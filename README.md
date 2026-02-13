@@ -12,6 +12,7 @@ Reusable test harness for Commodore 64 programs. Automates C64 programs via the 
 - **Little-endian helpers** — `read_word_le()` / `read_dword_le()` for 6502's native byte order
 - **PRG binary verification** — compare runtime memory against a PRG file to detect corruption
 - **Complete PETSCII/screen code tables** — full 256-entry mappings with extensibility
+- **Disk image management** — create/read/write D64/D71/D81 images via c1541, auto-attach to VICE
 - **Test runner framework** — scenario-based testing with error recovery
 - **Execution control** — load code into RAM, call subroutines via `jsr()`, set breakpoints, patch code at runtime
 - **Multi-instance VICE management** — run multiple emulators concurrently with thread-safe port allocation
@@ -189,6 +190,36 @@ with ViceInstanceManager(config, port_range_start=6510, port_range_end=6515) as 
 `PortAllocator` manages thread-safe port assignment, skipping ports with existing listeners. `ViceInstanceManager` handles the full lifecycle: allocate port, launch VICE, connect transport, and clean up on release. Set `reuse_existing=True` to adopt already-running VICE instances instead of launching new ones.
 
 See `scripts/run_parallel_sha256.py` for a full integration example running 3 concurrent VICE instances with SHA-256 validation, or `scripts/three_windows.py` for an interactive demo that writes user input directly into screen memory across 3 simultaneous VICE windows.
+
+## Disk Image Management
+
+Create and manipulate CBM disk images (D64/D71/D81) using VICE's `c1541` tool:
+
+```python
+from c64_test_harness import DiskImage, DiskFormat, ViceConfig, ViceProcess
+
+# Create a new disk image
+disk = DiskImage.create("test.d64", name="MYDATA", disk_id="01")
+
+# Write files into the image
+disk.write_file("keys.bin", "KEYS")
+disk.overwrite_file("updated.bin", "KEYS")
+
+# Read files back
+data = disk.read_file_bytes("KEYS")
+
+# List directory
+for entry in disk.list_files():
+    print(f"{entry.name:16s} {entry.blocks:>4d} {entry.file_type.value}")
+
+# Attach disk image to VICE automatically
+config = ViceConfig(prg_path="build/app.prg", disk_image=disk)
+with ViceProcess(config) as vice:
+    vice.wait_for_monitor()
+    # VICE drive 8 is attached with correct drive type (1541/1571/1581)
+```
+
+Requires `c1541` (included with VICE). No additional Python dependencies.
 
 ## Debug Utilities
 
