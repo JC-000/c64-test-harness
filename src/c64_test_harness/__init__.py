@@ -12,6 +12,7 @@ from .config import HarnessConfig
 from .runner import TestRunner, TestScenario, TestResult, TestStatus
 from .debug import dump_screen
 from .verify import PrgFile
+from .disk import DiskImage, DiskFormat, FileType, DirEntry, DiskImageError
 from .backends.vice import ViceTransport
 from .backends.vice_lifecycle import ViceProcess, ViceConfig
 from .backends.hardware import HardwareTransportBase
@@ -49,6 +50,12 @@ __all__ = [
     "dump_screen",
     # Verify
     "PrgFile",
+    # Disk
+    "DiskImage",
+    "DiskFormat",
+    "FileType",
+    "DirEntry",
+    "DiskImageError",
     # Backends
     "ViceTransport",
     "ViceProcess",
