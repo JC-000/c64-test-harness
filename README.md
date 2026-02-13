@@ -102,13 +102,14 @@ if result:
 Create and manipulate CBM disk images (D64/D71/D81) using VICE's `c1541` tool:
 
 ```python
-from c64_test_harness import DiskImage, DiskFormat, ViceConfig, ViceProcess
+from c64_test_harness import DiskImage, DiskFormat, FileType, ViceConfig, ViceProcess
 
 # Create a new disk image
 disk = DiskImage.create("test.d64", name="MYDATA", disk_id="01")
 
 # Write files into the image
 disk.write_file("keys.bin", "KEYS")
+disk.write_file("data.bin", "seqdata", FileType.SEQ)  # sequential file
 disk.overwrite_file("updated.bin", "KEYS")
 
 # Read files back
@@ -127,6 +128,8 @@ with ViceProcess(config) as vice:
 
 Requires `c1541` (included with VICE). No additional Python dependencies.
 
+**PETSCII filename note:** `c1541` stores uppercase ASCII as shifted PETSCII ($C1-$DA), but the C64 keyboard produces unshifted codes ($41-$5A). When writing files that will be LOADed by typing on the C64, use **lowercase** `c64_name` values (e.g. `"testprg"` not `"TESTPRG"`) so the PETSCII codes match.
+
 ## Architecture
 
 ```
@@ -142,8 +145,12 @@ Screen/Keyboard/Memory modules sit above the transport:
 
 ```bash
 pip install -e ".[dev]"
-pytest
+pytest                                   # unit tests only (no VICE needed)
+pytest tests/test_disk_vice.py -v        # VICE disk I/O integration tests
 ```
+
+Unit tests run without VICE. Integration tests (`test_disk_vice.py`) require both
+`x64sc` and `c1541` on PATH and are automatically skipped if either is missing.
 
 ## License
 
