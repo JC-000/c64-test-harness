@@ -6,11 +6,12 @@ Public API re-exports for convenient ``from c64_test_harness import ...``.
 from .transport import C64Transport, TransportError, ConnectionError, TimeoutError
 from .screen import ScreenGrid, wait_for_text, wait_for_stable
 from .keyboard import send_text, send_key
-from .memory import read_bytes, hex_dump
+from .memory import read_bytes, read_bytes_chunked, write_bytes, read_word_le, read_dword_le, hex_dump
 from .labels import Labels
 from .config import HarnessConfig
 from .runner import TestRunner, TestScenario, TestResult, TestStatus
 from .debug import dump_screen
+from .verify import PrgFile
 from .execute import load_code, goto, jsr, wait_for_pc, set_breakpoint, delete_breakpoint, set_register
 from .backends.vice import ViceTransport
 from .backends.vice_lifecycle import ViceProcess, ViceConfig
@@ -31,6 +32,10 @@ __all__ = [
     "send_key",
     # Memory
     "read_bytes",
+    "read_bytes_chunked",
+    "write_bytes",
+    "read_word_le",
+    "read_dword_le",
     "hex_dump",
     # Labels
     "Labels",
@@ -43,6 +48,8 @@ __all__ = [
     "TestStatus",
     # Debug
     "dump_screen",
+    # Verify
+    "PrgFile",
     # Execution control
     "load_code",
     "goto",
