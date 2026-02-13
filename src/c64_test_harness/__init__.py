@@ -11,6 +11,7 @@ from .labels import Labels
 from .config import HarnessConfig
 from .runner import TestRunner, TestScenario, TestResult, TestStatus
 from .debug import dump_screen
+from .execute import load_code, goto, jsr, wait_for_pc, set_breakpoint, delete_breakpoint, set_register
 from .backends.vice import ViceTransport
 from .backends.vice_lifecycle import ViceProcess, ViceConfig
 from .backends.hardware import HardwareTransportBase
@@ -42,6 +43,14 @@ __all__ = [
     "TestStatus",
     # Debug
     "dump_screen",
+    # Execution control
+    "load_code",
+    "goto",
+    "jsr",
+    "wait_for_pc",
+    "set_breakpoint",
+    "delete_breakpoint",
+    "set_register",
     # Backends
     "ViceTransport",
     "ViceProcess",
