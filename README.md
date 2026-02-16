@@ -14,6 +14,8 @@ Reusable test harness for Commodore 64 programs. Automates C64 programs via the 
 - **Complete PETSCII/screen code tables** — full 256-entry mappings with extensibility
 - **Test runner framework** — scenario-based testing with error recovery
 - **Execution control** — load code into RAM, call subroutines via `jsr()`, set breakpoints, patch code at runtime
+- **Multi-instance VICE management** — run multiple emulators concurrently with thread-safe port allocation
+- **Parallel test execution** — distribute tests across a pool of VICE instances via `run_parallel()`
 - **VICE label file parser** — load cc65/ACME/Kick Assembler label files
 
 ## Installation
@@ -150,6 +152,35 @@ with ViceProcess(config) as vice:
 
 `jsr()` writes a small trampoline (`JSR addr; NOP; NOP`) into the cassette buffer at `$0334`, sets a breakpoint after the `JSR`, and polls until the subroutine returns. The CPU is paused when `jsr()` returns, so memory reads are safe. See `examples/direct_memory_test.py` for a complete demo.
 
+## Multi-Instance VICE & Parallel Testing
+
+Run tests across multiple concurrent VICE instances:
+
+```python
+from c64_test_harness import (
+    ViceInstanceManager, ViceConfig, run_parallel,
+)
+
+config = ViceConfig(prg_path="build/mygame.prg", warp=True)
+
+with ViceInstanceManager(config, port_range_start=6510, port_range_end=6515) as mgr:
+    # Context-managed instance (auto-release)
+    with mgr.instance() as inst:
+        grid = wait_for_text(inst.transport, "READY")
+
+    # Or run tests in parallel across the pool
+    tests = [
+        ("test_a", lambda t: (True, "ok")),
+        ("test_b", lambda t: (True, "ok")),
+    ]
+    result = run_parallel(mgr, tests, max_workers=3)
+    result.print_summary()
+```
+
+`PortAllocator` manages thread-safe port assignment, skipping ports with existing listeners. `ViceInstanceManager` handles the full lifecycle: allocate port, launch VICE, connect transport, and clean up on release. Set `reuse_existing=True` to adopt already-running VICE instances instead of launching new ones.
+
+See `scripts/run_parallel_sha256.py` for a full integration example running 3 concurrent VICE instances with SHA-256 validation.
+
 ## Architecture
 
 ```
@@ -157,8 +188,15 @@ C64Transport (Protocol)
   +-- ViceTransport      (VICE TCP monitor)
   +-- HardwareTransportBase  (extension point for real hardware)
 
+ViceInstanceManager
+  +-- PortAllocator      (thread-safe port range)
+  +-- ViceInstance        (port + process + transport handle)
+
 Screen/Keyboard/Memory modules sit above the transport:
   ScreenGrid, wait_for_text, send_text, read_bytes, etc.
+
+Parallel execution:
+  run_parallel() -> ParallelTestResult
 ```
 
 ## Running Tests
