@@ -50,6 +50,11 @@ class HarnessConfig:
     keybuf_count_addr: int = 0x00C6
     keybuf_max: int = 10
 
+    # Multi-instance
+    vice_port_range_start: int = 6510
+    vice_port_range_end: int = 6520
+    vice_reuse_existing: bool = False
+
     # Timeouts
     startup_timeout: float = 30.0
     default_wait_timeout: float = 60.0
