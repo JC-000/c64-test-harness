@@ -12,6 +12,7 @@ from .config import HarnessConfig
 from .runner import TestRunner, TestScenario, TestResult, TestStatus
 from .debug import dump_screen
 from .verify import PrgFile
+from .execute import load_code, goto, jsr, wait_for_pc, set_breakpoint, delete_breakpoint, set_register
 from .backends.vice import ViceTransport
 from .backends.vice_lifecycle import ViceProcess, ViceConfig
 from .backends.hardware import HardwareTransportBase
@@ -49,6 +50,14 @@ __all__ = [
     "dump_screen",
     # Verify
     "PrgFile",
+    # Execution control
+    "load_code",
+    "goto",
+    "jsr",
+    "wait_for_pc",
+    "set_breakpoint",
+    "delete_breakpoint",
+    "set_register",
     # Backends
     "ViceTransport",
     "ViceProcess",
