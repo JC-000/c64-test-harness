@@ -179,7 +179,7 @@ with ViceInstanceManager(config, port_range_start=6510, port_range_end=6515) as 
 
 `PortAllocator` manages thread-safe port assignment, skipping ports with existing listeners. `ViceInstanceManager` handles the full lifecycle: allocate port, launch VICE, connect transport, and clean up on release. Set `reuse_existing=True` to adopt already-running VICE instances instead of launching new ones.
 
-See `scripts/run_parallel_sha256.py` for a full integration example running 3 concurrent VICE instances with SHA-256 validation.
+See `scripts/run_parallel_sha256.py` for a full integration example running 3 concurrent VICE instances with SHA-256 validation, or `scripts/three_windows.py` for an interactive demo that writes user input directly into screen memory across 3 simultaneous VICE windows.
 
 ## Architecture
 
