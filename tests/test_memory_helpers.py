@@ -6,6 +6,7 @@ from c64_test_harness.memory import (
     write_bytes,
     read_word_le,
     read_dword_le,
+    hex_dump,
     _AUTO_CHUNK_THRESHOLD,
 )
 from conftest import MockTransport
@@ -133,3 +134,32 @@ class TestReadDwordLE:
         t = MockTransport()
         t.memory[0x1000] = [0xFF, 0xFF, 0xFF, 0xFF]
         assert read_dword_le(t, 0x1000) == 0xFFFFFFFF
+
+
+class TestHexDump:
+    def test_hex_dump_format(self):
+        t = MockTransport()
+        t.memory[0x0400] = [0x05, 0x18, 0x10, 0x20]
+        result = hex_dump(t, 0x0400, 4)
+        assert result == "$0400: 05 18 10 20"
+
+    def test_hex_dump_multiple_lines(self):
+        t = MockTransport()
+        data = list(range(32))
+
+        def contiguous_read(addr, length):
+            offset = addr - 0x0400
+            return bytes(data[offset : offset + length])
+
+        t.read_memory = contiguous_read
+        result = hex_dump(t, 0x0400, 32)
+        lines = result.strip().split("\n")
+        assert len(lines) == 2
+        assert lines[0].startswith("$0400:")
+        assert lines[1].startswith("$0410:")
+
+    def test_hex_dump_partial_last_line(self):
+        t = MockTransport()
+        t.memory[0x0400] = [0xAA, 0xBB, 0xCC]
+        result = hex_dump(t, 0x0400, 3)
+        assert result == "$0400: aa bb cc"
