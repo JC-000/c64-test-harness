@@ -310,17 +310,38 @@ Additional scripts in `scripts/`:
 |--------|-------------|
 | `scripts/run_parallel_sha256.py` | 3 concurrent VICE instances running SHA-256 validation |
 | `scripts/three_windows.py` | Interactive demo writing user input across 3 VICE windows |
+| `scripts/run_all_tests.py` | Parallel test runner for the full test suite |
 
 ## Running Tests
 
 ```bash
 pip install -e ".[dev]"
+
+# Run the full test suite (parallel by default)
+python3 scripts/run_all_tests.py
+
+# Unit tests only (no external tools needed)
+python3 scripts/run_all_tests.py --unit-only
+
+# Sequential with full pytest output
+python3 scripts/run_all_tests.py --serial --verbose
+
+# Control parallelism or filter tests
+python3 scripts/run_all_tests.py --workers 4
+python3 scripts/run_all_tests.py -k "test_config"
+```
+
+The test runner organises 15 test files into three phases:
+1. **Unit tests** (13 files) — run in parallel, no external dependencies
+2. **Integration tests** (1 file) — needs `c1541` on PATH
+3. **VICE integration tests** (1 file) — needs `x64sc` + `c1541`, runs serially
+
+Suites with missing tools are skipped automatically. You can also run tests directly with pytest:
+
+```bash
 pytest                                   # unit tests only (no VICE needed)
 pytest tests/test_disk_vice.py -v        # VICE disk I/O integration tests
 ```
-
-Unit tests run without VICE. Integration tests (`test_disk_vice.py`) require both
-`x64sc` and `c1541` on PATH and are automatically skipped if either is missing.
 
 ## License
 
