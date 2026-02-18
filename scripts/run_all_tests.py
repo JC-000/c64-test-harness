@@ -122,7 +122,7 @@ class FileResult:
 _SUMMARY_RE = re.compile(
     r"(?:=+\s*)?"
     r"((?:\d+\s+\w+(?:,\s*)?)+)"
-    r"(?:\s+in\s+[\d.]+s)?"
+    r"(?:\s+in\s+[\d.]+s(?:\s*\([0-9:]+\))?)?"
     r"(?:\s*=+)?$",
     re.MULTILINE,
 )
