@@ -203,7 +203,8 @@ disk = DiskImage.create("test.d64", name="MYDATA", disk_id="01")
 
 # Write files into the image
 disk.write_file("keys.bin", "KEYS")
-disk.write_file("data.bin", "seqdata", FileType.SEQ)  # sequential file
+disk.write_file("data.bin", "SEQDATA", file_type=FileType.SEQ)  # sequential file
+disk.write_file("extra.bin", "USRDATA", file_type=FileType.USR)  # user file
 disk.overwrite_file("updated.bin", "KEYS")
 
 # Read files back
@@ -220,7 +221,7 @@ with ViceProcess(config) as vice:
     # VICE drive 8 is attached with correct drive type (1541/1571/1581)
 ```
 
-Requires `c1541` (included with VICE). No additional Python dependencies.
+Requires `c1541` (included with VICE). No additional Python dependencies. Filenames and disk names are validated against the CBM 16-character limit — a `ValueError` is raised immediately for names that are too long, rather than passing them to c1541. The `FileType` enum covers all standard CBM types: `PRG`, `SEQ`, `USR`, `REL`, and `DEL`. Parent directories are created automatically when calling `DiskImage.create()`.
 
 **PETSCII filename note:** `c1541` stores uppercase ASCII as shifted PETSCII ($C1-$DA), but the C64 keyboard produces unshifted codes ($41-$5A). When writing files that will be LOADed by typing on the C64, use **lowercase** `c64_name` values (e.g. `"testprg"` not `"TESTPRG"`) so the PETSCII codes match.
 
