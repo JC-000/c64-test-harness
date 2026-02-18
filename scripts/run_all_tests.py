@@ -65,6 +65,11 @@ SUITES: list[TestSuite] = [
     TestSuite("test_screen_codes.py",  "unit"),
     TestSuite("test_verify.py",        "unit"),
     TestSuite("test_vice_manager.py",  "unit"),
+    TestSuite("test_execute.py",       "unit"),
+    TestSuite("test_debug.py",         "unit"),
+    TestSuite("test_hardware.py",      "unit"),
+    TestSuite("test_transport.py",     "unit"),
+    TestSuite("test_vice_config.py",   "unit"),
 
     # ── Integration (needs c1541) ─────────────────────────────────
     TestSuite("test_disk.py",          "integration", required_tools=["c1541"]),
