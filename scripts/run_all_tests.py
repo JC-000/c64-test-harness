@@ -74,9 +74,13 @@ SUITES: list[TestSuite] = [
     # ── Integration (needs c1541) ─────────────────────────────────
     TestSuite("test_disk.py",          "integration", required_tools=["c1541"]),
 
-    # ── VICE integration (needs x64sc + c1541, uses fixed port) ───
+    # ── VICE integration (needs x64sc, uses dynamic ports) ────────
     TestSuite("test_disk_vice.py",     "integration-vice",
               required_tools=["x64sc", "c1541"], serial=True),
+    TestSuite("test_vice_core.py",     "integration-vice",
+              required_tools=["x64sc"], serial=True),
+    TestSuite("test_vice_transport.py","integration-vice",
+              required_tools=["x64sc"], serial=True),
 ]
 # fmt: on
 
