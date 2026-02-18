@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+import shutil
+
 import pytest
+
+from c64_test_harness.backends.vice import ViceTransport
+from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
+from c64_test_harness.backends.vice_manager import PortAllocator
+from c64_test_harness.screen import wait_for_text
 
 
 class MockTransport:
@@ -85,3 +92,26 @@ def labels_path():
     """Path to the real labels.txt fixture file."""
     import pathlib
     return pathlib.Path(__file__).parent / "fixtures" / "labels.txt"
+
+
+@pytest.fixture(scope="module")
+def vice_transport():
+    """Boot VICE, wait for READY prompt, yield a live ViceTransport."""
+    if shutil.which("x64sc") is None:
+        pytest.skip("x64sc not found on PATH")
+
+    allocator = PortAllocator(port_range_start=6520, port_range_end=6530)
+    port = allocator.allocate()
+    config = ViceConfig(port=port, warp=True, sound=False)
+
+    with ViceProcess(config) as vice:
+        assert vice.wait_for_monitor(timeout=30), \
+            "VICE monitor did not become available"
+        transport = ViceTransport(port=port)
+        try:
+            grid = wait_for_text(transport, "READY.", timeout=30, verbose=False)
+            assert grid is not None, "BASIC READY prompt not found"
+            yield transport
+        finally:
+            transport.close()
+            allocator.release(port)
