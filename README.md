@@ -331,16 +331,18 @@ python3 scripts/run_all_tests.py --workers 4
 python3 scripts/run_all_tests.py -k "test_config"
 ```
 
-The test runner organises 20 test files into three phases:
+The test runner organises 22 test files into three phases:
 1. **Unit tests** (18 files) — run in parallel, no external dependencies
 2. **Integration tests** (1 file) — needs `c1541` on PATH
-3. **VICE integration tests** (1 file) — needs `x64sc` + `c1541`, runs serially
+3. **VICE integration tests** (3 files) — needs `x64sc` + `c1541`, runs serially
 
 Suites with missing tools are skipped automatically. You can also run tests directly with pytest:
 
 ```bash
 pytest                                   # unit tests only (no VICE needed)
 pytest tests/test_disk_vice.py -v        # VICE disk I/O integration tests
+pytest tests/test_vice_core.py -v        # VICE core module integration tests
+pytest tests/test_vice_transport.py -v   # VICE transport protocol tests
 ```
 
 ## License
