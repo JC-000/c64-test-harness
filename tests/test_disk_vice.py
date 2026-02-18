@@ -16,6 +16,7 @@ import pytest
 
 from c64_test_harness.backends.vice import ViceTransport
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
+from c64_test_harness.backends.vice_manager import PortAllocator
 from c64_test_harness.disk import DiskImage, FileType
 from c64_test_harness.keyboard import send_text
 from c64_test_harness.memory import read_bytes, read_word_le, write_bytes
@@ -31,7 +32,9 @@ pytestmark = [
     ),
 ]
 
-VICE_PORT = 6510
+# Dynamic port allocation to avoid conflicts when running tests in parallel
+_allocator = PortAllocator(port_range_start=6510, port_range_end=6519)
+
 MONITOR_TIMEOUT = 30
 TEXT_TIMEOUT = 30
 
@@ -301,37 +304,41 @@ class TestPrgLoad:
         # ASCII so c1541 writes unshifted codes that match keyboard input.
         disk.write_file(prg_path, "testprg")
 
-        config = ViceConfig(
-            port=VICE_PORT,
-            disk_image=disk,
-            drive_unit=8,
-        )
+        port = _allocator.allocate()
+        try:
+            config = ViceConfig(
+                port=port,
+                disk_image=disk,
+                drive_unit=8,
+            )
 
-        with ViceProcess(config) as vice:
-            assert vice.wait_for_monitor(timeout=MONITOR_TIMEOUT), \
-                "VICE monitor did not become available"
-            transport = ViceTransport(port=VICE_PORT)
-            try:
-                # Wait for BASIC READY prompt
-                grid = wait_for_text(
-                    transport, "READY.", timeout=TEXT_TIMEOUT, verbose=False
-                )
-                assert grid is not None, "BASIC READY prompt not found"
+            with ViceProcess(config) as vice:
+                assert vice.wait_for_monitor(timeout=MONITOR_TIMEOUT), \
+                    "VICE monitor did not become available"
+                transport = ViceTransport(port=port)
+                try:
+                    # Wait for BASIC READY prompt
+                    grid = wait_for_text(
+                        transport, "READY.", timeout=TEXT_TIMEOUT, verbose=False
+                    )
+                    assert grid is not None, "BASIC READY prompt not found"
 
-                # LOAD from disk -- wait for "LOADING" followed by "READY."
-                send_text(transport, 'LOAD"TESTPRG",8\r')
-                grid = _wait_for_load_complete(transport)
-                assert grid is not None, "LOAD did not complete"
+                    # LOAD from disk -- wait for "LOADING" followed by "READY."
+                    send_text(transport, 'LOAD"TESTPRG",8\r')
+                    grid = _wait_for_load_complete(transport)
+                    assert grid is not None, "LOAD did not complete"
 
-                # RUN
-                send_text(transport, "RUN\r")
-                grid = wait_for_text(
-                    transport, signature, timeout=TEXT_TIMEOUT, verbose=False
-                )
-                assert grid is not None, \
-                    f"Signature '{signature}' not found on screen"
-            finally:
-                transport.close()
+                    # RUN
+                    send_text(transport, "RUN\r")
+                    grid = wait_for_text(
+                        transport, signature, timeout=TEXT_TIMEOUT, verbose=False
+                    )
+                    assert grid is not None, \
+                        f"Signature '{signature}' not found on screen"
+                finally:
+                    transport.close()
+        finally:
+            _allocator.release(port)
 
 
 # ======================================================================
@@ -355,52 +362,56 @@ class TestSeqRead:
         disk.write_file(seq_path, "testseq", FileType.SEQ)
         disk.write_file(reader_path, "reader")
 
-        config = ViceConfig(
-            port=VICE_PORT,
-            disk_image=disk,
-            drive_unit=8,
-        )
+        port = _allocator.allocate()
+        try:
+            config = ViceConfig(
+                port=port,
+                disk_image=disk,
+                drive_unit=8,
+            )
 
-        with ViceProcess(config) as vice:
-            assert vice.wait_for_monitor(timeout=MONITOR_TIMEOUT)
-            transport = ViceTransport(port=VICE_PORT)
-            try:
-                grid = wait_for_text(
-                    transport, "READY.", timeout=TEXT_TIMEOUT, verbose=False
-                )
-                assert grid is not None, "BASIC READY prompt not found"
+            with ViceProcess(config) as vice:
+                assert vice.wait_for_monitor(timeout=MONITOR_TIMEOUT)
+                transport = ViceTransport(port=port)
+                try:
+                    grid = wait_for_text(
+                        transport, "READY.", timeout=TEXT_TIMEOUT, verbose=False
+                    )
+                    assert grid is not None, "BASIC READY prompt not found"
 
-                # Load reader PRG
-                send_text(transport, 'LOAD"READER",8\r')
-                grid = _wait_for_load_complete(transport)
-                assert grid is not None, "LOAD did not complete"
+                    # Load reader PRG
+                    send_text(transport, 'LOAD"READER",8\r')
+                    grid = _wait_for_load_complete(transport)
+                    assert grid is not None, "LOAD did not complete"
 
-                # Run reader -- it displays "IDLE" when ready
-                send_text(transport, "RUN\r")
-                grid = wait_for_text(
-                    transport, "IDLE", timeout=TEXT_TIMEOUT, verbose=False
-                )
-                assert grid is not None, \
-                    "Reader program did not display IDLE on screen"
+                    # Run reader -- it displays "IDLE" when ready
+                    send_text(transport, "RUN\r")
+                    grid = wait_for_text(
+                        transport, "IDLE", timeout=TEXT_TIMEOUT, verbose=False
+                    )
+                    assert grid is not None, \
+                        "Reader program did not display IDLE on screen"
 
-                # Trigger SEQ read
-                write_bytes(transport, 0x033C, [0x01])
+                    # Trigger SEQ read
+                    write_bytes(transport, 0x033C, [0x01])
 
-                grid = wait_for_text(
-                    transport, "DONE", timeout=TEXT_TIMEOUT, verbose=False
-                )
-                assert grid is not None, \
-                    "DONE not found -- SEQ read may have failed"
+                    grid = wait_for_text(
+                        transport, "DONE", timeout=TEXT_TIMEOUT, verbose=False
+                    )
+                    assert grid is not None, \
+                        "DONE not found -- SEQ read may have failed"
 
-                # Verify byte count and buffer contents
-                count = read_word_le(transport, 0x033E)
-                assert count == len(original_data), \
-                    f"Byte count mismatch: got {count}, expected {len(original_data)}"
+                    # Verify byte count and buffer contents
+                    count = read_word_le(transport, 0x033E)
+                    assert count == len(original_data), \
+                        f"Byte count mismatch: got {count}, expected {len(original_data)}"
 
-                buffer = read_bytes(transport, 0xC000, count)
-                assert buffer == original_data
-            finally:
-                transport.close()
+                    buffer = read_bytes(transport, 0xC000, count)
+                    assert buffer == original_data
+                finally:
+                    transport.close()
+        finally:
+            _allocator.release(port)
 
 
 # ======================================================================
@@ -435,47 +446,51 @@ class TestSeqModify:
         disk.write_file(seq_path, "testseq", FileType.SEQ)
         disk.write_file(reader_path, "reader")
 
-        config = ViceConfig(
-            port=VICE_PORT,
-            disk_image=disk,
-            drive_unit=8,
-        )
+        port = _allocator.allocate()
+        try:
+            config = ViceConfig(
+                port=port,
+                disk_image=disk,
+                drive_unit=8,
+            )
 
-        with ViceProcess(config) as vice:
-            assert vice.wait_for_monitor(timeout=MONITOR_TIMEOUT)
-            transport = ViceTransport(port=VICE_PORT)
-            try:
-                grid = wait_for_text(
-                    transport, "READY.", timeout=TEXT_TIMEOUT, verbose=False
-                )
-                assert grid is not None, "BASIC READY prompt not found"
+            with ViceProcess(config) as vice:
+                assert vice.wait_for_monitor(timeout=MONITOR_TIMEOUT)
+                transport = ViceTransport(port=port)
+                try:
+                    grid = wait_for_text(
+                        transport, "READY.", timeout=TEXT_TIMEOUT, verbose=False
+                    )
+                    assert grid is not None, "BASIC READY prompt not found"
 
-                send_text(transport, 'LOAD"READER",8\r')
-                grid = _wait_for_load_complete(transport)
-                assert grid is not None, "LOAD did not complete"
+                    send_text(transport, 'LOAD"READER",8\r')
+                    grid = _wait_for_load_complete(transport)
+                    assert grid is not None, "LOAD did not complete"
 
-                send_text(transport, "RUN\r")
-                grid = wait_for_text(
-                    transport, "IDLE", timeout=TEXT_TIMEOUT, verbose=False
-                )
-                assert grid is not None, \
-                    "Reader program did not display IDLE on screen"
+                    send_text(transport, "RUN\r")
+                    grid = wait_for_text(
+                        transport, "IDLE", timeout=TEXT_TIMEOUT, verbose=False
+                    )
+                    assert grid is not None, \
+                        "Reader program did not display IDLE on screen"
 
-                write_bytes(transport, 0x033C, [0x01])
+                    write_bytes(transport, 0x033C, [0x01])
 
-                grid = wait_for_text(
-                    transport, "DONE", timeout=TEXT_TIMEOUT, verbose=False
-                )
-                assert grid is not None, \
-                    "DONE not found -- SEQ read may have failed"
+                    grid = wait_for_text(
+                        transport, "DONE", timeout=TEXT_TIMEOUT, verbose=False
+                    )
+                    assert grid is not None, \
+                        "DONE not found -- SEQ read may have failed"
 
-                count = read_word_le(transport, 0x033E)
-                assert count == len(modified), \
-                    f"Byte count mismatch: got {count}, expected {len(modified)}"
+                    count = read_word_le(transport, 0x033E)
+                    assert count == len(modified), \
+                        f"Byte count mismatch: got {count}, expected {len(modified)}"
 
-                buffer = read_bytes(transport, 0xC000, count)
-                assert buffer == modified
-                assert buffer != base_data, \
-                    "Buffer matches unmodified base data"
-            finally:
-                transport.close()
+                    buffer = read_bytes(transport, 0xC000, count)
+                    assert buffer == modified
+                    assert buffer != base_data, \
+                        "Buffer matches unmodified base data"
+                finally:
+                    transport.close()
+        finally:
+            _allocator.release(port)
