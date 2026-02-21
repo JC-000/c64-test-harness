@@ -8,6 +8,7 @@ from c64_test_harness.memory import (
     read_dword_le,
     hex_dump,
     _AUTO_CHUNK_THRESHOLD,
+    _WRITE_CHUNK_SIZE,
 )
 from conftest import MockTransport
 
@@ -100,6 +101,53 @@ class TestWriteBytes:
         t = MockTransport()
         write_bytes(t, 0x2000, b"\x01\x02\x03")
         assert t.written_memory[0] == (0x2000, [0x01, 0x02, 0x03])
+
+    def test_write_bytes_small_not_chunked(self):
+        """Writes <= chunk size go through as a single transport call."""
+        t = MockTransport()
+        data = bytes(range(_WRITE_CHUNK_SIZE))
+        write_bytes(t, 0x1000, data)
+        assert len(t.written_memory) == 1
+
+    def test_write_bytes_large_auto_chunked(self):
+        """Writes > chunk size are split into multiple transport calls."""
+        t = MockTransport()
+        size = _WRITE_CHUNK_SIZE * 3 + 7
+        data = bytes(i & 0xFF for i in range(size))
+        write_bytes(t, 0x1000, data)
+        # Should be 4 calls: 3 full chunks + 1 partial
+        assert len(t.written_memory) == 4
+        # Verify addresses are sequential
+        assert t.written_memory[0][0] == 0x1000
+        assert t.written_memory[1][0] == 0x1000 + _WRITE_CHUNK_SIZE
+        assert t.written_memory[2][0] == 0x1000 + _WRITE_CHUNK_SIZE * 2
+        assert t.written_memory[3][0] == 0x1000 + _WRITE_CHUNK_SIZE * 3
+        # Verify all data is present
+        reassembled = []
+        for _, chunk in t.written_memory:
+            reassembled.extend(chunk)
+        assert bytes(reassembled) == data
+
+    def test_write_bytes_exact_chunk_boundary(self):
+        """Write exactly 2x chunk size produces exactly 2 calls."""
+        t = MockTransport()
+        size = _WRITE_CHUNK_SIZE * 2
+        data = bytes([0xAA] * size)
+        write_bytes(t, 0x3000, data)
+        assert len(t.written_memory) == 2
+        assert len(t.written_memory[0][1]) == _WRITE_CHUNK_SIZE
+        assert len(t.written_memory[1][1]) == _WRITE_CHUNK_SIZE
+
+    def test_write_bytes_list_large_auto_chunked(self):
+        """List input also gets chunked for large writes."""
+        t = MockTransport()
+        data = list(range(100))
+        write_bytes(t, 0x4000, data)
+        assert len(t.written_memory) > 1
+        reassembled = []
+        for _, chunk in t.written_memory:
+            reassembled.extend(chunk)
+        assert reassembled == data
 
 
 class TestReadWordLE:

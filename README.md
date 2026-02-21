@@ -8,7 +8,7 @@ Reusable test harness for Commodore 64 programs. Automates C64 programs via the 
 - **Wrap-aware screen matching** — search for text that spans 40-column row boundaries
 - **Fast keyboard injection** — batched writes to the keyboard buffer (10x faster than per-character)
 - **Robust VICE monitor parsing** — works around known VICE text monitor bugs
-- **Reliable large memory reads** — automatic chunking for reads >256 bytes
+- **Reliable large memory access** — automatic chunking for reads >256 bytes and writes >84 bytes
 - **Little-endian helpers** — `read_word_le()` / `read_dword_le()` for 6502's native byte order
 - **PRG binary verification** — compare runtime memory against a PRG file to detect corruption
 - **Complete PETSCII/screen code tables** — full 256-entry mappings with extensibility
@@ -84,8 +84,9 @@ der_data = read_bytes(transport, der_buf_addr, 512)
 length = read_word_le(transport, length_addr)     # 16-bit
 counter = read_dword_le(transport, counter_addr)   # 32-bit
 
-# Write memory
+# write_bytes auto-chunks writes >84 bytes (VICE text monitor limit)
 write_bytes(transport, 0x1000, [0xDE, 0xAD, 0xBE, 0xEF])
+write_bytes(transport, 0xC000, bytes(256))  # large writes handled transparently
 ```
 
 ## PRG Binary Verification
