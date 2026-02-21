@@ -10,6 +10,11 @@ if TYPE_CHECKING:
 #: Reads larger than this are automatically chunked for reliability.
 _AUTO_CHUNK_THRESHOLD = 256
 
+#: VICE's text monitor silently truncates ``>`` (write) commands at ~261
+#: characters, which corresponds to 84 data bytes.  Writes larger than
+#: this threshold are automatically split into multiple commands.
+_WRITE_CHUNK_SIZE = 84
+
 
 def read_bytes(transport: C64Transport, addr: int, length: int) -> bytes:
     """Read *length* bytes from *addr*.
@@ -46,8 +51,23 @@ def read_bytes_chunked(
 
 
 def write_bytes(transport: C64Transport, addr: int, data: bytes | list[int]) -> None:
-    """Write *data* to *addr*.  Alias for ``transport.write_memory()``."""
-    transport.write_memory(addr, data)
+    """Write *data* to *addr*, automatically chunking large writes.
+
+    VICE's text monitor truncates write commands longer than ~261
+    characters (84 data bytes).  This function transparently splits
+    larger writes into *_WRITE_CHUNK_SIZE*-byte pieces so callers
+    never need to worry about the limit.
+    """
+    if isinstance(data, list):
+        data = bytes(data)
+    if len(data) <= _WRITE_CHUNK_SIZE:
+        transport.write_memory(addr, data)
+        return
+    offset = 0
+    while offset < len(data):
+        end = min(offset + _WRITE_CHUNK_SIZE, len(data))
+        transport.write_memory(addr + offset, data[offset:end])
+        offset = end
 
 
 def read_word_le(transport: C64Transport, addr: int) -> int:
