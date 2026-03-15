@@ -194,6 +194,7 @@ class ViceInstanceManager:
             warp=self._base_config.warp,
             ntsc=self._base_config.ntsc,
             sound=self._base_config.sound,
+            minimize=self._base_config.minimize,
             extra_args=list(self._base_config.extra_args),
         )
         proc = ViceProcess(cfg)
