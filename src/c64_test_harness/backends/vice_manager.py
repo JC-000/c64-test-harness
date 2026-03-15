@@ -19,7 +19,14 @@ from .vice_lifecycle import ViceConfig, ViceProcess
 
 
 class PortAllocator:
-    """Thread-safe allocator for TCP monitor ports."""
+    """Thread-safe, cross-process-safe allocator for TCP monitor ports.
+
+    Allocated ports are held at the OS level via ``bind()`` so that
+    concurrent processes cannot claim the same port.  The reservation
+    socket is kept open until the caller retrieves it with
+    ``take_socket()`` (to close it just before VICE starts) or until
+    ``release()`` is called.
+    """
 
     def __init__(
         self,
@@ -29,13 +36,16 @@ class PortAllocator:
         self._start = port_range_start
         self._end = port_range_end
         self._allocated: set[int] = set()
+        self._held_sockets: dict[int, socket.socket] = {}
         self._lock = threading.Lock()
 
     def allocate(self, allow_in_use: bool = False) -> int:
-        """Return the next free port (not allocated and, by default, no TCP listener).
+        """Return the next free port, reserved at the OS level.
 
+        The port is held via ``bind()`` so other processes cannot grab it.
         If *allow_in_use* is True, ports with active listeners are still
-        eligible (used when reusing existing VICE instances).
+        eligible (used when reusing existing VICE instances); no
+        reservation socket is held for those ports.
 
         Raises ``RuntimeError`` if all ports are exhausted.
         """
@@ -43,18 +53,39 @@ class PortAllocator:
             for port in range(self._start, self._end):
                 if port in self._allocated:
                     continue
-                if not allow_in_use and self.is_port_in_use(port):
+                if allow_in_use and self.is_port_in_use(port):
+                    self._allocated.add(port)
+                    return port
+                sock = self._try_bind(port)
+                if sock is None:
                     continue
                 self._allocated.add(port)
+                self._held_sockets[port] = sock
                 return port
             raise RuntimeError(
                 f"No free ports in range {self._start}-{self._end - 1}"
             )
 
+    def take_socket(self, port: int) -> socket.socket | None:
+        """Remove and return the reservation socket for *port*.
+
+        The caller should close it immediately before starting VICE so
+        the emulator can bind to the port.  Returns ``None`` if no
+        socket is held (e.g. adopted ports).
+        """
+        with self._lock:
+            return self._held_sockets.pop(port, None)
+
     def release(self, port: int) -> None:
-        """Mark *port* as available for reuse."""
+        """Mark *port* as available for reuse and close any held socket."""
         with self._lock:
             self._allocated.discard(port)
+            sock = self._held_sockets.pop(port, None)
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     @property
     def allocated_ports(self) -> frozenset[int]:
@@ -73,6 +104,27 @@ class PortAllocator:
             return True
         except (OSError, ConnectionRefusedError):
             return False
+
+    @staticmethod
+    def _try_bind(port: int, host: str = "127.0.0.1") -> socket.socket | None:
+        """Try to bind a TCP socket to *port*.
+
+        Returns the bound socket on success, ``None`` if the port is
+        already in use.  The socket is set to ``SO_REUSEADDR`` so that
+        VICE can rebind immediately after the socket is closed.
+        """
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((host, port))
+            s.listen(1)
+            return s
+        except OSError:
+            try:
+                s.close()
+            except OSError:
+                pass
+            return None
 
 
 @dataclass
@@ -203,6 +255,13 @@ class ViceInstanceManager:
             extra_args=list(self._base_config.extra_args),
         )
         proc = ViceProcess(cfg)
+
+        # Release the OS-level port reservation just before VICE starts
+        # so the emulator can bind to it.
+        reservation = self._allocator.take_socket(port)
+        if reservation is not None:
+            reservation.close()
+
         proc.start()
 
         if not proc.wait_for_monitor(timeout=30.0):
