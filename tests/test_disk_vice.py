@@ -305,6 +305,9 @@ class TestPrgLoad:
         disk.write_file(prg_path, "testprg")
 
         port = _allocator.allocate()
+        reservation = _allocator.take_socket(port)
+        if reservation is not None:
+            reservation.close()
         try:
             config = ViceConfig(
                 port=port,
@@ -363,6 +366,9 @@ class TestSeqRead:
         disk.write_file(reader_path, "reader")
 
         port = _allocator.allocate()
+        reservation = _allocator.take_socket(port)
+        if reservation is not None:
+            reservation.close()
         try:
             config = ViceConfig(
                 port=port,
@@ -447,6 +453,9 @@ class TestSeqModify:
         disk.write_file(reader_path, "reader")
 
         port = _allocator.allocate()
+        reservation = _allocator.take_socket(port)
+        if reservation is not None:
+            reservation.close()
         try:
             config = ViceConfig(
                 port=port,
