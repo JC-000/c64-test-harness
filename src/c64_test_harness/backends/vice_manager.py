@@ -84,6 +84,11 @@ class ViceInstance:
     transport: ViceTransport
     managed: bool = True
 
+    @property
+    def pid(self) -> int | None:
+        """PID of the underlying VICE process, or ``None`` if adopted."""
+        return self.process.pid if self.process else None
+
     def stop(self) -> None:
         """Close transport and stop the process (if managed)."""
         try:
