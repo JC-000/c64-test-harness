@@ -55,6 +55,7 @@ class HarnessConfig:
     vice_port_range_start: int = 6510
     vice_port_range_end: int = 6520
     vice_reuse_existing: bool = False
+    vice_acquire_retries: int = 3
 
     # Timeouts
     startup_timeout: float = 30.0

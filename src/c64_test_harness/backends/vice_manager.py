@@ -8,24 +8,30 @@ concurrent emulator instances.
 
 from __future__ import annotations
 
+import logging
 import socket
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Iterator
 
+from .port_lock import PortLock
 from .vice import ViceTransport
 from .vice_lifecycle import ViceConfig, ViceProcess
+
+logger = logging.getLogger(__name__)
 
 
 class PortAllocator:
     """Thread-safe, cross-process-safe allocator for TCP monitor ports.
 
-    Allocated ports are held at the OS level via ``bind()`` so that
-    concurrent processes cannot claim the same port.  The reservation
-    socket is kept open until the caller retrieves it with
-    ``take_socket()`` (to close it just before VICE starts) or until
-    ``release()`` is called.
+    Allocated ports are held at the OS level via ``bind()`` and a
+    file-based ``flock()`` so that concurrent processes cannot claim the
+    same port.  The reservation socket is kept open until the caller
+    retrieves it with ``take_socket()`` (to close it just before VICE
+    starts) or until ``release()`` is called.  The file lock persists
+    across the socket-close→VICE-start window, closing the TOCTOU gap.
     """
 
     def __init__(
@@ -37,15 +43,17 @@ class PortAllocator:
         self._end = port_range_end
         self._allocated: set[int] = set()
         self._held_sockets: dict[int, socket.socket] = {}
+        self._held_locks: dict[int, PortLock] = {}
         self._lock = threading.Lock()
+        PortLock.cleanup_stale()
 
     def allocate(self, allow_in_use: bool = False) -> int:
         """Return the next free port, reserved at the OS level.
 
-        The port is held via ``bind()`` so other processes cannot grab it.
-        If *allow_in_use* is True, ports with active listeners are still
-        eligible (used when reusing existing VICE instances); no
-        reservation socket is held for those ports.
+        The port is held via ``bind()`` and a file lock so other
+        processes cannot grab it.  If *allow_in_use* is True, ports with
+        active listeners are still eligible (used when reusing existing
+        VICE instances); no reservation socket is held for those ports.
 
         Raises ``RuntimeError`` if all ports are exhausted.
         """
@@ -59,8 +67,14 @@ class PortAllocator:
                 sock = self._try_bind(port)
                 if sock is None:
                     continue
+                # Also acquire a file lock for cross-process safety
+                port_lock = PortLock(port)
+                if not port_lock.acquire():
+                    sock.close()
+                    continue
                 self._allocated.add(port)
                 self._held_sockets[port] = sock
+                self._held_locks[port] = port_lock
                 return port
             raise RuntimeError(
                 f"No free ports in range {self._start}-{self._end - 1}"
@@ -76,16 +90,28 @@ class PortAllocator:
         with self._lock:
             return self._held_sockets.pop(port, None)
 
+    def take_lock(self, port: int) -> PortLock | None:
+        """Remove and return the file lock for *port*.
+
+        The caller becomes responsible for releasing it.  Returns
+        ``None`` if no lock is held (e.g. adopted ports).
+        """
+        with self._lock:
+            return self._held_locks.pop(port, None)
+
     def release(self, port: int) -> None:
-        """Mark *port* as available for reuse and close any held socket."""
+        """Mark *port* as available for reuse and close any held socket/lock."""
         with self._lock:
             self._allocated.discard(port)
             sock = self._held_sockets.pop(port, None)
+            lock = self._held_locks.pop(port, None)
         if sock is not None:
             try:
                 sock.close()
             except OSError:
                 pass
+        if lock is not None:
+            lock.release()
 
     @property
     def allocated_ports(self) -> frozenset[int]:
@@ -135,6 +161,7 @@ class ViceInstance:
     process: ViceProcess | None
     transport: ViceTransport
     managed: bool = True
+    _port_lock: PortLock | None = field(default=None, repr=False)
 
     @property
     def pid(self) -> int | None:
@@ -142,13 +169,16 @@ class ViceInstance:
         return self.process.pid if self.process else None
 
     def stop(self) -> None:
-        """Close transport and stop the process (if managed)."""
+        """Close transport, stop the process, and release the port lock."""
         try:
             self.transport.close()
         except Exception:
             pass
         if self.managed and self.process is not None:
             self.process.stop()
+        if self._port_lock is not None:
+            self._port_lock.release()
+            self._port_lock = None
 
 
 class ViceInstanceManager:
@@ -168,10 +198,12 @@ class ViceInstanceManager:
         port_range_start: int = 6510,
         port_range_end: int = 6520,
         reuse_existing: bool = False,
+        max_retries: int = 3,
     ) -> None:
         self._base_config = config or ViceConfig()
         self._allocator = PortAllocator(port_range_start, port_range_end)
         self._reuse_existing = reuse_existing
+        self._max_retries = max_retries
         self._instances: list[ViceInstance] = []
         self._lock = threading.Lock()
 
@@ -194,17 +226,43 @@ class ViceInstanceManager:
         allocated port, the manager adopts it (``managed=False``) instead
         of launching a new process.
 
-        Raises ``RuntimeError`` if the monitor port never becomes ready.
+        Retries with exponential backoff on failure (up to
+        ``max_retries`` attempts).
+
+        Raises ``RuntimeError`` if all attempts fail.
         """
-        port = self._allocator.allocate(allow_in_use=self._reuse_existing)
-        try:
-            instance = self._start_or_adopt(port)
-        except Exception:
-            self._allocator.release(port)
-            raise
-        with self._lock:
-            self._instances.append(instance)
-        return instance
+        last_error: Exception | None = None
+        for attempt in range(1, self._max_retries + 1):
+            try:
+                port = self._allocator.allocate(
+                    allow_in_use=self._reuse_existing,
+                )
+            except RuntimeError:
+                if attempt < self._max_retries:
+                    time.sleep(0.1 * attempt)
+                    continue
+                raise
+            try:
+                instance = self._start_or_adopt(port)
+            except Exception as exc:
+                last_error = exc
+                self._allocator.release(port)
+                if attempt < self._max_retries:
+                    logger.warning(
+                        "VICE acquire attempt %d/%d on port %d failed: %s",
+                        attempt, self._max_retries, port, exc,
+                    )
+                    time.sleep(0.1 * attempt)
+                    continue
+                raise
+            with self._lock:
+                self._instances.append(instance)
+            return instance
+        # Should not reach here, but just in case
+        raise RuntimeError(
+            f"Failed to acquire VICE instance after {self._max_retries} "
+            f"attempts: {last_error}"
+        )
 
     def release(self, instance: ViceInstance) -> None:
         """Stop an instance and free its port."""
@@ -256,21 +314,46 @@ class ViceInstanceManager:
         )
         proc = ViceProcess(cfg)
 
+        # Take the file lock BEFORE closing the reservation socket.
+        # The file lock bridges the gap between socket close and VICE
+        # binding, preventing other processes from stealing the port.
+        port_lock = self._allocator.take_lock(port)
+
         # Release the OS-level port reservation just before VICE starts
         # so the emulator can bind to it.
         reservation = self._allocator.take_socket(port)
         if reservation is not None:
             reservation.close()
 
-        proc.start()
+        try:
+            proc.start()
 
-        if not proc.wait_for_monitor(timeout=30.0):
-            proc.stop()
-            raise RuntimeError(
-                f"VICE monitor on port {port} did not become ready"
-            )
+            if not proc.wait_for_monitor(timeout=30.0):
+                proc.stop()
+                raise RuntimeError(
+                    f"VICE monitor on port {port} did not become ready"
+                )
+
+            # Verify the listener is actually our VICE process
+            listener_pid = ViceProcess.get_listener_pid(port)
+            if listener_pid is not None and proc.pid is not None:
+                if listener_pid != proc.pid:
+                    proc.stop()
+                    raise RuntimeError(
+                        f"PID mismatch on port {port}: expected {proc.pid}, "
+                        f"found {listener_pid}"
+                    )
+
+            if port_lock is not None:
+                port_lock.update_vice_pid(proc.pid or 0)
+
+        except Exception:
+            if port_lock is not None:
+                port_lock.release()
+            raise
 
         transport = ViceTransport(port=port)
         return ViceInstance(
             port=port, process=proc, transport=transport, managed=True,
+            _port_lock=port_lock,
         )
