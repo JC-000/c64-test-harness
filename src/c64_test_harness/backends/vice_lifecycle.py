@@ -146,10 +146,15 @@ class ViceProcess:
     def wait_for_monitor(self, timeout: float = 30.0) -> bool:
         """Poll the TCP monitor port until it accepts connections.
 
-        Returns ``True`` if connected within *timeout*, ``False`` otherwise.
+        Returns ``True`` if connected within *timeout*, ``False`` if the
+        timeout expires or the VICE process exits early (e.g. X11/GTK
+        resource contention during simultaneous startup).
         """
         start = time.monotonic()
         while time.monotonic() - start < timeout:
+            # Fail fast if the VICE process has already exited
+            if self._proc is not None and self._proc.poll() is not None:
+                return False
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.settimeout(2)

@@ -1,9 +1,12 @@
-"""Tests for ViceConfig dataclass (backends/vice_lifecycle.py)."""
+"""Tests for ViceConfig and ViceProcess (backends/vice_lifecycle.py)."""
 from __future__ import annotations
+
+import subprocess
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from c64_test_harness.backends.vice_lifecycle import ViceConfig
+from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 
 
 def test_default_values():
@@ -51,3 +54,31 @@ def test_not_frozen():
     cfg = ViceConfig()
     cfg.port = 9999
     assert cfg.port == 9999
+
+
+class TestWaitForMonitor:
+    def test_early_exit_returns_false_fast(self):
+        """wait_for_monitor fails fast when VICE process has already exited."""
+        proc = ViceProcess(ViceConfig(port=19900))
+        # Simulate a process that already exited with rc=1
+        mock_popen = MagicMock()
+        mock_popen.poll.return_value = 1  # already exited
+        proc._proc = mock_popen
+        # Should return False almost immediately, not wait 30s
+        import time
+        start = time.monotonic()
+        result = proc.wait_for_monitor(timeout=30.0)
+        elapsed = time.monotonic() - start
+        assert result is False
+        assert elapsed < 2.0  # Should be near-instant, not 30s
+
+    def test_no_proc_still_polls(self):
+        """wait_for_monitor polls normally when _proc is None."""
+        proc = ViceProcess(ViceConfig(port=19901))
+        proc._proc = None
+        import time
+        start = time.monotonic()
+        result = proc.wait_for_monitor(timeout=2.0)
+        elapsed = time.monotonic() - start
+        assert result is False
+        assert elapsed >= 1.5  # Should wait near full timeout
