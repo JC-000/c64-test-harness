@@ -146,3 +146,53 @@ class TestPortAllocator:
         assert p1 != p2
         alloc1.release(p1)
         alloc2.release(p2)
+
+    def test_allocate_acquires_file_lock(self):
+        """Allocated port has a file lock held by the allocator."""
+        from c64_test_harness.backends.port_lock import PortLock
+        alloc = PortAllocator(port_range_start=17740, port_range_end=17741)
+        p = alloc.allocate()
+        # Another PortLock on the same port should fail
+        rival = PortLock(p)
+        assert not rival.acquire()
+        alloc.release(p)
+        # After release, the lock should be available
+        assert rival.acquire()
+        rival.release()
+
+    def test_take_lock_returns_and_removes(self):
+        """take_lock() returns the held lock and removes it."""
+        alloc = PortAllocator(port_range_start=17750, port_range_end=17751)
+        p = alloc.allocate()
+        lock = alloc.take_lock(p)
+        assert lock is not None
+        assert lock.held
+        # Second call returns None
+        assert alloc.take_lock(p) is None
+        lock.release()
+        alloc.release(p)
+
+    def test_release_releases_file_lock(self):
+        """release() releases the file lock."""
+        from c64_test_harness.backends.port_lock import PortLock
+        alloc = PortAllocator(port_range_start=17760, port_range_end=17761)
+        p = alloc.allocate()
+        alloc.release(p)
+        # Lock should be free now
+        lock = PortLock(p)
+        assert lock.acquire()
+        lock.release()
+
+    def test_file_lock_blocks_concurrent_allocator(self):
+        """A port held by file lock is skipped by another allocator."""
+        from c64_test_harness.backends.port_lock import PortLock
+        # Hold a file lock on the first port manually
+        lock = PortLock(17770)
+        lock.acquire()
+        try:
+            alloc = PortAllocator(port_range_start=17770, port_range_end=17772)
+            p = alloc.allocate()
+            assert p == 17771  # Should skip 17770 (file-locked)
+            alloc.release(p)
+        finally:
+            lock.release()
