@@ -69,28 +69,59 @@ class PortLock:
 
         Returns True on success, False if another process holds it.
         Writes metadata (PID, timestamp) to the lockfile on success.
+
+        After acquiring the flock, we verify the fd's inode still
+        matches the path on disk.  If ``cleanup_stale()`` unlinked the
+        file between our ``open()`` and ``flock()``, we'd hold a lock
+        on an orphaned inode — another process could create a new file
+        at the same path and get an independent lock.  The inode check
+        detects this and retries with the new file.
         """
         if self._fd is not None:
             return True  # Already held by us
-        try:
-            fd = os.open(
-                str(self._lock_path),
-                os.O_CREAT | os.O_RDWR,
-                0o600,
-            )
-        except OSError:
-            return False
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        # Retry once in case cleanup_stale() deletes our file
+        # between open() and flock().
+        for _attempt in range(2):
+            try:
+                fd = os.open(
+                    str(self._lock_path),
+                    os.O_CREAT | os.O_RDWR,
+                    0o600,
+                )
+            except OSError:
+                return False
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(fd)
+                return False
+            # Verify our fd still points to the file on disk.
+            # If cleanup_stale() unlinked it, the path either doesn't
+            # exist or points to a new inode.
+            try:
+                fd_stat = os.fstat(fd)
+                path_stat = os.stat(str(self._lock_path))
+                if fd_stat.st_ino == path_stat.st_ino and fd_stat.st_dev == path_stat.st_dev:
+                    self._fd = fd
+                    self._write_metadata()
+                    return True
+            except OSError:
+                pass
+            # Inode mismatch or path gone — our lock is on a dead inode
+            fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
-            return False
-        self._fd = fd
-        self._write_metadata()
-        return True
+        return False
 
     def release(self) -> None:
-        """Release the lock and remove the lockfile (best-effort)."""
+        """Release the lock (best-effort).
+
+        The lockfile is intentionally **not** deleted.  Deleting it would
+        race with another process that has already opened the same path
+        and is about to ``flock()`` it — the delete would destroy the
+        new holder's lock (flocks are per-inode, and re-creating the
+        file yields a new inode).  Leftover lockfiles are tiny, live on
+        tmpfs, and are harmlessly reused by the next ``acquire()``.
+        """
         if self._fd is None:
             return
         fd = self._fd
@@ -101,10 +132,6 @@ class PortLock:
             pass
         try:
             os.close(fd)
-        except OSError:
-            pass
-        try:
-            self._lock_path.unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -130,6 +157,13 @@ class PortLock:
     def cleanup_stale(cls, lock_dir: Path | None = None) -> int:
         """Remove lockfiles whose holding PID is dead.
 
+        Safety: we only delete a lockfile while holding its flock, so
+        concurrent processes that have opened the same path but not yet
+        called ``flock()`` will see the flock fail (not succeed on a
+        new inode).  After unlinking we keep the fd open briefly so the
+        inode stays alive until we close — any racing ``open()`` on the
+        same path will create a new inode.
+
         Returns the number of stale lockfiles removed.
         """
         d = lock_dir or _default_lock_dir()
@@ -140,26 +174,44 @@ class PortLock:
             return 0
         for path in entries:
             try:
-                data = json.loads(path.read_text())
+                fd = os.open(str(path), os.O_RDWR)
+            except OSError:
+                continue
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                # Someone holds it — not stale
+                os.close(fd)
+                continue
+            # We hold the flock. Check if the recorded PID is dead.
+            try:
+                raw = os.read(fd, 4096)
+                data = json.loads(raw) if raw else {}
                 pid = data.get("pid")
-                if pid is not None and not _pid_alive(pid):
+                if pid is not None and _pid_alive(pid):
+                    # PID is alive but nobody holds the flock — the
+                    # metadata is stale (process forgot to clean up).
+                    # Still safe to remove since we hold the lock.
+                    pass  # fall through to unlink
+                # Either dead PID or no/corrupt metadata — remove it
+                try:
                     path.unlink(missing_ok=True)
                     removed += 1
-            except (OSError, json.JSONDecodeError, ValueError):
-                # Can't read it — try to lock it to check if it's stale
-                try:
-                    fd = os.open(str(path), os.O_RDWR)
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        # We got the lock, so no one holds it — stale
-                        fcntl.flock(fd, fcntl.LOCK_UN)
-                        os.close(fd)
-                        path.unlink(missing_ok=True)
-                        removed += 1
-                    except OSError:
-                        os.close(fd)
                 except OSError:
                     pass
+            except (json.JSONDecodeError, ValueError, OSError):
+                # Corrupt metadata — remove while we hold the lock
+                try:
+                    path.unlink(missing_ok=True)
+                    removed += 1
+                except OSError:
+                    pass
+            finally:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                os.close(fd)
         return removed
 
     # -- Context manager --
