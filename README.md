@@ -163,6 +163,17 @@ with ViceProcess(config) as vice:
 
 `jsr()` writes a small trampoline (`JSR addr; NOP; NOP`) into the cassette buffer at `$0334`, sets a breakpoint after the `JSR`, and polls until the subroutine returns. The CPU is paused when `jsr()` returns, so memory reads are safe. See `examples/direct_memory_test.py` for a complete demo.
 
+Both `jsr()` and `wait_for_pc()` accept a `poll_interval` parameter (default 0.2s) that controls how often the monitor is polled. For long-running computations, increase this to reduce overhead from monitor connections pausing the CPU:
+
+```python
+# Long computation — poll less often to reduce ~13% overhead
+regs = jsr(transport, labels["slow_routine"], timeout=300, poll_interval=2.0)
+
+# Or use HarnessConfig to set it globally
+config = HarnessConfig(exec_poll_interval=2.0)
+regs = jsr(transport, addr, timeout=300, poll_interval=config.exec_poll_interval)
+```
+
 ## Multi-Instance VICE & Parallel Testing
 
 Run tests across multiple concurrent VICE instances:
@@ -276,7 +287,7 @@ config = HarnessConfig.from_env()
 config = HarnessConfig(vice_port=6510, vice_warp=True)
 ```
 
-Key fields: `vice_host`, `vice_port`, `vice_executable`, `vice_prg_path`, `vice_warp`, `vice_sound`, `vice_minimize`, `screen_base`, `vice_port_range_start/end`, `vice_reuse_existing`.
+Key fields: `vice_host`, `vice_port`, `vice_executable`, `vice_prg_path`, `vice_warp`, `vice_sound`, `vice_minimize`, `screen_base`, `vice_port_range_start/end`, `vice_reuse_existing`, `exec_poll_interval`, `screen_poll_interval`.
 
 **Window focus:** VICE windows start minimized by default (`ViceConfig.minimize = True`) to prevent focus stealing during automated test runs. Set `minimize=False` in `ViceConfig` (or `vice_minimize = false` in TOML / `C64TEST_VICE_MINIMIZE=0` in env) if you need visible windows.
 
