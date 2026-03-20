@@ -84,13 +84,24 @@ class TestPortLock:
         lock = PortLock(19009, lock_dir=lock_dir)
         assert lock.read_info() is None
 
-    def test_release_removes_file(self, lock_dir):
+    def test_release_keeps_lockfile(self, lock_dir):
+        """release() does NOT delete the lockfile (prevents inode races)."""
         lock = PortLock(19010, lock_dir=lock_dir)
         lock.acquire()
         lock_path = lock_dir / "port-19010.lock"
         assert lock_path.exists()
         lock.release()
-        assert not lock_path.exists()
+        # File persists — intentional to avoid inode races
+        assert lock_path.exists()
+
+    def test_release_allows_reacquire(self, lock_dir):
+        """After release, another lock on the same port succeeds."""
+        lock1 = PortLock(19013, lock_dir=lock_dir)
+        lock1.acquire()
+        lock1.release()
+        lock2 = PortLock(19013, lock_dir=lock_dir)
+        assert lock2.acquire()
+        lock2.release()
 
     def test_release_without_acquire_is_noop(self, lock_dir):
         lock = PortLock(19011, lock_dir=lock_dir)
@@ -148,6 +159,23 @@ class TestPortLockCrossProcess:
         lock.release()
 
 
+    def test_acquire_survives_unlinked_lockfile(self, lock_dir):
+        """acquire() retries if the lockfile inode was replaced."""
+        # Create a lockfile, then delete it to simulate cleanup_stale()
+        lock_path = lock_dir / "port-19014.lock"
+        lock_path.write_text("{}")
+
+        lock = PortLock(19014, lock_dir=lock_dir)
+        # Even if the file is replaced between open and flock,
+        # acquire should succeed (retry with new inode)
+        assert lock.acquire()
+        # Verify the lock is on the current file
+        fd_stat = os.fstat(lock._fd)
+        path_stat = os.stat(str(lock_path))
+        assert fd_stat.st_ino == path_stat.st_ino
+        lock.release()
+
+
 class TestCleanupStale:
     def test_removes_stale_lockfile(self, lock_dir):
         """Lockfiles from dead PIDs are cleaned up."""
@@ -165,6 +193,33 @@ class TestCleanupStale:
         removed = PortLock.cleanup_stale(lock_dir)
         assert removed == 0
         lock.release()
+
+    def test_cleanup_does_not_break_held_lock(self, lock_dir):
+        """cleanup_stale() cannot remove a lockfile held by another process."""
+        def child(ld, ready_event, proceed_event):
+            child_lock = PortLock(19202, lock_dir=ld)
+            child_lock.acquire()
+            ready_event.set()
+            proceed_event.wait(timeout=10)
+
+        ready = multiprocessing.Event()
+        proceed = multiprocessing.Event()
+        p = multiprocessing.Process(
+            target=child, args=(lock_dir, ready, proceed),
+        )
+        p.start()
+        ready.wait(timeout=5)
+
+        # Child holds the lock — cleanup should not remove it
+        removed = PortLock.cleanup_stale(lock_dir)
+        assert removed == 0
+
+        # We should not be able to acquire it
+        lock = PortLock(19202, lock_dir=lock_dir)
+        assert not lock.acquire()
+
+        proceed.set()
+        p.join(timeout=5)
 
     def test_default_lock_dir_created(self):
         """_default_lock_dir creates the directory."""
