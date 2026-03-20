@@ -59,7 +59,10 @@ class HarnessConfig:
     # Timeouts
     startup_timeout: float = 30.0
     default_wait_timeout: float = 60.0
-    poll_interval: float = 2.0
+
+    # Poll intervals
+    exec_poll_interval: float = 0.2
+    screen_poll_interval: float = 2.0
 
     @classmethod
     def from_toml(cls, path: str | Path) -> HarnessConfig:

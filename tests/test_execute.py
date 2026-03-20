@@ -180,3 +180,17 @@ def test_jsr_trampoline_and_breakpoint():
     assert "delete 5" in t._raw_commands
 
     assert regs["PC"] == 0x0337
+
+
+def test_jsr_custom_poll_interval():
+    """Verify jsr passes poll_interval through to wait_for_pc."""
+    t = PollMockTransport(pc_sequence=[0x0337])
+    t.set_raw_responses(["BREAK: 5  C:$0337"])
+
+    regs = jsr(t, 0xC000, timeout=1.0, scratch_addr=0x0334, poll_interval=1.5)
+
+    assert regs["PC"] == 0x0337
+    # Trampoline still written correctly
+    addr, data = t.written_memory[0]
+    assert addr == 0x0334
+    assert data == [0x20, 0x00, 0xC0, 0xEA, 0xEA]
