@@ -15,6 +15,7 @@ from .verify import PrgFile
 from .execute import load_code, goto, jsr, jsr_poll, wait_for_pc, set_breakpoint, delete_breakpoint, set_register
 from .disk import DiskImage, DiskFormat, FileType, DirEntry, DiskImageError
 from .backends.vice import ViceTransport
+from .backends.vice_binary import BinaryViceTransport
 from .backends.vice_lifecycle import ViceProcess, ViceConfig
 from .backends.hardware import HardwareTransportBase
 from .backends.vice_manager import PortAllocator, ViceInstance, ViceInstanceManager
@@ -70,6 +71,7 @@ __all__ = [
     "DiskImageError",
     # Backends
     "ViceTransport",
+    "BinaryViceTransport",
     "ViceProcess",
     "ViceConfig",
     "HardwareTransportBase",

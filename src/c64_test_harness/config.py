@@ -65,6 +65,16 @@ class HarnessConfig:
     exec_poll_interval: float = 0.2
     screen_poll_interval: float = 2.0
 
+    # Monitor type
+    vice_monitor_type: str = "text"  # "binary" or "text"
+
+    # Ethernet / RR-Net
+    vice_ethernet: bool = False
+    vice_ethernet_mode: str = "rrnet"
+    vice_ethernet_interface: str = ""
+    vice_ethernet_driver: str = ""
+    vice_ethernet_base: int = 0xDE00
+
     @classmethod
     def from_toml(cls, path: str | Path) -> HarnessConfig:
         """Load configuration from a TOML file (e.g., ``c64test.toml``)."""
