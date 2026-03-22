@@ -48,7 +48,7 @@ pytestmark = [
 ]
 
 # Dynamic port allocation to avoid conflicts when running tests in parallel
-_allocator = PortAllocator(port_range_start=6510, port_range_end=6519)
+_allocator = PortAllocator(port_range_start=6600, port_range_end=6620)
 
 MONITOR_TIMEOUT = 30
 TEXT_TIMEOUT = 30

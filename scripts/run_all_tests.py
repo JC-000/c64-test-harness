@@ -4,7 +4,7 @@
 Discovers and runs test files in three phases:
   1. Unit tests — parallel, no external dependencies
   2. Integration tests — parallel, needs c1541
-  3. VICE integration tests — serial, needs x64sc + c1541
+  3. VICE integration tests — parallel, needs x64sc + c1541
 
 Usage:
     python3 scripts/run_all_tests.py
@@ -56,10 +56,10 @@ SUITES: list[TestSuite] = [
     TestSuite("test_keyboard.py",      "unit"),
     TestSuite("test_labels.py",        "unit"),
     TestSuite("test_memory_helpers.py", "unit"),
-    TestSuite("test_memory_parse.py",  "unit"),
     TestSuite("test_parallel.py",      "unit"),
     TestSuite("test_petscii.py",       "unit"),
     TestSuite("test_port_allocator.py","unit"),
+    TestSuite("test_port_lock.py",    "unit"),
     TestSuite("test_runner.py",        "unit"),
     TestSuite("test_screen.py",        "unit"),
     TestSuite("test_screen_codes.py",  "unit"),
@@ -76,11 +76,13 @@ SUITES: list[TestSuite] = [
 
     # ── VICE integration (needs x64sc, uses dynamic ports) ────────
     TestSuite("test_disk_vice.py",     "integration-vice",
-              required_tools=["x64sc", "c1541"], serial=True),
+              required_tools=["x64sc", "c1541"]),
     TestSuite("test_vice_core.py",     "integration-vice",
-              required_tools=["x64sc"], serial=True),
-    TestSuite("test_vice_transport.py","integration-vice",
-              required_tools=["x64sc"], serial=True),
+              required_tools=["x64sc"]),
+    TestSuite("test_vice_binary.py",   "integration-vice",
+              required_tools=["x64sc"]),
+    TestSuite("test_ethernet.py",      "integration-vice",
+              required_tools=["x64sc"]),
 ]
 # fmt: on
 
@@ -367,12 +369,12 @@ def main() -> int:
             )
         )
 
-        # Phase 3: VICE integration tests (serial)
+        # Phase 3: VICE integration tests (parallel with file locks)
         all_results.extend(
             _run_phase(
                 "PHASE 3: VICE Integration",
                 vice_suites,
-                max_workers=1,
+                max_workers=workers,
                 verbose=args.verbose,
                 k_pattern=args.k_pattern,
             )

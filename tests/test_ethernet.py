@@ -129,7 +129,7 @@ def _binary_jsr(
 @pytest.fixture(scope="module")
 def vice_ethernet():
     """Launch VICE with RR-Net on the TAP interface, yield transport."""
-    allocator = PortAllocator(port_range_start=6540, port_range_end=6550)
+    allocator = PortAllocator(port_range_start=6580, port_range_end=6600)
     port = allocator.allocate()
     reservation = allocator.take_socket(port)
     if reservation is not None:
