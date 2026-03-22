@@ -58,8 +58,5 @@ class HardwareTransportBase:
     def resume(self) -> None:
         raise NotImplementedError
 
-    def raw_command(self, cmd: str) -> str:
-        raise NotImplementedError
-
     def close(self) -> None:
         pass

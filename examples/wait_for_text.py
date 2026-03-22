@@ -1,15 +1,27 @@
 #!/usr/bin/env python3
-"""Minimal example: connect to VICE, wait for text, exit."""
+"""Minimal example: connect to VICE binary monitor, wait for text, exit."""
 
-from c64_test_harness import ViceTransport, ScreenGrid, wait_for_text
+import time
 
-transport = ViceTransport()  # localhost:6510
+from c64_test_harness import BinaryViceTransport, ScreenGrid
+
+transport = BinaryViceTransport()  # localhost:6510
 
 print("Waiting for 'READY.' on screen...")
-grid = wait_for_text(transport, "READY.", timeout=30)
+deadline = time.monotonic() + 30
+grid = None
+while time.monotonic() < deadline:
+    g = ScreenGrid.from_transport(transport)
+    if g.has_text("READY."):
+        grid = g
+        break
+    transport.resume()
+    time.sleep(1.0)
 
 if grid:
     print("Found! Screen contents:")
     print(grid.text())
 else:
     print("Timed out.")
+
+transport.close()

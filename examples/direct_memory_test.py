@@ -10,11 +10,13 @@ Demonstrates the full workflow without any PRG file:
 Requires ``x64sc`` on PATH.
 """
 
+import time
+
 from c64_test_harness import (
     ViceProcess,
     ViceConfig,
-    ViceTransport,
-    wait_for_text,
+    BinaryViceTransport,
+    ScreenGrid,
     load_code,
     jsr,
     read_bytes,
@@ -34,6 +36,34 @@ passed = 0
 failed = 0
 
 
+def connect_binary_transport(port, timeout=30.0, proc=None):
+    """Connect to VICE binary monitor with retries."""
+    deadline = time.monotonic() + timeout
+    last_err = None
+    while time.monotonic() < deadline:
+        if proc is not None and proc._proc is not None and proc._proc.poll() is not None:
+            raise RuntimeError("VICE process exited during binary monitor connect")
+        try:
+            return BinaryViceTransport(port=port)
+        except Exception as e:
+            last_err = e
+            time.sleep(1)
+    raise ConnectionError(f"Could not connect to binary monitor on port {port}: {last_err}")
+
+
+def wait_for_text_binary(transport, needle, timeout=15.0, poll_interval=1.0):
+    """Wait for text on screen, resuming CPU between reads (binary monitor)."""
+    needle_upper = needle.upper()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        grid = ScreenGrid.from_transport(transport)
+        if needle_upper in grid.continuous_text().upper():
+            return grid
+        transport.resume()
+        time.sleep(poll_interval)
+    return None
+
+
 def check(name: str, expected: int, actual: int) -> None:
     global passed, failed
     if actual == expected:
@@ -48,10 +78,10 @@ config = ViceConfig(warp=True, sound=False)
 
 with ViceProcess(config) as vice:
     vice.start()
-    transport = ViceTransport(port=config.port)
+    transport = connect_binary_transport(port=config.port, proc=vice)
 
     # Wait for BASIC prompt
-    wait_for_text(transport, "READY.", timeout=30)
+    wait_for_text_binary(transport, "READY.", timeout=30)
     print("C64 booted, BASIC READY.")
 
     # Load subroutine into RAM
@@ -88,3 +118,5 @@ with ViceProcess(config) as vice:
         print("All tests passed!")
     else:
         print(f"{failed} test(s) failed, {passed} passed.")
+
+    transport.close()

@@ -1,14 +1,13 @@
 # c64-test-harness
 
-Reusable test harness for Commodore 64 programs. Automates C64 programs via the VICE emulator's remote monitor, with an architecture that supports real hardware backends.
+Reusable test harness for Commodore 64 programs. Automates C64 programs via the VICE emulator's binary monitor protocol, with an architecture that supports real hardware backends.
 
 ## Features
 
 - **Transport abstraction** (`C64Transport` Protocol) — write tests once, run on VICE or hardware
+- **Binary monitor transport** — persistent TCP connection via VICE's binary monitor protocol (~0.08ms per command, no write size limits, async breakpoint events)
 - **Wrap-aware screen matching** — search for text that spans 40-column row boundaries
 - **Fast keyboard injection** — batched writes to the keyboard buffer (10x faster than per-character)
-- **Robust VICE monitor parsing** — works around known VICE text monitor bugs
-- **Reliable large memory access** — automatic chunking for reads >256 bytes and writes >84 bytes
 - **Little-endian helpers** — `read_word_le()` / `read_dword_le()` for 6502's native byte order
 - **PRG binary verification** — compare runtime memory against a PRG file to detect corruption
 - **Complete PETSCII/screen code tables** — full 256-entry mappings with extensibility
@@ -32,21 +31,35 @@ Requires Python 3.10+. Zero runtime dependencies.
 ## Quick Start
 
 ```python
+import time
 from c64_test_harness import (
-    ViceTransport, ViceProcess, ViceConfig,
-    ScreenGrid, wait_for_text, wait_for_stable, send_text, send_key,
+    BinaryViceTransport, ViceProcess, ViceConfig,
+    ScreenGrid, send_text, send_key,
     read_bytes, read_word_le, write_bytes,
 )
 
-# Launch VICE
+# Launch VICE (always uses binary monitor protocol)
 config = ViceConfig(prg_path="build/mygame.prg")
 with ViceProcess(config) as vice:
-    vice.wait_for_monitor()
-    transport = ViceTransport(port=config.port)
+    # Connect with retries (binary monitor needs a moment to start)
+    transport = None
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            transport = BinaryViceTransport(port=config.port)
+            break
+        except Exception:
+            time.sleep(1)
 
-    # Wait for the title screen
-    grid = wait_for_text(transport, "PRESS START")
-    assert grid is not None
+    # Wait for the title screen (binary monitor auto-pauses CPU,
+    # so resume between screen reads to let the C64 run)
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        grid = ScreenGrid.from_transport(transport)
+        if grid.has_text("PRESS START"):
+            break
+        transport.resume()
+        time.sleep(1.0)
 
     # Send keyboard input (batched)
     send_text(transport, "HELLO\r")
@@ -62,31 +75,32 @@ with ViceProcess(config) as vice:
     # Extract data between markers
     value = grid.extract_between("SCORE: ", " ")
 
-    # Wait for screen to stabilise (stops changing)
-    stable = wait_for_stable(transport, timeout=10, stable_count=3)
-
-    # Read memory (auto-chunks for large reads)
+    # Read memory (no chunking needed — binary monitor has no size limits)
     data = read_bytes(transport, 0x4000, 512)
 
     # Read 6502 little-endian values
     length = read_word_le(transport, 0xC000)
+
+    transport.close()
 ```
+
+**Binary monitor note:** The binary monitor auto-pauses the CPU when any command is sent. Screen and keyboard operations need explicit `transport.resume()` calls between reads so the C64 can process keystrokes and update the screen. The `_wait_for_text_binary()` pattern shown in `tests/test_vice_core.py` demonstrates this.
 
 ## Memory Helpers
 
 ```python
 from c64_test_harness import read_bytes, read_word_le, read_dword_le, write_bytes
 
-# read_bytes auto-chunks reads >256 bytes for reliability
+# read_bytes — no chunking needed with binary monitor
 der_data = read_bytes(transport, der_buf_addr, 512)
 
 # Little-endian readers for 6502's native byte order
 length = read_word_le(transport, length_addr)     # 16-bit
 counter = read_dword_le(transport, counter_addr)   # 32-bit
 
-# write_bytes auto-chunks writes >84 bytes (VICE text monitor limit)
+# write_bytes — no size limits with binary monitor
 write_bytes(transport, 0x1000, [0xDE, 0xAD, 0xBE, 0xEF])
-write_bytes(transport, 0xC000, bytes(256))  # large writes handled transparently
+write_bytes(transport, 0xC000, bytes(4096))  # large writes handled natively
 ```
 
 ## PRG Binary Verification
@@ -115,9 +129,10 @@ if result:
 Load 6502 machine code directly into VICE memory, execute subroutines, and inspect results — no PRG files needed:
 
 ```python
+import time
 from c64_test_harness import (
-    ViceProcess, ViceConfig, ViceTransport,
-    wait_for_text, load_code, jsr, read_bytes,
+    BinaryViceTransport, ViceProcess, ViceConfig,
+    ScreenGrid, load_code, jsr, read_bytes,
     set_breakpoint, delete_breakpoint, set_register, goto,
 )
 
@@ -129,9 +144,15 @@ code = bytes([0xAD, 0x00, 0xC1,   # LDA $C100
 
 config = ViceConfig(warp=True, sound=False)
 with ViceProcess(config) as vice:
-    vice.start()
-    transport = ViceTransport(port=config.port)
-    wait_for_text(transport, "READY.", timeout=30)
+    # Connect binary transport with retry
+    transport = None
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            transport = BinaryViceTransport(port=config.port)
+            break
+        except Exception:
+            time.sleep(1)
 
     # Load code and data directly into RAM
     load_code(transport, 0xC000, code)
@@ -147,6 +168,8 @@ with ViceProcess(config) as vice:
     transport.write_memory(0xC100, bytes([84]))
     jsr(transport, 0xC000)
     assert read_bytes(transport, 0xC101, 1)[0] == 42
+
+    transport.close()
 ```
 
 ### Functions
@@ -154,25 +177,17 @@ with ViceProcess(config) as vice:
 | Function | Description |
 |----------|-------------|
 | `load_code(transport, addr, code)` | Write machine code into memory (semantic alias for `write_memory`) |
-| `set_register(transport, name, value)` | Set a CPU register (A/X/Y/SP/PC) |
+| `set_register(transport, name, value)` | Set a CPU register (A/X/Y/SP/PC) via `set_registers()` |
 | `goto(transport, addr)` | Set PC and resume execution |
-| `set_breakpoint(transport, addr) -> int` | Set execution breakpoint, returns breakpoint ID |
-| `delete_breakpoint(transport, bp_id)` | Remove a breakpoint |
-| `wait_for_pc(transport, addr)` | Poll until PC reaches addr (with timeout) |
+| `set_breakpoint(transport, addr) -> int` | Set execution checkpoint, returns checkpoint ID |
+| `delete_breakpoint(transport, bp_id)` | Remove a checkpoint |
+| `wait_for_pc(transport, addr)` | Wait for CPU to stop at addr (uses async stopped events) |
 | `jsr(transport, addr)` | Call a subroutine and wait for RTS (uses trampoline at `$0334`) |
+| `jsr_poll(transport, addr)` | Flag-based alternative for long-running subroutines |
 
-`jsr()` writes a small trampoline (`JSR addr; NOP; NOP`) into the cassette buffer at `$0334`, sets a breakpoint after the `JSR`, and polls until the subroutine returns. The CPU is paused when `jsr()` returns, so memory reads are safe. See `examples/direct_memory_test.py` for a complete demo.
+`jsr()` writes a small trampoline (`JSR addr; NOP; NOP`) into the cassette buffer at `$0334`, sets a checkpoint after the `JSR`, resumes execution, and waits for the CPU to stop. The CPU is paused when `jsr()` returns, so memory reads are safe. See `examples/direct_memory_test.py` for a complete demo.
 
-Both `jsr()` and `wait_for_pc()` accept a `poll_interval` parameter (default 0.2s) that controls how often the monitor is polled. For long-running computations, increase this to reduce overhead from monitor connections pausing the CPU:
-
-```python
-# Long computation — poll less often to reduce ~13% overhead
-regs = jsr(transport, labels["slow_routine"], timeout=300, poll_interval=2.0)
-
-# Or use HarnessConfig to set it globally
-config = HarnessConfig(exec_poll_interval=2.0)
-regs = jsr(transport, addr, timeout=300, poll_interval=config.exec_poll_interval)
-```
+`jsr_poll()` is an alternative for long-running subroutines (e.g. heavy computation in warp mode). It uses a memory flag instead of breakpoints, polling until the flag is set. This avoids VICE monitor unresponsiveness during warp-mode computation. It accepts a `poll_interval` parameter (default 0.5s) to control the trade-off between responsiveness and overhead.
 
 ## Multi-Instance VICE & Parallel Testing
 
@@ -188,7 +203,8 @@ config = ViceConfig(prg_path="build/mygame.prg", warp=True)
 with ViceInstanceManager(config, port_range_start=6510, port_range_end=6515) as mgr:
     # Context-managed instance (auto-release)
     with mgr.instance() as inst:
-        grid = wait_for_text(inst.transport, "READY")
+        # inst.transport is a BinaryViceTransport
+        regs = inst.transport.read_registers()
 
     # Or run tests in parallel across the pool
     tests = [
@@ -199,7 +215,7 @@ with ViceInstanceManager(config, port_range_start=6510, port_range_end=6515) as 
     result.print_summary()
 ```
 
-`PortAllocator` manages thread-safe port assignment with dual-layer protection: OS-level `bind()` reservations and file-based `flock()` locks (`PortLock`). The file lock bridges the TOCTOU gap between closing the reservation socket and VICE binding to the port, making overlapping startup from independent processes completely safe. `ViceInstanceManager` handles the full lifecycle: allocate port, acquire file lock, launch VICE, verify PID ownership, connect transport, and clean up on release. Failed acquisitions retry with exponential backoff (configurable via `max_retries`). When multiple VICE instances launch simultaneously, some may crash due to X11/GTK resource contention — `wait_for_monitor()` detects early process exit within ~1 second and the retry logic recovers automatically. Set `reuse_existing=True` to adopt already-running VICE instances instead of launching new ones. Stress-tested with 3 concurrent agents × 6 workers across 5 phases (lock contention, VICE startup, mixed workloads, crash recovery, port exhaustion) with zero failures — see `scripts/stress_cross_process.py`.
+`PortAllocator` manages thread-safe port assignment with dual-layer protection: OS-level `bind()` reservations and file-based `flock()` locks (`PortLock`). The file lock bridges the TOCTOU gap between closing the reservation socket and VICE binding to the port, making overlapping startup from independent processes completely safe. `ViceInstanceManager` handles the full lifecycle: allocate port, acquire file lock, launch VICE, connect binary transport with retries, verify PID ownership, and clean up on release. Failed acquisitions retry with exponential backoff (configurable via `max_retries`). Set `reuse_existing=True` to adopt already-running VICE instances instead of launching new ones. Stress-tested with 3 concurrent agents × 6 workers across 5 phases (lock contention, VICE startup, mixed workloads, crash recovery, port exhaustion) with zero failures — see `scripts/stress_cross_process.py`.
 
 Each `ViceInstance` exposes a `.pid` property (the OS process ID of the VICE process), and `SingleTestResult` includes the `.pid` of the instance that ran each test. This allows callers to track and manage only their own VICE processes — essential when multiple agents run tests concurrently.
 
@@ -231,8 +247,8 @@ for entry in disk.list_files():
 # Attach disk image to VICE automatically
 config = ViceConfig(prg_path="build/app.prg", disk_image=disk)
 with ViceProcess(config) as vice:
-    vice.wait_for_monitor()
     # VICE drive 8 is attached with correct drive type (1541/1571/1581)
+    ...
 ```
 
 Requires `c1541` (included with VICE). No additional Python dependencies. Filenames and disk names are validated against the CBM 16-character limit — a `ValueError` is raised immediately for names that are too long, rather than passing them to c1541. The `FileType` enum covers all standard CBM types: `PRG`, `SEQ`, `USR`, `REL`, and `DEL`. Parent directories are created automatically when calling `DiskImage.create()`.
@@ -295,7 +311,7 @@ Key fields: `vice_host`, `vice_port`, `vice_executable`, `vice_prg_path`, `vice_
 
 ```
 C64Transport (Protocol)
-  +-- ViceTransport      (VICE TCP monitor)
+  +-- BinaryViceTransport  (VICE binary monitor, persistent TCP)
   +-- HardwareTransportBase  (extension point for real hardware)
 
 ViceInstanceManager
@@ -350,10 +366,10 @@ python3 scripts/run_all_tests.py --workers 4
 python3 scripts/run_all_tests.py -k "test_config"
 ```
 
-The test runner organises 23 test files into three phases:
-1. **Unit tests** (19 files) — run in parallel, no external dependencies
-2. **Integration tests** (1 file) — needs `c1541` on PATH
-3. **VICE integration tests** (3 files) — needs `x64sc` + `c1541`, runs serially
+The test runner organises test files into three phases:
+1. **Unit tests** — run in parallel, no external dependencies
+2. **Integration tests** — needs `c1541` on PATH
+3. **VICE integration tests** — needs `x64sc` + `c1541`, runs serially
 
 Suites with missing tools are skipped automatically. You can also run tests directly with pytest:
 
@@ -361,7 +377,7 @@ Suites with missing tools are skipped automatically. You can also run tests dire
 pytest                                   # unit tests only (no VICE needed)
 pytest tests/test_disk_vice.py -v        # VICE disk I/O integration tests
 pytest tests/test_vice_core.py -v        # VICE core module integration tests
-pytest tests/test_vice_transport.py -v   # VICE transport protocol tests
+pytest tests/test_vice_binary.py -v      # VICE binary monitor protocol tests
 ```
 
 ## License

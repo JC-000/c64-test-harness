@@ -40,8 +40,6 @@ def test_all_abstract_methods_raise():
         h.read_registers()
     with pytest.raises(NotImplementedError):
         h.resume()
-    with pytest.raises(NotImplementedError):
-        h.raw_command("help")
 
 
 def test_close_is_noop():
