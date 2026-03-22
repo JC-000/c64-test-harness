@@ -75,13 +75,15 @@ pytestmark = [
 CODE_BASE = 0xC000
 DATA_BASE = 0xC100
 
-# CS8900a I/O registers (RR-Net at $DE00)
-RRNET_BASE = 0xDE00
-RTDATA = RRNET_BASE + 0x00      # RX/TX data port (16-bit)
-TXCMD = RRNET_BASE + 0x04       # TX command (16-bit)
-TXLEN = RRNET_BASE + 0x06       # TX length (16-bit)
-PPTR = RRNET_BASE + 0x0A        # PacketPage Pointer (16-bit)
-PPDATA = RRNET_BASE + 0x0C      # PacketPage Data (16-bit)
+# CS8900a I/O registers (TFE mode at $DE00)
+# Note: RR-Net mode shifts all registers by +2 ($DE02 base).  TFE mode
+# uses the standard CS8900a layout at the configured base address.
+CS8900A_BASE = 0xDE00
+RTDATA = CS8900A_BASE + 0x00    # RX/TX data port (16-bit)
+TXCMD = CS8900A_BASE + 0x04     # TX command (16-bit)
+TXLEN = CS8900A_BASE + 0x06     # TX length (16-bit)
+PPTR = CS8900A_BASE + 0x0A      # PacketPage Pointer (16-bit)
+PPDATA = CS8900A_BASE + 0x0C    # PacketPage Data (16-bit)
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +167,7 @@ def vice_ethernet():
         warp=False,  # warp can cause timing issues with ethernet
         sound=False,
         ethernet=True,
-        ethernet_mode="rrnet",
+        ethernet_mode="tfe",
         ethernet_interface=TAP_IFACE or "tap-c64",
         ethernet_driver="tuntap",
     )
@@ -308,7 +310,7 @@ class TestEthernetTX:
             0x8D, 0x01, 0xDE,  # STA $DE01
             0xC8,              # INY
             0xC0, 0x40,        # CPY #$40       ; 64 bytes done?
-            0xD0, 0xF2,        # BNE .loop      (-14 -> back to LDA ($FB),Y)
+            0xD0, 0xF0,        # BNE .loop      (-16 -> back to LDA ($FB),Y)
 
             # Store success flag
             0xA9, 0x01,        # LDA #$01
@@ -396,7 +398,7 @@ class TestEthernetRX:
             # .poll:
             0xAD, 0x0D, 0xDE,  # LDA $DE0D  (PP Data high = RxEvent high)
             0x29, 0x01,        # AND #$01   (bit 8 = RxOK)
-            0xD0, 0x0F,        # BNE .got_packet (+15)
+            0xD0, 0x0E,        # BNE .got_packet (+14)
 
             # Decrement timeout
             0xC6, 0xFD,        # DEC $FD
