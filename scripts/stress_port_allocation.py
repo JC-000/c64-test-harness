@@ -46,6 +46,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 from c64_test_harness.backends.vice_manager import PortAllocator
+from c64_test_harness.backends.vice_binary import BinaryViceTransport
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +201,7 @@ def _vice_worker(
     port_start: int,
     port_end: int,
     startup_delay: float,
+    monitor_type: str = "text",
 ) -> dict:
     """Allocate port, start VICE, wait for monitor, clean up."""
     t0 = time.monotonic()
@@ -223,12 +225,33 @@ def _vice_worker(
         if reservation is not None:
             reservation.close()
 
-        config = ViceConfig(port=port, warp=True, sound=False, minimize=True)
+        config = ViceConfig(
+            port=port, warp=True, sound=False, minimize=True,
+            monitor_type=monitor_type,
+        )
         proc = ViceProcess(config)
         proc.start()
         pid = proc.pid
 
-        monitor_ready = proc.wait_for_monitor(timeout=20.0)
+        if monitor_type == "binary":
+            # Binary monitor: connect directly with retries (no TCP probe).
+            # The persistent connection IS the monitor session.
+            import socket as _socket
+            deadline = time.monotonic() + 20.0
+            transport = None
+            while time.monotonic() < deadline:
+                if proc._proc is not None and proc._proc.poll() is not None:
+                    break
+                try:
+                    transport = BinaryViceTransport(port=port, timeout=5.0)
+                    break
+                except Exception:
+                    time.sleep(1)
+            monitor_ready = transport is not None
+            if transport is not None:
+                transport.close()
+        else:
+            monitor_ready = proc.wait_for_monitor(timeout=20.0)
 
         proc.stop()
         alloc.release(port)
@@ -271,6 +294,7 @@ def run_vice_round(
     delay: float,
     round_num: int,
     verbose: bool,
+    monitor_type: str = "text",
 ) -> ViceRoundSummary:
     """Spawn workers, start VICE, collect results."""
     wall_start = time.monotonic()
@@ -281,7 +305,7 @@ def run_vice_round(
         for i in range(num_workers):
             f = pool.apply_async(
                 _vice_worker,
-                args=(i, port_start, port_end, delay),
+                args=(i, port_start, port_end, delay, monitor_type),
             )
             futures.append(f)
 
@@ -339,10 +363,12 @@ def run_vice_phase(
     delays: list[float],
     rounds: int,
     verbose: bool,
+    monitor_type: str = "text",
 ) -> list[ViceRoundSummary]:
     """Run VICE startup tests across multiple delays."""
+    label = "binary" if monitor_type == "binary" else "text"
     print(f"\n{'='*70}")
-    print("PHASE 2: VICE Startup Race")
+    print(f"PHASE 2: VICE Startup Race ({label} monitor)")
     print(f"{'='*70}")
     print(f"  {num_workers} workers, ports {port_start}-{port_end - 1}")
     print(f"  Delays: {delays}, {rounds} rounds each\n")
@@ -361,6 +387,7 @@ def run_vice_phase(
                 delay=delay,
                 round_num=rnd,
                 verbose=verbose,
+                monitor_type=monitor_type,
             )
             all_summaries.append(summary)
 
@@ -398,11 +425,14 @@ def main() -> None:
                         help="Comma-separated inter-worker delays for VICE phase")
     parser.add_argument("--skip-vice", action="store_true",
                         help="Run allocation phase only (no VICE needed)")
+    parser.add_argument("--binary", action="store_true",
+                        help="Use binary monitor (-binarymonitor) instead of text monitor")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
     port_range = args.port_end - args.port_start
     delays = [float(d) for d in args.delays.split(",")]
+    monitor_type = "binary" if args.binary else "text"
 
     print("Cross-process port allocation stress test")
     print(f"  Workers: {args.workers}")
@@ -410,6 +440,7 @@ def main() -> None:
     print(f"  Rounds: {args.rounds}")
     print(f"  VICE: {'skipped' if args.skip_vice else 'enabled'}")
     if not args.skip_vice:
+        print(f"  Monitor: {monitor_type}")
         print(f"  VICE delays: {delays}")
     print()
 
@@ -439,6 +470,7 @@ def main() -> None:
                 delays=delays,
                 rounds=args.rounds,
                 verbose=args.verbose,
+                monitor_type=monitor_type,
             )
 
     # -----------------------------------------------------------------------
