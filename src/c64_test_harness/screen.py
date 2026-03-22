@@ -141,6 +141,8 @@ def wait_for_text(
                 on_progress(elapsed, last)
         except Exception:
             pass
+            continue
+        transport.resume()  # Let CPU run during sleep (binary monitor auto-pauses)
         time.sleep(poll_interval)
 
 
@@ -175,4 +177,6 @@ def wait_for_stable(
                 prev_text = current
         except Exception:
             pass
+            continue
+        transport.resume()  # Let CPU run during sleep (binary monitor auto-pauses)
         time.sleep(poll_interval)

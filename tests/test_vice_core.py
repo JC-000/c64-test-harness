@@ -43,23 +43,6 @@ pytestmark = pytest.mark.skipif(
 CODE_BASE = 0xC000
 DATA_BASE = 0xC100
 
-def _wait_for_text_binary(transport, needle, timeout=15.0, poll_interval=1.0):
-    """Poll screen for *needle*, resuming the CPU between reads.
-
-    The binary monitor auto-pauses the CPU when any command is sent.
-    This helper resumes the CPU after each screen read so the KERNAL
-    can continue updating the screen.
-    """
-    needle_upper = needle.upper()
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        grid = ScreenGrid.from_transport(transport)
-        if needle_upper in grid.continuous_text().upper():
-            return grid
-        transport.resume()
-        time.sleep(poll_interval)
-    return None
-
 
 def _restore_basic(transport):
     """Return CPU to the BASIC idle loop.
@@ -212,8 +195,8 @@ class TestScreen:
     """Test screen.py functions against real VICE.
 
     The binary monitor auto-pauses the CPU on each command.  Screen tests
-    use _restore_basic() and _wait_for_text_binary() which explicitly
-    resume the CPU between operations.
+    use _restore_basic() to return to BASIC, and wait_for_text() which
+    now resumes the CPU between polls automatically.
     """
 
     @pytest.fixture(autouse=True)
@@ -234,7 +217,7 @@ class TestScreen:
         send_text(binary_transport, 'PRINT"HELLO VICE"\r')
         # Resume so BASIC processes the keystrokes
         binary_transport.resume()
-        grid = _wait_for_text_binary(binary_transport, "HELLO VICE", timeout=15)
+        grid = wait_for_text(binary_transport, "HELLO VICE", timeout=15, verbose=False)
         assert grid is not None, "HELLO VICE not found on screen"
 
     def test_wait_for_stable_on_idle(self, binary_transport) -> None:
@@ -262,7 +245,7 @@ class TestKeyboard:
 
     Keyboard tests inject keystrokes and verify screen output.  After
     injecting keys, we resume the CPU so BASIC can process them, then
-    use _wait_for_text_binary() which resumes between screen polls.
+    use wait_for_text() which resumes between screen polls.
     """
 
     @pytest.fixture(autouse=True)
@@ -277,7 +260,7 @@ class TestKeyboard:
         """send_text PRINT 2+3, verify '5' appears on screen."""
         send_text(binary_transport, "PRINT 2+3\r")
         binary_transport.resume()
-        grid = _wait_for_text_binary(binary_transport, "5", timeout=15)
+        grid = wait_for_text(binary_transport, "5", timeout=15, verbose=False)
         assert grid is not None, "'5' not found on screen after PRINT 2+3"
 
     def test_send_key_single_chars(self, binary_transport) -> None:
@@ -285,7 +268,7 @@ class TestKeyboard:
         for ch in "PRINT 7\r":
             send_key(binary_transport, ch)
         binary_transport.resume()
-        grid = _wait_for_text_binary(binary_transport, "7", timeout=15)
+        grid = wait_for_text(binary_transport, "7", timeout=15, verbose=False)
         assert grid is not None
 
     def test_send_text_long_batching(self, binary_transport) -> None:
@@ -293,8 +276,8 @@ class TestKeyboard:
         cmd = 'PRINT"ABCDEFGHIJKLMNOPQRST"\r'
         send_text(binary_transport, cmd)
         binary_transport.resume()
-        grid = _wait_for_text_binary(binary_transport, "ABCDEFGHIJKLMNOPQRST",
-                                     timeout=15)
+        grid = wait_for_text(binary_transport, "ABCDEFGHIJKLMNOPQRST",
+                             timeout=15, verbose=False)
         assert grid is not None, "Long string not found on screen"
 
     def test_send_text_return_key(self, binary_transport) -> None:

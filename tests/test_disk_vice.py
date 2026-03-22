@@ -9,10 +9,11 @@ The binary monitor protocol uses a persistent TCP connection.  The CPU stays
 stopped between commands, so screen polling helpers must call ``resume()``
 between reads to let the CPU run and update the screen.
 
-The ``_binary_wait_for_text()`` and ``_binary_wait_for_load_complete()``
-helpers below handle this by calling ``transport.resume()`` before each
-screen read.  Similarly, ``_binary_send_text()`` resumes the CPU after
-injecting keys so BASIC can process them.
+The library's ``wait_for_text()`` now handles this automatically by calling
+``transport.resume()`` between polls.  The ``_binary_wait_for_load_complete()``
+helper uses a custom condition (checking LOADING+READY sequence) so it
+remains local.  ``_binary_send_text()`` resumes the CPU after injecting
+keys so BASIC can process them.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from c64_test_harness.backends.vice_manager import PortAllocator
 from c64_test_harness.disk import DiskImage, FileType
 from c64_test_harness.keyboard import send_text
 from c64_test_harness.memory import read_bytes, read_word_le, write_bytes
-from c64_test_harness.screen import ScreenGrid
+from c64_test_harness.screen import ScreenGrid, wait_for_text
 from c64_test_harness.transport import TransportError
 
 from conftest import connect_binary_transport
@@ -58,35 +59,6 @@ TEXT_TIMEOUT = 30
 # ======================================================================
 
 
-
-def _binary_wait_for_text(
-    transport: BinaryViceTransport,
-    needle: str,
-    timeout: float = TEXT_TIMEOUT,
-    poll_interval: float = 2.0,
-) -> ScreenGrid | None:
-    """Wait until *needle* appears on screen, resuming between polls.
-
-    Unlike ``wait_for_text()`` (which assumes the text-monitor reconnect
-    model), this helper explicitly resumes the CPU before each poll so the
-    C64 can make progress while we sleep.
-    """
-    needle_upper = needle.upper()
-    start = time.monotonic()
-    while True:
-        elapsed = time.monotonic() - start
-        if elapsed >= timeout:
-            return None
-        try:
-            # Resume CPU so the C64 can execute during the sleep interval
-            transport.resume()
-            time.sleep(poll_interval)
-            # Read screen (this pauses the CPU via the binary protocol)
-            grid = ScreenGrid.from_transport(transport)
-            if needle_upper in grid.continuous_text().upper():
-                return grid
-        except Exception:
-            time.sleep(poll_interval)
 
 
 def _binary_wait_for_load_complete(
@@ -377,8 +349,8 @@ class TestPrgLoad:
                 transport = connect_binary_transport(port, proc=vice)
                 try:
                     # Wait for BASIC READY prompt
-                    grid = _binary_wait_for_text(
-                        transport, "READY.", timeout=TEXT_TIMEOUT,
+                    grid = wait_for_text(
+                        transport, "READY.", timeout=TEXT_TIMEOUT, verbose=False,
                     )
                     assert grid is not None, "BASIC READY prompt not found"
 
@@ -389,8 +361,8 @@ class TestPrgLoad:
 
                     # RUN
                     _binary_send_text(transport, "RUN\r")
-                    grid = _binary_wait_for_text(
-                        transport, signature, timeout=TEXT_TIMEOUT,
+                    grid = wait_for_text(
+                        transport, signature, timeout=TEXT_TIMEOUT, verbose=False,
                     )
                     assert grid is not None, \
                         f"Signature '{signature}' not found on screen"
@@ -435,8 +407,8 @@ class TestSeqRead:
             with ViceProcess(config) as vice:
                 transport = connect_binary_transport(port, proc=vice)
                 try:
-                    grid = _binary_wait_for_text(
-                        transport, "READY.", timeout=TEXT_TIMEOUT,
+                    grid = wait_for_text(
+                        transport, "READY.", timeout=TEXT_TIMEOUT, verbose=False,
                     )
                     assert grid is not None, "BASIC READY prompt not found"
 
@@ -447,8 +419,8 @@ class TestSeqRead:
 
                     # Run reader -- it displays "IDLE" when ready
                     _binary_send_text(transport, "RUN\r")
-                    grid = _binary_wait_for_text(
-                        transport, "IDLE", timeout=TEXT_TIMEOUT,
+                    grid = wait_for_text(
+                        transport, "IDLE", timeout=TEXT_TIMEOUT, verbose=False,
                     )
                     assert grid is not None, \
                         "Reader program did not display IDLE on screen"
@@ -457,8 +429,8 @@ class TestSeqRead:
                     write_bytes(transport, 0x033C, [0x01])
                     transport.resume()
 
-                    grid = _binary_wait_for_text(
-                        transport, "DONE", timeout=TEXT_TIMEOUT,
+                    grid = wait_for_text(
+                        transport, "DONE", timeout=TEXT_TIMEOUT, verbose=False,
                     )
                     assert grid is not None, \
                         "DONE not found -- SEQ read may have failed"
@@ -522,8 +494,8 @@ class TestSeqModify:
             with ViceProcess(config) as vice:
                 transport = connect_binary_transport(port, proc=vice)
                 try:
-                    grid = _binary_wait_for_text(
-                        transport, "READY.", timeout=TEXT_TIMEOUT,
+                    grid = wait_for_text(
+                        transport, "READY.", timeout=TEXT_TIMEOUT, verbose=False,
                     )
                     assert grid is not None, "BASIC READY prompt not found"
 
@@ -532,8 +504,8 @@ class TestSeqModify:
                     assert grid is not None, "LOAD did not complete"
 
                     _binary_send_text(transport, "RUN\r")
-                    grid = _binary_wait_for_text(
-                        transport, "IDLE", timeout=TEXT_TIMEOUT,
+                    grid = wait_for_text(
+                        transport, "IDLE", timeout=TEXT_TIMEOUT, verbose=False,
                     )
                     assert grid is not None, \
                         "Reader program did not display IDLE on screen"
@@ -542,8 +514,8 @@ class TestSeqModify:
                     write_bytes(transport, 0x033C, [0x01])
                     transport.resume()
 
-                    grid = _binary_wait_for_text(
-                        transport, "DONE", timeout=TEXT_TIMEOUT,
+                    grid = wait_for_text(
+                        transport, "DONE", timeout=TEXT_TIMEOUT, verbose=False,
                     )
                     assert grid is not None, \
                         "DONE not found -- SEQ read may have failed"

@@ -21,7 +21,6 @@ class TestDefaults:
 
     def test_poll_interval_defaults(self):
         cfg = HarnessConfig()
-        assert cfg.exec_poll_interval == 0.2
         assert cfg.screen_poll_interval == 2.0
 
 
@@ -42,10 +41,8 @@ class TestFromEnv:
         assert cfg.vice_timeout == 10.5
 
     def test_override_poll_intervals(self, monkeypatch):
-        monkeypatch.setenv("C64TEST_EXEC_POLL_INTERVAL", "1.0")
         monkeypatch.setenv("C64TEST_SCREEN_POLL_INTERVAL", "0.5")
         cfg = HarnessConfig.from_env()
-        assert cfg.exec_poll_interval == 1.0
         assert cfg.screen_poll_interval == 0.5
 
     def test_override_string(self, monkeypatch):
