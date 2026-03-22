@@ -183,11 +183,8 @@ with ViceProcess(config) as vice:
 | `delete_breakpoint(transport, bp_id)` | Remove a checkpoint |
 | `wait_for_pc(transport, addr)` | Wait for CPU to stop at addr (uses async stopped events) |
 | `jsr(transport, addr)` | Call a subroutine and wait for RTS (uses trampoline at `$0334`) |
-| `jsr_poll(transport, addr)` | Flag-based alternative for long-running subroutines |
 
-`jsr()` writes a small trampoline (`JSR addr; NOP; NOP`) into the cassette buffer at `$0334`, sets a checkpoint after the `JSR`, resumes execution, and waits for the CPU to stop. The CPU is paused when `jsr()` returns, so memory reads are safe. See `examples/direct_memory_test.py` for a complete demo.
-
-`jsr_poll()` is an alternative for long-running subroutines (e.g. heavy computation in warp mode). It uses a memory flag instead of breakpoints, polling until the flag is set. This avoids VICE monitor unresponsiveness during warp-mode computation. It accepts a `poll_interval` parameter (default 0.5s) to control the trade-off between responsiveness and overhead.
+`jsr()` writes a small trampoline (`JSR addr; NOP; NOP`) into the cassette buffer at `$0334`, sets a checkpoint after the `JSR`, resumes execution, and waits for the CPU to stop via async event. The CPU is paused when `jsr()` returns, so memory reads are safe. Works reliably even for long-running computations in warp mode. See `examples/direct_memory_test.py` for a complete demo.
 
 ## Multi-Instance VICE & Parallel Testing
 
