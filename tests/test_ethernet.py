@@ -4,7 +4,7 @@ Validates that VICE can emulate the CS8900a ethernet chip via the RR-Net
 cartridge mode, connected to a host TAP interface.  Tests probe the chip
 ID register and exercise TX/RX packet I/O.
 
-Uses BinaryViceTransport (-binarymonitor) instead of the text monitor.
+Uses BinaryViceTransport (-binarymonitor) for all VICE communication.
 
 Requirements:
 - x64sc on PATH with ethernet cartridge support
@@ -14,15 +14,11 @@ Requirements:
 
 All tests are skipped automatically if prerequisites are missing.
 
-NOTE: Binary transport compatibility
--------------------------------------
-The ``jsr()`` helper from ``execute.py`` uses ``raw_command()`` for breakpoints,
-which raises ``NotImplementedError`` on binary transport.  The ``_binary_jsr()``
-helper below uses the binary protocol's checkpoint mechanism instead:
+The ``_binary_jsr()`` helper uses the binary protocol's checkpoint mechanism:
 ``set_checkpoint()`` + ``set_registers()`` + ``resume()`` + ``wait_for_stopped()``.
 
-See ``test_disk_vice.py`` module docstring for the ``wait_for_text()`` /
-``resume()`` interaction explanation.
+See ``test_disk_vice.py`` module docstring for the screen polling / ``resume()``
+interaction explanation.
 """
 
 from __future__ import annotations
@@ -166,7 +162,6 @@ def vice_ethernet():
 
     config = ViceConfig(
         port=port,
-        monitor_type="binary",
         warp=False,  # warp can cause timing issues with ethernet
         sound=False,
         ethernet=True,

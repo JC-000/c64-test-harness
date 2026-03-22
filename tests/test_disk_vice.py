@@ -3,29 +3,16 @@
 Validates the full round-trip: create disk images with DiskImage, boot VICE
 with the image attached, and verify the C64 can load PRGs and read SEQ files.
 
-Uses BinaryViceTransport (-binarymonitor) instead of the text monitor.
+Uses BinaryViceTransport (-binarymonitor) for all VICE communication.
 
-NOTE: Binary transport compatibility
--------------------------------------
-The binary monitor protocol uses a persistent TCP connection.  The CPU is
-stopped after the initial connection and stays stopped between commands.
-This is fundamentally different from the text monitor, where each command
-opens a new TCP connection (pausing the CPU) and closing the connection
-resumes execution.
-
-``wait_for_text()`` from ``screen.py`` polls ``read_screen_codes()`` in a
-loop, but never calls ``resume()``.  With the text monitor this works
-because each read reconnects (resume) then reads (pause), and the
-``time.sleep()`` between polls lets the CPU run.  With binary transport
-the CPU stays paused between reads, so the screen never updates.
+The binary monitor protocol uses a persistent TCP connection.  The CPU stays
+stopped between commands, so screen polling helpers must call ``resume()``
+between reads to let the CPU run and update the screen.
 
 The ``_binary_wait_for_text()`` and ``_binary_wait_for_load_complete()``
-helpers below work around this by calling ``transport.resume()`` before
-each screen read, allowing the CPU to run during the sleep interval.
-
-Similarly, ``send_text()`` injects keys via the binary Keyboard Feed
-command, but the CPU must be running to process them.  The
-``_binary_send_text()`` helper resumes the CPU after injecting keys.
+helpers below handle this by calling ``transport.resume()`` before each
+screen read.  Similarly, ``_binary_send_text()`` resumes the CPU after
+injecting keys so BASIC can process them.
 """
 
 from __future__ import annotations
@@ -382,7 +369,6 @@ class TestPrgLoad:
         try:
             config = ViceConfig(
                 port=port,
-                monitor_type="binary",
                 disk_image=disk,
                 drive_unit=8,
             )
@@ -442,7 +428,6 @@ class TestSeqRead:
         try:
             config = ViceConfig(
                 port=port,
-                monitor_type="binary",
                 disk_image=disk,
                 drive_unit=8,
             )
@@ -530,7 +515,6 @@ class TestSeqModify:
         try:
             config = ViceConfig(
                 port=port,
-                monitor_type="binary",
                 disk_image=disk,
                 drive_unit=8,
             )

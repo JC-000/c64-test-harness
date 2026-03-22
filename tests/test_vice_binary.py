@@ -43,7 +43,7 @@ def binary_transport():
         reservation.close()
 
     config = ViceConfig(
-        port=port, warp=True, sound=False, monitor_type="binary",
+        port=port, warp=True, sound=False,
     )
 
     with ViceProcess(config) as vice:
@@ -263,11 +263,6 @@ class TestKeyboard:
 
 class TestErrors:
     """Test error handling and edge cases."""
-
-    def test_raw_command_raises(self, binary_transport) -> None:
-        """raw_command raises NotImplementedError."""
-        with pytest.raises(NotImplementedError):
-            binary_transport.raw_command("r")
 
     def test_read_zero_bytes(self, binary_transport) -> None:
         """Reading zero bytes returns empty bytes."""
