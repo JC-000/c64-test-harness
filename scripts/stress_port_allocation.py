@@ -11,8 +11,8 @@ Phase 1 — Allocation race
 
 Phase 2 — VICE startup (unless --skip-vice)
     Spawns N processes simultaneously, each allocating a port, releasing the
-    reservation socket, launching VICE, and waiting for the monitor.  Tests
-    the gap between reservation release and VICE bind under concurrency,
+    reservation socket, launching VICE, and connecting via the binary monitor.
+    Tests the gap between reservation release and VICE bind under concurrency,
     with configurable inter-worker delays to find the safe minimum.
 
 Usage:
@@ -46,6 +46,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 from c64_test_harness.backends.vice_manager import PortAllocator
+from c64_test_harness.backends.vice_binary import BinaryViceTransport
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +202,7 @@ def _vice_worker(
     port_end: int,
     startup_delay: float,
 ) -> dict:
-    """Allocate port, start VICE, wait for monitor, clean up."""
+    """Allocate port, start VICE, connect binary monitor, clean up."""
     t0 = time.monotonic()
     port = None
     pid = None
@@ -223,12 +224,28 @@ def _vice_worker(
         if reservation is not None:
             reservation.close()
 
-        config = ViceConfig(port=port, warp=True, sound=False, minimize=True)
+        config = ViceConfig(
+            port=port, warp=True, sound=False, minimize=True,
+        )
         proc = ViceProcess(config)
         proc.start()
         pid = proc.pid
 
-        monitor_ready = proc.wait_for_monitor(timeout=20.0)
+        # Binary monitor: connect directly with retries (no TCP probe).
+        # The persistent connection IS the monitor session.
+        deadline = time.monotonic() + 20.0
+        transport = None
+        while time.monotonic() < deadline:
+            if proc._proc is not None and proc._proc.poll() is not None:
+                break
+            try:
+                transport = BinaryViceTransport(port=port, timeout=5.0)
+                break
+            except Exception:
+                time.sleep(1)
+        monitor_ready = transport is not None
+        if transport is not None:
+            transport.close()
 
         proc.stop()
         alloc.release(port)
@@ -342,7 +359,7 @@ def run_vice_phase(
 ) -> list[ViceRoundSummary]:
     """Run VICE startup tests across multiple delays."""
     print(f"\n{'='*70}")
-    print("PHASE 2: VICE Startup Race")
+    print(f"PHASE 2: VICE Startup Race (binary monitor)")
     print(f"{'='*70}")
     print(f"  {num_workers} workers, ports {port_start}-{port_end - 1}")
     print(f"  Delays: {delays}, {rounds} rounds each\n")
@@ -410,6 +427,7 @@ def main() -> None:
     print(f"  Rounds: {args.rounds}")
     print(f"  VICE: {'skipped' if args.skip_vice else 'enabled'}")
     if not args.skip_vice:
+        print(f"  Monitor: binary")
         print(f"  VICE delays: {delays}")
     print()
 

@@ -64,7 +64,6 @@ class ViceConfig:
     ntsc: bool = True
     sound: bool = False
     minimize: bool = True
-    monitor_type: str = "text"  # "binary" or "text"
     extra_args: list[str] = field(default_factory=list)
     disk_image: DiskImage | None = None
     drive_unit: int = 8
@@ -84,8 +83,7 @@ class ViceProcess:
 
         config = ViceConfig(prg_path="game.prg")
         with ViceProcess(config) as vice:
-            vice.wait_for_monitor()
-            transport = ViceTransport(port=config.port)
+            transport = BinaryViceTransport(port=config.port)
             ...
     """
 
@@ -118,12 +116,8 @@ class ViceProcess:
             args.append("-warp")
         if cfg.ntsc:
             args.append("-ntsc")
-        if cfg.monitor_type == "binary":
-            args += ["-binarymonitor", "-binarymonitoraddress",
-                     f"ip4://127.0.0.1:{cfg.port}"]
-        else:
-            args += ["-remotemonitor", "-remotemonitoraddress",
-                     f"ip4://127.0.0.1:{cfg.port}"]
+        args += ["-binarymonitor", "-binarymonitoraddress",
+                 f"ip4://127.0.0.1:{cfg.port}"]
         if not cfg.sound:
             args.append("+sound")
         if cfg.minimize:
@@ -167,28 +161,6 @@ class ViceProcess:
             except Exception:
                 pass
         self._proc = None
-
-    def wait_for_monitor(self, timeout: float = 30.0) -> bool:
-        """Poll the TCP monitor port until it accepts connections.
-
-        Returns ``True`` if connected within *timeout*, ``False`` if the
-        timeout expires or the VICE process exits early (e.g. X11/GTK
-        resource contention during simultaneous startup).
-        """
-        start = time.monotonic()
-        while time.monotonic() - start < timeout:
-            # Fail fast if the VICE process has already exited
-            if self._proc is not None and self._proc.poll() is not None:
-                return False
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(2)
-                s.connect(("127.0.0.1", self.config.port))
-                s.close()
-                return True
-            except Exception:
-                time.sleep(1)
-        return False
 
     @staticmethod
     def get_listener_pid(port: int) -> int | None:

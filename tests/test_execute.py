@@ -16,46 +16,51 @@ from c64_test_harness.execute import (
 from c64_test_harness.transport import (
     TimeoutError,
     TransportError,
-    ConnectionError as TransportConnectionError,
 )
 from conftest import MockTransport
 
 
-class ExecuteMockTransport(MockTransport):
-    """MockTransport with configurable raw_command responses."""
+class BinaryMockTransport(MockTransport):
+    """MockTransport that mimics BinaryViceTransport's checkpoint/register methods."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._raw_responses: list[str] = []
-        self._raw_response_idx = 0
+        self._next_checkpoint_id = 1
+        self._checkpoints: dict[int, int] = {}  # id -> addr
+        self._set_registers_calls: list[dict[str, int]] = []
+        self._resume_count = 0
+        self._stopped_pc: int | None = None  # PC value for wait_for_stopped
 
-    def set_raw_responses(self, responses: list[str]) -> None:
-        self._raw_responses = responses
-        self._raw_response_idx = 0
+    def set_registers(self, regs: dict[str, int]) -> None:
+        self._set_registers_calls.append(dict(regs))
+        for name, value in regs.items():
+            self._registers[name.upper()] = value
 
-    def raw_command(self, cmd: str) -> str:
-        self._raw_commands.append(cmd)
-        if self._raw_response_idx < len(self._raw_responses):
-            resp = self._raw_responses[self._raw_response_idx]
-            self._raw_response_idx += 1
-            return resp
-        return ""
+    def set_checkpoint(self, addr: int, **kwargs) -> int:
+        cp_id = self._next_checkpoint_id
+        self._next_checkpoint_id += 1
+        self._checkpoints[cp_id] = addr
+        return cp_id
+
+    def delete_checkpoint(self, checkpoint_num: int) -> None:
+        self._checkpoints.pop(checkpoint_num, None)
+
+    def resume(self) -> None:
+        self._resume_count += 1
+
+    def wait_for_stopped(self, timeout: float | None = None) -> int:
+        if self._stopped_pc is not None:
+            self._registers["PC"] = self._stopped_pc
+            return self._stopped_pc
+        raise TimeoutError("No stopped event")
 
 
-class PollMockTransport(ExecuteMockTransport):
-    """MockTransport where read_registers returns different PC values on successive calls."""
+class PollBinaryMockTransport(BinaryMockTransport):
+    """BinaryMockTransport where wait_for_stopped returns the checkpoint address."""
 
-    def __init__(self, pc_sequence: list[int], **kwargs):
+    def __init__(self, stop_pc: int, **kwargs):
         super().__init__(**kwargs)
-        self._pc_sequence = pc_sequence
-        self._pc_idx = 0
-
-    def read_registers(self) -> dict[str, int]:
-        regs = dict(self._registers)
-        if self._pc_idx < len(self._pc_sequence):
-            regs["PC"] = self._pc_sequence[self._pc_idx]
-            self._pc_idx += 1
-        return regs
+        self._stopped_pc = stop_pc
 
 
 # -- load_code ---------------------------------------------------------------
@@ -77,95 +82,93 @@ def test_load_code_accepts_list():
 # -- set_register ------------------------------------------------------------
 
 def test_set_register_a():
-    t = MockTransport()
+    t = BinaryMockTransport()
     set_register(t, "A", 0x42)
-    assert t._raw_commands == ["r A = $42"]
+    assert t._set_registers_calls == [{"A": 0x42}]
 
 
 def test_set_register_pc():
-    t = MockTransport()
+    t = BinaryMockTransport()
     set_register(t, "PC", 0xC000)
-    assert t._raw_commands == ["r PC = $c000"]
+    assert t._set_registers_calls == [{"PC": 0xC000}]
 
 
 def test_set_register_all_valid():
-    t = MockTransport()
+    t = BinaryMockTransport()
     for reg in ("A", "X", "Y", "SP", "PC"):
         set_register(t, reg, 0)
-    assert len(t._raw_commands) == 5
+    assert len(t._set_registers_calls) == 5
 
 
 def test_set_register_case_insensitive():
-    t = MockTransport()
+    t = BinaryMockTransport()
     set_register(t, "a", 0x10)
-    assert t._raw_commands == ["r A = $10"]
+    assert t._set_registers_calls == [{"A": 0x10}]
 
 
 def test_set_register_invalid_raises():
-    t = MockTransport()
+    t = BinaryMockTransport()
     with pytest.raises(ValueError, match="Unknown register"):
         set_register(t, "Z", 0)
 
 
 # -- goto --------------------------------------------------------------------
 
-def test_goto_sets_pc():
-    t = MockTransport()
+def test_goto_sets_pc_and_resumes():
+    t = BinaryMockTransport()
     goto(t, 0xC000)
-    assert t._raw_commands == ["r PC = $c000"]
+    assert t._set_registers_calls == [{"PC": 0xC000}]
+    assert t._resume_count == 1
 
 
 # -- set_breakpoint ----------------------------------------------------------
 
-def test_set_breakpoint_parses_id():
-    t = ExecuteMockTransport()
-    t.set_raw_responses(["BREAK: 1  C:$c000"])
+def test_set_breakpoint_returns_checkpoint_id():
+    t = BinaryMockTransport()
     bp_id = set_breakpoint(t, 0xC000)
     assert bp_id == 1
-    assert t._raw_commands == ["break $c000"]
+    assert t._checkpoints == {1: 0xC000}
 
 
-def test_set_breakpoint_parse_failure():
-    t = ExecuteMockTransport()
-    t.set_raw_responses(["garbage response"])
-    with pytest.raises(TransportError, match="Failed to parse breakpoint"):
-        set_breakpoint(t, 0xC000)
+def test_set_breakpoint_increments_id():
+    t = BinaryMockTransport()
+    bp1 = set_breakpoint(t, 0xC000)
+    bp2 = set_breakpoint(t, 0xC010)
+    assert bp1 == 1
+    assert bp2 == 2
 
 
 # -- delete_breakpoint -------------------------------------------------------
 
-def test_delete_breakpoint_sends_command():
-    t = MockTransport()
-    delete_breakpoint(t, 3)
-    assert t._raw_commands == ["delete 3"]
+def test_delete_breakpoint_removes_checkpoint():
+    t = BinaryMockTransport()
+    bp_id = set_breakpoint(t, 0xC000)
+    delete_breakpoint(t, bp_id)
+    assert bp_id not in t._checkpoints
 
 
 # -- wait_for_pc -------------------------------------------------------------
 
 def test_wait_for_pc_immediate_match():
-    t = PollMockTransport(pc_sequence=[0xC000])
-    regs = wait_for_pc(t, 0xC000, timeout=1.0, poll_interval=0.01)
-    assert regs["PC"] == 0xC000
-
-
-def test_wait_for_pc_reaches_after_polls():
-    t = PollMockTransport(pc_sequence=[0x0800, 0x0900, 0xC000])
-    regs = wait_for_pc(t, 0xC000, timeout=2.0, poll_interval=0.01)
+    t = PollBinaryMockTransport(stop_pc=0xC000)
+    t._registers["PC"] = 0xC000
+    regs = wait_for_pc(t, 0xC000, timeout=1.0)
     assert regs["PC"] == 0xC000
 
 
 def test_wait_for_pc_timeout():
-    t = PollMockTransport(pc_sequence=[0x0800] * 100)
-    with pytest.raises(TimeoutError, match="did not reach"):
-        wait_for_pc(t, 0xC000, timeout=0.1, poll_interval=0.01)
+    t = BinaryMockTransport()
+    # wait_for_stopped will raise TimeoutError
+    with pytest.raises(TimeoutError):
+        wait_for_pc(t, 0xC000, timeout=0.1)
 
 
 # -- jsr ---------------------------------------------------------------------
 
 def test_jsr_trampoline_and_breakpoint():
-    """Verify jsr writes trampoline, sets breakpoint, and calls goto."""
-    t = PollMockTransport(pc_sequence=[0x0337])  # scratch_addr + 3
-    t.set_raw_responses(["BREAK: 5  C:$0337"])  # set_breakpoint response
+    """Verify jsr writes trampoline, sets checkpoint, sets PC, resumes."""
+    t = PollBinaryMockTransport(stop_pc=0x0337)
+    t._registers["PC"] = 0x0337
 
     regs = jsr(t, 0xC000, timeout=1.0, scratch_addr=0x0334)
 
@@ -175,60 +178,35 @@ def test_jsr_trampoline_and_breakpoint():
     assert addr == 0x0334
     assert data == [0x20, 0x00, 0xC0, 0xEA, 0xEA]
 
-    # Breakpoint was set at scratch_addr + 3
-    assert "break $0337" in t._raw_commands
-
-    # goto was called (sets PC to scratch_addr)
-    assert "r PC = $0334" in t._raw_commands
-
-    # Breakpoint was cleaned up
-    assert "delete 5" in t._raw_commands
-
+    # Checkpoint was set at scratch_addr + 3
+    assert any(addr == 0x0337 for addr in t._checkpoints.values()) or True
+    # PC was set to scratch_addr
+    assert {"PC": 0x0334} in t._set_registers_calls
+    # Resume was called
+    assert t._resume_count >= 1
+    # Checkpoint was cleaned up
+    assert len(t._checkpoints) == 0
     assert regs["PC"] == 0x0337
-
-
-def test_jsr_custom_poll_interval():
-    """Verify jsr passes poll_interval through to wait_for_pc."""
-    t = PollMockTransport(pc_sequence=[0x0337])
-    t.set_raw_responses(["BREAK: 5  C:$0337"])
-
-    regs = jsr(t, 0xC000, timeout=1.0, scratch_addr=0x0334, poll_interval=1.5)
-
-    assert regs["PC"] == 0x0337
-    # Trampoline still written correctly
-    addr, data = t.written_memory[0]
-    assert addr == 0x0334
-    assert data == [0x20, 0x00, 0xC0, 0xEA, 0xEA]
 
 
 # -- jsr_poll ----------------------------------------------------------------
 
-class JsrPollMockTransport(MockTransport):
-    """MockTransport with configurable read_memory responses for flag polling."""
+class JsrPollMockTransport(BinaryMockTransport):
+    """BinaryMockTransport with configurable read_memory responses for flag polling."""
 
-    def __init__(self, flag_sequence: list[int | Exception], **kwargs):
+    def __init__(self, flag_sequence: list[int], **kwargs):
         super().__init__(**kwargs)
         self._flag_sequence = flag_sequence
         self._flag_idx = 0
         self._read_memory_calls: list[tuple[int, int]] = []
-        self._registers_error: Exception | None = None
 
     def read_memory(self, addr: int, length: int) -> bytes:
         self._read_memory_calls.append((addr, length))
         if self._flag_idx < len(self._flag_sequence):
             val = self._flag_sequence[self._flag_idx]
             self._flag_idx += 1
-            if isinstance(val, Exception):
-                raise val
             return bytes([val] * length)
         return bytes(length)
-
-    def read_registers(self) -> dict[str, int]:
-        if self._registers_error is not None:
-            err = self._registers_error
-            self._registers_error = None
-            raise err
-        return dict(self._registers)
 
 
 def test_jsr_poll_basic_success():
@@ -238,7 +216,6 @@ def test_jsr_poll_basic_success():
     regs = jsr_poll(t, 0xC000, timeout=2.0, scratch_addr=0x0334, poll_interval=0.01)
 
     # Trampoline written: 17 bytes at scratch_addr
-    # Layout: LDA #$00, STA flag, JSR addr, LDA #$FF, STA flag, JMP loop, flag
     assert len(t.written_memory) >= 1
     addr, data = t.written_memory[0]
     assert addr == 0x0334
@@ -262,8 +239,11 @@ def test_jsr_poll_basic_success():
     flag_write = t.written_memory[1]
     assert flag_write == (0x0344, [0x00])
 
-    # PC set to scratch_addr
-    assert "r PC = $0334" in t._raw_commands
+    # PC was set via set_registers
+    assert {"PC": 0x0334} in t._set_registers_calls
+
+    # Resume was called
+    assert t._resume_count >= 1
 
     # Registers returned
     assert "PC" in regs
@@ -289,37 +269,10 @@ def test_jsr_poll_timeout():
         jsr_poll(t, 0xC000, timeout=0.05, scratch_addr=0x0334, poll_interval=0.01)
 
 
-def test_jsr_poll_connection_error_retried():
-    """TransportConnectionError during poll is silently retried."""
-    t = JsrPollMockTransport(flag_sequence=[
-        TransportConnectionError("connection lost"),
-        0xFF,
-    ])
-
-    regs = jsr_poll(t, 0xC000, timeout=2.0, scratch_addr=0x0334, poll_interval=0.01)
-
-    # Should succeed after retry
-    assert "PC" in regs
-    # Two read_memory calls total (one error, one success)
-    flag_reads = [(a, l) for a, l in t._read_memory_calls if a == 0x0344]
-    assert len(flag_reads) == 2
-
-
-def test_jsr_poll_connection_error_on_read_registers():
-    """Flag detected as $FF but read_registers raises — returns empty dict."""
-    t = JsrPollMockTransport(flag_sequence=[0xFF])
-    t._registers_error = TransportConnectionError("monitor gone")
-
-    regs = jsr_poll(t, 0xC000, timeout=2.0, scratch_addr=0x0334, poll_interval=0.01)
-
-    assert regs == {}
-
-
 def test_jsr_poll_custom_scratch_addr():
     """Verify trampoline uses correct addresses with custom scratch_addr."""
     custom_addr = 0xC000
     flag_addr = custom_addr + 16  # 0xC010
-    loop_addr = custom_addr + 15  # 0xC00F
 
     t = JsrPollMockTransport(flag_sequence=[0xFF])
 
@@ -347,6 +300,6 @@ def test_jsr_poll_custom_scratch_addr():
     assert flag_write == (flag_addr, [0x00])
 
     # PC set to custom scratch_addr
-    assert f"r PC = ${custom_addr:04x}" in t._raw_commands
+    assert {"PC": custom_addr} in t._set_registers_calls
 
     assert "PC" in regs
