@@ -125,16 +125,17 @@ class ViceProcess:
         args += cfg.extra_args
 
         if cfg.ethernet:
-            if cfg.ethernet_mode == "rrnet":
-                args.append("-rrnet")
-            else:
-                args.append("-tfe")
+            # Interface/driver MUST be set before the cart enable flag —
+            # VICE probes the interface when processing -ethernetcart and
+            # will reject the flag if the default interface is inaccessible.
             if cfg.ethernet_interface:
                 args += ["-ethernetioif", cfg.ethernet_interface]
             if cfg.ethernet_driver:
                 args += ["-ethernetiodriver", cfg.ethernet_driver]
             if cfg.ethernet_base != 0xDE00:
                 args += ["-ethernetcartbase", f"0x{cfg.ethernet_base:04X}"]
+            mode = 1 if cfg.ethernet_mode == "rrnet" else 0
+            args += ["-ethernetcart", "-ethernetcartmode", str(mode)]
 
         if cfg.disk_image is not None:
             args += [
