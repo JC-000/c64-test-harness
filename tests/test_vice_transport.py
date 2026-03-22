@@ -1,11 +1,14 @@
-"""VICE integration tests for ViceTransport protocol layer.
+"""VICE integration tests for the TEXT monitor transport (ViceTransport).
+
+These tests are specific to the text monitor protocol (-remotemonitor).
+For binary monitor equivalents, see ``test_vice_binary.py``.
 
 Validates the raw transport interface: register parsing, TCP command
 round-trips, chunked memory access, key injection, and error paths.
 Uses the module-scoped ``vice_transport`` fixture from conftest.py.
 
 NOTE: ``test_resume_closes_monitor`` must be the LAST test because
-``resume()`` permanently closes the VICE monitor port.
+``resume()`` permanently closes the VICE text monitor port.
 """
 
 from __future__ import annotations

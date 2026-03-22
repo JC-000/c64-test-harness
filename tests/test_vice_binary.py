@@ -21,6 +21,8 @@ from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 from c64_test_harness.backends.vice_manager import PortAllocator
 from c64_test_harness.transport import TransportError
 
+from conftest import connect_binary_transport
+
 # Skip entire module if x64sc is not installed
 pytestmark = pytest.mark.skipif(
     shutil.which("x64sc") is None, reason="x64sc not found on PATH"
@@ -45,11 +47,7 @@ def binary_transport():
     )
 
     with ViceProcess(config) as vice:
-        assert vice.wait_for_monitor(timeout=30), \
-            "VICE binary monitor did not become available"
-        # Small delay to let VICE fully initialise the binary monitor
-        time.sleep(0.5)
-        transport = BinaryViceTransport(port=port)
+        transport = connect_binary_transport(port, proc=vice)
         try:
             yield transport
         finally:
