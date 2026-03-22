@@ -7,67 +7,17 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .transport import C64Transport
 
-#: Reads larger than this are automatically chunked for reliability.
-_AUTO_CHUNK_THRESHOLD = 256
-
-#: VICE's text monitor silently truncates ``>`` (write) commands at ~261
-#: characters, which corresponds to 84 data bytes.  Writes larger than
-#: this threshold are automatically split into multiple commands.
-_WRITE_CHUNK_SIZE = 84
-
 
 def read_bytes(transport: C64Transport, addr: int, length: int) -> bytes:
-    """Read *length* bytes from *addr*.
-
-    Reads larger than 256 bytes are automatically chunked for reliability
-    (VICE's text monitor can return incomplete data on very large reads).
-    """
-    if length > _AUTO_CHUNK_THRESHOLD:
-        return read_bytes_chunked(transport, addr, length)
+    """Read *length* bytes from *addr*."""
     return transport.read_memory(addr, length)
 
 
-def read_bytes_chunked(
-    transport: C64Transport,
-    addr: int,
-    length: int,
-    chunk_size: int = 128,
-) -> bytes:
-    """Read a large memory region in chunks for reliability.
-
-    Breaks the read into *chunk_size*-byte pieces, concatenating the
-    results.  Useful when reading DER buffers, key material, or any
-    region larger than ~128 bytes where a single VICE ``m`` command
-    may return incomplete data.
-    """
-    result = bytearray()
-    offset = 0
-    while offset < length:
-        n = min(chunk_size, length - offset)
-        chunk = transport.read_memory(addr + offset, n)
-        result.extend(chunk)
-        offset += n
-    return bytes(result[:length])
-
-
 def write_bytes(transport: C64Transport, addr: int, data: bytes | list[int]) -> None:
-    """Write *data* to *addr*, automatically chunking large writes.
-
-    VICE's text monitor truncates write commands longer than ~261
-    characters (84 data bytes).  This function transparently splits
-    larger writes into *_WRITE_CHUNK_SIZE*-byte pieces so callers
-    never need to worry about the limit.
-    """
+    """Write *data* to *addr*."""
     if isinstance(data, list):
         data = bytes(data)
-    if len(data) <= _WRITE_CHUNK_SIZE:
-        transport.write_memory(addr, data)
-        return
-    offset = 0
-    while offset < len(data):
-        end = min(offset + _WRITE_CHUNK_SIZE, len(data))
-        transport.write_memory(addr + offset, data[offset:end])
-        offset = end
+    transport.write_memory(addr, data)
 
 
 def read_word_le(transport: C64Transport, addr: int) -> int:

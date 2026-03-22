@@ -36,7 +36,7 @@ from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 from c64_test_harness.backends.vice_manager import PortAllocator
 from c64_test_harness.execute import load_code
 from c64_test_harness.memory import read_bytes, write_bytes
-from c64_test_harness.screen import ScreenGrid
+from c64_test_harness.screen import ScreenGrid, wait_for_text
 from c64_test_harness.transport import TransportError
 
 from conftest import connect_binary_transport
@@ -120,31 +120,6 @@ def _binary_jsr(
         transport.delete_checkpoint(bp_num)
 
 
-def _binary_wait_for_text(
-    transport: BinaryViceTransport,
-    needle: str,
-    timeout: float = 30.0,
-    poll_interval: float = 2.0,
-) -> ScreenGrid | None:
-    """Wait until *needle* appears on screen, resuming between polls.
-
-    See ``test_disk_vice.py`` module docstring for why this is needed.
-    """
-    needle_upper = needle.upper()
-    start = time.monotonic()
-    while True:
-        elapsed = time.monotonic() - start
-        if elapsed >= timeout:
-            return None
-        try:
-            transport.resume()
-            time.sleep(poll_interval)
-            grid = ScreenGrid.from_transport(transport)
-            if needle_upper in grid.continuous_text().upper():
-                return grid
-        except Exception:
-            time.sleep(poll_interval)
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -173,7 +148,7 @@ def vice_ethernet():
     with ViceProcess(config) as vice:
         transport = connect_binary_transport(port, proc=vice)
         try:
-            grid = _binary_wait_for_text(transport, "READY.", timeout=30)
+            grid = wait_for_text(transport, "READY.", timeout=30, verbose=False)
             assert grid is not None, "BASIC READY prompt not found"
             yield transport
         finally:

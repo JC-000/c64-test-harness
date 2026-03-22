@@ -37,6 +37,7 @@ from c64_test_harness import (
     BinaryViceTransport,
     ScreenGrid,
     dump_screen,
+    wait_for_text,
 )
 from c64_test_harness.backends.vice_lifecycle import ViceConfig
 from c64_test_harness.backends.vice_manager import ViceInstanceManager
@@ -151,17 +152,7 @@ def main() -> int:
         # Wait for each instance's main menu
         print("\n=== Waiting for main menus ===")
         for i, inst in enumerate(instances):
-            import time as _time
-            needle = "Q=QUIT"
-            deadline = _time.monotonic() + 60.0
-            grid = None
-            while _time.monotonic() < deadline:
-                g = ScreenGrid.from_transport(inst.transport)
-                if needle.upper() in g.continuous_text().upper():
-                    grid = g
-                    break
-                inst.transport.resume()
-                _time.sleep(1.0)
+            grid = wait_for_text(inst.transport, "Q=QUIT", timeout=60, verbose=False)
             if grid is None:
                 print(f"  FATAL: Instance {i} (port {inst.port}) menu did not appear")
                 dump_screen(inst.transport, f"startup_{i}")

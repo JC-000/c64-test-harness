@@ -34,7 +34,7 @@ Requires Python 3.10+. Zero runtime dependencies.
 import time
 from c64_test_harness import (
     BinaryViceTransport, ViceProcess, ViceConfig,
-    ScreenGrid, send_text, send_key,
+    ScreenGrid, wait_for_text, send_text, send_key,
     read_bytes, read_word_le, write_bytes,
 )
 
@@ -51,15 +51,9 @@ with ViceProcess(config) as vice:
         except Exception:
             time.sleep(1)
 
-    # Wait for the title screen (binary monitor auto-pauses CPU,
-    # so resume between screen reads to let the C64 run)
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        grid = ScreenGrid.from_transport(transport)
-        if grid.has_text("PRESS START"):
-            break
-        transport.resume()
-        time.sleep(1.0)
+    # Wait for the title screen
+    grid = wait_for_text(transport, "PRESS START", timeout=30, verbose=False)
+    assert grid is not None
 
     # Send keyboard input (batched)
     send_text(transport, "HELLO\r")
@@ -75,7 +69,7 @@ with ViceProcess(config) as vice:
     # Extract data between markers
     value = grid.extract_between("SCORE: ", " ")
 
-    # Read memory (no chunking needed — binary monitor has no size limits)
+    # Read memory
     data = read_bytes(transport, 0x4000, 512)
 
     # Read 6502 little-endian values
@@ -83,8 +77,6 @@ with ViceProcess(config) as vice:
 
     transport.close()
 ```
-
-**Binary monitor note:** The binary monitor auto-pauses the CPU when any command is sent. Screen and keyboard operations need explicit `transport.resume()` calls between reads so the C64 can process keystrokes and update the screen. The `_wait_for_text_binary()` pattern shown in `tests/test_vice_core.py` demonstrates this.
 
 ## Memory Helpers
 
@@ -98,9 +90,8 @@ der_data = read_bytes(transport, der_buf_addr, 512)
 length = read_word_le(transport, length_addr)     # 16-bit
 counter = read_dword_le(transport, counter_addr)   # 32-bit
 
-# write_bytes — no size limits with binary monitor
 write_bytes(transport, 0x1000, [0xDE, 0xAD, 0xBE, 0xEF])
-write_bytes(transport, 0xC000, bytes(4096))  # large writes handled natively
+write_bytes(transport, 0xC000, bytes(4096))
 ```
 
 ## PRG Binary Verification
@@ -300,7 +291,7 @@ config = HarnessConfig.from_env()
 config = HarnessConfig(vice_port=6510, vice_warp=True)
 ```
 
-Key fields: `vice_host`, `vice_port`, `vice_executable`, `vice_prg_path`, `vice_warp`, `vice_sound`, `vice_minimize`, `screen_base`, `vice_port_range_start/end`, `vice_reuse_existing`, `vice_acquire_retries`, `exec_poll_interval`, `screen_poll_interval`.
+Key fields: `vice_host`, `vice_port`, `vice_executable`, `vice_prg_path`, `vice_warp`, `vice_sound`, `vice_minimize`, `screen_base`, `vice_port_range_start/end`, `vice_reuse_existing`, `vice_acquire_retries`, `screen_poll_interval`.
 
 **Window focus:** VICE windows start minimized by default (`ViceConfig.minimize = True`) to prevent focus stealing during automated test runs. Set `minimize=False` in `ViceConfig` (or `vice_minimize = false` in TOML / `C64TEST_VICE_MINIMIZE=0` in env) if you need visible windows.
 
