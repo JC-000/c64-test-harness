@@ -36,7 +36,7 @@ DATA_BASE = 0xC100
 @pytest.fixture(scope="module")
 def binary_transport():
     """Boot VICE with binary monitor, yield a live BinaryViceTransport."""
-    allocator = PortAllocator(port_range_start=6540, port_range_end=6550)
+    allocator = PortAllocator(port_range_start=6560, port_range_end=6580)
     port = allocator.allocate()
     reservation = allocator.take_socket(port)
     if reservation is not None:
