@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Iterator
 
 from .port_lock import PortLock
-from .vice import ViceTransport
+from .vice_binary import BinaryViceTransport
 from .vice_lifecycle import ViceConfig, ViceProcess
 
 logger = logging.getLogger(__name__)
@@ -159,7 +159,7 @@ class ViceInstance:
 
     port: int
     process: ViceProcess | None
-    transport: ViceTransport
+    transport: BinaryViceTransport
     managed: bool = True
     _port_lock: PortLock | None = field(default=None, repr=False)
 
@@ -297,7 +297,7 @@ class ViceInstanceManager:
     def _start_or_adopt(self, port: int) -> ViceInstance:
         """Start a new VICE or adopt an existing listener on *port*."""
         if self._reuse_existing and PortAllocator.is_port_in_use(port):
-            transport = ViceTransport(port=port)
+            transport = BinaryViceTransport(port=port)
             return ViceInstance(
                 port=port, process=None, transport=transport, managed=False,
             )
@@ -328,10 +328,26 @@ class ViceInstanceManager:
         try:
             proc.start()
 
-            if not proc.wait_for_monitor(timeout=30.0):
+            # Connect binary transport with retries
+            deadline_time = time.monotonic() + 30.0
+            transport = None
+            last_err = None
+            while time.monotonic() < deadline_time:
+                if proc._proc is not None and proc._proc.poll() is not None:
+                    proc.stop()
+                    raise RuntimeError(
+                        f"VICE process exited during binary monitor connect on port {port}"
+                    )
+                try:
+                    transport = BinaryViceTransport(port=port)
+                    break
+                except Exception as e:
+                    last_err = e
+                    time.sleep(1)
+            if transport is None:
                 proc.stop()
                 raise RuntimeError(
-                    f"VICE monitor on port {port} did not become ready"
+                    f"VICE binary monitor on port {port} did not become ready: {last_err}"
                 )
 
             # Verify the listener is actually our VICE process
@@ -352,7 +368,6 @@ class ViceInstanceManager:
                 port_lock.release()
             raise
 
-        transport = ViceTransport(port=port)
         return ViceInstance(
             port=port, process=proc, transport=transport, managed=True,
             _port_lock=port_lock,

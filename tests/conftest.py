@@ -7,7 +7,6 @@ import time
 
 import pytest
 
-from c64_test_harness.backends.vice import ViceTransport
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 from c64_test_harness.backends.vice_manager import PortAllocator
@@ -36,7 +35,6 @@ class MockTransport:
         self.written_memory: list[tuple[int, list[int]]] = []
         self.injected_keys: list[list[int]] = []
         self._registers: dict[str, int] = {"PC": 0x0800, "A": 0, "X": 0, "Y": 0, "SP": 0xFF}
-        self._raw_commands: list[str] = []
 
     @property
     def screen_cols(self) -> int:
@@ -75,10 +73,6 @@ class MockTransport:
     def resume(self) -> None:
         pass
 
-    def raw_command(self, cmd: str) -> str:
-        self._raw_commands.append(cmd)
-        return ""
-
     def close(self) -> None:
         pass
 
@@ -96,33 +90,6 @@ def labels_path():
     return pathlib.Path(__file__).parent / "fixtures" / "labels.txt"
 
 
-@pytest.fixture(scope="module")
-def vice_transport():
-    """Boot VICE, wait for READY prompt, yield a live ViceTransport."""
-    if shutil.which("x64sc") is None:
-        pytest.skip("x64sc not found on PATH")
-
-    allocator = PortAllocator(port_range_start=6520, port_range_end=6530)
-    port = allocator.allocate()
-    # Release OS-level reservation before VICE binds to the port
-    reservation = allocator.take_socket(port)
-    if reservation is not None:
-        reservation.close()
-    config = ViceConfig(port=port, warp=True, sound=False)
-
-    with ViceProcess(config) as vice:
-        assert vice.wait_for_monitor(timeout=30), \
-            "VICE monitor did not become available"
-        transport = ViceTransport(port=port)
-        try:
-            grid = wait_for_text(transport, "READY.", timeout=30, verbose=False)
-            assert grid is not None, "BASIC READY prompt not found"
-            yield transport
-        finally:
-            transport.close()
-            allocator.release(port)
-
-
 def connect_binary_transport(
     port: int,
     timeout: float = 30.0,
@@ -132,9 +99,8 @@ def connect_binary_transport(
     """Connect a BinaryViceTransport with retries.
 
     Polls until VICE's binary monitor accepts the persistent TCP connection.
-    Unlike ``wait_for_monitor()`` (which connects then disconnects, poisoning
-    the binary monitor's connection slot), this keeps the first successful
-    connection open — which is the correct lifecycle for binary monitor.
+    Keeps the first successful connection open — which is the correct
+    lifecycle for the binary monitor.
     """
     deadline = time.monotonic() + timeout
     last_err: Exception | None = None
@@ -165,7 +131,7 @@ def binary_transport():
         reservation.close()
 
     config = ViceConfig(
-        port=port, warp=True, sound=False, monitor_type="binary",
+        port=port, warp=True, sound=False,
     )
 
     with ViceProcess(config) as vice:

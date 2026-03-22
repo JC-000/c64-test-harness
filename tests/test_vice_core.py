@@ -22,7 +22,7 @@ import time
 import pytest
 
 from c64_test_harness.debug import dump_screen
-from c64_test_harness.execute import load_code
+from c64_test_harness.execute import jsr, load_code
 from c64_test_harness.keyboard import send_key, send_text
 from c64_test_harness.memory import (
     hex_dump,
@@ -42,32 +42,6 @@ pytestmark = pytest.mark.skipif(
 # Scratch area for machine code ($C000-$CFFF) -- avoids clobbering BASIC/kernal
 CODE_BASE = 0xC000
 DATA_BASE = 0xC100
-
-# Default scratch area for binary JSR trampoline
-SCRATCH_ADDR = 0x0334
-
-
-def binary_jsr(transport, addr, timeout=10.0, scratch_addr=SCRATCH_ADDR):
-    """JSR via binary monitor -- write trampoline, checkpoint, resume, wait.
-
-    Writes a small trampoline (JSR addr; NOP; NOP) at *scratch_addr*, sets
-    a breakpoint after the JSR, sets PC, resumes, and waits for the CPU to
-    stop.  Returns the register dict after the subroutine returns.
-    """
-    trampoline = bytes([0x20, addr & 0xFF, (addr >> 8) & 0xFF, 0xEA, 0xEA])
-    transport.write_memory(scratch_addr, trampoline)
-    bp_addr = scratch_addr + 3
-    bp_num = transport.set_checkpoint(bp_addr)
-    try:
-        transport.set_registers({"PC": scratch_addr})
-        transport.resume()
-        pc = transport.wait_for_stopped(timeout=timeout)
-        assert pc == bp_addr, f"Expected PC={bp_addr:#06x}, got PC={pc:#06x}"
-        regs = transport.read_registers()
-        return regs
-    finally:
-        transport.delete_checkpoint(bp_num)
-
 
 def _wait_for_text_binary(transport, needle, timeout=15.0, poll_interval=1.0):
     """Poll screen for *needle*, resuming the CPU between reads.
@@ -109,9 +83,9 @@ class TestExecution:
     """Test execution functions against real VICE via binary monitor."""
 
     def test_jsr_simple_rts(self, binary_transport) -> None:
-        """Load RTS at $C000, binary_jsr(), verify trampoline round-trip."""
+        """Load RTS at $C000, jsr(), verify trampoline round-trip."""
         load_code(binary_transport, CODE_BASE, [0x60])  # RTS
-        regs = binary_jsr(binary_transport, CODE_BASE, timeout=15)
+        regs = jsr(binary_transport, CODE_BASE, timeout=15)
         assert "PC" in regs
         assert "A" in regs
 
@@ -127,7 +101,7 @@ class TestExecution:
         write_bytes(binary_transport, DATA_BASE, [42])
         write_bytes(binary_transport, DATA_BASE + 1, [0])
 
-        binary_jsr(binary_transport, CODE_BASE, timeout=15)
+        jsr(binary_transport, CODE_BASE, timeout=15)
 
         result = read_bytes(binary_transport, DATA_BASE + 1, 1)
         assert result == bytes([84]), f"Expected 84, got {result[0]}"
@@ -141,7 +115,7 @@ class TestExecution:
             0x60,        # RTS
         ]
         load_code(binary_transport, CODE_BASE, code)
-        regs = binary_jsr(binary_transport, CODE_BASE, timeout=15)
+        regs = jsr(binary_transport, CODE_BASE, timeout=15)
 
         assert regs["A"] == 0xAA
         assert regs["X"] == 0xBB

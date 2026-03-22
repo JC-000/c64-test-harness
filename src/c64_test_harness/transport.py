@@ -82,10 +82,6 @@ class C64Transport(Protocol):
         """Resume execution (exit monitor / un-pause)."""
         ...
 
-    def raw_command(self, cmd: str) -> str:
-        """Send a backend-specific command.  Escape hatch for advanced use."""
-        ...
-
     def close(self) -> None:
         """Release resources / close connection."""
         ...

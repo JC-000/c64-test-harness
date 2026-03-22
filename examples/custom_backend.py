@@ -43,11 +43,8 @@ class MyHardwareTransport(HardwareTransportBase):
     def resume(self) -> None:
         raise NotImplementedError
 
-    def raw_command(self, cmd: str) -> str:
-        raise NotImplementedError
 
-
-# Once implemented, use it exactly like ViceTransport:
+# Once implemented, use it exactly like BinaryViceTransport:
 #
 #   transport = MyHardwareTransport("/dev/ttyUSB0")
 #   grid = wait_for_text(transport, "READY.")
