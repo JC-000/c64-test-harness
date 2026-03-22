@@ -1,12 +1,11 @@
 """VICE binary monitor transport -- persistent-connection backend.
 
-Uses VICE's binary monitor protocol (-binarymonitor) instead of the text
-monitor (-remotemonitor).  The binary protocol provides:
+Uses VICE's binary monitor protocol (-binarymonitor).  Provides:
 
-- A single persistent TCP connection (no reconnect per command)
-- No write-size limitations (text monitor truncates at ~82 bytes)
+- A single persistent TCP connection
+- No write-size limitations
 - Async breakpoint/stop events pushed by VICE
-- Dramatically lower latency (~0.08ms vs ~400ms per command)
+- ~0.08ms latency per command
 
 Wire format is little-endian throughout.  See VICE documentation for the
 full binary monitor protocol specification.
@@ -61,9 +60,10 @@ class _Response(NamedTuple):
 class BinaryViceTransport:
     """C64Transport backed by VICE's binary monitor protocol.
 
-    Unlike :class:`ViceTransport` (text monitor, per-command TCP), this
-    transport maintains a single persistent connection and uses the binary
-    wire format for all communication.
+    Maintains a single persistent TCP connection and uses the binary wire
+    format for all communication.  Provides ~0.08ms latency per command,
+    no write size limits, async breakpoint events, and non-destructive
+    resume().
     """
 
     def __init__(
@@ -353,17 +353,6 @@ class BinaryViceTransport:
         after Exit.  The CPU resumes and VICE pushes a Resumed event.
         """
         self._send_and_recv(CMD_EXIT)
-
-    def raw_command(self, cmd: str) -> str:
-        """Not supported for binary transport.
-
-        The binary monitor protocol does not accept text commands.
-        Use the typed methods (read_memory, write_memory, etc.) directly.
-        """
-        raise NotImplementedError(
-            "BinaryViceTransport does not support raw text commands. "
-            "Use the binary protocol methods directly."
-        )
 
     def close(self) -> None:
         """Close the TCP connection to VICE."""

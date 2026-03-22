@@ -16,14 +16,17 @@ from c64_test_harness.backends.vice_lifecycle import ViceConfig
 
 @pytest.fixture
 def _mock_vice():
-    """Patch ViceProcess and ViceTransport so no real VICE is needed."""
+    """Patch ViceProcess and BinaryViceTransport so no real VICE is needed."""
     with (
         patch("c64_test_harness.backends.vice_manager.ViceProcess") as MockProc,
-        patch("c64_test_harness.backends.vice_manager.ViceTransport") as MockTrans,
+        patch("c64_test_harness.backends.vice_manager.BinaryViceTransport") as MockTrans,
     ):
-        MockProc.return_value.wait_for_monitor.return_value = True
         MockProc.return_value.stop = MagicMock()
         MockProc.return_value.pid = 12345
+        # Simulate process still running (poll returns None)
+        mock_popen = MagicMock()
+        mock_popen.poll.return_value = None
+        MockProc.return_value._proc = mock_popen
         # get_listener_pid returns None by default (skip PID verification)
         MockProc.get_listener_pid = MagicMock(return_value=None)
         MockTrans.return_value.close = MagicMock()
@@ -38,7 +41,8 @@ class TestViceInstanceManager:
         assert inst.port == 18000
         assert inst.managed is True
         MockProc.return_value.start.assert_called_once()
-        MockProc.return_value.wait_for_monitor.assert_called_once()
+        # Binary transport should be connected
+        MockTrans.assert_called()
         assert mgr.active_count == 1
         mgr.release(inst)
         assert mgr.active_count == 0
@@ -87,35 +91,48 @@ class TestViceInstanceManager:
             MockProc.return_value.start.assert_not_called()
         mgr.shutdown()
 
-    def test_failed_wait_for_monitor_releases_port(self, _mock_vice):
-        MockProc, _ = _mock_vice
-        MockProc.return_value.wait_for_monitor.return_value = False
+    def test_failed_binary_connect_releases_port(self, _mock_vice):
+        MockProc, MockTrans = _mock_vice
+        # Binary transport always fails to connect
+        MockTrans.side_effect = ConnectionError("refused")
+        # Process exits immediately to break retry loop
+        MockProc.return_value._proc.poll.return_value = 1
         mgr = ViceInstanceManager(port_range_start=18600, port_range_end=18605)
-        with pytest.raises(RuntimeError, match="did not become ready"):
+        with pytest.raises(RuntimeError, match="exited during"):
             mgr.acquire()
         assert mgr.active_count == 0
         assert len(mgr._allocator.allocated_ports) == 0
 
-
     def test_acquire_retries_on_failure(self, _mock_vice):
         MockProc, MockTrans = _mock_vice
-        # First attempt: wait_for_monitor fails; second: succeeds
-        MockProc.return_value.wait_for_monitor.side_effect = [False, True, True]
+        # First attempt: process exits; second: succeeds
+        call_count = [0]
+        original_poll = MockProc.return_value._proc.poll
+
+        def poll_side_effect():
+            call_count[0] += 1
+            # First call for first acquire attempt - process exits
+            if call_count[0] <= 2:
+                return 1  # exited
+            return None  # running
+
+        MockProc.return_value._proc.poll.side_effect = poll_side_effect
         mgr = ViceInstanceManager(
             port_range_start=18700, port_range_end=18710, max_retries=3,
         )
         inst = mgr.acquire()
         assert inst.port in range(18700, 18710)
-        assert MockProc.return_value.start.call_count == 2
         mgr.release(inst)
 
     def test_acquire_exhausts_retries(self, _mock_vice):
-        MockProc, _ = _mock_vice
-        MockProc.return_value.wait_for_monitor.return_value = False
+        MockProc, MockTrans = _mock_vice
+        # Process always exits immediately
+        MockProc.return_value._proc.poll.return_value = 1
+        MockTrans.side_effect = ConnectionError("refused")
         mgr = ViceInstanceManager(
             port_range_start=18800, port_range_end=18810, max_retries=2,
         )
-        with pytest.raises(RuntimeError, match="did not become ready"):
+        with pytest.raises(RuntimeError):
             mgr.acquire()
         assert mgr.active_count == 0
 

@@ -13,7 +13,9 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from c64_test_harness import wait_for_text, write_bytes
+import time
+
+from c64_test_harness import ScreenGrid, write_bytes
 from c64_test_harness.backends.vice_lifecycle import ViceConfig
 from c64_test_harness.backends.vice_manager import ViceInstanceManager
 
@@ -132,7 +134,15 @@ def main() -> int:
         # Wait for BASIC READY prompt on each
         print("\nWaiting for VICE to boot...")
         for i, inst in enumerate(instances):
-            grid = wait_for_text(inst.transport, "READY.", timeout=30.0)
+            deadline = time.monotonic() + 30.0
+            grid = None
+            while time.monotonic() < deadline:
+                g = ScreenGrid.from_transport(inst.transport)
+                if "READY." in g.continuous_text().upper():
+                    grid = g
+                    break
+                inst.transport.resume()
+                time.sleep(1.0)
             if grid is None:
                 print(f"  FATAL: Instance {i} did not reach READY prompt")
                 return 1
