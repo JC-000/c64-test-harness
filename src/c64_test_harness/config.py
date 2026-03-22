@@ -65,9 +65,6 @@ class HarnessConfig:
     exec_poll_interval: float = 0.2
     screen_poll_interval: float = 2.0
 
-    # Monitor type
-    vice_monitor_type: str = "text"  # "binary" or "text"
-
     # Ethernet / RR-Net
     vice_ethernet: bool = False
     vice_ethernet_mode: str = "rrnet"

@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable
 
-from .backends.vice import ViceTransport
+from .backends.vice_binary import BinaryViceTransport
 from .backends.vice_manager import ViceInstanceManager
 
 
@@ -63,7 +63,7 @@ class ParallelTestResult:
 
 def run_parallel(
     manager: ViceInstanceManager,
-    tests: list[tuple[str, Callable[[ViceTransport], tuple[bool, str]]]],
+    tests: list[tuple[str, Callable[[BinaryViceTransport], tuple[bool, str]]]],
     max_workers: int | None = None,
 ) -> ParallelTestResult:
     """Run *tests* in parallel, each on its own VICE instance.
@@ -74,7 +74,7 @@ def run_parallel(
         Instance manager to acquire/release VICE instances from.
     tests:
         List of ``(name, test_fn)`` tuples. Each *test_fn* receives a
-        ``ViceTransport`` and must return ``(passed, message)``.
+        ``BinaryViceTransport`` and must return ``(passed, message)``.
     max_workers:
         Maximum concurrent tests. Defaults to ``len(tests)``.
 
@@ -89,7 +89,7 @@ def run_parallel(
     result = ParallelTestResult()
     wall_start = time.monotonic()
 
-    def _run_one(name: str, fn: Callable[[ViceTransport], tuple[bool, str]]) -> SingleTestResult:
+    def _run_one(name: str, fn: Callable[[BinaryViceTransport], tuple[bool, str]]) -> SingleTestResult:
         t0 = time.monotonic()
         instance = manager.acquire()
         vice_pid = instance.pid

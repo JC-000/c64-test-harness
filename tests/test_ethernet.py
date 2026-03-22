@@ -1,8 +1,10 @@
-"""Ethernet / RR-Net (CS8900a) integration tests.
+"""Ethernet / RR-Net (CS8900a) integration tests (binary monitor transport).
 
 Validates that VICE can emulate the CS8900a ethernet chip via the RR-Net
 cartridge mode, connected to a host TAP interface.  Tests probe the chip
 ID register and exercise TX/RX packet I/O.
+
+Uses BinaryViceTransport (-binarymonitor) for all VICE communication.
 
 Requirements:
 - x64sc on PATH with ethernet cartridge support
@@ -11,6 +13,12 @@ Requirements:
 - VICE must be compiled with tuntap or pcap driver support
 
 All tests are skipped automatically if prerequisites are missing.
+
+The ``_binary_jsr()`` helper uses the binary protocol's checkpoint mechanism:
+``set_checkpoint()`` + ``set_registers()`` + ``resume()`` + ``wait_for_stopped()``.
+
+See ``test_disk_vice.py`` module docstring for the screen polling / ``resume()``
+interaction explanation.
 """
 
 from __future__ import annotations
@@ -23,12 +31,15 @@ import time
 
 import pytest
 
-from c64_test_harness.backends.vice import ViceTransport
+from c64_test_harness.backends.vice_binary import BinaryViceTransport
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 from c64_test_harness.backends.vice_manager import PortAllocator
-from c64_test_harness.execute import jsr, load_code, goto, wait_for_pc
+from c64_test_harness.execute import load_code
 from c64_test_harness.memory import read_bytes, write_bytes
-from c64_test_harness.screen import wait_for_text
+from c64_test_harness.screen import ScreenGrid
+from c64_test_harness.transport import TransportError
+
+from conftest import connect_binary_transport
 
 # ---------------------------------------------------------------------------
 # Skip helpers
@@ -72,6 +83,69 @@ TXLEN = RRNET_BASE + 0x06       # TX length (16-bit)
 PPTR = RRNET_BASE + 0x0A        # PacketPage Pointer (16-bit)
 PPDATA = RRNET_BASE + 0x0C      # PacketPage Data (16-bit)
 
+
+# ---------------------------------------------------------------------------
+# Binary transport helpers
+# ---------------------------------------------------------------------------
+
+def _binary_jsr(
+    transport: BinaryViceTransport,
+    addr: int,
+    timeout: float = 10.0,
+    scratch_addr: int = 0x0334,
+) -> dict[str, int]:
+    """JSR via binary monitor checkpoint mechanism.
+
+    Writes a trampoline (JSR addr; NOP; NOP) at *scratch_addr*, sets a
+    checkpoint (breakpoint) at scratch_addr+3, sets PC to scratch_addr,
+    resumes, and waits for the CPU to stop at the breakpoint.
+
+    Returns the register state after the subroutine returns.
+    """
+    trampoline = bytes([
+        0x20, addr & 0xFF, (addr >> 8) & 0xFF,  # JSR addr
+        0xEA,  # NOP (breakpoint here)
+        0xEA,  # NOP
+    ])
+    transport.write_memory(scratch_addr, trampoline)
+    bp_addr = scratch_addr + 3
+    bp_num = transport.set_checkpoint(bp_addr)
+    try:
+        transport.set_registers({"PC": scratch_addr})
+        transport.resume()
+        transport.wait_for_stopped(timeout=timeout)
+        regs = transport.read_registers()
+        return regs
+    finally:
+        transport.delete_checkpoint(bp_num)
+
+
+def _binary_wait_for_text(
+    transport: BinaryViceTransport,
+    needle: str,
+    timeout: float = 30.0,
+    poll_interval: float = 2.0,
+) -> ScreenGrid | None:
+    """Wait until *needle* appears on screen, resuming between polls.
+
+    See ``test_disk_vice.py`` module docstring for why this is needed.
+    """
+    needle_upper = needle.upper()
+    start = time.monotonic()
+    while True:
+        elapsed = time.monotonic() - start
+        if elapsed >= timeout:
+            return None
+        try:
+            transport.resume()
+            time.sleep(poll_interval)
+            grid = ScreenGrid.from_transport(transport)
+            if needle_upper in grid.continuous_text().upper():
+                return grid
+        except Exception:
+            time.sleep(poll_interval)
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -97,11 +171,9 @@ def vice_ethernet():
     )
 
     with ViceProcess(config) as vice:
-        assert vice.wait_for_monitor(timeout=30), \
-            "VICE monitor did not become available"
-        transport = ViceTransport(port=port)
+        transport = connect_binary_transport(port, proc=vice)
         try:
-            grid = wait_for_text(transport, "READY.", timeout=30, verbose=False)
+            grid = _binary_wait_for_text(transport, "READY.", timeout=30)
             assert grid is not None, "BASIC READY prompt not found"
             yield transport
         finally:
@@ -117,8 +189,8 @@ def vice_ethernet():
 class TestCS8900aProbe:
     """Verify CS8900a chip is present by reading Product ID register."""
 
-    def test_product_id(self, vice_ethernet: ViceTransport) -> None:
-        """Read CS8900a Product ID — expect 0x630E."""
+    def test_product_id(self, vice_ethernet: BinaryViceTransport) -> None:
+        """Read CS8900a Product ID -- expect 0x630E."""
         transport = vice_ethernet
 
         # 6502 routine: probe CS8900a Product ID
@@ -136,7 +208,7 @@ class TestCS8900aProbe:
         ])
 
         load_code(transport, CODE_BASE, probe_code)
-        regs = jsr(transport, CODE_BASE, timeout=10)
+        regs = _binary_jsr(transport, CODE_BASE, timeout=10)
 
         result = read_bytes(transport, 0xC000, 2)
         chip_id = result[0] | (result[1] << 8)
@@ -184,7 +256,7 @@ class TestEthernetTX:
         if TAP_IFACE is None or not _can_open_raw_socket(TAP_IFACE):
             pytest.skip("Cannot open raw socket on TAP interface (need CAP_NET_RAW)")
 
-    def test_send_broadcast_frame(self, vice_ethernet: ViceTransport) -> None:
+    def test_send_broadcast_frame(self, vice_ethernet: BinaryViceTransport) -> None:
         """C64 sends a 64-byte broadcast frame; host captures it."""
         transport = vice_ethernet
 
@@ -217,7 +289,7 @@ class TestEthernetTX:
             # .wait:
             0xAD, 0x0D, 0xDE,  # LDA $DE0D  (PP Data high)
             0x29, 0x01,        # AND #$01
-            0xF0, 0xF9,        # BEQ .wait  (-7 → back to LDA $DE0D)
+            0xF0, 0xF9,        # BEQ .wait  (-7 -> back to LDA $DE0D)
 
             # --- Write frame data ---
             # Set up ZP pointer: $FB/$FC = FRAME_BUF ($C200)
@@ -236,7 +308,7 @@ class TestEthernetTX:
             0x8D, 0x01, 0xDE,  # STA $DE01
             0xC8,              # INY
             0xC0, 0x40,        # CPY #$40       ; 64 bytes done?
-            0xD0, 0xF2,        # BNE .loop      (-14 → back to LDA ($FB),Y)
+            0xD0, 0xF2,        # BNE .loop      (-14 -> back to LDA ($FB),Y)
 
             # Store success flag
             0xA9, 0x01,        # LDA #$01
@@ -254,8 +326,8 @@ class TestEthernetTX:
         sock.settimeout(5.0)
 
         try:
-            # Execute TX routine
-            regs = jsr(transport, CODE_BASE, timeout=10)
+            # Execute TX routine via binary checkpoint mechanism
+            regs = _binary_jsr(transport, CODE_BASE, timeout=10)
 
             # Verify success flag
             flag = read_bytes(transport, 0xC000, 1)
@@ -288,7 +360,7 @@ class TestEthernetRX:
         if TAP_IFACE is None or not _can_open_raw_socket(TAP_IFACE):
             pytest.skip("Cannot open raw socket on TAP interface (need CAP_NET_RAW)")
 
-    def test_receive_frame(self, vice_ethernet: ViceTransport) -> None:
+    def test_receive_frame(self, vice_ethernet: BinaryViceTransport) -> None:
         """Host sends a frame to the TAP; C64 reads it via CS8900a RX."""
         transport = vice_ethernet
 
@@ -332,7 +404,7 @@ class TestEthernetRX:
             0xC6, 0xFE,        # DEC $FE
             0xD0, 0xF1,        # BNE .poll  (-15)
 
-            # Timeout — store 0xFF at $C000 as error flag
+            # Timeout -- store 0xFF at $C000 as error flag
             0xA9, 0xFF,        # LDA #$FF
             0x8D, 0x00, 0xC0,  # STA $C000
             0x60,              # RTS
@@ -376,17 +448,23 @@ class TestEthernetRX:
         write_bytes(transport, 0xC000, [0x00] * 5)
 
         # We need to execute the RX routine, then send the packet while
-        # the routine is polling. Use goto() + send packet + wait_for_pc
+        # the routine is polling. Use goto() + send packet + wait_for_stopped
         # on the RTS address.
 
-        # Calculate RTS address (end of routine)
-        rts_offset = len(rx_code) - 1  # last byte is RTS
-        rts_addr = CODE_BASE + rts_offset
-
-        # But we also have the timeout-exit RTS. We need a breakpoint
-        # approach. Let's use jsr with a longer timeout and send the
-        # packet from a thread.
+        # For binary transport, we use set_checkpoint on the RTS + resume,
+        # then send the packet from a thread while the C64 polls.
         import threading
+
+        # Write a trampoline at scratch area and set breakpoint after JSR
+        scratch_addr = 0x0334
+        trampoline = bytes([
+            0x20, CODE_BASE & 0xFF, (CODE_BASE >> 8) & 0xFF,  # JSR CODE_BASE
+            0xEA,  # NOP (breakpoint here)
+            0xEA,  # NOP
+        ])
+        transport.write_memory(scratch_addr, trampoline)
+        bp_addr = scratch_addr + 3
+        bp_num = transport.set_checkpoint(bp_addr)
 
         def _send_packet_delayed():
             """Send the RX frame after a short delay."""
@@ -402,7 +480,14 @@ class TestEthernetRX:
         sender = threading.Thread(target=_send_packet_delayed, daemon=True)
         sender.start()
 
-        regs = jsr(transport, CODE_BASE, timeout=15)
+        try:
+            transport.set_registers({"PC": scratch_addr})
+            transport.resume()
+            transport.wait_for_stopped(timeout=15)
+            regs = transport.read_registers()
+        finally:
+            transport.delete_checkpoint(bp_num)
+
         sender.join(timeout=2)
 
         # Check results
@@ -410,7 +495,7 @@ class TestEthernetRX:
         success = result[4]
 
         if result[0] == 0xFF and success != 0x01:
-            pytest.skip("RX poll timed out — packet may not have reached CS8900a")
+            pytest.skip("RX poll timed out -- packet may not have reached CS8900a")
 
         assert success == 0x01, \
             f"RX routine did not complete successfully (flag=0x{success:02X})"
