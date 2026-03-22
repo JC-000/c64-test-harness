@@ -64,9 +64,17 @@ class ViceConfig:
     ntsc: bool = True
     sound: bool = False
     minimize: bool = True
+    monitor_type: str = "text"  # "binary" or "text"
     extra_args: list[str] = field(default_factory=list)
     disk_image: DiskImage | None = None
     drive_unit: int = 8
+
+    # Ethernet / RR-Net
+    ethernet: bool = False
+    ethernet_mode: str = "rrnet"  # "rrnet" or "tfe"
+    ethernet_interface: str = ""  # host interface (e.g. "tap-c64")
+    ethernet_driver: str = ""  # "tuntap" or "pcap" (empty = VICE default)
+    ethernet_base: int = 0xDE00  # I/O base address
 
 
 class ViceProcess:
@@ -110,12 +118,29 @@ class ViceProcess:
             args.append("-warp")
         if cfg.ntsc:
             args.append("-ntsc")
-        args += ["-remotemonitor", "-remotemonitoraddress", f"ip4://127.0.0.1:{cfg.port}"]
+        if cfg.monitor_type == "binary":
+            args += ["-binarymonitor", "-binarymonitoraddress",
+                     f"ip4://127.0.0.1:{cfg.port}"]
+        else:
+            args += ["-remotemonitor", "-remotemonitoraddress",
+                     f"ip4://127.0.0.1:{cfg.port}"]
         if not cfg.sound:
             args.append("+sound")
         if cfg.minimize:
             args.append("-minimized")
         args += cfg.extra_args
+
+        if cfg.ethernet:
+            if cfg.ethernet_mode == "rrnet":
+                args.append("-rrnet")
+            else:
+                args.append("-tfe")
+            if cfg.ethernet_interface:
+                args += ["-ethernetioif", cfg.ethernet_interface]
+            if cfg.ethernet_driver:
+                args += ["-ethernetiodriver", cfg.ethernet_driver]
+            if cfg.ethernet_base != 0xDE00:
+                args += ["-ethernetcartbase", f"0x{cfg.ethernet_base:04X}"]
 
         if cfg.disk_image is not None:
             args += [
