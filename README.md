@@ -200,7 +200,7 @@ from c64_test_harness import (
 
 config = ViceConfig(prg_path="build/mygame.prg", warp=True)
 
-with ViceInstanceManager(config, port_range_start=6510, port_range_end=6515) as mgr:
+with ViceInstanceManager(config, port_range_start=6511, port_range_end=6516) as mgr:
     # Context-managed instance (auto-release)
     with mgr.instance() as inst:
         # inst.transport is a BinaryViceTransport
@@ -300,7 +300,7 @@ config = HarnessConfig.from_toml("c64_harness.toml")
 config = HarnessConfig.from_env()
 
 # Or construct directly with defaults
-config = HarnessConfig(vice_port=6510, vice_warp=True)
+config = HarnessConfig(vice_port=6502, vice_warp=True)
 ```
 
 Key fields: `vice_host`, `vice_port`, `vice_executable`, `vice_prg_path`, `vice_warp`, `vice_sound`, `vice_minimize`, `screen_base`, `vice_port_range_start/end`, `vice_reuse_existing`, `vice_acquire_retries`, `exec_poll_interval`, `screen_poll_interval`.

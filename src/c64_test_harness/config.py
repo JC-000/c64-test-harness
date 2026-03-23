@@ -29,7 +29,10 @@ class HarnessConfig:
 
     # VICE connection
     vice_host: str = "127.0.0.1"
-    vice_port: int = 6510
+    vice_port: int = 6502
+    # NOTE: port 6510 is VICE's default text monitor port and must be
+    # avoided in port ranges — VICE misbehaves when the binary monitor
+    # is bound to that port.
     vice_timeout: float = 5.0
 
     # VICE executable
@@ -52,8 +55,8 @@ class HarnessConfig:
     keybuf_max: int = 10
 
     # Multi-instance
-    vice_port_range_start: int = 6510
-    vice_port_range_end: int = 6520
+    vice_port_range_start: int = 6511
+    vice_port_range_end: int = 6531
     vice_reuse_existing: bool = False
     vice_acquire_retries: int = 3
 

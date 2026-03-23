@@ -13,7 +13,7 @@ def test_default_values():
     cfg = ViceConfig()
     assert cfg.executable == "x64sc"
     assert cfg.prg_path == ""
-    assert cfg.port == 6510
+    assert cfg.port == 6502
     assert cfg.warp is True
     assert cfg.ntsc is True
     assert cfg.sound is False
