@@ -5,7 +5,7 @@ import time
 
 from c64_test_harness import BinaryViceTransport, ScreenGrid
 
-transport = BinaryViceTransport()  # localhost:6510
+transport = BinaryViceTransport()  # localhost:6502
 
 print("Waiting for 'READY.' on screen...")
 deadline = time.monotonic() + 30
