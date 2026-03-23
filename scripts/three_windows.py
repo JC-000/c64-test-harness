@@ -122,8 +122,8 @@ def main() -> int:
 
     with ViceInstanceManager(
         config=config,
-        port_range_start=6510,
-        port_range_end=6513,
+        port_range_start=6511,
+        port_range_end=6514,
     ) as mgr:
         instances = []
         for i in range(3):
