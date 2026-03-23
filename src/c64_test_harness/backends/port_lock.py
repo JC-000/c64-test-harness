@@ -35,17 +35,17 @@ class PortLock:
 
     Usage::
 
-        lock = PortLock(6510)
+        lock = PortLock(6502)
         if lock.acquire():
             try:
-                # port 6510 is exclusively ours
+                # port 6502 is exclusively ours
                 ...
             finally:
                 lock.release()
 
     Or as a context manager (acquires on enter, releases on exit)::
 
-        lock = PortLock(6510)
+        lock = PortLock(6502)
         with lock:
             ...
     """
