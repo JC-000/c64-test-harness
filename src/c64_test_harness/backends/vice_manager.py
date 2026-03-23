@@ -311,6 +311,13 @@ class ViceInstanceManager:
             sound=self._base_config.sound,
             minimize=self._base_config.minimize,
             extra_args=list(self._base_config.extra_args),
+            disk_image=self._base_config.disk_image,
+            drive_unit=self._base_config.drive_unit,
+            ethernet=self._base_config.ethernet,
+            ethernet_mode=self._base_config.ethernet_mode,
+            ethernet_interface=self._base_config.ethernet_interface,
+            ethernet_driver=self._base_config.ethernet_driver,
+            ethernet_base=self._base_config.ethernet_base,
         )
         proc = ViceProcess(cfg)
 
