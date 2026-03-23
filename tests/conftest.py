@@ -124,7 +124,7 @@ def binary_transport():
     if shutil.which("x64sc") is None:
         pytest.skip("x64sc not found on PATH")
 
-    allocator = PortAllocator(port_range_start=6540, port_range_end=6550)
+    allocator = PortAllocator(port_range_start=6511, port_range_end=6531)
     port = allocator.allocate()
     reservation = allocator.take_socket(port)
     if reservation is not None:
