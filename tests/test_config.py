@@ -13,7 +13,7 @@ class TestDefaults:
         cfg = HarnessConfig()
         assert cfg.backend == "vice"
         assert cfg.vice_host == "127.0.0.1"
-        assert cfg.vice_port == 6510
+        assert cfg.vice_port == 6502
         assert cfg.screen_cols == 40
         assert cfg.screen_rows == 25
         assert cfg.keybuf_addr == 0x0277
@@ -65,7 +65,7 @@ class TestFromEnv:
 
     def test_unset_vars_use_defaults(self):
         cfg = HarnessConfig.from_env()
-        assert cfg.vice_port == 6510
+        assert cfg.vice_port == 6502
 
 
 class TestFromToml:

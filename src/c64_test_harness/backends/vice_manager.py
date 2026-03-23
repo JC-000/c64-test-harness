@@ -36,8 +36,8 @@ class PortAllocator:
 
     def __init__(
         self,
-        port_range_start: int = 6510,
-        port_range_end: int = 6520,
+        port_range_start: int = 6511,
+        port_range_end: int = 6531,
     ) -> None:
         self._start = port_range_start
         self._end = port_range_end
@@ -195,8 +195,8 @@ class ViceInstanceManager:
     def __init__(
         self,
         config: ViceConfig | None = None,
-        port_range_start: int = 6510,
-        port_range_end: int = 6520,
+        port_range_start: int = 6511,
+        port_range_end: int = 6531,
         reuse_existing: bool = False,
         max_retries: int = 3,
     ) -> None:

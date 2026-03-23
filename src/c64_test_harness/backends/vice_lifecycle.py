@@ -59,7 +59,7 @@ class ViceConfig:
 
     executable: str = "x64sc"
     prg_path: str = ""
-    port: int = 6510
+    port: int = 6502
     warp: bool = True
     ntsc: bool = True
     sound: bool = False

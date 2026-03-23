@@ -69,7 +69,7 @@ class BinaryViceTransport:
     def __init__(
         self,
         host: str = "127.0.0.1",
-        port: int = 6510,
+        port: int = 6502,
         timeout: float = 5.0,
         screen_base: int = 0x0400,
         keybuf_addr: int = 0x0277,
