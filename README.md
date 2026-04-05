@@ -304,11 +304,73 @@ Key fields: `vice_host`, `vice_port`, `vice_executable`, `vice_prg_path`, `vice_
 
 **Window focus:** VICE windows start minimized by default (`ViceConfig.minimize = True`) to prevent focus stealing during automated test runs. Set `minimize=False` in `ViceConfig` (or `vice_minimize = false` in TOML / `C64TEST_VICE_MINIMIZE=0` in env) if you need visible windows.
 
+## Ultimate 64 Hardware Backend
+
+`Ultimate64Transport` talks to an Ultimate 64 (or Ultimate II+) running 1541ultimate firmware 3.11+ via its REST API over HTTP. No emulator, no TCP monitor — memory reads/writes and keyboard injection go through the device's DMA endpoints.
+
+```python
+from c64_test_harness import (
+    Ultimate64Transport, ScreenGrid, send_text, send_key,
+    wait_for_text, wait_for_stable,
+)
+
+transport = Ultimate64Transport(host="192.168.1.81")  # optional: password="..."
+try:
+    wait_for_text(transport, "READY.", timeout=10)
+    send_text(transport, "PRINT 2+2\r")
+    wait_for_stable(transport, timeout=5)
+    grid = ScreenGrid.from_transport(transport)
+    assert "4" in grid.text()
+finally:
+    transport.close()
+```
+
+Multiple devices can be pooled with `Ultimate64InstanceManager` — the same pattern as `ViceInstanceManager`, compatible with `run_parallel()`:
+
+```python
+from c64_test_harness import Ultimate64Device, Ultimate64InstanceManager, run_parallel
+
+devices = [
+    Ultimate64Device(host="192.168.1.81"),
+    Ultimate64Device(host="192.168.1.82"),
+]
+with Ultimate64InstanceManager(devices) as mgr:
+    with mgr.instance() as inst:
+        inst.transport.read_memory(0x0400, 40)
+    # run_parallel(mgr, tests, max_workers=2)
+```
+
+### Configuration helpers
+
+Ergonomic wrappers over the firmware config API — turbo speed, REU size, SID sockets, disk mounting, PRG run/load, and full snapshot/restore:
+
+```python
+from c64_test_harness import (
+    set_turbo_mhz, set_reu, set_sid_socket,
+    mount_disk_file, unmount, run_prg_file, load_prg_file,
+    snapshot_state, restore_state,
+)
+
+set_turbo_mhz(transport, 4)            # 1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 28, 32, 40, 48
+set_reu(transport, enabled=True, size_mb=16)
+mount_disk_file(transport, "build/disk.d64", drive="a")
+run_prg_file(transport, "build/app.prg")
+
+snap = snapshot_state(transport)        # capture turbo/REU/SID config
+# ... run tests ...
+restore_state(transport, snap)          # put device back as you found it
+```
+
+See `examples/ultimate64_hello.py` for a full BASIC round-trip demo and `scripts/probe_u64.py` for device capability discovery.
+
+**Limitations on hardware:** The REST API does not expose CPU registers or breakpoints. `jsr()`, `wait_for_pc()`, `set_breakpoint()`, and `set_register()` are VICE-only — they are not available on `Ultimate64Transport`. Tests that need register-precise execution control must use the VICE backend. Memory read/write, screen capture, keyboard injection, and screen-text waiting all work identically to VICE.
+
 ## Architecture
 
 ```
 C64Transport (Protocol)
   +-- BinaryViceTransport  (VICE binary monitor, persistent TCP)
+  +-- Ultimate64Transport  (Ultimate 64 REST API, HTTP/DMA)
   +-- HardwareTransportBase  (extension point for real hardware)
 
 ViceInstanceManager
@@ -333,6 +395,7 @@ The `examples/` directory contains runnable demos:
 | `examples/direct_memory_test.py` | Load and execute 6502 code directly in RAM |
 | `examples/drive_menu.py` | Navigate disk drive menus |
 | `examples/custom_backend.py` | Implement a custom `C64Transport` backend |
+| `examples/ultimate64_hello.py` | End-to-end BASIC round-trip on an Ultimate 64 |
 
 Additional scripts in `scripts/`:
 
@@ -343,6 +406,7 @@ Additional scripts in `scripts/`:
 | `scripts/run_all_tests.py` | Parallel test runner for the full test suite |
 | `scripts/stress_port_allocation.py` | Cross-process port allocation stress test |
 | `scripts/stress_cross_process.py` | Multi-agent VICE instance management stress test (5 phases) |
+| `scripts/probe_u64.py` | Probe an Ultimate 64 device (firmware, endpoints, config surface) |
 
 ## Running Tests
 
