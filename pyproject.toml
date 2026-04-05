@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "c64-test-harness"
-version = "0.4.3"
+version = "0.4.4"
 description = "Reusable test harness for Commodore 64 programs via VICE emulator or hardware"
 readme = "README.md"
 license = "MIT"

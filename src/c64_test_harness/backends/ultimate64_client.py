@@ -293,14 +293,22 @@ class Ultimate64Client:
         self._put_binary("/v1/runners:run_crt", data)
 
     def sid_play(self, data: bytes, songnr: int = 0) -> None:
-        """PUT /v1/runners:sid_play — play a .sid tune (DESTRUCTIVE)."""
+        """POST /v1/runners:sidplay — play a .sid tune (DESTRUCTIVE).
+
+        Firmware 3.14 exposes this as POST to ``sidplay`` (no underscore);
+        the PUT/``sid_play`` form returns HTTP 404.
+        """
         if not isinstance(songnr, int) or songnr < 0:
             raise ValueError(f"songnr must be >= 0, got {songnr}")
-        self._put_binary("/v1/runners:sid_play", data, query={"songnr": "%d" % songnr})
+        self._post_binary("/v1/runners:sidplay", data, query={"songnr": "%d" % songnr})
 
     def mod_play(self, data: bytes) -> None:
-        """PUT /v1/runners:mod_play — play a .mod file (DESTRUCTIVE)."""
-        self._put_binary("/v1/runners:mod_play", data)
+        """POST /v1/runners:modplay — play a .mod file (DESTRUCTIVE).
+
+        Firmware 3.14 exposes this as POST to ``modplay`` (no underscore);
+        the PUT/``mod_play`` form returns HTTP 404.
+        """
+        self._post_binary("/v1/runners:modplay", data)
 
     def _put_binary(
         self,
@@ -312,6 +320,22 @@ class Ultimate64Client:
             raise TypeError("data must be bytes")
         self._request(
             "PUT",
+            path,
+            body=bytes(data),
+            content_type="application/octet-stream",
+            query=query,
+        )
+
+    def _post_binary(
+        self,
+        path: str,
+        data: bytes,
+        query: dict[str, Any] | None = None,
+    ) -> None:
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("data must be bytes")
+        self._request(
+            "POST",
             path,
             body=bytes(data),
             content_type="application/octet-stream",
