@@ -335,8 +335,25 @@ def test_sid_play_includes_songnr():
     c = Ultimate64Client("h")
     with patch("urllib.request.urlopen", mock):
         c.sid_play(b"PSID", songnr=3)
-    url = captured[0][0].get_full_url()
-    assert url == "http://h/v1/runners:sid_play?songnr=3"
+    req = captured[0][0]
+    # Firmware 3.14 exposes POST /v1/runners:sidplay (no underscore).
+    assert req.get_method() == "POST"
+    assert req.get_full_url() == "http://h/v1/runners:sidplay?songnr=3"
+    assert req.data == b"PSID"
+    assert req.get_header("Content-type") == "application/octet-stream"
+
+
+def test_mod_play_sends_post():
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        c.mod_play(b"MODDATA")
+    req = captured[0][0]
+    # Firmware 3.14 exposes POST /v1/runners:modplay (no underscore).
+    assert req.get_method() == "POST"
+    assert req.get_full_url() == "http://h/v1/runners:modplay"
+    assert req.data == b"MODDATA"
+    assert req.get_header("Content-type") == "application/octet-stream"
 
 
 # ---------------------------------------------------------------- config write

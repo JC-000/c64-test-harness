@@ -67,6 +67,16 @@ from .backends.ultimate64_schema import (
     SIDSocketConfig,
 )
 from .parallel import run_parallel, ParallelTestResult, SingleTestResult
+from .sid import SidFile, SidError, SidFormatError, build_test_psid
+from .sid_player import (
+    play_sid,
+    play_sid_vice,
+    play_sid_ultimate64,
+    stop_sid_vice,
+    build_vice_stub,
+    SidPlaybackError,
+    DEFAULT_STUB_ADDR,
+)
 
 __all__ = [
     # Protocol + exceptions
@@ -171,4 +181,17 @@ __all__ = [
     "run_parallel",
     "ParallelTestResult",
     "SingleTestResult",
+    # SID file parsing
+    "SidFile",
+    "SidError",
+    "SidFormatError",
+    "build_test_psid",
+    # SID playback
+    "play_sid",
+    "play_sid_vice",
+    "play_sid_ultimate64",
+    "stop_sid_vice",
+    "build_vice_stub",
+    "SidPlaybackError",
+    "DEFAULT_STUB_ADDR",
 ]
