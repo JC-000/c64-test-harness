@@ -198,17 +198,20 @@ def run_one_speed(
     print(f"  {mhz} MHz")
     print(f"{'='*60}")
 
-    # 1. Load program at STOCK speed — REU DMA init fails at some turbo speeds
-    print("  Loading x25519.prg at stock speed ...", flush=True)
-    set_turbo_mhz(client, None)  # disable turbo for boot
+    # 1. Set turbo FIRST, then load program
+    print(f"  Setting turbo to {mhz} MHz ...", flush=True)
+    set_turbo_mhz(client, mhz)
     time.sleep(0.5)
+
+    # 2. Load and run the PRG (resets + loads + auto-starts)
+    print("  Loading x25519.prg ...", flush=True)
     client.run_prg(prg_data)
     time.sleep(2.0)
 
-    # 2. Verify program actually started by polling main_loop for JMP $082A
+    # 3. Verify program actually started by polling main_loop for JMP $082A
     #    (not just screen text, which can be stale from a previous run)
     print("  Waiting for program init ...", flush=True)
-    boot_deadline = time.monotonic() + 60.0
+    boot_deadline = time.monotonic() + 120.0
     while time.monotonic() < boot_deadline:
         ml = transport.read_memory(main_loop, 3)
         if ml == bytes([0x4C, 0x2A, 0x08]):
@@ -217,12 +220,7 @@ def run_one_speed(
     else:
         print(f"  ERROR: Program did not start (main_loop={ml.hex()}). Skipping.")
         return None
-    time.sleep(0.5)
-
-    # 3. NOW set turbo speed — program is initialized, tables built
-    print(f"  Setting turbo to {mhz} MHz ...", flush=True)
-    set_turbo_mhz(client, mhz)
-    time.sleep(0.5)
+    time.sleep(1.0)  # settle after init
 
     print("  Setting up benchmark ...", flush=True)
 
