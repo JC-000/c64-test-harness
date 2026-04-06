@@ -12,6 +12,7 @@ import os
 
 import pytest
 
+from c64_test_harness.backends.device_lock import DeviceLock
 from c64_test_harness.backends.ultimate64 import Ultimate64Transport
 from c64_test_harness.transport import C64Transport
 
@@ -26,9 +27,13 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def transport() -> Ultimate64Transport:
+    lock = DeviceLock(_HOST)
+    if not lock.acquire(timeout=120.0):
+        pytest.skip(f"Could not acquire device lock for {_HOST}")
     t = Ultimate64Transport(host=_HOST, password=_PW, timeout=8.0)
     yield t
     t.close()
+    lock.release()
 
 
 def test_protocol_conformance(transport: Ultimate64Transport) -> None:

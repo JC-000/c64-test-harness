@@ -340,6 +340,43 @@ with Ultimate64InstanceManager(devices) as mgr:
     # run_parallel(mgr, tests, max_workers=2)
 ```
 
+### Unified Backend Manager
+
+`UnifiedManager` provides backend-agnostic test target acquisition — agents specify `"vice"` or `"u64"` (or `"auto"` to read the `C64_BACKEND` env var) and get back a `TestTarget` with a ready-to-use transport:
+
+```python
+from c64_test_harness import create_manager
+
+# Reads C64_BACKEND and U64_HOST from environment
+with create_manager() as mgr:
+    with mgr.instance() as target:
+        target.transport.write_memory(0xC000, b"\xDE\xAD")
+        print(f"Backend: {target.backend}, PID: {target.pid}")
+```
+
+Environment variables: `C64_BACKEND` (`vice` or `u64`), `U64_HOST` (comma-separated for multiple devices), `U64_PASSWORD`.
+
+When the U64 backend is selected, `UnifiedManager` automatically wraps device access with `DeviceLock` — an `fcntl.flock`-based cross-process lock that serializes access to each physical device. Multiple independent agents (separate OS processes) can safely target the same U64 without coordination; the lock file queues them automatically. This is the same kernel-enforced locking pattern used by `PortLock` for VICE port allocation.
+
+### Liveness Probe
+
+Before connecting, probe whether a U64 device is reachable:
+
+```python
+from c64_test_harness import probe_u64, is_u64_reachable
+
+# Quick boolean check
+if is_u64_reachable("192.168.1.81"):
+    print("Device is up")
+
+# Detailed probe: ICMP ping -> TCP connect -> REST API check
+result = probe_u64("192.168.1.81")
+print(result.summary)  # "U64 at 192.168.1.81: reachable (ping=1.2ms, port=0.8ms, api=5.3ms)"
+# result.reachable, result.ping_ok, result.port_ok, result.api_ok, result.latency_ms, result.error
+```
+
+The probe runs with short timeouts (2s ping, 2s TCP, 3s API) and fails fast — if ping fails, TCP and API checks are skipped. `Ultimate64InstanceManager.acquire()` uses the probe internally to skip unreachable devices and try the next one in the pool.
+
 ### Configuration helpers
 
 Ergonomic wrappers over the firmware config API — turbo speed, REU size, SID sockets, disk mounting, PRG run/load, and full snapshot/restore:
@@ -431,10 +468,18 @@ C64Transport (Protocol)
   +-- Ultimate64Transport  (Ultimate 64 REST API, HTTP/DMA)
   +-- HardwareTransportBase  (extension point for real hardware)
 
-ViceInstanceManager
-  +-- PortAllocator      (thread-safe port range + file locks)
-  +-- PortLock           (fcntl.flock cross-process lock per port)
-  +-- ViceInstance        (port + process + transport + lock handle)
+UnifiedManager (backend-agnostic)
+  +-- ViceInstanceManager   (VICE emulator pool)
+  |     +-- PortAllocator   (thread-safe port range + file locks)
+  |     +-- PortLock        (fcntl.flock cross-process lock per port)
+  |     +-- ViceInstance    (port + process + transport + lock handle)
+  +-- _LockedU64Manager     (U64 hardware pool + cross-process queue)
+        +-- Ultimate64InstanceManager  (in-process thread-safe pool)
+        +-- DeviceLock      (fcntl.flock cross-process lock per device)
+        +-- probe_u64()     (ping + TCP + API liveness check)
+
+TestTarget: backend-agnostic handle (.transport, .backend, .pid)
+create_manager(): factory from env vars (C64_BACKEND, U64_HOST)
 
 Screen/Keyboard/Memory modules sit above the transport:
   ScreenGrid, wait_for_text, send_text, read_bytes, etc.
@@ -468,6 +513,8 @@ Additional scripts in `scripts/`:
 | `scripts/probe_u64.py` | Probe an Ultimate 64 device (firmware, endpoints, config surface) |
 | `scripts/play_scale_u64.py` | Build + play a C-major scale PSID on an Ultimate 64 |
 | `scripts/bench_x25519_u64_turbo.py` | X25519 benchmark across U64 turbo speeds (1–48 MHz) |
+| `scripts/stress_u64_queue.py` | Cross-process DeviceLock stress test (N workers × M rounds) |
+| `scripts/run_u64_parallel_locked.py` | Run all U64 live tests in parallel with cross-process locking |
 
 ## Running Tests
 
@@ -504,7 +551,15 @@ pytest tests/test_vice_binary.py -v      # VICE binary monitor protocol tests
 # Ultimate 64 live tests (requires U64_HOST)
 U64_HOST=192.168.1.81 pytest tests/test_u64_feature_parity_live.py -v
 U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 pytest tests/test_u64_turbo_bench_live.py -v
+
+# Run all U64 live tests in parallel (DeviceLock serializes access)
+python3 scripts/run_u64_parallel_locked.py 192.168.1.81
+
+# Stress test the cross-process queueing (6 workers, 5 rounds each)
+python3 scripts/stress_u64_queue.py 192.168.1.81 --workers 6 --rounds 5
 ```
+
+All U64 live tests use `DeviceLock` to serialize access to the physical device. Multiple agents (separate OS processes) can safely run tests in parallel — the lock file queues them automatically.
 
 ## License
 

@@ -17,6 +17,7 @@ import time
 
 import pytest
 
+from c64_test_harness.backends.device_lock import DeviceLock
 from c64_test_harness.backends.ultimate64 import Ultimate64Transport
 from c64_test_harness.debug import dump_screen
 from c64_test_harness.keyboard import send_key, send_text
@@ -45,9 +46,13 @@ DATA_BASE = 0xC100
 
 @pytest.fixture(scope="module")
 def transport() -> Ultimate64Transport:
+    lock = DeviceLock(_HOST)
+    if not lock.acquire(timeout=120.0):
+        pytest.skip(f"Could not acquire device lock for {_HOST}")
     t = Ultimate64Transport(host=_HOST, password=_PW, timeout=8.0)
     yield t
     t.close()
+    lock.release()
 
 
 # ======================================================================
