@@ -324,7 +324,7 @@ def test_run_prg_sends_binary():
     with patch("urllib.request.urlopen", mock):
         c.run_prg(b"\x01\x08\x0b\x08")
     req = captured[0][0]
-    assert req.get_method() == "PUT"
+    assert req.get_method() == "POST"
     assert req.get_full_url() == "http://h/v1/runners:run_prg"
     assert req.data == b"\x01\x08\x0b\x08"
     assert req.get_header("Content-type") == "application/octet-stream"
