@@ -115,14 +115,14 @@ def _run_clamp_fresh(
     Loads at stock speed because REU DMA init fails at some turbo speeds.
     Sets target turbo AFTER program initialization completes.
     """
-    # Load at stock speed — REU init needs 1 MHz
-    set_turbo_mhz(client, None)
+    # Set turbo FIRST, then load program
+    set_turbo_mhz(client, mhz)
     time.sleep(0.3)
     client.run_prg(prg_data)
     time.sleep(2.0)
 
     # Verify program started via main_loop bytes (not stale screen text)
-    boot_deadline = time.monotonic() + 60.0
+    boot_deadline = time.monotonic() + 120.0
     while time.monotonic() < boot_deadline:
         ml = transport.read_memory(MAIN_LOOP, 3)
         if ml == bytes([0x4C, 0x2A, 0x08]):
@@ -131,9 +131,7 @@ def _run_clamp_fresh(
     else:
         raise TimeoutError(f"PRG boot timeout (main_loop={ml.hex()})")
 
-    # NOW set turbo — program is initialized
-    set_turbo_mhz(client, mhz)
-    time.sleep(0.3)
+    time.sleep(0.5)  # settle after init
 
     # Write scalar, trampoline, zero sentinel
     write_bytes(transport, X25_SCALAR, scalar)
