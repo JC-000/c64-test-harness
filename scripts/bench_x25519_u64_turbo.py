@@ -198,12 +198,21 @@ def run_one_speed(
     print(f"  {mhz} MHz")
     print(f"{'='*60}")
 
-    # 1. Set turbo FIRST, then load program
+    # 1. Full reboot to clean all FPGA/DMA state from prior speed
+    #    A soft reset (what run_prg does internally) doesn't reinitialize
+    #    the REU DMA controller — stale state from a prior turbo speed
+    #    can cause hangs (observed at 32 MHz after running at 48 MHz).
+    print("  Rebooting U64 for clean state ...", flush=True)
+    client.reboot()
+    time.sleep(8.0)  # FPGA reinit takes several seconds
+
+    # 2. Re-enable REU (reboot may reset config) and set turbo
+    set_reu(client, enabled=True, size="512 KB")
     print(f"  Setting turbo to {mhz} MHz ...", flush=True)
     set_turbo_mhz(client, mhz)
     time.sleep(0.5)
 
-    # 2. Load and run the PRG (resets + loads + auto-starts)
+    # 3. Load and run the PRG
     print("  Loading x25519.prg ...", flush=True)
     client.run_prg(prg_data)
     time.sleep(2.0)
