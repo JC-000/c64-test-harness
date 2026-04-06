@@ -13,6 +13,7 @@ import os
 
 import pytest
 
+from c64_test_harness.backends.device_lock import DeviceLock
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
 
 _HOST = os.environ.get("U64_HOST")
@@ -26,7 +27,11 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def client() -> Ultimate64Client:
-    return Ultimate64Client(_HOST, password=_PW, timeout=8.0)
+    lock = DeviceLock(_HOST)
+    if not lock.acquire(timeout=120.0):
+        pytest.skip(f"Could not acquire device lock for {_HOST}")
+    yield Ultimate64Client(_HOST, password=_PW, timeout=8.0)
+    lock.release()
 
 
 def test_get_version(client: Ultimate64Client) -> None:
