@@ -335,12 +335,24 @@ def load_prg_file(client: Ultimate64Client, path: str) -> None:
 # --------------------------------------------------------------------------- #
 
 def reset(client: Ultimate64Client) -> None:
-    """Soft-reset the C64 (``PUT /v1/machine:reset``)."""
+    """Soft-reset the C64 (``PUT /v1/machine:reset``).
+
+    Resets the 6510 CPU but does NOT reinitialize the FPGA or DMA
+    controllers.  Use :func:`reboot` instead when switching turbo
+    speeds with REU-heavy workloads — stale REU DMA state from a
+    prior turbo speed can cause hangs after a soft reset.
+    """
     client.reset()
 
 
 def reboot(client: Ultimate64Client) -> None:
-    """Full reboot of the Ultimate device (``PUT /v1/machine:reboot``)."""
+    """Full reboot of the Ultimate device (``PUT /v1/machine:reboot``).
+
+    Reinitializes the entire FPGA including DMA controllers and REU.
+    Required when switching turbo speeds between REU-heavy workloads
+    (a soft :func:`reset` leaves stale DMA state).  Allow ~8 seconds
+    for the device to become responsive after reboot.
+    """
     client.reboot()
 
 

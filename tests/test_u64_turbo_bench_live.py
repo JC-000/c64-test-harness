@@ -110,12 +110,18 @@ def _run_clamp_fresh(
     scalar: bytes,
     mhz: int,
 ) -> bytes:
-    """Load x25519.prg at stock speed, set turbo, run clamp, return result.
+    """Reboot U64, set turbo, load x25519.prg, run clamp, return result.
 
-    Loads at stock speed because REU DMA init fails at some turbo speeds.
-    Sets target turbo AFTER program initialization completes.
+    Full reboot between runs clears REU DMA controller state — a soft
+    reset (what run_prg does internally) leaves stale DMA state that
+    causes hangs when switching turbo speeds.
     """
-    # Set turbo FIRST, then load program
+    # Full reboot for clean FPGA/DMA state
+    client.reboot()
+    time.sleep(8.0)
+
+    # Re-enable REU (reboot may reset config) and set turbo
+    set_reu(client, enabled=True, size="512 KB")
     set_turbo_mhz(client, mhz)
     time.sleep(0.3)
     client.run_prg(prg_data)
