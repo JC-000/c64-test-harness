@@ -16,6 +16,7 @@ import time
 
 import pytest
 
+from c64_test_harness.backends.device_lock import DeviceLock
 from c64_test_harness.backends.ultimate64 import Ultimate64Transport
 from c64_test_harness.sid import SidFile, build_test_psid
 from c64_test_harness.sid_player import play_sid
@@ -45,6 +46,9 @@ def test_play_sid_on_ultimate64() -> None:
     Client targets ``POST /v1/runners:sidplay`` (firmware 3.14 endpoint).
     """
     sid = _build_test_sid()
+    lock = DeviceLock(_HOST)
+    if not lock.acquire(timeout=120.0):
+        pytest.skip(f"Could not acquire device lock for {_HOST}")
     transport = Ultimate64Transport(host=_HOST, password=_PW, timeout=8.0)
     try:
         # sid_play is a DMA load + run — device starts playing the SID.
@@ -81,3 +85,4 @@ def test_play_sid_on_ultimate64() -> None:
         except Exception:
             pass
         transport.close()
+        lock.release()

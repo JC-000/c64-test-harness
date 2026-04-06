@@ -49,6 +49,18 @@ from .backends.ultimate64_manager import (
     Ultimate64ManagerError,
     Ultimate64PoolExhaustedError,
 )
+from .backends.ultimate64_probe import (
+    ProbeResult,
+    probe_u64,
+    is_u64_reachable,
+)
+from .backends.device_lock import DeviceLock
+from .backends.unified_manager import (
+    TestTarget,
+    BackendManager,
+    UnifiedManager,
+    create_manager,
+)
 from .backends.ultimate64_schema import (
     CPU_SPEED_VALUES,
     CPU_SPEED_BY_MHZ,
@@ -177,6 +189,17 @@ __all__ = [
     "Ultimate64InstanceManager",
     "Ultimate64ManagerError",
     "Ultimate64PoolExhaustedError",
+    # Ultimate 64 liveness probe
+    "ProbeResult",
+    "probe_u64",
+    "is_u64_reachable",
+    # Device lock
+    "DeviceLock",
+    # Unified backend manager
+    "TestTarget",
+    "BackendManager",
+    "UnifiedManager",
+    "create_manager",
     # Parallel execution
     "run_parallel",
     "ParallelTestResult",
