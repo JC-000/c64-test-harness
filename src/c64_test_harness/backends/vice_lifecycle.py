@@ -68,6 +68,18 @@ class ViceConfig:
     disk_image: DiskImage | None = None
     drive_unit: int = 8
 
+    # Sound recording
+    sounddev: str = ""  # e.g. "wav", "pulse"
+    soundarg: str = ""  # e.g. WAV output path
+    soundrate: int = 44100  # sample rate
+    soundoutput: int = 1  # 1=mono, 2=stereo
+
+    # Cycle limiting (batch mode)
+    limit_cycles: int = 0  # if >0, VICE exits after this many cycles
+
+    # Process environment (None = inherit parent)
+    env: dict[str, str] | None = None
+
     # Ethernet / RR-Net
     ethernet: bool = False
     ethernet_mode: str = "rrnet"  # "rrnet" or "tfe"
@@ -118,8 +130,17 @@ class ViceProcess:
             args.append("-ntsc")
         args += ["-binarymonitor", "-binarymonitoraddress",
                  f"ip4://127.0.0.1:{cfg.port}"]
-        if not cfg.sound:
+        if cfg.sounddev:
+            # Force sound on when a sound device is configured
+            args += ["-sounddev", cfg.sounddev]
+            if cfg.soundarg:
+                args += ["-soundarg", cfg.soundarg]
+            args += ["-soundrate", str(cfg.soundrate)]
+            args += ["-soundoutput", str(cfg.soundoutput)]
+        elif not cfg.sound:
             args.append("+sound")
+        if cfg.limit_cycles > 0:
+            args += ["-limitcycles", str(cfg.limit_cycles)]
         if cfg.minimize:
             args.append("-minimized")
         args += cfg.extra_args
@@ -143,11 +164,36 @@ class ViceProcess:
                 f"-drive{cfg.drive_unit}type", str(cfg.disk_image.drive_type),
             ]
 
-        self._proc = subprocess.Popen(
-            args,
+        popen_kwargs: dict[str, object] = dict(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        if cfg.env is not None:
+            popen_kwargs["env"] = cfg.env
+
+        self._proc = subprocess.Popen(args, **popen_kwargs)  # type: ignore[arg-type]
+
+    def wait_for_exit(self, timeout: float = 60.0) -> int:
+        """Wait for the VICE process to exit on its own.
+
+        Returns the exit code.  Useful with ``-limitcycles`` where VICE
+        terminates itself after a fixed number of CPU cycles.
+
+        Raises ``subprocess.TimeoutExpired`` if the process does not exit
+        within *timeout* seconds.  On timeout the process is killed and
+        the internal handle is cleared.
+        """
+        if self._proc is None:
+            raise RuntimeError("VICE process has not been started")
+        try:
+            self._proc.wait(timeout=timeout)
+            return self._proc.returncode
+        except subprocess.TimeoutExpired:
+            self.stop()
+            raise
+        finally:
+            # Clear internal handle so stop() becomes a no-op
+            self._proc = None
 
     def stop(self) -> None:
         """Terminate VICE: SIGTERM → wait 5s → SIGKILL fallback."""
