@@ -78,6 +78,7 @@ from .backends.ultimate64_schema import (
     validate_enum,
     SIDSocketConfig,
 )
+from .backends.render_wav import render_wav, RenderResult, PAL_CLOCK_HZ, NTSC_CLOCK_HZ
 from .parallel import run_parallel, ParallelTestResult, SingleTestResult
 from .sid import SidFile, SidError, SidFormatError, build_test_psid
 from .sid_player import (
@@ -217,4 +218,9 @@ __all__ = [
     "build_vice_stub",
     "SidPlaybackError",
     "DEFAULT_STUB_ADDR",
+    # Batch WAV render
+    "render_wav",
+    "RenderResult",
+    "PAL_CLOCK_HZ",
+    "NTSC_CLOCK_HZ",
 ]
