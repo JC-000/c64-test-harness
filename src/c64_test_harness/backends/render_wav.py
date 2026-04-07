@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .vice_lifecycle import ViceConfig, ViceProcess
-from .vice_manager import PortAllocator
 
 logger = logging.getLogger(__name__)
 
@@ -105,14 +104,13 @@ def render_wav(
     cfg = ViceConfig(
         executable=base.executable,
         prg_path=str(prg_path),
-        port=0,  # placeholder, will be set from allocator
         warp=False,
         ntsc=not pal,
         sound=True,
+        monitor=False,
         minimize=True,
         extra_args=[
             "+autostart-warp",
-            "+binarymonitor",
             "+remotemonitor",
             "+saveres",
         ] + list(base.extra_args),
@@ -123,20 +121,6 @@ def render_wav(
         limit_cycles=cycles,
         env=env,
     )
-
-    allocator = PortAllocator()
-    port = allocator.allocate()
-    cfg.port = port
-
-    # Take the file lock BEFORE closing the reservation socket.
-    # The file lock bridges the gap between socket close and VICE
-    # binding, preventing other processes from stealing the port.
-    port_lock = allocator.take_lock(port)
-
-    # Release reservation socket so VICE can bind if needed
-    reservation = allocator.take_socket(port)
-    if reservation is not None:
-        reservation.close()
 
     proc = ViceProcess(cfg)
     pid: int | None = None
@@ -170,10 +154,6 @@ def render_wav(
     except Exception:
         proc.stop()
         raise
-    finally:
-        if port_lock is not None:
-            port_lock.release()
-        allocator.release(port)
 
     return RenderResult(
         wav_path=out_wav,

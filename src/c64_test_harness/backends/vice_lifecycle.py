@@ -63,6 +63,7 @@ class ViceConfig:
     warp: bool = True
     ntsc: bool = True
     sound: bool = False
+    monitor: bool = True
     minimize: bool = True
     extra_args: list[str] = field(default_factory=list)
     disk_image: DiskImage | None = None
@@ -128,8 +129,9 @@ class ViceProcess:
             args.append("-warp")
         if cfg.ntsc:
             args.append("-ntsc")
-        args += ["-binarymonitor", "-binarymonitoraddress",
-                 f"ip4://127.0.0.1:{cfg.port}"]
+        if cfg.monitor:
+            args += ["-binarymonitor", "-binarymonitoraddress",
+                     f"ip4://127.0.0.1:{cfg.port}"]
         if cfg.sounddev:
             # Force sound on when a sound device is configured
             args += ["-sounddev", cfg.sounddev]

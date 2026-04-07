@@ -309,6 +309,7 @@ class ViceInstanceManager:
             warp=self._base_config.warp,
             ntsc=self._base_config.ntsc,
             sound=self._base_config.sound,
+            monitor=self._base_config.monitor,
             minimize=self._base_config.minimize,
             extra_args=list(self._base_config.extra_args),
             disk_image=self._base_config.disk_image,
