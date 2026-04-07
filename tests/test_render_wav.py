@@ -34,6 +34,7 @@ class TestViceConfigSoundFields:
         assert cfg.soundoutput == 1
         assert cfg.limit_cycles == 0
         assert cfg.env is None
+        assert cfg.monitor is True
 
     def test_sound_fields_custom(self):
         cfg = ViceConfig(
@@ -149,6 +150,34 @@ class TestViceConfigSoundFields:
         assert "env" not in kwargs
         proc._proc = None
 
+    @patch("subprocess.Popen")
+    def test_monitor_true_emits_binarymonitor(self, mock_popen):
+        """When monitor=True (default), -binarymonitor should appear."""
+        mock_popen.return_value = MagicMock()
+        cfg = ViceConfig(monitor=True, port=6520)
+        proc = ViceProcess(cfg)
+        proc.start()
+
+        args = mock_popen.call_args[0][0]
+        assert "-binarymonitor" in args
+        assert "-binarymonitoraddress" in args
+        idx = args.index("-binarymonitoraddress")
+        assert "6520" in args[idx + 1]
+        proc._proc = None
+
+    @patch("subprocess.Popen")
+    def test_monitor_false_omits_binarymonitor(self, mock_popen):
+        """When monitor=False, -binarymonitor should not appear."""
+        mock_popen.return_value = MagicMock()
+        cfg = ViceConfig(monitor=False)
+        proc = ViceProcess(cfg)
+        proc.start()
+
+        args = mock_popen.call_args[0][0]
+        assert "-binarymonitor" not in args
+        assert "-binarymonitoraddress" not in args
+        proc._proc = None
+
 
 # ---------------------------------------------------------------------------
 # Unit tests — wait_for_exit
@@ -220,18 +249,12 @@ class TestRenderWavCycles:
             )
 
     @patch("c64_test_harness.backends.render_wav.ViceProcess")
-    @patch("c64_test_harness.backends.render_wav.PortAllocator")
-    def test_pal_cycles_passed_to_config(self, mock_alloc_cls, mock_vp_cls, tmp_path):
+    def test_pal_cycles_passed_to_config(self, mock_vp_cls, tmp_path):
         """render_wav should compute PAL cycles and pass to ViceConfig."""
         prg = tmp_path / "test.prg"
         prg.write_bytes(b"\x01\x08")  # minimal .prg header
         wav = tmp_path / "out.wav"
         wav.write_bytes(b"RIFF" + b"\x00" * 40)  # fake WAV
-
-        mock_alloc = MagicMock()
-        mock_alloc.allocate.return_value = 6520
-        mock_alloc.take_socket.return_value = None
-        mock_alloc_cls.return_value = mock_alloc
 
         mock_proc = MagicMock()
         mock_proc.pid = 12345
@@ -257,18 +280,12 @@ class TestRenderWavCycles:
         assert config_arg.ntsc is False  # PAL
 
     @patch("c64_test_harness.backends.render_wav.ViceProcess")
-    @patch("c64_test_harness.backends.render_wav.PortAllocator")
-    def test_ntsc_cycles_passed_to_config(self, mock_alloc_cls, mock_vp_cls, tmp_path):
+    def test_ntsc_cycles_passed_to_config(self, mock_vp_cls, tmp_path):
         """render_wav should compute NTSC cycles when pal=False."""
         prg = tmp_path / "test.prg"
         prg.write_bytes(b"\x01\x08")
         wav = tmp_path / "out.wav"
         wav.write_bytes(b"RIFF" + b"\x00" * 40)
-
-        mock_alloc = MagicMock()
-        mock_alloc.allocate.return_value = 6520
-        mock_alloc.take_socket.return_value = None
-        mock_alloc_cls.return_value = mock_alloc
 
         mock_proc = MagicMock()
         mock_proc.pid = 12345
@@ -287,17 +304,11 @@ class TestRenderWavCycles:
         assert config_arg.ntsc is True  # NTSC mode
 
     @patch("c64_test_harness.backends.render_wav.ViceProcess")
-    @patch("c64_test_harness.backends.render_wav.PortAllocator")
-    def test_missing_wav_raises_runtime_error(self, mock_alloc_cls, mock_vp_cls, tmp_path):
+    def test_missing_wav_raises_runtime_error(self, mock_vp_cls, tmp_path):
         """render_wav should raise if VICE exits but no WAV was created."""
         prg = tmp_path / "test.prg"
         prg.write_bytes(b"\x01\x08")
         wav = tmp_path / "out.wav"  # does not exist
-
-        mock_alloc = MagicMock()
-        mock_alloc.allocate.return_value = 6520
-        mock_alloc.take_socket.return_value = None
-        mock_alloc_cls.return_value = mock_alloc
 
         mock_proc = MagicMock()
         mock_proc.pid = 12345
@@ -312,18 +323,12 @@ class TestRenderWavCycles:
             )
 
     @patch("c64_test_harness.backends.render_wav.ViceProcess")
-    @patch("c64_test_harness.backends.render_wav.PortAllocator")
-    def test_empty_wav_raises_runtime_error(self, mock_alloc_cls, mock_vp_cls, tmp_path):
+    def test_empty_wav_raises_runtime_error(self, mock_vp_cls, tmp_path):
         """render_wav should raise if VICE creates an empty WAV."""
         prg = tmp_path / "test.prg"
         prg.write_bytes(b"\x01\x08")
         wav = tmp_path / "out.wav"
         wav.write_bytes(b"")  # empty file
-
-        mock_alloc = MagicMock()
-        mock_alloc.allocate.return_value = 6520
-        mock_alloc.take_socket.return_value = None
-        mock_alloc_cls.return_value = mock_alloc
 
         mock_proc = MagicMock()
         mock_proc.pid = 12345
@@ -338,18 +343,12 @@ class TestRenderWavCycles:
             )
 
     @patch("c64_test_harness.backends.render_wav.ViceProcess")
-    @patch("c64_test_harness.backends.render_wav.PortAllocator")
-    def test_default_timeout_computation(self, mock_alloc_cls, mock_vp_cls, tmp_path):
+    def test_default_timeout_computation(self, mock_vp_cls, tmp_path):
         """Default timeout = max(30.0, duration * 1.5 + 20.0)."""
         prg = tmp_path / "test.prg"
         prg.write_bytes(b"\x01\x08")
         wav = tmp_path / "out.wav"
         wav.write_bytes(b"RIFF" + b"\x00" * 40)
-
-        mock_alloc = MagicMock()
-        mock_alloc.allocate.return_value = 6520
-        mock_alloc.take_socket.return_value = None
-        mock_alloc_cls.return_value = mock_alloc
 
         mock_proc = MagicMock()
         mock_proc.pid = 12345
@@ -366,41 +365,12 @@ class TestRenderWavCycles:
         mock_proc.wait_for_exit.assert_called_with(timeout=110.0)
 
     @patch("c64_test_harness.backends.render_wav.ViceProcess")
-    @patch("c64_test_harness.backends.render_wav.PortAllocator")
-    def test_port_released_on_success(self, mock_alloc_cls, mock_vp_cls, tmp_path):
-        """Port should be released after successful render."""
-        prg = tmp_path / "test.prg"
-        prg.write_bytes(b"\x01\x08")
-        wav = tmp_path / "out.wav"
-        wav.write_bytes(b"RIFF" + b"\x00" * 40)
-
-        mock_alloc = MagicMock()
-        mock_alloc.allocate.return_value = 6520
-        mock_alloc.take_socket.return_value = None
-        mock_alloc_cls.return_value = mock_alloc
-
-        mock_proc = MagicMock()
-        mock_proc.pid = 12345
-        mock_proc.wait_for_exit.return_value = 1
-        mock_vp_cls.return_value = mock_proc
-
-        render_wav(prg_path=prg, out_wav=wav, duration_seconds=1.0)
-        mock_alloc.release.assert_called_once_with(6520)
-
-    @patch("c64_test_harness.backends.render_wav.ViceProcess")
-    @patch("c64_test_harness.backends.render_wav.PortAllocator")
-    def test_sdl_videodriver_dummy_in_env(self, mock_alloc_cls, mock_vp_cls, tmp_path):
+    def test_sdl_videodriver_dummy_in_env(self, mock_vp_cls, tmp_path):
         """SDL_VIDEODRIVER=dummy should be set in the ViceConfig env."""
         prg = tmp_path / "test.prg"
         prg.write_bytes(b"\x01\x08")
         wav = tmp_path / "out.wav"
         wav.write_bytes(b"RIFF" + b"\x00" * 40)
-
-        mock_alloc = MagicMock()
-        mock_alloc.allocate.return_value = 6520
-        mock_alloc.take_socket.return_value = None
-        mock_alloc.take_lock.return_value = None
-        mock_alloc_cls.return_value = mock_alloc
 
         mock_proc = MagicMock()
         mock_proc.pid = 12345
@@ -414,19 +384,12 @@ class TestRenderWavCycles:
         assert config_arg.env.get("SDL_VIDEODRIVER") == "dummy"
 
     @patch("c64_test_harness.backends.render_wav.ViceProcess")
-    @patch("c64_test_harness.backends.render_wav.PortAllocator")
-    def test_stereo_sets_soundoutput_2(self, mock_alloc_cls, mock_vp_cls, tmp_path):
+    def test_stereo_sets_soundoutput_2(self, mock_vp_cls, tmp_path):
         """mono=False should set soundoutput=2 in the ViceConfig."""
         prg = tmp_path / "test.prg"
         prg.write_bytes(b"\x01\x08")
         wav = tmp_path / "out.wav"
         wav.write_bytes(b"RIFF" + b"\x00" * 40)
-
-        mock_alloc = MagicMock()
-        mock_alloc.allocate.return_value = 6520
-        mock_alloc.take_socket.return_value = None
-        mock_alloc.take_lock.return_value = None
-        mock_alloc_cls.return_value = mock_alloc
 
         mock_proc = MagicMock()
         mock_proc.pid = 12345
@@ -439,19 +402,30 @@ class TestRenderWavCycles:
         assert config_arg.soundoutput == 2
 
     @patch("c64_test_harness.backends.render_wav.ViceProcess")
-    @patch("c64_test_harness.backends.render_wav.PortAllocator")
-    def test_custom_base_config_inheritance(self, mock_alloc_cls, mock_vp_cls, tmp_path):
-        """Passing a ViceConfig with custom executable and extra_args should preserve them."""
+    def test_monitor_disabled_in_render(self, mock_vp_cls, tmp_path):
+        """render_wav should set monitor=False on the ViceConfig."""
         prg = tmp_path / "test.prg"
         prg.write_bytes(b"\x01\x08")
         wav = tmp_path / "out.wav"
         wav.write_bytes(b"RIFF" + b"\x00" * 40)
 
-        mock_alloc = MagicMock()
-        mock_alloc.allocate.return_value = 6520
-        mock_alloc.take_socket.return_value = None
-        mock_alloc.take_lock.return_value = None
-        mock_alloc_cls.return_value = mock_alloc
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_proc.wait_for_exit.return_value = 1
+        mock_vp_cls.return_value = mock_proc
+
+        render_wav(prg_path=prg, out_wav=wav, duration_seconds=1.0)
+
+        config_arg = mock_vp_cls.call_args[0][0]
+        assert config_arg.monitor is False
+
+    @patch("c64_test_harness.backends.render_wav.ViceProcess")
+    def test_custom_base_config_inheritance(self, mock_vp_cls, tmp_path):
+        """Passing a ViceConfig with custom executable and extra_args should preserve them."""
+        prg = tmp_path / "test.prg"
+        prg.write_bytes(b"\x01\x08")
+        wav = tmp_path / "out.wav"
+        wav.write_bytes(b"RIFF" + b"\x00" * 40)
 
         mock_proc = MagicMock()
         mock_proc.pid = 12345
@@ -467,21 +441,16 @@ class TestRenderWavCycles:
         assert "-VICIIfilter" in config_arg.extra_args
         assert "0" in config_arg.extra_args
         # render_wav's own args should also be present
-        assert "+binarymonitor" in config_arg.extra_args
         assert "+remotemonitor" in config_arg.extra_args
+        # monitor=False means no +binarymonitor workaround needed
+        assert config_arg.monitor is False
 
     @patch("c64_test_harness.backends.render_wav.ViceProcess")
-    @patch("c64_test_harness.backends.render_wav.PortAllocator")
-    def test_port_released_on_error(self, mock_alloc_cls, mock_vp_cls, tmp_path):
-        """Port should be released even when render fails."""
+    def test_stop_called_on_error(self, mock_vp_cls, tmp_path):
+        """ViceProcess.stop() should be called when render fails."""
         prg = tmp_path / "test.prg"
         prg.write_bytes(b"\x01\x08")
         wav = tmp_path / "out.wav"  # missing - will cause RuntimeError
-
-        mock_alloc = MagicMock()
-        mock_alloc.allocate.return_value = 6520
-        mock_alloc.take_socket.return_value = None
-        mock_alloc_cls.return_value = mock_alloc
 
         mock_proc = MagicMock()
         mock_proc.pid = 12345
@@ -490,7 +459,7 @@ class TestRenderWavCycles:
 
         with pytest.raises(RuntimeError):
             render_wav(prg_path=prg, out_wav=wav, duration_seconds=1.0)
-        mock_alloc.release.assert_called_once_with(6520)
+        mock_proc.stop.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
