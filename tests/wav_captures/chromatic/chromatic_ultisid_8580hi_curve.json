@@ -1,0 +1,37 @@
+{
+  "config": {
+    "name": "ultisid_8580hi_curve",
+    "description": "UltiSID FPGA with 8580 Hi filter curve",
+    "instrument_chip": "8580",
+    "ultisid_settings": {
+      "UltiSID 1 Filter Curve": "8580 Hi",
+      "UltiSID 1 Combined Waveforms": "8580"
+    },
+    "addressing": {
+      "SID Socket 1 Address": "Unmapped",
+      "SID Socket 2 Address": "Unmapped",
+      "UltiSID 1 Address": "$D400",
+      "UltiSID 2 Address": "Unmapped"
+    }
+  },
+  "capture": {
+    "duration_seconds": 14.968,
+    "packets_received": 3742,
+    "packets_dropped": 0,
+    "total_samples": 718464,
+    "sample_rate": 48000,
+    "peak_amplitude": 10129
+  },
+  "psid": {
+    "chip": "8580",
+    "load_addr": 4096,
+    "init_addr": 4096,
+    "play_addr": 4142,
+    "note_table_addr": 4196,
+    "num_notes": 25,
+    "frames_per_note": 25,
+    "total_frames": 625,
+    "duration_s": 12.5,
+    "psid_size": 274
+  }
+}
