@@ -18,6 +18,10 @@ Reusable test harness for Commodore 64 programs. Automates C64 programs via the 
 - **Parallel test execution** — distribute tests across a pool of VICE instances via `run_parallel()`
 - **VICE label file parser** — load cc65/ACME/Kick Assembler label files
 - **Debug utilities** — `dump_screen()` and `hex_dump()` for quick inspection during test runs
+- **Ethernet / CS8900a** — TFE-mode ethernet cartridge emulation with TAP interfaces, bridge networking for multi-VICE communication, auto-generated unique MAC addresses per instance
+- **SID playback** — cross-backend `play_sid()` dispatches to VICE (IRQ stub) or Ultimate 64 (native firmware endpoint); PSID/RSID parser
+- **Audio capture** — headless WAV recording via VICE (`render_wav()`) and U64 UDP audio stream (`capture_sid_u64()`, `AudioCapture`)
+- **U64 data streams** — cycle-accurate 6510/VIC bus trace (`DebugCapture`), VIC-II video frame capture (`VideoCapture`), audio capture — all over UDP with gap detection
 - **Flexible configuration** — `HarnessConfig` with TOML file and environment variable support
 
 ## Installation
@@ -460,6 +464,146 @@ play_sid(transport, sid, song=0)  # works with BinaryViceTransport or Ultimate64
 
 See `examples/play_sid.py` (supports `--vice` / `--u64 HOST` modes, plus `--self-test` which plays a synthesized C-major scale) and `scripts/play_scale_u64.py` for a full demo that builds a scale PSID on the fly, DMA-loads it, and plays it on hardware.
 
+## Ethernet / CS8900a Testing
+
+Test C64 networking code using VICE's CS8900a ethernet cartridge emulation with Linux TAP interfaces:
+
+```python
+from c64_test_harness import ViceConfig, ViceInstanceManager
+
+config = ViceConfig(
+    prg_path="build/network_app.prg",
+    warp=False,                 # warp causes timing issues with ethernet
+    ethernet=True,
+    ethernet_mode="tfe",        # TFE mode — standard CS8900a register layout
+    ethernet_interface="tap-c64",
+    ethernet_driver="tuntap",
+)
+
+with ViceInstanceManager(config=config) as mgr:
+    inst = mgr.acquire()
+    # CS8900a is ready — unique MAC auto-assigned to this instance
+    transport = inst.transport
+    # ... test networking code ...
+    mgr.release(inst)
+```
+
+**MAC address uniqueness:** VICE has no CLI flag for CS8900a MAC addresses. When multiple instances share a bridge, `ViceInstanceManager` auto-generates unique locally-administered MACs (`02:c6:40:xx:xx:xx`) per instance by programming the CS8900a Individual Address registers after transport connects. For manual control:
+
+```python
+from c64_test_harness import set_cs8900a_mac, generate_mac, parse_mac
+
+mac = generate_mac(0)                    # b"\x02\xc6\x40\x00\x00\x00"
+mac = parse_mac("02:c6:40:00:00:42")     # explicit MAC
+set_cs8900a_mac(transport, mac)           # program CS8900a IA registers
+```
+
+**Bridge setup** for multi-VICE networking: `sudo scripts/setup-bridge-tap.sh` (creates `br-c64` + `tap-c64-0` + `tap-c64-1`). Teardown: `sudo scripts/teardown-bridge-tap.sh`. Single TAP: `sudo scripts/setup-tap-networking.sh`.
+
+## Audio Capture
+
+### VICE — Headless WAV Render
+
+Record audio from a C64 program to WAV without a visible VICE window:
+
+```python
+from c64_test_harness import render_wav
+
+result = render_wav(
+    prg_path="build/sid_player.prg",
+    out_wav="/tmp/output.wav",
+    duration_seconds=10.0,
+    sample_rate=44100,
+    mono=True,
+    pal=True,
+)
+print(f"Wrote {result.wav_path} ({result.duration_seconds:.1f}s)")
+```
+
+### Ultimate 64 — Network Audio Capture
+
+Capture SID audio from a U64 via its UDP audio stream:
+
+```python
+from c64_test_harness import capture_sid_u64, SidFile, Ultimate64Client
+
+client = Ultimate64Client(host="192.168.1.81")
+sid = SidFile.from_file("tune.sid")
+result = capture_sid_u64(client, sid, out_wav="/tmp/u64_audio.wav", duration_seconds=10.0)
+print(f"{result.packets_received} packets, {result.packets_dropped} dropped")
+```
+
+For low-level control, use `AudioCapture` directly:
+
+```python
+from c64_test_harness import AudioCapture
+
+cap = AudioCapture(port=11001)
+cap.start()
+# ... play SID on U64 ...
+result = cap.stop(wav_path="/tmp/capture.wav")
+```
+
+## U64 Data Streams
+
+The Ultimate 64 can stream three types of data over UDP, all controllable via the REST API. The test harness provides receivers for all three:
+
+### Debug Stream — Cycle-Accurate Bus Trace
+
+Capture every 6510 CPU bus cycle with full address/data/control signals:
+
+```python
+from c64_test_harness import DebugCapture, BusCycle
+
+cap = DebugCapture(port=11002)
+cap.start()
+# ... run code on the C64 ...
+result = cap.stop()
+
+for cycle in result.trace:
+    if cycle.is_cpu and cycle.is_write and cycle.address == 0xD020:
+        print(f"Border color write: ${cycle.data:02X}")
+    if cycle.is_cpu and cycle.irq:
+        print(f"IRQ active at ${cycle.address:04X}")
+```
+
+Each `BusCycle` exposes: `.address` (16-bit), `.data` (8-bit), `.is_cpu`/`.is_vic`, `.is_read`/`.is_write`, `.irq`, `.nmi`, `.ba`, `.game`, `.exrom`, `.rom`. Five debug modes available: 6510-only, VIC-only, 6510+VIC interleaved, 1541-only, 6510+1541 interleaved.
+
+### Video Stream — VIC-II Frame Capture
+
+Capture the actual VIC-II display output (including sprites, raster effects, borders):
+
+```python
+from c64_test_harness import VideoCapture, VIC_PALETTE
+
+cap = VideoCapture(port=11000)
+cap.start()
+# ... wait for frames ...
+result = cap.stop()
+
+for frame in result.frames:
+    color = frame.pixel_at(160, 100)       # center pixel color index
+    r, g, b = VIC_PALETTE[color]           # RGB lookup
+    print(f"Frame {frame.frame_number}: {frame.width}x{frame.height}")
+```
+
+PAL: 384x272 @ 50fps. NTSC: 384x240 @ 60fps. 4-bit VIC-II color indices with `VIC_PALETTE` for RGB conversion.
+
+### Stream Configuration
+
+Configure stream destinations and debug mode via the REST API:
+
+```python
+from c64_test_harness import (
+    get_data_streams_config, set_stream_destination,
+    set_debug_stream_mode, DEBUG_MODE_6510_VIC,
+)
+
+config = get_data_streams_config(client)   # all stream destinations + mode
+set_stream_destination(client, "debug", "10.0.0.5:11002")
+set_debug_stream_mode(client, DEBUG_MODE_6510_VIC)
+```
+
 ## Architecture
 
 ```
@@ -483,6 +627,24 @@ create_manager(): factory from env vars (C64_BACKEND, U64_HOST)
 
 Screen/Keyboard/Memory modules sit above the transport:
   ScreenGrid, wait_for_text, send_text, read_bytes, etc.
+
+Ethernet:
+  ethernet.py: generate_mac, set_cs8900a_mac (CS8900a IA programming)
+  ViceConfig: ethernet=True, ethernet_mac auto-assigned by manager
+
+U64 Data Streams (UDP capture):
+  AudioCapture  -> CaptureResult          (port 11001, 48kHz stereo PCM)
+  VideoCapture  -> VideoCaptureResult      (port 11000, 4-bit VIC-II frames)
+  DebugCapture  -> DebugCaptureResult      (port 11002, cycle-accurate bus trace)
+
+Audio Pipeline:
+  render_wav()      -> RenderResult        (VICE headless WAV via -limitcycles)
+  capture_sid_u64() -> U64CaptureResult    (U64 SID -> UDP -> WAV)
+
+SID Playback:
+  play_sid() dispatches on transport type:
+    BinaryViceTransport -> play_sid_vice() (IRQ stub at $C000)
+    Ultimate64Transport -> play_sid_ultimate64() (POST /v1/runners:sidplay)
 
 Parallel execution:
   run_parallel() -> ParallelTestResult
@@ -515,6 +677,12 @@ Additional scripts in `scripts/`:
 | `scripts/bench_x25519_u64_turbo.py` | X25519 benchmark across U64 turbo speeds (1–48 MHz) |
 | `scripts/stress_u64_queue.py` | Cross-process DeviceLock stress test (N workers × M rounds) |
 | `scripts/run_u64_parallel_locked.py` | Run all U64 live tests in parallel with cross-process locking |
+| `scripts/play_chromatic_u64.py` | Chromatic scale capture through 4 SID configs on U64 |
+| `scripts/setup-bridge-tap.sh` | Create bridge + 2 TAP interfaces for multi-VICE ethernet |
+| `scripts/teardown-bridge-tap.sh` | Tear down bridge + TAP interfaces |
+| `scripts/setup-tap-networking.sh` | Create single TAP interface with NAT for VICE ethernet |
+| `scripts/teardown-tap-networking.sh` | Tear down single TAP interface |
+| `scripts/validate_ping.py` | End-to-end ARP + ICMP ping through VICE CS8900a + TAP |
 
 ## Running Tests
 
