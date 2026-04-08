@@ -66,6 +66,16 @@ __all__ = [
     "get_ultisid_config",
     "get_audio_mixer_config",
     "set_audio_mixer_item",
+    "get_data_streams_config",
+    "set_stream_destination",
+    "get_debug_stream_mode",
+    "set_debug_stream_mode",
+    "DEBUG_MODE_6510",
+    "DEBUG_MODE_VIC",
+    "DEBUG_MODE_6510_VIC",
+    "DEBUG_MODE_1541",
+    "DEBUG_MODE_6510_1541",
+    "DEBUG_MODES",
 ]
 
 
@@ -590,3 +600,92 @@ def restore_state(client: Ultimate64Client, snap: U64StateSnapshot) -> None:
     if snap.cartridge:
         cart_updates[_ITEM_CARTRIDGE] = snap.cartridge
     client.set_config_items(CAT_CART, cart_updates)
+
+
+# --------------------------------------------------------------------------- #
+# Data Streams                                                                #
+# --------------------------------------------------------------------------- #
+
+_ITEM_STREAM_VIC = "Stream VIC to"
+_ITEM_STREAM_AUDIO = "Stream Audio to"
+_ITEM_STREAM_DEBUG = "Stream Debug to"
+_ITEM_DEBUG_MODE = "Debug Stream Mode"
+
+DEBUG_MODE_6510 = "6510 Only"
+DEBUG_MODE_VIC = "VIC Only"
+DEBUG_MODE_6510_VIC = "6510 & VIC"
+DEBUG_MODE_1541 = "1541 Only"
+DEBUG_MODE_6510_1541 = "6510 & 1541"
+
+DEBUG_MODES = (
+    DEBUG_MODE_6510,
+    DEBUG_MODE_VIC,
+    DEBUG_MODE_6510_VIC,
+    DEBUG_MODE_1541,
+    DEBUG_MODE_6510_1541,
+)
+
+_STREAM_TYPE_MAP = {
+    "video": _ITEM_STREAM_VIC,
+    "audio": _ITEM_STREAM_AUDIO,
+    "debug": _ITEM_STREAM_DEBUG,
+}
+
+
+def get_data_streams_config(client: Ultimate64Client) -> dict[str, str]:
+    """Return all items from the Data Streams configuration category.
+
+    :param client: Connected Ultimate64 client.
+    :returns: Dict of item names to their current values.
+    """
+    return dict(
+        _unwrap(client.get_config_category(CAT_DATA_STREAMS), CAT_DATA_STREAMS)
+    )
+
+
+def set_stream_destination(
+    client: Ultimate64Client,
+    stream_type: str,
+    destination: str,
+) -> None:
+    """Set the default destination for a stream type.
+
+    :param client: Connected Ultimate64 client.
+    :param stream_type: One of ``"video"``, ``"audio"``, ``"debug"``.
+    :param destination: Multicast or unicast address string
+        (e.g. ``"239.0.1.64:11000"``).
+    :raises ValueError: If *stream_type* is not recognised.
+    """
+    item = _STREAM_TYPE_MAP.get(stream_type)
+    if item is None:
+        raise ValueError(
+            f"Unknown stream_type {stream_type!r}; "
+            f"expected one of {list(_STREAM_TYPE_MAP)}"
+        )
+    client.set_config_items(CAT_DATA_STREAMS, {item: destination})
+
+
+def get_debug_stream_mode(client: Ultimate64Client) -> str:
+    """Return the current Debug Stream Mode setting.
+
+    :param client: Connected Ultimate64 client.
+    :returns: One of :data:`DEBUG_MODES`.
+    """
+    inner = _unwrap(
+        client.get_config_category(CAT_DATA_STREAMS), CAT_DATA_STREAMS
+    )
+    return str(inner.get(_ITEM_DEBUG_MODE, ""))
+
+
+def set_debug_stream_mode(client: Ultimate64Client, mode: str) -> None:
+    """Set the Debug Stream Mode.
+
+    :param client: Connected Ultimate64 client.
+    :param mode: One of :data:`DEBUG_MODES`.
+    :raises ValueError: If *mode* is not a valid debug stream mode.
+    """
+    if mode not in DEBUG_MODES:
+        raise ValueError(
+            f"Unknown debug stream mode {mode!r}; expected one of {list(DEBUG_MODES)}"
+        )
+    client.set_config_items(CAT_DATA_STREAMS, {_ITEM_DEBUG_MODE: mode})
