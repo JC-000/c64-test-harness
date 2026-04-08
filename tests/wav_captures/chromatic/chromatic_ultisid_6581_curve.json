@@ -1,0 +1,37 @@
+{
+  "config": {
+    "name": "ultisid_6581_curve",
+    "description": "UltiSID FPGA with 6581 filter curve",
+    "instrument_chip": "6581",
+    "ultisid_settings": {
+      "UltiSID 1 Filter Curve": "6581",
+      "UltiSID 1 Combined Waveforms": "6581"
+    },
+    "addressing": {
+      "SID Socket 1 Address": "Unmapped",
+      "SID Socket 2 Address": "Unmapped",
+      "UltiSID 1 Address": "$D400",
+      "UltiSID 2 Address": "Unmapped"
+    }
+  },
+  "capture": {
+    "duration_seconds": 14.972,
+    "packets_received": 3743,
+    "packets_dropped": 0,
+    "total_samples": 718656,
+    "sample_rate": 48000,
+    "peak_amplitude": 9806
+  },
+  "psid": {
+    "chip": "6581",
+    "load_addr": 4096,
+    "init_addr": 4096,
+    "play_addr": 4142,
+    "note_table_addr": 4196,
+    "num_notes": 25,
+    "frames_per_note": 25,
+    "total_frames": 625,
+    "duration_s": 12.5,
+    "psid_size": 274
+  }
+}
