@@ -99,6 +99,7 @@ from .backends.u64_audio_capture import (
     CHANNELS,
     SAMPLE_WIDTH,
 )
+from .ethernet import generate_mac, parse_mac, format_mac, set_cs8900a_mac
 from .parallel import run_parallel, ParallelTestResult, SingleTestResult
 from .sid import SidFile, SidError, SidFormatError, build_test_psid
 from .sid_player import (
@@ -231,6 +232,11 @@ __all__ = [
     "BackendManager",
     "UnifiedManager",
     "create_manager",
+    # Ethernet MAC helpers
+    "generate_mac",
+    "parse_mac",
+    "format_mac",
+    "set_cs8900a_mac",
     # Parallel execution
     "run_parallel",
     "ParallelTestResult",
