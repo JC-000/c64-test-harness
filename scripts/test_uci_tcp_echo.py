@@ -20,13 +20,12 @@ import socket
 import sys
 import threading
 import time
-import urllib.request
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from c64_test_harness.backends.device_lock import DeviceLock
 from c64_test_harness.backends.ultimate64 import Ultimate64Transport
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
+from c64_test_harness.uci_network import enable_uci, disable_uci
 
 # ---------------------------------------------------------------------------
 # UCI registers and constants (same as uci_network.py)
@@ -507,17 +506,12 @@ def main() -> int:
         transport = Ultimate64Transport(host=u64_host, timeout=args.timeout,
                                         client=client)
 
-        # Save config to flash and reset
-        print("Saving config to flash...")
-        req = urllib.request.Request(
-            f"http://{u64_host}/v1/configs:save_to_flash", method='PUT')
-        urllib.request.urlopen(req, timeout=args.timeout)
-        time.sleep(0.5)
+        # Enable UCI transiently (not saved to flash)
+        print("Enabling UCI (Command Interface)...")
+        enable_uci(client)
 
         print("Resetting machine...")
-        req = urllib.request.Request(
-            f"http://{u64_host}/v1/machine:reset", method='PUT')
-        urllib.request.urlopen(req, timeout=args.timeout)
+        client.reset()
         time.sleep(3)
 
         # Build the routine
@@ -611,6 +605,11 @@ def main() -> int:
             return 1
 
     finally:
+        try:
+            print("Disabling UCI (Command Interface)...")
+            disable_uci(client)
+        except Exception as exc:
+            print(f"WARNING: Failed to disable UCI: {exc}")
         lock.release()
 
 

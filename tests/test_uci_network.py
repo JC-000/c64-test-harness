@@ -74,6 +74,10 @@ from c64_test_harness.uci_network import (
     uci_socket_read,
     uci_socket_write,
     uci_socket_close,
+    # UCI config helpers
+    get_uci_enabled,
+    enable_uci,
+    disable_uci,
 )
 
 
@@ -689,4 +693,88 @@ class TestAllBuilders:
         assert found, (
             f"{builder.__name__} does not reference any UCI register "
             f"($DF1C-$DF1F)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# UCI config helpers (REST API)
+# ---------------------------------------------------------------------------
+
+class TestGetUciEnabled:
+    """Tests for get_uci_enabled() — reads UCI state via REST API."""
+
+    def test_returns_true_when_enabled(self) -> None:
+        client = MagicMock()
+        client.get_config_category.return_value = {
+            "C64 and Cartridge Settings": {"Command Interface": "Enabled"}
+        }
+        assert get_uci_enabled(client) is True
+
+    def test_returns_false_when_disabled(self) -> None:
+        client = MagicMock()
+        client.get_config_category.return_value = {
+            "C64 and Cartridge Settings": {"Command Interface": "Disabled"}
+        }
+        assert get_uci_enabled(client) is False
+
+    def test_returns_false_when_missing(self) -> None:
+        client = MagicMock()
+        client.get_config_category.return_value = {
+            "C64 and Cartridge Settings": {}
+        }
+        assert get_uci_enabled(client) is False
+
+    def test_queries_correct_category(self) -> None:
+        client = MagicMock()
+        client.get_config_category.return_value = {
+            "C64 and Cartridge Settings": {"Command Interface": "Disabled"}
+        }
+        get_uci_enabled(client)
+        client.get_config_category.assert_called_once_with(
+            "C64 and Cartridge Settings"
+        )
+
+
+class TestEnableUci:
+    """Tests for enable_uci() — enables UCI via REST API."""
+
+    def test_sets_enabled(self) -> None:
+        client = MagicMock()
+        enable_uci(client)
+        client.set_config_items.assert_called_once_with(
+            "C64 and Cartridge Settings",
+            {"Command Interface": "Enabled"},
+        )
+
+    def test_does_not_save_to_flash(self) -> None:
+        """enable_uci must NOT persist changes to flash."""
+        client = MagicMock()
+        enable_uci(client)
+        # Only set_config_items should be called, not save_to_flash
+        assert not any(
+            "flash" in str(c).lower()
+            for c in client.method_calls
+            if c[0] != "set_config_items"
+        )
+
+
+class TestDisableUci:
+    """Tests for disable_uci() — disables UCI via REST API."""
+
+    def test_sets_disabled(self) -> None:
+        client = MagicMock()
+        disable_uci(client)
+        client.set_config_items.assert_called_once_with(
+            "C64 and Cartridge Settings",
+            {"Command Interface": "Disabled"},
+        )
+
+    def test_does_not_save_to_flash(self) -> None:
+        """disable_uci must NOT persist changes to flash."""
+        client = MagicMock()
+        disable_uci(client)
+        assert not any(
+            "flash" in str(c).lower()
+            for c in client.method_calls
+            if c[0] != "set_config_items"
         )
