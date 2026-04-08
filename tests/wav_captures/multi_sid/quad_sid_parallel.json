@@ -1,0 +1,49 @@
+{
+  "description": "4 SID engines playing simultaneously via run_prg",
+  "engines": {
+    "sid_socket_1": {
+      "address": "$D400",
+      "waveform": "sawtooth",
+      "note": "C4",
+      "pan": "Left 5"
+    },
+    "sid_socket_2": {
+      "address": "$D420",
+      "waveform": "pulse_50pct",
+      "note": "E4",
+      "pan": "Left 2"
+    },
+    "ultisid_1": {
+      "address": "$D440",
+      "waveform": "triangle",
+      "note": "G4",
+      "pan": "Right 2"
+    },
+    "ultisid_2": {
+      "address": "$D460",
+      "waveform": "noise",
+      "note": "C5",
+      "pan": "Right 5"
+    }
+  },
+  "addressing": {
+    "Auto Address Mirroring": "Disabled",
+    "SID Socket 1 Address": "$D400",
+    "SID Socket 2 Address": "$D420",
+    "UltiSID 1 Address": "$D440",
+    "UltiSID 2 Address": "$D460"
+  },
+  "panning": {
+    "Pan Socket 1": "Left 5",
+    "Pan Socket 2": "Left 2",
+    "Pan UltiSID 1": "Right 2",
+    "Pan UltiSID 2": "Right 5"
+  },
+  "capture": {
+    "duration_seconds": 7.364,
+    "packets_received": 1841,
+    "packets_dropped": 0,
+    "total_samples": 353472,
+    "sample_rate": 48000
+  }
+}
