@@ -51,6 +51,16 @@ from .backends.ultimate64_helpers import (
     CAT_ULTISID,
     CAT_AUDIO_MIXER,
     CAT_DATA_STREAMS,
+    get_data_streams_config,
+    set_stream_destination,
+    get_debug_stream_mode,
+    set_debug_stream_mode,
+    DEBUG_MODE_6510,
+    DEBUG_MODE_VIC,
+    DEBUG_MODE_6510_VIC,
+    DEBUG_MODE_1541,
+    DEBUG_MODE_6510_1541,
+    DEBUG_MODES,
 )
 from .backends.ultimate64_manager import (
     Ultimate64Device,
@@ -98,6 +108,20 @@ from .backends.u64_audio_capture import (
     DEFAULT_SAMPLE_RATE,
     CHANNELS,
     SAMPLE_WIDTH,
+)
+from .backends.u64_debug_capture import (
+    DebugCapture,
+    DebugCaptureResult,
+    BusCycle,
+    DEFAULT_DEBUG_PORT,
+    ENTRIES_PER_PACKET,
+)
+from .backends.u64_video_capture import (
+    VideoCapture,
+    VideoCaptureResult,
+    VideoFrame,
+    DEFAULT_VIDEO_PORT,
+    VIC_PALETTE,
 )
 from .ethernet import generate_mac, parse_mac, format_mac, set_cs8900a_mac
 from .parallel import run_parallel, ParallelTestResult, SingleTestResult
@@ -208,6 +232,16 @@ __all__ = [
     "CAT_ULTISID",
     "CAT_AUDIO_MIXER",
     "CAT_DATA_STREAMS",
+    "get_data_streams_config",
+    "set_stream_destination",
+    "get_debug_stream_mode",
+    "set_debug_stream_mode",
+    "DEBUG_MODE_6510",
+    "DEBUG_MODE_VIC",
+    "DEBUG_MODE_6510_VIC",
+    "DEBUG_MODE_1541",
+    "DEBUG_MODE_6510_1541",
+    "DEBUG_MODES",
     "mount_disk_file",
     "unmount",
     "run_prg_file",
@@ -270,4 +304,16 @@ __all__ = [
     "DEFAULT_SAMPLE_RATE",
     "CHANNELS",
     "SAMPLE_WIDTH",
+    # U64 debug stream capture
+    "DebugCapture",
+    "DebugCaptureResult",
+    "BusCycle",
+    "DEFAULT_DEBUG_PORT",
+    "ENTRIES_PER_PACKET",
+    # U64 video stream capture
+    "VideoCapture",
+    "VideoCaptureResult",
+    "VideoFrame",
+    "DEFAULT_VIDEO_PORT",
+    "VIC_PALETTE",
 ]
