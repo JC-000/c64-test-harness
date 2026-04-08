@@ -189,6 +189,9 @@ from .uci_network import (
     uci_tcp_listen_state,
     uci_tcp_listen_socket,
     uci_tcp_listen_stop,
+    get_uci_enabled,
+    enable_uci,
+    disable_uci,
 )
 from .ethernet import generate_mac, parse_mac, format_mac, set_cs8900a_mac
 from .parallel import run_parallel, ParallelTestResult, SingleTestResult
@@ -399,6 +402,9 @@ __all__ = [
     "uci_tcp_listen_state",
     "uci_tcp_listen_socket",
     "uci_tcp_listen_stop",
+    "get_uci_enabled",
+    "enable_uci",
+    "disable_uci",
     # Ethernet MAC helpers
     "generate_mac",
     "parse_mac",

@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .transport import C64Transport
+    from .backends.ultimate64_client import Ultimate64Client
 
 # ---------------------------------------------------------------------------
 # UCI I/O registers
@@ -1120,3 +1121,52 @@ def uci_tcp_listen_stop(
         cmd=NET_CMD_TCP_LISTENER_STOP,
     )
     _execute_uci_routine(transport, code, timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# UCI config helpers (REST API — require Ultimate64Client, not transport)
+# ---------------------------------------------------------------------------
+
+_UCI_CATEGORY = "C64 and Cartridge Settings"
+_UCI_ITEM = "Command Interface"
+
+
+def get_uci_enabled(client: "Ultimate64Client") -> bool:
+    """Return ``True`` if UCI (Command Interface) is currently enabled.
+
+    Reads the ``C64 and Cartridge Settings`` category from the device
+    and checks whether the ``Command Interface`` item is ``"Enabled"``.
+
+    :param client: Connected :class:`Ultimate64Client` instance.
+    :returns: ``True`` when UCI is enabled, ``False`` otherwise.
+    """
+    resp = client.get_config_category(_UCI_CATEGORY)
+    inner = resp.get(_UCI_CATEGORY, {})
+    return inner.get(_UCI_ITEM) == "Enabled"
+
+
+def enable_uci(client: "Ultimate64Client") -> None:
+    """Enable UCI (Command Interface) on the device.
+
+    Sets ``Command Interface`` to ``"Enabled"`` in the
+    ``C64 and Cartridge Settings`` category.  The change is **not**
+    saved to flash — a device reboot reverts to the default state.
+
+    A machine reset is typically needed after enabling UCI so that
+    the I/O registers at $DF1C-$DF1F become active.
+
+    :param client: Connected :class:`Ultimate64Client` instance.
+    """
+    client.set_config_items(_UCI_CATEGORY, {_UCI_ITEM: "Enabled"})
+
+
+def disable_uci(client: "Ultimate64Client") -> None:
+    """Disable UCI (Command Interface) on the device.
+
+    Sets ``Command Interface`` to ``"Disabled"`` in the
+    ``C64 and Cartridge Settings`` category.  The change is **not**
+    saved to flash.
+
+    :param client: Connected :class:`Ultimate64Client` instance.
+    """
+    client.set_config_items(_UCI_CATEGORY, {_UCI_ITEM: "Disabled"})

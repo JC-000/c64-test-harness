@@ -20,14 +20,13 @@ import os
 import struct
 import sys
 import time
-import urllib.request
-
 # Allow running from the repo root without install
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from c64_test_harness.backends.device_lock import DeviceLock
 from c64_test_harness.backends.ultimate64 import Ultimate64Transport
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
+from c64_test_harness.uci_network import enable_uci, disable_uci
 
 
 # ---------------------------------------------------------------------------
@@ -405,18 +404,13 @@ def main() -> int:
         transport = Ultimate64Transport(host=host, password=password,
                                         timeout=args.timeout, client=client)
 
-        # Save config to flash so UCI enablement persists across resets
-        print("Saving config to flash...")
-        req = urllib.request.Request(
-            f"http://{host}/v1/configs:save_to_flash", method='PUT')
-        urllib.request.urlopen(req, timeout=args.timeout)
-        time.sleep(0.5)
+        # Enable UCI transiently (not saved to flash)
+        print("Enabling UCI (Command Interface)...")
+        enable_uci(client)
 
         # Reset machine so UCI I/O registers ($DF1C-$DF1F) become active
         print("Resetting machine...")
-        req = urllib.request.Request(
-            f"http://{host}/v1/machine:reset", method='PUT')
-        urllib.request.urlopen(req, timeout=args.timeout)
+        client.reset()
         time.sleep(3)
 
         # Verify UCI is present before injecting code
@@ -471,6 +465,11 @@ def main() -> int:
         _dump_results(transport)
 
     finally:
+        try:
+            print("Disabling UCI (Command Interface)...")
+            disable_uci(client)
+        except Exception as exc:
+            print(f"WARNING: Failed to disable UCI: {exc}")
         lock.release()
 
     return 0
