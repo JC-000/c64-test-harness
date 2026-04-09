@@ -33,6 +33,8 @@ CMD_CHECKPOINT_DEL = 0x13
 CMD_REGISTERS_GET = 0x31
 CMD_REGISTERS_SET = 0x32
 CMD_KEYBOARD_FEED = 0x72
+CMD_RESOURCE_GET = 0x51
+CMD_RESOURCE_SET = 0x52
 CMD_REGS_AVAILABLE = 0x83
 CMD_EXIT = 0xAA
 
@@ -77,6 +79,7 @@ class BinaryViceTransport:
         keybuf_max: int = 10,
         cols: int = 40,
         rows: int = 25,
+        text_monitor_port: int = 0,
     ) -> None:
         self.host = host
         self.port = port
@@ -87,12 +90,15 @@ class BinaryViceTransport:
         self.keybuf_max = keybuf_max
         self._cols = cols
         self._rows = rows
+        self._text_monitor_port = text_monitor_port
 
         self._req_id = 0
         self._reg_map: dict[str, tuple[int, int]] = {}  # name -> (reg_id, size_bits)
         self._event_queue: deque[_Response] = deque()
         self._lock = threading.Lock()
+        self._text_lock = threading.Lock()
         self._sock: socket.socket | None = None
+        self._text_sock: socket.socket | None = None
 
         self._connect()
 
@@ -123,6 +129,64 @@ class BinaryViceTransport:
         # The first command triggers an auto-stop.  We drain those initial
         # events as part of the register-map initialisation.
         self._init_register_map()
+
+        if self._text_monitor_port > 0:
+            self._connect_text_monitor()
+
+    def _connect_text_monitor(self) -> None:
+        """Open TCP connection to VICE text monitor for warp control.
+
+        Retries for up to ``self.timeout`` seconds because the text monitor
+        may become ready slightly after the binary monitor.  VICE's text
+        monitor does not send a banner on connect — the first prompt only
+        appears after a command is sent.
+        """
+        deadline = time.monotonic() + self.timeout
+        last_err: Exception | None = None
+        while time.monotonic() < deadline:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(self.timeout)
+                sock.connect((self.host, self._text_monitor_port))
+                self._text_sock = sock
+                return
+            except OSError as e:
+                last_err = e
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                time.sleep(0.5)
+        raise ConnectionError(
+            f"Cannot connect to VICE text monitor at "
+            f"{self.host}:{self._text_monitor_port}: {last_err}"
+        )
+
+    def _text_recv_until_prompt(self) -> str:
+        """Read from text monitor until we see the (C:$xxxx) prompt."""
+        assert self._text_sock is not None
+        buf = b""
+        while True:
+            try:
+                chunk = self._text_sock.recv(4096)
+            except socket.timeout as e:
+                raise TimeoutError(
+                    f"Timed out reading from VICE text monitor"
+                ) from e
+            if not chunk:
+                raise ConnectionError("VICE text monitor closed connection")
+            buf += chunk
+            # Prompt is "(C:$xxxx) " at end of output
+            text = buf.decode("ascii", errors="replace")
+            if "(C:" in text and text.rstrip().endswith(")"):
+                return text
+
+    def _text_command(self, cmd: str) -> str:
+        """Send a command to the text monitor and return the response."""
+        assert self._text_sock is not None
+        with self._text_lock:
+            self._text_sock.sendall((cmd + "\n").encode("ascii"))
+            return self._text_recv_until_prompt()
 
     def _next_req_id(self) -> int:
         """Return an incrementing request ID (wraps at 32 bits)."""
@@ -355,7 +419,13 @@ class BinaryViceTransport:
         self._send_and_recv(CMD_EXIT)
 
     def close(self) -> None:
-        """Close the TCP connection to VICE."""
+        """Close TCP connections to VICE."""
+        if self._text_sock is not None:
+            try:
+                self._text_sock.close()
+            except OSError:
+                pass
+            self._text_sock = None
         if self._sock is not None:
             try:
                 self._sock.close()
@@ -472,6 +542,63 @@ class BinaryViceTransport:
                 if resp.response_type == EVENT_STOPPED:
                     return self._parse_stopped_event(resp)
                 # Discard other events (Resumed, Checkpoint info, etc.)
+
+    def resource_get(self, name: str) -> int | str:
+        """Get a VICE resource value by name.
+
+        Returns an int for integer resources, str for string resources.
+        """
+        name_bytes = name.encode("ascii")
+        body = bytes([len(name_bytes)]) + name_bytes
+        resp = self._send_and_recv(CMD_RESOURCE_GET, body)
+
+        if len(resp.body) < 2:
+            raise TransportError("Resource Get response too short")
+        resource_type = resp.body[0]
+        value_length = resp.body[1]
+        value_bytes = resp.body[2:2 + value_length]
+
+        if resource_type == 0x01:
+            return int.from_bytes(value_bytes, "little")
+        return value_bytes.decode("ascii")
+
+    def resource_set(self, name: str, value: int | str) -> None:
+        """Set a VICE resource value by name."""
+        name_bytes = name.encode("ascii")
+        if isinstance(value, int):
+            resource_type = 0x01
+            value_bytes = struct.pack("<i", value)
+        else:
+            resource_type = 0x00
+            value_bytes = value.encode("ascii")
+
+        body = bytes([resource_type, len(name_bytes)]) + name_bytes
+        body += bytes([len(value_bytes)]) + value_bytes
+        self._send_and_recv(CMD_RESOURCE_SET, body)
+
+    def set_warp(self, enabled: bool) -> None:
+        """Enable or disable VICE warp mode at runtime.
+
+        Requires text_monitor_port to be set (VICE must be launched with
+        both -binarymonitor and -remotemonitor).
+        """
+        if self._text_sock is None:
+            raise TransportError(
+                "Warp control requires text monitor connection "
+                "(set text_monitor_port when constructing transport)"
+            )
+        cmd = "warp on" if enabled else "warp off"
+        self._text_command(cmd)
+
+    def get_warp(self) -> bool:
+        """Return whether VICE warp mode is currently enabled."""
+        if self._text_sock is None:
+            raise TransportError(
+                "Warp control requires text monitor connection "
+                "(set text_monitor_port when constructing transport)"
+            )
+        response = self._text_command("warp")
+        return "is on" in response.lower()
 
     # ----- internal helpers -----
 
