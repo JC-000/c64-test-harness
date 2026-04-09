@@ -162,7 +162,9 @@ class ViceInstance:
     process: ViceProcess | None
     transport: BinaryViceTransport
     managed: bool = True
+    text_monitor_port: int = 0
     _port_lock: PortLock | None = field(default=None, repr=False)
+    _text_port_lock: PortLock | None = field(default=None, repr=False)
 
     @property
     def pid(self) -> int | None:
@@ -170,13 +172,16 @@ class ViceInstance:
         return self.process.pid if self.process else None
 
     def stop(self) -> None:
-        """Close transport, stop the process, and release the port lock."""
+        """Close transport, stop the process, and release port locks."""
         try:
             self.transport.close()
         except Exception:
             pass
         if self.managed and self.process is not None:
             self.process.stop()
+        if self._text_port_lock is not None:
+            self._text_port_lock.release()
+            self._text_port_lock = None
         if self._port_lock is not None:
             self._port_lock.release()
             self._port_lock = None
@@ -200,11 +205,13 @@ class ViceInstanceManager:
         port_range_end: int = 6531,
         reuse_existing: bool = False,
         max_retries: int = 3,
+        enable_text_monitor: bool = False,
     ) -> None:
         self._base_config = config or ViceConfig()
         self._allocator = PortAllocator(port_range_start, port_range_end)
         self._reuse_existing = reuse_existing
         self._max_retries = max_retries
+        self._enable_text_monitor = enable_text_monitor
         self._instances: list[ViceInstance] = []
         self._lock = threading.Lock()
         self._mac_counter = 0  # monotonic index for unique MAC generation
@@ -267,7 +274,7 @@ class ViceInstanceManager:
         )
 
     def release(self, instance: ViceInstance) -> None:
-        """Stop an instance and free its port."""
+        """Stop an instance and free its port(s)."""
         with self._lock:
             try:
                 self._instances.remove(instance)
@@ -275,6 +282,8 @@ class ViceInstanceManager:
                 pass
         instance.stop()
         self._allocator.release(instance.port)
+        if instance.text_monitor_port:
+            self._allocator.release(instance.text_monitor_port)
 
     def shutdown(self) -> None:
         """Stop all active instances."""
@@ -284,6 +293,8 @@ class ViceInstanceManager:
         for inst in instances:
             inst.stop()
             self._allocator.release(inst.port)
+            if inst.text_monitor_port:
+                self._allocator.release(inst.text_monitor_port)
 
     @contextmanager
     def instance(self) -> Iterator[ViceInstance]:
@@ -304,10 +315,17 @@ class ViceInstanceManager:
                 port=port, process=None, transport=transport, managed=False,
             )
 
+        # Allocate a text monitor port if requested
+        text_monitor_port = 0
+        text_port_lock: PortLock | None = None
+        if self._enable_text_monitor:
+            text_monitor_port = self._allocator.allocate()
+
         cfg = ViceConfig(
             executable=self._base_config.executable,
             prg_path=self._base_config.prg_path,
             port=port,
+            text_monitor_port=text_monitor_port,
             warp=self._base_config.warp,
             ntsc=self._base_config.ntsc,
             sound=self._base_config.sound,
@@ -342,6 +360,13 @@ class ViceInstanceManager:
         if reservation is not None:
             reservation.close()
 
+        # Same pattern for text monitor port
+        if text_monitor_port:
+            text_port_lock = self._allocator.take_lock(text_monitor_port)
+            text_reservation = self._allocator.take_socket(text_monitor_port)
+            if text_reservation is not None:
+                text_reservation.close()
+
         try:
             proc.start()
 
@@ -356,7 +381,10 @@ class ViceInstanceManager:
                         f"VICE process exited during binary monitor connect on port {port}"
                     )
                 try:
-                    transport = BinaryViceTransport(port=port)
+                    transport = BinaryViceTransport(
+                        port=port,
+                        text_monitor_port=text_monitor_port,
+                    )
                     break
                 except Exception as e:
                     last_err = e
@@ -379,6 +407,8 @@ class ViceInstanceManager:
 
             if port_lock is not None:
                 port_lock.update_vice_pid(proc.pid or 0)
+            if text_port_lock is not None:
+                text_port_lock.update_vice_pid(proc.pid or 0)
 
             # Program unique CS8900a MAC if ethernet is enabled
             if cfg.ethernet:
@@ -400,11 +430,14 @@ class ViceInstanceManager:
                     )
 
         except Exception:
+            if text_port_lock is not None:
+                text_port_lock.release()
             if port_lock is not None:
                 port_lock.release()
             raise
 
         return ViceInstance(
             port=port, process=proc, transport=transport, managed=True,
-            _port_lock=port_lock,
+            text_monitor_port=text_monitor_port,
+            _port_lock=port_lock, _text_port_lock=text_port_lock,
         )
