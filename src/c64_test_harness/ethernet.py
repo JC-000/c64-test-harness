@@ -1,4 +1,4 @@
-"""Ethernet MAC address helpers for CS8900a (TFE/RR-Net) on VICE.
+"""Ethernet MAC address helpers for CS8900a (RR-Net) on VICE.
 
 VICE does not expose a command-line flag for setting the CS8900a MAC
 address, so the Individual Address (IA) must be programmed at runtime
@@ -12,8 +12,9 @@ This module provides:
 * ``set_cs8900a_mac`` — program the CS8900a IA registers through a
   connected ``C64Transport``
 
-The MAC is written via the PPPtr ($DE0A) / PPData ($DE0C) I/O registers
-at the configured base address.
+The MAC is written via the RR-Net PPPtr ($DE02) / PPData ($DE04) I/O
+registers.  Before any register access we must set the RR clockport
+enable bit ($DE01 bit 0), otherwise the chip silently drops the writes.
 """
 
 from __future__ import annotations
@@ -26,11 +27,12 @@ if TYPE_CHECKING:
 # CS8900a PacketPage offsets for the Individual Address (6 bytes, 3 words)
 _IA_PP_OFFSET = 0x0158
 
-# I/O register offsets relative to the CS8900a base address
-_PPTR_LO = 0x0A
-_PPTR_HI = 0x0B
-_PPDATA_LO = 0x0C
-_PPDATA_HI = 0x0D
+# I/O register offsets relative to the CS8900a base address (RR-Net layout)
+_ISQ_HI = 0x01       # bit 0 = RR clockport enable
+_PPTR_LO = 0x02
+_PPTR_HI = 0x03
+_PPDATA_LO = 0x04
+_PPDATA_HI = 0x05
 
 # Locally-administered OUI prefix: 02:c6:40 (C64-themed)
 _MAC_PREFIX = b"\x02\xc6\x40"
@@ -88,7 +90,9 @@ def set_cs8900a_mac(
     Writes the 6-byte *mac* to PacketPage offsets 0x0158-0x015D by
     setting PPPtr and writing PPData one word at a time.
 
-    *base* is the CS8900a I/O base address (default 0xDE00 for TFE mode).
+    *base* is the CS8900a I/O base address (default 0xDE00 for RR-Net
+    mode).  The RR clockport enable bit ($base+1, bit 0) is set before
+    the first register access.
 
     The transport must be connected and the CPU should be stopped
     (normal state after binary monitor connect).
@@ -96,10 +100,15 @@ def set_cs8900a_mac(
     if len(mac) != 6:
         raise ValueError(f"MAC must be 6 bytes, got {len(mac)}")
 
+    isq_hi = base + _ISQ_HI
     pptr_lo = base + _PPTR_LO
     pptr_hi = base + _PPTR_HI
     ppdata_lo = base + _PPDATA_LO
     ppdata_hi = base + _PPDATA_HI
+
+    # Enable RR clockport: set bit 0 of $DE01 (read-modify-write).
+    cur = transport.read_memory(isq_hi, 1)
+    transport.write_memory(isq_hi, bytes([cur[0] | 0x01]))
 
     # Write 3 words (6 bytes) to IA registers at PP 0x0158-0x015D
     for i in range(3):
