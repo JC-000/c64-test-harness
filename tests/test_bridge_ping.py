@@ -40,6 +40,8 @@ from c64_test_harness.bridge_ping import (
     RTDATA_HI,
     RTDATA_LO,
     build_echo_request_frame,
+    build_icmp_responder_code,
+    build_ping_and_wait_code,
     build_tx_code,
 )
 from c64_test_harness.execute import jsr, load_code
@@ -338,4 +340,126 @@ class TestBridgeIcmp:
         # Payload
         assert PING_PAYLOAD in rx, (
             f"payload marker not found in RX buffer: {rx[:_RX_BYTES].hex()}"
+        )
+
+
+class TestBridgeIcmpRoundTrip:
+    """Full round-trip: A pings B, B replies in the same JSR, A verifies."""
+
+    def test_icmp_round_trip(
+        self,
+        bridge_vice_pair: tuple[BinaryViceTransport, BinaryViceTransport],
+    ) -> None:
+        """A TXes echo request, B's responder swaps + TXes echo reply, A reads it.
+
+        This exercises ``build_icmp_responder_code`` which issues a TX
+        immediately after consuming an RX frame in the same JSR.  The
+        prior TFE-era work claimed VICE 3.10 silently dropped the TX in
+        this pattern; we retry with RR-Net + clockport enable to verify.
+        """
+        transport_a, transport_b = bridge_vice_pair
+
+        echo = build_echo_request_frame(
+            src_mac=MAC_A,
+            dst_mac=MAC_B,
+            src_ip=IP_A,
+            dst_ip=IP_B,
+            identifier=PING_ID,
+            sequence=PING_SEQ,
+            payload=PING_PAYLOAD,
+        )
+        frame_len = len(echo.frame)
+
+        # B's responder: waits for an echo request, builds and TXes reply
+        responder_code = build_icmp_responder_code(
+            load_addr=CODE,
+            rx_buf=RX_FRAME_BUF,
+            my_ip=IP_B,
+            result_addr=RESULT,
+        )
+        load_code(transport_b, CODE, responder_code)
+        write_bytes(transport_b, RESULT, [0x00])
+        write_bytes(transport_b, RX_FRAME_BUF, [0x00] * 256)
+
+        # A's ping-and-wait: TX then poll for matching reply in the same JSR
+        ping_code = build_ping_and_wait_code(
+            load_addr=CODE,
+            tx_frame_buf=TX_FRAME_BUF,
+            tx_frame_len=frame_len,
+            rx_buf=RX_FRAME_BUF,
+            result_addr=RESULT,
+            identifier=PING_ID,
+            sequence=PING_SEQ,
+        )
+        load_code(transport_a, CODE, ping_code)
+        write_bytes(transport_a, TX_FRAME_BUF, echo.frame)
+        write_bytes(transport_a, RESULT, [0x00])
+        write_bytes(transport_a, RX_FRAME_BUF, [0x00] * 256)
+
+        rx_error: list[Exception] = []
+        tx_error: list[Exception] = []
+
+        def responder_worker() -> None:
+            try:
+                jsr(transport_b, CODE, timeout=30.0)
+            except Exception as e:
+                rx_error.append(e)
+
+        def ping_worker() -> None:
+            try:
+                time.sleep(1.0)  # let B start polling first
+                jsr(transport_a, CODE, timeout=20.0)
+            except Exception as e:
+                tx_error.append(e)
+
+        tr = threading.Thread(target=responder_worker, daemon=True)
+        tt = threading.Thread(target=ping_worker, daemon=True)
+        tr.start()
+        tt.start()
+        tr.join(timeout=45.0)
+        tt.join(timeout=45.0)
+
+        b_result = read_bytes(transport_b, RESULT, 1)[0]
+        a_result = read_bytes(transport_a, RESULT, 1)[0]
+
+        # Dump B's RX buffer for diagnostics even on failure
+        b_rx = bytes(read_bytes(transport_b, RX_FRAME_BUF, _RX_BYTES))
+
+        if rx_error:
+            raise AssertionError(
+                f"responder raised: {rx_error[0]}\n"
+                f"b_result=0x{b_result:02X} a_result=0x{a_result:02X}\n"
+                f"b_rx={b_rx.hex()}"
+            ) from rx_error[0]
+        if tx_error:
+            raise AssertionError(
+                f"pinger raised: {tx_error[0]}\n"
+                f"b_result=0x{b_result:02X} a_result=0x{a_result:02X}\n"
+                f"b_rx={b_rx.hex()}"
+            ) from tx_error[0]
+
+        assert b_result == 0x01, (
+            f"B responder did not complete (result=0x{b_result:02X}); "
+            f"b_rx={b_rx.hex()}"
+        )
+        assert a_result == 0x01, (
+            f"A did not receive matching ICMP echo reply "
+            f"(a_result=0x{a_result:02X}, b_result=0x{b_result:02X}); "
+            f"b_rx={b_rx.hex()}"
+        )
+
+        # Verify A's RX buffer contains an echo reply from B
+        a_rx = bytes(read_bytes(transport_a, RX_FRAME_BUF, _RX_BYTES))
+        assert a_rx[12:14] == b"\x08\x00", (
+            f"A rx ethertype not IPv4: {a_rx[12:14].hex()}"
+        )
+        assert a_rx[23] == 0x01, f"A rx IP protocol not ICMP: 0x{a_rx[23]:02X}"
+        assert a_rx[34] == 0x00, (
+            f"A rx ICMP type not echo reply: 0x{a_rx[34]:02X}"
+        )
+        assert a_rx[26:30] == IP_B, (
+            f"A rx src IP mismatch: {a_rx[26:30].hex()} expected {IP_B.hex()}"
+        )
+        assert a_rx[30:34] == IP_A, (
+            f"A rx dst IP mismatch: {a_rx[30:34].hex()} expected {IP_A.hex()}"
         )
