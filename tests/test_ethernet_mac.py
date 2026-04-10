@@ -112,46 +112,55 @@ class TestFormatMac:
 class TestSetCs8900aMac:
     def test_programs_three_words(self) -> None:
         transport = MagicMock()
+        transport.read_memory.return_value = b"\x00"
         mac = b"\x02\xc6\x40\x00\x00\x01"
         set_cs8900a_mac(transport, mac)
 
-        # Should write PPPtr + PPData for 3 words
-        assert transport.write_memory.call_count == 12  # 4 writes per word × 3
+        # 1 clockport enable write + 4 writes per word × 3 words = 13
+        assert transport.write_memory.call_count == 13
 
     def test_correct_pp_offsets(self) -> None:
+        """RR-Net layout: PPPtr=$DE02/03, PPData=$DE04/05."""
         transport = MagicMock()
+        transport.read_memory.return_value = b"\x00"
         mac = b"\x02\xc6\x40\x00\x00\x01"
         set_cs8900a_mac(transport, mac)
 
         calls = transport.write_memory.call_args_list
 
+        # First call: RR clockport enable ($DE01 |= 0x01)
+        assert calls[0] == call(0xDE01, bytes([0x01]))
+
         # Word 0: PPPtr = 0x0158
-        assert calls[0] == call(0xDE0A, bytes([0x58]))  # PPPtr lo
-        assert calls[1] == call(0xDE0B, bytes([0x01]))  # PPPtr hi
-        assert calls[2] == call(0xDE0C, bytes([0x02]))  # PPData lo = mac[0]
-        assert calls[3] == call(0xDE0D, bytes([0xC6]))  # PPData hi = mac[1]
+        assert calls[1] == call(0xDE02, bytes([0x58]))  # PPPtr lo
+        assert calls[2] == call(0xDE03, bytes([0x01]))  # PPPtr hi
+        assert calls[3] == call(0xDE04, bytes([0x02]))  # PPData lo = mac[0]
+        assert calls[4] == call(0xDE05, bytes([0xC6]))  # PPData hi = mac[1]
 
         # Word 1: PPPtr = 0x015A
-        assert calls[4] == call(0xDE0A, bytes([0x5A]))
-        assert calls[5] == call(0xDE0B, bytes([0x01]))
-        assert calls[6] == call(0xDE0C, bytes([0x40]))  # mac[2]
-        assert calls[7] == call(0xDE0D, bytes([0x00]))  # mac[3]
+        assert calls[5] == call(0xDE02, bytes([0x5A]))
+        assert calls[6] == call(0xDE03, bytes([0x01]))
+        assert calls[7] == call(0xDE04, bytes([0x40]))  # mac[2]
+        assert calls[8] == call(0xDE05, bytes([0x00]))  # mac[3]
 
         # Word 2: PPPtr = 0x015C
-        assert calls[8] == call(0xDE0A, bytes([0x5C]))
-        assert calls[9] == call(0xDE0B, bytes([0x01]))
-        assert calls[10] == call(0xDE0C, bytes([0x00]))  # mac[4]
-        assert calls[11] == call(0xDE0D, bytes([0x01]))  # mac[5]
+        assert calls[9] == call(0xDE02, bytes([0x5C]))
+        assert calls[10] == call(0xDE03, bytes([0x01]))
+        assert calls[11] == call(0xDE04, bytes([0x00]))  # mac[4]
+        assert calls[12] == call(0xDE05, bytes([0x01]))  # mac[5]
 
     def test_custom_base_address(self) -> None:
         transport = MagicMock()
+        transport.read_memory.return_value = b"\x00"
         mac = b"\x02\xc6\x40\x00\x00\x01"
         set_cs8900a_mac(transport, mac, base=0xDF00)
 
         calls = transport.write_memory.call_args_list
-        # PPPtr should be at base + 0x0A = 0xDF0A
-        assert calls[0] == call(0xDF0A, bytes([0x58]))
-        assert calls[1] == call(0xDF0B, bytes([0x01]))
+        # Clockport enable at $DF01
+        assert calls[0] == call(0xDF01, bytes([0x01]))
+        # PPPtr at base + 0x02 = 0xDF02
+        assert calls[1] == call(0xDF02, bytes([0x58]))
+        assert calls[2] == call(0xDF03, bytes([0x01]))
 
     def test_wrong_mac_length_raises(self) -> None:
         transport = MagicMock()
@@ -161,8 +170,9 @@ class TestSetCs8900aMac:
     def test_broadcast_mac(self) -> None:
         """Verify broadcast MAC can be programmed (edge case)."""
         transport = MagicMock()
+        transport.read_memory.return_value = b"\x00"
         set_cs8900a_mac(transport, b"\xff\xff\xff\xff\xff\xff")
-        assert transport.write_memory.call_count == 12
+        assert transport.write_memory.call_count == 13
 
 
 # ---------------------------------------------------------------------------
