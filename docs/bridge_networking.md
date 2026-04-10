@@ -52,12 +52,10 @@ sudo /home/someone/c64-test-harness/scripts/cleanup-bridge-networking.sh
 
 ## Launching two VICE instances on the bridge
 
-The simplest way is to use the `bridge_vice_pair` pytest fixture in
-`tests/test_bridge_ping.py`:
+The simplest way is to use the `bridge_vice_pair` pytest fixture
+defined in `tests/conftest.py`:
 
 ```python
-from tests.test_bridge_ping import bridge_vice_pair
-
 def test_my_bridge_thing(bridge_vice_pair):
     transport_a, transport_b = bridge_vice_pair
     # both VICE instances are at READY, CS8900a initialised, MACs set
@@ -106,10 +104,10 @@ vice_b.start()
 transport_a = connect_binary_transport(port_a, proc=vice_a)
 transport_b = connect_binary_transport(port_b, proc=vice_b)
 
-# Wait for BASIC READY (omitted: see _wait_for_ready in tests/test_bridge_ping.py)
+# Wait for BASIC READY (omitted: see _bridge_wait_ready in tests/conftest.py)
 
 # Initialise CS8900a on each instance: RxCTL = 0x00D8, LineCTL |= 0x00C0
-# (see _init_cs8900a in tests/test_bridge_ping.py for the exact sequence)
+# (see _bridge_init_cs8900a in tests/conftest.py for the exact sequence)
 
 # Program unique MAC addresses
 set_cs8900a_mac(transport_a, bytes.fromhex("02C640000001"))
