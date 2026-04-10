@@ -547,6 +547,8 @@ set_cs8900a_mac(transport, mac)           # program CS8900a IA registers
 
 **Bridge setup** for multi-VICE networking: `sudo scripts/setup-bridge-tap.sh` (creates `br-c64` + `tap-c64-0` + `tap-c64-1`). Teardown: `sudo scripts/teardown-bridge-tap.sh`. Single TAP: `sudo scripts/setup-tap-networking.sh`.
 
+**IP-layer ICMP exchange between two VICE instances** is supported via the `bridge_ping` module and the `bridge_vice_pair` pytest fixture (in `tests/conftest.py`). The fixture launches two VICE instances on the bridge, initialises the CS8900a, and programs unique MACs. Tests can build IP/ICMP frames in Python with `build_echo_request_frame()` and verify reception via 6502 RX routines. See `tests/test_bridge_ping.py` for an end-to-end example and [docs/bridge_networking.md](docs/bridge_networking.md) for the full pattern, including the documented VICE 3.10 TFE quirks (RR-Net mode is broken; ip65's cs8900a driver cannot be linked because it expects the original RR-Net register shift).
+
 ## Audio Capture
 
 ### VICE — Headless WAV Render

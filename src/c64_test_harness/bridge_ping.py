@@ -1,0 +1,673 @@
+"""Bridge ICMP ping support for two-VICE bridge tests.
+
+This module provides helpers to ping between two VICE instances that share
+a Linux bridge (``br-c64`` + ``tap-c64-0`` + ``tap-c64-1``) with
+CS8900a ethernet in TFE mode.
+
+The approach is minimal: neither VICE runs a full IP stack.  Instead, a
+small 6502 routine in each instance handles one network activity:
+
+* :func:`build_icmp_responder_code` -- 6502 routine that polls the CS8900a
+  RX queue, receives one frame, checks if it is an ICMP echo request
+  addressed to our IP, transforms it into an ICMP echo reply (swap MACs,
+  swap IPs, set type=0, adjust ICMP checksum), and transmits it back.
+
+* :func:`build_rx_echo_reply_code` -- 6502 routine that polls CS8900a RX
+  and waits for a specific ICMP echo *reply* (matched by ID+sequence).
+
+* :func:`build_tx_code` -- simple 6502 routine that transmits a pre-built
+  frame from memory.
+
+Both routines write a single-byte status flag at a well-known address:
+
+* ``0x00`` -- pending
+* ``0x01`` -- success (reply received / responder sent reply)
+* ``0xFF`` -- timeout
+
+Why no ip65?  The ip65 C64 cs8900a driver is hard-coded for the RR-Net
+register offsets (``rxtxreg := $DE08``).  VICE 3.10's RR-Net mode
+emulates a different layout (+4 shift, not +8) and packet-page
+addressing does not work, so the ip65 driver cannot be used with VICE.
+This module provides an equivalent minimal subset written against the
+standard CS8900a TFE layout that does work in VICE.
+
+Register layout assumed (TFE mode, CS8900a at ``$DE00``)::
+
+    $DE00/$DE01  RTDATA   (data FIFO, 16-bit)
+    $DE04/$DE05  TxCMD
+    $DE06/$DE07  TxLen
+    $DE0A/$DE0B  PPPtr
+    $DE0C/$DE0D  PPData
+"""
+
+from __future__ import annotations
+
+import struct
+from dataclasses import dataclass
+
+
+# ---------------------------------------------------------------------------
+# CS8900a registers (TFE layout)
+# ---------------------------------------------------------------------------
+RTDATA_LO = 0xDE00
+RTDATA_HI = 0xDE01
+TXCMD_LO = 0xDE04
+TXCMD_HI = 0xDE05
+TXLEN_LO = 0xDE06
+TXLEN_HI = 0xDE07
+PPTR_LO = 0xDE0A
+PPTR_HI = 0xDE0B
+PPDATA_LO = 0xDE0C
+PPDATA_HI = 0xDE0D
+
+
+# ---------------------------------------------------------------------------
+# Tiny 6502 assembler with branch fixups
+# ---------------------------------------------------------------------------
+class Asm:
+    """Tiny 6502 assembler with branch + JMP absolute fixups."""
+
+    def __init__(self, org: int = 0) -> None:
+        self.org = org
+        self.buf = bytearray()
+        self.labels: dict[str, int] = {}
+        self._branch_fix: list[tuple[int, str]] = []
+        self._jmp_fix: list[tuple[int, str]] = []
+
+    @property
+    def pos(self) -> int:
+        return len(self.buf)
+
+    def label(self, name: str) -> None:
+        if name in self.labels:
+            raise ValueError(f"duplicate label: {name}")
+        self.labels[name] = self.pos
+
+    def emit(self, *data: int) -> None:
+        self.buf.extend(data)
+
+    def branch(self, opcode: int, target: str) -> None:
+        self.buf.append(opcode)
+        self._branch_fix.append((self.pos, target))
+        self.buf.append(0)
+
+    def jmp(self, target: str) -> None:
+        """JMP absolute to a label; target fixed up at build() time."""
+        self.buf.append(0x4C)
+        self._jmp_fix.append((self.pos, target))
+        self.buf.append(0)
+        self.buf.append(0)
+
+    def build(self) -> bytes:
+        for fix_pos, label in self._branch_fix:
+            if label not in self.labels:
+                raise ValueError(f"unresolved branch label: {label}")
+            target = self.labels[label]
+            disp = target - (fix_pos + 1)
+            if not (-128 <= disp <= 127):
+                raise ValueError(f"branch to '{label}' out of range: {disp}")
+            self.buf[fix_pos] = disp & 0xFF
+        for fix_pos, label in self._jmp_fix:
+            if label not in self.labels:
+                raise ValueError(f"unresolved jmp label: {label}")
+            target = self.org + self.labels[label]
+            self.buf[fix_pos] = target & 0xFF
+            self.buf[fix_pos + 1] = (target >> 8) & 0xFF
+        return bytes(self.buf)
+
+
+# ---------------------------------------------------------------------------
+# ICMP checksum helpers
+# ---------------------------------------------------------------------------
+
+def _ip_checksum(data: bytes) -> int:
+    """Compute the standard IP/ICMP 16-bit 1's complement checksum."""
+    if len(data) % 2:
+        data = data + b"\x00"
+    s = 0
+    for i in range(0, len(data), 2):
+        s += (data[i] << 8) | data[i + 1]
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    return (~s) & 0xFFFF
+
+
+@dataclass
+class EchoRequest:
+    """Bundle holding a built frame + metadata for readback verification."""
+
+    frame: bytes
+    identifier: int
+    sequence: int
+    payload: bytes
+
+
+def build_echo_request_frame(
+    src_mac: bytes,
+    dst_mac: bytes,
+    src_ip: bytes,
+    dst_ip: bytes,
+    identifier: int = 0x1234,
+    sequence: int = 1,
+    payload: bytes = b"PING_FROM_C64",
+) -> EchoRequest:
+    """Build a complete ICMP echo-request ethernet frame.
+
+    Returns an EchoRequest with the full frame bytes ready to upload and
+    transmit, plus metadata needed to verify a matching echo reply.
+    """
+    assert len(src_mac) == 6 and len(dst_mac) == 6
+    assert len(src_ip) == 4 and len(dst_ip) == 4
+
+    icmp_body = (
+        struct.pack(">BBHHH", 8, 0, 0, identifier, sequence) + payload
+    )
+    icmp_cksum = _ip_checksum(icmp_body)
+    icmp = (
+        struct.pack(">BBHHH", 8, 0, icmp_cksum, identifier, sequence) + payload
+    )
+
+    ip_total_len = 20 + len(icmp)
+    ip_no_cksum = struct.pack(
+        ">BBHHHBBH4s4s",
+        0x45, 0x00, ip_total_len,
+        0x0000, 0x0000,
+        64, 0x01, 0x0000,
+        src_ip, dst_ip,
+    )
+    ip_cksum = _ip_checksum(ip_no_cksum)
+    ip_header = struct.pack(
+        ">BBHHHBBH4s4s",
+        0x45, 0x00, ip_total_len,
+        0x0000, 0x0000,
+        64, 0x01, ip_cksum,
+        src_ip, dst_ip,
+    )
+
+    frame = dst_mac + src_mac + b"\x08\x00" + ip_header + icmp
+    # Pad to 60 bytes minimum (CS8900a adds FCS on wire)
+    if len(frame) < 60:
+        frame = frame + b"\x00" * (60 - len(frame))
+    # Word-align for CS8900a TX
+    if len(frame) % 2:
+        frame = frame + b"\x00"
+    return EchoRequest(
+        frame=frame,
+        identifier=identifier,
+        sequence=sequence,
+        payload=payload,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CS8900a initialisation blobs (same as tests/test_ethernet_bridge.py)
+# ---------------------------------------------------------------------------
+
+def cs8900a_rxctl_code() -> bytes:
+    """RxCTL (PP 0x0104) = 0x00D8 (matches the working baseline test)."""
+    return bytes([
+        0xA9, 0x04, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8,
+        0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8,
+        0xA9, 0xD8, 0x8D, PPDATA_LO & 0xFF, PPDATA_LO >> 8,
+        0xA9, 0x00, 0x8D, PPDATA_HI & 0xFF, PPDATA_HI >> 8,
+        0x60,
+    ])
+
+
+def cs8900a_read_linectl_code(dest_addr: int) -> bytes:
+    """Read LineCTL (PP 0x0112) into dest_addr / dest_addr+1."""
+    lo = dest_addr & 0xFF
+    hi = (dest_addr >> 8) & 0xFF
+    return bytes([
+        0xA9, 0x12, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8,
+        0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8,
+        0xAD, PPDATA_LO & 0xFF, PPDATA_LO >> 8,
+        0x8D, lo, hi,
+        0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8,
+        0x8D, (dest_addr + 1) & 0xFF, ((dest_addr + 1) >> 8) & 0xFF,
+        0x60,
+    ])
+
+
+def cs8900a_write_linectl_code(lo_value: int, hi_value: int) -> bytes:
+    """Write lo/hi to LineCTL (PP 0x0112)."""
+    return bytes([
+        0xA9, 0x12, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8,
+        0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8,
+        0xA9, lo_value & 0xFF, 0x8D, PPDATA_LO & 0xFF, PPDATA_LO >> 8,
+        0xA9, hi_value & 0xFF, 0x8D, PPDATA_HI & 0xFF, PPDATA_HI >> 8,
+        0x60,
+    ])
+
+
+# ---------------------------------------------------------------------------
+# 6502 code builders
+# ---------------------------------------------------------------------------
+
+def build_tx_code(
+    load_addr: int,
+    frame_buf: int,
+    frame_len: int,
+    result_addr: int,
+) -> bytes:
+    """Build a 6502 routine that transmits ``frame_len`` bytes from ``frame_buf``.
+
+    Writes 0x01 to ``result_addr`` on success.  Loads at ``load_addr``.
+    """
+    a = Asm(org=load_addr)
+    a.emit(0x78)  # SEI
+    a.emit(0xA9, 0xC0, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
+    a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
+    a.emit(0xA9, frame_len & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
+    a.emit(0xA9, (frame_len >> 8) & 0xFF, 0x8D, TXLEN_HI & 0xFF, TXLEN_HI >> 8)
+    a.emit(0xA9, 0x38, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
+    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
+    a.label("tw")
+    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
+    a.emit(0x29, 0x01)
+    a.branch(0xF0, "tw")
+    a.emit(0xA9, frame_buf & 0xFF, 0x85, 0xFB)
+    a.emit(0xA9, (frame_buf >> 8) & 0xFF, 0x85, 0xFC)
+    a.emit(0xA0, 0x00)
+    a.label("tl")
+    a.emit(0xB1, 0xFB)
+    a.emit(0x8D, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
+    a.emit(0xC8)
+    a.emit(0xB1, 0xFB)
+    a.emit(0x8D, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
+    a.emit(0xC8)
+    a.emit(0xC0, frame_len & 0xFF)
+    a.branch(0xD0, "tl")
+    a.emit(0xA9, 0x01, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
+    a.emit(0x58)
+    a.emit(0x60)
+    return a.build()
+
+
+_FIXED_RX_BYTES = 60  # bytes to drain after status+length (drives loop count)
+
+
+def _emit_skip_packet(a: Asm) -> None:
+    """Emit code that issues CS8900a SkipNow (RxCFG bit 6, PP 0x0102).
+
+    Per the ip65 cs8900a driver: read RxCFG low byte, OR with 0x40,
+    write it back.  Only the low byte is touched -- the high byte must
+    be left alone or the chip drops critical state.
+    """
+    a.emit(0xA9, 0x02, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
+    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
+    a.emit(0xAD, PPDATA_LO & 0xFF, PPDATA_LO >> 8)  # LDA PPData lo
+    a.emit(0x09, 0x40)                                # ORA #$40
+    a.emit(0x8D, PPDATA_LO & 0xFF, PPDATA_LO >> 8)  # STA PPData lo
+
+
+def _emit_read_frame(a: Asm, rx_buf: int) -> None:
+    """Emit code to read a frame from CS8900a RTDATA into rx_buf.
+
+    Preconditions:
+      - a frame is waiting (RxEvent fired)
+    Side effects:
+      - RxStatus stored at ZP $F1:$F2
+      - RxLength stored at ZP $F3:$F4
+      - Reads exactly _FIXED_RX_BYTES bytes (32 words) into rx_buf in
+        wire order.  This matches the working pattern in
+        tests/test_ethernet_bridge.py and avoids trusting RxLength
+        (VICE's TFE emulation has been observed to return bogus
+        RxLength on the first ICMP read with this caller pattern).
+
+    The fixed-length read is sufficient because we only need to inspect
+    the IP header (offset 14-33) and ICMP header (34-41), and ethernet
+    frames are minimum 60 bytes anyway -- our test sends 60-byte frames.
+    """
+    # Read 4 status+length bytes (discarded) as separate byte reads.
+    a.emit(0xAD, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
+    a.emit(0x85, 0xF1)
+    a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
+    a.emit(0x85, 0xF2)
+    a.emit(0xAD, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
+    a.emit(0x85, 0xF3)
+    a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
+    a.emit(0x85, 0xF4)
+
+    a.emit(0xA9, rx_buf & 0xFF, 0x85, 0xFB)
+    a.emit(0xA9, (rx_buf >> 8) & 0xFF, 0x85, 0xFC)
+    a.emit(0xA0, 0x00)
+    a.label("_rf_lp")
+    a.emit(0xAD, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
+    a.emit(0x91, 0xFB)
+    a.emit(0xC8)
+    a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
+    a.emit(0x91, 0xFB)
+    a.emit(0xC8)
+    a.emit(0xC0, _FIXED_RX_BYTES)
+    a.branch(0xD0, "_rf_lp")
+    # Skip the rest of the current packet so the CS8900a FIFO is
+    # advanced to the start of the next frame.
+    _emit_skip_packet(a)
+
+
+def _emit_poll_rx(
+    a: Asm,
+    timeout_label: str,
+    success_label: str,
+    outer: int = 0x04,
+) -> None:
+    """Emit code to poll RxEvent with a 3-level timeout.
+
+    Jumps to ``success_label`` when a frame is available (BNE, within
+    branch range) and to ``timeout_label`` via JMP absolute when the
+    outer counters exhaust.  Uses ZP $F0/$F1/$F2 for counters.
+
+    Outer counter default ``0x04`` -> ~4-5 seconds on a PAL C64.
+    """
+    # PPPtr = 0x0124 (RxEvent)
+    a.emit(0xA9, 0x24, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
+    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
+    a.emit(0xA9, 0xFF, 0x85, 0xF0)
+    a.emit(0xA9, 0xFF, 0x85, 0xF1)
+    a.emit(0xA9, outer & 0xFF, 0x85, 0xF2)
+    a.label("_pr_lp")
+    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
+    a.emit(0x29, 0x01)
+    a.branch(0xD0, success_label)  # got frame
+    a.emit(0xC6, 0xF0)
+    a.branch(0xD0, "_pr_lp")
+    a.emit(0xA9, 0xFF, 0x85, 0xF0)
+    a.emit(0xC6, 0xF1)
+    a.branch(0xD0, "_pr_lp")
+    a.emit(0xA9, 0xFF, 0x85, 0xF1)
+    a.emit(0xC6, 0xF2)
+    a.branch(0xD0, "_pr_lp")
+    a.jmp(timeout_label)
+
+
+def build_rx_echo_reply_code(
+    load_addr: int,
+    rx_buf: int,
+    result_addr: int,
+    identifier: int,
+    sequence: int,
+) -> bytes:
+    """Build a 6502 routine that polls RX and waits for an ICMP echo reply.
+
+    Verifies ethertype=IPv4, protocol=ICMP, type=echo-reply, identifier
+    and sequence match (big-endian on the wire).  Writes 0x01 or 0xFF to
+    ``result_addr``.
+    """
+    id_hi = (identifier >> 8) & 0xFF
+    id_lo = identifier & 0xFF
+    seq_hi = (sequence >> 8) & 0xFF
+    seq_lo = sequence & 0xFF
+
+    a = Asm(org=load_addr)
+    a.emit(0x78)  # SEI
+
+    a.label("reset")
+    _emit_poll_rx(a, timeout_label="timeout", success_label="got")
+
+    a.label("got")
+    _emit_read_frame(a, rx_buf)
+
+    # Check ethertype [12..13] = 0x08 0x00 (IPv4)
+    def chk(off: int, val: int, fail: str) -> None:
+        addr = rx_buf + off
+        a.emit(0xAD, addr & 0xFF, (addr >> 8) & 0xFF)
+        a.emit(0xC9, val & 0xFF)
+        a.branch(0xD0, fail)
+
+    # We use 'drop_short' (branchable) -> JMP reset
+    chk(12, 0x08, "drop")
+    chk(13, 0x00, "drop")
+    chk(23, 0x01, "drop")  # protocol = ICMP
+    chk(34, 0x00, "drop")  # type = echo reply
+    chk(38, id_hi, "drop")
+    chk(39, id_lo, "drop")
+    chk(40, seq_hi, "drop")
+    chk(41, seq_lo, "drop")
+    a.jmp("success")
+
+    a.label("drop")
+    a.jmp("reset")
+
+    a.label("success")
+    a.emit(0xA9, 0x01, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
+    a.emit(0x58)
+    a.emit(0x60)
+
+    a.label("timeout")
+    a.emit(0xA9, 0xFF, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
+    a.emit(0x58)
+    a.emit(0x60)
+
+    return a.build()
+
+
+def build_ping_and_wait_code(
+    load_addr: int,
+    tx_frame_buf: int,
+    tx_frame_len: int,
+    rx_buf: int,
+    result_addr: int,
+    identifier: int,
+    sequence: int,
+) -> bytes:
+    """Build a 6502 routine that TXes an echo request and waits for the reply.
+
+    This combines :func:`build_tx_code` and :func:`build_rx_echo_reply_code`
+    into a single routine, run via one ``jsr()`` call.  This is important
+    because while the binary monitor is paused (between JSRs) the CS8900a
+    may not pump TAP frames reliably, so TX and RX must happen without
+    a CPU pause in between.
+
+    .. note::
+
+        This routine is intended to pair with
+        :func:`build_icmp_responder_code` running on the peer VICE.
+        Because the responder's TX-after-RX is currently broken under
+        VICE 3.10 TFE (see that function's warning), this combined
+        ping-and-wait routine cannot complete a full round-trip
+        end-to-end yet.  It is retained for completeness.
+    """
+    id_hi = (identifier >> 8) & 0xFF
+    id_lo = identifier & 0xFF
+    seq_hi = (sequence >> 8) & 0xFF
+    seq_lo = sequence & 0xFF
+
+    a = Asm(org=load_addr)
+    a.emit(0x78)  # SEI
+
+    # --- TX the echo request ---
+    a.emit(0xA9, 0xC0, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
+    a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
+    a.emit(0xA9, tx_frame_len & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
+    a.emit(0xA9, (tx_frame_len >> 8) & 0xFF, 0x8D, TXLEN_HI & 0xFF, TXLEN_HI >> 8)
+    a.emit(0xA9, 0x38, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
+    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
+    a.label("pw_txw")
+    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
+    a.emit(0x29, 0x01)
+    a.branch(0xF0, "pw_txw")
+    a.emit(0xA9, tx_frame_buf & 0xFF, 0x85, 0xFB)
+    a.emit(0xA9, (tx_frame_buf >> 8) & 0xFF, 0x85, 0xFC)
+    a.emit(0xA0, 0x00)
+    a.label("pw_txlp")
+    a.emit(0xB1, 0xFB)
+    a.emit(0x8D, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
+    a.emit(0xC8)
+    a.emit(0xB1, 0xFB)
+    a.emit(0x8D, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
+    a.emit(0xC8)
+    a.emit(0xC0, tx_frame_len & 0xFF)
+    a.branch(0xD0, "pw_txlp")
+
+    # --- Now poll for the reply (same as build_rx_echo_reply_code body) ---
+    a.label("reset")
+    _emit_poll_rx(a, timeout_label="timeout", success_label="got")
+
+    a.label("got")
+    _emit_read_frame(a, rx_buf)
+
+    def chk(off: int, val: int, fail: str) -> None:
+        addr = rx_buf + off
+        a.emit(0xAD, addr & 0xFF, (addr >> 8) & 0xFF)
+        a.emit(0xC9, val & 0xFF)
+        a.branch(0xD0, fail)
+
+    chk(12, 0x08, "drop")
+    chk(13, 0x00, "drop")
+    chk(23, 0x01, "drop")
+    chk(34, 0x00, "drop")
+    chk(38, id_hi, "drop")
+    chk(39, id_lo, "drop")
+    chk(40, seq_hi, "drop")
+    chk(41, seq_lo, "drop")
+    a.jmp("success")
+
+    a.label("drop")
+    a.jmp("reset")
+
+    a.label("success")
+    a.emit(0xA9, 0x01, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
+    a.emit(0x58)
+    a.emit(0x60)
+
+    a.label("timeout")
+    a.emit(0xA9, 0xFF, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
+    a.emit(0x58)
+    a.emit(0x60)
+
+    return a.build()
+
+
+def build_icmp_responder_code(
+    load_addr: int,
+    rx_buf: int,
+    my_ip: bytes,
+    result_addr: int,
+) -> bytes:
+    """Build a 6502 routine that receives one ICMP echo request and replies.
+
+    Polls RX, checks for an IPv4/ICMP echo request addressed to ``my_ip``,
+    transforms it in place into an echo reply (swap MAC, swap IP, set
+    type=0, patch ICMP checksum), and TXes it back.  Writes 0x01 or 0xFF
+    to ``result_addr``.
+
+    .. warning::
+
+        Under VICE 3.10's TFE emulation, doing a TX immediately after
+        consuming an RX frame in the same JSR has been observed to
+        silently drop the TX (the routine completes the standard
+        TxCmd/TxLen/Rdy4TxNOW sequence and writes the bytes to the
+        FIFO, but no frame appears on the wire).  See
+        ``docs/bridge_networking.md`` for the workaround
+        (verify received frames on the receiver via memory reads
+        instead of relying on a C64-side responder).  This function
+        is retained for completeness and future debugging; it works
+        correctly through the swap+checksum-patch stage.
+    """
+    assert len(my_ip) == 4
+
+    a = Asm(org=load_addr)
+    a.emit(0x78)
+
+    a.label("reset")
+    _emit_poll_rx(a, timeout_label="timeout", success_label="got")
+
+    a.label("got")
+    _emit_read_frame(a, rx_buf)
+
+    def chk(off: int, val: int, fail: str) -> None:
+        addr = rx_buf + off
+        a.emit(0xAD, addr & 0xFF, (addr >> 8) & 0xFF)
+        a.emit(0xC9, val & 0xFF)
+        a.branch(0xD0, fail)
+
+    chk(12, 0x08, "drop")   # ethertype hi
+    chk(13, 0x00, "drop")   # ethertype lo
+    chk(23, 0x01, "drop")   # IP protocol = ICMP
+    chk(34, 0x08, "drop")   # ICMP type = echo request
+    chk(30, my_ip[0], "drop")
+    chk(31, my_ip[1], "drop")
+    chk(32, my_ip[2], "drop")
+    chk(33, my_ip[3], "drop")
+    a.jmp("transform")
+
+    # Short drop trampoline reachable from all chk BNEs
+    a.label("drop")
+    a.jmp("reset")
+
+    a.label("transform")
+    # Swap dest MAC [0..5] with src MAC [6..11] using X as temp
+    for i in range(6):
+        dst = rx_buf + i
+        src = rx_buf + 6 + i
+        a.emit(0xAD, dst & 0xFF, (dst >> 8) & 0xFF)  # LDA dst
+        a.emit(0xAE, src & 0xFF, (src >> 8) & 0xFF)  # LDX src
+        a.emit(0x8E, dst & 0xFF, (dst >> 8) & 0xFF)  # STX dst
+        a.emit(0x8D, src & 0xFF, (src >> 8) & 0xFF)  # STA src
+
+    # Swap src IP [26..29] with dst IP [30..33]
+    for i in range(4):
+        dst = rx_buf + 26 + i
+        src = rx_buf + 30 + i
+        a.emit(0xAD, dst & 0xFF, (dst >> 8) & 0xFF)
+        a.emit(0xAE, src & 0xFF, (src >> 8) & 0xFF)
+        a.emit(0x8E, dst & 0xFF, (dst >> 8) & 0xFF)
+        a.emit(0x8D, src & 0xFF, (src >> 8) & 0xFF)
+
+    # ICMP type [34] = 0
+    type_addr = rx_buf + 34
+    a.emit(0xA9, 0x00, 0x8D, type_addr & 0xFF, (type_addr >> 8) & 0xFF)
+
+    # ICMP checksum [36..37] big-endian; type decreased by 8 -> checksum
+    # increases by 8 in hi byte.  Add to [36], handle carry into [37],
+    # then end-around carry into [36] again.
+    ck_hi = rx_buf + 36
+    ck_lo = rx_buf + 37
+    a.emit(0xAD, ck_hi & 0xFF, (ck_hi >> 8) & 0xFF)
+    a.emit(0x18)
+    a.emit(0x69, 0x08)
+    a.emit(0x8D, ck_hi & 0xFF, (ck_hi >> 8) & 0xFF)
+    a.branch(0x90, "ck_done")  # BCC: no carry
+    a.emit(0xAD, ck_lo & 0xFF, (ck_lo >> 8) & 0xFF)
+    a.emit(0x18)
+    a.emit(0x69, 0x01)
+    a.emit(0x8D, ck_lo & 0xFF, (ck_lo >> 8) & 0xFF)
+    a.label("ck_done")
+
+    # Wait for TxRdy, then transmit fixed _FIXED_RX_BYTES from rx_buf
+    a.emit(0xA9, 0xC0, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
+    a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
+    a.emit(0xA9, _FIXED_RX_BYTES & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
+    a.emit(0xA9, 0x00, 0x8D, TXLEN_HI & 0xFF, TXLEN_HI >> 8)
+    a.emit(0xA9, 0x38, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
+    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
+    a.label("tw")
+    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
+    a.emit(0x29, 0x01)
+    a.branch(0xF0, "tw")
+
+    # Transmit fixed _FIXED_RX_BYTES bytes from rx_buf (in place)
+    a.emit(0xA9, rx_buf & 0xFF, 0x85, 0xFB)
+    a.emit(0xA9, (rx_buf >> 8) & 0xFF, 0x85, 0xFC)
+    a.emit(0xA0, 0x00)
+    a.label("txlp")
+    a.emit(0xB1, 0xFB)
+    a.emit(0x8D, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
+    a.emit(0xC8)
+    a.emit(0xB1, 0xFB)
+    a.emit(0x8D, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
+    a.emit(0xC8)
+    a.emit(0xC0, _FIXED_RX_BYTES)
+    a.branch(0xD0, "txlp")
+
+    a.emit(0xA9, 0x01, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
+    a.emit(0x58)
+    a.emit(0x60)
+
+    a.label("timeout")
+    a.emit(0xA9, 0xFF, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
+    a.emit(0x58)
+    a.emit(0x60)
+
+    return a.build()
