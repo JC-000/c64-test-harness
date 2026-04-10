@@ -11,8 +11,8 @@ The pattern uses:
 * `br-c64` -- a Linux network bridge
 * `tap-c64-0` and `tap-c64-1` -- two TAP interfaces attached to the
   bridge, one per VICE instance
-* Two `x64sc` processes, each launched with TFE-mode CS8900a ethernet
-  bound to its TAP interface
+* Two `x64sc` processes, each launched with RR-Net-mode CS8900a
+  ethernet bound to its TAP interface
 
 This setup gives two VICE instances a shared layer-2 segment.  The
 host can also participate (the bridge's IP is `10.0.65.1`), so
@@ -83,16 +83,18 @@ allocator = PortAllocator(port_range_start=6560, port_range_end=6580)
 port_a = allocator.allocate()
 port_b = allocator.allocate()
 
-# Configure both VICE instances with TFE ethernet on different TAPs
+# Configure both VICE instances with RR-Net ethernet on different TAPs.
+# Keep warp=False: ip65's DHCP flow has been observed to misbehave in
+# warp mode, and normal speed is fast enough for ethernet tests.
 config_a = ViceConfig(
     port=port_a, warp=False, sound=False,
-    ethernet=True, ethernet_mode="tfe",
+    ethernet=True, ethernet_mode="rrnet",
     ethernet_interface="tap-c64-0",
     ethernet_driver="tuntap",
 )
 config_b = ViceConfig(
     port=port_b, warp=False, sound=False,
-    ethernet=True, ethernet_mode="tfe",
+    ethernet=True, ethernet_mode="rrnet",
     ethernet_interface="tap-c64-1",
     ethernet_driver="tuntap",
 )
@@ -131,18 +133,29 @@ VICE 3.10 has no command-line flag for setting the CS8900a MAC; the
 chip starts with a default MAC and you MUST program the IA registers
 through the binary monitor before exchanging frames.
 
-## CS8900a register layout (TFE mode)
+## CS8900a register layout (RR-Net mode)
 
-When VICE is launched with `ethernet_mode="tfe"`, the CS8900a is
-mapped at base `$DE00` with the standard layout:
+When VICE is launched with `ethernet_mode="rrnet"`, the CS8900a is
+mapped at base `$DE00` with the RR-Net register layout that matches
+the physical RR-Net cartridge and the ip65 `cs8900a.s` driver:
 
-| Address       | Register   | Purpose                       |
-|---------------|------------|-------------------------------|
-| `$DE00/$DE01` | RTDATA     | Receive/transmit data FIFO    |
-| `$DE04/$DE05` | TxCMD      | TX command register           |
-| `$DE06/$DE07` | TxLength   | TX frame length               |
-| `$DE0A/$DE0B` | PPPtr      | PacketPage pointer            |
-| `$DE0C/$DE0D` | PPData     | PacketPage data               |
+| Address       | Register   | Purpose                                       |
+|---------------|------------|-----------------------------------------------|
+| `$DE00/$DE01` | ISQ        | Interrupt status queue; **bit 0 of `$DE01` = RR clockport enable** |
+| `$DE02/$DE03` | PPPtr      | PacketPage pointer                            |
+| `$DE04/$DE05` | PPData     | PacketPage data                               |
+| `$DE08/$DE09` | RTDATA     | RX/TX data FIFO                               |
+| `$DE0C/$DE0D` | TxCMD      | TX command register                           |
+| `$DE0E/$DE0F` | TxLength   | TX frame length                               |
+
+**Critical:** before any other CS8900a access, you must set the RR
+clockport enable bit (read `$DE01`, OR with `$01`, write back).
+Without this, the chip silently drops every register read and write,
+and the failure mode looks like "TX frames never reach the wire" or
+"PPPtr/PPData don't return sensible values".  All code builders in
+`c64_test_harness.bridge_ping` prepend this snippet automatically;
+`set_cs8900a_mac()` in `c64_test_harness.ethernet` also does a
+read-modify-write on `$DE01` before the first PP access.
 
 Programming model:
 
@@ -171,40 +184,13 @@ frames you expect to be sent are actually leaving the chip.
 
 ## Known limitations
 
-### RR-Net mode is broken in VICE 3.10
+### Warp mode and ip65 DHCP
 
-VICE 3.10's `EthernetCartMode=1` (RR-Net) emulates a register layout
-that does NOT match the standard CS8900a packet-page addressing.  In
-particular, the `PPPtr`/`PPData` register pair does not function for
-arbitrary PP register access.  Always use `ethernet_mode="tfe"` for
-test code that touches packet-page registers.
-
-This also means the **ip65 cs8900a driver cannot be used with VICE
-3.10**.  ip65's driver is hard-coded for the original RR-Net register
-shift (`rxtxreg := $DE08`), but VICE 3.10's RR-Net emulation uses a
-different shift entirely.  The
-`c64_test_harness.bridge_ping` module provides a minimal ICMP-aware
-ethernet helper layer written against the standard TFE register
-layout instead.
-
-### TX-after-RX in the same JSR can be silently dropped
-
-A 6502 routine that consumes an RX frame from the CS8900a and then
-immediately attempts to TX a reply (in the same `jsr()` call) has
-been observed to *not* emit the TX frame onto the wire under VICE
-3.10's TFE emulation, even though the routine appears to complete
-the standard TX command sequence successfully (`TxCMD`, `TxLen`,
-`Rdy4TxNOW` poll, write N bytes).  Standalone TX from a fresh VICE
-instance works correctly.  The exact cause is unknown -- possibly
-the chip's TX queue is held off by leftover RX state that
-SkipPacket (RxCFG bit 6) does not fully release in the emulation.
-
-For tests that need a true ICMP round-trip between two VICE
-instances, the workaround is to TX from one instance and verify the
-**received frame contents** on the other instance via memory read,
-rather than relying on a C64-side responder.  See
-`tests/test_bridge_ping.py::TestBridgeIcmp::test_icmp_echo_request_received`
-for an example.
+Keep `warp=False` for ethernet tests.  ip65's DHCP state machine has
+been observed to misbehave in warp mode; normal speed is fast enough
+for bridge tests and avoids the problem.  The harness fixtures in
+`tests/conftest.py` and every script in this directory set
+`warp=False` explicitly.
 
 ### Frame minimum size
 
@@ -219,7 +205,9 @@ payloads must be padded.  The `build_echo_request_frame` helper in
   (works fully end-to-end, both directions)
 * `tests/test_bridge_ping.py` -- IP-layer ICMP exchange via the bridge
 * `src/c64_test_harness/bridge_ping.py` -- helpers for building
-  ICMP echo frames and 6502 RX/TX routines targetting TFE mode
+  ICMP echo frames and 6502 RX/TX routines for RR-Net mode
+  (register offsets match ip65's `cs8900a.s`)
 * `scripts/setup-bridge-tap.sh` and `scripts/teardown-bridge-tap.sh`
-* `scripts/verify_rrnet_registers.py` -- empirical CS8900a register
-  probe used to confirm the TFE/RR-Net layout differences in VICE
+* `tests/test_bridge_ping.py::TestBridgeIcmpRoundTrip` -- full
+  round-trip test where B's 6502 responder swaps IPs/MACs and TXes
+  an ICMP echo reply in the same JSR that consumed the request
