@@ -141,3 +141,130 @@ def binary_transport():
         finally:
             transport.close()
             allocator.release(port)
+
+
+# ---------------------------------------------------------------------------
+# Bridge networking fixtures (two VICE instances on a Linux bridge)
+# ---------------------------------------------------------------------------
+
+# Default MACs and IPs used by the bridge_vice_pair fixture
+BRIDGE_MAC_A = bytes.fromhex("02C640000001")
+BRIDGE_MAC_B = bytes.fromhex("02C640000002")
+BRIDGE_IP_A = bytes([10, 0, 65, 2])
+BRIDGE_IP_B = bytes([10, 0, 65, 3])
+
+
+def _bridge_wait_ready(transport: BinaryViceTransport, timeout: float = 30.0) -> None:
+    from c64_test_harness.screen import ScreenGrid
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            transport.resume()
+            time.sleep(2.0)
+            grid = ScreenGrid.from_transport(transport)
+            if "READY" in grid.continuous_text().upper():
+                return
+        except Exception:
+            time.sleep(1.0)
+    raise AssertionError("BASIC READY prompt not found within timeout")
+
+
+def _bridge_init_cs8900a(transport: BinaryViceTransport, scratch: int, code: int) -> None:
+    """Initialise CS8900a for promiscuous RX + SerTxON/SerRxON.
+
+    *code* is the load address used for the helper routines (e.g. 0xC000).
+    *scratch* is a 2-byte scratch area for reading LineCTL (e.g. 0xC1E0).
+    """
+    from c64_test_harness.bridge_ping import (
+        cs8900a_read_linectl_code,
+        cs8900a_rxctl_code,
+        cs8900a_write_linectl_code,
+    )
+    from c64_test_harness.execute import jsr, load_code
+    from c64_test_harness.memory import read_bytes
+
+    load_code(transport, code, cs8900a_rxctl_code())
+    jsr(transport, code, timeout=5.0)
+    load_code(transport, code, cs8900a_read_linectl_code(scratch))
+    jsr(transport, code, timeout=5.0)
+    linectl = read_bytes(transport, scratch, 2)
+    load_code(transport, code, cs8900a_write_linectl_code(linectl[0] | 0xC0, linectl[1]))
+    jsr(transport, code, timeout=5.0)
+
+
+@pytest.fixture(scope="module")
+def bridge_vice_pair():
+    """Launch two VICE instances with TFE ethernet on a Linux bridge.
+
+    Yields ``(transport_a, transport_b)`` -- both connected, at BASIC
+    READY, CS8900a initialised, and with unique MACs programmed
+    (``BRIDGE_MAC_A`` on tap-c64-0, ``BRIDGE_MAC_B`` on tap-c64-1).
+
+    Skipped automatically if ``x64sc`` is not on PATH or if the
+    ``tap-c64-0`` / ``tap-c64-1`` interfaces are not present.  Run
+    ``sudo scripts/setup-bridge-tap.sh`` first to create them.
+
+    Use this fixture for any test that needs two bridged C64 instances
+    sharing a layer-2 segment.  See ``docs/bridge_networking.md`` for
+    the full pattern.
+    """
+    import os
+    if shutil.which("x64sc") is None:
+        pytest.skip("x64sc not found on PATH")
+    if not os.path.isdir("/sys/class/net/tap-c64-0"):
+        pytest.skip("tap-c64-0 not found (run scripts/setup-bridge-tap.sh)")
+    if not os.path.isdir("/sys/class/net/tap-c64-1"):
+        pytest.skip("tap-c64-1 not found (run scripts/setup-bridge-tap.sh)")
+
+    from c64_test_harness.ethernet import set_cs8900a_mac
+
+    code = 0xC000
+    scratch = 0xC1E0
+
+    allocator = PortAllocator(port_range_start=6560, port_range_end=6580)
+    port_a = allocator.allocate()
+    port_b = allocator.allocate()
+    res_a = allocator.take_socket(port_a)
+    if res_a is not None:
+        res_a.close()
+    res_b = allocator.take_socket(port_b)
+    if res_b is not None:
+        res_b.close()
+
+    config_a = ViceConfig(
+        port=port_a, warp=False, sound=False,
+        ethernet=True, ethernet_mode="tfe",
+        ethernet_interface="tap-c64-0",
+        ethernet_driver="tuntap",
+    )
+    config_b = ViceConfig(
+        port=port_b, warp=False, sound=False,
+        ethernet=True, ethernet_mode="tfe",
+        ethernet_interface="tap-c64-1",
+        ethernet_driver="tuntap",
+    )
+
+    vice_a = ViceProcess(config_a)
+    vice_b = ViceProcess(config_b)
+
+    try:
+        vice_a.start()
+        vice_b.start()
+        transport_a = connect_binary_transport(port_a, proc=vice_a)
+        transport_b = connect_binary_transport(port_b, proc=vice_b)
+        try:
+            _bridge_wait_ready(transport_a)
+            _bridge_wait_ready(transport_b)
+            _bridge_init_cs8900a(transport_a, scratch, code)
+            _bridge_init_cs8900a(transport_b, scratch, code)
+            set_cs8900a_mac(transport_a, BRIDGE_MAC_A)
+            set_cs8900a_mac(transport_b, BRIDGE_MAC_B)
+            yield transport_a, transport_b
+        finally:
+            transport_a.close()
+            transport_b.close()
+    finally:
+        vice_a.stop()
+        vice_b.stop()
+        allocator.release(port_a)
+        allocator.release(port_b)
