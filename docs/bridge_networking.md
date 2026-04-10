@@ -211,3 +211,9 @@ payloads must be padded.  The `build_echo_request_frame` helper in
 * `tests/test_bridge_ping.py::TestBridgeIcmpRoundTrip` -- full
   round-trip test where B's 6502 responder swaps IPs/MACs and TXes
   an ICMP echo reply in the same JSR that consumed the request
+* `scripts/bridge_ping_demo.py` -- visible two-VICE demo: launches
+  both instances side by side (not minimized, normal speed) and
+  runs the ICMP round-trip in a loop with live per-screen status
+  (ping counter + latest result, green/red). Run with
+  `PYTHONPATH=src python3 scripts/bridge_ping_demo.py` (Ctrl+C to
+  stop, or `--count N` to limit iterations)
