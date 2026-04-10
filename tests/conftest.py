@@ -194,7 +194,7 @@ def _bridge_init_cs8900a(transport: BinaryViceTransport, scratch: int, code: int
 
 @pytest.fixture(scope="module")
 def bridge_vice_pair():
-    """Launch two VICE instances with TFE ethernet on a Linux bridge.
+    """Launch two VICE instances with RR-Net ethernet on a Linux bridge.
 
     Yields ``(transport_a, transport_b)`` -- both connected, at BASIC
     READY, CS8900a initialised, and with unique MACs programmed
@@ -233,13 +233,13 @@ def bridge_vice_pair():
 
     config_a = ViceConfig(
         port=port_a, warp=False, sound=False,
-        ethernet=True, ethernet_mode="tfe",
+        ethernet=True, ethernet_mode="rrnet",
         ethernet_interface="tap-c64-0",
         ethernet_driver="tuntap",
     )
     config_b = ViceConfig(
         port=port_b, warp=False, sound=False,
-        ethernet=True, ethernet_mode="tfe",
+        ethernet=True, ethernet_mode="rrnet",
         ethernet_interface="tap-c64-1",
         ethernet_driver="tuntap",
     )

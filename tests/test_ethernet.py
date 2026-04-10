@@ -75,15 +75,38 @@ pytestmark = [
 CODE_BASE = 0xC000
 DATA_BASE = 0xC100
 
-# CS8900a I/O registers (TFE mode at $DE00)
-# Note: RR-Net mode shifts all registers by +2 ($DE02 base).  TFE mode
-# uses the standard CS8900a layout at the configured base address.
+# CS8900a I/O registers (RR-Net mode at $DE00).
+# Matches ip65 cs8900a.s layout:
+#   isq       = $DE00   ; ISQ / RR clockport enable ($DE01 bit 0)
+#   packetpp  = $DE02   ; PPPtr (16-bit)
+#   ppdata    = $DE04   ; PPData (16-bit)
+#   rxtxreg   = $DE08   ; RX/TX data FIFO (16-bit)
+#   txcmd     = $DE0C   ; TX command
+#   txlen     = $DE0E   ; TX length
+#
+# CRITICAL: the RR clockport MUST be enabled (set bit 0 of $DE01) before
+# any CS8900a register access, or the chip ignores all reads/writes.
 CS8900A_BASE = 0xDE00
-RTDATA = CS8900A_BASE + 0x00    # RX/TX data port (16-bit)
-TXCMD = CS8900A_BASE + 0x04     # TX command (16-bit)
-TXLEN = CS8900A_BASE + 0x06     # TX length (16-bit)
-PPTR = CS8900A_BASE + 0x0A      # PacketPage Pointer (16-bit)
-PPDATA = CS8900A_BASE + 0x0C    # PacketPage Data (16-bit)
+ISQ_LO = CS8900A_BASE + 0x00
+ISQ_HI = CS8900A_BASE + 0x01    # bit 0 = RR clockport enable
+PPTR = CS8900A_BASE + 0x02      # PacketPage Pointer (16-bit)
+PPDATA = CS8900A_BASE + 0x04    # PacketPage Data (16-bit)
+RTDATA = CS8900A_BASE + 0x08    # RX/TX data FIFO (16-bit)
+TXCMD = CS8900A_BASE + 0x0C     # TX command (16-bit)
+TXLEN = CS8900A_BASE + 0x0E     # TX length (16-bit)
+
+
+def _clockport_enable_code() -> bytes:
+    """6502 snippet: enable RR clockport bit (ORA #$01 at $DE01).
+
+    Must be prepended to every CS8900a access routine.  Without it, the
+    chip silently drops all register reads and writes.
+    """
+    return bytes([
+        0xAD, ISQ_HI & 0xFF, ISQ_HI >> 8,   # LDA $DE01
+        0x09, 0x01,                          # ORA #$01
+        0x8D, ISQ_HI & 0xFF, ISQ_HI >> 8,   # STA $DE01
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +190,7 @@ def vice_ethernet():
         warp=False,  # warp can cause timing issues with ethernet
         sound=False,
         ethernet=True,
-        ethernet_mode="tfe",
+        ethernet_mode="rrnet",
         ethernet_interface=TAP_IFACE or "tap-c64",
         ethernet_driver="tuntap",
     )
@@ -192,21 +215,22 @@ class TestCS8900aProbe:
     """Verify CS8900a chip is present by reading Product ID register."""
 
     def test_product_id(self, vice_ethernet: BinaryViceTransport) -> None:
-        """Read CS8900a Product ID -- expect 0x630E."""
+        """Read CS8900a Product ID -- expect 0x630E.
+
+        RR-Net mode: PPPtr lives at $DE02/$DE03 and PPData at $DE04/$DE05.
+        The RR clockport bit ($DE01 bit 0) MUST be enabled first.
+        """
         transport = vice_ethernet
 
-        # 6502 routine: probe CS8900a Product ID
-        # Write 0x0000 to PP Pointer ($DE0A/$DE0B)
-        # Read PP Data ($DE0C/$DE0D) into $C000/$C001
-        probe_code = bytes([
-            0xA9, 0x00,        # LDA #$00
-            0x8D, 0x0A, 0xDE,  # STA $DE0A  (PP Pointer low)
-            0x8D, 0x0B, 0xDE,  # STA $DE0B  (PP Pointer high)
-            0xAD, 0x0C, 0xDE,  # LDA $DE0C  (PP Data low)
-            0x8D, 0x00, 0xC0,  # STA $C000
-            0xAD, 0x0D, 0xDE,  # LDA $DE0D  (PP Data high)
-            0x8D, 0x01, 0xC0,  # STA $C001
-            0x60,              # RTS
+        probe_code = _clockport_enable_code() + bytes([
+            0xA9, 0x00,                          # LDA #$00
+            0x8D, PPTR & 0xFF, PPTR >> 8,        # STA $DE02 (PPPtr lo)
+            0x8D, (PPTR + 1) & 0xFF, (PPTR + 1) >> 8,  # STA $DE03 (PPPtr hi)
+            0xAD, PPDATA & 0xFF, PPDATA >> 8,    # LDA $DE04 (PPData lo)
+            0x8D, 0x00, 0xC0,                    # STA $C000
+            0xAD, (PPDATA + 1) & 0xFF, (PPDATA + 1) >> 8,  # LDA $DE05 (PPData hi)
+            0x8D, 0x01, 0xC0,                    # STA $C001
+            0x60,                                # RTS
         ])
 
         load_code(transport, CODE_BASE, probe_code)
@@ -265,57 +289,50 @@ class TestEthernetTX:
         # Write the frame buffer into C64 RAM
         write_bytes(transport, FRAME_BUF, FRAME_DATA)
 
-        # 6502 TX routine
-        # Uses zero-page pointer at $FB/$FC for indirect indexed reads
-        tx_code = bytes([
-            # --- TX Setup ---
-            # TxCMD = 0x00C0 (TxStart: transmit after full frame)
-            0xA9, 0xC0,        # LDA #$C0
-            0x8D, 0x04, 0xDE,  # STA $DE04  (TxCMD low)
-            0xA9, 0x00,        # LDA #$00
-            0x8D, 0x05, 0xDE,  # STA $DE05  (TxCMD high)
+        # 6502 TX routine (RR-Net register layout)
+        tx_code = _clockport_enable_code() + bytes([
+            # TxCMD = 0x00C0 at $DE0C/$DE0D
+            0xA9, 0xC0,
+            0x8D, TXCMD & 0xFF, TXCMD >> 8,
+            0xA9, 0x00,
+            0x8D, (TXCMD + 1) & 0xFF, (TXCMD + 1) >> 8,
 
-            # TxLength = 64
-            0xA9, 0x40,        # LDA #$40
-            0x8D, 0x06, 0xDE,  # STA $DE06  (TxLength low)
-            0xA9, 0x00,        # LDA #$00
-            0x8D, 0x07, 0xDE,  # STA $DE07  (TxLength high)
+            # TxLength = 64 at $DE0E/$DE0F
+            0xA9, 0x40,
+            0x8D, TXLEN & 0xFF, TXLEN >> 8,
+            0xA9, 0x00,
+            0x8D, (TXLEN + 1) & 0xFF, (TXLEN + 1) >> 8,
 
-            # --- Wait for Rdy4TxNOW ---
-            # Write 0x0138 to PP Pointer
-            0xA9, 0x38,        # LDA #$38
-            0x8D, 0x0A, 0xDE,  # STA $DE0A  (PP Ptr low)
-            0xA9, 0x01,        # LDA #$01
-            0x8D, 0x0B, 0xDE,  # STA $DE0B  (PP Ptr high)
-            # Poll PP Data high byte bit 0 (= bit 8 of BusST)
-            # .wait:
-            0xAD, 0x0D, 0xDE,  # LDA $DE0D  (PP Data high)
-            0x29, 0x01,        # AND #$01
-            0xF0, 0xF9,        # BEQ .wait  (-7 -> back to LDA $DE0D)
+            # PPPtr = 0x0138 (BusST)
+            0xA9, 0x38,
+            0x8D, PPTR & 0xFF, PPTR >> 8,
+            0xA9, 0x01,
+            0x8D, (PPTR + 1) & 0xFF, (PPTR + 1) >> 8,
+            # Poll PPData hi (bit 0 = Rdy4TxNOW)
+            0xAD, (PPDATA + 1) & 0xFF, (PPDATA + 1) >> 8,
+            0x29, 0x01,
+            0xF0, 0xF9,  # BEQ back -7
 
-            # --- Write frame data ---
-            # Set up ZP pointer: $FB/$FC = FRAME_BUF ($C200)
-            0xA9, FRAME_BUF & 0xFF,         # LDA #<FRAME_BUF
-            0x85, 0xFB,                      # STA $FB
-            0xA9, (FRAME_BUF >> 8) & 0xFF,  # LDA #>FRAME_BUF
-            0x85, 0xFC,                      # STA $FC
+            # ZP $FB/$FC = FRAME_BUF
+            0xA9, FRAME_BUF & 0xFF, 0x85, 0xFB,
+            0xA9, (FRAME_BUF >> 8) & 0xFF, 0x85, 0xFC,
 
-            # Loop: write 64 bytes (32 16-bit words) to $DE00/$DE01
-            0xA0, 0x00,        # LDY #$00
+            # Write 64 bytes to RTDATA ($DE08/$DE09)
+            0xA0, 0x00,
             # .loop:
-            0xB1, 0xFB,        # LDA ($FB),Y   ; low byte
-            0x8D, 0x00, 0xDE,  # STA $DE00
-            0xC8,              # INY
-            0xB1, 0xFB,        # LDA ($FB),Y   ; high byte
-            0x8D, 0x01, 0xDE,  # STA $DE01
-            0xC8,              # INY
-            0xC0, 0x40,        # CPY #$40       ; 64 bytes done?
-            0xD0, 0xF0,        # BNE .loop      (-16 -> back to LDA ($FB),Y)
+            0xB1, 0xFB,
+            0x8D, RTDATA & 0xFF, RTDATA >> 8,
+            0xC8,
+            0xB1, 0xFB,
+            0x8D, (RTDATA + 1) & 0xFF, (RTDATA + 1) >> 8,
+            0xC8,
+            0xC0, 0x40,
+            0xD0, 0xF0,  # BNE -16
 
-            # Store success flag
-            0xA9, 0x01,        # LDA #$01
-            0x8D, 0x00, 0xC0,  # STA $C000
-            0x60,              # RTS
+            # Success
+            0xA9, 0x01,
+            0x8D, 0x00, 0xC0,
+            0x60,
         ])
 
         load_code(transport, CODE_BASE, tx_code)
@@ -382,67 +399,58 @@ class TestEthernetRX:
         # 4. Read first 4 payload bytes (skip 14-byte header = 7 word reads)
         # 5. Store marker at $C000-$C003
         # Note: uses a timeout counter to avoid infinite loop
-        rx_code = bytes([
-            # --- Poll for RxOK ---
-            # Write 0x0124 to PP Pointer
-            0xA9, 0x24,        # LDA #$24
-            0x8D, 0x0A, 0xDE,  # STA $DE0A
-            0xA9, 0x01,        # LDA #$01
-            0x8D, 0x0B, 0xDE,  # STA $DE0B
+        rtd_lo = RTDATA & 0xFF
+        rtd_h_lo = (RTDATA + 1) & 0xFF
+        # For RR-Net: RTDATA at $DE08/$DE09. The high byte of both addresses
+        # is 0xDE so we hard-code it via the constants.
+        rx_code = _clockport_enable_code() + bytes([
+            # PPPtr = 0x0124 (RxEvent)
+            0xA9, 0x24, 0x8D, PPTR & 0xFF, PPTR >> 8,
+            0xA9, 0x01, 0x8D, (PPTR + 1) & 0xFF, (PPTR + 1) >> 8,
 
-            # Timeout counter in $FD/$FE (16-bit, counts down from 0xFFFF)
-            0xA9, 0xFF,        # LDA #$FF
-            0x85, 0xFD,        # STA $FD
-            0x85, 0xFE,        # STA $FE
+            # Timeout counter 16-bit at $FD/$FE
+            0xA9, 0xFF, 0x85, 0xFD, 0x85, 0xFE,
 
             # .poll:
-            0xAD, 0x0D, 0xDE,  # LDA $DE0D  (PP Data high = RxEvent high)
-            0x29, 0x01,        # AND #$01   (bit 8 = RxOK)
-            0xD0, 0x0E,        # BNE .got_packet (+14)
+            0xAD, (PPDATA + 1) & 0xFF, (PPDATA + 1) >> 8,  # LDA PPData hi
+            0x29, 0x01,
+            0xD0, 0x0E,  # BNE .got_packet (+14)
 
             # Decrement timeout
-            0xC6, 0xFD,        # DEC $FD
-            0xD0, 0xF5,        # BNE .poll  (-11)
-            0xC6, 0xFE,        # DEC $FE
-            0xD0, 0xF1,        # BNE .poll  (-15)
+            0xC6, 0xFD, 0xD0, 0xF5,  # DEC $FD; BNE .poll  (-11)
+            0xC6, 0xFE, 0xD0, 0xF1,  # DEC $FE; BNE .poll  (-15)
 
-            # Timeout -- store 0xFF at $C000 as error flag
-            0xA9, 0xFF,        # LDA #$FF
-            0x8D, 0x00, 0xC0,  # STA $C000
-            0x60,              # RTS
+            # Timeout -> $C000 = 0xFF
+            0xA9, 0xFF, 0x8D, 0x00, 0xC0, 0x60,
 
             # .got_packet:
-            # Read RxStatus (2 bytes, discard)
-            0xAD, 0x00, 0xDE,  # LDA $DE00
-            0xAD, 0x01, 0xDE,  # LDA $DE01
-
+            # Read RxStatus (2 bytes, discard) -- from RTDATA
+            0xAD, rtd_lo, 0xDE,
+            0xAD, rtd_h_lo, 0xDE,
             # Read RxLength (2 bytes, discard)
-            0xAD, 0x00, 0xDE,  # LDA $DE00
-            0xAD, 0x01, 0xDE,  # LDA $DE01
+            0xAD, rtd_lo, 0xDE,
+            0xAD, rtd_h_lo, 0xDE,
 
             # Skip ethernet header: 14 bytes = 7 word reads
-            # (6 dest MAC + 6 src MAC + 2 ethertype)
-            0xA2, 0x07,        # LDX #$07
+            0xA2, 0x07,
             # .skip:
-            0xAD, 0x00, 0xDE,  # LDA $DE00
-            0xAD, 0x01, 0xDE,  # LDA $DE01
-            0xCA,              # DEX
-            0xD0, 0xF8,        # BNE .skip (-8)
+            0xAD, rtd_lo, 0xDE,
+            0xAD, rtd_h_lo, 0xDE,
+            0xCA,
+            0xD0, 0xF8,  # BNE -8
 
             # Read 4 marker bytes (2 word reads)
-            0xAD, 0x00, 0xDE,  # LDA $DE00  ; marker[0]
-            0x8D, 0x00, 0xC0,  # STA $C000
-            0xAD, 0x01, 0xDE,  # LDA $DE01  ; marker[1]
-            0x8D, 0x01, 0xC0,  # STA $C001
-            0xAD, 0x00, 0xDE,  # LDA $DE00  ; marker[2]
-            0x8D, 0x02, 0xC0,  # STA $C002
-            0xAD, 0x01, 0xDE,  # LDA $DE01  ; marker[3]
-            0x8D, 0x03, 0xC0,  # STA $C003
+            0xAD, rtd_lo, 0xDE,
+            0x8D, 0x00, 0xC0,
+            0xAD, rtd_h_lo, 0xDE,
+            0x8D, 0x01, 0xC0,
+            0xAD, rtd_lo, 0xDE,
+            0x8D, 0x02, 0xC0,
+            0xAD, rtd_h_lo, 0xDE,
+            0x8D, 0x03, 0xC0,
 
-            # Store success flag
-            0xA9, 0x01,        # LDA #$01
-            0x8D, 0x04, 0xC0,  # STA $C004
-            0x60,              # RTS
+            # Success
+            0xA9, 0x01, 0x8D, 0x04, 0xC0, 0x60,
         ])
 
         load_code(transport, CODE_BASE, rx_code)

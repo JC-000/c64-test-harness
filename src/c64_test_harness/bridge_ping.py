@@ -2,7 +2,7 @@
 
 This module provides helpers to ping between two VICE instances that share
 a Linux bridge (``br-c64`` + ``tap-c64-0`` + ``tap-c64-1``) with
-CS8900a ethernet in TFE mode.
+CS8900a ethernet in RR-Net mode.
 
 The approach is minimal: neither VICE runs a full IP stack.  Instead, a
 small 6502 routine in each instance handles one network activity:
@@ -24,20 +24,20 @@ Both routines write a single-byte status flag at a well-known address:
 * ``0x01`` -- success (reply received / responder sent reply)
 * ``0xFF`` -- timeout
 
-Why no ip65?  The ip65 C64 cs8900a driver is hard-coded for the RR-Net
-register offsets (``rxtxreg := $DE08``).  VICE 3.10's RR-Net mode
-emulates a different layout (+4 shift, not +8) and packet-page
-addressing does not work, so the ip65 driver cannot be used with VICE.
-This module provides an equivalent minimal subset written against the
-standard CS8900a TFE layout that does work in VICE.
+Register layout (RR-Net mode, CS8900a at ``$DE00``).  This matches the
+ip65 ``cs8900a.s`` driver and the physical RR-Net cartridge::
 
-Register layout assumed (TFE mode, CS8900a at ``$DE00``)::
+    $DE00/$DE01  ISQ     (bit 0 of $DE01 = RR clockport enable)
+    $DE02/$DE03  PPPtr
+    $DE04/$DE05  PPData
+    $DE08/$DE09  RTDATA  (RX/TX data FIFO)
+    $DE0C/$DE0D  TxCMD
+    $DE0E/$DE0F  TxLen
 
-    $DE00/$DE01  RTDATA   (data FIFO, 16-bit)
-    $DE04/$DE05  TxCMD
-    $DE06/$DE07  TxLen
-    $DE0A/$DE0B  PPPtr
-    $DE0C/$DE0D  PPData
+**Critical:** the RR clockport enable bit ($DE01 bit 0) MUST be set before
+any other CS8900a register access.  All code builders in this module
+prepend a clockport-enable snippet via :func:`_clockport_enable_bytes` so
+callers do not have to remember this.
 """
 
 from __future__ import annotations
@@ -47,18 +47,40 @@ from dataclasses import dataclass
 
 
 # ---------------------------------------------------------------------------
-# CS8900a registers (TFE layout)
+# CS8900a registers (RR-Net layout; matches ip65 cs8900a.s)
 # ---------------------------------------------------------------------------
-RTDATA_LO = 0xDE00
-RTDATA_HI = 0xDE01
-TXCMD_LO = 0xDE04
-TXCMD_HI = 0xDE05
-TXLEN_LO = 0xDE06
-TXLEN_HI = 0xDE07
-PPTR_LO = 0xDE0A
-PPTR_HI = 0xDE0B
-PPDATA_LO = 0xDE0C
-PPDATA_HI = 0xDE0D
+ISQ_LO = 0xDE00
+ISQ_HI = 0xDE01          # bit 0 = RR clockport enable
+PPTR_LO = 0xDE02
+PPTR_HI = 0xDE03
+PPDATA_LO = 0xDE04
+PPDATA_HI = 0xDE05
+RTDATA_LO = 0xDE08
+RTDATA_HI = 0xDE09
+TXCMD_LO = 0xDE0C
+TXCMD_HI = 0xDE0D
+TXLEN_LO = 0xDE0E
+TXLEN_HI = 0xDE0F
+
+
+def _clockport_enable_bytes() -> bytes:
+    """6502 snippet: enable RR clockport bit (LDA $DE01; ORA #$01; STA $DE01).
+
+    Must precede every CS8900a access.  Without it, the chip silently
+    drops all register reads/writes.
+    """
+    return bytes([
+        0xAD, ISQ_HI & 0xFF, ISQ_HI >> 8,
+        0x09, 0x01,
+        0x8D, ISQ_HI & 0xFF, ISQ_HI >> 8,
+    ])
+
+
+def _emit_clockport_enable(a: "Asm") -> None:
+    """Emit the RR clockport enable sequence into an Asm buffer."""
+    a.emit(0xAD, ISQ_HI & 0xFF, ISQ_HI >> 8)
+    a.emit(0x09, 0x01)
+    a.emit(0x8D, ISQ_HI & 0xFF, ISQ_HI >> 8)
 
 
 # ---------------------------------------------------------------------------
@@ -204,8 +226,11 @@ def build_echo_request_frame(
 # ---------------------------------------------------------------------------
 
 def cs8900a_rxctl_code() -> bytes:
-    """RxCTL (PP 0x0104) = 0x00D8 (matches the working baseline test)."""
-    return bytes([
+    """RxCTL (PP 0x0104) = 0x00D8 (promiscuous + RxOK).
+
+    Enables the RR clockport first, then programs the register.
+    """
+    return _clockport_enable_bytes() + bytes([
         0xA9, 0x04, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8,
         0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8,
         0xA9, 0xD8, 0x8D, PPDATA_LO & 0xFF, PPDATA_LO >> 8,
@@ -218,7 +243,7 @@ def cs8900a_read_linectl_code(dest_addr: int) -> bytes:
     """Read LineCTL (PP 0x0112) into dest_addr / dest_addr+1."""
     lo = dest_addr & 0xFF
     hi = (dest_addr >> 8) & 0xFF
-    return bytes([
+    return _clockport_enable_bytes() + bytes([
         0xA9, 0x12, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8,
         0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8,
         0xAD, PPDATA_LO & 0xFF, PPDATA_LO >> 8,
@@ -231,7 +256,7 @@ def cs8900a_read_linectl_code(dest_addr: int) -> bytes:
 
 def cs8900a_write_linectl_code(lo_value: int, hi_value: int) -> bytes:
     """Write lo/hi to LineCTL (PP 0x0112)."""
-    return bytes([
+    return _clockport_enable_bytes() + bytes([
         0xA9, 0x12, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8,
         0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8,
         0xA9, lo_value & 0xFF, 0x8D, PPDATA_LO & 0xFF, PPDATA_LO >> 8,
@@ -256,6 +281,7 @@ def build_tx_code(
     """
     a = Asm(org=load_addr)
     a.emit(0x78)  # SEI
+    _emit_clockport_enable(a)
     a.emit(0xA9, 0xC0, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
     a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
     a.emit(0xA9, frame_len & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
@@ -401,6 +427,7 @@ def build_rx_echo_reply_code(
 
     a = Asm(org=load_addr)
     a.emit(0x78)  # SEI
+    _emit_clockport_enable(a)
 
     a.label("reset")
     _emit_poll_rx(a, timeout_label="timeout", success_label="got")
@@ -461,12 +488,10 @@ def build_ping_and_wait_code(
 
     .. note::
 
-        This routine is intended to pair with
-        :func:`build_icmp_responder_code` running on the peer VICE.
-        Because the responder's TX-after-RX is currently broken under
-        VICE 3.10 TFE (see that function's warning), this combined
-        ping-and-wait routine cannot complete a full round-trip
-        end-to-end yet.  It is retained for completeness.
+        Intended to pair with :func:`build_icmp_responder_code` running
+        on the peer VICE.  See the stage-4 validation in the
+        bridge-networking-rrnet worktree history for current round-trip
+        status.
     """
     id_hi = (identifier >> 8) & 0xFF
     id_lo = identifier & 0xFF
@@ -475,6 +500,7 @@ def build_ping_and_wait_code(
 
     a = Asm(org=load_addr)
     a.emit(0x78)  # SEI
+    _emit_clockport_enable(a)
 
     # --- TX the echo request ---
     a.emit(0xA9, 0xC0, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
@@ -552,23 +578,15 @@ def build_icmp_responder_code(
     type=0, patch ICMP checksum), and TXes it back.  Writes 0x01 or 0xFF
     to ``result_addr``.
 
-    .. warning::
-
-        Under VICE 3.10's TFE emulation, doing a TX immediately after
-        consuming an RX frame in the same JSR has been observed to
-        silently drop the TX (the routine completes the standard
-        TxCmd/TxLen/Rdy4TxNOW sequence and writes the bytes to the
-        FIFO, but no frame appears on the wire).  See
-        ``docs/bridge_networking.md`` for the workaround
-        (verify received frames on the receiver via memory reads
-        instead of relying on a C64-side responder).  This function
-        is retained for completeness and future debugging; it works
-        correctly through the swap+checksum-patch stage.
+    Uses RR-Net register layout with the clockport enable injected at
+    entry.  See ``tests/test_bridge_ping.py`` for a working round-trip
+    exercise built on top of this routine.
     """
     assert len(my_ip) == 4
 
     a = Asm(org=load_addr)
     a.emit(0x78)
+    _emit_clockport_enable(a)
 
     a.label("reset")
     _emit_poll_rx(a, timeout_label="timeout", success_label="got")
