@@ -757,6 +757,7 @@ Additional scripts in `scripts/`:
 | `scripts/setup-tap-networking.sh` | Create single TAP interface with NAT for VICE ethernet |
 | `scripts/teardown-tap-networking.sh` | Tear down single TAP interface |
 | `scripts/validate_ping.py` | End-to-end ARP + ICMP ping through VICE CS8900a + TAP |
+| `scripts/bridge_ping_demo.py` | Visible two-VICE bridge ping demo (RR-Net, live on-screen counters) |
 
 ## Running Tests
 
