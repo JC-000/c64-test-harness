@@ -335,12 +335,23 @@ def main() -> int:
             try:
                 while args.count == 0 or count < args.count:
                     count += 1
-                    success, detail = run_one_ping(transport_a, transport_b, seq)
+                    try:
+                        success, detail = run_one_ping(transport_a, transport_b, seq)
+                    except (ConnectionError, BrokenPipeError, OSError) as e:
+                        print(f"\nVICE connection lost ({type(e).__name__}) — "
+                              "did you close a window? Shutting down.")
+                        break
                     if success:
                         ok += 1
                     last_color = GREEN if success else RED
-                    update_status(transport_a, count, detail, last_color, LIGHT_BLUE)
-                    update_status(transport_b, count, detail, last_color, YELLOW)
+                    try:
+                        update_status(transport_a, count, detail, last_color, LIGHT_BLUE)
+                        update_status(transport_b, count, detail, last_color, YELLOW)
+                    except (ConnectionError, BrokenPipeError, OSError):
+                        print(f"  [{count:4d}] {'OK ' if success else 'ERR'} {detail}  "
+                              f"({ok}/{count} pass)")
+                        print("VICE window closed — shutting down.")
+                        break
                     marker = "OK " if success else "ERR"
                     print(f"  [{count:4d}] {marker} {detail}  ({ok}/{count} pass)")
                     seq = (seq + 1) & 0xFFFF
