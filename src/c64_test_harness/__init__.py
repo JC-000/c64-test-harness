@@ -194,6 +194,17 @@ from .uci_network import (
     disable_uci,
 )
 from .ethernet import generate_mac, parse_mac, format_mac, set_cs8900a_mac
+from .bridge_ping import (
+    build_echo_request_frame,
+    build_icmp_responder_code,
+    build_ping_and_wait_code,
+    build_rx_echo_reply_code,
+    build_tx_code as build_bridge_tx_code,
+    cs8900a_read_linectl_code,
+    cs8900a_rxctl_code,
+    cs8900a_write_linectl_code,
+    EchoRequest,
+)
 from .parallel import run_parallel, ParallelTestResult, SingleTestResult
 from .sid import SidFile, SidError, SidFormatError, build_test_psid
 from .sid_player import (
@@ -410,6 +421,16 @@ __all__ = [
     "parse_mac",
     "format_mac",
     "set_cs8900a_mac",
+    # Bridge ICMP ping
+    "EchoRequest",
+    "build_echo_request_frame",
+    "build_icmp_responder_code",
+    "build_ping_and_wait_code",
+    "build_rx_echo_reply_code",
+    "build_bridge_tx_code",
+    "cs8900a_rxctl_code",
+    "cs8900a_read_linectl_code",
+    "cs8900a_write_linectl_code",
     # Parallel execution
     "run_parallel",
     "ParallelTestResult",
