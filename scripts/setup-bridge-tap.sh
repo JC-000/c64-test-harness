@@ -84,6 +84,25 @@ for TAP_DEV in "$TAP0" "$TAP1"; do
     fi
 done
 
+# --- iptables FORWARD rules --------------------------------------------------
+# Allow traffic in/out of bridge and TAP interfaces so frames are not dropped
+# when the FORWARD chain policy is DROP (or filtered by other rules).
+
+for DEV in "$BRIDGE" "$TAP0" "$TAP1"; do
+    if iptables -C FORWARD -i "$DEV" -j ACCEPT 2>/dev/null; then
+        echo "[ok] FORWARD rule ($DEV inbound) exists"
+    else
+        iptables -A FORWARD -i "$DEV" -j ACCEPT
+        echo "[added] FORWARD: $DEV inbound"
+    fi
+    if iptables -C FORWARD -o "$DEV" -j ACCEPT 2>/dev/null; then
+        echo "[ok] FORWARD rule ($DEV outbound) exists"
+    else
+        iptables -A FORWARD -o "$DEV" -j ACCEPT
+        echo "[added] FORWARD: $DEV outbound"
+    fi
+done
+
 # --- Summary -----------------------------------------------------------------
 
 echo

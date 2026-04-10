@@ -6,8 +6,10 @@ manager that handles the lifecycle).
 
 from __future__ import annotations
 
+import os
 import socket
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -105,6 +107,9 @@ class ViceProcess:
     def __init__(self, config: ViceConfig) -> None:
         self.config = config
         self._proc: subprocess.Popen | None = None  # type: ignore[type-arg]
+        # Temp vicerc used to activate CS8900a ethernet (see start()).
+        # Cleaned up in stop().
+        self._tmp_vicerc: str | None = None
 
     def __enter__(self) -> ViceProcess:
         self.start()
@@ -153,17 +158,67 @@ class ViceProcess:
         args += cfg.extra_args
 
         if cfg.ethernet:
-            # Interface/driver MUST be set before the cart enable flag —
-            # VICE probes the interface when processing -ethernetcart and
-            # will reject the flag if the default interface is inaccessible.
+            # VICE 3.10 ethernet activation has TWO quirks that must both
+            # be worked around:
+            #
+            # 1. The ``-ethernetcart`` / ``-tfe`` / ``-rrnet`` CLI flags
+            #    appear in ``-help`` but are rejected at parse time
+            #    ("Option '-ethernetcart' not valid.").
+            #
+            # 2. If ``ETHERNETCART_ACTIVE`` is only set via a vicerc file
+            #    (``-addconfig`` / ``-config``) WITHOUT also supplying
+            #    ``-ethernetioif`` / ``-ethernetiodriver`` on the command
+            #    line, VICE sets the resource to 1 and exposes the
+            #    CS8900a Product ID to the C64 — BUT never attaches a TAP
+            #    file descriptor on the host side, so frames never leave
+            #    the emulator (carrier stays 0, tcpdump sees nothing).
+            #    Conversely, if you only supply the CLI interface/driver
+            #    flags WITHOUT also activating the cart via addconfig,
+            #    the TAP gets attached (carrier=1) but the cart stays
+            #    disabled.
+            #
+            # The working combination, verified empirically with
+            # ``scripts/verify_vice_ethernet.py``, is:
+            #
+            #     -addconfig <tmp.rc>      (must come FIRST)
+            #     -ethernetioif <iface>
+            #     -ethernetiodriver <drv>
+            #
+            # In this order, VICE both attaches the TAP and activates
+            # the cart, and the C64 can TX/RX real frames.  If the
+            # ``-addconfig`` comes AFTER the CLI iface flags, the
+            # ETHERNETCART_ACTIVE value in the rc file is NOT honoured
+            # (reads back as 0).
+            mode = 1 if cfg.ethernet_mode == "rrnet" else 0
+            rc_lines = [
+                "[Version]",
+                "ConfigVersion=3.10",
+                "",
+                "[C64SC]",
+                "ETHERNETCART_ACTIVE=1",
+                f"EthernetCartMode={mode}",
+            ]
+            if cfg.ethernet_interface:
+                rc_lines.append(f'EthernetIOIF="{cfg.ethernet_interface}"')
+            if cfg.ethernet_driver:
+                rc_lines.append(f'EthernetIODriver="{cfg.ethernet_driver}"')
+            if cfg.ethernet_base != 0xDE00:
+                rc_lines.append(f"EthernetCartBase={cfg.ethernet_base}")
+            rc_lines.append("SaveResourcesOnExit=0")
+            rc_lines.append("")
+
+            fd, path = tempfile.mkstemp(prefix="vice_eth_", suffix=".rc")
+            with os.fdopen(fd, "w") as f:
+                f.write("\n".join(rc_lines))
+            self._tmp_vicerc = path
+
+            # ORDER MATTERS: -addconfig must come BEFORE the interface/
+            # driver CLI flags.  See note above.
+            args += ["-addconfig", path]
             if cfg.ethernet_interface:
                 args += ["-ethernetioif", cfg.ethernet_interface]
             if cfg.ethernet_driver:
                 args += ["-ethernetiodriver", cfg.ethernet_driver]
-            if cfg.ethernet_base != 0xDE00:
-                args += ["-ethernetcartbase", f"0x{cfg.ethernet_base:04X}"]
-            mode = 1 if cfg.ethernet_mode == "rrnet" else 0
-            args += ["-ethernetcart", "-ethernetcartmode", str(mode)]
 
         if cfg.disk_image is not None:
             args += [
@@ -205,6 +260,7 @@ class ViceProcess:
     def stop(self) -> None:
         """Terminate VICE: SIGTERM → wait 5s → SIGKILL fallback."""
         if self._proc is None:
+            self._cleanup_tmp_vicerc()
             return
         try:
             self._proc.terminate()
@@ -215,6 +271,15 @@ class ViceProcess:
             except Exception:
                 pass
         self._proc = None
+        self._cleanup_tmp_vicerc()
+
+    def _cleanup_tmp_vicerc(self) -> None:
+        if self._tmp_vicerc is not None:
+            try:
+                os.unlink(self._tmp_vicerc)
+            except OSError:
+                pass
+            self._tmp_vicerc = None
 
     @staticmethod
     def get_listener_pid(port: int) -> int | None:

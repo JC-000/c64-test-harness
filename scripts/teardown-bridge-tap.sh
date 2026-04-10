@@ -12,6 +12,15 @@ BRIDGE="br-c64"
 TAP0="tap-c64-0"
 TAP1="tap-c64-1"
 
+# --- iptables FORWARD rules --------------------------------------------------
+
+for DEV in "$BRIDGE" "$TAP0" "$TAP1"; do
+    iptables -D FORWARD -i "$DEV" -j ACCEPT 2>/dev/null && \
+        echo "[removed] FORWARD rule ($DEV inbound)" || echo "[ok] FORWARD rule ($DEV inbound) already absent"
+    iptables -D FORWARD -o "$DEV" -j ACCEPT 2>/dev/null && \
+        echo "[removed] FORWARD rule ($DEV outbound)" || echo "[ok] FORWARD rule ($DEV outbound) already absent"
+done
+
 # --- TAP interfaces ----------------------------------------------------------
 
 for TAP_DEV in "$TAP0" "$TAP1"; do
