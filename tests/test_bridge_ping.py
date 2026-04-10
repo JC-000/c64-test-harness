@@ -1,6 +1,6 @@
 """Bridge ICMP exchange test -- two VICE instances exchange IP-layer frames.
 
-Two VICE instances on ``br-c64`` exchange ICMP echo traffic via TFE
+Two VICE instances on ``br-c64`` exchange ICMP echo traffic via RR-Net
 ethernet:
 
 * VICE A transmits a Python-crafted ICMP echo request frame addressed
@@ -15,17 +15,8 @@ This test proves that the bridge supports **IP-layer** frame exchange
 between two C64 instances, not just raw L2 frames (which is what
 ``test_ethernet_bridge.py`` already covers).
 
-It does NOT exercise a full ICMP round-trip with a C64-side responder
-that transmits a reply.  See :mod:`c64_test_harness.bridge_ping` for
-the documented VICE 3.10 TFE quirk that prevents the CS8900a from
-TX'ing immediately after consuming an RX frame from the same chip.
-
-This test does NOT use ip65 -- the ip65 C64 cs8900a driver is
-hard-coded for the RR-Net register offsets that VICE 3.10 does not
-emulate correctly.
-
 Prerequisites:
-- x64sc on PATH with TFE ethernet support
+- x64sc on PATH with RR-Net ethernet support
 - Bridge set up via ``scripts/setup-bridge-tap.sh``
 """
 
@@ -41,7 +32,9 @@ import pytest
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
 from c64_test_harness.bridge_ping import (
     Asm,
+    ISQ_HI,
     PPDATA_HI,
+    PPDATA_LO,
     PPTR_HI,
     PPTR_LO,
     RTDATA_HI,
@@ -118,6 +111,10 @@ def _build_rx_match_icmp_code(
 
     a = Asm(org=load_addr)
     a.emit(0x78)  # SEI
+    # RR clockport enable
+    a.emit(0xAD, ISQ_HI & 0xFF, ISQ_HI >> 8)
+    a.emit(0x09, 0x01)
+    a.emit(0x8D, ISQ_HI & 0xFF, ISQ_HI >> 8)
 
     a.label("reset")
     # Inline poll loop with 3-level timeout (~5 seconds budget)
@@ -163,9 +160,9 @@ def _build_rx_match_icmp_code(
     # Skip rest of packet (RxCFG bit 6 - Skip-1)
     a.emit(0xA9, 0x02, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
     a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
-    a.emit(0xAD, 0x0C, 0xDE)
+    a.emit(0xAD, PPDATA_LO & 0xFF, PPDATA_LO >> 8)
     a.emit(0x09, 0x40)
-    a.emit(0x8D, 0x0C, 0xDE)
+    a.emit(0x8D, PPDATA_LO & 0xFF, PPDATA_LO >> 8)
 
     def chk(off: int, val: int, fail: str) -> None:
         addr = rx_buf + off

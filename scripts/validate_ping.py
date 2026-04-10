@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Validate ICMP ping: C64 -> tap-c64 -> host NAT -> 1.1.1.1 -> reply.
 
-Launches VICE with CS8900a ethernet emulation (TFE mode) on a TAP
+Launches VICE with CS8900a ethernet emulation (RR-Net mode) on a TAP
 interface, configures the chip, performs ARP resolution for the gateway,
 sends an ICMP echo request to 1.1.1.1, and verifies the echo reply.
 
@@ -12,7 +12,10 @@ Usage:
     python3 scripts/validate_ping.py
 
 Key implementation notes:
-- Uses TFE mode (not RR-Net) for standard CS8900a register layout at $DE00.
+- Uses RR-Net mode (EthernetCartMode=1). Register layout matches the
+  ip65 cs8900a.s driver: PPPtr=$DE02, PPData=$DE04, RTDATA=$DE08,
+  TxCMD=$DE0C, TxLen=$DE0E.
+- MUST set $DE01 bit 0 (RR clockport enable) before any CS8900a access.
 - Combined TX+RX routines keep the CPU running between send and receive,
   because VICE's CS8900a emulation only processes TAP frames while the
   CPU is executing (binary monitor pauses halt I/O processing).
@@ -56,6 +59,28 @@ GW_IP = b"\x0A\x00\x41\x01"  # 10.0.65.1
 TARGET_IP = b"\x01\x01\x01\x01"  # 1.1.1.1
 BCAST_MAC = b"\xFF" * 6
 TAP_IFACE = "tap-c64"
+
+# CS8900a RR-Net register map (base $DE00)
+ISQ_HI_ADDR = 0xDE01       # bit 0 = RR clockport enable
+PPTR_LO_ADDR = 0xDE02
+PPTR_HI_ADDR = 0xDE03
+PPDATA_LO_ADDR = 0xDE04
+PPDATA_HI_ADDR = 0xDE05
+RTDATA_LO_ADDR = 0xDE08
+RTDATA_HI_ADDR = 0xDE09
+TXCMD_LO_ADDR = 0xDE0C
+TXCMD_HI_ADDR = 0xDE0D
+TXLEN_LO_ADDR = 0xDE0E
+TXLEN_HI_ADDR = 0xDE0F
+
+
+def _cp_enable() -> bytes:
+    """6502 snippet: LDA $DE01; ORA #$01; STA $DE01."""
+    return bytes([
+        0xAD, ISQ_HI_ADDR & 0xFF, ISQ_HI_ADDR >> 8,
+        0x09, 0x01,
+        0x8D, ISQ_HI_ADDR & 0xFF, ISQ_HI_ADDR >> 8,
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -125,12 +150,12 @@ def _jsr(t: BinaryViceTransport, addr: int, timeout: float = 10.0) -> None:
 
 
 def pp_write(t: BinaryViceTransport, pp_addr: int, val: int) -> None:
-    """Write a 16-bit value to a CS8900a PacketPage register."""
-    code = bytes([
-        0xA9, pp_addr & 0xFF, 0x8D, 0x0A, 0xDE,
-        0xA9, (pp_addr >> 8) & 0xFF, 0x8D, 0x0B, 0xDE,
-        0xA9, val & 0xFF, 0x8D, 0x0C, 0xDE,
-        0xA9, (val >> 8) & 0xFF, 0x8D, 0x0D, 0xDE,
+    """Write a 16-bit value to a CS8900a PacketPage register (RR-Net)."""
+    code = _cp_enable() + bytes([
+        0xA9, pp_addr & 0xFF, 0x8D, PPTR_LO_ADDR & 0xFF, PPTR_LO_ADDR >> 8,
+        0xA9, (pp_addr >> 8) & 0xFF, 0x8D, PPTR_HI_ADDR & 0xFF, PPTR_HI_ADDR >> 8,
+        0xA9, val & 0xFF, 0x8D, PPDATA_LO_ADDR & 0xFF, PPDATA_LO_ADDR >> 8,
+        0xA9, (val >> 8) & 0xFF, 0x8D, PPDATA_HI_ADDR & 0xFF, PPDATA_HI_ADDR >> 8,
         0x60,
     ])
     load_code(t, CODE, code)
@@ -138,12 +163,12 @@ def pp_write(t: BinaryViceTransport, pp_addr: int, val: int) -> None:
 
 
 def pp_read(t: BinaryViceTransport, pp_addr: int) -> int:
-    """Read a 16-bit CS8900a PacketPage register."""
-    code = bytes([
-        0xA9, pp_addr & 0xFF, 0x8D, 0x0A, 0xDE,
-        0xA9, (pp_addr >> 8) & 0xFF, 0x8D, 0x0B, 0xDE,
-        0xAD, 0x0C, 0xDE, 0x8D, 0x81, 0xC0,
-        0xAD, 0x0D, 0xDE, 0x8D, 0x82, 0xC0,
+    """Read a 16-bit CS8900a PacketPage register (RR-Net)."""
+    code = _cp_enable() + bytes([
+        0xA9, pp_addr & 0xFF, 0x8D, PPTR_LO_ADDR & 0xFF, PPTR_LO_ADDR >> 8,
+        0xA9, (pp_addr >> 8) & 0xFF, 0x8D, PPTR_HI_ADDR & 0xFF, PPTR_HI_ADDR >> 8,
+        0xAD, PPDATA_LO_ADDR & 0xFF, PPDATA_LO_ADDR >> 8, 0x8D, 0x81, 0xC0,
+        0xAD, PPDATA_HI_ADDR & 0xFF, PPDATA_HI_ADDR >> 8, 0x8D, 0x82, 0xC0,
         0x60,
     ])
     load_code(t, CODE, code)
@@ -156,42 +181,63 @@ def pp_read(t: BinaryViceTransport, pp_addr: int) -> int:
 # 6502 code generators
 # ---------------------------------------------------------------------------
 
+def _emit_cp_enable(a: "Asm") -> None:
+    a.emit(0xAD, ISQ_HI_ADDR & 0xFF, ISQ_HI_ADDR >> 8)
+    a.emit(0x09, 0x01)
+    a.emit(0x8D, ISQ_HI_ADDR & 0xFF, ISQ_HI_ADDR >> 8)
+
+
+# Shorthand aliases for hand-built code below
+_TC_LO = TXCMD_LO_ADDR & 0xFF
+_TC_HI = TXCMD_HI_ADDR & 0xFF
+_TL_LO = TXLEN_LO_ADDR & 0xFF
+_TL_HI = TXLEN_HI_ADDR & 0xFF
+_PP_LO = PPTR_LO_ADDR & 0xFF
+_PP_HI = PPTR_HI_ADDR & 0xFF
+_PD_LO = PPDATA_LO_ADDR & 0xFF
+_PD_HI = PPDATA_HI_ADDR & 0xFF
+_RT_LO = RTDATA_LO_ADDR & 0xFF
+_RT_HI = RTDATA_HI_ADDR & 0xFF
+
+
 def _make_tx_then_rx(frame_len: int, rx_words: int = 80) -> bytes:
     """6502 routine: TX from FRAME_BUF then immediately RX into RX_BUF.
 
     SEI at entry prevents KERNAL IRQ from corrupting ZP counters.
+    RR clockport enable emitted first.
     """
     a = Asm()
     a.emit(0x78)  # SEI
+    _emit_cp_enable(a)
     # -- TX setup --
-    a.emit(0xA9, 0xC0, 0x8D, 0x04, 0xDE)  # TxCMD = 0x00C0
-    a.emit(0xA9, 0x00, 0x8D, 0x05, 0xDE)
-    a.emit(0xA9, frame_len & 0xFF, 0x8D, 0x06, 0xDE)  # TxLen
-    a.emit(0xA9, (frame_len >> 8) & 0xFF, 0x8D, 0x07, 0xDE)
+    a.emit(0xA9, 0xC0, 0x8D, _TC_LO, 0xDE)
+    a.emit(0xA9, 0x00, 0x8D, _TC_HI, 0xDE)
+    a.emit(0xA9, frame_len & 0xFF, 0x8D, _TL_LO, 0xDE)
+    a.emit(0xA9, (frame_len >> 8) & 0xFF, 0x8D, _TL_HI, 0xDE)
     # Wait Rdy4TxNOW (PP 0x0138 bit 8)
-    a.emit(0xA9, 0x38, 0x8D, 0x0A, 0xDE)
-    a.emit(0xA9, 0x01, 0x8D, 0x0B, 0xDE)
+    a.emit(0xA9, 0x38, 0x8D, _PP_LO, 0xDE)
+    a.emit(0xA9, 0x01, 0x8D, _PP_HI, 0xDE)
     a.label("txw")
-    a.emit(0xAD, 0x0D, 0xDE, 0x29, 0x01)
-    a.branch(0xF0, "txw")  # BEQ txw
+    a.emit(0xAD, _PD_HI, 0xDE, 0x29, 0x01)
+    a.branch(0xF0, "txw")
     # Write frame data via ZP pointer
     a.emit(0xA9, FRAME_BUF & 0xFF, 0x85, 0xFB)
     a.emit(0xA9, (FRAME_BUF >> 8) & 0xFF, 0x85, 0xFC)
     a.emit(0xA0, 0x00)
     a.label("txlp")
-    a.emit(0xB1, 0xFB, 0x8D, 0x00, 0xDE, 0xC8)  # lo byte
-    a.emit(0xB1, 0xFB, 0x8D, 0x01, 0xDE, 0xC8)  # hi byte
+    a.emit(0xB1, 0xFB, 0x8D, _RT_LO, 0xDE, 0xC8)
+    a.emit(0xB1, 0xFB, 0x8D, _RT_HI, 0xDE, 0xC8)
     a.emit(0xC0, frame_len & 0xFF)
     a.branch(0xD0, "txlp")
 
-    # -- RX poll (CPU stays running — no binary-monitor pause) --
-    a.emit(0xA9, 0x24, 0x8D, 0x0A, 0xDE)  # PPTR = 0x0124 (RxEvent)
-    a.emit(0xA9, 0x01, 0x8D, 0x0B, 0xDE)
-    a.emit(0xA9, 0xFF, 0x85, 0xFD)  # inner counter
-    a.emit(0xA9, 0xFF, 0x85, 0xFE)  # middle counter
-    a.emit(0xA9, 0x10, 0x85, 0xFF)  # outer counter
+    # -- RX poll --
+    a.emit(0xA9, 0x24, 0x8D, _PP_LO, 0xDE)  # PPTR = 0x0124 (RxEvent)
+    a.emit(0xA9, 0x01, 0x8D, _PP_HI, 0xDE)
+    a.emit(0xA9, 0xFF, 0x85, 0xFD)
+    a.emit(0xA9, 0xFF, 0x85, 0xFE)
+    a.emit(0xA9, 0x10, 0x85, 0xFF)
     a.label("rxp")
-    a.emit(0xAD, 0x0D, 0xDE, 0x29, 0x01)
+    a.emit(0xAD, _PD_HI, 0xDE, 0x29, 0x01)
     a.branch(0xD0, "rxg")
     a.emit(0xC6, 0xFD)
     a.branch(0xD0, "rxp")
@@ -203,16 +249,16 @@ def _make_tx_then_rx(frame_len: int, rx_words: int = 80) -> bytes:
     a.branch(0xD0, "rxp")
     # Timeout
     a.emit(0xA9, 0xFF, 0x8D, RESULT & 0xFF, (RESULT >> 8) & 0xFF,
-           0x58, 0x60)  # CLI; RTS
+           0x58, 0x60)
 
     a.label("rxg")
     # RxStatus + RxLength -> RX_META
-    a.emit(0xAD, 0x00, 0xDE, 0x8D, RX_META & 0xFF, (RX_META >> 8) & 0xFF)
-    a.emit(0xAD, 0x01, 0xDE, 0x8D, (RX_META + 1) & 0xFF,
+    a.emit(0xAD, _RT_LO, 0xDE, 0x8D, RX_META & 0xFF, (RX_META >> 8) & 0xFF)
+    a.emit(0xAD, _RT_HI, 0xDE, 0x8D, (RX_META + 1) & 0xFF,
            ((RX_META + 1) >> 8) & 0xFF)
-    a.emit(0xAD, 0x00, 0xDE, 0x8D, (RX_META + 2) & 0xFF,
+    a.emit(0xAD, _RT_LO, 0xDE, 0x8D, (RX_META + 2) & 0xFF,
            ((RX_META + 2) >> 8) & 0xFF)
-    a.emit(0xAD, 0x01, 0xDE, 0x8D, (RX_META + 3) & 0xFF,
+    a.emit(0xAD, _RT_HI, 0xDE, 0x8D, (RX_META + 3) & 0xFF,
            ((RX_META + 3) >> 8) & 0xFF)
     # Read frame data
     a.emit(0xA9, RX_BUF & 0xFF, 0x85, 0xFB)
@@ -220,13 +266,13 @@ def _make_tx_then_rx(frame_len: int, rx_words: int = 80) -> bytes:
     a.emit(0xA0, 0x00)
     a.emit(0xA2, rx_words & 0xFF)
     a.label("rxrd")
-    a.emit(0xAD, 0x00, 0xDE, 0x91, 0xFB, 0xC8)
-    a.emit(0xAD, 0x01, 0xDE, 0x91, 0xFB, 0xC8)
+    a.emit(0xAD, _RT_LO, 0xDE, 0x91, 0xFB, 0xC8)
+    a.emit(0xAD, _RT_HI, 0xDE, 0x91, 0xFB, 0xC8)
     a.emit(0xCA)
     a.branch(0xD0, "rxrd")
     # Success
     a.emit(0xA9, 0x01, 0x8D, RESULT & 0xFF, (RESULT >> 8) & 0xFF,
-           0x58, 0x60)  # CLI; RTS
+           0x58, 0x60)
     return a.build()
 
 
@@ -234,12 +280,13 @@ def _make_rx_only(rx_words: int = 80) -> bytes:
     """6502 routine: poll for next RX frame and read into RX_BUF."""
     a = Asm()
     a.emit(0x78)  # SEI
-    a.emit(0xA9, 0x24, 0x8D, 0x0A, 0xDE)
-    a.emit(0xA9, 0x01, 0x8D, 0x0B, 0xDE)
+    _emit_cp_enable(a)
+    a.emit(0xA9, 0x24, 0x8D, _PP_LO, 0xDE)
+    a.emit(0xA9, 0x01, 0x8D, _PP_HI, 0xDE)
     a.emit(0xA9, 0xFF, 0x85, 0xFD, 0x85, 0xFE)
     a.emit(0xA9, 0x10, 0x85, 0xFF)
     a.label("p")
-    a.emit(0xAD, 0x0D, 0xDE, 0x29, 0x01)
+    a.emit(0xAD, _PD_HI, 0xDE, 0x29, 0x01)
     a.branch(0xD0, "g")
     a.emit(0xC6, 0xFD)
     a.branch(0xD0, "p")
@@ -252,19 +299,19 @@ def _make_rx_only(rx_words: int = 80) -> bytes:
     a.emit(0xA9, 0xFF, 0x8D, RESULT & 0xFF, (RESULT >> 8) & 0xFF,
            0x58, 0x60)
     a.label("g")
-    a.emit(0xAD, 0x00, 0xDE, 0x8D, RX_META & 0xFF, (RX_META >> 8) & 0xFF)
-    a.emit(0xAD, 0x01, 0xDE, 0x8D, (RX_META + 1) & 0xFF,
+    a.emit(0xAD, _RT_LO, 0xDE, 0x8D, RX_META & 0xFF, (RX_META >> 8) & 0xFF)
+    a.emit(0xAD, _RT_HI, 0xDE, 0x8D, (RX_META + 1) & 0xFF,
            ((RX_META + 1) >> 8) & 0xFF)
-    a.emit(0xAD, 0x00, 0xDE, 0x8D, (RX_META + 2) & 0xFF,
+    a.emit(0xAD, _RT_LO, 0xDE, 0x8D, (RX_META + 2) & 0xFF,
            ((RX_META + 2) >> 8) & 0xFF)
-    a.emit(0xAD, 0x01, 0xDE, 0x8D, (RX_META + 3) & 0xFF,
+    a.emit(0xAD, _RT_HI, 0xDE, 0x8D, (RX_META + 3) & 0xFF,
            ((RX_META + 3) >> 8) & 0xFF)
     a.emit(0xA9, RX_BUF & 0xFF, 0x85, 0xFB)
     a.emit(0xA9, (RX_BUF >> 8) & 0xFF, 0x85, 0xFC)
     a.emit(0xA0, 0x00, 0xA2, rx_words & 0xFF)
     a.label("r")
-    a.emit(0xAD, 0x00, 0xDE, 0x91, 0xFB, 0xC8)
-    a.emit(0xAD, 0x01, 0xDE, 0x91, 0xFB, 0xC8)
+    a.emit(0xAD, _RT_LO, 0xDE, 0x91, 0xFB, 0xC8)
+    a.emit(0xAD, _RT_HI, 0xDE, 0x91, 0xFB, 0xC8)
     a.emit(0xCA)
     a.branch(0xD0, "r")
     a.emit(0xA9, 0x01, 0x8D, RESULT & 0xFF, (RESULT >> 8) & 0xFF,
@@ -329,7 +376,7 @@ def main() -> int:
 
     config = ViceConfig(
         port=port, warp=False, sound=False,
-        ethernet=True, ethernet_mode="tfe",
+        ethernet=True, ethernet_mode="rrnet",
         ethernet_interface=TAP_IFACE, ethernet_driver="tuntap",
     )
 
@@ -340,7 +387,7 @@ def main() -> int:
             return 1
         t = BinaryViceTransport(port=port)
         try:
-            print(f"VICE running on port {port} (TFE mode)")
+            print(f"VICE running on port {port} (RR-Net mode)")
 
             # --- Probe CS8900a ---
             chip_id = pp_read(t, 0x0000)
