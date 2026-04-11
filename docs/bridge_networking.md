@@ -93,6 +93,8 @@ run while unrelated VICE instances (outside the harness port ranges)
 are alive — they won't be touched.  Exit code is `0` on a clean result,
 `1` if any process is still alive after SIGKILL, `2` on argument error.
 
+The scoping is empirically verified by `tests/test_cleanup_vice_ports_live.py::TestBridgeCleanupScoping::test_scoped_cleanup_preserves_out_of_range_vice` (opt in with `BRIDGE_CLEANUP_LIVE=1`).
+
 ## Prerequisites
 
 * `x64sc` (VICE 3.10) compiled with `tuntap` driver support
