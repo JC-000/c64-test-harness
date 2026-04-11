@@ -3,6 +3,14 @@
 Public API re-exports for convenient ``from c64_test_harness import ...``.
 """
 
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+try:
+    __version__ = _pkg_version("c64-test-harness")
+except PackageNotFoundError:
+    # Package not installed (e.g. running from a raw checkout without pip install -e)
+    __version__ = "0+unknown"
+
 from .transport import C64Transport, TransportError, ConnectionError, TimeoutError
 from .screen import ScreenGrid, wait_for_text, wait_for_stable
 from .keyboard import send_text, send_key
@@ -233,6 +241,8 @@ from .sid_player import (
 )
 
 __all__ = [
+    # Package version
+    "__version__",
     # Protocol + exceptions
     "C64Transport",
     "TransportError",
