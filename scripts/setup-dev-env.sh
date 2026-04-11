@@ -35,6 +35,10 @@ NO_BRIDGE=0
 NO_U64=0
 U64_HOST="${U64_HOST:-}"
 BUILD_DIR="${BUILD_DIR:-$HOME/.cache/c64-test-harness/build}"
+# Dedicated venv for the harness. PEP 668 / externally-managed-environment
+# (Ubuntu 23+) blocks `pip install --user` against system Python, and Ubuntu
+# 25 enforces it, so we install into a dedicated venv instead. XDG-ish path.
+VENV_DIR="${VENV_DIR:-$HOME/.local/share/c64-test-harness/venv}"
 EXPECTED_SHA256=""
 
 REPO_ROOT=""
@@ -248,7 +252,13 @@ stage_system_packages() {
         libsdl2-image-dev     # SDL2_image headers
         libgtk-3-dev          # GTK3 headers (native-gtk3ui)
         libglew-dev           # GLEW for VICE GL backend
-        libgtkglext1-dev      # legacy GL extensions; may be missing on 25+
+        # NOTE: libgtkglext1-dev was in the original list as conservative
+        # coverage for legacy GtkGLExt GL bindings. It was deprecated on
+        # Ubuntu 24.04 and is not reliably available on Ubuntu 25 -- and
+        # VICE 3.10's native GTK3 UI does not need it (the modern GTK3 GL
+        # path uses GtkGLArea via GDK, not the legacy GtkGLExt library).
+        # Dropped here; add it back if a 25.x apt index resurrects it and
+        # your local VICE build actually requires it.
         libxaw7-dev           # Xaw fallback UI
 
         # -- VICE runtime support --
@@ -373,7 +383,16 @@ stage_vice_build() {
     #   --enable-ethernet       load-bearing: CS8900a / TFE / RR-Net support
     #   --enable-shared         shared libs (default, kept explicit)
     #   --disable-html-docs     skip doc generation; shaves minutes off build
-    #   --enable-native-gtk3ui  native GTK3 UI (matches current dev machine)
+    #   --enable-native-gtk3ui  native GTK3 UI
+    #
+    # UI choice: GTK3 was picked to match the binary on the current dev
+    # machine (inferred from the installed `x64sc`; the actual build log
+    # is not on disk). SDL2 is a reasonable alternative with fewer deps --
+    # to switch, replace `--enable-native-gtk3ui` below with
+    # `--enable-sdlui2` (and you can drop libgtk-3-dev / libglew-dev /
+    # libxaw7-dev from the stage 1 package list). Both UIs work with this
+    # test harness, which only talks to VICE via the binary monitor and
+    # doesn't care about the UI toolkit.
     local configure_cmd=(
         ./configure
         --enable-ethernet
@@ -421,41 +440,80 @@ stage_vice_build() {
 # ---------- Stage 3: Python harness install -------------------------------
 
 stage_harness_install() {
-    banner "Stage 3 -- Python harness editable install"
+    banner "Stage 3 -- Python harness editable install (dedicated venv)"
     if [ "$NO_HARNESS" = "1" ]; then
         log_skip "--no-harness passed"
         return
     fi
 
-    # Idempotency: if already importable from this repo root, skip.
-    if [ "$DRY_RUN" != "1" ] && python3 -c 'import c64_test_harness' >/dev/null 2>&1; then
-        local installed_path
-        installed_path="$(python3 -c 'import c64_test_harness, os; print(os.path.dirname(c64_test_harness.__file__))' 2>/dev/null || true)"
-        local expected_prefix="$REPO_ROOT/src/c64_test_harness"
-        if [ -n "$installed_path" ] && [ "$installed_path" = "$expected_prefix" ]; then
-            log_skip "c64_test_harness already installed editable from $installed_path"
+    # PEP 668 / externally-managed-environment: Ubuntu 23+ ships
+    # /usr/lib/python3*/EXTERNALLY-MANAGED and Ubuntu 25 enforces it, so
+    # `pip install --user` against system Python errors out. We create a
+    # dedicated venv at $VENV_DIR and install into it with plain
+    # `pip install -e` instead.
+    #
+    # --system-site-packages is used so system-installed libraries (pytest,
+    # pyyaml, etc.) remain visible inside the venv -- the harness itself
+    # has zero runtime deps so the usual "system pip leaks into venv" risk
+    # is low, and the gain is big (no surprise "ModuleNotFoundError: yaml"
+    # after creating the venv).
+    local expected_pkg="$REPO_ROOT/src/c64_test_harness"
+
+    # Idempotency: venv exists AND harness is importable from it AND resolves
+    # to this repo checkout -> skip.
+    if [ "$DRY_RUN" != "1" ] && [ -x "$VENV_DIR/bin/python" ]; then
+        local installed_path=""
+        installed_path="$("$VENV_DIR/bin/python" -c 'import c64_test_harness, os; print(os.path.dirname(c64_test_harness.__file__))' 2>/dev/null || true)"
+        if [ -n "$installed_path" ] && [ "$installed_path" = "$expected_pkg" ]; then
+            log_skip "c64_test_harness already installed editable in $VENV_DIR (resolves to $installed_path)"
             return
         fi
-        log_warn "c64_test_harness importable from $installed_path (expected $expected_prefix); will reinstall"
+        if [ -n "$installed_path" ]; then
+            log_warn "venv at $VENV_DIR has c64_test_harness from $installed_path (expected $expected_pkg); will reinstall"
+        fi
     fi
 
-    log_install "pip install --user -e .[dev]"
     if [ "$DRY_RUN" = "1" ]; then
-        log_dry "cd $REPO_ROOT && python3 -m pip install --user -e '.[dev]'"
-        log_dry "python3 -c 'import c64_test_harness; print(c64_test_harness.__version__)'"
-        log_ok "stage 3 (dry-run): would install harness in editable mode"
+        log_dry "mkdir -p $(dirname "$VENV_DIR")"
+        log_dry "python3 -m venv --system-site-packages $VENV_DIR"
+        log_dry "$VENV_DIR/bin/pip install --upgrade pip"
+        log_dry "$VENV_DIR/bin/pip install -e $REPO_ROOT"
+        log_dry "$VENV_DIR/bin/python -c 'import c64_test_harness; print(c64_test_harness.__version__)'"
+        log_ok "stage 3 (dry-run): would create venv at $VENV_DIR and install harness editable"
+        log_ok "stage 3 (dry-run): activate with: source $VENV_DIR/bin/activate"
         return
     fi
 
-    if ! ( cd "$REPO_ROOT" && python3 -m pip install --user -e '.[dev]' ); then
-        log_fail "pip install failed"
-        return
-    fi
-
-    if python3 -c 'import c64_test_harness; print(c64_test_harness.__version__)' 2>/dev/null; then
-        log_ok "c64_test_harness import check passed"
+    log_install "creating venv at $VENV_DIR"
+    run_cmd "mkdir-venv-parent" mkdir -p "$(dirname "$VENV_DIR")"
+    if [ ! -x "$VENV_DIR/bin/python" ]; then
+        if ! python3 -m venv --system-site-packages "$VENV_DIR"; then
+            log_fail "python3 -m venv failed -- is python3-venv installed?"
+            return
+        fi
     else
-        log_fail "c64_test_harness import check failed after install"
+        log_skip "venv already present at $VENV_DIR (reusing)"
+    fi
+
+    log_install "upgrading pip inside venv"
+    if ! "$VENV_DIR/bin/pip" install --upgrade pip; then
+        log_warn "pip upgrade failed; continuing with bundled pip"
+    fi
+
+    log_install "pip install -e $REPO_ROOT (inside venv)"
+    if ! "$VENV_DIR/bin/pip" install -e "$REPO_ROOT"; then
+        log_fail "editable install failed"
+        return
+    fi
+
+    if "$VENV_DIR/bin/python" -c 'import c64_test_harness; print(c64_test_harness.__version__)' 2>/dev/null; then
+        log_ok "installed into venv at $VENV_DIR"
+        printf '[next] activate the venv with:\n'
+        printf '    source %s/bin/activate\n' "$VENV_DIR"
+        printf '[next] or run tests via:\n'
+        printf '    %s/bin/python -m pytest tests/\n' "$VENV_DIR"
+    else
+        log_fail "c64_test_harness import check failed after install into $VENV_DIR"
     fi
 }
 
@@ -533,7 +591,19 @@ run_verify() {
     local verify="$REPO_ROOT/scripts/verify-dev-env.sh"
     # verify-dev-env.sh is non-destructive; run it even in dry-run mode so the
     # user sees the current state of the machine.
-    "$verify"
+    #
+    # verify-dev-env.sh uses plain `python3` to probe for the harness. Since
+    # we install into a dedicated venv (stage 3), that `python3` would
+    # resolve to system Python and fail the import check even though the
+    # install succeeded. Prepend the venv's bin dir to PATH for the verify
+    # invocation only -- this mirrors what an activated venv does, and
+    # avoids modifying verify-dev-env.sh in this PR.
+    if [ -x "$VENV_DIR/bin/python3" ] || [ -x "$VENV_DIR/bin/python" ]; then
+        log_install "prepending $VENV_DIR/bin to PATH for verify run"
+        PATH="$VENV_DIR/bin:$PATH" "$verify"
+    else
+        "$verify"
+    fi
     VERIFY_EXIT=$?
 }
 
