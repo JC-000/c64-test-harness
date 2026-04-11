@@ -757,7 +757,8 @@ Additional scripts in `scripts/`:
 | `scripts/setup-tap-networking.sh` | Create single TAP interface with NAT for VICE ethernet |
 | `scripts/teardown-tap-networking.sh` | Tear down single TAP interface |
 | `scripts/validate_ping.py` | End-to-end ARP + ICMP ping through VICE CS8900a + TAP |
-| `scripts/bridge_ping_demo.py` | Visible two-VICE bridge ping demo (RR-Net, live on-screen counters) |
+| `scripts/bridge_ping_demo.py` | Visible two-VICE bridge ping demo (RR-Net, live on-screen counters; supports `--warp` via host-side wall-clock orchestrators) |
+| `scripts/verify_tod_warp.py` | Empirical CIA TOD behavior probe in normal vs warp mode (regression check for the wall-clock timeout design) |
 
 ## Running Tests
 
