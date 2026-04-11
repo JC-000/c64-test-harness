@@ -91,7 +91,15 @@ each to a PID, verifies `/proc/<pid>/comm == x64sc`, then SIGTERMs,
 waits a grace period (default 2 s), and SIGKILLs survivors.  Safe to
 run while unrelated VICE instances (outside the harness port ranges)
 are alive — they won't be touched.  Exit code is `0` on a clean result,
-`1` if any process is still alive after SIGKILL, `2` on argument error.
+`1` if any process is still alive after SIGKILL, `2` on argument error,
+and `3` if listener(s) were found but `/proc/<pid>/comm` could not be
+read for any of them (insufficient privileges).
+
+If the helper reports "listener(s) found but could not read
+`/proc/<pid>/comm`" (exit 3), re-run with `sudo` — `x64sc` file
+capabilities (`cap_net_admin,cap_net_raw=ep`) make unprivileged comm
+reads fail, which the helper now detects and flags instead of silently
+reporting zero.
 
 The scoping is empirically verified by `tests/test_cleanup_vice_ports_live.py::TestBridgeCleanupScoping::test_scoped_cleanup_preserves_out_of_range_vice` (opt in with `BRIDGE_CLEANUP_LIVE=1`).
 

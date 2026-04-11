@@ -16,6 +16,23 @@ Usage:
     python3 scripts/cleanup_vice_ports.py --range 6511:6531,6560:6580
     python3 scripts/cleanup_vice_ports.py --range 6511:6531 --dry-run
     python3 scripts/cleanup_vice_ports.py --help
+
+Exit codes:
+    0 -- clean result (nothing to do, or all targets terminated cleanly)
+    1 -- at least one target still alive after SIGKILL
+    2 -- argument error / malformed range spec
+    3 -- listener(s) found in range but /proc/<pid>/comm could not be
+         read for ANY of them (insufficient privileges to verify the
+         process is x64sc). Re-run with sudo.
+
+Running unprivileged:
+    On systems where x64sc has file capabilities (cap_net_admin,
+    cap_net_raw=ep), x64sc processes are non-dumpable and
+    /proc/<pid>/comm returns EACCES for unprivileged callers. This
+    helper will detect the condition, print a warning to stderr, and
+    exit with code 3 rather than silently reporting zero hits. Run
+    with sudo (or via sudo scripts/cleanup-bridge-networking.sh) to
+    signal VICE processes in that configuration.
 """
 from __future__ import annotations
 
@@ -29,6 +46,12 @@ from typing import Iterable
 DEFAULT_COMM = "x64sc"
 DEFAULT_GRACE = 2.0
 DEFAULT_FALLBACK_RANGE = "6511:6531"
+
+# Sentinel return value from kill_vice_ports() meaning: listener(s) were
+# found in the requested ranges but /proc/<pid>/comm could not be read
+# for ANY of them, so we could not verify whether the processes are
+# x64sc. Mapped to CLI exit code 3 in main(). See module docstring.
+EXIT_UNVERIFIABLE = 3
 
 
 def _default_range_spec() -> str:
@@ -182,21 +205,73 @@ def kill_vice_ports(
             print(msg)
 
     # 1. Scan ranges for listeners whose comm matches.
+    #
+    # We track two counters here so we can detect a silent-failure
+    # footgun: on this system x64sc is installed with file capabilities
+    # (cap_net_admin,cap_net_raw=ep), which makes every x64sc process
+    # non-dumpable. An unprivileged caller can still read /proc/net/tcp
+    # (so get_listener_pid succeeds) but /proc/<pid>/comm returns
+    # EACCES (so comm_of returns None and the verification gate below
+    # silently rejects every candidate). Before this check landed, the
+    # helper would report "no harness-bound x64sc processes found" in
+    # that case -- misleading. We now detect listeners_found > 0 with
+    # comm_verified == 0 and bail out with a loud warning instead.
+    listeners_found = 0
+    comm_verified = 0
     targets: list[tuple[int, int]] = []  # (port, pid)
     seen_pids: set[int] = set()
     for port in _iter_ports(ranges):
         pid = get_listener_pid(port)
         if pid is None:
             continue
+        listeners_found += 1
         c = comm_of(pid)
         if c is None:
             continue
+        comm_verified += 1
         if c != comm:
             continue
         targets.append((port, pid))
         seen_pids.add(pid)
 
     if not targets:
+        if listeners_found > 0 and comm_verified == 0:
+            # Silent-failure condition: we have candidate PIDs but no
+            # way to verify them. Complain loudly on stderr and return
+            # the sentinel so main() can map it to exit code 3.
+            print(
+                f"[cleanup] WARNING: found {listeners_found} listener(s) in "
+                "the requested range(s) but",
+                file=sys.stderr,
+            )
+            print(
+                "[cleanup]          could not read /proc/<pid>/comm for any "
+                "of them.",
+                file=sys.stderr,
+            )
+            print(
+                "[cleanup]          This usually means the helper is running "
+                "without",
+                file=sys.stderr,
+            )
+            print(
+                "[cleanup]          sufficient privileges (x64sc has file "
+                "capabilities",
+                file=sys.stderr,
+            )
+            print(
+                "[cleanup]          that make processes non-dumpable). Try:",
+                file=sys.stderr,
+            )
+            print(
+                "[cleanup]            sudo python3 scripts/cleanup_vice_ports.py ...",
+                file=sys.stderr,
+            )
+            print(
+                "[cleanup]          Or invoke via `sudo scripts/cleanup-bridge-networking.sh`.",
+                file=sys.stderr,
+            )
+            return EXIT_UNVERIFIABLE
         log("[cleanup] no harness-bound x64sc processes found")
         return 0
 
@@ -324,6 +399,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    if survivors == EXIT_UNVERIFIABLE:
+        return 3
     return 0 if survivors == 0 else 1
 
 
