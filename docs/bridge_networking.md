@@ -182,15 +182,68 @@ sudo tcpdump -nne -i br-c64
 This is useful for debugging your test cases and for verifying that
 frames you expect to be sent are actually leaving the chip.
 
+## Timeouts: host-side wall clock
+
+Bridge networking polling loops use a **host-side wall-clock pattern**
+(see `src/c64_test_harness/poll_until.py`).  The 6502 side runs only a
+small bounded "peek batch" routine -- a fixed number of CS8900a RxEvent
+poll iterations -- and immediately RTSes whether or not a frame arrived.
+Python owns the wall-clock deadline via `time.monotonic` and decides
+whether to call the peek again.
+
+Why not let the 6502 own the timeout?  Earlier versions used a
+3-level inner counter (`DEC $F0/$F1/$F2`) to bound the poll to "about
+5 seconds".  That budget is denominated in 6502 cycles, so it
+evaporates in microseconds under VICE warp mode -- the C64 gives up
+before any TAP frame can arrive.  CIA TOD ($DC08-$DC0B) is also not
+usable as a wall-clock substitute: in our VICE 3.10 + `sound=False`
+configuration both CIA1 and CIA2 TOD registers stay pinned at
+`01:00:00.00` and never advance regardless of warp.
+
+The host-side pattern works in **both** normal and warp modes (verified
+10/10 each via `scripts/bridge_ping_demo.py [--warp]`) and is the same
+orchestration shape that will drive future Ultimate 64 Elite UCI
+networking tests -- a UCI peek routine would poll the socket-status
+register at `$DF1C-$DF1F` instead of CS8900a RxEvent and
+`poll_until_ready` would drive it identically.
+
+### High-level entry points
+
+* `bridge_ping.run_ping_and_wait(transport, ...)` -- transmit an echo
+  request and poll for a matching reply.  Owns the wall-clock budget
+  and re-polls on mismatched frames (e.g. host IPv6 multicast).
+* `bridge_ping.run_icmp_responder(transport, ...)` -- wait for an
+  echo request addressed to ``my_ip``, swap IPs/MACs, patch the ICMP
+  checksum, and TX the reply -- all inside a single JSR after the
+  Python-side poll reports a frame is waiting.
+* `poll_until.poll_until_ready(transport, code_addr, result_addr, ...)` --
+  the underlying generic primitive.  Backend-agnostic; any peek
+  routine that follows the contract in its docstring works.
+
+### Lower-level building blocks
+
+* `bridge_ping.build_rx_peek_code(load_addr, result_addr, *, batch_size=500)`
+  -- bounded CS8900a RxEvent peek (returns 0x01 ready / 0xFF batch
+  exhausted).  Uses ZP `$F0/$F1` only (`$F2` is freed).
+* `bridge_ping.build_read_and_match_echo_reply_code(...)` -- one-shot
+  drain + ICMP echo-reply matcher (returns 0x01 match / 0x02 mismatch).
+* `bridge_ping.build_read_and_respond_echo_request_code(...)` --
+  one-shot drain + transform + TX reply (returns 0x01 done / 0x02 mismatch).
+
+The legacy `build_icmp_responder_code` / `build_ping_and_wait_code` /
+`build_rx_echo_reply_code` builders are retained for back-compat but
+contain the broken cycle-budget poll loop and should not be used in
+new code.
+
 ## Known limitations
 
 ### Warp mode and ip65 DHCP
 
-Keep `warp=False` for ethernet tests.  ip65's DHCP state machine has
-been observed to misbehave in warp mode; normal speed is fast enough
-for bridge tests and avoids the problem.  The harness fixtures in
-`tests/conftest.py` and every script in this directory set
-`warp=False` explicitly.
+This caveat applies only to **ip65-driven** ethernet tests (DHCP, full
+TCP/IP).  ip65's DHCP state machine has been observed to misbehave in
+warp mode independently of the poll-budget issue described above.  The
+plain bridge ping tests in this directory work fine in warp mode --
+the demo opts in via `--warp`.
 
 ### Frame minimum size
 
@@ -212,8 +265,9 @@ payloads must be padded.  The `build_echo_request_frame` helper in
   round-trip test where B's 6502 responder swaps IPs/MACs and TXes
   an ICMP echo reply in the same JSR that consumed the request
 * `scripts/bridge_ping_demo.py` -- visible two-VICE demo: launches
-  both instances side by side (not minimized, normal speed) and
-  runs the ICMP round-trip in a loop with live per-screen status
-  (ping counter + latest result, green/red). Run with
+  both instances side by side (not minimized) and runs the ICMP
+  round-trip in a loop with live per-screen status (ping counter +
+  latest result, green/red). Run with
   `PYTHONPATH=src python3 scripts/bridge_ping_demo.py` (Ctrl+C to
-  stop, or `--count N` to limit iterations)
+  stop, or `--count N` to limit iterations).  Add `--warp` to verify
+  the host-side wall-clock pattern under VICE warp mode.

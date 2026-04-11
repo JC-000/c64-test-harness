@@ -689,3 +689,421 @@ def build_icmp_responder_code(
     a.emit(0x60)
 
     return a.build()
+
+
+# ---------------------------------------------------------------------------
+# Host-side wall-clock pattern (preferred -- works in VICE warp + on U64)
+# ---------------------------------------------------------------------------
+#
+# The legacy ``build_*_code`` functions above bake a 6502-cycle-denominated
+# poll budget into their inner loops via :func:`_emit_poll_rx`.  That budget
+# evaporates in microseconds under VICE warp mode, so the pattern fails when
+# warp is enabled.  An empirical investigation also ruled out CIA TOD as a
+# wall-clock substitute: in our VICE 3.10 + ``sound=False`` configuration,
+# both CIA1 and CIA2 TOD registers stay pinned at ``01:00:00.00`` and never
+# advance, regardless of warp.
+#
+# The replacement is to split each "poll RX, then act on the frame" routine
+# into two pieces:
+#
+#   * A bounded "peek batch" routine (:func:`build_rx_peek_code`) that polls
+#     RxEvent for a fixed number of iterations and immediately RTSes with
+#     ``0x01`` (ready) or ``0xFF`` (not yet).  Driven from Python via
+#     :func:`c64_test_harness.poll_until.poll_until_ready`, which owns the
+#     wall-clock deadline.
+#
+#   * A "consume" routine that runs once after the peek reports ready.  It
+#     drains the frame, validates it, and (for the responder) TXes a reply.
+#     The drain + TX still happen inside a single JSR, so the CS8900a state
+#     stays consistent across the RX-then-TX sequence.  Two flavours are
+#     provided: :func:`build_read_and_match_echo_reply_code` and
+#     :func:`build_read_and_respond_echo_request_code`.
+#
+# Python orchestrators (:func:`run_ping_and_wait`, :func:`run_icmp_responder`)
+# tie the two together.  These are the entry points new callers should use.
+#
+# The same orchestration shape generalises beyond CS8900a: a future Ultimate
+# 64 Elite UCI peek routine would poll its socket-status register at
+# ``$DF1C-$DF1F`` instead of CS8900a RxEvent, and ``poll_until_ready`` would
+# drive it identically.
+
+_RX_PEEK_BATCH_DEFAULT = 500
+
+
+def build_rx_peek_code(
+    load_addr: int,
+    result_addr: int,
+    *,
+    batch_size: int = _RX_PEEK_BATCH_DEFAULT,
+) -> bytes:
+    """Build a bounded CS8900a RxEvent peek routine.
+
+    Polls RxEvent (PP 0x0124, hi byte bit 0) for ``batch_size``
+    iterations.  Writes ``0x01`` to ``result_addr`` if the bit is set
+    on any iteration; writes ``0xFF`` if the loop runs to completion
+    without seeing it.  RTSes immediately in either case.
+
+    The routine is designed to be invoked repeatedly from the Python
+    side via :func:`c64_test_harness.poll_until.poll_until_ready`,
+    which owns the wall-clock deadline.
+
+    Zero-page footprint: ``$F0`` and ``$F1`` (16-bit counter).
+    ``$F2`` is NOT used by this routine, freeing it for callers.
+    """
+    if batch_size < 1 or batch_size > 65535:
+        raise ValueError(f"batch_size must be 1..65535, got {batch_size}")
+
+    lo = batch_size & 0xFF
+    hi = (batch_size >> 8) & 0xFF
+
+    a = Asm(org=load_addr)
+    a.emit(0x78)  # SEI -- prevent KERNAL IRQ corrupting ZP/scratch
+    _emit_clockport_enable(a)
+
+    # PPPtr = 0x0124 (RxEvent)
+    a.emit(0xA9, 0x24, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
+    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
+
+    # Initialise 16-bit counter at $F0/$F1
+    a.emit(0xA9, lo, 0x85, 0xF0)
+    a.emit(0xA9, hi, 0x85, 0xF1)
+
+    a.label("peek_loop")
+    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)  # LDA RxEvent hi
+    a.emit(0x29, 0x01)                               # AND #$01
+    a.branch(0xD0, "peek_hit")                       # BNE -> hit
+
+    # 16-bit decrement of $F0/$F1
+    a.emit(0xA5, 0xF0)              # LDA $F0
+    a.branch(0xD0, "_dec_lo")       # if lo != 0, just dec lo
+    a.emit(0xC6, 0xF1)              # DEC $F1 (hi)
+    a.label("_dec_lo")
+    a.emit(0xC6, 0xF0)              # DEC $F0 (lo)
+    a.emit(0xA5, 0xF0)              # LDA $F0
+    a.branch(0xD0, "peek_loop")     # any nonzero -> continue
+    a.emit(0xA5, 0xF1)              # LDA $F1
+    a.branch(0xD0, "peek_loop")     # if hi still nonzero -> continue
+
+    # Exhausted: write 0xFF to result, restore IRQs, RTS
+    a.emit(0xA9, 0xFF, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
+    a.emit(0x58)  # CLI
+    a.emit(0x60)  # RTS
+
+    a.label("peek_hit")
+    a.emit(0xA9, 0x01, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
+    a.emit(0x58)
+    a.emit(0x60)
+
+    return a.build()
+
+
+def build_read_and_match_echo_reply_code(
+    load_addr: int,
+    rx_buf: int,
+    result_addr: int,
+    identifier: int,
+    sequence: int,
+) -> bytes:
+    """Drain a waiting RX frame and match it against an expected echo reply.
+
+    Assumes ``RxEvent`` has already fired (caller ran a peek that
+    returned 0x01).  Writes:
+
+    * ``0x01`` -- match (caller may verify ``rx_buf`` contents)
+    * ``0x02`` -- frame consumed but did not match (host should re-poll)
+    """
+    id_hi = (identifier >> 8) & 0xFF
+    id_lo = identifier & 0xFF
+    seq_hi = (sequence >> 8) & 0xFF
+    seq_lo = sequence & 0xFF
+
+    a = Asm(org=load_addr)
+    a.emit(0x78)  # SEI
+    _emit_clockport_enable(a)
+
+    _emit_read_frame(a, rx_buf)
+
+    def chk(off: int, val: int, fail: str) -> None:
+        addr = rx_buf + off
+        a.emit(0xAD, addr & 0xFF, (addr >> 8) & 0xFF)
+        a.emit(0xC9, val & 0xFF)
+        a.branch(0xD0, fail)
+
+    chk(12, 0x08, "rmm")
+    chk(13, 0x00, "rmm")
+    chk(23, 0x01, "rmm")
+    chk(34, 0x00, "rmm")
+    chk(38, id_hi, "rmm")
+    chk(39, id_lo, "rmm")
+    chk(40, seq_hi, "rmm")
+    chk(41, seq_lo, "rmm")
+
+    # success
+    a.emit(0xA9, 0x01, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
+    a.emit(0x58)
+    a.emit(0x60)
+
+    a.label("rmm")
+    a.emit(0xA9, 0x02, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
+    a.emit(0x58)
+    a.emit(0x60)
+
+    return a.build()
+
+
+def build_read_and_respond_echo_request_code(
+    load_addr: int,
+    rx_buf: int,
+    my_ip: bytes,
+    result_addr: int,
+) -> bytes:
+    """Drain a waiting echo request, swap+TX a reply, no polling.
+
+    Assumes ``RxEvent`` has already fired.  Writes:
+
+    * ``0x01`` -- request consumed and reply transmitted
+    * ``0x02`` -- frame consumed but did not match (host should re-poll)
+    """
+    assert len(my_ip) == 4
+
+    a = Asm(org=load_addr)
+    a.emit(0x78)
+    _emit_clockport_enable(a)
+
+    _emit_read_frame(a, rx_buf)
+
+    def chk(off: int, val: int, fail: str) -> None:
+        addr = rx_buf + off
+        a.emit(0xAD, addr & 0xFF, (addr >> 8) & 0xFF)
+        a.emit(0xC9, val & 0xFF)
+        a.branch(0xD0, fail)
+
+    chk(12, 0x08, "rrm_tramp")
+    chk(13, 0x00, "rrm_tramp")
+    chk(23, 0x01, "rrm_tramp")
+    chk(34, 0x08, "rrm_tramp")
+    chk(30, my_ip[0], "rrm_tramp")
+    chk(31, my_ip[1], "rrm_tramp")
+    chk(32, my_ip[2], "rrm_tramp")
+    chk(33, my_ip[3], "rrm_tramp")
+    a.jmp("_rrm_skip")
+    a.label("rrm_tramp")
+    a.jmp("rrm")
+    a.label("_rrm_skip")
+
+    # Swap dest MAC [0..5] with src MAC [6..11]
+    for i in range(6):
+        dst = rx_buf + i
+        src = rx_buf + 6 + i
+        a.emit(0xAD, dst & 0xFF, (dst >> 8) & 0xFF)
+        a.emit(0xAE, src & 0xFF, (src >> 8) & 0xFF)
+        a.emit(0x8E, dst & 0xFF, (dst >> 8) & 0xFF)
+        a.emit(0x8D, src & 0xFF, (src >> 8) & 0xFF)
+
+    # Swap src IP [26..29] with dst IP [30..33]
+    for i in range(4):
+        dst = rx_buf + 26 + i
+        src = rx_buf + 30 + i
+        a.emit(0xAD, dst & 0xFF, (dst >> 8) & 0xFF)
+        a.emit(0xAE, src & 0xFF, (src >> 8) & 0xFF)
+        a.emit(0x8E, dst & 0xFF, (dst >> 8) & 0xFF)
+        a.emit(0x8D, src & 0xFF, (src >> 8) & 0xFF)
+
+    # ICMP type [34] = 0
+    type_addr = rx_buf + 34
+    a.emit(0xA9, 0x00, 0x8D, type_addr & 0xFF, (type_addr >> 8) & 0xFF)
+
+    # ICMP checksum patch: type decreased by 8 -> checksum hi += 8
+    ck_hi = rx_buf + 36
+    ck_lo = rx_buf + 37
+    a.emit(0xAD, ck_hi & 0xFF, (ck_hi >> 8) & 0xFF)
+    a.emit(0x18)
+    a.emit(0x69, 0x08)
+    a.emit(0x8D, ck_hi & 0xFF, (ck_hi >> 8) & 0xFF)
+    a.branch(0x90, "_ck2_done")
+    a.emit(0xAD, ck_lo & 0xFF, (ck_lo >> 8) & 0xFF)
+    a.emit(0x18)
+    a.emit(0x69, 0x01)
+    a.emit(0x8D, ck_lo & 0xFF, (ck_lo >> 8) & 0xFF)
+    a.label("_ck2_done")
+
+    # Wait for TxRdy then TX _FIXED_RX_BYTES from rx_buf
+    a.emit(0xA9, 0xC0, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
+    a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
+    a.emit(0xA9, _FIXED_RX_BYTES & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
+    a.emit(0xA9, 0x00, 0x8D, TXLEN_HI & 0xFF, TXLEN_HI >> 8)
+    a.emit(0xA9, 0x38, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
+    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
+    a.label("_tw2")
+    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
+    a.emit(0x29, 0x01)
+    a.branch(0xF0, "_tw2")
+
+    a.emit(0xA9, rx_buf & 0xFF, 0x85, 0xFB)
+    a.emit(0xA9, (rx_buf >> 8) & 0xFF, 0x85, 0xFC)
+    a.emit(0xA0, 0x00)
+    a.label("_txlp2")
+    a.emit(0xB1, 0xFB)
+    a.emit(0x8D, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
+    a.emit(0xC8)
+    a.emit(0xB1, 0xFB)
+    a.emit(0x8D, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
+    a.emit(0xC8)
+    a.emit(0xC0, _FIXED_RX_BYTES)
+    a.branch(0xD0, "_txlp2")
+
+    a.emit(0xA9, 0x01, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
+    a.emit(0x58)
+    a.emit(0x60)
+
+    a.label("rrm")
+    a.emit(0xA9, 0x02, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
+    a.emit(0x58)
+    a.emit(0x60)
+
+    return a.build()
+
+
+# ---------------------------------------------------------------------------
+# Python-side orchestrators
+# ---------------------------------------------------------------------------
+
+_DEFAULT_PEEK_ADDR = 0xC000
+_DEFAULT_CONSUME_ADDR = 0xC100
+
+
+def run_ping_and_wait(
+    transport,
+    *,
+    tx_frame: bytes,
+    rx_buf: int,
+    result_addr: int,
+    identifier: int,
+    sequence: int,
+    tx_frame_buf: int,
+    timeout_s: float = 5.0,
+    peek_addr: int = _DEFAULT_PEEK_ADDR,
+    consume_addr: int = _DEFAULT_CONSUME_ADDR,
+) -> int:
+    """Transmit an echo request, then poll for a matching reply.
+
+    Loads a TX routine, transmits ``tx_frame``, then loops:
+    ``poll_until_ready`` -> ``read_and_match_echo_reply`` -> on mismatch,
+    re-poll; on match, return ``0x01``; on wall-clock timeout, return
+    ``0xFF``.
+
+    The wall-clock budget is owned by Python via
+    :func:`c64_test_harness.poll_until.poll_until_ready`, so this works
+    correctly under VICE warp mode and on Ultimate 64 hardware.
+    """
+    import time as _time
+    from .execute import jsr, load_code
+    from .memory import read_bytes, write_bytes
+    from .poll_until import poll_until_ready
+
+    tx_code = build_tx_code(
+        load_addr=consume_addr,
+        frame_buf=tx_frame_buf,
+        frame_len=len(tx_frame),
+        result_addr=result_addr,
+    )
+    load_code(transport, consume_addr, tx_code)
+    write_bytes(transport, tx_frame_buf, tx_frame)
+    write_bytes(transport, result_addr, [0x00])
+    jsr(transport, consume_addr, timeout=5.0)
+    tx_result = read_bytes(transport, result_addr, 1)[0]
+    if tx_result != 0x01:
+        return tx_result
+
+    peek_code = build_rx_peek_code(load_addr=peek_addr, result_addr=result_addr)
+    load_code(transport, peek_addr, peek_code)
+
+    match_code = build_read_and_match_echo_reply_code(
+        load_addr=consume_addr,
+        rx_buf=rx_buf,
+        result_addr=result_addr,
+        identifier=identifier,
+        sequence=sequence,
+    )
+    load_code(transport, consume_addr, match_code)
+
+    deadline = _time.monotonic() + timeout_s
+    while True:
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            return 0xFF
+        peek_result = poll_until_ready(
+            transport,
+            code_addr=peek_addr,
+            result_addr=result_addr,
+            timeout_s=remaining,
+        )
+        if peek_result == 0xFF:
+            return 0xFF
+        if peek_result != 0x01:
+            return peek_result
+        write_bytes(transport, result_addr, [0x00])
+        jsr(transport, consume_addr, timeout=5.0)
+        match_result = read_bytes(transport, result_addr, 1)[0]
+        if match_result == 0x01:
+            return 0x01
+        if match_result == 0x02:
+            continue
+        return match_result
+
+
+def run_icmp_responder(
+    transport,
+    *,
+    rx_buf: int,
+    my_ip: bytes,
+    result_addr: int,
+    timeout_s: float = 5.0,
+    peek_addr: int = _DEFAULT_PEEK_ADDR,
+    consume_addr: int = _DEFAULT_CONSUME_ADDR,
+) -> int:
+    """Wait for an ICMP echo request and reply to it.
+
+    Loops: ``poll_until_ready`` -> ``read_and_respond_echo_request`` ->
+    on mismatch, re-poll; on success, return ``0x01``; on wall-clock
+    timeout, return ``0xFF``.
+    """
+    import time as _time
+    from .execute import jsr, load_code
+    from .memory import read_bytes, write_bytes
+    from .poll_until import poll_until_ready
+
+    peek_code = build_rx_peek_code(load_addr=peek_addr, result_addr=result_addr)
+    load_code(transport, peek_addr, peek_code)
+
+    body_code = build_read_and_respond_echo_request_code(
+        load_addr=consume_addr,
+        rx_buf=rx_buf,
+        my_ip=my_ip,
+        result_addr=result_addr,
+    )
+    load_code(transport, consume_addr, body_code)
+
+    deadline = _time.monotonic() + timeout_s
+    while True:
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            return 0xFF
+        peek_result = poll_until_ready(
+            transport,
+            code_addr=peek_addr,
+            result_addr=result_addr,
+            timeout_s=remaining,
+        )
+        if peek_result == 0xFF:
+            return 0xFF
+        if peek_result != 0x01:
+            return peek_result
+        write_bytes(transport, result_addr, [0x00])
+        jsr(transport, consume_addr, timeout=5.0)
+        body_result = read_bytes(transport, result_addr, 1)[0]
+        if body_result == 0x01:
+            return 0x01
+        if body_result == 0x02:
+            continue
+        return body_result

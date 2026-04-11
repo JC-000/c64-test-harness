@@ -33,11 +33,11 @@ from c64_test_harness.backends.vice_binary import BinaryViceTransport
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 from c64_test_harness.bridge_ping import (
     build_echo_request_frame,
-    build_icmp_responder_code,
-    build_ping_and_wait_code,
     cs8900a_read_linectl_code,
     cs8900a_rxctl_code,
     cs8900a_write_linectl_code,
+    run_icmp_responder,
+    run_ping_and_wait,
 )
 from c64_test_harness.ethernet import set_cs8900a_mac
 from c64_test_harness.execute import jsr, load_code
@@ -52,9 +52,11 @@ IP_B = bytes([10, 0, 65, 3])
 PING_ID = 0xBEEF
 PING_PAYLOAD = b"PING_FROM_VICE_A"
 
-CODE = 0xC000
-SCRATCH = 0xC1E0
-RESULT = 0xC1F0
+CODE = 0xC000           # init helpers (rxctl/linectl) + peek routine load addr
+PEEK_ADDR = 0xC000      # peek routine (~64 bytes)
+CONSUME_ADDR = 0xC200   # consume routine (~360 bytes, fits before $C400)
+SCRATCH = 0xC1E0        # used only during one-time CS8900a init
+RESULT = 0xC1F0         # 1-byte result (between peek and consume regions)
 TX_FRAME_BUF = 0xC500
 RX_FRAME_BUF = 0xC700
 
@@ -190,45 +192,58 @@ def run_one_ping(
     transport_b: BinaryViceTransport,
     seq: int,
 ) -> tuple[bool, str]:
-    """Run a single round-trip ping. Returns (success, detail_string)."""
+    """Run a single round-trip ping using the host-side wall-clock pattern.
+
+    Both A and B run their orchestration loops concurrently in worker
+    threads.  Each loop calls a bounded peek routine repeatedly via the
+    binary monitor, with Python owning the wall-clock deadline -- so
+    this works in both normal and warp modes.
+    """
     echo = build_echo_request_frame(
         src_mac=MAC_A, dst_mac=MAC_B,
         src_ip=IP_A, dst_ip=IP_B,
         identifier=PING_ID, sequence=seq,
         payload=PING_PAYLOAD,
     )
-
-    responder_code = build_icmp_responder_code(
-        load_addr=CODE, rx_buf=RX_FRAME_BUF, my_ip=IP_B, result_addr=RESULT,
-    )
-    load_code(transport_b, CODE, responder_code)
-    write_bytes(transport_b, RESULT, [0x00])
-    write_bytes(transport_b, RX_FRAME_BUF, [0x00] * 256)
-
-    ping_code = build_ping_and_wait_code(
-        load_addr=CODE,
-        tx_frame_buf=TX_FRAME_BUF, tx_frame_len=len(echo.frame),
-        rx_buf=RX_FRAME_BUF, result_addr=RESULT,
-        identifier=PING_ID, sequence=seq,
-    )
-    load_code(transport_a, CODE, ping_code)
-    write_bytes(transport_a, TX_FRAME_BUF, echo.frame)
-    write_bytes(transport_a, RESULT, [0x00])
     write_bytes(transport_a, RX_FRAME_BUF, [0x00] * 256)
+    write_bytes(transport_b, RX_FRAME_BUF, [0x00] * 256)
 
     rx_error: list[Exception] = []
     tx_error: list[Exception] = []
+    a_status: list[int] = []
+    b_status: list[int] = []
 
     def responder_worker() -> None:
         try:
-            jsr(transport_b, CODE, timeout=15.0)
+            r = run_icmp_responder(
+                transport_b,
+                rx_buf=RX_FRAME_BUF,
+                my_ip=IP_B,
+                result_addr=RESULT,
+                timeout_s=10.0,
+                peek_addr=PEEK_ADDR,
+                consume_addr=CONSUME_ADDR,
+            )
+            b_status.append(r)
         except Exception as e:
             rx_error.append(e)
 
     def ping_worker() -> None:
         try:
             time.sleep(0.6)
-            jsr(transport_a, CODE, timeout=10.0)
+            r = run_ping_and_wait(
+                transport_a,
+                tx_frame=echo.frame,
+                rx_buf=RX_FRAME_BUF,
+                result_addr=RESULT,
+                identifier=PING_ID,
+                sequence=seq,
+                tx_frame_buf=TX_FRAME_BUF,
+                timeout_s=8.0,
+                peek_addr=PEEK_ADDR,
+                consume_addr=CONSUME_ADDR,
+            )
+            a_status.append(r)
         except Exception as e:
             tx_error.append(e)
 
@@ -245,13 +260,12 @@ def run_one_ping(
         err = (rx_error or tx_error)[0]
         return False, f"ERR {type(err).__name__}"
 
-    a_result = read_bytes(transport_a, RESULT, 1)[0]
-    b_result = read_bytes(transport_b, RESULT, 1)[0]
-
-    if b_result != 0x01:
-        return False, f"B FAIL 0X{b_result:02X}"
-    if a_result != 0x01:
-        return False, f"A FAIL 0X{a_result:02X}"
+    if not b_status or b_status[0] != 0x01:
+        bs = b_status[0] if b_status else None
+        return False, f"B FAIL {bs}"
+    if not a_status or a_status[0] != 0x01:
+        ast = a_status[0] if a_status else None
+        return False, f"A FAIL {ast}"
     return True, f"OK {elapsed_ms}MS"
 
 
@@ -261,6 +275,9 @@ def main() -> int:
                         help="Number of pings to run (0 = loop until Ctrl+C)")
     parser.add_argument("--interval", type=float, default=1.5,
                         help="Seconds between pings")
+    parser.add_argument("--warp", action="store_true",
+                        help="Run VICE in warp mode (verifies host-side "
+                             "wall-clock timeout pattern)")
     args = parser.parse_args()
 
     if shutil.which("x64sc") is None:
@@ -272,7 +289,8 @@ def main() -> int:
                   file=sys.stderr)
             return 1
 
-    print("=== Bridge Ping Demo (RR-Net, normal speed) ===")
+    mode = "warp" if args.warp else "normal speed"
+    print(f"=== Bridge Ping Demo (RR-Net, {mode}) ===")
     print("Launching two VICE instances on br-c64...")
 
     allocator = PortAllocator(port_range_start=6560, port_range_end=6580)
@@ -286,12 +304,12 @@ def main() -> int:
         res_b.close()
 
     config_a = ViceConfig(
-        port=port_a, warp=False, sound=False, minimize=False,
+        port=port_a, warp=args.warp, sound=False, minimize=False,
         ethernet=True, ethernet_mode="rrnet",
         ethernet_interface="tap-c64-0", ethernet_driver="tuntap",
     )
     config_b = ViceConfig(
-        port=port_b, warp=False, sound=False, minimize=False,
+        port=port_b, warp=args.warp, sound=False, minimize=False,
         ethernet=True, ethernet_mode="rrnet",
         ethernet_interface="tap-c64-1", ethernet_driver="tuntap",
     )
