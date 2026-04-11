@@ -326,8 +326,25 @@ Zero-page footprint: `$F0`-`$F5`.  Deadline cap: **599 tenths
 
 The two paths are **additive** -- neither replaces the other.  The
 higher-level `build_*_tod_code` variants in `bridge_ping.py` wrap the
-TOD poll core for common ICMP scenarios (see
-`tests/test_bridge_ping_tod.py`).
+TOD poll core for common ICMP scenarios:
+
+* `build_ping_and_wait_tod_code` -- pure-6502 ping-and-wait that
+  TXes an echo request, polls RX with a TOD deadline, reads the
+  reply, and verifies identifier/sequence.
+* `build_icmp_responder_tod_code` -- pure-6502 responder that polls
+  RX with a TOD deadline, receives one ICMP echo request for a
+  given IP, transforms it into an echo reply in place, and TXes it.
+* `build_rx_echo_reply_tod_code` -- pure-6502 echo reply receiver
+  that polls RX with a TOD deadline and drains frames into a
+  buffer until one matches the expected identifier/sequence.
+
+All three are drop-in counterparts of the host-driven
+`build_ping_and_wait_code` / `build_icmp_responder_code` /
+`build_rx_echo_reply_code` and take the same arguments plus
+`deadline_tenths` (1..599).  See `tests/test_bridge_ping_tod.py` for a
+full two-VICE bridge round trip using these variants on VICE normal
+mode, plus a live Ultimate 64 TOD primitive test at 1 / 8 / 24 / 48
+MHz turbo speeds (gated by `U64_HOST`).
 
 ## See also
 
@@ -341,6 +358,9 @@ TOD poll core for common ICMP scenarios (see
   helpers for the shippable-application path (see "Test harness vs
   shippable application" above)
 * `tests/test_tod_timer.py` -- unit tests for the TOD code builders
+* `tests/test_bridge_ping_tod.py` -- live TOD-based bridge ping round
+  trip on VICE normal mode (shippable-application path) plus live
+  U64 TOD primitive test across turbo speeds
 * `scripts/setup-bridge-tap.sh` and `scripts/teardown-bridge-tap.sh`
 * `tests/test_bridge_ping.py::TestBridgeIcmpRoundTrip` -- full
   round-trip test where B's 6502 responder swaps IPs/MACs and TXes

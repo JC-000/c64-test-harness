@@ -567,6 +567,8 @@ code = build_poll_with_tod_deadline_code(
 
 TOD runs at wall-clock rate on real C64, on Ultimate 64 Elite (flat 1.0x across the full 1-48 MHz turbo range), and on VICE 3.10 normal mode. It does **not** work under VICE warp mode, where TOD is virtual-CPU clocked; use the host-driven helpers in that case. Deadline cap is 599 tenths (59.9 s) per single call; longer waits require a caller loop. Zero-page footprint: `$F0`-`$F5`. See [docs/bridge_networking.md](docs/bridge_networking.md#test-harness-vs-shippable-application) for the full split.
 
+For common ICMP scenarios the bridge_ping module ships higher-level wrappers that combine the TX/RX logic with a TOD-gated poll loop in one routine: `build_ping_and_wait_tod_code`, `build_icmp_responder_tod_code`, and `build_rx_echo_reply_tod_code`. They are drop-in shippable counterparts of the host-driven `build_ping_and_wait_code` / `build_icmp_responder_code` / `build_rx_echo_reply_code`. See `tests/test_bridge_ping_tod.py` for a full two-VICE bridge round trip using these variants on VICE normal mode, plus a live U64 TOD primitive test at 1 / 8 / 24 / 48 MHz turbo speeds (gated by `U64_HOST`).
+
 ## Audio Capture
 
 ### VICE — Headless WAV Render
