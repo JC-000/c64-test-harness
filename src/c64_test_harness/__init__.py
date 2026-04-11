@@ -211,6 +211,12 @@ from .bridge_ping import (
     run_ping_and_wait,
 )
 from .poll_until import poll_until_ready
+from .tod_timer import (
+    MAX_DEADLINE_TENTHS,
+    build_tod_start_code,
+    build_tod_read_tenths_code,
+    build_poll_with_tod_deadline_code,
+)
 from .parallel import run_parallel, ParallelTestResult, SingleTestResult
 from .sid import SidFile, SidError, SidFormatError, build_test_psid
 from .sid_player import (
@@ -444,6 +450,11 @@ __all__ = [
     "run_ping_and_wait",
     # Host-side wall-clock polling helper
     "poll_until_ready",
+    # CIA TOD-based 6502 timeouts (shippable networking applications)
+    "MAX_DEADLINE_TENTHS",
+    "build_tod_start_code",
+    "build_tod_read_tenths_code",
+    "build_poll_with_tod_deadline_code",
     # Parallel execution
     "run_parallel",
     "ParallelTestResult",
