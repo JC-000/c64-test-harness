@@ -252,6 +252,83 @@ data, before the 4-byte FCS that the chip auto-appends).  Smaller
 payloads must be padded.  The `build_echo_request_frame` helper in
 `c64_test_harness.bridge_ping` does this automatically.
 
+## Test harness vs shippable application
+
+The bridge networking helpers in this project come in **two flavours**
+that solve different problems:
+
+### 1. Test-orchestration path (host-driven)
+
+Used by `tests/test_bridge_ping.py` and `scripts/bridge_ping_demo.py`.
+The Python test harness owns the wall clock: it pauses the 6502
+between iterations via the VICE binary monitor, checks host-side
+monotonic time, and decides when to time out.  This pattern works
+under **VICE normal mode**, **VICE warp mode** (for fast automated
+test runs), and for **Ultimate 64**-backed tests.
+
+Relevant helpers: `build_tx_code`, `build_rx_echo_reply_code`,
+`build_ping_and_wait_code`, `build_icmp_responder_code` in
+`c64_test_harness.bridge_ping`.
+
+**This path is not shippable.**  A real C64 networking application
+running on bare iron or a standalone Ultimate 64 Elite has no Python
+driving a binary-monitor socket on the other side, so the 6502 code
+cannot rely on the host to enforce timeouts.
+
+### 2. Shippable-application path (6502-driven TOD)
+
+Used by the lower-level code builders in
+`c64_test_harness.tod_timer`.  The 6502 owns its own deadlines by
+reading **CIA1 Time-of-Day** and comparing against a pre-computed
+"tenths-since-start-of-poll" value.  This is pure 6502 code; it runs
+standalone on:
+
+* Real Commodore 64 hardware (TOD at wall-clock rate).
+* Real Ultimate 64 Elite, at any turbo speed from 1 to 48 MHz (TOD
+  is flat 1.0x across the full turbo range -- verified empirically).
+* VICE 3.10 normal mode (TOD at ~1.0x wall).
+
+It does **not** work under VICE warp mode, where CIA1 TOD is virtual-
+CPU clocked and accelerates with the CPU (~31x wall on VICE 3.10);
+the 6502 timeout would expire ~31x too fast.  Shippable applications
+do not run under warp anyway; only automated tests do, and those use
+the test-orchestration path above.
+
+The TOD poll core lives in `src/c64_test_harness/tod_timer.py` and
+exposes three code builders:
+
+* `build_tod_start_code(load_addr)` -- start CIA1 TOD at 00:00:00.0.
+* `build_tod_read_tenths_code(load_addr, result_addr)` -- read TOD
+  and store elapsed tenths since start as an LE16 value.
+* `build_poll_with_tod_deadline_code(load_addr, peek_snippet,
+  result_addr, deadline_tenths)` -- generic poll loop that calls a
+  user-supplied 6502 "ready?" snippet and bails out when the TOD
+  deadline elapses.  `peek_snippet` is raw 6502 bytes that must
+  leave `Z=0` when the device is ready -- for CS8900a RxEvent this
+  is `LDA $DE05 / AND #$01`, for a UCI response-ready bit it would
+  read the UCI status register, etc.  This is the generalization
+  boundary for eventual UCI support.
+
+Zero-page footprint: `$F0`-`$F5`.  Deadline cap: **599 tenths
+(59.9 s)** -- for longer waits, loop in the caller.
+
+### Which pattern should I use?
+
+| Scenario                                        | Use |
+| ----------------------------------------------- | --- |
+| Pytest test on VICE normal mode                 | Either (test path is simpler) |
+| Pytest test on VICE warp mode                   | Test path (host-driven) |
+| Pytest test on Ultimate 64                      | Test path (host-driven) |
+| Validate a 6502 ping routine end-to-end         | Either |
+| Ship a `.prg` on disk to a real C64 user        | **Shippable path** (TOD) |
+| Run on a standalone U64E with no host           | **Shippable path** (TOD) |
+| Run on VICE warp to burn CI budget              | Test path (host-driven) |
+
+The two paths are **additive** -- neither replaces the other.  The
+higher-level `build_*_tod_code` variants in `bridge_ping.py` wrap the
+TOD poll core for common ICMP scenarios (see
+`tests/test_bridge_ping_tod.py`).
+
 ## See also
 
 * `tests/test_ethernet_bridge.py` -- raw L2 broadcast frame exchange
@@ -260,6 +337,10 @@ payloads must be padded.  The `build_echo_request_frame` helper in
 * `src/c64_test_harness/bridge_ping.py` -- helpers for building
   ICMP echo frames and 6502 RX/TX routines for RR-Net mode
   (register offsets match ip65's `cs8900a.s`)
+* `src/c64_test_harness/tod_timer.py` -- CIA1 TOD-based 6502 timeout
+  helpers for the shippable-application path (see "Test harness vs
+  shippable application" above)
+* `tests/test_tod_timer.py` -- unit tests for the TOD code builders
 * `scripts/setup-bridge-tap.sh` and `scripts/teardown-bridge-tap.sh`
 * `tests/test_bridge_ping.py::TestBridgeIcmpRoundTrip` -- full
   round-trip test where B's 6502 responder swaps IPs/MACs and TXes
