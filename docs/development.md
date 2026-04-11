@@ -16,6 +16,18 @@ Always preview first with `--dry-run` — it prints every action it would take w
 ./scripts/setup-dev-env.sh --dry-run
 ```
 
+After a successful run, the harness lives in a dedicated venv at `~/.local/share/c64-test-harness/venv` (this avoids the PEP 668 `externally-managed-environment` error that Ubuntu 23+ raises against system Python). Activate it with:
+
+```bash
+source ~/.local/share/c64-test-harness/venv/bin/activate
+```
+
+or invoke the venv python directly:
+
+```bash
+~/.local/share/c64-test-harness/venv/bin/python -m pytest tests/
+```
+
 ### Stages
 
 The installer runs six stages. Every stage is **idempotent** (safe to re-run) and **opt-out** via `--no-*` flags.
@@ -24,7 +36,7 @@ The installer runs six stages. Every stage is **idempotent** (safe to re-run) an
 |---|-------|--------------|--------------|
 | 1 | `system packages` | `sudo apt-get install` build toolchain, VICE build deps (SDL2, GTK3, libpcap, pulse/alsa, flac/vorbis/mpg123/lame), harness tooling (python3, pip, iproute2, iptables). If a bulk install fails, retries per-package to report which names drifted. | `--no-system-packages` |
 | 2 | `VICE 3.10 build` | Downloads the VICE 3.10 tarball from SourceForge into `~/.cache/c64-test-harness/build/`, extracts, `./configure --enable-ethernet --disable-html-docs --enable-native-gtk3ui`, `make -j$(nproc)`, `sudo make install`. Skips entirely if `x64sc --version` already reports VICE 3.10 with ethernet support. Optional `--sha256 HEX` pin. | `--no-vice` |
-| 3 | `Python harness` | `pip install --user -e '.[dev]'` from the repo root. Skipped if the currently-importable `c64_test_harness` already points at this checkout. | `--no-harness` |
+| 3 | `Python harness` | Creates a dedicated venv at `~/.local/share/c64-test-harness/venv` (with `--system-site-packages`) and runs `pip install -e .` into it. This avoids the PEP 668 / externally-managed-environment error that Ubuntu 23+ raises for `pip install --user` against system Python. Skipped if the venv already exists and its `c64_test_harness` import resolves to this checkout. After success, prints the `source .../activate` command to run. | `--no-harness` |
 | 4 | `bridge networking` | Runs `sudo ./scripts/setup-bridge-tap.sh` to create `br-c64` + `tap-c64-0` + `tap-c64-1`. Skipped if all three interfaces already exist. | `--no-bridge` |
 | 5 | `Ultimate 64 probe` | Only runs if `U64_HOST` is set in env or `--u64-host HOST` is passed. `curl`s `/v1/version` and reports reachability; never a failure. | `--no-u64` |
 | 6 | `verify-dev-env.sh` | Final sanity check. The installer's exit code mirrors this: `0` READY, `1` NOT READY, `3` verify-script broken. | (always runs) |
@@ -100,7 +112,7 @@ Critical checks are: VICE presence/version/ethernet/binary-monitor, `c1541`, Pyt
 `scripts/setup-dev-env.sh` targets Ubuntu Desktop 25 specifically. On other distros, pass `--force` to bypass the OS check (system-package names may drift), or do it by hand:
 
 1. **Build VICE 3.10 from source with `--enable-ethernet`** — distro packages generally omit the flag, so `verify-dev-env.sh` will flag this as a critical failure if you install from `apt`. Install to `/usr/local/bin`.
-2. **Install the Python harness in editable mode**: `pip install -e '.[dev]'` from the repo root.
+2. **Install the Python harness in editable mode into a venv**: `python3 -m venv --system-site-packages ~/.local/share/c64-test-harness/venv && ~/.local/share/c64-test-harness/venv/bin/pip install -e .` from the repo root. On Ubuntu 23+ / PEP-668 distros this is mandatory — `pip install --user` against system Python is blocked. Activate with `source ~/.local/share/c64-test-harness/venv/bin/activate` before running tests, or invoke `~/.local/share/c64-test-harness/venv/bin/python -m pytest tests/` directly.
 3. **Set up bridge networking** (only required for multi-VICE ethernet tests): `sudo ./scripts/setup-bridge-tap.sh`. Teardown: `sudo ./scripts/teardown-bridge-tap.sh`. Emergency cleanup: `sudo ./scripts/cleanup-bridge-networking.sh`.
 4. **Optional Ultimate 64**: set `U64_HOST=<ip>` in the environment to enable hardware-backed live tests.
 
