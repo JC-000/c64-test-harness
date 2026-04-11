@@ -191,14 +191,15 @@ poll iterations -- and immediately RTSes whether or not a frame arrived.
 Python owns the wall-clock deadline via `time.monotonic` and decides
 whether to call the peek again.
 
-Why not let the 6502 own the timeout?  Earlier versions used a
-3-level inner counter (`DEC $F0/$F1/$F2`) to bound the poll to "about
-5 seconds".  That budget is denominated in 6502 cycles, so it
-evaporates in microseconds under VICE warp mode -- the C64 gives up
-before any TAP frame can arrive.  CIA TOD ($DC08-$DC0B) is also not
-usable as a wall-clock substitute: in our VICE 3.10 + `sound=False`
-configuration both CIA1 and CIA2 TOD registers stay pinned at
-`01:00:00.00` and never advance regardless of warp.
+Why not let the 6502 own the timeout in the test harness?  Earlier
+versions used a 3-level inner counter (`DEC $F0/$F1/$F2`) to bound the
+poll to "about 5 seconds".  That budget is denominated in 6502 cycles,
+so it evaporates in microseconds under VICE warp mode -- the C64 gives
+up before any TAP frame can arrive.  For **shippable applications**
+that do not run under warp, 6502-owned timeouts are appropriate and
+supported via CIA1 TOD (see "Test harness vs shippable application"
+below); warp-mode test runs must use the host-driven pattern
+described here.
 
 The host-side pattern works in **both** normal and warp modes (verified
 10/10 each via `scripts/bridge_ping_demo.py [--warp]`) and is the same
@@ -230,10 +231,13 @@ register at `$DF1C-$DF1F` instead of CS8900a RxEvent and
 * `bridge_ping.build_read_and_respond_echo_request_code(...)` --
   one-shot drain + transform + TX reply (returns 0x01 done / 0x02 mismatch).
 
-The legacy `build_icmp_responder_code` / `build_ping_and_wait_code` /
-`build_rx_echo_reply_code` builders are retained for back-compat but
-contain the broken cycle-budget poll loop and should not be used in
-new code.
+The older `build_icmp_responder_code` / `build_ping_and_wait_code` /
+`build_rx_echo_reply_code` builders remain the right choice for tests
+that run under VICE warp mode, because their polling budget is owned
+by the host-side `poll_until_ready` wrapper rather than by an in-6502
+counter.  For **shippable applications** (real C64, Ultimate 64 Elite,
+VICE normal mode) use the `*_tod_code` variants in the "Test harness
+vs shippable application" section below instead.
 
 ## Known limitations
 
