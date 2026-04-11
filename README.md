@@ -549,6 +549,26 @@ set_cs8900a_mac(transport, mac)           # program CS8900a IA registers
 
 **IP-layer ICMP exchange between two VICE instances** is supported via the `bridge_ping` module and the `bridge_vice_pair` pytest fixture (in `tests/conftest.py`). The fixture launches two VICE instances on the bridge, initialises the CS8900a, and programs unique MACs. Tests can build IP/ICMP frames in Python with `build_echo_request_frame()` and verify reception via 6502 RX routines. The harness uses RR-Net register offsets that match ip65's `cs8900a.s` driver (PPPtr=`$DE02`, PPData=`$DE04`, RTDATA=`$DE08`, TxCMD=`$DE0C`, TxLen=`$DE0E`) and automatically emits the RR clockport enable (`$DE01 |= $01`) before every CS8900a access. See `tests/test_bridge_ping.py` for both a one-way IP exchange and a full round-trip where the peer's 6502 responder swaps IPs/MACs and TXes an echo reply in the same JSR, plus [docs/bridge_networking.md](docs/bridge_networking.md) for the register layout and setup steps.
 
+**Shippable-application 6502 timeouts via CIA1 TOD** (`tod_timer` module): the host-driven `build_ping_and_wait_code` helpers above are great for tests but not for a real C64 application. For code that ships on a disk and runs standalone, use `c64_test_harness.tod_timer`, which emits pure 6502 poll loops that drive their own deadlines off the CIA1 Time-of-Day clock:
+
+```python
+from c64_test_harness import (
+    build_tod_start_code, build_tod_read_tenths_code,
+    build_poll_with_tod_deadline_code,
+)
+
+# Poll a CS8900a RxEvent register with a 5 s TOD-based timeout.
+peek = bytes([0xAD, 0x05, 0xDE, 0x29, 0x01])  # LDA $DE05; AND #$01
+code = build_poll_with_tod_deadline_code(
+    load_addr=0xC000, peek_check_snippet=peek,
+    result_addr=0xC1F0, deadline_tenths=50,   # 5.0 s
+)
+```
+
+TOD runs at wall-clock rate on real C64, on Ultimate 64 Elite (flat 1.0x across the full 1-48 MHz turbo range), and on VICE 3.10 normal mode. It does **not** work under VICE warp mode, where TOD is virtual-CPU clocked; use the host-driven helpers in that case. Deadline cap is 599 tenths (59.9 s) per single call; longer waits require a caller loop. Zero-page footprint: `$F0`-`$F5`. See [docs/bridge_networking.md](docs/bridge_networking.md#test-harness-vs-shippable-application) for the full split.
+
+For common ICMP scenarios the bridge_ping module ships higher-level wrappers that combine the TX/RX logic with a TOD-gated poll loop in one routine: `build_ping_and_wait_tod_code`, `build_icmp_responder_tod_code`, and `build_rx_echo_reply_tod_code`. They are drop-in shippable counterparts of the host-driven `build_ping_and_wait_code` / `build_icmp_responder_code` / `build_rx_echo_reply_code`. See `tests/test_bridge_ping_tod.py` for a full two-VICE bridge round trip using these variants on VICE normal mode, plus a live U64 TOD primitive test at 1 / 8 / 24 / 48 MHz turbo speeds (gated by `U64_HOST`).
+
 ## Audio Capture
 
 ### VICE — Headless WAV Render
