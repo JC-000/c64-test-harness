@@ -25,13 +25,29 @@ Reusable test harness for Commodore 64 programs. Automates C64 programs via the 
 - **Runtime warp toggle** — enable/disable VICE warp mode at runtime via dual-monitor (binary + text); `resource_get`/`resource_set` for general VICE resource control
 - **Flexible configuration** — `HarnessConfig` with TOML file and environment variable support
 
+## Getting started (fresh Ubuntu 25 machine)
+
+On a clean Ubuntu Desktop 25 box, one command gets you from zero to a working dev environment:
+
+```bash
+./scripts/setup-dev-env.sh
+```
+
+The installer runs six stages — system packages, VICE 3.10 source build with `--enable-ethernet`, editable harness install, bridge networking, optional Ultimate 64 probe, and a final `verify-dev-env.sh` run — and every stage is idempotent and opt-out via `--no-*` flags. Pass `--dry-run` first to preview exactly what it will do without touching anything:
+
+```bash
+./scripts/setup-dev-env.sh --dry-run
+```
+
+See [docs/development.md](docs/development.md) for the full stage breakdown, opt-out flags, and how to recover if a stage fails.
+
 ## Installation
 
 ```bash
 pip install -e .
 ```
 
-Requires Python 3.10+. Zero runtime dependencies.
+Requires Python 3.10+. Zero runtime dependencies. (If you used `scripts/setup-dev-env.sh`, this step is already done for you.)
 
 ## Verifying your dev environment
 
@@ -823,6 +839,7 @@ Additional scripts in `scripts/`:
 | `scripts/bridge_ping_demo.py` | Visible two-VICE bridge ping demo (RR-Net, live on-screen counters; supports `--warp` via host-side wall-clock orchestrators) |
 | `scripts/verify_tod_warp.py` | Empirical CIA TOD behavior probe in normal vs warp mode (regression check for the wall-clock timeout design) |
 | `scripts/verify-dev-env.sh` | Non-destructive dev environment check (VICE build flags, Python harness, bridge interfaces, optional U64 probe) |
+| `scripts/setup-dev-env.sh` | Fresh-Ubuntu-25 installer: apt packages, VICE 3.10 source build, harness install, bridge setup, final verify run (idempotent, `--dry-run` safe) |
 
 ## Running Tests
 
