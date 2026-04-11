@@ -419,6 +419,12 @@ def build_rx_echo_reply_code(
     Verifies ethertype=IPv4, protocol=ICMP, type=echo-reply, identifier
     and sequence match (big-endian on the wire).  Writes 0x01 or 0xFF to
     ``result_addr``.
+
+    .. note::
+
+        This is the **test-harness** variant.  For the shippable-
+        application equivalent (pure 6502, CIA1 TOD deadline), see
+        :func:`build_rx_echo_reply_tod_code`.
     """
     id_hi = (identifier >> 8) & 0xFF
     id_lo = identifier & 0xFF
@@ -492,6 +498,14 @@ def build_ping_and_wait_code(
         on the peer VICE.  See the stage-4 validation in the
         bridge-networking-rrnet worktree history for current round-trip
         status.
+
+    .. note::
+
+        This is the **test-harness** variant -- it uses an iteration-
+        counter timeout that evaporates under VICE warp mode.  For the
+        **shippable-application** equivalent (pure 6502, CIA1 TOD
+        deadline, correct on real C64 / U64E / VICE normal), see
+        :func:`build_ping_and_wait_tod_code`.
     """
     id_hi = (identifier >> 8) & 0xFF
     id_lo = identifier & 0xFF
@@ -581,6 +595,14 @@ def build_icmp_responder_code(
     Uses RR-Net register layout with the clockport enable injected at
     entry.  See ``tests/test_bridge_ping.py`` for a working round-trip
     exercise built on top of this routine.
+
+    .. note::
+
+        This is the **test-harness** variant -- iteration-counter
+        timeout, correct under VICE warp (when host-orchestrated).
+        For the shippable-application equivalent (pure 6502, CIA1 TOD
+        deadline, correct on real C64 / U64E / VICE normal), see
+        :func:`build_icmp_responder_tod_code`.
     """
     assert len(my_ip) == 4
 
@@ -1107,3 +1129,591 @@ def run_icmp_responder(
         if body_result == 0x02:
             continue
         return body_result
+
+
+# ---------------------------------------------------------------------------
+# Shippable-application variants: TOD-based 6502 timeouts
+# ---------------------------------------------------------------------------
+#
+# These routines mirror the host-driven helpers above but use CIA1
+# Time-of-Day as the deadline source instead of iteration counters.
+# They are the correct choice for code that ships on disk and runs
+# standalone on real C64 / U64E / VICE normal mode.  See
+# ``docs/bridge_networking.md`` "Test harness vs shippable application"
+# for the full split and ``c64_test_harness.tod_timer`` for the
+# low-level CIA1 TOD primitives.
+#
+# All _tod variants use ZP $F0-$F5 for TOD scratch and cap the
+# deadline at 599 tenths (59.9 s) per single call.  They do NOT work
+# under VICE warp mode (TOD accelerates with the virtual CPU on
+# VICE 3.10; deadlines expire ~31x too fast).
+# ---------------------------------------------------------------------------
+
+# CIA1 TOD register addresses (duplicated from tod_timer to keep
+# bridge_ping free of module-level imports from tod_timer, since
+# tod_timer imports ``Asm`` from us).
+_CIA1_TOD_TENTHS = 0xDC08
+_CIA1_TOD_SEC = 0xDC09
+_CIA1_TOD_MIN = 0xDC0A
+_CIA1_TOD_HR = 0xDC0B
+_CIA1_CRB = 0xDC0F
+
+_ZP_CUR_LO = 0xF0
+_ZP_CUR_HI = 0xF1
+_ZP_DEADLINE_LO = 0xF2
+_ZP_DEADLINE_HI = 0xF3
+_ZP_ONES = 0xF4
+_ZP_RAW = 0xF5
+
+_MAX_DEADLINE_TENTHS = 599
+
+
+def _emit_tod_start_inline(a: Asm) -> None:
+    """Inline: clear $DC0F bit 7, write $00 to $DC0B/$0A/$09/$08."""
+    a.emit(0xAD, _CIA1_CRB & 0xFF, _CIA1_CRB >> 8)
+    a.emit(0x29, 0x7F)
+    a.emit(0x8D, _CIA1_CRB & 0xFF, _CIA1_CRB >> 8)
+    a.emit(0xA9, 0x00)
+    a.emit(0x8D, _CIA1_TOD_HR & 0xFF, _CIA1_TOD_HR >> 8)
+    a.emit(0x8D, _CIA1_TOD_MIN & 0xFF, _CIA1_TOD_MIN >> 8)
+    a.emit(0x8D, _CIA1_TOD_SEC & 0xFF, _CIA1_TOD_SEC >> 8)
+    a.emit(0x8D, _CIA1_TOD_TENTHS & 0xFF, _CIA1_TOD_TENTHS >> 8)
+
+
+def _emit_tod_sec_table(a: Asm, label: str) -> None:
+    """Emit split tens*100 LE16 table (8 lo bytes + 8 hi bytes)."""
+    a.label(label)
+    for i in range(8):
+        a.emit((i * 100) & 0xFF)
+    for i in range(8):
+        a.emit(((i * 100) >> 8) & 0xFF)
+
+
+def _emit_tod_ones_table(a: Asm, label: str) -> None:
+    """Emit ones*10 table (10 bytes: 0, 10, 20, ... 90)."""
+    a.label(label)
+    for i in range(10):
+        a.emit(i * 10)
+
+
+def _emit_tod_read_current(a: Asm, min_ok_label: str, done_label: str) -> list[int]:
+    """Read CIA1 TOD -> $F0/$F1 (LE16, or $FFFF if minutes > 0).
+
+    Uses ``min_ok_label`` and ``done_label`` as unique labels so multiple
+    instances can coexist in one Asm buffer (callers supply fresh
+    names).  Returns ``[sec_lo_pos, sec_hi_pos, ones_pos]`` -- byte
+    offsets of the three ``LDA abs,X`` operand low-bytes, for
+    post-build patching against the sec_tab / ones_tab addresses.
+    """
+    a.emit(0xAD, _CIA1_TOD_HR & 0xFF, _CIA1_TOD_HR >> 8)    # latch
+    a.emit(0xAD, _CIA1_TOD_MIN & 0xFF, _CIA1_TOD_MIN >> 8)   # minutes
+    a.branch(0xF0, min_ok_label)
+    a.emit(0xAD, _CIA1_TOD_SEC & 0xFF, _CIA1_TOD_SEC >> 8)
+    a.emit(0xAD, _CIA1_TOD_TENTHS & 0xFF, _CIA1_TOD_TENTHS >> 8)
+    a.emit(0xA9, 0xFF, 0x85, _ZP_CUR_LO)
+    a.emit(0xA9, 0xFF, 0x85, _ZP_CUR_HI)
+    a.jmp(done_label)
+
+    a.label(min_ok_label)
+    a.emit(0xAD, _CIA1_TOD_SEC & 0xFF, _CIA1_TOD_SEC >> 8)
+    a.emit(0x85, _ZP_RAW)
+    a.emit(0x29, 0x0F)
+    a.emit(0x85, _ZP_ONES)
+    a.emit(0xA5, _ZP_RAW)
+    a.emit(0x4A)
+    a.emit(0x4A)
+    a.emit(0x4A)
+    a.emit(0x4A)
+    a.emit(0xAA)            # TAX
+
+    sec_lo_pos = a.pos + 1
+    a.emit(0xBD, 0x00, 0x00)   # LDA sec_tab_lo,X (patched)
+    a.emit(0x85, _ZP_CUR_LO)
+    sec_hi_pos = a.pos + 1
+    a.emit(0xBD, 0x00, 0x00)   # LDA sec_tab_hi,X (patched)
+    a.emit(0x85, _ZP_CUR_HI)
+
+    a.emit(0xA6, _ZP_ONES)
+    ones_pos = a.pos + 1
+    a.emit(0xBD, 0x00, 0x00)   # LDA ones_tab,X (patched)
+    a.emit(0x18)
+    a.emit(0x65, _ZP_CUR_LO)
+    a.emit(0x85, _ZP_CUR_LO)
+    a.emit(0x90, 0x02)
+    a.emit(0xE6, _ZP_CUR_HI)
+
+    a.emit(0xAD, _CIA1_TOD_TENTHS & 0xFF, _CIA1_TOD_TENTHS >> 8)
+    a.emit(0x29, 0x0F)
+    a.emit(0x18)
+    a.emit(0x65, _ZP_CUR_LO)
+    a.emit(0x85, _ZP_CUR_LO)
+    a.emit(0x90, 0x02)
+    a.emit(0xE6, _ZP_CUR_HI)
+
+    a.label(done_label)
+    return [sec_lo_pos, sec_hi_pos, ones_pos]
+
+
+def _emit_tod_poll_rxevent(
+    a: Asm,
+    got_label: str,
+    timeout_label: str,
+    min_ok_label: str,
+    done_label: str,
+    poll_label: str,
+) -> list[int]:
+    """Emit an inline poll loop: check CS8900a RxEvent, else check TOD.
+
+    Preconditions on entry: PPPtr already points at RxEvent (0x0124)
+    and TOD has been started at 00:00:00.0.  $F2/$F3 hold the deadline.
+
+    On frame available -> branch to ``got_label``.
+    On deadline elapsed -> ``JMP timeout_label`` (the caller does NOT
+    need to emit that jump themselves).
+
+    Returns ``[sec_lo_pos, sec_hi_pos, ones_pos]`` for post-build
+    abs,X operand patching.
+    """
+    a.label(poll_label)
+    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
+    a.emit(0x29, 0x01)
+    a.branch(0xD0, got_label)
+
+    patch = _emit_tod_read_current(a, min_ok_label, done_label)
+
+    # 16-bit compare: elapsed - deadline.  BCC -> still waiting.
+    a.emit(0xA5, _ZP_CUR_LO)
+    a.emit(0x38)
+    a.emit(0xE5, _ZP_DEADLINE_LO)
+    a.emit(0xA5, _ZP_CUR_HI)
+    a.emit(0xE5, _ZP_DEADLINE_HI)
+    a.branch(0x90, poll_label)
+
+    a.jmp(timeout_label)
+    return patch
+
+
+def _patch_tod_tables(
+    buf: bytearray,
+    sec_tab_addr: int,
+    ones_tab_addr: int,
+    patch_positions: list[int],
+) -> None:
+    """Patch the three ``LDA abs,X`` operand slots in ``buf``."""
+    sec_lo_pos, sec_hi_pos, ones_pos = patch_positions
+    buf[sec_lo_pos] = sec_tab_addr & 0xFF
+    buf[sec_lo_pos + 1] = (sec_tab_addr >> 8) & 0xFF
+    buf[sec_hi_pos] = (sec_tab_addr + 8) & 0xFF
+    buf[sec_hi_pos + 1] = ((sec_tab_addr + 8) >> 8) & 0xFF
+    buf[ones_pos] = ones_tab_addr & 0xFF
+    buf[ones_pos + 1] = (ones_tab_addr >> 8) & 0xFF
+
+
+def _validate_deadline_tenths(deadline_tenths: int) -> None:
+    if not (1 <= deadline_tenths <= _MAX_DEADLINE_TENTHS):
+        raise ValueError(
+            f"deadline_tenths must be in 1..{_MAX_DEADLINE_TENTHS} "
+            f"(got {deadline_tenths})"
+        )
+
+
+def build_rx_echo_reply_tod_code(
+    load_addr: int,
+    rx_buf: int,
+    result_addr: int,
+    expect_id: int,
+    expect_seq: int,
+    deadline_tenths: int = 50,
+) -> bytes:
+    """Shippable-application RX echo reply receiver with CIA1 TOD timeout.
+
+    Pure 6502: polls the CS8900a RX queue, drains incoming frames into
+    ``rx_buf``, matches the first IPv4/ICMP echo reply whose identifier
+    and sequence number equal ``expect_id`` / ``expect_seq`` (big-endian
+    on the wire).  Non-matching frames are drained and polling
+    continues against the same TOD deadline.
+
+    Writes ``0x01`` at ``result_addr`` on a match, ``0xFF`` on TOD
+    deadline expiry.  Runs standalone -- no host orchestration needed.
+    See :mod:`c64_test_harness.tod_timer` for the underlying poll
+    primitive and for the test-harness vs shippable-application
+    distinction.
+
+    Args:
+        load_addr: Where the routine will live in C64 memory.
+        rx_buf: RX frame buffer (at least 64 bytes).
+        result_addr: 1-byte status slot (0x01 success, 0xFF timeout).
+        expect_id: Expected ICMP identifier (16-bit, big-endian on wire).
+        expect_seq: Expected ICMP sequence number (16-bit, BE on wire).
+        deadline_tenths: Timeout in tenths-of-a-second (1..599).
+
+    Raises:
+        ValueError: if ``deadline_tenths`` is out of range.
+    """
+    _validate_deadline_tenths(deadline_tenths)
+    id_hi = (expect_id >> 8) & 0xFF
+    id_lo = expect_id & 0xFF
+    seq_hi = (expect_seq >> 8) & 0xFF
+    seq_lo = expect_seq & 0xFF
+
+    a = Asm(org=load_addr)
+    a.emit(0x78)  # SEI
+    _emit_clockport_enable(a)
+
+    _emit_tod_start_inline(a)
+    a.emit(0xA9, deadline_tenths & 0xFF, 0x85, _ZP_DEADLINE_LO)
+    a.emit(0xA9, (deadline_tenths >> 8) & 0xFF, 0x85, _ZP_DEADLINE_HI)
+
+    # PPPtr := 0x0124 (RxEvent)
+    a.emit(0xA9, 0x24, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
+    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
+
+    patch_positions = _emit_tod_poll_rxevent(
+        a,
+        got_label="got",
+        timeout_label="timeout",
+        min_ok_label="min_ok1",
+        done_label="tod_done1",
+        poll_label="poll_top",
+    )
+
+    a.label("got")
+    _emit_read_frame(a, rx_buf)
+
+    def chk(off: int, val: int, fail: str) -> None:
+        addr = rx_buf + off
+        a.emit(0xAD, addr & 0xFF, (addr >> 8) & 0xFF)
+        a.emit(0xC9, val & 0xFF)
+        a.branch(0xD0, fail)
+
+    chk(12, 0x08, "drop")
+    chk(13, 0x00, "drop")
+    chk(23, 0x01, "drop")
+    chk(34, 0x00, "drop")
+    chk(38, id_hi, "drop")
+    chk(39, id_lo, "drop")
+    chk(40, seq_hi, "drop")
+    chk(41, seq_lo, "drop")
+    a.jmp("success")
+
+    a.label("drop")
+    # re-point PPPtr (reading the frame moved it) + loop against same
+    # TOD deadline
+    a.emit(0xA9, 0x24, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
+    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
+    a.jmp("poll_top")
+
+    a.label("success")
+    a.emit(0xA9, 0x01, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
+    a.emit(0x58)
+    a.emit(0x60)
+
+    a.label("timeout")
+    a.emit(0xA9, 0xFF, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
+    a.emit(0x58)
+    a.emit(0x60)
+
+    _emit_tod_sec_table(a, "sec_tab")
+    _emit_tod_ones_table(a, "ones_tab")
+
+    raw = a.build()
+    sec_tab_addr = load_addr + a.labels["sec_tab"]
+    ones_tab_addr = load_addr + a.labels["ones_tab"]
+    buf = bytearray(raw)
+    _patch_tod_tables(buf, sec_tab_addr, ones_tab_addr, patch_positions)
+    return bytes(buf)
+
+
+def build_ping_and_wait_tod_code(
+    load_addr: int,
+    tx_frame_buf: int,
+    tx_frame_len: int,
+    rx_buf: int,
+    result_addr: int,
+    identifier: int,
+    sequence: int,
+    deadline_tenths: int = 50,
+) -> bytes:
+    """Shippable-application ping-and-wait with CIA1 TOD timeout.
+
+    Pure 6502 equivalent of :func:`build_ping_and_wait_code` but using
+    CIA1 Time-of-Day as the deadline source.  Runs standalone on real
+    C64 / U64E / VICE normal mode; **not** usable under VICE warp.
+
+    Steps:
+
+    1. Enable RR clockport; start CIA1 TOD at 00:00:00.0; store deadline.
+    2. TX the frame at ``tx_frame_buf`` (length ``tx_frame_len``).
+    3. Poll CS8900a RxEvent with TOD deadline.
+    4. Read the received frame into ``rx_buf``.
+    5. Verify ethertype=IPv4, IP protocol=ICMP, type=echo-reply,
+       identifier, sequence (all big-endian on the wire).
+    6. On match, store 0x01 at ``result_addr``.  On mismatch, drop the
+       frame and re-poll against the same TOD deadline.  On TOD expiry,
+       store 0xFF.
+
+    Args:
+        load_addr: Where the routine will live.
+        tx_frame_buf: Address of the pre-built echo request frame.
+        tx_frame_len: Frame length in bytes (<= 256).
+        rx_buf: RX buffer, at least 64 bytes.
+        result_addr: 1-byte status slot (0x01 success, 0xFF timeout).
+        identifier: Expected ICMP identifier (16-bit).
+        sequence: Expected ICMP sequence (16-bit).
+        deadline_tenths: Timeout in tenths-of-a-second (1..599).
+
+    Raises:
+        ValueError: if ``deadline_tenths`` is out of range.
+    """
+    _validate_deadline_tenths(deadline_tenths)
+    id_hi = (identifier >> 8) & 0xFF
+    id_lo = identifier & 0xFF
+    seq_hi = (sequence >> 8) & 0xFF
+    seq_lo = sequence & 0xFF
+
+    a = Asm(org=load_addr)
+    a.emit(0x78)  # SEI
+    _emit_clockport_enable(a)
+
+    _emit_tod_start_inline(a)
+    a.emit(0xA9, deadline_tenths & 0xFF, 0x85, _ZP_DEADLINE_LO)
+    a.emit(0xA9, (deadline_tenths >> 8) & 0xFF, 0x85, _ZP_DEADLINE_HI)
+
+    # --- TX the echo request (mirrors build_ping_and_wait_code) ---
+    a.emit(0xA9, 0xC0, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
+    a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
+    a.emit(0xA9, tx_frame_len & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
+    a.emit(0xA9, (tx_frame_len >> 8) & 0xFF, 0x8D, TXLEN_HI & 0xFF, TXLEN_HI >> 8)
+    a.emit(0xA9, 0x38, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
+    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
+    a.label("pw_txw")
+    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
+    a.emit(0x29, 0x01)
+    a.branch(0xF0, "pw_txw")
+    a.emit(0xA9, tx_frame_buf & 0xFF, 0x85, 0xFB)
+    a.emit(0xA9, (tx_frame_buf >> 8) & 0xFF, 0x85, 0xFC)
+    a.emit(0xA0, 0x00)
+    a.label("pw_txlp")
+    a.emit(0xB1, 0xFB)
+    a.emit(0x8D, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
+    a.emit(0xC8)
+    a.emit(0xB1, 0xFB)
+    a.emit(0x8D, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
+    a.emit(0xC8)
+    a.emit(0xC0, tx_frame_len & 0xFF)
+    a.branch(0xD0, "pw_txlp")
+
+    # --- Poll for reply with TOD deadline ---
+    a.emit(0xA9, 0x24, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
+    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
+
+    patch_positions = _emit_tod_poll_rxevent(
+        a,
+        got_label="got",
+        timeout_label="timeout",
+        min_ok_label="min_ok1",
+        done_label="tod_done1",
+        poll_label="poll_top",
+    )
+
+    a.label("got")
+    _emit_read_frame(a, rx_buf)
+
+    def chk(off: int, val: int, fail: str) -> None:
+        addr = rx_buf + off
+        a.emit(0xAD, addr & 0xFF, (addr >> 8) & 0xFF)
+        a.emit(0xC9, val & 0xFF)
+        a.branch(0xD0, fail)
+
+    chk(12, 0x08, "drop")
+    chk(13, 0x00, "drop")
+    chk(23, 0x01, "drop")
+    chk(34, 0x00, "drop")
+    chk(38, id_hi, "drop")
+    chk(39, id_lo, "drop")
+    chk(40, seq_hi, "drop")
+    chk(41, seq_lo, "drop")
+    a.jmp("success")
+
+    a.label("drop")
+    a.emit(0xA9, 0x24, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
+    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
+    a.jmp("poll_top")
+
+    a.label("success")
+    a.emit(0xA9, 0x01, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
+    a.emit(0x58)
+    a.emit(0x60)
+
+    a.label("timeout")
+    a.emit(0xA9, 0xFF, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
+    a.emit(0x58)
+    a.emit(0x60)
+
+    _emit_tod_sec_table(a, "sec_tab")
+    _emit_tod_ones_table(a, "ones_tab")
+
+    raw = a.build()
+    sec_tab_addr = load_addr + a.labels["sec_tab"]
+    ones_tab_addr = load_addr + a.labels["ones_tab"]
+    buf = bytearray(raw)
+    _patch_tod_tables(buf, sec_tab_addr, ones_tab_addr, patch_positions)
+    return bytes(buf)
+
+
+def build_icmp_responder_tod_code(
+    load_addr: int,
+    rx_buf: int,
+    my_ip: bytes,
+    result_addr: int,
+    deadline_tenths: int = 50,
+) -> bytes:
+    """Shippable-application ICMP responder with CIA1 TOD timeout.
+
+    Pure 6502 equivalent of :func:`build_icmp_responder_code`: polls
+    the CS8900a RX queue, receives one ICMP echo request addressed to
+    ``my_ip``, transforms it in place into an echo reply (swap MACs,
+    swap IPs, set ICMP type=0, patch checksum), and transmits it.  Uses
+    CIA1 Time-of-Day for the poll deadline.
+
+    Writes ``0x01`` at ``result_addr`` on successful reply TX, ``0xFF``
+    on TOD expiry.  Non-matching frames are drained and polling
+    continues against the same deadline.
+
+    Args:
+        load_addr: Where the routine will live.
+        rx_buf: RX frame buffer (at least 64 bytes).
+        my_ip: 4-byte IP address of this C64.
+        result_addr: 1-byte status slot.
+        deadline_tenths: Timeout in tenths-of-a-second (1..599).
+
+    Raises:
+        ValueError: if ``deadline_tenths`` is out of range.
+    """
+    _validate_deadline_tenths(deadline_tenths)
+    assert len(my_ip) == 4
+
+    a = Asm(org=load_addr)
+    a.emit(0x78)
+    _emit_clockport_enable(a)
+
+    _emit_tod_start_inline(a)
+    a.emit(0xA9, deadline_tenths & 0xFF, 0x85, _ZP_DEADLINE_LO)
+    a.emit(0xA9, (deadline_tenths >> 8) & 0xFF, 0x85, _ZP_DEADLINE_HI)
+
+    a.emit(0xA9, 0x24, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
+    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
+
+    patch_positions = _emit_tod_poll_rxevent(
+        a,
+        got_label="got",
+        timeout_label="timeout",
+        min_ok_label="min_ok1",
+        done_label="tod_done1",
+        poll_label="poll_top",
+    )
+
+    a.label("got")
+    _emit_read_frame(a, rx_buf)
+
+    def chk(off: int, val: int, fail: str) -> None:
+        addr = rx_buf + off
+        a.emit(0xAD, addr & 0xFF, (addr >> 8) & 0xFF)
+        a.emit(0xC9, val & 0xFF)
+        a.branch(0xD0, fail)
+
+    chk(12, 0x08, "drop")
+    chk(13, 0x00, "drop")
+    chk(23, 0x01, "drop")   # ICMP
+    chk(34, 0x08, "drop")   # type = echo request
+    chk(30, my_ip[0], "drop")
+    chk(31, my_ip[1], "drop")
+    chk(32, my_ip[2], "drop")
+    chk(33, my_ip[3], "drop")
+    a.jmp("transform")
+
+    a.label("drop")
+    a.emit(0xA9, 0x24, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
+    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
+    a.jmp("poll_top")
+
+    a.label("transform")
+    # Swap dest MAC [0..5] with src MAC [6..11]
+    for i in range(6):
+        dst = rx_buf + i
+        src = rx_buf + 6 + i
+        a.emit(0xAD, dst & 0xFF, (dst >> 8) & 0xFF)
+        a.emit(0xAE, src & 0xFF, (src >> 8) & 0xFF)
+        a.emit(0x8E, dst & 0xFF, (dst >> 8) & 0xFF)
+        a.emit(0x8D, src & 0xFF, (src >> 8) & 0xFF)
+
+    # Swap src IP [26..29] with dst IP [30..33]
+    for i in range(4):
+        dst = rx_buf + 26 + i
+        src = rx_buf + 30 + i
+        a.emit(0xAD, dst & 0xFF, (dst >> 8) & 0xFF)
+        a.emit(0xAE, src & 0xFF, (src >> 8) & 0xFF)
+        a.emit(0x8E, dst & 0xFF, (dst >> 8) & 0xFF)
+        a.emit(0x8D, src & 0xFF, (src >> 8) & 0xFF)
+
+    # ICMP type := 0
+    type_addr = rx_buf + 34
+    a.emit(0xA9, 0x00, 0x8D, type_addr & 0xFF, (type_addr >> 8) & 0xFF)
+
+    # ICMP checksum += 0x0008 (type went from 8 to 0)
+    ck_hi = rx_buf + 36
+    ck_lo = rx_buf + 37
+    a.emit(0xAD, ck_hi & 0xFF, (ck_hi >> 8) & 0xFF)
+    a.emit(0x18)
+    a.emit(0x69, 0x08)
+    a.emit(0x8D, ck_hi & 0xFF, (ck_hi >> 8) & 0xFF)
+    a.branch(0x90, "ck_done")
+    a.emit(0xAD, ck_lo & 0xFF, (ck_lo >> 8) & 0xFF)
+    a.emit(0x18)
+    a.emit(0x69, 0x01)
+    a.emit(0x8D, ck_lo & 0xFF, (ck_lo >> 8) & 0xFF)
+    a.label("ck_done")
+
+    # Wait TxRdy then TX _FIXED_RX_BYTES from rx_buf
+    a.emit(0xA9, 0xC0, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
+    a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
+    a.emit(0xA9, _FIXED_RX_BYTES & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
+    a.emit(0xA9, 0x00, 0x8D, TXLEN_HI & 0xFF, TXLEN_HI >> 8)
+    a.emit(0xA9, 0x38, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
+    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
+    a.label("tw2")
+    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
+    a.emit(0x29, 0x01)
+    a.branch(0xF0, "tw2")
+
+    a.emit(0xA9, rx_buf & 0xFF, 0x85, 0xFB)
+    a.emit(0xA9, (rx_buf >> 8) & 0xFF, 0x85, 0xFC)
+    a.emit(0xA0, 0x00)
+    a.label("txlp2")
+    a.emit(0xB1, 0xFB)
+    a.emit(0x8D, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
+    a.emit(0xC8)
+    a.emit(0xB1, 0xFB)
+    a.emit(0x8D, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
+    a.emit(0xC8)
+    a.emit(0xC0, _FIXED_RX_BYTES)
+    a.branch(0xD0, "txlp2")
+
+    a.emit(0xA9, 0x01, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
+    a.emit(0x58)
+    a.emit(0x60)
+
+    a.label("timeout")
+    a.emit(0xA9, 0xFF, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
+    a.emit(0x58)
+    a.emit(0x60)
+
+    _emit_tod_sec_table(a, "sec_tab")
+    _emit_tod_ones_table(a, "ones_tab")
+
+    raw = a.build()
+    sec_tab_addr = load_addr + a.labels["sec_tab"]
+    ones_tab_addr = load_addr + a.labels["ones_tab"]
+    buf = bytearray(raw)
+    _patch_tod_tables(buf, sec_tab_addr, ones_tab_addr, patch_positions)
+    return bytes(buf)
