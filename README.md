@@ -774,6 +774,8 @@ Additional scripts in `scripts/`:
 | `scripts/play_chromatic_u64.py` | Chromatic scale capture through 4 SID configs on U64 |
 | `scripts/setup-bridge-tap.sh` | Create bridge + 2 TAP interfaces for multi-VICE ethernet |
 | `scripts/teardown-bridge-tap.sh` | Tear down bridge + TAP interfaces |
+| `scripts/cleanup-bridge-networking.sh` | Emergency bridge recovery (scoped VICE kill + iptables/TAP teardown) |
+| `scripts/cleanup_vice_ports.py` | Port-range-scoped VICE killer (resolves PIDs via `/proc/net/tcp`, verifies `comm`, SIGTERM then SIGKILL — never `pkill`) |
 | `scripts/setup-tap-networking.sh` | Create single TAP interface with NAT for VICE ethernet |
 | `scripts/teardown-tap-networking.sh` | Tear down single TAP interface |
 | `scripts/validate_ping.py` | End-to-end ARP + ICMP ping through VICE CS8900a + TAP |
