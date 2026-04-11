@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
-# teardown-bridge-tap.sh — Remove bridge and TAP interfaces for inter-VICE ethernet testing.
+# Bridge networking teardown — reverses setup-bridge-tap.sh.
 #
-# Reverses setup-bridge-tap.sh.  Idempotent — safe to run if already torn down.
+# Symmetric with setup: touches only br-c64, tap-c64-{0,1}, the six
+# FORWARD iptables rules, and stale /tmp/vice_eth_*.rc temp files.
+# NEVER uses pkill by name; the happy-path VICE lifecycle is owned by
+# the Python harness (ViceProcess context manager).
+#
+# See docs/bridge_networking.md "Reference pattern for VICE agents" for
+# the canonical lifecycle and feedback_no_pkill.md for rationale.
+#
+# teardown-bridge-tap.sh — Remove bridge and TAP interfaces for inter-VICE
+# ethernet testing.  Idempotent — safe to run if already torn down.
 #
 # Usage:
 #   sudo ./scripts/teardown-bridge-tap.sh
@@ -42,6 +51,12 @@ if ip link show "$BRIDGE" &>/dev/null; then
 else
     echo "[ok] $BRIDGE already absent"
 fi
+
+# --- Stale vicerc temp files -------------------------------------------------
+# Remove stale VICE ethernet vicerc temp files. These are created by
+# ViceProcess when ethernet is enabled; a clean harness exit removes
+# them already, but teardown should be defensive.
+rm -f /tmp/vice_eth_*.rc 2>/dev/null || true
 
 echo
 echo "Done. Bridge and TAP interfaces torn down."
