@@ -250,6 +250,64 @@ def test_kill_vice_ports_quiet(world, capsys):
 
 
 # ---------------------------------------------------------------------------
+# Unprivileged silent-failure detection (x64sc file capabilities)
+# ---------------------------------------------------------------------------
+
+
+def test_silent_failure_detected_when_all_comm_reads_fail(monkeypatch, capsys):
+    """Listeners present but comm unreadable -> warn + return EXIT_UNVERIFIABLE."""
+    listeners = {6512: 11111, 6513: 22222}
+
+    def fake_get_listener_pid(port):
+        return listeners.get(port)
+
+    def fake_comm_of(pid):
+        return None  # EACCES for every PID (non-dumpable due to file caps)
+
+    monkeypatch.setattr(
+        cleanup_vice_ports, "get_listener_pid", fake_get_listener_pid
+    )
+    monkeypatch.setattr(cleanup_vice_ports, "comm_of", fake_comm_of)
+
+    rc = cleanup_vice_ports.kill_vice_ports([(6511, 6513)], grace=0.01)
+    assert rc == cleanup_vice_ports.EXIT_UNVERIFIABLE
+    captured = capsys.readouterr()
+    # Warning must be on stderr, not stdout.
+    assert "WARNING" in captured.err
+    assert "found 2 listener(s)" in captured.err
+    assert "sudo" in captured.err
+    # And the happy-path "no harness-bound" message must NOT appear.
+    assert "no harness-bound" not in captured.out
+
+
+def test_no_warning_when_some_comm_reads_succeed(world, capsys):
+    """If even one comm is readable, we are clearly privileged enough -- no warning."""
+    world.add(port=6512, pid=11111)  # comm readable, matches x64sc
+    # Second listener: pid exists but comm unreadable. Simulate by
+    # registering it as a listener without adding it to world.alive/comms
+    # via .add(); instead inject directly so comm_of returns None.
+    world.listeners[6513] = 22222
+    # (pid 22222 not in world.comms/alive -> comm_of returns None)
+
+    rc = cleanup_vice_ports.kill_vice_ports([(6511, 6513)], grace=0.1)
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "WARNING" not in captured.err
+    # The readable+matching PID got signaled.
+    killed = {pid for (pid, s) in world.signals_sent if s == signal.SIGTERM}
+    assert killed == {11111}
+
+
+def test_no_warning_when_no_listeners_at_all(world, capsys):
+    """Truly clean system -- should print the normal 'no listeners' line, not the EACCES warning."""
+    rc = cleanup_vice_ports.kill_vice_ports([(6511, 6513)], grace=0.01)
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "no harness-bound x64sc processes found" in captured.out
+    assert "WARNING" not in captured.err
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
