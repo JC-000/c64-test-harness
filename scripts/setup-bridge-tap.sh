@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
-# setup-bridge-tap.sh — Create a bridge with two TAP interfaces for inter-VICE ethernet testing.
+# Bridge networking setup — creates br-c64 + tap-c64-{0,1} for two-VICE
+# ethernet tests.  Paired with teardown-bridge-tap.sh (symmetric) and the
+# cleanup-bridge-networking.sh emergency recovery script.
 #
-# Creates a Linux bridge (br-c64) with two TAP devices (tap-c64-0, tap-c64-1)
-# so two VICE instances can communicate over emulated ethernet.  An IP address
-# is assigned to the bridge for optional host participation.
+# See docs/bridge_networking.md "Reference pattern for VICE agents" for
+# the canonical lifecycle and feedback_no_pkill.md for rationale.
+# Happy-path VICE lifecycle is owned by the Python harness — this script
+# NEVER touches VICE processes and NEVER uses pkill by name.
+#
+# setup-bridge-tap.sh — Create a bridge with two TAP interfaces for
+# inter-VICE ethernet testing.
+#
+# Creates a Linux bridge (br-c64) with two TAP devices (tap-c64-0,
+# tap-c64-1) so two VICE instances can communicate over emulated ethernet.
+# An IP address is assigned to the bridge for optional host participation.
 #
 # Must be run with sudo (or as root).  Idempotent — safe to run repeatedly.
 #
