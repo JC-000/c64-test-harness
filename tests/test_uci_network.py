@@ -306,15 +306,15 @@ class TestListenerStates:
 def _check_asm_basics(code: bytes) -> None:
     """Common checks for all assembly builders.
 
-    UCI routines end with a JMP-to-self park loop (not RTS) because they
-    are standalone programs that signal completion via a sentinel byte.
-    The last 3 bytes should be JMP $xxxx (0x4C lo hi).
+    UCI routines are dispatched via SYS + the keyboard buffer, so they
+    are JSR'd as subroutines by BASIC and must terminate with RTS (0x60)
+    to return control.
     """
     assert isinstance(code, bytes)
     assert len(code) > 0
-    # Must end with JMP park (0x4C) — these are standalone, not subroutines
-    assert code[-3] == 0x4C, (
-        f"Assembly routine must end with JMP park (0x4C), got 0x{code[-3]:02X}"
+    # Must end with RTS (0x60) — routines are dispatched via SYS
+    assert code[-1] == 0x60, (
+        f"Assembly routine must end with RTS (0x60), got 0x{code[-1]:02X}"
     )
 
 
@@ -496,6 +496,10 @@ _SENTINEL_DONE = 0x42
 def _make_mock_transport(result_byte: int = 0x01, resp_data: bytes = b"") -> MagicMock:
     """Build a mock transport that simulates _execute_uci_routine correctly.
 
+    Routines are dispatched via SYS + the keyboard buffer ($0277 / $00C6),
+    not via the IMAIN ($0302) vector patch, so this mock only needs to
+    answer sentinel, error, response, and status reads.
+
     *result_byte* is what read_memory returns for single-byte result reads.
     *resp_data* is what read_memory returns for the response data area.
     """
@@ -503,9 +507,6 @@ def _make_mock_transport(result_byte: int = 0x01, resp_data: bytes = b"") -> Mag
     call_count = {"sentinel_polls": 0}
 
     def mock_read_memory(addr: int, length: int) -> bytes:
-        if addr == 0x0302:
-            # IGONE vector — return original value
-            return b"\xAE\xA7"
         if addr == _SENTINEL_ADDR:
             # First poll returns 0, second returns sentinel done
             call_count["sentinel_polls"] += 1
@@ -686,7 +687,7 @@ class TestAllBuilders:
 
     def test_ends_with_rts(self, builder) -> None:
         code = builder()
-        assert code[-3] == 0x4C, f"{builder.__name__} must end with JMP park"
+        assert code[-1] == 0x60, f"{builder.__name__} must end with RTS"
 
     def test_references_at_least_one_uci_register(self, builder) -> None:
         """Every UCI routine must reference at least one UCI I/O register."""
@@ -878,9 +879,9 @@ class TestBuildTcpConnectTurboSafe:
             f"expected >= 10 fences, got {_count_fences(fenced)}"
         )
 
-    def test_ends_with_park(self) -> None:
+    def test_ends_with_rts(self) -> None:
         fenced = build_tcp_connect(turbo_safe=True)
-        assert fenced[-3] == 0x4C  # JMP park
+        assert fenced[-1] == 0x60  # RTS
 
 
 class TestBuildSocketReadTurboSafe:
@@ -890,8 +891,8 @@ class TestBuildSocketReadTurboSafe:
     def test_turbo_safe_has_fences(self) -> None:
         assert _count_fences(build_socket_read(turbo_safe=True)) >= 8
 
-    def test_ends_with_park(self) -> None:
-        assert build_socket_read(turbo_safe=True)[-3] == 0x4C
+    def test_ends_with_rts(self) -> None:
+        assert build_socket_read(turbo_safe=True)[-1] == 0x60
 
 
 class TestBuildSocketWriteTurboSafe:
@@ -901,8 +902,8 @@ class TestBuildSocketWriteTurboSafe:
     def test_turbo_safe_has_fences(self) -> None:
         assert _count_fences(build_socket_write(turbo_safe=True)) >= 8
 
-    def test_ends_with_park(self) -> None:
-        assert build_socket_write(turbo_safe=True)[-3] == 0x4C
+    def test_ends_with_rts(self) -> None:
+        assert build_socket_write(turbo_safe=True)[-1] == 0x60
 
 
 class TestBuildSocketCloseTurboSafe:
@@ -971,10 +972,10 @@ class TestTurboSafeInvariants:
 
     @pytest.mark.parametrize("name, builder, kwargs", BUILDERS,
                               ids=lambda x: x if isinstance(x, str) else "")
-    def test_turbo_safe_ends_with_park(self, name, builder, kwargs) -> None:
+    def test_turbo_safe_ends_with_rts(self, name, builder, kwargs) -> None:
         del name
         code = builder(turbo_safe=True, **kwargs)
-        assert code[-3] == 0x4C, "turbo-safe routine must end with JMP park"
+        assert code[-1] == 0x60, "turbo-safe routine must end with RTS"
 
     @pytest.mark.parametrize("name, builder, kwargs", BUILDERS,
                               ids=lambda x: x if isinstance(x, str) else "")
