@@ -759,6 +759,20 @@ uci_socket_close(transport, sock_id)
 
 The module also supports UDP sockets (`uci_udp_connect`), TCP listeners (`uci_tcp_listen_start`/`uci_tcp_listen_state`/`uci_tcp_listen_socket`/`uci_tcp_listen_stop`), and low-level assembly builders (`build_uci_probe`, `build_tcp_connect`, etc.) for custom 6502 routines. DNS resolution is handled by the firmware — hostnames work directly.
 
+### UCI at U64 turbo speeds (`turbo_safe=True`)
+
+On real Ultimate 64 Elite hardware the FPGA behind `$DF1C`-`$DF1F` needs ~38 µs of wall-clock settling time between consecutive register accesses. At 1 MHz the 6502 bus cycle is naturally slow enough; at turbo speeds (4/8/16/24/48 MHz) the CPU outruns the FPGA and UCI corrupts. Every builder and helper accepts an opt-in `turbo_safe: bool = False` keyword that emits a nested delay-loop fence (~52 µs at 48 MHz) after each UCI access. When you switch the U64 into turbo mode (`set_turbo_mhz(client, 48)`), pass `turbo_safe=True` to every UCI call:
+
+```python
+from c64_test_harness.backends.ultimate64_helpers import set_turbo_mhz
+
+set_turbo_mhz(client, 48)
+ident = uci_probe(transport, turbo_safe=True)   # 0xC9 at 48 MHz
+sock  = uci_tcp_connect(transport, "example.com", 80, turbo_safe=True)
+```
+
+At 1 MHz the default (`turbo_safe=False`) path is strictly faster and just as correct. See [`docs/uci_networking.md`](docs/uci_networking.md) for the full fence design, tuning constants (`UCI_FENCE_OUTER`, `UCI_FENCE_INNER`, `UCI_PUSH_SETTLE_ITERS`), and the c64-https reference implementation this was ported from.
+
 ## Architecture
 
 ```

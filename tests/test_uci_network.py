@@ -17,6 +17,10 @@ from c64_test_harness.uci_network import (
     UCI_CMD_DATA_REG,
     UCI_RESP_DATA_REG,
     UCI_STATUS_DATA_REG,
+    # Turbo-safety fence tuning
+    UCI_FENCE_OUTER,
+    UCI_FENCE_INNER,
+    UCI_PUSH_SETTLE_ITERS,
     # Target IDs
     TARGET_DOS1,
     TARGET_DOS2,
@@ -778,3 +782,276 @@ class TestDisableUci:
             for c in client.method_calls
             if c[0] != "set_config_items"
         )
+
+
+# ---------------------------------------------------------------------------
+# Turbo-safe fencing — required for UCI access at U64 turbo speeds (8/24/48
+# MHz). Ported from the c64-https `fix/uci-nop-fencing` PR. The fence is a
+# nested delay-loop (~52 us at 48 MHz) inserted after every read/write of
+# a UCI register.
+# ---------------------------------------------------------------------------
+
+def _fence_byte_signature() -> bytes:
+    """The canonical fence byte pattern: PHA, TXA, PHA, LDX #OUTER,
+    LDY #INNER. We search for this 7-byte prefix to count fence sites.
+    """
+    return bytes([
+        0x48,                # PHA
+        0x8A,                # TXA
+        0x48,                # PHA
+        0xA2, UCI_FENCE_OUTER,  # LDX #OUTER
+        0xA0, UCI_FENCE_INNER,  # LDY #INNER
+    ])
+
+
+def _count_fences(code: bytes) -> int:
+    sig = _fence_byte_signature()
+    count = 0
+    i = 0
+    while i <= len(code) - len(sig):
+        if code[i:i + len(sig)] == sig:
+            count += 1
+            i += len(sig)
+        else:
+            i += 1
+    return count
+
+
+class TestFenceTuning:
+    """Fence parameters must match the c64-https reference implementation."""
+
+    def test_outer_is_5(self) -> None:
+        assert UCI_FENCE_OUTER == 5
+
+    def test_inner_is_100(self) -> None:
+        assert UCI_FENCE_INNER == 100
+
+    def test_push_settle_is_255(self) -> None:
+        """Settle delay before first CMD_BUSY poll after PUSH_CMD."""
+        assert UCI_PUSH_SETTLE_ITERS == 0xFF
+
+    def test_outer_inner_yield_38us_minimum(self) -> None:
+        """OUTER * (INNER * 5 + 5) must give at least 38 us at 48 MHz.
+
+        c64-https empirical minimum: OUTER=3 INNER=122 (~1845 cycles).
+        Ours (OUTER=5 INNER=100) should comfortably exceed that.
+        """
+        cycles = UCI_FENCE_OUTER * (UCI_FENCE_INNER * 5 + 5)
+        # 48 MHz → 1 cycle = ~20.8 ns → 1845 cycles = ~38.4 us
+        min_cycles = 1845
+        assert cycles >= min_cycles, (
+            f"Fence is {cycles} cycles, minimum is {min_cycles}"
+        )
+
+
+class TestBuildUciProbeTurboSafe:
+    """``build_uci_probe(turbo_safe=True)`` must fence after the LDA $DF1D."""
+
+    def test_turbo_safe_is_larger(self) -> None:
+        plain = build_uci_probe()
+        fenced = build_uci_probe(turbo_safe=True)
+        assert len(fenced) > len(plain)
+
+    def test_turbo_safe_contains_fence(self) -> None:
+        fenced = build_uci_probe(turbo_safe=True)
+        assert _count_fences(fenced) >= 1
+
+    def test_plain_contains_no_fence(self) -> None:
+        plain = build_uci_probe()
+        assert _count_fences(plain) == 0
+
+
+class TestBuildTcpConnectTurboSafe:
+    """TCP_CONNECT is the most fence-dense builder — lots of UCI writes."""
+
+    def test_turbo_safe_is_larger(self) -> None:
+        plain = build_tcp_connect()
+        fenced = build_tcp_connect(turbo_safe=True)
+        assert len(fenced) > len(plain)
+
+    def test_turbo_safe_has_many_fences(self) -> None:
+        """At minimum one fence per UCI register access: TARGET, CMD, port_lo,
+        port_hi, hostname bytes, PUSH_CMD, etc.  Expect at least ~10.
+        """
+        fenced = build_tcp_connect(turbo_safe=True)
+        assert _count_fences(fenced) >= 10, (
+            f"expected >= 10 fences, got {_count_fences(fenced)}"
+        )
+
+    def test_ends_with_park(self) -> None:
+        fenced = build_tcp_connect(turbo_safe=True)
+        assert fenced[-3] == 0x4C  # JMP park
+
+
+class TestBuildSocketReadTurboSafe:
+    def test_turbo_safe_is_larger(self) -> None:
+        assert len(build_socket_read(turbo_safe=True)) > len(build_socket_read())
+
+    def test_turbo_safe_has_fences(self) -> None:
+        assert _count_fences(build_socket_read(turbo_safe=True)) >= 8
+
+    def test_ends_with_park(self) -> None:
+        assert build_socket_read(turbo_safe=True)[-3] == 0x4C
+
+
+class TestBuildSocketWriteTurboSafe:
+    def test_turbo_safe_is_larger(self) -> None:
+        assert len(build_socket_write(turbo_safe=True)) > len(build_socket_write())
+
+    def test_turbo_safe_has_fences(self) -> None:
+        assert _count_fences(build_socket_write(turbo_safe=True)) >= 8
+
+    def test_ends_with_park(self) -> None:
+        assert build_socket_write(turbo_safe=True)[-3] == 0x4C
+
+
+class TestBuildSocketCloseTurboSafe:
+    def test_turbo_safe_is_larger(self) -> None:
+        assert len(build_socket_close(turbo_safe=True)) > len(build_socket_close())
+
+    def test_turbo_safe_has_fences(self) -> None:
+        assert _count_fences(build_socket_close(turbo_safe=True)) >= 5
+
+
+class TestBuildUciCommandTurboSafe:
+    def test_turbo_safe_is_larger(self) -> None:
+        plain = build_uci_command(TARGET_NETWORK, NET_CMD_GET_INTERFACE_COUNT)
+        fenced = build_uci_command(
+            TARGET_NETWORK, NET_CMD_GET_INTERFACE_COUNT, turbo_safe=True,
+        )
+        assert len(fenced) > len(plain)
+
+    def test_turbo_safe_has_fences(self) -> None:
+        fenced = build_uci_command(
+            TARGET_NETWORK, NET_CMD_GET_INTERFACE_COUNT, turbo_safe=True,
+        )
+        assert _count_fences(fenced) >= 6
+
+    def test_params_fenced(self) -> None:
+        """Each parameter byte written to $DF1D gets its own fence."""
+        empty = build_uci_command(
+            TARGET_NETWORK, NET_CMD_GET_IPADDR, params=b"", turbo_safe=True,
+        )
+        with_one = build_uci_command(
+            TARGET_NETWORK, NET_CMD_GET_IPADDR,
+            params=bytes([0x00]), turbo_safe=True,
+        )
+        # one extra param byte → one extra LDA/STA + one extra fence
+        assert _count_fences(with_one) > _count_fences(empty)
+
+    def test_default_is_1mhz_path(self) -> None:
+        """turbo_safe must default to False so existing callers are unchanged."""
+        default = build_uci_command(TARGET_NETWORK, NET_CMD_GET_INTERFACE_COUNT)
+        explicit = build_uci_command(
+            TARGET_NETWORK, NET_CMD_GET_INTERFACE_COUNT, turbo_safe=False,
+        )
+        assert default == explicit
+        assert _count_fences(default) == 0
+
+
+class TestBuildGetIpTurboSafe:
+    def test_turbo_safe_larger_and_fenced(self) -> None:
+        fenced = build_get_ip(turbo_safe=True)
+        plain = build_get_ip()
+        assert len(fenced) > len(plain)
+        assert _count_fences(fenced) >= 6
+
+
+class TestTurboSafeInvariants:
+    """Cross-cutting invariants that every turbo-safe builder must satisfy."""
+
+    BUILDERS = [
+        ("build_uci_probe", build_uci_probe, {}),
+        ("build_get_ip", build_get_ip, {}),
+        ("build_tcp_connect", build_tcp_connect, {}),
+        ("build_socket_read", build_socket_read, {}),
+        ("build_socket_write", build_socket_write, {}),
+        ("build_socket_close", build_socket_close, {}),
+    ]
+
+    @pytest.mark.parametrize("name, builder, kwargs", BUILDERS,
+                              ids=lambda x: x if isinstance(x, str) else "")
+    def test_turbo_safe_ends_with_park(self, name, builder, kwargs) -> None:
+        del name
+        code = builder(turbo_safe=True, **kwargs)
+        assert code[-3] == 0x4C, "turbo-safe routine must end with JMP park"
+
+    @pytest.mark.parametrize("name, builder, kwargs", BUILDERS,
+                              ids=lambda x: x if isinstance(x, str) else "")
+    def test_turbo_safe_references_uci_register(
+        self, name, builder, kwargs,
+    ) -> None:
+        del name
+        code = builder(turbo_safe=True, **kwargs)
+        uci_regs = [
+            UCI_CONTROL_STATUS_REG, UCI_CMD_DATA_REG,
+            UCI_RESP_DATA_REG, UCI_STATUS_DATA_REG,
+        ]
+        assert any(_contains_io_addr(code, reg) for reg in uci_regs)
+
+    @pytest.mark.parametrize("name, builder, kwargs", BUILDERS,
+                              ids=lambda x: x if isinstance(x, str) else "")
+    def test_plain_and_turbo_safe_differ(self, name, builder, kwargs) -> None:
+        del name
+        plain = builder(**kwargs)
+        fenced = builder(turbo_safe=True, **kwargs)
+        assert plain != fenced
+
+
+class TestTurboSafeHelpers:
+    """High-level helpers accept ``turbo_safe`` and pipe it into the builder."""
+
+    def test_uci_probe_accepts_turbo_safe(self) -> None:
+        t = _make_mock_transport(result_byte=0xC9)
+        uci_probe(t, timeout=1.0, turbo_safe=True)
+        # Code writes should include a fence signature (see _fence_byte_signature).
+        all_writes = b"".join(
+            c.args[1] for c in t.write_memory.call_args_list
+            if len(c.args) > 1 and isinstance(c.args[1], (bytes, bytearray))
+        )
+        assert _fence_byte_signature() in all_writes
+
+    def test_uci_get_ip_accepts_turbo_safe(self) -> None:
+        t = _make_mock_transport(resp_data=b"10.0.0.1")
+        uci_get_ip(t, timeout=1.0, turbo_safe=True)
+        all_writes = b"".join(
+            c.args[1] for c in t.write_memory.call_args_list
+            if len(c.args) > 1 and isinstance(c.args[1], (bytes, bytearray))
+        )
+        assert _fence_byte_signature() in all_writes
+
+    def test_uci_tcp_connect_accepts_turbo_safe(self) -> None:
+        t = _make_mock_transport(result_byte=0x05)
+        uci_tcp_connect(t, "example.com", 80, timeout=1.0, turbo_safe=True)
+        all_writes = b"".join(
+            c.args[1] for c in t.write_memory.call_args_list
+            if len(c.args) > 1 and isinstance(c.args[1], (bytes, bytearray))
+        )
+        assert _fence_byte_signature() in all_writes
+
+    def test_uci_socket_read_accepts_turbo_safe(self) -> None:
+        t = _make_mock_transport(resp_data=b"hi")
+        uci_socket_read(t, 1, 4, timeout=1.0, turbo_safe=True)
+        all_writes = b"".join(
+            c.args[1] for c in t.write_memory.call_args_list
+            if len(c.args) > 1 and isinstance(c.args[1], (bytes, bytearray))
+        )
+        assert _fence_byte_signature() in all_writes
+
+    def test_uci_socket_write_accepts_turbo_safe(self) -> None:
+        t = _make_mock_transport()
+        uci_socket_write(t, 1, b"data", timeout=1.0, turbo_safe=True)
+        all_writes = b"".join(
+            c.args[1] for c in t.write_memory.call_args_list
+            if len(c.args) > 1 and isinstance(c.args[1], (bytes, bytearray))
+        )
+        assert _fence_byte_signature() in all_writes
+
+    def test_uci_socket_close_accepts_turbo_safe(self) -> None:
+        t = _make_mock_transport()
+        uci_socket_close(t, 1, timeout=1.0, turbo_safe=True)
+        all_writes = b"".join(
+            c.args[1] for c in t.write_memory.call_args_list
+            if len(c.args) > 1 and isinstance(c.args[1], (bytes, bytearray))
+        )
+        assert _fence_byte_signature() in all_writes
