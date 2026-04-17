@@ -268,6 +268,57 @@ def test_write_mem_uses_hex_data_query_param():
     assert "data=DEADBEEF" in url
 
 
+def test_write_mem_small_payload_at_threshold_uses_put_query():
+    """Exactly WRITE_MEM_QUERY_THRESHOLD bytes still takes the legacy PUT path."""
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    payload = bytes(range(Ultimate64Client.WRITE_MEM_QUERY_THRESHOLD))
+    with patch("urllib.request.urlopen", mock):
+        c.write_mem(0x0400, payload)
+    req = captured[0][0]
+    assert req.get_method() == "PUT"
+    assert req.data is None
+    url = req.get_full_url()
+    assert "address=0x0400" in url
+    assert f"data={payload.hex().upper()}" in url
+
+
+def test_write_mem_large_payload_uses_post_with_body():
+    """Payloads over the threshold switch to POST with raw-byte body.
+
+    This is required because the device caps the ``data=`` query param
+    at 128 hex chars; the error is
+    ``"Maximum length of 128 bytes exceeded. Consider using POST method
+    with attachment."``.
+    """
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    payload = bytes(range(200))  # well past threshold
+    with patch("urllib.request.urlopen", mock):
+        c.write_mem(0xC000, payload)
+    req = captured[0][0]
+    assert req.get_method() == "POST"
+    # Raw bytes in HTTP body, not hex-encoded in query.
+    assert req.data == payload
+    assert req.get_header("Content-type") == "application/octet-stream"
+    url = req.get_full_url()
+    assert "address=0xC000" in url
+    # No data= query string in POST form.
+    assert "data=" not in url
+
+
+def test_write_mem_just_above_threshold_uses_post():
+    """One byte past the threshold crosses into POST territory."""
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    payload = bytes(range(Ultimate64Client.WRITE_MEM_QUERY_THRESHOLD + 1))
+    with patch("urllib.request.urlopen", mock):
+        c.write_mem(0x1000, payload)
+    req = captured[0][0]
+    assert req.get_method() == "POST"
+    assert req.data == payload
+
+
 def test_write_mem_empty_is_noop():
     mock, captured = _capture(b"")
     c = Ultimate64Client("h")
