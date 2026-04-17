@@ -11,6 +11,14 @@ on the U64 that:
 
 Usage:
     U64_HOST=192.168.1.81 python3 scripts/test_uci_tcp_echo.py
+
+Note on CPU speed:
+    This script hand-writes its own 6502 routine (not via the uci_network
+    builders) and is NOT turbo-safe. It runs the U64 at stock 1 MHz so
+    the FPGA behind $DF1C-$DF1F naturally settles between accesses. For
+    UCI code that works at U64 turbo speeds (4/8/16/24/48 MHz), use the
+    builders in c64_test_harness.uci_network with turbo_safe=True --
+    see docs/uci_networking.md.
 """
 from __future__ import annotations
 
