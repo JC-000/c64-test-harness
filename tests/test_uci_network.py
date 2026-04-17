@@ -957,6 +957,88 @@ class TestBuildGetIpTurboSafe:
         assert len(fenced) > len(plain)
         assert _count_fences(fenced) >= 6
 
+    def test_turbo_safe_contains_data_av_spin_wait(self) -> None:
+        """Regression: at turbo speeds the FPGA may not have staged response
+        data by the time the CPU polls ``DATA_AV``. Without a per-byte
+        spin-wait the read loop exits with 0 bytes and ``uci_get_ip``
+        returns the empty string at 8/24/48 MHz. Ported from c64-https's
+        ``uci_read_resp_bytes`` (src/net/uci/uci_cmd.s) which spins up to
+        16 bits × ~110 cycles ≈ 150 ms at 48 MHz before giving up.
+
+        We detect the spin-wait by its signature sequence:
+
+            DEC  $C3F5       ; decrement ctr_hi
+            BEQ  $03         ; jump forward past JMP (timeout path)
+            JMP  ...         ; back to wait
+
+        which appears at every byte-read iteration in the fenced builder
+        but is absent from both the 1 MHz path and the pre-fix turbo path.
+        """
+        from c64_test_harness.uci_network import _UCI_WAIT_CTR_HI_ADDR
+        code = build_get_ip(turbo_safe=True)
+        sig = bytes([
+            0xCE,                                           # DEC abs
+            _UCI_WAIT_CTR_HI_ADDR & 0xFF,
+            (_UCI_WAIT_CTR_HI_ADDR >> 8) & 0xFF,
+            0xF0, 0x03,                                     # BEQ +3 → past JMP
+            0x4C,                                           # JMP abs
+        ])
+        assert sig in code, (
+            "build_get_ip(turbo_safe=True) must emit the per-byte DATA_AV "
+            "spin-wait — without it the first DATA_AV check fails at turbo "
+            "speeds and uci_get_ip returns empty string."
+        )
+
+    def test_plain_does_not_contain_spin_wait(self) -> None:
+        """The 1 MHz path keeps the original single-shot DATA_AV check —
+        it works there because the CPU is slow enough to outwait the FPGA."""
+        from c64_test_harness.uci_network import _UCI_WAIT_CTR_HI_ADDR
+        code = build_get_ip()
+        sig = bytes([
+            0xCE,
+            _UCI_WAIT_CTR_HI_ADDR & 0xFF,
+            (_UCI_WAIT_CTR_HI_ADDR >> 8) & 0xFF,
+        ])
+        assert sig not in code
+
+    def test_turbo_safe_bne_have_lands_on_ldx_save_x(self) -> None:
+        """The BNE that skips the timeout/decrement block must land on the
+        ``LDX save_x`` that restores the caller's X. If the offset is off
+        the read loop silently corrupts X and (depending on what the JMP
+        target happens to decode as) may crash. We check this explicitly
+        because the offset is computed from emitted length at build time.
+        """
+        from c64_test_harness.uci_network import (
+            _UCI_WAIT_SAVE_X_ADDR,
+            BIT_DATA_AV,
+        )
+        code = build_get_ip(turbo_safe=True)
+        ldx_save_sig = bytes([
+            0xAE,
+            _UCI_WAIT_SAVE_X_ADDR & 0xFF,
+            (_UCI_WAIT_SAVE_X_ADDR >> 8) & 0xFF,
+        ])
+        # Look for: AND #$80 (0x29, 0x80), BNE offset, DEX (0xCA) — the
+        # response-reader wait loop. Verify BNE target is LDX save_x.
+        found = 0
+        for i in range(len(code) - 4):
+            if (code[i] == 0x29 and code[i + 1] == BIT_DATA_AV
+                    and code[i + 2] == 0xD0  # BNE
+                    and code[i + 4] == 0xCA):  # DEX
+                # Compute signed 8-bit offset; target is (i+4) + offset
+                off = code[i + 3]
+                if off >= 0x80:
+                    off -= 0x100
+                target = i + 4 + off
+                assert 0 <= target <= len(code) - 3
+                assert code[target:target + 3] == ldx_save_sig, (
+                    f"BNE have at offset {i} jumps to "
+                    f"{code[target:target + 3].hex()}, expected "
+                    f"{ldx_save_sig.hex()}"
+                )
+                found += 1
+        assert found >= 1, "No response-reader BNE-to-have pattern found"
+
 
 class TestTurboSafeInvariants:
     """Cross-cutting invariants that every turbo-safe builder must satisfy."""

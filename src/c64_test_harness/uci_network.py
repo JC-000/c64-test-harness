@@ -182,6 +182,8 @@ _LDA_ABS_Y = 0xB9
 _STA_ABS_Y = 0x99
 _PHA     = 0x48
 _PLA     = 0x68
+_DEC_ABS = 0xCE  # DEC abs — used by turbo-safe data-available spin-wait
+_STX_ABS = 0x8E  # STX abs — used by turbo-safe data-available spin-wait
 _RTS = 0x60  # 6502 RTS opcode — used to end UCI routines dispatched via SYS.
 
 # ---------------------------------------------------------------------------
@@ -193,6 +195,12 @@ _RESP_ADDR     = 0xC200   # response data from UCI
 _STATUS_ADDR   = 0xC300   # status string from UCI
 _RESP_LEN_ADDR = 0xC3F0   # 2-byte LE response length
 _STAT_LEN_ADDR = 0xC3F2   # 2-byte LE status length
+# Scratch slots used by the turbo-safe response/status spin-wait: save_x is
+# the X preserved across the 16-bit iteration counter, ctr_hi is the high
+# byte of the counter. Located in the unused gap between _STAT_LEN_ADDR and
+# _SENTINEL_ADDR.
+_UCI_WAIT_SAVE_X_ADDR = 0xC3F4
+_UCI_WAIT_CTR_HI_ADDR = 0xC3F5
 _SENTINEL_ADDR = 0xC3FE   # completion sentinel
 _ERROR_ADDR    = 0xC3FF   # error flag
 
@@ -541,8 +549,18 @@ def _build_read_response_tsx(
     resp_len_addr: int,
     fence: bool = True,
 ) -> list[int]:
-    """Turbo-safe ``_build_read_response`` — fence every UCI read/write,
-    use JMP back for the main loop.
+    """Turbo-safe ``_build_read_response`` — fence every UCI read/write
+    AND spin-wait on ``DATA_AV`` for up to ~150 ms per byte at 48 MHz.
+
+    The critical difference vs the 1 MHz path: at turbo speeds the FPGA may
+    not have staged the response data by the time the CPU polls
+    ``DATA_AV``. A single ``LDA $DF1C; AND #$80; BEQ done`` check exits
+    immediately with zero bytes, leaving ``resp_len`` = 0 and returning
+    the empty string from ``uci_get_ip``. Ported from c64-https's
+    ``uci_read_resp_bytes`` (src/net/uci/uci_cmd.s) which uses a 16-bit
+    spin-wait at the top of every byte-read iteration — ~65536 outer
+    iterations, each ~110 cycles at 48 MHz ≈ 150 ms worst case — so the
+    CPU tolerates slow FPGA response without bailing early.
 
     Layout::
 
@@ -550,14 +568,27 @@ def _build_read_response_tsx(
         STA  resp_len_lo
         STA  resp_len_hi
     loop (pc_loop):
+        STX  save_x              ; preserve caller's X
+        LDX  #$00
+        STX  ctr_hi              ; 16-bit counter = 65536
+        LDX  #$00
+    wait (pc_wait):
         LDA  $DF1C
         <fence>
         AND  #BIT_DATA_AV
-        BEQ  done_trampoline
-        JMP  read
-    done_trampoline:
-        JMP  done
-    read:
+        BNE  have                ; short forward branch, skip trampoline block
+        DEX
+        BEQ  dec_hi
+        JMP  wait
+    dec_hi:
+        DEC  ctr_hi
+        BEQ  timeout
+        JMP  wait
+    timeout:
+        LDX  save_x
+        JMP  done                ; bail with whatever we've accumulated
+    have:
+        LDX  save_x
         LDA  $DF1E
         <fence>
         STA  resp_addr,Y
@@ -577,25 +608,62 @@ def _build_read_response_tsx(
                 _hi(resp_len_addr + 1)])
 
     loop_abs = pc + len(out)
+    # --- 16-bit DATA_AV spin-wait init ---
+    # STX save_x
+    out.extend([_STX_ABS, _lo(_UCI_WAIT_SAVE_X_ADDR),
+                _hi(_UCI_WAIT_SAVE_X_ADDR)])
+    # LDX #0; STX ctr_hi; LDX #0  (inner counter starts at 0 → 256 iters)
+    out.extend([_LDX_IMM, 0x00])
+    out.extend([_STX_ABS, _lo(_UCI_WAIT_CTR_HI_ADDR),
+                _hi(_UCI_WAIT_CTR_HI_ADDR)])
+    out.extend([_LDX_IMM, 0x00])
+
+    wait_abs = pc + len(out)
     # LDA $DF1C
     out.extend([_LDA_ABS, _lo(UCI_CONTROL_STATUS_REG),
                 _hi(UCI_CONTROL_STATUS_REG)])
     if fence:
         out.extend(_build_fence())
     out.extend([_AND_IMM, BIT_DATA_AV])
-    # BEQ done_trampoline (3 bytes ahead — skip the "JMP read" trampoline)
-    out.extend([_BEQ, 0x03])
-    # JMP read  (will patch target after we know where read is)
-    jmp_read_pos = len(out)
-    out.extend([_JMP_ABS, 0x00, 0x00])  # placeholder
-    # done_trampoline: JMP done (placeholder, patched at end)
-    jmp_done_pos = len(out)
-    out.extend([_JMP_ABS, 0x00, 0x00])  # placeholder
+    # BNE have — short forward branch to the "we have a byte" block.
+    # Distance from the byte after BNE to `have` label:
+    #   DEX(1) + BEQ(2) + JMP(3) + DEC(3) + BEQ(2) + JMP(3) + LDX(3) + JMP(3)
+    # = 20 bytes. Well within short-branch range.
+    bne_have_pos = len(out)
+    out.extend([_BNE, 0x00])  # placeholder, patched below
 
-    # read:
-    read_abs = pc + len(out)
-    out[jmp_read_pos + 1] = _lo(read_abs)
-    out[jmp_read_pos + 2] = _hi(read_abs)
+    # DEX
+    out.append(_DEX)
+    # BEQ dec_hi — skip the JMP wait (3 bytes)
+    out.extend([_BEQ, 0x03])
+    # JMP wait
+    out.extend([_JMP_ABS, _lo(wait_abs), _hi(wait_abs)])
+
+    # dec_hi: DEC ctr_hi
+    out.extend([_DEC_ABS, _lo(_UCI_WAIT_CTR_HI_ADDR),
+                _hi(_UCI_WAIT_CTR_HI_ADDR)])
+    # BEQ timeout — skip the JMP wait (3 bytes)
+    out.extend([_BEQ, 0x03])
+    # JMP wait
+    out.extend([_JMP_ABS, _lo(wait_abs), _hi(wait_abs)])
+
+    # timeout: LDX save_x; JMP done
+    out.extend([0xAE, _lo(_UCI_WAIT_SAVE_X_ADDR),
+                _hi(_UCI_WAIT_SAVE_X_ADDR)])  # LDX abs
+    jmp_done_pos = len(out)
+    out.extend([_JMP_ABS, 0x00, 0x00])  # placeholder — patched at end
+
+    # have: LDX save_x
+    have_abs = pc + len(out)
+    bne_have_target = have_abs
+    # Patch BNE offset (short branch: target - (bne_pos + 2))
+    branch_distance = bne_have_target - (pc + bne_have_pos + 2)
+    assert -128 <= branch_distance <= 127, (
+        f"BNE have distance out of short-branch range: {branch_distance}"
+    )
+    out[bne_have_pos + 1] = branch_distance & 0xFF
+    out.extend([0xAE, _lo(_UCI_WAIT_SAVE_X_ADDR),
+                _hi(_UCI_WAIT_SAVE_X_ADDR)])  # LDX abs
     # LDA $DF1E
     out.extend([_LDA_ABS, _lo(UCI_RESP_DATA_REG),
                 _hi(UCI_RESP_DATA_REG)])
@@ -630,7 +698,10 @@ def _build_read_status_tsx(
     fence: bool = True,
 ) -> list[int]:
     """Turbo-safe ``_build_read_status`` — same shape as the response
-    reader but reads $DF1F and tests BIT_STAT_AV."""
+    reader (including the 16-bit STAT_AV spin-wait) but reads ``$DF1F``
+    and tests ``BIT_STAT_AV``. See :func:`_build_read_response_tsx` for
+    the rationale behind the per-byte spin-wait (c64-https
+    ``uci_read_resp_bytes`` port)."""
     out: list[int] = []
     out.extend([_LDY_IMM, 0x00])
     out.extend([_STA_ABS, _lo(stat_len_addr), _hi(stat_len_addr)])
@@ -638,20 +709,45 @@ def _build_read_status_tsx(
                 _hi(stat_len_addr + 1)])
 
     loop_abs = pc + len(out)
+    # --- 16-bit STAT_AV spin-wait init ---
+    out.extend([_STX_ABS, _lo(_UCI_WAIT_SAVE_X_ADDR),
+                _hi(_UCI_WAIT_SAVE_X_ADDR)])
+    out.extend([_LDX_IMM, 0x00])
+    out.extend([_STX_ABS, _lo(_UCI_WAIT_CTR_HI_ADDR),
+                _hi(_UCI_WAIT_CTR_HI_ADDR)])
+    out.extend([_LDX_IMM, 0x00])
+
+    wait_abs = pc + len(out)
     out.extend([_LDA_ABS, _lo(UCI_CONTROL_STATUS_REG),
                 _hi(UCI_CONTROL_STATUS_REG)])
     if fence:
         out.extend(_build_fence())
     out.extend([_AND_IMM, BIT_STAT_AV])
+    bne_have_pos = len(out)
+    out.extend([_BNE, 0x00])  # patched below
+
+    out.append(_DEX)
     out.extend([_BEQ, 0x03])
-    jmp_read_pos = len(out)
-    out.extend([_JMP_ABS, 0x00, 0x00])
+    out.extend([_JMP_ABS, _lo(wait_abs), _hi(wait_abs)])
+
+    out.extend([_DEC_ABS, _lo(_UCI_WAIT_CTR_HI_ADDR),
+                _hi(_UCI_WAIT_CTR_HI_ADDR)])
+    out.extend([_BEQ, 0x03])
+    out.extend([_JMP_ABS, _lo(wait_abs), _hi(wait_abs)])
+
+    out.extend([0xAE, _lo(_UCI_WAIT_SAVE_X_ADDR),
+                _hi(_UCI_WAIT_SAVE_X_ADDR)])  # LDX abs
     jmp_done_pos = len(out)
     out.extend([_JMP_ABS, 0x00, 0x00])
 
-    read_abs = pc + len(out)
-    out[jmp_read_pos + 1] = _lo(read_abs)
-    out[jmp_read_pos + 2] = _hi(read_abs)
+    have_abs = pc + len(out)
+    branch_distance = have_abs - (pc + bne_have_pos + 2)
+    assert -128 <= branch_distance <= 127, (
+        f"BNE have distance out of short-branch range: {branch_distance}"
+    )
+    out[bne_have_pos + 1] = branch_distance & 0xFF
+    out.extend([0xAE, _lo(_UCI_WAIT_SAVE_X_ADDR),
+                _hi(_UCI_WAIT_SAVE_X_ADDR)])  # LDX abs
     out.extend([_LDA_ABS, _lo(UCI_STATUS_DATA_REG),
                 _hi(UCI_STATUS_DATA_REG)])
     if fence:
