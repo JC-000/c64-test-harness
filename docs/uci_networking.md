@@ -16,6 +16,32 @@ and reads responses.
 **Prerequisite:** UCI must be enabled in the device settings:
 *C64 and Cartridge Settings → Command Interface → Enabled*.
 
+## How the 6502 routine is dispatched
+
+The host (`_execute_uci_routine` in `uci_network.py`) writes the
+generated 6502 routine at `code_addr` (default `$C000`), then injects
+the string `SYS <code_addr>\r` into the keyboard buffer at `$0277` and
+sets the keyboard fill count at `$00C6` to the command length. BASIC's
+command-line processor reads the buffer on its next cycle as if the user
+typed the `SYS` command and RETURN, which JSRs into the routine. The
+routine does its work, writes the sentinel byte, and executes `RTS` to
+return to BASIC, which resumes its READY prompt loop.
+
+```asm
+; Tail of every UCI routine:
+    LDA #$01            ; sentinel done value
+    STA sentinel_addr   ; host polls this byte
+    RTS                 ; return to BASIC (SYS dispatch)
+```
+
+An earlier version patched the IMAIN vector at `$0302/$0303` to point at
+`code_addr` and waited for BASIC's idle loop to jump through it. That
+worked on warm devices (where prior BASIC activity had already traversed
+`$0302`) but silently failed on cold boots because BASIC's READY loop
+does not cycle through IMAIN — only the command-line processor does.
+
+Custom builders MUST end with `RTS` (0x60), not `JMP` or `BRK`.
+
 ## Turbo speed support (`turbo_safe=True`)
 
 The UCI FPGA inside the Ultimate 64 Elite needs **~38 µs** of wall-clock time
