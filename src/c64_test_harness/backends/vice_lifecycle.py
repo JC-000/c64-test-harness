@@ -7,6 +7,7 @@ manager that handles the lifecycle).
 from __future__ import annotations
 
 import os
+import platform
 import socket
 import subprocess
 import tempfile
@@ -18,13 +19,11 @@ if TYPE_CHECKING:
     from c64_test_harness.disk import DiskImage
 
 
-def _find_pid_on_port(port: int) -> int | None:
-    """Find the PID of the process listening on *port* via /proc/net/tcp.
+_IS_MACOS = platform.system() == "Darwin"
 
-    Returns the PID as an int, or ``None`` if not found or on non-Linux.
-    """
-    import os
 
+def _find_pid_on_port_linux(port: int) -> int | None:
+    """Linux: find the PID listening on *port* via /proc/net/tcp + /proc/*/fd."""
     hex_port = f"{port:04X}"
     try:
         with open("/proc/net/tcp") as f:
@@ -51,8 +50,49 @@ def _find_pid_on_port(port: int) -> int | None:
                         except (PermissionError, FileNotFoundError):
                             continue
     except FileNotFoundError:
-        pass  # Not Linux or /proc not mounted
+        pass  # /proc not mounted
     return None
+
+
+def _find_pid_on_port_macos(port: int) -> int | None:
+    """macOS: find the PID listening on *port* via ``lsof``.
+
+    ``lsof -nP -iTCP:<port> -sTCP:LISTEN -t`` prints one PID per line.
+    Returns the first, or ``None`` if there is no listener / lsof is
+    unavailable / the call fails.
+    """
+    try:
+        out = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            return int(line)
+        except ValueError:
+            return None
+    return None
+
+
+def _find_pid_on_port(port: int) -> int | None:
+    """Find the PID of the process listening on *port*.
+
+    Linux: uses ``/proc/net/tcp`` + ``/proc/*/fd``.
+    macOS: uses ``lsof -nP -iTCP:<port> -sTCP:LISTEN -t``.
+    Returns ``None`` on other platforms or when no listener is found.
+    """
+    if _IS_MACOS:
+        return _find_pid_on_port_macos(port)
+    return _find_pid_on_port_linux(port)
 
 
 @dataclass
@@ -285,17 +325,22 @@ class ViceProcess:
     def get_listener_pid(port: int) -> int | None:
         """Return the PID of the process listening on *port*, or None.
 
-        Uses ``/proc/net/tcp`` and ``/proc/*/fd`` (Linux only).
-        Returns ``None`` if the port has no listener or on non-Linux systems.
+        Cross-platform:
+            Linux -- parses ``/proc/net/tcp`` + ``/proc/*/fd``.
+            macOS -- shells out to ``lsof -nP -iTCP:<port> -sTCP:LISTEN -t``.
+        Returns ``None`` if the port has no listener (or on platforms
+        where neither path is available).
         """
         return _find_pid_on_port(port)
 
     @staticmethod
     def kill_on_port(port: int) -> bool:
-        """Kill a process listening on *port* using /proc/net/tcp (Linux).
+        """Kill the process listening on *port*.
 
-        Returns True if a process was found and killed, False otherwise.
-        This is an opt-in replacement for the old ``pkill -f`` approach.
+        Resolves the listener PID via :meth:`get_listener_pid` (works on
+        Linux and macOS) and sends SIGTERM. Returns True if a process
+        was found and signalled, False otherwise. This is an opt-in
+        replacement for the old ``pkill -f`` approach.
         """
         import os
         import signal
