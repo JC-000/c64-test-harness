@@ -1,18 +1,15 @@
 """Ethernet / RR-Net (CS8900a) integration tests (binary monitor transport).
 
 Validates that VICE can emulate the CS8900a ethernet chip via the RR-Net
-cartridge mode, connected to a host TAP interface.  Tests probe the chip
-ID register and exercise TX/RX packet I/O.
-
-Uses BinaryViceTransport (-binarymonitor) for all VICE communication.
-
-Requirements:
-- x64sc on PATH with ethernet cartridge support
-- A TAP interface named ``tap-c64`` (create with:
-  ``sudo ip tuntap add dev tap-c64 mode tap user $USER && sudo ip link set tap-c64 up``)
-- VICE must be compiled with tuntap or pcap driver support
-
-All tests are skipped automatically if prerequisites are missing.
+cartridge mode, connected to a host ethernet interface.  Tests probe the
+chip ID register and exercise TX/RX packet I/O.  The interface is
+selected via ``bridge_platform.first_available_ethernet_iface()`` using
+the matching ``ETHERNET_DRIVER``; platform-specific details (TAP+iproute2
+on Linux, feth+BSD bridge on macOS) live in that module and the matching
+``scripts/setup-bridge-*-{linux,macos}.sh`` setup scripts.  Uses
+``BinaryViceTransport`` (``-binarymonitor``) for all VICE communication;
+all tests are skipped automatically if ``x64sc`` is missing, no ethernet
+interface is available, or VICE lacks the required driver support.
 
 The ``_binary_jsr()`` helper uses the binary protocol's checkpoint mechanism:
 ``set_checkpoint()`` + ``set_registers()`` + ``resume()`` + ``wait_for_stopped()``.
@@ -23,7 +20,6 @@ interaction explanation.
 
 from __future__ import annotations
 
-import os
 import shutil
 import socket
 import struct
@@ -31,6 +27,12 @@ import time
 
 import pytest
 
+from bridge_platform import (
+    ETHERNET_DRIVER,
+    SETUP_HINT,
+    first_available_ethernet_iface,
+    probe_vice_pcap_ok,
+)
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 from c64_test_harness.backends.vice_manager import PortAllocator
@@ -47,28 +49,32 @@ from conftest import connect_binary_transport
 
 _HAS_X64SC = shutil.which("x64sc") is not None
 
+# Platform-dependent: Linux → first tap-*, macOS → first feth*.
+TAP_IFACE = first_available_ethernet_iface()
 
-def _tap_interface_exists(name: str = "tap-c64") -> bool:
-    """Check if a TAP interface exists by looking in /sys/class/net."""
-    return os.path.isdir(f"/sys/class/net/{name}")
-
-
-def _find_tap_interface() -> str | None:
-    """Return the first available tap-* interface, or None."""
-    try:
-        for iface in os.listdir("/sys/class/net"):
-            if iface.startswith("tap"):
-                return iface
-    except OSError:
-        pass
-    return None
-
-
-TAP_IFACE = _find_tap_interface()
+# On macOS 26 Tahoe the Homebrew VICE 3.10 bottle crashes immediately when
+# launched with ``-ethernetiodriver pcap -ethernetioif feth<N>`` (the
+# binary monitor never becomes reachable, VICE exits, and the host sees a
+# system crash dialog for x64sc). Root cause is upstream and likely shares
+# the same init-order-bug cluster as the known ``x64sc --version`` crash
+# (archdep_program_path_set_argv0 called after the pcap init path on macOS
+# 26; see docs/development.md "macOS (Homebrew)" caveats). Rather than
+# gate the tests behind an opt-in env var -- which makes full-suite runs
+# on a fresh machine hit a crash dialog before they learn the env var
+# exists -- we actively probe VICE once per process and skip cleanly if
+# the probe fails. ``MACOS_PCAP_DISABLED=1`` short-circuits the probe to
+# "broken" and ``MACOS_PCAP_ENABLED=1`` short-circuits it to "ok". See
+# ``tests/bridge_platform.probe_vice_pcap_ok`` and
+# ``scripts/probe-vice-feth.sh`` for deeper diagnosis.
+_PCAP_OK, _PCAP_REASON = probe_vice_pcap_ok(iface=TAP_IFACE)
 
 pytestmark = [
     pytest.mark.skipif(not _HAS_X64SC, reason="x64sc not found on PATH"),
-    pytest.mark.skipif(TAP_IFACE is None, reason="No TAP interface available (need: sudo ip tuntap add dev tap-c64 mode tap user $USER && sudo ip link set tap-c64 up)"),
+    pytest.mark.skipif(
+        TAP_IFACE is None,
+        reason=f"No ethernet interface available for VICE ({SETUP_HINT})",
+    ),
+    pytest.mark.skipif(not _PCAP_OK, reason=_PCAP_REASON),
 ]
 
 # Scratch area
@@ -191,8 +197,8 @@ def vice_ethernet():
         sound=False,
         ethernet=True,
         ethernet_mode="rrnet",
-        ethernet_interface=TAP_IFACE or "tap-c64",
-        ethernet_driver="tuntap",
+        ethernet_interface=TAP_IFACE or "",
+        ethernet_driver=ETHERNET_DRIVER,
     )
 
     with ViceProcess(config) as vice:
