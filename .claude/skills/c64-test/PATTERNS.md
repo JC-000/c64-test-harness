@@ -224,18 +224,22 @@ To add a new test suite to the parallel runner:
 
 ## Pattern 8: Ethernet / CS8900a Bridge Networking
 
-For testing C64 networking code with the CS8900a ethernet cartridge. Two VICE instances share a Linux bridge (`br-c64`) and talk to each other via L2 + IP + ICMP — no TAP-to-host NAT is involved.
+For testing C64 networking code with the CS8900a ethernet cartridge. Two VICE instances share a host bridge and talk to each other via L2 + IP + ICMP — no TAP-to-host NAT is involved. The harness supports both Linux (TAP devices + Linux bridge) and macOS (`feth(4)` peers + BSD bridge). Tests MUST dispatch through `tests/bridge_platform.py` constants — never hardcode `tap-c64-*` / `br-c64` / `tuntap`.
 
 ```python
+from tests.bridge_platform import IFACE_A, ETHERNET_DRIVER
+
 config = ViceConfig(
     prg_path="build/network_app.prg",
-    warp=True,                      # OK — new orchestrators are wall-clock-driven
-    ethernet=True,                  # Enable CS8900a
-    ethernet_mode="rrnet",          # RR-Net — matches ip65 and the physical cart
-    ethernet_interface="tap-c64-a", # Host TAP (per-instance)
-    ethernet_driver="tuntap",
+    warp=True,                       # OK — new orchestrators are wall-clock-driven
+    ethernet=True,                   # Enable CS8900a
+    ethernet_mode="rrnet",           # RR-Net — matches ip65 and the physical cart
+    ethernet_interface=IFACE_A,      # tap-c64-0 on Linux, feth0 on macOS
+    ethernet_driver=ETHERNET_DRIVER, # tuntap on Linux, pcap on macOS
 )
 ```
+
+On macOS `ViceProcess` auto-wraps the x64sc launch with `sudo -n` because VICE's pcap driver on `feth(4)` requires root (the macOS kernel enforces a per-process BPF attach permission that 666 on `/dev/bpf*` alone does not satisfy). This is a no-op on Linux. You need a NOPASSWD sudoers entry for `/opt/homebrew/bin/x64sc` on macOS; see `docs/development.md` -> macOS -> "Passwordless sudo for bridge lifecycle" for the full recipe.
 
 `ViceInstanceManager` auto-generates unique MACs (`02:c6:40:xx:xx:xx`) per instance and programs the CS8900a Individual Address registers after connect — no manual MAC handling needed.
 
@@ -244,11 +248,40 @@ config = ViceConfig(
 ```python
 # tests/conftest.py already provides this:
 def bridge_vice_pair(...) -> tuple[ViceInstance, ViceInstance]:
-    # Brings up two VICE instances on br-c64, RR-Net mode, warp=False (opt-in warp),
-    # unique MACs, CS8900a initialised (RxCTL + LineCTL + clockport).
+    # Brings up two VICE instances on the host bridge (br-c64 / bridge10),
+    # RR-Net mode, warp=False (opt-in warp), unique MACs,
+    # CS8900a initialised (RxCTL + LineCTL + clockport).
 ```
 
-Host setup lives in `scripts/setup-bridge-tap.sh` / `teardown-bridge-tap.sh` / `cleanup-bridge-networking.sh`. Cleanup uses the port-range-scoped `scripts/cleanup_vice_ports.py` — NEVER `pkill x64sc`.
+Skip-gate pattern for bridge tests — check all three interfaces through the dispatch module before running:
+
+```python
+from tests.bridge_platform import IFACE_A, IFACE_B, BRIDGE_NAME, SETUP_HINT, iface_present
+
+missing = [n for n in (IFACE_A, IFACE_B, BRIDGE_NAME) if not iface_present(n)]
+if missing:
+    pytest.skip(f"bridge down ({', '.join(missing)} missing); {SETUP_HINT}")
+```
+
+Host setup lives in three scripts per platform:
+
+- Linux: `scripts/setup-bridge-tap.sh`, `teardown-bridge-tap.sh`, `cleanup-bridge-networking.sh`
+- macOS: `scripts/setup-bridge-feth-macos.sh`, `teardown-bridge-feth-macos.sh`, `cleanup-bridge-feth-macos.sh`
+
+On macOS the setup script pairs `feth0` <-> `feth1` via `ifconfig feth0 peer feth1` and creates `bridge10` for the precondition + the host `10.0.65.1` address, but deliberately leaves the feth peers OUT of `bridge10`. The feth peer relation IS the L2 link; adding them as bridge members creates a second forwarding path that empirically caused asymmetric B->A reply drops. The setup script `deletem`s any stale peer-membership idempotently.
+
+Cleanup of orphaned VICE processes uses the port-range-scoped `scripts/cleanup_vice_ports.py` — NEVER `pkill x64sc`.
+
+### macOS gotcha — drain the CS8900a RX FIFO before each expect-RX phase
+
+libpcap over BPF sets `BIOCSSEESENT=1` when `pcap_set_promisc(1)` is on, so on macOS the sender's own pcap handle receives its own outbound broadcast frames back as inbound. The CS8900a in promiscuous mode queues those into its RX FIFO, so any test that TX's a broadcast then later RX's on the same transport will read its own just-sent frame first.
+
+Reference implementation in `tests/test_ethernet_bridge.py`:
+
+- `_build_drain_rx_code` / `_drain_cs8900a_rx` — 6502 routine that drains any queued CS8900a RX frames before each receive phase (primary defence; no-op on Linux because TAP doesn't loop TX back).
+- `_build_rx_code(..., expected_src_mac=...)` — optional src-MAC filter (defence in depth): any frame that slips past the drain with a non-matching src MAC is treated as non-matching and drained on the fly.
+
+ICMP tests (`test_bridge_ping.py`, `test_bridge_ping_tod.py`) are not affected because they address frames unicast to the peer's MAC and rely on the CS8900a's built-in Individual Address filter to discard self-echoes. Only broadcast TX-then-RX-on-same-transport tests need the drain.
 
 ### RR-Net mode is required (not TFE)
 
