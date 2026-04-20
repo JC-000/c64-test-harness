@@ -1,0 +1,56 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__serena__list_dir",
+      "mcp__serena__activate_project",
+      "mcp__serena__initial_instructions",
+      "mcp__serena__check_onboarding_performed",
+      "mcp__serena__onboarding",
+      "mcp__serena__search_for_pattern",
+      "mcp__serena__write_memory",
+      "mcp__serena__read_memory",
+      "mcp__serena__find_symbol",
+      "mcp__serena__read_file",
+
+      "Bash(security find-identity *)",
+      "Bash(brew *)",
+
+      "Bash(x64sc *)",
+      "Bash(sudo -n -l *)",
+      "Bash(sudo -n kill *)",
+      "Bash(sudo -n kill -9 *)",
+      "Bash(sudo -n /opt/homebrew/bin/x64sc *)",
+      "Bash(sudo -n /Users/someone/Documents/c64-test-harness/scripts/setup-bridge-feth-macos.sh)",
+      "Bash(sudo -n /Users/someone/Documents/c64-test-harness/scripts/teardown-bridge-feth-macos.sh)",
+      "Bash(sudo -n /Users/someone/Documents/c64-test-harness/scripts/cleanup-bridge-feth-macos.sh)",
+      "Bash(nc -z *)",
+      "Bash(otool *)",
+      "Bash(nm *)",
+      "Bash(strings *)",
+      "Bash(pkgutil *)",
+      "Bash(codesign -dv *)",
+      "Bash(brew info *)",
+      "Bash(brew list *)",
+      "Bash(brew --prefix *)",
+
+      "Bash(git add)",
+      "Bash(git add *)",
+      "Bash(git commit -m)",
+      "Bash(git commit -m *)",
+      "Bash(git commit --message *)",
+      "Bash(git push)",
+      "Bash(git push origin)",
+      "Bash(git push -u origin *)",
+      "Bash(git push origin *)",
+      "Bash(git stash)",
+      "Bash(git stash *)",
+      "Bash(git tag *)",
+
+      "Bash(gh pr create *)",
+      "Bash(gh pr edit *)",
+      "Bash(gh pr comment *)",
+      "Bash(gh issue create *)",
+      "Bash(gh issue comment *)"
+    ]
+  }
+}
