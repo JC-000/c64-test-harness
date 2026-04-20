@@ -10,6 +10,26 @@ import pytest
 from c64_test_harness.backends.port_lock import PortLock, _default_lock_dir
 
 
+def _child_try_acquire_19100(result_queue, ld):
+    child_lock = PortLock(19100, lock_dir=ld)
+    result_queue.put(child_lock.acquire())
+
+
+def _child_hold_until_proceed_19101(ld, ready_event, proceed_event):
+    child_lock = PortLock(19101, lock_dir=ld)
+    child_lock.acquire()
+    ready_event.set()
+    proceed_event.wait(timeout=5)
+    # Child exits without releasing — kernel releases flock
+
+
+def _child_hold_until_proceed_19202(ld, ready_event, proceed_event):
+    child_lock = PortLock(19202, lock_dir=ld)
+    child_lock.acquire()
+    ready_event.set()
+    proceed_event.wait(timeout=10)
+
+
 @pytest.fixture
 def lock_dir(tmp_path):
     """Use a temp directory for lock files to avoid test interference."""
@@ -118,12 +138,8 @@ class TestPortLockCrossProcess:
         lock = PortLock(19100, lock_dir=lock_dir)
         assert lock.acquire()
 
-        def child(result_queue, ld):
-            child_lock = PortLock(19100, lock_dir=ld)
-            result_queue.put(child_lock.acquire())
-
         q = multiprocessing.Queue()
-        p = multiprocessing.Process(target=child, args=(q, lock_dir))
+        p = multiprocessing.Process(target=_child_try_acquire_19100, args=(q, lock_dir))
         p.start()
         p.join(timeout=5)
         assert not q.get()  # Child should fail to acquire
@@ -131,17 +147,11 @@ class TestPortLockCrossProcess:
 
     def test_lock_released_on_process_exit(self, lock_dir):
         """Lock is released when the holding process exits."""
-        def child(ld, ready_event, proceed_event):
-            child_lock = PortLock(19101, lock_dir=ld)
-            child_lock.acquire()
-            ready_event.set()
-            proceed_event.wait(timeout=5)
-            # Child exits without releasing — kernel releases flock
-
         ready = multiprocessing.Event()
         proceed = multiprocessing.Event()
         p = multiprocessing.Process(
-            target=child, args=(lock_dir, ready, proceed),
+            target=_child_hold_until_proceed_19101,
+            args=(lock_dir, ready, proceed),
         )
         p.start()
         ready.wait(timeout=5)
@@ -196,16 +206,11 @@ class TestCleanupStale:
 
     def test_cleanup_does_not_break_held_lock(self, lock_dir):
         """cleanup_stale() cannot remove a lockfile held by another process."""
-        def child(ld, ready_event, proceed_event):
-            child_lock = PortLock(19202, lock_dir=ld)
-            child_lock.acquire()
-            ready_event.set()
-            proceed_event.wait(timeout=10)
-
         ready = multiprocessing.Event()
         proceed = multiprocessing.Event()
         p = multiprocessing.Process(
-            target=child, args=(lock_dir, ready, proceed),
+            target=_child_hold_until_proceed_19202,
+            args=(lock_dir, ready, proceed),
         )
         p.start()
         ready.wait(timeout=5)

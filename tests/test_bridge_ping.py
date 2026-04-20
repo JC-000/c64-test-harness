@@ -1,7 +1,10 @@
 """Bridge ICMP exchange test -- two VICE instances exchange IP-layer frames.
 
-Two VICE instances on ``br-c64`` exchange ICMP echo traffic via RR-Net
-ethernet:
+Two VICE instances attached to ``bridge_platform.BRIDGE_NAME`` (via
+``IFACE_A`` / ``IFACE_B``) exchange ICMP echo traffic via RR-Net
+ethernet; platform-specific details (TAP+iproute2 on Linux, feth+BSD
+bridge on macOS) live in that module and the matching
+``scripts/setup-bridge-*-{linux,macos}.sh`` setup scripts.
 
 * VICE A transmits a Python-crafted ICMP echo request frame addressed
   to VICE B's MAC and IP.
@@ -13,21 +16,19 @@ ethernet:
 
 This test proves that the bridge supports **IP-layer** frame exchange
 between two C64 instances, not just raw L2 frames (which is what
-``test_ethernet_bridge.py`` already covers).
-
-Prerequisites:
-- x64sc on PATH with RR-Net ethernet support
-- Bridge set up via ``scripts/setup-bridge-tap.sh``
+``test_ethernet_bridge.py`` already covers).  Prerequisites (``x64sc``
+on PATH and the bridge interfaces present) are checked automatically.
 """
 
 from __future__ import annotations
 
-import os
 import shutil
 import threading
 import time
 
 import pytest
+
+from bridge_platform import BRIDGE_NAME, IFACE_A, IFACE_B, SETUP_HINT, iface_present
 
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
 from c64_test_harness.bridge_ping import (
@@ -57,12 +58,19 @@ _HAS_X64SC = shutil.which("x64sc") is not None
 pytestmark = [
     pytest.mark.skipif(not _HAS_X64SC, reason="x64sc not found on PATH"),
     pytest.mark.skipif(
-        not os.path.isdir("/sys/class/net/tap-c64-0"),
-        reason="tap-c64-0 not found (run scripts/setup-bridge-tap.sh)",
+        not iface_present(IFACE_A),
+        reason=f"{IFACE_A} not found ({SETUP_HINT})",
     ),
     pytest.mark.skipif(
-        not os.path.isdir("/sys/class/net/tap-c64-1"),
-        reason="tap-c64-1 not found (run scripts/setup-bridge-tap.sh)",
+        not iface_present(IFACE_B),
+        reason=f"{IFACE_B} not found ({SETUP_HINT})",
+    ),
+    pytest.mark.skipif(
+        not iface_present(BRIDGE_NAME),
+        reason=(
+            f"{BRIDGE_NAME} not found -- feth/tap peers alone aren't enough; "
+            f"the host bridge must be up ({SETUP_HINT})"
+        ),
     ),
 ]
 
