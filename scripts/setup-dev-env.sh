@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# setup-dev-env.sh -- fresh Ubuntu Desktop 25 installer for c64-test-harness.
+# setup-dev-env.sh -- fresh dev-env installer for c64-test-harness.
 #
 # Takes a zero-state machine to a state where scripts/verify-dev-env.sh reports
 # READY. Every stage is idempotent (re-runs are safe) and opt-out via --no-*
@@ -8,21 +8,34 @@
 # inspect what would happen without touching the system.
 #
 # Stages:
-#   1. system packages (apt-get)           -- opt-out --no-system-packages
-#   2. VICE 3.10 source build + install    -- opt-out --no-vice
-#   3. Python harness editable install     -- opt-out --no-harness
-#   4. bridge networking setup             -- opt-out --no-bridge
-#   5. Ultimate 64 probe (optional)        -- opt-in via $U64_HOST or --u64-host
+#   1. system packages (apt-get / brew)     -- opt-out --no-system-packages
+#   2. VICE 3.10 source build + install     -- opt-out --no-vice (Linux only;
+#                                              macOS uses Homebrew bottle from
+#                                              stage 1)
+#   3. Python harness editable install      -- opt-out --no-harness
+#   4. bridge networking setup              -- opt-out --no-bridge
+#   5. Ultimate 64 probe (optional)         -- opt-in via $U64_HOST or --u64-host
 #   6. final verify-dev-env.sh run
 #
 # Safety: set -u (not -e) so the script continues through skipped/optional
 # stages. set -o pipefail for pipeline error propagation.
 #
-# Ubuntu Desktop 25 (25.04 / 25.10) is the target. Other distros are warned
-# against via check_os() but can proceed with --force.
+# Supported platforms:
+#   - Ubuntu Desktop 25 (25.04 / 25.10): full apt-get + VICE source build path.
+#   - macOS (Darwin): Homebrew-based install of the `vice` bottle; bridge
+#     setup dispatches to setup-bridge-feth-macos.sh.
+# Other distros are warned against via check_os() but can proceed with --force.
 
 set -u
 set -o pipefail
+
+# ---------- OS detection --------------------------------------------------
+
+# Detected once, used by stages that branch between Ubuntu (apt-get, Linux
+# bridge/TAP) and macOS (Homebrew, bridge10/feth0/feth1). The Linux path is
+# the long-standing default; macOS branches are wrapped around it so
+# behaviour on Ubuntu is unchanged.
+OS="$(uname)"
 
 # ---------- defaults ------------------------------------------------------
 
@@ -95,22 +108,22 @@ run_sudo() {
 
 usage() {
     cat <<'EOF'
-setup-dev-env.sh -- fresh Ubuntu 25 installer for c64-test-harness
+setup-dev-env.sh -- dev-env installer for c64-test-harness (Ubuntu 25 / macOS)
 
 USAGE:
   setup-dev-env.sh [OPTIONS]
 
 OPTIONS:
   --dry-run             Print actions without executing (safe; still runs verify)
-  --force               Skip the Ubuntu 25 version check
-  --no-system-packages  Skip apt-get install step
-  --no-vice             Skip VICE source build
+  --force               Skip the Ubuntu 25 version check (ignored on macOS)
+  --no-system-packages  Skip the apt-get / brew install step
+  --no-vice             Skip VICE source build (no-op on macOS: brew-installed)
   --no-harness          Skip pip install -e .
   --no-bridge           Skip bridge network setup
   --no-u64              Skip U64 probe even if U64_HOST is set
   --u64-host HOST       Probe this U64 host (overrides $U64_HOST)
   --build-dir DIR       Where to put VICE source (default ~/.cache/c64-test-harness/build)
-  --sha256 HEX          Expected SHA256 of VICE tarball (optional pin)
+  --sha256 HEX          Expected SHA256 of VICE tarball (optional pin; Linux-only)
   -h, --help            Print this help
 
 EXIT CODES:
@@ -165,6 +178,17 @@ parse_args() {
 
 check_os() {
     banner "Preflight -- OS detection"
+    if [ "$OS" = "Darwin" ]; then
+        # macOS: no /etc/os-release; report sw_vers for the record and move on.
+        # We don't gate on a specific macOS version -- Homebrew handles the
+        # differences between Apple Silicon (/opt/homebrew) and Intel
+        # (/usr/local) internally.
+        local mac_ver mac_build
+        mac_ver="$(sw_vers -productVersion 2>/dev/null || echo unknown)"
+        mac_build="$(sw_vers -buildVersion 2>/dev/null || echo unknown)"
+        log_ok "detected: macOS $mac_ver (build $mac_build)"
+        return
+    fi
     if [ ! -r /etc/os-release ]; then
         log_warn "/etc/os-release missing; cannot detect distro"
         if [ "$FORCE" = "0" ]; then
@@ -220,6 +244,62 @@ check_repo_root() {
 
 # ---------- Stage 1: system packages --------------------------------------
 
+# macOS variant of stage 1. The Linux path installs a large build toolchain
+# because it then builds VICE 3.10 from source; on macOS we consume the
+# Homebrew `vice` bottle instead (which also provides x64sc + c1541 +
+# ethernet support), so the only required package is `vice`. Python is
+# assumed to be already installed (Homebrew Python or system python3 >=
+# 3.10 per verify-dev-env.sh).
+#
+# Homebrew must NOT be run as root -- doing so corrupts the prefix
+# permissions. We never call `sudo brew`. If brew is missing we print a
+# hard stop and let the user install it manually per https://brew.sh.
+stage_system_packages_macos() {
+    if ! command -v brew >/dev/null 2>&1; then
+        log_fail "Homebrew (brew) not found on PATH"
+        log_fail "Install Homebrew first: https://brew.sh"
+        log_fail "Then re-run this script. Do not run Homebrew as root."
+        exit 2
+    fi
+    log_ok "Homebrew found at $(command -v brew)"
+
+    # Minimum macOS package set for the harness. `vice` is the only hard
+    # requirement; `curl` is in the base system on every supported macOS.
+    local packages=(
+        vice                  # x64sc, c1541 -- Homebrew bottle includes ethernet
+    )
+
+    if [ "$DRY_RUN" = "1" ]; then
+        log_dry "brew update"
+        log_dry "brew install ${packages[*]}"
+        log_ok "stage 1 (dry-run): would install ${#packages[@]} Homebrew packages"
+        return
+    fi
+
+    log_install "brew update"
+    if ! brew update; then
+        log_warn "brew update reported errors; continuing"
+    fi
+
+    log_install "brew install ${packages[*]}"
+    # `brew install` is idempotent: if the formula is already installed it
+    # prints a one-line skip notice and exits 0. We still capture failures
+    # per-package so we can report which formula (if any) broke.
+    local failed=()
+    local pkg
+    for pkg in "${packages[@]}"; do
+        if ! brew install "$pkg"; then
+            failed+=("$pkg")
+            log_warn "failed: $pkg (try: brew search $pkg)"
+        fi
+    done
+    if [ "${#failed[@]}" -eq 0 ]; then
+        log_ok "all ${#packages[@]} Homebrew packages installed"
+    else
+        log_fail "could not install: ${failed[*]}"
+    fi
+}
+
 stage_system_packages() {
     banner "Stage 1 -- system packages"
     if [ "$NO_SYSTEM_PACKAGES" = "1" ]; then
@@ -227,6 +307,12 @@ stage_system_packages() {
         return
     fi
 
+    if [ "$OS" = "Darwin" ]; then
+        stage_system_packages_macos
+        return
+    fi
+
+    # -------- Linux (Ubuntu) path --------
     # Package list derived from:
     #   - VICE 3.10 configure.ac requirements for --enable-ethernet +
     #     --enable-native-gtk3ui + audio codecs
@@ -332,6 +418,14 @@ stage_vice_build() {
     banner "Stage 2 -- VICE 3.10 source build"
     if [ "$NO_VICE" = "1" ]; then
         log_skip "--no-vice passed"
+        return
+    fi
+    if [ "$OS" = "Darwin" ]; then
+        # On macOS we install VICE via Homebrew in stage 1, which ships a
+        # prebuilt bottle with ethernet support enabled. Building from
+        # source isn't needed and the upstream tarball's ./configure
+        # doesn't support Darwin out of the box without patches.
+        log_skip "macOS uses Homebrew-installed VICE (see stage 1); source build not applicable"
         return
     fi
     if vice_already_installed; then
@@ -526,6 +620,41 @@ stage_bridge_setup() {
         return
     fi
 
+    if [ "$OS" = "Darwin" ]; then
+        # macOS uses bridge10 + feth0/feth1 (see tests/bridge_platform.py).
+        # Interface existence is probed via `ifconfig`; the BSD bridge
+        # driver doesn't expose sysfs.
+        if ifconfig bridge10 >/dev/null 2>&1 \
+           && ifconfig feth0 >/dev/null 2>&1 \
+           && ifconfig feth1 >/dev/null 2>&1; then
+            log_skip "bridge10 + feth0 + feth1 already present"
+            return
+        fi
+
+        local setup_script="$REPO_ROOT/scripts/setup-bridge-feth-macos.sh"
+        if [ ! -x "$setup_script" ]; then
+            log_fail "$setup_script missing or not executable"
+            return
+        fi
+
+        run_sudo "bridge-setup" "$setup_script"
+
+        if [ "$DRY_RUN" = "1" ]; then
+            log_ok "stage 4 (dry-run): would run sudo $setup_script"
+            return
+        fi
+
+        if ifconfig bridge10 >/dev/null 2>&1 \
+           && ifconfig feth0 >/dev/null 2>&1 \
+           && ifconfig feth1 >/dev/null 2>&1; then
+            log_ok "bridge + feth interfaces present"
+        else
+            log_fail "bridge setup reported success but interfaces missing"
+        fi
+        return
+    fi
+
+    # -------- Linux path --------
     if [ -d /sys/class/net/br-c64 ] && [ -d /sys/class/net/tap-c64-0 ] && [ -d /sys/class/net/tap-c64-1 ]; then
         log_skip "br-c64 + tap-c64-0 + tap-c64-1 already present"
         return
