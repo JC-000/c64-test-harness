@@ -1,5 +1,7 @@
 """Tests for labels.py — VICE label file parsing."""
 
+from collections.abc import Mapping
+
 import pytest
 
 from c64_test_harness.labels import Labels
@@ -53,3 +55,133 @@ class TestLabels:
         r = repr(labels)
         assert "Labels(" in r
         assert "entries" in r
+
+
+class TestNonCLabels:
+    """ld65 emits address-space-neutral ``al XXXXXX .name`` lines
+    (no ``C:`` prefix) for labels outside the 16-bit C64 code space —
+    e.g. REU offsets. The parser must accept both forms."""
+
+    def _write(self, tmp_path, lines: list[str]):
+        p = tmp_path / "labels.txt"
+        p.write_text("\n".join(lines) + "\n")
+        return p
+
+    def test_non_c_line_parsed(self, tmp_path):
+        path = self._write(
+            tmp_path,
+            ["al 022100 .REU_OVERLAY_X25519"],
+        )
+        labels = Labels.from_file(path)
+        assert labels["REU_OVERLAY_X25519"] == 0x022100
+
+    def test_non_c_line_reverse_lookup(self, tmp_path):
+        path = self._write(
+            tmp_path,
+            ["al 024100 .REU_OVERLAY_P384"],
+        )
+        labels = Labels.from_file(path)
+        assert labels.name(0x024100) == "REU_OVERLAY_P384"
+
+    def test_mixed_c_and_non_c(self, tmp_path):
+        path = self._write(
+            tmp_path,
+            [
+                "al C:4200 .__CRYPTO_OVERLAY_START__",
+                "al 020100 .REU_OVERLAY_X25519",
+                "al 022100 .REU_OVERLAY_P256",
+                "al C:C000 .tcp_recv_buf",
+            ],
+        )
+        labels = Labels.from_file(path)
+        assert len(labels) == 4
+        assert labels["__CRYPTO_OVERLAY_START__"] == 0x4200
+        assert labels["tcp_recv_buf"] == 0xC000
+        assert labels["REU_OVERLAY_X25519"] == 0x020100
+        assert labels["REU_OVERLAY_P256"] == 0x022100
+
+    def test_address_above_64k(self, tmp_path):
+        """Non-C addresses frequently exceed 16 bits."""
+        path = self._write(
+            tmp_path,
+            ["al 040000 .REU_P384_PRECOMPUTE_BASE"],
+        )
+        labels = Labels.from_file(path)
+        assert labels["REU_P384_PRECOMPUTE_BASE"] == 0x40000
+        assert labels["REU_P384_PRECOMPUTE_BASE"] > 0xFFFF
+
+
+class TestMappingInterface:
+    """``Labels`` inherits from ``collections.abc.Mapping`` so callers can
+    pass it straight to ``dict()`` and iterate it like any read-only map."""
+
+    def _write(self, tmp_path, lines: list[str]):
+        p = tmp_path / "labels.txt"
+        p.write_text("\n".join(lines) + "\n")
+        return p
+
+    def _mixed(self, tmp_path):
+        return self._write(
+            tmp_path,
+            [
+                "al C:4200 .__CRYPTO_OVERLAY_START__",
+                "al 020100 .REU_OVERLAY_X25519",
+                "al 022100 .REU_OVERLAY_P256",
+                "al C:C000 .tcp_recv_buf",
+            ],
+        )
+
+    def test_isinstance_mapping(self, tmp_path):
+        labels = Labels.from_file(self._mixed(tmp_path))
+        assert isinstance(labels, Mapping)
+
+    def test_dict_roundtrip_mixed(self, tmp_path):
+        labels = Labels.from_file(self._mixed(tmp_path))
+        assert dict(labels) == {
+            "__CRYPTO_OVERLAY_START__": 0x4200,
+            "REU_OVERLAY_X25519": 0x020100,
+            "REU_OVERLAY_P256": 0x022100,
+            "tcp_recv_buf": 0xC000,
+        }
+
+    def test_items_iteration(self, tmp_path):
+        labels = Labels.from_file(self._mixed(tmp_path))
+        collected = {}
+        for name, addr in labels.items():
+            collected[name] = addr
+        assert collected == {
+            "__CRYPTO_OVERLAY_START__": 0x4200,
+            "REU_OVERLAY_X25519": 0x020100,
+            "REU_OVERLAY_P256": 0x022100,
+            "tcp_recv_buf": 0xC000,
+        }
+
+    def test_keys_and_values_lengths(self, tmp_path):
+        labels = Labels.from_file(self._mixed(tmp_path))
+        keys = list(labels.keys())
+        values = list(labels.values())
+        assert len(keys) == 4
+        assert len(values) == 4
+        assert set(keys) == {
+            "__CRYPTO_OVERLAY_START__",
+            "REU_OVERLAY_X25519",
+            "REU_OVERLAY_P256",
+            "tcp_recv_buf",
+        }
+        assert set(values) == {0x4200, 0x020100, 0x022100, 0xC000}
+
+    def test_iter_yields_names(self, tmp_path):
+        labels = Labels.from_file(self._mixed(tmp_path))
+        names = list(iter(labels))
+        assert set(names) == {
+            "__CRYPTO_OVERLAY_START__",
+            "REU_OVERLAY_X25519",
+            "REU_OVERLAY_P256",
+            "tcp_recv_buf",
+        }
+
+    def test_get_returns_default(self, tmp_path):
+        labels = Labels.from_file(self._mixed(tmp_path))
+        assert labels.get("tcp_recv_buf") == 0xC000
+        assert labels.get("no_such_label") is None
+        assert labels.get("no_such_label", -1) == -1
