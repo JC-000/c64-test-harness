@@ -2,6 +2,13 @@
 
 Parses the ``al C:XXXX .name`` format produced by cc65, ACME, Kick
 Assembler, and other 6502 toolchains when generating VICE label files.
+
+Also accepts address-space-neutral lines of the form ``al XXXXXX .name``
+(no ``C:`` prefix). ld65 emits this form for labels whose address does
+not fit the 16-bit C64 code space — e.g. REU/DMA offsets, multi-byte
+overlay bases, or any symbol defined outside the ``C:`` region. Both
+forms populate the same name→address map; callers distinguish them by
+the value (addresses ≥ 0x10000 can only come from the non-``C:`` form).
 """
 
 from __future__ import annotations
@@ -9,7 +16,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-_LABEL_RE = re.compile(r"al\s+C:([0-9a-fA-F]+)\s+\.(\S+)")
+_LABEL_RE = re.compile(r"al\s+(?:C:)?([0-9a-fA-F]+)\s+\.(\S+)")
 
 
 class Labels:
