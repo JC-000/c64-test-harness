@@ -14,13 +14,19 @@ the value (addresses ≥ 0x10000 can only come from the non-``C:`` form).
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 _LABEL_RE = re.compile(r"al\s+(?:C:)?([0-9a-fA-F]+)\s+\.(\S+)")
 
 
-class Labels:
-    """Parsed label file providing bidirectional address ↔ name lookup."""
+class Labels(Mapping[str, int]):
+    """Parsed label file providing bidirectional address ↔ name lookup.
+
+    Implements ``collections.abc.Mapping[str, int]`` so a ``Labels`` instance
+    can be iterated, passed to ``dict()``, and used anywhere a read-only
+    ``Mapping`` is expected.
+    """
 
     def __init__(self) -> None:
         self._by_name: dict[str, int] = {}
@@ -53,8 +59,11 @@ class Labels:
         """Lookup by name, raising ``KeyError`` if not found."""
         return self._by_name[name]
 
-    def __contains__(self, name: str) -> bool:
+    def __contains__(self, name: object) -> bool:
         return name in self._by_name
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._by_name)
 
     def __len__(self) -> int:
         return len(self._by_name)

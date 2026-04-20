@@ -192,6 +192,11 @@ result = prg.first_diff(transport, labels["process_block"], 1024)
 if result:
     offset, expected, actual = result
     print(f"Diff at +{offset}: expected {expected:02x}, got {actual:02x}")
+
+# Labels is a read-only Mapping[str, int] — iterate or convert to dict
+for name, addr in labels.items():
+    print(f"{name} = ${addr:04x}")
+all_labels = dict(labels)
 ```
 
 ## Execution Control
