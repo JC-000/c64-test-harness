@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bridge networking setup (macOS) — creates bridge0 + feth0/feth1 for
+# Bridge networking setup (macOS) — creates bridge10 + feth0/feth1 for
 # two-VICE ethernet tests. Paired with teardown-bridge-feth-macos.sh.
 #
 # This is the macOS-native counterpart to setup-bridge-tap.sh. Instead of
@@ -7,6 +7,18 @@
 # (fake ethernet pairs) and the BSD "bridge" pseudo-device driven by
 # ifconfig. VICE attaches via its pcap driver rather than tuntap because
 # macOS has no /dev/net/tun and libpcap-over-BPF is the portable path.
+#
+# IMPORTANT (macOS L2 topology): the feth PEER mechanism already provides
+# a direct L2 link between feth0 and feth1 — frames TX'd on one appear as
+# RX on the other and vice versa. Adding feth0 and feth1 as members of a
+# BSD bridge creates a SECOND forwarding path between the same two nodes,
+# which causes every reply frame to be duplicated. Empirically (see PR #66
+# discussion) this asymmetry breaks B→A replies while A→B first-hops keep
+# working: the learning bridge and the peer mechanism race on the return
+# path, and pcap/CS8900a on A drops the duplicated reply. Therefore we
+# CREATE bridge10 (so tests' ``iface_present(BRIDGE_NAME)`` precondition
+# still passes and the host can participate at 10.0.65.1) but we DO NOT
+# add feth0/feth1 as members. The feth peer IS the L2 link.
 #
 # Must be run with sudo (or as root). Idempotent — safe to run repeatedly.
 #
@@ -82,21 +94,29 @@ else
     echo "[created] $BRIDGE"
 fi
 
-# Add both feth peers as bridge members. The bridge "addm" subcommand is
-# NOT idempotent on BSD — it errors if the member is already attached —
-# so we check via "ifconfig bridge0" grep first.
+# DO NOT add feth0/feth1 as members of the bridge. The feth peer mechanism
+# is already a point-to-point L2 link between them; bridging them again
+# via bridge10 creates a second forwarding path and causes duplicate /
+# asymmetric delivery (see docstring at top of file). If a prior setup
+# DID add them as members, deletem them now so we end up in a clean,
+# peers-only state.
 BRIDGE_INFO="$(ifconfig "$BRIDGE" 2>/dev/null || true)"
 for FETH in "$FETH0" "$FETH1"; do
     if echo "$BRIDGE_INFO" | grep -q "member: $FETH"; then
-        echo "[ok] $FETH already a member of $BRIDGE"
+        ifconfig "$BRIDGE" deletem "$FETH" 2>/dev/null || true
+        echo "[bridge] $FETH removed from $BRIDGE (peers-only L2)"
     else
-        ifconfig "$BRIDGE" addm "$FETH"
-        echo "[bridge] $FETH added to $BRIDGE"
+        echo "[ok] $FETH is not a member of $BRIDGE (peers-only L2)"
     fi
 done
 
-# Assign the host-side IP. "ifconfig bridge0 inet 10.0.65.1 netmask ..." is
-# the BSD form (there's no "ip addr add" on macOS).
+# Assign the host-side IP. "ifconfig bridge10 inet 10.0.65.1 netmask ..." is
+# the BSD form (there's no "ip addr add" on macOS). We keep this even with
+# zero members: it preserves the BRIDGE_NAME presence precondition used by
+# the bridge tests and gives the host a stable loopback-like address in
+# the 10.0.65.0/24 range for any future host-participant tests. With no
+# members, no host traffic is forwarded anywhere — the address just lives
+# on the bridge interface.
 if ifconfig "$BRIDGE" | grep -qE "inet ${BRIDGE_ADDR}\b"; then
     echo "[ok] $BRIDGE has address $BRIDGE_ADDR"
 else
@@ -120,8 +140,10 @@ echo
 echo "  VICE instance 0:  -ethernetiodriver pcap -ethernetioif $FETH0"
 echo "  VICE instance 1:  -ethernetiodriver pcap -ethernetioif $FETH1"
 echo
-echo "Both instances share the same L2 segment via $BRIDGE."
-echo "Host can participate at $BRIDGE_ADDR."
+echo "Both instances share the same L2 segment via the feth peer link"
+echo "($FETH0 <-> $FETH1). $BRIDGE exists only to host the $BRIDGE_ADDR"
+echo "address; feth peers are NOT added to it (doing so would double-forward"
+echo "every frame and break B->A replies)."
 echo
 echo "NOTE: VICE's pcap driver opens /dev/bpf* which is root-only by default"
 echo "      on macOS. If you see a 'pcap_open_live' or BPF permission error,"
