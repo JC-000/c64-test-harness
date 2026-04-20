@@ -10,6 +10,10 @@ argument-hint: "[test-subject]"
 
 You are an expert at writing and running tests for Commodore 64 assembly programs using the `c64-test-harness` Python package. This skill helps you write correct, reliable C64 tests on the first attempt.
 
+## Platforms
+
+The harness runs on **Ubuntu 25+** and **macOS 26 Tahoe (Apple Silicon)**. Full parity is a maintained property — tests must work on both or explicitly skip with a platform-specific reason. Bridge/ethernet tests dispatch all platform-specific constants through `tests/bridge_platform.py` (`IFACE_A`, `IFACE_B`, `BRIDGE_NAME`, `ETHERNET_DRIVER`, `SETUP_HINT`, `iface_present()`) — never hardcode `tap-c64-*` / `br-c64` / `/sys/class/net/...`. On macOS, `ViceProcess` auto-wraps x64sc with `sudo -n` when `ethernet=True` because VICE's pcap driver on `feth(4)` requires root; this needs a NOPASSWD sudoers entry for `/opt/homebrew/bin/x64sc`. See `docs/development.md` for the full setup (VICE via Homebrew, bridge lifecycle scripts, sudoers recipe).
+
 ## When to Use This Skill
 
 Use this when:
@@ -51,7 +55,7 @@ See the supporting files in this skill directory for detailed API reference:
 14. **Never `pkill x64sc`** — use PID-targeted cleanup only; other agents may have VICE instances running.
 15. **Probe before connecting to U64** — `probe_u64(host)` checks ping + TCP + REST API with short timeouts. `Ultimate64InstanceManager.acquire()` does this automatically, skipping unreachable devices.
 16. **Pass `turbo_safe=True` to UCI helpers at U64 speeds ≥ 4 MHz** — the FPGA behind `$DF1C-$DF1F` needs ~38 µs between accesses; without the fence, turbo-speed code double-latches writes and corrupts the UCI protocol. Every `uci_*` builder and helper accepts the kwarg. Default is `False` for backward compat.
-17. **Ethernet bridge tests default to RR-Net mode** — `ViceConfig.ethernet_mode="rrnet"` matches ip65 and the physical RR-Net cart; TFE mode is kept only for backward compat. Always use the `bridge_vice_pair` fixture and `run_ping_and_wait` / `run_icmp_responder` orchestrators, which work in BOTH VICE normal and warp modes.
+17. **Ethernet bridge tests default to RR-Net mode** — `ViceConfig.ethernet_mode="rrnet"` matches ip65 and the physical RR-Net cart; TFE mode is kept only for backward compat. Always use the `bridge_vice_pair` fixture and `run_ping_and_wait` / `run_icmp_responder` orchestrators, which work in BOTH VICE normal and warp modes. For the `ethernet_interface` / `ethernet_driver` values, import from `tests/bridge_platform.py` (`IFACE_A`, `IFACE_B`, `ETHERNET_DRIVER`) — do not hardcode. On macOS, `ViceConfig.run_as_root` auto-resolves to True when `ethernet=True` and `ViceProcess` wraps the launch with `sudo -n`; broadcast-TX-then-RX-on-same-transport tests must drain the CS8900a RX FIFO (see `_drain_cs8900a_rx` in `tests/test_ethernet_bridge.py`) because libpcap self-delivers the sender's own frames on BPF.
 18. **VICE TOD ≠ wall-clock** — VICE 3.10 CIA TOD is virtual-CPU-clocked (warp accelerates it ~31×). For code that must work in VICE warp, use the host-driven `run_ping_and_wait` / `poll_until_ready` orchestrators. For shippable pure-6502 code on real C64 / U64 / VICE normal, use `tod_timer.build_*` helpers.
 
 ## Test File Template
