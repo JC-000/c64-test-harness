@@ -252,20 +252,30 @@ def _build_tx_code(frame_len: int) -> bytes:
     return a.build()
 
 
-def _build_rx_code(payload_bytes: int = 46) -> bytes:
+def _build_rx_code(
+    payload_bytes: int = 46,
+    expected_src_mac: bytes | None = None,
+) -> bytes:
     """Build 6502 RX routine that polls for a frame and reads payload into RX_BUF.
 
     Filters frames by EtherType -- only accepts frames with EtherType 0xC640.
-    Non-matching frames (e.g. IPv6 multicast) are drained and discarded,
-    then polling resumes for the next frame.
+    If *expected_src_mac* is provided, also filters by source MAC: frames
+    whose src MAC does not match are drained. This is belt-and-braces
+    defence in depth; the primary protection against the macOS "pcap
+    BIOCSSEESENT self-RX" pattern is a FIFO drain performed by
+    ``_drain_cs8900a_rx`` before each RX run (see that helper).
+
+    Non-matching frames (wrong EtherType or wrong src MAC) are drained and
+    discarded, then polling resumes for the next frame.
 
     1. SEI
     2. Poll RxEvent (PP 0x0124 bit 8) with multi-level timeout
     3. Read RxStatus (2 bytes) + RxLength (2 bytes) from RTDATA
-    4. Skip dest MAC (3 word reads) and src MAC (3 word reads)
-    5. Read EtherType (1 word read) -- check for 0xC640
-    6. If no match: drain remaining (RxLength-14)/2 words, jump to step 2
-    7. If match: read payload into RX_BUF, set RESULT=0x01, CLI, RTS
+    4. Skip dest MAC (3 word reads = 6 bytes)
+    5. Read src MAC (3 word reads = 6 bytes); compare against expected if set
+    6. Read EtherType (1 word read) -- check for 0xC640
+    7. If any filter fails: drain remaining bytes, jump to step 2
+    8. If all match: read payload into RX_BUF, set RESULT=0x01, CLI, RTS
     """
     # Number of 16-bit words to read for payload
     rx_words = (payload_bytes + 1) // 2
@@ -322,13 +332,53 @@ def _build_rx_code(payload_bytes: int = 46) -> bytes:
     a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8)  # LDA $DE01 (RxLength hi)
     a.emit(0x8D, (RX_META + 3) & 0xFF, ((RX_META + 3) >> 8) & 0xFF)
 
-    # Skip dest+src MAC: 6 word reads (12 bytes, discard)
-    a.emit(0xA2, 0x06)  # LDX #6
+    # Skip dest MAC: 3 word reads (6 bytes, discard)
+    a.emit(0xA2, 0x03)  # LDX #3
     a.label("skm")
     a.emit(0xAD, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
     a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
     a.emit(0xCA)  # DEX
     a.branch(0xD0, "skm")  # BNE skm
+
+    # Read src MAC: 3 word reads (6 bytes). If expected_src_mac is set,
+    # compare each byte in-line; on mismatch we still need to finish
+    # reading the remaining src-MAC bytes AND the EtherType word so that
+    # the drain math in "dr2" (remaining = RxLength - 14) stays correct.
+    # Cleanest way: stash a "mismatch" flag in a zero-page byte ($F9),
+    # always consume all 6 src-MAC bytes + 2 EtherType bytes, then at the
+    # end branch to dr2 if the flag is set. That way the normal path and
+    # the filter-fail path consume the same number of bytes from RTDATA.
+    # Each word read: lo from $DE00, hi from $DE01. Wire ordering for src
+    # MAC word N is src[2N] (lo), src[2N+1] (hi).
+    if expected_src_mac is not None:
+        if len(expected_src_mac) != 6:
+            raise ValueError(
+                f"expected_src_mac must be 6 bytes, got {len(expected_src_mac)}"
+            )
+        # $F9 = mismatch flag. 0 = match so far, nonzero = mismatch seen.
+        a.emit(0xA9, 0x00, 0x85, 0xF9)
+        for word_idx in range(3):
+            byte_lo = expected_src_mac[word_idx * 2]
+            byte_hi = expected_src_mac[word_idx * 2 + 1]
+            # LDA $DE00 ; CMP #byte_lo ; BEQ ok_lo ; INC $F9 ; ok_lo:
+            a.emit(0xAD, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
+            a.emit(0xC9, byte_lo)
+            a.branch(0xF0, f"smlo{word_idx}")
+            a.emit(0xE6, 0xF9)  # INC $F9 (flag nonzero)
+            a.label(f"smlo{word_idx}")
+            a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
+            a.emit(0xC9, byte_hi)
+            a.branch(0xF0, f"smhi{word_idx}")
+            a.emit(0xE6, 0xF9)  # INC $F9 (flag nonzero)
+            a.label(f"smhi{word_idx}")
+    else:
+        # No src-MAC filter: just skip 3 words.
+        a.emit(0xA2, 0x03)  # LDX #3
+        a.label("skm2")
+        a.emit(0xAD, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
+        a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
+        a.emit(0xCA)  # DEX
+        a.branch(0xD0, "skm2")  # BNE skm2
 
     # Read EtherType (1 word): lo from $DE00, hi from $DE01
     # On wire: 0xC6, 0x40 -> CS8900a word read: lo=0xC6, hi=0x40
@@ -338,6 +388,13 @@ def _build_rx_code(payload_bytes: int = 46) -> bytes:
     a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8)  # LDA $DE01 -> hi byte
     a.emit(0xC9, 0x40)  # CMP #$40
     a.branch(0xD0, "dr2")  # BNE drain2 (wrong EtherType hi, but hi consumed)
+
+    # If src-MAC filtering is active, the 14-byte header has now been
+    # fully consumed from RTDATA (6 dst + 6 src + 2 EtherType). Check the
+    # mismatch flag: nonzero means drain this frame and poll again.
+    if expected_src_mac is not None:
+        a.emit(0xA5, 0xF9)  # LDA $F9
+        a.branch(0xD0, "dr2")  # BNE dr2 (src MAC mismatch)
 
     # --- EtherType matches: read payload into RX_BUF ---
     a.emit(0xA9, RX_BUF & 0xFF, 0x85, 0xFB)
@@ -415,6 +472,120 @@ def _build_rx_code(payload_bytes: int = 46) -> bytes:
     code[jmp_operand_pos] = rst_addr & 0xFF
     code[jmp_operand_pos + 1] = (rst_addr >> 8) & 0xFF
     return bytes(code)
+
+
+def _build_drain_rx_code() -> bytes:
+    """Build a 6502 routine that drains any currently-queued CS8900a RX frames.
+
+    Polls RxEvent with a SHORT timeout. For each frame seen, reads
+    RxStatus + RxLength and drains the remaining (RxLength)/2 words from
+    RTDATA. Exits (RESULT=0x02) when a poll iteration completes without
+    seeing any more frames.
+
+    Why this exists: on macOS, libpcap over BPF with ``BIOCSSEESENT=1``
+    (libpcap's default when promisc is enabled) delivers a host's own
+    outbound frames back to the same pcap handle. The CS8900a in
+    promiscuous mode happily pushes them into the RX FIFO. That means
+    after a phase where VICE-A was the sender, VICE-A's CS8900a RX FIFO
+    contains its own TX frame(s), which a subsequent phase where VICE-A
+    is the receiver will pick up FIRST -- before any real traffic from
+    the peer. Draining the FIFO at the start of each new RX phase gives
+    the receiver a clean slate. Linux TAP does not loop TX back, so this
+    is a no-op there, but running it on Linux is harmless (the poll
+    times out quickly and returns).
+    """
+    a = Asm()
+    a.emit(0x78)  # SEI
+    # RR clockport enable
+    a.emit(0xAD, ISQ_HI & 0xFF, ISQ_HI >> 8)
+    a.emit(0x09, 0x01)
+    a.emit(0x8D, ISQ_HI & 0xFF, ISQ_HI >> 8)
+
+    # --- Poll setup: PPTR = 0x0124 (RxEvent) ---
+    a.label("drst")
+    a.emit(0xA9, 0x24, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
+    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
+
+    # Short timeout: $FD=0x40 inner, $FE=0x20 outer (~0.5s total at 1MHz)
+    a.emit(0xA9, 0x40, 0x85, 0xFD)
+    a.emit(0xA9, 0x20, 0x85, 0xFE)
+
+    # Poll loop
+    a.label("dpl")
+    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)  # LDA $DE0D
+    a.emit(0x29, 0x01)  # AND #$01
+    a.branch(0xD0, "dgf")  # BNE got_frame
+
+    # Timeout: done draining (no more frames) -> set RESULT = 0x02, RTS
+    a.emit(0xC6, 0xFD)  # DEC $FD
+    a.branch(0xD0, "dpl")  # BNE dpl
+    a.emit(0xA9, 0x40, 0x85, 0xFD)  # reset inner
+    a.emit(0xC6, 0xFE)  # DEC $FE
+    a.branch(0xD0, "dpl")  # BNE dpl
+
+    # Poll exhausted: exit
+    a.emit(0xA9, 0x02)
+    a.emit(0x8D, RESULT & 0xFF, (RESULT >> 8) & 0xFF)
+    a.emit(0x58)  # CLI
+    a.emit(0x60)  # RTS
+
+    # --- got_frame: read RxStatus + RxLength, drain all bytes ---
+    a.label("dgf")
+    # Skip RxStatus (2 bytes)
+    a.emit(0xAD, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
+    a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
+    # Read RxLength into $FB (lo) / $FC (hi)
+    a.emit(0xAD, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
+    a.emit(0x85, 0xFB)
+    a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
+    a.emit(0x85, 0xFC)
+
+    # Divide 16-bit RxLength ($FC:$FB) by 2 -> word count
+    a.emit(0x46, 0xFC)  # LSR $FC
+    a.emit(0x66, 0xFB)  # ROR $FB
+
+    # Drain loop
+    a.label("ddrl")
+    a.emit(0xA5, 0xFB)
+    a.emit(0x05, 0xFC)
+    a.branch(0xF0, "ddnext")  # BEQ drain_done_this_frame
+
+    a.emit(0xAD, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
+    a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
+
+    # 16-bit decrement
+    a.emit(0xA5, 0xFB)
+    a.branch(0xD0, "ddnz")
+    a.emit(0xC6, 0xFC)
+    a.label("ddnz")
+    a.emit(0xC6, 0xFB)
+
+    a.emit(0x18)
+    a.branch(0x90, "ddrl")
+
+    a.label("ddnext")
+    # Jump back to drst (reset poll for next frame). "drst" may be far;
+    # use JMP absolute and fix up after build.
+    jmp_pos = a.pos + 1
+    a.emit(0x4C, 0x00, 0x00)  # JMP $0000 (placeholder)
+
+    code = bytearray(a.build())
+    drst_addr = CODE + a.labels["drst"]
+    code[jmp_pos] = drst_addr & 0xFF
+    code[jmp_pos + 1] = (drst_addr >> 8) & 0xFF
+    return bytes(code)
+
+
+def _drain_cs8900a_rx(transport: BinaryViceTransport) -> None:
+    """Load + run the FIFO drain routine on *transport*.
+
+    Silent no-op if the routine times out (which on Linux is the common
+    case -- TAP doesn't loop TX back, so the FIFO is usually empty).
+    """
+    drain_code = _build_drain_rx_code()
+    load_code(transport, CODE, drain_code)
+    write_bytes(transport, RESULT, [0x00])
+    jsr(transport, CODE, timeout=10.0)
 
 
 def _build_frame(src_mac: bytes, payload: bytes) -> bytes:
@@ -548,9 +719,23 @@ class TestEthernetBridge:
         frame = _build_frame(src_mac, payload)
         frame_len = len(frame)
 
+        # Drain any stale frames from the receiver's CS8900a RX FIFO
+        # before we start this transfer. Primary defence against the
+        # macOS pcap BIOCSSEESENT self-RX pattern (see docstring on
+        # _build_drain_rx_code). No-op on Linux.
+        _drain_cs8900a_rx(receiver)
+
         # Build code
         tx_code = _build_tx_code(frame_len)
-        rx_code = _build_rx_code(payload_bytes=len(payload))
+        # Filter RX by expected source MAC so the receiver rejects frames
+        # it accidentally sees from its own prior TX (on macOS, libpcap
+        # over BPF with BIOCSSEESENT=1 delivers outbound broadcasts back
+        # to the sender's pcap handle, and the CS8900a in promiscuous
+        # mode happily accepts them into its RX FIFO).
+        rx_code = _build_rx_code(
+            payload_bytes=len(payload),
+            expected_src_mac=src_mac,
+        )
 
         # Load TX code + frame data on sender
         load_code(sender, CODE, tx_code)
