@@ -6,6 +6,11 @@ dist/
 build/
 .pytest_cache/
 .serena/
+<<<<<<< HEAD
 
 # Claude Code local/user-specific settings
 .claude/settings.local.json
+=======
+.claude/settings.local.json
+.claude/worktrees/
+>>>>>>> origin/master
