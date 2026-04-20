@@ -179,11 +179,78 @@ Unlike the Ubuntu flow there is no one-shot installer — `scripts/setup-dev-env
 
    Without this, VICE errors out with a `pcap_open_live` / BPF permission message when you try to attach `feth0`/`feth1`.
 
+7. **Passwordless sudo for bridge lifecycle AND the VICE ethernet tests.** Two things on macOS need root and are driven non-interactively by the harness, so both need NOPASSWD sudoers entries:
+
+   - **Bridge lifecycle** — setup, teardown, and cleanup of `bridge10` + `feth0`/`feth1` all require root (`ifconfig create`, `addm`, `up`, `inet` assignment). The harness invokes these three scripts from tests and CI.
+   - **`x64sc` itself** — on macOS 26, VICE's `pcap` driver cannot attach to a `feth` interface without root (see the "Caveats" section below for why `chmod 666 /dev/bpf*` is not sufficient on macOS 26). `ViceProcess.start()` wraps its argv with `sudo -n` when ethernet is enabled, so any ethernet test needs `/opt/homebrew/bin/x64sc` to be runnable without a password prompt. **This is required for the ethernet suite to pass on macOS 26**; the three bridge scripts alone are not enough.
+
+   Install a sudoers drop-in so it doesn't conflict with the main `/etc/sudoers`:
+
+   ```bash
+   sudo visudo -f /etc/sudoers.d/c64-test-harness
+   ```
+
+   Paste (substituting your username for `YOURUSER` and the repo path for `/path/to/c64-test-harness` if it lives elsewhere):
+
+   ```
+   # c64-test-harness -- passwordless sudo for bridge networking lifecycle
+   # and for the VICE ethernet tests (macOS 26 requires root for pcap on feth).
+   # Scoped to four binaries by absolute path; does NOT grant general sudo.
+   #
+   # SECURITY NOTE: the three bridge scripts live under a user-writable repo
+   # path, so anyone who can write there can effectively run commands as root
+   # via sudo. /opt/homebrew/bin/x64sc is owned by the Homebrew-admin user
+   # (the current login on a single-user Mac), so the login user can
+   # effectively run x64sc as root. Both caveats are acceptable on a
+   # single-user dev workstation; do NOT deploy this entry on a shared
+   # or multi-user host.
+
+   YOURUSER ALL=(root) NOPASSWD: /path/to/c64-test-harness/scripts/setup-bridge-feth-macos.sh, \
+                                 /path/to/c64-test-harness/scripts/teardown-bridge-feth-macos.sh, \
+                                 /path/to/c64-test-harness/scripts/cleanup-bridge-feth-macos.sh, \
+                                 /opt/homebrew/bin/x64sc
+   ```
+
+   `visudo -f` syntax-checks the file before writing — a typo won't lock you out. Verify with:
+
+   ```bash
+   sudo -n -l /path/to/c64-test-harness/scripts/setup-bridge-feth-macos.sh
+   sudo -n -l /opt/homebrew/bin/x64sc
+   ```
+
+   each of which should print the NOPASSWD match instead of prompting for a password. `scripts/verify-dev-env.sh` checks each of the three bridge scripts and `/opt/homebrew/bin/x64sc` for a NOPASSWD entry and reports `warn` for any that are missing.
+
 ### Caveats
 
 - The Homebrew `vice` formula already passes `--enable-ethernet`, so `-ethernetcart` / `-ethernetioif` / `-ethernetiodriver` are available and `verify-dev-env.sh` reports the VICE section green.
 - On macOS 26 (Tahoe), the VICE 3.10 bottle prints a cosmetic `Error - failed to retrieve executable path, falling back to getcwd() + argv[0]` on every launch. `-help`, `-features`, and normal emulator launches proceed past it and work correctly, including `-binarymonitor`. The one case that does *not* recover is `x64sc --version`, which exits 1 after the error because VICE's init-order bug hits a NULL `argv[0]` reference before the path is stashed. `verify-dev-env.sh` works around this by falling back to `brew list --versions vice`, the Cellar path, and finally a `-features` probe. File upstream if we want a real fix.
-- On macOS 26 (Tahoe), launching the Homebrew `x64sc` 3.10 bottle with `-ethernetiodriver pcap -ethernetioif feth<N> -binarymonitor` additionally crashes during startup -- the process exits before the binary monitor becomes reachable, and the host raises a system crash reporter dialog for `x64sc`. Root cause is upstream and likely in the same init-order cluster as the `--version` crash above (the pcap init path runs before `archdep_program_path_set_argv0()` on this macOS release). The `tests/test_ethernet.py` fixture protects itself by importing `bridge_platform.probe_vice_pcap_ok()`, which launches a throwaway `x64sc` once per process to check whether the pcap driver survives startup; on failure the ethernet tests skip with a clear reason instead of torpedoing the suite. Override the probe with `MACOS_PCAP_DISABLED=1` (skip without probing) or `MACOS_PCAP_ENABLED=1` (trust the user without probing). Reproduce the crash interactively with `scripts/probe-vice-feth.sh`. File upstream once we have a small non-harness repro.
+- On macOS 26 (Tahoe), VICE's `pcap` ethernet driver requires **root** to attach to a `feth` interface. `/dev/bpf*` being world-readable/writable (mode 666, whether via `sudo chmod 666` or Wireshark's ChmodBPF helper) is NOT sufficient: the macOS 26 kernel enforces an additional per-process BPF-device attach check that is root-only. When a non-root `x64sc` hits that check, `pcap_open_live()` fails; VICE's error path then leaves `rawnet_arch_driver` as NULL, and the subsequent `cs8900_activate` derefs it. The observed symptom is a SIGSEGV at `rawnet_arch_pre_reset+8` inside `cs8900_activate`:
+
+  ```
+  rawnet_arch_pre_reset + 8        <- NULL deref at offset 8
+    cs8900_reset
+    cs8900_activate
+    cs8900io_activate
+    cs8900io_enable
+    set_ethernetcart_enabled
+    resources_read_item_from_file  (when -addconfig is used)
+    resources_load
+    cmdline_parse
+  ```
+
+  Earlier investigations mistook this for an upstream VICE init-order bug, because the crash looks identical to a missing-driver init race. The actual cause is the privilege check — running the same `x64sc` invocation under `sudo -n` makes everything Just Work end-to-end (pcap attaches to `feth0`, binary monitor reachable, `ETHERNETCART_ACTIVE=1` holds).
+
+  The harness works around this automatically:
+
+  - `ViceConfig.run_as_root: bool | None = None` auto-detects to `True` on Darwin when `ethernet=True`, and can be pinned explicitly on either platform.
+  - `ViceProcess.start()` wraps the argv with `sudo -n` when `run_as_root` is true; `ViceProcess.stop()` routes signals via `sudo -n kill` for the root-owned child.
+  - `tests/bridge_platform.py:probe_vice_pcap_ok()` launches its throwaway probe under `sudo -n` too, so the probe result matches what the tests will see.
+
+  The `sudo -n` wrap is **non-interactive**: it requires a passwordless sudoers entry for `/opt/homebrew/bin/x64sc` on macOS dev hosts. See the "Passwordless sudo for bridge lifecycle" subsection above — the same sudoers drop-in that covers the three bridge scripts now also needs an `x64sc` entry. `scripts/verify-dev-env.sh` reports a `warn` row if the entry is missing.
+
+  Escape hatches still work the same way: `MACOS_PCAP_DISABLED=1` force-skips the ethernet suite without running the probe, and `MACOS_PCAP_ENABLED=1` trusts the user and skips the probe. Reproduce the working launch interactively with `scripts/probe-vice-feth.sh` (which runs VICE under `sudo -n` by default; `--no-sudo` opts out for future hosts where ChmodBPF/TCC changes make non-root pcap work).
+
+  Quality-of-life upstream item (not blocking): the "silent NULL driver on pcap init failure" is worth reporting to VICE — a clean error-and-exit instead of a deferred NULL deref would have shortened this debugging loop considerably. File when convenient.
 - `tests/test_port_lock.py` has three tests (`test_cross_process_exclusion`, `test_lock_released_on_process_exit`, `test_cleanup_does_not_break_held_lock`) that use `multiprocessing` with nested helper functions; these fail on macOS because the default multiprocessing start method is `spawn` (Linux defaults to `fork`) and nested functions can't be pickled. Non-blocking for dev work, but worth fixing if we want green CI on macOS.
 
 ## Follow-ups not in this PR

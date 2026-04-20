@@ -10,6 +10,7 @@ import os
 import platform
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -132,6 +133,17 @@ class ViceConfig:
     ethernet_base: int = 0xDE00  # I/O base address
     ethernet_mac: bytes = b""  # 6-byte MAC (empty = VICE default)
 
+    # Run VICE as root. Required on macOS whenever the pcap ethernet driver
+    # is used: even with /dev/bpf* mode 666, the kernel's per-process BPF
+    # device allocation refuses to let a non-root process capture on a
+    # feth(4) interface, and VICE's error path leaves rawnet_arch_driver
+    # NULL so cs8900_activate segfaults.  The harness wraps the launch
+    # with ``sudo -n -E`` in that case; the caller must have a passwordless
+    # sudoers entry for x64sc (see docs/development.md -> macOS ->
+    # Passwordless sudo).  ``None`` means auto-detect: True on Darwin when
+    # ethernet is enabled, False otherwise.  Set explicitly to override.
+    run_as_root: bool | None = None
+
 
 class ViceProcess:
     """Context manager for a VICE emulator process.
@@ -150,6 +162,11 @@ class ViceProcess:
         # Temp vicerc used to activate CS8900a ethernet (see start()).
         # Cleaned up in stop().
         self._tmp_vicerc: str | None = None
+        # True when the child was launched via ``sudo -n -E`` so it runs as
+        # root.  stop() uses this flag to route SIGTERM / SIGKILL through
+        # ``sudo -n kill`` instead of Popen.terminate(), which on macOS
+        # cannot signal a root-owned child from an unprivileged parent.
+        self._is_sudo_child: bool = False
 
     def __enter__(self) -> ViceProcess:
         self.start()
@@ -273,6 +290,29 @@ class ViceProcess:
         if cfg.env is not None:
             popen_kwargs["env"] = cfg.env
 
+        # Decide whether to wrap with sudo.  On macOS, VICE's pcap driver
+        # needs root to open a BPF device for feth(4) capture; running as
+        # the user segfaults inside cs8900_activate (NULL rawnet_arch_driver
+        # after pcap init fails).  The wrap happens at exec time so the
+        # sudo failure mode is clean: if NOPASSWD isn't configured, Popen
+        # starts but exits with a "sudo: password is required" error on
+        # stderr and a non-zero status, and the caller sees "VICE exited
+        # early" through the normal monitor-connect path.
+        run_as_root = cfg.run_as_root
+        if run_as_root is None:
+            run_as_root = sys.platform == "darwin" and cfg.ethernet
+        if run_as_root:
+            # -E (preserve env) requires a SETENV tag in sudoers which we
+            # deliberately do NOT ask for -- it's a privilege expansion.
+            # VICE reads $HOME for its config path, but sudo's default
+            # env_keep includes HOME, so plain `sudo -n` works.
+            args = ["sudo", "-n"] + args
+            # Track that we're running under sudo so stop() can send SIGTERM
+            # via sudo as well (direct kill of a root child is refused).
+            self._is_sudo_child = True
+        else:
+            self._is_sudo_child = False
+
         self._proc = subprocess.Popen(args, **popen_kwargs)  # type: ignore[arg-type]
 
     def wait_for_exit(self, timeout: float = 60.0) -> int:
@@ -298,13 +338,51 @@ class ViceProcess:
             self._proc = None
 
     def stop(self) -> None:
-        """Terminate VICE: SIGTERM → wait 5s → SIGKILL fallback."""
+        """Terminate VICE: SIGTERM → wait 5s → SIGKILL fallback.
+
+        When VICE is running as root (macOS ethernet path), signals from
+        an unprivileged parent are dropped.  In that case we route the
+        terminate / kill via ``sudo -n kill``; if the sudo invocation
+        itself is the Popen target, signalling sudo forwards to x64sc
+        (sudo's default signal-forwarding behaviour on POSIX), so we try
+        that first and only escalate to ``sudo -n kill -9 <x64sc-pid>``
+        if sudo itself refuses to exit.
+        """
         if self._proc is None:
             self._cleanup_tmp_vicerc()
             return
+
         try:
-            self._proc.terminate()
-            self._proc.wait(timeout=5)
+            if self._is_sudo_child:
+                # sudo forwards SIGTERM to its child when it runs in the
+                # foreground.  SIGTERM → sudo → x64sc (as root).
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    # sudo / x64sc didn't exit; find the root child and kill
+                    # it with sudo, then give Popen a moment to reap.
+                    child_pid = self._find_x64sc_child_pid()
+                    if child_pid is not None:
+                        subprocess.run(
+                            ["sudo", "-n", "kill", "-9", str(child_pid)],
+                            check=False,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    try:
+                        self._proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        # Last resort: kill the sudo wrapper too.  Works
+                        # because sudo itself runs as our UID (it elevates
+                        # only its exec'd child).
+                        try:
+                            self._proc.kill()
+                        except Exception:
+                            pass
+            else:
+                self._proc.terminate()
+                self._proc.wait(timeout=5)
         except Exception:
             try:
                 self._proc.kill()
@@ -312,6 +390,42 @@ class ViceProcess:
                 pass
         self._proc = None
         self._cleanup_tmp_vicerc()
+
+    def _find_x64sc_child_pid(self) -> int | None:
+        """Find the x64sc process spawned under our sudo wrapper.
+
+        Only meaningful when ``self._is_sudo_child`` is True.  Returns the
+        PID of an x64sc process whose parent is our Popen child (the sudo
+        wrapper), or None if no such process is found.  Uses ``ps -axo
+        pid,ppid,comm`` which is available on both Linux and macOS.
+        """
+        if self._proc is None:
+            return None
+        sudo_pid = self._proc.pid
+        try:
+            out = subprocess.run(
+                ["ps", "-axo", "pid=,ppid=,comm="],
+                capture_output=True,
+                check=False,
+                text=True,
+            ).stdout
+        except OSError:
+            return None
+        for line in out.splitlines():
+            parts = line.strip().split(None, 2)
+            if len(parts) < 3:
+                continue
+            try:
+                pid = int(parts[0])
+                ppid = int(parts[1])
+            except ValueError:
+                continue
+            comm = parts[2]
+            # On macOS `comm` may be the full path; match on basename.
+            name = os.path.basename(comm)
+            if ppid == sudo_pid and name == "x64sc":
+                return pid
+        return None
 
     def _cleanup_tmp_vicerc(self) -> None:
         if self._tmp_vicerc is not None:
