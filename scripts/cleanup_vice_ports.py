@@ -2,10 +2,17 @@
 """Port-range-scoped VICE process cleanup for emergency recovery.
 
 Finds VICE binary-monitor TCP ports that still have listeners, resolves
-each to a PID via /proc/net/tcp, verifies the PID belongs to x64sc
-(via /proc/<pid>/comm), then sends SIGTERM followed by SIGKILL after a
-short grace period. Only touches processes bound to the specified
-port range -- never uses pkill.
+each to a PID, verifies the PID belongs to x64sc, then sends SIGTERM
+followed by SIGKILL after a short grace period. Only touches processes
+bound to the specified port range -- never uses pkill.
+
+Supported platforms:
+    Linux -- resolves PIDs via /proc/net/tcp and verifies comm via
+             /proc/<pid>/comm.
+    macOS -- resolves PIDs via `lsof -nP -iTCP:<port> -sTCP:LISTEN -t`
+             and verifies comm via `ps -p <pid> -o ucomm=` (accounting
+             name, basename-of-argv0, 15-char cap -- same semantics as
+             /proc/<pid>/comm on Linux).
 
 This is the reference pattern for VICE lifecycle cleanup in the
 c64-test-harness project. See docs/bridge_networking.md for the full
@@ -26,22 +33,28 @@ Exit codes:
          process is x64sc). Re-run with sudo.
 
 Running unprivileged:
-    On systems where x64sc has file capabilities (cap_net_admin,
+    On Linux systems where x64sc has file capabilities (cap_net_admin,
     cap_net_raw=ep), x64sc processes are non-dumpable and
-    /proc/<pid>/comm returns EACCES for unprivileged callers. This
-    helper will detect the condition, print a warning to stderr, and
-    exit with code 3 rather than silently reporting zero hits. Run
-    with sudo (or via sudo scripts/cleanup-bridge-networking.sh) to
-    signal VICE processes in that configuration.
+    /proc/<pid>/comm returns EACCES for unprivileged callers.
+    On macOS, lsof can only see sockets owned by other UIDs when run
+    as root. In either case, the helper detects the condition, prints
+    a warning to stderr, and exits with code 3 rather than silently
+    reporting zero hits. Run with sudo (or via the platform-appropriate
+    cleanup-bridge-*.sh wrapper) to signal VICE processes.
 """
 from __future__ import annotations
 
 import argparse
 import os
+import platform
 import signal
+import subprocess
 import sys
 import time
 from typing import Iterable
+
+IS_MACOS = platform.system() == "Darwin"
+IS_LINUX = platform.system() == "Linux"
 
 DEFAULT_COMM = "x64sc"
 DEFAULT_GRACE = 2.0
@@ -146,12 +159,65 @@ def _inline_find_pid_on_port(port: int) -> int | None:
     return None
 
 
+def _macos_find_pid_on_port(port: int) -> int | None:
+    """Find the listener PID on *port* using ``lsof`` (macOS).
+
+    Returns the first pid returned by ``lsof -nP -iTCP:<port> -sTCP:LISTEN -t``
+    or ``None`` if no listener is found / lsof is unavailable.
+    """
+    try:
+        out = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    lines = [line.strip() for line in out.stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    try:
+        return int(lines[0])
+    except ValueError:
+        return None
+
+
+def _macos_comm_of(pid: int) -> str | None:
+    """Return the short comm name of *pid* using ``ps`` (macOS).
+
+    Uses ``ps -p <pid> -o ucomm=`` which returns the accounting name
+    (basename of argv[0], 15-char cap) -- the same shape as Linux's
+    ``/proc/<pid>/comm``. Returns ``None`` if the pid is gone or ps
+    fails.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "ucomm="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    name = out.stdout.strip()
+    return name or None
+
+
 def _load_get_listener_pid():
     """Return a callable ``get_listener_pid(port) -> int | None``.
 
-    Tries to use ``ViceProcess.get_listener_pid`` from the harness package;
-    falls back to an inline /proc/net/tcp parser.
+    On macOS uses the lsof-based resolver directly (ViceProcess.get_listener_pid
+    is Linux-only and returns None on macOS). On Linux tries
+    ``ViceProcess.get_listener_pid`` first, then falls back to the inline
+    /proc/net/tcp parser.
     """
+    if IS_MACOS:
+        return _macos_find_pid_on_port
     try:
         from c64_test_harness.backends.vice_lifecycle import ViceProcess  # type: ignore
 
@@ -164,7 +230,13 @@ get_listener_pid = _load_get_listener_pid()
 
 
 def comm_of(pid: int) -> str | None:
-    """Return ``/proc/<pid>/comm`` stripped, or ``None`` if the pid is gone."""
+    """Return the short command name of *pid*, or ``None`` if the pid is gone.
+
+    Linux: reads ``/proc/<pid>/comm``.
+    macOS: runs ``ps -p <pid> -o ucomm=``.
+    """
+    if IS_MACOS:
+        return _macos_comm_of(pid)
     try:
         with open(f"/proc/{pid}/comm", "r") as f:
             return f.read().strip()
@@ -239,28 +311,37 @@ def kill_vice_ports(
             # Silent-failure condition: we have candidate PIDs but no
             # way to verify them. Complain loudly on stderr and return
             # the sentinel so main() can map it to exit code 3.
+            verify_source = "`ps -p <pid> -o ucomm=`" if IS_MACOS else "/proc/<pid>/comm"
+            priv_note = (
+                "lsof found the listener but ps could not report its ucomm "
+                "(likely a permission or SIP-protected process)."
+                if IS_MACOS
+                else (
+                    "x64sc has file capabilities that make processes "
+                    "non-dumpable, so /proc/<pid>/comm returns EACCES."
+                )
+            )
+            wrapper_script = (
+                "scripts/cleanup-bridge-feth-macos.sh"
+                if IS_MACOS
+                else "scripts/cleanup-bridge-networking.sh"
+            )
             print(
                 f"[cleanup] WARNING: found {listeners_found} listener(s) in "
                 "the requested range(s) but",
                 file=sys.stderr,
             )
             print(
-                "[cleanup]          could not read /proc/<pid>/comm for any "
+                f"[cleanup]          could not read {verify_source} for any "
                 "of them.",
                 file=sys.stderr,
             )
             print(
-                "[cleanup]          This usually means the helper is running "
-                "without",
+                f"[cleanup]          {priv_note}",
                 file=sys.stderr,
             )
             print(
-                "[cleanup]          sufficient privileges (x64sc has file "
-                "capabilities",
-                file=sys.stderr,
-            )
-            print(
-                "[cleanup]          that make processes non-dumpable). Try:",
+                "[cleanup]          Try:",
                 file=sys.stderr,
             )
             print(
@@ -268,7 +349,7 @@ def kill_vice_ports(
                 file=sys.stderr,
             )
             print(
-                "[cleanup]          Or invoke via `sudo scripts/cleanup-bridge-networking.sh`.",
+                f"[cleanup]          Or invoke via `sudo {wrapper_script}`.",
                 file=sys.stderr,
             )
             return EXIT_UNVERIFIABLE
@@ -360,7 +441,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--comm",
         default=DEFAULT_COMM,
-        help=f"Required /proc/<pid>/comm value (default: {DEFAULT_COMM})",
+        help=(
+            "Required process short-name to match (Linux /proc/<pid>/comm or "
+            f"macOS `ps -o ucomm=`). Default: {DEFAULT_COMM}"
+        ),
     )
     parser.add_argument(
         "--grace-seconds",
