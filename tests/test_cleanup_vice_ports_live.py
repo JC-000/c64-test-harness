@@ -20,6 +20,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -37,6 +38,15 @@ SENTINEL_PORT = 7031  # outside every harness range (6511-6531, 6560-6580)
 
 
 pytestmark = [
+    pytest.mark.skipif(
+        sys.platform != "linux",
+        reason=(
+            "Uses /proc, /sys/class/net, ip link, and iptables to snapshot host "
+            "network state -- Linux-only. The cleanup_vice_ports.py helper itself "
+            "is cross-platform; macOS coverage should come from a new feth/bridge10 "
+            "equivalent test (TODO) rather than trying to port these sysfs probes."
+        ),
+    ),
     pytest.mark.skipif(
         os.environ.get("BRIDGE_CLEANUP_LIVE") != "1",
         reason="live bridge cleanup test -- opt in with BRIDGE_CLEANUP_LIVE=1",

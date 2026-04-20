@@ -1,22 +1,27 @@
 # Bridge networking for two-VICE tests
 
-This document describes how to set up and use the **two-VICE Linux
-bridge** pattern for tests that need to exchange ethernet frames
-between two C64 emulator instances.
+This document describes how to set up and use the **two-VICE bridge**
+pattern for tests that need to exchange ethernet frames between two C64
+emulator instances. Both Linux (TAP + Linux bridge) and macOS (feth +
+BSD bridge) are supported; the cross-platform dispatch module lives in
+`tests/bridge_platform.py` (constants `ETHERNET_DRIVER`, `IFACE_A`,
+`IFACE_B`, `BRIDGE_NAME`, `SETUP_HINT`).
 
 ## Overview
 
-The pattern uses:
+The pattern uses (Linux naming shown; macOS equivalents in parentheses):
 
-* `br-c64` -- a Linux network bridge
-* `tap-c64-0` and `tap-c64-1` -- two TAP interfaces attached to the
-  bridge, one per VICE instance
+* `br-c64` (macOS: `bridge10`) -- a host network bridge
+* `tap-c64-0` / `tap-c64-1` (macOS: `feth0` / `feth1`) -- two
+  bridge-member interfaces, one per VICE instance
 * Two `x64sc` processes, each launched with RR-Net-mode CS8900a
-  ethernet bound to its TAP interface
+  ethernet bound to its interface (VICE's `tuntap` driver on Linux,
+  `pcap` driver on macOS)
 
 This setup gives two VICE instances a shared layer-2 segment.  The
-host can also participate (the bridge's IP is `10.0.65.1`), so
-captures via `tcpdump -i br-c64` will show all traffic between the
+host can also participate (the bridge's IP is `10.0.65.1` on both
+platforms), so captures via `tcpdump -i br-c64` (Linux) or
+`tcpdump -i bridge10` (macOS) will show all traffic between the
 instances.
 
 ## Reference pattern for VICE agents
@@ -27,7 +32,8 @@ can exchange ethernet frames, use this canonical lifecycle:
 1. **Setup** (once per session, as root):
 
    ```bash
-   sudo scripts/setup-bridge-tap.sh
+   sudo scripts/setup-bridge-tap.sh            # Linux
+   sudo scripts/setup-bridge-feth-macos.sh     # macOS
    ```
 
 2. **Acquire VICE instances** via the `bridge_vice_pair` pytest fixture
@@ -42,13 +48,15 @@ can exchange ethernet frames, use this canonical lifecycle:
 4. **Teardown** (after the last session completes, as root):
 
    ```bash
-   sudo scripts/teardown-bridge-tap.sh
+   sudo scripts/teardown-bridge-tap.sh           # Linux
+   sudo scripts/teardown-bridge-feth-macos.sh    # macOS
    ```
 
 5. **Recovery** (only if a session died uncleanly, leaving residue):
 
    ```bash
-   sudo scripts/cleanup-bridge-networking.sh
+   sudo scripts/cleanup-bridge-networking.sh     # Linux
+   sudo scripts/cleanup-bridge-feth-macos.sh     # macOS
    ```
 
 ### Rules for VICE lifecycle
@@ -62,14 +70,17 @@ can exchange ethernet frames, use this canonical lifecycle:
   `ViceProcess.__exit__` / `ViceInstanceManager.release()` stop VICE
   cleanly.  The cleanup script is only for the "my session crashed"
   case.
-- **Setup and teardown are symmetric.** They touch exactly these
-  resources: the `br-c64` bridge, `tap-c64-0` / `tap-c64-1` TAP devices,
-  six FORWARD iptables rules, and `/tmp/vice_eth_*.rc` stale files.
-  They never touch `/proc/sys/net/ipv4/ip_forward` — the host default
-  is preserved.
-- **Interface names are canonical.** The fixture, setup script,
-  teardown script, and cleanup script all agree on `br-c64` /
-  `tap-c64-{0,1}`.  Don't drift — update all four files in lockstep if
+- **Setup and teardown are symmetric.** On Linux they touch exactly
+  these resources: the `br-c64` bridge, `tap-c64-0` / `tap-c64-1` TAP
+  devices, six FORWARD iptables rules, and `/tmp/vice_eth_*.rc` stale
+  files.  They never touch `/proc/sys/net/ipv4/ip_forward` — the host
+  default is preserved.  On macOS the scope is `bridge10` + `feth0` /
+  `feth1` + `/tmp/vice_eth_*.rc`; no pf/iptables state is involved.
+- **Interface names are canonical per platform.** The fixture, setup
+  script, teardown script, and cleanup script all agree on
+  `br-c64` / `tap-c64-{0,1}` (Linux) or `bridge10` / `feth{0,1}`
+  (macOS).  The single source of truth is `tests/bridge_platform.py`;
+  don't drift — update that module and all four scripts in lockstep if
   you ever need to rename.
 - **Port ranges for harness VICE instances**: `6511-6531` and
   `6560-6580` (per `HarnessConfig.vice_port_range_start/end` and the
@@ -77,6 +88,15 @@ can exchange ethernet frames, use this canonical lifecycle:
   ranges by default.
 
 ### Recovery helper
+
+Both platforms ship a standalone sudo cleanup script
+(`scripts/cleanup-bridge-networking.sh` on Linux,
+`scripts/cleanup-bridge-feth-macos.sh` on macOS) and share
+`scripts/cleanup_vice_ports.py` for the scoped VICE-kill step. The
+Python helper is cross-platform: it discovers harness-port listeners via
+`/proc/net/tcp` on Linux and `lsof`/`ps` on macOS, and `ViceProcess`'s
+port-based introspection (`get_listener_pid`, `kill_on_port`) likewise
+supports both platforms natively.
 
 `scripts/cleanup_vice_ports.py` is the port-range-scoped VICE killer:
 
@@ -86,24 +106,24 @@ python3 scripts/cleanup_vice_ports.py --range 6511:6531 --dry-run
 python3 scripts/cleanup_vice_ports.py --help
 ```
 
-It reads `/proc/net/tcp` for listeners in the requested ranges, resolves
-each to a PID, verifies `/proc/<pid>/comm == x64sc`, then SIGTERMs,
-waits a grace period (default 2 s), and SIGKILLs survivors.  Safe to
-run while unrelated VICE instances (outside the harness port ranges)
-are alive — they won't be touched.  Exit code is `0` on a clean result,
-`1` if any process is still alive after SIGKILL, `2` on argument error,
-and `3` if listener(s) were found but `/proc/<pid>/comm` could not be
-read for any of them (insufficient privileges).
+It resolves listeners in the requested ranges to PIDs, verifies the
+process is `x64sc` (comm check via `/proc/<pid>/comm` on Linux or `ps`
+on macOS), then SIGTERMs, waits a grace period (default 2 s), and
+SIGKILLs survivors.  Safe to run while unrelated VICE instances
+(outside the harness port ranges) are alive — they won't be touched.
+Exit code is `0` on a clean result, `1` if any process is still alive
+after SIGKILL, `2` on argument error, and `3` if listener(s) were found
+but comm could not be read for any of them (insufficient privileges —
+re-run with `sudo`).
 
-If the helper reports "listener(s) found but could not read
-`/proc/<pid>/comm`" (exit 3), re-run with `sudo` — `x64sc` file
-capabilities (`cap_net_admin,cap_net_raw=ep`) make unprivileged comm
-reads fail, which the helper now detects and flags instead of silently
-reporting zero.
+On Linux specifically, exit 3 is typically caused by `x64sc` file
+capabilities (`cap_net_admin,cap_net_raw=ep`) making unprivileged
+`/proc/<pid>/comm` reads fail; the helper detects this and flags it
+instead of silently reporting zero.
 
 The scoping is empirically verified by `tests/test_cleanup_vice_ports_live.py::TestBridgeCleanupScoping::test_scoped_cleanup_preserves_out_of_range_vice` (opt in with `BRIDGE_CLEANUP_LIVE=1`).
 
-## Prerequisites
+## Prerequisites (Linux)
 
 * `x64sc` (VICE 3.10) compiled with `tuntap` driver support
 * Root privileges to create TAP devices and configure the bridge
@@ -111,7 +131,7 @@ The scoping is empirically verified by `tests/test_cleanup_vice_ports_live.py::T
 * `ip` (iproute2) and `iptables`
 * The c64-test-harness package (`c64_test_harness.bridge_ping`)
 
-## Setting up the bridge
+## Setting up the bridge (Linux)
 
 ```bash
 sudo ./scripts/setup-bridge-tap.sh
@@ -134,6 +154,77 @@ If something goes wrong, an emergency cleanup is available:
 sudo ./scripts/cleanup-bridge-networking.sh
 ```
 
+## macOS (feth + BSD bridge)
+
+The macOS path is a drop-in replacement for the Linux TAP layout. It
+uses `feth0`/`feth1` (a kernel "fake ethernet" peer pair) bridged via
+the BSD `bridge10` pseudo-device, all driven through `ifconfig`. VICE
+attaches with its `pcap` driver instead of `tuntap`, because macOS has
+no `/dev/net/tun` and `libpcap`-over-BPF is the portable path.
+
+```
+   host (10.0.65.1 on bridge10)
+              |
+         +----+----+
+         | bridge10|
+         +----+----+
+          /        \
+      feth0      feth1        (peered; frames pass through bridge10)
+        |          |
+      VICE A     VICE B       (-ethernetiodriver pcap -ethernetioif fethN)
+```
+
+Lifecycle (see the reference patterns below — do not inline the ifconfig
+steps in agent code; call the scripts):
+
+```bash
+sudo ./scripts/setup-bridge-feth-macos.sh       # create bridge10 + feth0/feth1
+sudo ./scripts/teardown-bridge-feth-macos.sh    # symmetric teardown
+sudo ./scripts/cleanup-bridge-feth-macos.sh     # emergency recovery (scoped VICE kill)
+```
+
+The setup script is idempotent. Internally it runs, roughly:
+
+```bash
+ifconfig feth0 create
+ifconfig feth1 create
+ifconfig feth0 peer feth1
+ifconfig feth0 up && ifconfig feth1 up
+ifconfig bridge10 create
+ifconfig bridge10 addm feth0
+ifconfig bridge10 addm feth1
+ifconfig bridge10 inet 10.0.65.1 netmask 255.255.255.0 up
+```
+
+Prerequisites:
+
+* `x64sc` (VICE 3.10 Homebrew bottle — pre-built with `--enable-ethernet`
+  and the pcap driver)
+* Root privileges for `ifconfig create`/`addm` (only for setup/teardown;
+  VICE itself runs unprivileged)
+* `/dev/bpf*` readable by your user — install Wireshark's **ChmodBPF**
+  helper (recommended) or `sudo chmod 666 /dev/bpf*` for a one-shot
+  (resets on reboot). Without this, VICE's pcap driver fails to attach
+  `feth0`/`feth1` with a `pcap_open_live` / BPF permission error.
+* The c64-test-harness package (`c64_test_harness.bridge_ping`)
+
+Notes:
+
+* The macOS setup does **not** configure a host firewall. There is no
+  pf ruleset or NAT layer analogous to the Linux `iptables FORWARD`
+  rules — the BSD bridge driver forwards freely between its members,
+  and no outside-host routing is involved. Teardown therefore has no
+  pf state to reverse.
+* We deliberately use `bridge10` rather than `bridge0`. `bridge0` is a
+  pre-existing system bridge on macOS (Thunderbolt / Internet Sharing)
+  that may already have system interfaces as members; attaching `feth`
+  peers or assigning our IP to it would pollute it.
+* VICE attachment: each instance is launched with
+  `-ethernetiodriver pcap -ethernetioif feth0` (or `feth1`). The
+  `ViceConfig` mapping handles this automatically when
+  `ethernet_driver="pcap"` is set — see `tests/bridge_platform.py` for
+  the `ETHERNET_DRIVER` constant that the fixtures read.
+
 ## Launching two VICE instances on the bridge
 
 The simplest way is to use the `bridge_vice_pair` pytest fixture
@@ -149,7 +240,9 @@ The fixture handles port allocation, VICE process lifecycle, BASIC
 READY synchronization, CS8900a initialization (RxCTL + LineCTL), and
 unique MAC programming.
 
-To launch manually:
+To launch manually (Linux values shown; on macOS substitute
+`ethernet_interface="feth0"`/`"feth1"` and `ethernet_driver="pcap"` —
+or pull both from `tests/bridge_platform.py`):
 
 ```python
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
@@ -449,7 +542,13 @@ MHz turbo speeds (gated by `U64_HOST`).
 * `tests/test_bridge_ping_tod.py` -- live TOD-based bridge ping round
   trip on VICE normal mode (shippable-application path) plus live
   U64 TOD primitive test across turbo speeds
-* `scripts/setup-bridge-tap.sh` and `scripts/teardown-bridge-tap.sh`
+* `scripts/setup-bridge-tap.sh` / `scripts/teardown-bridge-tap.sh` /
+  `scripts/cleanup-bridge-networking.sh` (Linux)
+* `scripts/setup-bridge-feth-macos.sh` /
+  `scripts/teardown-bridge-feth-macos.sh` /
+  `scripts/cleanup-bridge-feth-macos.sh` (macOS)
+* `tests/bridge_platform.py` — cross-platform constants
+  (`ETHERNET_DRIVER`, `IFACE_A`, `IFACE_B`, `BRIDGE_NAME`, `SETUP_HINT`)
 * `tests/test_bridge_ping.py::TestBridgeIcmpRoundTrip` -- full
   round-trip test where B's 6502 responder swaps IPs/MACs and TXes
   an ICMP echo reply in the same JSR that consumed the request

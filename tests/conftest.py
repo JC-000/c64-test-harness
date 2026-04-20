@@ -144,7 +144,8 @@ def binary_transport():
 
 
 # ---------------------------------------------------------------------------
-# Bridge networking fixtures (two VICE instances on a Linux bridge)
+# Bridge networking fixtures (two VICE instances on a platform-specific
+# bridge — Linux TAP / macOS feth; see ``tests/bridge_platform.py``)
 # ---------------------------------------------------------------------------
 
 # Default MACs and IPs used by the bridge_vice_pair fixture
@@ -194,27 +195,34 @@ def _bridge_init_cs8900a(transport: BinaryViceTransport, scratch: int, code: int
 
 @pytest.fixture(scope="module")
 def bridge_vice_pair():
-    """Launch two VICE instances with RR-Net ethernet on a Linux bridge.
+    """Launch two VICE instances with RR-Net ethernet on an L2 bridge.
 
     Yields ``(transport_a, transport_b)`` -- both connected, at BASIC
     READY, CS8900a initialised, and with unique MACs programmed
-    (``BRIDGE_MAC_A`` on tap-c64-0, ``BRIDGE_MAC_B`` on tap-c64-1).
+    (``BRIDGE_MAC_A`` on interface A, ``BRIDGE_MAC_B`` on interface B).
 
-    Skipped automatically if ``x64sc`` is not on PATH or if the
-    ``tap-c64-0`` / ``tap-c64-1`` interfaces are not present.  Run
-    ``sudo scripts/setup-bridge-tap.sh`` first to create them.
+    Platform dispatch lives in ``tests/bridge_platform.py``:
+      - Linux: ``tap-c64-0``/``tap-c64-1`` + ``tuntap`` driver
+      - macOS: ``feth0``/``feth1`` + ``pcap`` driver
 
-    Use this fixture for any test that needs two bridged C64 instances
-    sharing a layer-2 segment.  See ``docs/bridge_networking.md`` for
-    the full pattern.
+    Skipped automatically if ``x64sc`` is not on PATH or if the required
+    interfaces are not present. See ``docs/bridge_networking.md`` for the
+    full pattern.
     """
-    import os
+    from bridge_platform import (
+        ETHERNET_DRIVER,
+        IFACE_A,
+        IFACE_B,
+        SETUP_HINT,
+        iface_present,
+    )
+
     if shutil.which("x64sc") is None:
         pytest.skip("x64sc not found on PATH")
-    if not os.path.isdir("/sys/class/net/tap-c64-0"):
-        pytest.skip("tap-c64-0 not found (run scripts/setup-bridge-tap.sh)")
-    if not os.path.isdir("/sys/class/net/tap-c64-1"):
-        pytest.skip("tap-c64-1 not found (run scripts/setup-bridge-tap.sh)")
+    if not iface_present(IFACE_A):
+        pytest.skip(f"{IFACE_A} not found ({SETUP_HINT})")
+    if not iface_present(IFACE_B):
+        pytest.skip(f"{IFACE_B} not found ({SETUP_HINT})")
 
     from c64_test_harness.ethernet import set_cs8900a_mac
 
@@ -234,14 +242,14 @@ def bridge_vice_pair():
     config_a = ViceConfig(
         port=port_a, warp=False, sound=False,
         ethernet=True, ethernet_mode="rrnet",
-        ethernet_interface="tap-c64-0",
-        ethernet_driver="tuntap",
+        ethernet_interface=IFACE_A,
+        ethernet_driver=ETHERNET_DRIVER,
     )
     config_b = ViceConfig(
         port=port_b, warp=False, sound=False,
         ethernet=True, ethernet_mode="rrnet",
-        ethernet_interface="tap-c64-1",
-        ethernet_driver="tuntap",
+        ethernet_interface=IFACE_B,
+        ethernet_driver=ETHERNET_DRIVER,
     )
 
     vice_a = ViceProcess(config_a)
