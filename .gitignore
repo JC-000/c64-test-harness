@@ -6,3 +6,6 @@ dist/
 build/
 .pytest_cache/
 .serena/
+
+# Claude Code local/user-specific settings
+.claude/settings.local.json
