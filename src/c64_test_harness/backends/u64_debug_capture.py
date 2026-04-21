@@ -1,8 +1,27 @@
 """UDP debug stream capture from Ultimate 64 bus trace.
 
-The U64 streams cycle-accurate 6510 CPU bus traces over UDP.
-Each packet: 4-byte header (2-byte LE sequence + 2 reserved)
-followed by 360 × 4-byte LE entries, each representing one bus cycle.
+The U64 streams 6510/VIC bus traces over UDP. Each packet: 4-byte
+header (2-byte LE sequence + 2 reserved) followed by 360 × 4-byte LE
+entries, each representing one bus cycle.
+
+**Rate cap (measured, not a bug in this receiver)**
+
+The U64E FPGA emits the debug stream at a fixed rate of roughly
+**~850,000 entries per second** (≈ 2,400 UDP packets/sec) regardless
+of the CPU's actual turbo speed. This matches the 6510's native rate
+at 1 MHz, so at 1 MHz you get an essentially complete cycle-accurate
+trace. At higher turbo speeds you get a **uniformly sampled 1/N view**
+of the real bus: at 4 MHz you see ~1/4 of cycles, at 48 MHz ~1/48.
+The FPGA does NOT attempt to send everything and drop on overflow
+(sequence-number gaps stay at zero across speeds); it rate-limits at
+the source. See ``tests/test_u64_debug_stream_speed_live.py`` for
+the measurement.
+
+**Practical implication**: if your test needs a complete trace
+(call-graph, exact cycle count, bus-state transitions), set
+``set_turbo_mhz(client, 1)`` for the capture window. If you only need
+aggregate statistics (PC distribution, frequency maps), turbo-speed
+capture is fine because the sampling is uniform.
 
 Public API
 ----------
@@ -161,6 +180,15 @@ class DebugCapture:
 
     Raw bytes are accumulated during capture and parsed into BusCycle
     objects only on ``stop()`` to keep the recv loop fast at ~32 Mbps.
+
+    .. note::
+
+       The U64E debug stream is rate-capped at ~850k entries/sec at the
+       FPGA source (see the module docstring). At CPU turbo speeds you
+       receive a uniformly sampled ``1/N`` view of the bus, not a
+       dropped-during-send slice. ``packets_dropped`` stays at zero
+       regardless of turbo speed because the rate limit is applied
+       before emission. Drop to 1 MHz if you need a complete trace.
     """
 
     def __init__(
