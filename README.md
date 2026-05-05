@@ -33,6 +33,47 @@ pip install -e .
 
 Requires Python 3.10+. Zero runtime dependencies.
 
+## Verifying your dev environment
+
+Before running the full test suite (which needs VICE 3.10 built with ethernet support, bridge networking, and optionally an Ultimate 64 device), run the non-destructive environment check:
+
+```bash
+./scripts/verify-dev-env.sh
+```
+
+The script is **read-only**: it never launches VICE (only `--version` / `--help`), never runs pytest, never mutates networking, and never touches anything outside the repo. It reports presence of `x64sc`/`c1541`, whether VICE was built with `--enable-ethernet` (the main deployability blocker — distro packages usually omit it), Python harness import, bridge interfaces (`br-c64`, `tap-c64-*`), and optionally probes an Ultimate 64 over `/v1/version` when `U64_HOST` is set.
+
+```
+c64-test-harness dev environment check
+=======================================
+
+[VICE]
+  ✓ x64sc on PATH (/usr/local/bin/x64sc)
+  ✓ VICE version (VICE 3.10)
+  ✓ ethernet cart support (ethernet flags found in --help)
+  ✓ binary monitor support (-binarymonitor flag present)
+  ✓ text monitor support (-remotemonitor flag present)
+  ✓ c1541 on PATH (present)
+
+[Python]
+  ✓ python3 >= 3.10 (3.13.7)
+  ✓ c64_test_harness importable (version unknown)
+  ✓ pytest available (8.3.5)
+
+[Bridge networking]
+  ✗ br-c64 bridge (not found)
+  ✗ tap-c64-0 (not found)
+  ✗ tap-c64-1 (not found)
+
+[Fix hints]
+  -> Run: sudo ./scripts/setup-bridge-tap.sh
+
+Summary: 15 ok, 3 missing, 1 skipped
+Overall: READY (with optional gaps)
+```
+
+Options: `--quiet` (failures + summary only), `--json` (machine-readable), `--no-u64` (skip the U64 probe), `--u64-host HOST` (override `$U64_HOST`). Exit codes: `0` READY (optional gaps OK), `1` NOT READY (a critical check failed), `2` script error. See [docs/development.md](docs/development.md) for details.
+
 ## Quick Start
 
 ```python
@@ -781,6 +822,7 @@ Additional scripts in `scripts/`:
 | `scripts/validate_ping.py` | End-to-end ARP + ICMP ping through VICE CS8900a + TAP |
 | `scripts/bridge_ping_demo.py` | Visible two-VICE bridge ping demo (RR-Net, live on-screen counters; supports `--warp` via host-side wall-clock orchestrators) |
 | `scripts/verify_tod_warp.py` | Empirical CIA TOD behavior probe in normal vs warp mode (regression check for the wall-clock timeout design) |
+| `scripts/verify-dev-env.sh` | Non-destructive dev environment check (VICE build flags, Python harness, bridge interfaces, optional U64 probe) |
 
 ## Running Tests
 
