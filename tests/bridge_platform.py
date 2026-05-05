@@ -25,6 +25,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 
 if sys.platform == "darwin":
@@ -224,75 +225,124 @@ def probe_vice_pcap_ok(
         )
         return _PROBE_CACHE
 
-    port = _probe_port()
-    args = [
-        x64sc,
-        "-binarymonitor",
-        "-binarymonitoraddress", f"ip4://127.0.0.1:{port}",
-        "-ethernetiodriver", "pcap",
-        "-ethernetioif", iface,
-        "+sound",
-        "-minimized",
-        "-default",
-    ]
-
+    # Build the same ``-addconfig`` vicerc + CLI flag combination that
+    # ``ViceProcess`` uses in production (see
+    # ``src/c64_test_harness/backends/vice_lifecycle.py``).  This is the only
+    # invocation VICE 3.10 accepts for ethernet activation, so anything else
+    # would probe a flag pattern VICE rejects unconditionally and would
+    # tell us nothing about the pcap driver's actual health.
+    #
+    # Why NOT ``-ethernetiodriver pcap`` on a bare cmdline: the option is
+    # advertised in ``-help`` but its value set is populated by
+    # ``rawnet_arch_init()``, which the Homebrew build only runs when the
+    # cart is activated.  At parse time with no ``-addconfig`` loaded, the
+    # driver list is empty and VICE rejects ``pcap`` with
+    # ``Argument 'pcap' not valid``.  So the probe MUST go through
+    # ``-addconfig``.
+    rc_body = (
+        "[Version]\nConfigVersion=3.10\n\n"
+        "[C64SC]\n"
+        "ETHERNETCART_ACTIVE=1\n"
+        "EthernetCartMode=1\n"
+        f'EthernetIOIF="{iface}"\n'
+        'EthernetIODriver="pcap"\n'
+        "SaveResourcesOnExit=0\n"
+    )
+    fd, rc_path = tempfile.mkstemp(prefix="probe_pcap_", suffix=".rc")
     try:
-        proc = subprocess.Popen(
-            args,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-        )
-    except OSError as e:
-        _PROBE_CACHE = (False, f"could not spawn x64sc: {e}")
-        return _PROBE_CACHE
+        with os.fdopen(fd, "w") as f:
+            f.write(rc_body)
 
-    try:
-        deadline = time.monotonic() + timeout
-        monitor_up = False
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                # Exited during startup -- pcap is broken on this host.
-                break
-            if _wait_for_tcp("127.0.0.1", port, min(deadline, time.monotonic() + 0.5)):
-                monitor_up = True
-                break
-        if monitor_up:
-            _PROBE_CACHE = (
-                True,
-                f"VICE pcap+{iface} reached the binary monitor",
-            )
-        elif proc.poll() is not None:
-            _PROBE_CACHE = (
-                False,
-                (
-                    f"VICE (x64sc) exited during pcap+{iface} startup "
-                    f"(code={proc.returncode}); pcap driver is broken on "
-                    "this host.  See docs/development.md macOS caveats "
-                    "and scripts/probe-vice-feth.sh for a deeper probe."
-                ),
-            )
-        else:
-            _PROBE_CACHE = (
-                False,
-                (
-                    f"VICE pcap+{iface} did not open its binary monitor "
-                    f"within {timeout:.1f}s; assuming pcap is broken here."
-                ),
-            )
-    finally:
-        # Always clean up, even if we decide pcap is OK -- the probe
-        # process is throwaway either way.
+        port = _probe_port()
+        # VICE needs root on macOS for pcap on feth(4): /dev/bpf* mode 666
+        # is not enough -- the kernel refuses non-root BPF attach to feth.
+        # Probe under sudo -n so a host with passwordless sudo for x64sc
+        # gets a true "pcap works" result, while a host without it gets a
+        # clean "could not elevate" skip reason (sudo prints to stderr
+        # and exits non-zero, which we surface as process-exited below).
+        args = [
+            "sudo", "-n",
+            x64sc,
+            "-addconfig", rc_path,
+            "-ethernetioif", iface,
+            "-ethernetiodriver", "pcap",
+            "-binarymonitor",
+            "-binarymonitoraddress", f"ip4://127.0.0.1:{port}",
+            "+sound",
+            "-minimized",
+        ]
+
         try:
-            proc.terminate()
+            proc = subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+            )
+        except OSError as e:
+            _PROBE_CACHE = (False, f"could not spawn x64sc: {e}")
+            return _PROBE_CACHE
+
+        try:
+            # The crash mode on broken hosts (VICE 3.10 Homebrew bottle on
+            # macOS 26) is SIGSEGV inside ``cs8900_activate`` during the
+            # ``-addconfig`` rc-file load, which happens before the binary
+            # monitor socket is opened.  So ``proc.poll() != None`` very
+            # shortly after spawn is the signature of a broken host; a host
+            # that works surfaces the monitor within ~1-2s.
+            deadline = time.monotonic() + timeout
+            monitor_up = False
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    break
+                if _wait_for_tcp(
+                    "127.0.0.1", port, min(deadline, time.monotonic() + 0.5)
+                ):
+                    monitor_up = True
+                    break
+            if monitor_up:
+                _PROBE_CACHE = (
+                    True,
+                    f"VICE pcap+{iface} reached the binary monitor",
+                )
+            elif proc.poll() is not None:
+                _PROBE_CACHE = (
+                    False,
+                    (
+                        f"VICE (x64sc) exited during pcap+{iface} cart "
+                        f"activation (code={proc.returncode}); pcap driver "
+                        "is broken on this host.  Root cause: the "
+                        "EthernetIODriver resource setter does not populate "
+                        "rawnet_arch_driver before cs8900_activate runs, so "
+                        "cs8900_activate segfaults on a NULL driver vtable. "
+                        "See docs/development.md macOS caveats and "
+                        "scripts/probe-vice-feth.sh for a standalone probe."
+                    ),
+                )
+            else:
+                _PROBE_CACHE = (
+                    False,
+                    (
+                        f"VICE pcap+{iface} did not open its binary monitor "
+                        f"within {timeout:.1f}s; assuming pcap is broken here."
+                    ),
+                )
+        finally:
             try:
-                proc.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+                proc.terminate()
                 try:
                     proc.wait(timeout=1.0)
                 except subprocess.TimeoutExpired:
-                    pass
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        pass
+            except OSError:
+                pass
+    finally:
+        try:
+            os.unlink(rc_path)
         except OSError:
             pass
 

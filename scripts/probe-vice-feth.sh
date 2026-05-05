@@ -70,22 +70,50 @@ echo
 
 rm -f "$VICE_OUT"
 
+# VICE 3.10 ethernet activation has two quirks that must both be worked
+# around (see src/c64_test_harness/backends/vice_lifecycle.py for the
+# detailed comment block):
+#
+#   1. ``-ethernetcart`` is advertised in ``-help`` but rejected at parse
+#      time ("Option '-ethernetcart' not valid.").
+#   2. ``-ethernetiodriver <name>`` can only accept a value once
+#      ``rawnet_arch_init()`` has populated the registered-drivers list,
+#      which the Homebrew build only does as part of cart activation.
+#
+# The only invocation VICE 3.10 will actually accept is an ``-addconfig``
+# vicerc that sets ``ETHERNETCART_ACTIVE=1`` + the driver/iface, followed
+# by ``-ethernetioif`` / ``-ethernetiodriver`` on the cmdline to force
+# the host-side attach.  We write a tmp vicerc inline so this script is
+# standalone.
+RC_PATH="$(mktemp -t vice_probe_feth.XXXXXX.rc)"
+cat >"$RC_PATH" <<EOF
+[Version]
+ConfigVersion=3.10
+
+[C64SC]
+ETHERNETCART_ACTIVE=1
+EthernetCartMode=1
+EthernetIOIF="$FETH"
+EthernetIODriver="pcap"
+SaveResourcesOnExit=0
+EOF
 VICE_ARGS=(
+    -addconfig "$RC_PATH"
+    -ethernetioif "$FETH"
+    -ethernetiodriver pcap
     -binarymonitor
     -binarymonitoraddress "${MONITOR_HOST}:${MONITOR_PORT}"
-    -ethernetcart
-    -ethernetcartmode 1
-    -ethernetcartbase 0xde00
-    -ethernetiodriver pcap
-    -ethernetioif "$FETH"
     +sound
     -logtostdout
 )
 
 if [[ "$USE_SUDO" == "1" ]]; then
-    # -E preserves the env so VICE can find its data files via any VICE_*
-    # env vars the user has set. Background the process; we'll kill it.
-    sudo -E "$VICE_BIN" "${VICE_ARGS[@]}" >"$VICE_OUT" 2>&1 &
+    # -n makes sudo non-interactive so this script matches the harness's
+    # behaviour (ViceProcess.start() also uses `sudo -n`): a missing NOPASSWD
+    # entry fails loudly instead of hanging on a password prompt. VICE
+    # inherits HOME via sudo's default env_keep, which is enough to locate
+    # its data files; we drop -E on purpose for sudoers compatibility.
+    sudo -n "$VICE_BIN" "${VICE_ARGS[@]}" >"$VICE_OUT" 2>&1 &
     VICE_PID=$!
 else
     "$VICE_BIN" "${VICE_ARGS[@]}" >"$VICE_OUT" 2>&1 &
@@ -97,9 +125,9 @@ echo "[probe] launched VICE (pid=$VICE_PID)"
 cleanup() {
     if [[ -n "$VICE_PID" ]] && kill -0 "$VICE_PID" 2>/dev/null; then
         if [[ "$USE_SUDO" == "1" ]]; then
-            sudo kill "$VICE_PID" 2>/dev/null || true
+            sudo -n kill "$VICE_PID" 2>/dev/null || true
             sleep 0.5
-            sudo kill -9 "$VICE_PID" 2>/dev/null || true
+            sudo -n kill -9 "$VICE_PID" 2>/dev/null || true
         else
             kill "$VICE_PID" 2>/dev/null || true
             sleep 0.5
@@ -107,7 +135,7 @@ cleanup() {
         fi
     fi
 }
-trap cleanup EXIT
+trap 'rm -f "$RC_PATH"; cleanup' EXIT
 
 # --- wait for monitor to come up --------------------------------------------
 
