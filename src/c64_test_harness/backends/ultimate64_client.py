@@ -281,16 +281,25 @@ class Ultimate64Client:
 
     # ------------------------------------------------------------ code runners
     def load_prg(self, data: bytes) -> None:
-        """PUT /v1/runners:load_prg — load a PRG into memory (DESTRUCTIVE)."""
-        self._put_binary("/v1/runners:load_prg", data)
+        """POST /v1/runners:load_prg — load a PRG into memory (DESTRUCTIVE).
+
+        Firmware 3.14 requires POST (PUT returns 400).
+        """
+        self._post_binary("/v1/runners:load_prg", data)
 
     def run_prg(self, data: bytes) -> None:
-        """PUT /v1/runners:run_prg — load and RUN a PRG (DESTRUCTIVE)."""
-        self._put_binary("/v1/runners:run_prg", data)
+        """POST /v1/runners:run_prg — load and RUN a PRG (DESTRUCTIVE).
+
+        Firmware 3.14 requires POST (PUT returns 400).
+        """
+        self._post_binary("/v1/runners:run_prg", data)
 
     def run_crt(self, data: bytes) -> None:
-        """PUT /v1/runners:run_crt — start a cartridge image (DESTRUCTIVE)."""
-        self._put_binary("/v1/runners:run_crt", data)
+        """POST /v1/runners:run_crt — start a cartridge image (DESTRUCTIVE).
+
+        Firmware 3.14 requires POST (PUT returns 400).
+        """
+        self._post_binary("/v1/runners:run_crt", data)
 
     def sid_play(self, data: bytes, songnr: int = 0) -> None:
         """POST /v1/runners:sidplay — play a .sid tune (DESTRUCTIVE).
