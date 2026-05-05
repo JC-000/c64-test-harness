@@ -1,8 +1,8 @@
 """Ethernet bridge test -- two VICE instances exchange frames via CS8900a.
 
 Two VICE instances, each with their own TAP interface (tap-c64-0, tap-c64-1)
-in TFE mode, communicate over a Linux bridge.  The test verifies bidirectional
-frame exchange: A sends to B, then B sends to A.
+in RR-Net mode, communicate over a Linux bridge.  The test verifies
+bidirectional frame exchange: A sends to B, then B sends to A.
 
 Prerequisites:
 - x64sc on PATH with ethernet cartridge support
@@ -57,17 +57,28 @@ RESULT = 0xC0F0     # 1-byte result flag (0x00=pending, 0x01=success, 0xFF=timeo
 FRAME_BUF = 0xC100  # TX frame data buffer
 RX_BUF = 0xC300     # RX received data buffer
 
-# CS8900a I/O registers (TFE mode at $DE00)
-RTDATA_LO = 0xDE00
-RTDATA_HI = 0xDE01
-TXCMD_LO = 0xDE04
-TXCMD_HI = 0xDE05
-TXLEN_LO = 0xDE06
-TXLEN_HI = 0xDE07
-PPTR_LO = 0xDE0A
-PPTR_HI = 0xDE0B
-PPDATA_LO = 0xDE0C
-PPDATA_HI = 0xDE0D
+# CS8900a I/O registers (RR-Net mode at $DE00; matches ip65 cs8900a.s)
+ISQ_LO = 0xDE00
+ISQ_HI = 0xDE01           # bit 0 = RR clockport enable (must be set first!)
+PPTR_LO = 0xDE02
+PPTR_HI = 0xDE03
+PPDATA_LO = 0xDE04
+PPDATA_HI = 0xDE05
+RTDATA_LO = 0xDE08
+RTDATA_HI = 0xDE09
+TXCMD_LO = 0xDE0C
+TXCMD_HI = 0xDE0D
+TXLEN_LO = 0xDE0E
+TXLEN_HI = 0xDE0F
+
+
+def _clockport_enable() -> bytes:
+    """6502 snippet: LDA $DE01; ORA #$01; STA $DE01."""
+    return bytes([
+        0xAD, ISQ_HI & 0xFF, ISQ_HI >> 8,
+        0x09, 0x01,
+        0x8D, ISQ_HI & 0xFF, ISQ_HI >> 8,
+    ])
 
 # Frame constants
 DEST_MAC = b"\xFF\xFF\xFF\xFF\xFF\xFF"  # broadcast
@@ -127,7 +138,7 @@ def _init_cs8900a(transport: BinaryViceTransport) -> None:
     did not, which is why TX frames weren't reaching the bridge.
     """
     # Step 1: RxCTL (PP 0x0104) = 0x00D8  (promiscuous + RxOK)
-    pp_write_code = bytes([
+    pp_write_code = _clockport_enable() + bytes([
         0xA9, 0x04, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8,        # PPPtr = 0x0104
         0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8,
         0xA9, 0xD8, 0x8D, PPDATA_LO & 0xFF, PPDATA_LO >> 8,     # PPData = 0x00D8
@@ -138,8 +149,7 @@ def _init_cs8900a(transport: BinaryViceTransport) -> None:
     jsr(transport, CODE, timeout=5.0)
 
     # Step 2: Read LineCTL (PP 0x0112), OR with 0x00C0, write back
-    # Read current LineCTL into RESULT/RESULT+1
-    pp_read_code = bytes([
+    pp_read_code = _clockport_enable() + bytes([
         0xA9, 0x12, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8,        # PPPtr = 0x0112
         0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8,
         0xAD, PPDATA_LO & 0xFF, PPDATA_LO >> 8,                  # read low
@@ -156,7 +166,7 @@ def _init_cs8900a(transport: BinaryViceTransport) -> None:
     lo_new = lo | 0xC0       # SerRxON (bit 6) + SerTxON (bit 7)
 
     # Write back LineCTL with SerRxON + SerTxON enabled
-    pp_write_linectl = bytes([
+    pp_write_linectl = _clockport_enable() + bytes([
         0xA9, 0x12, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8,        # PPPtr = 0x0112
         0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8,
         0xA9, lo_new & 0xFF, 0x8D, PPDATA_LO & 0xFF, PPDATA_LO >> 8,
@@ -183,6 +193,10 @@ def _build_tx_code(frame_len: int) -> bytes:
     """
     a = Asm()
     a.emit(0x78)  # SEI
+    # RR clockport enable
+    a.emit(0xAD, ISQ_HI & 0xFF, ISQ_HI >> 8)
+    a.emit(0x09, 0x01)
+    a.emit(0x8D, ISQ_HI & 0xFF, ISQ_HI >> 8)
 
     # TxCMD = 0x00C0 (TxStart: transmit after full frame)
     a.emit(0xA9, 0xC0, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
@@ -245,6 +259,10 @@ def _build_rx_code(payload_bytes: int = 46) -> bytes:
 
     a = Asm()
     a.emit(0x78)  # SEI
+    # RR clockport enable
+    a.emit(0xAD, ISQ_HI & 0xFF, ISQ_HI >> 8)
+    a.emit(0x09, 0x01)
+    a.emit(0x8D, ISQ_HI & 0xFF, ISQ_HI >> 8)
 
     # --- Poll setup: PPTR = 0x0124 (RxEvent) + timeout counters ---
     a.label("rst")
@@ -445,7 +463,7 @@ def vice_bridge_pair():
         warp=False,
         sound=False,
         ethernet=True,
-        ethernet_mode="tfe",
+        ethernet_mode="rrnet",
         ethernet_interface="tap-c64-0",
         ethernet_driver="tuntap",
     )
@@ -454,7 +472,7 @@ def vice_bridge_pair():
         warp=False,
         sound=False,
         ethernet=True,
-        ethernet_mode="tfe",
+        ethernet_mode="rrnet",
         ethernet_interface="tap-c64-1",
         ethernet_driver="tuntap",
     )
