@@ -6,3 +6,5 @@ dist/
 build/
 .pytest_cache/
 .serena/
+.claude/settings.local.json
+.claude/worktrees/
