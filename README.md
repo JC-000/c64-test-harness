@@ -17,6 +17,8 @@ Reusable test harness for Commodore 64 programs. Automates C64 programs via the 
 - **Multi-instance VICE management** — run multiple emulators concurrently with thread-safe port allocation
 - **Parallel test execution** — distribute tests across a pool of VICE instances via `run_parallel()`
 - **VICE label file parser** — load cc65/ACME/Kick Assembler label files
+- **Debug utilities** — `dump_screen()` and `hex_dump()` for quick inspection during test runs
+- **Flexible configuration** — `HarnessConfig` with TOML file and environment variable support
 
 ## Installation
 
@@ -31,7 +33,7 @@ Requires Python 3.10+. Zero runtime dependencies.
 ```python
 from c64_test_harness import (
     ViceTransport, ViceProcess, ViceConfig,
-    ScreenGrid, wait_for_text, send_text,
+    ScreenGrid, wait_for_text, wait_for_stable, send_text, send_key,
     read_bytes, read_word_le, write_bytes,
 )
 
@@ -45,8 +47,12 @@ with ViceProcess(config) as vice:
     grid = wait_for_text(transport, "PRESS START")
     assert grid is not None
 
-    # Send keyboard input
+    # Send keyboard input (batched)
     send_text(transport, "HELLO\r")
+
+    # Send a single key (character or raw PETSCII code)
+    send_key(transport, "\r")
+    send_key(transport, 0x91)  # cursor up
 
     # Read screen content
     grid = ScreenGrid.from_transport(transport)
@@ -54,6 +60,9 @@ with ViceProcess(config) as vice:
 
     # Extract data between markers
     value = grid.extract_between("SCORE: ", " ")
+
+    # Wait for screen to stabilise (stops changing)
+    stable = wait_for_stable(transport, timeout=10, stable_count=3)
 
     # Read memory (auto-chunks for large reads)
     data = read_bytes(transport, 0x4000, 512)
@@ -181,6 +190,56 @@ with ViceInstanceManager(config, port_range_start=6510, port_range_end=6515) as 
 
 See `scripts/run_parallel_sha256.py` for a full integration example running 3 concurrent VICE instances with SHA-256 validation, or `scripts/three_windows.py` for an interactive demo that writes user input directly into screen memory across 3 simultaneous VICE windows.
 
+## Debug Utilities
+
+```python
+from c64_test_harness import dump_screen, hex_dump
+
+# Capture and print screen content (useful in test failures)
+output = dump_screen(transport, label="after login")
+
+# Hex dump a memory region
+print(hex_dump(transport, 0x0400, 64))
+# $0400: 05 18 10 20 0b 05 19 3a 20 37 03 20 06 04 20 03
+# $0410: ...
+```
+
+## Test Runner
+
+The `TestRunner` executes named scenarios sequentially with optional recovery between tests:
+
+```python
+from c64_test_harness import TestRunner
+
+runner = TestRunner()
+runner.add_scenario("Full CSR", test_full_csr, recover_to_menu)
+runner.add_scenario("CN only", test_cn_only, recover_to_menu)
+results = runner.run_all()
+runner.print_summary()
+sys.exit(runner.exit_code)
+```
+
+Each scenario is a `(name, run_fn, recovery_fn)` tuple. If a test raises an exception, the runner calls the recovery function before continuing with the next scenario.
+
+## Configuration
+
+`HarnessConfig` centralises all settings and can load from a TOML file or environment variables:
+
+```python
+from c64_test_harness import HarnessConfig
+
+# From a TOML file
+config = HarnessConfig.from_toml("c64_harness.toml")
+
+# From environment variables (C64_VICE_PORT, C64_VICE_HOST, etc.)
+config = HarnessConfig.from_env()
+
+# Or construct directly with defaults
+config = HarnessConfig(vice_port=6510, vice_warp=True)
+```
+
+Key fields: `vice_host`, `vice_port`, `vice_executable`, `vice_prg_path`, `vice_warp`, `vice_sound`, `screen_base`, `vice_port_range_start/end`, `vice_reuse_existing`.
+
 ## Architecture
 
 ```
@@ -198,6 +257,24 @@ Screen/Keyboard/Memory modules sit above the transport:
 Parallel execution:
   run_parallel() -> ParallelTestResult
 ```
+
+## Examples
+
+The `examples/` directory contains runnable demos:
+
+| Script | Description |
+|--------|-------------|
+| `examples/wait_for_text.py` | Basic screen text matching |
+| `examples/direct_memory_test.py` | Load and execute 6502 code directly in RAM |
+| `examples/drive_menu.py` | Navigate disk drive menus |
+| `examples/custom_backend.py` | Implement a custom `C64Transport` backend |
+
+Additional scripts in `scripts/`:
+
+| Script | Description |
+|--------|-------------|
+| `scripts/run_parallel_sha256.py` | 3 concurrent VICE instances running SHA-256 validation |
+| `scripts/three_windows.py` | Interactive demo writing user input across 3 VICE windows |
 
 ## Running Tests
 
