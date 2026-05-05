@@ -102,6 +102,10 @@ def vice_transport():
 
     allocator = PortAllocator(port_range_start=6520, port_range_end=6530)
     port = allocator.allocate()
+    # Release OS-level reservation before VICE binds to the port
+    reservation = allocator.take_socket(port)
+    if reservation is not None:
+        reservation.close()
     config = ViceConfig(port=port, warp=True, sound=False)
 
     with ViceProcess(config) as vice:
