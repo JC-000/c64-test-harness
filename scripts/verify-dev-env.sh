@@ -108,13 +108,54 @@ check_vice() {
         path="$(command -v x64sc)"
         record "$sec" "x64sc on PATH" ok "$path" 1
 
-        # Version check
-        local ver_out ver
+        # Version check. Primary: `x64sc --version`. On macOS 26 Tahoe the
+        # Homebrew vice 3.10 bottle has an upstream init-order bug where
+        # archdep_program_path_set_argv0() is called *after* `--version` is
+        # handled, so `proc_pidpath()` failure there hits a NULL argv0_ref
+        # and exits 1 without printing the version. Fall back to other
+        # signals (brew metadata, Cellar path, -features) when the primary
+        # path yields nothing. See docs/development.md "macOS (Homebrew)".
+        local ver_out ver ver_source=""
         ver_out="$(x64sc --version 2>&1 | head -5 || true)"
         ver="$(printf '%s\n' "$ver_out" | grep -oE 'VICE[[:space:]]+[0-9]+\.[0-9]+' | head -1)"
         if [ -n "$ver" ]; then
+            ver_source="--version"
+        elif have_cmd brew; then
+            # Fallback 1: `brew list --versions vice` prints e.g. "vice 3.10"
+            local brew_ver
+            brew_ver="$(brew list --versions vice 2>/dev/null | awk '{print $2}' | head -1)"
+            if [ -n "$brew_ver" ]; then
+                ver="VICE $brew_ver"
+                ver_source="brew"
+            fi
+        fi
+        if [ -z "$ver" ]; then
+            # Fallback 2: parse Cellar path from the symlink target, e.g.
+            # /opt/homebrew/bin/x64sc -> ../Cellar/vice/3.10/bin/x64sc
+            local real_path
+            real_path="$(readlink "$path" 2>/dev/null || true)"
+            local cellar_ver
+            cellar_ver="$(printf '%s' "$real_path" | sed -nE 's#.*/Cellar/vice/([0-9]+\.[0-9]+).*#\1#p')"
+            if [ -n "$cellar_ver" ]; then
+                ver="VICE $cellar_ver"
+                ver_source="Cellar path"
+            fi
+        fi
+        if [ -z "$ver" ]; then
+            # Fallback 3: `-features` is another code path that survives the
+            # argv[0] issue; if it runs at all, the binary is functional.
+            if x64sc -features 2>/dev/null | grep -qi 'HAVE_'; then
+                ver="unknown (binary functional)"
+                ver_source="-features probe"
+            fi
+        fi
+        if [ -n "$ver" ]; then
+            local detail="$ver"
+            [ -n "$ver_source" ] && [ "$ver_source" != "--version" ] && detail="$ver [via $ver_source; --version broken on macOS 26]"
             if printf '%s' "$ver" | grep -q '3\.10'; then
-                record "$sec" "VICE version" ok "$ver" 1
+                record "$sec" "VICE version" ok "$detail" 1
+            elif [ "$ver_source" = "-features probe" ]; then
+                record "$sec" "VICE version" warn "$detail" 0
             else
                 record "$sec" "VICE version" warn "$ver (expected VICE 3.10)" 0
             fi
@@ -165,47 +206,99 @@ check_vice() {
 
 # ---------- Section 2: Python --------------------------------------------
 
+# Pick the python3 to probe. A stale system python3 (e.g. macOS ships 3.9.6)
+# would make the harness look unhealthy even when the real runtime -- a venv
+# -- is modern. Priority:
+#   1. $VIRTUAL_ENV/bin/python3  (an active venv trumps everything)
+#   2. ~/.local/share/c64-test-harness/venv/bin/python3  (harness convention
+#      per docs/development.md)
+#   3. $REPO_ROOT/.venv/bin/python3  (in-tree venv, common layout)
+#   4. system python3 on PATH
+# Prints the selected binary path on stdout, empty if nothing is found.
+select_py_bin() {
+    if [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python3" ]; then
+        printf '%s' "$VIRTUAL_ENV/bin/python3"
+        return
+    fi
+    local harness_venv="$HOME/.local/share/c64-test-harness/venv/bin/python3"
+    if [ -x "$harness_venv" ]; then
+        printf '%s' "$harness_venv"
+        return
+    fi
+    if [ -n "${REPO_ROOT:-}" ] && [ -x "$REPO_ROOT/.venv/bin/python3" ]; then
+        printf '%s' "$REPO_ROOT/.venv/bin/python3"
+        return
+    fi
+    if have_cmd python3; then
+        command -v python3
+        return
+    fi
+}
+
+# Classify $1 (a python3 path) by origin, for transparent reporting.
+py_bin_source() {
+    local py_bin="$1"
+    if [ -n "${VIRTUAL_ENV:-}" ] && [ "$py_bin" = "$VIRTUAL_ENV/bin/python3" ]; then
+        printf 'active venv'
+        return
+    fi
+    case "$py_bin" in
+        "$HOME/.local/share/c64-test-harness/venv/"*) printf 'harness venv' ;;
+        "${REPO_ROOT:-/nope}/.venv/"*)                printf 'repo .venv' ;;
+        *)                                            printf 'system' ;;
+    esac
+}
+
 check_python() {
     local sec="Python"
-    if have_cmd python3; then
-        local py_ver
-        py_ver="$(python3 -c 'import sys;print("%d.%d.%d"%sys.version_info[:3])' 2>/dev/null || true)"
-        if [ -z "$py_ver" ]; then
-            record "$sec" "python3" missing "python3 present but failed to report version" 1
-        else
-            local major minor
-            major="$(printf '%s' "$py_ver" | cut -d. -f1)"
-            minor="$(printf '%s' "$py_ver" | cut -d. -f2)"
-            if [ "$major" -gt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -ge 10 ]; }; then
-                record "$sec" "python3 >= 3.10" ok "$py_ver" 1
-            else
-                record "$sec" "python3 >= 3.10" missing "found $py_ver, need >= 3.10" 1
-            fi
-        fi
+    local py_bin py_source
+    py_bin="$(select_py_bin)"
 
-        # Harness import
-        if python3 -c 'import c64_test_harness' >/dev/null 2>&1; then
-            local harness_ver
-            harness_ver="$(python3 -c 'import c64_test_harness as c; print(getattr(c, "__version__", "unknown"))' 2>/dev/null || echo unknown)"
-            record "$sec" "c64_test_harness importable" ok "version $harness_ver" 1
-        else
-            record "$sec" "c64_test_harness importable" missing "import failed" 1
-            add_hint "From repo root: pip install -e '.[dev]'"
-        fi
-
-        # pytest (dev dep, warn only)
-        if python3 -c 'import pytest' >/dev/null 2>&1; then
-            local pt_ver
-            pt_ver="$(python3 -c 'import pytest; print(pytest.__version__)' 2>/dev/null || echo '?')"
-            record "$sec" "pytest available" ok "$pt_ver" 0
-        else
-            record "$sec" "pytest available" warn "pytest not installed (dev dep)" 0
-            add_hint "Install dev deps: pip install -e '.[dev]'"
-        fi
-    else
+    if [ -z "$py_bin" ]; then
         record "$sec" "python3" missing "not found" 1
         record "$sec" "c64_test_harness importable" skipped "(python3 missing)" 1
         record "$sec" "pytest available" skipped "(python3 missing)" 0
+        return
+    fi
+
+    py_source="$(py_bin_source "$py_bin")"
+
+    local py_ver
+    py_ver="$("$py_bin" -c 'import sys;print("%d.%d.%d"%sys.version_info[:3])' 2>/dev/null || true)"
+    if [ -z "$py_ver" ]; then
+        record "$sec" "python3" missing "present at $py_bin but failed to report version" 1
+    else
+        local major minor
+        major="$(printf '%s' "$py_ver" | cut -d. -f1)"
+        minor="$(printf '%s' "$py_ver" | cut -d. -f2)"
+        if [ "$major" -gt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -ge 10 ]; }; then
+            record "$sec" "python3 >= 3.10" ok "$py_ver [$py_source: $py_bin]" 1
+        else
+            record "$sec" "python3 >= 3.10" missing "found $py_ver at $py_bin [$py_source], need >= 3.10" 1
+            if [ "$py_source" = "system" ]; then
+                add_hint "System python3 is too old. Create/activate a harness venv (see docs/development.md) -- verify-dev-env.sh will then pick it up automatically."
+            fi
+        fi
+    fi
+
+    # Harness import
+    if "$py_bin" -c 'import c64_test_harness' >/dev/null 2>&1; then
+        local harness_ver
+        harness_ver="$("$py_bin" -c 'import c64_test_harness as c; print(getattr(c, "__version__", "unknown"))' 2>/dev/null || echo unknown)"
+        record "$sec" "c64_test_harness importable" ok "version $harness_ver [$py_source]" 1
+    else
+        record "$sec" "c64_test_harness importable" missing "import failed [$py_source: $py_bin]" 1
+        add_hint "From repo root with the harness venv active: pip install -e '.[dev]'"
+    fi
+
+    # pytest (dev dep, warn only)
+    if "$py_bin" -c 'import pytest' >/dev/null 2>&1; then
+        local pt_ver
+        pt_ver="$("$py_bin" -c 'import pytest; print(pytest.__version__)' 2>/dev/null || echo '?')"
+        record "$sec" "pytest available" ok "$pt_ver" 0
+    else
+        record "$sec" "pytest available" warn "pytest not installed (dev dep)" 0
+        add_hint "Install dev deps: pip install -e '.[dev]'"
     fi
 }
 
@@ -213,28 +306,50 @@ check_python() {
 
 check_system() {
     local sec="System tools"
-    if have_cmd ip; then
-        record "$sec" "ip command" ok "$(command -v ip)" 0
+    # Bridge/TAP networking uses iproute2 + iptables + /dev/net/tun on Linux.
+    # On macOS the equivalent is ifconfig + the BSD bridge driver + feth(4),
+    # which are all part of the base system (no package install). Skip the
+    # Linux-specific checks on Darwin and verify ifconfig instead.
+    if [ "$(uname)" = "Darwin" ]; then
+        if have_cmd ifconfig; then
+            record "$sec" "ifconfig command" ok "$(command -v ifconfig)" 0
+        else
+            record "$sec" "ifconfig command" missing "ifconfig not found (macOS base tool)" 0
+        fi
+        if [ -c /dev/bpf0 ]; then
+            if [ -r /dev/bpf0 ]; then
+                record "$sec" "/dev/bpf0 readable" ok "BPF devices user-readable (pcap ready)" 0
+            else
+                record "$sec" "/dev/bpf0 readable" warn "BPF devices are root-only (VICE pcap driver needs sudo chmod 666 /dev/bpf* or Wireshark's ChmodBPF helper)" 0
+                add_hint "Make /dev/bpf* user-readable: sudo chmod 666 /dev/bpf* (session) or install Wireshark's ChmodBPF (permanent)"
+            fi
+        else
+            record "$sec" "/dev/bpf0 readable" missing "no /dev/bpf* device" 0
+        fi
     else
-        record "$sec" "ip command" missing "iproute2 not installed" 0
-        add_hint "Install iproute2 (Ubuntu: sudo apt-get install iproute2)"
-    fi
-    if have_cmd iptables; then
-        record "$sec" "iptables command" ok "$(command -v iptables)" 0
-    else
-        record "$sec" "iptables command" missing "iptables not installed" 0
-        add_hint "Install iptables (Ubuntu: sudo apt-get install iptables)"
+        if have_cmd ip; then
+            record "$sec" "ip command" ok "$(command -v ip)" 0
+        else
+            record "$sec" "ip command" missing "iproute2 not installed" 0
+            add_hint "Install iproute2 (Ubuntu: sudo apt-get install iproute2)"
+        fi
+        if have_cmd iptables; then
+            record "$sec" "iptables command" ok "$(command -v iptables)" 0
+        else
+            record "$sec" "iptables command" missing "iptables not installed" 0
+            add_hint "Install iptables (Ubuntu: sudo apt-get install iptables)"
+        fi
+        if [ -c /dev/net/tun ]; then
+            record "$sec" "/dev/net/tun" ok "present" 0
+        else
+            record "$sec" "/dev/net/tun" missing "TUN/TAP device node missing" 0
+            add_hint "Load the tun kernel module: sudo modprobe tun"
+        fi
     fi
     if sudo -n true 2>/dev/null; then
         record "$sec" "passwordless sudo" ok "available (informational)" 0
     else
         record "$sec" "passwordless sudo" unknown "not available (not a failure; needed for bridge setup)" 0
-    fi
-    if [ -c /dev/net/tun ]; then
-        record "$sec" "/dev/net/tun" ok "present" 0
-    else
-        record "$sec" "/dev/net/tun" missing "TUN/TAP device node missing" 0
-        add_hint "Load the tun kernel module: sudo modprobe tun"
     fi
 }
 
@@ -243,26 +358,44 @@ check_system() {
 check_bridge() {
     local sec="Bridge networking"
     local any_missing=0
-    if [ -d /sys/class/net/br-c64 ]; then
-        record "$sec" "br-c64 bridge" ok "present" 0
+    # Bridge layout is platform-dependent. Linux uses a Linux bridge (br-c64)
+    # + TAP devices (tap-c64-{0,1}); macOS uses bridge10 + feth peer pairs
+    # (feth0/feth1). Both sets of rows are non-critical — the ethernet test
+    # subset (5 files) skips cleanly when the bridge isn't set up.
+    if [ "$(uname)" = "Darwin" ]; then
+        for iface in bridge10 feth0 feth1; do
+            if ifconfig "$iface" >/dev/null 2>&1; then
+                record "$sec" "$iface" ok "present" 0
+            else
+                record "$sec" "$iface" missing "not found" 0
+                any_missing=1
+            fi
+        done
+        if [ "$any_missing" = "1" ]; then
+            add_hint "Run: sudo ./scripts/setup-bridge-feth-macos.sh"
+        fi
     else
-        record "$sec" "br-c64 bridge" missing "not found" 0
-        any_missing=1
-    fi
-    if [ -d /sys/class/net/tap-c64-0 ]; then
-        record "$sec" "tap-c64-0" ok "present" 0
-    else
-        record "$sec" "tap-c64-0" missing "not found" 0
-        any_missing=1
-    fi
-    if [ -d /sys/class/net/tap-c64-1 ]; then
-        record "$sec" "tap-c64-1" ok "present" 0
-    else
-        record "$sec" "tap-c64-1" missing "not found" 0
-        any_missing=1
-    fi
-    if [ "$any_missing" = "1" ]; then
-        add_hint "Run: sudo ./scripts/setup-bridge-tap.sh"
+        if [ -d /sys/class/net/br-c64 ]; then
+            record "$sec" "br-c64 bridge" ok "present" 0
+        else
+            record "$sec" "br-c64 bridge" missing "not found" 0
+            any_missing=1
+        fi
+        if [ -d /sys/class/net/tap-c64-0 ]; then
+            record "$sec" "tap-c64-0" ok "present" 0
+        else
+            record "$sec" "tap-c64-0" missing "not found" 0
+            any_missing=1
+        fi
+        if [ -d /sys/class/net/tap-c64-1 ]; then
+            record "$sec" "tap-c64-1" ok "present" 0
+        else
+            record "$sec" "tap-c64-1" missing "not found" 0
+            any_missing=1
+        fi
+        if [ "$any_missing" = "1" ]; then
+            add_hint "Run: sudo ./scripts/setup-bridge-tap.sh"
+        fi
     fi
 }
 
@@ -360,11 +493,14 @@ check_u64
 # ---------- Output --------------------------------------------------------
 
 status_glyph() {
+    # printf %b interprets octal escapes, which are portable across
+    # bash 3.2 (macOS) and bash 4+ (Linux). `\u` escapes are bash 4.2+
+    # only and render as literal "\u2713" on the stock macOS bash.
     case "$1" in
-        ok) printf '\u2713' ;;       # ✓
-        missing) printf '\u2717' ;;  # ✗
+        ok) printf '%b' '\342\234\223' ;;       # U+2713 check
+        missing) printf '%b' '\342\234\227' ;;  # U+2717 cross
         skipped|unknown) printf '?' ;;
-        warn) printf '\u26a0' ;;     # ⚠
+        warn) printf '%b' '\342\232\240' ;;     # U+26A0 warn
         *) printf '?' ;;
     esac
 }
@@ -469,13 +605,21 @@ else
 
     if [ "$QUIET" = "0" ] && [ ${#FIX_HINTS[@]} -gt 0 ]; then
         printf '\n[Fix hints]\n'
-        # Deduplicate
-        declare -A seen_hints=()
+        # Deduplicate without associative arrays — macOS ships bash 3.2
+        # which doesn't support `declare -A`, and `#!/usr/bin/env bash`
+        # resolves to /bin/bash there unless a newer one is on PATH. A
+        # newline-delimited seen-list avoids the portability issue and is
+        # fine for the handful of hints we emit. (This block is at top-
+        # level script scope, so no `local` keyword.)
+        seen_hints=""
         for h in "${FIX_HINTS[@]}"; do
-            if [ -z "${seen_hints[$h]:-}" ]; then
-                printf '  -> %s\n' "$h"
-                seen_hints[$h]=1
-            fi
+            case $'\n'"$seen_hints"$'\n' in
+                *$'\n'"$h"$'\n'*) ;;
+                *)
+                    printf '  -> %s\n' "$h"
+                    seen_hints="${seen_hints}${h}"$'\n'
+                    ;;
+            esac
         done
     fi
 

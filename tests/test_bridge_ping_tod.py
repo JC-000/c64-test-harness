@@ -29,6 +29,7 @@ import time
 
 import pytest
 
+from bridge_platform import BRIDGE_NAME, IFACE_A, IFACE_B, SETUP_HINT, iface_present
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
 from c64_test_harness.bridge_ping import (
     build_echo_request_frame,
@@ -51,12 +52,19 @@ _HAS_X64SC = shutil.which("x64sc") is not None
 _VICE_SKIPS = [
     pytest.mark.skipif(not _HAS_X64SC, reason="x64sc not found on PATH"),
     pytest.mark.skipif(
-        not os.path.isdir("/sys/class/net/tap-c64-0"),
-        reason="tap-c64-0 not found (run scripts/setup-bridge-tap.sh)",
+        not iface_present(IFACE_A),
+        reason=f"{IFACE_A} not found ({SETUP_HINT})",
     ),
     pytest.mark.skipif(
-        not os.path.isdir("/sys/class/net/tap-c64-1"),
-        reason="tap-c64-1 not found (run scripts/setup-bridge-tap.sh)",
+        not iface_present(IFACE_B),
+        reason=f"{IFACE_B} not found ({SETUP_HINT})",
+    ),
+    pytest.mark.skipif(
+        not iface_present(BRIDGE_NAME),
+        reason=(
+            f"{BRIDGE_NAME} not found -- feth/tap peers alone aren't enough; "
+            f"the host bridge must be up ({SETUP_HINT})"
+        ),
     ),
 ]
 
