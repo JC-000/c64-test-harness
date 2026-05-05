@@ -182,6 +182,7 @@ _LDA_ABS_Y = 0xB9
 _STA_ABS_Y = 0x99
 _PHA     = 0x48
 _PLA     = 0x68
+_RTS = 0x60  # 6502 RTS opcode — used to end UCI routines dispatched via SYS.
 
 # ---------------------------------------------------------------------------
 # Default memory layout for injected routines
@@ -753,10 +754,9 @@ def build_uci_probe(
     if turbo_safe:
         code.extend(_build_fence())
     code.extend([_STA_ABS, _lo(result_addr), _hi(result_addr)])
-    # Set sentinel + park
+    # Set sentinel + RTS (routine is dispatched via SYS, returns to BASIC)
     code.extend(_build_sentinel(sentinel_addr))
-    park = code_addr + len(code) + 3
-    code.extend([_JMP_ABS, _lo(park), _hi(park)])
+    code.append(_RTS)
     return bytes(code)
 
 
@@ -869,10 +869,9 @@ def build_uci_command(
     else:
         code.extend(_build_acknowledge())
 
-    # Sentinel + park
+    # Sentinel + RTS (routine is dispatched via SYS, returns to BASIC)
     code.extend(_build_sentinel(sentinel_addr))
-    park = code_addr + len(code) + 3
-    code.extend([_JMP_ABS, _lo(park), _hi(park)])
+    code.append(_RTS)
 
     return bytes(code)
 
@@ -1126,10 +1125,9 @@ def _build_connect_routine(
     else:
         code.extend(_build_acknowledge())
 
-    # Sentinel + park
+    # Sentinel + RTS (routine is dispatched via SYS, returns to BASIC)
     code.extend(_build_sentinel(sentinel_addr))
-    park = code_addr + len(code) + 3
-    code.extend([_JMP_ABS, _lo(park), _hi(park)])
+    code.append(_RTS)
 
     return bytes(code)
 
@@ -1286,10 +1284,9 @@ def build_socket_write(
     else:
         code.extend(_build_acknowledge())
 
-    # Sentinel + park
+    # Sentinel + RTS (routine is dispatched via SYS, returns to BASIC)
     code.extend(_build_sentinel(sentinel_addr))
-    park = code_addr + len(code) + 3
-    code.extend([_JMP_ABS, _lo(park), _hi(park)])
+    code.append(_RTS)
 
     return bytes(code)
 
@@ -1402,10 +1399,9 @@ def build_socket_read(
     else:
         code.extend(_build_acknowledge())
 
-    # Sentinel + park
+    # Sentinel + RTS (routine is dispatched via SYS, returns to BASIC)
     code.extend(_build_sentinel(sentinel_addr))
-    park = code_addr + len(code) + 3
-    code.extend([_JMP_ABS, _lo(park), _hi(park)])
+    code.append(_RTS)
 
     return bytes(code)
 
@@ -1493,10 +1489,9 @@ def build_socket_close(
     else:
         code.extend(_build_acknowledge())
 
-    # Sentinel + park
+    # Sentinel + RTS (routine is dispatched via SYS, returns to BASIC)
     code.extend(_build_sentinel(sentinel_addr))
-    park = code_addr + len(code) + 3
-    code.extend([_JMP_ABS, _lo(park), _hi(park)])
+    code.append(_RTS)
 
     return bytes(code)
 
@@ -1519,26 +1514,35 @@ def _execute_uci_routine(
 ) -> None:
     """Inject and execute a UCI routine on the U64.
 
-    Uses the DMA trampoline pattern:
-    1. Clear sentinel
-    2. Write routine code
-    3. Hijack IGONE vector ($0302) with pointer to code_addr
-    4. Poll sentinel for completion
-    5. Restore IGONE vector
-    6. Check error flag
+    Dispatches via ``SYS <code_addr>\\r`` injected into the keyboard
+    buffer ($0277, length in $00C6). BASIC's command-line processor
+    reads the buffer as if the user typed the SYS command, which calls
+    the routine as a subroutine via JSR; the routine writes the sentinel
+    byte and executes RTS to return to BASIC.
 
-    The BASIC idle loop calls through the IGONE vector ($0302/$0303)
-    every statement.  We patch it to jump into our routine so the CPU
-    executes the UCI code on the next iteration.
+    The prior IMAIN ($0302) vector patch did not work on cold devices
+    because BASIC's idle READY loop does not traverse $0302 — only the
+    command-line processor (which runs after the user hits RETURN) does.
+    On warm machines the patch happened to succeed because prior BASIC
+    activity had already exercised that code path; on cold boots the
+    routine never fired.
+
+    Sequence:
+    1. Clear sentinel and error bytes.
+    2. Write CTL_ABORT (0x04) to $DF1C, sleep briefly to drain UCI state.
+    3. Write the routine code to *code_addr*.
+    4. Inject ``SYS <code_addr>\\r`` at $0277, set keyboard fill count
+       at $00C6 to the command length.
+    5. Poll sentinel until set or *timeout* expires.
+    6. Check error flag and raise UCIError with status if set.
+
+    Routines dispatched this way MUST end with RTS, not JMP or BRK.
 
     Raises:
         UCIError: If the error flag is set after execution.
         TimeoutError: If sentinel is not set within *timeout* seconds.
     """
     from .transport import TimeoutError
-
-    igone_addr = 0x0302
-    orig_igone = transport.read_memory(igone_addr, 2)
 
     # Clear sentinel and error
     transport.write_memory(sentinel_addr, bytes([0x00]))
@@ -1551,25 +1555,29 @@ def _execute_uci_routine(
     # Write routine
     transport.write_memory(code_addr, code)
 
-    # Patch IGONE to jump to our code
-    transport.write_memory(igone_addr, bytes([_lo(code_addr), _hi(code_addr)]))
+    # Inject "SYS <code_addr>\r" into the keyboard buffer so BASIC's
+    # command-line processor JSRs our routine.
+    sys_cmd = f"SYS{code_addr}\r".encode("ascii")
+    if len(sys_cmd) > 10:
+        raise ValueError(
+            f"SYS command too long for keyboard buffer: "
+            f"{len(sys_cmd)} bytes (max 10). code_addr=${code_addr:04X}"
+        )
+    transport.write_memory(0x0277, sys_cmd)
+    transport.write_memory(0x00C6, bytes([len(sys_cmd)]))
 
-    try:
-        # Poll sentinel
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            val = transport.read_memory(sentinel_addr, 1)
-            if val[0] == _SENTINEL_DONE:
-                break
-            time.sleep(_POLL_INTERVAL)
-        else:
-            raise TimeoutError(
-                f"UCI routine did not complete within {timeout}s "
-                f"(sentinel at ${sentinel_addr:04X} never set)"
-            )
-    finally:
-        # Restore IGONE vector
-        transport.write_memory(igone_addr, orig_igone)
+    # Poll sentinel
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        val = transport.read_memory(sentinel_addr, 1)
+        if val[0] == _SENTINEL_DONE:
+            break
+        time.sleep(_POLL_INTERVAL)
+    else:
+        raise TimeoutError(
+            f"UCI routine did not complete within {timeout}s "
+            f"(sentinel at ${sentinel_addr:04X} never set)"
+        )
 
     # Check error flag
     err = transport.read_memory(error_addr, 1)
