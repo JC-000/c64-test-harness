@@ -331,8 +331,8 @@ python3 scripts/run_all_tests.py --workers 4
 python3 scripts/run_all_tests.py -k "test_config"
 ```
 
-The test runner organises 15 test files into three phases:
-1. **Unit tests** (13 files) — run in parallel, no external dependencies
+The test runner organises 20 test files into three phases:
+1. **Unit tests** (18 files) — run in parallel, no external dependencies
 2. **Integration tests** (1 file) — needs `c1541` on PATH
 3. **VICE integration tests** (1 file) — needs `x64sc` + `c1541`, runs serially
 
