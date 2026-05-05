@@ -24,6 +24,7 @@ class SingleTestResult:
     passed: bool
     message: str
     duration: float = 0.0
+    pid: int | None = None
 
 
 @dataclass
@@ -91,17 +92,20 @@ def run_parallel(
     def _run_one(name: str, fn: Callable[[ViceTransport], tuple[bool, str]]) -> SingleTestResult:
         t0 = time.monotonic()
         instance = manager.acquire()
+        vice_pid = instance.pid
         try:
             passed, message = fn(instance.transport)
             return SingleTestResult(
                 name=name, passed=passed, message=message,
                 duration=time.monotonic() - t0,
+                pid=vice_pid,
             )
         except Exception as e:
             return SingleTestResult(
                 name=name, passed=False,
                 message=f"ERROR: {type(e).__name__}: {e}",
                 duration=time.monotonic() - t0,
+                pid=vice_pid,
             )
         finally:
             manager.release(instance)
