@@ -1,26 +1,32 @@
 """Ethernet bridge test -- two VICE instances exchange frames via CS8900a.
 
-Two VICE instances, each with their own TAP interface (tap-c64-0, tap-c64-1)
-in RR-Net mode, communicate over a Linux bridge.  The test verifies
-bidirectional frame exchange: A sends to B, then B sends to A.
-
-Prerequisites:
-- x64sc on PATH with ethernet cartridge support
-- Two TAP interfaces: tap-c64-0 and tap-c64-1, bridged at the Linux level
-- VICE must be compiled with tuntap driver support
-
-All tests are skipped automatically if prerequisites are missing.
+Tests two VICE instances exchanging raw ethernet frames via CS8900a in
+RR-Net mode.  The interfaces are ``bridge_platform.IFACE_A`` /
+``IFACE_B``, bridged through ``BRIDGE_NAME``; platform-specific details
+(TAP+iproute2 on Linux, feth+BSD bridge on macOS) live in that module
+and the matching ``scripts/setup-bridge-*-{linux,macos}.sh`` setup
+scripts.  The test verifies bidirectional frame exchange: A sends to B,
+then B sends to A.  All tests are skipped automatically if prerequisites
+(``x64sc`` on PATH, both interfaces present, matching ethernet driver
+support in VICE) are missing.
 """
 
 from __future__ import annotations
 
-import os
 import shutil
 import threading
 import time
 
 import pytest
 
+from bridge_platform import (
+    BRIDGE_NAME,
+    ETHERNET_DRIVER,
+    IFACE_A,
+    IFACE_B,
+    SETUP_HINT,
+    iface_present,
+)
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 from c64_test_harness.backends.vice_manager import PortAllocator
@@ -39,12 +45,19 @@ _HAS_X64SC = shutil.which("x64sc") is not None
 pytestmark = [
     pytest.mark.skipif(not _HAS_X64SC, reason="x64sc not found on PATH"),
     pytest.mark.skipif(
-        not os.path.isdir("/sys/class/net/tap-c64-0"),
-        reason="tap-c64-0 interface not found",
+        not iface_present(IFACE_A),
+        reason=f"{IFACE_A} not found ({SETUP_HINT})",
     ),
     pytest.mark.skipif(
-        not os.path.isdir("/sys/class/net/tap-c64-1"),
-        reason="tap-c64-1 interface not found",
+        not iface_present(IFACE_B),
+        reason=f"{IFACE_B} not found ({SETUP_HINT})",
+    ),
+    pytest.mark.skipif(
+        not iface_present(BRIDGE_NAME),
+        reason=(
+            f"{BRIDGE_NAME} not found -- feth/tap peers alone aren't enough; "
+            f"the host bridge must be up ({SETUP_HINT})"
+        ),
     ),
 ]
 
@@ -464,8 +477,8 @@ def vice_bridge_pair():
         sound=False,
         ethernet=True,
         ethernet_mode="rrnet",
-        ethernet_interface="tap-c64-0",
-        ethernet_driver="tuntap",
+        ethernet_interface=IFACE_A,
+        ethernet_driver=ETHERNET_DRIVER,
     )
     config_b = ViceConfig(
         port=port_b,
@@ -473,8 +486,8 @@ def vice_bridge_pair():
         sound=False,
         ethernet=True,
         ethernet_mode="rrnet",
-        ethernet_interface="tap-c64-1",
-        ethernet_driver="tuntap",
+        ethernet_interface=IFACE_B,
+        ethernet_driver=ETHERNET_DRIVER,
     )
 
     vice_a = ViceProcess(config_a)

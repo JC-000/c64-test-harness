@@ -1,6 +1,6 @@
 # Development environment
 
-This page describes the dev-environment expectations for `c64-test-harness` and how to bring a fresh Ubuntu Desktop 25 box online using `scripts/setup-dev-env.sh`. The companion `scripts/verify-dev-env.sh` is the non-destructive diagnostic that the installer calls at the end.
+This page describes the dev-environment expectations for `c64-test-harness`. Two platforms are supported: **Ubuntu Desktop 25** (primary target; one-shot `scripts/setup-dev-env.sh` installer) and **macOS** (Apple Silicon, Tahoe 26.x verified; Homebrew-based manual setup described below). The companion `scripts/verify-dev-env.sh` is the non-destructive diagnostic that works on both platforms and is called at the end of the Ubuntu installer.
 
 ## Fresh-machine install: `scripts/setup-dev-env.sh`
 
@@ -117,6 +117,74 @@ Critical checks are: VICE presence/version/ethernet/binary-monitor, `c1541`, Pyt
 4. **Optional Ultimate 64**: set `U64_HOST=<ip>` in the environment to enable hardware-backed live tests.
 
 Re-run `./scripts/verify-dev-env.sh` after each step to confirm progress.
+
+## macOS (Homebrew)
+
+The harness runs natively on macOS (Apple Silicon, Tahoe 26.x verified). Bridge networking is supported via the BSD bridge driver plus `feth` peer interfaces (see `docs/bridge_networking.md` and `tests/bridge_platform.py` for the cross-platform dispatch module). VICE attaches to `feth` via its `pcap` driver rather than `tuntap` because macOS has no `/dev/net/tun`.
+
+Unlike the Ubuntu flow there is no one-shot installer — `scripts/setup-dev-env.sh` targets Ubuntu 25 specifically. The macOS flow is manual but short:
+
+1. **Install Homebrew** if you don't have it yet: <https://brew.sh>.
+
+2. **Install VICE 3.10** (ships `x64sc` and `c1541`, pre-built with `--enable-ethernet`):
+
+   ```bash
+   brew install vice
+   ```
+
+3. **Create the harness venv** at the same path Linux uses so scripts and docs stay uniform, and `pip install -e .` into it:
+
+   ```bash
+   python3 -m venv --system-site-packages ~/.local/share/c64-test-harness/venv
+   ~/.local/share/c64-test-harness/venv/bin/pip install -e '.[dev]'
+   source ~/.local/share/c64-test-harness/venv/bin/activate
+   ```
+
+4. **Verify** with the cross-platform checker:
+
+   ```bash
+   ./scripts/verify-dev-env.sh
+   ```
+
+   Bridge checks report as optional gaps until step 5 runs. Non-bridge tests should pass:
+
+   ```bash
+   ~/.local/share/c64-test-harness/venv/bin/python -m pytest tests/test_vice_core.py tests/test_vice_binary.py
+   ```
+
+5. **Bridge networking for ethernet tests** — creates `bridge10` + `feth0`/`feth1`, the macOS-native counterpart to `br-c64` + `tap-c64-{0,1}`:
+
+   ```bash
+   sudo ./scripts/setup-bridge-feth-macos.sh
+   ```
+
+   Teardown:
+
+   ```bash
+   sudo ./scripts/teardown-bridge-feth-macos.sh
+   ```
+
+   Emergency recovery (scoped VICE kill + bridge/feth destroy; does not touch the system `bridge0`):
+
+   ```bash
+   sudo ./scripts/cleanup-bridge-feth-macos.sh
+   ```
+
+   See [docs/bridge_networking.md](bridge_networking.md) for the full lifecycle.
+
+6. **BPF permission for the VICE pcap driver.** VICE's `pcap` ethernet driver opens `/dev/bpf*`, which is root-only on a fresh macOS install. Grant user access via one of:
+
+   - Install Wireshark and run its **ChmodBPF** helper (recommended — persists across reboots and is the standard Wireshark path).
+   - One-shot `sudo chmod 666 /dev/bpf*` (resets on the next boot).
+
+   Without this, VICE errors out with a `pcap_open_live` / BPF permission message when you try to attach `feth0`/`feth1`.
+
+### Caveats
+
+- The Homebrew `vice` formula already passes `--enable-ethernet`, so `-ethernetcart` / `-ethernetioif` / `-ethernetiodriver` are available and `verify-dev-env.sh` reports the VICE section green.
+- On macOS 26 (Tahoe), the VICE 3.10 bottle prints a cosmetic `Error - failed to retrieve executable path, falling back to getcwd() + argv[0]` on every launch. `-help`, `-features`, and normal emulator launches proceed past it and work correctly, including `-binarymonitor`. The one case that does *not* recover is `x64sc --version`, which exits 1 after the error because VICE's init-order bug hits a NULL `argv[0]` reference before the path is stashed. `verify-dev-env.sh` works around this by falling back to `brew list --versions vice`, the Cellar path, and finally a `-features` probe. File upstream if we want a real fix.
+- On macOS 26 (Tahoe), launching the Homebrew `x64sc` 3.10 bottle with `-ethernetiodriver pcap -ethernetioif feth<N> -binarymonitor` additionally crashes during startup -- the process exits before the binary monitor becomes reachable, and the host raises a system crash reporter dialog for `x64sc`. Root cause is upstream and likely in the same init-order cluster as the `--version` crash above (the pcap init path runs before `archdep_program_path_set_argv0()` on this macOS release). The `tests/test_ethernet.py` fixture protects itself by importing `bridge_platform.probe_vice_pcap_ok()`, which launches a throwaway `x64sc` once per process to check whether the pcap driver survives startup; on failure the ethernet tests skip with a clear reason instead of torpedoing the suite. Override the probe with `MACOS_PCAP_DISABLED=1` (skip without probing) or `MACOS_PCAP_ENABLED=1` (trust the user without probing). Reproduce the crash interactively with `scripts/probe-vice-feth.sh`. File upstream once we have a small non-harness repro.
+- `tests/test_port_lock.py` has three tests (`test_cross_process_exclusion`, `test_lock_released_on_process_exit`, `test_cleanup_does_not_break_held_lock`) that use `multiprocessing` with nested helper functions; these fail on macOS because the default multiprocessing start method is `spawn` (Linux defaults to `fork`) and nested functions can't be pickled. Non-blocking for dev work, but worth fixing if we want green CI on macOS.
 
 ## Follow-ups not in this PR
 

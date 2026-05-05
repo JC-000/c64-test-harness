@@ -27,6 +27,8 @@ Reusable test harness for Commodore 64 programs. Automates C64 programs via the 
 
 ## Getting started (fresh Ubuntu 25 machine)
 
+Supported platforms: **Ubuntu Desktop 25** (primary) and **macOS** (Homebrew-based; Apple Silicon, Tahoe 26.x verified).
+
 On a clean Ubuntu Desktop 25 box, one command gets you from zero to a working dev environment:
 
 ```bash
@@ -40,6 +42,8 @@ The installer runs six stages — system packages, VICE 3.10 source build with `
 ```
 
 See [docs/development.md](docs/development.md) for the full stage breakdown, opt-out flags, and how to recover if a stage fails.
+
+**macOS:** there is no one-shot installer — the flow is a short manual sequence (`brew install vice`, create the venv at `~/.local/share/c64-test-harness/venv`, `pip install -e .`, then `sudo scripts/setup-bridge-feth-macos.sh` if you want the bridge tests). See [docs/development.md#macos-homebrew](docs/development.md#macos-homebrew) for the step-by-step, and [docs/bridge_networking.md](docs/bridge_networking.md) for the `feth0`/`feth1` + `bridge10` layout that is the macOS counterpart to `tap-c64-{0,1}` + `br-c64`.
 
 ## Installation
 
@@ -574,7 +578,7 @@ See `examples/play_sid.py` (supports `--vice` / `--u64 HOST` modes, plus `--self
 
 ## Ethernet / CS8900a Testing
 
-Test C64 networking code using VICE's CS8900a ethernet cartridge emulation with Linux TAP interfaces:
+Test C64 networking code using VICE's CS8900a ethernet cartridge emulation. On Linux this uses TAP interfaces (`tap-c64-*`) with VICE's `tuntap` driver; on macOS the equivalent layout is `feth*` peers with the `pcap` driver (see [docs/bridge_networking.md](docs/bridge_networking.md) and `tests/bridge_platform.py` for the cross-platform dispatch):
 
 ```python
 from c64_test_harness import ViceConfig, ViceInstanceManager
