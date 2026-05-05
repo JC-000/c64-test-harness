@@ -19,6 +19,90 @@ host can also participate (the bridge's IP is `10.0.65.1`), so
 captures via `tcpdump -i br-c64` will show all traffic between the
 instances.
 
+## Reference pattern for VICE agents
+
+When an agent working on c64-test-harness needs two VICE instances that
+can exchange ethernet frames, use this canonical lifecycle:
+
+1. **Setup** (once per session, as root):
+
+   ```bash
+   sudo scripts/setup-bridge-tap.sh
+   ```
+
+2. **Acquire VICE instances** via the `bridge_vice_pair` pytest fixture
+   in `tests/conftest.py`, or the equivalent `ViceProcess`-based pattern
+   for non-pytest code. See `tests/test_bridge_ping.py` for full fixture
+   usage, and `scripts/bridge_ping_demo.py` for a standalone script
+   reference.
+
+3. **Run your code**. The fixture handles CS8900a init, MAC programming,
+   and clean VICE shutdown on context exit.
+
+4. **Teardown** (after the last session completes, as root):
+
+   ```bash
+   sudo scripts/teardown-bridge-tap.sh
+   ```
+
+5. **Recovery** (only if a session died uncleanly, leaving residue):
+
+   ```bash
+   sudo scripts/cleanup-bridge-networking.sh
+   ```
+
+### Rules for VICE lifecycle
+
+- **Never `pkill x64sc`.** It kills every VICE on the host including
+  unrelated instances.  Use `scripts/cleanup_vice_ports.py` instead,
+  which is scoped to the harness's known port ranges and verifies each
+  target's `/proc/<pid>/comm` before sending any signal.  See
+  `feedback_no_pkill.md`.
+- **The Python harness owns VICE lifecycle in the happy path.** Let
+  `ViceProcess.__exit__` / `ViceInstanceManager.release()` stop VICE
+  cleanly.  The cleanup script is only for the "my session crashed"
+  case.
+- **Setup and teardown are symmetric.** They touch exactly these
+  resources: the `br-c64` bridge, `tap-c64-0` / `tap-c64-1` TAP devices,
+  six FORWARD iptables rules, and `/tmp/vice_eth_*.rc` stale files.
+  They never touch `/proc/sys/net/ipv4/ip_forward` — the host default
+  is preserved.
+- **Interface names are canonical.** The fixture, setup script,
+  teardown script, and cleanup script all agree on `br-c64` /
+  `tap-c64-{0,1}`.  Don't drift — update all four files in lockstep if
+  you ever need to rename.
+- **Port ranges for harness VICE instances**: `6511-6531` and
+  `6560-6580` (per `HarnessConfig.vice_port_range_start/end` and the
+  bridge fixture respectively).  The cleanup helper scopes to these
+  ranges by default.
+
+### Recovery helper
+
+`scripts/cleanup_vice_ports.py` is the port-range-scoped VICE killer:
+
+```bash
+python3 scripts/cleanup_vice_ports.py --range 6511:6531,6560:6580
+python3 scripts/cleanup_vice_ports.py --range 6511:6531 --dry-run
+python3 scripts/cleanup_vice_ports.py --help
+```
+
+It reads `/proc/net/tcp` for listeners in the requested ranges, resolves
+each to a PID, verifies `/proc/<pid>/comm == x64sc`, then SIGTERMs,
+waits a grace period (default 2 s), and SIGKILLs survivors.  Safe to
+run while unrelated VICE instances (outside the harness port ranges)
+are alive — they won't be touched.  Exit code is `0` on a clean result,
+`1` if any process is still alive after SIGKILL, `2` on argument error,
+and `3` if listener(s) were found but `/proc/<pid>/comm` could not be
+read for any of them (insufficient privileges).
+
+If the helper reports "listener(s) found but could not read
+`/proc/<pid>/comm`" (exit 3), re-run with `sudo` — `x64sc` file
+capabilities (`cap_net_admin,cap_net_raw=ep`) make unprivileged comm
+reads fail, which the helper now detects and flags instead of silently
+reporting zero.
+
+The scoping is empirically verified by `tests/test_cleanup_vice_ports_live.py::TestBridgeCleanupScoping::test_scoped_cleanup_preserves_out_of_range_vice` (opt in with `BRIDGE_CLEANUP_LIVE=1`).
+
 ## Prerequisites
 
 * `x64sc` (VICE 3.10) compiled with `tuntap` driver support
