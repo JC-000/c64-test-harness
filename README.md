@@ -22,6 +22,7 @@ Reusable test harness for Commodore 64 programs. Automates C64 programs via the 
 - **SID playback** — cross-backend `play_sid()` dispatches to VICE (IRQ stub) or Ultimate 64 (native firmware endpoint); PSID/RSID parser
 - **Audio capture** — headless WAV recording via VICE (`render_wav()`) and U64 UDP audio stream (`capture_sid_u64()`, `AudioCapture`)
 - **U64 data streams** — cycle-accurate 6510/VIC bus trace (`DebugCapture`), VIC-II video frame capture (`VideoCapture`), audio capture — all over UDP with gap detection
+- **Runtime warp toggle** — enable/disable VICE warp mode at runtime via dual-monitor (binary + text); `resource_get`/`resource_set` for general VICE resource control
 - **Flexible configuration** — `HarnessConfig` with TOML file and environment variable support
 
 ## Installation
@@ -189,6 +190,52 @@ with ViceProcess(config) as vice:
 | `jsr(transport, addr)` | Call a subroutine and wait for RTS (uses trampoline at `$0334`) |
 
 `jsr()` writes a small trampoline (`JSR addr; NOP; NOP`) into the cassette buffer at `$0334`, sets a checkpoint after the `JSR`, resumes execution, and waits for the CPU to stop via async event. The CPU is paused when `jsr()` returns, so memory reads are safe. Works reliably even for long-running computations in warp mode. See `examples/direct_memory_test.py` for a complete demo.
+
+## Runtime Warp Mode Toggle
+
+Toggle VICE warp mode at runtime to speed up long-running computations (e.g. crypto benchmarks) and then return to normal speed for screen verification. VICE 3.10 does not expose `WarpMode` as a binary monitor resource, so warp control requires a secondary text remote monitor connection:
+
+```python
+from c64_test_harness import BinaryViceTransport, ViceProcess, ViceConfig
+
+# Enable both binary and text monitors
+config = ViceConfig(prg_path="build/app.prg", text_monitor_port=6510)
+with ViceProcess(config) as vice:
+    transport = BinaryViceTransport(
+        port=config.port,
+        text_monitor_port=config.text_monitor_port,
+    )
+
+    # Toggle warp at runtime
+    transport.set_warp(True)    # enable warp — CPU runs at maximum speed
+    # ... run long computation ...
+    transport.set_warp(False)   # disable warp — back to normal speed
+
+    # Query current warp state
+    if transport.get_warp():
+        print("Warp is ON")
+
+    # General VICE resource access (binary monitor protocol)
+    value = transport.resource_get("Sound")       # returns int or str
+    transport.resource_set("Sound", 0)            # mute audio
+
+    transport.close()
+```
+
+`ViceInstanceManager` can auto-allocate the text monitor port:
+
+```python
+from c64_test_harness import ViceInstanceManager, ViceConfig
+
+config = ViceConfig(prg_path="build/app.prg")
+with ViceInstanceManager(config, enable_text_monitor=True) as mgr:
+    with mgr.instance() as inst:
+        inst.transport.set_warp(True)
+        # ... run tests in warp ...
+        inst.transport.set_warp(False)
+```
+
+**Why dual monitors?** The binary monitor protocol (commands `0x51`/`0x52`) handles most VICE resources, but VICE 3.10's binary monitor returns error code `0x01` for `WarpMode`. The text remote monitor's `warp on`/`warp off` command works reliably. Both monitors run simultaneously on separate TCP ports.
 
 ## Multi-Instance VICE & Parallel Testing
 
