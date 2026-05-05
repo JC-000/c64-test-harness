@@ -365,6 +365,24 @@ See `examples/ultimate64_hello.py` for a full BASIC round-trip demo and `scripts
 
 **Limitations on hardware:** The REST API does not expose CPU registers or breakpoints. `jsr()`, `wait_for_pc()`, `set_breakpoint()`, and `set_register()` are VICE-only — they are not available on `Ultimate64Transport`. Tests that need register-precise execution control must use the VICE backend. Memory read/write, screen capture, keyboard injection, and screen-text waiting all work identically to VICE.
 
+## SID Playback
+
+Unified SID file playback API that works on both backends — same call, different plumbing underneath:
+
+```python
+from c64_test_harness import SidFile, play_sid
+sid = SidFile.load("song.sid")
+play_sid(transport, sid, song=0)  # works with BinaryViceTransport or Ultimate64Transport
+```
+
+`SidFile` parses PSID v1-v4 and RSID headers; `build_test_psid()` synthesizes minimal valid PSIDs for tests. `play_sid()` dispatches on transport type — VICE installs an 18-byte 6502 IRQ wrapper stub at `$C000` (configurable via `DEFAULT_STUB_ADDR`) that repoints the KERNAL IRQ vector at `$0314/$0315` through a `JSR play; JMP $EA31` trampoline, driving the tune at 50Hz. Ultimate 64 hands the `.sid` bytes to the native `POST /v1/runners:sidplay` firmware endpoint.
+
+**VICE limitations:** PSID only — no IRQ-driven RSID support in the stub; `load_addr` must be explicit (the 0x0000 "load-address-in-data" form is not supported here); `play_addr` must be non-zero (the VICE wrapper cannot host sample-driven tunes that have no play routine). Call `stop_sid_vice(transport)` to cleanly silence the SID and restore the original KERNAL IRQ vector.
+
+**Ultimate 64:** the native `sidplay` runner accepts anything the firmware supports (PSID and RSID, including sample-driven tunes), so on hardware the `play_sid()` call just forwards the file bytes.
+
+See `examples/play_sid.py` (supports `--vice` / `--u64 HOST` modes, plus `--self-test` which plays a synthesized C-major scale) and `scripts/play_scale_u64.py` for a full demo that builds a scale PSID on the fly, DMA-loads it, and plays it on hardware.
+
 ## Architecture
 
 ```
@@ -396,6 +414,7 @@ The `examples/` directory contains runnable demos:
 | `examples/drive_menu.py` | Navigate disk drive menus |
 | `examples/custom_backend.py` | Implement a custom `C64Transport` backend |
 | `examples/ultimate64_hello.py` | End-to-end BASIC round-trip on an Ultimate 64 |
+| `examples/play_sid.py` | Play a SID file on VICE or Ultimate 64 (`--vice` / `--u64 HOST`) |
 
 Additional scripts in `scripts/`:
 
@@ -407,6 +426,7 @@ Additional scripts in `scripts/`:
 | `scripts/stress_port_allocation.py` | Cross-process port allocation stress test |
 | `scripts/stress_cross_process.py` | Multi-agent VICE instance management stress test (5 phases) |
 | `scripts/probe_u64.py` | Probe an Ultimate 64 device (firmware, endpoints, config surface) |
+| `scripts/play_scale_u64.py` | Build + play a C-major scale PSID on an Ultimate 64 |
 
 ## Running Tests
 
