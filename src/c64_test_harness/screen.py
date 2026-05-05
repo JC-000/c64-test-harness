@@ -141,6 +141,12 @@ def wait_for_text(
                 on_progress(elapsed, last)
         except Exception:
             pass
+        # The binary monitor pauses the CPU on every memory read.
+        # Resume so the program can continue executing before we poll again.
+        try:
+            transport.resume()
+        except Exception:
+            pass
         time.sleep(poll_interval)
 
 
@@ -173,6 +179,12 @@ def wait_for_stable(
             else:
                 count = 0
                 prev_text = current
+        except Exception:
+            pass
+        # Resume the CPU so the program keeps running between polls
+        # (the binary monitor pauses on memory reads).
+        try:
+            transport.resume()
         except Exception:
             pass
         time.sleep(poll_interval)
