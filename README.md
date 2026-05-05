@@ -363,6 +363,46 @@ restore_state(transport, snap)          # put device back as you found it
 
 See `examples/ultimate64_hello.py` for a full BASIC round-trip demo and `scripts/probe_u64.py` for device capability discovery.
 
+### Reset vs Reboot
+
+The Ultimate 64 has two reset modes:
+
+- **`reset(client)`** — Soft C64 reset (6510 CPU only). Fast, but does NOT reinitialize the FPGA or DMA controllers.
+- **`reboot(client)`** — Full device reboot. Reinitializes the entire FPGA including DMA controllers and REU. Takes ~8 seconds. **Required when switching turbo speeds between REU-heavy workloads** — stale DMA state from a prior turbo speed causes hangs after a soft reset.
+
+### DMA Trampoline Pattern (executing code without jsr)
+
+Since the U64 has no CPU register control, use DMA writes to inject and trigger code:
+
+```python
+SENTINEL, TRAMPOLINE, MAIN_LOOP = 0x0350, 0x0360, 0x082A
+
+# Write trampoline: JSR target; LDA #$42; STA sentinel; JMP * (park)
+trampoline = bytes([0x20, target & 0xFF, target >> 8, 0xA9, 0x42,
+                    0x8D, 0x50, 0x03, 0x4C, 0x68, 0x03])
+write_bytes(transport, TRAMPOLINE, trampoline)
+write_bytes(transport, SENTINEL, bytes([0x00]))
+# Hijack the program's parking loop
+write_bytes(transport, MAIN_LOOP, bytes([0x4C, 0x60, 0x03]))
+# Poll sentinel for completion
+while transport.read_memory(SENTINEL, 1)[0] != 0x42:
+    time.sleep(0.1)
+```
+
+### Turbo Benchmark
+
+`scripts/bench_x25519_u64_turbo.py` benchmarks X25519 scalar multiplication across all turbo speeds. Results on Ultimate 64 Elite (fw 3.14d):
+
+| MHz | C64 Time | Speedup |
+|-----|----------|---------|
+| 48 | 12.0s | 13.6x |
+| 32 | 13.4s | 12.2x |
+| 16 | 18.1s | 9.1x |
+| 8 | 28.2s | 5.8x |
+| 4 | 48.3s | 3.4x |
+| 2 | 81.3s | 2.0x |
+| 1 | 163.7s | 1.0x |
+
 **Limitations on hardware:** The REST API does not expose CPU registers or breakpoints. `jsr()`, `wait_for_pc()`, `set_breakpoint()`, and `set_register()` are VICE-only — they are not available on `Ultimate64Transport`. Tests that need register-precise execution control must use the VICE backend. Memory read/write, screen capture, keyboard injection, and screen-text waiting all work identically to VICE.
 
 ## SID Playback
@@ -427,6 +467,7 @@ Additional scripts in `scripts/`:
 | `scripts/stress_cross_process.py` | Multi-agent VICE instance management stress test (5 phases) |
 | `scripts/probe_u64.py` | Probe an Ultimate 64 device (firmware, endpoints, config surface) |
 | `scripts/play_scale_u64.py` | Build + play a C-major scale PSID on an Ultimate 64 |
+| `scripts/bench_x25519_u64_turbo.py` | X25519 benchmark across U64 turbo speeds (1–48 MHz) |
 
 ## Running Tests
 
@@ -459,6 +500,10 @@ pytest                                   # unit tests only (no VICE needed)
 pytest tests/test_disk_vice.py -v        # VICE disk I/O integration tests
 pytest tests/test_vice_core.py -v        # VICE core module integration tests
 pytest tests/test_vice_binary.py -v      # VICE binary monitor protocol tests
+
+# Ultimate 64 live tests (requires U64_HOST)
+U64_HOST=192.168.1.81 pytest tests/test_u64_feature_parity_live.py -v
+U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 pytest tests/test_u64_turbo_bench_live.py -v
 ```
 
 ## License
