@@ -255,6 +255,44 @@ Unlike the Ubuntu flow there is no one-shot installer — `scripts/setup-dev-env
 - **libpcap over BPF self-delivers broadcasts on macOS.** `libpcap` sets `BIOCSSEESENT=1` whenever `pcap_set_promisc(1)` is on, which means the sender's own pcap handle receives its own outbound broadcast frames back as inbound. VICE's `pcap` driver feeds those back into the CS8900a RX FIFO, so after a TX phase the sender's CS8900a has its own just-sent frame queued for read. Any test that TX's then later RX's on the same transport (e.g. `test_bidirectional_exchange` in `tests/test_ethernet_bridge.py`) must drain the FIFO first or it will read the stale self-frame. `_drain_cs8900a_rx` in `tests/test_ethernet_bridge.py` is the 6502 helper that handles this; the `_build_rx_code(..., expected_src_mac=...)` src-MAC filter is the defence-in-depth layer. Unicast tests (e.g. the ICMP suite which addresses frames to the peer's MAC) are not affected because the CS8900a discards non-matching unicast under CS8900a's built-in IA filter.
 - `tests/test_port_lock.py` has three tests (`test_cross_process_exclusion`, `test_lock_released_on_process_exit`, `test_cleanup_does_not_break_held_lock`) that use `multiprocessing` with nested helper functions; these fail on macOS because the default multiprocessing start method is `spawn` (Linux defaults to `fork`) and nested functions can't be pickled. Non-blocking for dev work, but worth fixing if we want green CI on macOS.
 
+## Making the `c64-test` Claude Code skill available globally
+
+The harness ships a Claude Code skill at `.claude/skills/c64-test/` that teaches agents how to use the Python package (see the files next to it — `SKILL.md`, `REFERENCE.md`, `PATTERNS.md`). By default the skill is only discovered when Claude Code starts inside the harness repo. Most users work across multiple C64 projects (e.g. `c64-https`, `c64-x25519`, `c64-ChaCha20-Poly1305`) and want the skill loaded in those sessions too.
+
+The recommended install is a **user-scope symlink** pointing at the repo's copy, so the skill stays in version control in a single place but loads globally:
+
+```bash
+./scripts/install-skill.sh
+```
+
+The script is idempotent — re-running is a no-op. It creates `~/.claude/skills/c64-test` as a symlink to `<this-repo>/.claude/skills/c64-test`. Any update committed to the repo is visible to every Claude Code session on this machine the moment you pull the change.
+
+To check without touching anything:
+
+```bash
+./scripts/install-skill.sh --dry-run
+```
+
+To remove:
+
+```bash
+./scripts/install-skill.sh --uninstall
+```
+
+The uninstaller only removes the symlink if it points at this repo's copy — it will refuse to touch a symlink someone else installed (e.g., pointing at a fork or a different checkout), and it will never touch a real file/directory.
+
+### Why a symlink, not a copy
+
+- **Single source of truth.** The three skill files are long; keeping N divergent copies around the filesystem is a maintenance trap.
+- **Auto-update on pull.** You don't need to re-run the installer after a PR merges — the symlink resolves to whatever is on disk now.
+- **Repo-side review.** Skill changes go through the harness repo's PR flow like any code change. Irrelevant projects (e.g., X68000 sessions) just don't invoke the skill because its `description` field controls when Claude fires it.
+
+### Alternative approaches (not recommended)
+
+- **Per-project symlink** into each C64 project's `.claude/skills/` — works, but N symlinks to maintain and each needs `.gitignore`ing since the target path is machine-specific.
+- **Committed copy per project** — three copies drift instantly; hard pass.
+- **Claude Code plugin + marketplace** — the "official" distribution model, but overkill for a single-user multi-repo setup. Consider if the skill grows beyond this repo's audience.
+
 ## Follow-ups not in this PR
 
 - Real fresh-VM validation of `setup-dev-env.sh` (the authoring was done via `--dry-run` only, on an already-set-up machine)
