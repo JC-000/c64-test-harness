@@ -303,13 +303,31 @@ class Ultimate64Client:
         _, data = self._request("GET", "/v1/machine:readmem", query=query)
         return data
 
-    def write_mem(self, address: int, data: bytes) -> None:
-        """PUT /v1/machine:writemem — write bytes to C64 memory via DMA (DESTRUCTIVE).
+    #: Raw-byte threshold above which :meth:`write_mem` switches from the
+    #: legacy ``PUT ?data=<hex>`` form to the ``POST`` with raw-byte body.
+    #: The device caps the ``data=`` query field at 128 hex chars (= 64 raw
+    #: bytes); we trigger POST conservatively below that to leave room for
+    #: other query encoding (address=, etc.).
+    WRITE_MEM_QUERY_THRESHOLD: int = 48
 
-        The device expects the payload as a hex-encoded ``data=`` query
-        parameter (not an HTTP body). Each byte becomes two uppercase
-        hex nibbles with no prefix or separator, e.g. ``414243`` for
-        ``b"ABC"``.
+    def write_mem(self, address: int, data: bytes) -> None:
+        """Write bytes to C64 memory via DMA (DESTRUCTIVE).
+
+        Uses one of two wire forms depending on payload size:
+
+        * **Small payloads** (``len(data) <= WRITE_MEM_QUERY_THRESHOLD``,
+          48 bytes) — ``PUT /v1/machine:writemem?address=0xNNNN&data=<hex>``.
+          Kept for backwards compatibility with existing callers/mocks.
+        * **Large payloads** — ``POST /v1/machine:writemem?address=0xNNNN``
+          with the raw bytes as the request body
+          (``Content-Type: application/octet-stream``). Required for
+          anything past the device's 128-hex-char cap on the ``data=``
+          query param (firmware 3.14 responds
+          ``"Maximum length of 128 bytes exceeded. Consider using POST
+          method with attachment."``).
+
+        Both forms are functionally equivalent for supported sizes; the
+        POST form has no upper bound verified at 2048 bytes.
         """
         if not isinstance(address, int) or address < 0 or address > 0xFFFF:
             raise ValueError(f"address out of range 0..0xFFFF: {address}")
@@ -317,11 +335,22 @@ class Ultimate64Client:
             raise TypeError("data must be bytes")
         if not data:
             return
-        query = {
-            "address": "0x%04X" % address,
-            "data": bytes(data).hex().upper(),
-        }
-        self._request("PUT", "/v1/machine:writemem", query=query)
+        payload = bytes(data)
+        if len(payload) <= self.WRITE_MEM_QUERY_THRESHOLD:
+            query = {
+                "address": "0x%04X" % address,
+                "data": payload.hex().upper(),
+            }
+            self._request("PUT", "/v1/machine:writemem", query=query)
+        else:
+            # POST with raw-byte attachment — no data= query, body carries payload.
+            self._request(
+                "POST",
+                "/v1/machine:writemem",
+                body=payload,
+                content_type="application/octet-stream",
+                query={"address": "0x%04X" % address},
+            )
 
     # ------------------------------------------------------------ code runners
     def load_prg(self, data: bytes) -> None:
