@@ -114,7 +114,7 @@ The scoping is empirically verified by `tests/test_cleanup_vice_ports_live.py::T
 ## Setting up the bridge
 
 ```bash
-sudo /home/someone/c64-test-harness/scripts/setup-bridge-tap.sh
+sudo ./scripts/setup-bridge-tap.sh
 ```
 
 This creates:
@@ -125,13 +125,13 @@ This creates:
 To tear down:
 
 ```bash
-sudo /home/someone/c64-test-harness/scripts/teardown-bridge-tap.sh
+sudo ./scripts/teardown-bridge-tap.sh
 ```
 
 If something goes wrong, an emergency cleanup is available:
 
 ```bash
-sudo /home/someone/c64-test-harness/scripts/cleanup-bridge-networking.sh
+sudo ./scripts/cleanup-bridge-networking.sh
 ```
 
 ## Launching two VICE instances on the bridge
