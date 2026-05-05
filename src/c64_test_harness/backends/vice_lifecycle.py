@@ -16,6 +16,43 @@ if TYPE_CHECKING:
     from c64_test_harness.disk import DiskImage
 
 
+def _find_pid_on_port(port: int) -> int | None:
+    """Find the PID of the process listening on *port* via /proc/net/tcp.
+
+    Returns the PID as an int, or ``None`` if not found or on non-Linux.
+    """
+    import os
+
+    hex_port = f"{port:04X}"
+    try:
+        with open("/proc/net/tcp") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 4:
+                    continue
+                local = parts[1]
+                if local.endswith(f":{hex_port}") and parts[3] == "0A":
+                    # 0A = LISTEN state
+                    inode = parts[9] if len(parts) > 9 else None
+                    if inode is None:
+                        continue
+                    # Find PID via /proc/*/fd
+                    for pid_dir in os.listdir("/proc"):
+                        if not pid_dir.isdigit():
+                            continue
+                        fd_dir = f"/proc/{pid_dir}/fd"
+                        try:
+                            for fd in os.listdir(fd_dir):
+                                link = os.readlink(f"{fd_dir}/{fd}")
+                                if f"socket:[{inode}]" in link:
+                                    return int(pid_dir)
+                        except (PermissionError, FileNotFoundError):
+                            continue
+    except FileNotFoundError:
+        pass  # Not Linux or /proc not mounted
+    return None
+
+
 @dataclass
 class ViceConfig:
     """Configuration for launching a VICE instance."""
@@ -124,6 +161,15 @@ class ViceProcess:
         return False
 
     @staticmethod
+    def get_listener_pid(port: int) -> int | None:
+        """Return the PID of the process listening on *port*, or None.
+
+        Uses ``/proc/net/tcp`` and ``/proc/*/fd`` (Linux only).
+        Returns ``None`` if the port has no listener or on non-Linux systems.
+        """
+        return _find_pid_on_port(port)
+
+    @staticmethod
     def kill_on_port(port: int) -> bool:
         """Kill a process listening on *port* using /proc/net/tcp (Linux).
 
@@ -133,32 +179,11 @@ class ViceProcess:
         import os
         import signal
 
-        hex_port = f"{port:04X}"
-        try:
-            with open("/proc/net/tcp") as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if len(parts) < 4:
-                        continue
-                    local = parts[1]
-                    if local.endswith(f":{hex_port}") and parts[3] == "0A":
-                        # 0A = LISTEN state
-                        inode = parts[9] if len(parts) > 9 else None
-                        if inode is None:
-                            continue
-                        # Find PID via /proc/*/fd
-                        for pid_dir in os.listdir("/proc"):
-                            if not pid_dir.isdigit():
-                                continue
-                            fd_dir = f"/proc/{pid_dir}/fd"
-                            try:
-                                for fd in os.listdir(fd_dir):
-                                    link = os.readlink(f"{fd_dir}/{fd}")
-                                    if f"socket:[{inode}]" in link:
-                                        os.kill(int(pid_dir), signal.SIGTERM)
-                                        return True
-                            except (PermissionError, FileNotFoundError):
-                                continue
-        except FileNotFoundError:
-            pass  # Not Linux or /proc not mounted
+        pid = _find_pid_on_port(port)
+        if pid is not None:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                return True
+            except OSError:
+                pass
         return False

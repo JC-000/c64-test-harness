@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -23,6 +23,9 @@ def _mock_vice():
     ):
         MockProc.return_value.wait_for_monitor.return_value = True
         MockProc.return_value.stop = MagicMock()
+        MockProc.return_value.pid = 12345
+        # get_listener_pid returns None by default (skip PID verification)
+        MockProc.get_listener_pid = MagicMock(return_value=None)
         MockTrans.return_value.close = MagicMock()
         yield MockProc, MockTrans
 
@@ -94,6 +97,57 @@ class TestViceInstanceManager:
         assert len(mgr._allocator.allocated_ports) == 0
 
 
+    def test_acquire_retries_on_failure(self, _mock_vice):
+        MockProc, MockTrans = _mock_vice
+        # First attempt: wait_for_monitor fails; second: succeeds
+        MockProc.return_value.wait_for_monitor.side_effect = [False, True, True]
+        mgr = ViceInstanceManager(
+            port_range_start=18700, port_range_end=18710, max_retries=3,
+        )
+        inst = mgr.acquire()
+        assert inst.port in range(18700, 18710)
+        assert MockProc.return_value.start.call_count == 2
+        mgr.release(inst)
+
+    def test_acquire_exhausts_retries(self, _mock_vice):
+        MockProc, _ = _mock_vice
+        MockProc.return_value.wait_for_monitor.return_value = False
+        mgr = ViceInstanceManager(
+            port_range_start=18800, port_range_end=18810, max_retries=2,
+        )
+        with pytest.raises(RuntimeError, match="did not become ready"):
+            mgr.acquire()
+        assert mgr.active_count == 0
+
+    def test_pid_mismatch_raises(self, _mock_vice):
+        MockProc, _ = _mock_vice
+        MockProc.return_value.pid = 1234
+        with patch(
+            "c64_test_harness.backends.vice_manager.ViceProcess.get_listener_pid",
+            return_value=5678,
+        ):
+            mgr = ViceInstanceManager(
+                port_range_start=18900, port_range_end=18910, max_retries=1,
+            )
+            with pytest.raises(RuntimeError, match="PID mismatch"):
+                mgr.acquire()
+
+    def test_instance_holds_port_lock(self, _mock_vice):
+        mgr = ViceInstanceManager(port_range_start=19000, port_range_end=19010)
+        inst = mgr.acquire()
+        assert inst._port_lock is not None
+        assert inst._port_lock.held
+        mgr.release(inst)
+
+    def test_instance_stop_releases_port_lock(self, _mock_vice):
+        mgr = ViceInstanceManager(port_range_start=19100, port_range_end=19110)
+        inst = mgr.acquire()
+        lock = inst._port_lock
+        assert lock is not None
+        inst.stop()
+        assert not lock.held
+
+
 class TestViceInstance:
     def test_stop_closes_transport_and_process(self):
         proc = MagicMock()
@@ -108,3 +162,14 @@ class TestViceInstance:
         inst = ViceInstance(port=9999, process=None, transport=transport, managed=False)
         inst.stop()
         transport.close.assert_called_once()
+
+    def test_stop_releases_port_lock(self):
+        from c64_test_harness.backends.port_lock import PortLock
+        transport = MagicMock()
+        lock = MagicMock(spec=PortLock)
+        inst = ViceInstance(
+            port=9999, process=MagicMock(), transport=transport,
+            managed=True, _port_lock=lock,
+        )
+        inst.stop()
+        lock.release.assert_called_once()

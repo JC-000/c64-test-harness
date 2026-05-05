@@ -199,7 +199,7 @@ with ViceInstanceManager(config, port_range_start=6510, port_range_end=6515) as 
     result.print_summary()
 ```
 
-`PortAllocator` manages thread-safe port assignment, skipping ports with existing listeners. `ViceInstanceManager` handles the full lifecycle: allocate port, launch VICE, connect transport, and clean up on release. Set `reuse_existing=True` to adopt already-running VICE instances instead of launching new ones.
+`PortAllocator` manages thread-safe port assignment with dual-layer protection: OS-level `bind()` reservations and file-based `flock()` locks (`PortLock`). The file lock bridges the TOCTOU gap between closing the reservation socket and VICE binding to the port, making overlapping startup from independent processes completely safe. `ViceInstanceManager` handles the full lifecycle: allocate port, acquire file lock, launch VICE, verify PID ownership, connect transport, and clean up on release. Failed acquisitions retry with exponential backoff (configurable via `max_retries`). Set `reuse_existing=True` to adopt already-running VICE instances instead of launching new ones.
 
 Each `ViceInstance` exposes a `.pid` property (the OS process ID of the VICE process), and `SingleTestResult` includes the `.pid` of the instance that ran each test. This allows callers to track and manage only their own VICE processes — essential when multiple agents run tests concurrently.
 
@@ -287,7 +287,7 @@ config = HarnessConfig.from_env()
 config = HarnessConfig(vice_port=6510, vice_warp=True)
 ```
 
-Key fields: `vice_host`, `vice_port`, `vice_executable`, `vice_prg_path`, `vice_warp`, `vice_sound`, `vice_minimize`, `screen_base`, `vice_port_range_start/end`, `vice_reuse_existing`, `exec_poll_interval`, `screen_poll_interval`.
+Key fields: `vice_host`, `vice_port`, `vice_executable`, `vice_prg_path`, `vice_warp`, `vice_sound`, `vice_minimize`, `screen_base`, `vice_port_range_start/end`, `vice_reuse_existing`, `vice_acquire_retries`, `exec_poll_interval`, `screen_poll_interval`.
 
 **Window focus:** VICE windows start minimized by default (`ViceConfig.minimize = True`) to prevent focus stealing during automated test runs. Set `minimize=False` in `ViceConfig` (or `vice_minimize = false` in TOML / `C64TEST_VICE_MINIMIZE=0` in env) if you need visible windows.
 
@@ -299,8 +299,9 @@ C64Transport (Protocol)
   +-- HardwareTransportBase  (extension point for real hardware)
 
 ViceInstanceManager
-  +-- PortAllocator      (thread-safe port range)
-  +-- ViceInstance        (port + process + transport handle)
+  +-- PortAllocator      (thread-safe port range + file locks)
+  +-- PortLock           (fcntl.flock cross-process lock per port)
+  +-- ViceInstance        (port + process + transport + lock handle)
 
 Screen/Keyboard/Memory modules sit above the transport:
   ScreenGrid, wait_for_text, send_text, read_bytes, etc.
@@ -327,6 +328,8 @@ Additional scripts in `scripts/`:
 | `scripts/run_parallel_sha256.py` | 3 concurrent VICE instances running SHA-256 validation |
 | `scripts/three_windows.py` | Interactive demo writing user input across 3 VICE windows |
 | `scripts/run_all_tests.py` | Parallel test runner for the full test suite |
+| `scripts/stress_port_allocation.py` | Cross-process port allocation stress test |
+| `scripts/stress_cross_process.py` | Multi-agent VICE instance management stress test (5 phases) |
 
 ## Running Tests
 
@@ -347,8 +350,8 @@ python3 scripts/run_all_tests.py --workers 4
 python3 scripts/run_all_tests.py -k "test_config"
 ```
 
-The test runner organises 22 test files into three phases:
-1. **Unit tests** (18 files) — run in parallel, no external dependencies
+The test runner organises 23 test files into three phases:
+1. **Unit tests** (19 files) — run in parallel, no external dependencies
 2. **Integration tests** (1 file) — needs `c1541` on PATH
 3. **VICE integration tests** (3 files) — needs `x64sc` + `c1541`, runs serially
 
