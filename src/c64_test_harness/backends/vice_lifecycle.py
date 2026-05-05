@@ -87,6 +87,7 @@ class ViceConfig:
     ethernet_interface: str = ""  # host interface (e.g. "tap-c64")
     ethernet_driver: str = ""  # "tuntap" or "pcap" (empty = VICE default)
     ethernet_base: int = 0xDE00  # I/O base address
+    ethernet_mac: bytes = b""  # 6-byte MAC (empty = VICE default)
 
 
 class ViceProcess:

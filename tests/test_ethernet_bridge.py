@@ -24,6 +24,7 @@ import pytest
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 from c64_test_harness.backends.vice_manager import PortAllocator
+from c64_test_harness.ethernet import set_cs8900a_mac
 from c64_test_harness.execute import jsr, load_code
 from c64_test_harness.memory import read_bytes, write_bytes
 
@@ -475,6 +476,10 @@ def vice_bridge_pair():
             # Initialize CS8900a on both instances (enable TX/RX)
             _init_cs8900a(transport_a)
             _init_cs8900a(transport_b)
+
+            # Program unique MAC addresses into the CS8900a IA registers
+            set_cs8900a_mac(transport_a, SRC_MAC_A)
+            set_cs8900a_mac(transport_b, SRC_MAC_B)
 
             yield transport_a, transport_b
         finally:

@@ -19,6 +19,7 @@ from typing import Iterator
 from .port_lock import PortLock
 from .vice_binary import BinaryViceTransport
 from .vice_lifecycle import ViceConfig, ViceProcess
+from ..ethernet import generate_mac, set_cs8900a_mac
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +207,7 @@ class ViceInstanceManager:
         self._max_retries = max_retries
         self._instances: list[ViceInstance] = []
         self._lock = threading.Lock()
+        self._mac_counter = 0  # monotonic index for unique MAC generation
 
     def __enter__(self) -> ViceInstanceManager:
         return self
@@ -325,6 +327,7 @@ class ViceInstanceManager:
             ethernet_interface=self._base_config.ethernet_interface,
             ethernet_driver=self._base_config.ethernet_driver,
             ethernet_base=self._base_config.ethernet_base,
+            ethernet_mac=self._base_config.ethernet_mac,
         )
         proc = ViceProcess(cfg)
 
@@ -376,6 +379,25 @@ class ViceInstanceManager:
 
             if port_lock is not None:
                 port_lock.update_vice_pid(proc.pid or 0)
+
+            # Program unique CS8900a MAC if ethernet is enabled
+            if cfg.ethernet:
+                mac = cfg.ethernet_mac
+                if not mac:
+                    with self._lock:
+                        mac = generate_mac(self._mac_counter)
+                        self._mac_counter += 1
+                try:
+                    set_cs8900a_mac(transport, mac, base=cfg.ethernet_base)
+                    logger.info(
+                        "Set CS8900a MAC on port %d: %s",
+                        port,
+                        ":".join(f"{b:02x}" for b in mac),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to set CS8900a MAC on port %d: %s", port, exc,
+                    )
 
         except Exception:
             if port_lock is not None:
