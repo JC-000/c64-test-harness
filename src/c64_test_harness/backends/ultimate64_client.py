@@ -245,6 +245,50 @@ class Ultimate64Client:
         """PUT /v1/machine:menu_button — press the Ultimate menu button (DESTRUCTIVE)."""
         self._put_no_body("/v1/machine:menu_button")
 
+    # ------------------------------------------------------------ streams
+    def stream_audio_start(self, destination: str) -> None:
+        """PUT /v1/streams/audio:start — start streaming audio to *destination*.
+
+        *destination* is an IP address or hostname, optionally with ``:port``
+        suffix.  The device sends 16-bit stereo PCM at ~48 kHz over UDP.
+        Default multicast destination is ``239.0.1.65:11001``.
+        """
+        if not isinstance(destination, str) or not destination:
+            raise ValueError("destination must be a non-empty string")
+        self._put_no_body("/v1/streams/audio:start", query={"ip": destination})
+
+    def stream_audio_stop(self) -> None:
+        """PUT /v1/streams/audio:stop — stop the audio stream."""
+        self._put_no_body("/v1/streams/audio:stop")
+
+    def stream_video_start(self, destination: str) -> None:
+        """PUT /v1/streams/video:start — start streaming video to *destination*.
+
+        *destination* is an IP address or hostname, optionally with ``:port``
+        suffix.  The device sends video frames over UDP to the given address.
+        """
+        if not isinstance(destination, str) or not destination:
+            raise ValueError("destination must be a non-empty string")
+        self._put_no_body("/v1/streams/video:start", query={"ip": destination})
+
+    def stream_video_stop(self) -> None:
+        """PUT /v1/streams/video:stop — stop the video stream."""
+        self._put_no_body("/v1/streams/video:stop")
+
+    def stream_debug_start(self, destination: str) -> None:
+        """PUT /v1/streams/debug:start — start streaming debug data to *destination*.
+
+        *destination* is an IP address or hostname, optionally with ``:port``
+        suffix.
+        """
+        if not isinstance(destination, str) or not destination:
+            raise ValueError("destination must be a non-empty string")
+        self._put_no_body("/v1/streams/debug:start", query={"ip": destination})
+
+    def stream_debug_stop(self) -> None:
+        """PUT /v1/streams/debug:stop — stop the debug stream."""
+        self._put_no_body("/v1/streams/debug:stop")
+
     # ----------------------------------------------------------------- memory
     def read_mem(self, address: int, length: int) -> bytes:
         """GET /v1/machine:readmem — read `length` bytes from C64 memory via DMA.

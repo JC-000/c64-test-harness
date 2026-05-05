@@ -1,0 +1,34 @@
+{
+  "config": {
+    "name": "physical_8580",
+    "description": "Physical 8580 SID chip",
+    "instrument_chip": "8580",
+    "ultisid_settings": null,
+    "addressing": {
+      "SID Socket 1 Address": "$D400",
+      "SID Socket 2 Address": "Unmapped",
+      "UltiSID 1 Address": "Unmapped",
+      "UltiSID 2 Address": "Unmapped"
+    }
+  },
+  "capture": {
+    "duration_seconds": 14.972,
+    "packets_received": 3743,
+    "packets_dropped": 0,
+    "total_samples": 718656,
+    "sample_rate": 48000,
+    "peak_amplitude": 9921
+  },
+  "psid": {
+    "chip": "8580",
+    "load_addr": 4096,
+    "init_addr": 4096,
+    "play_addr": 4142,
+    "note_table_addr": 4196,
+    "num_notes": 25,
+    "frames_per_note": 25,
+    "total_frames": 625,
+    "duration_s": 12.5,
+    "psid_size": 274
+  }
+}
