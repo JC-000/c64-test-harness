@@ -161,3 +161,85 @@ def jsr(
                 break
             except TransportConnectionError:
                 time.sleep(0.2)
+
+
+def jsr_poll(
+    transport: C64Transport,
+    addr: int,
+    timeout: float = 10.0,
+    *,
+    scratch_addr: int = 0x0334,
+    poll_interval: float = 0.5,
+) -> dict[str, int]:
+    """Call a subroutine at *addr* using flag-based completion detection.
+
+    An alternative to :func:`jsr` for long-running subroutines (e.g. heavy
+    computation in warp mode).  Instead of breakpoints, a memory flag is
+    polled to detect when the subroutine returns.  This avoids VICE monitor
+    unresponsiveness that can occur when the CPU is busy during long
+    warp-mode computations.
+
+    For short subroutines, prefer :func:`jsr` — it provides more precise
+    register capture since the CPU is paused at the breakpoint.
+
+    A 17-byte trampoline is written at *scratch_addr*::
+
+        LDA #$00           ; clear flag
+        STA flag_addr      ; flag_addr = scratch_addr + 16
+        JSR addr           ; call subroutine
+        LDA #$FF           ; set flag
+        STA flag_addr
+        JMP loop_addr      ; loop_addr = scratch_addr + 15
+        BRK                ; flag byte (offset +16)
+
+    *poll_interval* controls the trade-off between responsiveness and
+    overhead — higher values reduce monitor connection attempts but
+    increase latency after the subroutine finishes.
+
+    Returns the register state if readable after completion, or an empty
+    dict if the monitor is not yet available.
+    """
+    flag_addr = scratch_addr + 16
+    loop_addr = scratch_addr + 15
+
+    addr_lo = addr & 0xFF
+    addr_hi = (addr >> 8) & 0xFF
+    flag_lo = flag_addr & 0xFF
+    flag_hi = (flag_addr >> 8) & 0xFF
+    loop_lo = loop_addr & 0xFF
+    loop_hi = (loop_addr >> 8) & 0xFF
+
+    trampoline = bytes([
+        0xA9, 0x00,                     # LDA #$00
+        0x8D, flag_lo, flag_hi,         # STA flag_addr
+        0x20, addr_lo, addr_hi,         # JSR addr
+        0xA9, 0xFF,                     # LDA #$FF
+        0x8D, flag_lo, flag_hi,         # STA flag_addr
+        0x4C, loop_lo, loop_hi,         # JMP loop_addr
+        0x00,                           # BRK (flag byte)
+    ])
+
+    transport.write_memory(scratch_addr, trampoline)
+    # Explicitly clear the flag
+    transport.write_memory(flag_addr, bytes([0x00]))
+
+    # Start execution — set_register disconnects the monitor, letting
+    # the CPU run freely without re-listening.
+    set_register(transport, "PC", scratch_addr)
+
+    deadline = time.monotonic() + timeout
+    while True:
+        time.sleep(poll_interval)
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Subroutine at ${addr:04X} did not return within {timeout}s"
+            )
+        try:
+            flag = transport.read_memory(flag_addr, 1)
+        except TransportConnectionError:
+            continue
+        if flag[0] == 0xFF:
+            try:
+                return transport.read_registers()
+            except TransportConnectionError:
+                return {}
