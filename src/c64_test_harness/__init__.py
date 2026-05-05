@@ -16,6 +16,8 @@ from .execute import load_code, goto, jsr, wait_for_pc, set_breakpoint, delete_b
 from .backends.vice import ViceTransport
 from .backends.vice_lifecycle import ViceProcess, ViceConfig
 from .backends.hardware import HardwareTransportBase
+from .backends.vice_manager import PortAllocator, ViceInstance, ViceInstanceManager
+from .parallel import run_parallel, ParallelTestResult, SingleTestResult
 
 __all__ = [
     # Protocol + exceptions
@@ -63,4 +65,12 @@ __all__ = [
     "ViceProcess",
     "ViceConfig",
     "HardwareTransportBase",
+    # Multi-instance
+    "PortAllocator",
+    "ViceInstance",
+    "ViceInstanceManager",
+    # Parallel execution
+    "run_parallel",
+    "ParallelTestResult",
+    "SingleTestResult",
 ]

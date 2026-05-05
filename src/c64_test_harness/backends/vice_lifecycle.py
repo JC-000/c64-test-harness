@@ -53,15 +53,11 @@ class ViceProcess:
         return self._proc.pid if self._proc else None
 
     def start(self) -> None:
-        """Kill any existing VICE on the same port, then launch."""
-        cfg = self.config
+        """Stop any existing process on this instance, then launch VICE."""
+        if self._proc is not None:
+            self.stop()
 
-        # Kill existing VICE instances using the same monitor port
-        subprocess.run(
-            ["pkill", "-f", f"remotemonitoraddress.*{cfg.port}"],
-            capture_output=True,
-        )
-        time.sleep(0.5)
+        cfg = self.config
 
         args = [cfg.executable]
         if cfg.prg_path:
@@ -110,4 +106,44 @@ class ViceProcess:
                 return True
             except Exception:
                 time.sleep(1)
+        return False
+
+    @staticmethod
+    def kill_on_port(port: int) -> bool:
+        """Kill a process listening on *port* using /proc/net/tcp (Linux).
+
+        Returns True if a process was found and killed, False otherwise.
+        This is an opt-in replacement for the old ``pkill -f`` approach.
+        """
+        import os
+        import signal
+
+        hex_port = f"{port:04X}"
+        try:
+            with open("/proc/net/tcp") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) < 4:
+                        continue
+                    local = parts[1]
+                    if local.endswith(f":{hex_port}") and parts[3] == "0A":
+                        # 0A = LISTEN state
+                        inode = parts[9] if len(parts) > 9 else None
+                        if inode is None:
+                            continue
+                        # Find PID via /proc/*/fd
+                        for pid_dir in os.listdir("/proc"):
+                            if not pid_dir.isdigit():
+                                continue
+                            fd_dir = f"/proc/{pid_dir}/fd"
+                            try:
+                                for fd in os.listdir(fd_dir):
+                                    link = os.readlink(f"{fd_dir}/{fd}")
+                                    if f"socket:[{inode}]" in link:
+                                        os.kill(int(pid_dir), signal.SIGTERM)
+                                        return True
+                            except (PermissionError, FileNotFoundError):
+                                continue
+        except FileNotFoundError:
+            pass  # Not Linux or /proc not mounted
         return False
