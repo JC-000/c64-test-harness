@@ -274,7 +274,9 @@ config = HarnessConfig.from_env()
 config = HarnessConfig(vice_port=6510, vice_warp=True)
 ```
 
-Key fields: `vice_host`, `vice_port`, `vice_executable`, `vice_prg_path`, `vice_warp`, `vice_sound`, `screen_base`, `vice_port_range_start/end`, `vice_reuse_existing`.
+Key fields: `vice_host`, `vice_port`, `vice_executable`, `vice_prg_path`, `vice_warp`, `vice_sound`, `vice_minimize`, `screen_base`, `vice_port_range_start/end`, `vice_reuse_existing`.
+
+**Window focus:** VICE windows start minimized by default (`ViceConfig.minimize = True`) to prevent focus stealing during automated test runs. Set `minimize=False` in `ViceConfig` (or `vice_minimize = false` in TOML / `C64TEST_VICE_MINIMIZE=0` in env) if you need visible windows.
 
 ## Architecture
 

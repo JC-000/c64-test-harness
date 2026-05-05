@@ -26,6 +26,7 @@ class ViceConfig:
     warp: bool = True
     ntsc: bool = True
     sound: bool = False
+    minimize: bool = True
     extra_args: list[str] = field(default_factory=list)
     disk_image: DiskImage | None = None
     drive_unit: int = 8
@@ -75,6 +76,8 @@ class ViceProcess:
         args += ["-remotemonitor", "-remotemonitoraddress", f"ip4://127.0.0.1:{cfg.port}"]
         if not cfg.sound:
             args.append("+sound")
+        if cfg.minimize:
+            args.append("-minimized")
         args += cfg.extra_args
 
         if cfg.disk_image is not None:
