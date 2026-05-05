@@ -60,6 +60,7 @@ class ViceConfig:
     executable: str = "x64sc"
     prg_path: str = ""
     port: int = 6502
+    text_monitor_port: int = 0  # 0 = no text monitor; >0 = enable -remotemonitor on this port
     warp: bool = True
     ntsc: bool = True
     sound: bool = False
@@ -133,6 +134,9 @@ class ViceProcess:
         if cfg.monitor:
             args += ["-binarymonitor", "-binarymonitoraddress",
                      f"ip4://127.0.0.1:{cfg.port}"]
+        if cfg.text_monitor_port > 0:
+            args += ["-remotemonitor", "-remotemonitoraddress",
+                     f"ip4://127.0.0.1:{cfg.text_monitor_port}"]
         if cfg.sounddev:
             # Force sound on when a sound device is configured
             args += ["-sounddev", cfg.sounddev]
