@@ -916,6 +916,16 @@ python3 scripts/stress_u64_queue.py 192.168.1.81 --workers 6 --rounds 5
 
 All U64 live tests use `DeviceLock` to serialize access to the physical device. Multiple agents (separate OS processes) can safely run tests in parallel — the lock file queues them automatically.
 
+## Claude Code Skill
+
+A project-level Claude Code skill lives at `.claude/skills/c64-test/`. When Claude Code runs inside this repo it is auto-discovered, giving the agent battle-tested patterns, a full API reference, and the gotcha list up front — no one-shot re-discovery of harness conventions.
+
+- `SKILL.md` — when to use it, core principles, test-file templates
+- `REFERENCE.md` — module-by-module API reference
+- `PATTERNS.md` — patterns (VICE management, jsr-based testing, parallel, U64 DMA trampoline, bridge networking, UCI) + 25 common gotchas
+
+The skill is versioned alongside the code, so every merge updates it with the harness. If you maintain a user-level copy at `~/.claude/skills/c64-test/`, the project-level version takes precedence when Claude Code is launched from this repo.
+
 ## License
 
 MIT
