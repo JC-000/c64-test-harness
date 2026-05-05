@@ -1,47 +1,79 @@
 #!/usr/bin/env bash
+# Bridge networking emergency cleanup — scoped to the harness port ranges.
+# Uses scripts/cleanup_vice_ports.py (Python helper) to target only VICE
+# processes bound to known test-harness ports, falling back to an in-script
+# bash port-resolve if Python is unavailable. NEVER uses pkill by name.
+#
+# See docs/bridge_networking.md "Reference pattern for VICE agents" for the
+# canonical lifecycle and feedback_no_pkill.md for rationale.
+#
 # cleanup-bridge-networking.sh — Idempotent emergency teardown for the
 # VICE ethernet bridge test environment.
 #
-# Kills any leftover VICE processes, tears down the br-c64 bridge and
-# its tap-c64-0/tap-c64-1 interfaces, removes the iptables FORWARD rules
-# added by setup-bridge-tap.sh, and cleans up stale /tmp/vice_eth_*.rc
-# files.
+# Kills leftover VICE processes (scoped to harness ports), tears down the
+# br-c64 bridge and its tap-c64-0/tap-c64-1 interfaces, removes the iptables
+# FORWARD rules added by setup-bridge-tap.sh, and cleans up stale
+# /tmp/vice_eth_*.rc files.
 #
 # Unlike the normal test lifecycle (ViceProcess context manager), this
-# script uses pkill as a last-resort cleanup when a test has crashed
-# mid-run and left VICE/TAP state behind.  Safe to run at any time.
+# script is a last-resort cleanup when a test has crashed mid-run and left
+# VICE/TAP state behind.  Safe to run at any time.
 #
 # Usage:
 #   sudo ./scripts/cleanup-bridge-networking.sh
 
 set -u  # don't set -e: we want to keep going through all cleanup steps
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 BRIDGE="br-c64"
 TAP0="tap-c64-0"
 TAP1="tap-c64-1"
+HARNESS_PORT_RANGES="6511:6531,6560:6580"
 
 echo "=== c64-test-harness bridge networking cleanup ==="
 echo
 
-# --- 1. Kill any leftover x64sc processes ---------------------------------
-echo "[1/5] Killing any leftover x64sc processes..."
-if pgrep -x x64sc > /dev/null 2>&1; then
-    pgrep -a x64sc | while read -r pid cmd; do
-        echo "  killing PID $pid: $cmd"
-    done
-    pkill -TERM x64sc 2>/dev/null || true
-    sleep 1
-    if pgrep -x x64sc > /dev/null 2>&1; then
-        pkill -KILL x64sc 2>/dev/null || true
-        sleep 1
-    fi
-    if pgrep -x x64sc > /dev/null 2>&1; then
-        echo "  WARNING: x64sc still running after SIGKILL"
-    else
-        echo "  all x64sc processes killed"
-    fi
+# --- 1. Kill harness-bound x64sc processes (scoped) ----------------------
+echo "[1/5] killing any lingering harness-bound x64sc processes (scoped)..."
+if command -v python3 >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/cleanup_vice_ports.py" ]; then
+    python3 "$SCRIPT_DIR/cleanup_vice_ports.py" --range "$HARNESS_PORT_RANGES" || true
 else
-    echo "  no x64sc processes running"
+    # Bash fallback: find listeners in the harness ports, verify comm, kill by PID.
+    echo "  (python3 / helper unavailable, using bash fallback)"
+    scope_ports() {
+        for p in $(seq 6511 6531) $(seq 6560 6580); do
+            echo "$p"
+        done
+    }
+    resolve_pid() {
+        local port="$1"
+        ss -Htlnp "sport = :$port" 2>/dev/null \
+            | awk '{print $NF}' \
+            | grep -oP 'pid=\K[0-9]+' \
+            | head -n1
+    }
+    for port in $(scope_ports); do
+        pid="$(resolve_pid "$port" || true)"
+        if [ -n "${pid:-}" ] && [ -r "/proc/$pid/comm" ]; then
+            comm="$(cat "/proc/$pid/comm")"
+            if [ "$comm" = "x64sc" ]; then
+                echo "[cleanup] port $port pid $pid ($comm) -> SIGTERM"
+                kill -TERM "$pid" 2>/dev/null || true
+            fi
+        fi
+    done
+    sleep 2
+    for port in $(scope_ports); do
+        pid="$(resolve_pid "$port" || true)"
+        if [ -n "${pid:-}" ] && [ -r "/proc/$pid/comm" ]; then
+            comm="$(cat "/proc/$pid/comm")"
+            if [ "$comm" = "x64sc" ]; then
+                echo "[cleanup] port $port pid $pid ($comm) -> SIGKILL (still alive)"
+                kill -KILL "$pid" 2>/dev/null || true
+            fi
+        fi
+    done
 fi
 echo
 

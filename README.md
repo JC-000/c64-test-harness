@@ -545,7 +545,7 @@ mac = parse_mac("02:c6:40:00:00:42")     # explicit MAC
 set_cs8900a_mac(transport, mac)           # program CS8900a IA registers
 ```
 
-**Bridge setup** for multi-VICE networking: `sudo scripts/setup-bridge-tap.sh` (creates `br-c64` + `tap-c64-0` + `tap-c64-1`). Teardown: `sudo scripts/teardown-bridge-tap.sh`. Single TAP: `sudo scripts/setup-tap-networking.sh`.
+**Bridge setup** for multi-VICE networking: `sudo scripts/setup-bridge-tap.sh` (creates `br-c64` + `tap-c64-0` + `tap-c64-1`). Teardown: `sudo scripts/teardown-bridge-tap.sh`. Single TAP: `sudo scripts/setup-tap-networking.sh`. Emergency recovery: `sudo scripts/cleanup-bridge-networking.sh` (port-range-scoped VICE kill via `scripts/cleanup_vice_ports.py` — never pkill). See the **Reference pattern for VICE agents** section in [docs/bridge_networking.md](docs/bridge_networking.md) for the canonical lifecycle.
 
 **IP-layer ICMP exchange between two VICE instances** is supported via the `bridge_ping` module and the `bridge_vice_pair` pytest fixture (in `tests/conftest.py`). The fixture launches two VICE instances on the bridge, initialises the CS8900a, and programs unique MACs. Tests can build IP/ICMP frames in Python with `build_echo_request_frame()` and verify reception via 6502 RX routines. The harness uses RR-Net register offsets that match ip65's `cs8900a.s` driver (PPPtr=`$DE02`, PPData=`$DE04`, RTDATA=`$DE08`, TxCMD=`$DE0C`, TxLen=`$DE0E`) and automatically emits the RR clockport enable (`$DE01 |= $01`) before every CS8900a access. See `tests/test_bridge_ping.py` for both a one-way IP exchange and a full round-trip where the peer's 6502 responder swaps IPs/MACs and TXes an echo reply in the same JSR, plus [docs/bridge_networking.md](docs/bridge_networking.md) for the register layout and setup steps.
 
@@ -774,6 +774,8 @@ Additional scripts in `scripts/`:
 | `scripts/play_chromatic_u64.py` | Chromatic scale capture through 4 SID configs on U64 |
 | `scripts/setup-bridge-tap.sh` | Create bridge + 2 TAP interfaces for multi-VICE ethernet |
 | `scripts/teardown-bridge-tap.sh` | Tear down bridge + TAP interfaces |
+| `scripts/cleanup-bridge-networking.sh` | Emergency bridge recovery (scoped VICE kill + iptables/TAP teardown) |
+| `scripts/cleanup_vice_ports.py` | Port-range-scoped VICE killer (resolves PIDs via `/proc/net/tcp`, verifies `comm`, SIGTERM then SIGKILL — never `pkill`) |
 | `scripts/setup-tap-networking.sh` | Create single TAP interface with NAT for VICE ethernet |
 | `scripts/teardown-tap-networking.sh` | Tear down single TAP interface |
 | `scripts/validate_ping.py` | End-to-end ARP + ICMP ping through VICE CS8900a + TAP |
