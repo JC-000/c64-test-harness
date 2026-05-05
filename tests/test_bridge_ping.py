@@ -43,6 +43,8 @@ from c64_test_harness.bridge_ping import (
     build_icmp_responder_code,
     build_ping_and_wait_code,
     build_tx_code,
+    run_icmp_responder,
+    run_ping_and_wait,
 )
 from c64_test_harness.execute import jsr, load_code
 from c64_test_harness.memory import read_bytes, write_bytes
@@ -72,6 +74,13 @@ SCRATCH = 0xC1E0
 RESULT = 0xC1F0
 TX_FRAME_BUF = 0xC500
 RX_FRAME_BUF = 0xC700
+
+# Layout for the host-side wall-clock pattern:
+# - peek routine at $C000 (~64 bytes)
+# - consume routine at $C200 (~360 bytes max, ends well before SCRATCH/RESULT
+#   at $C1E0/$C1F0 -- actually starts AFTER RESULT to avoid clobbering it)
+PEEK_ADDR = 0xC000
+CONSUME_ADDR = 0xC200
 
 MAC_A = bytes.fromhex("02C640000001")
 MAC_B = bytes.fromhex("02C640000002")
@@ -344,7 +353,14 @@ class TestBridgeIcmp:
 
 
 class TestBridgeIcmpRoundTrip:
-    """Full round-trip: A pings B, B replies in the same JSR, A verifies."""
+    """Full round-trip: A pings B, B replies in the same JSR, A verifies.
+
+    Uses the host-side wall-clock pattern (:func:`run_ping_and_wait` /
+    :func:`run_icmp_responder`) so the timeout budget is owned by Python
+    rather than a 6502-cycle counter.  This makes the test robust under
+    VICE warp mode and is the same orchestration shape that will drive
+    future Ultimate 64 Elite UCI networking tests.
+    """
 
     def test_icmp_round_trip(
         self,
@@ -352,10 +368,9 @@ class TestBridgeIcmpRoundTrip:
     ) -> None:
         """A TXes echo request, B's responder swaps + TXes echo reply, A reads it.
 
-        This exercises ``build_icmp_responder_code`` which issues a TX
-        immediately after consuming an RX frame in the same JSR.  The
-        prior TFE-era work claimed VICE 3.10 silently dropped the TX in
-        this pattern; we retry with RR-Net + clockport enable to verify.
+        Both A and B run their orchestrators concurrently in worker
+        threads.  Each orchestrator drives a bounded peek routine via
+        the binary monitor with Python owning the wall-clock deadline.
         """
         transport_a, transport_b = bridge_vice_pair
 
@@ -368,47 +383,46 @@ class TestBridgeIcmpRoundTrip:
             sequence=PING_SEQ,
             payload=PING_PAYLOAD,
         )
-        frame_len = len(echo.frame)
 
-        # B's responder: waits for an echo request, builds and TXes reply
-        responder_code = build_icmp_responder_code(
-            load_addr=CODE,
-            rx_buf=RX_FRAME_BUF,
-            my_ip=IP_B,
-            result_addr=RESULT,
-        )
-        load_code(transport_b, CODE, responder_code)
-        write_bytes(transport_b, RESULT, [0x00])
-        write_bytes(transport_b, RX_FRAME_BUF, [0x00] * 256)
-
-        # A's ping-and-wait: TX then poll for matching reply in the same JSR
-        ping_code = build_ping_and_wait_code(
-            load_addr=CODE,
-            tx_frame_buf=TX_FRAME_BUF,
-            tx_frame_len=frame_len,
-            rx_buf=RX_FRAME_BUF,
-            result_addr=RESULT,
-            identifier=PING_ID,
-            sequence=PING_SEQ,
-        )
-        load_code(transport_a, CODE, ping_code)
-        write_bytes(transport_a, TX_FRAME_BUF, echo.frame)
-        write_bytes(transport_a, RESULT, [0x00])
         write_bytes(transport_a, RX_FRAME_BUF, [0x00] * 256)
+        write_bytes(transport_b, RX_FRAME_BUF, [0x00] * 256)
 
         rx_error: list[Exception] = []
         tx_error: list[Exception] = []
+        a_status: list[int] = []
+        b_status: list[int] = []
 
         def responder_worker() -> None:
             try:
-                jsr(transport_b, CODE, timeout=30.0)
+                r = run_icmp_responder(
+                    transport_b,
+                    rx_buf=RX_FRAME_BUF,
+                    my_ip=IP_B,
+                    result_addr=RESULT,
+                    timeout_s=15.0,
+                    peek_addr=PEEK_ADDR,
+                    consume_addr=CONSUME_ADDR,
+                )
+                b_status.append(r)
             except Exception as e:
                 rx_error.append(e)
 
         def ping_worker() -> None:
             try:
                 time.sleep(1.0)  # let B start polling first
-                jsr(transport_a, CODE, timeout=20.0)
+                r = run_ping_and_wait(
+                    transport_a,
+                    tx_frame=echo.frame,
+                    rx_buf=RX_FRAME_BUF,
+                    result_addr=RESULT,
+                    identifier=PING_ID,
+                    sequence=PING_SEQ,
+                    tx_frame_buf=TX_FRAME_BUF,
+                    timeout_s=15.0,
+                    peek_addr=PEEK_ADDR,
+                    consume_addr=CONSUME_ADDR,
+                )
+                a_status.append(r)
             except Exception as e:
                 tx_error.append(e)
 
@@ -419,8 +433,8 @@ class TestBridgeIcmpRoundTrip:
         tr.join(timeout=45.0)
         tt.join(timeout=45.0)
 
-        b_result = read_bytes(transport_b, RESULT, 1)[0]
-        a_result = read_bytes(transport_a, RESULT, 1)[0]
+        b_result = b_status[0] if b_status else 0
+        a_result = a_status[0] if a_status else 0
 
         # Dump B's RX buffer for diagnostics even on failure
         b_rx = bytes(read_bytes(transport_b, RX_FRAME_BUF, _RX_BYTES))
