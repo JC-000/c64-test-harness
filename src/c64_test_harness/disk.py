@@ -33,6 +33,9 @@ class FileType(Enum):
 
     PRG = "prg"
     SEQ = "seq"
+    USR = "usr"
+    REL = "rel"
+    DEL = "del"
 
 
 @dataclass
@@ -97,6 +100,8 @@ class DiskImage:
             Disk format.  Detected from extension if *None*.
         """
         p = Path(path)
+        cls._validate_c64_name(name, label="disk name")
+        p.parent.mkdir(parents=True, exist_ok=True)
         resolved_fmt = fmt or cls.detect_format(p)
         c1541 = cls.find_c1541()
 
@@ -157,10 +162,15 @@ class DiskImage:
         c64_name
             Name to give the file on the CBM disk (max 16 chars).
         file_type
-            PRG (default) or SEQ.
+            PRG (default), SEQ, or USR.
         """
-        suffix = ",s" if file_type is FileType.SEQ else ""
-        self._run_c1541(f"-write", str(Path(host_path)), f"{c64_name}{suffix}")
+        self._validate_c64_name(c64_name)
+        p = Path(host_path)
+        if not p.exists():
+            raise FileNotFoundError(f"Host file not found: {p}")
+        suffix_map = {FileType.SEQ: ",s", FileType.USR: ",u"}
+        suffix = suffix_map.get(file_type, "")
+        self._run_c1541(f"-write", str(p), f"{c64_name}{suffix}")
 
     def read_file(self, c64_name: str, host_path: str | os.PathLike[str]) -> None:
         """Read a file from the disk image to a host path.
@@ -211,6 +221,7 @@ class DiskImage:
         CBM DOS ``@0:`` overwrite is historically unreliable, so this
         method deletes the old file first, then writes the new one.
         """
+        self._validate_c64_name(c64_name)
         if self.file_exists(c64_name):
             self.delete_file(c64_name)
         self.write_file(host_path, c64_name, file_type)
@@ -246,6 +257,14 @@ class DiskImage:
     # ------------------------------------------------------------------
     # Static helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_c64_name(name: str, label: str = "filename", max_len: int = 16) -> None:
+        """Raise :class:`ValueError` if *name* exceeds CBM length limit."""
+        if len(name) > max_len:
+            raise ValueError(
+                f"CBM {label} too long ({len(name)} chars, max {max_len}): {name!r}"
+            )
 
     @staticmethod
     def detect_format(path: str | os.PathLike[str]) -> DiskFormat:

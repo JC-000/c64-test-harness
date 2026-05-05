@@ -157,7 +157,7 @@ class TestWriteAndRead:
 
     def test_write_nonexistent_host_raises(self, tmp_path: Path) -> None:
         img = DiskImage.create(tmp_path / "test.d64")
-        with pytest.raises((DiskImageError, FileNotFoundError)):
+        with pytest.raises(FileNotFoundError):
             img.write_file(tmp_path / "nope.prg", "GONE")
 
 
@@ -204,6 +204,15 @@ class TestListFiles:
         entries = img.list_files()
         names = {e.name for e in entries}
         assert names == {"FILE1", "FILE2", "FILE3"}
+
+    def test_list_usr_file(self, tmp_path: Path) -> None:
+        img = DiskImage.create(tmp_path / "test.d64")
+        host = _write_host_file(tmp_path / "data.usr", b"\x01\x08usrdata")
+        img.write_file(host, "USRFILE", file_type=FileType.USR)
+        entries = img.list_files()
+        usr_entries = [e for e in entries if e.file_type is FileType.USR]
+        assert len(usr_entries) == 1
+        assert usr_entries[0].name == "USRFILE"
 
     def test_dir_entry_fields(self, tmp_path: Path) -> None:
         img = DiskImage.create(tmp_path / "test.d64")
@@ -317,3 +326,47 @@ class TestRoundTrip:
 
         for name, expected in files.items():
             assert img.read_file_bytes(name) == expected
+
+
+# ======================================================================
+# TestFilenameValidation
+# ======================================================================
+
+class TestFilenameValidation:
+    """CBM filename length validation."""
+
+    def test_write_file_name_too_long(self, tmp_path: Path) -> None:
+        img = DiskImage.create(tmp_path / "test.d64")
+        host = _write_host_file(tmp_path / "f.prg", b"\x01\x08x")
+        with pytest.raises(ValueError, match="CBM filename too long"):
+            img.write_file(host, "A" * 17)
+
+    def test_write_file_name_at_limit(self, tmp_path: Path) -> None:
+        img = DiskImage.create(tmp_path / "test.d64")
+        host = _write_host_file(tmp_path / "f.prg", b"\x01\x08x")
+        img.write_file(host, "A" * 16)
+        assert img.file_exists("A" * 16)
+
+    def test_overwrite_file_name_too_long(self, tmp_path: Path) -> None:
+        img = DiskImage.create(tmp_path / "test.d64")
+        host = _write_host_file(tmp_path / "f.prg", b"\x01\x08x")
+        with pytest.raises(ValueError, match="CBM filename too long"):
+            img.overwrite_file(host, "B" * 17)
+
+    def test_create_disk_name_too_long(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="CBM disk name too long"):
+            DiskImage.create(tmp_path / "test.d64", name="X" * 17)
+
+
+# ======================================================================
+# TestCreateNestedDirectory
+# ======================================================================
+
+class TestCreateNestedDirectory:
+    """Parent directory auto-creation in DiskImage.create()."""
+
+    def test_create_nested_directory(self, tmp_path: Path) -> None:
+        nested = tmp_path / "a" / "b" / "test.d64"
+        img = DiskImage.create(nested)
+        assert img.path.exists()
+        assert img.format is DiskFormat.D64
