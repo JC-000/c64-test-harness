@@ -20,12 +20,21 @@ from c64_test_harness.backends.ultimate64_manager import (
 
 @pytest.fixture
 def mock_transport():
-    """Patch Ultimate64Transport in the manager module."""
+    """Patch Ultimate64Transport and probe_u64 in the manager module."""
     with patch(
         "c64_test_harness.backends.ultimate64_manager.Ultimate64Transport"
-    ) as m:
+    ) as m, patch(
+        "c64_test_harness.backends.ultimate64_manager.probe_u64"
+    ) as mock_probe:
         m.side_effect = lambda **kwargs: MagicMock(name="Ultimate64Transport",
                                                     _kwargs=kwargs)
+        # Default: all probes succeed.
+        from c64_test_harness.backends.ultimate64_probe import ProbeResult
+        mock_probe.side_effect = lambda host, **kw: ProbeResult(
+            host=host, port=kw.get("port", 80), reachable=True,
+            ping_ok=True, port_ok=True, api_ok=None,
+            latency_ms=1.0, error=None,
+        )
         yield m
 
 

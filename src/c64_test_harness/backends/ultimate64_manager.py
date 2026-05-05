@@ -31,12 +31,16 @@ modifications to ``parallel.py``.
 
 from __future__ import annotations
 
+import logging
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Iterator
 
 from .ultimate64 import Ultimate64Transport
+from .ultimate64_probe import probe_u64
+
+_log = logging.getLogger(__name__)
 
 
 class Ultimate64ManagerError(Exception):
@@ -178,6 +182,12 @@ class Ultimate64InstanceManager:
     def acquire(self) -> Ultimate64Instance:
         """Acquire the next available device.
 
+        Before creating a transport, the device is probed (ping + TCP)
+        to confirm reachability.  If a device fails its probe, it is
+        returned to the *end* of the available list and the next device
+        is tried.  If ALL available devices fail probing, raises
+        :class:`Ultimate64PoolExhaustedError` with the probe errors.
+
         Blocks up to ``acquire_timeout`` seconds waiting for a device
         to become free.  Raises :class:`Ultimate64PoolExhaustedError`
         on timeout, or :class:`Ultimate64ManagerError` if the manager
@@ -203,21 +213,42 @@ class Ultimate64InstanceManager:
                         f"No Ultimate64 device became available within "
                         f"{self._acquire_timeout}s (pool size={len(self._devices)})"
                     )
-            device = self._available.pop(0)
-            # Create the transport outside the condition to avoid
-            # holding the lock across network I/O — but
-            # Ultimate64Transport.__init__ does not make any network
-            # calls, so it is safe to construct here.  We do so inside
-            # the lock to keep in_flight bookkeeping consistent.
-            transport = Ultimate64Transport(
-                host=device.host,
-                password=device.password,
-                port=device.port,
-                timeout=device.timeout,
+
+            # Try each available device with a liveness probe.
+            probe_errors: list[str] = []
+            tried = 0
+            total = len(self._available)
+            while tried < total:
+                device = self._available.pop(0)
+                result = probe_u64(
+                    device.host,
+                    port=device.port,
+                    password=device.password,
+                    skip_api=True,
+                )
+                if result.reachable:
+                    transport = Ultimate64Transport(
+                        host=device.host,
+                        password=device.password,
+                        port=device.port,
+                        timeout=device.timeout,
+                    )
+                    instance = Ultimate64Instance(device=device, transport=transport)
+                    self._in_flight.append(instance)
+                    return instance
+                # Probe failed — log, record, and push device to the end.
+                _log.warning(
+                    "Probe failed for %s: %s", device.label, result.error
+                )
+                probe_errors.append(f"{device.label}: {result.error}")
+                self._available.append(device)
+                tried += 1
+
+            # All devices failed probing.
+            raise Ultimate64PoolExhaustedError(
+                f"All {total} device(s) failed liveness probe: "
+                + "; ".join(probe_errors)
             )
-            instance = Ultimate64Instance(device=device, transport=transport)
-            self._in_flight.append(instance)
-            return instance
 
     def release(self, instance: Ultimate64Instance) -> None:
         """Return *instance*'s device to the pool.
