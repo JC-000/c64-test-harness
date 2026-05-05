@@ -20,6 +20,7 @@ import struct
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import Callable
 
 __all__ = [
     "DebugCapture",
@@ -168,6 +169,8 @@ class DebugCapture:
         bind_addr: str = "",
         multicast_group: str | None = None,
         recv_buf_size: int = 262144,
+        max_bytes: int | None = None,
+        filter: Callable[[int], bool] | None = None,
     ) -> None:
         """
         Args:
@@ -175,11 +178,20 @@ class DebugCapture:
             bind_addr: Address to bind to (empty = all interfaces).
             multicast_group: If set, join this multicast group.
             recv_buf_size: SO_RCVBUF size hint (larger for ~32 Mbps stream).
+            max_bytes: If set, cap retained raw entry bytes to the last
+                ``max_bytes`` (rolling window). Older chunks are evicted
+                FIFO in the recv thread. Default None = unbounded.
+            filter: If set, called with each 32-bit raw word in the recv
+                thread; return True to keep the entry, False to drop.
+                Lets the caller restrict capture to e.g. CPU cycles in a
+                given PC range. Default None = keep everything.
         """
         self._port = port
         self._bind_addr = bind_addr
         self._multicast_group = multicast_group
         self._recv_buf_size = recv_buf_size
+        self._max_bytes = max_bytes
+        self._filter = filter
 
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
@@ -188,6 +200,7 @@ class DebugCapture:
 
         # Accumulated raw entry data (no headers)
         self._raw_chunks: list[bytes] = []
+        self._raw_bytes_total = 0
         self._packets_received = 0
         self._packets_dropped = 0
         self._last_seq: int | None = None
@@ -201,6 +214,7 @@ class DebugCapture:
 
         self._stop_event.clear()
         self._raw_chunks = []
+        self._raw_bytes_total = 0
         self._packets_received = 0
         self._packets_dropped = 0
         self._last_seq = None
@@ -255,8 +269,19 @@ class DebugCapture:
             seq = struct.unpack_from("<H", data, 0)[0]
             entry_payload = data[HEADER_SIZE:]
 
+            # Optional per-entry filtering: done outside the lock since it
+            # only reads local bytes. Keeps the protected section short.
+            if self._filter is not None:
+                n = len(entry_payload) // ENTRY_SIZE
+                kept = bytearray()
+                for i in range(n):
+                    word = struct.unpack_from("<I", entry_payload, i * ENTRY_SIZE)[0]
+                    if self._filter(word):
+                        kept += entry_payload[i * ENTRY_SIZE : (i + 1) * ENTRY_SIZE]
+                entry_payload = bytes(kept)
+
             with self._lock:
-                # Gap detection
+                # Gap detection (always on raw packet sequence)
                 if self._last_seq is not None:
                     expected = (self._last_seq + 1) & 0xFFFF
                     if seq != expected:
@@ -269,8 +294,23 @@ class DebugCapture:
                             )
 
                 self._last_seq = seq
-                self._raw_chunks.append(entry_payload)
                 self._packets_received += 1
+
+                if entry_payload:
+                    self._raw_chunks.append(entry_payload)
+                    self._raw_bytes_total += len(entry_payload)
+
+                    # Rolling-window trim: evict oldest chunks FIFO until
+                    # the retained total fits in max_bytes. The tail chunk
+                    # is never partially sliced — we tolerate overshoot of
+                    # at most one chunk (a single UDP payload, ~1.4KB).
+                    if self._max_bytes is not None:
+                        while (
+                            self._raw_bytes_total > self._max_bytes
+                            and len(self._raw_chunks) > 1
+                        ):
+                            evicted = self._raw_chunks.pop(0)
+                            self._raw_bytes_total -= len(evicted)
 
     def stop(self) -> DebugCaptureResult:
         """Stop capturing and parse the accumulated bus trace.
