@@ -346,10 +346,60 @@ check_system() {
             add_hint "Load the tun kernel module: sudo modprobe tun"
         fi
     fi
-    if sudo -n true 2>/dev/null; then
-        record "$sec" "passwordless sudo" ok "available (informational)" 0
+    if [ "$(uname)" = "Darwin" ]; then
+        # Bridge lifecycle on macOS requires sudo for ifconfig create/addm/up,
+        # and the harness drives these scripts non-interactively from tests and
+        # CI. We check for a NOPASSWD sudoers entry per script rather than a
+        # bare `sudo -n true`: the latter just reports a cached credential
+        # window, which does not persist long enough for a test session.
+        local repo_root
+        repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+        local missing_nopasswd=0
+        local script
+        for script in setup-bridge-feth-macos.sh \
+                      teardown-bridge-feth-macos.sh \
+                      cleanup-bridge-feth-macos.sh; do
+            local path="$repo_root/scripts/$script"
+            if [ ! -x "$path" ]; then
+                # Missing script file is a separate concern (Bridge section
+                # reports it); skip here so we don't double-fail.
+                continue
+            fi
+            # `sudo -n -l <cmd>` exits 0 if the user can run <cmd> without a
+            # password, non-zero otherwise. On macOS with no NOPASSWD entry
+            # this exits 1 silently; with a stale cached credential it might
+            # transiently succeed -- the user will notice on the next session.
+            if sudo -n -l "$path" >/dev/null 2>&1; then
+                record "$sec" "NOPASSWD sudo for $script" ok "passwordless sudo configured" 0
+            else
+                record "$sec" "NOPASSWD sudo for $script" warn "no NOPASSWD entry (bridge setup will prompt for a password)" 0
+                missing_nopasswd=1
+            fi
+        done
+        # macOS 26 also needs root to attach VICE's pcap driver to a feth
+        # interface (the kernel's per-process BPF attach check is root-only,
+        # independent of /dev/bpf* permissions). `ViceProcess.start()` wraps
+        # the x64sc argv with `sudo -n` when ethernet is enabled, so the
+        # ethernet tests need a NOPASSWD entry for /opt/homebrew/bin/x64sc
+        # in the same sudoers drop-in.
+        local x64sc_path="/opt/homebrew/bin/x64sc"
+        if [ -x "$x64sc_path" ]; then
+            if sudo -n -l "$x64sc_path" >/dev/null 2>&1; then
+                record "$sec" "NOPASSWD sudo for x64sc" ok "passwordless sudo configured" 0
+            else
+                record "$sec" "NOPASSWD sudo for x64sc" warn "no NOPASSWD entry for $x64sc_path (ethernet tests will prompt for a password or fail)" 0
+                missing_nopasswd=1
+            fi
+        fi
+        if [ "$missing_nopasswd" = "1" ]; then
+            add_hint "Add a sudoers drop-in so the bridge lifecycle scripts AND /opt/homebrew/bin/x64sc run non-interactively. See docs/development.md -> macOS -> Passwordless sudo for bridge lifecycle. Example: sudo visudo -f /etc/sudoers.d/c64-test-harness"
+        fi
     else
-        record "$sec" "passwordless sudo" unknown "not available (not a failure; needed for bridge setup)" 0
+        if sudo -n true 2>/dev/null; then
+            record "$sec" "passwordless sudo" ok "available (informational)" 0
+        else
+            record "$sec" "passwordless sudo" unknown "not available (not a failure; needed for bridge setup)" 0
+        fi
     fi
 }
 
