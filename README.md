@@ -604,6 +604,31 @@ set_stream_destination(client, "debug", "10.0.0.5:11002")
 set_debug_stream_mode(client, DEBUG_MODE_6510_VIC)
 ```
 
+## UCI Networking (Ultimate Command Interface)
+
+The `uci_network` module provides TCP/UDP socket networking from C64 programs running on Ultimate 64 hardware via the UCI registers at `$DF1C`–`$DF1F`. The firmware's lwIP stack handles TCP/IP internally — C64 code just opens sockets, reads, and writes.
+
+**Prerequisite:** Enable the Command Interface in U64 settings: *C64 and Cartridge Settings → Command Interface → Enabled*.
+
+```python
+from c64_test_harness import uci_probe, uci_get_ip, uci_tcp_connect
+from c64_test_harness import uci_socket_write, uci_socket_read, uci_socket_close
+
+# Check UCI is available (returns 0xC9)
+ident = uci_probe(transport)
+
+# Query assigned IP address
+ip = uci_get_ip(transport)   # e.g. "192.168.1.81"
+
+# TCP socket roundtrip
+sock_id = uci_tcp_connect(transport, "example.com", 80)
+uci_socket_write(transport, sock_id, b"GET / HTTP/1.0\r\n\r\n")
+data = uci_socket_read(transport, sock_id)
+uci_socket_close(transport, sock_id)
+```
+
+The module also supports UDP sockets (`uci_udp_connect`), TCP listeners (`uci_tcp_listen_start`/`uci_tcp_listen_state`/`uci_tcp_listen_socket`/`uci_tcp_listen_stop`), and low-level assembly builders (`build_uci_probe`, `build_tcp_connect`, etc.) for custom 6502 routines. DNS resolution is handled by the firmware — hostnames work directly.
+
 ## Architecture
 
 ```
