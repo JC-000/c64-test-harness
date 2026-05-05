@@ -43,11 +43,15 @@ See [docs/development.md](docs/development.md) for the full stage breakdown, opt
 
 ## Installation
 
+On Ubuntu 23+ (including Ubuntu 25), PEP 668 / `externally-managed-environment` blocks `pip install` against system Python, so install into a venv:
+
 ```bash
-pip install -e .
+python3 -m venv --system-site-packages ~/.local/share/c64-test-harness/venv
+~/.local/share/c64-test-harness/venv/bin/pip install -e .
+source ~/.local/share/c64-test-harness/venv/bin/activate
 ```
 
-Requires Python 3.10+. Zero runtime dependencies. (If you used `scripts/setup-dev-env.sh`, this step is already done for you.)
+Requires Python 3.10+. Zero runtime dependencies. (If you used `scripts/setup-dev-env.sh`, the venv is already created for you at the same path; just `source` its `activate`.)
 
 ## Verifying your dev environment
 
@@ -844,7 +848,10 @@ Additional scripts in `scripts/`:
 ## Running Tests
 
 ```bash
-pip install -e ".[dev]"
+# Install into a venv (PEP 668 compliant — see Installation above)
+python3 -m venv --system-site-packages ~/.local/share/c64-test-harness/venv
+~/.local/share/c64-test-harness/venv/bin/pip install -e ".[dev]"
+source ~/.local/share/c64-test-harness/venv/bin/activate
 
 # Run the full test suite (parallel by default)
 python3 scripts/run_all_tests.py
