@@ -119,6 +119,7 @@ def jsr(
     timeout: float = 5.0,
     *,
     scratch_addr: int = 0x0334,
+    poll_interval: float = 0.2,
 ) -> dict[str, int]:
     """Call a subroutine at *addr* and wait for it to return.
 
@@ -133,6 +134,10 @@ def jsr(
     executes ``RTS``, execution resumes at the ``NOP`` and the breakpoint
     fires.
 
+    *poll_interval* controls how often registers are polled while waiting
+    for the subroutine to return.  Increase for long-running computations
+    to reduce overhead from monitor connections pausing the CPU.
+
     Returns the register state after the subroutine returns.  The CPU is
     paused when this function returns.
     """
@@ -146,7 +151,8 @@ def jsr(
     bp_id = set_breakpoint(transport, bp_addr)
     try:
         goto(transport, scratch_addr)
-        return wait_for_pc(transport, bp_addr, timeout=timeout)
+        return wait_for_pc(transport, bp_addr, timeout=timeout,
+                           poll_interval=poll_interval)
     finally:
         # Retry delete in case the monitor port isn't ready yet
         for attempt in range(5):
