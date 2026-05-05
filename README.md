@@ -18,7 +18,7 @@ Reusable test harness for Commodore 64 programs. Automates C64 programs via the 
 - **Parallel test execution** — distribute tests across a pool of VICE instances via `run_parallel()`
 - **VICE label file parser** — load cc65/ACME/Kick Assembler label files
 - **Debug utilities** — `dump_screen()` and `hex_dump()` for quick inspection during test runs
-- **Ethernet / CS8900a** — TFE-mode ethernet cartridge emulation with TAP interfaces, bridge networking for multi-VICE communication, auto-generated unique MAC addresses per instance
+- **Ethernet / CS8900a** — RR-Net-mode ethernet cartridge emulation with TAP interfaces, bridge networking for multi-VICE communication, auto-generated unique MAC addresses per instance
 - **SID playback** — cross-backend `play_sid()` dispatches to VICE (IRQ stub) or Ultimate 64 (native firmware endpoint); PSID/RSID parser
 - **Audio capture** — headless WAV recording via VICE (`render_wav()`) and U64 UDP audio stream (`capture_sid_u64()`, `AudioCapture`)
 - **U64 data streams** — cycle-accurate 6510/VIC bus trace (`DebugCapture`), VIC-II video frame capture (`VideoCapture`), audio capture — all over UDP with gap detection
@@ -522,7 +522,7 @@ config = ViceConfig(
     prg_path="build/network_app.prg",
     warp=False,                 # warp causes timing issues with ethernet
     ethernet=True,
-    ethernet_mode="tfe",        # TFE mode — standard CS8900a register layout
+    ethernet_mode="rrnet",      # RR-Net mode — matches ip65 cs8900a.s layout
     ethernet_interface="tap-c64",
     ethernet_driver="tuntap",
 )
@@ -547,7 +547,7 @@ set_cs8900a_mac(transport, mac)           # program CS8900a IA registers
 
 **Bridge setup** for multi-VICE networking: `sudo scripts/setup-bridge-tap.sh` (creates `br-c64` + `tap-c64-0` + `tap-c64-1`). Teardown: `sudo scripts/teardown-bridge-tap.sh`. Single TAP: `sudo scripts/setup-tap-networking.sh`.
 
-**IP-layer ICMP exchange between two VICE instances** is supported via the `bridge_ping` module and the `bridge_vice_pair` pytest fixture (in `tests/conftest.py`). The fixture launches two VICE instances on the bridge, initialises the CS8900a, and programs unique MACs. Tests can build IP/ICMP frames in Python with `build_echo_request_frame()` and verify reception via 6502 RX routines. See `tests/test_bridge_ping.py` for an end-to-end example and [docs/bridge_networking.md](docs/bridge_networking.md) for the full pattern, including the documented VICE 3.10 TFE quirks (RR-Net mode is broken; ip65's cs8900a driver cannot be linked because it expects the original RR-Net register shift).
+**IP-layer ICMP exchange between two VICE instances** is supported via the `bridge_ping` module and the `bridge_vice_pair` pytest fixture (in `tests/conftest.py`). The fixture launches two VICE instances on the bridge, initialises the CS8900a, and programs unique MACs. Tests can build IP/ICMP frames in Python with `build_echo_request_frame()` and verify reception via 6502 RX routines. The harness uses RR-Net register offsets that match ip65's `cs8900a.s` driver (PPPtr=`$DE02`, PPData=`$DE04`, RTDATA=`$DE08`, TxCMD=`$DE0C`, TxLen=`$DE0E`) and automatically emits the RR clockport enable (`$DE01 |= $01`) before every CS8900a access. See `tests/test_bridge_ping.py` for both a one-way IP exchange and a full round-trip where the peer's 6502 responder swaps IPs/MACs and TXes an echo reply in the same JSR, plus [docs/bridge_networking.md](docs/bridge_networking.md) for the register layout and setup steps.
 
 ## Audio Capture
 
@@ -757,6 +757,7 @@ Additional scripts in `scripts/`:
 | `scripts/setup-tap-networking.sh` | Create single TAP interface with NAT for VICE ethernet |
 | `scripts/teardown-tap-networking.sh` | Tear down single TAP interface |
 | `scripts/validate_ping.py` | End-to-end ARP + ICMP ping through VICE CS8900a + TAP |
+| `scripts/bridge_ping_demo.py` | Visible two-VICE bridge ping demo (RR-Net, live on-screen counters) |
 
 ## Running Tests
 
