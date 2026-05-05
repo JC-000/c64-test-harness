@@ -18,6 +18,54 @@ from .backends.vice_binary import BinaryViceTransport
 from .backends.vice_lifecycle import ViceProcess, ViceConfig
 from .backends.hardware import HardwareTransportBase
 from .backends.vice_manager import PortAllocator, ViceInstance, ViceInstanceManager
+from .backends.ultimate64 import Ultimate64Transport
+from .backends.ultimate64_client import (
+    Ultimate64Client,
+    Ultimate64Error,
+    Ultimate64AuthError,
+    Ultimate64TimeoutError,
+    Ultimate64ProtocolError,
+)
+from .backends.ultimate64_helpers import (
+    get_turbo_mhz,
+    set_turbo_mhz,
+    get_turbo_enabled,
+    get_reu_config,
+    set_reu,
+    get_sid_config,
+    set_sid_socket,
+    mount_disk_file,
+    unmount,
+    run_prg_file,
+    load_prg_file,
+    U64StateSnapshot,
+    snapshot_state,
+    restore_state,
+)
+from .backends.ultimate64_manager import (
+    Ultimate64Device,
+    Ultimate64Instance,
+    Ultimate64InstanceManager,
+    Ultimate64ManagerError,
+    Ultimate64PoolExhaustedError,
+)
+from .backends.ultimate64_schema import (
+    CPU_SPEED_VALUES,
+    CPU_SPEED_BY_MHZ,
+    TURBO_CONTROL_VALUES,
+    REU_SIZE_VALUES,
+    REU_ENABLED_VALUES,
+    SID_TYPE_VALUES,
+    SID_ADDRESS_VALUES,
+    DRIVE_TYPE_VALUES,
+    DISK_IMAGE_TYPES,
+    MOUNT_MODES,
+    cpu_speed_enum,
+    cpu_speed_mhz,
+    reu_size_enum,
+    validate_enum,
+    SIDSocketConfig,
+)
 from .parallel import run_parallel, ParallelTestResult, SingleTestResult
 
 __all__ = [
@@ -76,6 +124,49 @@ __all__ = [
     "PortAllocator",
     "ViceInstance",
     "ViceInstanceManager",
+    # Ultimate 64 hardware
+    "Ultimate64Transport",
+    "Ultimate64Client",
+    "Ultimate64Error",
+    "Ultimate64AuthError",
+    "Ultimate64TimeoutError",
+    "Ultimate64ProtocolError",
+    "CPU_SPEED_VALUES",
+    "CPU_SPEED_BY_MHZ",
+    "TURBO_CONTROL_VALUES",
+    "REU_SIZE_VALUES",
+    "REU_ENABLED_VALUES",
+    "SID_TYPE_VALUES",
+    "SID_ADDRESS_VALUES",
+    "DRIVE_TYPE_VALUES",
+    "DISK_IMAGE_TYPES",
+    "MOUNT_MODES",
+    "cpu_speed_enum",
+    "cpu_speed_mhz",
+    "reu_size_enum",
+    "validate_enum",
+    "SIDSocketConfig",
+    # Ultimate 64 helpers
+    "get_turbo_mhz",
+    "set_turbo_mhz",
+    "get_turbo_enabled",
+    "get_reu_config",
+    "set_reu",
+    "get_sid_config",
+    "set_sid_socket",
+    "mount_disk_file",
+    "unmount",
+    "run_prg_file",
+    "load_prg_file",
+    "U64StateSnapshot",
+    "snapshot_state",
+    "restore_state",
+    # Ultimate 64 instance management
+    "Ultimate64Device",
+    "Ultimate64Instance",
+    "Ultimate64InstanceManager",
+    "Ultimate64ManagerError",
+    "Ultimate64PoolExhaustedError",
     # Parallel execution
     "run_parallel",
     "ParallelTestResult",
