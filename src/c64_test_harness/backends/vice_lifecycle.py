@@ -10,6 +10,10 @@ import socket
 import subprocess
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from c64_test_harness.disk import DiskImage
 
 
 @dataclass
@@ -23,6 +27,8 @@ class ViceConfig:
     ntsc: bool = True
     sound: bool = False
     extra_args: list[str] = field(default_factory=list)
+    disk_image: DiskImage | None = None
+    drive_unit: int = 8
 
 
 class ViceProcess:
@@ -70,6 +76,12 @@ class ViceProcess:
         if not cfg.sound:
             args.append("+sound")
         args += cfg.extra_args
+
+        if cfg.disk_image is not None:
+            args += [
+                f"-{cfg.drive_unit}", str(cfg.disk_image.path),
+                f"-drive{cfg.drive_unit}type", str(cfg.disk_image.drive_type),
+            ]
 
         self._proc = subprocess.Popen(
             args,
