@@ -197,8 +197,11 @@ from .ethernet import generate_mac, parse_mac, format_mac, set_cs8900a_mac
 from .bridge_ping import (
     build_echo_request_frame,
     build_icmp_responder_code,
+    build_icmp_responder_tod_code,
     build_ping_and_wait_code,
+    build_ping_and_wait_tod_code,
     build_rx_echo_reply_code,
+    build_rx_echo_reply_tod_code,
     build_rx_peek_code,
     build_read_and_match_echo_reply_code,
     build_read_and_respond_echo_request_code,
@@ -211,6 +214,12 @@ from .bridge_ping import (
     run_ping_and_wait,
 )
 from .poll_until import poll_until_ready
+from .tod_timer import (
+    MAX_DEADLINE_TENTHS,
+    build_tod_start_code,
+    build_tod_read_tenths_code,
+    build_poll_with_tod_deadline_code,
+)
 from .parallel import run_parallel, ParallelTestResult, SingleTestResult
 from .sid import SidFile, SidError, SidFormatError, build_test_psid
 from .sid_player import (
@@ -431,8 +440,11 @@ __all__ = [
     "EchoRequest",
     "build_echo_request_frame",
     "build_icmp_responder_code",
+    "build_icmp_responder_tod_code",
     "build_ping_and_wait_code",
+    "build_ping_and_wait_tod_code",
     "build_rx_echo_reply_code",
+    "build_rx_echo_reply_tod_code",
     "build_rx_peek_code",
     "build_read_and_match_echo_reply_code",
     "build_read_and_respond_echo_request_code",
@@ -444,6 +456,11 @@ __all__ = [
     "run_ping_and_wait",
     # Host-side wall-clock polling helper
     "poll_until_ready",
+    # CIA TOD-based 6502 timeouts (shippable networking applications)
+    "MAX_DEADLINE_TENTHS",
+    "build_tod_start_code",
+    "build_tod_read_tenths_code",
+    "build_poll_with_tod_deadline_code",
     # Parallel execution
     "run_parallel",
     "ParallelTestResult",
