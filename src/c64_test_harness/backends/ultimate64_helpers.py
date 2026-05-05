@@ -27,6 +27,7 @@ from .ultimate64_schema import (
     REU_SIZE_VALUES,
     SID_ADDRESS_VALUES,
     SID_TYPE_VALUES,
+    SIDSocketConfig,
     TURBO_CONTROL_VALUES,
     cpu_speed_enum,
     cpu_speed_mhz,
@@ -55,6 +56,16 @@ __all__ = [
     "CAT_CART",
     "CAT_SID_SOCKETS",
     "CAT_SID_ADDRESSING",
+    "CAT_ULTISID",
+    "CAT_AUDIO_MIXER",
+    "CAT_DATA_STREAMS",
+    "get_sid_socket_types",
+    "get_sid_addresses",
+    "configure_multi_sid",
+    "get_physical_sid_sockets",
+    "get_ultisid_config",
+    "get_audio_mixer_config",
+    "set_audio_mixer_item",
 ]
 
 
@@ -66,6 +77,9 @@ CAT_U64_SPECIFIC = "U64 Specific Settings"
 CAT_CART = "C64 and Cartridge Settings"
 CAT_SID_SOCKETS = "SID Sockets Configuration"
 CAT_SID_ADDRESSING = "SID Addressing"
+CAT_ULTISID = "UltiSID Configuration"
+CAT_AUDIO_MIXER = "Audio Mixer"
+CAT_DATA_STREAMS = "Data Streams"
 
 _ITEM_TURBO_CONTROL = "Turbo Control"
 _ITEM_CPU_SPEED = "CPU Speed"
@@ -252,6 +266,159 @@ def set_sid_socket(
         CAT_SID_ADDRESSING,
         {f"SID Socket {socket} Address": address},
     )
+
+
+def get_sid_socket_types(client: Ultimate64Client) -> dict[int, str]:
+    """Return which SID type is detected in each socket.
+
+    Reads the ``SID Sockets Configuration`` category and extracts the
+    SID type for each numbered socket item (e.g. ``"SID Socket 1"``).
+
+    :param client: Connected Ultimate64 client.
+    :returns: Dict mapping 1-based socket index to type string
+        (e.g. ``{1: "8580", 2: "6581"}`` or ``{1: "None", 2: "8580"}``).
+    """
+    inner = _unwrap(
+        client.get_config_category(CAT_SID_SOCKETS), CAT_SID_SOCKETS
+    )
+    result: dict[int, str] = {}
+    for key, value in inner.items():
+        # Match items like "SID Socket 1", "SID Socket 2"
+        if key.startswith("SID Socket ") and key[-1].isdigit():
+            idx = int(key.split()[-1])
+            result[idx] = str(value)
+    return result
+
+
+def get_sid_addresses(client: Ultimate64Client) -> dict[int, str]:
+    """Return the current address mapping for each SID socket.
+
+    Reads the ``SID Addressing`` category and extracts the address for
+    each numbered socket address item (e.g. ``"SID Socket 1 Address"``).
+
+    :param client: Connected Ultimate64 client.
+    :returns: Dict mapping 1-based socket index to address string
+        (e.g. ``{1: "$D400", 2: "$D420"}``).
+    """
+    inner = _unwrap(
+        client.get_config_category(CAT_SID_ADDRESSING), CAT_SID_ADDRESSING
+    )
+    result: dict[int, str] = {}
+    for key, value in inner.items():
+        # Match items like "SID Socket 1 Address", "SID Socket 2 Address"
+        if key.startswith("SID Socket ") and key.endswith(" Address"):
+            idx_str = key.removeprefix("SID Socket ").removesuffix(" Address")
+            if idx_str.isdigit():
+                result[int(idx_str)] = str(value)
+    return result
+
+
+def configure_multi_sid(
+    client: Ultimate64Client,
+    configs: list[SIDSocketConfig],
+) -> None:
+    """Configure multiple SID sockets at once.
+
+    Takes a list of :class:`SIDSocketConfig` where index 0 corresponds
+    to socket 1, index 1 to socket 2, etc.  All configs are validated
+    before any writes are issued, so a bad value in any position raises
+    :class:`ValueError` without touching the device.
+
+    :param client: Connected Ultimate64 client.
+    :param configs: List of :class:`SIDSocketConfig` (max 2 for current
+        hardware). Index 0 = Socket 1, index 1 = Socket 2.
+    :raises ValueError: If any config has invalid type/address values,
+        or if the list is empty or too long.
+    """
+    if not isinstance(configs, list) or not configs:
+        raise ValueError("configs must be a non-empty list of SIDSocketConfig")
+    if len(configs) > 2:
+        raise ValueError(
+            f"at most 2 SID socket configs supported, got {len(configs)}"
+        )
+    # Validate all configs upfront (SIDSocketConfig.__post_init__ already
+    # validates against schema enums, but re-check in case caller built
+    # raw instances bypassing __post_init__).
+    for i, cfg in enumerate(configs):
+        if not isinstance(cfg, SIDSocketConfig):
+            raise TypeError(
+                f"configs[{i}] must be SIDSocketConfig, "
+                f"got {type(cfg).__name__}"
+            )
+        validate_enum(cfg.sid_type, SID_TYPE_VALUES, "SID type")
+        validate_enum(cfg.address, SID_ADDRESS_VALUES, "SID address")
+
+    # Write all socket types, then all addresses.
+    socket_updates: dict[str, str] = {}
+    address_updates: dict[str, str] = {}
+    for i, cfg in enumerate(configs):
+        socket_num = i + 1
+        socket_updates[f"SID Socket {socket_num}"] = cfg.sid_type
+        address_updates[f"SID Socket {socket_num} Address"] = cfg.address
+
+    client.set_config_items(CAT_SID_SOCKETS, socket_updates)
+    client.set_config_items(CAT_SID_ADDRESSING, address_updates)
+
+
+def get_physical_sid_sockets(client: Ultimate64Client) -> list[int]:
+    """Return socket indices that have physical SID chips detected.
+
+    A socket is considered to have a physical chip when its type is
+    ``"6581"`` or ``"8580"`` (not ``"None"``, ``"Disabled"``, or
+    ``"Enabled"``).
+
+    :param client: Connected Ultimate64 client.
+    :returns: Sorted list of 1-based socket indices with physical SIDs
+        (e.g. ``[1, 2]`` or ``[2]`` or ``[]``).
+    """
+    types = get_sid_socket_types(client)
+    physical_types = {"6581", "8580"}
+    return sorted(idx for idx, typ in types.items() if typ in physical_types)
+
+
+def get_ultisid_config(client: Ultimate64Client) -> dict:
+    """Read the UltiSID FPGA core configuration.
+
+    :param client: Connected Ultimate64 client.
+    :returns: Raw dict of UltiSID configuration items as returned by
+        the device.
+    """
+    return dict(
+        _unwrap(client.get_config_category(CAT_ULTISID), CAT_ULTISID)
+    )
+
+
+def get_audio_mixer_config(client: Ultimate64Client) -> dict:
+    """Read the Audio Mixer configuration.
+
+    The mixer provides per-SID-channel volume and panning controls,
+    needed for parallel capture of individual SID outputs.
+
+    :param client: Connected Ultimate64 client.
+    :returns: Raw dict of Audio Mixer configuration items as returned
+        by the device.
+    """
+    return dict(
+        _unwrap(client.get_config_category(CAT_AUDIO_MIXER), CAT_AUDIO_MIXER)
+    )
+
+
+def set_audio_mixer_item(
+    client: Ultimate64Client,
+    item: str,
+    value: Any,
+) -> None:
+    """Set a single Audio Mixer configuration item.
+
+    :param client: Connected Ultimate64 client.
+    :param item: Item name within the Audio Mixer category (e.g.
+        a volume or panning control name).
+    :param value: New value for the item (string enum or numeric).
+    :raises ValueError: If *item* is empty.
+    """
+    if not isinstance(item, str) or not item:
+        raise ValueError("item must be a non-empty string")
+    client.set_config_items(CAT_AUDIO_MIXER, {item: value})
 
 
 # --------------------------------------------------------------------------- #

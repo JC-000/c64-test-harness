@@ -34,6 +34,13 @@ from .backends.ultimate64_helpers import (
     set_reu,
     get_sid_config,
     set_sid_socket,
+    get_sid_socket_types,
+    get_sid_addresses,
+    configure_multi_sid,
+    get_physical_sid_sockets,
+    get_ultisid_config,
+    get_audio_mixer_config,
+    set_audio_mixer_item,
     mount_disk_file,
     unmount,
     run_prg_file,
@@ -41,6 +48,9 @@ from .backends.ultimate64_helpers import (
     U64StateSnapshot,
     snapshot_state,
     restore_state,
+    CAT_ULTISID,
+    CAT_AUDIO_MIXER,
+    CAT_DATA_STREAMS,
 )
 from .backends.ultimate64_manager import (
     Ultimate64Device,
@@ -79,6 +89,16 @@ from .backends.ultimate64_schema import (
     SIDSocketConfig,
 )
 from .backends.render_wav import render_wav, RenderResult, PAL_CLOCK_HZ, NTSC_CLOCK_HZ
+from .backends.render_wav_u64 import capture_sid_u64, U64CaptureResult
+from .backends.u64_audio_capture import (
+    AudioCapture,
+    CaptureResult,
+    write_wav,
+    DEFAULT_AUDIO_PORT,
+    DEFAULT_SAMPLE_RATE,
+    CHANNELS,
+    SAMPLE_WIDTH,
+)
 from .parallel import run_parallel, ParallelTestResult, SingleTestResult
 from .sid import SidFile, SidError, SidFormatError, build_test_psid
 from .sid_player import (
@@ -177,6 +197,16 @@ __all__ = [
     "set_reu",
     "get_sid_config",
     "set_sid_socket",
+    "get_sid_socket_types",
+    "get_sid_addresses",
+    "configure_multi_sid",
+    "get_physical_sid_sockets",
+    "get_ultisid_config",
+    "get_audio_mixer_config",
+    "set_audio_mixer_item",
+    "CAT_ULTISID",
+    "CAT_AUDIO_MIXER",
+    "CAT_DATA_STREAMS",
     "mount_disk_file",
     "unmount",
     "run_prg_file",
@@ -223,4 +253,15 @@ __all__ = [
     "RenderResult",
     "PAL_CLOCK_HZ",
     "NTSC_CLOCK_HZ",
+    # U64 SID capture
+    "capture_sid_u64",
+    "U64CaptureResult",
+    # U64 audio capture (low-level)
+    "AudioCapture",
+    "CaptureResult",
+    "write_wav",
+    "DEFAULT_AUDIO_PORT",
+    "DEFAULT_SAMPLE_RATE",
+    "CHANNELS",
+    "SAMPLE_WIDTH",
 ]
