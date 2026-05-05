@@ -772,6 +772,8 @@ Write raw PCM data to a WAV file.
 
 Cycle-accurate 6510/VIC bus trace capture from U64 debug stream over UDP.
 
+**Rate cap — read this before designing any turbo-speed test that relies on the trace.** The U64E FPGA emits the debug stream at a fixed rate of roughly **~850k entries/sec** (≈ 2,400 UDP packets/sec) regardless of CPU turbo speed. This matches the native 6510 rate at 1 MHz, so at 1 MHz the trace is essentially complete. At higher turbo speeds you get a **uniformly sampled 1/N view** of the real bus (1/4 of cycles at 4 MHz, 1/48 at 48 MHz). `packets_dropped` stays at zero at every speed because the rate limit is at the source, not in the UDP path. Drop to `set_turbo_mhz(client, 1)` for the capture window if you need a complete trace; turbo-speed capture is only sound for uniform-sample aggregate statistics (PC-hit distribution, frequency maps). Measurement lives in `tests/test_u64_debug_stream_speed_live.py`.
+
 ### `BusCycle` (frozen dataclass)
 Parsed 32-bit bus cycle entry. Properties:
 - `.is_cpu -> bool` / `.is_vic -> bool` — PHI2 clock phase
