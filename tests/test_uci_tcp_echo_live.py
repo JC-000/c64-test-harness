@@ -10,10 +10,10 @@ on the U64 that:
   5. Stores results in C64 memory for readback
 
 Usage:
-    U64_HOST=192.168.1.81 python3 scripts/test_uci_tcp_echo.py
+    U64_HOST=192.168.1.81 pytest tests/test_uci_tcp_echo_live.py -v
 
 Note on CPU speed:
-    This script hand-writes its own 6502 routine (not via the uci_network
+    This test hand-writes its own 6502 routine (not via the uci_network
     builders) and is NOT turbo-safe. It runs the U64 at stock 1 MHz so
     the FPGA behind $DF1C-$DF1F naturally settles between accesses. For
     UCI code that works at U64 turbo speeds (4/8/16/24/48 MHz), use the
@@ -22,12 +22,19 @@ Note on CPU speed:
 """
 from __future__ import annotations
 
-import argparse
 import os
 import socket
 import sys
 import threading
 import time
+
+import pytest
+
+U64_HOST = os.environ.get("U64_HOST")
+pytestmark = pytest.mark.skipif(
+    not U64_HOST,
+    reason="U64_HOST not set — live Ultimate 64 tests disabled",
+)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from c64_test_harness.backends.device_lock import DeviceLock
@@ -467,14 +474,9 @@ def _run_echo_server(host: str, port: int, result: dict):
         srv.close()
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="UCI TCP echo test")
-    parser.add_argument("--host", default=None,
-                        help="U64 host (default: $U64_HOST or 192.168.1.81)")
-    parser.add_argument("--timeout", type=float, default=30.0)
-    args = parser.parse_args()
-
-    u64_host = args.host or os.environ.get("U64_HOST", "192.168.1.81")
+def test_uci_tcp_echo_roundtrip() -> None:
+    u64_host = U64_HOST
+    timeout = 30.0
     # Detect our own IP on the same subnet
     test_host_ip = _detect_local_ip(u64_host)
 
@@ -499,19 +501,17 @@ def main() -> int:
             break
         time.sleep(0.05)
     else:
-        print("ERROR: Echo server failed to start")
-        return 1
+        pytest.fail("Echo server failed to start within 2.5s")
     print(f"Echo server listening on {test_host_ip}:{ECHO_PORT}")
 
     # Acquire device lock
     lock = DeviceLock(u64_host)
     if not lock.acquire(timeout=60.0):
-        print("ERROR: Could not acquire device lock")
-        return 1
+        pytest.fail("Could not acquire device lock within 60s")
 
     try:
-        client = Ultimate64Client(host=u64_host, timeout=args.timeout)
-        transport = Ultimate64Transport(host=u64_host, timeout=args.timeout,
+        client = Ultimate64Client(host=u64_host, timeout=timeout)
+        transport = Ultimate64Transport(host=u64_host, timeout=timeout,
                                         client=client)
 
         # Enable UCI transiently (not saved to flash)
@@ -566,9 +566,8 @@ def main() -> int:
                 print("  Sentinel set -- routine complete")
                 break
         else:
-            print(f"TIMEOUT: Sentinel not set (progress=0x{progress:02X})")
             _dump_results(transport)
-            return 1
+            pytest.fail(f"Sentinel not set within 20s (progress=0x{progress:02X})")
 
         # Read results
         _dump_results(transport)
@@ -601,16 +600,13 @@ def main() -> int:
             print(f"  actual_len field : {actual_len if read_len >= 2 else 'N/A'}")
             print(f"  payload          : {payload!r}")
             print()
-            if payload == TEST_STRING:
-                print("PASS: Echo roundtrip successful!")
-                return 0
-            else:
-                print(f"FAIL: Expected {TEST_STRING!r}, got {payload!r}")
-                return 1
+            assert payload == TEST_STRING, (
+                f"echo payload mismatch: expected {TEST_STRING!r}, got {payload!r}"
+            )
+            print("PASS: Echo roundtrip successful!")
         else:
             print()
-            print("FAIL: No data received from echo")
-            return 1
+            pytest.fail("No data received from echo (read_len == 0)")
 
     finally:
         try:
@@ -671,5 +667,3 @@ def _dump_results(transport: Ultimate64Transport) -> None:
             pass
 
 
-if __name__ == "__main__":
-    sys.exit(main())

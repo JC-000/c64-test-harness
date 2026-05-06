@@ -60,15 +60,14 @@ Protocol reference:
   https://vice-emu.sourceforge.io/vice_13.html (Binary Monitor Interface)
 
 Usage:
-  python3 scripts/test_binary_monitor.py [--vice-path x64sc] [--port 6502]
+  pytest tests/test_binary_monitor.py -v
 
-Requires x64sc (VICE) on PATH.
+Requires x64sc (VICE) on PATH; the test skips otherwise.
 ============================================================================
 """
 
 from __future__ import annotations
 
-import argparse
 import socket
 import struct
 import subprocess
@@ -457,7 +456,7 @@ def wait_for_port(host: str, port: int, timeout: float = 30.0) -> bool:
 # Test functions
 # ============================================================================
 
-def test_connect(mon: BinaryMonitor) -> bool:
+def _check_connect(mon: BinaryMonitor) -> bool:
     """Test A: Connect — does CPU pause? Does VICE send anything initially?"""
     print("\n=== Test A: Connect ===")
     try:
@@ -479,7 +478,7 @@ def test_connect(mon: BinaryMonitor) -> bool:
         return False
 
 
-def test_ping_and_initial_stop(mon: BinaryMonitor) -> bool:
+def _check_ping_and_initial_stop(mon: BinaryMonitor) -> bool:
     """Test A2: Ping — does sending any command stop the CPU?"""
     print("\n=== Test A2: Ping + Auto-Stop Behaviour ===")
     try:
@@ -518,7 +517,7 @@ def test_ping_and_initial_stop(mon: BinaryMonitor) -> bool:
         return False
 
 
-def test_registers_available(mon: BinaryMonitor) -> bool:
+def _check_registers_available(mon: BinaryMonitor) -> bool:
     """Test B: Registers Available (0x83)."""
     print("\n=== Test B: Registers Available (0x83) ===")
     try:
@@ -541,7 +540,7 @@ def test_registers_available(mon: BinaryMonitor) -> bool:
         return False
 
 
-def test_memory_get(mon: BinaryMonitor) -> bool:
+def _check_memory_get(mon: BinaryMonitor) -> bool:
     """Test C: Memory Get (0x01) — read from $0400 (screen memory)."""
     print("\n=== Test C: Memory Get (0x01) ===")
     try:
@@ -562,7 +561,7 @@ def test_memory_get(mon: BinaryMonitor) -> bool:
         return False
 
 
-def test_memory_set(mon: BinaryMonitor) -> bool:
+def _check_memory_set(mon: BinaryMonitor) -> bool:
     """Test D: Memory Set (0x02) — large writes (256, 1024, 4096 bytes)."""
     print("\n=== Test D: Memory Set (0x02) — Large Writes ===")
     results = {}
@@ -596,7 +595,7 @@ def test_memory_set(mon: BinaryMonitor) -> bool:
     return all_ok
 
 
-def test_registers_get(mon: BinaryMonitor) -> bool:
+def _check_registers_get(mon: BinaryMonitor) -> bool:
     """Test E: Registers Get (0x31)."""
     print("\n=== Test E: Registers Get (0x31) ===")
     try:
@@ -616,7 +615,7 @@ def test_registers_get(mon: BinaryMonitor) -> bool:
         return False
 
 
-def test_registers_set(mon: BinaryMonitor) -> bool:
+def _check_registers_set(mon: BinaryMonitor) -> bool:
     """Test F: Registers Set (0x32) — set PC to $C000."""
     print("\n=== Test F: Registers Set (0x32) ===")
     try:
@@ -634,7 +633,7 @@ def test_registers_set(mon: BinaryMonitor) -> bool:
         return False
 
 
-def test_exit_and_breakpoint(mon: BinaryMonitor) -> bool:
+def _check_exit_and_breakpoint(mon: BinaryMonitor) -> bool:
     """Test G+H: Checkpoint, Exit (resume), connection persistence, Stopped event."""
     print("\n=== Test G+H: Checkpoint + Exit + Stopped Event ===")
     try:
@@ -702,7 +701,7 @@ def test_exit_and_breakpoint(mon: BinaryMonitor) -> bool:
         return False
 
 
-def test_keyboard_feed(mon: BinaryMonitor) -> bool:
+def _check_keyboard_feed(mon: BinaryMonitor) -> bool:
     """Test I: Keyboard Feed (0x72)."""
     print("\n=== Test I: Keyboard Feed (0x72) ===")
     try:
@@ -716,7 +715,7 @@ def test_keyboard_feed(mon: BinaryMonitor) -> bool:
         return False
 
 
-def test_jsr_flow(mon: BinaryMonitor) -> bool:
+def _check_jsr_flow(mon: BinaryMonitor) -> bool:
     """Test J: Full jsr() equivalent via binary monitor.
 
     Subroutine at $C100: LDA #$42 / STA $C080 / RTS
@@ -791,7 +790,7 @@ def test_jsr_flow(mon: BinaryMonitor) -> bool:
         return False
 
 
-def test_performance(mon: BinaryMonitor) -> None:
+def _check_performance(mon: BinaryMonitor) -> None:
     """Measure key operation timings."""
     print("\n=== Performance Measurements ===")
 
@@ -870,90 +869,50 @@ def test_performance(mon: BinaryMonitor) -> None:
 
 
 # ============================================================================
-# Main
+# Pytest entry point
 # ============================================================================
+#
+# This module is a single end-to-end protocol test, not ten independent ones.
+# The ten _check_* helpers above mutate VICE state in sequence (connect,
+# stop, write memory, set breakpoints, …) so they cannot be reordered or run
+# in isolation. We expose them through one orchestrator test that owns VICE
+# lifecycle and asserts each sub-check, preserving the original print output
+# for diagnosability.
 
-def main():
-    parser = argparse.ArgumentParser(description="Test VICE binary monitor protocol")
-    parser.add_argument("--vice-path", default="x64sc", help="Path to VICE executable")
-    parser.add_argument("--port", type=int, default=0, help="Port (0 = auto)")
-    parser.add_argument("--no-launch", action="store_true",
-                        help="Don't launch VICE, connect to existing instance")
-    parser.add_argument("--debug", action="store_true", help="Show wire-level debug")
-    args = parser.parse_args()
+import shutil
 
-    port = args.port or find_free_port()
-    proc = None
 
-    print("=" * 70)
-    print("VICE Binary Monitor Protocol — Research Test")
-    print("=" * 70)
+def test_binary_monitor_protocol():
+    if shutil.which("x64sc") is None:
+        import pytest
+        pytest.skip("x64sc not on PATH")
 
-    if not args.no_launch:
-        print(f"\nLaunching VICE on port {port}...")
-        try:
-            proc = launch_vice(args.vice_path, port)
-        except FileNotFoundError:
-            print(f"ERROR: {args.vice_path} not found on PATH.")
-            print("Re-run with: python3 scripts/test_binary_monitor.py --vice-path /path/to/x64sc")
-            sys.exit(1)
-
-        print(f"  VICE PID: {proc.pid}")
-        print("  Waiting for binary monitor port...")
-        if not wait_for_port("127.0.0.1", port, timeout=30):
-            print("  ERROR: Binary monitor port did not open within 30s")
-            if proc.poll() is not None:
-                print(f"  VICE exited with code {proc.returncode}")
-            proc.terminate()
-            sys.exit(1)
-        print("  Port is accepting connections!")
-    else:
-        print(f"\nConnecting to existing VICE on port {port}...")
-
-    mon = BinaryMonitor(port=port, timeout=5.0, debug=args.debug)
-    results: dict[str, bool] = {}
-
+    port = find_free_port()
+    proc = launch_vice("x64sc", port)
     try:
-        results["A_connect"] = test_connect(mon)
-        if not results["A_connect"]:
-            print("\nCannot continue without connection.")
-            return
+        assert wait_for_port("127.0.0.1", port, timeout=30), (
+            f"binary monitor port {port} did not open within 30s "
+            f"(VICE exit={proc.poll()})"
+        )
 
-        results["A2_ping_stop"] = test_ping_and_initial_stop(mon)
-        results["B_regs_available"] = test_registers_available(mon)
-        results["C_mem_get"] = test_memory_get(mon)
-        results["D_mem_set"] = test_memory_set(mon)
-        results["E_regs_get"] = test_registers_get(mon)
-        results["F_regs_set"] = test_registers_set(mon)
-        results["GH_breakpoint_exit"] = test_exit_and_breakpoint(mon)
-        results["I_keyboard"] = test_keyboard_feed(mon)
-        results["J_jsr_flow"] = test_jsr_flow(mon)
-
-        test_performance(mon)
-
-        # Summary
-        print("\n" + "=" * 70)
-        print("SUMMARY")
-        print("=" * 70)
-        for name, ok in results.items():
-            print(f"  {name:30s} {'PASS' if ok else 'FAIL'}")
-        passed = sum(1 for v in results.values() if v)
-        print(f"\n  {passed}/{len(results)} tests passed")
-
-    except Exception as e:
-        print(f"\nUnhandled error: {e}")
-        import traceback; traceback.print_exc()
+        mon = BinaryMonitor(port=port, timeout=5.0)
+        try:
+            assert _check_connect(mon), "connect"
+            assert _check_ping_and_initial_stop(mon), "ping_and_initial_stop"
+            assert _check_registers_available(mon), "registers_available"
+            assert _check_memory_get(mon), "memory_get"
+            assert _check_memory_set(mon), "memory_set"
+            assert _check_registers_get(mon), "registers_get"
+            assert _check_registers_set(mon), "registers_set"
+            assert _check_exit_and_breakpoint(mon), "exit_and_breakpoint"
+            assert _check_keyboard_feed(mon), "keyboard_feed"
+            assert _check_jsr_flow(mon), "jsr_flow"
+            _check_performance(mon)  # benchmark only — no assertion
+        finally:
+            mon.close()
     finally:
-        mon.close()
-        if proc is not None:
-            print("\nTerminating VICE...")
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-            print("  Done.")
-
-
-if __name__ == "__main__":
-    main()
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
