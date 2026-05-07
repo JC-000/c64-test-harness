@@ -46,6 +46,136 @@ from c64_test_harness.backends.vice_manager import (
 from c64_test_harness.backends.vice_lifecycle import ViceConfig
 
 
+# Worker functions live at module scope so multiprocessing's 'spawn' start
+# method (Darwin's default) can pickle them. Nested closures inside the
+# phase_* helpers can't be pickled and crash before the first process starts.
+
+
+def _lock_only_worker(
+    wid: int,
+    results_q: multiprocessing.Queue,
+    port_s: int,
+    port_e: int,
+    rounds: int,
+) -> None:
+    allocated = []
+    try:
+        alloc = PortAllocator(port_range_start=port_s, port_range_end=port_e)
+        for _ in range(rounds):
+            try:
+                port = alloc.allocate()
+            except RuntimeError:
+                time.sleep(random.uniform(0.05, 0.2))
+                continue
+            sock = alloc.take_socket(port)
+            if sock:
+                sock.close()
+            hold_time = random.uniform(0.1, 2.0)
+            time.sleep(hold_time)
+            allocated.append(port)
+            alloc.release(port)
+        results_q.put(("ok", wid, allocated))
+    except Exception as e:
+        results_q.put(("error", wid, str(e)))
+
+
+def _vice_worker(
+    wid: int,
+    results_q: multiprocessing.Queue,
+    port_s: int,
+    port_e: int,
+    rounds: int,
+) -> None:
+    try:
+        cfg = ViceConfig(minimize=True, warp=True, sound=False)
+        mgr = ViceInstanceManager(
+            config=cfg,
+            port_range_start=port_s,
+            port_range_end=port_e,
+            max_retries=3,
+        )
+        for _ in range(rounds):
+            with mgr.instance() as inst:
+                assert inst.port in range(port_s, port_e)
+                assert inst.managed
+                time.sleep(random.uniform(0.5, 2.0))
+        results_q.put(("ok", wid, rounds))
+    except Exception as e:
+        results_q.put(("error", wid, str(e)))
+
+
+def _mixed_worker(
+    wid: int,
+    results_q: multiprocessing.Queue,
+    port_s: int,
+    port_e: int,
+) -> None:
+    try:
+        alloc = PortAllocator(port_range_start=port_s, port_range_end=port_e)
+        r = random.random()
+        if r < 0.5:
+            hold_time = random.uniform(2, 5)
+            label = "short"
+        elif r < 0.8:
+            hold_time = random.uniform(5, 10)
+            label = "medium"
+        else:
+            hold_time = random.uniform(10, 15)
+            label = "long"
+
+        port = alloc.allocate()
+        sock = alloc.take_socket(port)
+        if sock:
+            sock.close()
+        time.sleep(hold_time)
+        alloc.release(port)
+        results_q.put(("ok", wid, label, hold_time))
+    except Exception as e:
+        results_q.put(("error", wid, str(e)))
+
+
+def _crash_worker(
+    wid: int,
+    results_q: multiprocessing.Queue,
+    port_s: int,
+    port_e: int,
+    should_crash: bool,
+) -> None:
+    try:
+        alloc = PortAllocator(port_range_start=port_s, port_range_end=port_e)
+        port = alloc.allocate()
+        sock = alloc.take_socket(port)
+        if sock:
+            sock.close()
+        if should_crash:
+            os._exit(1)
+        time.sleep(random.uniform(1, 3))
+        alloc.release(port)
+        results_q.put(("ok", wid, port))
+    except Exception as e:
+        results_q.put(("error", wid, str(e)))
+
+
+def _exhaustion_worker(
+    wid: int,
+    results_q: multiprocessing.Queue,
+    port_s: int,
+    port_e: int,
+) -> None:
+    max_attempts = 10
+    for attempt in range(max_attempts):
+        try:
+            alloc = PortAllocator(port_range_start=port_s, port_range_end=port_e)
+            port = alloc.allocate()
+            time.sleep(random.uniform(0.5, 2.0))
+            alloc.release(port)
+            results_q.put(("ok", wid, attempt + 1))
+            return
+        except RuntimeError:
+            time.sleep(random.uniform(0.1, 0.5) * (attempt + 1))
+    results_q.put(("exhausted", wid, max_attempts))
+
+
 def phase_lock_only(
     port_start: int, port_end: int, workers: int, rounds: int,
 ) -> bool:
@@ -59,33 +189,13 @@ def phase_lock_only(
     print(f"Phase: lock-only | {workers} workers | ports {port_start}-{port_end-1}")
     print(f"{'='*60}")
 
-    def worker(wid: int, results_q: multiprocessing.Queue, port_s: int, port_e: int):
-        allocated = []
-        try:
-            alloc = PortAllocator(port_range_start=port_s, port_range_end=port_e)
-            for _ in range(rounds):
-                try:
-                    port = alloc.allocate()
-                except RuntimeError:
-                    time.sleep(random.uniform(0.05, 0.2))
-                    continue
-                # Take and close the socket (simulating VICE startup window)
-                sock = alloc.take_socket(port)
-                if sock:
-                    sock.close()
-                # Hold the file lock for a random duration
-                hold_time = random.uniform(0.1, 2.0)
-                time.sleep(hold_time)
-                allocated.append(port)
-                alloc.release(port)
-            results_q.put(("ok", wid, allocated))
-        except Exception as e:
-            results_q.put(("error", wid, str(e)))
-
     q: multiprocessing.Queue = multiprocessing.Queue()
     procs = []
     for i in range(workers):
-        p = multiprocessing.Process(target=worker, args=(i, q, port_start, port_end))
+        p = multiprocessing.Process(
+            target=_lock_only_worker,
+            args=(i, q, port_start, port_end, rounds),
+        )
         p.start()
         procs.append(p)
 
@@ -123,30 +233,13 @@ def phase_vice(
     print(f"Phase: vice | {workers} workers | ports {port_start}-{port_end-1}")
     print(f"{'='*60}")
 
-    def worker(wid: int, results_q: multiprocessing.Queue, port_s: int, port_e: int):
-        try:
-            cfg = ViceConfig(minimize=True, warp=True, sound=False)
-            mgr = ViceInstanceManager(
-                config=cfg,
-                port_range_start=port_s,
-                port_range_end=port_e,
-                max_retries=3,
-            )
-            for r in range(rounds):
-                with mgr.instance() as inst:
-                    # Verify we got a valid instance
-                    assert inst.port in range(port_s, port_e)
-                    assert inst.managed
-                    # Brief hold to simulate test work
-                    time.sleep(random.uniform(0.5, 2.0))
-            results_q.put(("ok", wid, rounds))
-        except Exception as e:
-            results_q.put(("error", wid, str(e)))
-
     q: multiprocessing.Queue = multiprocessing.Queue()
     procs = []
     for i in range(workers):
-        p = multiprocessing.Process(target=worker, args=(i, q, port_start, port_end))
+        p = multiprocessing.Process(
+            target=_vice_worker,
+            args=(i, q, port_start, port_end, rounds),
+        )
         p.start()
         procs.append(p)
         # Stagger starts slightly to reduce thundering herd
@@ -181,35 +274,13 @@ def phase_mixed(
     print(f"Phase: mixed | {workers} workers | ports {port_start}-{port_end-1}")
     print(f"{'='*60}")
 
-    def worker(wid: int, results_q: multiprocessing.Queue, port_s: int, port_e: int):
-        try:
-            alloc = PortAllocator(port_range_start=port_s, port_range_end=port_e)
-            # Assign duration class
-            r = random.random()
-            if r < 0.5:
-                hold_time = random.uniform(2, 5)  # short
-                label = "short"
-            elif r < 0.8:
-                hold_time = random.uniform(5, 10)  # medium (shorter for test)
-                label = "medium"
-            else:
-                hold_time = random.uniform(10, 15)  # long (shorter for test)
-                label = "long"
-
-            port = alloc.allocate()
-            sock = alloc.take_socket(port)
-            if sock:
-                sock.close()
-            time.sleep(hold_time)
-            alloc.release(port)
-            results_q.put(("ok", wid, label, hold_time))
-        except Exception as e:
-            results_q.put(("error", wid, str(e)))
-
     q: multiprocessing.Queue = multiprocessing.Queue()
     procs = []
     for i in range(workers):
-        p = multiprocessing.Process(target=worker, args=(i, q, port_start, port_end))
+        p = multiprocessing.Process(
+            target=_mixed_worker,
+            args=(i, q, port_start, port_end),
+        )
         p.start()
         procs.append(p)
 
@@ -248,22 +319,6 @@ def phase_crash(
     print(f"Phase: crash | {workers} workers | ports {port_start}-{port_end-1}")
     print(f"{'='*60}")
 
-    def worker(wid: int, results_q: multiprocessing.Queue, port_s: int, port_e: int, should_crash: bool):
-        try:
-            alloc = PortAllocator(port_range_start=port_s, port_range_end=port_e)
-            port = alloc.allocate()
-            sock = alloc.take_socket(port)
-            if sock:
-                sock.close()
-            if should_crash:
-                # Simulate crash — kernel releases flock
-                os._exit(1)
-            time.sleep(random.uniform(1, 3))
-            alloc.release(port)
-            results_q.put(("ok", wid, port))
-        except Exception as e:
-            results_q.put(("error", wid, str(e)))
-
     q: multiprocessing.Queue = multiprocessing.Queue()
     procs = []
     crash_count = 0
@@ -273,7 +328,8 @@ def phase_crash(
         if should_crash:
             crash_count += 1
         p = multiprocessing.Process(
-            target=worker, args=(i, q, port_start, port_end, should_crash),
+            target=_crash_worker,
+            args=(i, q, port_start, port_end, should_crash),
         )
         p.start()
         procs.append(p)
@@ -326,25 +382,12 @@ def phase_exhaustion(
     print(f"Phase: exhaustion | {workers} workers | ports {port_start}-{tight_end-1}")
     print(f"{'='*60}")
 
-    def worker(wid: int, results_q: multiprocessing.Queue, port_s: int, port_e: int):
-        max_attempts = 10
-        for attempt in range(max_attempts):
-            try:
-                alloc = PortAllocator(port_range_start=port_s, port_range_end=port_e)
-                port = alloc.allocate()
-                time.sleep(random.uniform(0.5, 2.0))
-                alloc.release(port)
-                results_q.put(("ok", wid, attempt + 1))
-                return
-            except RuntimeError:
-                time.sleep(random.uniform(0.1, 0.5) * (attempt + 1))
-        results_q.put(("exhausted", wid, max_attempts))
-
     q: multiprocessing.Queue = multiprocessing.Queue()
     procs = []
     for i in range(workers):
         p = multiprocessing.Process(
-            target=worker, args=(i, q, port_start, tight_end),
+            target=_exhaustion_worker,
+            args=(i, q, port_start, tight_end),
         )
         p.start()
         procs.append(p)
