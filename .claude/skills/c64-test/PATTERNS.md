@@ -541,7 +541,7 @@ sock = uci_tcp_connect(transport, "host", 80, turbo_safe=True)
 
 This emits a nested delay-loop fence (~52 µs at 48 MHz, ~2.5 ms at 1 MHz, 16 bytes per site), adds a 255-iteration settle after every `PUSH_CMD`, and converts short branches over fence expansions to `JMP` trampolines. Fence tuning is exposed as public constants: `UCI_FENCE_OUTER=5`, `UCI_FENCE_INNER=100`, `UCI_PUSH_SETTLE_ITERS=0xFF` — minimum is OUTER=3/INNER=122 (~38.4 µs), defaults provide 35% margin. Default is `turbo_safe=False` for backward compat.
 
-**Scripts `scripts/probe_uci_network.py` and `scripts/test_uci_tcp_echo.py` are NOT turbo-safe** (they hand-write 6502 outside the builders) — they only run at stock 1 MHz.
+**`scripts/probe_uci_network.py` and `tests/test_uci_tcp_echo_live.py` are NOT turbo-safe** (they hand-write 6502 outside the builders) — they only run at stock 1 MHz.
 
 ### UCI gotchas
 
