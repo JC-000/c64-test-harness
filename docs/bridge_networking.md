@@ -191,8 +191,12 @@ ifconfig feth1 create
 ifconfig feth0 peer feth1
 ifconfig feth0 up && ifconfig feth1 up
 ifconfig bridge10 create
-ifconfig bridge10 addm feth0
-ifconfig bridge10 addm feth1
+# NOTE: feth0/feth1 are intentionally NOT added as members of bridge10.
+# The feth peer mechanism already provides L2 between them; adding the
+# peers as bridge members creates a duplicate forwarding path and causes
+# duplicate / looped frames. bridge10 exists only to hold the host-side
+# IP. (The setup script actively removes feth members if a prior botched
+# run added them.)
 ifconfig bridge10 inet 10.0.65.1 netmask 255.255.255.0 up
 ```
 
@@ -224,6 +228,87 @@ Notes:
   `ViceConfig` mapping handles this automatically when
   `ethernet_driver="pcap"` is set — see `tests/bridge_platform.py` for
   the `ETHERNET_DRIVER` constant that the fixtures read.
+
+### macOS test-author traps (live tests only)
+
+These three gotchas are not present on the Linux side. They were
+surfaced empirically while landing
+`tests/test_cleanup_vice_ports_macos_live.py`; that file is the canonical
+working reference for any new live test that drives the macOS bridge.
+
+**1. NOPASSWD is scoped to the exact program path, not `bash <script>`.**
+The project's sudoers grant NOPASSWD for the cleanup/setup/teardown
+script paths directly. A test helper that does
+`subprocess.run(["sudo", "-n", "bash", script_path])` asks sudo to run
+`bash` (a different program from the matcher's POV) and fails with
+"password required". Always invoke scripts directly via their shebang:
+
+```python
+def _run_sudo_script(script_path: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["sudo", "-n", str(script_path)],   # NOT ["sudo", "-n", "bash", ...]
+        check=True, capture_output=True, text=True,
+    )
+```
+
+The Linux equivalent (`tests/test_cleanup_vice_ports_live.py`) uses the
+`bash` wrapper because Linux sudoers there are configured permissively;
+do not copy that helper verbatim onto macOS.
+
+**2. `ViceConfig.ethernet=True` auto-elevates the launch.**
+On macOS, `ViceConfig` flips `run_as_root=True` whenever `ethernet=True`
+(libpcap/BPF needs root unless ChmodBPF is installed). `ViceProcess`
+therefore wraps the launch in `sudo -n x64sc …`, so the recorded
+`ViceProcess.pid` is the **sudo wrapper's** PID, not the actual
+`x64sc` process. `ps -p <sudo_pid> -o ucomm=` returns `"sudo"`, which
+breaks any `_is_x64sc(pid)` sanity check.
+
+Resolve the real x64sc descendant before asserting:
+
+```python
+def _resolve_x64sc_child(parent_pid: int) -> int | None:
+    out = subprocess.run(
+        ["pgrep", "-P", str(parent_pid), "x64sc"],
+        capture_output=True, text=True, check=False,
+    )
+    for line in out.stdout.splitlines():
+        if line.strip().isdigit():
+            return int(line.strip())
+    return None
+```
+
+Sentinel VICEs spawned without `ethernet=True` are NOT sudo-wrapped, so
+`ViceProcess.pid` is correct for them — the resolver only applies to
+ethernet-enabled bridge VICEs.
+
+**3. macOS `ps -o ucomm=` preserves the comm name on zombies. Use `stat=`.**
+A SIGKILL'd-not-yet-reaped process retains its `ucomm` value, so a
+liveness helper that does `os.kill(pid, 0)` and then treats `comm == ""`
+as a zombie signal will silently report dead processes as alive. The
+right zombie indicator is the BSD STAT field — leading `Z` means zombie:
+
+```python
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    out = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "stat="],
+        capture_output=True, text=True, check=False,
+    )
+    if out.returncode != 0:
+        return False
+    stat = out.stdout.strip()
+    return bool(stat) and stat[0] != "Z"
+```
+
+Pair this with `Popen.poll()` calls in the test body to actually reap
+zombies whose parent is pytest. Without poll, the kernel keeps the PID
+alive until pytest exits; with poll, the next `os.kill(pid, 0)` raises
+`ProcessLookupError` cleanly. The Linux `_pid_alive` reads
+`/proc/<pid>/status State:` for the same purpose; macOS just gets the
+state via `ps` instead.
 
 ## Launching two VICE instances on the bridge
 
