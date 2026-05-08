@@ -51,14 +51,6 @@ try:  # pragma: no cover - import shape varies with sys.path on CI
 except Exception:  # pragma: no cover
     _imported_comm_of = None
 
-try:  # pragma: no cover - optional helper, gracefully degrade if missing
-    from tests.bridge_platform import probe_vice_pcap_ok
-except Exception:  # pragma: no cover
-    try:
-        from bridge_platform import probe_vice_pcap_ok  # type: ignore[no-redef]
-    except Exception:
-        probe_vice_pcap_ok = None  # type: ignore[assignment]
-
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CLEANUP_SCRIPT = REPO_ROOT / "scripts" / "cleanup-bridge-feth-macos.sh"
@@ -69,24 +61,6 @@ SENTINEL_PORT = 7031  # outside every harness range (6511-6531, 6560-6580)
 BRIDGE_NAME = "bridge10"
 FETH0 = "feth0"
 FETH1 = "feth1"
-
-
-def _pcap_probe_skip_reason() -> str | None:
-    """Return a non-empty skip reason iff the pcap probe says VICE is broken.
-
-    Wrapped so the skipif lambda below is cheap to evaluate when the
-    helper is unavailable -- in that case we just don't add the
-    fourth marker's effect.
-    """
-    if probe_vice_pcap_ok is None:
-        return None
-    try:
-        ok, reason = probe_vice_pcap_ok()
-    except Exception:  # pragma: no cover - probe is best-effort
-        return None
-    if ok:
-        return None
-    return reason or "VICE pcap driver is broken on this host"
 
 
 pytestmark = [
