@@ -15,6 +15,7 @@ from c64_test_harness.backends.ultimate64_client import (
     Ultimate64Error,
     Ultimate64ProtocolError,
     Ultimate64TimeoutError,
+    Ultimate64UnsafeOperationError,
     _build_multipart,
 )
 
@@ -355,7 +356,7 @@ def test_all_machine_endpoints_mapped():
         c.reboot()
         c.pause()
         c.resume()
-        c.poweroff()
+        c.poweroff(confirm_irrecoverable=True)
         c.menu_button()
     urls = [r[0].get_full_url() for r in captured]
     assert urls == [
@@ -366,6 +367,33 @@ def test_all_machine_endpoints_mapped():
         "http://h/v1/machine:poweroff",
         "http://h/v1/machine:menu_button",
     ]
+
+
+def test_poweroff_requires_confirmation_kwarg():
+    """poweroff() must default-deny -- no kwarg means no HTTP call."""
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        with pytest.raises(Ultimate64UnsafeOperationError):
+            c.poweroff()
+    # Crucially: the guard fires before any HTTP request is made.
+    assert captured == []
+
+
+def test_poweroff_with_confirmation_fires_request():
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        c.poweroff(confirm_irrecoverable=True)
+    assert len(captured) == 1
+    assert captured[0][0].get_full_url() == "http://h/v1/machine:poweroff"
+
+
+def test_poweroff_rejects_positional_confirmation():
+    """confirm_irrecoverable is keyword-only; passing positionally must fail."""
+    c = Ultimate64Client("h")
+    with pytest.raises(TypeError):
+        c.poweroff(True)  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------- runners
