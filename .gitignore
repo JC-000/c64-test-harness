@@ -14,6 +14,10 @@ build/
 # Claude Code local/user-specific settings
 .claude/settings.local.json
 .claude/worktrees/
+# CLAUDE.md is per-developer scratch / agent brief. AI-facing project
+# knowledge lives in .serena/memories/ instead, and human docs in
+# README.md + docs/. Don't track CLAUDE.md.
+CLAUDE.md
 
 # Client-side git hooks — installed per-machine by new-computer-setup.
 .githooks/
