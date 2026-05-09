@@ -42,9 +42,7 @@ pytestmark = [
         sys.platform != "linux",
         reason=(
             "Uses /proc, /sys/class/net, ip link, and iptables to snapshot host "
-            "network state -- Linux-only. The cleanup_vice_ports.py helper itself "
-            "is cross-platform; macOS coverage should come from a new feth/bridge10 "
-            "equivalent test (TODO) rather than trying to port these sysfs probes."
+            "network state -- Linux-only."
         ),
     ),
     pytest.mark.skipif(

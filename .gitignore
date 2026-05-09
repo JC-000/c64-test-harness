@@ -5,8 +5,19 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
-.serena/
+# Serena: ignore regenerable/local state, track project.yml + memories
+.serena/cache/
+.serena/logs/
+.serena/hook_data/
+.serena/project.local.yml
 
 # Claude Code local/user-specific settings
 .claude/settings.local.json
 .claude/worktrees/
+# CLAUDE.md is per-developer scratch / agent brief. AI-facing project
+# knowledge lives in .serena/memories/ instead, and human docs in
+# README.md + docs/. Don't track CLAUDE.md.
+CLAUDE.md
+
+# Client-side git hooks — installed per-machine by new-computer-setup.
+.githooks/
