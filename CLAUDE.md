@@ -42,6 +42,26 @@ Three traps agents hit when porting Linux tests to macOS — full details with c
 - The sudo'd setup/teardown/cleanup scripts are allowlisted at their canonical repo paths. They are NOT allowlisted at worktree paths under `.claude/worktrees/agent-*/scripts/…` — live network tests must run from the canonical repo.
 - Spawned subagents under `mode: bypassPermissions` may still be denied file mutations to the canonical repo (Edit/Write/Bash cp). When that happens, the supervising agent applies file edits directly and resumes the subagent for command execution. Authoring of new test logic still belongs to subagents; mechanical fixes the supervisor diagnosed are fine to apply directly.
 
+## Destructive U64E endpoints and the poweroff guard
+
+The `Ultimate64Client` exposes the full `/v1/machine:*` family. All are marked DESTRUCTIVE in the docstrings, but they are NOT all equally recoverable:
+
+| Endpoint | Recovers via | Guard |
+|---|---|---|
+| `reset()` | instant, over the wire | none |
+| `reboot()` | ~8s, over the wire | none |
+| `pause()` / `resume()` | over the wire | none |
+| `menu_button()` | over the wire | none |
+| **`poweroff()`** | **physical power-cycle only** | **`confirm_irrecoverable=True` kwarg required** |
+
+`poweroff()` is the special case: after the call, the device drops off the network entirely (no ICMP, no TCP) and the API cannot bring it back. Multiple agents have called it thinking it was a benign reset, then misdiagnosed the unreachable state as a "hung device" — wasting troubleshooting cycles.
+
+**Default behavior** when an agent (or its caller) invokes `client.poweroff()`: raises `Ultimate64UnsafeOperationError`. To actually power the device off, the caller must pass `client.poweroff(confirm_irrecoverable=True)` AND have physical access to power-cycle it later.
+
+**For "device looks stuck, I want to recover" scenarios, use `reboot()`** — it reinitializes the FPGA fully (recovers REU/DMA stuck state) and the device comes back in ~8s, all over the network. `reset()` is finer-grained: 6510-only, leaves FPGA state.
+
+If you find yourself reaching for `poweroff()` to "make sure it's really off", you almost certainly want `reboot()` instead.
+
 ## Things to skip
 
 - Do not run `scripts/setup-dev-env.sh` end-to-end unless the user asked for a fresh-machine setup. It installs system packages and brings up bridges; it is not a "make the venv work" shortcut.

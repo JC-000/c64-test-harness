@@ -27,6 +27,7 @@ __all__ = [
     "Ultimate64AuthError",
     "Ultimate64TimeoutError",
     "Ultimate64ProtocolError",
+    "Ultimate64UnsafeOperationError",
 ]
 
 _log = logging.getLogger(__name__)
@@ -51,6 +52,18 @@ class Ultimate64TimeoutError(Ultimate64Error):
 
 class Ultimate64ProtocolError(Ultimate64Error):
     """Raised when a JSON response cannot be parsed."""
+
+
+class Ultimate64UnsafeOperationError(Ultimate64Error):
+    """Raised when a destructive call needs an explicit caller-confirmation
+    kwarg and didn't get one.
+
+    Reserved for operations whose effect cannot be undone via the network
+    API -- specifically ``poweroff``, which leaves the device unreachable
+    until someone physically power-cycles it.  ``reset`` and ``reboot``
+    are also DESTRUCTIVE but recoverable over the wire (~8s for reboot,
+    instant for reset), so they don't require this gate.
+    """
 
 
 def _encode(value: str) -> str:
@@ -237,8 +250,34 @@ class Ultimate64Client:
         """PUT /v1/machine:resume — resume the emulated CPU."""
         self._put_no_body("/v1/machine:resume")
 
-    def poweroff(self) -> None:
-        """PUT /v1/machine:poweroff — power off the C64 side (DESTRUCTIVE)."""
+    def poweroff(self, *, confirm_irrecoverable: bool = False) -> None:
+        """PUT /v1/machine:poweroff — power off the C64 side (DESTRUCTIVE).
+
+        UNSAFE WITHOUT PHYSICAL ACCESS.  After this call the device drops
+        off the network entirely (no ICMP, no TCP, no HTTP) and only a
+        manual power-cycle restores it.  Multiple agents have called this
+        thinking it was a benign reset and then mis-diagnosed the
+        unreachable state as a "hung device" -- producing wasted
+        troubleshooting cycles each time.
+
+        For "the device looks stuck, recover it" scenarios, prefer:
+            * ``reset()``   — soft 6510 reset, instant
+            * ``reboot()``  — full FPGA reinit, ~8s, recovers REU/DMA state
+
+        Pass ``confirm_irrecoverable=True`` only if you (a) intend to
+        leave the device off and (b) have physical access to power-cycle
+        it later.  Without that explicit confirmation, this method
+        raises ``Ultimate64UnsafeOperationError`` rather than firing the
+        request.
+        """
+        if not confirm_irrecoverable:
+            raise Ultimate64UnsafeOperationError(
+                "Ultimate64Client.poweroff() requires "
+                "confirm_irrecoverable=True. After poweroff, the device "
+                "is unreachable until someone physically power-cycles "
+                "it -- use reboot() (~8s) or reset() (instant) for "
+                "recovery scenarios."
+            )
         self._put_no_body("/v1/machine:poweroff")
 
     def menu_button(self) -> None:
