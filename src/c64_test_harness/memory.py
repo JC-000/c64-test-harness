@@ -16,6 +16,28 @@ _AUTO_CHUNK_THRESHOLD = 256
 _WRITE_CHUNK_SIZE = 84
 
 
+class FlakeyReadError(Exception):
+    """Raised by :func:`read_bytes_verified` when consecutive reads disagree.
+
+    Attributes:
+        addr: starting address of the read.
+        length: number of bytes requested.
+        attempts: list of the disagreeing reads in the order they were
+            taken.  Inspect to diagnose whether the corruption is
+            structured (issue #88-style misrouted-response) or random
+            (e.g. truncation).
+    """
+
+    def __init__(self, addr: int, length: int, attempts: list[bytes]) -> None:
+        self.addr = addr
+        self.length = length
+        self.attempts = attempts
+        super().__init__(
+            f"read_bytes_verified: {len(attempts)} consecutive reads of "
+            f"{length} bytes at ${addr:04x} disagreed pairwise"
+        )
+
+
 def read_bytes(transport: C64Transport, addr: int, length: int) -> bytes:
     """Read *length* bytes from *addr*.
 
@@ -25,6 +47,38 @@ def read_bytes(transport: C64Transport, addr: int, length: int) -> bytes:
     if length > _AUTO_CHUNK_THRESHOLD:
         return read_bytes_chunked(transport, addr, length)
     return transport.read_memory(addr, length)
+
+
+def read_bytes_verified(
+    transport: C64Transport,
+    addr: int,
+    length: int,
+    *,
+    max_attempts: int = 2,
+) -> bytes:
+    """Read *length* bytes at *addr*, repeating until two consecutive reads agree.
+
+    Returns the value once two consecutive reads agree.  Raises
+    :class:`FlakeyReadError` if *max_attempts* reads in a row all
+    disagree pairwise.
+
+    Intended for downstream tests that suspect issue #88-style flakey
+    reads.  The standard :func:`read_bytes` should be used everywhere
+    else — this helper doubles the wire traffic per read and is only
+    worth the cost when a flake is suspected.
+    """
+    if max_attempts < 2:
+        raise ValueError(
+            f"max_attempts must be >= 2 (need two reads to compare); "
+            f"got {max_attempts}"
+        )
+    attempts: list[bytes] = [read_bytes(transport, addr, length)]
+    for _ in range(max_attempts - 1):
+        nxt = read_bytes(transport, addr, length)
+        if nxt == attempts[-1]:
+            return nxt
+        attempts.append(nxt)
+    raise FlakeyReadError(addr, length, attempts)
 
 
 def read_bytes_chunked(
