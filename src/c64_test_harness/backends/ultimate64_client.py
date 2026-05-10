@@ -513,6 +513,169 @@ class Ultimate64Client:
         slot = drive if drive.endswith(":") else drive + ":"
         self._put_no_body(f"/v1/drives/{_encode(slot)}:unmount")
 
+    @staticmethod
+    def _drive_slot_path(drive: str, action: str) -> str:
+        if drive not in ("a", "b"):
+            raise ValueError(f"drive must be 'a' or 'b', got {drive!r}")
+        slot = drive + ":"
+        return f"/v1/drives/{_encode(slot)}:{action}"
+
+    def drive_on(self, drive: str) -> None:
+        """PUT /v1/drives/<drive>:on — power on a drive slot (DESTRUCTIVE)."""
+        self._put_no_body(self._drive_slot_path(drive, "on"))
+
+    def drive_off(self, drive: str) -> None:
+        """PUT /v1/drives/<drive>:off — power off a drive slot (DESTRUCTIVE)."""
+        self._put_no_body(self._drive_slot_path(drive, "off"))
+
+    def drive_reset(self, drive: str) -> None:
+        """PUT /v1/drives/<drive>:reset — reset a drive slot (DESTRUCTIVE)."""
+        self._put_no_body(self._drive_slot_path(drive, "reset"))
+
+    def drive_remove_disk(self, drive: str) -> None:
+        """PUT /v1/drives/<drive>:remove — remove the disk from a drive (DESTRUCTIVE)."""
+        self._put_no_body(self._drive_slot_path(drive, "remove"))
+
+    def drive_unlink(self, drive: str) -> None:
+        """PUT /v1/drives/<drive>:unlink — unlink the mounted image (DESTRUCTIVE)."""
+        self._put_no_body(self._drive_slot_path(drive, "unlink"))
+
+    def drive_set_mode(self, drive: str, mode: str) -> None:
+        """PUT /v1/drives/<drive>:set_mode?mode=<mode> — set drive mode (DESTRUCTIVE).
+
+        `mode` is one of "1541", "1571", "1581".
+        """
+        if mode not in ("1541", "1571", "1581"):
+            raise ValueError(f"mode must be '1541', '1571', or '1581', got {mode!r}")
+        self._put_no_body(self._drive_slot_path(drive, "set_mode"), query={"mode": mode})
+
+    def drive_load_rom(self, drive: str, rom_path_or_data: bytes | bytearray | str) -> None:
+        """Load a custom ROM into a drive slot (DESTRUCTIVE).
+
+        If *rom_path_or_data* is a ``bytes``-like object, the ROM is uploaded
+        as a multipart body via PUT /v1/drives/<drive>:load_rom (mirrors the
+        ``mount_disk`` shape).  If it is a ``str``, it is treated as a
+        filename on the device's filesystem and passed via PUT
+        /v1/drives/<drive>:load_rom?file=<path>.
+        """
+        path = self._drive_slot_path(drive, "load_rom")
+        if isinstance(rom_path_or_data, (bytes, bytearray)):
+            boundary = "----U64ClientBoundary" + uuid.uuid4().hex
+            body = _build_multipart(
+                boundary,
+                fields={},
+                file_field="file",
+                file_name="drive.rom",
+                file_bytes=bytes(rom_path_or_data),
+            )
+            self._request(
+                "PUT",
+                path,
+                body=body,
+                content_type=f"multipart/form-data; boundary={boundary}",
+            )
+        elif isinstance(rom_path_or_data, str):
+            if not rom_path_or_data:
+                raise ValueError("rom_path_or_data must be a non-empty string")
+            self._put_no_body(path, query={"file": rom_path_or_data})
+        else:
+            raise TypeError("rom_path_or_data must be bytes or str")
+
+    # ----------------------------------------------------------------- files
+    def file_info(self, path: str) -> dict:
+        """GET /v1/files/<path>:info — return size/extension info for a file.
+
+        Path segments are URL-encoded individually so embedded slashes
+        survive as path delimiters.
+        """
+        if not isinstance(path, str) or not path:
+            raise ValueError("path must be a non-empty string")
+        encoded = "/".join(_encode(seg) for seg in path.lstrip("/").split("/"))
+        return self._get_json(f"/v1/files/{encoded}:info")
+
+    def _files_create_path(self, path: str, action: str) -> str:
+        if not isinstance(path, str) or not path:
+            raise ValueError("path must be a non-empty string")
+        encoded = "/".join(_encode(seg) for seg in path.lstrip("/").split("/"))
+        return f"/v1/files/{encoded}:{action}"
+
+    def create_d64(self, path: str, tracks: int = 35, diskname: str = "") -> None:
+        """PUT /v1/files/<path>:create_d64 — create an empty .d64 image (DESTRUCTIVE).
+
+        `tracks` must be 35 or 40.
+        """
+        if tracks not in (35, 40):
+            raise ValueError(f"tracks must be 35 or 40, got {tracks!r}")
+        if not isinstance(diskname, str):
+            raise TypeError("diskname must be a string")
+        self._put_no_body(
+            self._files_create_path(path, "create_d64"),
+            query={"tracks": tracks, "diskname": diskname},
+        )
+
+    def create_d71(self, path: str, diskname: str = "") -> None:
+        """PUT /v1/files/<path>:create_d71 — create an empty .d71 image (DESTRUCTIVE)."""
+        if not isinstance(diskname, str):
+            raise TypeError("diskname must be a string")
+        self._put_no_body(
+            self._files_create_path(path, "create_d71"),
+            query={"diskname": diskname},
+        )
+
+    def create_d81(self, path: str, diskname: str = "") -> None:
+        """PUT /v1/files/<path>:create_d81 — create an empty .d81 image (DESTRUCTIVE)."""
+        if not isinstance(diskname, str):
+            raise TypeError("diskname must be a string")
+        self._put_no_body(
+            self._files_create_path(path, "create_d81"),
+            query={"diskname": diskname},
+        )
+
+    def create_dnp(self, path: str, tracks: int = 1, diskname: str = "") -> None:
+        """PUT /v1/files/<path>:create_dnp — create an empty .dnp image (DESTRUCTIVE).
+
+        `tracks` must be 1..255 inclusive.
+        """
+        if not isinstance(tracks, int) or tracks < 1 or tracks > 255:
+            raise ValueError(f"tracks must be 1..255, got {tracks!r}")
+        if not isinstance(diskname, str):
+            raise TypeError("diskname must be a string")
+        self._put_no_body(
+            self._files_create_path(path, "create_dnp"),
+            query={"tracks": tracks, "diskname": diskname},
+        )
+
+    # ------------------------------------------------------------ debug / measure
+    def get_debug_register(self) -> int:
+        """GET /v1/machine:debugreg — return the byte at $D7FF."""
+        _, data = self._request("GET", "/v1/machine:debugreg")
+        text = data.decode("utf-8", errors="replace").strip()
+        try:
+            payload = json.loads(text) if text else None
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict) and "value" in payload:
+            return int(payload["value"], 0) if isinstance(payload["value"], str) else int(payload["value"])
+        if isinstance(payload, int):
+            return payload
+        if text:
+            return int(text, 0)
+        raise Ultimate64ProtocolError("empty debugreg response")
+
+    def set_debug_register(self, value: int) -> None:
+        """PUT /v1/machine:debugreg?value=<value> — write the byte at $D7FF (DESTRUCTIVE).
+
+        `value` must be 0..255 inclusive.
+        """
+        if not isinstance(value, int) or value < 0 or value > 255:
+            raise ValueError(f"value must be 0..255, got {value!r}")
+        self._put_no_body("/v1/machine:debugreg", query={"value": value})
+
+    def measure_bus_timing(self) -> bytes:
+        """GET /v1/machine:measure — return raw VCD bytes from a bus-timing capture."""
+        _, data = self._request("GET", "/v1/machine:measure")
+        return data
+
     # -------------------------------------------------------------- config write
     def set_config_item(self, category: str, item: str, value: Any) -> None:
         """PUT /v1/configs/<category>/<item>?value=<value> — set a single
@@ -545,6 +708,24 @@ class Ultimate64Client:
             raise TypeError("updates must be a dict")
         for item, value in updates.items():
             self.set_config_item(category, item, value)
+
+    def set_config_items_batch(self, updates: dict[str, dict[str, Any]]) -> None:
+        """POST /v1/configs — apply many config items in a single request (DESTRUCTIVE).
+
+        `updates` is a mapping of category -> {item: value, ...}.  Sends a
+        single JSON body to the device, so all writes are atomic from the
+        caller's perspective.  Use :meth:`set_config_items` for the
+        per-item PUT fan-out form.
+        """
+        if not isinstance(updates, dict):
+            raise TypeError("updates must be a dict")
+        for category, items in updates.items():
+            if not isinstance(category, str) or not category:
+                raise ValueError("category keys must be non-empty strings")
+            if not isinstance(items, dict):
+                raise TypeError(f"updates[{category!r}] must be a dict")
+        body = json.dumps(updates).encode("utf-8")
+        self._request("POST", "/v1/configs", body=body, content_type="application/json")
 
     def save_config_to_flash(self) -> None:
         """PUT /v1/configs:save_to_flash — persist config to flash (DESTRUCTIVE)."""
