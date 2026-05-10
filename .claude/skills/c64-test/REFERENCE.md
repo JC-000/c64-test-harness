@@ -550,6 +550,7 @@ from c64_test_harness.backends.ultimate64_helpers import (
     set_reu, get_reu_config,
     snapshot_state, restore_state,
     reset, reboot,
+    recover, runner_health_check,
     run_prg_file, load_prg_file,
 )
 ```
@@ -561,6 +562,8 @@ from c64_test_harness.backends.ultimate64_helpers import (
 - `restore_state(client, snap)` -- Restore a snapshot
 - `reset(client)` -- Soft reset (CPU only)
 - `reboot(client)` -- Full FPGA reboot (clears DMA state, ~8s settle)
+- `recover(client, *, reset_settle_seconds=2.0, reboot_settle_seconds=12.0, escalate_to_reboot=True) -> str` -- Escalate `reset()` -> probe -> `reboot()` -> probe; returns `"reset"` or `"reboot"`. Raises `Ultimate64UnreachableError` on total failure. Never calls `poweroff()`.
+- `runner_health_check(client) -> None` -- Post a tiny no-op PRG; raises `Ultimate64RunnerStuckError` on the firmware's "Cannot open file" wedged-runner signature.
 
 ### `ultimate64_schema` constants
 - `CPU_SPEED_VALUES` -- tuple of 16 speed enum strings (" 1" through "48")

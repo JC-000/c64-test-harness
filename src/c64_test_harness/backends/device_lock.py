@@ -114,6 +114,12 @@ class DeviceLock:
         if self._fd is not None:
             return True  # Already held by us
 
+        # Best-effort hygiene: a corrupt file shouldn't block legitimate acquirers.
+        try:
+            self.cleanup_stale(lock_dir=self._lock_dir)
+        except Exception:
+            pass
+
         deadline = time.monotonic() + timeout
         while True:
             result = self._try_acquire_once()
