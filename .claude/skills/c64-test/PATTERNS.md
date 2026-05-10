@@ -504,6 +504,34 @@ What to use turbo-speed capture for: aggregate statistics that tolerate uniform 
 
 The `multicast_group=` argument on `DebugCapture` is the portable receive path — the U64's default `Stream Debug to` destination is the multicast group `239.0.1.66:11002`. Unicast (`<local-ip>:11002`) only works when the Mac/Linux host and the U64 share an L2 segment; multicast works as long as your switch forwards admin-scoped multicast to the host NIC.
 
+### Recovering a stuck Ultimate 64
+
+Three failure modes show up when driving a U64 hard from a test run:
+
+- **CPU stuck (alive-but-hung 6510):** HTTP still works, but the running program has wedged the CPU. A soft `reset()` clears it instantly.
+- **FPGA / REU / DMA stuck:** typically after turbo-speed switches with REU-heavy workloads. A soft reset is not enough; only a full `reboot()` (~8s FPGA reinit) clears it.
+- **Runner subsystem wedged:** the device is otherwise reachable (HTTP + `/v1/version` respond) but `run_prg` returns the firmware's `"Cannot open file"` signature and refuses new programs. `recover()` clears it.
+
+`recover()` escalates `reset()` -> probe -> `reboot()` -> probe and returns `"reset"` or `"reboot"` to indicate which step succeeded. `runner_health_check()` posts a tiny no-op PRG and raises `Ultimate64RunnerStuckError` on the wedged-runner signature.
+
+```python
+from c64_test_harness.backends.ultimate64_helpers import recover, runner_health_check
+from c64_test_harness.backends.ultimate64_client import (
+    Ultimate64RunnerStuckError, Ultimate64UnreachableError,
+)
+
+try:
+    runner_health_check(client)
+except Ultimate64RunnerStuckError:
+    # Runner wedged but device alive — recover() will clear it.
+    step = recover(client)  # returns "reset" or "reboot"
+    runner_health_check(client)  # confirm the runner is back
+```
+
+If both `reset()` and `reboot()` fail to bring the device back, `recover()` raises `Ultimate64UnreachableError` and the device needs a physical power-cycle.
+
+**Never use `poweroff()` for recovery — it disconnects the device until manual physical power-cycle. Use `reboot()` (or `recover()` which escalates to it).**
+
 ---
 
 ## Pattern 11: UCI Networking on Ultimate 64 Elite

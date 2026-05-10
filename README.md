@@ -30,6 +30,7 @@ Reusable test harness for Commodore 64 programs. Automates C64 programs via the 
 - **U64 drive & disk fixtures** — `drive_on/off/reset/set_mode/load_rom`, `create_d64/d71/d81/dnp` blank-image creation, `file_info`, `get_debug_register`/`set_debug_register` ($D7FF), `measure_bus_timing` (VCD), batch `set_config_items_batch`
 - **U64 SocketDMA client** — `SocketDMAClient` on TCP 64 wraps capabilities REST does not expose: `inject_keys`, `reu_write`, `dma_load`/`dma_jump`/`dma_write`, `reset`, plus UDP identify-broadcast for LAN device discovery
 - **U64 syslog listener** — `U64SyslogListener` consumes UDP 514 raw-line syslog from the firmware; `wait_for(predicate)` for assertion-driven tests
+- **U64 robust recovery** — `recover()` escalates `reset()` -> probe -> `reboot()` -> probe to clear CPU/FPGA/REU stuck states, and `runner_health_check()` raises `Ultimate64RunnerStuckError` on the firmware's "Cannot open file" wedged-runner signature (never calls `poweroff()`)
 - **Flexible configuration** — `HarnessConfig` with TOML file and environment variable support
 
 ## Getting started (fresh Ubuntu 25 machine)
