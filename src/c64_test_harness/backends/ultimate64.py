@@ -52,6 +52,11 @@ class Ultimate64Transport(HardwareTransportBase):
         self._keybuf_count_addr = keybuf_count_addr
         self._keybuf_max = keybuf_max
 
+    @property
+    def client(self) -> "Ultimate64Client":
+        """Return the underlying Ultimate64Client for low-level operations not yet wrapped on the transport."""
+        return self._client
+
     # ----- C64Transport protocol -----
 
     def read_memory(self, addr: int, length: int) -> bytes:

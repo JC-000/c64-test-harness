@@ -227,7 +227,7 @@ def play_sid_ultimate64(
         SidPlaybackError: If ``song`` is out of range.
     """
     _validate_song(sid, song)
-    transport._client.sid_play(sid.raw, songnr=song)
+    transport.client.sid_play(sid.raw, songnr=song)
 
 
 def stop_sid_vice(transport: BinaryViceTransport) -> None:
