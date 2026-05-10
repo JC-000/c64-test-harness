@@ -28,6 +28,8 @@ __all__ = [
     "Ultimate64TimeoutError",
     "Ultimate64ProtocolError",
     "Ultimate64UnsafeOperationError",
+    "Ultimate64UnreachableError",
+    "Ultimate64RunnerStuckError",
 ]
 
 _log = logging.getLogger(__name__)
@@ -63,6 +65,31 @@ class Ultimate64UnsafeOperationError(Ultimate64Error):
     until someone physically power-cycles it.  ``reset`` and ``reboot``
     are also DESTRUCTIVE but recoverable over the wire (~8s for reboot,
     instant for reset), so they don't require this gate.
+    """
+
+
+class Ultimate64UnreachableError(Ultimate64Error):
+    """Raised when the device is unreachable after recovery attempts.
+
+    Used by ``ultimate64_helpers.recover()`` when both the soft reset and
+    (optionally) the full reboot escalations failed to bring the device
+    back to a probe-reachable state. Caller is expected to escalate to a
+    human / physical power-cycle -- the network API has no further
+    recovery primitive (``poweroff`` is irrecoverable, not a recovery).
+    """
+
+
+class Ultimate64RunnerStuckError(Ultimate64Error):
+    """Raised when the firmware's runner subsystem is wedged.
+
+    Signature: ``run_prg`` (or similar runner endpoint) returns the
+    "Cannot open file" error from the device even though the device is
+    otherwise reachable (HTTP works, ``/v1/version`` responds). The
+    runner state machine is stuck and refuses new programs.
+
+    ``recover()`` (which issues a soft reset and optionally a reboot)
+    typically clears this. Do NOT call ``poweroff()`` -- that's
+    irrecoverable over the network.
     """
 
 
@@ -403,6 +430,28 @@ class Ultimate64Client:
         """POST /v1/runners:run_prg — load and RUN a PRG (DESTRUCTIVE).
 
         Firmware 3.14 requires POST (PUT returns 400).
+
+        Failure modes:
+
+        * **Normal failure** (HTTP 4xx with informative body) — raised
+          as ``Ultimate64Error`` with the device's error message in
+          ``.body``. Caller can retry, fix the PRG, etc.
+        * **Stuck-runner state** — device returns the firmware's
+          ``"Cannot open file"`` signature (either as the body of a 4xx
+          or in a JSON ``errors`` array). The device is alive (HTTP and
+          ``/v1/version`` still work) but its runner state machine is
+          wedged and refuses new programs. Detect via
+          ``ultimate64_helpers.runner_health_check()``; clear via
+          ``ultimate64_helpers.recover()`` (soft reset, escalates to
+          ``reboot()`` if needed).
+        * **Device unreachable** — raised as ``Ultimate64TimeoutError``.
+          Use ``recover()`` first; if that raises
+          ``Ultimate64UnreachableError`` the device needs a physical
+          power-cycle.
+
+        Do NOT call ``poweroff()`` to clear a stuck runner -- it leaves
+        the device unreachable until someone physically power-cycles it.
+        ``reboot()`` (via ``recover()``) is the correct escalation.
         """
         self._post_binary("/v1/runners:run_prg", data)
 
