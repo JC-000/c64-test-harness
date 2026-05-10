@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import multiprocessing
 import os
 import threading
 import time
@@ -261,3 +262,105 @@ class TestCleanupStale:
         """Only device-*.lock files are touched, not port-*.lock."""
         (lock_dir / "port-6502.lock").write_text("{}")
         assert DeviceLock.cleanup_stale(lock_dir=lock_dir) == 0
+
+
+# -- Opportunistic cleanup wired into acquire() --
+
+
+def _hold_device_lock_worker(
+    lock_dir_str: str,
+    host: str,
+    started: "multiprocessing.synchronize.Event",
+    stop: "multiprocessing.synchronize.Event",
+) -> None:
+    """Child-process worker: hold a DeviceLock until told to stop."""
+    lock = DeviceLock(host, lock_dir=Path(lock_dir_str))
+    if not lock.acquire(timeout=5.0):
+        return
+    try:
+        started.set()
+        stop.wait(timeout=10.0)
+    finally:
+        lock.release()
+
+
+class TestAcquireCleansStaleOnEntry:
+    def test_acquire_cleans_stale_metadata(self, lock_dir: Path) -> None:
+        """acquire() opportunistically removes orphan metadata for a dead PID."""
+        path = lock_dir / "device-10.0.0.1.lock"
+        # PID 999999999 is virtually guaranteed not to exist.
+        stale_meta = {
+            "pid": 999999999,
+            "ts": 0.0,
+            "device_host": "10.0.0.1",
+        }
+        path.write_text(json.dumps(stale_meta))
+
+        lock = DeviceLock("10.0.0.1", lock_dir=lock_dir)
+        assert lock.acquire(timeout=1.0)
+        try:
+            info = lock.read_info()
+            assert info is not None
+            assert info["pid"] == os.getpid()
+            assert info["device_host"] == "10.0.0.1"
+            assert info["ts"] != 0.0
+        finally:
+            lock.release()
+
+    def test_acquire_does_not_disturb_live_holder(self, lock_dir: Path) -> None:
+        """A live cross-process holder must not be disturbed by acquire's cleanup."""
+        ctx = multiprocessing.get_context("spawn")
+        started = ctx.Event()
+        stop = ctx.Event()
+        proc = ctx.Process(
+            target=_hold_device_lock_worker,
+            args=(str(lock_dir), "10.0.0.7", started, stop),
+        )
+        proc.start()
+        try:
+            assert started.wait(timeout=5.0), "child never acquired the lock"
+
+            contender = DeviceLock("10.0.0.7", lock_dir=lock_dir)
+            t0 = time.monotonic()
+            assert not contender.acquire(timeout=0.5)
+            assert time.monotonic() - t0 >= 0.4
+
+            # Child still holds it: metadata reflects child PID.
+            info = contender.read_info()
+            assert info is not None
+            assert info["pid"] == proc.pid
+        finally:
+            stop.set()
+            proc.join(timeout=5.0)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=2.0)
+
+    def test_acquire_handles_corrupt_metadata(self, lock_dir: Path) -> None:
+        """Junk lockfile content must not prevent acquire."""
+        path = lock_dir / "device-10.0.0.2.lock"
+        path.write_bytes(b"not json \x00\xff garbage")
+
+        lock = DeviceLock("10.0.0.2", lock_dir=lock_dir)
+        assert lock.acquire(timeout=1.0)
+        try:
+            info = lock.read_info()
+            assert info is not None
+            assert info["pid"] == os.getpid()
+        finally:
+            lock.release()
+
+    def test_acquire_handles_missing_pid_field(self, lock_dir: Path) -> None:
+        """Metadata without a pid key is treated as stale and cleaned; acquire succeeds."""
+        path = lock_dir / "device-10.0.0.3.lock"
+        path.write_text(json.dumps({"ts": 0.0, "device_host": "10.0.0.3"}))
+
+        lock = DeviceLock("10.0.0.3", lock_dir=lock_dir)
+        assert lock.acquire(timeout=1.0)
+        try:
+            info = lock.read_info()
+            assert info is not None
+            assert info["pid"] == os.getpid()
+            assert info["device_host"] == "10.0.0.3"
+        finally:
+            lock.release()
