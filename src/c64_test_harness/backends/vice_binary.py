@@ -55,6 +55,32 @@ EVENT_STOPPED = 0x62
 EVENT_RESUMED = 0x63
 RESPONSE_CHECKPOINT_INFO = 0x11
 
+# For the binary monitor protocol, each request command's response_type field
+# echoes the command opcode for most commands.  Two exceptions: the
+# Checkpoint commands (Set/Delete) reply with CHECKPOINT_INFO (0x11), and
+# Registers Set replies with a Registers response (0x31).  This map lets
+# _wait_for_response detect request_id collisions where an unrelated
+# response carries the right id but the wrong payload shape, which would
+# otherwise be silently parsed as the expected reply (issue #88-style
+# corruption mode).
+CMD_TO_RESPONSE_TYPE: dict[int, int] = {
+    CMD_MEM_GET: 0x01,
+    CMD_MEM_SET: 0x02,
+    CMD_CHECKPOINT_SET: 0x11,
+    CMD_REGISTERS_GET: 0x31,
+    CMD_REGISTERS_SET: 0x31,
+    CMD_KEYBOARD_FEED: 0x72,
+    CMD_BANKS_AVAILABLE: 0x82,
+    CMD_REGS_AVAILABLE: 0x83,
+    CMD_DISPLAY_GET: 0x84,
+    CMD_CPUHISTORY_GET: 0x86,
+    CMD_PALETTE_GET: 0x91,
+    CMD_JOYPORT_SET: 0xA2,
+    CMD_USERPORT_SET: 0xB2,
+    CMD_EXIT: 0xAA,
+    CMD_RESET: 0xCC,
+}
+
 # Wire constants
 STX = 0x02
 API_VERSION = 0x02
@@ -273,13 +299,24 @@ class BinaryViceTransport:
         """Send a command and wait for its response, buffering any events."""
         with self._lock:
             req_id = self._send_command(cmd_type, body)
-            return self._wait_for_response(req_id)
+            expected_type = CMD_TO_RESPONSE_TYPE.get(cmd_type)
+            return self._wait_for_response(req_id, expected_response_type=expected_type)
 
-    def _wait_for_response(self, req_id: int) -> _Response:
+    def _wait_for_response(
+        self,
+        req_id: int,
+        expected_response_type: int | None = None,
+    ) -> _Response:
         """Read responses until we get the one matching *req_id*.
 
         Any unsolicited events (request_id == 0xFFFFFFFF) or responses
         for other request IDs are buffered in the event queue.
+
+        If *expected_response_type* is given, raise :class:`TransportError`
+        when a matched-id response carries a different ``response_type``.
+        Without this, a colliding request_id would silently misroute a
+        response (e.g. CHECKPOINT_INFO bytes parsed as MEM_GET data) — the
+        failure shape behind issue #88.
         """
         while True:
             resp = self._recv_response()
@@ -289,6 +326,15 @@ class BinaryViceTransport:
                         f"VICE binary monitor error {resp.error_code:#x} "
                         f"for command type {resp.response_type:#x} "
                         f"(req_id={req_id}), body={resp.body.hex()}"
+                    )
+                if (
+                    expected_response_type is not None
+                    and resp.response_type != expected_response_type
+                ):
+                    raise TransportError(
+                        f"VICE binary monitor response_type mismatch for "
+                        f"req_id={req_id}: expected {expected_response_type:#x}, "
+                        f"got {resp.response_type:#x} (body={resp.body.hex()})"
                     )
                 return resp
             # Unsolicited event or stale response — buffer it
@@ -365,6 +411,12 @@ class BinaryViceTransport:
                 raise TransportError("Memory Get response too short")
             data_len = struct.unpack_from("<H", resp.body, 0)[0]
             data = resp.body[2:2 + data_len]
+            if len(data) != chunk_size:
+                raise TransportError(
+                    f"Memory Get short read at ${current_addr:04x}: "
+                    f"requested {chunk_size} bytes, got {len(data)} "
+                    f"(data_len field={data_len}, body_len={len(resp.body)})"
+                )
             result.extend(data)
 
             remaining -= len(data)
@@ -612,7 +664,20 @@ class BinaryViceTransport:
 
                 if resp.response_type == EVENT_STOPPED:
                     return self._parse_stopped_event(resp)
-                # Discard other events (Resumed, Checkpoint info, etc.)
+                if resp.request_id == EVENT_REQUEST_ID:
+                    # Other unsolicited event (Resumed, Checkpoint info, …):
+                    # buffer for later inspection rather than dropping.
+                    self._event_queue.append(resp)
+                    continue
+                # Non-event response with a non-stopped type while waiting
+                # for STOPPED is a wire desync — raise rather than silently
+                # discarding bytes that belong to some other request.
+                raise TransportError(
+                    f"Unexpected non-event response while waiting for "
+                    f"STOPPED: response_type={resp.response_type:#x}, "
+                    f"req_id={resp.request_id:#x}, "
+                    f"body={resp.body.hex()}"
+                )
 
     def resource_get(self, name: str) -> int | str:
         """Get a VICE resource value by name.

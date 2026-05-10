@@ -1,8 +1,12 @@
 """Tests for memory convenience helpers: chunked reads, LE readers, write_bytes."""
 
+import pytest
+
 from c64_test_harness.memory import (
+    FlakeyReadError,
     read_bytes,
     read_bytes_chunked,
+    read_bytes_verified,
     write_bytes,
     read_word_le,
     read_dword_le,
@@ -211,3 +215,93 @@ class TestHexDump:
         t.memory[0x0400] = [0xAA, 0xBB, 0xCC]
         result = hex_dump(t, 0x0400, 3)
         assert result == "$0400: aa bb cc"
+
+
+class TestReadBytesVerified:
+    """Tests for read_bytes_verified — issue #88 diagnostic helper."""
+
+    def test_read_bytes_verified_happy_path(self):
+        """Two consecutive reads agree → returns immediately."""
+        t = MockTransport()
+        calls: list[tuple[int, int]] = []
+
+        def stable_read(addr, length):
+            calls.append((addr, length))
+            return b"\xde\xad\xbe\xef"
+
+        t.read_memory = stable_read
+        result = read_bytes_verified(t, 0x1000, 4)
+        assert result == b"\xde\xad\xbe\xef"
+        assert len(calls) == 2  # one initial + one confirming read
+
+    def test_read_bytes_verified_retries_on_disagreement(self):
+        """First two reads disagree, third agrees with second → return."""
+        t = MockTransport()
+        responses = [b"\x01\x02", b"\x03\x04", b"\x03\x04"]
+        idx = {"i": 0}
+
+        def flaky_read(addr, length):
+            r = responses[idx["i"]]
+            idx["i"] += 1
+            return r
+
+        t.read_memory = flaky_read
+        result = read_bytes_verified(t, 0x2000, 2, max_attempts=3)
+        assert result == b"\x03\x04"
+        assert idx["i"] == 3
+
+    def test_read_bytes_verified_raises_after_max_attempts(self):
+        """All reads disagree pairwise → FlakeyReadError after max_attempts."""
+        t = MockTransport()
+        seq = [b"\xaa", b"\xbb", b"\xcc", b"\xdd"]
+        idx = {"i": 0}
+
+        def fully_flaky_read(addr, length):
+            r = seq[idx["i"] % len(seq)]
+            idx["i"] += 1
+            return r
+
+        t.read_memory = fully_flaky_read
+        with pytest.raises(FlakeyReadError) as exc_info:
+            read_bytes_verified(t, 0x3000, 1, max_attempts=3)
+        err = exc_info.value
+        assert err.addr == 0x3000
+        assert err.length == 1
+        assert len(err.attempts) == 3
+        # Each attempt is a distinct read result
+        assert err.attempts == [b"\xaa", b"\xbb", b"\xcc"]
+
+    def test_read_bytes_verified_max_attempts_default_is_two(self):
+        """With default max_attempts=2: one initial + one comparison read."""
+        t = MockTransport()
+        results = [b"\x11", b"\x22"]
+        idx = {"i": 0}
+
+        def flaky(addr, length):
+            r = results[idx["i"]]
+            idx["i"] += 1
+            return r
+
+        t.read_memory = flaky
+        with pytest.raises(FlakeyReadError) as exc_info:
+            read_bytes_verified(t, 0x4000, 1)
+        assert len(exc_info.value.attempts) == 2
+
+    def test_read_bytes_verified_rejects_max_attempts_below_two(self):
+        """max_attempts < 2 has no meaning (need 2 reads to compare)."""
+        t = MockTransport()
+        with pytest.raises(ValueError, match="max_attempts"):
+            read_bytes_verified(t, 0x5000, 4, max_attempts=1)
+
+    def test_read_bytes_verified_uses_chunked_path_for_large_reads(self):
+        """Large reads use the same chunking as read_bytes() (>256 bytes)."""
+        t = MockTransport()
+        data = bytes([i & 0xFF for i in range(512)])
+
+        def contiguous_read(addr, length):
+            offset = addr - 0x6000
+            return data[offset : offset + length]
+
+        t.read_memory = contiguous_read
+        result = read_bytes_verified(t, 0x6000, 512)
+        assert result == data
