@@ -41,6 +41,7 @@ Environment variables:
 - `.transport: C64Transport` — the live transport
 - `.backend: str` — `"vice"` or `"u64"`
 - `.pid: int | None` — VICE OS process PID, or `None` for hardware
+- `.client -> Ultimate64Client` (property) — returns the underlying `Ultimate64Client` on U64-backed targets. Raises `AttributeError` on VICE-backed targets. Use this to reach U64-only endpoints (e.g. `target.client.reboot()`, `target.client.send_text(...)`) from cross-backend code that already has a `TestTarget`.
 
 ### `BackendManager` (Protocol)
 Structural protocol satisfied by both `ViceInstanceManager` and `Ultimate64InstanceManager`:
@@ -48,8 +49,10 @@ Structural protocol satisfied by both `ViceInstanceManager` and `Ultimate64Insta
 - `release(instance) -> None`
 - `shutdown() -> None`
 
-### `create_manager(backend="auto", **kwargs) -> UnifiedManager`
+### `create_manager(backend="auto", *, lock_timeout=60.0, **kwargs) -> UnifiedManager`
 Factory function. `backend="auto"` reads `C64_BACKEND` env var (defaults to `"vice"`).
+
+- `lock_timeout: float` — cross-process device-lock timeout in seconds (U64 only); threaded through `UnifiedManager` to `_LockedU64Manager`. Default 60.0; long parallel benches typically pass `lock_timeout=1800.0` (30 min). Bounds the wait against **stuck** holders only — a live holder making progress extends the deadline (see `DeviceLock.acquire`).
 
 **U64 cross-process safety:** When the U64 backend is selected, `UnifiedManager` automatically wraps device access with `DeviceLock` via `_LockedU64Manager`. Multiple agents (separate OS processes) queue for the same physical device automatically.
 
@@ -188,6 +191,7 @@ All functions take `transport: BinaryViceTransport` as first arg (stateless). Th
 - `delete_breakpoint(transport, bp_id) -> None` -- Calls `transport.delete_checkpoint(bp_id)`
 - `wait_for_pc(transport, addr, timeout=5.0) -> dict` -- Calls `transport.wait_for_stopped()` then verifies PC; returns register dict; CPU is **paused** on return
 - `jsr(transport, addr, timeout=5.0, *, scratch_addr=0x0334) -> dict` -- Call subroutine via trampoline, wait for RTS; CPU is **paused** on return. Works reliably for both short and long-running computations (event-based, no polling).
+- `run_subroutine(target, addr, *, timeout=30.0, poll_cadence=0.005, trampoline_addr=0x0360) -> None` -- Cross-backend "call sub and wait for RTS". Takes a `TestTarget` (not a transport). On VICE wraps `jsr()`. On U64 installs a 14-byte sentinel trampoline at `trampoline_addr` (default `$0360`, cassette buffer; flag bytes at `$03F0`/`$03F1`), triggers it via `SYS <addr>` keystroke (assumes BASIC READY), and host-polls the done flag every `poll_cadence` seconds — sub-millisecond cadence is permitted and useful for short routines (issue #82). Raises `TimeoutError` on U64 only; the message distinguishes "never started" (running flag still `0x00`) from "started but never returned" (running flag `0x01`, done flag never `0x02`). Re-exported from the package root.
 
 ### `jsr()` internals
 1. Writes trampoline at `scratch_addr`: `JSR $addr; NOP; NOP` (5 bytes)
@@ -516,6 +520,10 @@ REST API wrapper for U64 firmware endpoints.
 ```python
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
 client = Ultimate64Client(host="192.168.1.81", password=None, timeout=10.0)
+
+# Optional: override the per-instance write_mem PUT/POST cutoff (bytes).
+# When omitted, auto-detected from firmware: fw 3.14d -> 128, else 48.
+client = Ultimate64Client(host="192.168.1.81", write_mem_query_threshold=128)
 ```
 
 **Machine control:**
@@ -525,15 +533,18 @@ client = Ultimate64Client(host="192.168.1.81", password=None, timeout=10.0)
 - `client.resume()` -- Resume the emulated CPU
 
 **PRG/runner endpoints** (all use POST, not PUT — fw 3.14):
-- `client.run_prg(data)` -- Load and RUN a PRG (resets C64 internally)
+- `client.run_prg(data, *, fallback_on_404=True)` -- Load and RUN a PRG (resets C64 internally). When `fallback_on_404=True` (default) and the runner endpoint returns HTTP 404 (fw 3.14d wedged-runner symptom), the call transparently sideloads via `write_mem(load_addr, body)` using the PRG's first two header bytes as the load address (little-endian) and triggers via `send_text("SYS <addr>")`. A `logging.warning` is emitted when the fallback fires. Pass `fallback_on_404=False` to surface the 404 as a plain `Ultimate64Error`.
 - `client.load_prg(data)` -- Load a PRG into memory without running
 - `client.run_crt(data)` -- Start a cartridge image
 - `client.sid_play(data, songnr=0)` -- Play a .sid tune
 - `client.mod_play(data)` -- Play a .mod file
 
+**Keyboard injection:**
+- `client.send_text(text, *, finish_with_return=True) -> None` -- PETSCII-encode `text` and write into the KERNAL keyboard buffer at `$0277` (count byte at `$00C6`); appends a CR (`0x0D`) when `finish_with_return=True`. Canonical for triggering `SYS <addr>` after `run_prg` lands at READY. Respects the buffer's 10-byte hardware limit by polling `$00C6` and waiting for the KERNAL scan loop to drain before pushing the next chunk. Raises `Ultimate64Error` if the buffer never drains.
+
 **Memory (DMA-backed):**
 - `client.read_mem(address, length) -> bytes`
-- `client.write_mem(address, data)` -- data is hex-encoded in query param
+- `client.write_mem(address, data)` -- DMA-backed write. Uses the legacy `PUT ?data=<hex>` form for payloads `<= self.write_mem_query_threshold` bytes, the `POST` raw-byte form above. Threshold is per-instance and auto-detected at construction (fw 3.14d → 128, else 48); override via the `write_mem_query_threshold=` constructor kwarg.
 
 **Config:**
 - `client.get_version() -> dict`
@@ -593,8 +604,10 @@ with DeviceLock("192.168.1.81") as lock:
     ...
 ```
 
-- `acquire(timeout=30.0) -> bool` -- Blocking acquire (polls with LOCK_NB every 0.1s). Writes JSON metadata (PID, timestamp, device_host). Verifies inode after flock.
-- `release()` -- Release flock. Does NOT delete lockfile (inode race safety, same as PortLock).
+- `acquire(timeout=30.0, *, progress_window=60.0) -> bool` -- Blocking acquire (polls with LOCK_NB every 0.1s). Writes JSON metadata (PID, timestamp, device_host). Verifies inode after flock.
+  - **Queue-aware semantics (default).** `timeout` bounds time spent waiting on **stuck** holders only. A live holder that is making progress (PID alive AND lockfile mtime within `progress_window` seconds) extends the deadline — the deadline is reset on every poll iteration. Holders are considered stuck if their PID is dead or `mtime` is older than `progress_window`; only that time counts against `timeout`. Pass `progress_window=None` for legacy hard-timeout behavior.
+  - **Optional `watchdog` wakeup.** When the optional `c64-test-harness[notify]` extra is installed (`watchdog>=3.0`), queued acquirers wake on lockfile fs-events instead of waiting the full poll interval. The release path emits a cooperative `os.utime(lockfile)` so other waiters wake immediately. The 100 ms polling backstop is preserved for kernel-released flocks (`kill -9` holders where `release()` never ran and no fs-event fires).
+- `release()` -- Release flock. Does NOT delete lockfile (inode race safety, same as PortLock). Touches lockfile mtime via `os.utime` to wake `watchdog`-based waiters cooperatively (best-effort).
 - `read_info() -> dict | None` -- Read metadata without locking (diagnostics).
 - `cleanup_stale(lock_dir=None) -> int` -- Class method; removes lockfiles from dead PIDs.
 - `.device_host` / `.held` properties
@@ -803,6 +816,9 @@ for cycle in result.trace:
 ```
 
 Accumulates raw bytes in the recv loop; parses into `BusCycle` objects on `stop()` for performance at ~32 Mbps.
+
+**Classmethod constructor for per-routine FPGA refresh:**
+- `DebugCapture.with_fresh_fpga(client, *, capture_kwargs=None, reboot_settle_seconds=12.0) -> DebugCapture` -- Calls `client.reboot()`, sleeps `reboot_settle_seconds` (default 12.0s, matches `recover()`'s reboot-settle), then constructs and returns a fresh `DebugCapture` instance with `**(capture_kwargs or {})` forwarded to `__init__` (e.g. `port`, `multicast_group`, `max_bytes`, `filter`). Caller still has to call `.start()`. Use this before each routine in a multi-routine bench to recover from the FPGA UDP-stream rate degradation that builds up under sustained workload (issue #81). Never calls `poweroff()` — `reboot()` is the right primitive for clearing FPGA state.
 
 ### `DebugCaptureResult` (dataclass)
 - `.trace: list[BusCycle]`, `.duration_seconds: float`

@@ -53,6 +53,20 @@ class TestTarget:
     backend: str
     pid: int | None = None
 
+    @property
+    def client(self) -> "Ultimate64Client":  # type: ignore[name-defined]  # noqa: F821
+        """Return the underlying Ultimate64Client (U64 backend only).
+
+        Raises ``AttributeError`` on VICE-backed targets.
+        """
+        from .ultimate64 import Ultimate64Transport
+
+        if not isinstance(self.transport, Ultimate64Transport):
+            raise AttributeError(
+                "client accessor is U64-only; this target is VICE-backed"
+            )
+        return self.transport._client
+
 
 # ---------------------------------------------------------------------------
 # BackendManager Protocol
@@ -97,6 +111,10 @@ class UnifiedManager:
     u64_password:
         Optional password for Ultimate 64 devices.  Defaults to the
         ``U64_PASSWORD`` environment variable.
+    lock_timeout:
+        Cross-process device-lock timeout in seconds (U64 only).
+        Defaults to 60.0; long parallel benches typically pass
+        ``lock_timeout=1800.0`` (30 min) or higher.
     """
 
     def __init__(
@@ -106,6 +124,7 @@ class UnifiedManager:
         vice_kwargs: dict[str, Any] | None = None,
         u64_hosts: str | list[str] | None = None,
         u64_password: str | None = None,
+        lock_timeout: float = 60.0,
     ) -> None:
         self._backend = self._resolve_backend(backend)
         self._manager: BackendManager
@@ -117,7 +136,9 @@ class UnifiedManager:
                 config=vice_config, **kw,
             )
         elif self._backend == "u64":
-            self._manager = self._build_u64_manager(u64_hosts, u64_password)
+            self._manager = self._build_u64_manager(
+                u64_hosts, u64_password, lock_timeout=lock_timeout,
+            )
         else:
             raise ValueError(
                 f"Unknown backend {self._backend!r}; expected 'vice', 'u64', or 'auto'"
@@ -135,11 +156,14 @@ class UnifiedManager:
     def acquire(self) -> TestTarget:
         """Acquire a test target from the underlying manager."""
         instance = self._manager.acquire()
-        return TestTarget(
+        target = TestTarget(
             transport=instance.transport,
             backend=self._backend,
             pid=instance.pid,
         )
+        # Stash so release() can delegate to the underlying manager.
+        target._instance = instance  # type: ignore[attr-defined]
+        return target
 
     def release(self, target: TestTarget) -> None:
         """Release a previously acquired test target."""
@@ -207,6 +231,7 @@ class UnifiedManager:
     def _build_u64_manager(
         hosts: str | list[str] | None,
         password: str | None,
+        lock_timeout: float = 60.0,
     ) -> Any:
         """Build an Ultimate64InstanceManager from host/password config.
 
@@ -234,7 +259,7 @@ class UnifiedManager:
 
         if _HAS_DEVICE_LOCK:
             logger.debug("DeviceLock available — cross-process locking enabled")
-            return _LockedU64Manager(inner)
+            return _LockedU64Manager(inner, lock_timeout=lock_timeout)
 
         logger.debug("DeviceLock not available — in-process pooling only")
         return inner
@@ -324,15 +349,24 @@ class _LockedU64Manager:
 # Factory
 # ---------------------------------------------------------------------------
 
-def create_manager(backend: str = "auto", **kwargs: Any) -> UnifiedManager:
+def create_manager(
+    backend: str = "auto",
+    *,
+    lock_timeout: float = 60.0,
+    **kwargs: Any,
+) -> UnifiedManager:
     """Create a ``UnifiedManager`` from environment and keyword overrides.
 
     Parameters
     ----------
     backend:
         ``"vice"``, ``"u64"``, or ``"auto"`` (reads ``C64_BACKEND``).
+    lock_timeout:
+        Cross-process device-lock timeout in seconds (U64 only).
+        Defaults to 60.0; long parallel benches typically pass
+        ``lock_timeout=1800.0`` (30 min) or higher.
     **kwargs:
         Forwarded to ``UnifiedManager.__init__``.  Useful keys:
         ``vice_config``, ``vice_kwargs``, ``u64_hosts``, ``u64_password``.
     """
-    return UnifiedManager(backend=backend, **kwargs)
+    return UnifiedManager(backend=backend, lock_timeout=lock_timeout, **kwargs)

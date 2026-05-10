@@ -213,14 +213,14 @@ def test_play_sid_ultimate64_calls_client_sid_play():
     sid = make_sid(songs=5)
     t = MagicMock()
     play_sid_ultimate64(t, sid, song=2)
-    t._client.sid_play.assert_called_once_with(sid.raw, songnr=2)
+    t.client.sid_play.assert_called_once_with(sid.raw, songnr=2)
 
 
 def test_play_sid_ultimate64_song_zero():
     sid = make_sid(songs=5)
     t = MagicMock()
     play_sid_ultimate64(t, sid, song=0)
-    t._client.sid_play.assert_called_once_with(sid.raw, songnr=0)
+    t.client.sid_play.assert_called_once_with(sid.raw, songnr=0)
 
 
 def test_play_sid_ultimate64_song_out_of_range():
@@ -236,10 +236,10 @@ def test_play_sid_dispatches_to_u64():
     from c64_test_harness.backends.ultimate64 import Ultimate64Transport
 
     t = MagicMock(spec=Ultimate64Transport)
-    t._client = MagicMock()
+    t.client = MagicMock()
     sid = make_sid(songs=2)
     play_sid(t, sid, song=1)
-    t._client.sid_play.assert_called_once_with(sid.raw, songnr=1)
+    t.client.sid_play.assert_called_once_with(sid.raw, songnr=1)
 
 
 def test_play_sid_dispatches_to_vice(monkeypatch):
