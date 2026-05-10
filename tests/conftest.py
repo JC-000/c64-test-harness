@@ -34,6 +34,7 @@ class MockTransport:
         self.memory: dict[int, list[int]] = {}
         self.written_memory: list[tuple[int, list[int]]] = []
         self.injected_keys: list[list[int]] = []
+        self.injected_joysticks: list[tuple[int, int]] = []
         self._registers: dict[str, int] = {"PC": 0x0800, "A": 0, "X": 0, "Y": 0, "SP": 0xFF}
 
     @property
@@ -69,6 +70,15 @@ class MockTransport:
 
     def read_registers(self) -> dict[str, int]:
         return dict(self._registers)
+
+    def inject_joystick(self, port: int, value: int) -> None:
+        self.injected_joysticks.append((port, value))
+
+    def read_framebuffer(self) -> dict:
+        return {"debug_rect": (0, 0, 0, 0), "inner_rect": (0, 0, 0, 0), "bpp": 0, "palette": 0, "bytes": b""}
+
+    def read_palette(self) -> list[tuple[int, int, int]]:
+        return []
 
     def resume(self) -> None:
         pass
