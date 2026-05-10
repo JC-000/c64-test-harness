@@ -23,6 +23,30 @@ the measurement.
 aggregate statistics (PC distribution, frequency maps), turbo-speed
 capture is fine because the sampling is uniform.
 
+**FPGA degradation under sustained workload (issue #81)**
+
+Independent of the rate cap above, the U64E FPGA's debug-stream
+emitter exhibits *delivery-rate degradation* over time when the
+device is under sustained adjacent workload. Observed delivery
+drops to **30-90% of the configured rate** after a long run, with
+``packets_received`` falling well below the expected ~2,400/sec
+even at 1 MHz. Recovery requires a full :meth:`Ultimate64Client.reboot`
+(FPGA reinit, ~8s); a soft :meth:`Ultimate64Client.reset` is
+**insufficient**. For multi-routine benches, prefer constructing
+the capture via :meth:`DebugCapture.with_fresh_fpga` so each
+routine starts on a fresh emitter.
+
+**Cycle-counting on real silicon: use a tolerance window**
+
+The CIA 6526's timer arming has 1-2 cycle phase variance against
+the CPU clock, which adds up to roughly **~43 cycles of inherent
+non-determinism** per measured interval on real hardware (VICE does
+not model this jitter). Anyone using ``DebugCapture`` to verify a
+cycle count on a real U64 should compare against a *tolerance window*
+rather than an exact match. See commits ``38f2708`` and ``406c863``
+in ``c64-ChaCha20-Poly1305`` for a worked example of the tolerance
+pattern.
+
 Public API
 ----------
 - ``DebugCapture`` — background-thread UDP receiver
@@ -39,7 +63,10 @@ import struct
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
+
+if TYPE_CHECKING:
+    from .ultimate64_client import Ultimate64Client
 
 __all__ = [
     "DebugCapture",
@@ -234,6 +261,54 @@ class DebugCapture:
         self._last_seq: int | None = None
         self._started = False
         self._start_time = 0.0
+
+    @classmethod
+    def with_fresh_fpga(
+        cls,
+        client: "Ultimate64Client",
+        *,
+        capture_kwargs: dict | None = None,
+        reboot_settle_seconds: float = 12.0,
+    ) -> "DebugCapture":
+        """Reboot the U64 FPGA, then construct a fresh DebugCapture ready to start.
+
+        The U64E FPGA's debug-stream emitter degrades over time under
+        sustained workload — observed delivery drops to 30-90% of the
+        configured rate after a long run, and only a full
+        :meth:`Ultimate64Client.reboot` restores it. A soft
+        :meth:`Ultimate64Client.reset` is insufficient (see issue #81).
+
+        Use this constructor before each routine in a multi-routine bench::
+
+            for routine in routines:
+                cap = DebugCapture.with_fresh_fpga(client)
+                cap.start()
+                run_routine()
+                result = cap.stop()
+
+        If you need fine-grained control of the reboot sequencing relative
+        to other test fixtures, do the reboot+settle yourself and
+        instantiate :class:`DebugCapture` the normal way.
+
+        This helper NEVER calls :meth:`Ultimate64Client.poweroff` —
+        ``poweroff`` is irrecoverable over the network and requires
+        physical access to power-cycle. ``reboot()`` is the right
+        primitive for clearing FPGA state.
+
+        :param client: Connected Ultimate64 client.
+        :param capture_kwargs: Forwarded as ``**kwargs`` to the
+            :class:`DebugCapture` constructor (e.g. ``port``,
+            ``multicast_group``, ``max_bytes``, ``filter``). Default
+            ``None`` is treated as ``{}``.
+        :param reboot_settle_seconds: Sleep after ``reboot()`` before
+            returning. Default 12.0s — matches the value used by
+            :func:`ultimate64_helpers.recover` (PR #75).
+        :returns: A freshly-constructed :class:`DebugCapture`. The caller
+            still has to call ``.start()``.
+        """
+        client.reboot()
+        time.sleep(reboot_settle_seconds)
+        return cls(**(capture_kwargs or {}))
 
     def start(self) -> None:
         """Begin capturing debug packets in a background thread."""

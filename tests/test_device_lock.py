@@ -87,11 +87,20 @@ class TestContextManager:
         assert not lock.held
 
     def test_context_manager_raises_on_failure(self, lock_dir: Path) -> None:
-        """Hold the lock in another fd, then context manager should fail."""
+        """Hold the lock in another fd, then context manager should fail.
+
+        Patches __enter__ to use legacy hard-timeout because the live
+        in-process holder would otherwise extend the deadline forever.
+        """
         lock1 = DeviceLock("192.168.1.81", lock_dir=lock_dir)
         lock1.acquire(timeout=1.0)
         try:
             lock2 = DeviceLock("192.168.1.81", lock_dir=lock_dir)
+            # Force the contender into legacy mode to bound this test.
+            original_acquire = lock2.acquire
+            lock2.acquire = lambda timeout=1.0: original_acquire(  # type: ignore[method-assign]
+                timeout=timeout, progress_window=None
+            )
             with pytest.raises(RuntimeError, match="Could not acquire lock"):
                 with lock2:
                     pass  # pragma: no cover
@@ -104,13 +113,18 @@ class TestContextManager:
 
 class TestBlockingTimeout:
     def test_timeout_when_held(self, lock_dir: Path) -> None:
-        """acquire() returns False after timeout when another holder exists."""
+        """acquire() returns False after timeout when another holder exists.
+
+        Uses ``progress_window=None`` (legacy hard-timeout) because the
+        in-process holder writes recent metadata that would otherwise
+        extend the deadline under the default queue-aware semantics.
+        """
         lock1 = DeviceLock("192.168.1.81", lock_dir=lock_dir)
         lock1.acquire(timeout=1.0)
         try:
             lock2 = DeviceLock("192.168.1.81", lock_dir=lock_dir)
             start = time.monotonic()
-            assert not lock2.acquire(timeout=0.3)
+            assert not lock2.acquire(timeout=0.3, progress_window=None)
             elapsed = time.monotonic() - start
             assert elapsed >= 0.25  # should have waited ~0.3s
         finally:
@@ -220,7 +234,8 @@ class TestMultipleDevices:
         lock1 = DeviceLock("10.0.0.1", lock_dir=lock_dir)
         lock2 = DeviceLock("10.0.0.1", lock_dir=lock_dir)
         assert lock1.acquire(timeout=1.0)
-        assert not lock2.acquire(timeout=0.2)
+        # progress_window=None: in-process holder would otherwise extend deadline.
+        assert not lock2.acquire(timeout=0.2, progress_window=None)
         lock1.release()
 
 
@@ -322,7 +337,9 @@ class TestAcquireCleansStaleOnEntry:
 
             contender = DeviceLock("10.0.0.7", lock_dir=lock_dir)
             t0 = time.monotonic()
-            assert not contender.acquire(timeout=0.5)
+            # Legacy hard-timeout: this test specifically asserts the
+            # contender does NOT disturb a live holder over a fixed window.
+            assert not contender.acquire(timeout=0.5, progress_window=None)
             assert time.monotonic() - t0 >= 0.4
 
             # Child still holds it: metadata reflects child PID.
@@ -364,3 +381,183 @@ class TestAcquireCleansStaleOnEntry:
             assert info["device_host"] == "10.0.0.3"
         finally:
             lock.release()
+
+
+# -- F1: queue-aware progress_window --
+
+
+def _hold_and_bump_worker(
+    lock_dir_str: str,
+    host: str,
+    started: "multiprocessing.synchronize.Event",
+    hold_seconds: float,
+    bump_interval: float,
+) -> None:
+    """Hold a DeviceLock for *hold_seconds*, bumping mtime every *bump_interval*."""
+    lock = DeviceLock(host, lock_dir=Path(lock_dir_str))
+    if not lock.acquire(timeout=5.0, progress_window=None):
+        return
+    started.set()
+    try:
+        deadline = time.monotonic() + hold_seconds
+        while time.monotonic() < deadline:
+            try:
+                os.utime(str(lock._lock_path))
+            except OSError:
+                pass
+            time.sleep(bump_interval)
+    finally:
+        lock.release()
+
+
+class TestProgressWindow:
+    def test_acquire_extends_on_live_progressing_holder(
+        self, lock_dir: Path
+    ) -> None:
+        """A live holder bumping mtime extends the deadline past *timeout*."""
+        ctx = multiprocessing.get_context("spawn")
+        started = ctx.Event()
+        proc = ctx.Process(
+            target=_hold_and_bump_worker,
+            args=(str(lock_dir), "10.0.0.42", started, 4.0, 0.5),
+        )
+        proc.start()
+        try:
+            assert started.wait(timeout=5.0), "child never acquired the lock"
+
+            contender = DeviceLock("10.0.0.42", lock_dir=lock_dir)
+            t0 = time.monotonic()
+            # Default progress_window=60.0 should keep extending past
+            # the 2.0s timeout because the child is alive and bumping.
+            assert contender.acquire(timeout=2.0, progress_window=5.0)
+            elapsed = time.monotonic() - t0
+            try:
+                # Child held for ~4s; total wait should be well past 2.0s.
+                assert elapsed >= 3.0, f"acquire returned too early ({elapsed:.2f}s)"
+            finally:
+                contender.release()
+        finally:
+            proc.join(timeout=10.0)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=2.0)
+
+    def test_acquire_progress_window_none_legacy_behavior(
+        self, lock_dir: Path
+    ) -> None:
+        """progress_window=None reverts to the hard-timeout legacy behavior."""
+        ctx = multiprocessing.get_context("spawn")
+        started = ctx.Event()
+        proc = ctx.Process(
+            target=_hold_and_bump_worker,
+            args=(str(lock_dir), "10.0.0.43", started, 5.0, 0.2),
+        )
+        proc.start()
+        try:
+            assert started.wait(timeout=5.0)
+
+            contender = DeviceLock("10.0.0.43", lock_dir=lock_dir)
+            t0 = time.monotonic()
+            assert not contender.acquire(timeout=0.5, progress_window=None)
+            elapsed = time.monotonic() - t0
+            assert 0.4 <= elapsed < 1.5, (
+                f"legacy timeout did not bound wait correctly: {elapsed:.2f}s"
+            )
+        finally:
+            # Tell the child to stop early — it will just hold its 5s window.
+            proc.join(timeout=10.0)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=2.0)
+
+    def test_acquire_dead_holder_counts_against_timeout(
+        self, lock_dir: Path
+    ) -> None:
+        """A dead-PID holder is cleaned at acquire entry; acquire succeeds quickly."""
+        path = lock_dir / "device-10.0.0.44.lock"
+        # Stale metadata for a virtually-impossible PID.  No live process
+        # holds the flock, so cleanup_stale at acquire entry removes it.
+        meta = {"pid": 999999999, "ts": 0.0, "device_host": "10.0.0.44"}
+        path.write_text(json.dumps(meta))
+
+        lock = DeviceLock("10.0.0.44", lock_dir=lock_dir)
+        t0 = time.monotonic()
+        assert lock.acquire(timeout=0.5)
+        elapsed = time.monotonic() - t0
+        try:
+            assert elapsed < 0.4, f"dead holder should not extend deadline ({elapsed:.2f}s)"
+        finally:
+            lock.release()
+
+
+# -- F2: optional watchdog notifier + cooperative mtime bump --
+
+
+def _hold_and_release_after(
+    lock_dir_str: str,
+    host: str,
+    started: "multiprocessing.synchronize.Event",
+    hold_seconds: float,
+) -> None:
+    """Acquire the lock, wait *hold_seconds*, then release cleanly."""
+    lock = DeviceLock(host, lock_dir=Path(lock_dir_str))
+    if not lock.acquire(timeout=5.0, progress_window=None):
+        return
+    started.set()
+    time.sleep(hold_seconds)
+    lock.release()
+
+
+class TestWatchdogNotifier:
+    def test_acquire_wakes_on_watchdog_event_when_available(
+        self, lock_dir: Path
+    ) -> None:
+        """When watchdog is installed, acquire wakes on the release fs-event."""
+        pytest.importorskip("watchdog")
+
+        ctx = multiprocessing.get_context("spawn")
+        started = ctx.Event()
+        hold = 0.5
+        proc = ctx.Process(
+            target=_hold_and_release_after,
+            args=(str(lock_dir), "10.0.0.55", started, hold),
+        )
+        proc.start()
+        try:
+            assert started.wait(timeout=5.0)
+
+            contender = DeviceLock("10.0.0.55", lock_dir=lock_dir)
+            t0 = time.monotonic()
+            assert contender.acquire(timeout=5.0)
+            elapsed = time.monotonic() - t0
+            try:
+                # Lower bound: must wait at least until the holder releases.
+                assert elapsed >= hold - 0.1
+                # Upper bound: with watchdog, wake should be quick after release.
+                # Allow margin for spawn/scheduling, but still less than several
+                # poll cycles past the release.
+                assert elapsed <= hold + 0.5, (
+                    f"watchdog wake too slow: {elapsed:.3f}s vs hold={hold}s"
+                )
+            finally:
+                contender.release()
+        finally:
+            proc.join(timeout=10.0)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=2.0)
+
+    def test_release_bumps_mtime(self, lock_dir: Path) -> None:
+        """release() updates the lockfile mtime as a cooperative wake signal."""
+        lock = DeviceLock("10.0.0.56", lock_dir=lock_dir)
+        assert lock.acquire(timeout=1.0)
+        path = lock._lock_path
+        mtime_before = path.stat().st_mtime
+        # Sleep enough for the filesystem mtime granularity to advance.
+        # macOS HFS+/APFS supports sub-second; tmpfs on Linux is ns.  10ms is safe.
+        time.sleep(0.05)
+        lock.release()
+        mtime_after = path.stat().st_mtime
+        assert mtime_after > mtime_before, (
+            f"release() should bump mtime (before={mtime_before}, after={mtime_after})"
+        )

@@ -205,6 +205,8 @@ class ViceProcess:
         args = [cfg.executable]
         if cfg.prg_path:
             args += ["-autostart", cfg.prg_path]
+            if sys.platform == "darwin" and "-autostartprgmode" not in cfg.extra_args:
+                args += ["-autostartprgmode", "1"]
         if cfg.warp:
             args.append("-warp")
         if cfg.ntsc:

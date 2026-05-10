@@ -144,3 +144,34 @@ def test_paths_passed_unquoted_as_separate_tokens(mock_popen):
     args = _start_and_capture_args(cfg, mock_popen)
     i = args.index("-loadsnapshot")
     assert args[i + 1] == "/tmp/has space/state.vsf"
+
+
+@patch("c64_test_harness.backends.vice_lifecycle.sys.platform", "darwin")
+@patch("subprocess.Popen")
+def test_autostart_adds_prgmode_1_on_darwin(mock_popen):
+    cfg = ViceConfig(prg_path="/tmp/foo.prg")
+    args = _start_and_capture_args(cfg, mock_popen)
+    i = args.index("-autostart")
+    assert args[i + 1] == "/tmp/foo.prg"
+    j = args.index("-autostartprgmode")
+    assert args[j + 1] == "1"
+    assert j > i
+
+
+@patch("c64_test_harness.backends.vice_lifecycle.sys.platform", "linux")
+@patch("subprocess.Popen")
+def test_autostart_no_prgmode_on_linux(mock_popen):
+    cfg = ViceConfig(prg_path="/tmp/foo.prg")
+    args = _start_and_capture_args(cfg, mock_popen)
+    assert "-autostart" in args
+    assert "-autostartprgmode" not in args
+
+
+@patch("c64_test_harness.backends.vice_lifecycle.sys.platform", "darwin")
+@patch("subprocess.Popen")
+def test_autostart_extra_args_override_wins_on_darwin(mock_popen):
+    cfg = ViceConfig(prg_path="/tmp/foo.prg", extra_args=["-autostartprgmode", "0"])
+    args = _start_and_capture_args(cfg, mock_popen)
+    occurrences = [k for k, a in enumerate(args) if a == "-autostartprgmode"]
+    assert len(occurrences) == 1
+    assert args[occurrences[0] + 1] == "0"
