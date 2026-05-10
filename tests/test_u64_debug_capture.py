@@ -394,6 +394,59 @@ class TestDebugCaptureFilter:
         assert not cap._thread.is_alive()
 
 
+class TestWithFreshFpga:
+    """Tests for the DebugCapture.with_fresh_fpga classmethod (issue #81)."""
+
+    def _mock_client(self) -> MagicMock:
+        client = MagicMock()
+        client.host = "10.0.0.42"
+        client.port = 80
+        client.password = None
+        client.reboot = MagicMock()
+        return client
+
+    def test_with_fresh_fpga_calls_reboot_then_constructs(self):
+        client = self._mock_client()
+        with patch(
+            "c64_test_harness.backends.u64_debug_capture.time.sleep"
+        ) as mock_sleep:
+            cap = DebugCapture.with_fresh_fpga(client)
+
+        assert client.reboot.call_count == 1
+        assert isinstance(cap, DebugCapture)
+        # sleep was invoked exactly once for the reboot settle
+        assert mock_sleep.call_count == 1
+
+    def test_with_fresh_fpga_passes_kwargs(self):
+        client = self._mock_client()
+        with patch("c64_test_harness.backends.u64_debug_capture.time.sleep"):
+            cap = DebugCapture.with_fresh_fpga(
+                client, capture_kwargs={"port": 12345}
+            )
+
+        assert isinstance(cap, DebugCapture)
+        assert cap._port == 12345
+
+    def test_with_fresh_fpga_settle_default(self):
+        client = self._mock_client()
+        with patch(
+            "c64_test_harness.backends.u64_debug_capture.time.sleep"
+        ) as mock_sleep:
+            DebugCapture.with_fresh_fpga(client)
+
+        # Default per the API: 12.0 seconds.
+        mock_sleep.assert_called_once_with(12.0)
+
+    def test_with_fresh_fpga_settle_override(self):
+        client = self._mock_client()
+        with patch(
+            "c64_test_harness.backends.u64_debug_capture.time.sleep"
+        ) as mock_sleep:
+            DebugCapture.with_fresh_fpga(client, reboot_settle_seconds=1.0)
+
+        mock_sleep.assert_called_once_with(1.0)
+
+
 class TestDebugCaptureFilterAndMaxBytes:
     """Tests for composition of filter + max_bytes."""
 
