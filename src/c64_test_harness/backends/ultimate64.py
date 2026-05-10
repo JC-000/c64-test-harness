@@ -132,6 +132,44 @@ class Ultimate64Transport(HardwareTransportBase):
             "on hardware. Design tests to self-report results via memory."
         )
 
+    def inject_joystick(self, port: int, value: int) -> None:
+        """Inject joystick state on U64 by writing CIA1 ports via REST.
+
+        SocketDMA (TCP/64) has no dedicated joystick opcode, and the REST API
+        has no joystick endpoint.  The standard out-of-band technique is to
+        DMA-write CIA1's data ports directly: ``$DC01`` is read as joystick
+        port 1, ``$DC00`` as joystick port 2.  Bits 0-4 are
+        up/down/left/right/fire; the C64 joystick is **active-low** at the
+        hardware level, but this method preserves the caller-supplied
+        ``value`` byte verbatim — convert active-high/active-low conventions
+        in the caller, not here.
+
+        Note: writes are one-shot.  CIA1 will hold the value until the next
+        keyboard scan (the KERNAL writes ``$DC00`` ~60 Hz), so for sustained
+        input the caller must rewrite periodically or pause the C64 first.
+        """
+        if port == 1:
+            cia_addr = 0xDC01
+        elif port == 2:
+            cia_addr = 0xDC00
+        else:
+            raise ValueError(f"inject_joystick: port must be 1 or 2, got {port}")
+        if not (0 <= value <= 0xFF):
+            raise ValueError(f"inject_joystick: value {value:#x} out of byte range")
+        self._client.write_mem(cia_addr, bytes([value & 0xFF]))
+
+    def read_framebuffer(self) -> dict:
+        """Return raw framebuffer bytes plus geometry. Backend-specific layout — see backend docs."""
+        raise NotImplementedError(
+            "U64 hardware does not expose framebuffer reads directly via REST."
+        )
+
+    def read_palette(self) -> list[tuple[int, int, int]]:
+        """Return the active VIC palette as RGB triples."""
+        raise NotImplementedError(
+            "U64 hardware does not expose the VIC palette directly via REST."
+        )
+
     def resume(self) -> None:
         """Resume the emulated CPU (after an external pause)."""
         self._client.resume()

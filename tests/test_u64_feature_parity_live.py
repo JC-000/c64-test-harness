@@ -103,7 +103,9 @@ class TestScreenKeyboard:
     """Screen reads and keyboard injection against a live Ultimate 64."""
 
     def test_screen_grid_reads_real_screen(self, transport):
-        grid = ScreenGrid.from_transport(transport)
+        transport._client.reset()
+        grid = wait_for_text(transport, "READY.", timeout=5.0)
+        assert grid is not None, "BASIC READY. prompt did not appear after reset"
         assert len(grid.text_lines()) == 25
         for line in grid.text_lines():
             assert len(line) == 40
