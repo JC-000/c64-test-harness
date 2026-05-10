@@ -11,10 +11,8 @@
       "mcp__serena__read_memory",
       "mcp__serena__find_symbol",
       "mcp__serena__read_file",
-
       "Bash(security find-identity *)",
       "Bash(brew *)",
-
       "Bash(x64sc *)",
       "Bash(sudo -n -l *)",
       "Bash(sudo -n kill *)",
@@ -32,7 +30,6 @@
       "Bash(brew info *)",
       "Bash(brew list *)",
       "Bash(brew --prefix *)",
-
       "Bash(git add)",
       "Bash(git add *)",
       "Bash(git commit -m)",
@@ -45,12 +42,23 @@
       "Bash(git stash)",
       "Bash(git stash *)",
       "Bash(git tag *)",
-
       "Bash(gh pr create *)",
       "Bash(gh pr edit *)",
       "Bash(gh pr comment *)",
       "Bash(gh issue create *)",
-      "Bash(gh issue comment *)"
+      "Bash(gh issue comment *)",
+      "mcp__serena__create_text_file",
+      "mcp__serena__delete_memory",
+      "mcp__serena__edit_memory",
+      "mcp__serena__execute_shell_command",
+      "mcp__serena__find_file",
+      "mcp__serena__find_referencing_symbols",
+      "mcp__serena__get_current_config",
+      "mcp__serena__get_symbols_overview",
+      "mcp__serena__insert_before_symbol",
+      "mcp__serena__list_memories",
+      "mcp__serena__replace_content",
+      "mcp__serena__replace_symbol_body"
     ]
   }
 }
