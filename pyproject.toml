@@ -28,6 +28,7 @@ classifiers = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
+notify = ["watchdog>=3.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/c64_test_harness"]

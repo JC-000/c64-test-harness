@@ -8,6 +8,12 @@ kernel automatically releases flocks when the holding process exits
 Unlike :class:`PortLock` which uses non-blocking acquire, ``DeviceLock``
 supports a blocking ``acquire(timeout=...)`` so multiple agents queue up
 waiting for a single physical device.
+
+If ``watchdog`` is installed (``pip install c64-test-harness[notify]``),
+DeviceLock acquire wakes on filesystem events instead of polling.  The
+100ms poll cadence remains active as a backstop for kernel-released
+flocks (kill -9 holders) where ``release()`` never runs and therefore
+no fs-event is emitted.
 """
 
 from __future__ import annotations
@@ -18,6 +24,14 @@ import os
 import re
 import time
 from pathlib import Path
+
+try:  # Optional dependency — see [project.optional-dependencies] notify
+    from watchdog.events import FileSystemEventHandler
+    from watchdog.observers import Observer
+
+    _HAS_WATCHDOG = True
+except Exception:  # pragma: no cover - exercised only when watchdog absent
+    _HAS_WATCHDOG = False
 
 
 def _default_lock_dir() -> Path:
@@ -95,7 +109,12 @@ class DeviceLock:
         """Whether this instance currently holds the lock."""
         return self._fd is not None
 
-    def acquire(self, timeout: float = 30.0) -> bool:
+    def acquire(
+        self,
+        timeout: float = 30.0,
+        *,
+        progress_window: float | None = 60.0,
+    ) -> bool:
         """Acquire the lock, blocking up to *timeout* seconds.
 
         Polls with ``LOCK_EX | LOCK_NB`` every 0.1 seconds.  Returns
@@ -110,6 +129,24 @@ class DeviceLock:
         on an orphaned inode — another process could create a new file
         at the same path and get an independent lock.  The inode check
         detects this and retries with the new file.
+
+        **Queue-aware semantics (default).**  By default, *timeout* is
+        the time spent waiting on **stuck** holders.  A live, progressing
+        holder extends the deadline indefinitely: if the holder PID is
+        alive AND the lockfile mtime is within *progress_window* seconds,
+        the deadline is reset on every poll iteration.  Only time spent
+        waiting on dead/stuck holders (dead PID, or mtime older than
+        *progress_window*) counts against *timeout*.  Pass
+        ``progress_window=None`` for the legacy hard-timeout behavior.
+
+        :param timeout: maximum wall time (seconds) to wait against
+            stuck/dead holders.  With queue-aware semantics, total
+            wall time may exceed *timeout* if the holder keeps making
+            progress.
+        :param progress_window: how recently the holder must have touched
+            the lockfile (seconds) for it to count as "progressing".
+            ``None`` disables queue-aware behavior (legacy mode: hard
+            timeout).
         """
         if self._fd is not None:
             return True  # Already held by us
@@ -121,14 +158,54 @@ class DeviceLock:
             pass
 
         deadline = time.monotonic() + timeout
-        while True:
-            result = self._try_acquire_once()
-            if result:
-                return True
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return False
-            time.sleep(min(0.1, remaining))
+        notifier = _LockNotifier(self._lock_path) if _HAS_WATCHDOG else None
+        try:
+            while True:
+                result = self._try_acquire_once()
+                if result:
+                    return True
+                # Queue-aware: if the current holder is live and recently
+                # progressing, extend the deadline.
+                if progress_window is not None and self._holder_is_progressing(
+                    progress_window
+                ):
+                    deadline = time.monotonic() + timeout
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                wait = min(0.1, remaining)
+                if notifier is not None:
+                    # Wake on fs-event OR after the poll interval (backstop
+                    # for kernel-released flocks where release() never ran).
+                    notifier.wait(wait)
+                else:
+                    time.sleep(wait)
+        finally:
+            if notifier is not None:
+                notifier.stop()
+
+    def _holder_is_progressing(self, progress_window: float) -> bool:
+        """True iff the lockfile holder is alive AND mtime is recent.
+
+        "Alive" uses the same PID-liveness check as :meth:`cleanup_stale`.
+        "Recent" means lockfile mtime is within *progress_window* seconds.
+        Returns False on any IO/JSON error or missing pid (those are
+        treated as stuck so they count against *timeout*).
+        """
+        try:
+            st = os.stat(str(self._lock_path))
+        except OSError:
+            return False
+        if (time.time() - st.st_mtime) > progress_window:
+            return False
+        try:
+            data = json.loads(self._lock_path.read_text())
+        except (OSError, json.JSONDecodeError, ValueError):
+            return False
+        pid = data.get("pid")
+        if not isinstance(pid, int):
+            return False
+        return _pid_alive(pid)
 
     def _try_acquire_once(self) -> bool:
         """Single non-blocking acquire attempt with inode verification.
@@ -177,11 +254,20 @@ class DeviceLock:
         new holder's lock (flocks are per-inode, and re-creating the
         file yields a new inode).  Leftover lockfiles are tiny, live on
         tmpfs, and are harmlessly reused by the next ``acquire()``.
+
+        Bumps the lockfile's mtime as a cooperative wake-up signal for
+        watchdog-based notifiers in queued acquirers (best-effort).
         """
         if self._fd is None:
             return
         fd = self._fd
         self._fd = None
+        # Cooperative wake-up: bump mtime BEFORE releasing the flock so
+        # the fs-event is observed by waiters that immediately retry.
+        try:
+            os.utime(str(self._lock_path))
+        except OSError:
+            pass
         try:
             fcntl.flock(fd, fcntl.LOCK_UN)
         except OSError:
@@ -305,3 +391,87 @@ def _pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True  # Process exists but we can't signal it
+
+
+# -- Optional watchdog-backed notifier --
+
+
+if _HAS_WATCHDOG:
+
+    class _LockNotifier:  # type: ignore[no-redef]
+        """Wake on filesystem events targeting *lock_path*.
+
+        Watches the parent directory (the lockfile may not yet exist)
+        and signals whenever an event references the exact path.  The
+        notifier is single-shot per :meth:`wait` call: after firing it
+        re-arms automatically.
+
+        This is a responsiveness optimization, not a correctness
+        primitive.  Polling remains the backstop in :meth:`acquire`'s
+        loop so kill -9 holders (kernel-released flock, no ``release()``
+        cooperative mtime bump) still get noticed.
+        """
+
+        def __init__(self, lock_path: Path) -> None:
+            import threading
+
+            self._lock_path = str(lock_path)
+            self._event = threading.Event()
+            self._observer = Observer()
+            handler = _LockEventHandler(self._lock_path, self._event)
+            try:
+                self._observer.schedule(
+                    handler, str(lock_path.parent), recursive=False
+                )
+                self._observer.start()
+                self._started = True
+            except Exception:
+                self._started = False
+
+        def wait(self, timeout: float) -> bool:
+            """Block up to *timeout* seconds for an event; return True if signaled."""
+            if not self._started:
+                time.sleep(timeout)
+                return False
+            fired = self._event.wait(timeout)
+            self._event.clear()
+            return fired
+
+        def stop(self) -> None:
+            if not self._started:
+                return
+            try:
+                self._observer.stop()
+                self._observer.join(timeout=1.0)
+            except Exception:
+                pass
+
+    class _LockEventHandler(FileSystemEventHandler):  # type: ignore[no-redef,misc]
+        def __init__(self, lock_path: str, event) -> None:  # type: ignore[no-untyped-def]
+            super().__init__()
+            self._lock_path = lock_path
+            self._event = event
+
+        def on_any_event(self, event) -> None:  # type: ignore[no-untyped-def]
+            # src_path may be bytes on some backends — coerce.
+            try:
+                src = os.fsdecode(event.src_path)
+            except Exception:
+                return
+            if src == self._lock_path:
+                self._event.set()
+
+else:
+
+    class _LockNotifier:  # type: ignore[no-redef]
+        """Polling stub used when watchdog is unavailable."""
+
+        def __init__(self, lock_path: Path) -> None:  # pragma: no cover
+            self._lock_path = lock_path
+
+        def wait(self, timeout: float) -> bool:  # pragma: no cover
+            time.sleep(timeout)
+            return False
+
+        def stop(self) -> None:  # pragma: no cover
+            return None
