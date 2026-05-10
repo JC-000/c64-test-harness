@@ -55,6 +55,15 @@ class HardwareTransportBase:
     def read_registers(self) -> dict[str, int]:
         raise NotImplementedError
 
+    def inject_joystick(self, port: int, value: int) -> None:
+        raise NotImplementedError
+
+    def read_framebuffer(self) -> dict:
+        raise NotImplementedError
+
+    def read_palette(self) -> list[tuple[int, int, int]]:
+        raise NotImplementedError
+
     def resume(self) -> None:
         raise NotImplementedError
 

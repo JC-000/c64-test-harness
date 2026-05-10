@@ -78,6 +78,18 @@ class C64Transport(Protocol):
         """Read CPU registers.  Returns dict with keys like PC, A, X, Y, SP."""
         ...
 
+    def inject_joystick(self, port: int, value: int) -> None:
+        """Inject joystick state. port=1 or 2, value is the joystick byte (bits 0-4 = up/down/left/right/fire)."""
+        ...
+
+    def read_framebuffer(self) -> dict:
+        """Return raw framebuffer bytes plus geometry. Backend-specific layout — see backend docs."""
+        ...
+
+    def read_palette(self) -> list[tuple[int, int, int]]:
+        """Return the active VIC palette as RGB triples."""
+        ...
+
     def resume(self) -> None:
         """Resume execution (exit monitor / un-pause)."""
         ...

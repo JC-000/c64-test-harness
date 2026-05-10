@@ -133,6 +133,17 @@ class ViceConfig:
     ethernet_base: int = 0xDE00  # I/O base address
     ethernet_mac: bytes = b""  # 6-byte MAC (empty = VICE default)
 
+    # Snapshot / event recording / determinism / audio capture
+    load_snapshot: str | None = None
+    event_recording_start: bool = False
+    event_image: str | None = None
+    event_snapshot_mode: int | None = None
+    event_snapshot_dir: str | None = None
+    seed: int | None = None
+    sound_record_driver: str | None = None
+    sound_record_file: str | None = None
+    exit_screenshot: str | None = None
+
     # Run VICE as root. Required on macOS whenever the pcap ethernet driver
     # is used: even with /dev/bpf* mode 666, the kernel's per-process BPF
     # device allocation refuses to let a non-root process capture on a
@@ -186,6 +197,11 @@ class ViceProcess:
 
         cfg = self.config
 
+        if cfg.event_snapshot_mode is not None and not 0 <= cfg.event_snapshot_mode <= 2:
+            raise ValueError(
+                f"event_snapshot_mode must be 0, 1, or 2 (got {cfg.event_snapshot_mode})"
+            )
+
         args = [cfg.executable]
         if cfg.prg_path:
             args += ["-autostart", cfg.prg_path]
@@ -212,6 +228,24 @@ class ViceProcess:
             args += ["-limitcycles", str(cfg.limit_cycles)]
         if cfg.minimize:
             args.append("-minimized")
+        if cfg.load_snapshot is not None:
+            args += ["-loadsnapshot", cfg.load_snapshot]
+        if cfg.event_recording_start:
+            args.append("-eventstart")
+        if cfg.event_image is not None:
+            args += ["-eventimage", cfg.event_image]
+        if cfg.event_snapshot_mode is not None:
+            args += ["-eventsnapshot", str(cfg.event_snapshot_mode)]
+        if cfg.event_snapshot_dir is not None:
+            args += ["-eventsnapshotdir", cfg.event_snapshot_dir]
+        if cfg.seed is not None:
+            args += ["-seed", str(cfg.seed)]
+        if cfg.sound_record_driver is not None:
+            args += ["-soundrecord", cfg.sound_record_driver]
+        if cfg.sound_record_file is not None:
+            args += ["-recordfile", cfg.sound_record_file]
+        if cfg.exit_screenshot is not None:
+            args += ["-exitscreenshot", cfg.exit_screenshot]
         args += cfg.extra_args
 
         if cfg.ethernet:
