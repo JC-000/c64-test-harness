@@ -20,7 +20,16 @@ from .config import HarnessConfig
 from .runner import TestRunner, TestScenario, TestResult, TestStatus
 from .debug import dump_screen
 from .verify import PrgFile
-from .execute import load_code, goto, jsr, wait_for_pc, set_breakpoint, delete_breakpoint, set_register
+from .execute import (
+    load_code,
+    goto,
+    jsr,
+    wait_for_pc,
+    set_breakpoint,
+    delete_breakpoint,
+    set_register,
+    run_subroutine,
+)
 from .disk import DiskImage, DiskFormat, FileType, DirEntry, DiskImageError
 from .backends.vice_binary import BinaryViceTransport
 from .backends.vice_lifecycle import ViceProcess, ViceConfig
@@ -286,6 +295,7 @@ __all__ = [
     "set_breakpoint",
     "delete_breakpoint",
     "set_register",
+    "run_subroutine",
     # Disk
     "DiskImage",
     "DiskFormat",
