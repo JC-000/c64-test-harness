@@ -6,10 +6,6 @@ dist/
 build/
 .pytest_cache/
 # Serena: ignore regenerable/local state, track project.yml + memories
-.serena/cache/
-.serena/logs/
-.serena/hook_data/
-.serena/project.local.yml
 
 # Claude Code local/user-specific settings
 .claude/settings.local.json
@@ -21,3 +17,4 @@ CLAUDE.md
 
 # Client-side git hooks — installed per-machine by new-computer-setup.
 .githooks/
+.serena/
