@@ -396,6 +396,36 @@ with create_manager() as mgr:
 ### Cross-process safety
 `UnifiedManager` wraps U64 access with `DeviceLock` automatically. Multiple agents (separate OS processes) can call `create_manager()` simultaneously — the file lock queues them for the same physical device.
 
+### Cross-backend `run_subroutine` for short routines
+
+`run_subroutine(target, addr, *, timeout=30.0, poll_cadence=0.005, trampoline_addr=0x0360)` is the cross-backend "call this 6502 sub and wait for RTS" primitive. On VICE it wraps `jsr()` (binary-monitor checkpoint, sub-frame round-trip). On U64 it installs a 14-byte sentinel trampoline at `trampoline_addr` (default `$0360` in the cassette buffer; flags at `$03F0`/`$03F1`), triggers it via a `SYS` keystroke, and host-polls the done flag every `poll_cadence` seconds.
+
+```python
+from c64_test_harness import create_manager, run_subroutine
+
+with create_manager() as mgr:
+    with mgr.instance() as target:
+        # Short / sub-ms routines: drop poll_cadence below 1 ms on U64.
+        # Ignored on VICE (event-based, no polling).
+        run_subroutine(target, 0xC000, timeout=5.0, poll_cadence=0.0005)
+```
+
+The U64 path requires BASIC-READY state (the trampoline is triggered via the keyboard buffer). On U64 timeout, the exception message distinguishes "subroutine never started" (running flag still `0x00`) from "started but never returned" (running flag `0x01`, done flag never `0x02`).
+
+### Threading `lock_timeout` for long parallel benches
+
+`create_manager(lock_timeout=...)` threads through to `_LockedU64Manager` and bounds the wait against **stuck** holders only (a live, progressing holder extends the deadline indefinitely; see `progress_window`). Default 60s is fine for short tests; long benches that hold the device for tens of minutes per acquisition need a higher ceiling so a queued process doesn't time out behind a legitimately-busy peer.
+
+```python
+from c64_test_harness import create_manager
+
+# 30-minute upper bound against stuck holders; live progressing holders
+# still extend the deadline beyond this.
+with create_manager(lock_timeout=1800.0) as mgr:
+    with mgr.instance() as target:
+        ...
+```
+
 ---
 
 ## Pattern 10: Ultimate 64 Hardware Testing
@@ -503,6 +533,26 @@ client.stream_debug_start("239.0.1.66:11002")
 What to use turbo-speed capture for: aggregate statistics that tolerate uniform subsampling (which addresses are hit, hot-path frequency, read/write ratios). What *not* to use it for: call-graph reconstruction, exact cycle counting, transition chains (any read-modify-write, IRQ-entry sequence, or timing-sensitive inspection).
 
 The `multicast_group=` argument on `DebugCapture` is the portable receive path — the U64's default `Stream Debug to` destination is the multicast group `239.0.1.66:11002`. Unicast (`<local-ip>:11002`) only works when the Mac/Linux host and the U64 share an L2 segment; multicast works as long as your switch forwards admin-scoped multicast to the host NIC.
+
+### Recovering from FPGA UDP-rate degradation
+
+The U64E FPGA's debug-stream emitter degrades over time under sustained workload — observed delivery drops to 30–90% of the configured rate after a long run, and only a full `reboot()` restores it (`reset()` is not enough; see issue #81). For multi-routine benches, use `DebugCapture.with_fresh_fpga(client)` to reboot + settle (12s default) and return a freshly-constructed `DebugCapture` ready to `.start()`.
+
+```python
+from c64_test_harness.backends.u64_debug_capture import DebugCapture
+
+for routine in routines:
+    cap = DebugCapture.with_fresh_fpga(
+        client,
+        capture_kwargs={"port": 11002, "multicast_group": "239.0.1.66"},
+    )
+    cap.start()
+    client.stream_debug_start("239.0.1.66:11002")
+    run_routine()
+    result = cap.stop()
+```
+
+This helper never calls `poweroff()` — `reboot()` is the right primitive for clearing FPGA state.
 
 ### Recovering a stuck Ultimate 64
 
