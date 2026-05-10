@@ -30,13 +30,25 @@ CMD_MEM_GET = 0x01
 CMD_MEM_SET = 0x02
 CMD_CHECKPOINT_SET = 0x12
 CMD_CHECKPOINT_DEL = 0x13
+CMD_CONDITION_SET = 0x22
 CMD_REGISTERS_GET = 0x31
 CMD_REGISTERS_SET = 0x32
-CMD_KEYBOARD_FEED = 0x72
+CMD_DUMP = 0x41
+CMD_UNDUMP = 0x42
 CMD_RESOURCE_GET = 0x51
 CMD_RESOURCE_SET = 0x52
+CMD_ADVANCE_INSTRUCTIONS = 0x71
+CMD_KEYBOARD_FEED = 0x72
+CMD_EXECUTE_UNTIL_RETURN = 0x73
+CMD_BANKS_AVAILABLE = 0x82
 CMD_REGS_AVAILABLE = 0x83
+CMD_DISPLAY_GET = 0x84
+CMD_CPUHISTORY_GET = 0x86
+CMD_PALETTE_GET = 0x91
+CMD_JOYPORT_SET = 0xA2
+CMD_USERPORT_SET = 0xB2
 CMD_EXIT = 0xAA
+CMD_RESET = 0xCC
 
 # Event / response types
 EVENT_STOPPED = 0x62
@@ -410,6 +422,65 @@ class BinaryViceTransport:
         resp = self._send_and_recv(CMD_REGISTERS_GET, bytes([0x00]))
         return self._parse_register_response(resp.body)
 
+    def inject_joystick(self, port: int, value: int) -> None:
+        """Inject joystick state. port=1 or 2, value is the joystick byte (bits 0-4 = up/down/left/right/fire)."""
+        if port not in (1, 2):
+            raise ValueError(f"port must be 1 or 2, got {port}")
+        if not (0 <= value <= 0xFFFF):
+            raise ValueError(f"value must fit in u16, got {value}")
+        body = struct.pack("<HH", port, value)
+        self._send_and_recv(CMD_JOYPORT_SET, body)
+
+    def read_framebuffer(self, use_vic: bool = True, format: int = 0) -> dict:
+        """Return raw framebuffer bytes plus geometry. Backend-specific layout — see backend docs."""
+        body = struct.pack("<BB", 0x01 if use_vic else 0x00, format & 0xFF)
+        resp = self._send_and_recv(CMD_DISPLAY_GET, body)
+        data = resp.body
+        if len(data) < 4 + 8 + 4 + 1 + 4:
+            raise TransportError("Display Get response too short")
+        info_len = struct.unpack_from("<I", data, 0)[0]
+        debug_w = struct.unpack_from("<H", data, 4)[0]
+        debug_h = struct.unpack_from("<H", data, 6)[0]
+        inner_x = struct.unpack_from("<H", data, 8)[0]
+        inner_y = struct.unpack_from("<H", data, 10)[0]
+        inner_w = struct.unpack_from("<H", data, 12)[0]
+        inner_h = struct.unpack_from("<H", data, 14)[0]
+        bpp = data[16]
+        buf_off = 4 + info_len
+        if buf_off + 4 > len(data):
+            raise TransportError("Display Get response truncated before buffer length")
+        buf_len = struct.unpack_from("<I", data, buf_off)[0]
+        pixels = data[buf_off + 4:buf_off + 4 + buf_len]
+        return {
+            "debug_rect": (0, 0, debug_w, debug_h),
+            "inner_rect": (inner_x, inner_y, inner_w, inner_h),
+            "bpp": bpp,
+            "palette": 0,
+            "bytes": pixels,
+        }
+
+    def read_palette(self, use_vic: bool = True) -> list[tuple[int, int, int]]:
+        """Return the active VIC palette as RGB triples."""
+        body = bytes([0x01 if use_vic else 0x00])
+        resp = self._send_and_recv(CMD_PALETTE_GET, body)
+        data = resp.body
+        if len(data) < 2:
+            raise TransportError("Palette Get response too short")
+        count = struct.unpack_from("<H", data, 0)[0]
+        off = 2
+        result: list[tuple[int, int, int]] = []
+        for _ in range(count):
+            if off >= len(data):
+                break
+            item_size = data[off]
+            off += 1
+            if off + item_size > len(data):
+                break
+            if item_size >= 3:
+                result.append((data[off], data[off + 1], data[off + 2]))
+            off += item_size
+        return result
+
     def resume(self) -> None:
         """Resume CPU execution by sending the Exit command.
 
@@ -600,6 +671,255 @@ class BinaryViceTransport:
         response = self._text_command("warp")
         return "is on" in response.lower()
 
+    # ----- code-flow / inspection -----
+
+    def single_step(
+        self, count: int = 1, step_over_subroutines: bool = False
+    ) -> None:
+        """Advance the CPU by *count* instructions; waits for the STOPPED event."""
+        if count < 0 or count > 0xFFFF:
+            raise ValueError(f"count must fit in u16, got {count}")
+        body = struct.pack(
+            "<BH", 0x01 if step_over_subroutines else 0x00, count
+        )
+        self._send_and_recv(CMD_ADVANCE_INSTRUCTIONS, body)
+        self.wait_for_stopped()
+
+    def step_out(self) -> None:
+        """Resume execution until the next RTS; waits for STOPPED."""
+        self._send_and_recv(CMD_EXECUTE_UNTIL_RETURN, b"")
+        self.wait_for_stopped()
+
+    def set_condition(self, checkpoint_num: int, expression: str) -> None:
+        """Attach a condition expression to an existing checkpoint."""
+        if not (0 <= checkpoint_num <= 0xFFFFFFFF):
+            raise ValueError(
+                f"checkpoint_num must fit in u32, got {checkpoint_num}"
+            )
+        expr_bytes = expression.encode("ascii")
+        if len(expr_bytes) > 0xFF:
+            raise ValueError(
+                f"expression too long ({len(expr_bytes)} bytes, max 255)"
+            )
+        body = struct.pack("<IB", checkpoint_num, len(expr_bytes)) + expr_bytes
+        self._send_and_recv(CMD_CONDITION_SET, body)
+
+    def cpu_history(
+        self, count: int = 16, memspace: int = 0
+    ) -> list[dict]:
+        """Return up to *count* recent CPU history records (VICE 3.10+)."""
+        if count < 0 or count > 0xFFFFFFFF:
+            raise ValueError(f"count must fit in u32, got {count}")
+        body = struct.pack("<BI", memspace & 0xFF, count)
+        resp = self._send_and_recv(CMD_CPUHISTORY_GET, body)
+        data = resp.body
+        if len(data) < 4:
+            return []
+        record_count = struct.unpack_from("<I", data, 0)[0]
+        off = 4
+        records: list[dict] = []
+        for _ in range(record_count):
+            if off >= len(data):
+                break
+            item_size = data[off]
+            off += 1
+            if off + item_size > len(data):
+                break
+            entry = data[off:off + item_size]
+            off += item_size
+            rec = self._parse_cpu_history_entry(entry)
+            if rec is not None:
+                records.append(rec)
+        return records
+
+    def banks_available(self) -> list[tuple[int, str]]:
+        """Return the list of (bank_id, name) pairs available in main memspace."""
+        resp = self._send_and_recv(CMD_BANKS_AVAILABLE, b"")
+        data = resp.body
+        if len(data) < 2:
+            return []
+        count = struct.unpack_from("<H", data, 0)[0]
+        off = 2
+        result: list[tuple[int, str]] = []
+        for _ in range(count):
+            if off >= len(data):
+                break
+            item_size = data[off]
+            off += 1
+            if off + item_size > len(data):
+                break
+            if item_size < 3:
+                off += item_size
+                continue
+            bank_id = struct.unpack_from("<H", data, off)[0]
+            name_len = data[off + 2]
+            name = data[off + 3:off + 3 + name_len].decode(
+                "ascii", errors="replace"
+            )
+            off += item_size
+            result.append((bank_id, name))
+        return result
+
+    def registers_available(self, memspace: int = 0) -> list[dict]:
+        """Return register descriptors: [{id, size_bits, name}, ...]."""
+        body = bytes([memspace & 0xFF])
+        resp = self._send_and_recv(CMD_REGS_AVAILABLE, body)
+        data = resp.body
+        if len(data) < 2:
+            return []
+        count = struct.unpack_from("<H", data, 0)[0]
+        off = 2
+        result: list[dict] = []
+        for _ in range(count):
+            if off >= len(data):
+                break
+            item_size = data[off]
+            off += 1
+            if off + item_size > len(data):
+                break
+            if item_size < 3:
+                off += item_size
+                continue
+            reg_id = data[off]
+            size_bits = data[off + 1]
+            name_len = data[off + 2]
+            name = data[off + 3:off + 3 + name_len].decode(
+                "ascii", errors="replace"
+            )
+            off += item_size
+            result.append({"id": reg_id, "size_bits": size_bits, "name": name})
+        return result
+
+    # ----- I/O injection -----
+
+    def inject_userport(self, value: int) -> None:
+        """Drive the userport with *value* (u16)."""
+        if not (0 <= value <= 0xFFFF):
+            raise ValueError(f"value must fit in u16, got {value}")
+        body = struct.pack("<H", value)
+        self._send_and_recv(CMD_USERPORT_SET, body)
+
+    # ----- snapshots / state -----
+
+    def dump_snapshot(
+        self,
+        filename: str,
+        save_roms: bool = False,
+        save_disks: bool = True,
+    ) -> None:
+        """Write a VICE snapshot to *filename* on the host filesystem."""
+        name_bytes = filename.encode("utf-8")
+        if len(name_bytes) > 0xFF:
+            raise ValueError(
+                f"filename too long ({len(name_bytes)} bytes, max 255)"
+            )
+        body = struct.pack(
+            "<BBB",
+            0x01 if save_roms else 0x00,
+            0x01 if save_disks else 0x00,
+            len(name_bytes),
+        ) + name_bytes
+        self._send_and_recv(CMD_DUMP, body)
+
+    def undump_snapshot(self, filename: str) -> int:
+        """Restore a VICE snapshot from *filename* and return the new PC."""
+        name_bytes = filename.encode("utf-8")
+        if len(name_bytes) > 0xFF:
+            raise ValueError(
+                f"filename too long ({len(name_bytes)} bytes, max 255)"
+            )
+        body = struct.pack("<B", len(name_bytes)) + name_bytes
+        resp = self._send_and_recv(CMD_UNDUMP, body)
+        if len(resp.body) < 2:
+            raise TransportError("Undump response too short")
+        return struct.unpack_from("<H", resp.body, 0)[0]
+
+    # ----- reset -----
+
+    def reset(self, reset_type: int = 0) -> None:
+        """Reset the machine. type 0=soft, 1=hard, 8..11=drive 0..3."""
+        if reset_type not in (0, 1, 8, 9, 10, 11):
+            raise ValueError(
+                f"reset_type must be 0,1,8,9,10,11; got {reset_type}"
+            )
+        self._send_and_recv(CMD_RESET, bytes([reset_type]))
+
+    # ----- text-monitor extras -----
+
+    def detach_drive(self, device: int) -> None:
+        """Detach the image attached to *device* (1=tape, 8..11=drives)."""
+        if device not in (1, 8, 9, 10, 11):
+            raise ValueError(
+                f"device must be 1, 8, 9, 10 or 11; got {device}"
+            )
+        if self._text_sock is None:
+            raise TransportError(
+                "detach_drive requires text monitor connection "
+                "(set text_monitor_port when constructing transport)"
+            )
+        self._text_command(f"detach {device}")
+
+    def attach_drive(
+        self, device: int, image_path: str, read_only: bool = False
+    ) -> None:
+        """Attach *image_path* to *device* without auto-running it."""
+        if device not in (1, 8, 9, 10, 11):
+            raise ValueError(
+                f"device must be 1, 8, 9, 10 or 11; got {device}"
+            )
+        if self._text_sock is None:
+            raise TransportError(
+                "attach_drive requires text monitor connection "
+                "(set text_monitor_port when constructing transport)"
+            )
+        self._text_command(f'attach "{image_path}" {device}')
+
+    def screenshot_to_file(self, filename: str, format: str = "png") -> None:
+        """Have VICE write a screenshot to *filename* in the given format."""
+        if self._text_sock is None:
+            raise TransportError(
+                "screenshot_to_file requires text monitor connection "
+                "(set text_monitor_port when constructing transport)"
+            )
+        self._text_command(f'screenshot "{filename}" {format}')
+
+    def profile_start(self, mode: str = "on") -> None:
+        """Start the VICE profiler. mode is one of {on, ...}."""
+        if mode not in ("on", "off", "flat", "graph", "func", "disass", "context", "clear"):
+            raise ValueError(
+                f"mode must be one of on/off/flat/graph/func/disass/"
+                f"context/clear; got {mode!r}"
+            )
+        if self._text_sock is None:
+            raise TransportError(
+                "profile_start requires text monitor connection "
+                "(set text_monitor_port when constructing transport)"
+            )
+        self._text_command(f"profile {mode}")
+
+    def profile_stop(self) -> None:
+        """Stop the VICE profiler."""
+        if self._text_sock is None:
+            raise TransportError(
+                "profile_stop requires text monitor connection "
+                "(set text_monitor_port when constructing transport)"
+            )
+        self._text_command("profile off")
+
+    def profile_dump(self, mode: str = "flat") -> str:
+        """Return the captured profiler output for *mode*."""
+        if mode not in ("flat", "graph", "func", "disass", "context", "clear"):
+            raise ValueError(
+                f"mode must be one of flat/graph/func/disass/context/"
+                f"clear; got {mode!r}"
+            )
+        if self._text_sock is None:
+            raise TransportError(
+                "profile_dump requires text monitor connection "
+                "(set text_monitor_port when constructing transport)"
+            )
+        return self._text_command(f"profile {mode}")
+
     # ----- internal helpers -----
 
     def _parse_stopped_event(self, event: _Response) -> int:
@@ -644,3 +964,58 @@ class BinaryViceTransport:
                 regs[name] = value
 
         return regs
+
+    def _parse_cpu_history_entry(self, entry: bytes) -> dict | None:
+        """Decode one CPU history entry (defensive about layout drift).
+
+        VICE's per-entry layout is:
+          register_count(2 LE) +
+          register_count * (item_size(1) + reg_id(1) + value(...)) +
+          cycle(8 LE) + instr_len(1) + opcode + up to 3 operand bytes
+        Older builds and non-mainline forks have shipped slightly different
+        records, so anything that cannot be parsed cleanly returns None.
+        """
+        if len(entry) < 2:
+            return None
+        regs: dict[str, int] = {}
+        reg_count = struct.unpack_from("<H", entry, 0)[0]
+        off = 2
+        id_to_name: dict[int, str] = {
+            rid: name for name, (rid, _) in self._reg_map.items()
+        }
+        for _ in range(reg_count):
+            if off >= len(entry):
+                return None
+            item_size = entry[off]
+            off += 1
+            if off + item_size > len(entry):
+                return None
+            if item_size >= 1:
+                rid = entry[off]
+                val = int.from_bytes(
+                    entry[off + 1:off + item_size], "little"
+                )
+                name = id_to_name.get(rid)
+                if name is not None:
+                    regs[name] = val
+            off += item_size
+        cycle = 0
+        if off + 8 <= len(entry):
+            cycle = struct.unpack_from("<Q", entry, off)[0]
+            off += 8
+        instr_len = 0
+        if off < len(entry):
+            instr_len = entry[off]
+            off += 1
+        instr_bytes = entry[off:off + min(instr_len, 4)]
+        return {
+            "cycle": cycle,
+            "pc": regs.get("PC", 0),
+            "a": regs.get("A", 0),
+            "x": regs.get("X", 0),
+            "y": regs.get("Y", 0),
+            "sp": regs.get("SP", 0),
+            "sr": regs.get("FL", regs.get("FLAGS", regs.get("SR", 0))),
+            "instruction": bytes(instr_bytes),
+            "registers": regs,
+        }
