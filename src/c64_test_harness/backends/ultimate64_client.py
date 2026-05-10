@@ -114,7 +114,31 @@ class Ultimate64Client:
         password: str | None = None,
         port: int = 80,
         timeout: float = 10.0,
+        *,
+        write_mem_query_threshold: int | None = None,
     ) -> None:
+        """Construct an Ultimate64 REST client.
+
+        :param host: device hostname or IP.
+        :param password: ``X-Password`` header value (optional).
+        :param port: HTTP port (default 80).
+        :param timeout: per-request socket timeout in seconds.
+        :param write_mem_query_threshold: payload-size cutoff (in bytes)
+            at which :meth:`write_mem` switches from the legacy
+            ``PUT ?data=<hex>`` form to the ``POST`` raw-byte form. If
+            ``None`` (the default), the threshold is auto-detected from
+            the device's firmware version on first construction:
+
+            * fw ``3.14*`` (incl. 3.14d) → **128**. The 48..127 range over
+              the POST path occasionally wedges the runner on this fw,
+              so the higher threshold pushes everything below 128 onto
+              the reliable PUT-with-hex path.
+            * any other / unknown fw → **48** (conservative legacy default).
+
+            If the firmware probe (``get_info()``) fails for any reason,
+            the threshold falls back to 48 silently — construction never
+            raises on probe failure.
+        """
         if not isinstance(host, str) or not host:
             raise ValueError("host must be a non-empty string")
         if port <= 0 or port > 65535:
@@ -127,9 +151,39 @@ class Ultimate64Client:
         self.timeout = timeout
         self._base = f"http://{host}:{port}" if port != 80 else f"http://{host}"
 
+        if write_mem_query_threshold is not None:
+            self.write_mem_query_threshold = int(write_mem_query_threshold)
+        else:
+            self.write_mem_query_threshold = self._autodetect_write_mem_threshold()
+
     def close(self) -> None:
         """No-op — the client is stateless (uses a fresh connection per call)."""
         return None
+
+    #: Bounded timeout (seconds) for the construct-time firmware probe
+    #: used by :meth:`_autodetect_write_mem_threshold`. Decoupled from
+    #: the per-request ``timeout`` so an unreachable host doesn't stall
+    #: ``__init__`` for the full default.
+    _AUTODETECT_PROBE_TIMEOUT: float = 0.5
+
+    def _autodetect_write_mem_threshold(self) -> int:
+        original = self.timeout
+        self.timeout = min(self._AUTODETECT_PROBE_TIMEOUT, original)
+        try:
+            info = self.get_info()
+        except Exception:
+            return self.WRITE_MEM_QUERY_THRESHOLD
+        finally:
+            self.timeout = original
+        if not isinstance(info, dict):
+            return self.WRITE_MEM_QUERY_THRESHOLD
+        fw = info.get("firmware_version")
+        if not isinstance(fw, str):
+            return self.WRITE_MEM_QUERY_THRESHOLD
+        normalised = fw.lstrip("Vv").lower()
+        if normalised.startswith("3.14"):
+            return 128
+        return self.WRITE_MEM_QUERY_THRESHOLD
 
     # ----------------------------------------------------------------- internal
     def _url(self, path: str) -> str:
@@ -369,11 +423,11 @@ class Ultimate64Client:
         _, data = self._request("GET", "/v1/machine:readmem", query=query)
         return data
 
-    #: Raw-byte threshold above which :meth:`write_mem` switches from the
-    #: legacy ``PUT ?data=<hex>`` form to the ``POST`` with raw-byte body.
-    #: The device caps the ``data=`` query field at 128 hex chars (= 64 raw
-    #: bytes); we trigger POST conservatively below that to leave room for
-    #: other query encoding (address=, etc.).
+    #: Class-level fallback for the raw-byte threshold above which
+    #: :meth:`write_mem` switches from the legacy ``PUT ?data=<hex>`` form
+    #: to the ``POST`` raw-byte form. Per-instance ``write_mem_query_threshold``
+    #: (set in ``__init__``) takes precedence; this attribute is retained
+    #: for backwards compatibility with callers that poke the class.
     WRITE_MEM_QUERY_THRESHOLD: int = 48
 
     def write_mem(self, address: int, data: bytes) -> None:
@@ -381,9 +435,11 @@ class Ultimate64Client:
 
         Uses one of two wire forms depending on payload size:
 
-        * **Small payloads** (``len(data) <= WRITE_MEM_QUERY_THRESHOLD``,
-          48 bytes) — ``PUT /v1/machine:writemem?address=0xNNNN&data=<hex>``.
-          Kept for backwards compatibility with existing callers/mocks.
+        * **Small payloads**
+          (``len(data) <= self.write_mem_query_threshold``, default 48
+          bytes; auto-bumped to 128 on firmware 3.14*) —
+          ``PUT /v1/machine:writemem?address=0xNNNN&data=<hex>``.  Kept
+          for backwards compatibility with existing callers/mocks.
         * **Large payloads** — ``POST /v1/machine:writemem?address=0xNNNN``
           with the raw bytes as the request body
           (``Content-Type: application/octet-stream``). Required for
@@ -402,7 +458,7 @@ class Ultimate64Client:
         if not data:
             return
         payload = bytes(data)
-        if len(payload) <= self.WRITE_MEM_QUERY_THRESHOLD:
+        if len(payload) <= self.write_mem_query_threshold:
             query = {
                 "address": "0x%04X" % address,
                 "data": payload.hex().upper(),
@@ -418,6 +474,67 @@ class Ultimate64Client:
                 query={"address": "0x%04X" % address},
             )
 
+    # ------------------------------------------------------------ keyboard
+    #: KERNAL keyboard buffer base address ($0277).
+    KEYBUF_ADDR: int = 0x0277
+    #: KERNAL keyboard buffer fill-count byte ($00C6).
+    KEYBUF_COUNT_ADDR: int = 0x00C6
+    #: C64 keyboard buffer hardware capacity (10 bytes).
+    KEYBUF_MAX: int = 10
+
+    def send_text(self, text: str, *, finish_with_return: bool = True) -> None:
+        """Inject *text* as a sequence of keystrokes into the C64 keyboard buffer.
+
+        Convenience wrapper that PETSCII-encodes *text* and writes the
+        bytes into the KERNAL keyboard buffer at ``$0277`` (with the
+        fill-count byte at ``$00C6``).  When *finish_with_return* is
+        True (the default), a trailing CR (PETSCII ``0x0D``) is
+        appended — the canonical pattern for triggering a BASIC command
+        such as ``"SYS 864"`` after :meth:`run_prg` lands at READY.
+
+        Two trigger patterns for U64 PRGs:
+
+        1. **Hijack an existing parking JMP** in the PRG — no
+           ``send_text`` needed; ``run_prg`` alone fires the entry.
+        2. **Type a SYS** — call ``send_text("SYS <trampoline>")`` after
+           ``run_prg`` returns BASIC to READY.  This is the canonical
+           shape for library-only PRGs that have no native main loop.
+
+        For longer strings the buffer's 10-byte hardware limit is
+        respected: the call polls ``$00C6`` and waits for the KERNAL
+        scan loop to drain the buffer before pushing the next chunk.
+        """
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        # Local import keeps the encoding module out of the import-time graph.
+        from ..encoding.petscii import char_to_petscii
+
+        codes = [char_to_petscii(ch) for ch in text]
+        if finish_with_return:
+            codes.append(0x0D)
+        if not codes:
+            return
+
+        remaining = list(codes)
+        max_iters = len(remaining) * 4 + 16
+        iters = 0
+        while remaining:
+            iters += 1
+            if iters > max_iters:
+                raise Ultimate64Error(
+                    "send_text: keyboard buffer never drained "
+                    f"(still {len(remaining)} keys pending)"
+                )
+            count_byte = self.read_mem(self.KEYBUF_COUNT_ADDR, 1)
+            current = count_byte[0] if count_byte else 0
+            free = self.KEYBUF_MAX - current
+            if free <= 0:
+                continue
+            chunk = remaining[:free]
+            remaining = remaining[free:]
+            self.write_mem(self.KEYBUF_ADDR + current, bytes(chunk))
+            self.write_mem(self.KEYBUF_COUNT_ADDR, bytes([current + len(chunk)]))
+
     # ------------------------------------------------------------ code runners
     def load_prg(self, data: bytes) -> None:
         """POST /v1/runners:load_prg — load a PRG into memory (DESTRUCTIVE).
@@ -426,7 +543,7 @@ class Ultimate64Client:
         """
         self._post_binary("/v1/runners:load_prg", data)
 
-    def run_prg(self, data: bytes) -> None:
+    def run_prg(self, data: bytes, *, fallback_on_404: bool = True) -> None:
         """POST /v1/runners:run_prg — load and RUN a PRG (DESTRUCTIVE).
 
         Firmware 3.14 requires POST (PUT returns 400).
@@ -444,6 +561,16 @@ class Ultimate64Client:
           ``ultimate64_helpers.runner_health_check()``; clear via
           ``ultimate64_helpers.recover()`` (soft reset, escalates to
           ``reboot()`` if needed).
+        * **HTTP 404 on fw 3.14d** — after certain non-PRG load
+          sequences the runner endpoint starts returning 404 until the
+          device is rebooted.  When ``fallback_on_404=True`` (the
+          default), the call transparently retries by sideloading the
+          PRG body via :meth:`write_mem` (using the load address from
+          the PRG's first two header bytes, little-endian) and then
+          triggering with :meth:`send_text` (``"SYS <addr>\\r"``).  A
+          ``logging.warning`` is emitted when the fallback fires.  Pass
+          ``fallback_on_404=False`` to surface the 404 as a plain
+          :class:`Ultimate64Error`.
         * **Device unreachable** — raised as ``Ultimate64TimeoutError``.
           Use ``recover()`` first; if that raises
           ``Ultimate64UnreachableError`` the device needs a physical
@@ -453,7 +580,24 @@ class Ultimate64Client:
         the device unreachable until someone physically power-cycles it.
         ``reboot()`` (via ``recover()``) is the correct escalation.
         """
-        self._post_binary("/v1/runners:run_prg", data)
+        try:
+            self._post_binary("/v1/runners:run_prg", data)
+        except Ultimate64Error as exc:
+            if not (fallback_on_404 and exc.status == 404):
+                raise
+            if not isinstance(data, (bytes, bytearray)) or len(data) < 2:
+                raise
+            load_addr = data[0] | (data[1] << 8)
+            body = bytes(data[2:])
+            _log.warning(
+                "run_prg got HTTP 404 from /v1/runners:run_prg; "
+                "falling back to writemem+SYS sideload at $%04X "
+                "(fw 3.14d wedged-runner workaround)",
+                load_addr,
+            )
+            if body:
+                self.write_mem(load_addr, body)
+            self.send_text(f"SYS {load_addr}", finish_with_return=True)
 
     def run_crt(self, data: bytes) -> None:
         """POST /v1/runners:run_crt — start a cartridge image (DESTRUCTIVE).
