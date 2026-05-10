@@ -23,6 +23,13 @@ Reusable test harness for Commodore 64 programs. Automates C64 programs via the 
 - **Audio capture** — headless WAV recording via VICE (`render_wav()`) and U64 UDP audio stream (`capture_sid_u64()`, `AudioCapture`)
 - **U64 data streams** — cycle-accurate 6510/VIC bus trace (`DebugCapture`), VIC-II video frame capture (`VideoCapture`), audio capture — all over UDP with gap detection
 - **Runtime warp toggle** — enable/disable VICE warp mode at runtime via dual-monitor (binary + text); `resource_get`/`resource_set` for general VICE resource control
+- **VICE single-step / snapshots / trace** — `single_step` / `step_out`, conditional breakpoints (`set_condition`), instruction history (`cpu_history`, VICE 3.10+), `dump_snapshot`/`undump_snapshot`, `banks_available` / `registers_available` introspection
+- **VICE input simulation & display capture** — `inject_joystick`, `inject_userport`; `read_framebuffer` + `read_palette` for raw VIC capture
+- **VICE deterministic test setup** — `ViceConfig.load_snapshot`, event recording / replay (`event_recording_start`, `event_image`, `event_snapshot_mode`/`_dir`), `seed` for RNG, `sound_record_driver`/`_file`, `exit_screenshot`
+- **VICE text-monitor extras** — `detach_drive`, `attach_drive`, `screenshot_to_file`, 6502 profiler (`profile_start`/`profile_stop`/`profile_dump`)
+- **U64 drive & disk fixtures** — `drive_on/off/reset/set_mode/load_rom`, `create_d64/d71/d81/dnp` blank-image creation, `file_info`, `get_debug_register`/`set_debug_register` ($D7FF), `measure_bus_timing` (VCD), batch `set_config_items_batch`
+- **U64 SocketDMA client** — `SocketDMAClient` on TCP 64 wraps capabilities REST does not expose: `inject_keys`, `reu_write`, `dma_load`/`dma_jump`/`dma_write`, `reset`, plus UDP identify-broadcast for LAN device discovery
+- **U64 syslog listener** — `U64SyslogListener` consumes UDP 514 raw-line syslog from the firmware; `wait_for(predicate)` for assertion-driven tests
 - **Flexible configuration** — `HarnessConfig` with TOML file and environment variable support
 
 ## Getting started (fresh Ubuntu 25 machine)
