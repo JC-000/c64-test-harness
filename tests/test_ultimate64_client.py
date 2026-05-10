@@ -817,3 +817,146 @@ def test_set_config_items_batch_validates_inputs():
         c.set_config_items_batch({"": {"x": 1}})
     with pytest.raises(TypeError):
         c.set_config_items_batch({"cat": "not-a-dict"})  # type: ignore[dict-item]
+
+
+# ---------------------------------------------------------------- send_text
+def test_send_text_appends_return():
+    """send_text() PETSCII-encodes the text and writes a trailing 0x0D."""
+    c = Ultimate64Client("h")
+    writes: list[tuple[int, bytes]] = []
+    reads: list[tuple[int, int]] = []
+
+    def fake_read(addr: int, length: int) -> bytes:
+        reads.append((addr, length))
+        return b"\x00"  # buffer always empty
+
+    def fake_write(addr: int, data: bytes) -> None:
+        writes.append((addr, bytes(data)))
+
+    with patch.object(c, "read_mem", side_effect=fake_read), \
+         patch.object(c, "write_mem", side_effect=fake_write):
+        c.send_text("AB")
+
+    # Two writes per chunk: payload to $0277, count byte to $00C6.
+    payload_writes = [w for w in writes if w[0] == Ultimate64Client.KEYBUF_ADDR]
+    assert len(payload_writes) == 1
+    payload = payload_writes[0][1]
+    # "AB" + CR
+    assert payload == bytes([0x41, 0x42, 0x0D])
+    count_writes = [w for w in writes if w[0] == Ultimate64Client.KEYBUF_COUNT_ADDR]
+    assert count_writes[-1][1] == bytes([3])
+
+
+def test_send_text_no_return_when_disabled():
+    """finish_with_return=False omits the trailing 0x0D byte."""
+    c = Ultimate64Client("h")
+    writes: list[tuple[int, bytes]] = []
+
+    def fake_read(addr: int, length: int) -> bytes:
+        return b"\x00"
+
+    def fake_write(addr: int, data: bytes) -> None:
+        writes.append((addr, bytes(data)))
+
+    with patch.object(c, "read_mem", side_effect=fake_read), \
+         patch.object(c, "write_mem", side_effect=fake_write):
+        c.send_text("AB", finish_with_return=False)
+
+    payload_writes = [w for w in writes if w[0] == Ultimate64Client.KEYBUF_ADDR]
+    assert len(payload_writes) == 1
+    assert payload_writes[0][1] == bytes([0x41, 0x42])
+    assert 0x0D not in payload_writes[0][1]
+
+
+# ---------------------------------------------------------------- run_prg fallback
+def test_run_prg_falls_back_on_404(caplog):
+    """On 404, run_prg sideloads via write_mem + send_text("SYS <addr>")."""
+    import logging
+
+    c = Ultimate64Client("h")
+    # PRG load address $0360 = 864 (the canonical "tape buffer" trampoline).
+    prg = bytes([0x60, 0x03]) + b"\xAA\xBB\xCC"
+
+    write_mem_calls: list[tuple[int, bytes]] = []
+    send_text_calls: list[tuple[str, bool]] = []
+
+    def fake_post_binary(path, data, query=None):
+        # Mimic the firmware 404 by raising the matching client exception.
+        raise Ultimate64Error(f"POST {path} returned HTTP 404", status=404)
+
+    def fake_write_mem(addr: int, data: bytes) -> None:
+        write_mem_calls.append((addr, bytes(data)))
+
+    def fake_send_text(text: str, *, finish_with_return: bool = True) -> None:
+        send_text_calls.append((text, finish_with_return))
+
+    with patch.object(c, "_post_binary", side_effect=fake_post_binary), \
+         patch.object(c, "write_mem", side_effect=fake_write_mem), \
+         patch.object(c, "send_text", side_effect=fake_send_text), \
+         caplog.at_level(logging.WARNING, logger="c64_test_harness.backends.ultimate64_client"):
+        c.run_prg(prg)
+
+    assert write_mem_calls == [(0x0360, b"\xAA\xBB\xCC")]
+    assert send_text_calls == [("SYS 864", True)]
+    assert any("404" in r.message and "fallback" not in r.message.lower() or
+               "writemem" in r.message for r in caplog.records)
+
+
+def test_run_prg_fallback_disabled():
+    """fallback_on_404=False surfaces the 404 instead of side-loading."""
+    c = Ultimate64Client("h")
+    prg = bytes([0x60, 0x03]) + b"\xAA"
+
+    def fake_post_binary(path, data, query=None):
+        raise Ultimate64Error("POST 404", status=404)
+
+    sent_texts: list[str] = []
+
+    def fake_send_text(*a, **k):
+        sent_texts.append("called")
+
+    with patch.object(c, "_post_binary", side_effect=fake_post_binary), \
+         patch.object(c, "send_text", side_effect=fake_send_text):
+        with pytest.raises(Ultimate64Error) as ei:
+            c.run_prg(prg, fallback_on_404=False)
+    assert ei.value.status == 404
+    assert sent_texts == []
+
+
+# ---------------------------------------------------------------- write_mem threshold
+def test_write_mem_threshold_autodetect_3_14d():
+    """fw 3.14d auto-detects to 128, not the conservative 48 default."""
+    mock, _ = _capture(b'{"firmware_version":"V3.14d","product":"Ultimate 64"}')
+    with patch("urllib.request.urlopen", mock):
+        c = Ultimate64Client("h")
+        # The property is lazy; resolve it inside the patch context.
+        assert c.write_mem_query_threshold == 128
+
+
+def test_write_mem_threshold_autodetect_other():
+    """Unknown / non-3.14 firmware keeps 48."""
+    mock, _ = _capture(b'{"firmware_version":"V3.13","product":"Ultimate 64"}')
+    with patch("urllib.request.urlopen", mock):
+        c = Ultimate64Client("h")
+        assert c.write_mem_query_threshold == 48
+
+
+def test_write_mem_threshold_kwarg_override():
+    """Explicit kwarg wins over autodetect (no probe issued)."""
+    mock, captured = _capture(b'{"firmware_version":"V3.14d"}')
+    with patch("urllib.request.urlopen", mock):
+        c = Ultimate64Client("h", write_mem_query_threshold=64)
+        # Reading the threshold must not consume HTTP traffic.
+        assert c.write_mem_query_threshold == 64
+    assert captured == []
+
+
+def test_write_mem_threshold_probe_failure_falls_back():
+    """If get_info() raises during the probe, threshold falls back to 48."""
+    def _raise(req, timeout=None):
+        raise urllib.error.URLError("connection refused")
+
+    with patch("urllib.request.urlopen", side_effect=_raise):
+        c = Ultimate64Client("h")
+        # Construction must not raise; resolving the property must not raise.
+        assert c.write_mem_query_threshold == 48
