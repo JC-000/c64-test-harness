@@ -177,7 +177,7 @@ class TestU64Backend:
     def test_creates_u64_manager(self, mock_build: MagicMock) -> None:
         mock_build.return_value = MagicMock()
         mgr = UnifiedManager(backend="u64", u64_hosts="10.0.0.1")
-        mock_build.assert_called_once_with("10.0.0.1", None)
+        mock_build.assert_called_once_with("10.0.0.1", None, lock_timeout=60.0)
         assert mgr.backend == "u64"
 
     @patch("c64_test_harness.backends.unified_manager.UnifiedManager._build_u64_manager")
@@ -204,7 +204,7 @@ class TestU64Backend:
         mock_build.return_value = MagicMock()
         with patch.dict(os.environ, {"U64_PASSWORD": "secret"}):
             UnifiedManager(backend="u64", u64_hosts="10.0.0.1")
-        mock_build.assert_called_once_with("10.0.0.1", None)
+        mock_build.assert_called_once_with("10.0.0.1", None, lock_timeout=60.0)
 
 
 # ---------------------------------------------------------------------------
@@ -436,3 +436,119 @@ class TestLockedU64Manager:
             result = UnifiedManager._build_u64_manager(["10.0.0.1"], None)
 
         assert isinstance(result, _LockedU64Manager)
+
+
+# ---------------------------------------------------------------------------
+# TestTarget.client accessor (issue #76)
+# ---------------------------------------------------------------------------
+
+class TestTargetClientAccessor:
+    """The public client property is U64-only."""
+
+    def test_target_client_accessor_u64(self) -> None:
+        from c64_test_harness.backends.ultimate64 import Ultimate64Transport
+
+        transport = MagicMock(spec=Ultimate64Transport)
+        sentinel_client = MagicMock(name="Ultimate64Client")
+        transport._client = sentinel_client
+
+        target = TestTarget(transport=transport, backend="u64", pid=None)
+        assert target.client is sentinel_client
+
+    def test_target_client_accessor_vice_raises(self) -> None:
+        # A bare MagicMock is not an Ultimate64Transport instance.
+        target = TestTarget(transport=MagicMock(), backend="vice", pid=42)
+        with pytest.raises(
+            AttributeError,
+            match="client accessor is U64-only; this target is VICE-backed",
+        ):
+            target.client
+
+
+# ---------------------------------------------------------------------------
+# create_manager threads lock_timeout (issue #77)
+# ---------------------------------------------------------------------------
+
+class TestCreateManagerLockTimeout:
+    @patch("c64_test_harness.backends.unified_manager.UnifiedManager._build_u64_manager")
+    def test_create_manager_threads_lock_timeout(
+        self, mock_build: MagicMock,
+    ) -> None:
+        mock_build.return_value = MagicMock()
+        create_manager(backend="u64", u64_hosts="10.0.0.1", lock_timeout=1234.5)
+        mock_build.assert_called_once_with(
+            "10.0.0.1", None, lock_timeout=1234.5,
+        )
+
+    @patch("c64_test_harness.backends.unified_manager.DeviceLock")
+    @patch(
+        "c64_test_harness.backends.unified_manager.Ultimate64InstanceManager",
+        create=True,
+    )
+    @patch(
+        "c64_test_harness.backends.unified_manager.Ultimate64Device",
+        create=True,
+    )
+    def test_lock_timeout_reaches_locked_manager(
+        self,
+        MockDevice: MagicMock,
+        MockU64Mgr: MagicMock,
+        MockDeviceLock: MagicMock,
+    ) -> None:
+        with patch(
+            "c64_test_harness.backends.unified_manager._HAS_DEVICE_LOCK", True,
+        ):
+            result = UnifiedManager._build_u64_manager(
+                ["10.0.0.1"], None, lock_timeout=999.0,
+            )
+        assert isinstance(result, _LockedU64Manager)
+        assert result._lock_timeout == 999.0
+
+
+# ---------------------------------------------------------------------------
+# Bare acquire/release round-trip (issue #79)
+# ---------------------------------------------------------------------------
+
+class TestBareAcquireReleaseRoundTrip:
+    @patch("c64_test_harness.backends.unified_manager.ViceInstanceManager")
+    def test_bare_acquire_release_round_trip_vice(
+        self, mock_vim_cls: MagicMock,
+    ) -> None:
+        mock_inst = _make_mock_vice_instance()
+        mock_vim_cls.return_value.acquire.return_value = mock_inst
+
+        mgr = UnifiedManager(backend="vice")
+        target = mgr.acquire()
+        # Must NOT raise — regression for #79.
+        mgr.release(target)
+
+        mock_vim_cls.return_value.release.assert_called_once_with(mock_inst)
+
+    @patch("c64_test_harness.backends.unified_manager.UnifiedManager._build_u64_manager")
+    def test_bare_acquire_release_round_trip_u64(
+        self, mock_build: MagicMock,
+    ) -> None:
+        mock_inst = _make_mock_u64_instance()
+        mock_mgr = MagicMock()
+        mock_mgr.acquire.return_value = mock_inst
+        mock_build.return_value = mock_mgr
+
+        mgr = UnifiedManager(backend="u64", u64_hosts="10.0.0.1")
+        target = mgr.acquire()
+        mgr.release(target)
+
+        mock_mgr.release.assert_called_once_with(mock_inst)
+
+    @patch("c64_test_harness.backends.unified_manager.ViceInstanceManager")
+    def test_instance_context_manager_unaffected(
+        self, mock_vim_cls: MagicMock,
+    ) -> None:
+        mock_inst = _make_mock_vice_instance()
+        mock_vim_cls.return_value.acquire.return_value = mock_inst
+
+        mgr = UnifiedManager(backend="vice")
+        with mgr.instance() as target:
+            assert isinstance(target, TestTarget)
+            assert target.backend == "vice"
+
+        mock_vim_cls.return_value.release.assert_called_once_with(mock_inst)
