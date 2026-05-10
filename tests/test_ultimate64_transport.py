@@ -36,6 +36,13 @@ def test_protocol_conformance(transport: Ultimate64Transport) -> None:
     assert isinstance(transport, C64Transport)
 
 
+def test_client_property_returns_underlying_client(
+    transport: Ultimate64Transport, mock_client: MagicMock
+) -> None:
+    assert transport.client is mock_client
+    assert transport.client is transport._client
+
+
 def test_read_memory_delegates(transport: Ultimate64Transport, mock_client: MagicMock) -> None:
     mock_client.read_mem.return_value = b"\x01\x02\x03"
     result = transport.read_memory(0x1000, 3)
