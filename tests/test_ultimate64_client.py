@@ -567,3 +567,253 @@ def test_timeout_passed_to_urlopen():
     with patch("urllib.request.urlopen", mock):
         c.get_info()
     assert captured[0][1] == 2.5
+
+
+# ---------------------------------------------------------------- drive control
+def test_drive_on_off_reset_urls():
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        c.drive_on("a")
+        c.drive_off("a")
+        c.drive_reset("b")
+    urls = [r[0].get_full_url() for r in captured]
+    assert urls == [
+        "http://h/v1/drives/a%3A:on",
+        "http://h/v1/drives/a%3A:off",
+        "http://h/v1/drives/b%3A:reset",
+    ]
+    assert all(r[0].get_method() == "PUT" for r in captured)
+    assert all(r[0].data is None for r in captured)
+
+
+def test_drive_remove_disk_and_unlink_urls():
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        c.drive_remove_disk("a")
+        c.drive_unlink("b")
+    urls = [r[0].get_full_url() for r in captured]
+    assert urls == [
+        "http://h/v1/drives/a%3A:remove",
+        "http://h/v1/drives/b%3A:unlink",
+    ]
+
+
+def test_drive_set_mode_url_and_query():
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        c.drive_set_mode("a", "1581")
+    req = captured[0][0]
+    assert req.get_method() == "PUT"
+    assert req.get_full_url() == "http://h/v1/drives/a%3A:set_mode?mode=1581"
+    assert req.data is None
+
+
+def test_drive_set_mode_rejects_invalid_mode():
+    c = Ultimate64Client("h")
+    with pytest.raises(ValueError):
+        c.drive_set_mode("a", "1551")
+
+
+def test_drive_methods_reject_invalid_drive():
+    c = Ultimate64Client("h")
+    for fn in (c.drive_on, c.drive_off, c.drive_reset, c.drive_remove_disk, c.drive_unlink):
+        with pytest.raises(ValueError):
+            fn("c")
+    with pytest.raises(ValueError):
+        c.drive_set_mode("c", "1541")
+
+
+def test_drive_load_rom_with_bytes_uses_multipart_put():
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        c.drive_load_rom("a", b"\xaa\xbb\xcc")
+    req = captured[0][0]
+    assert req.get_method() == "PUT"
+    assert req.get_full_url() == "http://h/v1/drives/a%3A:load_rom"
+    ct = req.get_header("Content-type")
+    assert ct.startswith("multipart/form-data; boundary=")
+    assert b'name="file"' in req.data
+    assert b"\xaa\xbb\xcc" in req.data
+
+
+def test_drive_load_rom_with_str_uses_file_query():
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        c.drive_load_rom("b", "/Roms/dos1541.rom")
+    req = captured[0][0]
+    assert req.get_method() == "PUT"
+    assert req.data is None
+    url = req.get_full_url()
+    assert url == "http://h/v1/drives/b%3A:load_rom?file=/Roms/dos1541.rom"
+
+
+def test_drive_load_rom_rejects_bad_type():
+    c = Ultimate64Client("h")
+    with pytest.raises(TypeError):
+        c.drive_load_rom("a", 123)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------- files
+def test_file_info_url_and_parse():
+    body = b'{"size":174848,"extension":"d64"}'
+    mock, captured = _capture(body)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        result = c.file_info("Usb0/Disks/foo.d64")
+    req = captured[0][0]
+    assert req.get_method() == "GET"
+    assert req.get_full_url() == "http://h/v1/files/Usb0/Disks/foo.d64:info"
+    assert result == {"size": 174848, "extension": "d64"}
+
+
+def test_file_info_rejects_empty():
+    c = Ultimate64Client("h")
+    with pytest.raises(ValueError):
+        c.file_info("")
+
+
+def test_create_d64_default_tracks_and_query():
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        c.create_d64("Usb0/new.d64", diskname="MYDISK")
+    req = captured[0][0]
+    assert req.get_method() == "PUT"
+    url = req.get_full_url()
+    assert url.startswith("http://h/v1/files/Usb0/new.d64:create_d64?")
+    assert "tracks=35" in url
+    assert "diskname=MYDISK" in url
+
+
+def test_create_d64_accepts_40_tracks():
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        c.create_d64("foo.d64", tracks=40)
+    assert "tracks=40" in captured[0][0].get_full_url()
+
+
+def test_create_d64_rejects_bad_tracks():
+    c = Ultimate64Client("h")
+    with pytest.raises(ValueError):
+        c.create_d64("foo.d64", tracks=42)
+
+
+def test_create_d71_url():
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        c.create_d71("foo.d71", diskname="X")
+    url = captured[0][0].get_full_url()
+    assert url == "http://h/v1/files/foo.d71:create_d71?diskname=X"
+
+
+def test_create_d81_url():
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        c.create_d81("foo.d81", diskname="Y")
+    url = captured[0][0].get_full_url()
+    assert url == "http://h/v1/files/foo.d81:create_d81?diskname=Y"
+
+
+def test_create_dnp_default_tracks_and_query():
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        c.create_dnp("foo.dnp", tracks=10, diskname="N")
+    url = captured[0][0].get_full_url()
+    assert url.startswith("http://h/v1/files/foo.dnp:create_dnp?")
+    assert "tracks=10" in url
+    assert "diskname=N" in url
+
+
+def test_create_dnp_rejects_out_of_range_tracks():
+    c = Ultimate64Client("h")
+    with pytest.raises(ValueError):
+        c.create_dnp("foo.dnp", tracks=0)
+    with pytest.raises(ValueError):
+        c.create_dnp("foo.dnp", tracks=256)
+
+
+# ---------------------------------------------------------------- debug / measure
+def test_get_debug_register_int_response():
+    mock, captured = _capture(b"42")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        v = c.get_debug_register()
+    req = captured[0][0]
+    assert req.get_method() == "GET"
+    assert req.get_full_url() == "http://h/v1/machine:debugreg"
+    assert v == 42
+
+
+def test_get_debug_register_json_value_response():
+    mock, _ = _capture(b'{"value":"0xAB"}')
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        assert c.get_debug_register() == 0xAB
+
+
+def test_set_debug_register_url_and_query():
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        c.set_debug_register(0x7F)
+    req = captured[0][0]
+    assert req.get_method() == "PUT"
+    assert req.get_full_url() == "http://h/v1/machine:debugreg?value=127"
+    assert req.data is None
+
+
+def test_set_debug_register_rejects_out_of_range():
+    c = Ultimate64Client("h")
+    with pytest.raises(ValueError):
+        c.set_debug_register(-1)
+    with pytest.raises(ValueError):
+        c.set_debug_register(256)
+
+
+def test_measure_bus_timing_returns_raw_bytes():
+    vcd = b"$date\n  Mon\n$end\n#0\n0!\n#1\n1!\n"
+    mock, captured = _capture(vcd)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        data = c.measure_bus_timing()
+    assert data == vcd
+    req = captured[0][0]
+    assert req.get_method() == "GET"
+    assert req.get_full_url() == "http://h/v1/machine:measure"
+
+
+# ---------------------------------------------------------------- batch config
+def test_set_config_items_batch_posts_json_body():
+    mock, captured = _capture(b"{}")
+    c = Ultimate64Client("h")
+    updates = {
+        "Drive A Settings": {"Drive Bus ID": 8, "Drive Type": "1581"},
+        "U64 Specific Settings": {"CPU Speed": " 8"},
+    }
+    with patch("urllib.request.urlopen", mock):
+        c.set_config_items_batch(updates)
+    assert len(captured) == 1
+    req = captured[0][0]
+    assert req.get_method() == "POST"
+    assert req.get_full_url() == "http://h/v1/configs"
+    assert req.get_header("Content-type") == "application/json"
+    assert json.loads(req.data.decode("utf-8")) == updates
+
+
+def test_set_config_items_batch_validates_inputs():
+    c = Ultimate64Client("h")
+    with pytest.raises(TypeError):
+        c.set_config_items_batch("nope")  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        c.set_config_items_batch({"": {"x": 1}})
+    with pytest.raises(TypeError):
+        c.set_config_items_batch({"cat": "not-a-dict"})  # type: ignore[dict-item]
