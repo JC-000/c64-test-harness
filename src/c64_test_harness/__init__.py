@@ -14,7 +14,16 @@ except PackageNotFoundError:
 from .transport import C64Transport, TransportError, ConnectionError, TimeoutError
 from .screen import ScreenGrid, wait_for_text, wait_for_stable
 from .keyboard import send_text, send_key
-from .memory import read_bytes, read_bytes_chunked, write_bytes, read_word_le, read_dword_le, hex_dump
+from .memory import (
+    read_bytes,
+    read_bytes_chunked,
+    read_bytes_verified,
+    write_bytes,
+    read_word_le,
+    read_dword_le,
+    hex_dump,
+    FlakeyReadError,
+)
 from .labels import Labels
 from .config import HarnessConfig
 from .runner import TestRunner, TestScenario, TestResult, TestStatus
@@ -270,10 +279,12 @@ __all__ = [
     # Memory
     "read_bytes",
     "read_bytes_chunked",
+    "read_bytes_verified",
     "write_bytes",
     "read_word_le",
     "read_dword_le",
     "hex_dump",
+    "FlakeyReadError",
     # Labels
     "Labels",
     # Config
