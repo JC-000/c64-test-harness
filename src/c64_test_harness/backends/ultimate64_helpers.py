@@ -14,11 +14,19 @@ cryptic device-side error.
 """
 from __future__ import annotations
 
+import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
-from .ultimate64_client import Ultimate64Client
+from .ultimate64_client import (
+    Ultimate64Client,
+    Ultimate64Error,
+    Ultimate64RunnerStuckError,
+    Ultimate64UnreachableError,
+)
+from .ultimate64_probe import is_u64_reachable
 from .ultimate64_schema import (
     CPU_SPEED_VALUES,
     DISK_IMAGE_TYPES,
@@ -35,6 +43,8 @@ from .ultimate64_schema import (
     validate_enum,
 )
 
+_log = logging.getLogger(__name__)
+
 __all__ = [
     "get_turbo_mhz",
     "set_turbo_mhz",
@@ -49,6 +59,8 @@ __all__ = [
     "load_prg_file",
     "reset",
     "reboot",
+    "recover",
+    "runner_health_check",
     "U64StateSnapshot",
     "snapshot_state",
     "restore_state",
@@ -531,6 +543,111 @@ def reboot(client: Ultimate64Client) -> None:
     for the device to become responsive after reboot.
     """
     client.reboot()
+
+
+# --------------------------------------------------------------------------- #
+# Recovery / health                                                           #
+# --------------------------------------------------------------------------- #
+
+# Minimal viable PRG: load address $0801 (BASIC start) + RTS.
+_HEALTH_CHECK_PRG = bytes([0x01, 0x08, 0x60])
+
+# Firmware signature for a wedged runner subsystem.
+_STUCK_RUNNER_SIGNATURE = "Cannot open file"
+
+
+def recover(
+    client: Ultimate64Client,
+    *,
+    reset_settle_seconds: float = 2.0,
+    reboot_settle_seconds: float = 12.0,
+    escalate_to_reboot: bool = True,
+) -> str:
+    """Bring an unresponsive U64 back to a known-good state.
+
+    Strategy: :meth:`Ultimate64Client.reset` (instant; recovers most
+    CPU-stuck states) then probe for liveness; if still unreachable AND
+    *escalate_to_reboot* is ``True``, :meth:`Ultimate64Client.reboot`
+    (full FPGA reinit ~8s; recovers REU/DMA stuck state) then probe
+    again.
+
+    NEVER calls :meth:`Ultimate64Client.poweroff` -- that's irrecoverable
+    over the network and requires physical access to power-cycle. If
+    both reset and reboot fail to bring the device back, raises
+    :class:`Ultimate64UnreachableError`; at that point human
+    intervention is required.
+
+    :param client: Connected Ultimate64 client.
+    :param reset_settle_seconds: Sleep after ``reset()`` before probing.
+    :param reboot_settle_seconds: Sleep after ``reboot()`` before probing.
+    :param escalate_to_reboot: When ``False``, skip the reboot fallback;
+        if reset alone fails to recover, raise immediately.
+    :returns: ``"reset"`` or ``"reboot"`` -- whichever step ultimately
+        restored reachability.
+    :raises Ultimate64UnreachableError: When recovery fails.
+    """
+    _log.info("recover: issuing reset() on %s", client.host)
+    try:
+        client.reset()
+    except Ultimate64Error as exc:
+        _log.warning("recover: reset() raised %s -- continuing", exc)
+    time.sleep(reset_settle_seconds)
+    if is_u64_reachable(client.host, port=client.port, password=client.password):
+        _log.info("recover: device reachable after reset")
+        return "reset"
+
+    if not escalate_to_reboot:
+        raise Ultimate64UnreachableError(
+            f"U64 at {client.host} unreachable after reset(); "
+            f"escalate_to_reboot=False so not retrying with reboot()"
+        )
+
+    _log.info("recover: reset insufficient -- issuing reboot() on %s", client.host)
+    try:
+        client.reboot()
+    except Ultimate64Error as exc:
+        _log.warning("recover: reboot() raised %s -- continuing", exc)
+    time.sleep(reboot_settle_seconds)
+    if is_u64_reachable(client.host, port=client.port, password=client.password):
+        _log.info("recover: device reachable after reboot")
+        return "reboot"
+
+    raise Ultimate64UnreachableError(
+        f"U64 at {client.host} unreachable after reset() and reboot(); "
+        f"physical power-cycle required (do NOT call poweroff() -- it is "
+        f"irrecoverable over the network)"
+    )
+
+
+def runner_health_check(client: Ultimate64Client) -> None:
+    """Verify the U64 firmware's runner subsystem accepts new programs.
+
+    Posts a tiny no-op PRG (load address $0801 + RTS) via
+    :meth:`Ultimate64Client.run_prg` and inspects the response. Returns
+    silently when the runner accepts the program. Raises
+    :class:`Ultimate64RunnerStuckError` when the device returns the
+    firmware's wedged-runner signature (``"Cannot open file"``);
+    :func:`recover` can usually clear that state.
+
+    Other failures (auth, timeout, generic ``Ultimate64Error``) are
+    re-raised unchanged -- this helper only specialises the
+    stuck-runner case.
+
+    :param client: Connected Ultimate64 client.
+    :raises Ultimate64RunnerStuckError: When the runner is wedged.
+    :raises Ultimate64Error: On other API failures (auth, network, etc.).
+    """
+    try:
+        client.run_prg(_HEALTH_CHECK_PRG)
+    except Ultimate64Error as exc:
+        body = exc.body or ""
+        if _STUCK_RUNNER_SIGNATURE in body or _STUCK_RUNNER_SIGNATURE in str(exc):
+            raise Ultimate64RunnerStuckError(
+                f"U64 runner is wedged at {client.host}: {body[:200]!r}",
+                status=exc.status,
+                body=body,
+            ) from exc
+        raise
 
 
 # --------------------------------------------------------------------------- #

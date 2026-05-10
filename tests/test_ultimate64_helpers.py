@@ -5,6 +5,11 @@ from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
+from c64_test_harness.backends.ultimate64_client import (
+    Ultimate64Error,
+    Ultimate64RunnerStuckError,
+    Ultimate64UnreachableError,
+)
 from c64_test_harness.backends.ultimate64_helpers import (
     CAT_CART,
     CAT_SID_ADDRESSING,
@@ -18,9 +23,11 @@ from c64_test_harness.backends.ultimate64_helpers import (
     load_prg_file,
     mount_disk_file,
     reboot,
+    recover,
     reset,
     restore_state,
     run_prg_file,
+    runner_health_check,
     set_reu,
     set_sid_socket,
     set_turbo_mhz,
@@ -32,6 +39,15 @@ from c64_test_harness.backends.ultimate64_helpers import (
 def _make_client() -> MagicMock:
     """Build a MagicMock that looks like an Ultimate64Client."""
     return MagicMock()
+
+
+def _make_recover_client() -> MagicMock:
+    """Mock client with the attributes recover() uses for probing."""
+    client = MagicMock()
+    client.host = "192.0.2.81"
+    client.port = 80
+    client.password = None
+    return client
 
 
 def _u64_specific(turbo: str = "Off", cpu_speed: str = " 1") -> dict:
@@ -419,3 +435,100 @@ class TestSnapshotRestore:
         client = _make_client()
         with pytest.raises(TypeError, match="U64StateSnapshot"):
             restore_state(client, {"turbo_control": "Off"})  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------- #
+# recover()                                                                   #
+# --------------------------------------------------------------------------- #
+
+_HELPERS_PROBE = (
+    "c64_test_harness.backends.ultimate64_helpers.is_u64_reachable"
+)
+_HELPERS_SLEEP = "c64_test_harness.backends.ultimate64_helpers.time.sleep"
+
+
+class TestRecover:
+    def test_recover_reset_succeeds(self) -> None:
+        client = _make_recover_client()
+        with patch(_HELPERS_PROBE, return_value=True) as probe, patch(
+            _HELPERS_SLEEP
+        ):
+            result = recover(client)
+        assert result == "reset"
+        client.reset.assert_called_once_with()
+        client.reboot.assert_not_called()
+        assert probe.call_count == 1
+
+    def test_recover_escalates_to_reboot(self) -> None:
+        client = _make_recover_client()
+        with patch(
+            _HELPERS_PROBE, side_effect=[False, True]
+        ) as probe, patch(_HELPERS_SLEEP):
+            result = recover(client)
+        assert result == "reboot"
+        client.reset.assert_called_once_with()
+        client.reboot.assert_called_once_with()
+        assert probe.call_count == 2
+
+    def test_recover_both_fail_raises(self) -> None:
+        client = _make_recover_client()
+        with patch(_HELPERS_PROBE, return_value=False), patch(_HELPERS_SLEEP):
+            with pytest.raises(Ultimate64UnreachableError):
+                recover(client)
+        client.reset.assert_called_once_with()
+        client.reboot.assert_called_once_with()
+
+    def test_recover_never_calls_poweroff(self) -> None:
+        client = _make_recover_client()
+        with patch(_HELPERS_PROBE, return_value=False), patch(_HELPERS_SLEEP):
+            with pytest.raises(Ultimate64UnreachableError):
+                recover(client)
+        client.poweroff.assert_not_called()
+
+    def test_recover_escalate_to_reboot_false(self) -> None:
+        client = _make_recover_client()
+        with patch(_HELPERS_PROBE, return_value=False) as probe, patch(
+            _HELPERS_SLEEP
+        ):
+            with pytest.raises(Ultimate64UnreachableError):
+                recover(client, escalate_to_reboot=False)
+        client.reset.assert_called_once_with()
+        client.reboot.assert_not_called()
+        assert probe.call_count == 1
+
+    def test_recover_tolerates_reset_raising(self) -> None:
+        client = _make_recover_client()
+        client.reset.side_effect = Ultimate64Error("transient")
+        with patch(_HELPERS_PROBE, return_value=True), patch(_HELPERS_SLEEP):
+            assert recover(client) == "reset"
+
+
+# --------------------------------------------------------------------------- #
+# runner_health_check()                                                       #
+# --------------------------------------------------------------------------- #
+
+class TestRunnerHealthCheck:
+    def test_runner_health_check_happy_path(self) -> None:
+        client = _make_client()
+        runner_health_check(client)
+        client.run_prg.assert_called_once_with(bytes([0x01, 0x08, 0x60]))
+
+    def test_runner_health_check_detects_stuck(self) -> None:
+        client = _make_client()
+        client.run_prg.side_effect = Ultimate64Error(
+            "POST /v1/runners:run_prg returned HTTP 400: "
+            '{"errors":["Cannot open file"]}',
+            status=400,
+            body='{"errors":["Cannot open file"]}',
+        )
+        with pytest.raises(Ultimate64RunnerStuckError):
+            runner_health_check(client)
+
+    def test_runner_health_check_passes_through_other_errors(self) -> None:
+        client = _make_client()
+        client.run_prg.side_effect = Ultimate64Error(
+            "auth failed", status=401, body="unauthorized"
+        )
+        with pytest.raises(Ultimate64Error) as exc_info:
+            runner_health_check(client)
+        assert not isinstance(exc_info.value, Ultimate64RunnerStuckError)
