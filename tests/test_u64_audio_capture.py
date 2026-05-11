@@ -23,11 +23,20 @@ from c64_test_harness.backends.u64_audio_capture import (
 # ---------------------------------------------------------------- helpers
 
 
-def _free_port() -> int:
-    """Bind to port 0 and return the OS-assigned port."""
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def _reserve_port() -> tuple[int, socket.socket]:
+    """Reserve a free UDP port and return ``(port, placeholder_socket)``.
+
+    The placeholder socket stays bound to the port until the caller closes
+    it — typically immediately before constructing/starting their own
+    listener on the same port. Closing the placeholder before that point
+    re-opens the TOCTOU window that this helper exists to close (see
+    GitHub #91): with the placeholder closed, any other test in the same
+    process can have the OS hand them this port before the caller's
+    ``bind()`` lands.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 0))
+    return s.getsockname()[1], s
 
 
 def _send_test_packets(port: int, packets: list[tuple[int, bytes]]) -> None:
@@ -99,8 +108,9 @@ def test_capture_result_fields() -> None:
 
 
 def test_audio_capture_start_stop_no_packets() -> None:
-    port = _free_port()
+    port, _placeholder = _reserve_port()
     cap = AudioCapture(port=port)
+    _placeholder.close()
     cap.start()
     result = cap.stop()
     assert result.packets_received == 0
@@ -110,8 +120,9 @@ def test_audio_capture_start_stop_no_packets() -> None:
 
 
 def test_audio_capture_double_start_raises() -> None:
-    port = _free_port()
+    port, _placeholder = _reserve_port()
     cap = AudioCapture(port=port)
+    _placeholder.close()
     cap.start()
     try:
         with pytest.raises(RuntimeError, match="already started"):
@@ -121,8 +132,9 @@ def test_audio_capture_double_start_raises() -> None:
 
 
 def test_audio_capture_stop_not_started_raises() -> None:
-    port = _free_port()
+    port, _placeholder = _reserve_port()
     cap = AudioCapture(port=port)
+    _placeholder.close()
     with pytest.raises(RuntimeError, match="not started"):
         cap.stop()
 
@@ -131,8 +143,9 @@ def test_audio_capture_stop_not_started_raises() -> None:
 
 
 def test_audio_capture_receives_packets() -> None:
-    port = _free_port()
+    port, _placeholder = _reserve_port()
     cap = AudioCapture(port=port)
+    _placeholder.close()
     cap.start()
     try:
         pcm = _make_pcm(10)
@@ -145,8 +158,9 @@ def test_audio_capture_receives_packets() -> None:
 
 
 def test_audio_capture_gap_detection() -> None:
-    port = _free_port()
+    port, _placeholder = _reserve_port()
     cap = AudioCapture(port=port)
+    _placeholder.close()
     cap.start()
     try:
         pcm = _make_pcm(10)
@@ -160,8 +174,9 @@ def test_audio_capture_gap_detection() -> None:
 
 
 def test_audio_capture_sequence_wrap() -> None:
-    port = _free_port()
+    port, _placeholder = _reserve_port()
     cap = AudioCapture(port=port)
+    _placeholder.close()
     cap.start()
     try:
         pcm = _make_pcm(10)
@@ -174,8 +189,9 @@ def test_audio_capture_sequence_wrap() -> None:
 
 
 def test_audio_capture_writes_wav(tmp_path: Path) -> None:
-    port = _free_port()
+    port, _placeholder = _reserve_port()
     cap = AudioCapture(port=port)
+    _placeholder.close()
     cap.start()
     try:
         pcm = _make_pcm(50)
@@ -195,9 +211,10 @@ def test_audio_capture_writes_wav(tmp_path: Path) -> None:
 
 
 def test_audio_capture_is_capturing_property() -> None:
-    port = _free_port()
+    port, _placeholder = _reserve_port()
     cap = AudioCapture(port=port)
     assert cap.is_capturing is False
+    _placeholder.close()
     cap.start()
     assert cap.is_capturing is True
     cap.stop()
@@ -205,8 +222,9 @@ def test_audio_capture_is_capturing_property() -> None:
 
 
 def test_audio_capture_packets_received_property() -> None:
-    port = _free_port()
+    port, _placeholder = _reserve_port()
     cap = AudioCapture(port=port)
+    _placeholder.close()
     cap.start()
     try:
         assert cap.packets_received == 0
@@ -233,8 +251,9 @@ def test_constants() -> None:
 
 def test_audio_capture_multicast_join() -> None:
     """Verify multicast_group parameter is accepted at construction time."""
-    port = _free_port()
+    port, _placeholder = _reserve_port()
     cap = AudioCapture(port=port, multicast_group="239.0.1.65")
+    _placeholder.close()
     # Just verify construction succeeds and the attribute is stored
     assert cap._multicast_group == "239.0.1.65"
 
@@ -243,8 +262,9 @@ def test_audio_capture_multicast_join() -> None:
 
 
 def test_audio_capture_runt_packet_ignored() -> None:
-    port = _free_port()
+    port, _placeholder = _reserve_port()
     cap = AudioCapture(port=port)
+    _placeholder.close()
     cap.start()
     try:
         # Send a 1-byte packet (runt) and a 2-byte packet (just header, also runt)
