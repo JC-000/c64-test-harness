@@ -855,6 +855,34 @@ Route unwanted SID engines to Unmapped addresses (e.g. `$D500`) so they don't co
 ### 25. Labels is a Mapping — Use It as a Dict
 As of v0.12.4, `Labels` inherits from `collections.abc.Mapping[str, int]`. `dict(Labels.from_file(path))` works; `for name, addr in labels.items(): ...` iterates all entries. `.get()`, `__eq__`, and `__ne__` are inherited for free.
 
+### 26. UDP Test Fixtures: Hold the Placeholder Until Bind
+When a test needs a free UDP port to point a listener at (e.g. `AudioCapture`, any future U64 UDP stream consumer), the obvious helper — bind to port 0, return the assigned port as a bare int — is a TOCTOU trap. Between the helper's close and the listener's `bind()`, any other test in the same process can have the OS hand them the same ephemeral port, producing intermittent `OSError [Errno 48] Address already in use` (see #91). UDP has no TIME_WAIT, and `SO_REUSEADDR` does not protect against this because the colliding socket is freshly bound, not in CLOSED state.
+
+**Wrong:**
+```python
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]  # socket closed here — port is loose
+
+port = _free_port()
+cap = AudioCapture(port=port)
+cap.start()  # races against any sibling test calling _free_port()
+```
+**Right:**
+```python
+def _reserve_port() -> tuple[int, socket.socket]:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 0))
+    return s.getsockname()[1], s  # placeholder stays open
+
+port, placeholder = _reserve_port()
+cap = AudioCapture(port=port)
+placeholder.close()  # release immediately before bind
+cap.start()
+```
+**Why:** Holding the placeholder across construction keeps the OS from handing the port to anyone else. Closing it just before `cap.start()` shrinks the remaining race window to the kernel close→bind transition (microseconds), which is in practice unreachable from another Python test. Reference: `tests/test_u64_audio_capture.py::_reserve_port`. This is the UDP-test analogue to what `PortAllocator` (with its `flock()` bridge) does for VICE TCP ports — a `flock`-based bridge would be overkill here since the race is intra-process only.
+
 ---
 
 ## Memory Map Conventions
