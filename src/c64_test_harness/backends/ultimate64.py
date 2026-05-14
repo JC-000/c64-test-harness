@@ -37,6 +37,7 @@ class Ultimate64Transport(HardwareTransportBase):
         cols: int = 40,
         rows: int = 25,
         client: Ultimate64Client | None = None,
+        memory_policy: "MemoryPolicy | None" = None,
     ) -> None:
         super().__init__(screen_cols=cols, screen_rows=rows)
         if client is None:
@@ -52,10 +53,32 @@ class Ultimate64Transport(HardwareTransportBase):
         self._keybuf_count_addr = keybuf_count_addr
         self._keybuf_max = keybuf_max
 
+        from ..memory_policy import MemoryPolicy as _MemoryPolicy
+        self._memory_policy: _MemoryPolicy = memory_policy or _MemoryPolicy.permissive()
+
     @property
     def client(self) -> "Ultimate64Client":
         """Return the underlying Ultimate64Client for low-level operations not yet wrapped on the transport."""
         return self._client
+
+    @property
+    def memory_policy(self) -> "MemoryPolicy":
+        """Active :class:`MemoryPolicy` for this transport.
+
+        Set this to enforce allow-list/deny-list checks on every
+        :meth:`write_memory` call.  The default is permissive (every
+        write passes).
+        """
+        return self._memory_policy
+
+    @memory_policy.setter
+    def memory_policy(self, policy: "MemoryPolicy") -> None:
+        from ..memory_policy import MemoryPolicy as _MemoryPolicy
+        if not isinstance(policy, _MemoryPolicy):
+            raise TypeError(
+                f"memory_policy must be a MemoryPolicy, got {type(policy).__name__}"
+            )
+        self._memory_policy = policy
 
     # ----- C64Transport protocol -----
 
@@ -65,12 +88,28 @@ class Ultimate64Transport(HardwareTransportBase):
             return b""
         return self._client.read_mem(addr, length)
 
-    def write_memory(self, addr: int, data: bytes | list[int]) -> None:
-        """Write *data* bytes to C64 memory via DMA."""
+    def write_memory(
+        self,
+        addr: int,
+        data: bytes | list[int],
+        *,
+        override: str | None = None,
+    ) -> None:
+        """Write *data* bytes to C64 memory via DMA.
+
+        Routes through ``self.memory_policy.check_write`` before any byte
+        crosses the wire — a violating write raises
+        :class:`MemoryPolicyError`.  Pass ``override="<reason>"`` to
+        bypass for a single call (logged at WARNING).  The default
+        policy is permissive, so existing callers see no behaviour
+        change.
+        """
         if isinstance(data, list):
             data = bytes(data)
         if not data:
             return
+        if not self._memory_policy.is_permissive():
+            self._memory_policy.check_write(addr, len(data), override=override)
         self._client.write_mem(addr, data)
 
     def read_screen_codes(self) -> list[int]:

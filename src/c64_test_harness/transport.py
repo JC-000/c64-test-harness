@@ -55,8 +55,21 @@ class C64Transport(Protocol):
         """
         ...
 
-    def write_memory(self, addr: int, data: bytes | list[int]) -> None:
-        """Write ``data`` bytes starting at ``addr``."""
+    def write_memory(
+        self,
+        addr: int,
+        data: bytes | list[int],
+        *,
+        override: str | None = None,
+    ) -> None:
+        """Write ``data`` bytes starting at ``addr``.
+
+        Backends MAY enforce a ``MemoryPolicy`` against the write before
+        any byte crosses the wire.  Pass ``override="<reason>"`` to
+        bypass the policy for a single call; the bypass is logged at
+        WARNING level so the use stays visible.  Backends without policy
+        support ignore the kwarg.
+        """
         ...
 
     def read_screen_codes(self) -> list[int]:
