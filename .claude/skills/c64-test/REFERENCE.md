@@ -10,6 +10,44 @@ The package is `c64_test_harness`. All public symbols are re-exported from the t
 
 ---
 
+## Memory Safety (`MemoryPolicy`)
+
+The harness has fixed scratch addresses (`$0334` `jsr` trampoline, `$0360` + `$03F0`-`$03F1` `run_subroutine`, `$C000-$C3FF` UCI block, `$C000` + `$033C` + `$0339` SID player). Any host-side `write_memory()` into a region the consumer also uses silently collides — the 6502 has no MMU. `MemoryPolicy` enforces an allow-list / deny-list at the transport boundary; violations raise `MemoryPolicyError` before any byte crosses the wire.
+
+```python
+from c64_test_harness import MemoryPolicy, MemoryRegion, UnknownPolicy
+from c64_test_harness.verify import PrgFile
+
+# Cheapest signal — auto-reserve the PRG's load span:
+prg = PrgFile.from_file("build/program.prg")
+target.transport.memory_policy = MemoryPolicy.from_prg(prg, unknown=UnknownPolicy.WARN)
+
+# Or fully programmatic:
+policy = (
+    MemoryPolicy.permissive()
+    .with_reserved(MemoryRegion.parse("$4200-$50FF", note="X25519 RODATA"))
+    .with_safe(MemoryRegion.parse("$C000-$CFFF", note="harness scratch"))
+    .with_unknown(UnknownPolicy.DENY)
+)
+target.transport.memory_policy = policy
+
+# Override escape hatch (logged at WARNING):
+target.transport.write_memory(0x4200, payload, override="fault injection")
+```
+
+`UnifiedManager(memory_policy=cfg.memory_policy)` stamps the policy onto every acquired transport. `HarnessConfig.from_toml(...)` parses `[memory]` sections automatically.
+
+`MemoryArbiter` is the ergonomic complement — it walks the policy's free space and hands out addresses guaranteed to pass `check_write`:
+
+```python
+arbiter = MemoryArbiter(policy=cfg.memory_policy)
+trampoline_addr = arbiter.alloc(117, name="trampoline")
+```
+
+The arbiter is NOT the safety mechanism (the policy on the transport is). Even code that bypasses the arbiter and hardcodes an address is still checked. Full design in `docs/memory_safety.md`.
+
+---
+
 ## Backend-Agnostic Testing (RECOMMENDED)
 
 For tests that should work on both VICE and Ultimate 64, use `UnifiedManager` / `create_manager()`. It selects the backend at runtime and handles all cross-process locking automatically.

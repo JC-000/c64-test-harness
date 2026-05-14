@@ -98,3 +98,63 @@ rows = 50
     def test_missing_file_raises(self):
         with pytest.raises(FileNotFoundError):
             HarnessConfig.from_toml("/nonexistent/c64test.toml")
+
+
+
+class TestMemoryPolicySection:
+    """The [memory] TOML section builds a MemoryPolicy on the config.
+
+    Default is permissive (no checks), preserving the pre-policy
+    behaviour for tests that don't opt in.
+    """
+
+    def test_default_policy_is_permissive(self) -> None:
+        from c64_test_harness import MemoryPolicy
+        cfg = HarnessConfig()
+        assert isinstance(cfg.memory_policy, MemoryPolicy)
+        assert cfg.memory_policy.is_permissive()
+
+    def test_toml_memory_section_builds_policy(self, tmp_path) -> None:
+        from c64_test_harness import UnknownPolicy
+        toml = tmp_path / "c64test.toml"
+        toml.write_text(
+            "backend = \"vice\"\n"
+            "\n"
+            "[memory]\n"
+            "unknown_policy = \"deny\"\n"
+            "safe_regions = [\n"
+            "  { range = \"$C000-$CFFF\", note = \"scratch\" },\n"
+            "]\n"
+            "reserved_regions = [\n"
+            "  { range = \"$4200-$50FF\", note = \"X25519\" },\n"
+            "]\n"
+        )
+        cfg = HarnessConfig.from_toml(toml)
+        assert cfg.backend == "vice"  # other sections still parsed
+        assert not cfg.memory_policy.is_permissive()
+        assert cfg.memory_policy.unknown == UnknownPolicy.DENY
+        assert len(cfg.memory_policy.safe_regions) == 1
+        assert cfg.memory_policy.safe_regions[0].note == "scratch"
+        assert len(cfg.memory_policy.reserved_regions) == 1
+        assert cfg.memory_policy.reserved_regions[0].note == "X25519"
+
+    def test_toml_memory_with_prg_auto_reserves_load_span(self, tmp_path) -> None:
+        # Build a minimal PRG at $0801.
+        prg_path = tmp_path / "tiny.prg"
+        prg_path.write_bytes(b"\x01\x08" + b"\x00" * 0x100)
+        toml = tmp_path / "c64test.toml"
+        toml.write_text(
+            f"[memory]\nprg = \"{prg_path}\"\n"
+        )
+        cfg = HarnessConfig.from_toml(toml)
+        # The PRG load span shows up as a reserved region.
+        spans = [
+            (r.start, r.end) for r in cfg.memory_policy.reserved_regions
+        ]
+        assert (0x0801, 0x0901) in spans
+
+    def test_toml_without_memory_section_keeps_permissive(self, tmp_path) -> None:
+        toml = tmp_path / "c64test.toml"
+        toml.write_text("backend = \"u64\"\n")
+        cfg = HarnessConfig.from_toml(toml)
+        assert cfg.memory_policy.is_permissive()

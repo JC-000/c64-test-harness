@@ -43,7 +43,13 @@ class HardwareTransportBase:
     def read_memory(self, addr: int, length: int) -> bytes:
         raise NotImplementedError
 
-    def write_memory(self, addr: int, data: bytes | list[int]) -> None:
+    def write_memory(
+        self,
+        addr: int,
+        data: bytes | list[int],
+        *,
+        override: str | None = None,
+    ) -> None:
         raise NotImplementedError
 
     def read_screen_codes(self) -> list[int]:
