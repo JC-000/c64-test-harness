@@ -25,6 +25,7 @@ from .memory import (
     FlakeyReadError,
 )
 from .labels import Labels
+from .memory_arbiter import MemoryArbiter, MemoryArbiterError
 from .config import HarnessConfig
 from .runner import TestRunner, TestScenario, TestResult, TestStatus
 from .debug import dump_screen
@@ -287,6 +288,9 @@ __all__ = [
     "FlakeyReadError",
     # Labels
     "Labels",
+    # Memory arbiter
+    "MemoryArbiter",
+    "MemoryArbiterError",
     # Config
     "HarnessConfig",
     # Runner
