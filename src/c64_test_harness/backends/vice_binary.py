@@ -118,6 +118,7 @@ class BinaryViceTransport:
         cols: int = 40,
         rows: int = 25,
         text_monitor_port: int = 0,
+        memory_policy: "MemoryPolicy | None" = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -129,6 +130,9 @@ class BinaryViceTransport:
         self._cols = cols
         self._rows = rows
         self._text_monitor_port = text_monitor_port
+
+        from ..memory_policy import MemoryPolicy as _MemoryPolicy
+        self._memory_policy: _MemoryPolicy = memory_policy or _MemoryPolicy.permissive()
 
         self._req_id = 0
         self._reg_map: dict[str, tuple[int, int]] = {}  # name -> (reg_id, size_bits)
@@ -149,6 +153,25 @@ class BinaryViceTransport:
     @property
     def screen_rows(self) -> int:
         return self._rows
+
+    @property
+    def memory_policy(self) -> "MemoryPolicy":
+        """Active :class:`MemoryPolicy` for this transport.
+
+        Set this to enforce allow-list/deny-list checks on every
+        :meth:`write_memory` call.  The default is permissive (every
+        write passes).
+        """
+        return self._memory_policy
+
+    @memory_policy.setter
+    def memory_policy(self, policy: "MemoryPolicy") -> None:
+        from ..memory_policy import MemoryPolicy as _MemoryPolicy
+        if not isinstance(policy, _MemoryPolicy):
+            raise TypeError(
+                f"memory_policy must be a MemoryPolicy, got {type(policy).__name__}"
+            )
+        self._memory_policy = policy
 
     # ----- connection management -----
 
@@ -424,12 +447,29 @@ class BinaryViceTransport:
 
         return bytes(result[:length])
 
-    def write_memory(self, addr: int, data: bytes | list[int]) -> None:
-        """Write *data* bytes starting at *addr*."""
+    def write_memory(
+        self,
+        addr: int,
+        data: bytes | list[int],
+        *,
+        override: str | None = None,
+    ) -> None:
+        """Write *data* bytes starting at *addr*.
+
+        Routes through ``self.memory_policy.check_write`` before any byte
+        crosses the wire — a violating write raises
+        :class:`MemoryPolicyError`.  Pass ``override="<reason>"`` to
+        bypass for a single call (logged at WARNING).  The default
+        policy is permissive, so existing callers see no behaviour
+        change.
+        """
         if isinstance(data, list):
             data = bytes(data)
         if not data:
             return
+
+        if not self._memory_policy.is_permissive():
+            self._memory_policy.check_write(addr, len(data), override=override)
 
         remaining = data
         current_addr = addr

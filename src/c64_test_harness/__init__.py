@@ -25,6 +25,13 @@ from .memory import (
     FlakeyReadError,
 )
 from .labels import Labels
+from .memory_policy import (
+    MemoryPolicy,
+    MemoryPolicyError,
+    MemoryRegion,
+    UnknownPolicy,
+)
+from .memory_arbiter import MemoryArbiter, MemoryArbiterError
 from .config import HarnessConfig
 from .runner import TestRunner, TestScenario, TestResult, TestStatus
 from .debug import dump_screen
@@ -287,6 +294,14 @@ __all__ = [
     "FlakeyReadError",
     # Labels
     "Labels",
+    # Memory policy (transport-layer write guard)
+    "MemoryPolicy",
+    "MemoryPolicyError",
+    "MemoryRegion",
+    "UnknownPolicy",
+    # Memory arbiter (allocator helper on top of MemoryPolicy)
+    "MemoryArbiter",
+    "MemoryArbiterError",
     # Config
     "HarnessConfig",
     # Runner

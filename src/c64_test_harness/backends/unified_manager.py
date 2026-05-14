@@ -125,10 +125,16 @@ class UnifiedManager:
         u64_hosts: str | list[str] | None = None,
         u64_password: str | None = None,
         lock_timeout: float = 60.0,
+        memory_policy: "MemoryPolicy | None" = None,
     ) -> None:
         self._backend = self._resolve_backend(backend)
         self._manager: BackendManager
         self._device_lock: Any = None
+        # When set, the policy is stamped onto every transport this
+        # manager hands out via :meth:`acquire` / :meth:`instance`.
+        # ``None`` keeps the transport's existing (permissive) policy
+        # untouched, which is the migration default.
+        self._memory_policy: MemoryPolicy | None = memory_policy
 
         if self._backend == "vice":
             kw = dict(vice_kwargs or {})
@@ -156,6 +162,8 @@ class UnifiedManager:
     def acquire(self) -> TestTarget:
         """Acquire a test target from the underlying manager."""
         instance = self._manager.acquire()
+        if self._memory_policy is not None:
+            instance.transport.memory_policy = self._memory_policy
         target = TestTarget(
             transport=instance.transport,
             backend=self._backend,
@@ -185,6 +193,8 @@ class UnifiedManager:
     def instance(self) -> Iterator[TestTarget]:
         """Context manager: acquire a target, auto-release on exit."""
         instance = self._manager.acquire()
+        if self._memory_policy is not None:
+            instance.transport.memory_policy = self._memory_policy
         target = TestTarget(
             transport=instance.transport,
             backend=self._backend,

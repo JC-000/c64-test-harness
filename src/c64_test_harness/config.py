@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 try:
     import tomllib  # Python 3.11+
@@ -18,6 +19,17 @@ except ModuleNotFoundError:
         import tomli as tomllib  # type: ignore[no-redef]
     except ModuleNotFoundError:
         tomllib = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:
+    from .memory_policy import MemoryPolicy
+
+
+def _permissive_policy() -> "MemoryPolicy":
+    """Default-factory shim — defers the MemoryPolicy import so this
+    module stays import-cheap and never participates in cycles."""
+    from .memory_policy import MemoryPolicy
+
+    return MemoryPolicy.permissive()
 
 
 @dataclass
@@ -75,6 +87,12 @@ class HarnessConfig:
     vice_ethernet_driver: str = ""
     vice_ethernet_base: int = 0xDE00
 
+    # Memory policy enforced at the transport boundary.  Default is
+    # permissive (no checks) so existing configs see no behaviour
+    # change; consumers opt in by declaring a ``[memory]`` section in
+    # their TOML — see ``MemoryPolicy.from_config``.
+    memory_policy: "MemoryPolicy" = field(default_factory=_permissive_policy)
+
     @classmethod
     def from_toml(cls, path: str | Path) -> HarnessConfig:
         """Load configuration from a TOML file (e.g., ``c64test.toml``)."""
@@ -114,8 +132,18 @@ class HarnessConfig:
     @classmethod
     def _from_dict(cls, data: dict) -> HarnessConfig:
         """Build config from a flat or nested dict (TOML structure)."""
+        from .memory_policy import MemoryPolicy
+
         config = cls()
-        # Flatten nested sections: [vice] port → vice_port
+        # The [memory] section is special: it builds a MemoryPolicy rather
+        # than getting flattened into ``memory_*`` fields.  Pop it out
+        # before the flat-flattener consumes the rest of the dict.
+        memory_section = data.get("memory")
+        if isinstance(memory_section, dict):
+            config.memory_policy = MemoryPolicy.from_config(memory_section)
+            data = {k: v for k, v in data.items() if k != "memory"}
+
+        # Flatten remaining nested sections: [vice] port → vice_port
         flat: dict[str, object] = {}
         for key, val in data.items():
             if isinstance(val, dict):
