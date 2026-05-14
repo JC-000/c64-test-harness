@@ -186,6 +186,36 @@ write_bytes(transport, 0x1000, [0xDE, 0xAD, 0xBE, 0xEF])
 write_bytes(transport, 0xC000, bytes(4096))  # large writes handled natively
 ```
 
+## Memory Safety (`MemoryPolicy`)
+
+The harness writes DMA stubs to fixed C64 addresses (`$0334` for `jsr()` trampolines, `$C000-$C3FF` for UCI socket scaffolding, etc.).  If your program also lives at any of those addresses, the writes silently collide — the 6502 has no MMU, so both writes succeed and the last one wins.  This has cost downstream consumers ~12 hours of bisection in at least one incident (issue #93).
+
+`MemoryPolicy` is a transport-level write guard.  Declare your program's layout, attach the policy to the transport, and any `write_memory()` that would collide raises `MemoryPolicyError` *before* a byte crosses the wire:
+
+```python
+from c64_test_harness import MemoryPolicy, UnknownPolicy
+from c64_test_harness.verify import PrgFile
+
+prg = PrgFile.from_file("build/program.prg")
+policy = MemoryPolicy.from_prg(prg, unknown=UnknownPolicy.WARN)
+target.transport.memory_policy = policy
+```
+
+Or declare the layout in your `c64test.toml`:
+
+```toml
+[memory]
+prg = "build/program.prg"
+unknown_policy = "deny"
+reserved_regions = [
+    { range = "$4200-$50FF", note = "X25519 RODATA + BSS" },
+]
+```
+
+Per-call `override="reason"` is the escape hatch for deliberate clobbers (logged at WARNING).  `MemoryArbiter` is the companion ergonomic — ask it for a scratch address and it returns one guaranteed to pass the policy.
+
+See [docs/memory_safety.md](docs/memory_safety.md) for the full design, the harness's own scratch-address table, and the migration story.
+
 ## PRG Binary Verification
 
 Compare runtime C64 memory against the original PRG file to detect code or data corruption:
