@@ -638,6 +638,96 @@ This emits a nested delay-loop fence (~52 µs at 48 MHz, ~2.5 ms at 1 MHz, 16 by
 
 ---
 
+## Pattern 12: Memory Safety with `MemoryPolicy`
+
+The harness writes to fixed scratch addresses (`$0334` jsr trampoline, `$0360`+`$03F0`-`$03F1` `run_subroutine`, `$C000-$C3FF` UCI, `$C000`+`$033C`+`$0339` SID player). If the consumer's program also occupies those addresses, host-side `write_memory()` calls silently corrupt RAM — the 6502 has no MMU and no exception fires. `MemoryPolicy` is the transport-layer guard that catches collisions before any byte hits the wire.
+
+### Default is permissive — no behaviour change for existing tests
+
+`MemoryPolicy()` (and `MemoryPolicy.permissive()`) is the empty policy with `unknown=ALLOW`. Every existing test passes unchanged. The check is short-circuited when the policy is permissive, so the zero-config path has no overhead.
+
+### Opt in: cheapest signal is `MemoryPolicy.from_prg(prg)`
+
+Reserves the PRG's load span and defaults `unknown=UnknownPolicy.WARN` so writes outside the load image emit a `UserWarning` but pass:
+
+```python
+from c64_test_harness import MemoryPolicy, UnknownPolicy
+from c64_test_harness.verify import PrgFile
+
+prg = PrgFile.from_file("build/program.prg")
+target.transport.memory_policy = MemoryPolicy.from_prg(prg)
+# Now any write into the PRG's load span raises MemoryPolicyError.
+```
+
+### Programmatic: declare safe + reserved regions explicitly
+
+```python
+from c64_test_harness import MemoryPolicy, MemoryRegion, UnknownPolicy
+
+policy = (
+    MemoryPolicy.permissive()
+    .with_reserved(MemoryRegion.parse("$4200-$50FF", note="X25519 RODATA"))
+    .with_safe(MemoryRegion.parse("$C000-$CFFF", note="harness scratch"))
+    .with_unknown(UnknownPolicy.DENY)
+)
+target.transport.memory_policy = policy
+```
+
+`MemoryPolicy` is frozen — every `with_*` returns a new instance. `MemoryRegion.parse` accepts `"$XXXX-$YYYY"` (inclusive), `"$XXXX+N"`, or a bare `"$XXXX"` (single byte).
+
+### Wire-up via `HarnessConfig` / `UnifiedManager`
+
+`HarnessConfig.from_toml(...)` parses `[memory]` sections automatically. `UnifiedManager(memory_policy=cfg.memory_policy)` stamps the policy onto every acquired transport — no per-test wiring needed:
+
+```toml
+# config.toml
+[memory]
+unknown = "warn"
+safe = ["$C000-$CFFF", { range = "$0334", note = "jsr scratch" }]
+reserved = [{ range = "$4200-$50FF", note = "X25519 RODATA" }]
+```
+
+```python
+from c64_test_harness import HarnessConfig, UnifiedManager
+
+cfg = HarnessConfig.from_toml("config.toml")
+with UnifiedManager(backend="vice", memory_policy=cfg.memory_policy) as mgr:
+    with mgr.instance() as target:
+        # target.transport.memory_policy is set automatically
+        ...
+```
+
+### Per-call override escape hatch
+
+When you genuinely need to write into a reserved region for one call (fault injection, deliberate corruption testing), pass `override="<reason>"`. The override is logged at WARNING level so it's visible in test output:
+
+```python
+target.transport.write_memory(0x4200, payload, override="fault injection")
+```
+
+### `MemoryArbiter` is the allocator helper, not the safety net
+
+```python
+from c64_test_harness import MemoryArbiter
+
+arbiter = MemoryArbiter(policy=cfg.memory_policy)
+trampoline_addr = arbiter.alloc(117, name="trampoline")
+# trampoline_addr is guaranteed to pass policy.check_write
+```
+
+The arbiter walks the policy's free space and hands out addresses guaranteed to pass `check_write`. **But even code that bypasses the arbiter and hardcodes an address is still checked at the transport** — the policy is the safety mechanism; the arbiter is just ergonomics for "where can I put this scratch?". `arbiter.policy_with_allocations()` produces a derived policy reserving the allocations, useful when you want the arbiter's claims visible to subsequent checks.
+
+### What the policy does NOT cover (acknowledged residual risk)
+
+- Writes the running 6502 makes itself (no host visibility — mitigation is `PrgFile.verify_region` as a post-test structural check).
+- Banking transitions (toggling `$01` to expose RAM under ROM): the 16-bit MemoryPolicy plane can't disambiguate. Declaring `$A000-$BFFF` is safe but over-conservative.
+- REU / cartridge overlays: separate address plane; deferred.
+- Dynamic runtime allocation by the consumer's program: policy is static at write-time.
+
+Full design and the harness's own scratch-address table in `docs/memory_safety.md`.
+
+---
+
 ## Common Gotchas
 
 ### 1. Never Use ViceProcess or PortAllocator Directly
@@ -882,6 +972,27 @@ placeholder.close()  # release immediately before bind
 cap.start()
 ```
 **Why:** Holding the placeholder across construction keeps the OS from handing the port to anyone else. Closing it just before `cap.start()` shrinks the remaining race window to the kernel close→bind transition (microseconds), which is in practice unreachable from another Python test. Reference: `tests/test_u64_audio_capture.py::_reserve_port`. This is the UDP-test analogue to what `PortAllocator` (with its `flock()` bridge) does for VICE TCP ports — a `flock`-based bridge would be overkill here since the race is intra-process only.
+
+### 27. Suspected flakey `read_bytes()`? Use `read_bytes_verified()` as the diagnostic
+If a test reports byte-mismatched `read_bytes()` results that the C64-side math says can't be a 6502 bug (typical telltale: a round-trip operation like `(a+b)-b == a` closes correctly even though the intermediate displayed `a+b` byte sequence disagrees with `(a+b) mod p`), the prime suspect is the **VICE binary monitor protocol parser** — specifically a response-type misrouting where bytes from one response get fed into another response's parser.
+
+PR #88 tightened the binary read path to validate `response_type` against a `CMD_TO_RESPONSE_TYPE` map. A wire-level desync now raises `TransportError` naming both the expected and the actual response type — that error message identifies the desync directly, no bisection needed.
+
+As a diagnostic for downstream tests, use `read_bytes_verified()`:
+
+```python
+from c64_test_harness import read_bytes_verified, FlakeyReadError
+
+try:
+    data = read_bytes_verified(transport, 0x4200, 256, max_attempts=2)
+except FlakeyReadError as e:
+    # e.addr, e.length, e.attempts (list[bytes] of disagreeing reads)
+    for i, attempt in enumerate(e.attempts):
+        print(f"attempt {i}: {attempt.hex()}")
+    raise
+```
+
+**Use `read_bytes()` everywhere else** — `read_bytes_verified()` doubles the wire traffic per read and is only worth the cost when a flake is actively suspected. Once the issue is reproduced and rooted out (e.g., via the new `response_type` mismatch error), revert callsites to plain `read_bytes()`.
 
 ---
 
