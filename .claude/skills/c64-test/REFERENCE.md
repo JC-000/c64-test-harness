@@ -211,7 +211,9 @@ All functions take `transport` as first arg (stateless).
 
 - `read_bytes(transport, addr, length) -> bytes` -- Read bytes from addr. Contains legacy auto-chunking at 256 bytes (unnecessary with binary transport but harmless).
 - `read_bytes_chunked(transport, addr, length, chunk_size=128) -> bytes` -- Explicitly chunked read for large regions
-- `write_bytes(transport, addr, data) -> None` -- Write data to addr (accepts bytes or list[int]). Contains legacy auto-chunking at 84 bytes (unnecessary with binary transport but harmless).
+- `read_bytes_verified(transport, addr, length, *, max_attempts=2) -> bytes` -- Re-reads on disagreement until two consecutive reads match; raises `FlakeyReadError` if `max_attempts` reads all disagree pairwise. Diagnostic added in PR #88 for downstream tests suspecting issue-#88-style flakey reads (VICE binary monitor response-type misrouting). Doubles wire traffic per read — only use when a flake is actively suspected; the PR also tightened the read path to raise `TransportError` on `response_type` mismatch, which is usually the faster diagnostic.
+- `FlakeyReadError` -- Raised by `read_bytes_verified` on persistent disagreement. Attributes: `.addr`, `.length`, `.attempts: list[bytes]` (the disagreeing reads in order). Inspect to distinguish structured corruption (every-other-byte ±1) from random truncation.
+- `write_bytes(transport, addr, data) -> None` -- Write data to addr (accepts bytes or list[int]). Contains legacy auto-chunking at 84 bytes (unnecessary with binary transport but harmless). Subject to `MemoryPolicy` enforcement at the transport (see "Memory Safety" section above).
 - `read_word_le(transport, addr) -> int` -- Read 16-bit little-endian
 - `read_dword_le(transport, addr) -> int` -- Read 32-bit little-endian
 - `hex_dump(transport, addr, length) -> str` -- Formatted hex dump string
