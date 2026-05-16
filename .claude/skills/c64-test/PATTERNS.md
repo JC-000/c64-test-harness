@@ -412,19 +412,162 @@ with create_manager() as mgr:
 
 The U64 path requires BASIC-READY state (the trampoline is triggered via the keyboard buffer). On U64 timeout, the exception message distinguishes "subroutine never started" (running flag still `0x00`) from "started but never returned" (running flag `0x01`, done flag never `0x02`).
 
-### Threading `lock_timeout` for long parallel benches
+### Queueing for the U64 — `DeviceLock` heartbeat + `DeviceLockTimeout`
 
-`create_manager(lock_timeout=...)` threads through to `_LockedU64Manager` and bounds the wait against **stuck** holders only (a live, progressing holder extends the deadline indefinitely; see `progress_window`). Default 60s is fine for short tests; long benches that hold the device for tens of minutes per acquisition need a higher ceiling so a queued process doesn't time out behind a legitimately-busy peer.
+See "Pattern 9a" below for the full queueing semantics, the structured `DeviceLockTimeout` diagnostics, and the anti-patterns agents repeatedly hit. The short version: with the heartbeat in place, `lock_timeout` now bounds the wait against **wedged or dead** holders only — a live, progressing holder extends the deadline indefinitely, so widening `lock_timeout` to "wait out" a busy peer is almost never the right move.
+
+---
+
+## Pattern 9a: Queueing for the U64 / Interpreting `DeviceLockTimeout`
+
+The shared U64E hardware is queued behind a single `DeviceLock` per device. Two mechanisms make the queue robust:
+
+1. The lockfile is held with `fcntl.flock(LOCK_EX)`. The kernel releases it automatically when the holder process exits (crash-safe).
+2. While held, the holder runs a daemon thread that bumps the lockfile **mtime** every ~15 s (configurable via `DeviceLock(host, heartbeat_interval=...)`; `None` or `0` disables).
+
+Waiters call `acquire(timeout, progress_window=60.0)`. On every poll, if the holder PID is alive AND the lockfile mtime is within `progress_window` seconds, the waiter's deadline is reset. **So a legitimate long-running holder never causes a waiter timeout.**
+
+### What an `acquire()` timeout actually means now
+
+With the heartbeat in place, `acquire()` returning `False` (or `acquire_or_raise()` raising `DeviceLockTimeout`) is a meaningful diagnosis, not a "device is broken" signal. Exactly one of these is true:
+
+- **Holder is dead** — PID gone, lockfile metadata left behind. Self-heals on next `acquire()` (the opportunistic `cleanup_stale()` removes it); just retry.
+- **Holder is wedged** — PID alive but hasn't heartbeat'd in > `progress_window` seconds. The holder process, not the device, needs attention.
+- **No holder metadata** — race during a stale-cleanup cycle. Retry once.
+- **Queued behind a healthy holder with `progress_window=None`** — i.e. you opted out of queue-aware semantics. The holder is still progressing; bump your `timeout` or restore the default `progress_window`.
+
+A timeout is **never** "the device is broken." If you want to know whether the device itself is reachable, read `DeviceLockTimeout.device_reachable_rest`.
+
+### Reading a `DeviceLockTimeout`
+
+`acquire_or_raise()` raises `DeviceLockTimeout` (a `TimeoutError` subclass, exported from the top-level package) with structured fields and a diagnosed-state `__str__`:
 
 ```python
-from c64_test_harness import create_manager
+from c64_test_harness import DeviceLock, DeviceLockTimeout
 
-# 30-minute upper bound against stuck holders; live progressing holders
-# still extend the deadline beyond this.
-with create_manager(lock_timeout=1800.0) as mgr:
-    with mgr.instance() as target:
-        ...
+lock = DeviceLock("10.43.23.81")
+try:
+    lock.acquire_or_raise(timeout=120.0)
+except DeviceLockTimeout as e:
+    # Structured fields — log all of them.
+    log.error(
+        "lock acquire failed: host=%s holder_pid=%s pid_alive=%s "
+        "lockfile_age=%ss reachable_rest=%s",
+        e.device_host, e.holder_pid, e.pid_alive,
+        e.lockfile_age_seconds, e.device_reachable_rest,
+    )
+
+    # Branch by message text — these strings are stable and grep-friendly.
+    msg = str(e)
+    if "stale lock from dead PID" in msg:
+        # Self-healing on next acquire — single retry.
+        lock.acquire_or_raise(timeout=120.0)
+    elif "no holder metadata found" in msg:
+        # Race during stale-cleanup; single retry.
+        lock.acquire_or_raise(timeout=120.0)
+    elif "queued behind live, progressing PID" in msg:
+        # Healthy holder. Do NOT reboot the device. Either bump timeout
+        # (only when you know how long the holder runs) or wait for it
+        # to finish. See anti-patterns below.
+        raise
+    elif "holder may be wedged" in msg:
+        # Holder process needs attention — NOT the U64. Check the holder;
+        # do not unilaterally reboot the device.
+        raise
+    else:
+        raise
 ```
+
+The four diagnosed-state phrases are produced by `DeviceLockTimeout._build_message` and are stable across releases:
+
+| Phrase in `str(e)` | Meaning | Right move |
+|---|---|---|
+| `queued behind live, progressing PID X` | Healthy holder, queue working | Wait for holder, or bump `timeout` only if you know its duration |
+| `holder PID X is alive but the lockfile hasn't been touched in Ns` | Holder wedged | Investigate the holder process; do not reboot the device |
+| `stale lock from dead PID X` | Dead holder, self-healing | Retry once |
+| `no holder metadata found` | Race | Retry once |
+
+The message is suffixed with `; device REST API responsive` or `; device REST API unreachable` so an agent reading the log can immediately separate "queued" from "device fell off the network."
+
+### Usage patterns
+
+**Direct `DeviceLock` (pytest fixture):** prefer `acquire_or_raise` over `acquire` + manual skip. The exception's `__str__` is the diagnostic; pass it straight to `pytest.skip` and the message ends up in the test log unchanged.
+
+```python
+import pytest
+from c64_test_harness import DeviceLock, DeviceLockTimeout
+from c64_test_harness.backends.ultimate64 import Ultimate64Transport
+
+@pytest.fixture(scope="module")
+def transport():
+    lock = DeviceLock(_HOST)
+    try:
+        lock.acquire_or_raise(timeout=120.0)
+    except DeviceLockTimeout as e:
+        pytest.skip(str(e))  # diagnosed-state message ends up in pytest output
+    t = Ultimate64Transport(host=_HOST, password=_PW, timeout=8.0)
+    try:
+        yield t
+    finally:
+        t.close()
+        lock.release()
+```
+
+**`UnifiedManager` path:** `_LockedU64Manager.acquire()` now raises `DeviceLockTimeout` (previously a bare `RuntimeError`). `lock_timeout` bounds against **wedged or dead** holders only — the heartbeat makes live holders extend the deadline implicitly. 120 s is a reasonable ceiling for ad-hoc work; the historic "long benches need 1800 s" guidance no longer applies (see anti-patterns).
+
+```python
+from c64_test_harness import create_manager, DeviceLockTimeout
+
+try:
+    with create_manager(backend="u64", host="10.43.23.81", lock_timeout=120.0) as mgr:
+        with mgr.instance() as target:
+            ...
+except DeviceLockTimeout as e:
+    print(f"queued or wedged: {e}")
+```
+
+### Anti-patterns
+
+- **Catching `DeviceLockTimeout` and calling `client.reboot()`.** Almost always wrong. Check `e.pid_alive` and `e.device_reachable_rest` first. If `pid_alive` is `True`, the issue is a holder process, not the device — rebooting the U64 kicks the live holder mid-test and produces nothing useful. Reboot only when the diagnosis is "device unreachable" AND there's no live holder.
+- **Catching `DeviceLockTimeout` and calling `client.poweroff()`.** Always wrong. `poweroff()` disconnects the U64 until physical power-cycle (CLAUDE.md "Destructive U64E endpoints and the poweroff guard"). The `confirm_irrecoverable=True` guard exists precisely for this misuse.
+- **Bumping `lock_timeout` to "wait out" a known long-running holder.** With queue-aware semantics, a healthy long holder already extends the waiter's deadline — no bump needed. The correct action when a peer is running a multi-hour suite is to wait for the peer to exit (or pre-coordinate), not to widen the timeout. Bumping `lock_timeout` only matters when the holder is wedged or dead, which is rarely the situation you actually want to wait out.
+- **Disabling the heartbeat (`heartbeat_interval=None`) because tests are flaky.** The heartbeat is what makes queue-aware semantics work. Disable it only in unit tests that need deterministic mtime control (see `tests/test_device_lock_heartbeat.py::TestHeartbeatStopsOnRelease` for the legitimate use).
+- **Treating a `DeviceLockTimeout` as "device unreachable" without reading `device_reachable_rest`.** The field is the dedicated signal for that; the rest of the diagnostics are about the queue.
+
+### Diagnostic recipe
+
+Inspect the current lock state of a host without acquiring:
+
+```python
+from c64_test_harness import DeviceLock
+
+lock = DeviceLock("10.43.23.81")
+info = lock.read_info()
+# → {"pid": 12345, "ts": 1700000000.0, "device_host": "10.43.23.81"}
+# or None if the lockfile is missing or unreadable.
+print(info)
+```
+
+Tell whether the flock is **actually** held vs the file just being metadata-stale:
+
+```python
+import fcntl, os
+
+path = lock._lock_path  # or build it yourself from _default_lock_dir
+fd = os.open(str(path), os.O_RDWR)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    held = False  # got it ourselves — no one holds the flock
+    fcntl.flock(fd, fcntl.LOCK_UN)
+except BlockingIOError:
+    held = True   # someone else holds the flock (or kernel-released stale state)
+finally:
+    os.close(fd)
+print("held by another process:", held)
+```
+
+`held=False` + a populated `read_info()` = stale metadata; next `acquire()` will clean it up.
+`held=True` = a real holder; combine with `read_info()["pid"]` + `os.kill(pid, 0)` to classify alive vs wedged vs dead per the table above.
 
 ---
 
@@ -869,16 +1012,23 @@ transport.write_memory(0xC000, b"\xDE\xAD")
 ```
 **Right (pytest fixture):**
 ```python
+from c64_test_harness import DeviceLockTimeout
+
 @pytest.fixture(scope="module")
 def transport():
     lock = DeviceLock(_HOST)
-    if not lock.acquire(timeout=120.0):
-        pytest.skip(f"Could not acquire device lock for {_HOST}")
+    try:
+        lock.acquire_or_raise(timeout=120.0)
+    except DeviceLockTimeout as e:
+        pytest.skip(str(e))  # diagnosed-state message in test output
     t = Ultimate64Transport(host=_HOST, password=_PW, timeout=8.0)
-    yield t
-    t.close()
-    lock.release()
+    try:
+        yield t
+    finally:
+        t.close()
+        lock.release()
 ```
+See Pattern 9a for how to read `DeviceLockTimeout` (queued vs wedged vs dead vs unreachable) and which branches warrant a reboot vs a retry.
 **Right (standalone script):**
 ```python
 with create_manager(backend="u64", u64_hosts=["192.168.1.81"]) as mgr:
