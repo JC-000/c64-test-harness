@@ -42,6 +42,14 @@ does not cycle through IMAIN — only the command-line processor does.
 
 Custom builders MUST end with `RTS` (0x60), not `JMP` or `BRK`.
 
+## Datagram size limits
+
+`uci_socket_write` accepts up to **892 bytes per call** (the constant `SOCKET_WRITE_MAX_BYTES`). This is the *empirical* firmware ceiling on the U64E: the theoretical `CMD_MAX_COMMAND_LEN - 3` from Gideon's source is 893, but the firmware truncates by exactly one byte at that boundary (a fencepost in how `command->length` counts — verified with a size sweep in `tests/test_uci_udp_send_large_live.py` and the standalone probe captured at session time). The 6502 inner loop in `build_socket_write` uses self-modifying code on the `LDA abs,Y` operand to push payloads across 6502 page boundaries in one call.
+
+For UDP, one `uci_socket_write` call produces exactly one `lwip_send` on the firmware side, which is one UDP datagram on the wire (empirically confirmed by `tests/test_uci_udp_send_live.py`'s per-call-per-datagram probe). No firmware-side coalescing. For payloads larger than 892 bytes, call `uci_socket_write` in a loop; each call emits its own UDP datagram. Receivers must reassemble in application code.
+
+`uci_socket_read` has a documented theoretical cap of 894 bytes per call (`CMD_MAX_REPLY_LEN - 2`); the empirical read-side ceiling has not been probed and may share the same off-by-one as the write side.
+
 ## Turbo speed support (`turbo_safe=True`)
 
 The UCI FPGA inside the Ultimate 64 Elite needs **~38 µs** of wall-clock time
