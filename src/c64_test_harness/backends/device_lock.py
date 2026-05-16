@@ -22,7 +22,10 @@ import fcntl
 import json
 import os
 import re
+import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 try:  # Optional dependency — see [project.optional-dependencies] notify
@@ -60,6 +63,117 @@ def _sanitize_device_id(host: str) -> str:
     return s.strip("_") or "unknown"
 
 
+class DeviceLockTimeout(TimeoutError):
+    """Raised when :meth:`DeviceLock.acquire_or_raise` exceeds its timeout.
+
+    Carries structured diagnostics so callers (and the agents reading the
+    error) can distinguish "queued behind a healthy holder" from
+    "holder wedged" from "stale metadata" from "device unreachable" — and
+    avoid the historical misdiagnosis of "device is broken, reboot it".
+
+    Attributes
+    ----------
+    device_host:
+        The device's host string (as passed to ``DeviceLock``).
+    holder_pid:
+        PID recorded in the lockfile's metadata, or ``None`` if no
+        readable metadata was found.
+    pid_alive:
+        Whether the recorded holder PID is currently alive
+        (``os.kill(pid, 0)``).  ``None`` when ``holder_pid`` is ``None``.
+    lockfile_age_seconds:
+        Wall-clock seconds since the lockfile mtime was last bumped, or
+        ``None`` if the lockfile is missing.
+    device_reachable_rest:
+        ``True`` if a quick ``GET /v1/version`` against the device's
+        REST API returned a 2xx response, ``False`` on connection or
+        timeout failure, ``None`` if the probe was skipped or the URL
+        could not be built.
+    timeout:
+        The ``timeout`` argument passed to ``acquire_or_raise``.
+    progress_window:
+        The ``progress_window`` argument used during the wait — needed
+        for the message to compare ``lockfile_age_seconds`` against.
+    """
+
+    def __init__(
+        self,
+        *,
+        device_host: str,
+        holder_pid: int | None,
+        pid_alive: bool | None,
+        lockfile_age_seconds: float | None,
+        device_reachable_rest: bool | None,
+        timeout: float,
+        progress_window: float | None = None,
+    ) -> None:
+        self.device_host = device_host
+        self.holder_pid = holder_pid
+        self.pid_alive = pid_alive
+        self.lockfile_age_seconds = lockfile_age_seconds
+        self.device_reachable_rest = device_reachable_rest
+        self.timeout = timeout
+        self.progress_window = progress_window
+        super().__init__(self._build_message())
+
+    def _build_message(self) -> str:
+        # Tag for device reachability — appended to the diagnosed-state
+        # sentence so agents stop conflating "queued" with "broken".
+        if self.device_reachable_rest is True:
+            reach = "; device REST API responsive"
+        elif self.device_reachable_rest is False:
+            reach = "; device REST API unreachable"
+        else:
+            reach = ""
+
+        host_tag = f" on {self.device_host!r}"
+
+        # No holder metadata at all — race or fresh stale-cleanup
+        if self.holder_pid is None:
+            return (
+                f"DeviceLock acquire timed out after {self.timeout}s{host_tag}: "
+                f"no holder metadata found; acquire still failed (race?)"
+                f"{reach}"
+            )
+
+        # Dead holder PID — cleanup_stale should have removed this, but
+        # we hit the timeout anyway (e.g. test monkeypatched it out, or
+        # a real race).
+        if self.pid_alive is False:
+            return (
+                f"DeviceLock acquire timed out after {self.timeout}s{host_tag}: "
+                f"stale lock from dead PID {self.holder_pid}; will be cleaned "
+                f"on next acquire — retry"
+                f"{reach}"
+            )
+
+        # From here pid is alive.
+        age = self.lockfile_age_seconds
+        age_text = (
+            f"{age:.0f}s" if isinstance(age, (int, float)) else "unknown"
+        )
+        pw = self.progress_window
+        wedged = (
+            isinstance(age, (int, float))
+            and isinstance(pw, (int, float))
+            and age > pw
+        )
+        if wedged:
+            return (
+                f"DeviceLock acquire timed out after {self.timeout}s{host_tag}: "
+                f"holder PID {self.holder_pid} is alive but the lockfile "
+                f"hasn't been touched in {age_text}; holder may be wedged"
+                f"{reach}"
+            )
+        return (
+            f"DeviceLock acquire timed out after {self.timeout}s{host_tag}: "
+            f"queued behind live, progressing PID {self.holder_pid} "
+            f"(lockfile age {age_text}); retry with a larger timeout — "
+            f"device is healthy"
+            f"{reach}"
+        )
+
+
 class DeviceLock:
     """Cross-process exclusive lock for a hardware device.
 
@@ -92,12 +206,20 @@ class DeviceLock:
         self,
         device_host: str,
         lock_dir: Path | None = None,
+        *,
+        heartbeat_interval: float | None = 15.0,
     ) -> None:
         self._device_host = device_host
         self._device_id = _sanitize_device_id(device_host)
         self._lock_dir = lock_dir or _default_lock_dir()
         self._lock_path = self._lock_dir / f"device-{self._device_id}.lock"
         self._fd: int | None = None
+        # Heartbeat: keep the lockfile mtime fresh so waiters using
+        # queue-aware acquire() see this holder as "progressing" past
+        # their progress_window.  None/0/negative disables.
+        self._heartbeat_interval = heartbeat_interval
+        self._heartbeat_stop: threading.Event | None = None
+        self._heartbeat_thread: threading.Thread | None = None
 
     @property
     def device_host(self) -> str:
@@ -149,7 +271,9 @@ class DeviceLock:
             timeout).
         """
         if self._fd is not None:
-            return True  # Already held by us
+            # Already held by us; ensure heartbeat is running (idempotent).
+            self._start_heartbeat()
+            return True
 
         # Best-effort hygiene: a corrupt file shouldn't block legitimate acquirers.
         try:
@@ -163,6 +287,7 @@ class DeviceLock:
             while True:
                 result = self._try_acquire_once()
                 if result:
+                    self._start_heartbeat()
                     return True
                 # Queue-aware: if the current holder is live and recently
                 # progressing, extend the deadline.
@@ -183,6 +308,88 @@ class DeviceLock:
         finally:
             if notifier is not None:
                 notifier.stop()
+
+    def acquire_or_raise(
+        self,
+        timeout: float = 30.0,
+        *,
+        progress_window: float | None = 60.0,
+    ) -> None:
+        """Acquire the lock or raise :class:`DeviceLockTimeout` with diagnostics.
+
+        Thin wrapper around :meth:`acquire` that turns the bare ``False``
+        return value into a structured exception:
+
+        * holder PID, liveness, and lockfile age (the three signals that
+          tell you whether you're queued behind a healthy holder or
+          something is wrong)
+        * a quick reachability probe against the device's REST API
+          (``GET /v1/version``) so the message disambiguates "queued"
+          from "device broken"
+
+        ``acquire()``'s contract is unchanged — this method is purely
+        additive.
+
+        :raises DeviceLockTimeout: when the underlying ``acquire`` returns
+            ``False``.
+        """
+        if self.acquire(timeout=timeout, progress_window=progress_window):
+            return
+        # Acquire failed — gather diagnostics before raising.
+        info = self.read_info()
+        holder_pid: int | None = None
+        if isinstance(info, dict):
+            raw = info.get("pid")
+            if isinstance(raw, int):
+                holder_pid = raw
+        pid_alive: bool | None
+        if holder_pid is None:
+            pid_alive = None
+        else:
+            pid_alive = _pid_alive(holder_pid)
+        # Lockfile age
+        age: float | None
+        try:
+            st = os.stat(str(self._lock_path))
+            age = max(0.0, time.time() - st.st_mtime)
+        except OSError:
+            age = None
+        # Device REST reachability — fast probe, never let it dominate.
+        reachable = self._probe_rest_reachable()
+        raise DeviceLockTimeout(
+            device_host=self._device_host,
+            holder_pid=holder_pid,
+            pid_alive=pid_alive,
+            lockfile_age_seconds=age,
+            device_reachable_rest=reachable,
+            timeout=timeout,
+            progress_window=progress_window,
+        )
+
+    def _probe_rest_reachable(self) -> bool | None:
+        """Best-effort ``GET /v1/version`` against the device.
+
+        Returns ``True`` on any 2xx response, ``False`` on connection /
+        timeout / HTTP error, ``None`` if a URL cannot be built (empty
+        host, etc.).  Capped at a 3s budget so it never dominates the
+        caller's flow.
+        """
+        host = (self._device_host or "").strip()
+        if not host:
+            return None
+        try:
+            url = f"http://{host}/v1/version"
+        except Exception:
+            return None
+        try:
+            with urllib.request.urlopen(url, timeout=3.0) as resp:
+                status = getattr(resp, "status", None) or resp.getcode()
+                return 200 <= int(status) < 300
+        except (urllib.error.URLError, TimeoutError, OSError):
+            return False
+        except Exception:
+            # Defensive: don't let a probe oddity hide the timeout.
+            return False
 
     def _holder_is_progressing(self, progress_window: float) -> bool:
         """True iff the lockfile holder is alive AND mtime is recent.
@@ -262,6 +469,9 @@ class DeviceLock:
             return
         fd = self._fd
         self._fd = None
+        # Stop the heartbeat before unlinking/releasing so the thread
+        # doesn't race with the final mtime bump or the fd close.
+        self._stop_heartbeat()
         # Cooperative wake-up: bump mtime BEFORE releasing the flock so
         # the fs-event is observed by waiters that immediately retry.
         try:
@@ -380,6 +590,76 @@ class DeviceLock:
             os.write(self._fd, data)
         except OSError:
             pass
+
+    # -- Heartbeat --
+
+    def _start_heartbeat(self) -> None:
+        """Start a daemon thread that periodically bumps the lockfile mtime.
+
+        The heartbeat keeps the lockfile mtime fresh so queue-aware waiters
+        (``progress_window``) see this holder as "progressing" instead of
+        falling back to the hard-timeout deadline.  Only the mtime is
+        touched — the JSON metadata is preserved.
+
+        Idempotent: a no-op if a heartbeat thread is already running, or
+        if the interval is disabled (``None``, ``0``, or negative).
+        """
+        interval = self._heartbeat_interval
+        if interval is None or interval <= 0:
+            return
+        if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+            return
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=self._heartbeat_loop,
+            args=(stop, interval),
+            name=f"DeviceLock-heartbeat-{self._device_id}",
+            daemon=True,
+        )
+        self._heartbeat_stop = stop
+        self._heartbeat_thread = thread
+        thread.start()
+
+    def _stop_heartbeat(self) -> None:
+        """Signal the heartbeat thread to exit and join briefly.
+
+        Safe to call when no heartbeat is running.
+        """
+        stop = self._heartbeat_stop
+        thread = self._heartbeat_thread
+        self._heartbeat_stop = None
+        self._heartbeat_thread = None
+        if stop is not None:
+            stop.set()
+        if thread is not None and thread is not threading.current_thread():
+            # Brief join — the loop wakes on the Event every interval.
+            thread.join(timeout=2.0)
+
+    def _heartbeat_loop(
+        self, stop: threading.Event, interval: float
+    ) -> None:
+        """Thread body: bump mtime every *interval* seconds until *stop*.
+
+        Exits quietly on ``FileNotFoundError`` (lockfile unlinked under
+        us) or any other ``OSError``.  Never propagates exceptions —
+        a misbehaving heartbeat must not crash the holder.
+        """
+        path = str(self._lock_path)
+        while not stop.is_set():
+            # Wait first so the very first bump (from _write_metadata)
+            # isn't immediately overwritten; this also makes tests that
+            # disable the heartbeat predictable.
+            if stop.wait(interval):
+                return
+            try:
+                os.utime(path, None)
+            except FileNotFoundError:
+                return
+            except OSError:
+                # Filesystem hiccup — stop quietly rather than spinning.
+                return
+            except Exception:  # pragma: no cover - defensive
+                return
 
 
 def _pid_alive(pid: int) -> bool:
