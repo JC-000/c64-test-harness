@@ -11,9 +11,11 @@ is exercised here too so a later "lift the cap" change can flip the
 boundary case without rewriting the probe.
 
 KEY FACT (from Gideon's firmware source): WRITE_SOCKET maps 1:1 onto
-``lwip_send`` for UDP — one call == one datagram on the wire — with a
-firmware-side ceiling of ~893 bytes per datagram.  This test proves the
-1:1 part end-to-end on real hardware.
+``lwip_send`` for UDP — one call == one datagram on the wire — with an
+empirical firmware-side ceiling of 892 bytes per datagram (theoretical
+``CMD_MAX_COMMAND_LEN - 3`` is 893 but the firmware truncates by one at
+that boundary; see ``SOCKET_WRITE_MAX_BYTES`` in uci_network.py).  This
+test proves the 1:1 part end-to-end on real hardware.
 
 Usage::
 
@@ -368,9 +370,15 @@ def test_uci_udp_send_one_write_per_datagram() -> None:
         )
 
         # -----------------------------------------------------------------
-        # Sanity: the 255-byte cap.  This documents the CURRENT limit so a
-        # later "cap raised to 893" change in Stream B has a single
-        # canonical place to update.
+        # Sanity: the 892-byte cap (lifted from 255 in Stream B).
+        # Boundary cases:
+        #   - 893-byte payload: must raise ValueError (over the cap).
+        #   - 892-byte payload: must succeed (right at the empirical
+        #     firmware ceiling — see SOCKET_WRITE_MAX_BYTES comment for
+        #     why 892 and not the theoretical 893).
+        # The detailed end-to-end check (one datagram on the wire,
+        # payload bytes intact) lives in test_uci_udp_send_large_live.py
+        # — this probe just guards against accidental cap regressions.
         # -----------------------------------------------------------------
         # Use a fresh socket for this; the previous one is closed.
         sentinel_listener, sentinel_port = _open_listener()
@@ -382,12 +390,28 @@ def test_uci_udp_send_one_write_per_datagram() -> None:
             )
             with pytest.raises(ValueError):
                 uci_socket_write(
-                    transport, sentinel_socket_id, b"X" * 256,
+                    transport, sentinel_socket_id, b"X" * 893,
                     timeout=UCI_CALL_TIMEOUT,
                 )
             print(
-                "PASS: uci_socket_write(256-byte payload) raises "
+                "PASS: uci_socket_write(893-byte payload) raises "
                 "ValueError as documented.",
+                flush=True,
+            )
+            # 892 must succeed (no exception); we don't validate the
+            # datagram contents here — large_live test covers that.
+            uci_socket_write(
+                transport, sentinel_socket_id, b"X" * 892,
+                timeout=UCI_CALL_TIMEOUT,
+            )
+            # Drain any datagram so it doesn't disturb later state.
+            try:
+                sentinel_listener.recvfrom(2048)
+            except socket.timeout:
+                pass
+            print(
+                "PASS: uci_socket_write(892-byte payload) succeeded "
+                "(empirical firmware ceiling).",
                 flush=True,
             )
         finally:

@@ -168,9 +168,13 @@ _LDA_IMM = 0xA9
 _LDA_ABS = 0xAD
 _LDX_IMM = 0xA2
 _LDY_IMM = 0xA0
+_LDY_ABS = 0xAC
 _STA_ABS = 0x8D
 _STY_ABS = 0x8C
 _AND_IMM = 0x29
+_ORA_ABS = 0x0D
+_INC_ABS = 0xEE
+_DEC_ABS = 0xCE
 _BNE     = 0xD0
 _BEQ     = 0xF0
 _INY     = 0xC8
@@ -207,6 +211,47 @@ _SOCKET_ID_ADDR = 0xC100
 _DATA_BUF_ADDR  = 0xC101
 _DATA_LEN_ADDR  = 0xC1FF
 _HOST_ADDR      = 0xC100
+
+# Scratch bytes for the 16-bit socket-write inner loop.  These are
+# baked into the SMC routine emitted by ``build_socket_write`` and live
+# in the harness scratch page ($C000-$CFFF, see docs/memory_safety.md).
+# They sit safely above the response/status block ($C200-$C3FF) and the
+# default write data buffer at $C500+ used by ``uci_socket_write``.
+_INNER_LOOP_CNT_LO = 0xC400   # 16-bit countdown, low byte
+_INNER_LOOP_CNT_HI = 0xC401   # 16-bit countdown, high byte
+_INNER_LOOP_Y_SAVE = 0xC402   # Y register save slot across turbo fence
+
+# Layout used by the lifted-cap ``uci_socket_write`` helper.
+#
+# The legacy buffer ($C101-$C1FF) only holds 255 bytes; the new cap
+# (892 bytes empirical, see SOCKET_WRITE_MAX_BYTES below) needs a
+# buffer that does not overlap (a) the response/status/sentinel area
+# at $C200-$C3FF, (b) the inner-loop scratch at $C400-$C402, (c) the
+# turbo-safe routine code itself, which can exceed 400 bytes and so
+# spills past the default $C100 socket-id slot.
+#
+# Both addresses live above the turbo-safe routine footprint and the
+# 6502 scratch block:
+#   $C403  socket_id  (1 byte)
+#   $C500  data       (up to 892 bytes through $C87B)
+# data_len_addr is placed immediately after the payload (2 bytes LE).
+_WRITE_SOCKET_ID_ADDR = 0xC403
+_WRITE_DATA_BUF_ADDR  = 0xC500
+
+# EMPIRICAL firmware-side ceiling for one WRITE_SOCKET command.
+#
+# The theoretical ceiling from Gideon's source is CMD_MAX_COMMAND_LEN
+# (896) minus the 3-byte target/cmd/socket_id frame overhead = 893
+# (see software/io/command_interface/command_intf.h and
+# network_target.cc).  Live U64E testing showed the firmware truncates
+# by exactly one byte at that boundary: pushing 893 payload bytes
+# produces a 892-byte UDP datagram on the wire (verified with
+# /tmp/uci_udp_ceiling_probe.py — 255..892 round-trip clean, 893
+# arrives as 892).  Likely a fencepost in how the firmware counts
+# command->length.  Pushing 892 round-trips clean; the 6502 routine in
+# build_socket_write was simulator-verified for sizes through 893 so
+# the discrepancy is firmware-side, not harness-side.
+SOCKET_WRITE_MAX_BYTES = 892
 
 
 def _lo(addr: int) -> int:
@@ -1145,8 +1190,30 @@ def build_socket_write(
 ) -> bytes:
     """Build routine: SOCKET_WRITE.
 
-    Socket ID is read from *socket_id_addr* (1 byte).
-    Data is at *data_addr*, length (1 byte, max 255) at *data_len_addr*.
+    Socket ID is read from *socket_id_addr* (1 byte).  Data is at
+    *data_addr*; length is a 16-bit little-endian count at
+    ``data_len_addr`` (low byte) and ``data_len_addr + 1`` (high byte).
+    Maximum payload is :data:`SOCKET_WRITE_MAX_BYTES` (892) bytes — the
+    empirically-verified firmware ceiling.  The theoretical ceiling
+    from ``CMD_MAX_COMMAND_LEN - 3`` is 893 but the U64E firmware
+    truncates by one byte at that boundary; see the comment on
+    :data:`SOCKET_WRITE_MAX_BYTES` for the evidence.
+
+    The inner loop uses self-modifying code on the operand of an
+    ``LDA abs,Y`` to advance through pages when ``Y`` wraps, so the
+    payload may cross 6502 page boundaries freely (one WRITE_SOCKET
+    command on the wire — never fragmented into multiple datagrams).
+
+    Three scratch bytes are emitted into the routine for the 16-bit
+    countdown and a Y-register save slot used to bridge the turbo
+    delay-loop fence (which clobbers Y):
+    :data:`_INNER_LOOP_CNT_LO`, :data:`_INNER_LOOP_CNT_HI`,
+    :data:`_INNER_LOOP_Y_SAVE`.
+
+    Callers using the legacy default ``data_len_addr = $C1FF`` should
+    note that the high byte now lives at ``$C200`` (the response area).
+    Use :func:`uci_socket_write` for the safe layout, or pass an
+    explicit ``data_len_addr`` clear of the response/status block.
 
     :param turbo_safe: see :func:`build_uci_command`.
     """
@@ -1200,65 +1267,146 @@ def build_socket_write(
             _STA_ABS, _lo(UCI_CMD_DATA_REG), _hi(UCI_CMD_DATA_REG),
         ])
 
+    # ------------------------------------------------------------------
+    # 16-bit payload loop (max 892 bytes per call — empirical firmware
+    # ceiling; see SOCKET_WRITE_MAX_BYTES).
+    #
+    # SCHEME (both 1 MHz and turbo-safe paths): self-modify the operand
+    # of an ``LDA abs,Y`` so Y can wrap freely.  Use a 16-bit countdown
+    # in two scratch bytes (cnt_lo / cnt_hi) for the termination check.
+    # When Y wraps (Z=1 after INY), bump the high byte of the LDA
+    # operand by one page.
+    #
+    # SETUP (24 bytes, identical on both paths):
+    #     LDA data_len_addr     ; copy 16-bit len into cnt_lo/cnt_hi
+    #     STA cnt_lo
+    #     LDA data_len_addr+1
+    #     STA cnt_hi
+    #     LDA #<data_addr       ; SMC: patch LDA-abs,Y operand
+    #     STA fetch_op+1
+    #     LDA #>data_addr
+    #     STA fetch_op+2
+    #     LDY #$00
+    # LOOP (1 MHz path, 34 bytes from loop entry to JMP loop):
+    #   loop:
+    #     LDA cnt_lo            ; 16-bit zero check
+    #     ORA cnt_hi
+    #     BEQ done              ; +N forward
+    #   fetch_op:
+    #     LDA $XXXX,Y           ; operand patched by SMC
+    #     STA $DF1D             ; UCI_CMD_DATA_REG
+    #     INY                   ; Y++; Z=1 iff Y wrapped 255->0
+    #     BNE no_page_wrap      ; +3
+    #     INC fetch_op+2        ; advance page on wrap
+    #   no_page_wrap:
+    #     LDA cnt_lo            ; 16-bit decrement of cnt
+    #     BNE no_borrow         ; +3
+    #     DEC cnt_hi            ; cnt_lo was 0, borrow from high
+    #   no_borrow:
+    #     DEC cnt_lo
+    #     JMP loop
+    #   done:
+    #
+    # TURBO-SAFE path:
+    #   - Insert <fence> (16 bytes) between STA $DF1D and INY.  The
+    #     fence preserves A and X but TRASHES Y, so we wrap it with
+    #     STY y_save / LDY y_save (3 bytes each) to preserve Y across
+    #     the delay.  Loop body grows by 16 + 3 + 3 = 22 bytes.
+    #
+    # CORRECTNESS NOTES:
+    #   - Y starts at 0; SMC base = data_addr.  Iteration N reads
+    #     data_addr+N (16-bit) — page increments happen at the exact
+    #     moment Y wraps so the addressing is always correct.
+    #   - cnt is decremented AFTER each write; the BEQ-done check sees
+    #     the post-write count, so len=0 results in zero writes and
+    #     len=N results in exactly N writes.
+    #   - Branch offsets:
+    #       BEQ done   1 MHz: 26    turbo: 26 + 16 + 3 + 3 = 48
+    #       BNE no_page_wrap : 3 (3-byte INC over)
+    #       BNE no_borrow    : 3 (3-byte DEC over)
+    #     All fit in signed 8-bit branch range.
+    # ------------------------------------------------------------------
+    cnt_lo  = _INNER_LOOP_CNT_LO
+    cnt_hi  = _INNER_LOOP_CNT_HI
+    y_save  = _INNER_LOOP_Y_SAVE
+
+    # --- Setup: copy 16-bit len into cnt; patch SMC operand. ---
+    code.extend([
+        _LDA_ABS, _lo(data_len_addr), _hi(data_len_addr),
+        _STA_ABS, _lo(cnt_lo), _hi(cnt_lo),
+        _LDA_ABS, _lo(data_len_addr + 1), _hi(data_len_addr + 1),
+        _STA_ABS, _lo(cnt_hi), _hi(cnt_hi),
+        _LDA_IMM, _lo(data_addr),
+    ])
+    fetch_op_lo_patch_pos = len(code)  # remember to fill in STA target
+    # ``STA fetch_op+1`` — we'll patch this STA's operand to point at
+    # the LDA-abs,Y operand byte once we know fetch_op's address.
+    code.extend([_STA_ABS, 0x00, 0x00])  # patched below
+    code.extend([_LDA_IMM, _hi(data_addr)])
+    fetch_op_hi_patch_pos = len(code)
+    code.extend([_STA_ABS, 0x00, 0x00])  # patched below
+    code.extend([_LDY_IMM, 0x00])
+
+    # --- Loop entry ---
+    loop_abs = pc()
+    code.extend([
+        _LDA_ABS, _lo(cnt_lo), _hi(cnt_lo),
+        _ORA_ABS, _lo(cnt_hi), _hi(cnt_hi),
+    ])
+    beq_done_pos = len(code)
+    code.extend([_BEQ, 0x00])  # offset patched after we know `done` pos
+
+    # --- fetch_op: LDA $XXXX,Y (SMC operand) ---
+    fetch_op_abs = pc()
+    code.extend([_LDA_ABS_Y, _lo(data_addr), _hi(data_addr)])
+    # Now we know fetch_op's address, so the two earlier STA targets
+    # are ``fetch_op + 1`` (low operand byte) and ``fetch_op + 2``
+    # (high operand byte).
+    fetch_op_operand_lo = fetch_op_abs + 1
+    fetch_op_operand_hi = fetch_op_abs + 2
+    code[fetch_op_lo_patch_pos + 1] = _lo(fetch_op_operand_lo)
+    code[fetch_op_lo_patch_pos + 2] = _hi(fetch_op_operand_lo)
+    code[fetch_op_hi_patch_pos + 1] = _lo(fetch_op_operand_hi)
+    code[fetch_op_hi_patch_pos + 2] = _hi(fetch_op_operand_hi)
+
+    # --- STA $DF1D ---
+    code.extend([_STA_ABS, _lo(UCI_CMD_DATA_REG), _hi(UCI_CMD_DATA_REG)])
+
+    # --- Optional fence (turbo-safe) with Y save/restore ---
     if turbo_safe:
-        # Turbo-safe payload loop — fence after each STA $DF1D, JMP back
-        # because short BNE can't reach over a fence expansion.
-        #
-        #   LDA data_len; TAX; LDY #0
-        #   loop:
-        #     TXA
-        #     BEQ +3   -> skip JMP write  (X=0 means done)
-        #     JMP write
-        #     JMP done            ; fall-through when no more bytes
-        #   write:
-        #     LDA data,Y
-        #     STA $DF1D
-        #     <fence>
-        #     INY
-        #     DEX
-        #     JMP loop
-        #   done:
-        code.extend([_LDA_ABS, _lo(data_len_addr), _hi(data_len_addr)])
-        code.append(_TAX)
-        code.extend([_LDY_IMM, 0x00])
-        loop_abs = pc()
-        code.append(_TXA)
-        code.extend([_BEQ, 0x03])  # skip JMP write
-        jmp_write_pos = len(code)
-        code.extend([_JMP_ABS, 0x00, 0x00])  # patched to write
-        jmp_done_pos = len(code)
-        code.extend([_JMP_ABS, 0x00, 0x00])  # patched to done
-        # write:
-        write_abs = pc()
-        code[jmp_write_pos + 1] = _lo(write_abs)
-        code[jmp_write_pos + 2] = _hi(write_abs)
-        code.extend([_LDA_ABS_Y, _lo(data_addr), _hi(data_addr)])
-        code.extend([_STA_ABS, _lo(UCI_CMD_DATA_REG),
-                     _hi(UCI_CMD_DATA_REG)])
+        code.extend([_STY_ABS, _lo(y_save), _hi(y_save)])
         code.extend(_build_fence())
-        code.append(_INY)
-        code.append(_DEX)
-        code.extend([_JMP_ABS, _lo(loop_abs), _hi(loop_abs)])
-        # done:
-        done_abs = pc()
-        code[jmp_done_pos + 1] = _lo(done_abs)
-        code[jmp_done_pos + 2] = _hi(done_abs)
-    else:
-        # Write data bytes using X as counter, Y as index — 1 MHz path.
-        code.extend([
-            _LDA_ABS, _lo(data_len_addr), _hi(data_len_addr),
-            _TAX,
-            _LDY_IMM, 0x00,
-            # loop:
-            _TXA,
-            _BEQ, 10,     # skip to done: LDA(3)+STA(3)+INY(1)+DEX(1)+BNE(2) = 10
-            _LDA_ABS_Y, _lo(data_addr), _hi(data_addr),
-            _STA_ABS, _lo(UCI_CMD_DATA_REG), _hi(UCI_CMD_DATA_REG),
-            _INY,
-            _DEX,
-            _BNE, 0xF3,   # -13 back to TXA
-            # done:
-        ])
+        code.extend([_LDY_ABS, _lo(y_save), _hi(y_save)])
+
+    # --- INY ; BNE no_page_wrap ; INC fetch_op+2 ; no_page_wrap: ---
+    code.append(_INY)
+    code.extend([_BNE, 0x03])  # +3 over INC abs
+    code.extend([_INC_ABS,
+                 _lo(fetch_op_operand_hi), _hi(fetch_op_operand_hi)])
+
+    # --- LDA cnt_lo ; BNE no_borrow ; DEC cnt_hi ; no_borrow: ---
+    code.extend([_LDA_ABS, _lo(cnt_lo), _hi(cnt_lo)])
+    code.extend([_BNE, 0x03])  # +3 over DEC abs
+    code.extend([_DEC_ABS, _lo(cnt_hi), _hi(cnt_hi)])
+
+    # --- DEC cnt_lo ; JMP loop ---
+    code.extend([_DEC_ABS, _lo(cnt_lo), _hi(cnt_lo)])
+    code.extend([_JMP_ABS, _lo(loop_abs), _hi(loop_abs)])
+
+    # --- done: patch BEQ offset ---
+    done_abs = pc()
+    beq_target_pc = (code_addr + beq_done_pos + 2)  # PC after BEQ
+    branch_offset = done_abs - beq_target_pc
+    if not (-128 <= branch_offset <= 127):
+        # Sanity guard: the layout above is fixed-size, so this should
+        # never fire — but keep the check so a future change that
+        # widens the loop body trips loudly instead of silently
+        # emitting a wrong branch.
+        raise AssertionError(
+            f"BEQ done offset {branch_offset} out of 8-bit range; "
+            "inner loop body grew beyond branch reach."
+        )
+    code[beq_done_pos + 1] = branch_offset & 0xFF
 
     # Push and wait
     if turbo_safe:
@@ -1720,21 +1868,47 @@ def uci_socket_write(
 ) -> None:
     """Write *data* to a UCI socket.
 
-    *data* must be at most 255 bytes (single-call limit due to Y register
-    indexing).  For larger payloads, call this function in a loop.
+    *data* must be at most :data:`SOCKET_WRITE_MAX_BYTES` (892) bytes —
+    the EMPIRICALLY-verified firmware ceiling.  Theory from Gideon's
+    source (``CMD_MAX_COMMAND_LEN`` 896 minus the 3-byte target / cmd /
+    socket_id frame overhead in ``software/io/command_interface/``
+    ``command_intf.h`` and ``network_target.cc``) gives 893, but the
+    live U64E truncates by one byte at 893: pushing 893 payload bytes
+    produces a 892-byte UDP datagram on the wire.  See the comment on
+    :data:`SOCKET_WRITE_MAX_BYTES` for the empirical evidence.  One call
+    maps 1:1 onto one ``lwip_send`` on the firmware side — for UDP that
+    is one datagram on the wire (empirically confirmed by Stream A).
+
+    For payloads larger than 892 bytes, call this function in a loop;
+    each call emits its own ``WRITE_SOCKET`` command (and, for UDP, its
+    own datagram).
+
+    The data buffer is staged at ``$C500`` (in the harness scratch page,
+    clear of the response/status block at ``$C200-$C3FF``); the 16-bit
+    little-endian length sits immediately after the payload.  See
+    :func:`build_socket_write` for the inner-loop scratch addresses.
 
     :param turbo_safe: see :func:`build_uci_command`.
     """
-    if len(data) > 255:
-        raise ValueError(f"data must be <= 255 bytes, got {len(data)}")
+    if len(data) > SOCKET_WRITE_MAX_BYTES:
+        raise ValueError(
+            f"data must be <= {SOCKET_WRITE_MAX_BYTES} bytes, got {len(data)}"
+        )
 
-    socket_id_addr = _DATA_ADDR
-    data_area = _DATA_ADDR + 1
-    data_len_addr = _DATA_ADDR + 1 + len(data)
+    # Both addresses live ABOVE the turbo-safe routine footprint
+    # (which can extend past $C100 — the legacy socket_id slot — and
+    # corrupt it during ``write_memory(code_addr, code)``).
+    socket_id_addr = _WRITE_SOCKET_ID_ADDR    # $C403 — 1 byte
+    data_area     = _WRITE_DATA_BUF_ADDR      # $C500 — up to 892 bytes
+    data_len_addr = data_area + len(data)     # 2 bytes LE (lo, hi)
 
     transport.write_memory(socket_id_addr, bytes([socket_id]))
-    transport.write_memory(data_area, data)
-    transport.write_memory(data_len_addr, bytes([len(data)]))
+    if data:
+        transport.write_memory(data_area, data)
+    transport.write_memory(
+        data_len_addr,
+        bytes([len(data) & 0xFF, (len(data) >> 8) & 0xFF]),
+    )
 
     code = build_socket_write(
         socket_id_addr, data_area, data_len_addr,
