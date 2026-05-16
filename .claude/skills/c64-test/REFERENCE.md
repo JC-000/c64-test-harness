@@ -90,7 +90,7 @@ Structural protocol satisfied by both `ViceInstanceManager` and `Ultimate64Insta
 ### `create_manager(backend="auto", *, lock_timeout=60.0, **kwargs) -> UnifiedManager`
 Factory function. `backend="auto"` reads `C64_BACKEND` env var (defaults to `"vice"`).
 
-- `lock_timeout: float` — cross-process device-lock timeout in seconds (U64 only); threaded through `UnifiedManager` to `_LockedU64Manager`. Default 60.0; long parallel benches typically pass `lock_timeout=1800.0` (30 min). Bounds the wait against **stuck** holders only — a live holder making progress extends the deadline (see `DeviceLock.acquire`).
+- `lock_timeout: float` — cross-process device-lock timeout in seconds (U64 only); threaded through `UnifiedManager` to `_LockedU64Manager` (which now calls `lock.acquire_or_raise(timeout=lock_timeout)` and raises `DeviceLockTimeout` on failure — see below). Default 60.0; bounds the wait against **wedged or dead** holders only — healthy holders heartbeat the lockfile every ~15 s and extend the deadline implicitly, so widening this past ~120 s is rarely useful (see PATTERNS § "Pattern 9a: Queueing for the U64").
 
 **U64 cross-process safety:** When the U64 backend is selected, `UnifiedManager` automatically wraps device access with `DeviceLock` via `_LockedU64Manager`. Multiple agents (separate OS processes) queue for the same physical device automatically.
 
@@ -629,31 +629,56 @@ from c64_test_harness.backends.ultimate64_helpers import (
 Cross-process exclusive lock for hardware devices using `fcntl.flock()`. The key difference from `PortLock`: `acquire()` is blocking with a timeout, so multiple agents queue for the same device.
 
 ```python
-from c64_test_harness import DeviceLock
+from c64_test_harness import DeviceLock, DeviceLockTimeout
 
+# Preferred: structured diagnostics on timeout.
 lock = DeviceLock("192.168.1.81")
-if lock.acquire(timeout=30.0):  # Blocks up to 30s
+try:
+    lock.acquire_or_raise(timeout=120.0)
+except DeviceLockTimeout as e:
+    # str(e) is a diagnosed-state message; e.holder_pid / e.pid_alive /
+    # e.lockfile_age_seconds / e.device_reachable_rest are the fields.
+    raise
+try:
+    ...
+finally:
+    lock.release()
+
+# Bool API (legacy) is still supported and unchanged.
+lock = DeviceLock("192.168.1.81")
+if lock.acquire(timeout=30.0):
     try:
-        # Device is exclusively ours across all OS processes
         ...
     finally:
         lock.release()
-
-# Or as context manager (raises RuntimeError on timeout)
-with DeviceLock("192.168.1.81") as lock:
-    ...
 ```
 
-- `acquire(timeout=30.0, *, progress_window=60.0) -> bool` -- Blocking acquire (polls with LOCK_NB every 0.1s). Writes JSON metadata (PID, timestamp, device_host). Verifies inode after flock.
-  - **Queue-aware semantics (default).** `timeout` bounds time spent waiting on **stuck** holders only. A live holder that is making progress (PID alive AND lockfile mtime within `progress_window` seconds) extends the deadline — the deadline is reset on every poll iteration. Holders are considered stuck if their PID is dead or `mtime` is older than `progress_window`; only that time counts against `timeout`. Pass `progress_window=None` for legacy hard-timeout behavior.
+- `__init__(device_host, lock_dir=None, *, heartbeat_interval=15.0)` -- `heartbeat_interval` is the cadence (seconds) at which a daemon thread bumps the lockfile mtime while held, so queue-aware waiters see this holder as "progressing". `None`/`0`/negative disables the heartbeat (rarely useful outside unit tests that need deterministic mtime control).
+- `acquire(timeout=30.0, *, progress_window=60.0) -> bool` -- Blocking acquire (polls with LOCK_NB every 0.1s). Writes JSON metadata (PID, timestamp, device_host). Verifies inode after flock. Starts the heartbeat thread on success.
+  - **Queue-aware semantics (default).** `timeout` bounds time spent waiting on **wedged or dead** holders only. A live holder whose lockfile mtime is within `progress_window` seconds is "progressing"; the waiter's deadline is reset on every poll iteration. With the heartbeat, healthy holders stay "progressing" indefinitely. Pass `progress_window=None` for legacy hard-timeout behavior.
   - **Optional `watchdog` wakeup.** When the optional `c64-test-harness[notify]` extra is installed (`watchdog>=3.0`), queued acquirers wake on lockfile fs-events instead of waiting the full poll interval. The release path emits a cooperative `os.utime(lockfile)` so other waiters wake immediately. The 100 ms polling backstop is preserved for kernel-released flocks (`kill -9` holders where `release()` never ran and no fs-event fires).
-- `release()` -- Release flock. Does NOT delete lockfile (inode race safety, same as PortLock). Touches lockfile mtime via `os.utime` to wake `watchdog`-based waiters cooperatively (best-effort).
+- `acquire_or_raise(timeout=30.0, *, progress_window=60.0) -> None` -- Wraps `acquire()` and raises `DeviceLockTimeout` on timeout with structured diagnostics (holder PID, liveness, lockfile age, REST reachability). Prefer this over `acquire()` for live tests.
+- `release()` -- Release flock and stop the heartbeat thread. Does NOT delete lockfile (inode race safety, same as PortLock). Touches lockfile mtime via `os.utime` to wake `watchdog`-based waiters cooperatively (best-effort).
 - `read_info() -> dict | None` -- Read metadata without locking (diagnostics).
 - `cleanup_stale(lock_dir=None) -> int` -- Class method; removes lockfiles from dead PIDs.
 - `.device_host` / `.held` properties
 - Context manager support
 
 Lockfiles at `$XDG_RUNTIME_DIR/c64-test-harness/device-{sanitized_host}.lock`. Same directory as PortLock. Kernel auto-releases locks on process exit (crash-safe).
+
+### `DeviceLockTimeout(TimeoutError)`
+Raised by `DeviceLock.acquire_or_raise()` and by `_LockedU64Manager.acquire()` (i.e. `create_manager(backend="u64", ...)`) on lock-acquire timeout. Exported from the top-level package.
+
+Fields:
+- `.device_host: str`
+- `.holder_pid: int | None` — PID from the lockfile metadata, or None if unreadable.
+- `.pid_alive: bool | None` — whether the holder PID is still alive (`os.kill(pid, 0)`).
+- `.lockfile_age_seconds: float | None` — seconds since the lockfile mtime was last bumped.
+- `.device_reachable_rest: bool | None` — quick `GET /v1/version` probe (3 s budget); `True` on 2xx, `False` on connection/timeout failure, `None` if the probe was skipped.
+- `.timeout: float` — the timeout passed to `acquire_or_raise`.
+- `.progress_window: float | None`
+
+`str(e)` produces one of four stable diagnosed-state phrases — "queued behind live, progressing PID X" / "holder PID X is alive but the lockfile hasn't been touched in Ns; holder may be wedged" / "stale lock from dead PID X; will be cleaned on next acquire — retry" / "no holder metadata found" — suffixed with "; device REST API responsive" or "; device REST API unreachable". See PATTERNS § "Pattern 9a: Queueing for the U64" for the worked example, branch table, and anti-patterns.
 
 **When to use:** `UnifiedManager` uses `DeviceLock` automatically for U64 backends. Use directly only when creating `Ultimate64Transport` outside of `UnifiedManager` (e.g., in pytest fixtures for live tests).
 
