@@ -22,11 +22,12 @@ from .vice_lifecycle import ViceConfig
 from .vice_manager import ViceInstanceManager
 
 try:
-    from .device_lock import DeviceLock
+    from .device_lock import DeviceLock, DeviceLockTimeout
 
     _HAS_DEVICE_LOCK = True
 except ImportError:  # pragma: no cover
     _HAS_DEVICE_LOCK = False
+    DeviceLockTimeout = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
 
@@ -313,17 +314,23 @@ class _LockedU64Manager:
         self._map_lock = __import__("threading").Lock()
 
     def acquire(self) -> Any:
-        """Acquire a device with cross-process locking."""
+        """Acquire a device with cross-process locking.
+
+        On lock-timeout, raises :class:`DeviceLockTimeout` (a
+        ``TimeoutError`` subclass) with structured diagnostics —
+        holder PID, liveness, lockfile age, REST reachability — so
+        callers can distinguish "queued behind a healthy holder" from
+        "device wedged/unreachable" without guessing.
+        """
         instance = self._inner.acquire()
         device_host = instance.device.host
         lock = DeviceLock(device_host)
-        if not lock.acquire(timeout=self._lock_timeout):
+        try:
+            lock.acquire_or_raise(timeout=self._lock_timeout)
+        except BaseException:
             # Couldn't get cross-process lock — return device to pool.
             self._inner.release(instance)
-            raise RuntimeError(
-                f"Timed out waiting for cross-process lock on {device_host!r} "
-                f"after {self._lock_timeout}s"
-            )
+            raise
         with self._map_lock:
             self._locks[id(instance)] = lock
         logger.debug(
