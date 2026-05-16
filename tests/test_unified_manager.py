@@ -304,7 +304,7 @@ class TestLockedU64Manager:
     def test_acquire_delegates_and_locks(self, MockDeviceLock: MagicMock) -> None:
         """acquire() gets an instance from inner, then acquires DeviceLock."""
         mock_lock = MagicMock()
-        mock_lock.acquire.return_value = True
+        mock_lock.acquire_or_raise.return_value = None
         mock_lock.held = True
         MockDeviceLock.return_value = mock_lock
 
@@ -317,13 +317,13 @@ class TestLockedU64Manager:
         assert result is inst
         inner.acquire.assert_called_once()
         MockDeviceLock.assert_called_once_with("10.0.0.1")
-        mock_lock.acquire.assert_called_once_with(timeout=60.0)
+        mock_lock.acquire_or_raise.assert_called_once_with(timeout=60.0)
 
     @patch("c64_test_harness.backends.unified_manager.DeviceLock")
     def test_release_unlocks_and_delegates(self, MockDeviceLock: MagicMock) -> None:
         """release() releases DeviceLock then delegates to inner."""
         mock_lock = MagicMock()
-        mock_lock.acquire.return_value = True
+        mock_lock.acquire_or_raise.return_value = None
         mock_lock.held = True
         MockDeviceLock.return_value = mock_lock
 
@@ -341,9 +341,24 @@ class TestLockedU64Manager:
     def test_acquire_timeout_returns_to_pool_and_raises(
         self, MockDeviceLock: MagicMock,
     ) -> None:
-        """When DeviceLock.acquire() returns False, instance goes back to pool."""
+        """When DeviceLock.acquire_or_raise() raises, instance goes back to pool.
+
+        The wrapper now raises ``DeviceLockTimeout`` (a ``TimeoutError``
+        subclass) on cross-process lock-timeout, so callers see structured
+        diagnostics rather than a bare ``RuntimeError``.
+        """
+        from c64_test_harness.backends.device_lock import DeviceLockTimeout
+
         mock_lock = MagicMock()
-        mock_lock.acquire.return_value = False
+        mock_lock.acquire_or_raise.side_effect = DeviceLockTimeout(
+            device_host="10.0.0.5",
+            holder_pid=12345,
+            pid_alive=True,
+            lockfile_age_seconds=1.0,
+            device_reachable_rest=True,
+            timeout=5.0,
+            progress_window=60.0,
+        )
         mock_lock.held = False
         MockDeviceLock.return_value = mock_lock
 
@@ -351,7 +366,7 @@ class TestLockedU64Manager:
         inner = self._make_inner([inst])
         mgr = _LockedU64Manager(inner, lock_timeout=5.0)
 
-        with pytest.raises(RuntimeError, match="Timed out.*10.0.0.5.*5.0s"):
+        with pytest.raises(DeviceLockTimeout, match="10.0.0.5"):
             mgr.acquire()
 
         # Instance was returned to the pool exactly once
