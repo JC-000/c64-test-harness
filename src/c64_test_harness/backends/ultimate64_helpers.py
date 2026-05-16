@@ -26,6 +26,11 @@ from .ultimate64_client import (
     Ultimate64RunnerStuckError,
     Ultimate64UnreachableError,
 )
+
+
+class Ultimate64MeasurementEnvironmentError(Ultimate64Error):
+    """Raised when the device is in a state that would silently corrupt cycle-accurate measurements
+    (e.g., CPU turbo left enabled from a prior session). See GitHub issue #102."""
 from .ultimate64_probe import is_u64_reachable
 from .ultimate64_schema import (
     CPU_SPEED_VALUES,
@@ -88,6 +93,8 @@ __all__ = [
     "DEBUG_MODE_1541",
     "DEBUG_MODE_6510_1541",
     "DEBUG_MODES",
+    "Ultimate64MeasurementEnvironmentError",
+    "check_measurement_environment",
 ]
 
 
@@ -648,6 +655,34 @@ def runner_health_check(client: Ultimate64Client) -> None:
                 body=body,
             ) from exc
         raise
+
+
+def check_measurement_environment(client: Ultimate64Client) -> None:
+    """Validate that the device is in a state suitable for cycle-accurate (CIA-timer) measurements.
+
+    Checks performed:
+      - CPU turbo is disabled (effective speed = 1 MHz). A non-1 MHz speed causes
+        CIA-timer-based measurements to read as ``target_cycles / turbo_factor``
+        with no exception, because the CIA continues counting at its fixed rate
+        while the CPU runs N× faster.
+
+    Raises Ultimate64MeasurementEnvironmentError on a state that would produce
+    silently-wrong measurements. Returns None on a clean environment.
+
+    See GitHub issue #102 for the failure-mode walkthrough.
+
+    :param client: Connected Ultimate64 client.
+    :raises Ultimate64MeasurementEnvironmentError: When turbo is active at a
+        non-1 MHz speed.
+    """
+    mhz = get_turbo_mhz(client)
+    if mhz is None or mhz == 1:
+        return
+    raise Ultimate64MeasurementEnvironmentError(
+        f"CPU turbo is enabled at {mhz} MHz; CIA-timer measurements will read as "
+        f"target_cycles/{mhz}. Call set_turbo_mhz(client, 1) before benchmarking. "
+        f"See GitHub issue #102."
+    )
 
 
 # --------------------------------------------------------------------------- #

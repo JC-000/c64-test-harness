@@ -16,6 +16,8 @@ from c64_test_harness.backends.ultimate64_helpers import (
     CAT_SID_SOCKETS,
     CAT_U64_SPECIFIC,
     U64StateSnapshot,
+    Ultimate64MeasurementEnvironmentError,
+    check_measurement_environment,
     get_reu_config,
     get_sid_config,
     get_turbo_enabled,
@@ -532,3 +534,54 @@ class TestRunnerHealthCheck:
         with pytest.raises(Ultimate64Error) as exc_info:
             runner_health_check(client)
         assert not isinstance(exc_info.value, Ultimate64RunnerStuckError)
+
+
+# --------------------------------------------------------------------------- #
+# check_measurement_environment()                                             #
+# --------------------------------------------------------------------------- #
+
+class TestCheckMeasurementEnvironment:
+    """Tests for check_measurement_environment() — GitHub issue #102."""
+
+    def _client_with_turbo(self, turbo: str, cpu_speed: str) -> MagicMock:
+        client = _make_client()
+        client.get_config_category.return_value = _u64_specific(
+            turbo=turbo, cpu_speed=cpu_speed
+        )
+        return client
+
+    def test_clean_1mhz_returns_none(self) -> None:
+        """Device at 1 MHz (Manual + ' 1') is safe — no exception."""
+        client = self._client_with_turbo("Manual", " 1")
+        result = check_measurement_environment(client)
+        assert result is None
+
+    def test_turbo_off_returns_none(self) -> None:
+        """Turbo Control == 'Off' means get_turbo_mhz returns None — safe."""
+        client = self._client_with_turbo("Off", " 1")
+        result = check_measurement_environment(client)
+        assert result is None
+
+    def test_turbo_48mhz_raises(self) -> None:
+        """48 MHz turbo left from prior session raises with '48' and 'set_turbo_mhz'."""
+        client = self._client_with_turbo("Manual", "48")
+        with pytest.raises(Ultimate64MeasurementEnvironmentError) as exc_info:
+            check_measurement_environment(client)
+        msg = str(exc_info.value)
+        assert "48" in msg
+        assert "set_turbo_mhz" in msg
+
+    def test_turbo_6mhz_raises_with_value(self) -> None:
+        """Non-standard turbo value (6 MHz) raises with '6' in the message."""
+        client = self._client_with_turbo("Manual", " 6")
+        with pytest.raises(Ultimate64MeasurementEnvironmentError) as exc_info:
+            check_measurement_environment(client)
+        msg = str(exc_info.value)
+        assert "6" in msg
+        assert "set_turbo_mhz" in msg
+
+    def test_raises_is_subclass_of_ultimate64_error(self) -> None:
+        """Ultimate64MeasurementEnvironmentError is an Ultimate64Error subclass."""
+        client = self._client_with_turbo("Manual", "48")
+        with pytest.raises(Ultimate64Error):
+            check_measurement_environment(client)
