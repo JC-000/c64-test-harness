@@ -1144,6 +1144,28 @@ except FlakeyReadError as e:
 
 **Use `read_bytes()` everywhere else** — `read_bytes_verified()` doubles the wire traffic per read and is only worth the cost when a flake is actively suspected. Once the issue is reproduced and rooted out (e.g., via the new `response_type` mismatch error), revert callsites to plain `read_bytes()`.
 
+### 28. Turbo CPU Speed Survives `reset()` and Silently Corrupts CIA-Timer Measurements
+
+**Symptom:** A 500-cycle calibration loop reads as ~10 cycles (or some other `target / turbo_factor` fraction); no exception is raised. `recover()` and `reset()` do not normalize turbo — this is intentional, because they are minimum-disruption primitives. The pattern-match is: `measured ≈ expected / turbo_factor`. The CIA timer ticks at its fixed 1 MHz rate regardless of CPU speed, so if the CPU runs 48× faster, the loop completes ~48× sooner in CIA ticks.
+
+**Fix:** At the top of any benchmark or CIA-timer test setup, call `check_measurement_environment(client)` — it raises `Ultimate64MeasurementEnvironmentError` loudly if turbo is non-1:
+
+```python
+from c64_test_harness.backends.ultimate64_helpers import (
+    check_measurement_environment,
+    set_turbo_mhz,
+)
+
+# Guard — raises if a prior session left turbo on:
+check_measurement_environment(client)
+
+# If you want to enforce 1 MHz explicitly (e.g., after reset()):
+set_turbo_mhz(client, 1)
+check_measurement_environment(client)  # now guaranteed clean
+```
+
+`check_measurement_environment` calls `get_turbo_mhz()` internally and raises `Ultimate64MeasurementEnvironmentError` (a subclass of `Ultimate64Error`) with a message naming the actual MHz and pointing at `set_turbo_mhz(client, 1)` as the fix. See GitHub issue #102.
+
 ---
 
 ## Memory Map Conventions
