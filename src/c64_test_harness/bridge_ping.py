@@ -222,6 +222,209 @@ def build_echo_request_frame(
 
 
 # ---------------------------------------------------------------------------
+# UDP frame builder (Ethernet + IPv4 + UDP, IPv4 only, no fragmentation)
+#
+# Companion to :func:`build_echo_request_frame` but for UDP datagrams.
+# Caller supplies the L2/L3/L4 addressing and the payload; the helper
+# returns a wire-ready frame with both IPv4 and UDP checksums populated.
+#
+# Limits:
+#   * IPv4 only (Ethernet II EtherType 0x0800; IP version 4, IHL 5).
+#   * No fragmentation -- caller is responsible for keeping
+#     (14 + 20 + 8 + len(payload)) <= path MTU.  At the standard
+#     1500-byte Ethernet MTU that caps the payload at 1472 bytes.
+#   * No options.  Caller may not supply IP/UDP options.
+#   * UDP checksum is always computed (the optional-checksum=0 case
+#     is intentionally not used: every real Linux/macOS stack accepts
+#     a populated checksum and most accept 0, but supplying the real
+#     value avoids surprises when packet captures are scrutinised).
+# ---------------------------------------------------------------------------
+
+# IPv4 protocol number for UDP (RFC 768)
+_IP_PROTO_UDP = 17
+
+
+def _udp_checksum(
+    src_ip: bytes,
+    dst_ip: bytes,
+    src_port: int,
+    dst_port: int,
+    payload: bytes,
+) -> int:
+    """Compute the UDP checksum for IPv4 (RFC 768 + RFC 1071 fold).
+
+    The wire checksum is a 16-bit one's-complement sum over:
+
+      1. The 12-byte pseudo-header
+         ``src_ip | dst_ip | 0x00 | proto=17 | udp_length``
+      2. The 8-byte UDP header
+         ``src_port | dst_port | udp_length | checksum=0``
+      3. The payload, zero-padded to an even byte count for the
+         purpose of the sum (the wire payload is *not* padded).
+
+    A computed result of 0x0000 is replaced with 0xFFFF on the wire
+    so receivers can distinguish "checksum present and zero" from the
+    "checksum disabled" sentinel.
+    """
+    assert len(src_ip) == 4 and len(dst_ip) == 4
+    udp_length = 8 + len(payload)
+    pseudo = struct.pack(
+        ">4s4sBBH",
+        src_ip, dst_ip,
+        0, _IP_PROTO_UDP,
+        udp_length,
+    )
+    udp_hdr_no_cksum = struct.pack(
+        ">HHHH",
+        src_port, dst_port,
+        udp_length,
+        0,
+    )
+    data = pseudo + udp_hdr_no_cksum + payload
+    if len(data) % 2:
+        data = data + b"\x00"
+    s = 0
+    for i in range(0, len(data), 2):
+        s += (data[i] << 8) | data[i + 1]
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    cksum = (~s) & 0xFFFF
+    # Per RFC 768: a computed 0 must be transmitted as all-ones.
+    return cksum if cksum != 0 else 0xFFFF
+
+
+def build_udp_frame(
+    src_mac: bytes,
+    dst_mac: bytes,
+    src_ip: bytes,
+    dst_ip: bytes,
+    src_port: int,
+    dst_port: int,
+    payload: bytes,
+    *,
+    ttl: int = 64,
+    ip_id: int = 0x0000,
+) -> bytes:
+    """Build a complete Ethernet + IPv4 + UDP frame.
+
+    Layout (offsets within the returned ``bytes``):
+
+    ===  ===  ===========================================
+    Off  Len  Field
+    ===  ===  ===========================================
+      0    6  Destination MAC
+      6    6  Source MAC
+     12    2  EtherType (0x0800)
+     14   20  IPv4 header (IHL=5, no options)
+     34    8  UDP header
+     42    N  UDP payload
+    ===  ===  ===========================================
+
+    Both checksums are computed:
+
+    * IPv4 header checksum -- 16-bit 1's complement over the 20-byte
+      header with the checksum field zeroed during compute (RFC 1071).
+    * UDP checksum -- pseudo-header + UDP header + payload (zero-padded
+      for the compute only); RFC 768 / RFC 1071.  A computed 0 becomes
+      0xFFFF on the wire so it does not collide with the
+      ``checksum-disabled`` sentinel.
+
+    The returned frame is **pad-aligned to the CS8900a transmit
+    requirements**:
+
+    * Minimum 60 bytes (the chip adds the 4-byte FCS for a 64-byte
+      on-wire frame).  Frames shorter than 60 bytes are zero-padded.
+    * Length is rounded up to an even byte count -- the CS8900a TX
+      FIFO is word-oriented; an odd byte tail would leave half a word
+      stuck.  Padding bytes are post-payload zeros and are *not*
+      reflected in the IPv4 ``total_length`` or the UDP ``length``
+      fields, so receivers see exactly ``len(payload)`` UDP bytes.
+
+    Parameters
+    ----------
+    src_mac, dst_mac
+        6-byte Ethernet MAC addresses.  Use ``b"\\xff\\xff\\xff\\xff\\xff\\xff"``
+        for broadcast or the host bridge's MAC for unicast to the host.
+    src_ip, dst_ip
+        4-byte IPv4 addresses (network order).  E.g.
+        ``bytes([10, 0, 65, 2])`` for ``10.0.65.2``.
+    src_port, dst_port
+        UDP ports in host byte order (1-65535).
+    payload
+        UDP payload bytes.  May exceed 512 bytes but must keep the
+        full frame under the path MTU (no fragmentation).
+    ttl
+        IPv4 Time-To-Live.  Default 64 matches Linux/macOS hosts.
+    ip_id
+        IPv4 Identification field.  Default 0; not used outside of
+        fragment reassembly, which this builder does not support.
+
+    Returns
+    -------
+    bytes
+        The full Ethernet frame ready to upload to C64 RAM and feed
+        through :func:`build_tx_code`.
+    """
+    if len(src_mac) != 6 or len(dst_mac) != 6:
+        raise ValueError("MAC addresses must be 6 bytes")
+    if len(src_ip) != 4 or len(dst_ip) != 4:
+        raise ValueError("IPv4 addresses must be 4 bytes")
+    if not (0 < src_port < 0x10000) or not (0 < dst_port < 0x10000):
+        raise ValueError("UDP ports must be in 1..65535")
+    if not (0 <= ttl <= 255):
+        raise ValueError("TTL must be in 0..255")
+    if not (0 <= ip_id <= 0xFFFF):
+        raise ValueError("ip_id must be in 0..65535")
+
+    udp_length = 8 + len(payload)
+    ip_total_len = 20 + udp_length
+    if ip_total_len > 0xFFFF:
+        raise ValueError(
+            f"IPv4 total_length {ip_total_len} exceeds 65535; "
+            "split the payload before calling build_udp_frame()"
+        )
+
+    # --- UDP header ---
+    udp_cksum = _udp_checksum(src_ip, dst_ip, src_port, dst_port, payload)
+    udp_header = struct.pack(
+        ">HHHH",
+        src_port, dst_port,
+        udp_length,
+        udp_cksum,
+    )
+
+    # --- IPv4 header (checksum computed with the field set to 0) ---
+    # Version=4, IHL=5 -> first byte 0x45.
+    # TOS=0.  Flags=0 (DF=0, MF=0), Fragment offset=0.  Protocol=UDP.
+    ip_no_cksum = struct.pack(
+        ">BBHHHBBH4s4s",
+        0x45, 0x00, ip_total_len,
+        ip_id, 0x0000,
+        ttl, _IP_PROTO_UDP, 0x0000,
+        src_ip, dst_ip,
+    )
+    ip_cksum = _ip_checksum(ip_no_cksum)
+    ip_header = struct.pack(
+        ">BBHHHBBH4s4s",
+        0x45, 0x00, ip_total_len,
+        ip_id, 0x0000,
+        ttl, _IP_PROTO_UDP, ip_cksum,
+        src_ip, dst_ip,
+    )
+
+    # --- Ethernet II header + IP + UDP + payload ---
+    frame = dst_mac + src_mac + b"\x08\x00" + ip_header + udp_header + payload
+
+    # CS8900a TX padding: 60-byte minimum (chip appends 4-byte FCS), and
+    # the TX FIFO is word-oriented so length must be even.
+    if len(frame) < 60:
+        frame = frame + b"\x00" * (60 - len(frame))
+    if len(frame) % 2:
+        frame = frame + b"\x00"
+    return frame
+
+
+# ---------------------------------------------------------------------------
 # CS8900a initialisation blobs (same as tests/test_ethernet_bridge.py)
 # ---------------------------------------------------------------------------
 
