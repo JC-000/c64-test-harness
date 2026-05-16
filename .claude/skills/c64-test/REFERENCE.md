@@ -945,7 +945,7 @@ Ultimate Command Interface (UCI) socket-level TCP/UDP networking for U64 Elite. 
 - `uci_get_interface_count(transport, *, turbo_safe=False) -> int`
 - `uci_tcp_connect(transport, host, port, *, turbo_safe=False) -> int` — returns socket handle
 - `uci_udp_connect(transport, host, port, *, turbo_safe=False) -> int`
-- `uci_socket_write(transport, sock, data, *, turbo_safe=False) -> int`
+- `uci_socket_write(transport, sock, data, *, turbo_safe=False) -> int` -- `data` must be at most 892 bytes (`SOCKET_WRITE_MAX_BYTES`; empirical firmware ceiling, theoretical 893 truncates by one byte on the wire). For UDP, one call == one datagram (no firmware coalescing). Larger payloads must be split into multiple calls; each emits its own datagram. See `docs/uci_networking.md § Datagram size limits`.
 - `uci_socket_read(transport, sock, *, max_bytes, turbo_safe=False) -> bytes`
 - `uci_socket_close(transport, sock, *, turbo_safe=False) -> None`
 - `uci_tcp_listen_start(transport, port, *, turbo_safe=False) -> int`

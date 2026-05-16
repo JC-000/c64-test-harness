@@ -145,6 +145,9 @@ scratch addresses to functions that accept them via kwarg), or use
 | `$03F0`, `$03F1` | `execute.run_subroutine()` U64 flag bytes | hardcoded |
 | `$0277`, `$00C6` | UCI keyboard dispatch (KERNAL-mandated) | not changeable |
 | `$C000-$C3FF` | UCI stub block (code/data/response/status) | partially configurable |
+| `$C400-$C402` | `build_socket_write` inner-loop scratch (16-bit countdown + Y save) | hardcoded |
+| `$C403` | `uci_socket_write` socket-id slot | hardcoded |
+| `$C500-$C87D` | `uci_socket_write` data buffer + 2-byte LE length (up to 892 B payload) | hardcoded |
 | `$C000` | `sid_player` default code stub | `DEFAULT_STUB_ADDR` override |
 
 A consumer that declares these in `safe_regions` will let the harness
