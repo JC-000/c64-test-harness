@@ -62,7 +62,7 @@ See the supporting files in this skill directory for detailed API reference:
 
 20. **Use the public `target.client` / `transport.client` accessors** for U64 low-level operations not yet wrapped on the transport — e.g. `client.run_prg`, `client.mount_disk`, `client.reset`, `client.reboot`, `client.send_text`, `client.sid_play`. Never reach `target.transport._client` or `transport._client`; those private attrs are internal and may be renamed without notice.
 
-21. **For long parallel benches that hold a single device for hours**, pass `lock_timeout` to `create_manager()` (e.g. `create_manager(backend="u64", host=..., lock_timeout=1800)`). The default is 60 s. Separately, `DeviceLock.acquire(progress_window=...)` (default 60 s) treats live-progressing holders as legitimate — the deadline extends as long as the holder is alive AND the lockfile mtime is recent. Pass `progress_window=None` to restore the legacy hard-timeout behavior.
+21. **`lock_timeout` now bounds against wedged/dead holders only — not healthy long-running peers.** `DeviceLock` heartbeats the lockfile mtime every ~15 s while held, and `acquire(progress_window=60.0)` (the default) extends a waiter's deadline indefinitely as long as the holder PID is alive AND the lockfile mtime is fresh. So a peer running a multi-hour suite no longer causes you to time out — bumping `lock_timeout` past 60 s only helps against **wedged or dead** holders, which is rarely what you want. 120 s is a reasonable ceiling for ad-hoc work. Use `lock.acquire_or_raise(timeout=...)` (and `_LockedU64Manager.acquire()` via `create_manager`) to surface a structured `DeviceLockTimeout` with `holder_pid`, `pid_alive`, `lockfile_age_seconds`, `device_reachable_rest`, and a diagnosed-state message ("queued behind live, progressing PID X" / "holder PID X is alive but the lockfile hasn't been touched in Ns" / "stale lock from dead PID X" / "no holder metadata found", plus a REST-reachability suffix). `DeviceLockTimeout` is exported from the top-level package and is a `TimeoutError` subclass. Pass `progress_window=None` to opt out of queue-aware behavior (legacy hard timeout). Never reboot the U64 in response to a `DeviceLockTimeout` without first checking `pid_alive` and `device_reachable_rest` — see PATTERNS § "Pattern 9a".
 
 22. **For U64 unresponsive scenarios, use `recover(client)`** (in `ultimate64_helpers`) — escalates `reset()` → probe → `reboot()` → probe and returns which action succeeded. Never call `poweroff()` for recovery: it disconnects the device until manual physical power-cycle. Use `runner_health_check(client)` to detect the firmware's "Cannot open file" wedged-runner state before resorting to recovery.
 
@@ -217,7 +217,7 @@ All U64 live test files MUST use DeviceLock in their fixtures:
 ```python
 import os
 import pytest
-from c64_test_harness.backends.device_lock import DeviceLock
+from c64_test_harness import DeviceLock, DeviceLockTimeout
 from c64_test_harness.backends.ultimate64 import Ultimate64Transport
 
 _HOST = os.environ.get("U64_HOST")
@@ -228,12 +228,18 @@ pytestmark = pytest.mark.skipif(not _HOST, reason="U64_HOST not set")
 @pytest.fixture(scope="module")
 def transport():
     lock = DeviceLock(_HOST)
-    if not lock.acquire(timeout=120.0):
-        pytest.skip(f"Could not acquire device lock for {_HOST}")
+    try:
+        lock.acquire_or_raise(timeout=120.0)
+    except DeviceLockTimeout as e:
+        # str(e) is a diagnosed-state message: queued vs wedged vs stale vs
+        # unreachable. See PATTERNS Pattern 9a.
+        pytest.skip(str(e))
     t = Ultimate64Transport(host=_HOST, password=_PW, timeout=8.0)
-    yield t
-    t.close()
-    lock.release()
+    try:
+        yield t
+    finally:
+        t.close()
+        lock.release()
 ```
 
 ## Critical Gotchas
@@ -254,7 +260,7 @@ Read `PATTERNS.md` for the full list. The most common mistakes:
 
 7. **`resume()` is safe to call repeatedly** — it does not close the connection. It simply resumes CPU execution. The persistent connection remains open throughout the test session.
 
-8. **All U64 access must use DeviceLock** — creating `Ultimate64Transport` without a `DeviceLock` will cause test failures when another agent uses the same device concurrently. Use `UnifiedManager` (automatic locking) or wrap with `DeviceLock` in fixtures.
+8. **All U64 access must use DeviceLock** — creating `Ultimate64Transport` without a `DeviceLock` will cause test failures when another agent uses the same device concurrently. Use `UnifiedManager` (automatic locking) or wrap with `DeviceLock` in fixtures. Prefer `lock.acquire_or_raise(timeout=...)` over `lock.acquire(...)` so a timeout surfaces as a structured `DeviceLockTimeout` (with `holder_pid` / `pid_alive` / `lockfile_age_seconds` / `device_reachable_rest` and a diagnosed-state message) instead of a bare `False`. Never reboot the U64 just because acquire timed out — see PATTERNS § "Pattern 9a".
 
 9. **Probe U64 before connecting** — `probe_u64(host)` checks ping + TCP + API. `is_u64_reachable(host)` for a quick boolean. `Ultimate64InstanceManager.acquire()` probes automatically and skips unreachable devices.
 
