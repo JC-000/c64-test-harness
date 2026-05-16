@@ -60,6 +60,7 @@ def _make_transport() -> BinaryViceTransport:
         t._rows = 25
         t._text_monitor_port = 0
         t._req_id = 0
+        t._resume_generation = 0
         t._reg_map = {}
         t._event_queue = collections.deque()
         t._lock = threading.Lock()
@@ -188,7 +189,8 @@ class TestWaitForResponseTypeValidation:
         assert resp.body == good_body
         # The STOPPED event should now be in the queue (not dropped).
         assert len(t._event_queue) == 1
-        assert t._event_queue[0].response_type == EVENT_STOPPED
+        _gen, _evt = t._event_queue[0]
+        assert _evt.response_type == EVENT_STOPPED
 
     def test_cmd_to_response_type_map_covers_critical_commands(self) -> None:
         """The map exists and covers MEM_GET (the issue #88 hot path)."""
@@ -267,7 +269,7 @@ class TestWaitForStoppedRequeue:
         assert pc == 0xC000
         # RESUMED must be retained for diagnostic / later inspection.
         assert any(
-            ev.response_type == EVENT_RESUMED for ev in t._event_queue
+            resp.response_type == EVENT_RESUMED for _gen, resp in t._event_queue
         ), "RESUMED event was dropped instead of re-queued"
 
     def test_wait_for_stopped_raises_on_unexpected_response(self) -> None:
@@ -284,17 +286,26 @@ class TestWaitForStoppedRequeue:
         with pytest.raises(TransportError, match="Unexpected non-event"):
             t.wait_for_stopped(timeout=5.0)
 
-    def test_wait_for_stopped_clears_stale_events_at_start(self) -> None:
-        """Pre-existing events from before the call must still be cleared."""
+    def test_wait_for_stopped_discards_pre_resume_stale_events(self) -> None:
+        """Events tagged at a prior resume generation must be discarded.
+
+        Simulates a STOPPED event that was buffered during a *previous* test
+        phase (generation 0).  After resume() bumps the generation to 1, that
+        event is stale and wait_for_stopped must not return it.  A fresh
+        STOPPED at the current generation arrives on the wire instead.
+        """
         t = _make_transport()
-        # Pre-load the queue with a stale event.
-        stale = _Response(
+        # Simulate a prior resume phase: generation is already 1 (as if
+        # resume() was called once before).
+        t._resume_generation = 1
+        # Pre-load the queue with a stale event from generation 0.
+        stale_resp = _Response(
             response_type=EVENT_STOPPED,
             error_code=0x00,
             request_id=EVENT_REQUEST_ID,
             body=struct.pack("<H", 0xDEAD),
         )
-        t._event_queue.append(stale)
+        t._event_queue.append((0, stale_resp))  # generation 0 → stale
 
         stopped_body = struct.pack("<H", 0xBEEF)
         _queue_recvs(
@@ -309,7 +320,77 @@ class TestWaitForStoppedRequeue:
         assert pc == 0xBEEF
         # The stale 0xDEAD event must NOT be in the queue.
         assert all(
-            struct.unpack_from("<H", ev.body, 0)[0] != 0xDEAD
-            for ev in t._event_queue
-            if len(ev.body) >= 2
+            struct.unpack_from("<H", resp.body, 0)[0] != 0xDEAD
+            for _gen, resp in t._event_queue
+            if len(resp.body) >= 2
         )
+
+
+# ---------------------------------------------------------------------------
+# Fix 4 — resume-race: EVENT_STOPPED arriving during resume() ack window
+# ---------------------------------------------------------------------------
+
+
+class TestWaitForStoppedResumeRace:
+    def test_wait_for_stopped_honours_event_arriving_during_resume_ack(self) -> None:
+        """EVENT_STOPPED buffered during resume()'s CMD_EXIT ack window must
+        not be discarded by a subsequent wait_for_stopped() call.
+
+        This is the race reported in issue #103: VICE hits a breakpoint
+        immediately (especially under warp) and pushes the STOPPED event
+        onto the wire before the CMD_EXIT ack arrives.  _wait_for_response
+        parks the early event in _event_queue tagged at the current
+        _resume_generation.  The old code's _event_queue.clear() would
+        then discard it, causing a 60-second timeout.  The fix: only drain
+        events whose generation predates the current resume.
+        """
+        t = _make_transport()
+
+        # Simulate resume() having been called: bump the generation to 1.
+        # (We do this manually so we can inject the queued event without
+        # actually going through the socket mock for the CMD_EXIT exchange.)
+        t._resume_generation = 1
+
+        # Inject a STOPPED event tagged at generation 1 (the current
+        # generation) — as if _wait_for_response parked it during the
+        # CMD_EXIT ack read.
+        raced_resp = _Response(
+            response_type=EVENT_STOPPED,
+            error_code=0x00,
+            request_id=EVENT_REQUEST_ID,
+            body=struct.pack("<H", 0x08A8),  # PC matches issue #103 report
+        )
+        t._event_queue.append((1, raced_resp))
+
+        # wait_for_stopped must return immediately with the queued event —
+        # a timeout of 0.1 s rules out it blocking on the wire.
+        pc = t.wait_for_stopped(timeout=0.1)
+        assert pc == 0x08A8
+
+    def test_wait_for_stopped_ignores_pre_resume_stopped_still_blocks(self) -> None:
+        """A STOPPED event tagged at an older generation is stale and must
+        not be returned; wait_for_stopped falls through to the wire recv."""
+        t = _make_transport()
+
+        # Generation 2 is current; the queued event is from generation 1.
+        t._resume_generation = 2
+        stale_resp = _Response(
+            response_type=EVENT_STOPPED,
+            error_code=0x00,
+            request_id=EVENT_REQUEST_ID,
+            body=struct.pack("<H", 0x1234),
+        )
+        t._event_queue.append((1, stale_resp))  # stale
+
+        # The wire delivers the real STOPPED at generation 2.
+        fresh_body = struct.pack("<H", 0x5678)
+        _queue_recvs(
+            t._sock,
+            [
+                _build_response_bytes(
+                    EVENT_STOPPED, fresh_body, request_id=EVENT_REQUEST_ID
+                ),
+            ],
+        )
+        pc = t.wait_for_stopped(timeout=5.0)
+        assert pc == 0x5678

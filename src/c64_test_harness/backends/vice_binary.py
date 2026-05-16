@@ -135,8 +135,9 @@ class BinaryViceTransport:
         self._memory_policy: _MemoryPolicy = memory_policy or _MemoryPolicy.permissive()
 
         self._req_id = 0
+        self._resume_generation = 0  # bumped by resume() et al.; tags queued events
         self._reg_map: dict[str, tuple[int, int]] = {}  # name -> (reg_id, size_bits)
-        self._event_queue: deque[_Response] = deque()
+        self._event_queue: deque[tuple[int, _Response]] = deque()  # (generation, resp)
         self._lock = threading.Lock()
         self._text_lock = threading.Lock()
         self._sock: socket.socket | None = None
@@ -360,8 +361,10 @@ class BinaryViceTransport:
                         f"got {resp.response_type:#x} (body={resp.body.hex()})"
                     )
                 return resp
-            # Unsolicited event or stale response — buffer it
-            self._event_queue.append(resp)
+            # Unsolicited event or stale response — buffer it, tagged with
+            # the current resume generation so wait_for_stopped can decide
+            # whether to honour or discard it.
+            self._event_queue.append((self._resume_generation, resp))
 
     # ----- register map initialisation -----
 
@@ -578,7 +581,14 @@ class BinaryViceTransport:
 
         Unlike the text monitor, the binary monitor connection stays open
         after Exit.  The CPU resumes and VICE pushes a Resumed event.
+
+        Increments ``_resume_generation`` before the send so that any
+        unsolicited events (e.g. STOPPED from an immediately-hit breakpoint)
+        that arrive during the CMD_EXIT ack window are tagged at the current
+        generation and will be honoured by a subsequent ``wait_for_stopped``
+        call rather than discarded as stale.
         """
+        self._resume_generation += 1
         self._send_and_recv(CMD_EXIT)
 
     def close(self) -> None:
@@ -679,9 +689,21 @@ class BinaryViceTransport:
         if timeout is None:
             timeout = self.timeout
 
-        # Discard any stale events from before this call (e.g. the
-        # initial auto-stop event buffered during connect).
-        self._event_queue.clear()
+        # Drain events that pre-date the most recent resume() call (generation
+        # < current).  Events tagged at the current generation were buffered
+        # during resume()'s CMD_EXIT ack window and must be honoured — this is
+        # the fix for the resume-race described in issue #103.
+        gen = self._resume_generation
+        while self._event_queue and self._event_queue[0][0] < gen:
+            self._event_queue.popleft()
+
+        # Check whether an EVENT_STOPPED at the current generation is already
+        # sitting in the queue (arrived during the resume() ack window).
+        for i, (evt_gen, evt_resp) in enumerate(self._event_queue):
+            if evt_gen >= gen and evt_resp.response_type == EVENT_STOPPED:
+                # Remove it from the queue and return it immediately.
+                del self._event_queue[i]
+                return self._parse_stopped_event(evt_resp)
 
         deadline = time.monotonic() + timeout
         assert self._sock is not None
@@ -707,7 +729,7 @@ class BinaryViceTransport:
                 if resp.request_id == EVENT_REQUEST_ID:
                     # Other unsolicited event (Resumed, Checkpoint info, …):
                     # buffer for later inspection rather than dropping.
-                    self._event_queue.append(resp)
+                    self._event_queue.append((gen, resp))
                     continue
                 # Non-event response with a non-stopped type while waiting
                 # for STOPPED is a wire desync — raise rather than silently
@@ -787,11 +809,13 @@ class BinaryViceTransport:
         body = struct.pack(
             "<BH", 0x01 if step_over_subroutines else 0x00, count
         )
+        self._resume_generation += 1
         self._send_and_recv(CMD_ADVANCE_INSTRUCTIONS, body)
         self.wait_for_stopped()
 
     def step_out(self) -> None:
         """Resume execution until the next RTS; waits for STOPPED."""
+        self._resume_generation += 1
         self._send_and_recv(CMD_EXECUTE_UNTIL_RETURN, b"")
         self.wait_for_stopped()
 
