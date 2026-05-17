@@ -56,6 +56,7 @@ def _make_transport(*, text_monitor: bool = False) -> BinaryViceTransport:
         t._rows = 25
         t._text_monitor_port = 0
         t._req_id = 0
+        t._resume_generation = 0
         t._reg_map = {}
         t._event_queue = __import__("collections").deque()
         t._lock = __import__("threading").Lock()
