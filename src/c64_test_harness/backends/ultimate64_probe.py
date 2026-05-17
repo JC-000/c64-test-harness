@@ -311,7 +311,10 @@ class LivenessResult:
         ``GET /v1/info``, or ``None`` if it could not be read.
     :ivar failure: short tag identifying the failure mode, one of
         ``"unreachable"``, ``"writemem_404"``, ``"writemem_timeout"``,
-        ``"tcp_stack_wedged"``, ``"unknown"``, or ``None`` when healthy.
+        ``"tcp_stack_wedged"``, ``"connection_reset"``, ``"unknown"``,
+        or ``None`` when healthy.  ``"connection_reset"`` is a one-shot
+        TCP RST mid-request — empirically transient on fw 3.14d; callers
+        may retry once before treating it as a wedged stack.
     :ivar recommendation: optional human-readable hint about what to do
         next (e.g. ``"physical power-cycle required"``), or ``None``.
     """
@@ -350,9 +353,10 @@ def _liveness_request(
     """One-shot HTTP request for the liveness probe.
 
     Returns ``(status_code, body_bytes)`` on success, including non-2xx
-    responses (HTTPError is converted, not re-raised).  Raises only
-    ``socket.timeout`` / ``urllib.error.URLError`` for connection-level
-    failures — callers map those onto the ``LivenessResult.failure`` tag.
+    responses (HTTPError is converted, not re-raised).  Raises
+    ``socket.timeout``, ``urllib.error.URLError``, ``ConnectionResetError``,
+    or ``BrokenPipeError`` for connection-level failures — callers map those
+    onto the ``LivenessResult.failure`` tag.
     """
     base = f"http://{host}:{port}" if port != 80 else f"http://{host}"
     url = f"{base}{path}"
@@ -448,7 +452,14 @@ def liveness_probe(
                 fw = info.get("firmware_version")
                 if isinstance(fw, str):
                     firmware_version = fw
-    except (socket.timeout, urllib.error.URLError, json.JSONDecodeError, UnicodeDecodeError):
+    except (
+        socket.timeout,
+        urllib.error.URLError,
+        ConnectionResetError,
+        BrokenPipeError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+    ):
         # Non-fatal: proceed with firmware_version=None.  Probe payload
         # is sized for the worst-known case (fw 3.14*) regardless.
         firmware_version = None
@@ -472,6 +483,21 @@ def liveness_probe(
             password,
             http_timeout,
             query=addr_query,
+        )
+    except (ConnectionResetError, BrokenPipeError) as exc:
+        return LivenessResult(
+            host=host,
+            port=port,
+            healthy=False,
+            reachable=True,
+            writemem_ok=None,
+            firmware_version=firmware_version,
+            failure="connection_reset",
+            recommendation=(
+                f"readmem TCP reset mid-request ({exc!s}); empirically "
+                "transient on fw 3.14d — retry once; if persistent the "
+                "device may need a physical power-cycle"
+            ),
         )
     except (socket.timeout, urllib.error.URLError) as exc:
         return LivenessResult(
@@ -531,6 +557,24 @@ def liveness_probe(
             recommendation=(
                 f"POST /v1/machine:writemem timed out after {http_timeout}s; "
                 "device may need a physical power-cycle"
+            ),
+        )
+    except (ConnectionResetError, BrokenPipeError) as exc:
+        # Per issue #107, do NOT retry the POST internally — repeated
+        # POSTs against a degraded endpoint are the documented TCP-wedge
+        # trigger.  Surface the RST and let the caller decide.
+        return LivenessResult(
+            host=host,
+            port=port,
+            healthy=False,
+            reachable=True,
+            writemem_ok=False,
+            firmware_version=firmware_version,
+            failure="connection_reset",
+            recommendation=(
+                f"POST /v1/machine:writemem TCP reset mid-request ({exc!s}); "
+                "empirically transient on fw 3.14d — caller may retry once; "
+                "if persistent the device may need a physical power-cycle"
             ),
         )
     except urllib.error.URLError as exc:
@@ -611,6 +655,21 @@ def liveness_probe(
             password,
             http_timeout,
             query=addr_query,
+        )
+    except (ConnectionResetError, BrokenPipeError) as exc:
+        return LivenessResult(
+            host=host,
+            port=port,
+            healthy=False,
+            reachable=True,
+            writemem_ok=False,
+            firmware_version=firmware_version,
+            failure="connection_reset",
+            recommendation=(
+                f"readback TCP reset mid-request ({exc!s}); writemem POST "
+                "appeared to succeed but round-trip cannot be confirmed — "
+                "retry the probe before treating as wedged"
+            ),
         )
     except (socket.timeout, urllib.error.URLError):
         return LivenessResult(

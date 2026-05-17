@@ -598,6 +598,105 @@ def test_liveness_tcp_stack_wedged_on_readmem_timeout(mock_probe, mock_urlopen):
     assert r.failure == "tcp_stack_wedged"
 
 
+# ---- connection_reset (one-shot TCP RST mid-request) ------------------
+
+
+@patch("c64_test_harness.backends.ultimate64_probe.urllib.request.urlopen")
+@patch("c64_test_harness.backends.ultimate64_probe.probe_u64")
+def test_liveness_connection_reset_on_readmem(mock_probe, mock_urlopen):
+    """A TCP RST on the pre-POST readmem -> failure='connection_reset'."""
+    mock_probe.return_value = _HEALTHY_PROBE
+
+    mock_urlopen.side_effect = [
+        _make_urlopen_response(
+            200, json.dumps({"firmware_version": "V3.14d"}).encode("utf-8"),
+        ),
+        ConnectionResetError(54, "Connection reset by peer"),
+    ]
+
+    r = liveness_probe("10.0.0.1")
+    assert r.healthy is False
+    assert r.reachable is True
+    assert r.writemem_ok is None
+    assert r.failure == "connection_reset"
+    assert r.recommendation is not None
+    assert "retry" in r.recommendation.lower()
+
+
+@patch("c64_test_harness.backends.ultimate64_probe.urllib.request.urlopen")
+@patch("c64_test_harness.backends.ultimate64_probe.probe_u64")
+def test_liveness_connection_reset_on_writemem_post(mock_probe, mock_urlopen):
+    """A TCP RST on the POST writemem itself -> failure='connection_reset'.
+
+    Important: there must be exactly one POST attempt; the probe must
+    NOT retry internally (per issue #107, repeated POSTs against a
+    degraded endpoint are the documented TCP-wedge trigger).
+    """
+    mock_probe.return_value = _HEALTHY_PROBE
+
+    mock_urlopen.side_effect = [
+        _make_urlopen_response(
+            200, json.dumps({"firmware_version": "V3.14d"}).encode("utf-8"),
+        ),
+        _make_urlopen_response(200, b"\x00" * 128),
+        ConnectionResetError(54, "Connection reset by peer"),
+    ]
+
+    r = liveness_probe("10.0.0.1")
+    assert r.healthy is False
+    assert r.reachable is True
+    assert r.writemem_ok is False
+    assert r.failure == "connection_reset"
+    assert r.recommendation is not None
+    assert "retry" in r.recommendation.lower()
+    # Exactly one POST: 3 urlopen calls total (info, readmem, POST).
+    assert mock_urlopen.call_count == 3
+
+
+@patch("c64_test_harness.backends.ultimate64_probe.urllib.request.urlopen")
+@patch("c64_test_harness.backends.ultimate64_probe.probe_u64")
+def test_liveness_connection_reset_on_readback(mock_probe, mock_urlopen):
+    """A TCP RST on the post-POST readback -> failure='connection_reset'.
+
+    The writemem POST already happened, so round-trip cannot be confirmed;
+    the recommendation should suggest a retry, not assume wedged.
+    """
+    mock_probe.return_value = _HEALTHY_PROBE
+
+    mock_urlopen.side_effect = [
+        _make_urlopen_response(
+            200, json.dumps({"firmware_version": "V3.14d"}).encode("utf-8"),
+        ),
+        _make_urlopen_response(200, b"\x00" * 128),
+        _make_urlopen_response(200, b""),
+        ConnectionResetError(54, "Connection reset by peer"),
+    ]
+
+    r = liveness_probe("10.0.0.1")
+    assert r.healthy is False
+    assert r.reachable is True
+    assert r.writemem_ok is False
+    assert r.failure == "connection_reset"
+
+
+@patch("c64_test_harness.backends.ultimate64_probe.urllib.request.urlopen")
+@patch("c64_test_harness.backends.ultimate64_probe.probe_u64")
+def test_liveness_broken_pipe_treated_as_connection_reset(mock_probe, mock_urlopen):
+    """BrokenPipeError is the symmetric write-side RST — same tag."""
+    mock_probe.return_value = _HEALTHY_PROBE
+
+    mock_urlopen.side_effect = [
+        _make_urlopen_response(
+            200, json.dumps({"firmware_version": "V3.14d"}).encode("utf-8"),
+        ),
+        _make_urlopen_response(200, b"\x00" * 128),
+        BrokenPipeError(32, "Broken pipe"),
+    ]
+
+    r = liveness_probe("10.0.0.1")
+    assert r.failure == "connection_reset"
+
+
 # ---- unknown firmware --------------------------------------------------
 
 
