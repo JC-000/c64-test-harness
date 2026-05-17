@@ -19,7 +19,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .ultimate64_probe import LivenessResult
 
 __all__ = [
     "Ultimate64Client",
@@ -30,6 +33,8 @@ __all__ = [
     "Ultimate64UnsafeOperationError",
     "Ultimate64UnreachableError",
     "Ultimate64RunnerStuckError",
+    "U64UnreachableError",
+    "U64WritememDegradedError",
 ]
 
 _log = logging.getLogger(__name__)
@@ -91,6 +96,40 @@ class Ultimate64RunnerStuckError(Ultimate64Error):
     typically clears this. Do NOT call ``poweroff()`` -- that's
     irrecoverable over the network.
     """
+
+
+class U64UnreachableError(Ultimate64Error):
+    """Raised by :meth:`Ultimate64Client.assert_healthy` when the device
+    fails the reachability portion of the writemem-degradation liveness
+    probe (no TCP connect / no version GET).
+
+    Distinct from :class:`Ultimate64UnreachableError`, which is raised by
+    ``ultimate64_helpers.recover()`` *after* recovery attempts.  This
+    error is raised by ``assert_healthy()`` *before* any recovery is
+    attempted, so the caller can decide how to escalate (probe again,
+    call ``reboot()``, escalate to a human, etc.).  See issue #107.
+    """
+
+
+class U64WritememDegradedError(Ultimate64Error):
+    """Raised by :meth:`Ultimate64Client.assert_healthy` when the device
+    answers REST GETs but ``POST /v1/machine:writemem`` is in the fw
+    3.14d writemem-degraded state (HTTP 404 on the POST path, or the POST
+    timed out / wedged the TCP stack).
+
+    Recovery is not available over the network -- physical power-cycle
+    is the documented fix.  Do NOT retry the POST with varying payload
+    shapes; repeated 404s are the documented TCP-wedge trigger (see
+    issue #107).
+
+    The :class:`~c64_test_harness.backends.ultimate64_probe.LivenessResult`
+    is attached at ``.result`` for callers that want the structured
+    failure tag.
+    """
+
+    def __init__(self, message: str, result: object | None = None) -> None:
+        super().__init__(message)
+        self.result = result
 
 
 def _encode(value: str) -> str:
@@ -281,6 +320,55 @@ class Ultimate64Client:
     def get_info(self) -> dict:
         """GET /v1/info — product, firmware_version, fpga_version, etc."""
         return self._get_json("/v1/info")
+
+    def liveness_probe(self, http_timeout: float = 2.0) -> "LivenessResult":
+        """Run the writemem-degradation liveness probe against this device.
+
+        Delegates to
+        :func:`c64_test_harness.backends.ultimate64_probe.liveness_probe`,
+        passing the client's ``host``, ``port``, and ``password``.  Unlike
+        :meth:`get_version` / :meth:`get_info`, this method actively
+        exercises the ``POST /v1/machine:writemem`` path that
+        :func:`probe_u64` does not, and so detects the fw 3.14d
+        writemem-degraded transient state described in issue #107.
+
+        :param http_timeout: per-request socket timeout (default 2 s);
+            kept short so a wedged TCP stack returns
+            ``failure="tcp_stack_wedged"`` quickly.
+        :returns: a structured
+            :class:`~c64_test_harness.backends.ultimate64_probe.LivenessResult`.
+        """
+        from .ultimate64_probe import liveness_probe as _liveness_probe
+        return _liveness_probe(
+            self.host,
+            port=self.port,
+            password=self.password,
+            http_timeout=http_timeout,
+        )
+
+    def assert_healthy(self, http_timeout: float = 2.0) -> "LivenessResult":
+        """Run :meth:`liveness_probe` and raise on failure.
+
+        :raises U64UnreachableError: if the device fails the reachability
+            portion (TCP / version GET).
+        :raises U64WritememDegradedError: if the device is reachable but
+            the writemem POST round-trip failed (HTTP 404, timeout, or
+            wedged TCP stack).
+        :returns: the :class:`LivenessResult` on success (healthy device).
+        """
+        result = self.liveness_probe(http_timeout=http_timeout)
+        if result.healthy:
+            return result
+        if result.failure == "unreachable":
+            raise U64UnreachableError(
+                f"U64 at {self.host}:{self.port} unreachable: "
+                f"{result.recommendation}"
+            )
+        raise U64WritememDegradedError(
+            f"U64 at {self.host}:{self.port} writemem-degraded "
+            f"({result.failure}): {result.recommendation}",
+            result=result,
+        )
 
     def list_configs(self) -> list[str]:
         """GET /v1/configs — returns the list of config category names."""

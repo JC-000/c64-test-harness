@@ -15,6 +15,7 @@ import pytest
 
 from c64_test_harness.backends.ultimate64_probe import (
     is_u64_reachable,
+    liveness_probe,
     probe_u64,
 )
 
@@ -51,3 +52,31 @@ def test_is_u64_reachable_true():
     """Quick boolean check returns True for the live device."""
     assert _HOST is not None
     assert is_u64_reachable(_HOST, port=_PORT, password=_PASSWORD) is True
+
+
+# ---- liveness_probe (issue #107) ---------------------------------------
+
+
+def test_liveness_probe_healthy_device():
+    """Full writemem-degradation liveness probe against the live device.
+
+    Healthy device should return healthy=True with writemem_ok=True.
+    The probe writes 128 bytes at $0334 (harness-owned cassette scratch)
+    and restores the original bytes on success — no net side effect.
+    """
+    assert _HOST is not None
+    r = liveness_probe(_HOST, port=_PORT, password=_PASSWORD)
+    assert r.healthy is True, f"liveness probe failed: {r.summary} ({r.recommendation})"
+    assert r.reachable is True
+    assert r.writemem_ok is True
+    assert r.failure is None
+
+
+def test_liveness_probe_unreachable_host():
+    """Probe a TEST-NET address: failure='unreachable' fast-returns."""
+    # 192.0.2.1 is from RFC 5737 TEST-NET-1 — not routable.
+    r = liveness_probe("192.0.2.1", http_timeout=1.0)
+    assert r.healthy is False
+    assert r.reachable is False
+    assert r.failure == "unreachable"
+    assert r.writemem_ok is None
