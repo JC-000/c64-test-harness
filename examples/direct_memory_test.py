@@ -10,16 +10,16 @@ Demonstrates the full workflow without any PRG file:
 Requires ``x64sc`` on PATH.
 """
 
-import time
+import sys
 
 from c64_test_harness import (
-    ViceProcess,
     ViceConfig,
-    BinaryViceTransport,
-    ScreenGrid,
+    ViceInstanceManager,
     load_code,
     jsr,
     read_bytes,
+    write_bytes,
+    wait_for_text,
 )
 
 # 6502 program (8 bytes at $C000):
@@ -32,91 +32,80 @@ CODE_ADDR = 0xC000
 INPUT_ADDR = 0xC100
 OUTPUT_ADDR = 0xC101
 
-passed = 0
-failed = 0
+# Default per-jsr timeout. Required at warp=True: without it, a missed
+# breakpoint event would hang the test indefinitely.
+JSR_TIMEOUT = 15.0
 
 
-def connect_binary_transport(port, timeout=30.0, proc=None):
-    """Connect to VICE binary monitor with retries."""
-    deadline = time.monotonic() + timeout
-    last_err = None
-    while time.monotonic() < deadline:
-        if proc is not None and proc._proc is not None and proc._proc.poll() is not None:
-            raise RuntimeError("VICE process exited during binary monitor connect")
-        try:
-            return BinaryViceTransport(port=port)
-        except Exception as e:
-            last_err = e
-            time.sleep(1)
-    raise ConnectionError(f"Could not connect to binary monitor on port {port}: {last_err}")
-
-
-def wait_for_text_binary(transport, needle, timeout=15.0, poll_interval=1.0):
-    """Wait for text on screen, resuming CPU between reads (binary monitor)."""
-    needle_upper = needle.upper()
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        grid = ScreenGrid.from_transport(transport)
-        if needle_upper in grid.continuous_text().upper():
-            return grid
-        transport.resume()
-        time.sleep(poll_interval)
-    return None
-
-
-def check(name: str, expected: int, actual: int) -> None:
-    global passed, failed
+def check(name: str, expected: int, actual: int, counters: dict) -> None:
     if actual == expected:
         print(f"{name} PASS: result = {actual}")
-        passed += 1
+        counters["passed"] += 1
     else:
         print(f"{name} FAIL: expected {expected}, got {actual}")
-        failed += 1
+        counters["failed"] += 1
 
 
-config = ViceConfig(warp=True, sound=False)
+def main() -> int:
+    counters = {"passed": 0, "failed": 0}
 
-with ViceProcess(config) as vice:
-    vice.start()
-    transport = connect_binary_transport(port=config.port, proc=vice)
+    config = ViceConfig(warp=True, sound=False)
 
-    # Wait for BASIC prompt
-    wait_for_text_binary(transport, "READY.", timeout=30)
-    print("C64 booted, BASIC READY.")
+    with ViceInstanceManager(config=config) as mgr:
+        inst = mgr.acquire()
+        print(f"VICE PID={inst.pid}, port={inst.port}")
 
-    # Load subroutine into RAM
-    load_code(transport, CODE_ADDR, CODE)
-    print(f"Loaded {len(CODE)} bytes at ${CODE_ADDR:04X}")
+        transport = inst.transport
 
-    # --- Test 1: 42 * 2 = 84 ---
-    transport.write_memory( INPUT_ADDR, bytes([42]))
-    jsr(transport, CODE_ADDR)
-    result = read_bytes(transport, OUTPUT_ADDR, 1)[0]
-    check("Test 1", 84, result)
+        # Wait for BASIC prompt
+        grid = wait_for_text(transport, "READY.", timeout=30.0)
+        if grid is None:
+            print("FATAL: BASIC READY prompt did not appear")
+            return 1
+        print("C64 booted, BASIC READY.")
 
-    # --- Test 2: 100 * 2 = 200 ---
-    transport.write_memory( INPUT_ADDR, bytes([100]))
-    jsr(transport, CODE_ADDR)
-    result = read_bytes(transport, OUTPUT_ADDR, 1)[0]
-    check("Test 2", 200, result)
+        # Safety: write JMP $0339 at $0339 so CPU loops harmlessly
+        # after jsr() returns (prevents crash when BASIC ROM is banked out).
+        write_bytes(transport, 0x0339, bytes([0x4C, 0x39, 0x03]))
 
-    # --- Test 3: Patch ASL ($0A) -> LSR ($4A), 84 / 2 = 42 ---
-    transport.write_memory( CODE_ADDR + 3, bytes([0x4A]))  # patch opcode
-    transport.write_memory( INPUT_ADDR, bytes([84]))
-    jsr(transport, CODE_ADDR)
-    result = read_bytes(transport, OUTPUT_ADDR, 1)[0]
-    check("Test 3", 42, result)
+        # Load subroutine into RAM
+        load_code(transport, CODE_ADDR, CODE)
+        print(f"Loaded {len(CODE)} bytes at ${CODE_ADDR:04X}")
 
-    # --- Test 4: Edge case — 0 / 2 = 0 ---
-    transport.write_memory( INPUT_ADDR, bytes([0]))
-    jsr(transport, CODE_ADDR)
-    result = read_bytes(transport, OUTPUT_ADDR, 1)[0]
-    check("Test 4", 0, result)
+        # --- Test 1: 42 * 2 = 84 ---
+        write_bytes(transport, INPUT_ADDR, bytes([42]))
+        jsr(transport, CODE_ADDR, timeout=JSR_TIMEOUT)
+        result = read_bytes(transport, OUTPUT_ADDR, 1)[0]
+        check("Test 1", 84, result, counters)
+
+        # --- Test 2: 100 * 2 = 200 ---
+        write_bytes(transport, INPUT_ADDR, bytes([100]))
+        jsr(transport, CODE_ADDR, timeout=JSR_TIMEOUT)
+        result = read_bytes(transport, OUTPUT_ADDR, 1)[0]
+        check("Test 2", 200, result, counters)
+
+        # --- Test 3: Patch ASL ($0A) -> LSR ($4A), 84 / 2 = 42 ---
+        write_bytes(transport, CODE_ADDR + 3, bytes([0x4A]))  # patch opcode
+        write_bytes(transport, INPUT_ADDR, bytes([84]))
+        jsr(transport, CODE_ADDR, timeout=JSR_TIMEOUT)
+        result = read_bytes(transport, OUTPUT_ADDR, 1)[0]
+        check("Test 3", 42, result, counters)
+
+        # --- Test 4: Edge case — 0 / 2 = 0 ---
+        write_bytes(transport, INPUT_ADDR, bytes([0]))
+        jsr(transport, CODE_ADDR, timeout=JSR_TIMEOUT)
+        result = read_bytes(transport, OUTPUT_ADDR, 1)[0]
+        check("Test 4", 0, result, counters)
+
+        mgr.release(inst)
 
     print()
-    if failed == 0:
+    if counters["failed"] == 0:
         print("All tests passed!")
-    else:
-        print(f"{failed} test(s) failed, {passed} passed.")
+        return 0
+    print(f"{counters['failed']} test(s) failed, {counters['passed']} passed.")
+    return 1
 
-    transport.close()
+
+if __name__ == "__main__":
+    sys.exit(main())
