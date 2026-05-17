@@ -5,6 +5,13 @@ This shows how to create a backend for, e.g., an Ultimate 64 cartridge
 accessed over serial.  The backend only needs to implement the methods
 of C64Transport — it gets all screen matching, keyboard helpers, and
 the test framework for free.
+
+Unlike the other ``examples/*.py`` files (which spawn VICE via
+``ViceInstanceManager``), this example deliberately uses the low-level
+``HardwareTransportBase`` API: its purpose is to demonstrate how a new
+backend is *implemented*, not how an existing one is consumed. There is
+no VICE process here to manage. Once the subclass is wired up to real
+hardware, callers use it directly (see the usage comment at the bottom).
 """
 
 from c64_test_harness import HardwareTransportBase, ScreenGrid, wait_for_text

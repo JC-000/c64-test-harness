@@ -1,4 +1,15 @@
-"""Tests for the batch WAV render feature."""
+"""Tests for the batch WAV render feature.
+
+These tests use ``ViceProcess`` directly (rather than ``ViceInstanceManager``)
+because they verify the ``ViceConfig`` → CLI argument conversion inside
+``ViceProcess.start()`` with a mocked ``subprocess.Popen``. They never spawn
+a real x64sc, so the multi-instance / port-allocation machinery in
+``ViceInstanceManager`` would only get in the way.
+
+Each ``ViceProcess`` use is wrapped in a ``with`` context manager so cleanup
+runs even on assertion failure — see canon Rule 1 (ViceProcess always under
+managed lifecycle).
+"""
 
 from __future__ import annotations
 
@@ -61,69 +72,56 @@ class TestViceConfigSoundFields:
             soundoutput=2,
             sound=False,
         )
-        proc = ViceProcess(cfg)
-        proc.start()
+        with ViceProcess(cfg):
+            args = mock_popen.call_args[0][0]
+            assert "-sounddev" in args
+            idx = args.index("-sounddev")
+            assert args[idx + 1] == "wav"
 
-        args = mock_popen.call_args[0][0]
-        assert "-sounddev" in args
-        idx = args.index("-sounddev")
-        assert args[idx + 1] == "wav"
+            assert "-soundarg" in args
+            idx = args.index("-soundarg")
+            assert args[idx + 1] == "/tmp/test.wav"
 
-        assert "-soundarg" in args
-        idx = args.index("-soundarg")
-        assert args[idx + 1] == "/tmp/test.wav"
+            assert "-soundrate" in args
+            idx = args.index("-soundrate")
+            assert args[idx + 1] == "22050"
 
-        assert "-soundrate" in args
-        idx = args.index("-soundrate")
-        assert args[idx + 1] == "22050"
+            assert "-soundoutput" in args
+            idx = args.index("-soundoutput")
+            assert args[idx + 1] == "2"
 
-        assert "-soundoutput" in args
-        idx = args.index("-soundoutput")
-        assert args[idx + 1] == "2"
-
-        # +sound should NOT be present when sounddev is set
-        assert "+sound" not in args
-
-        proc._proc = None  # prevent cleanup issues
+            # +sound should NOT be present when sounddev is set
+            assert "+sound" not in args
 
     @patch("subprocess.Popen")
     def test_no_sounddev_emits_plus_sound(self, mock_popen):
         """Without sounddev and sound=False, +sound should be present."""
         mock_popen.return_value = MagicMock()
         cfg = ViceConfig(sound=False)
-        proc = ViceProcess(cfg)
-        proc.start()
-
-        args = mock_popen.call_args[0][0]
-        assert "+sound" in args
-        assert "-sounddev" not in args
-        proc._proc = None
+        with ViceProcess(cfg):
+            args = mock_popen.call_args[0][0]
+            assert "+sound" in args
+            assert "-sounddev" not in args
 
     @patch("subprocess.Popen")
     def test_limit_cycles_produces_arg(self, mock_popen):
         """When limit_cycles > 0, -limitcycles should appear."""
         mock_popen.return_value = MagicMock()
         cfg = ViceConfig(limit_cycles=985248)
-        proc = ViceProcess(cfg)
-        proc.start()
-
-        args = mock_popen.call_args[0][0]
-        assert "-limitcycles" in args
-        idx = args.index("-limitcycles")
-        assert args[idx + 1] == "985248"
-        proc._proc = None
+        with ViceProcess(cfg):
+            args = mock_popen.call_args[0][0]
+            assert "-limitcycles" in args
+            idx = args.index("-limitcycles")
+            assert args[idx + 1] == "985248"
 
     @patch("subprocess.Popen")
     def test_no_limit_cycles_no_arg(self, mock_popen):
         """When limit_cycles == 0, -limitcycles should not appear."""
         mock_popen.return_value = MagicMock()
         cfg = ViceConfig()
-        proc = ViceProcess(cfg)
-        proc.start()
-
-        args = mock_popen.call_args[0][0]
-        assert "-limitcycles" not in args
-        proc._proc = None
+        with ViceProcess(cfg):
+            args = mock_popen.call_args[0][0]
+            assert "-limitcycles" not in args
 
     @patch("subprocess.Popen")
     def test_env_passed_to_popen(self, mock_popen):
@@ -131,52 +129,40 @@ class TestViceConfigSoundFields:
         mock_popen.return_value = MagicMock()
         env = {"SDL_VIDEODRIVER": "dummy", "PATH": "/usr/bin"}
         cfg = ViceConfig(env=env)
-        proc = ViceProcess(cfg)
-        proc.start()
-
-        kwargs = mock_popen.call_args[1]
-        assert kwargs["env"] == env
-        proc._proc = None
+        with ViceProcess(cfg):
+            kwargs = mock_popen.call_args[1]
+            assert kwargs["env"] == env
 
     @patch("subprocess.Popen")
     def test_no_env_no_kwarg(self, mock_popen):
         """When env is None, env kwarg should not be passed to Popen."""
         mock_popen.return_value = MagicMock()
         cfg = ViceConfig()
-        proc = ViceProcess(cfg)
-        proc.start()
-
-        kwargs = mock_popen.call_args[1]
-        assert "env" not in kwargs
-        proc._proc = None
+        with ViceProcess(cfg):
+            kwargs = mock_popen.call_args[1]
+            assert "env" not in kwargs
 
     @patch("subprocess.Popen")
     def test_monitor_true_emits_binarymonitor(self, mock_popen):
         """When monitor=True (default), -binarymonitor should appear."""
         mock_popen.return_value = MagicMock()
         cfg = ViceConfig(monitor=True, port=6520)
-        proc = ViceProcess(cfg)
-        proc.start()
-
-        args = mock_popen.call_args[0][0]
-        assert "-binarymonitor" in args
-        assert "-binarymonitoraddress" in args
-        idx = args.index("-binarymonitoraddress")
-        assert "6520" in args[idx + 1]
-        proc._proc = None
+        with ViceProcess(cfg):
+            args = mock_popen.call_args[0][0]
+            assert "-binarymonitor" in args
+            assert "-binarymonitoraddress" in args
+            idx = args.index("-binarymonitoraddress")
+            assert "6520" in args[idx + 1]
 
     @patch("subprocess.Popen")
     def test_monitor_false_omits_binarymonitor(self, mock_popen):
         """When monitor=False, -binarymonitor should not appear."""
         mock_popen.return_value = MagicMock()
         cfg = ViceConfig(monitor=False)
-        proc = ViceProcess(cfg)
-        proc.start()
-
-        args = mock_popen.call_args[0][0]
-        assert "-binarymonitor" not in args
-        assert "-binarymonitoraddress" not in args
-        proc._proc = None
+        with ViceProcess(cfg):
+            args = mock_popen.call_args[0][0]
+            assert "-binarymonitor" not in args
+            assert "-binarymonitoraddress" not in args
 
 
 # ---------------------------------------------------------------------------
@@ -188,35 +174,49 @@ class TestWaitForExit:
     """Test ViceProcess.wait_for_exit() method."""
 
     def test_wait_for_exit_returns_code(self):
+        # ViceProcess is constructed without start() because these tests
+        # drive its state machine via a mocked Popen.  We use try/finally
+        # rather than ``with`` since ``with`` would invoke start() (which
+        # spawns a real x64sc subprocess).  stop() is a no-op when _proc
+        # is None and harmless when _proc is a Mock.
         proc = ViceProcess(ViceConfig())
-        mock_popen = MagicMock()
-        mock_popen.wait.return_value = None
-        mock_popen.returncode = 1
-        proc._proc = mock_popen
+        try:
+            mock_popen = MagicMock()
+            mock_popen.wait.return_value = None
+            mock_popen.returncode = 1
+            proc._proc = mock_popen
 
-        code = proc.wait_for_exit(timeout=10.0)
-        assert code == 1
-        mock_popen.wait.assert_called_once_with(timeout=10.0)
-        # After wait, _proc should be cleared
-        assert proc._proc is None
+            code = proc.wait_for_exit(timeout=10.0)
+            assert code == 1
+            mock_popen.wait.assert_called_once_with(timeout=10.0)
+            # After wait, _proc should be cleared
+            assert proc._proc is None
+        finally:
+            proc.stop()
 
     def test_wait_for_exit_not_started_raises(self):
         proc = ViceProcess(ViceConfig())
-        with pytest.raises(RuntimeError, match="not been started"):
-            proc.wait_for_exit()
+        try:
+            with pytest.raises(RuntimeError, match="not been started"):
+                proc.wait_for_exit()
+        finally:
+            proc.stop()
 
     def test_wait_for_exit_timeout_kills(self):
         proc = ViceProcess(ViceConfig())
-        mock_popen = MagicMock()
-        mock_popen.wait.side_effect = subprocess.TimeoutExpired(cmd="x64sc", timeout=5)
-        mock_popen.terminate.return_value = None
-        mock_popen.kill.return_value = None
-        proc._proc = mock_popen
+        try:
+            mock_popen = MagicMock()
+            mock_popen.wait.side_effect = subprocess.TimeoutExpired(cmd="x64sc", timeout=5)
+            mock_popen.terminate.return_value = None
+            mock_popen.kill.return_value = None
+            proc._proc = mock_popen
 
-        with pytest.raises(subprocess.TimeoutExpired):
-            proc.wait_for_exit(timeout=5.0)
-        # Process should be cleaned up
-        assert proc._proc is None
+            with pytest.raises(subprocess.TimeoutExpired):
+                proc.wait_for_exit(timeout=5.0)
+            # Process should be cleaned up
+            assert proc._proc is None
+        finally:
+            proc.stop()
 
 
 # ---------------------------------------------------------------------------
