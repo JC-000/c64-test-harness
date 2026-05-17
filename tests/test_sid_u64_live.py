@@ -81,7 +81,7 @@ def test_play_sid_on_ultimate64() -> None:
     finally:
         # Be polite to shared hardware: always reset to stop audio.
         try:
-            transport._client.reset()
+            transport.client.reset()
         except Exception:
             pass
         transport.close()
