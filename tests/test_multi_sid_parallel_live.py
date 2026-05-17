@@ -32,7 +32,7 @@ from pathlib import Path
 
 import pytest
 
-from c64_test_harness.backends.device_lock import DeviceLock
+from c64_test_harness.backends.device_lock import DeviceLock, DeviceLockTimeout
 from c64_test_harness.backends.u64_audio_capture import (
     AudioCapture,
     DEFAULT_AUDIO_PORT,
@@ -232,8 +232,10 @@ def u64_client():
     host = os.environ.get("U64_HOST")
     pw = os.environ.get("U64_PASSWORD")
     lock = DeviceLock(host)
-    if not lock.acquire(timeout=120.0):
-        pytest.skip(f"Could not acquire device lock for {host}")
+    try:
+        lock.acquire_or_raise(timeout=120.0)
+    except DeviceLockTimeout as e:
+        pytest.skip(str(e))
     client = Ultimate64Client(host=host, password=pw, timeout=15.0)
     yield client
     try:

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from c64_test_harness.backends.device_lock import DeviceLock
+from c64_test_harness.backends.device_lock import DeviceLock, DeviceLockTimeout
 from c64_test_harness.backends.ultimate64 import Ultimate64Transport
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
 from c64_test_harness.backends.ultimate64_helpers import (
@@ -82,10 +82,14 @@ _TRAMPOLINE_CODE = bytes([
 def client() -> Ultimate64Client:
     assert _HOST is not None
     lock = DeviceLock(_HOST)
-    if not lock.acquire(timeout=120.0):
-        pytest.skip(f"Could not acquire device lock for {_HOST}")
-    yield Ultimate64Client(host=_HOST, password=_PW, timeout=10.0)
-    lock.release()
+    try:
+        lock.acquire_or_raise(timeout=120.0)
+    except DeviceLockTimeout as e:
+        pytest.skip(str(e))
+    try:
+        yield Ultimate64Client(host=_HOST, password=_PW, timeout=10.0)
+    finally:
+        lock.release()
 
 
 @pytest.fixture(scope="module")

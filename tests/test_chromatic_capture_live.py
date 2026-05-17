@@ -39,7 +39,7 @@ from play_chromatic_u64 import (  # noqa: E402
     build_chromatic_psid,
 )
 
-from c64_test_harness.backends.device_lock import DeviceLock  # noqa: E402
+from c64_test_harness.backends.device_lock import DeviceLock, DeviceLockTimeout  # noqa: E402
 from c64_test_harness.backends.render_wav_u64 import capture_sid_u64  # noqa: E402
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client  # noqa: E402
 from c64_test_harness.sid import SidFile  # noqa: E402
@@ -130,8 +130,10 @@ def u64_client():
     host = os.environ.get("U64_HOST")
     pw = os.environ.get("U64_PASSWORD")
     lock = DeviceLock(host)
-    if not lock.acquire(timeout=120.0):
-        pytest.skip(f"Could not acquire device lock for {host}")
+    try:
+        lock.acquire_or_raise(timeout=120.0)
+    except DeviceLockTimeout as e:
+        pytest.skip(str(e))
 
     client = Ultimate64Client(host=host, password=pw, timeout=15.0)
     yield client
