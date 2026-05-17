@@ -103,7 +103,9 @@ from .backends.ultimate64_manager import (
     Ultimate64PoolExhaustedError,
 )
 from .backends.ultimate64_probe import (
+    LivenessResult,
     ProbeResult,
+    liveness_probe,
     probe_u64,
     is_u64_reachable,
 )
@@ -402,7 +404,9 @@ __all__ = [
     "Ultimate64PoolExhaustedError",
     # Ultimate 64 liveness probe
     "ProbeResult",
+    "LivenessResult",
     "probe_u64",
+    "liveness_probe",
     "is_u64_reachable",
     # Device lock
     "DeviceLock",
