@@ -79,7 +79,8 @@ def test_play_sid_on_vice(vice_mgr) -> None:
         # Wait for BASIC READY prompt so we know KERNAL IRQ is active.
         wait_for_text(transport, "READY.", timeout=30.0)
 
-        # Zero the sentinels first.
+        # Zero the sentinels first. $0360-$0361 is harness-reserved per
+        # the Rule 23 scratch table (sid_player trampoline flags).
         transport.write_memory(0x0360, bytes([0x00, 0x00]))
 
         # Play the SID.
