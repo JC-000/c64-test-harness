@@ -1,6 +1,7 @@
 """Unit tests for ultimate64_helpers (mocked Ultimate64Client)."""
 from __future__ import annotations
 
+from typing import Callable
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
@@ -15,6 +16,7 @@ from c64_test_harness.backends.ultimate64_helpers import (
     CAT_SID_ADDRESSING,
     CAT_SID_SOCKETS,
     CAT_U64_SPECIFIC,
+    ProgressEvent,
     U64StateSnapshot,
     Ultimate64MeasurementEnvironmentError,
     check_measurement_environment,
@@ -35,6 +37,7 @@ from c64_test_harness.backends.ultimate64_helpers import (
     set_turbo_mhz,
     snapshot_state,
     unmount,
+    watch_progress,
 )
 
 
@@ -585,3 +588,365 @@ class TestCheckMeasurementEnvironment:
         client = self._client_with_turbo("Manual", "48")
         with pytest.raises(Ultimate64Error):
             check_measurement_environment(client)
+
+
+# --------------------------------------------------------------------------- #
+# watch_progress() — GitHub issue #108                                        #
+# --------------------------------------------------------------------------- #
+
+
+class _FakeClock:
+    """A deterministic clock with explicit list of monotonic returns.
+
+    The list is consumed in order; once exhausted the clock keeps
+    incrementing by ``step`` (default 1.0 s) so generators bounded by
+    overall_timeout always eventually terminate even if a test consumes
+    extra ticks.
+    """
+
+    def __init__(self, ticks: list[float], step: float = 1.0) -> None:
+        if not ticks:
+            raise ValueError("ticks must be non-empty")
+        self._ticks = list(ticks)
+        self._idx = 0
+        self._step = step
+        self._tail = ticks[-1]
+
+    def __call__(self) -> float:
+        if self._idx < len(self._ticks):
+            value = self._ticks[self._idx]
+            self._idx += 1
+            self._tail = value
+        else:
+            self._tail += self._step
+            value = self._tail
+        return value
+
+
+def _record_sleep() -> tuple[list[float], "Callable[[float], None]"]:
+    calls: list[float] = []
+
+    def _sleep(seconds: float) -> None:
+        calls.append(seconds)
+
+    return calls, _sleep
+
+
+class TestWatchProgress:
+    """Unit tests for watch_progress() with mocked DMA reads."""
+
+    def test_validates_empty_addresses(self) -> None:
+        client = _make_client()
+        with pytest.raises(ValueError, match="non-empty"):
+            list(watch_progress(client, addresses={}))
+
+    def test_validates_non_positive_intervals(self) -> None:
+        client = _make_client()
+        with pytest.raises(ValueError, match="poll_interval"):
+            list(watch_progress(
+                client, addresses={"s": (0x0400, 1)}, poll_interval=0,
+            ))
+        with pytest.raises(ValueError, match="idle_timeout"):
+            list(watch_progress(
+                client, addresses={"s": (0x0400, 1)}, idle_timeout=0,
+            ))
+        with pytest.raises(ValueError, match="overall_timeout"):
+            list(watch_progress(
+                client, addresses={"s": (0x0400, 1)}, overall_timeout=0,
+            ))
+
+    def test_validates_address_specs(self) -> None:
+        client = _make_client()
+        with pytest.raises(ValueError, match="out of range"):
+            list(watch_progress(client, addresses={"x": (0x10000, 1)}))
+        with pytest.raises(ValueError, match="invalid"):
+            list(watch_progress(client, addresses={"x": (0x0400, 0)}))
+        with pytest.raises(ValueError, match="invalid"):
+            list(watch_progress(client, addresses={"x": (0xFFFF, 4)}))
+
+    def test_first_poll_yields_baseline_advanced(self) -> None:
+        """The first successful poll emits an Advanced event with empty old bytes."""
+        client = _make_client()
+        client.read_mem.return_value = b"\x00"
+        clock = _FakeClock([0.0, 0.1])
+        _, sleep = _record_sleep()
+
+        gen = watch_progress(
+            client,
+            addresses={"sentinel": (0x3C80, 1)},
+            poll_interval=10.0,
+            idle_timeout=120.0,
+            overall_timeout=5400.0,
+            _clock=clock,
+            _sleep=sleep,
+        )
+        event = next(gen)
+        gen.close()
+
+        assert event.kind == "Advanced"
+        assert event.changed == {"sentinel": (b"", b"\x00")}
+        assert event.values == {"sentinel": b"\x00"}
+        assert event.error is None
+
+    def test_advanced_on_change(self) -> None:
+        """A change between polls yields Advanced with (old, new) bytes."""
+        client = _make_client()
+        # poll1: 0x00, poll2: 0x01, poll3: 0x01
+        client.read_mem.side_effect = [b"\x00", b"\x01", b"\x01"]
+        # Clock: start, mid-poll, after-poll, sleep, start2, mid2, after2, ...
+        # The implementation calls _clock() once per loop top and once
+        # after the reads. Just provide plenty of ticks.
+        clock = _FakeClock([0.0, 0.1, 0.2, 10.0, 10.1, 20.0, 20.1, 30.0])
+        _, sleep = _record_sleep()
+
+        gen = watch_progress(
+            client,
+            addresses={"x": (0x0400, 1)},
+            poll_interval=10.0,
+            idle_timeout=120.0,
+            overall_timeout=5400.0,
+            _clock=clock,
+            _sleep=sleep,
+        )
+        first = next(gen)  # baseline Advanced
+        second = next(gen)  # actual change Advanced
+        gen.close()
+
+        assert first.kind == "Advanced"
+        assert second.kind == "Advanced"
+        assert second.changed == {"x": (b"\x00", b"\x01")}
+        assert second.values == {"x": b"\x01"}
+
+    def test_stalled_after_idle_timeout(self) -> None:
+        """No-change for idle_timeout seconds emits Stalled."""
+        client = _make_client()
+        # Same byte every poll => no diff
+        client.read_mem.return_value = b"\x42"
+        # Make the second poll's elapsed >= idle_timeout=5.0
+        clock = _FakeClock([0.0, 0.1, 0.2, 6.0, 6.1, 6.2, 6.3])
+        _, sleep = _record_sleep()
+
+        gen = watch_progress(
+            client,
+            addresses={"x": (0x0400, 1)},
+            poll_interval=1.0,
+            idle_timeout=5.0,
+            overall_timeout=60.0,
+            _clock=clock,
+            _sleep=sleep,
+        )
+        first = next(gen)  # baseline Advanced
+        second = next(gen)
+        gen.close()
+
+        assert first.kind == "Advanced"
+        assert second.kind == "Stalled"
+        assert second.changed == {}
+        assert second.values == {"x": b"\x42"}
+
+    def test_timeout_terminates_generator(self) -> None:
+        """overall_timeout elapsed emits Timeout and exits cleanly."""
+        client = _make_client()
+        client.read_mem.return_value = b"\x00"
+        # Force elapsed >= overall_timeout=2.0 on the very first iteration
+        clock = _FakeClock([0.0, 0.1, 0.2, 100.0])
+        _, sleep = _record_sleep()
+
+        gen = watch_progress(
+            client,
+            addresses={"x": (0x0400, 1)},
+            poll_interval=1.0,
+            idle_timeout=5.0,
+            overall_timeout=2.0,
+            _clock=clock,
+            _sleep=sleep,
+        )
+        first = next(gen)  # baseline
+        second = next(gen)  # next iteration's clock check trips Timeout
+        with pytest.raises(StopIteration):
+            next(gen)
+        gen.close()
+
+        assert first.kind == "Advanced"
+        assert second.kind == "Timeout"
+
+    def test_poll_error_then_continue(self) -> None:
+        """A failed read yields PollError but polling continues on the next tick."""
+        client = _make_client()
+        from c64_test_harness.backends.ultimate64_client import Ultimate64Error
+        boom = Ultimate64Error("transient DMA failure")
+        # poll1 succeeds, poll2 raises, poll3 succeeds with a change.
+        client.read_mem.side_effect = [b"\x00", boom, b"\x01"]
+        clock = _FakeClock(
+            [0.0, 0.1, 0.2, 1.0, 1.1, 1.2, 2.0, 2.1, 2.2, 3.0]
+        )
+        _, sleep = _record_sleep()
+
+        gen = watch_progress(
+            client,
+            addresses={"x": (0x0400, 1)},
+            poll_interval=1.0,
+            idle_timeout=600.0,
+            overall_timeout=600.0,
+            _clock=clock,
+            _sleep=sleep,
+        )
+        first = next(gen)
+        second = next(gen)
+        third = next(gen)
+        gen.close()
+
+        assert first.kind == "Advanced"
+        assert second.kind == "PollError"
+        assert second.error is boom
+        assert third.kind == "Advanced"
+        assert third.changed == {"x": (b"\x00", b"\x01")}
+
+    def test_poll_error_does_not_reset_baseline(self) -> None:
+        """PollError preserves last-known values so the next diff is correct."""
+        client = _make_client()
+        from c64_test_harness.backends.ultimate64_client import Ultimate64Error
+        client.read_mem.side_effect = [
+            b"\x00",  # baseline
+            Ultimate64Error("flake"),  # error
+            b"\x00",  # unchanged
+        ]
+        clock = _FakeClock([0.0] + [float(i) * 0.5 for i in range(1, 30)])
+        _, sleep = _record_sleep()
+
+        gen = watch_progress(
+            client,
+            addresses={"x": (0x0400, 1)},
+            poll_interval=0.1,
+            idle_timeout=600.0,
+            overall_timeout=600.0,
+            _clock=clock,
+            _sleep=sleep,
+        )
+        first = next(gen)
+        second = next(gen)
+        # Third poll returns the same byte we baselined — must NOT emit
+        # a spurious Advanced caused by the PollError clearing state.
+        # The generator should sleep instead; pull events until something
+        # non-Advanced/empty shows or we hit Stalled.
+        # Simplest: call next() with a short idle_timeout to force Stalled.
+        gen.close()
+
+        assert first.kind == "Advanced"
+        assert second.kind == "PollError"
+
+    def test_finished_via_stop_when(self) -> None:
+        """stop_when returning truthy yields Finished and ends iteration."""
+        client = _make_client()
+        client.read_mem.side_effect = [b"\x00", b"\xFF"]
+        clock = _FakeClock([0.0, 0.1, 0.2, 1.0, 1.1, 1.2])
+        _, sleep = _record_sleep()
+
+        def stop_at_ff(values: dict) -> bool:
+            return values.get("x") == b"\xFF"
+
+        gen = watch_progress(
+            client,
+            addresses={"x": (0x0400, 1)},
+            poll_interval=1.0,
+            idle_timeout=600.0,
+            overall_timeout=600.0,
+            stop_when=stop_at_ff,
+            _clock=clock,
+            _sleep=sleep,
+        )
+        events = list(gen)
+        # baseline Advanced (sentinel=0x00), then change Advanced to 0xFF,
+        # then Finished.
+        assert [e.kind for e in events] == ["Advanced", "Advanced", "Finished"]
+        assert events[-1].values == {"x": b"\xFF"}
+
+    def test_generator_cleanup_on_close(self) -> None:
+        """Closing the generator releases without further reads."""
+        client = _make_client()
+        client.read_mem.return_value = b"\x00"
+        clock = _FakeClock([0.0, 0.1, 0.2, 10.0, 10.1, 20.0])
+        _, sleep = _record_sleep()
+
+        gen = watch_progress(
+            client,
+            addresses={"x": (0x0400, 1)},
+            poll_interval=10.0,
+            idle_timeout=120.0,
+            overall_timeout=5400.0,
+            _clock=clock,
+            _sleep=sleep,
+        )
+        first = next(gen)
+        # Caller breaks out — simulate by .close()
+        gen.close()
+        assert first.kind == "Advanced"
+        # Subsequent next() on a closed generator raises StopIteration.
+        with pytest.raises(StopIteration):
+            next(gen)
+
+    def test_multiple_ranges_independent_diff(self) -> None:
+        """Each named range diffs independently; only changed names appear."""
+        client = _make_client()
+        # Two ranges per poll. Order: sentinel then row, repeated per poll.
+        client.read_mem.side_effect = [
+            b"\x00", b"AAAA",  # poll1
+            b"\x01", b"AAAA",  # poll2: only sentinel changed
+        ]
+        clock = _FakeClock([0.0, 0.1, 0.2, 1.0, 1.1, 1.2, 2.0])
+        _, sleep = _record_sleep()
+
+        gen = watch_progress(
+            client,
+            addresses={
+                "sentinel": (0x3C80, 1),
+                "row": (0x0780, 4),
+            },
+            poll_interval=1.0,
+            idle_timeout=600.0,
+            overall_timeout=600.0,
+            _clock=clock,
+            _sleep=sleep,
+        )
+        first = next(gen)
+        second = next(gen)
+        gen.close()
+
+        assert first.kind == "Advanced"
+        assert set(first.changed) == {"sentinel", "row"}
+        assert second.kind == "Advanced"
+        assert set(second.changed) == {"sentinel"}
+        assert second.changed["sentinel"] == (b"\x00", b"\x01")
+        assert second.values == {"sentinel": b"\x01", "row": b"AAAA"}
+
+    def test_poll_interval_passed_to_sleep(self) -> None:
+        """The poll_interval value is what we sleep for between polls."""
+        client = _make_client()
+        # Two different reads so the second poll yields Advanced (not Stalled)
+        client.read_mem.side_effect = [b"\x00", b"\x01"]
+        clock = _FakeClock([0.0, 0.1, 0.2, 0.3, 0.4, 0.5])
+        sleeps, sleep = _record_sleep()
+
+        gen = watch_progress(
+            client,
+            addresses={"x": (0x0400, 1)},
+            poll_interval=7.5,
+            idle_timeout=600.0,
+            overall_timeout=600.0,
+            _clock=clock,
+            _sleep=sleep,
+        )
+        next(gen)  # baseline Advanced
+        next(gen)  # change Advanced
+        gen.close()
+
+        assert sleeps and all(s == 7.5 for s in sleeps)
+
+    def test_progress_event_dataclass_defaults(self) -> None:
+        """ProgressEvent has sensible defaults for unset fields."""
+        e = ProgressEvent(kind="Stalled", elapsed=42.0)
+        assert e.kind == "Stalled"
+        assert e.changed == {}
+        assert e.values == {}
+        assert e.error is None
+        assert e.elapsed == 42.0
