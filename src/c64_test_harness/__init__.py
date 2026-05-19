@@ -276,6 +276,7 @@ from .sid_player import (
 # depend on the older names; keeping the new ones distinct preserves
 # both call sites.
 from .snapshot import (  # noqa: E402
+    DriveState,
     Snapshot,
     SnapshotFormatError,
     extract_snapshot,
@@ -575,9 +576,10 @@ __all__ = [
     "VideoFrame",
     "DEFAULT_VIDEO_PORT",
     "VIC_PALETTE",
-    # Cross-backend snapshot interop (Phase A)
+    # Cross-backend snapshot interop (Phase A + Phase B disk sidecar)
     "Snapshot",
     "SnapshotFormatError",
+    "DriveState",
     "extract_snapshot",
     "restore_snapshot",
 ]
