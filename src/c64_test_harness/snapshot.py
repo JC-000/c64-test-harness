@@ -1,12 +1,32 @@
-"""Cross-backend C64 snapshot — Phase A.
+"""Cross-backend C64 snapshot — Phases A + B + C.
 
-Round-trips just **64 KB RAM + CPU port** between VICE and Ultimate 64,
-using VICE's native ``.vsf`` format as the on-disk wire.
+Round-trips RAM, CPU port, mounted disk images, and now REU contents
+between VICE and Ultimate 64, using VICE's native ``.vsf`` format as the
+on-disk wire (with optional sidecar files for drives and a Phase C
+``reu.bin`` bundle file).
 
 Phase A is deliberately seed-only: a restored snapshot loads the RAM
 image but does NOT resume at the exact PC/cycle.  CPU register, VIC-II,
-SID, CIA, and REU state are out of scope and will follow in later
-phases.
+SID, and CIA state are out of scope and will follow in later phases.
+
+Phase C — REU
+-------------
+
+The optional ``Snapshot.reu_contents`` field carries up to 16 MB of REU
+bytes (sizes match the device's enum: 128 KB, 256 KB, ..., 16 MB).
+On the U64 side restore pushes the bytes through
+:class:`~c64_test_harness.backends.u64_socket_dma.SocketDMAClient` —
+specifically its 0xFF07 REUWRITE opcode — which is fast (a few seconds
+even for the full 16 MB) because it's a persistent TCP socket on port
+64.  Extract is slower: the U64 REST API has no REU readback endpoint,
+so :func:`extract_snapshot` uses a DMA-via-staging window at
+``$0800–$87FF``, with the CPU paused first, programming the REU
+registers at ``$DF02–$DF09`` to copy 32 KB banks from REU into the
+window, then reading them back via ``read_memory``.  Staging-window
+contents are stashed and restored under a ``try/finally`` so even a
+partial failure leaves the original bytes intact.  All staging writes
+carry ``override="reu-snapshot-staging"`` so :class:`MemoryPolicy`
+doesn't block them.
 
 Design notes
 ------------
@@ -125,6 +145,61 @@ _C64MEM_BODY_LEN = 4 + 65536 + _C64MEM_TRAILER_LEN  # = 65555
 _CIA_REGS_LEN = 16  # $DC00-$DC0F / $DD00-$DD0F register file
 _VIC_REGS_LEN = 47  # $D000-$D02E register file
 _SID_REGS_LEN = 32  # $D400-$D41F register file
+# REU1764 module — VICE writes this for the RAM Expansion Unit.
+# Body layout (empirically captured from VICE 3.10 at BASIC READY with
+# REU enabled, no transfers performed):
+#
+#   bytes 0..2:   REU size in KB, 24-bit LE  (e.g. 128 / 16384)
+#   byte  3:      reserved / unused (zero)
+#   bytes 4..14:  11 registers $DF00..$DF0A
+#   bytes 15..19: 5 bytes VICE-internal DMA state (FFs in the idle snapshot)
+#   bytes 20..N:  N bytes REU contents (N = size_KB * 1024)
+#
+# Total preamble length = 20.
+_REU_MODULE_NAME = b"REU1764"
+_REU_VMAJOR = 0
+_REU_VMINOR = 0
+_REU_PREAMBLE_LEN = 20
+
+# Idle-REU control register snapshot — what VICE writes when REU is
+# enabled but has performed no transfers since boot.  Reproduces the
+# observed preamble bytes 4..19 from a clean VICE 3.10 capture:
+#
+#   80 00 00 00  00 10 00 00 00 00 f8 ff ff 1f 3f  ff ff ff ff ff
+#   |-- size --| |---- 11 DF regs (DF00..DF0A) ---| |- internal -|
+#
+# Bytes 4..14 (11) = DF00..DF0A; bytes 15..19 (5) = internal DMA state.
+_REU_IDLE_DF_REGS = bytes([
+    0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0xF8, 0xFF, 0xFF, 0x1F, 0x3F,
+])
+_REU_IDLE_INTERNAL = bytes([0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+assert len(_REU_IDLE_DF_REGS) == 11
+assert len(_REU_IDLE_INTERNAL) == 5
+
+# REU size enum — matches the U64 schema (REU_SIZE_VALUES).  Used to
+# validate ``Snapshot.reu_size_bytes`` so the snapshot is restorable
+# onto either backend.
+_REU_SIZE_BYTES: tuple[int, ...] = (
+    128 * 1024,
+    256 * 1024,
+    512 * 1024,
+    1 * 1024 * 1024,
+    2 * 1024 * 1024,
+    4 * 1024 * 1024,
+    8 * 1024 * 1024,
+    16 * 1024 * 1024,
+)
+
+# Staging-window for the U64 REU→host extract path.  32 KB window at
+# $0800–$87FF.  Stays inside C64 RAM and clear of the harness's own
+# scratch regions (see docs/memory_safety.md).
+_REU_STAGING_ADDR = 0x0800
+_REU_STAGING_LEN = 0x8000  # 32 KB per bank read
+
+# REU command byte — DMA REU→C64, execute now, no autoload.
+# Bit layout: bit7=execute, bit6=autoload, bit5=ff00, bits1-0=direction
+#   0b1001_0001 = $91  (execute, no autoload, REU→C64)
+_REU_CMD_REU_TO_C64 = 0x91
 
 _TEMPLATE_PATH = Path(__file__).with_name("_vsf_template.vsf")
 
@@ -305,6 +380,12 @@ class Snapshot:
     cia2_regs: bytes = b""
     vic_regs: bytes = b""
     sid_regs: bytes = b""
+    # Phase C — RAM Expansion Unit (REU) contents.  ``reu_size_bytes``
+    # of 0 means the snapshot carries no REU; otherwise the size must
+    # be one of :data:`_REU_SIZE_BYTES` and ``reu_contents`` must hold
+    # exactly that many bytes.
+    reu_size_bytes: int = 0
+    reu_contents: bytes = b""
 
     def __post_init__(self) -> None:
         if not isinstance(self.ram, (bytes, bytearray)):
@@ -360,6 +441,37 @@ class Snapshot:
                 )
             if isinstance(v, bytearray):
                 object.__setattr__(self, name, bytes(v))
+        # ----- REU validation (Phase C) -----
+        if not isinstance(self.reu_size_bytes, int) or self.reu_size_bytes < 0:
+            raise ValueError(
+                f"reu_size_bytes must be a non-negative int, "
+                f"got {self.reu_size_bytes!r}"
+            )
+        if not isinstance(self.reu_contents, (bytes, bytearray)):
+            raise TypeError(
+                f"reu_contents must be bytes, "
+                f"not {type(self.reu_contents).__name__}"
+            )
+        if isinstance(self.reu_contents, bytearray):
+            object.__setattr__(self, "reu_contents", bytes(self.reu_contents))
+        if self.reu_size_bytes == 0:
+            if len(self.reu_contents) != 0:
+                raise ValueError(
+                    f"reu_size_bytes=0 but reu_contents has "
+                    f"{len(self.reu_contents)} bytes; pass empty bytes when "
+                    "no REU is present"
+                )
+        else:
+            if self.reu_size_bytes not in _REU_SIZE_BYTES:
+                raise ValueError(
+                    f"reu_size_bytes={self.reu_size_bytes} is not one of the "
+                    f"REU enum sizes {_REU_SIZE_BYTES}"
+                )
+            if len(self.reu_contents) != self.reu_size_bytes:
+                raise ValueError(
+                    f"reu_contents has {len(self.reu_contents)} bytes but "
+                    f"reu_size_bytes is {self.reu_size_bytes}"
+                )
 
     # ------------------------------------------------------------------
     # VSF codec
@@ -381,6 +493,12 @@ class Snapshot:
         modules (sequencer state, TOD alarm latches, etc.) stay as
         template values.  See :data:`_REGISTER_MODULE_SLICES` for the
         verified offsets.
+        When :attr:`reu_contents` is non-empty, a ``REU1764`` module is
+        injected immediately after ``C64MEM`` (the position VICE emits
+        when REU is enabled).  The 11-byte ``$DF00–$DF0A`` register
+        block in the module preamble is sourced from this snapshot's
+        RAM image (those addresses are memory-mapped) when REU appears
+        enabled, otherwise a captured idle-state preamble is used.
         """
         if template is None:
             template = _load_template()
@@ -392,6 +510,15 @@ class Snapshot:
             payload = self._regs_for_module(module_name)
             if payload:
                 out = _patch_module_prefix(out, module_name, offset, payload)
+        # Inject the REU1764 module immediately after C64MEM when the
+        # snapshot carries REU contents.  See _inject_reu_module for
+        # the byte-level placement.
+        if self.reu_contents:
+            out = _inject_reu_module(
+                out,
+                reu_contents=self.reu_contents,
+                control_regs=self._reu_control_regs(),
+            )
         return out
 
     def _regs_for_module(self, module_name: bytes) -> bytes:
@@ -408,21 +535,30 @@ class Snapshot:
 
     @classmethod
     def from_vsf(cls, data: bytes) -> Snapshot:
-        """Parse a ``.vsf`` and extract RAM + CPU port + I/O regs.
+        """Parse a ``.vsf`` and extract RAM + CPU port + I/O regs + REU.
 
-        Walks the module list once, picks up ``C64MEM`` (required) and
-        the four I/O register modules (best-effort: missing or shorter
-        modules leave the corresponding field empty).  Raises
-        :class:`SnapshotFormatError` if the file header is bad or the
-        ``C64MEM`` module is missing or too short.
+        Walks the module list once, picks up ``C64MEM`` (required), the
+        four I/O register modules (CIA1 / CIA2 / VIC-II / SID —
+        best-effort: missing or shorter modules leave the corresponding
+        field empty), and an optional ``REU1764`` module.
+
+        If a ``REU1764`` module is present its body is also parsed: the
+        size is taken from the preamble's first 24-bit LE field
+        (kilobytes), then validated against the byte count of the
+        body's REU bytes.  Missing REU module → ``reu_size_bytes=0``.
+
+        Raises :class:`SnapshotFormatError` if the file header is bad
+        or the ``C64MEM`` module is missing or too short.
         """
         _validate_file_header(data)
         c64mem_fields: dict | None = None
         regs: dict[bytes, bytes] = {}
+        reu_size_bytes = 0
+        reu_contents = b""
         slice_by_name = {
             name: (off, length) for name, off, length in _REGISTER_MODULE_SLICES
         }
-        for name, vmajor, vminor, body_start, body_len in _iter_modules(data):
+        for name, _vmajor, _vminor, body_start, body_len in _iter_modules(data):
             if name == _C64MEM_MODULE_NAME:
                 if body_len < 4 + 65536:
                     raise SnapshotFormatError(
@@ -443,6 +579,10 @@ class Snapshot:
                     regs[name] = bytes(
                         data[body_start + off : body_start + off + length]
                     )
+            elif name == _REU_MODULE_NAME:
+                reu_size_bytes, reu_contents = _parse_reu_module(
+                    data[body_start : body_start + body_len]
+                )
         if c64mem_fields is None:
             raise SnapshotFormatError("no C64MEM module found in snapshot")
         return cls(
@@ -451,6 +591,8 @@ class Snapshot:
             cia2_regs=regs.get(b"CIA2", b""),
             vic_regs=regs.get(b"VIC-II", b""),
             sid_regs=regs.get(b"SID", b""),
+            reu_size_bytes=reu_size_bytes,
+            reu_contents=reu_contents,
         )
 
     # ------------------------------------------------------------------
@@ -493,6 +635,11 @@ class Snapshot:
                 "image_file": image_file,
             })
 
+        # Phase C — write REU sidecar when present.  Empty REU → no
+        # file written, manifest field is 0.
+        if self.reu_contents:
+            (out / "reu.bin").write_bytes(self.reu_contents)
+
         manifest = {
             "version": 1,
             "cpu_port_data": self.cpu_port_data,
@@ -500,6 +647,7 @@ class Snapshot:
             "exrom": self.exrom,
             "game": self.game,
             "drives": drive_entries,
+            "reu_size_bytes": self.reu_size_bytes,
         }
         # I/O register banks — serialise as hex for human readability.
         # Each field is short (16-47 bytes) so hex bloat is irrelevant.
@@ -586,6 +734,27 @@ class Snapshot:
                 raise SnapshotFormatError(
                     f"manifest {key!r} is not valid hex: {exc}"
                 ) from exc
+        # Phase C — REU sidecar.  Prefer ``reu.bin`` (the canonical
+        # sidecar) over whatever the .vsf might carry, so callers can
+        # edit the bundle in place without re-serialising the .vsf.
+        reu_size_bytes = int(manifest.get("reu_size_bytes", 0) or 0)
+        reu_contents: bytes = b""
+        reu_path = src / "reu.bin"
+        if reu_path.is_file():
+            reu_contents = reu_path.read_bytes()
+            if reu_size_bytes == 0:
+                # Manifest didn't declare a size but the file exists — trust
+                # the file length and let __post_init__ validate.
+                reu_size_bytes = len(reu_contents)
+        elif reu_size_bytes > 0:
+            # Manifest says REU is present but no sidecar file.  Fall
+            # back to whatever bytes the .vsf already carried.
+            reu_contents = base.reu_contents
+            if not reu_contents:
+                raise SnapshotFormatError(
+                    f"manifest reu_size_bytes={reu_size_bytes} but no "
+                    "reu.bin sidecar and the .vsf carries no REU bytes"
+                )
 
         return cls(
             ram=base.ram,
@@ -598,6 +767,8 @@ class Snapshot:
             cia2_regs=_hex_field("cia2_regs", base.cia2_regs),
             vic_regs=_hex_field("vic_regs", base.vic_regs),
             sid_regs=_hex_field("sid_regs", base.sid_regs),
+            reu_size_bytes=reu_size_bytes,
+            reu_contents=reu_contents,
         )
 
     # ------------------------------------------------------------------
@@ -611,6 +782,27 @@ class Snapshot:
             + b"\x00" * _C64MEM_TRAILER_LEN
         )
 
+    def _reu_control_regs(self) -> bytes:
+        """Return the 11-byte $DF00..$DF0A register block for the REU module.
+
+        Pulled from this snapshot's RAM image (those addresses are
+        memory-mapped, so the bytes are already there) when the RAM
+        carries plausibly-valid REU state.  Otherwise the idle-state
+        default captured from a clean VICE 3.10 REU snapshot is used.
+
+        The "looks like real REU regs" heuristic: at least one of the
+        11 bytes is neither ``$00`` (zero-initialised host RAM) nor
+        ``$FF`` (unmapped bus floating).  A pure all-zero or all-FF
+        block is treated as "no REU register state captured" and the
+        idle defaults are substituted, which matches what VICE writes
+        when REU is enabled but has performed no transfers.
+        """
+        regs = bytes(self.ram[0xDF00 : 0xDF00 + 11])
+        looks_real = any(b not in (0x00, 0xFF) for b in regs)
+        if looks_real:
+            return regs
+        return _REU_IDLE_DF_REGS
+
 
 # ---------------------------------------------------------------------------
 # Public functions
@@ -622,6 +814,8 @@ def extract_snapshot(
     *,
     host_image_paths: "dict[int, str | Path] | None" = None,
     include_registers: bool = True,
+    include_reu: bool = False,
+    reu_turbo: bool = False,
 ) -> Snapshot:
     """Read RAM + CPU port out of any ``C64Transport``-conforming backend.
 
@@ -655,6 +849,18 @@ def extract_snapshot(
     expose any drive state at all the snapshot comes back with
     ``drives=()`` rather than failing.  See :func:`_extract_drives_vice`
     and :func:`_extract_drives_u64` for the per-backend specifics.
+
+    *include_reu* (default ``False``) opts in to REU capture.  The
+    operation is slow and intrusive even with the staging-window
+    optimisation, so it stays off by default.  When ``True``, the REU
+    contents are read into ``Snapshot.reu_contents``.  If the transport
+    reports REU as disabled (via ``get_reu_config`` on the U64), the
+    REU is emitted empty.
+
+    *reu_turbo* (default ``False``) — when ``True`` and the backend
+    supports it, the U64 CPU is switched to 48 MHz turbo for the
+    duration of the extract loop and the original speed restored after.
+    No-op on backends without a turbo facility.
     """
     ram = transport.read_memory(0x0000, 65536)
     if len(ram) != 65536:
@@ -680,6 +886,12 @@ def extract_snapshot(
         else:
             sid_regs = bytes(transport.read_memory(0xD400, _SID_REGS_LEN))
 
+    reu_size_bytes = 0
+    reu_contents = b""
+    if include_reu:
+        reu_size_bytes, reu_contents = _extract_reu(
+            transport, reu_turbo=reu_turbo,
+        )
     # CPU port registers are at $00 (direction) and $01 (data) — already
     # included in the RAM read, but we mirror them into the dedicated
     # fields so the Snapshot is self-describing.
@@ -692,6 +904,8 @@ def extract_snapshot(
         cia2_regs=cia2_regs,
         vic_regs=vic_regs,
         sid_regs=sid_regs,
+        reu_size_bytes=reu_size_bytes,
+        reu_contents=reu_contents,
     )
 
 
@@ -758,6 +972,12 @@ def restore_snapshot(
     # on U64, which only has slots a/b).
     if snap.drives:
         _restore_drives(transport, snap.drives)
+
+    # REU sidecar (Phase C).  Routes to the SocketDMA fast path on U64,
+    # or to a no-op on VICE since the .vsf restore already loaded the
+    # REU module via undump.  Empty REU → nothing to do.
+    if snap.reu_contents:
+        _restore_reu(transport, snap)
 
 
 # ---------------------------------------------------------------------------
@@ -1114,6 +1334,338 @@ def _restore_drives_u64(
 
 
 # ---------------------------------------------------------------------------
+# REU extract/restore — per-backend helpers (Phase C)
+# ---------------------------------------------------------------------------
+
+
+def _extract_reu(
+    transport: "C64Transport",
+    *,
+    reu_turbo: bool,
+) -> tuple[int, bytes]:
+    """Dispatch to the right REU-extract path for the transport.
+
+    Returns ``(size_bytes, contents)``.  Returns ``(0, b"")`` silently
+    when the transport has no REU (e.g. U64 with REU disabled, or a
+    backend that doesn't expose any REU surface).
+    """
+    # U64: REST + SocketDMA workaround.
+    if hasattr(transport, "client") and hasattr(transport, "read_memory"):
+        return _extract_reu_u64(transport, reu_turbo=reu_turbo)
+    # VICE: delegate to dump_snapshot if the transport exposes it; the
+    # caller's normal extract path already pulled RAM, so to keep the
+    # behaviour symmetric we read $DF00..$DF0A and try resource_get.
+    if hasattr(transport, "resource_get"):
+        return _extract_reu_vice(transport)
+    return 0, b""
+
+
+def _extract_reu_u64(
+    transport: "C64Transport",
+    *,
+    reu_turbo: bool,
+) -> tuple[int, bytes]:
+    """Capture REU bytes from an Ultimate 64 transport.
+
+    No native REST readback exists.  The workaround pauses the CPU,
+    stashes a 32 KB staging window at ``$0800–$87FF``, then loops over
+    each bank: programs the REU registers to copy from REU→C64 into
+    the window, ``read_memory``s the window, and appends to the output.
+    Always restores the staging window's original bytes via try/finally.
+    """
+    client = transport.client  # type: ignore[attr-defined]
+
+    # Probe REU state via the helper.  If REU is disabled, return empty.
+    try:
+        from .backends.ultimate64_helpers import get_reu_config
+        from .backends.ultimate64_schema import _REU_SIZE_BYTES as _SCHEMA_SIZES
+        enabled, size_str = get_reu_config(client)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning(
+            "U64 get_reu_config probe failed (%s); emitting empty REU",
+            exc,
+        )
+        return 0, b""
+    if not enabled:
+        _log.debug("U64 REU disabled per get_reu_config; emitting empty REU")
+        return 0, b""
+    if size_str not in _SCHEMA_SIZES:
+        _log.warning(
+            "U64 REU size %r not recognised in schema; emitting empty REU",
+            size_str,
+        )
+        return 0, b""
+    size_bytes = _SCHEMA_SIZES[size_str]
+
+    # Optional 48 MHz turbo for the duration of the extract.
+    prior_turbo: tuple[bool, int] | None = None
+    if reu_turbo:
+        try:
+            from .backends.ultimate64_helpers import set_turbo_mhz
+            set_turbo_mhz(client, 48)
+            prior_turbo = (True, 1)  # restore to native 1 MHz off afterward
+        except Exception as exc:  # noqa: BLE001
+            _log.warning(
+                "U64 set_turbo_mhz(48) failed (%s); continuing at native speed",
+                exc,
+            )
+
+    # Pause the CPU so the C64 can't race with our staging window writes.
+    paused = False
+    try:
+        try:
+            client.pause()
+            paused = True
+        except Exception as exc:  # noqa: BLE001
+            _log.warning(
+                "U64 pause() failed (%s); REU extract may race with running code",
+                exc,
+            )
+
+        # Stash the staging window so we can restore it after the loop.
+        original_window = transport.read_memory(
+            _REU_STAGING_ADDR, _REU_STAGING_LEN,
+        )
+
+        try:
+            collected = bytearray(size_bytes)
+            num_banks = size_bytes // _REU_STAGING_LEN
+            for bank in range(num_banks):
+                reu_offset = bank * _REU_STAGING_LEN
+                _program_reu_transfer_to_c64(
+                    transport,
+                    c64_addr=_REU_STAGING_ADDR,
+                    reu_addr=reu_offset,
+                    length=_REU_STAGING_LEN,
+                )
+                window = transport.read_memory(
+                    _REU_STAGING_ADDR, _REU_STAGING_LEN,
+                )
+                if len(window) != _REU_STAGING_LEN:
+                    raise RuntimeError(
+                        f"REU extract: read_memory returned "
+                        f"{len(window)} bytes, expected {_REU_STAGING_LEN}"
+                    )
+                collected[reu_offset : reu_offset + _REU_STAGING_LEN] = window
+            return size_bytes, bytes(collected)
+        finally:
+            # Always restore the staging window — even on partial failure.
+            try:
+                transport.write_memory(
+                    _REU_STAGING_ADDR, original_window,
+                    override="reu-snapshot-staging",
+                )
+            except Exception as exc:  # noqa: BLE001
+                _log.warning(
+                    "REU staging restore failed (%s); $0800-$87FF may be "
+                    "corrupted", exc,
+                )
+    finally:
+        if paused:
+            try:
+                client.resume()
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("U64 resume() failed after REU extract: %s", exc)
+        if prior_turbo is not None:
+            try:
+                from .backends.ultimate64_helpers import set_turbo_mhz
+                set_turbo_mhz(client, None)
+            except Exception as exc:  # noqa: BLE001
+                _log.warning(
+                    "U64 set_turbo_mhz(None) failed (%s); device may "
+                    "still be in turbo", exc,
+                )
+
+
+def _program_reu_transfer_to_c64(
+    transport: "C64Transport",
+    *,
+    c64_addr: int,
+    reu_addr: int,
+    length: int,
+) -> None:
+    """Program $DF02..$DF0A and trigger a REU→C64 transfer.
+
+    Sequence (per the 1764/1750 manual):
+
+    * $DF02-03: C64 address (16-bit LE)
+    * $DF04-06: REU address (24-bit LE)
+    * $DF07-08: length in bytes (16-bit LE; cap at $8000 here)
+    * $DF09:    interrupt mask = 0
+    * $DF0A:    address control = 0 (both addrs increment)
+    * $DF01:    command = 0x91 (REU→C64, execute now, no autoload)
+    """
+    if length > 0x8000:
+        raise ValueError(
+            f"REU transfer length {length:#x} exceeds 0x8000 cap"
+        )
+    setup = bytes([
+        c64_addr & 0xFF, (c64_addr >> 8) & 0xFF,         # DF02-03
+        reu_addr & 0xFF, (reu_addr >> 8) & 0xFF, (reu_addr >> 16) & 0xFF,  # DF04-06
+        length & 0xFF, (length >> 8) & 0xFF,             # DF07-08
+        0x00,                                            # DF09 int mask
+        0x00,                                            # DF0A addr control
+    ])
+    transport.write_memory(
+        0xDF02, setup, override="reu-snapshot-staging",
+    )
+    transport.write_memory(
+        0xDF01, bytes([_REU_CMD_REU_TO_C64]),
+        override="reu-snapshot-staging",
+    )
+
+
+def _extract_reu_vice(
+    transport: "C64Transport",
+) -> tuple[int, bytes]:
+    """Capture REU state from a VICE binary-monitor transport.
+
+    Uses the ``REU`` and ``REUsize`` resources to discover whether REU
+    is enabled and how big it is.  When enabled, programs the REU
+    registers via the same staging-window dance as the U64 path — VICE
+    handles those memory-mapped writes identically to real hardware.
+    """
+    try:
+        enabled = transport.resource_get("REU")  # type: ignore[attr-defined]
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("VICE resource_get REU failed: %s", exc)
+        return 0, b""
+    if not enabled:
+        return 0, b""
+    try:
+        size_kb = transport.resource_get("REUsize")  # type: ignore[attr-defined]
+    except Exception as exc:  # noqa: BLE001
+        _log.warning(
+            "VICE REU enabled but REUsize resource failed (%s); "
+            "emitting empty REU", exc,
+        )
+        return 0, b""
+    if not isinstance(size_kb, int):
+        return 0, b""
+    size_bytes = size_kb * 1024
+    if size_bytes not in _REU_SIZE_BYTES:
+        _log.warning(
+            "VICE REUsize=%d KB is not a recognised REU enum size; "
+            "emitting empty REU", size_kb,
+        )
+        return 0, b""
+
+    # Stash + loop + restore — same logic as U64 path, minus the
+    # turbo/pause facilities (VICE binary monitor pauses the CPU
+    # implicitly when the monitor is stopped, but here we don't
+    # depend on it; the writes are atomic at the C64-cycle level).
+    original_window = transport.read_memory(
+        _REU_STAGING_ADDR, _REU_STAGING_LEN,
+    )
+    try:
+        collected = bytearray(size_bytes)
+        num_banks = size_bytes // _REU_STAGING_LEN
+        for bank in range(num_banks):
+            reu_offset = bank * _REU_STAGING_LEN
+            _program_reu_transfer_to_c64(
+                transport,
+                c64_addr=_REU_STAGING_ADDR,
+                reu_addr=reu_offset,
+                length=_REU_STAGING_LEN,
+            )
+            window = transport.read_memory(
+                _REU_STAGING_ADDR, _REU_STAGING_LEN,
+            )
+            if len(window) != _REU_STAGING_LEN:
+                raise RuntimeError(
+                    f"VICE REU extract: read_memory returned "
+                    f"{len(window)} bytes, expected {_REU_STAGING_LEN}"
+                )
+            collected[reu_offset : reu_offset + _REU_STAGING_LEN] = window
+        return size_bytes, bytes(collected)
+    finally:
+        try:
+            transport.write_memory(
+                _REU_STAGING_ADDR, original_window,
+                override="reu-snapshot-staging",
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.warning(
+                "VICE REU staging restore failed (%s); $0800-$87FF may be "
+                "corrupted", exc,
+            )
+
+
+def _restore_reu(
+    transport: "C64Transport",
+    snap: "Snapshot",
+) -> None:
+    """Push ``snap.reu_contents`` to the right backend.
+
+    On the U64 we prefer the :class:`SocketDMAClient` ``REUWRITE``
+    fast path (one TCP socket on port 64; ~3 s for 16 MB).  On VICE
+    the .vsf already carries the REU module so the standard
+    ``undump_snapshot`` flow handles the bytes — there's nothing to do
+    here unless the caller bypassed that path.
+    """
+    # U64: SocketDMA REUWRITE.
+    if hasattr(transport, "client") and hasattr(transport.client, "host"):
+        _restore_reu_u64(transport, snap)
+        return
+    # VICE: undump_snapshot route is canonical; nothing extra to do.
+    if hasattr(transport, "undump_snapshot") or hasattr(transport, "resource_get"):
+        _log.debug(
+            "VICE REU restore is handled by .vsf undump; skipping explicit push",
+        )
+        return
+    _log.warning(
+        "transport %r has no recognised REU-restore API; skipping",
+        type(transport).__name__,
+    )
+
+
+def _restore_reu_u64(
+    transport: "C64Transport",
+    snap: "Snapshot",
+) -> None:
+    """Restore REU contents to the Ultimate 64.
+
+    Configures the cartridge preset to ``REU`` and the size to match
+    ``snap.reu_size_bytes`` (so the device's REU map is actually
+    enabled), then opens a :class:`SocketDMAClient` and pushes the
+    bytes in 64 KB chunks via REUWRITE.
+    """
+    client = transport.client  # type: ignore[attr-defined]
+    try:
+        from .backends.ultimate64_helpers import set_reu
+        from .backends.ultimate64_schema import reu_size_enum
+        # set_reu interprets int as MB, so pass the enum string explicitly.
+        size_str = reu_size_enum(snap.reu_size_bytes)
+        set_reu(client, enabled=True, size=size_str)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning(
+            "U64 set_reu(enabled=True, size=%d) failed (%s); REU restore "
+            "may target an unconfigured device", snap.reu_size_bytes, exc,
+        )
+
+    try:
+        from .backends.u64_socket_dma import SocketDMAClient
+    except Exception as exc:  # noqa: BLE001
+        _log.warning(
+            "SocketDMAClient unavailable (%s); skipping REU restore", exc,
+        )
+        return
+
+    chunk_size = 64 * 1024
+    host = getattr(client, "host", None)
+    password = getattr(client, "password", None)
+    if host is None:
+        _log.warning(
+            "U64 client has no .host attribute; skipping REU restore",
+        )
+        return
+    with SocketDMAClient(host=host, password=password, port=64) as dma:
+        for offset in range(0, len(snap.reu_contents), chunk_size):
+            chunk = snap.reu_contents[offset : offset + chunk_size]
+            dma.reu_write(offset, chunk)
+
+
+# ---------------------------------------------------------------------------
 # VSF helpers (file-level)
 # ---------------------------------------------------------------------------
 
@@ -1201,6 +1753,111 @@ def _patch_module_prefix(
     raise SnapshotFormatError(
         f"template has no {module_name!r} module to patch"
     )
+def _parse_reu_module(body: bytes) -> tuple[int, bytes]:
+    """Parse a ``REU1764`` module body into ``(size_bytes, contents)``.
+
+    The first 3 bytes of the preamble are the REU size in KB (24-bit
+    LE).  Bytes after the 20-byte preamble are the REU contents.
+    Raises :class:`SnapshotFormatError` on shape mismatches.
+    """
+    if len(body) < _REU_PREAMBLE_LEN:
+        raise SnapshotFormatError(
+            f"REU1764 module body too short: {len(body)} bytes, "
+            f"need >= {_REU_PREAMBLE_LEN}"
+        )
+    size_kb = int.from_bytes(body[0:3], "little")
+    size_bytes = size_kb * 1024
+    contents = bytes(body[_REU_PREAMBLE_LEN:])
+    if len(contents) != size_bytes:
+        raise SnapshotFormatError(
+            f"REU1764 body length {len(contents)} does not match "
+            f"preamble size {size_kb} KB ({size_bytes} bytes)"
+        )
+    if size_bytes not in _REU_SIZE_BYTES:
+        raise SnapshotFormatError(
+            f"REU1764 preamble size {size_kb} KB is not a recognised "
+            f"REU enum size; expected one of {_REU_SIZE_BYTES}"
+        )
+    return size_bytes, contents
+
+
+def _build_reu_module(reu_contents: bytes, control_regs: bytes) -> bytes:
+    """Build a complete ``REU1764`` module (header + body) for emission.
+
+    *reu_contents* must be one of the REU enum sizes.  *control_regs*
+    is the 11-byte $DF00..$DF0A snapshot; the rest of the preamble is
+    filled with the idle-state defaults captured from VICE 3.10.
+    """
+    size_bytes = len(reu_contents)
+    if size_bytes not in _REU_SIZE_BYTES:
+        raise ValueError(
+            f"reu_contents must be one of REU enum sizes "
+            f"{_REU_SIZE_BYTES}, got {size_bytes}"
+        )
+    if len(control_regs) != 11:
+        raise ValueError(
+            f"control_regs must be 11 bytes ($DF00..$DF0A), "
+            f"got {len(control_regs)}"
+        )
+    size_kb = size_bytes // 1024
+    preamble = (
+        size_kb.to_bytes(3, "little")
+        + b"\x00"               # reserved byte 3
+        + bytes(control_regs)   # bytes 4..14: DF00..DF0A
+        + _REU_IDLE_INTERNAL    # bytes 15..19: 5-byte internal state
+    )
+    assert len(preamble) == _REU_PREAMBLE_LEN
+    body = preamble + reu_contents
+    mod_size = _MODULE_HEADER_LEN + len(body)
+    header = (
+        _REU_MODULE_NAME
+        + b"\x00" * (_MODULE_NAME_LEN - len(_REU_MODULE_NAME))
+        + bytes([_REU_VMAJOR, _REU_VMINOR])
+        + struct.pack("<I", mod_size)
+    )
+    return header + body
+
+
+def _inject_reu_module(
+    vsf_bytes: bytes,
+    *,
+    reu_contents: bytes,
+    control_regs: bytes,
+) -> bytes:
+    """Insert a ``REU1764`` module into *vsf_bytes* immediately after C64MEM.
+
+    This is the position VICE 3.10 emits it.  If a ``REU1764`` module is
+    already present it is replaced in place.
+    """
+    _validate_file_header(vsf_bytes)
+    reu_module = _build_reu_module(reu_contents, control_regs)
+
+    # Walk modules to find C64MEM (insertion anchor) and any existing REU.
+    c64mem_end: int | None = None
+    existing_reu_span: tuple[int, int] | None = None
+    offset = _VSF_FILE_HEADER_LEN
+    n = len(vsf_bytes)
+    while offset + _MODULE_HEADER_LEN <= n:
+        name_field = vsf_bytes[offset : offset + _MODULE_NAME_LEN]
+        name = name_field.rstrip(b"\x00")
+        mod_size = struct.unpack_from("<I", vsf_bytes, offset + 18)[0]
+        if mod_size < _MODULE_HEADER_LEN or offset + mod_size > n:
+            break
+        if name == _C64MEM_MODULE_NAME:
+            c64mem_end = offset + mod_size
+        elif name == _REU_MODULE_NAME:
+            existing_reu_span = (offset, offset + mod_size)
+        offset += mod_size
+
+    if c64mem_end is None:
+        raise SnapshotFormatError(
+            "cannot inject REU1764: template has no C64MEM module"
+        )
+
+    if existing_reu_span is not None:
+        start, end = existing_reu_span
+        return vsf_bytes[:start] + reu_module + vsf_bytes[end:]
+    return vsf_bytes[:c64mem_end] + reu_module + vsf_bytes[c64mem_end:]
 
 
 def _replace_c64mem(template: bytes, new_body: bytes) -> bytes:
