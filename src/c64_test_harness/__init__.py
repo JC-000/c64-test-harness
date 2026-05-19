@@ -269,6 +269,18 @@ from .sid_player import (
     SidPlaybackError,
     DEFAULT_STUB_ADDR,
 )
+# Top-level snapshot interop (Phase A — RAM + CPU port round-trip).
+# Symbols are deliberately suffixed ``_snapshot`` to avoid colliding with
+# the existing U64 ``snapshot_state``/``restore_state`` config-state
+# helpers re-exported above. Downstream tests across multiple projects
+# depend on the older names; keeping the new ones distinct preserves
+# both call sites.
+from .snapshot import (  # noqa: E402
+    Snapshot,
+    SnapshotFormatError,
+    extract_snapshot,
+    restore_snapshot,
+)
 
 __all__ = [
     # Package version
@@ -563,4 +575,9 @@ __all__ = [
     "VideoFrame",
     "DEFAULT_VIDEO_PORT",
     "VIC_PALETTE",
+    # Cross-backend snapshot interop (Phase A)
+    "Snapshot",
+    "SnapshotFormatError",
+    "extract_snapshot",
+    "restore_snapshot",
 ]
