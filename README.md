@@ -622,7 +622,7 @@ play_sid(transport, sid, song=0)  # works with BinaryViceTransport or Ultimate64
 
 **Ultimate 64:** the native `sidplay` runner accepts anything the firmware supports (PSID and RSID, including sample-driven tunes), so on hardware the `play_sid()` call just forwards the file bytes.
 
-See `examples/play_sid.py` (supports `--vice` / `--u64 HOST` modes, plus `--self-test` which plays a synthesized C-major scale) and `scripts/play_scale_u64.py` for a full demo that builds a scale PSID on the fly, DMA-loads it, and plays it on hardware.
+See `examples/play_sid.py` (supports `--vice` / `--u64 HOST` modes, plus `--self-test` which uses a built-in sentinel-counter PSID to verify init/play executed) and `scripts/play_scale_u64.py` for a full demo that builds a scale PSID on the fly, DMA-loads it, and plays it on hardware.
 
 ## Ethernet / CS8900a Testing
 

@@ -635,6 +635,19 @@ set_turbo_mhz(client, 32)
 client.run_prg(prg_data)  # works reliably
 ```
 
+#### Cross-backend speed/reset variant
+When you hold a `C64Transport` (or `target.transport` from `UnifiedManager`), prefer the protocol APIs over `client.*` so the same code drives VICE and U64 (PR #122 / commit 4e70c84):
+
+```python
+target.transport.reset(scope="machine")   # VICE hard reset / U64 reboot()
+time.sleep(8.0)                            # U64 only; VICE returns near-instantly
+target.transport.set_speed(32)             # VICE: NotImplementedError; U64: 32 MHz
+target.transport.set_speed(1)              # 1 MHz on both backends (warp off / turbo off)
+target.transport.set_speed(None)           # "max speed" — VICE warp / U64 48 MHz
+```
+
+VICE raises `NotImplementedError` for `set_speed` multipliers other than `1` and `None` because the 6510 has no discrete CPU-speed steps natively. The REU re-enable step above remains U64-only — there's no protocol-level cartridge-state shim yet, so REU-heavy benches must still drop to `client.*` for `set_reu(...)`.
+
 ### Verify Program Startup via Code Bytes (not screen text)
 After `run_prg()`, screen RAM ($0400) may contain stale text from a prior run. Always verify startup by polling for known code bytes:
 ```python
@@ -871,6 +884,41 @@ Full design and the harness's own scratch-address table in `docs/memory_safety.m
 
 ---
 
+## Pattern 13: Cross-Backend Snapshot (Phase A)
+
+Round-trip the running RAM + CPU port state between VICE and Ultimate 64 using VICE's native `.vsf` format as the wire (PR #115 / commit 45a5844). Useful for "capture a state on the fast emulator, replay it on hardware to confirm timing-sensitive behaviour" — or the reverse.
+
+**Phase A scope** is RAM + CPU port only. CPU registers, CIA/VIC/SID register state, drive images, REU contents, and cartridge bytes are **not** captured yet (see `docs/snapshot_interop.md` for the per-layer matrix). On the U64 side, several layers are not even observable: the REST API has no readback for cart bytes, disk images, or REU memory; the 6510's registers aren't directly observable.
+
+```python
+from c64_test_harness import (
+    extract_snapshot, restore_snapshot, Snapshot,
+)
+
+# Capture on whichever backend currently has interesting state.
+snap = extract_snapshot(source_target.transport)
+
+# Persist as VICE-consumable .vsf — usable both as a checkpoint and as
+# something you can hand to a stock VICE x64sc -snapshot <file>.
+vsf_bytes = snap.to_vsf()
+open("checkpoint.vsf", "wb").write(vsf_bytes)
+
+# Later, on the same or other backend: load and restore.
+loaded = Snapshot.from_vsf(open("checkpoint.vsf", "rb").read())
+restore_snapshot(dest_target.transport, loaded)
+```
+
+`restore_snapshot()` threads `override="snapshot-restore"` through every `write_memory` call automatically so the bulk restore crosses `MemoryPolicy`-reserved regions without raising; one WARNING is logged per restore so the bypass is visible in test logs.
+
+**Why the rename**: top-level helpers were originally `extract_state` / `restore_state` and were renamed in PR #126 (373da4e) to avoid colliding with the U64 helper `snapshot_state` / `restore_state` in `ultimate64_helpers` (which captures turbo + REU + cartridge **config**, not RAM). Both APIs coexist.
+
+**What you cannot do yet**:
+- Resume execution from a captured PC — Phase A is a seed, not a resume.
+- Snapshot live drive image contents on U64 (REST has no readback).
+- Snapshot REU contents on U64 (the harness's staging-window workaround is in `docs/memory_safety.md`, but is not yet wired into `Snapshot`).
+
+---
+
 ## Common Gotchas
 
 ### 1. Never Use ViceProcess or PortAllocator Directly
@@ -1054,6 +1102,8 @@ if not result.reachable:
 
 ### 15. U64: reset() vs reboot()
 `reset()` is a soft C64 reset (6510 CPU only). `reboot()` reinitializes the entire FPGA including DMA controllers and REU. **Use `reboot()` when switching turbo speeds with REU-heavy workloads** — stale DMA state causes hangs. Allow ~8s for the device to become responsive after reboot.
+
+In backend-agnostic code, prefer `target.transport.reset(scope="cpu")` (soft) and `target.transport.reset(scope="machine")` (full). The dispatch maps to `client.reset()` / `client.reboot()` on U64 and `CMD_RESET 0` / `CMD_RESET 1` on VICE. See Pattern 13 in the named-patterns section above.
 
 ### 16. U64: Stale Screen RAM After Reset
 `run_prg()` does a soft reset internally, but screen memory at $0400 persists. Never use `wait_for_text()` alone to detect program startup — poll for known code bytes (e.g. main_loop JMP) instead. See Pattern 10.

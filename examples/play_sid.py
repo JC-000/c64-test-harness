@@ -115,20 +115,12 @@ def _run_u64(host: str, sid: SidFile) -> None:
             try:
                 play_sid(transport, sid, song=0)
             except Ultimate64Error as exc:
-                # Ultimate64Client.sid_play targets /v1/runners:sid_play + PUT,
-                # but firmware 3.14 exposes /v1/runners:sidplay + POST. If we
-                # hit the 404 we report it clearly rather than silently failing.
                 print(f"HTTP error from device: {exc}")
-                print(
-                    "Note: Ultimate64Client.sid_play targets an endpoint that "
-                    "differs from firmware 3.14's REST API — this needs a client "
-                    "fix to switch to POST /v1/runners:sidplay."
-                )
                 return
             print("Playing for 5 seconds...")
             time.sleep(5.0)
             print("Resetting device to stop audio...")
-            transport.client.reset()
+            transport.reset(scope="cpu")
             print("Done.")
         finally:
             transport.close()

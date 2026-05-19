@@ -61,7 +61,13 @@ class MockTransport:
             return bytes(data + [0] * (length - len(data)))
         return bytes(length)
 
-    def write_memory(self, addr: int, data: bytes | list[int]) -> None:
+    def write_memory(
+        self,
+        addr: int,
+        data: bytes | list[int],
+        *,
+        override: str | None = None,
+    ) -> None:
         self.written_memory.append((addr, list(data)))
 
     def read_screen_codes(self) -> list[int]:

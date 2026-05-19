@@ -15,7 +15,14 @@ from unittest.mock import MagicMock
 import pytest
 
 from c64_test_harness import ProgressEvent, watch_progress
+from c64_test_harness.backends.ultimate64 import Ultimate64Transport
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
+
+# Both concrete C64Transport implementations are exercised through the
+# canonical entry point so the cross-backend protocol claim is asserted
+# (PR #123 lifted ``watch_progress`` off of ``Ultimate64Client`` onto
+# ``C64Transport.read_memory``).
+_TRANSPORT_SPECS = [BinaryViceTransport, Ultimate64Transport]
 
 
 # --------------------------------------------------------------------------- #
@@ -59,15 +66,17 @@ def _record_sleep() -> tuple[list[float], "Callable[[float], None]"]:
     return calls, _sleep
 
 
-def _make_transport() -> MagicMock:
+def _make_transport(spec=BinaryViceTransport) -> MagicMock:
     """Mock that quacks like the slice of :class:`C64Transport` we need.
 
     ``watch_progress`` only ever touches ``transport.read_memory``; the
     rest of the protocol is irrelevant. We use a bare :class:`MagicMock`
     so individual tests script the ``read_memory`` side effects
-    declaratively.
+    declaratively. ``spec`` is parametrised over both concrete transport
+    types in the suites below so a regression that ties ``watch_progress``
+    back to one specific transport surfaces here.
     """
-    return MagicMock(spec=BinaryViceTransport)
+    return MagicMock(spec=spec)
 
 
 # --------------------------------------------------------------------------- #
@@ -160,6 +169,48 @@ class TestWatchProgressCanonical:
         # then Finished.
         assert [e.kind for e in events] == ["Advanced", "Advanced", "Finished"]
         assert events[-1].values == {"x": b"\xFF"}
+
+
+# --------------------------------------------------------------------------- #
+# Cross-backend smoke: watch_progress only touches the protocol's read_memory #
+# --------------------------------------------------------------------------- #
+
+
+class TestWatchProgressProtocolAgnostic:
+    """Same Advanced-event smoke against both concrete transports.
+
+    Guards against ``watch_progress`` regressing to a backend-specific call
+    (e.g. ``client.read_mem`` on U64 or any other shape). PR #123 lifted
+    the implementation onto ``C64Transport.read_memory``; the test proves
+    that with no transport-typed fork in the canonical path.
+    """
+
+    @pytest.mark.parametrize("spec", _TRANSPORT_SPECS)
+    def test_advanced_event_drives_protocol_read_memory(self, spec) -> None:
+        transport = _make_transport(spec=spec)
+        transport.read_memory.side_effect = [b"\x00", b"\x01"]
+        clock = _FakeClock([0.0, 0.1, 0.2, 1.0, 1.1, 1.2])
+        _, sleep = _record_sleep()
+
+        gen = watch_progress(
+            transport,
+            addresses={"sentinel": (0x0400, 1)},
+            poll_interval=1.0,
+            idle_timeout=120.0,
+            overall_timeout=600.0,
+            _clock=clock,
+            _sleep=sleep,
+        )
+        first = next(gen)
+        second = next(gen)
+        gen.close()
+
+        assert first.kind == "Advanced"
+        assert second.kind == "Advanced"
+        assert second.values == {"sentinel": b"\x01"}
+        # Critical: it drives the protocol, not any backend-specific path.
+        assert transport.read_memory.call_count == 2
+        transport.read_memory.assert_any_call(0x0400, 1)
 
 
 # --------------------------------------------------------------------------- #

@@ -187,16 +187,23 @@ Abstract transport interface. Concrete implementations: `BinaryViceTransport`, `
 
 Methods:
 - `read_memory(addr: int, length: int) -> bytes` -- Read raw bytes
-- `write_memory(addr: int, data: bytes | list[int]) -> None` -- Write bytes to C64 memory
+- `write_memory(addr: int, data: bytes | list[int], *, override: str | None = None) -> None` -- Write bytes to C64 memory. `override="reason"` bypasses `MemoryPolicy` for one call (logged at WARNING).
 - `read_screen_codes() -> list[int]` -- Read raw screen code bytes (cols * rows values)
 - `inject_keys(petscii_codes: list[int]) -> None` -- Inject PETSCII key codes into keyboard buffer
-- `read_registers() -> dict[str, int]` -- Returns `{"A": ..., "X": ..., "Y": ..., "SP": ..., "PC": ...}`
+- `inject_joystick(port: int, value: int) -> None` -- Joystick port 1 or 2; value bits 0-4 = up/down/left/right/fire.
+- `set_speed(multiplier: int | None) -> None` -- Backend-agnostic CPU-speed control. `multiplier=1` is native 1 MHz (warp off / turbo off); `multiplier=None` is max speed (VICE warp on / U64 48 MHz). U64 accepts discrete turbo multipliers (2/4/8/24/48); VICE raises `NotImplementedError` for any multiplier other than `1` / `None` because the 6510 has no discrete CPU-speed steps natively.
+- `get_speed() -> int | None` -- Current multiplier; `None` means "as fast as possible" (VICE warp / U64 48 MHz turbo).
+- `reset(scope: str = "cpu", *, drive: str | int | None = None) -> None` -- `scope="cpu"` soft-resets the 6510; `scope="machine"` is a full reset (VICE hard reset / U64 `reboot()`); `scope="drive"` requires `drive=` (0..3 on VICE, "a"/"b" on U64).
+- `read_framebuffer() -> dict` -- Captures one frame. Backend-specific layout (`debug_rect`, `inner_rect`, `bpp`, `palette`, `bytes`); on U64 captures one UDP video frame, on VICE pulls via the binary-monitor display command.
+- `read_palette() -> list[tuple[int,int,int]]` -- Active VIC palette as 16 RGB triples.
 - `resume() -> None` -- Resume CPU execution
 - `close() -> None` -- Release resources / close connection
 
 Properties:
 - `screen_cols -> int` -- Number of screen columns (typically 40)
 - `screen_rows -> int` -- Number of screen rows (typically 25)
+
+`read_registers()` is **VICE-only** — see `BinaryViceTransport` below. It was removed from the cross-backend protocol in PR #121 (ab49939) because the U64 REST API has no CPU-register endpoint.
 
 ### Exceptions
 - `TransportError` -- Base exception
@@ -366,14 +373,21 @@ transport = BinaryViceTransport(host="127.0.0.1", port=6502, timeout=5.0)
 
 **C64Transport protocol methods:**
 - `read_memory(addr, length) -> bytes`
-- `write_memory(addr, data) -> None`
+- `write_memory(addr, data, *, override=None) -> None`
 - `read_screen_codes() -> list[int]`
 - `inject_keys(petscii_codes) -> None`
-- `read_registers() -> dict[str, int]`
+- `inject_joystick(port, value) -> None`
+- `set_speed(multiplier)` / `get_speed()` -- maps `None`/`1` to VICE warp on/off; other multipliers raise `NotImplementedError` (no discrete CPU-speed steps natively).
+- `reset(scope="cpu", *, drive=None)` -- dispatches to VICE `CMD_RESET` 0 (cpu) / 1 (machine) / 8+idx (drive).
+- `read_framebuffer() -> dict`
+- `read_palette() -> list[tuple[int,int,int]]`
 - `resume() -> None`
 - `close() -> None`
 - `screen_cols -> int` (property)
 - `screen_rows -> int` (property)
+
+**VICE-only methods (not on the cross-backend protocol):**
+- `read_registers() -> dict[str, int]` -- `{"A": ..., "X": ..., "Y": ..., "SP": ..., "PC": ...}`. The U64 REST API has no CPU-register endpoint, so this was removed from `C64Transport` in PR #121.
 
 **Binary monitor methods (used by execute.py functions):**
 - `set_checkpoint(addr, *, temporary=False, stop_when_hit=True, enabled=True) -> int` -- Set execution checkpoint, returns checkpoint number
@@ -393,9 +407,12 @@ transport = BinaryViceTransport(host="127.0.0.1", port=6502, timeout=5.0)
 ## Module: parallel
 
 - `run_parallel(manager, tests, max_workers=None) -> ParallelTestResult`
-  - `tests`: list of `(name, fn)` where `fn(transport) -> (passed: bool, message: str)`
+  - `manager`: any `BackendManager` — `ViceInstanceManager`, `Ultimate64InstanceManager`, or `UnifiedManager` (PR #124 / commit 940b711 generalised this from VICE-only).
+  - `tests`: list of `(name, fn)`. What `fn` receives depends on the manager:
+    - `ViceInstanceManager` → `fn(transport: BinaryViceTransport)` — legacy signature preserved by unwrapping `instance.transport` before invoking the callable.
+    - Any other manager → `fn(instance)` — receives the acquired instance directly. For `UnifiedManager` that's a `TestTarget`; for `Ultimate64InstanceManager` it's an `Ultimate64Instance`. Both expose `.transport`.
 - `ParallelTestResult` -- `.results`, `.all_passed`, `.exit_code`, `.print_summary()`
-- `SingleTestResult` -- `.name`, `.passed`, `.message`, `.duration`, `.pid` (VICE process PID)
+- `SingleTestResult` -- `.name`, `.passed`, `.message`, `.duration`, `.pid: int | None` (VICE process PID; `None` on hardware).
 
 ---
 
@@ -523,10 +540,14 @@ class Ultimate64Transport(HardwareTransportBase):
 
 Methods (all raise `NotImplementedError` -- subclasses must override):
 - `read_memory(addr, length) -> bytes`
-- `write_memory(addr, data) -> None`
+- `write_memory(addr, data, *, override=None) -> None`
 - `read_screen_codes() -> list[int]`
 - `inject_keys(petscii_codes) -> None`
-- `read_registers() -> dict[str, int]`
+- `inject_joystick(port, value) -> None`
+- `set_speed(multiplier)` / `get_speed()`
+- `reset(scope, *, drive=None)`
+- `read_framebuffer() -> dict`
+- `read_palette() -> list[tuple[int,int,int]]`
 - `resume() -> None`
 - `close() -> None`
 
@@ -542,17 +563,22 @@ from c64_test_harness import Ultimate64Transport
 transport = Ultimate64Transport(host="192.168.1.81", password=None, timeout=10.0)
 ```
 
-**C64Transport methods** (all DMA-backed, no CPU pause):
+**C64Transport methods** (memory ops DMA-backed, no CPU pause):
 - `read_memory(addr, length) -> bytes`
-- `write_memory(addr, data) -> None`
+- `write_memory(addr, data, *, override=None) -> None`
 - `read_screen_codes() -> list[int]`
 - `inject_keys(petscii_codes) -> None`
-- `read_registers()` -- raises `NotImplementedError` (no CPU register access on U64)
+- `inject_joystick(port, value) -> None`
+- `set_speed(multiplier)` -- maps `None` → 48 MHz turbo, `1` → turbo off, other supported MHz (2/3/4/5/6/8/10/12/14/16/20/24/32/40/48) → set Turbo Control to "Manual" at that MHz. Wraps `set_turbo_mhz`. Unsupported multipliers raise `ValueError` locally (no request hits the wire).
+- `get_speed() -> int | None` -- `1` when turbo off; integer MHz when turbo on at a known step; `None` only when turbo is on but the CPU-Speed enum is unrecognised (treated same as VICE warp).
+- `reset(scope="cpu", *, drive=None)` -- `scope="cpu"` → `client.reset()` (soft 6510); `scope="machine"` → `client.reboot()` (full FPGA reinit; ~8s before reachable); `scope="drive"` → `client.drive_reset(drive)` (drive `"a"` / `"b"` or `0` / `1`).
+- `read_framebuffer() -> dict` -- captures one frame via the U64 UDP video stream. Auto-detects local IP that can reach the device. Raises `TransportError` with diagnostics if no frame arrives within `timeout`. Layout matches `BinaryViceTransport`: `debug_rect`, `inner_rect`, `bpp`, `palette`, `bytes`.
+- `read_palette() -> list[tuple[int,int,int]]` -- canonical 16-entry VIC-II palette via `u64_video_capture.VIC_PALETTE`.
 - `resume() -> None`
 - `close() -> None`
 
 **Not available on hardware** (require VICE binary monitor):
-- `jsr()`, `wait_for_pc()`, `set_breakpoint()`, `set_registers()`, `set_checkpoint()`, `wait_for_stopped()`
+- `read_registers()`, `jsr()`, `wait_for_pc()`, `set_breakpoint()`, `set_registers()`, `set_checkpoint()`, `wait_for_stopped()`
 - Design tests to self-report results via memory writes + sentinel polling
 
 ### `Ultimate64Client`
@@ -622,6 +648,53 @@ from c64_test_harness.backends.ultimate64_helpers import (
 - `CPU_SPEED_VALUES` -- tuple of 16 speed enum strings (" 1" through "48")
 - `CPU_SPEED_BY_MHZ` -- dict mapping int MHz to enum string
 - `REU_SIZE_VALUES`, `REU_ENABLED_VALUES`, `TURBO_CONTROL_VALUES`
+
+---
+
+## Module: snapshot
+
+Cross-backend VICE/U64 snapshot interop using VICE's native `.vsf` format as the on-disk wire. **Phase A** (PR #115 / commit 45a5844): 64 KB RAM + CPU port round-trip only. Later phases will add CIA/VIC/SID register state, drive images, REU contents, and cartridge bytes — see `docs/snapshot_interop.md` for the per-layer asymmetry matrix and the U64-side limitations (REST cannot read cart bytes / disk images / REU memory back; 6510 registers aren't directly observable; 28 of 32 SID registers are write-only on hardware).
+
+### `Snapshot` (frozen dataclass)
+- `.ram: bytes` -- 64 KB RAM image
+- `.cpu_port_data: int` -- value at `$0001`
+- `.cpu_port_dir: int` -- value at `$0000`
+- `.exrom: int` (default 1), `.game: int` (default 1) -- cartridge control lines
+
+### Functions
+- `extract_snapshot(transport: C64Transport) -> Snapshot` -- Reads RAM + CPU port via the protocol. Same code path for VICE and U64. Re-exported from the package root.
+- `restore_snapshot(transport: C64Transport, snap: Snapshot) -> None` -- Writes RAM and CPU port back. Logs one WARNING per restore and threads `override="snapshot-restore"` through every `write_memory` so the bulk restore crosses `MemoryPolicy`-reserved regions without raising. Re-exported from the package root.
+- `Snapshot.to_vsf() -> bytes` -- Emit a complete VICE-consumable `.vsf`. A bundled ~180 KB template captured from VICE 3.10 at BASIC READY supplies the ~30 modules VICE 3.10 requires (MAINCPU, CIA1/2, SID, VIC-II, GLUE, drives, joyports, ...); the codec overwrites only the C64MEM module body.
+- `Snapshot.from_vsf(data: bytes) -> Snapshot` -- Parse a VICE-emitted `.vsf` back into RAM + CPU port.
+- `SnapshotFormatError` -- Raised on malformed `.vsf` input.
+
+### Naming history
+The top-level helpers were originally named `extract_state` / `restore_state`. They were renamed in PR #126 (commit 373da4e) to `extract_snapshot` / `restore_snapshot` to avoid colliding with the U64 helper `snapshot_state` / `restore_state` in `ultimate64_helpers` — a different object that captures turbo + REU + cartridge config (not RAM). Both APIs coexist.
+
+---
+
+## Module: progress
+
+Backend-agnostic live memory watcher ("pexpect for DMA"). Polls memory addresses and yields `ProgressEvent` instances (kinds: `Advanced`, `Stalled`, `Finished`) until a sentinel matches or a timeout fires. Originally bound to `Ultimate64Client.read_mem`; lifted to the `C64Transport.read_memory` protocol in PR #123 (commit 9e6dd29).
+
+- `watch_progress(transport, addresses, *, poll_interval=1.0, idle_timeout=120.0, overall_timeout=600.0, stop_when=None) -> Iterator[ProgressEvent]` -- canonical entry point. Re-exported from the package root.
+- `ProgressEvent` -- frozen dataclass with `.kind` ("Advanced" / "Stalled" / "Finished"), `.elapsed`, `.changed` (dict of label → `(old, new)` byte deltas), `.values` (dict of label → current bytes), `.error`.
+
+```python
+from c64_test_harness import watch_progress
+
+for event in watch_progress(
+    target.transport,
+    addresses={"sentinel": (0xC000, 1), "counter": (0xC001, 2)},
+    poll_interval=0.5,
+    overall_timeout=30.0,
+    stop_when=lambda v: v["sentinel"] == b"\xFF",
+):
+    if event.kind == "Finished":
+        break
+```
+
+A legacy `from c64_test_harness.backends.ultimate64_helpers import watch_progress` shim is preserved for backwards compatibility (it wraps a client in a tiny `read_memory` adapter). New code should use the top-level import.
 
 ---
 
@@ -863,8 +936,10 @@ Parsed 32-bit bus cycle entry. Properties:
 - `.is_read -> bool` / `.is_write -> bool` — R/W# line
 - `.address -> int` — 16-bit address bus
 - `.data -> int` — 8-bit data bus
-- `.irq -> bool`, `.nmi -> bool`, `.ba -> bool` — True when asserted (active-low signals inverted)
-- `.game -> bool`, `.exrom -> bool`, `.rom -> bool` — cartridge/ROM signals
+- `.irq -> bool`, `.nmi -> bool` — True when asserted (active-low firmware signals at bits 26/25 inverted).
+- `.ba -> bool` — True when bus is available to the CPU (active-HIGH at bit 27; **NOT** inverted). Fixed in PR #125 (0ff4e15); earlier harness versions read bit 28 incorrectly.
+- `.game -> bool`, `.exrom -> bool` — cartridge control lines (active-low bits 30/29 inverted).
+- `.cart_rom_active -> bool` — True when at least one cartridge ROM line is asserted (firmware-derived `not (ROMH# AND ROML#)` at bit 28, active-HIGH; the firmware already applies the negation). Preferred name introduced in PR #125. `.rom` is preserved as a backwards-compatible alias for the same bit.
 - `.raw -> int` — original 32-bit word
 
 ### `DebugCapture`
