@@ -397,7 +397,9 @@ class TestExtractState:
                 assert addr == 0x0000 and length == 65536
                 return ram
 
-        snap = extract_snapshot(_Stub())
+        # include_registers=False keeps the contract narrow — RAM only,
+        # which matches what this Phase A test was written to verify.
+        snap = extract_snapshot(_Stub(), include_registers=False)
         assert snap.ram == ram
         assert snap.cpu_port_dir == 0x2F
         assert snap.cpu_port_data == 0x37

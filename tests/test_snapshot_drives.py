@@ -285,7 +285,10 @@ def _make_vice_mock(resource_values: dict[str, object]) -> MagicMock:
     """
     mock = MagicMock(spec=["read_memory", "resource_get", "resource_set",
                             "write_memory", "attach_drive", "memory_policy"])
-    mock.read_memory.return_value = b"\x00" * 65536
+    # read_memory must return exactly `length` bytes — extract_snapshot
+    # now reads CIA1/CIA2/VIC-II/SID register windows in addition to
+    # the full RAM image, so a fixed 65536-byte return no longer fits.
+    mock.read_memory.side_effect = lambda addr, length: b"\x00" * length
     mock.memory_policy = None
 
     def _resource_get(name: str):
@@ -364,7 +367,10 @@ def _make_u64_mock(list_drives_response: dict) -> MagicMock:
     """
     mock = MagicMock(spec=["read_memory", "write_memory", "client",
                             "memory_policy"])
-    mock.read_memory.return_value = b"\x00" * 65536
+    # read_memory must return exactly `length` bytes — extract_snapshot
+    # now reads CIA1/CIA2/VIC-II/SID register windows in addition to
+    # the full RAM image, so a fixed 65536-byte return no longer fits.
+    mock.read_memory.side_effect = lambda addr, length: b"\x00" * length
     mock.memory_policy = None
     mock.client = MagicMock(spec=[
         "list_drives", "mount_disk", "drive_set_mode", "drive_on",

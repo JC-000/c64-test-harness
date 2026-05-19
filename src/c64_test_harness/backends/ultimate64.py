@@ -16,12 +16,34 @@ from .hardware import HardwareTransportBase
 from .ultimate64_client import Ultimate64Client
 
 
+# SID I/O register window — 32 bytes at $D400-$D41F.  On real 6581/8580
+# hardware (and the UltiSID emulations the U64 ships with), 28 of these
+# 32 registers are write-only: reading $D400-$D418 and $D41D-$D41F
+# returns open-bus garbage.  The only readable registers are $D419 (POTX),
+# $D41A (POTY), $D41B (OSC3), and $D41C (ENV3).
+#
+# That breaks snapshot extraction from U64 hardware: we cannot ask the
+# device "what's the current voice 1 frequency?" the way we can on VICE
+# (where reads return last-written values).  The remedy is a host-side
+# "shadow" copy maintained by Ultimate64Transport: every byte that lands
+# in $D400-$D41F via write_memory() is recorded, and the snapshot
+# extractor reads from this shadow instead of the wire when the
+# transport exposes it.
+_SID_BASE = 0xD400
+_SID_LEN = 32  # $D400..$D41F
+
+
 class Ultimate64Transport(HardwareTransportBase):
     """C64Transport implementation backed by Ultimate 64 REST API.
 
     All memory I/O goes through the device's DMA-backed ``readmem``/
     ``writemem`` endpoints, so no CPU pause is required — reads and
     writes happen concurrently with normal execution.
+
+    Maintains a host-side shadow of the SID register file ($D400-$D41F)
+    so :func:`extract_snapshot` can capture the SID state even though
+    real-hardware SID readback returns open-bus garbage for the
+    write-only registers.  See :attr:`sid_shadow`.
     """
 
     def __init__(
@@ -56,6 +78,11 @@ class Ultimate64Transport(HardwareTransportBase):
         from ..memory_policy import MemoryPolicy as _MemoryPolicy
         self._memory_policy: _MemoryPolicy = memory_policy or _MemoryPolicy.permissive()
 
+        # Host-side shadow of $D400-$D41F.  Initialised to all-zero —
+        # matches the SID register file at C64 power-on.  Updated on
+        # every write_memory() call that overlaps the SID window.
+        self._sid_shadow: bytearray = bytearray(_SID_LEN)
+
     @property
     def client(self) -> "Ultimate64Client":
         """Return the underlying Ultimate64Client for low-level operations not yet wrapped on the transport."""
@@ -80,6 +107,43 @@ class Ultimate64Transport(HardwareTransportBase):
             )
         self._memory_policy = policy
 
+    @property
+    def sid_shadow(self) -> bytes:
+        """Host-side shadow of the SID register file ($D400-$D41F).
+
+        Returns a 32-byte snapshot of every byte written to the SID
+        through this transport since construction (or since the last
+        :meth:`reset_sid_shadow` call).  Used by
+        :func:`c64_test_harness.snapshot.extract_snapshot` to capture
+        SID state without hitting open-bus reads on real hardware.
+
+        The shadow tracks writes only; it does NOT reflect:
+
+        * Writes that bypass ``write_memory`` (e.g. SocketDMA opcodes
+          issued through :class:`U64SocketDMATransport`).
+        * SID register updates the running C64 program makes via 6502
+          stores — those happen entirely inside the device.
+
+        For programs that drive the SID from the C64 side, the shadow
+        will diverge from the device's true register state.  For tests
+        whose SID writes all originate host-side, the shadow is exact.
+        """
+        return bytes(self._sid_shadow)
+
+    def reset_sid_shadow(self) -> None:
+        """Clear the host-side SID shadow back to all zeros.
+
+        Call this after a full machine reset (e.g. ``client.reboot()``)
+        which clears the SID register file on the hardware.  A CPU soft
+        reset (``client.reset()``) does NOT clear the SID — the SID is
+        on its own clock domain on real hardware and only a full
+        machine reset / power-cycle wipes the register file — so this
+        method is deliberately NOT called automatically by
+        ``client.reset()``.  Call it explicitly when you know the SID
+        was cleared on the device side.
+        """
+        self._sid_shadow = bytearray(_SID_LEN)
+
     # ----- C64Transport protocol -----
 
     def read_memory(self, addr: int, length: int) -> bytes:
@@ -91,7 +155,7 @@ class Ultimate64Transport(HardwareTransportBase):
     def write_memory(
         self,
         addr: int,
-        data: bytes | list[int],
+        data: bytes | list[int] | bytearray,
         *,
         override: str | None = None,
     ) -> None:
@@ -103,13 +167,36 @@ class Ultimate64Transport(HardwareTransportBase):
         bypass for a single call (logged at WARNING).  The default
         policy is permissive, so existing callers see no behaviour
         change.
+
+        After the policy check (and any logging), the bytes that
+        overlap $D400-$D41F are mirrored into :attr:`sid_shadow` so the
+        snapshot extractor can capture SID state on a backend whose
+        readback returns open-bus.  Writes that don't touch the SID
+        window leave the shadow untouched.
         """
+        # Normalise data into bytes — accept bytes, bytearray, or list[int].
         if isinstance(data, list):
+            data = bytes(data)
+        elif isinstance(data, bytearray):
             data = bytes(data)
         if not data:
             return
         if not self._memory_policy.is_permissive():
             self._memory_policy.check_write(addr, len(data), override=override)
+
+        # Update the SID shadow if any byte of this write lands in the
+        # $D400-$D41F window.  Handle writes that straddle the SID range
+        # on either end — only the portion inside the window is mirrored.
+        end = addr + len(data)
+        if addr < _SID_BASE + _SID_LEN and end > _SID_BASE:
+            lo = max(addr, _SID_BASE)
+            hi = min(end, _SID_BASE + _SID_LEN)
+            src_start = lo - addr
+            src_end = hi - addr
+            dst_start = lo - _SID_BASE
+            dst_end = hi - _SID_BASE
+            self._sid_shadow[dst_start:dst_end] = data[src_start:src_end]
+
         self._client.write_mem(addr, data)
 
     def read_screen_codes(self) -> list[int]:
