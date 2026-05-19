@@ -70,5 +70,14 @@ class HardwareTransportBase:
     def resume(self) -> None:
         raise NotImplementedError
 
+    def set_speed(self, multiplier: int | None) -> None:
+        raise NotImplementedError
+
+    def get_speed(self) -> int | None:
+        raise NotImplementedError
+
+    def reset(self, scope: str = "cpu", *, drive: str | int | None = None) -> None:
+        raise NotImplementedError
+
     def close(self) -> None:
         pass

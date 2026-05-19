@@ -197,6 +197,180 @@ def test_close_delegates(transport: Ultimate64Transport, mock_client: MagicMock)
     mock_client.close.assert_called_once_with()
 
 
+# ---------------------------------------------------------------------------
+# set_speed / get_speed — wrap ultimate64_helpers.{set,get}_turbo_*
+# ---------------------------------------------------------------------------
+
+
+def test_set_speed_1_calls_set_turbo_mhz_none(
+    transport: Ultimate64Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[object] = []
+
+    def fake_set(_client: object, mhz: object) -> None:
+        calls.append(mhz)
+
+    monkeypatch.setattr(
+        "c64_test_harness.backends.ultimate64_helpers.set_turbo_mhz", fake_set
+    )
+    transport.set_speed(1)
+    assert calls == [None]
+
+
+def test_set_speed_none_calls_set_turbo_mhz_48(
+    transport: Ultimate64Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[object] = []
+
+    def fake_set(_client: object, mhz: object) -> None:
+        calls.append(mhz)
+
+    monkeypatch.setattr(
+        "c64_test_harness.backends.ultimate64_helpers.set_turbo_mhz", fake_set
+    )
+    transport.set_speed(None)
+    assert calls == [48]
+
+
+@pytest.mark.parametrize("mhz", [2, 4, 8, 12, 48])
+def test_set_speed_supported_int_forwards(
+    transport: Ultimate64Transport, monkeypatch: pytest.MonkeyPatch, mhz: int
+) -> None:
+    calls: list[object] = []
+
+    def fake_set(_client: object, m: object) -> None:
+        calls.append(m)
+
+    monkeypatch.setattr(
+        "c64_test_harness.backends.ultimate64_helpers.set_turbo_mhz", fake_set
+    )
+    transport.set_speed(mhz)
+    assert calls == [mhz]
+
+
+def test_set_speed_unsupported_int_raises(
+    transport: Ultimate64Transport,
+) -> None:
+    # set_turbo_mhz validates against the device enum and raises
+    # ValueError; we should surface that for unsupported multipliers
+    # like 7, 9, 11, etc.
+    with pytest.raises(ValueError):
+        transport.set_speed(7)
+
+
+def test_get_speed_native_when_turbo_off(
+    transport: Ultimate64Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "c64_test_harness.backends.ultimate64_helpers.get_turbo_enabled",
+        lambda _c: False,
+    )
+    monkeypatch.setattr(
+        "c64_test_harness.backends.ultimate64_helpers.get_turbo_mhz",
+        lambda _c: None,
+    )
+    assert transport.get_speed() == 1
+
+
+def test_get_speed_returns_mhz_when_turbo_on(
+    transport: Ultimate64Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "c64_test_harness.backends.ultimate64_helpers.get_turbo_enabled",
+        lambda _c: True,
+    )
+    monkeypatch.setattr(
+        "c64_test_harness.backends.ultimate64_helpers.get_turbo_mhz",
+        lambda _c: 8,
+    )
+    assert transport.get_speed() == 8
+
+
+def test_get_speed_none_when_turbo_on_but_mhz_unknown(
+    transport: Ultimate64Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "c64_test_harness.backends.ultimate64_helpers.get_turbo_enabled",
+        lambda _c: True,
+    )
+    monkeypatch.setattr(
+        "c64_test_harness.backends.ultimate64_helpers.get_turbo_mhz",
+        lambda _c: None,
+    )
+    assert transport.get_speed() is None
+
+
+# ---------------------------------------------------------------------------
+# reset(scope=...) — wraps client.{reset,reboot,drive_reset}
+# ---------------------------------------------------------------------------
+
+
+def test_reset_cpu_calls_client_reset(
+    transport: Ultimate64Transport, mock_client: MagicMock
+) -> None:
+    transport.reset("cpu")
+    mock_client.reset.assert_called_once_with()
+    mock_client.reboot.assert_not_called()
+    mock_client.drive_reset.assert_not_called()
+
+
+def test_reset_default_scope_is_cpu(
+    transport: Ultimate64Transport, mock_client: MagicMock
+) -> None:
+    transport.reset()
+    mock_client.reset.assert_called_once_with()
+
+
+def test_reset_machine_calls_client_reboot(
+    transport: Ultimate64Transport, mock_client: MagicMock
+) -> None:
+    transport.reset("machine")
+    mock_client.reboot.assert_called_once_with()
+    mock_client.reset.assert_not_called()
+
+
+@pytest.mark.parametrize("slot", ["a", "b", "A", "B"])
+def test_reset_drive_string_slot(
+    transport: Ultimate64Transport, mock_client: MagicMock, slot: str
+) -> None:
+    transport.reset("drive", drive=slot)
+    mock_client.drive_reset.assert_called_once_with(slot.lower())
+
+
+@pytest.mark.parametrize("idx,slot", [(0, "a"), (1, "b")])
+def test_reset_drive_int_index(
+    transport: Ultimate64Transport, mock_client: MagicMock, idx: int, slot: str
+) -> None:
+    transport.reset("drive", drive=idx)
+    mock_client.drive_reset.assert_called_once_with(slot)
+
+
+def test_reset_drive_requires_drive(transport: Ultimate64Transport) -> None:
+    with pytest.raises(ValueError, match="drive"):
+        transport.reset("drive")
+
+
+def test_reset_drive_invalid_string(transport: Ultimate64Transport) -> None:
+    with pytest.raises(ValueError, match="drive"):
+        transport.reset("drive", drive="c")
+
+
+def test_reset_drive_int_out_of_range(transport: Ultimate64Transport) -> None:
+    with pytest.raises(ValueError, match="drive"):
+        transport.reset("drive", drive=2)
+
+
+def test_reset_drive_bool_refused(transport: Ultimate64Transport) -> None:
+    # bool is int subclass; refuse the silent coercion.
+    with pytest.raises(ValueError, match="bool"):
+        transport.reset("drive", drive=True)
+
+
+def test_reset_unknown_scope(transport: Ultimate64Transport) -> None:
+    with pytest.raises(ValueError, match="scope"):
+        transport.reset("nuke")
+
+
 def test_constructs_own_client_when_none(monkeypatch: pytest.MonkeyPatch) -> None:
     created: dict = {}
 

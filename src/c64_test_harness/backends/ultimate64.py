@@ -291,6 +291,97 @@ class Ultimate64Transport(HardwareTransportBase):
         """Resume the emulated CPU (after an external pause)."""
         self._client.resume()
 
+    # ----- protocol: speed control ------------------------------------------
+
+    def set_speed(self, multiplier: int | None) -> None:
+        """Backend-agnostic CPU-speed control on Ultimate 64.
+
+        Wraps :func:`ultimate64_helpers.set_turbo_mhz`:
+
+        * ``multiplier=1`` — turbo off (1 MHz native).
+        * ``multiplier=N`` where N is a supported U64 CPU-Speed enum
+          (2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 20, 24, 32, 40, 48) —
+          set Turbo Control to ``"Manual"`` at that MHz.
+        * ``multiplier=None`` — max available speed (48 MHz).
+
+        :raises ValueError: integer is not one of the supported MHz steps.
+        """
+        from .ultimate64_helpers import set_turbo_mhz
+        if multiplier is None:
+            set_turbo_mhz(self._client, 48)
+            return
+        if multiplier == 1:
+            set_turbo_mhz(self._client, None)
+            return
+        # set_turbo_mhz validates against the device enum and raises
+        # ValueError for unsupported speeds.
+        set_turbo_mhz(self._client, multiplier)
+
+    def get_speed(self) -> int | None:
+        """Return the current CPU-speed multiplier.
+
+        Returns ``1`` when turbo is off (native 1 MHz), the integer MHz
+        when turbo is active at a known step, or ``None`` if the device
+        is in turbo mode but the underlying CPU-Speed enum is missing
+        (treated the same as VICE warp: faster-than-native, exact rate
+        unknown).
+        """
+        from .ultimate64_helpers import get_turbo_enabled, get_turbo_mhz
+        if not get_turbo_enabled(self._client):
+            return 1
+        return get_turbo_mhz(self._client)
+
+    # ----- protocol: reset --------------------------------------------------
+
+    def reset(self, scope: str = "cpu", *, drive: str | int | None = None) -> None:
+        """Reset the machine.  See :meth:`C64Transport.reset` for semantics.
+
+        * ``scope="cpu"`` — :meth:`Ultimate64Client.reset` (soft 6510).
+        * ``scope="machine"`` — :meth:`Ultimate64Client.reboot` (FPGA
+          full reinit; ~8 s before the device is reachable again).
+        * ``scope="drive"`` — :meth:`Ultimate64Client.drive_reset`;
+          ``drive`` must be ``"a"``, ``"b"`` (or ``0`` / ``1``).
+        """
+        if scope == "cpu":
+            self._client.reset()
+            return
+        if scope == "machine":
+            self._client.reboot()
+            return
+        if scope == "drive":
+            if drive is None:
+                raise ValueError(
+                    "reset(scope='drive') requires drive='a' or 'b'"
+                )
+            if isinstance(drive, bool):
+                raise ValueError(
+                    f"drive must be 'a'/'b' or 0/1, got bool {drive!r}"
+                )
+            if isinstance(drive, int):
+                if drive == 0:
+                    slot = "a"
+                elif drive == 1:
+                    slot = "b"
+                else:
+                    raise ValueError(
+                        f"drive index must be 0 or 1 (slot a/b); got {drive}"
+                    )
+            elif isinstance(drive, str):
+                slot = drive.lower()
+                if slot not in ("a", "b"):
+                    raise ValueError(
+                        f"drive slot must be 'a' or 'b'; got {drive!r}"
+                    )
+            else:
+                raise ValueError(
+                    f"drive must be 'a'/'b' or 0/1; got {drive!r}"
+                )
+            self._client.drive_reset(slot)
+            return
+        raise ValueError(
+            f"scope must be 'cpu', 'machine', or 'drive'; got {scope!r}"
+        )
+
     def close(self) -> None:
         """Release client resources (no-op for the stateless REST client)."""
         self._client.close()

@@ -35,6 +35,9 @@ class MockTransport:
         self.written_memory: list[tuple[int, list[int]]] = []
         self.injected_keys: list[list[int]] = []
         self.injected_joysticks: list[tuple[int, int]] = []
+        self.speed_calls: list[int | None] = []
+        self._speed: int | None = 1
+        self.reset_calls: list[tuple[str, str | int | None]] = []
 
     @property
     def screen_cols(self) -> int:
@@ -78,6 +81,16 @@ class MockTransport:
 
     def resume(self) -> None:
         pass
+
+    def set_speed(self, multiplier: int | None) -> None:
+        self.speed_calls.append(multiplier)
+        self._speed = multiplier
+
+    def get_speed(self) -> int | None:
+        return self._speed
+
+    def reset(self, scope: str = "cpu", *, drive: str | int | None = None) -> None:
+        self.reset_calls.append((scope, drive))
 
     def close(self) -> None:
         pass
