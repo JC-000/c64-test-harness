@@ -15,13 +15,13 @@ Design notes
   64 KB RAM, the two CPU port bytes ($00 direction, $01 data), and the
   EXROM/GAME cartridge-control lines (defaulted to ``1`` — no cart).
 
-* :func:`extract_state` reads state out of any
+* :func:`extract_snapshot` reads state out of any
   :class:`~c64_test_harness.transport.C64Transport`-conforming backend
   by issuing read_memory calls — the same code path for VICE and U64.
   This is simpler and more uniform than parsing a VICE-emitted ``.vsf``
   on the VICE side.
 
-* :func:`restore_state` writes RAM and CPU port back through
+* :func:`restore_snapshot` writes RAM and CPU port back through
   ``write_memory``.  Because the natural path of 64 KB writes will
   collide with most :class:`~c64_test_harness.MemoryPolicy` reserved
   regions, a single WARNING is logged at the start of the restore and
@@ -87,8 +87,8 @@ if TYPE_CHECKING:
 __all__ = [
     "Snapshot",
     "SnapshotFormatError",
-    "extract_state",
-    "restore_state",
+    "extract_snapshot",
+    "restore_snapshot",
 ]
 
 _log = logging.getLogger(__name__)
@@ -234,7 +234,7 @@ class Snapshot:
 # ---------------------------------------------------------------------------
 
 
-def extract_state(transport: "C64Transport") -> Snapshot:
+def extract_snapshot(transport: "C64Transport") -> Snapshot:
     """Read RAM + CPU port out of any ``C64Transport``-conforming backend.
 
     Reads ``$0000-$FFFF`` and the two CPU port registers and packages
@@ -256,7 +256,7 @@ def extract_state(transport: "C64Transport") -> Snapshot:
     )
 
 
-def restore_state(
+def restore_snapshot(
     transport: "C64Transport",
     snap: Snapshot,
     *,

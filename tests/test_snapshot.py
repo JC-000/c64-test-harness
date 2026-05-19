@@ -8,7 +8,7 @@ Covers four layers:
    produces a snapshot VICE 3.x accepts.
 3. Reverse cross-check (VICE dump → from_vsf) — proves our parser
    handles real VICE-emitted snapshots.
-4. ``restore_state`` mocking — verifies the U64 write path uses the
+4. ``restore_snapshot`` mocking — verifies the U64 write path uses the
    ``override="snapshot-restore"`` kwarg and that a MemoryPolicy with
    reserved regions does not block the restore.
 
@@ -34,8 +34,8 @@ from c64_test_harness import (
     Snapshot,
     SnapshotFormatError,
     UnknownPolicy,
-    extract_state,
-    restore_state,
+    extract_snapshot,
+    restore_snapshot,
 )
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
@@ -108,7 +108,7 @@ def vice_transport():
 
 
 class _MockTransport:
-    """Pure-Python transport stub for restore_state assertions.
+    """Pure-Python transport stub for restore_snapshot assertions.
 
     Records every write_memory call so the test can verify the bulk
     write went through with the ``override="snapshot-restore"`` kwarg.
@@ -125,7 +125,7 @@ class _MockTransport:
             self.memory_policy.check_write(addr, len(data), override=override)
         self.writes.append((addr, bytes(data), override))
 
-    # extract_state is not exercised by these tests; satisfy the protocol.
+    # extract_snapshot is not exercised by these tests; satisfy the protocol.
     def read_memory(self, addr: int, length: int) -> bytes:
         return bytes(length)
 
@@ -284,7 +284,7 @@ def test_we_parse_vice_emitted_vsf(vice_transport, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 4. restore_state writes through the transport with the right override
+# 4. restore_snapshot writes through the transport with the right override
 # ---------------------------------------------------------------------------
 
 
@@ -296,9 +296,9 @@ class TestRestoreState:
             cpu_port_dir=0x2F,
         )
         mock = _MockTransport()
-        restore_state(mock, snap)
+        restore_snapshot(mock, snap)
         # Every recorded write must carry the snapshot-restore override.
-        assert mock.writes, "restore_state issued no writes"
+        assert mock.writes, "restore_snapshot issued no writes"
         for addr, data, override in mock.writes:
             assert override == "snapshot-restore", (
                 f"write at ${addr:04X} ({len(data)} bytes) "
@@ -312,7 +312,7 @@ class TestRestoreState:
             cpu_port_dir=0x2F,
         )
         mock = _MockTransport()
-        restore_state(mock, snap)
+        restore_snapshot(mock, snap)
         ram_writes = [(a, d) for a, d, _ov in mock.writes if a == 0x0000 and len(d) == 65536]
         assert ram_writes, "no full-RAM write was issued"
         assert ram_writes[0][1] == snap.ram
@@ -324,7 +324,7 @@ class TestRestoreState:
             cpu_port_dir=0xCD,
         )
         mock = _MockTransport()
-        restore_state(mock, snap)
+        restore_snapshot(mock, snap)
         addrs = [(addr, data) for addr, data, _ov in mock.writes]
         # The explicit CPU port writes must appear.
         assert (0x0000, b"\xcd") in addrs
@@ -348,7 +348,7 @@ class TestRestoreState:
         )
         mock = _MockTransport(memory_policy=policy)
         with pytest.raises(Exception):  # MemoryPolicyError
-            restore_state(mock, snap, override_memory_policy=False)
+            restore_snapshot(mock, snap, override_memory_policy=False)
 
     def test_restore_overrides_reserved_regions(self, caplog) -> None:
         """A snapshot restore against a guarded policy succeeds via override."""
@@ -367,7 +367,7 @@ class TestRestoreState:
         mock = _MockTransport(memory_policy=policy)
 
         with caplog.at_level(logging.WARNING, logger="c64_test_harness.snapshot"):
-            restore_state(mock, snap)  # default override=True
+            restore_snapshot(mock, snap)  # default override=True
 
         # No exception raised, every write recorded.
         assert any(
@@ -380,7 +380,7 @@ class TestRestoreState:
 
 
 # ---------------------------------------------------------------------------
-# extract_state — light test with a stub transport
+# extract_snapshot — light test with a stub transport
 # ---------------------------------------------------------------------------
 
 
@@ -397,7 +397,7 @@ class TestExtractState:
                 assert addr == 0x0000 and length == 65536
                 return ram
 
-        snap = extract_state(_Stub())
+        snap = extract_snapshot(_Stub())
         assert snap.ram == ram
         assert snap.cpu_port_dir == 0x2F
         assert snap.cpu_port_data == 0x37

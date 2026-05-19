@@ -270,15 +270,16 @@ from .sid_player import (
     DEFAULT_STUB_ADDR,
 )
 # Top-level snapshot interop (Phase A — RAM + CPU port round-trip).
-# Imported LAST so ``Snapshot.extract_state``/``restore_state`` win the
-# top-level names over the U64-specific helpers above; consumers needing
-# the U64 ``snapshot_state``/``restore_state`` should import them from
-# ``c64_test_harness.backends.ultimate64_helpers``.
+# Symbols are deliberately suffixed ``_snapshot`` to avoid colliding with
+# the existing U64 ``snapshot_state``/``restore_state`` config-state
+# helpers re-exported above. Downstream tests across multiple projects
+# depend on the older names; keeping the new ones distinct preserves
+# both call sites.
 from .snapshot import (  # noqa: E402
     Snapshot,
     SnapshotFormatError,
-    extract_state,
-    restore_state,
+    extract_snapshot,
+    restore_snapshot,
 )
 
 __all__ = [
@@ -577,6 +578,6 @@ __all__ = [
     # Cross-backend snapshot interop (Phase A)
     "Snapshot",
     "SnapshotFormatError",
-    "extract_state",
-    "restore_state",
+    "extract_snapshot",
+    "restore_snapshot",
 ]
