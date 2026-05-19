@@ -269,6 +269,17 @@ from .sid_player import (
     SidPlaybackError,
     DEFAULT_STUB_ADDR,
 )
+# Top-level snapshot interop (Phase A — RAM + CPU port round-trip).
+# Imported LAST so ``Snapshot.extract_state``/``restore_state`` win the
+# top-level names over the U64-specific helpers above; consumers needing
+# the U64 ``snapshot_state``/``restore_state`` should import them from
+# ``c64_test_harness.backends.ultimate64_helpers``.
+from .snapshot import (  # noqa: E402
+    Snapshot,
+    SnapshotFormatError,
+    extract_state,
+    restore_state,
+)
 
 __all__ = [
     # Package version
@@ -563,4 +574,9 @@ __all__ = [
     "VideoFrame",
     "DEFAULT_VIDEO_PORT",
     "VIC_PALETTE",
+    # Cross-backend snapshot interop (Phase A)
+    "Snapshot",
+    "SnapshotFormatError",
+    "extract_state",
+    "restore_state",
 ]
