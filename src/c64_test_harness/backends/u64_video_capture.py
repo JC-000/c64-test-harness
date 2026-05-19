@@ -362,3 +362,9 @@ class VideoCapture:
         """Number of packets received so far (thread-safe)."""
         with self._lock:
             return self._packets_received
+
+    @property
+    def frames_completed(self) -> int:
+        """Number of complete frames assembled so far (thread-safe)."""
+        with self._lock:
+            return len(self._frames)

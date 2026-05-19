@@ -35,7 +35,6 @@ class MockTransport:
         self.written_memory: list[tuple[int, list[int]]] = []
         self.injected_keys: list[list[int]] = []
         self.injected_joysticks: list[tuple[int, int]] = []
-        self._registers: dict[str, int] = {"PC": 0x0800, "A": 0, "X": 0, "Y": 0, "SP": 0xFF}
 
     @property
     def screen_cols(self) -> int:
@@ -67,9 +66,6 @@ class MockTransport:
 
     def inject_keys(self, petscii_codes: list[int]) -> None:
         self.injected_keys.append(list(petscii_codes))
-
-    def read_registers(self) -> dict[str, int]:
-        return dict(self._registers)
 
     def inject_joystick(self, port: int, value: int) -> None:
         self.injected_joysticks.append((port, value))

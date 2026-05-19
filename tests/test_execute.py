@@ -34,6 +34,16 @@ class BinaryMockTransport(MockTransport):
         self._set_registers_calls: list[dict[str, int]] = []
         self._resume_count = 0
         self._stopped_pc: int | None = None  # PC value for wait_for_stopped
+        # BinaryViceTransport (VICE-only) exposes CPU registers; mock the
+        # same shape here.  read_registers is intentionally not on the
+        # cross-backend C64Transport protocol, so the base MockTransport
+        # does not carry _registers.
+        self._registers: dict[str, int] = {
+            "PC": 0x0800, "A": 0, "X": 0, "Y": 0, "SP": 0xFF,
+        }
+
+    def read_registers(self) -> dict[str, int]:
+        return dict(self._registers)
 
     def set_registers(self, regs: dict[str, int]) -> None:
         self._set_registers_calls.append(dict(regs))

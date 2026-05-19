@@ -87,10 +87,6 @@ class C64Transport(Protocol):
         """
         ...
 
-    def read_registers(self) -> dict[str, int]:
-        """Read CPU registers.  Returns dict with keys like PC, A, X, Y, SP."""
-        ...
-
     def inject_joystick(self, port: int, value: int) -> None:
         """Inject joystick state. port=1 or 2, value is the joystick byte (bits 0-4 = up/down/left/right/fire)."""
         ...

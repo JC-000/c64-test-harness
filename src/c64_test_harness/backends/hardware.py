@@ -58,9 +58,6 @@ class HardwareTransportBase:
     def inject_keys(self, petscii_codes: list[int]) -> None:
         raise NotImplementedError
 
-    def read_registers(self) -> dict[str, int]:
-        raise NotImplementedError
-
     def inject_joystick(self, port: int, value: int) -> None:
         raise NotImplementedError
 

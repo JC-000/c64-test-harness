@@ -64,6 +64,45 @@ def test_read_screen_codes(transport: Ultimate64Transport) -> None:
     assert all(isinstance(c, int) and 0 <= c <= 255 for c in codes)
 
 
-def test_read_registers_not_supported(transport: Ultimate64Transport) -> None:
-    with pytest.raises(NotImplementedError):
-        transport.read_registers()
+def test_read_registers_removed_from_protocol(transport: Ultimate64Transport) -> None:
+    """``read_registers`` is not part of ``C64Transport`` — VICE-only.
+
+    The Ultimate64 transport must not advertise the attribute at all
+    (so that ``hasattr`` checks in cross-backend helpers can dispatch
+    cleanly).
+    """
+    assert not hasattr(transport, "read_registers")
+
+
+def test_read_palette(transport: Ultimate64Transport) -> None:
+    """``read_palette`` returns the canonical 16-entry VIC palette."""
+    palette = transport.read_palette()
+    assert len(palette) == 16
+    assert palette[0] == (0x00, 0x00, 0x00)
+    assert palette[1] == (0xFF, 0xFF, 0xFF)
+
+
+def test_read_framebuffer_returns_one_frame(transport: Ultimate64Transport) -> None:
+    """Capturing one frame should produce a dict matching the VICE shape.
+
+    Requires the device to be able to reach the host on UDP
+    ``DEFAULT_VIDEO_PORT`` (11000).  Skips with a clear message if the
+    stream cannot be received (firewall, NAT, etc.).
+    """
+    from c64_test_harness.transport import TransportError
+
+    try:
+        fb = transport.read_framebuffer(timeout=3.0)
+    except TransportError as exc:
+        pytest.skip(f"U64 video stream not reachable from this host: {exc}")
+
+    assert set(fb.keys()) == {"debug_rect", "inner_rect", "bpp", "palette", "bytes"}
+    dx, dy, dw, dh = fb["debug_rect"]
+    assert dx == 0 and dy == 0
+    assert dw > 0 and dh > 0
+    ix, iy, iw, ih = fb["inner_rect"]
+    assert (iw, ih) == (dw, dh)  # U64 stream has no debug border
+    assert fb["bpp"] == 8
+    assert isinstance(fb["bytes"], bytes)
+    # 1 byte per pixel after unpacking.
+    assert len(fb["bytes"]) == dw * dh
