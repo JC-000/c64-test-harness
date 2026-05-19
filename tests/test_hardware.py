@@ -37,9 +37,17 @@ def test_all_abstract_methods_raise():
     with pytest.raises(NotImplementedError):
         h.inject_keys([0x41])
     with pytest.raises(NotImplementedError):
-        h.read_registers()
-    with pytest.raises(NotImplementedError):
         h.resume()
+
+
+def test_read_registers_not_on_hardware_base():
+    """``read_registers`` is intentionally not part of ``C64Transport``.
+
+    CPU-register inspection is a VICE-specific power
+    (binary monitor) — the hardware base should not advertise it.
+    """
+    h = HardwareTransportBase()
+    assert not hasattr(h, "read_registers")
 
 
 def test_close_is_noop():

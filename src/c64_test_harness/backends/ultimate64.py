@@ -4,15 +4,19 @@ Wraps :class:`Ultimate64Client` so the Ultimate 64 hardware can be used
 anywhere the test harness expects a :class:`C64Transport`.
 
 Unlike :class:`BinaryViceTransport`, there is no breakpoint/register
-protocol on the U64.  Methods that depend on CPU inspection —
-:meth:`read_registers`, :meth:`set_registers`, checkpoint management,
-:func:`jsr`, :func:`wait_for_pc`, :func:`set_breakpoint` — are all
-unavailable on hardware.  Design tests to self-report results via
-memory reads.
+protocol on the U64.  CPU inspection methods (``read_registers``,
+``set_registers``, checkpoint management, :func:`jsr`,
+:func:`wait_for_pc`, :func:`set_breakpoint`) are VICE-only — design
+U64 tests to self-report results via memory reads.  ``read_registers``
+is intentionally **not** part of :class:`C64Transport`; consult
+``BinaryViceTransport`` directly when you need it.
 """
 from __future__ import annotations
 
+import socket
+
 from .hardware import HardwareTransportBase
+from .u64_video_capture import VIC_PALETTE, DEFAULT_VIDEO_PORT, VideoCapture
 from .ultimate64_client import Ultimate64Client
 
 
@@ -163,19 +167,6 @@ class Ultimate64Transport(HardwareTransportBase):
                 bytes([current + len(chunk)]),
             )
 
-    def read_registers(self) -> dict[str, int]:
-        """Not supported on Ultimate 64 hardware.
-
-        The REST API does not expose CPU registers.  :func:`jsr`,
-        :func:`wait_for_pc`, and :func:`set_breakpoint` are therefore
-        unavailable — design tests to self-report results via memory.
-        """
-        raise NotImplementedError(
-            "Ultimate 64 REST API does not expose CPU registers. "
-            "jsr(), wait_for_pc(), and set_breakpoint() are unavailable "
-            "on hardware. Design tests to self-report results via memory."
-        )
-
     def inject_joystick(self, port: int, value: int) -> None:
         """Inject joystick state on U64 by writing CIA1 ports via REST.
 
@@ -202,17 +193,99 @@ class Ultimate64Transport(HardwareTransportBase):
             raise ValueError(f"inject_joystick: value {value:#x} out of byte range")
         self._client.write_mem(cia_addr, bytes([value & 0xFF]))
 
-    def read_framebuffer(self) -> dict:
-        """Return raw framebuffer bytes plus geometry. Backend-specific layout — see backend docs."""
-        raise NotImplementedError(
-            "U64 hardware does not expose framebuffer reads directly via REST."
-        )
+    def read_framebuffer(
+        self,
+        *,
+        listen_port: int = DEFAULT_VIDEO_PORT,
+        timeout: float = 2.0,
+    ) -> dict:
+        """Capture one VIC-II frame from the U64 video stream.
+
+        Returns a dict matching the :class:`BinaryViceTransport`
+        ``read_framebuffer`` shape::
+
+            {
+                "debug_rect": (0, 0, W, H),       # full frame rect
+                "inner_rect": (0, 0, W, H),       # U64 stream has no
+                                                  # debug border, so inner
+                                                  # == debug here
+                "bpp": 8,                         # we unpack to 1 byte/px
+                "palette": 0,                     # palette id (0 = VIC)
+                "bytes": <pixels>,                # W*H bytes, colour
+                                                  # indices 0-15
+            }
+
+        Implementation: starts the U64 video UDP stream, captures one
+        complete frame, then stops the stream.  Latency is roughly one
+        frame time (~20 ms on PAL) plus stream-start overhead — callers
+        that need many frames should drive ``VideoCapture`` directly
+        from :mod:`c64_test_harness.backends.u64_video_capture`.
+
+        Raises ``TransportError`` if no complete frame arrives within
+        ``timeout`` seconds (typically means the device cannot reach the
+        host on UDP — a firewall, or wrong source IP).
+        """
+        import time
+
+        from ..transport import TransportError
+
+        # Discover the local IP the U64 can reach us on (same trick
+        # render_wav_u64 uses — UDP connect picks the right interface
+        # without sending traffic).
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as _s:
+            _s.connect((self._client.host, self._client.port))
+            local_ip = _s.getsockname()[0]
+        destination = f"{local_ip}:{listen_port}"
+
+        capture = VideoCapture(port=listen_port)
+        capture.start()
+        stream_started = False
+        try:
+            self._client.stream_video_start(destination)
+            stream_started = True
+
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if capture.frames_completed >= 1:
+                    break
+                time.sleep(0.01)
+        finally:
+            if stream_started:
+                try:
+                    self._client.stream_video_stop()
+                except Exception:
+                    pass
+            result = capture.stop()
+
+        if not result.frames:
+            raise TransportError(
+                f"read_framebuffer: no complete frame received from "
+                f"{self._client.host} within {timeout}s "
+                f"(packets_received={result.packets_received}, "
+                f"frames_dropped={result.frames_dropped}). "
+                f"Check that the device can reach {destination} on UDP."
+            )
+
+        frame = result.frames[0]
+        return {
+            "debug_rect": (0, 0, frame.width, frame.height),
+            "inner_rect": (0, 0, frame.width, frame.height),
+            "bpp": 8,
+            "palette": 0,
+            "bytes": frame.pixels,
+        }
 
     def read_palette(self) -> list[tuple[int, int, int]]:
-        """Return the active VIC palette as RGB triples."""
-        raise NotImplementedError(
-            "U64 hardware does not expose the VIC palette directly via REST."
-        )
+        """Return the active VIC palette as a list of 16 RGB triples.
+
+        The U64 REST API does not expose the live palette, so this
+        returns the canonical VIC-II palette
+        (:data:`~c64_test_harness.backends.u64_video_capture.VIC_PALETTE`)
+        — the same indices the U64 video stream uses to encode pixels.
+        Matches the return shape of
+        :meth:`BinaryViceTransport.read_palette`.
+        """
+        return [tuple(rgb) for rgb in VIC_PALETTE]
 
     def resume(self) -> None:
         """Resume the emulated CPU (after an external pause)."""

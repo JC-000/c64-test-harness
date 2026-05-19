@@ -147,9 +147,44 @@ def test_inject_keys_waits_for_drain(
     assert mock_client.write_mem.call_count == 2
 
 
-def test_read_registers_not_supported(transport: Ultimate64Transport) -> None:
-    with pytest.raises(NotImplementedError, match="CPU registers"):
-        transport.read_registers()
+def test_read_registers_removed_from_protocol() -> None:
+    """``read_registers`` is intentionally NOT part of ``C64Transport``.
+
+    CPU-register inspection is a VICE-only power (binary monitor).
+    The U64 REST API cannot honour it, so the protocol was narrowed
+    rather than left as a silent-NotImplementedError trap.  Callers
+    that need registers should depend on ``BinaryViceTransport``
+    directly.  This test guards against accidental re-introduction.
+    """
+    assert "read_registers" not in C64Transport.__dict__
+    # Likewise the U64 transport must not advertise it.
+    assert not hasattr(Ultimate64Transport, "read_registers")
+
+
+def test_read_palette_returns_vic_palette(transport: Ultimate64Transport) -> None:
+    """``read_palette`` returns the canonical 16-entry VIC-II palette."""
+    from c64_test_harness.backends.u64_video_capture import VIC_PALETTE
+
+    palette = transport.read_palette()
+    assert isinstance(palette, list)
+    assert len(palette) == 16
+    # Every entry is an (r, g, b) tuple of ints in 0..255.
+    for entry in palette:
+        assert isinstance(entry, tuple)
+        assert len(entry) == 3
+        for chan in entry:
+            assert isinstance(chan, int)
+            assert 0 <= chan <= 255
+    # Matches the source-of-truth constant.
+    assert palette == [tuple(rgb) for rgb in VIC_PALETTE]
+
+
+def test_read_palette_matches_vice_shape(transport: Ultimate64Transport) -> None:
+    """Return type must satisfy ``list[tuple[int, int, int]]`` — same
+    as ``BinaryViceTransport.read_palette``."""
+    palette = transport.read_palette()
+    assert palette[0] == (0x00, 0x00, 0x00)   # black
+    assert palette[1] == (0xFF, 0xFF, 0xFF)   # white
 
 
 def test_resume_delegates(transport: Ultimate64Transport, mock_client: MagicMock) -> None:
