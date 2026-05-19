@@ -276,6 +276,7 @@ from .sid_player import (
 # depend on the older names; keeping the new ones distinct preserves
 # both call sites.
 from .snapshot import (  # noqa: E402
+    CartridgeState,
     CpuRegisters,
     DriveState,
     Snapshot,
@@ -577,10 +578,11 @@ __all__ = [
     "VideoFrame",
     "DEFAULT_VIDEO_PORT",
     "VIC_PALETTE",
-    # Cross-backend snapshot interop (Phase A + Phase B disk sidecar + Phase D CPU regs)
+    # Cross-backend snapshot interop (RAM + drives + CIA/VIC/SID + REU + CPU regs + cartridge)
     "Snapshot",
     "SnapshotFormatError",
     "DriveState",
+    "CartridgeState",
     "CpuRegisters",
     "extract_snapshot",
     "restore_snapshot",

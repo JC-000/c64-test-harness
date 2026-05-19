@@ -108,6 +108,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CpuRegisters",
+    "CartridgeState",
     "DriveState",
     "Snapshot",
     "SnapshotFormatError",
@@ -399,6 +400,92 @@ class DriveState:
 
 
 # ---------------------------------------------------------------------------
+# CartridgeState — sidecar .crt bytes + cart metadata
+# ---------------------------------------------------------------------------
+
+
+# Canonical cart-type strings recognised by the harness.  The runtime
+# attach path on VICE supports a subset (see ``_VICE_RUNTIME_ATTACHABLE``
+# below); other types are recorded for metadata round-trip but require
+# launch-time ``ViceConfig.extra_args`` to actually attach on VICE.
+_VICE_CART_TYPE_INT: dict[str, int] = {
+    # VICE c64cart.h enum names → IDs used by the CartridgeType resource.
+    # Generic cart subtypes (the .crt header carries the exact variant,
+    # so when CartridgeFile is set VICE auto-detects; the explicit
+    # CartridgeType is a hint for the legacy ``-cartgeneric`` path).
+    "generic": 1,
+    "generic-8k": 1,
+    "generic-16k": 2,
+    "ultimax": 3,
+    # A pragmatic shortlist — the ID space is broad but most consumers
+    # only ever ship generic/EasyFlash test carts.  See VICE's
+    # ``src/c64/cart/c64cart.h`` (CARTRIDGE_* macros) for the full list.
+    "easyflash": 32,
+    "action-replay": 1,  # AR variants share id 1 in some VICE builds
+    "freezer": 0,        # generic placeholder — many freezer carts
+}
+
+# Cart types we believe runtime-attach via CartridgeFile/CartridgeType
+# resources reliably swaps without restarting x64sc.  Other types fall
+# through to a WARNING + advice to use ``ViceConfig.extra_args``.
+_VICE_RUNTIME_ATTACHABLE: frozenset[str] = frozenset({
+    "", "generic", "generic-8k", "generic-16k", "ultimax", "easyflash",
+})
+
+
+@dataclass(frozen=True)
+class CartridgeState:
+    """Cartridge image + metadata for a Snapshot.
+
+    Attributes
+    ----------
+    image:
+        Raw ``.crt`` file bytes.  May be empty (``b""``) when the
+        snapshot was extracted from a backend that can't read cartridge
+        bytes back (true for U64 — the REST API has no file-download
+        endpoint).  Empty image means metadata-only: the snapshot
+        records the cart was active, but a restore must side-load the
+        actual bytes (typically by re-running the test with
+        ``ViceConfig.extra_args=['-cartcrt', path]`` or by U64
+        ``client.run_crt(...)`` with bytes from the test author's disk).
+    cart_type:
+        Canonical cart-type string — empty by default ("don't know /
+        let VICE auto-detect").  Recognised values include
+        ``"generic"``, ``"generic-8k"``, ``"generic-16k"``, ``"ultimax"``,
+        and ``"easyflash"``.  Other values are accepted for metadata
+        round-trip but will fall through the VICE runtime-attach
+        path with a WARNING; in that case the test author should
+        re-launch VICE with ``ViceConfig.extra_args`` instead.
+    reset_on_attach:
+        When True (the default), the backend should reset the C64 as
+        part of the attach so the cart boots.  Maps to VICE's
+        ``CartridgeReset`` resource and is the natural behaviour of
+        U64's ``run_crt``.
+    """
+
+    image: bytes
+    cart_type: str = ""
+    reset_on_attach: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.image, (bytes, bytearray)):
+            raise TypeError(
+                f"image must be bytes, not {type(self.image).__name__}"
+            )
+        if isinstance(self.image, bytearray):
+            object.__setattr__(self, "image", bytes(self.image))
+        if not isinstance(self.cart_type, str):
+            raise TypeError(
+                f"cart_type must be str, not {type(self.cart_type).__name__}"
+            )
+        if not isinstance(self.reset_on_attach, bool):
+            raise TypeError(
+                f"reset_on_attach must be bool, not "
+                f"{type(self.reset_on_attach).__name__}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Snapshot dataclass
 # ---------------------------------------------------------------------------
 
@@ -454,6 +541,7 @@ class Snapshot:
     reu_size_bytes: int = 0
     reu_contents: bytes = b""
     cpu_registers: CpuRegisters | None = None
+    cartridge: "CartridgeState | None" = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.ram, (bytes, bytearray)):
@@ -495,6 +583,13 @@ class Snapshot:
             raise TypeError(
                 "cpu_registers must be a CpuRegisters or None, got "
                 f"{type(self.cpu_registers).__name__}"
+            )
+        if self.cartridge is not None and not isinstance(
+            self.cartridge, CartridgeState
+        ):
+            raise TypeError(
+                "cartridge must be a CartridgeState or None, got "
+                f"{type(self.cartridge).__name__}"
             )
 
         # I/O register banks — each is either empty (not captured) or
@@ -742,7 +837,7 @@ class Snapshot:
         if self.reu_contents:
             (out / "reu.bin").write_bytes(self.reu_contents)
 
-        manifest = {
+        manifest: dict = {
             "version": 1,
             "cpu_port_data": self.cpu_port_data,
             "cpu_port_dir": self.cpu_port_dir,
@@ -771,6 +866,16 @@ class Snapshot:
                 "y": self.cpu_registers.y,
                 "sp": self.cpu_registers.sp,
                 "p": self.cpu_registers.p,
+            }
+        if self.cartridge is not None:
+            cart_image_file: str | None = None
+            if self.cartridge.image:
+                cart_image_file = "cartridge.crt"
+                (out / cart_image_file).write_bytes(self.cartridge.image)
+            manifest["cartridge"] = {
+                "cart_type": self.cartridge.cart_type,
+                "reset_on_attach": self.cartridge.reset_on_attach,
+                "image_file": cart_image_file,
             }
         (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
         return out
@@ -888,6 +993,26 @@ class Snapshot:
             # from the .vsf so a bundle without an explicit registers
             # entry still round-trips correctly.
             cpu_registers = base.cpu_registers
+        cartridge: CartridgeState | None = None
+        cart_entry = manifest.get("cartridge")
+        if isinstance(cart_entry, dict):
+            cart_image_file = cart_entry.get("image_file")
+            if cart_image_file:
+                cart_path = src / cart_image_file
+                try:
+                    cart_image_bytes = cart_path.read_bytes()
+                except FileNotFoundError as exc:
+                    raise SnapshotFormatError(
+                        f"manifest references missing cartridge image "
+                        f"file: {cart_image_file}"
+                    ) from exc
+            else:
+                cart_image_bytes = b""
+            cartridge = CartridgeState(
+                image=cart_image_bytes,
+                cart_type=cart_entry.get("cart_type", ""),
+                reset_on_attach=bool(cart_entry.get("reset_on_attach", True)),
+            )
 
         return cls(
             ram=base.ram,
@@ -903,6 +1028,7 @@ class Snapshot:
             reu_size_bytes=reu_size_bytes,
             reu_contents=reu_contents,
             cpu_registers=cpu_registers,
+            cartridge=cartridge,
         )
 
     # ------------------------------------------------------------------
@@ -1071,6 +1197,9 @@ def extract_snapshot(
     reu_turbo: bool = False,
     include_cpu_registers: bool = True,
     known_pc: int | None = None,
+    host_cart_path: "str | Path | None" = None,
+    cart_type: str = "",
+    cart_reset_on_attach: bool = True,
 ) -> Snapshot:
     """Read RAM + CPU port out of any ``C64Transport``-conforming backend.
 
@@ -1116,6 +1245,22 @@ def extract_snapshot(
         their last ``SYS``/JSR landed at) or, when ``None``, to the
         snoop's own entry address :data:`_SNOOP_ADDR`.  See
         :func:`_extract_cpu_registers_u64` for the full discussion.
+    host_cart_path:
+        Optional path to a ``.crt`` file that's currently attached.
+        Neither VICE binary monitor nor U64 REST can read cartridge
+        bytes back from the device, so the caller is the authoritative
+        source: if they launched VICE with ``-cartcrt foo.crt`` or
+        called ``client.run_crt(crt_bytes)``, pass that path here and
+        the snapshot picks up the bytes from disk.  When omitted and
+        the backend can't introspect any cart, the snapshot's
+        :attr:`Snapshot.cartridge` field stays ``None``.
+    cart_type:
+        Canonical cart-type string (see :class:`CartridgeState`).
+        Records what the caller knows about the cart; the harness does
+        no ``.crt`` header parsing of its own.
+    cart_reset_on_attach:
+        Stored in :attr:`CartridgeState.reset_on_attach`.  Default
+        ``True``.
 
     The drive-discovery side path is best-effort: on backends that don't
     expose any drive state at all the snapshot comes back with
@@ -1169,6 +1314,12 @@ def extract_snapshot(
         cpu_registers = _extract_cpu_registers(
             transport, known_pc=known_pc,
         )
+    cartridge = _extract_cartridge(
+        transport,
+        host_cart_path=host_cart_path,
+        cart_type=cart_type,
+        reset_on_attach=cart_reset_on_attach,
+    )
     # CPU port registers are at $00 (direction) and $01 (data) — already
     # included in the RAM read, but we mirror them into the dedicated
     # fields so the Snapshot is self-describing.
@@ -1184,6 +1335,7 @@ def extract_snapshot(
         reu_size_bytes=reu_size_bytes,
         reu_contents=reu_contents,
         cpu_registers=cpu_registers,
+        cartridge=cartridge,
     )
 
 
@@ -1216,6 +1368,14 @@ def restore_snapshot(
                 "Snapshot restore bypassing MemoryPolicy reserved regions: %d",
                 n,
             )
+
+    # Cartridge restore runs FIRST: on U64, ``run_crt`` resets the
+    # machine, so any RAM/register writes need to happen after.  On
+    # VICE, setting ``CartridgeReset`` resets the machine too — same
+    # ordering applies.  When the snapshot has no cart, this is a
+    # no-op.
+    if snap.cartridge is not None:
+        _restore_cartridge(transport, snap.cartridge)
 
     # Write the 64 KB image in one call — backend chunks as needed.
     transport.write_memory(0x0000, snap.ram, override=override)
@@ -2091,6 +2251,133 @@ def _restore_reu(
     )
 
 
+# ---------------------------------------------------------------------------
+# Cartridge sidecar — extract/restore per-backend helpers
+# ---------------------------------------------------------------------------
+#
+# .vsf-vs-sidecar contract.  The bundled ``_vsf_template.vsf`` was
+# captured at the VICE 3.10 BASIC READY prompt with no cartridge
+# attached.  We deliberately do NOT inject a ``C64CART`` module into
+# the template, for two reasons:
+#
+#   1. VICE's ``C64CART`` module references the cart by host path, not
+#      embedded bytes — so the .vsf can't be a self-contained
+#      cart-image carrier anyway.  Whichever way you slice it the
+#      bytes live on disk.
+#   2. The sidecar ``cartridge.crt`` file is the canonical carrier in
+#      both directions: VICE→U64 restore uses ``client.run_crt(bytes)``
+#      from the sidecar bytes; U64→VICE restore uses the sidecar bytes
+#      via ``resource_set("CartridgeFile", temp_path)`` (with a
+#      runtime-attach limitation matrix — see :func:`_restore_cartridge_vice`).
+#
+# Leaving the template's no-cart state therefore wins on three counts:
+# the template never goes stale against a new cart, the .vsf parser
+# stays minimal, and the sidecar carries the actual bytes uniformly.
+
+
+def _extract_cartridge(
+    transport: "C64Transport",
+    *,
+    host_cart_path: "str | Path | None",
+    cart_type: str,
+    reset_on_attach: bool,
+) -> "CartridgeState | None":
+    """Build a :class:`CartridgeState` from caller hints + best-effort probes.
+
+    Neither VICE binary monitor nor U64 REST can dump cartridge bytes
+    back from the running machine, so this function trusts the caller:
+    if they passed ``host_cart_path``, read the .crt bytes from disk;
+    otherwise leave the bytes empty and try to fill in ``cart_type``
+    from a transport-specific config probe.
+
+    Returns ``None`` when there is nothing to record — no host path,
+    no caller-supplied cart_type, and no introspectable cart on the
+    transport.
+    """
+    image: bytes = b""
+    if host_cart_path is not None:
+        image = Path(host_cart_path).read_bytes()
+
+    discovered_type = ""
+    # VICE: ``resource_get("CartridgeType")`` returns an int enum.  We
+    # can't translate every int to a canonical name, but a non-zero
+    # value at least tells us a cart is attached.  Failure of the
+    # probe is silent — VICE builds vary.
+    if not cart_type and hasattr(transport, "resource_get"):
+        try:
+            ct = transport.resource_get(  # type: ignore[attr-defined]
+                "CartridgeType"
+            )
+        except Exception:  # noqa: BLE001
+            ct = None
+        if isinstance(ct, int) and ct != 0:
+            # Best-effort reverse-lookup; otherwise stamp a generic
+            # marker so callers know SOMETHING was attached.
+            for name, value in _VICE_CART_TYPE_INT.items():
+                if value == ct:
+                    discovered_type = name
+                    break
+            if not discovered_type:
+                discovered_type = f"vice-type-{ct}"
+
+    # U64: ``get_config_item(CAT_CART, "Cartridge")`` returns a preset
+    # name (e.g. "None", "Final Cartridge III") but NOT bytes.  We
+    # surface the preset string verbatim when nothing better is known.
+    if (
+        not cart_type
+        and not discovered_type
+        and hasattr(transport, "client")
+        and hasattr(transport.client, "get_config_item")
+    ):
+        try:
+            preset = transport.client.get_config_item(  # type: ignore[attr-defined]
+                "Cartridge", category="Cartridge",
+            )
+        except Exception:  # noqa: BLE001
+            preset = None
+        if isinstance(preset, str) and preset and preset.lower() != "none":
+            discovered_type = preset
+
+    final_type = cart_type or discovered_type
+    if not image and not final_type:
+        return None
+    return CartridgeState(
+        image=image,
+        cart_type=final_type,
+        reset_on_attach=reset_on_attach,
+    )
+
+
+def _restore_cartridge(
+    transport: "C64Transport",
+    cart: "CartridgeState",
+) -> None:
+    """Dispatch to the per-backend cart-restore implementation."""
+    if not cart.image:
+        _log.warning(
+            "Snapshot carries cartridge metadata (cart_type=%r) but no "
+            "image bytes — skipping attach.  Re-launch the target with "
+            "the cart already in place (VICE: ViceConfig.extra_args=["
+            "'-cartcrt', path]; U64: client.run_crt(bytes_from_disk)).",
+            cart.cart_type,
+        )
+        return
+    # U64: ``client.run_crt`` is the natural primitive — accepts raw
+    # .crt bytes and resets the machine.
+    if hasattr(transport, "client") and hasattr(transport.client, "run_crt"):
+        _restore_cartridge_u64(transport, cart)
+        return
+    # VICE binary monitor: best-effort runtime attach via resource_set.
+    if hasattr(transport, "resource_set"):
+        _restore_cartridge_vice(transport, cart)
+        return
+    _log.warning(
+        "transport %r has no recognised cartridge-attach API; "
+        "skipping cartridge sidecar restore",
+        type(transport).__name__,
+    )
+
+
 def _restore_reu_u64(
     transport: "C64Transport",
     snap: "Snapshot",
@@ -2135,6 +2422,94 @@ def _restore_reu_u64(
         for offset in range(0, len(snap.reu_contents), chunk_size):
             chunk = snap.reu_contents[offset : offset + chunk_size]
             dma.reu_write(offset, chunk)
+def _restore_cartridge_u64(
+    transport: "C64Transport",
+    cart: "CartridgeState",
+) -> None:
+    """Push the .crt bytes through Ultimate 64's ``run_crt`` endpoint.
+
+    ``run_crt`` both attaches and runs the cart — it resets the CPU as
+    a side effect.  That's why :func:`restore_snapshot` calls this
+    BEFORE the RAM/register restore: if we wrote RAM first, the cart's
+    reset would clobber it.
+    """
+    client = transport.client  # type: ignore[attr-defined]
+    client.run_crt(cart.image)
+
+
+def _restore_cartridge_vice(
+    transport: "C64Transport",
+    cart: "CartridgeState",
+) -> None:
+    """Attach a cartridge to a running x64sc via the resource API.
+
+    Strategy: write the .crt bytes to a temp file, point
+    ``CartridgeFile`` at it, set ``CartridgeType`` if the caller named
+    a known type, and toggle ``CartridgeReset`` to match
+    ``cart.reset_on_attach``.
+
+    Limitation matrix (verified against VICE 3.10 docs / source):
+
+    ===========  ====================  ============================
+    cart_type    runtime-attachable?   notes
+    ===========  ====================  ============================
+    ""           yes (auto-detect)     VICE reads the .crt header
+    generic      yes                   CartridgeType=1
+    generic-8k   yes                   CartridgeType=1
+    generic-16k  yes                   CartridgeType=2
+    ultimax      yes                   CartridgeType=3
+    easyflash    yes                   CartridgeType=32
+    freezer      **no**                use ViceConfig.extra_args
+    action-replay  **no**              use ViceConfig.extra_args
+    *other*      **no**                use ViceConfig.extra_args
+    ===========  ====================  ============================
+
+    Freezer-style carts (AR, FC3, RR) need to hook into VICE's NMI/IRQ
+    paths during init; on VICE 3.10 the runtime ``CartridgeFile``
+    resource doesn't reliably re-wire those interrupts.  The snapshot
+    still records the bytes — the test author just needs to relaunch
+    x64sc with ``ViceConfig.extra_args=['-cartcrt', path]`` (or a
+    type-specific flag like ``-cartfreezer``).
+    """
+    if cart.cart_type and cart.cart_type not in _VICE_RUNTIME_ATTACHABLE:
+        _log.warning(
+            "VICE runtime cartridge attach is not reliable for "
+            "cart_type=%r; the .crt bytes are present in the snapshot "
+            "but a launch-time attach via "
+            "ViceConfig.extra_args=['-cartcrt', <path>] is required.  "
+            "Skipping runtime attach.",
+            cart.cart_type,
+        )
+        return
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="c64-snapshot-cart-"))
+    crt_path = tmpdir / "cartridge.crt"
+    crt_path.write_bytes(cart.image)
+    _log.info("VICE cartridge-restore staging file: %s", crt_path)
+
+    type_int = _VICE_CART_TYPE_INT.get(cart.cart_type)
+    if type_int is not None:
+        try:
+            transport.resource_set(  # type: ignore[attr-defined]
+                "CartridgeType", type_int,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.warning(
+                "resource_set CartridgeType=%d failed: %s — continuing "
+                "(VICE will auto-detect from the .crt header)",
+                type_int, exc,
+            )
+    try:
+        transport.resource_set(  # type: ignore[attr-defined]
+            "CartridgeReset", 1 if cart.reset_on_attach else 0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log.warning(
+            "resource_set CartridgeReset failed: %s — continuing", exc,
+        )
+    transport.resource_set(  # type: ignore[attr-defined]
+        "CartridgeFile", str(crt_path),
+    )
 
 
 # ---------------------------------------------------------------------------
