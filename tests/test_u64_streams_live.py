@@ -142,6 +142,28 @@ def test_debug_bus_cycle_fields(client: Ultimate64Client) -> None:
         cpu_read.address, cpu_read.data,
     )
 
+    # BA is active-high on bit 27 per the 1541ultimate firmware
+    # (slot_server_v4.vhd:1196). During normal operation BA stays high
+    # for the overwhelming majority of CPU cycles — the VIC only pulls
+    # BA low during badlines (≤25 per frame out of 312, and only while
+    # PHI2 is in the VIC half). On a 6510-only capture this should be
+    # ≥99% high. If this assertion regresses, the bit positions in
+    # `BusCycle` are almost certainly wrong again.
+    cpu_cycles = [c for c in result.trace if c.is_cpu]
+    assert len(cpu_cycles) > 0, "No CPU cycles to evaluate BA on"
+    ba_high = sum(1 for c in cpu_cycles if c.ba)
+    ba_fraction = ba_high / len(cpu_cycles)
+    logger.info(
+        "BA high on %d / %d CPU cycles (%.4f%%)",
+        ba_high, len(cpu_cycles), 100.0 * ba_fraction,
+    )
+    assert ba_fraction >= 0.99, (
+        f"Expected BA high on >=99% of CPU cycles (firmware guarantee "
+        f"when VIC isn't stealing badlines), got {100.0 * ba_fraction:.2f}%. "
+        f"This likely means BusCycle.ba reads the wrong bit position — "
+        f"see slot_server_v4.vhd:1183-1228 for the authoritative layout."
+    )
+
 
 def test_debug_stream_irq_detection(client: Ultimate64Client) -> None:
     """Capture for 1 second, verify IRQ# is asserted during KERNAL IRQ handler."""

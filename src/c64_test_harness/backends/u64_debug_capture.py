@@ -88,18 +88,38 @@ HEADER_SIZE = 4          # 2-byte LE sequence number + 2 reserved
 class BusCycle:
     """A single 6510/VIC bus cycle parsed from a 32-bit debug stream word.
 
-    Bit layout (6510/VIC)::
+    Bit layout (6510/VIC) — matches the 1541ultimate firmware truth at
+    ``fpga/cart_slot/vhdl_source/slot_server_v4.vhd`` block ``b_debug``
+    (lines 1183-1228 on the ``GideonZ/1541ultimate`` master branch).
+    In VHDL the ``&`` concatenation operator places its leftmost operand
+    in the most-significant bits, and the firmware composes::
 
-        Bit 31:    PHI2 (1=6510 access, 0=VIC access)
-        Bit 30:    GAME# (active low)
-        Bit 29:    EXROM# (active low)
-        Bit 28:    BA (Bus Available)
-        Bit 27:    IRQ# (active low)
-        Bit 26:    ROM# (active low)
-        Bit 25:    NMI# (active low)
-        Bit 24:    R/W# (1=read, 0=write)
-        Bits 23-16: Data bus (8-bit)
-        Bits 15-0:  Address bus (16-bit)
+        vector_in := phi2_c & gamen_c & exromn_c & not (romhn_c and romln_c) &
+                     ba_c   & irqn_c  & nmin_c   & rwn_c &
+                     slot_data_c & std_logic_vector(slot_addr_c);
+
+    which yields:
+
+    ===  =======================================================
+    Bit  Field
+    ===  =======================================================
+    31   PHI2 (1=6510 access, 0=VIC access)
+    30   GAME# (active low)
+    29   EXROM# (active low)
+    28   cart-ROM-active = ``not (ROMH# AND ROML#)`` — derived
+         active-HIGH signal: ``1`` means at least one cartridge
+         ROM line is asserted. Exposed by :attr:`cart_rom_active`
+         (and :attr:`rom`, kept as a backwards-compatible alias).
+         This is NOT the raw cartridge ROMH#/ROML# pins.
+    27   BA (Bus Available) — active HIGH: ``1`` means the bus
+         is available to the CPU. Exposed by :attr:`ba` without
+         inversion.
+    26   IRQ# (active low) — :attr:`irq` returns True when asserted.
+    25   NMI# (active low) — :attr:`nmi` returns True when asserted.
+    24   R/W# (1=read, 0=write)
+    23-16 Data bus (8-bit)
+    15-0  Address bus (16-bit)
+    ===  =======================================================
     """
 
     raw: int
@@ -130,18 +150,38 @@ class BusCycle:
         return not bool(self.raw & (1 << 29))
 
     @property
-    def ba(self) -> bool:
-        """Bus Available signal."""
+    def cart_rom_active(self) -> bool:
+        """Cartridge ROM activity — ``not (ROMH# AND ROML#)`` from firmware.
+
+        Bit 28 is composed on the FPGA as ``not (romhn_c and romln_c)``,
+        so it is active HIGH: ``True`` means at least one cartridge ROM
+        line (ROMH# or ROML#) is currently asserted low. This is a
+        derived signal, NOT the raw ROMH#/ROML# pins.
+        """
         return bool(self.raw & (1 << 28))
+
+    @property
+    def rom(self) -> bool:
+        """Backwards-compatible alias for :attr:`cart_rom_active`.
+
+        Returns ``True`` when at least one cartridge ROM line is asserted.
+        Prefer :attr:`cart_rom_active` in new code — the name reflects
+        the derived nature of the firmware signal.
+        """
+        return self.cart_rom_active
+
+    @property
+    def ba(self) -> bool:
+        """Bus Available signal — active HIGH.
+
+        ``True`` when the bus is available to the CPU (typical during
+        normal 6510 cycles when the VIC is not stealing badlines).
+        """
+        return bool(self.raw & (1 << 27))
 
     @property
     def irq(self) -> bool:
         """IRQ# signal — True when asserted (active low, bit=0)."""
-        return not bool(self.raw & (1 << 27))
-
-    @property
-    def rom(self) -> bool:
-        """ROM# signal — True when asserted (active low, bit=0)."""
         return not bool(self.raw & (1 << 26))
 
     @property

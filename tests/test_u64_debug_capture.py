@@ -37,8 +37,12 @@ def _build_raw_word(
 ) -> int:
     """Build a 32-bit debug stream word from field values.
 
-    Active-low signals (IRQ#, NMI#, GAME#, EXROM#, ROM#): when the logical
-    signal is *asserted* (True), the bit is 0.
+    Bit layout matches the 1541ultimate firmware at
+    ``fpga/cart_slot/vhdl_source/slot_server_v4.vhd`` block ``b_debug``
+    (lines 1183-1228). Active-low signals (IRQ#, NMI#, GAME#, EXROM#)
+    have the bit set high when *deasserted*. The bit-28 "cart ROM
+    active" signal is the firmware-derived ``not (ROMH# AND ROML#)``
+    and is active HIGH: bit=1 when at least one ROM line is asserted.
     """
     word = address & 0xFFFF
     word |= (data & 0xFF) << 16
@@ -46,11 +50,11 @@ def _build_raw_word(
         word |= 1 << 24
     if not nmi:   # active low: deasserted = bit high
         word |= 1 << 25
-    if not rom:
+    if not irq:   # active low: deasserted = bit high
         word |= 1 << 26
-    if not irq:
+    if ba:        # active high
         word |= 1 << 27
-    if ba:
+    if rom:       # firmware-derived active-HIGH "any cart ROM asserted"
         word |= 1 << 28
     if not exrom:
         word |= 1 << 29
@@ -137,6 +141,142 @@ class TestBusCycle:
         raw = _build_raw_word(phi2=True, rw=False, address=0x1234, data=0xAB)
         c = BusCycle(raw=raw)
         assert c.raw == raw
+
+    def test_cart_rom_active_alias(self):
+        """`rom` is a backwards-compatible alias for `cart_rom_active`."""
+        c_active = BusCycle(raw=(1 << 28))
+        assert c_active.cart_rom_active is True
+        assert c_active.rom is True
+
+        c_inactive = BusCycle(raw=0)
+        assert c_inactive.cart_rom_active is False
+        assert c_inactive.rom is False
+
+
+class TestBusCycleBitPositions:
+    """Pin each bit position 24..31 to a specific firmware field.
+
+    These tests construct a raw word with ONLY bit N set (everything
+    else cleared, including data/address) and assert exactly the
+    expected property reflects that. They catch any future regression
+    that shuffles the bits relative to the firmware truth.
+
+    Authoritative source: ``GideonZ/1541ultimate`` master branch,
+    ``fpga/cart_slot/vhdl_source/slot_server_v4.vhd`` block ``b_debug``,
+    lines 1183-1228. Composition order (MSB first) is::
+
+        phi2 & gamen & exromn & not(romhn and romln) &
+        ba   & irqn  & nmin   & rwn &
+        data[7:0] & addr[15:0]
+    """
+
+    def test_bit_31_is_phi2(self):
+        """Bit 31 is PHI2 — high means 6510 access (is_cpu)."""
+        c = BusCycle(raw=(1 << 31))
+        assert c.phi2 is True
+        assert c.is_cpu is True
+        assert c.is_vic is False
+        # Active-low signals all read deasserted (their bits are 0)
+        assert c.game is True   # GAME# bit 30 = 0 → asserted
+        assert c.exrom is True  # EXROM# bit 29 = 0 → asserted
+        assert c.irq is True    # IRQ# bit 26 = 0 → asserted
+        assert c.nmi is True    # NMI# bit 25 = 0 → asserted
+
+    def test_bit_30_is_gamen(self):
+        """Bit 30 is GAME# (active low). Bit=1 → game property False."""
+        c = BusCycle(raw=(1 << 30))
+        assert c.game is False
+        assert c.phi2 is False
+        assert c.exrom is True  # bit 29 = 0 → asserted
+        assert c.cart_rom_active is False  # bit 28 = 0
+        assert c.ba is False               # bit 27 = 0
+        assert c.irq is True   # bit 26 = 0 → asserted
+        assert c.nmi is True   # bit 25 = 0 → asserted
+        assert c.rw is False   # bit 24 = 0
+
+    def test_bit_29_is_exromn(self):
+        """Bit 29 is EXROM# (active low). Bit=1 → exrom property False."""
+        c = BusCycle(raw=(1 << 29))
+        assert c.exrom is False
+        assert c.game is True  # bit 30 = 0 → asserted
+        assert c.cart_rom_active is False
+        assert c.ba is False
+        assert c.irq is True
+        assert c.nmi is True
+
+    def test_bit_28_is_cart_rom_active(self):
+        """Bit 28 is the firmware-derived `not (ROMH# AND ROML#)`.
+
+        Active HIGH: bit=1 means a cartridge ROM line is asserted.
+        Surfaced via `cart_rom_active` and the `rom` alias.
+        """
+        c = BusCycle(raw=(1 << 28))
+        assert c.cart_rom_active is True
+        assert c.rom is True
+        # Verify no other property is triggered by bit 28
+        assert c.phi2 is False
+        assert c.ba is False
+        assert c.irq is True  # bit 26 = 0 → IRQ# asserted
+        assert c.nmi is True  # bit 25 = 0 → NMI# asserted
+
+    def test_bit_27_is_ba(self):
+        """Bit 27 is BA (Bus Available), active HIGH."""
+        c = BusCycle(raw=(1 << 27))
+        assert c.ba is True
+        assert c.cart_rom_active is False
+        assert c.rom is False
+        assert c.irq is True  # bit 26 = 0 → asserted
+        assert c.nmi is True  # bit 25 = 0 → asserted
+
+    def test_bit_26_is_irqn(self):
+        """Bit 26 is IRQ# (active low). Bit=1 → irq property False."""
+        c = BusCycle(raw=(1 << 26))
+        assert c.irq is False
+        assert c.nmi is True  # bit 25 = 0 → asserted
+        assert c.ba is False
+        assert c.cart_rom_active is False
+
+    def test_bit_25_is_nmin(self):
+        """Bit 25 is NMI# (active low). Bit=1 → nmi property False."""
+        c = BusCycle(raw=(1 << 25))
+        assert c.nmi is False
+        assert c.irq is True  # bit 26 = 0 → asserted
+        assert c.ba is False
+        assert c.cart_rom_active is False
+
+    def test_bit_24_is_rw(self):
+        """Bit 24 is R/W# — high=read, low=write."""
+        c = BusCycle(raw=(1 << 24))
+        assert c.rw is True
+        assert c.is_read is True
+        assert c.is_write is False
+
+    def test_bit_24_clear_is_write(self):
+        """Bit 24 clear → write cycle."""
+        c = BusCycle(raw=0)
+        assert c.rw is False
+        assert c.is_read is False
+        assert c.is_write is True
+
+    def test_address_field_pin_low_16_bits(self):
+        """Bits 15-0 are the address bus — nothing else moves them."""
+        c = BusCycle(raw=0xABCD)
+        assert c.address == 0xABCD
+        assert c.data == 0
+        # No high-byte signal should be tripped by the address field.
+        assert c.phi2 is False
+        assert c.ba is False
+        assert c.cart_rom_active is False
+
+    def test_data_field_pin_bits_23_through_16(self):
+        """Bits 23-16 are the data bus — distinct from the signal bits."""
+        c = BusCycle(raw=(0xFF << 16))
+        assert c.data == 0xFF
+        assert c.address == 0
+        # No signal bit at 24..31 is affected by a full data byte.
+        assert c.rw is False
+        assert c.ba is False
+        assert c.phi2 is False
 
 
 # ---------------------------------------------------------------- DebugCapture
