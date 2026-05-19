@@ -121,7 +121,40 @@ _C64MEM_VMINOR = 1  # VICE 3.5+ layout — what 3.10 requires
 _C64MEM_TRAILER_LEN = 15  # VICE-internal CPU-port delayed-bit state
 _C64MEM_BODY_LEN = 4 + 65536 + _C64MEM_TRAILER_LEN  # = 65555
 
+# I/O register-bank sizes.
+_CIA_REGS_LEN = 16  # $DC00-$DC0F / $DD00-$DD0F register file
+_VIC_REGS_LEN = 47  # $D000-$D02E register file
+_SID_REGS_LEN = 32  # $D400-$D41F register file
+
 _TEMPLATE_PATH = Path(__file__).with_name("_vsf_template.vsf")
+
+# I/O register-bank slice locations inside each VICE 3.10 module body.
+# Verified empirically (May 2026, x64sc 3.10 build on macOS) by writing
+# a distinctive byte pattern to the corresponding $D000-$D02E /
+# $D400-$D41F / $DC00-$DC0F / $DD00-$DD0F memory window through the
+# binary monitor and inspecting the dumped .vsf — see commit history
+# for the probe script.  Module module-body layouts:
+#
+#  * CIA1 v2.5 (77 bytes body): first 16 bytes are the register file
+#    readback of $DC00-$DC0F.  Remaining bytes are timer latches /
+#    TOD alarm / IRQ mask internals — left as template.
+#  * CIA2 v2.5 (77 bytes body): same layout as CIA1, at $DD00-$DD0F.
+#  * SID  v1.5 (36 bytes body): bytes 0..3 are an engine-state prefix
+#    (always `00 00 01 01` at the BASIC READY template), bytes 4..35
+#    are the SID register file ($D400-$D41F).
+#  * VIC-II v1.3 (109207 bytes body): byte 0 is a single-byte prefix
+#    (irq-condition flag), bytes 1..47 are the VIC register file
+#    ($D000-$D02E).  The remaining ~109 KB is sequencer internals
+#    (DMA caches, sprite shift registers, pixel pipeline) and is left
+#    as template — VICE re-derives most of it during the next frame.
+#
+# Each entry: (module_name, body_offset, length).
+_REGISTER_MODULE_SLICES: tuple[tuple[bytes, int, int], ...] = (
+    (b"CIA1", 0, _CIA_REGS_LEN),
+    (b"CIA2", 0, _CIA_REGS_LEN),
+    (b"SID", 4, _SID_REGS_LEN),
+    (b"VIC-II", 1, _VIC_REGS_LEN),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +263,7 @@ class DriveState:
 
 @dataclass(frozen=True)
 class Snapshot:
-    """Minimum backend-agnostic C64 state — Phase A scope.
+    """Minimum backend-agnostic C64 state — Phase A + B scope.
 
     Attributes
     ----------
@@ -244,6 +277,22 @@ class Snapshot:
     exrom, game:
         Cartridge control lines from the C64MEM module.  Default to
         ``1`` (high / not asserted / no cart attached).
+    drives:
+        Tuple of :class:`DriveState` capturing mounted images.  Empty
+        by default — Phase B sidecar.
+    cia1_regs, cia2_regs:
+        Raw 16-byte register files of CIA1 ($DC00-$DC0F) and CIA2
+        ($DD00-$DD0F) at the moment of snapshot.  Empty (``b""``) means
+        "not captured" — restore skips the corresponding writes.
+    vic_regs:
+        Raw 47-byte VIC-II register file ($D000-$D02E).  Empty means
+        not captured.
+    sid_regs:
+        Raw 32-byte SID register file ($D400-$D41F).  Empty means not
+        captured.  On real-hardware backends this is sourced from a
+        host-side shadow (see :attr:`Ultimate64Transport.sid_shadow`)
+        because 28 of the 32 SID registers are write-only on
+        6581/8580/UltiSID.
     """
 
     ram: bytes
@@ -252,6 +301,10 @@ class Snapshot:
     exrom: int = 1
     game: int = 1
     drives: tuple[DriveState, ...] = ()
+    cia1_regs: bytes = b""
+    cia2_regs: bytes = b""
+    vic_regs: bytes = b""
+    sid_regs: bytes = b""
 
     def __post_init__(self) -> None:
         if not isinstance(self.ram, (bytes, bytearray)):
@@ -287,6 +340,27 @@ class Snapshot:
                 )
             seen.add(d.device)
 
+        # I/O register banks — each is either empty (not captured) or
+        # exactly the expected length.  Normalise bytearray → bytes.
+        for name, expected in (
+            ("cia1_regs", _CIA_REGS_LEN),
+            ("cia2_regs", _CIA_REGS_LEN),
+            ("vic_regs", _VIC_REGS_LEN),
+            ("sid_regs", _SID_REGS_LEN),
+        ):
+            v = getattr(self, name)
+            if not isinstance(v, (bytes, bytearray)):
+                raise TypeError(
+                    f"{name} must be bytes, not {type(v).__name__}"
+                )
+            if len(v) not in (0, expected):
+                raise ValueError(
+                    f"{name} must be empty or exactly {expected} bytes, "
+                    f"got {len(v)}"
+                )
+            if isinstance(v, bytearray):
+                object.__setattr__(self, name, bytes(v))
+
     # ------------------------------------------------------------------
     # VSF codec
     # ------------------------------------------------------------------
@@ -299,20 +373,55 @@ class Snapshot:
         snapshot's contents.  All other modules in the template are
         preserved verbatim — VICE 3.10 refuses snapshots that don't
         carry the full module set.
+
+        When ``cia1_regs`` / ``cia2_regs`` / ``vic_regs`` / ``sid_regs``
+        are non-empty, the corresponding bytes inside the CIA1, CIA2,
+        VIC-II, and SID modules are also patched to carry this
+        snapshot's I/O register state — the remaining bytes of those
+        modules (sequencer state, TOD alarm latches, etc.) stay as
+        template values.  See :data:`_REGISTER_MODULE_SLICES` for the
+        verified offsets.
         """
         if template is None:
             template = _load_template()
-        return _replace_c64mem(template, self._build_c64mem_body())
+        out = _replace_c64mem(template, self._build_c64mem_body())
+        # Patch each I/O register module in turn.  Skip fields that are
+        # empty — those snapshots came from extract_snapshot(
+        # include_registers=False) and the template values stand.
+        for module_name, offset, length in _REGISTER_MODULE_SLICES:
+            payload = self._regs_for_module(module_name)
+            if payload:
+                out = _patch_module_prefix(out, module_name, offset, payload)
+        return out
+
+    def _regs_for_module(self, module_name: bytes) -> bytes:
+        """Look up this snapshot's register bytes for *module_name*."""
+        if module_name == b"CIA1":
+            return self.cia1_regs
+        if module_name == b"CIA2":
+            return self.cia2_regs
+        if module_name == b"SID":
+            return self.sid_regs
+        if module_name == b"VIC-II":
+            return self.vic_regs
+        return b""
 
     @classmethod
     def from_vsf(cls, data: bytes) -> Snapshot:
-        """Parse a ``.vsf`` and extract RAM + CPU port from ``C64MEM``.
+        """Parse a ``.vsf`` and extract RAM + CPU port + I/O regs.
 
-        Other modules are skipped.  Raises :class:`SnapshotFormatError`
-        if the file header is bad or the ``C64MEM`` module is missing
-        or too short.
+        Walks the module list once, picks up ``C64MEM`` (required) and
+        the four I/O register modules (best-effort: missing or shorter
+        modules leave the corresponding field empty).  Raises
+        :class:`SnapshotFormatError` if the file header is bad or the
+        ``C64MEM`` module is missing or too short.
         """
         _validate_file_header(data)
+        c64mem_fields: dict | None = None
+        regs: dict[bytes, bytes] = {}
+        slice_by_name = {
+            name: (off, length) for name, off, length in _REGISTER_MODULE_SLICES
+        }
         for name, vmajor, vminor, body_start, body_len in _iter_modules(data):
             if name == _C64MEM_MODULE_NAME:
                 if body_len < 4 + 65536:
@@ -321,14 +430,28 @@ class Snapshot:
                         f"need >= {4 + 65536}"
                     )
                 body = data[body_start : body_start + body_len]
-                return cls(
+                c64mem_fields = dict(
                     cpu_port_data=body[0],
                     cpu_port_dir=body[1],
                     exrom=body[2],
                     game=body[3],
                     ram=bytes(body[4 : 4 + 65536]),
                 )
-        raise SnapshotFormatError("no C64MEM module found in snapshot")
+            elif name in slice_by_name:
+                off, length = slice_by_name[name]
+                if body_len >= off + length:
+                    regs[name] = bytes(
+                        data[body_start + off : body_start + off + length]
+                    )
+        if c64mem_fields is None:
+            raise SnapshotFormatError("no C64MEM module found in snapshot")
+        return cls(
+            **c64mem_fields,
+            cia1_regs=regs.get(b"CIA1", b""),
+            cia2_regs=regs.get(b"CIA2", b""),
+            vic_regs=regs.get(b"VIC-II", b""),
+            sid_regs=regs.get(b"SID", b""),
+        )
 
     # ------------------------------------------------------------------
     # Sidecar bundle (directory) codec — Phase B
@@ -378,6 +501,18 @@ class Snapshot:
             "game": self.game,
             "drives": drive_entries,
         }
+        # I/O register banks — serialise as hex for human readability.
+        # Each field is short (16-47 bytes) so hex bloat is irrelevant.
+        # Omit empty fields entirely (compact manifest for Phase A / B
+        # snapshots that did not capture I/O state).
+        for key, payload in (
+            ("cia1_regs", self.cia1_regs),
+            ("cia2_regs", self.cia2_regs),
+            ("vic_regs", self.vic_regs),
+            ("sid_regs", self.sid_regs),
+        ):
+            if payload:
+                manifest[key] = payload.hex()
         (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
         return out
 
@@ -434,6 +569,24 @@ class Snapshot:
                 mode=entry.get("mode", "readwrite"),
             ))
 
+        # I/O register banks: manifest values win when present (they are
+        # the human-editable source); fall back to whatever from_vsf
+        # picked up from the embedded .vsf modules.
+        def _hex_field(key: str, default: bytes) -> bytes:
+            raw = manifest.get(key)
+            if raw is None:
+                return default
+            if not isinstance(raw, str):
+                raise SnapshotFormatError(
+                    f"manifest {key!r} must be a hex string, got {type(raw).__name__}"
+                )
+            try:
+                return bytes.fromhex(raw)
+            except ValueError as exc:
+                raise SnapshotFormatError(
+                    f"manifest {key!r} is not valid hex: {exc}"
+                ) from exc
+
         return cls(
             ram=base.ram,
             cpu_port_data=base.cpu_port_data,
@@ -441,6 +594,10 @@ class Snapshot:
             exrom=base.exrom,
             game=base.game,
             drives=tuple(drives),
+            cia1_regs=_hex_field("cia1_regs", base.cia1_regs),
+            cia2_regs=_hex_field("cia2_regs", base.cia2_regs),
+            vic_regs=_hex_field("vic_regs", base.vic_regs),
+            sid_regs=_hex_field("sid_regs", base.sid_regs),
         )
 
     # ------------------------------------------------------------------
@@ -464,6 +621,7 @@ def extract_snapshot(
     transport: "C64Transport",
     *,
     host_image_paths: "dict[int, str | Path] | None" = None,
+    include_registers: bool = True,
 ) -> Snapshot:
     """Read RAM + CPU port out of any ``C64Transport``-conforming backend.
 
@@ -484,6 +642,14 @@ def extract_snapshot(
         they just attached ``foo.d64`` to drive 8 themselves, they pass
         ``{8: "foo.d64"}`` and the snapshot picks up the image bytes
         verbatim from disk.
+    include_registers:
+        When ``True`` (default), also read the CIA1, CIA2, VIC-II, and
+        SID register files into the snapshot.  SID extraction uses the
+        host-side ``sid_shadow`` attribute when the transport exposes
+        it (Ultimate 64) and falls back to ``read_memory(0xD400, 32)``
+        otherwise (VICE — which returns last-written values).  Set to
+        ``False`` to emit a Phase A / Phase B-disk-only snapshot with
+        the four register fields left empty.
 
     The drive-discovery side path is best-effort: on backends that don't
     expose any drive state at all the snapshot comes back with
@@ -496,6 +662,24 @@ def extract_snapshot(
             f"transport.read_memory(0x0000, 65536) returned {len(ram)} bytes"
         )
     drives = _extract_drives(transport, host_image_paths or {})
+
+    # I/O register banks.  When skipped, the four fields stay empty
+    # bytes — preserves the Phase A/B-disk snapshot shape.
+    cia1_regs = cia2_regs = vic_regs = sid_regs = b""
+    if include_registers:
+        cia1_regs = bytes(transport.read_memory(0xDC00, _CIA_REGS_LEN))
+        cia2_regs = bytes(transport.read_memory(0xDD00, _CIA_REGS_LEN))
+        vic_regs = bytes(transport.read_memory(0xD000, _VIC_REGS_LEN))
+        # SID extract asymmetry: U64 hardware can't read back the
+        # write-only SID registers, so we use the transport's
+        # host-side shadow.  VICE returns last-written values from
+        # read_memory($D400, 32) directly.
+        shadow = getattr(transport, "sid_shadow", None)
+        if isinstance(shadow, (bytes, bytearray)) and len(shadow) == _SID_REGS_LEN:
+            sid_regs = bytes(shadow)
+        else:
+            sid_regs = bytes(transport.read_memory(0xD400, _SID_REGS_LEN))
+
     # CPU port registers are at $00 (direction) and $01 (data) — already
     # included in the RAM read, but we mirror them into the dedicated
     # fields so the Snapshot is self-describing.
@@ -504,6 +688,10 @@ def extract_snapshot(
         cpu_port_data=ram[0x01],
         cpu_port_dir=ram[0x00],
         drives=drives,
+        cia1_regs=cia1_regs,
+        cia2_regs=cia2_regs,
+        vic_regs=vic_regs,
+        sid_regs=sid_regs,
     )
 
 
@@ -544,6 +732,26 @@ def restore_snapshot(
     # case the backend treats those addresses specially.)
     transport.write_memory(0x0000, bytes([snap.cpu_port_dir]), override=override)
     transport.write_memory(0x0001, bytes([snap.cpu_port_data]), override=override)
+
+    # I/O register banks.  Each non-empty field becomes a single
+    # write_memory call at the canonical base address.  Order: CIA1,
+    # CIA2, SID, then VIC-II last.  VIC-II is intentionally last
+    # because the VIC sequencer latches several values from neighbouring
+    # I/O state (raster IRQ enable interacts with $D019/$D01A, etc.) —
+    # writing it after the CIAs are settled produces the most consistent
+    # restore.  A caller wanting finer-grained ordering can split the
+    # restore by skipping fields and writing them manually.
+    if snap.cia1_regs:
+        transport.write_memory(0xDC00, snap.cia1_regs, override=override)
+    if snap.cia2_regs:
+        transport.write_memory(0xDD00, snap.cia2_regs, override=override)
+    if snap.sid_regs:
+        # SID writes go to the wire on both backends; on U64 the same
+        # call also primes the host-side sid_shadow via write_memory's
+        # built-in shadow update.
+        transport.write_memory(0xD400, snap.sid_regs, override=override)
+    if snap.vic_regs:
+        transport.write_memory(0xD000, snap.vic_regs, override=override)
 
     # Attached-drives sidecar.  Best-effort: warn (not raise) when the
     # target backend can't host a requested drive (e.g. devices 10/11
@@ -959,6 +1167,40 @@ def _iter_modules(data: bytes):
         body_len = mod_size - _MODULE_HEADER_LEN
         yield name, vmajor, vminor, body_start, body_len
         offset += mod_size
+
+
+def _patch_module_prefix(
+    template: bytes,
+    module_name: bytes,
+    offset: int,
+    payload: bytes,
+) -> bytes:
+    """Patch *payload* into a slice of *module_name*'s body in *template*.
+
+    Walks the .vsf modules, finds the one whose name matches
+    *module_name*, and overwrites bytes ``[offset : offset + len(payload)]``
+    of that module's body.  Module headers and all other modules are
+    preserved verbatim — the file's total length is unchanged.
+
+    Returns the patched ``.vsf`` bytes.  Raises
+    :class:`SnapshotFormatError` if the module is missing or its body
+    is too short to hold the slice.
+    """
+    if not payload:
+        return template
+    for name, _vmaj, _vmin, body_start, body_len in _iter_modules(template):
+        if name == module_name:
+            if body_len < offset + len(payload):
+                raise SnapshotFormatError(
+                    f"{module_name!r} body is {body_len} bytes; "
+                    f"cannot patch {len(payload)} bytes at offset {offset}"
+                )
+            patch_start = body_start + offset
+            patch_end = patch_start + len(payload)
+            return template[:patch_start] + payload + template[patch_end:]
+    raise SnapshotFormatError(
+        f"template has no {module_name!r} module to patch"
+    )
 
 
 def _replace_c64mem(template: bytes, new_body: bytes) -> bytes:
