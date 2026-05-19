@@ -252,6 +252,7 @@ from .bridge_ping import (
     run_ping_and_wait,
 )
 from .poll_until import poll_until_ready
+from .progress import ProgressEvent, ProgressEventKind, watch_progress
 from .tod_timer import (
     MAX_DEADLINE_TENTHS,
     build_tod_start_code,
@@ -525,6 +526,10 @@ __all__ = [
     "run_ping_and_wait",
     # Host-side wall-clock polling helper
     "poll_until_ready",
+    # Backend-agnostic live memory watcher (pexpect-for-DMA)
+    "ProgressEvent",
+    "ProgressEventKind",
+    "watch_progress",
     # CIA TOD-based 6502 timeouts (shippable networking applications)
     "MAX_DEADLINE_TENTHS",
     "build_tod_start_code",
