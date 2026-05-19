@@ -1,8 +1,26 @@
-"""Parallel test execution across multiple VICE instances.
+"""Parallel test execution across multiple backend instances.
 
-Provides ``run_parallel()`` to distribute tests across a pool of VICE
-instances managed by a ``ViceInstanceManager``, and ``ParallelTestResult``
-to collect and summarise the outcomes.
+Provides ``run_parallel()`` to distribute tests across a pool of test
+instances managed by any ``BackendManager`` (VICE, Ultimate 64, or the
+``UnifiedManager`` dispatch wrapper), and ``ParallelTestResult`` to
+collect and summarise the outcomes.
+
+Backwards compatibility
+-----------------------
+Historically ``run_parallel`` accepted only :class:`ViceInstanceManager`
+and passed a ``BinaryViceTransport`` to each test function.  The
+function now accepts any object satisfying the
+:class:`BackendManager` Protocol (``acquire``/``release``/``shutdown``).
+
+To keep existing VICE callers working without code changes, when the
+supplied manager is a :class:`ViceInstanceManager` the test callable
+still receives the ``BinaryViceTransport`` (i.e. ``instance.transport``).
+For all other managers — :class:`Ultimate64InstanceManager`,
+:class:`UnifiedManager`, custom backends — the test callable receives
+the acquired instance itself (e.g. :class:`TestTarget` for
+``UnifiedManager``, :class:`Ultimate64Instance` for the U64 manager).
+Both ``TestTarget`` and ``Ultimate64Instance`` expose ``.transport`` so
+the migration is one short line per test body.
 """
 
 from __future__ import annotations
@@ -10,15 +28,18 @@ from __future__ import annotations
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Any, Callable
 
-from .backends.vice_binary import BinaryViceTransport
 from .backends.vice_manager import ViceInstanceManager
 
 
 @dataclass
 class SingleTestResult:
-    """Outcome of one test function."""
+    """Outcome of one test function.
+
+    ``pid`` is the VICE OS PID when a VICE-backed instance ran the test,
+    and ``None`` for hardware backends (Ultimate 64 has no OS process).
+    """
 
     name: str
     passed: bool
@@ -62,19 +83,33 @@ class ParallelTestResult:
 
 
 def run_parallel(
-    manager: ViceInstanceManager,
-    tests: list[tuple[str, Callable[[BinaryViceTransport], tuple[bool, str]]]],
+    manager: Any,
+    tests: list[tuple[str, Callable[[Any], tuple[bool, str]]]],
     max_workers: int | None = None,
 ) -> ParallelTestResult:
-    """Run *tests* in parallel, each on its own VICE instance.
+    """Run *tests* in parallel, each on its own backend instance.
 
     Parameters
     ----------
     manager:
-        Instance manager to acquire/release VICE instances from.
+        Any object satisfying the
+        :class:`c64_test_harness.backends.unified_manager.BackendManager`
+        Protocol — i.e. exposes ``acquire()``, ``release(instance)``,
+        and ``shutdown()``.  In practice this is one of
+        :class:`ViceInstanceManager`,
+        :class:`Ultimate64InstanceManager`, or
+        :class:`UnifiedManager`.
     tests:
-        List of ``(name, test_fn)`` tuples. Each *test_fn* receives a
-        ``BinaryViceTransport`` and must return ``(passed, message)``.
+        List of ``(name, test_fn)`` tuples.  Each *test_fn* receives the
+        argument described below and must return ``(passed, message)``.
+
+        - When *manager* is a :class:`ViceInstanceManager`, *test_fn*
+          receives a ``BinaryViceTransport`` (backwards-compatible
+          behaviour).
+        - Otherwise *test_fn* receives the acquired instance itself
+          (e.g. ``TestTarget`` from ``UnifiedManager``, or
+          ``Ultimate64Instance`` from the U64 manager).  Both expose
+          ``.transport``.
     max_workers:
         Maximum concurrent tests. Defaults to ``len(tests)``.
 
@@ -86,26 +121,37 @@ def run_parallel(
     if max_workers is None:
         max_workers = len(tests)
 
+    # Backwards-compat: legacy VICE callers expect their test functions
+    # to receive a ``BinaryViceTransport`` directly.  Anything else gets
+    # the acquired instance (which exposes ``.transport`` for both U64
+    # and the unified ``TestTarget``).
+    unwrap_to_transport = isinstance(manager, ViceInstanceManager)
+
     result = ParallelTestResult()
     wall_start = time.monotonic()
 
-    def _run_one(name: str, fn: Callable[[BinaryViceTransport], tuple[bool, str]]) -> SingleTestResult:
+    def _run_one(
+        name: str,
+        fn: Callable[[Any], tuple[bool, str]],
+    ) -> SingleTestResult:
         t0 = time.monotonic()
         instance = manager.acquire()
-        vice_pid = instance.pid
+        # ``pid`` is optional on the Protocol; default to None if absent.
+        instance_pid = getattr(instance, "pid", None)
+        arg: Any = instance.transport if unwrap_to_transport else instance
         try:
-            passed, message = fn(instance.transport)
+            passed, message = fn(arg)
             return SingleTestResult(
                 name=name, passed=passed, message=message,
                 duration=time.monotonic() - t0,
-                pid=vice_pid,
+                pid=instance_pid,
             )
         except Exception as e:
             return SingleTestResult(
                 name=name, passed=False,
                 message=f"ERROR: {type(e).__name__}: {e}",
                 duration=time.monotonic() - t0,
-                pid=vice_pid,
+                pid=instance_pid,
             )
         finally:
             manager.release(instance)
