@@ -633,3 +633,120 @@ class TestProfile:
         t = _make_transport(text_monitor=False)
         with pytest.raises(TransportError, match="text monitor"):
             t.profile_start()
+
+
+# ---------------------------------------------------------------------------
+# set_speed / get_speed (protocol-level CPU speed control)
+# ---------------------------------------------------------------------------
+
+
+class TestSpeedProtocol:
+    """set_speed / get_speed delegate correctly to VICE warp."""
+
+    def test_set_speed_1_disables_warp(self) -> None:
+        t = _make_transport(text_monitor=True)
+        with patch.object(t, "set_warp") as mock_warp:
+            t.set_speed(1)
+        mock_warp.assert_called_once_with(False)
+
+    def test_set_speed_none_enables_warp(self) -> None:
+        t = _make_transport(text_monitor=True)
+        with patch.object(t, "set_warp") as mock_warp:
+            t.set_speed(None)
+        mock_warp.assert_called_once_with(True)
+
+    @pytest.mark.parametrize("mult", [2, 4, 8, 48])
+    def test_set_speed_other_int_raises_notimplemented(self, mult: int) -> None:
+        t = _make_transport(text_monitor=True)
+        with pytest.raises(NotImplementedError, match="VICE"):
+            t.set_speed(mult)
+
+    def test_get_speed_native(self) -> None:
+        t = _make_transport(text_monitor=True)
+        with patch.object(t, "get_warp", return_value=False):
+            assert t.get_speed() == 1
+
+    def test_get_speed_warp(self) -> None:
+        t = _make_transport(text_monitor=True)
+        with patch.object(t, "get_warp", return_value=True):
+            assert t.get_speed() is None
+
+
+# ---------------------------------------------------------------------------
+# reset(scope=...) — protocol-level dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestResetScope:
+    """reset(scope=...) sends the right CMD_RESET type byte."""
+
+    def test_reset_scope_cpu(self) -> None:
+        t = _make_transport()
+        with patch.object(t, "_send_and_recv", return_value=_empty_resp(CMD_RESET)) as mock_send:
+            t.reset("cpu")
+        assert mock_send.call_args[0][0] == CMD_RESET
+        assert mock_send.call_args[0][1] == bytes([0])
+
+    def test_reset_scope_machine(self) -> None:
+        t = _make_transport()
+        with patch.object(t, "_send_and_recv", return_value=_empty_resp(CMD_RESET)) as mock_send:
+            t.reset("machine")
+        assert mock_send.call_args[0][1] == bytes([1])
+
+    @pytest.mark.parametrize("idx,expected", [(0, 8), (1, 9), (2, 10), (3, 11)])
+    def test_reset_scope_drive(self, idx: int, expected: int) -> None:
+        t = _make_transport()
+        with patch.object(t, "_send_and_recv", return_value=_empty_resp(CMD_RESET)) as mock_send:
+            t.reset("drive", drive=idx)
+        assert mock_send.call_args[0][1] == bytes([expected])
+
+    def test_reset_scope_default_is_cpu(self) -> None:
+        t = _make_transport()
+        with patch.object(t, "_send_and_recv", return_value=_empty_resp(CMD_RESET)) as mock_send:
+            t.reset()
+        assert mock_send.call_args[0][1] == bytes([0])
+
+    def test_reset_scope_drive_missing_drive(self) -> None:
+        t = _make_transport()
+        with pytest.raises(ValueError, match="drive"):
+            t.reset("drive")
+
+    def test_reset_scope_drive_index_out_of_range(self) -> None:
+        t = _make_transport()
+        with pytest.raises(ValueError, match="0..3"):
+            t.reset("drive", drive=4)
+
+    def test_reset_scope_drive_string_value(self) -> None:
+        t = _make_transport()
+        with pytest.raises(ValueError, match="drive"):
+            t.reset("drive", drive="bogus")
+
+    def test_reset_scope_unknown(self) -> None:
+        t = _make_transport()
+        with pytest.raises(ValueError, match="scope"):
+            t.reset("everything")
+
+    def test_reset_bool_scope_refused(self) -> None:
+        # bool is an int subclass — make sure we don't silently coerce.
+        t = _make_transport()
+        with pytest.raises(ValueError, match="bool"):
+            t.reset(True)
+
+    # Backwards-compat: the legacy reset_type kwarg / positional int still works.
+
+    def test_reset_legacy_kwarg(self) -> None:
+        t = _make_transport()
+        with patch.object(t, "_send_and_recv", return_value=_empty_resp(CMD_RESET)) as mock_send:
+            t.reset(reset_type=1)
+        assert mock_send.call_args[0][1] == bytes([1])
+
+    def test_reset_legacy_positional_int(self) -> None:
+        t = _make_transport()
+        with patch.object(t, "_send_and_recv", return_value=_empty_resp(CMD_RESET)) as mock_send:
+            t.reset(9)
+        assert mock_send.call_args[0][1] == bytes([9])
+
+    def test_reset_legacy_kwarg_invalid_still_raises(self) -> None:
+        t = _make_transport()
+        with pytest.raises(ValueError, match="reset_type"):
+            t.reset(reset_type=2)

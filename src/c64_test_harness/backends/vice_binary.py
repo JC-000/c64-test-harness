@@ -774,6 +774,33 @@ class BinaryViceTransport:
         body += bytes([len(value_bytes)]) + value_bytes
         self._send_and_recv(CMD_RESOURCE_SET, body)
 
+    # ----- protocol: speed control ------------------------------------------
+
+    def set_speed(self, multiplier: int | None) -> None:
+        """Backend-agnostic CPU-speed control on VICE.
+
+        ``multiplier=1`` maps to ``set_warp(False)`` (native 1 MHz).
+        ``multiplier=None`` maps to ``set_warp(True)`` (run as fast as
+        possible).  VICE has no discrete CPU-speed multipliers
+        comparable to the U64 turbo enum, so any other integer raises
+        ``NotImplementedError`` to keep the backend asymmetry explicit.
+        """
+        if multiplier is None:
+            self.set_warp(True)
+            return
+        if multiplier == 1:
+            self.set_warp(False)
+            return
+        raise NotImplementedError(
+            "VICE has no discrete CPU-speed multipliers; only "
+            "multiplier=1 (warp off) and multiplier=None (warp on) "
+            f"are supported on this backend, got {multiplier!r}"
+        )
+
+    def get_speed(self) -> int | None:
+        """Return ``1`` when VICE is at native speed, ``None`` when warp is on."""
+        return None if self.get_warp() else 1
+
     def set_warp(self, enabled: bool) -> None:
         """Enable or disable VICE warp mode at runtime.
 
@@ -965,13 +992,68 @@ class BinaryViceTransport:
 
     # ----- reset -----
 
-    def reset(self, reset_type: int = 0) -> None:
-        """Reset the machine. type 0=soft, 1=hard, 8..11=drive 0..3."""
-        if reset_type not in (0, 1, 8, 9, 10, 11):
+    def reset(
+        self,
+        scope: "str | int" = "cpu",
+        *,
+        drive: "str | int | None" = None,
+        reset_type: int | None = None,
+    ) -> None:
+        """Reset the machine.
+
+        Backend-agnostic form (preferred):
+
+        * ``reset("cpu")`` — soft 6510 reset (CMD_RESET type 0).
+        * ``reset("machine")`` — hard reset (CMD_RESET type 1).
+        * ``reset("drive", drive=N)`` — reset drive ``N`` (0..3),
+          mapped to CMD_RESET type 8..11.
+
+        Legacy backend-specific form (kept for backwards compat with
+        callers written against the original VICE-only signature):
+
+        * ``reset(0)`` / ``reset(1)`` / ``reset(8..11)`` — raw type
+          byte passed straight to CMD_RESET.
+        * ``reset(reset_type=N)`` — same, by kwarg.
+
+        Any other ``scope`` value or invalid ``drive`` raises ``ValueError``.
+        """
+        # Legacy keyword-int path takes priority.
+        if reset_type is not None:
+            rt = reset_type
+        elif isinstance(scope, bool):
+            # bool is an int subclass — refuse to silently coerce.
+            raise ValueError(f"scope must be str or int, got bool {scope!r}")
+        elif isinstance(scope, int):
+            rt = scope
+        elif scope == "cpu":
+            rt = 0
+        elif scope == "machine":
+            rt = 1
+        elif scope == "drive":
+            if drive is None:
+                raise ValueError(
+                    "reset(scope='drive') requires drive=<index> (0..3)"
+                )
+            try:
+                idx = int(drive)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"drive must be coercible to int 0..3; got {drive!r}"
+                ) from exc
+            if idx not in (0, 1, 2, 3):
+                raise ValueError(
+                    f"drive index must be 0..3 (VICE drives 8..11); got {idx}"
+                )
+            rt = 8 + idx
+        else:
             raise ValueError(
-                f"reset_type must be 0,1,8,9,10,11; got {reset_type}"
+                f"scope must be 'cpu', 'machine', or 'drive'; got {scope!r}"
             )
-        self._send_and_recv(CMD_RESET, bytes([reset_type]))
+        if rt not in (0, 1, 8, 9, 10, 11):
+            raise ValueError(
+                f"reset_type must be 0,1,8,9,10,11; got {rt}"
+            )
+        self._send_and_recv(CMD_RESET, bytes([rt]))
 
     # ----- text-monitor extras -----
 

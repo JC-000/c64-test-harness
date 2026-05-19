@@ -103,6 +103,51 @@ class C64Transport(Protocol):
         """Resume execution (exit monitor / un-pause)."""
         ...
 
+    def set_speed(self, multiplier: int | None) -> None:
+        """Set the host-side CPU-speed multiplier.
+
+        Backend-agnostic CPU-speed control.  Semantics:
+
+        * ``multiplier=1`` — run at native 1 MHz (warp off on VICE,
+          turbo off on U64).
+        * ``multiplier=2|4|8|...`` — run at the requested discrete
+          multiplier where the backend supports it (U64 turbo enums).
+          Backends that do not support discrete speeds raise
+          ``NotImplementedError`` for these values.
+        * ``multiplier=None`` — run at the backend's max available
+          speed (warp on VICE, max turbo on U64).
+
+        :raises NotImplementedError: backend cannot honour the request.
+        :raises ValueError: integer is not in the backend's supported set.
+        """
+        ...
+
+    def get_speed(self) -> int | None:
+        """Return the current CPU-speed multiplier.
+
+        Returns ``1`` when the backend is running at native 1× speed.
+        Returns the integer multiplier when running at a known turbo
+        step.  Returns ``None`` when the backend is running faster
+        than native but the exact multiplier is not known (e.g. VICE
+        warp mode, which is "run as fast as possible").
+        """
+        ...
+
+    def reset(self, scope: str = "cpu", *, drive: str | int | None = None) -> None:
+        """Reset the machine.  ``scope`` selects which part:
+
+        * ``"cpu"`` — soft 6510-only reset.  VICE ``reset(type=0)``,
+          U64 ``client.reset()``.
+        * ``"machine"`` — full machine reset including FPGA-equivalent
+          state.  VICE ``reset(type=1)``, U64 ``client.reboot()``.
+        * ``"drive"`` — per-drive reset.  ``drive`` is required; on
+          VICE it is a 0..3 index (mapped to VICE drive 8..11), on
+          U64 it is the slot string ``"a"`` or ``"b"``.
+
+        :raises ValueError: unknown scope or missing/invalid ``drive``.
+        """
+        ...
+
     def close(self) -> None:
         """Release resources / close connection."""
         ...
