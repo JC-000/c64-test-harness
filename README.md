@@ -571,6 +571,10 @@ The Ultimate 64 has two reset modes:
 - **`reset(client)`** — Soft C64 reset (6510 CPU only). Fast, but does NOT reinitialize the FPGA or DMA controllers.
 - **`reboot(client)`** — Full device reboot. Reinitializes the entire FPGA including DMA controllers and REU. Takes ~8 seconds. **Required when switching turbo speeds between REU-heavy workloads** — stale DMA state from a prior turbo speed causes hangs after a soft reset.
 
+### Recovery and wedge diagnosis
+
+The U64 firmware has three independent wedge tiers (REST/writemem, runner subsystem, UCI STATE bits) and a separate probe + recovery primitive for each. Mis-diagnosing the tier — e.g. calling `recover()` for a UCI wedge — is the most common failure mode, because `recover()`'s liveness check is REST-only. See [docs/u64_recovery.md](docs/u64_recovery.md) for the diagnosis flow, the tier-to-recovery-primitive mapping, and the confirmed cases where physical power-cycle is the only option.
+
 ### DMA Trampoline Pattern (executing code without jsr)
 
 Since the U64 has no CPU register control, use DMA writes to inject and trigger code:
