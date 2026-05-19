@@ -107,6 +107,7 @@ if TYPE_CHECKING:
     from .transport import C64Transport
 
 __all__ = [
+    "CpuRegisters",
     "DriveState",
     "Snapshot",
     "SnapshotFormatError",
@@ -232,6 +233,27 @@ _REGISTER_MODULE_SLICES: tuple[tuple[bytes, int, int], ...] = (
 )
 
 
+# MAINCPU module register-block layout, empirically derived from the
+# bundled VICE 3.10 template (vmajor=1, vminor=4):
+#
+#   bytes  0..3  clock counter low DWORD
+#   bytes  4..7  additional clock / reserved (treated opaquely; preserved verbatim)
+#   byte   8     A
+#   byte   9     X
+#   byte   10    Y
+#   byte   11    SP
+#   bytes  12..13  PC (little-endian)
+#   byte   14    P (processor status flags)
+#   bytes  15..   last opcode info + remaining CPU state (preserved verbatim)
+#
+# The cross-check is that for the template (captured at the BASIC READY
+# prompt) the bytes at offset 8..14 decode to A=0,X=0,Y=$0A,SP=$F3,
+# PC=$E5D1 (BASIC main input loop), P=$22 (Z+unused) — see the offline
+# round-trip test.
+_MAINCPU_MODULE_NAME = b"MAINCPU"
+_MAINCPU_REG_OFFSET = 8  # byte offset of A within the module body
+
+
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
@@ -239,6 +261,51 @@ _REGISTER_MODULE_SLICES: tuple[tuple[bytes, int, int], ...] = (
 
 class SnapshotFormatError(ValueError):
     """The .vsf bytes are malformed or not a recognised snapshot."""
+
+
+# ---------------------------------------------------------------------------
+# CpuRegisters — 6510 register state — Phase D
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CpuRegisters:
+    """6510 CPU register state captured in / restored from a snapshot.
+
+    Attributes
+    ----------
+    pc:
+        Program counter — 16-bit address ``0..0xFFFF``.
+    a, x, y:
+        Accumulator and the two index registers — 8-bit ``0..0xFF``.
+    sp:
+        Stack pointer — 8-bit ``0..0xFF`` (it actually addresses
+        ``$0100 + sp`` on the hardware, but the register itself is one
+        byte).
+    p:
+        Processor status flags — 8-bit ``0..0xFF`` (bit 7 = N, bit 6 = V,
+        bit 5 = unused/always-1, bit 4 = B, bit 3 = D, bit 2 = I,
+        bit 1 = Z, bit 0 = C).
+    """
+
+    pc: int
+    a: int
+    x: int
+    y: int
+    sp: int
+    p: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pc, int) or not 0 <= self.pc <= 0xFFFF:
+            raise ValueError(
+                f"pc must be a 16-bit int 0..65535, got {self.pc!r}"
+            )
+        for name in ("a", "x", "y", "sp", "p"):
+            v = getattr(self, name)
+            if not isinstance(v, int) or not 0 <= v <= 0xFF:
+                raise ValueError(
+                    f"{name} must be an 8-bit int 0..255, got {v!r}"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +453,7 @@ class Snapshot:
     # exactly that many bytes.
     reu_size_bytes: int = 0
     reu_contents: bytes = b""
+    cpu_registers: CpuRegisters | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.ram, (bytes, bytearray)):
@@ -420,6 +488,14 @@ class Snapshot:
                     f"duplicate DriveState for device {d.device}"
                 )
             seen.add(d.device)
+        # cpu_registers is optional; when present it must be a CpuRegisters.
+        if self.cpu_registers is not None and not isinstance(
+            self.cpu_registers, CpuRegisters
+        ):
+            raise TypeError(
+                "cpu_registers must be a CpuRegisters or None, got "
+                f"{type(self.cpu_registers).__name__}"
+            )
 
         # I/O register banks — each is either empty (not captured) or
         # exactly the expected length.  Normalise bytearray → bytes.
@@ -499,6 +575,11 @@ class Snapshot:
         block in the module preamble is sourced from this snapshot's
         RAM image (those addresses are memory-mapped) when REU appears
         enabled, otherwise a captured idle-state preamble is used.
+        When ``cpu_registers`` is set, the MAINCPU module is patched
+        in-place: only the register block (A, X, Y, SP, PC, P at body
+        offset 8..14) is rewritten; clock counter and last-opcode info
+        are preserved from the template so VICE's internal CPU state
+        stays self-consistent.
         """
         if template is None:
             template = _load_template()
@@ -519,6 +600,10 @@ class Snapshot:
                 reu_contents=self.reu_contents,
                 control_regs=self._reu_control_regs(),
             )
+        # Patch MAINCPU when cpu_registers is set — only the register
+        # block is touched; clock counter and trailing state are preserved.
+        if self.cpu_registers is not None:
+            out = _patch_maincpu_registers(out, self.cpu_registers)
         return out
 
     def _regs_for_module(self, module_name: bytes) -> bytes:
@@ -535,12 +620,14 @@ class Snapshot:
 
     @classmethod
     def from_vsf(cls, data: bytes) -> Snapshot:
-        """Parse a ``.vsf`` and extract RAM + CPU port + I/O regs + REU.
+        """Parse a ``.vsf`` and extract RAM + CPU port + I/O regs + REU + CPU regs.
 
         Walks the module list once, picks up ``C64MEM`` (required), the
         four I/O register modules (CIA1 / CIA2 / VIC-II / SID —
         best-effort: missing or shorter modules leave the corresponding
-        field empty), and an optional ``REU1764`` module.
+        field empty), an optional ``REU1764`` module, and the
+        ``MAINCPU`` register block when present (missing MAINCPU →
+        ``cpu_registers=None``).
 
         If a ``REU1764`` module is present its body is also parsed: the
         size is taken from the preamble's first 24-bit LE field
@@ -555,6 +642,7 @@ class Snapshot:
         regs: dict[bytes, bytes] = {}
         reu_size_bytes = 0
         reu_contents = b""
+        cpu_regs: CpuRegisters | None = None
         slice_by_name = {
             name: (off, length) for name, off, length in _REGISTER_MODULE_SLICES
         }
@@ -583,6 +671,19 @@ class Snapshot:
                 reu_size_bytes, reu_contents = _parse_reu_module(
                     data[body_start : body_start + body_len]
                 )
+            elif name == _MAINCPU_MODULE_NAME:
+                needed = _MAINCPU_REG_OFFSET + 7
+                if body_len >= needed:
+                    rb = data[body_start + _MAINCPU_REG_OFFSET :
+                              body_start + _MAINCPU_REG_OFFSET + 7]
+                    cpu_regs = CpuRegisters(
+                        a=rb[0],
+                        x=rb[1],
+                        y=rb[2],
+                        sp=rb[3],
+                        pc=rb[4] | (rb[5] << 8),
+                        p=rb[6],
+                    )
         if c64mem_fields is None:
             raise SnapshotFormatError("no C64MEM module found in snapshot")
         return cls(
@@ -593,6 +694,7 @@ class Snapshot:
             sid_regs=regs.get(b"SID", b""),
             reu_size_bytes=reu_size_bytes,
             reu_contents=reu_contents,
+            cpu_registers=cpu_regs,
         )
 
     # ------------------------------------------------------------------
@@ -661,6 +763,15 @@ class Snapshot:
         ):
             if payload:
                 manifest[key] = payload.hex()
+        if self.cpu_registers is not None:
+            manifest["cpu_registers"] = {
+                "pc": self.cpu_registers.pc,
+                "a": self.cpu_registers.a,
+                "x": self.cpu_registers.x,
+                "y": self.cpu_registers.y,
+                "sp": self.cpu_registers.sp,
+                "p": self.cpu_registers.p,
+            }
         (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
         return out
 
@@ -755,6 +866,28 @@ class Snapshot:
                     f"manifest reu_size_bytes={reu_size_bytes} but no "
                     "reu.bin sidecar and the .vsf carries no REU bytes"
                 )
+        cpu_registers: CpuRegisters | None = None
+        regs_entry = manifest.get("cpu_registers")
+        if isinstance(regs_entry, dict):
+            try:
+                cpu_registers = CpuRegisters(
+                    pc=int(regs_entry["pc"]),
+                    a=int(regs_entry["a"]),
+                    x=int(regs_entry["x"]),
+                    y=int(regs_entry["y"]),
+                    sp=int(regs_entry["sp"]),
+                    p=int(regs_entry["p"]),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise SnapshotFormatError(
+                    f"manifest.cpu_registers malformed: {exc}"
+                ) from exc
+        elif base.cpu_registers is not None:
+            # The bundled .vsf carried a MAINCPU register block.  Prefer
+            # the explicit manifest entry when present, otherwise inherit
+            # from the .vsf so a bundle without an explicit registers
+            # entry still round-trips correctly.
+            cpu_registers = base.cpu_registers
 
         return cls(
             ram=base.ram,
@@ -769,6 +902,7 @@ class Snapshot:
             sid_regs=_hex_field("sid_regs", base.sid_regs),
             reu_size_bytes=reu_size_bytes,
             reu_contents=reu_contents,
+            cpu_registers=cpu_registers,
         )
 
     # ------------------------------------------------------------------
@@ -805,6 +939,125 @@ class Snapshot:
 
 
 # ---------------------------------------------------------------------------
+# CPU-register snoop / restore — Phase D 6510 routines
+# ---------------------------------------------------------------------------
+#
+# Both routines live at the harness scratch base $0334 in the cassette-buffer
+# region ($0334-$03FB).  The snoop reserves $0350-$0354 for the readback
+# buffer (5 bytes: A, X, Y, P, SP); the routine itself uses $0334-$0346
+# (19 bytes).  The restorer fits in $0334-$0343 (16 bytes) — no readback
+# buffer needed.
+
+_SNOOP_ADDR = 0x0334
+_SNOOP_SAVE_ADDR = 0x0350         # A, X, Y, P, SP — 5 bytes
+_SNOOP_LENGTH = 19                # the snoop routine itself
+_RESTORE_ADDR = 0x0334
+_RESTORE_LENGTH = 16
+
+
+def _build_snoop_routine(save_addr: int = _SNOOP_SAVE_ADDR) -> bytes:
+    """Return the 19-byte snoop routine that records A, X, Y, P, SP.
+
+    Layout when ``save_addr == $0350`` (the default) — assembled at
+    :data:`_SNOOP_ADDR` (``$0334``):
+
+    ::
+
+        $0334  8D 50 03   STA $0350     ; save A first (before PHP/PLA clobbers it)
+        $0337  8E 51 03   STX $0351     ; save X
+        $033A  8C 52 03   STY $0352     ; save Y
+        $033D  08         PHP           ; push P onto stack (SP -= 1)
+        $033E  68         PLA           ; pop P-byte into A    (SP += 1, net SP unchanged)
+        $033F  8D 53 03   STA $0353     ; save P
+        $0342  BA         TSX           ; X <- SP (the SP we want — see below)
+        $0343  8E 54 03   STX $0354     ; save SP
+        $0346  60         RTS           ; return to caller
+
+    PHP/PLA SP arithmetic — PHP decrements SP by 1 (after the cycle that
+    stores P at $0100+SP), PLA increments SP by 1 (before the cycle that
+    reads from $0100+SP).  Net effect on SP is zero.  Therefore the TSX
+    at $0342 captures the same SP value the caller had when they entered
+    the snoop — exactly what we want in the snapshot.
+
+    Caveat: the caller's A, X, and Y are saved before any other side
+    effect; P is captured via PHP, which reflects the flags as of the
+    STA/STX/STY (none of those touch the flags except the bus cycle so P
+    is unchanged from caller-entry).  Specifically, none of STA, STX,
+    STY, PHP, PLA modify N or Z based on the operand — they're all
+    flag-neutral except PLP — so the captured P is the caller-entry P.
+    """
+    lo_a = save_addr & 0xFF
+    hi_a = (save_addr >> 8) & 0xFF
+    lo_x = (save_addr + 1) & 0xFF
+    hi_x = ((save_addr + 1) >> 8) & 0xFF
+    lo_y = (save_addr + 2) & 0xFF
+    hi_y = ((save_addr + 2) >> 8) & 0xFF
+    lo_p = (save_addr + 3) & 0xFF
+    hi_p = ((save_addr + 3) >> 8) & 0xFF
+    lo_s = (save_addr + 4) & 0xFF
+    hi_s = ((save_addr + 4) >> 8) & 0xFF
+    return bytes([
+        0x8D, lo_a, hi_a,   # STA save+0
+        0x8E, lo_x, hi_x,   # STX save+1
+        0x8C, lo_y, hi_y,   # STY save+2
+        0x08,               # PHP
+        0x68,               # PLA
+        0x8D, lo_p, hi_p,   # STA save+3
+        0xBA,               # TSX
+        0x8E, lo_s, hi_s,   # STX save+4
+        0x60,               # RTS
+    ])
+
+
+def _build_restore_routine(regs: CpuRegisters) -> bytes:
+    """Return the 16-byte restorer that pokes registers and jumps to PC.
+
+    Layout (assembled at :data:`_RESTORE_ADDR`):
+
+    ::
+
+        $0334  A2 SP      LDX #SP_VAL       ; load target SP into X
+        $0336  9A         TXS               ; SP <- X
+        $0337  A9 P       LDA #P_VAL        ; load target P into A
+        $0339  48         PHA               ; push P_VAL onto stack (SP -= 1)
+        $033A  A2 X       LDX #X_VAL        ; restore X (overwrites the SP we used)
+        $033C  A0 Y       LDY #Y_VAL        ; restore Y
+        $033E  A9 A       LDA #A_VAL        ; restore A
+        $0340  28         PLP               ; pop P from stack (SP += 1, P_VAL -> P)
+        $0341  4C lo hi   JMP PC_VAL        ; jump to target PC
+
+    After the LDA #A_VAL the registers other than P are at their target
+    values; PLP then restores P (so any flag changes from the loads are
+    overwritten) and PLP increments SP back to the target SP.  JMP doesn't
+    touch any register or flag — the dispatched code starts with exactly
+    the requested machine state.
+
+    Stack arithmetic: TXS sets SP to SP_VAL; PHA decrements to SP_VAL-1
+    (stores P at $0100 + SP_VAL - 1); PLP reads from $0100 + SP_VAL and
+    increments SP back to SP_VAL.  Net effect: SP is the requested
+    SP_VAL when JMP executes.  The byte at $0100 + SP_VAL - 1 was
+    temporarily clobbered, but the target program treats that as below
+    the stack pointer (free space) anyway.
+
+    PLP-followed-by-JMP is intentional — there's a NMOS 6502 quirk where
+    a pending IRQ is recognised on the cycle following PLP, but for
+    snapshot restore that's the same behaviour the saved program would
+    have seen at its own next instruction.
+    """
+    return bytes([
+        0xA2, regs.sp,            # LDX #SP_VAL
+        0x9A,                     # TXS
+        0xA9, regs.p,             # LDA #P_VAL
+        0x48,                     # PHA
+        0xA2, regs.x,             # LDX #X_VAL
+        0xA0, regs.y,             # LDY #Y_VAL
+        0xA9, regs.a,             # LDA #A_VAL
+        0x28,                     # PLP
+        0x4C, regs.pc & 0xFF, (regs.pc >> 8) & 0xFF,  # JMP PC_VAL
+    ])
+
+
+# ---------------------------------------------------------------------------
 # Public functions
 # ---------------------------------------------------------------------------
 
@@ -816,6 +1069,8 @@ def extract_snapshot(
     include_registers: bool = True,
     include_reu: bool = False,
     reu_turbo: bool = False,
+    include_cpu_registers: bool = True,
+    known_pc: int | None = None,
 ) -> Snapshot:
     """Read RAM + CPU port out of any ``C64Transport``-conforming backend.
 
@@ -844,6 +1099,23 @@ def extract_snapshot(
         otherwise (VICE — which returns last-written values).  Set to
         ``False`` to emit a Phase A / Phase B-disk-only snapshot with
         the four register fields left empty.
+    include_cpu_registers:
+        When ``True`` (the default) also capture A, X, Y, SP, PC, P into
+        :attr:`Snapshot.cpu_registers`.  On VICE this uses the binary
+        monitor's :meth:`read_registers` directly.  On Ultimate 64 this
+        sideloads a small snoop routine at ``$0334`` (see
+        :func:`_build_snoop_routine`), triggers it, and reads the saved
+        register block back out of ``$0350-$0354``.  Set ``False`` to
+        skip the snoop (e.g. when the device is in a state where running
+        the snoop would interfere with the test).
+    known_pc:
+        Optional caller-supplied PC.  Ignored on VICE (the monitor knows
+        the running PC).  On Ultimate 64 the REST API has no way to
+        read back an arbitrary running PC, so the captured PC is set
+        either to *known_pc* (preferred — caller passes the address
+        their last ``SYS``/JSR landed at) or, when ``None``, to the
+        snoop's own entry address :data:`_SNOOP_ADDR`.  See
+        :func:`_extract_cpu_registers_u64` for the full discussion.
 
     The drive-discovery side path is best-effort: on backends that don't
     expose any drive state at all the snapshot comes back with
@@ -892,6 +1164,11 @@ def extract_snapshot(
         reu_size_bytes, reu_contents = _extract_reu(
             transport, reu_turbo=reu_turbo,
         )
+    cpu_registers: CpuRegisters | None = None
+    if include_cpu_registers:
+        cpu_registers = _extract_cpu_registers(
+            transport, known_pc=known_pc,
+        )
     # CPU port registers are at $00 (direction) and $01 (data) — already
     # included in the RAM read, but we mirror them into the dedicated
     # fields so the Snapshot is self-describing.
@@ -906,6 +1183,7 @@ def extract_snapshot(
         sid_regs=sid_regs,
         reu_size_bytes=reu_size_bytes,
         reu_contents=reu_contents,
+        cpu_registers=cpu_registers,
     )
 
 
@@ -978,6 +1256,200 @@ def restore_snapshot(
     # REU module via undump.  Empty REU → nothing to do.
     if snap.reu_contents:
         _restore_reu(transport, snap)
+    # CPU registers — must happen LAST.  The U64 path triggers via
+    # BASIC SYS, which would otherwise be clobbered by the RAM bulk
+    # write above.  On VICE the order doesn't matter for correctness,
+    # but matching the U64 ordering keeps the two paths identical.
+    if snap.cpu_registers is not None:
+        _restore_cpu_registers(transport, snap.cpu_registers)
+
+
+# ---------------------------------------------------------------------------
+# CPU-register extract/restore — per-backend helpers
+# ---------------------------------------------------------------------------
+
+
+def _extract_cpu_registers(
+    transport: "C64Transport",
+    *,
+    known_pc: int | None,
+) -> CpuRegisters | None:
+    """Dispatch to the right per-backend register collector.
+
+    Backend selection is by duck-typing: a U64 transport exposes a
+    ``client`` attribute with ``run_prg`` / ``send_text``; a VICE binary
+    transport exposes ``read_registers`` returning the running register
+    values.  Returns ``None`` on truly unknown transports rather than
+    failing — the snapshot field is optional.
+    """
+    if hasattr(transport, "client") and hasattr(transport.client, "run_prg"):
+        return _extract_cpu_registers_u64(transport, known_pc=known_pc)
+    if hasattr(transport, "read_registers"):
+        try:
+            regs = transport.read_registers()
+        except NotImplementedError:
+            # U64 transport raises NotImplementedError here; but the
+            # branch above should have caught it.  Belt-and-braces.
+            return None
+        except Exception as exc:  # noqa: BLE001
+            _log.warning(
+                "read_registers() failed on %s: %s — emitting "
+                "cpu_registers=None", type(transport).__name__, exc,
+            )
+            return None
+        return _build_cpu_registers_from_dict(regs)
+    return None
+
+
+def _build_cpu_registers_from_dict(
+    regs: dict[str, int],
+) -> CpuRegisters | None:
+    """Coerce a VICE-binary-monitor register dict to :class:`CpuRegisters`.
+
+    The dict is expected to carry keys ``PC``, ``A``, ``X``, ``Y``, ``SP``
+    plus one of ``P`` / ``FL`` / ``STATUS`` for the flags register
+    (different VICE builds expose it under different names).  Missing
+    keys cause this helper to return ``None``.
+    """
+    norm = {k.upper(): v for k, v in regs.items()}
+    flags_key = next(
+        (k for k in ("P", "FL", "STATUS", "PS") if k in norm),
+        None,
+    )
+    try:
+        return CpuRegisters(
+            pc=norm["PC"] & 0xFFFF,
+            a=norm["A"] & 0xFF,
+            x=norm["X"] & 0xFF,
+            y=norm["Y"] & 0xFF,
+            sp=norm["SP"] & 0xFF,
+            p=(norm[flags_key] & 0xFF) if flags_key is not None else 0x20,
+        )
+    except KeyError as exc:
+        _log.warning(
+            "register dict missing key %s — emitting cpu_registers=None "
+            "(present keys: %s)", exc, sorted(norm),
+        )
+        return None
+
+
+def _extract_cpu_registers_u64(
+    transport: "C64Transport",
+    *,
+    known_pc: int | None,
+) -> CpuRegisters | None:
+    """Snoop A, X, Y, SP, P via a sideloaded routine and read it back.
+
+    Sequence:
+
+    1. Save the 19 bytes currently at ``$0334-$0346`` and the 5 bytes
+       at ``$0350-$0354`` so we can restore the cassette buffer after
+       the snoop fires.
+    2. Write the snoop routine to ``$0334`` (with
+       ``override="snapshot-snoop"`` so the call goes through the
+       harness's MemoryPolicy).
+    3. Trigger the snoop via ``client.send_text("SYS 820")`` — BASIC's
+       JSR pushes a return PC and lands at ``$0334``.  The RTS at the
+       tail brings BASIC back to the READY prompt cleanly.
+    4. Read ``$0350-$0354`` to recover A, X, Y, P, SP.
+    5. Restore the original 19 + 5 bytes.
+
+    PC handling — see :func:`extract_snapshot` for the design discussion.
+    """
+    client = transport.client  # type: ignore[attr-defined]
+    if not hasattr(client, "send_text"):
+        _log.warning(
+            "U64 client lacks send_text(); skipping CPU-register snoop",
+        )
+        return None
+    # 1. Save what's currently there.
+    routine_save = transport.read_memory(_SNOOP_ADDR, _SNOOP_LENGTH)
+    regs_buf_save = transport.read_memory(_SNOOP_SAVE_ADDR, 5)
+    # 2. Sideload the snoop routine.
+    snoop = _build_snoop_routine()
+    transport.write_memory(_SNOOP_ADDR, snoop, override="snapshot-snoop")
+    # 3. Trigger.  Convert _SNOOP_ADDR to decimal for BASIC.
+    try:
+        client.send_text(f"SYS {_SNOOP_ADDR}", finish_with_return=True)
+    except TypeError:
+        # Older send_text signatures don't accept finish_with_return.
+        client.send_text(f"SYS {_SNOOP_ADDR}\r")
+    # 4. Read back A, X, Y, P, SP.
+    rb = transport.read_memory(_SNOOP_SAVE_ADDR, 5)
+    if len(rb) != 5:
+        raise RuntimeError(
+            f"read_memory({_SNOOP_SAVE_ADDR:#04x}, 5) returned {len(rb)} bytes"
+        )
+    # 5. Restore original bytes (best effort — log if the restore fails).
+    try:
+        transport.write_memory(
+            _SNOOP_ADDR, routine_save, override="snapshot-snoop",
+        )
+        transport.write_memory(
+            _SNOOP_SAVE_ADDR, regs_buf_save, override="snapshot-snoop",
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log.warning(
+            "post-snoop restore of $%04X..$%04X failed: %s",
+            _SNOOP_ADDR, _SNOOP_SAVE_ADDR + 4, exc,
+        )
+    a, x, y, p, sp = rb[0], rb[1], rb[2], rb[3], rb[4]
+    pc = known_pc if known_pc is not None else _SNOOP_ADDR
+    return CpuRegisters(pc=pc, a=a, x=x, y=y, sp=sp, p=p)
+
+
+def _restore_cpu_registers(
+    transport: "C64Transport",
+    regs: CpuRegisters,
+) -> None:
+    """Push *regs* into the live machine via the right per-backend path.
+
+    On VICE, calls :meth:`set_registers` directly.  On U64, sideloads a
+    16-byte restorer at ``$0334`` and triggers it via BASIC ``SYS``.
+    """
+    if hasattr(transport, "client") and hasattr(transport.client, "run_prg"):
+        _restore_cpu_registers_u64(transport, regs)
+        return
+    set_regs = getattr(transport, "set_registers", None)
+    if set_regs is None:
+        _log.warning(
+            "transport %r has no set_registers; skipping CPU-register restore",
+            type(transport).__name__,
+        )
+        return
+    set_regs({
+        "PC": regs.pc,
+        "A": regs.a,
+        "X": regs.x,
+        "Y": regs.y,
+        "SP": regs.sp,
+        "FL": regs.p,
+    })
+
+
+def _restore_cpu_registers_u64(
+    transport: "C64Transport",
+    regs: CpuRegisters,
+) -> None:
+    """Sideload the restorer routine at ``$0334`` and trigger via BASIC.
+
+    See :func:`_build_restore_routine` for the byte layout.
+    """
+    routine = _build_restore_routine(regs)
+    transport.write_memory(
+        _RESTORE_ADDR, routine, override="snapshot-restore",
+    )
+    client = transport.client  # type: ignore[attr-defined]
+    if not hasattr(client, "send_text"):
+        _log.warning(
+            "U64 client lacks send_text(); cannot trigger restorer at $%04X",
+            _RESTORE_ADDR,
+        )
+        return
+    try:
+        client.send_text(f"SYS {_RESTORE_ADDR}", finish_with_return=True)
+    except TypeError:
+        client.send_text(f"SYS {_RESTORE_ADDR}\r")
 
 
 # ---------------------------------------------------------------------------
@@ -1858,6 +2330,29 @@ def _inject_reu_module(
         start, end = existing_reu_span
         return vsf_bytes[:start] + reu_module + vsf_bytes[end:]
     return vsf_bytes[:c64mem_end] + reu_module + vsf_bytes[c64mem_end:]
+
+
+def _patch_maincpu_registers(template: bytes, regs: CpuRegisters) -> bytes:
+    """Patch the MAINCPU module's register block with *regs*.
+
+    Only the 7-byte register block (A, X, Y, SP, PC_lo, PC_hi, P) at
+    body-relative offset :data:`_MAINCPU_REG_OFFSET` is rewritten — clock
+    counter, last-opcode info, and trailing CPU state are preserved
+    verbatim from the template.
+    """
+    rb = bytes([
+        regs.a,
+        regs.x,
+        regs.y,
+        regs.sp,
+        regs.pc & 0xFF,
+        (regs.pc >> 8) & 0xFF,
+        regs.p,
+    ])
+    return _patch_module_prefix(
+        template, _MAINCPU_MODULE_NAME, _MAINCPU_REG_OFFSET, rb,
+    )
+
 
 
 def _replace_c64mem(template: bytes, new_body: bytes) -> bytes:
