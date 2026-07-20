@@ -577,6 +577,26 @@ The U64 has NO CPU control (no `jsr()`, no registers, no breakpoints). To execut
 
 **All U64 access must use DeviceLock** for cross-process safety. Use `UnifiedManager` (automatic) or wrap with `DeviceLock` in pytest fixtures.
 
+### Two device generations — detect via `get_info()`, don't assume
+
+There are two hardware generations with real behavioral differences. Detect with `client.get_info()["product"]`: `"Ultimate 64 Elite"` (fw 3.14) vs `"C64 Ultimate"` (fw 1.1.0). Never hardcode one generation's behavior; on an unrecognized product, skip with the observed payload rather than guessing. Known asymmetries (each live-verified):
+
+- **CPU-speed enum**: Elite has `" 5"` but not `"64"`; C64U has `"64"` but not `" 5"`. The harness schema is the cross-generation superset — a foreign speed passes local validation and is firmware-rejected with HTTP 400 *before* Turbo Control is enabled (`set_turbo_mhz` writes CPU Speed first, on purpose). Contract test: `tests/test_turbo_contract_live.py` (`TURBO_CONTRACT_LIVE=1` gate).
+- **REU / Cartridge preset**: the C64U has no `"REU"` Cartridge preset — its `Cartridge` config value merely mirrors REU state, and writing it back is rejected with HTTP 400. `set_reu` / `restore_state` handle this by probing the item's presets (preset write ordered first, so a rejection never half-enables the REU). Don't hand-write `Cartridge: "REU"` config updates; use the helpers.
+- **REST `POST writemem` cliff (C64U)**: ~100–160 ms up to 12 KiB, then ~6 s per request at ≥16 KiB (sometimes exceeding a 10 s client timeout). Per-request pathology, not a wedge — the device stays healthy. For bulk writes use the SocketDMA fast path below.
+
+### SocketDMA write fast path (TCP 64)
+
+The firmware serves a binary "SocketDMA" channel on TCP port 64 (client: `SocketDMAClient`, package-root export; capabilities: DMA load/run, raw memory write, REU write, keyboard inject, reset, identify). On the C64U it ships disabled — enable **Network Settings → "Ultimate DMA Service"**. `Ultimate64Transport` wires it in as an opt-in bulk-write route:
+
+```python
+transport.socket_dma = True            # default False — zero behavior change until enabled
+transport.socket_dma_min_bytes = 8192  # payloads >= this go via DMAWRITE
+transport.write_memory(0x4000, blob)   # 16 KiB in ~150 ms vs >6 s REST POST on C64U
+```
+
+Semantics to rely on: same `MemoryPolicy` checks as the REST path; chunked at 32 KiB (full 64 KiB writes work); the protocol is fire-and-forget so the transport verifies via a **polled** tail read-back (`socket_dma_verify_timeout`, default 2 s — a single immediate read races the device-side DMA application); connect/send/verify failure logs a WARNING and falls back to REST, and a connect failure latches the fast path off for the transport's lifetime. Live tests: `tests/test_socketdma_live.py` (`SOCKETDMA_LIVE=1` gate). U64E fw 3.14 availability is untested — the fallback makes enabling it safe everywhere.
+
 ### DMA Trampoline Pattern
 ```python
 from c64_test_harness.backends.device_lock import DeviceLock
@@ -719,6 +739,8 @@ Three failure modes show up when driving a U64 hard from a test run:
 - **Runner subsystem wedged:** the device is otherwise reachable (HTTP + `/v1/version` respond) but `run_prg` returns the firmware's `"Cannot open file"` signature and refuses new programs. `recover()` clears it.
 
 `recover()` escalates `reset()` -> probe -> `reboot()` -> probe and returns `"reset"` or `"reboot"` to indicate which step succeeded. `runner_health_check()` posts a tiny no-op PRG and raises `Ultimate64RunnerStuckError` on the wedged-runner signature.
+
+**Caveat — `recover()`'s liveness probe is REST-only.** It declares success the moment REST answers, so for wedges that live *below* REST (FPGA / REU / DMA / UCI state, where REST typically stays healthy throughout) it returns `"reset"` without fixing anything, and the next run wedges identically. For FPGA-tier symptoms call `client.reboot()` directly instead of `recover()`. Known worst case: the UCI STATE-bit wedge after sustained `SOCKET_WRITE` (issue #112) survives even `reboot()` — fail fast and require a physical power-cycle rather than papering over it with a retry loop.
 
 ```python
 from c64_test_harness.backends.ultimate64_helpers import recover, runner_health_check
@@ -888,7 +910,7 @@ Full design and the harness's own scratch-address table in `docs/memory_safety.m
 
 Round-trip the running RAM + CPU port state between VICE and Ultimate 64 using VICE's native `.vsf` format as the wire (PR #115 / commit 45a5844). Useful for "capture a state on the fast emulator, replay it on hardware to confirm timing-sensitive behaviour" — or the reverse.
 
-**Phase A scope** is RAM + CPU port only. CPU registers, CIA/VIC/SID register state, drive images, REU contents, and cartridge bytes are **not** captured yet (see `docs/snapshot_interop.md` for the per-layer matrix). On the U64 side, several layers are not even observable: the REST API has no readback for cart bytes, disk images, or REU memory; the 6510's registers aren't directly observable.
+**Phase A scope** is RAM + CPU port only. CPU registers, CIA/VIC/SID register state, drive images, REU contents, and cartridge bytes are **not** captured yet (see `docs/snapshot_interop.md` for the per-layer matrix). On the U64 side, several layers are not even observable: the REST API has no readback for cart bytes, disk images, or REU memory; the 6510's registers aren't directly observable. The REU layer's fast restore path (SocketDMA `REUWRITE`) is designed and tracked in issue #134 — check there before re-deriving it.
 
 ```python
 from c64_test_harness import (
