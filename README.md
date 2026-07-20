@@ -564,7 +564,21 @@ restore_state(transport, snap)          # put device back as you found it
 
 CPU speeds are validated against the **superset** of enum values across device generations: the Ultimate 64 Elite (fw 3.14) supports 1–48 MHz including 5; the C64 Ultimate (fw 1.1.0) drops 5 and adds 64. A speed the connected device doesn't have passes local validation and is rejected by the firmware with HTTP 400 (`Ultimate64Error`) — and because `set_turbo_mhz` writes CPU Speed before enabling Turbo Control, a rejected speed never leaves turbo half-enabled. Verified live on the C64 Ultimate (foreign speed rejected; all 16 native speeds apply and read back cleanly); the U64E direction is covered by the same test and pending hardware access. See `tests/test_turbo_contract_live.py` (gated by `TURBO_CONTRACT_LIVE=1` + `U64_HOST` + `U64_ALLOW_MUTATE=1`).
 
+`set_reu` is also cross-generation aware: the U64E requires switching the `Cartridge` preset to `"REU"` alongside enabling the REU item, while the C64 Ultimate has no `"REU"` cartridge preset at all (its `Cartridge` value merely mirrors REU state — writing it back is rejected with HTTP 400). The helper probes the device's `Cartridge` presets once per enable and writes the preset only where it exists — ordered first, so a firmware rejection can never leave the REU half-enabled. `restore_state` applies the same probe before restoring a snapshotted cartridge value, so a C64U snapshot/restore round-trip is safe.
+
 See `examples/ultimate64_hello.py` for a full BASIC round-trip demo and `scripts/probe_u64.py` for device capability discovery.
+
+### SocketDMA write fast path
+
+The Ultimate firmware serves a binary "SocketDMA" channel on TCP port 64 (on the C64 Ultimate it ships disabled — enable **Network Settings → "Ultimate DMA Service"**; availability on U64E fw 3.14 is untested, and a refused connect simply falls back to REST). `Ultimate64Transport` can route bulk `write_memory` calls through it:
+
+```python
+transport.socket_dma = True                # opt-in (default False)
+transport.socket_dma_min_bytes = 8192      # payloads >= this use DMAWRITE
+transport.write_memory(0x4000, blob)       # 16 KiB in ~150 ms instead of >6 s
+```
+
+Motivation: on C64 Ultimate fw 1.1.0 the REST `POST writemem` path degrades sharply at 16 KiB (~6 s per request, measured; ≤12 KiB is fine). The fast path chunks at 32 KiB, passes the same `MemoryPolicy` checks as the REST path, and — because the protocol is fire-and-forget — verifies by polling a tail read-back (budget `transport.socket_dma_verify_timeout`, default 2 s). Any connect failure, send failure, or verify miss logs a WARNING and falls back to REST; connect failures latch the fast path off for the transport's lifetime. The raw client (`SocketDMAClient`: DMA load/run, REU write, keyboard inject, reset, identify) is exported from the package root for direct use.
 
 ### Reset vs Reboot
 
@@ -952,6 +966,7 @@ pytest tests/test_vice_binary.py -v      # VICE binary monitor protocol tests
 U64_HOST=192.168.1.81 pytest tests/test_u64_feature_parity_live.py -v
 U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 pytest tests/test_u64_turbo_bench_live.py -v
 TURBO_CONTRACT_LIVE=1 U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 pytest tests/test_turbo_contract_live.py -v  # cross-generation CPU-speed contract
+SOCKETDMA_LIVE=1 U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 pytest tests/test_socketdma_live.py -v  # SocketDMA fast path + cross-generation REU contract
 
 # Run all U64 live tests in parallel (DeviceLock serializes access)
 python3 scripts/run_u64_parallel_locked.py 192.168.1.81

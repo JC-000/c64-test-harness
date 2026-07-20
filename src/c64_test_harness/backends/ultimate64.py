@@ -13,11 +13,30 @@ is intentionally **not** part of :class:`C64Transport`; consult
 """
 from __future__ import annotations
 
+import logging
 import socket
+import time
 
 from .hardware import HardwareTransportBase
+from .u64_socket_dma import SocketDMAClient
 from .u64_video_capture import VIC_PALETTE, DEFAULT_VIDEO_PORT, VideoCapture
-from .ultimate64_client import Ultimate64Client
+from .ultimate64_client import Ultimate64Client, Ultimate64Error
+
+_log = logging.getLogger(__name__)
+
+# DMAWRITE chunk ceiling: ``SocketDMAClient`` caps a single command payload at
+# 0xFFFF bytes, but the 6510 address is 16-bit, so we also need every chunk's
+# *start* address to stay <= 0xFFFF.  Splitting on 32 KiB boundaries satisfies
+# both: a full 64 KiB restore at $0000 becomes exactly two chunks ($0000 and
+# $8000), the second still a legal DMAWRITE address.
+_SOCKET_DMA_CHUNK = 0x8000
+
+#: How long write_memory polls the tail read-back before declaring a
+#: SocketDMA verify mismatch.  The protocol is fire-and-forget: the device
+#: applies the DMA asynchronously after consuming the TCP stream, so an
+#: immediate single read races the transfer (observed live on C64U fw
+#: 1.1.0: 16 KiB lands in ~100-150 ms).
+_SOCKET_DMA_VERIFY_TIMEOUT = 2.0
 
 
 class Ultimate64Transport(HardwareTransportBase):
@@ -42,6 +61,9 @@ class Ultimate64Transport(HardwareTransportBase):
         rows: int = 25,
         client: Ultimate64Client | None = None,
         memory_policy: "MemoryPolicy | None" = None,
+        *,
+        socket_dma: bool = False,
+        socket_dma_min_bytes: int = 8192,
     ) -> None:
         super().__init__(screen_cols=cols, screen_rows=rows)
         if client is None:
@@ -56,6 +78,18 @@ class Ultimate64Transport(HardwareTransportBase):
         self._keybuf_addr = keybuf_addr
         self._keybuf_count_addr = keybuf_count_addr
         self._keybuf_max = keybuf_max
+
+        # Opt-in SocketDMA (TCP/64) fast path for bulk writes.  ``socket_dma``
+        # is the master switch; writes of >= ``socket_dma_min_bytes`` are
+        # eligible.  Both are plain public attributes — flip them at any time.
+        self.socket_dma: bool = bool(socket_dma)
+        self.socket_dma_min_bytes: int = int(socket_dma_min_bytes)
+        #: Tail-verify poll budget (seconds); see _SOCKET_DMA_VERIFY_TIMEOUT.
+        self.socket_dma_verify_timeout: float = _SOCKET_DMA_VERIFY_TIMEOUT
+        self._socket_dma_client: SocketDMAClient | None = None
+        # Latched True after a connect failure so we stop paying the connect
+        # timeout on every subsequent write (verify mismatches do NOT latch).
+        self._socket_dma_unusable: bool = False
 
         from ..memory_policy import MemoryPolicy as _MemoryPolicy
         self._memory_policy: _MemoryPolicy = memory_policy or _MemoryPolicy.permissive()
@@ -114,7 +148,92 @@ class Ultimate64Transport(HardwareTransportBase):
             return
         if not self._memory_policy.is_permissive():
             self._memory_policy.check_write(addr, len(data), override=override)
+        # SocketDMA fast path is reachable only for policy-approved writes.
+        if (
+            self.socket_dma
+            and not self._socket_dma_unusable
+            and len(data) >= self.socket_dma_min_bytes
+            and self._socket_dma_write(addr, bytes(data))
+        ):
+            return
         self._client.write_mem(addr, data)
+
+    def _ensure_socket_dma_client(self) -> SocketDMAClient:
+        """Return the lazily-created, connection-reusing SocketDMA client.
+
+        Host and password are inherited from the REST client; the port is
+        the SocketDMA default (TCP/64), independent of the REST port.
+        """
+        if self._socket_dma_client is None:
+            self._socket_dma_client = SocketDMAClient(
+                host=self._client.host,
+                password=self._client.password,
+            )
+        return self._socket_dma_client
+
+    def _socket_dma_write(self, addr: int, data: bytes) -> bool:
+        """Attempt the SocketDMA fast path for one write.
+
+        Returns ``True`` when the payload was sent and the tail verified via
+        the REST read path; ``False`` (with a WARNING logged) when the caller
+        should fall back to the REST ``write_mem`` for this write.  A connect
+        failure additionally latches the fast path off for this transport's
+        lifetime; send failures and verify mismatches do not latch.
+        """
+        client = self._ensure_socket_dma_client()
+
+        # Establish (or reuse) the connection.  ``__enter__`` runs the
+        # idempotent connect + optional authenticate; a no-op if already open.
+        try:
+            client.__enter__()
+        except Ultimate64Error as exc:
+            _log.warning(
+                "SocketDMA connect to %s:64 failed (%s); latching fast path "
+                "off and falling back to REST write_mem",
+                self._client.host,
+                exc,
+            )
+            self._socket_dma_unusable = True
+            return False
+
+        try:
+            for offset in range(0, len(data), _SOCKET_DMA_CHUNK):
+                chunk = data[offset:offset + _SOCKET_DMA_CHUNK]
+                client.dma_write(addr + offset, chunk)
+        except Ultimate64Error as exc:
+            _log.warning(
+                "SocketDMA send failed at %#06x (%s); falling back to REST "
+                "write_mem for this write",
+                addr,
+                exc,
+            )
+            return False
+
+        # Fire-and-forget protocol has no ack, so poll the tail back over REST
+        # until it matches — the only confirmation the payload landed.  A
+        # single immediate read races the device-side DMA application (the
+        # TCP stream is consumed before the bytes hit C64 RAM).
+        tail_len = min(16, len(data))
+        expected = data[len(data) - tail_len:]
+        deadline = time.monotonic() + self.socket_dma_verify_timeout
+        while True:
+            actual = self._client.read_mem(addr + len(data) - tail_len, tail_len)
+            if actual == expected:
+                return True
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+        _log.warning(
+            "SocketDMA verify mismatch at %#06x (wrote %d bytes; tail "
+            "expected %r, read %r after %.1fs); falling back to REST "
+            "write_mem for this write",
+            addr,
+            len(data),
+            expected,
+            actual,
+            self.socket_dma_verify_timeout,
+        )
+        return False
 
     def read_screen_codes(self) -> list[int]:
         """Read raw screen codes (cols * rows values) from screen memory."""
@@ -383,5 +502,14 @@ class Ultimate64Transport(HardwareTransportBase):
         )
 
     def close(self) -> None:
-        """Release client resources (no-op for the stateless REST client)."""
+        """Release client resources.
+
+        The REST client is stateless, but the SocketDMA fast-path client (if
+        one was ever created) holds an open TCP/64 socket that must be closed.
+        """
+        if self._socket_dma_client is not None:
+            try:
+                self._socket_dma_client.close()
+            finally:
+                self._socket_dma_client = None
         self._client.close()

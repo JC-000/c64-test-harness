@@ -151,6 +151,10 @@ from .backends.u64_debug_capture import (
     DEFAULT_DEBUG_PORT,
     ENTRIES_PER_PACKET,
 )
+from .backends.u64_socket_dma import (
+    SocketDMAClient,
+    SocketDMAIdentifyUDP,
+)
 from .backends.u64_video_capture import (
     VideoCapture,
     VideoCaptureResult,
@@ -569,6 +573,8 @@ __all__ = [
     "CHANNELS",
     "SAMPLE_WIDTH",
     # U64 debug stream capture
+    "SocketDMAClient",
+    "SocketDMAIdentifyUDP",
     "DebugCapture",
     "DebugCaptureResult",
     "BusCycle",

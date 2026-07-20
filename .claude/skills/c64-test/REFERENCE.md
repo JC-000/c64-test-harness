@@ -565,7 +565,7 @@ transport = Ultimate64Transport(host="192.168.1.81", password=None, timeout=10.0
 
 **C64Transport methods** (memory ops DMA-backed, no CPU pause):
 - `read_memory(addr, length) -> bytes`
-- `write_memory(addr, data, *, override=None) -> None`
+- `write_memory(addr, data, *, override=None) -> None` -- Opt-in SocketDMA fast path for bulk writes: set `transport.socket_dma = True` (constructor kwarg or attribute; default False) and payloads >= `socket_dma_min_bytes` (default 8192) route via DMAWRITE on TCP 64 instead of REST (~150 ms vs >6 s for 16 KiB on C64U fw 1.1.0, whose POST writemem degrades at >=16 KiB). Same `MemoryPolicy` checks; tail read-back verify polled up to `socket_dma_verify_timeout` (2 s); WARNING + REST fallback on connect/send/verify failure (connect failure latches the fast path off). Requires the device's DMA service on TCP 64 (C64U: enable Network Settings → "Ultimate DMA Service", ships disabled; U64E fw 3.14 availability untested — connect failure just falls back to REST).
 - `read_screen_codes() -> list[int]`
 - `inject_keys(petscii_codes) -> None`
 - `inject_joystick(port, value) -> None`
@@ -635,7 +635,7 @@ from c64_test_harness.backends.ultimate64_helpers import (
 
 - `set_turbo_mhz(client, mhz)` -- Set turbo to given MHz (int), or `None` to disable
 - `get_turbo_mhz(client) -> int | None` -- Current speed, or None if turbo off
-- `set_reu(client, enabled, size=None)` -- Enable/disable REU; size as str ("512 KB") or int (MB)
+- `set_reu(client, enabled, size=None)` -- Enable/disable REU; size as str ("512 KB") or int (MB). Cross-generation: probes the device's `Cartridge` presets and writes `Cartridge: "REU"` only where offered (U64E yes, C64 Ultimate no — its Cartridge value mirrors REU state and rejects the write with HTTP 400). The preset write is ordered first so a rejection never half-enables the REU. `restore_state` applies the same probe to the snapshotted cartridge value.
 - `snapshot_state(client) -> U64StateSnapshot` -- Capture turbo + REU + cartridge state
 - `restore_state(client, snap)` -- Restore a snapshot
 - `reset(client)` -- Soft reset (CPU only)
