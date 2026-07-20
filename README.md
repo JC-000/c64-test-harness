@@ -552,7 +552,7 @@ from c64_test_harness import (
     snapshot_state, restore_state,
 )
 
-set_turbo_mhz(transport, 4)            # 1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 28, 32, 40, 48
+set_turbo_mhz(transport, 4)            # superset: 1-6, 8, 10, 12, 14, 16, 20, 24, 32, 40, 48, 64
 set_reu(transport, enabled=True, size_mb=16)
 mount_disk_file(transport, "build/disk.d64", drive="a")
 run_prg_file(transport, "build/app.prg")
@@ -561,6 +561,8 @@ snap = snapshot_state(transport)        # capture turbo/REU/SID config
 # ... run tests ...
 restore_state(transport, snap)          # put device back as you found it
 ```
+
+CPU speeds are validated against the **superset** of enum values across device generations: the Ultimate 64 Elite (fw 3.14) supports 1–48 MHz including 5; the C64 Ultimate (fw 1.1.0) drops 5 and adds 64. A speed the connected device doesn't have passes local validation and is rejected by the firmware with HTTP 400 (`Ultimate64Error`) — and because `set_turbo_mhz` writes CPU Speed before enabling Turbo Control, a rejected speed never leaves turbo half-enabled. Verified live on the C64 Ultimate (foreign speed rejected; all 16 native speeds apply and read back cleanly); the U64E direction is covered by the same test and pending hardware access. See `tests/test_turbo_contract_live.py` (gated by `TURBO_CONTRACT_LIVE=1` + `U64_HOST` + `U64_ALLOW_MUTATE=1`).
 
 See `examples/ultimate64_hello.py` for a full BASIC round-trip demo and `scripts/probe_u64.py` for device capability discovery.
 
@@ -949,6 +951,7 @@ pytest tests/test_vice_binary.py -v      # VICE binary monitor protocol tests
 # Ultimate 64 live tests (requires U64_HOST)
 U64_HOST=192.168.1.81 pytest tests/test_u64_feature_parity_live.py -v
 U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 pytest tests/test_u64_turbo_bench_live.py -v
+TURBO_CONTRACT_LIVE=1 U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 pytest tests/test_turbo_contract_live.py -v  # cross-generation CPU-speed contract
 
 # Run all U64 live tests in parallel (DeviceLock serializes access)
 python3 scripts/run_u64_parallel_locked.py 192.168.1.81
