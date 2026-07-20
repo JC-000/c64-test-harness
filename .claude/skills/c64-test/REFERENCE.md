@@ -821,6 +821,27 @@ with Ultimate64InstanceManager(devices, acquire_timeout=30.0) as mgr:
 
 ---
 
+## Module: backends.u64_socket_dma
+
+Binary "SocketDMA" command channel on TCP port 64, distinct from REST. Covers capabilities REST lacks (keyboard inject, REU write, raw reset, DMA load/jump) and is the transport behind the `Ultimate64Transport.socket_dma` bulk-write fast path. Wire format: 2-byte LE opcode + 2-byte LE length + payload; mostly fire-and-forget (no reply — confirmation is the connection staying open), so pair every write with a read-back where correctness matters. On the C64 Ultimate the service ships disabled (enable Network Settings → "Ultimate DMA Service"); U64E fw 3.14 availability untested. Both classes are package-root exports.
+
+### `SocketDMAClient(host, port=64, password=None, timeout=5.0)`
+Context manager — `with` opens one connection reused across commands; outside `with`, each call opens/closes its own (slow for chains; every connect re-authenticates when a network password is set).
+- `identify() -> dict` — `{"title": "*** C64 Ultimate (V1.49) 1.1.0 ***"}`-style; cheap protocol/liveness probe
+- `dma_write(addr, data)` — raw memory write (opcode 0xFF06), no autostart; payload ≤ 65535 bytes/command
+- `dma_load(addr, data, run=False)` — PRG-style load (0xFF01), `run=True` → DMARUN (0xFF02) autostart
+- `dma_jump(addr)` — 0xFF09
+- `reu_write(offset, data)` — 0xFF07; 24-bit LE offset, ≤16 MB REU space (no readback exists on any firmware — see issue #134 for the snapshot REU restore wiring)
+- `inject_keys(text)` — 0xFF03; firmware DMAs into the 10-byte keyboard buffer
+- `reset()` — 0xFF04; recoverable, menu-equivalent
+- `authenticate()` — 0xFF1F; required first on password-protected devices (fw 3.12+)
+- Raises `Ultimate64Error` on connect/send/recv failure
+
+### `SocketDMAIdentifyUDP`
+- `identify(probe=b"json") -> dict` — UDP/64 discovery; JSON reply with `probe=b"json"`, else `"<echo>,<hostname>,<menu_header>"`. Governed by the separate "Ultimate Ident Service" config item on the C64U (TCP identify works even with it disabled).
+
+---
+
 ## Module: sid
 
 ### `SidFile`
