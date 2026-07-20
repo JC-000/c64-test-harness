@@ -209,6 +209,52 @@ def get_reu_config(client: Ultimate64Client) -> tuple[bool, str]:
     return (enabled_raw == "Enabled", str(size_raw))
 
 
+def _cartridge_preset_supported(
+    client: Ultimate64Client, value: str
+) -> bool | None:
+    """Report whether *value* is a settable ``Cartridge`` preset on this device.
+
+    Cross-generation quirk: on the U64 Elite (firmware 3.14) the
+    ``Cartridge`` item exposes ``"REU"`` as a real preset, and writing it
+    is what exposes the REU to the C64. On the C64 Ultimate (firmware
+    1.1.0) the same item reports ``presets: [""]`` — ``"REU"`` is only a
+    *mirrored* display value, and PUTting it back is rejected with HTTP
+    400 ("not a valid choice"). This probe distinguishes the two.
+
+    Live-verified response shape::
+
+        {"C64 and Cartridge Settings":
+            {"Cartridge": {"current": "REU", "presets": [""], "default": ""}},
+         "errors": []}
+
+    Parsed defensively: the presets list is dug out of the nested
+    category/item maps, and any structural surprise (or a probe that
+    raises) yields the inconclusive ``None`` rather than a wrong answer.
+
+    :param client: Connected Ultimate64 client.
+    :param value: Candidate ``Cartridge`` value to test for settability.
+    :returns: ``True`` if *value* is among the parsed presets, ``False``
+        if presets parsed cleanly and *value* is absent, ``None`` if the
+        probe failed or the response could not be parsed.
+    """
+    try:
+        resp = client.get_config_item(CAT_CART, _ITEM_CARTRIDGE)
+    except Ultimate64Error:
+        return None
+    if not isinstance(resp, dict):
+        return None
+    category = resp.get(CAT_CART)
+    if not isinstance(category, dict):
+        return None
+    item = category.get(_ITEM_CARTRIDGE)
+    if not isinstance(item, dict):
+        return None
+    presets = item.get("presets")
+    if not isinstance(presets, list):
+        return None
+    return value in presets
+
+
 def set_reu(
     client: Ultimate64Client,
     enabled: bool,
@@ -216,10 +262,34 @@ def set_reu(
 ) -> None:
     """Enable or disable the REU and optionally set its size.
 
-    When *enabled* is ``True``, this also switches the Cartridge preset
-    to ``"REU"`` so the device actually exposes the expansion to the
-    C64. When *enabled* is ``False``, the size argument is ignored and
-    the Cartridge preset is left unchanged.
+    When *enabled* is ``True`` this enables the ``RAM Expansion Unit``
+    item and optionally sets ``REU Size``. Whether it *also* writes the
+    ``Cartridge`` preset depends on the device generation:
+
+    - **U64 Elite (firmware 3.14):** the ``Cartridge`` item exposes
+      ``"REU"`` as a real preset, and writing it is REQUIRED — that is
+      what actually exposes the expansion to the C64.
+    - **C64 Ultimate (firmware 1.1.0):** ``Cartridge`` reports
+      ``presets: [""]``; ``"REU"`` is a mirrored display value only and
+      PUTting it back is rejected with HTTP 400. Enabling the
+      ``RAM Expansion Unit`` item alone is the verified working method.
+
+    To pick the right behavior this probes the ``Cartridge`` presets once
+    (via :func:`_cartridge_preset_supported`). When the probe says the
+    preset is unsupported (the C64U case) the ``Cartridge`` write is
+    omitted; when it is supported *or* inconclusive (``None`` — e.g. the
+    probe GET failed) the ``Cartridge`` write is included so legacy U64E
+    behavior is preserved.
+
+    Ordering matters: when included, ``Cartridge`` is inserted into the
+    updates dict FIRST — before ``RAM Expansion Unit`` and ``REU Size``.
+    :meth:`Ultimate64Client.set_config_items` iterates in insertion order
+    and does not catch per-item failures, so a firmware rejection of the
+    ``Cartridge`` write aborts the batch before the REU is half-enabled.
+
+    When *enabled* is ``False`` the size argument is ignored, no probe is
+    issued, and only a single ``RAM Expansion Unit: "Disabled"`` write is
+    sent.
 
     :param client: Connected Ultimate64 client.
     :param enabled: ``True`` to enable the REU, ``False`` to disable.
@@ -232,8 +302,11 @@ def set_reu(
 
     updates: dict[str, Any] = {}
     if enabled:
+        # Probe once; include the Cartridge write (ordered first) unless
+        # the device positively reports "REU" as an unsupported preset.
+        if _cartridge_preset_supported(client, "REU") is not False:
+            updates[_ITEM_CARTRIDGE] = "REU"
         updates[_ITEM_REU_ENABLED] = "Enabled"
-        updates[_ITEM_CARTRIDGE] = "REU"
         if size is not None:
             if isinstance(size, int) and not isinstance(size, bool):
                 # Caller passes MB as an int -- map to bytes first.
@@ -733,6 +806,15 @@ def restore_state(client: Ultimate64Client, snap: U64StateSnapshot) -> None:
     Writes the snapshotted values back into U64 Specific Settings and
     C64 and Cartridge Settings in a single batch per category.
 
+    Cross-generation caveat for the ``Cartridge`` field: on a C64 Ultimate
+    (firmware 1.1.0) :func:`snapshot_state` captures the *mirrored*
+    ``Cartridge: "REU"`` value, but that value is not a settable preset on
+    that firmware (writing it back is rejected with HTTP 400). Before
+    restoring a non-empty cartridge value this checks
+    :func:`_cartridge_preset_supported` and skips the write when the value
+    is positively reported as unsupported; ``True`` or an inconclusive
+    ``None`` (legacy U64E behavior) still writes it.
+
     :param client: Connected Ultimate64 client.
     :param snap: Snapshot previously returned by :func:`snapshot_state`.
     """
@@ -753,7 +835,12 @@ def restore_state(client: Ultimate64Client, snap: U64StateSnapshot) -> None:
     # ("Function none requires parameter value").
     if snap.reu_size:
         cart_updates[_ITEM_REU_SIZE] = snap.reu_size
-    if snap.cartridge:
+    # A snapshotted cartridge value may be a firmware-mirrored display
+    # value (C64U reports "REU" but rejects it as a PUT). Skip the write
+    # only when the device positively reports it as unsupported.
+    if snap.cartridge and _cartridge_preset_supported(
+        client, snap.cartridge
+    ) is not False:
         cart_updates[_ITEM_CARTRIDGE] = snap.cartridge
     client.set_config_items(CAT_CART, cart_updates)
 
