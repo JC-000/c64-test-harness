@@ -55,7 +55,7 @@ def test_cpu_speed_mhz_parses_padded_values() -> None:
 
 def test_cpu_speed_mhz_rejects_unknown() -> None:
     with pytest.raises(ValueError):
-        cpu_speed_mhz("64")
+        cpu_speed_mhz("96")
     with pytest.raises(ValueError):
         cpu_speed_mhz("1")  # missing leading space
 
@@ -67,8 +67,14 @@ def test_cpu_speed_round_trip_all_values() -> None:
 
 
 def test_cpu_speed_values_count() -> None:
-    assert len(CPU_SPEED_VALUES) == 16
-    assert len(CPU_SPEED_BY_MHZ) == 16
+    # 16 U64E speeds + "64" (C64 Ultimate only) — see schema module docs.
+    assert len(CPU_SPEED_VALUES) == 17
+    assert len(CPU_SPEED_BY_MHZ) == 17
+
+
+def test_cpu_speed_enum_supports_c64u_64mhz() -> None:
+    assert cpu_speed_enum(64) == "64"
+    assert cpu_speed_mhz("64") == 64
 
 
 # --------------------------------------------------------------------------- #

@@ -20,9 +20,14 @@ from typing import Union
 
 #: Raw CPU Speed enum values from ``U64 Specific Settings / CPU Speed``.
 #: Single-digit speeds are space-padded to width 2 (e.g. ``" 1"``).
+#: Superset across device generations: U64E firmware 3.14 reports
+#: " 1".." 5".."48"; the C64 Ultimate (firmware 1.1.0, core 1.49) drops
+#: " 5" and adds "64". Speeds absent on a given device are rejected by
+#: its firmware at set time.
 CPU_SPEED_VALUES: tuple[str, ...] = (
     " 1", " 2", " 3", " 4", " 5", " 6", " 8", "10",
     "12", "14", "16", "20", "24", "32", "40", "48",
+    "64",
 )
 
 #: Mapping from integer MHz to the device's enum string.
@@ -30,13 +35,15 @@ CPU_SPEED_BY_MHZ: dict[int, str] = {
     1: " 1", 2: " 2", 3: " 3", 4: " 4", 5: " 5", 6: " 6",
     8: " 8", 10: "10", 12: "12", 14: "14", 16: "16",
     20: "20", 24: "24", 32: "32", 40: "40", 48: "48",
+    64: "64",
 }
 
 
 def cpu_speed_enum(mhz: int) -> str:
     """Convert an integer MHz value to the device's CPU Speed enum string.
 
-    :param mhz: CPU speed in MHz. Must be one of the 16 supported values.
+    :param mhz: CPU speed in MHz. Must be one of the supported values
+        in :data:`CPU_SPEED_BY_MHZ`.
     :returns: The device enum string (e.g. ``" 1"``, ``"48"``).
     :raises ValueError: If *mhz* is not a supported CPU speed.
     """
