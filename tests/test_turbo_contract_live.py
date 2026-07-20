@@ -27,10 +27,12 @@ Env gates (all unset -> everything skips cleanly):
 * ``U64_ALLOW_MUTATE=1``    — required for the mutating contract test;
                               the read-only smoke test runs without it.
 
-What the mutating test touches: ``U64 Specific Settings / Turbo Control``
-and ``.../CPU Speed`` only. The original values are snapshotted up front
-and restored in a ``finally``; nothing is written to flash, and the device
-is never rebooted or powered off.
+What the mutating tests touch: ``U64 Specific Settings / Turbo Control``
+and ``.../CPU Speed`` only. ``test_foreign_speed_contract`` pokes a single
+foreign speed; ``test_native_speed_sweep`` walks every native speed for the
+detected generation. Both snapshot the original values up front and restore
+them in a ``finally``; nothing is written to flash, and the device is never
+rebooted or powered off.
 """
 from __future__ import annotations
 
@@ -50,7 +52,10 @@ from c64_test_harness.backends.ultimate64_helpers import (
     set_turbo_mhz,
     snapshot_state,
 )
-from c64_test_harness.backends.ultimate64_schema import cpu_speed_enum
+from c64_test_harness.backends.ultimate64_schema import (
+    CPU_SPEED_BY_MHZ,
+    cpu_speed_enum,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -239,4 +244,82 @@ def test_foreign_speed_contract(
     )
     assert after.cpu_speed == snap.cpu_speed, (
         f"CPU Speed not restored: {snap.cpu_speed!r} -> {after.cpu_speed!r}"
+    )
+
+
+@pytest.mark.skipif(
+    not _ALLOW_MUTATE,
+    reason="U64_ALLOW_MUTATE not set — skipping native speed sweep test",
+)
+def test_native_speed_sweep(
+    client: Ultimate64Client,
+    record_property,
+) -> None:
+    """Set every native CPU speed in turn and verify the device applies it.
+
+    The sweep list is every speed in :data:`CPU_SPEED_BY_MHZ` *except* the
+    detected generation's foreign speed, ascending — so it self-adjusts:
+    on the C64 Ultimate it covers 1,2,3,4,6,8,...,48,64 (excludes 5); on the
+    U64 Elite it covers 1..48 including 5 (excludes 64).
+
+    Mismatches are accumulated rather than failing fast, so one bad speed
+    still yields the full picture. A speed that raises ``Ultimate64Error``
+    is itself a finding: it is recorded as a mismatch and the sweep
+    continues.
+    """
+    info = client.get_info()
+    product, native, foreign = _profile_for(info)
+    record_property("product", product)
+    record_property("foreign_mhz", foreign)
+
+    sweep = sorted(mhz for mhz in CPU_SPEED_BY_MHZ if mhz != foreign)
+    record_property("sweep", sweep)
+
+    snap = snapshot_state(client)
+    mismatches: list[str] = []
+    try:
+        for mhz in sweep:
+            expected_enum = cpu_speed_enum(mhz)
+            try:
+                set_turbo_mhz(client, mhz)
+            except Ultimate64Error as exc:
+                entry = f"{mhz} MHz: HTTP {exc.status}: {exc}"
+                mismatches.append(entry)
+                print(f"[sweep] {entry}")
+                continue
+            read_mhz = get_turbo_mhz(client)
+            read_enum = snapshot_state(client).cpu_speed
+            ok = read_mhz == mhz and read_enum == expected_enum
+            line = (
+                f"[sweep] {mhz} MHz: {'ok' if ok else 'MISMATCH'} "
+                f"(get_turbo_mhz={read_mhz}, cpu_speed={read_enum!r}, "
+                f"expected {expected_enum!r})"
+            )
+            print(line)
+            if not ok:
+                mismatches.append(
+                    f"{mhz} MHz: get_turbo_mhz={read_mhz}, "
+                    f"cpu_speed={read_enum!r} (expected {expected_enum!r})"
+                )
+    finally:
+        restore_state(client, snap)
+
+    record_property(
+        "sweep_result",
+        f"{len(sweep) - len(mismatches)}/{len(sweep)} speeds applied cleanly",
+    )
+
+    # Post-restore: device is back exactly where we found it.
+    after = snapshot_state(client)
+    assert after.turbo_control == snap.turbo_control, (
+        f"Turbo Control not restored: {snap.turbo_control!r} -> "
+        f"{after.turbo_control!r}"
+    )
+    assert after.cpu_speed == snap.cpu_speed, (
+        f"CPU Speed not restored: {snap.cpu_speed!r} -> {after.cpu_speed!r}"
+    )
+
+    assert not mismatches, (
+        f"{len(mismatches)}/{len(sweep)} native speeds did not apply "
+        f"correctly on {product}: {mismatches}"
     )
