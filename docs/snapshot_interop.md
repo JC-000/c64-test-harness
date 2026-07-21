@@ -21,6 +21,8 @@ This document covers the architecture and per-layer limitations. The canonical A
 
 Adding optional fields to `Snapshot` is the supported extension pattern. Existing callers that construct `Snapshot(ram=..., cpu_port_data=..., cpu_port_dir=...)` continue to work unchanged across feature additions.
 
+Implementation status: the RAM/CPU-port layer (Phase A) and the **REU layer** (`reu_size_bytes`, `reu_contents` — issue #134) are wired; the drive, register, CPU-register, and cartridge fields are the planned extension surface for later phases.
+
 ## `.vsf` wire format
 
 VICE's `.vsf` carries ~30 module sections (MAINCPU, C64MEM, CIA1, CIA2, VIC-II, SID, REU1764, DRIVE0, …). VICE 3.10 refuses snapshots that don't include the full module set, so the harness ships `_vsf_template.vsf` — a 179 KB capture from a fresh `x64sc` at BASIC READY — and patches in the snapshot's domain-specific bytes via prefix overlays per module:
@@ -47,14 +49,14 @@ The bundle format is a directory:
 ```
 mysnapshot/
   snapshot.vsf       # full .vsf with all in-band state
-  manifest.json      # which drives are configured, what cart, etc.
-  drive8.d64         # raw disk image per CBM device
+  manifest.json      # which sidecar layers are present
+  drive8.d64         # raw disk image per CBM device (planned — drive phase)
   drive9.d81
-  cartridge.crt      # active cartridge image
-  reu.bin            # raw REU dump (also embedded in .vsf, but kept for fast access)
+  cartridge.crt      # active cartridge image (planned — cartridge phase)
+  reu.bin            # raw REU dump (wired; NOT embedded in the .vsf today)
 ```
 
-Use `Snapshot.to_bundle(path)` / `Snapshot.from_bundle(path)` to round-trip the directory. The `.vsf` inside is also valid on its own.
+Use `Snapshot.to_bundle(path)` / `Snapshot.from_bundle(path)` to round-trip the directory. The `.vsf` inside is also valid on its own. The wired implementation currently carries `snapshot.vsf`, `manifest.json`, and `reu.bin`; the drive and cartridge files are the design target for their phases. REU bytes travel **only** in the sidecar — `to_vsf()` output is byte-identical with or without the REU layer (no `REU1764` module is emitted yet).
 
 ## Extract / restore semantics
 
@@ -63,20 +65,30 @@ from c64_test_harness import extract_snapshot, restore_snapshot
 
 snap = extract_snapshot(
     transport,
-    include_registers=True,
-    include_reu=False,           # opt-in; slow on U64 without firmware support
-    reu_turbo=False,
-    host_image_paths={8: "game.d64"},   # caller supplies disk bytes
-    host_cart_path=None,
-    known_pc=None,               # required on U64 if you need an authoritative PC
+    include_reu=True,            # opt-in; staging-window extract is slow
+    reu_size_bytes=None,         # None = auto-detect from the U64 config
+    reu_settle=0.05,             # per-bank DMA settle delay
 )
 
-restore_snapshot(transport, snap)
+restore_snapshot(transport, snap)                    # REU restored when present
+restore_snapshot(transport, snap, restore_reu=False)  # explicit REU opt-out
 ```
+
+(Registers, drives, and cartridge layers — `include_registers`, `host_image_paths`, `host_cart_path`, `known_pc` — are later phases and not yet part of the signatures.)
 
 **On VICE**, extract uses the binary monitor where possible (`read_registers`, `read_memory`); restore uses `set_registers` + bulk `write_memory`. The `.vsf` template carries the modules VICE expects.
 
 **On U64**, extract reads memory via DMA, uses the shadow-SID for write-only registers, sideloads a snoop routine for CPU registers, and DMA-stages REU contents through C64 RAM (pending the upstream firmware feature request for `/v1/machine:reumem`). Restore writes memory directly, uses SocketDMA `reu_write` for fast REU restore, sideloads a trampoline for CPU registers, and calls `client.run_crt` / `client.mount_disk` for cartridges and drives.
+
+### REU layer status (wired — issue #134)
+
+The REU layer is implemented, not just designed:
+
+- **Capture** — `extract_reu_contents(transport, size_bytes)` (also reachable via `extract_snapshot(..., include_reu=True)`) runs the 32 KB staging-window extract described under "Memory-safety contracts". It needs only the `C64Transport` read/write surface plus a best-effort CPU pause (`transport.client.pause()` when available).
+- **Restore** — `restore_snapshot` routes `snap.reu_contents` through `Ultimate64Transport.socket_dma_reu_write(offset, data)`, which reuses the transport's **managed SocketDMA client** (the same lazily-connected, teardown-closed TCP/64 client as the `write_memory` fast path) and respects its connect-failure latch. `SocketDMAClient.reu_write` chunks transparently at 65 532 data bytes per `REUWRITE` command (the 16-bit length field covers the 3-byte 24-bit offset prefix).
+- **REU enablement during restore** goes through the generation-aware `set_reu` helper (the C64U has no `"REU"` Cartridge preset; writing it raw is an HTTP 400).
+- **No fallback, no silent skip** — REU memory has no REST write or read endpoint on either generation. If the SocketDMA service is unavailable (TCP/64 refused, or the latch is set), restore raises `Ultimate64Error` with the fix ("Ultimate DMA Service" in Network Settings). A transport without the SocketDMA path at all (VICE) raises `SnapshotRestoreError`; pass `restore_reu=False` to skip the layer explicitly.
+- **Fidelity caveat** — on C64U fw 1.1.0 the `REUWRITE` opcode is accepted, but **byte fidelity has not yet been live-verified**; the gated `test_reuwrite_byte_fidelity` in `tests/test_socketdma_live.py` (write pattern via REUWRITE → staging-window read-back → compare) is the pending validation on both generations. Keep this caveat until that run happens.
 
 Restoring drives uses temp files for VICE (`attach_drive` takes paths) and direct byte upload for U64 (`mount_disk` takes bytes).
 
@@ -89,7 +101,7 @@ Restoring drives uses temp files for VICE (`attach_drive` takes paths) and direc
 | Drive slot count | partial | partial | U64 has 2 slots (a/b → devices 8/9); devices 10/11 in a snapshot log a WARNING and are skipped on U64 restore |
 | CIA1 / CIA2 / VIC-II registers | ✓ | ✓ | Memory-mapped, DMA-readable; internal latches are degraded both ways but the visible register file round-trips |
 | SID registers | ✓ via shadow | ✓ | 28 of 32 SID registers are write-only on real hardware; `Ultimate64Transport` shadows writes to `$D400-$D41F` so extract reads the shadow |
-| REU contents | slow | fast | Extract via staging window (~30s/16MB native, ~5-10s turbo); restore via SocketDMA `REUWRITE` (~3s/16MB). Pending upstream firmware feature for direct extract |
+| REU contents | slow | fast | **Wired.** Extract via staging window (~30s/16MB native, ~5-10s turbo); restore via SocketDMA `REUWRITE` (~3s/16MB), chunked at 65 532 bytes/command through the transport's managed client — no REST fallback exists, unavailable DMA service raises. C64U fw 1.1.0 accepts `REUWRITE` but byte fidelity is **not yet live-verified** (pending `test_reuwrite_byte_fidelity`). Direct extract pending upstream firmware feature |
 | CPU registers | active snoop | ✓ | U64 has no `read_registers` REST endpoint; harness injects a snoop routine at `$0334` (PHP/PHA/STX/STY/TSX → scratch area) and reads it back. PC of arbitrary running code can't be recovered — pass `known_pc=` or accept the snoop entry address |
 | Cartridge bytes | not extractable | ✓ | Neither backend reads cart bytes back; caller supplies via `host_cart_path`. VICE runtime attach works for `generic`/`generic-8k`/`generic-16k`/`ultimax`/`easyflash`; `freezer`/`action-replay`/others need `ViceConfig.extra_args=["-cartcrt", path]` at launch |
 
@@ -104,15 +116,16 @@ The snapshot work introduces two new harness scratch usages:
 
 ## Upstream firmware feature request
 
-The U64 REU extract path is currently slow (DMA-via-staging) because firmware 3.14d has no REST endpoint for REU memory readback. A feature request for `GET /v1/machine:reumem` is filed at `https://github.com/GideonZ/1541ultimate/issues` (2026-05-19). When/if it lands, the staging-window dance can be swapped for a direct chunked GET — see `project_reu_readback_feature_request` in agent memory for the swap target. The restore path is already on the fast SocketDMA `REUWRITE` (opcode `0xFF07`) and doesn't change.
+The U64 REU extract path is currently slow (DMA-via-staging) because firmware 3.14d has no REST endpoint for REU memory readback. A feature request for `GET /v1/machine:reumem` is filed at `https://github.com/GideonZ/1541ultimate/issues` (2026-05-19). When/if it lands, the staging-window dance in `extract_reu_contents` can be swapped for a direct chunked GET — see `project_reu_readback_feature_request` in agent memory for the swap target. The restore path is already on the fast SocketDMA `REUWRITE` (opcode `0xFF07`) and doesn't change.
 
 ## Files
 
 - `src/c64_test_harness/snapshot.py` — the full implementation
 - `src/c64_test_harness/_vsf_template.vsf` — bundled 179 KB template
 - `tests/test_snapshot.py` — Phase A round-trip + .vsf format guards
-- `tests/test_snapshot_drives.py` — disk side-channel
-- `tests/test_snapshot_registers.py` — CIA/VIC/SID + shadow-SID
-- `tests/test_snapshot_reu.py` — REU staging + SocketDMA restore
-- `tests/test_snapshot_cpu_regs.py` — active snoop + trampoline
-- `tests/test_snapshot_cartridge.py` — cart sidecar with VICE allowlist
+- `tests/test_snapshot_reu.py` — REU staging extract, `REUWRITE` chunking, SocketDMA restore routing, sidecar round-trip (mock-only)
+- `tests/test_socketdma_live.py` — gated live tests (`SOCKETDMA_LIVE`), including the pending `REUWRITE` byte-fidelity validation
+- `tests/test_snapshot_drives.py` — disk side-channel (planned phase)
+- `tests/test_snapshot_registers.py` — CIA/VIC/SID + shadow-SID (planned phase)
+- `tests/test_snapshot_cpu_regs.py` — active snoop + trampoline (planned phase)
+- `tests/test_snapshot_cartridge.py` — cart sidecar with VICE allowlist (planned phase)

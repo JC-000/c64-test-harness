@@ -30,6 +30,7 @@ from typing import Optional
 from .ultimate64_client import Ultimate64Error
 
 __all__ = [
+    "REU_WRITE_MAX_CHUNK",
     "SocketDMAClient",
     "SocketDMAIdentifyUDP",
 ]
@@ -45,6 +46,14 @@ _CMD_KERNALWRITE = 0xFF08
 _CMD_DMAJUMP = 0xFF09
 _CMD_IDENTIFY = 0xFF0E
 _CMD_AUTHENTICATE = 0xFF1F
+
+#: Maximum REU data bytes in a single REUWRITE command: the 16-bit command
+#: length field covers the whole payload, and the payload leads with a
+#: 3-byte offset, so at most ``0xFFFF - 3`` data bytes fit per command.
+REU_WRITE_MAX_CHUNK = 0xFFFF - 3
+
+#: The REU address space is 24-bit (16 MB).
+_REU_ADDRESS_SPACE = 0x1000000
 
 
 class SocketDMAClient:
@@ -218,15 +227,32 @@ class SocketDMAClient:
         """Send 0xFF07 REUWRITE: 3-byte LE offset (24-bit) + data.
 
         The firmware reads only 3 bytes of offset (REU is 16 MB max).
+
+        A single command carries at most :data:`REU_WRITE_MAX_CHUNK` data
+        bytes (the 16-bit length field covers the 3-byte offset prefix +
+        data).  Larger payloads are transparently split into sequential
+        commands with advancing offsets, all on one connection.  The
+        protocol is fire-and-forget: there is no per-command ack, and REU
+        memory has no REST read-back — byte-fidelity verification is the
+        caller's job (e.g. the snapshot staging-window extract).
         """
         if not (0 <= offset <= 0xFFFFFF):
             raise Ultimate64Error(f"REU offset {offset:#x} out of range (24-bit)")
         if not data:
             return
-        payload = struct.pack("<I", offset)[:3] + bytes(data)
+        data = bytes(data)
+        end = offset + len(data)
+        if end > _REU_ADDRESS_SPACE:
+            raise Ultimate64Error(
+                f"REU write of {len(data)} bytes at {offset:#x} runs past the "
+                f"16 MB REU address space (end {end:#x} > {_REU_ADDRESS_SPACE:#x})"
+            )
         opened = self._sock is None
         try:
-            self._send(_CMD_REUWRITE, payload)
+            for i in range(0, len(data), REU_WRITE_MAX_CHUNK):
+                chunk = data[i : i + REU_WRITE_MAX_CHUNK]
+                payload = struct.pack("<I", offset + i)[:3] + chunk
+                self._send(_CMD_REUWRITE, payload)
         finally:
             if opened:
                 self.close()

@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from c64_test_harness.backends.u64_socket_dma import (
+    REU_WRITE_MAX_CHUNK,
     SocketDMAClient,
     SocketDMAIdentifyUDP,
 )
@@ -200,6 +201,31 @@ def test_reu_write_rejects_oversize_offset(fake_server):
     with SocketDMAClient("127.0.0.1", port=srv.port, timeout=2.0) as c:
         with pytest.raises(Ultimate64Error):
             c.reu_write(0x1000000, b"\x00")
+
+
+def test_reu_write_chunks_oversize_payload_on_the_wire(fake_server):
+    """A 64 KiB + 1 REU write becomes two framed REUWRITE commands.
+
+    Wire-level counterpart of the chunking unit tests in
+    ``test_snapshot_reu.py``: each command's 16-bit length field covers
+    the 3-byte offset prefix + data, so a chunk carries at most
+    ``REU_WRITE_MAX_CHUNK`` (65532) data bytes and the second command's
+    offset advances by exactly one chunk.
+    """
+    data = bytes((i * 13) & 0xFF for i in range(65536 + 1))
+    srv = fake_server()
+    with SocketDMAClient("127.0.0.1", port=srv.port, timeout=2.0) as c:
+        c.reu_write(0x000100, data)
+    for _ in range(100):
+        if len(srv.requests) >= 2:
+            break
+        time.sleep(0.01)
+    assert [op for op, _ in srv.requests] == [0xFF07, 0xFF07]
+    first, second = (payload for _, payload in srv.requests)
+    assert len(first) == 3 + REU_WRITE_MAX_CHUNK == 0xFFFF
+    assert int.from_bytes(first[:3], "little") == 0x000100
+    assert int.from_bytes(second[:3], "little") == 0x000100 + REU_WRITE_MAX_CHUNK
+    assert first[3:] + second[3:] == data
 
 
 def test_identify_returns_title(fake_server):
