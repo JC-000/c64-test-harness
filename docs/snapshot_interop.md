@@ -84,11 +84,11 @@ restore_snapshot(transport, snap, restore_reu=False)  # explicit REU opt-out
 
 The REU layer is implemented, not just designed:
 
-- **Capture** — `extract_reu_contents(transport, size_bytes)` (also reachable via `extract_snapshot(..., include_reu=True)`) runs the 32 KB staging-window extract described under "Memory-safety contracts". It needs only the `C64Transport` read/write surface plus a best-effort CPU pause (`transport.client.pause()` when available).
+- **Capture** — `extract_reu_contents(transport, size_bytes)` (also reachable via `extract_snapshot(..., include_reu=True)`) runs the 32 KB staging-window extract described under "Memory-safety contracts". It needs only the `C64Transport` read/write surface. **It runs unpaused by default and must stay that way on Ultimate hardware**: live-verified on C64U fw 1.1.0 (2026-07-21), `machine:pause` freezes the machine clock including the REC's DMA engine, so a paused extract returns stale RAM instead of REU contents. Consequence: the capture is not atomic — don't extract while the running program is actively mutating REU.
 - **Restore** — `restore_snapshot` routes `snap.reu_contents` through `Ultimate64Transport.socket_dma_reu_write(offset, data)`, which reuses the transport's **managed SocketDMA client** (the same lazily-connected, teardown-closed TCP/64 client as the `write_memory` fast path) and respects its connect-failure latch. `SocketDMAClient.reu_write` chunks transparently at 65 532 data bytes per `REUWRITE` command (the 16-bit length field covers the 3-byte 24-bit offset prefix).
 - **REU enablement during restore** goes through the generation-aware `set_reu` helper (the C64U has no `"REU"` Cartridge preset; writing it raw is an HTTP 400).
 - **No fallback, no silent skip** — REU memory has no REST write or read endpoint on either generation. If the SocketDMA service is unavailable (TCP/64 refused, or the latch is set), restore raises `Ultimate64Error` with the fix ("Ultimate DMA Service" in Network Settings). A transport without the SocketDMA path at all (VICE) raises `SnapshotRestoreError`; pass `restore_reu=False` to skip the layer explicitly.
-- **Fidelity caveat** — on C64U fw 1.1.0 the `REUWRITE` opcode is accepted, but **byte fidelity has not yet been live-verified**; the gated `test_reuwrite_byte_fidelity` in `tests/test_socketdma_live.py` (write pattern via REUWRITE → staging-window read-back → compare) is the pending validation on both generations. Keep this caveat until that run happens.
+- **Fidelity** — **live-verified byte-exact on C64U fw 1.1.0 (2026-07-21)** via the gated `test_reuwrite_byte_fidelity` in `tests/test_socketdma_live.py` (96 KiB pattern via REUWRITE → staging-window read-back → compare; crosses both the 65 532-byte chunk seam and three 32 KiB staging banks). The U64E direction is still pending — run the same gated test against 10.43.23.81 when that site is reachable.
 
 Restoring drives uses temp files for VICE (`attach_drive` takes paths) and direct byte upload for U64 (`mount_disk` takes bytes).
 
@@ -101,7 +101,7 @@ Restoring drives uses temp files for VICE (`attach_drive` takes paths) and direc
 | Drive slot count | partial | partial | U64 has 2 slots (a/b → devices 8/9); devices 10/11 in a snapshot log a WARNING and are skipped on U64 restore |
 | CIA1 / CIA2 / VIC-II registers | ✓ | ✓ | Memory-mapped, DMA-readable; internal latches are degraded both ways but the visible register file round-trips |
 | SID registers | ✓ via shadow | ✓ | 28 of 32 SID registers are write-only on real hardware; `Ultimate64Transport` shadows writes to `$D400-$D41F` so extract reads the shadow |
-| REU contents | slow | fast | **Wired.** Extract via staging window (~30s/16MB native, ~5-10s turbo); restore via SocketDMA `REUWRITE` (~3s/16MB), chunked at 65 532 bytes/command through the transport's managed client — no REST fallback exists, unavailable DMA service raises. C64U fw 1.1.0 accepts `REUWRITE` but byte fidelity is **not yet live-verified** (pending `test_reuwrite_byte_fidelity`). Direct extract pending upstream firmware feature |
+| REU contents | slow | fast | **Wired.** Extract via staging window (~30s/16MB native, ~5-10s turbo); restore via SocketDMA `REUWRITE` (~3s/16MB), chunked at 65 532 bytes/command through the transport's managed client — no REST fallback exists, unavailable DMA service raises. Byte fidelity live-verified on C64U fw 1.1.0 (2026-07-21, `test_reuwrite_byte_fidelity`); U64E direction pending reachability. Extract must run unpaused (`machine:pause` freezes REC DMA); direct extract pending upstream firmware feature |
 | CPU registers | active snoop | ✓ | U64 has no `read_registers` REST endpoint; harness injects a snoop routine at `$0334` (PHP/PHA/STX/STY/TSX → scratch area) and reads it back. PC of arbitrary running code can't be recovered — pass `known_pc=` or accept the snoop entry address |
 | Cartridge bytes | not extractable | ✓ | Neither backend reads cart bytes back; caller supplies via `host_cart_path`. VICE runtime attach works for `generic`/`generic-8k`/`generic-16k`/`ultimax`/`easyflash`; `freezer`/`action-replay`/others need `ViceConfig.extra_args=["-cartcrt", path]` at launch |
 
@@ -124,7 +124,7 @@ The U64 REU extract path is currently slow (DMA-via-staging) because firmware 3.
 - `src/c64_test_harness/_vsf_template.vsf` — bundled 179 KB template
 - `tests/test_snapshot.py` — Phase A round-trip + .vsf format guards
 - `tests/test_snapshot_reu.py` — REU staging extract, `REUWRITE` chunking, SocketDMA restore routing, sidecar round-trip (mock-only)
-- `tests/test_socketdma_live.py` — gated live tests (`SOCKETDMA_LIVE`), including the pending `REUWRITE` byte-fidelity validation
+- `tests/test_socketdma_live.py` — gated live tests (`SOCKETDMA_LIVE`), including the `REUWRITE` byte-fidelity validation (passed on C64U fw 1.1.0, 2026-07-21)
 - `tests/test_snapshot_drives.py` — disk side-channel (planned phase)
 - `tests/test_snapshot_registers.py` — CIA/VIC/SID + shadow-SID (planned phase)
 - `tests/test_snapshot_cpu_regs.py` — active snoop + trampoline (planned phase)

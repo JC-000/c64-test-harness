@@ -440,17 +440,19 @@ class TestExtractReuContents:
         assert t.writes  # REC programming + stash restore
         assert all(ov == _REU_STAGING_OVERRIDE for _, _, ov in t.writes)
 
-    def test_pause_and_resume_paired(self) -> None:
+    def test_default_runs_unpaused(self) -> None:
+        # machine:pause freezes REC DMA on Ultimate hardware (live-verified
+        # C64U fw 1.1.0), so the default must never pause.
         t = _FakeRecTransport(_pattern(1024))
         extract_reu_contents(t, 1024, settle=0)
-        t.client.pause.assert_called_once_with()
-        assert t.resume_calls == 1
-
-    def test_pause_false_skips_pause(self) -> None:
-        t = _FakeRecTransport(_pattern(1024))
-        extract_reu_contents(t, 1024, settle=0, pause=False)
         t.client.pause.assert_not_called()
         assert t.resume_calls == 0
+
+    def test_pause_true_pairs_pause_and_resume(self) -> None:
+        t = _FakeRecTransport(_pattern(1024))
+        extract_reu_contents(t, 1024, settle=0, pause=True)
+        t.client.pause.assert_called_once_with()
+        assert t.resume_calls == 1
 
     def test_resume_even_when_bank_read_fails(self) -> None:
         t = _FakeRecTransport(_pattern(1024))
@@ -465,7 +467,7 @@ class TestExtractReuContents:
 
         t.read_memory = flaky_read  # type: ignore[method-assign]
         with pytest.raises(RuntimeError, match="staging window read"):
-            extract_reu_contents(t, 1024, settle=0)
+            extract_reu_contents(t, 1024, settle=0, pause=True)
         assert t.resume_calls == 1  # resumed despite the failure
         # Stash restore still happened (last write is the 32 KiB window).
         assert t.writes[-1][0] == _REU_STAGING_BASE

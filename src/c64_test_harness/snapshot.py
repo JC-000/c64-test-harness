@@ -532,7 +532,7 @@ def extract_reu_contents(
     size_bytes: int,
     *,
     settle: float = 0.05,
-    pause: bool = True,
+    pause: bool = False,
 ) -> bytes:
     """Read *size_bytes* of REU expansion memory via the staging window.
 
@@ -540,15 +540,22 @@ def extract_reu_contents(
     upstream ``GET /v1/machine:reumem`` feature request is pending), so
     the extract stages each bank through C64 RAM:
 
-    1. Best-effort CPU pause (``transport.client.pause()`` when
-       available; skipped with ``pause=False`` or on backends without
-       one — VICE's binary monitor already holds the machine during
-       memory commands).
-    2. Stash the 32 KB staging window ``$0800-$87FF``.
-    3. Per 32 KB bank: program an REU→C64 transfer through the REC
+    1. Stash the 32 KB staging window ``$0800-$87FF``.
+    2. Per 32 KB bank: program an REU→C64 transfer through the REC
        registers (``$DF02-$DF0A`` then the command at ``$DF01``), wait
        *settle* seconds for the DMA to land, and read the window back.
-    4. Restore the original 32 KB and resume the CPU if it was paused.
+    3. Restore the original 32 KB.
+
+    ``pause=True`` requests a CPU pause around the extract
+    (``transport.client.pause()`` when available), but **must not be
+    used on Ultimate hardware**: live-verified on C64U fw 1.1.0
+    (2026-07-21), ``machine:pause`` freezes the whole machine clock
+    including the REC's DMA engine, so the staged transfers never
+    execute and the extract returns stale RAM. The default therefore
+    runs unpaused — the capture is not atomic, so ensure the running
+    program isn't actively mutating REU during the extract. On VICE
+    the knob is irrelevant: the binary monitor already holds the
+    machine during memory commands.
 
     All staging/REC writes carry ``override="reu-snapshot-staging"`` so
     a strict :class:`~c64_test_harness.MemoryPolicy` doesn't block them.
