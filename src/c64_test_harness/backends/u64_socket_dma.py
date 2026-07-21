@@ -55,6 +55,13 @@ REU_WRITE_MAX_CHUNK = 0xFFFF - 3
 #: The REU address space is 24-bit (16 MB).
 _REU_ADDRESS_SPACE = 0x1000000
 
+#: Worst-case REUWRITE drain rate used to scale the completion-barrier
+#: timeout.  Live-measured on C64U fw 1.1.0 (2026-07-21): a 96 KiB burst
+#: drains in 0.4-19 s depending on what the firmware is doing, i.e. down
+#: to ~5 KiB/s; 4 KiB/s adds margin.  This is a timeout ceiling, not a
+#: wait — the barrier returns as soon as the reply arrives.
+_REU_DRAIN_FLOOR_BPS = 4096.0
+
 
 class SocketDMAClient:
     """Client for the U64 SocketDMA binary protocol on TCP 64.
@@ -241,9 +248,10 @@ class SocketDMAClient:
         read-back started right after this method returns races the
         firmware's socket drain and can observe stale REU contents
         (live-observed on C64U fw 1.1.0, 2026-07-21: a 96 KiB write
-        needs ~0.5 s to drain; the barrier itself is that wait).  Pass
-        ``sync=False`` only when a later same-connection command or
-        barrier follows anyway.
+        takes 0.4-19 s to drain depending on firmware load; the barrier
+        itself is that wait, with a recv timeout scaled by payload size
+        at the worst-observed drain rate).  Pass ``sync=False`` only
+        when a later same-connection command or barrier follows anyway.
         """
         if not (0 <= offset <= 0xFFFFFF):
             raise Ultimate64Error(f"REU offset {offset:#x} out of range (24-bit)")
@@ -263,6 +271,14 @@ class SocketDMAClient:
                 payload = struct.pack("<I", offset + i)[:3] + chunk
                 self._send(_CMD_REUWRITE, payload)
             if sync:
+                # Drain time is erratic on C64U fw 1.1.0 — 0.4 s to 19 s
+                # live-observed for the same 96 KiB burst — so the flat
+                # client timeout is not enough for the barrier's recv.
+                # Budget the worst observed rate (~5 KiB/s) with margin.
+                if self._sock is not None:
+                    self._sock.settimeout(
+                        self._timeout + len(data) / _REU_DRAIN_FLOOR_BPS
+                    )
                 try:
                     self.identify()
                 except Ultimate64Error as exc:
@@ -270,6 +286,9 @@ class SocketDMAClient:
                         "REUWRITE completion barrier (IDENTIFY) failed — the "
                         f"writes may not have been applied: {exc}"
                     ) from exc
+                finally:
+                    if self._sock is not None:
+                        self._sock.settimeout(self._timeout)
         finally:
             if opened:
                 self.close()
