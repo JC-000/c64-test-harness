@@ -215,6 +215,9 @@ class _MockTransport:
 
 
 class TestReuWriteChunking:
+    # All writes pass sync=False: the recording client has no socket to
+    # answer the IDENTIFY completion barrier.  Barrier framing is covered
+    # by the wire-level tests in test_u64_socket_dma.py.
     def test_chunk_ceiling_constant(self) -> None:
         # 16-bit command length field minus the 3-byte offset prefix.
         assert REU_WRITE_MAX_CHUNK == 0xFFFF - 3 == 65532
@@ -227,7 +230,7 @@ class TestReuWriteChunking:
     def test_exact_ceiling_is_single_command(self) -> None:
         data = _pattern(REU_WRITE_MAX_CHUNK)
         c = _RecordingDMAClient()
-        c.reu_write(0, data)
+        c.reu_write(0, data, sync=False)
         assert len(c.sent) == 1
         opcode, payload = c.sent[0]
         assert opcode == _CMD_REUWRITE
@@ -238,7 +241,7 @@ class TestReuWriteChunking:
     def test_ceiling_plus_one_splits_in_two(self) -> None:
         data = _pattern(REU_WRITE_MAX_CHUNK + 1)
         c = _RecordingDMAClient()
-        c.reu_write(0, data)
+        c.reu_write(0, data, sync=False)
         assert len(c.sent) == 2
         assert c.sent[0][1][3:] == data[:REU_WRITE_MAX_CHUNK]
         # Second command: offset advanced by one full chunk, one data byte.
@@ -249,7 +252,7 @@ class TestReuWriteChunking:
     def test_64kib_splits_in_two(self) -> None:
         data = _pattern(65536)
         c = _RecordingDMAClient()
-        c.reu_write(0, data)
+        c.reu_write(0, data, sync=False)
         assert [len(p) - 3 for _, p in c.sent] == [REU_WRITE_MAX_CHUNK, 4]
         reassembled = b"".join(p[3:] for _, p in c.sent)
         assert reassembled == data
@@ -258,7 +261,7 @@ class TestReuWriteChunking:
         base = 0x010000
         data = _pattern(200_000)
         c = _RecordingDMAClient()
-        c.reu_write(base, data)
+        c.reu_write(base, data, sync=False)
         expected_offsets = list(range(0, len(data), REU_WRITE_MAX_CHUNK))
         got_offsets = [int.from_bytes(p[:3], "little") for _, p in c.sent]
         assert got_offsets == [base + o for o in expected_offsets]
@@ -269,7 +272,7 @@ class TestReuWriteChunking:
         expected_commands = math.ceil(size / REU_WRITE_MAX_CHUNK)
         assert expected_commands == 257
         c = _RecordingDMAClient()
-        c.reu_write(0, bytes(size))
+        c.reu_write(0, bytes(size), sync=False)
         assert len(c.sent) == expected_commands
         # Last chunk carries the remainder.
         assert len(c.sent[-1][1]) - 3 == size - 256 * REU_WRITE_MAX_CHUNK == 1024
@@ -291,7 +294,7 @@ class TestReuWriteChunking:
 
     def test_write_ending_exactly_at_16mb_accepted(self) -> None:
         c = _RecordingDMAClient()
-        c.reu_write(0xFFFFFF, b"\xAA")
+        c.reu_write(0xFFFFFF, b"\xAA", sync=False)
         assert len(c.sent) == 1
         assert c.sent[0][1] == b"\xFF\xFF\xFF\xAA"
 

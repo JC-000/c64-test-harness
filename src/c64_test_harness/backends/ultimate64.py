@@ -254,9 +254,12 @@ class Ultimate64Transport(HardwareTransportBase):
         immediately here, and a connect failure here latches the fast path
         off for the transport's lifetime.
 
-        The protocol is fire-and-forget — no ack, and REU contents cannot
-        be read back over REST.  Byte-fidelity verification, when needed,
-        goes through the snapshot staging-window extract
+        ``REUWRITE`` has no per-command ack, so the client finishes with
+        an in-band ``IDENTIFY`` completion barrier — when this method
+        returns, the firmware has applied every chunk (a read-back
+        started immediately afterwards is safe).  REU contents still
+        cannot be read back over REST; byte-fidelity verification, when
+        needed, goes through the snapshot staging-window extract
         (:func:`c64_test_harness.snapshot.extract_reu_contents`).
 
         :raises Ultimate64Error: if SocketDMA is latched off, the connect

@@ -223,7 +223,7 @@ class SocketDMAClient:
             if opened:
                 self.close()
 
-    def reu_write(self, offset: int, data: bytes) -> None:
+    def reu_write(self, offset: int, data: bytes, *, sync: bool = True) -> None:
         """Send 0xFF07 REUWRITE: 3-byte LE offset (24-bit) + data.
 
         The firmware reads only 3 bytes of offset (REU is 16 MB max).
@@ -231,10 +231,19 @@ class SocketDMAClient:
         A single command carries at most :data:`REU_WRITE_MAX_CHUNK` data
         bytes (the 16-bit length field covers the 3-byte offset prefix +
         data).  Larger payloads are transparently split into sequential
-        commands with advancing offsets, all on one connection.  The
-        protocol is fire-and-forget: there is no per-command ack, and REU
-        memory has no REST read-back — byte-fidelity verification is the
-        caller's job (e.g. the snapshot staging-window extract).
+        commands with advancing offsets, all on one connection.
+
+        ``REUWRITE`` itself has no per-command ack, so with ``sync=True``
+        (the default) the method finishes with an in-band ``IDENTIFY``
+        completion barrier: the firmware services commands on a
+        connection strictly in order, so once the identify reply arrives
+        every preceding write has been applied.  Without the barrier a
+        read-back started right after this method returns races the
+        firmware's socket drain and can observe stale REU contents
+        (live-observed on C64U fw 1.1.0, 2026-07-21: a 96 KiB write
+        needs ~0.5 s to drain; the barrier itself is that wait).  Pass
+        ``sync=False`` only when a later same-connection command or
+        barrier follows anyway.
         """
         if not (0 <= offset <= 0xFFFFFF):
             raise Ultimate64Error(f"REU offset {offset:#x} out of range (24-bit)")
@@ -253,6 +262,14 @@ class SocketDMAClient:
                 chunk = data[i : i + REU_WRITE_MAX_CHUNK]
                 payload = struct.pack("<I", offset + i)[:3] + chunk
                 self._send(_CMD_REUWRITE, payload)
+            if sync:
+                try:
+                    self.identify()
+                except Ultimate64Error as exc:
+                    raise Ultimate64Error(
+                        "REUWRITE completion barrier (IDENTIFY) failed — the "
+                        f"writes may not have been applied: {exc}"
+                    ) from exc
         finally:
             if opened:
                 self.close()
