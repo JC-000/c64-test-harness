@@ -30,6 +30,7 @@ from typing import Optional
 from .ultimate64_client import Ultimate64Error
 
 __all__ = [
+    "REU_WRITE_MAX_CHUNK",
     "SocketDMAClient",
     "SocketDMAIdentifyUDP",
 ]
@@ -45,6 +46,21 @@ _CMD_KERNALWRITE = 0xFF08
 _CMD_DMAJUMP = 0xFF09
 _CMD_IDENTIFY = 0xFF0E
 _CMD_AUTHENTICATE = 0xFF1F
+
+#: Maximum REU data bytes in a single REUWRITE command: the 16-bit command
+#: length field covers the whole payload, and the payload leads with a
+#: 3-byte offset, so at most ``0xFFFF - 3`` data bytes fit per command.
+REU_WRITE_MAX_CHUNK = 0xFFFF - 3
+
+#: The REU address space is 24-bit (16 MB).
+_REU_ADDRESS_SPACE = 0x1000000
+
+#: Worst-case REUWRITE drain rate used to scale the completion-barrier
+#: timeout.  Live-measured on C64U fw 1.1.0 (2026-07-21): a 96 KiB burst
+#: drains in 0.4-19 s depending on what the firmware is doing, i.e. down
+#: to ~5 KiB/s; 4 KiB/s adds margin.  This is a timeout ceiling, not a
+#: wait — the barrier returns as soon as the reply arrives.
+_REU_DRAIN_FLOOR_BPS = 4096.0
 
 
 class SocketDMAClient:
@@ -214,19 +230,65 @@ class SocketDMAClient:
             if opened:
                 self.close()
 
-    def reu_write(self, offset: int, data: bytes) -> None:
+    def reu_write(self, offset: int, data: bytes, *, sync: bool = True) -> None:
         """Send 0xFF07 REUWRITE: 3-byte LE offset (24-bit) + data.
 
         The firmware reads only 3 bytes of offset (REU is 16 MB max).
+
+        A single command carries at most :data:`REU_WRITE_MAX_CHUNK` data
+        bytes (the 16-bit length field covers the 3-byte offset prefix +
+        data).  Larger payloads are transparently split into sequential
+        commands with advancing offsets, all on one connection.
+
+        ``REUWRITE`` itself has no per-command ack, so with ``sync=True``
+        (the default) the method finishes with an in-band ``IDENTIFY``
+        completion barrier: the firmware services commands on a
+        connection strictly in order, so once the identify reply arrives
+        every preceding write has been applied.  Without the barrier a
+        read-back started right after this method returns races the
+        firmware's socket drain and can observe stale REU contents
+        (live-observed on C64U fw 1.1.0, 2026-07-21: a 96 KiB write
+        takes 0.4-19 s to drain depending on firmware load; the barrier
+        itself is that wait, with a recv timeout scaled by payload size
+        at the worst-observed drain rate).  Pass ``sync=False`` only
+        when a later same-connection command or barrier follows anyway.
         """
         if not (0 <= offset <= 0xFFFFFF):
             raise Ultimate64Error(f"REU offset {offset:#x} out of range (24-bit)")
         if not data:
             return
-        payload = struct.pack("<I", offset)[:3] + bytes(data)
+        data = bytes(data)
+        end = offset + len(data)
+        if end > _REU_ADDRESS_SPACE:
+            raise Ultimate64Error(
+                f"REU write of {len(data)} bytes at {offset:#x} runs past the "
+                f"16 MB REU address space (end {end:#x} > {_REU_ADDRESS_SPACE:#x})"
+            )
         opened = self._sock is None
         try:
-            self._send(_CMD_REUWRITE, payload)
+            for i in range(0, len(data), REU_WRITE_MAX_CHUNK):
+                chunk = data[i : i + REU_WRITE_MAX_CHUNK]
+                payload = struct.pack("<I", offset + i)[:3] + chunk
+                self._send(_CMD_REUWRITE, payload)
+            if sync:
+                # Drain time is erratic on C64U fw 1.1.0 — 0.4 s to 19 s
+                # live-observed for the same 96 KiB burst — so the flat
+                # client timeout is not enough for the barrier's recv.
+                # Budget the worst observed rate (~5 KiB/s) with margin.
+                if self._sock is not None:
+                    self._sock.settimeout(
+                        self._timeout + len(data) / _REU_DRAIN_FLOOR_BPS
+                    )
+                try:
+                    self.identify()
+                except Ultimate64Error as exc:
+                    raise Ultimate64Error(
+                        "REUWRITE completion barrier (IDENTIFY) failed — the "
+                        f"writes may not have been applied: {exc}"
+                    ) from exc
+                finally:
+                    if self._sock is not None:
+                        self._sock.settimeout(self._timeout)
         finally:
             if opened:
                 self.close()

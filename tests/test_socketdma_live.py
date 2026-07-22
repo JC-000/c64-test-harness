@@ -36,6 +36,14 @@ What the mutating tests touch:
   raw item values (never the ``Cartridge`` item). No flash write.
 * ``test_restore_state_cartridge_safe`` — snapshots and immediately restores
   turbo/REU/cartridge state; a no-op round-trip regression check.
+* ``test_reuwrite_byte_fidelity`` — enables a 128 KB REU (original config
+  restored afterwards), writes a 96 KiB pattern into REU memory via the
+  SocketDMA ``REUWRITE`` snapshot-restore path, reads it back through the
+  32 KB staging window at ``$0800-$87FF`` (stashed and restored around the
+  extract; the machine is paused/resumed via REST), and compares
+  byte-for-byte.  This is the deferred live validation for issue #134 —
+  REUWRITE is accepted by C64U fw 1.1.0 but byte fidelity has not been
+  hardware-verified until this passes.
 
 Never: ``save_config_to_flash``, ``poweroff``, ``reboot``, or a machine
 reset.
@@ -229,6 +237,72 @@ def test_set_reu_c64u_contract(
 # --------------------------------------------------------------------------- #
 # restore_state cartridge-safety regression (mutate)                          #
 # --------------------------------------------------------------------------- #
+
+# --------------------------------------------------------------------------- #
+# REUWRITE byte fidelity — snapshot REU layer (mutate; issue #134)             #
+# --------------------------------------------------------------------------- #
+
+@requires_mutate
+def test_reuwrite_byte_fidelity(client: Ultimate64Client) -> None:
+    """Pattern via REUWRITE → staging-window read-back → byte-exact compare.
+
+    96 KiB deliberately crosses both seams: the 65532-byte REUWRITE
+    per-command chunk boundary and three 32 KiB staging banks.  A refused
+    TCP/64 connect means the Ultimate DMA Service is disabled on the
+    device — a valid configuration, so it skips (the REU restore path has
+    no fallback to prove anything against).  The module ``client`` fixture
+    holds the device lock; the transport owns its own REST client.
+
+    Restores the original REU config items afterwards (never the
+    ``Cartridge`` item — its value is a non-settable mirror on the C64U).
+    """
+    from c64_test_harness.snapshot import extract_reu_contents
+
+    size = 96 * 1024
+    pattern = bytes(((i * 7) ^ (i >> 8) ^ (i >> 16)) & 0xFF for i in range(size))
+
+    items = _category_items(client, _CAT_CART)
+    orig_enabled = items.get("RAM Expansion Unit")
+    orig_size = items.get("REU Size")
+
+    transport = Ultimate64Transport(host=_HOST or "", password=_PW, timeout=30.0)
+    try:
+        set_reu(client, True, size="128 KB")
+        try:
+            transport.socket_dma_reu_write(0, pattern)
+        except Ultimate64Error as exc:
+            msg = str(exc).lower()
+            if "connect" in msg or "latched" in msg:
+                pytest.skip(
+                    f"Ultimate DMA Service disabled on device (TCP 64): {exc}"
+                )
+            raise
+
+        readback = extract_reu_contents(transport, size, settle=0.1)
+
+        assert len(readback) == size
+        if readback != pattern:
+            first = next(
+                i for i in range(size) if readback[i] != pattern[i]
+            )
+            diffs = sum(
+                1 for i in range(size) if readback[i] != pattern[i]
+            )
+            pytest.fail(
+                f"REU byte-fidelity mismatch: {diffs}/{size} bytes differ, "
+                f"first at REU offset {first:#x} "
+                f"(wrote {pattern[first]:#04x}, read {readback[first]:#04x})"
+            )
+    finally:
+        transport.close()
+        restore: dict = {}
+        if isinstance(orig_enabled, str):
+            restore["RAM Expansion Unit"] = orig_enabled
+        if isinstance(orig_size, str):
+            restore["REU Size"] = orig_size
+        if restore:
+            client.set_config_items(_CAT_CART, restore)
+
 
 @requires_mutate
 def test_restore_state_cartridge_safe(client: Ultimate64Client) -> None:

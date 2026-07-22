@@ -235,6 +235,61 @@ class Ultimate64Transport(HardwareTransportBase):
         )
         return False
 
+    def socket_dma_reu_write(self, offset: int, data: bytes) -> None:
+        """Write *data* into REU expansion memory via SocketDMA ``REUWRITE``.
+
+        Routes through the transport's managed (lazily-connected,
+        teardown-closed) SocketDMA client, the same one the ``write_memory``
+        fast path uses, so the TCP/64 connection is reused across calls.
+        Payloads above the per-command ceiling are chunked by
+        :meth:`SocketDMAClient.reu_write` (~65 KiB per command, 24-bit
+        offsets advancing automatically).
+
+        Unlike the ``write_memory`` fast path this does **not** require the
+        ``socket_dma`` master switch: there is no REST fallback for REU
+        memory (the firmware has no REU write endpoint, and no read-back
+        endpoint either), so an unusable SocketDMA service is a hard error,
+        never a silent skip or degrade.  The transport's connect-failure
+        latch is respected in both directions: a latched fast path fails
+        immediately here, and a connect failure here latches the fast path
+        off for the transport's lifetime.
+
+        ``REUWRITE`` has no per-command ack, so the client finishes with
+        an in-band ``IDENTIFY`` completion barrier — when this method
+        returns, the firmware has applied every chunk (a read-back
+        started immediately afterwards is safe).  REU contents still
+        cannot be read back over REST; byte-fidelity verification, when
+        needed, goes through the snapshot staging-window extract
+        (:func:`c64_test_harness.snapshot.extract_reu_contents`).
+
+        :raises Ultimate64Error: if SocketDMA is latched off, the connect
+            fails (which also latches), or a send fails mid-transfer.
+        """
+        if not data:
+            return
+        unavailable_hint = (
+            f"SocketDMA (TCP {self._client.host}:64) is required for REU "
+            "writes and there is NO REST fallback. Enable 'Ultimate DMA "
+            "Service' in the device's Network Settings and ensure TCP port "
+            "64 is reachable, then retry."
+        )
+        if self._socket_dma_unusable:
+            raise Ultimate64Error(
+                "SocketDMA is latched off after an earlier connect failure; "
+                f"cannot write REU memory. {unavailable_hint}"
+            )
+        client = self._ensure_socket_dma_client()
+        try:
+            client.__enter__()
+        except Ultimate64Error as exc:
+            self._socket_dma_unusable = True
+            raise Ultimate64Error(
+                f"SocketDMA connect failed ({exc}); cannot write REU memory. "
+                f"{unavailable_hint}"
+            ) from exc
+        # Send failures propagate: there is nothing to fall back to.
+        client.reu_write(offset, bytes(data))
+
     def read_screen_codes(self) -> list[int]:
         """Read raw screen codes (cols * rows values) from screen memory."""
         total = self._screen_cols * self._screen_rows

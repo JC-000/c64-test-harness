@@ -653,17 +653,20 @@ from c64_test_harness.backends.ultimate64_helpers import (
 
 ## Module: snapshot
 
-Cross-backend VICE/U64 snapshot interop using VICE's native `.vsf` format as the on-disk wire. **Phase A** (PR #115 / commit 45a5844): 64 KB RAM + CPU port round-trip only. Later phases will add CIA/VIC/SID register state, drive images, REU contents, and cartridge bytes — see `docs/snapshot_interop.md` for the per-layer asymmetry matrix and the U64-side limitations (REST cannot read cart bytes / disk images / REU memory back; 6510 registers aren't directly observable; 28 of 32 SID registers are write-only on hardware).
+Cross-backend VICE/U64 snapshot interop using VICE's native `.vsf` format as the on-disk wire. **Phase A** (PR #115 / commit 45a5844): 64 KB RAM + CPU port round-trip. **REU layer** (issue #134): `reu_size_bytes` + `reu_contents` capture/restore, live-validated byte-exact on C64U fw 1.1.0 (2026-07-21). Later phases will add CIA/VIC/SID register state, drive images, and cartridge bytes — see `docs/snapshot_interop.md` for the per-layer asymmetry matrix and the U64-side limitations (REST cannot read cart bytes / disk images / REU memory back; 6510 registers aren't directly observable; 28 of 32 SID registers are write-only on hardware).
 
 ### `Snapshot` (frozen dataclass)
 - `.ram: bytes` -- 64 KB RAM image
 - `.cpu_port_data: int` -- value at `$0001`
 - `.cpu_port_dir: int` -- value at `$0000`
 - `.exrom: int` (default 1), `.game: int` (default 1) -- cartridge control lines
+- `.reu_size_bytes: int | None`, `.reu_contents: bytes | None` -- REU layer; travels only in the sidecar bundle (`reu.bin`), never in the `.vsf`
 
 ### Functions
-- `extract_snapshot(transport: C64Transport) -> Snapshot` -- Reads RAM + CPU port via the protocol. Same code path for VICE and U64. Re-exported from the package root.
-- `restore_snapshot(transport: C64Transport, snap: Snapshot) -> None` -- Writes RAM and CPU port back. Logs one WARNING per restore and threads `override="snapshot-restore"` through every `write_memory` so the bulk restore crosses `MemoryPolicy`-reserved regions without raising. Re-exported from the package root.
+- `extract_snapshot(transport, *, include_reu=False, reu_size_bytes=None, reu_settle=0.05) -> Snapshot` -- Reads RAM + CPU port via the protocol; `include_reu=True` adds the staging-window REU extract (`reu_size_bytes=None` auto-detects from the U64 config). Same code path for VICE and U64. Re-exported from the package root.
+- `restore_snapshot(transport, snap, *, restore_reu=True) -> None` -- Writes RAM and CPU port back; when `snap.reu_contents` is present, enables the REU via generation-aware `set_reu` and writes contents via `Ultimate64Transport.socket_dma_reu_write` (SocketDMA `REUWRITE` — **no REST fallback**; unavailable DMA service raises `Ultimate64Error`, VICE-shaped transports raise `SnapshotRestoreError`; `restore_reu=False` opts out). Logs one WARNING per restore and threads `override="snapshot-restore"` through every `write_memory` so the bulk restore crosses `MemoryPolicy`-reserved regions without raising. Re-exported from the package root.
+- `extract_reu_contents(transport, size_bytes, *, settle=0.05, pause=False) -> bytes` -- Staging-window REU readback ($0800–$87FF, 32 KB banks via REC-programmed REU→C64 transfers). **Must run unpaused on Ultimate hardware** — `machine:pause` freezes the machine clock including REC DMA (live-verified C64U fw 1.1.0), so a paused extract returns stale RAM. Capture is therefore not atomic.
+- `Snapshot.to_bundle(path)` / `Snapshot.from_bundle(path)` -- Sidecar directory round-trip: `snapshot.vsf` + `manifest.json` + `reu.bin`.
 - `Snapshot.to_vsf() -> bytes` -- Emit a complete VICE-consumable `.vsf`. A bundled ~180 KB template captured from VICE 3.10 at BASIC READY supplies the ~30 modules VICE 3.10 requires (MAINCPU, CIA1/2, SID, VIC-II, GLUE, drives, joyports, ...); the codec overwrites only the C64MEM module body.
 - `Snapshot.from_vsf(data: bytes) -> Snapshot` -- Parse a VICE-emitted `.vsf` back into RAM + CPU port.
 - `SnapshotFormatError` -- Raised on malformed `.vsf` input.
@@ -825,7 +828,7 @@ with Ultimate64InstanceManager(devices, acquire_timeout=30.0) as mgr:
 
 ## Module: backends.u64_socket_dma
 
-Binary "SocketDMA" command channel on TCP port 64, distinct from REST. Covers capabilities REST lacks (keyboard inject, REU write, raw reset, DMA load/jump) and is the transport behind the `Ultimate64Transport.socket_dma` bulk-write fast path. Wire format: 2-byte LE opcode + 2-byte LE length + payload; mostly fire-and-forget (no reply — confirmation is the connection staying open), so pair every write with a read-back where correctness matters. On the C64 Ultimate the service ships disabled (enable Network Settings → "Ultimate DMA Service"); U64E fw 3.14 availability untested. Both classes are package-root exports.
+Binary "SocketDMA" command channel on TCP port 64, distinct from REST. Covers capabilities REST lacks (keyboard inject, REU write, raw reset, DMA load/jump) and is the transport behind the `Ultimate64Transport.socket_dma` bulk-write fast path. Wire format: 2-byte LE opcode + 2-byte LE length + payload; mostly fire-and-forget (no reply — confirmation is the connection staying open), so pair every write with a read-back where correctness matters. Commands on one connection are serviced strictly in order, so a replying command (IDENTIFY) doubles as a completion barrier — `reu_write` does this by default. On the C64 Ultimate the service ships disabled (enable Network Settings → "Ultimate DMA Service"); U64E fw 3.14 availability untested. Both classes are package-root exports.
 
 ### `SocketDMAClient(host, port=64, password=None, timeout=5.0)`
 Context manager — `with` opens one connection reused across commands; outside `with`, each call opens/closes its own (slow for chains; every connect re-authenticates when a network password is set).
@@ -833,7 +836,7 @@ Context manager — `with` opens one connection reused across commands; outside 
 - `dma_write(addr, data)` — raw memory write (opcode 0xFF06), no autostart; payload ≤ 65535 bytes/command
 - `dma_load(addr, data, run=False)` — PRG-style load (0xFF01), `run=True` → DMARUN (0xFF02) autostart
 - `dma_jump(addr)` — 0xFF09
-- `reu_write(offset, data)` — 0xFF07; 24-bit LE offset, ≤16 MB REU space (no readback exists on any firmware — see issue #134 for the snapshot REU restore wiring)
+- `reu_write(offset, data, *, sync=True)` — 0xFF07; 24-bit LE offset, ≤16 MB REU space; chunks transparently at `REU_WRITE_MAX_CHUNK` (65 532) data bytes/command. `sync=True` ends with an in-band IDENTIFY completion barrier — REUWRITE has no per-command ack and the C64U fw 1.1.0 drains large bursts erratically (0.4–19 s live-measured for 96 KiB), so without the barrier an immediate read-back sees stale contents; the barrier's recv timeout scales with payload size. No REST readback exists on any firmware — extraction goes through the snapshot staging window (issue #134, wired).
 - `inject_keys(text)` — 0xFF03; firmware DMAs into the 10-byte keyboard buffer
 - `reset()` — 0xFF04; recoverable, menu-equivalent
 - `authenticate()` — 0xFF1F; required first on password-protected devices (fw 3.12+)

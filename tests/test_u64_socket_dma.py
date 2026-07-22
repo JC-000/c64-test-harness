@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from c64_test_harness.backends.u64_socket_dma import (
+    REU_WRITE_MAX_CHUNK,
     SocketDMAClient,
     SocketDMAIdentifyUDP,
 )
@@ -181,18 +182,36 @@ def test_inject_keys_sends_petscii_payload(fake_server):
     assert srv.requests == [(0xFF03, b"RUN\r")]
 
 
+_IDENTIFY_REPLY = bytes([4]) + b"Fake"
+
+
 def test_reu_write_packs_24bit_offset(fake_server):
-    srv = fake_server()
+    srv = fake_server(replies={0xFF0E: _IDENTIFY_REPLY})
     with SocketDMAClient("127.0.0.1", port=srv.port, timeout=2.0) as c:
         c.reu_write(0x123456, b"\xDE\xAD\xBE\xEF")
+    # sync=True (default): the write is followed by an IDENTIFY barrier.
+    assert [op for op, _ in srv.requests] == [0xFF07, 0xFF0E]
+    opcode, payload = srv.requests[0]
+    assert payload == b"\x56\x34\x12\xDE\xAD\xBE\xEF"
+
+
+def test_reu_write_sync_false_skips_barrier(fake_server):
+    srv = fake_server()
+    with SocketDMAClient("127.0.0.1", port=srv.port, timeout=2.0) as c:
+        c.reu_write(0x000000, b"\x01\x02", sync=False)
     for _ in range(50):
         if srv.requests:
             break
         time.sleep(0.01)
-    assert len(srv.requests) == 1
-    opcode, payload = srv.requests[0]
-    assert opcode == 0xFF07
-    assert payload == b"\x56\x34\x12\xDE\xAD\xBE\xEF"
+    assert [op for op, _ in srv.requests] == [0xFF07]
+
+
+def test_reu_write_barrier_failure_raises(fake_server):
+    # Server silent on IDENTIFY -> barrier recv times out -> clear error.
+    srv = fake_server()
+    with SocketDMAClient("127.0.0.1", port=srv.port, timeout=0.3) as c:
+        with pytest.raises(Ultimate64Error, match="completion barrier"):
+            c.reu_write(0x000000, b"\x01\x02")
 
 
 def test_reu_write_rejects_oversize_offset(fake_server):
@@ -200,6 +219,28 @@ def test_reu_write_rejects_oversize_offset(fake_server):
     with SocketDMAClient("127.0.0.1", port=srv.port, timeout=2.0) as c:
         with pytest.raises(Ultimate64Error):
             c.reu_write(0x1000000, b"\x00")
+
+
+def test_reu_write_chunks_oversize_payload_on_the_wire(fake_server):
+    """A 64 KiB + 1 REU write becomes two framed REUWRITE commands.
+
+    Wire-level counterpart of the chunking unit tests in
+    ``test_snapshot_reu.py``: each command's 16-bit length field covers
+    the 3-byte offset prefix + data, so a chunk carries at most
+    ``REU_WRITE_MAX_CHUNK`` (65532) data bytes and the second command's
+    offset advances by exactly one chunk.
+    """
+    data = bytes((i * 13) & 0xFF for i in range(65536 + 1))
+    srv = fake_server(replies={0xFF0E: _IDENTIFY_REPLY})
+    with SocketDMAClient("127.0.0.1", port=srv.port, timeout=2.0) as c:
+        c.reu_write(0x000100, data)
+    assert [op for op, _ in srv.requests] == [0xFF07, 0xFF07, 0xFF0E]
+    srv.requests = srv.requests[:2]
+    first, second = (payload for _, payload in srv.requests)
+    assert len(first) == 3 + REU_WRITE_MAX_CHUNK == 0xFFFF
+    assert int.from_bytes(first[:3], "little") == 0x000100
+    assert int.from_bytes(second[:3], "little") == 0x000100 + REU_WRITE_MAX_CHUNK
+    assert first[3:] + second[3:] == data
 
 
 def test_identify_returns_title(fake_server):
