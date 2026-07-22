@@ -735,6 +735,8 @@ if lock.acquire(timeout=30.0):
 - `acquire_or_raise(timeout=30.0, *, progress_window=60.0) -> None` -- Wraps `acquire()` and raises `DeviceLockTimeout` on timeout with structured diagnostics (holder PID, liveness, lockfile age, REST reachability). Prefer this over `acquire()` for live tests.
 - `release()` -- Release flock and stop the heartbeat thread. Does NOT delete lockfile (inode race safety, same as PortLock). Touches lockfile mtime via `os.utime` to wake `watchdog`-based waiters cooperatively (best-effort).
 - `read_info() -> dict | None` -- Read metadata without locking (diagnostics).
+- `queue_depth -> int | None` -- Property, lazily computed. Number of **live** waiters currently blocked in `acquire()` for this device (holder not counted). `0` = empty queue; `None` = unobservable (sidecar path unreadable). Read-only: never touches the flock.
+- `peek_queue_depth(device_host, lock_dir=None) -> int | None` -- Class method; same semantics as `queue_depth` but needs no instance and no lock — the pre-flight "should I even try to queue?" check for CI bots. Mechanism: each waiter registers an intent file in a `<lockfile>.queue/` sidecar directory before blocking (removed on exit from `acquire()`); dead-PID entries are excluded and garbage-collected, so crashed waiters don't inflate the count.
 - `cleanup_stale(lock_dir=None) -> int` -- Class method; removes lockfiles from dead PIDs.
 - `.device_host` / `.held` properties
 - Context manager support

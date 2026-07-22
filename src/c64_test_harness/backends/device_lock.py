@@ -9,6 +9,21 @@ Unlike :class:`PortLock` which uses non-blocking acquire, ``DeviceLock``
 supports a blocking ``acquire(timeout=...)`` so multiple agents queue up
 waiting for a single physical device.
 
+**Queue-depth observability.**  The wait queue is observable without
+touching the lock: each waiter registers an intent file in a
+``<lockfile>.queue/`` sidecar directory before blocking and removes it
+after acquiring (or on timeout/error).  ``lock.queue_depth`` (instance
+property) and ``DeviceLock.peek_queue_depth(device_host)`` (classmethod,
+no instance or lock required) both return the number of *live* waiters —
+entries whose recorded PID is dead are treated as stale, excluded from
+the count, and garbage-collected on the spot, so crashed waiters never
+inflate the count.  Both return ``None`` when the queue is unobservable
+(e.g. the sidecar path is unreadable).  Introspection is strictly
+read-only with respect to locking: ``acquire(timeout=...)`` semantics
+are unchanged.  The mechanism is plain files, so it is portable across
+Linux and macOS; it counts cooperating ``DeviceLock`` waiters (which is
+every harness consumer), not arbitrary foreign ``flock()`` callers.
+
 If ``watchdog`` is installed (``pip install c64-test-harness[notify]``),
 DeviceLock acquire wakes on filesystem events instead of polling.  The
 100ms poll cadence remains active as a backstop for kernel-released
@@ -26,6 +41,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 try:  # Optional dependency — see [project.optional-dependencies] notify
@@ -61,6 +77,12 @@ def _sanitize_device_id(host: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9.\-]", "_", host)
     s = re.sub(r"_+", "_", s)
     return s.strip("_") or "unknown"
+
+
+# Waiter intent files live in ``<lockfile>.queue/`` and are named
+# ``waiter-<pid>-<token>.json`` so the owning PID is recoverable from the
+# filename alone (no JSON parse needed for liveness checks).
+_WAITER_NAME_RE = re.compile(r"^waiter-(\d+)-[0-9a-f]+\.json$")
 
 
 class DeviceLockTimeout(TimeoutError):
@@ -184,7 +206,9 @@ class DeviceLock:
 
     The key difference from :class:`PortLock`: :meth:`acquire` polls
     with ``LOCK_NB`` in a loop up to *timeout* seconds, allowing
-    multiple agents to queue for the same physical device.
+    multiple agents to queue for the same physical device.  The queue
+    is observable read-only via :attr:`queue_depth` and
+    :meth:`peek_queue_depth` (see module docstring).
 
     Usage::
 
@@ -213,6 +237,7 @@ class DeviceLock:
         self._device_id = _sanitize_device_id(device_host)
         self._lock_dir = lock_dir or _default_lock_dir()
         self._lock_path = self._lock_dir / f"device-{self._device_id}.lock"
+        self._queue_dir_path = Path(str(self._lock_path) + ".queue")
         self._fd: int | None = None
         # Heartbeat: keep the lockfile mtime fresh so waiters using
         # queue-aware acquire() see this holder as "progressing" past
@@ -269,6 +294,13 @@ class DeviceLock:
             the lockfile (seconds) for it to count as "progressing".
             ``None`` disables queue-aware behavior (legacy mode: hard
             timeout).
+
+        While blocked, the waiter registers an intent file in the
+        ``<lockfile>.queue/`` sidecar directory (removed on exit from
+        this method, success or not) so :attr:`queue_depth` /
+        :meth:`peek_queue_depth` observers can see it.  Registration is
+        best-effort and never changes acquire semantics; an uncontended
+        acquire takes the fast path and registers nothing.
         """
         if self._fd is not None:
             # Already held by us; ensure heartbeat is running (idempotent).
@@ -281,14 +313,20 @@ class DeviceLock:
         except Exception:
             pass
 
+        # Fast path: an uncontended acquire never becomes a waiter, so it
+        # registers no queue intent.
+        if self._try_acquire_once():
+            self._start_heartbeat()
+            return True
+
         deadline = time.monotonic() + timeout
         notifier = _LockNotifier(self._lock_path) if _HAS_WATCHDOG else None
+        # We are about to block: register wait intent so queue_depth /
+        # peek_queue_depth observers see this waiter.  Best-effort — a
+        # failure to register must never affect acquire semantics.
+        intent = self._register_wait_intent()
         try:
             while True:
-                result = self._try_acquire_once()
-                if result:
-                    self._start_heartbeat()
-                    return True
                 # Queue-aware: if the current holder is live and recently
                 # progressing, extend the deadline.
                 if progress_window is not None and self._holder_is_progressing(
@@ -305,7 +343,11 @@ class DeviceLock:
                     notifier.wait(wait)
                 else:
                     time.sleep(wait)
+                if self._try_acquire_once():
+                    self._start_heartbeat()
+                    return True
         finally:
+            self._deregister_wait_intent(intent)
             if notifier is not None:
                 notifier.stop()
 
@@ -498,6 +540,116 @@ class DeviceLock:
             return json.loads(data)
         except (OSError, json.JSONDecodeError, ValueError):
             return None
+
+    # -- Queue-depth introspection (issue #130) --
+
+    @property
+    def queue_depth(self) -> int | None:
+        """Number of live waiters currently queued for this device.
+
+        Lazily computed on each access from the ``<lockfile>.queue/``
+        intent directory.  Entries whose recorded PID is dead are
+        treated as stale, excluded, and garbage-collected.  Returns
+        ``0`` when nobody is waiting (including when the sidecar
+        directory doesn't exist yet) and ``None`` when the queue is
+        unobservable (sidecar path unreadable or not a directory).
+
+        Read-only: never touches the flock, never blocks.  Note that
+        the count reflects *waiters*, not the holder — a held lock with
+        no queue reads ``0``.  If this instance is itself blocked in
+        :meth:`acquire` (e.g. observed from another thread), its own
+        intent entry is included.
+        """
+        return self._count_live_waiters(self._queue_dir_path)
+
+    @classmethod
+    def peek_queue_depth(
+        cls, device_host: str, lock_dir: Path | None = None
+    ) -> int | None:
+        """Pre-acquire peek at the wait-queue depth for *device_host*.
+
+        Classmethod so callers (e.g. a CI bot deciding whether to queue
+        or yield) can probe without constructing a lock or holding
+        anything.  Same semantics as :attr:`queue_depth`: live waiters
+        only, ``0`` for an empty/absent queue, ``None`` when
+        unobservable.
+        """
+        d = lock_dir or _default_lock_dir()
+        device_id = _sanitize_device_id(device_host)
+        queue_dir = Path(str(d / f"device-{device_id}.lock") + ".queue")
+        return cls._count_live_waiters(queue_dir)
+
+    @staticmethod
+    def _count_live_waiters(queue_dir: Path) -> int | None:
+        """Count live-PID intent files in *queue_dir*, pruning stale ones.
+
+        Stale-entry hygiene mirrors :meth:`cleanup_stale`: an entry
+        whose PID (parsed from the filename, falling back to the JSON
+        body) is dead or unparseable is unlinked best-effort and not
+        counted, so crashed waiters don't inflate the count forever.
+        """
+        try:
+            entries = list(queue_dir.iterdir())
+        except FileNotFoundError:
+            return 0
+        except OSError:
+            # Exists but unreadable / not a directory — unobservable.
+            return None
+        count = 0
+        for entry in entries:
+            pid: int | None = None
+            m = _WAITER_NAME_RE.match(entry.name)
+            if m:
+                pid = int(m.group(1))
+            else:
+                # Foreign filename — try the JSON body before giving up.
+                try:
+                    data = json.loads(entry.read_text())
+                    raw = data.get("pid")
+                    if isinstance(raw, int):
+                        pid = raw
+                except (OSError, json.JSONDecodeError, ValueError):
+                    pid = None
+            if pid is not None and _pid_alive(pid):
+                count += 1
+                continue
+            # Stale (dead PID) or unparseable — prune best-effort.
+            try:
+                entry.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return count
+
+    def _register_wait_intent(self) -> Path | None:
+        """Create this waiter's intent file; return its path or ``None``.
+
+        Best-effort: any failure returns ``None`` and the caller
+        proceeds without queue visibility (acquire semantics are never
+        affected).
+        """
+        try:
+            self._queue_dir_path.mkdir(parents=True, exist_ok=True)
+            name = f"waiter-{os.getpid()}-{uuid.uuid4().hex[:8]}.json"
+            path = self._queue_dir_path / name
+            meta = {
+                "pid": os.getpid(),
+                "ts": time.time(),
+                "device_host": self._device_host,
+            }
+            path.write_text(json.dumps(meta))
+            return path
+        except OSError:
+            return None
+
+    @staticmethod
+    def _deregister_wait_intent(path: Path | None) -> None:
+        """Remove this waiter's intent file (best-effort, ``None``-safe)."""
+        if path is None:
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     @classmethod
     def cleanup_stale(cls, lock_dir: Path | None = None) -> int:
