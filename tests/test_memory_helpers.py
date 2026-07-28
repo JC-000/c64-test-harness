@@ -4,6 +4,7 @@ import pytest
 
 from c64_test_harness.memory import (
     FlakeyReadError,
+    ShortReadError,
     read_bytes,
     read_bytes_chunked,
     read_bytes_verified,
@@ -58,6 +59,61 @@ class TestReadBytesChunked:
         result = read_bytes_chunked(t, 0x4000, 256, chunk_size=128)
         assert len(result) == 256
         assert all(b == 0xAA for b in result)
+
+    def test_short_chunk_retried_once_then_succeeds(self):
+        """A transiently short chunk is retried; the retry's full data
+        is used and the result stays aligned."""
+        t = MockTransport()
+        data = bytes(range(128)) * 2  # 256 bytes
+        calls = []
+        shorted = {"done": False}
+
+        def flaky_read(addr, length):
+            calls.append((addr, length))
+            offset = addr - 0x5000
+            full = data[offset : offset + length]
+            if addr == 0x5000 and not shorted["done"]:
+                shorted["done"] = True
+                return full[: length // 2]  # short once
+            return full
+
+        t.read_memory = flaky_read
+        result = read_bytes_chunked(t, 0x5000, 256, chunk_size=128)
+        assert result == data
+        # First chunk was read twice (short + retry), second once.
+        assert calls == [(0x5000, 128), (0x5000, 128), (0x5080, 128)]
+
+    def test_persistently_short_chunk_raises(self):
+        """A chunk that is short on the retry too raises ShortReadError
+        instead of silently returning short, misaligned data."""
+        t = MockTransport()
+
+        def always_short_read(addr, length):
+            return b"\xAA" * (length - 10)
+
+        t.read_memory = always_short_read
+        with pytest.raises(ShortReadError) as exc_info:
+            read_bytes_chunked(t, 0x6000, 256, chunk_size=128)
+        err = exc_info.value
+        assert err.addr == 0x6000
+        assert err.requested == 128
+        assert err.got == 118
+
+    def test_short_final_partial_chunk_raises(self):
+        """The short-read guard also covers the final partial chunk."""
+        t = MockTransport()
+
+        def read(addr, length):
+            if addr == 0x7000:
+                return b"\x11" * length  # first chunk fine
+            return b""  # final chunk empty (failed read)
+
+        t.read_memory = read
+        with pytest.raises(ShortReadError) as exc_info:
+            read_bytes_chunked(t, 0x7000, 200, chunk_size=128)
+        assert exc_info.value.addr == 0x7080
+        assert exc_info.value.requested == 72
+        assert exc_info.value.got == 0
 
 
 class TestReadBytesAutoChunk:
