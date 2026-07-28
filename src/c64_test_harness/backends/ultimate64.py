@@ -38,6 +38,14 @@ _SOCKET_DMA_CHUNK = 0x8000
 #: 1.1.0: 16 KiB lands in ~100-150 ms).
 _SOCKET_DMA_VERIFY_TIMEOUT = 2.0
 
+#: Worst-case SocketDMA drain rate used to scale the IDENTIFY
+#: completion-barrier recv timeout with payload size.  Same figure as
+#: ``u64_socket_dma._REU_DRAIN_FLOOR_BPS`` (live-measured on C64U fw
+#: 1.1.0: bursts drain as slowly as ~5 KiB/s under firmware load; 4 KiB/s
+#: adds margin).  This is a timeout ceiling, not a wait — the barrier
+#: returns as soon as the IDENTIFY reply arrives.
+_SOCKET_DMA_DRAIN_FLOOR_BPS = 4096.0
+
 
 class Ultimate64Transport(HardwareTransportBase):
     """C64Transport implementation backed by Ultimate 64 REST API.
@@ -171,14 +179,47 @@ class Ultimate64Transport(HardwareTransportBase):
             )
         return self._socket_dma_client
 
+    def _socket_dma_barrier(self, client: SocketDMAClient, payload_len: int) -> None:
+        """In-band ``IDENTIFY`` completion barrier for fire-and-forget sends.
+
+        The firmware services SocketDMA commands on a connection strictly
+        in order, so once the ``IDENTIFY`` reply arrives every preceding
+        ``DMAWRITE`` has been consumed and applied — the same barrier
+        :meth:`SocketDMAClient.reu_write` uses for ``REUWRITE``.  The recv
+        timeout is scaled by *payload_len* at the worst-observed drain
+        rate (:data:`_SOCKET_DMA_DRAIN_FLOOR_BPS`) because drain time is
+        erratic under firmware load; the barrier returns as soon as the
+        reply arrives.
+
+        :raises Ultimate64Error: when the barrier send/recv fails — the
+            preceding writes may not have been applied.
+        """
+        # The timeout scaling pokes the client's socket the same way
+        # reu_write does internally; guarded getattr keeps test fakes
+        # (no ``_sock``) working with the plain client timeout.
+        sock = getattr(client, "_sock", None)
+        base_timeout = getattr(client, "_timeout", 5.0)
+        if sock is not None:
+            sock.settimeout(
+                base_timeout + payload_len / _SOCKET_DMA_DRAIN_FLOOR_BPS
+            )
+        try:
+            client.identify()
+        finally:
+            if sock is not None:
+                sock.settimeout(base_timeout)
+
     def _socket_dma_write(self, addr: int, data: bytes) -> bool:
         """Attempt the SocketDMA fast path for one write.
 
-        Returns ``True`` when the payload was sent and the tail verified via
-        the REST read path; ``False`` (with a WARNING logged) when the caller
-        should fall back to the REST ``write_mem`` for this write.  A connect
-        failure additionally latches the fast path off for this transport's
-        lifetime; send failures and verify mismatches do not latch.
+        Returns ``True`` when the payload was sent, the in-band
+        ``IDENTIFY`` completion barrier confirmed the device consumed
+        every chunk, and the tail verified via the REST read path;
+        ``False`` (with a WARNING logged) when the caller should fall
+        back to the REST ``write_mem`` for this write.  A connect
+        failure additionally latches the fast path off for this
+        transport's lifetime; send failures, barrier failures and verify
+        mismatches do not latch.
         """
         client = self._ensure_socket_dma_client()
 
@@ -209,10 +250,33 @@ class Ultimate64Transport(HardwareTransportBase):
             )
             return False
 
-        # Fire-and-forget protocol has no ack, so poll the tail back over REST
-        # until it matches — the only confirmation the payload landed.  A
-        # single immediate read races the device-side DMA application (the
-        # TCP stream is consumed before the bytes hit C64 RAM).
+        # DMAWRITE is fire-and-forget with no per-command ack, so finish with
+        # the in-band IDENTIFY completion barrier (FIFO ordering means the
+        # reply proves every chunk above was consumed and applied).  A tail
+        # read-back alone is NOT a completion barrier: if the tail happens to
+        # match pre-existing RAM (zero padding, re-writing the same buffer,
+        # snapshot restores whose last bytes rarely change) it reports success
+        # while the bulk DMA is still in flight, which can then clobber
+        # subsequent REST writes (e.g. restore_snapshot's $0000/$0001
+        # CPU-port writes).
+        try:
+            self._socket_dma_barrier(client, len(data))
+        except Ultimate64Error as exc:
+            _log.warning(
+                "SocketDMA completion barrier (IDENTIFY) failed after write "
+                "at %#06x (%s); falling back to REST write_mem for this "
+                "write",
+                addr,
+                exc,
+            )
+            # A timed-out barrier can leave its reply unread on the wire;
+            # drop the connection so a later fast-path attempt starts clean.
+            client.close()
+            return False
+
+        # Post-barrier sanity check: the DMA has been applied, so the tail
+        # must read back immediately; the short poll budget only covers REST
+        # read latency jitter.
         tail_len = min(16, len(data))
         expected = data[len(data) - tail_len:]
         deadline = time.monotonic() + self.socket_dma_verify_timeout
