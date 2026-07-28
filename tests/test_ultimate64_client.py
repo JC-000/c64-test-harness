@@ -895,6 +895,76 @@ def test_send_text_no_return_when_disabled():
     assert 0x0D not in payload_writes[0][1]
 
 
+def test_send_text_waits_for_empty_buffer_before_writing():
+    """send_text must not top up a partially-full buffer.
+
+    The read-$C6 / write-chunk / write-$C6 sequence is three HTTP
+    round-trips ~100 ms apart while the KERNAL dequeues from the front
+    at 50/60 Hz — writing at a non-zero offset races the dequeue and
+    produces garbage keystrokes.  The fix: poll $C6 until it reads 0,
+    then write the chunk at offset 0 with a single count publication.
+    """
+    c = Ultimate64Client("h")
+    # Simulate the KERNAL draining an in-flight buffer between polls:
+    # $C6 reads 4, then 2, then 0 (empty), then 0 for any later polls.
+    counts = iter([4, 2, 0])
+    events: list[tuple[str, int, bytes]] = []
+
+    def fake_read(addr: int, length: int) -> bytes:
+        assert addr == Ultimate64Client.KEYBUF_COUNT_ADDR
+        value = next(counts, 0)
+        events.append(("read", addr, bytes([value])))
+        return bytes([value])
+
+    def fake_write(addr: int, data: bytes) -> None:
+        events.append(("write", addr, bytes(data)))
+
+    with patch.object(c, "read_mem", side_effect=fake_read), \
+         patch.object(c, "write_mem", side_effect=fake_write):
+        c.send_text("AB")
+
+    writes = [e for e in events if e[0] == "write"]
+    # No write may happen until the buffer polled empty (three reads first).
+    reads_before_first_write = events[: events.index(writes[0])]
+    assert [e[2][0] for e in reads_before_first_write] == [4, 2, 0]
+    # Chunk lands at offset 0 ($0277 exactly), never $0277+current.
+    assert writes[0] == ("write", Ultimate64Client.KEYBUF_ADDR, bytes([0x41, 0x42, 0x0D]))
+    # Count write publishes exactly the chunk length, not current+len.
+    assert writes[1] == ("write", Ultimate64Client.KEYBUF_COUNT_ADDR, bytes([3]))
+    assert len(writes) == 2
+
+
+def test_send_text_long_string_chunks_start_at_offset_zero():
+    """Strings past KEYBUF_MAX are split into full-buffer chunks, each
+    written at $0277 offset 0 after the previous chunk drains to empty."""
+    c = Ultimate64Client("h")
+    # 12 chars + CR = 13 codes -> chunks of 10 and 3.
+    text = "ABCDEFGHIJKL"
+    # Poll sequence: empty (write chunk 1), still draining (5), empty
+    # (write chunk 2).
+    counts = iter([0, 5, 0])
+    writes: list[tuple[int, bytes]] = []
+
+    def fake_read(addr: int, length: int) -> bytes:
+        return bytes([next(counts, 0)])
+
+    def fake_write(addr: int, data: bytes) -> None:
+        writes.append((addr, bytes(data)))
+
+    with patch.object(c, "read_mem", side_effect=fake_read), \
+         patch.object(c, "write_mem", side_effect=fake_write):
+        c.send_text(text)
+
+    payload_writes = [w for w in writes if w[0] == Ultimate64Client.KEYBUF_ADDR]
+    count_writes = [w for w in writes if w[0] == Ultimate64Client.KEYBUF_COUNT_ADDR]
+    assert len(payload_writes) == 2
+    assert payload_writes[0][1] == bytes([0x41 + i for i in range(10)])
+    assert payload_writes[1][1] == bytes([0x4B, 0x4C, 0x0D])
+    assert [w[1] for w in count_writes] == [bytes([10]), bytes([3])]
+    # Every payload write targets the buffer base — no offset writes at all.
+    assert all(w[0] == Ultimate64Client.KEYBUF_ADDR for w in payload_writes)
+
+
 # ---------------------------------------------------------------- run_prg fallback
 def test_run_prg_falls_back_on_404(caplog):
     """On 404, run_prg sideloads via write_mem + send_text("SYS <addr>")."""

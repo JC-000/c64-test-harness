@@ -602,7 +602,15 @@ class Ultimate64Client:
 
         For longer strings the buffer's 10-byte hardware limit is
         respected: the call polls ``$00C6`` and waits for the KERNAL
-        scan loop to drain the buffer before pushing the next chunk.
+        scan loop to drain the buffer **to empty** before pushing the
+        next chunk.  Topping up a partially-full buffer is deliberately
+        avoided: the read-$C6 / write-chunk / write-$C6 sequence is
+        three HTTP round-trips ~100 ms apart, and the KERNAL dequeues
+        from the front of the buffer at 50/60 Hz — any consumption
+        inside that window would land the chunk at a stale offset and
+        overstate the count (garbage keystrokes).  Writing only into an
+        empty buffer means chunks always start at ``$0277`` offset 0 and
+        the ``$00C6`` count write is the single publication step.
         """
         if not isinstance(text, str):
             raise TypeError("text must be a string")
@@ -627,13 +635,15 @@ class Ultimate64Client:
                 )
             count_byte = self.read_mem(self.KEYBUF_COUNT_ADDR, 1)
             current = count_byte[0] if count_byte else 0
-            free = self.KEYBUF_MAX - current
-            if free <= 0:
+            if current != 0:
+                # Buffer not yet drained — never top up a partially-full
+                # buffer (the KERNAL may dequeue between our read of $C6
+                # and the two writes, corrupting offset and count).
                 continue
-            chunk = remaining[:free]
-            remaining = remaining[free:]
-            self.write_mem(self.KEYBUF_ADDR + current, bytes(chunk))
-            self.write_mem(self.KEYBUF_COUNT_ADDR, bytes([current + len(chunk)]))
+            chunk = remaining[:self.KEYBUF_MAX]
+            remaining = remaining[self.KEYBUF_MAX:]
+            self.write_mem(self.KEYBUF_ADDR, bytes(chunk))
+            self.write_mem(self.KEYBUF_COUNT_ADDR, bytes([len(chunk)]))
 
     # ------------------------------------------------------------ code runners
     def load_prg(self, data: bytes) -> None:
