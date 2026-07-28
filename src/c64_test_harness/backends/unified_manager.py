@@ -324,7 +324,12 @@ class _LockedU64Manager:
         """
         instance = self._inner.acquire()
         device_host = instance.device.host
-        lock = DeviceLock(device_host)
+        # allow_nested: a caller that already holds this device's lock
+        # (a pytest fixture, a bench tool wrapping its whole run) would
+        # otherwise queue behind itself for the full lock_timeout and
+        # then fail.  The inner manager still guarantees one in-process
+        # user per device, so joining the existing hold is safe.
+        lock = DeviceLock(device_host, allow_nested=True)
         try:
             lock.acquire_or_raise(timeout=self._lock_timeout)
         except BaseException:

@@ -109,7 +109,12 @@ from .backends.ultimate64_probe import (
     probe_u64,
     is_u64_reachable,
 )
-from .backends.device_lock import DeviceLock, DeviceLockTimeout
+from .backends.device_lock import (
+    DeviceLock,
+    DeviceLockContentionError,
+    DeviceLockTimeout,
+    advisory_lock_check,
+)
 from .backends.unified_manager import (
     TestTarget,
     BackendManager,
@@ -429,7 +434,9 @@ __all__ = [
     "is_u64_reachable",
     # Device lock
     "DeviceLock",
+    "DeviceLockContentionError",
     "DeviceLockTimeout",
+    "advisory_lock_check",
     # Unified backend manager
     "TestTarget",
     "BackendManager",

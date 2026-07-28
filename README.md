@@ -522,6 +522,40 @@ Environment variables: `C64_BACKEND` (`vice` or `u64`), `U64_HOST` (comma-separa
 
 When the U64 backend is selected, `UnifiedManager` automatically wraps device access with `DeviceLock` — an `fcntl.flock`-based cross-process lock that serializes access to each physical device. Multiple independent agents (separate OS processes) can safely target the same U64 without coordination; the lock file queues them automatically. This is the same kernel-enforced locking pattern used by `PortLock` for VICE port allocation.
 
+### Shared-device contract (`DeviceLock`)
+
+**Any tool that touches a shared device must acquire that device's `DeviceLock` first, and hold it for the whole job.** This includes read-mostly tools: a reboot issued by somebody else invalidates a reader mid-measurement just as thoroughly as it invalidates a writer. The lockfile is machine-global (`$XDG_RUNTIME_DIR`, else `/tmp/c64-test-harness-<uid>`, keyed by device host), so every checkout, venv, and downstream repo on the machine converges on the same lock without configuration.
+
+The contract exists because unlocked access is not a theoretical problem. On 2026-07-19 a locked `c64-nist-curves` ECDSA bench was rebooted mid-sweep by two jobs that drove the same device without locking; the bench spent its per-primitive timeouts against a machine sitting at `READY` and the whole sweep was discarded.
+
+```python
+from c64_test_harness import DeviceLock, DeviceLockTimeout
+
+lock = DeviceLock(host)
+try:
+    lock.acquire_or_raise(timeout=120.0)   # queue-aware: extends behind a live, progressing holder
+except DeviceLockTimeout as exc:
+    raise SystemExit(f"device busy: {exc}")  # the message says WHY: queued / wedged / stale / unreachable
+try:
+    ...  # the device is yours for the duration
+finally:
+    lock.release()
+```
+
+Top-level tools generally wrap that in an `acquire_device_lock_or_exit(host)` helper that stale-cleans first, prints the current holder before blocking, and exits non-zero on timeout rather than proceeding unlocked (see `c64-nist-curves`'s `tools/bench_u64_common.py` for a reference implementation).
+
+Three mechanisms back the contract up:
+
+| Mechanism | What it does |
+|---|---|
+| Advisory check in the client | `Ultimate64Client` checks, before every state-changing request (any non-GET: `machine:*`, runners, `writemem`, drive and config PUT/POSTs — which is how turbo and REU settings change) and before every destructive SocketDMA opcode, whether this process holds the device lock. If it doesn't, and another live process does, it logs a `WARNING` naming the holder PID. |
+| `U64_REQUIRE_DEVICE_LOCK=1` | Turns that warning into a `DeviceLockContentionError` before the request goes out. Recommended for CI and for long benches on a shared device. |
+| `device_lock_guard` fixture | Autouse fixture in `tests/conftest.py` that holds the lock around every `*_live.py` test for the resolved device host (module `_HOST` attribute, else `U64_HOST`), logging acquire and release. The harness's own live suite is a good citizen by construction; `U64_DEVICE_LOCK_TIMEOUT` overrides the 300 s queue timeout. |
+
+The check is filesystem-only (one `open`, one non-blocking shared `flock`, one small read) and never touches the network. Liveness comes from the flock rather than the lockfile contents, because `release()` deliberately leaves the lockfile behind. **Single-user flows see nothing**: with no other live holder the check emits at most a `DEBUG` line, and a repeat offence against the same holder is logged once, not once per request.
+
+A process that already holds a device's lock can re-enter the library — `create_manager()`, or a live test acquiring its own lock under the fixture — via `DeviceLock(host, allow_nested=True)`, which joins the existing hold (refcounted) instead of queueing behind itself. Without that flag two `DeviceLock` instances in one process contend exactly as two processes do, which remains the default.
+
 ### Liveness Probe
 
 Before connecting, probe whether a U64 device is reachable:
@@ -975,7 +1009,7 @@ python3 scripts/run_u64_parallel_locked.py 192.168.1.81
 python3 scripts/stress_u64_queue.py 192.168.1.81 --workers 6 --rounds 5
 ```
 
-All U64 live tests use `DeviceLock` to serialize access to the physical device. Multiple agents (separate OS processes) can safely run tests in parallel — the lock file queues them automatically.
+Every live test runs inside the autouse `device_lock_guard` fixture, so `DeviceLock` serializes access to the physical device whether or not the test asks for it. Multiple agents (separate OS processes) can safely run tests in parallel — the lock file queues them automatically. See [Shared-device contract](#shared-device-contract-devicelock) for what that obliges non-test tools to do, and set `U64_REQUIRE_DEVICE_LOCK=1` to make an unlocked destructive call an error instead of a warning.
 
 ## Claude Code Skill
 

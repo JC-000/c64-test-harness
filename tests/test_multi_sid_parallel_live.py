@@ -231,7 +231,9 @@ def u64_client():
     """Connect to U64E with cross-process DeviceLock."""
     host = os.environ.get("U64_HOST")
     pw = os.environ.get("U64_PASSWORD")
-    lock = DeviceLock(host)
+    # allow_nested: the autouse device_lock_guard fixture already holds
+    # this device's lock for the test (issue #136).
+    lock = DeviceLock(host, allow_nested=True)
     try:
         lock.acquire_or_raise(timeout=120.0)
     except DeviceLockTimeout as e:

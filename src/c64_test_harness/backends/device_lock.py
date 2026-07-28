@@ -29,12 +29,23 @@ DeviceLock acquire wakes on filesystem events instead of polling.  The
 100ms poll cadence remains active as a backstop for kernel-released
 flocks (kill -9 holders) where ``release()`` never runs and therefore
 no fs-event is emitted.
+
+**Advisory enforcement.**  Holding the lock is a cooperative contract:
+nothing stops a process from driving a device it hasn't locked, and
+that is exactly how a locked bench run got rebooted underneath itself
+(issue #136).  :func:`advisory_lock_check` is the cheap, network-free
+check the client layers call before every destructive operation — it
+warns (or raises under ``U64_REQUIRE_DEVICE_LOCK=1``) when *this*
+process doesn't hold the device lock and another live process does.
+Single-user flows never see it: with no live foreign holder the check
+emits at most a debug line.
 """
 
 from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import re
 import threading
@@ -43,6 +54,8 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
 
 try:  # Optional dependency — see [project.optional-dependencies] notify
     from watchdog.events import FileSystemEventHandler
@@ -53,18 +66,22 @@ except Exception:  # pragma: no cover - exercised only when watchdog absent
     _HAS_WATCHDOG = False
 
 
-def _default_lock_dir() -> Path:
+def _default_lock_dir(create: bool = True) -> Path:
     """Return the lock directory, creating it if needed.
 
     Uses the same directory as :func:`port_lock._default_lock_dir` so
     all harness locks live together.
+
+    Pass ``create=False`` for read-only callers (the advisory check) that
+    must not have a filesystem side effect just by looking.
     """
     runtime = os.environ.get("XDG_RUNTIME_DIR")
     if runtime:
         d = Path(runtime) / "c64-test-harness"
     else:
         d = Path(f"/tmp/c64-test-harness-{os.getuid()}")
-    d.mkdir(parents=True, exist_ok=True)
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
     return d
 
 
@@ -83,6 +100,39 @@ def _sanitize_device_id(host: str) -> str:
 # ``waiter-<pid>-<token>.json`` so the owning PID is recoverable from the
 # filename alone (no JSON parse needed for liveness checks).
 _WAITER_NAME_RE = re.compile(r"^waiter-(\d+)-[0-9a-f]+\.json$")
+
+
+#: Lockfile paths this process currently holds, mapped to a reference
+#: count.  The count is 1 for the real (flock-owning) holder plus one per
+#: live nested holder (see ``allow_nested``).  Consulted by
+#: :meth:`DeviceLock.held_by_this_process`, which is how the advisory
+#: check tells "we own this device" from "somebody else does".
+_PROCESS_HELD: dict[str, int] = {}
+_PROCESS_HELD_GUARD = threading.Lock()
+
+#: Environment variable that upgrades the advisory warning to a raise.
+REQUIRE_DEVICE_LOCK_ENV = "U64_REQUIRE_DEVICE_LOCK"
+
+#: (device_host, holder_pid) pairs already warned about, so a chatty
+#: caller (write_mem chunking, a config sweep) warns once per holder
+#: instead of once per request.
+_WARNED_HOLDERS: set[tuple[str, int | None]] = set()
+
+
+class DeviceLockContentionError(RuntimeError):
+    """Raised by :func:`advisory_lock_check` under ``U64_REQUIRE_DEVICE_LOCK=1``.
+
+    Signals that a destructive device operation was attempted while
+    another live process holds the device lock and this process does
+    not.  Deliberately not an ``Ultimate64Error`` subclass: callers that
+    blanket-catch device errors to retry should NOT swallow this — the
+    fix is to acquire the lock, not to retry.
+    """
+
+    def __init__(self, message: str, *, device_host: str, holder_pid: int | None = None) -> None:
+        super().__init__(message)
+        self.device_host = device_host
+        self.holder_pid = holder_pid
 
 
 class DeviceLockTimeout(TimeoutError):
@@ -232,12 +282,30 @@ class DeviceLock:
         lock_dir: Path | None = None,
         *,
         heartbeat_interval: float | None = 15.0,
+        allow_nested: bool = False,
     ) -> None:
+        """Construct a device lock.
+
+        :param allow_nested: when ``True``, an :meth:`acquire` on a
+            device this *same process* already holds joins the existing
+            hold (refcounted) instead of blocking on the flock.  Default
+            ``False`` keeps the historical behaviour — two ``DeviceLock``
+            instances in one process contend exactly like two processes.
+
+            Opt in only where the caller genuinely owns the device
+            already and is re-entering the library (e.g. a pytest
+            fixture holds the lock for the whole test and the test body
+            then goes through ``create_manager``, which locks again).
+            Two independent worker *threads* sharing a device must not
+            use it — they are concurrent users, not one nested user.
+        """
         self._device_host = device_host
         self._device_id = _sanitize_device_id(device_host)
         self._lock_dir = lock_dir or _default_lock_dir()
         self._lock_path = self._lock_dir / f"device-{self._device_id}.lock"
         self._queue_dir_path = Path(str(self._lock_path) + ".queue")
+        self._allow_nested = allow_nested
+        self._nested = False
         self._fd: int | None = None
         # Heartbeat: keep the lockfile mtime fresh so waiters using
         # queue-aware acquire() see this holder as "progressing" past
@@ -253,8 +321,13 @@ class DeviceLock:
 
     @property
     def held(self) -> bool:
-        """Whether this instance currently holds the lock."""
-        return self._fd is not None
+        """Whether this instance currently holds the lock.
+
+        ``True`` for a nested holder too (see ``allow_nested``) — it has
+        the same right to use the device, it just isn't the instance
+        that owns the underlying flock.
+        """
+        return self._fd is not None or self._nested
 
     def acquire(
         self,
@@ -305,6 +378,13 @@ class DeviceLock:
         if self._fd is not None:
             # Already held by us; ensure heartbeat is running (idempotent).
             self._start_heartbeat()
+            return True
+        if self._nested:
+            return True
+
+        # This process may already hold the device via another instance —
+        # join that hold instead of deadlocking against ourselves.
+        if self._allow_nested and self._join_process_hold():
             return True
 
         # Best-effort hygiene: a corrupt file shouldn't block legitimate acquirers.
@@ -486,6 +566,7 @@ class DeviceLock:
                 ):
                     self._fd = fd
                     self._write_metadata()
+                    self._register_process_hold()
                     return True
             except OSError:
                 pass
@@ -506,11 +587,22 @@ class DeviceLock:
 
         Bumps the lockfile's mtime as a cooperative wake-up signal for
         watchdog-based notifiers in queued acquirers (best-effort).
+
+        A nested holder (see ``allow_nested``) only drops its reference —
+        the flock stays with the outermost holder until that one
+        releases.
         """
+        if self._nested:
+            self._nested = False
+            self._drop_process_hold()
+            return
         if self._fd is None:
             return
         fd = self._fd
         self._fd = None
+        # The flock is going away, so the process no longer holds the
+        # device even if a nested holder outlived its parent.
+        self._drop_process_hold(purge=True)
         # Stop the heartbeat before unlinking/releasing so the thread
         # doesn't race with the final mtime bump or the fd close.
         self._stop_heartbeat()
@@ -528,6 +620,116 @@ class DeviceLock:
             os.close(fd)
         except OSError:
             pass
+
+    # -- Process-hold registry (issue #136) --
+
+    def _register_process_hold(self) -> None:
+        """Record that this process owns the flock for this lockfile."""
+        key = str(self._lock_path)
+        with _PROCESS_HELD_GUARD:
+            _PROCESS_HELD[key] = _PROCESS_HELD.get(key, 0) + 1
+
+    def _join_process_hold(self) -> bool:
+        """Join an existing in-process hold; ``True`` if there was one."""
+        key = str(self._lock_path)
+        with _PROCESS_HELD_GUARD:
+            count = _PROCESS_HELD.get(key, 0)
+            if count <= 0:
+                return False
+            _PROCESS_HELD[key] = count + 1
+        self._nested = True
+        _log.debug(
+            "DeviceLock %s already held by this process (pid=%d) — nested acquire",
+            self._device_host,
+            os.getpid(),
+        )
+        return True
+
+    def _drop_process_hold(self, *, purge: bool = False) -> None:
+        """Drop this instance's reference in the process-hold registry."""
+        key = str(self._lock_path)
+        with _PROCESS_HELD_GUARD:
+            if purge:
+                _PROCESS_HELD.pop(key, None)
+                return
+            count = _PROCESS_HELD.get(key, 0) - 1
+            if count > 0:
+                _PROCESS_HELD[key] = count
+            else:
+                _PROCESS_HELD.pop(key, None)
+
+    @classmethod
+    def held_by_this_process(
+        cls, device_host: str, lock_dir: Path | None = None
+    ) -> bool:
+        """Whether *this OS process* currently holds *device_host*'s lock.
+
+        Answers from the in-process registry, so it costs a dict lookup:
+        no filesystem access, no network.  Any ``DeviceLock`` instance
+        that acquired successfully and hasn't released registers here,
+        which makes this the check destructive-operation callers use to
+        decide whether they are a good citizen or a squatter.
+        """
+        d = lock_dir or _default_lock_dir(create=False)
+        key = str(d / f"device-{_sanitize_device_id(device_host)}.lock")
+        with _PROCESS_HELD_GUARD:
+            return _PROCESS_HELD.get(key, 0) > 0
+
+    @classmethod
+    def foreign_holder(
+        cls, device_host: str, lock_dir: Path | None = None
+    ) -> dict | None:
+        """Return metadata for *another live process* holding this device.
+
+        ``None`` when the device is unlocked, when the only holder is
+        this process, or when the lock state can't be read.  Never
+        blocks and never touches the network.
+
+        Liveness is decided by the flock itself, not by the lockfile
+        contents: ``release()`` deliberately leaves the lockfile behind,
+        so trusting the metadata alone would report a holder long after
+        the run finished.  We probe with a *shared*, non-blocking flock —
+        if it fails, someone holds the exclusive lock right now.  The
+        probe is released immediately and never blocks a real acquirer
+        (a waiter that collides just retries on its next 100 ms poll).
+        """
+        d = lock_dir or _default_lock_dir(create=False)
+        path = d / f"device-{_sanitize_device_id(device_host)}.lock"
+        try:
+            fd = os.open(str(path), os.O_RDONLY)
+        except OSError:
+            return None  # No lockfile at all — nobody has ever locked it.
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError:
+                pass  # Held right now — fall through and describe the holder.
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                return None  # Nobody holds it; stale lockfile.
+            try:
+                raw = os.read(fd, 4096)
+            except OSError:
+                raw = b""
+        finally:
+            os.close(fd)
+
+        info: dict = {}
+        try:
+            parsed = json.loads(raw) if raw else {}
+            if isinstance(parsed, dict):
+                info = parsed
+        except (json.JSONDecodeError, ValueError):
+            info = {}
+        pid = info.get("pid")
+        if isinstance(pid, int) and pid == os.getpid():
+            # Held by us through some other fd (e.g. a DeviceLock that
+            # never registered).  Not a foreign holder.
+            return None
+        holder = dict(info)
+        holder["pid"] = pid if isinstance(pid, int) else None
+        holder["device_host"] = info.get("device_host", device_host)
+        return holder
 
     def read_info(self) -> dict | None:
         """Read metadata from the lockfile without acquiring the lock.
@@ -812,6 +1014,91 @@ class DeviceLock:
                 return
             except Exception:  # pragma: no cover - defensive
                 return
+
+
+def require_device_lock() -> bool:
+    """Whether ``U64_REQUIRE_DEVICE_LOCK`` asks for hard enforcement.
+
+    Read at call time (not import time) so tests and long-lived
+    processes can flip it.  Accepts ``1`` / ``true`` / ``yes`` / ``on``,
+    case-insensitive.
+    """
+    raw = os.environ.get(REQUIRE_DEVICE_LOCK_ENV, "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def advisory_lock_check(
+    device_host: str,
+    operation: str,
+    *,
+    lock_dir: Path | None = None,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Warn (or raise) before *operation* mutates an unlocked device.
+
+    Called by the client layers at destructive-call time.  Three
+    outcomes, in order of how much noise they make:
+
+    * this process holds the device lock → silent, the contract is met;
+    * nobody else holds it → a DEBUG line, nothing more.  This is the
+      single-user case and it must stay quiet;
+    * another live process holds it → a WARNING naming the holder PID,
+      or :class:`DeviceLockContentionError` when
+      ``U64_REQUIRE_DEVICE_LOCK=1``.
+
+    The check is filesystem-only (one ``open`` + one non-blocking
+    ``flock`` + one small read) and swallows its own errors: an advisory
+    check must never be the reason a device call fails.
+
+    :param operation: short description used in the message, e.g.
+        ``"PUT /v1/machine:reboot"``.
+    """
+    log = logger or _log
+    try:
+        if DeviceLock.held_by_this_process(device_host, lock_dir=lock_dir):
+            return
+        holder = DeviceLock.foreign_holder(device_host, lock_dir=lock_dir)
+    except Exception:  # pragma: no cover - defensive
+        return
+    if holder is None:
+        log.debug(
+            "%s on %s: no device lock held (no other holder either)",
+            operation,
+            device_host,
+        )
+        return
+
+    holder_pid = holder.get("pid")
+    message = (
+        f"{operation} on {device_host} without holding the device lock — "
+        f"PID {holder_pid if holder_pid is not None else '?'} holds it right "
+        f"now.  Destructive calls against a device another job has locked are "
+        f"how measurements get silently discarded (issue #136).  Acquire the "
+        f"lock first: DeviceLock({device_host!r}).acquire_or_raise(...)."
+    )
+    if require_device_lock():
+        raise DeviceLockContentionError(
+            message + f"  ({REQUIRE_DEVICE_LOCK_ENV}=1 turns this warning into an error.)",
+            device_host=device_host,
+            holder_pid=holder_pid if isinstance(holder_pid, int) else None,
+        )
+    key = (device_host, holder_pid if isinstance(holder_pid, int) else None)
+    with _PROCESS_HELD_GUARD:
+        already_warned = key in _WARNED_HOLDERS
+        _WARNED_HOLDERS.add(key)
+    if already_warned:
+        log.debug("%s (repeat, warned once already)", message)
+        return
+    log.warning(
+        "%s  Set %s=1 to make this an error.", message, REQUIRE_DEVICE_LOCK_ENV
+    )
+
+
+def _reset_advisory_state() -> None:
+    """Clear the warn-once cache and the hold registry (tests only)."""
+    with _PROCESS_HELD_GUARD:
+        _WARNED_HOLDERS.clear()
+        _PROCESS_HELD.clear()
 
 
 def _pid_alive(pid: int) -> bool:

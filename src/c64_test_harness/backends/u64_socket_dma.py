@@ -29,6 +29,13 @@ from typing import Optional
 
 from .ultimate64_client import Ultimate64Error
 
+try:  # device_lock needs fcntl — absent on Windows, optional everywhere
+    from .device_lock import advisory_lock_check as _advisory_lock_check
+
+    _HAS_DEVICE_LOCK = True
+except Exception:  # pragma: no cover - exercised only without fcntl
+    _HAS_DEVICE_LOCK = False
+
 __all__ = [
     "REU_WRITE_MAX_CHUNK",
     "SocketDMAClient",
@@ -54,6 +61,23 @@ REU_WRITE_MAX_CHUNK = 0xFFFF - 3
 
 #: The REU address space is 24-bit (16 MB).
 _REU_ADDRESS_SPACE = 0x1000000
+
+#: Opcodes that only interrogate the device.  Everything else on this
+#: channel writes memory, injects keys, or resets the machine, and so
+#: gets the advisory device-lock check (issue #136).
+_READ_ONLY_OPCODES = frozenset({_CMD_IDENTIFY, _CMD_AUTHENTICATE})
+
+#: Human-readable opcode names for the advisory-check message.
+_OPCODE_NAMES = {
+    _CMD_DMA: "SocketDMA DMA",
+    _CMD_DMARUN: "SocketDMA DMARUN",
+    _CMD_KEYB: "SocketDMA KEYB",
+    _CMD_RESET: "SocketDMA RESET",
+    _CMD_DMAWRITE: "SocketDMA DMAWRITE",
+    _CMD_REUWRITE: "SocketDMA REUWRITE",
+    _CMD_KERNALWRITE: "SocketDMA KERNALWRITE",
+    _CMD_DMAJUMP: "SocketDMA DMAJUMP",
+}
 
 #: Worst-case REUWRITE drain rate used to scale the completion-barrier
 #: timeout.  Live-measured on C64U fw 1.1.0 (2026-07-21): a 96 KiB burst
@@ -125,6 +149,11 @@ class SocketDMAClient:
         return self._sock
 
     def _send(self, opcode: int, payload: bytes = b"") -> None:
+        if _HAS_DEVICE_LOCK and opcode not in _READ_ONLY_OPCODES:
+            _advisory_lock_check(
+                self._host,
+                _OPCODE_NAMES.get(opcode, f"SocketDMA opcode {opcode:#06x}"),
+            )
         if len(payload) > 0xFFFF:
             raise Ultimate64Error(
                 f"SocketDMA payload too large: {len(payload)} bytes (max 65535)"
