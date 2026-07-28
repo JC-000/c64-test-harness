@@ -667,8 +667,19 @@ class Ultimate64Client:
           default), the call transparently retries by sideloading the
           PRG body via :meth:`write_mem` (using the load address from
           the PRG's first two header bytes, little-endian) and then
-          triggering with :meth:`send_text` (``"SYS <addr>\\r"``).  A
-          ``logging.warning`` is emitted when the fallback fires.  Pass
+          triggering it, matching the real endpoint's load-and-RUN
+          semantics:
+
+          * load address ``$0801`` (a canonical BASIC-stub PRG) —
+            triggers with :meth:`send_text` (``"RUN\\r"``).  ``SYS 2049``
+            would execute the BASIC line-link bytes as 6502 opcodes and
+            corrupt the machine; ``RUN`` interprets the stub the way
+            the runner endpoint does.
+          * any other load address (pure-ML PRG) — triggers with
+            :meth:`send_text` (``"SYS <addr>\\r"``).
+
+          A ``logging.warning`` is emitted when the fallback fires,
+          naming which trigger path was taken.  Pass
           ``fallback_on_404=False`` to surface the 404 as a plain
           :class:`Ultimate64Error`.
         * **Device unreachable** — raised as ``Ultimate64TimeoutError``.
@@ -689,15 +700,17 @@ class Ultimate64Client:
                 raise
             load_addr = data[0] | (data[1] << 8)
             body = bytes(data[2:])
+            trigger = "RUN" if load_addr == 0x0801 else f"SYS {load_addr}"
             _log.warning(
                 "run_prg got HTTP 404 from /v1/runners:run_prg; "
-                "falling back to writemem+SYS sideload at $%04X "
-                "(fw 3.14d wedged-runner workaround)",
+                "falling back to writemem sideload at $%04X, triggering "
+                "with %r (fw 3.14d wedged-runner workaround)",
                 load_addr,
+                trigger,
             )
             if body:
                 self.write_mem(load_addr, body)
-            self.send_text(f"SYS {load_addr}", finish_with_return=True)
+            self.send_text(trigger, finish_with_return=True)
 
     def run_crt(self, data: bytes) -> None:
         """POST /v1/runners:run_crt — start a cartridge image (DESTRUCTIVE).

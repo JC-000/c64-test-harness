@@ -929,6 +929,52 @@ def test_run_prg_falls_back_on_404(caplog):
                "writemem" in r.message for r in caplog.records)
 
 
+def test_run_prg_falls_back_on_404_basic_stub_types_run(caplog):
+    """A $0801 BASIC-stub PRG must be triggered with RUN, not SYS 2049.
+
+    SYS 2049 would execute the BASIC line-link bytes as 6502 opcodes and
+    corrupt the machine; the real runner endpoint's semantics are
+    load-and-RUN.
+    """
+    import logging
+
+    c = Ultimate64Client("h")
+    # Canonical BASIC stub: 10 SYS 2062 — load address $0801.
+    stub_body = bytes([
+        0x0B, 0x08,              # link to next line ($080B)
+        0x0A, 0x00,              # line number 10
+        0x9E,                    # SYS token
+        0x32, 0x30, 0x36, 0x32,  # "2062"
+        0x00,                    # end of line
+        0x00, 0x00,              # end of program
+    ])
+    prg = bytes([0x01, 0x08]) + stub_body
+
+    write_mem_calls: list[tuple[int, bytes]] = []
+    send_text_calls: list[tuple[str, bool]] = []
+
+    def fake_post_binary(path, data, query=None):
+        raise Ultimate64Error(f"POST {path} returned HTTP 404", status=404)
+
+    def fake_write_mem(addr: int, data: bytes) -> None:
+        write_mem_calls.append((addr, bytes(data)))
+
+    def fake_send_text(text: str, *, finish_with_return: bool = True) -> None:
+        send_text_calls.append((text, finish_with_return))
+
+    with patch.object(c, "_post_binary", side_effect=fake_post_binary), \
+         patch.object(c, "write_mem", side_effect=fake_write_mem), \
+         patch.object(c, "send_text", side_effect=fake_send_text), \
+         caplog.at_level(logging.WARNING, logger="c64_test_harness.backends.ultimate64_client"):
+        c.run_prg(prg)
+
+    assert write_mem_calls == [(0x0801, stub_body)]
+    # RUN, never "SYS 2049".
+    assert send_text_calls == [("RUN", True)]
+    # The warning names the trigger path that was taken.
+    assert any("'RUN'" in r.getMessage() for r in caplog.records)
+
+
 def test_run_prg_fallback_disabled():
     """fallback_on_404=False surfaces the 404 instead of side-loading."""
     c = Ultimate64Client("h")
