@@ -171,3 +171,20 @@ class TestWaitForStable:
         transport.read_screen_codes = changing_read
         grid = wait_for_stable(transport, timeout=3, poll_interval=0.1, stable_count=2)
         assert grid is not None
+
+    def test_timeout_returns_none(self):
+        """A screen that never stabilizes must return None, per the
+        docstring contract — not the last still-changing grid."""
+        transport = MockTransport()
+        call_count = 0
+
+        def always_changing_read():
+            nonlocal call_count
+            call_count += 1
+            return [call_count % 256] * 1000
+
+        transport.read_screen_codes = always_changing_read
+        grid = wait_for_stable(
+            transport, timeout=0.3, poll_interval=0.05, stable_count=3
+        )
+        assert grid is None

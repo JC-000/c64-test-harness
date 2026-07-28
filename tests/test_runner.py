@@ -111,3 +111,10 @@ class TestTestRunner:
         # Returns a copy
         assert runner.results is not runner._results
         assert len(runner.results) == 1
+
+    def test_not_collected_by_pytest(self):
+        """TestRunner/TestStatus are framework classes, not test classes —
+        __test__ = False keeps pytest from warning about (or collecting)
+        them when they're imported into test modules."""
+        assert TestRunner.__test__ is False
+        assert TestStatus.__test__ is False

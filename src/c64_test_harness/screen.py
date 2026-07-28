@@ -158,20 +158,20 @@ def wait_for_stable(
 ) -> ScreenGrid | None:
     """Wait until screen content stops changing.
 
-    Returns the stable ``ScreenGrid``, or ``None`` on timeout.
+    Returns the stable ``ScreenGrid``, or ``None`` on timeout —
+    matching ``wait_for_text``'s contract (a non-``None`` return always
+    means the condition was met).
     """
     prev_text: str | None = None
     count = 0
     start = time.monotonic()
-    last_grid: ScreenGrid | None = None
     while True:
         elapsed = time.monotonic() - start
         if elapsed >= timeout:
-            return last_grid
+            return None
         try:
             grid = ScreenGrid.from_transport(transport)
             current = grid.continuous_text()
-            last_grid = grid
             if current == prev_text:
                 count += 1
                 if count >= stable_count:

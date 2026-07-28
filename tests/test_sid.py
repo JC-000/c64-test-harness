@@ -218,12 +218,26 @@ def test_song_is_60hz_bit_one():
     assert sid.song_is_60hz(1) is True
 
 
-def test_song_is_60hz_wraps_past_32():
+def test_song_is_60hz_clamps_past_31():
+    """PSIDv2NG: songs beyond 32 all reuse bit 31 — no wrap-around."""
     raw = bytearray(build_test_psid())
-    struct.pack_into(">I", raw, 18, 0b0001)  # bit 0 set
+    struct.pack_into(">I", raw, 18, 1 << 31)  # bit 31 set
     sid = SidFile.from_bytes(bytes(raw))
-    assert sid.song_is_60hz(32) is True  # 32 % 32 == 0
-    assert sid.song_is_60hz(33) is False
+    assert sid.song_is_60hz(31) is True
+    assert sid.song_is_60hz(32) is True   # clamps to bit 31
+    assert sid.song_is_60hz(33) is True   # clamps to bit 31
+    assert sid.song_is_60hz(100) is True  # clamps to bit 31
+    assert sid.song_is_60hz(30) is False
+
+
+def test_song_is_60hz_no_wrap_to_bit_zero():
+    """Regression: bit = song_index % 32 wrongly mapped song 32 to bit 0."""
+    raw = bytearray(build_test_psid())
+    struct.pack_into(">I", raw, 18, 0b0001)  # only bit 0 set
+    sid = SidFile.from_bytes(bytes(raw))
+    assert sid.song_is_60hz(0) is True
+    assert sid.song_is_60hz(32) is False  # used to be True via 32 % 32 == 0
+    assert sid.song_is_60hz(64) is False  # used to be True via 64 % 32 == 0
 
 
 # ---------------------------------------------------------------------------

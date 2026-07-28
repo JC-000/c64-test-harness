@@ -79,11 +79,22 @@ class PrgFile:
 
         Returns ``(match, diff_count)`` where *match* is ``True`` if all
         bytes are identical, and *diff_count* is the number of differing bytes.
+
+        A read that returns the wrong number of bytes (e.g. a failed or
+        truncated transport read) counts every missing byte as a diff —
+        it never verifies as intact.
         """
         from .memory import read_bytes  # avoid circular import
 
         expected = self.bytes_at(addr, length)
         actual = read_bytes(transport, addr, length)
+        if len(actual) != length:
+            # zip() would silently truncate the comparison and a failed
+            # (empty) read would "verify" as intact.  Count the length
+            # mismatch as diffs on top of any differing overlap bytes.
+            diffs = sum(1 for a, b in zip(actual, expected) if a != b)
+            diffs += abs(length - len(actual))
+            return (False, diffs)
         diffs = sum(1 for a, b in zip(actual, expected) if a != b)
         return (diffs == 0, diffs)
 

@@ -67,6 +67,23 @@ class TestFromEnv:
         cfg = HarnessConfig.from_env()
         assert cfg.vice_port == 6502
 
+    def test_memory_policy_env_var_raises(self, monkeypatch):
+        # No env spelling can legitimately populate the structured
+        # memory_policy field.  The generic scan used to setattr the raw
+        # string, deferring the failure to transport-stamp time.
+        monkeypatch.setenv("C64TEST_MEMORY_POLICY", "deny")
+        with pytest.raises(ValueError, match="C64TEST_MEMORY_POLICY"):
+            HarnessConfig.from_env()
+
+    def test_memory_policy_env_var_raises_with_custom_prefix(self, monkeypatch):
+        monkeypatch.setenv("MYTEST_MEMORY_POLICY", "deny")
+        with pytest.raises(ValueError, match="MYTEST_MEMORY_POLICY"):
+            HarnessConfig.from_env(prefix="MYTEST_")
+
+    def test_memory_policy_stays_permissive_without_env(self):
+        cfg = HarnessConfig.from_env()
+        assert cfg.memory_policy.is_permissive()
+
 
 class TestFromToml:
     def test_basic_toml(self, tmp_path):
