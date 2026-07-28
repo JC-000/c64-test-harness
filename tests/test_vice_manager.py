@@ -23,6 +23,8 @@ def _mock_vice():
     ):
         MockProc.return_value.stop = MagicMock()
         MockProc.return_value.pid = 12345
+        MockProc.return_value.is_sudo_child = False
+        MockProc.return_value.resolve_vice_pid = MagicMock(return_value=12345)
         # Simulate process still running (poll returns None)
         mock_popen = MagicMock()
         mock_popen.poll.return_value = None
@@ -148,6 +150,107 @@ class TestViceInstanceManager:
             )
             with pytest.raises(RuntimeError, match="PID mismatch"):
                 mgr.acquire()
+
+    def test_failed_start_with_text_monitor_releases_both_ports(self, _mock_vice):
+        """A failing VICE start must return the text-monitor port too.
+
+        Mirror of test_failed_binary_connect_releases_port: with
+        enable_text_monitor=True, TWO ports are allocated per attempt;
+        the text-monitor port is allocated inside _start_or_adopt so
+        acquire()'s failure path alone cannot release it.
+        """
+        MockProc, MockTrans = _mock_vice
+        MockTrans.side_effect = ConnectionError("refused")
+        MockProc.return_value._proc.poll.return_value = 1
+        mgr = ViceInstanceManager(
+            port_range_start=19300, port_range_end=19310,
+            enable_text_monitor=True,
+        )
+        with pytest.raises(RuntimeError, match="exited during"):
+            mgr.acquire()
+        assert mgr.active_count == 0
+        assert len(mgr._allocator.allocated_ports) == 0
+
+    def test_sudo_child_listener_pid_accepts_resolved_child(self, _mock_vice):
+        """Sudo-wrapped launch: the listener is the x64sc child, not the
+        sudo wrapper — the PID check must accept the resolved child."""
+        MockProc, _ = _mock_vice
+        MockProc.return_value.pid = 5000  # sudo wrapper
+        MockProc.return_value.is_sudo_child = True
+        MockProc.return_value.resolve_vice_pid = MagicMock(return_value=5001)
+        MockProc.get_listener_pid = MagicMock(return_value=5001)
+        mgr = ViceInstanceManager(
+            port_range_start=19320, port_range_end=19325, max_retries=1,
+        )
+        inst = mgr.acquire()  # must not raise "PID mismatch"
+        assert inst.port == 19320
+        mgr.release(inst)
+
+    def test_sudo_child_listener_pid_accepts_wrapper(self, _mock_vice):
+        """Sudo-wrapped launch: the wrapper PID itself is also accepted."""
+        MockProc, _ = _mock_vice
+        MockProc.return_value.pid = 5000
+        MockProc.return_value.is_sudo_child = True
+        MockProc.return_value.resolve_vice_pid = MagicMock(return_value=None)
+        MockProc.get_listener_pid = MagicMock(return_value=5000)
+        mgr = ViceInstanceManager(
+            port_range_start=19330, port_range_end=19335, max_retries=1,
+        )
+        inst = mgr.acquire()
+        mgr.release(inst)
+
+    def test_sudo_child_pid_mismatch_still_raises(self, _mock_vice):
+        """A listener that is neither the wrapper nor the resolved x64sc
+        child is still a PID mismatch."""
+        MockProc, _ = _mock_vice
+        MockProc.return_value.pid = 5000
+        MockProc.return_value.is_sudo_child = True
+        MockProc.return_value.resolve_vice_pid = MagicMock(return_value=5001)
+        MockProc.get_listener_pid = MagicMock(return_value=6000)
+        mgr = ViceInstanceManager(
+            port_range_start=19340, port_range_end=19345, max_retries=1,
+        )
+        with pytest.raises(RuntimeError, match="PID mismatch"):
+            mgr.acquire()
+
+    def test_sudo_child_no_listener_pid_warns(self, _mock_vice, caplog):
+        """listener_pid=None for a sudo'd instance logs a WARNING instead
+        of silently skipping verification."""
+        import logging
+
+        MockProc, _ = _mock_vice
+        MockProc.return_value.pid = 5000
+        MockProc.return_value.is_sudo_child = True
+        MockProc.get_listener_pid = MagicMock(return_value=None)
+        mgr = ViceInstanceManager(
+            port_range_start=19350, port_range_end=19355, max_retries=1,
+        )
+        with caplog.at_level(
+            logging.WARNING, logger="c64_test_harness.backends.vice_manager",
+        ):
+            inst = mgr.acquire()
+        mgr.release(inst)
+        assert any(
+            "skipping PID verification" in rec.getMessage() for rec in caplog.records
+        )
+
+    def test_non_sudo_no_listener_pid_does_not_warn(self, _mock_vice, caplog):
+        """The warning is scoped to sudo-wrapped launches only."""
+        import logging
+
+        MockProc, _ = _mock_vice
+        MockProc.get_listener_pid = MagicMock(return_value=None)
+        mgr = ViceInstanceManager(
+            port_range_start=19360, port_range_end=19365, max_retries=1,
+        )
+        with caplog.at_level(
+            logging.WARNING, logger="c64_test_harness.backends.vice_manager",
+        ):
+            inst = mgr.acquire()
+        mgr.release(inst)
+        assert not any(
+            "skipping PID verification" in rec.getMessage() for rec in caplog.records
+        )
 
     def test_instance_holds_port_lock(self, _mock_vice):
         mgr = ViceInstanceManager(port_range_start=19000, port_range_end=19010)
