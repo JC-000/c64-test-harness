@@ -90,9 +90,9 @@ class SidFile:
         """Return True if the given 0-based song index plays at 60 Hz (CIA).
 
         Bit N (0..31) of the 32-bit ``speed`` bitfield selects the timing
-        for song N+1. For songs beyond 32 the bit index wraps.
+        for song N+1. Per PSIDv2NG, songs beyond 32 all reuse bit 31.
         """
-        bit = song_index % 32
+        bit = min(song_index, 31)
         return bool(self.speed & (1 << bit))
 
     @classmethod

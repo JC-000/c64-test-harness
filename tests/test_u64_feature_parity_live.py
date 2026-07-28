@@ -1,11 +1,29 @@
 """Feature-parity live integration tests for Ultimate 64.
 
-Exercises the same C64Transport protocol surface that test_vice_core.py
+Exercises part of the C64Transport protocol surface that test_vice_core.py
 covers on VICE, but against real Ultimate 64 hardware via the REST API.
 
-Gated by the ``U64_HOST`` env var — e.g.:
+Covered here:
+  - memory read/write round-trips (incl. word/dword helpers, hex_dump,
+    ROM-area reads, zero-length and page-boundary edge cases)
+  - screen reads (``read_screen_codes``, ScreenGrid, wait_for_text,
+    dump_screen) and keyboard injection (send_text batching)
+  - protocol-level ``reset()`` (default scope only) and ``resume()``
+  - SID playback via ``play_sid`` (success + song-out-of-range error)
 
-    U64_HOST=192.168.1.81 python3 -m pytest tests/test_u64_feature_parity_live.py -v
+NOT covered here (protocol surface added after this module was written):
+  - ``inject_joystick``
+  - ``read_framebuffer`` / ``read_palette``
+  - ``set_speed`` / ``get_speed`` (turbo)
+  - ``reset()`` scopes other than the default (e.g. drive scopes)
+  Some of these are exercised by ``tests/test_ultimate64_transport_live.py``;
+  turbo has its own contract test in ``tests/test_turbo_contract_live.py``.
+
+Double-gated by ``U64_HOST`` and ``U64_ALLOW_MUTATE`` (the suite resets
+the machine and writes to RAM) — e.g.:
+
+    U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 \\
+        python3 -m pytest tests/test_u64_feature_parity_live.py -v
 
 Unlike VICE, the U64 does NOT pause the CPU on memory operations (DMA-backed),
 so no ``resume()`` calls are needed between screen reads or after key injection.
@@ -34,11 +52,19 @@ from c64_test_harness.sid_player import SidPlaybackError, play_sid
 
 _HOST = os.environ.get("U64_HOST")
 _PW = os.environ.get("U64_PASSWORD")
+_ALLOW_MUTATE = os.environ.get("U64_ALLOW_MUTATE")
 
-pytestmark = pytest.mark.skipif(
-    not _HOST,
-    reason="U64_HOST not set — live Ultimate device tests disabled",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not _HOST,
+        reason="U64_HOST not set — live Ultimate device tests disabled",
+    ),
+    pytest.mark.skipif(
+        not _ALLOW_MUTATE,
+        reason="U64_ALLOW_MUTATE not set — suite resets the machine and "
+        "writes to RAM",
+    ),
+]
 
 # Scratch area — avoids clobbering BASIC/KERNAL
 DATA_BASE = 0xC100
@@ -103,9 +129,16 @@ class TestScreenKeyboard:
     """Screen reads and keyboard injection against a live Ultimate 64."""
 
     def test_screen_grid_reads_real_screen(self, transport):
-        transport.client.reset()
+        transport.reset()
         grid = wait_for_text(transport, "READY.", timeout=5.0)
         assert grid is not None, "BASIC READY. prompt did not appear after reset"
+        # Settle past the first READY sighting: on real U64E hardware the
+        # boot can blank the screen again moments later (observed live
+        # 2026-07-28 — keys injected in that window vanish into the
+        # KERNAL init's buffer wipe). Re-assert READY after the window.
+        time.sleep(2.5)
+        grid = wait_for_text(transport, "READY.", timeout=5.0)
+        assert grid is not None, "READY. did not survive the boot settle window"
         assert len(grid.text_lines()) == 25
         for line in grid.text_lines():
             assert len(line) == 40
@@ -186,7 +219,7 @@ class TestSidPlayback:
                 )
         finally:
             try:
-                transport.client.reset()
+                transport.reset()
             except Exception:
                 pass
 
@@ -197,6 +230,6 @@ class TestSidPlayback:
                 play_sid(transport, sid, song=5)
         finally:
             try:
-                transport.client.reset()
+                transport.reset()
             except Exception:
                 pass

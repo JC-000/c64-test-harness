@@ -36,6 +36,14 @@ addresses (neither declared safe nor reserved):
 A write that overlaps any `reserved_region` always raises, regardless
 of `unknown_policy`.
 
+Separately from the region logic, a write whose span runs past the top
+of the 16-bit address space (`addr + length > $10000`) is rejected with
+`ValueError` — by `check_write` itself *and* by the transports'
+`read_memory`/`write_memory`.  Previously such a span silently wrapped
+back to `$0000` on the wire, which could clobber page zero after the
+policy had approved the un-wrapped range.  `override=` does **not**
+bypass this check; split the access at `$FFFF`.
+
 ## Three ways to construct a policy
 
 ### From a PRG file (cheapest accurate signal)
@@ -167,6 +175,15 @@ trampoline_addr = arbiter.alloc(117, name="trampoline")
 sentinel_addr = arbiter.alloc(16, name="sentinel")
 # Both addresses are guaranteed to pass policy.check_write.
 ```
+
+The "guaranteed to pass" contract is enforced, not assumed: `alloc()`
+runs every candidate span through `policy.check_write` before returning
+it, so an allocated address can never trip the transport-level check.
+This matters for reserved-only policies with `unknown="deny"` — their
+"free" intervals would still be refused by `check_write`, and the
+arbiter now rejects such candidates instead of handing them out (with
+an explicit diagnostic in `MemoryArbiterError.trace` when nothing is
+allocatable because no `safe_regions` are declared).
 
 The arbiter is **not** the safety mechanism — the policy on the
 transport is.  Even code that bypasses the arbiter and hands a

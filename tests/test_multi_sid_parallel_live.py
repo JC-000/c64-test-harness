@@ -44,10 +44,17 @@ logger = logging.getLogger(__name__)
 
 WAV_DIR = Path(__file__).parent / "wav_captures" / "multi_sid"
 
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("U64_HOST"),
-    reason="U64_HOST not set -- skipping live U64 tests",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not os.environ.get("U64_HOST"),
+        reason="U64_HOST not set -- skipping live U64 tests",
+    ),
+    pytest.mark.skipif(
+        not os.environ.get("U64_ALLOW_MUTATE"),
+        reason="U64_ALLOW_MUTATE not set -- suite rewrites SID addressing/"
+        "panning config and resets the machine",
+    ),
+]
 
 # ---------------------------------------------------------------------------
 # SID engine configuration

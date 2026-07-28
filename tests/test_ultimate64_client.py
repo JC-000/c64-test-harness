@@ -1,6 +1,7 @@
 """Unit tests for Ultimate64Client (mocks urllib.request.urlopen)."""
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import socket
@@ -215,6 +216,32 @@ def test_urlerror_raises_timeout_error():
             c.get_info()
 
 
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ConnectionResetError(104, "Connection reset by peer"),
+        BrokenPipeError(32, "Broken pipe"),
+        http.client.RemoteDisconnected("Remote end closed connection without response"),
+        http.client.IncompleteRead(b"\x01\x02", expected=6),
+    ],
+    ids=["connection-reset", "broken-pipe", "remote-disconnected", "incomplete-read"],
+)
+def test_connection_drop_maps_to_ultimate64_error(exc):
+    """urllib only wraps the send phase in URLError; getresponse()/read()
+    failures escape raw on fw 3.14d. They must land in the client's own
+    exception hierarchy, not leak OSError/HTTPException to callers."""
+    def _raise(req, timeout=None):
+        raise exc
+
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", side_effect=_raise):
+        with pytest.raises(Ultimate64TimeoutError) as ei:
+            c.get_info()
+    assert isinstance(ei.value, Ultimate64Error)
+    assert "connection dropped" in str(ei.value)
+    assert ei.value.__cause__ is exc
+
+
 def test_bad_json_raises_protocol_error():
     mock, _ = _capture(b"{not json}")
     c = Ultimate64Client("h")
@@ -237,12 +264,32 @@ def test_read_mem_returns_raw_bytes():
 
 
 def test_read_mem_address_formatted_uppercase_hex():
-    mock, captured = _capture(b"")
+    mock, captured = _capture(b"\x00" * 16)
     c = Ultimate64Client("h")
     with patch("urllib.request.urlopen", mock):
         c.read_mem(0xABCD, 16)
     url = captured[0][0].get_full_url()
     assert "address=0xABCD" in url
+
+
+def test_read_mem_short_payload_raises_protocol_error():
+    """A payload shorter than requested must raise, not silently truncate."""
+    mock, _ = _capture(b"\x01\x02")  # device returned 2 of 8 bytes
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        with pytest.raises(Ultimate64ProtocolError) as ei:
+            c.read_mem(0x0400, 8)
+    assert "expected 8" in str(ei.value)
+    assert isinstance(ei.value, Ultimate64Error)
+
+
+def test_read_mem_long_payload_raises_protocol_error():
+    """A payload longer than requested is equally malformed."""
+    mock, _ = _capture(b"\x00" * 5)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        with pytest.raises(Ultimate64ProtocolError):
+            c.read_mem(0x0400, 4)
 
 
 def test_read_mem_validates_address():
@@ -579,9 +626,9 @@ def test_drive_on_off_reset_urls():
         c.drive_reset("b")
     urls = [r[0].get_full_url() for r in captured]
     assert urls == [
-        "http://h/v1/drives/a%3A:on",
-        "http://h/v1/drives/a%3A:off",
-        "http://h/v1/drives/b%3A:reset",
+        "http://h/v1/drives/a:on",
+        "http://h/v1/drives/a:off",
+        "http://h/v1/drives/b:reset",
     ]
     assert all(r[0].get_method() == "PUT" for r in captured)
     assert all(r[0].data is None for r in captured)
@@ -595,8 +642,8 @@ def test_drive_remove_disk_and_unlink_urls():
         c.drive_unlink("b")
     urls = [r[0].get_full_url() for r in captured]
     assert urls == [
-        "http://h/v1/drives/a%3A:remove",
-        "http://h/v1/drives/b%3A:unlink",
+        "http://h/v1/drives/a:remove",
+        "http://h/v1/drives/b:unlink",
     ]
 
 
@@ -607,7 +654,7 @@ def test_drive_set_mode_url_and_query():
         c.drive_set_mode("a", "1581")
     req = captured[0][0]
     assert req.get_method() == "PUT"
-    assert req.get_full_url() == "http://h/v1/drives/a%3A:set_mode?mode=1581"
+    assert req.get_full_url() == "http://h/v1/drives/a:set_mode?mode=1581"
     assert req.data is None
 
 
@@ -633,7 +680,7 @@ def test_drive_load_rom_with_bytes_uses_multipart_put():
         c.drive_load_rom("a", b"\xaa\xbb\xcc")
     req = captured[0][0]
     assert req.get_method() == "PUT"
-    assert req.get_full_url() == "http://h/v1/drives/a%3A:load_rom"
+    assert req.get_full_url() == "http://h/v1/drives/a:load_rom"
     ct = req.get_header("Content-type")
     assert ct.startswith("multipart/form-data; boundary=")
     assert b'name="file"' in req.data
@@ -649,7 +696,7 @@ def test_drive_load_rom_with_str_uses_file_query():
     assert req.get_method() == "PUT"
     assert req.data is None
     url = req.get_full_url()
-    assert url == "http://h/v1/drives/b%3A:load_rom?file=/Roms/dos1541.rom"
+    assert url == "http://h/v1/drives/b:load_rom?file=/Roms/dos1541.rom"
 
 
 def test_drive_load_rom_rejects_bad_type():
@@ -868,6 +915,76 @@ def test_send_text_no_return_when_disabled():
     assert 0x0D not in payload_writes[0][1]
 
 
+def test_send_text_waits_for_empty_buffer_before_writing():
+    """send_text must not top up a partially-full buffer.
+
+    The read-$C6 / write-chunk / write-$C6 sequence is three HTTP
+    round-trips ~100 ms apart while the KERNAL dequeues from the front
+    at 50/60 Hz — writing at a non-zero offset races the dequeue and
+    produces garbage keystrokes.  The fix: poll $C6 until it reads 0,
+    then write the chunk at offset 0 with a single count publication.
+    """
+    c = Ultimate64Client("h")
+    # Simulate the KERNAL draining an in-flight buffer between polls:
+    # $C6 reads 4, then 2, then 0 (empty), then 0 for any later polls.
+    counts = iter([4, 2, 0])
+    events: list[tuple[str, int, bytes]] = []
+
+    def fake_read(addr: int, length: int) -> bytes:
+        assert addr == Ultimate64Client.KEYBUF_COUNT_ADDR
+        value = next(counts, 0)
+        events.append(("read", addr, bytes([value])))
+        return bytes([value])
+
+    def fake_write(addr: int, data: bytes) -> None:
+        events.append(("write", addr, bytes(data)))
+
+    with patch.object(c, "read_mem", side_effect=fake_read), \
+         patch.object(c, "write_mem", side_effect=fake_write):
+        c.send_text("AB")
+
+    writes = [e for e in events if e[0] == "write"]
+    # No write may happen until the buffer polled empty (three reads first).
+    reads_before_first_write = events[: events.index(writes[0])]
+    assert [e[2][0] for e in reads_before_first_write] == [4, 2, 0]
+    # Chunk lands at offset 0 ($0277 exactly), never $0277+current.
+    assert writes[0] == ("write", Ultimate64Client.KEYBUF_ADDR, bytes([0x41, 0x42, 0x0D]))
+    # Count write publishes exactly the chunk length, not current+len.
+    assert writes[1] == ("write", Ultimate64Client.KEYBUF_COUNT_ADDR, bytes([3]))
+    assert len(writes) == 2
+
+
+def test_send_text_long_string_chunks_start_at_offset_zero():
+    """Strings past KEYBUF_MAX are split into full-buffer chunks, each
+    written at $0277 offset 0 after the previous chunk drains to empty."""
+    c = Ultimate64Client("h")
+    # 12 chars + CR = 13 codes -> chunks of 10 and 3.
+    text = "ABCDEFGHIJKL"
+    # Poll sequence: empty (write chunk 1), still draining (5), empty
+    # (write chunk 2).
+    counts = iter([0, 5, 0])
+    writes: list[tuple[int, bytes]] = []
+
+    def fake_read(addr: int, length: int) -> bytes:
+        return bytes([next(counts, 0)])
+
+    def fake_write(addr: int, data: bytes) -> None:
+        writes.append((addr, bytes(data)))
+
+    with patch.object(c, "read_mem", side_effect=fake_read), \
+         patch.object(c, "write_mem", side_effect=fake_write):
+        c.send_text(text)
+
+    payload_writes = [w for w in writes if w[0] == Ultimate64Client.KEYBUF_ADDR]
+    count_writes = [w for w in writes if w[0] == Ultimate64Client.KEYBUF_COUNT_ADDR]
+    assert len(payload_writes) == 2
+    assert payload_writes[0][1] == bytes([0x41 + i for i in range(10)])
+    assert payload_writes[1][1] == bytes([0x4B, 0x4C, 0x0D])
+    assert [w[1] for w in count_writes] == [bytes([10]), bytes([3])]
+    # Every payload write targets the buffer base — no offset writes at all.
+    assert all(w[0] == Ultimate64Client.KEYBUF_ADDR for w in payload_writes)
+
+
 # ---------------------------------------------------------------- run_prg fallback
 def test_run_prg_falls_back_on_404(caplog):
     """On 404, run_prg sideloads via write_mem + send_text("SYS <addr>")."""
@@ -900,6 +1017,52 @@ def test_run_prg_falls_back_on_404(caplog):
     assert send_text_calls == [("SYS 864", True)]
     assert any("404" in r.message and "fallback" not in r.message.lower() or
                "writemem" in r.message for r in caplog.records)
+
+
+def test_run_prg_falls_back_on_404_basic_stub_types_run(caplog):
+    """A $0801 BASIC-stub PRG must be triggered with RUN, not SYS 2049.
+
+    SYS 2049 would execute the BASIC line-link bytes as 6502 opcodes and
+    corrupt the machine; the real runner endpoint's semantics are
+    load-and-RUN.
+    """
+    import logging
+
+    c = Ultimate64Client("h")
+    # Canonical BASIC stub: 10 SYS 2062 — load address $0801.
+    stub_body = bytes([
+        0x0B, 0x08,              # link to next line ($080B)
+        0x0A, 0x00,              # line number 10
+        0x9E,                    # SYS token
+        0x32, 0x30, 0x36, 0x32,  # "2062"
+        0x00,                    # end of line
+        0x00, 0x00,              # end of program
+    ])
+    prg = bytes([0x01, 0x08]) + stub_body
+
+    write_mem_calls: list[tuple[int, bytes]] = []
+    send_text_calls: list[tuple[str, bool]] = []
+
+    def fake_post_binary(path, data, query=None):
+        raise Ultimate64Error(f"POST {path} returned HTTP 404", status=404)
+
+    def fake_write_mem(addr: int, data: bytes) -> None:
+        write_mem_calls.append((addr, bytes(data)))
+
+    def fake_send_text(text: str, *, finish_with_return: bool = True) -> None:
+        send_text_calls.append((text, finish_with_return))
+
+    with patch.object(c, "_post_binary", side_effect=fake_post_binary), \
+         patch.object(c, "write_mem", side_effect=fake_write_mem), \
+         patch.object(c, "send_text", side_effect=fake_send_text), \
+         caplog.at_level(logging.WARNING, logger="c64_test_harness.backends.ultimate64_client"):
+        c.run_prg(prg)
+
+    assert write_mem_calls == [(0x0801, stub_body)]
+    # RUN, never "SYS 2049".
+    assert send_text_calls == [("RUN", True)]
+    # The warning names the trigger path that was taken.
+    assert any("'RUN'" in r.getMessage() for r in caplog.records)
 
 
 def test_run_prg_fallback_disabled():

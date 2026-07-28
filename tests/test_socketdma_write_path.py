@@ -2,8 +2,9 @@
 
 Mock-only: the REST client is a MagicMock and the SocketDMAClient is
 replaced by an in-process fake, so no network or hardware is touched.  These
-tests cover the write-routing decision, chunking, MemoryPolicy ordering, and
-the connect-failure / verify-mismatch fallback behaviour.  Live behaviour of
+tests cover the write-routing decision, chunking, MemoryPolicy ordering, the
+in-band IDENTIFY completion barrier, and the connect-failure /
+verify-mismatch fallback behaviour.  Live behaviour of
 the real SocketDMAClient framing lives in ``test_u64_socket_dma.py``.
 """
 from __future__ import annotations
@@ -23,16 +24,24 @@ from c64_test_harness.backends.ultimate64_client import Ultimate64Error
 
 
 class FakeSocketDMAClient:
-    """Records dma_write calls and lets a test script connect/send failures."""
+    """Records dma_write/identify calls and lets a test script failures.
+
+    ``events`` is a shared ordered log (``"dma_write"`` / ``"identify"``
+    entries; tests may append their own markers, e.g. for REST reads) so
+    barrier-ordering assertions can see the full call sequence.
+    """
 
     def __init__(self) -> None:
         self.init_kwargs: dict | None = None
         self.enter_count = 0
         self.close_count = 0
         self.dma_calls: list[tuple[int, bytes]] = []
+        self.identify_calls = 0
+        self.events: list[str] = []
         # Test hooks:
         self.connect_error = False          # raise Ultimate64Error on __enter__
         self.send_error_after: int | None = None  # raise on Nth dma_write (0-based)
+        self.identify_error = False         # raise Ultimate64Error on identify()
 
     def __enter__(self) -> "FakeSocketDMAClient":
         self.enter_count += 1
@@ -53,6 +62,14 @@ class FakeSocketDMAClient:
         ):
             raise Ultimate64Error("fake send failed")
         self.dma_calls.append((address, bytes(data)))
+        self.events.append("dma_write")
+
+    def identify(self) -> dict:
+        self.identify_calls += 1
+        self.events.append("identify")
+        if self.identify_error:
+            raise Ultimate64Error("fake identify failed")
+        return {"title": "FAKE ULTIMATE 64"}
 
 
 @pytest.fixture
@@ -282,6 +299,109 @@ def test_verify_mismatch_falls_back_no_latch(
     t.write_memory(0x7000, data)
     assert fake.dma_calls[-1] == (0x7000, data)
     mock_client.write_mem.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Completion barrier (in-band IDENTIFY)
+# ---------------------------------------------------------------------------
+
+
+def test_barrier_required_even_when_tail_already_matches(
+    mock_client: MagicMock, install_fake
+) -> None:
+    """Regression: a tail read-back is not a completion barrier.
+
+    Simulates RAM whose tail ALREADY equals the payload tail (zero
+    padding / re-writing the same buffer / snapshot restores whose last
+    bytes rarely change) while the head bytes are still stale in flight.
+    The pre-fix code returned success off the immediate tail match
+    without any completion barrier; the fixed code must issue the
+    in-band IDENTIFY barrier BEFORE any REST tail read.
+    """
+    fake, _ = install_fake
+    data = _payload(8192)
+
+    def read_mem(addr: int, length: int) -> bytes:
+        fake.events.append("read_mem")
+        return data[-16:]  # tail matches from the very first read
+
+    mock_client.read_mem.side_effect = read_mem
+    t = Ultimate64Transport(host="h", client=mock_client, socket_dma=True)
+
+    t.write_memory(0x2000, data)
+
+    # The barrier must have run, exactly once, after the DMA send and
+    # before the (now sanity-only) REST tail read.
+    assert fake.identify_calls == 1
+    assert fake.events == ["dma_write", "identify", "read_mem"]
+    mock_client.write_mem.assert_not_called()
+
+
+def test_barrier_once_after_all_chunks(
+    mock_client: MagicMock, install_fake
+) -> None:
+    """Chunked writes get ONE barrier, after the last DMAWRITE chunk."""
+    fake, _ = install_fake
+    data = _payload(65536)  # full 64 KiB → two 32 KiB chunks
+    mock_client.read_mem.return_value = data[-16:]
+    t = Ultimate64Transport(host="h", client=mock_client, socket_dma=True)
+
+    t.write_memory(0x0000, data)
+
+    assert fake.identify_calls == 1
+    assert fake.events == ["dma_write", "dma_write", "identify"]
+
+
+def test_barrier_failure_falls_back_no_latch(
+    mock_client: MagicMock, install_fake, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake, _ = install_fake
+    fake.identify_error = True
+    data = _payload(8192)
+    t = Ultimate64Transport(host="h", client=mock_client, socket_dma=True)
+
+    with caplog.at_level("WARNING"):
+        t.write_memory(0x4000, data)
+    assert any("barrier" in r.message.lower() for r in caplog.records)
+    # Fell back to REST for this write; no tail read was attempted.
+    mock_client.write_mem.assert_called_once_with(0x4000, data)
+    mock_client.read_mem.assert_not_called()
+    # The connection is dropped so a later attempt starts clean.
+    assert fake.close_count >= 1
+
+    # Barrier failure does not latch — a later write attempts SocketDMA.
+    fake.identify_error = False
+    mock_client.read_mem.return_value = data[-16:]
+    mock_client.write_mem.reset_mock()
+    t.write_memory(0x6000, data)
+    assert fake.dma_calls[-1] == (0x6000, data)
+    mock_client.write_mem.assert_not_called()
+
+
+def test_barrier_recv_timeout_scaled_with_payload(
+    mock_client: MagicMock, install_fake
+) -> None:
+    """The barrier stretches the socket recv timeout by payload size at
+    the worst-observed drain rate (~4 KiB/s floor), then restores it —
+    the same scaling ``SocketDMAClient.reu_write`` applies."""
+
+    class _FakeSock:
+        def __init__(self) -> None:
+            self.timeouts: list[float] = []
+
+        def settimeout(self, value: float) -> None:
+            self.timeouts.append(value)
+
+    fake, _ = install_fake
+    fake._sock = _FakeSock()
+    fake._timeout = 5.0
+    data = _payload(65536)
+    mock_client.read_mem.return_value = data[-16:]
+    t = Ultimate64Transport(host="h", client=mock_client, socket_dma=True)
+
+    t.write_memory(0x0000, data)
+
+    assert fake._sock.timeouts == [5.0 + 65536 / 4096.0, 5.0]
 
 
 # ---------------------------------------------------------------------------

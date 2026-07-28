@@ -18,6 +18,7 @@ monitor read path:
 from __future__ import annotations
 
 import collections
+import socket
 import struct
 import threading
 from unittest.mock import MagicMock, patch
@@ -26,18 +27,28 @@ import pytest
 
 from c64_test_harness.backends.vice_binary import (
     API_VERSION,
+    CMD_ADVANCE_INSTRUCTIONS,
+    CMD_CHECKPOINT_DEL,
+    CMD_CONDITION_SET,
+    CMD_DUMP,
+    CMD_EXECUTE_UNTIL_RETURN,
     CMD_MEM_GET,
+    CMD_MEM_SET,
     CMD_REGISTERS_GET,
+    CMD_RESOURCE_GET,
+    CMD_RESOURCE_SET,
     CMD_TO_RESPONSE_TYPE,
+    CMD_UNDUMP,
     EVENT_REQUEST_ID,
     EVENT_RESUMED,
     EVENT_STOPPED,
     RESPONSE_CHECKPOINT_INFO,
+    RESPONSE_HEADER_SIZE,
     STX,
     BinaryViceTransport,
     _Response,
 )
-from c64_test_harness.transport import TransportError
+from c64_test_harness.transport import ConnectionError, TimeoutError, TransportError
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +70,12 @@ def _make_transport() -> BinaryViceTransport:
         t._cols = 40
         t._rows = 25
         t._text_monitor_port = 0
+        from c64_test_harness.memory_policy import MemoryPolicy
+
+        t._memory_policy = MemoryPolicy.permissive()
         t._req_id = 0
+        t._recv_buf = bytearray()
+        t._pending_header = None
         t._resume_generation = 0
         t._reg_map = {}
         t._event_queue = collections.deque()
@@ -394,3 +410,273 @@ class TestWaitForStoppedResumeRace:
         )
         pc = t.wait_for_stopped(timeout=5.0)
         assert pc == 0x5678
+
+
+# ---------------------------------------------------------------------------
+# Fix 5 — CMD_TO_RESPONSE_TYPE completeness + _send_and_recv loud failure
+# ---------------------------------------------------------------------------
+
+
+class TestCmdResponseTypeMapCompleteness:
+    """Every command the transport can send must have a map entry, and
+    _send_and_recv must refuse to send an unmapped command rather than
+    silently skipping response validation."""
+
+    @pytest.mark.parametrize(
+        "cmd,expected",
+        [
+            (CMD_CHECKPOINT_DEL, 0x13),
+            (CMD_CONDITION_SET, 0x22),
+            (CMD_DUMP, 0x41),
+            (CMD_UNDUMP, 0x42),
+            (CMD_RESOURCE_GET, 0x51),
+            (CMD_RESOURCE_SET, 0x52),
+            (CMD_ADVANCE_INSTRUCTIONS, 0x71),
+            (CMD_EXECUTE_UNTIL_RETURN, 0x73),
+        ],
+    )
+    def test_previously_missing_commands_echo_opcode(
+        self, cmd: int, expected: int
+    ) -> None:
+        """The 8 commands the audit found missing now map to their echoed
+        opcode per the VICE binary monitor spec."""
+        assert CMD_TO_RESPONSE_TYPE[cmd] == expected
+
+    def test_every_cmd_constant_is_mapped(self) -> None:
+        """All CMD_* module constants have a CMD_TO_RESPONSE_TYPE entry."""
+        import c64_test_harness.backends.vice_binary as vb
+
+        cmds = {
+            name: value
+            for name, value in vars(vb).items()
+            if name.startswith("CMD_") and name != "CMD_TO_RESPONSE_TYPE"
+        }
+        missing = [
+            name for name, value in cmds.items()
+            if value not in CMD_TO_RESPONSE_TYPE
+        ]
+        assert not missing, f"Commands without response-type mapping: {missing}"
+
+    def test_send_and_recv_raises_on_unmapped_command(self) -> None:
+        """An unmapped command type raises before anything hits the wire."""
+        t = _make_transport()
+        with pytest.raises(TransportError, match="CMD_TO_RESPONSE_TYPE"):
+            t._send_and_recv(0x99, b"")
+        t._sock.sendall.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Fix 6 — _recv_exact partial-read resume after socket.timeout
+# ---------------------------------------------------------------------------
+
+
+def _queue_recvs_with_timeouts(sock: MagicMock, sequence: list) -> None:
+    """Make sock.recv(n) walk *sequence*: a bytes item is served (chunked
+    to at most n bytes per call), an Exception instance is raised once."""
+    state = {"seq": list(sequence)}
+
+    def fake_recv(n: int) -> bytes:
+        while state["seq"]:
+            item = state["seq"][0]
+            if isinstance(item, BaseException):
+                state["seq"].pop(0)
+                raise item
+            if not item:
+                state["seq"].pop(0)
+                continue
+            chunk = item[:n]
+            state["seq"][0] = item[len(chunk):]
+            if not state["seq"][0]:
+                state["seq"].pop(0)
+            return chunk
+        return b""
+
+    sock.recv.side_effect = fake_recv
+
+
+class TestRecvExactPartialReadResume:
+    """A socket.timeout mid-frame must not drop the partial bytes; a
+    retried read must resume the same frame and return it intact."""
+
+    def test_timeout_mid_header_resumes_same_frame(self) -> None:
+        t = _make_transport()
+        frame = _build_response_bytes(0x01, struct.pack("<H", 2) + b"\xab\xcd",
+                                      request_id=5)
+        # First 7 header bytes, then a timeout, then the rest.
+        _queue_recvs_with_timeouts(
+            t._sock, [frame[:7], socket.timeout("timed out"), frame[7:]]
+        )
+
+        with pytest.raises(TimeoutError):
+            t._recv_response()
+
+        resp = t._recv_response()
+        assert resp.response_type == 0x01
+        assert resp.request_id == 5
+        assert resp.body == struct.pack("<H", 2) + b"\xab\xcd"
+
+    def test_timeout_mid_body_resumes_same_frame(self) -> None:
+        t = _make_transport()
+        body = struct.pack("<H", 4) + b"\xde\xad\xbe\xef"
+        frame = _build_response_bytes(0x01, body, request_id=9)
+        split = RESPONSE_HEADER_SIZE + 2  # header + 2 body bytes
+        _queue_recvs_with_timeouts(
+            t._sock, [frame[:split], socket.timeout("timed out"), frame[split:]]
+        )
+
+        with pytest.raises(TimeoutError):
+            t._recv_response()
+
+        resp = t._recv_response()
+        assert resp.request_id == 9
+        assert resp.body == body
+
+    def test_wait_for_stopped_retry_returns_correct_frame(self) -> None:
+        """The wait_for_stopped deadline pattern: a timed-out call followed
+        by a retry must yield the correct STOPPED PC, not garbage parsed
+        from an arbitrary wire offset."""
+        t = _make_transport()
+        stopped_body = struct.pack("<H", 0xC0DE)
+        frame = _build_response_bytes(
+            EVENT_STOPPED, stopped_body, request_id=EVENT_REQUEST_ID
+        )
+        _queue_recvs_with_timeouts(
+            t._sock, [frame[:5], socket.timeout("timed out"), frame[5:]]
+        )
+
+        with pytest.raises(TimeoutError):
+            t.wait_for_stopped(timeout=0.2)
+
+        pc = t.wait_for_stopped(timeout=1.0)
+        assert pc == 0xC0DE
+
+    def test_back_to_back_frames_after_resume(self) -> None:
+        """After a resumed frame, the next frame parses from the correct
+        offset (no leftover state)."""
+        t = _make_transport()
+        frame1 = _build_response_bytes(0x01, struct.pack("<H", 1) + b"\x11",
+                                       request_id=1)
+        frame2 = _build_response_bytes(0x02, b"", request_id=2)
+        _queue_recvs_with_timeouts(
+            t._sock,
+            [frame1[:3], socket.timeout("timed out"), frame1[3:] + frame2],
+        )
+
+        with pytest.raises(TimeoutError):
+            t._recv_response()
+        resp1 = t._recv_response()
+        resp2 = t._recv_response()
+        assert resp1.request_id == 1
+        assert resp1.body == struct.pack("<H", 1) + b"\x11"
+        assert resp2.request_id == 2
+        assert resp2.response_type == 0x02
+
+    def test_connection_close_clears_partial_buffer(self) -> None:
+        """A closed connection resets the carry-over state."""
+        t = _make_transport()
+        _queue_recvs_with_timeouts(t._sock, [b"\x02\x02\x00"])  # then b"" = EOF
+        with pytest.raises(ConnectionError):
+            t._recv_response()
+        assert t._recv_buf == bytearray()
+        assert t._pending_header is None
+
+
+# ---------------------------------------------------------------------------
+# Fix 7 — _connect closes the socket when post-connect init raises
+# ---------------------------------------------------------------------------
+
+
+class TestConnectClosesSocketOnInitFailure:
+    def test_init_register_map_failure_closes_socket(self) -> None:
+        """If _init_register_map raises, the connected socket is closed."""
+        mock_sock = MagicMock()
+        with patch(
+            "c64_test_harness.backends.vice_binary.socket.socket",
+            return_value=mock_sock,
+        ), patch.object(
+            BinaryViceTransport,
+            "_init_register_map",
+            side_effect=TransportError("boom"),
+        ):
+            with pytest.raises(TransportError, match="boom"):
+                BinaryViceTransport(host="127.0.0.1", port=6502)
+        mock_sock.close.assert_called()
+
+    def test_text_monitor_failure_closes_binary_socket(self) -> None:
+        """If _connect_text_monitor raises, the binary socket is closed."""
+        mock_sock = MagicMock()
+        with patch(
+            "c64_test_harness.backends.vice_binary.socket.socket",
+            return_value=mock_sock,
+        ), patch.object(
+            BinaryViceTransport, "_init_register_map"
+        ), patch.object(
+            BinaryViceTransport,
+            "_connect_text_monitor",
+            side_effect=ConnectionError("no text monitor"),
+        ):
+            with pytest.raises(ConnectionError, match="no text monitor"):
+                BinaryViceTransport(
+                    host="127.0.0.1", port=6502, text_monitor_port=6510
+                )
+        mock_sock.close.assert_called()
+
+    def test_successful_init_leaves_socket_open(self) -> None:
+        """Happy path: no init failure, socket stays open."""
+        mock_sock = MagicMock()
+        with patch(
+            "c64_test_harness.backends.vice_binary.socket.socket",
+            return_value=mock_sock,
+        ), patch.object(BinaryViceTransport, "_init_register_map"):
+            t = BinaryViceTransport(host="127.0.0.1", port=6502)
+        mock_sock.close.assert_not_called()
+        assert t._sock is mock_sock
+
+
+# ---------------------------------------------------------------------------
+# Fix 8 — read/write_memory refuse to wrap past $FFFF
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryNoAddressWrap:
+    def test_write_past_ffff_raises_value_error(self) -> None:
+        t = _make_transport()
+        with patch.object(t, "_send_and_recv") as mock_send:
+            with pytest.raises(ValueError, match="wrap"):
+                t.write_memory(0xFFFF, b"\x01\x02")
+        mock_send.assert_not_called()
+
+    def test_write_far_past_ffff_raises_value_error(self) -> None:
+        t = _make_transport()
+        with patch.object(t, "_send_and_recv") as mock_send:
+            with pytest.raises(ValueError, match="wrap"):
+                t.write_memory(0xC000, bytes(0x8000))
+        mock_send.assert_not_called()
+
+    def test_write_ending_exactly_at_ffff_succeeds(self) -> None:
+        t = _make_transport()
+        resp = _Response(0x02, 0x00, 0, b"")
+        with patch.object(t, "_send_and_recv", return_value=resp) as mock_send:
+            t.write_memory(0xFFFE, b"\xaa\xbb")
+        assert mock_send.call_args[0][0] == CMD_MEM_SET
+
+    def test_read_past_ffff_raises_value_error(self) -> None:
+        t = _make_transport()
+        with patch.object(t, "_send_and_recv") as mock_send:
+            with pytest.raises(ValueError, match="wrap"):
+                t.read_memory(0xFFF0, 0x11)
+        mock_send.assert_not_called()
+
+    def test_read_ending_exactly_at_ffff_succeeds(self) -> None:
+        t = _make_transport()
+        body = struct.pack("<H", 2) + b"\x12\x34"
+        resp = _Response(0x01, 0x00, 0, body)
+        with patch.object(t, "_send_and_recv", return_value=resp):
+            assert t.read_memory(0xFFFE, 2) == b"\x12\x34"
+
+    def test_write_zero_length_still_noop(self) -> None:
+        """Empty writes remain a no-op even at the top of memory."""
+        t = _make_transport()
+        with patch.object(t, "_send_and_recv") as mock_send:
+            t.write_memory(0xFFFF, b"")
+        mock_send.assert_not_called()

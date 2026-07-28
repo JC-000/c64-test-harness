@@ -106,6 +106,33 @@ class TestVerifyRegion:
         assert ok is False
         assert diffs == 2
 
+    def test_empty_read_fails_verification(self, sample_prg):
+        """Regression: zip() truncation made a failed (empty) read
+        verify as intact with 0 diffs."""
+        path, _, _ = sample_prg
+        prg = PrgFile.from_file(path)
+        t = MockTransport()
+        t.read_memory = lambda addr, length: b""
+        ok, diffs = prg.verify_region(t, 0x0801, 32)
+        assert ok is False
+        assert diffs == 32  # every missing byte counts as a diff
+
+    def test_short_read_fails_verification(self, sample_prg):
+        """A truncated read never verifies as intact, even if the bytes
+        that did arrive all match."""
+        path, _, data = sample_prg
+        prg = PrgFile.from_file(path)
+        t = MockTransport()
+
+        def short_read(addr, length):
+            offset = addr - 0x0801
+            return data[offset : offset + length - 8]  # 8 bytes missing
+
+        t.read_memory = short_read
+        ok, diffs = prg.verify_region(t, 0x0801, 32)
+        assert ok is False
+        assert diffs == 8
+
 
 class TestFirstDiff:
     def test_no_diff(self, sample_prg):

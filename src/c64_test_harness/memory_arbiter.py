@@ -42,11 +42,17 @@ it to the transport.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from .memory_policy import MemoryPolicy, MemoryRegion
+from .memory_policy import (
+    MemoryPolicy,
+    MemoryPolicyError,
+    MemoryRegion,
+    UnknownPolicy,
+)
 
 if TYPE_CHECKING:
     from .labels import Labels
@@ -174,11 +180,18 @@ class MemoryArbiter:
         * ``[base, base + size)`` lies entirely inside the policy's
           ``safe_regions`` (when any are declared) or inside the window
           (when none are declared),
-        * the span overlaps no reserved region and no prior allocation.
+        * the span overlaps no reserved region and no prior allocation,
+        * ``policy.check_write(base, size)`` passes — every candidate is
+          verified against the policy before it is returned, so an
+          allocated address never trips the transport-level check.
+          (Under ``UnknownPolicy.WARN`` the verification pass suppresses
+          the warning; the caller's actual ``write_memory`` still warns.)
 
-        Raises :class:`MemoryArbiterError` if no such address exists.
-        The exception's ``trace`` attribute carries a line-per-candidate
-        explanation.
+        Raises :class:`MemoryArbiterError` if no such address exists —
+        in particular when the policy is ``UnknownPolicy.DENY`` with no
+        ``safe_regions`` declared, in which case *nothing* is
+        allocatable and the diagnostic says so.  The exception's
+        ``trace`` attribute carries a line-per-candidate explanation.
 
         Parameters
         ----------
@@ -202,12 +215,37 @@ class MemoryArbiter:
         for lo, hi in free_intervals:
             base = (lo + alignment - 1) & ~(alignment - 1)
             if base + size <= hi:
+                # Verify against the actual policy check before handing
+                # the address out.  A reserved-only policy with
+                # unknown=DENY has "free" intervals (nothing reserved
+                # there) that check_write would still refuse — returning
+                # one would break the "guaranteed to pass check_write"
+                # promise.
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        self.policy.check_write(base, size)
+                except MemoryPolicyError as exc:
+                    trace.append(
+                        f"free ${lo:04X}-${hi - 1:04X}: candidate ${base:04X} "
+                        f"rejected by policy.check_write ({exc.reason})"
+                    )
+                    continue
                 region = MemoryRegion(base, base + size, name)
                 self._allocated.append(region)
                 return base
             trace.append(
                 f"free ${lo:04X}-${hi - 1:04X} ({hi - lo} B) too small for "
                 f"{size} B @ alignment {alignment}"
+            )
+        if (
+            self.policy.unknown == UnknownPolicy.DENY
+            and not self.policy.safe_regions
+        ):
+            trace.append(
+                "policy denies unknown addresses and declares no "
+                "safe_regions — nothing is allocatable; declare "
+                "safe_regions or relax unknown_policy"
             )
         raise MemoryArbiterError(size, alignment, name, trace)
 

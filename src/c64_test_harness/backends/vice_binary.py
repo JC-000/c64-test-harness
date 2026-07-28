@@ -67,9 +67,17 @@ CMD_TO_RESPONSE_TYPE: dict[int, int] = {
     CMD_MEM_GET: 0x01,
     CMD_MEM_SET: 0x02,
     CMD_CHECKPOINT_SET: 0x11,
+    CMD_CHECKPOINT_DEL: 0x13,
+    CMD_CONDITION_SET: 0x22,
     CMD_REGISTERS_GET: 0x31,
     CMD_REGISTERS_SET: 0x31,
+    CMD_DUMP: 0x41,
+    CMD_UNDUMP: 0x42,
+    CMD_RESOURCE_GET: 0x51,
+    CMD_RESOURCE_SET: 0x52,
+    CMD_ADVANCE_INSTRUCTIONS: 0x71,
     CMD_KEYBOARD_FEED: 0x72,
+    CMD_EXECUTE_UNTIL_RETURN: 0x73,
     CMD_BANKS_AVAILABLE: 0x82,
     CMD_REGS_AVAILABLE: 0x83,
     CMD_DISPLAY_GET: 0x84,
@@ -135,6 +143,8 @@ class BinaryViceTransport:
         self._memory_policy: _MemoryPolicy = memory_policy or _MemoryPolicy.permissive()
 
         self._req_id = 0
+        self._recv_buf = bytearray()  # partial-read carry-over (see _recv_exact)
+        self._pending_header: bytes | None = None  # frame resume (see _recv_response)
         self._resume_generation = 0  # bumped by resume() et al.; tags queued events
         self._reg_map: dict[str, tuple[int, int]] = {}  # name -> (reg_id, size_bits)
         self._event_queue: deque[tuple[int, _Response]] = deque()  # (generation, resp)
@@ -189,11 +199,28 @@ class BinaryViceTransport:
             ) from e
 
         # The first command triggers an auto-stop.  We drain those initial
-        # events as part of the register-map initialisation.
-        self._init_register_map()
+        # events as part of the register-map initialisation.  If any
+        # post-connect init step fails, close the socket(s) we opened so
+        # a raising constructor doesn't leak a connected fd.
+        try:
+            self._init_register_map()
 
-        if self._text_monitor_port > 0:
-            self._connect_text_monitor()
+            if self._text_monitor_port > 0:
+                self._connect_text_monitor()
+        except BaseException:
+            if self._text_sock is not None:
+                try:
+                    self._text_sock.close()
+                except OSError:
+                    pass
+                self._text_sock = None
+            if self._sock is not None:
+                try:
+                    self._sock.close()
+                except OSError:
+                    pass
+                self._sock = None
+            raise
 
     def _connect_text_monitor(self) -> None:
         """Open TCP connection to VICE text monitor for warp control.
@@ -259,44 +286,67 @@ class BinaryViceTransport:
     # ----- low-level wire I/O -----
 
     def _recv_exact(self, n: int) -> bytes:
-        """Read exactly *n* bytes from the socket, handling partial reads."""
+        """Read exactly *n* bytes from the socket, handling partial reads.
+
+        On ``socket.timeout`` the bytes read so far are preserved in
+        ``self._recv_buf`` so a retried call resumes the *same* read
+        instead of dropping the partial data and leaving the wire
+        desynced (the next parse would otherwise start mid-frame).
+        ``wait_for_stopped``'s deadline loop relies on this: it catches
+        the TimeoutError and retries ``_recv_response``.
+        """
         assert self._sock is not None
-        buf = bytearray()
+        buf = self._recv_buf
         while len(buf) < n:
             try:
                 chunk = self._sock.recv(n - len(buf))
             except socket.timeout as e:
+                # Partial bytes stay in self._recv_buf for the retry.
                 raise TimeoutError(
                     f"Timed out reading from VICE binary monitor "
                     f"(got {len(buf)}/{n} bytes)"
                 ) from e
             except OSError as e:
+                self._recv_buf = bytearray()
                 raise ConnectionError(
                     f"Lost connection to VICE binary monitor: {e}"
                 ) from e
             if not chunk:
+                self._recv_buf = bytearray()
                 raise ConnectionError(
                     f"VICE binary monitor closed connection "
                     f"(got {len(buf)}/{n} bytes)"
                 )
             buf.extend(chunk)
+        self._recv_buf = bytearray()
         return bytes(buf)
 
     def _recv_response(self) -> _Response:
-        """Read one complete response/event from the wire."""
-        header = self._recv_exact(RESPONSE_HEADER_SIZE)
-        # Bytes 0-1: STX, API version (validate)
-        if header[0] != STX or header[1] != API_VERSION:
-            raise TransportError(
-                f"Invalid response header: expected STX={STX:#x} API={API_VERSION:#x}, "
-                f"got {header[0]:#x} {header[1]:#x}"
-            )
+        """Read one complete response/event from the wire.
+
+        Resumable after a mid-frame timeout: a fully-read header is
+        parked in ``self._pending_header`` so a retried call skips
+        straight to the (partially buffered) body read rather than
+        misinterpreting body bytes as a fresh header.
+        """
+        if self._pending_header is None:
+            header = self._recv_exact(RESPONSE_HEADER_SIZE)
+            # Bytes 0-1: STX, API version (validate)
+            if header[0] != STX or header[1] != API_VERSION:
+                raise TransportError(
+                    f"Invalid response header: expected STX={STX:#x} API={API_VERSION:#x}, "
+                    f"got {header[0]:#x} {header[1]:#x}"
+                )
+            self._pending_header = header
+        else:
+            header = self._pending_header
         body_length = struct.unpack_from("<I", header, 2)[0]
         response_type = header[6]
         error_code = header[7]
         request_id = struct.unpack_from("<I", header, 8)[0]
 
         body = self._recv_exact(body_length) if body_length > 0 else b""
+        self._pending_header = None
         return _Response(response_type, error_code, request_id, body)
 
     def _send_command(self, cmd_type: int, body: bytes = b"") -> int:
@@ -320,10 +370,22 @@ class BinaryViceTransport:
         return req_id
 
     def _send_and_recv(self, cmd_type: int, body: bytes = b"") -> _Response:
-        """Send a command and wait for its response, buffering any events."""
+        """Send a command and wait for its response, buffering any events.
+
+        Every command type must have an entry in ``CMD_TO_RESPONSE_TYPE``
+        so its response can be validated; an unmapped command raises
+        :class:`TransportError` *before* anything hits the wire, so a
+        newly-added command can't silently opt out of response validation.
+        """
+        expected_type = CMD_TO_RESPONSE_TYPE.get(cmd_type)
+        if expected_type is None:
+            raise TransportError(
+                f"Command type {cmd_type:#x} has no entry in "
+                f"CMD_TO_RESPONSE_TYPE; add one so its response can be "
+                f"validated (see issue #88)"
+            )
         with self._lock:
             req_id = self._send_command(cmd_type, body)
-            expected_type = CMD_TO_RESPONSE_TYPE.get(cmd_type)
             return self._wait_for_response(req_id, expected_response_type=expected_type)
 
     def _wait_for_response(
@@ -408,12 +470,18 @@ class BinaryViceTransport:
     def read_memory(self, addr: int, length: int) -> bytes:
         """Read *length* bytes starting at *addr*.
 
-        Automatically chunks reads that span more than 64 KiB (the 16-bit
-        address fields are inclusive, so a single request can read at most
-        65536 bytes: 0x0000..0xFFFF).
+        The address space is 16-bit (``$0000``-``$FFFF``); a read that
+        would run past ``$FFFF`` raises :class:`ValueError` rather than
+        silently wrapping back to ``$0000``.
         """
         if length <= 0:
             return b""
+        if addr + length > 0x10000:
+            raise ValueError(
+                f"read of {length} bytes at ${addr:04x} runs past $FFFF "
+                f"(ends at ${addr + length - 1:x}); the 6502 address "
+                f"space is 16-bit and reads do not wrap"
+            )
 
         result = bytearray()
         remaining = length
@@ -465,11 +533,22 @@ class BinaryViceTransport:
         bypass for a single call (logged at WARNING).  The default
         policy is permissive, so existing callers see no behaviour
         change.
+
+        A write that would run past ``$FFFF`` raises :class:`ValueError`
+        rather than silently wrapping back to ``$0000`` — wrapping could
+        clobber page zero *after* the memory policy approved the
+        un-wrapped range.
         """
         if isinstance(data, list):
             data = bytes(data)
         if not data:
             return
+        if addr + len(data) > 0x10000:
+            raise ValueError(
+                f"write of {len(data)} bytes at ${addr:04x} runs past "
+                f"$FFFF (ends at ${addr + len(data) - 1:x}); the 6502 "
+                f"address space is 16-bit and writes do not wrap"
+            )
 
         if not self._memory_policy.is_permissive():
             self._memory_policy.check_write(addr, len(data), override=override)
@@ -605,6 +684,8 @@ class BinaryViceTransport:
             except OSError:
                 pass
             self._sock = None
+        self._recv_buf = bytearray()
+        self._pending_header = None
 
     # ----- extended methods (beyond C64Transport protocol) -----
 
@@ -801,29 +882,44 @@ class BinaryViceTransport:
         """Return ``1`` when VICE is at native speed, ``None`` when warp is on."""
         return None if self.get_warp() else 1
 
+    # Pseudo-warp percentage for the binary-monitor fallback: VICE 3.10
+    # exposes no warp control over the binary monitor (there is no
+    # ``WarpMode`` resource, and the ``Speed`` resource rejects the
+    # documented unlimited value ``0``, reverting to 100). An absurdly
+    # large percentage sticks and lifts the frame cap — verified against
+    # x64sc 3.10.
+    _WARP_SPEED_PERCENT = 1_000_000
+    _NATIVE_SPEED_PERCENT = 100
+
     def set_warp(self, enabled: bool) -> None:
         """Enable or disable VICE warp mode at runtime.
 
-        Requires text_monitor_port to be set (VICE must be launched with
-        both -binarymonitor and -remotemonitor).
+        With a text monitor connected this drives VICE's real warp toggle
+        (``warp on``/``warp off``). Without one — every default
+        construction path — it falls back to the binary monitor's
+        ``Speed`` resource with an effectively-unlimited percentage, so
+        protocol-level ``set_speed`` works on default targets too.
         """
-        if self._text_sock is None:
-            raise TransportError(
-                "Warp control requires text monitor connection "
-                "(set text_monitor_port when constructing transport)"
-            )
-        cmd = "warp on" if enabled else "warp off"
-        self._text_command(cmd)
+        if self._text_sock is not None:
+            self._text_command("warp on" if enabled else "warp off")
+            return
+        self.resource_set(
+            "Speed",
+            self._WARP_SPEED_PERCENT if enabled else self._NATIVE_SPEED_PERCENT,
+        )
 
     def get_warp(self) -> bool:
-        """Return whether VICE warp mode is currently enabled."""
-        if self._text_sock is None:
-            raise TransportError(
-                "Warp control requires text monitor connection "
-                "(set text_monitor_port when constructing transport)"
-            )
-        response = self._text_command("warp")
-        return "is on" in response.lower()
+        """Return whether VICE warp mode is currently enabled.
+
+        The text-monitor path reads the real warp state (including warp
+        enabled via the ``-warp`` CLI flag). The binary-monitor fallback
+        reflects the pseudo-warp state this transport set via the
+        ``Speed`` resource; CLI-started warp is not observable there.
+        """
+        if self._text_sock is not None:
+            response = self._text_command("warp")
+            return "is on" in response.lower()
+        return self.resource_get("Speed") >= self._WARP_SPEED_PERCENT
 
     # ----- code-flow / inspection -----
 

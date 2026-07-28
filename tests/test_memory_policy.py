@@ -241,6 +241,40 @@ class TestUnknownPolicy:
 
 
 # ---------------------------------------------------------------------------
+# Address-space overflow — wrapped spans cannot be policy-checked
+# ---------------------------------------------------------------------------
+
+
+class TestAddressSpaceOverflow:
+    def test_overflowing_write_rejected(self) -> None:
+        # A policy reserving $0000-$00FF used to approve
+        # check_write(0xFF00, 0x200): the wrapped second half landed on
+        # addresses >= $10000 where no region exists, then the VICE
+        # transport wrapped it onto $0000-$00FF anyway.
+        p = MemoryPolicy(
+            reserved_regions=(MemoryRegion(0x0000, 0x0100, "zero page"),),
+        )
+        with pytest.raises(ValueError, match="past the top"):
+            p.check_write(0xFF00, 0x200)
+
+    def test_overflow_rejected_even_on_permissive_policy(self) -> None:
+        with pytest.raises(ValueError, match="past the top"):
+            MemoryPolicy.permissive().check_write(0xFFFF, 2)
+
+    def test_overflow_not_bypassed_by_override(self) -> None:
+        # Invalid input, not a policy denial — the escape hatch does
+        # not apply.
+        p = MemoryPolicy.permissive()
+        with pytest.raises(ValueError, match="past the top"):
+            p.check_write(0xFF00, 0x200, override="still invalid")
+
+    def test_write_ending_exactly_at_top_passes(self) -> None:
+        # $FFFF + 1 byte ends exactly at $10000 (exclusive) — no wrap.
+        MemoryPolicy.permissive().check_write(0xFFFF, 1)
+        MemoryPolicy.permissive().check_write(0xFF00, 0x100)
+
+
+# ---------------------------------------------------------------------------
 # Override escape hatch
 # ---------------------------------------------------------------------------
 

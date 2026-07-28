@@ -12,6 +12,7 @@ arrays should be treated as a soft failure by the caller.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import socket
@@ -61,11 +62,15 @@ class Ultimate64AuthError(Ultimate64Error):
 
 
 class Ultimate64TimeoutError(Ultimate64Error):
-    """Raised when the HTTP request times out or the device is unreachable."""
+    """Raised when the HTTP request times out, the device is unreachable,
+    or the connection drops mid-request (reset / broken pipe / truncated
+    HTTP response)."""
 
 
 class Ultimate64ProtocolError(Ultimate64Error):
-    """Raised when a JSON response cannot be parsed."""
+    """Raised when a response cannot be parsed (invalid JSON) or has an
+    unexpected shape — e.g. a ``readmem`` payload whose length differs
+    from the requested length."""
 
 
 class Ultimate64UnsafeOperationError(Ultimate64Error):
@@ -274,6 +279,15 @@ class Ultimate64Client:
             return status, data  # unreachable
         except socket.timeout as e:
             raise Ultimate64TimeoutError(f"timeout after {self.timeout}s: {method} {url}") from e
+        except (ConnectionResetError, BrokenPipeError, http.client.HTTPException) as e:
+            # urllib only wraps the *send* phase in URLError; failures during
+            # getresponse()/read() escape raw (fw 3.14d drops connections
+            # mid-response under load — see ultimate64_probe.py).  Map them
+            # into the client's exception hierarchy so callers can catch
+            # Ultimate64Error uniformly.
+            raise Ultimate64TimeoutError(
+                f"connection dropped: {method} {url}: {type(e).__name__}: {e}"
+            ) from e
         except urllib.error.URLError as e:
             reason = getattr(e, "reason", e)
             if isinstance(reason, socket.timeout):
@@ -529,6 +543,11 @@ class Ultimate64Client:
         """GET /v1/machine:readmem — read `length` bytes from C64 memory via DMA.
 
         Returns the raw byte payload. Address is formatted as 0xNNNN.
+
+        :raises Ultimate64ProtocolError: if the device returns a payload
+            whose length differs from the requested `length`.  Without
+            this check, downstream chunked readers would silently
+            produce short / misaligned results.
         """
         if not isinstance(address, int) or address < 0 or address > 0xFFFF:
             raise ValueError(f"address out of range 0..0xFFFF: {address}")
@@ -536,6 +555,11 @@ class Ultimate64Client:
             raise ValueError(f"length must be positive, got {length}")
         query = {"address": "0x%04X" % address, "length": "%d" % length}
         _, data = self._request("GET", "/v1/machine:readmem", query=query)
+        if len(data) != length:
+            raise Ultimate64ProtocolError(
+                f"readmem at 0x{address:04X} returned {len(data)} bytes, "
+                f"expected {length}"
+            )
         return data
 
     #: Class-level fallback for the raw-byte threshold above which
@@ -617,7 +641,15 @@ class Ultimate64Client:
 
         For longer strings the buffer's 10-byte hardware limit is
         respected: the call polls ``$00C6`` and waits for the KERNAL
-        scan loop to drain the buffer before pushing the next chunk.
+        scan loop to drain the buffer **to empty** before pushing the
+        next chunk.  Topping up a partially-full buffer is deliberately
+        avoided: the read-$C6 / write-chunk / write-$C6 sequence is
+        three HTTP round-trips ~100 ms apart, and the KERNAL dequeues
+        from the front of the buffer at 50/60 Hz — any consumption
+        inside that window would land the chunk at a stale offset and
+        overstate the count (garbage keystrokes).  Writing only into an
+        empty buffer means chunks always start at ``$0277`` offset 0 and
+        the ``$00C6`` count write is the single publication step.
         """
         if not isinstance(text, str):
             raise TypeError("text must be a string")
@@ -642,13 +674,15 @@ class Ultimate64Client:
                 )
             count_byte = self.read_mem(self.KEYBUF_COUNT_ADDR, 1)
             current = count_byte[0] if count_byte else 0
-            free = self.KEYBUF_MAX - current
-            if free <= 0:
+            if current != 0:
+                # Buffer not yet drained — never top up a partially-full
+                # buffer (the KERNAL may dequeue between our read of $C6
+                # and the two writes, corrupting offset and count).
                 continue
-            chunk = remaining[:free]
-            remaining = remaining[free:]
-            self.write_mem(self.KEYBUF_ADDR + current, bytes(chunk))
-            self.write_mem(self.KEYBUF_COUNT_ADDR, bytes([current + len(chunk)]))
+            chunk = remaining[:self.KEYBUF_MAX]
+            remaining = remaining[self.KEYBUF_MAX:]
+            self.write_mem(self.KEYBUF_ADDR, bytes(chunk))
+            self.write_mem(self.KEYBUF_COUNT_ADDR, bytes([len(chunk)]))
 
     # ------------------------------------------------------------ code runners
     def load_prg(self, data: bytes) -> None:
@@ -682,8 +716,19 @@ class Ultimate64Client:
           default), the call transparently retries by sideloading the
           PRG body via :meth:`write_mem` (using the load address from
           the PRG's first two header bytes, little-endian) and then
-          triggering with :meth:`send_text` (``"SYS <addr>\\r"``).  A
-          ``logging.warning`` is emitted when the fallback fires.  Pass
+          triggering it, matching the real endpoint's load-and-RUN
+          semantics:
+
+          * load address ``$0801`` (a canonical BASIC-stub PRG) —
+            triggers with :meth:`send_text` (``"RUN\\r"``).  ``SYS 2049``
+            would execute the BASIC line-link bytes as 6502 opcodes and
+            corrupt the machine; ``RUN`` interprets the stub the way
+            the runner endpoint does.
+          * any other load address (pure-ML PRG) — triggers with
+            :meth:`send_text` (``"SYS <addr>\\r"``).
+
+          A ``logging.warning`` is emitted when the fallback fires,
+          naming which trigger path was taken.  Pass
           ``fallback_on_404=False`` to surface the 404 as a plain
           :class:`Ultimate64Error`.
         * **Device unreachable** — raised as ``Ultimate64TimeoutError``.
@@ -704,15 +749,17 @@ class Ultimate64Client:
                 raise
             load_addr = data[0] | (data[1] << 8)
             body = bytes(data[2:])
+            trigger = "RUN" if load_addr == 0x0801 else f"SYS {load_addr}"
             _log.warning(
                 "run_prg got HTTP 404 from /v1/runners:run_prg; "
-                "falling back to writemem+SYS sideload at $%04X "
-                "(fw 3.14d wedged-runner workaround)",
+                "falling back to writemem sideload at $%04X, triggering "
+                "with %r (fw 3.14d wedged-runner workaround)",
                 load_addr,
+                trigger,
             )
             if body:
                 self.write_mem(load_addr, body)
-            self.send_text(f"SYS {load_addr}", finish_with_return=True)
+            self.send_text(trigger, finish_with_return=True)
 
     def run_crt(self, data: bytes) -> None:
         """POST /v1/runners:run_crt — start a cartridge image (DESTRUCTIVE).
@@ -823,10 +870,12 @@ class Ultimate64Client:
 
     @staticmethod
     def _drive_slot_path(drive: str, action: str) -> str:
+        # Plain slot letter, no trailing colon: fw 3.14 answers 400
+        # "Invalid Drive 'a:'" for /v1/drives/a%3A:reset but 200 for
+        # /v1/drives/a:reset (verified live 2026-07-28).
         if drive not in ("a", "b"):
             raise ValueError(f"drive must be 'a' or 'b', got {drive!r}")
-        slot = drive + ":"
-        return f"/v1/drives/{_encode(slot)}:{action}"
+        return f"/v1/drives/{drive}:{action}"
 
     def drive_on(self, drive: str) -> None:
         """PUT /v1/drives/<drive>:on — power on a drive slot (DESTRUCTIVE)."""

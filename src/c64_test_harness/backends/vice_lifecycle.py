@@ -190,6 +190,27 @@ class ViceProcess:
     def pid(self) -> int | None:
         return self._proc.pid if self._proc else None
 
+    @property
+    def is_sudo_child(self) -> bool:
+        """True when the launch was wrapped with ``sudo -n`` (macOS
+        ethernet path).  In that case :attr:`pid` is the sudo wrapper,
+        not x64sc itself — use :meth:`resolve_vice_pid` for the actual
+        emulator PID."""
+        return self._is_sudo_child
+
+    def resolve_vice_pid(self) -> int | None:
+        """PID of the actual x64sc process.
+
+        For a plain launch this is :attr:`pid`.  For a sudo-wrapped
+        launch (macOS ethernet), :attr:`pid` is the sudo wrapper, so the
+        x64sc child is resolved via the process table (``ps``, matching
+        the ``pgrep -P <sudo_pid> x64sc`` pattern).  Returns ``None``
+        when the process is not running or the child cannot be found.
+        """
+        if not self._is_sudo_child:
+            return self.pid
+        return self._find_x64sc_child_pid()
+
     def start(self) -> None:
         """Stop any existing process on this instance, then launch VICE."""
         if self._proc is not None:
@@ -414,6 +435,11 @@ class ViceProcess:
                         # only its exec'd child).
                         try:
                             self._proc.kill()
+                            # Reap the wrapper: without wait() the killed
+                            # process lingers as a zombie, and BSD ps
+                            # keeps the comm name on zombies, confusing
+                            # cleanup helpers (macOS trap #3).
+                            self._proc.wait(timeout=3)
                         except Exception:
                             pass
             else:
@@ -422,6 +448,9 @@ class ViceProcess:
         except Exception:
             try:
                 self._proc.kill()
+                # Reap after SIGKILL so we don't leave a zombie behind
+                # (see comment on the sudo path above).
+                self._proc.wait(timeout=3)
             except Exception:
                 pass
         self._proc = None

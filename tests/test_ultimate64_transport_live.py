@@ -25,7 +25,10 @@ import pytest
 
 from c64_test_harness.backends.device_lock import DeviceLock
 from c64_test_harness.backends.ultimate64 import Ultimate64Transport
-from c64_test_harness.backends.ultimate64_helpers import get_turbo_mhz
+from c64_test_harness.backends.ultimate64_helpers import (
+    get_turbo_mhz,
+    max_cpu_speed_mhz,
+)
 from c64_test_harness.backends.ultimate64_probe import is_u64_reachable
 from c64_test_harness.transport import C64Transport
 
@@ -107,10 +110,21 @@ def test_read_framebuffer_returns_one_frame(transport: Ultimate64Transport) -> N
     ``DEFAULT_VIDEO_PORT`` (11000).  Skips with a clear message if the
     stream cannot be received (firewall, NAT, etc.).
     """
+    from c64_test_harness.backends.ultimate64_client import Ultimate64Error
     from c64_test_harness.transport import TransportError
 
     try:
         fb = transport.read_framebuffer(timeout=3.0)
+    except Ultimate64Error as exc:
+        if exc.status == 500:
+            # Observed live 2026-07-28: C64U fw 1.1.0 answered HTTP 500
+            # "No Operational Network Interface" to video:start with a
+            # routed capture host. May be topology-dependent — the skip
+            # reason carries the device's actual error body.
+            pytest.skip(
+                f"video stream start rejected by this firmware: {exc}"
+            )
+        raise
     except TransportError as exc:
         pytest.skip(f"U64 video stream not reachable from this host: {exc}")
 
@@ -152,20 +166,26 @@ class TestSetSpeed:
     def test_set_speed_none_selects_max(
         self, transport: Ultimate64Transport
     ) -> None:
-        """``set_speed(None)`` enables turbo at the device max (48 MHz).
+        """``set_speed(None)`` enables turbo at the device's probed max.
+
+        Since PR #143 the max is probed from the device's CPU-Speed
+        presets (64 on a C64 Ultimate fw 1.1.0, 48 on a U64 Elite fw
+        3.14; 48 fallback on an inconclusive probe), so the expectation
+        is ``max_cpu_speed_mhz(client)`` rather than a literal 48.
 
         Note the asymmetry with VICE (where ``set_speed(None)`` ⇒ warp on,
         and ``get_speed()`` returns ``None``): on U64, ``set_speed(None)``
-        maps to ``set_turbo_mhz(client, 48)``, which sets Turbo Control to
-        ``"Manual"`` at 48 MHz, so ``get_speed()`` reads back ``48`` (not
+        maps to ``set_turbo_mhz(client, <max>)``, which sets Turbo Control
+        to ``"Manual"``, so ``get_speed()`` reads back the max (not
         ``None``). ``get_speed()`` only returns ``None`` when turbo is on
         but the CPU-Speed enum is unrecognised — a state ``set_speed``
         does not produce.
         """
+        device_max = max_cpu_speed_mhz(transport.client)
         try:
             transport.set_speed(None)
-            assert transport.get_speed() == 48
-            assert get_turbo_mhz(transport.client) == 48
+            assert transport.get_speed() == device_max
+            assert get_turbo_mhz(transport.client) == device_max
         finally:
             transport.set_speed(1)
 
@@ -235,6 +255,12 @@ class TestResetScopes:
             assert is_u64_reachable(_HOST, password=_PW)
             data = transport.read_memory(0xA000, 16)
             assert isinstance(data, bytes) and len(data) == 16
+            # Settle: the C64's boot sequence walks RAM upward (BASIC
+            # memory sizing) for a few seconds after reset. Leaving
+            # mid-boot pollutes whatever runs next — e.g. a SocketDMA
+            # write to $4000 gets clobbered by the walker (observed
+            # live on U64E fw 3.14, 2026-07-28).
+            time.sleep(3.0)
         finally:
             transport.set_speed(1)
 
@@ -246,6 +272,9 @@ class TestResetScopes:
             transport.reset()
             time.sleep(1.0)
             assert is_u64_reachable(_HOST, password=_PW)
+            # Same boot-settle as test_reset_scope_cpu_keeps_device_responsive:
+            # don't hand a mid-boot machine to whatever runs next.
+            time.sleep(3.0)
         finally:
             transport.set_speed(1)
 

@@ -22,9 +22,10 @@ Reusable test harness for Commodore 64 programs. Automates C64 programs via the 
 - **SID playback** — cross-backend `play_sid()` dispatches to VICE (IRQ stub) or Ultimate 64 (native firmware endpoint); PSID/RSID parser
 - **Audio capture** — headless WAV recording via VICE (`render_wav()`) and U64 UDP audio stream (`capture_sid_u64()`, `AudioCapture`)
 - **U64 data streams** — cycle-accurate 6510/VIC bus trace (`DebugCapture`), VIC-II video frame capture (`VideoCapture`), audio capture — all over UDP with gap detection
-- **Runtime warp toggle** — enable/disable VICE warp mode at runtime via dual-monitor (binary + text); `resource_get`/`resource_set` for general VICE resource control
+- **Runtime warp toggle** — enable/disable VICE warp mode at runtime on any VICE target (real warp via the text monitor when connected, `Speed`-resource pseudo-warp over the binary monitor otherwise); `resource_get`/`resource_set` for general VICE resource control
 - **VICE single-step / snapshots / trace** — `single_step` / `step_out`, conditional breakpoints (`set_condition`), instruction history (`cpu_history`, VICE 3.10+), `dump_snapshot`/`undump_snapshot`, `banks_available` / `registers_available` introspection
-- **VICE input simulation & display capture** — `inject_joystick`, `inject_userport`; `read_framebuffer` + `read_palette` for raw VIC capture
+- **Input simulation & display capture** — cross-backend `inject_joystick` (active-high: bit set = pressed; the U64 backend inverts for its active-low CIA ports internally), `inject_userport` (VICE); `read_framebuffer` + `read_palette` for raw VIC capture
+- **Cross-backend snapshots** — `extract_snapshot` / `restore_snapshot` round-trip RAM (+ optional REU contents) between VICE and U64 via VICE's native `.vsf` format; restore skips the live I/O window `$D000-$DFFF` except color RAM (see [docs/snapshot_interop.md](docs/snapshot_interop.md))
 - **VICE deterministic test setup** — `ViceConfig.load_snapshot`, event recording / replay (`event_recording_start`, `event_image`, `event_snapshot_mode`/`_dir`), `seed` for RNG, `sound_record_driver`/`_file`, `exit_screenshot`
 - **VICE text-monitor extras** — `detach_drive`, `attach_drive`, `screenshot_to_file`, 6502 profiler (`profile_start`/`profile_stop`/`profile_dump`)
 - **U64 drive & disk fixtures** — `drive_on/off/reset/set_mode/load_rom`, `create_d64/d71/d81/dnp` blank-image creation, `file_info`, `get_debug_register`/`set_debug_register` ($D7FF), `measure_bus_timing` (VCD), batch `set_config_items_batch`
@@ -32,7 +33,7 @@ Reusable test harness for Commodore 64 programs. Automates C64 programs via the 
 - **U64 syslog listener** — `U64SyslogListener` consumes UDP 514 raw-line syslog from the firmware; `wait_for(predicate)` for assertion-driven tests
 - **U64 robust recovery** — `recover()` escalates `reset()` -> probe -> `reboot()` -> probe to clear CPU/FPGA/REU stuck states, and `runner_health_check()` raises `Ultimate64RunnerStuckError` on the firmware's "Cannot open file" wedged-runner signature (never calls `poweroff()`)
 - **Cross-backend `run_subroutine()`** — single primitive for short routines that dispatches to VICE `jsr()` (binary-monitor checkpoint) or U64 sentinel-trampoline + host poll (`poll_cadence` knob for sub-ms targets); `target.client` accessor returns the underlying `Ultimate64Client` on U64-backed targets
-- **Ultimate64Client robustness** — public `send_text(text, *, finish_with_return=True)` for KERNAL keyboard-buffer injection (the `SYS <addr>` trigger pattern); `run_prg(..., fallback_on_404=True)` transparently sideloads via `write_mem` + SYS keystroke when fw 3.14d returns HTTP 404 from a wedged runner; `write_mem_query_threshold` is per-instance with auto-detect (fw 3.14d → 128, else 48) and a kwarg override
+- **Ultimate64Client robustness** — public `send_text(text, *, finish_with_return=True)` for KERNAL keyboard-buffer injection (waits for the buffer to fully drain — `$C6 == 0` — before each chunk, so keystrokes can't land at stale offsets); `run_prg(..., fallback_on_404=True)` transparently sideloads via `write_mem` when fw 3.14d returns HTTP 404 from a wedged runner, triggering with `RUN` for `$0801` BASIC-stub PRGs and `SYS <addr>` for pure-ML; connection drops mid-request (reset / broken pipe / truncated response) map to `Ultimate64TimeoutError` and short `readmem` payloads raise `Ultimate64ProtocolError`; `write_mem_query_threshold` is per-instance with auto-detect (fw 3.14d → 128, else 48) and a kwarg override
 - **Queue-aware device locking** — `DeviceLock` heartbeats the lockfile mtime every ~15 s while held (configurable via `heartbeat_interval`), and `acquire(timeout, *, progress_window=60.0)` extends a waiter's deadline indefinitely against any live, heartbeating holder — so multi-hour holders no longer cause waiter timeouts. `acquire_or_raise()` raises `DeviceLockTimeout` (a `TimeoutError` subclass; exported from the top-level package) with structured diagnostics — holder PID, liveness, lockfile age, REST reachability — and a diagnosed-state message that distinguishes "queued behind live, progressing" / "holder may be wedged" / "stale lock from dead PID" / "no holder metadata" so callers stop conflating "queued" with "device broken". `create_manager(lock_timeout=...)` threads through to `_LockedU64Manager`, which now raises `DeviceLockTimeout` on failure; default 60 s and 120 s ceiling for ad-hoc work — widening past that is rarely useful with the heartbeat in place. Optional `c64-test-harness[notify]` extra adds `watchdog`-based fs-event wakeups
 - **Per-routine FPGA refresh** — `DebugCapture.with_fresh_fpga(client, *, capture_kwargs=None, reboot_settle_seconds=12.0)` classmethod reboots the U64 FPGA before each capture to recover from the UDP debug-stream rate degradation that builds up during sustained workloads (issue #81)
 - **VICE Darwin autostart fix** — `ViceProcess` auto-injects `-autostartprgmode 1` on macOS when `prg_path` is set, unless the caller has already passed `-autostartprgmode` via `extra_args`
@@ -212,7 +213,9 @@ reserved_regions = [
 ]
 ```
 
-Per-call `override="reason"` is the escape hatch for deliberate clobbers (logged at WARNING).  `MemoryArbiter` is the companion ergonomic — ask it for a scratch address and it returns one guaranteed to pass the policy.
+Per-call `override="reason"` is the escape hatch for deliberate clobbers (logged at WARNING).  `MemoryArbiter` is the companion ergonomic — ask it for a scratch address and it returns one guaranteed to pass the policy (every candidate is verified via `check_write` before it is handed out).
+
+Independent of the policy, reads and writes whose span runs past `$FFFF` raise `ValueError` at the transport instead of silently wrapping to `$0000` — `override=` does not bypass this; split the access at `$FFFF`.
 
 See [docs/memory_safety.md](docs/memory_safety.md) for the full design, the harness's own scratch-address table, and the migration story.
 
@@ -306,18 +309,14 @@ with ViceProcess(config) as vice:
 
 ## Runtime Warp Mode Toggle
 
-Toggle VICE warp mode at runtime to speed up long-running computations (e.g. crypto benchmarks) and then return to normal speed for screen verification. VICE 3.10 does not expose `WarpMode` as a binary monitor resource, so warp control requires a secondary text remote monitor connection:
+Toggle VICE warp mode at runtime to speed up long-running computations (e.g. crypto benchmarks) and then return to normal speed for screen verification. Warp control works on any `BinaryViceTransport` — no text monitor connection required:
 
 ```python
 from c64_test_harness import BinaryViceTransport, ViceProcess, ViceConfig
 
-# Enable both binary and text monitors
-config = ViceConfig(prg_path="build/app.prg", text_monitor_port=6510)
+config = ViceConfig(prg_path="build/app.prg")
 with ViceProcess(config) as vice:
-    transport = BinaryViceTransport(
-        port=config.port,
-        text_monitor_port=config.text_monitor_port,
-    )
+    transport = BinaryViceTransport(port=config.port)
 
     # Toggle warp at runtime
     transport.set_warp(True)    # enable warp — CPU runs at maximum speed
@@ -335,20 +334,9 @@ with ViceProcess(config) as vice:
     transport.close()
 ```
 
-`ViceInstanceManager` can auto-allocate the text monitor port:
+The cross-backend equivalents `set_speed(None)` / `set_speed(1)` (warp on / off on VICE) therefore also work on default-constructed VICE targets.
 
-```python
-from c64_test_harness import ViceInstanceManager, ViceConfig
-
-config = ViceConfig(prg_path="build/app.prg")
-with ViceInstanceManager(config, enable_text_monitor=True) as mgr:
-    with mgr.instance() as inst:
-        inst.transport.set_warp(True)
-        # ... run tests in warp ...
-        inst.transport.set_warp(False)
-```
-
-**Why dual monitors?** The binary monitor protocol (commands `0x51`/`0x52`) handles most VICE resources, but VICE 3.10's binary monitor returns error code `0x01` for `WarpMode`. The text remote monitor's `warp on`/`warp off` command works reliably. Both monitors run simultaneously on separate TCP ports.
+**How it works:** VICE 3.10 exposes no warp control over the binary monitor (there is no `WarpMode` resource, and the `Speed` resource rejects the documented "unlimited" value 0), so `set_warp`/`get_warp` are hybrid. With a text monitor connected (`ViceConfig(text_monitor_port=...)`, or `ViceInstanceManager(enable_text_monitor=True)` to auto-allocate the port) they drive VICE's real `warp on`/`warp off` toggle — including detecting warp enabled via the `-warp` CLI flag. Without one, they fall back to setting the binary monitor's `Speed` resource to an effectively-unlimited percentage (pseudo-warp); on that path `get_warp` only reflects pseudo-warp set through the transport. The text monitor is otherwise only needed for the text-monitor extras (`attach_drive`/`detach_drive`, `screenshot_to_file`, the 6502 profiler).
 
 ## Multi-Instance VICE & Parallel Testing
 
@@ -379,6 +367,8 @@ with ViceInstanceManager(config, port_range_start=6511, port_range_end=6516) as 
 `PortAllocator` manages thread-safe port assignment with dual-layer protection: OS-level `bind()` reservations and file-based `flock()` locks (`PortLock`). The file lock bridges the TOCTOU gap between closing the reservation socket and VICE binding to the port, making overlapping startup from independent processes completely safe. `ViceInstanceManager` handles the full lifecycle: allocate port, acquire file lock, launch VICE, connect binary transport with retries, verify PID ownership, and clean up on release. Failed acquisitions retry with exponential backoff (configurable via `max_retries`). Set `reuse_existing=True` to adopt already-running VICE instances instead of launching new ones. Stress-tested with 3 concurrent agents × 6 workers across 5 phases (lock contention, VICE startup, mixed workloads, crash recovery, port exhaustion) with zero failures — see `scripts/stress_cross_process.py`.
 
 Each `ViceInstance` exposes a `.pid` property (the OS process ID of the VICE process), and `SingleTestResult` includes the `.pid` of the instance that ran each test. This allows callers to track and manage only their own VICE processes — essential when multiple agents run tests concurrently.
+
+`run_parallel()` is failure-isolated: an instance-acquire failure (e.g. port exhaustion) is recorded as a failed result for that one test instead of aborting the whole run and discarding completed results. When `max_workers` is omitted it defaults to `len(tests)` capped at 10 (the port-allocator budget cannot serve more concurrent instances anyway), and an empty test list returns an empty `ParallelTestResult`.
 
 See `scripts/run_parallel_sha256.py` for a full integration example running 3 concurrent VICE instances with SHA-256 validation, or `scripts/three_windows.py` for an interactive demo that writes user input directly into screen memory across 3 simultaneous VICE windows.
 
@@ -596,9 +586,9 @@ snap = snapshot_state(transport)        # capture turbo/REU/SID config
 restore_state(transport, snap)          # put device back as you found it
 ```
 
-CPU speeds are validated against the **superset** of enum values across device generations: the Ultimate 64 Elite (fw 3.14) supports 1–48 MHz including 5; the C64 Ultimate (fw 1.1.0) drops 5 and adds 64. A speed the connected device doesn't have passes local validation and is rejected by the firmware with HTTP 400 (`Ultimate64Error`) — and because `set_turbo_mhz` writes CPU Speed before enabling Turbo Control, a rejected speed never leaves turbo half-enabled. Verified live on the C64 Ultimate (foreign speed rejected; all 16 native speeds apply and read back cleanly); the U64E direction is covered by the same test and pending hardware access. See `tests/test_turbo_contract_live.py` (gated by `TURBO_CONTRACT_LIVE=1` + `U64_HOST` + `U64_ALLOW_MUTATE=1`).
+CPU speeds are validated against the **superset** of enum values across device generations: the Ultimate 64 Elite (fw 3.14) supports 1–48 MHz including 5; the C64 Ultimate (fw 1.1.0) drops 5 and adds 64. `set_turbo_mhz` probes the connected device's actual `CPU Speed` presets (once, cached per client) and rejects a generation-foreign speed with a local `ValueError` before anything goes on the wire; only when the probe is inconclusive does the request reach the firmware, which rejects it with HTTP 400 (`Ultimate64Error`) — and because CPU Speed is written before Turbo Control is enabled, a rejected speed never leaves turbo half-enabled. The same probe backs `max_cpu_speed_mhz(client)`, so `transport.set_speed(None)` ("max speed") resolves to the device's true maximum — 64 MHz on a C64 Ultimate, 48 MHz on a U64 Elite, with a 48 fallback when the probe is inconclusive. See `tests/test_turbo_contract_live.py` (gated by `TURBO_CONTRACT_LIVE=1` + `U64_HOST` + `U64_ALLOW_MUTATE=1`).
 
-`set_reu` is also cross-generation aware: the U64E requires switching the `Cartridge` preset to `"REU"` alongside enabling the REU item, while the C64 Ultimate has no `"REU"` cartridge preset at all (its `Cartridge` value merely mirrors REU state — writing it back is rejected with HTTP 400). The helper probes the device's `Cartridge` presets once per enable and writes the preset only where it exists — ordered first, so a firmware rejection can never leave the REU half-enabled. `restore_state` applies the same probe before restoring a snapshotted cartridge value, so a C64U snapshot/restore round-trip is safe.
+`set_reu` is also cross-generation aware: the U64E requires switching the `Cartridge` preset to `"REU"` alongside enabling the REU item, while the C64 Ultimate has no `"REU"` cartridge preset at all (its `Cartridge` value merely mirrors REU state — writing it back is rejected with HTTP 400). The helper probes the device's `Cartridge` presets once per enable and writes the preset only where it exists — ordered first, so a firmware rejection can never leave the REU half-enabled. `restore_state` applies the same probe and the same Cartridge-first ordering when restoring a snapshotted state, so a C64U snapshot/restore round-trip is safe.
 
 See `examples/ultimate64_hello.py` for a full BASIC round-trip demo and `scripts/probe_u64.py` for device capability discovery.
 
@@ -612,7 +602,7 @@ transport.socket_dma_min_bytes = 8192      # payloads >= this use DMAWRITE
 transport.write_memory(0x4000, blob)       # 16 KiB in ~150 ms instead of >6 s
 ```
 
-Motivation: on C64 Ultimate fw 1.1.0 the REST `POST writemem` path degrades sharply at 16 KiB (~6 s per request, measured; ≤12 KiB is fine). The fast path chunks at 32 KiB, passes the same `MemoryPolicy` checks as the REST path, and — because the protocol is fire-and-forget — verifies by polling a tail read-back (budget `transport.socket_dma_verify_timeout`, default 2 s). Any connect failure, send failure, or verify miss logs a WARNING and falls back to REST; connect failures latch the fast path off for the transport's lifetime. The raw client (`SocketDMAClient`: DMA load/run, REU write, keyboard inject, reset, identify) is exported from the package root for direct use.
+Motivation: on C64 Ultimate fw 1.1.0 the REST `POST writemem` path degrades sharply at 16 KiB (~6 s per request, measured; ≤12 KiB is fine). The fast path chunks at 32 KiB and passes the same `MemoryPolicy` checks as the REST path. `DMAWRITE` itself is fire-and-forget (no per-command ack), so the write finishes with an in-band `IDENTIFY` completion barrier — the firmware services commands on a connection strictly in order, so the `IDENTIFY` reply proves every preceding chunk was consumed and applied (the same barrier the REU `reu_write` path uses; its recv timeout scales with payload size). A tail read-back over REST follows as a post-barrier sanity check (budget `transport.socket_dma_verify_timeout`, default 2 s). Any connect failure, send failure, barrier failure, or verify miss logs a WARNING and falls back to REST; connect failures latch the fast path off for the transport's lifetime. The raw client (`SocketDMAClient`: DMA load/run, REU write, keyboard inject, reset, identify) is exported from the package root for direct use.
 
 ### Reset vs Reboot
 
@@ -996,8 +986,10 @@ pytest tests/test_disk_vice.py -v        # VICE disk I/O integration tests
 pytest tests/test_vice_core.py -v        # VICE core module integration tests
 pytest tests/test_vice_binary.py -v      # VICE binary monitor protocol tests
 
-# Ultimate 64 live tests (requires U64_HOST)
-U64_HOST=192.168.1.81 pytest tests/test_u64_feature_parity_live.py -v
+# Ultimate 64 live tests (requires U64_HOST; suites that mutate device
+# state — reset, RAM writes, config changes — additionally require
+# U64_ALLOW_MUTATE=1)
+U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 pytest tests/test_u64_feature_parity_live.py -v
 U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 pytest tests/test_u64_turbo_bench_live.py -v
 TURBO_CONTRACT_LIVE=1 U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 pytest tests/test_turbo_contract_live.py -v  # cross-generation CPU-speed contract
 SOCKETDMA_LIVE=1 U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 pytest tests/test_socketdma_live.py -v  # SocketDMA fast path + cross-generation REU contract
@@ -1010,6 +1002,8 @@ python3 scripts/stress_u64_queue.py 192.168.1.81 --workers 6 --rounds 5
 ```
 
 Every live test runs inside the autouse `device_lock_guard` fixture, so `DeviceLock` serializes access to the physical device whether or not the test asks for it. Multiple agents (separate OS processes) can safely run tests in parallel — the lock file queues them automatically. See [Shared-device contract](#shared-device-contract-devicelock) for what that obliges non-test tools to do, and set `U64_REQUIRE_DEVICE_LOCK=1` to make an unlocked destructive call an error instead of a warning.
+
+Live suites that mutate device state (`test_u64_feature_parity_live.py`, `test_multi_sid_parallel_live.py`, `test_ultimate64_client_writemem_live.py`, the turbo/SocketDMA suites above) are double-gated behind `U64_HOST` **and** `U64_ALLOW_MUTATE=1`; with either unset they skip cleanly. The UCI UDP live probes (`test_uci_udp_send_live.py`, `test_uci_udp_send_large_live.py`) read the device address from `U64_HOST` (plus their `UCI_UDP_LIVE=1` gate) — no hardcoded IPs.
 
 ## Claude Code Skill
 

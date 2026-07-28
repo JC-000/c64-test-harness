@@ -38,6 +38,14 @@ _SOCKET_DMA_CHUNK = 0x8000
 #: 1.1.0: 16 KiB lands in ~100-150 ms).
 _SOCKET_DMA_VERIFY_TIMEOUT = 2.0
 
+#: Worst-case SocketDMA drain rate used to scale the IDENTIFY
+#: completion-barrier recv timeout with payload size.  Same figure as
+#: ``u64_socket_dma._REU_DRAIN_FLOOR_BPS`` (live-measured on C64U fw
+#: 1.1.0: bursts drain as slowly as ~5 KiB/s under firmware load; 4 KiB/s
+#: adds margin).  This is a timeout ceiling, not a wait — the barrier
+#: returns as soon as the IDENTIFY reply arrives.
+_SOCKET_DMA_DRAIN_FLOOR_BPS = 4096.0
+
 
 class Ultimate64Transport(HardwareTransportBase):
     """C64Transport implementation backed by Ultimate 64 REST API.
@@ -171,14 +179,47 @@ class Ultimate64Transport(HardwareTransportBase):
             )
         return self._socket_dma_client
 
+    def _socket_dma_barrier(self, client: SocketDMAClient, payload_len: int) -> None:
+        """In-band ``IDENTIFY`` completion barrier for fire-and-forget sends.
+
+        The firmware services SocketDMA commands on a connection strictly
+        in order, so once the ``IDENTIFY`` reply arrives every preceding
+        ``DMAWRITE`` has been consumed and applied — the same barrier
+        :meth:`SocketDMAClient.reu_write` uses for ``REUWRITE``.  The recv
+        timeout is scaled by *payload_len* at the worst-observed drain
+        rate (:data:`_SOCKET_DMA_DRAIN_FLOOR_BPS`) because drain time is
+        erratic under firmware load; the barrier returns as soon as the
+        reply arrives.
+
+        :raises Ultimate64Error: when the barrier send/recv fails — the
+            preceding writes may not have been applied.
+        """
+        # The timeout scaling pokes the client's socket the same way
+        # reu_write does internally; guarded getattr keeps test fakes
+        # (no ``_sock``) working with the plain client timeout.
+        sock = getattr(client, "_sock", None)
+        base_timeout = getattr(client, "_timeout", 5.0)
+        if sock is not None:
+            sock.settimeout(
+                base_timeout + payload_len / _SOCKET_DMA_DRAIN_FLOOR_BPS
+            )
+        try:
+            client.identify()
+        finally:
+            if sock is not None:
+                sock.settimeout(base_timeout)
+
     def _socket_dma_write(self, addr: int, data: bytes) -> bool:
         """Attempt the SocketDMA fast path for one write.
 
-        Returns ``True`` when the payload was sent and the tail verified via
-        the REST read path; ``False`` (with a WARNING logged) when the caller
-        should fall back to the REST ``write_mem`` for this write.  A connect
-        failure additionally latches the fast path off for this transport's
-        lifetime; send failures and verify mismatches do not latch.
+        Returns ``True`` when the payload was sent, the in-band
+        ``IDENTIFY`` completion barrier confirmed the device consumed
+        every chunk, and the tail verified via the REST read path;
+        ``False`` (with a WARNING logged) when the caller should fall
+        back to the REST ``write_mem`` for this write.  A connect
+        failure additionally latches the fast path off for this
+        transport's lifetime; send failures, barrier failures and verify
+        mismatches do not latch.
         """
         client = self._ensure_socket_dma_client()
 
@@ -209,10 +250,33 @@ class Ultimate64Transport(HardwareTransportBase):
             )
             return False
 
-        # Fire-and-forget protocol has no ack, so poll the tail back over REST
-        # until it matches — the only confirmation the payload landed.  A
-        # single immediate read races the device-side DMA application (the
-        # TCP stream is consumed before the bytes hit C64 RAM).
+        # DMAWRITE is fire-and-forget with no per-command ack, so finish with
+        # the in-band IDENTIFY completion barrier (FIFO ordering means the
+        # reply proves every chunk above was consumed and applied).  A tail
+        # read-back alone is NOT a completion barrier: if the tail happens to
+        # match pre-existing RAM (zero padding, re-writing the same buffer,
+        # snapshot restores whose last bytes rarely change) it reports success
+        # while the bulk DMA is still in flight, which can then clobber
+        # subsequent REST writes (e.g. restore_snapshot's $0000/$0001
+        # CPU-port writes).
+        try:
+            self._socket_dma_barrier(client, len(data))
+        except Ultimate64Error as exc:
+            _log.warning(
+                "SocketDMA completion barrier (IDENTIFY) failed after write "
+                "at %#06x (%s); falling back to REST write_mem for this "
+                "write",
+                addr,
+                exc,
+            )
+            # A timed-out barrier can leave its reply unread on the wire;
+            # drop the connection so a later fast-path attempt starts clean.
+            client.close()
+            return False
+
+        # Post-barrier sanity check: the DMA has been applied, so the tail
+        # must read back immediately; the short poll budget only covers REST
+        # read latency jitter.
         tail_len = min(16, len(data))
         expected = data[len(data) - tail_len:]
         deadline = time.monotonic() + self.socket_dma_verify_timeout
@@ -300,9 +364,17 @@ class Ultimate64Transport(HardwareTransportBase):
         """Inject PETSCII codes into the KERNAL keyboard buffer at $0277.
 
         The C64 keyboard buffer is 10 bytes at $0277 with the pending-count
-        byte at $00C6.  Each chunk writes up to ``(keybuf_max - current_count)``
-        bytes, updates the count, and polls for the buffer to drain before
-        writing the next chunk.
+        byte at $00C6.  Each chunk waits for the buffer to fully drain
+        (``$C6 == 0``), then writes up to ``keybuf_max`` codes at offset 0
+        and sets the count.
+
+        Topping up a *partially* drained buffer is a race: the KERNAL
+        shifts the remaining buffer bytes down and decrements ``$C6``
+        concurrently with our DMA writes, so a write placed at
+        ``buf + count`` can land at a stale offset (dropping or
+        duplicating keys).  Waiting for a fully drained buffer and always
+        writing at offset 0 makes the write placement race-free (the same
+        convention :meth:`Ultimate64Client.send_text` uses).
 
         Because U64 memory I/O is DMA-backed, no CPU pause is needed.
         """
@@ -310,8 +382,10 @@ class Ultimate64Transport(HardwareTransportBase):
             return
 
         remaining = list(petscii_codes)
-        # Safety bound: single iterations are bounded by keybuf_max.
-        max_iters = len(remaining) * 4 + 16
+        # Safety bound: covers the drain polls between chunks (a full
+        # 10-key buffer drains in ~166 ms at the KERNAL's ~60 Hz scan;
+        # each poll below sleeps 20 ms when the buffer is non-empty).
+        max_iters = len(remaining) * 4 + 100
         iters = 0
         while remaining:
             iters += 1
@@ -323,22 +397,23 @@ class Ultimate64Transport(HardwareTransportBase):
 
             count_byte = self.read_memory(self._keybuf_count_addr, 1)
             current = count_byte[0] if count_byte else 0
-            free = self._keybuf_max - current
-            if free <= 0:
-                # Buffer full — wait for KERNAL to consume keys.
+            if current != 0:
+                # KERNAL is still consuming keys — writing now would race
+                # its shift-down of the buffer.  Wait for a full drain.
+                time.sleep(0.02)
                 continue
 
-            chunk = remaining[:free]
-            remaining = remaining[free:]
+            chunk = remaining[:self._keybuf_max]
+            remaining = remaining[len(chunk):]
 
-            # Write into the buffer at (buf_addr + current), then update count.
+            # Buffer is empty — write at offset 0, then set the count.
             self.write_memory(
-                self._keybuf_addr + current,
+                self._keybuf_addr,
                 bytes(chunk),
             )
             self.write_memory(
                 self._keybuf_count_addr,
-                bytes([current + len(chunk)]),
+                bytes([len(chunk)]),
             )
 
     def inject_joystick(self, port: int, value: int) -> None:
@@ -347,15 +422,27 @@ class Ultimate64Transport(HardwareTransportBase):
         SocketDMA (TCP/64) has no dedicated joystick opcode, and the REST API
         has no joystick endpoint.  The standard out-of-band technique is to
         DMA-write CIA1's data ports directly: ``$DC01`` is read as joystick
-        port 1, ``$DC00`` as joystick port 2.  Bits 0-4 are
-        up/down/left/right/fire; the C64 joystick is **active-low** at the
-        hardware level, but this method preserves the caller-supplied
-        ``value`` byte verbatim — convert active-high/active-low conventions
-        in the caller, not here.
+        port 1, ``$DC00`` as joystick port 2.
 
-        Note: writes are one-shot.  CIA1 will hold the value until the next
-        keyboard scan (the KERNAL writes ``$DC00`` ~60 Hz), so for sustained
-        input the caller must rewrite periodically or pause the C64 first.
+        ``value`` follows the protocol convention (:meth:`C64Transport.
+        inject_joystick`): **active-high**, bit set = direction/button
+        pressed, bits 0-4 = up/down/left/right/fire — the same convention
+        VICE's ``JOYPORT_SET`` uses.  The CIA data ports are active-low at
+        the hardware level, so this method inverts bits 0-4 before the
+        write (bits 5-7 pass through verbatim).
+
+        The write routes through :meth:`write_memory` with
+        ``override="inject-joystick"`` so it stays visible to the
+        transport's :class:`MemoryPolicy` (the override is logged at
+        WARNING when a non-permissive policy is active) — CIA registers
+        are I/O, not consumer RAM, so the policy is bypassed rather than
+        consulted.
+
+        Persistence caveat (differs from VICE): U64 writes are
+        **one-shot**.  CIA1 holds the value only until the next keyboard
+        scan (the KERNAL rewrites the ports at ~60 Hz), so for sustained
+        input the caller must rewrite periodically or pause the C64
+        first.  VICE's ``JOYPORT_SET`` holds the state until changed.
         """
         if port == 1:
             cia_addr = 0xDC01
@@ -365,7 +452,12 @@ class Ultimate64Transport(HardwareTransportBase):
             raise ValueError(f"inject_joystick: port must be 1 or 2, got {port}")
         if not (0 <= value <= 0xFF):
             raise ValueError(f"inject_joystick: value {value:#x} out of byte range")
-        self._client.write_mem(cia_addr, bytes([value & 0xFF]))
+        # Protocol value is active-high; CIA lines are active-low with
+        # pull-ups, so invert the five joystick bits.
+        cia_value = value ^ 0x1F
+        self.write_memory(
+            cia_addr, bytes([cia_value & 0xFF]), override="inject-joystick"
+        )
 
     def read_framebuffer(
         self,
@@ -374,6 +466,13 @@ class Ultimate64Transport(HardwareTransportBase):
         timeout: float = 2.0,
     ) -> dict:
         """Capture one VIC-II frame from the U64 video stream.
+
+        Generation caveat (observed live 2026-07-28): a C64 Ultimate
+        (firmware 1.1.0) answered the video-stream start with HTTP 500
+        "No Operational Network Interface" when the capture host was on
+        a routed subnet — this raises :class:`Ultimate64Error` there.
+        Whether C64U streaming works with an on-subnet capture host is
+        still unverified; on the U64 Elite (fw 3.14) the stream works.
 
         Returns a dict matching the :class:`BinaryViceTransport`
         ``read_framebuffer`` shape::
@@ -473,16 +572,26 @@ class Ultimate64Transport(HardwareTransportBase):
         Wraps :func:`ultimate64_helpers.set_turbo_mhz`:
 
         * ``multiplier=1`` — turbo off (1 MHz native).
-        * ``multiplier=N`` where N is a supported U64 CPU-Speed enum
-          (2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 20, 24, 32, 40, 48) —
-          set Turbo Control to ``"Manual"`` at that MHz.
-        * ``multiplier=None`` — max available speed (48 MHz).
+        * ``multiplier=N`` where N is a supported CPU-Speed enum step
+          (2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 20, 24, 32, 40, 48, 64) —
+          set Turbo Control to ``"Manual"`` at that MHz.  The enum is
+          the cross-generation superset: the U64 Elite (fw 3.14) lacks
+          64, the C64 Ultimate (fw 1.1.0) lacks 5.  The device's actual
+          preset list is probed once (cached) and a generation-foreign
+          speed raises :class:`ValueError` locally; when the probe is
+          inconclusive the firmware still rejects it with HTTP 400
+          before turbo is enabled.
+        * ``multiplier=None`` — max available speed as probed from the
+          device's CPU-Speed presets (64 MHz on a C64 Ultimate, 48 MHz
+          on a U64 Elite; falls back to 48 when the probe is
+          inconclusive).
 
-        :raises ValueError: integer is not one of the supported MHz steps.
+        :raises ValueError: integer is not one of the supported MHz
+            steps, or not supported by this device generation.
         """
-        from .ultimate64_helpers import set_turbo_mhz
+        from .ultimate64_helpers import max_cpu_speed_mhz, set_turbo_mhz
         if multiplier is None:
-            set_turbo_mhz(self._client, 48)
+            set_turbo_mhz(self._client, max_cpu_speed_mhz(self._client))
             return
         if multiplier == 1:
             set_turbo_mhz(self._client, None)

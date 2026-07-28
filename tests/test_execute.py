@@ -31,6 +31,11 @@ class BinaryMockTransport(MockTransport):
         super().__init__(**kwargs)
         self._next_checkpoint_id = 1
         self._checkpoints: dict[int, int] = {}  # id -> addr
+        # Every address ever passed to set_checkpoint, in call order.
+        # _checkpoints only holds *live* checkpoints — jsr() deletes its
+        # checkpoint before returning, so assertions about "a checkpoint
+        # was set at $XXXX" must consult this history instead.
+        self._checkpoint_history: list[int] = []
         self._set_registers_calls: list[dict[str, int]] = []
         self._resume_count = 0
         self._stopped_pc: int | None = None  # PC value for wait_for_stopped
@@ -54,6 +59,7 @@ class BinaryMockTransport(MockTransport):
         cp_id = self._next_checkpoint_id
         self._next_checkpoint_id += 1
         self._checkpoints[cp_id] = addr
+        self._checkpoint_history.append(addr)
         return cp_id
 
     def delete_checkpoint(self, checkpoint_num: int) -> None:
@@ -192,8 +198,9 @@ def test_jsr_trampoline_and_breakpoint():
     assert addr == 0x0334
     assert data == [0x20, 0x00, 0xC0, 0xEA, 0xEA]
 
-    # Checkpoint was set at scratch_addr + 3
-    assert any(addr == 0x0337 for addr in t._checkpoints.values()) or True
+    # Checkpoint was set at scratch_addr + 3 (jsr() deletes it before
+    # returning, so check the history, not the live checkpoint table).
+    assert 0x0337 in t._checkpoint_history
     # PC was set to scratch_addr
     assert {"PC": 0x0334} in t._set_registers_calls
     # Resume was called

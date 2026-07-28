@@ -19,7 +19,7 @@ test proves the 1:1 part end-to-end on real hardware.
 
 Usage::
 
-    UCI_UDP_LIVE=1 \\
+    UCI_UDP_LIVE=1 U64_HOST=192.168.1.81 \\
     ~/.local/share/c64-test-harness/venv/bin/pytest \\
         tests/test_uci_udp_send_live.py -xvs
 """
@@ -33,10 +33,17 @@ import time
 import pytest
 
 UCI_UDP_LIVE = os.environ.get("UCI_UDP_LIVE")
-pytestmark = pytest.mark.skipif(
-    not UCI_UDP_LIVE,
-    reason="UCI_UDP_LIVE not set — live UCI UDP send probe disabled",
-)
+U64_HOST = os.environ.get("U64_HOST")
+pytestmark = [
+    pytest.mark.skipif(
+        not UCI_UDP_LIVE,
+        reason="UCI_UDP_LIVE not set — live UCI UDP send probe disabled",
+    ),
+    pytest.mark.skipif(
+        not U64_HOST,
+        reason="U64_HOST not set — live Ultimate 64 tests disabled",
+    ),
+]
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from c64_test_harness.backends.device_lock import DeviceLock  # noqa: E402
@@ -56,7 +63,6 @@ from c64_test_harness.uci_network import (  # noqa: E402
 # ---------------------------------------------------------------------------
 # Test parameters
 # ---------------------------------------------------------------------------
-U64_HOST = "10.43.23.81"
 LOCK_TIMEOUT = 600.0  # generous: another agent may hold the device for hours
 UCI_CALL_TIMEOUT = 15.0
 INTER_WRITE_SLEEP = 0.08  # 80 ms between writes (diagnostic spacing)

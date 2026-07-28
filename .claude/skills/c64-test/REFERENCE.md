@@ -37,7 +37,7 @@ target.transport.write_memory(0x4200, payload, override="fault injection")
 
 `UnifiedManager(memory_policy=cfg.memory_policy)` stamps the policy onto every acquired transport. `HarnessConfig.from_toml(...)` parses `[memory]` sections automatically.
 
-`MemoryArbiter` is the ergonomic complement — it walks the policy's free space and hands out addresses guaranteed to pass `check_write`:
+`MemoryArbiter` is the ergonomic complement — it walks the policy's free space and hands out addresses guaranteed to pass `check_write` (`alloc()` verifies every candidate via `policy.check_write` before returning it):
 
 ```python
 arbiter = MemoryArbiter(policy=cfg.memory_policy)
@@ -186,13 +186,13 @@ Lockfiles are stored in `$XDG_RUNTIME_DIR/c64-test-harness/` (fallback: `/tmp/c6
 Abstract transport interface. Concrete implementations: `BinaryViceTransport`, `Ultimate64Transport`, `HardwareTransportBase`.
 
 Methods:
-- `read_memory(addr: int, length: int) -> bytes` -- Read raw bytes
-- `write_memory(addr: int, data: bytes | list[int], *, override: str | None = None) -> None` -- Write bytes to C64 memory. `override="reason"` bypasses `MemoryPolicy` for one call (logged at WARNING).
+- `read_memory(addr: int, length: int) -> bytes` -- Read raw bytes. A span that would run past `$FFFF` raises `ValueError` (no silent wrap to `$0000`).
+- `write_memory(addr: int, data: bytes | list[int], *, override: str | None = None) -> None` -- Write bytes to C64 memory. `override="reason"` bypasses `MemoryPolicy` for one call (logged at WARNING). A span that would run past `$FFFF` raises `ValueError` — `override` does not bypass that check.
 - `read_screen_codes() -> list[int]` -- Read raw screen code bytes (cols * rows values)
 - `inject_keys(petscii_codes: list[int]) -> None` -- Inject PETSCII key codes into keyboard buffer
-- `inject_joystick(port: int, value: int) -> None` -- Joystick port 1 or 2; value bits 0-4 = up/down/left/right/fire.
-- `set_speed(multiplier: int | None) -> None` -- Backend-agnostic CPU-speed control. `multiplier=1` is native 1 MHz (warp off / turbo off); `multiplier=None` is max speed (VICE warp on / U64 48 MHz). U64 accepts discrete turbo multipliers (2–48, plus 64 on the C64 Ultimate generation); VICE raises `NotImplementedError` for any multiplier other than `1` / `None` because the 6510 has no discrete CPU-speed steps natively.
-- `get_speed() -> int | None` -- Current multiplier; `None` means "as fast as possible" (VICE warp / U64 48 MHz turbo).
+- `inject_joystick(port: int, value: int) -> None` -- Joystick port 1 or 2; value bits 0-4 = up/down/left/right/fire. **Active-high protocol convention**: bit set = pressed (VICE `JOYPORT_SET` polarity); backends with active-low hardware (U64 CIA ports) invert internally. Persistence differs: VICE holds the state until the next call; the U64 write is one-shot (KERNAL rewrites the CIA ports at ~60 Hz), so sustained input needs re-injection or a paused machine.
+- `set_speed(multiplier: int | None) -> None` -- Backend-agnostic CPU-speed control. `multiplier=1` is native 1 MHz (warp off / turbo off); `multiplier=None` is max speed (VICE warp on / U64 probed device maximum — 64 MHz on C64U, 48 on U64E, 48 fallback). U64 accepts discrete turbo multipliers (2–48, plus 64 on the C64 Ultimate generation; generation-foreign speeds raise `ValueError` locally when the preset probe succeeded); VICE raises `NotImplementedError` for any multiplier other than `1` / `None` because the 6510 has no discrete CPU-speed steps natively.
+- `get_speed() -> int | None` -- Current multiplier; `None` means "as fast as possible" (VICE warp / unrecognised U64 turbo step).
 - `reset(scope: str = "cpu", *, drive: str | int | None = None) -> None` -- `scope="cpu"` soft-resets the 6510; `scope="machine"` is a full reset (VICE hard reset / U64 `reboot()`); `scope="drive"` requires `drive=` (0..3 on VICE, "a"/"b" on U64).
 - `read_framebuffer() -> dict` -- Captures one frame. Backend-specific layout (`debug_rect`, `inner_rect`, `bpp`, `palette`, `bytes`); on U64 captures one UDP video frame, on VICE pulls via the binary-monitor display command.
 - `read_palette() -> list[tuple[int,int,int]]` -- Active VIC palette as 16 RGB triples.
@@ -217,7 +217,8 @@ Properties:
 All functions take `transport` as first arg (stateless).
 
 - `read_bytes(transport, addr, length) -> bytes` -- Read bytes from addr. Contains legacy auto-chunking at 256 bytes (unnecessary with binary transport but harmless).
-- `read_bytes_chunked(transport, addr, length, chunk_size=128) -> bytes` -- Explicitly chunked read for large regions
+- `read_bytes_chunked(transport, addr, length, chunk_size=128) -> bytes` -- Explicitly chunked read for large regions. A chunk that comes back short is retried once, then raises `ShortReadError` instead of silently returning a truncated, misaligned result.
+- `ShortReadError` -- Raised by `read_bytes_chunked` on a persistent short chunk. Attributes: `.addr`, `.requested`, `.got`. (Module-level export, not re-exported from the package root.)
 - `read_bytes_verified(transport, addr, length, *, max_attempts=2) -> bytes` -- Re-reads on disagreement until two consecutive reads match; raises `FlakeyReadError` if `max_attempts` reads all disagree pairwise. Diagnostic added in PR #88 for downstream tests suspecting issue-#88-style flakey reads (VICE binary monitor response-type misrouting). Doubles wire traffic per read — only use when a flake is actively suspected; the PR also tightened the read path to raise `TransportError` on `response_type` mismatch, which is usually the faster diagnostic.
 - `FlakeyReadError` -- Raised by `read_bytes_verified` on persistent disagreement. Attributes: `.addr`, `.length`, `.attempts: list[bytes]` (the disagreeing reads in order). Inspect to distinguish structured corruption (every-other-byte ±1) from random truncation.
 - `write_bytes(transport, addr, data) -> None` -- Write data to addr (accepts bytes or list[int]). Contains legacy auto-chunking at 84 bytes (unnecessary with binary transport but harmless). Subject to `MemoryPolicy` enforcement at the transport (see "Memory Safety" section above).
@@ -377,7 +378,7 @@ transport = BinaryViceTransport(host="127.0.0.1", port=6502, timeout=5.0)
 - `read_screen_codes() -> list[int]`
 - `inject_keys(petscii_codes) -> None`
 - `inject_joystick(port, value) -> None`
-- `set_speed(multiplier)` / `get_speed()` -- maps `None`/`1` to VICE warp on/off; other multipliers raise `NotImplementedError` (no discrete CPU-speed steps natively).
+- `set_speed(multiplier)` / `get_speed()` -- maps `None`/`1` to VICE warp on/off; other multipliers raise `NotImplementedError` (no discrete CPU-speed steps natively). Works on default targets — warp control is hybrid: real `warp on`/`off` via the text monitor when connected (sees CLI `-warp` too), `Speed`-resource pseudo-warp (`Speed=1000000` / restore `Speed=100`) over the binary monitor otherwise; on the fallback path `get_warp` only reflects pseudo-warp set through this transport.
 - `reset(scope="cpu", *, drive=None)` -- dispatches to VICE `CMD_RESET` 0 (cpu) / 1 (machine) / 8+idx (drive).
 - `read_framebuffer() -> dict`
 - `read_palette() -> list[tuple[int,int,int]]`
@@ -413,6 +414,7 @@ transport = BinaryViceTransport(host="127.0.0.1", port=6502, timeout=5.0)
     - Any other manager → `fn(instance)` — receives the acquired instance directly. For `UnifiedManager` that's a `TestTarget`; for `Ultimate64InstanceManager` it's an `Ultimate64Instance`. Both expose `.transport`.
 - `ParallelTestResult` -- `.results`, `.all_passed`, `.exit_code`, `.print_summary()`
 - `SingleTestResult` -- `.name`, `.passed`, `.message`, `.duration`, `.pid: int | None` (VICE process PID; `None` on hardware).
+- Failure isolation: an `acquire()` failure (e.g. port exhaustion) is recorded as a failed `SingleTestResult` for that test — it does not abort the run or discard completed results. `max_workers=None` defaults to `len(tests)` capped at 10 (the port-allocator budget can't serve more concurrent instances); an empty `tests` list returns an empty `ParallelTestResult`.
 
 ---
 
@@ -565,11 +567,11 @@ transport = Ultimate64Transport(host="192.168.1.81", password=None, timeout=10.0
 
 **C64Transport methods** (memory ops DMA-backed, no CPU pause):
 - `read_memory(addr, length) -> bytes`
-- `write_memory(addr, data, *, override=None) -> None` -- Opt-in SocketDMA fast path for bulk writes: set `transport.socket_dma = True` (constructor kwarg or attribute; default False) and payloads >= `socket_dma_min_bytes` (default 8192) route via DMAWRITE on TCP 64 instead of REST (~150 ms vs >6 s for 16 KiB on C64U fw 1.1.0, whose POST writemem degrades at >=16 KiB). Same `MemoryPolicy` checks; tail read-back verify polled up to `socket_dma_verify_timeout` (2 s); WARNING + REST fallback on connect/send/verify failure (connect failure latches the fast path off). Requires the device's DMA service on TCP 64 (C64U: enable Network Settings → "Ultimate DMA Service", ships disabled; U64E fw 3.14 availability untested — connect failure just falls back to REST).
+- `write_memory(addr, data, *, override=None) -> None` -- Opt-in SocketDMA fast path for bulk writes: set `transport.socket_dma = True` (constructor kwarg or attribute; default False) and payloads >= `socket_dma_min_bytes` (default 8192) route via DMAWRITE on TCP 64 instead of REST (~150 ms vs >6 s for 16 KiB on C64U fw 1.1.0, whose POST writemem degrades at >=16 KiB). Same `MemoryPolicy` checks. DMAWRITE is fire-and-forget, so the write finishes with an in-band IDENTIFY completion barrier (FIFO command servicing means the reply proves every chunk was consumed and applied; recv timeout scales with payload size — same pattern as `reu_write`), then a REST tail read-back as a post-barrier sanity check (up to `socket_dma_verify_timeout`, 2 s). WARNING + REST fallback on connect/send/barrier/verify failure (connect failure latches the fast path off). Requires the device's DMA service on TCP 64 (C64U: enable Network Settings → "Ultimate DMA Service", ships disabled; U64E fw 3.14 availability untested — connect failure just falls back to REST).
 - `read_screen_codes() -> list[int]`
 - `inject_keys(petscii_codes) -> None`
-- `inject_joystick(port, value) -> None`
-- `set_speed(multiplier)` -- maps `None` → 48 MHz turbo, `1` → turbo off, other supported MHz (cross-generation superset: 2/3/4/5/6/8/10/12/14/16/20/24/32/40/48/64; U64E fw 3.14 lacks 64, C64 Ultimate fw 1.1.0 lacks 5) → set Turbo Control to "Manual" at that MHz. Wraps `set_turbo_mhz`. Multipliers outside the superset raise `ValueError` locally (no request hits the wire); a speed valid only on the *other* device generation reaches the wire and the firmware rejects it with HTTP 400 (`Ultimate64Error`) before Turbo Control is enabled — verified live on C64U fw 1.1.0, see `tests/test_turbo_contract_live.py`.
+- `inject_joystick(port, value) -> None` -- Active-high protocol value (bit set = pressed); inverts bits 0-4 before the CIA write (`$DC01` port 1 / `$DC00` port 2, active-low hardware) and routes through `write_memory` with `override="inject-joystick"` so it stays `MemoryPolicy`-visible. One-shot: the KERNAL keyboard scan rewrites the CIA ports at ~60 Hz, so sustained input needs periodic re-injection or a paused machine (VICE holds injected state instead).
+- `set_speed(multiplier)` -- maps `None` → the device's probed maximum turbo speed (`max_cpu_speed_mhz`: 64 on a C64 Ultimate, 48 on a U64E; 48 fallback when the probe is inconclusive), `1` → turbo off, other supported MHz (cross-generation superset: 2/3/4/5/6/8/10/12/14/16/20/24/32/40/48/64; U64E fw 3.14 lacks 64, C64 Ultimate fw 1.1.0 lacks 5) → set Turbo Control to "Manual" at that MHz. Wraps `set_turbo_mhz`. Multipliers outside the superset raise `ValueError` locally (no request hits the wire); a speed valid only on the *other* device generation also raises `ValueError` locally when the device's CPU-Speed preset probe succeeded (probed once, cached per client) — only when the probe is inconclusive does it reach the wire, where the firmware rejects it with HTTP 400 (`Ultimate64Error`) before Turbo Control is enabled. See `tests/test_turbo_contract_live.py`.
 - `get_speed() -> int | None` -- `1` when turbo off; integer MHz when turbo on at a known step; `None` only when turbo is on but the CPU-Speed enum is unrecognised (treated same as VICE warp).
 - `reset(scope="cpu", *, drive=None)` -- `scope="cpu"` → `client.reset()` (soft 6510); `scope="machine"` → `client.reboot()` (full FPGA reinit; ~8s before reachable); `scope="drive"` → `client.drive_reset(drive)` (drive `"a"` / `"b"` or `0` / `1`).
 - `read_framebuffer() -> dict` -- captures one frame via the U64 UDP video stream. Auto-detects local IP that can reach the device. Raises `TransportError` with diagnostics if no frame arrives within `timeout`. Layout matches `BinaryViceTransport`: `debug_rect`, `inner_rect`, `bpp`, `palette`, `bytes`.
@@ -592,6 +594,8 @@ client = Ultimate64Client(host="192.168.1.81", password=None, timeout=10.0)
 client = Ultimate64Client(host="192.168.1.81", write_mem_query_threshold=128)
 ```
 
+Exception mapping: timeouts, unreachable device, and connection drops mid-request (`ConnectionResetError` / `BrokenPipeError` / truncated HTTP response — fw 3.14d drops connections under load) all raise `Ultimate64TimeoutError`; unparseable or wrong-shaped responses raise `Ultimate64ProtocolError`. Catch `Ultimate64Error` to cover the whole hierarchy — raw socket exceptions no longer escape.
+
 **Machine control:**
 - `client.reset()` -- Soft reset the C64 (6510 CPU only, does NOT reinitialize FPGA/DMA)
 - `client.reboot()` -- Full reboot of the Ultimate device (reinitializes FPGA, DMA, REU). Required when switching turbo speeds with REU-heavy workloads. Allow ~8s settle after reboot.
@@ -599,17 +603,17 @@ client = Ultimate64Client(host="192.168.1.81", write_mem_query_threshold=128)
 - `client.resume()` -- Resume the emulated CPU
 
 **PRG/runner endpoints** (all use POST, not PUT — fw 3.14):
-- `client.run_prg(data, *, fallback_on_404=True)` -- Load and RUN a PRG (resets C64 internally). When `fallback_on_404=True` (default) and the runner endpoint returns HTTP 404 (fw 3.14d wedged-runner symptom), the call transparently sideloads via `write_mem(load_addr, body)` using the PRG's first two header bytes as the load address (little-endian) and triggers via `send_text("SYS <addr>")`. A `logging.warning` is emitted when the fallback fires. Pass `fallback_on_404=False` to surface the 404 as a plain `Ultimate64Error`.
+- `client.run_prg(data, *, fallback_on_404=True)` -- Load and RUN a PRG (resets C64 internally). When `fallback_on_404=True` (default) and the runner endpoint returns HTTP 404 (fw 3.14d wedged-runner symptom), the call transparently sideloads via `write_mem(load_addr, body)` using the PRG's first two header bytes as the load address (little-endian) and triggers via `send_text("RUN")` for load address `$0801` (BASIC-stub PRG — `SYS 2049` would execute the BASIC line-link bytes as opcodes) or `send_text("SYS <addr>")` for any other load address (pure ML). A `logging.warning` naming the trigger is emitted when the fallback fires. Pass `fallback_on_404=False` to surface the 404 as a plain `Ultimate64Error`.
 - `client.load_prg(data)` -- Load a PRG into memory without running
 - `client.run_crt(data)` -- Start a cartridge image
 - `client.sid_play(data, songnr=0)` -- Play a .sid tune
 - `client.mod_play(data)` -- Play a .mod file
 
 **Keyboard injection:**
-- `client.send_text(text, *, finish_with_return=True) -> None` -- PETSCII-encode `text` and write into the KERNAL keyboard buffer at `$0277` (count byte at `$00C6`); appends a CR (`0x0D`) when `finish_with_return=True`. Canonical for triggering `SYS <addr>` after `run_prg` lands at READY. Respects the buffer's 10-byte hardware limit by polling `$00C6` and waiting for the KERNAL scan loop to drain before pushing the next chunk. Raises `Ultimate64Error` if the buffer never drains.
+- `client.send_text(text, *, finish_with_return=True) -> None` -- PETSCII-encode `text` and write into the KERNAL keyboard buffer at `$0277` (count byte at `$00C6`); appends a CR (`0x0D`) when `finish_with_return=True`. Canonical for triggering `SYS <addr>` after `run_prg` lands at READY. Respects the buffer's 10-byte hardware limit by polling `$00C6` and waiting for the buffer to drain **to empty** (`$C6 == 0`) before writing each chunk at offset 0 — topping up a partially-full buffer races the KERNAL's dequeue (three HTTP round-trips apart) and can corrupt offset and count. Raises `Ultimate64Error` if the buffer never drains. (`Ultimate64Transport.inject_keys` uses the same drain-to-empty convention.)
 
 **Memory (DMA-backed):**
-- `client.read_mem(address, length) -> bytes`
+- `client.read_mem(address, length) -> bytes` -- Raises `Ultimate64ProtocolError` when the device returns a payload shorter or longer than requested (prevents silently short/misaligned chunked reads).
 - `client.write_mem(address, data)` -- DMA-backed write. Uses the legacy `PUT ?data=<hex>` form for payloads `<= self.write_mem_query_threshold` bytes, the `POST` raw-byte form above. Threshold is per-instance and auto-detected at construction (fw 3.14d → 128, else 48); override via the `write_mem_query_threshold=` constructor kwarg.
 
 **Config:**
@@ -633,11 +637,12 @@ from c64_test_harness.backends.ultimate64_helpers import (
 )
 ```
 
-- `set_turbo_mhz(client, mhz)` -- Set turbo to given MHz (int), or `None` to disable
+- `set_turbo_mhz(client, mhz)` -- Set turbo to given MHz (int), or `None` to disable. Probes the device's CPU-Speed presets (once, cached per client) and raises `ValueError` locally for a generation-foreign speed when the probe is conclusive; an inconclusive probe preserves the legacy firmware-side HTTP 400 rejection.
 - `get_turbo_mhz(client) -> int | None` -- Current speed, or None if turbo off
+- `max_cpu_speed_mhz(client) -> int` -- The device's maximum turbo speed from the same preset probe (64 on C64U fw 1.1.0, 48 on U64E fw 3.14; 48 fallback when inconclusive). Backs `Ultimate64Transport.set_speed(None)`. Module-level export, not re-exported from the package root.
 - `set_reu(client, enabled, size=None)` -- Enable/disable REU; size as str ("512 KB") or int (MB). Cross-generation: probes the device's `Cartridge` presets and writes `Cartridge: "REU"` only where offered (U64E yes, C64 Ultimate no — its Cartridge value mirrors REU state and rejects the write with HTTP 400). The preset write is ordered first so a rejection never half-enables the REU. `restore_state` applies the same probe to the snapshotted cartridge value.
 - `snapshot_state(client) -> U64StateSnapshot` -- Capture turbo + REU + cartridge state
-- `restore_state(client, snap)` -- Restore a snapshot
+- `restore_state(client, snap)` -- Restore a snapshot. Orders the `Cartridge` item first in its config batch — the same abort-before-half-applied invariant as `set_reu` (a firmware rejection of the Cartridge write aborts the batch before the REU is half-enabled).
 - `reset(client)` -- Soft reset (CPU only)
 - `reboot(client)` -- Full FPGA reboot (clears DMA state, ~8s settle)
 - `recover(client, *, reset_settle_seconds=2.0, reboot_settle_seconds=12.0, escalate_to_reboot=True) -> str` -- Escalate `reset()` -> probe -> `reboot()` -> probe; returns `"reset"` or `"reboot"`. Raises `Ultimate64UnreachableError` on total failure. Never calls `poweroff()`.
@@ -645,7 +650,7 @@ from c64_test_harness.backends.ultimate64_helpers import (
 - `check_measurement_environment(client) -> None` -- Assert turbo is off (1 MHz); raises `Ultimate64MeasurementEnvironmentError` if a prior session left turbo enabled. Call before any CIA-timer benchmark. See GitHub issue #102.
 
 ### `ultimate64_schema` constants
-- `CPU_SPEED_VALUES` -- tuple of 16 speed enum strings (" 1" through "48")
+- `CPU_SPEED_VALUES` -- tuple of 17 speed enum strings (" 1" through "48", plus "64") — the cross-generation superset; a given device offers a subset (probed at runtime by the helpers above)
 - `CPU_SPEED_BY_MHZ` -- dict mapping int MHz to enum string
 - `REU_SIZE_VALUES`, `REU_ENABLED_VALUES`, `TURBO_CONTROL_VALUES`
 
@@ -653,10 +658,10 @@ from c64_test_harness.backends.ultimate64_helpers import (
 
 ## Module: snapshot
 
-Cross-backend VICE/U64 snapshot interop using VICE's native `.vsf` format as the on-disk wire. **Phase A** (PR #115 / commit 45a5844): 64 KB RAM + CPU port round-trip. **REU layer** (issue #134): `reu_size_bytes` + `reu_contents` capture/restore, live-validated byte-exact on C64U fw 1.1.0 (2026-07-21). Later phases will add CIA/VIC/SID register state, drive images, and cartridge bytes — see `docs/snapshot_interop.md` for the per-layer asymmetry matrix and the U64-side limitations (REST cannot read cart bytes / disk images / REU memory back; 6510 registers aren't directly observable; 28 of 32 SID registers are write-only on hardware).
+Cross-backend VICE/U64 snapshot interop using VICE's native `.vsf` format as the on-disk wire. **Phase A** (PR #115 / commit 45a5844): RAM + CPU port round-trip — explicitly RAM + color RAM, I/O window excluded on restore: extract captures I/O-view bytes for `$D000-$DFFF`, but restore skips that window except color RAM `$D800-$DBFF` (blind register writes could fire spurious REU DMA via `$DF01`), so the round-trip guarantee is `$0000-$CFFF` + `$D800-$DBFF` + `$E000-$FFFF`. **REU layer** (issue #134): `reu_size_bytes` + `reu_contents` capture/restore, live-validated byte-exact on C64U fw 1.1.0 (2026-07-21). Later phases will add CIA/VIC/SID register state, drive images, and cartridge bytes — see `docs/snapshot_interop.md` for the per-layer asymmetry matrix and the U64-side limitations (REST cannot read cart bytes / disk images / REU memory back; 6510 registers aren't directly observable; 28 of 32 SID registers are write-only on hardware).
 
 ### `Snapshot` (frozen dataclass)
-- `.ram: bytes` -- 64 KB RAM image
+- `.ram: bytes` -- 64 KB image as seen through the CPU view (`$D000-$DFFF` holds I/O-view bytes, not RAM under I/O)
 - `.cpu_port_data: int` -- value at `$0001`
 - `.cpu_port_dir: int` -- value at `$0000`
 - `.exrom: int` (default 1), `.game: int` (default 1) -- cartridge control lines
@@ -664,7 +669,7 @@ Cross-backend VICE/U64 snapshot interop using VICE's native `.vsf` format as the
 
 ### Functions
 - `extract_snapshot(transport, *, include_reu=False, reu_size_bytes=None, reu_settle=0.05) -> Snapshot` -- Reads RAM + CPU port via the protocol; `include_reu=True` adds the staging-window REU extract (`reu_size_bytes=None` auto-detects from the U64 config). Same code path for VICE and U64. Re-exported from the package root.
-- `restore_snapshot(transport, snap, *, restore_reu=True) -> None` -- Writes RAM and CPU port back; when `snap.reu_contents` is present, enables the REU via generation-aware `set_reu` and writes contents via `Ultimate64Transport.socket_dma_reu_write` (SocketDMA `REUWRITE` — **no REST fallback**; unavailable DMA service raises `Ultimate64Error`, VICE-shaped transports raise `SnapshotRestoreError`; `restore_reu=False` opts out). Logs one WARNING per restore and threads `override="snapshot-restore"` through every `write_memory` so the bulk restore crosses `MemoryPolicy`-reserved regions without raising. Re-exported from the package root.
+- `restore_snapshot(transport, snap, *, restore_reu=True) -> None` -- Writes RAM back in three slices (`$0000-$CFFF`, color RAM `$D800-$DBFF`, `$E000-$FFFF` — the live I/O window is skipped, see above) plus the CPU port; when `snap.reu_contents` is present, enables the REU via generation-aware `set_reu` and writes contents via `Ultimate64Transport.socket_dma_reu_write` (SocketDMA `REUWRITE` — **no REST fallback**; unavailable DMA service raises `Ultimate64Error`, VICE-shaped transports raise `SnapshotRestoreError`; `restore_reu=False` opts out). Logs one WARNING per restore and threads `override="snapshot-restore"` through every `write_memory` so the bulk restore crosses `MemoryPolicy`-reserved regions without raising. Re-exported from the package root.
 - `extract_reu_contents(transport, size_bytes, *, settle=0.05, pause=False) -> bytes` -- Staging-window REU readback ($0800–$87FF, 32 KB banks via REC-programmed REU→C64 transfers). **Must run unpaused on Ultimate hardware** — `machine:pause` freezes the machine clock including REC DMA (live-verified C64U fw 1.1.0), so a paused extract returns stale RAM. Capture is therefore not atomic.
 - `Snapshot.to_bundle(path)` / `Snapshot.from_bundle(path)` -- Sidecar directory round-trip: `snapshot.vsf` + `manifest.json` + `reu.bin`.
 - `Snapshot.to_vsf() -> bytes` -- Emit a complete VICE-consumable `.vsf`. A bundled ~180 KB template captured from VICE 3.10 at BASIC READY supplies the ~30 modules VICE 3.10 requires (MAINCPU, CIA1/2, SID, VIC-II, GLUE, drives, joyports, ...); the codec overwrites only the C64MEM module body.
@@ -847,7 +852,7 @@ with Ultimate64InstanceManager(devices, acquire_timeout=30.0) as mgr:
 
 ## Module: backends.u64_socket_dma
 
-Binary "SocketDMA" command channel on TCP port 64, distinct from REST. Covers capabilities REST lacks (keyboard inject, REU write, raw reset, DMA load/jump) and is the transport behind the `Ultimate64Transport.socket_dma` bulk-write fast path. Wire format: 2-byte LE opcode + 2-byte LE length + payload; mostly fire-and-forget (no reply — confirmation is the connection staying open), so pair every write with a read-back where correctness matters. Commands on one connection are serviced strictly in order, so a replying command (IDENTIFY) doubles as a completion barrier — `reu_write` does this by default. On the C64 Ultimate the service ships disabled (enable Network Settings → "Ultimate DMA Service"); U64E fw 3.14 availability untested. Both classes are package-root exports.
+Binary "SocketDMA" command channel on TCP port 64, distinct from REST. Covers capabilities REST lacks (keyboard inject, REU write, raw reset, DMA load/jump) and is the transport behind the `Ultimate64Transport.socket_dma` bulk-write fast path. Wire format: 2-byte LE opcode + 2-byte LE length + payload; mostly fire-and-forget (no reply — confirmation is the connection staying open), so pair every write with a read-back where correctness matters. Commands on one connection are serviced strictly in order, so a replying command (IDENTIFY) doubles as a completion barrier — `reu_write` does this by default, and the transport's `DMAWRITE` bulk-write fast path finishes with the same barrier before its tail read-back sanity check. On the C64 Ultimate the service ships disabled (enable Network Settings → "Ultimate DMA Service"); U64E fw 3.14 availability untested. Both classes are package-root exports.
 
 ### `SocketDMAClient(host, port=64, password=None, timeout=5.0)`
 Context manager — `with` opens one connection reused across commands; outside `with`, each call opens/closes its own (slow for chains; every connect re-authenticates when a network password is set).

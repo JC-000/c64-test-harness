@@ -16,6 +16,31 @@ _AUTO_CHUNK_THRESHOLD = 256
 _WRITE_CHUNK_SIZE = 84
 
 
+class ShortReadError(Exception):
+    """Raised by :func:`read_bytes_chunked` when the transport returns
+    fewer bytes than requested for a chunk (after one retry).
+
+    Without this check a short chunk would be appended as-is while the
+    offset advanced by the full chunk size — producing a result that is
+    both short AND misaligned past the short chunk, silently.
+
+    Attributes:
+        addr: starting address of the short chunk.
+        requested: number of bytes requested for the chunk.
+        got: number of bytes the transport actually returned.
+    """
+
+    def __init__(self, addr: int, requested: int, got: int) -> None:
+        self.addr = addr
+        self.requested = requested
+        self.got = got
+        super().__init__(
+            f"read_bytes_chunked: transport returned {got} of {requested} "
+            f"bytes at ${addr:04x} (retried once); result would be short "
+            f"and misaligned"
+        )
+
+
 class FlakeyReadError(Exception):
     """Raised by :func:`read_bytes_verified` when consecutive reads disagree.
 
@@ -93,12 +118,23 @@ def read_bytes_chunked(
     results.  Useful when reading DER buffers, key material, or any
     region larger than ~128 bytes where a single VICE ``m`` command
     may return incomplete data.
+
+    A chunk that comes back short is retried once; if it is still short,
+    :class:`ShortReadError` is raised rather than silently returning a
+    truncated, misaligned result.
     """
     result = bytearray()
     offset = 0
     while offset < length:
         n = min(chunk_size, length - offset)
         chunk = transport.read_memory(addr + offset, n)
+        if len(chunk) < n:
+            # Short reads are exactly why this function exists — retry
+            # once, then fail loudly instead of appending a short chunk
+            # while the offset advances by n (short AND misaligned).
+            chunk = transport.read_memory(addr + offset, n)
+            if len(chunk) < n:
+                raise ShortReadError(addr + offset, n, len(chunk))
         result.extend(chunk)
         offset += n
     return bytes(result[:length])

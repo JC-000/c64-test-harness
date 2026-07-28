@@ -581,7 +581,7 @@ The U64 has NO CPU control (no `jsr()`, no registers, no breakpoints). To execut
 
 There are two hardware generations with real behavioral differences. Detect with `client.get_info()["product"]`: `"Ultimate 64 Elite"` (fw 3.14) vs `"C64 Ultimate"` (fw 1.1.0). Never hardcode one generation's behavior; on an unrecognized product, skip with the observed payload rather than guessing. Known asymmetries (each live-verified):
 
-- **CPU-speed enum**: Elite has `" 5"` but not `"64"`; C64U has `"64"` but not `" 5"`. The harness schema is the cross-generation superset — a foreign speed passes local validation and is firmware-rejected with HTTP 400 *before* Turbo Control is enabled (`set_turbo_mhz` writes CPU Speed first, on purpose). Contract test: `tests/test_turbo_contract_live.py` (`TURBO_CONTRACT_LIVE=1` gate).
+- **CPU-speed enum**: Elite has `" 5"` but not `"64"`; C64U has `"64"` but not `" 5"`. The harness schema is the cross-generation superset — `set_turbo_mhz` probes the device's actual CPU-Speed presets (once, cached per client) and raises `ValueError` locally for a foreign speed; only when the probe is inconclusive does the write reach the firmware, which rejects it with HTTP 400 *before* Turbo Control is enabled (`set_turbo_mhz` writes CPU Speed first, on purpose). `max_cpu_speed_mhz(client)` / `set_speed(None)` resolve "max" from the same probe (64 on C64U, 48 on U64E; 48 fallback). Contract test: `tests/test_turbo_contract_live.py` (`TURBO_CONTRACT_LIVE=1` gate).
 - **REU / Cartridge preset**: the C64U has no `"REU"` Cartridge preset — its `Cartridge` config value merely mirrors REU state, and writing it back is rejected with HTTP 400. `set_reu` / `restore_state` handle this by probing the item's presets (preset write ordered first, so a rejection never half-enables the REU). Don't hand-write `Cartridge: "REU"` config updates; use the helpers.
 - **REST `POST writemem` cliff (C64U)**: ~100–160 ms up to 12 KiB, then ~6 s per request at ≥16 KiB (sometimes exceeding a 10 s client timeout). Per-request pathology, not a wedge — the device stays healthy. For bulk writes use the SocketDMA fast path below.
 
@@ -595,7 +595,7 @@ transport.socket_dma_min_bytes = 8192  # payloads >= this go via DMAWRITE
 transport.write_memory(0x4000, blob)   # 16 KiB in ~150 ms vs >6 s REST POST on C64U
 ```
 
-Semantics to rely on: same `MemoryPolicy` checks as the REST path; chunked at 32 KiB (full 64 KiB writes work); the protocol is fire-and-forget so the transport verifies via a **polled** tail read-back (`socket_dma_verify_timeout`, default 2 s — a single immediate read races the device-side DMA application); connect/send/verify failure logs a WARNING and falls back to REST, and a connect failure latches the fast path off for the transport's lifetime. Live tests: `tests/test_socketdma_live.py` (`SOCKETDMA_LIVE=1` gate). U64E fw 3.14 availability is untested — the fallback makes enabling it safe everywhere.
+Semantics to rely on: same `MemoryPolicy` checks as the REST path; chunked at 32 KiB (full 64 KiB writes work); `DMAWRITE` is fire-and-forget (no per-command ack), so the transport finishes each write with an in-band **`IDENTIFY` completion barrier** — commands on one connection are serviced strictly in order, so the reply proves every chunk was consumed and applied (same pattern as `reu_write`; recv timeout scales with payload size) — followed by a REST tail read-back as a post-barrier sanity check (`socket_dma_verify_timeout`, default 2 s). A tail read-back alone is NOT a completion barrier: a tail that matches pre-existing RAM reports success while the bulk DMA is still in flight. Connect/send/barrier/verify failure logs a WARNING and falls back to REST, and a connect failure latches the fast path off for the transport's lifetime. Live tests: `tests/test_socketdma_live.py` (`SOCKETDMA_LIVE=1` gate). U64E fw 3.14 availability is untested — the fallback makes enabling it safe everywhere.
 
 ### DMA Trampoline Pattern
 ```python
@@ -663,10 +663,10 @@ target.transport.reset(scope="machine")   # VICE hard reset / U64 reboot()
 time.sleep(8.0)                            # U64 only; VICE returns near-instantly
 target.transport.set_speed(32)             # VICE: NotImplementedError; U64: 32 MHz
 target.transport.set_speed(1)              # 1 MHz on both backends (warp off / turbo off)
-target.transport.set_speed(None)           # "max speed" — VICE warp / U64 48 MHz
+target.transport.set_speed(None)           # "max speed" — VICE warp / U64 probed max (64 on C64U, 48 on U64E)
 ```
 
-VICE raises `NotImplementedError` for `set_speed` multipliers other than `1` and `None` because the 6510 has no discrete CPU-speed steps natively. The REU re-enable step above remains U64-only — there's no protocol-level cartridge-state shim yet, so REU-heavy benches must still drop to `client.*` for `set_reu(...)`.
+VICE raises `NotImplementedError` for `set_speed` multipliers other than `1` and `None` because the 6510 has no discrete CPU-speed steps natively; both work on default VICE targets (no text monitor needed — see Gotcha 20). On U64, `set_speed(None)` resolves to the device's true maximum via a cached CPU-Speed preset probe (48 fallback when inconclusive), and a generation-foreign multiplier raises `ValueError` locally when the probe succeeded. The REU re-enable step above remains U64-only — there's no protocol-level cartridge-state shim yet, so REU-heavy benches must still drop to `client.*` for `set_reu(...)`.
 
 ### Verify Program Startup via Code Bytes (not screen text)
 After `run_prg()`, screen RAM ($0400) may contain stale text from a prior run. Always verify startup by polling for known code bytes:
@@ -893,7 +893,7 @@ trampoline_addr = arbiter.alloc(117, name="trampoline")
 # trampoline_addr is guaranteed to pass policy.check_write
 ```
 
-The arbiter walks the policy's free space and hands out addresses guaranteed to pass `check_write`. **But even code that bypasses the arbiter and hardcodes an address is still checked at the transport** — the policy is the safety mechanism; the arbiter is just ergonomics for "where can I put this scratch?". `arbiter.policy_with_allocations()` produces a derived policy reserving the allocations, useful when you want the arbiter's claims visible to subsequent checks.
+The arbiter walks the policy's free space and hands out addresses guaranteed to pass `check_write` — the guarantee is enforced: `alloc()` verifies every candidate via `policy.check_write` before returning it (a reserved-only policy with `unknown="deny"` and no `safe_regions` is unallocatable, and the `MemoryArbiterError.trace` says so). **But even code that bypasses the arbiter and hardcodes an address is still checked at the transport** — the policy is the safety mechanism; the arbiter is just ergonomics for "where can I put this scratch?". `arbiter.policy_with_allocations()` produces a derived policy reserving the allocations, useful when you want the arbiter's claims visible to subsequent checks.
 
 ### What the policy does NOT cover (acknowledged residual risk)
 
@@ -906,11 +906,13 @@ Full design and the harness's own scratch-address table in `docs/memory_safety.m
 
 ---
 
-## Pattern 13: Cross-Backend Snapshot (Phase A)
+## Pattern 13: Cross-Backend Snapshot
 
-Round-trip the running RAM + CPU port state between VICE and Ultimate 64 using VICE's native `.vsf` format as the wire (PR #115 / commit 45a5844). Useful for "capture a state on the fast emulator, replay it on hardware to confirm timing-sensitive behaviour" — or the reverse.
+Round-trip the running RAM + CPU port state (and optionally REU contents) between VICE and Ultimate 64 using VICE's native `.vsf` format as the wire (PR #115 / commit 45a5844). Useful for "capture a state on the fast emulator, replay it on hardware to confirm timing-sensitive behaviour" — or the reverse.
 
-**Phase A scope** is RAM + CPU port only. CPU registers, CIA/VIC/SID register state, drive images, REU contents, and cartridge bytes are **not** captured yet (see `docs/snapshot_interop.md` for the per-layer matrix). On the U64 side, several layers are not even observable: the REST API has no readback for cart bytes, disk images, or REU memory; the 6510's registers aren't directly observable. The REU layer's fast restore path (SocketDMA `REUWRITE`) is designed and tracked in issue #134 — check there before re-deriving it.
+**Wired layers**: RAM + CPU port (Phase A) and REU contents (issue #134; `extract_snapshot(..., include_reu=True)` staging-window extract, SocketDMA `REUWRITE` restore). CPU registers, CIA/VIC/SID register state, drive images, and cartridge bytes are **not** captured yet (see `docs/snapshot_interop.md` for the per-layer matrix). On the U64 side, several layers are not even observable: the REST API has no readback for cart bytes, disk images, or REU memory; the 6510's registers aren't directly observable.
+
+**I/O window caveat**: extract captures I/O-view bytes for `$D000-$DFFF` (live register reads, not RAM under I/O), and `restore_snapshot` **skips** that window except color RAM `$D800-$DBFF` — blind writes into live registers could fire a spurious REU DMA via the REC command register at `$DF01`. The RAM round-trip guarantee is `$0000-$CFFF` + color RAM + `$E000-$FFFF`, not the full 64 KB.
 
 ```python
 from c64_test_harness import (
@@ -935,9 +937,9 @@ restore_snapshot(dest_target.transport, loaded)
 **Why the rename**: top-level helpers were originally `extract_state` / `restore_state` and were renamed in PR #126 (373da4e) to avoid colliding with the U64 helper `snapshot_state` / `restore_state` in `ultimate64_helpers` (which captures turbo + REU + cartridge **config**, not RAM). Both APIs coexist.
 
 **What you cannot do yet**:
-- Resume execution from a captured PC — Phase A is a seed, not a resume.
+- Resume execution from a captured PC — the snapshot is a seed, not a resume.
 - Snapshot live drive image contents on U64 (REST has no readback).
-- Snapshot REU contents on U64 (the harness's staging-window workaround is in `docs/memory_safety.md`, but is not yet wired into `Snapshot`).
+- Round-trip CIA/VIC/SID register state or CPU registers (planned phases — restore skips the I/O window, see above).
 
 ---
 
@@ -1139,8 +1141,8 @@ Programs that use the REU (e.g. x25519) need `set_reu(client, True, size="512 KB
 ### 19. VICE Binary Monitor Must Not Use Port 6510
 Port 6510 is VICE's default TEXT monitor port. VICE misbehaves when the BINARY monitor is bound there. `PortAllocator` starts at 6511 (range 6511-6531) and `ViceConfig.port` defaults to 6502 for this reason. Don't override to 6510.
 
-### 20. VICE 3.10 WarpMode is Not a Resource
-`resource_get("WarpMode")` returns error 0x1 — WarpMode is a static C variable in vsync.c, not in the resource system. Runtime warp toggle requires the text remote monitor (`warp on` / `warp off`). Same for `Speed=0`. The `ViceInstanceManager(enable_text_monitor=True)` flag allocates both ports automatically.
+### 20. VICE 3.10 WarpMode is Not a Resource — set_warp/get_warp Are Hybrid
+`resource_get("WarpMode")` returns error 0x1 — WarpMode is a static C variable in vsync.c, not in the resource system — and the `Speed` resource rejects the documented "unlimited" value 0. `set_warp`/`get_warp` handle this: with a text monitor connected they use the real `warp on` / `warp off` toggle (and `get_warp` sees warp enabled via the `-warp` CLI flag); on default targets (no text monitor) they fall back to pseudo-warp via the binary monitor's `Speed` resource (`Speed=1000000`; warp off restores `Speed=100`), so protocol-level `set_speed`/`get_speed` work on every VICE target. Caveat on the fallback path: `get_warp` only reflects pseudo-warp set through the transport — CLI `-warp` is not observable without a text monitor. The `ViceInstanceManager(enable_text_monitor=True)` flag allocates both ports automatically.
 
 ### 21. VICE 3.10 Ethernet Needs BOTH -addconfig AND -ethernetioif
 CS8900a activation needs both `-addconfig <rc>` (with `ETHERNETCART_ACTIVE=1`) AND `-ethernetioif` / `-ethernetiodriver` on the CLI, with `-addconfig` FIRST. `ViceConfig` handles this when `ethernet=True`.

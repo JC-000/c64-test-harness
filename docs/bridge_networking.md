@@ -281,6 +281,11 @@ Sentinel VICEs spawned without `ethernet=True` are NOT sudo-wrapped, so
 `ViceProcess.pid` is correct for them — the resolver only applies to
 ethernet-enabled bridge VICEs.
 
+`ViceProcess` now ships this resolver: check `proc.is_sudo_child` and
+call `proc.resolve_vice_pid()` to get the actual x64sc PID (equal to
+`proc.pid` for plain launches) instead of hand-rolling the `pgrep`
+snippet above.
+
 **3. macOS `ps -o ucomm=` preserves the comm name on zombies. Use `stat=`.**
 A SIGKILL'd-not-yet-reaped process retains its `ucomm` value, so a
 liveness helper that does `os.kill(pid, 0)` and then treats `comm == ""`
