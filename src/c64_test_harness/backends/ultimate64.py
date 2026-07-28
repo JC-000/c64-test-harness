@@ -422,15 +422,27 @@ class Ultimate64Transport(HardwareTransportBase):
         SocketDMA (TCP/64) has no dedicated joystick opcode, and the REST API
         has no joystick endpoint.  The standard out-of-band technique is to
         DMA-write CIA1's data ports directly: ``$DC01`` is read as joystick
-        port 1, ``$DC00`` as joystick port 2.  Bits 0-4 are
-        up/down/left/right/fire; the C64 joystick is **active-low** at the
-        hardware level, but this method preserves the caller-supplied
-        ``value`` byte verbatim — convert active-high/active-low conventions
-        in the caller, not here.
+        port 1, ``$DC00`` as joystick port 2.
 
-        Note: writes are one-shot.  CIA1 will hold the value until the next
-        keyboard scan (the KERNAL writes ``$DC00`` ~60 Hz), so for sustained
-        input the caller must rewrite periodically or pause the C64 first.
+        ``value`` follows the protocol convention (:meth:`C64Transport.
+        inject_joystick`): **active-high**, bit set = direction/button
+        pressed, bits 0-4 = up/down/left/right/fire — the same convention
+        VICE's ``JOYPORT_SET`` uses.  The CIA data ports are active-low at
+        the hardware level, so this method inverts bits 0-4 before the
+        write (bits 5-7 pass through verbatim).
+
+        The write routes through :meth:`write_memory` with
+        ``override="inject-joystick"`` so it stays visible to the
+        transport's :class:`MemoryPolicy` (the override is logged at
+        WARNING when a non-permissive policy is active) — CIA registers
+        are I/O, not consumer RAM, so the policy is bypassed rather than
+        consulted.
+
+        Persistence caveat (differs from VICE): U64 writes are
+        **one-shot**.  CIA1 holds the value only until the next keyboard
+        scan (the KERNAL rewrites the ports at ~60 Hz), so for sustained
+        input the caller must rewrite periodically or pause the C64
+        first.  VICE's ``JOYPORT_SET`` holds the state until changed.
         """
         if port == 1:
             cia_addr = 0xDC01
@@ -440,7 +452,12 @@ class Ultimate64Transport(HardwareTransportBase):
             raise ValueError(f"inject_joystick: port must be 1 or 2, got {port}")
         if not (0 <= value <= 0xFF):
             raise ValueError(f"inject_joystick: value {value:#x} out of byte range")
-        self._client.write_mem(cia_addr, bytes([value & 0xFF]))
+        # Protocol value is active-high; CIA lines are active-low with
+        # pull-ups, so invert the five joystick bits.
+        cia_value = value ^ 0x1F
+        self.write_memory(
+            cia_addr, bytes([cia_value & 0xFF]), override="inject-joystick"
+        )
 
     def read_framebuffer(
         self,

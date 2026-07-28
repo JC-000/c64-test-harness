@@ -398,15 +398,17 @@ def test_udp_identify_returns_empty_on_timeout():
 def test_inject_joystick_port1_writes_dc01():
     fake_client = MagicMock()
     t = Ultimate64Transport(host="ignored", client=fake_client)
+    # value is active-high (protocol convention); bits 0-4 are inverted
+    # onto the active-low CIA lines, bits 5-7 pass through.
     t.inject_joystick(1, 0x7F)
-    fake_client.write_mem.assert_called_once_with(0xDC01, b"\x7F")
+    fake_client.write_mem.assert_called_once_with(0xDC01, bytes([0x7F ^ 0x1F]))
 
 
 def test_inject_joystick_port2_writes_dc00():
     fake_client = MagicMock()
     t = Ultimate64Transport(host="ignored", client=fake_client)
     t.inject_joystick(2, 0xEF)
-    fake_client.write_mem.assert_called_once_with(0xDC00, b"\xEF")
+    fake_client.write_mem.assert_called_once_with(0xDC00, bytes([0xEF ^ 0x1F]))
 
 
 def test_inject_joystick_invalid_port_raises():

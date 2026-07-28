@@ -155,6 +155,77 @@ def test_inject_keys_waits_for_drain(
     assert mock_client.write_mem.call_count == 2
 
 
+# ---------------------------------------------------------------------------
+# inject_joystick — active-high protocol convention onto active-low CIA
+# ---------------------------------------------------------------------------
+
+
+def test_inject_joystick_port2_inverts_and_writes_dc00(
+    transport: Ultimate64Transport, mock_client: MagicMock
+) -> None:
+    # Active-high fire (bit 4) → CIA active-low byte with bit 4 cleared.
+    transport.inject_joystick(2, 0x10)
+    mock_client.write_mem.assert_called_once_with(0xDC00, bytes([0x10 ^ 0x1F]))
+
+
+def test_inject_joystick_port1_inverts_and_writes_dc01(
+    transport: Ultimate64Transport, mock_client: MagicMock
+) -> None:
+    # Up + fire pressed (bits 0 and 4) → bits 0/4 low, bits 1-3 high.
+    transport.inject_joystick(1, 0b1_0001)
+    mock_client.write_mem.assert_called_once_with(0xDC01, bytes([0b0_1110]))
+
+
+def test_inject_joystick_nothing_pressed_all_lines_high(
+    transport: Ultimate64Transport, mock_client: MagicMock
+) -> None:
+    transport.inject_joystick(2, 0x00)
+    mock_client.write_mem.assert_called_once_with(0xDC00, bytes([0x1F]))
+
+
+def test_inject_joystick_bits_5_to_7_pass_through(
+    transport: Ultimate64Transport, mock_client: MagicMock
+) -> None:
+    # Only the five joystick bits are inverted.
+    transport.inject_joystick(2, 0xE0)
+    mock_client.write_mem.assert_called_once_with(0xDC00, bytes([0xE0 | 0x1F]))
+
+
+def test_inject_joystick_invalid_port(transport: Ultimate64Transport) -> None:
+    with pytest.raises(ValueError, match="port"):
+        transport.inject_joystick(3, 0x10)
+
+
+def test_inject_joystick_value_out_of_range(
+    transport: Ultimate64Transport,
+) -> None:
+    with pytest.raises(ValueError, match="range"):
+        transport.inject_joystick(1, 0x100)
+
+
+def test_inject_joystick_is_policy_visible(
+    mock_client: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The CIA write routes through write_memory, not client.write_mem.
+
+    With a policy that reserves the CIA range the write still succeeds
+    (CIA registers are I/O, not consumer RAM — the per-call
+    ``override="inject-joystick"`` bypasses the check by design), but
+    the bypass is logged at WARNING so the policy sees every write.
+    """
+    from c64_test_harness import MemoryPolicy, MemoryRegion
+
+    policy = MemoryPolicy(
+        reserved_regions=(MemoryRegion(0xDC00, 0xDD00, "CIA1"),),
+    )
+    t = Ultimate64Transport(host="h", client=mock_client, memory_policy=policy)
+    with caplog.at_level("WARNING"):
+        t.inject_joystick(2, 0x10)
+    # The write went through the policy-checked path and was logged.
+    assert any("inject-joystick" in r.message for r in caplog.records)
+    mock_client.write_mem.assert_called_once_with(0xDC00, bytes([0x10 ^ 0x1F]))
+
+
 def test_read_registers_removed_from_protocol() -> None:
     """``read_registers`` is intentionally NOT part of ``C64Transport``.
 
