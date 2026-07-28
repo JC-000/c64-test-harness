@@ -25,7 +25,10 @@ import pytest
 
 from c64_test_harness.backends.device_lock import DeviceLock
 from c64_test_harness.backends.ultimate64 import Ultimate64Transport
-from c64_test_harness.backends.ultimate64_helpers import get_turbo_mhz
+from c64_test_harness.backends.ultimate64_helpers import (
+    get_turbo_mhz,
+    max_cpu_speed_mhz,
+)
 from c64_test_harness.backends.ultimate64_probe import is_u64_reachable
 from c64_test_harness.transport import C64Transport
 
@@ -152,20 +155,26 @@ class TestSetSpeed:
     def test_set_speed_none_selects_max(
         self, transport: Ultimate64Transport
     ) -> None:
-        """``set_speed(None)`` enables turbo at the device max (48 MHz).
+        """``set_speed(None)`` enables turbo at the device's probed max.
+
+        Since PR #143 the max is probed from the device's CPU-Speed
+        presets (64 on a C64 Ultimate fw 1.1.0, 48 on a U64 Elite fw
+        3.14; 48 fallback on an inconclusive probe), so the expectation
+        is ``max_cpu_speed_mhz(client)`` rather than a literal 48.
 
         Note the asymmetry with VICE (where ``set_speed(None)`` ⇒ warp on,
         and ``get_speed()`` returns ``None``): on U64, ``set_speed(None)``
-        maps to ``set_turbo_mhz(client, 48)``, which sets Turbo Control to
-        ``"Manual"`` at 48 MHz, so ``get_speed()`` reads back ``48`` (not
+        maps to ``set_turbo_mhz(client, <max>)``, which sets Turbo Control
+        to ``"Manual"``, so ``get_speed()`` reads back the max (not
         ``None``). ``get_speed()`` only returns ``None`` when turbo is on
         but the CPU-Speed enum is unrecognised — a state ``set_speed``
         does not produce.
         """
+        device_max = max_cpu_speed_mhz(transport.client)
         try:
             transport.set_speed(None)
-            assert transport.get_speed() == 48
-            assert get_turbo_mhz(transport.client) == 48
+            assert transport.get_speed() == device_max
+            assert get_turbo_mhz(transport.client) == device_max
         finally:
             transport.set_speed(1)
 

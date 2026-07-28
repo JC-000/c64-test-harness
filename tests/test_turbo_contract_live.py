@@ -46,6 +46,7 @@ from c64_test_harness.backends.ultimate64_client import (
     Ultimate64Error,
 )
 from c64_test_harness.backends.ultimate64_helpers import (
+    CAT_U64_SPECIFIC,
     get_turbo_enabled,
     get_turbo_mhz,
     restore_state,
@@ -186,9 +187,50 @@ def test_foreign_speed_contract(
             f"device reports {after_native.cpu_speed!r}"
         )
 
-        # (b) Foreign attempt — the actual contract probe.
+        # (b) Helper contract (PR #143): with a conclusive preset probe —
+        #     the normal case on a healthy device — set_turbo_mhz rejects
+        #     a generation-foreign speed locally with ValueError before
+        #     anything goes on the wire. An inconclusive probe falls back
+        #     to the legacy wire path (firmware HTTP 400); both count as
+        #     rejection, but which one fired is recorded.
         try:
             set_turbo_mhz(client, foreign)
+        except ValueError as exc:
+            local_observation = (
+                f"LOCAL-REJECT foreign speed {foreign} (enum "
+                f"{foreign_enum!r}) via ValueError before the wire: {exc}"
+            )
+        except Ultimate64Error as exc:
+            local_observation = (
+                f"WIRE-REJECT foreign speed {foreign}: preset probe was "
+                f"inconclusive, firmware answered HTTP {exc.status}: {exc}"
+            )
+        else:
+            after_local = snapshot_state(client)
+            local_observation = (
+                f"NOT REJECTED: set_turbo_mhz({foreign}) raised nothing; "
+                f"readback cpu_speed={after_local.cpu_speed!r}"
+            )
+        record_property("helper_contract", local_observation)
+        print(local_observation)
+        assert local_observation.startswith(("LOCAL-REJECT", "WIRE-REJECT")), (
+            f"foreign speed {foreign} was not rejected by set_turbo_mhz — "
+            f"contract violated: {local_observation}"
+        )
+        # Rejection must not have half-applied: CPU Speed unchanged from (a).
+        after_reject = snapshot_state(client)
+        assert after_reject.cpu_speed == native_enum, (
+            f"foreign speed rejected but CPU Speed changed from "
+            f"{native_enum!r} to {after_reject.cpu_speed!r} — half-applied"
+        )
+
+        # (c) Raw firmware probe — bypasses the helper's local validation
+        #     (PUTs the foreign enum directly) so the empirical firmware
+        #     observation this test exists for is still gathered.
+        try:
+            client.set_config_item(
+                CAT_U64_SPECIFIC, "CPU Speed", foreign_enum
+            )
         except Ultimate64Error as exc:
             # --- Branch 1: firmware rejected the foreign speed. ---
             status = exc.status
@@ -203,10 +245,10 @@ def test_foreign_speed_contract(
                 f"({exc})"
             )
             # Rejection must not have half-applied: CPU Speed unchanged from (a).
-            after_reject = snapshot_state(client)
-            assert after_reject.cpu_speed == native_enum, (
+            after_fw = snapshot_state(client)
+            assert after_fw.cpu_speed == native_enum, (
                 f"firmware rejected foreign speed but CPU Speed changed from "
-                f"{native_enum!r} to {after_reject.cpu_speed!r} — half-applied"
+                f"{native_enum!r} to {after_fw.cpu_speed!r} — half-applied"
             )
         else:
             # No raise: inspect what the device actually did.
