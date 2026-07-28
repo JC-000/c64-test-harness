@@ -114,7 +114,7 @@ Critical checks are: VICE presence/version/ethernet/binary-monitor, `c1541`, Pyt
 1. **Build VICE 3.10 from source with `--enable-ethernet`** — distro packages generally omit the flag, so `verify-dev-env.sh` will flag this as a critical failure if you install from `apt`. Install to `/usr/local/bin`.
 2. **Install the Python harness in editable mode into a venv**: `python3 -m venv --system-site-packages ~/.local/share/c64-test-harness/venv && ~/.local/share/c64-test-harness/venv/bin/pip install -e .` from the repo root. On Ubuntu 23+ / PEP-668 distros this is mandatory — `pip install --user` against system Python is blocked. Activate with `source ~/.local/share/c64-test-harness/venv/bin/activate` before running tests, or invoke `~/.local/share/c64-test-harness/venv/bin/python -m pytest tests/` directly.
 3. **Set up bridge networking** (only required for multi-VICE ethernet tests): `sudo ./scripts/setup-bridge-tap.sh`. Teardown: `sudo ./scripts/teardown-bridge-tap.sh`. Emergency cleanup: `sudo ./scripts/cleanup-bridge-networking.sh`.
-4. **Optional Ultimate 64**: set `U64_HOST=<ip>` in the environment to enable hardware-backed live tests.
+4. **Optional Ultimate 64**: set `U64_HOST=<ip>` in the environment to enable hardware-backed live tests. Suites that mutate device state (reset, RAM writes, config changes) additionally require `U64_ALLOW_MUTATE=1`; with either variable unset they skip cleanly.
 
 Re-run `./scripts/verify-dev-env.sh` after each step to confirm progress.
 
