@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import weakref
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Mapping
 
@@ -55,6 +56,7 @@ __all__ = [
     "get_turbo_mhz",
     "set_turbo_mhz",
     "get_turbo_enabled",
+    "max_cpu_speed_mhz",
     "get_reu_config",
     "set_reu",
     "get_sid_config",
@@ -165,6 +167,90 @@ def get_turbo_enabled(client: Ultimate64Client) -> bool:
     return isinstance(value, str) and value != "Off"
 
 
+#: Per-client cache of conclusively-probed CPU Speed presets.  Keyed
+#: weakly so a cached probe result never outlives (or pins) its client;
+#: inconclusive probes are NOT cached, so a transient GET failure does
+#: not permanently disable generation-aware validation.
+_CPU_SPEED_PRESETS_CACHE: "weakref.WeakKeyDictionary[Ultimate64Client, tuple[str, ...]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _cpu_speed_presets(client: Ultimate64Client) -> tuple[str, ...] | None:
+    """Probe (once, cached) the device's settable ``CPU Speed`` presets.
+
+    The schema's :data:`CPU_SPEED_VALUES` is the cross-generation
+    *superset*: the U64 Elite (firmware 3.14) has ``" 5"`` but no
+    ``"64"``, the C64 Ultimate (firmware 1.1.0) has ``"64"`` but no
+    ``" 5"``. The device's actual preset list is dug out of the
+    ``get_config_item`` response with the same defensive parsing as
+    :func:`_cartridge_preset_supported`: any structural surprise (or a
+    probe that raises) yields the inconclusive ``None`` rather than a
+    wrong answer. Conclusive results are cached per client (weakly), so
+    the probe costs one GET per client lifetime.
+
+    :param client: Connected Ultimate64 client.
+    :returns: Tuple of preset enum strings, or ``None`` when the probe
+        was inconclusive.
+    """
+    try:
+        cached = _CPU_SPEED_PRESETS_CACHE.get(client)
+    except TypeError:  # unhashable / non-weakrefable client stand-in
+        cached = None
+    if cached is not None:
+        return cached
+    try:
+        resp = client.get_config_item(CAT_U64_SPECIFIC, _ITEM_CPU_SPEED)
+    except Ultimate64Error:
+        return None
+    if not isinstance(resp, dict):
+        return None
+    category = resp.get(CAT_U64_SPECIFIC)
+    if not isinstance(category, dict):
+        return None
+    item = category.get(_ITEM_CPU_SPEED)
+    if not isinstance(item, dict):
+        return None
+    presets = item.get("presets")
+    if not isinstance(presets, list):
+        return None
+    if not presets or not all(isinstance(p, str) for p in presets):
+        return None
+    result = tuple(presets)
+    try:
+        _CPU_SPEED_PRESETS_CACHE[client] = result
+    except TypeError:
+        pass
+    return result
+
+
+def max_cpu_speed_mhz(client: Ultimate64Client) -> int:
+    """Return this device's maximum turbo CPU speed in MHz.
+
+    Probes the device's ``CPU Speed`` presets (cached; see
+    :func:`_cpu_speed_presets`) and returns the largest one that parses
+    as a known MHz step — ``64`` on a C64 Ultimate (firmware 1.1.0),
+    ``48`` on a U64 Elite (firmware 3.14). Falls back to ``48`` (the
+    U64E maximum, always firmware-accepted on both generations) when
+    the probe is inconclusive.
+
+    :param client: Connected Ultimate64 client.
+    :returns: Maximum CPU speed in MHz (``48`` fallback).
+    """
+    presets = _cpu_speed_presets(client)
+    if presets is None:
+        return 48
+    best: int | None = None
+    for preset in presets:
+        try:
+            mhz = cpu_speed_mhz(preset)
+        except ValueError:
+            continue
+        if best is None or mhz > best:
+            best = mhz
+    return best if best is not None else 48
+
+
 def set_turbo_mhz(client: Ultimate64Client, mhz: int | None) -> None:
     """Set (or disable) U64 CPU turbo.
 
@@ -173,6 +259,16 @@ def set_turbo_mhz(client: Ultimate64Client, mhz: int | None) -> None:
     ``"Manual"`` mode and sets the CPU Speed enum to the matching
     schema value; the integer is validated by :func:`cpu_speed_enum`
     so unsupported speeds raise :class:`ValueError` locally.
+
+    The schema enum is the cross-generation superset (the U64 Elite
+    lacks ``64``, the C64 Ultimate lacks ``5``), so a superset-valid
+    speed can still be generation-foreign. The device's actual preset
+    list is probed once (cached; see :func:`_cpu_speed_presets`) and,
+    when the probe is conclusive, a generation-foreign speed raises
+    :class:`ValueError` locally instead of going on the wire and
+    surfacing as an HTTP 400 :class:`Ultimate64Error`. An inconclusive
+    probe preserves the legacy behaviour (the firmware rejects a
+    foreign speed with HTTP 400 before turbo is enabled).
 
     :param client: Connected Ultimate64 client.
     :param mhz: CPU speed in MHz, or ``None`` to disable turbo.
@@ -183,6 +279,15 @@ def set_turbo_mhz(client: Ultimate64Client, mhz: int | None) -> None:
     if not isinstance(mhz, int) or isinstance(mhz, bool):
         raise ValueError(f"mhz must be int or None, got {type(mhz).__name__}")
     speed_enum = cpu_speed_enum(mhz)  # raises ValueError on bad speed
+    presets = _cpu_speed_presets(client)
+    if presets is not None and speed_enum not in presets:
+        supported = sorted(
+            cpu_speed_mhz(p) for p in presets if p in CPU_SPEED_VALUES
+        )
+        raise ValueError(
+            f"speed {mhz} not supported by this device generation; "
+            f"supported: {supported}"
+        )
     client.set_config_items(
         CAT_U64_SPECIFIC,
         {

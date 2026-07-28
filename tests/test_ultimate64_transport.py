@@ -337,6 +337,91 @@ def test_set_speed_unsupported_int_raises(
         transport.set_speed(7)
 
 
+_U64E_CPU_SPEED_PRESETS = [
+    " 1", " 2", " 3", " 4", " 5", " 6", " 8", "10",
+    "12", "14", "16", "20", "24", "32", "40", "48",
+]
+_C64U_CPU_SPEED_PRESETS = [
+    " 1", " 2", " 3", " 4", " 6", " 8", "10",
+    "12", "14", "16", "20", "24", "32", "40", "48", "64",
+]
+
+
+def _cpu_speed_item_response(presets: list[str]) -> dict:
+    return {
+        "U64 Specific Settings": {
+            "CPU Speed": {
+                "current": " 1",
+                "presets": list(presets),
+                "default": " 1",
+            },
+        },
+        "errors": [],
+    }
+
+
+def test_set_speed_none_uses_probed_max_on_c64u(
+    transport: Ultimate64Transport, mock_client: MagicMock
+) -> None:
+    """C64U fw 1.1.0 has a '64' CPU-Speed step — None means 64, not 48."""
+    mock_client.get_config_item.return_value = _cpu_speed_item_response(
+        _C64U_CPU_SPEED_PRESETS
+    )
+    transport.set_speed(None)
+    mock_client.set_config_items.assert_called_once_with(
+        "U64 Specific Settings",
+        {"CPU Speed": "64", "Turbo Control": "Manual"},
+    )
+
+
+def test_set_speed_none_uses_probed_max_on_u64e(
+    transport: Ultimate64Transport, mock_client: MagicMock
+) -> None:
+    mock_client.get_config_item.return_value = _cpu_speed_item_response(
+        _U64E_CPU_SPEED_PRESETS
+    )
+    transport.set_speed(None)
+    mock_client.set_config_items.assert_called_once_with(
+        "U64 Specific Settings",
+        {"CPU Speed": "48", "Turbo Control": "Manual"},
+    )
+
+
+def test_set_speed_generation_foreign_5_raises_locally_on_c64u(
+    transport: Ultimate64Transport, mock_client: MagicMock
+) -> None:
+    mock_client.get_config_item.return_value = _cpu_speed_item_response(
+        _C64U_CPU_SPEED_PRESETS
+    )
+    with pytest.raises(ValueError, match="device generation"):
+        transport.set_speed(5)
+    mock_client.set_config_items.assert_not_called()
+
+
+def test_set_speed_generation_foreign_64_raises_locally_on_u64e(
+    transport: Ultimate64Transport, mock_client: MagicMock
+) -> None:
+    mock_client.get_config_item.return_value = _cpu_speed_item_response(
+        _U64E_CPU_SPEED_PRESETS
+    )
+    with pytest.raises(ValueError, match="device generation"):
+        transport.set_speed(64)
+    mock_client.set_config_items.assert_not_called()
+
+
+def test_set_speed_64_goes_on_the_wire_on_c64u(
+    transport: Ultimate64Transport, mock_client: MagicMock
+) -> None:
+    mock_client.get_config_item.return_value = _cpu_speed_item_response(
+        _C64U_CPU_SPEED_PRESETS
+    )
+    transport.set_speed(64)
+    mock_client.set_config_items.assert_called_once_with(
+        "U64 Specific Settings",
+        {"CPU Speed": "64", "Turbo Control": "Manual"},
+    )
+
+
 def test_get_speed_native_when_turbo_off(
     transport: Ultimate64Transport, monkeypatch: pytest.MonkeyPatch
 ) -> None:

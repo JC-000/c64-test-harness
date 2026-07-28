@@ -565,16 +565,26 @@ class Ultimate64Transport(HardwareTransportBase):
         Wraps :func:`ultimate64_helpers.set_turbo_mhz`:
 
         * ``multiplier=1`` — turbo off (1 MHz native).
-        * ``multiplier=N`` where N is a supported U64 CPU-Speed enum
-          (2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 20, 24, 32, 40, 48) —
-          set Turbo Control to ``"Manual"`` at that MHz.
-        * ``multiplier=None`` — max available speed (48 MHz).
+        * ``multiplier=N`` where N is a supported CPU-Speed enum step
+          (2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 20, 24, 32, 40, 48, 64) —
+          set Turbo Control to ``"Manual"`` at that MHz.  The enum is
+          the cross-generation superset: the U64 Elite (fw 3.14) lacks
+          64, the C64 Ultimate (fw 1.1.0) lacks 5.  The device's actual
+          preset list is probed once (cached) and a generation-foreign
+          speed raises :class:`ValueError` locally; when the probe is
+          inconclusive the firmware still rejects it with HTTP 400
+          before turbo is enabled.
+        * ``multiplier=None`` — max available speed as probed from the
+          device's CPU-Speed presets (64 MHz on a C64 Ultimate, 48 MHz
+          on a U64 Elite; falls back to 48 when the probe is
+          inconclusive).
 
-        :raises ValueError: integer is not one of the supported MHz steps.
+        :raises ValueError: integer is not one of the supported MHz
+            steps, or not supported by this device generation.
         """
-        from .ultimate64_helpers import set_turbo_mhz
+        from .ultimate64_helpers import max_cpu_speed_mhz, set_turbo_mhz
         if multiplier is None:
-            set_turbo_mhz(self._client, 48)
+            set_turbo_mhz(self._client, max_cpu_speed_mhz(self._client))
             return
         if multiplier == 1:
             set_turbo_mhz(self._client, None)
