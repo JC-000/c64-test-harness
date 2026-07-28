@@ -934,12 +934,13 @@ def restore_state(client: Ultimate64Client, snap: U64StateSnapshot) -> None:
             _ITEM_CPU_SPEED: snap.cpu_speed,
         },
     )
-    cart_updates: dict[str, Any] = {_ITEM_REU_ENABLED: snap.reu_enabled}
-    # Only restore non-empty enum values — the device reports "" for
-    # unset preset fields, and writing "" back produces HTTP 400
-    # ("Function none requires parameter value").
-    if snap.reu_size:
-        cart_updates[_ITEM_REU_SIZE] = snap.reu_size
+    cart_updates: dict[str, Any] = {}
+    # Cartridge FIRST — the same ordering invariant :func:`set_reu`
+    # documents: :meth:`Ultimate64Client.set_config_items` iterates in
+    # insertion order and does not catch per-item failures, so a
+    # firmware rejection of the Cartridge write aborts the batch before
+    # the REU is half-enabled.
+    #
     # A snapshotted cartridge value may be a firmware-mirrored display
     # value (C64U reports "REU" but rejects it as a PUT). Skip the write
     # only when the device positively reports it as unsupported.
@@ -947,6 +948,12 @@ def restore_state(client: Ultimate64Client, snap: U64StateSnapshot) -> None:
         client, snap.cartridge
     ) is not False:
         cart_updates[_ITEM_CARTRIDGE] = snap.cartridge
+    cart_updates[_ITEM_REU_ENABLED] = snap.reu_enabled
+    # Only restore non-empty enum values — the device reports "" for
+    # unset preset fields, and writing "" back produces HTTP 400
+    # ("Function none requires parameter value").
+    if snap.reu_size:
+        cart_updates[_ITEM_REU_SIZE] = snap.reu_size
     client.set_config_items(CAT_CART, cart_updates)
 
 

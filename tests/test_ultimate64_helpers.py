@@ -542,6 +542,30 @@ class TestSnapshotRestore:
             "Cartridge": "REU",
         }
 
+    def test_restore_state_cartridge_ordered_first(self) -> None:
+        """Cartridge must lead the cart batch — set_reu's ordering invariant.
+
+        set_config_items iterates in insertion order and does not catch
+        per-item failures, so a firmware rejection of the Cartridge write
+        must abort the batch BEFORE the REU is half-enabled.
+        """
+        client = _make_client()
+        snap = U64StateSnapshot(
+            turbo_control="Manual",
+            cpu_speed=" 4",
+            reu_enabled="Enabled",
+            reu_size="16 MB",
+            cartridge="REU",
+        )
+        restore_state(client, snap)
+        cart_call = client.set_config_items.call_args_list[1]
+        assert cart_call.args[0] == CAT_CART
+        assert list(cart_call.args[1]) == [
+            "Cartridge",
+            "RAM Expansion Unit",
+            "REU Size",
+        ]
+
     def test_restore_state_bad_type(self) -> None:
         client = _make_client()
         with pytest.raises(TypeError, match="U64StateSnapshot"):
