@@ -110,10 +110,21 @@ def test_read_framebuffer_returns_one_frame(transport: Ultimate64Transport) -> N
     ``DEFAULT_VIDEO_PORT`` (11000).  Skips with a clear message if the
     stream cannot be received (firewall, NAT, etc.).
     """
+    from c64_test_harness.backends.ultimate64_client import Ultimate64Error
     from c64_test_harness.transport import TransportError
 
     try:
         fb = transport.read_framebuffer(timeout=3.0)
+    except Ultimate64Error as exc:
+        if exc.status == 500:
+            # Observed live 2026-07-28: C64U fw 1.1.0 answered HTTP 500
+            # "No Operational Network Interface" to video:start with a
+            # routed capture host. May be topology-dependent — the skip
+            # reason carries the device's actual error body.
+            pytest.skip(
+                f"video stream start rejected by this firmware: {exc}"
+            )
+        raise
     except TransportError as exc:
         pytest.skip(f"U64 video stream not reachable from this host: {exc}")
 
