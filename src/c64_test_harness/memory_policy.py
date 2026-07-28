@@ -394,9 +394,25 @@ class MemoryPolicy:
         override:
             Non-empty reason string bypasses the check.  The bypass is
             logged at WARNING so it remains visible in test output.
+
+        Raises
+        ------
+        ValueError
+            If ``addr + length`` exceeds the 16-bit address space.  The
+            transport would wrap such a write back to ``$0000``, and the
+            wrapped span cannot be evaluated against regions declared in
+            ``$0000-$FFFF`` — so it is rejected as invalid input rather
+            than silently approved.  ``override`` does not bypass this.
         """
         if length <= 0:
             return
+        if addr + length > _ADDR_SPACE:
+            raise ValueError(
+                f"write_memory(${addr:04X}, {length} B) extends past the top "
+                f"of the 16-bit address space (end ${addr + length:05X} > "
+                f"$10000); the wrapped span cannot be policy-checked — split "
+                f"the write at $FFFF"
+            )
         if override:
             _log.warning(
                 "memory policy override at $%04X+%d (reason: %s)",
