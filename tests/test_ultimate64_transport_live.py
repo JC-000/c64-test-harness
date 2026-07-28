@@ -244,6 +244,12 @@ class TestResetScopes:
             assert is_u64_reachable(_HOST, password=_PW)
             data = transport.read_memory(0xA000, 16)
             assert isinstance(data, bytes) and len(data) == 16
+            # Settle: the C64's boot sequence walks RAM upward (BASIC
+            # memory sizing) for a few seconds after reset. Leaving
+            # mid-boot pollutes whatever runs next — e.g. a SocketDMA
+            # write to $4000 gets clobbered by the walker (observed
+            # live on U64E fw 3.14, 2026-07-28).
+            time.sleep(3.0)
         finally:
             transport.set_speed(1)
 

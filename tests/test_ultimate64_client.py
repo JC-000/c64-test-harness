@@ -626,9 +626,9 @@ def test_drive_on_off_reset_urls():
         c.drive_reset("b")
     urls = [r[0].get_full_url() for r in captured]
     assert urls == [
-        "http://h/v1/drives/a%3A:on",
-        "http://h/v1/drives/a%3A:off",
-        "http://h/v1/drives/b%3A:reset",
+        "http://h/v1/drives/a:on",
+        "http://h/v1/drives/a:off",
+        "http://h/v1/drives/b:reset",
     ]
     assert all(r[0].get_method() == "PUT" for r in captured)
     assert all(r[0].data is None for r in captured)
@@ -642,8 +642,8 @@ def test_drive_remove_disk_and_unlink_urls():
         c.drive_unlink("b")
     urls = [r[0].get_full_url() for r in captured]
     assert urls == [
-        "http://h/v1/drives/a%3A:remove",
-        "http://h/v1/drives/b%3A:unlink",
+        "http://h/v1/drives/a:remove",
+        "http://h/v1/drives/b:unlink",
     ]
 
 
@@ -654,7 +654,7 @@ def test_drive_set_mode_url_and_query():
         c.drive_set_mode("a", "1581")
     req = captured[0][0]
     assert req.get_method() == "PUT"
-    assert req.get_full_url() == "http://h/v1/drives/a%3A:set_mode?mode=1581"
+    assert req.get_full_url() == "http://h/v1/drives/a:set_mode?mode=1581"
     assert req.data is None
 
 
@@ -680,7 +680,7 @@ def test_drive_load_rom_with_bytes_uses_multipart_put():
         c.drive_load_rom("a", b"\xaa\xbb\xcc")
     req = captured[0][0]
     assert req.get_method() == "PUT"
-    assert req.get_full_url() == "http://h/v1/drives/a%3A:load_rom"
+    assert req.get_full_url() == "http://h/v1/drives/a:load_rom"
     ct = req.get_header("Content-type")
     assert ct.startswith("multipart/form-data; boundary=")
     assert b'name="file"' in req.data
@@ -696,7 +696,7 @@ def test_drive_load_rom_with_str_uses_file_query():
     assert req.get_method() == "PUT"
     assert req.data is None
     url = req.get_full_url()
-    assert url == "http://h/v1/drives/b%3A:load_rom?file=/Roms/dos1541.rom"
+    assert url == "http://h/v1/drives/b:load_rom?file=/Roms/dos1541.rom"
 
 
 def test_drive_load_rom_rejects_bad_type():

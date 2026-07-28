@@ -213,7 +213,10 @@ def _cpu_speed_presets(client: Ultimate64Client) -> tuple[str, ...] | None:
     item = category.get(_ITEM_CPU_SPEED)
     if not isinstance(item, dict):
         return None
-    presets = item.get("presets")
+    # NB: enum/value-list items carry their choices under "values";
+    # only preset-file items (e.g. Cartridge) use "presets". Verified
+    # live against U64E fw 3.14 and C64U fw 1.1.0 on 2026-07-28.
+    presets = item.get("values")
     if not isinstance(presets, list):
         return None
     if not presets or not all(isinstance(p, str) for p in presets):

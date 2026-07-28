@@ -843,10 +843,12 @@ class Ultimate64Client:
 
     @staticmethod
     def _drive_slot_path(drive: str, action: str) -> str:
+        # Plain slot letter, no trailing colon: fw 3.14 answers 400
+        # "Invalid Drive 'a:'" for /v1/drives/a%3A:reset but 200 for
+        # /v1/drives/a:reset (verified live 2026-07-28).
         if drive not in ("a", "b"):
             raise ValueError(f"drive must be 'a' or 'b', got {drive!r}")
-        slot = drive + ":"
-        return f"/v1/drives/{_encode(slot)}:{action}"
+        return f"/v1/drives/{drive}:{action}"
 
     def drive_on(self, drive: str) -> None:
         """PUT /v1/drives/<drive>:on — power on a drive slot (DESTRUCTIVE)."""

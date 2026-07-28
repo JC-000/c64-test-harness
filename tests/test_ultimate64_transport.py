@@ -352,7 +352,7 @@ def _cpu_speed_item_response(presets: list[str]) -> dict:
         "U64 Specific Settings": {
             "CPU Speed": {
                 "current": " 1",
-                "presets": list(presets),
+                "values": list(presets),
                 "default": " 1",
             },
         },

@@ -132,6 +132,13 @@ class TestScreenKeyboard:
         transport.reset()
         grid = wait_for_text(transport, "READY.", timeout=5.0)
         assert grid is not None, "BASIC READY. prompt did not appear after reset"
+        # Settle past the first READY sighting: on real U64E hardware the
+        # boot can blank the screen again moments later (observed live
+        # 2026-07-28 — keys injected in that window vanish into the
+        # KERNAL init's buffer wipe). Re-assert READY after the window.
+        time.sleep(2.5)
+        grid = wait_for_text(transport, "READY.", timeout=5.0)
+        assert grid is not None, "READY. did not survive the boot settle window"
         assert len(grid.text_lines()) == 25
         for line in grid.text_lines():
             assert len(line) == 40
