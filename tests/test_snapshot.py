@@ -130,6 +130,16 @@ class _MockTransport:
         return bytes(length)
 
 
+def _replay_writes(
+    writes: list[tuple[int, bytes, str | None]], fill: int = 0xEA
+) -> bytearray:
+    """Apply recorded write_memory calls, in order, onto a sentinel image."""
+    mem = bytearray([fill]) * 65536
+    for addr, data, _override in writes:
+        mem[addr : addr + len(data)] = data
+    return mem
+
+
 # ---------------------------------------------------------------------------
 # 1. Offline VSF round-trip
 # ---------------------------------------------------------------------------
@@ -305,7 +315,8 @@ class TestRestoreState:
                 f"used override={override!r}"
             )
 
-    def test_restore_writes_full_ram_image(self) -> None:
+    def test_restore_writes_ram_around_io_window(self) -> None:
+        """RAM is restored byte-exact outside $D000-$DFFF (+ color RAM)."""
         snap = Snapshot(
             ram=_make_pattern_ram(),
             cpu_port_data=0x37,
@@ -313,9 +324,48 @@ class TestRestoreState:
         )
         mock = _MockTransport()
         restore_snapshot(mock, snap)
-        ram_writes = [(a, d) for a, d, _ov in mock.writes if a == 0x0000 and len(d) == 65536]
-        assert ram_writes, "no full-RAM write was issued"
-        assert ram_writes[0][1] == snap.ram
+        mem = _replay_writes(mock.writes)
+        # $0000/$0001 end up as the explicit CPU-port writes (by design).
+        assert mem[0x0000] == snap.cpu_port_dir
+        assert mem[0x0001] == snap.cpu_port_data
+        assert bytes(mem[0x0002:0xD000]) == snap.ram[0x0002:0xD000]
+        assert bytes(mem[0xE000:0x10000]) == snap.ram[0xE000:0x10000]
+
+    def test_restore_skips_io_registers_entirely(self) -> None:
+        """No write may touch $D000-$D7FF or $DC00-$DFFF (live registers).
+
+        Regression for the spurious-REU-DMA bug: the old single 64 KiB
+        write landed ram[$DF01] in the REC command register while
+        $DF02-$DF0A still held pre-restore values.  A captured command
+        byte with bit7|bit4 set (e.g. $91) fired an immediate REU DMA
+        with stale registers, clobbering just-restored RAM.
+        """
+        ram = bytearray(_make_pattern_ram())
+        ram[0xDF01] = 0x91  # the exact byte shape that fired the DMA
+        snap = Snapshot(ram=bytes(ram), cpu_port_data=0x37, cpu_port_dir=0x2F)
+        mock = _MockTransport()
+        restore_snapshot(mock, snap)
+        skipped = [(0xD000, 0xD800), (0xDC00, 0xE000)]
+        for addr, data, _ov in mock.writes:
+            end = addr + len(data)
+            for lo, hi in skipped:
+                assert end <= lo or addr >= hi, (
+                    f"write ${addr:04X}-${end - 1:04X} overlaps the "
+                    f"skipped I/O range ${lo:04X}-${hi - 1:04X}"
+                )
+
+    def test_restore_keeps_color_ram(self) -> None:
+        """$D800-$DBFF (color RAM) IS restored — real RAM through the
+        CPU view, side-effect-free writes, and visible screen state."""
+        snap = Snapshot(
+            ram=_make_pattern_ram(),
+            cpu_port_data=0x37,
+            cpu_port_dir=0x2F,
+        )
+        mock = _MockTransport()
+        restore_snapshot(mock, snap)
+        mem = _replay_writes(mock.writes)
+        assert bytes(mem[0xD800:0xDC00]) == snap.ram[0xD800:0xDC00]
 
     def test_restore_writes_cpu_port_explicitly(self) -> None:
         snap = Snapshot(

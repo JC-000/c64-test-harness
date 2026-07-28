@@ -622,6 +622,35 @@ class TestRestoreSnapshotReu:
         with pytest.raises(Ultimate64Error, match="connect failed"):
             restore_snapshot(t, snap)
 
+    def test_restore_never_writes_rec_registers(self) -> None:
+        """No write_memory call may cover $DF00-$DFFF (REC registers).
+
+        Regression: the old single 64 KiB RAM write landed ram[$DF01]
+        in the live REC command register while $DF02-$DF0A still held
+        pre-restore values — a captured command byte with bit7|bit4 set
+        (e.g. $91, a readable REC value) fired an immediate spurious
+        REU DMA with stale address/length registers.  REU contents must
+        travel only via the SocketDMA REUWRITE path.
+        """
+        ram = bytearray(_ram_64k(0x00))
+        ram[0xDF01] = _REC_CMD_REU_TO_C64  # the byte shape that fired DMA
+        snap = Snapshot(
+            ram=bytes(ram),
+            cpu_port_data=0x37,
+            cpu_port_dir=0x2F,
+            reu_contents=_pattern(128 * 1024),
+        )
+        t = _FakeU64RestoreTransport()
+        restore_snapshot(t, snap)
+        for addr, data, _ov in t.writes:
+            end = addr + len(data)
+            assert end <= 0xDF00 or addr >= 0xE000, (
+                f"write ${addr:04X}-${end - 1:04X} overlaps the REC "
+                f"register window $DF00-$DFFF"
+            )
+        # REU bytes still went through SocketDMA, after the RAM slices.
+        assert t.reu_calls == [(0, snap.reu_contents)]
+
     def test_invalid_reu_size_rejected_before_any_write(self) -> None:
         # 100 KiB is not a firmware REU Size — reu_size_enum must reject
         # it during the enable step, before any REUWRITE goes out.

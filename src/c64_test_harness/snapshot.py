@@ -10,6 +10,30 @@ but does NOT resume at the exact PC/cycle.  CPU register, VIC-II, SID,
 CIA, drive, and cartridge state are still out of scope and will follow
 in later phases (see ``docs/snapshot_interop.md``).
 
+I/O window ($D000-$DFFF) restore exclusion
+------------------------------------------
+
+Neither backend banks out I/O for host memory access: the VICE binary
+monitor uses the CPU view (memspace 0, bank 0) and U64 ``writemem`` is
+real bus DMA.  Two consequences:
+
+* **Extract** reads *I/O-view* bytes for ``$D000-$DFFF`` (live VIC-II /
+  SID / CIA / REC register reads and color RAM), not the RAM under I/O.
+  The full 64 KB is still captured for fidelity of everything else.
+* **Restore skips ``$D000-$DFFF``** — with the sole exception of color
+  RAM ``$D800-$DBFF``, which through the CPU view *is* the real (only)
+  color RAM and whose writes are side-effect-free.  Blind byte-writes
+  into live registers are wrong (register state is a planned later
+  phase, see above) and actively dangerous: the bulk ascending write
+  used to land ``ram[$DF01]`` in the REC command register while
+  ``$DF02-$DF0A`` still held pre-restore values, firing a spurious REU
+  DMA with stale address/length registers that clobbered
+  just-restored RAM.
+
+So the RAM round-trip guarantee is ``$0000-$CFFF``, ``$D800-$DBFF``
+(color RAM, low nibbles on real hardware), and ``$E000-$FFFF`` — not
+the full 64 KB.
+
 REU layer (Phase B)
 -------------------
 
@@ -43,12 +67,12 @@ Design notes
   This is simpler and more uniform than parsing a VICE-emitted ``.vsf``
   on the VICE side.
 
-* :func:`restore_snapshot` writes RAM and CPU port back through
-  ``write_memory``.  Because the natural path of 64 KB writes will
-  collide with most :class:`~c64_test_harness.MemoryPolicy` reserved
-  regions, a single WARNING is logged at the start of the restore and
-  each underlying ``write_memory`` call carries
-  ``override="snapshot-restore"``.
+* :func:`restore_snapshot` writes RAM (minus the I/O window, see above)
+  and CPU port back through ``write_memory``.  Because the natural path
+  of near-64 KB writes will collide with most
+  :class:`~c64_test_harness.MemoryPolicy` reserved regions, a single
+  WARNING is logged at the start of the restore and each underlying
+  ``write_memory`` call carries ``override="snapshot-restore"``.
 
 * :meth:`Snapshot.to_vsf` emits a complete VICE ``.vsf`` by taking a
   bundled reference template (captured from VICE 3.10 at the BASIC READY
@@ -169,6 +193,19 @@ _REC_CMD_C64_TO_REU = 0x90  # reserved: restore goes via SocketDMA REUWRITE
 _REU_STAGING_OVERRIDE = "reu-snapshot-staging"
 
 # ---------------------------------------------------------------------------
+# I/O window constants — see the module docstring's "I/O window" section
+# ---------------------------------------------------------------------------
+
+#: Live I/O register window skipped by restore (end exclusive).
+_IO_WINDOW_START = 0xD000
+_IO_WINDOW_END = 0xE000
+
+#: Color RAM inside the I/O window (end exclusive) — real RAM through the
+#: CPU view, side-effect-free to write, so restore keeps it.
+_COLOR_RAM_START = 0xD800
+_COLOR_RAM_END = 0xDC00
+
+# ---------------------------------------------------------------------------
 # Sidecar bundle file names
 # ---------------------------------------------------------------------------
 
@@ -206,8 +243,13 @@ class Snapshot:
     Attributes
     ----------
     ram:
-        Exactly 65536 bytes of system RAM ($0000-$FFFF as seen with all
-        banks disabled).
+        Exactly 65536 bytes covering $0000-$FFFF as seen through the
+        CPU view at capture time.  For ``$D000-$DFFF`` this means
+        *I/O-view* bytes (live VIC-II/SID/CIA/REC register reads plus
+        color RAM), NOT the RAM under I/O — neither backend banks out
+        I/O for host reads.  ``restore_snapshot`` therefore skips that
+        window except color RAM ``$D800-$DBFF`` (see the module
+        docstring).
     cpu_port_data:
         CPU port data register ($01), one byte.
     cpu_port_dir:
@@ -434,7 +476,11 @@ def extract_snapshot(
 
     Reads ``$0000-$FFFF`` and the two CPU port registers and packages
     them into a :class:`Snapshot`.  The backend's chunking handles any
-    transport-level size limits.
+    transport-level size limits.  The read goes through the CPU view,
+    so the ``$D000-$DFFF`` slice of :attr:`Snapshot.ram` holds I/O-view
+    bytes (register reads + color RAM), not RAM under I/O — see the
+    module docstring; ``restore_snapshot`` skips that window apart from
+    color RAM.
 
     With ``include_reu=True`` the REU contents are additionally captured
     via the 32 KB staging window (see :func:`extract_reu_contents` —
@@ -477,7 +523,18 @@ def restore_snapshot(
 ) -> None:
     """Write RAM and CPU port back through the transport.
 
-    The 64 KB of writes will collide with most ``MemoryPolicy`` reserved
+    The RAM image is restored in three slices — ``$0000-$CFFF``, color
+    RAM ``$D800-$DBFF``, and ``$E000-$FFFF``.  The rest of the I/O
+    window ``$D000-$D7FF`` / ``$DC00-$DFFF`` is **skipped**: host
+    writes land in live VIC/SID/CIA/REC registers (neither backend
+    banks out I/O), and in particular a byte with bit7|bit4 set written
+    to the REC command register ``$DF01`` would fire an immediate REU
+    DMA with stale address/length registers, clobbering just-restored
+    RAM.  Register-layer restore is a later phase (module docstring).
+    Color RAM is kept because through the CPU view it *is* the real
+    color RAM and its writes are side-effect-free.
+
+    The writes will collide with most ``MemoryPolicy`` reserved
     regions; by default each underlying ``write_memory`` carries
     ``override="snapshot-restore"`` so the restore proceeds, and a
     single WARNING is logged at the start so the bulk override stays
@@ -510,8 +567,21 @@ def restore_snapshot(
                 n,
             )
 
-    # Write the 64 KB image in one call — backend chunks as needed.
-    transport.write_memory(0x0000, snap.ram, override=override)
+    # Write the RAM image around the live I/O window (backend chunks as
+    # needed).  $D000-$DFFF is never written wholesale: only color RAM
+    # ($D800-$DBFF, real RAM through the CPU view, side-effect-free) is
+    # restored — see the docstring above and the module docstring.
+    transport.write_memory(
+        0x0000, snap.ram[:_IO_WINDOW_START], override=override
+    )
+    transport.write_memory(
+        _COLOR_RAM_START,
+        snap.ram[_COLOR_RAM_START:_COLOR_RAM_END],
+        override=override,
+    )
+    transport.write_memory(
+        _IO_WINDOW_END, snap.ram[_IO_WINDOW_END:], override=override
+    )
     # Then force the CPU port data/direction to the snapshot values.
     # (Already covered by the RAM write above, but explicit is safer in
     # case the backend treats those addresses specially.)
