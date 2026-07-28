@@ -12,6 +12,7 @@ arrays should be treated as a soft failure by the caller.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import socket
@@ -54,7 +55,9 @@ class Ultimate64AuthError(Ultimate64Error):
 
 
 class Ultimate64TimeoutError(Ultimate64Error):
-    """Raised when the HTTP request times out or the device is unreachable."""
+    """Raised when the HTTP request times out, the device is unreachable,
+    or the connection drops mid-request (reset / broken pipe / truncated
+    HTTP response)."""
 
 
 class Ultimate64ProtocolError(Ultimate64Error):
@@ -265,6 +268,15 @@ class Ultimate64Client:
             return status, data  # unreachable
         except socket.timeout as e:
             raise Ultimate64TimeoutError(f"timeout after {self.timeout}s: {method} {url}") from e
+        except (ConnectionResetError, BrokenPipeError, http.client.HTTPException) as e:
+            # urllib only wraps the *send* phase in URLError; failures during
+            # getresponse()/read() escape raw (fw 3.14d drops connections
+            # mid-response under load — see ultimate64_probe.py).  Map them
+            # into the client's exception hierarchy so callers can catch
+            # Ultimate64Error uniformly.
+            raise Ultimate64TimeoutError(
+                f"connection dropped: {method} {url}: {type(e).__name__}: {e}"
+            ) from e
         except urllib.error.URLError as e:
             reason = getattr(e, "reason", e)
             if isinstance(reason, socket.timeout):

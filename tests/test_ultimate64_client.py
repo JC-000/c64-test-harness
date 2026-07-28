@@ -1,6 +1,7 @@
 """Unit tests for Ultimate64Client (mocks urllib.request.urlopen)."""
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import socket
@@ -213,6 +214,32 @@ def test_urlerror_raises_timeout_error():
     with patch("urllib.request.urlopen", side_effect=_raise):
         with pytest.raises(Ultimate64TimeoutError):
             c.get_info()
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ConnectionResetError(104, "Connection reset by peer"),
+        BrokenPipeError(32, "Broken pipe"),
+        http.client.RemoteDisconnected("Remote end closed connection without response"),
+        http.client.IncompleteRead(b"\x01\x02", expected=6),
+    ],
+    ids=["connection-reset", "broken-pipe", "remote-disconnected", "incomplete-read"],
+)
+def test_connection_drop_maps_to_ultimate64_error(exc):
+    """urllib only wraps the send phase in URLError; getresponse()/read()
+    failures escape raw on fw 3.14d. They must land in the client's own
+    exception hierarchy, not leak OSError/HTTPException to callers."""
+    def _raise(req, timeout=None):
+        raise exc
+
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", side_effect=_raise):
+        with pytest.raises(Ultimate64TimeoutError) as ei:
+            c.get_info()
+    assert isinstance(ei.value, Ultimate64Error)
+    assert "connection dropped" in str(ei.value)
+    assert ei.value.__cause__ is exc
 
 
 def test_bad_json_raises_protocol_error():
