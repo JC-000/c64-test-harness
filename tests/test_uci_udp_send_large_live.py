@@ -25,7 +25,7 @@ A 1-byte cap regression in :func:`uci_socket_write` would cause:
 
 Usage::
 
-    UCI_UDP_LIVE=1 \\
+    UCI_UDP_LIVE=1 U64_HOST=192.168.1.81 \\
     ~/.local/share/c64-test-harness/venv/bin/pytest \\
         tests/test_uci_udp_send_large_live.py -xvs
 """
@@ -39,10 +39,17 @@ import time
 import pytest
 
 UCI_UDP_LIVE = os.environ.get("UCI_UDP_LIVE")
-pytestmark = pytest.mark.skipif(
-    not UCI_UDP_LIVE,
-    reason="UCI_UDP_LIVE not set — live UCI UDP large-payload test disabled",
-)
+U64_HOST = os.environ.get("U64_HOST")
+pytestmark = [
+    pytest.mark.skipif(
+        not UCI_UDP_LIVE,
+        reason="UCI_UDP_LIVE not set — live UCI UDP large-payload test disabled",
+    ),
+    pytest.mark.skipif(
+        not U64_HOST,
+        reason="U64_HOST not set — live Ultimate 64 tests disabled",
+    ),
+]
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from c64_test_harness.backends.device_lock import DeviceLock  # noqa: E402
@@ -62,7 +69,6 @@ from c64_test_harness.uci_network import (  # noqa: E402
 # ---------------------------------------------------------------------------
 # Test parameters
 # ---------------------------------------------------------------------------
-U64_HOST = "10.43.23.81"
 LOCK_TIMEOUT = 600.0     # generous: another holder may hold the device for hours
 UCI_CALL_TIMEOUT = 20.0  # large WRITE_SOCKETs take longer on real HW
 RECV_TIMEOUT = 5.0
