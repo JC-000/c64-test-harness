@@ -364,9 +364,17 @@ class Ultimate64Transport(HardwareTransportBase):
         """Inject PETSCII codes into the KERNAL keyboard buffer at $0277.
 
         The C64 keyboard buffer is 10 bytes at $0277 with the pending-count
-        byte at $00C6.  Each chunk writes up to ``(keybuf_max - current_count)``
-        bytes, updates the count, and polls for the buffer to drain before
-        writing the next chunk.
+        byte at $00C6.  Each chunk waits for the buffer to fully drain
+        (``$C6 == 0``), then writes up to ``keybuf_max`` codes at offset 0
+        and sets the count.
+
+        Topping up a *partially* drained buffer is a race: the KERNAL
+        shifts the remaining buffer bytes down and decrements ``$C6``
+        concurrently with our DMA writes, so a write placed at
+        ``buf + count`` can land at a stale offset (dropping or
+        duplicating keys).  Waiting for a fully drained buffer and always
+        writing at offset 0 makes the write placement race-free (the same
+        convention :meth:`Ultimate64Client.send_text` uses).
 
         Because U64 memory I/O is DMA-backed, no CPU pause is needed.
         """
@@ -374,8 +382,10 @@ class Ultimate64Transport(HardwareTransportBase):
             return
 
         remaining = list(petscii_codes)
-        # Safety bound: single iterations are bounded by keybuf_max.
-        max_iters = len(remaining) * 4 + 16
+        # Safety bound: covers the drain polls between chunks (a full
+        # 10-key buffer drains in ~166 ms at the KERNAL's ~60 Hz scan;
+        # each poll below sleeps 20 ms when the buffer is non-empty).
+        max_iters = len(remaining) * 4 + 100
         iters = 0
         while remaining:
             iters += 1
@@ -387,22 +397,23 @@ class Ultimate64Transport(HardwareTransportBase):
 
             count_byte = self.read_memory(self._keybuf_count_addr, 1)
             current = count_byte[0] if count_byte else 0
-            free = self._keybuf_max - current
-            if free <= 0:
-                # Buffer full — wait for KERNAL to consume keys.
+            if current != 0:
+                # KERNAL is still consuming keys — writing now would race
+                # its shift-down of the buffer.  Wait for a full drain.
+                time.sleep(0.02)
                 continue
 
-            chunk = remaining[:free]
-            remaining = remaining[free:]
+            chunk = remaining[:self._keybuf_max]
+            remaining = remaining[len(chunk):]
 
-            # Write into the buffer at (buf_addr + current), then update count.
+            # Buffer is empty — write at offset 0, then set the count.
             self.write_memory(
-                self._keybuf_addr + current,
+                self._keybuf_addr,
                 bytes(chunk),
             )
             self.write_memory(
                 self._keybuf_count_addr,
-                bytes([current + len(chunk)]),
+                bytes([len(chunk)]),
             )
 
     def inject_joystick(self, port: int, value: int) -> None:

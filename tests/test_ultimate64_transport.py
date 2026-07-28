@@ -107,16 +107,24 @@ def test_inject_keys_simple(transport: Ultimate64Transport, mock_client: MagicMo
     assert calls[1].args == (0x00C6, bytes([3]))
 
 
-def test_inject_keys_respects_existing_count(
+def test_inject_keys_waits_for_full_drain_before_writing(
     transport: Ultimate64Transport, mock_client: MagicMock
 ) -> None:
-    # Existing count is 4 — only 6 bytes of free space.
-    mock_client.read_mem.return_value = b"\x04"
+    """A partially-filled buffer is never topped up at an offset.
+
+    The KERNAL shifts the buffer down and decrements $C6 concurrently
+    with our DMA writes, so writing at (buf + count) races it.  The
+    transport must wait for $C6 == 0 and always write at offset 0.
+    """
+    # Existing count is 4 on the first poll, drained on the second.
+    mock_client.read_mem.side_effect = [b"\x04", b"\x00"]
     transport.inject_keys([0x11, 0x22, 0x33])
-    # Writes at (0x0277 + 4), then count becomes 4 + 3 = 7.
     calls = mock_client.write_mem.call_args_list
-    assert calls[0].args == (0x0277 + 4, b"\x11\x22\x33")
-    assert calls[1].args == (0x00C6, bytes([7]))
+    # No write happened while $C6 was non-zero; the buffer write starts
+    # at offset 0 and the count is exactly the chunk length.
+    assert calls[0].args == (0x0277, b"\x11\x22\x33")
+    assert calls[1].args == (0x00C6, bytes([3]))
+    assert mock_client.read_mem.call_count == 2
 
 
 def test_inject_keys_chunks_when_over_max(
