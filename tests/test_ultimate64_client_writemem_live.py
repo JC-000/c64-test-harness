@@ -32,11 +32,18 @@ from c64_test_harness.backends.ultimate64_client import Ultimate64Client
 
 _HOST = os.environ.get("U64_HOST")
 _PW = os.environ.get("U64_PASSWORD")
+_ALLOW_MUTATE = os.environ.get("U64_ALLOW_MUTATE")
 
-pytestmark = pytest.mark.skipif(
-    not _HOST,
-    reason="U64_HOST not set — live Ultimate device tests disabled",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not _HOST,
+        reason="U64_HOST not set — live Ultimate device tests disabled",
+    ),
+    pytest.mark.skipif(
+        not _ALLOW_MUTATE,
+        reason="U64_ALLOW_MUTATE not set — suite writes to machine RAM",
+    ),
+]
 
 # Inside the documented harness scratch range ($C000-$C3FF). Picked to
 # stay clear of $C000-$C0FF where some harness machinery lives.
