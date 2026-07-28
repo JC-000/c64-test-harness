@@ -54,7 +54,9 @@ def client():
     """Acquire device lock and return client for the module."""
     host = os.environ.get("U64_HOST")
     pw = os.environ.get("U64_PASSWORD")
-    lock = DeviceLock(host)
+    # allow_nested: the autouse device_lock_guard fixture already holds
+    # this device's lock for the test (issue #136).
+    lock = DeviceLock(host, allow_nested=True)
     if not lock.acquire(timeout=120.0):
         pytest.skip(f"Could not acquire device lock for {host}")
     c = Ultimate64Client(host=host, password=pw, timeout=8.0)

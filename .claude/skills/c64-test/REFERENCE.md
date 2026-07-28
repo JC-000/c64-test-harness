@@ -731,7 +731,7 @@ if lock.acquire(timeout=30.0):
         lock.release()
 ```
 
-- `__init__(device_host, lock_dir=None, *, heartbeat_interval=15.0)` -- `heartbeat_interval` is the cadence (seconds) at which a daemon thread bumps the lockfile mtime while held, so queue-aware waiters see this holder as "progressing". `None`/`0`/negative disables the heartbeat (rarely useful outside unit tests that need deterministic mtime control).
+- `__init__(device_host, lock_dir=None, *, heartbeat_interval=15.0, allow_nested=False)` -- `heartbeat_interval` is the cadence (seconds) at which a daemon thread bumps the lockfile mtime while held, so queue-aware waiters see this holder as "progressing". `None`/`0`/negative disables the heartbeat (rarely useful outside unit tests that need deterministic mtime control).
 - `acquire(timeout=30.0, *, progress_window=60.0) -> bool` -- Blocking acquire (polls with LOCK_NB every 0.1s). Writes JSON metadata (PID, timestamp, device_host). Verifies inode after flock. Starts the heartbeat thread on success.
   - **Queue-aware semantics (default).** `timeout` bounds time spent waiting on **wedged or dead** holders only. A live holder whose lockfile mtime is within `progress_window` seconds is "progressing"; the waiter's deadline is reset on every poll iteration. With the heartbeat, healthy holders stay "progressing" indefinitely. Pass `progress_window=None` for legacy hard-timeout behavior.
   - **Optional `watchdog` wakeup.** When the optional `c64-test-harness[notify]` extra is installed (`watchdog>=3.0`), queued acquirers wake on lockfile fs-events instead of waiting the full poll interval. The release path emits a cooperative `os.utime(lockfile)` so other waiters wake immediately. The 100 ms polling backstop is preserved for kernel-released flocks (`kill -9` holders where `release()` never ran and no fs-event fires).
@@ -741,6 +741,9 @@ if lock.acquire(timeout=30.0):
 - `queue_depth -> int | None` -- Property, lazily computed. Number of **live** waiters currently blocked in `acquire()` for this device (holder not counted). `0` = empty queue; `None` = unobservable (sidecar path unreadable). Read-only: never touches the flock.
 - `peek_queue_depth(device_host, lock_dir=None) -> int | None` -- Class method; same semantics as `queue_depth` but needs no instance and no lock — the pre-flight "should I even try to queue?" check for CI bots. Mechanism: each waiter registers an intent file in a `<lockfile>.queue/` sidecar directory before blocking (removed on exit from `acquire()`); dead-PID entries are excluded and garbage-collected, so crashed waiters don't inflate the count.
 - `cleanup_stale(lock_dir=None) -> int` -- Class method; removes lockfiles from dead PIDs.
+- `held_by_this_process(device_host, lock_dir=None) -> bool` -- Class method; whether *this OS process* holds the device lock (dict lookup — no filesystem, no network). Backs the advisory check below.
+- `foreign_holder(device_host, lock_dir=None) -> dict | None` -- Class method; metadata for **another live process** holding the device, else `None`. Liveness comes from a non-blocking shared `flock` probe, not the lockfile contents, so the leftover lockfile `release()` keeps is correctly reported as "not held".
+- `allow_nested=True` (constructor) -- acquire joins an existing hold by this same process (refcounted) instead of blocking on the flock. For re-entering the library while already holding the lock — a pytest fixture holding it while the test calls `create_manager()`. Default `False` keeps two in-process `DeviceLock` instances contending exactly as two processes do. Two worker threads sharing a device are concurrent users, not nested ones: don't use it there.
 - `.device_host` / `.held` properties
 - Context manager support
 
@@ -761,6 +764,22 @@ Fields:
 `str(e)` produces one of four stable diagnosed-state phrases — "queued behind live, progressing PID X" / "holder PID X is alive but the lockfile hasn't been touched in Ns; holder may be wedged" / "stale lock from dead PID X; will be cleaned on next acquire — retry" / "no holder metadata found" — suffixed with "; device REST API responsive" or "; device REST API unreachable". See PATTERNS § "Pattern 9a: Queueing for the U64" for the worked example, branch table, and anti-patterns.
 
 **When to use:** `UnifiedManager` uses `DeviceLock` automatically for U64 backends. Use directly only when creating `Ultimate64Transport` outside of `UnifiedManager` (e.g., in pytest fixtures for live tests).
+
+### `advisory_lock_check(device_host, operation, *, lock_dir=None, logger=None)`
+Advisory enforcement of the shared-device contract (issue #136). Called by `Ultimate64Client` before every non-GET request and by `SocketDMAClient` before every destructive opcode; call it directly only when adding a new transport that mutates a device.
+
+- This process holds the lock → silent.
+- Nobody holds it → `DEBUG` line. **Single-user flows never see a warning.**
+- Another live process holds it → `WARNING` naming the holder PID, once per holder (not once per request).
+- `U64_REQUIRE_DEVICE_LOCK=1` → raises `DeviceLockContentionError` instead, before the request goes out.
+
+Filesystem-only (one `open` + one non-blocking `flock` + one small read), never networked, and swallows its own errors — an advisory check must never be why a device call fails.
+
+### `DeviceLockContentionError(RuntimeError)`
+Raised by `advisory_lock_check` under `U64_REQUIRE_DEVICE_LOCK=1`. Fields: `.device_host`, `.holder_pid`. Deliberately **not** an `Ultimate64Error` subclass — a caller that blanket-catches device errors to retry must not swallow it, because the fix is to acquire the lock, not to retry.
+
+### Live-test fixture: `device_lock_guard`
+Autouse fixture in `tests/conftest.py`. Holds the device lock around every `*_live.py` test for the host it resolves (module `_HOST`/`HOST`/`U64_HOST` attribute, else the `U64_HOST` env var), logging acquire and release to `c64_test_harness.tests.device_lock`. Non-live tests return immediately. `U64_DEVICE_LOCK_TIMEOUT` overrides the 300 s queue timeout. New live tests need no locking code of their own; a live test that still acquires its own `DeviceLock` must pass `allow_nested=True`.
 
 ---
 

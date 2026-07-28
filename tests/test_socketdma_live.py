@@ -105,7 +105,9 @@ def client() -> Ultimate64Client:
     becomes a clean skip (never a reboot/recover).
     """
     assert _HOST is not None
-    lock = DeviceLock(_HOST)
+    # allow_nested: the autouse device_lock_guard fixture already holds
+    # this device's lock for the test (issue #136).
+    lock = DeviceLock(_HOST, allow_nested=True)
     try:
         lock.acquire_or_raise(timeout=120.0, progress_window=60.0)
     except DeviceLockTimeout as exc:

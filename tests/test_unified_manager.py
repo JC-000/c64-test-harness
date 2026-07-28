@@ -316,7 +316,9 @@ class TestLockedU64Manager:
 
         assert result is inst
         inner.acquire.assert_called_once()
-        MockDeviceLock.assert_called_once_with("10.0.0.1")
+        # allow_nested: a caller that already holds the device lock joins
+        # its own hold instead of queueing behind itself (issue #136).
+        MockDeviceLock.assert_called_once_with("10.0.0.1", allow_nested=True)
         mock_lock.acquire_or_raise.assert_called_once_with(timeout=60.0)
 
     @patch("c64_test_harness.backends.unified_manager.DeviceLock")
@@ -376,7 +378,7 @@ class TestLockedU64Manager:
     def test_shutdown_releases_all_locks(self, MockDeviceLock: MagicMock) -> None:
         """shutdown() releases every held lock and delegates to inner."""
         locks = []
-        def make_lock(host):
+        def make_lock(host, **kwargs):
             lock = MagicMock()
             lock.acquire.return_value = True
             lock.held = True
@@ -404,7 +406,7 @@ class TestLockedU64Manager:
     ) -> None:
         """Each device gets its own DeviceLock keyed by host."""
         created_locks: dict[str, MagicMock] = {}
-        def make_lock(host):
+        def make_lock(host, **kwargs):
             lock = MagicMock()
             lock.acquire.return_value = True
             lock.held = True

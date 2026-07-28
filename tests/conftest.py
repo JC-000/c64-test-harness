@@ -2,15 +2,112 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import shutil
 import time
 
 import pytest
 
+from c64_test_harness.backends.device_lock import DeviceLock
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 from c64_test_harness.backends.vice_manager import PortAllocator
 from c64_test_harness.screen import wait_for_text
+
+# ---------------------------------------------------------------------------
+# Device-lock adoption for live tests (issue #136)
+# ---------------------------------------------------------------------------
+
+_device_lock_log = logging.getLogger("c64_test_harness.tests.device_lock")
+
+#: Module attributes a live test may use to name its device, checked
+#: before falling back to ``U64_HOST``.
+_HOST_ATTRS = ("_HOST", "HOST", "U64_HOST", "_U64_HOST")
+
+#: Default seconds to queue for a busy device before giving up.  Long by
+#: design: the point is to wait for the other job, not to barge in.
+_DEFAULT_LOCK_TIMEOUT = 300.0
+
+
+def is_live_test_file(path: str) -> bool:
+    """Whether *path* is one of the opt-in live test modules.
+
+    The suite's convention is a ``_live.py`` suffix; there are no pytest
+    markers to key off.
+    """
+    return os.path.basename(str(path)).endswith("_live.py")
+
+
+def live_device_host(module: object = None) -> str | None:
+    """Resolve the device a live test module drives, or ``None``.
+
+    Prefers a host the module has already resolved (``_HOST`` and
+    friends — the shape every U64 live test in this repo uses) and falls
+    back to ``U64_HOST``.  A comma- or space-separated list yields its
+    first entry, matching ``UnifiedManager._parse_u64_hosts``.
+    """
+    for attr in _HOST_ATTRS:
+        value = getattr(module, attr, None)
+        if isinstance(value, str) and value.strip():
+            return _first_host(value)
+    env = os.environ.get("U64_HOST", "")
+    return _first_host(env) if env.strip() else None
+
+
+def _first_host(raw: str) -> str | None:
+    for chunk in raw.replace(",", " ").split():
+        if chunk:
+            return chunk
+    return None
+
+
+def _lock_timeout() -> float:
+    raw = os.environ.get("U64_DEVICE_LOCK_TIMEOUT", "").strip()
+    try:
+        return float(raw) if raw else _DEFAULT_LOCK_TIMEOUT
+    except ValueError:
+        return _DEFAULT_LOCK_TIMEOUT
+
+
+@pytest.fixture(autouse=True)
+def device_lock_guard(request):
+    """Hold the machine-global :class:`DeviceLock` around every live test.
+
+    Adoption by construction (issue #136): a live test no longer has to
+    remember to lock, and a run of this suite can no longer reboot a
+    device out from under another job's measurement.  Unit tests — the
+    overwhelming majority — return before touching anything.
+
+    ``allow_nested=True`` so the test body can still go through
+    ``create_manager`` (or acquire its own ``DeviceLock``) without
+    queueing behind the lock this fixture already holds.
+
+    Scope note: a live test that drives only VICE will also take the
+    device lock when ``U64_HOST`` is set.  That is deliberately
+    conservative — over-serialising a rarely-run bridge test is cheaper
+    than reasoning about which live tests reach the wire.
+    """
+    node_path = getattr(request.node, "path", None) or request.node.fspath
+    if not is_live_test_file(node_path):
+        yield None
+        return
+    host = live_device_host(getattr(request, "module", None))
+    if host is None:
+        yield None
+        return
+
+    lock = DeviceLock(host, allow_nested=True)
+    _device_lock_log.info(
+        "acquiring device lock for %s (%s)", host, request.node.name
+    )
+    lock.acquire_or_raise(timeout=_lock_timeout())
+    _device_lock_log.info("device lock acquired for %s (pid=%d)", host, os.getpid())
+    try:
+        yield lock
+    finally:
+        lock.release()
+        _device_lock_log.info("device lock released for %s", host)
 
 
 class MockTransport:

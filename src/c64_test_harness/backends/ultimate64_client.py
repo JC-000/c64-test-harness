@@ -24,6 +24,13 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .ultimate64_probe import LivenessResult
 
+try:  # device_lock needs fcntl — absent on Windows, optional everywhere
+    from .device_lock import advisory_lock_check as _advisory_lock_check
+
+    _HAS_DEVICE_LOCK = True
+except Exception:  # pragma: no cover - exercised only without fcntl
+    _HAS_DEVICE_LOCK = False
+
 __all__ = [
     "Ultimate64Client",
     "Ultimate64Error",
@@ -239,6 +246,8 @@ class Ultimate64Client:
         content_type: str | None = None,
         query: dict[str, Any] | None = None,
     ) -> tuple[int, bytes]:
+        if method != "GET":
+            self._check_device_lock(f"{method} {path}")
         url = self._url(path)
         if query:
             # Preserve caller-formatted values (e.g. "0x0400") by stringifying as-is
@@ -275,6 +284,24 @@ class Ultimate64Client:
         if status < 200 or status >= 300:
             self._raise_for_status(status, data, method, url)
         return status, data
+
+    def _check_device_lock(self, operation: str) -> None:
+        """Advisory device-lock check for a state-changing request.
+
+        Every non-GET request against the device mutates it: the
+        ``/v1/machine:*`` family (reset, reboot, pause, poweroff), the
+        runners (``run_prg``, ``run_crt``, sidplay), ``writemem``,
+        drive mounts, and every config PUT/POST — which is how CPU turbo
+        and REU settings are changed.  Enumerating them individually
+        would rot; the HTTP method is the invariant.
+
+        See :func:`~c64_test_harness.backends.device_lock.advisory_lock_check`
+        for the warn/raise policy.  No-op when ``device_lock`` is
+        unavailable.
+        """
+        if not _HAS_DEVICE_LOCK:
+            return
+        _advisory_lock_check(self.host, operation, logger=_log)
 
     @staticmethod
     def _raise_for_status(status: int, data: bytes, method: str, url: str) -> None:
