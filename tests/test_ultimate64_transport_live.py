@@ -261,6 +261,9 @@ class TestResetScopes:
             transport.reset()
             time.sleep(1.0)
             assert is_u64_reachable(_HOST, password=_PW)
+            # Same boot-settle as test_reset_scope_cpu_keeps_device_responsive:
+            # don't hand a mid-boot machine to whatever runs next.
+            time.sleep(3.0)
         finally:
             transport.set_speed(1)
 

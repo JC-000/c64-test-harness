@@ -172,6 +172,12 @@ def test_transport_fast_path_16k(client: Ultimate64Client) -> None:  # noqa: ARG
     transport = Ultimate64Transport(host=_HOST or "", password=_PW, timeout=30.0)
     transport.socket_dma = True
     try:
+        # Pause the 6510 for the write+read-back window: this test measures
+        # DMA byte-exactness and speed, not C64-concurrency semantics, and
+        # a live CPU can legitimately rewrite $4000+ (e.g. the post-reset
+        # boot RAM walk clobbered this test when a reset-scope test ran
+        # a few seconds earlier — observed live on U64E fw 3.14).
+        transport.client.pause()
         start = time.monotonic()
         transport.write_memory(addr, pattern)
         elapsed = time.monotonic() - start
@@ -187,6 +193,10 @@ def test_transport_fast_path_16k(client: Ultimate64Client) -> None:  # noqa: ARG
             f"likely did not engage and it fell back to REST"
         )
     finally:
+        try:
+            transport.client.resume()
+        except Exception:
+            pass
         transport.close()
 
 
