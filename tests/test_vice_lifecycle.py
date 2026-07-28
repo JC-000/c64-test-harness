@@ -4,6 +4,7 @@ Pure unit tests — no real x64sc spawn; ``subprocess.Popen`` is patched.
 """
 from __future__ import annotations
 
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -175,3 +176,101 @@ def test_autostart_extra_args_override_wins_on_darwin(mock_popen):
     occurrences = [k for k, a in enumerate(args) if a == "-autostartprgmode"]
     assert len(occurrences) == 1
     assert args[occurrences[0] + 1] == "0"
+
+
+# ---------- stop() must reap after kill() (no zombies) ----------
+
+class TestStopReapsProcess:
+    def test_stop_waits_after_kill_when_terminate_raises(self):
+        """Non-sudo path: kill() must be followed by wait() so the dead
+        process is reaped (BSD ps keeps comm names on zombies)."""
+        proc = ViceProcess(ViceConfig())
+        mock_proc = MagicMock()
+        mock_proc.terminate.side_effect = OSError("cannot signal")
+        proc._proc = mock_proc
+        proc.stop()
+        mock_proc.kill.assert_called_once()
+        mock_proc.wait.assert_called_once_with(timeout=3)
+        assert proc._proc is None
+
+    def test_stop_waits_after_kill_on_terminate_timeout(self):
+        """Non-sudo path: SIGTERM times out -> SIGKILL -> wait() reaps."""
+        proc = ViceProcess(ViceConfig())
+        mock_proc = MagicMock()
+        mock_proc.wait.side_effect = [
+            subprocess.TimeoutExpired("x64sc", 5),
+            0,
+        ]
+        proc._proc = mock_proc
+        proc.stop()
+        mock_proc.kill.assert_called_once()
+        assert mock_proc.wait.call_count == 2
+        # The wait after kill() must reap, i.e. come after kill().
+        kill_index = [c[0] for c in mock_proc.method_calls].index("kill")
+        last_wait_index = max(
+            i for i, c in enumerate(mock_proc.method_calls) if c[0] == "wait"
+        )
+        assert last_wait_index > kill_index
+        assert proc._proc is None
+
+    @patch("subprocess.run")
+    def test_sudo_stop_waits_after_last_resort_kill(self, mock_run):
+        """Sudo path: after the last-resort kill() of the sudo wrapper,
+        wait() must reap it before the handle is dropped."""
+        proc = ViceProcess(ViceConfig())
+        proc._is_sudo_child = True
+        mock_proc = MagicMock()
+        mock_proc.pid = 4321
+        mock_proc.wait.side_effect = [
+            subprocess.TimeoutExpired("sudo", 5),
+            subprocess.TimeoutExpired("sudo", 3),
+            0,
+        ]
+        proc._proc = mock_proc
+        # ps output with no matching x64sc child -> skip `sudo -n kill`
+        mock_run.return_value = MagicMock(stdout="")
+        proc.stop()
+        mock_proc.kill.assert_called_once()
+        assert mock_proc.wait.call_count == 3
+        assert proc._proc is None
+
+
+# ---------- sudo child PID resolution helpers ----------
+
+class TestResolveVicePid:
+    def test_non_sudo_resolves_to_popen_pid(self):
+        proc = ViceProcess(ViceConfig())
+        mock_proc = MagicMock()
+        mock_proc.pid = 777
+        proc._proc = mock_proc
+        assert proc.is_sudo_child is False
+        assert proc.resolve_vice_pid() == 777
+        proc._proc = None
+
+    @patch("subprocess.run")
+    def test_sudo_resolves_x64sc_child(self, mock_run):
+        proc = ViceProcess(ViceConfig())
+        proc._is_sudo_child = True
+        mock_proc = MagicMock()
+        mock_proc.pid = 500
+        proc._proc = mock_proc
+        mock_run.return_value = MagicMock(
+            stdout=(
+                "  501   500 /usr/local/bin/x64sc\n"
+                "  600     1 bash\n"
+            )
+        )
+        assert proc.is_sudo_child is True
+        assert proc.resolve_vice_pid() == 501
+        proc._proc = None
+
+    @patch("subprocess.run")
+    def test_sudo_resolve_returns_none_when_no_child(self, mock_run):
+        proc = ViceProcess(ViceConfig())
+        proc._is_sudo_child = True
+        mock_proc = MagicMock()
+        mock_proc.pid = 500
+        proc._proc = mock_proc
+        mock_run.return_value = MagicMock(stdout="  600     1 bash\n")
+        assert proc.resolve_vice_pid() is None
+        proc._proc = None
