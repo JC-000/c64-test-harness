@@ -218,70 +218,88 @@ def _resource_int_resp(value: int) -> _Response:
 
 
 class TestWarp:
-    """Tests for set_warp / get_warp via the binary monitor resource API.
+    """Tests for the hybrid set_warp / get_warp.
 
     Warp control must NOT require the text monitor — text_monitor_port
-    is 0 on every default construction path, so these run against a
-    transport with no text monitor connection at all.
+    is 0 on every default construction path. VICE 3.10 has no warp
+    control on the binary monitor (no ``WarpMode`` resource; ``Speed``
+    rejects 0), so the fallback drives the ``Speed`` resource with a
+    pseudo-warp percentage. When a text monitor IS connected, the real
+    ``warp on``/``warp off`` toggle is used instead.
     """
 
-    def test_set_warp_on(self) -> None:
-        """set_warp(True) sends resource_set('WarpMode', 1) over the wire."""
+    def test_set_warp_on_uses_speed_resource(self) -> None:
+        """Without a text monitor, set_warp(True) sets Speed to pseudo-warp."""
         t = _make_transport(text_monitor=False)
         resp = _Response(CMD_RESOURCE_SET, 0x00, 0, b"")
         with patch.object(t, "_send_and_recv", return_value=resp) as mock_send:
             t.set_warp(True)
         assert mock_send.call_args[0][0] == CMD_RESOURCE_SET
-        name_bytes = b"WarpMode"
+        name_bytes = b"Speed"
         expected = (
             bytes([0x01, len(name_bytes)])
             + name_bytes
             + bytes([4])
-            + struct.pack("<i", 1)
+            + struct.pack("<i", BinaryViceTransport._WARP_SPEED_PERCENT)
         )
         assert mock_send.call_args[0][1] == expected
 
-    def test_set_warp_off(self) -> None:
-        """set_warp(False) sends resource_set('WarpMode', 0) over the wire."""
+    def test_set_warp_off_restores_native_speed(self) -> None:
+        """Without a text monitor, set_warp(False) sets Speed back to 100."""
         t = _make_transport(text_monitor=False)
         resp = _Response(CMD_RESOURCE_SET, 0x00, 0, b"")
         with patch.object(t, "_send_and_recv", return_value=resp) as mock_send:
             t.set_warp(False)
         assert mock_send.call_args[0][0] == CMD_RESOURCE_SET
-        name_bytes = b"WarpMode"
+        name_bytes = b"Speed"
         expected = (
             bytes([0x01, len(name_bytes)])
             + name_bytes
             + bytes([4])
-            + struct.pack("<i", 0)
+            + struct.pack("<i", 100)
         )
         assert mock_send.call_args[0][1] == expected
 
     def test_get_warp_true(self) -> None:
-        """get_warp() returns True when the WarpMode resource is 1."""
+        """get_warp() is True when Speed reads the pseudo-warp percentage."""
         t = _make_transport(text_monitor=False)
         with patch.object(
-            t, "_send_and_recv", return_value=_resource_int_resp(1)
+            t,
+            "_send_and_recv",
+            return_value=_resource_int_resp(
+                BinaryViceTransport._WARP_SPEED_PERCENT
+            ),
         ) as mock_send:
             assert t.get_warp() is True
         assert mock_send.call_args[0][0] == CMD_RESOURCE_GET
-        name_bytes = b"WarpMode"
+        name_bytes = b"Speed"
         assert mock_send.call_args[0][1] == bytes([len(name_bytes)]) + name_bytes
 
     def test_get_warp_false(self) -> None:
-        """get_warp() returns False when the WarpMode resource is 0."""
+        """get_warp() is False at native speed."""
         t = _make_transport(text_monitor=False)
-        with patch.object(t, "_send_and_recv", return_value=_resource_int_resp(0)):
+        with patch.object(t, "_send_and_recv", return_value=_resource_int_resp(100)):
             assert t.get_warp() is False
 
-    def test_warp_does_not_touch_text_monitor(self) -> None:
-        """Even with a text monitor connected, warp uses the resource API."""
+    def test_warp_prefers_text_monitor_when_connected(self) -> None:
+        """With a text monitor connected, warp uses VICE's real toggle."""
         t = _make_transport(text_monitor=True)
-        resp = _Response(CMD_RESOURCE_SET, 0x00, 0, b"")
-        with patch.object(t, "_send_and_recv", return_value=resp), \
-             patch.object(t, "_text_command") as mock_cmd:
+        with patch.object(t, "_send_and_recv") as mock_send, \
+             patch.object(t, "_text_command", return_value="") as mock_cmd:
             t.set_warp(True)
-        mock_cmd.assert_not_called()
+        mock_cmd.assert_called_once_with("warp on")
+        mock_send.assert_not_called()
+
+    def test_get_warp_prefers_text_monitor_when_connected(self) -> None:
+        """With a text monitor connected, get_warp reads the real state."""
+        t = _make_transport(text_monitor=True)
+        with patch.object(t, "_send_and_recv") as mock_send, \
+             patch.object(
+                 t, "_text_command", return_value="Warp mode is on"
+             ) as mock_cmd:
+            assert t.get_warp() is True
+        mock_cmd.assert_called_once_with("warp")
+        mock_send.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -680,14 +698,14 @@ class TestProfile:
 # ---------------------------------------------------------------------------
 
 
-def _resource_answering_mock(t, warp_value: int = 0):
+def _resource_answering_mock(t, speed_value: int = 100):
     """Patch t._send_and_recv with a side effect that answers the
     resource commands the way a live binary monitor would: RESOURCE_GET
-    returns the integer *warp_value*, RESOURCE_SET acks with an empty
-    body.  Anything else is a test bug."""
+    returns the integer *speed_value* (the Speed resource), RESOURCE_SET
+    acks with an empty body.  Anything else is a test bug."""
     def answer(cmd_type: int, body: bytes = b"") -> _Response:
         if cmd_type == CMD_RESOURCE_GET:
-            return _resource_int_resp(warp_value)
+            return _resource_int_resp(speed_value)
         if cmd_type == CMD_RESOURCE_SET:
             return _Response(CMD_RESOURCE_SET, 0x00, 0, b"")
         raise AssertionError(f"unexpected command {cmd_type:#x}")
@@ -748,9 +766,11 @@ class TestSpeedProtocol:
 
     def test_get_speed_no_text_monitor_end_to_end(self) -> None:
         t = _make_transport(text_monitor=False)
-        with _resource_answering_mock(t, warp_value=0):
+        with _resource_answering_mock(t, speed_value=100):
             assert t.get_speed() == 1
-        with _resource_answering_mock(t, warp_value=1):
+        with _resource_answering_mock(
+            t, speed_value=BinaryViceTransport._WARP_SPEED_PERCENT
+        ):
             assert t.get_speed() is None
 
 

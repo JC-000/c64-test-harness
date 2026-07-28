@@ -882,17 +882,44 @@ class BinaryViceTransport:
         """Return ``1`` when VICE is at native speed, ``None`` when warp is on."""
         return None if self.get_warp() else 1
 
+    # Pseudo-warp percentage for the binary-monitor fallback: VICE 3.10
+    # exposes no warp control over the binary monitor (there is no
+    # ``WarpMode`` resource, and the ``Speed`` resource rejects the
+    # documented unlimited value ``0``, reverting to 100). An absurdly
+    # large percentage sticks and lifts the frame cap — verified against
+    # x64sc 3.10.
+    _WARP_SPEED_PERCENT = 1_000_000
+    _NATIVE_SPEED_PERCENT = 100
+
     def set_warp(self, enabled: bool) -> None:
         """Enable or disable VICE warp mode at runtime.
 
-        Uses the binary monitor resource API (``WarpMode`` resource), so
-        it works on every construction path — no text monitor required.
+        With a text monitor connected this drives VICE's real warp toggle
+        (``warp on``/``warp off``). Without one — every default
+        construction path — it falls back to the binary monitor's
+        ``Speed`` resource with an effectively-unlimited percentage, so
+        protocol-level ``set_speed`` works on default targets too.
         """
-        self.resource_set("WarpMode", 1 if enabled else 0)
+        if self._text_sock is not None:
+            self._text_command("warp on" if enabled else "warp off")
+            return
+        self.resource_set(
+            "Speed",
+            self._WARP_SPEED_PERCENT if enabled else self._NATIVE_SPEED_PERCENT,
+        )
 
     def get_warp(self) -> bool:
-        """Return whether VICE warp mode is currently enabled."""
-        return bool(self.resource_get("WarpMode"))
+        """Return whether VICE warp mode is currently enabled.
+
+        The text-monitor path reads the real warp state (including warp
+        enabled via the ``-warp`` CLI flag). The binary-monitor fallback
+        reflects the pseudo-warp state this transport set via the
+        ``Speed`` resource; CLI-started warp is not observable there.
+        """
+        if self._text_sock is not None:
+            response = self._text_command("warp")
+            return "is on" in response.lower()
+        return self.resource_get("Speed") >= self._WARP_SPEED_PERCENT
 
     # ----- code-flow / inspection -----
 

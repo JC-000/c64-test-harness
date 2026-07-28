@@ -201,7 +201,9 @@ def _cpu_speed_presets(client: Ultimate64Client) -> tuple[str, ...] | None:
         return cached
     try:
         resp = client.get_config_item(CAT_U64_SPECIFIC, _ITEM_CPU_SPEED)
-    except Ultimate64Error:
+    except (Ultimate64Error, AttributeError, TypeError):
+        # AttributeError/TypeError: minimal client stand-ins (test doubles)
+        # without get_config_item — inconclusive, same as a wire failure.
         return None
     if not isinstance(resp, dict):
         return None
