@@ -50,6 +50,8 @@ class TestTarget:
         VICE OS process PID, or ``None`` for hardware backends.
     """
 
+    __test__ = False  # not a pytest test class, despite the name
+
     transport: C64Transport
     backend: str
     pid: int | None = None

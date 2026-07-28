@@ -15,6 +15,8 @@ from typing import Callable
 class TestStatus(Enum):
     """Outcome of a test scenario."""
 
+    __test__ = False  # not a pytest test class, despite the name
+
     PASS = "PASS"
     FAIL = "FAIL"
     ERROR = "ERROR"
@@ -53,6 +55,8 @@ class TestRunner:
         runner.print_summary()
         sys.exit(runner.exit_code)
     """
+
+    __test__ = False  # not a pytest test class, despite the name
 
     def __init__(self) -> None:
         self._scenarios: list[TestScenario] = []
