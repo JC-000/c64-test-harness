@@ -32,6 +32,12 @@ from typing import Any, Callable
 
 from .backends.vice_manager import ViceInstanceManager
 
+# Default cap on concurrent workers when the caller doesn't pass
+# ``max_workers``.  The default PortAllocator budget is ~20 ports
+# (6511-6531) and an instance may hold two (binary + text monitor), so
+# more than 10 concurrent instances cannot be served anyway.
+_DEFAULT_MAX_WORKERS = 10
+
 
 @dataclass
 class SingleTestResult:
@@ -111,15 +117,19 @@ def run_parallel(
           ``Ultimate64Instance`` from the U64 manager).  Both expose
           ``.transport``.
     max_workers:
-        Maximum concurrent tests. Defaults to ``len(tests)``.
+        Maximum concurrent tests.  Defaults to ``len(tests)`` capped at
+        ``_DEFAULT_MAX_WORKERS`` (the port-allocator budget cannot serve
+        more concurrent instances anyway).
 
     Returns
     -------
     ParallelTestResult
         Aggregated outcomes.
     """
+    if not tests:
+        return ParallelTestResult()
     if max_workers is None:
-        max_workers = len(tests)
+        max_workers = min(len(tests), _DEFAULT_MAX_WORKERS)
 
     # Backwards-compat: legacy VICE callers expect their test functions
     # to receive a ``BinaryViceTransport`` directly.  Anything else gets
@@ -135,11 +145,17 @@ def run_parallel(
         fn: Callable[[Any], tuple[bool, str]],
     ) -> SingleTestResult:
         t0 = time.monotonic()
-        instance = manager.acquire()
-        # ``pid`` is optional on the Protocol; default to None if absent.
-        instance_pid = getattr(instance, "pid", None)
-        arg: Any = instance.transport if unwrap_to_transport else instance
+        instance: Any = None
+        instance_pid: int | None = None
         try:
+            # acquire() and the transport unwrap live INSIDE the try:
+            # a failed acquire must surface as a failed result for THIS
+            # test, not propagate through ``future.result()`` and
+            # discard every other completed result.
+            instance = manager.acquire()
+            # ``pid`` is optional on the Protocol; default to None if absent.
+            instance_pid = getattr(instance, "pid", None)
+            arg: Any = instance.transport if unwrap_to_transport else instance
             passed, message = fn(arg)
             return SingleTestResult(
                 name=name, passed=passed, message=message,
@@ -154,7 +170,8 @@ def run_parallel(
                 pid=instance_pid,
             )
         finally:
-            manager.release(instance)
+            if instance is not None:
+                manager.release(instance)
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {

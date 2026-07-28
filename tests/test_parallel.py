@@ -157,6 +157,90 @@ class TestRunParallel:
         assert result.results[0].pid == 4001
 
 
+class TestRunParallelRobustness:
+    def test_acquire_failure_recorded_as_error_result(self):
+        """One failing acquire() must not discard the other results."""
+        mgr = MagicMock(spec=ViceInstanceManager)
+        acquire_count = [0]
+
+        def fake_acquire():
+            acquire_count[0] += 1
+            if acquire_count[0] == 1:
+                raise RuntimeError("no ports left")
+            inst = MagicMock()
+            inst.transport = MagicMock()
+            inst.pid = 4001
+            return inst
+
+        mgr.acquire = MagicMock(side_effect=fake_acquire)
+        mgr.release = MagicMock()
+        tests = [
+            ("first", lambda t: (True, "ok")),
+            ("second", lambda t: (True, "ok")),
+        ]
+        # max_workers=1 makes acquire order deterministic: "first" hits
+        # the failing acquire.
+        result = run_parallel(mgr, tests, max_workers=1)
+
+        assert len(result.results) == 2
+        by_name = {r.name: r for r in result.results}
+        assert not by_name["first"].passed
+        assert "ERROR" in by_name["first"].message
+        assert "RuntimeError" in by_name["first"].message
+        assert by_name["second"].passed
+        # release() only for the successful acquire — never with a
+        # half-acquired None instance.
+        assert mgr.release.call_count == 1
+
+    def test_all_acquires_fail_reports_all_tests(self):
+        mgr = MagicMock(spec=ViceInstanceManager)
+        mgr.acquire = MagicMock(side_effect=RuntimeError("exhausted"))
+        mgr.release = MagicMock()
+        tests = [
+            ("a", lambda t: (True, "ok")),
+            ("b", lambda t: (True, "ok")),
+        ]
+        result = run_parallel(mgr, tests)
+        assert len(result.results) == 2
+        assert not result.all_passed
+        assert all("RuntimeError" in r.message for r in result.results)
+        assert mgr.release.call_count == 0
+
+    def test_empty_tests_returns_empty_result(self):
+        """No tests -> empty result, not ThreadPoolExecutor ValueError."""
+        mgr = _make_mock_manager()
+        result = run_parallel(mgr, [])
+        assert result.results == []
+        assert result.all_passed  # vacuously
+        assert result.exit_code == 0
+        assert mgr.acquire.call_count == 0
+
+    def test_default_max_workers_clamped_to_port_budget(self):
+        """Default worker count is capped (allocator has ~20 ports)."""
+        from concurrent.futures import ThreadPoolExecutor as RealTPE
+
+        mgr = _make_mock_manager()
+        tests = [(f"t{i}", lambda t: (True, "ok")) for i in range(15)]
+        with patch(
+            "c64_test_harness.parallel.ThreadPoolExecutor", wraps=RealTPE,
+        ) as tpe:
+            result = run_parallel(mgr, tests)
+        assert tpe.call_args.kwargs["max_workers"] == 10
+        assert len(result.results) == 15
+        assert result.all_passed
+
+    def test_explicit_max_workers_respected(self):
+        from concurrent.futures import ThreadPoolExecutor as RealTPE
+
+        mgr = _make_mock_manager()
+        tests = [(f"t{i}", lambda t: (True, "ok")) for i in range(3)]
+        with patch(
+            "c64_test_harness.parallel.ThreadPoolExecutor", wraps=RealTPE,
+        ) as tpe:
+            run_parallel(mgr, tests, max_workers=2)
+        assert tpe.call_args.kwargs["max_workers"] == 2
+
+
 class TestRunParallelGeneralized:
     """Non-VICE managers: test callable receives the instance itself."""
 

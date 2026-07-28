@@ -317,10 +317,26 @@ class ViceInstanceManager:
 
         # Allocate a text monitor port if requested
         text_monitor_port = 0
-        text_port_lock: PortLock | None = None
         if self._enable_text_monitor:
             text_monitor_port = self._allocator.allocate()
 
+        try:
+            return self._start_instance(
+                port, text_monitor_port,
+            )
+        except Exception:
+            # The caller (acquire()) releases the main port; the text
+            # monitor port was allocated here, so it must be returned
+            # to the allocator here or it leaks on every failed start.
+            if text_monitor_port:
+                self._allocator.release(text_monitor_port)
+            raise
+
+    def _start_instance(
+        self, port: int, text_monitor_port: int,
+    ) -> ViceInstance:
+        """Launch VICE on *port* and connect the binary transport."""
+        text_port_lock: PortLock | None = None
         cfg = ViceConfig(
             executable=self._base_config.executable,
             prg_path=self._base_config.prg_path,
@@ -397,12 +413,31 @@ class ViceInstanceManager:
 
             # Verify the listener is actually our VICE process
             listener_pid = ViceProcess.get_listener_pid(port)
+            if listener_pid is None and proc.is_sudo_child:
+                # lsof frequently cannot inspect root-owned processes,
+                # so a sudo-wrapped launch (macOS ethernet) often yields
+                # no listener PID.  Don't silently skip: make the gap in
+                # verification visible.
+                logger.warning(
+                    "Cannot resolve listener PID on port %d for the "
+                    "sudo-wrapped VICE launch (lsof may be unable to "
+                    "inspect root processes); skipping PID verification",
+                    port,
+                )
             if listener_pid is not None and proc.pid is not None:
-                if listener_pid != proc.pid:
+                # For a sudo-wrapped launch, proc.pid is the sudo
+                # wrapper — the listener is the x64sc child, so accept
+                # either the wrapper or the resolved child PID.
+                expected_pids = {proc.pid}
+                if proc.is_sudo_child:
+                    child_pid = proc.resolve_vice_pid()
+                    if child_pid is not None:
+                        expected_pids.add(child_pid)
+                if listener_pid not in expected_pids:
                     proc.stop()
                     raise RuntimeError(
-                        f"PID mismatch on port {port}: expected {proc.pid}, "
-                        f"found {listener_pid}"
+                        f"PID mismatch on port {port}: expected "
+                        f"{sorted(expected_pids)}, found {listener_pid}"
                     )
 
             if port_lock is not None:

@@ -183,7 +183,31 @@ class PortLock:
                 # Someone holds it — not stale
                 os.close(fd)
                 continue
-            # We hold the flock. Check if the recorded PID is dead.
+            # We hold the flock.  Verify our fd still points at the file
+            # on disk (symmetric with acquire()'s inode check): if the
+            # path was unlinked and re-created between our open() and
+            # flock(), unlinking by path here would destroy a NEW
+            # lockfile legitimately held by another process — two
+            # processes could then own the same port.
+            try:
+                fd_stat = os.fstat(fd)
+                path_stat = os.stat(str(path))
+                inode_matches = (
+                    fd_stat.st_ino == path_stat.st_ino
+                    and fd_stat.st_dev == path_stat.st_dev
+                )
+            except OSError:
+                # Path gone (FileNotFoundError) or unreadable — nothing
+                # safe to unlink.
+                inode_matches = False
+            if not inode_matches:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                os.close(fd)
+                continue
+            # Check if the recorded PID is dead.
             try:
                 raw = os.read(fd, 4096)
                 data = json.loads(raw) if raw else {}

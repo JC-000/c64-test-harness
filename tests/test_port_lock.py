@@ -4,6 +4,7 @@ import json
 import multiprocessing
 import os
 import time
+from unittest.mock import patch
 
 import pytest
 
@@ -196,13 +197,35 @@ class TestCleanupStale:
         assert removed == 1
         assert not lock_path.exists()
 
-    def test_keeps_live_lockfile(self, lock_dir):
-        """Lockfiles from the current PID are not cleaned up."""
+    def test_keeps_lockfile_with_held_flock(self, lock_dir):
+        """A lockfile whose flock is currently held is never removed.
+
+        (Historically named ``test_keeps_live_lockfile``, but what it
+        exercises is the held-flock branch: cleanup_stale() cannot even
+        get the flock, so it skips the file regardless of PID.)
+        """
         lock = PortLock(19201, lock_dir=lock_dir)
         lock.acquire()
         removed = PortLock.cleanup_stale(lock_dir)
         assert removed == 0
         lock.release()
+
+    def test_removes_alive_pid_with_unheld_flock(self, lock_dir):
+        """Alive-PID metadata WITHOUT a held flock is treated as stale.
+
+        Documents the intentional semantics of the alive-PID branch in
+        cleanup_stale(): if nobody holds the flock, the metadata is
+        leftover state (the process forgot to clean up, or wrote the
+        file without locking) and removal is safe — the flock, not the
+        PID, is the source of truth for liveness.
+        """
+        lock_path = lock_dir / "port-19203.lock"
+        lock_path.write_text(
+            json.dumps({"pid": os.getpid(), "ts": time.time()})
+        )
+        removed = PortLock.cleanup_stale(lock_dir)
+        assert removed == 1
+        assert not lock_path.exists()
 
     def test_cleanup_does_not_break_held_lock(self, lock_dir):
         """cleanup_stale() cannot remove a lockfile held by another process."""
@@ -225,6 +248,63 @@ class TestCleanupStale:
 
         proceed.set()
         p.join(timeout=5)
+
+    def test_does_not_unlink_recreated_lockfile(self, lock_dir):
+        """cleanup_stale() must not delete a lockfile re-created after open().
+
+        Race: cleanup opens the stale file, another process unlinks it
+        (or a concurrent cleanup does) and re-creates the path with a
+        NEW inode it legitimately holds.  Without the inode re-check,
+        cleanup would flock the ORPHANED inode, then unlink by path —
+        destroying the new holder's lockfile so two processes could end
+        up owning the same port.
+        """
+        import c64_test_harness.backends.port_lock as port_lock_mod
+
+        target = lock_dir / "port-19204.lock"
+        # Stale file (dead PID) so cleanup proceeds past the PID check.
+        target.write_text(json.dumps({"pid": 999999999, "ts": time.time()}))
+        new_metadata = json.dumps({"pid": os.getpid(), "ts": time.time()})
+
+        real_open = os.open
+
+        def racy_open(path, flags, *args):
+            fd = real_open(path, flags, *args)
+            if str(path) == str(target) and flags == os.O_RDWR:
+                # Simulate the race: the path is unlinked and re-created
+                # (new inode) between cleanup's open() and flock().
+                target.unlink()
+                target.write_text(new_metadata)
+            return fd
+
+        with patch.object(port_lock_mod.os, "open", side_effect=racy_open):
+            removed = PortLock.cleanup_stale(lock_dir)
+
+        assert removed == 0
+        assert target.exists()
+        assert target.read_text() == new_metadata
+
+    def test_skips_unlink_when_path_vanishes_after_open(self, lock_dir):
+        """If the path is gone by flock time, cleanup_stale() skips it."""
+        import c64_test_harness.backends.port_lock as port_lock_mod
+
+        target = lock_dir / "port-19205.lock"
+        target.write_text(json.dumps({"pid": 999999999, "ts": time.time()}))
+
+        real_open = os.open
+
+        def racy_open(path, flags, *args):
+            fd = real_open(path, flags, *args)
+            if str(path) == str(target) and flags == os.O_RDWR:
+                target.unlink()  # gone before the inode re-check
+            return fd
+
+        with patch.object(port_lock_mod.os, "open", side_effect=racy_open):
+            removed = PortLock.cleanup_stale(lock_dir)
+
+        # Nothing was there to unlink; must not count it as removed.
+        assert removed == 0
+        assert not target.exists()
 
     def test_default_lock_dir_created(self):
         """_default_lock_dir creates the directory."""
