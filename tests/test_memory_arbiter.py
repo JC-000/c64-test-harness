@@ -129,6 +129,60 @@ class TestSafeRegions:
 
 
 # ---------------------------------------------------------------------------
+# Allocations must pass check_write — reserved-only policy + unknown
+# ---------------------------------------------------------------------------
+
+
+class TestAllocPassesCheckWrite:
+    def test_reserved_only_deny_raises_descriptive_error(self) -> None:
+        # With no safe_regions and unknown=DENY, every "free" interval
+        # is still unknown territory that check_write refuses.  The old
+        # code returned an address whose write then raised
+        # MemoryPolicyError — breaking the "guaranteed to pass
+        # check_write" promise.
+        policy = MemoryPolicy(
+            reserved_regions=(MemoryRegion(0x0200, 0x0300, "BASIC_TMP"),),
+            unknown=UnknownPolicy.DENY,
+        )
+        a = MemoryArbiter(policy=policy)
+        with pytest.raises(MemoryArbiterError) as ei:
+            a.alloc(16, name="stub")
+        msg = str(ei.value)
+        assert "denies unknown addresses" in msg
+        assert "no safe_regions" in msg
+
+    def test_reserved_only_warn_alloc_passes_check_write(self) -> None:
+        # WARN shape: the address is handed out (check_write passes,
+        # warning or not) and the promise holds.
+        policy = MemoryPolicy(
+            reserved_regions=(MemoryRegion(0x0200, 0x0300, "BASIC_TMP"),),
+            unknown=UnknownPolicy.WARN,
+        )
+        a = MemoryArbiter(policy=policy)
+        import warnings as _warnings
+
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("error")  # alloc itself must not warn
+            addr = a.alloc(16, name="stub")
+        assert addr == 0x0300
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            policy.check_write(addr, 16)  # does not raise
+
+    def test_deny_with_safe_regions_still_allocates(self) -> None:
+        # DENY is fine when safe_regions exist — allocation is
+        # restricted to them and check_write passes.
+        policy = MemoryPolicy(
+            safe_regions=(MemoryRegion(0xC000, 0xD000, "scratch"),),
+            reserved_regions=(MemoryRegion(0x0200, 0x0300, "BASIC_TMP"),),
+            unknown=UnknownPolicy.DENY,
+        )
+        a = MemoryArbiter(policy=policy)
+        addr = a.alloc(16, name="stub")
+        policy.check_write(addr, 16)  # does not raise
+
+
+# ---------------------------------------------------------------------------
 # Window constraints
 # ---------------------------------------------------------------------------
 
