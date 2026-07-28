@@ -61,7 +61,9 @@ class Ultimate64TimeoutError(Ultimate64Error):
 
 
 class Ultimate64ProtocolError(Ultimate64Error):
-    """Raised when a JSON response cannot be parsed."""
+    """Raised when a response cannot be parsed (invalid JSON) or has an
+    unexpected shape — e.g. a ``readmem`` payload whose length differs
+    from the requested length."""
 
 
 class Ultimate64UnsafeOperationError(Ultimate64Error):
@@ -514,6 +516,11 @@ class Ultimate64Client:
         """GET /v1/machine:readmem — read `length` bytes from C64 memory via DMA.
 
         Returns the raw byte payload. Address is formatted as 0xNNNN.
+
+        :raises Ultimate64ProtocolError: if the device returns a payload
+            whose length differs from the requested `length`.  Without
+            this check, downstream chunked readers would silently
+            produce short / misaligned results.
         """
         if not isinstance(address, int) or address < 0 or address > 0xFFFF:
             raise ValueError(f"address out of range 0..0xFFFF: {address}")
@@ -521,6 +528,11 @@ class Ultimate64Client:
             raise ValueError(f"length must be positive, got {length}")
         query = {"address": "0x%04X" % address, "length": "%d" % length}
         _, data = self._request("GET", "/v1/machine:readmem", query=query)
+        if len(data) != length:
+            raise Ultimate64ProtocolError(
+                f"readmem at 0x{address:04X} returned {len(data)} bytes, "
+                f"expected {length}"
+            )
         return data
 
     #: Class-level fallback for the raw-byte threshold above which

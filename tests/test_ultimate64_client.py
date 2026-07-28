@@ -264,12 +264,32 @@ def test_read_mem_returns_raw_bytes():
 
 
 def test_read_mem_address_formatted_uppercase_hex():
-    mock, captured = _capture(b"")
+    mock, captured = _capture(b"\x00" * 16)
     c = Ultimate64Client("h")
     with patch("urllib.request.urlopen", mock):
         c.read_mem(0xABCD, 16)
     url = captured[0][0].get_full_url()
     assert "address=0xABCD" in url
+
+
+def test_read_mem_short_payload_raises_protocol_error():
+    """A payload shorter than requested must raise, not silently truncate."""
+    mock, _ = _capture(b"\x01\x02")  # device returned 2 of 8 bytes
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        with pytest.raises(Ultimate64ProtocolError) as ei:
+            c.read_mem(0x0400, 8)
+    assert "expected 8" in str(ei.value)
+    assert isinstance(ei.value, Ultimate64Error)
+
+
+def test_read_mem_long_payload_raises_protocol_error():
+    """A payload longer than requested is equally malformed."""
+    mock, _ = _capture(b"\x00" * 5)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        with pytest.raises(Ultimate64ProtocolError):
+            c.read_mem(0x0400, 4)
 
 
 def test_read_mem_validates_address():
