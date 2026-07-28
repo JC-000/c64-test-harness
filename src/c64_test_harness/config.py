@@ -109,7 +109,10 @@ class HarnessConfig:
         """Load configuration from environment variables.
 
         Maps ``C64TEST_VICE_PORT=6511`` → ``vice_port=6511``, etc.
-        Only fields with matching env vars are overridden.
+        Only fields with matching env vars are overridden.  Structured
+        fields (``memory_policy``) cannot be expressed as an env string;
+        setting their env var raises ``ValueError`` rather than smuggling
+        a raw string into the config.
         """
         config = cls()
         for fld in config.__dataclass_fields__:
@@ -125,8 +128,16 @@ class HarnessConfig:
                     setattr(config, fld, float(env_val))
                 elif isinstance(current, list):
                     setattr(config, fld, env_val.split(","))
-                else:
+                elif isinstance(current, str):
                     setattr(config, fld, env_val)
+                else:
+                    raise ValueError(
+                        f"{env_key} cannot be set via environment: "
+                        f"{fld!r} is a structured field with no string "
+                        f"form. Declare it in TOML (e.g. a [memory] "
+                        f"section for memory_policy) or set it "
+                        f"programmatically."
+                    )
         return config
 
     @classmethod
