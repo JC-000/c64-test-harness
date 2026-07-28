@@ -107,16 +107,24 @@ def test_inject_keys_simple(transport: Ultimate64Transport, mock_client: MagicMo
     assert calls[1].args == (0x00C6, bytes([3]))
 
 
-def test_inject_keys_respects_existing_count(
+def test_inject_keys_waits_for_full_drain_before_writing(
     transport: Ultimate64Transport, mock_client: MagicMock
 ) -> None:
-    # Existing count is 4 — only 6 bytes of free space.
-    mock_client.read_mem.return_value = b"\x04"
+    """A partially-filled buffer is never topped up at an offset.
+
+    The KERNAL shifts the buffer down and decrements $C6 concurrently
+    with our DMA writes, so writing at (buf + count) races it.  The
+    transport must wait for $C6 == 0 and always write at offset 0.
+    """
+    # Existing count is 4 on the first poll, drained on the second.
+    mock_client.read_mem.side_effect = [b"\x04", b"\x00"]
     transport.inject_keys([0x11, 0x22, 0x33])
-    # Writes at (0x0277 + 4), then count becomes 4 + 3 = 7.
     calls = mock_client.write_mem.call_args_list
-    assert calls[0].args == (0x0277 + 4, b"\x11\x22\x33")
-    assert calls[1].args == (0x00C6, bytes([7]))
+    # No write happened while $C6 was non-zero; the buffer write starts
+    # at offset 0 and the count is exactly the chunk length.
+    assert calls[0].args == (0x0277, b"\x11\x22\x33")
+    assert calls[1].args == (0x00C6, bytes([3]))
+    assert mock_client.read_mem.call_count == 2
 
 
 def test_inject_keys_chunks_when_over_max(
@@ -145,6 +153,77 @@ def test_inject_keys_waits_for_drain(
     assert mock_client.read_mem.call_count == 3
     # Single write pair after drain.
     assert mock_client.write_mem.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# inject_joystick — active-high protocol convention onto active-low CIA
+# ---------------------------------------------------------------------------
+
+
+def test_inject_joystick_port2_inverts_and_writes_dc00(
+    transport: Ultimate64Transport, mock_client: MagicMock
+) -> None:
+    # Active-high fire (bit 4) → CIA active-low byte with bit 4 cleared.
+    transport.inject_joystick(2, 0x10)
+    mock_client.write_mem.assert_called_once_with(0xDC00, bytes([0x10 ^ 0x1F]))
+
+
+def test_inject_joystick_port1_inverts_and_writes_dc01(
+    transport: Ultimate64Transport, mock_client: MagicMock
+) -> None:
+    # Up + fire pressed (bits 0 and 4) → bits 0/4 low, bits 1-3 high.
+    transport.inject_joystick(1, 0b1_0001)
+    mock_client.write_mem.assert_called_once_with(0xDC01, bytes([0b0_1110]))
+
+
+def test_inject_joystick_nothing_pressed_all_lines_high(
+    transport: Ultimate64Transport, mock_client: MagicMock
+) -> None:
+    transport.inject_joystick(2, 0x00)
+    mock_client.write_mem.assert_called_once_with(0xDC00, bytes([0x1F]))
+
+
+def test_inject_joystick_bits_5_to_7_pass_through(
+    transport: Ultimate64Transport, mock_client: MagicMock
+) -> None:
+    # Only the five joystick bits are inverted.
+    transport.inject_joystick(2, 0xE0)
+    mock_client.write_mem.assert_called_once_with(0xDC00, bytes([0xE0 | 0x1F]))
+
+
+def test_inject_joystick_invalid_port(transport: Ultimate64Transport) -> None:
+    with pytest.raises(ValueError, match="port"):
+        transport.inject_joystick(3, 0x10)
+
+
+def test_inject_joystick_value_out_of_range(
+    transport: Ultimate64Transport,
+) -> None:
+    with pytest.raises(ValueError, match="range"):
+        transport.inject_joystick(1, 0x100)
+
+
+def test_inject_joystick_is_policy_visible(
+    mock_client: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The CIA write routes through write_memory, not client.write_mem.
+
+    With a policy that reserves the CIA range the write still succeeds
+    (CIA registers are I/O, not consumer RAM — the per-call
+    ``override="inject-joystick"`` bypasses the check by design), but
+    the bypass is logged at WARNING so the policy sees every write.
+    """
+    from c64_test_harness import MemoryPolicy, MemoryRegion
+
+    policy = MemoryPolicy(
+        reserved_regions=(MemoryRegion(0xDC00, 0xDD00, "CIA1"),),
+    )
+    t = Ultimate64Transport(host="h", client=mock_client, memory_policy=policy)
+    with caplog.at_level("WARNING"):
+        t.inject_joystick(2, 0x10)
+    # The write went through the policy-checked path and was logged.
+    assert any("inject-joystick" in r.message for r in caplog.records)
+    mock_client.write_mem.assert_called_once_with(0xDC00, bytes([0x10 ^ 0x1F]))
 
 
 def test_read_registers_removed_from_protocol() -> None:
@@ -256,6 +335,91 @@ def test_set_speed_unsupported_int_raises(
     # like 7, 9, 11, etc.
     with pytest.raises(ValueError):
         transport.set_speed(7)
+
+
+_U64E_CPU_SPEED_PRESETS = [
+    " 1", " 2", " 3", " 4", " 5", " 6", " 8", "10",
+    "12", "14", "16", "20", "24", "32", "40", "48",
+]
+_C64U_CPU_SPEED_PRESETS = [
+    " 1", " 2", " 3", " 4", " 6", " 8", "10",
+    "12", "14", "16", "20", "24", "32", "40", "48", "64",
+]
+
+
+def _cpu_speed_item_response(presets: list[str]) -> dict:
+    return {
+        "U64 Specific Settings": {
+            "CPU Speed": {
+                "current": " 1",
+                "presets": list(presets),
+                "default": " 1",
+            },
+        },
+        "errors": [],
+    }
+
+
+def test_set_speed_none_uses_probed_max_on_c64u(
+    transport: Ultimate64Transport, mock_client: MagicMock
+) -> None:
+    """C64U fw 1.1.0 has a '64' CPU-Speed step — None means 64, not 48."""
+    mock_client.get_config_item.return_value = _cpu_speed_item_response(
+        _C64U_CPU_SPEED_PRESETS
+    )
+    transport.set_speed(None)
+    mock_client.set_config_items.assert_called_once_with(
+        "U64 Specific Settings",
+        {"CPU Speed": "64", "Turbo Control": "Manual"},
+    )
+
+
+def test_set_speed_none_uses_probed_max_on_u64e(
+    transport: Ultimate64Transport, mock_client: MagicMock
+) -> None:
+    mock_client.get_config_item.return_value = _cpu_speed_item_response(
+        _U64E_CPU_SPEED_PRESETS
+    )
+    transport.set_speed(None)
+    mock_client.set_config_items.assert_called_once_with(
+        "U64 Specific Settings",
+        {"CPU Speed": "48", "Turbo Control": "Manual"},
+    )
+
+
+def test_set_speed_generation_foreign_5_raises_locally_on_c64u(
+    transport: Ultimate64Transport, mock_client: MagicMock
+) -> None:
+    mock_client.get_config_item.return_value = _cpu_speed_item_response(
+        _C64U_CPU_SPEED_PRESETS
+    )
+    with pytest.raises(ValueError, match="device generation"):
+        transport.set_speed(5)
+    mock_client.set_config_items.assert_not_called()
+
+
+def test_set_speed_generation_foreign_64_raises_locally_on_u64e(
+    transport: Ultimate64Transport, mock_client: MagicMock
+) -> None:
+    mock_client.get_config_item.return_value = _cpu_speed_item_response(
+        _U64E_CPU_SPEED_PRESETS
+    )
+    with pytest.raises(ValueError, match="device generation"):
+        transport.set_speed(64)
+    mock_client.set_config_items.assert_not_called()
+
+
+def test_set_speed_64_goes_on_the_wire_on_c64u(
+    transport: Ultimate64Transport, mock_client: MagicMock
+) -> None:
+    mock_client.get_config_item.return_value = _cpu_speed_item_response(
+        _C64U_CPU_SPEED_PRESETS
+    )
+    transport.set_speed(64)
+    mock_client.set_config_items.assert_called_once_with(
+        "U64 Specific Settings",
+        {"CPU Speed": "64", "Turbo Control": "Manual"},
+    )
 
 
 def test_get_speed_native_when_turbo_off(

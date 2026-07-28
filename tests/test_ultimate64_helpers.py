@@ -25,6 +25,7 @@ from c64_test_harness.backends.ultimate64_helpers import (
     get_turbo_enabled,
     get_turbo_mhz,
     load_prg_file,
+    max_cpu_speed_mhz,
     mount_disk_file,
     reboot,
     recover,
@@ -153,6 +154,111 @@ class TestTurbo:
         client = _make_client()
         client.get_config_category.return_value = _u64_specific(turbo="Off")
         assert get_turbo_enabled(client) is False
+
+
+_U64E_PRESETS = [
+    " 1", " 2", " 3", " 4", " 5", " 6", " 8", "10",
+    "12", "14", "16", "20", "24", "32", "40", "48",
+]
+_C64U_PRESETS = [
+    " 1", " 2", " 3", " 4", " 6", " 8", "10",
+    "12", "14", "16", "20", "24", "32", "40", "48", "64",
+]
+
+
+def _cpu_speed_item(presets: list[str]) -> dict:
+    """Shape of ``get_config_item(CAT_U64_SPECIFIC, "CPU Speed")``."""
+    return {
+        "U64 Specific Settings": {
+            "CPU Speed": {
+                "current": " 1",
+                "presets": list(presets),
+                "default": " 1",
+            },
+        },
+        "errors": [],
+    }
+
+
+class TestCpuSpeedGenerations:
+    """Generation-aware CPU-Speed probing (U64E fw 3.14 vs C64U fw 1.1.0)."""
+
+    def test_max_cpu_speed_mhz_c64u_is_64(self) -> None:
+        client = _make_client()
+        client.get_config_item.return_value = _cpu_speed_item(_C64U_PRESETS)
+        assert max_cpu_speed_mhz(client) == 64
+
+    def test_max_cpu_speed_mhz_u64e_is_48(self) -> None:
+        client = _make_client()
+        client.get_config_item.return_value = _cpu_speed_item(_U64E_PRESETS)
+        assert max_cpu_speed_mhz(client) == 48
+
+    def test_max_cpu_speed_mhz_probe_error_falls_back_48(self) -> None:
+        client = _make_client()
+        client.get_config_item.side_effect = Ultimate64Error("boom")
+        assert max_cpu_speed_mhz(client) == 48
+
+    def test_max_cpu_speed_mhz_unparseable_response_falls_back_48(self) -> None:
+        client = _make_client()
+        client.get_config_item.return_value = {"errors": []}
+        assert max_cpu_speed_mhz(client) == 48
+
+    def test_set_turbo_mhz_5_on_c64u_raises_locally(self) -> None:
+        client = _make_client()
+        client.get_config_item.return_value = _cpu_speed_item(_C64U_PRESETS)
+        with pytest.raises(
+            ValueError, match="not supported by this device generation"
+        ):
+            set_turbo_mhz(client, 5)
+        client.set_config_items.assert_not_called()
+
+    def test_set_turbo_mhz_64_on_u64e_raises_locally(self) -> None:
+        client = _make_client()
+        client.get_config_item.return_value = _cpu_speed_item(_U64E_PRESETS)
+        with pytest.raises(
+            ValueError, match="not supported by this device generation"
+        ):
+            set_turbo_mhz(client, 64)
+        client.set_config_items.assert_not_called()
+
+    def test_set_turbo_mhz_64_on_c64u_sends(self) -> None:
+        client = _make_client()
+        client.get_config_item.return_value = _cpu_speed_item(_C64U_PRESETS)
+        set_turbo_mhz(client, 64)
+        client.set_config_items.assert_called_once_with(
+            CAT_U64_SPECIFIC,
+            {"CPU Speed": "64", "Turbo Control": "Manual"},
+        )
+
+    def test_set_turbo_mhz_inconclusive_probe_sends_superset_speed(self) -> None:
+        """Inconclusive probe keeps legacy behaviour: the PUT goes on the
+        wire and the firmware rejects a foreign speed with HTTP 400."""
+        client = _make_client()
+        client.get_config_item.side_effect = Ultimate64Error("boom")
+        set_turbo_mhz(client, 64)
+        client.set_config_items.assert_called_once_with(
+            CAT_U64_SPECIFIC,
+            {"CPU Speed": "64", "Turbo Control": "Manual"},
+        )
+
+    def test_preset_probe_is_cached_per_client(self) -> None:
+        client = _make_client()
+        client.get_config_item.return_value = _cpu_speed_item(_C64U_PRESETS)
+        set_turbo_mhz(client, 2)
+        set_turbo_mhz(client, 4)
+        assert max_cpu_speed_mhz(client) == 64
+        # One probe GET for all three calls.
+        assert client.get_config_item.call_count == 1
+
+    def test_inconclusive_probe_is_not_cached(self) -> None:
+        client = _make_client()
+        client.get_config_item.side_effect = [
+            Ultimate64Error("transient"),
+            _cpu_speed_item(_C64U_PRESETS),
+        ]
+        assert max_cpu_speed_mhz(client) == 48  # first probe fails
+        assert max_cpu_speed_mhz(client) == 64  # re-probed, now conclusive
+        assert client.get_config_item.call_count == 2
 
 
 # --------------------------------------------------------------------------- #
@@ -435,6 +541,30 @@ class TestSnapshotRestore:
             "REU Size": "1 MB",
             "Cartridge": "REU",
         }
+
+    def test_restore_state_cartridge_ordered_first(self) -> None:
+        """Cartridge must lead the cart batch — set_reu's ordering invariant.
+
+        set_config_items iterates in insertion order and does not catch
+        per-item failures, so a firmware rejection of the Cartridge write
+        must abort the batch BEFORE the REU is half-enabled.
+        """
+        client = _make_client()
+        snap = U64StateSnapshot(
+            turbo_control="Manual",
+            cpu_speed=" 4",
+            reu_enabled="Enabled",
+            reu_size="16 MB",
+            cartridge="REU",
+        )
+        restore_state(client, snap)
+        cart_call = client.set_config_items.call_args_list[1]
+        assert cart_call.args[0] == CAT_CART
+        assert list(cart_call.args[1]) == [
+            "Cartridge",
+            "RAM Expansion Unit",
+            "REU Size",
+        ]
 
     def test_restore_state_bad_type(self) -> None:
         client = _make_client()

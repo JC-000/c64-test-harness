@@ -88,7 +88,20 @@ class C64Transport(Protocol):
         ...
 
     def inject_joystick(self, port: int, value: int) -> None:
-        """Inject joystick state. port=1 or 2, value is the joystick byte (bits 0-4 = up/down/left/right/fire)."""
+        """Inject joystick state.  ``port`` is 1 or 2; ``value`` is the
+        joystick byte, bits 0-4 = up/down/left/right/fire.
+
+        Convention: ``value`` is **active-high** — bit set means the
+        direction/button is pressed (the VICE ``JOYPORT_SET`` polarity).
+        Backends whose hardware is active-low (the U64's CIA1 data
+        ports) convert internally; callers always pass active-high.
+
+        Persistence differs by backend: VICE holds the injected state
+        until the next ``inject_joystick`` call; the U64 write is
+        one-shot — the KERNAL keyboard scan rewrites the CIA ports at
+        ~60 Hz, so sustained input needs periodic re-injection (or a
+        paused machine).
+        """
         ...
 
     def read_framebuffer(self) -> dict:
