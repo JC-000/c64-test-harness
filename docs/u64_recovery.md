@@ -15,13 +15,40 @@ next test wedge identically.
 The harness recognises three independent layers, listed in escalation
 order. Each layer has its own probe + recovery primitive.
 
+## Status: root cause and upstream fix
+
+This whole wedge family (issues #112, #129, #137) was root-caused after
+the tiers below were first characterised, and the mitigations here are
+**temporary**. The underlying cause is firmware Temp-folder accumulation:
+`POST /v1/machine:writemem` uploads arrive as multipart attachments that
+land in Temp, and without garbage collection the accumulation produces
+the latency drift and eventual wedge described in every tier below.
+
+The fix is upstream in
+[GideonZ/1541ultimate#686 "Add automatic cleanup of Temp folder"](https://github.com/GideonZ/1541ultimate/pull/686)
+(merged 2026-04-26). It is **merged but not yet in any released
+firmware** — there is no 3.15 release. Until a firmware release
+containing it is installed, the wedge behaviour is live on our hardware
+(U64E on 3.14d, C64U on 1.1.0) and everything below applies as written.
+
+Two practical consequences while the fix is unreleased:
+
+- Prefer `PUT /v1/machine:writemem?data=<hex>` over `POST` for heavy
+  write loads. POST is the leaking path; PUT does not accumulate Temp
+  files.
+- Once both devices run fixed firmware, the tier-1 mitigations and the
+  tier-3 `uci_wedge_probe` become diagnostic history rather than
+  operating procedure. Re-validate against the new firmware before
+  deleting anything — the deterministic repro in issue #112 is the
+  intended verification.
+
 ## Wedge tiers
 
 | Tier | Symptom | Probe | Recovery | Fallback when recovery fails |
 |---|---|---|---|---|
 | 1. REST / writemem | `POST /v1/machine:writemem` returns 404 or RST; TCP stack may wedge after repeated POSTs | [`liveness_probe`](../src/c64_test_harness/backends/ultimate64_probe.py) | [`recover`](../src/c64_test_harness/backends/ultimate64_helpers.py) (`reset` → `reboot`) | Physical power-cycle |
 | 2. Runner | `run_prg` response body contains `"Cannot open file"`; REST otherwise healthy | [`runner_health_check`](../src/c64_test_harness/backends/ultimate64_helpers.py) | `client.reboot()` (typically) | Physical power-cycle |
-| 3. UCI STATE bit | `uci_wait_idle` hangs ~161 s after sustained `SOCKET_WRITE`; queued datagram silently dropped; REST stays healthy throughout | [`uci_wedge_probe`](../src/c64_test_harness/uci_network.py) | None over the network | Physical power-cycle (only) |
+| 3. UCI STATE bit | the wait-idle spin hangs ~161 s after sustained `SOCKET_WRITE`; queued datagram silently dropped; REST stays healthy throughout | [`uci_wedge_probe`](../src/c64_test_harness/uci_network.py) | None over the network | Physical power-cycle (only) |
 
 ### Tier 1 — REST writemem / TCP stack
 
@@ -69,7 +96,12 @@ reinit, ~8 s); `client.reset()` is insufficient.
 Canonical evidence:
 
 - After 2–3 successful `SOCKET_WRITE` test runs in a session, the next
-  run hangs at `uci_wait_idle` for ~161 s.
+  run hangs for ~161 s in the wait-idle spin. ("`uci_wait_idle`" is the
+  consumer-side name for this pattern in issue #112 and in
+  c64-wireguard; it is not a harness symbol. The harness emits the
+  equivalent spin inline from `_build_wait_idle` / `_build_push_and_wait`
+  in `uci_network.py`, which is exactly the unbounded loop
+  `uci_wedge_probe` exists to avoid.)
 - `UCI_STATUS` at `$DF1C` reads with the STATE bits (`$30` mask) stuck
   non-idle; the in-flight UDP datagram is silently dropped while STATE is
   stuck.
