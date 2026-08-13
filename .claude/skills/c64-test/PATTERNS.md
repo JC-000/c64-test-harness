@@ -105,15 +105,53 @@ def test_via_menu(transport, labels):
     time.sleep(0.1)
     send_key(transport, "\r")
 
-    # Wait for result
-    grid = wait_for_text(transport, "Q=QUIT", timeout=30.0, verbose=False)
+    # Wait for result. Wait on a string that appears ONLY on completion --
+    # NOT on the menu banner, which never left the screen (see below).
+    grid = wait_for_text(transport, "RESULT:", timeout=30.0, verbose=False)
     if grid is None:
-        return False, "Did not return to menu"
+        return False, "Operation did not complete"
 
     # Read result from memory
     result = read_bytes(transport, labels["output"], 32)
     return True, f"Got: {result.hex()}"
 ```
+
+### Never wait on a string that is already on screen
+
+`wait_for_text()` checks the current screen first, so a needle that is
+already visible **returns immediately and waits for nothing**. Using a
+persistent menu banner as an "operation finished" signal is a false
+completion signal, and it fails in a way that looks like a dropped keypress:
+
+```python
+send_key(transport, "F")                    # start a long operation
+wait_for_text(transport, "Q=QUIT")          # BUG: banner was never off screen
+send_key(transport, "J")                    # arrives mid-operation
+```
+
+The `J` *is* delivered — it lands in the KERNAL buffer at `$0277`/`$C6`
+correctly. But the program is still busy, and most menu code flushes
+pending keys when it redraws (`LDA #$00 / STA $C6`), so the keypress is
+discarded with no error and no screen change. Symptoms that follow from
+this and mislead the diagnosis:
+
+- A settle delay before the next poll does not help — the key is already gone.
+- Sending a throwaway key first "unsticks" it, which looks like a
+  keyboard-buffer quirk but only works because it delays the real key
+  until the program is listening again.
+- The same key works fine from a freshly-booted menu.
+
+This was diagnosed in issue #138 and reproduced on a minimal GETIN menu
+program: a plain busy loop drops nothing, and the symptom only appears
+once the key is sent mid-operation against a menu that flushes on
+re-entry. It is not a VICE quirk and not a harness/`send_key` bug.
+
+Wait on a **transition** instead:
+
+- a string that appears only on completion (a result value, a `DONE` marker), or
+- the in-progress indicator first, then poll until it disappears, or
+- a memory-based completion flag the program sets (see "Verify Program
+  Startup via Code Bytes" for why memory beats screen text for this).
 
 ---
 
