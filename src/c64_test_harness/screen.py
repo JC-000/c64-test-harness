@@ -120,6 +120,31 @@ def wait_for_text(
 
     *on_progress* replaces hardcoded ``print()`` — receives elapsed seconds
     and a snippet of the last non-blank screen row.
+
+    .. warning::
+
+       **Do not wait on a string that is already on screen.** This checks
+       the *current* screen first, so a needle that is already visible
+       returns immediately — it does not wait for anything. Using a
+       persistent menu banner as an "operation finished" signal is the
+       classic form of this bug:
+
+       .. code-block:: python
+
+          send_key(transport, "F")                     # start a long operation
+          wait_for_text(transport, "Q=QUIT")           # BUG: banner never left
+          send_key(transport, "J")                     # arrives mid-operation
+
+       The second key is delivered into the KERNAL buffer correctly, but
+       the program is still busy and typically flushes pending keys when
+       it redraws its menu — so the keypress vanishes with no error and no
+       screen change. Adding a settle delay does not help; sending a
+       throwaway key first appears to "fix" it only because it delays the
+       real key until the program is listening again. See issue #138.
+
+       Wait on a *transition* instead: a string that appears only on
+       completion (a result value, a "DONE" marker), or first wait for the
+       in-progress indicator and then for it to disappear.
     """
     needle_upper = needle.upper()
     start = time.monotonic()
