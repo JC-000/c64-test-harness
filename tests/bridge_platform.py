@@ -28,7 +28,11 @@ import sys
 import tempfile
 import time
 
-from c64_test_harness.backends.vice_lifecycle import bpf_capture_available
+from c64_test_harness.backends.vice_lifecycle import (
+    ETHERNET_VICE_BIN_ENV,
+    bpf_capture_available,
+    ethernet_vice_binary,
+)
 
 if sys.platform == "darwin":
     ETHERNET_DRIVER = "pcap"
@@ -223,9 +227,19 @@ def probe_vice_pcap_ok(
         )
         return _PROBE_CACHE
 
-    x64sc = shutil.which("x64sc")
+    # Probe the binary the ethernet tests will actually launch: an
+    # ethernet-capable build when one is configured ($VICE_ETHERNET_BIN),
+    # otherwise the PATH x64sc.  Probing PATH while the tests run a
+    # different binary would report on the wrong emulator entirely.
+    x64sc = ethernet_vice_binary() or shutil.which("x64sc")
     if x64sc is None:
         _PROBE_CACHE = (False, "x64sc not on PATH")
+        return _PROBE_CACHE
+    if not os.access(x64sc, os.X_OK):
+        _PROBE_CACHE = (
+            False,
+            f"{x64sc} (from ${ETHERNET_VICE_BIN_ENV}) is not executable",
+        )
         return _PROBE_CACHE
 
     if iface is None:

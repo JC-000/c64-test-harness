@@ -262,6 +262,26 @@ keeps those root-only, so elevation is the default there; a rig that runs
 `sudo chmod o+rw /dev/bpf*` (as `scripts/setup-bridge-feth-macos.sh`
 instructs) makes them reachable and no sudo is used at all.
 
+**The BPF device pool is the real macOS constraint.** `sudo chmod o+rw
+/dev/bpf*` only affects nodes that exist *at that moment*. macOS creates
+further ones on demand with default root-only permissions, and an
+unprivileged process cannot grow the pool. Each pcap-attached VICE opens
+**two** BPF devices, so a rig with `/dev/bpf0..3` opened supports exactly
+**one** unprivileged VICE — a second forces `/dev/bpf4`/`bpf5` into
+existence as `crw-------` and dies with `rc=255`:
+
+```
+A/feth0: ALIVE   bpf: ['/dev/bpf3', '/dev/bpf2']
+B/feth1: DIED rc=255
+```
+
+Single-instance work (a consumer rig such as c64-https) is therefore fine
+unprivileged, while the two-VICE bridge suite here is not. For the pair,
+either let it elevate, or pre-create and open `2 x <instances>` nodes as
+root before the run. `bpf_capture_available(min_nodes=...)` reports the
+pool at decision time; it cannot predict a concurrently starting VICE
+consuming the remainder.
+
 When elevation *does* fire, `ViceProcess` wraps the launch in
 `sudo -n x64sc …`, so the recorded `ViceProcess.pid` is the **sudo
 wrapper's** PID, not the actual `x64sc` process. `ps -p <sudo_pid> -o

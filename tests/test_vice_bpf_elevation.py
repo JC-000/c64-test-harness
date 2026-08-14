@@ -41,8 +41,19 @@ def test_bpf_probe_true_when_root(monkeypatch):
     assert bpf_capture_available() is True
 
 
-def test_bpf_probe_true_when_a_node_is_rw(monkeypatch):
+def test_bpf_probe_true_when_enough_nodes_are_rw(monkeypatch):
     """A rig that ran `chmod o+rw /dev/bpf*` makes capture reachable."""
+    monkeypatch.setattr(vice_lifecycle.sys, "platform", "darwin")
+    monkeypatch.setattr(vice_lifecycle.os, "geteuid", lambda: 501)
+    monkeypatch.setattr(
+        vice_lifecycle.glob, "glob", lambda pat: ["/dev/bpf0", "/dev/bpf1"]
+    )
+    monkeypatch.setattr(vice_lifecycle.os, "access", lambda node, mode: True)
+    assert bpf_capture_available() is True
+
+
+def test_bpf_probe_false_when_only_one_node_is_rw(monkeypatch):
+    """One VICE opens two BPF devices, so a single node is not enough."""
     monkeypatch.setattr(vice_lifecycle.sys, "platform", "darwin")
     monkeypatch.setattr(vice_lifecycle.os, "geteuid", lambda: 501)
     monkeypatch.setattr(
@@ -51,7 +62,21 @@ def test_bpf_probe_true_when_a_node_is_rw(monkeypatch):
     monkeypatch.setattr(
         vice_lifecycle.os, "access", lambda node, mode: node == "/dev/bpf1"
     )
-    assert bpf_capture_available() is True
+    assert bpf_capture_available() is False
+
+
+def test_bpf_probe_min_nodes_is_explicit(monkeypatch):
+    """Callers can ask whether N concurrent instances would fit."""
+    monkeypatch.setattr(vice_lifecycle.sys, "platform", "darwin")
+    monkeypatch.setattr(vice_lifecycle.os, "geteuid", lambda: 501)
+    monkeypatch.setattr(
+        vice_lifecycle.glob, "glob",
+        lambda pat: [f"/dev/bpf{i}" for i in range(4)],
+    )
+    monkeypatch.setattr(vice_lifecycle.os, "access", lambda node, mode: True)
+    assert bpf_capture_available(min_nodes=4) is True
+    # Two concurrent VICEs need 4 nodes; a third would not fit.
+    assert bpf_capture_available(min_nodes=6) is False
 
 
 def test_bpf_probe_false_when_all_nodes_root_only(monkeypatch):
@@ -136,3 +161,47 @@ def test_auto_never_elevates_off_darwin(monkeypatch):
     _patch_bpf(monkeypatch, available=False, platform="linux")
     cfg = ViceConfig(ethernet=True)
     assert _should_run_as_root(cfg) is False
+
+
+# ------------------------------------------- ethernet binary resolution
+
+def test_ethernet_binary_empty_when_unset(monkeypatch):
+    monkeypatch.delenv(vice_lifecycle.ETHERNET_VICE_BIN_ENV, raising=False)
+    assert vice_lifecycle.ethernet_vice_binary() == ""
+
+
+def test_ethernet_binary_reads_env_and_strips(monkeypatch):
+    monkeypatch.setenv(vice_lifecycle.ETHERNET_VICE_BIN_ENV, "  /opt/eth/x64sc \n")
+    assert vice_lifecycle.ethernet_vice_binary() == "/opt/eth/x64sc"
+
+
+def test_resolve_prefers_ethernet_build_when_ethernet_on():
+    cfg = ViceConfig(executable="x64sc", ethernet=True,
+                     ethernet_executable="/opt/eth/x64sc")
+    assert vice_lifecycle.resolve_vice_executable(cfg) == "/opt/eth/x64sc"
+
+
+def test_resolve_ignores_ethernet_build_without_ethernet():
+    """Non-ethernet runs keep using the everyday PATH binary."""
+    cfg = ViceConfig(executable="x64sc", ethernet=False,
+                     ethernet_executable="/opt/eth/x64sc")
+    assert vice_lifecycle.resolve_vice_executable(cfg) == "x64sc"
+
+
+def test_resolve_falls_back_when_no_ethernet_build_configured():
+    cfg = ViceConfig(executable="x64sc", ethernet=True, ethernet_executable="")
+    assert vice_lifecycle.resolve_vice_executable(cfg) == "x64sc"
+
+
+def test_config_default_picks_up_env(monkeypatch):
+    """Existing ethernet tests inherit the build without per-test edits."""
+    monkeypatch.setenv(vice_lifecycle.ETHERNET_VICE_BIN_ENV, "/opt/eth/x64sc")
+    cfg = ViceConfig(ethernet=True)
+    assert cfg.ethernet_executable == "/opt/eth/x64sc"
+    assert vice_lifecycle.resolve_vice_executable(cfg) == "/opt/eth/x64sc"
+
+
+def test_explicit_field_beats_env(monkeypatch):
+    monkeypatch.setenv(vice_lifecycle.ETHERNET_VICE_BIN_ENV, "/opt/eth/x64sc")
+    cfg = ViceConfig(ethernet=True, ethernet_executable="/other/x64sc")
+    assert vice_lifecycle.resolve_vice_executable(cfg) == "/other/x64sc"

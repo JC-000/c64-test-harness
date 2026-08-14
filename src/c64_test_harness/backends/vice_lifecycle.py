@@ -23,6 +23,42 @@ if TYPE_CHECKING:
 
 _IS_MACOS = platform.system() == "Darwin"
 
+#: Environment variable naming an ethernet-capable ``x64sc``.
+ETHERNET_VICE_BIN_ENV = "VICE_ETHERNET_BIN"
+
+
+def ethernet_vice_binary() -> str:
+    """Path to an ethernet-capable ``x64sc``, or ``""`` when unconfigured.
+
+    The ``x64sc`` on ``PATH`` frequently cannot do ethernet at all --
+    Homebrew's bottle is the standard example (issue #144): it starts,
+    serves the binary monitor, and attaches no BPF device, so ethernet
+    tests assert against emulated CS8900 registers while no host packet
+    ever moves.  Real ethernet work therefore needs a separate build
+    (official binary, or source with ``--enable-ethernet``), which is
+    typically installed outside ``PATH`` so it does not displace the
+    everyday emulator.
+
+    Set ``VICE_ETHERNET_BIN`` to that path, or configure
+    ``HarnessConfig.vice_ethernet_executable`` (TOML
+    ``[vice] ethernet_executable``).  It is consulted **only** when
+    ``ViceConfig.ethernet`` is true, so non-ethernet runs keep using the
+    ``PATH`` binary.
+    """
+    return os.environ.get(ETHERNET_VICE_BIN_ENV, "").strip()
+
+
+def resolve_vice_executable(cfg: ViceConfig) -> str:
+    """The ``x64sc`` binary *cfg* should actually launch.
+
+    Prefers :attr:`ViceConfig.ethernet_executable` when the ethernet cart
+    is in play, so a bench can keep a stock ``x64sc`` on ``PATH`` for
+    ordinary tests and an ethernet-enabled build for the bridge suite.
+    """
+    if cfg.ethernet and cfg.ethernet_executable:
+        return cfg.ethernet_executable
+    return cfg.executable
+
 
 def _find_pid_on_port_linux(port: int) -> int | None:
     """Linux: find the PID listening on *port* via /proc/net/tcp + /proc/*/fd."""
@@ -133,6 +169,10 @@ class ViceConfig:
     ethernet_driver: str = ""  # "tuntap" or "pcap" (empty = VICE default)
     ethernet_base: int = 0xDE00  # I/O base address
     ethernet_mac: bytes = b""  # 6-byte MAC (empty = VICE default)
+    #: Ethernet-capable x64sc, used instead of ``executable`` when
+    #: ``ethernet`` is true.  Defaults from ``$VICE_ETHERNET_BIN``; see
+    #: :func:`ethernet_vice_binary`.  Empty means "just use ``executable``".
+    ethernet_executable: str = field(default_factory=ethernet_vice_binary)
 
     # Snapshot / event recording / determinism / audio capture
     load_snapshot: str | None = None
@@ -168,8 +208,29 @@ class ViceConfig:
     run_as_root: bool | None = None
 
 
-def bpf_capture_available() -> bool:
-    """True when this process could open a BPF device for pcap capture.
+#: BPF devices a single pcap-attached VICE consumes (measured: it opens two).
+BPF_NODES_PER_VICE = 2
+
+
+def bpf_capture_available(min_nodes: int = BPF_NODES_PER_VICE) -> bool:
+    """True when this process could open BPF devices for pcap capture.
+
+    *min_nodes* is how many user-openable ``/dev/bpf*`` nodes must exist.
+    One pcap-attached VICE opens :data:`BPF_NODES_PER_VICE` of them.
+
+    .. important::
+
+       ``chmod o+rw /dev/bpf*`` only affects the nodes that **exist at
+       that moment**. macOS creates further nodes on demand with default
+       root-only permissions, so an unprivileged process cannot grow the
+       pool. With four pre-opened nodes exactly *one* VICE can capture;
+       a second one forces creation of ``/dev/bpf4``/``bpf5`` as
+       ``crw-------`` and dies with rc=255.
+
+       So the harness's two-VICE bridge suite needs either root, or a rig
+       that pre-creates and opens ``2 x <instances>`` nodes. This check
+       cannot see that coming -- it reports the pool at decision time, and
+       a concurrently starting VICE may consume the remainder.
 
     macOS gates packet capture behind read/write access to a ``/dev/bpf*``
     node, which is root-only out of the box.  Test rigs routinely open them
@@ -189,10 +250,12 @@ def bpf_capture_available() -> bool:
         return True
     if os.geteuid() == 0:
         return True
-    return any(
-        os.access(node, os.R_OK | os.W_OK)
+    usable = sum(
+        1
         for node in glob.glob("/dev/bpf*")
+        if os.access(node, os.R_OK | os.W_OK)
     )
+    return usable >= min_nodes
 
 
 def _should_run_as_root(cfg: ViceConfig) -> bool:
@@ -278,7 +341,7 @@ class ViceProcess:
                 f"event_snapshot_mode must be 0, 1, or 2 (got {cfg.event_snapshot_mode})"
             )
 
-        args = [cfg.executable]
+        args = [resolve_vice_executable(cfg)]
         if cfg.prg_path:
             args += ["-autostart", cfg.prg_path]
             if sys.platform == "darwin" and "-autostartprgmode" not in cfg.extra_args:
