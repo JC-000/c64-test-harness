@@ -9,6 +9,13 @@
 #   sudo ./scripts/probe-vice-feth.sh          # runs VICE as root for BPF
 #   ./scripts/probe-vice-feth.sh --no-sudo     # assumes ChmodBPF or 666 bpf
 #
+#   --vice-bin PATH        use PATH instead of the x64sc on $PATH (also
+#                          settable via the VICE_BIN environment variable).
+#                          Homebrew's x64sc has ethernet compiled out, so an
+#                          ethernet-capable build must be named explicitly --
+#                          see issue #144.
+#   --skip-ethernet-check  bypass the ethernet-capability pre-flight
+#
 # Expected outcome: VICE launches, binary monitor accepts a TCP connection
 # on 127.0.0.1:6510, a minimal MON_CMD_PING request gets a valid response,
 # VICE is killed cleanly, and /tmp/vice-probe-feth.out contains no pcap
@@ -25,17 +32,28 @@ VICE_OUT="/tmp/vice-probe-feth.out"
 VICE_PID=""
 PROBE_TIMEOUT=8
 USE_SUDO=1
+SKIP_ETHERNET_CHECK=0
+VICE_BIN="${VICE_BIN:-}"
 
-for arg in "$@"; do
-    case "$arg" in
+while [[ $# -gt 0 ]]; do
+    case "$1" in
         --no-sudo) USE_SUDO=0 ;;
+        --skip-ethernet-check) SKIP_ETHERNET_CHECK=1 ;;
+        --vice-bin)
+            if [[ $# -lt 2 ]]; then
+                echo "--vice-bin requires a path argument" >&2
+                exit 2
+            fi
+            VICE_BIN="$2"
+            shift ;;
         -h|--help)
-            sed -n '2,15p' "$0"
+            sed -n '2,22p' "$0"
             exit 0 ;;
         *)
-            echo "unknown arg: $arg" >&2
+            echo "unknown arg: $1" >&2
             exit 2 ;;
     esac
+    shift
 done
 
 if [[ "$(uname)" != "Darwin" ]]; then
@@ -50,13 +68,60 @@ if ! ifconfig "$FETH" >/dev/null 2>&1; then
     exit 1
 fi
 
-if ! command -v x64sc >/dev/null 2>&1; then
+if [[ -n "$VICE_BIN" ]]; then
+    if [[ ! -x "$VICE_BIN" ]]; then
+        echo "[fail] --vice-bin/\$VICE_BIN '$VICE_BIN' is not an executable file"
+        exit 1
+    fi
+elif command -v x64sc >/dev/null 2>&1; then
+    VICE_BIN="$(command -v x64sc)"
+else
     echo "[fail] x64sc not on PATH — is VICE installed? (brew install vice)"
     exit 1
 fi
 
-VICE_BIN="$(command -v x64sc)"
 echo "[probe] VICE binary: $VICE_BIN"
+
+# --- ethernet-capability pre-flight (issue #144) -----------------------------
+# The -ethernetcart / -ethernetiodriver command-line options are compiled in
+# unconditionally, but the *rawnet driver registry* is only populated when
+# VICE was built with ethernet support. Homebrew's arm64 x64sc links libpcap
+# yet registers no driver, so activating the cart dereferences NULL and
+# segfaults in rawnet_arch_pre_reset+8 — an opaque crash that looks like a BPF
+# permissions problem but is not.
+#
+# Detect it before the cart is ever activated: ask VICE to parse
+# `-ethernetiodriver pcap` followed by a deliberately invalid option. VICE
+# parses left to right and bails at the first error, so the message tells us
+# which build we have, and it exits immediately either way -- no window, no
+# cart activation, no crash:
+#
+#   ethernet compiled out -> "Argument 'pcap' not valid for option ..."
+#   ethernet capable      -> "Unknown option '-zz-not-a-real-option'."
+#
+# We only fail on the *specific* pcap rejection, so any unforeseen third
+# outcome falls through to the real probe rather than blocking it.
+if [[ "$SKIP_ETHERNET_CHECK" == "1" ]]; then
+    echo "[warn] ethernet-capability pre-flight skipped (--skip-ethernet-check)"
+else
+    ETH_CHECK_OUT="$("$VICE_BIN" -ethernetiodriver pcap -zz-not-a-real-option 2>&1)" || true
+    if grep -qF "not valid for option \`-ethernetiodriver'" <<<"$ETH_CHECK_OUT"; then
+        echo "[fail] this VICE build has ethernet support compiled out"
+        echo "       $VICE_BIN rejects the 'pcap' rawnet driver:"
+        echo "         $(grep -F "not valid for option" <<<"$ETH_CHECK_OUT" | head -1)"
+        echo
+        echo "       The -ethernetcart option exists but the rawnet driver registry"
+        echo "       is empty, so enabling the cart segfaults in rawnet_arch_pre_reset."
+        echo "       This is NOT a /dev/bpf permissions problem — see issue #144."
+        echo
+        echo "       Fix: use an ethernet-enabled x64sc (official binary, or build"
+        echo "       from source with --enable-ethernet), then re-run with"
+        echo "         $0 --vice-bin /path/to/ethernet-x64sc"
+        echo "       or export VICE_BIN=/path/to/ethernet-x64sc"
+        exit 1
+    fi
+    echo "[ok]   ethernet-capability pre-flight passed (pcap driver registered)"
+fi
 echo "[probe] interface:   $FETH"
 echo "[probe] monitor:     $MONITOR_HOST:$MONITOR_PORT"
 echo "[probe] log:         $VICE_OUT"
@@ -144,7 +209,22 @@ MONITOR_READY=0
 for i in $(seq 1 $((PROBE_TIMEOUT * 4))); do
     if ! kill -0 "$VICE_PID" 2>/dev/null; then
         echo " FAILED"
-        echo "[fail] VICE exited before monitor came up"
+        # Reap the job so we can tell a crash from an orderly exit. A death by
+        # SIGSEGV (128+11) here is the issue-#144 signature: the pre-flight
+        # above should have caught it, so reaching this point means the cart
+        # activation crashed for some other reason.
+        wait "$VICE_PID" 2>/dev/null
+        VICE_RC=$?
+        if [[ "$VICE_RC" == "139" ]]; then
+            echo "[fail] VICE segfaulted (SIGSEGV) during startup"
+            echo "       A crash while activating the ethernet cart is the"
+            echo "       signature of a VICE build without ethernet support"
+            echo "       (empty rawnet driver registry) — see issue #144."
+            echo "       Re-run with --vice-bin pointing at an ethernet-enabled"
+            echo "       x64sc. This is not a /dev/bpf permissions problem."
+        else
+            echo "[fail] VICE exited before monitor came up (rc=$VICE_RC)"
+        fi
         echo "---- VICE output ----"
         cat "$VICE_OUT"
         echo "---- end VICE output ----"
