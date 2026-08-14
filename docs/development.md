@@ -242,9 +242,10 @@ Unlike the Ubuntu flow there is no one-shot installer — `scripts/setup-dev-env
 
   The harness works around this automatically:
 
-  - `ViceConfig.run_as_root: bool | None = None` auto-detects to `True` on Darwin when `ethernet=True`, and can be pinned explicitly on either platform.
-  - `ViceProcess.start()` wraps the argv with `sudo -n` when `run_as_root` is true; `ViceProcess.stop()` routes signals via `sudo -n kill` for the root-owned child.
-  - `tests/bridge_platform.py:probe_vice_pcap_ok()` launches its throwaway probe under `sudo -n` too, so the probe result matches what the tests will see.
+  - `ViceConfig.run_as_root: bool | None = None` auto-detects on Darwin when `ethernet=True`: it elevates **only if this process cannot already open a `/dev/bpf*` node** (`vice_lifecycle.bpf_capture_available()`). A rig that has run `sudo chmod o+rw /dev/bpf*` needs no sudo at all — an unprivileged VICE attaches BPF and captures on `feth(4)` normally. Can be pinned explicitly on either platform.
+  - `ViceProcess.start()` wraps the argv with `sudo -n` when `run_as_root` resolves true; `ViceProcess.stop()` routes signals via `sudo -n kill` for the root-owned child. When it resolves false, `ViceProcess.pid` is x64sc directly.
+  - The NOPASSWD entry (when elevation does fire) must name the **exact** x64sc path being launched. An entry for `/opt/homebrew/bin/x64sc` does not cover a custom ethernet-enabled build elsewhere.
+  - `tests/bridge_platform.py:probe_vice_pcap_ok()` applies the same elevation rule, so the probe measures the configuration the tests will run under. It also requires the probed VICE to hold a real `/dev/bpf*` handle: reaching the binary monitor is **not** proof of capture, because a VICE whose rawnet driver never attached still emulates the CS8900 registers and would let the ethernet suite pass vacuously (issue #144).
 
   The `sudo -n` wrap is **non-interactive**: it requires a passwordless sudoers entry for `/opt/homebrew/bin/x64sc` on macOS dev hosts. See the "Passwordless sudo for bridge lifecycle" subsection above — the same sudoers drop-in that covers the three bridge scripts now also needs an `x64sc` entry. `scripts/verify-dev-env.sh` reports a `warn` row if the entry is missing.
 

@@ -29,7 +29,14 @@ import time
 
 import pytest
 
-from bridge_platform import BRIDGE_NAME, IFACE_A, IFACE_B, SETUP_HINT, iface_present
+from bridge_platform import (
+    BRIDGE_NAME,
+    IFACE_A,
+    IFACE_B,
+    SETUP_HINT,
+    iface_present,
+    probe_vice_pcap_ok,
+)
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
 from c64_test_harness.bridge_ping import (
     build_echo_request_frame,
@@ -49,8 +56,13 @@ from c64_test_harness.tod_timer import (
 # ---------------------------------------------------------------------------
 _HAS_X64SC = shutil.which("x64sc") is not None
 
+_PCAP_OK, _PCAP_REASON = probe_vice_pcap_ok(iface=IFACE_A)
+
 _VICE_SKIPS = [
     pytest.mark.skipif(not _HAS_X64SC, reason="x64sc not found on PATH"),
+    # See test_bridge_ping.py: monitor-up is not proof of capture, so
+    # require a real /dev/bpf* attach or these pass vacuously (issue #144).
+    pytest.mark.skipif(not _PCAP_OK, reason=_PCAP_REASON),
     pytest.mark.skipif(
         not iface_present(IFACE_A),
         reason=f"{IFACE_A} not found ({SETUP_HINT})",

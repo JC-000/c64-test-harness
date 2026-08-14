@@ -277,7 +277,9 @@ config = ViceConfig(
 )
 ```
 
-On macOS `ViceProcess` auto-wraps the x64sc launch with `sudo -n` because VICE's pcap driver on `feth(4)` requires root (the macOS kernel enforces a per-process BPF attach permission that 666 on `/dev/bpf*` alone does not satisfy). This is a no-op on Linux. You need a NOPASSWD sudoers entry for `/opt/homebrew/bin/x64sc` on macOS; see `docs/development.md` -> macOS -> "Passwordless sudo for bridge lifecycle" for the full recipe.
+On macOS `ViceProcess` wraps the x64sc launch with `sudo -n` only when this process cannot already open a `/dev/bpf*` node — those are root-only on stock macOS, but a rig that runs `sudo chmod o+rw /dev/bpf*` makes them reachable and no elevation happens (an unprivileged VICE then attaches BPF and captures on `feth(4)` normally). This is a no-op on Linux. When elevation does fire you need a NOPASSWD sudoers entry naming the **exact** x64sc path you launch — an entry for `/opt/homebrew/bin/x64sc` will not cover a custom ethernet-enabled build; see `docs/development.md` -> macOS -> "Passwordless sudo for bridge lifecycle".
+
+Note that Homebrew's x64sc cannot do real ethernet at all (issue #144): as root it starts and answers the binary monitor while attaching **no** BPF device, so CS8900 register assertions pass against pure emulation with zero host traffic. `probe_vice_pcap_ok()` demands a real `/dev/bpf*` attach for exactly this reason — if the ethernet tests skip with "attached no /dev/bpf* device", point them at an ethernet-enabled build rather than assuming a permissions problem.
 
 `ViceInstanceManager` auto-generates unique MACs (`02:c6:40:xx:xx:xx`) per instance and programs the CS8900a Individual Address registers after connect — no manual MAC handling needed.
 

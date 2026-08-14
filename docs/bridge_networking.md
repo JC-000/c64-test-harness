@@ -255,13 +255,18 @@ The Linux equivalent (`tests/test_cleanup_vice_ports_live.py`) uses the
 `bash` wrapper because Linux sudoers there are configured permissively;
 do not copy that helper verbatim onto macOS.
 
-**2. `ViceConfig.ethernet=True` auto-elevates the launch.**
-On macOS, `ViceConfig` flips `run_as_root=True` whenever `ethernet=True`
-(libpcap/BPF needs root unless ChmodBPF is installed). `ViceProcess`
-therefore wraps the launch in `sudo -n x64sc …`, so the recorded
-`ViceProcess.pid` is the **sudo wrapper's** PID, not the actual
-`x64sc` process. `ps -p <sudo_pid> -o ucomm=` returns `"sudo"`, which
-breaks any `_is_x64sc(pid)` sanity check.
+**2. `ViceConfig.ethernet=True` may auto-elevate the launch.**
+On macOS, `ViceConfig` resolves `run_as_root=True` when `ethernet=True`
+**and** this process cannot already open a `/dev/bpf*` node. Stock macOS
+keeps those root-only, so elevation is the default there; a rig that runs
+`sudo chmod o+rw /dev/bpf*` (as `scripts/setup-bridge-feth-macos.sh`
+instructs) makes them reachable and no sudo is used at all.
+
+When elevation *does* fire, `ViceProcess` wraps the launch in
+`sudo -n x64sc …`, so the recorded `ViceProcess.pid` is the **sudo
+wrapper's** PID, not the actual `x64sc` process. `ps -p <sudo_pid> -o
+ucomm=` returns `"sudo"`, which breaks any `_is_x64sc(pid)` sanity check.
+Check `ViceProcess.is_sudo_child` rather than assuming either shape.
 
 Resolve the real x64sc descendant before asserting:
 

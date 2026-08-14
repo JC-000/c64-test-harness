@@ -6,6 +6,7 @@ manager that handles the lifecycle).
 
 from __future__ import annotations
 
+import glob
 import os
 import platform
 import socket
@@ -144,16 +145,70 @@ class ViceConfig:
     sound_record_file: str | None = None
     exit_screenshot: str | None = None
 
-    # Run VICE as root. Required on macOS whenever the pcap ethernet driver
-    # is used: even with /dev/bpf* mode 666, the kernel's per-process BPF
-    # device allocation refuses to let a non-root process capture on a
-    # feth(4) interface, and VICE's error path leaves rawnet_arch_driver
-    # NULL so cs8900_activate segfaults.  The harness wraps the launch
-    # with ``sudo -n -E`` in that case; the caller must have a passwordless
-    # sudoers entry for x64sc (see docs/development.md -> macOS ->
-    # Passwordless sudo).  ``None`` means auto-detect: True on Darwin when
-    # ethernet is enabled, False otherwise.  Set explicitly to override.
+    # Run VICE as root.  On macOS the pcap ethernet driver needs read/write
+    # on a ``/dev/bpf*`` node, which is root-only by default -- so the
+    # harness wraps the launch with ``sudo -n`` when, and only when, those
+    # nodes are not already reachable as the current user.  Rigs commonly
+    # open them up (``chmod o+rw /dev/bpf*``); once they are accessible an
+    # unprivileged VICE captures on feth(4) perfectly well, verified with a
+    # full DHCP exchange over feth0 (issue #144 follow-up).
+    #
+    # An earlier revision of this comment claimed the kernel refuses
+    # non-root capture on feth(4) even at mode 666, and elevated every
+    # macOS ethernet launch on that basis.  That was a misreading of the
+    # segfault in ``cs8900_activate`` (NULL ``rawnet_arch_driver``): per
+    # #144 that crash is a VICE build with ethernet compiled out, and it
+    # reproduces identically as root and with /dev/bpf* already o+rw.
+    # Do not restore the blanket elevation -- fix the VICE build instead.
+    #
+    # ``None`` means auto-detect (the rule above).  Set explicitly to
+    # override; a passwordless sudoers entry is only needed when elevation
+    # actually fires, and it must name the *exact* x64sc path being
+    # launched (see docs/development.md -> macOS -> Passwordless sudo).
     run_as_root: bool | None = None
+
+
+def bpf_capture_available() -> bool:
+    """True when this process could open a BPF device for pcap capture.
+
+    macOS gates packet capture behind read/write access to a ``/dev/bpf*``
+    node, which is root-only out of the box.  Test rigs routinely open them
+    up (``sudo chmod o+rw /dev/bpf*`` --
+    ``scripts/setup-bridge-feth-macos.sh`` prints this as a required manual
+    step, and consumer rigs such as c64-https's ``rig-up-macos.sh`` do it
+    for you).  Once the nodes are reachable, an unprivileged VICE captures
+    on feth(4) normally -- confirmed by a full DHCP exchange over feth0.
+
+    This is what :attr:`ViceConfig.run_as_root` auto-detection consults, so
+    the harness elevates only when it would otherwise be unable to capture.
+
+    Returns ``True`` on non-Darwin platforms, where this gate does not
+    apply, and when already running as root.
+    """
+    if sys.platform != "darwin":
+        return True
+    if os.geteuid() == 0:
+        return True
+    return any(
+        os.access(node, os.R_OK | os.W_OK)
+        for node in glob.glob("/dev/bpf*")
+    )
+
+
+def _should_run_as_root(cfg: ViceConfig) -> bool:
+    """Resolve :attr:`ViceConfig.run_as_root`, including auto-detection.
+
+    An explicit ``True``/``False`` is honoured verbatim.  ``None`` means:
+    elevate only on macOS, only when the ethernet cart is in play, and only
+    when this process could not open a BPF device on its own.
+    """
+    if cfg.run_as_root is not None:
+        return cfg.run_as_root
+    return (
+        sys.platform == "darwin"
+        and cfg.ethernet
+        and not bpf_capture_available()
+    )
 
 
 class ViceProcess:
@@ -347,17 +402,15 @@ class ViceProcess:
         if cfg.env is not None:
             popen_kwargs["env"] = cfg.env
 
-        # Decide whether to wrap with sudo.  On macOS, VICE's pcap driver
-        # needs root to open a BPF device for feth(4) capture; running as
-        # the user segfaults inside cs8900_activate (NULL rawnet_arch_driver
-        # after pcap init fails).  The wrap happens at exec time so the
-        # sudo failure mode is clean: if NOPASSWD isn't configured, Popen
-        # starts but exits with a "sudo: password is required" error on
-        # stderr and a non-zero status, and the caller sees "VICE exited
-        # early" through the normal monitor-connect path.
-        run_as_root = cfg.run_as_root
-        if run_as_root is None:
-            run_as_root = sys.platform == "darwin" and cfg.ethernet
+        # Decide whether to wrap with sudo.  On macOS the pcap driver needs
+        # read/write on a /dev/bpf* node; elevate only when the current user
+        # cannot already reach one (see ViceConfig.run_as_root).  The wrap
+        # happens at exec time so the sudo failure mode is clean: if
+        # NOPASSWD isn't configured, Popen starts but exits with a "sudo:
+        # password is required" error on stderr and a non-zero status, and
+        # the caller sees "VICE exited early" through the normal
+        # monitor-connect path.
+        run_as_root = _should_run_as_root(cfg)
         if run_as_root:
             # -E (preserve env) requires a SETENV tag in sudoers which we
             # deliberately do NOT ask for -- it's a privilege expansion.

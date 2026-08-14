@@ -28,7 +28,14 @@ import time
 
 import pytest
 
-from bridge_platform import BRIDGE_NAME, IFACE_A, IFACE_B, SETUP_HINT, iface_present
+from bridge_platform import (
+    BRIDGE_NAME,
+    IFACE_A,
+    IFACE_B,
+    SETUP_HINT,
+    iface_present,
+    probe_vice_pcap_ok,
+)
 
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
 from c64_test_harness.bridge_ping import (
@@ -55,8 +62,16 @@ from c64_test_harness.memory import read_bytes, write_bytes
 # ---------------------------------------------------------------------------
 _HAS_X64SC = shutil.which("x64sc") is not None
 
+_PCAP_OK, _PCAP_REASON = probe_vice_pcap_ok(iface=IFACE_A)
+
 pytestmark = [
     pytest.mark.skipif(not _HAS_X64SC, reason="x64sc not found on PATH"),
+    # Reaching the binary monitor is not proof of capture: a VICE whose
+    # rawnet driver never attached still emulates the CS8900 registers, so
+    # these tests would assert on register readbacks with zero host traffic
+    # and pass vacuously. probe_vice_pcap_ok() demands a real /dev/bpf*
+    # attach. See issue #144.
+    pytest.mark.skipif(not _PCAP_OK, reason=_PCAP_REASON),
     pytest.mark.skipif(
         not iface_present(IFACE_A),
         reason=f"{IFACE_A} not found ({SETUP_HINT})",
