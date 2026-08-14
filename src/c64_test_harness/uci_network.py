@@ -40,6 +40,7 @@ Response formats:
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -2054,6 +2055,178 @@ def uci_tcp_listen_stop(
         turbo_safe=turbo_safe,
     )
     _execute_uci_routine(transport, code, timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Wedge detection — non-blocking $DF1C status sampling
+# ---------------------------------------------------------------------------
+#
+# Issue #112: 6502-side ``uci_wait_idle`` routines that spin on
+# ``UCI_STATUS & 0x31 != 0`` with no timeout will hang for ~161s when the
+# FPGA gets stuck (typically after 2-3 successful SOCKET_WRITE runs).
+# ``client.reboot()`` does NOT recover this state — only a physical
+# power-cycle does. See ``docs/u64_recovery.md``.
+#
+# The primitives below let consumers DETECT the wedge from the host side
+# without invoking any unbounded spin: a single ``LDA $DF1C; STA result``
+# routine returns whatever state the firmware happens to be in right now,
+# and ``uci_wedge_probe`` classifies a short window of samples.
+# ---------------------------------------------------------------------------
+
+# Classification strings returned by :class:`UciWedgeProbeResult`.
+WEDGE_CLASS_IDLE           = "idle"
+WEDGE_CLASS_BUSY_TRANSIENT = "busy_transient"
+WEDGE_CLASS_WEDGED         = "wedged"
+
+_WEDGE_RECOMMEND_BUSY = (
+    "UCI command processor cycling normally; "
+    "retry after current command completes"
+)
+_WEDGE_RECOMMEND_WEDGED = (
+    "UCI STATE-bit stuck. reset()/reboot() typically DO NOT clear this; "
+    "physical power-cycle is required. See docs/u64_recovery.md."
+)
+
+
+def build_uci_status_peek(
+    result_addr: int = _RESP_ADDR,
+    sentinel_addr: int = _SENTINEL_ADDR,
+    code_addr: int = _CODE_ADDR,
+    turbo_safe: bool = False,
+) -> bytes:
+    """Build 6502 routine: NON-BLOCKING read of UCI status ($DF1C), store at *result_addr*.
+
+    Unlike :func:`_build_wait_idle`, this routine does NOT spin on
+    STATE/CMD_BUSY — it captures whatever state the firmware is in right
+    now. That makes it safe to call against a wedged UCI (issue #112)
+    without hanging the 6502.
+
+    :param turbo_safe: If ``True``, insert the delay-loop fence after the
+        ``LDA $DF1C`` so the FPGA has time to settle the status byte before
+        the CPU stores it. See :func:`build_uci_command` for background.
+    """
+    code: list[int] = []
+    # Non-blocking read of UCI status register.
+    code.extend([_LDA_ABS, _lo(UCI_CONTROL_STATUS_REG), _hi(UCI_CONTROL_STATUS_REG)])
+    if turbo_safe:
+        code.extend(_build_fence())
+    code.extend([_STA_ABS, _lo(result_addr), _hi(result_addr)])
+    # Sentinel + RTS (routine is dispatched via SYS, returns to BASIC).
+    code.extend(_build_sentinel(sentinel_addr))
+    code.append(_RTS)
+    return bytes(code)
+
+
+def uci_status_peek(
+    transport: "C64Transport",
+    *,
+    timeout: float = _DEFAULT_TIMEOUT,
+    turbo_safe: bool = False,
+) -> int:
+    """Non-blocking read of the UCI status register ($DF1C).
+
+    Returns the raw status byte (0-255). Bit layout:
+    bit7=DATA_AV, bit6=STAT_AV, bits5:4=STATE, bit3=ERROR, bit0=CMD_BUSY.
+
+    Use :func:`uci_wedge_probe` for classified multi-sample diagnostics.
+
+    :param turbo_safe: If ``True``, emit the delay-loop fence required for
+        turbo CPU speeds (8/24/48 MHz) on real U64E. See
+        :func:`build_uci_command` for background.
+    """
+    code = build_uci_status_peek(turbo_safe=turbo_safe)
+    _execute_uci_routine(transport, code, timeout=timeout)
+    return transport.read_memory(_RESP_ADDR, 1)[0]
+
+
+@dataclass(frozen=True)
+class UciWedgeProbeResult:
+    """Result of a :func:`uci_wedge_probe` sampling window.
+
+    :ivar samples: Raw ``$DF1C`` bytes captured over the probe window.
+    :ivar classification: One of ``"idle"``, ``"busy_transient"``, or
+        ``"wedged"``.
+    :ivar recommendation: Human-readable next-step text, or ``None`` when
+        the UCI is idle (no action required).
+    """
+
+    samples: tuple[int, ...]
+    classification: str
+    recommendation: str | None
+
+    @property
+    def is_wedged(self) -> bool:
+        """``True`` when every sample shows STATE or CMD_BUSY set."""
+        return self.classification == WEDGE_CLASS_WEDGED
+
+    @property
+    def is_idle(self) -> bool:
+        """``True`` when every sample shows STATE==0 and CMD_BUSY==0."""
+        return self.classification == WEDGE_CLASS_IDLE
+
+
+def uci_wedge_probe(
+    transport: "C64Transport",
+    *,
+    samples: int = 4,
+    sample_interval: float = 0.25,
+    timeout: float = _DEFAULT_TIMEOUT,
+    turbo_safe: bool = False,
+) -> UciWedgeProbeResult:
+    """Sample $DF1C *samples* times and classify the UCI state.
+
+    Issues *samples* consecutive :func:`uci_status_peek` calls separated by
+    *sample_interval* seconds of host-side ``time.sleep`` and classifies the
+    result:
+
+    - ``"idle"`` — every sample has ``byte & 0x31 == 0``
+    - ``"busy_transient"`` — at least one sample is idle and at least one
+      sample shows STATE or CMD_BUSY set (i.e. the command processor is
+      cycling normally)
+    - ``"wedged"`` — every sample has ``byte & 0x31 != 0`` (the FPGA's
+      STATE bit is stuck; ``reset()``/``reboot()`` will NOT recover —
+      physical power-cycle required, see issue #112).
+
+    :param samples: Number of $DF1C reads to take. Must be ``>= 2`` so the
+        wedged-vs-transient distinction is well-defined.
+    :param sample_interval: Host-side sleep between samples, seconds.
+    :param timeout: Per-peek SYS-dispatch timeout, seconds.
+    :param turbo_safe: see :func:`build_uci_command`.
+    :raises ValueError: If *samples* < 2.
+    """
+    if samples < 2:
+        raise ValueError(
+            f"uci_wedge_probe requires samples >= 2 to distinguish wedged "
+            f"from transient busy, got samples={samples}"
+        )
+
+    collected: list[int] = []
+    for i in range(samples):
+        collected.append(uci_status_peek(
+            transport, timeout=timeout, turbo_safe=turbo_safe,
+        ))
+        if i + 1 < samples:
+            time.sleep(sample_interval)
+
+    busy = [b for b in collected if (b & _IDLE_MASK) != 0]
+    idle = [b for b in collected if (b & _IDLE_MASK) == 0]
+
+    if not busy:
+        classification = WEDGE_CLASS_IDLE
+        recommendation: str | None = None
+    elif idle:
+        classification = WEDGE_CLASS_BUSY_TRANSIENT
+        recommendation = _WEDGE_RECOMMEND_BUSY
+    else:
+        classification = WEDGE_CLASS_WEDGED
+        recommendation = _WEDGE_RECOMMEND_WEDGED
+
+    return UciWedgeProbeResult(
+        samples=tuple(collected),
+        classification=classification,
+        recommendation=recommendation,
+    )
 
 
 # ---------------------------------------------------------------------------
