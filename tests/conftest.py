@@ -273,8 +273,8 @@ def binary_transport():
 # Default MACs and IPs used by the bridge_vice_pair fixture
 BRIDGE_MAC_A = bytes.fromhex("02C640000001")
 BRIDGE_MAC_B = bytes.fromhex("02C640000002")
-BRIDGE_IP_A = bytes([10, 0, 65, 2])
-BRIDGE_IP_B = bytes([10, 0, 65, 3])
+# Reserved harness range; see tests/bridge_platform.py.
+from bridge_platform import BRIDGE_IP_A, BRIDGE_IP_B  # noqa: E402,F401
 
 
 def _bridge_wait_ready(transport: BinaryViceTransport, timeout: float = 30.0) -> None:

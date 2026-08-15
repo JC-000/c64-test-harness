@@ -33,8 +33,10 @@ from c64_test_harness.bridge_ping import (
 # Reuse the bridge fixture defaults so the values match real test traffic.
 MAC_A = bytes.fromhex("02C640000001")
 HOST_MAC = bytes.fromhex("0A0B0C0D0E0F")
-IP_A = bytes([10, 0, 65, 2])
-HOST_IP = bytes([10, 0, 65, 1])
+from bridge_platform import BRIDGE_HOST_IP, BRIDGE_IP_A
+
+IP_A = BRIDGE_IP_A
+HOST_IP = BRIDGE_HOST_IP
 
 
 def _verify_ip_checksum(ip_header_bytes: bytes) -> int:
