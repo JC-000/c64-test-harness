@@ -26,6 +26,7 @@ from bridge_platform import (
     IFACE_B,
     SETUP_HINT,
     iface_present,
+    probe_vice_pcap_ok,
 )
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
@@ -42,8 +43,13 @@ from conftest import connect_binary_transport
 
 _HAS_X64SC = shutil.which("x64sc") is not None
 
+_PCAP_OK, _PCAP_REASON = probe_vice_pcap_ok(iface=IFACE_A)
+
 pytestmark = [
     pytest.mark.skipif(not _HAS_X64SC, reason="x64sc not found on PATH"),
+    # See test_bridge_ping.py: monitor-up is not proof of capture, so
+    # require a real /dev/bpf* attach or these pass vacuously (issue #144).
+    pytest.mark.skipif(not _PCAP_OK, reason=_PCAP_REASON),
     pytest.mark.skipif(
         not iface_present(IFACE_A),
         reason=f"{IFACE_A} not found ({SETUP_HINT})",

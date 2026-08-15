@@ -28,6 +28,12 @@ import sys
 import tempfile
 import time
 
+from c64_test_harness.backends.vice_lifecycle import (
+    ETHERNET_VICE_BIN_ENV,
+    bpf_capture_available,
+    ethernet_vice_binary,
+)
+
 if sys.platform == "darwin":
     ETHERNET_DRIVER = "pcap"
     IFACE_A = "feth0"
@@ -134,6 +140,41 @@ def _wait_for_tcp(host: str, port: int, deadline: float) -> bool:
     return False
 
 
+def _x64sc_pid(proc: subprocess.Popen, elevated: bool) -> int | None:
+    """Resolve the real x64sc PID (``proc`` is the sudo wrapper when elevated)."""
+    if not elevated:
+        return proc.pid
+    try:
+        out = subprocess.run(
+            ["pgrep", "-P", str(proc.pid), "x64sc"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for line in out.stdout.split():
+        try:
+            return int(line)
+        except ValueError:
+            continue
+    return None
+
+
+def _bpf_fds(pid: int) -> list[str]:
+    """``/dev/bpf*`` nodes held open by *pid* — the proof of a live capture."""
+    try:
+        out = subprocess.run(
+            ["lsof", "-nP", "-p", str(pid)],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return [
+        line.split()[-1]
+        for line in out.stdout.splitlines()
+        if "/dev/bpf" in line
+    ]
+
+
 def probe_vice_pcap_ok(
     iface: str | None = None,
     timeout: float = 3.0,
@@ -186,9 +227,19 @@ def probe_vice_pcap_ok(
         )
         return _PROBE_CACHE
 
-    x64sc = shutil.which("x64sc")
+    # Probe the binary the ethernet tests will actually launch: an
+    # ethernet-capable build when one is configured ($VICE_ETHERNET_BIN),
+    # otherwise the PATH x64sc.  Probing PATH while the tests run a
+    # different binary would report on the wrong emulator entirely.
+    x64sc = ethernet_vice_binary() or shutil.which("x64sc")
     if x64sc is None:
         _PROBE_CACHE = (False, "x64sc not on PATH")
+        return _PROBE_CACHE
+    if not os.access(x64sc, os.X_OK):
+        _PROBE_CACHE = (
+            False,
+            f"{x64sc} (from ${ETHERNET_VICE_BIN_ENV}) is not executable",
+        )
         return _PROBE_CACHE
 
     if iface is None:
@@ -254,14 +305,13 @@ def probe_vice_pcap_ok(
             f.write(rc_body)
 
         port = _probe_port()
-        # VICE needs root on macOS for pcap on feth(4): /dev/bpf* mode 666
-        # is not enough -- the kernel refuses non-root BPF attach to feth.
-        # Probe under sudo -n so a host with passwordless sudo for x64sc
-        # gets a true "pcap works" result, while a host without it gets a
-        # clean "could not elevate" skip reason (sudo prints to stderr
-        # and exits non-zero, which we surface as process-exited below).
-        args = [
-            "sudo", "-n",
+        # Elevate on exactly the same rule production uses, so the probe
+        # measures the configuration the tests will actually run under.
+        # ``/dev/bpf*`` is root-only by default; rigs that open it up
+        # (``chmod o+rw``) let VICE capture unprivileged, verified by a
+        # non-root build attaching /dev/bpf1+2 on feth0.
+        elevated = not bpf_capture_available()
+        args = (["sudo", "-n"] if elevated else []) + [
             x64sc,
             "-addconfig", rc_path,
             "-ethernetioif", iface,
@@ -301,10 +351,34 @@ def probe_vice_pcap_ok(
                     monitor_up = True
                     break
             if monitor_up:
-                _PROBE_CACHE = (
-                    True,
-                    f"VICE pcap+{iface} reached the binary monitor",
-                )
+                # Reaching the monitor is necessary but NOT sufficient. A
+                # VICE whose rawnet driver never attached still emulates the
+                # CS8900 registers, so register-level assertions (product
+                # ID, TxCMD readback) pass while zero host packets move --
+                # a silently vacuous ethernet suite. The Homebrew 3.10
+                # bottle does exactly this when launched as root: alive,
+                # monitor up, and no /dev/bpf* handle. Demand the BPF
+                # attach as the proof of real capture.
+                bpf_pid = _x64sc_pid(proc, elevated)
+                held = _bpf_fds(bpf_pid) if bpf_pid else []
+                if held:
+                    _PROBE_CACHE = (
+                        True,
+                        f"VICE pcap+{iface} attached {', '.join(held)}",
+                    )
+                else:
+                    _PROBE_CACHE = (
+                        False,
+                        (
+                            f"VICE reached the binary monitor on {iface} but "
+                            "attached no /dev/bpf* device, so it captures "
+                            "nothing -- ethernet tests would pass vacuously "
+                            "against emulated CS8900 registers with no host "
+                            "traffic. This is the Homebrew x64sc signature "
+                            "(see issue #144); point the tests at an "
+                            "ethernet-enabled build."
+                        ),
+                    )
             elif proc.poll() is not None:
                 _PROBE_CACHE = (
                     False,

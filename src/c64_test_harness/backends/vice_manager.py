@@ -357,6 +357,7 @@ class ViceInstanceManager:
             limit_cycles=self._base_config.limit_cycles,
             env=self._base_config.env,
             ethernet=self._base_config.ethernet,
+            ethernet_executable=self._base_config.ethernet_executable,
             ethernet_mode=self._base_config.ethernet_mode,
             ethernet_interface=self._base_config.ethernet_interface,
             ethernet_driver=self._base_config.ethernet_driver,
