@@ -39,6 +39,8 @@ import time
 
 import pytest
 
+from bridge_platform import BRIDGE_HOST_IP, BRIDGE_IP_A, bridge_ip_str
+
 # Skip the entire module if the gate is unset -- collection still works,
 # but tests will be marked skipped.  Module-level skip keeps the imports
 # below from running on machines without VICE.
@@ -111,7 +113,7 @@ if _LIVE_GATE and _IS_LINUX:
 # C64 MAC and IP -- the same locally-administered MAC used by the bridge
 # fixture pair.  The host bridge already knows this address pattern.
 C64_MAC = bytes.fromhex("02C640000001")
-C64_IP = bytes([10, 0, 65, 2])
+C64_IP = BRIDGE_IP_A
 
 # Host bridge IP (set by scripts/setup-bridge-tap.sh).  The host MAC is
 # not fixed -- we use Ethernet broadcast for the destination so we don't
@@ -119,7 +121,7 @@ C64_IP = bytes([10, 0, 65, 2])
 # frames to the host stack on the bridge interface; the kernel then
 # accepts the IPv4/UDP packet as locally-destined because dst_ip
 # matches the bridge's IP.
-HOST_IP = bytes([10, 0, 65, 1])
+HOST_IP = BRIDGE_HOST_IP
 HOST_MAC_BROADCAST = b"\xff\xff\xff\xff\xff\xff"
 
 # UDP ports.  Source port is arbitrary, dst port is what the host
@@ -304,7 +306,7 @@ class TestRrnetUdpSend:
         # surface that loudly so the next agent doesn't chase phantom
         # checksum bugs.
         src_ip_str, src_port = listener_out["src"]
-        assert src_ip_str == "10.0.65.2", (
+        assert src_ip_str == bridge_ip_str(2), (
             f"unexpected source IP from listener: {src_ip_str}"
         )
         assert src_port == SRC_PORT, (

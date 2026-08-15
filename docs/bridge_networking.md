@@ -262,6 +262,23 @@ keeps those root-only, so elevation is the default there; a rig that runs
 `sudo chmod o+rw /dev/bpf*` (as `scripts/setup-bridge-feth-macos.sh`
 instructs) makes them reachable and no sudo is used at all.
 
+**The `10.0.65.0/24` range belongs to the harness.** The setup scripts put
+the host at `.1` (`BRIDGE_ADDR`) and the ethernet tests answer on `.2` and
+`.3`. Those three addresses are reserved; they are defined once in
+`tests/bridge_platform.py` (`BRIDGE_HOST_IP`, `BRIDGE_IP_A`,
+`BRIDGE_IP_B`) rather than repeated as literals, and the whole range can
+be moved with `C64_BRIDGE_SUBNET=10.77.1` when the harness has to coexist
+with a rig that already owns `10.0.65/24`.
+
+**Consumer rigs built on this bridge must stay clear of `.1`-`.3`.** A rig
+that reuses the harness's bridge and runs its own services should take
+`.100` upward. This is not hypothetical: c64-https's `rig-up-macos.sh`
+calls the harness setup script, then moves the host address to `feth1`
+while keeping `.1`, and runs a dnsmasq DHCP pool of `.2-.10` — handing out
+exactly the addresses the harness's two-VICE tests hardcode. Nothing
+detects that clash; the bridge tests simply fail or behave oddly while the
+consumer rig is up.
+
 **The BPF device pool is the real macOS constraint.** `sudo chmod o+rw
 /dev/bpf*` only affects nodes that exist *at that moment*. macOS creates
 further ones on demand with default root-only permissions, and an

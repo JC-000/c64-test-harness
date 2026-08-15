@@ -46,6 +46,10 @@ from c64_test_harness.memory import read_bytes
 # Reuse the same MAC/IP constants the test suite uses
 MAC_A = bytes.fromhex("02C640000001")
 MAC_B = bytes.fromhex("02C640000002")
+# Harness-reserved bridge addresses. The canonical definition (and the
+# C64_BRIDGE_SUBNET override) lives in tests/bridge_platform.py; this demo
+# is standalone and outside the tests package, so it repeats the default.
+# Keep in step with that module if the range ever moves.
 IP_A = bytes([10, 0, 65, 2])
 IP_B = bytes([10, 0, 65, 3])
 
