@@ -75,6 +75,19 @@ env var. Once a released firmware ships #686, this becomes a no-op that
 finds nothing to delete rather than diagnostic history to remove
 outright — re-validate against the new firmware first.
 
+**Correction (issue #153 comment, 2026-08-21):** the firmware's
+attachment counter is hex, not decimal — `temp0009` is followed by
+`temp000A`. `gc_temp_folder` matches `^temp[0-9a-fA-F]+$` and sorts by
+the suffix parsed as base-16 (a decimal-only pattern silently leaves
+every lettered name uncollected — this exact bug was already found and
+fixed in the sibling `c64-https` repo, `tools/uci/_temp_gc.py` at
+`a4f4c46`). Separately, the C64U ships `FTP File Service: Disabled` by
+default (the U64E has it enabled); `gc_temp_folder` detects a refused
+FTP connection and reports that the setting may need enabling via
+`Network Settings > FTP File Service` — a runtime-only REST config
+write, so a reboot both reverts it and empties `/Temp` (the revert is
+benign).
+
 ## Wedge tiers
 
 | Tier | Symptom | Probe | Recovery | Fallback when recovery fails |

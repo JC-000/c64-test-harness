@@ -16,8 +16,8 @@ Env gates (all unset -> skips cleanly):
                             files in the device's ``/Temp`` folder.
 
 Never: ``save_config_to_flash``, ``poweroff``, ``reboot``, or a machine
-reset. Only ``^temp\\d+$``-named files are ever deleted — see the
-pattern guard test, which is unit-level (no live device needed).
+reset. Only ``^temp[0-9a-fA-F]+$``-named files are ever deleted — see
+the pattern guard test, which is unit-level (no live device needed).
 """
 from __future__ import annotations
 

@@ -58,10 +58,13 @@ FTP_USER_ENV = "U64_TEMP_GC_FTP_USER"
 FTP_PASSWORD_ENV = "U64_TEMP_GC_FTP_PASSWORD"
 
 #: The firmware's managed-attachment naming (see 1541ultimate#686 and
-#: the c64-https tools/uci/_temp_gc.py workaround this supersedes).
-#: Deliberately narrow -- user files and mounted disk images that also
-#: live in /Temp must never match.
-_MANAGED_ATTACHMENT_RE = re.compile(r"^temp(\d+)$")
+#: the c64-https tools/uci/_temp_gc.py workaround this supersedes). The
+#: counter is HEX, not decimal -- ``temp0009`` is followed by
+#: ``temp000A`` -- so the suffix must accept a-f/A-F, not just digits
+#: (issue #153 correction; a decimal-only pattern silently leaves every
+#: lettered name uncollected). Deliberately narrow -- user files and
+#: mounted disk images that also live in /Temp must never match.
+_MANAGED_ATTACHMENT_RE = re.compile(r"^temp([0-9a-fA-F]+)$")
 
 DEFAULT_KEEP = 2
 DEFAULT_FTP_PORT = 21
@@ -132,10 +135,12 @@ def gc_temp_folder(
 ) -> TempGCResult:
     """Best-effort GC of the U64's managed ``/Temp`` attachments over FTP.
 
-    Deletes ``^temp\\d+$``-named files in ``/Temp``, oldest-first (by the
-    numeric suffix), keeping the *keep* youngest. Nothing else in
-    ``/Temp`` (user files, mounted ``.d64``/``.crt`` images) matches the
-    pattern and so is never touched.
+    Deletes ``^temp[0-9a-fA-F]+$``-named files in ``/Temp``, oldest-first
+    (by the suffix parsed as base-16 -- the firmware's counter is hex, so
+    ``temp0009`` is followed by ``temp000A``), keeping the *keep*
+    youngest. Nothing else in ``/Temp`` (user files, mounted
+    ``.d64``/``.crt`` images) matches the pattern and so is never
+    touched.
 
     :param host: Device hostname/IP (the REST host -- FTP is a separate
         port on the same device).
@@ -171,7 +176,7 @@ def gc_temp_folder(
                 basename = name.rsplit("/", 1)[-1]
                 m = _MANAGED_ATTACHMENT_RE.match(basename)
                 if m:
-                    managed.append((int(m.group(1)), name))
+                    managed.append((int(m.group(1), 16), name))
             managed.sort(key=lambda pair: pair[0])
             managed_names = [name for _, name in managed]
 
@@ -197,6 +202,16 @@ def gc_temp_folder(
                     len(deleted), host, len(to_keep),
                 )
             return TempGCResult(host=host, deleted=deleted, kept=to_keep)
+    except ConnectionRefusedError as exc:
+        error = (
+            f"ConnectionRefusedError: {exc} -- FTP File Service may be disabled on this "
+            "device (seen by default on C64U fw 1.1.0; U64E ships it enabled). Enable it "
+            "via Network Settings > FTP File Service in the device's REST config; this is "
+            "a runtime-only setting -- a reboot reverts it, which is benign since a reboot "
+            "also empties /Temp."
+        )
+        _log.info("gc_temp_folder: /Temp hygiene pass skipped on %s (%s)", host, error)
+        return TempGCResult(host=host, error=error)
     except Exception as exc:  # noqa: BLE001 - deliberately blanket, see module docstring
         _log.info("gc_temp_folder: /Temp hygiene pass skipped on %s (%s: %s)", host, type(exc).__name__, exc)
         return TempGCResult(host=host, error=f"{type(exc).__name__}: {exc}")

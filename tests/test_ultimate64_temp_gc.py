@@ -91,13 +91,30 @@ def test_deletes_oldest_first_keeps_default_youngest():
 
 
 def test_ignores_non_managed_files():
-    _FakeFTP.files = ["temp0000", "temp0001", "temp0002", "somefile.d64", "temp", "temp12a"]
+    _FakeFTP.files = ["temp0000", "temp0001", "temp0002", "somefile.d64", "temp", "temp12g"]
     result = gc_temp_folder("10.0.0.1", keep=1)
     assert result.deleted == ["temp0000", "temp0001"]
     assert result.kept == ["temp0002"]
     assert "somefile.d64" not in _FakeFTP.deleted
     assert "temp" not in _FakeFTP.deleted
-    assert "temp12a" not in _FakeFTP.deleted
+    assert "temp12g" not in _FakeFTP.deleted
+
+
+def test_hex_suffix_ordering_across_letter_boundary():
+    # Firmware's attachment counter is hex: temp0009 is followed by
+    # temp000A, not treated as "after" a hypothetical temp0010. A
+    # decimal-only pattern skips lettered names entirely (issue #153).
+    _FakeFTP.files = ["temp000A", "temp0009", "temp000B"]
+    result = gc_temp_folder("10.0.0.1", keep=1)
+    assert result.deleted == ["temp0009", "temp000A"]
+    assert result.kept == ["temp000B"]
+
+
+def test_hex_suffix_lowercase_also_matches():
+    _FakeFTP.files = ["temp000a", "temp000b"]
+    result = gc_temp_folder("10.0.0.1", keep=1)
+    assert result.deleted == ["temp000a"]
+    assert result.kept == ["temp000b"]
 
 
 def test_keep_le_len_keeps_everything():
@@ -151,6 +168,18 @@ def test_never_raises_on_connect_failure():
     result = gc_temp_folder("10.0.0.1")
     assert not result.ok
     assert "connection refused" in result.error
+    assert result.deleted == []
+
+
+def test_connection_refused_names_ftp_file_service_setting():
+    # Seen on C64U fw 1.1.0, which ships FTP File Service disabled by
+    # default (issue #153 correction) -- the error should say what to
+    # check instead of just surfacing the bare connect exception.
+    _FakeFTP.connect_error = ConnectionRefusedError("[Errno 61] Connection refused")
+    result = gc_temp_folder("10.0.0.1")
+    assert not result.ok
+    assert "FTP File Service" in result.error
+    assert "Network Settings" in result.error
     assert result.deleted == []
 
 
