@@ -42,6 +42,52 @@ Two practical consequences while the fix is unreleased:
   deleting anything — the deterministic repro in issue #112 is the
   intended verification.
 
+### Harness-side mitigation: FTP `/Temp` GC (issue #153)
+
+`run_prg` (and any other endpoint that carries a body — `writemem`,
+`load_prg`, keyboard-inject) leaks a managed attachment
+(`temp0000`, `temp0001`, ...) per call, and no released firmware
+collects them. This is shared 1541ultimate firmware behaviour, not
+specific to either device generation. `ultimate64_temp_gc.gc_temp_folder(host, ...)`
+deletes those files over FTP, oldest-first, keeping the youngest N
+(default 2) — mirroring the policy 1541ultimate#686 will eventually
+apply on-device. It is best-effort: any FTP/network failure is captured
+in the returned `TempGCResult.error` rather than raised, so a hygiene
+pass can never fail a test run.
+
+Verified live on both device generations: originally on the U64E, and
+on the C64U (10.53.21.158, firmware 1.1.0) on 2026-08-21 —
+`tests/test_temp_gc_live.py` passed end-to-end (repeated `run_prg`
+leaks `temp####` attachments, `gc_temp_folder` trims them to the
+keep-count and is idempotent on a re-run) using the same anonymous-FTP,
+`/Temp`-path defaults as the U64E; no generation-specific credentials or
+path were needed.
+
+`Ultimate64Client.run_prg` calls this automatically before uploading
+when the `U64_AUTO_TEMP_GC` env var is set (off by default — unit tests
+that construct a client against a fake host never make a real network
+call). Knobs: `U64_TEMP_GC_KEEP` (keep-count override) and
+`U64_TEMP_GC_FTP_USER` / `U64_TEMP_GC_FTP_PASSWORD` (bench devices run
+anonymous FTP; override for a device with FTP credentials configured).
+Call `client.gc_temp_folder()` (or the module function) directly for
+other attachment-heavy paths, or to run a manual pass regardless of the
+env var. Once a released firmware ships #686, this becomes a no-op that
+finds nothing to delete rather than diagnostic history to remove
+outright — re-validate against the new firmware first.
+
+**Correction (issue #153 comment, 2026-08-21):** the firmware's
+attachment counter is hex, not decimal — `temp0009` is followed by
+`temp000A`. `gc_temp_folder` matches `^temp[0-9a-fA-F]+$` and sorts by
+the suffix parsed as base-16 (a decimal-only pattern silently leaves
+every lettered name uncollected — this exact bug was already found and
+fixed in the sibling `c64-https` repo, `tools/uci/_temp_gc.py` at
+`a4f4c46`). Separately, the C64U ships `FTP File Service: Disabled` by
+default (the U64E has it enabled); `gc_temp_folder` detects a refused
+FTP connection and reports that the setting may need enabling via
+`Network Settings > FTP File Service` — a runtime-only REST config
+write, so a reboot both reverts it and empties `/Temp` (the revert is
+benign).
+
 ## Wedge tiers
 
 | Tier | Symptom | Probe | Recovery | Fallback when recovery fails |
@@ -247,3 +293,5 @@ fail-fast can be swapped for a direct recovery call.
 - [`src/c64_test_harness/backends/ultimate64_helpers.py`](../src/c64_test_harness/backends/ultimate64_helpers.py) — `recover`, `runner_health_check`
 - [`src/c64_test_harness/backends/ultimate64_client.py`](../src/c64_test_harness/backends/ultimate64_client.py) — `reset`, `reboot`, `poweroff`, `Ultimate64RunnerStuckError`, `Ultimate64UnsafeOperationError`, `Ultimate64UnreachableError`
 - [`src/c64_test_harness/uci_network.py`](../src/c64_test_harness/uci_network.py) — `uci_wedge_probe`, `UCI_CONTROL_STATUS_REG` (`$DF1C`), STATE-bit masks
+- Issue [#153](https://github.com/JC-000/c64-test-harness/issues/153) — automatic FTP `/Temp` GC to defuse the writemem-exhaustion wedge before it starts
+- [`src/c64_test_harness/backends/ultimate64_temp_gc.py`](../src/c64_test_harness/backends/ultimate64_temp_gc.py) — `gc_temp_folder`, `TempGCResult`, `auto_gc_enabled`

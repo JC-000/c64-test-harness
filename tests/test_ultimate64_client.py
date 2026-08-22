@@ -456,6 +456,56 @@ def test_run_prg_sends_binary():
     assert req.get_header("Content-type") == "application/octet-stream"
 
 
+def test_run_prg_does_not_gc_temp_by_default(monkeypatch: pytest.MonkeyPatch):
+    """U64_AUTO_TEMP_GC is unset by default -- run_prg must not touch FTP.
+
+    Regression guard for issue #153: the auto-GC hook is opt-in
+    specifically so this test (and every other run_prg test in this
+    file, none of which mock ftplib) never makes a real network call.
+    """
+    monkeypatch.delenv("U64_AUTO_TEMP_GC", raising=False)
+    c = Ultimate64Client("h")
+    with patch.object(c, "gc_temp_folder") as mock_gc:
+        mock, _ = _capture(b"")
+        with patch("urllib.request.urlopen", mock):
+            c.run_prg(b"\x01\x08\x0b\x08")
+    mock_gc.assert_not_called()
+
+
+def test_run_prg_gcs_temp_folder_when_auto_enabled(monkeypatch: pytest.MonkeyPatch):
+    """U64_AUTO_TEMP_GC=1 makes run_prg GC /Temp before uploading (issue #153)."""
+    monkeypatch.setenv("U64_AUTO_TEMP_GC", "1")
+    c = Ultimate64Client("h")
+    calls: list[str] = []
+
+    def fake_gc(**kwargs):
+        calls.append("gc")
+        return None
+
+    mock, captured = _capture(b"")
+    with patch.object(c, "gc_temp_folder", side_effect=fake_gc) as mock_gc, \
+         patch("urllib.request.urlopen", mock):
+        c.run_prg(b"\x01\x08\x0b\x08")
+    mock_gc.assert_called_once()
+    # GC must run before the upload, not after.
+    assert calls == ["gc"]
+    assert captured[0][0].get_full_url() == "http://h/v1/runners:run_prg"
+
+
+def test_client_gc_temp_folder_delegates_with_host():
+    """Ultimate64Client.gc_temp_folder() forwards this client's host + kwargs."""
+    c = Ultimate64Client("10.0.0.64")
+    with patch(
+        "c64_test_harness.backends.ultimate64_temp_gc.gc_temp_folder"
+    ) as mock_module_gc:
+        mock_module_gc.return_value = "sentinel"
+        result = c.gc_temp_folder(keep=5, ftp_username="bench", ftp_password="hunter2")
+    assert result == "sentinel"
+    mock_module_gc.assert_called_once_with(
+        "10.0.0.64", port=None, username="bench", password="hunter2", keep=5, timeout=10.0
+    )
+
+
 def test_sid_play_includes_songnr():
     mock, captured = _capture(b"")
     c = Ultimate64Client("h")
