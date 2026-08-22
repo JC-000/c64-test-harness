@@ -107,6 +107,11 @@ from .backends.ultimate64_manager import (
     Ultimate64ManagerError,
     Ultimate64PoolExhaustedError,
 )
+from .backends.ultimate64_temp_gc import (
+    TempGCResult,
+    gc_temp_folder,
+    auto_gc_enabled,
+)
 from .backends.ultimate64_probe import (
     LivenessResult,
     ProbeResult,
@@ -446,6 +451,10 @@ __all__ = [
     "Ultimate64InstanceManager",
     "Ultimate64ManagerError",
     "Ultimate64PoolExhaustedError",
+    # Ultimate 64 /Temp attachment GC (issue #153)
+    "TempGCResult",
+    "gc_temp_folder",
+    "auto_gc_enabled",
     # Ultimate 64 liveness probe
     "ProbeResult",
     "LivenessResult",

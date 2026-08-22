@@ -42,6 +42,30 @@ Two practical consequences while the fix is unreleased:
   deleting anything — the deterministic repro in issue #112 is the
   intended verification.
 
+### Harness-side mitigation: FTP `/Temp` GC (issue #153)
+
+`run_prg` (and any other endpoint that carries a body — `writemem`,
+`load_prg`, keyboard-inject) leaks a managed attachment
+(`temp0000`, `temp0001`, ...) per call, and no released firmware
+collects them. `ultimate64_temp_gc.gc_temp_folder(host, ...)` deletes
+those files over FTP, oldest-first, keeping the youngest N (default 2)
+— mirroring the policy 1541ultimate#686 will eventually apply on-device.
+It is best-effort: any FTP/network failure is captured in the returned
+`TempGCResult.error` rather than raised, so a hygiene pass can never
+fail a test run.
+
+`Ultimate64Client.run_prg` calls this automatically before uploading
+when the `U64_AUTO_TEMP_GC` env var is set (off by default — unit tests
+that construct a client against a fake host never make a real network
+call). Knobs: `U64_TEMP_GC_KEEP` (keep-count override) and
+`U64_TEMP_GC_FTP_USER` / `U64_TEMP_GC_FTP_PASSWORD` (bench devices run
+anonymous FTP; override for a device with FTP credentials configured).
+Call `client.gc_temp_folder()` (or the module function) directly for
+other attachment-heavy paths, or to run a manual pass regardless of the
+env var. Once a released firmware ships #686, this becomes a no-op that
+finds nothing to delete rather than diagnostic history to remove
+outright — re-validate against the new firmware first.
+
 ## Wedge tiers
 
 | Tier | Symptom | Probe | Recovery | Fallback when recovery fails |
@@ -247,3 +271,5 @@ fail-fast can be swapped for a direct recovery call.
 - [`src/c64_test_harness/backends/ultimate64_helpers.py`](../src/c64_test_harness/backends/ultimate64_helpers.py) — `recover`, `runner_health_check`
 - [`src/c64_test_harness/backends/ultimate64_client.py`](../src/c64_test_harness/backends/ultimate64_client.py) — `reset`, `reboot`, `poweroff`, `Ultimate64RunnerStuckError`, `Ultimate64UnsafeOperationError`, `Ultimate64UnreachableError`
 - [`src/c64_test_harness/uci_network.py`](../src/c64_test_harness/uci_network.py) — `uci_wedge_probe`, `UCI_CONTROL_STATUS_REG` (`$DF1C`), STATE-bit masks
+- Issue [#153](https://github.com/JC-000/c64-test-harness/issues/153) — automatic FTP `/Temp` GC to defuse the writemem-exhaustion wedge before it starts
+- [`src/c64_test_harness/backends/ultimate64_temp_gc.py`](../src/c64_test_harness/backends/ultimate64_temp_gc.py) — `gc_temp_folder`, `TempGCResult`, `auto_gc_enabled`

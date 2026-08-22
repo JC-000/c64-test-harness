@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .ultimate64_probe import LivenessResult
+    from .ultimate64_temp_gc import TempGCResult
 
 try:  # device_lock needs fcntl — absent on Windows, optional everywhere
     from .device_lock import advisory_lock_check as _advisory_lock_check
@@ -692,6 +693,46 @@ class Ultimate64Client:
         """
         self._post_binary("/v1/runners:load_prg", data)
 
+    def gc_temp_folder(
+        self,
+        *,
+        keep: int | None = None,
+        ftp_port: int | None = None,
+        ftp_username: str | None = None,
+        ftp_password: str | None = None,
+        timeout: float | None = None,
+    ) -> "TempGCResult":
+        """Best-effort GC of the device's leaked ``/Temp`` attachments over FTP.
+
+        Every REST call that carries a body leaks a managed attachment
+        (``temp0000``, ``temp0001``, ...) into ``/Temp``; unreleased
+        firmware never collects them, and enough accumulation wedges
+        the REST API and UCI bridge together (see GitHub issue #153,
+        ``docs/u64_recovery.md``). This deletes them oldest-first,
+        keeping the youngest *keep*.
+
+        Delegates to
+        :func:`~c64_test_harness.backends.ultimate64_temp_gc.gc_temp_folder`
+        with this client's ``host``. Never raises -- any FTP/network
+        failure is captured in the returned result's ``.error``.
+        :meth:`run_prg` calls this automatically when
+        ``U64_AUTO_TEMP_GC`` is set; call it directly for other
+        attachment-heavy paths (e.g. repeated :meth:`load_prg`) or to
+        run a manual hygiene pass.
+
+        Caller responsibility: this does not acquire a DeviceLock. Call
+        it only while already holding the lock for this device.
+        """
+        from .ultimate64_temp_gc import DEFAULT_FTP_TIMEOUT, gc_temp_folder as _gc_temp_folder
+        return _gc_temp_folder(
+            self.host,
+            port=ftp_port,
+            username=ftp_username,
+            password=ftp_password,
+            keep=keep,
+            timeout=timeout if timeout is not None else DEFAULT_FTP_TIMEOUT,
+        )
+
     def run_prg(self, data: bytes, *, fallback_on_404: bool = True) -> None:
         """POST /v1/runners:run_prg — load and RUN a PRG (DESTRUCTIVE).
 
@@ -739,7 +780,17 @@ class Ultimate64Client:
         Do NOT call ``poweroff()`` to clear a stuck runner -- it leaves
         the device unreachable until someone physically power-cycles it.
         ``reboot()`` (via ``recover()``) is the correct escalation.
+
+        **Temp-folder hygiene** (issue #153): when the ``U64_AUTO_TEMP_GC``
+        env var is set, this calls :meth:`gc_temp_folder` before
+        uploading, best-effort, to defuse the writemem-exhaustion wedge
+        described above and in ``docs/u64_recovery.md``. Off by default
+        (opt-in) so callers that never set the var see no behavior
+        change and no network traffic beyond the PRG upload itself.
         """
+        from .ultimate64_temp_gc import auto_gc_enabled as _auto_gc_enabled
+        if _auto_gc_enabled():
+            self.gc_temp_folder()
         try:
             self._post_binary("/v1/runners:run_prg", data)
         except Ultimate64Error as exc:
