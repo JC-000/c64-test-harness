@@ -631,6 +631,8 @@ Exception mapping: timeouts, unreachable device, and connection drops mid-reques
 from c64_test_harness.backends.ultimate64_helpers import (
     set_turbo_mhz, get_turbo_mhz, get_turbo_enabled,
     set_reu, get_reu_config,
+    set_badline_timing, get_badline_timing,
+    set_bus_operation_mode, get_bus_config,
     snapshot_state, restore_state,
     reset, reboot,
     recover, runner_health_check,
@@ -643,13 +645,15 @@ from c64_test_harness.backends.ultimate64_helpers import (
 - `get_turbo_mhz(client) -> int | None` -- Current speed, or None if turbo off
 - `max_cpu_speed_mhz(client) -> int` -- The device's maximum turbo speed from the same preset probe (64 on C64U fw 1.1.0, 48 on U64E fw 3.14; 48 fallback when inconclusive). Backs `Ultimate64Transport.set_speed(None)`. Module-level export, not re-exported from the package root.
 - `set_reu(client, enabled, size=None)` -- Enable/disable REU; size as str ("512 KB") or int (MB). Cross-generation: probes the device's `Cartridge` presets and writes `Cartridge: "REU"` only where offered (U64E yes, C64 Ultimate no — its Cartridge value mirrors REU state and rejects the write with HTTP 400). The preset write is ordered first so a rejection never half-enables the REU. `restore_state` applies the same probe to the snapshotted cartridge value.
-- `snapshot_state(client) -> U64StateSnapshot` -- Capture turbo + REU + cartridge state
+- `set_badline_timing(client, enabled)` / `get_badline_timing(client) -> bool` -- VIC-II badline DMA, which costs the 6510 ~20-25% of its cycles at 1 MHz. Disabling it is the clean way to measure badline cost while holding the PRG byte-identical (vs `$D011` blanking, which changes the shipped image). **Runtime-only state that persists until power cycle on a queue-shared device** — a run that disables badlines and dies leaves every later run quietly ~20-25% fast. `snapshot_state`/`restore_state` cover it and `check_measurement_environment` fails closed on it. Live-verified on U64E fw 3.14d (`"Enabled"`/`"Disabled"`); the C64U spelling is **unverified** — the helpers raise rather than silently no-op if the item is absent. See issue #150.
+- `get_bus_config(client) -> BusConfig` / `set_bus_operation_mode(client, mode)` -- Cartridge-port `Bus Operation Mode` (`"Quiet"`, `"Writes"`, `"Dynamic"`, `"Dyn. & Writes"`; default `"Quiet"`) plus the four read-only `Bus Sharing - *` values in `BusConfig.sharing`. A plausible input to the REU-DMA-bound wall-clock floor, so record `get_bus_config()` alongside any benchmark artifact. Same runtime-only caveat as the REU helpers. See issue #145.
+- `snapshot_state(client) -> U64StateSnapshot` -- Capture turbo + REU + cartridge + badline + bus-mode state. The two newest fields default to `""`, and `restore_state` skips empty values, so snapshots taken before they existed still restore.
 - `restore_state(client, snap)` -- Restore a snapshot. Orders the `Cartridge` item first in its config batch — the same abort-before-half-applied invariant as `set_reu` (a firmware rejection of the Cartridge write aborts the batch before the REU is half-enabled).
 - `reset(client)` -- Soft reset (CPU only)
 - `reboot(client)` -- Full FPGA reboot (clears DMA state, ~8s settle)
 - `recover(client, *, reset_settle_seconds=2.0, reboot_settle_seconds=12.0, escalate_to_reboot=True) -> str` -- Escalate `reset()` -> probe -> `reboot()` -> probe; returns `"reset"` or `"reboot"`. Raises `Ultimate64UnreachableError` on total failure. Never calls `poweroff()`.
 - `runner_health_check(client) -> None` -- Post a tiny no-op PRG; raises `Ultimate64RunnerStuckError` on the firmware's "Cannot open file" wedged-runner signature.
-- `check_measurement_environment(client) -> None` -- Assert turbo is off (1 MHz); raises `Ultimate64MeasurementEnvironmentError` if a prior session left turbo enabled. Call before any CIA-timer benchmark. See GitHub issue #102.
+- `check_measurement_environment(client) -> None` -- Assert turbo is off (1 MHz) **and** badline DMA is enabled; raises `Ultimate64MeasurementEnvironmentError` if a prior session left either dirty. Turbo is checked first. The badline check is skipped (not failed) when the device does not expose `Badline Timing`, since an unreadable item is not evidence of a dirty environment. Call before any CIA-timer benchmark. See GitHub issues #102 and #150.
 
 ### `ultimate64_schema` constants
 - `CPU_SPEED_VALUES` -- tuple of 17 speed enum strings (" 1" through "48", plus "64") — the cross-generation superset; a given device offers a subset (probed at runtime by the helpers above)

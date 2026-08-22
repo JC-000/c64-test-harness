@@ -35,6 +35,9 @@ class Ultimate64MeasurementEnvironmentError(Ultimate64Error):
     (e.g., CPU turbo left enabled from a prior session). See GitHub issue #102."""
 from .ultimate64_probe import is_u64_reachable
 from .ultimate64_schema import (
+    BADLINE_TIMING_VALUES,
+    BUS_OPERATION_MODE_VALUES,
+    BUS_SHARING_VALUES,
     CPU_SPEED_VALUES,
     DISK_IMAGE_TYPES,
     MOUNT_MODES,
@@ -59,6 +62,12 @@ __all__ = [
     "max_cpu_speed_mhz",
     "get_reu_config",
     "set_reu",
+    "get_badline_timing",
+    "set_badline_timing",
+    "BusConfig",
+    "get_bus_config",
+    "set_bus_operation_mode",
+    "BUS_SHARING_ITEMS",
     "get_sid_config",
     "set_sid_socket",
     "mount_disk_file",
@@ -121,6 +130,17 @@ _ITEM_CPU_SPEED = "CPU Speed"
 _ITEM_REU_ENABLED = "RAM Expansion Unit"
 _ITEM_REU_SIZE = "REU Size"
 _ITEM_CARTRIDGE = "Cartridge"
+_ITEM_BADLINE_TIMING = "Badline Timing"
+_ITEM_BUS_OPERATION_MODE = "Bus Operation Mode"
+
+#: The four ``Bus Sharing - *`` items, in device-report order. All four
+#: share :data:`BUS_SHARING_VALUES`.
+BUS_SHARING_ITEMS: tuple[str, ...] = (
+    "Bus Sharing - ROMs",
+    "Bus Sharing - I/O1",
+    "Bus Sharing - I/O2",
+    "Bus Sharing - Interrupts",
+)
 
 
 def _unwrap(resp: dict, category: str) -> dict:
@@ -852,24 +872,186 @@ def check_measurement_environment(client: Ultimate64Client) -> None:
         CIA-timer-based measurements to read as ``target_cycles / turbo_factor``
         with no exception, because the CIA continues counting at its fixed rate
         while the CPU runs N× faster.
+      - VIC-II badline DMA is enabled. Badlines cost the 6510 ~20-25% of its
+        cycles at 1 MHz, so a device left with them disabled by a prior run
+        reports uniformly optimistic figures. This is the same hazard shape as
+        turbo: runtime-only state on a queue-shared device, persisting until
+        power cycle, with no symptom that looks like a misconfiguration.
 
     Raises Ultimate64MeasurementEnvironmentError on a state that would produce
     silently-wrong measurements. Returns None on a clean environment.
 
-    See GitHub issue #102 for the failure-mode walkthrough.
+    The badline check is skipped (not failed) when the device does not expose
+    ``Badline Timing`` -- the item is live-verified on U64E firmware 3.14d but
+    unverified on the C64 Ultimate, and an unreadable item is not evidence of a
+    dirty environment.
+
+    See GitHub issues #102 and #150 for the failure-mode walkthroughs.
 
     :param client: Connected Ultimate64 client.
     :raises Ultimate64MeasurementEnvironmentError: When turbo is active at a
-        non-1 MHz speed.
+        non-1 MHz speed, or badline DMA is disabled.
     """
     mhz = get_turbo_mhz(client)
-    if mhz is None or mhz == 1:
-        return
-    raise Ultimate64MeasurementEnvironmentError(
-        f"CPU turbo is enabled at {mhz} MHz; CIA-timer measurements will read as "
-        f"target_cycles/{mhz}. Call set_turbo_mhz(client, 1) before benchmarking. "
-        f"See GitHub issue #102."
+    if mhz is not None and mhz != 1:
+        raise Ultimate64MeasurementEnvironmentError(
+            f"CPU turbo is enabled at {mhz} MHz; CIA-timer measurements will read as "
+            f"target_cycles/{mhz}. Call set_turbo_mhz(client, 1) before benchmarking. "
+            f"See GitHub issue #102."
+        )
+    try:
+        badline_raw = _read_badline_raw(client)
+    except Ultimate64Error:
+        badline_raw = None
+    if badline_raw == "Disabled":
+        raise Ultimate64MeasurementEnvironmentError(
+            "VIC-II badline DMA is disabled; the 6510 gets ~20-25% more cycles "
+            "than a stock C64, so measurements will read uniformly fast. Call "
+            "set_badline_timing(client, True) before benchmarking. "
+            "See GitHub issue #150."
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Badline timing                                                              #
+# --------------------------------------------------------------------------- #
+
+def _read_badline_raw(client: Ultimate64Client) -> str | None:
+    """Return the raw ``Badline Timing`` enum string, or ``None`` if absent.
+
+    ``None`` means the item was not present in the category dump -- the
+    expected outcome on a device generation that does not expose it, or
+    spells it differently. Callers decide whether that is fatal.
+    """
+    inner = _unwrap(
+        client.get_config_category(CAT_U64_SPECIFIC), CAT_U64_SPECIFIC
     )
+    raw = inner.get(_ITEM_BADLINE_TIMING)
+    return None if raw is None else str(raw)
+
+
+def get_badline_timing(client: Ultimate64Client) -> bool:
+    """Return ``True`` when VIC-II badline DMA is enabled (authentic C64 behaviour).
+
+    Badlines cost the 6510 roughly 20-25% of its cycles at 1 MHz, so this
+    is a timing-relevant variable for any benchmark. Disabling it is the
+    clean way to isolate badline cost while holding the PRG byte-identical
+    (as opposed to ``$D011`` blanking inside the program, which changes the
+    shipped image and hides on-screen progress markers).
+
+    :param client: Connected Ultimate64 client.
+    :returns: ``True`` if ``Badline Timing`` is ``"Enabled"``.
+    :raises Ultimate64Error: If the device does not expose the item.
+    """
+    raw = _read_badline_raw(client)
+    if raw is None:
+        raise Ultimate64Error(
+            f"{_ITEM_BADLINE_TIMING!r} is not exposed under {CAT_U64_SPECIFIC!r} "
+            f"on {client.host}. Verified present on U64E firmware 3.14d; other "
+            f"generations may spell it differently."
+        )
+    return raw == "Enabled"
+
+
+def set_badline_timing(client: Ultimate64Client, enabled: bool) -> None:
+    """Enable or disable VIC-II badline DMA.
+
+    .. warning::
+       This is **runtime-only state that persists until power cycle**, on a
+       queue-shared device. A run that disables badlines and dies before
+       restoring leaves every subsequent run on that device quietly ~20-25%
+       fast, with no symptom that looks like a misconfiguration. Capture and
+       restore it with :func:`snapshot_state` / :func:`restore_state`, which
+       both cover this field; :func:`check_measurement_environment` also
+       fails closed on a device left with badlines disabled.
+
+    Cross-generation caveat: live-verified on the U64 Elite (firmware
+    3.14d), where the item accepts ``"Enabled"`` / ``"Disabled"``. The C64
+    Ultimate is *assumed* to spell the category and item identically, but
+    that is unverified -- the two generations already diverge on the CPU
+    Speed enum and on cartridge presets, so same-name is an assumption.
+    On a device that does not expose the item this raises rather than
+    silently no-opping.
+
+    :param client: Connected Ultimate64 client.
+    :param enabled: ``True`` for authentic badline DMA, ``False`` to
+        suppress it (giving the 6510 ~20-25% more cycles at 1 MHz).
+    :raises ValueError: If *enabled* is not a bool.
+    :raises Ultimate64Error: If the device does not expose the item.
+    """
+    if not isinstance(enabled, bool):
+        raise ValueError(f"enabled must be bool, got {type(enabled).__name__}")
+    if _read_badline_raw(client) is None:
+        raise Ultimate64Error(
+            f"{_ITEM_BADLINE_TIMING!r} is not exposed under {CAT_U64_SPECIFIC!r} "
+            f"on {client.host}; refusing to write an item the device does not report."
+        )
+    value = validate_enum(
+        "Enabled" if enabled else "Disabled",
+        BADLINE_TIMING_VALUES,
+        _ITEM_BADLINE_TIMING,
+    )
+    client.set_config_items(CAT_U64_SPECIFIC, {_ITEM_BADLINE_TIMING: value})
+
+
+# --------------------------------------------------------------------------- #
+# Cartridge-port bus behaviour                                                #
+# --------------------------------------------------------------------------- #
+
+@dataclass(frozen=True)
+class BusConfig:
+    """Cartridge-port bus settings that can influence expansion-bus timing.
+
+    :param operation_mode: ``Bus Operation Mode`` enum value, one of
+        :data:`BUS_OPERATION_MODE_VALUES`.
+    :param sharing: Mapping of each :data:`BUS_SHARING_ITEMS` name to its
+        current value. Items the device did not report are omitted.
+    """
+
+    operation_mode: str
+    sharing: Mapping[str, str]
+
+
+def get_bus_config(client: Ultimate64Client) -> BusConfig:
+    """Read the cartridge-port bus settings in one category fetch.
+
+    Intended for recording alongside a benchmark result: an REU-DMA-bound
+    workload's headline number may depend on these values, and a run whose
+    artifact does not carry them is not reproducible in the way the numbers
+    imply.
+
+    :param client: Connected Ultimate64 client.
+    :returns: A :class:`BusConfig`. ``operation_mode`` is ``""`` when the
+        device did not report the item.
+    """
+    inner = _unwrap(client.get_config_category(CAT_CART), CAT_CART)
+    return BusConfig(
+        operation_mode=str(inner.get(_ITEM_BUS_OPERATION_MODE, "")),
+        sharing={
+            item: str(inner[item])
+            for item in BUS_SHARING_ITEMS
+            if item in inner
+        },
+    )
+
+
+def set_bus_operation_mode(client: Ultimate64Client, mode: str) -> None:
+    """Set ``Bus Operation Mode``, validating *mode* before touching the network.
+
+    .. warning::
+       Runtime-only state that reverts on power cycle, the same caveat the
+       REU helpers carry. On a queue-shared device, restore it after a run
+       -- :func:`snapshot_state` / :func:`restore_state` cover this field.
+
+    :param client: Connected Ultimate64 client.
+    :param mode: One of :data:`BUS_OPERATION_MODE_VALUES` (device default
+        is ``"Quiet"``).
+    :raises ValueError: If *mode* is not a known enum value.
+    """
+    value = validate_enum(
+        mode, BUS_OPERATION_MODE_VALUES, _ITEM_BUS_OPERATION_MODE
+    )
+    client.set_config_items(CAT_CART, {_ITEM_BUS_OPERATION_MODE: value})
 
 
 # --------------------------------------------------------------------------- #
@@ -882,8 +1064,13 @@ class U64StateSnapshot:
 
     Holds exactly the raw string enum values needed to reconstruct the
     device state touched by :func:`set_turbo_mhz`, :func:`set_reu`,
-    and :func:`set_sid_socket`. All strings preserve device-side
+    :func:`set_sid_socket`, :func:`set_badline_timing`, and
+    :func:`set_bus_operation_mode`. All strings preserve device-side
     formatting (e.g. the leading space in ``" 1"`` for CPU Speed).
+
+    ``badline_timing`` and ``bus_operation_mode`` default to ``""`` so that
+    snapshots constructed positionally by existing callers keep working; an
+    empty value is skipped at restore time, exactly like ``reu_size``.
     """
 
     turbo_control: str
@@ -891,6 +1078,8 @@ class U64StateSnapshot:
     reu_enabled: str
     reu_size: str
     cartridge: str
+    badline_timing: str = ""
+    bus_operation_mode: str = ""
 
 
 def snapshot_state(client: Ultimate64Client) -> U64StateSnapshot:
@@ -907,6 +1096,8 @@ def snapshot_state(client: Ultimate64Client) -> U64StateSnapshot:
         reu_enabled=str(cart.get(_ITEM_REU_ENABLED, "")),
         reu_size=str(cart.get(_ITEM_REU_SIZE, "")),
         cartridge=str(cart.get(_ITEM_CARTRIDGE, "")),
+        badline_timing=str(u64.get(_ITEM_BADLINE_TIMING, "")),
+        bus_operation_mode=str(cart.get(_ITEM_BUS_OPERATION_MODE, "")),
     )
 
 
@@ -932,13 +1123,16 @@ def restore_state(client: Ultimate64Client, snap: U64StateSnapshot) -> None:
         raise TypeError(
             f"snap must be U64StateSnapshot, got {type(snap).__name__}"
         )
-    client.set_config_items(
-        CAT_U64_SPECIFIC,
-        {
-            _ITEM_TURBO_CONTROL: snap.turbo_control,
-            _ITEM_CPU_SPEED: snap.cpu_speed,
-        },
-    )
+    u64_updates: dict[str, Any] = {
+        _ITEM_TURBO_CONTROL: snap.turbo_control,
+        _ITEM_CPU_SPEED: snap.cpu_speed,
+    }
+    # Skipped when empty: a snapshot taken before this field existed, or
+    # from a device generation that does not expose the item. Writing ""
+    # back produces HTTP 400, same as the reu_size case below.
+    if snap.badline_timing:
+        u64_updates[_ITEM_BADLINE_TIMING] = snap.badline_timing
+    client.set_config_items(CAT_U64_SPECIFIC, u64_updates)
     cart_updates: dict[str, Any] = {}
     # Cartridge FIRST — the same ordering invariant :func:`set_reu`
     # documents: :meth:`Ultimate64Client.set_config_items` iterates in
@@ -959,6 +1153,8 @@ def restore_state(client: Ultimate64Client, snap: U64StateSnapshot) -> None:
     # ("Function none requires parameter value").
     if snap.reu_size:
         cart_updates[_ITEM_REU_SIZE] = snap.reu_size
+    if snap.bus_operation_mode:
+        cart_updates[_ITEM_BUS_OPERATION_MODE] = snap.bus_operation_mode
     client.set_config_items(CAT_CART, cart_updates)
 
 

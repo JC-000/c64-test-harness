@@ -88,6 +88,34 @@ TURBO_CONTROL_VALUES: tuple[str, ...] = (
 
 
 # --------------------------------------------------------------------------- #
+# Badline timing                                                              #
+# --------------------------------------------------------------------------- #
+
+#: ``U64 Specific Settings / Badline Timing``. Governs whether the VIC-II
+#: steals cycles from the 6510 for badline DMA (~20-25% of cycles at 1 MHz).
+#: Device default is ``"Enabled"`` (i.e. authentic C64 behaviour).
+#: Live-probed on U64E firmware 3.14d; the C64 Ultimate is assumed to spell
+#: the item identically but that is UNVERIFIED -- see :func:`.set_badline_timing`.
+BADLINE_TIMING_VALUES: tuple[str, ...] = ("Disabled", "Enabled")
+
+
+# --------------------------------------------------------------------------- #
+# Cartridge-port bus behaviour                                                #
+# --------------------------------------------------------------------------- #
+
+#: ``C64 and Cartridge Settings / Bus Operation Mode``. Controls how the
+#: cartridge port is driven; a plausible input to REU-DMA-bound workloads.
+#: Device default is ``"Quiet"``.
+BUS_OPERATION_MODE_VALUES: tuple[str, ...] = (
+    "Quiet", "Writes", "Dynamic", "Dyn. & Writes",
+)
+
+#: Shared value set for all four ``C64 and Cartridge Settings / Bus Sharing - *``
+#: items (ROMs, I/O1, I/O2, Interrupts). Device default is ``"Both"``.
+BUS_SHARING_VALUES: tuple[str, ...] = ("Internal", "External", "Both")
+
+
+# --------------------------------------------------------------------------- #
 # REU (RAM Expansion Unit)                                                    #
 # --------------------------------------------------------------------------- #
 
@@ -239,6 +267,9 @@ __all__ = [
     "cpu_speed_enum",
     "cpu_speed_mhz",
     "TURBO_CONTROL_VALUES",
+    "BADLINE_TIMING_VALUES",
+    "BUS_OPERATION_MODE_VALUES",
+    "BUS_SHARING_VALUES",
     "REU_SIZE_VALUES",
     "REU_ENABLED_VALUES",
     "reu_size_enum",
