@@ -1,13 +1,22 @@
-"""FTP-based garbage collection for the U64E's leaked ``/Temp`` attachments.
+"""FTP-based garbage collection for the Ultimate's leaked ``/Temp`` attachments.
 
-Every U64E REST call that carries a body (``writemem`` POST, ``run_prg``,
-``load_prg``, ...) lands as a managed attachment (``temp0000``,
-``temp0001``, ...) in the device's ``/Temp`` folder, and no released
-firmware collects them. Once ``/Temp`` fills (~15 cycles of a 63 KB PRG
-in the reproduction that prompted this module), the REST API and the
-C64-facing UCI bridge wedge together and only a physical power-cycle
-recovers — see ``docs/u64_recovery.md`` for the wedge-tier writeup and
-GitHub issue #153 for the FTP-based mitigation this module implements.
+Every Ultimate REST call that carries a body (``writemem`` POST,
+``run_prg``, ``load_prg``, ...) lands as a managed attachment
+(``temp0000``, ``temp0001``, ...) in the device's ``/Temp`` folder, and
+no released firmware collects them. Once ``/Temp`` fills (~15 cycles of
+a 63 KB PRG in the U64E reproduction that prompted this module), the
+REST API and the C64-facing UCI bridge wedge together and only a
+physical power-cycle recovers — see ``docs/u64_recovery.md`` for the
+wedge-tier writeup and GitHub issue #153 for the FTP-based mitigation
+this module implements.
+
+This is shared 1541ultimate firmware behaviour, not U64E-specific: it
+affects both device generations (U64E on 3.14d, C64U on 1.1.0). The
+module itself is host-generic (no generation branching) and has been
+verified live end-to-end (leak via ``run_prg`` + FTP GC trims to the
+keep-count) on both: originally on the U64E, and on the C64U at
+10.53.21.158 via ``tests/test_temp_gc_live.py`` (2026-08-21) — anonymous
+FTP against ``/Temp`` worked with the same defaults as the U64E.
 
 Upstream root cause and fix: GideonZ/1541ultimate#686 (auto-cleanup of
 managed ``/Temp`` files, oldest-first, keep youngest 10) — merged but not

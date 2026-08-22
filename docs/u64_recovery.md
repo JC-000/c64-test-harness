@@ -47,12 +47,21 @@ Two practical consequences while the fix is unreleased:
 `run_prg` (and any other endpoint that carries a body — `writemem`,
 `load_prg`, keyboard-inject) leaks a managed attachment
 (`temp0000`, `temp0001`, ...) per call, and no released firmware
-collects them. `ultimate64_temp_gc.gc_temp_folder(host, ...)` deletes
-those files over FTP, oldest-first, keeping the youngest N (default 2)
-— mirroring the policy 1541ultimate#686 will eventually apply on-device.
-It is best-effort: any FTP/network failure is captured in the returned
-`TempGCResult.error` rather than raised, so a hygiene pass can never
-fail a test run.
+collects them. This is shared 1541ultimate firmware behaviour, not
+specific to either device generation. `ultimate64_temp_gc.gc_temp_folder(host, ...)`
+deletes those files over FTP, oldest-first, keeping the youngest N
+(default 2) — mirroring the policy 1541ultimate#686 will eventually
+apply on-device. It is best-effort: any FTP/network failure is captured
+in the returned `TempGCResult.error` rather than raised, so a hygiene
+pass can never fail a test run.
+
+Verified live on both device generations: originally on the U64E, and
+on the C64U (10.53.21.158, firmware 1.1.0) on 2026-08-21 —
+`tests/test_temp_gc_live.py` passed end-to-end (repeated `run_prg`
+leaks `temp####` attachments, `gc_temp_folder` trims them to the
+keep-count and is idempotent on a re-run) using the same anonymous-FTP,
+`/Temp`-path defaults as the U64E; no generation-specific credentials or
+path were needed.
 
 `Ultimate64Client.run_prg` calls this automatically before uploading
 when the `U64_AUTO_TEMP_GC` env var is set (off by default — unit tests
