@@ -432,7 +432,7 @@ def launch_vice(executable: str, port: int) -> subprocess.Popen:
         executable,
         "-binarymonitor",
         "-binarymonitoraddress", f"ip4://127.0.0.1:{port}",
-        "-warp", "-ntsc", "+sound", "-minimized",
+        "-warp", "-ntsc", "+sound", "-console",
     ]
     print(f"  Launching: {' '.join(args)}")
     return subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

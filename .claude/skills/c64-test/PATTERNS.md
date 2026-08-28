@@ -1056,13 +1056,13 @@ send_key(transport, "\r")
 ```
 
 ### 8. Window Focus Stealing
-VICE windows steal keyboard focus when launched, disrupting the user's work. `ViceConfig.minimize` defaults to `True`, passing `-minimized` to VICE. Do **not** set `minimize=False` unless the user explicitly needs visible windows:
+VICE windows steal keyboard focus when launched, disrupting the user's work — on macOS the GTK3 build activates the app even with `-minimized`. `ViceConfig.console` defaults to `True`, passing `-console`: the full emulation runs headless (binary monitor, screen RAM, palette, `-exitscreenshot` all work) and no window is ever created. Do **not** set `console=False` unless the user explicitly needs a visible window:
 ```python
-# Default — windows start minimized (correct for automated testing)
+# Default — headless, no window, no focus steal (correct for automated testing)
 config = ViceConfig(prg_path="build/prog.prg", warp=True, sound=False)
 
-# Only if user needs to see the VICE window
-config = ViceConfig(prg_path="build/prog.prg", minimize=False)
+# Only if user needs to see the VICE window (minimize= then applies)
+config = ViceConfig(prg_path="build/prog.prg", console=False, minimize=False)
 ```
 
 ### 9. Multi-Agent VICE Process Safety

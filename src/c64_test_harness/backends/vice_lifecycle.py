@@ -145,7 +145,12 @@ class ViceConfig:
     ntsc: bool = True
     sound: bool = False
     monitor: bool = True
-    minimize: bool = True
+    # Headless launch.  ``-console`` runs the full emulation (binary
+    # monitor, VIC/SID state, -exitscreenshot) without creating the GTK
+    # window, so VICE never activates and steals focus on macOS.  With
+    # ``console=False`` the window is created and ``minimize`` applies.
+    console: bool = True
+    minimize: bool = True  # only meaningful when console=False
     extra_args: list[str] = field(default_factory=list)
     disk_image: DiskImage | None = None
     drive_unit: int = 8
@@ -367,7 +372,9 @@ class ViceProcess:
             args.append("+sound")
         if cfg.limit_cycles > 0:
             args += ["-limitcycles", str(cfg.limit_cycles)]
-        if cfg.minimize:
+        if cfg.console:
+            args.append("-console")
+        elif cfg.minimize:
             args.append("-minimized")
         if cfg.load_snapshot is not None:
             args += ["-loadsnapshot", cfg.load_snapshot]

@@ -319,7 +319,7 @@ def probe_vice_pcap_ok(
             "-binarymonitor",
             "-binarymonitoraddress", f"ip4://127.0.0.1:{port}",
             "+sound",
-            "-minimized",
+            "-console",
         ]
 
         try:
