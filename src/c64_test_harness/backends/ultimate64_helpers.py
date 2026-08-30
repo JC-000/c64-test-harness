@@ -41,8 +41,14 @@ from .ultimate64_schema import (
     REU_ENABLED_VALUES,
     REU_SIZE_VALUES,
     SID_ADDRESS_VALUES,
+    SID_SLOT_ADDRESS_ITEMS,
+    SID_SOCKET_ENABLE_VALUES,
     SID_TYPE_VALUES,
     SIDSocketConfig,
+    SidAddressConflict,
+    SidSlot,
+    _as_slot as _as_sid_slot,
+    sid_address_occupancy,
     TURBO_CONTROL_VALUES,
     cpu_speed_enum,
     cpu_speed_mhz,
@@ -61,6 +67,11 @@ __all__ = [
     "set_reu",
     "get_sid_config",
     "set_sid_socket",
+    "enable_sid_socket",
+    "get_sid_socket_enabled",
+    "get_detected_sid_types",
+    "get_sid_address_map",
+    "set_sid_address_map",
     "mount_disk_file",
     "unmount",
     "run_prg_file",
@@ -1127,3 +1138,324 @@ def watch_progress(
     if stop_when is not None:
         kwargs["stop_when"] = stop_when
     return _watch_progress(adapter, addresses, **kwargs)
+
+
+# --------------------------------------------------------------------------- #
+# SID selection & address allocation                                          #
+# --------------------------------------------------------------------------- #
+_ITEM_SID_PROBE = SID_SLOT_ADDRESS_ITEMS[SidSlot.SOCKET1]
+
+#: Per-client cache of the device's declared SID address choices.
+#: Weakly keyed, and inconclusive probes are not cached, matching
+#: :data:`_CPU_SPEED_PRESETS_CACHE`.
+_SID_ADDRESS_CHOICES_CACHE: "weakref.WeakKeyDictionary[Ultimate64Client, tuple[str, ...]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _sid_address_choices(client: Ultimate64Client) -> tuple[str, ...] | None:
+    """Probe (once, cached) the addresses this device offers a SID slot.
+
+    All four slots bind the same firmware enum (``u64_sid_base``,
+    u64_config.cc:404-408), so one item is probed and the answer is
+    used for every slot. Enum items carry their choices under
+    ``"values"``; only preset-file items use ``"presets"``
+    (route_configs.cc:31-45).
+
+    Any structural surprise, or a probe that raises, yields the
+    inconclusive ``None`` rather than a wrong answer -- callers then
+    fall back to the schema superset and let the firmware arbitrate.
+
+    :param client: Connected Ultimate64 client.
+    :returns: Tuple of address enum strings, or ``None`` when the probe
+        was inconclusive.
+    """
+    try:
+        cached = _SID_ADDRESS_CHOICES_CACHE.get(client)
+    except TypeError:  # unhashable / non-weakrefable client stand-in
+        cached = None
+    if cached is not None:
+        return cached
+    try:
+        resp = client.get_config_item(CAT_SID_ADDRESSING, _ITEM_SID_PROBE)
+    except (Ultimate64Error, AttributeError, TypeError):
+        return None
+    if not isinstance(resp, dict):
+        return None
+    category = resp.get(CAT_SID_ADDRESSING)
+    if not isinstance(category, dict):
+        return None
+    item = category.get(_ITEM_SID_PROBE)
+    if not isinstance(item, dict):
+        return None
+    values = item.get("values")
+    if not isinstance(values, list):
+        return None
+    if not values or not all(isinstance(v, str) for v in values):
+        return None
+    result = tuple(values)
+    try:
+        _SID_ADDRESS_CHOICES_CACHE[client] = result
+    except TypeError:
+        pass
+    return result
+
+
+def enable_sid_socket(
+    client: Ultimate64Client, socket: int, enabled: bool
+) -> None:
+    """Enable or disable a physical SID socket.
+
+    ``SID Sockets Configuration / SID Socket N`` is a plain enable
+    toggle over ``en_dis`` (u64_config.cc:393-394). The chip *type* is
+    a separate, read-only item -- see :func:`get_detected_sid_types`.
+
+    :param client: Connected Ultimate64 client.
+    :param socket: Socket index, 1 or 2.
+    :param enabled: ``True`` to enable the socket, ``False`` to disable.
+    :raises ValueError: If *socket* is not 1 or 2.
+    """
+    if socket not in (1, 2):
+        raise ValueError(f"socket must be 1 or 2, got {socket!r}")
+    value = "Enabled" if enabled else "Disabled"
+    client.set_config_items(CAT_SID_SOCKETS, {f"SID Socket {socket}": value})
+
+
+def get_sid_socket_enabled(client: Ultimate64Client) -> dict[int, bool]:
+    """Return whether each physical SID socket is enabled.
+
+    :param client: Connected Ultimate64 client.
+    :returns: Dict mapping 1-based socket index to its enable state,
+        e.g. ``{1: True, 2: False}``.
+    """
+    inner = _unwrap(
+        client.get_config_category(CAT_SID_SOCKETS), CAT_SID_SOCKETS
+    )
+    result: dict[int, bool] = {}
+    for socket in (1, 2):
+        value = inner.get(f"SID Socket {socket}")
+        if isinstance(value, str) and value in SID_SOCKET_ENABLE_VALUES:
+            result[socket] = value == "Enabled"
+    return result
+
+
+def get_detected_sid_types(client: Ultimate64Client) -> dict[int, str]:
+    """Return the SID chip the firmware detected in each socket.
+
+    Reads ``SID Sockets Configuration / SID Detected Socket N``, which
+    is the item that actually holds a chip type -- filled in by the
+    boot-time probe in ``U64SidSockets::detect()``.
+
+    Values come from :data:`SID_DETECTED_TYPE_VALUES` and include
+    replacement chips (``"ARMSID"``, ``"SIDKick Pico"``, ...), not just
+    ``"6581"`` / ``"8580"``.
+
+    .. warning::
+
+       **This is advisory, not authoritative.** The firmware marks the
+       item read-only for its *menu* (``cfg->disable(CFG_SID1_TYPE)``,
+       u64_config.cc:517-518), but ``set_item`` never consults that flag
+       (route_configs.cc:63-91), so REST can write it. Verified live on
+       a U64E (firmware 3.15) on 2026-08-30: ``PUT SID Detected
+       Socket 1 = 6581`` returned HTTP 200 on a device with a real 8580
+       fitted, and the value read back as ``6581``.
+
+       So what this returns is the last value *written*, which is the
+       detection result only if nothing has overwritten it since boot.
+       Do not use it to decide what is physically socketed without a
+       reboot first, and do not treat a mismatch against expectations as
+       a hardware fault. Nothing in the harness writes this item; a
+       stale value means something else did.
+
+    :param client: Connected Ultimate64 client.
+    :returns: Dict mapping 1-based socket index to the detected type
+        string, e.g. ``{1: "8580", 2: "None"}``. Sockets whose item is
+        absent are omitted.
+    """
+    inner = _unwrap(
+        client.get_config_category(CAT_SID_SOCKETS), CAT_SID_SOCKETS
+    )
+    result: dict[int, str] = {}
+    for socket in (1, 2):
+        value = inner.get(f"SID Detected Socket {socket}")
+        if isinstance(value, str) and value:
+            result[socket] = value
+    return result
+
+
+def get_sid_address_map(client: Ultimate64Client) -> dict[SidSlot, str]:
+    """Return the base address of all four SID decodes.
+
+    Unlike :func:`get_sid_addresses`, which covers the two physical
+    sockets only, this reports the UltiSID cores too -- and those share
+    the same address space, so an allocation is only sound when all
+    four are considered together.
+
+    :param client: Connected Ultimate64 client.
+    :returns: Dict mapping :class:`SidSlot` to its address enum string
+        (e.g. ``"$D400"`` or ``"Unmapped"``). Slots whose item is
+        absent from the response are omitted.
+    """
+    inner = _unwrap(
+        client.get_config_category(CAT_SID_ADDRESSING), CAT_SID_ADDRESSING
+    )
+    result: dict[SidSlot, str] = {}
+    for slot, item in SID_SLOT_ADDRESS_ITEMS.items():
+        value = inner.get(item)
+        if isinstance(value, str) and value:
+            result[slot] = value
+    return result
+
+
+def _introduced_sid_conflicts(
+    current: Mapping[SidSlot, str],
+    resulting: Mapping[SidSlot, str],
+    touched: set[SidSlot],
+) -> list[SidAddressConflict]:
+    """Conflicts in *resulting* that are not already in *current*.
+
+    An address counts as newly conflicted when it ends up with two or
+    more occupants AND either the pile grew, or a slot the caller named
+    joined it. The second test matters: swapping one occupant for
+    another keeps the count the same while still putting a caller-named
+    slot somewhere it was not.
+
+    :param current: The device's map before the write.
+    :param resulting: That map with the caller's changes overlaid.
+    :param touched: The slots the caller named.
+    :returns: One :class:`SidAddressConflict` per newly-conflicted
+        address, in ascending decode order.
+    """
+    before = sid_address_occupancy(current)
+    after = sid_address_occupancy(resulting)
+    introduced: list[SidAddressConflict] = []
+    for address, slots in after.items():
+        if len(slots) < 2:
+            continue
+        was = set(before.get(address, ()))
+        now = set(slots)
+        if len(now) > len(was) or (now - was) & touched:
+            introduced.append(
+                SidAddressConflict(address=address, slots=slots)
+            )
+    return introduced
+
+
+def set_sid_address_map(
+    client: Ultimate64Client,
+    mapping: Mapping[SidSlot | str, str],
+    *,
+    allow_conflicts: str | None = None,
+) -> None:
+    """Assign base addresses to one or more SID slots.
+
+    Slots not named in *mapping* are left alone.
+
+    Addresses are validated locally before anything goes on the wire.
+    The schema's :data:`SID_ADDRESS_VALUES` is the baseline; the
+    device's own choice list is probed once (cached, see
+    :func:`_sid_address_choices`) and, when the probe is conclusive, an
+    address this device does not offer raises :class:`ValueError`
+    rather than surfacing as an HTTP 400. This mirrors
+    :func:`set_turbo_mhz`.
+
+    The firmware performs no conflict check of its own: ``set_item``
+    only tests membership of the enum (route_configs.cc:76-88), and
+    nothing downstream rejects two slots decoding one address -- the
+    FPGA simply answers from both. This helper therefore reads the
+    current map, overlays *mapping*, and refuses the write if it would
+    *introduce* an overlap: an address that ends up with more occupants
+    than it had, or that gains a slot the caller named.
+
+    **The check is a delta, and that is a real limitation.** Overlap
+    the caller did not cause is tolerated, because the device ships
+    with all four slots on ``$D400`` under Auto Address Mirroring and a
+    whole-map check would fire on the factory state -- refusing even a
+    move that strictly *reduces* overlap. But pre-existing mirroring and
+    a genuine accidental collision are not distinguishable from the map
+    alone: ``$D400`` with four occupants looks identical either way.
+    What separates them is provenance, not shape, and provenance is not
+    in the map. So this guard promises only *"I did not let you make it
+    worse"* -- never *"your resulting allocation is sane"*. Validating
+    the latter needs knowledge the device does not expose.
+
+    That is the same contract the firmware's own ``auto_mirror`` states
+    for itself: it widens decodes "without introducing overlaps that
+    were not already there" (u64_config.cc:2381-2384).
+
+    Pass ``allow_conflicts="<reason>"`` to introduce an overlap
+    deliberately (which also skips the read); the reason is logged at
+    WARNING, matching :meth:`MemoryPolicy.write_memory`'s
+    ``override="reason"`` idiom.
+
+    :param client: Connected Ultimate64 client.
+    :param mapping: :class:`SidSlot` (or address-item name) -> address
+        enum string.
+    :param allow_conflicts: Reason string permitting two slots on one
+        address. A bare ``True`` is rejected -- an overlap has to be
+        justified in the diff, not merely enabled.
+    :raises ValueError: On an empty mapping, an unknown slot, an
+        address outside the schema or outside this device's probed
+        choices, or -- unless *allow_conflicts* gives a reason -- an
+        overlap this call would introduce. Also if *allow_conflicts* is
+        not a non-empty string or ``None``.
+    """
+    if not isinstance(mapping, Mapping) or not mapping:
+        raise ValueError(
+            "mapping must be a non-empty mapping of SidSlot to address"
+        )
+    if allow_conflicts is not None and (
+        not isinstance(allow_conflicts, str) or not allow_conflicts
+    ):
+        raise ValueError(
+            "allow_conflicts must be a non-empty reason string, e.g. "
+            'allow_conflicts="reproducing #NNN overlap"'
+        )
+
+    requested: dict[SidSlot, str] = {}
+    for key, address in mapping.items():
+        slot = _as_sid_slot(key)  # raises ValueError on an unknown slot
+        validate_enum(address, SID_ADDRESS_VALUES, "SID address")
+        requested[slot] = address
+
+    choices = _sid_address_choices(client)
+    if choices is not None:
+        for slot, address in requested.items():
+            if address not in choices:
+                raise ValueError(
+                    f"SID address {address!r} for {slot.value} is not "
+                    f"offered by this device; offered: {list(choices)}"
+                )
+
+    if allow_conflicts:
+        _log.warning(
+            "SID address conflict check bypassed for %s (reason: %s)",
+            ", ".join(
+                f"{slot.value}={addr}" for slot, addr in requested.items()
+            ),
+            allow_conflicts,
+        )
+    else:
+        current = dict(get_sid_address_map(client))
+        resulting = dict(current)
+        resulting.update(requested)
+        conflicts = _introduced_sid_conflicts(
+            current, resulting, set(requested)
+        )
+        if conflicts:
+            detail = "; ".join(
+                f"{c.address} <- {', '.join(s.value for s in c.slots)}"
+                for c in conflicts
+            )
+            raise ValueError(
+                f"SID address conflict introduced by this call: {detail}. "
+                f"Pass "
+                f'allow_conflicts="<reason>" to stack slots on one '
+                f"address deliberately."
+            )
+
+    client.set_config_items(
+        CAT_SID_ADDRESSING,
+        {SID_SLOT_ADDRESS_ITEMS[slot]: address
+         for slot, address in requested.items()},
+    )

@@ -12,7 +12,8 @@ This module is pure-constants: no I/O, no side effects at import time.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Union
+from enum import Enum
+from typing import Mapping, Union
 
 # --------------------------------------------------------------------------- #
 # Turbo / CPU Speed                                                           #
@@ -165,6 +166,222 @@ SID_ADDRESS_VALUES: tuple[str, ...] = (
 )
 
 
+#: Socket-enable values for ``SID Sockets Configuration / SID Socket N``.
+#: This item is a plain enable toggle, *not* a chip-type selector.
+#: Firmware: ``u64_sid_detection_cfg`` binds CFG_SOCKET1/2_ENABLE to
+#: ``en_dis`` (u64_config.cc:393-394; en_dis at config.cc:927).
+SID_SOCKET_ENABLE_VALUES: tuple[str, ...] = ("Disabled", "Enabled")
+
+#: Chip types the firmware can report in ``SID Detected Socket N``.
+#: Read-only on the device: the store constructor calls
+#: ``cfg->disable(CFG_SID1_TYPE)`` / ``CFG_SID2_TYPE``
+#: (u64_config.cc:517-518), so this is a detection result, not a
+#: selector. Firmware table ``sid_types`` at u64_config.cc:271.
+#:
+#: Firmware 3.14 shipped the first nine entries only; 3.15 appends
+#: ``"PDsid"``, ``"SIDKick (Teensy)"`` and ``"SIDKick Pico"`` (compare
+#: ``git show ult_v3.14:software/u64/u64_config.cc`` line 236).
+SID_DETECTED_TYPE_VALUES: tuple[str, ...] = (
+    "None",
+    "6581",
+    "8580",
+    "FPGASID",
+    "SwinSID Ultimate",
+    "ARMSID",
+    "ARM2SID",
+    "SidFx",
+    "FPGASID Dukestah",
+    "PDsid",
+    "SIDKick (Teensy)",
+    "SIDKick Pico",
+)
+
+#: ``SID Addressing / Ext DualSID Range Split`` — which address line
+#: splits a dual-SID cartridge across the two socket decodes.
+#: Firmware ``stereo_addr`` at u64_config.cc:256.
+SID_STEREO_SPLIT_VALUES: tuple[str, ...] = ("Off", "A5", "A6", "A7", "A8", "A9")
+
+#: ``SID Addressing / UltiSID Range Split``.
+#: Firmware ``sid_split`` at u64_config.cc:257.
+ULTISID_SPLIT_VALUES: tuple[str, ...] = (
+    "Off",
+    "1/2 (A5)",
+    "1/2 (A6)",
+    "1/2 (A7)",
+    "1/2 (A8)",
+    "1/4 (A5,A6)",
+    "1/4 (A5,A8)",
+    "1/4 (A7,A8)",
+)
+
+#: ``UltiSID Configuration / UltiSID N Filter Curve``.
+#: Firmware ``filter_sel`` at u64_config.cc:274.
+ULTISID_FILTER_VALUES: tuple[str, ...] = (
+    "8580 Lo",
+    "8580 Hi",
+    "6581",
+    "6581 Alt",
+    "U2 Low",
+    "U2 Mid",
+    "U2 High",
+)
+
+#: ``UltiSID Configuration / UltiSID N Filter Resonance`` (``filter_res``,
+#: u64_config.cc:275).
+ULTISID_RESONANCE_VALUES: tuple[str, ...] = ("Low", "High")
+
+#: ``UltiSID Configuration / UltiSID N Combined Waveforms`` (``comb_wave``,
+#: u64_config.cc:276).
+ULTISID_WAVEFORM_VALUES: tuple[str, ...] = ("6581", "8580")
+
+#: ``UltiSID Configuration / UltiSID N Digis Level`` (``digi_levels``,
+#: u64_config.cc:261).
+ULTISID_DIGI_VALUES: tuple[str, ...] = ("Off", "Low", "Medium", "High")
+
+
+class SidSlot(str, Enum):
+    """One of the four independently addressable SID decodes.
+
+    The device has two physical sockets and two FPGA-emulated
+    ("UltiSID") cores, and all four take their base address from the
+    same 49-entry enum (u64_config.cc:404-408). The member value is the
+    firmware's name for the slot, which is also the prefix of its
+    address item.
+    """
+
+    SOCKET1 = "SID Socket 1"
+    SOCKET2 = "SID Socket 2"
+    ULTISID1 = "UltiSID 1"
+    ULTISID2 = "UltiSID 2"
+
+
+#: Slot -> the ``SID Addressing`` item name that holds its base address.
+SID_SLOT_ADDRESS_ITEMS: dict[SidSlot, str] = {
+    slot: f"{slot.value} Address" for slot in SidSlot
+}
+
+#: The value ``u64_sid_offsets[0]`` carries for ``"Unmapped"``
+#: (``#define UNMAPPED_BASE 0x01``, u64_config.cc:193). It is an odd
+#: number, and every real decode is even, so an unmapped slot can never
+#: alias a mapped one.
+SID_UNMAPPED_OFFSET: int = 0x01
+
+#: Address enum string -> the 8-bit decode value the firmware programs
+#: into ``C64_SID1_BASE`` and friends. Mirrors ``u64_sid_offsets``
+#: (u64_config.cc:219-227).
+SID_ADDRESS_OFFSETS: dict[str, int] = {
+    "Unmapped": SID_UNMAPPED_OFFSET,
+    **{
+        addr: (int(addr[1:], 16) & 0x0FF0) >> 4
+        for addr in SID_ADDRESS_VALUES[1:]
+    },
+}
+
+
+def sid_address_offset(address: str) -> int:
+    """Return the firmware decode offset for a SID address enum string.
+
+    :param address: One of :data:`SID_ADDRESS_VALUES`.
+    :returns: The 8-bit base value, e.g. ``0x40`` for ``"$D400"`` and
+        :data:`SID_UNMAPPED_OFFSET` for ``"Unmapped"``.
+    :raises ValueError: If *address* is not a known SID address.
+    """
+    try:
+        return SID_ADDRESS_OFFSETS[address]
+    except (KeyError, TypeError):
+        raise ValueError(
+            f"Invalid SID address {address!r}. "
+            f"Valid values: {list(SID_ADDRESS_VALUES)}"
+        ) from None
+
+
+@dataclass(frozen=True)
+class SidAddressConflict:
+    """Two or more slots decoding the same base address.
+
+    :param address: The shared address enum string.
+    :param slots: The slots that share it, in :class:`SidSlot` order.
+    """
+
+    address: str
+    slots: tuple[SidSlot, ...]
+
+
+def _as_slot(key: Union[SidSlot, str]) -> SidSlot:
+    """Coerce a slot name or address-item name to a :class:`SidSlot`."""
+    if isinstance(key, SidSlot):
+        return key
+    if isinstance(key, str):
+        name = key[: -len(" Address")] if key.endswith(" Address") else key
+        for slot in SidSlot:
+            if slot.value == name:
+                return slot
+    raise ValueError(
+        f"Invalid SID slot {key!r}. Valid values: "
+        f"{[s.value for s in SidSlot]} (optionally suffixed ' Address')"
+    )
+
+
+def sid_address_occupancy(
+    mapping: "Mapping[Union[SidSlot, str], str]",
+) -> dict[str, tuple[SidSlot, ...]]:
+    """Group slots by the base address they decode.
+
+    ``"Unmapped"`` slots are omitted entirely: the firmware gives them
+    the odd offset ``0x01`` while every mapped decode is even, so they
+    can never alias anything.
+
+    :param mapping: Slot (or address-item name) -> address enum string.
+    :returns: Address enum string -> the slots on it, in
+        :class:`SidSlot` order, keyed in ascending decode order.
+    :raises ValueError: On an unknown slot key or address value.
+    """
+    order = {slot: i for i, slot in enumerate(SidSlot)}
+    by_offset: dict[int, list[SidSlot]] = {}
+    for key, address in mapping.items():
+        slot = _as_slot(key)
+        offset = sid_address_offset(address)
+        if offset == SID_UNMAPPED_OFFSET:
+            continue
+        by_offset.setdefault(offset, []).append(slot)
+
+    result: dict[str, tuple[SidSlot, ...]] = {}
+    for offset in sorted(by_offset):
+        slots = sorted(by_offset[offset], key=order.__getitem__)
+        address = next(
+            a for a, o in SID_ADDRESS_OFFSETS.items() if o == offset
+        )
+        result[address] = tuple(slots)
+    return result
+
+
+def sid_address_conflicts(
+    mapping: "Mapping[Union[SidSlot, str], str]",
+) -> list[SidAddressConflict]:
+    """Find slots that would decode the same base address.
+
+    ``"Unmapped"`` slots are never in conflict: the firmware gives them
+    the odd offset ``0x01`` while every mapped decode is even.
+
+    Only exact base equality counts. ``Auto Address Mirroring`` widens
+    the decodes but is documented to fill the address space "without
+    introducing overlaps that were not already there"
+    (u64_config.cc:2381-2384), so it cannot create a conflict that
+    exact-base comparison misses.
+
+    :param mapping: Slot (or address-item name) -> address enum string.
+    :returns: One :class:`SidAddressConflict` per shared address, in
+        ascending offset order.
+    :raises ValueError: On an unknown slot key or address value.
+    """
+    occupancy = sid_address_occupancy(mapping)
+    return [
+        SidAddressConflict(address=address, slots=slots)
+        for address, slots in occupancy.items()
+        if len(slots) >= 2
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # Drive types                                                                 #
 # --------------------------------------------------------------------------- #
@@ -244,6 +461,22 @@ __all__ = [
     "reu_size_enum",
     "SID_TYPE_VALUES",
     "SID_ADDRESS_VALUES",
+    "SID_SOCKET_ENABLE_VALUES",
+    "SID_DETECTED_TYPE_VALUES",
+    "SID_STEREO_SPLIT_VALUES",
+    "ULTISID_SPLIT_VALUES",
+    "ULTISID_FILTER_VALUES",
+    "ULTISID_RESONANCE_VALUES",
+    "ULTISID_WAVEFORM_VALUES",
+    "ULTISID_DIGI_VALUES",
+    "SidSlot",
+    "SID_SLOT_ADDRESS_ITEMS",
+    "SID_UNMAPPED_OFFSET",
+    "SID_ADDRESS_OFFSETS",
+    "sid_address_offset",
+    "SidAddressConflict",
+    "sid_address_occupancy",
+    "sid_address_conflicts",
     "DRIVE_TYPE_VALUES",
     "CARTRIDGE_VALUES",
     "DISK_IMAGE_TYPES",
