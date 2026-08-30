@@ -280,14 +280,59 @@ Verified live: with `/dev/bpf0` at `crw----rw-` and uid 501,
 `-ethernetiodriver pcap` is still rejected.
 
 > An earlier version of this section claimed a rig that ran
-> `sudo chmod o+rw /dev/bpf*` needed no elevation, and described a BPF
-> device pool limiting concurrent unprivileged instances. That rule was
-> wrong — it modelled libpcap's requirements rather than VICE's gate, and
-> `bpf_capture_available()` has been removed. (The pool observation it
-> rested on, one VICE alive on `/dev/bpf3`+`bpf2` and a second dying
-> `rc=255`, was almost certainly recorded under `sudo`; as root, macOS
-> creates further nodes on demand, so a busy pool can still bite a
-> multi-instance run.)
+> `sudo chmod o+rw /dev/bpf*` needed no elevation. That rule was wrong —
+> it modelled libpcap's requirements rather than VICE's gate, and
+> `bpf_capture_available()` has been removed.
+>
+> The **pool observation is not retracted**: one VICE holding two
+> `/dev/bpf*` nodes and a second instance dying `rc=255` was recorded
+> correctly, under `sudo`, and only its context was lost. Re-verified
+> 2026-08-30 with `netstat -B`: a single elevated x64sc holds exactly two
+> BPF peers — one bound to the requested `feth`, one to another host
+> interface — and the count of nodes an unprivileged process can still
+> open drops by exactly two. That is the old `BPF_NODES_PER_VICE = 2`,
+> measured again. As root macOS creates further nodes on demand, so the
+> pool does not block a second instance the way it blocks an unprivileged
+> one, but a pool exhausted by another capturing process can still bite a
+> multi-instance run.
+
+### Issue #144 is refuted: the Homebrew bottle captures fine
+
+#144 recorded that *as root*, VICE answers the binary monitor while
+attaching no BPF device — i.e. that the Homebrew build's ethernet was
+silently non-functional and a separate build was required. **That is
+false.** Measured 2026-08-30, elevated, cart active, with the interface
+and driver supplied only through the `-addconfig` rc:
+
+```
+wrapper=4636  x64sc=4637  owner=root  monitor=up
+  ETHERNET_DRIVER      = 'pcap'
+  ETHERNET_INTERFACE   = 'feth0'
+  ETHERNETCART_ACTIVE  = 1
+netstat -B:
+  bpf1  ap1    p---IO------  x64sc.4637
+  bpf2  feth0  p---IO------  x64sc.4637
+```
+
+Two BPF descriptors, one bound to the requested interface, in
+promiscuous mode.
+
+The claim came from the harness's own measurement. `probe_vice_pcap_ok()`
+demanded a `/dev/bpf*` attach as proof of real capture — correctly — but
+read it with `lsof -nP -p <pid>` run **unelevated**. An unprivileged
+`lsof` cannot read a root-owned process's descriptor table at all: it
+returns *zero lines*, not zero `bpf` lines. Since every macOS pcap launch
+elevates, the helper returned `[]` every time, and the probe published
+that as a defect in the emulator build. Its own diagnostic string is what
+#144 was written from.
+
+The instrument is now `netstat -B` (`bpf_attached_interfaces()` in
+`tests/bridge_platform.py`), which reports device, bound interface and
+owning command, needs no privilege, and reads root-owned processes.
+`lsof` is the wrong tool for this measurement at any privilege level.
+Regression test: `tests/test_bpf_attach_detection.py`, which launches a
+real elevated VICE and asserts the attach is seen — it fails against the
+`lsof` implementation.
 
 So on macOS every pcap ethernet launch elevates. The harness refuses to
 launch one it cannot elevate: `plan_vice_launch()` (in
