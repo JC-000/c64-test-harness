@@ -322,25 +322,84 @@ def driver_requires_root(driver: str) -> bool:
 # ------------------------------------------------------------ sudo probe
 
 
-def sudo_can_run(binary: str) -> bool:
-    """Whether this user may run *binary* as root without a password.
+@dataclass(frozen=True)
+class SudoAuthorisation:
+    """What ``sudo`` will let this user do *without a password*.
 
-    ``sudo -n -l -- <binary>`` asks sudo itself, non-interactively and
-    without running anything: exit 0 means the rule exists (or a
-    credential is cached), non-zero means it does not.  Never prompts —
-    stdin is closed and ``-n`` makes sudo fail rather than ask.
+    ``all_commands`` is a blanket ``NOPASSWD: ALL``; ``commands`` are the
+    individually authorised binaries.  Rules that pin arguments (e.g.
+    ``NOPASSWD: /opt/homebrew/bin/brew reinstall --HEAD vice``) authorise
+    that one command line and are deliberately *not* counted here: they
+    would not cover the argv we intend to launch.
+    """
+
+    all_commands: bool
+    commands: frozenset[str]
+
+    def allows(self, binary: str) -> bool:
+        return self.all_commands or binary in self.commands
+
+
+def parse_sudo_listing(text: str) -> SudoAuthorisation:
+    """Extract the NOPASSWD rules from ``sudo -l`` output.
+
+    Only NOPASSWD matters.  A plain ``(ALL) ALL`` line means the user may
+    become root *with a password* — useless to an unattended harness, and
+    the reason a per-command ``sudo -n -l -- <cmd>`` probe is worthless:
+    it exits 0 for anything such a user may run, ``/bin/ls`` included.
+    """
+    all_commands = False
+    commands: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        marker = "NOPASSWD:"
+        if marker not in line:
+            continue
+        for entry in line.split(marker, 1)[1].split(","):
+            parts = entry.split()
+            if not parts:
+                continue
+            if parts[0] == "ALL":
+                all_commands = True
+            elif len(parts) == 1:  # no pinned arguments
+                commands.add(parts[0])
+    return SudoAuthorisation(all_commands, frozenset(commands))
+
+
+@lru_cache(maxsize=1)
+def sudo_authorisation() -> SudoAuthorisation:
+    """This user's passwordless sudo rules, read once per process.
+
+    ``sudo -n -l`` lists them without running anything and, with ``-n``,
+    without ever prompting.
     """
     try:
         proc = subprocess.run(
-            ["sudo", "-n", "-l", "--", binary],
+            ["sudo", "-n", "-l"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=_SUDO_PROBE_TIMEOUT,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return proc.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return SudoAuthorisation(False, frozenset())
+    if proc.returncode != 0:
+        return SudoAuthorisation(False, frozenset())
+    return parse_sudo_listing(proc.stdout or "")
+
+
+def sudo_can_run(binary: str) -> bool:
+    """Whether *binary* can be run as root **without a password**.
+
+    Asks sudo for its rule list and looks for a NOPASSWD entry naming
+    this exact path.  Being *permitted* to run it is not enough: an
+    unattended launch that stops at a password prompt is a failed launch.
+
+    Caveat: a cached sudo timestamp would let a launch through that this
+    reports False for.  Refusing with an actionable message is the safe
+    direction, and ``VICE_ETHERNET_ALLOW_UNELEVATED=1`` overrides it.
+    """
+    return sudo_authorisation().allows(binary)
 
 
 # ------------------------------------------------------------ the plan

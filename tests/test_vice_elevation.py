@@ -301,27 +301,86 @@ def test_plan_honours_explicit_run_as_root_without_ethernet(monkeypatch):
 
 # ------------------------------------------------------- the sudo probe
 
-def test_sudo_probe_asks_about_the_exact_binary(monkeypatch):
-    seen: list[list[str]] = []
+#: Real ``sudo -n -l`` output from this bench, trimmed. Note the
+#: ``(ALL) ALL`` line: the user may run anything as root *with a
+#: password*, so mere permission proves nothing about an unattended run.
+_SUDO_LISTING = """\
+Matching Defaults entries for someone on Offensive-Bias:
+    env_reset, env_keep+=BLOCKSIZE, lecture_file=/etc/sudo_lecture, !log_allowed
+
+User someone may run the following commands on Offensive-Bias:
+    (ALL) ALL
+    (root) NOPASSWD: /Users/someone/Documents/c64-test-harness/scripts/setup-bridge-feth-macos.sh, \
+/Users/someone/Documents/c64-test-harness/scripts/teardown-bridge-feth-macos.sh
+    (root) NOPASSWD: /opt/homebrew/bin/x64sc
+    (root) NOPASSWD: /opt/homebrew/bin/brew reinstall --HEAD vice, /opt/homebrew/bin/brew install --HEAD vice
+"""
+
+
+def _sudo_listing(monkeypatch, text: str, *, rc: int = 0, calls: list | None = None):
+    ve.sudo_authorisation.cache_clear()
 
     def fake_run(argv, **kwargs):
-        seen.append(argv)
-        return subprocess.CompletedProcess(argv, 0, "", "")
+        if calls is not None:
+            calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, rc, text, "")
 
     monkeypatch.setattr(ve.subprocess, "run", fake_run)
-    assert ve.sudo_can_run("/opt/eth/x64sc") is True
-    assert seen == [["sudo", "-n", "-l", "--", "/opt/eth/x64sc"]]
 
 
-def test_sudo_probe_is_false_when_not_permitted(monkeypatch):
-    monkeypatch.setattr(
-        ve.subprocess, "run",
-        lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "sorry"),
-    )
-    assert ve.sudo_can_run("/opt/eth/x64sc") is False
+def test_permission_to_run_is_not_authorisation_to_run_unattended(monkeypatch):
+    """The bug this test exists for.
+
+    ``sudo -n -l -- <cmd>`` exits 0 for any command the user may run at
+    all, including under a password-requiring ``(ALL) ALL``. On this
+    bench it returns 0 for /bin/ls. Only a NOPASSWD rule means the
+    harness can elevate unattended.
+    """
+    _sudo_listing(monkeypatch, _SUDO_LISTING)
+    assert ve.sudo_can_run("/opt/homebrew/bin/x64sc") is True
+    # Permitted via (ALL) ALL, but it would prompt -- so: no.
+    assert ve.sudo_can_run("/Users/someone/.local/opt/vice-3.10-ethernet/bin/x64sc") is False
+    assert ve.sudo_can_run("/bin/ls") is False
+
+
+def test_nopasswd_rule_may_list_several_commands(monkeypatch):
+    _sudo_listing(monkeypatch, _SUDO_LISTING)
+    for path in (
+        "/Users/someone/Documents/c64-test-harness/scripts/setup-bridge-feth-macos.sh",
+        "/Users/someone/Documents/c64-test-harness/scripts/teardown-bridge-feth-macos.sh",
+    ):
+        assert ve.sudo_can_run(path) is True
+
+
+def test_an_argument_restricted_rule_does_not_authorise_the_binary(monkeypatch):
+    """`NOPASSWD: /opt/homebrew/bin/brew reinstall --HEAD vice` authorises
+    that one command line, not brew in general."""
+    _sudo_listing(monkeypatch, _SUDO_LISTING)
+    assert ve.sudo_can_run("/opt/homebrew/bin/brew") is False
+
+
+def test_blanket_nopasswd_all_authorises_everything(monkeypatch):
+    _sudo_listing(monkeypatch, "User x may run the following commands:\n    (ALL) NOPASSWD: ALL\n")
+    assert ve.sudo_can_run("/anything/at/all") is True
+
+
+def test_no_nopasswd_rules_means_no_unattended_elevation(monkeypatch):
+    _sudo_listing(monkeypatch, "User x may run the following commands:\n    (ALL) ALL\n")
+    assert ve.sudo_can_run("/opt/homebrew/bin/x64sc") is False
+
+
+def test_sudo_listing_is_read_once(monkeypatch):
+    calls: list = []
+    _sudo_listing(monkeypatch, _SUDO_LISTING, calls=calls)
+    for _ in range(4):
+        ve.sudo_can_run("/opt/homebrew/bin/x64sc")
+    assert len(calls) == 1
+    assert calls[0][0] == ["sudo", "-n", "-l"]
 
 
 def test_sudo_probe_survives_a_missing_sudo(monkeypatch):
+    ve.sudo_authorisation.cache_clear()
+
     def boom(argv, **kwargs):
         raise OSError("no sudo")
 
@@ -329,18 +388,19 @@ def test_sudo_probe_survives_a_missing_sudo(monkeypatch):
     assert ve.sudo_can_run("/opt/eth/x64sc") is False
 
 
+def test_sudo_probe_survives_a_refused_listing(monkeypatch):
+    _sudo_listing(monkeypatch, "", rc=1)
+    assert ve.sudo_can_run("/opt/eth/x64sc") is False
+
+
 def test_sudo_probe_never_prompts(monkeypatch):
     """A probe that blocks on a password prompt would hang the suite."""
-    captured: dict[str, object] = {}
-
-    def fake_run(argv, **kwargs):
-        captured.update(kwargs)
-        return subprocess.CompletedProcess(argv, 0, "", "")
-
-    monkeypatch.setattr(ve.subprocess, "run", fake_run)
-    ve.sudo_can_run("/opt/eth/x64sc")
-    assert captured.get("stdin") is subprocess.DEVNULL
-    assert captured.get("timeout")
+    calls: list = []
+    _sudo_listing(monkeypatch, _SUDO_LISTING, calls=calls)
+    ve.sudo_can_run("/opt/homebrew/bin/x64sc")
+    _, kwargs = calls[0]
+    assert kwargs.get("stdin") is subprocess.DEVNULL
+    assert kwargs.get("timeout")
 
 
 # ---------------------------------------------- ethernet binary resolver
