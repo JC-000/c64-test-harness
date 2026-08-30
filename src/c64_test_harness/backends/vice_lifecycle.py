@@ -201,6 +201,49 @@ def _find_pid_on_port(port: int) -> int | None:
     return _find_pid_on_port_linux(port)
 
 
+def build_ethernet_rc(cfg: ViceConfig) -> str:
+    """The vicerc body that activates the CS8900a for *cfg*.
+
+    Extracted from :meth:`ViceProcess.start` so the resource names can be
+    checked against a running VICE rather than against the generated
+    text.  Asserting the text is what let ``EthernetIOIF`` /
+    ``EthernetIODriver`` survive: neither is a VICE resource in any
+    casing, so VICE logged ``Unknown resource`` and ignored them, and
+    the settings only ever arrived through the ``-ethernetioif`` /
+    ``-ethernetiodriver`` CLI flags that are passed alongside.
+
+    The real names are ``ETHERNET_INTERFACE`` (S ``cs8900io.c:309``) and
+    ``ETHERNET_DRIVER`` (S ``rawnetarch.c:146``).  They are written here
+    as well as on the command line so that any path which does not pass
+    the CLI flags still gets the setting.
+
+    ``EthernetCartMode`` / ``EthernetCartBase`` are correct as they
+    stand: the *resource* table lookup is case-insensitive
+    (``util_strcasecmp`` at S ``resources.c:243``, and
+    ``resources_calc_hash_key`` lowercases every character).  That is a
+    different lookup from the *option* table in ``cmdline.c``, which is
+    both case-sensitive and prefix-matching.
+    """
+    mode = 1 if cfg.ethernet_mode == "rrnet" else 0
+    rc_lines = [
+        "[Version]",
+        "ConfigVersion=3.10",
+        "",
+        "[C64SC]",
+        "ETHERNETCART_ACTIVE=1",
+        f"EthernetCartMode={mode}",
+    ]
+    if cfg.ethernet_interface:
+        rc_lines.append(f'ETHERNET_INTERFACE="{cfg.ethernet_interface}"')
+    if cfg.ethernet_driver:
+        rc_lines.append(f'ETHERNET_DRIVER="{cfg.ethernet_driver}"')
+    if cfg.ethernet_base != 0xDE00:
+        rc_lines.append(f"EthernetCartBase={cfg.ethernet_base}")
+    rc_lines.append("SaveResourcesOnExit=0")
+    rc_lines.append("")
+    return "\n".join(rc_lines)
+
+
 @dataclass
 class ViceConfig:
     """Configuration for launching a VICE instance."""
@@ -227,12 +270,16 @@ class ViceConfig:
     #: and any of it can be overridden by whatever the operator last
     #: clicked in VICE's settings dialog.
     #:
-    #: It is also a crash: in console mode, loading *any* vicerc segfaults
-    #: x64sc (measured on two 3.10 builds; a file containing only
-    #: ``Speed=50`` is enough).  ``resources_load()`` reaches GTK style
-    #: state that console mode never initialises.  Windowed launches
-    #: survive it, which is why it went unnoticed while ``-console`` was
-    #: positionally broken and every launch was really windowed.
+    #: It is also a crash, for a specific class of vicerc: when the file's
+    #: ``ConfigVersion`` is absent, empty, or does not match the running
+    #: VICE, ``check_resource_file_version`` calls ``ui_error()``
+    #: (S ``resources.c:1281,1291``), and in console mode that reaches GTK
+    #: state which was never initialised -- SIGSEGV on both 3.10 builds
+    #: measured here.  A vicerc written by the same VICE version is fine;
+    #: one left by an older VICE, or hand-written, is not.  Windowed
+    #: launches survive either way, which is why it went unnoticed while
+    #: ``-console`` was positionally broken and every launch was really
+    #: windowed.
     #:
     #: Set True only to deliberately test config inheritance.
     load_user_config: bool = False
@@ -550,27 +597,9 @@ class ViceProcess:
             # ``-addconfig`` comes AFTER the CLI iface flags, the
             # ETHERNETCART_ACTIVE value in the rc file is NOT honoured
             # (reads back as 0).
-            mode = 1 if cfg.ethernet_mode == "rrnet" else 0
-            rc_lines = [
-                "[Version]",
-                "ConfigVersion=3.10",
-                "",
-                "[C64SC]",
-                "ETHERNETCART_ACTIVE=1",
-                f"EthernetCartMode={mode}",
-            ]
-            if cfg.ethernet_interface:
-                rc_lines.append(f'EthernetIOIF="{cfg.ethernet_interface}"')
-            if cfg.ethernet_driver:
-                rc_lines.append(f'EthernetIODriver="{cfg.ethernet_driver}"')
-            if cfg.ethernet_base != 0xDE00:
-                rc_lines.append(f"EthernetCartBase={cfg.ethernet_base}")
-            rc_lines.append("SaveResourcesOnExit=0")
-            rc_lines.append("")
-
             fd, path = tempfile.mkstemp(prefix="vice_eth_", suffix=".rc")
             with os.fdopen(fd, "w") as f:
-                f.write("\n".join(rc_lines))
+                f.write(build_ethernet_rc(cfg))
             self._tmp_vicerc = path
 
             # ORDER MATTERS: -addconfig must come BEFORE the interface/

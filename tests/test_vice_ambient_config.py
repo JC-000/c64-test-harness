@@ -18,11 +18,36 @@ windowed, vicerc, no ``-default``            runs
 ``-console``, no vicerc                      runs
 ===========================================  ==================
 
-The content of the vicerc is irrelevant — a file holding nothing but
-``Speed=50`` is enough.  stderr fills with ``Gtk-CRITICAL
-_gtk_style_provider_private_get_settings: assertion
-'GTK_IS_STYLE_PROVIDER_PRIVATE (provider)' failed`` first, so
-``resources_load()`` is reaching UI state that console mode never built.
+The trigger is narrower than "any vicerc", and worth stating precisely.
+``check_resource_file_version`` (S ``resources.c:1255-1295``) calls
+``ui_error()`` when the file's ``ConfigVersion`` is absent, empty, or
+does not match the running VICE, and in console mode the GTK3
+``ui_error`` reaches UI state that was never initialised.  Measured:
+
+=========================================  =======
+vicerc                                     result
+=========================================  =======
+absent                                     runs
+``[Version] ConfigVersion=3.10``           runs
+``[C64SC]`` only, no ``[Version]``         SIGSEGV
+``ConfigVersion=3.9`` (mismatch)           SIGSEGV
+``ConfigVersion=`` (empty)                 SIGSEGV
+empty file                                 SIGSEGV
+=========================================  =======
+
+So a vicerc written by this very VICE is safe; one left behind by an
+older VICE, or hand-written, is not.  The empty-value case faults
+without the ``Gtk-CRITICAL`` preamble the others show, because
+``strtok`` returns NULL and ``strcmp(NULL, VERSION)`` dereferences it
+first (S ``resources.c:1275-1277``) — a second, independent NULL deref.
+
+``-default`` closes the two doors that reach this check: the user vicerc
+and the portable vicerc beside the binary, both of which arrive via
+``resources_load(NULL)`` at S ``main.c:390``, gated on ``loadconfig``.
+It does not close ``-config <file>``, which the harness never emits.
+``-addconfig`` never reaches the check at all — ``resources_load`` only
+version-checks when its argument is NULL (S ``resources.c:1376``) — which
+is why the ethernet path is unaffected either way.
 
 That makes the crash console-mode-specific, which is why it stayed
 invisible: while ``-console`` was positionally broken every launch was
@@ -55,7 +80,15 @@ pytestmark = pytest.mark.skipif(
 
 #: Every value here is deliberately *not* what the harness intends, so a
 #: resource reading back as one of these proves contamination.
-CONTAMINANT_VICERC = """[C64SC]
+#:
+#: Deliberately carries a matching ``[Version]`` header so VICE loads it
+#: without complaint.  An unversioned file would crash console mode
+#: outright, which would confound "-default suppressed the load" with
+#: "-default dodged a segfault" — this proves the former.
+CONTAMINANT_VICERC = """[Version]
+ConfigVersion=3.10
+
+[C64SC]
 SaveResourcesOnExit=1
 AutostartWarp=0
 AutostartPrgMode=2
@@ -65,7 +98,17 @@ JAMAction=0
 Speed=50
 SoundEmulateOnWarp=0
 Drive8Type=1571
+SoundVolume=42
+Drive9Type=1571
 """
+
+#: Resources in the contaminant that the harness does NOT pin on the
+#: command line.  These are the ones that actually discriminate: for a
+#: pinned resource the CLI flag beats the vicerc whether or not
+#: ``-default`` is passed, so only an unpinned one can show that the file
+#: was suppressed rather than merely overridden.
+UNPINNED_FACTORY = {"SoundVolume": 100, "Drive9Type": 0}
+UNPINNED_CONTAMINANT = {"SoundVolume": 42, "Drive9Type": 1571}
 
 
 def free_port() -> int:
@@ -105,28 +148,32 @@ def test_ambient_vicerc_is_read_when_the_harness_asks_for_it(tmp_path):
     make every assertion below pass for the wrong reason.
 
     ``load_user_config=True`` suppresses ``-default``, so VICE loads the
-    vicerc and dies on it.  A launch that survives here means the file
-    was never read, and the neutralisation tests prove nothing.
+    vicerc and the contaminant wins.  If this test ever reads back the
+    factory value instead, the redirection is not working and the
+    neutralisation tests below prove nothing.
     """
     cfg = ViceConfig(
         port=free_port(),
         env=home_with_vicerc(tmp_path, CONTAMINANT_VICERC),
         load_user_config=True,
     )
-    proc = ViceProcess(cfg)
-    proc.start()
-    try:
-        with pytest.raises(Exception):
-            connect_binary_transport(cfg.port, proc=proc, timeout=20.0).close()
-    finally:
-        proc.stop()
+    got = resources_after_launch(cfg, *UNPINNED_CONTAMINANT)
+    assert got == UNPINNED_CONTAMINANT
 
 
 def test_default_neutralises_an_ambient_vicerc(tmp_path):
     """The vicerc must not reach the emulator at all.
 
-    Each expected value below is the harness's own intent, and differs
+    Each expected value below is the harness's own intent and differs
     from the contaminant, so this cannot pass by coincidence.
+
+    The ``UNPINNED_FACTORY`` entries carry most of the weight.  For a
+    resource the harness pins on the command line, the CLI flag beats the
+    vicerc with or without ``-default``, so those assertions would hold
+    even if the file were still being loaded.  ``SoundVolume`` and
+    ``Drive9Type`` are set by the contaminant and by nothing else, so
+    reading them back at their factory values is what actually proves the
+    file never reached the emulator.
     """
     cfg = ViceConfig(
         port=free_port(),
@@ -146,8 +193,10 @@ def test_default_neutralises_an_ambient_vicerc(tmp_path):
         "Speed",
         "SoundEmulateOnWarp",
         "Drive8Type",
+        *UNPINNED_FACTORY,
     )
     assert got == {
+        **UNPINNED_FACTORY,
         # Never rewrite the operator's vicerc on exit.
         "SaveResourcesOnExit": 0,
         # Follows cfg.warp instead of running warped regardless.
@@ -185,11 +234,22 @@ def test_pal_is_selected_when_ntsc_is_false(tmp_path):
     Cycle counts and TOD rates differ between PAL and NTSC, and
     ``tod_timer.py`` calibrates against them.  The vicerc here asks for
     NTSC so the assertion cannot be satisfied by the factory default.
+    It carries a matching ``[Version]`` header, so VICE loads it happily
+    and this tests that the harness *pins* the standard rather than that
+    ``-default`` dodged a crash.
     """
     cfg = ViceConfig(
         port=free_port(),
         ntsc=False,
-        env=home_with_vicerc(tmp_path, "[C64SC]\nMachineVideoStandard=2\n"),
+        # load_user_config=True on purpose: PAL is *also* VICE's factory
+        # value, so with the vicerc suppressed there is nothing to tell
+        # "we pinned it" apart from "we inherited a default that happened
+        # to match".  Letting the file load makes the pin falsifiable.
+        load_user_config=True,
+        env=home_with_vicerc(
+            tmp_path,
+            "[Version]\nConfigVersion=3.10\n\n[C64SC]\nMachineVideoStandard=2\n",
+        ),
     )
     got = resources_after_launch(cfg, "MachineVideoStandard")
     assert got["MachineVideoStandard"] == 1  # PAL
@@ -203,7 +263,12 @@ def test_sound_true_actually_enables_sound(tmp_path):
     cfg = ViceConfig(
         port=free_port(),
         sound=True,
-        env=home_with_vicerc(tmp_path, "[C64SC]\nSound=0\n"),
+        # Same reasoning as the PAL test: Sound=1 is the factory value, so
+        # the vicerc has to actually load for this to mean anything.
+        load_user_config=True,
+        env=home_with_vicerc(
+            tmp_path, "[Version]\nConfigVersion=3.10\n\n[C64SC]\nSound=0\n"
+        ),
     )
     got = resources_after_launch(cfg, "Sound")
     assert got["Sound"] == 1
@@ -226,7 +291,7 @@ def test_autostart_prg_mode_is_inject_on_every_platform(tmp_path, monkeypatch):
     cfg = ViceConfig(
         port=free_port(),
         prg_path=str(prg),
-        env=home_with_vicerc(tmp_path, "[C64SC]\nAutostartPrgMode=2\n"),
+        env=home_with_vicerc(tmp_path, "[Version]\nConfigVersion=3.10\n\n[C64SC]\nAutostartPrgMode=2\n"),
     )
     got = resources_after_launch(cfg, "AutostartPrgMode")
     assert got["AutostartPrgMode"] == 1
