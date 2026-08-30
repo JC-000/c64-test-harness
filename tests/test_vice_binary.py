@@ -273,3 +273,38 @@ class TestErrors:
         """Writing empty data is a no-op."""
         binary_transport.write_memory(0x0400, b"")
         binary_transport.write_memory(0x0400, [])
+
+
+class TestFullAddressSpaceRead:
+    """A 64 KiB read must not be sent as a single MEM_GET.
+
+    VICE computes ``length = (endaddress + 1) - startaddress`` into a
+    ``uint32_t`` and then writes it into the response with
+    ``write_uint16`` (S ``monitor_binary.c:1637,1672``).  For a whole
+    address space that is 0x10000, which truncates to 0, so the response
+    declares zero bytes of payload and the transport can only raise.
+
+    The chunker computed ``0x10000 - (addr & 0xFFFF)``, which for
+    ``addr=0`` is exactly the one size that cannot work, and never split.
+    """
+
+    def test_full_64k_read_matches_piecewise_reads(self, binary_transport) -> None:
+        whole = binary_transport.read_memory(0x0000, 0x10000)
+        assert len(whole) == 0x10000
+        piecewise = b"".join(
+            binary_transport.read_memory(base, 0x2000)
+            for base in range(0x0000, 0x10000, 0x2000)
+        )
+        assert whole == piecewise
+
+    def test_read_spanning_the_top_of_memory(self, binary_transport) -> None:
+        """The chunk boundary must not drop or duplicate the last byte."""
+        whole = binary_transport.read_memory(0x0000, 0x10000)
+        assert whole[0xFFFF:] == binary_transport.read_memory(0xFFFF, 1)
+        assert whole[0xFF00:] == binary_transport.read_memory(0xFF00, 0x100)
+
+    def test_65535_byte_read_still_works(self, binary_transport) -> None:
+        """0xFFFF is the largest length VICE's uint16 field can express."""
+        data = binary_transport.read_memory(0x0000, 0xFFFF)
+        assert len(data) == 0xFFFF
+        assert data == binary_transport.read_memory(0x0000, 0x10000)[:0xFFFF]

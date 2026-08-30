@@ -488,10 +488,21 @@ class BinaryViceTransport:
         current_addr = addr
 
         while remaining > 0:
-            # end_addr is inclusive, and both fields are 16-bit
-            chunk_size = min(remaining, 0x10000 - (current_addr & 0xFFFF))
+            # end_addr is inclusive, and both fields are 16-bit.
+            #
+            # A single request may ask for at most 0xFFFF bytes, never
+            # 0x10000.  VICE computes
+            #     length = (endaddress + 1) - startaddress
+            # into a uint32_t but returns it through write_uint16
+            # (S monitor_binary.c:1637,1672), so a whole-address-space
+            # request truncates the declared payload length to 0 -- the
+            # data is all there (body_len 65538) but the response claims
+            # zero bytes, and there is no way to tell that apart from a
+            # genuinely empty read.  Splitting 64 KiB into 0xFFFF + 1
+            # keeps every request inside what the field can express.
+            chunk_size = min(remaining, 0x10000 - (current_addr & 0xFFFF), 0xFFFF)
             if chunk_size <= 0:
-                chunk_size = min(remaining, 0x10000)
+                chunk_size = min(remaining, 0xFFFF)
 
             end_addr = (current_addr + chunk_size - 1) & 0xFFFF
             start_lo = current_addr & 0xFFFF

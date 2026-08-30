@@ -435,19 +435,31 @@ class TestRestoreState:
 
 
 class TestExtractState:
-    def test_extract_reads_full_ram_and_cpu_port(self) -> None:
-        ram = _make_pattern_ram()
-        ram_buf = bytearray(ram)
-        ram_buf[0x00] = 0x2F  # cpu_port_dir
-        ram_buf[0x01] = 0x37  # cpu_port_data
-        ram = bytes(ram_buf)
+    """``extract_snapshot`` against a real transport.
 
-        class _Stub:
-            def read_memory(self, addr: int, length: int) -> bytes:
-                assert addr == 0x0000 and length == 65536
-                return ram
+    This class used to hold a stub whose ``read_memory`` asserted
+    ``addr == 0x0000 and length == 65536`` and returned a canned 64 KiB
+    buffer.  That is precisely the call VICE rejects, so the test
+    encoded the defect as the expectation and could never fail: VICE had
+    in fact never produced a snapshot.  ``read_memory`` is now exercised
+    for real.
+    """
 
-        snap = extract_snapshot(_Stub())
-        assert snap.ram == ram
+    @pytest.mark.skipif(
+        shutil.which("x64sc") is None, reason="x64sc not found on PATH"
+    )
+    def test_extract_reads_full_ram_and_cpu_port(self, binary_transport) -> None:
+        binary_transport.write_memory(0x0000, bytes([0x2F, 0x37]))
+
+        snap = extract_snapshot(binary_transport)
+
+        assert len(snap.ram) == 65536
         assert snap.cpu_port_dir == 0x2F
         assert snap.cpu_port_data == 0x37
+        # The extract must agree with the same bytes fetched in slices
+        # small enough to have always worked.
+        piecewise = b"".join(
+            binary_transport.read_memory(base, 0x2000)
+            for base in range(0x0000, 0x10000, 0x2000)
+        )
+        assert snap.ram == piecewise
