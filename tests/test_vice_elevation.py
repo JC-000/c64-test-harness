@@ -59,6 +59,19 @@ def _as_uid(monkeypatch, uid: int):
     monkeypatch.setattr(ve.os, "geteuid", lambda: uid)
 
 
+def _stub_features(monkeypatch, *, rawnet=True, pcap=True, tuntap=False):
+    """Answer the build probe without exec'ing anything.
+
+    Needed wherever a test patches ``subprocess.Popen``: ``subprocess`` is
+    one module object, so a Popen sentinel would also fire inside
+    ``subprocess.run`` when ``vice_features`` shells out to ``-features``.
+    """
+    stub = lambda path: ve.ViceFeatures(rawnet, pcap, tuntap, "-features", True)
+    monkeypatch.setattr(ve, "vice_features", stub)
+    # vice_lifecycle imported the name directly, so patch it there too.
+    monkeypatch.setattr(vice_lifecycle, "vice_features", stub)
+
+
 # ------------------------------------------------- build capability scan
 
 def test_build_scan_accepts_a_binary_with_rawnet_strings(tmp_path):
@@ -384,6 +397,7 @@ def test_start_refuses_before_spawning_anything(tmp_path, monkeypatch):
     _as_uid(monkeypatch, 501)
     monkeypatch.setattr(ve.sys, "platform", "darwin")
     _no_sudo(monkeypatch)
+    _stub_features(monkeypatch)
     monkeypatch.setattr(
         vice_lifecycle.subprocess, "Popen",
         lambda *a, **k: pytest.fail("must not spawn VICE"),
@@ -402,6 +416,7 @@ def test_start_cleans_up_the_temp_vicerc_when_it_refuses(tmp_path, monkeypatch):
     _as_uid(monkeypatch, 501)
     monkeypatch.setattr(ve.sys, "platform", "darwin")
     _no_sudo(monkeypatch)
+    _stub_features(monkeypatch)
     monkeypatch.setattr(
         vice_lifecycle.subprocess, "Popen",
         lambda *a, **k: pytest.fail("must not spawn VICE"),
@@ -419,6 +434,7 @@ def test_start_cleans_up_the_temp_vicerc_when_it_refuses(tmp_path, monkeypatch):
 def test_start_refuses_an_ethernet_less_binary_before_spawning(tmp_path, monkeypatch):
     exe = _fake_x64sc(tmp_path, "x64sc", ethernet=False)
     _as_uid(monkeypatch, 0)  # elevation is not the problem here
+    _stub_features(monkeypatch, rawnet=False)
     monkeypatch.setattr(
         vice_lifecycle.subprocess, "Popen",
         lambda *a, **k: pytest.fail("must not spawn VICE"),
@@ -448,3 +464,178 @@ def test_the_bpf_heuristic_is_gone():
     """Its presence is what made the old decision look defensible."""
     assert not hasattr(vice_lifecycle, "bpf_capture_available")
     assert not hasattr(vice_lifecycle, "BPF_NODES_PER_VICE")
+
+
+# =====================================================================
+# Capability probing via ``x64sc -features`` (owner design change:
+# stand up the Homebrew binary intelligently rather than requiring a
+# separately-built VICE).
+# =====================================================================
+
+_FEATURES_OUT = """\
+HAVE_DEBUG                no   Enable debugging code.
+HAVE_RAWNET               yes  Enable raw ethernet emulation.
+HAVE_PCAP                 yes  Use the PCAP library.
+HAVE_TUNTAP               no   Support for TUN/TAP virtual network interface.
+"""
+
+_FEATURES_NO_RAWNET = """\
+HAVE_DEBUG                no   Enable debugging code.
+HAVE_RAWNET               no   Enable raw ethernet emulation.
+HAVE_PCAP                 no   Use the PCAP library.
+HAVE_TUNTAP               no   Support for TUN/TAP virtual network interface.
+"""
+
+
+def _fake_features(monkeypatch, output: str, *, calls: list | None = None, rc: int = 0):
+    def fake_run(argv, **kwargs):
+        if calls is not None:
+            calls.append(argv)
+        return subprocess.CompletedProcess(argv, rc, output, "")
+
+    monkeypatch.setattr(ve.subprocess, "run", fake_run)
+
+
+def test_features_probe_reads_the_binarys_own_report(tmp_path, monkeypatch):
+    exe = _fake_x64sc(tmp_path, "x64sc", ethernet=False)  # scan would say no
+    calls: list = []
+    _fake_features(monkeypatch, _FEATURES_OUT, calls=calls)
+    feat = ve.vice_features(exe)
+    assert feat.rawnet is True
+    assert feat.pcap is True
+    assert feat.tuntap is False
+    assert feat.source == "-features"
+    # It asks the binary, with the documented flag, and nothing else.
+    assert calls == [[exe, "-features"]]
+
+
+def test_features_probe_reports_a_build_without_rawnet(tmp_path, monkeypatch):
+    exe = _fake_x64sc(tmp_path, "x64sc", ethernet=True)  # scan would say yes
+    _fake_features(monkeypatch, _FEATURES_NO_RAWNET)
+    assert ve.vice_features(exe).rawnet is False
+
+
+def test_features_probe_is_cached_per_binary(tmp_path, monkeypatch):
+    exe = _fake_x64sc(tmp_path, "x64sc", ethernet=True)
+    calls: list = []
+    _fake_features(monkeypatch, _FEATURES_OUT, calls=calls)
+    for _ in range(5):
+        ve.vice_features(exe)
+    assert len(calls) == 1
+
+
+def test_features_probe_falls_back_to_the_binary_scan(tmp_path, monkeypatch):
+    """A binary we cannot exec still gets an honest answer."""
+    exe = _fake_x64sc(tmp_path, "x64sc", ethernet=True)
+
+    def boom(argv, **kwargs):
+        raise OSError("exec format error")
+
+    monkeypatch.setattr(ve.subprocess, "run", boom)
+    feat = ve.vice_features(exe)
+    assert feat.rawnet is True
+    assert feat.source == "scan"
+
+
+def test_scan_fallback_does_not_claim_driver_knowledge(tmp_path, monkeypatch):
+    """The byte scan cannot tell pcap from tuntap; it must not pretend."""
+    exe = _fake_x64sc(tmp_path, "x64sc", ethernet=True)
+    monkeypatch.setattr(
+        ve.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(OSError())
+    )
+    assert ve.vice_features(exe).drivers_known is False
+
+
+def test_supports_ethernet_uses_the_features_probe(tmp_path, monkeypatch):
+    exe = _fake_x64sc(tmp_path, "x64sc", ethernet=True)
+    _fake_features(monkeypatch, _FEATURES_NO_RAWNET)
+    assert ve.vice_binary_supports_ethernet(exe) is False
+
+
+@pytest.mark.skipif(
+    not os.path.exists("/opt/homebrew/bin/x64sc"),
+    reason="no Homebrew x64sc on this host",
+)
+def test_homebrew_x64sc_reports_rawnet_and_pcap():
+    """Ground truth for the design decision to drop the custom build."""
+    feat = ve.vice_features("/opt/homebrew/bin/x64sc")
+    assert feat.source == "-features"
+    assert feat.rawnet is True
+    assert feat.pcap is True
+
+
+# -------------------------------------------- driver-vs-build agreement
+
+def test_resolver_rejects_a_driver_the_build_lacks(tmp_path, monkeypatch):
+    """Asking for tuntap on a pcap-only build is the same NULL-driver
+    SIGSEGV by another route."""
+    exe = _fake_x64sc(tmp_path, "x64sc", ethernet=True)
+    _fake_features(monkeypatch, _FEATURES_OUT)  # HAVE_TUNTAP no
+    cfg = ViceConfig(executable=exe, ethernet=True, ethernet_driver="tuntap")
+    with pytest.raises(vice_lifecycle.ViceEthernetBinaryError) as excinfo:
+        vice_lifecycle.resolve_vice_executable(cfg)
+    assert "tuntap" in str(excinfo.value)
+
+
+def test_resolver_accepts_a_driver_the_build_has(tmp_path, monkeypatch):
+    exe = _fake_x64sc(tmp_path, "x64sc", ethernet=True)
+    _fake_features(monkeypatch, _FEATURES_OUT)
+    cfg = ViceConfig(executable=exe, ethernet=True, ethernet_driver="pcap")
+    assert vice_lifecycle.resolve_vice_executable(cfg) == exe
+
+
+def test_resolver_does_not_second_guess_the_scan_fallback(tmp_path, monkeypatch):
+    """No driver knowledge means no driver refusal."""
+    exe = _fake_x64sc(tmp_path, "x64sc", ethernet=True)
+    monkeypatch.setattr(
+        ve.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(OSError())
+    )
+    cfg = ViceConfig(executable=exe, ethernet=True, ethernet_driver="tuntap")
+    assert vice_lifecycle.resolve_vice_executable(cfg) == exe
+
+
+def test_unset_ethernet_bin_is_the_normal_case(tmp_path, monkeypatch):
+    """$VICE_ETHERNET_BIN is an override, not a requirement."""
+    exe = _fake_x64sc(tmp_path, "x64sc", ethernet=True)
+    monkeypatch.delenv(vice_lifecycle.ETHERNET_VICE_BIN_ENV, raising=False)
+    _fake_features(monkeypatch, _FEATURES_OUT)
+    cfg = ViceConfig(executable=exe, ethernet=True)
+    assert cfg.ethernet_executable == ""
+    assert vice_lifecycle.resolve_vice_executable(cfg) == exe
+
+
+# ------------------------------------------- the path sudo actually sees
+
+def test_sudo_wrap_uses_an_absolute_binary(tmp_path, monkeypatch):
+    """``sudo -n x64sc`` would fail: sudo's secure_path does not include
+    /opt/homebrew/bin, so the bare name must be resolved first."""
+    exe = _fake_x64sc(tmp_path, "x64sc", ethernet=True)
+    _as_uid(monkeypatch, 501)
+    monkeypatch.setattr(ve.sys, "platform", "darwin")
+    monkeypatch.setattr(ve.shutil, "which", lambda name: exe if name == "x64sc" else None)
+    probed: list[str] = []
+    monkeypatch.setattr(ve, "sudo_can_run", lambda b: probed.append(b) or True)
+    cfg = ViceConfig(ethernet=True, ethernet_driver="pcap")
+    plan = ve.plan_vice_launch(cfg, ["x64sc", "-warp"])
+    assert plan.argv == ["sudo", "-n", exe, "-warp"]
+    # And authorisation was checked for that same absolute path.
+    assert probed == [exe]
+
+
+def test_elevation_error_names_the_symlink_not_its_target(tmp_path, monkeypatch):
+    """sudoers matches the literal command path after PATH lookup and does
+    not follow symlinks, so /opt/homebrew/bin/x64sc is what must be
+    authorised — not the Cellar path behind it."""
+    target = _fake_x64sc(tmp_path, "cellar-x64sc", ethernet=True)
+    link = tmp_path / "bin-x64sc"
+    link.symlink_to(target)
+    _as_uid(monkeypatch, 501)
+    monkeypatch.setattr(ve.sys, "platform", "darwin")
+    _no_sudo(monkeypatch)
+    cfg = ViceConfig(ethernet=True, ethernet_driver="pcap")
+    with pytest.raises(ve.ViceElevationRequiredError) as excinfo:
+        ve.plan_vice_launch(cfg, [str(link), "-warp"])
+    err = excinfo.value
+    assert err.binary == str(link)
+    assert "cellar-x64sc" not in err.sudoers_entry
+    assert "cellar-x64sc" not in err.command

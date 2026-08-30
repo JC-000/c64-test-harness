@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING
 
 from c64_test_harness.backends.vice_elevation import (
     ViceElevationRequiredError,
+    effective_driver_name,
+    vice_features,
     ViceEthernetBinaryError,
     ViceEthernetError,
     ViceLaunchPlan,
@@ -40,19 +42,20 @@ ETHERNET_VICE_BIN_ENV = "VICE_ETHERNET_BIN"
 def ethernet_vice_binary() -> str:
     """Path to an ethernet-capable ``x64sc``, or ``""`` when unconfigured.
 
-    Escape hatch for a bench whose ``PATH`` ``x64sc`` was built without
-    raw-network support: such a build starts, serves the binary monitor,
-    and emulates the CS8900a registers while no host packet ever moves,
-    so an ethernet suite passes vacuously (issue #144).
-    :func:`resolve_vice_executable` now *checks* for that build (see
-    :func:`~c64_test_harness.backends.vice_elevation.vice_binary_supports_ethernet`)
-    and raises instead of falling back, so this variable is only needed
-    when the check actually fails.
+    **Override, not a requirement -- normally leave this unset.**  The
+    ``PATH`` binary is the intended one: Homebrew's VICE 3.10 bottle
+    reports ``HAVE_RAWNET yes`` / ``HAVE_PCAP yes`` to ``-features`` and
+    links libpcap, so ethernet work needs no separately-built companion.
+    (It was long cited as an ethernet-less build, issue #144; that was a
+    misreading of the crash an *unelevated* launch produces -- see
+    ``vice_elevation``.)
 
-    Note that Homebrew's VICE 3.10 bottle -- long cited as the example of
-    an ethernet-less build -- is *not* one: it carries the full rawnet
-    resource surface and links libpcap.  What breaks it is running
-    unelevated (see ``vice_elevation``), not the build.
+    Set it only for a bench that must launch a different binary.
+    :func:`resolve_vice_executable` probes whichever binary it resolves
+    (see :func:`~c64_test_harness.backends.vice_elevation.vice_features`)
+    and raises rather than falling back to one that cannot do ethernet,
+    which is how a suite ends up asserting against emulated CS8900a
+    registers while no host packet moves.
 
     Set ``VICE_ETHERNET_BIN`` to that path, or configure
     ``HarnessConfig.vice_ethernet_executable`` (TOML
@@ -100,12 +103,25 @@ def resolve_vice_executable(cfg: ViceConfig) -> str:
             f"ethernet=True but no x64sc found at {candidate!r} "
             f"(from {source}). {hint}"
         )
-    if not vice_binary_supports_ethernet(resolved):
+    features = vice_features(resolved)
+    if not features.rawnet:
         raise ViceEthernetBinaryError(
-            f"ethernet=True but {resolved!r} (from {source}) was built "
-            f"without raw-network support — it has no ethernet resources, "
+            f"ethernet=True but {resolved!r} (from {source}) reports "
+            f"HAVE_RAWNET no — it was built without raw-network support, "
             f"so the CS8900a would be pure emulation with no host traffic. "
             f"{hint}"
+        )
+    # A driver the build lacks is the same NULL-driver SIGSEGV by another
+    # route, so refuse it here.  Only when the binary actually told us
+    # which drivers it has: the image-scan fallback cannot know.
+    driver = effective_driver_name(cfg.ethernet_driver)
+    if features.drivers_known and not features.has_driver(driver):
+        have = ", ".join(d for d in ("pcap", "tuntap") if features.has_driver(d))
+        raise ViceEthernetBinaryError(
+            f"ethernet_driver={driver!r} but {resolved!r} was built "
+            f"without it (-features says HAVE_{driver.upper()} no; "
+            f"this build has: {have or 'no drivers'}). VICE would leave "
+            f"rawnet_arch_driver NULL and SIGSEGV on reset."
         )
     # Return the caller's spelling, not the resolved path: sudoers and
     # PATH lookups downstream expect what was configured.

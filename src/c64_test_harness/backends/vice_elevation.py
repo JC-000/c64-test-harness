@@ -33,6 +33,7 @@ import getpass
 import logging
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -50,6 +51,17 @@ _log = logging.getLogger(__name__)
 #: unelevated and a WARNING says so; if the capability really is missing,
 #: VICE will SIGSEGV on the first reset.
 ALLOW_UNELEVATED_ENV = "VICE_ETHERNET_ALLOW_UNELEVATED"
+
+#: Seconds to allow ``x64sc -features``.  It prints a table and exits;
+#: no emulator starts.
+_FEATURES_TIMEOUT = 10.0
+
+#: ``-features`` rows the harness cares about, mapped to field names.
+_FEATURE_ROWS = {
+    "HAVE_RAWNET": "rawnet",
+    "HAVE_PCAP": "pcap",
+    "HAVE_TUNTAP": "tuntap",
+}
 
 #: Resource-name strings present in every x64sc built with raw-network
 #: support and absent when ethernet is compiled out.  Both live in the
@@ -136,29 +148,92 @@ class ViceLaunchPlan:
 # ------------------------------------------------------- build capability
 
 
-def vice_binary_supports_ethernet(path: str) -> bool:
-    """Whether the x64sc at *path* was built with raw-network support.
+@dataclass(frozen=True)
+class ViceFeatures:
+    """What an ``x64sc`` build can do, as the binary itself reports it.
 
-    Scans the binary image for the rawnet resource names
-    (:data:`ETHERNET_BUILD_MARKERS`).  Cheap, offline, and — unlike
-    "is ``$VICE_ETHERNET_BIN`` set?" — an actual property of the build.
+    ``source`` is ``"-features"`` when the binary answered, or ``"scan"``
+    when it could not be executed and we fell back to reading its image.
+    The fallback can see *whether* raw-network support is compiled in but
+    not *which* drivers, so ``drivers_known`` is False there and callers
+    must not refuse a driver on its say-so.
+    """
 
-    It cannot tell pcap from tuntap: both drivers share those resource
-    names.  Use :func:`driver_requires_root` for the driver question.
+    rawnet: bool
+    pcap: bool
+    tuntap: bool
+    source: str
+    drivers_known: bool
 
-    Returns ``False`` for a path that does not exist or cannot be read.
+    def has_driver(self, name: str) -> bool:
+        return {"pcap": self.pcap, "tuntap": self.tuntap}.get(name.lower(), False)
+
+
+def vice_features(path: str) -> ViceFeatures:
+    """Probe the build capabilities of the ``x64sc`` at *path*.
+
+    ``x64sc -features`` prints its compile-time feature table and exits
+    (no emulator, no window, no monitor), so this is the authoritative
+    and cheap answer to "was this built with ethernet?":
+
+        HAVE_RAWNET               yes  Enable raw ethernet emulation.
+        HAVE_PCAP                 yes  Use the PCAP library.
+        HAVE_TUNTAP               no   Support for TUN/TAP virtual ...
+
+    Cached per binary (path + mtime + size), so a rebuild is re-probed
+    but a hot loop pays once.  If the binary cannot be executed or says
+    nothing useful, falls back to scanning its image for the rawnet
+    resource names.
     """
     try:
         st = os.stat(path)
     except OSError:
-        return False
-    return _scan_for_markers(os.path.realpath(path), st.st_mtime_ns, st.st_size)
+        return ViceFeatures(False, False, False, "unreadable", False)
+    return _probe_features(os.path.realpath(path), st.st_mtime_ns, st.st_size, path)
+
+
+@lru_cache(maxsize=32)
+def _probe_features(
+    real_path: str, mtime_ns: int, size: int, launch_path: str
+) -> ViceFeatures:
+    values: dict[str, bool] = {}
+    try:
+        proc = subprocess.run(
+            [launch_path, "-features"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=_FEATURES_TIMEOUT,
+        )
+        for line in (proc.stdout or "").splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] in _FEATURE_ROWS:
+                values[_FEATURE_ROWS[parts[0]]] = parts[1].lower() == "yes"
+    except (OSError, subprocess.SubprocessError):
+        values = {}
+
+    if "rawnet" in values:
+        return ViceFeatures(
+            rawnet=values.get("rawnet", False),
+            pcap=values.get("pcap", False),
+            tuntap=values.get("tuntap", False),
+            source="-features",
+            drivers_known=True,
+        )
+
+    # Could not ask the binary; read it instead.
+    rawnet = _scan_for_markers(real_path, mtime_ns, size)
+    _log.debug("%s did not answer -features; fell back to image scan", launch_path)
+    return ViceFeatures(
+        rawnet=rawnet, pcap=False, tuntap=False, source="scan", drivers_known=False
+    )
 
 
 @lru_cache(maxsize=32)
 def _scan_for_markers(real_path: str, mtime_ns: int, size: int) -> bool:
-    """Marker scan, cached on the file's identity (so a rebuilt binary at
-    the same path is rescanned rather than remembered)."""
+    """Fallback for a binary we cannot execute: does its image carry the
+    rawnet resource names?  Cached on the file's identity, so a rebuilt
+    binary at the same path is rescanned rather than remembered."""
     remaining = set(ETHERNET_BUILD_MARKERS)
     overlap = max(len(m) for m in ETHERNET_BUILD_MARKERS) - 1
     tail = b""
@@ -174,6 +249,15 @@ def _scan_for_markers(real_path: str, mtime_ns: int, size: int) -> bool:
     except OSError:
         return False
     return not remaining
+
+
+def vice_binary_supports_ethernet(path: str) -> bool:
+    """Whether the x64sc at *path* was built with raw-network support.
+
+    Thin wrapper over :func:`vice_features`.  Returns ``False`` for a
+    path that does not exist.
+    """
+    return vice_features(path).rawnet
 
 
 # --------------------------------------------- archdep_rawnet_capability
@@ -210,17 +294,26 @@ def rawnet_capability(*, as_root: bool | None = None) -> bool:
     return _has_cap_net_raw()
 
 
+def effective_driver_name(driver: str) -> str:
+    """*driver*, or VICE's default for this platform when it is empty.
+
+    macOS builds ship pcap only (``HAVE_TUNTAP no``, confirmed by
+    ``-features`` on the Homebrew 3.10 bottle); Linux defaults to tuntap
+    where it is compiled in.
+    """
+    name = (driver or "").strip().lower()
+    if name:
+        return name
+    return "pcap" if sys.platform == "darwin" else "tuntap"
+
+
 def driver_requires_root(driver: str) -> bool:
     """Whether *driver* is one VICE gates behind rawnet capability.
 
-    An empty string means "VICE's default for this platform": pcap on
-    macOS (the only driver a Darwin build has), tuntap elsewhere.  An
-    unrecognised name is treated as ungated — better to let VICE reject
-    an unknown driver than to demand root on a guess.
+    An unrecognised name is treated as ungated — better to let VICE
+    reject an unknown driver than to demand root on a guess.
     """
-    name = (driver or "").strip().lower()
-    if not name:
-        name = "pcap" if sys.platform == "darwin" else "tuntap"
+    name = effective_driver_name(driver)
     if name in _UNGATED_DRIVERS:
         return False
     return name in _ROOT_GATED_DRIVERS
@@ -261,6 +354,22 @@ def _sudoers_entry(binary: str) -> str:
     return f"{user} ALL=(root) NOPASSWD: {binary}"
 
 
+def launch_path(binary: str) -> str:
+    """*binary* as an absolute path, resolved the way sudo matches it.
+
+    A bare name must be resolved before it is handed to sudo: sudo looks
+    the command up in ``secure_path``, which on macOS does not include
+    ``/opt/homebrew/bin``, so ``sudo -n x64sc`` fails with "command not
+    found" even where ``x64sc`` runs fine unelevated.
+
+    PATH lookup only -- symlinks are deliberately *not* resolved.
+    sudoers matches the literal command path, so
+    ``/opt/homebrew/bin/x64sc`` is what a NOPASSWD rule must name, not
+    the ``/opt/homebrew/Cellar/vice/3.10/bin/x64sc`` it points at.
+    """
+    return shutil.which(binary) or binary
+
+
 def _unelevated_allowed() -> bool:
     return os.environ.get(ALLOW_UNELEVATED_ENV, "").strip() == "1"
 
@@ -298,7 +407,7 @@ def plan_vice_launch(cfg: "ViceConfig", argv: Sequence[str]) -> ViceLaunchPlan:
     :data:`ALLOW_UNELEVATED_ENV` opts out.
     """
     args = list(argv)
-    binary = args[0]
+    binary = launch_path(args[0])
     already_root = os.geteuid() == 0
 
     needs_root = (
@@ -350,4 +459,7 @@ def plan_vice_launch(cfg: "ViceConfig", argv: Sequence[str]) -> ViceLaunchPlan:
     # privilege expansion we deliberately do not ask for.  VICE reads
     # $HOME for its config path and sudo's default env_keep includes
     # HOME, so plain `sudo -n` suffices.
-    return ViceLaunchPlan(argv=["sudo", "-n"] + args, elevated=True, sudo_wrapped=True)
+    # argv[0] becomes the resolved absolute path: see launch_path().
+    return ViceLaunchPlan(
+        argv=["sudo", "-n", binary] + args[1:], elevated=True, sudo_wrapped=True
+    )
