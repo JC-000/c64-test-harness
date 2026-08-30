@@ -1,6 +1,33 @@
-"""Tests for new ViceConfig fields wired into ViceProcess argv construction.
+"""``ViceConfig`` -> argv construction: the logic, not the flag names.
 
-Pure unit tests — no real x64sc spawn; ``subprocess.Popen`` is patched.
+What belongs here is argv-shaping logic that is the harness's own:
+whether a branch fires, how a value is formatted, which token wins when a
+caller overrides, and that a path is passed as one token.  Those are real
+invariants with no oracle outside this repo, and a mock is the right tool
+for them.
+
+What does **not** belong here is any assertion whose expected value is a
+VICE flag *name*.  Such a test's oracle is the string the author typed,
+so it detects drift from the author's intent and can never detect that
+the intent was wrong -- which is not hypothetical: six flag names added
+in af479ee were all wrong, four of them fatal, and a full set of argv
+assertions here certified them green for months.  Flag names are now
+checked against VICE itself:
+
+* ``tests/test_vice_argv_contract.py`` -- every emitted flag must exist
+  in ``x64sc -help`` exactly, every early-scan flag must precede the
+  ordinary ones, and a fully-populated config must really launch.
+* ``tests/test_vice_cmdline_flags.py`` -- each field's flag must set the
+  resource it claims to, read back over the binary monitor.
+
+Five tests were deleted from this module when those landed, each one an
+argv assertion for a field now covered live with a stronger oracle:
+``event_snapshot_mode``, ``event_image_include``, ``event_snapshot_dir``,
+``sound_record_driver`` and ``sound_record_file``.  They are not merely
+redundant -- they would re-certify a wrong flag name as correct, which is
+how the original defect survived.
+
+Pure unit tests -- no real x64sc spawn; ``subprocess.Popen`` is patched.
 """
 from __future__ import annotations
 
@@ -53,58 +80,12 @@ def test_defaults_emit_no_new_flags(mock_popen):
 
 # ---------- per-field positive cases ----------
 
-@pytest.mark.parametrize("mode", [0, 1, 2, 3])
-@patch("subprocess.Popen")
-def test_event_snapshot_mode_valid_values(mock_popen, mode):
-    cfg = ViceConfig(event_snapshot_mode=mode)
-    args = _start_and_capture_args(cfg, mock_popen)
-    i = args.index("-eventstartmode")
-    assert args[i + 1] == str(mode)
-
-
-@pytest.mark.parametrize(
-    "value, expected", [(True, "-eventimageinc"), (False, "+eventimageinc")]
-)
-@patch("subprocess.Popen")
-def test_event_image_include_emits_the_right_polarity(mock_popen, value, expected):
-    """VICE's cmdline convention: a leading ``+`` is the disabling form."""
-    cfg = ViceConfig(event_image_include=value)
-    args = _start_and_capture_args(cfg, mock_popen)
-    assert expected in args
-    other = "+eventimageinc" if value else "-eventimageinc"
-    assert other not in args
-
-
-@patch("subprocess.Popen")
-def test_event_snapshot_dir_emits_flag_and_path(mock_popen):
-    cfg = ViceConfig(event_snapshot_dir="/var/tmp/snaps")
-    args = _start_and_capture_args(cfg, mock_popen)
-    i = args.index("-eventsnapshotdir")
-    assert args[i + 1] == "/var/tmp/snaps"
-
-
 @patch("subprocess.Popen")
 def test_seed_emits_flag_and_int(mock_popen):
     cfg = ViceConfig(seed=42)
     args = _start_and_capture_args(cfg, mock_popen)
     i = args.index("-seed")
     assert args[i + 1] == "42"
-
-
-@patch("subprocess.Popen")
-def test_sound_record_driver_emits_flag(mock_popen):
-    cfg = ViceConfig(sound_record_driver="wav")
-    args = _start_and_capture_args(cfg, mock_popen)
-    i = args.index("-soundrecdev")
-    assert args[i + 1] == "wav"
-
-
-@patch("subprocess.Popen")
-def test_sound_record_file_emits_flag(mock_popen):
-    cfg = ViceConfig(sound_record_file="/tmp/out.wav")
-    args = _start_and_capture_args(cfg, mock_popen)
-    i = args.index("-soundrecarg")
-    assert args[i + 1] == "/tmp/out.wav"
 
 
 @patch("subprocess.Popen")

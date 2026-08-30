@@ -29,12 +29,14 @@ from c64_test_harness.backends.vice_binary import (
     API_VERSION,
     CMD_ADVANCE_INSTRUCTIONS,
     CMD_CHECKPOINT_DEL,
+    CMD_CHECKPOINT_SET,
     CMD_CONDITION_SET,
     CMD_DUMP,
     CMD_EXECUTE_UNTIL_RETURN,
     CMD_MEM_GET,
     CMD_MEM_SET,
     CMD_REGISTERS_GET,
+    CMD_REGISTERS_SET,
     CMD_RESOURCE_GET,
     CMD_RESOURCE_SET,
     CMD_TO_RESPONSE_TYPE,
@@ -422,25 +424,70 @@ class TestCmdResponseTypeMapCompleteness:
     _send_and_recv must refuse to send an unmapped command rather than
     silently skipping response validation."""
 
-    @pytest.mark.parametrize(
-        "cmd,expected",
-        [
-            (CMD_CHECKPOINT_DEL, 0x13),
-            (CMD_CONDITION_SET, 0x22),
-            (CMD_DUMP, 0x41),
-            (CMD_UNDUMP, 0x42),
-            (CMD_RESOURCE_GET, 0x51),
-            (CMD_RESOURCE_SET, 0x52),
-            (CMD_ADVANCE_INSTRUCTIONS, 0x71),
-            (CMD_EXECUTE_UNTIL_RETURN, 0x73),
-        ],
-    )
-    def test_previously_missing_commands_echo_opcode(
-        self, cmd: int, expected: int
-    ) -> None:
-        """The 8 commands the audit found missing now map to their echoed
-        opcode per the VICE binary monitor spec."""
-        assert CMD_TO_RESPONSE_TYPE[cmd] == expected
+    #: The two commands whose reply is *not* an echo of the opcode, with
+    #: the reason.  Both are structural to the protocol -- a "set" that
+    #: returns the resulting state -- and both are proven against a real
+    #: VICE by the live tests named below, because a wrong entry here
+    #: makes ``_wait_for_response`` raise a type mismatch on the wire.
+    NON_ECHO_REPLIES = {
+        CMD_CHECKPOINT_SET: (
+            0x11,
+            "replies with CHECKPOINT_INFO, not a Set ack "
+            "(live: test_vice_binary.py::test_checkpoint_and_resume)",
+        ),
+        CMD_REGISTERS_SET: (
+            0x31,
+            "replies with a Registers response "
+            "(live: test_vice_binary.py::test_set_and_read_registers)",
+        ),
+    }
+
+    def test_response_type_echoes_the_opcode_except_where_documented(self) -> None:
+        """The map must follow the protocol's rule, not a typed-in table.
+
+        This replaces eight assertions of the form
+        ``CMD_TO_RESPONSE_TYPE[CMD_DUMP] == 0x41``.  Those restated the
+        opcode constant as a literal in the test file, under a docstring
+        citing the spec -- so their oracle was the author, and they would
+        have agreed just as readily with eight wrong numbers.  They also
+        covered only 8 of the 23 commands.
+
+        The real rule is that a reply echoes the command opcode, with two
+        documented exceptions.  Asserting the rule covers every command,
+        including ones added later, and makes the exceptions explicit
+        rather than indistinguishable from the other 21 entries.
+        """
+        import c64_test_harness.backends.vice_binary as vb
+
+        for name, cmd in sorted(vars(vb).items()):
+            if not name.startswith("CMD_") or name == "CMD_TO_RESPONSE_TYPE":
+                continue
+            got = CMD_TO_RESPONSE_TYPE[cmd]
+            if cmd in self.NON_ECHO_REPLIES:
+                want, why = self.NON_ECHO_REPLIES[cmd]
+                assert got == want, f"{name}: expected {want:#04x} ({why})"
+            else:
+                assert got == cmd, (
+                    f"{name} ({cmd:#04x}) maps to {got:#04x}. A reply echoes "
+                    f"its command opcode unless it is a documented exception "
+                    f"-- add it to NON_ECHO_REPLIES with the reason if this "
+                    f"is genuinely one."
+                )
+
+    def test_the_echo_rule_would_catch_a_wrong_entry(self) -> None:
+        """Negative control: the rule above must reject a corrupted map.
+
+        Without this, a refactor that made the loop iterate over nothing
+        would leave a passing test that checks no commands at all.
+        """
+        import c64_test_harness.backends.vice_binary as vb
+
+        assert len(CMD_TO_RESPONSE_TYPE) >= 20, "map shrank; rule covers little"
+        bad = dict(CMD_TO_RESPONSE_TYPE)
+        bad[vb.CMD_DUMP] = 0xFF
+        assert bad[vb.CMD_DUMP] != vb.CMD_DUMP, (
+            "a corrupted entry must be distinguishable from a good one"
+        )
 
     def test_every_cmd_constant_is_mapped(self) -> None:
         """All CMD_* module constants have a CMD_TO_RESPONSE_TYPE entry."""

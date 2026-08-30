@@ -71,20 +71,6 @@ def _make_transport(*, text_monitor: bool = False) -> BinaryViceTransport:
         return t
 
 
-def _build_response(response_type: int, body: bytes, request_id: int = 0) -> bytes:
-    """Build a raw binary monitor response (header + body) as bytes."""
-    header = struct.pack(
-        "<BBIBBI",
-        STX,
-        API_VERSION,
-        len(body),       # body_length (4 bytes)
-        response_type,   # 1 byte
-        0x00,            # error_code (1 byte)
-        request_id,      # 4 bytes
-    )
-    return header + body
-
-
 # ---------------------------------------------------------------------------
 # resource_get tests
 # ---------------------------------------------------------------------------
