@@ -313,13 +313,16 @@ def probe_vice_pcap_ok(
         elevated = not bpf_capture_available()
         args = (["sudo", "-n"] if elevated else []) + [
             x64sc,
+            # -console must precede every other flag: VICE's pre-UI argv
+            # scan (S main.c:267-303) breaks at the first argument it does
+            # not recognise, and -addconfig is one of those.
+            "-console",
             "-addconfig", rc_path,
             "-ethernetioif", iface,
             "-ethernetiodriver", "pcap",
             "-binarymonitor",
             "-binarymonitoraddress", f"ip4://127.0.0.1:{port}",
             "+sound",
-            "-console",
         ]
 
         try:

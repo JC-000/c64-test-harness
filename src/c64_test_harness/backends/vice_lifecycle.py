@@ -54,10 +54,47 @@ def resolve_vice_executable(cfg: ViceConfig) -> str:
     Prefers :attr:`ViceConfig.ethernet_executable` when the ethernet cart
     is in play, so a bench can keep a stock ``x64sc`` on ``PATH`` for
     ordinary tests and an ethernet-enabled build for the bridge suite.
+
+    With ``cfg.ethernet`` set, the chosen binary is *checked* for
+    raw-network support and a build without it raises
+    :class:`ViceEthernetBinaryError`.  It used to fall back to
+    ``cfg.executable`` silently, which is how an ethernet suite ends up
+    asserting against emulated CS8900a registers while no host packet
+    ever moves (issue #144).
     """
-    if cfg.ethernet and cfg.ethernet_executable:
-        return cfg.ethernet_executable
-    return cfg.executable
+    if not cfg.ethernet:
+        return cfg.executable
+
+    candidate = cfg.ethernet_executable or cfg.executable
+    source = (
+        f"ViceConfig.ethernet_executable / ${ETHERNET_VICE_BIN_ENV}"
+        if cfg.ethernet_executable
+        else "ViceConfig.executable"
+    )
+    resolved = shutil.which(candidate)
+    if resolved is None and os.path.isfile(candidate):
+        resolved = candidate
+    hint = (
+        f"Point the harness at an ethernet-capable x64sc: set "
+        f"${ETHERNET_VICE_BIN_ENV}=/path/to/x64sc, or TOML "
+        f"``[vice] ethernet_executable`` "
+        f"(HarnessConfig.vice_ethernet_executable)."
+    )
+    if resolved is None:
+        raise ViceEthernetBinaryError(
+            f"ethernet=True but no x64sc found at {candidate!r} "
+            f"(from {source}). {hint}"
+        )
+    if not vice_binary_supports_ethernet(resolved):
+        raise ViceEthernetBinaryError(
+            f"ethernet=True but {resolved!r} (from {source}) was built "
+            f"without raw-network support — it has no ethernet resources, "
+            f"so the CS8900a would be pure emulation with no host traffic. "
+            f"{hint}"
+        )
+    # Return the caller's spelling, not the resolved path: sudoers and
+    # PATH lookups downstream expect what was configured.
+    return candidate
 
 
 def _find_pid_on_port_linux(port: int) -> int | None:
@@ -346,7 +383,28 @@ class ViceProcess:
                 f"event_snapshot_mode must be 0, 1, or 2 (got {cfg.event_snapshot_mode})"
             )
 
-        args = [resolve_vice_executable(cfg)]
+        # VICE scans argv for a handful of flags *before* it initialises the
+        # UI or loads the config file (S main.c:267-303), and that scan
+        # ``break``s at the first argument it does not recognise.  Anything
+        # it handles must therefore appear before every other flag.
+        #
+        # ``-console`` is the one that bites: ``ui_init_with_args``
+        # (S main.c:385) is gated on the ``console_mode`` flag that only
+        # this early scan sets.  The late handler registered via
+        # initcmdline.c:307 fires at main.c:421, long after the window
+        # exists.  Emitted after ``-autostart``/``-warp`` the flag is
+        # silently ineffective on macOS: VICE opens the window anyway.
+        #
+        # ``-seed`` has the identical shape -- ``lib_rand_seed()`` is called
+        # from the early scan and nowhere else, so a late ``-seed`` is
+        # parsed as a resource option and never seeds the RNG.
+        early_args: list[str] = []
+        if cfg.console:
+            early_args.append("-console")
+        if cfg.seed is not None:
+            early_args += ["-seed", str(cfg.seed)]
+
+        args = [resolve_vice_executable(cfg)] + early_args
         if cfg.prg_path:
             args += ["-autostart", cfg.prg_path]
             if sys.platform == "darwin" and "-autostartprgmode" not in cfg.extra_args:
@@ -372,9 +430,7 @@ class ViceProcess:
             args.append("+sound")
         if cfg.limit_cycles > 0:
             args += ["-limitcycles", str(cfg.limit_cycles)]
-        if cfg.console:
-            args.append("-console")
-        elif cfg.minimize:
+        if not cfg.console and cfg.minimize:
             args.append("-minimized")
         if cfg.load_snapshot is not None:
             args += ["-loadsnapshot", cfg.load_snapshot]
@@ -386,8 +442,6 @@ class ViceProcess:
             args += ["-eventsnapshot", str(cfg.event_snapshot_mode)]
         if cfg.event_snapshot_dir is not None:
             args += ["-eventsnapshotdir", cfg.event_snapshot_dir]
-        if cfg.seed is not None:
-            args += ["-seed", str(cfg.seed)]
         if cfg.sound_record_driver is not None:
             args += ["-soundrecord", cfg.sound_record_driver]
         if cfg.sound_record_file is not None:
