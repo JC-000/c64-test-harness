@@ -148,11 +148,34 @@ def test_autostart_adds_prgmode_1_on_darwin(mock_popen):
 
 @patch("c64_test_harness.backends.vice_lifecycle.sys.platform", "linux")
 @patch("subprocess.Popen")
-def test_autostart_no_prgmode_on_linux(mock_popen):
+def test_autostart_prgmode_is_set_on_linux_too(mock_popen):
+    """Linux gets ``-autostartprgmode 1`` like every other platform.
+
+    This test previously asserted the opposite -- that Linux emitted no
+    ``-autostartprgmode`` at all -- which pinned a platform divergence in
+    place rather than describing an intent.  With no flag, Linux inherited
+    ``AutostartPrgMode`` from the vicerc, or fell back to the factory
+    2/Disk (S ``autostart-prg.h:45``), while macOS injected 1/Inject.  The
+    two platforms therefore autostarted programs by different mechanisms.
+    """
     cfg = ViceConfig(prg_path="/tmp/foo.prg")
     args = _start_and_capture_args(cfg, mock_popen)
     assert "-autostart" in args
-    assert "-autostartprgmode" not in args
+    i = args.index("-autostartprgmode")
+    assert args[i + 1] == "1"
+
+
+@patch("subprocess.Popen")
+def test_autostart_prgmode_is_pinned_even_without_a_prg(mock_popen):
+    """The resource is pinned whether or not this run autostarts anything.
+
+    ``-default`` leaves VICE at its factory values, so a resource the
+    harness cares about has to be set explicitly every time, not only on
+    the code path that happens to use it.
+    """
+    args = _start_and_capture_args(ViceConfig(), mock_popen)
+    i = args.index("-autostartprgmode")
+    assert args[i + 1] == "1"
 
 
 @patch("c64_test_harness.backends.vice_lifecycle.sys.platform", "darwin")
