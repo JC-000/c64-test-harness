@@ -213,9 +213,13 @@ def build_ethernet_rc(cfg: ViceConfig) -> str:
     ``-ethernetiodriver`` CLI flags that are passed alongside.
 
     The real names are ``ETHERNET_INTERFACE`` (S ``cs8900io.c:309``) and
-    ``ETHERNET_DRIVER`` (S ``rawnetarch.c:146``).  They are written here
-    as well as on the command line so that any path which does not pass
-    the CLI flags still gets the setting.
+    ``ETHERNET_DRIVER`` (S ``rawnetarch.c:146``).  Verified elevated with
+    no ethernet CLI flags at all: this rc alone brings up
+    ``ETHERNET_DRIVER='pcap'``, ``ETHERNET_INTERFACE='feth0'`` and
+    ``ETHERNETCART_ACTIVE=1``, with two BPF peers attached.  The rc is
+    therefore sufficient by itself and the CLI flags are redundant, not
+    load-bearing -- which is why the old misspellings mattered: any path
+    relying on the rc alone was silently unconfigured.
 
     ``EthernetCartMode`` / ``EthernetCartBase`` are correct as they
     stand: the *resource* table lookup is case-insensitive

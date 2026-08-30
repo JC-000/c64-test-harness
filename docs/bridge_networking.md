@@ -326,6 +326,24 @@ elevates, the helper returned `[]` every time, and the probe published
 that as a defect in the emulator build. Its own diagnostic string is what
 #144 was written from.
 
+### The rc alone is sufficient; the ethernet CLI flags are redundant
+
+The same elevated run settles a second question. `ViceProcess` writes an
+`-addconfig` rc *and* passes `-ethernetioif` / `-ethernetiodriver`, and
+two rc keys were misspelled (`EthernetIOIF` / `EthernetIODriver` — not
+VICE resources in any casing; the real names are `ETHERNET_INTERFACE`
+and `ETHERNET_DRIVER`). That was first recorded as harmless, because the
+CLI flags carried the same settings.
+
+It was worse than that. With the corrected names and **no ethernet CLI
+flags at all**, the rc on its own produces `ETHERNET_DRIVER='pcap'`,
+`ETHERNET_INTERFACE='feth0'`, `ETHERNETCART_ACTIVE=1` and two attached
+BPF peers. The rc is sufficient by itself, so the CLI flags are
+redundant rather than load-bearing — and the misspelling was harmless
+only on paths that happened to pass both. Any path relying on the rc
+alone was silently unconfigured. Hence the fix writes the real names
+rather than dropping the lines.
+
 The instrument is now `netstat -B` (`bpf_attached_interfaces()` in
 `tests/bridge_platform.py`), which reports device, bound interface and
 owning command, needs no privilege, and reads root-owned processes.

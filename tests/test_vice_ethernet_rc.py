@@ -3,11 +3,19 @@
 ``ViceProcess.start()`` writes a temporary vicerc to activate the
 CS8900a, and two of the names in it were invented:  ``EthernetIOIF`` and
 ``EthernetIODriver`` do not exist in the VICE tree in any casing.  VICE
-logged ``Unknown resource`` and ignored them.  They were inert rather
-than harmful only because the ``-ethernetioif`` / ``-ethernetiodriver``
-CLI flags are passed alongside and carry the same settings — so on any
-path that did not also pass those flags, the rc silently configured
-nothing.
+logged ``Unknown resource`` and ignored them.
+
+They were first recorded as *harmless*, on the grounds that the
+``-ethernetioif`` / ``-ethernetiodriver`` CLI flags are passed alongside
+and carry the same settings.  That understates it.  An elevated run with
+the corrected names and **no ethernet CLI flags at all** configures
+ethernet completely from the rc — ``ETHERNET_DRIVER='pcap'``,
+``ETHERNET_INTERFACE='feth0'``, ``ETHERNETCART_ACTIVE=1``, and two BPF
+peers attached.  So the rc is sufficient on its own and the CLI flags are
+redundant rather than load-bearing: the misspelling was harmless only on
+paths that happened to pass both, and anything relying on the rc alone
+was silently unconfigured.  That is the case for writing the real names
+rather than dropping the lines.
 
 The real names are ``ETHERNET_INTERFACE`` (S ``cs8900io.c:309``) and
 ``ETHERNET_DRIVER`` (S ``rawnetarch.c:146``).
