@@ -87,10 +87,7 @@ if _LIVE_GATE and _IS_LINUX:
     # half-configured machine bails cleanly rather than hanging in VICE
     # bringup.
     pytestmark.extend([
-        pytest.mark.skipif(
-            shutil.which("x64sc") is None,
-            reason="x64sc not found on PATH",
-        ),
+        pytest.mark.vice_live,
         pytest.mark.skipif(
             not iface_present(IFACE_A),
             reason=f"{IFACE_A} not found ({SETUP_HINT})",

@@ -22,7 +22,6 @@ on PATH and the bridge interfaces present) are checked automatically.
 
 from __future__ import annotations
 
-import shutil
 import threading
 import time
 
@@ -60,12 +59,11 @@ from c64_test_harness.memory import read_bytes, write_bytes
 # ---------------------------------------------------------------------------
 # Skip conditions
 # ---------------------------------------------------------------------------
-_HAS_X64SC = shutil.which("x64sc") is not None
 
 _PCAP_OK, _PCAP_REASON = probe_vice_pcap_ok(iface=IFACE_A)
 
 pytestmark = [
-    pytest.mark.skipif(not _HAS_X64SC, reason="x64sc not found on PATH"),
+    pytest.mark.vice_live,
     # Reaching the binary monitor is not proof of capture: a VICE whose
     # rawnet driver never attached still emulates the CS8900 registers, so
     # these tests would assert on register readbacks with zero host traffic

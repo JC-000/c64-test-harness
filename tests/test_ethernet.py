@@ -20,7 +20,6 @@ interaction explanation.
 
 from __future__ import annotations
 
-import shutil
 import socket
 import struct
 import time
@@ -47,7 +46,6 @@ from conftest import connect_binary_transport
 # Skip helpers
 # ---------------------------------------------------------------------------
 
-_HAS_X64SC = shutil.which("x64sc") is not None
 
 # Platform-dependent: Linux → first tap-*, macOS → first feth*.
 TAP_IFACE = first_available_ethernet_iface()
@@ -69,7 +67,7 @@ TAP_IFACE = first_available_ethernet_iface()
 _PCAP_OK, _PCAP_REASON = probe_vice_pcap_ok(iface=TAP_IFACE)
 
 pytestmark = [
-    pytest.mark.skipif(not _HAS_X64SC, reason="x64sc not found on PATH"),
+    pytest.mark.vice_live,
     pytest.mark.skipif(
         TAP_IFACE is None,
         reason=f"No ethernet interface available for VICE ({SETUP_HINT})",

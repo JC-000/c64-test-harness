@@ -47,6 +47,7 @@ import time
 from dataclasses import dataclass
 
 import pytest
+from conftest import require_vice_or_skip
 
 from c64_test_harness import (
     ViceConfig,
@@ -281,8 +282,7 @@ def _variant_d_jsr_roundtrip(
 
 def test_read_bytes_stress_for_issue_88(capsys):
     """Stress reproducer for issue #88. See module docstring."""
-    if shutil.which("x64sc") is None:
-        pytest.skip("x64sc not on PATH")
+    require_vice_or_skip()
 
     iters_a = int(os.environ.get("READ_BYTES_STRESS_ITERS_A", "5000"))
     iters_b = int(os.environ.get("READ_BYTES_STRESS_ITERS_B", "5000"))
