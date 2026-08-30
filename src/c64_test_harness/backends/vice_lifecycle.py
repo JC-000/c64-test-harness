@@ -219,6 +219,23 @@ class ViceConfig:
     # ``console=False`` the window is created and ``minimize`` applies.
     console: bool = True
     minimize: bool = True  # only meaningful when console=False
+    #: Load the operator's ``~/.config/vice/vicerc``.
+    #:
+    #: Default **False**, which emits ``-default``.  A launch that reads
+    #: an ambient vicerc is not reproducible -- consumers of this harness
+    #: assert on machine state (turbo, REU, video standard, drive type),
+    #: and any of it can be overridden by whatever the operator last
+    #: clicked in VICE's settings dialog.
+    #:
+    #: It is also a crash: in console mode, loading *any* vicerc segfaults
+    #: x64sc (measured on two 3.10 builds; a file containing only
+    #: ``Speed=50`` is enough).  ``resources_load()`` reaches GTK style
+    #: state that console mode never initialises.  Windowed launches
+    #: survive it, which is why it went unnoticed while ``-console`` was
+    #: positionally broken and every launch was really windowed.
+    #:
+    #: Set True only to deliberately test config inheritance.
+    load_user_config: bool = False
     extra_args: list[str] = field(default_factory=list)
     disk_image: DiskImage | None = None
     drive_unit: int = 8
@@ -411,6 +428,10 @@ class ViceProcess:
         # from the early scan and nowhere else, so a late ``-seed`` is
         # parsed as a resource option and never seeds the RNG.
         early_args: list[str] = []
+        if not cfg.load_user_config:
+            # Also an early-scan flag: it sets ``loadconfig = false``
+            # (S main.c:285-291) before resources_load() runs at main.c:390.
+            early_args.append("-default")
         if cfg.console:
             early_args.append("-console")
         if cfg.seed is not None:
@@ -419,12 +440,46 @@ class ViceProcess:
         args = [resolve_vice_executable(cfg)] + early_args
         if cfg.prg_path:
             args += ["-autostart", cfg.prg_path]
-            if sys.platform == "darwin" and "-autostartprgmode" not in cfg.extra_args:
-                args += ["-autostartprgmode", "1"]
+
+        # ------------------------------------------------------------------
+        # Resources pinned explicitly rather than inherited.
+        #
+        # -default (above) stops the vicerc being read, which leaves VICE's
+        # factory defaults -- and several of those are not what the harness
+        # wants.  Pin them here so a run means the same thing on every
+        # machine.  cfg.extra_args is appended after this block, and VICE
+        # takes the last occurrence of a resource flag, so a caller can
+        # still override any of them.
+        # ------------------------------------------------------------------
+
+        # Factory is 2/Disk (S autostart-prg.h:45).  1/Inject is what the
+        # harness has always wanted, but it was set only on macOS, so Linux
+        # silently took the disk path.
+        if "-autostartprgmode" not in cfg.extra_args:
+            args += ["-autostartprgmode", "1"]
+
+        # Factory is 1 (S autostart.c:413): autostart ran warped even when
+        # the caller explicitly asked for warp=False.
+        args.append("-autostart-warp" if cfg.warp else "+autostart-warp")
+
+        # Factory is 0, but an operator's vicerc may set it -- in which case
+        # our runs would rewrite their settings file on exit.
+        args.append("+saveres")
+
+        # Determinism knobs.  These match VICE's factory values; they are
+        # named explicitly so they stay put if a future VICE changes them.
+        args += ["-jamaction", "1"]      # continue; never block on a dialog
+        args += ["-speed", "100"]        # no ambient speed limit
+        args += ["-soundwarpmode", "1"]  # keep emulating SID under warp,
+                                         # or render_wav() records silence
+        if cfg.disk_image is None or cfg.drive_unit != 8:
+            args += ["-drive8type", "1542"]
         if cfg.warp:
             args.append("-warp")
-        if cfg.ntsc:
-            args.append("-ntsc")
+        # ntsc=False used to emit nothing at all and inherit
+        # MachineVideoStandard.  PAL/NTSC changes cycle counts and TOD
+        # rates, which tod_timer.py calibrates against.
+        args.append("-ntsc" if cfg.ntsc else "-pal")
         if cfg.monitor:
             args += ["-binarymonitor", "-binarymonitoraddress",
                      f"ip4://127.0.0.1:{cfg.port}"]
@@ -432,14 +487,18 @@ class ViceProcess:
             args += ["-remotemonitor", "-remotemonitoraddress",
                      f"ip4://127.0.0.1:{cfg.text_monitor_port}"]
         if cfg.sounddev:
-            # Force sound on when a sound device is configured
+            # Force sound on when a sound device is configured.  The
+            # comment here has always said so; the flag was never emitted.
+            args.append("-sound")
             args += ["-sounddev", cfg.sounddev]
             if cfg.soundarg:
                 args += ["-soundarg", cfg.soundarg]
             args += ["-soundrate", str(cfg.soundrate)]
             args += ["-soundoutput", str(cfg.soundoutput)]
-        elif not cfg.sound:
-            args.append("+sound")
+        else:
+            # Factory Sound is 1 (S sound.c:721), so sound=True emitting
+            # nothing was an inherit, not a default.
+            args.append("-sound" if cfg.sound else "+sound")
         if cfg.limit_cycles > 0:
             args += ["-limitcycles", str(cfg.limit_cycles)]
         if not cfg.console and cfg.minimize:
