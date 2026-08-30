@@ -49,6 +49,14 @@ from .execute import (
 from .disk import DiskImage, DiskFormat, FileType, DirEntry, DiskImageError
 from .backends.vice_binary import BinaryViceTransport
 from .backends.vice_lifecycle import ViceProcess, ViceConfig
+from .backends.vice_elevation import (
+    ViceEthernetError,
+    ViceEthernetBinaryError,
+    ViceElevationRequiredError,
+    ViceLaunchPlan,
+    plan_vice_launch,
+    vice_binary_supports_ethernet,
+)
 from .backends.hardware import HardwareTransportBase
 from .backends.vice_manager import PortAllocator, ViceInstance, ViceInstanceManager
 from .backends.ultimate64 import Ultimate64Transport
@@ -362,6 +370,13 @@ __all__ = [
     "BinaryViceTransport",
     "ViceProcess",
     "ViceConfig",
+    # VICE ethernet capability / elevation preflight
+    "ViceEthernetError",
+    "ViceEthernetBinaryError",
+    "ViceElevationRequiredError",
+    "ViceLaunchPlan",
+    "plan_vice_launch",
+    "vice_binary_supports_ethernet",
     "HardwareTransportBase",
     # Multi-instance
     "PortAllocator",

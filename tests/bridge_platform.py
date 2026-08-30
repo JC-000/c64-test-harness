@@ -28,9 +28,12 @@ import sys
 import tempfile
 import time
 
+from c64_test_harness.backends.vice_elevation import (
+    rawnet_capability,
+    sudo_can_run,
+)
 from c64_test_harness.backends.vice_lifecycle import (
     ETHERNET_VICE_BIN_ENV,
-    bpf_capture_available,
     ethernet_vice_binary,
 )
 
@@ -307,10 +310,20 @@ def probe_vice_pcap_ok(
         port = _probe_port()
         # Elevate on exactly the same rule production uses, so the probe
         # measures the configuration the tests will actually run under.
-        # ``/dev/bpf*`` is root-only by default; rigs that open it up
-        # (``chmod o+rw``) let VICE capture unprivileged, verified by a
-        # non-root build attaching /dev/bpf1+2 on feth0.
-        elevated = not bpf_capture_available()
+        # VICE admits the pcap driver only when
+        # ``archdep_rawnet_capability()`` holds (euid 0; ``/dev/bpf*``
+        # permissions are not consulted), and without a driver it
+        # SIGSEGVs on reset -- which on macOS raises the crash reporter.
+        # So when we cannot elevate, skip rather than launch.
+        elevated = not rawnet_capability(as_root=False)
+        if elevated and not sudo_can_run(x64sc):
+            _PROBE_CACHE = (
+                False,
+                f"pcap needs root and 'sudo -n' is not authorised for "
+                f"{x64sc}; add a NOPASSWD sudoers rule naming that exact "
+                f"path (no bash wrapper), or run the suite as root",
+            )
+            return _PROBE_CACHE
         args = (["sudo", "-n"] if elevated else []) + [
             x64sc,
             # -console must precede every other flag: VICE's pre-UI argv
