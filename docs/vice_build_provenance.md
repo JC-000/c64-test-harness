@@ -152,12 +152,27 @@ answer the question:**
 The reliable check is parsing the NOPASSWD rules out of plain `sudo -n -l`, as
 above.
 
-**U:** the rule names the symlink `/opt/homebrew/bin/x64sc`. Whether invoking the
-resolved Cellar path (`/opt/homebrew/Cellar/vice/3.10/bin/x64sc`) also matches it
-was not tested — sudo matches the command as written and does not resolve
-symlinks by default, so assume it does **not** match and invoke the symlink path.
-This is the same class of trap as the existing "no `bash` wrapper" rule: NOPASSWD
-matches sudo's first non-flag argv verbatim.
+**Trap: sudo matches argv as written — resolve PATH, do not resolve symlinks.**
+The rule names the symlink `/opt/homebrew/bin/x64sc`, and that exact form is
+verified to work elevated (T, above). Name the symlink path in any NOPASSWD rule
+and invoke that same form. Two ways to get this wrong, both handled by
+`elevation-design`'s `launch_path()`:
+
+- **Resolving symlinks breaks authorisation.** Sudo matches the literal command
+  path after PATH lookup and does not follow links, so a rule naming the resolved
+  Cellar path would authorise nothing. `launch_path()` deliberately does not
+  resolve symlinks.
+- **Not resolving PATH breaks the launch.** Sudo's `secure_path` excludes
+  `/opt/homebrew/bin`, so a bare `x64sc` fails "command not found" under sudo even
+  where it runs fine unelevated (T, `elevation-design`) — and
+  `ViceConfig.executable` defaults to the bare name, so every elevated launch from
+  a default config would have failed this way. Resolving PATH is mandatory.
+
+Same root as the existing "no `bash` wrapper" rule: NOPASSWD matches sudo's first
+non-flag argv verbatim. Whether the resolved Cellar path would match is untested
+and academic — nothing invokes it elevated. (The unelevated segfault matrix in
+finding 2 used the Cellar path deliberately, to name the bottle unambiguously; no
+sudo was involved there.)
 
 A from-source `--enable-ethernet` build made during this phase still exists at
 `~/.local/opt/vice-3.10-ethernet/`. It is **not maintained and not the harness
