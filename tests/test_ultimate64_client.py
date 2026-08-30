@@ -358,8 +358,8 @@ def test_write_mem_large_payload_uses_post_with_body():
 def test_write_mem_just_above_threshold_uses_post():
     """One byte past the threshold crosses into POST territory."""
     mock, captured = _capture(b"")
-    c = Ultimate64Client("h")
-    payload = bytes(range(Ultimate64Client.WRITE_MEM_QUERY_THRESHOLD + 1))
+    c = Ultimate64Client("h", write_mem_query_threshold=48)
+    payload = bytes(range(c.write_mem_query_threshold + 1))
     with patch("urllib.request.urlopen", mock):
         c.write_mem(0x1000, payload)
     req = captured[0][0]
@@ -567,12 +567,18 @@ def test_mount_disk_validates_mode():
 
 
 def test_unmount_disk_url():
+    """The `:unmount` endpoint this used to assert has never existed.
+
+    It 404s on 3.14, 3.15 and 1.1.0 alike; `:remove` is the unmount verb,
+    and the slot takes the plain letter (a percent-encoded `b:` draws a
+    400 "Invalid Drive"). See `test_unmount_disk_targets_the_remove_endpoint`.
+    """
     mock, captured = _capture(b"")
-    c = Ultimate64Client("h")
+    c = Ultimate64Client("h", write_mem_query_threshold=48)
     with patch("urllib.request.urlopen", mock):
         c.unmount_disk("b")
     url = captured[0][0].get_full_url()
-    assert url == "http://h/v1/drives/b%3A:unmount"
+    assert url == "http://h/v1/drives/b:remove"
 
 
 # ---------------------------------------------------------------- multipart helper
@@ -1096,12 +1102,17 @@ def test_write_mem_threshold_autodetect_3_14d():
         assert c.write_mem_query_threshold == 128
 
 
-def test_write_mem_threshold_autodetect_other():
-    """Unknown / non-3.14 firmware keeps 48."""
+def test_write_mem_threshold_autodetect_older_firmware_is_protected():
+    """Firmware below 3.15 lacks the Temp-folder fix, whatever the version.
+
+    This used to assert 48 for anything that was not literally `3.14*`,
+    which handed the permissive threshold to every older build and to the
+    whole CBM line. The rule is now "has the fix", not "is 3.14".
+    """
     mock, _ = _capture(b'{"firmware_version":"V3.13","product":"Ultimate 64"}')
     with patch("urllib.request.urlopen", mock):
         c = Ultimate64Client("h")
-        assert c.write_mem_query_threshold == 48
+        assert c.write_mem_query_threshold == 128
 
 
 def test_write_mem_threshold_kwarg_override():
@@ -1114,12 +1125,77 @@ def test_write_mem_threshold_kwarg_override():
     assert captured == []
 
 
-def test_write_mem_threshold_probe_failure_falls_back():
-    """If get_info() raises during the probe, threshold falls back to 48."""
+def test_write_mem_threshold_probe_failure_is_conservative():
+    """A failed probe must assume the fix is absent, not present.
+
+    Guessing "present" puts small writes back on the leaking POST path;
+    guessing "absent" only costs a higher PUT threshold.
+    """
     def _raise(req, timeout=None):
         raise urllib.error.URLError("connection refused")
 
     with patch("urllib.request.urlopen", side_effect=_raise):
         c = Ultimate64Client("h")
         # Construction must not raise; resolving the property must not raise.
+        assert c.write_mem_query_threshold == 128
+        assert c.capabilities.writemem_post_safe is False
+
+
+# ------------------------------------------- drive unmount endpoint (audit #3)
+def test_unmount_disk_targets_the_remove_endpoint():
+    """`:unmount` has never existed on any firmware.
+
+    3.15's `software/api/route_drives.cc` registers mount / reset / remove /
+    on / off / unlink / load_rom / set_mode. `remove` is the unmount verb;
+    `unmount` 404s on 3.14, 3.15 and 1.1.0 alike.
+    """
+    mock, captured = _capture()
+    c = Ultimate64Client("h", write_mem_query_threshold=48)
+    with patch("urllib.request.urlopen", mock):
+        c.unmount_disk("a")
+    assert captured[0][0].full_url == "http://h/v1/drives/a:remove"
+
+
+def test_unmount_disk_does_not_percent_encode_the_slot():
+    """`/v1/drives/a%3A:remove` answers 400 "Invalid Drive 'a:'".
+
+    The slot takes the plain letter (verified live 2026-07-28).
+    """
+    mock, captured = _capture()
+    c = Ultimate64Client("h", write_mem_query_threshold=48)
+    with patch("urllib.request.urlopen", mock):
+        c.unmount_disk("a:")
+    assert "%3A" not in captured[0][0].full_url
+    assert captured[0][0].full_url == "http://h/v1/drives/a:remove"
+
+
+def test_unmount_disk_rejects_an_unknown_slot():
+    c = Ultimate64Client("h", write_mem_query_threshold=48)
+    with pytest.raises(ValueError):
+        c.unmount_disk("z")
+
+
+# --------------------------------- write_mem threshold via capabilities (#1)
+def test_write_mem_threshold_autodetect_3_15_uses_post_sooner():
+    """3.15 carries the Temp-folder fix, so the POST path is safe again."""
+    mock, _ = _capture(b'{"firmware_version":"3.15","product":"Ultimate 64 Elite"}')
+    with patch("urllib.request.urlopen", mock):
+        c = Ultimate64Client("h")
         assert c.write_mem_query_threshold == 48
+
+
+def test_write_mem_threshold_autodetect_c64u_1_1_0_is_protected():
+    """Regression: 1.1.0 is not `3.14*`, so the old string match left the
+    C64U on the permissive threshold despite predating the fix."""
+    mock, _ = _capture(b'{"firmware_version":"1.1.0"}')
+    with patch("urllib.request.urlopen", mock):
+        c = Ultimate64Client("h")
+        assert c.write_mem_query_threshold == 128
+
+
+def test_client_exposes_capabilities():
+    mock, _ = _capture(b'{"firmware_version":"3.15"}')
+    with patch("urllib.request.urlopen", mock):
+        c = Ultimate64Client("h")
+        assert c.capabilities.writemem_post_safe is True
+        assert c.capabilities.runner_wedge_possible is False
