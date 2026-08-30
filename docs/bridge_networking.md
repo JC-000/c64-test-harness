@@ -202,14 +202,24 @@ ifconfig bridge10 inet 10.0.65.1 netmask 255.255.255.0 up
 
 Prerequisites:
 
-* `x64sc` (VICE 3.10 Homebrew bottle — pre-built with `--enable-ethernet`
-  and the pcap driver)
-* Root privileges for `ifconfig create`/`addm` (only for setup/teardown;
-  VICE itself runs unprivileged)
-* `/dev/bpf*` readable by your user — install Wireshark's **ChmodBPF**
-  helper (recommended) or `sudo chmod 666 /dev/bpf*` for a one-shot
-  (resets on reboot). Without this, VICE's pcap driver fails to attach
-  `feth0`/`feth1` with a `pcap_open_live` / BPF permission error.
+* `x64sc` — **the Homebrew bottle is the right binary**; no separately
+  built VICE is needed. It reports `HAVE_RAWNET yes` / `HAVE_PCAP yes`
+  (`HAVE_TUNTAP no`) to `x64sc -features` and links libpcap. Leave
+  `$VICE_ETHERNET_BIN` unset; it is an override, not a requirement.
+* Root privileges for `ifconfig create`/`addm` (setup/teardown) **and for
+  VICE itself**. VICE registers its pcap driver only when
+  `archdep_rawnet_capability()` holds — `geteuid() == 0` on macOS — so an
+  unelevated ethernet launch has no driver at all and SIGSEGVs on reset.
+  The harness refuses such a launch rather than crashing; see trap 2
+  below.
+* A NOPASSWD sudoers rule naming the exact x64sc path, for unattended
+  runs (`/opt/homebrew/bin/x64sc` — the literal path, not its Cellar
+  symlink target). Being *permitted* to sudo is not enough: a launch that
+  stops at a password prompt is a failed launch.
+* `/dev/bpf*` permissions are **not** a prerequisite. VICE never reads
+  those nodes, and `chmod o+rw /dev/bpf*` changes nothing it consults —
+  running as root is what makes capture work. (Wireshark's ChmodBPF
+  helper is still useful for `tcpdump` as your own user.)
 * The c64-test-harness package (`c64_test_harness.bridge_ping`)
 
 Notes:
