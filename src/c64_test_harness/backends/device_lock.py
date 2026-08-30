@@ -108,6 +108,11 @@ _WAITER_NAME_RE = re.compile(r"^waiter-(\d+)-[0-9a-f]+\.json$")
 #: :meth:`DeviceLock.held_by_this_process`, which is how the advisory
 #: check tells "we own this device" from "somebody else does".
 _PROCESS_HELD: dict[str, int] = {}
+#: Thread idents that took a flock for each lockfile path, one entry per
+#: outstanding hold.  Only used to spot a thread waiting on a lock it
+#: holds itself, which can never be released; guarded by the same lock
+#: as :data:`_PROCESS_HELD`.
+_PROCESS_HELD_THREADS: dict[str, list[int]] = {}
 _PROCESS_HELD_GUARD = threading.Lock()
 
 #: Environment variable that upgrades the advisory warning to a raise.
@@ -306,6 +311,7 @@ class DeviceLock:
         self._queue_dir_path = Path(str(self._lock_path) + ".queue")
         self._allow_nested = allow_nested
         self._nested = False
+        self._owner_thread: int | None = None
         self._fd: int | None = None
         # Heartbeat: keep the lockfile mtime fresh so waiters using
         # queue-aware acquire() see this holder as "progressing" past
@@ -359,6 +365,16 @@ class DeviceLock:
         *progress_window*) counts against *timeout*.  Pass
         ``progress_window=None`` for the legacy hard-timeout behavior.
 
+        **A lock held by this same thread never extends the deadline.**
+        Its heartbeat keeps the mtime fresh and its PID is alive by
+        definition, so it would otherwise read as a perfectly healthy
+        holder for ever and *timeout would be unreachable* -- a permanent
+        hang that looks exactly like a healthy queue.  The wait is still
+        allowed (another thread may hold a reference to the holder and
+        release it in time, which is a supported pattern); it is simply
+        bounded by *timeout* again.  Holders in other threads or other
+        processes extend the deadline as before.
+
         :param timeout: maximum wall time (seconds) to wait against
             stuck/dead holders.  With queue-aware semantics, total
             wall time may exceed *timeout* if the holder keeps making
@@ -367,6 +383,8 @@ class DeviceLock:
             the lockfile (seconds) for it to count as "progressing".
             ``None`` disables queue-aware behavior (legacy mode: hard
             timeout).
+        :raises DeviceLockContentionError: never from this method; see
+            :meth:`acquire_or_raise` for the raising variant.
 
         While blocked, the waiter registers an intent file in the
         ``<lockfile>.queue/`` sidecar directory (removed on exit from
@@ -513,14 +531,51 @@ class DeviceLock:
             # Defensive: don't let a probe oddity hide the timeout.
             return False
 
+    def _held_by_this_thread(self) -> bool:
+        """Whether the flock we just failed to take is held by *this thread*.
+
+        Scoped to the thread, not the process, and both halves of that
+        matter:
+
+        * Not the lockfile's ``pid`` field, because :meth:`release`
+          leaves the lockfile behind on purpose -- a file naming this PID
+          routinely outlives the hold that wrote it, so reading it would
+          make every acquire/release/acquire cycle look self-held.
+        * Not the process-wide count either.  Two worker *threads*
+          sharing a device are concurrent users, and one waiting on the
+          other is legitimate and terminates: the holding thread can
+          still reach :meth:`release`.  Only a thread waiting on a lock
+          it holds itself is unconditionally stuck, because the one
+          thread that could release is the one blocked in ``acquire``.
+        """
+        key = str(self._lock_path)
+        me = threading.get_ident()
+        with _PROCESS_HELD_GUARD:
+            return me in _PROCESS_HELD_THREADS.get(key, ())
+
     def _holder_is_progressing(self, progress_window: float) -> bool:
         """True iff the lockfile holder is alive AND mtime is recent.
 
         "Alive" uses the same PID-liveness check as :meth:`cleanup_stale`.
         "Recent" means lockfile mtime is within *progress_window* seconds.
         Returns False on any IO/JSON error or missing pid (those are
-        treated as stuck so they count against *timeout*).
+        treated as stuck so they count against *timeout*), and False for
+        a lock held by this same thread -- see the comment below.
         """
+        # A lock held by this very thread is the one case where the
+        # freshness signal is worthless: our own heartbeat bumps the
+        # mtime and our own PID is alive by definition, so the holder
+        # looks maximally healthy while the only thread that could
+        # release it is the one blocked here.  Left as "progressing",
+        # the deadline resets on every poll and *timeout is unreachable*
+        # -- a permanent hang indistinguishable from a healthy queue.
+        # Refusing to extend makes the wait bounded again.  It does not
+        # forbid the wait: another thread holding a reference to the
+        # holder can still release it in time, which is a tested and
+        # supported pattern.  A hold owned by a *different* thread is a
+        # normal queue and still extends the deadline.
+        if self._held_by_this_thread():
+            return False
         try:
             st = os.stat(str(self._lock_path))
         except OSError:
@@ -626,8 +681,12 @@ class DeviceLock:
     def _register_process_hold(self) -> None:
         """Record that this process owns the flock for this lockfile."""
         key = str(self._lock_path)
+        self._owner_thread = threading.get_ident()
         with _PROCESS_HELD_GUARD:
             _PROCESS_HELD[key] = _PROCESS_HELD.get(key, 0) + 1
+            _PROCESS_HELD_THREADS.setdefault(key, []).append(
+                self._owner_thread
+            )
 
     def _join_process_hold(self) -> bool:
         """Join an existing in-process hold; ``True`` if there was one."""
@@ -649,9 +708,15 @@ class DeviceLock:
         """Drop this instance's reference in the process-hold registry."""
         key = str(self._lock_path)
         with _PROCESS_HELD_GUARD:
+            owners = _PROCESS_HELD_THREADS.get(key)
+            if owners and self._owner_thread in owners:
+                owners.remove(self._owner_thread)
             if purge:
                 _PROCESS_HELD.pop(key, None)
+                _PROCESS_HELD_THREADS.pop(key, None)
                 return
+            if owners is not None and not owners:
+                _PROCESS_HELD_THREADS.pop(key, None)
             count = _PROCESS_HELD.get(key, 0) - 1
             if count > 0:
                 _PROCESS_HELD[key] = count
@@ -1099,6 +1164,7 @@ def _reset_advisory_state() -> None:
     with _PROCESS_HELD_GUARD:
         _WARNED_HOLDERS.clear()
         _PROCESS_HELD.clear()
+        _PROCESS_HELD_THREADS.clear()
 
 
 def _pid_alive(pid: int) -> bool:
