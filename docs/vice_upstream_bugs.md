@@ -53,12 +53,22 @@ is derived from attacker-influenceable geometry.
 `buffer_length` — measured during this audit as 157,248 declared against
 157,244 returned (4 pixels missing at 8bpp). No error, no log line.
 
-**Harness mitigation: none.** `BinaryViceTransport.read_framebuffer()`
+**Harness mitigation: NONE — known unmitigated gap.**
+`BinaryViceTransport.read_framebuffer()`
 (`src/c64_test_harness/backends/vice_binary.py:619`) slices
 `data[buf_off + 4 : buf_off + 4 + buf_len]`, which silently yields a
-buffer 4 bytes shorter than `buf_len` claims. Callers doing
-`len(pixels) == w * h * bpp // 8` will be surprised. Anyone relying on
-exact framebuffer length should validate it themselves.
+buffer 4 bytes shorter than `buf_len` claims. Nothing compares
+`len(pixels)` against `buf_len`, so the shortfall is invisible to
+callers. Anyone relying on exact framebuffer length must validate it
+themselves until this is fixed.
+
+*Fix identified, deliberately deferred.* Add a length check in
+`read_framebuffer()` — compare `len(pixels)` to `buf_len` and raise
+`TransportError` (or return the shortfall explicitly) rather than
+handing back a silently truncated buffer. It needs a test against a live
+VICE, and VICE test execution was held by another agent when this was
+written, so it was not attempted rather than run concurrently. Pick this
+up next; it is the only bug in this file with no mitigation at all.
 
 ---
 
@@ -92,17 +102,33 @@ int rawnet_arch_activate(const char *interface_name)
     }
 ```
 
-**Observed (verified here):** an `-addconfig` rc containing
-`ETHERNETCART_ACTIVE=1`, launched **unelevated**, SIGSEGVs during
-command-line parsing — before the binary monitor socket opens, with
-**zero log output**. Exit code **-11** (139 via a shell), on both builds.
-It does not degrade to "ethernet present but no traffic"; it dies.
+**Observed:** SIGSEGV during command-line parsing — before the binary
+monitor socket opens, with **zero log output**. Exit code **-11** (139
+via a shell). It does not degrade to "ethernet present but no traffic";
+it dies. Two routes reach it, both on both builds:
 
-The `-ethernetcart` / `-rrnet` / `-tfe` CLI flags are widely described as
-crashing the same way. **Not verified here** — `vice_lifecycle.py`'s own
-notes record those flags being *rejected at parse time* ("Option
-'-ethernetcart' not valid"), which would mean they never reach the
-dereference. Treat the rc route above as the reproduction of record.
+* **The `-ethernetcart` / `-rrnet` / `-tfe` CLI flags**, passed
+  unelevated. Measured `rc=139` on **6 of 6** flag × build combinations
+  as uid 501 during phase 0 of this audit, and reproduced independently
+  by a second agent — same three flags, same two binaries, 6/6 again.
+  (Measurements attributed, not re-run here; this bench avoids launching
+  those flags unelevated by standing instruction.)
+* **An `-addconfig` rc containing `ETHERNETCART_ACTIVE=1`**, launched
+  unelevated — the route reproduced directly here, script below.
+
+All three flags are genuinely registered: S `ethernetcart.c:434-451`.
+`-tfe` and `-rrnet` are `CALL_FUNCTION` entries whose handlers end in
+`resources_set_int("ETHERNETCART_ACTIVE", 1)`, so they activate the cart
+exactly as the rc does and arrive at the same dereference.
+
+> A comment in `vice_lifecycle.py` used to claim these flags "appear in
+> `-help` but are rejected at parse time (`Option '-ethernetcart' not
+> valid`)". That was false, and it is now corrected in place. The
+> confusion is worth knowing: `-ethernetiodriver pcap` on a bare command
+> line **is** rejected that way (exit 255, `Argument 'pcap' not valid`),
+> because its value set is only populated once the cart is active. A
+> rejection of the *driver* option was generalised into a rejection of
+> the *cart* options.
 
 **Harness mitigation: yes.** `plan_vice_launch()`
 (`src/c64_test_harness/backends/vice_elevation.py`) refuses to spawn an

@@ -570,24 +570,33 @@ class ViceProcess:
         args += cfg.extra_args
 
         if cfg.ethernet:
-            # VICE 3.10 ethernet activation has TWO quirks that must both
-            # be worked around:
+            # VICE 3.10 ethernet activation has a quirk that must be
+            # worked around:
             #
-            # 1. The ``-ethernetcart`` / ``-tfe`` / ``-rrnet`` CLI flags
-            #    appear in ``-help`` but are rejected at parse time
-            #    ("Option '-ethernetcart' not valid.").
+            # (An earlier revision of this comment claimed the
+            # ``-ethernetcart`` / ``-tfe`` / ``-rrnet`` CLI flags "appear
+            # in -help but are rejected at parse time".  That was false.
+            # All three are registered in S ``ethernetcart.c:434-451``;
+            # ``-tfe`` and ``-rrnet`` are CALL_FUNCTION entries that set
+            # ``ETHERNETCART_ACTIVE`` to 1.  What actually happens when
+            # they are passed unelevated is a SIGSEGV -- the cart
+            # activates, ``rawnet_arch_driver`` is NULL, and
+            # ``rawnet_arch_pre_reset`` dereferences it
+            # (S ``rawnetarch.c:251``).  Measured rc=139 on 6 of 6 flag x
+            # build combinations, twice, by separate agents.  See
+            # docs/vice_upstream_bugs.md § 2.  This route is not used
+            # here regardless, because of the quirk below.)
             #
-            # 2. If ``ETHERNETCART_ACTIVE`` is only set via a vicerc file
-            #    (``-addconfig`` / ``-config``) WITHOUT also supplying
-            #    ``-ethernetioif`` / ``-ethernetiodriver`` on the command
-            #    line, VICE sets the resource to 1 and exposes the
-            #    CS8900a Product ID to the C64 — BUT never attaches a TAP
-            #    file descriptor on the host side, so frames never leave
-            #    the emulator (carrier stays 0, tcpdump sees nothing).
-            #    Conversely, if you only supply the CLI interface/driver
-            #    flags WITHOUT also activating the cart via addconfig,
-            #    the TAP gets attached (carrier=1) but the cart stays
-            #    disabled.
+            # If ``ETHERNETCART_ACTIVE`` is only set via a vicerc file
+            # (``-addconfig`` / ``-config``) WITHOUT also supplying
+            # ``-ethernetioif`` / ``-ethernetiodriver`` on the command
+            # line, VICE sets the resource to 1 and exposes the CS8900a
+            # Product ID to the C64 — BUT never attaches a TAP file
+            # descriptor on the host side, so frames never leave the
+            # emulator (carrier stays 0, tcpdump sees nothing).
+            # Conversely, if you only supply the CLI interface/driver
+            # flags WITHOUT also activating the cart via addconfig, the
+            # TAP gets attached (carrier=1) but the cart stays disabled.
             #
             # The working combination, verified empirically with
             # ``scripts/verify_vice_ethernet.py``, is:
