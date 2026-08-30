@@ -9,7 +9,6 @@ Requires ``x64sc`` on PATH.
 
 from __future__ import annotations
 
-import shutil
 import struct
 import time
 
@@ -27,9 +26,7 @@ from c64_test_harness.sid_player import (
 )
 
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("x64sc") is None, reason="x64sc not found on PATH"
-)
+pytestmark = pytest.mark.vice_live
 
 
 def _build_test_sid() -> SidFile:

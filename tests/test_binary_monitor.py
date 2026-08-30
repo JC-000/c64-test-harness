@@ -887,9 +887,8 @@ import shutil
 
 
 def test_binary_monitor_protocol():
-    if shutil.which("x64sc") is None:
-        import pytest
-        pytest.skip("x64sc not on PATH")
+    from conftest import require_vice_or_skip
+    require_vice_or_skip()
 
     port = find_free_port()
     proc = launch_vice("x64sc", port)

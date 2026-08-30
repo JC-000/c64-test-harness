@@ -44,7 +44,6 @@ thing that could set what is asserted.
 
 from __future__ import annotations
 
-import shutil
 import socket
 
 import pytest
@@ -56,9 +55,7 @@ from c64_test_harness.backends.vice_lifecycle import (
     build_ethernet_rc,
 )
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("x64sc") is None, reason="x64sc not found on PATH"
-)
+pytestmark = pytest.mark.vice_live
 
 IFACE = "feth0"
 

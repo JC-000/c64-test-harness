@@ -16,7 +16,6 @@ operations so BASIC can process keystrokes and update the screen.
 
 from __future__ import annotations
 
-import shutil
 import time
 
 import pytest
@@ -35,9 +34,7 @@ from c64_test_harness.screen import ScreenGrid, wait_for_stable, wait_for_text
 from c64_test_harness.transport import TimeoutError as TransportTimeoutError
 
 # Skip entire module if x64sc is not installed
-pytestmark = pytest.mark.skipif(
-    shutil.which("x64sc") is None, reason="x64sc not found on PATH"
-)
+pytestmark = pytest.mark.vice_live
 
 # Scratch area for machine code ($C000-$CFFF) -- avoids clobbering BASIC/kernal
 CODE_BASE = 0xC000

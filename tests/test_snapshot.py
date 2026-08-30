@@ -21,12 +21,12 @@ the U64 fixture is available.
 from __future__ import annotations
 
 import logging
-import shutil
 import struct
 import time
 from pathlib import Path
 
 import pytest
+from conftest import require_vice_or_skip
 
 from c64_test_harness import (
     MemoryPolicy,
@@ -86,8 +86,7 @@ def vice_transport():
 
     Reused across the two VICE-touching tests to keep total runtime low.
     """
-    if shutil.which("x64sc") is None:
-        pytest.skip("x64sc not found on PATH")
+    require_vice_or_skip()
 
     allocator = PortAllocator(port_range_start=6611, port_range_end=6631)
     port = allocator.allocate()
@@ -445,9 +444,7 @@ class TestExtractState:
     for real.
     """
 
-    @pytest.mark.skipif(
-        shutil.which("x64sc") is None, reason="x64sc not found on PATH"
-    )
+    @pytest.mark.vice_live
     def test_extract_reads_full_ram_and_cpu_port(self, binary_transport) -> None:
         binary_transport.write_memory(0x0000, bytes([0x2F, 0x37]))
 

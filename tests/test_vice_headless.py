@@ -27,7 +27,6 @@ window, which is exactly what the flag exists to prevent.
 from __future__ import annotations
 
 import platform
-import shutil
 import socket
 import subprocess
 import time
@@ -37,9 +36,7 @@ import pytest
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 
 pytestmark = [
-    pytest.mark.skipif(
-        shutil.which("x64sc") is None, reason="x64sc not found on PATH"
-    ),
+    pytest.mark.vice_live,
     pytest.mark.skipif(
         platform.system() != "Darwin",
         reason="the LaunchServices GUI probe is macOS-only",

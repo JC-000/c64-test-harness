@@ -31,7 +31,6 @@ after it unparsed, and VICE bailed with "Extra arguments on command-line".
 
 from __future__ import annotations
 
-import shutil
 import socket
 
 import pytest
@@ -39,9 +38,7 @@ from conftest import connect_binary_transport
 
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("x64sc") is None, reason="x64sc not found on PATH"
-)
+pytestmark = pytest.mark.vice_live
 
 
 def free_port() -> int:

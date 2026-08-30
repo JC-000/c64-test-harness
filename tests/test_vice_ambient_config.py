@@ -65,7 +65,6 @@ from __future__ import annotations
 
 import os
 import pathlib
-import shutil
 import socket
 
 import pytest
@@ -73,9 +72,7 @@ from conftest import connect_binary_transport
 
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("x64sc") is None, reason="x64sc not found on PATH"
-)
+pytestmark = pytest.mark.vice_live
 
 
 #: Every value here is deliberately *not* what the harness intends, so a
