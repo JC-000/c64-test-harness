@@ -25,9 +25,7 @@ def _start_and_capture_args(cfg: ViceConfig, mock_popen: MagicMock) -> list[str]
 
 def test_new_fields_default_to_none_or_false():
     cfg = ViceConfig()
-    assert cfg.load_snapshot is None
-    assert cfg.event_recording_start is False
-    assert cfg.event_image is None
+    assert cfg.event_image_include is None
     assert cfg.event_snapshot_mode is None
     assert cfg.event_snapshot_dir is None
     assert cfg.seed is None
@@ -41,14 +39,13 @@ def test_defaults_emit_no_new_flags(mock_popen):
     cfg = ViceConfig()
     args = _start_and_capture_args(cfg, mock_popen)
     for flag in (
-        "-loadsnapshot",
-        "-eventstart",
-        "-eventimage",
-        "-eventsnapshot",
+        "-eventstartmode",
         "-eventsnapshotdir",
+        "-eventimageinc",
+        "+eventimageinc",
         "-seed",
-        "-soundrecord",
-        "-recordfile",
+        "-soundrecdev",
+        "-soundrecarg",
         "-exitscreenshot",
     ):
         assert flag not in args, f"unexpected default flag: {flag}"
@@ -56,36 +53,26 @@ def test_defaults_emit_no_new_flags(mock_popen):
 
 # ---------- per-field positive cases ----------
 
-@patch("subprocess.Popen")
-def test_load_snapshot_emits_flag_and_path(mock_popen):
-    cfg = ViceConfig(load_snapshot="/tmp/state.vsf")
-    args = _start_and_capture_args(cfg, mock_popen)
-    i = args.index("-loadsnapshot")
-    assert args[i + 1] == "/tmp/state.vsf"
-
-
-@patch("subprocess.Popen")
-def test_event_recording_start_emits_flag(mock_popen):
-    cfg = ViceConfig(event_recording_start=True)
-    args = _start_and_capture_args(cfg, mock_popen)
-    assert "-eventstart" in args
-
-
-@patch("subprocess.Popen")
-def test_event_image_emits_flag_and_path(mock_popen):
-    cfg = ViceConfig(event_image="/tmp/events.bin")
-    args = _start_and_capture_args(cfg, mock_popen)
-    i = args.index("-eventimage")
-    assert args[i + 1] == "/tmp/events.bin"
-
-
-@pytest.mark.parametrize("mode", [0, 1, 2])
+@pytest.mark.parametrize("mode", [0, 1, 2, 3])
 @patch("subprocess.Popen")
 def test_event_snapshot_mode_valid_values(mock_popen, mode):
     cfg = ViceConfig(event_snapshot_mode=mode)
     args = _start_and_capture_args(cfg, mock_popen)
-    i = args.index("-eventsnapshot")
+    i = args.index("-eventstartmode")
     assert args[i + 1] == str(mode)
+
+
+@pytest.mark.parametrize(
+    "value, expected", [(True, "-eventimageinc"), (False, "+eventimageinc")]
+)
+@patch("subprocess.Popen")
+def test_event_image_include_emits_the_right_polarity(mock_popen, value, expected):
+    """VICE's cmdline convention: a leading ``+`` is the disabling form."""
+    cfg = ViceConfig(event_image_include=value)
+    args = _start_and_capture_args(cfg, mock_popen)
+    assert expected in args
+    other = "+eventimageinc" if value else "-eventimageinc"
+    assert other not in args
 
 
 @patch("subprocess.Popen")
@@ -108,7 +95,7 @@ def test_seed_emits_flag_and_int(mock_popen):
 def test_sound_record_driver_emits_flag(mock_popen):
     cfg = ViceConfig(sound_record_driver="wav")
     args = _start_and_capture_args(cfg, mock_popen)
-    i = args.index("-soundrecord")
+    i = args.index("-soundrecdev")
     assert args[i + 1] == "wav"
 
 
@@ -116,7 +103,7 @@ def test_sound_record_driver_emits_flag(mock_popen):
 def test_sound_record_file_emits_flag(mock_popen):
     cfg = ViceConfig(sound_record_file="/tmp/out.wav")
     args = _start_and_capture_args(cfg, mock_popen)
-    i = args.index("-recordfile")
+    i = args.index("-soundrecarg")
     assert args[i + 1] == "/tmp/out.wav"
 
 
@@ -130,7 +117,7 @@ def test_exit_screenshot_emits_flag(mock_popen):
 
 # ---------- validation ----------
 
-@pytest.mark.parametrize("bad", [-1, 3, 99])
+@pytest.mark.parametrize("bad", [-1, 4, 99])
 def test_event_snapshot_mode_out_of_range_raises(bad):
     cfg = ViceConfig(event_snapshot_mode=bad)
     proc = ViceProcess(cfg)
@@ -141,10 +128,10 @@ def test_event_snapshot_mode_out_of_range_raises(bad):
 @patch("subprocess.Popen")
 def test_paths_passed_unquoted_as_separate_tokens(mock_popen):
     """Paths with spaces are passed as a single token, no shell-quoting."""
-    cfg = ViceConfig(load_snapshot="/tmp/has space/state.vsf")
+    cfg = ViceConfig(event_snapshot_dir="/tmp/has space/snaps")
     args = _start_and_capture_args(cfg, mock_popen)
-    i = args.index("-loadsnapshot")
-    assert args[i + 1] == "/tmp/has space/state.vsf"
+    i = args.index("-eventsnapshotdir")
+    assert args[i + 1] == "/tmp/has space/snaps"
 
 
 @patch("c64_test_harness.backends.vice_lifecycle.sys.platform", "darwin")
