@@ -727,3 +727,114 @@ class TestMemoryNoAddressWrap:
         with patch.object(t, "_send_and_recv") as mock_send:
             t.write_memory(0xFFFF, b"")
         mock_send.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Truncation boundaries in the response parsers
+# ---------------------------------------------------------------------------
+
+
+class TestParserTruncationBoundaries:
+    """Every guard here is one byte from an ``IndexError`` on a short frame.
+
+    These are defensive branches against a malformed or truncated
+    response -- the exact failure mode issue #88 turned out to be -- and
+    a mutation run found them unguarded: flipping ``>=`` to ``>`` or
+    ``<=`` to ``<`` in each left the whole suite green, live modules
+    included.  A guard nothing exercises at its boundary is a guard
+    nobody knows is still there.
+
+    Each test sits *on* the boundary rather than safely inside it, which
+    is what makes the relational operator load-bearing: an off-by-one
+    turns a clean ``break``/``return None`` into an exception.
+    """
+
+    def test_register_map_stops_when_the_count_outruns_the_data(self):
+        """``off >= len(data)``: the count claims one more entry than
+        the body carries, and ``off`` lands exactly on ``len(data)``."""
+        t = _make_transport()
+        # count=2, but only one complete entry follows.
+        entry = bytes([3, 0x00, 0x02, ord("A")])  # size, id_lo, id_hi, name
+        data = struct.pack("<H", 2) + entry
+        resp = _Response(0x83, 0x00, 0, data)
+        with patch.object(t, "_send_and_recv", return_value=resp):
+            t._init_register_map()
+        # The truncated second entry is dropped, not fatal.
+        assert isinstance(t._reg_map, dict)
+
+    def test_cpu_history_entry_truncated_before_an_item_returns_none(self):
+        """``off >= len(entry)``: the entry ends exactly where the next
+        item's size byte should start."""
+        t = _make_transport()
+        entry = struct.pack("<H", 1)  # claims one register, then stops
+        assert t._parse_cpu_history_entry(entry) is None
+
+    def test_cpu_history_item_of_size_exactly_one_still_yields_its_register(self):
+        """``item_size >= 1``: size 1 is an id byte and a zero-width value.
+
+        Size *1* is the boundary, not size 0 -- a zero-size item fails
+        both ``>= 1`` and ``> 1``, so a test built on it passes with the
+        operator either way.  That was this test's first form, and a
+        mutation run caught it doing nothing.
+
+        The register map must also be populated, or no item resolves to a
+        name and both branches yield ``registers == {}``.
+        """
+        t = _make_transport()
+        t._reg_map = {"a": (0x42, 8)}
+        tail = b"\x00" * 9  # cycle(8) + instr_len(1)
+
+        one = t._parse_cpu_history_entry(
+            struct.pack("<H", 1) + bytes([1, 0x42]) + tail
+        )
+        assert one is not None and one["registers"] == {"a": 0}, (
+            f"a size-1 item was skipped instead of decoded: {one}"
+        )
+
+    def test_cpu_history_cycle_field_is_read_when_it_exactly_fits(self):
+        """``off + 8 <= len(entry)``: eight trailing bytes are a cycle count.
+
+        Asserting only that neither input raises passes with ``<`` too --
+        declining to read the field is not an error, just silent data
+        loss.  So assert the value: at ``off + 8 == len(entry)`` the
+        count must actually be decoded.
+        """
+        t = _make_transport()
+        base = struct.pack("<H", 0)  # no register items, so off == 2
+        exact = base + struct.pack("<Q", 0xDEADBEEF)  # off + 8 == len(entry)
+
+        result = t._parse_cpu_history_entry(exact)
+        assert result is not None
+        assert result["cycle"] == 0xDEADBEEF, (
+            f"the cycle field was not read at the exact boundary: "
+            f"got {result['cycle']:#x}"
+        )
+
+        short = base + b"\x00" * 7  # one byte short of a <Q
+        assert t._parse_cpu_history_entry(short) is not None, (
+            "a seven-byte tail must be declined, not fatal"
+        )
+
+
+class TestRedundantGuards:
+    """Guards a mutation run showed to be unreachable or already implied.
+
+    Recorded rather than tested: a test that cannot distinguish the guard
+    being present from absent is decorative by construction, and writing
+    one would only hide that.
+    """
+
+    def test_zero_length_read_is_guarded_twice(self):
+        """``read_memory``'s ``if length <= 0`` is redundant.
+
+        The chunking loop below it is ``while remaining > 0``, so a zero
+        length sends nothing with or without the early return -- which is
+        why mutating ``<=`` to ``<`` changes no observable behaviour.
+        Both paths are pinned here so the *behaviour* stays covered even
+        though the branch cannot be isolated.
+        """
+        t = _make_transport()
+        with patch.object(t, "_send_and_recv") as send:
+            assert t.read_memory(0x1000, 0) == b""
+            assert t.read_memory(0x1000, -5) == b""
+        send.assert_not_called()

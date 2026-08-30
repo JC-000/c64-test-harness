@@ -146,3 +146,35 @@ def test_fields_without_a_vice_equivalent_are_gone(field):
     the UI and the monitor.
     """
     assert not hasattr(ViceConfig(), field)
+
+
+# ---------- sound forced on by a configured device ----------
+
+def test_a_configured_sound_device_forces_sound_on(tmp_path):
+    """``sounddev`` must enable ``Sound``, not merely name a device.
+
+    The harness's comment has always said a configured device forces
+    sound on, and for a long time the flag was simply not emitted.  It is
+    emitted now, and this is what holds it there.
+
+    The polarity is the whole test.  ``-sound`` and ``+sound`` are both
+    valid VICE options, so the flag-name guard in
+    ``test_vice_argv_contract.py`` passes either way -- a flipped
+    polarity here is invisible to every other check in the suite, which
+    is how it was measured surviving a mutation run.  Only reading the
+    resource back distinguishes them.
+
+    ``dummy`` is used deliberately: it exercises the same branch without
+    opening a real audio device on the operator's machine.
+    """
+    cfg = ViceConfig(
+        port=free_port(),
+        sounddev="dummy",
+        sound=False,  # the device must win over this
+    )
+    got = resources_after_launch(cfg, "Sound", "SoundDeviceName")
+    assert got["Sound"] == 1, (
+        "a configured sound device did not enable Sound; render_wav() and "
+        "the SID suites would record silence"
+    )
+    assert got["SoundDeviceName"] == "dummy"

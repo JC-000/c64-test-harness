@@ -42,9 +42,21 @@ def _start_vice(warp: bool = False):
 
     proc = ViceProcess(config)
     proc.start()
-    transport = connect_binary_transport(
-        port, proc=proc, text_monitor_port=text_port,
-    )
+    # Every caller wraps the returned handles in try/finally, but that
+    # cannot help if the connect raises: the caller never receives
+    # ``proc``, so nothing stops the emulator it already launched.  A
+    # port conflict or a VICE whose monitor never comes up therefore
+    # leaked an x64sc per attempt -- measured at five orphaned processes
+    # in one run while this helper was under test.
+    try:
+        transport = connect_binary_transport(
+            port, proc=proc, text_monitor_port=text_port,
+        )
+    except BaseException:
+        proc.stop()
+        allocator.release(port)
+        allocator.release(text_port)
+        raise
     return proc, transport, allocator, port, text_port
 
 

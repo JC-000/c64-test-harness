@@ -308,13 +308,6 @@ def test_the_launch_guard_catches_a_flag_help_lists_but_vice_rejects():
 # Keeping the config surface honest
 # ---------------------------------------------------------------------------
 
-#: Flag literals reachable only through a ``DiskImage``, which this module
-#: deliberately does not build.  Covered live in ``tests/test_disk_vice.py``.
-UNREACHABLE_FLAGS = {
-    "-drive": "f-string stem of -drive<unit>type; needs a DiskImage fixture",
-}
-
-
 def _flag_literals_in_source() -> set[str]:
     """Every flag-shaped literal in ``ViceProcess.start``'s argv building.
 
@@ -368,7 +361,7 @@ def test_the_config_surface_reaches_every_flag_the_source_can_emit():
     reachable: set[str] = set()
     for cfg in CONFIG_SURFACE.values():
         reachable |= emitted_flags(cfg)
-    missing = sorted(_flag_literals_in_source() - reachable - set(UNREACHABLE_FLAGS))
+    missing = sorted(_flag_literals_in_source() - reachable)
     assert not missing, (
         f"vice_lifecycle.py can emit {missing}, but no entry in "
         f"CONFIG_SURFACE produces them, so no test checks them against "
