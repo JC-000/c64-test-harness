@@ -39,9 +39,12 @@ Response formats:
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+_log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .transport import C64Transport
@@ -254,6 +257,13 @@ _WRITE_DATA_BUF_ADDR  = 0xC500
 # the discrepancy is firmware-side, not harness-side.
 SOCKET_WRITE_MAX_BYTES = 892
 
+#: Bytes of ``[len_lo][len_hi]`` the firmware prefixes to a socket-read reply.
+_SOCKET_READ_HEADER_LEN = 2
+
+#: Maximum payload a single :func:`uci_socket_read` can return. The drain
+#: loop indexes with Y, so header + payload must stay under 256.
+SOCKET_READ_MAX_BYTES = 255 - _SOCKET_READ_HEADER_LEN
+
 
 def _lo(addr: int) -> int:
     return addr & 0xFF
@@ -393,15 +403,20 @@ def _build_read_response(resp_addr: int, resp_len_addr: int) -> list[int]:
     $DF1C so the UCI advances to the next data byte (or returns to idle
     when all data has been consumed).
 
-    Byte layout (32 bytes):
+    Reads consecutively with **no** control write between reads: the read
+    strobe advances the queue pointer in hardware (``command_protocol.vhd``).
+    Writing CMD_NEXT_DATA here would be a DATA_ACC accept, which resets both
+    queues and truncates the reply to its first byte (issue #155). The single
+    accept belongs in :func:`_build_acknowledge`, after the status drain.
+
+    Byte layout (27 bytes):
     0: LDY #$00(2)=2; STA resp_len(3)=5; STA resp_len+1(3)=8
-    8: LDA $DF1C(3)=11; AND #$80(2)=13; BEQ +14(2)=15
-    15: LDA $DF1E(3)=18; STA resp,Y(3)=21; INY(1)=22
-    22: LDA #$02(2)=24; STA $DF1C(3)=27; BNE -21(2)=29
-    29: STY resp_len(3)=32
-    BEQ at 13, next=15, target=29(STY): offset = 29-15 = 14
-    BNE at 27, next=29, target=8(loop): offset = 8-29 = -21 = 0xEB
-    (BNE is always taken because A=$02 after the STA)
+    8: LDA $DF1C(3)=11; AND #$80(2)=13; BEQ +9(2)=15
+    15: LDA $DF1E(3)=18; STA resp,Y(3)=21; INY(1)=22; BNE -16(2)=24
+    24: STY resp_len(3)=27
+    BEQ at 13, next=15, target=24(STY): offset = 24-15 = 9
+    BNE at 22, next=24, target=8(loop): offset = 8-24 = -16 = 0xF0
+    INY sets Z only on wrap, so the BNE also bounds the drain at 256 bytes.
     """
     return [
         _LDY_IMM, 0x00,
@@ -410,13 +425,11 @@ def _build_read_response(resp_addr: int, resp_len_addr: int) -> list[int]:
         # loop:
         _LDA_ABS, _lo(UCI_CONTROL_STATUS_REG), _hi(UCI_CONTROL_STATUS_REG),
         _AND_IMM, BIT_DATA_AV,
-        _BEQ, 14,
+        _BEQ, 9,
         _LDA_ABS, _lo(UCI_RESP_DATA_REG), _hi(UCI_RESP_DATA_REG),
         _STA_ABS_Y, _lo(resp_addr), _hi(resp_addr),
         _INY,
-        _LDA_IMM, CMD_NEXT_DATA,
-        _STA_ABS, _lo(UCI_CONTROL_STATUS_REG), _hi(UCI_CONTROL_STATUS_REG),
-        _BNE, 0xEB,
+        _BNE, 0xF0,
         # done:
         _STY_ABS, _lo(resp_len_addr), _hi(resp_len_addr),
     ]
@@ -426,8 +439,9 @@ def _build_read_status(status_addr: int, stat_len_addr: int) -> list[int]:
     """6502 fragment: read status string into status_addr, count into stat_len_addr.
 
     Same structure as _build_read_response but reads from $DF1F and
-    checks BIT_STAT_AV (bit 6).  Each byte is acknowledged with
-    CMD_NEXT_DATA so the UCI advances through the status queue.
+    checks BIT_STAT_AV (bit 6). No control write between reads — see
+    :func:`_build_read_response`. The status queue must be fully drained
+    *before* the accept, which destroys it.
     """
     return [
         _LDY_IMM, 0x00,
@@ -436,28 +450,39 @@ def _build_read_status(status_addr: int, stat_len_addr: int) -> list[int]:
         # loop:
         _LDA_ABS, _lo(UCI_CONTROL_STATUS_REG), _hi(UCI_CONTROL_STATUS_REG),
         _AND_IMM, BIT_STAT_AV,
-        _BEQ, 14,
+        _BEQ, 9,
         _LDA_ABS, _lo(UCI_STATUS_DATA_REG), _hi(UCI_STATUS_DATA_REG),
         _STA_ABS_Y, _lo(status_addr), _hi(status_addr),
         _INY,
-        _LDA_IMM, CMD_NEXT_DATA,
-        _STA_ABS, _lo(UCI_CONTROL_STATUS_REG), _hi(UCI_CONTROL_STATUS_REG),
-        _BNE, 0xEB,
+        _BNE, 0xF0,
         # done:
         _STY_ABS, _lo(stat_len_addr), _hi(stat_len_addr),
     ]
 
 
 def _build_acknowledge() -> list[int]:
-    """6502 fragment: wait for UCI to return to idle after draining data/status.
+    """6502 fragment: accept the reply once, then wait for idle.
 
-    The read_response and read_status loops now include NEXT_DATA
-    acknowledgment with each byte read, so by the time they finish UCI
-    is typically idle.  We just wait for idle confirmation here; writing
-    NEXT_DATA to an already-idle UCI can cause it to enter a non-idle
-    state, so we avoid it.
+    CMD_NEXT_DATA ($02) is the DATA_ACC accept. It is written exactly once,
+    after both queues have been drained, and it is **required** — it is what
+    releases the interface out of Data More. The drains themselves must not
+    write it (issue #155).
+
+    The old comment here claimed writing it to an idle UCI could push the
+    interface out of idle, and skipped it. The VHDL does not support that:
+    the block is gated on ``state(1)='1'``, so a write while idle is a strict
+    no-op. The symptom that motivated the comment is better explained by the
+    interface sitting in Data More ("11"), where the accept legitimately
+    moves it to "01".
+
+    Never write $06 as a "complete" pulse: bit 2 latches ABORT, which forces
+    response_valid/status_valid low for every future reply until the Ultimate
+    clears it — unrecoverable client-side.
     """
-    return _build_wait_idle()
+    return [
+        _LDA_IMM, CMD_NEXT_DATA,
+        _STA_ABS, _lo(UCI_CONTROL_STATUS_REG), _hi(UCI_CONTROL_STATUS_REG),
+    ] + _build_wait_idle()
 
 
 # ---------------------------------------------------------------------------
@@ -608,12 +633,13 @@ def _build_read_response_tsx(
         <fence>
         STA  resp_addr,Y
         INY
-        LDA  #CMD_NEXT_DATA
-        STA  $DF1C
-        <fence>
         JMP  loop
     done:
         STY  resp_len
+
+    No control write inside the loop: that would be a DATA_ACC accept, which
+    resets both queues (issue #155). The single accept lives in
+    :func:`_build_acknowledge_tsx`.
     """
     out: list[int] = []
     # Preamble: LDY #0; STA resp_len; STA resp_len+1
@@ -650,13 +676,7 @@ def _build_read_response_tsx(
     # STA resp_addr,Y
     out.extend([_STA_ABS_Y, _lo(resp_addr), _hi(resp_addr)])
     out.append(_INY)
-    # LDA #CMD_NEXT_DATA; STA $DF1C
-    out.extend([_LDA_IMM, CMD_NEXT_DATA])
-    out.extend([_STA_ABS, _lo(UCI_CONTROL_STATUS_REG),
-                _hi(UCI_CONTROL_STATUS_REG)])
-    if fence:
-        out.extend(_build_fence())
-    # JMP loop
+    # JMP loop  (no control write — see the docstring)
     out.extend([_JMP_ABS, _lo(loop_abs), _hi(loop_abs)])
 
     # done:
@@ -704,11 +724,6 @@ def _build_read_status_tsx(
         out.extend(_build_fence())
     out.extend([_STA_ABS_Y, _lo(status_addr), _hi(status_addr)])
     out.append(_INY)
-    out.extend([_LDA_IMM, CMD_NEXT_DATA])
-    out.extend([_STA_ABS, _lo(UCI_CONTROL_STATUS_REG),
-                _hi(UCI_CONTROL_STATUS_REG)])
-    if fence:
-        out.extend(_build_fence())
     out.extend([_JMP_ABS, _lo(loop_abs), _hi(loop_abs)])
 
     done_abs = pc + len(out)
@@ -716,6 +731,21 @@ def _build_read_status_tsx(
     out[jmp_done_pos + 2] = _hi(done_abs)
     out.extend([_STY_ABS, _lo(stat_len_addr), _hi(stat_len_addr)])
 
+    return out
+
+
+def _build_acknowledge_tsx(pc: int, fence: bool = True) -> list[int]:
+    """Turbo-safe variant of :func:`_build_acknowledge`.
+
+    Writes the single DATA_ACC accept, fences it, then waits for idle.
+    """
+    out: list[int] = [
+        _LDA_IMM, CMD_NEXT_DATA,
+        _STA_ABS, _lo(UCI_CONTROL_STATUS_REG), _hi(UCI_CONTROL_STATUS_REG),
+    ]
+    if fence:
+        out.extend(_build_fence())
+    out.extend(_build_wait_idle_tsx(pc + len(out), fence))
     return out
 
 
@@ -911,7 +941,7 @@ def build_uci_command(
 
     # Acknowledge
     if turbo_safe:
-        code.extend(_build_wait_idle_tsx(pc()))
+        code.extend(_build_acknowledge_tsx(pc()))
     else:
         code.extend(_build_acknowledge())
 
@@ -1167,7 +1197,7 @@ def _build_connect_routine(
 
     # Acknowledge
     if turbo_safe:
-        code.extend(_build_wait_idle_tsx(pc()))
+        code.extend(_build_acknowledge_tsx(pc()))
     else:
         code.extend(_build_acknowledge())
 
@@ -1429,7 +1459,7 @@ def build_socket_write(
 
     # Acknowledge
     if turbo_safe:
-        code.extend(_build_wait_idle_tsx(pc()))
+        code.extend(_build_acknowledge_tsx(pc()))
     else:
         code.extend(_build_acknowledge())
 
@@ -1544,7 +1574,7 @@ def build_socket_read(
 
     # Acknowledge
     if turbo_safe:
-        code.extend(_build_wait_idle_tsx(pc()))
+        code.extend(_build_acknowledge_tsx(pc()))
     else:
         code.extend(_build_acknowledge())
 
@@ -1634,7 +1664,7 @@ def build_socket_close(
 
     # Acknowledge
     if turbo_safe:
-        code.extend(_build_wait_idle_tsx(pc()))
+        code.extend(_build_acknowledge_tsx(pc()))
     else:
         code.extend(_build_acknowledge())
 
@@ -1934,11 +1964,23 @@ def uci_socket_read(
 
     .. note::
         The UCI firmware response is ``[actual_len_lo] [actual_len_hi]
-        [data...]``.  The 6502 routine stores the full response at the
-        result address; this helper reads *resp_len* bytes from there.
+        [data...]`` (``NetworkTarget::read_socket``, which fills
+        ``data_message.message[0..1]`` with the byte count and memcpys the
+        payload to ``&message[2]``).  The 6502 routine stores that whole
+        block at the result address; this helper skips the two header bytes
+        and returns only the payload.
+
+    .. warning::
+        *max_len* is capped at :data:`SOCKET_READ_MAX_BYTES` (253) rather
+        than 255 because the drain loop indexes with an 8-bit Y register:
+        the two header bytes plus 254 payload bytes would wrap it. Lifting
+        the cap needs a 16-bit drain, which is the same work as draining the
+        multi-block replies firmware 3.15 can return — tracked separately.
     """
-    if max_len > 255:
-        raise ValueError(f"max_len must be <= 255, got {max_len}")
+    if max_len > SOCKET_READ_MAX_BYTES:
+        raise ValueError(
+            f"max_len must be <= {SOCKET_READ_MAX_BYTES}, got {max_len}"
+        )
 
     socket_id_addr = _DATA_ADDR
     transport.write_memory(socket_id_addr, bytes([socket_id]))
@@ -1948,10 +1990,30 @@ def uci_socket_read(
     )
     _execute_uci_routine(transport, code, timeout=timeout)
 
-    actual_len = transport.read_memory(_RESP_LEN_ADDR, 1)[0]
-    if actual_len == 0:
+    drained = transport.read_memory(_RESP_LEN_ADDR, 1)[0]
+    if drained < _SOCKET_READ_HEADER_LEN:
+        # No reply block at all, or one too short to carry the count.
         return b""
-    return transport.read_memory(_RESP_ADDR, actual_len)
+    header = transport.read_memory(_RESP_ADDR, _SOCKET_READ_HEADER_LEN)
+    payload_len = header[0] | (header[1] << 8)
+    available = drained - _SOCKET_READ_HEADER_LEN
+    if payload_len > available:
+        # The firmware reports the *total* reply length in the header, so a
+        # count larger than this block delivered means the reply spanned
+        # blocks (firmware 3.15's Data More path). This drain reads one
+        # block, so return what actually arrived rather than over-reading
+        # stale memory.
+        _log.warning(
+            "uci_socket_read: header reports %d bytes but only %d arrived in "
+            "this block — reply spans blocks; returning the first block only",
+            payload_len, available,
+        )
+        payload_len = available
+    if payload_len == 0:
+        return b""
+    return transport.read_memory(
+        _RESP_ADDR + _SOCKET_READ_HEADER_LEN, payload_len
+    )
 
 
 def uci_socket_close(

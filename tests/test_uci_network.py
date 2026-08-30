@@ -76,6 +76,7 @@ from c64_test_harness.uci_network import (
     uci_get_interface_count,
     uci_tcp_connect,
     uci_socket_read,
+    SOCKET_READ_MAX_BYTES,
     uci_socket_write,
     uci_socket_close,
     # UCI config helpers
@@ -493,7 +494,11 @@ _STAT_LEN_ADDR = 0xC3F2
 _SENTINEL_DONE = 0x42
 
 
-def _make_mock_transport(result_byte: int = 0x01, resp_data: bytes = b"") -> MagicMock:
+def _make_mock_transport(
+    result_byte: int = 0x01,
+    resp_data: bytes = b"",
+    framed: bool = False,
+) -> MagicMock:
     """Build a mock transport that simulates _execute_uci_routine correctly.
 
     Routines are dispatched via SYS + the keyboard buffer ($0277 / $00C6),
@@ -502,9 +507,21 @@ def _make_mock_transport(result_byte: int = 0x01, resp_data: bytes = b"") -> Mag
 
     *result_byte* is what read_memory returns for single-byte result reads.
     *resp_data* is what read_memory returns for the response data area.
+
+    *framed* models the reply shape of the socket commands specifically:
+    ``NetworkTarget::read_socket`` puts the byte count in
+    ``data_message.message[0..1]`` and memcpys the payload to
+    ``&message[2]``, so what the 6502 drains is ``[len_lo][len_hi][data...]``
+    and ``resp_len`` counts the header too. Commands whose replies carry no
+    length prefix (IDENTIFY, GET_IP, ...) leave this False.
     """
     t = MagicMock()
     call_count = {"sentinel_polls": 0}
+    block = (
+        bytes([len(resp_data) & 0xFF, (len(resp_data) >> 8) & 0xFF]) + resp_data
+        if framed
+        else resp_data
+    )
 
     def mock_read_memory(addr: int, length: int) -> bytes:
         if addr == _SENTINEL_ADDR:
@@ -516,14 +533,15 @@ def _make_mock_transport(result_byte: int = 0x01, resp_data: bytes = b"") -> Mag
         if addr == _ERROR_ADDR:
             return b"\x00"  # no error
         if addr == _RESP_LEN_ADDR:
-            if resp_data:
-                return bytes([len(resp_data)])
+            if block:
+                return bytes([len(block)])
             return bytes([1])  # default: 1 byte response
         if addr == _STAT_LEN_ADDR:
             return b"\x00"
-        if addr == _RESP_ADDR:
-            if resp_data:
-                return resp_data[:length]
+        if _RESP_ADDR <= addr < _RESP_ADDR + max(len(block), 1) or addr == _RESP_ADDR:
+            if block:
+                offset = addr - _RESP_ADDR
+                return block[offset:offset + length]
             return bytes([result_byte]) * length
         return bytes(length)
 
@@ -637,15 +655,41 @@ class TestUciSocketRead:
     """Tests for uci_socket_read() helper."""
 
     def test_returns_bytes(self) -> None:
-        t = _make_mock_transport(resp_data=b"Hello")
-        result = uci_socket_read(t, 1, 255, timeout=1.0)
+        t = _make_mock_transport(resp_data=b"Hello", framed=True)
+        result = uci_socket_read(t, 1, SOCKET_READ_MAX_BYTES, timeout=1.0)
         assert isinstance(result, bytes)
 
     def test_returns_response_data(self) -> None:
         expected = b"Hello"
-        t = _make_mock_transport(resp_data=expected)
+        t = _make_mock_transport(resp_data=expected, framed=True)
         result = uci_socket_read(t, 1, len(expected), timeout=1.0)
         assert result == expected
+
+    def test_skips_the_two_byte_length_header(self) -> None:
+        """The payload starts at _RESP_ADDR + 2, not _RESP_ADDR.
+
+        Regression guard: with the per-byte DATA_ACC bug the drain returned
+        one byte, so the header was never visible and the helper read from
+        the wrong offset without anyone noticing (issue #155).
+        """
+        expected = bytes(range(64))
+        t = _make_mock_transport(resp_data=expected, framed=True)
+        assert uci_socket_read(t, 1, len(expected), timeout=1.0) == expected
+
+    def test_empty_datagram_returns_empty(self) -> None:
+        t = _make_mock_transport(resp_data=b"", framed=True)
+        assert uci_socket_read(t, 1, 16, timeout=1.0) == b""
+
+    def test_max_len_above_the_cap_is_rejected(self) -> None:
+        """Header + payload must stay inside the 8-bit drain index."""
+        t = _make_mock_transport(framed=True)
+        with pytest.raises(ValueError):
+            uci_socket_read(t, 1, SOCKET_READ_MAX_BYTES + 1, timeout=1.0)
+
+    def test_max_len_at_the_cap_is_accepted(self) -> None:
+        t = _make_mock_transport(resp_data=b"x" * 8, framed=True)
+        assert uci_socket_read(
+            t, 1, SOCKET_READ_MAX_BYTES, timeout=1.0) == b"x" * 8
 
 
 class TestUciSocketClose:
