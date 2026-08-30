@@ -35,6 +35,9 @@ from c64_test_harness.backends.ultimate64_helpers import (
     get_sid_socket_enabled,
     set_sid_address_map,
 )
+from c64_test_harness.backends.ultimate64_helpers import (
+    _introduced_sid_conflicts,
+)
 from c64_test_harness.backends.ultimate64_schema import (
     SID_ADDRESS_VALUES,
     SID_DETECTED_TYPE_VALUES,
@@ -48,6 +51,7 @@ from c64_test_harness.backends.ultimate64_schema import (
     ULTISID_SPLIT_VALUES,
     ULTISID_WAVEFORM_VALUES,
     sid_address_conflicts,
+    sid_address_occupancy,
 )
 
 _HOST = os.environ.get("U64_HOST")
@@ -242,12 +246,69 @@ def test_get_sid_socket_enabled_returns_booleans(
     assert all(isinstance(v, bool) for v in enabled.values())
 
 
-def test_live_map_is_conflict_free_or_reports_why(
+def test_live_map_is_readable_and_self_consistent(
     client: Ultimate64Client,
 ) -> None:
-    """A device in its stock allocation should have no overlapping slots."""
-    conflicts = sid_address_conflicts(get_sid_address_map(client))
-    assert conflicts == [], f"device is running overlapped SIDs: {conflicts}"
+    """Absence of overlap is NOT a property of a healthy device.
+
+    This replaces a test that asserted the stock allocation has no
+    overlapping slots. It failed on two separate live runs, and the
+    premise was what was wrong: the U64E ships with all four slots on
+    ``$D400`` -- ``u64_sid_addressing_cfg`` gives every address item
+    ``def = 1``, and index 1 of ``u64_sid_base`` is ``$D400``
+    (u64_config.cc:404-408, :209-217). Overlap *is* the factory
+    condition, so "no conflicts" could only ever pass on a device
+    someone had already reconfigured.
+
+    What is actually checkable without believing anything about how the
+    device was left: every slot reports a value from the address enum,
+    and :func:`sid_address_occupancy` accounts for each slot exactly
+    once. That falsifies on a garbled read, a renamed item, or an
+    occupancy bug -- none of which the old assertion would have caught,
+    since it drowned in the factory overlap first.
+    """
+    mapping = get_sid_address_map(client)
+    assert set(mapping) == set(SidSlot), f"missing slots: {mapping}"
+    for slot, address in mapping.items():
+        assert address in SID_ADDRESS_VALUES, (slot.value, address)
+
+    occupancy = sid_address_occupancy(mapping)
+    placed = [slot for slots in occupancy.values() for slot in slots]
+    expected = [
+        slot for slot, address in mapping.items() if address != "Unmapped"
+    ]
+    assert sorted(placed, key=list(SidSlot).index) == sorted(
+        expected, key=list(SidSlot).index
+    ), f"occupancy does not account for every mapped slot: {occupancy}"
+    for address, slots in occupancy.items():
+        assert address in SID_ADDRESS_VALUES
+        assert all(mapping[slot] == address for slot in slots), occupancy
+
+    conflicts = sid_address_conflicts(mapping)
+    if conflicts:
+        # Reported, not asserted against -- see the docstring.
+        print(f"device is running overlapped SIDs (expected on a stock "
+              f"device): {conflicts}")
+
+
+def test_delta_guard_tolerates_the_devices_current_map(
+    client: Ultimate64Client,
+) -> None:
+    """The guard must never reject the state the device is already in.
+
+    This is the property the old test was reaching for and got backwards.
+    A whole-map conflict check made ``set_sid_address_map`` unusable
+    against a factory device: every call was refused because the stock
+    ``$D400 x4`` was already an overlap. The delta guard fixed that, and
+    this pins it against whatever the bench is actually running.
+
+    Pure: it re-checks the current map against itself and writes nothing.
+    """
+    current = get_sid_address_map(client)
+    assert _introduced_sid_conflicts(current, dict(current), set()) == [], (
+        "the delta guard objects to the device's own current allocation, so "
+        "set_sid_address_map would refuse every write on this device"
+    )
 
 
 # --------------------------------------------------------------------------- #

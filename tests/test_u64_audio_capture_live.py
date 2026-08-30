@@ -20,17 +20,22 @@ from c64_test_harness.backends.render_wav_u64 import capture_sid_u64
 from c64_test_harness.backends.u64_audio_capture import AudioCapture
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
 from c64_test_harness.backends.ultimate64_helpers import (
+    CAT_SID_SOCKETS,
     configure_multi_sid,
     get_audio_mixer_config,
     get_physical_sid_sockets,
+    get_sid_address_map,
     get_sid_addresses,
+    get_sid_socket_enabled,
     get_sid_socket_types,
+    set_sid_address_map,
     set_sid_socket,
 )
 from c64_test_harness.backends.ultimate64_schema import (
     SID_DETECTED_TYPE_VALUES,
     SID_SOCKET_ENABLE_VALUES,
     SIDSocketConfig,
+    SidSlot,
 )
 from c64_test_harness.sid import SidFile, build_test_psid
 
@@ -70,6 +75,85 @@ def u64_client():
         pass
     client.close()
     lock.release()
+
+
+@pytest.fixture(autouse=True)
+def restore_sid_config(u64_client: Ultimate64Client):
+    """Put back any SID socket or addressing state a test moved.
+
+    Modelled on ``test_sid_addressing_live.py::restore_addressing``, with
+    two differences.
+
+    It is **autouse**. Two tests here mutate SID configuration and
+    neither restored it; requiring each author to remember an opt-in
+    fixture is exactly what failed. The cost of covering the read-only
+    tests too is two GETs each, because the restore is a diff -- nothing
+    is written when nothing moved.
+
+    And it restores with ``allow_conflicts``, which is not laziness: the
+    device's stock allocation is all four slots on ``$D400``, so putting
+    a slot *back* onto that pile grows an occupant set and the delta
+    guard would correctly refuse it. Restoring a known-good snapshot is
+    precisely the case the override exists for.
+
+    Why this matters beyond tidiness: leaked state poisons every later
+    measurement on the bench, including the ones checking whether
+    anything leaked. A drifted ``SID Socket 2 Address`` was once
+    captured as a baseline by a later run and "restored" to the drifted
+    value, reporting success. Four independent read paths had to agree
+    before it was noticed.
+    """
+    try:
+        before_addresses = get_sid_address_map(u64_client)
+        before_sockets = get_sid_socket_enabled(u64_client)
+    except Exception:  # noqa: BLE001 -- a probe failure must not eat the test
+        logger.exception("SID snapshot failed; test will run unprotected")
+        yield
+        return
+
+    try:
+        yield
+    finally:
+        # Restore even if the test raised part-way through its own
+        # writes -- that is the case most likely to leave drift.
+        try:
+            after_addresses = get_sid_address_map(u64_client)
+            moved = {
+                slot: addr
+                for slot, addr in before_addresses.items()
+                if after_addresses.get(slot) != addr
+            }
+            if moved:
+                logger.warning(
+                    "restoring SID addresses moved by this test: %s",
+                    {s.value: a for s, a in moved.items()},
+                )
+                set_sid_address_map(
+                    u64_client,
+                    moved,
+                    allow_conflicts="restoring the pre-test snapshot",
+                )
+
+            after_sockets = get_sid_socket_enabled(u64_client)
+            for socket, enabled in before_sockets.items():
+                if after_sockets.get(socket) != enabled:
+                    logger.warning(
+                        "restoring SID socket %d enable state to %s",
+                        socket,
+                        enabled,
+                    )
+                    u64_client.set_config_items(
+                        CAT_SID_SOCKETS,
+                        {
+                            f"SID Socket {socket}":
+                                "Enabled" if enabled else "Disabled"
+                        },
+                    )
+        except Exception:
+            # Loud on purpose: a failed restore leaves the bench dirty
+            # for every later run, which is worse than a failed test.
+            logger.exception("SID CONFIG RESTORE FAILED -- device left drifted")
+            raise
 
 
 # ======================================================================
@@ -263,6 +347,8 @@ def test_multi_sid_addressing(u64_client: Ultimate64Client, tmp_path) -> None:
         SIDSocketConfig(sid_type="Enabled", address="$D420"),
     ])
     logger.info("Configured dual SID: socket 1=$D400, socket 2=$D420")
+    # NB: this used to leak $D420 into SID Socket 2 Address permanently.
+    # The autouse restore_sid_config fixture puts it back.
 
     sid = _build_test_sid()
     wav_path = tmp_path / "sid_multi.wav"
