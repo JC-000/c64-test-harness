@@ -122,12 +122,42 @@ the `PATH` x64sc is verified rather than assumed. `VICE_ETHERNET_BIN`
 `[vice] ethernet_executable`) is an **override, not a requirement — normally
 leave it unset.**
 
-**U (reported by `elevation-design`, not verified here):** only
-`/opt/homebrew/bin/x64sc` carries a NOPASSWD sudoers rule on this bench, so an
-elevated launch aimed at any other path would stop at a password prompt. This
-document does not verify it — reading sudoers requires root; all that was
-observed directly is that `sudo -n true` returns `sudo: a password is required`
-(T).
+**Only `/opt/homebrew/bin/x64sc` carries a NOPASSWD sudoers rule (T)**, so it can
+be launched elevated unattended and any other path cannot. `sudo -n -l` lists the
+invoking user's rules and needs no root:
+
+```
+User someone may run the following commands on Offensive-Bias:
+    (ALL) ALL
+    (root) NOPASSWD: …/scripts/setup-bridge-feth-macos.sh, …/teardown-…, …/cleanup-…
+    (root) NOPASSWD: /opt/homebrew/bin/x64sc
+    (root) NOPASSWD: /opt/homebrew/bin/brew reinstall --HEAD vice, … install --HEAD vice, … uninstall vice
+```
+
+Corroborated by a successful elevated launch (T, `vice-remediation`):
+`sudo -n /opt/homebrew/bin/x64sc -console -default …` ran as root. A `sudo -n`
+that succeeds is itself proof of a NOPASSWD rule for that exact command —
+stronger evidence than reading the sudoers file.
+
+**This sudoers shape misleads in both directions. Two probes that do not
+answer the question:**
+
+- `sudo -n true` prompts, because `true` has no NOPASSWD rule. It says nothing
+  about whether some *other* command does. Phase 0 of this audit drew the wrong
+  conclusion from exactly this — that no elevated run was possible at all.
+- `sudo -n -l -- <cmd>` exits 0 for **anything** the user may run, `/bin/ls`
+  included, because of the `(ALL) ALL` line. A per-command probe of this form is
+  vacuous.
+
+The reliable check is parsing the NOPASSWD rules out of plain `sudo -n -l`, as
+above.
+
+**U:** the rule names the symlink `/opt/homebrew/bin/x64sc`. Whether invoking the
+resolved Cellar path (`/opt/homebrew/Cellar/vice/3.10/bin/x64sc`) also matches it
+was not tested — sudo matches the command as written and does not resolve
+symlinks by default, so assume it does **not** match and invoke the symlink path.
+This is the same class of trap as the existing "no `bash` wrapper" rule: NOPASSWD
+matches sudo's first non-flag argv verbatim.
 
 A from-source `--enable-ethernet` build made during this phase still exists at
 `~/.local/opt/vice-3.10-ethernet/`. It is **not maintained and not the harness
@@ -195,10 +225,17 @@ $ echo $?
 This refutes any launcher heuristic that treats a user-openable `/dev/bpf*` as
 grounds to skip elevation.
 
-**U:** root-side behaviour was never observed. `sudo -n true` returns `sudo: a
-password is required`, so no elevated run could be made non-interactively. Issue
-#144's claim that capture silently fails *even as root* therefore remains
-unsettled, and points the opposite way from this source reading.
+**Root side (T, `vice-remediation`).** Phase 0 recorded this as unverifiable,
+having concluded from `sudo -n true` prompting that no elevated run was possible.
+That conclusion was wrong — see "Reference binary" above for why that probe does
+not answer the question. An elevated launch was subsequently made:
+`sudo -n /opt/homebrew/bin/x64sc -console -default …` ran as root (sudo wrapper
+pid 4636, x64sc 4637), the binary monitor came up, and the process held **two BPF
+descriptors, one bound to `feth0`**.
+
+So as root the pcap driver is selected and a BPF device *is* attached, matching
+the source reading in this finding. Issue #144's claim that capture silently
+fails even when elevated is not supported by that run.
 
 ### 2. Enabling the ethernet cart unelevated segfaults — upstream, not a packaging defect
 
