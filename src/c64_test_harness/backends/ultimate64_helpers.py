@@ -42,8 +42,8 @@ from .ultimate64_schema import (
     REU_SIZE_VALUES,
     SID_ADDRESS_VALUES,
     SID_SLOT_ADDRESS_ITEMS,
+    SID_DETECTED_TYPE_VALUES,
     SID_SOCKET_ENABLE_VALUES,
-    SID_TYPE_VALUES,
     SIDSocketConfig,
     SidAddressConflict,
     SidSlot,
@@ -466,24 +466,55 @@ def get_sid_config(client: Ultimate64Client) -> dict:
     }
 
 
+def _validate_socket_state(value: str) -> str:
+    """Validate a ``SID Socket N`` enable value, naming the usual mistake.
+
+    A chip type gets a message that says where the type actually lives,
+    because the fabricated ``SID_TYPE_VALUES`` union used to accept one
+    here and the resulting HTTP 400 named neither item usefully.
+    """
+    if isinstance(value, str) and value in SID_DETECTED_TYPE_VALUES:
+        raise ValueError(
+            f"SID chip type {value!r} is not settable. 'SID Socket N' is an "
+            f"enable toggle taking {list(SID_SOCKET_ENABLE_VALUES)}; the chip "
+            f"type is reported by 'SID Detected Socket N' (see "
+            f"get_detected_sid_types) and is filled by the device's boot-time "
+            f"probe, not chosen."
+        )
+    return validate_enum(value, SID_SOCKET_ENABLE_VALUES, "SID socket state")
+
+
 def set_sid_socket(
     client: Ultimate64Client,
     socket: int,
     sid_type: str,
     address: str,
 ) -> None:
-    """Configure a SID socket's type and address.
+    """Enable or disable a SID socket and set its base address.
+
+    *sid_type* keeps its name for compatibility but means the socket's
+    **enable state**: ``"Enabled"`` or ``"Disabled"``. That is the only
+    domain ``SID Socket N`` has (``en_dis``, u64_config.cc:393-394).
+
+    A chip type such as ``"8580"`` raises :class:`ValueError` here
+    rather than going on the wire. It used to be sent and answered with
+    HTTP 400 "Value '8580' is not a valid choice for item SID Socket 1"
+    (route_configs.cc:85-88, verified live 2026-08-30). There is no
+    other item it could go to: the detected type is filled by the
+    boot-time probe and is not a selector.
 
     :param client: Connected Ultimate64 client.
     :param socket: Socket index (1 or 2).
-    :param sid_type: One of :data:`SID_TYPE_VALUES` — e.g. ``"Enabled"``,
-        ``"Disabled"``, ``"6581"``, ``"8580"``, ``"None"``.
+    :param sid_type: ``"Enabled"`` or ``"Disabled"``. See
+        :func:`enable_sid_socket` for a boolean-typed alternative.
     :param address: One of :data:`SID_ADDRESS_VALUES` — e.g. ``"$D400"``
         or ``"Unmapped"``.
+    :raises ValueError: On a bad socket index, a *sid_type* outside
+        :data:`SID_SOCKET_ENABLE_VALUES`, or a bad address.
     """
     if socket not in (1, 2):
         raise ValueError(f"socket must be 1 or 2, got {socket!r}")
-    validate_enum(sid_type, SID_TYPE_VALUES, "SID type")
+    _validate_socket_state(sid_type)
     validate_enum(address, SID_ADDRESS_VALUES, "SID address")
     client.set_config_items(
         CAT_SID_SOCKETS,
@@ -498,23 +529,23 @@ def set_sid_socket(
 def get_sid_socket_types(client: Ultimate64Client) -> dict[int, str]:
     """Return which SID type is detected in each socket.
 
-    Reads the ``SID Sockets Configuration`` category and extracts the
-    SID type for each numbered socket item (e.g. ``"SID Socket 1"``).
+    An alias for :func:`get_detected_sid_types`, kept because callers
+    use this name. It previously read ``SID Socket N`` -- the *enable*
+    toggle -- and returned ``{1: "Enabled"}`` labelled as a chip type.
+
+    .. warning::
+
+       The detected type is advisory. REST can write the item even
+       though the device's own menu marks it read-only, so this reports
+       the last value *written*, which is the detection result only if
+       nothing has overwritten it since boot. See
+       :func:`get_detected_sid_types` for the full caveat.
 
     :param client: Connected Ultimate64 client.
     :returns: Dict mapping 1-based socket index to type string
-        (e.g. ``{1: "8580", 2: "6581"}`` or ``{1: "None", 2: "8580"}``).
+        (e.g. ``{1: "8580", 2: "None"}``).
     """
-    inner = _unwrap(
-        client.get_config_category(CAT_SID_SOCKETS), CAT_SID_SOCKETS
-    )
-    result: dict[int, str] = {}
-    for key, value in inner.items():
-        # Match items like "SID Socket 1", "SID Socket 2"
-        if key.startswith("SID Socket ") and key[-1].isdigit():
-            idx = int(key.split()[-1])
-            result[idx] = str(value)
-    return result
+    return get_detected_sid_types(client)
 
 
 def get_sid_addresses(client: Ultimate64Client) -> dict[int, str]:
@@ -572,7 +603,7 @@ def configure_multi_sid(
                 f"configs[{i}] must be SIDSocketConfig, "
                 f"got {type(cfg).__name__}"
             )
-        validate_enum(cfg.sid_type, SID_TYPE_VALUES, "SID type")
+        _validate_socket_state(cfg.sid_type)
         validate_enum(cfg.address, SID_ADDRESS_VALUES, "SID address")
 
     # Write all socket types, then all addresses.
@@ -588,19 +619,32 @@ def configure_multi_sid(
 
 
 def get_physical_sid_sockets(client: Ultimate64Client) -> list[int]:
-    """Return socket indices that have physical SID chips detected.
+    """Return socket indices that have a physical SID chip detected.
 
-    A socket is considered to have a physical chip when its type is
-    ``"6581"`` or ``"8580"`` (not ``"None"``, ``"Disabled"``, or
-    ``"Enabled"``).
+    A socket counts as populated when its detected type is anything
+    other than ``"None"``. That deliberately includes replacement chips
+    -- ARMSID, FPGASID, SIDKick, SwinSID and the rest of
+    :data:`SID_DETECTED_TYPE_VALUES` -- because those are physically in
+    the socket too; restricting to ``"6581"``/``"8580"`` would report an
+    empty socket on every device fitted with one.
+
+    This function previously read the socket *enable* item, whose values
+    are ``"Enabled"``/``"Disabled"``, and filtered them for chip types.
+    Nothing ever matched, so it returned ``[]`` on every device.
+
+    .. warning::
+
+       Built on :func:`get_detected_sid_types`, so it inherits that
+       item's advisory nature: REST can overwrite the detected type, and
+       this function believes what it reads. A socket reported populated
+       has not necessarily been probed since the last write.
 
     :param client: Connected Ultimate64 client.
-    :returns: Sorted list of 1-based socket indices with physical SIDs
+    :returns: Sorted list of 1-based socket indices with a chip fitted
         (e.g. ``[1, 2]`` or ``[2]`` or ``[]``).
     """
-    types = get_sid_socket_types(client)
-    physical_types = {"6581", "8580"}
-    return sorted(idx for idx, typ in types.items() if typ in physical_types)
+    types = get_detected_sid_types(client)
+    return sorted(idx for idx, typ in types.items() if typ != "None")
 
 
 def get_ultisid_config(client: Ultimate64Client) -> dict:

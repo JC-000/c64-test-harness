@@ -27,7 +27,11 @@ from c64_test_harness.backends.ultimate64_helpers import (
     get_sid_socket_types,
     set_sid_socket,
 )
-from c64_test_harness.backends.ultimate64_schema import SIDSocketConfig
+from c64_test_harness.backends.ultimate64_schema import (
+    SID_DETECTED_TYPE_VALUES,
+    SID_SOCKET_ENABLE_VALUES,
+    SIDSocketConfig,
+)
 from c64_test_harness.sid import SidFile, build_test_psid
 
 logger = logging.getLogger(__name__)
@@ -161,15 +165,20 @@ def test_capture_sid_with_physical_sids(
         pytest.skip("No physical SID chips detected")
 
     chip_socket = physical[0]
-    chip_type = get_sid_socket_types(u64_client).get(chip_socket, "8580")
+    chip_type = get_sid_socket_types(u64_client).get(chip_socket, "unknown")
     logger.info(
         "Using physical SID '%s' in socket %d at $D400",
         chip_type,
         chip_socket,
     )
 
-    # Configure socket 1 to use the physical chip at $D400
-    set_sid_socket(u64_client, socket=1, sid_type=chip_type, address="$D400")
+    # Enable the socket the chip is in and map it to $D400.  The chip
+    # type is NOT passed here: 'SID Socket N' is an enable toggle, and
+    # this line used to feed it the detected type, which the firmware
+    # answers with HTTP 400.
+    set_sid_socket(
+        u64_client, socket=chip_socket, sid_type="Enabled", address="$D400"
+    )
 
     sid = _build_test_sid()
     wav_path = tmp_path / "sid_physical.wav"
@@ -212,7 +221,12 @@ def test_probe_audio_mixer(u64_client: Ultimate64Client) -> None:
 
 
 def test_probe_sid_sockets(u64_client: Ultimate64Client) -> None:
-    """Verify SID socket type and address queries return non-empty dicts."""
+    """Verify SID socket type and address queries return non-empty dicts.
+
+    ``get_sid_socket_types`` now reports the *detected chip*, not the
+    socket enable state, so the values here are drawn from
+    ``SID_DETECTED_TYPE_VALUES``.
+    """
     types = get_sid_socket_types(u64_client)
     addresses = get_sid_addresses(u64_client)
 
@@ -225,6 +239,11 @@ def test_probe_sid_sockets(u64_client: Ultimate64Client) -> None:
 
     for idx, typ in sorted(types.items()):
         addr = addresses.get(idx, "?")
+        assert typ in SID_DETECTED_TYPE_VALUES, (idx, typ)
+        assert typ not in SID_SOCKET_ENABLE_VALUES, (
+            f"socket {idx} reported {typ!r} -- that is an enable state, so "
+            f"get_sid_socket_types is reading the wrong item again"
+        )
         logger.info("Socket %d: type=%s, address=%s", idx, typ, addr)
 
 

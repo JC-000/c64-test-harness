@@ -150,10 +150,6 @@ def reu_size_enum(size_spec: Union[str, int]) -> str:
 # SID types & addresses                                                       #
 # --------------------------------------------------------------------------- #
 
-#: SID socket detected-chip / type values, from ``SID Sockets Configuration``.
-#: Includes detected physical types plus the socket enable toggle values.
-SID_TYPE_VALUES: tuple[str, ...] = ("Enabled", "Disabled", "6581", "8580", "None")
-
 #: SID address enum (49 entries) from ``SID Addressing / SID Socket 1 Address``.
 SID_ADDRESS_VALUES: tuple[str, ...] = (
     "Unmapped",
@@ -435,10 +431,20 @@ def validate_enum(value: str, allowed: tuple[str, ...], name: str) -> str:
 class SIDSocketConfig:
     """Structured config for one SID socket slot.
 
-    Validates *sid_type* against :data:`SID_TYPE_VALUES` and *address*
-    against :data:`SID_ADDRESS_VALUES` at construction time.
+    Validates *sid_type* against :data:`SID_SOCKET_ENABLE_VALUES` and
+    *address* against :data:`SID_ADDRESS_VALUES` at construction time.
 
-    :param sid_type: SID type / enable string (e.g. ``"Enabled"``, ``"8580"``).
+    .. note::
+
+       Despite the field name, *sid_type* is the socket's **enable
+       state**, because that is the only thing ``SID Socket N`` accepts
+       (``en_dis``, u64_config.cc:393-394). A chip type is rejected: the
+       detected type lives in a separate, probe-filled item and is not a
+       selector. The field previously validated against a fabricated
+       union of both domains, which let callers build a config the
+       device answers HTTP 400 to.
+
+    :param sid_type: ``"Enabled"`` or ``"Disabled"``.
     :param address: Device address enum (e.g. ``"$D400"`` or ``"Unmapped"``).
     """
 
@@ -446,7 +452,9 @@ class SIDSocketConfig:
     address: str
 
     def __post_init__(self) -> None:
-        validate_enum(self.sid_type, SID_TYPE_VALUES, "SID type")
+        validate_enum(
+            self.sid_type, SID_SOCKET_ENABLE_VALUES, "SID socket state"
+        )
         validate_enum(self.address, SID_ADDRESS_VALUES, "SID address")
 
 
@@ -459,7 +467,6 @@ __all__ = [
     "REU_SIZE_VALUES",
     "REU_ENABLED_VALUES",
     "reu_size_enum",
-    "SID_TYPE_VALUES",
     "SID_ADDRESS_VALUES",
     "SID_SOCKET_ENABLE_VALUES",
     "SID_DETECTED_TYPE_VALUES",
