@@ -1,27 +1,9 @@
-"""Reproduce upstream bug 6 -- VICE stops emulating -- and interrogate it.
+"""Reproduce the TestKeyboard wedge and interrogate the halted machine.
 
-    python3 scripts/vice_stall_probe.py
-
-Runs the minimal sequence the keyboard fixture runs, in a loop, until the
-CPU is found pinned at $CF00.  Then asks the questions a test failure
-cannot: does it move with more resumes, what checkpoints does VICE think
-are set, is the *machine* emulating at all (raster position), and what is
-in the event queue.
-
-**Needs host load to reproduce.**  It does not stall on an idle bench.
-Three concurrent `pytest tests/test_vice_warp.py` loops are enough.  With
-that, it stalls by cycle ~80 in roughly half of its runs, so a
-reproduction costs a couple of minutes rather than the three days of
-elimination that produced the diagnosis.
-
-See `docs/vice_upstream_bugs.md` bug 6 for what it found, and for the
-four hypotheses it ruled out.
-
-Written as a script rather than a test on purpose: it is an
-investigation tool, and turning "the emulator sometimes stops" into a
-pass/fail assertion would make the suite flaky by design.  The *detection*
-lives in `tests/test_vice_core.py`, which reports a stall when one
-happens rather than hunting for one.
+Runs the minimal sequence the fixture runs, in a loop, until the CPU is
+found pinned at $CF00.  Then asks the questions the failure report
+cannot: how many resumes does it take to move (if any), what checkpoints
+does VICE think are set, and what does the event queue hold.
 """
 from __future__ import annotations
 
@@ -70,6 +52,19 @@ def is_wedged(t, samples=6):
 
 def interrogate(t):
     print("\n=== INTERROGATION ===", flush=True)
+
+    # Exercise the PRODUCTION detector against this genuine stall.  Stubs
+    # can show that `_emulator_is_stalled` distinguishes a constant raster
+    # from an advancing one; only a real stall shows it firing on the
+    # thing it was built for, and the stall is far easier to induce here
+    # than through the test suite.
+    import test_vice_core as tc
+    stalled, raster = tc._emulator_is_stalled(t)
+    print(f"\n*** tests/test_vice_core.py::_emulator_is_stalled -> "
+          f"stalled={stalled} raster={raster}", flush=True)
+    print("*** production failure report follows:", flush=True)
+    print(tc._machine_failure_report(t, "<verification>"), flush=True)
+
     print(f"registers: {t.read_registers()}", flush=True)
     stub = t.read_memory(0xCF00, 8)
     print(f"memory at $CF00: {stub.hex()}  (stub should be 584ccde5)",

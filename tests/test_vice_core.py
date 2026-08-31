@@ -238,8 +238,14 @@ def _machine_failure_report(transport, needle: str) -> str:
         )
     except Exception as e:
         lines.append(f"could not list checkpoints: {type(e).__name__}: {e}")
+    # Built directly rather than via debug.dump_screen(), which prints to
+    # stdout *and* returns the same text: using it here emitted the dump
+    # twice, and the printed copy appeared before the report it belongs
+    # to, so the reader saw a screen with no idea what it was evidence of.
     try:
-        lines.append(dump_screen(transport, label="screen at failure"))
+        lines.append(
+            ScreenGrid.from_transport(transport).dump("screen at failure")
+        )
     except Exception as e:
         lines.append(f"could not dump screen: {type(e).__name__}: {e}")
     return "\n".join(lines)
