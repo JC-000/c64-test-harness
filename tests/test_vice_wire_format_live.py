@@ -6,37 +6,42 @@ built by a local helper::
     struct.pack("<BBIBBI", STX, API_VERSION, len(body),
                 response_type, error_code, request_id)
 
-Nineteen call sites rest on that one line, and the transport parses the
-frames back at fixed offsets.  A slip in the builder alone is caught --
-the two disagree.  What is *not* caught is the case that matters: the
-builder and the transport sharing the same wrong understanding.  Then
-they agree perfectly, and so does every test between them.
+Nineteen call sites in that module rest on the one line (twenty
+repo-wide, counting this module's own), and the transport parses the
+frames back at fixed offsets.
 
-Measured, by swapping ``response_type`` and ``error_code`` in both the
-transport's parse and the mock's build:
+**A slip in the builder alone is caught.** Swapping ``response_type`` and
+``error_code`` in the mock only leaves 13 of that module's tests failing
+-- builder and transport disagree, and the suite notices. That control
+matters: it is what makes the finding below specific rather than a blanket
+claim that mocks prove nothing.
 
-* ``test_vice_binary_unit.py`` -- 32 passed
-* ``test_vice_binary_resource.py`` -- 82 passed
+**A slip they share is not caught.** Make the same swap in the
+transport's parse *and* the mock's build and they agree perfectly, as
+does every test between them. Measured at this commit:
+
+* ``test_vice_binary_unit.py`` -- 40 passed
 * this module -- failed
 
-114 mocked tests certifying a frame layout VICE does not use.  Nothing
-in the suite compared the shape to VICE, so nothing could tell.
+So the honest figure is **40 mocked tests certifying a frame layout VICE
+does not use** -- the tests that actually feed bytes through the builder.
 
-So this module does.  It talks to a real binary monitor over a raw
-socket, captures genuine response bytes, and checks that the mock's
-builder reproduces them exactly.
+Scope note, because it is easy to inflate this number: the 85 tests in
+``test_vice_binary_resource.py`` also pass under that mutation, but they
+pass under *no* mutation too. They inject already-parsed ``_Response``
+tuples, so they sit above the wire format and a layout error is invisible
+to them by construction -- they are decode-logic tests, not wire tests,
+and counting them here would be padding. (That module's own
+``_build_response`` helper was dead code and has been removed.)
+
+So this module talks to a real binary monitor over a raw socket, captures
+genuine response bytes, and checks that the mock's builder reproduces
+them exactly.
 
 Raw sockets on purpose: going through ``BinaryViceTransport`` would
 validate the format against the same code that defines it, which is the
 circularity this module exists to break.
-
-Scope note: ``test_vice_binary_resource.py``'s 82 tests inject already
-parsed ``_Response`` tuples rather than bytes, so they sit *above* the
-wire format and a layout error is invisible to them by construction --
-they are decode-logic tests, not wire tests.  That module's own
-``_build_response`` helper was dead code and has been removed.
 """
-
 from __future__ import annotations
 
 import socket
@@ -145,6 +150,16 @@ def test_the_mock_builder_reproduces_a_real_frame_exactly(raw_monitor):
     body_len = struct.unpack_from("<I", frame, 2)[0]
     response_type = frame[6]
     error_code = frame[7]
+    # This test can only see a response_type/error_code swap while the two
+    # differ.  RESOURCE_GET replies 0x51 with error 0x00, so they do -- but
+    # nothing enforces that, and a command whose response type were 0x00
+    # would make the swap invisible here.  Pinned so the dependency is a
+    # stated property rather than a lucky choice of command.
+    assert response_type != error_code, (
+        f"response_type and error_code are both {error_code:#04x}; this "
+        f"frame cannot distinguish them, so the check below would pass "
+        f"under a swap. Capture a different command."
+    )
     request_id = struct.unpack_from("<I", frame, 8)[0]
     body = frame[RESPONSE_HEADER_SIZE:]
 

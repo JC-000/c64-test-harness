@@ -144,6 +144,24 @@ def emitted_flags(cfg: ViceConfig) -> set[str]:
 # The config surface: every branch in ViceProcess.start() that emits a flag
 # ---------------------------------------------------------------------------
 
+class _StubDisk:
+    """Stands in for :class:`DiskImage` for argv purposes only.
+
+    ``start()`` reads exactly two attributes off the disk image when it
+    builds the command line, so a stub emits a byte-identical argv while
+    needing neither ``c1541`` nor a real ``.d64`` on disk.  Real disk
+    behaviour is covered live in ``tests/test_disk_vice.py``; what is
+    under test *here* is only which flags come out.
+
+    If ``start()`` ever grows a third call on the disk image this stub
+    fails loudly with ``AttributeError`` rather than quietly diverging.
+    """
+
+    def __init__(self, path: str, drive_type: int = 1541) -> None:
+        self.path = path
+        self.drive_type = drive_type
+
+
 #: Named configs chosen to cover every flag-emitting branch, including the
 #: mutually exclusive ones (``sounddev`` set vs unset, ``console`` vs
 #: ``minimize``, ``warp`` on vs off, disk attached vs not).  A branch that
@@ -176,6 +194,17 @@ CONFIG_SURFACE: dict[str, ViceConfig] = {
         port=6510, sound_record_driver="wav", sound_record_file="/tmp/o.wav"
     ),
     "exit-screenshot": ViceConfig(port=6510, exit_screenshot="/tmp/e.png"),
+    # The disk branch interpolates its own flag names --
+    # f"-{cfg.drive_unit}" and f"-drive{cfg.drive_unit}type" -- which is
+    # the only place in start() where a flag name is *computed* rather
+    # than written out.  Both units are covered because a single unit
+    # would validate one interpolation and leave the arithmetic untested.
+    "disk-drive-8": ViceConfig(
+        port=6510, disk_image=_StubDisk("/tmp/a.d64"), drive_unit=8
+    ),
+    "disk-drive-9": ViceConfig(
+        port=6510, disk_image=_StubDisk("/tmp/a.d64", drive_type=1571), drive_unit=9
+    ),
     "ethernet": ViceConfig(
         port=6510, ethernet=True, ethernet_interface="feth0", ethernet_driver="pcap"
     ),
