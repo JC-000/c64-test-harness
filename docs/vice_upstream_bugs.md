@@ -336,42 +336,63 @@ checkpoints, and a screen carrying nothing but `READY.` — the machine ran
 happily for fifteen seconds and never received the text
 `send_text` had written to its keyboard buffer.
 
-That second mode is **partly characterised now**, and it is not
-necessarily a VICE bug — attribution is still open, which is why it has
-no numbered entry here. Measured at a reproduced failure, on a machine
-whose raster and PC were both advancing in the BASIC idle loop:
+That second mode is **now root-caused, and it is ours, not VICE's.** It
+is left recorded here only because it shares a surface symptom with the
+stall; the defect belongs to the tests.
+
+Bisected by dropping whole classes, under load, fresh VICE per run:
+
+| selection | reproduced |
+|---|---|
+| whole module | 2/25 |
+| `TestScreen or TestKeyboard` | 3/50 |
+| `TestKeyboard` alone | **0/50** |
+
+So `TestScreen` running first is the trigger, and the victim is always
+`TestKeyboard::test_send_text_basic_command`, the first keyboard test.
+
+Replaying that order with the keyboard buffer sampled between each step
+gives the mechanism:
 
 ```
-expected '7' on screen
-keyboard buffer: $C6=0 $0277=00000000000000000000
-  (empty and uncounted: the keys never reached the C64)
+after send_text('PRINT 2+3')     $C6=10 $0277=5052494e5420322b330d
+after wait_for('5') found=False  $C6= 0 $0277=00000000000000000000
+
+screen:
+   6| PRINT"HELLO VICE"
+   7| H_..V.. 2+3
+   9| READY.
 ```
 
-Fifteen seconds after `send_text` fed the characters, the C64's keyboard
-buffer is **empty and its count is zero**. So the loss is *upstream of
-the C64*: either `CMD_KEYBOARD_FEED` never put the characters into VICE's
-own ring, or the ring never flushed into `$0277`. It is emphatically
-**not** BASIC failing to consume them — that would show `$C6 > 0` with
-bytes present.
+`5052494e5420322b330d` is `PRINT 2+3\r` in PETSCII. **The keys arrive and
+are consumed.** Line 7 is the failure: BASIC's `HELLO VICE` *output*
+interleaved with the echo of `PRINT 2+3`, on the same line, producing
+garbage that BASIC then fails to parse.
 
-That distinction matters because the binary-monitor mapping had already
-ruled out the obvious candidate: `kbdbuf_feed` appends into a 16 KiB ring
-and fails only on overflow (S `kbdbuf.c:248-266`), so a *lost* keystroke
-is not the ring filling up. Ring overflow and "the ring never received
-or never flushed" are different failures, and the measurement above is
-consistent only with the latter.
+The cause is a **false-completion signal** of exactly the kind this repo
+documents (c33b5c4, issue #138), in
+`TestScreen::test_wait_for_text_after_print`. It types
+`PRINT"HELLO VICE"` and waits for `HELLO VICE` — but the *echoed command
+line* contains that substring the moment it is typed, so the wait returns
+long before BASIC executes anything. The test passes on the echo,
+`_restore_basic` jumps to MAINLOOP mid-execution, and BASIC's real output
+lands on top of the next test's input.
 
-Two further facts bound it. `kbdbuf_flush` will not move more characters
-in until `$C6` drains to zero (S `kbdbuf.c:382-388`) — and `$C6` *was*
-zero here, so the flush was not blocked by a full C64 buffer. And the
-sequence does not reproduce in isolation: **199 cycles of the failing
-test's exact sequence, under the same load, never lost a keystroke.** It
-needs the surrounding module to reproduce, which points at state left by
-earlier tests rather than at the feed in isolation.
+**Two of my own earlier claims about this were wrong**, and both are
+corrected above:
 
-**Not yet done:** reading VICE's ring directly would separate "never
-arrived" from "never flushed", and the binary monitor exposes no way to
-do it.
+* "The keys never reached the C64." They do. The failure report samples
+  fifteen seconds later, *after* BASIC has consumed the buffer, so
+  `$C6=0` with an empty `$0277` at failure time says nothing about
+  whether the keys arrived. Sampling immediately after the feed shows
+  `$C6=10`.
+* "199 cycles of the exact sequence never lost a keystroke." That probe
+  reused **one** VICE across all cycles, so only the first was
+  boot-faithful. With a fresh VICE per cycle — which is what pytest does
+  — it reproduces at cycle 12 of 45.
+
+**Fix deliberately not applied in the same pass**, so the diagnosis can
+be reviewed before the change.
 
 **Harness mitigation: detection, not recovery.** We cannot fix VICE. The
 raster check is the discriminating signal — it distinguishes a stalled
