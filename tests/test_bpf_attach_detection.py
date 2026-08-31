@@ -34,6 +34,7 @@ reads root-owned processes.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import platform
 import shutil
@@ -65,17 +66,27 @@ def _iface_up(name: str) -> bool:
     return out.returncode == 0
 
 
-def _sudo_can_run(binary: str) -> bool:
-    out = subprocess.run(
-        ["sudo", "-n", "-l", "--", binary], capture_output=True, text=True
-    )
-    return out.returncode == 0
+# Deliberately the production function rather than a local probe.
+#
+# The local probe this replaced ran ``sudo -n -l -- <binary>`` and took
+# rc=0 as "NOPASSWD".  On a machine whose sudoers carries ``(ALL) ALL``
+# that is rc=0 for *anything that exists*, so it was a file-existence
+# check wearing a sudo costume.  Measured here: ``/bin/ls`` and
+# ``/usr/sbin/lsof`` both "authorised", as was the ethernet build that
+# has no rule at all.
+#
+# That is the same defect ``vice_elevation.sudo_can_run`` was corrected
+# for -- it parses the ``NOPASSWD:`` entries out of the listing -- so the
+# fixed and broken versions were coexisting in one branch.  Importing it
+# keeps one implementation of the question, and means a future fix to it
+# reaches this gate too.
+from c64_test_harness.backends.vice_elevation import sudo_can_run
 
 
 requires_bench = pytest.mark.skipif(
     not shutil.which("netstat")
     or not _iface_up(IFACE)
-    or not _sudo_can_run(X64SC),
+    or not sudo_can_run(X64SC),
     reason=(
         f"needs {IFACE} up (scripts/setup-bridge-feth-macos.sh) and a "
         f"NOPASSWD sudoers rule for {X64SC}"
@@ -89,32 +100,33 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
-@requires_bench
-def test_attach_is_detected_for_a_root_owned_vice():
-    """An elevated VICE on *IFACE* must be seen as attached.
+@contextlib.contextmanager
+def _elevated_vice(*, ethernet: bool):
+    """Run a root-owned x64sc, with or without the ethernet cart.
 
-    The launch is the real one: cart active, pcap driver, elevated.  The
-    ``lsof`` implementation cannot pass this — it sees nothing at all of
-    a root process — while ``netstat -B`` reports the bound interface.
+    Both arms of the attachment control need an identical launch that
+    differs *only* in whether a BPF device gets bound, so the launch lives
+    here rather than being written out twice and drifting.
     """
-    rc_path = tempfile.mktemp(prefix="vice_eth_", suffix=".rc", dir="/tmp")
-    with open(rc_path, "w") as f:
-        f.write(
-            "[Version]\nConfigVersion=3.10\n\n[C64SC]\n"
-            "ETHERNETCART_ACTIVE=1\nEthernetCartMode=1\n"
-            f'ETHERNET_INTERFACE="{IFACE}"\nETHERNET_DRIVER="pcap"\n'
-            "SaveResourcesOnExit=0\n"
-        )
+    rc_path = None
+    args = ["sudo", "-n", X64SC, "-console", "-default"]
+    if ethernet:
+        rc_path = tempfile.mktemp(prefix="vice_eth_", suffix=".rc", dir="/tmp")
+        with open(rc_path, "w") as f:
+            f.write(
+                "[Version]\nConfigVersion=3.10\n\n[C64SC]\n"
+                "ETHERNETCART_ACTIVE=1\nEthernetCartMode=1\n"
+                f'ETHERNET_INTERFACE="{IFACE}"\nETHERNET_DRIVER="pcap"\n'
+                "SaveResourcesOnExit=0\n"
+            )
+        args += ["-addconfig", rc_path]
     port = _free_port()
+    args += [
+        "-binarymonitor", "-binarymonitoraddress", f"ip4://127.0.0.1:{port}",
+        "+sound", "-warp", "-limitcycles", "200000000",
+    ]
     wrapper = subprocess.Popen(
-        [
-            "sudo", "-n", X64SC,
-            "-console", "-default", "-addconfig", rc_path,
-            "-binarymonitor", "-binarymonitoraddress", f"ip4://127.0.0.1:{port}",
-            "+sound", "-warp", "-limitcycles", "200000000",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL,
     )
     child: int | None = None
@@ -147,12 +159,7 @@ def test_attach_is_detected_for_a_root_owned_vice():
             capture_output=True, text=True,
         ).stdout.strip()
         assert owner == "root", f"expected a root-owned child, got {owner!r}"
-
-        attached = bpf_attached_interfaces(child)
-        assert IFACE in attached, (
-            f"elevated VICE (pid {child}, owner {owner}) reported as attached "
-            f"to {attached!r}; expected {IFACE!r}"
-        )
+        yield child
     finally:
         if child is not None:
             subprocess.run(
@@ -166,14 +173,59 @@ def test_attach_is_detected_for_a_root_owned_vice():
             wrapper.wait(timeout=8)
         except Exception:
             wrapper.kill()
-        if os.path.exists(rc_path):
+        if rc_path and os.path.exists(rc_path):
             os.unlink(rc_path)
 
 
-def test_no_attach_reported_for_a_process_that_holds_none():
-    """Negative control: a process with no BPF descriptor reports none.
+@requires_bench
+def test_attach_is_detected_for_a_root_owned_vice():
+    """An elevated VICE on *IFACE* must be seen as attached.
 
-    Without this, an implementation that returned a non-empty list for
-    everything would satisfy the test above.
+    The launch is the real one: cart active, pcap driver, elevated.  The
+    ``lsof`` implementation cannot pass this — it sees nothing at all of
+    a root process — while ``netstat -B`` reports the bound interface.
+    """
+    with _elevated_vice(ethernet=True) as child:
+        attached = bpf_attached_interfaces(child)
+        assert IFACE in attached, (
+            f"elevated VICE (pid {child}) reported as attached to "
+            f"{attached!r}; expected {IFACE!r}"
+        )
+
+
+@requires_bench
+def test_no_attach_reported_for_a_root_owned_vice_without_the_cart():
+    """The control that varies attachment while holding privilege fixed.
+
+    The old negative control used ``os.getpid()`` — this process, which
+    is user-owned *and* unattached — against a positive that is root
+    *and* attached.  Privilege and attachment moved together, so the pair
+    only ever sampled two diagonal corners of a 2x2 and neither test
+    could say which variable the instrument was responding to.  That
+    matters here more than usual, because the bug this module exists to
+    refute was an instrument responding to *privilege* (unelevated
+    ``lsof`` reading nothing of a root process) while appearing to report
+    on attachment.
+
+    This is the same root-owned launch as the test above with the cart
+    left off, so the only thing that changes is whether a BPF device is
+    bound.
+    """
+    with _elevated_vice(ethernet=False) as child:
+        attached = bpf_attached_interfaces(child)
+        assert attached == [], (
+            f"a root-owned VICE with no ethernet cart reported BPF "
+            f"attachments {attached!r} — the probe is responding to "
+            f"something other than attachment"
+        )
+
+
+def test_no_attach_reported_for_a_process_that_holds_none():
+    """Cheap negative control: a process with no BPF descriptor reports none.
+
+    Kept because it needs no bench and no emulator, so it still runs
+    where ``requires_bench`` skips.  It cannot separate privilege from
+    attachment on its own — that is what the root-owned pair above is
+    for.
     """
     assert bpf_attached_interfaces(os.getpid()) == []
