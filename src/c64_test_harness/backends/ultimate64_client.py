@@ -842,25 +842,34 @@ class Ultimate64Client:
         image_type: str,
         mode: str = "readwrite",
     ) -> None:
-        """PUT /v1/drives/<drive>:mount — mount a disk image (DESTRUCTIVE).
+        """POST /v1/drives/<drive>:mount — upload and mount an image (DESTRUCTIVE).
 
-        `drive` is the slot id (e.g. "a", "b"). The trailing colon used by
-        the drives endpoint is added automatically. `image_type` is e.g.
-        "d64", "d71", "d81", "g64". `mode` is "readwrite", "readonly",
-        or "unlinked".
+        `drive` is the slot id ("a", "b" or "softiec"). `image_type` is
+        e.g. "d64", "d71", "d81", "g64", "g71". `mode` is "readwrite",
+        "readonly", or "unlinked".
+
+        **POST, not PUT.** The firmware registers two different routes on
+        this path: ``PUT`` mounts an image *already on the device* and
+        takes an ``image`` query argument with no body handler at all,
+        while ``POST`` is the upload-and-mount form that accepts a
+        multipart or ``application/octet-stream`` body.  S: 3.15's
+        ``software/api/route_drives.cc:109`` (``PUT ... NULL,
+        ARRAY({{"image", P_REQUIRED}, ...})``) versus ``:141``
+        (``POST ... &attachment_writer``).
+
+        This used to PUT the body, which reaches the route that wants a
+        query argument and has nowhere to put the bytes -- so it answered
+        400 for every body shape tried, multipart and raw alike.  That
+        looked like "this firmware cannot accept an upload"; it was the
+        wrong verb.  See :meth:`mount_disk_path` for the PUT form.
         """
-        if not isinstance(drive, str) or not drive:
-            raise ValueError("drive must be a non-empty string")
         if not isinstance(image, (bytes, bytearray)):
             raise TypeError("image must be bytes")
         if not isinstance(image_type, str) or not image_type:
             raise ValueError("image_type must be a non-empty string")
         if mode not in ("readwrite", "readonly", "unlinked"):
             raise ValueError(f"mode must be readwrite/readonly/unlinked, got {mode!r}")
-
-        # Normalise "a" -> "a:" — URL-encode the full segment including colon.
-        slot = drive if drive.endswith(":") else drive + ":"
-        path = f"/v1/drives/{_encode(slot)}:mount"
+        path = self._drive_slot_path(drive, "mount")
 
         boundary = "----U64ClientBoundary" + uuid.uuid4().hex
         body = _build_multipart(
@@ -871,11 +880,45 @@ class Ultimate64Client:
             file_bytes=bytes(image),
         )
         self._request(
-            "PUT",
+            "POST",
             path,
             body=body,
             content_type=f"multipart/form-data; boundary={boundary}",
         )
+
+    def mount_disk_path(
+        self,
+        drive: str,
+        image_path: str,
+        image_type: str | None = None,
+        mode: str = "readwrite",
+    ) -> None:
+        """PUT /v1/drives/<drive>:mount — mount an image already on the device.
+
+        The counterpart to :meth:`mount_disk`: no bytes cross the wire,
+        the device opens a path of its own.  ``image_path`` is a device
+        path such as ``/Usb0/games/disk.d64``.
+
+        ``image_type`` may be omitted, in which case the firmware infers
+        it from the file extension (S: ``route_drives.cc:97`` -- "Defaults
+        to the file extension").
+
+        This is the form that works when an upload is impractical, and
+        the one callers were rediscovering by hand as a workaround for
+        :meth:`mount_disk` sending its body by the wrong verb.
+
+        :raises ValueError: on a bad drive, an empty path, or a mode
+            outside readwrite/readonly/unlinked.
+        """
+        if not isinstance(image_path, str) or not image_path:
+            raise ValueError("image_path must be a non-empty string")
+        if mode not in ("readwrite", "readonly", "unlinked"):
+            raise ValueError(f"mode must be readwrite/readonly/unlinked, got {mode!r}")
+        path = self._drive_slot_path(drive, "mount")
+        query: dict[str, Any] = {"image": image_path, "mode": mode}
+        if image_type:
+            query["type"] = image_type
+        self._put_no_body(path, query=query)
 
     def unmount_disk(self, drive: str) -> None:
         """PUT /v1/drives/<drive>:remove — unmount a drive (DESTRUCTIVE).
@@ -890,18 +933,41 @@ class Ultimate64Client:
         colon into the slot, which draws a 400 ("Invalid Drive 'a:'"). Both
         are fixed here; the slot now takes the plain letter.
         """
-        if not isinstance(drive, str) or not drive:
-            raise ValueError("drive must be a non-empty string")
-        self.drive_remove_disk(drive.rstrip(":").lower())
+        self.drive_remove_disk(drive)
+
+    #: Drive slots the firmware accepts in a ``/v1/drives/{drive}:...``
+    #: path.  ``softiec`` is the IEC file system; S: 3.15's
+    #: ``software/api/route_drives.cc:95``
+    #: ``PATH_PARAM_ENUM("drive", "a,b,softiec")``.
+    _DRIVE_SLOTS = ("a", "b", "softiec")
 
     @staticmethod
     def _drive_slot_path(drive: str, action: str) -> str:
-        # Plain slot letter, no trailing colon: fw 3.14 answers 400
-        # "Invalid Drive 'a:'" for /v1/drives/a%3A:reset but 200 for
-        # /v1/drives/a:reset (verified live 2026-07-28).
-        if drive not in ("a", "b"):
-            raise ValueError(f"drive must be 'a' or 'b', got {drive!r}")
-        return f"/v1/drives/{drive}:{action}"
+        """Build ``/v1/drives/<slot>:<action>``.
+
+        The single place a drive path is constructed.  Every drive
+        method routes through here, because the one that did not --
+        ``mount_disk`` -- kept the over-encoding bug through a live
+        audit that fixed the identical construction in its sibling
+        (issue #167).
+
+        The slot is a plain identifier with no trailing colon and no
+        percent-encoding: the colon after it is the firmware's verb
+        separator, so a slot containing an encoded one draws
+        400 "Invalid Drive 'a:'" (verified live 2026-07-28 on fw 3.14,
+        again on 3.15).  Callers were long told the trailing colon is
+        added for them, so ``"a:"`` and ``"A"`` are accepted and
+        normalised here rather than rejected.
+        """
+        if not isinstance(drive, str):
+            raise ValueError(f"drive must be a string, got {type(drive).__name__}")
+        slot = drive.strip().rstrip(":").lower()
+        if slot not in Ultimate64Client._DRIVE_SLOTS:
+            raise ValueError(
+                f"drive must be one of {list(Ultimate64Client._DRIVE_SLOTS)}, "
+                f"got {drive!r}"
+            )
+        return f"/v1/drives/{slot}:{action}"
 
     def drive_on(self, drive: str) -> None:
         """PUT /v1/drives/<drive>:on — power on a drive slot (DESTRUCTIVE)."""

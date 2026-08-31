@@ -401,7 +401,12 @@ CARTRIDGE_VALUES: tuple[str, ...] = ("",)
 # --------------------------------------------------------------------------- #
 
 #: Disk image file formats accepted by the U64 mount endpoints.
-DISK_IMAGE_TYPES: tuple[str, ...] = ("d64", "d71", "d81", "g64")
+#: S: 3.15 ``software/api/route_drives.cc:99`` and ``:130`` --
+#: ``PARAM_ENUM("type", "d64,g64,d71,g71,d81")``.  ``g71`` was missing
+#: here, and :func:`_detect_disk_type` raises on anything outside this
+#: tuple, so a ``.g71`` image could not be mounted through the harness
+#: even though the firmware accepts it.
+DISK_IMAGE_TYPES: tuple[str, ...] = ("d64", "d71", "d81", "g64", "g71")
 
 #: Mount modes for the U64 disk-mount REST endpoints.
 MOUNT_MODES: tuple[str, ...] = ("readwrite", "readonly", "unlinked")
