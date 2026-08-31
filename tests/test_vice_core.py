@@ -204,6 +204,33 @@ def _machine_failure_report(transport, needle: str) -> str:
         lines.append(f"registers: {second}")
     except Exception as e:  # diagnostics must never mask the real failure
         lines.append(f"could not read registers: {type(e).__name__}: {e}")
+    # Where did the keystrokes go?  Three outcomes discriminate, and
+    # they need the C64 keyboard buffer rather than the screen:
+    #
+    #   $0277 empty, $C6 == 0  -> the feed never reached the machine, or
+    #                             sat unflushed in VICE's own 16 KiB ring
+    #                             (kbdbuf_flush will not move more in
+    #                             until $C6 drains to zero, S kbdbuf.c:382)
+    #   $0277 full,  $C6 > 0   -> the keys arrived and BASIC never
+    #                             consumed them
+    #
+    # $C6 is also worth seeing *before* a feed: _restore_basic does not
+    # clear it, so a previous test leaving it non-zero would stall the
+    # flush indefinitely.
+    try:
+        c6 = transport.read_memory(0x00C6, 1)[0]
+        kb = transport.read_memory(0x0277, 10)
+        lines.append(
+            f"keyboard buffer: $C6={c6} $0277={kb.hex()}"
+            + ("  (empty and uncounted: the keys never reached the C64)"
+               if c6 == 0 and not any(kb) else
+               f"  ({c6} key(s) queued and not consumed)" if c6 else
+               "  (bytes present but $C6 is 0, so BASIC will not read them)")
+        )
+    except Exception as e:
+        lines.append(f"could not read the keyboard buffer: "
+                     f"{type(e).__name__}: {e}")
+
     # What is actually at $CF00?  A pinned PC is equally consistent with
     # "halted" and with "jammed": if the stub write did not land, or was
     # overwritten, the 6510 may be sitting on an illegal opcode that

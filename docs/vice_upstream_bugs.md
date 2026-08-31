@@ -301,6 +301,12 @@ perform the transition.
 | a lost resume, or monitor nesting needing more exits | 40 acknowledged resumes, no movement |
 | the 6510 jammed on an illegal opcode | `$CF00` holds `584ccde5`, a valid CLI; and **no `0x61` JAM event** in 1328 queued events; and `JAMAction=1` (continue) would have kept the raster advancing anyway |
 
+**A CPU-contention experiment was deliberately not run**, and that is a
+choice rather than an omission: with two failure modes sharing one
+surface symptom, characterising both is worth more than testing a
+trigger hypothesis for one of them. The hypothesis below stands
+untested.
+
 **Trigger: unidentified.** It is load-correlated — it does not reproduce
 on an idle bench, and this bench routinely runs several `x64sc`
 processes from unrelated projects at once. A plausible but **untested**
@@ -330,11 +336,42 @@ checkpoints, and a screen carrying nothing but `READY.` — the machine ran
 happily for fifteen seconds and never received the text
 `send_text` had written to its keyboard buffer.
 
-That second mode is **not characterised** and has no entry here yet. It
-was only distinguishable once the raster check existed; before that both
-modes presented as the same timeout, which is why an earlier write-up
-attributed all of these failures to the stall. That attribution was
-incomplete.
+That second mode is **partly characterised now**, and it is not
+necessarily a VICE bug — attribution is still open, which is why it has
+no numbered entry here. Measured at a reproduced failure, on a machine
+whose raster and PC were both advancing in the BASIC idle loop:
+
+```
+expected '7' on screen
+keyboard buffer: $C6=0 $0277=00000000000000000000
+  (empty and uncounted: the keys never reached the C64)
+```
+
+Fifteen seconds after `send_text` fed the characters, the C64's keyboard
+buffer is **empty and its count is zero**. So the loss is *upstream of
+the C64*: either `CMD_KEYBOARD_FEED` never put the characters into VICE's
+own ring, or the ring never flushed into `$0277`. It is emphatically
+**not** BASIC failing to consume them — that would show `$C6 > 0` with
+bytes present.
+
+That distinction matters because the binary-monitor mapping had already
+ruled out the obvious candidate: `kbdbuf_feed` appends into a 16 KiB ring
+and fails only on overflow (S `kbdbuf.c:248-266`), so a *lost* keystroke
+is not the ring filling up. Ring overflow and "the ring never received
+or never flushed" are different failures, and the measurement above is
+consistent only with the latter.
+
+Two further facts bound it. `kbdbuf_flush` will not move more characters
+in until `$C6` drains to zero (S `kbdbuf.c:382-388`) — and `$C6` *was*
+zero here, so the flush was not blocked by a full C64 buffer. And the
+sequence does not reproduce in isolation: **199 cycles of the failing
+test's exact sequence, under the same load, never lost a keystroke.** It
+needs the surrounding module to reproduce, which points at state left by
+earlier tests rather than at the feed in isolation.
+
+**Not yet done:** reading VICE's ring directly would separate "never
+arrived" from "never flushed", and the binary monitor exposes no way to
+do it.
 
 **Harness mitigation: detection, not recovery.** We cannot fix VICE. The
 raster check is the discriminating signal — it distinguishes a stalled
