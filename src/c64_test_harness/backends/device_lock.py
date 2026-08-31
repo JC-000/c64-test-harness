@@ -107,6 +107,22 @@ _WAITER_NAME_RE = re.compile(r"^waiter-(\d+)-[0-9a-f]+\.json$")
 #: live nested holder (see ``allow_nested``).  Consulted by
 #: :meth:`DeviceLock.held_by_this_process`, which is how the advisory
 #: check tells "we own this device" from "somebody else does".
+#: Size of the lockfile's metadata record, in bytes.  The record is
+#: padded to this length and rewritten in place so that a reader -- and
+#: every reader but ``cleanup_stale`` reads with no lock at all -- sees
+#: either the whole previous record or the whole new one.  4096 is
+#: chosen to match the ``os.read(fd, 4096)`` cap in ``foreign_holder``
+#: and ``cleanup_stale``, and to stay under the ~8 KB threshold above
+#: which a reader-side second ``read()`` syscall can land mid-write
+#: (issue #161).
+_LOCK_RECORD_SIZE = 4096
+
+#: Consecutive ``os.utime`` failures the heartbeat tolerates before it
+#: gives up.  A transient filesystem hiccup must not permanently freeze
+#: the mtime -- that is the only liveness signal a waiter has, and its
+#: absence is reported as "holder may be wedged" (issue #160).
+_HEARTBEAT_MAX_CONSECUTIVE_FAILURES = 5
+
 _PROCESS_HELD: dict[str, int] = {}
 #: Thread idents that took a flock for each lockfile path, one entry per
 #: outstanding hold.  Only used to spot a thread waiting on a lock it
@@ -318,6 +334,12 @@ class DeviceLock:
         # their progress_window.  None/0/negative disables.
         self._heartbeat_interval = heartbeat_interval
         self._heartbeat_stop: threading.Event | None = None
+        #: False once the heartbeat has given up (issue #160).  Local
+        #: to the holder: a waiter in another process cannot see it,
+        #: so it distinguishes the two cases in *this* process's logs
+        #: only.  Surfacing it cross-process would need a field in the
+        #: lockfile record, which is deliberately not done here.
+        self._heartbeat_healthy: bool = True
         self._heartbeat_thread: threading.Thread | None = None
 
     @property
@@ -586,6 +608,11 @@ class DeviceLock:
             data = json.loads(self._lock_path.read_text())
         except (OSError, json.JSONDecodeError, ValueError):
             return False
+        # Valid JSON that is not an object -- "null", "[]", "42" -- parses
+        # fine and then raises AttributeError on .get, which is not in the
+        # guard above and would escape a routine acquire() (issue #163).
+        if not isinstance(data, dict):
+            return False
         pid = data.get("pid")
         if not isinstance(pid, int):
             return False
@@ -611,6 +638,17 @@ class DeviceLock:
             except OSError:
                 os.close(fd)
                 return False
+            # Claim our identity in the file *immediately*.  The flock
+            # is already ours, so from here on any unlocked reader --
+            # foreign_holder, _holder_is_progressing -- is entitled to
+            # believe whatever the body says.  Writing it after the
+            # inode recheck left the previous holder's PID in place for
+            # the length of two stat() calls, and readers in that window
+            # named a process that had released the device some time
+            # ago: a confident wrong answer rather than a missing one
+            # (issue #165).
+            self._fd = fd
+            self._write_metadata()
             # Verify our fd still points to the file on disk.
             try:
                 fd_stat = os.fstat(fd)
@@ -619,13 +657,15 @@ class DeviceLock:
                     fd_stat.st_ino == path_stat.st_ino
                     and fd_stat.st_dev == path_stat.st_dev
                 ):
-                    self._fd = fd
-                    self._write_metadata()
                     self._register_process_hold()
                     return True
             except OSError:
                 pass
-            # Inode mismatch or path gone — lock is on a dead inode
+            # Inode mismatch or path gone — lock is on a dead inode.
+            # The metadata we just wrote went to that dead inode, which
+            # is about to be unreachable, so there is nothing to undo
+            # beyond dropping our reference to it.
+            self._fd = None
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
         return False
@@ -658,8 +698,12 @@ class DeviceLock:
         # The flock is going away, so the process no longer holds the
         # device even if a nested holder outlived its parent.
         self._drop_process_hold(purge=True)
-        # Stop the heartbeat before unlinking/releasing so the thread
-        # doesn't race with the final mtime bump or the fd close.
+        # Stop the heartbeat before the mtime bump and the fd close so
+        # the thread doesn't race with them.  (The lockfile is
+        # deliberately NOT unlinked here — see the docstring above.  An
+        # earlier version of this comment said "before unlinking",
+        # which sent two sessions hunting a leak that does not exist:
+        # a lockfile holding a dead PID is the normal post-run state.)
         self._stop_heartbeat()
         # Cooperative wake-up: bump mtime BEFORE releasing the flock so
         # the fs-event is observed by waiters that immediately retry.
@@ -804,9 +848,13 @@ class DeviceLock:
         """
         try:
             data = self._lock_path.read_text()
-            return json.loads(data)
+            parsed = json.loads(data)
         except (OSError, json.JSONDecodeError, ValueError):
             return None
+        # Only an object is metadata.  Returning a bare list or int here
+        # would push the AttributeError into every caller instead
+        # (issue #163).
+        return parsed if isinstance(parsed, dict) else None
 
     # -- Queue-depth introspection (issue #130) --
 
@@ -920,16 +968,34 @@ class DeviceLock:
 
     @classmethod
     def cleanup_stale(cls, lock_dir: Path | None = None) -> int:
-        """Remove device lockfiles whose holding PID is dead.
+        """Remove every ``device-*.lock`` in *lock_dir* that nobody holds.
 
-        Safety: we only delete a lockfile while holding its flock, so
-        concurrent processes that have opened the same path but not yet
-        called ``flock()`` will see the flock fail (not succeed on a
-        new inode).  After unlinking we keep the fd open briefly so the
-        inode stays alive until we close — any racing ``open()`` on the
-        same path will create a new inode.
+        The rule is **not** "whose holding PID is dead", which is what
+        this docstring used to claim.  The recorded PID is read but not
+        acted on: a file whose PID is alive is unlinked just the same,
+        because being unheld is what makes it removable.  Nor is the
+        sweep scoped to this instance's device -- it globs
+        ``device-*.lock``, so acquiring one device clears every other
+        device's unheld lockfile in the machine-global lock dir.
 
-        Returns the number of stale lockfiles removed.
+        Safety comes from the flock, not from the PID: a file is only
+        unlinked after this call takes ``LOCK_EX|LOCK_NB`` on it, which
+        proves nobody holds the device.  A racing acquirer that opened
+        the inode before the unlink and flocks it after is caught by the
+        ``st_ino``/``st_dev`` recheck in :meth:`_try_acquire_once`,
+        which sees the mismatch and retries.  This is why the sweep is
+        safe in a way a manual ``rm`` is not -- a shell has no way to
+        prove nobody holds the lock, and unlinking the path while
+        another process is blocked on the inode leaves the next acquirer
+        locking a *new* inode that excludes nobody.
+
+        Consequence worth knowing: because unheld lockfiles are swept by
+        unrelated acquires, and because the record is a single
+        last-writer-wins slot, the JSON body is **live status only**.  It
+        cannot answer "which lane held this device an hour ago"; there
+        is no durable record of a hold anywhere in this package.
+
+        Returns the number of lockfiles removed.
         """
         d = lock_dir or _default_lock_dir()
         removed = 0
@@ -948,17 +1014,22 @@ class DeviceLock:
                 # Someone holds it — not stale
                 os.close(fd)
                 continue
-            # We hold the flock.  Check if the recorded PID is dead.
+            # We hold the flock, which is the whole justification for
+            # unlinking: nobody can be using this device.  The recorded
+            # PID is read only to log what we are sweeping — alive or
+            # dead, the file goes, because an unheld lockfile is debris
+            # either way.
             try:
                 raw = os.read(fd, 4096)
                 data = json.loads(raw) if raw else {}
-                pid = data.get("pid")
+                pid = data.get("pid") if isinstance(data, dict) else None
                 if pid is not None and _pid_alive(pid):
-                    # PID is alive but nobody holds the flock — the
-                    # metadata is stale (process forgot to clean up).
-                    # Still safe to remove since we hold the lock.
-                    pass  # fall through to unlink
-                # Either dead PID or no/corrupt metadata — remove it
+                    _log.debug(
+                        "cleanup_stale: %s names live pid %s but is unheld; "
+                        "removing (the process released without cleaning up)",
+                        path.name,
+                        pid,
+                    )
                 try:
                     path.unlink(missing_ok=True)
                     removed += 1
@@ -994,7 +1065,31 @@ class DeviceLock:
     # -- Internal --
 
     def _write_metadata(self) -> None:
-        """Write JSON metadata to the lockfile."""
+        """Write the metadata record to the lockfile, in place.
+
+        Padded to :data:`_LOCK_RECORD_SIZE` and written at offset 0 with
+        no truncation, because the flock excludes other *writers* and
+        nothing at all excludes readers: ``read_info`` and
+        ``_holder_is_progressing`` both read unlocked, and
+        ``_holder_is_progressing`` has to, since it reads while the
+        holder holds ``LOCK_EX``.
+
+        The previous form was ``lseek`` + ``ftruncate(0)`` + ``write``,
+        which left the file zero bytes between the second and third
+        call.  A reader landing there degraded quietly -- ``read_info``
+        returned ``None``, and ``acquire_or_raise`` then reported "no
+        holder metadata found; acquire still failed (race?)" instead of
+        naming the holder.  Rewriting a fixed-length record in place
+        removes the window rather than narrowing it: the bytes on disk
+        are always one complete record.
+
+        ``json.loads`` ignores the trailing padding, so readers are
+        unchanged.  Not write-to-temp-and-rename: the lockfile's
+        identity *is* the flock inode, and a rename would orphan the
+        holder's flock on the old inode while the next acquirer locks
+        the new one -- two simultaneous holders, the hazard
+        :meth:`release` documents.
+        """
         if self._fd is None:
             return
         meta = {
@@ -1004,9 +1099,26 @@ class DeviceLock:
         }
         data = json.dumps(meta).encode()
         try:
+            if len(data) > _LOCK_RECORD_SIZE:
+                # Should not happen: the record is three small fields.
+                # Truncate-and-write rather than silently cutting the
+                # record short -- correctness over atomicity, loudly.
+                # Readers capped at 4096 bytes will fail to parse this
+                # and degrade to "no metadata", which is honest.
+                _log.error(
+                    "DeviceLock metadata for %s is %d bytes, over the %d-byte "
+                    "record; falling back to a truncating write, which is "
+                    "briefly observable as empty",
+                    self._device_host,
+                    len(data),
+                    _LOCK_RECORD_SIZE,
+                )
+                os.lseek(self._fd, 0, os.SEEK_SET)
+                os.ftruncate(self._fd, 0)
+                os.write(self._fd, data)
+                return
             os.lseek(self._fd, 0, os.SEEK_SET)
-            os.ftruncate(self._fd, 0)
-            os.write(self._fd, data)
+            os.write(self._fd, data.ljust(_LOCK_RECORD_SIZE))
         except OSError:
             pass
 
@@ -1028,6 +1140,7 @@ class DeviceLock:
             return
         if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
             return
+        self._heartbeat_healthy = True
         stop = threading.Event()
         thread = threading.Thread(
             target=self._heartbeat_loop,
@@ -1059,11 +1172,31 @@ class DeviceLock:
     ) -> None:
         """Thread body: bump mtime every *interval* seconds until *stop*.
 
-        Exits quietly on ``FileNotFoundError`` (lockfile unlinked under
-        us) or any other ``OSError``.  Never propagates exceptions —
-        a misbehaving heartbeat must not crash the holder.
+        The mtime bump is the **only** liveness signal a waiter has:
+        ``_holder_is_progressing`` reads it, and
+        ``DeviceLockTimeout._build_message`` turns its absence into
+        "holder may be wedged".  So a heartbeat that dies takes a
+        perfectly healthy holder and has every other lane told it is
+        stuck -- a diagnosis that is confident, specific and wrong, and
+        invisible to the holder itself.
+
+        This used to ``return`` on the first ``OSError``, unlogged, with
+        nothing to restart it (``_start_heartbeat`` is only reached from
+        ``acquire``).  A single tmpfs hiccup or fd-pressure moment was
+        therefore permanent.  Transient errors are now logged and
+        retried; only ``_HEARTBEAT_MAX_CONSECUTIVE_FAILURES`` in a row
+        give up, loudly, because retrying forever against a genuinely
+        broken path is its own bug (issue #160).
+
+        ``FileNotFoundError`` still stops immediately and quietly: the
+        lockfile being gone is the documented steady state after a
+        release, not a hiccup.
+
+        Never propagates: a misbehaving heartbeat must not crash the
+        holder.
         """
         path = str(self._lock_path)
+        failures = 0
         while not stop.is_set():
             # Wait first so the very first bump (from _write_metadata)
             # isn't immediately overwritten; this also makes tests that
@@ -1074,11 +1207,39 @@ class DeviceLock:
                 os.utime(path, None)
             except FileNotFoundError:
                 return
-            except OSError:
-                # Filesystem hiccup — stop quietly rather than spinning.
-                return
+            except OSError as exc:
+                failures += 1
+                _log.warning(
+                    "DeviceLock heartbeat for %s failed to bump %s "
+                    "(%d consecutive): %s",
+                    self._device_host,
+                    path,
+                    failures,
+                    exc,
+                )
+                if failures >= _HEARTBEAT_MAX_CONSECUTIVE_FAILURES:
+                    self._heartbeat_healthy = False
+                    _log.error(
+                        "DeviceLock heartbeat for %s giving up after %d "
+                        "consecutive failures; this holder's mtime will now "
+                        "freeze and waiters will report it as wedged even "
+                        "though it is alive",
+                        self._device_host,
+                        failures,
+                    )
+                    return
+                continue
             except Exception:  # pragma: no cover - defensive
+                self._heartbeat_healthy = False
                 return
+            if failures:
+                _log.info(
+                    "DeviceLock heartbeat for %s recovered after %d "
+                    "consecutive failure(s)",
+                    self._device_host,
+                    failures,
+                )
+                failures = 0
 
 
 def require_device_lock() -> bool:
