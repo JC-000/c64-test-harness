@@ -336,9 +336,10 @@ checkpoints, and a screen carrying nothing but `READY.` — the machine ran
 happily for fifteen seconds and never received the text
 `send_text` had written to its keyboard buffer.
 
-That second mode is **now root-caused, and it is ours, not VICE's.** It
-is left recorded here only because it shares a surface symptom with the
-stall; the defect belongs to the tests.
+That second mode is **not root-caused.** An earlier revision of this note
+said it was; that claim was based on a single capture and is withdrawn
+below. It is recorded here only because it shares a surface symptom with
+the stall.
 
 Bisected by dropping whole classes, under load, fresh VICE per run:
 
@@ -391,8 +392,32 @@ corrected above:
   boot-faithful. With a fresh VICE per cycle — which is what pytest does
   — it reproduces at cycle 12 of 45.
 
-**Fix deliberately not applied in the same pass**, so the diagnosis can
-be reviewed before the change.
+**The fix based on this diagnosis did not work, and the diagnosis was
+therefore incomplete.** Both layers were applied — every needle changed
+so no echo can satisfy it, and `_restore_basic` extended to drop queued
+keystrokes and wait for the screen to quiesce — and the reproduction rate
+did not move: cycles 17, 29, 11 and 15 of 45, against 12 of 45 before.
+The residual failures classify as **mode 2 by the raster check**, so they
+are not the stall.
+
+Later captures show states the collision hypothesis does not explain:
+
+* `PRINT 2+3` echoed on screen but never executed, PC at `$FF09`
+* PC at **`$0002`** — the 6510 executing zero page, with `$C6=3` while
+  `$0277` reads all zeros, a count and a buffer that disagree
+* a screen blank but for `READY.`
+
+The line-collision capture that produced the original diagnosis was one
+manifestation among several, and generalising from it was the error. What
+is common to all of them is that the machine is *running* and BASIC does
+not execute the typed line; what varies is where the CPU ends up. That is
+not a false-completion problem, and no test-side wait can fix it.
+
+The oracle and isolation changes are kept because they remove a genuine
+defect of the documented false-completion class — three of the four
+content-asserting tests in `test_vice_core.py` waited on a needle their
+own echoed command contained — but they are **not** a fix for this
+failure and are not described as one.
 
 **Harness mitigation: detection, not recovery.** We cannot fix VICE. The
 raster check is the discriminating signal — it distinguishes a stalled

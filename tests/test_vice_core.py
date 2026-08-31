@@ -291,6 +291,21 @@ def _restore_basic(transport):
     transport.resume()
     time.sleep(0.5)
 
+    # Leave the editor in a known-clean state, not merely the CPU in
+    # MAINLOOP.  Jumping to MAINLOOP abandons whatever BASIC was doing
+    # without undoing it, so a previous test that returned while its
+    # command was still executing leaves output *in flight* — and it
+    # lands on top of the next test's input line, producing a line
+    # neither test typed. That is a leak from one test into a different
+    # test's failure, which no per-test fix can close.
+    #
+    # Two steps: drop keystrokes the previous test left queued, then wait
+    # for the screen to stop changing so anything already executing has
+    # finished landing.
+    transport.write_memory(0x00C6, b"\x00")
+    transport.resume()
+    wait_for_stable(transport, timeout=5.0, poll_interval=0.15, stable_count=2)
+
 
 # ======================================================================
 # Execution control
@@ -448,13 +463,19 @@ class TestScreen:
 
     def test_wait_for_text_after_print(self, binary_transport) -> None:
         """send_text PRINT command, wait for output on screen."""
-        send_text(binary_transport, 'PRINT"HELLO VICE"\r')
+        # The needle must be something the echoed command line cannot
+        # contain.  This test used to type PRINT"HELLO VICE" and wait for
+        # HELLO VICE — which the echo contains the instant it is typed, so
+        # it passed before BASIC had executed anything, and its real
+        # output then landed on the next test's input.
+        #
+        # An arithmetic result is the clean discriminator: 42 appears on
+        # screen only because BASIC evaluated it.
+        send_text(binary_transport, "PRINT 6*7\r")
         # Resume so BASIC processes the keystrokes
         binary_transport.resume()
-        grid = _wait_for_text_binary(binary_transport, "HELLO VICE", timeout=15)
-        assert grid is not None, _machine_failure_report(
-            binary_transport, "HELLO VICE"
-        )
+        grid = _wait_for_text_binary(binary_transport, "42", timeout=15)
+        assert grid is not None, _machine_failure_report(binary_transport, "42")
 
     def test_wait_for_stable_on_idle(self, binary_transport) -> None:
         """Screen grid reads READY. on idle C64."""
@@ -531,7 +552,10 @@ class TestKeyboard:
 
     def test_send_key_single_chars(self, binary_transport) -> None:
         """Individual send_key calls form a BASIC command."""
-        for ch in "PRINT 7\r":
+        # "PRINT 7" waiting for "7" was satisfied by its own echo; the
+        # sum keeps the per-character exercise and moves the needle out of
+        # the typed text.
+        for ch in "PRINT 3+4\r":
             send_key(binary_transport, ch)
         binary_transport.resume()
         grid = _wait_for_text_binary(binary_transport, "7", timeout=15)
@@ -539,14 +563,15 @@ class TestKeyboard:
 
     def test_send_text_long_batching(self, binary_transport) -> None:
         """36-char PRINT command (4 batches of 10 keys)."""
-        cmd = 'PRINT"ABCDEFGHIJKLMNOPQRST"\r'
+        # Still long enough to batch (34 chars -> 4 batches of 10), but
+        # the needle is now computed rather than echoed: the old form
+        # waited for the very string it had just typed.
+        cmd = 'PRINT LEN("ABCDEFGHIJKLMNOPQRST")\r'
+        assert len(cmd) > 31, "must still span four keyboard batches"
         send_text(binary_transport, cmd)
         binary_transport.resume()
-        grid = _wait_for_text_binary(binary_transport, "ABCDEFGHIJKLMNOPQRST",
-                                     timeout=15)
-        assert grid is not None, _machine_failure_report(
-            binary_transport, "ABCDEFGHIJKLMNOPQRST"
-        )
+        grid = _wait_for_text_binary(binary_transport, "20", timeout=15)
+        assert grid is not None, _machine_failure_report(binary_transport, "20")
 
     def test_send_text_return_key(self, binary_transport) -> None:
         """send_text with just CR should not crash."""

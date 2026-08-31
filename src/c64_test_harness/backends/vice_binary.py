@@ -164,6 +164,15 @@ class BinaryViceTransport:
         port: int = 6502,
         timeout: float = 5.0,
         screen_base: int = 0x0400,
+        # keybuf_addr / keybuf_count_addr are **not used by this
+        # transport**: inject_keys() goes through CMD_KEYBOARD_FEED and
+        # never writes $0277/$C6 itself.  They are kept rather than
+        # removed because they are part of the documented HarnessConfig
+        # surface and dropping a public constructor parameter would break
+        # any consumer passing it.  Recorded here because their presence
+        # reads as evidence that the keyboard path writes memory
+        # directly, which it does not -- a reader who assumes otherwise
+        # will mis-diagnose a lost keystroke as a failed write.
         keybuf_addr: int = 0x0277,
         keybuf_count_addr: int = 0x00C6,
         keybuf_max: int = 10,
