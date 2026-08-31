@@ -13,6 +13,7 @@ full binary monitor protocol specification.
 
 from __future__ import annotations
 
+import logging
 import socket
 import struct
 import threading
@@ -21,6 +22,18 @@ from collections import deque
 from typing import NamedTuple
 
 from ..transport import ConnectionError, TimeoutError, TransportError
+
+_log = logging.getLogger(__name__)
+
+#: VICE 3.10 under-allocates every ``DISPLAY_GET`` response by exactly four
+#: bytes.  ``monitor_binary.c:1273`` sizes the buffer as
+#: ``4 + info_length + buffer_length``, accounting for the ``info_length``
+#: field at ``:1278`` but not for the *second* four-byte field -- the
+#: display-buffer length written at ``:1297``.  The reply therefore carries
+#: four fewer pixel bytes than its own ``buffer_length`` claims (and VICE
+#: writes four bytes past the end of its heap allocation on the way out).
+#: See ``docs/vice_upstream_bugs.md`` bug 1.
+DISPLAY_GET_SHORTFALL = 4
 
 # ---------------------------------------------------------------------------
 # Command IDs
@@ -617,7 +630,19 @@ class BinaryViceTransport:
         self._send_and_recv(CMD_JOYPORT_SET, body)
 
     def read_framebuffer(self, use_vic: bool = True, format: int = 0) -> dict:
-        """Return raw framebuffer bytes plus geometry. Backend-specific layout — see backend docs."""
+        """Return raw framebuffer bytes plus geometry.
+
+        Backend-specific layout — see backend docs.  Beyond the shared
+        keys this adds two VICE-specific ones, ``declared_length`` and
+        ``short_by``, because VICE 3.10 delivers fewer pixel bytes than
+        it declares (:data:`DISPLAY_GET_SHORTFALL`).  ``bytes`` is what
+        actually arrived; size buffers from the geometry and check
+        ``short_by`` rather than trusting ``len(bytes)``.
+
+        Raises :class:`TransportError` if the shortfall is anything other
+        than the documented one, which indicates a truncated or
+        desynchronised response rather than the known bug.
+        """
         body = struct.pack("<BB", 0x01 if use_vic else 0x00, format & 0xFF)
         resp = self._send_and_recv(CMD_DISPLAY_GET, body)
         data = resp.body
@@ -636,12 +661,55 @@ class BinaryViceTransport:
             raise TransportError("Display Get response truncated before buffer length")
         buf_len = struct.unpack_from("<I", data, buf_off)[0]
         pixels = data[buf_off + 4:buf_off + 4 + buf_len]
+
+        # VICE always delivers four bytes fewer than it declares (see
+        # DISPLAY_GET_SHORTFALL).  Slicing alone hides that: the slice
+        # just stops early and the caller gets a buffer that does not
+        # match its own geometry, with no error and no log line.
+        #
+        # Raising unconditionally is not the answer either -- the bug
+        # fires on *every* call, and ``read_framebuffer`` is on the
+        # cross-backend C64Transport protocol, so that would make the
+        # VICE backend fail where the U64 one succeeds.  Instead: report
+        # the known shortfall explicitly and loudly, and refuse anything
+        # that is *not* the known shortfall, which would be real
+        # corruption rather than this documented bug.
+        short_by = buf_len - len(pixels)
+        if short_by not in (0, DISPLAY_GET_SHORTFALL):
+            raise TransportError(
+                f"Display Get buffer is {short_by} bytes short of its "
+                f"declared length ({len(pixels)} of {buf_len}). VICE 3.10's "
+                f"known under-allocation is exactly "
+                f"{DISPLAY_GET_SHORTFALL} bytes, so this is a different "
+                f"fault -- a truncated or desynchronised response, not the "
+                f"documented bug."
+            )
+        # Warn once per transport, not once per frame: the bug fires on
+        # every call, so a capture loop would bury the message in copies
+        # of itself.  The ``short_by`` key below carries it per call.
+        if short_by and not getattr(self, "_display_shortfall_warned", False):
+            self._display_shortfall_warned = True
+            _log.warning(
+                "DISPLAY_GET returned %d of %d declared pixel bytes; VICE "
+                "3.10 under-allocates the response by %d bytes "
+                "(docs/vice_upstream_bugs.md bug 1). The frame is short by "
+                "%d pixels at %d bpp. Reported once per transport; see the "
+                "'short_by' key on every call.",
+                len(pixels), buf_len, DISPLAY_GET_SHORTFALL,
+                short_by * 8 // bpp if bpp else short_by, bpp,
+            )
         return {
             "debug_rect": (0, 0, debug_w, debug_h),
             "inner_rect": (inner_x, inner_y, inner_w, inner_h),
             "bpp": bpp,
             "palette": 0,
             "bytes": pixels,
+            # VICE-specific diagnostics.  ``declared_length`` is what the
+            # response claimed; ``short_by`` is how far ``bytes`` falls
+            # short of it.  A caller that sizes buffers from the geometry
+            # can check these instead of trusting len(bytes).
+            "declared_length": buf_len,
+            "short_by": short_by,
         }
 
     def read_palette(self, use_vic: bool = True) -> list[tuple[int, int, int]]:

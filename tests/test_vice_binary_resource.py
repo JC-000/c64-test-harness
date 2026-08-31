@@ -505,6 +505,60 @@ class TestReadFramebuffer:
             with pytest.raises(TransportError, match="too short"):
                 t.read_framebuffer()
 
+    # ---- the declared-vs-delivered length check (upstream bug 1) ----
+
+    @staticmethod
+    def _display_body(declared: int, delivered: int) -> bytes:
+        """A DISPLAY_GET body claiming *declared* bytes and carrying
+        *delivered*."""
+        info = struct.pack("<IHHHHHHB", 13, 384, 272, 32, 35, 320, 200, 8)
+        return info + struct.pack("<I", declared) + bytes(delivered)
+
+    def test_a_full_length_buffer_reports_no_shortfall(self) -> None:
+        """The healthy case still reports the declared length."""
+        t = _make_transport()
+        resp = _Response(CMD_DISPLAY_GET, 0x00, 0, self._display_body(16, 16))
+        with patch.object(t, "_send_and_recv", return_value=resp):
+            result = t.read_framebuffer()
+        assert result["short_by"] == 0
+        assert result["declared_length"] == 16
+        assert len(result["bytes"]) == 16
+
+    def test_the_known_four_byte_shortfall_is_surfaced_not_hidden(
+        self, caplog
+    ) -> None:
+        """VICE 3.10's under-allocation must reach the caller as data.
+
+        Slicing alone stops early and hands back a buffer that does not
+        match its own geometry, with no error and no log line -- which is
+        exactly how this went unnoticed.  It must not raise either: the
+        bug fires on every call and ``read_framebuffer`` is on the
+        cross-backend protocol, so raising would make VICE fail where the
+        U64 backend succeeds.
+        """
+        t = _make_transport()
+        resp = _Response(CMD_DISPLAY_GET, 0x00, 0, self._display_body(20, 16))
+        with caplog.at_level("WARNING"):
+            with patch.object(t, "_send_and_recv", return_value=resp):
+                result = t.read_framebuffer()
+        assert result["declared_length"] == 20
+        assert result["short_by"] == 4
+        assert len(result["bytes"]) == 16
+        assert "under-allocates" in caplog.text, "the shortfall was silent"
+
+    def test_an_unexpected_shortfall_is_refused(self) -> None:
+        """Anything but the documented 4 bytes is real corruption.
+
+        Pinning the exact number is the point: a desynchronised or
+        truncated response is not this bug, and must not be waved through
+        as though it were.
+        """
+        t = _make_transport()
+        resp = _Response(CMD_DISPLAY_GET, 0x00, 0, self._display_body(24, 16))
+        with patch.object(t, "_send_and_recv", return_value=resp):
+            with pytest.raises(TransportError, match="different fault"):
+                t.read_framebuffer()
+
 
 class TestReadPalette:
     def test_read_palette(self) -> None:

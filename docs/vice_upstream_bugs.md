@@ -53,22 +53,38 @@ is derived from attacker-influenceable geometry.
 `buffer_length` — measured during this audit as 157,248 declared against
 157,244 returned (4 pixels missing at 8bpp). No error, no log line.
 
-**Harness mitigation: NONE — known unmitigated gap.**
-`BinaryViceTransport.read_framebuffer()`
-(`src/c64_test_harness/backends/vice_binary.py:619`) slices
-`data[buf_off + 4 : buf_off + 4 + buf_len]`, which silently yields a
-buffer 4 bytes shorter than `buf_len` claims. Nothing compares
-`len(pixels)` against `buf_len`, so the shortfall is invisible to
-callers. Anyone relying on exact framebuffer length must validate it
-themselves until this is fixed.
+**Harness mitigation: the shortfall is now measured and surfaced.**
+`BinaryViceTransport.read_framebuffer()` compares `len(pixels)` against
+the declared `buffer_length` and returns the difference to the caller:
 
-*Fix identified, deliberately deferred.* Add a length check in
-`read_framebuffer()` — compare `len(pixels)` to `buf_len` and raise
-`TransportError` (or return the shortfall explicitly) rather than
-handing back a silently truncated buffer. It needs a test against a live
-VICE, and VICE test execution was held by another agent when this was
-written, so it was not attempted rather than run concurrently. Pick this
-up next; it is the only bug in this file with no mitigation at all.
+| key | meaning |
+|---|---|
+| `bytes` | the pixel bytes that actually arrived |
+| `declared_length` | what the response claimed |
+| `short_by` | `declared_length - len(bytes)` |
+
+A shortfall of exactly `DISPLAY_GET_SHORTFALL` (4) is this bug: the call
+succeeds, `short_by` reports it, and a warning is logged **once per
+transport** (not per frame — a capture loop would otherwise bury the
+message in copies of itself). Any *other* shortfall raises
+`TransportError`, because that is a truncated or desynchronised response
+rather than this documented bug.
+
+It deliberately does **not** raise on the known case. The bug fires on
+every single call, and `read_framebuffer` is part of the cross-backend
+`C64Transport` protocol, so raising would make the VICE backend fail
+where the Ultimate 64 backend succeeds — trading a silent wrong answer
+for a loud wrong behaviour.
+
+Callers that need exact geometry should size from `debug_rect`/`bpp` and
+check `short_by`, rather than trusting `len(bytes)`.
+
+*Verified against a live VICE*, not just asserted: the constant 4 is read
+out of VICE's source and typed into ours, so
+`tests/test_vice_binary.py::TestUpstreamBugOneIsReal` measures the real
+shortfall and fails if this build differs — including if a future VICE
+fixes the bug, at which point the workaround should be removed rather
+than left to rot.
 
 ---
 

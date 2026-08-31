@@ -15,7 +15,10 @@ import time
 
 import pytest
 
-from c64_test_harness.backends.vice_binary import BinaryViceTransport
+from c64_test_harness.backends.vice_binary import (
+    DISPLAY_GET_SHORTFALL,
+    BinaryViceTransport,
+)
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 from c64_test_harness.backends.vice_manager import PortAllocator
 from c64_test_harness.transport import TransportError
@@ -305,3 +308,88 @@ class TestFullAddressSpaceRead:
         data = binary_transport.read_memory(0x0000, 0xFFFF)
         assert len(data) == 0xFFFF
         assert data == binary_transport.read_memory(0x0000, 0x10000)[:0xFFFF]
+
+
+# ======================================================================
+# Anchors: constants this harness asserts about VICE, checked against it
+# ======================================================================
+
+
+class TestUpstreamBugOneIsReal:
+    """``DISPLAY_GET`` really is four bytes short (upstream bug 1).
+
+    ``DISPLAY_GET_SHORTFALL`` is a number read out of VICE's source and
+    typed into ours; ``read_framebuffer`` refuses any *other* shortfall as
+    corruption.  If the real value were different -- a VICE build that
+    fixed the bug, or one that broke it differently -- the mocked tests
+    would keep agreeing with the constant and every live call would start
+    raising.  So measure it.
+    """
+
+    def test_the_declared_length_exceeds_the_delivered_by_exactly_four(
+        self, binary_transport
+    ) -> None:
+        fb = binary_transport.read_framebuffer()
+        assert fb["short_by"] == DISPLAY_GET_SHORTFALL, (
+            f"VICE delivered {len(fb['bytes'])} of {fb['declared_length']} "
+            f"declared bytes ({fb['short_by']} short). The harness is built "
+            f"around a {DISPLAY_GET_SHORTFALL}-byte shortfall "
+            f"(docs/vice_upstream_bugs.md bug 1); this build differs, so "
+            f"the constant and the doc both need revisiting."
+        )
+
+    def test_the_shortfall_is_reported_not_hidden(self, binary_transport) -> None:
+        """The caller must be able to see it without counting bytes."""
+        fb = binary_transport.read_framebuffer()
+        assert fb["declared_length"] == len(fb["bytes"]) + fb["short_by"]
+        assert fb["short_by"] > 0, (
+            "this build appears to have fixed the bug — if so, remove the "
+            "workaround rather than leaving it to rot"
+        )
+
+
+class TestStatusRegisterNameAnchor:
+    """Which name does VICE actually use for the status register?
+
+    ``_parse_cpu_history_entry`` resolves ``sr`` through ``FL`` → ``FLAGS``
+    → ``SR``.  That chain is an assumption about VICE's naming that no
+    test checked: if VICE used none of the three, ``sr`` would read 0
+    forever and every mocked test would still pass.
+
+    Measured on this bench (VICE 3.10, Homebrew bottle), the full set is
+    ``00 01 A CYC FL LIN PC SP X Y`` — so **``FL`` is the real name** and
+    ``FLAGS``/``SR`` are speculative fallbacks that never fire here.  The
+    test asserts the chain matches *something* rather than pinning
+    ``FL``: the fallbacks cost nothing, and a VICE fork or a later
+    release renaming the register is exactly what this should catch.
+    """
+
+    def test_vice_exposes_a_status_register_the_alias_chain_matches(
+        self, binary_transport
+    ) -> None:
+        names = {r["name"] for r in binary_transport.registers_available()}
+        matched = [n for n in ("FL", "FLAGS", "SR") if n in names]
+        assert matched, (
+            f"VICE exposes {sorted(names)}, none of which is FL/FLAGS/SR, so "
+            f"the 'sr' field in cpu_history() is permanently 0. The alias "
+            f"chain in _parse_cpu_history_entry needs the real name."
+        )
+
+    def test_the_status_register_reaches_cpu_history_as_sr(
+        self, binary_transport
+    ) -> None:
+        """End to end: the alias chain must actually populate ``sr``.
+
+        Knowing the name exists is not the same as the chain using it --
+        that is the gap a register-name mutation slipped through.
+        """
+        binary_transport.cpu_history(count=1)  # prime the ring
+        binary_transport.single_step()
+        history = binary_transport.cpu_history(count=4)
+        if not history:
+            pytest.skip("VICE returned no CPU history records")
+        assert all("sr" in entry for entry in history)
+        assert any(entry["registers"] for entry in history), (
+            "no record carried any named register, so this cannot show the "
+            "alias chain resolving"
+        )
