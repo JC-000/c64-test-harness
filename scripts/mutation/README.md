@@ -33,6 +33,33 @@ list finds the weaknesses its author already suspected.
 | `int` | integer literal 0–8 on a line containing `=` or `,` → value + 1 |
 | `cmp` | single-operator comparison → `<=`→`<`, `>=`→`>`, `==`→`!=`, `is not None`→`is None` |
 
+Three exclusions, all applied at generation time rather than tolerated in
+the output:
+
+* **f-string fragments.** `f"-drive{unit}type"` contributes the stem
+  `-drive`, which nothing emits.
+* **Sibling-tool argv.** `-axo` belongs to `ps`, not to VICE. Mutating it
+  produces a permanent survivor, since the argv contract checks emitted
+  flags against `x64sc -help` and `ps` argv is not in it.
+* **Patterns absent from the source.** The `int` operator would emit
+  `= 5` for `timeout=5,` (no space) and for `header[7]` (not an
+  assignment at all).
+
+### A no-op result is a defect to remove, not a row to skip
+
+This is the rule those exclusions exist to serve, and it was learned the
+expensive way.
+
+The generator was reporting `NOTAPPLIED -drive` on **every sweep**. That
+line means "this tool did nothing", and it was skipped over every time.
+Tolerating it is *how* the internal-hyphen bug survived: the one output
+that would have prompted a look at the extraction was the one being
+routinely ignored. `-autostart-warp` went unmutated for a week behind a
+row nobody read.
+
+A tool that reports its own inaction is telling you something. If a row
+means the instrument did not measure, fix the instrument.
+
 The count depends on the source revision, so any figure must name one.
 At `6868168` — the revision the results below were measured at — the
 generator yields exactly **167 mutations** (cmp=66, flagname=38,
@@ -104,7 +131,17 @@ direction — **the argv contract's contribution was overstated**.
 An earlier write-up also gave the population as 68 with 10 killed; it is
 74 and 24.
 
-3. **The flag regex skipped every hyphenated flag.** It was
+3. **The population is now identical to an independent extraction.**
+   After the three exclusions above and the regex fix, this generator and
+   one built separately by another agent produce **the same 37 literals**
+   — symmetric difference empty, not merely the same count.
+
+   The number went 37 (wrong set) → 39 (hyphen fix) → **37 (right set)**.
+   Landing back on the number it started at, having changed which
+   literals it contains, is the whole lesson in one line: a matching
+   count is not a matching population.
+
+4. **The flag regex skipped every hyphenated flag.** It was
    `[-+][a-z0-9]{3,}`, which cannot match `-autostart-warp` — a flag this
    harness emits unconditionally (`vice_lifecycle.py:514`). Two real
    flags were therefore never mutated in any sweep.
