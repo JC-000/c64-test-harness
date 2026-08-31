@@ -314,6 +314,28 @@ it stalls within a few dozen attempts. A standalone probe that stalls it
 and interrogates the halted machine reproduced it by cycle ~80 in about
 half of its runs.
 
+**Scope — this is one of two failure modes, not the only one.** The
+keyboard and screen tests fail intermittently in two different ways that
+look identical from the outside ("the text never appeared"), and the
+raster check is what separates them:
+
+| | raster | PC | screen | diagnosis |
+|---|---|---|---|---|
+| **stall (this bug)** | frozen | pinned, e.g. at `$CF00` | stale | VICE stopped emulating |
+| **lost keystrokes** | advancing | cycling the BASIC idle loop `$E5CD-$E5D4` | `READY.` only, nothing typed | machine healthy; the injected keys never took effect |
+
+Measured example of the second, which is **not** this bug: 15 poll
+windows, 4 distinct PCs all inside the idle loop, stub intact, zero
+checkpoints, and a screen carrying nothing but `READY.` — the machine ran
+happily for fifteen seconds and never received the text
+`send_text` had written to its keyboard buffer.
+
+That second mode is **not characterised** and has no entry here yet. It
+was only distinguishable once the raster check existed; before that both
+modes presented as the same timeout, which is why an earlier write-up
+attributed all of these failures to the stall. That attribution was
+incomplete.
+
 **Harness mitigation: detection, not recovery.** We cannot fix VICE. The
 raster check is the discriminating signal — it distinguishes a stalled
 emulator from every other failure and, unlike a PC sample, cannot
