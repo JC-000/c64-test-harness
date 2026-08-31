@@ -60,9 +60,19 @@ the six non-live modules:**
 | survived | 85 |
 | killed | 76 |
 
-**The flag funnel.** Population is exactly the `flagname` and
-`flagpolarity` mutations in `vice_lifecycle.py` — 74 of them, 2 of which
-never apply, so **72 viable**:
+**The flag funnel.** Population is the `flagname` and `flagpolarity`
+mutations in `vice_lifecycle.py`. The staged figures below were measured
+on a **74**-mutant population (37 literals); the generator's flag regex
+has since been corrected to allow internal hyphens, which brings it to
+**78** (39 literals). The four newly-reachable mutants were tested
+separately — `-autostart-warp` and `+autostart-warp`, name and polarity —
+and **all four die**: the two name corruptions at the contract, the two
+polarity flips at the live readback modules
+(`test_autostart_warp_follows_cfg_warp` and
+`test_default_neutralises_an_ambient_vicerc`). So the residual is still 0
+on the corrected population, and the stages below are not re-derived.
+
+Of the 74 measured, 2 never apply, so **72 viable**:
 
 | stage | survivors |
 |---|---|
@@ -93,6 +103,21 @@ direction — **the argv contract's contribution was overstated**.
 
 An earlier write-up also gave the population as 68 with 10 killed; it is
 74 and 24.
+
+3. **The flag regex skipped every hyphenated flag.** It was
+   `[-+][a-z0-9]{3,}`, which cannot match `-autostart-warp` — a flag this
+   harness emits unconditionally (`vice_lifecycle.py:514`). Two real
+   flags were therefore never mutated in any sweep.
+
+   It was found by diffing this population against one extracted
+   independently, and the way it hid is worth keeping: **both extractions
+   produced exactly 37 literals**, so the totals agreed while the sets
+   did not. Mine was missing the two `autostart-warp` entries and
+   carrying two things that are not VICE flags at all — `-axo` (argv for
+   `ps`, in the sudo-child resolver) and `-drive` (the f-string stem of
+   `f"-drive{unit}type"`, which never applies). Two missing, two
+   spurious, totals identical. A matching count is not a matching
+   population.
 
 ## Known limits — read before quoting a number
 

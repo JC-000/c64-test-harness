@@ -24,8 +24,17 @@ TARGETS = [
     "src/c64_test_harness/backends/vice_manager.py",
 ]
 
-#: A CLI flag: a leading -/+ then lowercase alphanumerics.
-FLAG_RE = re.compile(r"[-+][a-z0-9]{3,}")
+#: A CLI flag: a leading -/+ then lowercase alphanumerics, which may
+#: contain internal hyphens.
+#:
+#: The hyphen matters.  An earlier version was ``[-+][a-z0-9]{3,}``, which
+#: silently skipped every hyphenated flag -- and ``-autostart-warp`` /
+#: ``+autostart-warp`` are emitted unconditionally (vice_lifecycle.py:514),
+#: so two real flags were never mutated in any sweep.  Found by diffing
+#: this population against an independently-extracted one; a count that
+#: matched (37 literals both ways) hid the fact that the two sets were
+#: not the same 37.
+FLAG_RE = re.compile(r"[-+][a-z0-9][a-z0-9-]{2,}")
 #: A VICE resource name: CamelCase, five characters or more.
 RESOURCE_RE = re.compile(r"[A-Z][A-Za-z0-9]{4,}")
 
