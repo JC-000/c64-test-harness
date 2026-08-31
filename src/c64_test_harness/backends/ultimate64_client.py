@@ -22,6 +22,8 @@ import urllib.request
 import uuid
 from typing import TYPE_CHECKING, Any
 
+from .u64_capabilities import DeviceCapabilities
+
 if TYPE_CHECKING:
     from .ultimate64_probe import LivenessResult
     from .ultimate64_temp_gc import TempGCResult
@@ -178,18 +180,18 @@ class Ultimate64Client:
         :param write_mem_query_threshold: payload-size cutoff (in bytes)
             at which :meth:`write_mem` switches from the legacy
             ``PUT ?data=<hex>`` form to the ``POST`` raw-byte form. If
-            ``None`` (the default), the threshold is auto-detected from
-            the device's firmware version on first construction:
+            ``None`` (the default), it is derived from :attr:`capabilities`:
 
-            * fw ``3.14*`` (incl. 3.14d) → **128**. The 48..127 range over
-              the POST path occasionally wedges the runner on this fw,
-              so the higher threshold pushes everything below 128 onto
-              the reliable PUT-with-hex path.
-            * any other / unknown fw → **48** (conservative legacy default).
+            * firmware **without** the Temp-folder GC fix (upstream #686) —
+              every 3.14/3.13 build, and the whole 1.x CBM line — → **128**,
+              which pushes the 48..127 band that wedges the runner off the
+              POST path and onto the reliable PUT-with-hex path;
+            * firmware **with** it (3.15 and later) → **48**.
 
-            If the firmware probe (``get_info()``) fails for any reason,
-            the threshold falls back to 48 silently — construction never
-            raises on probe failure.
+            Passing a value explicitly pins it and skips the probe entirely,
+            so construction issues no HTTP traffic. If the probe fails, the
+            capability set resolves conservatively (fix assumed absent, so
+            128) — construction never raises on probe failure.
         """
         if not isinstance(host, str) or not host:
             raise ValueError("host must be a non-empty string")
@@ -203,39 +205,51 @@ class Ultimate64Client:
         self.timeout = timeout
         self._base = f"http://{host}:{port}" if port != 80 else f"http://{host}"
 
+        self._capabilities: DeviceCapabilities | None = None
         if write_mem_query_threshold is not None:
+            # An explicit threshold pins the behaviour, so the probe is not
+            # needed at construction; ``capabilities`` stays lazy and this
+            # path issues no HTTP traffic at all.
             self.write_mem_query_threshold = int(write_mem_query_threshold)
         else:
-            self.write_mem_query_threshold = self._autodetect_write_mem_threshold()
+            self.write_mem_query_threshold = (
+                self.capabilities.write_mem_query_threshold
+            )
 
     def close(self) -> None:
         """No-op — the client is stateless (uses a fresh connection per call)."""
         return None
 
     #: Bounded timeout (seconds) for the construct-time firmware probe
-    #: used by :meth:`_autodetect_write_mem_threshold`. Decoupled from
+    #: used by :meth:`_probe_info`. Decoupled from
     #: the per-request ``timeout`` so an unreachable host doesn't stall
     #: ``__init__`` for the full default.
     _AUTODETECT_PROBE_TIMEOUT: float = 0.5
 
-    def _autodetect_write_mem_threshold(self) -> int:
+    @property
+    def capabilities(self) -> DeviceCapabilities:
+        """What this device's firmware can do — probed once, then cached.
+
+        A failed probe yields the conservative all-fixes-absent set rather
+        than raising; construction never fails on an unreachable device.
+        """
+        if self._capabilities is None:
+            self._capabilities = DeviceCapabilities.from_info(
+                self._probe_info()
+            )
+        return self._capabilities
+
+    def _probe_info(self) -> dict | None:
+        """``GET /v1/info`` under a short timeout; ``None`` on any failure."""
         original = self.timeout
         self.timeout = min(self._AUTODETECT_PROBE_TIMEOUT, original)
         try:
             info = self.get_info()
         except Exception:
-            return self.WRITE_MEM_QUERY_THRESHOLD
+            return None
         finally:
             self.timeout = original
-        if not isinstance(info, dict):
-            return self.WRITE_MEM_QUERY_THRESHOLD
-        fw = info.get("firmware_version")
-        if not isinstance(fw, str):
-            return self.WRITE_MEM_QUERY_THRESHOLD
-        normalised = fw.lstrip("Vv").lower()
-        if normalised.startswith("3.14"):
-            return 128
-        return self.WRITE_MEM_QUERY_THRESHOLD
+        return info if isinstance(info, dict) else None
 
     # ----------------------------------------------------------------- internal
     def _url(self, path: str) -> str:
@@ -566,8 +580,9 @@ class Ultimate64Client:
     #: Class-level fallback for the raw-byte threshold above which
     #: :meth:`write_mem` switches from the legacy ``PUT ?data=<hex>`` form
     #: to the ``POST`` raw-byte form. Per-instance ``write_mem_query_threshold``
-    #: (set in ``__init__``) takes precedence; this attribute is retained
-    #: for backwards compatibility with callers that poke the class.
+    #: (set in ``__init__`` from :attr:`capabilities`) takes precedence; this
+    #: attribute is retained for backwards compatibility with callers that
+    #: poke the class.
     WRITE_MEM_QUERY_THRESHOLD: int = 48
 
     def write_mem(self, address: int, data: bytes) -> None:
@@ -576,8 +591,9 @@ class Ultimate64Client:
         Uses one of two wire forms depending on payload size:
 
         * **Small payloads**
-          (``len(data) <= self.write_mem_query_threshold``, default 48
-          bytes; auto-bumped to 128 on firmware 3.14*) —
+          (``len(data) <= self.write_mem_query_threshold``; 48 on firmware
+          carrying the Temp-folder fix, 128 without it — see
+          :attr:`capabilities`) —
           ``PUT /v1/machine:writemem?address=0xNNNN&data=<hex>``.  Kept
           for backwards compatibility with existing callers/mocks.
         * **Large payloads** — ``POST /v1/machine:writemem?address=0xNNNN``
@@ -913,11 +929,21 @@ class Ultimate64Client:
         )
 
     def unmount_disk(self, drive: str) -> None:
-        """PUT /v1/drives/<drive>:unmount — unmount a drive (DESTRUCTIVE)."""
+        """PUT /v1/drives/<drive>:remove — unmount a drive (DESTRUCTIVE).
+
+        Alias for :meth:`drive_remove_disk`, kept for callers that reach for
+        the "unmount" name.
+
+        This used to target ``:unmount``, an endpoint no firmware has ever
+        registered — 3.15's ``software/api/route_drives.cc`` exposes mount /
+        reset / remove / on / off / unlink / load_rom / set_mode, and
+        ``remove`` is the unmount verb. It also percent-encoded a trailing
+        colon into the slot, which draws a 400 ("Invalid Drive 'a:'"). Both
+        are fixed here; the slot now takes the plain letter.
+        """
         if not isinstance(drive, str) or not drive:
             raise ValueError("drive must be a non-empty string")
-        slot = drive if drive.endswith(":") else drive + ":"
-        self._put_no_body(f"/v1/drives/{_encode(slot)}:unmount")
+        self.drive_remove_disk(drive.rstrip(":").lower())
 
     @staticmethod
     def _drive_slot_path(drive: str, action: str) -> str:

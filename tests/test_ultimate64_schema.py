@@ -16,7 +16,6 @@ from c64_test_harness.backends.ultimate64_schema import (
     REU_ENABLED_VALUES,
     REU_SIZE_VALUES,
     SID_ADDRESS_VALUES,
-    SID_TYPE_VALUES,
     TURBO_CONTROL_VALUES,
     SIDSocketConfig,
     cpu_speed_enum,
@@ -122,14 +121,33 @@ def test_sid_address_values_count() -> None:
 
 
 def test_sid_socket_config_validates() -> None:
-    cfg = SIDSocketConfig(sid_type="8580", address="$D400")
-    assert cfg.sid_type == "8580"
+    cfg = SIDSocketConfig(sid_type="Enabled", address="$D400")
+    assert cfg.sid_type == "Enabled"
     assert cfg.address == "$D400"
 
 
 def test_sid_socket_config_rejects_bad_type() -> None:
     with pytest.raises(ValueError):
         SIDSocketConfig(sid_type="9999", address="$D400")
+
+
+def test_sid_socket_config_rejects_a_chip_type() -> None:
+    """``sid_type`` is the socket enable state, not a chip selector.
+
+    It used to validate against a fabricated union of two different
+    firmware items, which let a caller build a config the device
+    answers 400 to.
+    """
+    with pytest.raises(ValueError):
+        SIDSocketConfig(sid_type="8580", address="$D400")
+
+
+def test_sid_type_values_is_gone() -> None:
+    """The fabricated union is removed; the real domains replace it."""
+    import c64_test_harness.backends.ultimate64_schema as schema
+
+    assert not hasattr(schema, "SID_TYPE_VALUES")
+    assert schema.SID_SOCKET_ENABLE_VALUES == ("Disabled", "Enabled")
 
 
 def test_sid_socket_config_rejects_bad_address() -> None:
