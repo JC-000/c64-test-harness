@@ -43,47 +43,79 @@ population is the six non-live VICE modules listed in
 set, which is how "survives the non-live suite" and "survives the live
 suite too" were separated.
 
-## Measured results (source at `6868168`)
+## Measured results
 
-Reproduce with `git archive 6868168 src` into a scratch tree and
-`generate.py --repo <that tree>`.
+Reproduce the baseline with `git archive 6868168 src tests` into a scratch
+tree and `generate.py --repo <that tree>`.
 
-**Whole population, against the six non-live modules:** 96 survivors of
-167. Three were docstring no-ops (all in `vice_elevation.py`), so **93
-real survivors**.
+**Whole population, baseline suite (src *and* tests at `6868168`), against
+the six non-live modules:**
 
-**The flag funnel**, whose population is exactly *the `flagname` and
-`flagpolarity` mutations in `vice_lifecycle.py`* — 74 of them:
-
-| stage | count |
+| verdict | count |
 |---|---|
-| population | 74 (72 applicable; 2 patterns not found) |
-| survived the non-live suite | 58 (14 killed) |
-| still alive after `test_vice_argv_contract.py` | 10 (48 killed) |
-| of those, out of scope | 2 (`-axo`, a `ps` flag, not VICE's) |
-| genuine residue: polarity flips | 8 |
-| still alive after the live readback modules | 1 (7 killed) |
-| still alive after `test_a_configured_sound_device_forces_sound_on` | **0** |
+| population | 167 |
+| not applied (pattern absent from source) | 5 |
+| not viable (broke collection) | 1 |
+| **viable** | **161** |
+| survived | 85 |
+| killed | 76 |
 
-The last residue was the `-sound` forced on by a configured `sounddev`:
-both `-sound` and `+sound` are valid VICE options, so a name-based guard
-passes either way and only a resource readback can tell them apart.
+**The flag funnel.** Population is exactly the `flagname` and
+`flagpolarity` mutations in `vice_lifecycle.py` — 74 of them, 2 of which
+never apply, so **72 viable**:
 
-An earlier write-up of this funnel said "68 ... killed 10". Both were
-wrong — the population is 74 and 14 were killed — though the 58 survivors
-and everything downstream of them were right. The numbers here are the
-ones the tooling reproduces.
+| stage | survivors |
+|---|---|
+| baseline suite at `6868168` | 48 (24 killed) |
+| today's non-live suite + `test_vice_argv_contract.py` | 9 (63 killed) |
+| of those, out of scope — `-axo` is a `ps` flag, not VICE's | 2 |
+| **genuine residue: polarity flips** | **7** |
+| after the live resource-readback modules | **0** (7 killed) |
+
+Both polarities of a flag are valid VICE options, so a name-based guard
+passes either way; only reading the resource back distinguishes them.
+The last residue was `-sound` forced on by a configured `sounddev`.
+
+### Two corrections to earlier published figures
+
+Both were found by re-running with the fixed scorer, and both go the same
+direction — **the argv contract's contribution was overstated**.
+
+1. **The baseline was taken after my own change.** An earlier write-up
+   gave the funnel as 58 survivors falling to 10. That 58 was measured
+   against a tree from which five argv tests had *already been deleted*.
+   Ten mutations flip verdict between the two baselines, and they are
+   exactly the flags those five tests covered. Removing tests and then
+   crediting a new guard with killing the resulting survivors is not a
+   measurement of the guard. The correct baseline is **48**.
+2. **One mutant was scored as a survivor when it had broken collection**
+   (`vice_binary.py:128:int`) — see the scorer note below.
+
+An earlier write-up also gave the population as 68 with 10 killed; it is
+74 and 24.
 
 ## Known limits — read before quoting a number
 
 These are real and they bound what the results can support.
 
-- **First-occurrence replacement.** `run.py` replaces the first textual
-  occurrence of `old`, not the occurrence at the recorded line. For
-  `flagname`/`flagpolarity`/`cmp` the text is distinctive enough that
-  this is almost always the intended site; for **`int` it is not**, since
-  `= 4` occurs everywhere. **Treat `int`-category results as having
-  unreliable line attribution.**
+- **First-occurrence replacement, measured.** `run.py` replaces the first
+  textual occurrence of `old`, not the occurrence at the recorded line.
+  **32 of the 167 mutations have an `old` that appears more than once** —
+  13 `cmp`, 11 `int`, 3 `flagname`, 3 `flagpolarity`, 2 `resname`. The
+  worst offenders are comparisons (`self._sock is not None` at 5 sites,
+  `port_lock is not None` and `off >= len(data)` at 6) and bare integers
+  (`= 0` at 53 sites).
+
+  **The bias is towards survival**, which is the direction that inflates
+  how much any new guard appears to add: the unmutated sites keep
+  behaving correctly, so the defect is only half applied and the mutant
+  is more likely to live.
+
+  This corrects an earlier claim in this file that `cmp` was reliable
+  because its text is distinctive. It is not — `cmp` is the *largest*
+  affected category. Only single-site literals are safe, and the tool
+  does not currently tell you which those are.
+
 - **Docstring hits.** A literal whose first occurrence is inside a
   docstring produces a no-op mutation that reports as a survivor. Three
   of 96 survivors were this; all three were in `vice_elevation.py`. Check
@@ -93,6 +125,26 @@ These are real and they bound what the results can support.
   implied by a surrounding loop, dead code. The runner cannot tell these
   apart from coverage holes; that judgement is manual and belongs in the
   write-up.
+- **Scoring is exit-code-authoritative, and must be.** An earlier version
+  scored purely by scanning for `FAILED`/`ERROR` lines. A mutation that
+  breaks the parse produces neither: pytest reports
+  `ImportError while loading conftest ...` and exits **4**, so the mutant
+  scored as a *survivor*. Measured — a seeded syntax error and a seeded
+  bad import both scored SURVIVED under the old scorer. Text-parsing
+  scorers are exposed to this; exit-code scorers are safe by
+  construction. (Exit codes vary by failure mode: a broken conftest gives
+  4 here, while a collection error inside a test module gives 1. Both are
+  non-zero, which is why keying off the code rather than the text is what
+  matters.)
+
+- **No in-place restore guard is needed, by construction.** Each mutation
+  is applied to a fresh `copytree` of `src` and `tests` in a temp dir;
+  the real working tree is never written to, so there is no restore step
+  that a signal could interrupt and leave a mutant behind. Do not "fix"
+  this by adding one — sandboxing is the stronger property. (Another
+  harness on this project did lose a `finally` to SIGTERM and left a
+  truncated flag in its tree.)
+
 - **`PYTHONPATH` provenance.** The runner sets `PYTHONPATH` to the box's
   `src`, but an installed copy of the package can still win and make a
   mutation look ineffective (or a clean run look broken). If a result

@@ -85,6 +85,38 @@ def _wait_for_text_binary(transport, needle, timeout=15.0, poll_interval=1.0):
         _LAST_POLL_TRACE[:] = trace
 
 
+def _emulator_is_stalled(transport, samples: int = 4) -> tuple[bool, list[str]]:
+    """Whether VICE has stopped emulating, and the raster positions seen.
+
+    ``LIN``/``CYC`` are the raster position.  They advance whenever the
+    *machine* is emulating, whether or not the 6510 is executing any
+    instruction, so they discriminate a stalled emulator from every other
+    failure — and unlike a PC sample they cannot coincide by accident,
+    because the raster never sits still on a running machine.
+
+    This is upstream bug 6 (docs/vice_upstream_bugs.md): under host load
+    VICE stops emulating while its monitor thread stays healthy, answers
+    every command, and acknowledges every resume.  A test that waits on
+    the machine running will otherwise spend its whole timeout and then
+    report something misleading about screen text.
+    """
+    seen: list[str] = []
+    positions: set[tuple[int, int]] = set()
+    for _ in range(samples):
+        try:
+            r = transport.read_registers()
+        except Exception:
+            break
+        pos = (r.get("LIN", -1), r.get("CYC", -1))
+        positions.add(pos)
+        seen.append(f"LIN={pos[0]} CYC={pos[1]}")
+        if len(positions) > 1:
+            return False, seen
+        transport.resume()
+        time.sleep(0.1)
+    return len(positions) == 1, seen
+
+
 def _stub_was_executed(transport, samples: int = 4) -> tuple[bool, list[int]]:
     """Whether the CPU left ``_restore_basic``'s stub, and the PCs seen.
 
@@ -110,8 +142,14 @@ def _stub_was_executed(transport, samples: int = 4) -> tuple[bool, list[int]]:
     return False, seen
 
 
-def _keyboard_failure_report(transport, needle: str) -> str:
-    """Why a keyboard test failed, rather than just that it did.
+def _machine_failure_report(transport, needle: str) -> str:
+    """Why a test waiting on the machine failed, rather than just that it did.
+
+    Used by every site that waits for the C64 to actually run — the
+    keyboard tests and ``TestScreen``'s print-and-wait alike. That is not
+    incidental: the stall reported as upstream bug 6 has now been
+    observed in both, which is itself evidence that the fault is the
+    emulator rather than anything about keyboard injection.
 
     These three tests fail together, intermittently, and only in
     full-suite runs -- never in 60 isolated runs, nor in 30 under heavy
@@ -125,6 +163,21 @@ def _keyboard_failure_report(transport, needle: str) -> str:
     moved.
     """
     lines = [f"expected {needle!r} on screen"]
+
+    # First, because it subsumes every other diagnosis below: if VICE has
+    # stopped emulating, the PC, the screen and the checkpoints are all
+    # just the last state the machine was left in.
+    try:
+        stalled, raster = _emulator_is_stalled(transport)
+        lines.append(
+            f"raster across resumes: {raster}"
+            + ("  <- FROZEN: VICE has stopped emulating entirely "
+               "(upstream bug 6). Everything below is the state it was "
+               "left in, not a clue about this test." if stalled else
+               "  (advancing: the emulator is running)")
+        )
+    except Exception as e:
+        lines.append(f"could not sample the raster: {type(e).__name__}: {e}")
     if _LAST_POLL_TRACE:
         distinct = len(set(_LAST_POLL_TRACE))
         lines.append(
@@ -366,7 +419,9 @@ class TestScreen:
         # Resume so BASIC processes the keystrokes
         binary_transport.resume()
         grid = _wait_for_text_binary(binary_transport, "HELLO VICE", timeout=15)
-        assert grid is not None, "HELLO VICE not found on screen"
+        assert grid is not None, _machine_failure_report(
+            binary_transport, "HELLO VICE"
+        )
 
     def test_wait_for_stable_on_idle(self, binary_transport) -> None:
         """Screen grid reads READY. on idle C64."""
@@ -426,11 +481,11 @@ class TestKeyboard:
             f"{[hex(p) for p in pcs]} ($CF00 is CLI; JMP $E5CD, which "
             f"executes once and never returns). Any READY. on screen is "
             f"left over from the previous test.\n"
-            + _keyboard_failure_report(binary_transport, "a running CPU")
+            + _machine_failure_report(binary_transport, "a running CPU")
         )
 
         grid = ScreenGrid.from_transport(binary_transport)
-        assert grid.has_text("READY."), _keyboard_failure_report(
+        assert grid.has_text("READY."), _machine_failure_report(
             binary_transport, "READY."
         )
 
@@ -439,7 +494,7 @@ class TestKeyboard:
         send_text(binary_transport, "PRINT 2+3\r")
         binary_transport.resume()
         grid = _wait_for_text_binary(binary_transport, "5", timeout=15)
-        assert grid is not None, _keyboard_failure_report(binary_transport, "5")
+        assert grid is not None, _machine_failure_report(binary_transport, "5")
 
     def test_send_key_single_chars(self, binary_transport) -> None:
         """Individual send_key calls form a BASIC command."""
@@ -447,7 +502,7 @@ class TestKeyboard:
             send_key(binary_transport, ch)
         binary_transport.resume()
         grid = _wait_for_text_binary(binary_transport, "7", timeout=15)
-        assert grid is not None, _keyboard_failure_report(binary_transport, "7")
+        assert grid is not None, _machine_failure_report(binary_transport, "7")
 
     def test_send_text_long_batching(self, binary_transport) -> None:
         """36-char PRINT command (4 batches of 10 keys)."""
@@ -456,7 +511,7 @@ class TestKeyboard:
         binary_transport.resume()
         grid = _wait_for_text_binary(binary_transport, "ABCDEFGHIJKLMNOPQRST",
                                      timeout=15)
-        assert grid is not None, _keyboard_failure_report(
+        assert grid is not None, _machine_failure_report(
             binary_transport, "ABCDEFGHIJKLMNOPQRST"
         )
 

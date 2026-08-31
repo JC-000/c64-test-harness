@@ -253,6 +253,79 @@ from.
 
 ---
 
+## 6. Emulation stops while the binary monitor stays responsive
+
+**The one bug in this file whose trigger we have not identified.** It is
+recorded because it was characterised precisely and because the next
+person to hit it will otherwise spend a day on it, as two investigations
+here already did.
+
+Under host load, a running VICE stops emulating. Its binary monitor
+thread stays completely healthy: it answers `read_registers`,
+`read_memory`, `CHECKPOINT_LIST` and `resource_get`, and it acknowledges
+every `EXIT`. The machine simply never runs again.
+
+**Measured**, at a reproduced stall:
+
+```
+registers : PC=0xcf00 ... '00': 47, '01': 55   (banking normal)
+memory at $CF00 : 584ccde5                     (a valid CLI; JMP $E5CD)
+checkpoints     : []                           (via CHECKPOINT_LIST)
+raster across 5 resumes, 0.2s apart:
+    LIN=12 CYC=2   LIN=12 CYC=2   LIN=12 CYC=2   LIN=12 CYC=2   LIN=12 CYC=2
+still pinned after 40 further resumes
+event queue: 1328 entries over 442 resume generations
+    0x31 REGISTER_INFO x443
+    0x62 STOPPED       x443
+    0x63 RESUMED       x442
+    0x61 JAM           x0
+JAMAction resource: 1 (continue)
+```
+
+`LIN`/`CYC` are the raster position. They advance whenever the *machine*
+is emulating, whether or not the 6510 is executing, so a frozen raster
+means nothing is being emulated at all — this is not the monitor holding
+the CPU.
+
+**And VICE reports that it resumed.** 442 resumes produced 442 `RESUMED`
+events, including the ones issued while the raster sat frozen. VICE
+acknowledges the `EXIT`, emits the state-transition event, and does not
+perform the transition.
+
+**What it is not** — each ruled out by measurement, not by argument:
+
+| hypothesis | eliminated by |
+|---|---|
+| a slow screen / marginal timeout | the text is normally found in 0–1s against a 15s limit |
+| a checkpoint leaked by an interrupted `jsr()` pinning the CPU | `CHECKPOINT_LIST` reports zero |
+| a lost resume, or monitor nesting needing more exits | 40 acknowledged resumes, no movement |
+| the 6510 jammed on an illegal opcode | `$CF00` holds `584ccde5`, a valid CLI; and **no `0x61` JAM event** in 1328 queued events; and `JAMAction=1` (continue) would have kept the raster advancing anyway |
+
+**Trigger: unidentified.** It is load-correlated — it does not reproduce
+on an idle bench, and this bench routinely runs several `x64sc`
+processes from unrelated projects at once. A plausible but **untested**
+hypothesis is that VICE's emulation thread can starve under host CPU
+contention while its network thread keeps servicing. That is a guess and
+is recorded as one.
+
+**Reproduction cost:** roughly 8 seconds per attempt. Loop
+`pytest tests/test_vice_core.py -k Keyboard` while the machine is loaded;
+it stalls within a few dozen attempts. A standalone probe that stalls it
+and interrogates the halted machine reproduced it by cycle ~80 in about
+half of its runs.
+
+**Harness mitigation: detection, not recovery.** We cannot fix VICE. The
+raster check is the discriminating signal — it distinguishes a stalled
+emulator from every other failure and, unlike a PC sample, cannot
+coincide by accident. `tests/test_vice_core.py` reports it, so a stall
+says so instead of timing out on a screen assertion.
+
+Deliberately **not** auto-restarted. A harness that silently rebuilds a
+stalled emulator converts a reproducible upstream bug into an invisible
+one.
+
+---
+
 ## Reproducer for bugs 3 and 4
 
 Self-contained; takes about 40 seconds. Pass the `x64sc` to test.
@@ -356,6 +429,16 @@ Any `DISPLAY_GET` over the binary monitor; compare the declared
   one: the BPF-attach probe measured its own permission failure), the
   elevation gate, and the macOS test-author traps.
 - `docs/vice_build_provenance.md` — how the two builds here were produced.
+
+An unreproduced observation from the binary-monitor mapping is worth
+re-reading against bug 6: after a client dropped its socket *while a
+checkpoint had halted the monitor*, VICE kept `LISTEN`ing but never
+served a fresh connect. It was guessed at the time to be
+checkpoint-plus-halt. Bug 6 establishes that a different state exists and
+is reachable — **emulation stopped while the monitor thread stays alive
+and responsive** — which fits that observation without needing a
+checkpoint to be involved at all. Neither has been tied to the other; the
+point is only that the state is no longer hypothetical.
 
 VICE's own case-sensitivity split is worth knowing but is **not** a bug —
 it is documented behaviour that reads as one. Resource-table lookup is

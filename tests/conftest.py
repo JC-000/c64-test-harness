@@ -424,6 +424,22 @@ def bridge_vice_pair():
 #   someone adds next year, a ``-k`` that accidentally deselects the lot.
 #   No future module can quietly opt out of it, because nothing has to
 #   be remembered at the call site.
+#
+# **How much rides on it, measured.**  The argv contract needs
+# ``x64sc -help`` and is therefore live.  Mutation testing puts a number
+# on what that means: **41 flag mutations across 23 flag families**
+# survive the entire non-live suite and are killed only once the contract
+# runs -- ``-binarymonitor``, ``-remotemonitor*``, ``-sound*``,
+# ``-ethernetio*``, ``-addconfig``, ``-drive8type``, ``-default``,
+# ``-warp``, ``-ntsc``/``-pal``, ``+saveres``, ``-jamaction``,
+# ``-speed``, ``-limitcycles`` and more.
+#
+# So on a machine with no emulator those families are validated by
+# nothing at all, and this gate is the only thing standing between the
+# project and their silent unvalidation.  That also reframes the
+# ``--ignore`` escape closed below: it was not a tidy edge case but a way
+# to switch off the sole guard for twenty-three flag families and still
+# exit green.
 
 #: Env var by which an operator declares an emulator must be present.
 REQUIRE_VICE_ENV = "C64_REQUIRE_VICE"
