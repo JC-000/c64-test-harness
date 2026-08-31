@@ -895,3 +895,60 @@ class TestStatusRegisterAliases:
         """The documented fallback, pinned so it stays deliberate."""
         reg_map = {"ZZ": (0x10, 8)}
         assert self._parse(reg_map, {"ZZ": 0x37})["sr"] == 0
+
+
+class TestFieldsTheWireTestsCannotSeparate:
+    """Coincidences that make a structural property untestable by value.
+
+    Three times now a test has named a *structural* property -- which
+    field comes first, which register holds the status byte -- while its
+    oracle was a *value* comparison that happens to be decisive today:
+
+    * ``sr`` resolved through FL/FLAGS/SR, and VICE only ever exposes FL;
+    * the wire anchor sees a ``response_type``/``error_code`` swap only
+      because RESOURCE_GET replies 0x51 with error 0x00;
+    * and ``STX`` and ``API_VERSION`` are **both 0x02**, so transposing
+      them is byte-identical on the wire.
+
+    The rule, for the next person writing a frame test: if two fields you
+    are distinguishing can hold the same value, your test is measuring
+    the values, not the structure, and it will go quiet the day they
+    coincide. Where a black-box test cannot exist, say so out loud --
+    a guard that declares "I cannot see this" is worth more than one that
+    silently cannot.
+    """
+
+    def test_stx_and_api_version_still_coincide(self):
+        """Tripwire, not an invariant: assert the blind spot still exists.
+
+        ``STX`` (VICE's ``ASC_STX``) and ``API_VERSION``
+        (``MON_BINARY_API_VERSION``) are both 0x02
+        (S ``monitor_binary.c:288,290``), so a harness with those two
+        request fields transposed emits byte-identical frames and every
+        test passes -- measured: 125 mocked tests and the live wire
+        anchor, zero failures, with the transposition applied to the
+        parser, the request builder and the mock together.
+
+        No black-box test can find it while they coincide: VICE
+        ``continue``s past both a bad STX and an out-of-range api_version
+        *without replying* (S ``monitor_binary.c:1913``), so the only
+        signal is silence, and there is nothing to send that differs.
+
+        It matters because the protocol carries a version field precisely
+        so it can change. The day VICE ships 0x03 and this constant is
+        updated, a transposed harness sends ``03 02``; VICE reads byte 0,
+        sees it is not ASC_STX, discards the frame, then resyncs on the
+        0x02 and parses the length as the api_version. Every request
+        breaks at once.
+
+        So this fails on that version bump, deliberately. When it does:
+        the field order is now observable -- write the test that checks
+        it, and delete this one.
+        """
+        assert STX == API_VERSION, (
+            f"STX ({STX:#04x}) and API_VERSION ({API_VERSION:#04x}) now "
+            f"differ. That is not a regression — it means the request "
+            f"field order is finally observable on the wire. Add a test "
+            f"that transposes them and watches VICE reject the frame, "
+            f"then remove this tripwire."
+        )

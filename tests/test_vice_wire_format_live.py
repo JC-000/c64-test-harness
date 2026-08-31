@@ -41,6 +41,31 @@ them exactly.
 Raw sockets on purpose: going through ``BinaryViceTransport`` would
 validate the format against the same code that defines it, which is the
 circularity this module exists to break.
+
+**What this module cannot see.** It distinguishes fields by comparing
+their *values*, so any two fields that happen to hold the same value are
+indistinguishable to it:
+
+* ``STX`` and ``API_VERSION`` are **both 0x02**, so transposing those two
+  request fields is byte-identical on the wire. Measured: 125 mocked
+  tests and all three tests here pass with the transposition applied to
+  the parser, the request builder and the mock together. No black-box
+  test can find it while they coincide — VICE ``continue``s past both a
+  bad STX and an out-of-range api_version *without replying*
+  (S ``monitor_binary.c:1913``), so the only signal is silence. It is
+  declared instead, as a tripwire:
+  ``test_vice_binary_unit.py::TestFieldsTheWireTestsCannotSeparate``.
+* ``response_type`` and ``error_code`` are separable only while they
+  differ for the command being captured. RESOURCE_GET gives 0x51 against
+  0x00, and :func:`test_the_mock_builder_reproduces_a_real_frame_exactly`
+  now asserts that rather than relying on it.
+
+The general rule, since this is the third instance: a test naming a
+*structural* property — field order, identity, which register holds
+what — whose oracle is a *value* comparison will go quiet the day those
+values coincide. Where no black-box test can exist, say so out loud. A
+guard that declares "I cannot see this" is worth more than one that
+silently cannot.
 """
 from __future__ import annotations
 
