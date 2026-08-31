@@ -151,6 +151,23 @@ def _keyboard_failure_report(transport, needle: str) -> str:
         lines.append(f"registers: {second}")
     except Exception as e:  # diagnostics must never mask the real failure
         lines.append(f"could not read registers: {type(e).__name__}: {e}")
+    # A leaked execution checkpoint pins the CPU at its address — every
+    # resume re-triggers it and stops before executing — which is
+    # indistinguishable from a hung emulator without asking.  For the
+    # TestKeyboard wedge this reported zero, which is how that diagnosis
+    # was ruled out rather than argued about.
+    try:
+        cps = transport.checkpoint_list()
+        lines.append(
+            f"checkpoints VICE holds: {len(cps)}"
+            + ("" if not cps else
+               " -> " + ", ".join(
+                   f"#{c['number']} at ${c['start']:04x}"
+                   f"{' (enabled)' if c['enabled'] else ' (disabled)'}"
+                   for c in cps))
+        )
+    except Exception as e:
+        lines.append(f"could not list checkpoints: {type(e).__name__}: {e}")
     try:
         lines.append(dump_screen(transport, label="screen at failure"))
     except Exception as e:
@@ -377,6 +394,15 @@ class TestKeyboard:
         # That is exactly the shape of the intermittent failure these
         # tests show — the fixture passes, then the three tests that need
         # execution fail while the one that only reads the screen passes.
+        #
+        # This was recorded as an *analytic* argument when the check was
+        # written, because every wedge seeded by hand also stopped BASIC
+        # from drawing READY. in the first place, so the old assertion
+        # failed for the wrong reason and its vacuity could not be shown.
+        # The real failure then produced the state that could not be
+        # constructed: caught in a full-suite run, the screen genuinely
+        # still carried READY. from the previous test while the 6510 sat
+        # pinned at $CF00. Measured, not argued.
         ran, pcs = _stub_was_executed(binary_transport)
         assert ran, (
             "the 6510 never left _restore_basic's stub — PC stayed at "

@@ -393,3 +393,59 @@ class TestStatusRegisterNameAnchor:
             "no record carried any named register, so this cannot show the "
             "alias chain resolving"
         )
+
+
+class TestCheckpointList:
+    """Enumerating checkpoints, which the client could not do before.
+
+    The harness could set and delete checkpoints but never list them, so
+    a checkpoint leaked by an interrupted ``jsr()`` — whose ``finally``
+    never ran — was invisible from the client side. A leaked execution
+    checkpoint pins the CPU at its address: every resume re-triggers it
+    and stops before executing, which is indistinguishable from a hung
+    emulator without this.
+    """
+
+    def test_a_set_checkpoint_appears_and_a_deleted_one_does_not(
+        self, binary_transport
+    ) -> None:
+        before = binary_transport.checkpoint_list()
+        num = binary_transport.set_checkpoint(0xC002)
+        try:
+            listed = binary_transport.checkpoint_list()
+            assert len(listed) == len(before) + 1, (
+                f"setting one checkpoint changed the list by "
+                f"{len(listed) - len(before)}"
+            )
+            mine = [c for c in listed if c["number"] == num]
+            assert mine, f"checkpoint {num} was set but is not listed"
+            assert mine[0]["start"] == 0xC002
+            assert mine[0]["enabled"] is True
+        finally:
+            binary_transport.delete_checkpoint(num)
+
+        after = binary_transport.checkpoint_list()
+        assert [c["number"] for c in after] == [c["number"] for c in before], (
+            "the deleted checkpoint is still listed — a delete that VICE "
+            "did not honour would leak a CPU-pinning checkpoint"
+        )
+
+    def test_the_declared_count_and_the_frames_agree(
+        self, binary_transport
+    ) -> None:
+        """The trailing 0x14 frame carries a count; cross-check it.
+
+        VICE answers this command with one CHECKPOINT_INFO per checkpoint
+        and *then* a count. Parsing only the count, or only the frames,
+        would hide a desynchronised reply — the issue-#88 shape.
+        """
+        nums = [binary_transport.set_checkpoint(a) for a in (0xC010, 0xC020)]
+        try:
+            listed = binary_transport.checkpoint_list()
+            starts = {c["start"] for c in listed}
+            assert {0xC010, 0xC020} <= starts, (
+                f"expected both checkpoints in {sorted(hex(s) for s in starts)}"
+            )
+        finally:
+            for n in nums:
+                binary_transport.delete_checkpoint(n)

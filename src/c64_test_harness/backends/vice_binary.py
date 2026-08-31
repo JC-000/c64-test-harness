@@ -43,6 +43,7 @@ CMD_MEM_GET = 0x01
 CMD_MEM_SET = 0x02
 CMD_CHECKPOINT_SET = 0x12
 CMD_CHECKPOINT_DEL = 0x13
+CMD_CHECKPOINT_LIST = 0x14
 CMD_CONDITION_SET = 0x22
 CMD_REGISTERS_GET = 0x31
 CMD_REGISTERS_SET = 0x32
@@ -81,6 +82,7 @@ CMD_TO_RESPONSE_TYPE: dict[int, int] = {
     CMD_MEM_SET: 0x02,
     CMD_CHECKPOINT_SET: 0x11,
     CMD_CHECKPOINT_DEL: 0x13,
+    CMD_CHECKPOINT_LIST: 0x14,
     CMD_CONDITION_SET: 0x22,
     CMD_REGISTERS_GET: 0x31,
     CMD_REGISTERS_SET: 0x31,
@@ -798,6 +800,82 @@ class BinaryViceTransport:
             raise TransportError("Checkpoint Set response too short")
         checkpoint_num = struct.unpack_from("<I", resp.body, 0)[0]
         return checkpoint_num
+
+    def checkpoint_list(self) -> list[dict]:
+        """Every checkpoint VICE currently holds.
+
+        The harness could set and delete checkpoints but never enumerate
+        them, so a checkpoint leaked by an interrupted :func:`jsr` — whose
+        ``finally`` never ran — was undetectable from the client side.  A
+        leaked execution checkpoint pins the CPU at its address: every
+        resume re-triggers it and stops before executing, which looks
+        exactly like a hung emulator and is why this was worth adding
+        even though the first thing it did was *rule out* that diagnosis
+        for the TestKeyboard wedge (it reported zero).
+
+        Cannot use :meth:`_send_and_recv`: VICE answers this one with a
+        ``CHECKPOINT_INFO`` (0x11) frame *per checkpoint*, all carrying
+        this request's id, and only then the 0x14 frame holding the
+        count.  A single-response helper would take the first 0x11, see a
+        response type it was not expecting, and raise.
+
+        Returns a list of dicts with ``number``, ``start``, ``end``,
+        ``enabled``, ``stop_when_hit``, ``temporary``, ``hit_count`` and
+        ``cpu_operation``.
+        """
+        found: list[dict] = []
+        with self._lock:
+            req_id = self._send_command(CMD_CHECKPOINT_LIST, b"")
+            while True:
+                resp = self._recv_response()
+                if resp.request_id != req_id:
+                    self._event_queue.append((self._resume_generation, resp))
+                    continue
+                if resp.error_code != 0x00:
+                    raise TransportError(
+                        f"VICE binary monitor error {resp.error_code:#x} "
+                        f"listing checkpoints (body={resp.body.hex()})"
+                    )
+                if resp.response_type == CMD_CHECKPOINT_LIST:
+                    # The trailing frame: a count we can cross-check.
+                    declared = (
+                        struct.unpack_from("<I", resp.body, 0)[0]
+                        if len(resp.body) >= 4
+                        else len(found)
+                    )
+                    if declared != len(found):
+                        raise TransportError(
+                            f"VICE declared {declared} checkpoints but sent "
+                            f"{len(found)} CHECKPOINT_INFO frames"
+                        )
+                    return found
+                if resp.response_type != RESPONSE_CHECKPOINT_INFO:
+                    raise TransportError(
+                        f"unexpected response type {resp.response_type:#x} "
+                        f"while listing checkpoints"
+                    )
+                found.append(self._parse_checkpoint_info(resp.body))
+
+    @staticmethod
+    def _parse_checkpoint_info(body: bytes) -> dict:
+        """Decode a CHECKPOINT_INFO body (leading fixed-size fields)."""
+        if len(body) < 18:
+            raise TransportError(
+                f"Checkpoint Info response too short ({len(body)} bytes)"
+            )
+        (number, hit, start, end, stop_when_hit, enabled, cpu_op,
+         temporary, hit_count) = struct.unpack_from("<IBHHBBBBI", body, 0)
+        return {
+            "number": number,
+            "currently_hit": bool(hit),
+            "start": start,
+            "end": end,
+            "stop_when_hit": bool(stop_when_hit),
+            "enabled": bool(enabled),
+            "cpu_operation": cpu_op,
+            "temporary": bool(temporary),
+            "hit_count": hit_count,
+        }
 
     def delete_checkpoint(self, checkpoint_num: int) -> None:
         """Delete a checkpoint by its number."""
