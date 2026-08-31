@@ -58,6 +58,41 @@ def _wait_for_text_binary(transport, needle, timeout=15.0, poll_interval=1.0):
     return None
 
 
+def _keyboard_failure_report(transport, needle: str) -> str:
+    """Why a keyboard test failed, rather than just that it did.
+
+    These three tests fail together, intermittently, and only in
+    full-suite runs -- never in 60 isolated runs, nor in 30 under heavy
+    concurrent VICE load.  "'5' not found on screen" is all the evidence
+    a failure has ever produced, which is why the cause is still open.
+
+    The distinguishing question is whether the 6510 is *executing*.  The
+    fourth test in this class asserts no screen content and has never
+    failed, which points at a stopped CPU rather than a slow screen
+    update -- so sample the PC twice across a resume and say whether it
+    moved.
+    """
+    lines = [f"expected {needle!r} on screen"]
+    try:
+        first = transport.read_registers()
+        transport.resume()
+        time.sleep(0.3)
+        second = transport.read_registers()
+        moved = first.get("PC") != second.get("PC")
+        lines.append(
+            f"PC {first.get('PC', 0):#06x} -> {second.get('PC', 0):#06x} "
+            f"({'advancing' if moved else 'STUCK — the CPU is not running'})"
+        )
+        lines.append(f"registers: {second}")
+    except Exception as e:  # diagnostics must never mask the real failure
+        lines.append(f"could not read registers: {type(e).__name__}: {e}")
+    try:
+        lines.append(dump_screen(transport, label="screen at failure"))
+    except Exception as e:
+        lines.append(f"could not dump screen: {type(e).__name__}: {e}")
+    return "\n".join(lines)
+
+
 def _restore_basic(transport):
     """Return CPU to the BASIC idle loop.
 
@@ -268,14 +303,16 @@ class TestKeyboard:
         _restore_basic(binary_transport)
         # Verify BASIC is ready
         grid = ScreenGrid.from_transport(binary_transport)
-        assert grid.has_text("READY."), "BASIC not ready after restore"
+        assert grid.has_text("READY."), _keyboard_failure_report(
+            binary_transport, "READY."
+        )
 
     def test_send_text_basic_command(self, binary_transport) -> None:
         """send_text PRINT 2+3, verify '5' appears on screen."""
         send_text(binary_transport, "PRINT 2+3\r")
         binary_transport.resume()
         grid = _wait_for_text_binary(binary_transport, "5", timeout=15)
-        assert grid is not None, "'5' not found on screen after PRINT 2+3"
+        assert grid is not None, _keyboard_failure_report(binary_transport, "5")
 
     def test_send_key_single_chars(self, binary_transport) -> None:
         """Individual send_key calls form a BASIC command."""
@@ -283,7 +320,7 @@ class TestKeyboard:
             send_key(binary_transport, ch)
         binary_transport.resume()
         grid = _wait_for_text_binary(binary_transport, "7", timeout=15)
-        assert grid is not None
+        assert grid is not None, _keyboard_failure_report(binary_transport, "7")
 
     def test_send_text_long_batching(self, binary_transport) -> None:
         """36-char PRINT command (4 batches of 10 keys)."""
@@ -292,7 +329,9 @@ class TestKeyboard:
         binary_transport.resume()
         grid = _wait_for_text_binary(binary_transport, "ABCDEFGHIJKLMNOPQRST",
                                      timeout=15)
-        assert grid is not None, "Long string not found on screen"
+        assert grid is not None, _keyboard_failure_report(
+            binary_transport, "ABCDEFGHIJKLMNOPQRST"
+        )
 
     def test_send_text_return_key(self, binary_transport) -> None:
         """send_text with just CR should not crash."""
