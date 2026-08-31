@@ -838,3 +838,60 @@ class TestRedundantGuards:
             assert t.read_memory(0x1000, 0) == b""
             assert t.read_memory(0x1000, -5) == b""
         send.assert_not_called()
+
+
+class TestStatusRegisterAliases:
+    """``sr`` is resolved through a three-name chain: FL, then FLAGS, then SR.
+
+    Nothing pinned any of the three.  A mutation run renamed ``"FLAGS"``
+    to ``"FLAGSX"`` and the whole suite stayed green, live modules
+    included -- the alias silently stopped matching and ``sr`` fell
+    through to the next name, or to 0.
+
+    The chain is also an *assumption about VICE's naming*, not a fact
+    derived from it, which is the same shape of defect as the flag names.
+    ``test_vice_binary.py`` anchors it to a real emulator; these pin the
+    resolution order so a reordering cannot pass unnoticed.
+    """
+
+    @staticmethod
+    def _entry(reg_map: dict, values: dict) -> bytes:
+        """A CPU-history entry carrying *values* keyed by register name."""
+        ids = {name: rid for name, (rid, _) in reg_map.items()}
+        body = b"".join(
+            bytes([2, ids[name], val]) for name, val in values.items()
+        )
+        return (
+            struct.pack("<H", len(values)) + body
+            + struct.pack("<Q", 0) + bytes([0])
+        )
+
+    def _parse(self, reg_map, values):
+        t = _make_transport()
+        t._reg_map = reg_map
+        return t._parse_cpu_history_entry(self._entry(reg_map, values))
+
+    def test_each_alias_resolves_on_its_own(self):
+        for name in ("FL", "FLAGS", "SR"):
+            reg_map = {name: (0x10, 8)}
+            result = self._parse(reg_map, {name: 0x37})
+            assert result is not None and result["sr"] == 0x37, (
+                f"alias {name!r} did not resolve to sr"
+            )
+
+    def test_fl_wins_over_flags_and_flags_wins_over_sr(self):
+        """Precedence is load-bearing: a VICE exposing more than one of
+        these must not have ``sr`` depend on dict ordering."""
+        reg_map = {"FL": (0x10, 8), "FLAGS": (0x11, 8), "SR": (0x12, 8)}
+        both = self._parse(reg_map, {"FL": 0x01, "FLAGS": 0x02, "SR": 0x03})
+        assert both["sr"] == 0x01, "FL must win"
+
+        no_fl = self._parse(
+            {"FLAGS": (0x11, 8), "SR": (0x12, 8)}, {"FLAGS": 0x02, "SR": 0x03}
+        )
+        assert no_fl["sr"] == 0x02, "FLAGS must win over SR"
+
+    def test_sr_is_zero_when_no_alias_matches(self):
+        """The documented fallback, pinned so it stays deliberate."""
+        reg_map = {"ZZ": (0x10, 8)}
+        assert self._parse(reg_map, {"ZZ": 0x37})["sr"] == 0

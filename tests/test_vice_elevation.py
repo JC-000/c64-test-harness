@@ -699,3 +699,90 @@ def test_elevation_error_names_the_symlink_not_its_target(tmp_path, monkeypatch)
     assert err.binary == str(link)
     assert "cellar-x64sc" not in err.sudoers_entry
     assert "cellar-x64sc" not in err.command
+
+
+# --------------------------------------------- -features row parsing
+
+
+class TestFeaturesRowParsing:
+    """``len(parts) >= 2`` is the guard that reads a feature row.
+
+    Every fixture in this module mirrors VICE 3.10's four-column layout
+    (``NAME  yes  Description...``), so the boundary the guard actually
+    defends -- a row with exactly two tokens -- is never exercised.  A
+    mutation run confirmed it: changing ``>= 2`` to ``> 2`` left all 56
+    tests here green, because six-token rows satisfy both.
+    """
+
+    def test_a_bare_two_token_row_is_still_a_feature_row(
+        self, tmp_path, monkeypatch
+    ):
+        """``NAME value`` with no description must parse.
+
+        This is the whole point of ``>= 2``.  Nothing guarantees VICE
+        keeps the description column, and a build that dropped it would
+        silently demote every probe to the image-scan fallback --
+        reporting ``drivers_known=False`` and refusing drivers the binary
+        actually has.
+        """
+        exe = _fake_x64sc(tmp_path, "x64sc", ethernet=False)  # scan says no
+        _fake_features(monkeypatch, "HAVE_RAWNET yes\nHAVE_PCAP yes\n")
+        feat = ve.vice_features(exe)
+        assert feat.source == "-features", (
+            "a two-token row was not recognised, so the probe fell back to "
+            "the image scan"
+        )
+        assert feat.rawnet is True and feat.pcap is True
+
+    def test_a_single_token_row_is_ignored_not_fatal(
+        self, tmp_path, monkeypatch
+    ):
+        """The other side of the boundary: one token is not a row.
+
+        The malformed row is ``HAVE_PCAP`` rather than ``HAVE_RAWNET``
+        deliberately.  A malformed *rawnet* row is not merely ignored --
+        it leaves ``"rawnet"`` out of ``values``, which is the documented
+        trigger for the image-scan fallback, so the test would be
+        measuring the fallback rather than the parse.
+        """
+        exe = _fake_x64sc(tmp_path, "x64sc", ethernet=False)
+        _fake_features(monkeypatch, "HAVE_RAWNET yes\nHAVE_PCAP\n")
+        feat = ve.vice_features(exe)
+        assert feat.source == "-features", "the probe should not have fallen back"
+        assert feat.rawnet is True, "the well-formed row must still count"
+        assert feat.pcap is False, "a one-token row must contribute nothing"
+
+
+@pytest.mark.skipif(
+    not os.path.exists("/opt/homebrew/bin/x64sc"),
+    reason="no Homebrew x64sc on this host",
+)
+def test_the_features_fixtures_match_the_real_output_shape():
+    """The fixtures encode an assumption about VICE that nothing checks.
+
+    Every mocked test here feeds ``_fake_features`` a string the author
+    typed.  If VICE's real ``-features`` layout differed -- a different
+    row name, a colon, a leading indent -- the mocks would agree with
+    each other and with a parser written to the same misunderstanding,
+    and no test would notice.  This anchors the fixture shape to the
+    binary, the way ``test_vice_wire_format_live`` anchors the response
+    frame.
+    """
+    proc = subprocess.run(
+        ["/opt/homebrew/bin/x64sc", "-features"],
+        capture_output=True, text=True, timeout=60,
+    )
+    rows = {
+        parts[0]: parts[1]
+        for line in proc.stdout.splitlines()
+        if (parts := line.split()) and len(parts) >= 2
+    }
+    missing = sorted(set(ve._FEATURE_ROWS) - set(rows))
+    assert not missing, (
+        f"the parser looks for {missing}, which real -features output does "
+        f"not contain -- every fixture in this module is the wrong shape"
+    )
+    assert set(rows[name] for name in ve._FEATURE_ROWS) <= {"yes", "no"}, (
+        "a feature value was neither 'yes' nor 'no'; the parser's "
+        "`== \"yes\"` test would silently read it as False"
+    )
