@@ -9,6 +9,21 @@ Uses VICE's binary monitor protocol (-binarymonitor).  Provides:
 
 Wire format is little-endian throughout.  See VICE documentation for the
 full binary monitor protocol specification.
+
+**One request does not always mean one response.** Most commands answer
+with a single frame, and :meth:`BinaryViceTransport._send_and_recv`
+models that: it matches on request id, validates the response type
+against :data:`CMD_TO_RESPONSE_TYPE`, and returns the first match.
+``CHECKPOINT_LIST`` does not fit — VICE replies with one
+``CHECKPOINT_INFO`` (0x11) frame *per checkpoint*, every one carrying the
+request's id, and only then the 0x14 frame holding the count.  A
+single-response helper takes the first 0x11, sees a type it was not
+expecting, and raises.
+
+So a list-shaped command has to drain its own reply (see
+:meth:`BinaryViceTransport.checkpoint_list`), and anyone adding one
+should expect the same shape rather than assume ``_send_and_recv``
+covers it.
 """
 
 from __future__ import annotations
@@ -68,6 +83,20 @@ CMD_RESET = 0xCC
 EVENT_STOPPED = 0x62
 EVENT_RESUMED = 0x63
 RESPONSE_CHECKPOINT_INFO = 0x11
+
+#: VICE emits this when the 6510 hits an illegal opcode and jams
+#: (``e_MON_RESPONSE_JAM``, S ``monitor_binary.c:382-391``).  It declares a
+#: body length of 0 and sends no payload, so the jammed address has to be
+#: read back separately.
+#:
+#: Found by the binary-monitor mapping, which noted that this client never
+#: mentioned 0x61 at all: a jam was buffered as an unrecognised event and
+#: never looked at, so a jammed program timed out on whatever assertion
+#: came next instead of reporting that the CPU had stopped.  The event
+#: queue makes that concrete — it is only ever drained by
+#: :meth:`wait_for_stopped`, so on any path that does not call it a jam
+#: notification sits there unread for the life of the transport.
+RESPONSE_JAM = 0x61
 
 # For the binary monitor protocol, each request command's response_type field
 # echoes the command opcode for most commands.  Two exceptions: the
@@ -915,6 +944,28 @@ class BinaryViceTransport:
 
         self._send_and_recv(CMD_REGISTERS_SET, body)
 
+    def _jam_message(self) -> str:
+        """Describe a CPU jam, naming the address if it can be read.
+
+        The JAM event carries no body, so the address has to come from a
+        register read.  That read can itself fail on a sufficiently
+        unwell machine, so it is best-effort: a jam reported without an
+        address is still far better than the timeout this replaces.
+        """
+        where = ""
+        try:
+            pc = self.read_registers().get("PC")
+            if pc is not None:
+                where = f" at ${pc:04x}"
+        except Exception:
+            where = " (PC unreadable)"
+        return (
+            f"The 6510 jammed{where}: VICE reported a JAM event "
+            f"({RESPONSE_JAM:#04x}), which means an illegal opcode halted "
+            f"the CPU. Execution will not continue, so waiting for a "
+            f"stopped event would only time out."
+        )
+
     def wait_for_stopped(self, timeout: float | None = None) -> int:
         """Wait for an EVENT_STOPPED event from VICE.
 
@@ -934,6 +985,14 @@ class BinaryViceTransport:
         gen = self._resume_generation
         while self._event_queue and self._event_queue[0][0] < gen:
             self._event_queue.popleft()
+
+        # A jam already in the queue means the machine stopped before we
+        # got here; the stop we are waiting for is never coming.  Checked
+        # before the STOPPED scan so a jam is reported as a jam rather
+        # than as whatever timeout follows it.
+        for evt_gen, evt_resp in self._event_queue:
+            if evt_gen >= gen and evt_resp.response_type == RESPONSE_JAM:
+                raise TransportError(self._jam_message())
 
         # Check whether an EVENT_STOPPED at the current generation is already
         # sitting in the queue (arrived during the resume() ack window).
@@ -964,6 +1023,8 @@ class BinaryViceTransport:
 
                 if resp.response_type == EVENT_STOPPED:
                     return self._parse_stopped_event(resp)
+                if resp.response_type == RESPONSE_JAM:
+                    raise TransportError(self._jam_message())
                 if resp.request_id == EVENT_REQUEST_ID:
                     # Other unsolicited event (Resumed, Checkpoint info, …):
                     # buffer for later inspection rather than dropping.

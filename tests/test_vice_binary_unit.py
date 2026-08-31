@@ -952,3 +952,66 @@ class TestFieldsTheWireTestsCannotSeparate:
             f"that transposes them and watches VICE reject the frame, "
             f"then remove this tripwire."
         )
+
+
+class TestJamIsReportedNotDropped:
+    """A CPU jam must raise, not time out on some later assertion.
+
+    Found by the binary-monitor mapping: this client never mentioned
+    ``0x61`` at all, so VICE's jam notification was buffered as an
+    unrecognised event and never read. The event queue makes that
+    concrete — its only drain is :meth:`wait_for_stopped`, so on any path
+    that does not call it the notification sits unread for the life of
+    the transport, and a jammed program fails as "the text never
+    appeared" fifteen seconds later.
+
+    The JAM frame carries **no body** (S ``monitor_binary.c:382-391``
+    declares length 0), so the address has to come from a register read;
+    these cover both the queued and the on-the-wire arrival.
+    """
+
+    @staticmethod
+    def _jam_frame(request_id: int = EVENT_REQUEST_ID) -> bytes:
+        return _build_response_bytes(0x61, b"", request_id=request_id)
+
+    def test_a_jam_arriving_on_the_wire_raises(self):
+        t = _make_transport()
+        t._reg_map = {"PC": (0x00, 16)}
+        _queue_recvs(t._sock, [self._jam_frame()])
+        with patch.object(t, "read_registers", return_value={"PC": 0xC0DE}):
+            with pytest.raises(TransportError, match="jammed"):
+                t.wait_for_stopped(timeout=5.0)
+
+    def test_the_jam_message_names_the_address(self):
+        t = _make_transport()
+        _queue_recvs(t._sock, [self._jam_frame()])
+        with patch.object(t, "read_registers", return_value={"PC": 0xC0DE}):
+            with pytest.raises(TransportError, match=r"\$c0de"):
+                t.wait_for_stopped(timeout=5.0)
+
+    def test_a_jam_already_in_the_queue_raises_before_the_wait(self):
+        """The realistic shape: the jam arrived during an earlier command.
+
+        Without this the queued jam is skipped by the STOPPED scan and the
+        call blocks until its timeout — reporting a timeout for a machine
+        that has already told us why it stopped.
+        """
+        t = _make_transport()
+        resp = _Response(0x61, 0x00, EVENT_REQUEST_ID, b"")
+        t._event_queue.append((t._resume_generation, resp))
+        with patch.object(t, "read_registers", return_value={"PC": 0x1234}):
+            with pytest.raises(TransportError, match=r"jammed at \$1234"):
+                t.wait_for_stopped(timeout=5.0)
+
+    def test_an_unreadable_pc_still_reports_the_jam(self):
+        """Diagnostics must not mask the diagnosis.
+
+        A machine unwell enough to jam may not answer a register read;
+        reporting the jam without an address still beats a timeout.
+        """
+        t = _make_transport()
+        resp = _Response(0x61, 0x00, EVENT_REQUEST_ID, b"")
+        t._event_queue.append((t._resume_generation, resp))
+        with patch.object(t, "read_registers", side_effect=OSError("gone")):
+            with pytest.raises(TransportError, match="PC unreadable"):
+                t.wait_for_stopped(timeout=5.0)
