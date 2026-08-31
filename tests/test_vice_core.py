@@ -151,6 +151,23 @@ def _keyboard_failure_report(transport, needle: str) -> str:
         lines.append(f"registers: {second}")
     except Exception as e:  # diagnostics must never mask the real failure
         lines.append(f"could not read registers: {type(e).__name__}: {e}")
+    # What is actually at $CF00?  A pinned PC is equally consistent with
+    # "halted" and with "jammed": if the stub write did not land, or was
+    # overwritten, the 6510 may be sitting on an illegal opcode that
+    # halts it in place.  $CF00 should read 58 4C CD E5 (CLI; JMP $E5CD).
+    try:
+        stub = transport.read_memory(0xCF00, 4)
+        expected = bytes([0x58, 0x4C, 0xCD, 0xE5])
+        lines.append(
+            f"memory at $CF00: {stub.hex()} "
+            + ("(the stub, intact)" if stub == expected else
+               f"<- NOT the stub, expected {expected.hex()} — the write did "
+               f"not land or was overwritten, so the CPU may be jammed on "
+               f"whatever is there rather than halted")
+        )
+    except Exception as e:
+        lines.append(f"could not read $CF00: {type(e).__name__}: {e}")
+
     # A leaked execution checkpoint pins the CPU at its address — every
     # resume re-triggers it and stops before executing — which is
     # indistinguishable from a hung emulator without asking.  For the
