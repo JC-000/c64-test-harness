@@ -40,22 +40,49 @@ pytestmark = pytest.mark.vice_live
 CODE_BASE = 0xC000
 DATA_BASE = 0xC100
 
+#: PC sampled at the end of each poll window by the last
+#: :func:`_wait_for_text_binary` call, read by the failure report.
+_LAST_POLL_TRACE: list[int] = []
+
+
 def _wait_for_text_binary(transport, needle, timeout=15.0, poll_interval=1.0):
     """Poll screen for *needle*, resuming the CPU between reads.
 
     The binary monitor auto-pauses the CPU when any command is sent.
     This helper resumes the CPU after each screen read so the KERNAL
     can continue updating the screen.
+
+    Every command re-enters the monitor (S ``monitor.c:407`` ->
+    ``monitor_binary.c:284``), and the CPU is halted for as long as the
+    monitor is open.  So ``time.sleep(poll_interval)`` below is the
+    *only* window in which the C64 executes at all.  If a resume is lost,
+    or a command lands between the resume and the sleep, that iteration
+    gives the machine zero cycles and the screen cannot change however
+    long the loop runs -- which is a candidate explanation for the
+    intermittent failures in ``TestKeyboard``.
+
+    So the PC is sampled once per window and kept for the failure report.
+    That costs one extra monitor entry per iteration, taken immediately
+    before the next screen read would have trapped the CPU anyway, so it
+    does not shorten the window it measures.
     """
     needle_upper = needle.upper()
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        grid = ScreenGrid.from_transport(transport)
-        if needle_upper in grid.continuous_text().upper():
-            return grid
-        transport.resume()
-        time.sleep(poll_interval)
-    return None
+    trace: list[int] = []
+    try:
+        while time.monotonic() < deadline:
+            grid = ScreenGrid.from_transport(transport)
+            if needle_upper in grid.continuous_text().upper():
+                return grid
+            transport.resume()
+            time.sleep(poll_interval)
+            try:
+                trace.append(transport.read_registers().get("PC", -1))
+            except Exception:
+                break
+        return None
+    finally:
+        _LAST_POLL_TRACE[:] = trace
 
 
 def _cpu_is_running(transport, samples: int = 4) -> tuple[bool, list[int]]:
@@ -91,6 +118,19 @@ def _keyboard_failure_report(transport, needle: str) -> str:
     moved.
     """
     lines = [f"expected {needle!r} on screen"]
+    if _LAST_POLL_TRACE:
+        distinct = len(set(_LAST_POLL_TRACE))
+        lines.append(
+            f"PC at the end of each poll window ({len(_LAST_POLL_TRACE)} "
+            f"windows, {distinct} distinct): "
+            f"{[hex(p) for p in _LAST_POLL_TRACE[:8]]}"
+            + ("" if distinct > 1 else
+               "  <- IDENTICAL: the CPU got no cycles in any poll window, "
+               "so a resume was lost rather than the screen being slow. "
+               "Note the PC line below resumes explicitly, so it can show "
+               "'advancing' even in this case — together they mean the CPU "
+               "runs when resumed but the loop's resumes were not landing.")
+        )
     try:
         first = transport.read_registers()
         transport.resume()
