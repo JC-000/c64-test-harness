@@ -498,23 +498,50 @@ def pytest_sessionfinish(session, exitstatus):
     """Fail a required run in which no live VICE test actually executed.
 
     The missing-binary case is already caught per-test.  This catches
-    every *other* way the surface can vanish -- and it is the check that
-    makes the gate a guard rather than a predicate, because it does not
-    need to anticipate the reason.
+    every *other* way the surface can vanish, without having to
+    anticipate the reason.
+
+    **It deliberately does not exempt a run that collected no live tests.**
+    An earlier version returned early in that case, to leave room for
+    someone deliberately running a single mocked module.  That exemption
+    was the hole: ``pytest --ignore=tests/test_vice_core.py ...`` and
+    ``pytest tests/test_vice_binary_unit.py`` are both ordinary CI
+    invocations, both collect zero live tests, and both therefore exited
+    0 -- producing exactly the mocks-only green run the gate exists to
+    prevent, silently.
+
+    **The trade-off chosen.**  ``C64_REQUIRE_VICE=1`` now means "this
+    invocation must exercise a real emulator", and any run that does not
+    fails -- including running one mocked module, or a module with no
+    VICE tests at all.  The escape is to not make that claim: leave the
+    variable unset for subset and development runs, and set it on the
+    invocation that is supposed to cover the backend.  That is stricter
+    than necessary for a developer typing one module name, and it is the
+    only version that cannot be opted out of by an argument list, which
+    is the property being bought.
     """
     if not vice_is_required() or _vice_live_ran:
         return
-    # Nothing to demand if the run never asked for live tests at all.
-    if session.testscollected == 0 or getattr(session, "_vice_live_collected", 0) == 0:
+    # A run that collected nothing at all has a different problem (an
+    # empty selection or a collection error), already reported as such.
+    if session.testscollected == 0:
         return
+    collected = getattr(session, "_vice_live_collected", 0)
     session.exitstatus = 1
     reporter = session.config.pluginmanager.get_plugin("terminalreporter")
     if reporter is not None:
+        detail = (
+            f"{collected} were collected but none ran"
+            if collected
+            else "none were even collected — this selection contains no "
+                 "live VICE tests"
+        )
         reporter.write_sep(
             "=",
-            f"{REQUIRE_VICE_ENV}=1 but no {VICE_LIVE_MARKER} test ran "
-            f"({getattr(session, '_vice_live_collected', 0)} collected). "
-            f"The VICE surface was certified by mocks alone.",
+            f"{REQUIRE_VICE_ENV}=1 declares this run must exercise a real "
+            f"emulator, but no {VICE_LIVE_MARKER} test ran ({detail}). "
+            f"The VICE surface was certified by mocks alone. Unset "
+            f"{REQUIRE_VICE_ENV} for a deliberately mocked-only run.",
             red=True,
         )
 
