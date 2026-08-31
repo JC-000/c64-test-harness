@@ -85,12 +85,17 @@ def _wait_for_text_binary(transport, needle, timeout=15.0, poll_interval=1.0):
         _LAST_POLL_TRACE[:] = trace
 
 
-def _cpu_is_running(transport, samples: int = 4) -> tuple[bool, list[int]]:
-    """Whether the 6510 is actually executing, and the PCs seen.
+def _stub_was_executed(transport, samples: int = 4) -> tuple[bool, list[int]]:
+    """Whether the CPU left ``_restore_basic``'s stub, and the PCs seen.
 
-    Reading a register stops the CPU, so each sample is taken across its
-    own resume.  A machine sitting in the BASIC idle loop moves its PC
-    constantly; one that is wedged reports the same address every time.
+    Deliberately *not* "did the PC change".  The BASIC idle loop is about
+    eight bytes ($E5CD-$E5D4), so on a perfectly healthy machine four
+    samples can land on the same address by coincidence -- measured, and
+    it would make this a flaky check for the flake it exists to diagnose.
+
+    The stub at $CF00 is ``CLI; JMP $E5CD``: it executes once and never
+    returns.  So "PC is no longer $CF00" is a precise, one-way signal
+    that the machine ran, immune to loop-size coincidence.
     """
     seen: list[int] = []
     for _ in range(samples):
@@ -98,9 +103,11 @@ def _cpu_is_running(transport, samples: int = 4) -> tuple[bool, list[int]]:
             seen.append(transport.read_registers().get("PC", -1))
         except Exception:
             break
+        if seen[-1] != 0xCF00:
+            return True, seen
         transport.resume()
         time.sleep(0.1)
-    return (len(set(seen)) > 1), seen
+    return False, seen
 
 
 def _keyboard_failure_report(transport, needle: str) -> str:
@@ -370,11 +377,12 @@ class TestKeyboard:
         # That is exactly the shape of the intermittent failure these
         # tests show — the fixture passes, then the three tests that need
         # execution fail while the one that only reads the screen passes.
-        running, pcs = _cpu_is_running(binary_transport)
-        assert running, (
-            "the 6510 is not executing after _restore_basic — PC stayed at "
-            f"{[hex(p) for p in pcs]}. Any READY. on screen is left over "
-            f"from the previous test.\n"
+        ran, pcs = _stub_was_executed(binary_transport)
+        assert ran, (
+            "the 6510 never left _restore_basic's stub — PC stayed at "
+            f"{[hex(p) for p in pcs]} ($CF00 is CLI; JMP $E5CD, which "
+            f"executes once and never returns). Any READY. on screen is "
+            f"left over from the previous test.\n"
             + _keyboard_failure_report(binary_transport, "a running CPU")
         )
 
