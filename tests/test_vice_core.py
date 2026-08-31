@@ -58,6 +58,24 @@ def _wait_for_text_binary(transport, needle, timeout=15.0, poll_interval=1.0):
     return None
 
 
+def _cpu_is_running(transport, samples: int = 4) -> tuple[bool, list[int]]:
+    """Whether the 6510 is actually executing, and the PCs seen.
+
+    Reading a register stops the CPU, so each sample is taken across its
+    own resume.  A machine sitting in the BASIC idle loop moves its PC
+    constantly; one that is wedged reports the same address every time.
+    """
+    seen: list[int] = []
+    for _ in range(samples):
+        try:
+            seen.append(transport.read_registers().get("PC", -1))
+        except Exception:
+            break
+        transport.resume()
+        time.sleep(0.1)
+    return (len(set(seen)) > 1), seen
+
+
 def _keyboard_failure_report(transport, needle: str) -> str:
     """Why a keyboard test failed, rather than just that it did.
 
@@ -301,7 +319,25 @@ class TestKeyboard:
     def _ensure_basic_loop(self, binary_transport):
         """Ensure CPU is in the BASIC idle loop and ready for keyboard input."""
         _restore_basic(binary_transport)
-        # Verify BASIC is ready
+
+        # Prove the CPU is executing *before* trusting anything on screen.
+        #
+        # ``READY.`` is left on screen by the previous test and
+        # ``_restore_basic`` never clears it, so asserting on it is the
+        # false-completion signal this repo documents (c33b5c4, issue
+        # #138): it cannot tell "BASIC is ready now" from "the screen
+        # still shows READY. from the last test and the 6510 is wedged".
+        # That is exactly the shape of the intermittent failure these
+        # tests show — the fixture passes, then the three tests that need
+        # execution fail while the one that only reads the screen passes.
+        running, pcs = _cpu_is_running(binary_transport)
+        assert running, (
+            "the 6510 is not executing after _restore_basic — PC stayed at "
+            f"{[hex(p) for p in pcs]}. Any READY. on screen is left over "
+            f"from the previous test.\n"
+            + _keyboard_failure_report(binary_transport, "a running CPU")
+        )
+
         grid = ScreenGrid.from_transport(binary_transport)
         assert grid.has_text("READY."), _keyboard_failure_report(
             binary_transport, "READY."
