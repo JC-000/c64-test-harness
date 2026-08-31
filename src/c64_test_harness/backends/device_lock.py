@@ -123,6 +123,18 @@ _LOCK_RECORD_SIZE = 4096
 #: absence is reported as "holder may be wedged" (issue #160).
 _HEARTBEAT_MAX_CONSECUTIVE_FAILURES = 5
 
+#: How often a waiter that keeps having its deadline extended says so.
+#: Extension is silent by default, which is how a starved waiter can sit
+#: for hours with nobody able to tell what it is behind (issue #162).
+_EXTENSION_LOG_INTERVAL = 30.0
+
+#: How many times the holder's identity may change under a waiter before
+#: the deadline stops being extended.  This is a count of *overtakes*,
+#: not a duration: a single holder, however long it holds, never changes
+#: identity and is never bounded by it.  See :meth:`acquire` for why the
+#: two cases need separating and why the bound sits here.
+_MAX_HOLDER_HANDOFFS = 3
+
 _PROCESS_HELD: dict[str, int] = {}
 #: Thread idents that took a flock for each lockfile path, one entry per
 #: outstanding hold.  Only used to spot a thread waiting on a lock it
@@ -387,6 +399,38 @@ class DeviceLock:
         *progress_window*) counts against *timeout*.  Pass
         ``progress_window=None`` for the legacy hard-timeout behavior.
 
+        **Starvation by a handoff chain.**  The extension above is tied
+        to the holder's *identity*, not just to its freshness.  A single
+        holder, however long it holds, never changes identity and so
+        waits indefinitely -- that is the documented behaviour and the
+        reason a real REU drain or a full capture does not fail the
+        lanes behind it.  A *chain* of short holders is different: each
+        release bumps the mtime, and each new holder's metadata write
+        bumps it again, so two lanes trading the device read as one
+        continuously-progressing holder while a third is starved by
+        someone who is never the same process twice.
+
+        The bound is therefore a count of *overtakes*, not a duration:
+        after ``_MAX_HOLDER_HANDOFFS`` identity changes the deadline
+        stops being re-armed and the caller's ``timeout`` runs out
+        normally.  Being overtaken once or twice is ordinary -- arriving
+        just as a hold ends is a coincidence, not a pathology -- so the
+        first few handoffs still extend, and a holder that settles in
+        afterwards gets the same indefinite wait it would have got had
+        the caller arrived a moment later.  Repeatedly losing the race
+        is the signal that no single holder is accountable.  Nothing
+        collapses on the first handoff: when extension does stop, the
+        full remaining ``timeout`` is still served.
+
+        A holder whose identity cannot be read is not counted as a
+        change; a flaky read must not become a starvation verdict.
+
+        While extending, a waiter logs at WARNING every
+        ``_EXTENSION_LOG_INTERVAL`` seconds naming how long it has been
+        queued, which PID it believes holds the lock, and whether that
+        identity has been changing -- so a starved waiter can say what
+        it is behind instead of sitting silently.
+
         **A lock held by this same thread never extends the deadline.**
         Its heartbeat keeps the mtime fresh and its PID is alive by
         definition, so it would otherwise read as a perfectly healthy
@@ -440,6 +484,14 @@ class DeviceLock:
             return True
 
         deadline = time.monotonic() + timeout
+        queued_since = time.monotonic()
+        # Identity of the holder we are queued behind, and how many times
+        # it has changed under us.  See the "Starvation" note in the
+        # docstring for why a count of overtakes is the right bound.
+        observed_pid: int | None = None
+        handoffs = 0
+        stopped_extending = False
+        last_extension_log = time.monotonic()
         notifier = _LockNotifier(self._lock_path) if _HAS_WATCHDOG else None
         # We are about to block: register wait intent so queue_depth /
         # peek_queue_depth observers see this waiter.  Best-effort — a
@@ -448,11 +500,60 @@ class DeviceLock:
         try:
             while True:
                 # Queue-aware: if the current holder is live and recently
-                # progressing, extend the deadline.
-                if progress_window is not None and self._holder_is_progressing(
-                    progress_window
-                ):
-                    deadline = time.monotonic() + timeout
+                # progressing, extend the deadline -- but only while it is
+                # the *same* holder.  Freshness alone cannot tell one long
+                # hold from a chain of short ones, because a handoff
+                # refreshes the mtime exactly as a live holder does.
+                if progress_window is not None:
+                    progressing, holder_pid = self._holder_progress(
+                        progress_window
+                    )
+                    if progressing:
+                        # An unreadable identity is not evidence of a new
+                        # holder; treating it as one would turn a flaky
+                        # read into a starvation verdict.
+                        if holder_pid is not None:
+                            if (
+                                observed_pid is not None
+                                and holder_pid != observed_pid
+                            ):
+                                handoffs += 1
+                            observed_pid = holder_pid
+                        if handoffs <= _MAX_HOLDER_HANDOFFS:
+                            deadline = time.monotonic() + timeout
+                            now = time.monotonic()
+                            if (
+                                now - last_extension_log
+                                >= _EXTENSION_LOG_INTERVAL
+                            ):
+                                last_extension_log = now
+                                _log.warning(
+                                    "DeviceLock %s: still queued after %.0fs, "
+                                    "deadline extended behind live holder "
+                                    "pid=%s%s",
+                                    self._device_host,
+                                    now - queued_since,
+                                    observed_pid,
+                                    (
+                                        f"; holder identity has changed "
+                                        f"{handoffs} time(s) (handoff chain)"
+                                        if handoffs
+                                        else ""
+                                    ),
+                                )
+                        elif not stopped_extending:
+                            stopped_extending = True
+                            _log.warning(
+                                "DeviceLock %s: no longer extending the "
+                                "deadline -- the holder changed %d times in "
+                                "%.0fs (handoff chain, currently pid=%s). "
+                                "Waiting out the remaining timeout; nobody "
+                                "holds this device long enough to blame.",
+                                self._device_host,
+                                handoffs,
+                                time.monotonic() - queued_since,
+                                observed_pid,
+                            )
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
@@ -576,7 +677,27 @@ class DeviceLock:
             return me in _PROCESS_HELD_THREADS.get(key, ())
 
     def _holder_is_progressing(self, progress_window: float) -> bool:
-        """True iff the lockfile holder is alive AND mtime is recent.
+        """Whether the holder looks alive and recently active.
+
+        Thin boolean wrapper over :meth:`_holder_progress`, kept because
+        callers and tests use this form.
+        """
+        return self._holder_progress(progress_window)[0]
+
+    def _holder_progress(
+        self, progress_window: float
+    ) -> tuple[bool, int | None]:
+        """``(progressing, holder_pid)`` for the current lockfile holder.
+
+        The PID half is what lets :meth:`acquire` tell one long holder
+        from a chain of short ones; freshness alone cannot, because a
+        handoff refreshes the mtime just as a live holder does.
+
+        ``holder_pid`` is ``None`` when the record could not be read or
+        names no PID -- which is *not* the same as "a different holder",
+        and callers must not treat it as one.
+
+        True iff the lockfile holder is alive AND mtime is recent.
 
         "Alive" uses the same PID-liveness check as :meth:`cleanup_stale`.
         "Recent" means lockfile mtime is within *progress_window* seconds.
@@ -597,26 +718,26 @@ class DeviceLock:
         # supported pattern.  A hold owned by a *different* thread is a
         # normal queue and still extends the deadline.
         if self._held_by_this_thread():
-            return False
+            return False, None
         try:
             st = os.stat(str(self._lock_path))
         except OSError:
-            return False
+            return False, None
         if (time.time() - st.st_mtime) > progress_window:
-            return False
+            return False, None
         try:
             data = json.loads(self._lock_path.read_text())
         except (OSError, json.JSONDecodeError, ValueError):
-            return False
+            return False, None
         # Valid JSON that is not an object -- "null", "[]", "42" -- parses
         # fine and then raises AttributeError on .get, which is not in the
         # guard above and would escape a routine acquire() (issue #163).
         if not isinstance(data, dict):
-            return False
+            return False, None
         pid = data.get("pid")
         if not isinstance(pid, int):
-            return False
-        return _pid_alive(pid)
+            return False, None
+        return _pid_alive(pid), pid
 
     def _try_acquire_once(self) -> bool:
         """Single non-blocking acquire attempt with inode verification.
