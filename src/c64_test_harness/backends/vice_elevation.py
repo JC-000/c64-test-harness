@@ -198,8 +198,19 @@ def _probe_features(
 ) -> ViceFeatures:
     values: dict[str, bool] = {}
     try:
+        # ``-default`` matters here for the same reason it matters on a
+        # real launch: without it VICE reads the ambient vicerc, and a
+        # vicerc carrying ``LogToStdout=0`` (or a log-file setting) sends
+        # this output somewhere we are not reading.  ``values`` then comes
+        # back empty and the probe degrades silently to the image scan,
+        # which reports ``drivers_known=False`` and so refuses drivers the
+        # binary actually has.
+        #
+        # Measured on this bench: with such a vicerc on ``$HOME``,
+        # ``x64sc -features`` prints 0 feature rows and
+        # ``x64sc -default -features`` prints 36.
         proc = subprocess.run(
-            [launch_path, "-features"],
+            [launch_path, "-default", "-features"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,

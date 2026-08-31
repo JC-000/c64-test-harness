@@ -565,8 +565,16 @@ def test_features_probe_reads_the_binarys_own_report(tmp_path, monkeypatch):
     assert feat.pcap is True
     assert feat.tuntap is False
     assert feat.source == "-features"
-    # It asks the binary, with the documented flag, and nothing else.
-    assert calls == [[exe, "-features"]]
+    # It asks the binary, with the documented flags, and nothing else.
+    #
+    # ``-default`` is load-bearing, not decoration: without it the
+    # child reads the ambient vicerc, and one carrying
+    # ``LogToStdout=0`` sends the feature rows somewhere we are not
+    # reading -- measured at 0 rows against 36. This pins the argv;
+    # ``test_the_features_probe_ignores_an_ambient_vicerc`` pins the
+    # effect against a real binary, because an argv assertion alone
+    # cannot tell you the flag does what it is here for.
+    assert calls == [[exe, "-default", "-features"]]
 
 
 def test_features_probe_reports_a_build_without_rawnet(tmp_path, monkeypatch):
@@ -786,3 +794,44 @@ def test_the_features_fixtures_match_the_real_output_shape():
         "a feature value was neither 'yes' nor 'no'; the parser's "
         "`== \"yes\"` test would silently read it as False"
     )
+
+
+@pytest.mark.skipif(
+    not os.path.exists("/opt/homebrew/bin/x64sc"),
+    reason="no Homebrew x64sc on this host",
+)
+def test_the_features_probe_ignores_an_ambient_vicerc(tmp_path, monkeypatch):
+    """``-features`` must not be silenced by the operator's own config.
+
+    The probe shells out to the binary, and without ``-default`` that
+    child reads ``$HOME/.config/vice/vicerc`` like any other launch.  A
+    vicerc carrying ``LogToStdout=0`` sends the feature rows somewhere we
+    are not reading; ``values`` comes back empty and
+    :func:`_probe_features` falls through to the image scan, reporting
+    ``drivers_known=False`` and refusing drivers the binary really has.
+
+    Measured on this bench: 0 feature rows without ``-default``, 36 with.
+    That is the same ambient-config lesson as ``ViceProcess.start()``'s
+    own ``-default``, one file over.
+
+    Hermetic: ``HOME`` is redirected at *tmp_path*, so this never reads or
+    writes the operator's real configuration.
+    """
+    vice_dir = tmp_path / ".config" / "vice"
+    vice_dir.mkdir(parents=True)
+    (vice_dir / "vicerc").write_text(
+        "[Version]\nConfigVersion=3.10\n\n[C64SC]\nLogToStdout=0\n"
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    # The probe is cached on the binary's identity, not on $HOME, so a
+    # result cached by an earlier test would mask this entirely.
+    ve._probe_features.cache_clear()
+
+    feat = ve.vice_features("/opt/homebrew/bin/x64sc")
+    ve._probe_features.cache_clear()
+
+    assert feat.source == "-features", (
+        "an ambient vicerc silenced the probe and it fell back to the "
+        "image scan, which cannot report driver support"
+    )
+    assert feat.drivers_known is True
