@@ -25,6 +25,11 @@ from .memory import (
     FlakeyReadError,
 )
 from .labels import Labels
+from .execution_policy import (
+    ExecutionPolicy,
+    ExecutionPolicyError,
+    check_execution_policy,
+)
 from .memory_policy import (
     MemoryPolicy,
     MemoryPolicyError,
@@ -359,6 +364,9 @@ __all__ = [
     "Labels",
     # Memory policy (transport-layer write guard)
     "MemoryPolicy",
+    "ExecutionPolicy",
+    "ExecutionPolicyError",
+    "check_execution_policy",
     "MemoryPolicyError",
     "MemoryRegion",
     "UnknownPolicy",

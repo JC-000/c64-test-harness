@@ -174,7 +174,11 @@ def test_cartridge_values_contains_empty_default() -> None:
 
 
 def test_disk_image_types() -> None:
-    assert DISK_IMAGE_TYPES == ("d64", "d71", "d81", "g64")
+    # S: 3.15 software/api/route_drives.cc:99 and :130 --
+    # PARAM_ENUM("type", "d64,g64,d71,g71,d81"). g71 was missing, and
+    # infer_image_type() rejects anything outside this tuple, so a .g71
+    # image could not be mounted through the harness at all.
+    assert DISK_IMAGE_TYPES == ("d64", "d71", "d81", "g64", "g71")
 
 
 def test_mount_modes() -> None:

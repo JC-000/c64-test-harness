@@ -583,7 +583,9 @@ def test_mount_disk_multipart_body():
     with patch("urllib.request.urlopen", mock):
         c.mount_disk("a", b"\x01\x02\x03", "d64", mode="readonly")
     req = captured[0][0]
-    assert req.get_method() == "PUT"
+    # POST is the upload-and-mount route; PUT is mount-by-device-path and
+    # has no body handler at all. See test_mount_disk_with_a_body_uses_post.
+    assert req.get_method() == "POST"
     ct = req.get_header("Content-type")
     assert ct.startswith("multipart/form-data; boundary=")
     boundary = ct.split("boundary=", 1)[1]
@@ -600,14 +602,122 @@ def test_mount_disk_multipart_body():
     assert body.rstrip(b"\r\n").endswith(f"--{boundary}--".encode())
 
 
-def test_mount_disk_url_includes_colon():
+def test_mount_disk_slot_is_a_plain_letter():
+    """The slot must not carry an encoded colon.
+
+    ``/v1/drives/a%3A:mount`` draws 400 "Invalid Drive 'a:'" -- the
+    trailing colon is the firmware's verb separator, so the drive
+    identifier cannot contain one. This test used to assert the
+    over-encoded form, which is why the bug survived a live audit that
+    fixed the same construction in ``unmount_disk``.
+    """
     mock, captured = _capture(b"")
     c = Ultimate64Client("h")
     with patch("urllib.request.urlopen", mock):
         c.mount_disk("a", b"x", "d64")
     url = captured[0][0].get_full_url()
-    # slot "a:" URL-encoded -> a%3A
-    assert url == "http://h/v1/drives/a%3A:mount"
+    assert "%3A" not in url, url
+    assert url == "http://h/v1/drives/a:mount"
+
+
+def test_mount_disk_with_a_body_uses_post():
+    """Upload-and-mount is the POST form; PUT is mount-by-device-path.
+
+    S: 1541u-315preview software/api/route_drives.cc:109 registers
+    ``API_CALL(PUT, drives, mount, NULL, ...)`` with ``image`` P_REQUIRED
+    and a NULL body handler, while :141 registers
+    ``API_CALL(POST, drives, mount, &attachment_writer, ...)`` which
+    takes multipart or application/octet-stream. Sending a body by PUT
+    hits the route that wants an ``image`` query argument and has no
+    body handler, so it 400s whatever the body looks like.
+    """
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        c.mount_disk("a", b"x", "d64")
+    assert captured[0][0].get_method() == "POST"
+
+
+def test_mount_disk_image_accepts_a_device_path():
+    """The PUT form: mount an image already on the device."""
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        c.mount_disk_path("a", "/Usb0/games/disk.d64", mode="readonly")
+    req = captured[0][0]
+    assert req.get_method() == "PUT"
+    url = req.get_full_url()
+    assert url.startswith("http://h/v1/drives/a:mount?")
+    # urllib.parse.quote defaults to safe="/", which every query in this
+    # client relies on, and an unencoded "/" is legal in a query
+    # component. The device path therefore appears verbatim.
+    assert "image=/Usb0/games/disk.d64" in url
+    assert "mode=readonly" in url
+    assert req.data is None
+
+
+def test_mount_disk_path_validates_drive_and_mode():
+    c = Ultimate64Client("h")
+    with pytest.raises(ValueError):
+        c.mount_disk_path("c", "/Usb0/x.d64")
+    with pytest.raises(ValueError):
+        c.mount_disk_path("a", "/Usb0/x.d64", mode="bogus")
+    with pytest.raises(ValueError):
+        c.mount_disk_path("a", "")
+
+
+def test_drive_slot_path_normalises_the_caller_s_spelling():
+    """One construction point, so a third hand-rolled site cannot appear.
+
+    Callers have long been told the trailing colon is added for them, so
+    "a:" must keep working -- it just must not reach the wire.
+    """
+    for spelling in ("a", "A", "a:", "A:"):
+        assert (
+            Ultimate64Client._drive_slot_path(spelling, "mount")
+            == "/v1/drives/a:mount"
+        )
+
+
+def test_drive_slot_path_allows_softiec():
+    """S: route_drives.cc:95 PATH_PARAM_ENUM("drive", "a,b,softiec").
+
+    The validation was narrower than the firmware, so the IEC file
+    system could not be addressed at all.
+    """
+    assert (
+        Ultimate64Client._drive_slot_path("softiec", "mount")
+        == "/v1/drives/softiec:mount"
+    )
+
+
+def test_drive_slot_path_still_rejects_nonsense():
+    for bad in ("c", "", "a b", "../etc"):
+        with pytest.raises(ValueError):
+            Ultimate64Client._drive_slot_path(bad, "mount")
+
+
+def test_mount_disk_routes_through_the_shared_builder():
+    """Regression guard for the class of bug, not the instance.
+
+    #167 was one hand-rolled path construction left behind when its
+    sibling was fixed. Asserting the shared builder is actually used
+    means a future hand-rolled site fails here rather than on hardware.
+    """
+    seen = []
+    real = Ultimate64Client._drive_slot_path
+
+    def spy(drive, action):
+        seen.append((drive, action))
+        return real(drive, action)
+
+    mock, _ = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch.object(
+        Ultimate64Client, "_drive_slot_path", staticmethod(spy)
+    ), patch("urllib.request.urlopen", mock):
+        c.mount_disk("a", b"x", "d64")
+    assert seen == [("a", "mount")]
 
 
 def test_mount_disk_validates_mode():
