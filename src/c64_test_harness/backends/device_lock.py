@@ -107,6 +107,34 @@ _WAITER_NAME_RE = re.compile(r"^waiter-(\d+)-[0-9a-f]+\.json$")
 #: live nested holder (see ``allow_nested``).  Consulted by
 #: :meth:`DeviceLock.held_by_this_process`, which is how the advisory
 #: check tells "we own this device" from "somebody else does".
+#: Size of the lockfile's metadata record, in bytes.  The record is
+#: padded to this length and rewritten in place so that a reader -- and
+#: every reader but ``cleanup_stale`` reads with no lock at all -- sees
+#: either the whole previous record or the whole new one.  4096 is
+#: chosen to match the ``os.read(fd, 4096)`` cap in ``foreign_holder``
+#: and ``cleanup_stale``, and to stay under the ~8 KB threshold above
+#: which a reader-side second ``read()`` syscall can land mid-write
+#: (issue #161).
+_LOCK_RECORD_SIZE = 4096
+
+#: Consecutive ``os.utime`` failures the heartbeat tolerates before it
+#: gives up.  A transient filesystem hiccup must not permanently freeze
+#: the mtime -- that is the only liveness signal a waiter has, and its
+#: absence is reported as "holder may be wedged" (issue #160).
+_HEARTBEAT_MAX_CONSECUTIVE_FAILURES = 5
+
+#: How often a waiter that keeps having its deadline extended says so.
+#: Extension is silent by default, which is how a starved waiter can sit
+#: for hours with nobody able to tell what it is behind (issue #162).
+_EXTENSION_LOG_INTERVAL = 30.0
+
+#: How many times the holder's identity may change under a waiter before
+#: the deadline stops being extended.  This is a count of *overtakes*,
+#: not a duration: a single holder, however long it holds, never changes
+#: identity and is never bounded by it.  See :meth:`acquire` for why the
+#: two cases need separating and why the bound sits here.
+_MAX_HOLDER_HANDOFFS = 3
+
 _PROCESS_HELD: dict[str, int] = {}
 #: Thread idents that took a flock for each lockfile path, one entry per
 #: outstanding hold.  Only used to spot a thread waiting on a lock it
@@ -318,6 +346,12 @@ class DeviceLock:
         # their progress_window.  None/0/negative disables.
         self._heartbeat_interval = heartbeat_interval
         self._heartbeat_stop: threading.Event | None = None
+        #: False once the heartbeat has given up (issue #160).  Local
+        #: to the holder: a waiter in another process cannot see it,
+        #: so it distinguishes the two cases in *this* process's logs
+        #: only.  Surfacing it cross-process would need a field in the
+        #: lockfile record, which is deliberately not done here.
+        self._heartbeat_healthy: bool = True
         self._heartbeat_thread: threading.Thread | None = None
 
     @property
@@ -364,6 +398,38 @@ class DeviceLock:
         waiting on dead/stuck holders (dead PID, or mtime older than
         *progress_window*) counts against *timeout*.  Pass
         ``progress_window=None`` for the legacy hard-timeout behavior.
+
+        **Starvation by a handoff chain.**  The extension above is tied
+        to the holder's *identity*, not just to its freshness.  A single
+        holder, however long it holds, never changes identity and so
+        waits indefinitely -- that is the documented behaviour and the
+        reason a real REU drain or a full capture does not fail the
+        lanes behind it.  A *chain* of short holders is different: each
+        release bumps the mtime, and each new holder's metadata write
+        bumps it again, so two lanes trading the device read as one
+        continuously-progressing holder while a third is starved by
+        someone who is never the same process twice.
+
+        The bound is therefore a count of *overtakes*, not a duration:
+        after ``_MAX_HOLDER_HANDOFFS`` identity changes the deadline
+        stops being re-armed and the caller's ``timeout`` runs out
+        normally.  Being overtaken once or twice is ordinary -- arriving
+        just as a hold ends is a coincidence, not a pathology -- so the
+        first few handoffs still extend, and a holder that settles in
+        afterwards gets the same indefinite wait it would have got had
+        the caller arrived a moment later.  Repeatedly losing the race
+        is the signal that no single holder is accountable.  Nothing
+        collapses on the first handoff: when extension does stop, the
+        full remaining ``timeout`` is still served.
+
+        A holder whose identity cannot be read is not counted as a
+        change; a flaky read must not become a starvation verdict.
+
+        While extending, a waiter logs at WARNING every
+        ``_EXTENSION_LOG_INTERVAL`` seconds naming how long it has been
+        queued, which PID it believes holds the lock, and whether that
+        identity has been changing -- so a starved waiter can say what
+        it is behind instead of sitting silently.
 
         **A lock held by this same thread never extends the deadline.**
         Its heartbeat keeps the mtime fresh and its PID is alive by
@@ -418,6 +484,14 @@ class DeviceLock:
             return True
 
         deadline = time.monotonic() + timeout
+        queued_since = time.monotonic()
+        # Identity of the holder we are queued behind, and how many times
+        # it has changed under us.  See the "Starvation" note in the
+        # docstring for why a count of overtakes is the right bound.
+        observed_pid: int | None = None
+        handoffs = 0
+        stopped_extending = False
+        last_extension_log = time.monotonic()
         notifier = _LockNotifier(self._lock_path) if _HAS_WATCHDOG else None
         # We are about to block: register wait intent so queue_depth /
         # peek_queue_depth observers see this waiter.  Best-effort — a
@@ -426,11 +500,60 @@ class DeviceLock:
         try:
             while True:
                 # Queue-aware: if the current holder is live and recently
-                # progressing, extend the deadline.
-                if progress_window is not None and self._holder_is_progressing(
-                    progress_window
-                ):
-                    deadline = time.monotonic() + timeout
+                # progressing, extend the deadline -- but only while it is
+                # the *same* holder.  Freshness alone cannot tell one long
+                # hold from a chain of short ones, because a handoff
+                # refreshes the mtime exactly as a live holder does.
+                if progress_window is not None:
+                    progressing, holder_pid = self._holder_progress(
+                        progress_window
+                    )
+                    if progressing:
+                        # An unreadable identity is not evidence of a new
+                        # holder; treating it as one would turn a flaky
+                        # read into a starvation verdict.
+                        if holder_pid is not None:
+                            if (
+                                observed_pid is not None
+                                and holder_pid != observed_pid
+                            ):
+                                handoffs += 1
+                            observed_pid = holder_pid
+                        if handoffs <= _MAX_HOLDER_HANDOFFS:
+                            deadline = time.monotonic() + timeout
+                            now = time.monotonic()
+                            if (
+                                now - last_extension_log
+                                >= _EXTENSION_LOG_INTERVAL
+                            ):
+                                last_extension_log = now
+                                _log.warning(
+                                    "DeviceLock %s: still queued after %.0fs, "
+                                    "deadline extended behind live holder "
+                                    "pid=%s%s",
+                                    self._device_host,
+                                    now - queued_since,
+                                    observed_pid,
+                                    (
+                                        f"; holder identity has changed "
+                                        f"{handoffs} time(s) (handoff chain)"
+                                        if handoffs
+                                        else ""
+                                    ),
+                                )
+                        elif not stopped_extending:
+                            stopped_extending = True
+                            _log.warning(
+                                "DeviceLock %s: no longer extending the "
+                                "deadline -- the holder changed %d times in "
+                                "%.0fs (handoff chain, currently pid=%s). "
+                                "Waiting out the remaining timeout; nobody "
+                                "holds this device long enough to blame.",
+                                self._device_host,
+                                handoffs,
+                                time.monotonic() - queued_since,
+                                observed_pid,
+                            )
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
@@ -554,7 +677,27 @@ class DeviceLock:
             return me in _PROCESS_HELD_THREADS.get(key, ())
 
     def _holder_is_progressing(self, progress_window: float) -> bool:
-        """True iff the lockfile holder is alive AND mtime is recent.
+        """Whether the holder looks alive and recently active.
+
+        Thin boolean wrapper over :meth:`_holder_progress`, kept because
+        callers and tests use this form.
+        """
+        return self._holder_progress(progress_window)[0]
+
+    def _holder_progress(
+        self, progress_window: float
+    ) -> tuple[bool, int | None]:
+        """``(progressing, holder_pid)`` for the current lockfile holder.
+
+        The PID half is what lets :meth:`acquire` tell one long holder
+        from a chain of short ones; freshness alone cannot, because a
+        handoff refreshes the mtime just as a live holder does.
+
+        ``holder_pid`` is ``None`` when the record could not be read or
+        names no PID -- which is *not* the same as "a different holder",
+        and callers must not treat it as one.
+
+        True iff the lockfile holder is alive AND mtime is recent.
 
         "Alive" uses the same PID-liveness check as :meth:`cleanup_stale`.
         "Recent" means lockfile mtime is within *progress_window* seconds.
@@ -575,21 +718,26 @@ class DeviceLock:
         # supported pattern.  A hold owned by a *different* thread is a
         # normal queue and still extends the deadline.
         if self._held_by_this_thread():
-            return False
+            return False, None
         try:
             st = os.stat(str(self._lock_path))
         except OSError:
-            return False
+            return False, None
         if (time.time() - st.st_mtime) > progress_window:
-            return False
+            return False, None
         try:
             data = json.loads(self._lock_path.read_text())
         except (OSError, json.JSONDecodeError, ValueError):
-            return False
+            return False, None
+        # Valid JSON that is not an object -- "null", "[]", "42" -- parses
+        # fine and then raises AttributeError on .get, which is not in the
+        # guard above and would escape a routine acquire() (issue #163).
+        if not isinstance(data, dict):
+            return False, None
         pid = data.get("pid")
         if not isinstance(pid, int):
-            return False
-        return _pid_alive(pid)
+            return False, None
+        return _pid_alive(pid), pid
 
     def _try_acquire_once(self) -> bool:
         """Single non-blocking acquire attempt with inode verification.
@@ -611,6 +759,17 @@ class DeviceLock:
             except OSError:
                 os.close(fd)
                 return False
+            # Claim our identity in the file *immediately*.  The flock
+            # is already ours, so from here on any unlocked reader --
+            # foreign_holder, _holder_is_progressing -- is entitled to
+            # believe whatever the body says.  Writing it after the
+            # inode recheck left the previous holder's PID in place for
+            # the length of two stat() calls, and readers in that window
+            # named a process that had released the device some time
+            # ago: a confident wrong answer rather than a missing one
+            # (issue #165).
+            self._fd = fd
+            self._write_metadata()
             # Verify our fd still points to the file on disk.
             try:
                 fd_stat = os.fstat(fd)
@@ -619,13 +778,15 @@ class DeviceLock:
                     fd_stat.st_ino == path_stat.st_ino
                     and fd_stat.st_dev == path_stat.st_dev
                 ):
-                    self._fd = fd
-                    self._write_metadata()
                     self._register_process_hold()
                     return True
             except OSError:
                 pass
-            # Inode mismatch or path gone — lock is on a dead inode
+            # Inode mismatch or path gone — lock is on a dead inode.
+            # The metadata we just wrote went to that dead inode, which
+            # is about to be unreachable, so there is nothing to undo
+            # beyond dropping our reference to it.
+            self._fd = None
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
         return False
@@ -658,8 +819,12 @@ class DeviceLock:
         # The flock is going away, so the process no longer holds the
         # device even if a nested holder outlived its parent.
         self._drop_process_hold(purge=True)
-        # Stop the heartbeat before unlinking/releasing so the thread
-        # doesn't race with the final mtime bump or the fd close.
+        # Stop the heartbeat before the mtime bump and the fd close so
+        # the thread doesn't race with them.  (The lockfile is
+        # deliberately NOT unlinked here — see the docstring above.  An
+        # earlier version of this comment said "before unlinking",
+        # which sent two sessions hunting a leak that does not exist:
+        # a lockfile holding a dead PID is the normal post-run state.)
         self._stop_heartbeat()
         # Cooperative wake-up: bump mtime BEFORE releasing the flock so
         # the fs-event is observed by waiters that immediately retry.
@@ -804,9 +969,13 @@ class DeviceLock:
         """
         try:
             data = self._lock_path.read_text()
-            return json.loads(data)
+            parsed = json.loads(data)
         except (OSError, json.JSONDecodeError, ValueError):
             return None
+        # Only an object is metadata.  Returning a bare list or int here
+        # would push the AttributeError into every caller instead
+        # (issue #163).
+        return parsed if isinstance(parsed, dict) else None
 
     # -- Queue-depth introspection (issue #130) --
 
@@ -920,16 +1089,34 @@ class DeviceLock:
 
     @classmethod
     def cleanup_stale(cls, lock_dir: Path | None = None) -> int:
-        """Remove device lockfiles whose holding PID is dead.
+        """Remove every ``device-*.lock`` in *lock_dir* that nobody holds.
 
-        Safety: we only delete a lockfile while holding its flock, so
-        concurrent processes that have opened the same path but not yet
-        called ``flock()`` will see the flock fail (not succeed on a
-        new inode).  After unlinking we keep the fd open briefly so the
-        inode stays alive until we close — any racing ``open()`` on the
-        same path will create a new inode.
+        The rule is **not** "whose holding PID is dead", which is what
+        this docstring used to claim.  The recorded PID is read but not
+        acted on: a file whose PID is alive is unlinked just the same,
+        because being unheld is what makes it removable.  Nor is the
+        sweep scoped to this instance's device -- it globs
+        ``device-*.lock``, so acquiring one device clears every other
+        device's unheld lockfile in the machine-global lock dir.
 
-        Returns the number of stale lockfiles removed.
+        Safety comes from the flock, not from the PID: a file is only
+        unlinked after this call takes ``LOCK_EX|LOCK_NB`` on it, which
+        proves nobody holds the device.  A racing acquirer that opened
+        the inode before the unlink and flocks it after is caught by the
+        ``st_ino``/``st_dev`` recheck in :meth:`_try_acquire_once`,
+        which sees the mismatch and retries.  This is why the sweep is
+        safe in a way a manual ``rm`` is not -- a shell has no way to
+        prove nobody holds the lock, and unlinking the path while
+        another process is blocked on the inode leaves the next acquirer
+        locking a *new* inode that excludes nobody.
+
+        Consequence worth knowing: because unheld lockfiles are swept by
+        unrelated acquires, and because the record is a single
+        last-writer-wins slot, the JSON body is **live status only**.  It
+        cannot answer "which lane held this device an hour ago"; there
+        is no durable record of a hold anywhere in this package.
+
+        Returns the number of lockfiles removed.
         """
         d = lock_dir or _default_lock_dir()
         removed = 0
@@ -948,17 +1135,22 @@ class DeviceLock:
                 # Someone holds it — not stale
                 os.close(fd)
                 continue
-            # We hold the flock.  Check if the recorded PID is dead.
+            # We hold the flock, which is the whole justification for
+            # unlinking: nobody can be using this device.  The recorded
+            # PID is read only to log what we are sweeping — alive or
+            # dead, the file goes, because an unheld lockfile is debris
+            # either way.
             try:
                 raw = os.read(fd, 4096)
                 data = json.loads(raw) if raw else {}
-                pid = data.get("pid")
+                pid = data.get("pid") if isinstance(data, dict) else None
                 if pid is not None and _pid_alive(pid):
-                    # PID is alive but nobody holds the flock — the
-                    # metadata is stale (process forgot to clean up).
-                    # Still safe to remove since we hold the lock.
-                    pass  # fall through to unlink
-                # Either dead PID or no/corrupt metadata — remove it
+                    _log.debug(
+                        "cleanup_stale: %s names live pid %s but is unheld; "
+                        "removing (the process released without cleaning up)",
+                        path.name,
+                        pid,
+                    )
                 try:
                     path.unlink(missing_ok=True)
                     removed += 1
@@ -994,7 +1186,31 @@ class DeviceLock:
     # -- Internal --
 
     def _write_metadata(self) -> None:
-        """Write JSON metadata to the lockfile."""
+        """Write the metadata record to the lockfile, in place.
+
+        Padded to :data:`_LOCK_RECORD_SIZE` and written at offset 0 with
+        no truncation, because the flock excludes other *writers* and
+        nothing at all excludes readers: ``read_info`` and
+        ``_holder_is_progressing`` both read unlocked, and
+        ``_holder_is_progressing`` has to, since it reads while the
+        holder holds ``LOCK_EX``.
+
+        The previous form was ``lseek`` + ``ftruncate(0)`` + ``write``,
+        which left the file zero bytes between the second and third
+        call.  A reader landing there degraded quietly -- ``read_info``
+        returned ``None``, and ``acquire_or_raise`` then reported "no
+        holder metadata found; acquire still failed (race?)" instead of
+        naming the holder.  Rewriting a fixed-length record in place
+        removes the window rather than narrowing it: the bytes on disk
+        are always one complete record.
+
+        ``json.loads`` ignores the trailing padding, so readers are
+        unchanged.  Not write-to-temp-and-rename: the lockfile's
+        identity *is* the flock inode, and a rename would orphan the
+        holder's flock on the old inode while the next acquirer locks
+        the new one -- two simultaneous holders, the hazard
+        :meth:`release` documents.
+        """
         if self._fd is None:
             return
         meta = {
@@ -1004,9 +1220,26 @@ class DeviceLock:
         }
         data = json.dumps(meta).encode()
         try:
+            if len(data) > _LOCK_RECORD_SIZE:
+                # Should not happen: the record is three small fields.
+                # Truncate-and-write rather than silently cutting the
+                # record short -- correctness over atomicity, loudly.
+                # Readers capped at 4096 bytes will fail to parse this
+                # and degrade to "no metadata", which is honest.
+                _log.error(
+                    "DeviceLock metadata for %s is %d bytes, over the %d-byte "
+                    "record; falling back to a truncating write, which is "
+                    "briefly observable as empty",
+                    self._device_host,
+                    len(data),
+                    _LOCK_RECORD_SIZE,
+                )
+                os.lseek(self._fd, 0, os.SEEK_SET)
+                os.ftruncate(self._fd, 0)
+                os.write(self._fd, data)
+                return
             os.lseek(self._fd, 0, os.SEEK_SET)
-            os.ftruncate(self._fd, 0)
-            os.write(self._fd, data)
+            os.write(self._fd, data.ljust(_LOCK_RECORD_SIZE))
         except OSError:
             pass
 
@@ -1028,6 +1261,7 @@ class DeviceLock:
             return
         if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
             return
+        self._heartbeat_healthy = True
         stop = threading.Event()
         thread = threading.Thread(
             target=self._heartbeat_loop,
@@ -1059,11 +1293,31 @@ class DeviceLock:
     ) -> None:
         """Thread body: bump mtime every *interval* seconds until *stop*.
 
-        Exits quietly on ``FileNotFoundError`` (lockfile unlinked under
-        us) or any other ``OSError``.  Never propagates exceptions —
-        a misbehaving heartbeat must not crash the holder.
+        The mtime bump is the **only** liveness signal a waiter has:
+        ``_holder_is_progressing`` reads it, and
+        ``DeviceLockTimeout._build_message`` turns its absence into
+        "holder may be wedged".  So a heartbeat that dies takes a
+        perfectly healthy holder and has every other lane told it is
+        stuck -- a diagnosis that is confident, specific and wrong, and
+        invisible to the holder itself.
+
+        This used to ``return`` on the first ``OSError``, unlogged, with
+        nothing to restart it (``_start_heartbeat`` is only reached from
+        ``acquire``).  A single tmpfs hiccup or fd-pressure moment was
+        therefore permanent.  Transient errors are now logged and
+        retried; only ``_HEARTBEAT_MAX_CONSECUTIVE_FAILURES`` in a row
+        give up, loudly, because retrying forever against a genuinely
+        broken path is its own bug (issue #160).
+
+        ``FileNotFoundError`` still stops immediately and quietly: the
+        lockfile being gone is the documented steady state after a
+        release, not a hiccup.
+
+        Never propagates: a misbehaving heartbeat must not crash the
+        holder.
         """
         path = str(self._lock_path)
+        failures = 0
         while not stop.is_set():
             # Wait first so the very first bump (from _write_metadata)
             # isn't immediately overwritten; this also makes tests that
@@ -1074,11 +1328,39 @@ class DeviceLock:
                 os.utime(path, None)
             except FileNotFoundError:
                 return
-            except OSError:
-                # Filesystem hiccup — stop quietly rather than spinning.
-                return
+            except OSError as exc:
+                failures += 1
+                _log.warning(
+                    "DeviceLock heartbeat for %s failed to bump %s "
+                    "(%d consecutive): %s",
+                    self._device_host,
+                    path,
+                    failures,
+                    exc,
+                )
+                if failures >= _HEARTBEAT_MAX_CONSECUTIVE_FAILURES:
+                    self._heartbeat_healthy = False
+                    _log.error(
+                        "DeviceLock heartbeat for %s giving up after %d "
+                        "consecutive failures; this holder's mtime will now "
+                        "freeze and waiters will report it as wedged even "
+                        "though it is alive",
+                        self._device_host,
+                        failures,
+                    )
+                    return
+                continue
             except Exception:  # pragma: no cover - defensive
+                self._heartbeat_healthy = False
                 return
+            if failures:
+                _log.info(
+                    "DeviceLock heartbeat for %s recovered after %d "
+                    "consecutive failure(s)",
+                    self._device_host,
+                    failures,
+                )
+                failures = 0
 
 
 def require_device_lock() -> bool:
