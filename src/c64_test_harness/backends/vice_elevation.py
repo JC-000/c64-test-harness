@@ -81,6 +81,14 @@ _UNGATED_DRIVERS = frozenset({"tuntap"})
 #: Seconds to allow the ``sudo -l`` authorisation probe.
 _SUDO_PROBE_TIMEOUT = 5.0
 
+#: sudoers tag specifiers as ``sudo -l`` prints them (sudoers(5) "Tag_Spec").
+#: Any of these may precede the command in a NOPASSWD entry.
+_SUDO_TAGS = frozenset({
+    "PASSWD:", "NOPASSWD:", "SETENV:", "NOSETENV:", "EXEC:", "NOEXEC:",
+    "LOG_INPUT:", "NOLOG_INPUT:", "LOG_OUTPUT:", "NOLOG_OUTPUT:",
+    "MAIL:", "NOMAIL:", "FOLLOW:", "NOFOLLOW:", "INTERCEPT:", "NOINTERCEPT:",
+})
+
 
 class ViceEthernetError(RuntimeError):
     """Base for ethernet-launch problems detected before spawning VICE."""
@@ -368,11 +376,18 @@ def parse_sudo_listing(text: str) -> SudoAuthorisation:
             continue
         for entry in line.split(marker, 1)[1].split(","):
             parts = entry.split()
-            if not parts:
+            # Further tags may follow NOPASSWD: (``NOPASSWD: SETENV: /x``);
+            # they are not part of the command.  A later PASSWD: tag
+            # reinstates the prompt, so such an entry is useless to us.
+            tags: list[str] = []
+            while parts and parts[0] in _SUDO_TAGS:
+                tags.append(parts.pop(0))
+            if not parts or "PASSWD:" in tags:
                 continue
             if parts[0] == "ALL":
                 all_commands = True
-            elif len(parts) == 1:  # no pinned arguments
+            elif len(parts) == 1 or parts[1:] == ["*"]:
+                # No pinned arguments, or the bare wildcard that admits any.
                 commands.add(parts[0])
     return SudoAuthorisation(all_commands, frozenset(commands))
 

@@ -854,3 +854,37 @@ def test_plan_does_not_refuse_run_as_root_false_when_already_root(monkeypatch):
     assert plan.argv == _eth_argv()
     assert plan.sudo_wrapped is False
     assert plan.elevated is True
+
+
+def test_a_wildcard_argument_rule_authorises_the_binary(monkeypatch):
+    """``NOPASSWD: /path/x64sc *`` authorises *any* argument list, so it
+    covers the launch; it was being dropped as an argument-pinned rule."""
+    _sudo_listing(
+        monkeypatch,
+        "User x may run the following commands:\n"
+        "    (root) NOPASSWD: /opt/homebrew/bin/x64sc *\n",
+    )
+    assert ve.sudo_can_run("/opt/homebrew/bin/x64sc") is True
+
+
+def test_a_setenv_tagged_rule_authorises_the_binary(monkeypatch):
+    """sudoers tags may follow NOPASSWD: (``NOPASSWD: SETENV: /path``);
+    the tag is not part of the command."""
+    _sudo_listing(
+        monkeypatch,
+        "User x may run the following commands:\n"
+        "    (root) NOPASSWD: SETENV: /opt/homebrew/bin/x64sc\n",
+    )
+    assert ve.sudo_can_run("/opt/homebrew/bin/x64sc") is True
+
+
+def test_a_specific_argument_rule_still_does_not_authorise(monkeypatch):
+    """Only the bare wildcard widens; a pinned argv is still one command."""
+    _sudo_listing(
+        monkeypatch,
+        "User x may run the following commands:\n"
+        "    (root) NOPASSWD: /opt/homebrew/bin/x64sc -warp\n"
+        "    (root) NOPASSWD: /opt/homebrew/bin/brew reinstall *\n",
+    )
+    assert ve.sudo_can_run("/opt/homebrew/bin/x64sc") is False
+    assert ve.sudo_can_run("/opt/homebrew/bin/brew") is False
