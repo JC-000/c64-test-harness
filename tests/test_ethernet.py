@@ -11,17 +11,20 @@ on Linux, feth+BSD bridge on macOS) live in that module and the matching
 all tests are skipped automatically if ``x64sc`` is missing, no ethernet
 interface is available, or VICE lacks the required driver support.
 
-The ``_binary_jsr()`` helper uses the binary protocol's checkpoint mechanism:
-``set_checkpoint()`` + ``set_registers()`` + ``resume()`` + ``wait_for_stopped()``.
+Host-side capture and injection go through ``c64_test_harness.capture``
+(``AF_PACKET`` on Linux, ``/dev/bpf*`` on macOS -- issue #158).  The TX
+and RX bodies live in ``tests/ethernet_scenarios.py`` so that
+``tests/test_ethernet_capture_wiring.py`` can prove, with fakes, that
+they fail rather than skip when no frame is seen.  They skip only when
+:func:`~c64_test_harness.capture.open_capture` reports the path is
+genuinely unavailable, and then the skip reason *is* the remedy.
 
-See ``test_disk_vice.py`` module docstring for the screen polling / ``resume()``
-interaction explanation.
+See ``test_disk_vice.py`` module docstring for the screen polling /
+``resume()`` interaction explanation.
 """
 
 from __future__ import annotations
 
-import socket
-import struct
 import time
 
 import pytest
@@ -35,10 +38,24 @@ from bridge_platform import (
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 from c64_test_harness.backends.vice_manager import PortAllocator
+from c64_test_harness.capture import (
+    CaptureUnavailable,
+    PacketCapture,
+    capture_unavailable_reason,
+    open_capture,
+)
 from c64_test_harness.execute import load_code
-from c64_test_harness.memory import read_bytes, write_bytes
+from c64_test_harness.memory import read_bytes
 from c64_test_harness.screen import ScreenGrid
-from c64_test_harness.transport import TransportError
+from ethernet_scenarios import (
+    CODE_BASE,
+    PPDATA,
+    PPTR,
+    binary_jsr,
+    clockport_enable_code,
+    run_rx_scenario,
+    run_tx_scenario,
+)
 
 from conftest import connect_binary_transport
 
@@ -75,79 +92,10 @@ pytestmark = [
     pytest.mark.skipif(not _PCAP_OK, reason=_PCAP_REASON),
 ]
 
-# Scratch area
-CODE_BASE = 0xC000
-DATA_BASE = 0xC100
-
-# CS8900a I/O registers (RR-Net mode at $DE00).
-# Matches ip65 cs8900a.s layout:
-#   isq       = $DE00   ; ISQ / RR clockport enable ($DE01 bit 0)
-#   packetpp  = $DE02   ; PPPtr (16-bit)
-#   ppdata    = $DE04   ; PPData (16-bit)
-#   rxtxreg   = $DE08   ; RX/TX data FIFO (16-bit)
-#   txcmd     = $DE0C   ; TX command
-#   txlen     = $DE0E   ; TX length
-#
-# CRITICAL: the RR clockport MUST be enabled (set bit 0 of $DE01) before
-# any CS8900a register access, or the chip ignores all reads/writes.
-CS8900A_BASE = 0xDE00
-ISQ_LO = CS8900A_BASE + 0x00
-ISQ_HI = CS8900A_BASE + 0x01    # bit 0 = RR clockport enable
-PPTR = CS8900A_BASE + 0x02      # PacketPage Pointer (16-bit)
-PPDATA = CS8900A_BASE + 0x04    # PacketPage Data (16-bit)
-RTDATA = CS8900A_BASE + 0x08    # RX/TX data FIFO (16-bit)
-TXCMD = CS8900A_BASE + 0x0C     # TX command (16-bit)
-TXLEN = CS8900A_BASE + 0x0E     # TX length (16-bit)
-
-
-def _clockport_enable_code() -> bytes:
-    """6502 snippet: enable RR clockport bit (ORA #$01 at $DE01).
-
-    Must be prepended to every CS8900a access routine.  Without it, the
-    chip silently drops all register reads and writes.
-    """
-    return bytes([
-        0xAD, ISQ_HI & 0xFF, ISQ_HI >> 8,   # LDA $DE01
-        0x09, 0x01,                          # ORA #$01
-        0x8D, ISQ_HI & 0xFF, ISQ_HI >> 8,   # STA $DE01
-    ])
-
 
 # ---------------------------------------------------------------------------
 # Binary transport helpers
 # ---------------------------------------------------------------------------
-
-def _binary_jsr(
-    transport: BinaryViceTransport,
-    addr: int,
-    timeout: float = 10.0,
-    scratch_addr: int = 0x0334,
-) -> dict[str, int]:
-    """JSR via binary monitor checkpoint mechanism.
-
-    Writes a trampoline (JSR addr; NOP; NOP) at *scratch_addr*, sets a
-    checkpoint (breakpoint) at scratch_addr+3, sets PC to scratch_addr,
-    resumes, and waits for the CPU to stop at the breakpoint.
-
-    Returns the register state after the subroutine returns.
-    """
-    trampoline = bytes([
-        0x20, addr & 0xFF, (addr >> 8) & 0xFF,  # JSR addr
-        0xEA,  # NOP (breakpoint here)
-        0xEA,  # NOP
-    ])
-    transport.write_memory(scratch_addr, trampoline)
-    bp_addr = scratch_addr + 3
-    bp_num = transport.set_checkpoint(bp_addr)
-    try:
-        transport.set_registers({"PC": scratch_addr})
-        transport.resume()
-        transport.wait_for_stopped(timeout=timeout)
-        regs = transport.read_registers()
-        return regs
-    finally:
-        transport.delete_checkpoint(bp_num)
-
 
 def _binary_wait_for_text(
     transport: BinaryViceTransport,
@@ -210,6 +158,35 @@ def vice_ethernet():
             allocator.release(port)
 
 
+@pytest.fixture
+def host_capture(vice_ethernet: BinaryViceTransport) -> PacketCapture:
+    """An open host-side capture on ``TAP_IFACE``, or a skip that names the fix.
+
+    Depends on ``vice_ethernet`` so the probe runs *after* the elevated
+    VICE has taken its two ``/dev/bpf*`` nodes: on macOS a root VICE takes
+    the lowest free nodes, which are exactly the ones ``chmod o+rw`` made
+    usable, so probing beforehand would report a pool this process no
+    longer has.
+
+    Skips only when :func:`open_capture` says the path is genuinely
+    absent, with its message -- which carries the operator's remedy
+    verbatim -- as the reason.  When the path exists the test runs, and
+    a silent wire is then a *failure* (see ``ethernet_scenarios``).
+    """
+    assert TAP_IFACE is not None
+    reason = capture_unavailable_reason(TAP_IFACE)
+    if reason is not None:
+        pytest.skip(f"no host-side capture on {TAP_IFACE}: {reason}")
+    try:
+        cap = open_capture(TAP_IFACE)
+    except CaptureUnavailable as e:  # pool changed between probe and open
+        pytest.skip(f"no host-side capture on {TAP_IFACE}: {e}")
+    try:
+        yield cap
+    finally:
+        cap.close()
+
+
 # ---------------------------------------------------------------------------
 # Part 2: CS8900a Probe Test
 # ---------------------------------------------------------------------------
@@ -226,7 +203,7 @@ class TestCS8900aProbe:
         """
         transport = vice_ethernet
 
-        probe_code = _clockport_enable_code() + bytes([
+        probe_code = clockport_enable_code() + bytes([
             0xA9, 0x00,                          # LDA #$00
             0x8D, PPTR & 0xFF, PPTR >> 8,        # STA $DE02 (PPPtr lo)
             0x8D, (PPTR + 1) & 0xFF, (PPTR + 1) >> 8,  # STA $DE03 (PPPtr hi)
@@ -238,7 +215,7 @@ class TestCS8900aProbe:
         ])
 
         load_code(transport, CODE_BASE, probe_code)
-        regs = _binary_jsr(transport, CODE_BASE, timeout=10)
+        binary_jsr(transport, CODE_BASE, timeout=10)
 
         result = read_bytes(transport, 0xC000, 2)
         chip_id = result[0] | (result[1] << 8)
@@ -253,292 +230,29 @@ class TestCS8900aProbe:
 # ---------------------------------------------------------------------------
 
 
-# Frame constants
-DEST_MAC = b"\xFF\xFF\xFF\xFF\xFF\xFF"  # broadcast
-SRC_MAC = b"\x00\x00\x00\x00\x00\x01"  # arbitrary
-ETHERTYPE = b"\x88\xB5"                  # local experimental
-FRAME_LEN = 64
-# Payload: fill with 0xC6, 0x40 ("C", "6" in a loose sense) repeated
-PAYLOAD_LEN = FRAME_LEN - 14  # 14 = 6+6+2 header
-PAYLOAD = bytes([0xC6, 0x40] * (PAYLOAD_LEN // 2))
-FRAME_DATA = DEST_MAC + SRC_MAC + ETHERTYPE + PAYLOAD
-
-# Buffer location in C64 RAM for the frame
-FRAME_BUF = 0xC200
-
-
-def _can_open_raw_socket(iface: str) -> bool:
-    """Whether we can capture frames off *iface* with an ``AF_PACKET`` socket.
-
-    ``AF_PACKET`` is Linux-only.  On macOS the attribute does not exist at
-    all, so this used to raise ``AttributeError`` straight through the
-    ``(PermissionError, OSError)`` handler and error the test rather than
-    skip it.  That went unnoticed while ``probe_vice_pcap_ok()`` skipped
-    the whole ethernet suite on macOS for an unrelated (and, as it turned
-    out, wrong) reason -- see docs/bridge_networking.md § "Issue #144 is
-    refuted".
-
-    macOS has no AF_PACKET equivalent; host-side capture there goes
-    through BPF/pcap, which these tests do not implement.  Returning
-    False produces an honest skip.  Porting them would mean writing a
-    BPF capture path -- a real gap, not a host limitation.
-    """
-    if not hasattr(socket, "AF_PACKET"):
-        return False
-    try:
-        s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
-        s.bind((iface, 0))
-        s.close()
-        return True
-    except (PermissionError, OSError):
-        return False
-
-
 class TestEthernetTX:
     """Send an ethernet frame from the C64 and capture it on the host."""
 
-    @pytest.fixture(autouse=True)
-    def _check_raw_socket(self) -> None:
-        if TAP_IFACE is None or not _can_open_raw_socket(TAP_IFACE):
-            pytest.skip(
-                "no AF_PACKET capture available on this host "
-                "(Linux needs CAP_NET_RAW; macOS has no AF_PACKET at all "
-                "and would need a BPF/pcap capture path, not implemented)"
-            )
+    def test_send_broadcast_frame(
+        self, vice_ethernet: BinaryViceTransport, host_capture: PacketCapture
+    ) -> None:
+        """C64 sends a 64-byte broadcast frame; the host must capture it.
 
-    def test_send_broadcast_frame(self, vice_ethernet: BinaryViceTransport) -> None:
-        """C64 sends a 64-byte broadcast frame; host captures it."""
-        transport = vice_ethernet
-
-        # Write the frame buffer into C64 RAM
-        write_bytes(transport, FRAME_BUF, FRAME_DATA)
-
-        # 6502 TX routine (RR-Net register layout)
-        tx_code = _clockport_enable_code() + bytes([
-            # TxCMD = 0x00C0 at $DE0C/$DE0D
-            0xA9, 0xC0,
-            0x8D, TXCMD & 0xFF, TXCMD >> 8,
-            0xA9, 0x00,
-            0x8D, (TXCMD + 1) & 0xFF, (TXCMD + 1) >> 8,
-
-            # TxLength = 64 at $DE0E/$DE0F
-            0xA9, 0x40,
-            0x8D, TXLEN & 0xFF, TXLEN >> 8,
-            0xA9, 0x00,
-            0x8D, (TXLEN + 1) & 0xFF, (TXLEN + 1) >> 8,
-
-            # PPPtr = 0x0138 (BusST)
-            0xA9, 0x38,
-            0x8D, PPTR & 0xFF, PPTR >> 8,
-            0xA9, 0x01,
-            0x8D, (PPTR + 1) & 0xFF, (PPTR + 1) >> 8,
-            # Poll PPData hi (bit 0 = Rdy4TxNOW)
-            0xAD, (PPDATA + 1) & 0xFF, (PPDATA + 1) >> 8,
-            0x29, 0x01,
-            0xF0, 0xF9,  # BEQ back -7
-
-            # ZP $FB/$FC = FRAME_BUF
-            0xA9, FRAME_BUF & 0xFF, 0x85, 0xFB,
-            0xA9, (FRAME_BUF >> 8) & 0xFF, 0x85, 0xFC,
-
-            # Write 64 bytes to RTDATA ($DE08/$DE09)
-            0xA0, 0x00,
-            # .loop:
-            0xB1, 0xFB,
-            0x8D, RTDATA & 0xFF, RTDATA >> 8,
-            0xC8,
-            0xB1, 0xFB,
-            0x8D, (RTDATA + 1) & 0xFF, (RTDATA + 1) >> 8,
-            0xC8,
-            0xC0, 0x40,
-            0xD0, 0xF0,  # BNE -16
-
-            # Success
-            0xA9, 0x01,
-            0x8D, 0x00, 0xC0,
-            0x60,
-        ])
-
-        load_code(transport, CODE_BASE, tx_code)
-        # Clear success flag
-        write_bytes(transport, 0xC000, [0x00])
-
-        # Open raw socket on TAP BEFORE executing
-        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
-        sock.bind((TAP_IFACE, 0))
-        sock.settimeout(5.0)
-
-        try:
-            # Execute TX routine via binary checkpoint mechanism
-            regs = _binary_jsr(transport, CODE_BASE, timeout=10)
-
-            # Verify success flag
-            flag = read_bytes(transport, 0xC000, 1)
-            assert flag[0] == 0x01, "TX routine did not complete (success flag not set)"
-
-            # Capture packet
-            captured = sock.recv(1518)
-
-            # Verify frame contents
-            assert len(captured) >= FRAME_LEN, \
-                f"Captured frame too short: {len(captured)} < {FRAME_LEN}"
-            assert captured[:6] == DEST_MAC, \
-                f"Dest MAC mismatch: {captured[:6].hex()}"
-            assert captured[6:12] == SRC_MAC, \
-                f"Source MAC mismatch: {captured[6:12].hex()}"
-            assert captured[12:14] == ETHERTYPE, \
-                f"EtherType mismatch: {captured[12:14].hex()}"
-            # Check at least the first few payload bytes
-            assert captured[14:18] == PAYLOAD[:4], \
-                f"Payload mismatch: {captured[14:18].hex()} != {PAYLOAD[:4].hex()}"
-        finally:
-            sock.close()
+        The capture is open and bound before the routine runs.  No frame
+        with our ethertype within 5 s is an AssertionError, not a skip.
+        """
+        run_tx_scenario(vice_ethernet, host_capture, timeout=5.0)
 
 
 class TestEthernetRX:
     """Send a packet from the host and have the C64 receive it."""
 
-    @pytest.fixture(autouse=True)
-    def _check_raw_socket(self) -> None:
-        if TAP_IFACE is None or not _can_open_raw_socket(TAP_IFACE):
-            pytest.skip(
-                "no AF_PACKET capture available on this host "
-                "(Linux needs CAP_NET_RAW; macOS has no AF_PACKET at all "
-                "and would need a BPF/pcap capture path, not implemented)"
-            )
+    def test_receive_frame(
+        self, vice_ethernet: BinaryViceTransport, host_capture: PacketCapture
+    ) -> None:
+        """Host injects a frame on the interface; the C64 reads it via CS8900a RX.
 
-    def test_receive_frame(self, vice_ethernet: BinaryViceTransport) -> None:
-        """Host sends a frame to the TAP; C64 reads it via CS8900a RX."""
-        transport = vice_ethernet
-
-        # Build a frame to send from host
-        # Dest MAC: use the CS8900a's MAC or broadcast
-        rx_dest_mac = b"\xFF\xFF\xFF\xFF\xFF\xFF"
-        rx_src_mac = b"\x00\x00\x00\x00\x00\x02"
-        rx_ethertype = b"\x88\xB5"
-        rx_marker = b"\xDE\xAD\xBE\xEF"
-        rx_payload = rx_marker + b"\x00" * (FRAME_LEN - 14 - len(rx_marker))
-        rx_frame = rx_dest_mac + rx_src_mac + rx_ethertype + rx_payload
-
-        # 6502 RX routine:
-        # 1. Poll RxEvent (PP 0x0124) for RxOK (bit 8)
-        # 2. Read RxStatus from $DE00/$DE01
-        # 3. Read RxLength from $DE00/$DE01
-        # 4. Read first 4 payload bytes (skip 14-byte header = 7 word reads)
-        # 5. Store marker at $C000-$C003
-        # Note: uses a timeout counter to avoid infinite loop
-        rtd_lo = RTDATA & 0xFF
-        rtd_h_lo = (RTDATA + 1) & 0xFF
-        # For RR-Net: RTDATA at $DE08/$DE09. The high byte of both addresses
-        # is 0xDE so we hard-code it via the constants.
-        rx_code = _clockport_enable_code() + bytes([
-            # PPPtr = 0x0124 (RxEvent)
-            0xA9, 0x24, 0x8D, PPTR & 0xFF, PPTR >> 8,
-            0xA9, 0x01, 0x8D, (PPTR + 1) & 0xFF, (PPTR + 1) >> 8,
-
-            # Timeout counter 16-bit at $FD/$FE
-            0xA9, 0xFF, 0x85, 0xFD, 0x85, 0xFE,
-
-            # .poll:
-            0xAD, (PPDATA + 1) & 0xFF, (PPDATA + 1) >> 8,  # LDA PPData hi
-            0x29, 0x01,
-            0xD0, 0x0E,  # BNE .got_packet (+14)
-
-            # Decrement timeout
-            0xC6, 0xFD, 0xD0, 0xF5,  # DEC $FD; BNE .poll  (-11)
-            0xC6, 0xFE, 0xD0, 0xF1,  # DEC $FE; BNE .poll  (-15)
-
-            # Timeout -> $C000 = 0xFF
-            0xA9, 0xFF, 0x8D, 0x00, 0xC0, 0x60,
-
-            # .got_packet:
-            # Read RxStatus (2 bytes, discard) -- from RTDATA
-            0xAD, rtd_lo, 0xDE,
-            0xAD, rtd_h_lo, 0xDE,
-            # Read RxLength (2 bytes, discard)
-            0xAD, rtd_lo, 0xDE,
-            0xAD, rtd_h_lo, 0xDE,
-
-            # Skip ethernet header: 14 bytes = 7 word reads
-            0xA2, 0x07,
-            # .skip:
-            0xAD, rtd_lo, 0xDE,
-            0xAD, rtd_h_lo, 0xDE,
-            0xCA,
-            0xD0, 0xF8,  # BNE -8
-
-            # Read 4 marker bytes (2 word reads)
-            0xAD, rtd_lo, 0xDE,
-            0x8D, 0x00, 0xC0,
-            0xAD, rtd_h_lo, 0xDE,
-            0x8D, 0x01, 0xC0,
-            0xAD, rtd_lo, 0xDE,
-            0x8D, 0x02, 0xC0,
-            0xAD, rtd_h_lo, 0xDE,
-            0x8D, 0x03, 0xC0,
-
-            # Success
-            0xA9, 0x01, 0x8D, 0x04, 0xC0, 0x60,
-        ])
-
-        load_code(transport, CODE_BASE, rx_code)
-        # Clear result area
-        write_bytes(transport, 0xC000, [0x00] * 5)
-
-        # We need to execute the RX routine, then send the packet while
-        # the routine is polling. Use goto() + send packet + wait_for_stopped
-        # on the RTS address.
-
-        # For binary transport, we use set_checkpoint on the RTS + resume,
-        # then send the packet from a thread while the C64 polls.
-        import threading
-
-        # Write a trampoline at scratch area and set breakpoint after JSR
-        scratch_addr = 0x0334
-        trampoline = bytes([
-            0x20, CODE_BASE & 0xFF, (CODE_BASE >> 8) & 0xFF,  # JSR CODE_BASE
-            0xEA,  # NOP (breakpoint here)
-            0xEA,  # NOP
-        ])
-        transport.write_memory(scratch_addr, trampoline)
-        bp_addr = scratch_addr + 3
-        bp_num = transport.set_checkpoint(bp_addr)
-
-        def _send_packet_delayed():
-            """Send the RX frame after a short delay."""
-            time.sleep(0.5)
-            try:
-                sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
-                sock.bind((TAP_IFACE, 0))
-                sock.send(rx_frame)
-                sock.close()
-            except OSError:
-                pass
-
-        sender = threading.Thread(target=_send_packet_delayed, daemon=True)
-        sender.start()
-
-        try:
-            transport.set_registers({"PC": scratch_addr})
-            transport.resume()
-            transport.wait_for_stopped(timeout=15)
-            regs = transport.read_registers()
-        finally:
-            transport.delete_checkpoint(bp_num)
-
-        sender.join(timeout=2)
-
-        # Check results
-        result = read_bytes(transport, 0xC000, 5)
-        success = result[4]
-
-        if result[0] == 0xFF and success != 0x01:
-            pytest.skip("RX poll timed out -- packet may not have reached CS8900a")
-
-        assert success == 0x01, \
-            f"RX routine did not complete successfully (flag=0x{success:02X})"
-
-        # Verify marker bytes
-        marker = bytes(result[:4])
-        assert marker == rx_marker, \
-            f"RX marker mismatch: got {marker.hex()}, expected {rx_marker.hex()}"
+        A failed host send, or a C64 poll timeout (the frame never reached
+        the chip), is an AssertionError, not a skip.
+        """
+        run_rx_scenario(vice_ethernet, host_capture, send_delay=0.5, timeout=15.0)
