@@ -150,31 +150,14 @@ def wait_for_pc(
 #: emulator or the transport, not the probe.
 RECOVERY_PROBE_TIMEOUT = 5.0
 
-#: The two harness-owned trampoline slots (docs/memory_safety.md).  The
-#: recovery ``RTS`` goes in whichever one the current call is not using.
-_TRAMPOLINE_SLOTS = (0x0360, 0x0334)
-_TRAMPOLINE_LEN = 5
-
-
-def _recovery_rts_addr(scratch_addr: int) -> int:
-    """Pick the byte the hang-recovery ``RTS`` is written to.
-
-    Default ``$0360``: the first byte of :func:`run_subroutine`'s
-    documented trampoline slot.  It is already harness scratch, nothing is
-    mid-flight there while ``jsr`` is recovering (one CPU, one Python
-    thread), and ``run_subroutine`` rewrites it on every call so a
-    leftover ``$60`` is inert.  When the caller's own trampoline covers
-    ``$0360`` -- which is exactly what ``run_subroutine`` on VICE does --
-    the ``RTS`` moves to the ``$0334`` slot instead, which that call is
-    then not using.  No new address is claimed either way.
-    """
-    for slot in _TRAMPOLINE_SLOTS:
-        if not (scratch_addr <= slot < scratch_addr + _TRAMPOLINE_LEN):
-            return slot
-    # Unreachable with a 5-byte trampoline: the slots are $2C apart.
-    raise ValueError(  # pragma: no cover
-        f"trampoline at ${scratch_addr:04X} covers both recovery slots"
-    )
+#: Trampoline tails.  The normal call parks two NOPs after the JSR; the
+#: breakpoint sits on the first, so the second is never executed.  The
+#: hang-recovery probe turns that spare byte into an RTS and JSRs it, so
+#: the whole probe fits in the five bytes the caller already owns.
+_TAIL_NOP_NOP = bytes([0xEA, 0xEA])
+_TAIL_NOP_RTS = bytes([0xEA, 0x60])
+#: Offset of that spare byte from the trampoline start.
+_PROBE_RTS_OFFSET = 4
 
 
 def _jsr_once(
@@ -182,12 +165,13 @@ def _jsr_once(
     addr: int,
     timeout: float,
     scratch_addr: int,
+    tail: bytes = _TAIL_NOP_NOP,
 ) -> dict[str, int]:
     """One trampoline round-trip; the machinery :func:`jsr` documents."""
-    # Build trampoline: JSR $xxxx; NOP; NOP
+    # Build trampoline: JSR $xxxx; NOP; NOP   (or NOP; RTS for the probe)
     lo = addr & 0xFF
     hi = (addr >> 8) & 0xFF
-    trampoline = bytes([0x20, lo, hi, 0xEA, 0xEA])  # JSR, NOP, NOP
+    trampoline = bytes([0x20, lo, hi]) + tail
     transport.write_memory(scratch_addr, trampoline)
 
     bp_addr = scratch_addr + 3
@@ -224,14 +208,14 @@ def _recover_from_hang(
         # (b) Drop the hung routine's frames and the trampoline's return
         # address in one move.
         transport.set_registers({"SP": saved_sp})
-        # (c) A single RTS in the harness slot this call is not using.
-        rts_addr = _recovery_rts_addr(scratch_addr)
-        transport.write_memory(rts_addr, bytes([0x60]))
-        # (d) Prove the trampoline is live rather than assume it: the JSR
-        # must push, the RTS must pop, and the checkpoint must fire at
-        # the post-RTS landing.  _jsr_once so a probe hang cannot recurse.
+        # (c)+(d) Prove the trampoline is live rather than assume it,
+        # using only the caller's five bytes: JSR <scratch+4>; NOP; RTS.
+        # The JSR must push, the RTS must pop, and the checkpoint on the
+        # NOP must fire at the post-RTS landing.  _jsr_once so a probe
+        # hang cannot recurse.
+        rts_addr = scratch_addr + _PROBE_RTS_OFFSET
         regs = _jsr_once(transport, rts_addr, RECOVERY_PROBE_TIMEOUT,
-                         scratch_addr)
+                         scratch_addr, tail=_TAIL_NOP_RTS)
     except _RECOVERY_ERRORS as e:
         return False, f"recovery probe failed: {e}", hung_pc
     pc = regs.get("PC")
@@ -288,11 +272,12 @@ def jsr(
     trampoline's return frame — the next ``jsr`` on that transport is not
     safe.  With ``recover_on_timeout=True`` the SP is captured before the
     call and, on timeout, the harness (a) reads the registers, (b)
-    restores SP, (c) writes a single ``RTS`` into the harness trampoline
-    slot this call is not using (``$0360``, or ``$0334`` when the caller's
-    trampoline is at ``$0360``), (d) ``JSR``\\ s it through the trampoline
-    with :data:`RECOVERY_PROBE_TIMEOUT` and checks the CPU stops at the
-    post-``RTS`` landing (*scratch_addr* + 3, ``$0337`` by default), then
+    restores SP, (c) rewrites the trampoline as ``JSR scratch_addr+4;
+    NOP; RTS`` — the never-executed second ``NOP`` becomes the ``RTS``,
+    so the probe touches no byte outside the five the caller already
+    owns — (d) runs it with :data:`RECOVERY_PROBE_TIMEOUT` and checks
+    the CPU stops at the post-``RTS`` landing (*scratch_addr* + 3,
+    ``$0337`` by default), then
     (e) raises :class:`RoutineHung` — a ``TimeoutError`` subclass — whose
     ``recovered`` says whether the next call is safe.
 

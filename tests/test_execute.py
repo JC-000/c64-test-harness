@@ -514,12 +514,13 @@ def test_jsr_recover_on_timeout_success():
     # hang had lowered it.
     assert {"SP": 0xF7} in t._set_registers_calls
     assert t._registers["SP"] == 0xF7
-    # (c) a single RTS at the run_subroutine slot, which this call's own
-    # trampoline ($0334-$0338) does not touch.
-    assert (0x0360, [0x60]) in t.written_memory
-    # (d) the probe went through the trampoline: JSR $0360 written at
-    # $0334, breakpoint at $0337, and a second resume.
-    assert (0x0334, [0x20, 0x60, 0x03, 0xEA, 0xEA]) in t.written_memory
+    # (c)+(d) the probe reuses the five trampoline bytes and nothing else:
+    # JSR $0338; NOP; RTS -- the second NOP becomes the RTS, the JSR
+    # targets it, and the checkpoint on the first NOP catches the return.
+    assert t.written_memory == [
+        (0x0334, [0x20, 0x00, 0xC1, 0xEA, 0xEA]),   # the hung call
+        (0x0334, [0x20, 0x38, 0x03, 0xEA, 0x60]),   # the probe
+    ]
     assert t._checkpoint_history == [0x0337, 0x0337]
     assert t._resume_count == 2
     # The probe used its own short timeout, not the caller's.
@@ -604,27 +605,53 @@ def test_jsr_recover_on_timeout_register_read_failure():
     assert exc.recovered is False
     assert exc.hung_pc is None
     assert "socket closed" in exc.detail
-    # No probe was attempted on a machine that does not answer.
-    assert (0x0360, [0x60]) not in t.written_memory
+    # No probe was attempted on a machine that does not answer: the only
+    # write is the hung call's own trampoline.
+    assert len(t.written_memory) == 1
     assert t._resume_count == 1
 
 
-def test_jsr_recover_on_timeout_uses_other_slot_when_trampoline_is_at_0360():
-    """run_subroutine on VICE calls jsr with scratch_addr=0x0360; the RTS
-    must not land inside that trampoline, so it moves to the $0334 slot."""
+def test_jsr_recovery_writes_nothing_outside_the_callers_trampoline():
+    """A custom scratch_addr is the only memory recovery may touch: every
+    byte written during the whole call lies in [scratch_addr, scratch_addr+5).
+    The harness claims no second slot for the RTS."""
+    scratch = 0x0360
     t = ScriptedStopMockTransport(
-        [TimeoutError("No stopped event within 2.0s"), 0x0363],
+        [TimeoutError("No stopped event within 2.0s"), scratch + 3],
     )
     t._registers["SP"] = 0xF7
     with pytest.raises(RoutineHung) as excinfo:
-        jsr(t, 0xC100, timeout=2.0, scratch_addr=0x0360,
+        jsr(t, 0xC100, timeout=2.0, scratch_addr=scratch,
             recover_on_timeout=True)
     assert excinfo.value.recovered is True
-    assert (0x0334, [0x60]) in t.written_memory
-    assert (0x0360, [0x60]) not in t.written_memory
-    # The probe trampoline stays where the caller put it and JSRs $0334.
-    assert (0x0360, [0x20, 0x34, 0x03, 0xEA, 0xEA]) in t.written_memory
-    assert "$0363" in excinfo.value.detail
+    assert len(t.written_memory) == 2
+    for addr, data in t.written_memory:
+        assert addr == scratch
+        assert scratch <= addr and addr + len(data) <= scratch + 5, (
+            f"write at ${addr:04X} x{len(data)} escapes the trampoline"
+        )
+    assert f"${scratch + 3:04X}" in excinfo.value.detail
+
+
+def test_jsr_recovery_trampoline_is_jsr_to_its_own_rts():
+    """The probe trampoline is exactly ``20 lo hi EA 60`` with the JSR
+    target at scratch_addr + 4 -- the RTS that replaced the second NOP."""
+    scratch = 0x0360
+    t = ScriptedStopMockTransport(
+        [TimeoutError("No stopped event within 2.0s"), scratch + 3],
+    )
+    t._registers["SP"] = 0xF7
+    with pytest.raises(RoutineHung):
+        jsr(t, 0xC100, timeout=2.0, scratch_addr=scratch,
+            recover_on_timeout=True)
+    target = scratch + 4
+    assert t.written_memory[-1] == (
+        scratch, [0x20, target & 0xFF, target >> 8, 0xEA, 0x60],
+    )
+    assert t.written_memory[-1] == (0x0360, [0x20, 0x64, 0x03, 0xEA, 0x60])
+    # Probe PC was steered to the trampoline start; landing is +3.
+    assert t._set_registers_calls[-1] == {"PC": scratch}
+    assert t._checkpoint_history[-1] == scratch + 3
 
 
 def test_routine_hung_is_exported_from_package_root():
