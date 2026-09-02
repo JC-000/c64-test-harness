@@ -742,3 +742,67 @@ def test_e2e_notice_counts_per_affected_test_not_per_fixture_call(pytester):
     result = pytester.runpytest()
     result.assert_outcomes(skipped=3)
     result.stdout.fnmatch_lines(["*ELEVATION REQUIRED: 3 test(s) skipped*"])
+
+
+# ---------------------------------------------------------------------------
+# N4 (adversarial review): the "at most once per session" cache claim
+# needs to be proven through pytest_runtest_setup composing across TWO
+# real, separately collected items -- not only by calling
+# check_elevation() directly twice in the same test, which says nothing
+# about whether the hook actually reuses one cache across items.
+# ---------------------------------------------------------------------------
+
+
+def test_e2e_probe_runs_once_across_two_items_sharing_a_kind(pytester):
+    """Two different tests, same elevation("vice_root") kind and kwargs,
+    driven through real collection + pytest_runtest_setup for each --
+    the probe must still execute exactly once."""
+    pytester.makeconftest(
+        """
+        import pytest
+
+        calls = []
+
+        def pytest_configure(config):
+            config.addinivalue_line("markers", "elevation(kind, **kw): test")
+
+        def _counting_probe(**kwargs):
+            calls.append(kwargs)
+            return True, ""
+
+        _PROBES = {"vice_root": _counting_probe}
+        _cache = {}
+
+        @pytest.hookimpl(tryfirst=True)
+        def pytest_runtest_setup(item):
+            for marker in item.iter_markers("elevation"):
+                kind, kwargs = marker.args[0], dict(marker.kwargs)
+                key = (kind, tuple(sorted(kwargs.items())))
+                if key not in _cache:
+                    _cache[key] = _PROBES[kind](**kwargs)
+                ok, remedy = _cache[key]
+                if not ok:
+                    pytest.skip(f"elevation required ({kind}): {remedy}")
+
+        def pytest_sessionfinish(session, exitstatus):
+            reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+            if reporter is not None:
+                reporter.write_line(f"PROBE CALLS: {len(calls)}")
+        """
+    )
+    pytester.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.elevation("vice_root")
+        def test_a():
+            pass
+
+        @pytest.mark.elevation("vice_root")
+        def test_b():
+            pass
+        """
+    )
+    result = pytester.runpytest()
+    result.assert_outcomes(passed=2)
+    result.stdout.fnmatch_lines(["PROBE CALLS: 1"])
