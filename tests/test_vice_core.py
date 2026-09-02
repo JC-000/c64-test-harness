@@ -40,6 +40,11 @@ pytestmark = pytest.mark.vice_live
 CODE_BASE = 0xC000
 DATA_BASE = 0xC100
 
+# Default screen RAM, blanked by _restore_basic() so no test starts with a
+# needle already on screen.
+_SCREEN_RAM = 0x0400
+_SCREEN_CELLS = 40 * 25
+
 #: PC sampled at the end of each poll window by the last
 #: :func:`_wait_for_text_binary` call, read by the failure report.
 _LAST_POLL_TRACE: list[int] = []
@@ -306,6 +311,57 @@ def _restore_basic(transport):
     transport.resume()
     wait_for_stable(transport, timeout=5.0, poll_interval=0.15, stable_count=2)
 
+    # Third step: start every test on a blank screen.
+    #
+    # Nothing above clears the screen, so a needle a test waits for can
+    # already be there from an earlier test -- TestScreen types
+    # ``PRINT 6*7`` and the keyboard test that waits for ``7`` was
+    # satisfied by that echo before its first keystroke was processed.
+    # A ``send_key`` that did nothing passed.
+    #
+    # Blank the screen RAM synchronously while the CPU is paused (a
+    # monitor write, not a keystroke, so it does not depend on the code
+    # under test), then have BASIC execute an empty statement so the
+    # ``READY.`` that appears is one this fixture caused -- it cannot be
+    # the previous test's, because the screen was blank the instant
+    # before.  That also makes the fixtures' ``READY.`` assertions mean
+    # what they say.  Injected straight into the KERNAL buffer for the
+    # same reason the clear is a monitor write: the keyboard tests are
+    # what proves ``send_key`` works, so they must not rely on it.
+    #
+    #   $93  shift+CLR/HOME: clears the screen editor's state and homes
+    #        the cursor, so output lands at the top rather than wherever
+    #        the last test left the cursor.
+    #   ":"  an empty statement -- executes nothing, but is a non-empty
+    #        line, so BASIC prints READY. afterwards (an empty line just
+    #        loops back to input without one).
+    #   $0D  RETURN.
+    transport.write_memory(_SCREEN_RAM, b"\x20" * _SCREEN_CELLS)
+    transport.write_memory(0x0277, bytes([0x93, 0x3A, 0x0D]))
+    transport.write_memory(0x00C6, b"\x03")
+    grid = _wait_for_text_binary(transport, "READY.", timeout=10.0, poll_interval=0.2)
+    assert grid is not None, (
+        "BASIC did not print READY. after the screen was blanked and an "
+        "empty statement queued -- the previous test left the machine "
+        "in a state _restore_basic cannot recover from.\n"
+        + _machine_failure_report(transport, "READY.")
+    )
+
+
+def _assert_needle_absent(transport, needle: str) -> None:
+    """Precondition for every test that waits for *needle* to appear.
+
+    A wait that returns the instant it starts has measured nothing, and
+    that is exactly what happened when the needle was already on screen
+    from an earlier test.  Fail loudly *before* sending a key, so the
+    failure names the leak rather than looking like a passing test.
+    """
+    grid = ScreenGrid.from_transport(transport)
+    assert needle.upper() not in grid.continuous_text().upper(), (
+        f"{needle!r} is already on screen before any key was sent, so the "
+        f"wait for it below could not fail:\n" + grid.dump("screen before keys")
+    )
+
 
 # ======================================================================
 # Execution control
@@ -471,6 +527,7 @@ class TestScreen:
         #
         # An arithmetic result is the clean discriminator: 42 appears on
         # screen only because BASIC evaluated it.
+        _assert_needle_absent(binary_transport, "42")
         send_text(binary_transport, "PRINT 6*7\r")
         # Resume so BASIC processes the keystrokes
         binary_transport.resume()
@@ -512,10 +569,14 @@ class TestKeyboard:
 
         # Prove the CPU is executing *before* trusting anything on screen.
         #
-        # ``READY.`` is left on screen by the previous test and
-        # ``_restore_basic`` never clears it, so asserting on it is the
-        # false-completion signal this repo documents (c33b5c4, issue
-        # #138): it cannot tell "BASIC is ready now" from "the screen
+        # ``_restore_basic`` now blanks the screen before waiting for its
+        # own ``READY.``, so that wait is no longer satisfiable by the
+        # previous test's output.  This PC check is kept as the more
+        # direct instrument: when the restore's wait *does* time out, the
+        # report here says whether the 6510 ever left the stub, which the
+        # screen cannot.  Before the blanking, asserting on ``READY.`` was
+        # the false-completion signal this repo documents (c33b5c4, issue
+        # #138): it could not tell "BASIC is ready now" from "the screen
         # still shows READY. from the last test and the 6510 is wedged".
         # That is exactly the shape of the intermittent failure these
         # tests show — the fixture passes, then the three tests that need
@@ -545,6 +606,7 @@ class TestKeyboard:
 
     def test_send_text_basic_command(self, binary_transport) -> None:
         """send_text PRINT 2+3, verify '5' appears on screen."""
+        _assert_needle_absent(binary_transport, "5")
         send_text(binary_transport, "PRINT 2+3\r")
         binary_transport.resume()
         grid = _wait_for_text_binary(binary_transport, "5", timeout=15)
@@ -554,7 +616,13 @@ class TestKeyboard:
         """Individual send_key calls form a BASIC command."""
         # "PRINT 7" waiting for "7" was satisfied by its own echo; the
         # sum keeps the per-character exercise and moves the needle out of
-        # the typed text.
+        # the typed text.  Moving it out of the typed text was not enough
+        # on its own: TestScreen's ``PRINT 6*7`` echo also contains a 7,
+        # and until _restore_basic blanked the screen it was still there
+        # when this test started -- so the wait below returned before the
+        # first send_key was processed, and a send_key that did nothing
+        # passed.  The precondition makes that leak a failure here.
+        _assert_needle_absent(binary_transport, "7")
         for ch in "PRINT 3+4\r":
             send_key(binary_transport, ch)
         binary_transport.resume()
@@ -568,6 +636,7 @@ class TestKeyboard:
         # waited for the very string it had just typed.
         cmd = 'PRINT LEN("ABCDEFGHIJKLMNOPQRST")\r'
         assert len(cmd) > 31, "must still span four keyboard batches"
+        _assert_needle_absent(binary_transport, "20")
         send_text(binary_transport, cmd)
         binary_transport.resume()
         grid = _wait_for_text_binary(binary_transport, "20", timeout=15)
