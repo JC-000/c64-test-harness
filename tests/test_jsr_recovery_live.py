@@ -37,12 +37,18 @@ POST_RTS_LANDING = 0x0337
 def test_hung_routine_is_recovered_and_the_next_call_runs(binary_transport):
     t = binary_transport
 
-    # JMP * -- an infinite loop that never RTSes.
-    load_code(t, HANG_ADDR, [0x4C, HANG_ADDR & 0xFF, HANG_ADDR >> 8])
+    # SEI; JMP * -- an infinite loop that never RTSes.  The SEI is what
+    # makes hung_pc deterministic: the monitor pauses at the next
+    # instruction boundary from a per-frame hook, and the KERNAL's CIA
+    # IRQ is not frame-aligned, so with I clear the pause can land inside
+    # $EA31 instead of on the loop.  It also exercises the SEI'd-routine
+    # case a real hang often is.
+    loop = HANG_ADDR + 1
+    load_code(t, HANG_ADDR, [0x78, 0x4C, loop & 0xFF, loop >> 8])
     # INC $C000; RTS -- observable side effect, then a clean return.
     load_code(t, INC_ADDR, [0xEE, COUNTER_ADDR & 0xFF, COUNTER_ADDR >> 8, 0x60])
     t.write_memory(COUNTER_ADDR, bytes([0x41]))
-    assert t.read_memory(HANG_ADDR, 3) == b"\x4c\x00\xc1", "hang loop did not land"
+    assert t.read_memory(HANG_ADDR, 4) == b"\x78\x4c\x01\xc1", "hang loop did not land"
     assert t.read_memory(INC_ADDR, 4) == b"\xee\x00\xc0\x60", "INC routine did not land"
 
     sp_before = t.read_registers()["SP"]
@@ -56,8 +62,9 @@ def test_hung_routine_is_recovered_and_the_next_call_runs(binary_transport):
     assert exc.addr == HANG_ADDR
     assert exc.elapsed >= 2.0, exc.elapsed
     # Binmon answered while the CPU was spinning: the register read landed
-    # and found the CPU on the only instruction the loop has.
-    assert exc.hung_pc == HANG_ADDR, str(exc)
+    # and found the CPU on the JMP -- the only instruction the loop has
+    # once the SEI has executed.
+    assert exc.hung_pc == HANG_ADDR + 1, str(exc)
     assert exc.recovered is True, str(exc)
     assert f"${POST_RTS_LANDING:04X}" in exc.detail, exc.detail
 
