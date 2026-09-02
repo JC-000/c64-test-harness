@@ -190,6 +190,221 @@ class MemoryRegion:
         return f"${self.start:04X}-${end_incl:04X}{suffix}"
 
 
+# ---------------------------------------------------------------------------
+# The harness's own scratch addresses (issue #169)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ScratchRegion:
+    """One fixed address range the harness itself writes during normal use.
+
+    ``HARNESS_SCRATCH`` is the machine-readable form of the table in
+    ``docs/memory_safety.md`` (which is *generated* from it by
+    ``scripts/gen_memory_table.py``).  :class:`MemoryArbiter` consults
+    it by default so it never hands a consumer an address the harness
+    is about to overwrite, and :meth:`MemoryPolicy.from_prg` warns when
+    a consumer's load image overlaps one.
+
+    ``end`` is exclusive, like :class:`MemoryRegion`.  ``owner`` is the
+    dotted path of the writer; ``configurable`` names the kwarg or
+    constant that moves the address (``"hardcoded"`` when nothing
+    does).  ``transient`` marks spans whose prior contents are saved
+    first and restored afterwards — still a write, so still declared,
+    but not withheld from allocation by default.
+    """
+
+    start: int
+    end: int
+    owner: str
+    purpose: str
+    configurable: str = "hardcoded"
+    transient: bool = False
+
+    def __post_init__(self) -> None:
+        # Reuse MemoryRegion's bounds validation.
+        MemoryRegion(self.start, self.end)
+
+    @property
+    def length(self) -> int:
+        return self.end - self.start
+
+    @property
+    def span(self) -> str:
+        """Inclusive ``$XXXX-$YYYY`` form; a single byte prints as ``$XXXX``."""
+        if self.length == 1:
+            return f"${self.start:04X}"
+        return f"${self.start:04X}-${self.end - 1:04X}"
+
+    @property
+    def region(self) -> MemoryRegion:
+        return MemoryRegion(
+            self.start, self.end, note=f"harness scratch: {self.owner}"
+        )
+
+
+#: Every fixed C64 RAM address the harness writes as part of normal
+#: operation, verified against the code that performs the write (the
+#: owner column).  Keep sorted by ``(start, end)``.  Overlaps between
+#: entries are expected — several features share the cassette buffer
+#: and the ``$C000`` page.  I/O-register writes (``$D000-$DFFF``:
+#: CIA/REC/UCI/CS8900a) are not RAM and are not listed.
+HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
+    ScratchRegion(
+        0x0000, 0x0002,
+        owner="snapshot.restore_snapshot",
+        purpose="6510 CPU port direction/data re-asserted after the RAM "
+                "restore (override=\"snapshot-restore\")",
+        configurable="restore-time only; carries override=",
+    ),
+    ScratchRegion(
+        0x00C6, 0x00C7,
+        owner="uci_network._execute_uci_routine, "
+              "backends.ultimate64.Ultimate64Transport.inject_keys",
+        purpose="KERNAL NDX — keyboard-buffer fill count set after a "
+                "SYS/text injection",
+        configurable="KERNAL-mandated (keybuf_count_addr= on U64 transport)",
+    ),
+    ScratchRegion(
+        0x0277, 0x0281,
+        owner="uci_network._execute_uci_routine, "
+              "backends.ultimate64.Ultimate64Transport.inject_keys",
+        purpose="KERNAL KEYD — 10-byte keyboard buffer receiving "
+                "\"SYS<addr>\\r\" or injected text",
+        configurable="KERNAL-mandated (keybuf_addr= on U64 transport)",
+    ),
+    ScratchRegion(
+        0x0314, 0x0316,
+        owner="sid_player.stop_sid_vice",
+        purpose="RAM IRQ vector (CINV) restored to $EA31; the installer "
+                "stub also patches it from 6502 code",
+        configurable="hardcoded",
+    ),
+    ScratchRegion(
+        0x0334, 0x0339,
+        owner="execute.jsr",
+        purpose="JSR addr / NOP / NOP trampoline; checkpoint at +3",
+        configurable="scratch_addr=",
+    ),
+    ScratchRegion(
+        0x0334, 0x03B4,
+        owner="backends.ultimate64_probe.liveness_probe",
+        purpose="128-byte writemem POST round-trip payload (raw REST, "
+                "bypasses the transport policy); original bytes read "
+                "first and written back",
+        configurable="hardcoded",
+        transient=True,
+    ),
+    ScratchRegion(
+        0x0339, 0x033C,
+        owner="sid_player.play_sid_vice",
+        purpose="park JMP ($A002) executed after the installer so "
+                "resume() lands in BASIC warm start",
+        configurable="_PARK_ADDR constant",
+    ),
+    ScratchRegion(
+        0x033C, 0x0342,
+        owner="sid_player.play_sid_vice",
+        purpose="song trampoline: LDA #song / JSR init / RTS",
+        configurable="_SONG_TRAMPOLINE_ADDR constant",
+    ),
+    ScratchRegion(
+        0x0360, 0x036E,
+        owner="execute.run_subroutine (U64 path)",
+        purpose="14-byte sentinel trampoline; on VICE the 5-byte jsr() "
+                "trampoline is written here instead",
+        configurable="trampoline_addr=",
+    ),
+    ScratchRegion(
+        0x03F0, 0x03F2,
+        owner="execute.run_subroutine (U64 path)",
+        purpose="running / done flag bytes polled by the host",
+        configurable="hardcoded",
+    ),
+    ScratchRegion(
+        0x0800, 0x8800,
+        owner="snapshot.extract_reu_contents",
+        purpose="32 KiB REU→C64 DMA staging window (opt-in "
+                "include_reu=True, override=\"reu-snapshot-staging\"); "
+                "contents saved before and restored after",
+        configurable="hardcoded",
+        transient=True,
+    ),
+    ScratchRegion(
+        0xC000, 0xC012,
+        owner="sid_player.play_sid_vice",
+        purpose="18-byte IRQ installer + wrapper stub",
+        configurable="stub_addr= (DEFAULT_STUB_ADDR)",
+    ),
+    ScratchRegion(
+        0xC000, 0xC040,
+        owner="bridge_ping.run_ping_and_wait / run_icmp_responder",
+        purpose="64-byte CS8900a RX peek routine",
+        configurable="peek_addr=",
+    ),
+    ScratchRegion(
+        0xC000, 0xC400,
+        owner="uci_network (build_uci_command, _execute_uci_routine)",
+        purpose="UCI stub block: code $C000, data $C100, response $C200, "
+                "status $C300, lengths $C3F0-$C3F3, sentinel $C3FE, "
+                "error $C3FF",
+        configurable="code_addr= for the routine; buffers hardcoded",
+    ),
+    ScratchRegion(
+        0xC100, 0xC265,
+        owner="bridge_ping.run_ping_and_wait / run_icmp_responder",
+        purpose="TX / echo-match / echo-respond routines (largest "
+                "357 bytes)",
+        configurable="consume_addr=",
+    ),
+    ScratchRegion(
+        0xC400, 0xC403,
+        owner="uci_network.build_socket_write",
+        purpose="16-bit inner-loop countdown (lo, hi) + Y save slot "
+                "across the turbo fence",
+        configurable="hardcoded",
+    ),
+    ScratchRegion(
+        0xC403, 0xC404,
+        owner="uci_network.uci_socket_write",
+        purpose="socket-id slot for the lifted-cap write routine",
+        configurable="hardcoded",
+    ),
+    ScratchRegion(
+        0xC500, 0xC87E,
+        owner="uci_network.uci_socket_write",
+        purpose="data buffer (up to 892 bytes) followed by the 2-byte LE "
+                "length",
+        configurable="hardcoded",
+    ),
+    ScratchRegion(
+        0xCF00, 0xCF04,
+        owner="tests/test_vice_core.py::_restore_basic (also "
+              "scripts/vice_keyecho_probe.py, scripts/vice_stall_probe.py)",
+        purpose="CLI; JMP $E5CD stub returning the CPU to BASIC MAINLOOP "
+                "before every screen/keyboard test — test-suite scratch, "
+                "not library",
+        configurable="hardcoded",
+    ),
+)
+
+
+def harness_scratch_regions(
+    *, include_transient: bool = False
+) -> tuple[MemoryRegion, ...]:
+    """``HARNESS_SCRATCH`` as :class:`MemoryRegion` objects.
+
+    Transient spans (saved and restored around the write, e.g. the
+    32 KiB REU staging window) are omitted unless ``include_transient``
+    is set — reserving them by default would withhold half the address
+    space for a window that is put back the way it was found.
+    """
+    return tuple(
+        r.region for r in HARNESS_SCRATCH
+        if include_transient or not r.transient
+    )
+
+
 def _region_from_entry(entry: object) -> MemoryRegion:
     """Coerce a TOML/dict region entry into a :class:`MemoryRegion`.
 
@@ -478,8 +693,11 @@ def _fully_covered(
 
 
 __all__ = [
+    "HARNESS_SCRATCH",
     "MemoryPolicy",
     "MemoryPolicyError",
     "MemoryRegion",
+    "ScratchRegion",
     "UnknownPolicy",
+    "harness_scratch_regions",
 ]
