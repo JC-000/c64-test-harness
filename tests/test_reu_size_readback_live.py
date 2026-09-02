@@ -53,7 +53,7 @@ Env gates (all unset -> everything skips cleanly):
 * ``REU_READBACK_LIVE=1`` — master switch for this module.
 * ``U64_HOST``            — device hostname/IP (no IPs are committed).
 * ``U64_PASSWORD``        — optional; sent as ``X-Password`` when set.
-* ``U64_ALLOW_MUTATE=1``  — required for the three mutating tests; the
+* ``U64_ALLOW_MUTATE=1``  — required for the four mutating tests; the
                             quiet-read test runs without it.
 
 What the mutating tests touch:
@@ -81,7 +81,10 @@ import time
 import pytest
 
 from c64_test_harness.backends.device_lock import DeviceLock, DeviceLockTimeout
-from c64_test_harness.backends.ultimate64_client import Ultimate64Client
+from c64_test_harness.backends.ultimate64_client import (
+    Ultimate64Client,
+    Ultimate64Error,
+)
 from c64_test_harness.backends.ultimate64_helpers import (
     CAT_CART,
     get_reu_config,
@@ -180,6 +183,46 @@ def _diff(before: dict, after: dict) -> dict:
         for k in set(before) | set(after)
         if before.get(k) != after.get(k)
     }
+
+
+def _restore_category_items(client, stock: dict, now: dict) -> None:
+    """PUT back every item in *now* that differs from *stock*; raise afterwards.
+
+    Used by the flash-reload tests, where ``restore_state`` alone is not
+    enough (the reload also flips items the snapshot does not carry, e.g.
+    ``Command Interface``, which ``set_emulation_flags`` really applies on
+    the device). Every PUT is attempted even if an earlier one is rejected
+    — the firmware answers 400 for ``value=""`` on some items — and the
+    failures are raised together at the end, so one bad item cannot leave
+    the rest un-restored.
+    """
+    failures: list[str] = []
+    for item, (want, _got) in _diff(stock, now).items():
+        try:
+            client.set_config_item(CAT_CART, item, want)
+        except Ultimate64Error as exc:
+            failures.append(f"{item}={want!r}: {exc}")
+    if failures:
+        raise Ultimate64Error(
+            f"{len(failures)} item(s) could not be restored in {CAT_CART!r}: "
+            + "; ".join(failures)
+        )
+
+
+def _pick_ram_target(stock_size: str, default_size: str | None) -> str:
+    """Pick a ``REU Size`` to PUT into RAM before a flash reload.
+
+    Must differ from the RAM value (so the PUT is observable) AND from the
+    item default (the value flash most likely holds) — if it equalled the
+    flash value, ``flash_size != ram_target`` would fail with the wrong
+    diagnosis. Preferred candidates first, then anything else in the enum.
+    """
+    for v in ("1 MB", "4 MB", *REU_SIZE_VALUES):
+        if v != stock_size and v != default_size:
+            return v
+    raise AssertionError(  # pragma: no cover — the enum has 8 values
+        f"no REU Size differs from stock {stock_size!r} and default {default_size!r}"
+    )
 
 
 def _observe(client: Ultimate64Client, tag: str) -> tuple[dict, tuple[bool, str]]:
@@ -408,9 +451,11 @@ def test_flash_reload_moves_reu_size_without_a_config_write(
 
     Mechanism (hard assertions): the per-category reload leaves the item at
     the flash value, not at what was PUT; the change is visible at once (no
-    reset). Bench-state (labelled): flash holds the item default ``"2 MB"``
-    — nobody on this bench has saved a non-default REU size. If that ever
-    changes, the assertion says the flash contents moved, not the mechanism.
+    reset). The bench-state observation (flash holds the item default
+    ``"2 MB"``) lives in its own test below so a changed bench can never
+    hide a green mechanism. The RAM value PUT here is chosen to differ from
+    both the stock size and the item default, so it cannot coincide with
+    the flash value (``_pick_ram_target``).
 
     Blast radius: the per-category form reloads only ``C64 and Cartridge
     Settings`` (``/v1/configs/<category>:load_from_flash``; live-verified
@@ -427,7 +472,7 @@ def test_flash_reload_moves_reu_size_without_a_config_write(
     # Make RAM differ from whatever flash holds via a plain item PUT (no
     # save_to_flash), so the reload has something to undo even on a freshly
     # booted bench where RAM == flash.
-    ram_target = next(v for v in ("1 MB", "4 MB") if v != stock[_ITEM_REU_SIZE])
+    ram_target = _pick_ram_target(stock[_ITEM_REU_SIZE], default_size)
     try:
         client.set_config_item(CAT_CART, _ITEM_REU_SIZE, ram_target)
         _before, cfg_before = _observe(client, f"after PUT REU Size={ram_target!r}")
@@ -446,24 +491,63 @@ def test_flash_reload_moves_reu_size_without_a_config_write(
         # flash value, with no write to the item and no reset.
         assert flash_size != ram_target, (
             f"REU Size still {ram_target!r} after load_from_flash — the PUT "
-            f"reached flash, or the reload did not replace memory"
+            f"reached flash, or the reload did not replace memory "
+            f"(ram_target was chosen to differ from stock {stock[_ITEM_REU_SIZE]!r} "
+            f"and default {default_size!r}, so this is not a flash coincidence)"
         )
         assert flash_size in reu_item["values"]
-        # Bench-state: flash holds the item default (the reporter's second value).
-        assert flash_size == default_size == "2 MB", (
-            f"bench-state changed: flash holds REU Size {flash_size!r} "
-            f"(item default {default_size!r}) — someone saved a non-default "
-            f"REU size to flash; the mechanism assertions above still stand"
-        )
     finally:
         # Put back every item the reload (or our PUT) changed, from the
         # pre-write snapshot — not just the REU pair.
-        now = _category(client)
-        for item, (want, _got) in _diff(stock, now).items():
-            client.set_config_item(CAT_CART, item, want)
+        _restore_category_items(client, stock, _category(client))
 
     restored, cfg_restored = _observe(client, "after full-category restore")
     assert cfg_restored[1] == stock[_ITEM_REU_SIZE]
     assert _diff(stock, restored) == {}, (
         f"category differs from the pre-write snapshot: {_diff(stock, restored)!r}"
     )
+
+
+@requires_mutate
+def test_flash_holds_the_item_default_reu_size(
+    client: Ultimate64Client, stock: dict, record_property
+) -> None:
+    """Bench-state: flash holds ``REU Size`` = item default ``"2 MB"``.
+
+    This is the observation that explains the reporter's second value
+    (2026-09-01 local: RAM ``512 KB``, flash ``2 MB``). It is a fact about
+    what has been saved to this bench's flash, not about the firmware, so a
+    mismatch is reported as ``xfail`` ("bench-state changed") rather than a
+    failure — it must never mask the mechanism test above. The item's
+    *default* being ``"2 MB"`` is a firmware fact (``c64_config[]`` def
+    index) and stays a hard assertion. Same reload/restore dance as the
+    mechanism test, so it stands alone under ``-k``.
+    """
+    reu_item = _item(client, _ITEM_REU_SIZE)
+    default_size = reu_item.get("default")
+    record_property("reu_size_default", default_size)
+    assert default_size == "2 MB", (
+        f"REU Size item default is {default_size!r}, not the \"2 MB\" this "
+        f"module documents — firmware definition changed"
+    )
+
+    ram_target = _pick_ram_target(stock[_ITEM_REU_SIZE], default_size)
+    try:
+        client.set_config_item(CAT_CART, _ITEM_REU_SIZE, ram_target)
+        client.load_config_from_flash(CAT_CART)
+        _after, cfg_after = _observe(client, "flash value after load_from_flash")
+        flash_size = cfg_after[1]
+        record_property("reu_size_flash", flash_size)
+    finally:
+        _restore_category_items(client, stock, _category(client))
+
+    restored = _category(client)
+    assert _diff(stock, restored) == {}, (
+        f"category differs from the pre-write snapshot: {_diff(stock, restored)!r}"
+    )
+    if flash_size != default_size:
+        pytest.xfail(
+            f"bench-state changed: flash holds REU Size {flash_size!r}, not the "
+            f"item default {default_size!r} — someone saved a non-default REU "
+            f"size to flash; the mechanism test's verdict is unaffected"
+        )
