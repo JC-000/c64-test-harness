@@ -495,22 +495,44 @@ class TestExtractState:
 # ---------------------------------------------------------------------------
 
 
-class TestReuStagingWindowWarning:
-    def test_extract_warns_when_policy_overlaps_staging_window(self) -> None:
-        import warnings as _w
+class _HardwareMockTransport(_MockTransport):
+    """Ultimate-shaped mock: has a ``client`` (the REST object), like
+    ``Ultimate64Transport``.  ``_try_pause`` uses the same duck-typing.
+    The stub has no ``pause`` so the extract runs unpaused as on hardware."""
 
+    client = object()
+
+
+_OVERLAPPING = MemoryPolicy(
+    reserved_regions=(MemoryRegion(0x0801, 0x1000, "consumer PRG"),),
+)
+
+
+class TestReuStagingWindowWarning:
+    def test_extract_warns_on_hardware_when_policy_overlaps_staging_window(self) -> None:
         from c64_test_harness.snapshot import extract_reu_contents
 
-        policy = MemoryPolicy(
-            reserved_regions=(MemoryRegion(0x0801, 0x1000, "consumer PRG"),),
-        )
-        mock = _MockTransport(memory_policy=policy)
+        mock = _HardwareMockTransport(memory_policy=_OVERLAPPING)
         with pytest.warns(UserWarning, match="staging window") as rec:
             extract_reu_contents(mock, 0x8000, settle=0)
         msg = str(rec[0].message)
         assert "$0801-$0FFF" in msg
         assert "consumer PRG" in msg
         assert "execut" in msg  # says the span is not safe to execute from
+
+    def test_extract_is_silent_on_vice_shaped_transport_even_when_overlapping(self) -> None:
+        # No ``client`` attribute => VICE-shaped.  The binary monitor holds
+        # the machine during memory commands, so nothing executes from the
+        # window mid-extract and the write-back is genuinely transient.
+        import warnings as _w
+
+        from c64_test_harness.snapshot import extract_reu_contents
+
+        mock = _MockTransport(memory_policy=_OVERLAPPING)  # no .client
+        assert not hasattr(mock, "client")
+        with _w.catch_warnings():
+            _w.simplefilter("error")
+            extract_reu_contents(mock, 0x8000, settle=0)
 
     def test_extract_is_silent_when_nothing_overlaps(self) -> None:
         import warnings as _w
@@ -520,7 +542,7 @@ class TestReuStagingWindowWarning:
         policy = MemoryPolicy(
             reserved_regions=(MemoryRegion(0xA000, 0xC000, "SHADOW_BSS"),),
         )
-        mock = _MockTransport(memory_policy=policy)
+        mock = _HardwareMockTransport(memory_policy=policy)
         with _w.catch_warnings():
             _w.simplefilter("error")
             extract_reu_contents(mock, 0x8000, settle=0)
@@ -532,4 +554,4 @@ class TestReuStagingWindowWarning:
 
         with _w.catch_warnings():
             _w.simplefilter("error")
-            extract_reu_contents(_MockTransport(), 0x8000, settle=0)
+            extract_reu_contents(_HardwareMockTransport(), 0x8000, settle=0)

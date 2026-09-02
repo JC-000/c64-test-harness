@@ -62,8 +62,9 @@ def render_table(regions: tuple[ScratchRegion, ...] = HARNESS_SCRATCH) -> str:
             "(best-effort for the liveness probe: only on success). It does "
             "NOT mean the span is safe to execute from while the operation "
             "runs: the REU window is filled by REC DMA with the CPU live and "
-            "`MemoryPolicy` cannot see that fill; `extract_reu_contents` "
-            "warns when the transport's policy declares RAM inside it. "
+            "`MemoryPolicy` cannot see that fill; on Ultimate transports "
+            "`extract_reu_contents` warns when the policy declares RAM inside "
+            "it (VICE's monitor holds the machine, so no warning there). "
             "Declared like every other write, but not withheld by "
             "`MemoryArbiter` by default."
         )

@@ -686,7 +686,16 @@ def _warn_if_layout_overlaps_staging_window(transport: "C64Transport") -> None:
     executing from ``$0801-$87FF`` runs REU data while the extract is in
     flight; writing the original bytes back afterwards does not undo
     PC/stack/side effects.  Say so up front.
+
+    Hardware only.  On VICE the binary monitor holds the machine during
+    memory commands, nothing executes from the window mid-extract, and
+    the write-back is genuinely transient — so the warning would be
+    noise.  The backend test is the same duck-typing :func:`_try_pause`
+    uses: an Ultimate transport carries a ``client`` (the REST object),
+    a VICE transport does not.
     """
+    if getattr(transport, "client", None) is None:
+        return  # VICE-shaped: monitor holds the machine; no hazard
     policy = getattr(transport, "memory_policy", None)
     overlaps = getattr(policy, "harness_scratch_overlaps", None)
     if overlaps is None:

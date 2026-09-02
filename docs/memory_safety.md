@@ -181,7 +181,7 @@ the code, the code won (issue #169).
 | `$C500-$C87D` | 894 | `uci_network.uci_socket_write` | data buffer (up to 892 bytes) followed by the 2-byte LE length | hardcoded |
 | `$CF00-$CF03` | 4 | `tests/test_vice_core.py::_restore_basic (also scripts/vice_keyecho_probe.py + scripts/vice_stall_probe.py)` | CLI; JMP $E5CD stub returning the CPU to BASIC MAINLOOP before every screen/keyboard test — test-suite scratch, not library | hardcoded |
 
-† *transient* — the prior contents are written back afterwards (best-effort for the liveness probe: only on success). It does NOT mean the span is safe to execute from while the operation runs: the REU window is filled by REC DMA with the CPU live and `MemoryPolicy` cannot see that fill; `extract_reu_contents` warns when the transport's policy declares RAM inside it. Declared like every other write, but not withheld by `MemoryArbiter` by default.
+† *transient* — the prior contents are written back afterwards (best-effort for the liveness probe: only on success). It does NOT mean the span is safe to execute from while the operation runs: the REU window is filled by REC DMA with the CPU live and `MemoryPolicy` cannot see that fill; on Ultimate transports `extract_reu_contents` warns when the policy declares RAM inside it (VICE's monitor holds the machine, so no warning there). Declared like every other write, but not withheld by `MemoryArbiter` by default.
 <!-- END HARNESS_SCRATCH TABLE -->
 
 Reading the table:
@@ -215,9 +215,12 @@ Reading the table:
   with the CPU running (unpaused is mandatory on Ultimate hardware,
   see `docs/snapshot_interop.md`).  A program executing from
   `$0801-$87FF` runs REU data during the extract, and the write-back
-  does not undo PC/stack/side effects.  `extract_reu_contents` emits a
-  `UserWarning` when the transport's policy declares a region inside
-  the window; stop the program or keep it out of the window first.
+  does not undo PC/stack/side effects.  On Ultimate transports
+  `extract_reu_contents` emits a `UserWarning` when the policy declares
+  a region inside the window; stop the program or keep it out of the
+  window first.  On VICE the binary monitor holds the machine during
+  memory commands, so the write-back really is transient and no
+  warning is raised.
 
 `MemoryPolicy.from_prg()` warns at construction when the load image
 overlaps a non-transient entry — the collision would otherwise surface
