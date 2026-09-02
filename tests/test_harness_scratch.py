@@ -233,3 +233,41 @@ class TestBoundsMatchCode:
     def test_cpu_port_is_two_single_byte_writes(self) -> None:
         r = _region_of("restore_snapshot", 0x0000)
         assert r.length == 2
+
+
+# ---------------------------------------------------------------------------
+# Transient flag — only the two save-and-write-back spans may carry it
+# ---------------------------------------------------------------------------
+
+_TRANSIENT_OWNERS = (
+    "backends.ultimate64_probe.liveness_probe",
+    "snapshot.extract_reu_contents",
+)
+_NON_TRANSIENT_STARTS = [
+    0x0000, 0x00C6, 0x0277, 0x0314, 0x0334, 0x0339, 0x033C, 0x0360, 0x03F0,
+    0xC000, 0xC100, 0xC400, 0xC403, 0xC500, 0xCF00,
+]
+
+
+class TestTransientFlag:
+    """Flipping any scratch entry to ``transient=True`` silently makes it
+    allocatable again (the arbiter skips transient entries).  Only the
+    drift test would notice — so pin the flag on every entry here."""
+
+    @pytest.mark.parametrize("start", _NON_TRANSIENT_STARTS)
+    def test_non_transient_entries_stay_non_transient(self, start: int) -> None:
+        entries = [
+            r for r in HARNESS_SCRATCH
+            if r.start == start and r.owner not in _TRANSIENT_OWNERS
+        ]
+        assert entries, f"no non-transient entry starts at ${start:04X}"
+        for r in entries:
+            assert r.transient is False, r
+
+    def test_only_the_two_known_owners_are_transient(self) -> None:
+        transient_owners = sorted({r.owner for r in HARNESS_SCRATCH if r.transient})
+        assert transient_owners == sorted(_TRANSIENT_OWNERS)
+
+    def test_every_start_in_the_list_is_covered_by_this_test(self) -> None:
+        starts = sorted({r.start for r in HARNESS_SCRATCH if not r.transient})
+        assert starts == sorted(_NON_TRANSIENT_STARTS)

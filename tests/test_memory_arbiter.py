@@ -414,3 +414,9 @@ class TestHarnessScratchDefault:
         # every non-transient scratch entry is after the U64 flags.
         a = MemoryArbiter(MemoryPolicy.permissive())
         assert a.alloc(256, name="page") == 0x03F2
+
+    @pytest.mark.parametrize("addr", [0xC300, 0xC3FE])
+    def test_uci_block_interior_is_not_free(self, addr: int) -> None:
+        # The UCI status page and completion sentinel sit mid-block; a
+        # transient=True slip on the $C000-$C3FF entry would free them.
+        assert MemoryArbiter().is_free(addr) is False
