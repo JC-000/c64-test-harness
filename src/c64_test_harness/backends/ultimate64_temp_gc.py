@@ -2,8 +2,8 @@
 
 Every Ultimate REST call that carries a body (``writemem`` POST,
 ``run_prg``, ``load_prg``, ...) lands as a managed attachment
-(``temp0000``, ``temp0001``, ...) in the device's ``/Temp`` folder, and
-no released firmware collects them. Once ``/Temp`` fills (~15 cycles of
+(``temp0000``, ``temp0001``, ...) in the device's ``/Temp`` folder;
+firmware without the #686 cleanup never collects them. Once ``/Temp`` fills (~15 cycles of
 a 63 KB PRG in the U64E reproduction that prompted this module), the
 REST API and the C64-facing UCI bridge wedge together and only a
 physical power-cycle recovers — see ``docs/u64_recovery.md`` for the
@@ -19,10 +19,13 @@ keep-count) on both: originally on the U64E, and on the C64U at
 FTP against ``/Temp`` worked with the same defaults as the U64E.
 
 Upstream root cause and fix: GideonZ/1541ultimate#686 (auto-cleanup of
-managed ``/Temp`` files, oldest-first, keep youngest 10) — merged but not
-in any released firmware as of this writing (U64E on 3.14d, C64U on
-1.1.0). Once a firmware release containing it ships, this module becomes
-redundant (it will simply find nothing to delete).
+managed ``/Temp`` files, oldest-first, keep youngest 10). The merge is an
+ancestor of the ``v3.15`` tag, so every Ultimate-line 3.15 build has it;
+on the bench U64E (v3.15-85) this module finds nothing to delete
+(measured 2026-09-02: 0 managed files before and after 15 ``run_prg``
+uploads with the GC off). It still matters on the C64 Ultimate, whose
+1.1.0 firmware predates the fix; ``u64_capabilities.writemem_post_safe``
+is the per-device switch.
 
 :func:`gc_temp_folder` is deliberately *never raising*: every FTP or
 network failure is caught and reported via :class:`TempGCResult.error`

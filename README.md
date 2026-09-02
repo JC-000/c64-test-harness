@@ -615,7 +615,7 @@ The Ultimate 64 has two reset modes:
 
 ### Recovery and wedge diagnosis
 
-The U64 firmware has three independent wedge tiers (REST/writemem, runner subsystem, UCI STATE bits) and a separate probe + recovery primitive for each. Mis-diagnosing the tier — e.g. calling `recover()` for a UCI wedge — is the most common failure mode, because `recover()`'s liveness check is REST-only. See [docs/u64_recovery.md](docs/u64_recovery.md) for the diagnosis flow, the tier-to-recovery-primitive mapping, and the confirmed cases where physical power-cycle is the only option.
+The U64 firmware has three independent wedge tiers (REST/writemem, runner subsystem, UCI STATE bits) and a separate probe + recovery primitive for each. Mis-diagnosing the tier — e.g. calling `recover()` for a UCI wedge — is the most common failure mode, because `recover()`'s liveness check is REST-only. See [docs/u64_recovery.md](docs/u64_recovery.md) for the diagnosis flow, the tier-to-recovery-primitive mapping, and the confirmed cases where physical power-cycle is the only option. The root cause (Temp-folder accumulation) is fixed upstream by 1541ultimate#686, which is in every Ultimate-line 3.15 build — so on the U64E these tiers are diagnostic history; they remain live on the C64 Ultimate at 1.1.0.
 
 ### DMA Trampoline Pattern (executing code without jsr)
 

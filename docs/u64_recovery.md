@@ -26,12 +26,17 @@ the latency drift and eventual wedge described in every tier below.
 
 The fix is upstream in
 [GideonZ/1541ultimate#686 "Add automatic cleanup of Temp folder"](https://github.com/GideonZ/1541ultimate/pull/686)
-(merged 2026-04-26). It is **merged but not yet in any released
-firmware** — there is no 3.15 release. Until a firmware release
-containing it is installed, the wedge behaviour is live on our hardware
-(U64E on 3.14d, C64U on 1.1.0) and everything below applies as written.
+(merged 2026-04-26). **That merge is an ancestor of the `v3.15` tag**, so
+every Ultimate-line 3.15 build carries it. The bench U64E runs
+`v3.15-85` and is fixed: measured 2026-09-02 with the harness GC off
+(`U64_AUTO_TEMP_GC` unset), `/Temp` held zero managed attachments before
+and after fifteen `run_prg` uploads. `u64_capabilities` encodes the same
+fact (`writemem_post_safe=True` for Ultimate-line ≥ 3.15, POST cutoff 48
+bytes). **The C64 Ultimate on 1.1.0 is not fixed** (`_CBM_WRITEMEM_FIXED_FROM`
+is `None`); everything below applies as written only on that generation,
+and on any Ultimate-line device still on 3.14.
 
-Two practical consequences while the fix is unreleased:
+Two practical consequences on unfixed firmware:
 
 - Prefer `PUT /v1/machine:writemem?data=<hex>` over `POST` for heavy
   write loads. POST is the leaking path; PUT does not accumulate Temp
@@ -44,10 +49,10 @@ Two practical consequences while the fix is unreleased:
 
 ### Harness-side mitigation: FTP `/Temp` GC (issue #153)
 
-`run_prg` (and any other endpoint that carries a body — `writemem`,
-`load_prg`, keyboard-inject) leaks a managed attachment
-(`temp0000`, `temp0001`, ...) per call, and no released firmware
-collects them. This is shared 1541ultimate firmware behaviour, not
+On unfixed firmware, `run_prg` (and any other endpoint that carries a
+body — `writemem`, `load_prg`, keyboard-inject) leaks a managed attachment
+(`temp0000`, `temp0001`, ...) per call. Ultimate-line 3.15 collects them
+on-device (#686); the C64U on 1.1.0 does not. This is shared 1541ultimate firmware behaviour, not
 specific to either device generation. `ultimate64_temp_gc.gc_temp_folder(host, ...)`
 deletes those files over FTP, oldest-first, keeping the youngest N
 (default 2) — mirroring the policy 1541ultimate#686 will eventually
@@ -71,9 +76,9 @@ call). Knobs: `U64_TEMP_GC_KEEP` (keep-count override) and
 anonymous FTP; override for a device with FTP credentials configured).
 Call `client.gc_temp_folder()` (or the module function) directly for
 other attachment-heavy paths, or to run a manual pass regardless of the
-env var. Once a released firmware ships #686, this becomes a no-op that
-finds nothing to delete rather than diagnostic history to remove
-outright — re-validate against the new firmware first.
+env var. On firmware carrying #686 (Ultimate-line ≥ 3.15) this is a
+no-op that finds nothing to delete — verified on the U64E 2026-09-02 —
+so it matters only for the C64U until its firmware catches up.
 
 **Correction (issue #153 comment, 2026-08-21):** the firmware's
 attachment counter is hex, not decimal — `temp0009` is followed by
