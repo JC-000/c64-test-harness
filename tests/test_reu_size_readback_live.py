@@ -216,40 +216,64 @@ def test_reu_size_stable_across_quiet_reads(
 def test_cartridge_write_does_not_move_reu_size(
     client: Ultimate64Client, stock: dict, record_property
 ) -> None:
-    """A ``Cartridge`` PUT is not what moves ``REU Size`` on this generation.
+    """The ``Cartridge`` item has no ``"REU"`` preset, so it cannot move ``REU Size``.
 
-    Found on U64E fw 3.15: ``Cartridge`` offers ``presets: [""]`` only —
-    no ``"REU"`` preset — so the only value the firmware accepts is the
-    current one and the issue's explanation 2 has no lever to pull. The
-    test records the preset list, writes the empty preset (a same-value
-    write on this device; the only benign alternative elsewhere), and
-    asserts the REU items and the rest of the category are untouched.
-    Any other preset (``"Action Replay"`` etc.) is deliberately not
-    written: it may attach a cartridge image.
+    Found on U64E fw 3.15 (and confirmed in the firmware source, branch
+    ``issue-807``): ``Cartridge`` is declared ``CFG_TYPE_STRFUNC`` backed by
+    ``C64::list_crts`` — a ``.crt`` *file chooser*, not an enum
+    (``software/io/c64/c64.cc:73``; ``:1650`` "Always return at least the
+    empty string"), and the REU is driven only by ``CFG_C64_REU_SIZE`` /
+    ``CFG_C64_REU_EN`` (``c64.cc:315-316``). The 3.14-era ``"REU"`` preset
+    is gone, so the issue's explanation 2 has no lever to pull on this
+    firmware. The load-bearing assertions are on the item's shape: they
+    FAIL if the firmware ever regrows a ``"REU"`` preset or a non-empty
+    default. The ``Cartridge=""`` PUT that follows is a smoke write kept
+    only to show the endpoint accepts the empty chooser value; it proves
+    nothing about REU coupling by itself. It is a same-value no-op ONLY on
+    a bench with no ``.crt`` selected (``current == ""``, the state this
+    was characterised in). On a bench with a ``.crt`` selected the PUT
+    **detaches that cartridge** — a real mutation, restored in the
+    ``finally``. Other chooser values are deliberately never written: they
+    attach a cartridge image.
     """
     cart = _item(client, _ITEM_CARTRIDGE)
     presets = cart.get("presets", cart.get("values"))
     current = cart.get("current")
     record_property("cartridge_presets", presets)
     record_property("cartridge_current", current)
+    record_property("cartridge_default", cart.get("default"))
     print(f"[cartridge item] {cart!r}")
     assert isinstance(presets, list), f"Cartridge item has no preset list: {cart!r}"
     assert current == stock[_ITEM_CARTRIDGE]
-    assert "" in presets, (
-        f"Cartridge presets {presets!r} lack the empty preset this control writes"
+    # Load-bearing: the .crt chooser shape. A "REU" entry here would mean
+    # the firmware went back to the 3.14 enum and this module's verdict
+    # (a Cartridge write cannot move REU Size) no longer holds.
+    assert "REU" not in presets, (
+        f'Cartridge exposes a "REU" preset again ({presets!r}) — the item is '
+        f"an enum, not the .crt chooser this test characterised; re-run the "
+        f"issue-#168 procedure with a real Cartridge write"
     )
-    record_property("reu_preset_present", "REU" in presets)
+    assert cart.get("default") == "", (
+        f"Cartridge default is {cart.get('default')!r}, expected the empty "
+        f"chooser value (c64.cc:73 declares the default as \"\")"
+    )
+    assert "" in presets, (
+        f"Cartridge presets {presets!r} lack the empty chooser value "
+        f"(c64.cc:1650 always returns at least the empty string)"
+    )
 
-    before, _ = _observe(client, "before Cartridge PUT")
+    # No-op smoke write: Cartridge="" on a device whose current value is
+    # already "" (asserted above via `stock`). Not a coupling test.
+    before, _ = _observe(client, "before no-op Cartridge PUT")
     client.set_config_item(CAT_CART, _ITEM_CARTRIDGE, "")
-    after, _ = _observe(client, 'after Cartridge PUT ""')
+    after, _ = _observe(client, 'after no-op Cartridge PUT ""')
     try:
         assert after[_ITEM_REU_SIZE] == before[_ITEM_REU_SIZE], (
-            f"REU Size moved with a Cartridge write: "
+            f"REU Size moved on a same-value Cartridge write: "
             f"{before[_ITEM_REU_SIZE]!r} -> {after[_ITEM_REU_SIZE]!r}"
         )
         assert after[_ITEM_REU_ENABLED] == before[_ITEM_REU_ENABLED], (
-            f"RAM Expansion Unit moved with a Cartridge write: "
+            f"RAM Expansion Unit moved on a same-value Cartridge write: "
             f"{before[_ITEM_REU_ENABLED]!r} -> {after[_ITEM_REU_ENABLED]!r}"
         )
     finally:
