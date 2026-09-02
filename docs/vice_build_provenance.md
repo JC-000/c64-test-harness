@@ -163,11 +163,17 @@ and invoke that same form. Two ways to get this wrong, both handled by
   path after PATH lookup and does not follow links, so a rule naming the resolved
   Cellar path would authorise nothing. `launch_path()` deliberately does not
   resolve symlinks.
-- **Not resolving PATH breaks the launch.** Sudo's `secure_path` excludes
-  `/opt/homebrew/bin`, so a bare `x64sc` fails "command not found" under sudo even
-  where it runs fine unelevated (T, verified while writing `vice_elevation.py`) — and
-  `ViceConfig.executable` defaults to the bare name, so every elevated launch from
-  a default config would have failed this way. Resolving PATH is mandatory.
+- **Not resolving PATH breaks authorisation, and on Linux the launch too.**
+  A NOPASSWD rule names an absolute path, and sudoers matches the command
+  *as an absolute path*, so a bare `x64sc` can never be the thing a rule
+  authorises. Separately, Linux sudoers commonly set a `secure_path` that omits
+  Homebrew-style prefixes, so there the bare name also fails "command not found"
+  under sudo. Stock macOS sets no `secure_path` — `sudo -n -l` lists no such
+  Default and `sudo -n x64sc -features` exits 0 (T, measured) — so an earlier
+  version of this bullet, which blamed `secure_path` on macOS, stated a false
+  premise; the conclusion stands for the sudoers-matching reason.
+  `ViceConfig.executable` defaults to the bare name, so every elevated launch
+  from a default config depends on this. Resolving PATH is mandatory.
 
 Same root as the existing "no `bash` wrapper" rule: NOPASSWD matches sudo's first
 non-flag argv verbatim. Whether the resolved Cellar path would match is untested
