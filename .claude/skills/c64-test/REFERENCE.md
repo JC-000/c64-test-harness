@@ -292,8 +292,7 @@ Key fields:
 - `vice_executable` (default "x64sc")
 - `vice_port` (default 6502)
 - `vice_warp` (default True)
-- `vice_console` (default True) -- passes `-console` to VICE (headless, no window)
-- `vice_minimize` (default True) -- passes `-minimized` when `vice_console` is false
+- `vice_console` / `vice_minimize` (default True) -- recorded but **not wired**: nothing builds a `ViceConfig` from a `HarnessConfig`, so these do not reach the launch. `-console` / `-minimized` are controlled by `ViceConfig(console=..., minimize=...)`.
 - `vice_prg_path` (default "")
 - `vice_acquire_retries` (default 3) -- retry count for `ViceInstanceManager.acquire()` on startup failure
 - `screen_poll_interval` (default 2.0) -- poll interval for `wait_for_text()`/`wait_for_stable()`. Decrease for graphics-heavy tests.

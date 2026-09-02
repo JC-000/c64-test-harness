@@ -456,7 +456,7 @@ config = HarnessConfig(vice_port=6502, vice_warp=True)
 
 Key fields: `vice_host`, `vice_port`, `vice_executable`, `vice_prg_path`, `vice_warp`, `vice_sound`, `vice_console`, `vice_minimize`, `screen_base`, `vice_port_range_start/end`, `vice_reuse_existing`, `vice_acquire_retries`, `exec_poll_interval`, `screen_poll_interval`.
 
-**Window focus:** VICE launches headless by default (`ViceConfig.console = True`, passing `-console`): the full emulation runs — binary monitor, screen/VIC/SID state, `-exitscreenshot` — but no window is created, so VICE never activates and steals focus (on macOS the GTK3 build activates the app even when started `-minimized`). Set `console=False` in `ViceConfig` (or `vice_console = false` in TOML / `C64TEST_VICE_CONSOLE=0` in env) if you need a visible window; `minimize` (default True, `-minimized`) then controls whether that window starts minimized.
+**Window focus:** VICE launches headless by default (`ViceConfig.console = True`, passing `-console`): the full emulation runs — binary monitor, screen/VIC/SID state, `-exitscreenshot` — but no window is created, so VICE never activates and steals focus (on macOS the GTK3 build activates the app even when started `-minimized`). Set `console=False` in `ViceConfig` if you need a visible window; `minimize` (default True, `-minimized`) then controls whether that window starts minimized. (`HarnessConfig.vice_console` / `vice_minimize` exist as fields but nothing builds a `ViceConfig` from a `HarnessConfig`, so the TOML key and `C64TEST_VICE_CONSOLE` have no effect on the launch — set it on `ViceConfig`.)
 
 ## Ultimate 64 Hardware Backend
 

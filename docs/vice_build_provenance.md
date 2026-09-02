@@ -118,9 +118,10 @@ itself:
 **Ethernet capability is now probed, not configured.**
 `resolve_vice_executable()` probes `-features` on whatever binary it resolves, so
 the `PATH` x64sc is verified rather than assumed. `VICE_ETHERNET_BIN`
-(equivalently `HarnessConfig.vice_ethernet_executable`, TOML
-`[vice] ethernet_executable`) is an **override, not a requirement — normally
-leave it unset.**
+(equivalently `ViceConfig(ethernet_executable=...)`, whose default reads that
+env var) is an **override, not a requirement — normally leave it unset.**
+There is no `HarnessConfig` field or TOML key for it: `HarnessConfig._from_dict`
+silently drops an unknown `[vice] ethernet_executable`.
 
 **Only `/opt/homebrew/bin/x64sc` carries a NOPASSWD sudoers rule (T)**, so it can
 be launched elevated unattended and any other path cannot. `sudo -n -l` lists the
