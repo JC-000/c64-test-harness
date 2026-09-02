@@ -409,3 +409,457 @@ def test_run_subroutine_custom_trampoline_addr():
     # No write at the default $0360.
     default_writes = [data for addr, data in target.write_memory_calls if addr == 0x0360]
     assert default_writes == []
+
+
+# -- RoutineHung / jsr(recover_on_timeout=True) ------------------------------
+#
+# Issue #156: after a hung routine times out, the CPU is still spinning in
+# it and the stack carries the trampoline's return frame.  Opt-in recovery
+# restores SP and proves the trampoline is live again before re-raising.
+# All mock-based; the live counterpart is tests/test_jsr_recovery_live.py.
+
+from c64_test_harness.execute import (  # noqa: E402
+    RECOVERY_PROBE_TIMEOUT,
+    RoutineHung,
+)
+
+
+def test_routine_hung_is_a_transport_timeout_error():
+    """Existing ``except TimeoutError`` callers must keep catching hangs."""
+    exc = RoutineHung(0xC100, recovered=True, elapsed=2.0, detail="ok")
+    assert isinstance(exc, TimeoutError)
+    assert isinstance(exc, TransportError)
+
+
+def test_routine_hung_carries_recovery_facts():
+    # addr != hung_pc so the message's "(CPU at $xxxx)" clause is checked
+    # on its own, not satisfied by the routine address.
+    exc = RoutineHung(0xC100, recovered=False, elapsed=1.5,
+                      detail="recovery jsr timed out", hung_pc=0xC1A0)
+    assert exc.addr == 0xC100
+    assert exc.recovered is False
+    assert exc.elapsed == 1.5
+    assert exc.detail == "recovery jsr timed out"
+    assert exc.hung_pc == 0xC1A0
+    msg = str(exc)
+    assert "$C100" in msg
+    assert "(CPU at $C1A0)" in msg
+    assert "1.5" in msg
+    assert "not recovered" in msg
+    assert "recovery jsr timed out" in msg
+
+
+def test_routine_hung_message_says_recovered():
+    exc = RoutineHung(0xC100, recovered=True, elapsed=2.0, detail="")
+    assert "recovered" in str(exc)
+    assert "not recovered" not in str(exc)
+
+
+class ScriptedStopMockTransport(BinaryMockTransport):
+    """BinaryMockTransport whose successive ``wait_for_stopped`` calls follow
+    a script.
+
+    Each entry is either an int (the PC to stop at) or an exception to
+    raise.  ``hang_sp`` is the SP the mock reports once the first wait has
+    raised — a hung routine has pushed frames, so SP is *lower* than it was
+    before the call; that is what makes the SP-restore assertion falsifiable.
+    """
+
+    def __init__(self, script: list, *, hang_sp: int = 0xF3, **kwargs):
+        super().__init__(**kwargs)
+        self._script = list(script)
+        self._hang_sp = hang_sp
+        self.wait_calls: list[float | None] = []
+
+    def wait_for_stopped(self, timeout: float | None = None) -> int:
+        self.wait_calls.append(timeout)
+        step = self._script.pop(0)
+        if isinstance(step, BaseException):
+            # A hung routine has been running: SP is lower, A/X/Y hold
+            # its temporaries, and it may have SEI'd (I = $04 in FL).
+            self._registers.update(
+                SP=self._hang_sp, PC=0xC101, A=0x11, X=0x22, Y=0x33,
+                FL=self._registers.get("FL", 0x24) | 0x04,
+            )
+            raise step
+        self._registers["PC"] = step
+        return step
+
+
+#: Register file before the hung call, as a VICE read_registers() reports
+#: it (FL is the real name of the status register, mon_register6502.c:65).
+_PRE_CALL_REGS = {"A": 0xA0, "X": 0xB0, "Y": 0xC0, "SP": 0xF7, "FL": 0x24}
+
+
+def _hang_then_recover(**kwargs) -> ScriptedStopMockTransport:
+    """First jsr hangs; the recovery probe lands on the $0337 breakpoint."""
+    t = ScriptedStopMockTransport(
+        [TimeoutError("No stopped event within 2.0s"), 0x0337], **kwargs,
+    )
+    t._registers.update(_PRE_CALL_REGS)
+    return t
+
+
+def _restore_calls(t: BinaryMockTransport) -> list[dict[str, int]]:
+    """The set_registers calls that touched SP -- recovery's restore."""
+    return [c for c in t._set_registers_calls if "SP" in c]
+
+
+def test_jsr_default_timeout_is_a_plain_timeout_error_and_does_not_recover():
+    """recover_on_timeout defaults to False: behaviour is exactly today's."""
+    t = _hang_then_recover()
+    with pytest.raises(TimeoutError) as excinfo:
+        jsr(t, 0xC100, timeout=2.0)
+    assert not isinstance(excinfo.value, RoutineHung)
+    # One trampoline write, no RTS probe, no SP restore, one resume.
+    assert t.written_memory == [(0x0334, [0x20, 0x00, 0xC1, 0xEA, 0xEA])]
+    assert not any("SP" in call for call in t._set_registers_calls)
+    assert t._resume_count == 1
+    assert len(t.wait_calls) == 1
+    assert len(t._checkpoints) == 0
+
+
+def test_jsr_recover_on_timeout_success():
+    t = _hang_then_recover()
+    with pytest.raises(RoutineHung) as excinfo:
+        jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
+    exc = excinfo.value
+    assert exc.recovered is True
+    assert exc.addr == 0xC100
+    assert exc.hung_pc == 0xC101
+    assert exc.elapsed >= 0.0
+    assert "$0337" in exc.detail
+
+    # (b) The register file restored to what was captured before the call,
+    # in one set_registers, after the hang had changed every one of them.
+    assert _restore_calls(t) == [_PRE_CALL_REGS]
+    assert t._registers["SP"] == 0xF7
+    assert t._registers["FL"] == 0x24, "I flag left set by the SEI'd hang"
+    # (c)+(d) the probe reuses the five trampoline bytes and nothing else:
+    # JSR $0338; NOP; RTS -- the second NOP becomes the RTS, the JSR
+    # targets it, and the checkpoint on the first NOP catches the return.
+    assert t.written_memory == [
+        (0x0334, [0x20, 0x00, 0xC1, 0xEA, 0xEA]),   # the hung call
+        (0x0334, [0x20, 0x38, 0x03, 0xEA, 0x60]),   # the probe
+    ]
+    assert t._checkpoint_history == [0x0337, 0x0337]
+    assert t._resume_count == 2
+    # The probe used its own short timeout, not the caller's 2.0.
+    assert t.wait_calls == [2.0, RECOVERY_PROBE_TIMEOUT]
+    # Nothing left armed.
+    assert len(t._checkpoints) == 0
+
+
+def test_jsr_recover_on_timeout_restores_sp_before_probing():
+    """SP must be restored *before* the probe JSR pushes its own frame."""
+    t = _hang_then_recover()
+    with pytest.raises(RoutineHung):
+        jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
+    calls = t._set_registers_calls
+    sp_idx = calls.index(_restore_calls(t)[0])
+    probe_pc_idx = max(i for i, c in enumerate(calls) if c == {"PC": 0x0334})
+    assert sp_idx < probe_pc_idx
+
+
+def test_jsr_recover_on_timeout_restores_only_registers_the_transport_reports():
+    """A transport whose read_registers lacks FL (older map) still gets SP,
+    A, X, Y back; recovery must not invent a register the wire cannot set."""
+    t = _hang_then_recover()
+    del t._registers["FL"]
+    with pytest.raises(RoutineHung) as excinfo:
+        jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
+    assert excinfo.value.recovered is True
+    expected = {k: v for k, v in _PRE_CALL_REGS.items() if k != "FL"}
+    assert _restore_calls(t) == [expected]
+
+
+def test_jsr_after_recovery_works_on_same_transport():
+    t = ScriptedStopMockTransport(
+        [TimeoutError("No stopped event within 2.0s"), 0x0337, 0x0337],
+    )
+    t._registers["SP"] = 0xF7
+    with pytest.raises(RoutineHung) as excinfo:
+        jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
+    assert excinfo.value.recovered is True
+
+    regs = jsr(t, 0xC110, timeout=1.0)
+    assert regs["PC"] == 0x0337
+    assert t.written_memory[-1] == (0x0334, [0x20, 0x10, 0xC1, 0xEA, 0xEA])
+
+
+def test_jsr_recover_on_timeout_probe_times_out():
+    t = ScriptedStopMockTransport([
+        TimeoutError("No stopped event within 2.0s"),
+        TimeoutError("No stopped event within 5.0s"),
+    ])
+    t._registers["SP"] = 0xF7
+    with pytest.raises(RoutineHung) as excinfo:
+        jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
+    exc = excinfo.value
+    assert exc.recovered is False
+    assert exc.addr == 0xC100
+    assert "No stopped event within 5.0s" in exc.detail
+    assert "not recovered" in str(exc)
+    assert len(t._checkpoints) == 0
+
+
+def test_jsr_recover_on_timeout_probe_lands_elsewhere():
+    """The probe stopping anywhere but the post-RTS landing is a failure."""
+    t = ScriptedStopMockTransport([
+        TimeoutError("No stopped event within 2.0s"), 0x1234,
+    ])
+    t._registers["SP"] = 0xF7
+    with pytest.raises(RoutineHung) as excinfo:
+        jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
+    exc = excinfo.value
+    assert exc.recovered is False
+    assert "$1234" in exc.detail
+    assert "$0337" in exc.detail
+
+
+def test_jsr_recover_on_timeout_register_read_failure():
+    """If binmon does not answer, recovery reports that step and stops."""
+    t = _hang_then_recover()
+    calls = {"n": 0}
+    real_read = t.read_registers
+
+    def flaky_read():
+        calls["n"] += 1
+        # First read is the pre-call SP capture; the second is the
+        # post-timeout read that the docstring's invariant says must work.
+        if calls["n"] == 2:
+            raise TransportError("socket closed")
+        return real_read()
+
+    t.read_registers = flaky_read
+    with pytest.raises(RoutineHung) as excinfo:
+        jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
+    exc = excinfo.value
+    assert exc.recovered is False
+    assert exc.hung_pc is None
+    assert "socket closed" in exc.detail
+    # No probe was attempted on a machine that does not answer: the only
+    # write is the hung call's own trampoline.
+    assert len(t.written_memory) == 1
+    assert t._resume_count == 1
+
+
+def test_jsr_recovery_writes_nothing_outside_the_callers_trampoline():
+    """A custom scratch_addr is the only memory recovery may touch: every
+    byte written during the whole call lies in [scratch_addr, scratch_addr+5).
+    The harness claims no second slot for the RTS."""
+    scratch = 0x0360
+    t = ScriptedStopMockTransport(
+        [TimeoutError("No stopped event within 2.0s"), scratch + 3],
+    )
+    t._registers["SP"] = 0xF7
+    with pytest.raises(RoutineHung) as excinfo:
+        jsr(t, 0xC100, timeout=2.0, scratch_addr=scratch,
+            recover_on_timeout=True)
+    assert excinfo.value.recovered is True
+    assert len(t.written_memory) == 2
+    for addr, data in t.written_memory:
+        assert addr == scratch
+        assert scratch <= addr and addr + len(data) <= scratch + 5, (
+            f"write at ${addr:04X} x{len(data)} escapes the trampoline"
+        )
+    assert f"${scratch + 3:04X}" in excinfo.value.detail
+
+
+def test_jsr_recovery_trampoline_is_jsr_to_its_own_rts():
+    """The probe trampoline is exactly ``20 lo hi EA 60`` with the JSR
+    target at scratch_addr + 4 -- the RTS that replaced the second NOP."""
+    scratch = 0x0360
+    t = ScriptedStopMockTransport(
+        [TimeoutError("No stopped event within 2.0s"), scratch + 3],
+    )
+    t._registers["SP"] = 0xF7
+    with pytest.raises(RoutineHung):
+        jsr(t, 0xC100, timeout=2.0, scratch_addr=scratch,
+            recover_on_timeout=True)
+    target = scratch + 4
+    assert t.written_memory[-1] == (
+        scratch, [0x20, target & 0xFF, target >> 8, 0xEA, 0x60],
+    )
+    assert t.written_memory[-1] == (0x0360, [0x20, 0x64, 0x03, 0xEA, 0x60])
+    # Probe PC was steered to the trampoline start; landing is +3.
+    assert t._set_registers_calls[-1] == {"PC": scratch}
+    assert t._checkpoint_history[-1] == scratch + 3
+
+
+def test_routine_hung_is_exported_from_package_root():
+    import c64_test_harness as pkg
+
+    assert "RoutineHung" in pkg.__all__
+    assert pkg.RoutineHung is RoutineHung
+
+
+def test_package_root_exports_have_no_duplicate_names():
+    """Thousands of downstream tests import from the root; a re-export
+    that shadows an existing name would silently swap behaviour.  Walk the
+    AST rather than the runtime namespace: at runtime a duplicate has
+    already won, so nothing is left to detect."""
+    import ast
+    import collections
+    import c64_test_harness as pkg
+
+    tree = ast.parse(open(pkg.__file__, encoding="utf-8").read())
+    bound = collections.Counter()
+    all_names = collections.Counter()
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                bound[alias.asname or alias.name] += 1
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "__all__":
+                    for elt in node.value.elts:
+                        all_names[elt.value] += 1
+    assert bound["RoutineHung"] == 1
+    dup_bound = sorted(n for n, c in bound.items() if c > 1)
+    dup_all = sorted(n for n, c in all_names.items() if c > 1)
+    assert dup_bound == [], f"names imported more than once: {dup_bound}"
+    assert dup_all == [], f"names listed in __all__ more than once: {dup_all}"
+    # Every re-export is advertised, and vice versa.
+    assert set(all_names) - {"__version__"} <= set(bound)
+
+
+# -- mutation survivors from review (S4) --------------------------------------
+
+def test_jsr_recover_on_timeout_does_not_engage_for_a_jam():
+    """A JAM is a TransportError, not a timeout: the docstring promises
+    recovery does not engage.  Kills the mutation ``except TimeoutError``
+    -> ``except TransportError`` in jsr()."""
+    # The 0x0337 is bait: if recovery wrongly engages, its probe "lands"
+    # and the failure is the RoutineHung assertion below, not an
+    # exhausted script.
+    t = ScriptedStopMockTransport(
+        [TransportError("The 6510 jammed at $c100"), 0x0337],
+    )
+    t._registers.update(_PRE_CALL_REGS)
+    with pytest.raises(TransportError) as excinfo:
+        jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
+    assert not isinstance(excinfo.value, RoutineHung)
+    assert _restore_calls(t) == []
+    assert t._resume_count == 1
+    assert len(t.written_memory) == 1
+
+
+def test_jsr_recovery_lets_a_harness_bug_escape_rather_than_folding_it():
+    """Only the wire and the policies are folded into RoutineHung.detail.
+    A ValueError from set_registers is a harness bug and must surface as
+    itself.  Kills the mutation ``_RECOVERY_ERRORS = (Exception,)``."""
+    t = _hang_then_recover()
+    real_set = t.set_registers
+
+    def bad_set(regs):
+        if "SP" in regs:
+            raise ValueError("Unknown register 'FL'")
+        real_set(regs)
+
+    t.set_registers = bad_set
+    with pytest.raises(ValueError, match="Unknown register"):
+        jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
+
+
+# -- review nits --------------------------------------------------------------
+
+def test_routine_hung_survives_a_pickle_round_trip():
+    """Exceptions cross process boundaries in run_parallel and in pytest's
+    xdist-style reporting; a kw-only __init__ breaks the default reduce."""
+    import pickle
+
+    exc = RoutineHung(0xC100, recovered=False, elapsed=1.5,
+                      detail="recovery probe failed: x", hung_pc=0xC1A0)
+    back = pickle.loads(pickle.dumps(exc))
+    assert type(back) is RoutineHung
+    assert (back.addr, back.recovered, back.elapsed, back.detail, back.hung_pc) == (
+        0xC100, False, 1.5, "recovery probe failed: x", 0xC1A0,
+    )
+    assert str(back) == str(exc)
+
+
+def test_routine_hung_chains_the_original_timeout_as_cause():
+    """The transport's own message ('No stopped event within 2.0s', or
+    wait_for_pc's 'PC did not reach ... (stopped at $xxxx)' when a user
+    checkpoint fired inside the routine) must not be lost."""
+    t = _hang_then_recover()
+    with pytest.raises(RoutineHung) as excinfo:
+        jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, TimeoutError)
+    assert not isinstance(cause, RoutineHung)
+    assert str(cause) == "No stopped event within 2.0s"
+
+
+def test_jsr_recover_on_timeout_with_a_routine_that_returns_is_a_plain_call():
+    """The opt-in must cost nothing when the routine behaves: one trampoline
+    write, one resume, no register restore, the normal return value."""
+    t = PollBinaryMockTransport(stop_pc=0x0337)
+    t._registers.update(_PRE_CALL_REGS)
+
+    regs = jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
+
+    assert regs["PC"] == 0x0337
+    assert t.written_memory == [(0x0334, [0x20, 0x00, 0xC1, 0xEA, 0xEA])]
+    assert _restore_calls(t) == []
+    assert t._set_registers_calls == [{"PC": 0x0334}]
+    assert t._resume_count == 1
+    assert len(t._checkpoints) == 0
+
+
+def test_jsr_recovery_folds_a_memory_policy_refusal_into_detail():
+    """A MemoryPolicy that refuses the probe's trampoline rewrite (the
+    second write_memory of the call) is a recovery failure to report, not
+    an exception to escape.  Kills ``_RECOVERY_ERRORS = (TransportError,)``."""
+    from c64_test_harness.memory_policy import MemoryPolicyError
+
+    t = _hang_then_recover()
+    real_write = t.write_memory
+    seen = {"writes": 0}
+
+    def guarded(*args, **kwargs):
+        seen["writes"] += 1
+        if seen["writes"] == 2:
+            raise MemoryPolicyError(0x0334, 5, "refused by policy")
+        real_write(*args, **kwargs)
+
+    t.write_memory = guarded
+    with pytest.raises(RoutineHung) as excinfo:
+        jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
+    exc = excinfo.value
+    assert exc.recovered is False
+    assert "refused by policy" in exc.detail
+    assert seen["writes"] == 2
+
+
+def test_routine_hung_elapsed_is_wall_clock_from_resume_to_timeout(monkeypatch):
+    import types
+    import c64_test_harness.execute as ex
+
+    ticks = iter([100.0, 102.5])
+    monkeypatch.setattr(
+        ex, "time", types.SimpleNamespace(monotonic=lambda: next(ticks),
+                                          sleep=time.sleep),
+    )
+    t = _hang_then_recover()
+    with pytest.raises(RoutineHung) as excinfo:
+        jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
+    assert excinfo.value.elapsed == 2.5
+
+
+def test_jsr_recovery_refuses_when_the_transport_reports_no_sp():
+    """Without a captured SP there is nothing to restore the stack to;
+    recovery must say so rather than probe on a leaked frame."""
+    t = _hang_then_recover()
+    del t._registers["SP"]
+    with pytest.raises(RoutineHung) as excinfo:
+        jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
+    exc = excinfo.value
+    assert exc.recovered is False
+    assert "transport reports no SP; cannot drop the hung frames" in exc.detail
+    assert exc.hung_pc == 0xC101
+    # Nothing was attempted: no restore, no probe, one resume.
+    assert _restore_calls(t) == []
+    assert t._resume_count == 1
+    assert len(t.written_memory) == 1

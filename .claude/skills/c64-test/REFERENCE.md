@@ -238,7 +238,9 @@ All functions take `transport: BinaryViceTransport` as first arg (stateless). Th
 - `set_breakpoint(transport, addr) -> int` -- Calls `transport.set_checkpoint(addr)`, returns checkpoint ID
 - `delete_breakpoint(transport, bp_id) -> None` -- Calls `transport.delete_checkpoint(bp_id)`
 - `wait_for_pc(transport, addr, timeout=5.0) -> dict` -- Calls `transport.wait_for_stopped()` then verifies PC; returns register dict; CPU is **paused** on return
-- `jsr(transport, addr, timeout=5.0, *, scratch_addr=0x0334) -> dict` -- Call subroutine via trampoline, wait for RTS; CPU is **paused** on return. Works reliably for both short and long-running computations (event-based, no polling).
+- `jsr(transport, addr, timeout=5.0, *, scratch_addr=0x0334, override=None, recover_on_timeout=False) -> dict` -- Call subroutine via trampoline, wait for RTS; CPU is **paused** on return. Works reliably for both short and long-running computations (event-based, no polling). With `recover_on_timeout=True`, a routine that never returns raises `RoutineHung` (a `TimeoutError` subclass) after restoring SP and proving the trampoline live with an `RTS` probe; `recovered`, `elapsed`, `addr`, `hung_pc`, `detail` carry the outcome (PATTERNS § "Probing a routine that may hang"). Default `False`: a bare `TimeoutError`, as before.
+- `RoutineHung(TimeoutError)` -- Raised by `jsr(..., recover_on_timeout=True)` when the routine hangs. `recovered=False` means the next call on that transport is not safe. Re-exported from the package root.
+- `RECOVERY_PROBE_TIMEOUT = 5.0` -- Seconds the recovery `RTS` probe waits for its landing.
 - `run_subroutine(target, addr, *, timeout=30.0, poll_cadence=0.005, trampoline_addr=0x0360) -> None` -- Cross-backend "call sub and wait for RTS". Takes a `TestTarget` (not a transport). On VICE wraps `jsr()`. On U64 installs a 14-byte sentinel trampoline at `trampoline_addr` (default `$0360`, cassette buffer; flag bytes at `$03F0`/`$03F1`), triggers it via `SYS <addr>` keystroke (assumes BASIC READY), and host-polls the done flag every `poll_cadence` seconds — sub-millisecond cadence is permitted and useful for short routines (issue #82). Raises `TimeoutError` on U64 only; the message distinguishes "never started" (running flag still `0x00`) from "started but never returned" (running flag `0x01`, done flag never `0x02`). Re-exported from the package root.
 
 ### `jsr()` internals
@@ -247,6 +249,8 @@ All functions take `transport: BinaryViceTransport` as first arg (stateless). Th
 3. Sets PC to `scratch_addr` and resumes CPU
 4. Calls `wait_for_stopped()` until checkpoint fires, verifies PC
 5. Deletes checkpoint
+
+With `recover_on_timeout=True`, step 4 timing out adds: read registers (binmon answers while the CPU spins), restore the register file (A, X, Y, SP, FL) captured before step 1 in one command, rewrite the trampoline as `20 lo hi EA 60` — `JSR scratch_addr+4; NOP; RTS`, the spare second `NOP` byte becoming the `RTS` — and run steps 2-5 against it with `RECOVERY_PROBE_TIMEOUT`, require PC == `scratch_addr + 3`, then raise `RoutineHung`. Recovery writes nothing outside the five trampoline bytes the call already owns.
 
 ---
 

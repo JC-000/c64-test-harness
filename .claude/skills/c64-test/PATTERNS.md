@@ -84,6 +84,28 @@ def test_routine(transport, labels, input_data):
 ### Why sequential jsr() calls work
 The binary transport maintains a persistent TCP connection. After `jsr()` returns, the CPU is paused at the breakpoint. The breakpoint is deleted, but the connection stays open and the CPU remains paused. The next `jsr()` writes a new trampoline and resumes — no reconnection needed.
 
+### Probing a routine that may hang (`recover_on_timeout=True`)
+By default a routine that never returns surfaces as a bare `TimeoutError` and leaves the boot in a bad state: the CPU is still spinning in the routine and the stack holds the trampoline's return frame (two bytes leaked per hang — a suite probing several hangs walks the stack down). To turn a hang into a result row and keep going in the same boot, opt in per call:
+
+```python
+from c64_test_harness import jsr, RoutineHung
+
+try:
+    jsr(transport, labels["fp_mod_inv"], timeout=90.0, recover_on_timeout=True)
+    got = "returned"
+except RoutineHung as e:          # subclass of transport TimeoutError
+    got = "HANG/timeout"
+    if not e.recovered:           # treat the boot as lost
+        pytest.fail(f"hang at ${e.addr:04X} and recovery failed: {e.detail}")
+# e.elapsed, e.hung_pc and e.detail are there for the row.
+```
+
+What recovery does: captures the register file (A, X, Y, SP, FL) before the call; on timeout reads the registers, restores that file in one command (SP drops the hung frames; FL undoes a `SEI` the routine executed, so later tests do not run with IRQs off), rewrites the five-byte trampoline at `scratch_addr` as `JSR scratch_addr+4; NOP; RTS` (the second `NOP` is never executed in a normal call — the breakpoint sits on the first — so it becomes the `RTS`; no byte outside `$0334-$0338` is touched), runs it with a short timeout and requires the CPU to stop at the post-`RTS` landing (`scratch_addr + 3`, `$0337` by default). `recovered=True` means that probe passed, not that it was assumed.
+
+**Invariant it relies on:** the binary monitor services commands while the CPU spins — every command halts the machine at an instruction boundary and it stays halted between commands — so register and memory writes land inside a hung routine. Because the trampoline is rewritten while halted, a routine that scribbled over `$0334-$0338` *before* hanging is recovered fine. **Its limits** are the state it does not put back: the `$01` banking register, zero page, and the RAM IRQ/NMI/BRK vectors at `$0314-$0319`. A routine that hijacked `$0314` and hung with I clear makes the probe fail — `recovered=False` with the probe's landing PC in `detail`, never a silent success; a routine that banked RAM out under the trampoline or corrupted zero page leaves later tests to find out. A JAM opcode is reported as a `TransportError`, not a timeout, and recovery does not engage. Default behaviour (`recover_on_timeout=False`) is unchanged.
+
+(Address naming: `$0334-$033B` is unused KERNAL RAM — that is where the default trampoline sits; the cassette buffer proper is `$033C-$03FB`.)
+
 ---
 
 ## Pattern 3: UI-Driven Testing
