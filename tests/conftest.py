@@ -504,9 +504,19 @@ def pytest_runtest_setup(item):
 
 
 def pytest_runtest_logreport(report):
-    """Count live tests that genuinely ran a body (passed or failed)."""
+    """Count live tests that genuinely ran a body (passed or failed).
+
+    A ``pytest.skip()`` *inside* the body still produces a ``call``
+    report, with ``outcome == "skipped"``.  It exercised no emulator, so
+    it must not count -- otherwise a run made entirely of such skips
+    would satisfy the gate while certifying the backend from mocks.
+    """
     global _vice_live_ran
-    if report.when == "call" and VICE_LIVE_MARKER in getattr(report, "keywords", {}):
+    if (
+        report.when == "call"
+        and report.outcome != "skipped"
+        and VICE_LIVE_MARKER in getattr(report, "keywords", {})
+    ):
         _vice_live_ran += 1
 
 
@@ -543,7 +553,11 @@ def pytest_sessionfinish(session, exitstatus):
     if session.testscollected == 0:
         return
     collected = getattr(session, "_vice_live_collected", 0)
-    session.exitstatus = 1
+    # Escalate a green run to a failure; never overwrite a status that is
+    # already saying something worse (INTERRUPTED=2, INTERNAL_ERROR=3), or
+    # a run that already failed on its own merits.
+    if session.exitstatus == 0:
+        session.exitstatus = 1
     reporter = session.config.pluginmanager.get_plugin("terminalreporter")
     if reporter is not None:
         detail = (
