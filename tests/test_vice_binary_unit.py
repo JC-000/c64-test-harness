@@ -1058,3 +1058,27 @@ class TestJamIsReportedNotDropped:
         with patch.object(t, "read_registers", side_effect=OSError("gone")):
             with pytest.raises(TransportError, match="PC unreadable"):
                 t.wait_for_stopped(timeout=5.0)
+
+    def test_a_jam_body_carrying_the_pc_is_used_without_a_register_read(self):
+        """The protocol documents a 2-byte PC body (vice.texi, "JAM
+        Response (0x61)").  When a frame carries it, that is the address
+        -- no wire round-trip against a machine that just jammed.  No
+        REGISTERS_GET reply is queued, so a fallback read would find
+        nothing and report "PC unreadable" instead of ``$c0de``.
+
+        (VICE 3.10 itself sends length 0 -- S ``monitor_binary.c:389``
+        passes 0 where STOPPED/RESUMED pass 2 -- so the register-read
+        fallback stays for the bodiless frame; see the tests above.)
+        """
+        t = _make_transport()
+        t._reg_map = {"PC": (0x03, 16)}
+        _queue_recvs(
+            t._sock,
+            [_build_response_bytes(0x61, struct.pack("<H", 0xC0DE), request_id=EVENT_REQUEST_ID)],
+        )
+        with pytest.raises(TransportError, match=r"jammed at \$c0de"):
+            t.wait_for_stopped(timeout=1.0)
+        sent_cmds = [c.args[0][10] for c in t._sock.sendall.call_args_list]
+        assert CMD_REGISTERS_GET not in sent_cmds, (
+            "the PC was on the wire; a register read is a needless round-trip"
+        )

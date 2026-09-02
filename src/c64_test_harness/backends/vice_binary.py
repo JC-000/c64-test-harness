@@ -85,9 +85,13 @@ EVENT_RESUMED = 0x63
 RESPONSE_CHECKPOINT_INFO = 0x11
 
 #: VICE emits this when the 6510 hits an illegal opcode and jams
-#: (``e_MON_RESPONSE_JAM``, S ``monitor_binary.c:382-391``).  It declares a
-#: body length of 0 and sends no payload, so the jammed address has to be
-#: read back separately.
+#: (``e_MON_RESPONSE_JAM``, S ``monitor_binary.c:382-391``).  The protocol
+#: manual (vice.texi, "JAM Response (0x61)") documents a 2-byte PC body,
+#: and ``monitor_binary_ui_jam_dialog`` does fill one -- but 3.10 passes
+#: ``length=0`` to ``monitor_binary_response`` (S ``monitor_binary.c:389``,
+#: where STOPPED/RESUMED pass 2), which transmits ``length`` body bytes.
+#: So on the wire the 3.10 frame is bodiless and the jammed address has to
+#: be read back separately; a body, when a build sends one, is preferred.
 #:
 #: Found by the binary-monitor mapping, which noted that this client never
 #: mentioned 0x61 at all: a jam was buffered as an unrecognised event and
@@ -953,21 +957,31 @@ class BinaryViceTransport:
 
         self._send_and_recv(CMD_REGISTERS_SET, body)
 
-    def _jam_message(self) -> str:
-        """Describe a CPU jam, naming the address if it can be read.
+    def _jam_message(self, frame: _Response) -> str:
+        """Describe the CPU jam reported by *frame*, naming the address.
 
-        The JAM event carries no body, so the address has to come from a
+        The protocol documents a 2-byte little-endian PC body for the
+        JAM response (vice.texi, "JAM Response (0x61)"), and that is
+        used when present: no wire round-trip against a machine that
+        has just jammed.  VICE 3.10 does not actually send it -- see
+        :data:`RESPONSE_JAM` -- so a bodiless frame falls back to a
         register read.  That read can itself fail on a sufficiently
         unwell machine, so it is best-effort: a jam reported without an
         address is still far better than the timeout this replaces.
+
+        Must be called with ``_lock`` *released*: the fallback goes
+        through ``_send_and_recv``, which takes it.
         """
         where = ""
-        try:
-            pc = self.read_registers().get("PC")
-            if pc is not None:
-                where = f" at ${pc:04x}"
-        except Exception:
-            where = " (PC unreadable)"
+        if len(frame.body) >= 2:
+            where = f" at ${struct.unpack_from('<H', frame.body, 0)[0]:04x}"
+        else:
+            try:
+                pc = self.read_registers().get("PC")
+                if pc is not None:
+                    where = f" at ${pc:04x}"
+            except Exception:
+                where = " (PC unreadable)"
         return (
             f"The 6510 jammed{where}: VICE reported a JAM event "
             f"({RESPONSE_JAM:#04x}), which means an illegal opcode halted "
@@ -1001,7 +1015,7 @@ class BinaryViceTransport:
         # than as whatever timeout follows it.
         for evt_gen, evt_resp in self._event_queue:
             if evt_gen >= gen and evt_resp.response_type == RESPONSE_JAM:
-                raise TransportError(self._jam_message())
+                raise TransportError(self._jam_message(evt_resp))
 
         # Check whether an EVENT_STOPPED at the current generation is already
         # sitting in the queue (arrived during the resume() ack window).
@@ -1033,11 +1047,11 @@ class BinaryViceTransport:
                 if resp.response_type == EVENT_STOPPED:
                     return self._parse_stopped_event(resp)
                 if resp.response_type == RESPONSE_JAM:
-                    # Leave the ``with`` before describing the jam:
-                    # ``_jam_message`` reads the PC through
-                    # ``_send_and_recv``, which takes this same
-                    # non-reentrant lock.  Raising from inside the block
-                    # deadlocked the transport for good.
+                    # Leave the ``with`` before describing the jam: for
+                    # a bodiless frame (VICE 3.10) ``_jam_message`` reads
+                    # the PC through ``_send_and_recv``, which takes this
+                    # same non-reentrant lock.  Raising from inside the
+                    # block deadlocked the transport for good.
                     break
                 if resp.request_id == EVENT_REQUEST_ID:
                     # Other unsolicited event (Resumed, Checkpoint info, …):
@@ -1053,8 +1067,9 @@ class BinaryViceTransport:
                     f"req_id={resp.request_id:#x}, "
                     f"body={resp.body.hex()}"
                 )
-        # Only the JAM ``break`` reaches here; the lock is released.
-        raise TransportError(self._jam_message())
+        # Only the JAM ``break`` reaches here; the lock is released and
+        # ``resp`` is the JAM frame.
+        raise TransportError(self._jam_message(resp))
 
     def resource_get(self, name: str) -> int | str:
         """Get a VICE resource value by name.

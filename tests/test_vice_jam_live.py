@@ -43,8 +43,9 @@ def test_a_jam_is_reported_not_timed_out(binary_transport):
     with pytest.raises(TransportError, match="jammed") as excinfo:
         t.wait_for_stopped(timeout=15)
 
-    # VICE reports the jam with reg_pc still on the offending opcode, so
-    # the message should name the jam site when the PC was readable.
-    msg = str(excinfo.value)
-    if "PC unreadable" not in msg:
-        assert f"${JAM_ADDR:04x}" in msg, msg
+    # VICE reports the jam with reg_pc still on the offending opcode.  The
+    # 3.10 frame is bodiless (S ``monitor_binary.c:389`` passes length 0
+    # despite the manual's 2-byte PC body), so on this build the address
+    # comes from the register-read fallback; the machine is sitting in
+    # the monitor and must answer it.  Either way the message names it.
+    assert f"jammed at ${JAM_ADDR:04x}" in str(excinfo.value), str(excinfo.value)
