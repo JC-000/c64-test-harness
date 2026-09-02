@@ -25,6 +25,7 @@ See ``test_disk_vice.py`` module docstring for the screen polling /
 
 from __future__ import annotations
 
+import os
 import time
 
 import pytest
@@ -53,6 +54,7 @@ from ethernet_scenarios import (
     binary_jsr,
     capture_failure_disposition,
     clockport_enable_code,
+    resolve_capture_ifaces,
     run_rx_scenario,
     run_tx_scenario,
 )
@@ -66,6 +68,17 @@ from conftest import connect_binary_transport
 
 # Platform-dependent: Linux → first tap-*, macOS → first feth*.
 TAP_IFACE = first_available_ethernet_iface()
+
+# Where the *host* side captures and sends.  Defaults to VICE's interface;
+# C64_ETH_CAPTURE_IFACE / C64_ETH_SEND_IFACE move either to another
+# interface -- the peer of the feth pair -- without a code change.  Pivot
+# to the peer when a TX failure shows VICE's own BPF descriptor at
+# Written=1: the chip put the frame on the interface and the capture was
+# on the wrong side of it.  See docs/bridge_networking.md "Host-side
+# capture on macOS".
+CAPTURE_IFACE, SEND_IFACE = (
+    resolve_capture_ifaces(TAP_IFACE, os.environ) if TAP_IFACE else (None, None)
+)
 
 # On macOS 26 Tahoe the Homebrew VICE 3.10 bottle crashes immediately when
 # launched with ``-ethernetiodriver pcap -ethernetioif feth<N>`` (the
@@ -158,35 +171,59 @@ def vice_ethernet():
             allocator.release(port)
 
 
+def _open_capture_or_verdict(iface: str) -> PacketCapture:
+    """Open once; skip or fail on the exception per its classification.
+
+    Skips only when the path is genuinely absent (every node root-only, no
+    nodes, no CAP_NET_RAW, no backend), with the message -- which carries
+    the operator's remedy verbatim -- as the reason.  A path that exists
+    but is broken (pool eaten while VICE is live, bind failure on the
+    interface we just found, wrong DLT) *fails* with the same remedy: a
+    skip there is how issue #158 hid.
+    """
+    try:
+        return open_capture(iface)
+    except CaptureUnavailable as e:
+        verdict, reason = capture_failure_disposition(e, iface=iface)
+        if verdict == "skip":
+            pytest.skip(reason)
+        pytest.fail(reason, pytrace=False)
+
+
 @pytest.fixture
 def host_capture(vice_ethernet: BinaryViceTransport) -> PacketCapture:
-    """An open host-side capture on ``TAP_IFACE``, or a skip that names the fix.
+    """An open host-side capture on ``CAPTURE_IFACE`` (TX side).
 
     Depends on ``vice_ethernet`` so the open happens *after* the elevated
     VICE has taken its two ``/dev/bpf*`` nodes: on macOS a root VICE takes
     the lowest free nodes, which are exactly the ones ``chmod o+rw`` made
     usable, so opening beforehand would report a pool this process no
-    longer has.
-
-    One :func:`open_capture` call, no separate probe: the exception it
-    raises is the verdict, classified by
-    :func:`ethernet_scenarios.capture_failure_disposition`.  Skips only
-    when the path is genuinely absent (every node root-only, no nodes, no
-    CAP_NET_RAW, no backend), with the message -- which carries the
-    operator's remedy verbatim -- as the reason.  A path that exists but
-    is broken (pool eaten while VICE is live, bind failure on the
-    interface we just found, wrong DLT) *fails* with the same remedy: a
-    skip there is how issue #158 hid.  When the path opens the test runs,
-    and a silent wire is then a failure too (see ``ethernet_scenarios``).
+    longer has.  One :func:`open_capture` call, no separate probe; see
+    :func:`_open_capture_or_verdict` for the skip-vs-fail rule.  When the
+    path opens the test runs, and a silent wire is then a failure (see
+    ``ethernet_scenarios``).
     """
-    assert TAP_IFACE is not None
+    assert CAPTURE_IFACE is not None
+    cap = _open_capture_or_verdict(CAPTURE_IFACE)
     try:
-        cap = open_capture(TAP_IFACE)
-    except CaptureUnavailable as e:
-        verdict, reason = capture_failure_disposition(e, iface=TAP_IFACE)
-        if verdict == "skip":
-            pytest.skip(reason)
-        pytest.fail(reason, pytrace=False)
+        yield cap
+    finally:
+        cap.close()
+
+
+@pytest.fixture
+def host_send_capture(host_capture: PacketCapture) -> PacketCapture:
+    """The capture the RX frame is written through: ``SEND_IFACE``.
+
+    The same object as ``host_capture`` unless ``C64_ETH_SEND_IFACE``
+    names another interface, in which case a second capture is opened
+    there (and consumes a second BPF node).
+    """
+    assert SEND_IFACE is not None
+    if SEND_IFACE == host_capture.iface:
+        yield host_capture
+        return
+    cap = _open_capture_or_verdict(SEND_IFACE)
     try:
         yield cap
     finally:
@@ -254,11 +291,17 @@ class TestEthernetRX:
     """Send a packet from the host and have the C64 receive it."""
 
     def test_receive_frame(
-        self, vice_ethernet: BinaryViceTransport, host_capture: PacketCapture
+        self,
+        vice_ethernet: BinaryViceTransport,
+        host_capture: PacketCapture,
+        host_send_capture: PacketCapture,
     ) -> None:
-        """Host injects a frame on the interface; the C64 reads it via CS8900a RX.
+        """Host injects a frame on ``SEND_IFACE``; the C64 reads it via CS8900a RX.
 
         A failed host send, or a C64 poll timeout (the frame never reached
         the chip), is an AssertionError, not a skip.
         """
-        run_rx_scenario(vice_ethernet, host_capture, send_delay=0.5, timeout=15.0)
+        run_rx_scenario(
+            vice_ethernet, host_capture, send_capture=host_send_capture,
+            send_delay=0.5, timeout=15.0,
+        )

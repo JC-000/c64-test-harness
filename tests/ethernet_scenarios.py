@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any
+from typing import Any, Mapping
 
 from c64_test_harness.bridge_ping import cs8900a_enable_inline_code
 from c64_test_harness.capture import (
@@ -97,6 +97,32 @@ def capture_failure_disposition(exc: CaptureUnavailable, *, iface: str) -> tuple
         f"(cause={exc.cause}; this is not absence, so the test fails rather "
         f"than skips): {exc}",
     )
+
+
+#: Bind the host capture (TX side) to this interface instead of VICE's.
+CAPTURE_IFACE_ENV = "C64_ETH_CAPTURE_IFACE"
+#: Write the RX frame to this interface instead of the capture's.
+SEND_IFACE_ENV = "C64_ETH_SEND_IFACE"
+
+
+def resolve_capture_ifaces(vice_iface: str, env: Mapping[str, str]) -> tuple[str, str]:
+    """``(capture_iface, send_iface)`` for the host side, from *env* overrides.
+
+    Default: both are *vice_iface*.  ``C64_ETH_CAPTURE_IFACE`` moves the
+    capture (and, unless ``C64_ETH_SEND_IFACE`` is also set, the send) to
+    another interface -- the peer of a feth pair when the live TX run
+    shows VICE's descriptor at Written=1 with nothing captured, i.e. the
+    frame left on the interface but our capture was on the wrong side.
+    Blank values are ignored.
+    """
+    def _get(name: str) -> str | None:
+        v = env.get(name, "")
+        v = v.strip() if isinstance(v, str) else ""
+        return v or None
+
+    capture_iface = _get(CAPTURE_IFACE_ENV) or vice_iface
+    send_iface = _get(SEND_IFACE_ENV) or capture_iface
+    return capture_iface, send_iface
 
 
 def is_test_frame(frame: bytes) -> bool:
@@ -329,18 +355,22 @@ def run_rx_scenario(
     transport: Any,
     capture: PacketCapture,
     *,
+    send_capture: PacketCapture | None = None,
     send_delay: float = 0.5,
     timeout: float = 15.0,
 ) -> bytes:
-    """Host injects RX_FRAME through *capture*; the C64 must receive it.
+    """Host injects RX_FRAME; the C64 must receive it.
 
-    The RX routine polls the CS8900a; a thread sends the frame after
-    *send_delay* so the poll is already running.  Returns the five
+    The frame is written through *send_capture* (default: *capture*
+    itself -- see :func:`resolve_capture_ifaces` for when the two
+    differ).  The RX routine polls the CS8900a; a thread sends the frame
+    after *send_delay* so the poll is already running.  Returns the five
     result bytes ($C000-$C004: marker, flag).  Raises
     :class:`AssertionError` if the host send failed, if the C64's poll
     timed out (the frame never reached the chip), or if the marker read
     back differs.
     """
+    sender_cap = send_capture if send_capture is not None else capture
     load_code(transport, CODE_BASE, rx_routine())
     write_bytes(transport, 0xC000, [0x00] * 5)  # clear result area
 
@@ -360,7 +390,7 @@ def run_rx_scenario(
     def _send_packet_delayed() -> None:
         time.sleep(send_delay)
         try:
-            capture.send(RX_FRAME)
+            sender_cap.send(RX_FRAME)
         except BaseException as e:  # reported below, never swallowed
             send_error.append(e)
 
@@ -377,19 +407,22 @@ def run_rx_scenario(
 
     if send_error:
         raise AssertionError(
-            f"host-side send on {capture.iface} failed, so no frame ever left the "
+            f"host-side send on {sender_cap.iface} failed, so no frame ever left the "
             f"host: {send_error[0]!r}"
         )
     if sender.is_alive():
-        raise AssertionError(f"host-side send on {capture.iface} did not return")
+        raise AssertionError(f"host-side send on {sender_cap.iface} did not return")
 
     result = read_bytes(transport, 0xC000, 5)
     success = result[4]
     if result[0] == 0xFF and success != 0x01:
+        sides = [sender_cap.iface]
+        if capture.iface != sender_cap.iface:
+            sides.append(capture.iface)
         raise AssertionError(
             f"C64 poll for RxOK timed out (result {result.hex()}) after the host "
-            f"wrote {len(RX_FRAME)} bytes to {capture.iface}; the frame never reached "
-            f"the CS8900a. {bpf_descriptor_summary(capture.iface)}"
+            f"wrote {len(RX_FRAME)} bytes to {sender_cap.iface}; the frame never reached "
+            f"the CS8900a. " + " | ".join(bpf_descriptor_summary(i) for i in sides)
         )
     if success != 0x01:
         raise AssertionError(

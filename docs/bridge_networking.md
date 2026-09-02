@@ -286,11 +286,46 @@ sudo chmod o+rw /dev/bpf*
 ```
 
 The tests open the capture *after* the module's VICE fixture has taken
-its nodes, so the availability probe reflects the pool this process
-really has. No `tcpdump` NOPASSWD rule exists or is needed; if an
-operator prefers sudoers over chmod, `someone ALL=(root) NOPASSWD:
-/usr/sbin/tcpdump` would enable a subprocess path the harness does not
-currently implement.
+its nodes, so the one `open_capture()` call reflects the pool this
+process really has. Its exception is classified: **skip** only on genuine
+absence (every node root-only, no nodes, no `CAP_NET_RAW`, no backend);
+**fail**, remedy in the message, when the path exists but is broken —
+all writable nodes `EBUSY` while VICE is live (pool eaten; `chmod o+rw`
+opens `bpf4-7`, which exist), `BIOCSETIF` failing on the interface the
+platform helper just found, a non-ethernet DLT, a Linux bind failure. No
+`tcpdump` NOPASSWD rule exists or is needed; if an operator prefers
+sudoers over chmod, `someone ALL=(root) NOPASSWD: /usr/sbin/tcpdump`
+would enable a subprocess path the harness does not currently implement.
+
+**Direction assumption and the peer knob.** `feth0`/`feth1` are a peer
+pair (`ifconfig feth0` reports `peer: feth1`). A frame VICE injects on
+`feth0` is *outgoing* there and *incoming* on `feth1`; a frame the host
+writes to `feth0`'s BPF emerges from `feth1`. By default the harness
+binds capture and send to VICE's interface and relies on `BIOCSSEESENT`
+(TX) and the driver's write-path tap (RX). If that assumption is wrong
+the failure message says so without a re-run: it ends with `netstat -B`
+counters for the interface, and VICE's own descriptor reads
+**`Written=1`** while nothing was captured — the chip put the frame on
+the interface, the capture was on the wrong side. **`Written=0`** means
+the frame died inside the emulated CS8900a (chip fault; check the
+routine's RxCTL/LineCTL enable, `cs8900a_enable_inline_code`). Pivot to
+the peer without a code change:
+
+```bash
+C64_ETH_CAPTURE_IFACE=feth1 pytest tests/test_ethernet.py   # capture + send on the peer
+C64_ETH_SEND_IFACE=feth1    pytest tests/test_ethernet.py   # send on the peer only
+```
+
+(`C64_ETH_SEND_IFACE` follows `C64_ETH_CAPTURE_IFACE` unless set
+separately; a second interface costs a second BPF node.) The knob is
+`ethernet_scenarios.resolve_capture_ifaces()`.
+
+**Linux behaviour change.** The TX test used to accept the *first* frame
+`AF_PACKET` returned within 5 s and compare it; it now discards frames
+whose ethertype is not `0x88B5` until the deadline, so stray traffic on
+the TAP (IPv6 multicast, ARP) can no longer fail the test by arriving
+first — and can no longer *pass* it either, since the compared frame is
+always ours.
 
 ### macOS test-author traps (live tests only)
 
