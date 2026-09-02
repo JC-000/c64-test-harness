@@ -53,9 +53,9 @@ the output:
   *first* textual occurrence. When that is a docstring or a comment the
   code is unchanged, the suite passes, and the row scores as a survivor.
   `generate.py` computes the docstring and comment spans and refuses
-  these, printing each one it refused. At `bbb0261` that is exactly
+  these, printing each one it refused. At `02553ae` that is exactly
   three, all in `vice_elevation.py`: the `"-features"` name and polarity
-  mutants (the docstring at :155 precedes the code at :213) and an `int`
+  mutants (the docstring at :163 precedes the code at :221) and an `int`
   mutant whose `= 0` first matched the module docstring's
   `geteuid() == 0` at :6.
 
@@ -78,10 +78,10 @@ means the instrument did not measure, fix the instrument.
 
 The count depends on the source revision, so any figure must name one.
 
-**At `bbb0261` (this branch, `fix/vice-backend-audit`), `generate.py`
-yields exactly 168 mutations**: cmp=71, flagname=38, flagpolarity=38,
-int=16, resname=5. By file: `vice_lifecycle.py` 98, `vice_binary.py` 41,
-`vice_manager.py` 17, `vice_elevation.py` 12. That is what the tool
+**At `02553ae` (this branch, `fix/vice-backend-audit`), `generate.py`
+yields exactly 169 mutations**: cmp=72, flagname=38, flagpolarity=38,
+int=16, resname=5. By file: `vice_lifecycle.py` 97, `vice_binary.py` 42,
+`vice_manager.py` 17, `vice_elevation.py` 13. That is what the tool
 prints; if it prints something else, the source has changed and this
 paragraph is stale.
 
@@ -120,7 +120,7 @@ now excluded at generation (see the fourth exclusion), so 82 is the honest
 survivor count for that run.
 
 **The flag funnel.** Population is the `flagname` and `flagpolarity`
-mutations in `vice_lifecycle.py`. At `bbb0261` that is **74 mutants over
+mutations in `vice_lifecycle.py`. At `02553ae` that is **74 mutants over
 37 literals** — the *right* 37 (see correction 3 below). The staged
 figures were measured on an earlier 74 that was the *wrong* 37: it
 carried `-axo` and `-drive`, which are not VICE flags, and lacked
@@ -206,9 +206,9 @@ contribution was overstated**.
 
 These are real and they bound what the results can support.
 
-- **First-occurrence replacement, measured at `bbb0261`.** `run.py`
+- **First-occurrence replacement, measured at `02553ae`.** `run.py`
   replaces the first textual occurrence of `old`, not the occurrence at
-  the recorded line. **31 of the 168 mutations have an `old` that appears
+  the recorded line. **31 of the 169 mutations have an `old` that appears
   more than once** — 15 `cmp`, 10 `int`, 2 `flagname`, 2 `flagpolarity`,
   2 `resname`. The worst offenders are bare integers (`= 0` at 56 sites
   in `vice_binary.py` alone, `= 1` at 23) and comparisons
