@@ -625,3 +625,40 @@ def test_jsr_recover_on_timeout_uses_other_slot_when_trampoline_is_at_0360():
     # The probe trampoline stays where the caller put it and JSRs $0334.
     assert (0x0360, [0x20, 0x34, 0x03, 0xEA, 0xEA]) in t.written_memory
     assert "$0363" in excinfo.value.detail
+
+
+def test_routine_hung_is_exported_from_package_root():
+    import c64_test_harness as pkg
+
+    assert "RoutineHung" in pkg.__all__
+    assert pkg.RoutineHung is RoutineHung
+
+
+def test_package_root_exports_have_no_duplicate_names():
+    """Thousands of downstream tests import from the root; a re-export
+    that shadows an existing name would silently swap behaviour.  Walk the
+    AST rather than the runtime namespace: at runtime a duplicate has
+    already won, so nothing is left to detect."""
+    import ast
+    import collections
+    import c64_test_harness as pkg
+
+    tree = ast.parse(open(pkg.__file__, encoding="utf-8").read())
+    bound = collections.Counter()
+    all_names = collections.Counter()
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                bound[alias.asname or alias.name] += 1
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "__all__":
+                    for elt in node.value.elts:
+                        all_names[elt.value] += 1
+    assert bound["RoutineHung"] == 1
+    dup_bound = sorted(n for n, c in bound.items() if c > 1)
+    dup_all = sorted(n for n, c in all_names.items() if c > 1)
+    assert dup_bound == [], f"names imported more than once: {dup_bound}"
+    assert dup_all == [], f"names listed in __all__ more than once: {dup_all}"
+    # Every re-export is advertised, and vice versa.
+    assert set(all_names) - {"__version__"} <= set(bound)
