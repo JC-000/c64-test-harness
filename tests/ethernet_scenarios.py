@@ -22,6 +22,7 @@ import time
 from typing import Any, Mapping
 
 from c64_test_harness.bridge_ping import cs8900a_enable_inline_code
+from c64_test_harness.disasm import disassemble
 from c64_test_harness.capture import (
     CaptureTimeout,
     CaptureUnavailable,
@@ -31,9 +32,14 @@ from c64_test_harness.capture import (
 from c64_test_harness.execute import load_code
 from c64_test_harness.memory import read_bytes, write_bytes
 
-# Scratch area
+# Scratch area.  The routine is loaded at CODE_BASE; every result byte it
+# stores and every byte the host clears lives in DATA_BASE.  They used to
+# share $C000, and "clearing the flag" after load_code() zeroed the first
+# opcode into BRK -- the C64 never returned (live, 2026-09-01).
 CODE_BASE = 0xC000
 DATA_BASE = 0xC100
+#: TX: success flag.  RX: marker bytes at +0..+3, success flag at +4.
+RESULT = DATA_BASE
 
 # CS8900a I/O registers (RR-Net mode at $DE00).
 # Matches ip65 cs8900a.s layout:
@@ -168,11 +174,43 @@ def binary_jsr(
     try:
         transport.set_registers({"PC": scratch_addr})
         transport.resume()
-        transport.wait_for_stopped(timeout=timeout)
+        try:
+            transport.wait_for_stopped(timeout=timeout)
+        except TimeoutError as e:
+            raise AssertionError(jsr_timeout_report(transport, addr, timeout)) from e
         regs = transport.read_registers()
         return regs
     finally:
         transport.delete_checkpoint(bp_num)
+
+
+def jsr_timeout_report(transport: Any, addr: int, timeout: float, *, window: int = 8) -> str:
+    """Where the 6502 is when a JSR to *addr* did not return.
+
+    Registers, a disassembly window around PC with the PC line marked,
+    the CS8900a I/O window $DE00-$DE0F, and the first bytes of the routine
+    as they are in RAM *now* -- which is how a clobbered first opcode
+    (``00 BRK``) shows itself.
+    """
+    regs = transport.read_registers()
+    pc = regs.get("PC", 0) & 0xFFFF
+    lines = [
+        f"6502 did not return from ${addr:04X} within {timeout:.1f}s.",
+        "regs: " + " ".join(
+            f"{k}=${regs[k]:0{4 if k == 'PC' else 2}X}"
+            for k in ("PC", "A", "X", "Y", "SP") if k in regs
+        ),
+    ]
+    start = max(0, pc - window)
+    mem = transport.read_memory(start, window * 3)
+    for line in disassemble(mem, start):
+        at = int(line[:4], 16)
+        lines.append(("> " if at == pc else "  ") + line)
+    io = transport.read_memory(0xDE00, 16)
+    lines.append(f"$DE00: {bytes(io).hex(' ')}")
+    code = transport.read_memory(addr, 16)
+    lines.append(f"code@${addr:04X}: {bytes(code).hex(' ')}")
+    return "\n".join(lines)
 
 
 def tx_routine() -> bytes:
@@ -223,9 +261,9 @@ def tx_routine() -> bytes:
         0xC0, 0x40,
         0xD0, 0xF0,  # BNE -16
 
-        # Success
+        # Success flag -> RESULT
         0xA9, 0x01,
-        0x8D, 0x00, 0xC0,
+        0x8D, RESULT & 0xFF, RESULT >> 8,
         0x60,
     ])
 
@@ -237,9 +275,9 @@ def rx_routine() -> bytes:
     2. Read RxStatus from RTDATA
     3. Read RxLength from RTDATA
     4. Read first 4 payload bytes (skip 14-byte header = 7 word reads)
-    5. Store marker at $C000-$C003, success flag 0x01 at $C004
+    5. Store marker at RESULT+0..+3, success flag 0x01 at RESULT+4
 
-    A 16-bit timeout counter avoids an infinite loop; on timeout $C000
+    A 16-bit timeout counter avoids an infinite loop; on timeout RESULT+0
     is set to 0xFF and the flag is left clear.
     """
     rtd_lo = RTDATA & 0xFF
@@ -267,8 +305,8 @@ def rx_routine() -> bytes:
         0xC6, 0xFD, 0xD0, 0xF5,  # DEC $FD; BNE .poll  (-11)
         0xC6, 0xFE, 0xD0, 0xF1,  # DEC $FE; BNE .poll  (-15)
 
-        # Timeout -> $C000 = 0xFF
-        0xA9, 0xFF, 0x8D, 0x00, 0xC0, 0x60,
+        # Timeout -> RESULT+0 = 0xFF
+        0xA9, 0xFF, 0x8D, RESULT & 0xFF, RESULT >> 8, 0x60,
 
         # .got_packet:
         # Read RxStatus (2 bytes, discard) -- from RTDATA
@@ -286,18 +324,18 @@ def rx_routine() -> bytes:
         0xCA,
         0xD0, 0xF8,  # BNE -8
 
-        # Read 4 marker bytes (2 word reads)
+        # Read 4 marker bytes (2 word reads) -> RESULT+0..+3
         0xAD, rtd_lo, 0xDE,
-        0x8D, 0x00, 0xC0,
+        0x8D, (RESULT + 0) & 0xFF, RESULT >> 8,
         0xAD, rtd_h_lo, 0xDE,
-        0x8D, 0x01, 0xC0,
+        0x8D, (RESULT + 1) & 0xFF, RESULT >> 8,
         0xAD, rtd_lo, 0xDE,
-        0x8D, 0x02, 0xC0,
+        0x8D, (RESULT + 2) & 0xFF, RESULT >> 8,
         0xAD, rtd_h_lo, 0xDE,
-        0x8D, 0x03, 0xC0,
+        0x8D, (RESULT + 3) & 0xFF, RESULT >> 8,
 
-        # Success
-        0xA9, 0x01, 0x8D, 0x04, 0xC0, 0x60,
+        # Success flag -> RESULT+4
+        0xA9, 0x01, 0x8D, (RESULT + 4) & 0xFF, RESULT >> 8, 0x60,
     ])
 
 
@@ -311,12 +349,12 @@ def run_tx_scenario(transport: Any, capture: PacketCapture, *, timeout: float = 
     the wire within *timeout*, or if the frame's bytes disagree.
     """
     write_bytes(transport, FRAME_BUF, FRAME_DATA)
+    write_bytes(transport, RESULT, [0x00])  # clear success flag (never inside the code)
     load_code(transport, CODE_BASE, tx_routine())
-    write_bytes(transport, 0xC000, [0x00])  # clear success flag
 
     binary_jsr(transport, CODE_BASE, timeout=10)
 
-    flag = read_bytes(transport, 0xC000, 1)
+    flag = read_bytes(transport, RESULT, 1)
     if flag[0] != 0x01:
         raise AssertionError(
             f"TX routine did not complete (success flag 0x{flag[0]:02X}, expected 0x01)"
@@ -366,14 +404,14 @@ def run_rx_scenario(
     itself -- see :func:`resolve_capture_ifaces` for when the two
     differ).  The RX routine polls the CS8900a; a thread sends the frame
     after *send_delay* so the poll is already running.  Returns the five
-    result bytes ($C000-$C004: marker, flag).  Raises
+    result bytes (RESULT+0..+4: marker, flag).  Raises
     :class:`AssertionError` if the host send failed, if the C64's poll
     timed out (the frame never reached the chip), or if the marker read
     back differs.
     """
     sender_cap = send_capture if send_capture is not None else capture
+    write_bytes(transport, RESULT, [0x00] * 5)  # clear result area (never inside the code)
     load_code(transport, CODE_BASE, rx_routine())
-    write_bytes(transport, 0xC000, [0x00] * 5)  # clear result area
 
     # Trampoline at the scratch area with a breakpoint after the JSR, so
     # the send can happen while the C64 is inside the routine.
@@ -414,7 +452,7 @@ def run_rx_scenario(
     if sender.is_alive():
         raise AssertionError(f"host-side send on {sender_cap.iface} did not return")
 
-    result = read_bytes(transport, 0xC000, 5)
+    result = read_bytes(transport, RESULT, 5)
     success = result[4]
     if result[0] == 0xFF and success != 0x01:
         sides = [sender_cap.iface]

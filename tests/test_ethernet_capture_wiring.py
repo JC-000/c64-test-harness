@@ -30,6 +30,7 @@ from ethernet_scenarios import (
     FRAME_BUF,
     FRAME_DATA,
     FRAME_LEN,
+    RESULT,
     RX_FRAME,
     RX_MARKER,
     run_rx_scenario,
@@ -120,7 +121,7 @@ class FakeCapture:
 
 
 def _c64_sets_tx_flag(ram: bytearray) -> None:
-    ram[0xC000] = 0x01
+    ram[RESULT] = 0x01
 
 
 STRAY_IPV4 = b"\x01\x00\x5e\x00\x00\xfb" + b"\x02\xc6\x40\x00\x00\x09" + b"\x08\x00" + b"\x45" * 50
@@ -220,12 +221,12 @@ def test_tx_scenario_rejects_a_matching_ethertype_with_wrong_payload():
 
 
 def _c64_receives_marker(ram: bytearray) -> None:
-    ram[0xC000:0xC004] = RX_MARKER
-    ram[0xC004] = 0x01
+    ram[RESULT:RESULT + 4] = RX_MARKER
+    ram[RESULT + 4] = 0x01
 
 
 def _c64_poll_times_out(ram: bytearray) -> None:
-    ram[0xC000] = 0xFF
+    ram[RESULT] = 0xFF
 
 
 def test_rx_scenario_sends_the_marker_frame_through_the_capture():
@@ -268,8 +269,8 @@ def test_rx_scenario_fails_not_skips_when_the_c64_never_sees_the_frame():
 
 def test_rx_scenario_rejects_a_wrong_marker():
     def _wrong_marker(ram: bytearray) -> None:
-        ram[0xC000:0xC004] = b"\x00\x00\x00\x00"
-        ram[0xC004] = 0x01
+        ram[RESULT:RESULT + 4] = b"\x00\x00\x00\x00"
+        ram[RESULT + 4] = 0x01
 
     transport = FakeTransport(on_resume=_wrong_marker)
     with pytest.raises(AssertionError) as ei:
@@ -591,10 +592,15 @@ def test_routines_store_results_in_data_base_not_in_their_own_page():
 
 
 class HangingTransport(FakeTransport):
-    """The CPU never reaches the breakpoint; registers say where it is."""
+    """The CPU never reaches the breakpoint; registers say where it is.
 
-    def __init__(self, pc: int) -> None:
-        super().__init__()
+    ``on_resume`` models what RAM looks like while the CPU is stuck --
+    here, a routine whose first opcode has been zeroed *after* it was
+    loaded, which is what the live bench showed.
+    """
+
+    def __init__(self, pc: int, on_resume=None) -> None:
+        super().__init__(on_resume)
         self._pc = pc
 
     def wait_for_stopped(self, timeout: float = 0.0) -> None:
@@ -605,9 +611,11 @@ class HangingTransport(FakeTransport):
 
 
 def test_jsr_timeout_reports_pc_disassembly_io_window_and_routine_bytes():
-    transport = HangingTransport(pc=0xC003)
-    transport.ram[0xC000:0xC00B] = bytes([0x00, 0x01, 0xDE, 0x09, 0x01, 0x8D, 0x01, 0xDE, 0xF0, 0xF9, 0x60])
-    transport.ram[0xDE00:0xDE10] = bytes(range(0x10, 0x20))
+    def clobbered(ram: bytearray) -> None:
+        ram[0xC000:0xC00B] = bytes([0x00, 0x01, 0xDE, 0x09, 0x01, 0x8D, 0x01, 0xDE, 0xF0, 0xF9, 0x60])
+        ram[0xDE00:0xDE10] = bytes(range(0x10, 0x20))
+
+    transport = HangingTransport(pc=0xC003, on_resume=clobbered)
 
     with pytest.raises(AssertionError) as ei:
         run_tx_scenario(transport, FakeCapture([FRAME_DATA]), timeout=0.01)
