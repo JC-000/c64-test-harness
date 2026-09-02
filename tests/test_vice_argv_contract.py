@@ -26,10 +26,14 @@ no single oracle sees all three:
   absent from ``-help`` as an exact string, so the same test catches it —
   which is precisely why that test matches **exactly** and never by
   prefix.
-* **Present in ``-help`` but rejected at parse time.**  ``-ethernetcart``
-  is listed by ``-help`` and still dies with "Option '-ethernetcart' not
-  valid."  No amount of ``-help`` parsing sees this one; only a real
-  launch does.  That is :func:`test_a_fully_populated_config_launches`.
+* **Present in ``-help`` but rejected at parse time.**  ``-jamaction`` is
+  listed by ``-help``, and ``-jamaction 99`` still dies with "Argument
+  '99' not valid for option `-jamaction'" because the resource setter
+  refuses it (S ``machine.c:461-473``, ``cmdline.c:262-269``).  No amount
+  of ``-help`` parsing sees this one; only a real launch does.  That is
+  :func:`test_a_fully_populated_config_launches`.  (An earlier revision
+  named ``-ethernetcart`` here; that flag parses fine and the unelevated
+  VICE it activates SIGSEGVs later -- a different failure entirely.)
 
 Both guards carry a negative control that seeds a known-bad flag and
 proves the guard fails on it.  A guard that cannot fail is worth less
@@ -354,19 +358,32 @@ def test_a_fully_populated_config_launches(tmp_path):
 def test_the_launch_guard_catches_a_flag_help_lists_but_vice_rejects():
     """Negative control for the test above, and the reason it exists.
 
-    ``-ethernetcart`` is in ``-help`` and is rejected at parse time, so it
-    passes the option-table guard and must fail this one.  Safe to seed:
-    the launch dies during argument parsing, long before any rawnet
-    driver is touched, so this never reaches the unelevated SIGSEGV.
+    ``-jamaction 99`` is listed by ``-help`` and rejected at parse time,
+    so it passes the option-table guard and must fail this one.  The
+    rejection is genuine and traceable (VICE 3.10 source): ``-jamaction``
+    is a ``SET_RESOURCE`` with ``NEED_ARGS`` (S ``machine.c:539-541``), so
+    ``cmdline_parse`` hands the argument to ``resources_set_value_string``
+    (S ``cmdline.c:248``), whose int setter ``set_jam_action`` returns -1
+    for anything outside 0-5 (S ``machine.c:461-473``); ``cmdline_parse``
+    then logs "Argument '99' not valid for option `-jamaction'" and
+    returns -1 (S ``cmdline.c:262-269``), and ``initcmdline.c:527`` bails
+    out.  No emulation starts, so the monitor never listens.
+
+    An earlier version seeded ``-ethernetcart`` and claimed *it* was
+    rejected at parse time.  It is not: it is a plain ``SET_RESOURCE``
+    (S ``ethernetcart.c:434-436``), parsing succeeds, the cart activates,
+    and an unelevated VICE then SIGSEGVs on the NULL rawnet driver
+    (docs/vice_upstream_bugs.md § 2).  That test passed -- the monitor
+    never answered -- but for the wrong reason, and by crashing a VICE.
     """
-    assert "-ethernetcart" in vice_option_names(), (
-        "premise changed: -ethernetcart is no longer listed by -help, so "
+    assert "-jamaction" in vice_option_names(), (
+        "premise changed: -jamaction is no longer listed by -help, so "
         "this no longer tests what it claims"
     )
-    cfg = ViceConfig(port=free_port(), console=True, extra_args=["-ethernetcart"])
+    cfg = ViceConfig(port=free_port(), console=True, extra_args=["-jamaction", "99"])
     assert not launches_and_answers(cfg), (
-        "the launch guard failed to notice a flag VICE rejects at parse "
-        "time — the one defect class -help cannot see"
+        "the launch guard failed to notice an argument VICE rejects at "
+        "parse time — the one defect class -help cannot see"
     )
 
 
