@@ -349,22 +349,36 @@ from c64_test_harness import (
     build_icmp_responder_code, run_ping_and_wait, run_icmp_responder,
 )
 
+# Layout (same as tests/test_bridge_ping.py): peek routine at $C000 (the
+# default peek_addr, 64 B), consume routines at $C200 (up to 357 B), the
+# result byte at $C1F0, TX frame at $C500, RX frame at $C700 (small ping
+# frames; widen the gap for bigger ones).  Never put result_addr on the
+# default consume_addr ($C100): run_ping_and_wait loads the routine there,
+# then zeroes the result byte before the jsr — a $00 (BRK) over the
+# routine's first opcode.  $C400-$C87D is also uci_network's socket-write
+# scratch (see docs/memory_safety.md); RR-Net and UCI never run in the
+# same test, but don't reuse this layout alongside uci_socket_write.
+PEEK_ADDR, CONSUME_ADDR, RESULT_ADDR = 0xC000, 0xC200, 0xC1F0
+TX_FRAME_BUF, RX_FRAME_BUF = 0xC500, 0xC700
+
 # One side: send ICMP echo, poll for the reply
 frame = build_echo_request_frame(
     src_mac=mac_a, dst_mac=mac_b, src_ip=ip_a, dst_ip=ip_b,
     identifier=0x1234, sequence=1, payload=b"ping",
 )
 result = run_ping_and_wait(
-    transport_a, tx_frame=frame, rx_buf=0xC200,
-    result_addr=0xC100, identifier=0x1234, sequence=1,
-    tx_frame_buf=0xC400, timeout_s=5.0,
+    transport_a, tx_frame=frame, rx_buf=RX_FRAME_BUF,
+    result_addr=RESULT_ADDR, identifier=0x1234, sequence=1,
+    tx_frame_buf=TX_FRAME_BUF, timeout_s=5.0,
+    peek_addr=PEEK_ADDR, consume_addr=CONSUME_ADDR,
 )
 # result: 0x01 on reply match, 0xFF on wall-clock timeout
 
 # Other side: reply to any echo request addressed to us
 result = run_icmp_responder(
-    transport_b, rx_buf=0xC200, my_ip=ip_b,
-    result_addr=0xC100, timeout_s=5.0,
+    transport_b, rx_buf=RX_FRAME_BUF, my_ip=ip_b,
+    result_addr=RESULT_ADDR, timeout_s=5.0,
+    peek_addr=PEEK_ADDR, consume_addr=CONSUME_ADDR,
 )
 ```
 
@@ -858,7 +872,7 @@ This emits a nested delay-loop fence (~52 µs at 48 MHz, ~2.5 ms at 1 MHz, 16 by
 
 ## Pattern 12: Memory Safety with `MemoryPolicy`
 
-The harness writes to fixed scratch addresses (`$0334` jsr trampoline, `$0360`+`$03F0`-`$03F1` `run_subroutine`, `$C000-$C3FF` UCI, `$C000`+`$033C`+`$0339` SID player). If the consumer's program also occupies those addresses, host-side `write_memory()` calls silently corrupt RAM — the 6502 has no MMU and no exception fires. `MemoryPolicy` is the transport-layer guard that catches collisions before any byte hits the wire.
+The harness writes to fixed scratch addresses (authoritative list: `HARNESS_SCRATCH` in `memory_policy.py`, rendered into `docs/memory_safety.md` by `scripts/gen_memory_table.py`; highlights: `$0334` jsr trampoline, `$0360`+`$03F0`-`$03F1` `run_subroutine`, `$0277`/`$00C6` keyboard buffer, `$C000-$C3FF` UCI block, `$C400-$C87D` UCI socket-write scratch, `$C000`+`$0339`+`$033C` SID player, `$CF00` test-suite BASIC-restore stub). If the consumer's program also occupies those addresses, host-side `write_memory()` calls silently corrupt RAM — the 6502 has no MMU and no exception fires. `MemoryPolicy` is the transport-layer guard that catches collisions before any byte hits the wire.
 
 ### Default is permissive — no behaviour change for existing tests
 

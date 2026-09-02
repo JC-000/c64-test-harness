@@ -190,6 +190,238 @@ class MemoryRegion:
         return f"${self.start:04X}-${end_incl:04X}{suffix}"
 
 
+# ---------------------------------------------------------------------------
+# The harness's own scratch addresses (issue #169)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ScratchRegion:
+    """One fixed address range the harness itself writes during normal use.
+
+    ``HARNESS_SCRATCH`` is the machine-readable form of the table in
+    ``docs/memory_safety.md`` (which is *generated* from it by
+    ``scripts/gen_memory_table.py``).  :class:`MemoryArbiter` consults
+    it by default so it never hands a consumer an address the harness
+    is about to overwrite, and :meth:`MemoryPolicy.from_prg` warns when
+    a consumer's load image overlaps one.
+
+    ``end`` is exclusive, like :class:`MemoryRegion`.  ``owner`` is the
+    dotted path of the writer; ``configurable`` names the kwarg or
+    constant that moves the address (``"hardcoded"`` when nothing
+    does).  ``transient`` means the prior contents are written back
+    afterwards — nothing more.  It does NOT mean the span is safe to
+    execute from while the operation runs (the REU staging window is
+    filled by REC DMA with the CPU live, and the liveness probe only
+    restores on success), and it does not undo side effects of code
+    that ran there meanwhile.  Transient spans are declared like every
+    other write but not withheld from allocation by default.
+    """
+
+    start: int
+    end: int
+    owner: str
+    purpose: str
+    configurable: str = "hardcoded"
+    transient: bool = False
+
+    def __post_init__(self) -> None:
+        # Reuse MemoryRegion's bounds validation.
+        MemoryRegion(self.start, self.end)
+
+    @property
+    def length(self) -> int:
+        return self.end - self.start
+
+    @property
+    def span(self) -> str:
+        """Inclusive ``$XXXX-$YYYY`` form; a single byte prints as ``$XXXX``."""
+        if self.length == 1:
+            return f"${self.start:04X}"
+        return f"${self.start:04X}-${self.end - 1:04X}"
+
+    @property
+    def region(self) -> MemoryRegion:
+        return MemoryRegion(
+            self.start, self.end, note=f"harness scratch: {self.owner}"
+        )
+
+
+#: Every fixed C64 RAM address the harness writes as part of normal
+#: operation, verified against the code that performs the write (the
+#: owner column).  Inclusion criterion: library writes under ``src/``
+#: at fixed default addresses, plus the one live-suite stub at ``$CF00``
+#: (``tests/test_vice_core.py::_restore_basic``) because every screen
+#: and keyboard test runs it.  Caller-supplied addresses (required
+#: kwargs with no default, e.g. bridge_ping's ``rx_buf``/``result_addr``)
+#: are the caller's to declare and are not listed.  Keep sorted by
+#: ``(start, end)``.  Overlaps between entries are expected — several
+#: features share the cassette buffer and the ``$C000`` page.
+#: I/O-register writes (``$D000-$DFFF``: CIA/REC/UCI/CS8900a) are not
+#: RAM and are not listed.
+HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
+    ScratchRegion(
+        0x0000, 0x0002,
+        owner="snapshot.restore_snapshot",
+        purpose="6510 CPU port direction/data re-asserted after the RAM "
+                "restore (override=\"snapshot-restore\")",
+        configurable="restore-time only; carries override=",
+    ),
+    ScratchRegion(
+        0x00C6, 0x00C7,
+        owner="uci_network._execute_uci_routine, "
+              "backends.ultimate64.Ultimate64Transport.inject_keys, "
+              "backends.ultimate64_client.Ultimate64Client.send_text",
+        purpose="KERNAL NDX — keyboard-buffer fill count set after a "
+                "SYS/text injection",
+        configurable="KERNAL-mandated (keybuf_count_addr= on U64 transport)",
+    ),
+    ScratchRegion(
+        0x0277, 0x0281,
+        owner="uci_network._execute_uci_routine, "
+              "backends.ultimate64.Ultimate64Transport.inject_keys, "
+              "backends.ultimate64_client.Ultimate64Client.send_text",
+        purpose="KERNAL KEYD — 10-byte keyboard buffer receiving "
+                "\"SYS<addr>\\r\" or injected text",
+        configurable="KERNAL-mandated (keybuf_addr= on U64 transport)",
+    ),
+    ScratchRegion(
+        0x0314, 0x0316,
+        owner="sid_player.stop_sid_vice",
+        purpose="RAM IRQ vector (CINV) restored to $EA31; the installer "
+                "stub also patches it from 6502 code",
+        configurable="hardcoded",
+    ),
+    ScratchRegion(
+        0x0334, 0x0339,
+        owner="execute.jsr",
+        purpose="JSR addr / NOP / NOP trampoline; checkpoint at +3",
+        configurable="scratch_addr=",
+    ),
+    ScratchRegion(
+        0x0334, 0x03B4,
+        owner="backends.ultimate64_probe.liveness_probe",
+        purpose="128-byte writemem POST round-trip payload via the raw "
+                "REST client (bypasses the transport MemoryPolicy); "
+                "original bytes written back on success only — the "
+                "readback-failure branches leave the pattern in place",
+        configurable="hardcoded",
+        transient=True,
+    ),
+    ScratchRegion(
+        0x0339, 0x033C,
+        owner="sid_player.play_sid_vice",
+        purpose="park JMP ($A002) executed after the installer so "
+                "resume() lands in BASIC warm start",
+        configurable="_PARK_ADDR constant",
+    ),
+    ScratchRegion(
+        0x033C, 0x0342,
+        owner="sid_player.play_sid_vice",
+        purpose="song trampoline: LDA #song / JSR init / RTS",
+        configurable="_SONG_TRAMPOLINE_ADDR constant",
+    ),
+    ScratchRegion(
+        0x0360, 0x036E,
+        owner="execute.run_subroutine (U64 path)",
+        purpose="14-byte sentinel trampoline; on VICE the 5-byte jsr() "
+                "trampoline is written here instead",
+        configurable="trampoline_addr=",
+    ),
+    ScratchRegion(
+        0x03F0, 0x03F2,
+        owner="execute.run_subroutine (U64 path)",
+        purpose="running / done flag bytes polled by the host",
+        configurable="hardcoded",
+    ),
+    ScratchRegion(
+        0x0800, 0x8800,
+        owner="snapshot.extract_reu_contents",
+        purpose="32 KiB REU→C64 DMA staging window (opt-in "
+                "include_reu=True, override=\"reu-snapshot-staging\"). "
+                "Filled by REC DMA with the CPU running (unpaused is "
+                "mandatory on hardware) — MemoryPolicy cannot see the "
+                "fill; prior contents written back afterwards, but code "
+                "executing there meanwhile runs REU data",
+        configurable="hardcoded",
+        transient=True,
+    ),
+    ScratchRegion(
+        0xC000, 0xC012,
+        owner="sid_player.play_sid_vice",
+        purpose="18-byte IRQ installer + wrapper stub",
+        configurable="stub_addr= (DEFAULT_STUB_ADDR)",
+    ),
+    ScratchRegion(
+        0xC000, 0xC040,
+        owner="bridge_ping.run_ping_and_wait / run_icmp_responder",
+        purpose="64-byte CS8900a RX peek routine",
+        configurable="peek_addr=",
+    ),
+    ScratchRegion(
+        0xC000, 0xC400,
+        owner="uci_network._execute_uci_routine / build_uci_command",
+        purpose="UCI stub block: code $C000, data $C100, response $C200, "
+                "status $C300, lengths $C3F0-$C3F3, sentinel $C3FE, "
+                "error $C3FF",
+        configurable="code_addr= for the routine; buffers hardcoded",
+    ),
+    ScratchRegion(
+        0xC100, 0xC265,
+        owner="bridge_ping.run_ping_and_wait / run_icmp_responder",
+        purpose="TX / echo-match / echo-respond routines (largest "
+                "357 bytes)",
+        configurable="consume_addr=",
+    ),
+    ScratchRegion(
+        0xC400, 0xC403,
+        owner="uci_network.build_socket_write",
+        purpose="16-bit inner-loop countdown (lo, hi) + Y save slot "
+                "across the turbo fence",
+        configurable="hardcoded",
+    ),
+    ScratchRegion(
+        0xC403, 0xC404,
+        owner="uci_network.uci_socket_write",
+        purpose="socket-id slot for the lifted-cap write routine",
+        configurable="hardcoded",
+    ),
+    ScratchRegion(
+        0xC500, 0xC87E,
+        owner="uci_network.uci_socket_write",
+        purpose="data buffer (up to 892 bytes) followed by the 2-byte LE "
+                "length",
+        configurable="hardcoded",
+    ),
+    ScratchRegion(
+        0xCF00, 0xCF04,
+        owner="tests/test_vice_core.py::_restore_basic (also "
+              "scripts/vice_keyecho_probe.py + scripts/vice_stall_probe.py)",
+        purpose="CLI; JMP $E5CD stub returning the CPU to BASIC MAINLOOP "
+                "before every screen/keyboard test — test-suite scratch, "
+                "not library",
+        configurable="hardcoded",
+    ),
+)
+
+
+def harness_scratch_regions(
+    *, include_transient: bool = False
+) -> tuple[MemoryRegion, ...]:
+    """``HARNESS_SCRATCH`` as :class:`MemoryRegion` objects.
+
+    Transient spans (prior contents written back afterwards, e.g. the
+    32 KiB REU staging window) are omitted unless ``include_transient``
+    is set — reserving them by default would withhold half the address
+    space for a window whose bytes are put back afterwards.  "Written
+    back" is all transient promises; see :class:`ScratchRegion`.
+    """
+    return tuple(
+        r.region for r in HARNESS_SCRATCH
+        if include_transient or not r.transient
+    )
+
+
 def _region_from_entry(entry: object) -> MemoryRegion:
     """Coerce a TOML/dict region entry into a :class:`MemoryRegion`.
 
@@ -279,11 +511,33 @@ class MemoryPolicy:
         if isinstance(prg, (str, Path)):
             prg = _PrgFile.from_file(prg)
         prg_region = MemoryRegion(prg.load_address, prg.end_address, note)
-        return cls(
+        policy = cls(
             safe_regions=tuple(safe_regions),
             reserved_regions=(prg_region,) + tuple(extra_reserved),
             unknown=unknown,
         )
+        # Issue #169: say so *now* if the load image sits on an address
+        # the harness writes for itself.  The policy still blocks the
+        # eventual collision (the PRG span is reserved, so jsr()'s
+        # trampoline write raises MemoryPolicyError) — but that surfaces
+        # only when the first harness call happens, deep in a test.  We
+        # do NOT add HARNESS_SCRATCH to either region list: as reserved
+        # it would break every harness write into its own scratch; as
+        # safe it would change the unknown-address semantics.
+        overlaps = policy.harness_scratch_overlaps()
+        if overlaps:
+            detail = "; ".join(
+                f"{r} vs {s.span} ({s.owner}; {s.configurable})"
+                for r, s in overlaps
+            )
+            warnings.warn(
+                f"MemoryPolicy.from_prg: the load image overlaps harness "
+                f"scratch — harness writes there will raise "
+                f"MemoryPolicyError. Move the harness (see the "
+                f"'configurable' hint) or the program: {detail}",
+                stacklevel=2,
+            )
+        return policy
 
     @classmethod
     def from_config(cls, data: dict) -> MemoryPolicy:
@@ -371,6 +625,28 @@ class MemoryPolicy:
             and not self.reserved_regions
             and self.unknown == UnknownPolicy.ALLOW
         )
+
+    def harness_scratch_overlaps(
+        self, *, include_transient: bool = False
+    ) -> tuple[tuple[MemoryRegion, ScratchRegion], ...]:
+        """Reserved regions that overlap the harness's own scratch (#169).
+
+        Each pair is ``(reserved_region, scratch_entry)``.  A non-empty
+        result means a harness write into that scratch will raise
+        :class:`MemoryPolicyError` under this policy — the consumer
+        should relocate the program or pass the harness the kwarg named
+        in ``scratch_entry.configurable``.  Transient entries (prior
+        contents written back afterwards) are omitted unless requested,
+        since the 32 KiB REU staging window overlaps nearly every PRG.
+        """
+        pairs: list[tuple[MemoryRegion, ScratchRegion]] = []
+        for reserved in self.reserved_regions:
+            for scratch in HARNESS_SCRATCH:
+                if scratch.transient and not include_transient:
+                    continue
+                if reserved.overlaps_range(scratch.start, scratch.length):
+                    pairs.append((reserved, scratch))
+        return tuple(pairs)
 
     # ------------------------------------------------------------------
     # The check
@@ -478,8 +754,11 @@ def _fully_covered(
 
 
 __all__ = [
+    "HARNESS_SCRATCH",
     "MemoryPolicy",
     "MemoryPolicyError",
     "MemoryRegion",
+    "ScratchRegion",
     "UnknownPolicy",
+    "harness_scratch_regions",
 ]

@@ -382,6 +382,85 @@ class TestFromPrg:
 
 
 # ---------------------------------------------------------------------------
+# Issue #169 — consumer layouts that overlap the harness's own scratch
+# ---------------------------------------------------------------------------
+
+
+class TestHarnessScratchOverlap:
+    """``from_prg`` must flag a PRG that sits on harness scratch, without
+    changing what the policy blocks: the harness's writes into its own
+    scratch are the point, and a reserved PRG span overlapping them is
+    exactly the collision the policy exists to surface (via
+    ``MemoryPolicyError`` at the transport), not something to silence.
+    """
+
+    def test_permissive_is_unchanged_and_reports_no_overlap(self) -> None:
+        p = MemoryPolicy.permissive()
+        assert p.is_permissive()
+        assert p.harness_scratch_overlaps() == ()
+
+    def test_from_prg_warns_when_load_span_hits_scratch(self, tmp_path: Path) -> None:
+        # $0330 + 0x20 bytes → $0330-$034F, across jsr()'s $0334-$0338,
+        # the SID park JMP and song trampoline.
+        prg_path = tmp_path / "onscratch.prg"
+        prg_path.write_bytes(b"\x30\x03" + b"\x00" * 0x20)
+        with pytest.warns(UserWarning, match="harness scratch") as rec:
+            p = MemoryPolicy.from_prg(prg_path)
+        msg = str(rec[0].message)
+        assert "execute.jsr" in msg
+        assert "$0334-$0338" in msg
+        # Only the PRG span is reserved — the harness's regions are not
+        # added to the policy in either list.
+        assert len(p.reserved_regions) == 1
+        assert p.safe_regions == ()
+
+    def test_overlaps_lists_region_pairs(self, tmp_path: Path) -> None:
+        prg_path = tmp_path / "onscratch.prg"
+        prg_path.write_bytes(b"\x30\x03" + b"\x00" * 0x20)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            p = MemoryPolicy.from_prg(prg_path)
+        pairs = p.harness_scratch_overlaps()
+        owners = {scratch.owner for _reserved, scratch in pairs}
+        assert any("execute.jsr" in o for o in owners)
+        assert any("sid_player" in o for o in owners)
+        for reserved, scratch in pairs:
+            assert reserved.overlaps_range(scratch.start, scratch.length)
+
+    def test_collision_still_raises_at_check_write(self, tmp_path: Path) -> None:
+        prg_path = tmp_path / "onscratch.prg"
+        prg_path.write_bytes(b"\x30\x03" + b"\x00" * 0x20)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            p = MemoryPolicy.from_prg(prg_path)
+        # jsr()'s trampoline write would land inside the PRG: blocked.
+        with pytest.raises(MemoryPolicyError, match="PRG load image"):
+            p.check_write(0x0334, 5)
+
+    def test_from_prg_is_silent_for_a_normal_basic_prg(self, tmp_path: Path) -> None:
+        # $0801 sits inside the *transient* REU staging window; that must
+        # not warn, or every BASIC-start PRG would.
+        prg_path = tmp_path / "normal.prg"
+        prg_path.write_bytes(b"\x01\x08" + b"\x00" * 0x100)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            p = MemoryPolicy.from_prg(prg_path)
+        assert p.harness_scratch_overlaps() == ()
+        transient = p.harness_scratch_overlaps(include_transient=True)
+        assert [s.owner for _r, s in transient] == ["snapshot.extract_reu_contents"]
+
+    def test_from_config_reserved_overlap_is_queryable(self) -> None:
+        # from_config does not warn (the consumer typed the range on
+        # purpose), but the query works on any policy.
+        p = MemoryPolicy.from_config(
+            {"reserved_regions": [{"range": "$C000-$CFFF", "note": "TCP_BUF"}]}
+        )
+        owners = {s.owner for _r, s in p.harness_scratch_overlaps()}
+        assert any("uci_network" in o for o in owners)
+        assert any("_restore_basic" in o for o in owners)
+
+
+# ---------------------------------------------------------------------------
 # from_config — TOML/dict shape
 # ---------------------------------------------------------------------------
 

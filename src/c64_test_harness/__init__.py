@@ -31,10 +31,13 @@ from .execution_policy import (
     check_execution_policy,
 )
 from .memory_policy import (
+    HARNESS_SCRATCH,
     MemoryPolicy,
     MemoryPolicyError,
     MemoryRegion,
+    ScratchRegion,
     UnknownPolicy,
+    harness_scratch_regions,
 )
 from .memory_arbiter import MemoryArbiter, MemoryArbiterError
 from .config import HarnessConfig
@@ -378,6 +381,10 @@ __all__ = [
     "MemoryPolicyError",
     "MemoryRegion",
     "UnknownPolicy",
+    # Harness's own scratch addresses (issue #169)
+    "HARNESS_SCRATCH",
+    "ScratchRegion",
+    "harness_scratch_regions",
     # Memory arbiter (allocator helper on top of MemoryPolicy)
     "MemoryArbiter",
     "MemoryArbiterError",

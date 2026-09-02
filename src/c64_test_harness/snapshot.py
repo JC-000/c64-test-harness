@@ -125,6 +125,7 @@ import json
 import logging
 import struct
 import time
+import warnings
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -642,6 +643,7 @@ def extract_reu_contents(
             f"size_bytes must be 1..{_REU_MAX_BYTES}, got {size_bytes}"
         )
 
+    _warn_if_layout_overlaps_staging_window(transport)
     paused = _try_pause(transport) if pause else False
     try:
         saved = transport.read_memory(_REU_STAGING_BASE, _REU_STAGING_SIZE)
@@ -672,6 +674,51 @@ def extract_reu_contents(
     finally:
         if paused:
             transport.resume()
+
+
+def _warn_if_layout_overlaps_staging_window(transport: "C64Transport") -> None:
+    """Warn when the transport's policy declares RAM inside the staging window.
+
+    The window is filled by REC DMA, not by a host ``write_memory`` — the
+    host only programs ``$DF01-$DF0A`` — so :class:`MemoryPolicy` never
+    sees the clobber and cannot block it (issue #169 review).  The extract
+    runs unpaused by default (and must on Ultimate hardware), so a program
+    executing from ``$0801-$87FF`` runs REU data while the extract is in
+    flight; writing the original bytes back afterwards does not undo
+    PC/stack/side effects.  Say so up front.
+
+    Hardware only.  On VICE the binary monitor holds the machine during
+    memory commands, nothing executes from the window mid-extract, and
+    the write-back is genuinely transient — so the warning would be
+    noise.  The backend test is the same duck-typing :func:`_try_pause`
+    uses: an Ultimate transport carries a ``client`` (the REST object),
+    a VICE transport does not.
+    """
+    if getattr(transport, "client", None) is None:
+        return  # VICE-shaped: monitor holds the machine; no hazard
+    policy = getattr(transport, "memory_policy", None)
+    overlaps = getattr(policy, "harness_scratch_overlaps", None)
+    if overlaps is None:
+        return
+    window_end = _REU_STAGING_BASE + _REU_STAGING_SIZE
+    hits = [
+        reserved
+        for reserved, scratch in overlaps(include_transient=True)
+        if scratch.start == _REU_STAGING_BASE and scratch.end == window_end
+    ]
+    if not hits:
+        return
+    warnings.warn(
+        f"extract_reu_contents: the REU staging window "
+        f"${_REU_STAGING_BASE:04X}-${window_end - 1:04X} overlaps declared "
+        f"region(s) {', '.join(str(r) for r in hits)}. The window is filled "
+        f"by REC DMA (not a host write — MemoryPolicy cannot block it) while "
+        f"the CPU keeps running; code executing from that span meanwhile "
+        f"runs REU data, and writing the original bytes back afterwards does "
+        f"not undo PC/stack/side effects. Stop the program, or keep it out of "
+        f"the window, before extracting.",
+        stacklevel=3,
+    )
 
 
 def _rec_transfer(
