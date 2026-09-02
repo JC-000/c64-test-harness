@@ -13,9 +13,11 @@ suite (and no VICE) is involved.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import pathlib
 import stat
+import sys
 
 import pytest
 
@@ -83,3 +85,40 @@ def test_the_baseline_runs_the_unmutated_copy(run, repo, tmp_path):
         repo / "tests" / "test_x.py"
     ).read_text()
     assert os.path.isdir(box / "src")
+
+
+def test_main_runs_the_baseline_before_scoring_any_mutant(run, repo, tmp_path, monkeypatch):
+    """``check_baseline`` is worth nothing unless ``main()`` calls it first.
+
+    The tests above drive the function directly, so deleting the one call
+    in ``main()`` would survive them.  This goes through ``main()`` with
+    a stub pytest that is always red and one mutation on file: the run
+    must abort with the baseline message, and the stub must have been
+    invoked exactly once -- the baseline -- with no mutant ever scored.
+    Without the call, ``main()`` scores the mutant as KILLED off the
+    pre-existing failure and returns normally.
+    """
+    calls = tmp_path / "calls"
+    fake = _stub_pytest(
+        tmp_path,
+        f"echo x >> {calls}; echo 'FAILED tests/test_x.py::test_a - boom'; exit 1",
+    )
+    mutations = tmp_path / "mutations.json"
+    mutations.write_text(json.dumps([{
+        "id": "test_x.py:1:cmp:pass->assert False",
+        "file": "tests/test_x.py",
+        "old": "pass",
+        "new": "assert False",
+        "kind": "cmp",
+    }]))
+    out = tmp_path / "results.txt"
+    monkeypatch.setattr(sys, "argv", [
+        "run.py", str(mutations), str(out),
+        "--repo", str(repo), "--pytest", fake,
+        "--modules", "test_x.py", "--timeout", "30",
+    ])
+    with pytest.raises(SystemExit) as exc:
+        run.main()
+    assert "baseline" in str(exc.value).lower()
+    assert calls.read_text().count("x") == 1, "stub pytest must run once: the baseline"
+    assert "KILLED" not in out.read_text(), "no mutant may be scored after a red baseline"
