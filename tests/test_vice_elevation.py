@@ -27,15 +27,22 @@ from c64_test_harness.backends import vice_elevation as ve
 from c64_test_harness.backends import vice_lifecycle
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 
-# The four "ground truth against the real binary" tests below all need
-# both a Homebrew x64sc present at this exact sudoers-listed path AND
-# passwordless sudo authorised for it -- the same elevation("vice_root")
-# question the harness's live ethernet suite asks, scoped to this one
-# path. Sharing the mark means the probe (an lru_cache'd sudo -n -l) runs
-# at most once across this whole file, and across test_bpf_attach_detection.py
-# too, which checks the identical (kind, binary) pair.
+# The four "ground truth against the real binary" tests below only call
+# vice_features()/vice_binary_supports_ethernet(), which run
+# `x64sc -features` unprivileged -- no launch, no sudo. They must NOT be
+# gated by elevation("vice_root") (adversarial review B1, 2026-09-02):
+# that marker also demands passwordless sudo, which these tests never
+# use, so on a bench with the binary but no sudoers rule they would
+# silently skip -- contradicting their own docstrings, which promise to
+# "fail loudly" as ground truth. A plain existence check is the right
+# (and only) prerequisite here. Contrast test_bpf_attach_detection.py's
+# requires_root, which DOES launch a real elevated VICE and correctly
+# keeps elevation("vice_root").
 _HOMEBREW_X64SC = "/opt/homebrew/bin/x64sc"
-requires_homebrew_x64sc = pytest.mark.elevation("vice_root", binary=_HOMEBREW_X64SC)
+requires_homebrew_x64sc = pytest.mark.skipif(
+    not os.path.exists(_HOMEBREW_X64SC),
+    reason="no Homebrew x64sc on this host",
+)
 
 
 # --------------------------------------------------------------- helpers

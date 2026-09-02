@@ -485,3 +485,72 @@ def test_bridge_vice_pair_converts_a_mid_launch_refusal(monkeypatch):
         next(gen)
     assert "need root" in str(excinfo.value)
     assert any(kind == "vice_root" for _n, kind, _r in conftest._elevation_skips)
+
+
+# ---------------------------------------------------------------------------
+# B1 (adversarial review): the four "ground truth against the real
+# binary" tests in test_vice_elevation.py call vice_features() /
+# vice_binary_supports_ethernet(), which run `x64sc -features`
+# unprivileged -- no launch, no sudo. They must NOT be gated by
+# elevation("vice_root"): on a bench with the binary but no sudoers
+# rule, that marker would silently skip them even though their own
+# docstrings promise to "fail loudly". Only the two tests in
+# test_bpf_attach_detection.py that launch a real elevated VICE need
+# vice_root.
+# ---------------------------------------------------------------------------
+
+
+def _real_elevation_marks(func):
+    return [m for m in getattr(func, "pytestmark", []) if m.name == conftest.ELEVATION_MARKER]
+
+
+def test_the_ground_truth_x64sc_features_tests_are_not_gated_by_sudo(monkeypatch):
+    import test_vice_elevation as tve
+    from c64_test_harness.backends import vice_elevation as ve
+
+    monkeypatch.setattr(ve, "sudo_can_run", lambda binary: False)
+    monkeypatch.setattr(ve, "rawnet_capability", lambda **k: False)
+
+    names = [
+        "test_homebrew_x64sc_is_ethernet_capable",
+        "test_homebrew_x64sc_reports_rawnet_and_pcap",
+        "test_the_features_fixtures_match_the_real_output_shape",
+        "test_the_features_probe_ignores_an_ambient_vicerc",
+    ]
+    for name in names:
+        func = getattr(tve, name)
+        marks = _real_elevation_marks(func)
+        item = _FakeItem(f"test_vice_elevation.py::{name}", markers=marks)
+        # Must NOT skip: these tests need no sudo at all. A bare
+        # pytest.skip.Exception escaping this test body would report as
+        # SKIPPED, not FAILED, so catch it explicitly and fail loudly --
+        # that IS the over-gating bug this test exists to catch.
+        try:
+            conftest.pytest_runtest_setup(item)
+        except pytest.skip.Exception as e:
+            pytest.fail(
+                f"{name} was gated by elevation({marks[0].args[0] if marks else '?'}) "
+                f"even though it never launches VICE: {e}",
+                pytrace=False,
+            )
+
+
+def test_bpf_attach_detection_launch_tests_still_require_vice_root(monkeypatch):
+    """The control: the two tests that DO launch a real elevated VICE
+    must still be gated -- this is not "remove elevation() everywhere"."""
+    import test_bpf_attach_detection as tbad
+    from c64_test_harness.backends import vice_elevation as ve
+
+    monkeypatch.setattr(ve, "sudo_can_run", lambda binary: False)
+    monkeypatch.setattr(ve, "rawnet_capability", lambda **k: False)
+
+    for name in (
+        "test_attach_is_detected_for_a_root_owned_vice",
+        "test_no_attach_reported_for_a_root_owned_vice_without_the_cart",
+    ):
+        func = getattr(tbad, name)
+        marks = _real_elevation_marks(func)
+        assert marks, f"{name} lost its elevation marker entirely"
+        item = _FakeItem(f"test_bpf_attach_detection.py::{name}", markers=marks)
+        with pytest.raises(pytest.skip.Exception):
+            conftest.pytest_runtest_setup(item)
