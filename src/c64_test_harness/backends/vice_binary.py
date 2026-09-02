@@ -1033,7 +1033,12 @@ class BinaryViceTransport:
                 if resp.response_type == EVENT_STOPPED:
                     return self._parse_stopped_event(resp)
                 if resp.response_type == RESPONSE_JAM:
-                    raise TransportError(self._jam_message())
+                    # Leave the ``with`` before describing the jam:
+                    # ``_jam_message`` reads the PC through
+                    # ``_send_and_recv``, which takes this same
+                    # non-reentrant lock.  Raising from inside the block
+                    # deadlocked the transport for good.
+                    break
                 if resp.request_id == EVENT_REQUEST_ID:
                     # Other unsolicited event (Resumed, Checkpoint info, …):
                     # buffer for later inspection rather than dropping.
@@ -1048,6 +1053,8 @@ class BinaryViceTransport:
                     f"req_id={resp.request_id:#x}, "
                     f"body={resp.body.hex()}"
                 )
+        # Only the JAM ``break`` reaches here; the lock is released.
+        raise TransportError(self._jam_message())
 
     def resource_get(self, name: str) -> int | str:
         """Get a VICE resource value by name.

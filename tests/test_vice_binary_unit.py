@@ -18,6 +18,7 @@ monitor read path:
 from __future__ import annotations
 
 import collections
+import re
 import socket
 import struct
 import threading
@@ -981,6 +982,48 @@ class TestJamIsReportedNotDropped:
         with patch.object(t, "read_registers", return_value={"PC": 0xC0DE}):
             with pytest.raises(TransportError, match="jammed"):
                 t.wait_for_stopped(timeout=5.0)
+
+    def test_a_jam_on_the_wire_reads_the_pc_without_deadlocking(self):
+        """The wire arrival must not deadlock on the transport's own lock.
+
+        ``wait_for_stopped`` reads the wire under ``_lock``.  When the
+        frame it reads is a JAM it calls ``_jam_message``, whose
+        ``read_registers`` goes through ``_send_and_recv`` -- which takes
+        the same, non-reentrant ``_lock``.  Every other test in this
+        class patches ``read_registers`` away, which is precisely what
+        let that hang pass as "jam reported".  So this one leaves the
+        register read real: the wire carries the JAM frame followed by
+        the REGISTERS_GET reply the PC read must consume.
+        """
+        t = _make_transport()
+        t._reg_map = {"PC": (0x03, 16)}
+        regs_reply = struct.pack("<H", 1) + bytes([3, 3]) + struct.pack("<H", 0xC0DE)
+        _queue_recvs(
+            t._sock,
+            [
+                self._jam_frame(),
+                # First request id the transport will issue is 0.
+                _build_response_bytes(CMD_REGISTERS_GET, regs_reply, request_id=0),
+            ],
+        )
+        outcome: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                t.wait_for_stopped(timeout=1.0)
+            except BaseException as e:  # noqa: BLE001 - recorded for the assert
+                outcome.append(e)
+
+        th = threading.Thread(target=run, daemon=True)
+        th.start()
+        th.join(5.0)
+        assert not th.is_alive(), (
+            "wait_for_stopped never returned: it deadlocked reading the PC "
+            "under the lock it already held"
+        )
+        assert not t._lock.locked()
+        assert len(outcome) == 1 and isinstance(outcome[0], TransportError)
+        assert re.search(r"jammed at \$c0de", str(outcome[0]))
 
     def test_the_jam_message_names_the_address(self):
         t = _make_transport()
