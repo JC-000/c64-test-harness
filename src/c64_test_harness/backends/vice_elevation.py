@@ -447,12 +447,20 @@ def launch_path(binary: str) -> str:
     ``/opt/homebrew/bin``, so ``sudo -n x64sc`` fails with "command not
     found" even where ``x64sc`` runs fine unelevated.
 
-    PATH lookup only -- symlinks are deliberately *not* resolved.
-    sudoers matches the literal command path, so
+    A relative path (``./x64sc``) is made absolute against the current
+    directory: sudo matches on the absolute command path, and visudo
+    rejects ``NOPASSWD: ./x64sc`` outright, so the sudoers line built
+    from it would have been unusable.
+
+    PATH lookup and absolutising only -- symlinks are deliberately *not*
+    resolved.  sudoers matches the literal command path, so
     ``/opt/homebrew/bin/x64sc`` is what a NOPASSWD rule must name, not
     the ``/opt/homebrew/Cellar/vice/3.10/bin/x64sc`` it points at.
     """
-    return shutil.which(binary) or binary
+    found = shutil.which(binary) or binary
+    if os.sep in found:  # a path, not a bare name that PATH could not place
+        return os.path.abspath(found)
+    return found
 
 
 def _unelevated_allowed() -> bool:

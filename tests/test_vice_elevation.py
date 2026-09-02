@@ -888,3 +888,23 @@ def test_a_specific_argument_rule_still_does_not_authorise(monkeypatch):
     )
     assert ve.sudo_can_run("/opt/homebrew/bin/x64sc") is False
     assert ve.sudo_can_run("/opt/homebrew/bin/brew") is False
+
+
+def test_a_relative_binary_is_resolved_to_an_absolute_path(tmp_path, monkeypatch):
+    """``launch_path("./x64sc")`` returned "./x64sc", and the sudoers line
+    built from it -- ``NOPASSWD: ./x64sc`` -- is one visudo rejects.
+    sudo itself also matches an absolute command path."""
+    exe = _fake_x64sc(tmp_path, "x64sc", ethernet=True)
+    monkeypatch.chdir(tmp_path)
+    assert ve.launch_path("./x64sc") == exe
+
+    _as_uid(monkeypatch, 501)
+    monkeypatch.setattr(ve.sys, "platform", "darwin")
+    _no_sudo(monkeypatch)
+    cfg = ViceConfig(ethernet=True, ethernet_driver="pcap")
+    with pytest.raises(ve.ViceElevationRequiredError) as excinfo:
+        ve.plan_vice_launch(cfg, ["./x64sc", "-warp"])
+    err = excinfo.value
+    assert err.binary == exe
+    assert err.sudoers_entry.endswith(f"NOPASSWD: {exe}")
+    assert "./x64sc" not in err.sudoers_entry
