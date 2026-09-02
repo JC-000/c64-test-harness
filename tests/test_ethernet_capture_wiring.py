@@ -804,3 +804,47 @@ def test_rx_scenario_gives_up_when_stale_frames_never_stop():
         run_rx_scenario(transport, cap, send_delay=0.0, timeout=1.0)
     assert "stale" in str(ei.value) and "c640c640" in str(ei.value)
     assert cap.sent == [], "never send into a chip that is still draining"
+
+
+# ---------------------------------------------------------------------------
+# Second-pass review: S3a, N4, N1
+# ---------------------------------------------------------------------------
+
+
+def test_s3a_denied_pool_with_vice_live_is_a_misconfigured_bench_and_fails():
+    """Every node root-only is this bench's state after each reboot (the
+    chmod is not persisted).  With a root VICE up and the interface found,
+    that is a misconfigured bench, not an absent capability: fail, remedy
+    in the message.  Without a live VICE the same cause is still a skip."""
+    exc = CaptureUnavailable("all 4 nodes EACCES.", remedy="sudo chmod o+rw /dev/bpf*", cause="denied")
+    verdict, reason = capture_failure_disposition(exc, iface="feth0", vice_live=True)
+    assert verdict == "fail"
+    assert "sudo chmod o+rw /dev/bpf*" in reason and "misconfigured" in reason
+    verdict, _ = capture_failure_disposition(exc, iface="feth0", vice_live=False)
+    assert verdict == "skip"
+    verdict, _ = capture_failure_disposition(exc, iface="feth0")
+    assert verdict == "skip", "default stays the pure classification"
+
+
+@pytest.mark.parametrize("cause", ["no-nodes", "cap-net-raw", "platform"])
+def test_s3a_true_absence_still_skips_with_vice_live(cause):
+    exc = CaptureUnavailable("nothing.", remedy="x", cause=cause)
+    assert capture_failure_disposition(exc, iface="feth0", vice_live=True)[0] == "skip"
+
+
+def test_n4_capture_iface_knob_naming_an_absent_interface_is_rejected_at_resolve_time():
+    present = lambda name: name in {"feth0", "feth1"}  # noqa: E731
+    assert resolve_capture_ifaces("feth0", {"C64_ETH_CAPTURE_IFACE": "feth1"}, iface_present=present) == ("feth1", "feth1")
+    with pytest.raises(ValueError) as ei:
+        resolve_capture_ifaces("feth0", {"C64_ETH_CAPTURE_IFACE": "feth9"}, iface_present=present)
+    assert "C64_ETH_CAPTURE_IFACE=feth9" in str(ei.value) and "interface not present" in str(ei.value)
+    with pytest.raises(ValueError) as ei:
+        resolve_capture_ifaces("feth0", {"C64_ETH_SEND_IFACE": "fethX"}, iface_present=present)
+    assert "C64_ETH_SEND_IFACE=fethX" in str(ei.value) and "interface not present" in str(ei.value)
+
+
+def test_n1_enable_inline_code_starts_with_the_clockport_enable():
+    """Pin: conftest loads these bytes live; dropping the clockport prefix
+    would silently change that blob.  (Passes today -- a pin, not a drive.)"""
+    from c64_test_harness.bridge_ping import cs8900a_enable_inline_code
+    assert cs8900a_enable_inline_code()[:8] == bytes([0xAD, 0x01, 0xDE, 0x09, 0x01, 0x8D, 0x01, 0xDE])
