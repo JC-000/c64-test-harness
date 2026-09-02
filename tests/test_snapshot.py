@@ -446,17 +446,41 @@ class TestExtractState:
 
     @pytest.mark.vice_live
     def test_extract_reads_full_ram_and_cpu_port(self, binary_transport) -> None:
-        binary_transport.write_memory(0x0000, bytes([0x2F, 0x37]))
+        """The CPU port fields come from the extract, not from the reset defaults.
 
-        snap = extract_snapshot(binary_transport)
+        This used to write ``2F 37`` -- the 6510's reset values -- so the
+        two port assertions passed whether or not the write, or the
+        extract, had happened.  The values below are non-default and
+        distinct, chosen so VICE reads them back exactly (S
+        ``c64pla.c:53-55``, ``c64mem.c:269``):
 
-        assert len(snap.ram) == 65536
-        assert snap.cpu_port_dir == 0x2F
-        assert snap.cpu_port_data == 0x37
-        # The extract must agree with the same bytes fetched in slices
-        # small enough to have always worked.
-        piecewise = b"".join(
-            binary_transport.read_memory(base, 0x2000)
-            for base in range(0x0000, 0x10000, 0x2000)
-        )
-        assert snap.ram == piecewise
+        * ``$00 = $7F``: bits 3, 4 and 6 become outputs alongside the
+          default 0-2 and 5.  Reading ``$00`` returns ``pport.dir_read``,
+          which is the DDR as written (S ``c64pla.c:98``).
+        * ``$01 = $3F``: bits 0-2 stay ``111`` so the banking is untouched
+          (BASIC/KERNAL/I-O all still in -- the machine must survive the
+          restore below); bits 3-5 are outputs driven 1; bit 6 is an
+          output driven 0, so no capacitor-fade path applies (S
+          ``c64mem.c:327`` fades only when the bit is an *input*).
+          ``data_read = (data | ~dir) & (data_out | 0x17)`` gives
+          ``$3F`` for these inputs.
+
+        Both are put back to ``2F 37`` afterwards so the rest of the module
+        sees a stock port.
+        """
+        binary_transport.write_memory(0x0000, bytes([0x7F, 0x3F]))
+        try:
+            snap = extract_snapshot(binary_transport)
+
+            assert len(snap.ram) == 65536
+            assert snap.cpu_port_dir == 0x7F
+            assert snap.cpu_port_data == 0x3F
+            # The extract must agree with the same bytes fetched in slices
+            # small enough to have always worked.
+            piecewise = b"".join(
+                binary_transport.read_memory(base, 0x2000)
+                for base in range(0x0000, 0x10000, 0x2000)
+            )
+            assert snap.ram == piecewise
+        finally:
+            binary_transport.write_memory(0x0000, bytes([0x2F, 0x37]))

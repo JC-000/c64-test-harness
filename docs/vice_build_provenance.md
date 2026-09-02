@@ -157,7 +157,7 @@ above.
 The rule names the symlink `/opt/homebrew/bin/x64sc`, and that exact form is
 verified to work elevated (T, above). Name the symlink path in any NOPASSWD rule
 and invoke that same form. Two ways to get this wrong, both handled by
-`elevation-design`'s `launch_path()`:
+`launch_path()` in `src/c64_test_harness/backends/vice_elevation.py`:
 
 - **Resolving symlinks breaks authorisation.** Sudo matches the literal command
   path after PATH lookup and does not follow links, so a rule naming the resolved
@@ -165,7 +165,7 @@ and invoke that same form. Two ways to get this wrong, both handled by
   resolve symlinks.
 - **Not resolving PATH breaks the launch.** Sudo's `secure_path` excludes
   `/opt/homebrew/bin`, so a bare `x64sc` fails "command not found" under sudo even
-  where it runs fine unelevated (T, `elevation-design`) — and
+  where it runs fine unelevated (T, verified while writing `vice_elevation.py`) — and
   `ViceConfig.executable` defaults to the bare name, so every elevated launch from
   a default config would have failed this way. Resolving PATH is mandatory.
 

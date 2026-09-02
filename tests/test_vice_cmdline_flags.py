@@ -121,12 +121,23 @@ def test_event_image_include_false_disables_the_resource():
 
 
 def test_event_image_include_true_enables_the_resource():
+    """Symmetric twin of the test above -- and unfalsifiable on its own.
+
+    1 is the factory default (S ``event.c:1248``), so this passes whether
+    ``-eventimageinc`` was emitted, mis-spelled, or dropped entirely.  It
+    is kept because the *pair* is the contract (True and False both map
+    to the resource they name) and because the default test below pins
+    what "factory" means; the load-bearing direction is the ``False``
+    test, which is the only one of the three a broken flag can fail.
+    Do not read a green here as evidence the flag works.
+    """
     cfg = ViceConfig(port=free_port(), event_image_include=True)
     got = resources_after_launch(cfg, "EventImageInclude")
     assert got["EventImageInclude"] == 1
 
 
 def test_event_image_include_default_leaves_factory_value():
+    """Pins the premise the two tests above rest on: the default is 1."""
     cfg = ViceConfig(port=free_port())
     got = resources_after_launch(cfg, "EventImageInclude")
     assert got["EventImageInclude"] == 1
