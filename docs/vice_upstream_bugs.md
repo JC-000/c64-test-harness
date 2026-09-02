@@ -156,12 +156,12 @@ with the exact command and a NOPASSWD line naming that binary.
 
 ## 3. `ui_error()` called from console mode, where no UI exists
 
-`resources.c:1255-1295`, `check_resource_file_version()`:
+`resources.c:1241-1295`, `check_resource_file_version()`:
 
 ```c
 if (strcmp(tag, VERSION) != 0) {
     log_warning(LOG_DEFAULT, "Config file version mismatch ...");
-    ui_error("WARNING: Configuration file version mismatch ...");   /* :1281 */
+    ui_error("WARNING: Configuration file version mismatch ...");   /* :1279 */
     err = 0;
 }
 ...
@@ -206,13 +206,13 @@ ethernet rc path is unaffected.
 
 ## 4. `strcmp(NULL, VERSION)` on an empty `ConfigVersion` value
 
-Same function, a separate fault reached earlier. `resources.c:1273-1277`:
+Same function, a separate fault reached earlier. `resources.c:1273-1276`:
 
 ```c
 char *tag = strtok(buf, "=");
 if (strcmp(tag, "ConfigVersion") == 0) {
     tag = strtok(NULL, "=");          /* returns NULL when nothing follows '=' */
-    if (strcmp(tag, VERSION) != 0) {  /* :1277 — strcmp(NULL, ...) */
+    if (strcmp(tag, VERSION) != 0) {  /* :1276 — strcmp(NULL, ...) */
 ```
 
 A line reading exactly `ConfigVersion=` makes `strtok` return NULL, and

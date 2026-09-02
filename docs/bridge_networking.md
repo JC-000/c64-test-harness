@@ -293,8 +293,9 @@ exactly the addresses the harness's two-VICE tests hardcode. Nothing
 detects that clash; the bridge tests simply fail or behave oddly while the
 consumer rig is up.
 
-Verified live: with `/dev/bpf0` at `crw----rw-` and uid 501,
-`-ethernetiodriver pcap` is still rejected.
+Verified live that the euid gate, not `/dev/bpf*` permissions, is what
+VICE checks: with `/dev/bpf0` at `crw----rw-` (world read/write) and uid
+501, `-ethernetiodriver pcap` is still rejected.
 
 > An earlier version of this section claimed a rig that ran
 > `sudo chmod o+rw /dev/bpf*` needed no elevation. That rule was wrong —
