@@ -11,7 +11,8 @@ wedge-tier writeup and GitHub issue #153 for the FTP-based mitigation
 this module implements.
 
 This is shared 1541ultimate firmware behaviour, not U64E-specific: it
-affects both device generations (U64E on 3.14d, C64U on 1.1.0). The
+affects any generation whose firmware predates #686 (it was verified on
+the U64E while it ran 3.14d; the C64U on 1.1.0 still qualifies). The
 module itself is host-generic (no generation branching) and has been
 verified live end-to-end (leak via ``run_prg`` + FTP GC trims to the
 keep-count) on both: originally on the U64E, and on the C64U at
