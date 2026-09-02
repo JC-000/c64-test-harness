@@ -245,3 +245,209 @@ def test_bpf_descriptor_summary_without_netstat_B_is_explicit(monkeypatch):
     monkeypatch.setattr(capture_mod, "_run_netstat_B", lambda: None)
     assert bpf_descriptors() == []
     assert bpf_descriptor_summary("feth0") == "netstat -B unavailable"
+
+
+# ---------------------------------------------------------------------------
+# S2: what the fakes above cannot see -- the ABI and the syscall sequence
+# ---------------------------------------------------------------------------
+
+
+def test_ioctl_request_numbers_match_the_sdk_compiled_values():
+    """Derived by compiling ``printf("%#lx", BIOCxxx)`` against
+    ``<net/bpf.h>`` on arm64 macOS (Xcode SDK); _IOW('B',108,struct ifreq)
+    encodes sizeof(struct ifreq)=32 in bits 16-28, which is why a 16-byte
+    ifreq would be a different request number, not merely a short arg."""
+    from c64_test_harness.capture import (
+        BIOCFLUSH, BIOCGBLEN, BIOCGDLT, BIOCIMMEDIATE, BIOCPROMISC,
+        BIOCSETIF, BIOCSHDRCMPLT, BIOCSSEESENT,
+    )
+    assert (
+        BIOCGBLEN, BIOCSETIF, BIOCIMMEDIATE, BIOCSHDRCMPLT,
+        BIOCSSEESENT, BIOCPROMISC, BIOCFLUSH, BIOCGDLT,
+    ) == (
+        0x40044266, 0x8020426C, 0x80044270, 0x80044275,
+        0x80044277, 0x20004269, 0x20004268, 0x4004426A,
+    )
+
+
+class _FakeBpfKernel:
+    """Records the ioctl sequence and serves two hand-built records on read."""
+
+    FD = 4242
+
+    def __init__(self, records: bytes, dlt: int = 1, blen: int = 4096) -> None:
+        self.records = records
+        self.dlt = dlt
+        self.blen = blen
+        self.ioctls: list[tuple[int, int, bytes | None]] = []
+        self.reads = 0
+        self.writes: list[bytes] = []
+        self.closed = False
+
+    def open_node(self, path: str, flags: int) -> int:
+        assert path == "/dev/bpf0"
+        return self.FD
+
+    def ioctl(self, fd: int, req: int, arg=None):
+        assert fd == self.FD
+        self.ioctls.append((fd, req, bytes(arg) if arg is not None else None))
+        if req == capture_mod.BIOCGBLEN:
+            return struct.pack("I", self.blen)
+        if req == capture_mod.BIOCGDLT:
+            return struct.pack("I", self.dlt)
+        return arg if arg is not None else 0
+
+    def read(self, fd: int, n: int) -> bytes:
+        assert fd == self.FD and n == self.blen
+        self.reads += 1
+        return self.records
+
+    def select(self, r, w, x, timeout):
+        return (list(r), [], [])
+
+    def write(self, fd: int, data: bytes) -> int:
+        self.writes.append(bytes(data))
+        return len(data)
+
+    def close(self, fd: int) -> None:
+        assert fd == self.FD
+        self.closed = True
+
+
+def _install(monkeypatch, kernel: _FakeBpfKernel) -> None:
+    monkeypatch.setattr(capture_mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(capture_mod, "_open_node", kernel.open_node)
+    monkeypatch.setattr(capture_mod, "_ioctl", kernel.ioctl)
+    monkeypatch.setattr(capture_mod, "_read", kernel.read)
+    monkeypatch.setattr(capture_mod, "_select", kernel.select)
+    monkeypatch.setattr(capture_mod, "_write", kernel.write)
+    monkeypatch.setattr(capture_mod, "_close_node", kernel.close)
+
+
+IPV4_FRAME = b"\x01\x00\x5e\x00\x00\xfb" + b"\x02\xc6\x40\x00\x00\x09" + b"\x08\x00" + b"\x45" * 47  # 61 B
+TEST_FRAME = b"\xff" * 6 + b"\x00\x00\x00\x00\x00\x01" + b"\x88\xb5" + bytes([0xC6, 0x40] * 25)  # 64 B
+
+
+def test_bpf_capture_issues_the_setup_ioctls_with_a_32_byte_ifreq(monkeypatch):
+    kernel = _FakeBpfKernel(b"")
+    _install(monkeypatch, kernel)
+
+    cap = open_capture("feth0")
+    reqs = [req for _, req, _ in kernel.ioctls]
+    assert reqs.count(capture_mod.BIOCSETIF) == 1
+    setif_arg = next(arg for _, req, arg in kernel.ioctls if req == capture_mod.BIOCSETIF)
+    assert len(setif_arg) == 32, "struct ifreq is 32 bytes on Darwin"
+    assert setif_arg[:16] == b"feth0".ljust(16, b"\0")
+    for required in (capture_mod.BIOCIMMEDIATE, capture_mod.BIOCSHDRCMPLT,
+                     capture_mod.BIOCSSEESENT, capture_mod.BIOCPROMISC, capture_mod.BIOCGDLT):
+        assert required in reqs, f"missing ioctl {required:#x}"
+    # Promiscuous mode is per-interface: it must follow the bind.
+    assert reqs.index(capture_mod.BIOCPROMISC) > reqs.index(capture_mod.BIOCSETIF)
+    # Immediate/hdrcmplt/seesent are u_int 1.
+    for req in (capture_mod.BIOCIMMEDIATE, capture_mod.BIOCSHDRCMPLT, capture_mod.BIOCSSEESENT):
+        assert next(arg for _, r, arg in kernel.ioctls if r == req) == struct.pack("I", 1)
+    assert cap.buflen == 4096 and cap.dlt == 1
+    cap.close()
+    assert kernel.closed
+
+
+def test_bpf_capture_recv_returns_the_matching_frame_not_the_buffer(monkeypatch):
+    kernel = _FakeBpfKernel(_record(IPV4_FRAME) + _record(TEST_FRAME))
+    _install(monkeypatch, kernel)
+
+    with open_capture("feth0") as cap:
+        got = cap.recv(1.0, match=lambda f: f[12:14] == b"\x88\xb5")
+    assert got == TEST_FRAME
+    assert kernel.reads == 1  # both records came from one read; the first was skipped, not re-read
+
+
+def test_bpf_capture_recv_without_match_returns_the_first_frame(monkeypatch):
+    kernel = _FakeBpfKernel(_record(IPV4_FRAME) + _record(TEST_FRAME))
+    _install(monkeypatch, kernel)
+    with open_capture("feth0") as cap:
+        assert cap.recv(1.0) == IPV4_FRAME
+        assert cap.recv(1.0) == TEST_FRAME  # second record served from the pending queue
+
+
+def test_bpf_capture_rejects_a_non_ethernet_dlt(monkeypatch):
+    kernel = _FakeBpfKernel(b"", dlt=0)  # DLT_NULL, e.g. lo0
+    _install(monkeypatch, kernel)
+    with pytest.raises(CaptureUnavailable) as ei:
+        open_capture("lo0")
+    assert "DLT 0" in str(ei.value)
+    assert kernel.closed, "the node must be released on a failed setup"
+
+
+def test_bpf_capture_send_writes_the_frame_verbatim(monkeypatch):
+    kernel = _FakeBpfKernel(b"")
+    _install(monkeypatch, kernel)
+    with open_capture("feth0") as cap:
+        cap.send(TEST_FRAME)
+    assert kernel.writes == [TEST_FRAME]
+
+
+class _FakeSocket:
+    instances: list["_FakeSocket"] = []
+
+    def __init__(self, family, type_, proto):
+        self.args = (family, type_, proto)
+        self.bound = None
+        self.timeouts: list[float] = []
+        self.inbox: list[bytes] = []
+        self.sent: list[bytes] = []
+        self.closed = False
+        _FakeSocket.instances.append(self)
+
+    def bind(self, addr):
+        self.bound = addr
+
+    def settimeout(self, t):
+        self.timeouts.append(t)
+
+    def recv(self, n):
+        if not self.inbox:
+            raise _FakeSocketModule.timeout()
+        return self.inbox.pop(0)
+
+    def send(self, data):
+        self.sent.append(bytes(data))
+        return len(data)
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeSocketModule:
+    """Enough of the ``socket`` module for AfPacketCapture, on a host without AF_PACKET."""
+
+    AF_PACKET = 17
+    SOCK_RAW = 3
+
+    class timeout(OSError):
+        pass
+
+    socket = _FakeSocket
+
+    @staticmethod
+    def htons(x: int) -> int:
+        import socket as real
+        return real.htons(x)
+
+
+def test_af_packet_capture_opens_eth_p_all_and_binds_the_interface(monkeypatch):
+    import socket as real_socket
+    _FakeSocket.instances.clear()
+    monkeypatch.setattr(capture_mod.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(capture_mod, "socket", _FakeSocketModule)
+
+    with open_capture("tap-c64-0") as cap:
+        sock = _FakeSocket.instances[-1]
+        assert sock.args == (17, 3, real_socket.htons(0x0003)), (
+            "ETH_P_ALL (0x0003), not a single ethertype: TX must see our 0x88b5 frame"
+        )
+        assert sock.bound == ("tap-c64-0", 0)
+        sock.inbox[:] = [IPV4_FRAME, TEST_FRAME]
+        assert cap.recv(1.0, match=lambda f: f[12:14] == b"\x88\xb5") == TEST_FRAME
+        cap.send(TEST_FRAME)
+        assert sock.sent == [TEST_FRAME]
+    assert sock.closed
