@@ -509,9 +509,15 @@ class ViceProcess:
         # default branch is a bare CLK++ with no PC advance
         # (S maincpu.c:606-628; opcode $02 reaches it via JAM_02(),
         # 6510core.c:1242-1249): the 6510 halts in place, silently, and
-        # that report is unreachable.  No GUI dialog can block: the
-        # monitor takes it.
-        args += ["-jamaction", "0"]
+        # that report is unreachable.
+        #
+        # DIALOG is safe only while a monitor client can take the dialog:
+        # monitor_is_binary() is connected_socket != NULL
+        # (S monitor_binary.c:2110-2113), and with nothing connected
+        # machine.c:140's `else if (!console_mode)` opens the GTK jam
+        # dialog and the emulator blocks on it.  A launch with no binary
+        # monitor therefore keeps the factory CONTINUE.
+        args += ["-jamaction", "0" if cfg.monitor else "1"]
         args += ["-speed", "100"]        # no ambient speed limit
         args += ["-soundwarpmode", "1"]  # keep emulating SID under warp,
                                          # or render_wav() records silence

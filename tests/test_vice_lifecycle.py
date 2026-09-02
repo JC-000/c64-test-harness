@@ -288,3 +288,19 @@ def test_jamaction_is_pinned_to_dialog_so_a_jam_reaches_the_monitor(mock_popen):
     args = _start_and_capture_args(ViceConfig(), mock_popen)
     i = args.index("-jamaction")
     assert args[i + 1] == "0"
+
+
+@patch("subprocess.Popen")
+def test_jamaction_falls_back_to_continue_without_a_monitor(mock_popen):
+    """DIALOG only helps while a monitor client can take the dialog.
+
+    ``monitor_is_binary()`` is ``connected_socket != NULL``
+    (S ``monitor_binary.c:2110-2113``).  With no monitor configured
+    nothing is ever connected, so ``machine.c:140``'s
+    ``else if (!console_mode)`` opens the GTK jam dialog and the emulator
+    blocks on it.  A monitor-less launch must therefore keep CONTINUE.
+    """
+    args = _start_and_capture_args(ViceConfig(monitor=False), mock_popen)
+    i = args.index("-jamaction")
+    assert args[i + 1] == "1"
+    assert "-binarymonitor" not in args
