@@ -25,6 +25,52 @@ from .transport import TransportError, TimeoutError
 _VALID_REGS = {"A", "X", "Y", "SP", "PC"}
 
 
+class RoutineHung(TimeoutError):
+    """A routine called through :func:`jsr` never returned (issue #156).
+
+    Raised only when ``jsr(..., recover_on_timeout=True)`` was asked for.
+    It subclasses the transport :class:`~.transport.TimeoutError` on
+    purpose: every existing ``except TimeoutError`` caller keeps catching
+    hangs exactly as before, and a caller that wants to turn the hang into
+    a result row and carry on inspects the extra fields.
+
+    :ivar addr: The routine that was called.
+    :ivar recovered: ``True`` if the machine was put back into a callable
+        state -- SP restored, and a probe ``RTS`` proved the trampoline
+        live by landing on its post-``RTS`` breakpoint.  ``False`` means
+        the next ``jsr`` on this transport is not safe to attempt; treat
+        the boot as lost.
+    :ivar elapsed: Wall-clock seconds between resuming into the routine
+        and the timeout.
+    :ivar detail: What recovery observed -- the probe's landing PC on
+        success, the failing step and its exception on failure.
+    :ivar hung_pc: Where the CPU was when the timeout fired, or ``None``
+        if even that register read failed.
+    """
+
+    def __init__(
+        self,
+        addr: int,
+        *,
+        recovered: bool,
+        elapsed: float,
+        detail: str = "",
+        hung_pc: int | None = None,
+    ) -> None:
+        self.addr = addr
+        self.recovered = recovered
+        self.elapsed = elapsed
+        self.detail = detail
+        self.hung_pc = hung_pc
+        where = f" (CPU at ${hung_pc:04X})" if hung_pc is not None else ""
+        state = "recovered" if recovered else "not recovered"
+        tail = f": {detail}" if detail else ""
+        super().__init__(
+            f"routine at ${addr:04X} did not return within {elapsed:.1f}s"
+            f"{where}; machine {state}{tail}"
+        )
+
+
 def load_code(transport: BinaryViceTransport, addr: int, code: bytes | list[int]) -> None:
     """Write executable code into memory.
 

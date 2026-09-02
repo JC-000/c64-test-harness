@@ -409,3 +409,41 @@ def test_run_subroutine_custom_trampoline_addr():
     # No write at the default $0360.
     default_writes = [data for addr, data in target.write_memory_calls if addr == 0x0360]
     assert default_writes == []
+
+
+# -- RoutineHung / jsr(recover_on_timeout=True) ------------------------------
+#
+# Issue #156: after a hung routine times out, the CPU is still spinning in
+# it and the stack carries the trampoline's return frame.  Opt-in recovery
+# restores SP and proves the trampoline is live again before re-raising.
+# All mock-based; the live counterpart is tests/test_jsr_recovery_live.py.
+
+from c64_test_harness.execute import RoutineHung  # noqa: E402
+
+
+def test_routine_hung_is_a_transport_timeout_error():
+    """Existing ``except TimeoutError`` callers must keep catching hangs."""
+    exc = RoutineHung(0xC100, recovered=True, elapsed=2.0, detail="ok")
+    assert isinstance(exc, TimeoutError)
+    assert isinstance(exc, TransportError)
+
+
+def test_routine_hung_carries_recovery_facts():
+    exc = RoutineHung(0xC100, recovered=False, elapsed=1.5,
+                      detail="recovery jsr timed out", hung_pc=0xC100)
+    assert exc.addr == 0xC100
+    assert exc.recovered is False
+    assert exc.elapsed == 1.5
+    assert exc.detail == "recovery jsr timed out"
+    assert exc.hung_pc == 0xC100
+    msg = str(exc)
+    assert "$C100" in msg
+    assert "1.5" in msg
+    assert "not recovered" in msg
+    assert "recovery jsr timed out" in msg
+
+
+def test_routine_hung_message_says_recovered():
+    exc = RoutineHung(0xC100, recovered=True, elapsed=2.0, detail="")
+    assert "recovered" in str(exc)
+    assert "not recovered" not in str(exc)
