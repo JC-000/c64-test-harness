@@ -790,3 +790,19 @@ def test_routine_hung_chains_the_original_timeout_as_cause():
     assert isinstance(cause, TimeoutError)
     assert not isinstance(cause, RoutineHung)
     assert str(cause) == "No stopped event within 2.0s"
+
+
+def test_jsr_recover_on_timeout_with_a_routine_that_returns_is_a_plain_call():
+    """The opt-in must cost nothing when the routine behaves: one trampoline
+    write, one resume, no register restore, the normal return value."""
+    t = PollBinaryMockTransport(stop_pc=0x0337)
+    t._registers.update(_PRE_CALL_REGS)
+
+    regs = jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
+
+    assert regs["PC"] == 0x0337
+    assert t.written_memory == [(0x0334, [0x20, 0x00, 0xC1, 0xEA, 0xEA])]
+    assert _restore_calls(t) == []
+    assert t._set_registers_calls == [{"PC": 0x0334}]
+    assert t._resume_count == 1
+    assert len(t._checkpoints) == 0
