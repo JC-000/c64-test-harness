@@ -33,6 +33,9 @@ INC_ADDR = 0xC110
 #: Default trampoline: JSR at $0334, breakpoint on the NOP at $0337.
 POST_RTS_LANDING = 0x0337
 
+#: Interrupt-disable bit of the 6510 status register (VICE reports it as FL).
+I_FLAG = 0x04
+
 
 def test_hung_routine_is_recovered_and_the_next_call_runs(binary_transport):
     t = binary_transport
@@ -51,7 +54,11 @@ def test_hung_routine_is_recovered_and_the_next_call_runs(binary_transport):
     assert t.read_memory(HANG_ADDR, 4) == b"\x78\x4c\x01\xc1", "hang loop did not land"
     assert t.read_memory(INC_ADDR, 4) == b"\xee\x00\xc0\x60", "INC routine did not land"
 
-    sp_before = t.read_registers()["SP"]
+    regs_before = t.read_registers()
+    sp_before = regs_before["SP"]
+    # I is clear at BASIC READY; the SEI in the stub sets it.  A recovery
+    # that restores SP but not FL leaves every later test with IRQs off.
+    assert regs_before["FL"] & I_FLAG == 0, "precondition: I clear before the hang"
 
     with pytest.raises(RoutineHung) as excinfo:
         jsr(t, HANG_ADDR, timeout=2.0, recover_on_timeout=True)
@@ -69,8 +76,10 @@ def test_hung_routine_is_recovered_and_the_next_call_runs(binary_transport):
     assert f"${POST_RTS_LANDING:04X}" in exc.detail, exc.detail
 
     # The frame the hung call left on the stack is gone.  A no-op recovery
-    # leaves SP two bytes lower here.
-    assert t.read_registers()["SP"] == sp_before
+    # leaves SP two bytes lower here -- and the SEI still in force.
+    regs_after = t.read_registers()
+    assert regs_after["SP"] == sp_before
+    assert regs_after["FL"] & I_FLAG == 0, "SEI from the hung routine not undone"
 
     # And the same boot is still callable: the second routine runs, returns,
     # and lands on the trampoline's post-RTS breakpoint.

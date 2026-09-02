@@ -184,9 +184,18 @@ def _jsr_once(
         delete_breakpoint(transport, bp_id)
 
 
+#: The register file recovery puts back, when the transport reports it.
+#: SP drops the hung frames; A/X/Y are the caller's; FL undoes a SEI (or
+#: SED) the routine executed before hanging -- without it every later
+#: test in the boot runs with IRQs off.  PC is deliberately absent: the
+#: probe sets it.  ``FL`` is VICE's name for the status register
+#: (mon_register6502.c:65); a map without it just restores the rest.
+_RESTORED_REGS = ("A", "X", "Y", "SP", "FL")
+
+
 def _recover_from_hang(
     transport: BinaryViceTransport,
-    saved_sp: int,
+    saved_regs: dict[str, int],
     scratch_addr: int,
 ) -> tuple[bool, str, int | None]:
     """Put a machine whose routine never returned back into a callable state.
@@ -197,6 +206,7 @@ def _recover_from_hang(
     is about to raise.
     """
     landing = scratch_addr + 3
+    restore = {k: saved_regs[k] for k in _RESTORED_REGS if k in saved_regs}
     # (a) Read registers.  Binmon services commands while the CPU spins,
     # so this both proves the transport is alive and records where the
     # routine was stuck.
@@ -205,9 +215,10 @@ def _recover_from_hang(
     except _RECOVERY_ERRORS as e:
         return False, f"register read after timeout failed: {e!r}", None
     try:
-        # (b) Drop the hung routine's frames and the trampoline's return
-        # address in one move.
-        transport.set_registers({"SP": saved_sp})
+        # (b) Put the register file back in one command: SP drops the
+        # hung routine's frames and the trampoline's return address, FL
+        # undoes a SEI, A/X/Y are the caller's again.
+        transport.set_registers(restore)
         # (c)+(d) Prove the trampoline is live rather than assume it,
         # using only the caller's five bytes: JSR <scratch+4>; NOP; RTS.
         # The JSR must push, the RTS must pop, and the checkpoint on the
@@ -224,8 +235,9 @@ def _recover_from_hang(
                 f"recovery probe stopped at ${pc:04X}, expected the post-RTS "
                 f"landing ${landing:04X}",
                 hung_pc)
+    restored = " ".join(f"{k}=${v:02X}" for k, v in restore.items())
     return (True,
-            f"SP restored to ${saved_sp:02X}; RTS probe via ${rts_addr:04X} "
+            f"restored {restored}; RTS probe via ${rts_addr:04X} "
             f"landed at ${landing:04X}",
             hung_pc)
 
@@ -242,7 +254,8 @@ def jsr(
     """Call a subroutine at *addr* and wait for it to return.
 
     Uses a tiny trampoline written at *scratch_addr* (default ``$0334``,
-    the C64 cassette buffer — safe after BASIC boot)::
+    in the unused KERNAL RAM at ``$0334-$033B`` just below the cassette
+    buffer — safe after BASIC boot)::
 
         JSR addr    ; 3 bytes
         NOP         ; 1 byte  <- breakpoint here
@@ -270,9 +283,11 @@ def jsr(
     :class:`~.transport.TimeoutError` after *timeout* seconds, with the
     CPU still spinning inside the routine and the stack still holding the
     trampoline's return frame — the next ``jsr`` on that transport is not
-    safe.  With ``recover_on_timeout=True`` the SP is captured before the
-    call and, on timeout, the harness (a) reads the registers, (b)
-    restores SP, (c) rewrites the trampoline as ``JSR scratch_addr+4;
+    safe.  With ``recover_on_timeout=True`` the register file (A, X, Y,
+    SP, FL) is captured before the call and, on timeout, the harness (a)
+    reads the registers, (b) restores that file in one command — SP
+    drops the hung frames, FL undoes a ``SEI`` the routine executed —
+    (c) rewrites the trampoline as ``JSR scratch_addr+4;
     NOP; RTS`` — the never-executed second ``NOP`` becomes the ``RTS``,
     so the probe touches no byte outside the five the caller already
     owns — (d) runs it with :data:`RECOVERY_PROBE_TIMEOUT` and checks
@@ -282,13 +297,23 @@ def jsr(
     ``recovered`` says whether the next call is safe.
 
     *Invariant this relies on:* the binary monitor services commands
-    while the CPU spins — every command pauses the machine — so register
-    and memory writes land inside a hung routine and a resume from a new
-    PC takes effect.  *Its limit:* recovery re-arms the trampoline at
-    *scratch_addr* and probes through it, so a routine that scribbles
-    over the cassette buffer (the trampoline, or the ``RTS`` slot)
-    defeats it; the probe then reports ``recovered=False`` rather than
-    pretending.  A JAM opcode is a different failure altogether — the
+    while the CPU spins — every command halts the machine at an
+    instruction boundary and it stays halted between commands — so
+    register and memory writes land inside a hung routine and a resume
+    from a new PC takes effect.  Because the trampoline is rewritten
+    while the CPU is halted, a routine that scribbled over it *before*
+    hanging is recovered fine.
+
+    *Its limits* are the state recovery does not put back: the ``$01``
+    banking register, zero page, and the RAM IRQ/NMI/BRK vectors at
+    ``$0314-$0319``.  A routine that hijacked ``$0314`` and hung with I
+    clear makes the probe fail (the IRQ fires into the hijack before the
+    ``RTS`` lands) — reported as ``recovered=False``, never silent.  A
+    routine that banked out RAM under the trampoline or corrupted zero
+    page leaves later tests to find that out for themselves.  A stop at
+    a PC other than the landing — the caller's own checkpoint inside the
+    routine — reaches this path too, because :func:`wait_for_pc` reports
+    it as a ``TimeoutError``.  A JAM opcode is a different failure altogether — the
     transport reports it as a :class:`~.transport.TransportError`, not a
     timeout, and recovery does not engage.
 
@@ -305,14 +330,14 @@ def jsr(
     if not recover_on_timeout:
         return _jsr_once(transport, addr, timeout, scratch_addr)
 
-    saved_sp = transport.read_registers()["SP"]
+    saved_regs = transport.read_registers()
     started = time.monotonic()
     try:
         return _jsr_once(transport, addr, timeout, scratch_addr)
     except TimeoutError:
         elapsed = time.monotonic() - started
     recovered, detail, hung_pc = _recover_from_hang(
-        transport, saved_sp, scratch_addr,
+        transport, saved_regs, scratch_addr,
     )
     raise RoutineHung(
         addr, recovered=recovered, elapsed=elapsed, detail=detail,

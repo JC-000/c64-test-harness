@@ -469,11 +469,20 @@ class ScriptedStopMockTransport(BinaryMockTransport):
         self.wait_calls.append(timeout)
         step = self._script.pop(0)
         if isinstance(step, BaseException):
-            self._registers["SP"] = self._hang_sp
-            self._registers["PC"] = 0xC101  # somewhere inside the hung routine
+            # A hung routine has been running: SP is lower, A/X/Y hold
+            # its temporaries, and it may have SEI'd (I = $04 in FL).
+            self._registers.update(
+                SP=self._hang_sp, PC=0xC101, A=0x11, X=0x22, Y=0x33,
+                FL=self._registers.get("FL", 0x24) | 0x04,
+            )
             raise step
         self._registers["PC"] = step
         return step
+
+
+#: Register file before the hung call, as a VICE read_registers() reports
+#: it (FL is the real name of the status register, mon_register6502.c:65).
+_PRE_CALL_REGS = {"A": 0xA0, "X": 0xB0, "Y": 0xC0, "SP": 0xF7, "FL": 0x24}
 
 
 def _hang_then_recover(**kwargs) -> ScriptedStopMockTransport:
@@ -481,8 +490,13 @@ def _hang_then_recover(**kwargs) -> ScriptedStopMockTransport:
     t = ScriptedStopMockTransport(
         [TimeoutError("No stopped event within 2.0s"), 0x0337], **kwargs,
     )
-    t._registers["SP"] = 0xF7
+    t._registers.update(_PRE_CALL_REGS)
     return t
+
+
+def _restore_calls(t: BinaryMockTransport) -> list[dict[str, int]]:
+    """The set_registers calls that touched SP -- recovery's restore."""
+    return [c for c in t._set_registers_calls if "SP" in c]
 
 
 def test_jsr_default_timeout_is_a_plain_timeout_error_and_does_not_recover():
@@ -510,10 +524,11 @@ def test_jsr_recover_on_timeout_success():
     assert exc.elapsed >= 0.0
     assert "$0337" in exc.detail
 
-    # (b) SP restored to the value captured before the call, after the
-    # hang had lowered it.
-    assert {"SP": 0xF7} in t._set_registers_calls
+    # (b) The register file restored to what was captured before the call,
+    # in one set_registers, after the hang had changed every one of them.
+    assert _restore_calls(t) == [_PRE_CALL_REGS]
     assert t._registers["SP"] == 0xF7
+    assert t._registers["FL"] == 0x24, "I flag left set by the SEI'd hang"
     # (c)+(d) the probe reuses the five trampoline bytes and nothing else:
     # JSR $0338; NOP; RTS -- the second NOP becomes the RTS, the JSR
     # targets it, and the checkpoint on the first NOP catches the return.
@@ -535,9 +550,21 @@ def test_jsr_recover_on_timeout_restores_sp_before_probing():
     with pytest.raises(RoutineHung):
         jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
     calls = t._set_registers_calls
-    sp_idx = calls.index({"SP": 0xF7})
+    sp_idx = calls.index(_restore_calls(t)[0])
     probe_pc_idx = max(i for i, c in enumerate(calls) if c == {"PC": 0x0334})
     assert sp_idx < probe_pc_idx
+
+
+def test_jsr_recover_on_timeout_restores_only_registers_the_transport_reports():
+    """A transport whose read_registers lacks FL (older map) still gets SP,
+    A, X, Y back; recovery must not invent a register the wire cannot set."""
+    t = _hang_then_recover()
+    del t._registers["FL"]
+    with pytest.raises(RoutineHung) as excinfo:
+        jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
+    assert excinfo.value.recovered is True
+    expected = {k: v for k, v in _PRE_CALL_REGS.items() if k != "FL"}
+    assert _restore_calls(t) == [expected]
 
 
 def test_jsr_after_recovery_works_on_same_transport():
