@@ -282,6 +282,12 @@ event queue: 1328 entries over 442 resume generations
 JAMAction resource: 1 (continue)
 ```
 
+> `JAMAction=1` was the harness pin when this was captured. The pin has
+> since moved to `0` (DIALOG): VICE emits the `0x61` JAM event only under
+> JAMAction 0 with the binary monitor connected (S `machine.c:130-138`),
+> so a jam now stops the machine and is reported by `wait_for_stopped`
+> instead of continuing silently. The dump above is as captured.
+
 `LIN`/`CYC` are the raster position. They advance whenever the *machine*
 is emulating, whether or not the 6510 is executing, so a frozen raster
 means nothing is being emulated at all — this is not the monitor holding
@@ -299,7 +305,7 @@ perform the transition.
 | a slow screen / marginal timeout | the text is normally found in 0–1s against a 15s limit |
 | a checkpoint leaked by an interrupted `jsr()` pinning the CPU | `CHECKPOINT_LIST` reports zero |
 | a lost resume, or monitor nesting needing more exits | 40 acknowledged resumes, no movement |
-| the 6510 jammed on an illegal opcode | `$CF00` holds `584ccde5`, a valid CLI; and **no `0x61` JAM event** in 1328 queued events; and `JAMAction=1` (continue) would have kept the raster advancing anyway |
+| the 6510 jammed on an illegal opcode | `$CF00` holds `584ccde5`, a valid CLI; and **no `0x61` JAM event** in 1328 queued events; and `JAMAction=1` (continue) would have kept the raster advancing anyway (true at capture time; the harness pin is now `0`, under which a jam stops the machine and surfaces as a `TransportError` from `wait_for_stopped` — so a stall captured today would be distinguished from a jam by that error, not by this row) |
 
 **A CPU-contention experiment was deliberately not run**, and that is a
 choice rather than an omission: with two failure modes sharing one
