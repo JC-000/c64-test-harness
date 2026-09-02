@@ -716,3 +716,41 @@ def test_package_root_exports_have_no_duplicate_names():
     assert dup_all == [], f"names listed in __all__ more than once: {dup_all}"
     # Every re-export is advertised, and vice versa.
     assert set(all_names) - {"__version__"} <= set(bound)
+
+
+# -- mutation survivors from review (S4) --------------------------------------
+
+def test_jsr_recover_on_timeout_does_not_engage_for_a_jam():
+    """A JAM is a TransportError, not a timeout: the docstring promises
+    recovery does not engage.  Kills the mutation ``except TimeoutError``
+    -> ``except TransportError`` in jsr()."""
+    # The 0x0337 is bait: if recovery wrongly engages, its probe "lands"
+    # and the failure is the RoutineHung assertion below, not an
+    # exhausted script.
+    t = ScriptedStopMockTransport(
+        [TransportError("The 6510 jammed at $c100"), 0x0337],
+    )
+    t._registers.update(_PRE_CALL_REGS)
+    with pytest.raises(TransportError) as excinfo:
+        jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
+    assert not isinstance(excinfo.value, RoutineHung)
+    assert _restore_calls(t) == []
+    assert t._resume_count == 1
+    assert len(t.written_memory) == 1
+
+
+def test_jsr_recovery_lets_a_harness_bug_escape_rather_than_folding_it():
+    """Only the wire and the policies are folded into RoutineHung.detail.
+    A ValueError from set_registers is a harness bug and must surface as
+    itself.  Kills the mutation ``_RECOVERY_ERRORS = (Exception,)``."""
+    t = _hang_then_recover()
+    real_set = t.set_registers
+
+    def bad_set(regs):
+        if "SP" in regs:
+            raise ValueError("Unknown register 'FL'")
+        real_set(regs)
+
+    t.set_registers = bad_set
+    with pytest.raises(ValueError, match="Unknown register"):
+        jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
