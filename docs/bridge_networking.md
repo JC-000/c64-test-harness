@@ -371,8 +371,11 @@ real elevated VICE and asserts the attach is seen — it fails against the
 
 So on macOS every pcap ethernet launch elevates. The harness refuses to
 launch one it cannot elevate: `plan_vice_launch()` (in
-`c64_test_harness.backends.vice_elevation`) checks
-`sudo -n -l -- <x64sc>` and raises `ViceElevationRequiredError` carrying
+`c64_test_harness.backends.vice_elevation`) parses the `NOPASSWD:` rules
+out of plain `sudo -n -l` (`sudo_can_run` → `parse_sudo_listing`; a
+per-command `sudo -n -l -- <x64sc>` probe exits 0 for anything a
+`(ALL) ALL` user may run and proves nothing) and, when no rule names the
+exact binary, raises `ViceElevationRequiredError` carrying
 the exact command to run and a NOPASSWD line naming that exact binary
 path — never `bash`-wrapped, since sudoers matches sudo's first non-flag
 argument. `VICE_ETHERNET_ALLOW_UNELEVATED=1` downgrades the refusal to a

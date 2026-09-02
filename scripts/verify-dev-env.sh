@@ -99,6 +99,55 @@ add_hint() {
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+# ---------- sudo NOPASSWD probe (begin) -----------------------------------
+#
+# `sudo -n -l <cmd>` is NOT a NOPASSWD probe.  It exits 0 whenever the user
+# may run <cmd> at all -- with or without a password -- so on a host whose
+# sudoers carries `(ALL) ALL` it is a file-existence check wearing a sudo
+# costume: /bin/ls "authorised", /usr/sbin/lsof "authorised", and a binary
+# with no rule whatsoever "authorised".  The harness's launcher
+# (`vice_elevation.parse_sudo_listing`) was corrected for exactly this;
+# this mirrors it in shell so the two cannot disagree again.
+#
+# The reliable check is the rule list itself: `sudo -n -l` prints it
+# without running anything and, with -n, without ever prompting.  A rule
+# authorises an unattended launch of <cmd> only if a `NOPASSWD:` line names
+# <cmd> exactly, with no pinned arguments, or names `ALL`.  Entries with
+# pinned arguments (`NOPASSWD: /opt/homebrew/bin/brew reinstall --HEAD
+# vice`) authorise that one command line and are deliberately not counted.
+SUDO_LISTING=""
+SUDO_LISTING_LOADED=0
+load_sudo_listing() {
+    if [ "$SUDO_LISTING_LOADED" = "0" ]; then
+        SUDO_LISTING="$(sudo -n -l 2>/dev/null </dev/null || true)"
+        SUDO_LISTING_LOADED=1
+    fi
+}
+# nopasswd_for <abs-path>: exit 0 if this user may run <abs-path> as root
+# without a password, per the NOPASSWD rules in `sudo -n -l`; 1 otherwise.
+nopasswd_for() {
+    local target="$1" line rest entry
+    local -a entries words
+    load_sudo_listing
+    while IFS= read -r line; do
+        case "$line" in *"NOPASSWD:"*) ;; *) continue ;; esac
+        rest="${line#*NOPASSWD:}"
+        IFS=',' read -r -a entries <<< "$rest"
+        for entry in "${entries[@]}"; do
+            read -r -a words <<< "$entry"
+            [ "${#words[@]}" -eq 0 ] && continue
+            if [ "${words[0]}" = "ALL" ]; then
+                return 0
+            fi
+            if [ "${#words[@]}" -eq 1 ] && [ "${words[0]}" = "$target" ]; then
+                return 0
+            fi
+        done
+    done <<< "$SUDO_LISTING"
+    return 1
+}
+# ---------- sudo NOPASSWD probe (end) -------------------------------------
+
 # ---------- Section 1: VICE ----------------------------------------------
 
 check_vice() {
@@ -365,11 +414,11 @@ check_system() {
                 # reports it); skip here so we don't double-fail.
                 continue
             fi
-            # `sudo -n -l <cmd>` exits 0 if the user can run <cmd> without a
-            # password, non-zero otherwise. On macOS with no NOPASSWD entry
-            # this exits 1 silently; with a stale cached credential it might
-            # transiently succeed -- the user will notice on the next session.
-            if sudo -n -l "$path" >/dev/null 2>&1; then
+            # Parse the NOPASSWD rules out of `sudo -n -l` (see nopasswd_for
+            # above).  The per-command `sudo -n -l <cmd>` form this replaced
+            # exits 0 for anything a `(ALL) ALL` user may run at all, so it
+            # reported "passwordless" on hosts where every launch prompts.
+            if nopasswd_for "$path"; then
                 record "$sec" "NOPASSWD sudo for $script" ok "passwordless sudo configured" 0
             else
                 record "$sec" "NOPASSWD sudo for $script" warn "no NOPASSWD entry (bridge setup will prompt for a password)" 0
@@ -384,10 +433,10 @@ check_system() {
         # in the same sudoers drop-in.
         local x64sc_path="/opt/homebrew/bin/x64sc"
         if [ -x "$x64sc_path" ]; then
-            if sudo -n -l "$x64sc_path" >/dev/null 2>&1; then
-                record "$sec" "NOPASSWD sudo for x64sc" ok "passwordless sudo configured" 0
+            if nopasswd_for "$x64sc_path"; then
+                record "$sec" "NOPASSWD sudo for x64sc" ok "NOPASSWD rule names $x64sc_path" 0
             else
-                record "$sec" "NOPASSWD sudo for x64sc" warn "no NOPASSWD entry for $x64sc_path (ethernet tests will prompt for a password or fail)" 0
+                record "$sec" "NOPASSWD sudo for x64sc" warn "no NOPASSWD rule names $x64sc_path (plan_vice_launch will refuse the ethernet launch; a (ALL) ALL rule does not count)" 0
                 missing_nopasswd=1
             fi
         fi
