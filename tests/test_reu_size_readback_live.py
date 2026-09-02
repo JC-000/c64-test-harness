@@ -9,12 +9,16 @@ which the issue pins on the ``Cartridge`` item because the C64 Ultimate's
 ``Cartridge`` value mirrors REU state).
 
 This module runs the issue's procedure against a real device and encodes
-what was FOUND (U64E, firmware 3.15, 2026-09-02, device lock held for the
-whole run; the C64 Ultimate generation was not reachable and is untested):
+what was FOUND (U64E, firmware 3.15, 2026-09-01 local = 02:21-02:40 UTC
+2026-09-02, device lock held for the whole run; the C64 Ultimate
+generation was not reachable and is untested):
 
 * ``REU Size`` did **not** move on its own: five category reads over ~60 s
   with nothing else touching the device were byte-identical, and
-  ``get_reu_config()`` agreed with the raw category on every read.
+  ``get_reu_config()`` agreed with the raw category on every read. (The
+  committed test keeps five reads but at ``_QUIET_INTERVAL_S`` = 4 s; the
+  characterisation is settled and the source excludes a cache — see
+  ``test_reu_size_stable_across_quiet_reads``.)
 * The ``Cartridge`` item on U64E fw 3.15 exposes ``presets: [""]`` — there
   is **no** ``"REU"`` preset (the shape previously documented only for the
   C64 Ultimate), so a ``Cartridge`` write cannot be what moved the size on
@@ -46,19 +50,28 @@ firmware ever behaves the other way.
 
 Env gates (all unset -> everything skips cleanly):
 
-* ``U64_HOST``           — device hostname/IP (no IPs are committed).
-* ``U64_PASSWORD``       — optional; sent as ``X-Password`` when set.
-* ``U64_ALLOW_MUTATE=1`` — required for the two mutating tests; the
-                           quiet-read test runs without it.
+* ``REU_READBACK_LIVE=1`` — master switch for this module.
+* ``U64_HOST``            — device hostname/IP (no IPs are committed).
+* ``U64_PASSWORD``        — optional; sent as ``X-Password`` when set.
+* ``U64_ALLOW_MUTATE=1``  — required for the three mutating tests; the
+                            quiet-read test runs without it.
 
-What the mutating tests touch: ``C64 and Cartridge Settings`` /
-``RAM Expansion Unit`` and ``REU Size`` (via ``set_reu`` / ``restore_state``),
-a ``Cartridge=""`` smoke PUT, and one per-category
-``configs/<C64 and Cartridge Settings>:load_from_flash`` (the flash-vs-RAM
-measurement; every item it changes is PUT back). The stock category is
-snapshotted before any write and every mutating test ends by diffing the
-full category against that snapshot. Never: ``save_config_to_flash``,
-``reset``, ``reboot``, ``poweroff``.
+What the mutating tests touch:
+
+* ``C64 and Cartridge Settings`` — ``RAM Expansion Unit`` and ``REU Size``
+  (via ``set_reu`` / ``restore_state``), a ``Cartridge=""`` smoke PUT
+  (a no-op only with no ``.crt`` selected; otherwise it detaches the
+  cartridge and the ``finally`` re-selects it), and one per-category
+  ``configs/<C64 and Cartridge Settings>:load_from_flash`` (the
+  flash-vs-RAM measurement; every item it changes is PUT back).
+* ``U64 Specific Settings`` — ``restore_state`` rewrites ``Turbo Control``,
+  ``CPU Speed`` and ``Badline Timing`` there with their snapshotted values
+  (``ultimate64_helpers.restore_state``), so that category sees same-value
+  PUTs even though nothing in this module changes it.
+
+The stock cartridge category is snapshotted before any write and every
+mutating test ends by diffing the full category against that snapshot.
+Never: ``save_config_to_flash``, ``reset``, ``reboot``, ``poweroff``.
 """
 from __future__ import annotations
 
@@ -83,11 +96,15 @@ from c64_test_harness.backends.ultimate64_schema import REU_SIZE_VALUES
 # Environment gates                                                           #
 # --------------------------------------------------------------------------- #
 
+_LIVE = os.environ.get("REU_READBACK_LIVE")
 _HOST = os.environ.get("U64_HOST")
 _PW = os.environ.get("U64_PASSWORD")
 _ALLOW_MUTATE = os.environ.get("U64_ALLOW_MUTATE")
 
-pytestmark = pytest.mark.skipif(not _HOST, reason="U64_HOST not set")
+pytestmark = [
+    pytest.mark.skipif(not _LIVE, reason="REU_READBACK_LIVE not set"),
+    pytest.mark.skipif(not _HOST, reason="U64_HOST not set"),
+]
 
 requires_mutate = pytest.mark.skipif(
     not _ALLOW_MUTATE,
@@ -99,8 +116,10 @@ _ITEM_REU_SIZE = "REU Size"
 _ITEM_CARTRIDGE = "Cartridge"
 
 #: Quiet-read window: ``_QUIET_READS`` reads, ``_QUIET_INTERVAL_S`` apart.
+#: The original characterisation used 15 s (60 s total); 4 s keeps the
+#: whole module well under 30 s now that the finding is settled.
 _QUIET_READS = 5
-_QUIET_INTERVAL_S = 15.0
+_QUIET_INTERVAL_S = 4.0
 
 
 # --------------------------------------------------------------------------- #
@@ -191,6 +210,18 @@ def test_reu_size_stable_across_quiet_reads(
 
     Explanation 1 from the issue (firmware reports a stale size) predicts a
     drift across these reads; it did not happen on U64E fw 3.15.
+
+    Scope of what this proves: the reads are compared with the module's
+    own first read, so a value that was stale *before* the module started
+    and stayed stale would pass. Correctness is carried by the firmware
+    source, which this test corroborates rather than establishes: the GET
+    is emitted straight from the in-memory ``ConfigStore`` with no cache
+    (``software/api/route_configs.cc:6-58`` — ``emit_store`` reads
+    ``i->getValue()`` per item) and the same store feeds the REU hardware
+    register on every PUT (``at_close_config -> effectuate ->
+    set_emulation_flags``; ``components/config.h:199``,
+    ``io/c64/c64.cc:270-280, 315-318``). The test corroborates; the source
+    excludes a cache.
     """
     info = client.get_info()
     record_property("product", str(info.get("product")))
