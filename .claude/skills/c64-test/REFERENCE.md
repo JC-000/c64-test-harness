@@ -250,7 +250,7 @@ All functions take `transport: BinaryViceTransport` as first arg (stateless). Th
 4. Calls `wait_for_stopped()` until checkpoint fires, verifies PC
 5. Deletes checkpoint
 
-With `recover_on_timeout=True`, step 4 timing out adds: read registers (binmon answers while the CPU spins), restore the SP captured before step 1, rewrite the trampoline as `20 lo hi EA 60` — `JSR scratch_addr+4; NOP; RTS`, the spare second `NOP` byte becoming the `RTS` — and run steps 2-5 against it with `RECOVERY_PROBE_TIMEOUT`, require PC == `scratch_addr + 3`, then raise `RoutineHung`. Recovery writes nothing outside the five trampoline bytes the call already owns.
+With `recover_on_timeout=True`, step 4 timing out adds: read registers (binmon answers while the CPU spins), restore the register file (A, X, Y, SP, FL) captured before step 1 in one command, rewrite the trampoline as `20 lo hi EA 60` — `JSR scratch_addr+4; NOP; RTS`, the spare second `NOP` byte becoming the `RTS` — and run steps 2-5 against it with `RECOVERY_PROBE_TIMEOUT`, require PC == `scratch_addr + 3`, then raise `RoutineHung`. Recovery writes nothing outside the five trampoline bytes the call already owns.
 
 ---
 

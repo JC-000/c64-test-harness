@@ -229,6 +229,12 @@ def _recover_from_hang(
         hung_pc: int | None = transport.read_registers().get("PC")
     except _RECOVERY_ERRORS as e:
         return False, f"register read after timeout failed: {e!r}", None
+    if "SP" not in restore:
+        # Without the pre-call SP there is nothing to unwind the stack to;
+        # probing on a leaked frame would "succeed" and hide the leak.
+        return (False,
+                "transport reports no SP; cannot drop the hung frames",
+                hung_pc)
     try:
         # (b) Put the register file back in one command: SP drops the
         # hung routine's frames and the trampoline's return address, FL

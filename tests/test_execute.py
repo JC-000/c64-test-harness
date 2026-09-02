@@ -806,3 +806,60 @@ def test_jsr_recover_on_timeout_with_a_routine_that_returns_is_a_plain_call():
     assert t._set_registers_calls == [{"PC": 0x0334}]
     assert t._resume_count == 1
     assert len(t._checkpoints) == 0
+
+
+def test_jsr_recovery_folds_a_memory_policy_refusal_into_detail():
+    """A MemoryPolicy that refuses the probe's trampoline rewrite (the
+    second write_memory of the call) is a recovery failure to report, not
+    an exception to escape.  Kills ``_RECOVERY_ERRORS = (TransportError,)``."""
+    from c64_test_harness.memory_policy import MemoryPolicyError
+
+    t = _hang_then_recover()
+    real_write = t.write_memory
+    seen = {"writes": 0}
+
+    def guarded(*args, **kwargs):
+        seen["writes"] += 1
+        if seen["writes"] == 2:
+            raise MemoryPolicyError(0x0334, 5, "refused by policy")
+        real_write(*args, **kwargs)
+
+    t.write_memory = guarded
+    with pytest.raises(RoutineHung) as excinfo:
+        jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
+    exc = excinfo.value
+    assert exc.recovered is False
+    assert "refused by policy" in exc.detail
+    assert seen["writes"] == 2
+
+
+def test_routine_hung_elapsed_is_wall_clock_from_resume_to_timeout(monkeypatch):
+    import types
+    import c64_test_harness.execute as ex
+
+    ticks = iter([100.0, 102.5])
+    monkeypatch.setattr(
+        ex, "time", types.SimpleNamespace(monotonic=lambda: next(ticks),
+                                          sleep=time.sleep),
+    )
+    t = _hang_then_recover()
+    with pytest.raises(RoutineHung) as excinfo:
+        jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
+    assert excinfo.value.elapsed == 2.5
+
+
+def test_jsr_recovery_refuses_when_the_transport_reports_no_sp():
+    """Without a captured SP there is nothing to restore the stack to;
+    recovery must say so rather than probe on a leaked frame."""
+    t = _hang_then_recover()
+    del t._registers["SP"]
+    with pytest.raises(RoutineHung) as excinfo:
+        jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
+    exc = excinfo.value
+    assert exc.recovered is False
+    assert "transport reports no SP; cannot drop the hung frames" in exc.detail
+    assert exc.hung_pc == 0xC101
+    # Nothing was attempted: no restore, no probe, one resume.
+    assert _restore_calls(t) == []
+    assert t._resume_count == 1
+    assert len(t.written_memory) == 1
