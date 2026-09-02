@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import argparse
 import ast
+import io
 import json
 import pathlib
 import re
+import tokenize
+from typing import Sequence
 
 #: The four modules that make up the VICE backend.  Mutating anything
 #: else would be measuring a different suite.
@@ -49,10 +52,58 @@ FLAG_RE = re.compile(r"[-+][a-z0-9][a-z0-9-]{2,}")
 RESOURCE_RE = re.compile(r"[A-Z][A-Za-z0-9]{4,}")
 
 
-def generate(repo: pathlib.Path) -> list[dict]:
+def prose_spans(src: str, tree: ast.AST) -> list[tuple[int, int]]:
+    """Character spans of *src* that are documentation, not code.
+
+    Docstrings (the leading string expression of a module, class or
+    function body) and ``#`` comments.  ``run.py`` replaces the *first*
+    textual occurrence of a pattern, so a pattern that first appears in
+    one of these spans would be "applied" to prose: the code is unchanged,
+    the suite passes, and the row is scored as a survivor.
+    """
+    offsets = [0]
+    for line in src.splitlines(keepends=True):
+        offsets.append(offsets[-1] + len(line))
+
+    def pos(lineno: int, col: int) -> int:
+        return offsets[lineno - 1] + col
+
+    spans: list[tuple[int, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                             ast.AsyncFunctionDef)):
+            body = node.body
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                d = body[0]
+                spans.append((pos(d.lineno, d.col_offset),
+                              pos(d.end_lineno, d.end_col_offset)))
+    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+        if tok.type == tokenize.COMMENT:
+            spans.append((pos(*tok.start), pos(*tok.end)))
+    return spans
+
+
+def _in_spans(offset: int, spans: list[tuple[int, int]]) -> bool:
+    return any(a <= offset < b for a, b in spans)
+
+
+def generate(
+    repo: pathlib.Path,
+    targets: Sequence[str] | None = None,
+    excluded: list[dict] | None = None,
+) -> list[dict]:
+    """Every mutation for *targets* (default :data:`TARGETS`) under *repo*.
+
+    *excluded*, when given, collects the mutations refused because their
+    first occurrence is documentation -- so the exclusion is auditable
+    rather than silent.
+    """
     muts: list[dict] = []
     seen: set[tuple[str, str, str]] = set()
     sources: dict[str, str] = {}
+    prose: dict[str, list[tuple[int, int]]] = {}
 
     def add(rel: str, old: str, new: str, kind: str, line: int) -> None:
         key = (rel, old, new)
@@ -65,23 +116,35 @@ def generate(repo: pathlib.Path) -> list[dict]:
         # output that would have prompted a look at the extraction was
         # being routinely ignored.  A no-op result from your own tooling
         # is a defect to remove, not a row to skip.
-        if old not in sources[rel]:
+        first = sources[rel].find(old)
+        if first < 0:
             return
         seen.add(key)
-        muts.append(
-            {
-                "id": f"{rel.split('/')[-1]}:{line}:{kind}:{old[:34]}->{new[:24]}",
-                "file": rel,
-                "old": old,
-                "new": new,
-                "kind": kind,
-            }
-        )
+        record = {
+            "id": f"{rel.split('/')[-1]}:{line}:{kind}:{old[:34]}->{new[:24]}",
+            "file": rel,
+            "old": old,
+            "new": new,
+            "kind": kind,
+        }
+        # The same defect in a different coat: the pattern *is* in the
+        # source, but its first occurrence is a docstring or a comment, so
+        # first-occurrence replacement mutates prose and the suite passes
+        # without the code having changed.  Three of these sat in the
+        # population as "survivors" (vice_elevation.py's "-features" name
+        # and polarity, and an "= 0" that first matched a docstring's
+        # "geteuid() == 0").  Refused here, and reported via *excluded*.
+        if _in_spans(first, prose[rel]):
+            if excluded is not None:
+                excluded.append(record)
+            return
+        muts.append(record)
 
-    for rel in TARGETS:
+    for rel in (TARGETS if targets is None else targets):
         src = (repo / rel).read_text()
         sources[rel] = src
         tree = ast.parse(src)
+        prose[rel] = prose_spans(src, tree)
         lines = src.splitlines()
         fragments = {
             id(c)
@@ -128,13 +191,23 @@ def main() -> None:
     ap.add_argument("out")
     ap.add_argument("--repo", default=str(pathlib.Path(__file__).resolve().parents[2]))
     args = ap.parse_args()
-    muts = generate(pathlib.Path(args.repo))
+    excluded: list[dict] = []
+    muts = generate(pathlib.Path(args.repo), excluded=excluded)
     pathlib.Path(args.out).write_text(json.dumps(muts, indent=1))
     by_kind: dict[str, int] = {}
     for m in muts:
         by_kind[m["kind"]] = by_kind.get(m["kind"], 0) + 1
     print(f"{len(muts)} mutations: " +
           ", ".join(f"{k}={v}" for k, v in sorted(by_kind.items())))
+    by_file: dict[str, int] = {}
+    for m in muts:
+        by_file[m["file"].split("/")[-1]] = by_file.get(m["file"].split("/")[-1], 0) + 1
+    print("per file: " + ", ".join(f"{k}={v}" for k, v in sorted(by_file.items())))
+    # Announce the exclusions: an exclusion nobody can see is a row nobody
+    # can audit, which is how no-op rows survived for a week last time.
+    print(f"{len(excluded)} excluded (first occurrence is a docstring/comment):")
+    for m in excluded:
+        print(f"  {m['id']}")
 
 
 if __name__ == "__main__":
