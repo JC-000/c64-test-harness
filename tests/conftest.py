@@ -425,21 +425,27 @@ def bridge_vice_pair():
 #   No future module can quietly opt out of it, because nothing has to
 #   be remembered at the call site.
 #
-# **How much rides on it, measured.**  The argv contract needs
-# ``x64sc -help`` and is therefore live.  Mutation testing puts a number
-# on what that means: **41 flag mutations across 23 flag families**
-# survive the entire non-live suite and are killed only once the contract
-# runs -- ``-binarymonitor``, ``-remotemonitor*``, ``-sound*``,
+# **How much rides on it, measured -- once, and the figure is dated.**
+# The argv contract needs ``x64sc -help`` and is therefore live.  A
+# mutation sweep (``scripts/mutation/README.md``) put a number on what
+# that means at the time: 41 flag mutations across 23 flag families
+# survived the entire non-live suite and were killed only once the
+# contract ran -- ``-binarymonitor``, ``-remotemonitor*``, ``-sound*``,
 # ``-ethernetio*``, ``-addconfig``, ``-drive8type``, ``-default``,
 # ``-warp``, ``-ntsc``/``-pal``, ``+saveres``, ``-jamaction``,
-# ``-speed``, ``-limitcycles`` and more.
+# ``-speed``, ``-limitcycles`` and more.  That sweep predates the
+# generator's hyphen fix (9bfb005) and its no-op exclusions (7873cb6),
+# and was taken against a population anchored at 6868168, which is not
+# an ancestor of this branch; treat "41 across 23" as illustrating the
+# shape, not as a current count.  The README carries the current
+# population and the commit it was counted at.
 #
-# So on a machine with no emulator those families are validated by
-# nothing at all, and this gate is the only thing standing between the
-# project and their silent unvalidation.  That also reframes the
-# ``--ignore`` escape closed below: it was not a tidy edge case but a way
-# to switch off the sole guard for twenty-three flag families and still
-# exit green.
+# The shape is what matters here: on a machine with no emulator those
+# families are validated by nothing at all, and this gate is the only
+# thing standing between the project and their silent unvalidation.
+# That also reframes the ``--ignore`` escape closed below: it was not a
+# tidy edge case but a way to switch off the sole guard for those flag
+# families and still exit green.
 
 #: Env var by which an operator declares an emulator must be present.
 REQUIRE_VICE_ENV = "C64_REQUIRE_VICE"
