@@ -100,7 +100,7 @@ except RoutineHung as e:          # subclass of transport TimeoutError
 # e.elapsed, e.hung_pc and e.detail are there for the row.
 ```
 
-What recovery does: captures SP before the call; on timeout reads the registers, restores SP, writes a single `RTS` into the harness trampoline slot the call is not using (`$0360`, or `$0334` when the caller's trampoline is at `$0360`), `JSR`s it through the trampoline with a short timeout and requires the CPU to stop at the post-`RTS` landing (`scratch_addr + 3`, `$0337` by default). `recovered=True` means that probe passed, not that it was assumed.
+What recovery does: captures SP before the call; on timeout reads the registers, restores SP, rewrites the five-byte trampoline at `scratch_addr` as `JSR scratch_addr+4; NOP; RTS` (the second `NOP` is never executed in a normal call — the breakpoint sits on the first — so it becomes the `RTS`; no byte outside `$0334-$0338` is touched), runs it with a short timeout and requires the CPU to stop at the post-`RTS` landing (`scratch_addr + 3`, `$0337` by default). `recovered=True` means that probe passed, not that it was assumed.
 
 **Invariant it relies on:** the binary monitor services commands while the CPU spins — every command pauses the machine — so register and memory writes land inside a hung routine. **Its limit:** recovery re-arms the trampoline at `scratch_addr` and probes through it, so a routine that scribbles over the cassette buffer (`$0334-$03FB`: the trampoline or the `RTS` slot) defeats it — you get `recovered=False` with the probe's landing PC in `detail`, never a silent success. A JAM opcode is reported as a `TransportError`, not a timeout, and recovery does not engage. Default behaviour (`recover_on_timeout=False`) is unchanged.
 

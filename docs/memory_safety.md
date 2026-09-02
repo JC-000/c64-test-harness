@@ -150,7 +150,6 @@ scratch addresses to functions that accept them via kwarg), or use
 | `$0334-$0338` | `execute.jsr()` default trampoline | `scratch_addr=` kwarg |
 | `$0339`, `$033C` | `sid_player` park JMP + song trampoline | module-level constants |
 | `$0360-$036D` | `execute.run_subroutine()` default trampoline | `trampoline_addr=` kwarg |
-| `$0360` (or `$0334`) | `execute.jsr(recover_on_timeout=True)` hang-recovery `RTS` — the trampoline slot the call is not using | follows `scratch_addr=` |
 | `$03F0`, `$03F1` | `execute.run_subroutine()` U64 flag bytes | hardcoded |
 | `$0277`, `$00C6` | UCI keyboard dispatch (KERNAL-mandated) | not changeable |
 | `$C000-$C3FF` | UCI stub block (code/data/response/status) | partially configurable |
