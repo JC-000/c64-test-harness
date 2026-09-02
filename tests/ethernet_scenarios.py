@@ -21,6 +21,7 @@ import threading
 import time
 from typing import Any
 
+from c64_test_harness.bridge_ping import cs8900a_enable_inline_code
 from c64_test_harness.capture import CaptureTimeout, PacketCapture
 from c64_test_harness.execute import load_code
 from c64_test_harness.memory import read_bytes, write_bytes
@@ -122,8 +123,15 @@ def binary_jsr(
 
 
 def tx_routine() -> bytes:
-    """6502 TX routine (RR-Net register layout): send FRAME_LEN bytes from FRAME_BUF."""
-    return clockport_enable_code() + bytes([
+    """6502 TX routine (RR-Net register layout): send FRAME_LEN bytes from FRAME_BUF.
+
+    Begins with the chip enable (RxCTL, then LineCTL |= SerRxON|SerTxON):
+    VICE's cs8900.c accepts TxLength and raises Rdy4TxNOW whether or not
+    TX is enabled, then drops the frame at transmit time if it is not, so
+    a routine without this "succeeds" on the C64 side and never reaches
+    the wire.
+    """
+    return cs8900a_enable_inline_code() + clockport_enable_code() + bytes([
         # TxCMD = 0x00C0 at $DE0C/$DE0D
         0xA9, 0xC0,
         0x8D, TXCMD & 0xFF, TXCMD >> 8,
@@ -185,7 +193,11 @@ def rx_routine() -> bytes:
     rtd_h_lo = (RTDATA + 1) & 0xFF
     # For RR-Net: RTDATA at $DE08/$DE09. The high byte of both addresses
     # is 0xDE so we hard-code it via the constants.
-    return clockport_enable_code() + bytes([
+    #
+    # The chip enable comes first: without SerRxON the CS8900a never
+    # raises RxOK, and without PromiscuousA the reset RxCTL (0x0005, no
+    # BroadcastA) filters our broadcast frame out.
+    return cs8900a_enable_inline_code() + clockport_enable_code() + bytes([
         # PPPtr = 0x0124 (RxEvent)
         0xA9, 0x24, 0x8D, PPTR & 0xFF, PPTR >> 8,
         0xA9, 0x01, 0x8D, (PPTR + 1) & 0xFF, (PPTR + 1) >> 8,
