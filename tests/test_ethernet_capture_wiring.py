@@ -648,3 +648,31 @@ def test_rx_scenario_timeout_carries_the_same_cpu_report():
     assert "> C02A" in msg
     # The host send happened (or its failure is reported) before the CPU verdict.
     assert "host wrote 64 bytes to fake0" in msg
+
+
+from c64_test_harness.transport import TimeoutError as TransportTimeoutError  # noqa: E402
+
+
+class HangingViceTransport(HangingTransport):
+    """What the real BinaryViceTransport raises: the *transport's* TimeoutError,
+    a TransportError -- not a subclass of the builtin.  Live 2026-09-02 the
+    report never appeared because only the builtin was caught."""
+
+    def wait_for_stopped(self, timeout: float = 0.0) -> None:
+        raise TransportTimeoutError(f"No stopped event within {timeout}s")
+
+
+def test_tx_jsr_timeout_report_fires_for_the_transports_own_timeout_error():
+    transport = HangingViceTransport(pc=0xC010)
+    with pytest.raises(AssertionError) as ei:
+        run_tx_scenario(transport, FakeCapture([FRAME_DATA]), timeout=0.01)
+    assert "6502 did not return from $C000 within 10.0s" in str(ei.value)
+    assert "> C010" in str(ei.value)
+
+
+def test_rx_timeout_report_fires_for_the_transports_own_timeout_error():
+    transport = HangingViceTransport(pc=0xC02A)
+    with pytest.raises(AssertionError) as ei:
+        run_rx_scenario(transport, FakeCapture(), send_delay=0.0, timeout=1.0)
+    assert "6502 did not return from $C000 within 1.0s" in str(ei.value)
+    assert "> C02A" in str(ei.value)
