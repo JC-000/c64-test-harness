@@ -31,6 +31,7 @@ from c64_test_harness.capture import (
 )
 from c64_test_harness.execute import load_code
 from c64_test_harness.memory import read_bytes, write_bytes
+from c64_test_harness.transport import TimeoutError as TransportTimeoutError
 
 # Scratch area.  The routine is loaded at CODE_BASE; every result byte it
 # stores and every byte the host clears lives in DATA_BASE.  They used to
@@ -176,7 +177,9 @@ def binary_jsr(
         transport.resume()
         try:
             transport.wait_for_stopped(timeout=timeout)
-        except TimeoutError as e:
+        except (TimeoutError, TransportTimeoutError) as e:
+            # BinaryViceTransport raises the transport's TimeoutError, a
+            # TransportError and not the builtin; catch both.
             raise AssertionError(jsr_timeout_report(transport, addr, timeout)) from e
         regs = transport.read_registers()
         return regs
@@ -201,11 +204,24 @@ def jsr_timeout_report(transport: Any, addr: int, timeout: float, *, window: int
             for k in ("PC", "A", "X", "Y", "SP") if k in regs
         ),
     ]
-    start = max(0, pc - window)
-    mem = transport.read_memory(start, window * 3)
-    for line in disassemble(mem, start):
-        at = int(line[:4], 16)
-        lines.append(("> " if at == pc else "  ") + line)
+    # Decode from an instruction boundary: the routine start when PC is
+    # inside the routine (a decode begun mid-instruction never aligns onto
+    # PC and the marker is lost), else from PC itself.
+    start = addr if addr <= pc < addr + 0x100 else pc
+    mem = transport.read_memory(start, (pc - start) + window * 3)
+    decoded = disassemble(mem, start)
+    at_pc = next((i for i, l in enumerate(decoded) if int(l[:4], 16) == pc), None)
+    if at_pc is None:
+        # PC is not on a boundary of the code as loaded: the CPU is
+        # executing a different instruction stream through these bytes.
+        # Show the loaded decode for context, then decode from PC itself.
+        lines.append(f"  (PC ${pc:04X} is not an instruction boundary of the code at ${start:04X})")
+        lines.extend("  " + l for l in decoded[:window])
+        from_pc = disassemble(transport.read_memory(pc, window * 3), pc)
+        lines.extend(("> " if i == 0 else "  ") + l for i, l in enumerate(from_pc[:window]))
+    else:
+        for line in decoded[max(0, at_pc - window // 2):at_pc + window]:
+            lines.append(("> " if int(line[:4], 16) == pc else "  ") + line)
     io = transport.read_memory(0xDE00, 16)
     lines.append(f"$DE00: {bytes(io).hex(' ')}")
     code = transport.read_memory(addr, 16)
@@ -435,14 +451,30 @@ def run_rx_scenario(
 
     sender = threading.Thread(target=_send_packet_delayed, daemon=True)
     sender.start()
+    cpu_report: str | None = None
     try:
         transport.set_registers({"PC": scratch_addr})
         transport.resume()
-        transport.wait_for_stopped(timeout=timeout)
-        transport.read_registers()
+        try:
+            transport.wait_for_stopped(timeout=timeout)
+        except (TimeoutError, TransportTimeoutError):
+            # Same report binary_jsr gives: where the 6502 is, not just
+            # that it did not come back.
+            cpu_report = jsr_timeout_report(transport, CODE_BASE, timeout)
+        else:
+            transport.read_registers()
     finally:
         transport.delete_checkpoint(bp_num)
     sender.join(timeout=join_timeout)
+
+    if cpu_report is not None:
+        if send_error:
+            sent = f"host send on {sender_cap.iface} failed: {send_error[0]!r}"
+        elif sender.is_alive():
+            sent = f"host send on {sender_cap.iface} did not return"
+        else:
+            sent = f"host wrote {len(RX_FRAME)} bytes to {sender_cap.iface}"
+        raise AssertionError(f"{cpu_report}\n({sent}) {bpf_descriptor_summary(capture.iface)}")
 
     if send_error:
         raise AssertionError(
