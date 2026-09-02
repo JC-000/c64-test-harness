@@ -69,3 +69,33 @@ def test_script_has_no_opcode_table_of_its_own():
 
 def test_script_imports_the_shared_disassemble_function():
     assert dis6502.disassemble is disassemble
+
+
+def test_dis_end_bound_excludes_an_instruction_that_has_not_started_yet():
+    """Every other test in this file calls ``dis()`` with a single-
+    instruction window (``end = start + 1``), which never exercises the
+    ``< end`` filter on a second instruction -- ``<= end`` passes them
+    all too, while changing real output for any multi-instruction range.
+
+    mem = NOP NOP LDA $1234 NOP, base $4000: NOP at $4000, NOP at $4001,
+    LDA $1234 at $4002-$4004, NOP at $4005. ``end = $4002`` (the LDA's
+    own address) must exclude the LDA -- only the two NOPs decode,
+    matching the original script (verified against the pre-consolidation
+    scripts/dis6502.py, byte-for-byte)."""
+    mem = bytes([0xEA, 0xEA, 0xAD, 0x34, 0x12, 0xEA])
+    base = 0x4000
+    assert dis(mem, base, base, 0x4002) == "4000  ea        NOP\n4001  ea        NOP"
+
+
+def test_dis_end_bound_still_includes_an_instruction_already_begun():
+    """The other half of the same boundary: ``end`` landing *inside* the
+    LDA (one byte past its opcode) does not truncate it -- the original
+    script decodes a full instruction once started, regardless of where
+    ``end`` falls inside it, and only checks ``pc < end`` before
+    *starting* the next one.  So the LDA is included whole and the
+    trailing NOP at $4005 is excluded, matching the original script."""
+    mem = bytes([0xEA, 0xEA, 0xAD, 0x34, 0x12, 0xEA])
+    base = 0x4000
+    assert dis(mem, base, base, 0x4003) == (
+        "4000  ea        NOP\n4001  ea        NOP\n4002  ad 34 12  LDA $1234"
+    )
