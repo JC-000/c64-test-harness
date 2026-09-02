@@ -459,9 +459,12 @@ def cs8900a_rxctl_inline_code(value: int = CS8900A_RXCTL_VALUE) -> bytes:
 
 
 def cs8900a_rxctl_code() -> bytes:
-    """RxCTL (PP 0x0104) = 0x00D8 (promiscuous + RxOK), then RTS.
+    """RxCTL (PP 0x0104) = 0x00D8 (PromiscuousA set), then RTS.
 
-    Enables the RR clockport first, then programs the register.
+    Enables the RR clockport first, then programs the register.  The value
+    is VICE-verified only: RxOKA (0x0100) is *not* in 0x00D8, and a real
+    CS8900A programmed this way accepts nothing -- VICE's rawnetarch forces
+    rx_ok, which is why it works there.  See :data:`CS8900A_RXCTL_VALUE`.
     """
     return cs8900a_rxctl_inline_code() + bytes([0x60])
 
