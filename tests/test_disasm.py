@@ -83,3 +83,24 @@ def test_spot_check_a_stream_mixing_legal_and_illegal_opcodes():
     assert [line[16:] for line in disassemble(code, 0x1000)] == [
         "KIL", "SAX $81", "JMP $606C", "RTI", "BRK", "SEI", "CLI", "CLD", "STX $AB",
     ]
+
+
+def test_jmp_indirect_addressing_mode():
+    """The one addressing mode (``ind``, used only by JMP $6C) that none of
+    the spot checks above happens to exercise -- ported from dis6502's
+    ``test_legal_spot_checks`` when the two disassemblers were consolidated."""
+    lines = disassemble(bytes([0x6C, 0x02, 0xA0]), 0x1000)
+    assert lines == ["1000  6C 02 A0  JMP ($A002)"]
+
+
+def test_lower_case_rendering_option_for_the_cli_shim():
+    """scripts/dis6502.py (post-consolidation) is a thin CLI over this
+    module's table, but its callers -- vice_keyecho_probe.py and its own
+    pinned tests -- depend on lower-case bytes and a literal ``.byte``
+    marker for a truncated tail.  Rather than a second opcode table, that
+    rendering is an option on the one table's function."""
+    lines = disassemble(bytes([0x87, 0x87]), 0x1000, upper=False)
+    assert lines == ["1000  87 87     SAX $87"]
+
+    lines = disassemble(bytes([0xAD, 0x01]), 0x2000, upper=False)
+    assert lines == ["2000  ad 01     .byte"]
