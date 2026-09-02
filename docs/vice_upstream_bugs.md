@@ -446,21 +446,50 @@ redirect PC:=$CF00  paused at PC=$EA86 (the handler's RTI) SP=$F0
 ```
 
 The fixture's own RETURN then popped `X:=$22, Y:=$D4` and the RTS landed
-at `$00E5+1 = $00E6`, the screen line-link table, whose bytes `86 86 86
-86 86 86 86 87` decode as `STX $86 ×3; STX $87` — CHRGET's `SBC #$30;
-SEC` at `$0086-$0087` became `22 22`, then `CLD; BRK` at `$00F5` warm-
-started the machine, `CINT` cleared the screen, and the resulting
-`READY.` satisfied the fixture's wait. The test's first typed line then
-hit opcode `$22` (KIL) in CHRGET and the 6510 jammed: raster frozen
-(JAMAction 0 stops the machine), one `0x61` event queued, PC `$0087`.
-Every capture shape listed above is this class — a bogus RTS whose
-landing address is set by the frame depth: the 3-byte frame at the RTI
-lands in zero page and corrupts CHRGET; the 6-byte frame deeper in the
-handler lands at `$2201` (`00`, BRK) and warm-starts cleanly, so the
-fixture *self-heals* and the cycle passes (also measured, 1 of 317).
+at `$00E5+1 = $00E6`, the screen line-link table. Disassembled from the
+captured zero page with `scripts/dis6502.py` (illegal opcodes included —
+the first version of that tool had none and desynchronised here):
+
+```
+00E6  86 86     STX $86        ; X = popped P = $22
+00E8  86 86     STX $86
+00EA  86 86     STX $86
+00EC  86 87     STX $87
+00EE  87 87     SAX $87        ; A & X = $3A & $22 = $22  (A = the ':' just returned)
+00F0  87 87     SAX $87
+00F2  87 00     SAX $00        ; $F3 = colour-ptr lo, $00 with the cursor on line 0:
+                               ; hits the 6510 DDR, rewritten by IOINIT in the warm start
+00F4  d8        CLD
+00F5  00        BRK            ; $F5/$F6 KEYTAB = $0000: VICE never scanned a matrix key
+                               ; (with KEYTAB = $EB81 it is STA ($EB,X) and BRK at $F7)
+```
+
+CHRGET's `SBC #$30; SEC` at `$0086-$0087` became `22 22`; BRK → `($0316)
+= $FE66` → IOINIT, `CINT` cleared the screen, and the resulting `READY.`
+satisfied the fixture's wait. The test's first typed line then hit opcode
+`$22` (KIL) in CHRGET and the 6510 jammed: one `0x61` event queued, PC
+`$0087`, raster frozen (JAMAction 0 stops the machine). The `$F3` value at
+RTS time is derived (the dump was taken after the warm start), the rest is
+the captured bytes.
+
+Which of the capture shapes listed above this explains: "screen blank but
+for `READY.`" and "PC in zero page" follow from the mechanism — the RTS
+lands at `((X<<8)|Y)+1` of the interrupted code, or at `(P<<8|A)+1` one
+frame deeper (`$2201` = `00`, BRK, a clean warm start: the fixture
+*self-heals* and the cycle passes, also measured, 1 of 317). The
+line-collision capture is the false-completion wait already fixed above.
+`$FF09` and the `$C6=3` / empty-`$0277` disagreement are *consistent
+with* a bogus RTS but were not re-derived. Reconciling the old evidence
+row "no `0x61` in 1328 events, raster advancing": it was captured under
+`JAMAction=1` (CONTINUE), where `machine_jam` returns `JAM_NONE` with no
+`0x61` and the CPU spins at the KIL with the clock advancing — so that
+row never excluded this mechanism.
 
 Fix: the restore now goes through BASIC's warm-start vector — `CLI; JMP
-($A002)` → `$E37B` → `JSR $A67A` (`LDX #$FA; TXS`) rebuilds the stack.
+($A002)` → `$E37B` → `JSR $A67A` (`LDX #$19; STX $16; PLA; TAY; PLA; LDX
+#$FA; TXS; PHA; TYA; PHA; LDA #0; STA $3E; STA $10; RTS`: pops its own
+return, resets SP, pushes it back, resets the temp-string stack, disables
+CONT — no NEW/CLR, a loaded program survives) rebuilds the stack.
 Deterministic reproduction, not a rate: `tests/test_vice_core.py::
 TestRestoreBasicFromInterrupt` parks the CPU on `$EA86` with a checkpoint
 and calls `_restore_basic`; RED = CHRGET `… e9 30 38 …` → `… e9 22 22 …`

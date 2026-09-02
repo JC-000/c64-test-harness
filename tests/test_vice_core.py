@@ -353,8 +353,12 @@ def _restore_basic(transport):
 
     Writes ``CLI; JMP ($A002)`` to scratch memory, sets PC there, and
     resumes.  ($A002) is the BASIC warm start ($E37B): CLRCHN, then
-    ``JSR $A67A`` which does ``LDX #$FA; TXS`` and rebuilds the stack,
-    CLI, READY., and into INLIN -> CHRIN -> the idle loop at $E5CD.
+    ``JSR $A67A`` -- ``LDX #$19; STX $16; PLA; TAY; PLA; LDX #$FA; TXS;
+    PHA; TYA; PHA; LDA #0; STA $3E; STA $10; RTS`` -- which pops its own
+    return address, resets SP to $FA, pushes the return back, resets the
+    temporary-string stack and disables CONT (no NEW, no CLR: a loaded
+    program survives), then CLI, READY., and into INLIN -> CHRIN -> the
+    idle loop at $E5CD.
 
     It used to be ``CLI; JMP $E5CD`` -- straight into the idle loop, SP
     untouched.  That is issue #170.  $E5CD sits *inside* CHRIN's call
@@ -761,14 +765,26 @@ class TestRestoreBasicFromInterrupt:
     touching SP*.  $E5CD is inside CHRIN's call frame ($E632 pushes X and
     Y, then falls into the loop), so the next RETURN made CHRIN's exit
     ($E676 ``PLA;TAX;PLA;TAY;...;RTS``) pop the interrupt frame as its
-    saved registers and return address: X := P, and the RTS landed in
-    zero page at the screen line-link table ($00E6: ``86 86 86 86 86 86
-    86 87`` = ``STX $86`` x3, ``STX $87``), which overwrote CHRGET's
-    ``SBC #$30; SEC`` with the popped P ($22, a KIL opcode), then hit a
-    BRK -> warm start -> screen cleared -> READY. -- which satisfied the
-    fixture's own wait.  The test's first typed line then jammed the CPU
-    in CHRGET.  Every capture shape the issue lists (screen blank but for
-    READY., line echoed but never executed, PC in zero page) is this.
+    saved registers and return address: X := P ($22), and the RTS landed
+    in zero page at $00E6, the screen line-link table.  Disassembled from
+    the captured bytes (scripts/dis6502.py):
+    ``E6/E8/EA STX $86; EC STX $87; EE/F0 SAX $87; F2 SAX $00; F4 CLD;
+    F5 BRK``.  So $0086 := X = $22 and $0087 := A & X = $3A & $22 = $22
+    (A was the ':' CHRIN had just returned) -- CHRGET's ``SBC #$30; SEC``
+    became ``22 22``, and $22 is a KIL opcode.  ($F3, the colour-RAM
+    pointer low byte, was $00 with the cursor on line 0, so the SAX at
+    $F2 hit the 6510 DDR, which IOINIT rewrites during the warm start;
+    $F5/$F6 KEYTAB is $0000 on a VICE machine that never scanned a matrix
+    key, hence BRK at $F5 -- with KEYTAB set it is ``STA ($EB,X)`` and
+    BRK at $F7.)  BRK -> ($0316) = $FE66 -> CINT cleared the screen ->
+    READY., which satisfied the fixture's own wait; the test's first
+    typed line then jammed the CPU in CHRGET.  Of the shapes issue #170
+    lists, "screen blank but for READY." and "PC in zero page" follow
+    from this mechanism (the RTS lands at ((X<<8)|Y)+1 of the interrupted
+    code, or at (P<<8|A)+1 one frame deeper); the line-collision capture
+    is the false-completion wait already fixed; the $FF09 and $C6=3 /
+    empty-$0277 captures are consistent with a bogus RTS but were not
+    re-derived.
 
     The checkpoint below parks the CPU on the handler's RTI, which is the
     exact state the failing capture showed, and then asks the two
