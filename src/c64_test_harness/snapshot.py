@@ -761,9 +761,9 @@ def _restore_reu(transport: "C64Transport", snap: Snapshot) -> None:
         )
     client = getattr(transport, "client", None)
     if client is not None:
-        # Generation-aware enable: the C64U has no "REU" Cartridge preset
-        # (its Cartridge value mirrors REU state) — set_reu probes and
-        # writes only what the firmware accepts.
+        # Generation-aware enable: neither the C64U nor the U64E on fw 3.15
+        # has a "REU" Cartridge preset (only U64E 3.14 did) — set_reu
+        # probes and writes only what the firmware accepts.
         from .backends.ultimate64_helpers import set_reu
         from .backends.ultimate64_schema import reu_size_enum
 

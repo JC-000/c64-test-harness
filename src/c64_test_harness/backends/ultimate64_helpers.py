@@ -382,12 +382,18 @@ def _cartridge_preset_supported(
 ) -> bool | None:
     """Report whether *value* is a settable ``Cartridge`` preset on this device.
 
-    Cross-generation quirk: on the U64 Elite (firmware 3.14) the
-    ``Cartridge`` item exposes ``"REU"`` as a real preset, and writing it
-    is what exposes the REU to the C64. On the C64 Ultimate (firmware
-    1.1.0) the same item reports ``presets: [""]`` — ``"REU"`` is only a
-    *mirrored* display value, and PUTting it back is rejected with HTTP
-    400 ("not a valid choice"). This probe distinguishes the two.
+    Firmware quirk, three shapes. On the U64 Elite as of firmware **3.14**
+    the ``Cartridge`` item was an enum exposing ``"REU"`` as a real
+    preset, and writing it was what exposed the REU to the C64. U64E
+    firmware **3.15** replaced it with a ``.crt`` file chooser
+    (``CFG_TYPE_STRFUNC`` via ``C64::list_crts``,
+    ``software/io/c64/c64.cc:73``; ``presets: [""]`` with no ``.crt``
+    selected) and the REU is driven by ``RAM Expansion Unit`` /
+    ``REU Size`` alone (``c64.cc:315-316``). On the C64 Ultimate (firmware
+    1.1.0) the item also reports ``presets: [""]``; there ``"REU"`` is only
+    a *mirrored* display value, and PUTting it back is rejected with HTTP
+    400 ("not a valid choice"). This probe separates the 3.14 enum shape
+    from the other two.
 
     Live-verified response shape::
 
@@ -434,9 +440,14 @@ def set_reu(
     item and optionally sets ``REU Size``. Whether it *also* writes the
     ``Cartridge`` preset depends on the device generation:
 
-    - **U64 Elite (firmware 3.14):** the ``Cartridge`` item exposes
+    - **U64 Elite, firmware 3.14:** the ``Cartridge`` item exposes
       ``"REU"`` as a real preset, and writing it is REQUIRED — that is
       what actually exposes the expansion to the C64.
+    - **U64 Elite, firmware 3.15:** ``Cartridge`` is a ``.crt`` file
+      chooser (``presets: [""]``, no ``"REU"``); the ``RAM Expansion
+      Unit`` / ``REU Size`` writes alone enable and size the REU
+      (read-back live-verified, issue #168; bus exposure not separately
+      verified on 3.15).
     - **C64 Ultimate (firmware 1.1.0):** ``Cartridge`` reports
       ``presets: [""]``; ``"REU"`` is a mirrored display value only and
       PUTting it back is rejected with HTTP 400. Enabling the
@@ -1196,7 +1207,7 @@ def restore_state(client: Ultimate64Client, snap: U64StateSnapshot) -> None:
     restoring a non-empty cartridge value this checks
     :func:`_cartridge_preset_supported` and skips the write when the value
     is positively reported as unsupported; ``True`` or an inconclusive
-    ``None`` (legacy U64E behavior) still writes it.
+    ``None`` (the U64E 3.14 enum shape) still writes it.
 
     :param client: Connected Ultimate64 client.
     :param snap: Snapshot previously returned by :func:`snapshot_state`.
