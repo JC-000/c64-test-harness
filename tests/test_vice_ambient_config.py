@@ -91,7 +91,7 @@ AutostartWarp=0
 AutostartPrgMode=2
 Sound=1
 MachineVideoStandard=1
-JAMAction=0
+JAMAction=3
 Speed=50
 SoundEmulateOnWarp=0
 Drive8Type=1571
@@ -204,8 +204,11 @@ def test_default_neutralises_an_ambient_vicerc(tmp_path):
         "Sound": 0,
         # NTSC, from cfg.ntsc.
         "MachineVideoStandard": 2,
-        # Continue on a CPU jam; never open a dialog in a headless run.
-        "JAMAction": 1,
+        # DIALOG, deliberately not the factory CONTINUE: with the binary
+        # monitor connected VICE routes the "dialog" to the monitor, stops,
+        # and emits the 0x61 JAM event wait_for_stopped reports.  The
+        # contaminant says 3 (reset CPU), so this cannot pass by coincidence.
+        "JAMAction": 0,
         "Speed": 100,
         # Keep emulating the SID under warp, or render_wav() records
         # silence.
