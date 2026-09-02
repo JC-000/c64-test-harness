@@ -505,9 +505,9 @@ class ViceProcess:
         # monitor connected the "dialog" is routed to the monitor and
         # the machine stops, so wait_for_stopped can report the jam.
         # Under CONTINUE machine_jam returns JAM_NONE (S machine.c:145-150,
-        # actions[0] == -1, falling through to :163) and the core's JAM()
+        # actions[0] == -1, falling through to :162) and the core's JAM()
         # default branch is a bare CLK++ with no PC advance
-        # (S maincpu.c:606-628; opcode $02 reaches it via JAM_02(),
+        # (S maincpu.c:607-628; opcode $02 reaches it via JAM_02(),
         # 6510core.c:1242-1249): the 6510 halts in place, silently, and
         # that report is unreachable.
         #

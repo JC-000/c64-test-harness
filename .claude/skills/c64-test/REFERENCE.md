@@ -311,7 +311,7 @@ Key fields:
 ### `ViceConfig`
 Dataclass for VICE configuration. **Pass to `ViceInstanceManager`, not `ViceProcess` directly.**
 
-**Jams follow `monitor`.** With `monitor=True` (default; always under `ViceInstanceManager`) the harness emits `-jamaction 0`, VICE hands the jam to the binary monitor (S `machine.c:131-139`), the machine stops, and `wait_for_stopped()` raises `TransportError` naming the jammed PC. With `monitor=False` it emits `-jamaction 1`: `0` would open a blocking GTK jam dialog in a windowed VICE with no monitor client (S `machine.c:140`), and under `1` the 6510 halts silently in place — `JAM()` does `CLK++` and never advances the PC (S `maincpu.c:607-628`) — so a jam looks like a hang. Keep the monitor on if you need jams reported.
+**Jams follow `monitor`.** With `monitor=True` (default; `ViceInstanceManager` forwards its base config's value) the harness emits `-jamaction 0`; while a binary-monitor client is *connected* (S `monitor_binary.c:2110-2113`) VICE hands the jam to it (S `machine.c:131-139`), the machine stops, and `wait_for_stopped()` raises `TransportError` naming the jammed PC. With `monitor=False` it emits `-jamaction 1`: `0` would open a blocking GTK jam dialog in a windowed VICE with no monitor client (S `machine.c:140`), and under `1` the 6510 halts silently in place — `JAM()` does `CLK++` and never advances the PC (S `maincpu.c:607-628`) — so a jam looks like a hang. With `monitor=True` but no client connected, `console=True` halts silently and `console=False` opens the GTK dialog. Keep the monitor on and connected if you need jams reported.
 ```python
 ViceConfig(
     executable="x64sc",
