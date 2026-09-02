@@ -653,6 +653,89 @@ class TestKeyboard:
 
 
 # ======================================================================
+# _restore_basic must rebuild the stack, not inherit it (issue #170)
+# ======================================================================
+
+#: The KERNAL IRQ handler's ``RTI`` (S kernal $EA86).  A monitor pause
+#: landing here leaves the interrupt frame (P, PCL, PCH) on the stack.
+_IRQ_RTI = 0xEA86
+#: CHRGET lives at $0073-$008A; $007A-$007B is its self-modified pointer.
+_CHRGET, _CHRGET_LEN = 0x0073, 0x18
+_CHRGET_PTR = slice(0x007A - _CHRGET, 0x007C - _CHRGET)
+
+
+def _chrget_constant_bytes(transport) -> bytes:
+    """CHRGET as it stands, with the variable pointer masked out."""
+    code = bytearray(transport.read_memory(_CHRGET, _CHRGET_LEN))
+    code[_CHRGET_PTR] = b"\x00\x00"
+    return bytes(code)
+
+
+class TestRestoreBasicFromInterrupt:
+    """``_restore_basic`` called while the 6510 is inside the IRQ handler.
+
+    This is the mechanism behind issue #170, reproduced deterministically
+    instead of at a flake rate.  The monitor pauses the CPU wherever the
+    per-frame poll (S ``monitor.c:407``, from ``monitor_vsync_hook``)
+    happens to catch it; a few percent of the time that is inside the
+    KERNAL IRQ handler, with its interrupt frame still on the stack.  The
+    original restore then set PC to the idle loop at $E5CD *without
+    touching SP*.  $E5CD is inside CHRIN's call frame ($E632 pushes X and
+    Y, then falls into the loop), so the next RETURN made CHRIN's exit
+    ($E676 ``PLA;TAX;PLA;TAY;...;RTS``) pop the interrupt frame as its
+    saved registers and return address: X := P, and the RTS landed in
+    zero page at the screen line-link table ($00E6: ``86 86 86 86 86 86
+    86 87`` = ``STX $86`` x3, ``STX $87``), which overwrote CHRGET's
+    ``SBC #$30; SEC`` with the popped P ($22, a KIL opcode), then hit a
+    BRK -> warm start -> screen cleared -> READY. -- which satisfied the
+    fixture's own wait.  The test's first typed line then jammed the CPU
+    in CHRGET.  Every capture shape the issue lists (screen blank but for
+    READY., line echoed but never executed, PC in zero page) is this.
+
+    The checkpoint below parks the CPU on the handler's RTI, which is the
+    exact state the failing capture showed, and then asks the two
+    questions that failed there: is CHRGET intact, and does BASIC run
+    the next line.
+    """
+
+    def test_restore_from_irq_handler_leaves_basic_usable(self, binary_transport) -> None:
+        t = binary_transport
+        _restore_basic(t)
+        chrget = _chrget_constant_bytes(t)
+
+        # Park the CPU on the IRQ handler's RTI: interrupt frame on stack.
+        bp = t.set_checkpoint(_IRQ_RTI)
+        try:
+            t.resume()
+            pc = t.wait_for_stopped(timeout=15)
+        finally:
+            t.delete_checkpoint(bp)
+        assert pc == _IRQ_RTI, f"checkpoint stopped at {pc:#06x}, not the RTI"
+        regs = t.read_registers()
+        frame = t.read_memory(0x0100 + regs["SP"] + 1, 3)
+        assert frame[1] | (frame[2] << 8) >= 0xA000, (
+            f"expected an interrupt frame returning into ROM above SP, got "
+            f"{frame.hex(' ')} at SP={regs['SP']:#04x}"
+        )
+
+        _restore_basic(t)  # <- under test: called with that frame on the stack
+
+        after = _chrget_constant_bytes(t)
+        assert after == chrget, (
+            f"CHRGET was corrupted by _restore_basic's re-entry:\n"
+            f"  before {chrget.hex(' ')}\n  after  {after.hex(' ')}\n"
+            "the restore inherited the interrupted IRQ handler's stack "
+            "frame, and the next RETURN returned into zero page.\n"
+            + _machine_failure_report(t, "an intact CHRGET")
+        )
+        _assert_needle_absent(t, "42")
+        send_text(t, "PRINT 6*7\r")
+        t.resume()
+        grid = _wait_for_text_binary(t, "42", timeout=15)
+        assert grid is not None, _machine_failure_report(t, "42")
+
+
+# ======================================================================
 # wait_for_pc timeout (no longer needs to be last -- resume is safe)
 # ======================================================================
 
