@@ -284,7 +284,7 @@ JAMAction resource: 1 (continue)
 
 > `JAMAction=1` was the harness pin when this was captured. The pin has
 > since moved to `0` (DIALOG): VICE emits the `0x61` JAM event only under
-> JAMAction 0 with the binary monitor connected (S `machine.c:130-138`),
+> JAMAction 0 with the binary monitor connected (S `machine.c:131-139`),
 > so a jam now stops the machine and is reported by `wait_for_stopped`
 > instead of continuing silently. The dump above is as captured.
 
@@ -475,7 +475,7 @@ header will block on (or misattribute) the next frame's bytes. A client
 that trusts the header sees an empty body and has no PC.
 
 The event is only emitted under `JAMAction=0` with the binary monitor
-connected (S `machine.c:130-138`), which is why the harness pins that
+connected (S `machine.c:131-139`), which is why the harness pins that
 value — see the note under bug 6.
 
 **Harness mitigation: yes.** `BinaryViceTransport._jam_message(frame)`
