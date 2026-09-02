@@ -437,6 +437,58 @@ one.
 
 ---
 
+## 7. Binary-monitor JAM response (`0x61`) documents a PC body it never sends
+
+The manual documents the JAM event with a body. `doc/vice.texi`,
+§ "JAM Response (0x61)" (`@subsection JAM Response (0x61)`, :23362):
+
+```
+Response body:
+    PC PC
+PC: 2 bytes: The current program counter position
+```
+
+The implementation computes that body and then transmits zero bytes of
+it. `monitor_binary.c:382-392`, `monitor_binary_ui_jam_dialog()`:
+
+```c
+unsigned char response[2];
+uint16_t addr = ... mon_register_get_val(e_comp_space, e_PC);
+write_uint16(addr, response);                                   /* :387 — body filled */
+monitor_binary_response(0, e_MON_RESPONSE_JAM, e_MON_ERR_OK,    /* :389 — length 0 */
+                        MON_EVENT_ID, response);
+```
+
+The first argument of `monitor_binary_response()` is `length`
+(`:339-355`): it is written into the header at `:345` and is the byte
+count handed to `monitor_binary_transmit(body, length)` at `:353`. The
+two sibling events that carry the same body pass `2` —
+`monitor_binary_response_stopped()` at `:369` and
+`monitor_binary_response_resumed()` at `:379`. So a STOPPED or RESUMED
+frame carries the PC and a JAM frame carries a header announcing length
+0 followed by nothing: documented body, computed body, never sent.
+
+**Observed:** read off the source, on both the bottle and the local build
+(same `monitor_binary.c`); the wire frame was not captured on this bench.
+A client that trusts the manual and reads two body bytes after the JAM
+header will block on (or misattribute) the next frame's bytes. A client
+that trusts the header sees an empty body and has no PC.
+
+The event is only emitted under `JAMAction=0` with the binary monitor
+connected (S `machine.c:130-138`), which is why the harness pins that
+value — see the note under bug 6.
+
+**Harness mitigation: yes.** `BinaryViceTransport._jam_message(frame)`
+(`src/c64_test_harness/backends/vice_binary.py`, commit `6579585`) parses
+the PC from the body when the frame carries two or more bytes — so a
+build that fixes this is used as documented — and otherwise falls back to
+a `REGISTERS_GET` read. The fallback is issued after the transport lock is
+released, because it goes through `_send_and_recv`, which takes that
+same non-reentrant lock; raising from inside the receive loop deadlocked
+the transport. Not reported upstream, like the others.
+
+---
+
 ## Reproducer for bugs 3 and 4
 
 Self-contained; takes about 40 seconds. Pass the `x64sc` to test.
