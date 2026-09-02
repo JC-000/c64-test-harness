@@ -5,9 +5,14 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import subprocess
+import sys
 import time
+from functools import lru_cache
 
 import pytest
+
+pytest_plugins = ["pytester"]
 
 from c64_test_harness.backends.device_lock import DeviceLock
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
@@ -494,19 +499,268 @@ def require_vice_or_skip() -> None:
     pytest.skip(reason)
 
 
+# ---------------------------------------------------------------------------
+# The elevation marker (``elevation(kind, **kwargs)``) and its gate
+# ---------------------------------------------------------------------------
+#
+# Ten live test files each grew their own ad hoc ``skipif`` for one of
+# four elevated prerequisites: (a) ``vice_root`` -- a NOPASSWD sudoers
+# rule for the exact x64sc path VICE's ethernet driver needs root for;
+# (b) ``bridge_scripts`` -- NOPASSWD rules for the bridge lifecycle
+# scripts; (c) ``bpf_nodes`` -- a world-rw ``/dev/bpf*`` node for
+# host-side capture; (d) ``bridge_iface`` -- the bridge interface(s)
+# present and up.  On a bench missing one, the affected tests silently
+# skip and the reason is visible only under ``-rs``.
+#
+# ``@pytest.mark.elevation(kind, **kwargs)`` replaces the ad hoc copies
+# with one probe per (kind, kwargs), evaluated at most once per session
+# (``check_elevation`` caches on it), and a session-end notice that
+# always prints -- no ``-rs`` required -- naming the remedy verbatim.
+# The kwargs let a test override what the default probe checks (a
+# specific binary path, a specific interface set) while still sharing
+# the one cache and the one notice.
+#
+# ``C64_REQUIRE_ELEVATION=1`` mirrors ``C64_REQUIRE_VICE`` above: a
+# missing prerequisite becomes a hard failure at setup instead of a
+# skip, and a green exit status is escalated 0 -> 1 (never masking
+# INTERRUPTED=2 or INTERNAL_ERROR=3 -- the same rule the VICE gate
+# follows, for the same reason: a worse status is already saying
+# something this gate must not paper over).
+
+ELEVATION_MARKER = "elevation"
+REQUIRE_ELEVATION_ENV = "C64_REQUIRE_ELEVATION"
+
+#: ``(nodeid, kind, remedy)`` for every test the gate skipped or failed
+#: this session -- read by the end-of-session notice.
+_elevation_skips: list[tuple[str, str, str]] = []
+
+#: One probe result per ``(kind, sorted(kwargs.items()))`` -- a probe
+#: never runs twice for the same question in one session.
+_elevation_cache: dict[tuple, tuple[bool, str]] = {}
+
+
+def elevation_is_required() -> bool:
+    """Whether the operator has declared every elevated prerequisite
+    must already be satisfied on this bench."""
+    return os.environ.get(REQUIRE_ELEVATION_ENV, "").strip().lower() in _TRUTHY
+
+
+def _resolve_ethernet_binary() -> str:
+    from c64_test_harness.backends.vice_lifecycle import ethernet_vice_binary
+    return ethernet_vice_binary() or shutil.which("x64sc") or "x64sc"
+
+
+@lru_cache(maxsize=1)
+def _canonical_repo_root() -> str:
+    """The main (non-worktree) checkout's absolute path.
+
+    The sudo'd bridge lifecycle scripts are allowlisted -- and any
+    NOPASSWD sudoers rule is written -- against this path, never a
+    worktree's copy under ``.claude/worktrees/agent-*`` (see CLAUDE.md
+    "Permission notes for agents"). ``git worktree list``'s first row is
+    always the main worktree, regardless of which worktree this process
+    happens to be running from.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return os.getcwd()
+    for line in (out.stdout or "").splitlines():
+        if line.startswith("worktree "):
+            return line[len("worktree "):].strip()
+    return os.getcwd()
+
+
+def _probe_vice_root(binary: str | None = None) -> tuple[bool, str]:
+    """(a): a NOPASSWD sudoers rule for the exact x64sc path.
+
+    *binary* overrides the default resolved ethernet binary -- for a
+    test that needs a specific bench binary (e.g. the Homebrew path on
+    macOS) rather than whatever ``ethernet_vice_binary()``/PATH resolve
+    to here.
+    """
+    from c64_test_harness.backends.vice_elevation import (
+        _sudoers_entry,
+        launch_path,
+        rawnet_capability,
+        sudo_can_run,
+    )
+    if rawnet_capability():
+        return True, ""
+    resolved = launch_path(binary or _resolve_ethernet_binary())
+    if binary is not None and not os.path.exists(resolved):
+        return False, f"{resolved} not found on this host"
+    if sudo_can_run(resolved):
+        return True, ""
+    entry = _sudoers_entry(resolved)
+    return False, (
+        f"'sudo -n' is not authorised for {resolved}. Add to sudoers "
+        f"(visudo; the rule must name this exact path and must not be "
+        f"bash-wrapped):\n    {entry}"
+    )
+
+
+#: Canonical bridge-lifecycle scripts per platform (see docs/development.md
+#: "Passwordless sudo").  ``bridge_iface``'s ``SETUP_HINT`` names only one
+#: of these; this is the full NOPASSWD set the harness actually drives.
+_BRIDGE_SCRIPT_SETS = {
+    "darwin": (
+        "setup-bridge-feth-macos.sh",
+        "teardown-bridge-feth-macos.sh",
+        "cleanup-bridge-feth-macos.sh",
+    ),
+    "linux": (
+        "setup-bridge-tap.sh",
+        "teardown-bridge-tap.sh",
+        "cleanup-bridge-networking.sh",
+    ),
+}
+
+
+def _probe_bridge_scripts(scripts: tuple[str, ...] | None = None) -> tuple[bool, str]:
+    """(b): NOPASSWD rules for the bridge lifecycle scripts.
+
+    Probed at their canonical repo path -- never a worktree's -- because
+    that is the only path a NOPASSWD rule can be written against (see
+    CLAUDE.md "Permission notes for agents").
+    """
+    from c64_test_harness.backends.vice_elevation import _sudoers_entry, sudo_can_run
+    names = scripts or _BRIDGE_SCRIPT_SETS.get(sys.platform, _BRIDGE_SCRIPT_SETS["linux"])
+    root = _canonical_repo_root()
+    paths = [os.path.join(root, "scripts", name) for name in names]
+    missing = [p for p in paths if not sudo_can_run(p)]
+    if not missing:
+        return True, ""
+    lines = "\n".join(f"    {_sudoers_entry(p)}" for p in missing)
+    return False, (
+        f"'sudo -n' is not authorised for: {', '.join(missing)}. Add to "
+        f"sudoers (visudo; each rule must name its exact path and must "
+        f"not be bash-wrapped):\n{lines}"
+    )
+
+
+def _probe_bpf_nodes() -> tuple[bool, str]:
+    """(c): a world-rw ``/dev/bpf*`` node for host-side capture.
+
+    Opens -- and immediately closes -- at most one node, matching the
+    same node the real capture path would take.  A no-op (satisfied) on
+    every non-Darwin platform, where this prerequisite does not exist.
+    """
+    if sys.platform != "darwin":
+        return True, ""
+    from c64_test_harness.capture import CaptureUnavailable, _close_node, _open_first_bpf
+    try:
+        fd, _path = _open_first_bpf()
+    except CaptureUnavailable as e:
+        return False, e.remedy or str(e)
+    _close_node(fd)
+    return True, ""
+
+
+def _probe_bridge_iface(ifaces: tuple[str, ...] | None = None) -> tuple[bool, str]:
+    """(d): the bridge interface(s) present and up.
+
+    Defaults to the platform's full pair-plus-bridge
+    (``IFACE_A``, ``IFACE_B``, ``BRIDGE_NAME``); *ifaces* overrides it
+    for a test that only depends on a subset.
+    """
+    import bridge_platform as bp
+    names = ifaces or (bp.IFACE_A, bp.IFACE_B, bp.BRIDGE_NAME)
+    missing = [n for n in names if not bp.iface_present(n)]
+    if not missing:
+        return True, ""
+    return False, f"{', '.join(missing)} not found ({bp.SETUP_HINT})"
+
+
+_ELEVATION_PROBES = {
+    "vice_root": _probe_vice_root,
+    "bridge_scripts": _probe_bridge_scripts,
+    "bpf_nodes": _probe_bpf_nodes,
+    "bridge_iface": _probe_bridge_iface,
+}
+
+
+def check_elevation(kind: str, **kwargs) -> tuple[bool, str]:
+    """Probe *kind* at most once per session; returns ``(ok, remedy)``."""
+    probe = _ELEVATION_PROBES.get(kind)
+    if probe is None:
+        raise ValueError(
+            f"unknown elevation kind {kind!r}; expected one of "
+            f"{sorted(_ELEVATION_PROBES)}"
+        )
+    key = (kind, tuple(sorted(kwargs.items())))
+    if key not in _elevation_cache:
+        _elevation_cache[key] = probe(**kwargs)
+    return _elevation_cache[key]
+
+
+def gate_elevation(nodeid: str, kind: str, remedy: str) -> None:
+    """Skip *nodeid* -- or fail it, under ``C64_REQUIRE_ELEVATION=1`` --
+    for a missing *kind* prerequisite, and record it for the
+    end-of-session notice.  *remedy* is shown verbatim: it must already
+    be the exact command the operator needs, not a paraphrase.
+    """
+    _elevation_skips.append((nodeid, kind, remedy))
+    text = f"elevation required ({kind}): {remedy}"
+    if elevation_is_required():
+        pytest.fail(text, pytrace=False)
+    pytest.skip(text)
+
+
+def start_vice_or_skip(config, nodeid: str) -> ViceProcess:
+    """Start a :class:`ViceProcess`, converting a mid-launch
+    :class:`~c64_test_harness.backends.vice_elevation.ViceElevationRequiredError`
+    into the same skip-or-fail + record the ``elevation("vice_root")``
+    marker uses.
+
+    Shared by every module-scoped ethernet fixture that launches VICE
+    with ``ethernet=True`` (this module's ``bridge_vice_pair``,
+    ``test_ethernet.py``'s ``vice_ethernet``,
+    ``test_ethernet_bridge.py``'s ``vice_bridge_pair``): a bypassed
+    preflight probe (``MACOS_PCAP_ENABLED=1``) means
+    ``ViceProcess.start()`` itself is the last line of defence and can
+    still refuse mid-fixture.
+    """
+    from c64_test_harness.backends.vice_elevation import ViceElevationRequiredError
+    vice = ViceProcess(config)
+    try:
+        vice.start()
+    except ViceElevationRequiredError as exc:
+        gate_elevation(nodeid, "vice_root", str(exc))
+    return vice
+
+
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         f"{VICE_LIVE_MARKER}: needs a real x64sc; gated by ${REQUIRE_VICE_ENV}",
     )
+    config.addinivalue_line(
+        "markers",
+        f"{ELEVATION_MARKER}(kind, **kwargs): needs an elevated prerequisite "
+        f"({', '.join(sorted(_ELEVATION_PROBES))}); gated by "
+        f"${REQUIRE_ELEVATION_ENV}",
+    )
 
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item):
-    """Enforce the gate before pytest's own skipif evaluation."""
-    if item.get_closest_marker(VICE_LIVE_MARKER) is None:
-        return
-    require_vice_or_skip()
+    """Enforce the VICE and elevation gates before pytest's own skipif."""
+    if item.get_closest_marker(VICE_LIVE_MARKER) is not None:
+        require_vice_or_skip()
+    for marker in item.iter_markers(ELEVATION_MARKER):
+        if not marker.args:
+            raise TypeError(
+                f"{item.nodeid}: @pytest.mark.elevation(...) needs a kind "
+                f"as its first positional argument"
+            )
+        kind, kwargs = marker.args[0], dict(marker.kwargs)
+        ok, remedy = check_elevation(kind, **kwargs)
+        if not ok:
+            gate_elevation(item.nodeid, kind, remedy)
 
 
 def pytest_runtest_logreport(report):
@@ -524,6 +778,36 @@ def pytest_runtest_logreport(report):
         and VICE_LIVE_MARKER in getattr(report, "keywords", {})
     ):
         _vice_live_ran += 1
+
+
+def _elevation_group() -> dict[tuple[str, str], int]:
+    """(kind, remedy) -> count, for the notice below."""
+    counts: dict[tuple[str, str], int] = {}
+    for _nodeid, kind, remedy in _elevation_skips:
+        counts[(kind, remedy)] = counts.get((kind, remedy), 0) + 1
+    return counts
+
+
+def _elevation_sessionfinish(session, exitstatus) -> None:
+    """Print the elevation notice and, if required, escalate the exit
+    status -- unconditionally, unlike the VICE gate below: this fires
+    whenever anything was skipped for elevation this session, not only
+    when nothing at all ran.
+    """
+    if not _elevation_skips:
+        return
+    if elevation_is_required() and session.exitstatus == 0:
+        session.exitstatus = 1
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is None:
+        return
+    reporter.write_sep(
+        "=",
+        f"ELEVATION REQUIRED: {len(_elevation_skips)} test(s) skipped",
+        red=True,
+    )
+    for (kind, remedy), count in sorted(_elevation_group().items()):
+        reporter.write_line(f"[{kind}] {count} test(s): {remedy}")
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -552,6 +836,7 @@ def pytest_sessionfinish(session, exitstatus):
     only version that cannot be opted out of by an argument list, which
     is the property being bought.
     """
+    _elevation_sessionfinish(session, exitstatus)
     if not vice_is_required() or _vice_live_ran:
         return
     # A run that collected nothing at all has a different problem (an

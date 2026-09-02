@@ -1,0 +1,445 @@
+"""The ``elevation(kind, ...)`` marker and its gate in ``tests/conftest.py``.
+
+Ten live test files each grew their own ad hoc ``skipif`` for one of four
+elevated prerequisites (a NOPASSWD sudoers rule for the exact x64sc path,
+NOPASSWD rules for the bridge lifecycle scripts, world-rw ``/dev/bpf*``
+nodes, or the bridge interface being up).  On a bench missing one, the
+affected tests silently skip and the reason is visible only under
+``-rs``.  ``@pytest.mark.elevation(kind)`` replaces the ad hoc copies
+with one probe per kind, evaluated once per session (cached), and a
+session-end notice that always prints, naming the remedy verbatim.
+
+Most of these tests drive the conftest hook functions directly with fake
+item/session objects, matching ``tests/test_vice_live_gate.py``'s style.
+A handful use ``pytester`` (enabled via ``pytest_plugins`` in conftest)
+for end-to-end proof that a marked test really does skip through the
+full pytest machinery, and that the session-end notice really is what
+prints to the terminal.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+import conftest
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+class _FakeMarker:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+
+class _FakeItem:
+    def __init__(self, nodeid, markers=(), vice_live=False):
+        self.nodeid = nodeid
+        self._markers = list(markers)
+        self._vice_live = vice_live
+
+    def get_closest_marker(self, name):
+        if name == conftest.VICE_LIVE_MARKER and self._vice_live:
+            return object()
+        return None
+
+    def iter_markers(self, name):
+        if name == conftest.ELEVATION_MARKER:
+            return iter(self._markers)
+        return iter(())
+
+
+def _session(*, exitstatus: int = 0, reporter=None):
+    pm = SimpleNamespace(get_plugin=lambda name: reporter)
+    return SimpleNamespace(exitstatus=exitstatus, config=SimpleNamespace(pluginmanager=pm))
+
+
+class _FakeReporter:
+    def __init__(self):
+        self.seps: list[tuple] = []
+        self.lines: list[str] = []
+
+    def write_sep(self, sep, title, **kwargs):
+        self.seps.append((sep, title, kwargs))
+
+    def write_line(self, line):
+        self.lines.append(line)
+
+
+@pytest.fixture(autouse=True)
+def fresh_elevation_state(monkeypatch):
+    """Every test in this module gets a clean slate: the record list and
+    the probe cache are both module-global and would otherwise leak
+    between tests (and between this file and a real live run)."""
+    monkeypatch.setattr(conftest, "_elevation_skips", [])
+    monkeypatch.setattr(conftest, "_elevation_cache", {})
+    monkeypatch.delenv(conftest.REQUIRE_ELEVATION_ENV, raising=False)
+    yield
+
+
+# ---------------------------------------------------------------------------
+# Marker registration
+# ---------------------------------------------------------------------------
+
+
+def test_marker_is_registered_next_to_vice_live():
+    config = SimpleNamespace(_lines=[])
+
+    def addinivalue_line(section, line):
+        assert section == "markers"
+        config._lines.append(line)
+
+    config.addinivalue_line = addinivalue_line
+    conftest.pytest_configure(config)
+    joined = "\n".join(config._lines)
+    assert conftest.ELEVATION_MARKER in joined
+    assert conftest.VICE_LIVE_MARKER in joined
+
+
+# ---------------------------------------------------------------------------
+# check_elevation: cache, at most once per session
+# ---------------------------------------------------------------------------
+
+
+def test_check_elevation_calls_the_probe_at_most_once(monkeypatch):
+    calls = []
+
+    def fake_probe(**kwargs):
+        calls.append(kwargs)
+        return False, "fix it"
+
+    monkeypatch.setitem(conftest._ELEVATION_PROBES, "vice_root", fake_probe)
+    conftest.check_elevation("vice_root")
+    conftest.check_elevation("vice_root")
+    conftest.check_elevation("vice_root")
+    assert len(calls) == 1
+
+
+def test_check_elevation_caches_per_distinct_kwargs(monkeypatch):
+    calls = []
+
+    def fake_probe(**kwargs):
+        calls.append(kwargs)
+        return False, "fix it"
+
+    monkeypatch.setitem(conftest._ELEVATION_PROBES, "vice_root", fake_probe)
+    conftest.check_elevation("vice_root", binary="/a/x64sc")
+    conftest.check_elevation("vice_root", binary="/a/x64sc")
+    conftest.check_elevation("vice_root", binary="/b/x64sc")
+    assert len(calls) == 2
+
+
+def test_check_elevation_returns_the_probe_result(monkeypatch):
+    monkeypatch.setitem(
+        conftest._ELEVATION_PROBES, "vice_root", lambda **k: (True, "")
+    )
+    assert conftest.check_elevation("vice_root") == (True, "")
+
+
+def test_check_elevation_rejects_an_unknown_kind():
+    with pytest.raises(ValueError):
+        conftest.check_elevation("not_a_real_kind")
+
+
+# ---------------------------------------------------------------------------
+# gate_elevation: skip-or-fail + record
+# ---------------------------------------------------------------------------
+
+
+def test_gate_elevation_skips_with_the_remedy_text():
+    with pytest.raises(pytest.skip.Exception) as excinfo:
+        conftest.gate_elevation("t::test_x", "vice_root", "sudo -n /x64sc ...")
+    assert "sudo -n /x64sc ..." in str(excinfo.value)
+
+
+def test_gate_elevation_records_the_skip():
+    with pytest.raises(pytest.skip.Exception):
+        conftest.gate_elevation("t::test_x", "vice_root", "the remedy")
+    assert conftest._elevation_skips == [("t::test_x", "vice_root", "the remedy")]
+
+
+def test_gate_elevation_fails_instead_when_required(monkeypatch):
+    monkeypatch.setenv(conftest.REQUIRE_ELEVATION_ENV, "1")
+    with pytest.raises(pytest.fail.Exception) as excinfo:
+        conftest.gate_elevation("t::test_x", "vice_root", "the remedy")
+    assert "the remedy" in str(excinfo.value)
+
+
+def test_gate_elevation_records_even_when_required(monkeypatch):
+    monkeypatch.setenv(conftest.REQUIRE_ELEVATION_ENV, "1")
+    with pytest.raises(pytest.fail.Exception):
+        conftest.gate_elevation("t::test_x", "vice_root", "the remedy")
+    assert conftest._elevation_skips == [("t::test_x", "vice_root", "the remedy")]
+
+
+# ---------------------------------------------------------------------------
+# pytest_runtest_setup: marked test, prerequisite missing / present
+# ---------------------------------------------------------------------------
+
+
+def test_setup_skips_a_marked_test_on_a_missing_prerequisite(monkeypatch):
+    monkeypatch.setitem(
+        conftest._ELEVATION_PROBES, "vice_root", lambda **k: (False, "run sudo -n x64sc")
+    )
+    item = _FakeItem("t::test_x", markers=[_FakeMarker("vice_root")])
+    with pytest.raises(pytest.skip.Exception) as excinfo:
+        conftest.pytest_runtest_setup(item)
+    assert "run sudo -n x64sc" in str(excinfo.value)
+    assert conftest._elevation_skips == [("t::test_x", "vice_root", "run sudo -n x64sc")]
+
+
+def test_setup_does_not_skip_when_the_prerequisite_is_present(monkeypatch):
+    monkeypatch.setitem(conftest._ELEVATION_PROBES, "vice_root", lambda **k: (True, ""))
+    item = _FakeItem("t::test_x", markers=[_FakeMarker("vice_root")])
+    conftest.pytest_runtest_setup(item)  # must not raise
+    assert conftest._elevation_skips == []
+
+
+def test_setup_passes_marker_kwargs_to_the_probe(monkeypatch):
+    seen = {}
+
+    def fake_probe(**kwargs):
+        seen.update(kwargs)
+        return True, ""
+
+    monkeypatch.setitem(conftest._ELEVATION_PROBES, "bridge_iface", fake_probe)
+    item = _FakeItem(
+        "t::test_x", markers=[_FakeMarker("bridge_iface", ifaces=("feth0", "feth1"))]
+    )
+    conftest.pytest_runtest_setup(item)
+    assert seen == {"ifaces": ("feth0", "feth1")}
+
+
+# ---------------------------------------------------------------------------
+# The end-of-session notice
+# ---------------------------------------------------------------------------
+
+
+def test_notice_prints_without_dash_r_s(monkeypatch):
+    monkeypatch.setattr(
+        conftest, "_elevation_skips", [("t::test_x", "vice_root", "the remedy")]
+    )
+    reporter = _FakeReporter()
+    session = _session(reporter=reporter)
+    conftest.pytest_sessionfinish(session, 0)
+    assert any("ELEVATION REQUIRED" in title for _, title, _ in reporter.seps)
+    assert any("1 test(s)" in title for _, title, _ in reporter.seps)
+    assert any("the remedy" in line for line in reporter.lines)
+    assert any("vice_root" in line for line in reporter.lines)
+
+
+def test_notice_groups_by_kind_and_counts(monkeypatch):
+    monkeypatch.setattr(
+        conftest,
+        "_elevation_skips",
+        [
+            ("t::a", "vice_root", "fix a"),
+            ("t::b", "vice_root", "fix a"),
+            ("t::c", "bpf_nodes", "fix c"),
+        ],
+    )
+    reporter = _FakeReporter()
+    session = _session(reporter=reporter)
+    conftest.pytest_sessionfinish(session, 0)
+    vice_lines = [l for l in reporter.lines if "vice_root" in l]
+    bpf_lines = [l for l in reporter.lines if "bpf_nodes" in l]
+    assert len(vice_lines) == 1 and "2 test(s)" in vice_lines[0]
+    assert len(bpf_lines) == 1 and "1 test(s)" in bpf_lines[0]
+
+
+def test_no_notice_when_nothing_was_skipped_for_elevation():
+    reporter = _FakeReporter()
+    session = _session(reporter=reporter)
+    conftest.pytest_sessionfinish(session, 0)
+    assert reporter.seps == []
+    assert reporter.lines == []
+
+
+# ---------------------------------------------------------------------------
+# C64_REQUIRE_ELEVATION exit-status escalation
+# ---------------------------------------------------------------------------
+
+
+def test_required_escalates_a_green_exit_status(monkeypatch):
+    monkeypatch.setenv(conftest.REQUIRE_ELEVATION_ENV, "1")
+    monkeypatch.setattr(
+        conftest, "_elevation_skips", [("t::test_x", "vice_root", "the remedy")]
+    )
+    session = _session(exitstatus=0)
+    conftest.pytest_sessionfinish(session, 0)
+    assert session.exitstatus == 1
+
+
+@pytest.mark.parametrize("status", [2, 3], ids=["INTERRUPTED", "INTERNAL_ERROR"])
+def test_required_does_not_mask_a_worse_status(monkeypatch, status):
+    monkeypatch.setenv(conftest.REQUIRE_ELEVATION_ENV, "1")
+    monkeypatch.setattr(
+        conftest, "_elevation_skips", [("t::test_x", "vice_root", "the remedy")]
+    )
+    session = _session(exitstatus=status)
+    conftest.pytest_sessionfinish(session, status)
+    assert session.exitstatus == status
+
+
+def test_not_required_leaves_a_green_status_alone(monkeypatch):
+    monkeypatch.setattr(
+        conftest, "_elevation_skips", [("t::test_x", "vice_root", "the remedy")]
+    )
+    session = _session(exitstatus=0)
+    conftest.pytest_sessionfinish(session, 0)
+    assert session.exitstatus == 0
+
+
+# ---------------------------------------------------------------------------
+# Mid-fixture refusal: ViceElevationRequiredError -> the same skip/fail
+# ---------------------------------------------------------------------------
+
+
+def test_start_vice_or_skip_converts_the_refusal(monkeypatch):
+    from c64_test_harness.backends.vice_elevation import ViceElevationRequiredError
+
+    class _RefusingViceProcess:
+        def __init__(self, config):
+            pass
+
+        def start(self):
+            raise ViceElevationRequiredError(
+                "need root", argv=["sudo", "x64sc"], binary="/x64sc",
+                sudoers_entry="me ALL=(root) NOPASSWD: /x64sc",
+            )
+
+    monkeypatch.setattr(conftest, "ViceProcess", _RefusingViceProcess)
+    with pytest.raises(pytest.skip.Exception) as excinfo:
+        conftest.start_vice_or_skip(object(), "t::test_x")
+    assert "need root" in str(excinfo.value)
+    assert conftest._elevation_skips == [
+        ("t::test_x", "vice_root", str(
+            ViceElevationRequiredError(
+                "need root", argv=["sudo", "x64sc"], binary="/x64sc",
+                sudoers_entry="me ALL=(root) NOPASSWD: /x64sc",
+            )
+        )),
+    ]
+
+
+def test_start_vice_or_skip_fails_instead_when_required(monkeypatch):
+    from c64_test_harness.backends.vice_elevation import ViceElevationRequiredError
+
+    monkeypatch.setenv(conftest.REQUIRE_ELEVATION_ENV, "1")
+
+    class _RefusingViceProcess:
+        def __init__(self, config):
+            pass
+
+        def start(self):
+            raise ViceElevationRequiredError(
+                "need root", argv=["sudo", "x64sc"], binary="/x64sc",
+                sudoers_entry="me ALL=(root) NOPASSWD: /x64sc",
+            )
+
+    monkeypatch.setattr(conftest, "ViceProcess", _RefusingViceProcess)
+    with pytest.raises(pytest.fail.Exception):
+        conftest.start_vice_or_skip(object(), "t::test_x")
+
+
+def test_start_vice_or_skip_returns_the_process_when_it_starts(monkeypatch):
+    started = []
+
+    class _OkViceProcess:
+        def __init__(self, config):
+            self.config = config
+
+        def start(self):
+            started.append(self.config)
+
+    monkeypatch.setattr(conftest, "ViceProcess", _OkViceProcess)
+    vice = conftest.start_vice_or_skip("cfg", "t::test_x")
+    assert started == ["cfg"]
+    assert isinstance(vice, _OkViceProcess)
+    assert conftest._elevation_skips == []
+
+
+# ---------------------------------------------------------------------------
+# End-to-end, through real pytest collection (pytester)
+# ---------------------------------------------------------------------------
+
+
+def test_e2e_marked_test_skips_with_remedy_and_records(pytester):
+    pytester.makeconftest(
+        """
+        import pytest
+
+        def pytest_configure(config):
+            config.addinivalue_line("markers", "elevation(kind, **kw): test")
+
+        _PROBES = {"vice_root": lambda **k: (False, "THE REMEDY TEXT")}
+
+        @pytest.hookimpl(tryfirst=True)
+        def pytest_runtest_setup(item):
+            for marker in item.iter_markers("elevation"):
+                ok, remedy = _PROBES[marker.args[0]]()
+                if not ok:
+                    pytest.skip(f"elevation required ({marker.args[0]}): {remedy}")
+        """
+    )
+    pytester.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.elevation("vice_root")
+        def test_needs_root():
+            assert False, "must not run"
+        """
+    )
+    result = pytester.runpytest("-rs")
+    result.assert_outcomes(skipped=1)
+    result.stdout.fnmatch_lines(["*THE REMEDY TEXT*"])
+
+
+def test_e2e_session_notice_prints_without_dash_r_s(pytester):
+    pytester.makeconftest(
+        """
+        import pytest
+
+        _skips = []
+
+        def pytest_configure(config):
+            config.addinivalue_line("markers", "elevation(kind, **kw): test")
+
+        _PROBES = {"vice_root": lambda **k: (False, "THE REMEDY TEXT")}
+
+        @pytest.hookimpl(tryfirst=True)
+        def pytest_runtest_setup(item):
+            for marker in item.iter_markers("elevation"):
+                ok, remedy = _PROBES[marker.args[0]]()
+                if not ok:
+                    _skips.append((item.nodeid, marker.args[0], remedy))
+                    pytest.skip(f"elevation required ({marker.args[0]}): {remedy}")
+
+        def pytest_sessionfinish(session, exitstatus):
+            if not _skips:
+                return
+            reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+            if reporter is None:
+                return
+            reporter.write_sep("=", f"ELEVATION REQUIRED: {len(_skips)} test(s) skipped", red=True)
+            for nodeid, kind, remedy in _skips:
+                reporter.write_line(f"[{kind}] {remedy}")
+        """
+    )
+    pytester.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.elevation("vice_root")
+        def test_needs_root():
+            pass
+        """
+    )
+    result = pytester.runpytest()
+    result.stdout.fnmatch_lines(["*ELEVATION REQUIRED: 1 test(s) skipped*", "*THE REMEDY TEXT*"])
