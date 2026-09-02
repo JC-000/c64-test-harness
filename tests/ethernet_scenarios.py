@@ -22,7 +22,7 @@ import time
 from typing import Any
 
 from c64_test_harness.bridge_ping import cs8900a_enable_inline_code
-from c64_test_harness.capture import CaptureTimeout, PacketCapture
+from c64_test_harness.capture import CaptureTimeout, PacketCapture, bpf_descriptor_summary
 from c64_test_harness.execute import load_code
 from c64_test_harness.memory import read_bytes, write_bytes
 
@@ -272,10 +272,15 @@ def run_tx_scenario(transport: Any, capture: PacketCapture, *, timeout: float = 
     try:
         captured = capture.recv(timeout, match=is_test_frame)
     except CaptureTimeout as e:
+        # State what was measured; the netstat -B counters on VICE's own
+        # descriptor say which side lost the frame (Written=1: the chip
+        # handed it to pcap and our capture is on the wrong side or
+        # direction; Written=0: it died inside the emulated CS8900a).
         raise AssertionError(
-            f"the frame the C64 transmitted never reached the wire: no frame with "
-            f"ethertype {ETHERTYPE.hex()} captured on {capture.iface} within "
-            f"{timeout:.1f}s ({e})"
+            f"no frame with ethertype {ETHERTYPE.hex()} captured on {capture.iface} "
+            f"within {timeout:.1f}s ({e.seen} non-matching seen); the C64 routine "
+            f"reported Rdy4TxNOW and wrote all {FRAME_LEN} bytes. "
+            f"{bpf_descriptor_summary(capture.iface)}"
         ) from e
 
     if len(captured) < FRAME_LEN:
@@ -355,8 +360,9 @@ def run_rx_scenario(
     success = result[4]
     if result[0] == 0xFF and success != 0x01:
         raise AssertionError(
-            f"RX poll timed out: the frame put on {capture.iface} never reached the "
-            f"CS8900a (result {result.hex()})"
+            f"C64 poll for RxOK timed out (result {result.hex()}) after the host "
+            f"wrote {len(RX_FRAME)} bytes to {capture.iface}; the frame never reached "
+            f"the CS8900a. {bpf_descriptor_summary(capture.iface)}"
         )
     if success != 0x01:
         raise AssertionError(

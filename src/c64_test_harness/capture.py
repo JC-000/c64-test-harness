@@ -36,20 +36,26 @@ import errno
 import os
 import platform
 import select
+import shutil
 import socket
 import struct
+import subprocess
 import time
 from collections import deque
+from dataclasses import dataclass
 from typing import Callable, Protocol, runtime_checkable
 
 __all__ = [
     "BPF_HDR_SIZE",
     "AfPacketCapture",
     "BpfCapture",
+    "BpfDescriptor",
     "BpfParseError",
     "CaptureTimeout",
     "CaptureUnavailable",
     "PacketCapture",
+    "bpf_descriptor_summary",
+    "bpf_descriptors",
     "bpf_wordalign",
     "capture_unavailable_reason",
     "open_capture",
@@ -75,7 +81,16 @@ class CaptureUnavailable(RuntimeError):
 
 
 class CaptureTimeout(TimeoutError):
-    """No (matching) frame arrived within the deadline."""
+    """No (matching) frame arrived within the deadline.
+
+    ``seen`` counts frames that arrived but did not satisfy ``match`` --
+    the difference between a silent interface and a busy one carrying
+    the wrong traffic.
+    """
+
+    def __init__(self, message: str, *, seen: int = 0) -> None:
+        super().__init__(message)
+        self.seen = seen
 
 
 class BpfParseError(ValueError):
@@ -316,7 +331,8 @@ class BpfCapture:
                 raise CaptureTimeout(
                     f"no {'matching ' if match else ''}frame on {self.iface} "
                     f"({self.node}) within {timeout:.1f}s"
-                    + (f"; {seen} non-matching frame(s) seen" if seen else "")
+                    + (f"; {seen} non-matching frame(s) seen" if seen else ""),
+                    seen=seen,
                 )
             readable, _, _ = select.select([self._fd], [], [], remaining)
             if not readable:
@@ -391,7 +407,8 @@ class AfPacketCapture:
                 raise CaptureTimeout(
                     f"no {'matching ' if match else ''}frame on {self.iface} "
                     f"within {timeout:.1f}s"
-                    + (f"; {seen} non-matching frame(s) seen" if seen else "")
+                    + (f"; {seen} non-matching frame(s) seen" if seen else ""),
+                    seen=seen,
                 )
             self._sock.settimeout(remaining)
             try:
@@ -413,6 +430,88 @@ class AfPacketCapture:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+
+# ---------------------------------------------------------------------------
+# netstat -B: who else holds a BPF descriptor, and what it has moved
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BpfDescriptor:
+    """One row of ``netstat -B``: a BPF descriptor, its interface, its counters."""
+
+    device: str
+    netif: str
+    recv: int
+    written: int
+    command: str
+    pid: int
+
+
+def _run_netstat_B() -> str | None:
+    """``netstat -B`` stdout, or ``None`` where it does not exist (Linux) or fails."""
+    if shutil.which("netstat") is None:
+        return None
+    try:
+        out = subprocess.run(
+            ["netstat", "-B"], capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0 or "Device" not in out.stdout:
+        return None
+    return out.stdout
+
+
+def bpf_descriptors(iface: str | None = None) -> list[BpfDescriptor]:
+    """Every BPF descriptor on the host (optionally only those bound to *iface*).
+
+    Needs no privilege and reads root-owned holders, so it sees the
+    descriptors an elevated VICE holds.  ``Written`` on VICE's feth-bound
+    descriptor is the fact that separates a direction fault from a chip
+    fault when a TX test sees nothing: 1 means the chip handed the frame
+    to pcap and the harness capture was bound to the wrong side; 0 means
+    the frame died inside the emulated CS8900a.
+    """
+    text = _run_netstat_B()
+    if text is None:
+        return []
+    lines = text.splitlines()
+    header = next((l.split() for l in lines if l.split()[:1] == ["Device"]), None)
+    if header is None or "Recv" not in header or "Written" not in header:
+        return []
+    i_recv, i_written = header.index("Recv"), header.index("Written")
+    rows: list[BpfDescriptor] = []
+    for line in lines:
+        fields = line.split()
+        if len(fields) < len(header) or fields[0] == "Device":
+            continue
+        if iface is not None and fields[1] != iface:
+            continue
+        command, _, pid = fields[-1].rpartition(".")
+        try:
+            rows.append(BpfDescriptor(
+                device=fields[0], netif=fields[1],
+                recv=int(fields[i_recv]), written=int(fields[i_written]),
+                command=command, pid=int(pid),
+            ))
+        except ValueError:
+            continue
+    return rows
+
+
+def bpf_descriptor_summary(iface: str | None = None) -> str:
+    """One line for a failure message: ``netstat -B <iface>: bpf2 Recv=12 Written=1 x64sc.4326``."""
+    if _run_netstat_B() is None:
+        return "netstat -B unavailable"
+    rows = bpf_descriptors(iface)
+    label = f"netstat -B {iface}" if iface else "netstat -B"
+    if not rows:
+        return f"{label}: no BPF descriptors bound"
+    return f"{label}: " + "; ".join(
+        f"{r.device} Recv={r.recv} Written={r.written} {r.command}.{r.pid}" for r in rows
+    )
 
 
 # ---------------------------------------------------------------------------
