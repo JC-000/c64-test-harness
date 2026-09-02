@@ -835,3 +835,97 @@ def test_the_features_probe_ignores_an_ambient_vicerc(tmp_path, monkeypatch):
         "image scan, which cannot report driver support"
     )
     assert feat.drivers_known is True
+
+
+# ------------------------------------------- plan / listing / path nits
+
+
+def test_plan_does_not_refuse_run_as_root_false_when_already_root(monkeypatch):
+    """Root already holds the capability; ``run_as_root=False`` only
+    means "do not sudo", which as root is exactly what happens anyway.
+    ``needs_root`` used to ignore the current euid and refuse."""
+    _as_uid(monkeypatch, 0)
+    monkeypatch.setattr(ve.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        ve, "sudo_can_run", lambda b: pytest.fail("must not shell out to sudo as root")
+    )
+    cfg = ViceConfig(ethernet=True, ethernet_driver="pcap", run_as_root=False)
+    plan = ve.plan_vice_launch(cfg, _eth_argv())
+    assert plan.argv == _eth_argv()
+    assert plan.sudo_wrapped is False
+    assert plan.elevated is True
+
+
+def test_a_wildcard_argument_rule_authorises_the_binary(monkeypatch):
+    """``NOPASSWD: /path/x64sc *`` authorises *any* argument list, so it
+    covers the launch; it was being dropped as an argument-pinned rule."""
+    _sudo_listing(
+        monkeypatch,
+        "User x may run the following commands:\n"
+        "    (root) NOPASSWD: /opt/homebrew/bin/x64sc *\n",
+    )
+    assert ve.sudo_can_run("/opt/homebrew/bin/x64sc") is True
+
+
+def test_a_setenv_tagged_rule_authorises_the_binary(monkeypatch):
+    """sudoers tags may follow NOPASSWD: (``NOPASSWD: SETENV: /path``);
+    the tag is not part of the command."""
+    _sudo_listing(
+        monkeypatch,
+        "User x may run the following commands:\n"
+        "    (root) NOPASSWD: SETENV: /opt/homebrew/bin/x64sc\n",
+    )
+    assert ve.sudo_can_run("/opt/homebrew/bin/x64sc") is True
+
+
+def test_a_specific_argument_rule_still_does_not_authorise(monkeypatch):
+    """Only the bare wildcard widens; a pinned argv is still one command."""
+    _sudo_listing(
+        monkeypatch,
+        "User x may run the following commands:\n"
+        "    (root) NOPASSWD: /opt/homebrew/bin/x64sc -warp\n"
+        "    (root) NOPASSWD: /opt/homebrew/bin/brew reinstall *\n",
+    )
+    assert ve.sudo_can_run("/opt/homebrew/bin/x64sc") is False
+    assert ve.sudo_can_run("/opt/homebrew/bin/brew") is False
+
+
+def test_a_relative_binary_is_resolved_to_an_absolute_path(tmp_path, monkeypatch):
+    """``launch_path("./x64sc")`` returned "./x64sc", and the sudoers line
+    built from it -- ``NOPASSWD: ./x64sc`` -- is one visudo rejects.
+    sudo itself also matches an absolute command path."""
+    exe = _fake_x64sc(tmp_path, "x64sc", ethernet=True)
+    monkeypatch.chdir(tmp_path)
+    assert ve.launch_path("./x64sc") == exe
+
+    _as_uid(monkeypatch, 501)
+    monkeypatch.setattr(ve.sys, "platform", "darwin")
+    _no_sudo(monkeypatch)
+    cfg = ViceConfig(ethernet=True, ethernet_driver="pcap")
+    with pytest.raises(ve.ViceElevationRequiredError) as excinfo:
+        ve.plan_vice_launch(cfg, ["./x64sc", "-warp"])
+    err = excinfo.value
+    assert err.binary == exe
+    assert err.sudoers_entry.endswith(f"NOPASSWD: {exe}")
+    assert "./x64sc" not in err.sudoers_entry
+
+
+def test_the_remedy_command_names_the_resolved_binary(tmp_path, monkeypatch):
+    """``binary`` and ``sudoers_entry`` already used the resolved path;
+    the pasteable ``sudo ...`` command was built from the caller's
+    spelling.  ``sudo x64sc`` fails on macOS (secure_path lacks
+    /opt/homebrew/bin), so the remedy must use the same absolute path
+    the sudoers line names."""
+    exe = _fake_x64sc(tmp_path, "x64sc", ethernet=True)
+    _as_uid(monkeypatch, 501)
+    monkeypatch.setattr(ve.sys, "platform", "darwin")
+    monkeypatch.setattr(ve.shutil, "which", lambda name: exe if name == "x64sc" else None)
+    _no_sudo(monkeypatch)
+    cfg = ViceConfig(ethernet=True, ethernet_driver="pcap")
+    with pytest.raises(ve.ViceElevationRequiredError) as excinfo:
+        ve.plan_vice_launch(cfg, ["x64sc", "-warp"])
+    err = excinfo.value
+    assert err.binary == exe
+    assert err.argv == ["sudo", exe, "-warp"]
+    assert err.command == f"sudo {exe} -warp"
+    assert f"NOPASSWD: {exe}" in err.sudoers_entry

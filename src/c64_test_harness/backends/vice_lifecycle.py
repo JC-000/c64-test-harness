@@ -25,7 +25,6 @@ from c64_test_harness.backends.vice_elevation import (
     ViceEthernetError,
     ViceLaunchPlan,
     plan_vice_launch,
-    rawnet_capability,
     vice_binary_supports_ethernet,
 )
 
@@ -372,29 +371,6 @@ class ViceConfig:
     run_as_root: bool | None = None
 
 
-def _should_run_as_root(cfg: ViceConfig) -> bool:
-    """Whether this launch is *intended* to run as root.
-
-    An explicit :attr:`ViceConfig.run_as_root` is honoured verbatim.
-    ``None`` auto-detects: elevate exactly when the ethernet cart is in
-    play and VICE would otherwise have no raw-network capability for the
-    driver in use.
-
-    This reports intent only.  :func:`plan_vice_launch` decides how the
-    exec actually happens, and refuses rather than launching a VICE that
-    would SIGSEGV.
-    """
-    if cfg.run_as_root is not None:
-        return cfg.run_as_root
-    from c64_test_harness.backends.vice_elevation import driver_requires_root
-
-    return (
-        cfg.ethernet
-        and driver_requires_root(cfg.ethernet_driver)
-        and not rawnet_capability(as_root=False)
-    )
-
-
 class ViceProcess:
     """Context manager for a VICE emulator process.
 
@@ -412,10 +388,12 @@ class ViceProcess:
         # Temp vicerc used to activate CS8900a ethernet (see start()).
         # Cleaned up in stop().
         self._tmp_vicerc: str | None = None
-        # True when the child was launched via ``sudo -n -E`` so it runs as
-        # root.  stop() uses this flag to route SIGTERM / SIGKILL through
-        # ``sudo -n kill`` instead of Popen.terminate(), which on macOS
-        # cannot signal a root-owned child from an unprivileged parent.
+        # True when the child was launched via plain ``sudo -n`` (no -E:
+        # that would need a SETENV tag in sudoers; see plan_vice_launch)
+        # so it runs as root.  stop() uses this flag to route SIGTERM /
+        # SIGKILL through ``sudo -n kill`` instead of Popen.terminate(),
+        # which on macOS cannot signal a root-owned child from an
+        # unprivileged parent.
         self._is_sudo_child: bool = False
 
     def __enter__(self) -> ViceProcess:
@@ -517,9 +495,19 @@ class ViceProcess:
         # our runs would rewrite their settings file on exit.
         args.append("+saveres")
 
-        # Determinism knobs.  These match VICE's factory values; they are
-        # named explicitly so they stay put if a future VICE changes them.
-        args += ["-jamaction", "1"]      # continue; never block on a dialog
+        # Determinism knobs, named explicitly so they stay put if a future
+        # VICE changes its factory values.
+        #
+        # -jamaction 0 is DIALOG, deliberately *not* the factory 1
+        # (CONTINUE).  VICE emits the 0x61 JAM event only from
+        # monitor_binary_ui_jam_dialog, which machine_jam reaches only
+        # when jam_action == 0 (S machine.c:131-139); with the binary
+        # monitor connected the "dialog" is routed to the monitor and
+        # the machine stops, so wait_for_stopped can report the jam.
+        # Under CONTINUE the 6510 silently carries on past the illegal
+        # opcode and that report is unreachable.  No GUI dialog can
+        # block: the monitor takes it.
+        args += ["-jamaction", "0"]
         args += ["-speed", "100"]        # no ambient speed limit
         args += ["-soundwarpmode", "1"]  # keep emulating SID under warp,
                                          # or render_wav() records silence
@@ -570,53 +558,42 @@ class ViceProcess:
         args += cfg.extra_args
 
         if cfg.ethernet:
-            # VICE 3.10 ethernet activation has a quirk that must be
-            # worked around:
+            # The CS8900a is activated through a temporary vicerc passed
+            # with ``-addconfig``.  That rc is sufficient on its own: it
+            # names the real resources (``ETHERNETCART_ACTIVE``,
+            # ``ETHERNET_INTERFACE``, ``ETHERNET_DRIVER``) and, launched
+            # elevated with no ethernet CLI flags at all, brings the cart
+            # up with two BPF peers attached -- see build_ethernet_rc().
             #
-            # (An earlier revision of this comment claimed the
-            # ``-ethernetcart`` / ``-tfe`` / ``-rrnet`` CLI flags "appear
-            # in -help but are rejected at parse time".  That was false.
-            # All three are registered in S ``ethernetcart.c:434-451``;
-            # ``-tfe`` and ``-rrnet`` are CALL_FUNCTION entries that set
-            # ``ETHERNETCART_ACTIVE`` to 1.  What actually happens when
-            # they are passed unelevated is a SIGSEGV -- the cart
-            # activates, ``rawnet_arch_driver`` is NULL, and
-            # ``rawnet_arch_pre_reset`` dereferences it
-            # (S ``rawnetarch.c:251``).  Measured rc=139 on 6 of 6 flag x
-            # build combinations, twice, by separate agents.  See
-            # docs/vice_upstream_bugs.md § 2.  This route is not used
-            # here regardless, because of the quirk below.)
+            # Two earlier accounts in this comment were wrong and are
+            # recorded here so they are not re-derived:
             #
-            # If ``ETHERNETCART_ACTIVE`` is only set via a vicerc file
-            # (``-addconfig`` / ``-config``) WITHOUT also supplying
-            # ``-ethernetioif`` / ``-ethernetiodriver`` on the command
-            # line, VICE sets the resource to 1 and exposes the CS8900a
-            # Product ID to the C64 — BUT never attaches a TAP file
-            # descriptor on the host side, so frames never leave the
-            # emulator (carrier stays 0, tcpdump sees nothing).
-            # Conversely, if you only supply the CLI interface/driver
-            # flags WITHOUT also activating the cart via addconfig, the
-            # TAP gets attached (carrier=1) but the cart stays disabled.
+            # * "``-ethernetcart`` / ``-tfe`` / ``-rrnet`` are rejected at
+            #   parse time."  False: all three are registered
+            #   (S ``ethernetcart.c:434-451``).  Passed *unelevated* they
+            #   SIGSEGV instead -- the cart activates with
+            #   ``rawnet_arch_driver`` NULL and ``rawnet_arch_pre_reset``
+            #   dereferences it (S ``rawnetarch.c:251``; rc=139 on 6 of 6
+            #   flag x build combinations).  docs/vice_upstream_bugs.md § 2.
             #
-            # The working combination, verified empirically with
-            # ``scripts/verify_vice_ethernet.py``, is:
+            # * "The rc alone activates the cart but never attaches a TAP,
+            #   so ``-ethernetioif`` / ``-ethernetiodriver`` must follow it,
+            #   and must follow it in that order."  That was an artefact
+            #   of the rc misspelling the interface and driver resources
+            #   (``EthernetIOIF`` / ``EthernetIODriver`` are not VICE
+            #   resources in any casing; VICE logged ``Unknown resource``
+            #   and ignored them), so the interface and driver only ever
+            #   arrived via the CLI flags.  There is no VICE ordering
+            #   quirk to work around.
             #
-            #     -addconfig <tmp.rc>      (must come FIRST)
-            #     -ethernetioif <iface>
-            #     -ethernetiodriver <drv>
-            #
-            # In this order, VICE both attaches the TAP and activates
-            # the cart, and the C64 can TX/RX real frames.  If the
-            # ``-addconfig`` comes AFTER the CLI iface flags, the
-            # ETHERNETCART_ACTIVE value in the rc file is NOT honoured
-            # (reads back as 0).
+            # The CLI flags are still emitted, as belt-and-braces, and
+            # ``-addconfig`` is kept ahead of them so a run means the same
+            # thing it always has; neither is load-bearing.
             fd, path = tempfile.mkstemp(prefix="vice_eth_", suffix=".rc")
             with os.fdopen(fd, "w") as f:
                 f.write(build_ethernet_rc(cfg))
             self._tmp_vicerc = path
 
-            # ORDER MATTERS: -addconfig must come BEFORE the interface/
-            # driver CLI flags.  See note above.
             args += ["-addconfig", path]
             if cfg.ethernet_interface:
                 args += ["-ethernetioif", cfg.ethernet_interface]
