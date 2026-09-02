@@ -58,5 +58,28 @@ def test_truncated_tail_is_rendered_as_bytes_not_an_exception():
     assert lines[1].startswith("2001  AD 01") and "??" in lines[1]
 
 
-def test_undocumented_opcode_is_rendered_as_a_byte():
-    assert disassemble(bytes([0x02]), 0x3000) == ["3000  02        ???"]
+def test_illegal_opcodes_are_decoded_not_rendered_as_bytes():
+    """A 1-byte ``???`` for an illegal opcode desyncs the listing from the
+    first illegal instruction on -- exactly where jsr_timeout_report's
+    "PC is not an instruction boundary" path is looking.  Every 6510
+    opcode has a length; decode it (table ported from issue #170's
+    scripts/dis6502.py)."""
+    assert disassemble(bytes([0x02]), 0x3000) == ["3000  02        KIL"]
+    assert disassemble(bytes([0x87, 0x87]), 0x3000) == ["3000  87 87     SAX $87"]
+
+
+def test_every_opcode_has_a_length_and_never_desyncs():
+    lengths = {op: instruction_length(op) for op in range(256)}
+    assert len(lengths) == 256
+    assert set(lengths.values()) <= {1, 2, 3}
+    for op in range(256):
+        lines = disassemble(bytes([op, 0x11, 0x22]) + b"\xEA" * 3, 0x1000)
+        consumed = int(lines[1][:4], 16) - 0x1000
+        assert consumed == lengths[op], hex(op)
+
+
+def test_spot_check_a_stream_mixing_legal_and_illegal_opcodes():
+    code = bytes.fromhex("22 87 81 4C 6C 60 40 00 78 58 D8 86 AB".replace(" ", ""))
+    assert [line[16:] for line in disassemble(code, 0x1000)] == [
+        "KIL", "SAX $81", "JMP $606C", "RTI", "BRK", "SEI", "CLI", "CLD", "STX $AB",
+    ]
