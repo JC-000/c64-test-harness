@@ -49,6 +49,13 @@ _SCREEN_CELLS = 40 * 25
 #: :func:`_wait_for_text_binary` call, read by the failure report.
 _LAST_POLL_TRACE: list[int] = []
 
+#: ``transport._resume_generation`` when the last :func:`_wait_for_text_binary`
+#: began.  The failure report counts only JAM events tagged at or after it:
+#: the fixture is module-scoped and nothing in the poll loop drains
+#: ``_event_queue``, so an earlier test's JAM would otherwise be blamed on
+#: every later failure.
+_LAST_POLL_START_GEN: list[int] = []
+
 
 def _wait_for_text_binary(transport, needle, timeout=15.0, poll_interval=1.0):
     """Poll screen for *needle*, resuming the CPU between reads.
@@ -74,6 +81,7 @@ def _wait_for_text_binary(transport, needle, timeout=15.0, poll_interval=1.0):
     needle_upper = needle.upper()
     deadline = time.monotonic() + timeout
     trace: list[int] = []
+    _LAST_POLL_START_GEN[:] = [getattr(transport, "_resume_generation", 0)]
     try:
         while time.monotonic() < deadline:
             grid = ScreenGrid.from_transport(transport)
@@ -130,7 +138,7 @@ def _stub_was_executed(transport, samples: int = 4) -> tuple[bool, list[int]]:
     samples can land on the same address by coincidence -- measured, and
     it would make this a flaky check for the flake it exists to diagnose.
 
-    The stub at $CF00 is ``CLI; JMP $E5CD``: it executes once and never
+    The stub at $CF00 is ``CLI; JMP ($A002)``: it executes once and never
     returns.  So "PC is no longer $CF00" is a precise, one-way signal
     that the machine ran, immune to loop-size coincidence.
     """
@@ -183,6 +191,34 @@ def _machine_failure_report(transport, needle: str) -> str:
         )
     except Exception as e:
         lines.append(f"could not sample the raster: {type(e).__name__}: {e}")
+    # Under JAMAction 0 an illegal opcode enters the monitor and VICE
+    # queues a 0x61 event that nothing in the poll loop reads.  The issue
+    # #170 capture had one: the 6510 was jammed in CHRGET, and the report
+    # above had nothing to say about it until the queue was checked.
+    # Only events tagged at or after the failing wait's first resume
+    # generation are this failure's; the queue is never drained here, so
+    # an earlier test's JAM would otherwise be reported forever.
+    try:
+        now = getattr(transport, "_resume_generation", 0)
+        start = _LAST_POLL_START_GEN[0] if _LAST_POLL_START_GEN else now
+        jams = [gen for gen, resp in getattr(transport, "_event_queue", ())
+                if resp.response_type == 0x61]
+        fresh = [g for g in jams if g >= start]
+        if fresh:
+            lines.append(
+                f"{len(fresh)} JAM event(s) (0x61) queued since this wait "
+                f"began (resume generation {start}..{now})  <- the 6510 hit "
+                "an illegal opcode and JAMAction 0 stopped it; the PC below "
+                "is the jammed instruction."
+            )
+        elif jams:
+            lines.append(
+                f"{len(jams)} older JAM event(s) in the queue, from before "
+                f"this wait began (generations {sorted(jams)}, wait began "
+                f"at {start}) -- an earlier test's, not this failure's"
+            )
+    except Exception as e:
+        lines.append(f"could not scan the event queue: {type(e).__name__}: {e}")
     if _LAST_POLL_TRACE:
         distinct = len(set(_LAST_POLL_TRACE))
         lines.append(
@@ -236,13 +272,37 @@ def _machine_failure_report(transport, needle: str) -> str:
         lines.append(f"could not read the keyboard buffer: "
                      f"{type(e).__name__}: {e}")
 
+    # CHRGET ($0073-$008A) is BASIC's tokenizer/interpreter fetch, copied
+    # from ROM at cold start.  Issue #170 corrupted it through a bogus RTS
+    # into zero page; a damaged copy means BASIC cannot run *any* line,
+    # whatever the keyboard buffer says.  $007A-$007B is the pointer.
+    try:
+        chrget = bytearray(transport.read_memory(0x0073, 0x18))
+        chrget[7:9] = b"\x00\x00"
+        # ROM master copy at $E3A2 (its LDA operand is a placeholder,
+        # 60 EA on the 901227-03 KERNAL; mask it the same way).
+        master = bytearray(transport.read_memory(0xE3A2, 0x18))
+        master[7:9] = b"\x00\x00"
+        lines.append(
+            "CHRGET $0073-$008A: "
+            + ("intact" if chrget == master else
+               f"CORRUPTED -> {bytes(chrget).hex(' ')} (ROM master "
+               f"{bytes(master).hex(' ')}); something executed in zero "
+               "page -- check SP and the stack frame. Both reads go "
+               "through the CPU bank, so with the KERNAL banked out "
+               "($01 bit 1 clear) the 'master' is RAM and this line is "
+               "spurious")
+        )
+    except Exception as e:
+        lines.append(f"could not read CHRGET: {type(e).__name__}: {e}")
+
     # What is actually at $CF00?  A pinned PC is equally consistent with
     # "halted" and with "jammed": if the stub write did not land, or was
     # overwritten, the 6510 may be sitting on an illegal opcode that
-    # halts it in place.  $CF00 should read 58 4C CD E5 (CLI; JMP $E5CD).
+    # halts it in place.  $CF00 should read 58 6C 02 A0 (CLI; JMP ($A002)).
     try:
         stub = transport.read_memory(0xCF00, 4)
-        expected = bytes([0x58, 0x4C, 0xCD, 0xE5])
+        expected = _RESTORE_STUB
         lines.append(
             f"memory at $CF00: {stub.hex()} "
             + ("(the stub, intact)" if stub == expected else
@@ -283,15 +343,37 @@ def _machine_failure_report(transport, needle: str) -> str:
     return "\n".join(lines)
 
 
-def _restore_basic(transport):
-    """Return CPU to the BASIC idle loop.
+#: The stub ``_restore_basic`` plants at $CF00: ``CLI; JMP ($A002)``.
+#: ($A002) is BASIC's warm-start vector ($E37B on a stock KERNAL).
+_RESTORE_STUB = bytes([0x58, 0x6C, 0x02, 0xA0])
 
-    Writes CLI + JMP $E5CD (KERNAL MAINLOOP) to scratch memory, sets PC
-    there, and resumes.  After a brief delay the CPU should be in BASIC's
-    idle loop ready to process keystrokes.
+
+def _restore_basic(transport):
+    """Return CPU to the BASIC idle loop, with a stack BASIC built.
+
+    Writes ``CLI; JMP ($A002)`` to scratch memory, sets PC there, and
+    resumes.  ($A002) is the BASIC warm start ($E37B): CLRCHN, then
+    ``JSR $A67A`` -- ``LDX #$19; STX $16; PLA; TAY; PLA; LDX #$FA; TXS;
+    PHA; TYA; PHA; LDA #0; STA $3E; STA $10; RTS`` -- which pops its own
+    return address, resets SP to $FA, pushes the return back, resets the
+    temporary-string stack and disables CONT (no NEW, no CLR: a loaded
+    program survives), then CLI, READY., and into INLIN -> CHRIN -> the
+    idle loop at $E5CD.
+
+    It used to be ``CLI; JMP $E5CD`` -- straight into the idle loop, SP
+    untouched.  That is issue #170.  $E5CD sits *inside* CHRIN's call
+    frame ($E632 pushes X and Y and falls into the loop; RETURN makes
+    $E676 pop them and RTS to INLIN), so it only works if SP already
+    points at that frame.  The monitor pauses the CPU wherever the
+    per-frame poll catches it, and when that was inside the KERNAL IRQ
+    handler the interrupt frame was still on the stack: the next RETURN
+    popped it as CHRIN's saved registers and return address and the RTS
+    landed in zero page, corrupting CHRGET before a BRK warm-started the
+    machine -- whose READY. then satisfied the wait below.  Measured, with
+    CPU history, in ``TestRestoreBasicFromInterrupt``.  Going through the
+    warm start makes the restore independent of where the pause landed.
     """
-    restore_code = bytes([0x58, 0x4C, 0xCD, 0xE5])
-    transport.write_memory(0xCF00, restore_code)
+    transport.write_memory(0xCF00, _RESTORE_STUB)
     transport.set_registers({"PC": 0xCF00})
     transport.resume()
     time.sleep(0.5)
@@ -593,7 +675,7 @@ class TestKeyboard:
         ran, pcs = _stub_was_executed(binary_transport)
         assert ran, (
             "the 6510 never left _restore_basic's stub — PC stayed at "
-            f"{[hex(p) for p in pcs]} ($CF00 is CLI; JMP $E5CD, which "
+            f"{[hex(p) for p in pcs]} ($CF00 is CLI; JMP ($A002), which "
             f"executes once and never returns). Any READY. on screen is "
             f"left over from the previous test.\n"
             + _machine_failure_report(binary_transport, "a running CPU")
@@ -650,6 +732,104 @@ class TestKeyboard:
         # Just verify we can still read the screen afterwards
         grid = ScreenGrid.from_transport(binary_transport)
         assert grid is not None
+
+
+# ======================================================================
+# _restore_basic must rebuild the stack, not inherit it (issue #170)
+# ======================================================================
+
+#: The KERNAL IRQ handler's ``RTI`` (S kernal $EA86).  A monitor pause
+#: landing here leaves the interrupt frame (P, PCL, PCH) on the stack.
+_IRQ_RTI = 0xEA86
+#: CHRGET lives at $0073-$008A; $007A-$007B is its self-modified pointer.
+_CHRGET, _CHRGET_LEN = 0x0073, 0x18
+_CHRGET_PTR = slice(0x007A - _CHRGET, 0x007C - _CHRGET)
+
+
+def _chrget_constant_bytes(transport) -> bytes:
+    """CHRGET as it stands, with the variable pointer masked out."""
+    code = bytearray(transport.read_memory(_CHRGET, _CHRGET_LEN))
+    code[_CHRGET_PTR] = b"\x00\x00"
+    return bytes(code)
+
+
+class TestRestoreBasicFromInterrupt:
+    """``_restore_basic`` called while the 6510 is inside the IRQ handler.
+
+    This is the mechanism behind issue #170, reproduced deterministically
+    instead of at a flake rate.  The monitor pauses the CPU wherever the
+    per-frame poll (S ``monitor.c:407``, from ``monitor_vsync_hook``)
+    happens to catch it; a few percent of the time that is inside the
+    KERNAL IRQ handler, with its interrupt frame still on the stack.  The
+    original restore then set PC to the idle loop at $E5CD *without
+    touching SP*.  $E5CD is inside CHRIN's call frame ($E632 pushes X and
+    Y, then falls into the loop), so the next RETURN made CHRIN's exit
+    ($E676 ``PLA;TAX;PLA;TAY;...;RTS``) pop the interrupt frame as its
+    saved registers and return address: X := P ($22), and the RTS landed
+    in zero page at $00E6, the screen line-link table.  Disassembled from
+    the captured bytes (scripts/dis6502.py):
+    ``E6/E8/EA STX $86; EC STX $87; EE/F0 SAX $87; F2 SAX $00; F4 CLD;
+    F5 BRK``.  So $0086 := X = $22 and $0087 := A & X = $3A & $22 = $22
+    (A was the ':' CHRIN had just returned) -- CHRGET's ``SBC #$30; SEC``
+    became ``22 22``, and $22 is a KIL opcode.  ($F3, the colour-RAM
+    pointer low byte, was $00 with the cursor on line 0, so the SAX at
+    $F2 hit the 6510 DDR, which IOINIT rewrites during the warm start;
+    $F5/$F6 KEYTAB is $0000 on a VICE machine that never scanned a matrix
+    key, hence BRK at $F5 -- with KEYTAB set it is ``STA ($EB,X)`` and
+    BRK at $F7.)  BRK -> ($0316) = $FE66 -> CINT cleared the screen ->
+    READY., which satisfied the fixture's own wait; the test's first
+    typed line then jammed the CPU in CHRGET.  Of the shapes issue #170
+    lists, "screen blank but for READY." and "PC in zero page" follow
+    from this mechanism (the RTS lands at ((X<<8)|Y)+1 of the interrupted
+    code, or at (P<<8|A)+1 one frame deeper); the line-collision capture
+    is the false-completion wait already fixed; the $FF09 and $C6=3 /
+    empty-$0277 captures are consistent with a bogus RTS but were not
+    re-derived.
+
+    The checkpoint below parks the CPU on the handler's RTI, which is the
+    exact state the failing capture showed, and then asks the two
+    questions that failed there: is CHRGET intact, and does BASIC run
+    the next line.
+    """
+
+    def test_restore_from_irq_handler_leaves_basic_usable(self, binary_transport) -> None:
+        t = binary_transport
+        _restore_basic(t)
+        chrget = _chrget_constant_bytes(t)
+
+        # Park the CPU on the IRQ handler's RTI: interrupt frame on stack.
+        bp = t.set_checkpoint(_IRQ_RTI)
+        try:
+            t.resume()
+            pc = t.wait_for_stopped(timeout=15)
+        finally:
+            t.delete_checkpoint(bp)
+        assert pc == _IRQ_RTI, f"checkpoint stopped at {pc:#06x}, not the RTI"
+        regs = t.read_registers()
+        frame = t.read_memory(0x0100 + regs["SP"] + 1, 3)  # P, PCL, PCH
+        ret = frame[1] | (frame[2] << 8)
+        assert 0xE5CD <= ret <= 0xE5D6, (
+            f"expected the interrupt frame above SP to return into the idle "
+            f"loop $E5CD-$E5D5 (the machine was idle when the IRQ fired), got "
+            f"{frame.hex(' ')} -> ${ret:04x} at SP={regs['SP']:#04x}. That "
+            "frame is what the old restore left for CHRIN's RTS to pop."
+        )
+
+        _restore_basic(t)  # <- under test: called with that frame on the stack
+
+        after = _chrget_constant_bytes(t)
+        assert after == chrget, (
+            f"CHRGET was corrupted by _restore_basic's re-entry:\n"
+            f"  before {chrget.hex(' ')}\n  after  {after.hex(' ')}\n"
+            "the restore inherited the interrupted IRQ handler's stack "
+            "frame, and the next RETURN returned into zero page.\n"
+            + _machine_failure_report(t, "an intact CHRGET")
+        )
+        _assert_needle_absent(t, "42")
+        send_text(t, "PRINT 6*7\r")
+        t.resume()
+        grid = _wait_for_text_binary(t, "42", timeout=15)
+        assert grid is not None, _machine_failure_report(t, "42")
 
 
 # ======================================================================

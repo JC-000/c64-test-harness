@@ -305,7 +305,7 @@ perform the transition.
 | a slow screen / marginal timeout | the text is normally found in 0–1s against a 15s limit |
 | a checkpoint leaked by an interrupted `jsr()` pinning the CPU | `CHECKPOINT_LIST` reports zero |
 | a lost resume, or monitor nesting needing more exits | 40 acknowledged resumes, no movement |
-| the 6510 jammed on an illegal opcode | `$CF00` holds `584ccde5`, a valid CLI; and **no `0x61` JAM event** in 1328 queued events; and `JAMAction=1` (continue) would have kept the raster advancing anyway (true at capture time; the harness pin is now `0`, under which a jam stops the machine and surfaces as a `TransportError` from `wait_for_stopped` — so a stall captured today would be distinguished from a jam by that error, not by this row) |
+| the 6510 jammed on an illegal opcode | `$CF00` holds `584ccde5`, a valid CLI; and **no `0x61` JAM event** in 1328 queued events; and `JAMAction=1` (continue) would have kept the raster advancing anyway (true at capture time; the harness pin is now `0`, under which a jam stops the machine and surfaces as a `TransportError` from `wait_for_stopped` — so a stall captured today would be distinguished from a jam by that error, not by this row — and **not by the raster either**: measured 2026-09-02, a JAMAction-0 jam pins `LIN`/`CYC` exactly like this stall (`LIN=12 CYC=2` across ten resumes); the poll loop never calls `wait_for_stopped`, so the discriminator is the queued `0x61` event, which `_machine_failure_report` now scans for — see "Mode 2 resolved" below) |
 
 **A CPU-contention experiment was deliberately not run**, and that is a
 choice rather than an omission: with two failure modes sharing one
@@ -342,10 +342,12 @@ checkpoints, and a screen carrying nothing but `READY.` — the machine ran
 happily for fifteen seconds and never received the text
 `send_text` had written to its keyboard buffer.
 
-That second mode is **not root-caused.** An earlier revision of this note
-said it was; that claim was based on a single capture and is withdrawn
-below. It is recorded here only because it shares a surface symptom with
-the stall.
+That second mode **is now root-caused, and it is a harness bug, not a
+VICE one** — see "Mode 2 resolved" at the end of this entry. An earlier
+revision of this note claimed a different root cause on a single capture;
+that claim is withdrawn below and the history is kept because the false
+trail is instructive. The mode is recorded here only because it shares a
+surface symptom with the stall.
 
 Bisected by dropping whole classes, under load, fresh VICE per run:
 
@@ -424,6 +426,94 @@ defect of the documented false-completion class — three of the four
 content-asserting tests in `test_vice_core.py` waited on a needle their
 own echoed command contained — but they are **not** a fix for this
 failure and are not described as one.
+
+**Mode 2 resolved (issue #170): `_restore_basic` inherited the stack of
+whatever the monitor pause interrupted.** The restore was `CLI; JMP
+$E5CD` with SP untouched. `$E5CD` is *inside* CHRIN's call frame (`$E632`
+pushes X and Y and falls into the idle loop; RETURN makes `$E676`
+`PLA;TAX;PLA;TAY;…;RTS` back to INLIN), so it is only correct when SP
+already points at that frame. The binary monitor pauses the CPU wherever
+the per-frame poll catches it (`monitor_check_binary()` from
+`monitor_vsync_hook()`, S `monitor.c:407`), and in 2 of 317 redirects
+measured under load that was inside the KERNAL IRQ handler with the
+interrupt frame still on the stack. Captured with CPU history
+(`scripts/vice_keyecho_probe.py`, cycle 23 of 45):
+
+```
+redirect PC:=$CF00  paused at PC=$EA86 (the handler's RTI) SP=$F0
+                    stack = 22 d4 e5 | 00 0a 14 e1 64 a5 ...
+                            P  PCL PCH  X  Y  ret   ret
+```
+
+The fixture's own RETURN then popped `X:=$22, Y:=$D4` and the RTS landed
+at `$00E5+1 = $00E6`, the screen line-link table. Disassembled from the
+captured zero page with `scripts/dis6502.py` (illegal opcodes included —
+the first version of that tool had none and desynchronised here):
+
+```
+00E6  86 86     STX $86        ; X = popped P = $22
+00E8  86 86     STX $86
+00EA  86 86     STX $86
+00EC  86 87     STX $87
+00EE  87 87     SAX $87        ; A & X = $3A & $22 = $22  (A = the ':' just returned)
+00F0  87 87     SAX $87
+00F2  87 00     SAX $00        ; $F3 = colour-ptr lo, $00 with the cursor on line 0:
+                               ; hits the 6510 DDR, rewritten by IOINIT in the warm start
+00F4  d8        CLD
+00F5  00        BRK            ; $F5/$F6 KEYTAB = $0000: VICE never scanned a matrix key
+                               ; (with KEYTAB = $EB81 it is STA ($EB,X) and BRK at $F7)
+```
+
+CHRGET's `SBC #$30; SEC` at `$0086-$0087` became `22 22`; BRK → `($0316)
+= $FE66` → IOINIT, `CINT` cleared the screen, and the resulting `READY.`
+satisfied the fixture's wait. The test's first typed line then hit opcode
+`$22` (KIL) in CHRGET and the 6510 jammed: one `0x61` event queued, PC
+`$0087`. The `$F3` value at RTS time is derived (the dump was taken after
+the warm start), the rest is the captured bytes.
+
+**A JAMAction-0 jam pins the raster — measured, against the source's
+prediction.** Reproduced on 2026-09-02 with the deterministic test driven
+to the jam: `_emulator_is_stalled()` sampled `LIN=12 CYC=2` four times
+across four resumes, and six further resumes 0.3 s apart all read
+`PC=$0087 LIN=12 CYC=2 SP=$F6`, with the `0x61` event queued and CPU
+history ending at `0087 op=22`. The source reads the other way:
+`6510core.c:2481-2484` sets `CPU_IS_JAMMED`, `REWIND_FETCH_OPCODE(CLK)`
+(a no-op in x64sc, `c64cpusc.c:42`) and calls `JAM()`; on the next pass
+`6510core.c:2388-2394` re-fetches the jam opcode (`SET_OPCODE(lastop)`),
+`machine_jam` returns `JAM_NONE` because `is_jammed` (`machine.c:112-114`),
+and `maincpu.c:625-626` does `CLK++` — so a re-executing jam loop *should*
+advance `maincpu_clk` and with it `LIN`/`CYC` (`c64.c:1298-1302`). It does
+not, so after the first `CMD_EXIT` the core is evidently not iterating;
+**why is UNVERIFIED** (the `should_pause_on_exit_mon` path at
+`monitor.c:3325` arms only when the UI is already paused, and was ruled
+out). Consequence for diagnosis: a frozen raster does **not** separate a
+jam from bug 6. The queued `0x61` and a PC sitting on a KIL opcode do,
+and `_machine_failure_report` now checks for them.
+
+Which of the capture shapes listed above this explains: "screen blank but
+for `READY.`" and "PC in zero page" follow from the mechanism — the RTS
+lands at `((X<<8)|Y)+1` of the interrupted code, or at `(P<<8|A)+1` one
+frame deeper (`$2201` = `00`, BRK, a clean warm start: the fixture
+*self-heals* and the cycle passes, also measured, 1 of 317). The
+line-collision capture is the false-completion wait already fixed above.
+`$FF09` and the `$C6=3` / empty-`$0277` disagreement are *consistent
+with* a bogus RTS but were not re-derived. Reconciling the old evidence
+row "no `0x61` in 1328 events, raster advancing": it was captured under
+`JAMAction=1` (CONTINUE), where `machine_jam` returns `JAM_NONE` with no
+`0x61` and the CPU spins at the KIL with the clock advancing — so that
+row never excluded this mechanism.
+
+Fix: the restore now goes through BASIC's warm-start vector — `CLI; JMP
+($A002)` → `$E37B` → `JSR $A67A` (`LDX #$19; STX $16; PLA; TAY; PLA; LDX
+#$FA; TXS; PHA; TYA; PHA; LDA #0; STA $3E; STA $10; RTS`: pops its own
+return, resets SP, pushes it back, resets the temp-string stack, disables
+CONT — no NEW/CLR, a loaded program survives) rebuilds the stack.
+Deterministic reproduction, not a rate: `tests/test_vice_core.py::
+TestRestoreBasicFromInterrupt` parks the CPU on `$EA86` with a checkpoint
+and calls `_restore_basic`; RED = CHRGET `… e9 30 38 …` → `… e9 22 22 …`
+in 3.6 s, GREEN after the fix. Under the issue's load recipe: 1 of 45
+cycles before, 0 of 45 after -- with 3 of 315 redirects landing inside
+the IRQ handler, each of which the rebuilt stack survived.
 
 **Harness mitigation: detection, not recovery.** We cannot fix VICE. The
 raster check is the discriminating signal — it distinguishes a stalled
