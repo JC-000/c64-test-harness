@@ -32,7 +32,9 @@ class TestBasics:
         assert a.alloc(16, name="first") == 0x0200
 
     def test_sequential_allocs_dont_overlap(self) -> None:
-        a = MemoryArbiter()
+        # Raw mechanics test: $0200-$03FF crosses the keyboard buffer and
+        # cassette-buffer scratch, so opt out of the #169 exclusion.
+        a = MemoryArbiter(exclude_harness_scratch=False)
         first = a.alloc(256, name="a")
         second = a.alloc(256, name="b")
         assert first == 0x0200
@@ -40,7 +42,8 @@ class TestBasics:
         assert first + 256 <= second
 
     def test_alignment(self) -> None:
-        a = MemoryArbiter()
+        # Raw mechanics test (see above) — $0300 page holds CINV/$0334.
+        a = MemoryArbiter(exclude_harness_scratch=False)
         a.alloc(17, name="prefix")
         aligned = a.alloc(256, alignment=256, name="aligned")
         assert aligned == 0x0300
@@ -76,7 +79,9 @@ class TestReserved:
                 MemoryRegion(0x0400, 0x0500, "high"),
             ),
         )
-        a = MemoryArbiter(policy=policy)
+        # Raw mechanics test: the $0300 gap holds harness scratch (CINV,
+        # jsr trampoline, run_subroutine flags) — opt out of #169.
+        a = MemoryArbiter(policy=policy, exclude_harness_scratch=False)
         assert a.alloc(256, name="middle") == 0x0300
 
     def test_alloc_overflows_gap_into_next_free(self) -> None:
@@ -111,7 +116,8 @@ class TestSafeRegions:
             safe_regions=(MemoryRegion(0xC000, 0xC010, "tiny"),),
             unknown=UnknownPolicy.DENY,
         )
-        a = MemoryArbiter(policy=policy)
+        # Raw mechanics test: $C000 is the UCI/SID stub page — opt out.
+        a = MemoryArbiter(policy=policy, exclude_harness_scratch=False)
         assert a.alloc(16, name="first") == 0xC000
         with pytest.raises(MemoryArbiterError):
             a.alloc(1, name="second")  # safe region full
@@ -123,9 +129,15 @@ class TestSafeRegions:
                 MemoryRegion(0xC000, 0xD000, "high scratch"),
             ),
         )
-        a = MemoryArbiter(policy=policy)
+        # Raw mechanics test: both safe regions are harness scratch, and
+        # the point here is first-fit ordering — opt out of #169.
+        a = MemoryArbiter(policy=policy, exclude_harness_scratch=False)
         # First fit is the cassette scratch region.
         assert a.alloc(16, name="stub") == 0x0334
+        # With the default exclusion the same policy skips $0334-$0341
+        # (jsr trampoline, SID park JMP, SID song trampoline) and lands
+        # on the first free byte after them.
+        assert MemoryArbiter(policy=policy).alloc(8, name="stub") == 0x0342
 
 
 # ---------------------------------------------------------------------------
@@ -319,3 +331,86 @@ class TestIssue93Regression:
         # trace is empty but the exception message names the failure.
         assert "no free range" in str(ei.value)
         assert "trampoline" in str(ei.value)
+
+
+# ---------------------------------------------------------------------------
+# Issue #169 — the arbiter must never hand out the harness's own scratch
+# ---------------------------------------------------------------------------
+
+
+class TestHarnessScratchDefault:
+    """The issue's measurement: ``MemoryArbiter(MemoryPolicy.permissive())``
+    reported every documented harness scratch address as free to allocate.
+    It must not — the allocator whose job is safe addresses was handing
+    back the exact byte ``jsr()`` writes its trampoline to.
+    """
+
+    ISSUE_ADDRESSES = [
+        0x0277, 0x0334, 0x0339, 0x0360, 0x03F0,
+        0xC000, 0xC400, 0xC500, 0xCF00,
+    ]
+
+    @pytest.mark.parametrize("addr", ISSUE_ADDRESSES)
+    def test_documented_scratch_is_not_free(self, addr: int) -> None:
+        a = MemoryArbiter(MemoryPolicy.permissive())
+        assert a.is_free(addr) is False, f"${addr:04X} reported free"
+
+    @pytest.mark.parametrize("addr", ISSUE_ADDRESSES)
+    def test_alloc_pinned_to_scratch_address_refuses(self, addr: int) -> None:
+        a = MemoryArbiter(MemoryPolicy.permissive(), window=(addr, addr))
+        with pytest.raises(MemoryArbiterError) as ei:
+            a.alloc(1, name="pinned")
+        assert "harness scratch" in str(ei.value)
+
+    def test_allocations_never_overlap_harness_scratch(self) -> None:
+        from c64_test_harness import harness_scratch_regions
+
+        a = MemoryArbiter(MemoryPolicy.permissive(), window=(0x0200, 0xCFFF))
+        scratch = harness_scratch_regions()
+        for i in range(64):
+            base = a.alloc(16, name=f"blk{i}")
+            for r in scratch:
+                assert not r.overlaps_range(base, 16), (hex(base), str(r))
+
+    def test_is_free_positive_case(self) -> None:
+        a = MemoryArbiter(MemoryPolicy.permissive())
+        assert a.is_free(0x0200) is True
+        assert a.is_free(0x0200, 0x77) is True   # $0200-$0276, stops at KEYD
+        assert a.is_free(0x0200, 0x78) is False  # ... touches $0277
+
+    def test_is_free_respects_reserved_and_allocations(self) -> None:
+        policy = MemoryPolicy(
+            reserved_regions=(MemoryRegion(0x4000, 0x5000, "consumer"),),
+        )
+        a = MemoryArbiter(policy)
+        assert a.is_free(0x4000) is False
+        taken = a.alloc(16, name="x")
+        assert a.is_free(taken) is False
+
+    def test_transient_scratch_is_not_withheld(self) -> None:
+        # The 32 KiB REU staging window is saved/restored around its use;
+        # it is declared, but allocation there stays allowed by default.
+        a = MemoryArbiter(MemoryPolicy.permissive())
+        assert a.is_free(0x0800) is True
+
+    def test_opt_out_restores_raw_allocation(self) -> None:
+        a = MemoryArbiter(MemoryPolicy.permissive(), exclude_harness_scratch=False)
+        assert a.is_free(0x0334) is True
+        assert a.alloc(5, name="own trampoline") == 0x0200  # window start
+
+    def test_from_labels_honours_opt_out(self) -> None:
+        labels = Labels()
+        strict = MemoryArbiter.from_labels(labels, window=(0x0334, 0x0338))
+        with pytest.raises(MemoryArbiterError):
+            strict.alloc(5, name="stub")
+        raw = MemoryArbiter.from_labels(
+            labels, window=(0x0334, 0x0338), exclude_harness_scratch=False,
+        )
+        assert raw.alloc(5, name="stub") == 0x0334
+
+    def test_default_first_fit_skips_cassette_buffer_scratch(self) -> None:
+        # A 256-byte request used to land on $0200-$02FF straight across
+        # the keyboard buffer at $0277.  Now the first span that clears
+        # every non-transient scratch entry is after the U64 flags.
+        a = MemoryArbiter(MemoryPolicy.permissive())
+        assert a.alloc(256, name="page") == 0x03F2

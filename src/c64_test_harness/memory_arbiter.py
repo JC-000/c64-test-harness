@@ -52,6 +52,7 @@ from .memory_policy import (
     MemoryPolicyError,
     MemoryRegion,
     UnknownPolicy,
+    harness_scratch_regions,
 )
 
 if TYPE_CHECKING:
@@ -115,6 +116,18 @@ class MemoryArbiter:
     window:
         ``(lo, hi)`` inclusive scan window.  Defaults to
         ``($0200, $FFFF)`` — i.e. excludes the zero page and stack.
+    exclude_harness_scratch:
+        When ``True`` (the default) every non-transient entry of
+        :data:`~c64_test_harness.memory_policy.HARNESS_SCRATCH` — the
+        ``jsr()`` trampoline at ``$0334``, the UCI stub block at
+        ``$C000-$C3FF``, the keyboard buffer, and so on — is treated as
+        taken, so the arbiter never hands out an address the harness is
+        about to overwrite (issue #169).  Pass ``False`` for raw
+        allocation over the policy alone — e.g. when the caller *is*
+        the harness, or has moved every scratch address via its kwargs
+        and wants the default spots back.  Transient entries (saved and
+        restored around the write, like the REU staging window) are not
+        withheld either way; :meth:`reserve` them explicitly if needed.
 
     Notes
     -----
@@ -126,6 +139,7 @@ class MemoryArbiter:
 
     policy: MemoryPolicy = field(default_factory=MemoryPolicy.permissive)
     window: tuple[int, int] = _DEFAULT_WINDOW
+    exclude_harness_scratch: bool = True
     _allocated: list[MemoryRegion] = field(default_factory=list, init=False)
 
     # ------------------------------------------------------------------
@@ -140,6 +154,7 @@ class MemoryArbiter:
         label_address_is_data: Callable[[str], bool] = lambda _name: True,
         extra_reserved: tuple[MemoryRegion, ...] = (),
         window: tuple[int, int] = _DEFAULT_WINDOW,
+        exclude_harness_scratch: bool = True,
     ) -> MemoryArbiter:
         """Build an arbiter whose policy reserves each data label.
 
@@ -159,7 +174,11 @@ class MemoryArbiter:
                 continue
             reserved.append(MemoryRegion(addr, addr + 1, f"label:{name}"))
         policy = MemoryPolicy(reserved_regions=tuple(reserved))
-        return cls(policy=policy, window=window)
+        return cls(
+            policy=policy,
+            window=window,
+            exclude_harness_scratch=exclude_harness_scratch,
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -181,6 +200,8 @@ class MemoryArbiter:
           ``safe_regions`` (when any are declared) or inside the window
           (when none are declared),
         * the span overlaps no reserved region and no prior allocation,
+        * the span overlaps no harness scratch address (unless
+          ``exclude_harness_scratch=False``),
         * ``policy.check_write(base, size)`` passes — every candidate is
           verified against the policy before it is returned, so an
           allocated address never trips the transport-level check.
@@ -211,6 +232,7 @@ class MemoryArbiter:
             )
 
         free_intervals = self._compute_free_intervals()
+        win_lo, win_hi = self.window[0], self.window[1] + 1
         trace: list[str] = []
         for lo, hi in free_intervals:
             base = (lo + alignment - 1) & ~(alignment - 1)
@@ -247,7 +269,43 @@ class MemoryArbiter:
                 "safe_regions — nothing is allocatable; declare "
                 "safe_regions or relax unknown_policy"
             )
+        if self.exclude_harness_scratch:
+            hits = [
+                r for r in self._harness_scratch()
+                if r.overlaps_range(win_lo, win_hi - win_lo)
+            ]
+            if hits:
+                trace.append(
+                    "window overlaps harness scratch (withheld by default; "
+                    "pass exclude_harness_scratch=False for raw "
+                    "allocation): " + ", ".join(str(r) for r in hits)
+                )
         raise MemoryArbiterError(size, alignment, name, trace)
+
+    def is_free(self, addr: int, length: int = 1) -> bool:
+        """True iff ``[addr, addr+length)`` could be returned by :meth:`alloc`.
+
+        Answers the question the issue-#169 measurement asked: is this
+        address free to hand out?  A span is free when it lies inside
+        the window, inside the policy's safe regions (when any are
+        declared), and overlaps no reserved region, no prior
+        allocation, no non-transient harness scratch entry (unless
+        ``exclude_harness_scratch=False``), and passes
+        ``policy.check_write``.
+        """
+        if length < 1:
+            raise ValueError(f"length must be >= 1, got {length}")
+        end = addr + length
+        for lo, hi in self._compute_free_intervals():
+            if lo <= addr and end <= hi:
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        self.policy.check_write(addr, length)
+                except MemoryPolicyError:
+                    return False
+                return True
+        return False
 
     def reserve(self, region: MemoryRegion) -> None:
         """Manually mark a range as taken.
@@ -299,8 +357,9 @@ class MemoryArbiter:
         * ``allowed_intervals`` is the window intersected with
           ``policy.safe_regions`` (or just the window if no safe
           regions are declared).
-        * ``blocked_intervals`` is the union of ``policy.reserved_regions``
-          and the arbiter's own ``_allocated`` regions.
+        * ``blocked_intervals`` is the union of ``policy.reserved_regions``,
+          the arbiter's own ``_allocated`` regions, and (by default) the
+          non-transient ``HARNESS_SCRATCH`` entries.
         """
         win_lo, win_hi_incl = self.window
         if not (0 <= win_lo < _ADDR_SPACE and 0 <= win_hi_incl < _ADDR_SPACE):
@@ -335,6 +394,11 @@ class MemoryArbiter:
             e = min(r.end, win_hi)
             if e > s:
                 blocked.append((s, e))
+        for r in self._harness_scratch():
+            s = max(r.start, win_lo)
+            e = min(r.end, win_hi)
+            if e > s:
+                blocked.append((s, e))
         blocked = _merge_intervals(blocked)
 
         free: list[tuple[int, int]] = []
@@ -353,6 +417,13 @@ class MemoryArbiter:
             if cursor < a_hi:
                 free.append((cursor, a_hi))
         return free
+
+
+    def _harness_scratch(self) -> tuple[MemoryRegion, ...]:
+        """Harness scratch entries withheld from allocation (none if opted out)."""
+        if not self.exclude_harness_scratch:
+            return ()
+        return harness_scratch_regions()
 
 
 def _merge_intervals(
