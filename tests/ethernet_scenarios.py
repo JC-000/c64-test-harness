@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from c64_test_harness.bridge_ping import cs8900a_enable_inline_code
 from c64_test_harness.disasm import disassemble
@@ -84,7 +84,9 @@ RX_FRAME = (
 )
 
 
-def capture_failure_disposition(exc: CaptureUnavailable, *, iface: str) -> tuple[str, str]:
+def capture_failure_disposition(
+    exc: CaptureUnavailable, *, iface: str, vice_live: bool = False
+) -> tuple[str, str]:
     """``("skip" | "fail", reason)`` for a fixture that could not open a capture.
 
     Skip only when the exception says the capability is *genuinely absent*
@@ -95,7 +97,21 @@ def capture_failure_disposition(exc: CaptureUnavailable, *, iface: str) -> tuple
     classified -- is a path that exists and is broken, and a skip there is
     exactly how issue #158 stayed hidden.  Those fail, with the same
     remedy in the message.
+
+    ``vice_live=True`` (the fixtures pass it: a root VICE is up and the
+    interface was found) additionally turns ``"denied"`` -- every node
+    root-only -- into a *fail*.  That is this bench's state after every
+    reboot, because the chmod is not persisted; on a bench that has just
+    launched an elevated ethernet VICE it is a misconfiguration to fix,
+    not a capability the host lacks.
     """
+    if vice_live and exc.cause == "denied":
+        return (
+            "fail",
+            f"host-side capture on {iface}: every /dev/bpf* node is root-only while "
+            f"a root VICE is up -- a misconfigured bench (the chmod does not survive "
+            f"a reboot), not an absent capability: {exc}",
+        )
     if exc.genuinely_absent:
         return "skip", f"no host-side capture on {iface}: {exc}"
     return (
@@ -112,7 +128,12 @@ CAPTURE_IFACE_ENV = "C64_ETH_CAPTURE_IFACE"
 SEND_IFACE_ENV = "C64_ETH_SEND_IFACE"
 
 
-def resolve_capture_ifaces(vice_iface: str, env: Mapping[str, str]) -> tuple[str, str]:
+def resolve_capture_ifaces(
+    vice_iface: str,
+    env: Mapping[str, str],
+    *,
+    iface_present: Callable[[str], bool] | None = None,
+) -> tuple[str, str]:
     """``(capture_iface, send_iface)`` for the host side, from *env* overrides.
 
     Default: both are *vice_iface*.  ``C64_ETH_CAPTURE_IFACE`` moves the
@@ -120,12 +141,27 @@ def resolve_capture_ifaces(vice_iface: str, env: Mapping[str, str]) -> tuple[str
     another interface -- the peer of a feth pair when the live TX run
     shows VICE's descriptor at Written=1 with nothing captured, i.e. the
     frame left on the interface but our capture was on the wrong side.
-    Blank values are ignored.
+    Blank values are ignored.  A knob naming an interface that is not
+    present raises ``ValueError`` here, so a typo is reported as such and
+    never reaches ``BIOCSETIF`` to come back as ENXIO / cause "bind".
+    *iface_present* defaults to ``bridge_platform.iface_present``.
     """
     def _get(name: str) -> str | None:
         v = env.get(name, "")
         v = v.strip() if isinstance(v, str) else ""
         return v or None
+
+    if iface_present is None:
+        from bridge_platform import iface_present as _present
+        iface_present = _present
+
+    for knob in (CAPTURE_IFACE_ENV, SEND_IFACE_ENV):
+        name = _get(knob)
+        if name is not None and not iface_present(name):
+            raise ValueError(
+                f"{knob}={name}: interface not present on this host "
+                f"(VICE interface is {vice_iface!r})"
+            )
 
     capture_iface = _get(CAPTURE_IFACE_ENV) or vice_iface
     send_iface = _get(SEND_IFACE_ENV) or capture_iface

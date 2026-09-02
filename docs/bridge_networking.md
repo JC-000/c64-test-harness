@@ -285,14 +285,26 @@ Remedy after a reboot or when the pool is short (no sudoers change):
 sudo chmod o+rw /dev/bpf*
 ```
 
+Order matters after a reboot: devfs exposes only `bpf0-3` until a root
+process opens more — macOS creates `bpf4+` on demand *for root only*
+(e.g. the next elevated VICE launch takes `bpf0`+`bpf1`, then `bpf2`…). A
+`chmod` run before that widens nothing beyond the four that exist, so
+either launch VICE first and `chmod` afterwards, or accept that with one
+VICE up only the nodes it did not take (`bpf2-3`) are open to the
+harness.
+
 The tests open the capture *after* the module's VICE fixture has taken
 its nodes, so the one `open_capture()` call reflects the pool this
 process really has. Its exception is classified: **skip** only on genuine
-absence (every node root-only, no nodes, no `CAP_NET_RAW`, no backend);
-**fail**, remedy in the message, when the path exists but is broken —
-all writable nodes `EBUSY` while VICE is live (pool eaten; `chmod o+rw`
-opens `bpf4-7`, which exist), `BIOCSETIF` failing on the interface the
-platform helper just found, a non-ethernet DLT, a Linux bind failure. No
+absence (no nodes, no `CAP_NET_RAW`, no backend); **fail**, remedy in the
+message, when the path exists but is broken — all writable nodes `EBUSY`
+while VICE is live (pool eaten), `BIOCSETIF` failing on the interface the
+platform helper just found, a non-ethernet DLT, a Linux bind failure, an
+unclassified errno — **and** every node root-only while a root VICE is up:
+that is this bench's state after every reboot (the chmod is not
+persisted), and with an elevated ethernet VICE already running it is a
+misconfigured bench, not a missing capability
+(`capture_failure_disposition(..., vice_live=True)`). No
 `tcpdump` NOPASSWD rule exists or is needed; if an operator prefers
 sudoers over chmod, `someone ALL=(root) NOPASSWD: /usr/sbin/tcpdump`
 would enable a subprocess path the harness does not currently implement.

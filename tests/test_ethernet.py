@@ -76,9 +76,16 @@ TAP_IFACE = first_available_ethernet_iface()
 # Written=1: the chip put the frame on the interface and the capture was
 # on the wrong side of it.  See docs/bridge_networking.md "Host-side
 # capture on macOS".
-CAPTURE_IFACE, SEND_IFACE = (
-    resolve_capture_ifaces(TAP_IFACE, os.environ) if TAP_IFACE else (None, None)
-)
+CAPTURE_IFACE: str | None = None
+SEND_IFACE: str | None = None
+#: Set when a knob names an interface that is not present; the capture
+#: fixtures then fail with it (a typo must not become an ENXIO "bind").
+IFACE_KNOB_ERROR: str | None = None
+if TAP_IFACE:
+    try:
+        CAPTURE_IFACE, SEND_IFACE = resolve_capture_ifaces(TAP_IFACE, os.environ)
+    except ValueError as _e:
+        IFACE_KNOB_ERROR = str(_e)
 
 # On macOS 26 Tahoe the Homebrew VICE 3.10 bottle crashes immediately when
 # launched with ``-ethernetiodriver pcap -ethernetioif feth<N>`` (the
@@ -181,10 +188,15 @@ def _open_capture_or_verdict(iface: str) -> PacketCapture:
     interface we just found, wrong DLT) *fails* with the same remedy: a
     skip there is how issue #158 hid.
     """
+    if IFACE_KNOB_ERROR:
+        pytest.fail(IFACE_KNOB_ERROR, pytrace=False)
     try:
         return open_capture(iface)
     except CaptureUnavailable as e:
-        verdict, reason = capture_failure_disposition(e, iface=iface)
+        # vice_live=True: the fixtures below depend on vice_ethernet, so a
+        # root VICE is up -- every node root-only is then a misconfigured
+        # bench (fail with the chmod remedy), not an absent capability.
+        verdict, reason = capture_failure_disposition(e, iface=iface, vice_live=True)
         if verdict == "skip":
             pytest.skip(reason)
         pytest.fail(reason, pytrace=False)
@@ -203,6 +215,8 @@ def host_capture(vice_ethernet: BinaryViceTransport) -> PacketCapture:
     path opens the test runs, and a silent wire is then a failure (see
     ``ethernet_scenarios``).
     """
+    if IFACE_KNOB_ERROR:
+        pytest.fail(IFACE_KNOB_ERROR, pytrace=False)
     assert CAPTURE_IFACE is not None
     cap = _open_capture_or_verdict(CAPTURE_IFACE)
     try:
