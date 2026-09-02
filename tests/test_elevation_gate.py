@@ -443,3 +443,45 @@ def test_e2e_session_notice_prints_without_dash_r_s(pytester):
     )
     result = pytester.runpytest()
     result.stdout.fnmatch_lines(["*ELEVATION REQUIRED: 1 test(s) skipped*", "*THE REMEDY TEXT*"])
+
+
+# ---------------------------------------------------------------------------
+# The real ethernet fixtures route through start_vice_or_skip
+# ---------------------------------------------------------------------------
+#
+# Direct proof that the shared helper is actually wired into the fixture
+# bodies that need it, not just exercised in isolation above.  Each
+# fixture is a generator function; calling ``.__wrapped__`` gets past
+# pytest's FixtureFunctionMarker to the raw function so it can be driven
+# without a full pytest session.
+
+
+def test_bridge_vice_pair_converts_a_mid_launch_refusal(monkeypatch):
+    from c64_test_harness.backends.vice_elevation import ViceElevationRequiredError
+
+    monkeypatch.setattr(conftest.shutil, "which", lambda name: "/usr/bin/x64sc")
+    import bridge_platform
+    monkeypatch.setattr(bridge_platform, "iface_present", lambda name: True)
+
+    class _RefusingViceProcess:
+        def __init__(self, config):
+            self.config = config
+
+        def start(self):
+            raise ViceElevationRequiredError(
+                "need root", argv=["sudo", "x64sc"], binary="/x64sc",
+                sudoers_entry="me ALL=(root) NOPASSWD: /x64sc",
+            )
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(conftest, "ViceProcess", _RefusingViceProcess)
+
+    gen = conftest.bridge_vice_pair.__wrapped__(
+        request=SimpleNamespace(node=SimpleNamespace(nodeid="t::test_x"))
+    )
+    with pytest.raises(pytest.skip.Exception) as excinfo:
+        next(gen)
+    assert "need root" in str(excinfo.value)
+    assert any(kind == "vice_root" for _n, kind, _r in conftest._elevation_skips)

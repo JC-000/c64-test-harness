@@ -34,7 +34,7 @@ from c64_test_harness.ethernet import set_cs8900a_mac
 from c64_test_harness.execute import jsr, load_code
 from c64_test_harness.memory import read_bytes, write_bytes
 
-from conftest import connect_binary_transport
+from conftest import connect_binary_transport, start_vice_or_skip
 
 # ---------------------------------------------------------------------------
 # Skip conditions
@@ -627,7 +627,7 @@ def _wait_for_ready(transport: BinaryViceTransport, timeout: float = 30.0) -> No
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
-def vice_bridge_pair():
+def vice_bridge_pair(request):
     """Launch two VICE instances with ethernet on tap-c64-0 and tap-c64-1.
 
     Yields (transport_a, transport_b) -- both connected and at READY prompt.
@@ -665,12 +665,16 @@ def vice_bridge_pair():
         ethernet_driver=ETHERNET_DRIVER,
     )
 
-    vice_a = ViceProcess(config_a)
-    vice_b = ViceProcess(config_b)
+    # start_vice_or_skip: converts a mid-launch ViceElevationRequiredError
+    # (e.g. the preflight probe was bypassed with MACOS_PCAP_ENABLED=1)
+    # into the same skip-or-fail + record the elevation("vice_root")
+    # marker uses, instead of a bare fixture error.
+    vice_a: ViceProcess | None = None
+    vice_b: ViceProcess | None = None
 
     try:
-        vice_a.start()
-        vice_b.start()
+        vice_a = start_vice_or_skip(config_a, request.node.nodeid)
+        vice_b = start_vice_or_skip(config_b, request.node.nodeid)
 
         transport_a = connect_binary_transport(port_a, proc=vice_a)
         transport_b = connect_binary_transport(port_b, proc=vice_b)
@@ -692,8 +696,10 @@ def vice_bridge_pair():
             transport_a.close()
             transport_b.close()
     finally:
-        vice_a.stop()
-        vice_b.stop()
+        if vice_a is not None:
+            vice_a.stop()
+        if vice_b is not None:
+            vice_b.stop()
         allocator.release(port_a)
         allocator.release(port_b)
 

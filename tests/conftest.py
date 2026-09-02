@@ -320,7 +320,7 @@ def _bridge_init_cs8900a(transport: BinaryViceTransport, scratch: int, code: int
 
 
 @pytest.fixture(scope="module")
-def bridge_vice_pair():
+def bridge_vice_pair(request):
     """Launch two VICE instances with RR-Net ethernet on an L2 bridge.
 
     Yields ``(transport_a, transport_b)`` -- both connected, at BASIC
@@ -378,12 +378,17 @@ def bridge_vice_pair():
         ethernet_driver=ETHERNET_DRIVER,
     )
 
-    vice_a = ViceProcess(config_a)
-    vice_b = ViceProcess(config_b)
+    # start_vice_or_skip: a bypassed preflight probe (MACOS_PCAP_ENABLED=1)
+    # means ViceProcess.start() itself can still refuse mid-fixture with
+    # ViceElevationRequiredError; convert that the same way the
+    # elevation("vice_root") marker does, rather than let it surface as a
+    # bare fixture error the notice below never learns about.
+    vice_a: ViceProcess | None = None
+    vice_b: ViceProcess | None = None
 
     try:
-        vice_a.start()
-        vice_b.start()
+        vice_a = start_vice_or_skip(config_a, request.node.nodeid)
+        vice_b = start_vice_or_skip(config_b, request.node.nodeid)
         transport_a = connect_binary_transport(port_a, proc=vice_a)
         transport_b = connect_binary_transport(port_b, proc=vice_b)
         try:
@@ -398,8 +403,10 @@ def bridge_vice_pair():
             transport_a.close()
             transport_b.close()
     finally:
-        vice_a.stop()
-        vice_b.stop()
+        if vice_a is not None:
+            vice_a.stop()
+        if vice_b is not None:
+            vice_b.stop()
         allocator.release(port_a)
         allocator.release(port_b)
 

@@ -53,7 +53,7 @@ from ethernet_scenarios import (
     run_tx_scenario,
 )
 
-from conftest import connect_binary_transport
+from conftest import connect_binary_transport, start_vice_or_skip
 
 # ---------------------------------------------------------------------------
 # Skip helpers
@@ -143,7 +143,7 @@ def _binary_wait_for_text(
 
 
 @pytest.fixture(scope="module")
-def vice_ethernet():
+def vice_ethernet(request):
     """Launch VICE with RR-Net on the TAP interface, yield transport."""
     allocator = PortAllocator(port_range_start=6511, port_range_end=6531)
     port = allocator.allocate()
@@ -161,7 +161,12 @@ def vice_ethernet():
         ethernet_driver=ETHERNET_DRIVER,
     )
 
-    with ViceProcess(config) as vice:
+    # start_vice_or_skip: converts a mid-launch ViceElevationRequiredError
+    # (e.g. the preflight probe was bypassed with MACOS_PCAP_ENABLED=1)
+    # into the same skip-or-fail + record the elevation("vice_root")
+    # marker uses, instead of a bare fixture error.
+    vice = start_vice_or_skip(config, request.node.nodeid)
+    try:
         transport = connect_binary_transport(port, proc=vice)
         try:
             grid = _binary_wait_for_text(transport, "READY.", timeout=30)
@@ -170,6 +175,8 @@ def vice_ethernet():
         finally:
             transport.close()
             allocator.release(port)
+    finally:
+        vice.stop()
 
 
 def _open_capture_or_verdict(iface: str) -> PacketCapture:
