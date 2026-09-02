@@ -19,18 +19,18 @@ if TYPE_CHECKING:
     from .backends.unified_manager import TestTarget
     from .backends.vice_binary import BinaryViceTransport
 
-from .execution_policy import ExecutionPolicyError, check_execution_policy
+from .execution_policy import check_execution_policy
 from .memory_policy import MemoryPolicyError
 from .transport import TransportError, TimeoutError
 
 _VALID_REGS = {"A", "X", "Y", "SP", "PC"}
 
 #: What hang recovery folds into ``RoutineHung.detail`` instead of letting
-#: escape: the wire (TransportError, OSError) and the two policies that
-#: can refuse the RTS write or the probe call.  Anything else is a bug in
-#: the harness and should surface as itself.
-_RECOVERY_ERRORS = (TransportError, OSError, MemoryPolicyError,
-                    ExecutionPolicyError)
+#: escape: the wire (TransportError, OSError) and the memory policy, which
+#: can refuse the trampoline rewrite.  Not the execution policy: the probe
+#: goes through ``_jsr_once``, which never consults it.  Anything else is
+#: a bug in the harness and should surface as itself.
+_RECOVERY_ERRORS = (TransportError, OSError, MemoryPolicyError)
 
 
 class RoutineHung(TimeoutError):
@@ -77,6 +77,21 @@ class RoutineHung(TimeoutError):
             f"routine at ${addr:04X} did not return within {elapsed:.1f}s"
             f"{where}; machine {state}{tail}"
         )
+
+    def __reduce__(self):
+        # BaseException's default reduce replays ``cls(*self.args)``, which
+        # cannot satisfy the keyword-only signature; exceptions cross
+        # process boundaries in run_parallel, so spell out the rebuild.
+        return (
+            _rebuild_routine_hung,
+            (self.addr, self.recovered, self.elapsed, self.detail, self.hung_pc),
+        )
+
+
+def _rebuild_routine_hung(addr, recovered, elapsed, detail, hung_pc):
+    """Unpickle target for :class:`RoutineHung` (module-level so it resolves)."""
+    return RoutineHung(addr, recovered=recovered, elapsed=elapsed,
+                       detail=detail, hung_pc=hung_pc)
 
 
 def load_code(transport: BinaryViceTransport, addr: int, code: bytes | list[int]) -> None:
@@ -313,7 +328,9 @@ def jsr(
     page leaves later tests to find that out for themselves.  A stop at
     a PC other than the landing — the caller's own checkpoint inside the
     routine — reaches this path too, because :func:`wait_for_pc` reports
-    it as a ``TimeoutError``.  A JAM opcode is a different failure altogether — the
+    it as a ``TimeoutError``; the message that distinguishes the two
+    ("No stopped event within Ns" versus "PC did not reach ... (stopped
+    at $xxxx)") is chained as ``__cause__``.  A JAM opcode is a different failure altogether — the
     transport reports it as a :class:`~.transport.TransportError`, not a
     timeout, and recovery does not engage.
 
@@ -334,15 +351,16 @@ def jsr(
     started = time.monotonic()
     try:
         return _jsr_once(transport, addr, timeout, scratch_addr)
-    except TimeoutError:
+    except TimeoutError as exc:
         elapsed = time.monotonic() - started
+        cause = exc  # the name ``exc`` is unbound once the block ends
     recovered, detail, hung_pc = _recover_from_hang(
         transport, saved_regs, scratch_addr,
     )
     raise RoutineHung(
         addr, recovered=recovered, elapsed=elapsed, detail=detail,
         hung_pc=hung_pc,
-    )
+    ) from cause
 
 
 # ---------------------------------------------------------------------------

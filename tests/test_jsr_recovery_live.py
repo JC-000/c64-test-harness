@@ -25,7 +25,9 @@ from c64_test_harness.transport import TimeoutError
 pytestmark = pytest.mark.vice_live
 
 #: Harness-claimed scratch page (docs/memory_safety.md); clear of BASIC,
-#: the KERNAL workspace, and the cassette-buffer trampolines.
+#: the KERNAL workspace, and the trampolines.  $C000 sits inside the UCI
+#: stub block, which is harmless on VICE (no UCI) -- the same address
+#: tests/test_vice_jam_live.py uses.
 COUNTER_ADDR = 0xC000
 HANG_ADDR = 0xC100
 INC_ADDR = 0xC110

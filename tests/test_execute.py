@@ -418,7 +418,10 @@ def test_run_subroutine_custom_trampoline_addr():
 # restores SP and proves the trampoline is live again before re-raising.
 # All mock-based; the live counterpart is tests/test_jsr_recovery_live.py.
 
-from c64_test_harness.execute import RoutineHung  # noqa: E402
+from c64_test_harness.execute import (  # noqa: E402
+    RECOVERY_PROBE_TIMEOUT,
+    RoutineHung,
+)
 
 
 def test_routine_hung_is_a_transport_timeout_error():
@@ -429,15 +432,18 @@ def test_routine_hung_is_a_transport_timeout_error():
 
 
 def test_routine_hung_carries_recovery_facts():
+    # addr != hung_pc so the message's "(CPU at $xxxx)" clause is checked
+    # on its own, not satisfied by the routine address.
     exc = RoutineHung(0xC100, recovered=False, elapsed=1.5,
-                      detail="recovery jsr timed out", hung_pc=0xC100)
+                      detail="recovery jsr timed out", hung_pc=0xC1A0)
     assert exc.addr == 0xC100
     assert exc.recovered is False
     assert exc.elapsed == 1.5
     assert exc.detail == "recovery jsr timed out"
-    assert exc.hung_pc == 0xC100
+    assert exc.hung_pc == 0xC1A0
     msg = str(exc)
     assert "$C100" in msg
+    assert "(CPU at $C1A0)" in msg
     assert "1.5" in msg
     assert "not recovered" in msg
     assert "recovery jsr timed out" in msg
@@ -538,8 +544,8 @@ def test_jsr_recover_on_timeout_success():
     ]
     assert t._checkpoint_history == [0x0337, 0x0337]
     assert t._resume_count == 2
-    # The probe used its own short timeout, not the caller's.
-    assert t.wait_calls[1] is not None and t.wait_calls[1] != 2.0
+    # The probe used its own short timeout, not the caller's 2.0.
+    assert t.wait_calls == [2.0, RECOVERY_PROBE_TIMEOUT]
     # Nothing left armed.
     assert len(t._checkpoints) == 0
 
@@ -754,3 +760,33 @@ def test_jsr_recovery_lets_a_harness_bug_escape_rather_than_folding_it():
     t.set_registers = bad_set
     with pytest.raises(ValueError, match="Unknown register"):
         jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
+
+
+# -- review nits --------------------------------------------------------------
+
+def test_routine_hung_survives_a_pickle_round_trip():
+    """Exceptions cross process boundaries in run_parallel and in pytest's
+    xdist-style reporting; a kw-only __init__ breaks the default reduce."""
+    import pickle
+
+    exc = RoutineHung(0xC100, recovered=False, elapsed=1.5,
+                      detail="recovery probe failed: x", hung_pc=0xC1A0)
+    back = pickle.loads(pickle.dumps(exc))
+    assert type(back) is RoutineHung
+    assert (back.addr, back.recovered, back.elapsed, back.detail, back.hung_pc) == (
+        0xC100, False, 1.5, "recovery probe failed: x", 0xC1A0,
+    )
+    assert str(back) == str(exc)
+
+
+def test_routine_hung_chains_the_original_timeout_as_cause():
+    """The transport's own message ('No stopped event within 2.0s', or
+    wait_for_pc's 'PC did not reach ... (stopped at $xxxx)' when a user
+    checkpoint fired inside the routine) must not be lost."""
+    t = _hang_then_recover()
+    with pytest.raises(RoutineHung) as excinfo:
+        jsr(t, 0xC100, timeout=2.0, recover_on_timeout=True)
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, TimeoutError)
+    assert not isinstance(cause, RoutineHung)
+    assert str(cause) == "No stopped event within 2.0s"
