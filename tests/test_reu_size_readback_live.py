@@ -45,7 +45,9 @@ Env gates (all unset -> everything skips cleanly):
 
 What the mutating tests touch: ``C64 and Cartridge Settings`` /
 ``RAM Expansion Unit`` and ``REU Size`` (via ``set_reu`` / ``restore_state``),
-plus a same-value ``Cartridge`` PUT as a control. The stock category is
+a ``Cartridge=""`` smoke PUT, and one per-category
+``configs/<C64 and Cartridge Settings>:load_from_flash`` (the flash-vs-RAM
+measurement; every item it changes is PUT back). The stock category is
 snapshotted before any write and every mutating test ends by diffing the
 full category against that snapshot. Never: ``save_config_to_flash``,
 ``reset``, ``reboot``, ``poweroff``.
@@ -341,4 +343,88 @@ def test_set_reu_readback_is_immediate_and_restore_is_exact(
     assert _diff(stock, restored) == {}, (
         f"category differs from the pre-write snapshot after restore_state: "
         f"{_diff(stock, restored)!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Step 5 — flash vs RAM: a reload from flash moves REU Size, no config write   #
+# --------------------------------------------------------------------------- #
+
+@requires_mutate
+def test_flash_reload_moves_reu_size_without_a_config_write(
+    client: Ultimate64Client, stock: dict, record_property
+) -> None:
+    """``configs:load_from_flash`` changes ``REU Size`` with no PUT to the item.
+
+    Firmware (branch ``issue-807``, ``software/api/route_configs.cc``): a
+    config PUT "takes effect at once but lives only in memory ... until the
+    device reboots ... unless ``configs:save_to_flash`` writes it" (:239,
+    :329); ``load_from_flash`` "throws away the settings in memory and reads
+    them back from flash" (:374) — which is also what a boot does. So a lane
+    that PUT ``REU Size`` and never saved, followed by any reboot or
+    power-cycle, flips the read-back with no config write anywhere.
+    Measured on this bench (U64E fw 3.15, 2026-09-01 local = 02:39 UTC
+    2026-09-02): RAM held ``512 KB``, flash held ``2 MB`` — the item
+    default and exactly the reporter's second value.
+
+    Mechanism (hard assertions): the per-category reload leaves the item at
+    the flash value, not at what was PUT; the change is visible at once (no
+    reset). Bench-state (labelled): flash holds the item default ``"2 MB"``
+    — nobody on this bench has saved a non-default REU size. If that ever
+    changes, the assertion says the flash contents moved, not the mechanism.
+
+    Blast radius: the per-category form reloads only ``C64 and Cartridge
+    Settings`` (``/v1/configs/<category>:load_from_flash``; live-verified
+    that ``U64 Specific Settings`` is untouched). Every item the reload
+    changed is PUT back from ``stock`` in the ``finally`` — ``restore_state``
+    alone is not enough here (live: flash also differed in ``Command
+    Interface``, which the snapshot does not carry).
+    """
+    reu_item = _item(client, _ITEM_REU_SIZE)
+    default_size = reu_item.get("default")
+    record_property("reu_size_default", default_size)
+    record_property("reu_size_ram_at_entry", stock[_ITEM_REU_SIZE])
+
+    # Make RAM differ from whatever flash holds via a plain item PUT (no
+    # save_to_flash), so the reload has something to undo even on a freshly
+    # booted bench where RAM == flash.
+    ram_target = next(v for v in ("1 MB", "4 MB") if v != stock[_ITEM_REU_SIZE])
+    try:
+        client.set_config_item(CAT_CART, _ITEM_REU_SIZE, ram_target)
+        _before, cfg_before = _observe(client, f"after PUT REU Size={ram_target!r}")
+        assert cfg_before[1] == ram_target
+
+        t0 = time.monotonic()
+        client.load_config_from_flash(CAT_CART)
+        print(f"[load_from_flash] {CAT_CART!r} in {time.monotonic() - t0:.3f}s")
+        after, cfg_after = _observe(client, "immediately after load_from_flash")
+        flash_size = cfg_after[1]
+        record_property("reu_size_flash", flash_size)
+        record_property("flash_vs_stock_diff", _diff(stock, after))
+        print(f"[flash vs stock] {_diff(stock, after)!r}")
+
+        # Mechanism: the PUT was volatile; the reload replaced it with the
+        # flash value, with no write to the item and no reset.
+        assert flash_size != ram_target, (
+            f"REU Size still {ram_target!r} after load_from_flash — the PUT "
+            f"reached flash, or the reload did not replace memory"
+        )
+        assert flash_size in reu_item["values"]
+        # Bench-state: flash holds the item default (the reporter's second value).
+        assert flash_size == default_size == "2 MB", (
+            f"bench-state changed: flash holds REU Size {flash_size!r} "
+            f"(item default {default_size!r}) — someone saved a non-default "
+            f"REU size to flash; the mechanism assertions above still stand"
+        )
+    finally:
+        # Put back every item the reload (or our PUT) changed, from the
+        # pre-write snapshot — not just the REU pair.
+        now = _category(client)
+        for item, (want, _got) in _diff(stock, now).items():
+            client.set_config_item(CAT_CART, item, want)
+
+    restored, cfg_restored = _observe(client, "after full-category restore")
+    assert cfg_restored[1] == stock[_ITEM_REU_SIZE]
+    assert _diff(stock, restored) == {}, (
+        f"category differs from the pre-write snapshot: {_diff(stock, restored)!r}"
     )

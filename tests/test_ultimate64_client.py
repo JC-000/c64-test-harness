@@ -576,6 +576,25 @@ def test_config_flash_endpoints():
     ]
 
 
+def test_load_config_from_flash_single_category():
+    """Per-category reload hits ``/v1/configs/<category>:load_from_flash``.
+
+    The category is percent-encoded as one path segment; the ``:load_from_flash``
+    suffix stays literal. An empty category is a local ValueError, not a wire call.
+    """
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        c.load_config_from_flash("C64 and Cartridge Settings")
+        with pytest.raises(ValueError):
+            c.load_config_from_flash("")
+    assert [r[0].get_full_url() for r in captured] == [
+        "http://h/v1/configs/C64%20and%20Cartridge%20Settings:load_from_flash",
+    ]
+    assert captured[0][0].get_method() == "PUT"
+    assert captured[0][0].data is None
+
+
 # ---------------------------------------------------------------- drives mount
 def test_mount_disk_multipart_body():
     mock, captured = _capture(b"")
