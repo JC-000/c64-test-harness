@@ -12,7 +12,7 @@ The package is `c64_test_harness`. All public symbols are re-exported from the t
 
 ## Memory Safety (`MemoryPolicy`)
 
-The harness has fixed scratch addresses (`$0334` `jsr` trampoline, `$0360` + `$03F0`-`$03F1` `run_subroutine`, `$C000-$C3FF` UCI block, `$C000` + `$033C` + `$0339` SID player). Any host-side `write_memory()` into a region the consumer also uses silently collides — the 6502 has no MMU. `MemoryPolicy` enforces an allow-list / deny-list at the transport boundary; violations raise `MemoryPolicyError` before any byte crosses the wire.
+The harness has fixed scratch addresses (authoritative list: `HARNESS_SCRATCH` in `memory_policy.py`, rendered into `docs/memory_safety.md` by `scripts/gen_memory_table.py`; highlights: `$0334` jsr trampoline, `$0360`+`$03F0`-`$03F1` `run_subroutine`, `$0277`/`$00C6` keyboard buffer, `$C000-$C3FF` UCI block, `$C400-$C87D` UCI socket-write scratch, `$C000`+`$0339`+`$033C` SID player, `$CF00` test-suite BASIC-restore stub). Any host-side `write_memory()` into a region the consumer also uses silently collides — the 6502 has no MMU. `MemoryPolicy` enforces an allow-list / deny-list at the transport boundary; violations raise `MemoryPolicyError` before any byte crosses the wire.
 
 ```python
 from c64_test_harness import MemoryPolicy, MemoryRegion, UnknownPolicy
@@ -44,7 +44,7 @@ arbiter = MemoryArbiter(policy=cfg.memory_policy)
 trampoline_addr = arbiter.alloc(117, name="trampoline")
 ```
 
-The arbiter is NOT the safety mechanism (the policy on the transport is). Even code that bypasses the arbiter and hardcodes an address is still checked. Full design in `docs/memory_safety.md`.
+The arbiter is NOT the safety mechanism (the policy on the transport is). Even code that bypasses the arbiter and hardcodes an address is still checked. By default it withholds every non-transient `HARNESS_SCRATCH` entry (issue #169) — `MemoryArbiter(policy, exclude_harness_scratch=False)` opts out; `arbiter.is_free(addr, length=1)` asks whether a span would be handed out. `MemoryPolicy.from_prg()` warns when the load image overlaps harness scratch; `policy.harness_scratch_overlaps()` lists the pairs. Full design in `docs/memory_safety.md`.
 
 ---
 

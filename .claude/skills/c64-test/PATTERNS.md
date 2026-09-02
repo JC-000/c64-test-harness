@@ -858,7 +858,7 @@ This emits a nested delay-loop fence (~52 µs at 48 MHz, ~2.5 ms at 1 MHz, 16 by
 
 ## Pattern 12: Memory Safety with `MemoryPolicy`
 
-The harness writes to fixed scratch addresses (`$0334` jsr trampoline, `$0360`+`$03F0`-`$03F1` `run_subroutine`, `$C000-$C3FF` UCI, `$C000`+`$033C`+`$0339` SID player). If the consumer's program also occupies those addresses, host-side `write_memory()` calls silently corrupt RAM — the 6502 has no MMU and no exception fires. `MemoryPolicy` is the transport-layer guard that catches collisions before any byte hits the wire.
+The harness writes to fixed scratch addresses (authoritative list: `HARNESS_SCRATCH` in `memory_policy.py`, rendered into `docs/memory_safety.md` by `scripts/gen_memory_table.py`; highlights: `$0334` jsr trampoline, `$0360`+`$03F0`-`$03F1` `run_subroutine`, `$0277`/`$00C6` keyboard buffer, `$C000-$C3FF` UCI block, `$C400-$C87D` UCI socket-write scratch, `$C000`+`$0339`+`$033C` SID player, `$CF00` test-suite BASIC-restore stub). If the consumer's program also occupies those addresses, host-side `write_memory()` calls silently corrupt RAM — the 6502 has no MMU and no exception fires. `MemoryPolicy` is the transport-layer guard that catches collisions before any byte hits the wire.
 
 ### Default is permissive — no behaviour change for existing tests
 

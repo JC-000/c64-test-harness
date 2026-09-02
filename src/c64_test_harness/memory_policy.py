@@ -344,7 +344,7 @@ HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
     ),
     ScratchRegion(
         0xC000, 0xC400,
-        owner="uci_network (build_uci_command, _execute_uci_routine)",
+        owner="uci_network._execute_uci_routine / build_uci_command",
         purpose="UCI stub block: code $C000, data $C100, response $C200, "
                 "status $C300, lengths $C3F0-$C3F3, sentinel $C3FE, "
                 "error $C3FF",
@@ -380,7 +380,7 @@ HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
     ScratchRegion(
         0xCF00, 0xCF04,
         owner="tests/test_vice_core.py::_restore_basic (also "
-              "scripts/vice_keyecho_probe.py, scripts/vice_stall_probe.py)",
+              "scripts/vice_keyecho_probe.py + scripts/vice_stall_probe.py)",
         purpose="CLI; JMP $E5CD stub returning the CPU to BASIC MAINLOOP "
                 "before every screen/keyboard test — test-suite scratch, "
                 "not library",
