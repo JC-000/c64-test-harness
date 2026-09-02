@@ -216,10 +216,12 @@ Prerequisites:
   runs (`/opt/homebrew/bin/x64sc` — the literal path, not its Cellar
   symlink target). Being *permitted* to sudo is not enough: a launch that
   stops at a password prompt is a failed launch.
-* `/dev/bpf*` permissions are **not** a prerequisite. VICE never reads
-  those nodes, and `chmod o+rw /dev/bpf*` changes nothing it consults —
-  running as root is what makes capture work. (Wireshark's ChmodBPF
-  helper is still useful for `tcpdump` as your own user.)
+* `/dev/bpf*` permissions are **not** a prerequisite for VICE. It never
+  reads those nodes, and `chmod o+rw /dev/bpf*` changes nothing it
+  consults — running as root is what makes *its* capture work. They
+  **are** the prerequisite for the harness's own unelevated host-side
+  capture (`c64_test_harness.capture`, the TX/RX tests) — see
+  "Host-side capture" below.
 * The c64-test-harness package (`c64_test_harness.bridge_ping`)
 
 Notes:
@@ -238,6 +240,57 @@ Notes:
   `ViceConfig` mapping handles this automatically when
   `ethernet_driver="pcap"` is set — see `tests/bridge_platform.py` for
   the `ETHERNET_DRIVER` constant that the fixtures read.
+
+### Host-side capture on macOS (issue #158)
+
+`tests/test_ethernet.py`'s TX and RX tests check that a frame the C64
+transmits actually reaches the wire, and inject a frame for it to
+receive. On Linux that is an `AF_PACKET` socket; macOS has none, so until
+`c64_test_harness.capture` existed those two tests skipped on the primary
+bench and nothing verified emitted frames host-side at all.
+
+`open_capture(iface)` returns the platform's `PacketCapture`
+(`recv(timeout, match=...)`, `send(frame)`): `AfPacketCapture` on Linux,
+`BpfCapture` on macOS. `BpfCapture` opens the lowest `/dev/bpfN` this
+process may, then `BIOCIMMEDIATE`, `BIOCSHDRCMPLT` (injected source MACs
+are left alone), `BIOCSSEESENT`, `BIOCSETIF`, `BIOCPROMISC`; reads are
+runs of `bpf_hdr` records split by `parse_bpf_records()` (pinned by hand-
+built headers in `tests/test_capture.py`). It needs **no elevation** —
+only a node the process can open.
+
+What the bench looks like (measured 2026-09-01, uid 501):
+
+* `/dev/bpf0-3` are `crw----rw-` — a manual `chmod o+rw`; there is no
+  ChmodBPF LaunchDaemon and no `access_bpf` group, so **the mode does not
+  survive a reboot**. `/dev/bpf4-7` are root-only, and macOS creates
+  further nodes on demand *only for root*.
+* A root VICE takes the lowest two free nodes per instance — i.e. exactly
+  the ones the chmod opened. With one VICE up and one stray holder
+  (`netstat -B` lists them), one node is left for the harness.
+* Full unelevated sequence verified: open `/dev/bpf1`, `BIOCGBLEN`=4096,
+  `BIOCSETIF feth0`, `BIOCGDLT`=1 (EN10MB), `BIOCPROMISC`.
+
+When nothing can be opened, `open_capture` raises `CaptureUnavailable`
+whose message carries the operator remedy verbatim, and the two tests
+skip **with that message as the reason** — only then. When a capture is
+open, a silent wire is a **failure**: `run_tx_scenario` raises when no
+frame with the test ethertype arrives, and `run_rx_scenario` raises on a
+failed host send or a C64 poll timeout (the old code swallowed the send
+error and skipped on the timeout). `tests/test_ethernet_capture_wiring.py`
+proves both with fakes.
+
+Remedy after a reboot or when the pool is short (no sudoers change):
+
+```bash
+sudo chmod o+rw /dev/bpf*
+```
+
+The tests open the capture *after* the module's VICE fixture has taken
+its nodes, so the availability probe reflects the pool this process
+really has. No `tcpdump` NOPASSWD rule exists or is needed; if an
+operator prefers sudoers over chmod, `someone ALL=(root) NOPASSWD:
+/usr/sbin/tcpdump` would enable a subprocess path the harness does not
+currently implement.
 
 ### macOS test-author traps (live tests only)
 
