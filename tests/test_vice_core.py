@@ -49,6 +49,13 @@ _SCREEN_CELLS = 40 * 25
 #: :func:`_wait_for_text_binary` call, read by the failure report.
 _LAST_POLL_TRACE: list[int] = []
 
+#: ``transport._resume_generation`` when the last :func:`_wait_for_text_binary`
+#: began.  The failure report counts only JAM events tagged at or after it:
+#: the fixture is module-scoped and nothing in the poll loop drains
+#: ``_event_queue``, so an earlier test's JAM would otherwise be blamed on
+#: every later failure.
+_LAST_POLL_START_GEN: list[int] = []
+
 
 def _wait_for_text_binary(transport, needle, timeout=15.0, poll_interval=1.0):
     """Poll screen for *needle*, resuming the CPU between reads.
@@ -74,6 +81,7 @@ def _wait_for_text_binary(transport, needle, timeout=15.0, poll_interval=1.0):
     needle_upper = needle.upper()
     deadline = time.monotonic() + timeout
     trace: list[int] = []
+    _LAST_POLL_START_GEN[:] = [getattr(transport, "_resume_generation", 0)]
     try:
         while time.monotonic() < deadline:
             grid = ScreenGrid.from_transport(transport)
@@ -183,19 +191,31 @@ def _machine_failure_report(transport, needle: str) -> str:
         )
     except Exception as e:
         lines.append(f"could not sample the raster: {type(e).__name__}: {e}")
-    # A frozen raster is also what a JAM looks like: under JAMAction 0 an
-    # illegal opcode stops the whole machine and VICE queues a 0x61 event
-    # that nothing in the poll loop reads.  The issue #170 capture was
-    # exactly that -- reported above as bug 6 until the queue was checked.
+    # Under JAMAction 0 an illegal opcode enters the monitor and VICE
+    # queues a 0x61 event that nothing in the poll loop reads.  The issue
+    # #170 capture had one: the 6510 was jammed in CHRGET, and the report
+    # above had nothing to say about it until the queue was checked.
+    # Only events tagged at or after the failing wait's first resume
+    # generation are this failure's; the queue is never drained here, so
+    # an earlier test's JAM would otherwise be reported forever.
     try:
-        jams = [resp for _, resp in getattr(transport, "_event_queue", ())
+        now = getattr(transport, "_resume_generation", 0)
+        start = _LAST_POLL_START_GEN[0] if _LAST_POLL_START_GEN else now
+        jams = [gen for gen, resp in getattr(transport, "_event_queue", ())
                 if resp.response_type == 0x61]
-        if jams:
+        fresh = [g for g in jams if g >= start]
+        if fresh:
             lines.append(
-                f"{len(jams)} JAM event(s) (0x61) queued  <- the 6510 hit "
-                "an illegal opcode and JAMAction 0 stopped the machine. "
-                "The frozen raster above is that stop, NOT bug 6; the PC "
-                "below is the jammed instruction."
+                f"{len(fresh)} JAM event(s) (0x61) queued since this wait "
+                f"began (resume generation {start}..{now})  <- the 6510 hit "
+                "an illegal opcode and JAMAction 0 stopped it; the PC below "
+                "is the jammed instruction."
+            )
+        elif jams:
+            lines.append(
+                f"{len(jams)} older JAM event(s) in the queue, from before "
+                f"this wait began (generations {sorted(jams)}, wait began "
+                f"at {start}) -- an earlier test's, not this failure's"
             )
     except Exception as e:
         lines.append(f"could not scan the event queue: {type(e).__name__}: {e}")
@@ -268,7 +288,10 @@ def _machine_failure_report(transport, needle: str) -> str:
             + ("intact" if chrget == master else
                f"CORRUPTED -> {bytes(chrget).hex(' ')} (ROM master "
                f"{bytes(master).hex(' ')}); something executed in zero "
-               "page -- check SP and the stack frame")
+               "page -- check SP and the stack frame. Both reads go "
+               "through the CPU bank, so with the KERNAL banked out "
+               "($01 bit 1 clear) the 'master' is RAM and this line is "
+               "spurious")
         )
     except Exception as e:
         lines.append(f"could not read CHRGET: {type(e).__name__}: {e}")
@@ -767,10 +790,13 @@ class TestRestoreBasicFromInterrupt:
             t.delete_checkpoint(bp)
         assert pc == _IRQ_RTI, f"checkpoint stopped at {pc:#06x}, not the RTI"
         regs = t.read_registers()
-        frame = t.read_memory(0x0100 + regs["SP"] + 1, 3)
-        assert frame[1] | (frame[2] << 8) >= 0xA000, (
-            f"expected an interrupt frame returning into ROM above SP, got "
-            f"{frame.hex(' ')} at SP={regs['SP']:#04x}"
+        frame = t.read_memory(0x0100 + regs["SP"] + 1, 3)  # P, PCL, PCH
+        ret = frame[1] | (frame[2] << 8)
+        assert 0xE5CD <= ret <= 0xE5D6, (
+            f"expected the interrupt frame above SP to return into the idle "
+            f"loop $E5CD-$E5D5 (the machine was idle when the IRQ fired), got "
+            f"{frame.hex(' ')} -> ${ret:04x} at SP={regs['SP']:#04x}. That "
+            "frame is what the old restore left for CHRIN's RTS to pop."
         )
 
         _restore_basic(t)  # <- under test: called with that frame on the stack
