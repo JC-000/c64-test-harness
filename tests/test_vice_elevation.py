@@ -278,7 +278,44 @@ def test_elevation_error_carries_a_runnable_command(monkeypatch):
     assert "/opt/eth/x64sc" in err.sudoers_entry
     assert "NOPASSWD" in err.sudoers_entry
     assert err.sudoers_entry in str(err)
-    assert err.command in str(err)
+    # _eth_argv() carries -addconfig /tmp/x.rc, a per-launch temp file
+    # (see test_the_addconfig_temp_path_is_not_pasted_into_the_remedy
+    # below): the message shows a placeholder for it instead of the raw
+    # command, but err.command itself is still the exact, real,
+    # programmatically re-runnable argv.
+    assert err.command.startswith("sudo /opt/eth/x64sc -addconfig /tmp/x.rc")
+    assert "/tmp/x.rc" not in str(err)
+
+
+def test_the_addconfig_temp_path_is_not_pasted_into_the_remedy(monkeypatch):
+    """The rc ViceProcess writes for -addconfig is a per-launch temp file
+    deleted right after this refusal (ViceProcess._cleanup_tmp_vicerc(),
+    called from stop(), which start() invokes on any failure -- see
+    vice_lifecycle.py), so pasting it verbatim hands the operator a
+    command that fails immediately with "No such file or directory".
+    The remedy must show a placeholder instead and still name the
+    sudoers rule as the durable, always-re-runnable fix (adversarial
+    review S4)."""
+    _as_uid(monkeypatch, 501)
+    monkeypatch.setattr(ve.sys, "platform", "darwin")
+    _no_sudo(monkeypatch)
+    cfg = ViceConfig(ethernet=True, ethernet_driver="pcap")
+    argv = [
+        "/opt/eth/x64sc", "-addconfig",
+        "/var/folders/xp/pg4rg55j7sqbcwz53hd9z8fw0000gn/T/vice_eth_zcaqela4.rc",
+        "-ethernetioif", "feth0", "-ethernetiodriver", "pcap",
+    ]
+    with pytest.raises(ve.ViceElevationRequiredError) as excinfo:
+        ve.plan_vice_launch(cfg, argv)
+    err = excinfo.value
+    msg = str(err)
+    assert "/var/folders" not in msg
+    assert "vice_eth_zcaqela4.rc" not in msg
+    assert ve._ADDCONFIG_PLACEHOLDER in msg
+    # The real, exact, programmatically re-runnable argv/command are
+    # untouched -- only what gets printed for a human to paste changes.
+    assert err.argv[3] == argv[2]
+    assert "/var/folders" in err.command
 
 
 def test_plan_refuses_an_unelevated_ethernet_launch_pinned_off(monkeypatch):

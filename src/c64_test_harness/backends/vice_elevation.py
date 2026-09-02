@@ -470,14 +470,52 @@ def _unelevated_allowed() -> bool:
     return os.environ.get(ALLOW_UNELEVATED_ENV, "").strip() == "1"
 
 
+#: Shown in the printed remedy in place of a ``-addconfig`` path -- see
+#: ``_display_command()``.
+_ADDCONFIG_PLACEHOLDER = "<the rc ViceProcess writes at launch>"
+
+
+def _display_command(interactive: list[str]) -> str:
+    """*interactive* rendered for a human to paste, not to exec.
+
+    ``ViceProcess.start()`` writes the ``-addconfig`` rc to a per-launch
+    temp file and ``stop()``'s ``_cleanup_tmp_vicerc()`` deletes it the
+    moment this refusal unwinds (``start()`` calls ``stop()`` on any
+    failure) -- so the literal path in *interactive* already points at a
+    file that is gone by the time an operator reads this message.
+    Pasting it verbatim fails immediately with "No such file or
+    directory", not with the elevation problem being reported. The path
+    argument immediately after ``-addconfig`` is replaced with a
+    placeholder; everything else, including the rest of the command,
+    stays exact.
+    """
+    rendered = list(interactive)
+    for i, arg in enumerate(rendered):
+        if arg == "-addconfig" and i + 1 < len(rendered):
+            rendered[i + 1] = _ADDCONFIG_PLACEHOLDER
+    return shlex.join(rendered)
+
+
 def _refuse(argv: list[str], binary: str, reason: str) -> ViceElevationRequiredError:
     # The remedy names the *resolved* binary, like ``binary`` and the
     # sudoers line do: sudoers matches the absolute command path (and
     # Linux sudoers commonly set secure_path), and the three must agree
     # so the pasted command is the one the pasted rule authorises.
     interactive = ["sudo", binary] + argv[1:]
+    # .command / .argv (below) stay the exact, real argv -- useful to a
+    # caller that wants to re-run this launch *programmatically*, right
+    # now, before the temp rc is cleaned up. Only the PRINTED remedy
+    # substitutes a placeholder for a path that won't outlive this call.
     command = shlex.join(interactive)
+    display_command = _display_command(interactive)
     entry = _sudoers_entry(binary)
+    addconfig_note = (
+        "    (the -addconfig path above is a per-launch temp file VICE "
+        "already deleted; the sudoers rule below is the durable, "
+        "always-re-runnable fix)\n"
+        if display_command != command
+        else ""
+    )
     message = (
         f"{reason}\n"
         f"VICE selects an ethernet driver only when "
@@ -486,7 +524,8 @@ def _refuse(argv: list[str], binary: str, reason: str) -> ViceElevationRequiredE
         f"SIGSEGVs on the first reset with no log output. "
         f"/dev/bpf* permissions are irrelevant — VICE never reads them.\n"
         f"Run this launch elevated:\n"
-        f"    {command}\n"
+        f"    {display_command}\n"
+        f"{addconfig_note}"
         f"Or authorise it for unattended runs by adding to sudoers "
         f"(visudo; the rule must name this exact path and must not be "
         f"bash-wrapped, because sudo matches its first non-flag argument):\n"
