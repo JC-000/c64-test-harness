@@ -202,14 +202,24 @@ ifconfig bridge10 inet 10.0.65.1 netmask 255.255.255.0 up
 
 Prerequisites:
 
-* `x64sc` (VICE 3.10 Homebrew bottle — pre-built with `--enable-ethernet`
-  and the pcap driver)
-* Root privileges for `ifconfig create`/`addm` (only for setup/teardown;
-  VICE itself runs unprivileged)
-* `/dev/bpf*` readable by your user — install Wireshark's **ChmodBPF**
-  helper (recommended) or `sudo chmod 666 /dev/bpf*` for a one-shot
-  (resets on reboot). Without this, VICE's pcap driver fails to attach
-  `feth0`/`feth1` with a `pcap_open_live` / BPF permission error.
+* `x64sc` — **the Homebrew bottle is the right binary**; no separately
+  built VICE is needed. It reports `HAVE_RAWNET yes` / `HAVE_PCAP yes`
+  (`HAVE_TUNTAP no`) to `x64sc -features` and links libpcap. Leave
+  `$VICE_ETHERNET_BIN` unset; it is an override, not a requirement.
+* Root privileges for `ifconfig create`/`addm` (setup/teardown) **and for
+  VICE itself**. VICE registers its pcap driver only when
+  `archdep_rawnet_capability()` holds — `geteuid() == 0` on macOS — so an
+  unelevated ethernet launch has no driver at all and SIGSEGVs on reset.
+  The harness refuses such a launch rather than crashing; see trap 2
+  below.
+* A NOPASSWD sudoers rule naming the exact x64sc path, for unattended
+  runs (`/opt/homebrew/bin/x64sc` — the literal path, not its Cellar
+  symlink target). Being *permitted* to sudo is not enough: a launch that
+  stops at a password prompt is a failed launch.
+* `/dev/bpf*` permissions are **not** a prerequisite. VICE never reads
+  those nodes, and `chmod o+rw /dev/bpf*` changes nothing it consults —
+  running as root is what makes capture work. (Wireshark's ChmodBPF
+  helper is still useful for `tcpdump` as your own user.)
 * The c64-test-harness package (`c64_test_harness.bridge_ping`)
 
 Notes:
@@ -255,12 +265,16 @@ The Linux equivalent (`tests/test_cleanup_vice_ports_live.py`) uses the
 `bash` wrapper because Linux sudoers there are configured permissively;
 do not copy that helper verbatim onto macOS.
 
-**2. `ViceConfig.ethernet=True` may auto-elevate the launch.**
-On macOS, `ViceConfig` resolves `run_as_root=True` when `ethernet=True`
-**and** this process cannot already open a `/dev/bpf*` node. Stock macOS
-keeps those root-only, so elevation is the default there; a rig that runs
-`sudo chmod o+rw /dev/bpf*` (as `scripts/setup-bridge-feth-macos.sh`
-instructs) makes them reachable and no sudo is used at all.
+**2. `ViceConfig.ethernet=True` needs root on macOS, and `/dev/bpf*` has
+nothing to do with it.**
+VICE admits an ethernet driver only when `archdep_rawnet_capability()`
+holds. That function is, in full: `geteuid() == 0`, plus a Linux-only
+`CAP_NET_RAW` branch (`src/arch/shared/archdep_rawnet_capability.c`). It
+never inspects `/dev/bpf*`. The result gates *driver selection* in
+`rawnetarch.c` (`set_ethernet_driver()` and `rawnet_arch_resources_init()`),
+so an unelevated macOS VICE leaves `rawnet_arch_driver` NULL and
+dereferences it in `rawnet_arch_pre_reset()` — **SIGSEGV with no log
+output at all**. It does not degrade to "no traffic"; it dies.
 
 **The `10.0.65.0/24` range belongs to the harness.** The setup scripts put
 the host at `.1` (`BRIDGE_ADDR`) and the ethernet tests answer on `.2` and
@@ -279,25 +293,98 @@ exactly the addresses the harness's two-VICE tests hardcode. Nothing
 detects that clash; the bridge tests simply fail or behave oddly while the
 consumer rig is up.
 
-**The BPF device pool is the real macOS constraint.** `sudo chmod o+rw
-/dev/bpf*` only affects nodes that exist *at that moment*. macOS creates
-further ones on demand with default root-only permissions, and an
-unprivileged process cannot grow the pool. Each pcap-attached VICE opens
-**two** BPF devices, so a rig with `/dev/bpf0..3` opened supports exactly
-**one** unprivileged VICE — a second forces `/dev/bpf4`/`bpf5` into
-existence as `crw-------` and dies with `rc=255`:
+Verified live that the euid gate, not `/dev/bpf*` permissions, is what
+VICE checks: with `/dev/bpf0` at `crw----rw-` (world read/write) and uid
+501, `-ethernetiodriver pcap` is still rejected.
+
+> An earlier version of this section claimed a rig that ran
+> `sudo chmod o+rw /dev/bpf*` needed no elevation. That rule was wrong —
+> it modelled libpcap's requirements rather than VICE's gate, and
+> `bpf_capture_available()` has been removed.
+>
+> The **pool observation is not retracted**: one VICE holding two
+> `/dev/bpf*` nodes and a second instance dying `rc=255` was recorded
+> correctly, under `sudo`, and only its context was lost. Re-verified
+> 2026-08-30 with `netstat -B`: a single elevated x64sc holds exactly two
+> BPF peers — one bound to the requested `feth`, one to another host
+> interface — and the count of nodes an unprivileged process can still
+> open drops by exactly two. That is the old `BPF_NODES_PER_VICE = 2`,
+> measured again. As root macOS creates further nodes on demand, so the
+> pool does not block a second instance the way it blocks an unprivileged
+> one, but a pool exhausted by another capturing process can still bite a
+> multi-instance run.
+
+### Issue #144 is refuted: the Homebrew bottle captures fine
+
+#144 recorded that *as root*, VICE answers the binary monitor while
+attaching no BPF device — i.e. that the Homebrew build's ethernet was
+silently non-functional and a separate build was required. **That is
+false.** Measured 2026-08-30, elevated, cart active, with the interface
+and driver supplied only through the `-addconfig` rc:
 
 ```
-A/feth0: ALIVE   bpf: ['/dev/bpf3', '/dev/bpf2']
-B/feth1: DIED rc=255
+wrapper=4636  x64sc=4637  owner=root  monitor=up
+  ETHERNET_DRIVER      = 'pcap'
+  ETHERNET_INTERFACE   = 'feth0'
+  ETHERNETCART_ACTIVE  = 1
+netstat -B:
+  bpf1  ap1    p---IO------  x64sc.4637
+  bpf2  feth0  p---IO------  x64sc.4637
 ```
 
-Single-instance work (a consumer rig such as c64-https) is therefore fine
-unprivileged, while the two-VICE bridge suite here is not. For the pair,
-either let it elevate, or pre-create and open `2 x <instances>` nodes as
-root before the run. `bpf_capture_available(min_nodes=...)` reports the
-pool at decision time; it cannot predict a concurrently starting VICE
-consuming the remainder.
+Two BPF descriptors, one bound to the requested interface, in
+promiscuous mode.
+
+The claim came from the harness's own measurement. `probe_vice_pcap_ok()`
+demanded a `/dev/bpf*` attach as proof of real capture — correctly — but
+read it with `lsof -nP -p <pid>` run **unelevated**. An unprivileged
+`lsof` cannot read a root-owned process's descriptor table at all: it
+returns *zero lines*, not zero `bpf` lines. Since every macOS pcap launch
+elevates, the helper returned `[]` every time, and the probe published
+that as a defect in the emulator build. Its own diagnostic string is what
+#144 was written from.
+
+### The rc alone is sufficient; the ethernet CLI flags are redundant
+
+The same elevated run settles a second question. `ViceProcess` writes an
+`-addconfig` rc *and* passes `-ethernetioif` / `-ethernetiodriver`, and
+two rc keys were misspelled (`EthernetIOIF` / `EthernetIODriver` — not
+VICE resources in any casing; the real names are `ETHERNET_INTERFACE`
+and `ETHERNET_DRIVER`). That was first recorded as harmless, because the
+CLI flags carried the same settings.
+
+It was worse than that. With the corrected names and **no ethernet CLI
+flags at all**, the rc on its own produces `ETHERNET_DRIVER='pcap'`,
+`ETHERNET_INTERFACE='feth0'`, `ETHERNETCART_ACTIVE=1` and two attached
+BPF peers. The rc is sufficient by itself, so the CLI flags are
+redundant rather than load-bearing — and the misspelling was harmless
+only on paths that happened to pass both. Any path relying on the rc
+alone was silently unconfigured. Hence the fix writes the real names
+rather than dropping the lines.
+
+The instrument is now `netstat -B` (`bpf_attached_interfaces()` in
+`tests/bridge_platform.py`), which reports device, bound interface and
+owning command, needs no privilege, and reads root-owned processes.
+`lsof` is the wrong tool for this measurement at any privilege level.
+Regression test: `tests/test_bpf_attach_detection.py`, which launches a
+real elevated VICE and asserts the attach is seen — it fails against the
+`lsof` implementation.
+
+So on macOS every pcap ethernet launch elevates. The harness refuses to
+launch one it cannot elevate: `plan_vice_launch()` (in
+`c64_test_harness.backends.vice_elevation`) parses the `NOPASSWD:` rules
+out of plain `sudo -n -l` (`sudo_can_run` → `parse_sudo_listing`; a
+per-command `sudo -n -l -- <x64sc>` probe exits 0 for anything a
+`(ALL) ALL` user may run and proves nothing) and, when no rule names the
+exact binary, raises `ViceElevationRequiredError` carrying
+the exact command to run and a NOPASSWD line naming that exact binary
+path — never `bash`-wrapped, since sudoers matches sudo's first non-flag
+argument. `VICE_ETHERNET_ALLOW_UNELEVATED=1` downgrades the refusal to a
+warning for a host that grants the capability some way we cannot see
+(Linux file capabilities, say).
+
+Linux is unaffected: the `tuntap` driver is selected without consulting
+the capability, so the Linux bridge suite needs no elevation.
 
 When elevation *does* fire, `ViceProcess` wraps the launch in
 `sudo -n x64sc …`, so the recorded `ViceProcess.pid` is the **sudo

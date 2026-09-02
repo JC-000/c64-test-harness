@@ -20,7 +20,6 @@ interaction explanation.
 
 from __future__ import annotations
 
-import shutil
 import socket
 import struct
 import time
@@ -47,7 +46,6 @@ from conftest import connect_binary_transport
 # Skip helpers
 # ---------------------------------------------------------------------------
 
-_HAS_X64SC = shutil.which("x64sc") is not None
 
 # Platform-dependent: Linux → first tap-*, macOS → first feth*.
 TAP_IFACE = first_available_ethernet_iface()
@@ -69,7 +67,7 @@ TAP_IFACE = first_available_ethernet_iface()
 _PCAP_OK, _PCAP_REASON = probe_vice_pcap_ok(iface=TAP_IFACE)
 
 pytestmark = [
-    pytest.mark.skipif(not _HAS_X64SC, reason="x64sc not found on PATH"),
+    pytest.mark.vice_live,
     pytest.mark.skipif(
         TAP_IFACE is None,
         reason=f"No ethernet interface available for VICE ({SETUP_HINT})",
@@ -270,7 +268,23 @@ FRAME_BUF = 0xC200
 
 
 def _can_open_raw_socket(iface: str) -> bool:
-    """Check if we can open a raw socket on the interface."""
+    """Whether we can capture frames off *iface* with an ``AF_PACKET`` socket.
+
+    ``AF_PACKET`` is Linux-only.  On macOS the attribute does not exist at
+    all, so this used to raise ``AttributeError`` straight through the
+    ``(PermissionError, OSError)`` handler and error the test rather than
+    skip it.  That went unnoticed while ``probe_vice_pcap_ok()`` skipped
+    the whole ethernet suite on macOS for an unrelated (and, as it turned
+    out, wrong) reason -- see docs/bridge_networking.md § "Issue #144 is
+    refuted".
+
+    macOS has no AF_PACKET equivalent; host-side capture there goes
+    through BPF/pcap, which these tests do not implement.  Returning
+    False produces an honest skip.  Porting them would mean writing a
+    BPF capture path -- a real gap, not a host limitation.
+    """
+    if not hasattr(socket, "AF_PACKET"):
+        return False
     try:
         s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
         s.bind((iface, 0))
@@ -286,7 +300,11 @@ class TestEthernetTX:
     @pytest.fixture(autouse=True)
     def _check_raw_socket(self) -> None:
         if TAP_IFACE is None or not _can_open_raw_socket(TAP_IFACE):
-            pytest.skip("Cannot open raw socket on TAP interface (need CAP_NET_RAW)")
+            pytest.skip(
+                "no AF_PACKET capture available on this host "
+                "(Linux needs CAP_NET_RAW; macOS has no AF_PACKET at all "
+                "and would need a BPF/pcap capture path, not implemented)"
+            )
 
     def test_send_broadcast_frame(self, vice_ethernet: BinaryViceTransport) -> None:
         """C64 sends a 64-byte broadcast frame; host captures it."""
@@ -383,7 +401,11 @@ class TestEthernetRX:
     @pytest.fixture(autouse=True)
     def _check_raw_socket(self) -> None:
         if TAP_IFACE is None or not _can_open_raw_socket(TAP_IFACE):
-            pytest.skip("Cannot open raw socket on TAP interface (need CAP_NET_RAW)")
+            pytest.skip(
+                "no AF_PACKET capture available on this host "
+                "(Linux needs CAP_NET_RAW; macOS has no AF_PACKET at all "
+                "and would need a BPF/pcap capture path, not implemented)"
+            )
 
     def test_receive_frame(self, vice_ethernet: BinaryViceTransport) -> None:
         """Host sends a frame to the TAP; C64 reads it via CS8900a RX."""

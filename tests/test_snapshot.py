@@ -21,12 +21,12 @@ the U64 fixture is available.
 from __future__ import annotations
 
 import logging
-import shutil
 import struct
 import time
 from pathlib import Path
 
 import pytest
+from conftest import require_vice_or_skip
 
 from c64_test_harness import (
     MemoryPolicy,
@@ -86,8 +86,7 @@ def vice_transport():
 
     Reused across the two VICE-touching tests to keep total runtime low.
     """
-    if shutil.which("x64sc") is None:
-        pytest.skip("x64sc not found on PATH")
+    require_vice_or_skip()
 
     allocator = PortAllocator(port_range_start=6611, port_range_end=6631)
     port = allocator.allocate()
@@ -244,6 +243,7 @@ class TestVsfCodec:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.vice_live
 def test_vice_accepts_our_emitted_vsf(vice_transport, tmp_path):
     """Emit a Snapshot to .vsf, load via undump_snapshot, confirm RAM.
 
@@ -271,6 +271,7 @@ def test_vice_accepts_our_emitted_vsf(vice_transport, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.vice_live
 def test_we_parse_vice_emitted_vsf(vice_transport, tmp_path):
     """VICE dumps a snapshot; we parse it and verify RAM round-trip."""
     marker = bytes(range(0x80, 0x90))  # distinctive from previous test's marker
@@ -435,19 +436,53 @@ class TestRestoreState:
 
 
 class TestExtractState:
-    def test_extract_reads_full_ram_and_cpu_port(self) -> None:
-        ram = _make_pattern_ram()
-        ram_buf = bytearray(ram)
-        ram_buf[0x00] = 0x2F  # cpu_port_dir
-        ram_buf[0x01] = 0x37  # cpu_port_data
-        ram = bytes(ram_buf)
+    """``extract_snapshot`` against a real transport.
 
-        class _Stub:
-            def read_memory(self, addr: int, length: int) -> bytes:
-                assert addr == 0x0000 and length == 65536
-                return ram
+    This class used to hold a stub whose ``read_memory`` asserted
+    ``addr == 0x0000 and length == 65536`` and returned a canned 64 KiB
+    buffer.  That is precisely the call VICE rejects, so the test
+    encoded the defect as the expectation and could never fail: VICE had
+    in fact never produced a snapshot.  ``read_memory`` is now exercised
+    for real.
+    """
 
-        snap = extract_snapshot(_Stub())
-        assert snap.ram == ram
-        assert snap.cpu_port_dir == 0x2F
-        assert snap.cpu_port_data == 0x37
+    @pytest.mark.vice_live
+    def test_extract_reads_full_ram_and_cpu_port(self, binary_transport) -> None:
+        """The CPU port fields come from the extract, not from the reset defaults.
+
+        This used to write ``2F 37`` -- the 6510's reset values -- so the
+        two port assertions passed whether or not the write, or the
+        extract, had happened.  The values below are non-default and
+        distinct, chosen so VICE reads them back exactly (S
+        ``c64pla.c:53-55``, ``c64mem.c:269``):
+
+        * ``$00 = $7F``: bits 3, 4 and 6 become outputs alongside the
+          default 0-2 and 5.  Reading ``$00`` returns ``pport.dir_read``,
+          which is the DDR as written (S ``c64pla.c:98``).
+        * ``$01 = $3F``: bits 0-2 stay ``111`` so the banking is untouched
+          (BASIC/KERNAL/I-O all still in -- the machine must survive the
+          restore below); bits 3-5 are outputs driven 1; bit 6 is an
+          output driven 0, so no capacitor-fade path applies (S
+          ``c64mem.c:327`` fades only when the bit is an *input*).
+          ``data_read = (data | ~dir) & (data_out | 0x17)`` gives
+          ``$3F`` for these inputs.
+
+        Both are put back to ``2F 37`` afterwards so the rest of the module
+        sees a stock port.
+        """
+        binary_transport.write_memory(0x0000, bytes([0x7F, 0x3F]))
+        try:
+            snap = extract_snapshot(binary_transport)
+
+            assert len(snap.ram) == 65536
+            assert snap.cpu_port_dir == 0x7F
+            assert snap.cpu_port_data == 0x3F
+            # The extract must agree with the same bytes fetched in slices
+            # small enough to have always worked.
+            piecewise = b"".join(
+                binary_transport.read_memory(base, 0x2000)
+                for base in range(0x0000, 0x10000, 0x2000)
+            )
+            assert snap.ram == piecewise
+        finally:
+            binary_transport.write_memory(0x0000, bytes([0x2F, 0x37]))

@@ -243,8 +243,7 @@ def connect_binary_transport(
 @pytest.fixture(scope="module")
 def binary_transport():
     """Boot VICE with binary monitor, yield a live BinaryViceTransport."""
-    if shutil.which("x64sc") is None:
-        pytest.skip("x64sc not found on PATH")
+    require_vice_or_skip()
 
     allocator = PortAllocator(port_range_start=6511, port_range_end=6531)
     port = allocator.allocate()
@@ -398,3 +397,193 @@ def bridge_vice_pair():
         vice_b.stop()
         allocator.release(port_a)
         allocator.release(port_b)
+
+
+# ---------------------------------------------------------------------------
+# The VICE live gate (``C64_REQUIRE_VICE``)
+# ---------------------------------------------------------------------------
+#
+# Every VICE live module used to carry its own
+# ``pytest.mark.skipif(shutil.which("x64sc") is None, ...)``.  Eighteen
+# copies of one predicate, and every one of them fails *open*: on a
+# machine with no emulator the entire live VICE surface skips, the run
+# is green, and what remains certifying the backend is the mocked layer
+# -- which asserts the harness against its own assumptions.  That is a
+# silent, total loss of coverage that looks exactly like success.
+#
+# The gate below replaces those copies.  Two properties matter:
+#
+# * **An operator can demand an emulator.**  With ``C64_REQUIRE_VICE=1``
+#   a missing ``x64sc`` is a hard failure, not a skip.  A developer who
+#   legitimately has no emulator leaves it unset and still gets the
+#   bare skip.
+#
+# * **It is a class-level guard, not an instance fix.**  The
+#   end-of-session check fires when *zero* live tests ran for any reason
+#   at all -- a missing binary, an import error, a stray ``skipif``
+#   someone adds next year, a ``-k`` that accidentally deselects the lot.
+#   No future module can quietly opt out of it, because nothing has to
+#   be remembered at the call site.
+#
+# **How much rides on it, measured -- once, and the figure is dated.**
+# The argv contract needs ``x64sc -help`` and is therefore live.  A
+# mutation sweep (``scripts/mutation/README.md``) put a number on what
+# that means at the time: 41 flag mutations across 23 flag families
+# survived the entire non-live suite and were killed only once the
+# contract ran -- ``-binarymonitor``, ``-remotemonitor*``, ``-sound*``,
+# ``-ethernetio*``, ``-addconfig``, ``-drive8type``, ``-default``,
+# ``-warp``, ``-ntsc``/``-pal``, ``+saveres``, ``-jamaction``,
+# ``-speed``, ``-limitcycles`` and more.  That sweep predates the
+# generator's hyphen fix (9bfb005) and its no-op exclusions (7873cb6),
+# and was taken against a population anchored at 6868168, which is not
+# an ancestor of this branch; treat "41 across 23" as illustrating the
+# shape, not as a current count.  The README carries the current
+# population and the commit it was counted at.
+#
+# The shape is what matters here: on a machine with no emulator those
+# families are validated by nothing at all, and this gate is the only
+# thing standing between the project and their silent unvalidation.
+# That also reframes the ``--ignore`` escape closed below: it was not a
+# tidy edge case but a way to switch off the sole guard for those flag
+# families and still exit green.
+
+#: Env var by which an operator declares an emulator must be present.
+REQUIRE_VICE_ENV = "C64_REQUIRE_VICE"
+
+#: Marker naming a test that needs a real ``x64sc``.
+VICE_LIVE_MARKER = "vice_live"
+
+_TRUTHY = {"1", "true", "yes", "on"}
+
+#: Count of live VICE tests whose body actually *executed*, read by the
+#: end-of-session check.  Incremented from the report hook rather than
+#: from setup: a test that setup lets through can still be skipped by a
+#: later mark, and counting intent instead of execution is precisely the
+#: vacuous pass this gate exists to stop.
+_vice_live_ran = 0
+
+
+def vice_is_required() -> bool:
+    """Whether the operator has declared an emulator must be present."""
+    return os.environ.get(REQUIRE_VICE_ENV, "").strip().lower() in _TRUTHY
+
+
+def vice_missing_reason() -> str | None:
+    """Why a VICE live test cannot run here, or ``None`` if it can."""
+    if shutil.which("x64sc") is None:
+        return "x64sc not found on PATH"
+    return None
+
+
+def require_vice_or_skip() -> None:
+    """Gate a live VICE code path: skip, or fail when one was demanded.
+
+    For fixtures and helpers that cannot carry a marker.  Test *modules*
+    should use ``pytestmark = pytest.mark.vice_live`` instead.
+    """
+    reason = vice_missing_reason()
+    if reason is None:
+        return
+    if vice_is_required():
+        pytest.fail(
+            f"{REQUIRE_VICE_ENV}=1 declares an emulator must be present, "
+            f"but {reason}. Refusing to skip: this run would certify the "
+            f"VICE backend entirely from mocks.",
+            pytrace=False,
+        )
+    pytest.skip(reason)
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        f"{VICE_LIVE_MARKER}: needs a real x64sc; gated by ${REQUIRE_VICE_ENV}",
+    )
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item):
+    """Enforce the gate before pytest's own skipif evaluation."""
+    if item.get_closest_marker(VICE_LIVE_MARKER) is None:
+        return
+    require_vice_or_skip()
+
+
+def pytest_runtest_logreport(report):
+    """Count live tests that genuinely ran a body (passed or failed).
+
+    A ``pytest.skip()`` *inside* the body still produces a ``call``
+    report, with ``outcome == "skipped"``.  It exercised no emulator, so
+    it must not count -- otherwise a run made entirely of such skips
+    would satisfy the gate while certifying the backend from mocks.
+    """
+    global _vice_live_ran
+    if (
+        report.when == "call"
+        and report.outcome != "skipped"
+        and VICE_LIVE_MARKER in getattr(report, "keywords", {})
+    ):
+        _vice_live_ran += 1
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Fail a required run in which no live VICE test actually executed.
+
+    The missing-binary case is already caught per-test.  This catches
+    every *other* way the surface can vanish, without having to
+    anticipate the reason.
+
+    **It deliberately does not exempt a run that collected no live tests.**
+    An earlier version returned early in that case, to leave room for
+    someone deliberately running a single mocked module.  That exemption
+    was the hole: ``pytest --ignore=tests/test_vice_core.py ...`` and
+    ``pytest tests/test_vice_binary_unit.py`` are both ordinary CI
+    invocations, both collect zero live tests, and both therefore exited
+    0 -- producing exactly the mocks-only green run the gate exists to
+    prevent, silently.
+
+    **The trade-off chosen.**  ``C64_REQUIRE_VICE=1`` now means "this
+    invocation must exercise a real emulator", and any run that does not
+    fails -- including running one mocked module, or a module with no
+    VICE tests at all.  The escape is to not make that claim: leave the
+    variable unset for subset and development runs, and set it on the
+    invocation that is supposed to cover the backend.  That is stricter
+    than necessary for a developer typing one module name, and it is the
+    only version that cannot be opted out of by an argument list, which
+    is the property being bought.
+    """
+    if not vice_is_required() or _vice_live_ran:
+        return
+    # A run that collected nothing at all has a different problem (an
+    # empty selection or a collection error), already reported as such.
+    if session.testscollected == 0:
+        return
+    collected = getattr(session, "_vice_live_collected", 0)
+    # Escalate a green run to a failure; never overwrite a status that is
+    # already saying something worse (INTERRUPTED=2, INTERNAL_ERROR=3), or
+    # a run that already failed on its own merits.
+    if session.exitstatus == 0:
+        session.exitstatus = 1
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        detail = (
+            f"{collected} were collected but none ran"
+            if collected
+            else "none were even collected — this selection contains no "
+                 "live VICE tests"
+        )
+        reporter.write_sep(
+            "=",
+            f"{REQUIRE_VICE_ENV}=1 declares this run must exercise a real "
+            f"emulator, but no {VICE_LIVE_MARKER} test ran ({detail}). "
+            f"The VICE surface was certified by mocks alone. Unset "
+            f"{REQUIRE_VICE_ENV} for a deliberately mocked-only run.",
+            red=True,
+        )
+
+
+def pytest_collection_modifyitems(session, config, items):
+    """Record how many live VICE tests this run intended to execute."""
+    session._vice_live_collected = sum(
+        1 for i in items if i.get_closest_marker(VICE_LIVE_MARKER) is not None
+    )

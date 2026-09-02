@@ -11,12 +11,14 @@ This means resume() is NOT destructive, and tests can freely call it.
 
 from __future__ import annotations
 
-import shutil
 import time
 
 import pytest
 
-from c64_test_harness.backends.vice_binary import BinaryViceTransport
+from c64_test_harness.backends.vice_binary import (
+    DISPLAY_GET_SHORTFALL,
+    BinaryViceTransport,
+)
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 from c64_test_harness.backends.vice_manager import PortAllocator
 from c64_test_harness.transport import TransportError
@@ -24,9 +26,7 @@ from c64_test_harness.transport import TransportError
 from conftest import connect_binary_transport
 
 # Skip entire module if x64sc is not installed
-pytestmark = pytest.mark.skipif(
-    shutil.which("x64sc") is None, reason="x64sc not found on PATH"
-)
+pytestmark = pytest.mark.vice_live
 
 # Scratch area for machine code
 CODE_BASE = 0xC000
@@ -273,3 +273,179 @@ class TestErrors:
         """Writing empty data is a no-op."""
         binary_transport.write_memory(0x0400, b"")
         binary_transport.write_memory(0x0400, [])
+
+
+class TestFullAddressSpaceRead:
+    """A 64 KiB read must not be sent as a single MEM_GET.
+
+    VICE computes ``length = (endaddress + 1) - startaddress`` into a
+    ``uint32_t`` and then writes it into the response with
+    ``write_uint16`` (S ``monitor_binary.c:1637,1672``).  For a whole
+    address space that is 0x10000, which truncates to 0, so the response
+    declares zero bytes of payload and the transport can only raise.
+
+    The chunker computed ``0x10000 - (addr & 0xFFFF)``, which for
+    ``addr=0`` is exactly the one size that cannot work, and never split.
+    """
+
+    def test_full_64k_read_matches_piecewise_reads(self, binary_transport) -> None:
+        whole = binary_transport.read_memory(0x0000, 0x10000)
+        assert len(whole) == 0x10000
+        piecewise = b"".join(
+            binary_transport.read_memory(base, 0x2000)
+            for base in range(0x0000, 0x10000, 0x2000)
+        )
+        assert whole == piecewise
+
+    def test_read_spanning_the_top_of_memory(self, binary_transport) -> None:
+        """The chunk boundary must not drop or duplicate the last byte."""
+        whole = binary_transport.read_memory(0x0000, 0x10000)
+        assert whole[0xFFFF:] == binary_transport.read_memory(0xFFFF, 1)
+        assert whole[0xFF00:] == binary_transport.read_memory(0xFF00, 0x100)
+
+    def test_65535_byte_read_still_works(self, binary_transport) -> None:
+        """0xFFFF is the largest length VICE's uint16 field can express."""
+        data = binary_transport.read_memory(0x0000, 0xFFFF)
+        assert len(data) == 0xFFFF
+        assert data == binary_transport.read_memory(0x0000, 0x10000)[:0xFFFF]
+
+
+# ======================================================================
+# Anchors: constants this harness asserts about VICE, checked against it
+# ======================================================================
+
+
+class TestUpstreamBugOneIsReal:
+    """``DISPLAY_GET`` really is four bytes short (upstream bug 1).
+
+    ``DISPLAY_GET_SHORTFALL`` is a number read out of VICE's source and
+    typed into ours; ``read_framebuffer`` refuses any *other* shortfall as
+    corruption.  If the real value were different -- a VICE build that
+    fixed the bug, or one that broke it differently -- the mocked tests
+    would keep agreeing with the constant and every live call would start
+    raising.  So measure it.
+    """
+
+    def test_the_declared_length_exceeds_the_delivered_by_exactly_four(
+        self, binary_transport
+    ) -> None:
+        fb = binary_transport.read_framebuffer()
+        assert fb["short_by"] == DISPLAY_GET_SHORTFALL, (
+            f"VICE delivered {len(fb['bytes'])} of {fb['declared_length']} "
+            f"declared bytes ({fb['short_by']} short). The harness is built "
+            f"around a {DISPLAY_GET_SHORTFALL}-byte shortfall "
+            f"(docs/vice_upstream_bugs.md bug 1); this build differs, so "
+            f"the constant and the doc both need revisiting."
+        )
+
+    def test_the_shortfall_is_reported_not_hidden(self, binary_transport) -> None:
+        """The caller must be able to see it without counting bytes."""
+        fb = binary_transport.read_framebuffer()
+        assert fb["declared_length"] == len(fb["bytes"]) + fb["short_by"]
+        assert fb["short_by"] > 0, (
+            "this build appears to have fixed the bug — if so, remove the "
+            "workaround rather than leaving it to rot"
+        )
+
+
+class TestStatusRegisterNameAnchor:
+    """Which name does VICE actually use for the status register?
+
+    ``_parse_cpu_history_entry`` resolves ``sr`` through ``FL`` → ``FLAGS``
+    → ``SR``.  That chain is an assumption about VICE's naming that no
+    test checked: if VICE used none of the three, ``sr`` would read 0
+    forever and every mocked test would still pass.
+
+    Measured on this bench (VICE 3.10, Homebrew bottle), the full set is
+    ``00 01 A CYC FL LIN PC SP X Y`` — so **``FL`` is the real name** and
+    ``FLAGS``/``SR`` are speculative fallbacks that never fire here.  The
+    test asserts the chain matches *something* rather than pinning
+    ``FL``: the fallbacks cost nothing, and a VICE fork or a later
+    release renaming the register is exactly what this should catch.
+    """
+
+    def test_vice_exposes_a_status_register_the_alias_chain_matches(
+        self, binary_transport
+    ) -> None:
+        names = {r["name"] for r in binary_transport.registers_available()}
+        matched = [n for n in ("FL", "FLAGS", "SR") if n in names]
+        assert matched, (
+            f"VICE exposes {sorted(names)}, none of which is FL/FLAGS/SR, so "
+            f"the 'sr' field in cpu_history() is permanently 0. The alias "
+            f"chain in _parse_cpu_history_entry needs the real name."
+        )
+
+    def test_the_status_register_reaches_cpu_history_as_sr(
+        self, binary_transport
+    ) -> None:
+        """End to end: the alias chain must actually populate ``sr``.
+
+        Knowing the name exists is not the same as the chain using it --
+        that is the gap a register-name mutation slipped through.
+        """
+        binary_transport.cpu_history(count=1)  # prime the ring
+        binary_transport.single_step()
+        history = binary_transport.cpu_history(count=4)
+        if not history:
+            pytest.skip("VICE returned no CPU history records")
+        assert all("sr" in entry for entry in history)
+        assert any(entry["registers"] for entry in history), (
+            "no record carried any named register, so this cannot show the "
+            "alias chain resolving"
+        )
+
+
+class TestCheckpointList:
+    """Enumerating checkpoints, which the client could not do before.
+
+    The harness could set and delete checkpoints but never list them, so
+    a checkpoint leaked by an interrupted ``jsr()`` — whose ``finally``
+    never ran — was invisible from the client side. A leaked execution
+    checkpoint pins the CPU at its address: every resume re-triggers it
+    and stops before executing, which is indistinguishable from a hung
+    emulator without this.
+    """
+
+    def test_a_set_checkpoint_appears_and_a_deleted_one_does_not(
+        self, binary_transport
+    ) -> None:
+        before = binary_transport.checkpoint_list()
+        num = binary_transport.set_checkpoint(0xC002)
+        try:
+            listed = binary_transport.checkpoint_list()
+            assert len(listed) == len(before) + 1, (
+                f"setting one checkpoint changed the list by "
+                f"{len(listed) - len(before)}"
+            )
+            mine = [c for c in listed if c["number"] == num]
+            assert mine, f"checkpoint {num} was set but is not listed"
+            assert mine[0]["start"] == 0xC002
+            assert mine[0]["enabled"] is True
+        finally:
+            binary_transport.delete_checkpoint(num)
+
+        after = binary_transport.checkpoint_list()
+        assert [c["number"] for c in after] == [c["number"] for c in before], (
+            "the deleted checkpoint is still listed — a delete that VICE "
+            "did not honour would leak a CPU-pinning checkpoint"
+        )
+
+    def test_the_declared_count_and_the_frames_agree(
+        self, binary_transport
+    ) -> None:
+        """The trailing 0x14 frame carries a count; cross-check it.
+
+        VICE answers this command with one CHECKPOINT_INFO per checkpoint
+        and *then* a count. Parsing only the count, or only the frames,
+        would hide a desynchronised reply — the issue-#88 shape.
+        """
+        nums = [binary_transport.set_checkpoint(a) for a in (0xC010, 0xC020)]
+        try:
+            listed = binary_transport.checkpoint_list()
+            starts = {c["start"] for c in listed}
+            assert {0xC010, 0xC020} <= starts, (
+                f"expected both checkpoints in {sorted(hex(s) for s in starts)}"
+            )
+        finally:
+            for n in nums:
+                binary_transport.delete_checkpoint(n)

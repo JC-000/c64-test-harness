@@ -11,9 +11,14 @@
 #
 #   --vice-bin PATH        use PATH instead of the x64sc on $PATH (also
 #                          settable via the VICE_BIN environment variable).
-#                          Homebrew's x64sc has ethernet compiled out, so an
-#                          ethernet-capable build must be named explicitly --
-#                          see issue #144.
+#                          Rarely needed: the x64sc on $PATH is normally the
+#                          right one.  Homebrew's bottle reports HAVE_RAWNET
+#                          yes / HAVE_PCAP yes to 'x64sc -features' and links
+#                          libpcap -- issue #144's "ethernet compiled out"
+#                          reading was a misdiagnosis of the crash an
+#                          UNELEVATED launch produces (VICE selects a pcap
+#                          driver only at euid 0, so unelevated it leaves
+#                          rawnet_arch_driver NULL and SIGSEGVs).
 #   --skip-ethernet-check  bypass the ethernet-capability pre-flight
 #
 # Expected outcome: VICE launches, binary monitor accepts a TCP connection
@@ -110,14 +115,21 @@ else
         echo "       $VICE_BIN rejects the 'pcap' rawnet driver:"
         echo "         $(grep -F "not valid for option" <<<"$ETH_CHECK_OUT" | head -1)"
         echo
-        echo "       The -ethernetcart option exists but the rawnet driver registry"
-        echo "       is empty, so enabling the cart segfaults in rawnet_arch_pre_reset."
-        echo "       This is NOT a /dev/bpf permissions problem — see issue #144."
+        echo "       The rawnet driver registry is empty, so enabling the cart"
+        echo "       segfaults in rawnet_arch_pre_reset."
+        echo "       This is NOT a /dev/bpf permissions problem — VICE never reads"
+        echo "       those nodes."
         echo
-        echo "       Fix: use an ethernet-enabled x64sc (official binary, or build"
-        echo "       from source with --enable-ethernet), then re-run with"
+        echo "       Most likely cause: this probe is running unelevated. VICE"
+        echo "       registers the pcap driver only when archdep_rawnet_capability()"
+        echo "       holds -- geteuid() == 0 on macOS. Re-run as:"
+        echo "         sudo $0"
+        echo
+        echo "       If it persists as root, the build genuinely lacks rawnet."
+        echo "       Check with:"
+        echo "         $VICE_BIN -features | grep -E 'HAVE_RAWNET|HAVE_PCAP'"
+        echo "       and if so, name a build that has it:"
         echo "         $0 --vice-bin /path/to/ethernet-x64sc"
-        echo "       or export VICE_BIN=/path/to/ethernet-x64sc"
         exit 1
     fi
     echo "[ok]   ethernet-capability pre-flight passed (pcap driver registered)"

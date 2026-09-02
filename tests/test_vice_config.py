@@ -17,6 +17,8 @@ def test_default_values():
     assert cfg.warp is True
     assert cfg.ntsc is True
     assert cfg.sound is False
+    assert cfg.console is True
+    assert cfg.minimize is True
     assert cfg.extra_args == []
 
 
@@ -56,3 +58,42 @@ def test_not_frozen():
     assert cfg.port == 9999
 
 
+
+
+def _launch_args(cfg: ViceConfig) -> list[str]:
+    """Build the x64sc argv for *cfg* without spawning anything."""
+    import subprocess
+    from unittest import mock
+    from c64_test_harness.backends.vice_lifecycle import ViceProcess
+
+    captured: list[list[str]] = []
+
+    def fake_popen(args, **kw):
+        captured.append(list(args))
+        raise RuntimeError("stop before spawn")
+
+    with mock.patch.object(subprocess, "Popen", fake_popen):
+        try:
+            ViceProcess(cfg).start()
+        except RuntimeError:
+            pass
+    assert captured, "Popen was not reached"
+    return captured[0]
+
+
+def test_console_default_emits_console_not_minimized():
+    args = _launch_args(ViceConfig(executable="x64sc"))
+    assert "-console" in args
+    assert "-minimized" not in args
+
+
+def test_console_false_falls_back_to_minimized():
+    args = _launch_args(ViceConfig(executable="x64sc", console=False))
+    assert "-console" not in args
+    assert "-minimized" in args
+
+
+def test_console_false_minimize_false_emits_neither():
+    args = _launch_args(ViceConfig(executable="x64sc", console=False, minimize=False))
+    assert "-console" not in args
+    assert "-minimized" not in args

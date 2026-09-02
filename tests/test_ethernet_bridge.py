@@ -13,7 +13,6 @@ support in VICE) are missing.
 
 from __future__ import annotations
 
-import shutil
 import threading
 import time
 
@@ -41,12 +40,11 @@ from conftest import connect_binary_transport
 # Skip conditions
 # ---------------------------------------------------------------------------
 
-_HAS_X64SC = shutil.which("x64sc") is not None
 
 _PCAP_OK, _PCAP_REASON = probe_vice_pcap_ok(iface=IFACE_A)
 
 pytestmark = [
-    pytest.mark.skipif(not _HAS_X64SC, reason="x64sc not found on PATH"),
+    pytest.mark.vice_live,
     # See test_bridge_ping.py: monitor-up is not proof of capture, so
     # require a real /dev/bpf* attach or these pass vacuously (issue #144).
     pytest.mark.skipif(not _PCAP_OK, reason=_PCAP_REASON),

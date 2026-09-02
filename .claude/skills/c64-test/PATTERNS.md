@@ -277,9 +277,9 @@ config = ViceConfig(
 )
 ```
 
-On macOS `ViceProcess` wraps the x64sc launch with `sudo -n` only when this process cannot already open a `/dev/bpf*` node — those are root-only on stock macOS, but a rig that runs `sudo chmod o+rw /dev/bpf*` makes them reachable and no elevation happens (an unprivileged VICE then attaches BPF and captures on `feth(4)` normally). This is a no-op on Linux. When elevation does fire you need a NOPASSWD sudoers entry naming the **exact** x64sc path you launch — an entry for `/opt/homebrew/bin/x64sc` will not cover a custom ethernet-enabled build; see `docs/development.md` -> macOS -> "Passwordless sudo for bridge lifecycle".
+On macOS `ViceProcess` wraps the x64sc launch with `sudo -n` whenever the pcap driver is in play: VICE admits that driver only when `archdep_rawnet_capability()` (`geteuid()==0`) holds, and `chmod o+rw /dev/bpf*` changes nothing it looks at. Unelevated the launch is refused with `ViceElevationRequiredError` rather than allowed to SIGSEGV. This is a no-op on Linux, whose `tuntap` driver is ungated. When elevation does fire you need a NOPASSWD sudoers entry naming the **exact** x64sc path you launch, symlink form and all (`/opt/homebrew/bin/x64sc`, not its Cellar target — sudoers matches the literal path); the error tells you the entry to add. See `docs/development.md` -> macOS -> "Passwordless sudo for bridge lifecycle".
 
-Note that Homebrew's x64sc cannot do real ethernet at all (issue #144): as root it starts and answers the binary monitor while attaching **no** BPF device, so CS8900 register assertions pass against pure emulation with zero host traffic. `probe_vice_pcap_ok()` demands a real `/dev/bpf*` attach for exactly this reason — if the ethernet tests skip with "attached no /dev/bpf* device", point them at an ethernet-enabled build rather than assuming a permissions problem.
+A build without raw-network support starts and answers the binary monitor while attaching **no** BPF device, so CS8900 register assertions pass against pure emulation with zero host traffic — `probe_vice_pcap_ok()` demands a real `/dev/bpf*` attach for exactly this reason, and `resolve_vice_executable()` refuses such a binary up front via `x64sc -features` (`ViceEthernetBinaryError`). Homebrew's x64sc is **not** such a build, despite issue #144: `-features` reports `HAVE_RAWNET yes` / `HAVE_PCAP yes` and it links libpcap. What breaks it is being run unelevated — so use the PATH binary and leave `$VICE_ETHERNET_BIN` unset; it is an override, not a requirement.
 
 `ViceInstanceManager` auto-generates unique MACs (`02:c6:40:xx:xx:xx`) per instance and programs the CS8900a Individual Address registers after connect — no manual MAC handling needed.
 
@@ -1056,13 +1056,13 @@ send_key(transport, "\r")
 ```
 
 ### 8. Window Focus Stealing
-VICE windows steal keyboard focus when launched, disrupting the user's work. `ViceConfig.minimize` defaults to `True`, passing `-minimized` to VICE. Do **not** set `minimize=False` unless the user explicitly needs visible windows:
+VICE windows steal keyboard focus when launched, disrupting the user's work — on macOS the GTK3 build activates the app even with `-minimized`. `ViceConfig.console` defaults to `True`, passing `-console`: the full emulation runs headless (binary monitor, screen RAM, palette, `-exitscreenshot` all work) and no window is ever created. Do **not** set `console=False` unless the user explicitly needs a visible window:
 ```python
-# Default — windows start minimized (correct for automated testing)
+# Default — headless, no window, no focus steal (correct for automated testing)
 config = ViceConfig(prg_path="build/prog.prg", warp=True, sound=False)
 
-# Only if user needs to see the VICE window
-config = ViceConfig(prg_path="build/prog.prg", minimize=False)
+# Only if user needs to see the VICE window (minimize= then applies)
+config = ViceConfig(prg_path="build/prog.prg", console=False, minimize=False)
 ```
 
 ### 9. Multi-Agent VICE Process Safety

@@ -53,6 +53,7 @@ class HarnessConfig:
     vice_warp: bool = True
     vice_ntsc: bool = True
     vice_sound: bool = False
+    vice_console: bool = True
     vice_minimize: bool = True
     vice_extra_args: list[str] = field(default_factory=list)
 

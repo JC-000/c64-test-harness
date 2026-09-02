@@ -430,9 +430,13 @@ def find_free_port() -> int:
 def launch_vice(executable: str, port: int) -> subprocess.Popen:
     args = [
         executable,
+        # -console first: VICE's pre-UI argv scan (S main.c:267-303) breaks
+        # at the first unrecognised argument, so a trailing -console is
+        # handled only after the window already exists.
+        "-console",
         "-binarymonitor",
         "-binarymonitoraddress", f"ip4://127.0.0.1:{port}",
-        "-warp", "-ntsc", "+sound", "-minimized",
+        "-warp", "-ntsc", "+sound",
     ]
     print(f"  Launching: {' '.join(args)}")
     return subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -881,11 +885,13 @@ def _check_performance(mon: BinaryMonitor) -> None:
 
 import shutil
 
+import pytest
 
+
+@pytest.mark.vice_live
 def test_binary_monitor_protocol():
-    if shutil.which("x64sc") is None:
-        import pytest
-        pytest.skip("x64sc not on PATH")
+    from conftest import require_vice_or_skip
+    require_vice_or_skip()
 
     port = find_free_port()
     proc = launch_vice("x64sc", port)

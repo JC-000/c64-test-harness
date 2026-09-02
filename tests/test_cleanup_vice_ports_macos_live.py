@@ -77,10 +77,7 @@ pytestmark = [
         os.environ.get("BRIDGE_CLEANUP_LIVE") != "1",
         reason="live bridge cleanup test -- opt in with BRIDGE_CLEANUP_LIVE=1",
     ),
-    pytest.mark.skipif(
-        shutil.which("x64sc") is None,
-        reason="x64sc not on PATH",
-    ),
+    pytest.mark.vice_live,
     # NOTE: we deliberately do NOT add a pcap-probe skipif here.  The
     # probe in tests/bridge_platform.py gates on a pre-existing feth
     # interface, but this test brings the bridge up itself in step 1.

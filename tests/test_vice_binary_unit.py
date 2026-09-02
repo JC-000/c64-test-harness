@@ -18,6 +18,7 @@ monitor read path:
 from __future__ import annotations
 
 import collections
+import re
 import socket
 import struct
 import threading
@@ -29,12 +30,14 @@ from c64_test_harness.backends.vice_binary import (
     API_VERSION,
     CMD_ADVANCE_INSTRUCTIONS,
     CMD_CHECKPOINT_DEL,
+    CMD_CHECKPOINT_SET,
     CMD_CONDITION_SET,
     CMD_DUMP,
     CMD_EXECUTE_UNTIL_RETURN,
     CMD_MEM_GET,
     CMD_MEM_SET,
     CMD_REGISTERS_GET,
+    CMD_REGISTERS_SET,
     CMD_RESOURCE_GET,
     CMD_RESOURCE_SET,
     CMD_TO_RESPONSE_TYPE,
@@ -422,25 +425,70 @@ class TestCmdResponseTypeMapCompleteness:
     _send_and_recv must refuse to send an unmapped command rather than
     silently skipping response validation."""
 
-    @pytest.mark.parametrize(
-        "cmd,expected",
-        [
-            (CMD_CHECKPOINT_DEL, 0x13),
-            (CMD_CONDITION_SET, 0x22),
-            (CMD_DUMP, 0x41),
-            (CMD_UNDUMP, 0x42),
-            (CMD_RESOURCE_GET, 0x51),
-            (CMD_RESOURCE_SET, 0x52),
-            (CMD_ADVANCE_INSTRUCTIONS, 0x71),
-            (CMD_EXECUTE_UNTIL_RETURN, 0x73),
-        ],
-    )
-    def test_previously_missing_commands_echo_opcode(
-        self, cmd: int, expected: int
-    ) -> None:
-        """The 8 commands the audit found missing now map to their echoed
-        opcode per the VICE binary monitor spec."""
-        assert CMD_TO_RESPONSE_TYPE[cmd] == expected
+    #: The two commands whose reply is *not* an echo of the opcode, with
+    #: the reason.  Both are structural to the protocol -- a "set" that
+    #: returns the resulting state -- and both are proven against a real
+    #: VICE by the live tests named below, because a wrong entry here
+    #: makes ``_wait_for_response`` raise a type mismatch on the wire.
+    NON_ECHO_REPLIES = {
+        CMD_CHECKPOINT_SET: (
+            0x11,
+            "replies with CHECKPOINT_INFO, not a Set ack "
+            "(live: test_vice_binary.py::test_checkpoint_and_resume)",
+        ),
+        CMD_REGISTERS_SET: (
+            0x31,
+            "replies with a Registers response "
+            "(live: test_vice_binary.py::test_set_and_read_registers)",
+        ),
+    }
+
+    def test_response_type_echoes_the_opcode_except_where_documented(self) -> None:
+        """The map must follow the protocol's rule, not a typed-in table.
+
+        This replaces eight assertions of the form
+        ``CMD_TO_RESPONSE_TYPE[CMD_DUMP] == 0x41``.  Those restated the
+        opcode constant as a literal in the test file, under a docstring
+        citing the spec -- so their oracle was the author, and they would
+        have agreed just as readily with eight wrong numbers.  They also
+        covered only 8 of the 23 commands.
+
+        The real rule is that a reply echoes the command opcode, with two
+        documented exceptions.  Asserting the rule covers every command,
+        including ones added later, and makes the exceptions explicit
+        rather than indistinguishable from the other 21 entries.
+        """
+        import c64_test_harness.backends.vice_binary as vb
+
+        for name, cmd in sorted(vars(vb).items()):
+            if not name.startswith("CMD_") or name == "CMD_TO_RESPONSE_TYPE":
+                continue
+            got = CMD_TO_RESPONSE_TYPE[cmd]
+            if cmd in self.NON_ECHO_REPLIES:
+                want, why = self.NON_ECHO_REPLIES[cmd]
+                assert got == want, f"{name}: expected {want:#04x} ({why})"
+            else:
+                assert got == cmd, (
+                    f"{name} ({cmd:#04x}) maps to {got:#04x}. A reply echoes "
+                    f"its command opcode unless it is a documented exception "
+                    f"-- add it to NON_ECHO_REPLIES with the reason if this "
+                    f"is genuinely one."
+                )
+
+    def test_the_echo_rule_would_catch_a_wrong_entry(self) -> None:
+        """Negative control: the rule above must reject a corrupted map.
+
+        Without this, a refactor that made the loop iterate over nothing
+        would leave a passing test that checks no commands at all.
+        """
+        import c64_test_harness.backends.vice_binary as vb
+
+        assert len(CMD_TO_RESPONSE_TYPE) >= 20, "map shrank; rule covers little"
+        bad = dict(CMD_TO_RESPONSE_TYPE)
+        bad[vb.CMD_DUMP] = 0xFF
+        assert bad[vb.CMD_DUMP] != vb.CMD_DUMP, (
+            "a corrupted entry must be distinguishable from a good one"
+        )
 
     def test_every_cmd_constant_is_mapped(self) -> None:
         """All CMD_* module constants have a CMD_TO_RESPONSE_TYPE entry."""
@@ -680,3 +728,357 @@ class TestMemoryNoAddressWrap:
         with patch.object(t, "_send_and_recv") as mock_send:
             t.write_memory(0xFFFF, b"")
         mock_send.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Truncation boundaries in the response parsers
+# ---------------------------------------------------------------------------
+
+
+class TestParserTruncationBoundaries:
+    """Every guard here is one byte from an ``IndexError`` on a short frame.
+
+    These are defensive branches against a malformed or truncated
+    response -- the exact failure mode issue #88 turned out to be -- and
+    a mutation run found them unguarded: flipping ``>=`` to ``>`` or
+    ``<=`` to ``<`` in each left the whole suite green, live modules
+    included.  A guard nothing exercises at its boundary is a guard
+    nobody knows is still there.
+
+    Each test sits *on* the boundary rather than safely inside it, which
+    is what makes the relational operator load-bearing: an off-by-one
+    turns a clean ``break``/``return None`` into an exception.
+    """
+
+    def test_register_map_stops_when_the_count_outruns_the_data(self):
+        """``off >= len(data)``: the count claims one more entry than
+        the body carries, and ``off`` lands exactly on ``len(data)``."""
+        t = _make_transport()
+        # count=2, but only one complete entry follows.
+        entry = bytes([3, 0x00, 0x02, ord("A")])  # size, id_lo, id_hi, name
+        data = struct.pack("<H", 2) + entry
+        resp = _Response(0x83, 0x00, 0, data)
+        with patch.object(t, "_send_and_recv", return_value=resp):
+            t._init_register_map()
+        # The truncated second entry is dropped, not fatal.
+        assert isinstance(t._reg_map, dict)
+
+    def test_cpu_history_entry_truncated_before_an_item_returns_none(self):
+        """``off >= len(entry)``: the entry ends exactly where the next
+        item's size byte should start."""
+        t = _make_transport()
+        entry = struct.pack("<H", 1)  # claims one register, then stops
+        assert t._parse_cpu_history_entry(entry) is None
+
+    def test_cpu_history_item_of_size_exactly_one_still_yields_its_register(self):
+        """``item_size >= 1``: size 1 is an id byte and a zero-width value.
+
+        Size *1* is the boundary, not size 0 -- a zero-size item fails
+        both ``>= 1`` and ``> 1``, so a test built on it passes with the
+        operator either way.  That was this test's first form, and a
+        mutation run caught it doing nothing.
+
+        The register map must also be populated, or no item resolves to a
+        name and both branches yield ``registers == {}``.
+        """
+        t = _make_transport()
+        t._reg_map = {"a": (0x42, 8)}
+        tail = b"\x00" * 9  # cycle(8) + instr_len(1)
+
+        one = t._parse_cpu_history_entry(
+            struct.pack("<H", 1) + bytes([1, 0x42]) + tail
+        )
+        assert one is not None and one["registers"] == {"a": 0}, (
+            f"a size-1 item was skipped instead of decoded: {one}"
+        )
+
+    def test_cpu_history_cycle_field_is_read_when_it_exactly_fits(self):
+        """``off + 8 <= len(entry)``: eight trailing bytes are a cycle count.
+
+        Asserting only that neither input raises passes with ``<`` too --
+        declining to read the field is not an error, just silent data
+        loss.  So assert the value: at ``off + 8 == len(entry)`` the
+        count must actually be decoded.
+        """
+        t = _make_transport()
+        base = struct.pack("<H", 0)  # no register items, so off == 2
+        exact = base + struct.pack("<Q", 0xDEADBEEF)  # off + 8 == len(entry)
+
+        result = t._parse_cpu_history_entry(exact)
+        assert result is not None
+        assert result["cycle"] == 0xDEADBEEF, (
+            f"the cycle field was not read at the exact boundary: "
+            f"got {result['cycle']:#x}"
+        )
+
+        short = base + b"\x00" * 7  # one byte short of a <Q
+        assert t._parse_cpu_history_entry(short) is not None, (
+            "a seven-byte tail must be declined, not fatal"
+        )
+
+
+class TestRedundantGuards:
+    """Guards a mutation run showed to be unreachable or already implied.
+
+    Recorded rather than tested: a test that cannot distinguish the guard
+    being present from absent is decorative by construction, and writing
+    one would only hide that.
+    """
+
+    def test_zero_length_read_is_guarded_twice(self):
+        """``read_memory``'s ``if length <= 0`` is redundant.
+
+        The chunking loop below it is ``while remaining > 0``, so a zero
+        length sends nothing with or without the early return -- which is
+        why mutating ``<=`` to ``<`` changes no observable behaviour.
+        Both paths are pinned here so the *behaviour* stays covered even
+        though the branch cannot be isolated.
+        """
+        t = _make_transport()
+        with patch.object(t, "_send_and_recv") as send:
+            assert t.read_memory(0x1000, 0) == b""
+            assert t.read_memory(0x1000, -5) == b""
+        send.assert_not_called()
+
+
+class TestStatusRegisterAliases:
+    """``sr`` is resolved through a three-name chain: FL, then FLAGS, then SR.
+
+    Nothing pinned any of the three.  A mutation run renamed ``"FLAGS"``
+    to ``"FLAGSX"`` and the whole suite stayed green, live modules
+    included -- the alias silently stopped matching and ``sr`` fell
+    through to the next name, or to 0.
+
+    The chain is also an *assumption about VICE's naming*, not a fact
+    derived from it, which is the same shape of defect as the flag names.
+    ``test_vice_binary.py`` anchors it to a real emulator; these pin the
+    resolution order so a reordering cannot pass unnoticed.
+    """
+
+    @staticmethod
+    def _entry(reg_map: dict, values: dict) -> bytes:
+        """A CPU-history entry carrying *values* keyed by register name."""
+        ids = {name: rid for name, (rid, _) in reg_map.items()}
+        body = b"".join(
+            bytes([2, ids[name], val]) for name, val in values.items()
+        )
+        return (
+            struct.pack("<H", len(values)) + body
+            + struct.pack("<Q", 0) + bytes([0])
+        )
+
+    def _parse(self, reg_map, values):
+        t = _make_transport()
+        t._reg_map = reg_map
+        return t._parse_cpu_history_entry(self._entry(reg_map, values))
+
+    def test_each_alias_resolves_on_its_own(self):
+        for name in ("FL", "FLAGS", "SR"):
+            reg_map = {name: (0x10, 8)}
+            result = self._parse(reg_map, {name: 0x37})
+            assert result is not None and result["sr"] == 0x37, (
+                f"alias {name!r} did not resolve to sr"
+            )
+
+    def test_fl_wins_over_flags_and_flags_wins_over_sr(self):
+        """Precedence is load-bearing: a VICE exposing more than one of
+        these must not have ``sr`` depend on dict ordering."""
+        reg_map = {"FL": (0x10, 8), "FLAGS": (0x11, 8), "SR": (0x12, 8)}
+        both = self._parse(reg_map, {"FL": 0x01, "FLAGS": 0x02, "SR": 0x03})
+        assert both["sr"] == 0x01, "FL must win"
+
+        no_fl = self._parse(
+            {"FLAGS": (0x11, 8), "SR": (0x12, 8)}, {"FLAGS": 0x02, "SR": 0x03}
+        )
+        assert no_fl["sr"] == 0x02, "FLAGS must win over SR"
+
+    def test_sr_is_zero_when_no_alias_matches(self):
+        """The documented fallback, pinned so it stays deliberate."""
+        reg_map = {"ZZ": (0x10, 8)}
+        assert self._parse(reg_map, {"ZZ": 0x37})["sr"] == 0
+
+
+class TestFieldsTheWireTestsCannotSeparate:
+    """Coincidences that make a structural property untestable by value.
+
+    Three times now a test has named a *structural* property -- which
+    field comes first, which register holds the status byte -- while its
+    oracle was a *value* comparison that happens to be decisive today:
+
+    * ``sr`` resolved through FL/FLAGS/SR, and VICE only ever exposes FL;
+    * the wire anchor sees a ``response_type``/``error_code`` swap only
+      because RESOURCE_GET replies 0x51 with error 0x00;
+    * and ``STX`` and ``API_VERSION`` are **both 0x02**, so transposing
+      them is byte-identical on the wire.
+
+    The rule, for the next person writing a frame test: if two fields you
+    are distinguishing can hold the same value, your test is measuring
+    the values, not the structure, and it will go quiet the day they
+    coincide. Where a black-box test cannot exist, say so out loud --
+    a guard that declares "I cannot see this" is worth more than one that
+    silently cannot.
+    """
+
+    def test_stx_and_api_version_still_coincide(self):
+        """Tripwire, not an invariant: assert the blind spot still exists.
+
+        ``STX`` (VICE's ``ASC_STX``) and ``API_VERSION``
+        (``MON_BINARY_API_VERSION``) are both 0x02
+        (S ``monitor_binary.c:288,290``), so a harness with those two
+        request fields transposed emits byte-identical frames and every
+        test passes -- measured: 125 mocked tests and the live wire
+        anchor, zero failures, with the transposition applied to the
+        parser, the request builder and the mock together.
+
+        No black-box test can find it while they coincide: VICE
+        ``continue``s past both a bad STX and an out-of-range api_version
+        *without replying* (S ``monitor_binary.c:1913``), so the only
+        signal is silence, and there is nothing to send that differs.
+
+        It matters because the protocol carries a version field precisely
+        so it can change. The day VICE ships 0x03 and this constant is
+        updated, a transposed harness sends ``03 02``; VICE reads byte 0,
+        sees it is not ASC_STX, discards the frame, then resyncs on the
+        0x02 and parses the length as the api_version. Every request
+        breaks at once.
+
+        So this fails on that version bump, deliberately. When it does:
+        the field order is now observable -- write the test that checks
+        it, and delete this one.
+        """
+        assert STX == API_VERSION, (
+            f"STX ({STX:#04x}) and API_VERSION ({API_VERSION:#04x}) now "
+            f"differ. That is not a regression — it means the request "
+            f"field order is finally observable on the wire. Add a test "
+            f"that transposes them and watches VICE reject the frame, "
+            f"then remove this tripwire."
+        )
+
+
+class TestJamIsReportedNotDropped:
+    """A CPU jam must raise, not time out on some later assertion.
+
+    Found by the binary-monitor mapping: this client never mentioned
+    ``0x61`` at all, so VICE's jam notification was buffered as an
+    unrecognised event and never read. The event queue makes that
+    concrete — its only drain is :meth:`wait_for_stopped`, so on any path
+    that does not call it the notification sits unread for the life of
+    the transport, and a jammed program fails as "the text never
+    appeared" fifteen seconds later.
+
+    The JAM frame carries **no body** (S ``monitor_binary.c:382-391``
+    declares length 0), so the address has to come from a register read;
+    these cover both the queued and the on-the-wire arrival.
+    """
+
+    @staticmethod
+    def _jam_frame(request_id: int = EVENT_REQUEST_ID) -> bytes:
+        return _build_response_bytes(0x61, b"", request_id=request_id)
+
+    def test_a_jam_arriving_on_the_wire_raises(self):
+        t = _make_transport()
+        t._reg_map = {"PC": (0x00, 16)}
+        _queue_recvs(t._sock, [self._jam_frame()])
+        with patch.object(t, "read_registers", return_value={"PC": 0xC0DE}):
+            with pytest.raises(TransportError, match="jammed"):
+                t.wait_for_stopped(timeout=5.0)
+
+    def test_a_jam_on_the_wire_reads_the_pc_without_deadlocking(self):
+        """The wire arrival must not deadlock on the transport's own lock.
+
+        ``wait_for_stopped`` reads the wire under ``_lock``.  When the
+        frame it reads is a JAM it calls ``_jam_message``, whose
+        ``read_registers`` goes through ``_send_and_recv`` -- which takes
+        the same, non-reentrant ``_lock``.  Every other test in this
+        class patches ``read_registers`` away, which is precisely what
+        let that hang pass as "jam reported".  So this one leaves the
+        register read real: the wire carries the JAM frame followed by
+        the REGISTERS_GET reply the PC read must consume.
+        """
+        t = _make_transport()
+        t._reg_map = {"PC": (0x03, 16)}
+        regs_reply = struct.pack("<H", 1) + bytes([3, 3]) + struct.pack("<H", 0xC0DE)
+        _queue_recvs(
+            t._sock,
+            [
+                self._jam_frame(),
+                # First request id the transport will issue is 0.
+                _build_response_bytes(CMD_REGISTERS_GET, regs_reply, request_id=0),
+            ],
+        )
+        outcome: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                t.wait_for_stopped(timeout=1.0)
+            except BaseException as e:  # noqa: BLE001 - recorded for the assert
+                outcome.append(e)
+
+        th = threading.Thread(target=run, daemon=True)
+        th.start()
+        th.join(5.0)
+        assert not th.is_alive(), (
+            "wait_for_stopped never returned: it deadlocked reading the PC "
+            "under the lock it already held"
+        )
+        assert not t._lock.locked()
+        assert len(outcome) == 1 and isinstance(outcome[0], TransportError)
+        assert re.search(r"jammed at \$c0de", str(outcome[0]))
+
+    def test_the_jam_message_names_the_address(self):
+        t = _make_transport()
+        _queue_recvs(t._sock, [self._jam_frame()])
+        with patch.object(t, "read_registers", return_value={"PC": 0xC0DE}):
+            with pytest.raises(TransportError, match=r"\$c0de"):
+                t.wait_for_stopped(timeout=5.0)
+
+    def test_a_jam_already_in_the_queue_raises_before_the_wait(self):
+        """The realistic shape: the jam arrived during an earlier command.
+
+        Without this the queued jam is skipped by the STOPPED scan and the
+        call blocks until its timeout — reporting a timeout for a machine
+        that has already told us why it stopped.
+        """
+        t = _make_transport()
+        resp = _Response(0x61, 0x00, EVENT_REQUEST_ID, b"")
+        t._event_queue.append((t._resume_generation, resp))
+        with patch.object(t, "read_registers", return_value={"PC": 0x1234}):
+            with pytest.raises(TransportError, match=r"jammed at \$1234"):
+                t.wait_for_stopped(timeout=5.0)
+
+    def test_an_unreadable_pc_still_reports_the_jam(self):
+        """Diagnostics must not mask the diagnosis.
+
+        A machine unwell enough to jam may not answer a register read;
+        reporting the jam without an address still beats a timeout.
+        """
+        t = _make_transport()
+        resp = _Response(0x61, 0x00, EVENT_REQUEST_ID, b"")
+        t._event_queue.append((t._resume_generation, resp))
+        with patch.object(t, "read_registers", side_effect=OSError("gone")):
+            with pytest.raises(TransportError, match="PC unreadable"):
+                t.wait_for_stopped(timeout=5.0)
+
+    def test_a_jam_body_carrying_the_pc_is_used_without_a_register_read(self):
+        """The protocol documents a 2-byte PC body (vice.texi, "JAM
+        Response (0x61)").  When a frame carries it, that is the address
+        -- no wire round-trip against a machine that just jammed.  No
+        REGISTERS_GET reply is queued, so a fallback read would find
+        nothing and report "PC unreadable" instead of ``$c0de``.
+
+        (VICE 3.10 itself sends length 0 -- S ``monitor_binary.c:389``
+        passes 0 where STOPPED/RESUMED pass 2 -- so the register-read
+        fallback stays for the bodiless frame; see the tests above.)
+        """
+        t = _make_transport()
+        t._reg_map = {"PC": (0x03, 16)}
+        _queue_recvs(
+            t._sock,
+            [_build_response_bytes(0x61, struct.pack("<H", 0xC0DE), request_id=EVENT_REQUEST_ID)],
+        )
+        with pytest.raises(TransportError, match=r"jammed at \$c0de"):
+            t.wait_for_stopped(timeout=1.0)
+        sent_cmds = [c.args[0][10] for c in t._sock.sendall.call_args_list]
+        assert CMD_REGISTERS_GET not in sent_cmds, (
+            "the PC was on the wire; a register read is a needless round-trip"
+        )

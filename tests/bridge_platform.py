@@ -14,8 +14,9 @@ a one-shot ``sudo chmod 666 /dev/bpf*``).
 This module is imported by the test fixtures so the tests remain platform-
 portable without duplicating OS dispatch everywhere.  It also hosts the
 cached ``probe_vice_pcap_ok()`` helper used to skip the pcap-driver tests
-cleanly on macOS hosts where the VICE 3.10 Homebrew bottle crashes at
-startup with the pcap driver attached (see the function docstring).
+cleanly on macOS hosts that cannot run them -- typically because the
+launch could not be elevated, which is what the pcap driver requires
+(see the function docstring).
 """
 
 from __future__ import annotations
@@ -28,9 +29,12 @@ import sys
 import tempfile
 import time
 
+from c64_test_harness.backends.vice_elevation import (
+    rawnet_capability,
+    sudo_can_run,
+)
 from c64_test_harness.backends.vice_lifecycle import (
     ETHERNET_VICE_BIN_ENV,
-    bpf_capture_available,
     ethernet_vice_binary,
 )
 
@@ -133,12 +137,14 @@ else:
 # macOS-only: probe whether VICE's pcap driver survives startup
 # ---------------------------------------------------------------------------
 #
-# On macOS 26 Tahoe the Homebrew VICE 3.10 bottle crashes immediately when
-# launched with ``-ethernetiodriver pcap -ethernetioif feth<N>``, producing
-# a system crash dialog and exiting before the binary monitor becomes
-# usable.  The root cause is upstream (likely the same cluster of init-order
-# bugs that also breaks ``x64sc --version``; see docs/development.md macOS
-# caveats).  Rather than gate every ethernet run behind an opt-in env var
+# On macOS, an *unelevated* VICE 3.10 crashes immediately when launched
+# with ``-ethernetiodriver pcap -ethernetioif feth<N>``, producing a system
+# crash dialog and exiting before the binary monitor becomes usable.
+# ``archdep_rawnet_capability()`` is ``geteuid() == 0``, so an unprivileged
+# launch leaves ``rawnet_arch_driver`` NULL and dereferences it in
+# ``rawnet_arch_pre_reset()``.  This is not a property of any particular
+# build: the Homebrew bottle captures correctly once elevated (issue #144,
+# refuted -- see ``bpf_attached_interfaces``).  Rather than gate every ethernet run behind an opt-in env var
 # (which means running the suite on a fresh machine has to wade through a
 # crash dialog to learn to set the env var), we actively probe once per
 # process: launch VICE in a throwaway mode, watch for either the binary
@@ -204,20 +210,42 @@ def _x64sc_pid(proc: subprocess.Popen, elevated: bool) -> int | None:
     return None
 
 
-def _bpf_fds(pid: int) -> list[str]:
-    """``/dev/bpf*`` nodes held open by *pid* — the proof of a live capture."""
+def bpf_attached_interfaces(pid: int) -> list[str]:
+    """Host interfaces *pid* is capturing on via ``/dev/bpf*``.
+
+    Uses ``netstat -B``, which lists every BPF peer as
+    ``<device> <netif> <flags> ... <command>.<pid>``.  It needs no
+    privilege and — crucially — reads **root-owned** processes.
+
+    This replaced an ``lsof -nP -p <pid>`` implementation that was the
+    direct cause of issue #144.  An unprivileged ``lsof`` cannot read a
+    root process's descriptor table at all: against a root x64sc it
+    returns zero lines, not zero ``bpf`` lines.  Since every macOS pcap
+    launch elevates (``archdep_rawnet_capability()`` is ``geteuid() == 0``),
+    the old instrument reported "no attach" for every ethernet VICE the
+    harness ever started, and :func:`probe_vice_pcap_ok` published that as
+    a defect in the *emulator build*.  It was measuring its own permission
+    failure.  ``lsof`` is the wrong tool here at any privilege level.
+    """
     try:
         out = subprocess.run(
-            ["lsof", "-nP", "-p", str(pid)],
-            capture_output=True, text=True, timeout=10,
+            ["netstat", "-B"], capture_output=True, text=True, timeout=10
         )
     except (OSError, subprocess.TimeoutExpired):
         return []
-    return [
-        line.split()[-1]
-        for line in out.stdout.splitlines()
-        if "/dev/bpf" in line
-    ]
+    ifaces: list[str] = []
+    for line in out.stdout.splitlines():
+        fields = line.split()
+        # header: "Device Netif Flags ... Command"
+        if len(fields) < 3 or fields[0] == "Device":
+            continue
+        # The command column is "<name>.<pid>"; names can contain dots,
+        # so split from the right.
+        _, _, owner_pid = fields[-1].rpartition(".")
+        if owner_pid != str(pid):
+            continue
+        ifaces.append(fields[1])
+    return ifaces
 
 
 def probe_vice_pcap_ok(
@@ -352,19 +380,32 @@ def probe_vice_pcap_ok(
         port = _probe_port()
         # Elevate on exactly the same rule production uses, so the probe
         # measures the configuration the tests will actually run under.
-        # ``/dev/bpf*`` is root-only by default; rigs that open it up
-        # (``chmod o+rw``) let VICE capture unprivileged, verified by a
-        # non-root build attaching /dev/bpf1+2 on feth0.
-        elevated = not bpf_capture_available()
+        # VICE admits the pcap driver only when
+        # ``archdep_rawnet_capability()`` holds (euid 0; ``/dev/bpf*``
+        # permissions are not consulted), and without a driver it
+        # SIGSEGVs on reset -- which on macOS raises the crash reporter.
+        # So when we cannot elevate, skip rather than launch.
+        elevated = not rawnet_capability(as_root=False)
+        if elevated and not sudo_can_run(x64sc):
+            _PROBE_CACHE = (
+                False,
+                f"pcap needs root and 'sudo -n' is not authorised for "
+                f"{x64sc}; add a NOPASSWD sudoers rule naming that exact "
+                f"path (no bash wrapper), or run the suite as root",
+            )
+            return _PROBE_CACHE
         args = (["sudo", "-n"] if elevated else []) + [
             x64sc,
+            # -console must precede every other flag: VICE's pre-UI argv
+            # scan (S main.c:267-303) breaks at the first argument it does
+            # not recognise, and -addconfig is one of those.
+            "-console",
             "-addconfig", rc_path,
             "-ethernetioif", iface,
             "-ethernetiodriver", "pcap",
             "-binarymonitor",
             "-binarymonitoraddress", f"ip4://127.0.0.1:{port}",
             "+sound",
-            "-minimized",
         ]
 
         try:
@@ -379,12 +420,12 @@ def probe_vice_pcap_ok(
             return _PROBE_CACHE
 
         try:
-            # The crash mode on broken hosts (VICE 3.10 Homebrew bottle on
-            # macOS 26) is SIGSEGV inside ``cs8900_activate`` during the
-            # ``-addconfig`` rc-file load, which happens before the binary
-            # monitor socket is opened.  So ``proc.poll() != None`` very
-            # shortly after spawn is the signature of a broken host; a host
-            # that works surfaces the monitor within ~1-2s.
+            # The crash mode on a host that cannot run this is SIGSEGV
+            # inside ``cs8900_activate`` during the ``-addconfig`` rc-file
+            # load, which happens before the binary monitor socket is
+            # opened -- almost always because the launch was not elevated.
+            # So ``proc.poll() != None`` very shortly after spawn is the
+            # signature; a usable host surfaces the monitor within ~1-2s.
             deadline = time.monotonic() + timeout
             monitor_up = False
             while time.monotonic() < deadline:
@@ -400,12 +441,19 @@ def probe_vice_pcap_ok(
                 # VICE whose rawnet driver never attached still emulates the
                 # CS8900 registers, so register-level assertions (product
                 # ID, TxCMD readback) pass while zero host packets move --
-                # a silently vacuous ethernet suite. The Homebrew 3.10
-                # bottle does exactly this when launched as root: alive,
-                # monitor up, and no /dev/bpf* handle. Demand the BPF
-                # attach as the proof of real capture.
+                # a silently vacuous ethernet suite. Demand the BPF attach
+                # as the proof of real capture.
+                #
+                # This branch used to assert that the Homebrew 3.10 bottle
+                # did exactly that when launched as root -- alive, monitor
+                # up, no /dev/bpf* handle -- and issue #144 was written
+                # from it. That was false. The bottle attaches BPF
+                # correctly when elevated; the old lsof instrument simply
+                # could not see a root process's descriptors. See
+                # bpf_attached_interfaces() and
+                # tests/test_bpf_attach_detection.py.
                 bpf_pid = _x64sc_pid(proc, elevated)
-                held = _bpf_fds(bpf_pid) if bpf_pid else []
+                held = bpf_attached_interfaces(bpf_pid) if bpf_pid else []
                 if held:
                     _PROBE_CACHE = (
                         True,
@@ -416,12 +464,18 @@ def probe_vice_pcap_ok(
                         False,
                         (
                             f"VICE reached the binary monitor on {iface} but "
-                            "attached no /dev/bpf* device, so it captures "
-                            "nothing -- ethernet tests would pass vacuously "
-                            "against emulated CS8900 registers with no host "
-                            "traffic. This is the Homebrew x64sc signature "
-                            "(see issue #144); point the tests at an "
-                            "ethernet-enabled build."
+                            "netstat -B shows it holding no /dev/bpf* "
+                            "descriptor, so it captures nothing -- ethernet "
+                            "tests would pass vacuously against emulated "
+                            "CS8900 registers with no host traffic. A "
+                            "working elevated launch shows two BPF peers, "
+                            "one bound to the requested interface. Check "
+                            f"that {iface} exists and is up "
+                            "(scripts/setup-bridge-feth-macos.sh), that the "
+                            "launch really was elevated (an unelevated one "
+                            "SIGSEGVs rather than reaching this point), and "
+                            "that the BPF node pool is not exhausted by "
+                            "another capturing process."
                         ),
                     )
             elif proc.poll() is not None:

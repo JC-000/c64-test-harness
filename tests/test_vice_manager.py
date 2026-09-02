@@ -293,3 +293,85 @@ class TestViceInstance:
         )
         inst.stop()
         lock.release.assert_called_once()
+
+
+class TestPortReservationHandover:
+    """The OS-level port reservation must be released before VICE starts.
+
+    ``PortAllocator.take_socket`` holds the port bound so nothing else can
+    steal it between allocation and launch.  That bind has to be dropped
+    *before* ``proc.start()``, or VICE cannot bind the port it was told to
+    use and the instance never comes up.
+
+    A mutation run found both ``if reservation is not None`` guards
+    unguarded: inverting either left all 21 tests in this module green.
+    Asserting only that ``close()`` was called would be weaker than the
+    real requirement, so these pin the **ordering** -- which is the part
+    that actually makes the handover work.
+    """
+
+    @staticmethod
+    def _order_tracking_allocator(mgr, order: list[str]):
+        """Make the manager's allocator record when it releases a socket."""
+        real_take_socket = mgr._allocator.take_socket
+
+        def tracking(port):
+            sock = real_take_socket(port)
+            if sock is None:
+                return None
+            wrapper = MagicMock()
+            wrapper.close.side_effect = lambda: (
+                order.append(f"release:{port}"), sock.close()
+            )[0]
+            return wrapper
+
+        mgr._allocator.take_socket = tracking
+
+    def test_the_binary_port_reservation_is_released_before_launch(
+        self, _mock_vice
+    ):
+        MockProc, _ = _mock_vice
+        mgr = ViceInstanceManager(port_range_start=18400, port_range_end=18405)
+        order: list[str] = []
+        self._order_tracking_allocator(mgr, order)
+        MockProc.return_value.start.side_effect = lambda: order.append("start")
+
+        inst = mgr.acquire()
+        try:
+            assert "start" in order, "VICE was never started"
+            assert f"release:{inst.port}" in order, (
+                "the port reservation was never released, so VICE could not "
+                "have bound its own monitor port"
+            )
+            assert order.index(f"release:{inst.port}") < order.index("start"), (
+                f"reservation released after launch: {order}"
+            )
+        finally:
+            mgr.release(inst)
+
+    def test_the_text_monitor_reservation_is_released_before_launch(
+        self, _mock_vice
+    ):
+        """The text-monitor port takes the same path and needs the same
+        handover; it has its own guard, and its own mutation survived."""
+        MockProc, _ = _mock_vice
+        mgr = ViceInstanceManager(
+            port_range_start=18500, port_range_end=18510,
+            enable_text_monitor=True,
+        )
+        order: list[str] = []
+        self._order_tracking_allocator(mgr, order)
+        MockProc.return_value.start.side_effect = lambda: order.append("start")
+
+        inst = mgr.acquire()
+        try:
+            text_port = inst.text_monitor_port
+            assert text_port, "no text monitor port was allocated"
+            assert f"release:{text_port}" in order, (
+                "the text-monitor reservation was never released"
+            )
+            assert order.index(f"release:{text_port}") < order.index("start"), (
+                f"text reservation released after launch: {order}"
+            )
+        finally:
+            mgr.release(inst)

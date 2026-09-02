@@ -38,9 +38,7 @@ from conftest import connect_binary_transport
 
 # Skip entire module if required tools are missing
 pytestmark = [
-    pytest.mark.skipif(
-        shutil.which("x64sc") is None, reason="x64sc not found on PATH"
-    ),
+    pytest.mark.vice_live,
     pytest.mark.skipif(
         shutil.which("c1541") is None, reason="c1541 not found on PATH"
     ),

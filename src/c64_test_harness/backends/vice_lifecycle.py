@@ -6,9 +6,9 @@ manager that handles the lifecycle).
 
 from __future__ import annotations
 
-import glob
 import os
 import platform
+import shutil
 import socket
 import subprocess
 import sys
@@ -16,6 +16,17 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+
+from c64_test_harness.backends.vice_elevation import (
+    ViceElevationRequiredError,
+    effective_driver_name,
+    vice_features,
+    ViceEthernetBinaryError,
+    ViceEthernetError,
+    ViceLaunchPlan,
+    plan_vice_launch,
+    vice_binary_supports_ethernet,
+)
 
 if TYPE_CHECKING:
     from c64_test_harness.disk import DiskImage
@@ -30,20 +41,27 @@ ETHERNET_VICE_BIN_ENV = "VICE_ETHERNET_BIN"
 def ethernet_vice_binary() -> str:
     """Path to an ethernet-capable ``x64sc``, or ``""`` when unconfigured.
 
-    The ``x64sc`` on ``PATH`` frequently cannot do ethernet at all --
-    Homebrew's bottle is the standard example (issue #144): it starts,
-    serves the binary monitor, and attaches no BPF device, so ethernet
-    tests assert against emulated CS8900 registers while no host packet
-    ever moves.  Real ethernet work therefore needs a separate build
-    (official binary, or source with ``--enable-ethernet``), which is
-    typically installed outside ``PATH`` so it does not displace the
-    everyday emulator.
+    **Override, not a requirement -- normally leave this unset.**  The
+    ``PATH`` binary is the intended one: Homebrew's VICE 3.10 bottle
+    reports ``HAVE_RAWNET yes`` / ``HAVE_PCAP yes`` to ``-features`` and
+    links libpcap, so ethernet work needs no separately-built companion.
+    (It was long cited as an ethernet-less build, issue #144; that was a
+    misreading of the crash an *unelevated* launch produces -- see
+    ``vice_elevation``.)
 
-    Set ``VICE_ETHERNET_BIN`` to that path, or configure
-    ``HarnessConfig.vice_ethernet_executable`` (TOML
-    ``[vice] ethernet_executable``).  It is consulted **only** when
-    ``ViceConfig.ethernet`` is true, so non-ethernet runs keep using the
-    ``PATH`` binary.
+    Set it only for a bench that must launch a different binary.
+    :func:`resolve_vice_executable` probes whichever binary it resolves
+    (see :func:`~c64_test_harness.backends.vice_elevation.vice_features`)
+    and raises rather than falling back to one that cannot do ethernet,
+    which is how a suite ends up asserting against emulated CS8900a
+    registers while no host packet moves.
+
+    Set ``VICE_ETHERNET_BIN`` to that path, or pass
+    ``ViceConfig(ethernet_executable=...)`` directly.  (There is no
+    ``HarnessConfig`` / TOML knob for this: nothing maps
+    ``HarnessConfig.vice_*`` fields into :class:`ViceConfig`.)  It is
+    consulted **only** when ``ViceConfig.ethernet`` is true, so
+    non-ethernet runs keep using the ``PATH`` binary.
     """
     return os.environ.get(ETHERNET_VICE_BIN_ENV, "").strip()
 
@@ -54,10 +72,59 @@ def resolve_vice_executable(cfg: ViceConfig) -> str:
     Prefers :attr:`ViceConfig.ethernet_executable` when the ethernet cart
     is in play, so a bench can keep a stock ``x64sc`` on ``PATH`` for
     ordinary tests and an ethernet-enabled build for the bridge suite.
+
+    With ``cfg.ethernet`` set, the chosen binary is *checked* for
+    raw-network support and a build without it raises
+    :class:`ViceEthernetBinaryError`.  It used to fall back to
+    ``cfg.executable`` silently, which is how an ethernet suite ends up
+    asserting against emulated CS8900a registers while no host packet
+    ever moves (issue #144).
     """
-    if cfg.ethernet and cfg.ethernet_executable:
-        return cfg.ethernet_executable
-    return cfg.executable
+    if not cfg.ethernet:
+        return cfg.executable
+
+    candidate = cfg.ethernet_executable or cfg.executable
+    source = (
+        f"ViceConfig.ethernet_executable / ${ETHERNET_VICE_BIN_ENV}"
+        if cfg.ethernet_executable
+        else "ViceConfig.executable"
+    )
+    resolved = shutil.which(candidate)
+    if resolved is None and os.path.isfile(candidate):
+        resolved = candidate
+    hint = (
+        f"Point the harness at an ethernet-capable x64sc: set "
+        f"{ETHERNET_VICE_BIN_ENV}=/path/to/x64sc in the environment, or "
+        f"pass ViceConfig(ethernet_executable=/path/to/x64sc)."
+    )
+    if resolved is None:
+        raise ViceEthernetBinaryError(
+            f"ethernet=True but no x64sc found at {candidate!r} "
+            f"(from {source}). {hint}"
+        )
+    features = vice_features(resolved)
+    if not features.rawnet:
+        raise ViceEthernetBinaryError(
+            f"ethernet=True but {resolved!r} (from {source}) reports "
+            f"HAVE_RAWNET no — it was built without raw-network support, "
+            f"so the CS8900a would be pure emulation with no host traffic. "
+            f"{hint}"
+        )
+    # A driver the build lacks is the same NULL-driver SIGSEGV by another
+    # route, so refuse it here.  Only when the binary actually told us
+    # which drivers it has: the image-scan fallback cannot know.
+    driver = effective_driver_name(cfg.ethernet_driver)
+    if features.drivers_known and not features.has_driver(driver):
+        have = ", ".join(d for d in ("pcap", "tuntap") if features.has_driver(d))
+        raise ViceEthernetBinaryError(
+            f"ethernet_driver={driver!r} but {resolved!r} was built "
+            f"without it (-features says HAVE_{driver.upper()} no; "
+            f"this build has: {have or 'no drivers'}). VICE would leave "
+            f"rawnet_arch_driver NULL and SIGSEGV on reset."
+        )
+    # Return the caller's spelling, not the resolved path: sudoers and
+    # PATH lookups downstream expect what was configured.
+    return candidate
 
 
 def _find_pid_on_port_linux(port: int) -> int | None:
@@ -133,6 +200,53 @@ def _find_pid_on_port(port: int) -> int | None:
     return _find_pid_on_port_linux(port)
 
 
+def build_ethernet_rc(cfg: ViceConfig) -> str:
+    """The vicerc body that activates the CS8900a for *cfg*.
+
+    Extracted from :meth:`ViceProcess.start` so the resource names can be
+    checked against a running VICE rather than against the generated
+    text.  Asserting the text is what let ``EthernetIOIF`` /
+    ``EthernetIODriver`` survive: neither is a VICE resource in any
+    casing, so VICE logged ``Unknown resource`` and ignored them, and
+    the settings only ever arrived through the ``-ethernetioif`` /
+    ``-ethernetiodriver`` CLI flags that are passed alongside.
+
+    The real names are ``ETHERNET_INTERFACE`` (S ``cs8900io.c:309``) and
+    ``ETHERNET_DRIVER`` (S ``rawnetarch.c:146``).  Verified elevated with
+    no ethernet CLI flags at all: this rc alone brings up
+    ``ETHERNET_DRIVER='pcap'``, ``ETHERNET_INTERFACE='feth0'`` and
+    ``ETHERNETCART_ACTIVE=1``, with two BPF peers attached.  The rc is
+    therefore sufficient by itself and the CLI flags are redundant, not
+    load-bearing -- which is why the old misspellings mattered: any path
+    relying on the rc alone was silently unconfigured.
+
+    ``EthernetCartMode`` / ``EthernetCartBase`` are correct as they
+    stand: the *resource* table lookup is case-insensitive
+    (``util_strcasecmp`` at S ``resources.c:243``, and
+    ``resources_calc_hash_key`` lowercases every character).  That is a
+    different lookup from the *option* table in ``cmdline.c``, which is
+    both case-sensitive and prefix-matching.
+    """
+    mode = 1 if cfg.ethernet_mode == "rrnet" else 0
+    rc_lines = [
+        "[Version]",
+        "ConfigVersion=3.10",
+        "",
+        "[C64SC]",
+        "ETHERNETCART_ACTIVE=1",
+        f"EthernetCartMode={mode}",
+    ]
+    if cfg.ethernet_interface:
+        rc_lines.append(f'ETHERNET_INTERFACE="{cfg.ethernet_interface}"')
+    if cfg.ethernet_driver:
+        rc_lines.append(f'ETHERNET_DRIVER="{cfg.ethernet_driver}"')
+    if cfg.ethernet_base != 0xDE00:
+        rc_lines.append(f"EthernetCartBase={cfg.ethernet_base}")
+    rc_lines.append("SaveResourcesOnExit=0")
+    rc_lines.append("")
+    return "\n".join(rc_lines)
+
+
 @dataclass
 class ViceConfig:
     """Configuration for launching a VICE instance."""
@@ -145,7 +259,33 @@ class ViceConfig:
     ntsc: bool = True
     sound: bool = False
     monitor: bool = True
-    minimize: bool = True
+    # Headless launch.  ``-console`` runs the full emulation (binary
+    # monitor, VIC/SID state, -exitscreenshot) without creating the GTK
+    # window, so VICE never activates and steals focus on macOS.  With
+    # ``console=False`` the window is created and ``minimize`` applies.
+    console: bool = True
+    minimize: bool = True  # only meaningful when console=False
+    #: Load the operator's ``~/.config/vice/vicerc``.
+    #:
+    #: Default **False**, which emits ``-default``.  A launch that reads
+    #: an ambient vicerc is not reproducible -- consumers of this harness
+    #: assert on machine state (turbo, REU, video standard, drive type),
+    #: and any of it can be overridden by whatever the operator last
+    #: clicked in VICE's settings dialog.
+    #:
+    #: It is also a crash, for a specific class of vicerc: when the file's
+    #: ``ConfigVersion`` is absent, empty, or does not match the running
+    #: VICE, ``check_resource_file_version`` calls ``ui_error()``
+    #: (S ``resources.c:1281,1291``), and in console mode that reaches GTK
+    #: state which was never initialised -- SIGSEGV on both 3.10 builds
+    #: measured here.  A vicerc written by the same VICE version is fine;
+    #: one left by an older VICE, or hand-written, is not.  Windowed
+    #: launches survive either way, which is why it went unnoticed while
+    #: ``-console`` was positionally broken and every launch was really
+    #: windowed.
+    #:
+    #: Set True only to deliberately test config inheritance.
+    load_user_config: bool = False
     extra_args: list[str] = field(default_factory=list)
     disk_image: DiskImage | None = None
     drive_unit: int = 8
@@ -174,104 +314,61 @@ class ViceConfig:
     #: :func:`ethernet_vice_binary`.  Empty means "just use ``executable``".
     ethernet_executable: str = field(default_factory=ethernet_vice_binary)
 
-    # Snapshot / event recording / determinism / audio capture
-    load_snapshot: str | None = None
-    event_recording_start: bool = False
-    event_image: str | None = None
+    # Event replay / determinism / audio capture.
+    #
+    # Every field here maps to a flag verified present in VICE 3.10's
+    # cmdline tables.  An earlier revision carried two more --
+    # ``load_snapshot`` and ``event_recording_start`` -- that mapped to
+    # flags VICE has never had: there is no ``-loadsnapshot`` anywhere in
+    # the source (load a ``.vsf`` through the monitor's
+    # ``undump_snapshot()`` instead), and the entire ``-event*`` table is
+    # five options (S ``event.c:1279-1301``) with no way to start a
+    # recording -- ``event_record_start()`` (S ``event.c:758``) is
+    # reachable only from the UI and the monitor.
+
+    #: ``EventStartMode``: 0 file save, 1 file load, 2 reset, 3 playback
+    #: (S ``event.c:1293-1295``).
     event_snapshot_mode: int | None = None
+    #: ``EventSnapshotDir`` -- where event recordings are written.  VICE
+    #: normalises the value to a trailing separator.
     event_snapshot_dir: str | None = None
+    #: ``EventImageInclude`` -- whether disk images are included in an
+    #: event recording.  ``None`` leaves VICE's factory default, which is
+    #: already **enabled** (S ``event.c:1248``), so only ``False`` changes
+    #: anything.
+    event_image_include: bool | None = None
     seed: int | None = None
+    #: ``SoundRecordDeviceName`` (S ``sound.c:806``), e.g. ``"wav"``.
     sound_record_driver: str | None = None
+    #: ``SoundRecordDeviceArg`` (S ``sound.c:809``) -- the recording
+    #: driver's parameter, which for ``wav`` is the output path.
     sound_record_file: str | None = None
     exit_screenshot: str | None = None
 
-    # Run VICE as root.  On macOS the pcap ethernet driver needs read/write
-    # on a ``/dev/bpf*`` node, which is root-only by default -- so the
-    # harness wraps the launch with ``sudo -n`` when, and only when, those
-    # nodes are not already reachable as the current user.  Rigs commonly
-    # open them up (``chmod o+rw /dev/bpf*``); once they are accessible an
-    # unprivileged VICE captures on feth(4) perfectly well, verified with a
-    # full DHCP exchange over feth0 (issue #144 follow-up).
+    # Run VICE as root.  VICE selects a pcap ethernet driver only when
+    # ``archdep_rawnet_capability()`` holds -- ``geteuid() == 0``, plus a
+    # Linux-only ``CAP_NET_RAW`` branch.  It never inspects ``/dev/bpf*``:
+    # a rig that ran ``chmod o+rw /dev/bpf*`` has changed nothing VICE
+    # looks at, and an unelevated ethernet launch leaves
+    # ``rawnet_arch_driver`` NULL and SIGSEGVs on the first reset with no
+    # log output.
     #
-    # An earlier revision of this comment claimed the kernel refuses
-    # non-root capture on feth(4) even at mode 666, and elevated every
-    # macOS ethernet launch on that basis.  That was a misreading of the
-    # segfault in ``cs8900_activate`` (NULL ``rawnet_arch_driver``): per
-    # #144 that crash is a VICE build with ethernet compiled out, and it
-    # reproduces identically as root and with /dev/bpf* already o+rw.
-    # Do not restore the blanket elevation -- fix the VICE build instead.
+    # Earlier revisions of this comment claimed the opposite in both
+    # directions -- first that the kernel refuses non-root capture on
+    # feth(4) at mode 666, then that open ``/dev/bpf*`` nodes make
+    # elevation unnecessary.  Both were readings of the same
+    # ``cs8900_activate`` segfault; the cause is the NULL driver, and it
+    # is the euid that decides.  Confirmed live: with ``/dev/bpf0`` at
+    # ``crw----rw-`` and uid 501, VICE still refuses the pcap driver.
     #
-    # ``None`` means auto-detect (the rule above).  Set explicitly to
-    # override; a passwordless sudoers entry is only needed when elevation
-    # actually fires, and it must name the *exact* x64sc path being
-    # launched (see docs/development.md -> macOS -> Passwordless sudo).
+    # ``None`` means auto-detect (ethernet + a root-gated driver + no
+    # capability).  Set explicitly to override -- but note that
+    # ``run_as_root=False`` on a launch that needs root is refused rather
+    # than crashed; see ``vice_elevation.plan_vice_launch``.  A
+    # passwordless sudoers entry is only needed when elevation actually
+    # fires, and it must name the *exact* x64sc path being launched (see
+    # docs/development.md -> macOS -> Passwordless sudo).
     run_as_root: bool | None = None
-
-
-#: BPF devices a single pcap-attached VICE consumes (measured: it opens two).
-BPF_NODES_PER_VICE = 2
-
-
-def bpf_capture_available(min_nodes: int = BPF_NODES_PER_VICE) -> bool:
-    """True when this process could open BPF devices for pcap capture.
-
-    *min_nodes* is how many user-openable ``/dev/bpf*`` nodes must exist.
-    One pcap-attached VICE opens :data:`BPF_NODES_PER_VICE` of them.
-
-    .. important::
-
-       ``chmod o+rw /dev/bpf*`` only affects the nodes that **exist at
-       that moment**. macOS creates further nodes on demand with default
-       root-only permissions, so an unprivileged process cannot grow the
-       pool. With four pre-opened nodes exactly *one* VICE can capture;
-       a second one forces creation of ``/dev/bpf4``/``bpf5`` as
-       ``crw-------`` and dies with rc=255.
-
-       So the harness's two-VICE bridge suite needs either root, or a rig
-       that pre-creates and opens ``2 x <instances>`` nodes. This check
-       cannot see that coming -- it reports the pool at decision time, and
-       a concurrently starting VICE may consume the remainder.
-
-    macOS gates packet capture behind read/write access to a ``/dev/bpf*``
-    node, which is root-only out of the box.  Test rigs routinely open them
-    up (``sudo chmod o+rw /dev/bpf*`` --
-    ``scripts/setup-bridge-feth-macos.sh`` prints this as a required manual
-    step, and consumer rigs such as c64-https's ``rig-up-macos.sh`` do it
-    for you).  Once the nodes are reachable, an unprivileged VICE captures
-    on feth(4) normally -- confirmed by a full DHCP exchange over feth0.
-
-    This is what :attr:`ViceConfig.run_as_root` auto-detection consults, so
-    the harness elevates only when it would otherwise be unable to capture.
-
-    Returns ``True`` on non-Darwin platforms, where this gate does not
-    apply, and when already running as root.
-    """
-    if sys.platform != "darwin":
-        return True
-    if os.geteuid() == 0:
-        return True
-    usable = sum(
-        1
-        for node in glob.glob("/dev/bpf*")
-        if os.access(node, os.R_OK | os.W_OK)
-    )
-    return usable >= min_nodes
-
-
-def _should_run_as_root(cfg: ViceConfig) -> bool:
-    """Resolve :attr:`ViceConfig.run_as_root`, including auto-detection.
-
-    An explicit ``True``/``False`` is honoured verbatim.  ``None`` means:
-    elevate only on macOS, only when the ethernet cart is in play, and only
-    when this process could not open a BPF device on its own.
-    """
-    if cfg.run_as_root is not None:
-        return cfg.run_as_root
-    return (
-        sys.platform == "darwin"
-        and cfg.ethernet
-        and not bpf_capture_available()
-    )
 
 
 class ViceProcess:
@@ -291,10 +388,12 @@ class ViceProcess:
         # Temp vicerc used to activate CS8900a ethernet (see start()).
         # Cleaned up in stop().
         self._tmp_vicerc: str | None = None
-        # True when the child was launched via ``sudo -n -E`` so it runs as
-        # root.  stop() uses this flag to route SIGTERM / SIGKILL through
-        # ``sudo -n kill`` instead of Popen.terminate(), which on macOS
-        # cannot signal a root-owned child from an unprivileged parent.
+        # True when the child was launched via plain ``sudo -n`` (no -E:
+        # that would need a SETENV tag in sudoers; see plan_vice_launch)
+        # so it runs as root.  stop() uses this flag to route SIGTERM /
+        # SIGKILL through ``sudo -n kill`` instead of Popen.terminate(),
+        # which on macOS cannot signal a root-owned child from an
+        # unprivileged parent.
         self._is_sudo_child: bool = False
 
     def __enter__(self) -> ViceProcess:
@@ -336,20 +435,100 @@ class ViceProcess:
 
         cfg = self.config
 
-        if cfg.event_snapshot_mode is not None and not 0 <= cfg.event_snapshot_mode <= 2:
+        if cfg.event_snapshot_mode is not None and not 0 <= cfg.event_snapshot_mode <= 3:
             raise ValueError(
-                f"event_snapshot_mode must be 0, 1, or 2 (got {cfg.event_snapshot_mode})"
+                "event_snapshot_mode must be 0, 1, 2, or 3 "
+                f"(got {cfg.event_snapshot_mode})"
             )
 
-        args = [resolve_vice_executable(cfg)]
+        # VICE scans argv for a handful of flags *before* it initialises the
+        # UI or loads the config file (S main.c:267-303), and that scan
+        # ``break``s at the first argument it does not recognise.  Anything
+        # it handles must therefore appear before every other flag.
+        #
+        # ``-console`` is the one that bites: ``ui_init_with_args``
+        # (S main.c:385) is gated on the ``console_mode`` flag that only
+        # this early scan sets.  The late handler registered via
+        # initcmdline.c:307 fires at main.c:421, long after the window
+        # exists.  Emitted after ``-autostart``/``-warp`` the flag is
+        # silently ineffective on macOS: VICE opens the window anyway.
+        #
+        # ``-seed`` has the identical shape -- ``lib_rand_seed()`` is called
+        # from the early scan and nowhere else, so a late ``-seed`` is
+        # parsed as a resource option and never seeds the RNG.
+        early_args: list[str] = []
+        if not cfg.load_user_config:
+            # Also an early-scan flag: it sets ``loadconfig = false``
+            # (S main.c:285-291) before resources_load() runs at main.c:390.
+            early_args.append("-default")
+        if cfg.console:
+            early_args.append("-console")
+        if cfg.seed is not None:
+            early_args += ["-seed", str(cfg.seed)]
+
+        args = [resolve_vice_executable(cfg)] + early_args
         if cfg.prg_path:
             args += ["-autostart", cfg.prg_path]
-            if sys.platform == "darwin" and "-autostartprgmode" not in cfg.extra_args:
-                args += ["-autostartprgmode", "1"]
+
+        # ------------------------------------------------------------------
+        # Resources pinned explicitly rather than inherited.
+        #
+        # -default (above) stops the vicerc being read, which leaves VICE's
+        # factory defaults -- and several of those are not what the harness
+        # wants.  Pin them here so a run means the same thing on every
+        # machine.  cfg.extra_args is appended after this block, and VICE
+        # takes the last occurrence of a resource flag, so a caller can
+        # still override any of them.
+        # ------------------------------------------------------------------
+
+        # Factory is 2/Disk (S autostart-prg.h:45).  1/Inject is what the
+        # harness has always wanted, but it was set only on macOS, so Linux
+        # silently took the disk path.
+        if "-autostartprgmode" not in cfg.extra_args:
+            args += ["-autostartprgmode", "1"]
+
+        # Factory is 1 (S autostart.c:413): autostart ran warped even when
+        # the caller explicitly asked for warp=False.
+        args.append("-autostart-warp" if cfg.warp else "+autostart-warp")
+
+        # Factory is 0, but an operator's vicerc may set it -- in which case
+        # our runs would rewrite their settings file on exit.
+        args.append("+saveres")
+
+        # Determinism knobs, named explicitly so they stay put if a future
+        # VICE changes its factory values.
+        #
+        # -jamaction 0 is DIALOG, deliberately *not* the factory 1
+        # (CONTINUE).  VICE emits the 0x61 JAM event only from
+        # monitor_binary_ui_jam_dialog, which machine_jam reaches only
+        # when jam_action == 0 (S machine.c:131-139); with the binary
+        # monitor connected the "dialog" is routed to the monitor and
+        # the machine stops, so wait_for_stopped can report the jam.
+        # Under CONTINUE machine_jam returns JAM_NONE (S machine.c:145-150,
+        # actions[0] == -1, falling through to :162) and the core's JAM()
+        # default branch is a bare CLK++ with no PC advance
+        # (S maincpu.c:607-628; opcode $02 reaches it via JAM_02(),
+        # 6510core.c:1242-1249): the 6510 halts in place, silently, and
+        # that report is unreachable.
+        #
+        # DIALOG is safe only while a monitor client can take the dialog:
+        # monitor_is_binary() is connected_socket != NULL
+        # (S monitor_binary.c:2110-2113), and with nothing connected
+        # machine.c:140's `else if (!console_mode)` opens the GTK jam
+        # dialog and the emulator blocks on it.  A launch with no binary
+        # monitor therefore keeps the factory CONTINUE.
+        args += ["-jamaction", "0" if cfg.monitor else "1"]
+        args += ["-speed", "100"]        # no ambient speed limit
+        args += ["-soundwarpmode", "1"]  # keep emulating SID under warp,
+                                         # or render_wav() records silence
+        if cfg.disk_image is None or cfg.drive_unit != 8:
+            args += ["-drive8type", "1542"]
         if cfg.warp:
             args.append("-warp")
-        if cfg.ntsc:
-            args.append("-ntsc")
+        # ntsc=False used to emit nothing at all and inherit
+        # MachineVideoStandard.  PAL/NTSC changes cycle counts and TOD
+        # rates, which tod_timer.py calibrates against.
+        args.append("-ntsc" if cfg.ntsc else "-pal")
         if cfg.monitor:
             args += ["-binarymonitor", "-binarymonitoraddress",
                      f"ip4://127.0.0.1:{cfg.port}"]
@@ -357,95 +536,74 @@ class ViceProcess:
             args += ["-remotemonitor", "-remotemonitoraddress",
                      f"ip4://127.0.0.1:{cfg.text_monitor_port}"]
         if cfg.sounddev:
-            # Force sound on when a sound device is configured
+            # Force sound on when a sound device is configured.  The
+            # comment here has always said so; the flag was never emitted.
+            args.append("-sound")
             args += ["-sounddev", cfg.sounddev]
             if cfg.soundarg:
                 args += ["-soundarg", cfg.soundarg]
             args += ["-soundrate", str(cfg.soundrate)]
             args += ["-soundoutput", str(cfg.soundoutput)]
-        elif not cfg.sound:
-            args.append("+sound")
+        else:
+            # Factory Sound is 1 (S sound.c:721), so sound=True emitting
+            # nothing was an inherit, not a default.
+            args.append("-sound" if cfg.sound else "+sound")
         if cfg.limit_cycles > 0:
             args += ["-limitcycles", str(cfg.limit_cycles)]
-        if cfg.minimize:
+        if not cfg.console and cfg.minimize:
             args.append("-minimized")
-        if cfg.load_snapshot is not None:
-            args += ["-loadsnapshot", cfg.load_snapshot]
-        if cfg.event_recording_start:
-            args.append("-eventstart")
-        if cfg.event_image is not None:
-            args += ["-eventimage", cfg.event_image]
         if cfg.event_snapshot_mode is not None:
-            args += ["-eventsnapshot", str(cfg.event_snapshot_mode)]
+            args += ["-eventstartmode", str(cfg.event_snapshot_mode)]
         if cfg.event_snapshot_dir is not None:
             args += ["-eventsnapshotdir", cfg.event_snapshot_dir]
-        if cfg.seed is not None:
-            args += ["-seed", str(cfg.seed)]
+        if cfg.event_image_include is not None:
+            # A +flag disables in VICE's cmdline convention.
+            args.append("-eventimageinc" if cfg.event_image_include else "+eventimageinc")
         if cfg.sound_record_driver is not None:
-            args += ["-soundrecord", cfg.sound_record_driver]
+            args += ["-soundrecdev", cfg.sound_record_driver]
         if cfg.sound_record_file is not None:
-            args += ["-recordfile", cfg.sound_record_file]
+            args += ["-soundrecarg", cfg.sound_record_file]
         if cfg.exit_screenshot is not None:
             args += ["-exitscreenshot", cfg.exit_screenshot]
         args += cfg.extra_args
 
         if cfg.ethernet:
-            # VICE 3.10 ethernet activation has TWO quirks that must both
-            # be worked around:
+            # The CS8900a is activated through a temporary vicerc passed
+            # with ``-addconfig``.  That rc is sufficient on its own: it
+            # names the real resources (``ETHERNETCART_ACTIVE``,
+            # ``ETHERNET_INTERFACE``, ``ETHERNET_DRIVER``) and, launched
+            # elevated with no ethernet CLI flags at all, brings the cart
+            # up with two BPF peers attached -- see build_ethernet_rc().
             #
-            # 1. The ``-ethernetcart`` / ``-tfe`` / ``-rrnet`` CLI flags
-            #    appear in ``-help`` but are rejected at parse time
-            #    ("Option '-ethernetcart' not valid.").
+            # Two earlier accounts in this comment were wrong and are
+            # recorded here so they are not re-derived:
             #
-            # 2. If ``ETHERNETCART_ACTIVE`` is only set via a vicerc file
-            #    (``-addconfig`` / ``-config``) WITHOUT also supplying
-            #    ``-ethernetioif`` / ``-ethernetiodriver`` on the command
-            #    line, VICE sets the resource to 1 and exposes the
-            #    CS8900a Product ID to the C64 — BUT never attaches a TAP
-            #    file descriptor on the host side, so frames never leave
-            #    the emulator (carrier stays 0, tcpdump sees nothing).
-            #    Conversely, if you only supply the CLI interface/driver
-            #    flags WITHOUT also activating the cart via addconfig,
-            #    the TAP gets attached (carrier=1) but the cart stays
-            #    disabled.
+            # * "``-ethernetcart`` / ``-tfe`` / ``-rrnet`` are rejected at
+            #   parse time."  False: all three are registered
+            #   (S ``ethernetcart.c:434-451``).  Passed *unelevated* they
+            #   SIGSEGV instead -- the cart activates with
+            #   ``rawnet_arch_driver`` NULL and ``rawnet_arch_pre_reset``
+            #   dereferences it (S ``rawnetarch.c:251``; rc=139 on 6 of 6
+            #   flag x build combinations).  docs/vice_upstream_bugs.md § 2.
             #
-            # The working combination, verified empirically with
-            # ``scripts/verify_vice_ethernet.py``, is:
+            # * "The rc alone activates the cart but never attaches a TAP,
+            #   so ``-ethernetioif`` / ``-ethernetiodriver`` must follow it,
+            #   and must follow it in that order."  That was an artefact
+            #   of the rc misspelling the interface and driver resources
+            #   (``EthernetIOIF`` / ``EthernetIODriver`` are not VICE
+            #   resources in any casing; VICE logged ``Unknown resource``
+            #   and ignored them), so the interface and driver only ever
+            #   arrived via the CLI flags.  There is no VICE ordering
+            #   quirk to work around.
             #
-            #     -addconfig <tmp.rc>      (must come FIRST)
-            #     -ethernetioif <iface>
-            #     -ethernetiodriver <drv>
-            #
-            # In this order, VICE both attaches the TAP and activates
-            # the cart, and the C64 can TX/RX real frames.  If the
-            # ``-addconfig`` comes AFTER the CLI iface flags, the
-            # ETHERNETCART_ACTIVE value in the rc file is NOT honoured
-            # (reads back as 0).
-            mode = 1 if cfg.ethernet_mode == "rrnet" else 0
-            rc_lines = [
-                "[Version]",
-                "ConfigVersion=3.10",
-                "",
-                "[C64SC]",
-                "ETHERNETCART_ACTIVE=1",
-                f"EthernetCartMode={mode}",
-            ]
-            if cfg.ethernet_interface:
-                rc_lines.append(f'EthernetIOIF="{cfg.ethernet_interface}"')
-            if cfg.ethernet_driver:
-                rc_lines.append(f'EthernetIODriver="{cfg.ethernet_driver}"')
-            if cfg.ethernet_base != 0xDE00:
-                rc_lines.append(f"EthernetCartBase={cfg.ethernet_base}")
-            rc_lines.append("SaveResourcesOnExit=0")
-            rc_lines.append("")
-
+            # The CLI flags are still emitted, as belt-and-braces, and
+            # ``-addconfig`` is kept ahead of them so a run means the same
+            # thing it always has; neither is load-bearing.
             fd, path = tempfile.mkstemp(prefix="vice_eth_", suffix=".rc")
             with os.fdopen(fd, "w") as f:
-                f.write("\n".join(rc_lines))
+                f.write(build_ethernet_rc(cfg))
             self._tmp_vicerc = path
 
-            # ORDER MATTERS: -addconfig must come BEFORE the interface/
-            # driver CLI flags.  See note above.
             args += ["-addconfig", path]
             if cfg.ethernet_interface:
                 args += ["-ethernetioif", cfg.ethernet_interface]
@@ -465,26 +623,21 @@ class ViceProcess:
         if cfg.env is not None:
             popen_kwargs["env"] = cfg.env
 
-        # Decide whether to wrap with sudo.  On macOS the pcap driver needs
-        # read/write on a /dev/bpf* node; elevate only when the current user
-        # cannot already reach one (see ViceConfig.run_as_root).  The wrap
-        # happens at exec time so the sudo failure mode is clean: if
-        # NOPASSWD isn't configured, Popen starts but exits with a "sudo:
-        # password is required" error on stderr and a non-zero status, and
-        # the caller sees "VICE exited early" through the normal
-        # monitor-connect path.
-        run_as_root = _should_run_as_root(cfg)
-        if run_as_root:
-            # -E (preserve env) requires a SETENV tag in sudoers which we
-            # deliberately do NOT ask for -- it's a privilege expansion.
-            # VICE reads $HOME for its config path, but sudo's default
-            # env_keep includes HOME, so plain `sudo -n` works.
-            args = ["sudo", "-n"] + args
-            # Track that we're running under sudo so stop() can send SIGTERM
-            # via sudo as well (direct kill of a root child is refused).
-            self._is_sudo_child = True
-        else:
-            self._is_sudo_child = False
+        # Decide how to exec: plain, or wrapped in ``sudo -n`` when the
+        # ethernet cart needs raw-network capability this process lacks.
+        # An unelevated ethernet launch does not degrade -- VICE leaves
+        # ``rawnet_arch_driver`` NULL and SIGSEGVs on the first reset with
+        # no log output -- so plan_vice_launch() refuses it and reports
+        # the command to run instead.  See vice_elevation.py.
+        try:
+            plan = plan_vice_launch(cfg, args)
+        except ViceEthernetError:
+            self._cleanup_tmp_vicerc()
+            raise
+        args = plan.argv
+        # Track sudo wrapping so stop() routes signals through sudo: an
+        # unprivileged parent cannot signal a root-owned child.
+        self._is_sudo_child = plan.sudo_wrapped
 
         self._proc = subprocess.Popen(args, **popen_kwargs)  # type: ignore[arg-type]
 

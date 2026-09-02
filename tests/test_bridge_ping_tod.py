@@ -23,7 +23,6 @@ clock rate on real hardware across several turbo speeds using the
 from __future__ import annotations
 
 import os
-import shutil
 import threading
 import time
 
@@ -56,12 +55,11 @@ from c64_test_harness.tod_timer import (
 # ---------------------------------------------------------------------------
 # VICE bridge skip conditions
 # ---------------------------------------------------------------------------
-_HAS_X64SC = shutil.which("x64sc") is not None
 
 _PCAP_OK, _PCAP_REASON = probe_vice_pcap_ok(iface=IFACE_A)
 
 _VICE_SKIPS = [
-    pytest.mark.skipif(not _HAS_X64SC, reason="x64sc not found on PATH"),
+    pytest.mark.vice_live,
     # See test_bridge_ping.py: monitor-up is not proof of capture, so
     # require a real /dev/bpf* attach or these pass vacuously (issue #144).
     pytest.mark.skipif(not _PCAP_OK, reason=_PCAP_REASON),

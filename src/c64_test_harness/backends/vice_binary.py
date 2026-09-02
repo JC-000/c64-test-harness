@@ -9,10 +9,26 @@ Uses VICE's binary monitor protocol (-binarymonitor).  Provides:
 
 Wire format is little-endian throughout.  See VICE documentation for the
 full binary monitor protocol specification.
+
+**One request does not always mean one response.** Most commands answer
+with a single frame, and :meth:`BinaryViceTransport._send_and_recv`
+models that: it matches on request id, validates the response type
+against :data:`CMD_TO_RESPONSE_TYPE`, and returns the first match.
+``CHECKPOINT_LIST`` does not fit — VICE replies with one
+``CHECKPOINT_INFO`` (0x11) frame *per checkpoint*, every one carrying the
+request's id, and only then the 0x14 frame holding the count.  A
+single-response helper takes the first 0x11, sees a type it was not
+expecting, and raises.
+
+So a list-shaped command has to drain its own reply (see
+:meth:`BinaryViceTransport.checkpoint_list`), and anyone adding one
+should expect the same shape rather than assume ``_send_and_recv``
+covers it.
 """
 
 from __future__ import annotations
 
+import logging
 import socket
 import struct
 import threading
@@ -22,6 +38,18 @@ from typing import NamedTuple
 
 from ..transport import ConnectionError, TimeoutError, TransportError
 
+_log = logging.getLogger(__name__)
+
+#: VICE 3.10 under-allocates every ``DISPLAY_GET`` response by exactly four
+#: bytes.  ``monitor_binary.c:1273`` sizes the buffer as
+#: ``4 + info_length + buffer_length``, accounting for the ``info_length``
+#: field at ``:1278`` but not for the *second* four-byte field -- the
+#: display-buffer length written at ``:1297``.  The reply therefore carries
+#: four fewer pixel bytes than its own ``buffer_length`` claims (and VICE
+#: writes four bytes past the end of its heap allocation on the way out).
+#: See ``docs/vice_upstream_bugs.md`` bug 1.
+DISPLAY_GET_SHORTFALL = 4
+
 # ---------------------------------------------------------------------------
 # Command IDs
 # ---------------------------------------------------------------------------
@@ -30,6 +58,7 @@ CMD_MEM_GET = 0x01
 CMD_MEM_SET = 0x02
 CMD_CHECKPOINT_SET = 0x12
 CMD_CHECKPOINT_DEL = 0x13
+CMD_CHECKPOINT_LIST = 0x14
 CMD_CONDITION_SET = 0x22
 CMD_REGISTERS_GET = 0x31
 CMD_REGISTERS_SET = 0x32
@@ -55,6 +84,24 @@ EVENT_STOPPED = 0x62
 EVENT_RESUMED = 0x63
 RESPONSE_CHECKPOINT_INFO = 0x11
 
+#: VICE emits this when the 6510 hits an illegal opcode and jams
+#: (``e_MON_RESPONSE_JAM``, S ``monitor_binary.c:382-391``).  The protocol
+#: manual (vice.texi, "JAM Response (0x61)") documents a 2-byte PC body,
+#: and ``monitor_binary_ui_jam_dialog`` does fill one -- but 3.10 passes
+#: ``length=0`` to ``monitor_binary_response`` (S ``monitor_binary.c:389``,
+#: where STOPPED/RESUMED pass 2), which transmits ``length`` body bytes.
+#: So on the wire the 3.10 frame is bodiless and the jammed address has to
+#: be read back separately; a body, when a build sends one, is preferred.
+#:
+#: Found by the binary-monitor mapping, which noted that this client never
+#: mentioned 0x61 at all: a jam was buffered as an unrecognised event and
+#: never looked at, so a jammed program timed out on whatever assertion
+#: came next instead of reporting that the CPU had stopped.  The event
+#: queue makes that concrete — it is only ever drained by
+#: :meth:`wait_for_stopped`, so on any path that does not call it a jam
+#: notification sits there unread for the life of the transport.
+RESPONSE_JAM = 0x61
+
 # For the binary monitor protocol, each request command's response_type field
 # echoes the command opcode for most commands.  Two exceptions: the
 # Checkpoint commands (Set/Delete) reply with CHECKPOINT_INFO (0x11), and
@@ -68,6 +115,7 @@ CMD_TO_RESPONSE_TYPE: dict[int, int] = {
     CMD_MEM_SET: 0x02,
     CMD_CHECKPOINT_SET: 0x11,
     CMD_CHECKPOINT_DEL: 0x13,
+    CMD_CHECKPOINT_LIST: 0x14,
     CMD_CONDITION_SET: 0x22,
     CMD_REGISTERS_GET: 0x31,
     CMD_REGISTERS_SET: 0x31,
@@ -120,6 +168,15 @@ class BinaryViceTransport:
         port: int = 6502,
         timeout: float = 5.0,
         screen_base: int = 0x0400,
+        # keybuf_addr / keybuf_count_addr are **not used by this
+        # transport**: inject_keys() goes through CMD_KEYBOARD_FEED and
+        # never writes $0277/$C6 itself.  They are kept rather than
+        # removed because they are part of the documented HarnessConfig
+        # surface and dropping a public constructor parameter would break
+        # any consumer passing it.  Recorded here because their presence
+        # reads as evidence that the keyboard path writes memory
+        # directly, which it does not -- a reader who assumes otherwise
+        # will mis-diagnose a lost keystroke as a failed write.
         keybuf_addr: int = 0x0277,
         keybuf_count_addr: int = 0x00C6,
         keybuf_max: int = 10,
@@ -488,10 +545,21 @@ class BinaryViceTransport:
         current_addr = addr
 
         while remaining > 0:
-            # end_addr is inclusive, and both fields are 16-bit
-            chunk_size = min(remaining, 0x10000 - (current_addr & 0xFFFF))
+            # end_addr is inclusive, and both fields are 16-bit.
+            #
+            # A single request may ask for at most 0xFFFF bytes, never
+            # 0x10000.  VICE computes
+            #     length = (endaddress + 1) - startaddress
+            # into a uint32_t but returns it through write_uint16
+            # (S monitor_binary.c:1637,1672), so a whole-address-space
+            # request truncates the declared payload length to 0 -- the
+            # data is all there (body_len 65538) but the response claims
+            # zero bytes, and there is no way to tell that apart from a
+            # genuinely empty read.  Splitting 64 KiB into 0xFFFF + 1
+            # keeps every request inside what the field can express.
+            chunk_size = min(remaining, 0x10000 - (current_addr & 0xFFFF), 0xFFFF)
             if chunk_size <= 0:
-                chunk_size = min(remaining, 0x10000)
+                chunk_size = min(remaining, 0xFFFF)
 
             end_addr = (current_addr + chunk_size - 1) & 0xFFFF
             start_lo = current_addr & 0xFFFF
@@ -606,7 +674,19 @@ class BinaryViceTransport:
         self._send_and_recv(CMD_JOYPORT_SET, body)
 
     def read_framebuffer(self, use_vic: bool = True, format: int = 0) -> dict:
-        """Return raw framebuffer bytes plus geometry. Backend-specific layout — see backend docs."""
+        """Return raw framebuffer bytes plus geometry.
+
+        Backend-specific layout — see backend docs.  Beyond the shared
+        keys this adds two VICE-specific ones, ``declared_length`` and
+        ``short_by``, because VICE 3.10 delivers fewer pixel bytes than
+        it declares (:data:`DISPLAY_GET_SHORTFALL`).  ``bytes`` is what
+        actually arrived; size buffers from the geometry and check
+        ``short_by`` rather than trusting ``len(bytes)``.
+
+        Raises :class:`TransportError` if the shortfall is anything other
+        than the documented one, which indicates a truncated or
+        desynchronised response rather than the known bug.
+        """
         body = struct.pack("<BB", 0x01 if use_vic else 0x00, format & 0xFF)
         resp = self._send_and_recv(CMD_DISPLAY_GET, body)
         data = resp.body
@@ -625,12 +705,55 @@ class BinaryViceTransport:
             raise TransportError("Display Get response truncated before buffer length")
         buf_len = struct.unpack_from("<I", data, buf_off)[0]
         pixels = data[buf_off + 4:buf_off + 4 + buf_len]
+
+        # VICE always delivers four bytes fewer than it declares (see
+        # DISPLAY_GET_SHORTFALL).  Slicing alone hides that: the slice
+        # just stops early and the caller gets a buffer that does not
+        # match its own geometry, with no error and no log line.
+        #
+        # Raising unconditionally is not the answer either -- the bug
+        # fires on *every* call, and ``read_framebuffer`` is on the
+        # cross-backend C64Transport protocol, so that would make the
+        # VICE backend fail where the U64 one succeeds.  Instead: report
+        # the known shortfall explicitly and loudly, and refuse anything
+        # that is *not* the known shortfall, which would be real
+        # corruption rather than this documented bug.
+        short_by = buf_len - len(pixels)
+        if short_by not in (0, DISPLAY_GET_SHORTFALL):
+            raise TransportError(
+                f"Display Get buffer is {short_by} bytes short of its "
+                f"declared length ({len(pixels)} of {buf_len}). VICE 3.10's "
+                f"known under-allocation is exactly "
+                f"{DISPLAY_GET_SHORTFALL} bytes, so this is a different "
+                f"fault -- a truncated or desynchronised response, not the "
+                f"documented bug."
+            )
+        # Warn once per transport, not once per frame: the bug fires on
+        # every call, so a capture loop would bury the message in copies
+        # of itself.  The ``short_by`` key below carries it per call.
+        if short_by and not getattr(self, "_display_shortfall_warned", False):
+            self._display_shortfall_warned = True
+            _log.warning(
+                "DISPLAY_GET returned %d of %d declared pixel bytes; VICE "
+                "3.10 under-allocates the response by %d bytes "
+                "(docs/vice_upstream_bugs.md bug 1). The frame is short by "
+                "%d pixels at %d bpp. Reported once per transport; see the "
+                "'short_by' key on every call.",
+                len(pixels), buf_len, DISPLAY_GET_SHORTFALL,
+                short_by * 8 // bpp if bpp else short_by, bpp,
+            )
         return {
             "debug_rect": (0, 0, debug_w, debug_h),
             "inner_rect": (inner_x, inner_y, inner_w, inner_h),
             "bpp": bpp,
             "palette": 0,
             "bytes": pixels,
+            # VICE-specific diagnostics.  ``declared_length`` is what the
+            # response claimed; ``short_by`` is how far ``bytes`` falls
+            # short of it.  A caller that sizes buffers from the geometry
+            # can check these instead of trusting len(bytes).
+            "declared_length": buf_len,
+            "short_by": short_by,
         }
 
     def read_palette(self, use_vic: bool = True) -> list[tuple[int, int, int]]:
@@ -720,6 +843,82 @@ class BinaryViceTransport:
         checkpoint_num = struct.unpack_from("<I", resp.body, 0)[0]
         return checkpoint_num
 
+    def checkpoint_list(self) -> list[dict]:
+        """Every checkpoint VICE currently holds.
+
+        The harness could set and delete checkpoints but never enumerate
+        them, so a checkpoint leaked by an interrupted :func:`jsr` — whose
+        ``finally`` never ran — was undetectable from the client side.  A
+        leaked execution checkpoint pins the CPU at its address: every
+        resume re-triggers it and stops before executing, which looks
+        exactly like a hung emulator and is why this was worth adding
+        even though the first thing it did was *rule out* that diagnosis
+        for the TestKeyboard wedge (it reported zero).
+
+        Cannot use :meth:`_send_and_recv`: VICE answers this one with a
+        ``CHECKPOINT_INFO`` (0x11) frame *per checkpoint*, all carrying
+        this request's id, and only then the 0x14 frame holding the
+        count.  A single-response helper would take the first 0x11, see a
+        response type it was not expecting, and raise.
+
+        Returns a list of dicts with ``number``, ``start``, ``end``,
+        ``enabled``, ``stop_when_hit``, ``temporary``, ``hit_count`` and
+        ``cpu_operation``.
+        """
+        found: list[dict] = []
+        with self._lock:
+            req_id = self._send_command(CMD_CHECKPOINT_LIST, b"")
+            while True:
+                resp = self._recv_response()
+                if resp.request_id != req_id:
+                    self._event_queue.append((self._resume_generation, resp))
+                    continue
+                if resp.error_code != 0x00:
+                    raise TransportError(
+                        f"VICE binary monitor error {resp.error_code:#x} "
+                        f"listing checkpoints (body={resp.body.hex()})"
+                    )
+                if resp.response_type == CMD_CHECKPOINT_LIST:
+                    # The trailing frame: a count we can cross-check.
+                    declared = (
+                        struct.unpack_from("<I", resp.body, 0)[0]
+                        if len(resp.body) >= 4
+                        else len(found)
+                    )
+                    if declared != len(found):
+                        raise TransportError(
+                            f"VICE declared {declared} checkpoints but sent "
+                            f"{len(found)} CHECKPOINT_INFO frames"
+                        )
+                    return found
+                if resp.response_type != RESPONSE_CHECKPOINT_INFO:
+                    raise TransportError(
+                        f"unexpected response type {resp.response_type:#x} "
+                        f"while listing checkpoints"
+                    )
+                found.append(self._parse_checkpoint_info(resp.body))
+
+    @staticmethod
+    def _parse_checkpoint_info(body: bytes) -> dict:
+        """Decode a CHECKPOINT_INFO body (leading fixed-size fields)."""
+        if len(body) < 18:
+            raise TransportError(
+                f"Checkpoint Info response too short ({len(body)} bytes)"
+            )
+        (number, hit, start, end, stop_when_hit, enabled, cpu_op,
+         temporary, hit_count) = struct.unpack_from("<IBHHBBBBI", body, 0)
+        return {
+            "number": number,
+            "currently_hit": bool(hit),
+            "start": start,
+            "end": end,
+            "stop_when_hit": bool(stop_when_hit),
+            "enabled": bool(enabled),
+            "cpu_operation": cpu_op,
+            "temporary": bool(temporary),
+            "hit_count": hit_count,
+        }
+
     def delete_checkpoint(self, checkpoint_num: int) -> None:
         """Delete a checkpoint by its number."""
         body = struct.pack("<I", checkpoint_num)
@@ -758,6 +957,38 @@ class BinaryViceTransport:
 
         self._send_and_recv(CMD_REGISTERS_SET, body)
 
+    def _jam_message(self, frame: _Response) -> str:
+        """Describe the CPU jam reported by *frame*, naming the address.
+
+        The protocol documents a 2-byte little-endian PC body for the
+        JAM response (vice.texi, "JAM Response (0x61)"), and that is
+        used when present: no wire round-trip against a machine that
+        has just jammed.  VICE 3.10 does not actually send it -- see
+        :data:`RESPONSE_JAM` -- so a bodiless frame falls back to a
+        register read.  That read can itself fail on a sufficiently
+        unwell machine, so it is best-effort: a jam reported without an
+        address is still far better than the timeout this replaces.
+
+        Must be called with ``_lock`` *released*: the fallback goes
+        through ``_send_and_recv``, which takes it.
+        """
+        where = ""
+        if len(frame.body) >= 2:
+            where = f" at ${struct.unpack_from('<H', frame.body, 0)[0]:04x}"
+        else:
+            try:
+                pc = self.read_registers().get("PC")
+                if pc is not None:
+                    where = f" at ${pc:04x}"
+            except Exception:
+                where = " (PC unreadable)"
+        return (
+            f"The 6510 jammed{where}: VICE reported a JAM event "
+            f"({RESPONSE_JAM:#04x}), which means an illegal opcode halted "
+            f"the CPU. Execution will not continue, so waiting for a "
+            f"stopped event would only time out."
+        )
+
     def wait_for_stopped(self, timeout: float | None = None) -> int:
         """Wait for an EVENT_STOPPED event from VICE.
 
@@ -777,6 +1008,14 @@ class BinaryViceTransport:
         gen = self._resume_generation
         while self._event_queue and self._event_queue[0][0] < gen:
             self._event_queue.popleft()
+
+        # A jam already in the queue means the machine stopped before we
+        # got here; the stop we are waiting for is never coming.  Checked
+        # before the STOPPED scan so a jam is reported as a jam rather
+        # than as whatever timeout follows it.
+        for evt_gen, evt_resp in self._event_queue:
+            if evt_gen >= gen and evt_resp.response_type == RESPONSE_JAM:
+                raise TransportError(self._jam_message(evt_resp))
 
         # Check whether an EVENT_STOPPED at the current generation is already
         # sitting in the queue (arrived during the resume() ack window).
@@ -807,6 +1046,13 @@ class BinaryViceTransport:
 
                 if resp.response_type == EVENT_STOPPED:
                     return self._parse_stopped_event(resp)
+                if resp.response_type == RESPONSE_JAM:
+                    # Leave the ``with`` before describing the jam: for
+                    # a bodiless frame (VICE 3.10) ``_jam_message`` reads
+                    # the PC through ``_send_and_recv``, which takes this
+                    # same non-reentrant lock.  Raising from inside the
+                    # block deadlocked the transport for good.
+                    break
                 if resp.request_id == EVENT_REQUEST_ID:
                     # Other unsolicited event (Resumed, Checkpoint info, …):
                     # buffer for later inspection rather than dropping.
@@ -821,6 +1067,9 @@ class BinaryViceTransport:
                     f"req_id={resp.request_id:#x}, "
                     f"body={resp.body.hex()}"
                 )
+        # Only the JAM ``break`` reaches here; the lock is released and
+        # ``resp`` is the JAM frame.
+        raise TransportError(self._jam_message(resp))
 
     def resource_get(self, name: str) -> int | str:
         """Get a VICE resource value by name.
