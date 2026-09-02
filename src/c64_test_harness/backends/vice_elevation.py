@@ -480,10 +480,13 @@ def plan_vice_launch(cfg: "ViceConfig", argv: Sequence[str]) -> ViceLaunchPlan:
     binary = launch_path(args[0])
     already_root = os.geteuid() == 0
 
+    # "Needs root" means "needs *more* than this process has": a process
+    # already running as root (or holding CAP_NET_RAW) needs nothing, and
+    # run_as_root=False then just means "do not sudo", which is right.
     needs_root = (
         bool(cfg.ethernet)
         and driver_requires_root(cfg.ethernet_driver)
-        and not rawnet_capability(as_root=False)
+        and not rawnet_capability()
     )
     want_root = needs_root if cfg.run_as_root is None else bool(cfg.run_as_root)
 

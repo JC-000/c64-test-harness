@@ -835,3 +835,22 @@ def test_the_features_probe_ignores_an_ambient_vicerc(tmp_path, monkeypatch):
         "image scan, which cannot report driver support"
     )
     assert feat.drivers_known is True
+
+
+# ------------------------------------------- plan / listing / path nits
+
+
+def test_plan_does_not_refuse_run_as_root_false_when_already_root(monkeypatch):
+    """Root already holds the capability; ``run_as_root=False`` only
+    means "do not sudo", which as root is exactly what happens anyway.
+    ``needs_root`` used to ignore the current euid and refuse."""
+    _as_uid(monkeypatch, 0)
+    monkeypatch.setattr(ve.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        ve, "sudo_can_run", lambda b: pytest.fail("must not shell out to sudo as root")
+    )
+    cfg = ViceConfig(ethernet=True, ethernet_driver="pcap", run_as_root=False)
+    plan = ve.plan_vice_launch(cfg, _eth_argv())
+    assert plan.argv == _eth_argv()
+    assert plan.sudo_wrapped is False
+    assert plan.elevated is True
