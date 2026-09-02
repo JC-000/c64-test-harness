@@ -19,10 +19,18 @@ if TYPE_CHECKING:
     from .backends.unified_manager import TestTarget
     from .backends.vice_binary import BinaryViceTransport
 
-from .execution_policy import check_execution_policy
+from .execution_policy import ExecutionPolicyError, check_execution_policy
+from .memory_policy import MemoryPolicyError
 from .transport import TransportError, TimeoutError
 
 _VALID_REGS = {"A", "X", "Y", "SP", "PC"}
+
+#: What hang recovery folds into ``RoutineHung.detail`` instead of letting
+#: escape: the wire (TransportError, OSError) and the two policies that
+#: can refuse the RTS write or the probe call.  Anything else is a bug in
+#: the harness and should surface as itself.
+_RECOVERY_ERRORS = (TransportError, OSError, MemoryPolicyError,
+                    ExecutionPolicyError)
 
 
 class RoutineHung(TimeoutError):
@@ -137,6 +145,107 @@ def wait_for_pc(
     return regs
 
 
+#: Seconds the hang-recovery probe waits for its ``RTS`` to land.  The
+#: probe executes three instructions; anything approaching this is the
+#: emulator or the transport, not the probe.
+RECOVERY_PROBE_TIMEOUT = 5.0
+
+#: The two harness-owned trampoline slots (docs/memory_safety.md).  The
+#: recovery ``RTS`` goes in whichever one the current call is not using.
+_TRAMPOLINE_SLOTS = (0x0360, 0x0334)
+_TRAMPOLINE_LEN = 5
+
+
+def _recovery_rts_addr(scratch_addr: int) -> int:
+    """Pick the byte the hang-recovery ``RTS`` is written to.
+
+    Default ``$0360``: the first byte of :func:`run_subroutine`'s
+    documented trampoline slot.  It is already harness scratch, nothing is
+    mid-flight there while ``jsr`` is recovering (one CPU, one Python
+    thread), and ``run_subroutine`` rewrites it on every call so a
+    leftover ``$60`` is inert.  When the caller's own trampoline covers
+    ``$0360`` -- which is exactly what ``run_subroutine`` on VICE does --
+    the ``RTS`` moves to the ``$0334`` slot instead, which that call is
+    then not using.  No new address is claimed either way.
+    """
+    for slot in _TRAMPOLINE_SLOTS:
+        if not (scratch_addr <= slot < scratch_addr + _TRAMPOLINE_LEN):
+            return slot
+    # Unreachable with a 5-byte trampoline: the slots are $2C apart.
+    raise ValueError(  # pragma: no cover
+        f"trampoline at ${scratch_addr:04X} covers both recovery slots"
+    )
+
+
+def _jsr_once(
+    transport: BinaryViceTransport,
+    addr: int,
+    timeout: float,
+    scratch_addr: int,
+) -> dict[str, int]:
+    """One trampoline round-trip; the machinery :func:`jsr` documents."""
+    # Build trampoline: JSR $xxxx; NOP; NOP
+    lo = addr & 0xFF
+    hi = (addr >> 8) & 0xFF
+    trampoline = bytes([0x20, lo, hi, 0xEA, 0xEA])  # JSR, NOP, NOP
+    transport.write_memory(scratch_addr, trampoline)
+
+    bp_addr = scratch_addr + 3
+    bp_id = set_breakpoint(transport, bp_addr)
+    try:
+        transport.set_registers({"PC": scratch_addr})
+        transport.resume()
+        return wait_for_pc(transport, bp_addr, timeout=timeout)
+    finally:
+        delete_breakpoint(transport, bp_id)
+
+
+def _recover_from_hang(
+    transport: BinaryViceTransport,
+    saved_sp: int,
+    scratch_addr: int,
+) -> tuple[bool, str, int | None]:
+    """Put a machine whose routine never returned back into a callable state.
+
+    Returns ``(recovered, detail, hung_pc)``.  Never raises for the
+    failures recovery is there to absorb (:data:`_RECOVERY_ERRORS`);
+    each is folded into *detail* for the :class:`RoutineHung` the caller
+    is about to raise.
+    """
+    landing = scratch_addr + 3
+    # (a) Read registers.  Binmon services commands while the CPU spins,
+    # so this both proves the transport is alive and records where the
+    # routine was stuck.
+    try:
+        hung_pc: int | None = transport.read_registers().get("PC")
+    except _RECOVERY_ERRORS as e:
+        return False, f"register read after timeout failed: {e!r}", None
+    try:
+        # (b) Drop the hung routine's frames and the trampoline's return
+        # address in one move.
+        transport.set_registers({"SP": saved_sp})
+        # (c) A single RTS in the harness slot this call is not using.
+        rts_addr = _recovery_rts_addr(scratch_addr)
+        transport.write_memory(rts_addr, bytes([0x60]))
+        # (d) Prove the trampoline is live rather than assume it: the JSR
+        # must push, the RTS must pop, and the checkpoint must fire at
+        # the post-RTS landing.  _jsr_once so a probe hang cannot recurse.
+        regs = _jsr_once(transport, rts_addr, RECOVERY_PROBE_TIMEOUT,
+                         scratch_addr)
+    except _RECOVERY_ERRORS as e:
+        return False, f"recovery probe failed: {e}", hung_pc
+    pc = regs.get("PC")
+    if pc != landing:
+        return (False,
+                f"recovery probe stopped at ${pc:04X}, expected the post-RTS "
+                f"landing ${landing:04X}",
+                hung_pc)
+    return (True,
+            f"SP restored to ${saved_sp:02X}; RTS probe via ${rts_addr:04X} "
+            f"landed at ${landing:04X}",
+            hung_pc)
+
+
 def jsr(
     transport: BinaryViceTransport,
     addr: int,
@@ -144,6 +253,7 @@ def jsr(
     *,
     scratch_addr: int = 0x0334,
     override: str | None = None,
+    recover_on_timeout: bool = False,
 ) -> dict[str, int]:
     """Call a subroutine at *addr* and wait for it to return.
 
@@ -171,27 +281,58 @@ def jsr(
     recovery. ``override="<reason>"`` permits one call and is logged at
     WARNING. Permissive by default: no policy, no behaviour change.
 
+    **Surviving a hang** (issue #156).  When the routine never returns,
+    the default behaviour is unchanged: a bare
+    :class:`~.transport.TimeoutError` after *timeout* seconds, with the
+    CPU still spinning inside the routine and the stack still holding the
+    trampoline's return frame — the next ``jsr`` on that transport is not
+    safe.  With ``recover_on_timeout=True`` the SP is captured before the
+    call and, on timeout, the harness (a) reads the registers, (b)
+    restores SP, (c) writes a single ``RTS`` into the harness trampoline
+    slot this call is not using (``$0360``, or ``$0334`` when the caller's
+    trampoline is at ``$0360``), (d) ``JSR``\\ s it through the trampoline
+    with :data:`RECOVERY_PROBE_TIMEOUT` and checks the CPU stops at the
+    post-``RTS`` landing (*scratch_addr* + 3, ``$0337`` by default), then
+    (e) raises :class:`RoutineHung` — a ``TimeoutError`` subclass — whose
+    ``recovered`` says whether the next call is safe.
+
+    *Invariant this relies on:* the binary monitor services commands
+    while the CPU spins — every command pauses the machine — so register
+    and memory writes land inside a hung routine and a resume from a new
+    PC takes effect.  *Its limit:* recovery re-arms the trampoline at
+    *scratch_addr* and probes through it, so a routine that scribbles
+    over the cassette buffer (the trampoline, or the ``RTS`` slot)
+    defeats it; the probe then reports ``recovered=False`` rather than
+    pretending.  A JAM opcode is a different failure altogether — the
+    transport reports it as a :class:`~.transport.TransportError`, not a
+    timeout, and recovery does not engage.
+
     :param override: Reason string permitting a call into a declared
         dead span. A bare ``True`` is rejected.
+    :param recover_on_timeout: Opt in to SP restore + trampoline probe on
+        timeout, raising :class:`RoutineHung` instead of a bare
+        ``TimeoutError``.  Default ``False``.
     """
     # Guard first — before the trampoline write, so a refused call leaves
     # the machine exactly as it was.
     check_execution_policy(transport, addr, override=override)
 
-    # Build trampoline: JSR $xxxx; NOP; NOP
-    lo = addr & 0xFF
-    hi = (addr >> 8) & 0xFF
-    trampoline = bytes([0x20, lo, hi, 0xEA, 0xEA])  # JSR, NOP, NOP
-    transport.write_memory(scratch_addr, trampoline)
+    if not recover_on_timeout:
+        return _jsr_once(transport, addr, timeout, scratch_addr)
 
-    bp_addr = scratch_addr + 3
-    bp_id = set_breakpoint(transport, bp_addr)
+    saved_sp = transport.read_registers()["SP"]
+    started = time.monotonic()
     try:
-        transport.set_registers({"PC": scratch_addr})
-        transport.resume()
-        return wait_for_pc(transport, bp_addr, timeout=timeout)
-    finally:
-        delete_breakpoint(transport, bp_id)
+        return _jsr_once(transport, addr, timeout, scratch_addr)
+    except TimeoutError:
+        elapsed = time.monotonic() - started
+    recovered, detail, hung_pc = _recover_from_hang(
+        transport, saved_sp, scratch_addr,
+    )
+    raise RoutineHung(
+        addr, recovered=recovered, elapsed=elapsed, detail=detail,
+        hung_pc=hung_pc,
+    )
 
 
 # ---------------------------------------------------------------------------
