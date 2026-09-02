@@ -220,13 +220,37 @@ def test_tx_scenario_rejects_a_matching_ethertype_with_wrong_payload():
 # ---------------------------------------------------------------------------
 
 
-def _c64_receives_marker(ram: bytearray) -> None:
-    ram[RESULT:RESULT + 4] = RX_MARKER
-    ram[RESULT + 4] = 0x01
-
-
 def _c64_poll_times_out(ram: bytearray) -> None:
     ram[RESULT] = 0xFF
+
+
+def _marker_step(marker: bytes):
+    def step(ram: bytearray) -> None:
+        ram[RESULT:RESULT + 4] = marker
+        ram[RESULT + 4] = 0x01
+    return step
+
+
+STALE_LOOPBACK = bytes([0xC6, 0x40, 0xC6, 0x40])  # payload of the TX test's own frame
+
+
+def scripted(*steps):
+    """One behaviour per resume(); the last step repeats.
+
+    run_rx_scenario first *drains* stale frames (runs the routine until its
+    poll times out) and only then sends, so the "C64 receives our marker"
+    story is: nothing pending (poll times out), then our frame.
+    """
+    remaining = list(steps)
+
+    def on_resume(ram: bytearray) -> None:
+        step = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+        step(ram)
+    return on_resume
+
+
+#: Drain finds nothing, then the host frame arrives with our marker.
+_c64_receives_marker = scripted(_c64_poll_times_out, _marker_step(RX_MARKER))
 
 
 def test_rx_scenario_sends_the_marker_frame_through_the_capture():
@@ -242,7 +266,8 @@ def test_rx_scenario_sends_the_marker_frame_through_the_capture():
     assert frame[12:14] == ETHERTYPE
     assert frame[14:18] == RX_MARKER == b"\xDE\xAD\xBE\xEF"
     assert result == RX_MARKER + b"\x01"
-    assert transport.resumes == 1 and transport.deleted == [1]
+    # One drain run (poll timed out: nothing pending) + the real attempt.
+    assert transport.resumes == 2 and transport.deleted == [1, 2]
 
 
 def test_rx_scenario_fails_when_the_host_send_fails():
@@ -268,9 +293,7 @@ def test_rx_scenario_fails_not_skips_when_the_c64_never_sees_the_frame():
 
 
 def test_rx_scenario_rejects_a_wrong_marker():
-    def _wrong_marker(ram: bytearray) -> None:
-        ram[RESULT:RESULT + 4] = b"\x00\x00\x00\x00"
-        ram[RESULT + 4] = 0x01
+    _wrong_marker = scripted(_c64_poll_times_out, _marker_step(b"\x00\x00\x00\x00"))
 
     transport = FakeTransport(on_resume=_wrong_marker)
     with pytest.raises(AssertionError) as ei:
@@ -569,16 +592,16 @@ def test_tx_scenario_never_writes_over_the_loaded_routine():
 
 def test_rx_scenario_never_writes_over_the_loaded_routine():
     seen_first_bytes: list[bytes] = []
+    story = scripted(_c64_poll_times_out, _marker_step(RX_MARKER))
 
     def c64(ram: bytearray) -> None:
         seen_first_bytes.append(bytes(ram[CODE_BASE:CODE_BASE + 3]))
-        ram[DATA_BASE:DATA_BASE + 4] = RX_MARKER
-        ram[DATA_BASE + 4] = 0x01
+        story(ram)
 
     transport = RecordingTransport(on_resume=c64)
     run_rx_scenario(transport, FakeCapture(), send_delay=0.0, timeout=1.0)
     assert _writes_inside_code_after_load(transport, _rx_routine()) == []
-    assert seen_first_bytes == [_rx_routine()[:3]]
+    assert seen_first_bytes == [_rx_routine()[:3]] * 2, "intact at every JSR (drain + attempt)"
 
 
 def test_routines_store_results_in_data_base_not_in_their_own_page():
@@ -596,15 +619,18 @@ class HangingTransport(FakeTransport):
 
     ``on_resume`` models what RAM looks like while the CPU is stuck --
     here, a routine whose first opcode has been zeroed *after* it was
-    loaded, which is what the live bench showed.
+    loaded, which is what the live bench showed.  ``hang_on_resume`` says
+    which resume() hangs (1 = the first; for RX that is the drain run).
     """
 
-    def __init__(self, pc: int, on_resume=None) -> None:
+    def __init__(self, pc: int, on_resume=None, *, hang_on_resume: int = 1) -> None:
         super().__init__(on_resume)
         self._pc = pc
+        self.hang_on_resume = hang_on_resume
 
     def wait_for_stopped(self, timeout: float = 0.0) -> None:
-        raise TimeoutError(f"No stopped event within {timeout}s")
+        if self.resumes >= self.hang_on_resume:
+            raise TimeoutError(f"No stopped event within {timeout}s")
 
     def read_registers(self) -> dict[str, int]:
         return {"PC": self._pc, "A": 0x12, "X": 0x00, "Y": 0x40, "SP": 0xF6}
@@ -637,8 +663,10 @@ def test_rx_scenario_timeout_carries_the_same_cpu_report():
     RX timed out and the message said only "No stopped event within 15.0s"."""
     def spinning(ram: bytearray) -> None:
         ram[0xDE00:0xDE10] = bytes(range(0x20, 0x30))
+        ram[RESULT] = 0xFF  # the drain run: nothing pending
 
-    transport = HangingTransport(pc=0xC02A, on_resume=spinning)
+    # Drain run completes; the real attempt (second resume) hangs.
+    transport = HangingTransport(pc=0xC02A, on_resume=spinning, hang_on_resume=2)
     with pytest.raises(AssertionError) as ei:
         run_rx_scenario(transport, FakeCapture(), send_delay=0.0, timeout=1.0)
     msg = str(ei.value)
@@ -648,6 +676,16 @@ def test_rx_scenario_timeout_carries_the_same_cpu_report():
     assert "> C02A" in msg
     # The host send happened (or its failure is reported) before the CPU verdict.
     assert "host wrote 64 bytes to fake0" in msg
+
+
+def test_rx_scenario_hang_during_the_drain_says_so():
+    transport = HangingTransport(pc=0xC02A)  # hangs on the first resume = drain
+    cap = FakeCapture()
+    with pytest.raises(AssertionError) as ei:
+        run_rx_scenario(transport, cap, send_delay=0.0, timeout=1.0)
+    assert "6502 did not return from $C000" in str(ei.value)
+    assert "stale-frame drain" in str(ei.value) and "before any host send" in str(ei.value)
+    assert cap.sent == []
 
 
 from c64_test_harness.transport import TimeoutError as TransportTimeoutError  # noqa: E402
@@ -676,3 +714,88 @@ def test_rx_timeout_report_fires_for_the_transports_own_timeout_error():
         run_rx_scenario(transport, FakeCapture(), send_delay=0.0, timeout=1.0)
     assert "6502 did not return from $C000 within 1.0s" in str(ei.value)
     assert "> C02A" in str(ei.value)
+
+
+# ---------------------------------------------------------------------------
+# Live 2026-09-02, bisected: the RX routine's header-skip loop branched -8
+# ---------------------------------------------------------------------------
+#
+# `.skip: LDA $DE08 / LDA $DE09 / DEX / BNE .skip` is 9 bytes, so the branch
+# back is -9.  The routine (inherited from the original test) had -8, which
+# lands on the `$08` operand byte = PHP: six iterations push six bytes, RTS
+# pops garbage, and the CPU ends up in BASIC's READY loop instead of at the
+# trampoline's checkpoint.  The wire was fine (VICE's descriptor Recv went
+# 1 -> 2), the reads were fine (bisect: 34 straight RTDATA word reads return
+# to the checkpoint), the loop was not.  Pinned generally: every branch in
+# both routines lands on an instruction boundary inside the routine.
+
+from c64_test_harness.disasm import disassemble  # noqa: E402
+
+_BRANCHES = {"BPL", "BMI", "BVC", "BVS", "BCC", "BCS", "BNE", "BEQ"}
+
+
+def _branch_targets_off_boundary(code: bytes, base: int) -> list[str]:
+    lines = disassemble(code, base)
+    boundaries = {int(l[:4], 16) for l in lines}
+    bad = []
+    for line in lines:
+        mn = line[16:19]
+        if mn in _BRANCHES:
+            target = int(line.split("$")[-1], 16)
+            if target not in boundaries or not (base <= target < base + len(code)):
+                bad.append(f"{line}  -> ${target:04X} is not an instruction boundary")
+    return bad
+
+
+@pytest.mark.parametrize("routine", [_tx_routine, _rx_routine], ids=["tx", "rx"])
+def test_every_branch_lands_on_an_instruction_boundary(routine):
+    assert _branch_targets_off_boundary(routine(), CODE_BASE) == []
+
+
+def test_rx_header_skip_loop_branches_back_to_its_first_read():
+    code = _rx_routine()
+    i = code.find(bytes([0xA2, 0x07]))  # LDX #7
+    assert i >= 0
+    loop = i + 2
+    assert code[loop:loop + 9] == bytes([0xAD, 0x08, 0xDE, 0xAD, 0x09, 0xDE, 0xCA, 0xD0, 0xF7]), (
+        f"skip loop bytes {code[loop:loop + 9].hex()}: BNE must be -9 (F7), not -8 (F8)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stale frames: VICE's CS8900a hands the RX routine whatever it received
+# first -- after the TX test that is VICE's *own* transmitted frame, seen
+# back through pcap (Recv=1 on its descriptor).  cs8900_receive() replaces a
+# pending frame with the next one on every RxEvent read, so draining is a
+# matter of running the routine until its poll times out, then sending.
+# ---------------------------------------------------------------------------
+
+
+def test_rx_scenario_drains_stale_frames_before_sending():
+    transport = FakeTransport(on_resume=scripted(
+        _marker_step(STALE_LOOPBACK),          # drain run 1: the TX loopback frame
+        _marker_step(b"\x01\x02\x03\x04"),     # drain run 2: another stale frame
+        _c64_poll_times_out,                   # drain run 3: nothing pending
+        _marker_step(RX_MARKER),               # the real attempt sees our frame
+    ))
+
+    class OrderCapture(FakeCapture):
+        def send(self, frame: bytes) -> None:
+            self.sent_after_resumes = transport.resumes
+            super().send(frame)
+
+    cap = OrderCapture()
+    result = run_rx_scenario(transport, cap, send_delay=0.0, timeout=1.0)
+    assert result == RX_MARKER + b"\x01"
+    assert cap.sent == [RX_FRAME]
+    assert cap.sent_after_resumes == 3, "the frame goes out only after the drain timed out"
+    assert transport.resumes == 4
+
+
+def test_rx_scenario_gives_up_when_stale_frames_never_stop():
+    transport = FakeTransport(on_resume=_marker_step(STALE_LOOPBACK))
+    cap = FakeCapture()
+    with pytest.raises(AssertionError) as ei:
+        run_rx_scenario(transport, cap, send_delay=0.0, timeout=1.0)
+    assert "stale" in str(ei.value) and "c640c640" in str(ei.value)
+    assert cap.sent == [], "never send into a chip that is still draining"
