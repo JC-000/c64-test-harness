@@ -567,3 +567,16 @@ def test_linux_bind_failure_is_not_absence(monkeypatch):
 def test_unknown_cause_is_treated_as_present_but_broken():
     exc = CaptureUnavailable("something new")
     assert exc.cause == "unknown" and exc.genuinely_absent is False
+
+
+# ---------------------------------------------------------------------------
+# NIT: a short tail is a BpfParseError, never a struct.error
+# ---------------------------------------------------------------------------
+
+
+def test_trailing_bytes_shorter_than_a_header_raise_bpf_parse_error():
+    buf = _record(FRAME_B) + b"\x01\x02\x03\x04\x05"  # 5 bytes: below sizeof(bpf_hdr)
+    with pytest.raises(BpfParseError) as ei:
+        parse_bpf_records(buf)
+    assert not isinstance(ei.value, struct.error)
+    assert "5 trailing byte(s)" in str(ei.value)

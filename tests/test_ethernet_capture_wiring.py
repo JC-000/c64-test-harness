@@ -443,3 +443,72 @@ def test_resolve_capture_ifaces_reads_the_two_env_knobs():
 
 def test_resolve_capture_ifaces_ignores_blank_values():
     assert resolve_capture_ifaces("feth0", {"C64_ETH_CAPTURE_IFACE": "  "}) == ("feth0", "feth0")
+
+
+# ---------------------------------------------------------------------------
+# NITs: mutants the reviewer found alive in the scenarios
+# ---------------------------------------------------------------------------
+
+import threading  # noqa: E402
+import time  # noqa: E402
+
+
+def test_tx_scenario_rejects_a_wrong_destination_mac():
+    wrong = b"\x02\xc6\x40\x00\x00\x07" + FRAME_DATA[6:]
+    transport = FakeTransport(on_resume=_c64_sets_tx_flag)
+    with pytest.raises(AssertionError) as ei:
+        run_tx_scenario(transport, FakeCapture([wrong]), timeout=0.01)
+    assert "Dest MAC" in str(ei.value)
+
+
+def test_tx_scenario_rejects_a_wrong_source_mac():
+    wrong = FRAME_DATA[:6] + b"\x02\xc6\x40\x00\x00\x07" + FRAME_DATA[12:]
+    transport = FakeTransport(on_resume=_c64_sets_tx_flag)
+    with pytest.raises(AssertionError) as ei:
+        run_tx_scenario(transport, FakeCapture([wrong]), timeout=0.01)
+    assert "Source MAC" in str(ei.value)
+
+
+def test_tx_scenario_rejects_a_truncated_frame():
+    short = FRAME_DATA[:50]  # header intact, payload cut: the length check must fire first
+    transport = FakeTransport(on_resume=_c64_sets_tx_flag)
+    with pytest.raises(AssertionError) as ei:
+        run_tx_scenario(transport, FakeCapture([short]), timeout=0.01)
+    assert "too short: 50 < 64" in str(ei.value)
+
+
+class TimestampingCapture(FakeCapture):
+    def send(self, frame: bytes) -> None:
+        self.sent_at = time.monotonic()
+        super().send(frame)
+
+
+def test_rx_scenario_really_waits_send_delay_before_writing():
+    """A `pass` in place of time.sleep(send_delay) sends before the C64 is
+    polling; the fake cannot tell, so the clock has to."""
+    transport = FakeTransport(on_resume=_c64_receives_marker)
+    cap = TimestampingCapture()
+    started = time.monotonic()
+    run_rx_scenario(transport, cap, send_delay=0.08, timeout=1.0)
+    assert cap.sent_at - started >= 0.08
+
+
+class HangingCapture(FakeCapture):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = threading.Event()
+
+    def send(self, frame: bytes) -> None:
+        self.release.wait(5.0)
+        super().send(frame)
+
+
+def test_rx_scenario_fails_when_the_host_send_never_returns():
+    transport = FakeTransport(on_resume=_c64_poll_times_out)
+    cap = HangingCapture()
+    try:
+        with pytest.raises(AssertionError) as ei:
+            run_rx_scenario(transport, cap, send_delay=0.0, timeout=1.0, join_timeout=0.05)
+        assert "did not return" in str(ei.value) and "fake0" in str(ei.value)
+    finally:
+        cap.release.set()
