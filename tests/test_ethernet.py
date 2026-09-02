@@ -41,7 +41,6 @@ from c64_test_harness.backends.vice_manager import PortAllocator
 from c64_test_harness.capture import (
     CaptureUnavailable,
     PacketCapture,
-    capture_unavailable_reason,
     open_capture,
 )
 from c64_test_harness.execute import load_code
@@ -162,24 +161,22 @@ def vice_ethernet():
 def host_capture(vice_ethernet: BinaryViceTransport) -> PacketCapture:
     """An open host-side capture on ``TAP_IFACE``, or a skip that names the fix.
 
-    Depends on ``vice_ethernet`` so the probe runs *after* the elevated
+    Depends on ``vice_ethernet`` so the open happens *after* the elevated
     VICE has taken its two ``/dev/bpf*`` nodes: on macOS a root VICE takes
     the lowest free nodes, which are exactly the ones ``chmod o+rw`` made
-    usable, so probing beforehand would report a pool this process no
+    usable, so opening beforehand would report a pool this process no
     longer has.
 
-    Skips only when :func:`open_capture` says the path is genuinely
-    absent, with its message -- which carries the operator's remedy
-    verbatim -- as the reason.  When the path exists the test runs, and
-    a silent wire is then a *failure* (see ``ethernet_scenarios``).
+    One :func:`open_capture` call, no separate probe: the exception it
+    raises is the verdict.  Skips only when the path is genuinely absent,
+    with the message -- which carries the operator's remedy verbatim --
+    as the reason.  When the path exists the test runs, and a silent wire
+    is then a *failure* (see ``ethernet_scenarios``).
     """
     assert TAP_IFACE is not None
-    reason = capture_unavailable_reason(TAP_IFACE)
-    if reason is not None:
-        pytest.skip(f"no host-side capture on {TAP_IFACE}: {reason}")
     try:
         cap = open_capture(TAP_IFACE)
-    except CaptureUnavailable as e:  # pool changed between probe and open
+    except CaptureUnavailable as e:
         pytest.skip(f"no host-side capture on {TAP_IFACE}: {e}")
     try:
         yield cap

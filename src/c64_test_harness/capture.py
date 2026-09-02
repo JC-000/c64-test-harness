@@ -62,7 +62,6 @@ __all__ = [
     "bpf_descriptor_summary",
     "bpf_descriptors",
     "bpf_wordalign",
-    "capture_unavailable_reason",
     "open_capture",
     "parse_bpf_records",
 ]
@@ -564,15 +563,3 @@ def open_capture(iface: str) -> PacketCapture:
         f"no host-side packet capture implementation for {system}"
     )
 
-
-def capture_unavailable_reason(iface: str) -> str | None:
-    """``None`` if :func:`open_capture` works right now, else why (with remedy).
-
-    Opens and immediately closes a capture, so it also consumes and
-    releases one BPF node; call it once per module, not per test.
-    """
-    try:
-        open_capture(iface).close()
-    except CaptureUnavailable as e:
-        return str(e)
-    return None
