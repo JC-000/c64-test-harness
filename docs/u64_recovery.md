@@ -1,6 +1,6 @@
 # Ultimate 64 recovery primitives
 
-The Ultimate 64 firmware (3.14d) has several distinct wedge modes, each
+Ultimate firmware without the #686 Temp-folder cleanup (Ultimate-line 3.14d, C64U 1.1.0) has several distinct wedge modes, each
 with its own observable shape and its own recovery path. The harness
 exposes a probe primitive and a recovery primitive for each, plus a hard
 guard around `poweroff()` (which is irrecoverable over the network).
@@ -55,8 +55,8 @@ body — `writemem`, `load_prg`, keyboard-inject) leaks a managed attachment
 on-device (#686); the C64U on 1.1.0 does not. This is shared 1541ultimate firmware behaviour, not
 specific to either device generation. `ultimate64_temp_gc.gc_temp_folder(host, ...)`
 deletes those files over FTP, oldest-first, keeping the youngest N
-(default 2) — mirroring the policy 1541ultimate#686 will eventually
-apply on-device. It is best-effort: any FTP/network failure is captured
+(default 2) — mirroring the policy 1541ultimate#686 applies on-device on
+Ultimate-line ≥ 3.15. It is best-effort: any FTP/network failure is captured
 in the returned `TempGCResult.error` rather than raised, so a hygiene
 pass can never fail a test run.
 
