@@ -269,6 +269,13 @@ class TestTransientFlag:
         transient_owners = sorted({r.owner for r in HARNESS_SCRATCH if r.transient})
         assert transient_owners == sorted(_TRANSIENT_OWNERS)
 
+    def test_transient_entries_pinned_by_span(self) -> None:
+        # Owner-set pinning alone misses a second transient entry under a
+        # known owner at a new start.  Pin the exact (start, end-exclusive)
+        # spans: liveness probe $0334-$03B3 and REU staging $0800-$87FF.
+        spans = sorted((r.start, r.end) for r in HARNESS_SCRATCH if r.transient)
+        assert spans == [(0x0334, 0x03B4), (0x0800, 0x8800)]
+
     def test_every_start_in_the_list_is_covered_by_this_test(self) -> None:
         starts = sorted({r.start for r in HARNESS_SCRATCH if not r.transient})
         assert starts == sorted(_NON_TRANSIENT_STARTS)
