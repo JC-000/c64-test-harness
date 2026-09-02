@@ -598,7 +598,12 @@ def _probe_vice_root(binary: str | None = None) -> tuple[bool, str]:
     if rawnet_capability():
         return True, ""
     resolved = launch_path(binary or _resolve_ethernet_binary())
-    if binary is not None and not os.path.exists(resolved):
+    # Existence-check BOTH paths (adversarial review N3): a missing
+    # binary is not a sudo problem, and letting a missing default
+    # resolution fall through to sudo_can_run() reported "'sudo -n' is
+    # not authorised for x64sc" for a binary that was never there to
+    # authorise in the first place.
+    if not os.path.exists(resolved):
         return False, f"{resolved} not found on this host"
     if sudo_can_run(resolved):
         return True, ""

@@ -147,6 +147,48 @@ def test_check_elevation_rejects_an_unknown_kind():
 
 
 # ---------------------------------------------------------------------------
+# N3 (adversarial review): _probe_vice_root must existence-check the
+# binary on BOTH the default-resolution path and the binary= override
+# path. Before this fix only the override path did -- a missing binary
+# on the default path fell through to sudo_can_run(), which reported
+# "sudo -n not authorised" for a binary that was never there to
+# authorise in the first place.
+# ---------------------------------------------------------------------------
+
+
+def test_probe_vice_root_existence_checks_the_default_resolution_path(monkeypatch):
+    from c64_test_harness.backends import vice_elevation as ve
+
+    monkeypatch.setattr(ve, "rawnet_capability", lambda **k: False)
+    monkeypatch.setattr(conftest, "_resolve_ethernet_binary", lambda: "/nonexistent/x64sc")
+    monkeypatch.setattr(
+        ve, "sudo_can_run",
+        lambda b: pytest.fail("must not probe sudo for a binary that doesn't exist"),
+    )
+
+    ok, remedy = conftest._probe_vice_root()
+    assert ok is False
+    assert "not found on this host" in remedy
+    assert "/nonexistent/x64sc" in remedy
+
+
+def test_probe_vice_root_existence_checks_the_binary_override_too(monkeypatch):
+    """The override path already did this; pin it so a refactor can't
+    silently regress it back to being the only checked path."""
+    from c64_test_harness.backends import vice_elevation as ve
+
+    monkeypatch.setattr(ve, "rawnet_capability", lambda **k: False)
+    monkeypatch.setattr(
+        ve, "sudo_can_run",
+        lambda b: pytest.fail("must not probe sudo for a binary that doesn't exist"),
+    )
+
+    ok, remedy = conftest._probe_vice_root(binary="/nonexistent/x64sc")
+    assert ok is False
+    assert "not found on this host" in remedy
+
+
+# ---------------------------------------------------------------------------
 # gate_elevation: skip-or-fail
 #
 # Recording for the notice is NOT gate_elevation()'s job (adversarial
