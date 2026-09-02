@@ -37,8 +37,11 @@ import pytest
 
 from c64_test_harness.capture import (
     BPF_HDR_SIZE,
+    BpfDescriptor,
     BpfParseError,
     CaptureUnavailable,
+    bpf_descriptor_summary,
+    bpf_descriptors,
     bpf_wordalign,
     open_capture,
     parse_bpf_records,
@@ -194,3 +197,51 @@ def test_bpf_no_nodes_at_all_is_reported(monkeypatch):
     with pytest.raises(CaptureUnavailable) as ei:
         open_capture("feth0")
     assert "/dev/bpf" in str(ei.value)
+
+
+# ---------------------------------------------------------------------------
+# netstat -B counters: the disambiguator for a silent wire
+# ---------------------------------------------------------------------------
+#
+# When the TX test sees nothing, VICE's own descriptor says which side is
+# at fault: Written=1 on the feth-bound descriptor means the chip handed
+# the frame to pcap and our capture is bound to the wrong side/direction;
+# Written=0 means the frame died inside the emulated chip.
+
+NETSTAT_B = """\
+Device    Netif          Flags              Recv     RDrop    RMatch        RSize   ReadCnt     Bsize     Sblen      Scnt     Hblen      Hcnt      Ccnt        Csize   Written     WDrop Command
+bpf0      feth1          --f-IO------      1136      1104      1136        44300         0      4096      4088        17      3883        15         0            0         1         0 .11844
+bpf1      ap1            p---IO------         7         0         7          420         0      4096         0         0         0         0         0            0         0         0 x64sc.4326
+bpf2      feth0          p---IO------        12         0        12          768         3      4096         0         0         0         0         0            0         1         0 x64sc.4326
+"""
+
+
+def test_bpf_descriptors_parses_device_netif_counters_and_owner(monkeypatch):
+    monkeypatch.setattr(capture_mod, "_run_netstat_B", lambda: NETSTAT_B)
+    rows = bpf_descriptors()
+    assert [r.device for r in rows] == ["bpf0", "bpf1", "bpf2"]
+    feth0 = [r for r in rows if r.netif == "feth0"]
+    assert feth0 == [BpfDescriptor(device="bpf2", netif="feth0", recv=12, written=1,
+                                   command="x64sc", pid=4326)]
+    # Command names may be empty (".11844") or contain dots; pid is split from the right.
+    assert (rows[0].command, rows[0].pid) == ("", 11844)
+
+
+def test_bpf_descriptors_filters_by_interface(monkeypatch):
+    monkeypatch.setattr(capture_mod, "_run_netstat_B", lambda: NETSTAT_B)
+    assert [r.device for r in bpf_descriptors("feth1")] == ["bpf0"]
+    assert bpf_descriptors("nosuch") == []
+
+
+def test_bpf_descriptor_summary_is_one_line_per_descriptor(monkeypatch):
+    monkeypatch.setattr(capture_mod, "_run_netstat_B", lambda: NETSTAT_B)
+    text = bpf_descriptor_summary("feth0")
+    assert text == "netstat -B feth0: bpf2 Recv=12 Written=1 x64sc.4326"
+    both = bpf_descriptor_summary()
+    assert "bpf0 Recv=1136 Written=1 .11844" in both and "bpf2 Recv=12 Written=1 x64sc.4326" in both
+
+
+def test_bpf_descriptor_summary_without_netstat_B_is_explicit(monkeypatch):
+    monkeypatch.setattr(capture_mod, "_run_netstat_B", lambda: None)
+    assert bpf_descriptors() == []
+    assert bpf_descriptor_summary("feth0") == "netstat -B unavailable"

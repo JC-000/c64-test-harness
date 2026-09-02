@@ -96,11 +96,13 @@ class FakeCapture:
 
     def recv(self, timeout: float, *, match=None) -> bytes:
         self.recv_calls.append(timeout)
+        seen = 0
         while self.frames:
             frame = self.frames.pop(0)
+            seen += 1
             if match is None or match(frame):
                 return frame
-        raise CaptureTimeout(f"fake: nothing on {self.iface}")
+        raise CaptureTimeout(f"fake: nothing on {self.iface}", seen=seen)
 
     def send(self, frame: bytes) -> None:
         if self.send_error is not None:
@@ -151,8 +153,43 @@ def test_tx_scenario_fails_when_no_frame_is_captured():
 
     with pytest.raises(AssertionError) as ei:
         run_tx_scenario(transport, cap, timeout=0.01)
-    assert "reached the wire" in str(ei.value)
-    assert "fake0" in str(ei.value)
+    assert "captured on fake0" in str(ei.value)
+
+
+def test_tx_failure_states_what_was_measured_and_the_vice_descriptor_counters(monkeypatch):
+    """The message says what was seen, not what was concluded, and carries
+    VICE's descriptor counters so a direction fault (Written=1) can be
+    told from a chip fault (Written=0) without re-running anything."""
+    import ethernet_scenarios
+    monkeypatch.setattr(
+        ethernet_scenarios, "bpf_descriptor_summary",
+        lambda iface=None: f"netstat -B {iface}: bpf2 Recv=12 Written=1 x64sc.4326",
+    )
+    transport = FakeTransport(on_resume=_c64_sets_tx_flag)
+    cap = FakeCapture([STRAY_IPV4, STRAY_IPV4])
+
+    with pytest.raises(AssertionError) as ei:
+        run_tx_scenario(transport, cap, timeout=0.5)
+    msg = str(ei.value)
+    assert "no frame with ethertype 88b5 captured on fake0 within 0.5s (2 non-matching seen)" in msg
+    assert "netstat -B fake0: bpf2 Recv=12 Written=1 x64sc.4326" in msg
+
+
+def test_rx_failure_states_the_poll_timeout_and_the_vice_descriptor_counters(monkeypatch):
+    import ethernet_scenarios
+    monkeypatch.setattr(
+        ethernet_scenarios, "bpf_descriptor_summary",
+        lambda iface=None: f"netstat -B {iface}: bpf2 Recv=13 Written=0 x64sc.4326",
+    )
+    transport = FakeTransport(on_resume=_c64_poll_times_out)
+    cap = FakeCapture()
+
+    with pytest.raises(AssertionError) as ei:
+        run_rx_scenario(transport, cap, send_delay=0.0, timeout=1.0)
+    msg = str(ei.value)
+    assert "C64 poll for RxOK timed out" in msg
+    assert "after the host wrote 64 bytes to fake0" in msg
+    assert "netstat -B fake0: bpf2 Recv=13 Written=0 x64sc.4326" in msg
 
 
 def test_tx_scenario_fails_when_the_c64_routine_did_not_complete():
