@@ -56,11 +56,12 @@ def ethernet_vice_binary() -> str:
     which is how a suite ends up asserting against emulated CS8900a
     registers while no host packet moves.
 
-    Set ``VICE_ETHERNET_BIN`` to that path, or configure
-    ``HarnessConfig.vice_ethernet_executable`` (TOML
-    ``[vice] ethernet_executable``).  It is consulted **only** when
-    ``ViceConfig.ethernet`` is true, so non-ethernet runs keep using the
-    ``PATH`` binary.
+    Set ``VICE_ETHERNET_BIN`` to that path, or pass
+    ``ViceConfig(ethernet_executable=...)`` directly.  (There is no
+    ``HarnessConfig`` / TOML knob for this: nothing maps
+    ``HarnessConfig.vice_*`` fields into :class:`ViceConfig`.)  It is
+    consulted **only** when ``ViceConfig.ethernet`` is true, so
+    non-ethernet runs keep using the ``PATH`` binary.
     """
     return os.environ.get(ETHERNET_VICE_BIN_ENV, "").strip()
 
@@ -93,9 +94,8 @@ def resolve_vice_executable(cfg: ViceConfig) -> str:
         resolved = candidate
     hint = (
         f"Point the harness at an ethernet-capable x64sc: set "
-        f"${ETHERNET_VICE_BIN_ENV}=/path/to/x64sc, or TOML "
-        f"``[vice] ethernet_executable`` "
-        f"(HarnessConfig.vice_ethernet_executable)."
+        f"{ETHERNET_VICE_BIN_ENV}=/path/to/x64sc in the environment, or "
+        f"pass ViceConfig(ethernet_executable=/path/to/x64sc)."
     )
     if resolved is None:
         raise ViceEthernetBinaryError(
