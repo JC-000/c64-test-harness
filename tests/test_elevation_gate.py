@@ -750,7 +750,35 @@ def test_e2e_notice_counts_per_affected_test_not_per_fixture_call(pytester):
 # real, separately collected items -- not only by calling
 # check_elevation() directly twice in the same test, which says nothing
 # about whether the hook actually reuses one cache across items.
+#
+# L2 follow-up: the pytester test below proves the CONCEPT, but its
+# conftest is a hand-copied toy -- it never calls the real
+# conftest.pytest_runtest_setup, so a bug introduced in the real hook's
+# wiring (as opposed to check_elevation()'s own cache dict) would not
+# be caught by it. test_pytest_runtest_setup_composes_the_cache_across_
+# two_real_items drives the REAL hook directly, with two _FakeItem
+# instances (the same style every other direct-call test in this file
+# already uses), and is kept alongside the pytester test rather than
+# instead of it.
 # ---------------------------------------------------------------------------
+
+
+def test_pytest_runtest_setup_composes_the_cache_across_two_real_items(monkeypatch):
+    calls = []
+
+    def counting_probe(**kwargs):
+        calls.append(kwargs)
+        return True, ""
+
+    monkeypatch.setitem(conftest._ELEVATION_PROBES, "vice_root", counting_probe)
+
+    item1 = _FakeItem("t::test_a", markers=[_FakeMarker("vice_root")])
+    item2 = _FakeItem("t::test_b", markers=[_FakeMarker("vice_root")])
+
+    conftest.pytest_runtest_setup(item1)  # must not raise (prerequisite present)
+    conftest.pytest_runtest_setup(item2)
+
+    assert len(calls) == 1, calls
 
 
 def test_e2e_probe_runs_once_across_two_items_sharing_a_kind(pytester):
