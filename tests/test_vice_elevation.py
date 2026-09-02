@@ -113,7 +113,6 @@ def test_build_scan_sees_a_rewritten_binary(tmp_path):
     assert ve.vice_binary_supports_ethernet(exe) is True
 
 
-@pytest.mark.vice_live
 @requires_homebrew_x64sc
 def test_homebrew_x64sc_is_ethernet_capable():
     """Ground truth, not an assumption.
@@ -672,7 +671,6 @@ def test_supports_ethernet_uses_the_features_probe(tmp_path, monkeypatch):
     assert ve.vice_binary_supports_ethernet(exe) is False
 
 
-@pytest.mark.vice_live
 @requires_homebrew_x64sc
 def test_homebrew_x64sc_reports_rawnet_and_pcap():
     """Ground truth for the design decision to drop the custom build."""
@@ -811,7 +809,6 @@ class TestFeaturesRowParsing:
         assert feat.pcap is False, "a one-token row must contribute nothing"
 
 
-@pytest.mark.vice_live
 @requires_homebrew_x64sc
 def test_the_features_fixtures_match_the_real_output_shape():
     """The fixtures encode an assumption about VICE that nothing checks.
@@ -844,7 +841,6 @@ def test_the_features_fixtures_match_the_real_output_shape():
     )
 
 
-@pytest.mark.vice_live
 @requires_homebrew_x64sc
 def test_the_features_probe_ignores_an_ambient_vicerc(tmp_path, monkeypatch):
     """``-features`` must not be silenced by the operator's own config.
