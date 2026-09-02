@@ -127,11 +127,19 @@ def _operand(mode: str, b: bytes, pc: int) -> str:
     return f"${w:04X}" + {"abs": "", "absx": ",X", "absy": ",Y"}[mode]
 
 
-def disassemble(mem: bytes, base: int) -> list[str]:
+def disassemble(mem: bytes, base: int, *, upper: bool = True) -> list[str]:
     """One line per instruction for *mem*, which starts at address *base*.
 
     A trailing instruction cut short by the end of *mem* is rendered with
     the bytes present and ``??`` for the missing operand.
+
+    *upper* selects the byte-hex case and the truncated-tail rendering.
+    The default (``True``) is this module's own monitor-style rendering:
+    upper-case bytes, and the real mnemonic followed by ``??`` for a
+    truncated tail. ``upper=False`` is the rendering scripts/dis6502.py's
+    CLI shim asks for, to match its established output (lower-case bytes,
+    and a literal ``.byte`` in place of the mnemonic for a truncated
+    tail) without keeping a second opcode table.
     """
     out: list[str] = []
     i, n = 0, len(mem)
@@ -141,11 +149,17 @@ def disassemble(mem: bytes, base: int) -> list[str]:
         mn, mode = _OPS[op]
         length = _LEN[mode]
         b = bytes(mem[i:i + length])
+        hexpart = b.hex(" ")
+        if upper:
+            hexpart = hexpart.upper()
         if len(b) < length:
-            shown = b.hex(" ").upper() + " ??" * (length - len(b))
-            out.append(f"{pc:04X}  {shown:<9} {mn} ??")
+            if upper:
+                shown = hexpart + " ??" * (length - len(b))
+                out.append(f"{pc:04X}  {shown:<9} {mn} ??")
+            else:
+                out.append(f"{pc:04X}  {hexpart:<9} .byte")
             break
         text = f"{mn} {_operand(mode, b, pc)}".rstrip()
-        out.append(f"{pc:04X}  {b.hex(' ').upper():<9} {text}")
+        out.append(f"{pc:04X}  {hexpart:<9} {text}")
         i += length
     return out
