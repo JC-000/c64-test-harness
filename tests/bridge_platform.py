@@ -7,9 +7,12 @@ attaches via its ``tuntap`` driver.
 On macOS, no ``/dev/net/tun`` exists and there is no iproute2. The equivalent
 layout is ``feth0``/``feth1`` pseudo-ethernet peers bridged via ``bridge10``
 (set up by ``scripts/setup-bridge-feth-macos.sh``), and VICE attaches via its
-``pcap`` driver. The feth interfaces are BPF-visible, so ``libpcap`` can open
-them once ``/dev/bpf*`` is user-readable (via Wireshark's ChmodBPF helper or
-a one-shot ``sudo chmod 666 /dev/bpf*``).
+``pcap`` driver. VICE's pcap attach needs VICE to run as **root**
+(``archdep_rawnet_capability()`` is ``geteuid() == 0``); ``/dev/bpf*``
+node modes are irrelevant to it. Those modes matter to the *harness's own*
+unelevated host-side capture (``c64_test_harness.capture``), which needs a
+node this uid can open -- see docs/bridge_networking.md "Host-side capture
+on macOS".
 
 This module is imported by the test fixtures so the tests remain platform-
 portable without duplicating OS dispatch everywhere.  It also hosts the

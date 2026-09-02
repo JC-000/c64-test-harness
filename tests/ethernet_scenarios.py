@@ -358,6 +358,7 @@ def run_rx_scenario(
     send_capture: PacketCapture | None = None,
     send_delay: float = 0.5,
     timeout: float = 15.0,
+    join_timeout: float = 2.0,
 ) -> bytes:
     """Host injects RX_FRAME; the C64 must receive it.
 
@@ -403,7 +404,7 @@ def run_rx_scenario(
         transport.read_registers()
     finally:
         transport.delete_checkpoint(bp_num)
-    sender.join(timeout=2)
+    sender.join(timeout=join_timeout)
 
     if send_error:
         raise AssertionError(
