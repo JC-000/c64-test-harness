@@ -854,3 +854,42 @@ def test_n1_enable_inline_code_starts_with_the_clockport_enable():
     from c64_test_harness.bridge_ping import cs8900a_enable_inline_code
     assert cs8900a_enable_inline_code()[:8] == bytes([0xAD, 0x01, 0xDE, 0x09, 0x01, 0x8D, 0x01, 0xDE])
 
+
+# ---------------------------------------------------------------------------
+# F7: the CS8900a Product ID probe obeys the same rule as TX/RX
+# ---------------------------------------------------------------------------
+#
+# test_product_id loaded its probe at $C000 and stored the ID into
+# $C000/$C001 -- its own first two bytes.  It worked only because those
+# STAs execute after the bytes were fetched.  The probe moves into the
+# scenarios module (product_id_routine / run_product_id_scenario), stores
+# into RESULT, and is covered by the no-host-write pin.
+
+
+def test_f7_product_id_probe_stores_in_result_not_in_its_own_bytes():
+    from ethernet_scenarios import product_id_routine, run_product_id_scenario
+    code = product_id_routine()
+    for i in range(len(code) - 2):
+        assert not (code[i] == 0x8D and code[i + 2] == (CODE_BASE >> 8)), (
+            f"STA into the code page at offset {i}: {code[i:i+3].hex()}"
+        )
+    assert _branch_targets_off_boundary(code, CODE_BASE) == []
+
+    def c64(ram: bytearray) -> None:
+        ram[RESULT] = 0x0E
+        ram[RESULT + 1] = 0x63
+
+    transport = RecordingTransport(on_resume=c64)
+    assert run_product_id_scenario(transport) == 0x630E
+    assert _writes_inside_code_after_load(transport, code) == []
+
+
+def test_f7_product_id_scenario_reports_a_wrong_id():
+    from ethernet_scenarios import run_product_id_scenario
+
+    def c64(ram: bytearray) -> None:
+        ram[RESULT:RESULT + 2] = b"\xFF\xFF"
+
+    with pytest.raises(AssertionError) as ei:
+        run_product_id_scenario(FakeTransport(on_resume=c64))
+    assert "0x630E" in str(ei.value) and "0xFFFF" in str(ei.value)
