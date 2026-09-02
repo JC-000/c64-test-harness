@@ -500,19 +500,29 @@ Platform-dispatch module for bridge/ethernet tests. **Tests MUST import from her
 - `MACOS_PCAP_DISABLED=1` — skip the probe, return `(False, ...)`. Use on hosts where pcap is known broken.
 - `MACOS_PCAP_ENABLED=1` — skip the probe, return `(True, ...)`. Use on hosts where pcap is known working and you want to save the ~3s probe cost per test session.
 
-### Skip-gate idiom
+### Skip-gate idiom: `elevation(kind, **kwargs)`, not ad hoc `skipif`
+
+Don't hand-roll `iface_present`/`sudo_can_run` checks per module. `tests/conftest.py` registers one marker, `@pytest.mark.elevation(kind, **kwargs)`, covering four elevated prerequisites — each probed **at most once per session** (cached) and, on a miss, skipped with the remedy verbatim (the exact `sudo`/`visudo` line, or `sudo chmod o+rw /dev/bpf*`):
+
+| `kind` | Checks | Default probe |
+|---|---|---|
+| `"vice_root"` | NOPASSWD sudo for the exact `x64sc` path | resolved ethernet binary; override with `binary="/path/to/x64sc"` |
+| `"bridge_scripts"` | NOPASSWD sudo for the bridge lifecycle scripts | the platform's setup/teardown/cleanup trio at their **canonical repo path** (never a worktree's); override with `scripts=("name.sh", ...)` |
+| `"bpf_nodes"` | a usable `/dev/bpf*` node (macOS only; always satisfied elsewhere) | opens and immediately closes at most one node |
+| `"bridge_iface"` | the bridge interface(s) present and up | `IFACE_A`, `IFACE_B`, `BRIDGE_NAME`; override with `ifaces=(...)` for a subset |
 
 ```python
-from tests.bridge_platform import (
-    IFACE_A, IFACE_B, BRIDGE_NAME, SETUP_HINT, iface_present,
-)
-
-missing = [n for n in (IFACE_A, IFACE_B, BRIDGE_NAME) if not iface_present(n)]
-if missing:
-    pytest.skip(f"bridge down ({', '.join(missing)}); {SETUP_HINT}")
+pytestmark = [
+    pytest.mark.vice_live,
+    pytest.mark.elevation("bridge_iface"),  # IFACE_A + IFACE_B + BRIDGE_NAME
+]
 ```
 
-Check **all three** (both peers + bridge), not just the peers — on macOS the bridge is created separately from the feth pair and may be absent after a partial teardown.
+Keep a module-specific gate (e.g. `probe_vice_pcap_ok`'s active launch-and-crash probe, or `BRIDGE_CLEANUP_LIVE` opt-in) as its own `skipif` alongside the marker — only the four *static* prerequisites above belong to `elevation(...)`.
+
+A fixture that launches `ViceProcess(ethernet=True)` (rather than a test carrying the marker) should route through `start_vice_or_skip(config, request.node.nodeid)` (in `tests/conftest.py`) instead of `with ViceProcess(config) as vice:` — it converts a mid-launch `ViceElevationRequiredError` (e.g. a bypassed preflight probe) into the same skip/fail + record, so the session-end notice covers it too.
+
+`C64_REQUIRE_ELEVATION=1` mirrors `C64_REQUIRE_VICE=1` (the env var that fails a run instead of silently certifying the VICE backend from mocks when no `vice_live` test executes): a missing elevation prerequisite fails at setup instead of skipping, and `pytest_sessionfinish` always prints an `ELEVATION REQUIRED: N test(s) skipped` section — kind, count, remedy — whenever anything was skipped for elevation, without needing `-rs`. See `docs/development.md` "Live test gates" for the full writeup of both knobs.
 
 ---
 
