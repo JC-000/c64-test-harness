@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "src
 
 import dis6502  # noqa: E402
 from dis6502 import dis  # noqa: E402
+import c64_test_harness.disasm as disasm_module  # noqa: E402
 from c64_test_harness.disasm import disassemble  # noqa: E402
 
 
@@ -45,17 +46,25 @@ def test_dis_delegates_truncated_tail_too():
 
 
 def test_script_has_no_opcode_table_of_its_own():
-    """The whole point of the consolidation: one 256-entry opcode table,
-    living in c64_test_harness.disasm -- not a second one duplicated here.
-    Every module-level dict big enough to be a per-opcode table (256
-    entries, e.g. the old ``M`` mnemonic table or a ``LENGTH`` table
-    derived from it) must be gone from the script."""
+    """The whole point of the consolidation: one opcode table, living in
+    c64_test_harness.disasm -- not a second one duplicated here, and not
+    a smaller look-alike either.  A strict ``len == 256`` check only
+    catches a full duplicate table; a partial one (say, a 128-entry
+    table covering just the illegal opcodes) would slip right past it.
+    Flag any module-level dict/list/tuple large enough to plausibly be
+    an opcode-keyed table -- and, the stronger guarantee, pin that the
+    shim's `dis()` is built on the actual shared function object, not a
+    re-implementation that merely happens to produce the same strings."""
+    MAX_BENIGN_SIZE = 20  # generous headroom over any real config/const the script needs
     suspects = {
-        name: value
+        name: len(value)
         for name, value in vars(dis6502).items()
-        if isinstance(value, dict) and len(value) == 256
+        if not name.startswith("__")  # not module machinery (e.g. __builtins__)
+        and isinstance(value, (dict, list, tuple))
+        and len(value) > MAX_BENIGN_SIZE
     }
-    assert suspects == {}, f"script still carries its own opcode table(s): {sorted(suspects)}"
+    assert suspects == {}, f"script still carries large module-level collection(s): {suspects}"
+    assert dis6502.disassemble is disasm_module.disassemble
 
 
 def test_script_imports_the_shared_disassemble_function():
