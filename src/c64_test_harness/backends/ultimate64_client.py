@@ -1231,9 +1231,23 @@ class Ultimate64Client:
         """PUT /v1/configs:save_to_flash — persist config to flash (DESTRUCTIVE)."""
         self._put_no_body("/v1/configs:save_to_flash")
 
-    def load_config_from_flash(self) -> None:
-        """PUT /v1/configs:load_from_flash — reload config from flash (DESTRUCTIVE)."""
-        self._put_no_body("/v1/configs:load_from_flash")
+    def load_config_from_flash(self, category: str | None = None) -> None:
+        """PUT /v1/configs:load_from_flash — reload config from flash (DESTRUCTIVE).
+
+        Discards every unsaved in-memory change: config PUTs are volatile
+        until ``save_config_to_flash`` (firmware ``route_configs.cc``
+        ``load_from_flash``: ``s->read(false); s->at_close_config()`` per
+        store, so the reloaded values are re-effectuated too). With
+        *category* given, only that category is reloaded via
+        ``PUT /v1/configs/<category>:load_from_flash`` (firmware accepts
+        a name or pattern; path depth >1 is HTTP 400).
+        """
+        if category is None:
+            self._put_no_body("/v1/configs:load_from_flash")
+            return
+        if not isinstance(category, str) or not category:
+            raise ValueError("category must be a non-empty string")
+        self._put_no_body(f"/v1/configs/{_encode(category)}:load_from_flash")
 
     def reset_config_to_default(self) -> None:
         """PUT /v1/configs:reset_to_default — reset all config (DESTRUCTIVE)."""

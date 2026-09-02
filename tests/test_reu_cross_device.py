@@ -1,9 +1,13 @@
 """Cross-device REU-enable contract tests (mocked Ultimate64Client).
 
 Background: :func:`set_reu` used to unconditionally write
-``Cartridge: "REU"`` when enabling the REU. On the U64 Elite (firmware
-3.14) that write is REQUIRED — the ``Cartridge`` preset is what exposes
-the expansion to the C64. On the new C64 Ultimate (firmware 1.1.0) the
+``Cartridge: "REU"`` when enabling the REU. On the U64 Elite as of
+firmware **3.14** — the shape the ``_U64E_CART_RESPONSE`` mock below
+models — ``Cartridge`` was an enum with a ``"REU"`` preset and that write
+was REQUIRED to expose the expansion to the C64. Firmware 3.15 replaced
+the item with a ``.crt`` file chooser (``presets: [""]``) and the REU is
+controlled by ``RAM Expansion Unit`` alone; the probe treats it like the
+C64U case. On the new C64 Ultimate (firmware 1.1.0) the
 ``Cartridge`` item reports ``presets: [""]``; ``"REU"`` is only a
 mirrored display value and PUTting it back is rejected with HTTP 400
 ("not a valid choice"). Worse, the old updates-dict ordering wrote
@@ -63,7 +67,8 @@ def _cart_item_response(presets: list[str], current: str = "REU") -> dict:
     }
 
 
-# U64 Elite firmware 3.14: "REU" is a real, settable preset.
+# U64 Elite firmware 3.14 shape: "REU" is a real, settable preset. (3.15
+# turned Cartridge into a .crt chooser with presets [""] — the C64U shape.)
 _U64E_CART_RESPONSE = _cart_item_response(presets=["", "REU", "Action Replay"])
 # C64 Ultimate firmware 1.1.0: only the empty preset is settable.
 _C64U_CART_RESPONSE = _cart_item_response(presets=[""])

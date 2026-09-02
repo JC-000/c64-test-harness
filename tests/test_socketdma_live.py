@@ -216,9 +216,11 @@ def test_set_reu_c64u_contract(
     On the C64 Ultimate this previously raised HTTP 400 because ``set_reu``
     tried to write ``Cartridge: "REU"`` (an unsettable mirror value). With
     the preset probe it must now succeed with the ``RAM Expansion Unit``
-    write alone. On the U64 Elite the same call also succeeds (it has the
-    ``"REU"`` preset). Restore touches only the two raw items we wrote —
-    never the ``Cartridge`` item.
+    write alone. On the U64 Elite the same call also succeeds — via the
+    ``"REU"`` preset on firmware 3.14, or via the REU items alone on 3.15,
+    where ``Cartridge`` is a ``.crt`` chooser with ``presets: [""]``.
+    Restore touches only the two raw items we wrote — never the
+    ``Cartridge`` item.
     """
     info = client.get_info()
     record_property("product", str(info.get("product", "")))
