@@ -929,3 +929,20 @@ def test_the_remedy_command_names_the_resolved_binary(tmp_path, monkeypatch):
     assert err.argv == ["sudo", exe, "-warp"]
     assert err.command == f"sudo {exe} -warp"
     assert f"NOPASSWD: {exe}" in err.sudoers_entry
+
+
+def test_the_resolver_hint_names_only_knobs_that_exist(tmp_path):
+    """The remedy used to point at ``HarnessConfig.vice_ethernet_executable``
+    / TOML ``[vice] ethernet_executable``.  Neither exists: nothing maps
+    HarnessConfig.vice_* into ViceConfig.  The two knobs that do work are
+    the env var and ``ViceConfig(ethernet_executable=...)``."""
+    exe = _fake_x64sc(tmp_path, "x64sc", ethernet=False)
+    cfg = ViceConfig(executable=exe, ethernet=True, ethernet_executable="")
+    with pytest.raises(vice_lifecycle.ViceEthernetBinaryError) as excinfo:
+        vice_lifecycle.resolve_vice_executable(cfg)
+    msg = str(excinfo.value)
+    assert f"{vice_lifecycle.ETHERNET_VICE_BIN_ENV}=/path/to/x64sc" in msg
+    assert "ViceConfig(ethernet_executable=" in msg
+    assert "HarnessConfig" not in msg
+    assert "[vice]" not in msg
+    assert "TOML" not in msg
