@@ -164,9 +164,14 @@ def vice_ethernet(request):
     # start_vice_or_skip: converts a mid-launch ViceElevationRequiredError
     # (e.g. the preflight probe was bypassed with MACOS_PCAP_ENABLED=1)
     # into the same skip-or-fail + record the elevation("vice_root")
-    # marker uses, instead of a bare fixture error.
-    vice = start_vice_or_skip(config, request.node.nodeid)
+    # marker uses, instead of a bare fixture error. Called INSIDE the try
+    # (adversarial review S2): a refusal must still release the port --
+    # calling it before the try let a skip escape straight past
+    # allocator.release(port), matching conftest.bridge_vice_pair's
+    # pattern of putting the allocator release in the outermost finally.
+    vice: ViceProcess | None = None
     try:
+        vice = start_vice_or_skip(config, request.node.nodeid)
         transport = connect_binary_transport(port, proc=vice)
         try:
             grid = _binary_wait_for_text(transport, "READY.", timeout=30)
@@ -174,9 +179,10 @@ def vice_ethernet(request):
             yield transport
         finally:
             transport.close()
-            allocator.release(port)
     finally:
-        vice.stop()
+        if vice is not None:
+            vice.stop()
+        allocator.release(port)
 
 
 def _open_capture_or_verdict(iface: str) -> PacketCapture:

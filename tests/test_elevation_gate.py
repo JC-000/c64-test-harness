@@ -554,3 +554,46 @@ def test_bpf_attach_detection_launch_tests_still_require_vice_root(monkeypatch):
         item = _FakeItem(f"test_bpf_attach_detection.py::{name}", markers=marks)
         with pytest.raises(pytest.skip.Exception):
             conftest.pytest_runtest_setup(item)
+
+
+# ---------------------------------------------------------------------------
+# S2 (adversarial review): vice_ethernet must release its port even when
+# start_vice_or_skip() refuses -- it currently calls start_vice_or_skip
+# BEFORE the try, so a refusal skips straight past
+# allocator.release(port).
+# ---------------------------------------------------------------------------
+
+
+def test_vice_ethernet_releases_the_port_when_start_vice_or_skip_refuses(monkeypatch):
+    import test_ethernet as te
+
+    def _raising_start_vice_or_skip(config, nodeid):
+        pytest.skip("elevation required (vice_root): fix it")
+
+    monkeypatch.setattr(te, "start_vice_or_skip", _raising_start_vice_or_skip)
+
+    released = []
+
+    class _FakeAllocator:
+        def __init__(self, **kwargs):
+            pass
+
+        def allocate(self):
+            return 6511
+
+        def take_socket(self, port):
+            return None
+
+        def release(self, port):
+            released.append(port)
+
+    monkeypatch.setattr(te, "PortAllocator", _FakeAllocator)
+
+    gen = te.vice_ethernet.__wrapped__(
+        request=SimpleNamespace(node=SimpleNamespace(nodeid="t::test_x"))
+    )
+    with pytest.raises(pytest.skip.Exception):
+        next(gen)
+    assert released == [6511], (
+        "allocator.release(port) must run even when start_vice_or_skip refuses"
+    )
