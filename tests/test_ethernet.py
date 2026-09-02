@@ -53,7 +53,7 @@ from ethernet_scenarios import (
     run_tx_scenario,
 )
 
-from conftest import connect_binary_transport
+from conftest import connect_binary_transport, start_vice_or_skip
 
 # ---------------------------------------------------------------------------
 # Skip helpers
@@ -161,7 +161,17 @@ def vice_ethernet():
         ethernet_driver=ETHERNET_DRIVER,
     )
 
-    with ViceProcess(config) as vice:
+    # start_vice_or_skip: converts a mid-launch ViceElevationRequiredError
+    # (e.g. the preflight probe was bypassed with MACOS_PCAP_ENABLED=1)
+    # into the same skip-or-fail + record the elevation("vice_root")
+    # marker uses, instead of a bare fixture error. Called INSIDE the try
+    # (adversarial review S2): a refusal must still release the port --
+    # calling it before the try let a skip escape straight past
+    # allocator.release(port), matching conftest.bridge_vice_pair's
+    # pattern of putting the allocator release in the outermost finally.
+    vice: ViceProcess | None = None
+    try:
+        vice = start_vice_or_skip(config)
         transport = connect_binary_transport(port, proc=vice)
         try:
             grid = _binary_wait_for_text(transport, "READY.", timeout=30)
@@ -169,7 +179,10 @@ def vice_ethernet():
             yield transport
         finally:
             transport.close()
-            allocator.release(port)
+    finally:
+        if vice is not None:
+            vice.stop()
+        allocator.release(port)
 
 
 def _open_capture_or_verdict(iface: str) -> PacketCapture:

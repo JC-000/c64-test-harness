@@ -27,6 +27,23 @@ from c64_test_harness.backends import vice_elevation as ve
 from c64_test_harness.backends import vice_lifecycle
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 
+# The four "ground truth against the real binary" tests below only call
+# vice_features()/vice_binary_supports_ethernet(), which run
+# `x64sc -features` unprivileged -- no launch, no sudo. They must NOT be
+# gated by elevation("vice_root") (adversarial review B1, 2026-09-02):
+# that marker also demands passwordless sudo, which these tests never
+# use, so on a bench with the binary but no sudoers rule they would
+# silently skip -- contradicting their own docstrings, which promise to
+# "fail loudly" as ground truth. A plain existence check is the right
+# (and only) prerequisite here. Contrast test_bpf_attach_detection.py's
+# requires_root, which DOES launch a real elevated VICE and correctly
+# keeps elevation("vice_root").
+_HOMEBREW_X64SC = "/opt/homebrew/bin/x64sc"
+requires_homebrew_x64sc = pytest.mark.skipif(
+    not os.path.exists(_HOMEBREW_X64SC),
+    reason="no Homebrew x64sc on this host",
+)
+
 
 # --------------------------------------------------------------- helpers
 
@@ -96,10 +113,7 @@ def test_build_scan_sees_a_rewritten_binary(tmp_path):
     assert ve.vice_binary_supports_ethernet(exe) is True
 
 
-@pytest.mark.skipif(
-    not os.path.exists("/opt/homebrew/bin/x64sc"),
-    reason="no Homebrew x64sc on this host",
-)
+@requires_homebrew_x64sc
 def test_homebrew_x64sc_is_ethernet_capable():
     """Ground truth, not an assumption.
 
@@ -264,7 +278,44 @@ def test_elevation_error_carries_a_runnable_command(monkeypatch):
     assert "/opt/eth/x64sc" in err.sudoers_entry
     assert "NOPASSWD" in err.sudoers_entry
     assert err.sudoers_entry in str(err)
-    assert err.command in str(err)
+    # _eth_argv() carries -addconfig /tmp/x.rc, a per-launch temp file
+    # (see test_the_addconfig_temp_path_is_not_pasted_into_the_remedy
+    # below): the message shows a placeholder for it instead of the raw
+    # command, but err.command itself is still the exact, real,
+    # programmatically re-runnable argv.
+    assert err.command.startswith("sudo /opt/eth/x64sc -addconfig /tmp/x.rc")
+    assert "/tmp/x.rc" not in str(err)
+
+
+def test_the_addconfig_temp_path_is_not_pasted_into_the_remedy(monkeypatch):
+    """The rc ViceProcess writes for -addconfig is a per-launch temp file
+    deleted right after this refusal (ViceProcess._cleanup_tmp_vicerc(),
+    called from stop(), which start() invokes on any failure -- see
+    vice_lifecycle.py), so pasting it verbatim hands the operator a
+    command that fails immediately with "No such file or directory".
+    The remedy must show a placeholder instead and still name the
+    sudoers rule as the durable, always-re-runnable fix (adversarial
+    review S4)."""
+    _as_uid(monkeypatch, 501)
+    monkeypatch.setattr(ve.sys, "platform", "darwin")
+    _no_sudo(monkeypatch)
+    cfg = ViceConfig(ethernet=True, ethernet_driver="pcap")
+    argv = [
+        "/opt/eth/x64sc", "-addconfig",
+        "/var/folders/xp/pg4rg55j7sqbcwz53hd9z8fw0000gn/T/vice_eth_zcaqela4.rc",
+        "-ethernetioif", "feth0", "-ethernetiodriver", "pcap",
+    ]
+    with pytest.raises(ve.ViceElevationRequiredError) as excinfo:
+        ve.plan_vice_launch(cfg, argv)
+    err = excinfo.value
+    msg = str(err)
+    assert "/var/folders" not in msg
+    assert "vice_eth_zcaqela4.rc" not in msg
+    assert ve._ADDCONFIG_PLACEHOLDER in msg
+    # The real, exact, programmatically re-runnable argv/command are
+    # untouched -- only what gets printed for a human to paste changes.
+    assert err.argv[3] == argv[2]
+    assert "/var/folders" in err.command
 
 
 def test_plan_refuses_an_unelevated_ethernet_launch_pinned_off(monkeypatch):
@@ -620,10 +671,7 @@ def test_supports_ethernet_uses_the_features_probe(tmp_path, monkeypatch):
     assert ve.vice_binary_supports_ethernet(exe) is False
 
 
-@pytest.mark.skipif(
-    not os.path.exists("/opt/homebrew/bin/x64sc"),
-    reason="no Homebrew x64sc on this host",
-)
+@requires_homebrew_x64sc
 def test_homebrew_x64sc_reports_rawnet_and_pcap():
     """Ground truth for the design decision to drop the custom build."""
     feat = ve.vice_features("/opt/homebrew/bin/x64sc")
@@ -761,10 +809,7 @@ class TestFeaturesRowParsing:
         assert feat.pcap is False, "a one-token row must contribute nothing"
 
 
-@pytest.mark.skipif(
-    not os.path.exists("/opt/homebrew/bin/x64sc"),
-    reason="no Homebrew x64sc on this host",
-)
+@requires_homebrew_x64sc
 def test_the_features_fixtures_match_the_real_output_shape():
     """The fixtures encode an assumption about VICE that nothing checks.
 
@@ -796,10 +841,7 @@ def test_the_features_fixtures_match_the_real_output_shape():
     )
 
 
-@pytest.mark.skipif(
-    not os.path.exists("/opt/homebrew/bin/x64sc"),
-    reason="no Homebrew x64sc on this host",
-)
+@requires_homebrew_x64sc
 def test_the_features_probe_ignores_an_ambient_vicerc(tmp_path, monkeypatch):
     """``-features`` must not be silenced by the operator's own config.
 
@@ -958,3 +1000,49 @@ def test_a_passwd_retag_after_nopasswd_voids_the_entry(monkeypatch):
         "    (root) NOPASSWD: PASSWD: /opt/homebrew/bin/x64sc\n",
     )
     assert ve.sudo_can_run("/opt/homebrew/bin/x64sc") is False
+
+
+# ---------------------------------------------------------------------------
+# Cross-test cache leak (coordinator follow-up, 2026-09-02):
+# sudo_authorisation() is a process-global lru_cache(maxsize=1).
+# _sudo_listing() (used throughout this file) clears it BEFORE
+# installing a mock, but nothing clears it AFTER -- so whatever the last
+# test in this file to touch it leaves cached survives into whatever
+# runs next in the same pytest session, mocked or not. A full-suite (or
+# any multi-file) run can serve a fake "not authorised" to
+# test_bpf_attach_detection.py or the elevation gate's own
+# _probe_vice_root, silently skipping a real live test -- exactly the
+# class of hidden skip this branch exists to remove.
+#
+# This pair deliberately does NOT rely on the fix (an autouse fixture
+# in tests/conftest.py) to pass: test_a leaves the cache populated with
+# a fake, empty listing on purpose (matching the shape every other test
+# here already has, minus a final clear), and test_b asks a completely
+# different, real-shaped question with no idea test_a ran. Without the
+# autouse fixture this fails when the two run in sequence, which they
+# do by default (source order, no test-randomisation plugin configured
+# in this repo).
+# ---------------------------------------------------------------------------
+
+
+def test_a_leaves_a_mocked_empty_sudo_listing_cached(monkeypatch):
+    monkeypatch.setattr(
+        ve.subprocess, "run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "", ""),
+    )
+    ve.sudo_authorisation.cache_clear()
+    result = ve.sudo_authorisation()
+    assert result.all_commands is False
+    assert result.commands == frozenset()
+    # No cache_clear() here -- that omission is the point.
+
+
+def test_b_a_later_test_must_not_see_test_as_stale_cache(monkeypatch):
+    monkeypatch.setattr(
+        ve.subprocess, "run",
+        lambda *a, **k: subprocess.CompletedProcess(
+            a[0], 0, "    (root) NOPASSWD: /opt/homebrew/bin/x64sc\n", "",
+        ),
+    )
+    result = ve.sudo_authorisation()
+    assert result.allows("/opt/homebrew/bin/x64sc") is True

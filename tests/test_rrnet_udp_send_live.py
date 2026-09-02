@@ -68,8 +68,6 @@ if _LIVE_GATE and _IS_LINUX:
         BRIDGE_NAME,
         ETHERNET_DRIVER,
         IFACE_A,
-        SETUP_HINT,
-        iface_present,
     )
     from c64_test_harness.backends.vice_binary import BinaryViceTransport
     from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
@@ -87,20 +85,12 @@ if _LIVE_GATE and _IS_LINUX:
     # Add a runtime "is x64sc on PATH" + "are the interfaces up" skip --
     # mirrors the pattern in tests/test_ethernet_bridge.py so a
     # half-configured machine bails cleanly rather than hanging in VICE
-    # bringup.
+    # bringup.  This module only drives IFACE_A (one VICE instance) plus
+    # the bridge, not IFACE_B, so the default elevation("bridge_iface")
+    # trio is narrowed with an explicit ifaces= override.
     pytestmark.extend([
         pytest.mark.vice_live,
-        pytest.mark.skipif(
-            not iface_present(IFACE_A),
-            reason=f"{IFACE_A} not found ({SETUP_HINT})",
-        ),
-        pytest.mark.skipif(
-            not iface_present(BRIDGE_NAME),
-            reason=(
-                f"{BRIDGE_NAME} not found; the host bridge must be up "
-                f"({SETUP_HINT})"
-            ),
-        ),
+        pytest.mark.elevation("bridge_iface", ifaces=(IFACE_A, BRIDGE_NAME)),
     ])
 
 

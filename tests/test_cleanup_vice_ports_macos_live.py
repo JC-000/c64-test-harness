@@ -84,6 +84,16 @@ pytestmark = [
     # Running the probe before setup would skip every clean-host run.
     # If pcap is genuinely broken, the test will fail loudly at the
     # bridge VICE spawn step, which is the right signal.
+    #
+    # NOPASSWD sudo for setup-bridge-feth-macos.sh /
+    # teardown-bridge-feth-macos.sh / cleanup-bridge-feth-macos.sh (this
+    # test drives them directly), and for x64sc itself (ViceConfig flips
+    # run_as_root=True for ethernet=True on macOS -- see module
+    # docstring).  Unlike the pcap probe above, both ARE static
+    # prerequisites the bench either has or doesn't, so checking them
+    # upfront costs nothing on a clean host.
+    pytest.mark.elevation("bridge_scripts"),
+    pytest.mark.elevation("vice_root"),
 ]
 
 

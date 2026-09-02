@@ -19,12 +19,9 @@ import time
 import pytest
 
 from bridge_platform import (
-    BRIDGE_NAME,
     ETHERNET_DRIVER,
     IFACE_A,
     IFACE_B,
-    SETUP_HINT,
-    iface_present,
     probe_vice_pcap_ok,
 )
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
@@ -34,7 +31,7 @@ from c64_test_harness.ethernet import set_cs8900a_mac
 from c64_test_harness.execute import jsr, load_code
 from c64_test_harness.memory import read_bytes, write_bytes
 
-from conftest import connect_binary_transport
+from conftest import connect_binary_transport, start_vice_or_skip
 
 # ---------------------------------------------------------------------------
 # Skip conditions
@@ -47,22 +44,11 @@ pytestmark = [
     pytest.mark.vice_live,
     # See test_bridge_ping.py: monitor-up is not proof of capture, so
     # require a real /dev/bpf* attach or these pass vacuously (issue #144).
+    # This probe is module-specific (an active launch-and-watch-for-crash
+    # check, not a static prerequisite) and stays outside the marker.
     pytest.mark.skipif(not _PCAP_OK, reason=_PCAP_REASON),
-    pytest.mark.skipif(
-        not iface_present(IFACE_A),
-        reason=f"{IFACE_A} not found ({SETUP_HINT})",
-    ),
-    pytest.mark.skipif(
-        not iface_present(IFACE_B),
-        reason=f"{IFACE_B} not found ({SETUP_HINT})",
-    ),
-    pytest.mark.skipif(
-        not iface_present(BRIDGE_NAME),
-        reason=(
-            f"{BRIDGE_NAME} not found -- feth/tap peers alone aren't enough; "
-            f"the host bridge must be up ({SETUP_HINT})"
-        ),
-    ),
+    # IFACE_A / IFACE_B / BRIDGE_NAME all present and up.
+    pytest.mark.elevation("bridge_iface"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -665,12 +651,16 @@ def vice_bridge_pair():
         ethernet_driver=ETHERNET_DRIVER,
     )
 
-    vice_a = ViceProcess(config_a)
-    vice_b = ViceProcess(config_b)
+    # start_vice_or_skip: converts a mid-launch ViceElevationRequiredError
+    # (e.g. the preflight probe was bypassed with MACOS_PCAP_ENABLED=1)
+    # into the same skip-or-fail + record the elevation("vice_root")
+    # marker uses, instead of a bare fixture error.
+    vice_a: ViceProcess | None = None
+    vice_b: ViceProcess | None = None
 
     try:
-        vice_a.start()
-        vice_b.start()
+        vice_a = start_vice_or_skip(config_a)
+        vice_b = start_vice_or_skip(config_b)
 
         transport_a = connect_binary_transport(port_a, proc=vice_a)
         transport_b = connect_binary_transport(port_b, proc=vice_b)
@@ -692,8 +682,10 @@ def vice_bridge_pair():
             transport_a.close()
             transport_b.close()
     finally:
-        vice_a.stop()
-        vice_b.stop()
+        if vice_a is not None:
+            vice_a.stop()
+        if vice_b is not None:
+            vice_b.stop()
         allocator.release(port_a)
         allocator.release(port_b)
 

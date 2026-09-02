@@ -5,9 +5,14 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import subprocess
+import sys
 import time
+from functools import lru_cache
 
 import pytest
+
+pytest_plugins = ["pytester"]
 
 from c64_test_harness.backends.device_lock import DeviceLock
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
@@ -108,6 +113,43 @@ def device_lock_guard(request):
     finally:
         lock.release()
         _device_lock_log.info("device lock released for %s", host)
+
+
+@pytest.fixture(autouse=True)
+def _clear_vice_elevation_process_caches():
+    """Clear every process-global cache in vice_elevation.py, before AND
+    after every test in the whole suite (not just this file).
+
+    Three ``functools.lru_cache``'d functions live there:
+    ``sudo_authorisation()`` (``maxsize=1``, no args -- the sharpest
+    edge, since a single call answers for the rest of the process) and
+    ``_probe_features()`` / ``_scan_for_markers()`` (keyed on a binary's
+    real path/mtime/size, lower risk but still process-global).
+    ``tests/test_vice_elevation.py`` mocks ``subprocess.run`` to feed
+    ``sudo_authorisation()`` fake listings extensively; most of those
+    tests clear the cache *before* installing their mock (see
+    ``_sudo_listing()``) but nothing there clears it *after* -- so
+    whichever such test runs last in a session leaves its fake answer
+    cached for whatever asks next, mocked or not. A full-suite (or any
+    multi-file) run could then serve a fake "not authorised" to
+    ``test_bpf_attach_detection.py`` or the elevation gate's own
+    ``_probe_vice_root``, silently skipping a real live test -- exactly
+    the class of hidden skip this branch exists to remove.
+
+    Clearing *before* protects the first test in a session (nothing ran
+    before it to leave a residue) and any test whose own setup runs
+    before a marker-driven probe within the same test; clearing *after*
+    protects every test that runs later, regardless of what this one
+    did.
+    """
+    from c64_test_harness.backends import vice_elevation as ve
+
+    caches = (ve.sudo_authorisation, ve._probe_features, ve._scan_for_markers)
+    for cache in caches:
+        cache.cache_clear()
+    yield
+    for cache in caches:
+        cache.cache_clear()
 
 
 class MockTransport:
@@ -373,12 +415,17 @@ def bridge_vice_pair():
         ethernet_driver=ETHERNET_DRIVER,
     )
 
-    vice_a = ViceProcess(config_a)
-    vice_b = ViceProcess(config_b)
+    # start_vice_or_skip: a bypassed preflight probe (MACOS_PCAP_ENABLED=1)
+    # means ViceProcess.start() itself can still refuse mid-fixture with
+    # ViceElevationRequiredError; convert that the same way the
+    # elevation("vice_root") marker does, rather than let it surface as a
+    # bare fixture error the notice below never learns about.
+    vice_a: ViceProcess | None = None
+    vice_b: ViceProcess | None = None
 
     try:
-        vice_a.start()
-        vice_b.start()
+        vice_a = start_vice_or_skip(config_a)
+        vice_b = start_vice_or_skip(config_b)
         transport_a = connect_binary_transport(port_a, proc=vice_a)
         transport_b = connect_binary_transport(port_b, proc=vice_b)
         try:
@@ -393,8 +440,10 @@ def bridge_vice_pair():
             transport_a.close()
             transport_b.close()
     finally:
-        vice_a.stop()
-        vice_b.stop()
+        if vice_a is not None:
+            vice_a.stop()
+        if vice_b is not None:
+            vice_b.stop()
         allocator.release(port_a)
         allocator.release(port_b)
 
@@ -494,19 +543,368 @@ def require_vice_or_skip() -> None:
     pytest.skip(reason)
 
 
+# ---------------------------------------------------------------------------
+# The elevation marker (``elevation(kind, **kwargs)``) and its gate
+# ---------------------------------------------------------------------------
+#
+# Ten live test files each grew their own ad hoc ``skipif`` for one of
+# four elevated prerequisites: (a) ``vice_root`` -- a NOPASSWD sudoers
+# rule for the exact x64sc path VICE's ethernet driver needs root for;
+# (b) ``bridge_scripts`` -- NOPASSWD rules for the bridge lifecycle
+# scripts; (c) ``bpf_nodes`` -- a world-rw ``/dev/bpf*`` node for
+# host-side capture; (d) ``bridge_iface`` -- the bridge interface(s)
+# present and up.  On a bench missing one, the affected tests silently
+# skip and the reason is visible only under ``-rs``.
+#
+# ``@pytest.mark.elevation(kind, **kwargs)`` replaces the ad hoc copies
+# with one probe per (kind, kwargs), evaluated at most once per session
+# (``check_elevation`` caches on it), and a session-end notice that
+# always prints -- no ``-rs`` required -- naming the remedy verbatim.
+# The kwargs let a test override what the default probe checks (a
+# specific binary path, a specific interface set) while still sharing
+# the one cache and the one notice.
+#
+# ``C64_REQUIRE_ELEVATION=1`` mirrors ``C64_REQUIRE_VICE`` above: a
+# missing prerequisite becomes a hard failure at setup instead of a
+# skip, and a green exit status is escalated 0 -> 1 (never masking
+# INTERRUPTED=2 or INTERNAL_ERROR=3 -- the same rule the VICE gate
+# follows, for the same reason: a worse status is already saying
+# something this gate must not paper over).
+
+ELEVATION_MARKER = "elevation"
+REQUIRE_ELEVATION_ENV = "C64_REQUIRE_ELEVATION"
+
+#: ``(nodeid, kind, remedy)`` for every test the gate skipped or failed
+#: this session -- read by the end-of-session notice.
+_elevation_skips: list[tuple[str, str, str]] = []
+
+#: One probe result per ``(kind, sorted(kwargs.items()))`` -- a probe
+#: never runs twice for the same question in one session.
+_elevation_cache: dict[tuple, tuple[bool, str]] = {}
+
+
+def elevation_is_required() -> bool:
+    """Whether the operator has declared every elevated prerequisite
+    must already be satisfied on this bench."""
+    return os.environ.get(REQUIRE_ELEVATION_ENV, "").strip().lower() in _TRUTHY
+
+
+def _resolve_ethernet_binary() -> str:
+    from c64_test_harness.backends.vice_lifecycle import ethernet_vice_binary
+    return ethernet_vice_binary() or shutil.which("x64sc") or "x64sc"
+
+
+@lru_cache(maxsize=1)
+def _canonical_repo_root() -> str | None:
+    """The main (non-worktree) checkout's absolute path, or ``None``.
+
+    The sudo'd bridge lifecycle scripts are allowlisted -- and any
+    NOPASSWD sudoers rule is written -- against this path, never a
+    worktree's copy under ``.claude/worktrees/agent-*`` (see CLAUDE.md
+    "Permission notes for agents"). ``git worktree list``'s first row is
+    always the main worktree, regardless of which worktree this process
+    happens to be running from.
+
+    Returns ``None`` -- never a fallback guess like ``os.getcwd()`` --
+    when the git command fails, exits non-zero, or its ``--porcelain``
+    output carries no ``worktree `` row (e.g. a ``git archive`` export
+    with no ``.git`` at all).  A wrong path here used to make
+    ``_probe_bridge_scripts`` print a confident, fabricated sudoers
+    remedy naming throwaway paths nobody could ever authorise (verified
+    live against a ``git archive`` copy).
+    """
+    try:
+        out = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    for line in (out.stdout or "").splitlines():
+        if line.startswith("worktree "):
+            return line[len("worktree "):].strip()
+    return None
+
+
+def _probe_vice_root(binary: str | None = None) -> tuple[bool, str]:
+    """(a): a NOPASSWD sudoers rule for the exact x64sc path.
+
+    *binary* overrides the default resolved ethernet binary -- for a
+    test that needs a specific bench binary (e.g. the Homebrew path on
+    macOS) rather than whatever ``ethernet_vice_binary()``/PATH resolve
+    to here.
+    """
+    from c64_test_harness.backends.vice_elevation import (
+        _sudoers_entry,
+        launch_path,
+        rawnet_capability,
+        sudo_authorisation,
+        sudo_can_run,
+    )
+    if rawnet_capability():
+        return True, ""
+    resolved = launch_path(binary or _resolve_ethernet_binary())
+    # Existence-check BOTH paths (adversarial review N3): a missing
+    # binary is not a sudo problem, and letting a missing default
+    # resolution fall through to sudo_can_run() reported "'sudo -n' is
+    # not authorised for x64sc" for a binary that was never there to
+    # authorise in the first place.
+    if not os.path.exists(resolved):
+        return False, f"{resolved} not found on this host"
+    # sudo_authorisation() is a process-global lru_cache(maxsize=1) that
+    # test_vice_elevation.py's mocked tests populate extensively; the
+    # autouse fixture above already clears it between tests, but this
+    # probe is the ONE-SHOT-per-session answer the whole live gate rests
+    # on (check_elevation caches ITS result too), so it does not rely on
+    # fixture ordering for that one answer -- it forces a fresh read
+    # itself, immune to whatever any other test left behind.
+    sudo_authorisation.cache_clear()
+    if sudo_can_run(resolved):
+        return True, ""
+    entry = _sudoers_entry(resolved)
+    return False, (
+        f"'sudo -n' is not authorised for {resolved}. Add to sudoers "
+        f"(visudo; the rule must name this exact path and must not be "
+        f"bash-wrapped):\n    {entry}"
+    )
+
+
+#: Canonical bridge-lifecycle scripts per platform (see docs/development.md
+#: "Passwordless sudo").  ``bridge_iface``'s ``SETUP_HINT`` names only one
+#: of these; this is the full NOPASSWD set the harness actually drives.
+_BRIDGE_SCRIPT_SETS = {
+    "darwin": (
+        "setup-bridge-feth-macos.sh",
+        "teardown-bridge-feth-macos.sh",
+        "cleanup-bridge-feth-macos.sh",
+    ),
+    "linux": (
+        "setup-bridge-tap.sh",
+        "teardown-bridge-tap.sh",
+        "cleanup-bridge-networking.sh",
+    ),
+}
+
+
+def _probe_bridge_scripts(scripts: tuple[str, ...] | None = None) -> tuple[bool, str]:
+    """(b): NOPASSWD rules for the bridge lifecycle scripts.
+
+    Probed at their canonical repo path -- never a worktree's -- because
+    that is the only path a NOPASSWD rule can be written against (see
+    CLAUDE.md "Permission notes for agents").
+    """
+    from c64_test_harness.backends.vice_elevation import _sudoers_entry, sudo_can_run
+    names = scripts or _BRIDGE_SCRIPT_SETS.get(sys.platform, _BRIDGE_SCRIPT_SETS["linux"])
+    root = _canonical_repo_root()
+    if root is None:
+        return False, (
+            "cannot locate the canonical checkout (not a git clone?): "
+            "'git worktree list --porcelain' failed or returned no "
+            "worktree row, and the sudoers path for these scripts can "
+            "only be resolved from a real git checkout -- run the tests "
+            "from a git clone, not an exported copy"
+        )
+    paths = [os.path.join(root, "scripts", name) for name in names]
+    missing = [p for p in paths if not sudo_can_run(p)]
+    if not missing:
+        return True, ""
+    lines = "\n".join(f"    {_sudoers_entry(p)}" for p in missing)
+    return False, (
+        f"'sudo -n' is not authorised for: {', '.join(missing)}. Add to "
+        f"sudoers (visudo; each rule must name its exact path and must "
+        f"not be bash-wrapped):\n{lines}"
+    )
+
+
+def _probe_bpf_nodes() -> tuple[bool, str]:
+    """(c): a world-rw ``/dev/bpf*`` node for host-side capture.
+
+    Opens -- and immediately closes -- at most one node, matching the
+    same node the real capture path would take.  A no-op (satisfied) on
+    every non-Darwin platform, where this prerequisite does not exist.
+    """
+    if sys.platform != "darwin":
+        return True, ""
+    from c64_test_harness.capture import CaptureUnavailable, _close_node, _open_first_bpf
+    try:
+        fd, _path = _open_first_bpf()
+    except CaptureUnavailable as e:
+        return False, e.remedy or str(e)
+    _close_node(fd)
+    return True, ""
+
+
+def _probe_bridge_iface(ifaces: tuple[str, ...] | None = None) -> tuple[bool, str]:
+    """(d): the bridge interface(s) present and up.
+
+    Defaults to the platform's full pair-plus-bridge
+    (``IFACE_A``, ``IFACE_B``, ``BRIDGE_NAME``); *ifaces* overrides it
+    for a test that only depends on a subset.
+    """
+    import bridge_platform as bp
+    names = ifaces or (bp.IFACE_A, bp.IFACE_B, bp.BRIDGE_NAME)
+    missing = [n for n in names if not bp.iface_present(n)]
+    if not missing:
+        return True, ""
+    return False, f"{', '.join(missing)} not found ({bp.SETUP_HINT})"
+
+
+_ELEVATION_PROBES = {
+    "vice_root": _probe_vice_root,
+    "bridge_scripts": _probe_bridge_scripts,
+    "bpf_nodes": _probe_bpf_nodes,
+    "bridge_iface": _probe_bridge_iface,
+}
+
+
+def check_elevation(kind: str, **kwargs) -> tuple[bool, str]:
+    """Probe *kind* at most once per session; returns ``(ok, remedy)``."""
+    probe = _ELEVATION_PROBES.get(kind)
+    if probe is None:
+        raise ValueError(
+            f"unknown elevation kind {kind!r}; expected one of "
+            f"{sorted(_ELEVATION_PROBES)}"
+        )
+    key = (kind, tuple(sorted(kwargs.items())))
+    if key not in _elevation_cache:
+        _elevation_cache[key] = probe(**kwargs)
+    return _elevation_cache[key]
+
+
+#: Prefix every elevation skip/fail message carries, so
+#: pytest_runtest_makereport (below) can recognise one in a report's
+#: exception text without any other coupling to gate_elevation().
+_ELEVATION_TEXT_PREFIX = "elevation required ("
+
+
+def _elevation_text(kind: str, remedy: str) -> str:
+    return f"{_ELEVATION_TEXT_PREFIX}{kind}): {remedy}"
+
+
+def _parse_elevation_text(text: str) -> tuple[str, str] | None:
+    """Recover ``(kind, remedy)`` from a message built by
+    :func:`_elevation_text`, or ``None`` if *text* isn't one."""
+    if not text.startswith(_ELEVATION_TEXT_PREFIX):
+        return None
+    rest = text[len(_ELEVATION_TEXT_PREFIX):]
+    kind, sep, remedy = rest.partition("): ")
+    return (kind, remedy) if sep else None
+
+
+def gate_elevation(kind: str, remedy: str) -> None:
+    """Skip the current test -- or fail it, under
+    ``C64_REQUIRE_ELEVATION=1`` -- for a missing *kind* prerequisite.
+    *remedy* is shown verbatim: it must already be the exact command the
+    operator needs, not a paraphrase.
+
+    Recording for the end-of-session notice happens in
+    ``pytest_runtest_makereport`` below, not here.  A caller-supplied
+    nodeid used to be recorded right in this function, but the only
+    caller that isn't already inside ``pytest_runtest_setup`` (where
+    ``item.nodeid`` is exact) is ``start_vice_or_skip()``, called from a
+    *module-scoped* fixture -- where ``request.node`` is the Module, not
+    the Function, so ``request.node.nodeid`` silently recorded the
+    wrong, non-test nodeid (a real over-count, caught live: three tests
+    sharing one refused fixture reported "4 test(s) skipped", one too
+    many, adversarial review S3 follow-up). ``pytest_runtest_makereport``
+    always sees the real per-test ``item.nodeid``, for every path.
+    """
+    text = _elevation_text(kind, remedy)
+    if elevation_is_required():
+        pytest.fail(text, pytrace=False)
+    pytest.skip(text)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Record every test an elevation refusal actually skipped or failed.
+
+    This is the ONE place ``_elevation_skips`` is written -- deliberately
+    not ``gate_elevation()`` itself.  ``item.nodeid`` here is always the
+    real test Function, for both call sites: a marker checked straight
+    from ``pytest_runtest_setup(item)``, and a module-scoped fixture's
+    refusal (``start_vice_or_skip()``) whose SINGLE ``gate_elevation()``
+    call still produces a ``TestReport`` (``when="setup"``) for every
+    dependent test -- pytest's own fixture-error caching re-raises the
+    same cached exception for each one, with that test's own real
+    nodeid, even though the fixture body itself ran only once. Recording
+    here, from the report, rather than in ``gate_elevation()`` from a
+    caller-supplied nodeid, is what makes a shared fixture refusal count
+    once per affected TEST rather than once per fixture invocation
+    (adversarial review S3) -- and sidesteps a related bug a first
+    attempt at S3 hit: a module-scoped fixture's ``request.node`` is the
+    Module, not the Function, so a nodeid threaded through from there
+    was simply wrong.
+    """
+    yield
+    if call.when != "setup" or call.excinfo is None:
+        return
+    exc = call.excinfo.value
+    if not isinstance(exc, (pytest.skip.Exception, pytest.fail.Exception)):
+        return
+    parsed = _parse_elevation_text(str(exc))
+    if parsed is None:
+        return
+    kind, remedy = parsed
+    entry = (item.nodeid, kind, remedy)
+    if entry not in _elevation_skips:
+        _elevation_skips.append(entry)
+
+
+def start_vice_or_skip(config) -> ViceProcess:
+    """Start a :class:`ViceProcess`, converting a mid-launch
+    :class:`~c64_test_harness.backends.vice_elevation.ViceElevationRequiredError`
+    into the same skip-or-fail the ``elevation("vice_root")`` marker
+    uses (recorded for the notice by ``pytest_runtest_makereport``, not
+    here -- see its docstring for why no nodeid is threaded through).
+
+    Shared by every module-scoped ethernet fixture that launches VICE
+    with ``ethernet=True`` (this module's ``bridge_vice_pair``,
+    ``test_ethernet.py``'s ``vice_ethernet``,
+    ``test_ethernet_bridge.py``'s ``vice_bridge_pair``): a bypassed
+    preflight probe (``MACOS_PCAP_ENABLED=1``) means
+    ``ViceProcess.start()`` itself is the last line of defence and can
+    still refuse mid-fixture.
+    """
+    from c64_test_harness.backends.vice_elevation import ViceElevationRequiredError
+    vice = ViceProcess(config)
+    try:
+        vice.start()
+    except ViceElevationRequiredError as exc:
+        gate_elevation("vice_root", str(exc))
+    return vice
+
+
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         f"{VICE_LIVE_MARKER}: needs a real x64sc; gated by ${REQUIRE_VICE_ENV}",
     )
+    config.addinivalue_line(
+        "markers",
+        f"{ELEVATION_MARKER}(kind, **kwargs): needs an elevated prerequisite "
+        f"({', '.join(sorted(_ELEVATION_PROBES))}); gated by "
+        f"${REQUIRE_ELEVATION_ENV}",
+    )
 
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item):
-    """Enforce the gate before pytest's own skipif evaluation."""
-    if item.get_closest_marker(VICE_LIVE_MARKER) is None:
-        return
-    require_vice_or_skip()
+    """Enforce the VICE and elevation gates before pytest's own skipif."""
+    if item.get_closest_marker(VICE_LIVE_MARKER) is not None:
+        require_vice_or_skip()
+    for marker in item.iter_markers(ELEVATION_MARKER):
+        if not marker.args:
+            raise TypeError(
+                f"{item.nodeid}: @pytest.mark.elevation(...) needs a kind "
+                f"as its first positional argument"
+            )
+        kind, kwargs = marker.args[0], dict(marker.kwargs)
+        ok, remedy = check_elevation(kind, **kwargs)
+        if not ok:
+            gate_elevation(kind, remedy)
 
 
 def pytest_runtest_logreport(report):
@@ -524,6 +922,36 @@ def pytest_runtest_logreport(report):
         and VICE_LIVE_MARKER in getattr(report, "keywords", {})
     ):
         _vice_live_ran += 1
+
+
+def _elevation_group() -> dict[tuple[str, str], int]:
+    """(kind, remedy) -> count, for the notice below."""
+    counts: dict[tuple[str, str], int] = {}
+    for _nodeid, kind, remedy in _elevation_skips:
+        counts[(kind, remedy)] = counts.get((kind, remedy), 0) + 1
+    return counts
+
+
+def _elevation_sessionfinish(session, exitstatus) -> None:
+    """Print the elevation notice and, if required, escalate the exit
+    status -- unconditionally, unlike the VICE gate below: this fires
+    whenever anything was skipped for elevation this session, not only
+    when nothing at all ran.
+    """
+    if not _elevation_skips:
+        return
+    if elevation_is_required() and session.exitstatus == 0:
+        session.exitstatus = 1
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is None:
+        return
+    reporter.write_sep(
+        "=",
+        f"ELEVATION REQUIRED: {len(_elevation_skips)} test(s) skipped",
+        red=True,
+    )
+    for (kind, remedy), count in sorted(_elevation_group().items()):
+        reporter.write_line(f"[{kind}] {count} test(s): {remedy}")
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -552,6 +980,7 @@ def pytest_sessionfinish(session, exitstatus):
     only version that cannot be opted out of by an argument list, which
     is the property being bought.
     """
+    _elevation_sessionfinish(session, exitstatus)
     if not vice_is_required() or _vice_live_ran:
         return
     # A run that collected nothing at all has a different problem (an
