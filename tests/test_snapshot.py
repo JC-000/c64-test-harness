@@ -243,6 +243,7 @@ class TestVsfCodec:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.vice_live
 def test_vice_accepts_our_emitted_vsf(vice_transport, tmp_path):
     """Emit a Snapshot to .vsf, load via undump_snapshot, confirm RAM.
 
@@ -270,6 +271,7 @@ def test_vice_accepts_our_emitted_vsf(vice_transport, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.vice_live
 def test_we_parse_vice_emitted_vsf(vice_transport, tmp_path):
     """VICE dumps a snapshot; we parse it and verify RAM round-trip."""
     marker = bytes(range(0x80, 0x90))  # distinctive from previous test's marker

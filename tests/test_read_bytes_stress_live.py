@@ -60,10 +60,14 @@ from c64_test_harness import (
 )
 
 
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("READ_BYTES_STRESS"),
-    reason="long-running stress reproducer; opt-in with READ_BYTES_STRESS=1",
-)
+pytestmark = [
+    # Needs a real x64sc: visible to the C64_REQUIRE_VICE gate's counter.
+    pytest.mark.vice_live,
+    pytest.mark.skipif(
+        not os.environ.get("READ_BYTES_STRESS"),
+        reason="long-running stress reproducer; opt-in with READ_BYTES_STRESS=1",
+    ),
+]
 
 
 @dataclass

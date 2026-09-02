@@ -885,7 +885,10 @@ def _check_performance(mon: BinaryMonitor) -> None:
 
 import shutil
 
+import pytest
 
+
+@pytest.mark.vice_live
 def test_binary_monitor_protocol():
     from conftest import require_vice_or_skip
     require_vice_or_skip()
