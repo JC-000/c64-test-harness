@@ -278,9 +278,12 @@ def test_jamaction_is_pinned_to_dialog_so_a_jam_reaches_the_monitor(mock_popen):
     ``monitor_binary_ui_jam_dialog``, which ``machine_jam`` reaches only
     when ``jam_action == 0`` (S ``machine.c:131-139``).  With the binary
     monitor connected the "dialog" is routed to the monitor and the
-    machine stops.  Under ``-jamaction 1`` the CPU silently carries on
-    and the JAM-reporting path in ``wait_for_stopped`` is unreachable on
-    every harness launch -- certified by mocks alone.
+    machine stops.  Under ``-jamaction 1`` ``machine_jam`` returns
+    ``JAM_NONE`` (S ``machine.c:145-150``) and ``JAM()``'s default branch
+    is a bare ``CLK++`` with no PC advance (S ``maincpu.c:606-628``): the
+    CPU halts in place, silently, and the JAM-reporting path in
+    ``wait_for_stopped`` is unreachable on every harness launch --
+    certified by mocks alone.
     """
     args = _start_and_capture_args(ViceConfig(), mock_popen)
     i = args.index("-jamaction")

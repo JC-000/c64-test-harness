@@ -504,9 +504,13 @@ class ViceProcess:
         # when jam_action == 0 (S machine.c:131-139); with the binary
         # monitor connected the "dialog" is routed to the monitor and
         # the machine stops, so wait_for_stopped can report the jam.
-        # Under CONTINUE the 6510 silently carries on past the illegal
-        # opcode and that report is unreachable.  No GUI dialog can
-        # block: the monitor takes it.
+        # Under CONTINUE machine_jam returns JAM_NONE (S machine.c:145-150,
+        # actions[0] == -1, falling through to :163) and the core's JAM()
+        # default branch is a bare CLK++ with no PC advance
+        # (S maincpu.c:606-628; opcode $02 reaches it via JAM_02(),
+        # 6510core.c:1242-1249): the 6510 halts in place, silently, and
+        # that report is unreachable.  No GUI dialog can block: the
+        # monitor takes it.
         args += ["-jamaction", "0"]
         args += ["-speed", "100"]        # no ambient speed limit
         args += ["-soundwarpmode", "1"]  # keep emulating SID under warp,
