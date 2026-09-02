@@ -442,10 +442,13 @@ def _sudoers_entry(binary: str) -> str:
 def launch_path(binary: str) -> str:
     """*binary* as an absolute path, resolved the way sudo matches it.
 
-    A bare name must be resolved before it is handed to sudo: sudo looks
-    the command up in ``secure_path``, which on macOS does not include
-    ``/opt/homebrew/bin``, so ``sudo -n x64sc`` fails with "command not
-    found" even where ``x64sc`` runs fine unelevated.
+    A bare name must be resolved before it is handed to sudo: sudoers
+    matches the absolute command path, so a NOPASSWD rule can only ever
+    name one, and Linux sudoers commonly set ``secure_path`` (Ubuntu
+    does), under which ``sudo -n x64sc`` cannot find a binary that lives
+    outside it.  (Stock macOS sets no ``secure_path`` Default --
+    ``sudo -n x64sc -features`` exits 0 there -- so on that platform the
+    resolution serves the rule match, not the lookup.)
 
     A relative path (``./x64sc``) is made absolute against the current
     directory: sudo matches on the absolute command path, and visudo
@@ -469,9 +472,9 @@ def _unelevated_allowed() -> bool:
 
 def _refuse(argv: list[str], binary: str, reason: str) -> ViceElevationRequiredError:
     # The remedy names the *resolved* binary, like ``binary`` and the
-    # sudoers line do: ``sudo x64sc`` fails on macOS because sudo's
-    # secure_path lacks /opt/homebrew/bin, and the three must agree so
-    # the pasted command is the one the pasted rule authorises.
+    # sudoers line do: sudoers matches the absolute command path (and
+    # Linux sudoers commonly set secure_path), and the three must agree
+    # so the pasted command is the one the pasted rule authorises.
     interactive = ["sudo", binary] + argv[1:]
     command = shlex.join(interactive)
     entry = _sudoers_entry(binary)

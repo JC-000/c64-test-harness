@@ -675,8 +675,8 @@ def test_unset_ethernet_bin_is_the_normal_case(tmp_path, monkeypatch):
 # ------------------------------------------- the path sudo actually sees
 
 def test_sudo_wrap_uses_an_absolute_binary(tmp_path, monkeypatch):
-    """``sudo -n x64sc`` would fail: sudo's secure_path does not include
-    /opt/homebrew/bin, so the bare name must be resolved first."""
+    """sudoers matches the absolute command path, and Linux sudoers
+    commonly set secure_path, so the bare name must be resolved first."""
     exe = _fake_x64sc(tmp_path, "x64sc", ethernet=True)
     _as_uid(monkeypatch, 501)
     monkeypatch.setattr(ve.sys, "platform", "darwin")
@@ -913,9 +913,9 @@ def test_a_relative_binary_is_resolved_to_an_absolute_path(tmp_path, monkeypatch
 def test_the_remedy_command_names_the_resolved_binary(tmp_path, monkeypatch):
     """``binary`` and ``sudoers_entry`` already used the resolved path;
     the pasteable ``sudo ...`` command was built from the caller's
-    spelling.  ``sudo x64sc`` fails on macOS (secure_path lacks
-    /opt/homebrew/bin), so the remedy must use the same absolute path
-    the sudoers line names."""
+    spelling.  sudoers matches the absolute command path (and Linux
+    sudoers commonly set secure_path), so the remedy must use the same
+    absolute path the sudoers line names."""
     exe = _fake_x64sc(tmp_path, "x64sc", ethernet=True)
     _as_uid(monkeypatch, 501)
     monkeypatch.setattr(ve.sys, "platform", "darwin")
@@ -946,3 +946,15 @@ def test_the_resolver_hint_names_only_knobs_that_exist(tmp_path):
     assert "HarnessConfig" not in msg
     assert "[vice]" not in msg
     assert "TOML" not in msg
+
+
+def test_a_passwd_retag_after_nopasswd_voids_the_entry(monkeypatch):
+    """``NOPASSWD: PASSWD: /x`` reinstates the prompt for /x.  The parser
+    skips the entry; without that clause it would count as authorised
+    and the unattended launch would hang on a password prompt."""
+    _sudo_listing(
+        monkeypatch,
+        "User x may run the following commands:\n"
+        "    (root) NOPASSWD: PASSWD: /opt/homebrew/bin/x64sc\n",
+    )
+    assert ve.sudo_can_run("/opt/homebrew/bin/x64sc") is False

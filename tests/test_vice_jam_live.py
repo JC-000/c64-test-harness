@@ -37,9 +37,11 @@ def test_a_jam_is_reported_not_timed_out(binary_transport):
     t.set_registers({"PC": JAM_ADDR})
     t.resume()
 
-    # A timeout here means the CPU sailed past the illegal opcode (the
-    # pin is CONTINUE again) or the event was dropped; either is the
-    # defect this test exists to catch, and both fail it.
+    # A timeout here means the CPU halted in place with no event (the pin
+    # is CONTINUE again: machine_jam returns JAM_NONE, S machine.c:145-150,
+    # and JAM()'s default branch is a bare CLK++, S maincpu.c:606-628) or
+    # the event was dropped; either is the defect this test exists to
+    # catch, and both fail it.
     with pytest.raises(TransportError, match="jammed") as excinfo:
         t.wait_for_stopped(timeout=15)
 
