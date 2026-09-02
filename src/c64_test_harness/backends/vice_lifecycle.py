@@ -517,9 +517,19 @@ class ViceProcess:
         # our runs would rewrite their settings file on exit.
         args.append("+saveres")
 
-        # Determinism knobs.  These match VICE's factory values; they are
-        # named explicitly so they stay put if a future VICE changes them.
-        args += ["-jamaction", "1"]      # continue; never block on a dialog
+        # Determinism knobs, named explicitly so they stay put if a future
+        # VICE changes its factory values.
+        #
+        # -jamaction 0 is DIALOG, deliberately *not* the factory 1
+        # (CONTINUE).  VICE emits the 0x61 JAM event only from
+        # monitor_binary_ui_jam_dialog, which machine_jam reaches only
+        # when jam_action == 0 (S machine.c:131-139); with the binary
+        # monitor connected the "dialog" is routed to the monitor and
+        # the machine stops, so wait_for_stopped can report the jam.
+        # Under CONTINUE the 6510 silently carries on past the illegal
+        # opcode and that report is unreachable.  No GUI dialog can
+        # block: the monitor takes it.
+        args += ["-jamaction", "0"]
         args += ["-speed", "100"]        # no ambient speed limit
         args += ["-soundwarpmode", "1"]  # keep emulating SID under warp,
                                          # or render_wav() records silence

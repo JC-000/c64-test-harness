@@ -265,3 +265,23 @@ class TestResolveVicePid:
         mock_run.return_value = MagicMock(stdout="  600     1 bash\n")
         assert proc.resolve_vice_pid() is None
         proc._proc = None
+
+
+# ---------- the JAM action pin ----------
+
+
+@patch("subprocess.Popen")
+def test_jamaction_is_pinned_to_dialog_so_a_jam_reaches_the_monitor(mock_popen):
+    """``-jamaction 0`` (DIALOG), not 1 (CONTINUE).
+
+    VICE only emits the ``0x61`` JAM event from
+    ``monitor_binary_ui_jam_dialog``, which ``machine_jam`` reaches only
+    when ``jam_action == 0`` (S ``machine.c:131-139``).  With the binary
+    monitor connected the "dialog" is routed to the monitor and the
+    machine stops.  Under ``-jamaction 1`` the CPU silently carries on
+    and the JAM-reporting path in ``wait_for_stopped`` is unreachable on
+    every harness launch -- certified by mocks alone.
+    """
+    args = _start_and_capture_args(ViceConfig(), mock_popen)
+    i = args.index("-jamaction")
+    assert args[i + 1] == "0"
