@@ -305,7 +305,7 @@ perform the transition.
 | a slow screen / marginal timeout | the text is normally found in 0–1s against a 15s limit |
 | a checkpoint leaked by an interrupted `jsr()` pinning the CPU | `CHECKPOINT_LIST` reports zero |
 | a lost resume, or monitor nesting needing more exits | 40 acknowledged resumes, no movement |
-| the 6510 jammed on an illegal opcode | `$CF00` holds `584ccde5`, a valid CLI; and **no `0x61` JAM event** in 1328 queued events; and `JAMAction=1` (continue) would have kept the raster advancing anyway (true at capture time; the harness pin is now `0`, under which a jam stops the machine and surfaces as a `TransportError` from `wait_for_stopped` — so a stall captured today would be distinguished from a jam by that error, not by this row) |
+| the 6510 jammed on an illegal opcode | `$CF00` holds `584ccde5`, a valid CLI; and **no `0x61` JAM event** in 1328 queued events; and `JAMAction=1` (continue) would have kept the raster advancing anyway (true at capture time; the harness pin is now `0`, under which a jam stops the machine and surfaces as a `TransportError` from `wait_for_stopped` — so a stall captured today would be distinguished from a jam by that error, not by this row — and **not by the raster either**: measured 2026-09-02, a JAMAction-0 jam pins `LIN`/`CYC` exactly like this stall (`LIN=12 CYC=2` across ten resumes); the poll loop never calls `wait_for_stopped`, so the discriminator is the queued `0x61` event, which `_machine_failure_report` now scans for — see "Mode 2 resolved" below) |
 
 **A CPU-contention experiment was deliberately not run**, and that is a
 choice rather than an omission: with two failure modes sharing one
@@ -468,9 +468,27 @@ CHRGET's `SBC #$30; SEC` at `$0086-$0087` became `22 22`; BRK → `($0316)
 = $FE66` → IOINIT, `CINT` cleared the screen, and the resulting `READY.`
 satisfied the fixture's wait. The test's first typed line then hit opcode
 `$22` (KIL) in CHRGET and the 6510 jammed: one `0x61` event queued, PC
-`$0087`, raster frozen (JAMAction 0 stops the machine). The `$F3` value at
-RTS time is derived (the dump was taken after the warm start), the rest is
-the captured bytes.
+`$0087`. The `$F3` value at RTS time is derived (the dump was taken after
+the warm start), the rest is the captured bytes.
+
+**A JAMAction-0 jam pins the raster — measured, against the source's
+prediction.** Reproduced on 2026-09-02 with the deterministic test driven
+to the jam: `_emulator_is_stalled()` sampled `LIN=12 CYC=2` four times
+across four resumes, and six further resumes 0.3 s apart all read
+`PC=$0087 LIN=12 CYC=2 SP=$F6`, with the `0x61` event queued and CPU
+history ending at `0087 op=22`. The source reads the other way:
+`6510core.c:2481-2484` sets `CPU_IS_JAMMED`, `REWIND_FETCH_OPCODE(CLK)`
+(a no-op in x64sc, `c64cpusc.c:42`) and calls `JAM()`; on the next pass
+`6510core.c:2388-2394` re-fetches the jam opcode (`SET_OPCODE(lastop)`),
+`machine_jam` returns `JAM_NONE` because `is_jammed` (`machine.c:112-114`),
+and `maincpu.c:625-626` does `CLK++` — so a re-executing jam loop *should*
+advance `maincpu_clk` and with it `LIN`/`CYC` (`c64.c:1298-1302`). It does
+not, so after the first `CMD_EXIT` the core is evidently not iterating;
+**why is UNVERIFIED** (the `should_pause_on_exit_mon` path at
+`monitor.c:3325` arms only when the UI is already paused, and was ruled
+out). Consequence for diagnosis: a frozen raster does **not** separate a
+jam from bug 6. The queued `0x61` and a PC sitting on a KIL opcode do,
+and `_machine_failure_report` now checks for them.
 
 Which of the capture shapes listed above this explains: "screen blank but
 for `READY.`" and "PC in zero page" follow from the mechanism — the RTS
