@@ -238,3 +238,78 @@ def test_rx_scenario_rejects_a_wrong_marker():
     with pytest.raises(AssertionError) as ei:
         run_rx_scenario(transport, FakeCapture(), send_delay=0.0, timeout=1.0)
     assert "marker" in str(ei.value).lower()
+
+
+# ---------------------------------------------------------------------------
+# B1: the routines must enable the chip before touching TX/RX
+# ---------------------------------------------------------------------------
+#
+# VICE 3.10 src/core/cs8900.c: reset clears tx_enabled/rx_enabled (:420-421)
+# and only a LineCTL (PP 0x0112) write sets them (:923-931, SerTxON 0x0080 /
+# SerRxON 0x0040; reset LineCTL is 0x0013, both clear).  TxLength acceptance
+# raises Rdy4TxNOW regardless (:969-1002), so a routine that skips the enable
+# polls through, writes all 64 bytes, and :780 `if (!tx_enabled)` drops the
+# frame before rawnet_arch_transmit.  RX: :1060 `if (!rx_enabled)` means RxOK
+# never appears, and reset RxCTL 0x0005 lacks BroadcastA; :594 accepts a
+# broadcast only when promiscuous.  bridge_ping.py and test_ethernet_bridge.py
+# already write RxCTL=0x00D8 and OR 0x00C0 into LineCTL; these routines must
+# too, and before the first TX command / RxEvent poll.
+
+from ethernet_scenarios import rx_routine, tx_routine  # noqa: E402
+
+_PPTR_LO, _PPTR_HI, _PPDATA_LO, _PPDATA_HI = 0x02, 0x03, 0x04, 0x05
+# PPPtr = 0x0104 (RxCTL); PPData = 0x00D8 (PromiscuousA + the value the live
+# bridge path uses).
+RXCTL_WRITE = bytes([
+    0xA9, 0x04, 0x8D, _PPTR_LO, 0xDE, 0xA9, 0x01, 0x8D, _PPTR_HI, 0xDE,
+    0xA9, 0xD8, 0x8D, _PPDATA_LO, 0xDE, 0xA9, 0x00, 0x8D, _PPDATA_HI, 0xDE,
+])
+# PPPtr = 0x0112 (LineCTL); PPData lo |= 0xC0 (SerRxON | SerTxON), read-OR-write
+# so the other LineCTL bits survive.
+LINECTL_OR_C0 = bytes([
+    0xA9, 0x12, 0x8D, _PPTR_LO, 0xDE, 0xA9, 0x01, 0x8D, _PPTR_HI, 0xDE,
+    0xAD, _PPDATA_LO, 0xDE, 0x09, 0xC0, 0x8D, _PPDATA_LO, 0xDE,
+])
+STA_TXCMD_LO = bytes([0x8D, 0x0C, 0xDE])          # first TX command register write
+LDA_RXEVENT_PTR = bytes([0xA9, 0x24, 0x8D, _PPTR_LO, 0xDE])  # PPPtr = 0x0124 (RxEvent)
+
+
+def _index(hay: bytes, needle: bytes, what: str) -> int:
+    i = hay.find(needle)
+    assert i >= 0, f"{what} ({needle.hex()}) not present in routine {hay.hex()}"
+    return i
+
+
+def test_tx_routine_enables_the_chip_before_the_first_tx_command():
+    code = tx_routine()
+    rxctl = _index(code, RXCTL_WRITE, "RxCTL=0x00D8 write")
+    linectl = _index(code, LINECTL_OR_C0, "LineCTL |= 0x00C0 write-back")
+    txcmd = _index(code, STA_TXCMD_LO, "STA TXCMD")
+    assert rxctl < txcmd and linectl < txcmd, (
+        f"chip enable at {rxctl}/{linectl} must precede the TX command at {txcmd}"
+    )
+
+
+def test_rx_routine_enables_the_chip_before_polling_rxevent():
+    code = rx_routine()
+    rxctl = _index(code, RXCTL_WRITE, "RxCTL=0x00D8 write")
+    linectl = _index(code, LINECTL_OR_C0, "LineCTL |= 0x00C0 write-back")
+    poll = _index(code, LDA_RXEVENT_PTR, "PPPtr = RxEvent")
+    assert rxctl < poll and linectl < poll, (
+        f"chip enable at {rxctl}/{linectl} must precede the RxEvent poll at {poll}"
+    )
+
+
+def test_chip_enable_bytes_are_the_bridge_ping_ones_not_a_second_copy():
+    """The inline enable comes from bridge_ping's builders, whose RTS-terminated
+    forms the live bridge tests already exercise; no parallel byte copy."""
+    from c64_test_harness.bridge_ping import (
+        cs8900a_enable_inline_code,
+        cs8900a_rxctl_code,
+        cs8900a_rxctl_inline_code,
+    )
+    inline = cs8900a_enable_inline_code()
+    assert inline.find(RXCTL_WRITE) >= 0 and inline.find(LINECTL_OR_C0) >= 0
+    assert not inline.endswith(b"\x60"), "inline form must not RTS mid-routine"
+    assert cs8900a_rxctl_code() == cs8900a_rxctl_inline_code() + b"\x60"
+    assert tx_routine().startswith(inline) and rx_routine().startswith(inline)
