@@ -1,0 +1,445 @@
+"""Host-side raw ethernet capture and injection, selected by platform.
+
+The ethernet tests need to see the frames a C64 program puts on the wire
+and to put frames on the wire for it to receive.  Linux does that with an
+``AF_PACKET`` socket; macOS has no such family, so until this module
+existed the two TX/RX tests skipped there and the primary bench had no
+host-side proof that emitted frames reach the wire at all (issue #158).
+
+:func:`open_capture` returns a :class:`PacketCapture` for the platform:
+
+* Linux -- :class:`AfPacketCapture`, an ``AF_PACKET``/``SOCK_RAW`` socket
+  bound to the interface.  Needs ``CAP_NET_RAW`` (root).
+* macOS -- :class:`BpfCapture`, a ``/dev/bpf*`` node bound with
+  ``BIOCSETIF``, in immediate + promiscuous mode with
+  ``BIOCSHDRCMPLT`` so injected source MACs are left alone.  Needs a
+  node the process can open: macOS ships ``/dev/bpf0-3`` root-only and
+  creates further nodes on demand *only for root*, so the unelevated
+  path relies on ``sudo chmod o+rw /dev/bpf*`` having been run (the
+  mode does not survive a reboot).  VICE, which the harness runs as
+  root, takes the lowest two free nodes per instance -- the very ones
+  the chmod opened -- so a bench with one VICE up typically has one
+  node left for this module.
+
+When no path is usable, :func:`open_capture` raises
+:class:`CaptureUnavailable` whose message names the remedy verbatim.
+Callers that want to skip a test should skip *with that message*, so the
+operator reads the fix and not a paraphrase.
+
+The BPF read buffer format is parsed by :func:`parse_bpf_records`, kept
+pure so it can be pinned without a device (``tests/test_capture.py``).
+"""
+
+from __future__ import annotations
+
+import errno
+import os
+import platform
+import select
+import socket
+import struct
+import time
+from collections import deque
+from typing import Callable, Protocol, runtime_checkable
+
+__all__ = [
+    "BPF_HDR_SIZE",
+    "AfPacketCapture",
+    "BpfCapture",
+    "BpfParseError",
+    "CaptureTimeout",
+    "CaptureUnavailable",
+    "PacketCapture",
+    "bpf_wordalign",
+    "capture_unavailable_reason",
+    "open_capture",
+    "parse_bpf_records",
+]
+
+#: Largest ethernet frame we expect to hand back (1500 MTU + 14 header + 4 FCS).
+MAX_FRAME = 1518
+
+
+class CaptureUnavailable(RuntimeError):
+    """No host-side capture path is usable on this host for this interface.
+
+    ``remedy`` is the exact command (or ``None``) that would make it
+    usable; ``str(exc)`` already includes it.
+    """
+
+    def __init__(self, message: str, *, remedy: str | None = None) -> None:
+        if remedy:
+            message = f"{message} Remedy: {remedy}"
+        super().__init__(message)
+        self.remedy = remedy
+
+
+class CaptureTimeout(TimeoutError):
+    """No (matching) frame arrived within the deadline."""
+
+
+class BpfParseError(ValueError):
+    """A ``/dev/bpf`` read buffer is not a well-formed run of records."""
+
+
+@runtime_checkable
+class PacketCapture(Protocol):
+    """A bound, open capture on one host interface.
+
+    Frames are whole ethernet frames (dst, src, ethertype, payload).
+    """
+
+    iface: str
+
+    def recv(
+        self,
+        timeout: float,
+        *,
+        match: Callable[[bytes], bool] | None = None,
+    ) -> bytes:
+        """Return the next frame (for which ``match`` is true) or raise
+        :class:`CaptureTimeout`."""
+        ...
+
+    def send(self, frame: bytes) -> None:
+        """Inject *frame* on the interface as-is (source MAC untouched)."""
+        ...
+
+    def close(self) -> None: ...
+
+    def __enter__(self) -> "PacketCapture": ...
+
+    def __exit__(self, *exc) -> None: ...
+
+
+# ---------------------------------------------------------------------------
+# BPF buffer format (pure)
+# ---------------------------------------------------------------------------
+
+#: ``sizeof(struct bpf_hdr)`` with a ``timeval32`` timestamp: 4+4+4+4+2.
+BPF_HDR_SIZE = 18
+_BPF_HDR = struct.Struct("<IIIIH")
+_BPF_ALIGNMENT = 4
+
+
+def bpf_wordalign(n: int) -> int:
+    """``BPF_WORDALIGN(x)`` from ``<net/bpf.h>``: round up to 4."""
+    return (n + (_BPF_ALIGNMENT - 1)) & ~(_BPF_ALIGNMENT - 1)
+
+
+def parse_bpf_records(buf: bytes) -> list[bytes]:
+    """Split one ``read(2)`` result from ``/dev/bpf*`` into captured frames.
+
+    Each record is a ``struct bpf_hdr`` whose ``bh_hdrlen`` says where the
+    frame starts and ``bh_caplen`` how many bytes of it were captured;
+    the next record begins at ``BPF_WORDALIGN(hdrlen + caplen)``.  Any
+    inconsistency -- a header shorter than the struct, a capture longer
+    than the original frame, a record running past the buffer, trailing
+    bytes too short for a header -- raises :class:`BpfParseError` rather
+    than yielding a frame assembled from the wrong bytes.
+    """
+    frames: list[bytes] = []
+    off = 0
+    n = len(buf)
+    while off < n:
+        if n - off < BPF_HDR_SIZE:
+            raise BpfParseError(
+                f"{n - off} trailing byte(s) at offset {off}: shorter than a bpf_hdr"
+            )
+        _sec, _usec, caplen, datalen, hdrlen = _BPF_HDR.unpack_from(buf, off)
+        if hdrlen < BPF_HDR_SIZE:
+            raise BpfParseError(
+                f"bh_hdrlen={hdrlen} at offset {off} is below sizeof(bpf_hdr)={BPF_HDR_SIZE}; "
+                "record boundary is not word-aligned or the buffer is corrupt"
+            )
+        if caplen > datalen:
+            raise BpfParseError(
+                f"bh_caplen={caplen} exceeds bh_datalen={datalen} at offset {off}"
+            )
+        start = off + hdrlen
+        end = start + caplen
+        if end > n:
+            raise BpfParseError(
+                f"record at offset {off} claims {hdrlen}+{caplen} bytes but only "
+                f"{n - off} remain"
+            )
+        frames.append(bytes(buf[start:end]))
+        off += bpf_wordalign(hdrlen + caplen)
+    return frames
+
+
+# ---------------------------------------------------------------------------
+# macOS: /dev/bpf*
+# ---------------------------------------------------------------------------
+
+# <sys/ioccom.h> encoding.  Lengths are the sizeof() of the argument type
+# on a 64-bit Darwin: u_int 4, struct ifreq 32, struct timeval 16.
+_IOC_VOID = 0x20000000
+_IOC_OUT = 0x40000000
+_IOC_IN = 0x80000000
+
+
+def _ioc(inout: int, group: str, num: int, length: int) -> int:
+    return inout | ((length & 0x1FFF) << 16) | (ord(group) << 8) | num
+
+
+BIOCGBLEN = _ioc(_IOC_OUT, "B", 102, 4)
+BIOCFLUSH = _ioc(_IOC_VOID, "B", 104, 0)
+BIOCPROMISC = _ioc(_IOC_VOID, "B", 105, 0)
+BIOCGDLT = _ioc(_IOC_OUT, "B", 106, 4)
+BIOCSETIF = _ioc(_IOC_IN, "B", 108, 32)
+BIOCIMMEDIATE = _ioc(_IOC_IN, "B", 112, 4)
+BIOCSHDRCMPLT = _ioc(_IOC_IN, "B", 117, 4)
+BIOCSSEESENT = _ioc(_IOC_IN, "B", 119, 4)
+
+DLT_EN10MB = 1
+_IFNAMSIZ = 16
+
+#: Highest ``/dev/bpfN`` we will probe.  macOS creates nodes on demand
+#: for root up to ``debug.bpf_maxdevices`` (256); an unprivileged process
+#: stops at the first ENOENT anyway.
+_BPF_MAX_NODES = 256
+
+_CHMOD_REMEDY = "sudo chmod o+rw /dev/bpf*"
+
+
+def _open_node(path: str, flags: int) -> int:
+    """``os.open`` behind a name so tests can substitute node behaviour."""
+    return os.open(path, flags)
+
+
+def _open_first_bpf() -> tuple[int, str]:
+    """Open the lowest ``/dev/bpfN`` this process may, or raise with the remedy."""
+    failures: dict[str, int] = {}
+    for n in range(_BPF_MAX_NODES):
+        path = f"/dev/bpf{n}"
+        try:
+            fd = _open_node(path, os.O_RDWR | os.O_NONBLOCK)
+        except OSError as e:
+            if e.errno == errno.ENOENT:
+                break
+            failures[path] = e.errno
+            continue
+        return fd, path
+    if not failures:
+        raise CaptureUnavailable(
+            "no /dev/bpf* nodes exist on this host (BPF is compiled out or "
+            "devfs is not exposing it); host-side capture is impossible."
+        )
+    counts: dict[str, int] = {}
+    for eno in failures.values():
+        name = errno.errorcode.get(eno, str(eno))
+        counts[name] = counts.get(name, 0) + 1
+    summary = ", ".join(f"{k} x{v}" for k, v in sorted(counts.items()))
+    busy = [p for p, eno in failures.items() if eno == errno.EBUSY]
+    denied = [p for p, eno in failures.items() if eno == errno.EACCES]
+    detail = (
+        f"could not open any of {len(failures)} /dev/bpf* node(s) ({summary})."
+    )
+    if busy:
+        detail += (
+            f" {len(busy)} node(s) are held by other captures (`netstat -B` "
+            "lists holders; a root VICE takes two per instance)."
+        )
+    if denied:
+        detail += (
+            f" {len(denied)} node(s) are root-only, and macOS creates further "
+            "nodes only for root; the chmod mode does not survive a reboot."
+        )
+    raise CaptureUnavailable(detail, remedy=_CHMOD_REMEDY)
+
+
+class BpfCapture:
+    """Capture on and inject into one interface through ``/dev/bpf*`` (macOS)."""
+
+    def __init__(self, iface: str) -> None:
+        self.iface = iface
+        self._fd, self.node = _open_first_bpf()
+        self._pending: deque[bytes] = deque()
+        try:
+            import fcntl
+
+            self._fcntl = fcntl
+            self.buflen = struct.unpack(
+                "I", fcntl.ioctl(self._fd, BIOCGBLEN, struct.pack("I", 0))
+            )[0]
+            # Deliver each packet as it arrives instead of waiting for the
+            # buffer to fill or the read timeout to elapse.
+            fcntl.ioctl(self._fd, BIOCIMMEDIATE, struct.pack("I", 1))
+            # Leave the source MAC of frames we write() untouched.
+            fcntl.ioctl(self._fd, BIOCSHDRCMPLT, struct.pack("I", 1))
+            # Report frames the host itself transmits on the interface too
+            # (the default, made explicit: a VICE pcap_inject on this feth
+            # is an *outgoing* frame from the interface's point of view).
+            fcntl.ioctl(self._fd, BIOCSSEESENT, struct.pack("I", 1))
+            ifr = iface.encode().ljust(_IFNAMSIZ, b"\0") + b"\0" * 16
+            try:
+                fcntl.ioctl(self._fd, BIOCSETIF, ifr)
+            except OSError as e:
+                raise CaptureUnavailable(
+                    f"BIOCSETIF {iface!r} on {self.node} failed: "
+                    f"{errno.errorcode.get(e.errno, e.errno)} {e.strerror}"
+                    + (" (interface does not exist)" if e.errno == errno.ENXIO else "")
+                ) from e
+            self.dlt = struct.unpack(
+                "I", fcntl.ioctl(self._fd, BIOCGDLT, struct.pack("I", 0))
+            )[0]
+            if self.dlt != DLT_EN10MB:
+                raise CaptureUnavailable(
+                    f"{iface} is not an ethernet interface (DLT {self.dlt}, "
+                    f"expected DLT_EN10MB={DLT_EN10MB})"
+                )
+            fcntl.ioctl(self._fd, BIOCPROMISC)
+            fcntl.ioctl(self._fd, BIOCFLUSH)
+        except Exception:
+            os.close(self._fd)
+            raise
+
+    # -- PacketCapture --------------------------------------------------
+
+    def recv(
+        self,
+        timeout: float,
+        *,
+        match: Callable[[bytes], bool] | None = None,
+    ) -> bytes:
+        deadline = time.monotonic() + timeout
+        seen = 0
+        while True:
+            while self._pending:
+                frame = self._pending.popleft()
+                seen += 1
+                if match is None or match(frame):
+                    return frame
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CaptureTimeout(
+                    f"no {'matching ' if match else ''}frame on {self.iface} "
+                    f"({self.node}) within {timeout:.1f}s"
+                    + (f"; {seen} non-matching frame(s) seen" if seen else "")
+                )
+            readable, _, _ = select.select([self._fd], [], [], remaining)
+            if not readable:
+                continue
+            try:
+                buf = os.read(self._fd, self.buflen)
+            except BlockingIOError:
+                continue
+            self._pending.extend(parse_bpf_records(buf))
+
+    def send(self, frame: bytes) -> None:
+        written = os.write(self._fd, frame)
+        if written != len(frame):
+            raise OSError(
+                f"short write to {self.node}: {written} of {len(frame)} bytes"
+            )
+
+    def close(self) -> None:
+        if self._fd >= 0:
+            os.close(self._fd)
+            self._fd = -1
+
+    def __enter__(self) -> "BpfCapture":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+# ---------------------------------------------------------------------------
+# Linux: AF_PACKET
+# ---------------------------------------------------------------------------
+
+_ETH_P_ALL = 0x0003
+
+
+class AfPacketCapture:
+    """Capture on and inject into one interface through ``AF_PACKET`` (Linux)."""
+
+    def __init__(self, iface: str) -> None:
+        self.iface = iface
+        af_packet = getattr(socket, "AF_PACKET", None)
+        if af_packet is None:
+            raise CaptureUnavailable("socket.AF_PACKET does not exist on this platform")
+        try:
+            self._sock = socket.socket(af_packet, socket.SOCK_RAW, socket.htons(_ETH_P_ALL))
+        except PermissionError as e:
+            raise CaptureUnavailable(
+                f"AF_PACKET socket refused ({e.strerror}); needs CAP_NET_RAW.",
+                remedy="run the tests as root, or grant the interpreter "
+                "`sudo setcap cap_net_raw+ep $(readlink -f $(command -v python3))`",
+            ) from e
+        try:
+            self._sock.bind((iface, 0))
+        except OSError as e:
+            self._sock.close()
+            raise CaptureUnavailable(
+                f"AF_PACKET bind to {iface!r} failed: {e.strerror}"
+            ) from e
+
+    def recv(
+        self,
+        timeout: float,
+        *,
+        match: Callable[[bytes], bool] | None = None,
+    ) -> bytes:
+        deadline = time.monotonic() + timeout
+        seen = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CaptureTimeout(
+                    f"no {'matching ' if match else ''}frame on {self.iface} "
+                    f"within {timeout:.1f}s"
+                    + (f"; {seen} non-matching frame(s) seen" if seen else "")
+                )
+            self._sock.settimeout(remaining)
+            try:
+                frame = self._sock.recv(MAX_FRAME)
+            except socket.timeout:
+                continue
+            seen += 1
+            if match is None or match(frame):
+                return frame
+
+    def send(self, frame: bytes) -> None:
+        self._sock.send(frame)
+
+    def close(self) -> None:
+        self._sock.close()
+
+    def __enter__(self) -> "AfPacketCapture":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+# ---------------------------------------------------------------------------
+# Selection
+# ---------------------------------------------------------------------------
+
+
+def open_capture(iface: str) -> PacketCapture:
+    """Open the platform's capture path on *iface* or raise :class:`CaptureUnavailable`."""
+    system = platform.system()
+    if system == "Linux":
+        return AfPacketCapture(iface)
+    if system == "Darwin":
+        return BpfCapture(iface)
+    raise CaptureUnavailable(
+        f"no host-side packet capture implementation for {system}"
+    )
+
+
+def capture_unavailable_reason(iface: str) -> str | None:
+    """``None`` if :func:`open_capture` works right now, else why (with remedy).
+
+    Opens and immediately closes a capture, so it also consumes and
+    releases one BPF node; call it once per module, not per test.
+    """
+    try:
+        open_capture(iface).close()
+    except CaptureUnavailable as e:
+        return str(e)
+    return None
