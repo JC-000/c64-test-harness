@@ -125,8 +125,9 @@ class MemoryArbiter:
         about to overwrite (issue #169).  Pass ``False`` for raw
         allocation over the policy alone — e.g. when the caller *is*
         the harness, or has moved every scratch address via its kwargs
-        and wants the default spots back.  Transient entries (saved and
-        restored around the write, like the REU staging window) are not
+        and wants the default spots back.  Transient entries (prior contents
+        written back afterwards, like the REU staging window — which is
+        still not safe to execute from during the extract) are not
         withheld either way; :meth:`reserve` them explicitly if needed.
 
     Notes

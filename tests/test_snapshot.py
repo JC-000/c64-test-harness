@@ -486,3 +486,50 @@ class TestExtractState:
             assert snap.ram == piecewise
         finally:
             binary_transport.write_memory(0x0000, bytes([0x2F, 0x37]))
+
+
+# ---------------------------------------------------------------------------
+# Issue #169 review S2 — the staging window is clobbered by REC DMA, not by
+# a host write, so MemoryPolicy never sees it.  Warn when the consumer's
+# declared layout overlaps it.
+# ---------------------------------------------------------------------------
+
+
+class TestReuStagingWindowWarning:
+    def test_extract_warns_when_policy_overlaps_staging_window(self) -> None:
+        import warnings as _w
+
+        from c64_test_harness.snapshot import extract_reu_contents
+
+        policy = MemoryPolicy(
+            reserved_regions=(MemoryRegion(0x0801, 0x1000, "consumer PRG"),),
+        )
+        mock = _MockTransport(memory_policy=policy)
+        with pytest.warns(UserWarning, match="staging window") as rec:
+            extract_reu_contents(mock, 0x8000, settle=0)
+        msg = str(rec[0].message)
+        assert "$0801-$0FFF" in msg
+        assert "consumer PRG" in msg
+        assert "execut" in msg  # says the span is not safe to execute from
+
+    def test_extract_is_silent_when_nothing_overlaps(self) -> None:
+        import warnings as _w
+
+        from c64_test_harness.snapshot import extract_reu_contents
+
+        policy = MemoryPolicy(
+            reserved_regions=(MemoryRegion(0xA000, 0xC000, "SHADOW_BSS"),),
+        )
+        mock = _MockTransport(memory_policy=policy)
+        with _w.catch_warnings():
+            _w.simplefilter("error")
+            extract_reu_contents(mock, 0x8000, settle=0)
+
+    def test_extract_is_silent_on_permissive_policy(self) -> None:
+        import warnings as _w
+
+        from c64_test_harness.snapshot import extract_reu_contents
+
+        with _w.catch_warnings():
+            _w.simplefilter("error")
+            extract_reu_contents(_MockTransport(), 0x8000, settle=0)

@@ -171,7 +171,7 @@ the code, the code won (issue #169).
 | `$033C-$0341` | 6 | `sid_player.play_sid_vice` | song trampoline: LDA #song / JSR init / RTS | _SONG_TRAMPOLINE_ADDR constant |
 | `$0360-$036D` | 14 | `execute.run_subroutine (U64 path)` | 14-byte sentinel trampoline; on VICE the 5-byte jsr() trampoline is written here instead | trampoline_addr= |
 | `$03F0-$03F1` | 2 | `execute.run_subroutine (U64 path)` | running / done flag bytes polled by the host | hardcoded |
-| `$0800-$87FF` † | 32768 | `snapshot.extract_reu_contents` | 32 KiB REU→C64 DMA staging window (opt-in include_reu=True, override="reu-snapshot-staging"); contents saved before and restored after | hardcoded |
+| `$0800-$87FF` † | 32768 | `snapshot.extract_reu_contents` | 32 KiB REU→C64 DMA staging window (opt-in include_reu=True, override="reu-snapshot-staging"). Filled by REC DMA with the CPU running (unpaused is mandatory on hardware) — MemoryPolicy cannot see the fill; prior contents written back afterwards, but code executing there meanwhile runs REU data | hardcoded |
 | `$C000-$C011` | 18 | `sid_player.play_sid_vice` | 18-byte IRQ installer + wrapper stub | stub_addr= (DEFAULT_STUB_ADDR) |
 | `$C000-$C03F` | 64 | `bridge_ping.run_ping_and_wait / run_icmp_responder` | 64-byte CS8900a RX peek routine | peek_addr= |
 | `$C000-$C3FF` | 1024 | `uci_network._execute_uci_routine / build_uci_command` | UCI stub block: code $C000, data $C100, response $C200, status $C300, lengths $C3F0-$C3F3, sentinel $C3FE, error $C3FF | code_addr= for the routine; buffers hardcoded |
@@ -181,7 +181,7 @@ the code, the code won (issue #169).
 | `$C500-$C87D` | 894 | `uci_network.uci_socket_write` | data buffer (up to 892 bytes) followed by the 2-byte LE length | hardcoded |
 | `$CF00-$CF03` | 4 | `tests/test_vice_core.py::_restore_basic (also scripts/vice_keyecho_probe.py + scripts/vice_stall_probe.py)` | CLI; JMP $E5CD stub returning the CPU to BASIC MAINLOOP before every screen/keyboard test — test-suite scratch, not library | hardcoded |
 
-† *transient* — the harness reads the prior contents first and writes them back afterwards. Declared (it is still a write) but not withheld by `MemoryArbiter` by default.
+† *transient* — the prior contents are written back afterwards (best-effort for the liveness probe: only on success). It does NOT mean the span is safe to execute from while the operation runs: the REU window is filled by REC DMA with the CPU live and `MemoryPolicy` cannot see that fill; `extract_reu_contents` warns when the transport's policy declares RAM inside it. Declared like every other write, but not withheld by `MemoryArbiter` by default.
 <!-- END HARNESS_SCRATCH TABLE -->
 
 Reading the table:
@@ -205,7 +205,19 @@ Reading the table:
   scripts poke it.
 * `backends.ultimate64_probe.liveness_probe` issues its 128-byte write
   through the raw REST client, so the transport-level policy never
-  sees it.  It restores the original bytes, hence *transient*.
+  sees it.  It writes the original bytes back on success (the readback-
+  failure branches leave the pattern in place), hence *transient*.
+* *Transient* is a narrow promise: the prior bytes are written back
+  afterwards.  It does **not** mean the span is safe to execute from
+  while the operation runs.  The REU staging window is the sharp case:
+  `extract_reu_contents` fills `$0800-$87FF` by REC DMA — the host only
+  programs `$DF01-$DF0A`, so `MemoryPolicy` never sees the clobber —
+  with the CPU running (unpaused is mandatory on Ultimate hardware,
+  see `docs/snapshot_interop.md`).  A program executing from
+  `$0801-$87FF` runs REU data during the extract, and the write-back
+  does not undo PC/stack/side effects.  `extract_reu_contents` emits a
+  `UserWarning` when the transport's policy declares a region inside
+  the window; stop the program or keep it out of the window first.
 
 `MemoryPolicy.from_prg()` warns at construction when the load image
 overlaps a non-transient entry — the collision would otherwise surface

@@ -58,9 +58,14 @@ def render_table(regions: tuple[ScratchRegion, ...] = HARNESS_SCRATCH) -> str:
     if any_transient:
         lines.append("")
         lines.append(
-            "† *transient* — the harness reads the prior contents first and "
-            "writes them back afterwards. Declared (it is still a write) but "
-            "not withheld by `MemoryArbiter` by default."
+            "† *transient* — the prior contents are written back afterwards "
+            "(best-effort for the liveness probe: only on success). It does "
+            "NOT mean the span is safe to execute from while the operation "
+            "runs: the REU window is filled by REC DMA with the CPU live and "
+            "`MemoryPolicy` cannot see that fill; `extract_reu_contents` "
+            "warns when the transport's policy declares RAM inside it. "
+            "Declared like every other write, but not withheld by "
+            "`MemoryArbiter` by default."
         )
     return "\n".join(lines)
 

@@ -209,9 +209,13 @@ class ScratchRegion:
     ``end`` is exclusive, like :class:`MemoryRegion`.  ``owner`` is the
     dotted path of the writer; ``configurable`` names the kwarg or
     constant that moves the address (``"hardcoded"`` when nothing
-    does).  ``transient`` marks spans whose prior contents are saved
-    first and restored afterwards — still a write, so still declared,
-    but not withheld from allocation by default.
+    does).  ``transient`` means the prior contents are written back
+    afterwards — nothing more.  It does NOT mean the span is safe to
+    execute from while the operation runs (the REU staging window is
+    filled by REC DMA with the CPU live, and the liveness probe only
+    restores on success), and it does not undo side effects of code
+    that ran there meanwhile.  Transient spans are declared like every
+    other write but not withheld from allocation by default.
     """
 
     start: int
@@ -325,8 +329,11 @@ HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
         0x0800, 0x8800,
         owner="snapshot.extract_reu_contents",
         purpose="32 KiB REU→C64 DMA staging window (opt-in "
-                "include_reu=True, override=\"reu-snapshot-staging\"); "
-                "contents saved before and restored after",
+                "include_reu=True, override=\"reu-snapshot-staging\"). "
+                "Filled by REC DMA with the CPU running (unpaused is "
+                "mandatory on hardware) — MemoryPolicy cannot see the "
+                "fill; prior contents written back afterwards, but code "
+                "executing there meanwhile runs REU data",
         configurable="hardcoded",
         transient=True,
     ),
@@ -394,10 +401,11 @@ def harness_scratch_regions(
 ) -> tuple[MemoryRegion, ...]:
     """``HARNESS_SCRATCH`` as :class:`MemoryRegion` objects.
 
-    Transient spans (saved and restored around the write, e.g. the
+    Transient spans (prior contents written back afterwards, e.g. the
     32 KiB REU staging window) are omitted unless ``include_transient``
     is set — reserving them by default would withhold half the address
-    space for a window that is put back the way it was found.
+    space for a window whose bytes are put back afterwards.  "Written
+    back" is all transient promises; see :class:`ScratchRegion`.
     """
     return tuple(
         r.region for r in HARNESS_SCRATCH
@@ -618,9 +626,9 @@ class MemoryPolicy:
         result means a harness write into that scratch will raise
         :class:`MemoryPolicyError` under this policy — the consumer
         should relocate the program or pass the harness the kwarg named
-        in ``scratch_entry.configurable``.  Transient entries (saved and
-        restored around the write) are omitted unless requested, since
-        the 32 KiB REU staging window overlaps nearly every PRG.
+        in ``scratch_entry.configurable``.  Transient entries (prior
+        contents written back afterwards) are omitted unless requested,
+        since the 32 KiB REU staging window overlaps nearly every PRG.
         """
         pairs: list[tuple[MemoryRegion, ScratchRegion]] = []
         for reserved in self.reserved_regions:
