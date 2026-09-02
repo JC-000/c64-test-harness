@@ -451,3 +451,16 @@ def test_af_packet_capture_opens_eth_p_all_and_binds_the_interface(monkeypatch):
         cap.send(TEST_FRAME)
         assert sock.sent == [TEST_FRAME]
     assert sock.closed
+
+
+# ---------------------------------------------------------------------------
+# S4: one open per test, no separate probe cycle
+# ---------------------------------------------------------------------------
+
+
+def test_no_separate_availability_probe_exists():
+    """The fixture opens the capture once and acts on its exception.  A
+    probe-then-open pair costs two full BPF setup cycles per test and can
+    disagree with itself when the pool changes in between."""
+    assert not hasattr(capture_mod, "capture_unavailable_reason")
+    assert "capture_unavailable_reason" not in capture_mod.__all__
