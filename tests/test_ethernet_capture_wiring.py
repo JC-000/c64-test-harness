@@ -629,3 +629,22 @@ def test_jsr_timeout_reports_pc_disassembly_io_window_and_routine_bytes():
     assert "$DE00: 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f" in msg
     # First bytes of the routine as loaded, so a clobbered opcode is visible.
     assert "code@$C000: 00 01 de 09" in msg
+
+
+def test_rx_scenario_timeout_carries_the_same_cpu_report():
+    """run_rx_scenario drives its own trampoline (the send has to overlap the
+    poll), so it must not lose the report binary_jsr gives.  Live 2026-09-02:
+    RX timed out and the message said only "No stopped event within 15.0s"."""
+    def spinning(ram: bytearray) -> None:
+        ram[0xDE00:0xDE10] = bytes(range(0x20, 0x30))
+
+    transport = HangingTransport(pc=0xC02A, on_resume=spinning)
+    with pytest.raises(AssertionError) as ei:
+        run_rx_scenario(transport, FakeCapture(), send_delay=0.0, timeout=1.0)
+    msg = str(ei.value)
+    assert "6502 did not return from $C000 within 1.0s" in msg
+    assert "PC=$C02A" in msg
+    assert "$DE00: 20 21 22 23 24 25 26 27 28 29 2a 2b 2c 2d 2e 2f" in msg
+    assert "> C02A" in msg
+    # The host send happened (or its failure is reported) before the CPU verdict.
+    assert "host wrote 64 bytes to fake0" in msg
