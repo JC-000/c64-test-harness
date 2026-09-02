@@ -325,10 +325,15 @@ def _open_first_bpf() -> tuple[int, str]:
             "nodes only for root; the chmod mode does not survive a reboot."
         )
     # Any EBUSY means a node this uid may open exists and is merely held:
-    # a present path, not an absent one.  Only "every node denied" is absence.
-    raise CaptureUnavailable(
-        detail, remedy=_CHMOD_REMEDY, cause="busy" if busy else "denied"
-    )
+    # a present path, not an absent one.  Only "every node denied" is
+    # absence; any other errno is unclassified and treated as broken.
+    if busy:
+        cause = "busy"
+    elif len(denied) == len(failures):
+        cause = "denied"
+    else:
+        cause = "unknown"
+    raise CaptureUnavailable(detail, remedy=_CHMOD_REMEDY, cause=cause)
 
 
 class BpfCapture:
@@ -518,7 +523,7 @@ class BpfDescriptor:
     recv: int
     written: int
     command: str
-    pid: int
+    pid: int | None
 
 
 def _run_netstat_B() -> str | None:
@@ -561,15 +566,21 @@ def bpf_descriptors(iface: str | None = None) -> list[BpfDescriptor]:
             continue
         if iface is not None and fields[1] != iface:
             continue
-        command, _, pid = fields[-1].rpartition(".")
+        # "<name>.<pid>"; names may contain dots, so split from the right.
+        # A command with no ".<pid>" suffix is kept with pid=None rather
+        # than dropped -- a dropped row would read as "no descriptors".
+        command, dot, pid = fields[-1].rpartition(".")
+        pid_val: int | None = int(pid) if (dot and pid.isdigit()) else None
+        if pid_val is None:
+            command = fields[-1]
         try:
-            rows.append(BpfDescriptor(
-                device=fields[0], netif=fields[1],
-                recv=int(fields[i_recv]), written=int(fields[i_written]),
-                command=command, pid=int(pid),
-            ))
+            recv, written = int(fields[i_recv]), int(fields[i_written])
         except ValueError:
             continue
+        rows.append(BpfDescriptor(
+            device=fields[0], netif=fields[1], recv=recv, written=written,
+            command=command, pid=pid_val,
+        ))
     return rows
 
 
@@ -582,7 +593,9 @@ def bpf_descriptor_summary(iface: str | None = None) -> str:
     if not rows:
         return f"{label}: no BPF descriptors bound"
     return f"{label}: " + "; ".join(
-        f"{r.device} Recv={r.recv} Written={r.written} {r.command}.{r.pid}" for r in rows
+        f"{r.device} Recv={r.recv} Written={r.written} "
+        + (f"{r.command}.{r.pid}" if r.pid is not None else r.command)
+        for r in rows
     )
 
 
