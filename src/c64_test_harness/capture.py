@@ -45,6 +45,11 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Protocol, runtime_checkable
 
+try:  # POSIX only; absent on Windows, where no backend exists anyway
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover
+    _fcntl = None
+
 __all__ = [
     "BPF_HDR_SIZE",
     "AfPacketCapture",
@@ -218,9 +223,38 @@ _BPF_MAX_NODES = 256
 _CHMOD_REMEDY = "sudo chmod o+rw /dev/bpf*"
 
 
+# The BPF backend reaches the kernel only through these names, so a unit
+# test can stand in a fake kernel and check the exact ioctl sequence and
+# arguments without a device (tests/test_capture.py).
+
+
 def _open_node(path: str, flags: int) -> int:
     """``os.open`` behind a name so tests can substitute node behaviour."""
     return os.open(path, flags)
+
+
+def _close_node(fd: int) -> None:
+    os.close(fd)
+
+
+def _ioctl(fd: int, request: int, arg=None):
+    if _fcntl is None:  # pragma: no cover
+        raise CaptureUnavailable("fcntl is unavailable on this platform")
+    if arg is None:
+        return _fcntl.ioctl(fd, request)
+    return _fcntl.ioctl(fd, request, arg)
+
+
+def _read(fd: int, n: int) -> bytes:
+    return os.read(fd, n)
+
+
+def _write(fd: int, data: bytes) -> int:
+    return os.write(fd, data)
+
+
+def _select(rlist, wlist, xlist, timeout):
+    return select.select(rlist, wlist, xlist, timeout)
 
 
 def _open_first_bpf() -> tuple[int, str]:
@@ -272,24 +306,22 @@ class BpfCapture:
         self._fd, self.node = _open_first_bpf()
         self._pending: deque[bytes] = deque()
         try:
-            import fcntl
-
-            self._fcntl = fcntl
             self.buflen = struct.unpack(
-                "I", fcntl.ioctl(self._fd, BIOCGBLEN, struct.pack("I", 0))
+                "I", _ioctl(self._fd, BIOCGBLEN, struct.pack("I", 0))
             )[0]
             # Deliver each packet as it arrives instead of waiting for the
             # buffer to fill or the read timeout to elapse.
-            fcntl.ioctl(self._fd, BIOCIMMEDIATE, struct.pack("I", 1))
+            _ioctl(self._fd, BIOCIMMEDIATE, struct.pack("I", 1))
             # Leave the source MAC of frames we write() untouched.
-            fcntl.ioctl(self._fd, BIOCSHDRCMPLT, struct.pack("I", 1))
+            _ioctl(self._fd, BIOCSHDRCMPLT, struct.pack("I", 1))
             # Report frames the host itself transmits on the interface too
             # (the default, made explicit: a VICE pcap_inject on this feth
             # is an *outgoing* frame from the interface's point of view).
-            fcntl.ioctl(self._fd, BIOCSSEESENT, struct.pack("I", 1))
+            _ioctl(self._fd, BIOCSSEESENT, struct.pack("I", 1))
+            # struct ifreq: char ifr_name[IFNAMSIZ=16] + a 16-byte union.
             ifr = iface.encode().ljust(_IFNAMSIZ, b"\0") + b"\0" * 16
             try:
-                fcntl.ioctl(self._fd, BIOCSETIF, ifr)
+                _ioctl(self._fd, BIOCSETIF, ifr)
             except OSError as e:
                 raise CaptureUnavailable(
                     f"BIOCSETIF {iface!r} on {self.node} failed: "
@@ -297,17 +329,19 @@ class BpfCapture:
                     + (" (interface does not exist)" if e.errno == errno.ENXIO else "")
                 ) from e
             self.dlt = struct.unpack(
-                "I", fcntl.ioctl(self._fd, BIOCGDLT, struct.pack("I", 0))
+                "I", _ioctl(self._fd, BIOCGDLT, struct.pack("I", 0))
             )[0]
             if self.dlt != DLT_EN10MB:
                 raise CaptureUnavailable(
                     f"{iface} is not an ethernet interface (DLT {self.dlt}, "
                     f"expected DLT_EN10MB={DLT_EN10MB})"
                 )
-            fcntl.ioctl(self._fd, BIOCPROMISC)
-            fcntl.ioctl(self._fd, BIOCFLUSH)
+            # Promiscuous mode is a property of the bound interface: after SETIF.
+            _ioctl(self._fd, BIOCPROMISC)
+            _ioctl(self._fd, BIOCFLUSH)
         except Exception:
-            os.close(self._fd)
+            _close_node(self._fd)
+            self._fd = -1
             raise
 
     # -- PacketCapture --------------------------------------------------
@@ -334,17 +368,17 @@ class BpfCapture:
                     + (f"; {seen} non-matching frame(s) seen" if seen else ""),
                     seen=seen,
                 )
-            readable, _, _ = select.select([self._fd], [], [], remaining)
+            readable, _, _ = _select([self._fd], [], [], remaining)
             if not readable:
                 continue
             try:
-                buf = os.read(self._fd, self.buflen)
+                buf = _read(self._fd, self.buflen)
             except BlockingIOError:
                 continue
             self._pending.extend(parse_bpf_records(buf))
 
     def send(self, frame: bytes) -> None:
-        written = os.write(self._fd, frame)
+        written = _write(self._fd, frame)
         if written != len(frame):
             raise OSError(
                 f"short write to {self.node}: {written} of {len(frame)} bytes"
@@ -352,7 +386,7 @@ class BpfCapture:
 
     def close(self) -> None:
         if self._fd >= 0:
-            os.close(self._fd)
+            _close_node(self._fd)
             self._fd = -1
 
     def __enter__(self) -> "BpfCapture":
