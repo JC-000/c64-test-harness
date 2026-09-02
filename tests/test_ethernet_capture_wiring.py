@@ -375,3 +375,71 @@ def test_present_but_broken_path_fails_with_the_remedy(cause):
     assert verdict == "fail"
     assert "feth0" in reason and "sudo chmod o+rw /dev/bpf*" in reason
     assert "not absence" in reason
+
+
+# ---------------------------------------------------------------------------
+# S5: the peer-interface knob, so a live direction fault can be pivoted on
+# ---------------------------------------------------------------------------
+#
+# feth0 and feth1 are a peer pair (the interface listing shows feth0 with
+# "peer: feth1").  A frame VICE injects on feth0 is *outgoing* there and
+# *incoming* on feth1; a frame the host writes to feth0's BPF emerges from
+# feth1.  The default binds everything to the VICE interface and relies on
+# BIOCSSEESENT for TX and the driver's tap on the write path for RX.  If
+# the live TX run fails with VICE's descriptor showing Written=1, that
+# assumption is wrong and the capture must bind the peer instead --
+# without a code change.
+
+from ethernet_scenarios import resolve_capture_ifaces  # noqa: E402
+
+
+class PeerCapture(FakeCapture):
+    iface = "peer0"
+
+
+def test_rx_scenario_sends_through_send_capture_when_given():
+    transport = FakeTransport(on_resume=_c64_receives_marker)
+    cap, peer = FakeCapture(), PeerCapture()
+
+    run_rx_scenario(transport, cap, send_capture=peer, send_delay=0.0, timeout=1.0)
+
+    assert peer.sent == [RX_FRAME]
+    assert cap.sent == [], "the frame must go out exactly once, on the send capture"
+
+
+def test_rx_failure_names_the_interface_the_frame_was_written_to(monkeypatch):
+    import ethernet_scenarios
+    monkeypatch.setattr(ethernet_scenarios, "bpf_descriptor_summary", lambda iface=None: f"ns[{iface}]")
+    transport = FakeTransport(on_resume=_c64_poll_times_out)
+    with pytest.raises(AssertionError) as ei:
+        run_rx_scenario(transport, FakeCapture(), send_capture=PeerCapture(), send_delay=0.0, timeout=1.0)
+    msg = str(ei.value)
+    assert "after the host wrote 64 bytes to peer0" in msg
+    # Counters for both sides: where we wrote, and where VICE listens.
+    assert "ns[peer0]" in msg and "ns[fake0]" in msg
+
+
+def test_rx_scenario_defaults_to_sending_on_the_capture_itself():
+    transport = FakeTransport(on_resume=_c64_receives_marker)
+    cap = FakeCapture()
+    run_rx_scenario(transport, cap, send_delay=0.0, timeout=1.0)
+    assert cap.sent == [RX_FRAME]
+
+
+def test_resolve_capture_ifaces_defaults_to_the_vice_interface():
+    assert resolve_capture_ifaces("feth0", {}) == ("feth0", "feth0")
+
+
+def test_resolve_capture_ifaces_reads_the_two_env_knobs():
+    env = {"C64_ETH_CAPTURE_IFACE": "feth1"}
+    assert resolve_capture_ifaces("feth0", env) == ("feth1", "feth1"), (
+        "the send side follows the capture side unless overridden separately"
+    )
+    env = {"C64_ETH_CAPTURE_IFACE": "feth1", "C64_ETH_SEND_IFACE": "feth0"}
+    assert resolve_capture_ifaces("feth0", env) == ("feth1", "feth0")
+    env = {"C64_ETH_SEND_IFACE": "feth1"}
+    assert resolve_capture_ifaces("feth0", env) == ("feth0", "feth1")
+
+
+def test_resolve_capture_ifaces_ignores_blank_values():
+    assert resolve_capture_ifaces("feth0", {"C64_ETH_CAPTURE_IFACE": "  "}) == ("feth0", "feth0")
