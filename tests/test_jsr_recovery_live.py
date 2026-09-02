@@ -20,6 +20,7 @@ from __future__ import annotations
 import pytest
 
 from c64_test_harness.execute import RoutineHung, jsr, load_code
+from c64_test_harness.screen import wait_for_text
 from c64_test_harness.transport import TimeoutError
 
 pytestmark = pytest.mark.vice_live
@@ -31,6 +32,7 @@ pytestmark = pytest.mark.vice_live
 COUNTER_ADDR = 0xC000
 HANG_ADDR = 0xC100
 INC_ADDR = 0xC110
+SETTLE_ADDR = 0xC120
 
 #: Default trampoline: JSR at $0334, breakpoint on the NOP at $0337.
 POST_RTS_LANDING = 0x0337
@@ -41,6 +43,24 @@ I_FLAG = 0x04
 
 def test_hung_routine_is_recovered_and_the_next_call_runs(binary_transport):
     t = binary_transport
+
+    # Let the machine finish booting.  Nothing before this point waited
+    # for it: ViceProcess.start does not wait for boot, and the fixture's
+    # first monitor command halted the machine at the next vsync -- which
+    # can be mid-KERNAL-reset, ~25 frames under SEI before its final CLI.
+    # wait_for_text resumes the CPU between screen reads.
+    t.resume()
+    assert wait_for_text(t, "READY.", timeout=15.0, poll_interval=0.2,
+                         verbose=False) is not None, "C64 never reached READY."
+
+    # Then settle into a known register state.  wait_for_text leaves the
+    # CPU halted at a vsync trap, which now and then lands inside the IRQ
+    # handler with I set; jsr() would capture that FL and recovery would
+    # faithfully restore it, flaking the I-clear checks below.  A trivial
+    # CLI; RTS through the trampoline leaves the CPU halted at the
+    # checkpoint with I deterministically clear.
+    load_code(t, SETTLE_ADDR, [0x58, 0x60])
+    assert jsr(t, SETTLE_ADDR, timeout=5.0)["PC"] == POST_RTS_LANDING
 
     # SEI; JMP * -- an infinite loop that never RTSes.  The SEI is what
     # makes hung_pc deterministic: the monitor pauses at the next
