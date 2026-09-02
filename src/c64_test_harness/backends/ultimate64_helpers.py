@@ -340,6 +340,19 @@ def set_turbo_mhz(client: Ultimate64Client, mhz: int | None) -> None:
 def get_reu_config(client: Ultimate64Client) -> tuple[bool, str]:
     """Return ``(enabled, size_str)`` describing current REU state.
 
+    Plain, uncached read of the config store. Live-verified on U64E fw
+    3.15 (issue #168): ``REU Size`` is stable across quiet reads, reflects
+    a :func:`set_reu` write immediately (no reset needed), and is not moved
+    by the ``Cartridge`` item — so a size that differs between two reads
+    means something wrote the config in between (another lane's
+    ``set_reu``/``restore_state``, ``load_config_from_flash``,
+    ``reset_config_to_default`` — the item's default is ``"2 MB"``). Read
+    it when you need it; don't hold it across other config writes. See
+    ``tests/test_reu_size_readback_live.py``.
+
+    ``enabled`` is ``True`` only for ``"Enabled"``; the U64E's third
+    ``RAM Expansion Unit`` value, ``"GeoRAM Mode"``, reads as ``False``.
+
     :param client: Connected Ultimate64 client.
     :returns: Tuple of (enabled bool, REU Size enum string). Size is
         whatever the device currently reports, even when REU is disabled.
