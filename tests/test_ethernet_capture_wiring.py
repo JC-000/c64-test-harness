@@ -727,12 +727,17 @@ def test_rx_timeout_report_fires_for_the_transports_own_timeout_error():
 #
 # `.skip: LDA $DE08 / LDA $DE09 / DEX / BNE .skip` is 9 bytes, so the branch
 # back is -9.  The routine (inherited from the original test) had -8, which
-# lands on the `$08` operand byte = PHP: six iterations push six bytes, RTS
-# pops garbage, and the CPU ends up in BASIC's READY loop instead of at the
-# trampoline's checkpoint.  The wire was fine (VICE's descriptor Recv went
-# 1 -> 2), the reads were fine (bisect: 34 straight RTDATA word reads return
-# to the checkpoint), the loop was not.  Pinned generally: every branch in
-# both routines lands on an instruction boundary inside the routine.
+# lands on .skip+1, the `$08` operand byte.  Decoded from there the stream
+# is `08 PHP / DE AD 09 DEC $09AD,X / DE CA D0 DEC $D0CA,X / F8 SED`, eight
+# bytes, after which execution falls into the marker reads: the BNE is
+# never reached again.  So exactly one push, one header word skipped (the
+# marker reads return the frame's first bytes, FF FF FF FF), RESULT+4 set,
+# and RTS pops P/retlo as PCL/PCH -- the CPU ends up in BASIC's READY loop
+# instead of at the trampoline's checkpoint.  The wire was fine (VICE's
+# descriptor Recv went 1 -> 2), the reads were fine (bisect: 34 straight
+# RTDATA word reads return to the checkpoint), the loop was not.  Pinned
+# generally: every branch in both routines lands on an instruction
+# boundary inside the routine.
 
 from c64_test_harness.disasm import disassemble  # noqa: E402
 
@@ -848,3 +853,4 @@ def test_n1_enable_inline_code_starts_with_the_clockport_enable():
     would silently change that blob.  (Passes today -- a pin, not a drive.)"""
     from c64_test_harness.bridge_ping import cs8900a_enable_inline_code
     assert cs8900a_enable_inline_code()[:8] == bytes([0xAD, 0x01, 0xDE, 0x09, 0x01, 0x8D, 0x01, 0xDE])
+

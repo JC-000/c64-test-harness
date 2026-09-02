@@ -375,8 +375,12 @@ def rx_routine() -> bytes:
         0xAD, rtd_h_lo, 0xDE,
         0xCA,
         0xD0, 0xF7,  # BNE -9 -> .skip (LDA abs 3 + LDA abs 3 + DEX 1 + BNE 2 = 9 bytes).
-                     # The inherited -8 landed on the $08 operand byte = PHP,
-                     # pushing a byte per iteration; RTS then popped garbage.
+                     # The inherited -8 landed on .skip+1, the $08 operand byte, and
+                     # from there the CPU decoded 08 PHP / DE AD 09 DEC $09AD,X /
+                     # DE CA D0 DEC $D0CA,X / F8 SED and fell straight into the
+                     # marker reads: the BNE was never reached again.  One push, one
+                     # header word skipped, RESULT+4 set, then RTS popped P/retlo as
+                     # PCL/PCH -- and the CPU landed in BASIC.
 
         # Read 4 marker bytes (2 word reads) -> RESULT+0..+3
         0xAD, rtd_lo, 0xDE,
