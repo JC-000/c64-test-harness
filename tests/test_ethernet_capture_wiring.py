@@ -512,3 +512,112 @@ def test_rx_scenario_fails_when_the_host_send_never_returns():
         assert "did not return" in str(ei.value) and "fake0" in str(ei.value)
     finally:
         cap.release.set()
+
+
+# ---------------------------------------------------------------------------
+# Live failure 2026-09-01: the 6502 never returned from the TX routine
+# ---------------------------------------------------------------------------
+#
+# run_tx_scenario did load_code(CODE_BASE, ...) and then write_bytes(0xC000,
+# [0]) to "clear the success flag" -- but CODE_BASE *is* 0xC000, so that
+# zeroed the routine's first opcode into BRK.  The KERNAL BRK handler warm-
+# starts BASIC and the trampoline's breakpoint is never reached:
+# wait_for_stopped timed out after 10 s and nothing downstream (capture,
+# netstat -B counters) was ever consulted.  The RX scenario had the same
+# collision over five bytes.  Both were inherited from the original test.
+#
+# Two rules, pinned here: results live in DATA_BASE and no host write may
+# land inside the loaded routine; and when a JSR does not return, the
+# failure text must say where the CPU is (PC, the instruction window
+# there, the CS8900a I/O window, and the first routine bytes), so this
+# class of hang is diagnosed from the message rather than by re-running.
+
+from ethernet_scenarios import DATA_BASE, rx_routine as _rx_routine, tx_routine as _tx_routine  # noqa: E402
+
+
+class RecordingTransport(FakeTransport):
+    """FakeTransport that logs every write_memory(addr, data) in order."""
+
+    def __init__(self, on_resume=None) -> None:
+        super().__init__(on_resume)
+        self.writes: list[tuple[int, bytes]] = []
+
+    def write_memory(self, addr: int, data) -> None:
+        self.writes.append((addr, bytes(data)))
+        super().write_memory(addr, data)
+
+
+def _writes_inside_code_after_load(transport: RecordingTransport, code: bytes) -> list[tuple[int, bytes]]:
+    loaded_at = next(i for i, (a, d) in enumerate(transport.writes) if a == CODE_BASE and d == code)
+    lo, hi = CODE_BASE, CODE_BASE + len(code)
+    return [(a, d) for a, d in transport.writes[loaded_at + 1:] if a < hi and a + len(d) > lo]
+
+
+def test_tx_scenario_never_writes_over_the_loaded_routine():
+    seen_first_bytes: list[bytes] = []
+
+    def c64(ram: bytearray) -> None:
+        seen_first_bytes.append(bytes(ram[CODE_BASE:CODE_BASE + 3]))
+        ram[DATA_BASE] = 0x01
+
+    transport = RecordingTransport(on_resume=c64)
+    run_tx_scenario(transport, FakeCapture([FRAME_DATA]), timeout=0.01)
+    assert _writes_inside_code_after_load(transport, _tx_routine()) == []
+    assert seen_first_bytes == [_tx_routine()[:3]], "the first opcode must be intact at JSR time"
+
+
+def test_rx_scenario_never_writes_over_the_loaded_routine():
+    seen_first_bytes: list[bytes] = []
+
+    def c64(ram: bytearray) -> None:
+        seen_first_bytes.append(bytes(ram[CODE_BASE:CODE_BASE + 3]))
+        ram[DATA_BASE:DATA_BASE + 4] = RX_MARKER
+        ram[DATA_BASE + 4] = 0x01
+
+    transport = RecordingTransport(on_resume=c64)
+    run_rx_scenario(transport, FakeCapture(), send_delay=0.0, timeout=1.0)
+    assert _writes_inside_code_after_load(transport, _rx_routine()) == []
+    assert seen_first_bytes == [_rx_routine()[:3]]
+
+
+def test_routines_store_results_in_data_base_not_in_their_own_page():
+    for code in (_tx_routine(), _rx_routine()):
+        # STA $C0xx (8D xx C0) anywhere in the routine would be a self-overwrite.
+        for i in range(len(code) - 2):
+            assert not (code[i] == 0x8D and code[i + 2] == (CODE_BASE >> 8)), (
+                f"STA into the code page at offset {i}: {code[i:i+3].hex()}"
+            )
+    assert DATA_BASE >> 8 != CODE_BASE >> 8
+
+
+class HangingTransport(FakeTransport):
+    """The CPU never reaches the breakpoint; registers say where it is."""
+
+    def __init__(self, pc: int) -> None:
+        super().__init__()
+        self._pc = pc
+
+    def wait_for_stopped(self, timeout: float = 0.0) -> None:
+        raise TimeoutError(f"No stopped event within {timeout}s")
+
+    def read_registers(self) -> dict[str, int]:
+        return {"PC": self._pc, "A": 0x12, "X": 0x00, "Y": 0x40, "SP": 0xF6}
+
+
+def test_jsr_timeout_reports_pc_disassembly_io_window_and_routine_bytes():
+    transport = HangingTransport(pc=0xC003)
+    transport.ram[0xC000:0xC00B] = bytes([0x00, 0x01, 0xDE, 0x09, 0x01, 0x8D, 0x01, 0xDE, 0xF0, 0xF9, 0x60])
+    transport.ram[0xDE00:0xDE10] = bytes(range(0x10, 0x20))
+
+    with pytest.raises(AssertionError) as ei:
+        run_tx_scenario(transport, FakeCapture([FRAME_DATA]), timeout=0.01)
+    msg = str(ei.value)
+    assert "6502 did not return from $C000 within 10.0s" in msg
+    assert "PC=$C003" in msg and "A=$12" in msg and "Y=$40" in msg
+    # Disassembly window around PC, with the PC line marked.
+    assert "C000  00        BRK" in msg
+    assert "> C003  09 01     ORA #$01" in msg
+    # CS8900a I/O window.
+    assert "$DE00: 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f" in msg
+    # First bytes of the routine as loaded, so a clobbered opcode is visible.
+    assert "code@$C000: 00 01 de 09" in msg
