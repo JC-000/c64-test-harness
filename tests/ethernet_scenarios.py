@@ -22,7 +22,12 @@ import time
 from typing import Any
 
 from c64_test_harness.bridge_ping import cs8900a_enable_inline_code
-from c64_test_harness.capture import CaptureTimeout, PacketCapture, bpf_descriptor_summary
+from c64_test_harness.capture import (
+    CaptureTimeout,
+    CaptureUnavailable,
+    PacketCapture,
+    bpf_descriptor_summary,
+)
 from c64_test_harness.execute import load_code
 from c64_test_harness.memory import read_bytes, write_bytes
 
@@ -70,6 +75,28 @@ RX_FRAME = (
     DEST_MAC + RX_SRC_MAC + ETHERTYPE
     + RX_MARKER + b"\x00" * (FRAME_LEN - 14 - len(RX_MARKER))
 )
+
+
+def capture_failure_disposition(exc: CaptureUnavailable, *, iface: str) -> tuple[str, str]:
+    """``("skip" | "fail", reason)`` for a fixture that could not open a capture.
+
+    Skip only when the exception says the capability is *genuinely absent*
+    on this host (see ``GENUINELY_ABSENT_CAUSES``); the reason is the
+    exception's message, which carries the remedy.  Anything else -- the
+    pool eaten while VICE is live, a bind that failed on an interface the
+    platform helper just found, a non-ethernet DLT, a cause nobody has
+    classified -- is a path that exists and is broken, and a skip there is
+    exactly how issue #158 stayed hidden.  Those fail, with the same
+    remedy in the message.
+    """
+    if exc.genuinely_absent:
+        return "skip", f"no host-side capture on {iface}: {exc}"
+    return (
+        "fail",
+        f"host-side capture on {iface} exists but could not be opened "
+        f"(cause={exc.cause}; this is not absence, so the test fails rather "
+        f"than skips): {exc}",
+    )
 
 
 def is_test_frame(frame: bytes) -> bool:

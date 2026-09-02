@@ -51,6 +51,7 @@ from ethernet_scenarios import (
     PPDATA,
     PPTR,
     binary_jsr,
+    capture_failure_disposition,
     clockport_enable_code,
     run_rx_scenario,
     run_tx_scenario,
@@ -168,16 +169,24 @@ def host_capture(vice_ethernet: BinaryViceTransport) -> PacketCapture:
     longer has.
 
     One :func:`open_capture` call, no separate probe: the exception it
-    raises is the verdict.  Skips only when the path is genuinely absent,
-    with the message -- which carries the operator's remedy verbatim --
-    as the reason.  When the path exists the test runs, and a silent wire
-    is then a *failure* (see ``ethernet_scenarios``).
+    raises is the verdict, classified by
+    :func:`ethernet_scenarios.capture_failure_disposition`.  Skips only
+    when the path is genuinely absent (every node root-only, no nodes, no
+    CAP_NET_RAW, no backend), with the message -- which carries the
+    operator's remedy verbatim -- as the reason.  A path that exists but
+    is broken (pool eaten while VICE is live, bind failure on the
+    interface we just found, wrong DLT) *fails* with the same remedy: a
+    skip there is how issue #158 hid.  When the path opens the test runs,
+    and a silent wire is then a failure too (see ``ethernet_scenarios``).
     """
     assert TAP_IFACE is not None
     try:
         cap = open_capture(TAP_IFACE)
     except CaptureUnavailable as e:
-        pytest.skip(f"no host-side capture on {TAP_IFACE}: {e}")
+        verdict, reason = capture_failure_disposition(e, iface=TAP_IFACE)
+        if verdict == "skip":
+            pytest.skip(reason)
+        pytest.fail(reason, pytrace=False)
     try:
         yield cap
     finally:

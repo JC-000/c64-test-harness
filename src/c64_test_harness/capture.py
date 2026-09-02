@@ -58,6 +58,7 @@ __all__ = [
     "BpfParseError",
     "CaptureTimeout",
     "CaptureUnavailable",
+    "GENUINELY_ABSENT_CAUSES",
     "PacketCapture",
     "bpf_descriptor_summary",
     "bpf_descriptors",
@@ -70,18 +71,46 @@ __all__ = [
 MAX_FRAME = 1518
 
 
+#: ``CaptureUnavailable.cause`` values that mean the capability is genuinely
+#: absent on this host -- the only cases a test may *skip* on.  Everything
+#: else is a path that exists and is broken, which must fail.
+GENUINELY_ABSENT_CAUSES = frozenset({
+    "denied",       # every /dev/bpf* node is EACCES: nothing this uid may open
+    "no-nodes",     # no /dev/bpf* exists at all
+    "cap-net-raw",  # Linux: AF_PACKET refused for lack of CAP_NET_RAW
+    "platform",     # no backend for this OS
+})
+
+
 class CaptureUnavailable(RuntimeError):
     """No host-side capture path is usable on this host for this interface.
 
     ``remedy`` is the exact command (or ``None``) that would make it
-    usable; ``str(exc)`` already includes it.
+    usable; ``str(exc)`` already includes it.  ``cause`` is a short tag
+    for *why* (see :data:`GENUINELY_ABSENT_CAUSES`); ``genuinely_absent``
+    is the skip-vs-fail verdict: True only when nothing on this host could
+    have captured, False when a path exists and something is wrong with
+    it -- a pool eaten by other holders, a bind that failed on an
+    interface that exists, a non-ethernet DLT, or a cause nobody has
+    classified yet (treated as broken, never as absent).
     """
 
-    def __init__(self, message: str, *, remedy: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        remedy: str | None = None,
+        cause: str = "unknown",
+    ) -> None:
         if remedy:
             message = f"{message} Remedy: {remedy}"
         super().__init__(message)
         self.remedy = remedy
+        self.cause = cause
+
+    @property
+    def genuinely_absent(self) -> bool:
+        return self.cause in GENUINELY_ABSENT_CAUSES
 
 
 class CaptureTimeout(TimeoutError):
@@ -272,7 +301,8 @@ def _open_first_bpf() -> tuple[int, str]:
     if not failures:
         raise CaptureUnavailable(
             "no /dev/bpf* nodes exist on this host (BPF is compiled out or "
-            "devfs is not exposing it); host-side capture is impossible."
+            "devfs is not exposing it); host-side capture is impossible.",
+            cause="no-nodes",
         )
     counts: dict[str, int] = {}
     for eno in failures.values():
@@ -294,7 +324,11 @@ def _open_first_bpf() -> tuple[int, str]:
             f" {len(denied)} node(s) are root-only, and macOS creates further "
             "nodes only for root; the chmod mode does not survive a reboot."
         )
-    raise CaptureUnavailable(detail, remedy=_CHMOD_REMEDY)
+    # Any EBUSY means a node this uid may open exists and is merely held:
+    # a present path, not an absent one.  Only "every node denied" is absence.
+    raise CaptureUnavailable(
+        detail, remedy=_CHMOD_REMEDY, cause="busy" if busy else "denied"
+    )
 
 
 class BpfCapture:
@@ -325,7 +359,8 @@ class BpfCapture:
                 raise CaptureUnavailable(
                     f"BIOCSETIF {iface!r} on {self.node} failed: "
                     f"{errno.errorcode.get(e.errno, e.errno)} {e.strerror}"
-                    + (" (interface does not exist)" if e.errno == errno.ENXIO else "")
+                    + (" (interface does not exist)" if e.errno == errno.ENXIO else ""),
+                    cause="bind",
                 ) from e
             self.dlt = struct.unpack(
                 "I", _ioctl(self._fd, BIOCGDLT, struct.pack("I", 0))
@@ -333,7 +368,8 @@ class BpfCapture:
             if self.dlt != DLT_EN10MB:
                 raise CaptureUnavailable(
                     f"{iface} is not an ethernet interface (DLT {self.dlt}, "
-                    f"expected DLT_EN10MB={DLT_EN10MB})"
+                    f"expected DLT_EN10MB={DLT_EN10MB})",
+                    cause="dlt",
                 )
             # Promiscuous mode is a property of the bound interface: after SETIF.
             _ioctl(self._fd, BIOCPROMISC)
@@ -409,7 +445,9 @@ class AfPacketCapture:
         self.iface = iface
         af_packet = getattr(socket, "AF_PACKET", None)
         if af_packet is None:
-            raise CaptureUnavailable("socket.AF_PACKET does not exist on this platform")
+            raise CaptureUnavailable(
+                "socket.AF_PACKET does not exist on this platform", cause="platform"
+            )
         try:
             self._sock = socket.socket(af_packet, socket.SOCK_RAW, socket.htons(_ETH_P_ALL))
         except PermissionError as e:
@@ -417,13 +455,14 @@ class AfPacketCapture:
                 f"AF_PACKET socket refused ({e.strerror}); needs CAP_NET_RAW.",
                 remedy="run the tests as root, or grant the interpreter "
                 "`sudo setcap cap_net_raw+ep $(readlink -f $(command -v python3))`",
+                cause="cap-net-raw",
             ) from e
         try:
             self._sock.bind((iface, 0))
         except OSError as e:
             self._sock.close()
             raise CaptureUnavailable(
-                f"AF_PACKET bind to {iface!r} failed: {e.strerror}"
+                f"AF_PACKET bind to {iface!r} failed: {e.strerror}", cause="linux-bind"
             ) from e
 
     def recv(
@@ -560,6 +599,6 @@ def open_capture(iface: str) -> PacketCapture:
     if system == "Darwin":
         return BpfCapture(iface)
     raise CaptureUnavailable(
-        f"no host-side packet capture implementation for {system}"
+        f"no host-side packet capture implementation for {system}", cause="platform"
     )
 
