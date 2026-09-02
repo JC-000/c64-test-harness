@@ -249,10 +249,16 @@ class ScratchRegion:
 
 #: Every fixed C64 RAM address the harness writes as part of normal
 #: operation, verified against the code that performs the write (the
-#: owner column).  Keep sorted by ``(start, end)``.  Overlaps between
-#: entries are expected — several features share the cassette buffer
-#: and the ``$C000`` page.  I/O-register writes (``$D000-$DFFF``:
-#: CIA/REC/UCI/CS8900a) are not RAM and are not listed.
+#: owner column).  Inclusion criterion: library writes under ``src/``
+#: at fixed default addresses, plus the one live-suite stub at ``$CF00``
+#: (``tests/test_vice_core.py::_restore_basic``) because every screen
+#: and keyboard test runs it.  Caller-supplied addresses (required
+#: kwargs with no default, e.g. bridge_ping's ``rx_buf``/``result_addr``)
+#: are the caller's to declare and are not listed.  Keep sorted by
+#: ``(start, end)``.  Overlaps between entries are expected — several
+#: features share the cassette buffer and the ``$C000`` page.
+#: I/O-register writes (``$D000-$DFFF``: CIA/REC/UCI/CS8900a) are not
+#: RAM and are not listed.
 HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
     ScratchRegion(
         0x0000, 0x0002,
@@ -264,7 +270,8 @@ HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
     ScratchRegion(
         0x00C6, 0x00C7,
         owner="uci_network._execute_uci_routine, "
-              "backends.ultimate64.Ultimate64Transport.inject_keys",
+              "backends.ultimate64.Ultimate64Transport.inject_keys, "
+              "backends.ultimate64_client.Ultimate64Client.send_text",
         purpose="KERNAL NDX — keyboard-buffer fill count set after a "
                 "SYS/text injection",
         configurable="KERNAL-mandated (keybuf_count_addr= on U64 transport)",
@@ -272,7 +279,8 @@ HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
     ScratchRegion(
         0x0277, 0x0281,
         owner="uci_network._execute_uci_routine, "
-              "backends.ultimate64.Ultimate64Transport.inject_keys",
+              "backends.ultimate64.Ultimate64Transport.inject_keys, "
+              "backends.ultimate64_client.Ultimate64Client.send_text",
         purpose="KERNAL KEYD — 10-byte keyboard buffer receiving "
                 "\"SYS<addr>\\r\" or injected text",
         configurable="KERNAL-mandated (keybuf_addr= on U64 transport)",
@@ -293,9 +301,10 @@ HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
     ScratchRegion(
         0x0334, 0x03B4,
         owner="backends.ultimate64_probe.liveness_probe",
-        purpose="128-byte writemem POST round-trip payload (raw REST, "
-                "bypasses the transport policy); original bytes read "
-                "first and written back",
+        purpose="128-byte writemem POST round-trip payload via the raw "
+                "REST client (bypasses the transport MemoryPolicy); "
+                "original bytes written back on success only — the "
+                "readback-failure branches leave the pattern in place",
         configurable="hardcoded",
         transient=True,
     ),

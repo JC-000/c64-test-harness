@@ -162,11 +162,11 @@ the code, the code won (issue #169).
 | Address(es) | Bytes | Owner | Purpose | Configurable |
 |---|---:|---|---|---|
 | `$0000-$0001` | 2 | `snapshot.restore_snapshot` | 6510 CPU port direction/data re-asserted after the RAM restore (override="snapshot-restore") | restore-time only; carries override= |
-| `$00C6` | 1 | `uci_network._execute_uci_routine`, `backends.ultimate64.Ultimate64Transport.inject_keys` | KERNAL NDX — keyboard-buffer fill count set after a SYS/text injection | KERNAL-mandated (keybuf_count_addr= on U64 transport) |
-| `$0277-$0280` | 10 | `uci_network._execute_uci_routine`, `backends.ultimate64.Ultimate64Transport.inject_keys` | KERNAL KEYD — 10-byte keyboard buffer receiving "SYS<addr>\r" or injected text | KERNAL-mandated (keybuf_addr= on U64 transport) |
+| `$00C6` | 1 | `uci_network._execute_uci_routine`, `backends.ultimate64.Ultimate64Transport.inject_keys`, `backends.ultimate64_client.Ultimate64Client.send_text` | KERNAL NDX — keyboard-buffer fill count set after a SYS/text injection | KERNAL-mandated (keybuf_count_addr= on U64 transport) |
+| `$0277-$0280` | 10 | `uci_network._execute_uci_routine`, `backends.ultimate64.Ultimate64Transport.inject_keys`, `backends.ultimate64_client.Ultimate64Client.send_text` | KERNAL KEYD — 10-byte keyboard buffer receiving "SYS<addr>\r" or injected text | KERNAL-mandated (keybuf_addr= on U64 transport) |
 | `$0314-$0315` | 2 | `sid_player.stop_sid_vice` | RAM IRQ vector (CINV) restored to $EA31; the installer stub also patches it from 6502 code | hardcoded |
 | `$0334-$0338` | 5 | `execute.jsr` | JSR addr / NOP / NOP trampoline; checkpoint at +3 | scratch_addr= |
-| `$0334-$03B3` † | 128 | `backends.ultimate64_probe.liveness_probe` | 128-byte writemem POST round-trip payload (raw REST, bypasses the transport policy); original bytes read first and written back | hardcoded |
+| `$0334-$03B3` † | 128 | `backends.ultimate64_probe.liveness_probe` | 128-byte writemem POST round-trip payload via the raw REST client (bypasses the transport MemoryPolicy); original bytes written back on success only — the readback-failure branches leave the pattern in place | hardcoded |
 | `$0339-$033B` | 3 | `sid_player.play_sid_vice` | park JMP ($A002) executed after the installer so resume() lands in BASIC warm start | _PARK_ADDR constant |
 | `$033C-$0341` | 6 | `sid_player.play_sid_vice` | song trampoline: LDA #song / JSR init / RTS | _SONG_TRAMPOLINE_ADDR constant |
 | `$0360-$036D` | 14 | `execute.run_subroutine (U64 path)` | 14-byte sentinel trampoline; on VICE the 5-byte jsr() trampoline is written here instead | trampoline_addr= |
@@ -258,7 +258,12 @@ By default the arbiter also treats every non-transient entry of
 about to put its trampoline on (issue #169 measured exactly that:
 `MemoryArbiter(MemoryPolicy.permissive())` reported `$0334`, `$C000`
 and the rest all free).  `arbiter.is_free(addr, length=1)` answers the
-question directly.  Pass `exclude_harness_scratch=False` for raw
+question directly.  Consequence of the exclusion: with a permissive
+policy the first 256-byte request now lands at `$03F2-$04F1`, half of
+it in screen RAM `$0400-$07E7` (which the arbiter does not know about —
+the KERNAL scrolls it); callers who want RAM clear of the screen should
+pass a policy whose `safe_regions` name their own window.  Pass
+`exclude_harness_scratch=False` for raw
 allocation over the policy alone — appropriate when the caller *is*
 the harness, or has relocated every scratch address via the kwargs in
 the table.  Transient entries (the REU staging window, the liveness

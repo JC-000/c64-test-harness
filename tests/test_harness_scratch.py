@@ -203,7 +203,8 @@ class TestBoundsMatchCode:
         from c64_test_harness import bridge_ping as bp
 
         peek = _region_of("bridge_ping", bp._DEFAULT_PEEK_ADDR)
-        assert peek.length >= len(
+        # Exact, not >=: the declared span must move when the routine does.
+        assert peek.length == len(
             bp.build_rx_peek_code(load_addr=bp._DEFAULT_PEEK_ADDR, result_addr=0xC0FF)
         )
         consume = _region_of("bridge_ping", bp._DEFAULT_CONSUME_ADDR)
@@ -221,7 +222,7 @@ class TestBoundsMatchCode:
                 my_ip=bytes(4), result_addr=0xC0FF,
             )),
         )
-        assert consume.length >= largest
+        assert consume.length == largest  # tx 79, match 143, respond 357
 
     def test_reu_staging_window_matches_snapshot_constants(self) -> None:
         from c64_test_harness import snapshot as s
