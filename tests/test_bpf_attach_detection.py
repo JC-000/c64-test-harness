@@ -173,6 +173,7 @@ def _elevated_vice(*, ethernet: bool):
             os.unlink(rc_path)
 
 
+@pytest.mark.vice_live
 @requires_bench
 @requires_root
 def test_attach_is_detected_for_a_root_owned_vice():
@@ -190,6 +191,7 @@ def test_attach_is_detected_for_a_root_owned_vice():
         )
 
 
+@pytest.mark.vice_live
 @requires_bench
 @requires_root
 def test_no_attach_reported_for_a_root_owned_vice_without_the_cart():
