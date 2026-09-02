@@ -494,11 +494,33 @@ class MemoryPolicy:
         if isinstance(prg, (str, Path)):
             prg = _PrgFile.from_file(prg)
         prg_region = MemoryRegion(prg.load_address, prg.end_address, note)
-        return cls(
+        policy = cls(
             safe_regions=tuple(safe_regions),
             reserved_regions=(prg_region,) + tuple(extra_reserved),
             unknown=unknown,
         )
+        # Issue #169: say so *now* if the load image sits on an address
+        # the harness writes for itself.  The policy still blocks the
+        # eventual collision (the PRG span is reserved, so jsr()'s
+        # trampoline write raises MemoryPolicyError) — but that surfaces
+        # only when the first harness call happens, deep in a test.  We
+        # do NOT add HARNESS_SCRATCH to either region list: as reserved
+        # it would break every harness write into its own scratch; as
+        # safe it would change the unknown-address semantics.
+        overlaps = policy.harness_scratch_overlaps()
+        if overlaps:
+            detail = "; ".join(
+                f"{r} vs {s.span} ({s.owner}; {s.configurable})"
+                for r, s in overlaps
+            )
+            warnings.warn(
+                f"MemoryPolicy.from_prg: the load image overlaps harness "
+                f"scratch — harness writes there will raise "
+                f"MemoryPolicyError. Move the harness (see the "
+                f"'configurable' hint) or the program: {detail}",
+                stacklevel=2,
+            )
+        return policy
 
     @classmethod
     def from_config(cls, data: dict) -> MemoryPolicy:
@@ -586,6 +608,28 @@ class MemoryPolicy:
             and not self.reserved_regions
             and self.unknown == UnknownPolicy.ALLOW
         )
+
+    def harness_scratch_overlaps(
+        self, *, include_transient: bool = False
+    ) -> tuple[tuple[MemoryRegion, ScratchRegion], ...]:
+        """Reserved regions that overlap the harness's own scratch (#169).
+
+        Each pair is ``(reserved_region, scratch_entry)``.  A non-empty
+        result means a harness write into that scratch will raise
+        :class:`MemoryPolicyError` under this policy — the consumer
+        should relocate the program or pass the harness the kwarg named
+        in ``scratch_entry.configurable``.  Transient entries (saved and
+        restored around the write) are omitted unless requested, since
+        the 32 KiB REU staging window overlaps nearly every PRG.
+        """
+        pairs: list[tuple[MemoryRegion, ScratchRegion]] = []
+        for reserved in self.reserved_regions:
+            for scratch in HARNESS_SCRATCH:
+                if scratch.transient and not include_transient:
+                    continue
+                if reserved.overlaps_range(scratch.start, scratch.length):
+                    pairs.append((reserved, scratch))
+        return tuple(pairs)
 
     # ------------------------------------------------------------------
     # The check
