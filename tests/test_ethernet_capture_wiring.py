@@ -350,3 +350,28 @@ def test_chip_enable_bytes_are_the_bridge_ping_ones_not_a_second_copy():
     assert not inline.endswith(b"\x60"), "inline form must not RTS mid-routine"
     assert cs8900a_rxctl_code() == cs8900a_rxctl_inline_code() + b"\x60"
     assert tx_routine().startswith(inline) and rx_routine().startswith(inline)
+
+
+# ---------------------------------------------------------------------------
+# S3: the fixture's skip-vs-fail decision, unit-tested per cause
+# ---------------------------------------------------------------------------
+
+from c64_test_harness.capture import CaptureUnavailable  # noqa: E402
+from ethernet_scenarios import capture_failure_disposition  # noqa: E402
+
+
+@pytest.mark.parametrize("cause", ["denied", "no-nodes", "cap-net-raw", "platform"])
+def test_genuine_absence_skips_with_the_remedy_in_the_reason(cause):
+    exc = CaptureUnavailable("nothing to open.", remedy="sudo chmod o+rw /dev/bpf*", cause=cause)
+    verdict, reason = capture_failure_disposition(exc, iface="feth0")
+    assert verdict == "skip"
+    assert "feth0" in reason and "sudo chmod o+rw /dev/bpf*" in reason
+
+
+@pytest.mark.parametrize("cause", ["busy", "bind", "dlt", "linux-bind", "unknown"])
+def test_present_but_broken_path_fails_with_the_remedy(cause):
+    exc = CaptureUnavailable("pool eaten.", remedy="sudo chmod o+rw /dev/bpf*", cause=cause)
+    verdict, reason = capture_failure_disposition(exc, iface="feth0")
+    assert verdict == "fail"
+    assert "feth0" in reason and "sudo chmod o+rw /dev/bpf*" in reason
+    assert "not absence" in reason

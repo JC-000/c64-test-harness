@@ -464,3 +464,106 @@ def test_no_separate_availability_probe_exists():
     disagree with itself when the pool changes in between."""
     assert not hasattr(capture_mod, "capture_unavailable_reason")
     assert "capture_unavailable_reason" not in capture_mod.__all__
+
+
+# ---------------------------------------------------------------------------
+# S3: genuine absence (skip) versus a present-but-broken path (fail)
+# ---------------------------------------------------------------------------
+#
+# Issue #158 was hidden for months behind a skip that looked like absence.
+# The only conditions that are absence are: no node this process may open
+# (every node EACCES, or none exist), no CAP_NET_RAW on Linux, no backend
+# for the platform.  Everything else -- writable nodes all EBUSY (pool
+# eaten; chmod o+rw opens bpf4-7, which exist), BIOCSETIF failing on an
+# interface first_available_ethernet_iface() just found, a feth with a
+# non-ethernet DLT, a Linux bind failure -- is a broken path and must fail.
+
+
+def _cause_of(fn) -> tuple[str, bool]:
+    with pytest.raises(CaptureUnavailable) as ei:
+        fn()
+    return ei.value.cause, ei.value.genuinely_absent
+
+
+def test_all_nodes_denied_is_genuine_absence(monkeypatch):
+    monkeypatch.setattr(capture_mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(capture_mod, "_open_node", _fake_open_bpf({}, exists=4))
+    assert _cause_of(lambda: open_capture("feth0")) == ("denied", True)
+
+
+def test_no_nodes_is_genuine_absence(monkeypatch):
+    monkeypatch.setattr(capture_mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(capture_mod, "_open_node", _fake_open_bpf({}, exists=0))
+    assert _cause_of(lambda: open_capture("feth0")) == ("no-nodes", True)
+
+
+def test_busy_writable_nodes_with_root_only_rest_is_not_absence(monkeypatch):
+    """The bench shape with one VICE up: bpf0-3 EBUSY, bpf4-7 EACCES."""
+    monkeypatch.setattr(capture_mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        capture_mod, "_open_node",
+        _fake_open_bpf({0: errno.EBUSY, 1: errno.EBUSY, 2: errno.EBUSY, 3: errno.EBUSY}, exists=8),
+    )
+    assert _cause_of(lambda: open_capture("feth0")) == ("busy", False)
+
+
+def test_every_node_busy_is_not_absence(monkeypatch):
+    monkeypatch.setattr(capture_mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        capture_mod, "_open_node",
+        _fake_open_bpf({n: errno.EBUSY for n in range(4)}, exists=4),
+    )
+    assert _cause_of(lambda: open_capture("feth0")) == ("busy", False)
+
+
+def test_biocsetif_failure_is_not_absence(monkeypatch):
+    kernel = _FakeBpfKernel(b"")
+    real_ioctl = kernel.ioctl
+
+    def failing_setif(fd, req, arg=None):
+        if req == capture_mod.BIOCSETIF:
+            raise OSError(errno.ENXIO, "Device not configured")
+        return real_ioctl(fd, req, arg)
+
+    _install(monkeypatch, kernel)
+    monkeypatch.setattr(capture_mod, "_ioctl", failing_setif)
+    assert _cause_of(lambda: open_capture("feth0")) == ("bind", False)
+    assert kernel.closed
+
+
+def test_non_ethernet_dlt_is_not_absence(monkeypatch):
+    _install(monkeypatch, _FakeBpfKernel(b"", dlt=0))
+    assert _cause_of(lambda: open_capture("feth0")) == ("dlt", False)
+
+
+def test_unsupported_platform_is_genuine_absence(monkeypatch):
+    monkeypatch.setattr(capture_mod.platform, "system", lambda: "Plan9")
+    assert _cause_of(lambda: open_capture("eth0")) == ("platform", True)
+
+
+def test_linux_missing_cap_net_raw_is_genuine_absence(monkeypatch):
+    class Denied(_FakeSocketModule):
+        class socket:  # noqa: N801 - stands in for socket.socket
+            def __init__(self, *a):
+                raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(capture_mod.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(capture_mod, "socket", Denied)
+    cause, absent = _cause_of(lambda: open_capture("tap-c64-0"))
+    assert (cause, absent) == ("cap-net-raw", True)
+
+
+def test_linux_bind_failure_is_not_absence(monkeypatch):
+    class BindFails(_FakeSocketModule):
+        class socket(_FakeSocket):
+            def bind(self, addr):
+                raise OSError(errno.ENODEV, "No such device")
+
+    monkeypatch.setattr(capture_mod.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(capture_mod, "socket", BindFails)
+    assert _cause_of(lambda: open_capture("tap-c64-9")) == ("linux-bind", False)
+
+
+def test_unknown_cause_is_treated_as_present_but_broken():
+    exc = CaptureUnavailable("something new")
+    assert exc.cause == "unknown" and exc.genuinely_absent is False
