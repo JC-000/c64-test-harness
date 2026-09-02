@@ -613,7 +613,7 @@ def _wait_for_ready(transport: BinaryViceTransport, timeout: float = 30.0) -> No
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
-def vice_bridge_pair(request):
+def vice_bridge_pair():
     """Launch two VICE instances with ethernet on tap-c64-0 and tap-c64-1.
 
     Yields (transport_a, transport_b) -- both connected and at READY prompt.
@@ -659,8 +659,8 @@ def vice_bridge_pair(request):
     vice_b: ViceProcess | None = None
 
     try:
-        vice_a = start_vice_or_skip(config_a, request.node.nodeid)
-        vice_b = start_vice_or_skip(config_b, request.node.nodeid)
+        vice_a = start_vice_or_skip(config_a)
+        vice_b = start_vice_or_skip(config_b)
 
         transport_a = connect_binary_transport(port_a, proc=vice_a)
         transport_b = connect_binary_transport(port_b, proc=vice_b)

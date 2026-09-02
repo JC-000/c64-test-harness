@@ -320,7 +320,7 @@ def _bridge_init_cs8900a(transport: BinaryViceTransport, scratch: int, code: int
 
 
 @pytest.fixture(scope="module")
-def bridge_vice_pair(request):
+def bridge_vice_pair():
     """Launch two VICE instances with RR-Net ethernet on an L2 bridge.
 
     Yields ``(transport_a, transport_b)`` -- both connected, at BASIC
@@ -387,8 +387,8 @@ def bridge_vice_pair(request):
     vice_b: ViceProcess | None = None
 
     try:
-        vice_a = start_vice_or_skip(config_a, request.node.nodeid)
-        vice_b = start_vice_or_skip(config_b, request.node.nodeid)
+        vice_a = start_vice_or_skip(config_a)
+        vice_b = start_vice_or_skip(config_b)
         transport_a = connect_binary_transport(port_a, proc=vice_a)
         transport_b = connect_binary_transport(port_b, proc=vice_b)
         try:
@@ -704,24 +704,92 @@ def check_elevation(kind: str, **kwargs) -> tuple[bool, str]:
     return _elevation_cache[key]
 
 
-def gate_elevation(nodeid: str, kind: str, remedy: str) -> None:
-    """Skip *nodeid* -- or fail it, under ``C64_REQUIRE_ELEVATION=1`` --
-    for a missing *kind* prerequisite, and record it for the
-    end-of-session notice.  *remedy* is shown verbatim: it must already
-    be the exact command the operator needs, not a paraphrase.
+#: Prefix every elevation skip/fail message carries, so
+#: pytest_runtest_makereport (below) can recognise one in a report's
+#: exception text without any other coupling to gate_elevation().
+_ELEVATION_TEXT_PREFIX = "elevation required ("
+
+
+def _elevation_text(kind: str, remedy: str) -> str:
+    return f"{_ELEVATION_TEXT_PREFIX}{kind}): {remedy}"
+
+
+def _parse_elevation_text(text: str) -> tuple[str, str] | None:
+    """Recover ``(kind, remedy)`` from a message built by
+    :func:`_elevation_text`, or ``None`` if *text* isn't one."""
+    if not text.startswith(_ELEVATION_TEXT_PREFIX):
+        return None
+    rest = text[len(_ELEVATION_TEXT_PREFIX):]
+    kind, sep, remedy = rest.partition("): ")
+    return (kind, remedy) if sep else None
+
+
+def gate_elevation(kind: str, remedy: str) -> None:
+    """Skip the current test -- or fail it, under
+    ``C64_REQUIRE_ELEVATION=1`` -- for a missing *kind* prerequisite.
+    *remedy* is shown verbatim: it must already be the exact command the
+    operator needs, not a paraphrase.
+
+    Recording for the end-of-session notice happens in
+    ``pytest_runtest_makereport`` below, not here.  A caller-supplied
+    nodeid used to be recorded right in this function, but the only
+    caller that isn't already inside ``pytest_runtest_setup`` (where
+    ``item.nodeid`` is exact) is ``start_vice_or_skip()``, called from a
+    *module-scoped* fixture -- where ``request.node`` is the Module, not
+    the Function, so ``request.node.nodeid`` silently recorded the
+    wrong, non-test nodeid (a real over-count, caught live: three tests
+    sharing one refused fixture reported "4 test(s) skipped", one too
+    many, adversarial review S3 follow-up). ``pytest_runtest_makereport``
+    always sees the real per-test ``item.nodeid``, for every path.
     """
-    _elevation_skips.append((nodeid, kind, remedy))
-    text = f"elevation required ({kind}): {remedy}"
+    text = _elevation_text(kind, remedy)
     if elevation_is_required():
         pytest.fail(text, pytrace=False)
     pytest.skip(text)
 
 
-def start_vice_or_skip(config, nodeid: str) -> ViceProcess:
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Record every test an elevation refusal actually skipped or failed.
+
+    This is the ONE place ``_elevation_skips`` is written -- deliberately
+    not ``gate_elevation()`` itself.  ``item.nodeid`` here is always the
+    real test Function, for both call sites: a marker checked straight
+    from ``pytest_runtest_setup(item)``, and a module-scoped fixture's
+    refusal (``start_vice_or_skip()``) whose SINGLE ``gate_elevation()``
+    call still produces a ``TestReport`` (``when="setup"``) for every
+    dependent test -- pytest's own fixture-error caching re-raises the
+    same cached exception for each one, with that test's own real
+    nodeid, even though the fixture body itself ran only once. Recording
+    here, from the report, rather than in ``gate_elevation()`` from a
+    caller-supplied nodeid, is what makes a shared fixture refusal count
+    once per affected TEST rather than once per fixture invocation
+    (adversarial review S3) -- and sidesteps a related bug a first
+    attempt at S3 hit: a module-scoped fixture's ``request.node`` is the
+    Module, not the Function, so a nodeid threaded through from there
+    was simply wrong.
+    """
+    yield
+    if call.when != "setup" or call.excinfo is None:
+        return
+    exc = call.excinfo.value
+    if not isinstance(exc, (pytest.skip.Exception, pytest.fail.Exception)):
+        return
+    parsed = _parse_elevation_text(str(exc))
+    if parsed is None:
+        return
+    kind, remedy = parsed
+    entry = (item.nodeid, kind, remedy)
+    if entry not in _elevation_skips:
+        _elevation_skips.append(entry)
+
+
+def start_vice_or_skip(config) -> ViceProcess:
     """Start a :class:`ViceProcess`, converting a mid-launch
     :class:`~c64_test_harness.backends.vice_elevation.ViceElevationRequiredError`
-    into the same skip-or-fail + record the ``elevation("vice_root")``
-    marker uses.
+    into the same skip-or-fail the ``elevation("vice_root")`` marker
+    uses (recorded for the notice by ``pytest_runtest_makereport``, not
+    here -- see its docstring for why no nodeid is threaded through).
 
     Shared by every module-scoped ethernet fixture that launches VICE
     with ``ethernet=True`` (this module's ``bridge_vice_pair``,
@@ -736,7 +804,7 @@ def start_vice_or_skip(config, nodeid: str) -> ViceProcess:
     try:
         vice.start()
     except ViceElevationRequiredError as exc:
-        gate_elevation(nodeid, "vice_root", str(exc))
+        gate_elevation("vice_root", str(exc))
     return vice
 
 
@@ -767,7 +835,7 @@ def pytest_runtest_setup(item):
         kind, kwargs = marker.args[0], dict(marker.kwargs)
         ok, remedy = check_elevation(kind, **kwargs)
         if not ok:
-            gate_elevation(item.nodeid, kind, remedy)
+            gate_elevation(kind, remedy)
 
 
 def pytest_runtest_logreport(report):

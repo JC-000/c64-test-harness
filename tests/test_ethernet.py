@@ -143,7 +143,7 @@ def _binary_wait_for_text(
 
 
 @pytest.fixture(scope="module")
-def vice_ethernet(request):
+def vice_ethernet():
     """Launch VICE with RR-Net on the TAP interface, yield transport."""
     allocator = PortAllocator(port_range_start=6511, port_range_end=6531)
     port = allocator.allocate()
@@ -171,7 +171,7 @@ def vice_ethernet(request):
     # pattern of putting the allocator release in the outermost finally.
     vice: ViceProcess | None = None
     try:
-        vice = start_vice_or_skip(config, request.node.nodeid)
+        vice = start_vice_or_skip(config)
         transport = connect_binary_transport(port, proc=vice)
         try:
             grid = _binary_wait_for_text(transport, "READY.", timeout=30)

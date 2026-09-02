@@ -147,34 +147,26 @@ def test_check_elevation_rejects_an_unknown_kind():
 
 
 # ---------------------------------------------------------------------------
-# gate_elevation: skip-or-fail + record
+# gate_elevation: skip-or-fail
+#
+# Recording for the notice is NOT gate_elevation()'s job (adversarial
+# review S3 follow-up) -- see pytest_runtest_makereport's tests further
+# down for that. gate_elevation() only decides skip vs. fail and raises
+# with the right text.
 # ---------------------------------------------------------------------------
 
 
 def test_gate_elevation_skips_with_the_remedy_text():
     with pytest.raises(pytest.skip.Exception) as excinfo:
-        conftest.gate_elevation("t::test_x", "vice_root", "sudo -n /x64sc ...")
+        conftest.gate_elevation("vice_root", "sudo -n /x64sc ...")
     assert "sudo -n /x64sc ..." in str(excinfo.value)
-
-
-def test_gate_elevation_records_the_skip():
-    with pytest.raises(pytest.skip.Exception):
-        conftest.gate_elevation("t::test_x", "vice_root", "the remedy")
-    assert conftest._elevation_skips == [("t::test_x", "vice_root", "the remedy")]
 
 
 def test_gate_elevation_fails_instead_when_required(monkeypatch):
     monkeypatch.setenv(conftest.REQUIRE_ELEVATION_ENV, "1")
     with pytest.raises(pytest.fail.Exception) as excinfo:
-        conftest.gate_elevation("t::test_x", "vice_root", "the remedy")
+        conftest.gate_elevation("vice_root", "the remedy")
     assert "the remedy" in str(excinfo.value)
-
-
-def test_gate_elevation_records_even_when_required(monkeypatch):
-    monkeypatch.setenv(conftest.REQUIRE_ELEVATION_ENV, "1")
-    with pytest.raises(pytest.fail.Exception):
-        conftest.gate_elevation("t::test_x", "vice_root", "the remedy")
-    assert conftest._elevation_skips == [("t::test_x", "vice_root", "the remedy")]
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +182,6 @@ def test_setup_skips_a_marked_test_on_a_missing_prerequisite(monkeypatch):
     with pytest.raises(pytest.skip.Exception) as excinfo:
         conftest.pytest_runtest_setup(item)
     assert "run sudo -n x64sc" in str(excinfo.value)
-    assert conftest._elevation_skips == [("t::test_x", "vice_root", "run sudo -n x64sc")]
 
 
 def test_setup_does_not_skip_when_the_prerequisite_is_present(monkeypatch):
@@ -315,16 +306,8 @@ def test_start_vice_or_skip_converts_the_refusal(monkeypatch):
 
     monkeypatch.setattr(conftest, "ViceProcess", _RefusingViceProcess)
     with pytest.raises(pytest.skip.Exception) as excinfo:
-        conftest.start_vice_or_skip(object(), "t::test_x")
+        conftest.start_vice_or_skip(object())
     assert "need root" in str(excinfo.value)
-    assert conftest._elevation_skips == [
-        ("t::test_x", "vice_root", str(
-            ViceElevationRequiredError(
-                "need root", argv=["sudo", "x64sc"], binary="/x64sc",
-                sudoers_entry="me ALL=(root) NOPASSWD: /x64sc",
-            )
-        )),
-    ]
 
 
 def test_start_vice_or_skip_fails_instead_when_required(monkeypatch):
@@ -344,7 +327,7 @@ def test_start_vice_or_skip_fails_instead_when_required(monkeypatch):
 
     monkeypatch.setattr(conftest, "ViceProcess", _RefusingViceProcess)
     with pytest.raises(pytest.fail.Exception):
-        conftest.start_vice_or_skip(object(), "t::test_x")
+        conftest.start_vice_or_skip(object())
 
 
 def test_start_vice_or_skip_returns_the_process_when_it_starts(monkeypatch):
@@ -358,7 +341,7 @@ def test_start_vice_or_skip_returns_the_process_when_it_starts(monkeypatch):
             started.append(self.config)
 
     monkeypatch.setattr(conftest, "ViceProcess", _OkViceProcess)
-    vice = conftest.start_vice_or_skip("cfg", "t::test_x")
+    vice = conftest.start_vice_or_skip("cfg")
     assert started == ["cfg"]
     assert isinstance(vice, _OkViceProcess)
     assert conftest._elevation_skips == []
@@ -478,13 +461,10 @@ def test_bridge_vice_pair_converts_a_mid_launch_refusal(monkeypatch):
 
     monkeypatch.setattr(conftest, "ViceProcess", _RefusingViceProcess)
 
-    gen = conftest.bridge_vice_pair.__wrapped__(
-        request=SimpleNamespace(node=SimpleNamespace(nodeid="t::test_x"))
-    )
+    gen = conftest.bridge_vice_pair.__wrapped__()
     with pytest.raises(pytest.skip.Exception) as excinfo:
         next(gen)
     assert "need root" in str(excinfo.value)
-    assert any(kind == "vice_root" for _n, kind, _r in conftest._elevation_skips)
 
 
 # ---------------------------------------------------------------------------
@@ -567,7 +547,7 @@ def test_bpf_attach_detection_launch_tests_still_require_vice_root(monkeypatch):
 def test_vice_ethernet_releases_the_port_when_start_vice_or_skip_refuses(monkeypatch):
     import test_ethernet as te
 
-    def _raising_start_vice_or_skip(config, nodeid):
+    def _raising_start_vice_or_skip(config):
         pytest.skip("elevation required (vice_root): fix it")
 
     monkeypatch.setattr(te, "start_vice_or_skip", _raising_start_vice_or_skip)
@@ -589,11 +569,134 @@ def test_vice_ethernet_releases_the_port_when_start_vice_or_skip_refuses(monkeyp
 
     monkeypatch.setattr(te, "PortAllocator", _FakeAllocator)
 
-    gen = te.vice_ethernet.__wrapped__(
-        request=SimpleNamespace(node=SimpleNamespace(nodeid="t::test_x"))
-    )
+    gen = te.vice_ethernet.__wrapped__()
     with pytest.raises(pytest.skip.Exception):
         next(gen)
     assert released == [6511], (
         "allocator.release(port) must run even when start_vice_or_skip refuses"
     )
+
+
+# ---------------------------------------------------------------------------
+# S3 (adversarial review): the notice must count once per AFFECTED
+# TEST, not once per fixture invocation. A module-scoped fixture's
+# refusal executes gate_elevation() exactly once (the fixture body runs
+# once, however many tests depend on it); pytest's own fixture-error
+# caching then reports every OTHER dependent test as "skipped" too,
+# with its own real nodeid, from a report pytest builds without ever
+# calling into this fixture's code again. pytest_runtest_makereport is
+# the only place any of that gets recorded (see its docstring), for
+# every affected test, deduplicated by the full (nodeid, kind, remedy)
+# tuple so an identical report seen twice is not double counted.
+# ---------------------------------------------------------------------------
+
+
+def test_makereport_records_each_affected_test_for_a_shared_fixture_refusal():
+    exc = pytest.skip.Exception("elevation required (vice_root): THE REMEDY")
+    # test_a's report has already been recorded once (e.g. by an
+    # earlier delivery of the exact same TestReport) -- must not be
+    # double counted when its report is (re)observed below.
+    conftest._elevation_skips.append(("t::test_a", "vice_root", "THE REMEDY"))
+
+    for nodeid in ("t::test_a", "t::test_b", "t::test_c"):
+        item = SimpleNamespace(nodeid=nodeid)
+        call = SimpleNamespace(when="setup", excinfo=SimpleNamespace(value=exc))
+        gen = conftest.pytest_runtest_makereport(item, call)
+        next(gen)
+        with pytest.raises(StopIteration):
+            gen.send(None)
+
+    assert len(conftest._elevation_skips) == 3, conftest._elevation_skips
+    assert {n for n, _, _ in conftest._elevation_skips} == {
+        "t::test_a", "t::test_b", "t::test_c",
+    }
+
+
+def test_makereport_ignores_non_setup_phases():
+    exc = pytest.skip.Exception("elevation required (vice_root): THE REMEDY")
+    item = SimpleNamespace(nodeid="t::test_a")
+    call = SimpleNamespace(when="call", excinfo=SimpleNamespace(value=exc))
+    gen = conftest.pytest_runtest_makereport(item, call)
+    next(gen)
+    with pytest.raises(StopIteration):
+        gen.send(None)
+    assert conftest._elevation_skips == []
+
+
+def test_makereport_ignores_an_unrelated_skip():
+    exc = pytest.skip.Exception("some other reason entirely")
+    item = SimpleNamespace(nodeid="t::test_a")
+    call = SimpleNamespace(when="setup", excinfo=SimpleNamespace(value=exc))
+    gen = conftest.pytest_runtest_makereport(item, call)
+    next(gen)
+    with pytest.raises(StopIteration):
+        gen.send(None)
+    assert conftest._elevation_skips == []
+
+
+def test_makereport_ignores_a_clean_setup():
+    item = SimpleNamespace(nodeid="t::test_a")
+    call = SimpleNamespace(when="setup", excinfo=None)
+    gen = conftest.pytest_runtest_makereport(item, call)
+    next(gen)
+    with pytest.raises(StopIteration):
+        gen.send(None)
+    assert conftest._elevation_skips == []
+
+
+def test_e2e_notice_counts_per_affected_test_not_per_fixture_call(pytester):
+    """A module-scoped fixture shared by three tests skips once (the
+    fixture body runs once); the notice must say 3, not 1."""
+    pytester.makeconftest(
+        """
+        import pytest
+
+        _skips = []
+
+        def pytest_configure(config):
+            config.addinivalue_line("markers", "elevation(kind, **kw): test")
+
+        @pytest.fixture(scope="module")
+        def shared():
+            _skips.append(("<fixture>", "vice_root", "THE REMEDY"))
+            pytest.skip("elevation required (vice_root): THE REMEDY")
+
+        @pytest.hookimpl(hookwrapper=True)
+        def pytest_runtest_makereport(item, call):
+            outcome = yield
+            if call.when != "setup" or call.excinfo is None:
+                return
+            exc = call.excinfo.value
+            if not isinstance(exc, (pytest.skip.Exception, pytest.fail.Exception)):
+                return
+            text = str(exc)
+            prefix = "elevation required ("
+            if not text.startswith(prefix):
+                return
+            rest = text[len(prefix):]
+            kind, sep, remedy = rest.partition("): ")
+            if sep and (item.nodeid, kind, remedy) not in _skips:
+                _skips.append((item.nodeid, kind, remedy))
+
+        def pytest_sessionfinish(session, exitstatus):
+            recorded = [s for s in _skips if s[0] != "<fixture>"]
+            if not recorded:
+                return
+            reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+            if reporter is None:
+                return
+            reporter.write_sep(
+                "=", f"ELEVATION REQUIRED: {len(recorded)} test(s) skipped", red=True
+            )
+        """
+    )
+    pytester.makepyfile(
+        """
+        def test_a(shared): pass
+        def test_b(shared): pass
+        def test_c(shared): pass
+        """
+    )
+    result = pytester.runpytest()
+    result.assert_outcomes(skipped=3)
+    result.stdout.fnmatch_lines(["*ELEVATION REQUIRED: 3 test(s) skipped*"])
