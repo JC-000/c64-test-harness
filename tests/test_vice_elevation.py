@@ -946,3 +946,15 @@ def test_the_resolver_hint_names_only_knobs_that_exist(tmp_path):
     assert "HarnessConfig" not in msg
     assert "[vice]" not in msg
     assert "TOML" not in msg
+
+
+def test_a_passwd_retag_after_nopasswd_voids_the_entry(monkeypatch):
+    """``NOPASSWD: PASSWD: /x`` reinstates the prompt for /x.  The parser
+    skips the entry; without that clause it would count as authorised
+    and the unattended launch would hang on a password prompt."""
+    _sudo_listing(
+        monkeypatch,
+        "User x may run the following commands:\n"
+        "    (root) NOPASSWD: PASSWD: /opt/homebrew/bin/x64sc\n",
+    )
+    assert ve.sudo_can_run("/opt/homebrew/bin/x64sc") is False
