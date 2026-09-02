@@ -28,13 +28,21 @@ whole run; the C64 Ultimate generation was not reachable and is untested):
   ``reset()`` was performed (the procedure calls for one only on a
   discrepancy).
 
+* Flash and RAM disagreed on this bench: a per-category
+  ``configs/<C64 and Cartridge Settings>:load_from_flash`` moved ``REU
+  Size`` from ``512 KB`` to ``2 MB`` — the item default and exactly the
+  reporter's second value — with no config write anywhere.
+
 Verdict: neither explanation reproduces. ``REU Size`` is trustworthy at
-the moment it is read; a value that differs between two reads means
-*something wrote the config in between* — ``set_reu`` / ``restore_state``
-from another lane, ``load_config_from_flash``, ``reset_config_to_default``
-(the item's ``default`` is ``"2 MB"``, exactly the reporter's second
-value) — not a ``Cartridge`` interaction and not firmware staleness. The
-test below fails if the firmware ever behaves the other way.
+the moment it is read; a value that differs between two reads means the
+*config changed in between* — a config write (``set_reu`` /
+``restore_state`` from another lane, ``reset_config_to_default``), a
+reload from flash (``load_config_from_flash``), or — the likeliest for the
+reporter's data — a **reboot/power-cycle**: config PUTs are volatile
+until ``save_config_to_flash`` and a boot reloads flash (firmware
+``software/api/route_configs.cc:239, :329, :374``). Not a ``Cartridge``
+interaction and not firmware staleness. The tests below fail if the
+firmware ever behaves the other way.
 
 Env gates (all unset -> everything skips cleanly):
 

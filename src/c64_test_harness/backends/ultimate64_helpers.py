@@ -340,14 +340,28 @@ def set_turbo_mhz(client: Ultimate64Client, mhz: int | None) -> None:
 def get_reu_config(client: Ultimate64Client) -> tuple[bool, str]:
     """Return ``(enabled, size_str)`` describing current REU state.
 
-    Plain, uncached read of the config store. Live-verified on U64E fw
-    3.15 (issue #168): ``REU Size`` is stable across quiet reads, reflects
-    a :func:`set_reu` write immediately (no reset needed), and is not moved
-    by the ``Cartridge`` item — so a size that differs between two reads
-    means something wrote the config in between (another lane's
-    ``set_reu``/``restore_state``, ``load_config_from_flash``,
-    ``reset_config_to_default`` — the item's default is ``"2 MB"``). Read
-    it when you need it; don't hold it across other config writes. See
+    Plain, uncached read of the config store — corroborated live and
+    excluded as a cache by the firmware source (branch ``issue-807``):
+    ``GET /v1/configs/<category>`` is emitted straight from the in-memory
+    ``ConfigStore`` (``software/api/route_configs.cc:6-58``, ``emit_store``
+    reads ``i->getValue()`` per item), and that same store feeds the REU
+    hardware register on every PUT (``at_close_config -> effectuate ->
+    set_emulation_flags``: ``components/config.h:199``,
+    ``io/c64/c64.cc:270-280, 315-318``). Live on U64E fw 3.15 (issue #168,
+    2026-09-01 local): ``REU Size`` is stable across quiet reads, reflects
+    a :func:`set_reu` write immediately (no reset), and is not moved by the
+    ``Cartridge`` item (a ``.crt`` chooser on that firmware — no ``"REU"``
+    preset).
+
+    A size that differs between two reads therefore means the config
+    changed in between: a config write (another lane's ``set_reu`` /
+    ``restore_state``, ``reset_config_to_default``), a reload from flash
+    (``load_config_from_flash``), or a **reboot/power-cycle** — config PUTs
+    live only in memory until ``save_config_to_flash`` and a boot reloads
+    flash (``route_configs.cc:239, :329, :374``). Measured on the bench:
+    RAM held ``512 KB`` while flash held the item default ``"2 MB"`` — the
+    reporter's exact pair. Read it when you need it; don't hold it across
+    other config writes or a reboot. See
     ``tests/test_reu_size_readback_live.py``.
 
     ``enabled`` is ``True`` only for ``"Enabled"``; the U64E's third
