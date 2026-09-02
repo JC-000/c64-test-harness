@@ -111,10 +111,15 @@ have_cmd() { command -v "$1" >/dev/null 2>&1; }
 #
 # The reliable check is the rule list itself: `sudo -n -l` prints it
 # without running anything and, with -n, without ever prompting.  A rule
-# authorises an unattended launch of <cmd> only if a `NOPASSWD:` line names
-# <cmd> exactly, with no pinned arguments, or names `ALL`.  Entries with
-# pinned arguments (`NOPASSWD: /opt/homebrew/bin/brew reinstall --HEAD
+# authorises an unattended launch of <cmd> only if a `NOPASSWD:` entry
+# names <cmd> exactly with no pinned arguments (or the bare `*` wildcard
+# that admits any), or names `ALL`.  Further sudoers tags may sit between
+# `NOPASSWD:` and the command (`NOPASSWD: SETENV: /x`) and are skipped; a
+# later `PASSWD:` tag reinstates the prompt and voids the entry.  Entries
+# with pinned arguments (`NOPASSWD: /opt/homebrew/bin/brew reinstall --HEAD
 # vice`) authorise that one command line and are deliberately not counted.
+# tests/test_verify_dev_env_sudo_probe.py holds this function to the Python
+# parser's verdict on every one of those shapes.
 SUDO_LISTING=""
 SUDO_LISTING_LOADED=0
 load_sudo_listing() {
@@ -126,8 +131,9 @@ load_sudo_listing() {
 # nopasswd_for <abs-path>: exit 0 if this user may run <abs-path> as root
 # without a password, per the NOPASSWD rules in `sudo -n -l`; 1 otherwise.
 nopasswd_for() {
-    local target="$1" line rest entry
+    local target="$1" line rest entry cmd
     local -a entries words
+    local i n nargs reprompt
     load_sudo_listing
     while IFS= read -r line; do
         case "$line" in *"NOPASSWD:"*) ;; *) continue ;; esac
@@ -135,12 +141,35 @@ nopasswd_for() {
         IFS=',' read -r -a entries <<< "$rest"
         for entry in "${entries[@]}"; do
             read -r -a words <<< "$entry"
-            [ "${#words[@]}" -eq 0 ] && continue
-            if [ "${words[0]}" = "ALL" ]; then
+            n="${#words[@]}"
+            # Skip leading sudoers tags (sudoers(5) Tag_Spec), noting a
+            # PASSWD: that would reinstate the prompt.  Indexed rather than
+            # sliced so it stays inside bash 3.2 + `set -u`.
+            i=0
+            reprompt=0
+            while [ "$i" -lt "$n" ]; do
+                case "${words[$i]}" in
+                    PASSWD:) reprompt=1 ;;
+                    NOPASSWD:|SETENV:|NOSETENV:|EXEC:|NOEXEC:|LOG_INPUT:|NOLOG_INPUT:|LOG_OUTPUT:|NOLOG_OUTPUT:|MAIL:|NOMAIL:|FOLLOW:|NOFOLLOW:|INTERCEPT:|NOINTERCEPT:) ;;
+                    *) break ;;
+                esac
+                i=$((i + 1))
+            done
+            [ "$i" -ge "$n" ] && continue        # tags only, no command
+            [ "$reprompt" = "1" ] && continue    # would prompt after all
+            cmd="${words[$i]}"
+            nargs=$((n - i - 1))
+            if [ "$cmd" = "ALL" ]; then
                 return 0
             fi
-            if [ "${#words[@]}" -eq 1 ] && [ "${words[0]}" = "$target" ]; then
-                return 0
+            if [ "$cmd" = "$target" ]; then
+                # No pinned arguments, or the bare wildcard that admits any.
+                if [ "$nargs" -eq 0 ]; then
+                    return 0
+                fi
+                if [ "$nargs" -eq 1 ] && [ "${words[$((i + 1))]}" = "*" ]; then
+                    return 0
+                fi
             fi
         done
     done <<< "$SUDO_LISTING"
