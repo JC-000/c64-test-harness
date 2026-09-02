@@ -38,6 +38,7 @@ than no guard, because it also reports success.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import socket
@@ -48,7 +49,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 from conftest import connect_binary_transport
 
-from c64_test_harness.backends.vice_elevation import sudo_authorisation, vice_features
+from c64_test_harness.backends.vice_elevation import (
+    ALLOW_UNELEVATED_ENV,
+    sudo_authorisation,
+    vice_features,
+)
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 
 pytestmark = pytest.mark.vice_live
@@ -113,10 +118,19 @@ def _prewarm_elevation_caches() -> None:
 
 
 def emitted_argv(cfg: ViceConfig) -> list[str]:
-    """The argv *cfg* would launch, without launching it."""
+    """The argv *cfg* would launch, without launching it.
+
+    ``plan_vice_launch`` runs for real here, and for an ethernet config it
+    refuses outright when this user cannot ``sudo -n`` the binary.  That
+    refusal protects a *launch*; nothing is launched, so it is lifted for
+    the duration of the capture -- the flags a config emits do not depend
+    on whether this host may run them elevated.  Any ``sudo -n`` wrapper
+    the plan does add is stripped by :func:`emitted_flags`.
+    """
     _prewarm_elevation_caches()
     proc = ViceProcess(cfg)
-    with patch("subprocess.Popen") as mock_popen:
+    with patch("subprocess.Popen") as mock_popen, \
+            patch.dict(os.environ, {ALLOW_UNELEVATED_ENV: "1"}):
         mock_popen.return_value = MagicMock()
         proc.start()
         argv = list(mock_popen.call_args[0][0])
@@ -138,6 +152,29 @@ def emitted_flags(cfg: ViceConfig) -> set[str]:
     if argv and argv[0].endswith("sudo"):
         argv = argv[2:]  # drop "sudo" and its "-n"
     return {tok for tok in argv[1:] if re.match(r"^[-+][A-Za-z0-9]", tok)}
+
+
+def test_the_argv_capture_does_not_depend_on_sudo_authorisation(monkeypatch):
+    """Capturing an argv must never require the host to be able to run it.
+
+    ``emitted_argv`` mocks only ``Popen``, so ``plan_vice_launch`` runs for
+    real -- and for the ``ethernet`` entry it asks sudo whether this user
+    may run x64sc as root without a password.  On any host without that
+    NOPASSWD rule the plan raised ``ViceElevationRequiredError`` and three
+    contract tests ERRORed before checking a single flag.  That is a
+    guard switched off by the host's sudoers, which is the opposite of
+    what a class-level guard is for: the flags exist whether or not this
+    machine may launch them elevated.
+
+    Simulated here rather than assumed: the sudo probe is forced to say
+    no, and the capture must still return the ethernet flags.
+    """
+    from c64_test_harness.backends import vice_elevation as ve
+
+    _prewarm_elevation_caches()
+    monkeypatch.setattr(ve, "sudo_can_run", lambda binary: False)
+    flags = emitted_flags(CONFIG_SURFACE["ethernet"])
+    assert "-ethernetioif" in flags, flags
 
 
 # ---------------------------------------------------------------------------
