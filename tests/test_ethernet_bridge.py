@@ -19,12 +19,9 @@ import time
 import pytest
 
 from bridge_platform import (
-    BRIDGE_NAME,
     ETHERNET_DRIVER,
     IFACE_A,
     IFACE_B,
-    SETUP_HINT,
-    iface_present,
     probe_vice_pcap_ok,
 )
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
@@ -47,22 +44,11 @@ pytestmark = [
     pytest.mark.vice_live,
     # See test_bridge_ping.py: monitor-up is not proof of capture, so
     # require a real /dev/bpf* attach or these pass vacuously (issue #144).
+    # This probe is module-specific (an active launch-and-watch-for-crash
+    # check, not a static prerequisite) and stays outside the marker.
     pytest.mark.skipif(not _PCAP_OK, reason=_PCAP_REASON),
-    pytest.mark.skipif(
-        not iface_present(IFACE_A),
-        reason=f"{IFACE_A} not found ({SETUP_HINT})",
-    ),
-    pytest.mark.skipif(
-        not iface_present(IFACE_B),
-        reason=f"{IFACE_B} not found ({SETUP_HINT})",
-    ),
-    pytest.mark.skipif(
-        not iface_present(BRIDGE_NAME),
-        reason=(
-            f"{BRIDGE_NAME} not found -- feth/tap peers alone aren't enough; "
-            f"the host bridge must be up ({SETUP_HINT})"
-        ),
-    ),
+    # IFACE_A / IFACE_B / BRIDGE_NAME all present and up.
+    pytest.mark.elevation("bridge_iface"),
 ]
 
 # ---------------------------------------------------------------------------

@@ -50,6 +50,10 @@ pytestmark = [
         reason="live bridge cleanup test -- opt in with BRIDGE_CLEANUP_LIVE=1",
     ),
     pytest.mark.vice_live,
+    # NOPASSWD sudo for setup-bridge-tap.sh / teardown-bridge-tap.sh /
+    # cleanup-bridge-networking.sh -- this test drives them directly via
+    # _run_sudo_script().
+    pytest.mark.elevation("bridge_scripts"),
 ]
 
 

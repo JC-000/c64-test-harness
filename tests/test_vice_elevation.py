@@ -27,6 +27,16 @@ from c64_test_harness.backends import vice_elevation as ve
 from c64_test_harness.backends import vice_lifecycle
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 
+# The four "ground truth against the real binary" tests below all need
+# both a Homebrew x64sc present at this exact sudoers-listed path AND
+# passwordless sudo authorised for it -- the same elevation("vice_root")
+# question the harness's live ethernet suite asks, scoped to this one
+# path. Sharing the mark means the probe (an lru_cache'd sudo -n -l) runs
+# at most once across this whole file, and across test_bpf_attach_detection.py
+# too, which checks the identical (kind, binary) pair.
+_HOMEBREW_X64SC = "/opt/homebrew/bin/x64sc"
+requires_homebrew_x64sc = pytest.mark.elevation("vice_root", binary=_HOMEBREW_X64SC)
+
 
 # --------------------------------------------------------------- helpers
 
@@ -96,10 +106,7 @@ def test_build_scan_sees_a_rewritten_binary(tmp_path):
     assert ve.vice_binary_supports_ethernet(exe) is True
 
 
-@pytest.mark.skipif(
-    not os.path.exists("/opt/homebrew/bin/x64sc"),
-    reason="no Homebrew x64sc on this host",
-)
+@requires_homebrew_x64sc
 def test_homebrew_x64sc_is_ethernet_capable():
     """Ground truth, not an assumption.
 
@@ -620,10 +627,7 @@ def test_supports_ethernet_uses_the_features_probe(tmp_path, monkeypatch):
     assert ve.vice_binary_supports_ethernet(exe) is False
 
 
-@pytest.mark.skipif(
-    not os.path.exists("/opt/homebrew/bin/x64sc"),
-    reason="no Homebrew x64sc on this host",
-)
+@requires_homebrew_x64sc
 def test_homebrew_x64sc_reports_rawnet_and_pcap():
     """Ground truth for the design decision to drop the custom build."""
     feat = ve.vice_features("/opt/homebrew/bin/x64sc")
@@ -761,10 +765,7 @@ class TestFeaturesRowParsing:
         assert feat.pcap is False, "a one-token row must contribute nothing"
 
 
-@pytest.mark.skipif(
-    not os.path.exists("/opt/homebrew/bin/x64sc"),
-    reason="no Homebrew x64sc on this host",
-)
+@requires_homebrew_x64sc
 def test_the_features_fixtures_match_the_real_output_shape():
     """The fixtures encode an assumption about VICE that nothing checks.
 
@@ -796,10 +797,7 @@ def test_the_features_fixtures_match_the_real_output_shape():
     )
 
 
-@pytest.mark.skipif(
-    not os.path.exists("/opt/homebrew/bin/x64sc"),
-    reason="no Homebrew x64sc on this host",
-)
+@requires_homebrew_x64sc
 def test_the_features_probe_ignores_an_ambient_vicerc(tmp_path, monkeypatch):
     """``-features`` must not be silenced by the operator's own config.
 

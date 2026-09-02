@@ -66,32 +66,28 @@ def _iface_up(name: str) -> bool:
     return out.returncode == 0
 
 
-# Deliberately the production function rather than a local probe.
-#
-# The local probe this replaced ran ``sudo -n -l -- <binary>`` and took
-# rc=0 as "NOPASSWD".  On a machine whose sudoers carries ``(ALL) ALL``
-# that is rc=0 for *anything that exists*, so it was a file-existence
-# check wearing a sudo costume.  Measured here: ``/bin/ls`` and
-# ``/usr/sbin/lsof`` both "authorised", as was the ethernet build that
-# has no rule at all.
-#
-# That is the same defect ``vice_elevation.sudo_can_run`` was corrected
-# for -- it parses the ``NOPASSWD:`` entries out of the listing -- so the
-# fixed and broken versions were coexisting in one branch.  Importing it
-# keeps one implementation of the question, and means a future fix to it
-# reaches this gate too.
-from c64_test_harness.backends.vice_elevation import sudo_can_run
+# The sudo-authorisation question below used to be answered by a local
+# probe that ran ``sudo -n -l -- <binary>`` and took rc=0 as "NOPASSWD".
+# On a machine whose sudoers carries ``(ALL) ALL`` that is rc=0 for
+# *anything that exists*, so it was a file-existence check wearing a
+# sudo costume.  Measured here: ``/bin/ls`` and ``/usr/sbin/lsof`` both
+# "authorised", as was the ethernet build that has no rule at all.  That
+# is the same defect ``vice_elevation.sudo_can_run`` was corrected for
+# (it parses the ``NOPASSWD:`` entries out of the listing) -- and it is
+# exactly what ``elevation("vice_root")`` below now asks on this file's
+# behalf, via the same one implementation of the question.
 
 
 requires_bench = pytest.mark.skipif(
-    not shutil.which("netstat")
-    or not _iface_up(IFACE)
-    or not sudo_can_run(X64SC),
-    reason=(
-        f"needs {IFACE} up (scripts/setup-bridge-feth-macos.sh) and a "
-        f"NOPASSWD sudoers rule for {X64SC}"
-    ),
+    not shutil.which("netstat") or not _iface_up(IFACE),
+    reason=f"needs {IFACE} up (scripts/setup-bridge-feth-macos.sh)",
 )
+
+# The NOPASSWD sudoers rule for this exact (hardcoded, sudoers-listed)
+# x64sc path -- the same question elevation("vice_root") asks elsewhere,
+# scoped here to the one binary this bench's sudoers entry actually
+# names rather than whatever ethernet_vice_binary()/PATH would resolve.
+requires_root = pytest.mark.elevation("vice_root", binary=X64SC)
 
 
 def _free_port() -> int:
@@ -178,6 +174,7 @@ def _elevated_vice(*, ethernet: bool):
 
 
 @requires_bench
+@requires_root
 def test_attach_is_detected_for_a_root_owned_vice():
     """An elevated VICE on *IFACE* must be seen as attached.
 
@@ -194,6 +191,7 @@ def test_attach_is_detected_for_a_root_owned_vice():
 
 
 @requires_bench
+@requires_root
 def test_no_attach_reported_for_a_root_owned_vice_without_the_cart():
     """The control that varies attachment while holding privilege fixed.
 
