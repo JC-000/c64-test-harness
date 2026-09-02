@@ -428,18 +428,74 @@ def build_udp_frame(
 # CS8900a initialisation blobs (same as tests/test_ethernet_bridge.py)
 # ---------------------------------------------------------------------------
 
-def cs8900a_rxctl_code() -> bytes:
-    """RxCTL (PP 0x0104) = 0x00D8 (promiscuous + RxOK).
+#: RxCTL value the live bridge path has always written.  What VICE's
+#: cs8900.c acts on is bit 7, PromiscuousA: with it set the receive filter
+#: (:594) accepts a broadcast without BroadcastA (0x0800), which the reset
+#: value 0x0005 lacks.  Kept at 0x00D8 rather than a datasheet-minimal
+#: 0x0905 so every harness routine programs the chip the one way that is
+#: verified live (tests/test_ethernet_bridge.py, run_ping_and_wait).
+CS8900A_RXCTL_VALUE = 0x00D8
 
-    Enables the RR clockport first, then programs the register.
+#: LineCTL bits that let the chip move frames at all: SerRxON (bit 6) and
+#: SerTxON (bit 7).  cs8900.c clears both on reset (:420-421) and sets them
+#: only from a LineCTL write (:923-931); without them TX frames are dropped
+#: at :780 after the routine has "successfully" written them, and RxOK is
+#: never raised (:1060).
+CS8900A_LINECTL_ENABLE = 0x00C0
+
+
+def cs8900a_rxctl_inline_code(value: int = CS8900A_RXCTL_VALUE) -> bytes:
+    """Clockport enable + ``RxCTL (PP 0x0104) = value``, **no RTS**.
+
+    The inline form is what gets prepended to a larger routine; see
+    :func:`cs8900a_rxctl_code` for the callable-blob form.
     """
     return _clockport_enable_bytes() + bytes([
         0xA9, 0x04, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8,
         0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8,
-        0xA9, 0xD8, 0x8D, PPDATA_LO & 0xFF, PPDATA_LO >> 8,
-        0xA9, 0x00, 0x8D, PPDATA_HI & 0xFF, PPDATA_HI >> 8,
-        0x60,
+        0xA9, value & 0xFF, 0x8D, PPDATA_LO & 0xFF, PPDATA_LO >> 8,
+        0xA9, (value >> 8) & 0xFF, 0x8D, PPDATA_HI & 0xFF, PPDATA_HI >> 8,
     ])
+
+
+def cs8900a_rxctl_code() -> bytes:
+    """RxCTL (PP 0x0104) = 0x00D8 (PromiscuousA set), then RTS.
+
+    Enables the RR clockport first, then programs the register.  The value
+    is VICE-verified only: RxOKA (0x0100) is *not* in 0x00D8, and a real
+    CS8900A programmed this way accepts nothing -- VICE's rawnetarch forces
+    rx_ok, which is why it works there.  See :data:`CS8900A_RXCTL_VALUE`.
+    """
+    return cs8900a_rxctl_inline_code() + bytes([0x60])
+
+
+def cs8900a_linectl_or_inline_code(mask: int = CS8900A_LINECTL_ENABLE) -> bytes:
+    """``LineCTL (PP 0x0112) low byte |= mask`` as a read-OR-write, **no RTS**.
+
+    Read-modify-write on the low byte only, so the other LineCTL bits
+    (and the untouched high byte) survive; the mask defaults to
+    SerRxON | SerTxON.  This is the inline equivalent of the three-step
+    read / OR on the host / :func:`cs8900a_write_linectl_code` dance that
+    ``tests/test_ethernet_bridge.py`` does, folded into the routine so a
+    single JSR brings the chip up.
+    """
+    return bytes([
+        0xA9, 0x12, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8,
+        0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8,
+        0xAD, PPDATA_LO & 0xFF, PPDATA_LO >> 8,     # LDA PPData lo
+        0x09, mask & 0xFF,                          # ORA #mask
+        0x8D, PPDATA_LO & 0xFF, PPDATA_LO >> 8,     # STA PPData lo
+    ])
+
+
+def cs8900a_enable_inline_code() -> bytes:
+    """Everything a fresh CS8900a needs before it will pass a frame, **no RTS**.
+
+    RxCTL = :data:`CS8900A_RXCTL_VALUE` then LineCTL |= SerRxON | SerTxON.
+    Prepend to any TX or RX routine that runs against a chip nobody else
+    has initialised (the RR clockport is enabled as part of it).
+    """
+    return cs8900a_rxctl_inline_code() + cs8900a_linectl_or_inline_code()
 
 
 def cs8900a_read_linectl_code(dest_addr: int) -> bytes:
