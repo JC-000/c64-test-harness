@@ -8,10 +8,17 @@ memory as one line per instruction in the classic monitor layout::
     C003  09 01     ORA #$01
     C008  F0 F9     BEQ $C003
 
-Only the documented opcodes are decoded; anything else is rendered as its
-byte and ``???`` so a corrupted routine (a zeroed opcode is ``00 BRK``)
-is visible rather than hidden.  No cycle counts, no labels -- this is a
+All 256 opcodes are decoded, illegal ones included (KIL SLO RLA SRE RRA
+SAX LAX DCP ISC ANC ALR ARR XAA AHX TAS SHY SHX LAS AXS and the NOP
+variants), each with its real length, so a listing never desynchronises
+at an illegal instruction -- which is exactly where the "PC is not an
+instruction boundary" path of a JSR-timeout report is looking.  A zeroed
+opcode reads ``00 BRK``.  No cycle counts, no labels -- this is a
 diagnostic, not a tool.
+
+The opcode table is the one from issue #170's ``scripts/dis6502.py``
+(``assert len == 256``); after both branches merge, that script becomes a
+thin CLI over this module -- this is the consolidation target.
 """
 
 from __future__ import annotations
@@ -60,13 +67,42 @@ for _op, _mn in {0x00: "BRK", 0x18: "CLC", 0xD8: "CLD", 0x58: "CLI", 0xB8: "CLV"
                  0xA8: "TAY", 0xBA: "TSX", 0x8A: "TXA", 0x9A: "TXS", 0x98: "TYA"}.items():
     _OPS[_op] = (_mn, "imp")
 
+# --- illegal (6510) --------------------------------------------------------
+for _op in (0x02, 0x12, 0x22, 0x32, 0x42, 0x52, 0x62, 0x72, 0x92, 0xB2, 0xD2, 0xF2):
+    _OPS[_op] = ("KIL", "imp")
+for _op in (0x1A, 0x3A, 0x5A, 0x7A, 0xDA, 0xFA):
+    _OPS[_op] = ("NOP", "imp")
+_add("NOP", {0x80: "imm", 0x82: "imm", 0x89: "imm", 0xC2: "imm", 0xE2: "imm",
+             0x04: "zp", 0x44: "zp", 0x64: "zp",
+             0x14: "zpx", 0x34: "zpx", 0x54: "zpx", 0x74: "zpx", 0xD4: "zpx", 0xF4: "zpx",
+             0x0C: "abs", 0x1C: "absx", 0x3C: "absx", 0x5C: "absx", 0x7C: "absx", 0xDC: "absx", 0xFC: "absx"})
+# read-modify-write family: columns 3/7/B/F of rows x0 and x1
+for _row, _mn in ((0x00, "SLO"), (0x20, "RLA"), (0x40, "SRE"), (0x60, "RRA"), (0xC0, "DCP"), (0xE0, "ISC")):
+    _add(_mn, {_row + 0x03: "indx", _row + 0x07: "zp", _row + 0x0F: "abs",
+               _row + 0x13: "indy", _row + 0x17: "zpx", _row + 0x1B: "absy", _row + 0x1F: "absx"})
+_add("SAX", {0x83: "indx", 0x87: "zp", 0x8F: "abs", 0x97: "zpy"})
+_add("LAX", {0xAB: "imm", 0xA3: "indx", 0xA7: "zp", 0xAF: "abs", 0xB3: "indy", 0xB7: "zpy", 0xBF: "absy"})
+_add("ANC", {0x0B: "imm", 0x2B: "imm"})
+_add("ALR", {0x4B: "imm"})
+_add("ARR", {0x6B: "imm"})
+_add("XAA", {0x8B: "imm"})
+_add("AHX", {0x93: "indy", 0x9F: "absy"})
+_add("TAS", {0x9B: "absy"})
+_add("SHY", {0x9C: "absx"})
+_add("SHX", {0x9E: "absy"})
+_add("LAS", {0xBB: "absy"})
+_add("AXS", {0xCB: "imm"})
+_add("SBC", {0xEB: "imm"})
+
+assert len(_OPS) == 256, f"opcode table has {len(_OPS)} entries"
+
 _LEN = {"imp": 1, "acc": 1, "imm": 2, "zp": 2, "zpx": 2, "zpy": 2, "rel": 2,
         "abs": 3, "absx": 3, "absy": 3, "ind": 3, "indx": 2, "indy": 2}
 
 
 def instruction_length(opcode: int) -> int:
-    """Byte length of the instruction starting with *opcode* (1 for undocumented)."""
-    return _LEN[_OPS.get(opcode, ("???", "imp"))[1]]
+    """Byte length of the instruction starting with *opcode* (defined for all 256)."""
+    return _LEN[_OPS[opcode & 0xFF][1]]
 
 
 def _operand(mode: str, b: bytes, pc: int) -> str:
@@ -102,7 +138,7 @@ def disassemble(mem: bytes, base: int) -> list[str]:
     while i < n:
         pc = (base + i) & 0xFFFF
         op = mem[i]
-        mn, mode = _OPS.get(op, ("???", "imp"))
+        mn, mode = _OPS[op]
         length = _LEN[mode]
         b = bytes(mem[i:i + length])
         if len(b) < length:
