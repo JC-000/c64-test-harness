@@ -342,10 +342,12 @@ checkpoints, and a screen carrying nothing but `READY.` — the machine ran
 happily for fifteen seconds and never received the text
 `send_text` had written to its keyboard buffer.
 
-That second mode is **not root-caused.** An earlier revision of this note
-said it was; that claim was based on a single capture and is withdrawn
-below. It is recorded here only because it shares a surface symptom with
-the stall.
+That second mode **is now root-caused, and it is a harness bug, not a
+VICE one** — see "Mode 2 resolved" at the end of this entry. An earlier
+revision of this note claimed a different root cause on a single capture;
+that claim is withdrawn below and the history is kept because the false
+trail is instructive. The mode is recorded here only because it shares a
+surface symptom with the stall.
 
 Bisected by dropping whole classes, under load, fresh VICE per run:
 
@@ -424,6 +426,47 @@ defect of the documented false-completion class — three of the four
 content-asserting tests in `test_vice_core.py` waited on a needle their
 own echoed command contained — but they are **not** a fix for this
 failure and are not described as one.
+
+**Mode 2 resolved (issue #170): `_restore_basic` inherited the stack of
+whatever the monitor pause interrupted.** The restore was `CLI; JMP
+$E5CD` with SP untouched. `$E5CD` is *inside* CHRIN's call frame (`$E632`
+pushes X and Y and falls into the idle loop; RETURN makes `$E676`
+`PLA;TAX;PLA;TAY;…;RTS` back to INLIN), so it is only correct when SP
+already points at that frame. The binary monitor pauses the CPU wherever
+the per-frame poll catches it (`monitor_check_binary()` from
+`monitor_vsync_hook()`, S `monitor.c:407`), and in 2 of 317 redirects
+measured under load that was inside the KERNAL IRQ handler with the
+interrupt frame still on the stack. Captured with CPU history
+(`scripts/vice_keyecho_probe.py`, cycle 23 of 45):
+
+```
+redirect PC:=$CF00  paused at PC=$EA86 (the handler's RTI) SP=$F0
+                    stack = 22 d4 e5 | 00 0a 14 e1 64 a5 ...
+                            P  PCL PCH  X  Y  ret   ret
+```
+
+The fixture's own RETURN then popped `X:=$22, Y:=$D4` and the RTS landed
+at `$00E5+1 = $00E6`, the screen line-link table, whose bytes `86 86 86
+86 86 86 86 87` decode as `STX $86 ×3; STX $87` — CHRGET's `SBC #$30;
+SEC` at `$0086-$0087` became `22 22`, then `CLD; BRK` at `$00F5` warm-
+started the machine, `CINT` cleared the screen, and the resulting
+`READY.` satisfied the fixture's wait. The test's first typed line then
+hit opcode `$22` (KIL) in CHRGET and the 6510 jammed: raster frozen
+(JAMAction 0 stops the machine), one `0x61` event queued, PC `$0087`.
+Every capture shape listed above is this class — a bogus RTS whose
+landing address is set by the frame depth: the 3-byte frame at the RTI
+lands in zero page and corrupts CHRGET; the 6-byte frame deeper in the
+handler lands at `$2201` (`00`, BRK) and warm-starts cleanly, so the
+fixture *self-heals* and the cycle passes (also measured, 1 of 317).
+
+Fix: the restore now goes through BASIC's warm-start vector — `CLI; JMP
+($A002)` → `$E37B` → `JSR $A67A` (`LDX #$FA; TXS`) rebuilds the stack.
+Deterministic reproduction, not a rate: `tests/test_vice_core.py::
+TestRestoreBasicFromInterrupt` parks the CPU on `$EA86` with a checkpoint
+and calls `_restore_basic`; RED = CHRGET `… e9 30 38 …` → `… e9 22 22 …`
+in 3.6 s, GREEN after the fix. Under the issue's load recipe: 1 of 45
+cycles before, 0 of 45 after -- with 3 of 315 redirects landing inside
+the IRQ handler, each of which the rebuilt stack survived.
 
 **Harness mitigation: detection, not recovery.** We cannot fix VICE. The
 raster check is the discriminating signal — it distinguishes a stalled

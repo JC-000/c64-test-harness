@@ -130,7 +130,7 @@ def _stub_was_executed(transport, samples: int = 4) -> tuple[bool, list[int]]:
     samples can land on the same address by coincidence -- measured, and
     it would make this a flaky check for the flake it exists to diagnose.
 
-    The stub at $CF00 is ``CLI; JMP $E5CD``: it executes once and never
+    The stub at $CF00 is ``CLI; JMP ($A002)``: it executes once and never
     returns.  So "PC is no longer $CF00" is a precise, one-way signal
     that the machine ran, immune to loop-size coincidence.
     """
@@ -183,6 +183,22 @@ def _machine_failure_report(transport, needle: str) -> str:
         )
     except Exception as e:
         lines.append(f"could not sample the raster: {type(e).__name__}: {e}")
+    # A frozen raster is also what a JAM looks like: under JAMAction 0 an
+    # illegal opcode stops the whole machine and VICE queues a 0x61 event
+    # that nothing in the poll loop reads.  The issue #170 capture was
+    # exactly that -- reported above as bug 6 until the queue was checked.
+    try:
+        jams = [resp for _, resp in getattr(transport, "_event_queue", ())
+                if resp.response_type == 0x61]
+        if jams:
+            lines.append(
+                f"{len(jams)} JAM event(s) (0x61) queued  <- the 6510 hit "
+                "an illegal opcode and JAMAction 0 stopped the machine. "
+                "The frozen raster above is that stop, NOT bug 6; the PC "
+                "below is the jammed instruction."
+            )
+    except Exception as e:
+        lines.append(f"could not scan the event queue: {type(e).__name__}: {e}")
     if _LAST_POLL_TRACE:
         distinct = len(set(_LAST_POLL_TRACE))
         lines.append(
@@ -236,13 +252,34 @@ def _machine_failure_report(transport, needle: str) -> str:
         lines.append(f"could not read the keyboard buffer: "
                      f"{type(e).__name__}: {e}")
 
+    # CHRGET ($0073-$008A) is BASIC's tokenizer/interpreter fetch, copied
+    # from ROM at cold start.  Issue #170 corrupted it through a bogus RTS
+    # into zero page; a damaged copy means BASIC cannot run *any* line,
+    # whatever the keyboard buffer says.  $007A-$007B is the pointer.
+    try:
+        chrget = bytearray(transport.read_memory(0x0073, 0x18))
+        chrget[7:9] = b"\x00\x00"
+        # ROM master copy at $E3A2 (its LDA operand is a placeholder,
+        # 60 EA on the 901227-03 KERNAL; mask it the same way).
+        master = bytearray(transport.read_memory(0xE3A2, 0x18))
+        master[7:9] = b"\x00\x00"
+        lines.append(
+            "CHRGET $0073-$008A: "
+            + ("intact" if chrget == master else
+               f"CORRUPTED -> {bytes(chrget).hex(' ')} (ROM master "
+               f"{bytes(master).hex(' ')}); something executed in zero "
+               "page -- check SP and the stack frame")
+        )
+    except Exception as e:
+        lines.append(f"could not read CHRGET: {type(e).__name__}: {e}")
+
     # What is actually at $CF00?  A pinned PC is equally consistent with
     # "halted" and with "jammed": if the stub write did not land, or was
     # overwritten, the 6510 may be sitting on an illegal opcode that
-    # halts it in place.  $CF00 should read 58 4C CD E5 (CLI; JMP $E5CD).
+    # halts it in place.  $CF00 should read 58 6C 02 A0 (CLI; JMP ($A002)).
     try:
         stub = transport.read_memory(0xCF00, 4)
-        expected = bytes([0x58, 0x4C, 0xCD, 0xE5])
+        expected = _RESTORE_STUB
         lines.append(
             f"memory at $CF00: {stub.hex()} "
             + ("(the stub, intact)" if stub == expected else
@@ -283,15 +320,33 @@ def _machine_failure_report(transport, needle: str) -> str:
     return "\n".join(lines)
 
 
-def _restore_basic(transport):
-    """Return CPU to the BASIC idle loop.
+#: The stub ``_restore_basic`` plants at $CF00: ``CLI; JMP ($A002)``.
+#: ($A002) is BASIC's warm-start vector ($E37B on a stock KERNAL).
+_RESTORE_STUB = bytes([0x58, 0x6C, 0x02, 0xA0])
 
-    Writes CLI + JMP $E5CD (KERNAL MAINLOOP) to scratch memory, sets PC
-    there, and resumes.  After a brief delay the CPU should be in BASIC's
-    idle loop ready to process keystrokes.
+
+def _restore_basic(transport):
+    """Return CPU to the BASIC idle loop, with a stack BASIC built.
+
+    Writes ``CLI; JMP ($A002)`` to scratch memory, sets PC there, and
+    resumes.  ($A002) is the BASIC warm start ($E37B): CLRCHN, then
+    ``JSR $A67A`` which does ``LDX #$FA; TXS`` and rebuilds the stack,
+    CLI, READY., and into INLIN -> CHRIN -> the idle loop at $E5CD.
+
+    It used to be ``CLI; JMP $E5CD`` -- straight into the idle loop, SP
+    untouched.  That is issue #170.  $E5CD sits *inside* CHRIN's call
+    frame ($E632 pushes X and Y and falls into the loop; RETURN makes
+    $E676 pop them and RTS to INLIN), so it only works if SP already
+    points at that frame.  The monitor pauses the CPU wherever the
+    per-frame poll catches it, and when that was inside the KERNAL IRQ
+    handler the interrupt frame was still on the stack: the next RETURN
+    popped it as CHRIN's saved registers and return address and the RTS
+    landed in zero page, corrupting CHRGET before a BRK warm-started the
+    machine -- whose READY. then satisfied the wait below.  Measured, with
+    CPU history, in ``TestRestoreBasicFromInterrupt``.  Going through the
+    warm start makes the restore independent of where the pause landed.
     """
-    restore_code = bytes([0x58, 0x4C, 0xCD, 0xE5])
-    transport.write_memory(0xCF00, restore_code)
+    transport.write_memory(0xCF00, _RESTORE_STUB)
     transport.set_registers({"PC": 0xCF00})
     transport.resume()
     time.sleep(0.5)
@@ -593,7 +648,7 @@ class TestKeyboard:
         ran, pcs = _stub_was_executed(binary_transport)
         assert ran, (
             "the 6510 never left _restore_basic's stub — PC stayed at "
-            f"{[hex(p) for p in pcs]} ($CF00 is CLI; JMP $E5CD, which "
+            f"{[hex(p) for p in pcs]} ($CF00 is CLI; JMP ($A002), which "
             f"executes once and never returns). Any READY. on screen is "
             f"left over from the previous test.\n"
             + _machine_failure_report(binary_transport, "a running CPU")

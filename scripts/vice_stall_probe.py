@@ -23,7 +23,9 @@ CMD_CHECKPOINT_LIST = 0x14
 
 
 def restore_basic(t):
-    t.write_memory(0xCF00, bytes([0x58, 0x4C, 0xCD, 0xE5]))
+    # CLI; JMP ($A002) -- the suite's restore since issue #170.  The old
+    # CLI; JMP $E5CD inherited whatever stack the pause left behind.
+    t.write_memory(0xCF00, bytes([0x58, 0x6C, 0x02, 0xA0]))
     t.set_registers({"PC": 0xCF00})
     t.resume()
     time.sleep(0.5)
@@ -67,7 +69,7 @@ def interrogate(t):
 
     print(f"registers: {t.read_registers()}", flush=True)
     stub = t.read_memory(0xCF00, 8)
-    print(f"memory at $CF00: {stub.hex()}  (stub should be 584ccde5)",
+    print(f"memory at $CF00: {stub.hex()}  (stub should be 586c02a0)",
           flush=True)
     print(f"checkpoints: {t.checkpoint_list()}", flush=True)
 
