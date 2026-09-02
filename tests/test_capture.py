@@ -580,3 +580,57 @@ def test_trailing_bytes_shorter_than_a_header_raise_bpf_parse_error():
         parse_bpf_records(buf)
     assert not isinstance(ei.value, struct.error)
     assert "5 trailing byte(s)" in str(ei.value)
+
+
+# ---------------------------------------------------------------------------
+# Second-pass review: S3b, N2, N3
+# ---------------------------------------------------------------------------
+
+
+def test_s3b_unclassified_errnos_are_not_absence(monkeypatch):
+    """All-EIO (neither EBUSY nor EACCES) must not be filed under 'denied'."""
+    monkeypatch.setattr(capture_mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(capture_mod, "_open_node", _fake_open_bpf({n: errno.EIO for n in range(4)}, exists=4))
+    cause, absent = _cause_of(lambda: open_capture("feth0"))
+    assert cause == "unknown" and absent is False
+
+
+def test_s3b_denied_requires_every_failure_to_be_eacces(monkeypatch):
+    monkeypatch.setattr(capture_mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(capture_mod, "_open_node",
+                        _fake_open_bpf({0: errno.EACCES, 1: errno.EIO, 2: errno.EACCES, 3: errno.EACCES}, exists=4))
+    cause, absent = _cause_of(lambda: open_capture("feth0"))
+    assert cause == "unknown" and absent is False
+
+
+class _OneReadKernel(_FakeBpfKernel):
+    """select() is readable exactly once; afterwards the interface is silent."""
+
+    def select(self, r, w, x, timeout):
+        if self.reads == 0:
+            return (list(r), [], [])
+        return ([], [], [])
+
+
+def test_n2_capture_timeout_counts_the_non_matching_frames_it_discarded(monkeypatch):
+    kernel = _OneReadKernel(_record(IPV4_FRAME))
+    _install(monkeypatch, kernel)
+    with open_capture("feth0") as cap:
+        with pytest.raises(capture_mod.CaptureTimeout) as ei:
+            cap.recv(0.05, match=lambda f: f[12:14] == b"\x88\xb5")
+    assert ei.value.seen == 1
+    assert "1 non-matching frame(s) seen" in str(ei.value)
+
+
+NETSTAT_B_NO_PID = NETSTAT_B + (
+    "bpf4      feth0          p---IO------         3         0         3          200         0      4096         0         0         0         0         0            0         0         0 tcpdump\n"
+)
+
+
+def test_n3_a_row_whose_command_has_no_pid_suffix_is_kept(monkeypatch):
+    monkeypatch.setattr(capture_mod, "_run_netstat_B", lambda: NETSTAT_B_NO_PID)
+    rows = bpf_descriptors("feth0")
+    assert [r.device for r in rows] == ["bpf2", "bpf4"]
+    assert rows[1] == BpfDescriptor(device="bpf4", netif="feth0", recv=3, written=0, command="tcpdump", pid=None)
+    text = bpf_descriptor_summary("feth0")
+    assert "bpf4 Recv=3 Written=0 tcpdump" in text and "None" not in text
