@@ -338,7 +338,9 @@ def rx_routine() -> bytes:
         0xAD, rtd_lo, 0xDE,
         0xAD, rtd_h_lo, 0xDE,
         0xCA,
-        0xD0, 0xF8,  # BNE -8
+        0xD0, 0xF7,  # BNE -9 -> .skip (LDA abs 3 + LDA abs 3 + DEX 1 + BNE 2 = 9 bytes).
+                     # The inherited -8 landed on the $08 operand byte = PHP,
+                     # pushing a byte per iteration; RTS then popped garbage.
 
         # Read 4 marker bytes (2 word reads) -> RESULT+0..+3
         0xAD, rtd_lo, 0xDE,
@@ -405,6 +407,43 @@ def run_tx_scenario(transport: Any, capture: PacketCapture, *, timeout: float = 
     return captured
 
 
+#: Upper bound on stale frames drained before the RX send.  One VICE run
+#: leaves one (its own TX frame seen back through pcap); several means
+#: something else is talking on the interface, which the message reports.
+MAX_STALE_DRAINS = 4
+
+
+def _run_rx_routine(transport: Any, timeout: float) -> tuple[bytes, str | None]:
+    """One JSR of the loaded RX routine via the $0334 trampoline.
+
+    Returns ``(RESULT bytes, None)`` when the routine came back, or
+    ``(b"", cpu_report)`` when the checkpoint was never reached -- the
+    same report :func:`binary_jsr` gives.  Kept separate from
+    :func:`binary_jsr` because the caller must be able to overlap a host
+    send with the C64's poll.
+    """
+    write_bytes(transport, RESULT, [0x00] * 5)  # clear result area (never inside the code)
+    scratch_addr = 0x0334
+    trampoline = bytes([
+        0x20, CODE_BASE & 0xFF, (CODE_BASE >> 8) & 0xFF,  # JSR CODE_BASE
+        0xEA,  # NOP (breakpoint here)
+        0xEA,  # NOP
+    ])
+    transport.write_memory(scratch_addr, trampoline)
+    bp_num = transport.set_checkpoint(scratch_addr + 3)
+    try:
+        transport.set_registers({"PC": scratch_addr})
+        transport.resume()
+        try:
+            transport.wait_for_stopped(timeout=timeout)
+        except (TimeoutError, TransportTimeoutError):
+            return b"", jsr_timeout_report(transport, CODE_BASE, timeout)
+        transport.read_registers()
+    finally:
+        transport.delete_checkpoint(bp_num)
+    return read_bytes(transport, RESULT, 5), None
+
+
 def run_rx_scenario(
     transport: Any,
     capture: PacketCapture,
@@ -426,19 +465,32 @@ def run_rx_scenario(
     back differs.
     """
     sender_cap = send_capture if send_capture is not None else capture
-    write_bytes(transport, RESULT, [0x00] * 5)  # clear result area (never inside the code)
     load_code(transport, CODE_BASE, rx_routine())
 
-    # Trampoline at the scratch area with a breakpoint after the JSR, so
-    # the send can happen while the C64 is inside the routine.
-    scratch_addr = 0x0334
-    trampoline = bytes([
-        0x20, CODE_BASE & 0xFF, (CODE_BASE >> 8) & 0xFF,  # JSR CODE_BASE
-        0xEA,  # NOP (breakpoint here)
-        0xEA,  # NOP
-    ])
-    transport.write_memory(scratch_addr, trampoline)
-    bp_num = transport.set_checkpoint(scratch_addr + 3)
+    # Drain stale frames first.  After the TX test VICE's CS8900a holds
+    # VICE's *own* transmitted frame (pcap shows it the frames it sends:
+    # Recv=1 on its descriptor), and cs8900_receive() replaces a pending
+    # frame with the next one on every RxEvent read.  Each run of the
+    # routine consumes one pending frame in microseconds; a run whose poll
+    # times out (~1.2 s) proves the queue is empty.  Only then do we send,
+    # so the marker we read back can only be ours.
+    stale: list[str] = []
+    for _ in range(MAX_STALE_DRAINS):
+        result, cpu_report = _run_rx_routine(transport, timeout)
+        if cpu_report is not None:
+            raise AssertionError(
+                f"{cpu_report}\n(hung during the stale-frame drain, before any "
+                f"host send) {bpf_descriptor_summary(capture.iface)}"
+            )
+        if result[0] == 0xFF and result[4] != 0x01:
+            break  # poll timed out: nothing pending
+        stale.append(result.hex())
+    else:
+        raise AssertionError(
+            f"CS8900a still delivering stale frames after {MAX_STALE_DRAINS} drain "
+            f"runs (results {stale}); not sending into a chip that never empties. "
+            f"{bpf_descriptor_summary(capture.iface)}"
+        )
 
     send_error: list[BaseException] = []
 
@@ -451,20 +503,7 @@ def run_rx_scenario(
 
     sender = threading.Thread(target=_send_packet_delayed, daemon=True)
     sender.start()
-    cpu_report: str | None = None
-    try:
-        transport.set_registers({"PC": scratch_addr})
-        transport.resume()
-        try:
-            transport.wait_for_stopped(timeout=timeout)
-        except (TimeoutError, TransportTimeoutError):
-            # Same report binary_jsr gives: where the 6502 is, not just
-            # that it did not come back.
-            cpu_report = jsr_timeout_report(transport, CODE_BASE, timeout)
-        else:
-            transport.read_registers()
-    finally:
-        transport.delete_checkpoint(bp_num)
+    result, cpu_report = _run_rx_routine(transport, timeout)
     sender.join(timeout=join_timeout)
 
     if cpu_report is not None:
@@ -484,7 +523,6 @@ def run_rx_scenario(
     if sender.is_alive():
         raise AssertionError(f"host-side send on {sender_cap.iface} did not return")
 
-    result = read_bytes(transport, RESULT, 5)
     success = result[4]
     if result[0] == 0xFF and success != 0x01:
         sides = [sender_cap.iface]

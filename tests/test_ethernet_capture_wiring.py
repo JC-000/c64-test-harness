@@ -249,12 +249,17 @@ def scripted(*steps):
     return on_resume
 
 
-#: Drain finds nothing, then the host frame arrives with our marker.
-_c64_receives_marker = scripted(_c64_poll_times_out, _marker_step(RX_MARKER))
+def _c64_receives_marker():
+    """Drain finds nothing, then the host frame arrives with our marker.
+
+    A factory, not a shared closure: ``scripted`` keeps per-resume state,
+    and one instance shared across tests would repeat its last step.
+    """
+    return scripted(_c64_poll_times_out, _marker_step(RX_MARKER))
 
 
 def test_rx_scenario_sends_the_marker_frame_through_the_capture():
-    transport = FakeTransport(on_resume=_c64_receives_marker)
+    transport = FakeTransport(on_resume=_c64_receives_marker())
     cap = FakeCapture()
 
     result = run_rx_scenario(transport, cap, send_delay=0.0, timeout=1.0)
@@ -422,7 +427,7 @@ class PeerCapture(FakeCapture):
 
 
 def test_rx_scenario_sends_through_send_capture_when_given():
-    transport = FakeTransport(on_resume=_c64_receives_marker)
+    transport = FakeTransport(on_resume=_c64_receives_marker())
     cap, peer = FakeCapture(), PeerCapture()
 
     run_rx_scenario(transport, cap, send_capture=peer, send_delay=0.0, timeout=1.0)
@@ -444,7 +449,7 @@ def test_rx_failure_names_the_interface_the_frame_was_written_to(monkeypatch):
 
 
 def test_rx_scenario_defaults_to_sending_on_the_capture_itself():
-    transport = FakeTransport(on_resume=_c64_receives_marker)
+    transport = FakeTransport(on_resume=_c64_receives_marker())
     cap = FakeCapture()
     run_rx_scenario(transport, cap, send_delay=0.0, timeout=1.0)
     assert cap.sent == [RX_FRAME]
@@ -510,7 +515,7 @@ class TimestampingCapture(FakeCapture):
 def test_rx_scenario_really_waits_send_delay_before_writing():
     """A `pass` in place of time.sleep(send_delay) sends before the C64 is
     polling; the fake cannot tell, so the clock has to."""
-    transport = FakeTransport(on_resume=_c64_receives_marker)
+    transport = FakeTransport(on_resume=_c64_receives_marker())
     cap = TimestampingCapture()
     started = time.monotonic()
     run_rx_scenario(transport, cap, send_delay=0.08, timeout=1.0)
