@@ -908,3 +908,24 @@ def test_a_relative_binary_is_resolved_to_an_absolute_path(tmp_path, monkeypatch
     assert err.binary == exe
     assert err.sudoers_entry.endswith(f"NOPASSWD: {exe}")
     assert "./x64sc" not in err.sudoers_entry
+
+
+def test_the_remedy_command_names_the_resolved_binary(tmp_path, monkeypatch):
+    """``binary`` and ``sudoers_entry`` already used the resolved path;
+    the pasteable ``sudo ...`` command was built from the caller's
+    spelling.  ``sudo x64sc`` fails on macOS (secure_path lacks
+    /opt/homebrew/bin), so the remedy must use the same absolute path
+    the sudoers line names."""
+    exe = _fake_x64sc(tmp_path, "x64sc", ethernet=True)
+    _as_uid(monkeypatch, 501)
+    monkeypatch.setattr(ve.sys, "platform", "darwin")
+    monkeypatch.setattr(ve.shutil, "which", lambda name: exe if name == "x64sc" else None)
+    _no_sudo(monkeypatch)
+    cfg = ViceConfig(ethernet=True, ethernet_driver="pcap")
+    with pytest.raises(ve.ViceElevationRequiredError) as excinfo:
+        ve.plan_vice_launch(cfg, ["x64sc", "-warp"])
+    err = excinfo.value
+    assert err.binary == exe
+    assert err.argv == ["sudo", exe, "-warp"]
+    assert err.command == f"sudo {exe} -warp"
+    assert f"NOPASSWD: {exe}" in err.sudoers_entry

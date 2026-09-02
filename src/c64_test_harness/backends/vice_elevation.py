@@ -468,7 +468,11 @@ def _unelevated_allowed() -> bool:
 
 
 def _refuse(argv: list[str], binary: str, reason: str) -> ViceElevationRequiredError:
-    interactive = ["sudo"] + argv
+    # The remedy names the *resolved* binary, like ``binary`` and the
+    # sudoers line do: ``sudo x64sc`` fails on macOS because sudo's
+    # secure_path lacks /opt/homebrew/bin, and the three must agree so
+    # the pasted command is the one the pasted rule authorises.
+    interactive = ["sudo", binary] + argv[1:]
     command = shlex.join(interactive)
     entry = _sudoers_entry(binary)
     message = (
