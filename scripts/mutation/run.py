@@ -92,6 +92,35 @@ def run_suite(box: pathlib.Path, pytest_bin: str, modules: list[str],
     return "NOTVIABLE", f"rc={rc} with no reported failures"
 
 
+def fresh_box(repo: pathlib.Path, box: pathlib.Path) -> None:
+    """*box* becomes a clean copy of *repo*'s ``src`` and ``tests``."""
+    shutil.rmtree(box, ignore_errors=True)
+    box.mkdir(parents=True)
+    for d in ("src", "tests"):
+        shutil.copytree(repo / d, box / d)
+
+
+def check_baseline(repo: pathlib.Path, box: pathlib.Path, pytest_bin: str,
+                   modules: list[str], timeout: int) -> None:
+    """Run the *unmutated* suite once and refuse to proceed unless it is green.
+
+    Every verdict below is "did the suite fail?".  If it fails before any
+    mutation is applied -- one pre-existing red test, a broken import --
+    then every mutant is scored KILLED (or NOTVIABLE) for a reason that
+    has nothing to do with the mutant, and the kill rate reads as
+    near-perfect while measuring nothing.  A baseline that is not green
+    is not a measurement setup; it is the thing to fix first.
+    """
+    fresh_box(repo, box)
+    verdict, detail = run_suite(box, pytest_bin, modules, timeout)
+    if verdict != "SURVIVED":
+        raise SystemExit(
+            f"unmutated baseline is not green ({verdict} {detail}): every "
+            f"mutant would inherit that failure and score as a kill. Fix "
+            f"the suite (modules: {' '.join(modules)}) before measuring."
+        )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("mutations")
@@ -112,11 +141,10 @@ def main() -> None:
     with open(args.out, "w", buffering=1) as out, \
             tempfile.TemporaryDirectory(prefix="mutation-") as tmp:
         box = pathlib.Path(tmp) / "box"
+        check_baseline(repo, box, args.pytest, args.modules, args.timeout)
+        out.write("BASELINE  unmutated suite green\n")
         for i, m in enumerate(muts, 1 + args.start):
-            shutil.rmtree(box, ignore_errors=True)
-            box.mkdir(parents=True)
-            for d in ("src", "tests"):
-                shutil.copytree(repo / d, box / d)
+            fresh_box(repo, box)
             target = box / m["file"]
             src = target.read_text()
             if m["old"] not in src:
