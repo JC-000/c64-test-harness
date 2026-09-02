@@ -115,6 +115,43 @@ def device_lock_guard(request):
         _device_lock_log.info("device lock released for %s", host)
 
 
+@pytest.fixture(autouse=True)
+def _clear_vice_elevation_process_caches():
+    """Clear every process-global cache in vice_elevation.py, before AND
+    after every test in the whole suite (not just this file).
+
+    Three ``functools.lru_cache``'d functions live there:
+    ``sudo_authorisation()`` (``maxsize=1``, no args -- the sharpest
+    edge, since a single call answers for the rest of the process) and
+    ``_probe_features()`` / ``_scan_for_markers()`` (keyed on a binary's
+    real path/mtime/size, lower risk but still process-global).
+    ``tests/test_vice_elevation.py`` mocks ``subprocess.run`` to feed
+    ``sudo_authorisation()`` fake listings extensively; most of those
+    tests clear the cache *before* installing their mock (see
+    ``_sudo_listing()``) but nothing there clears it *after* -- so
+    whichever such test runs last in a session leaves its fake answer
+    cached for whatever asks next, mocked or not. A full-suite (or any
+    multi-file) run could then serve a fake "not authorised" to
+    ``test_bpf_attach_detection.py`` or the elevation gate's own
+    ``_probe_vice_root``, silently skipping a real live test -- exactly
+    the class of hidden skip this branch exists to remove.
+
+    Clearing *before* protects the first test in a session (nothing ran
+    before it to leave a residue) and any test whose own setup runs
+    before a marker-driven probe within the same test; clearing *after*
+    protects every test that runs later, regardless of what this one
+    did.
+    """
+    from c64_test_harness.backends import vice_elevation as ve
+
+    caches = (ve.sudo_authorisation, ve._probe_features, ve._scan_for_markers)
+    for cache in caches:
+        cache.cache_clear()
+    yield
+    for cache in caches:
+        cache.cache_clear()
+
+
 class MockTransport:
     """In-memory C64Transport for testing screen/keyboard/memory modules.
 
@@ -593,6 +630,7 @@ def _probe_vice_root(binary: str | None = None) -> tuple[bool, str]:
         _sudoers_entry,
         launch_path,
         rawnet_capability,
+        sudo_authorisation,
         sudo_can_run,
     )
     if rawnet_capability():
@@ -605,6 +643,14 @@ def _probe_vice_root(binary: str | None = None) -> tuple[bool, str]:
     # authorise in the first place.
     if not os.path.exists(resolved):
         return False, f"{resolved} not found on this host"
+    # sudo_authorisation() is a process-global lru_cache(maxsize=1) that
+    # test_vice_elevation.py's mocked tests populate extensively; the
+    # autouse fixture above already clears it between tests, but this
+    # probe is the ONE-SHOT-per-session answer the whole live gate rests
+    # on (check_elevation caches ITS result too), so it does not rely on
+    # fixture ordering for that one answer -- it forces a fresh read
+    # itself, immune to whatever any other test left behind.
+    sudo_authorisation.cache_clear()
     if sudo_can_run(resolved):
         return True, ""
     entry = _sudoers_entry(resolved)

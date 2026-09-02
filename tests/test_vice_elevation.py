@@ -1000,3 +1000,49 @@ def test_a_passwd_retag_after_nopasswd_voids_the_entry(monkeypatch):
         "    (root) NOPASSWD: PASSWD: /opt/homebrew/bin/x64sc\n",
     )
     assert ve.sudo_can_run("/opt/homebrew/bin/x64sc") is False
+
+
+# ---------------------------------------------------------------------------
+# Cross-test cache leak (coordinator follow-up, 2026-09-02):
+# sudo_authorisation() is a process-global lru_cache(maxsize=1).
+# _sudo_listing() (used throughout this file) clears it BEFORE
+# installing a mock, but nothing clears it AFTER -- so whatever the last
+# test in this file to touch it leaves cached survives into whatever
+# runs next in the same pytest session, mocked or not. A full-suite (or
+# any multi-file) run can serve a fake "not authorised" to
+# test_bpf_attach_detection.py or the elevation gate's own
+# _probe_vice_root, silently skipping a real live test -- exactly the
+# class of hidden skip this branch exists to remove.
+#
+# This pair deliberately does NOT rely on the fix (an autouse fixture
+# in tests/conftest.py) to pass: test_a leaves the cache populated with
+# a fake, empty listing on purpose (matching the shape every other test
+# here already has, minus a final clear), and test_b asks a completely
+# different, real-shaped question with no idea test_a ran. Without the
+# autouse fixture this fails when the two run in sequence, which they
+# do by default (source order, no test-randomisation plugin configured
+# in this repo).
+# ---------------------------------------------------------------------------
+
+
+def test_a_leaves_a_mocked_empty_sudo_listing_cached(monkeypatch):
+    monkeypatch.setattr(
+        ve.subprocess, "run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "", ""),
+    )
+    ve.sudo_authorisation.cache_clear()
+    result = ve.sudo_authorisation()
+    assert result.all_commands is False
+    assert result.commands == frozenset()
+    # No cache_clear() here -- that omission is the point.
+
+
+def test_b_a_later_test_must_not_see_test_as_stale_cache(monkeypatch):
+    monkeypatch.setattr(
+        ve.subprocess, "run",
+        lambda *a, **k: subprocess.CompletedProcess(
+            a[0], 0, "    (root) NOPASSWD: /opt/homebrew/bin/x64sc\n", "",
+        ),
+    )
+    result = ve.sudo_authorisation()
+    assert result.allows("/opt/homebrew/bin/x64sc") is True
