@@ -19,6 +19,7 @@ prints to the terminal.
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -186,6 +187,72 @@ def test_probe_vice_root_existence_checks_the_binary_override_too(monkeypatch):
     ok, remedy = conftest._probe_vice_root(binary="/nonexistent/x64sc")
     assert ok is False
     assert "not found on this host" in remedy
+
+
+# ---------------------------------------------------------------------------
+# L3 (coordinator follow-up): _canonical_repo_root() must not fall back
+# to os.getcwd() when `git worktree list` fails or yields no row (e.g.
+# a `git archive` export with no .git) -- that fabricates a confident
+# sudoers remedy naming throwaway paths nobody could ever authorise.
+# ---------------------------------------------------------------------------
+
+
+def _fake_run(returncode: int, stdout: str):
+    import subprocess as _subprocess
+    return lambda *a, **k: _subprocess.CompletedProcess(a[0], returncode, stdout, "")
+
+
+def test_canonical_repo_root_returns_none_when_git_exits_nonzero(monkeypatch):
+    monkeypatch.setattr(conftest, "subprocess", conftest.subprocess)
+    monkeypatch.setattr(conftest.subprocess, "run", _fake_run(128, ""))
+    conftest._canonical_repo_root.cache_clear()
+    try:
+        assert conftest._canonical_repo_root() is None
+    finally:
+        conftest._canonical_repo_root.cache_clear()
+
+
+def test_canonical_repo_root_returns_none_when_no_worktree_row(monkeypatch):
+    """rc=0 but stdout carries no ``worktree `` line at all -- a
+    malformed or unexpected --porcelain output, not just a hard git
+    failure."""
+    monkeypatch.setattr(conftest.subprocess, "run", _fake_run(0, "branch refs/heads/main\n"))
+    conftest._canonical_repo_root.cache_clear()
+    try:
+        assert conftest._canonical_repo_root() is None
+    finally:
+        conftest._canonical_repo_root.cache_clear()
+
+
+def test_canonical_repo_root_finds_a_real_git_clone():
+    """Ground truth on this bench: a real invocation must resolve to an
+    actual git checkout, not just any non-None string."""
+    conftest._canonical_repo_root.cache_clear()
+    try:
+        root = conftest._canonical_repo_root()
+    finally:
+        conftest._canonical_repo_root.cache_clear()
+    assert root is not None
+    assert os.path.exists(os.path.join(root, ".git"))
+
+
+def test_probe_bridge_scripts_does_not_fabricate_a_remedy_without_a_canonical_root(
+    monkeypatch,
+):
+    monkeypatch.setattr(conftest.subprocess, "run", _fake_run(128, ""))
+    conftest._canonical_repo_root.cache_clear()
+    from c64_test_harness.backends import vice_elevation as ve
+    monkeypatch.setattr(
+        ve, "sudo_can_run",
+        lambda b: pytest.fail("must not probe sudo without a canonical root"),
+    )
+    try:
+        ok, remedy = conftest._probe_bridge_scripts()
+    finally:
+        conftest._canonical_repo_root.cache_clear()
+    assert ok is False
+    assert os.getcwd() not in remedy
+    assert "cannot locate the canonical checkout" in remedy
 
 
 # ---------------------------------------------------------------------------

@@ -595,8 +595,8 @@ def _resolve_ethernet_binary() -> str:
 
 
 @lru_cache(maxsize=1)
-def _canonical_repo_root() -> str:
-    """The main (non-worktree) checkout's absolute path.
+def _canonical_repo_root() -> str | None:
+    """The main (non-worktree) checkout's absolute path, or ``None``.
 
     The sudo'd bridge lifecycle scripts are allowlisted -- and any
     NOPASSWD sudoers rule is written -- against this path, never a
@@ -604,6 +604,14 @@ def _canonical_repo_root() -> str:
     "Permission notes for agents"). ``git worktree list``'s first row is
     always the main worktree, regardless of which worktree this process
     happens to be running from.
+
+    Returns ``None`` -- never a fallback guess like ``os.getcwd()`` --
+    when the git command fails, exits non-zero, or its ``--porcelain``
+    output carries no ``worktree `` row (e.g. a ``git archive`` export
+    with no ``.git`` at all).  A wrong path here used to make
+    ``_probe_bridge_scripts`` print a confident, fabricated sudoers
+    remedy naming throwaway paths nobody could ever authorise (verified
+    live against a ``git archive`` copy).
     """
     try:
         out = subprocess.run(
@@ -611,11 +619,13 @@ def _canonical_repo_root() -> str:
             capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
-        return os.getcwd()
+        return None
+    if out.returncode != 0:
+        return None
     for line in (out.stdout or "").splitlines():
         if line.startswith("worktree "):
             return line[len("worktree "):].strip()
-    return os.getcwd()
+    return None
 
 
 def _probe_vice_root(binary: str | None = None) -> tuple[bool, str]:
@@ -688,6 +698,14 @@ def _probe_bridge_scripts(scripts: tuple[str, ...] | None = None) -> tuple[bool,
     from c64_test_harness.backends.vice_elevation import _sudoers_entry, sudo_can_run
     names = scripts or _BRIDGE_SCRIPT_SETS.get(sys.platform, _BRIDGE_SCRIPT_SETS["linux"])
     root = _canonical_repo_root()
+    if root is None:
+        return False, (
+            "cannot locate the canonical checkout (not a git clone?): "
+            "'git worktree list --porcelain' failed or returned no "
+            "worktree row, and the sudoers path for these scripts can "
+            "only be resolved from a real git checkout -- run the tests "
+            "from a git clone, not an exported copy"
+        )
     paths = [os.path.join(root, "scripts", name) for name in names]
     missing = [p for p in paths if not sudo_can_run(p)]
     if not missing:
