@@ -358,8 +358,8 @@ def test_write_mem_large_payload_uses_post_with_body():
 def test_write_mem_just_above_threshold_uses_post():
     """One byte past the threshold crosses into POST territory."""
     mock, captured = _capture(b"")
-    c = Ultimate64Client("h")
-    payload = bytes(range(Ultimate64Client.WRITE_MEM_QUERY_THRESHOLD + 1))
+    c = Ultimate64Client("h", write_mem_query_threshold=48)
+    payload = bytes(range(c.write_mem_query_threshold + 1))
     with patch("urllib.request.urlopen", mock):
         c.write_mem(0x1000, payload)
     req = captured[0][0]
@@ -456,6 +456,56 @@ def test_run_prg_sends_binary():
     assert req.get_header("Content-type") == "application/octet-stream"
 
 
+def test_run_prg_does_not_gc_temp_by_default(monkeypatch: pytest.MonkeyPatch):
+    """U64_AUTO_TEMP_GC is unset by default -- run_prg must not touch FTP.
+
+    Regression guard for issue #153: the auto-GC hook is opt-in
+    specifically so this test (and every other run_prg test in this
+    file, none of which mock ftplib) never makes a real network call.
+    """
+    monkeypatch.delenv("U64_AUTO_TEMP_GC", raising=False)
+    c = Ultimate64Client("h")
+    with patch.object(c, "gc_temp_folder") as mock_gc:
+        mock, _ = _capture(b"")
+        with patch("urllib.request.urlopen", mock):
+            c.run_prg(b"\x01\x08\x0b\x08")
+    mock_gc.assert_not_called()
+
+
+def test_run_prg_gcs_temp_folder_when_auto_enabled(monkeypatch: pytest.MonkeyPatch):
+    """U64_AUTO_TEMP_GC=1 makes run_prg GC /Temp before uploading (issue #153)."""
+    monkeypatch.setenv("U64_AUTO_TEMP_GC", "1")
+    c = Ultimate64Client("h")
+    calls: list[str] = []
+
+    def fake_gc(**kwargs):
+        calls.append("gc")
+        return None
+
+    mock, captured = _capture(b"")
+    with patch.object(c, "gc_temp_folder", side_effect=fake_gc) as mock_gc, \
+         patch("urllib.request.urlopen", mock):
+        c.run_prg(b"\x01\x08\x0b\x08")
+    mock_gc.assert_called_once()
+    # GC must run before the upload, not after.
+    assert calls == ["gc"]
+    assert captured[0][0].get_full_url() == "http://h/v1/runners:run_prg"
+
+
+def test_client_gc_temp_folder_delegates_with_host():
+    """Ultimate64Client.gc_temp_folder() forwards this client's host + kwargs."""
+    c = Ultimate64Client("10.0.0.64")
+    with patch(
+        "c64_test_harness.backends.ultimate64_temp_gc.gc_temp_folder"
+    ) as mock_module_gc:
+        mock_module_gc.return_value = "sentinel"
+        result = c.gc_temp_folder(keep=5, ftp_username="bench", ftp_password="hunter2")
+    assert result == "sentinel"
+    mock_module_gc.assert_called_once_with(
+        "10.0.0.64", port=None, username="bench", password="hunter2", keep=5, timeout=10.0
+    )
+
+
 def test_sid_play_includes_songnr():
     mock, captured = _capture(b"")
     c = Ultimate64Client("h")
@@ -533,7 +583,9 @@ def test_mount_disk_multipart_body():
     with patch("urllib.request.urlopen", mock):
         c.mount_disk("a", b"\x01\x02\x03", "d64", mode="readonly")
     req = captured[0][0]
-    assert req.get_method() == "PUT"
+    # POST is the upload-and-mount route; PUT is mount-by-device-path and
+    # has no body handler at all. See test_mount_disk_with_a_body_uses_post.
+    assert req.get_method() == "POST"
     ct = req.get_header("Content-type")
     assert ct.startswith("multipart/form-data; boundary=")
     boundary = ct.split("boundary=", 1)[1]
@@ -550,14 +602,122 @@ def test_mount_disk_multipart_body():
     assert body.rstrip(b"\r\n").endswith(f"--{boundary}--".encode())
 
 
-def test_mount_disk_url_includes_colon():
+def test_mount_disk_slot_is_a_plain_letter():
+    """The slot must not carry an encoded colon.
+
+    ``/v1/drives/a%3A:mount`` draws 400 "Invalid Drive 'a:'" -- the
+    trailing colon is the firmware's verb separator, so the drive
+    identifier cannot contain one. This test used to assert the
+    over-encoded form, which is why the bug survived a live audit that
+    fixed the same construction in ``unmount_disk``.
+    """
     mock, captured = _capture(b"")
     c = Ultimate64Client("h")
     with patch("urllib.request.urlopen", mock):
         c.mount_disk("a", b"x", "d64")
     url = captured[0][0].get_full_url()
-    # slot "a:" URL-encoded -> a%3A
-    assert url == "http://h/v1/drives/a%3A:mount"
+    assert "%3A" not in url, url
+    assert url == "http://h/v1/drives/a:mount"
+
+
+def test_mount_disk_with_a_body_uses_post():
+    """Upload-and-mount is the POST form; PUT is mount-by-device-path.
+
+    S: 1541u-315preview software/api/route_drives.cc:109 registers
+    ``API_CALL(PUT, drives, mount, NULL, ...)`` with ``image`` P_REQUIRED
+    and a NULL body handler, while :141 registers
+    ``API_CALL(POST, drives, mount, &attachment_writer, ...)`` which
+    takes multipart or application/octet-stream. Sending a body by PUT
+    hits the route that wants an ``image`` query argument and has no
+    body handler, so it 400s whatever the body looks like.
+    """
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        c.mount_disk("a", b"x", "d64")
+    assert captured[0][0].get_method() == "POST"
+
+
+def test_mount_disk_image_accepts_a_device_path():
+    """The PUT form: mount an image already on the device."""
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        c.mount_disk_path("a", "/Usb0/games/disk.d64", mode="readonly")
+    req = captured[0][0]
+    assert req.get_method() == "PUT"
+    url = req.get_full_url()
+    assert url.startswith("http://h/v1/drives/a:mount?")
+    # urllib.parse.quote defaults to safe="/", which every query in this
+    # client relies on, and an unencoded "/" is legal in a query
+    # component. The device path therefore appears verbatim.
+    assert "image=/Usb0/games/disk.d64" in url
+    assert "mode=readonly" in url
+    assert req.data is None
+
+
+def test_mount_disk_path_validates_drive_and_mode():
+    c = Ultimate64Client("h")
+    with pytest.raises(ValueError):
+        c.mount_disk_path("c", "/Usb0/x.d64")
+    with pytest.raises(ValueError):
+        c.mount_disk_path("a", "/Usb0/x.d64", mode="bogus")
+    with pytest.raises(ValueError):
+        c.mount_disk_path("a", "")
+
+
+def test_drive_slot_path_normalises_the_caller_s_spelling():
+    """One construction point, so a third hand-rolled site cannot appear.
+
+    Callers have long been told the trailing colon is added for them, so
+    "a:" must keep working -- it just must not reach the wire.
+    """
+    for spelling in ("a", "A", "a:", "A:"):
+        assert (
+            Ultimate64Client._drive_slot_path(spelling, "mount")
+            == "/v1/drives/a:mount"
+        )
+
+
+def test_drive_slot_path_allows_softiec():
+    """S: route_drives.cc:95 PATH_PARAM_ENUM("drive", "a,b,softiec").
+
+    The validation was narrower than the firmware, so the IEC file
+    system could not be addressed at all.
+    """
+    assert (
+        Ultimate64Client._drive_slot_path("softiec", "mount")
+        == "/v1/drives/softiec:mount"
+    )
+
+
+def test_drive_slot_path_still_rejects_nonsense():
+    for bad in ("c", "", "a b", "../etc"):
+        with pytest.raises(ValueError):
+            Ultimate64Client._drive_slot_path(bad, "mount")
+
+
+def test_mount_disk_routes_through_the_shared_builder():
+    """Regression guard for the class of bug, not the instance.
+
+    #167 was one hand-rolled path construction left behind when its
+    sibling was fixed. Asserting the shared builder is actually used
+    means a future hand-rolled site fails here rather than on hardware.
+    """
+    seen = []
+    real = Ultimate64Client._drive_slot_path
+
+    def spy(drive, action):
+        seen.append((drive, action))
+        return real(drive, action)
+
+    mock, _ = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch.object(
+        Ultimate64Client, "_drive_slot_path", staticmethod(spy)
+    ), patch("urllib.request.urlopen", mock):
+        c.mount_disk("a", b"x", "d64")
+    assert seen == [("a", "mount")]
 
 
 def test_mount_disk_validates_mode():
@@ -567,12 +727,18 @@ def test_mount_disk_validates_mode():
 
 
 def test_unmount_disk_url():
+    """The `:unmount` endpoint this used to assert has never existed.
+
+    It 404s on 3.14, 3.15 and 1.1.0 alike; `:remove` is the unmount verb,
+    and the slot takes the plain letter (a percent-encoded `b:` draws a
+    400 "Invalid Drive"). See `test_unmount_disk_targets_the_remove_endpoint`.
+    """
     mock, captured = _capture(b"")
-    c = Ultimate64Client("h")
+    c = Ultimate64Client("h", write_mem_query_threshold=48)
     with patch("urllib.request.urlopen", mock):
         c.unmount_disk("b")
     url = captured[0][0].get_full_url()
-    assert url == "http://h/v1/drives/b%3A:unmount"
+    assert url == "http://h/v1/drives/b:remove"
 
 
 # ---------------------------------------------------------------- multipart helper
@@ -1096,12 +1262,17 @@ def test_write_mem_threshold_autodetect_3_14d():
         assert c.write_mem_query_threshold == 128
 
 
-def test_write_mem_threshold_autodetect_other():
-    """Unknown / non-3.14 firmware keeps 48."""
+def test_write_mem_threshold_autodetect_older_firmware_is_protected():
+    """Firmware below 3.15 lacks the Temp-folder fix, whatever the version.
+
+    This used to assert 48 for anything that was not literally `3.14*`,
+    which handed the permissive threshold to every older build and to the
+    whole CBM line. The rule is now "has the fix", not "is 3.14".
+    """
     mock, _ = _capture(b'{"firmware_version":"V3.13","product":"Ultimate 64"}')
     with patch("urllib.request.urlopen", mock):
         c = Ultimate64Client("h")
-        assert c.write_mem_query_threshold == 48
+        assert c.write_mem_query_threshold == 128
 
 
 def test_write_mem_threshold_kwarg_override():
@@ -1114,12 +1285,77 @@ def test_write_mem_threshold_kwarg_override():
     assert captured == []
 
 
-def test_write_mem_threshold_probe_failure_falls_back():
-    """If get_info() raises during the probe, threshold falls back to 48."""
+def test_write_mem_threshold_probe_failure_is_conservative():
+    """A failed probe must assume the fix is absent, not present.
+
+    Guessing "present" puts small writes back on the leaking POST path;
+    guessing "absent" only costs a higher PUT threshold.
+    """
     def _raise(req, timeout=None):
         raise urllib.error.URLError("connection refused")
 
     with patch("urllib.request.urlopen", side_effect=_raise):
         c = Ultimate64Client("h")
         # Construction must not raise; resolving the property must not raise.
+        assert c.write_mem_query_threshold == 128
+        assert c.capabilities.writemem_post_safe is False
+
+
+# ------------------------------------------- drive unmount endpoint (audit #3)
+def test_unmount_disk_targets_the_remove_endpoint():
+    """`:unmount` has never existed on any firmware.
+
+    3.15's `software/api/route_drives.cc` registers mount / reset / remove /
+    on / off / unlink / load_rom / set_mode. `remove` is the unmount verb;
+    `unmount` 404s on 3.14, 3.15 and 1.1.0 alike.
+    """
+    mock, captured = _capture()
+    c = Ultimate64Client("h", write_mem_query_threshold=48)
+    with patch("urllib.request.urlopen", mock):
+        c.unmount_disk("a")
+    assert captured[0][0].full_url == "http://h/v1/drives/a:remove"
+
+
+def test_unmount_disk_does_not_percent_encode_the_slot():
+    """`/v1/drives/a%3A:remove` answers 400 "Invalid Drive 'a:'".
+
+    The slot takes the plain letter (verified live 2026-07-28).
+    """
+    mock, captured = _capture()
+    c = Ultimate64Client("h", write_mem_query_threshold=48)
+    with patch("urllib.request.urlopen", mock):
+        c.unmount_disk("a:")
+    assert "%3A" not in captured[0][0].full_url
+    assert captured[0][0].full_url == "http://h/v1/drives/a:remove"
+
+
+def test_unmount_disk_rejects_an_unknown_slot():
+    c = Ultimate64Client("h", write_mem_query_threshold=48)
+    with pytest.raises(ValueError):
+        c.unmount_disk("z")
+
+
+# --------------------------------- write_mem threshold via capabilities (#1)
+def test_write_mem_threshold_autodetect_3_15_uses_post_sooner():
+    """3.15 carries the Temp-folder fix, so the POST path is safe again."""
+    mock, _ = _capture(b'{"firmware_version":"3.15","product":"Ultimate 64 Elite"}')
+    with patch("urllib.request.urlopen", mock):
+        c = Ultimate64Client("h")
         assert c.write_mem_query_threshold == 48
+
+
+def test_write_mem_threshold_autodetect_c64u_1_1_0_is_protected():
+    """Regression: 1.1.0 is not `3.14*`, so the old string match left the
+    C64U on the permissive threshold despite predating the fix."""
+    mock, _ = _capture(b'{"firmware_version":"1.1.0"}')
+    with patch("urllib.request.urlopen", mock):
+        c = Ultimate64Client("h")
+        assert c.write_mem_query_threshold == 128
+
+
+def test_client_exposes_capabilities():
+    mock, _ = _capture(b'{"firmware_version":"3.15"}')
+    with patch("urllib.request.urlopen", mock):
+        c = Ultimate64Client("h")
+        assert c.capabilities.writemem_post_safe is True
+        assert c.capabilities.runner_wedge_possible is False

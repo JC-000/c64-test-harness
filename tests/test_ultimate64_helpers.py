@@ -35,6 +35,8 @@ from c64_test_harness.backends.ultimate64_helpers import (
     runner_health_check,
     set_reu,
     set_sid_socket,
+    get_sid_socket_types,
+    get_physical_sid_sockets,
     set_turbo_mhz,
     snapshot_state,
     unmount,
@@ -355,31 +357,113 @@ class TestSID:
         assert result["sockets"] == {"SID Socket 1": "Enabled"}
         assert result["addressing"] == {"SID Socket 1 Address": "$D400"}
 
-    def test_set_sid_socket_valid(self) -> None:
+    def test_set_sid_socket_enables_the_socket(self) -> None:
+        """``SID Socket N`` takes an enable value, and only that.
+
+        The old shape of this test asserted a PUT of ``"8580"`` to that
+        item and stayed green against a mock while the firmware answered
+        400 on the wire (verified live 2026-08-30). It certified our own
+        assumption rather than the contract.
+        """
         client = _make_client()
-        set_sid_socket(client, 1, "8580", "$D400")
+        set_sid_socket(client, 1, "Enabled", "$D400")
         calls = client.set_config_items.call_args_list
         assert len(calls) == 2
-        assert calls[0].args == (CAT_SID_SOCKETS, {"SID Socket 1": "8580"})
+        assert calls[0].args == (CAT_SID_SOCKETS, {"SID Socket 1": "Enabled"})
         assert calls[1].args == (
             CAT_SID_ADDRESSING,
             {"SID Socket 1 Address": "$D400"},
         )
 
+    def test_set_sid_socket_rejects_a_chip_type_locally(self) -> None:
+        """A chip type has nothing legitimate to write to.
+
+        ``SID Detected Socket N`` is filled by the boot probe and is not
+        a selector, so this raises locally instead of sending a request
+        the firmware rejects with 400.
+        """
+        client = _make_client()
+        with pytest.raises(ValueError, match="not settable"):
+            set_sid_socket(client, 1, "8580", "$D400")
+        client.set_config_items.assert_not_called()
+
     def test_set_sid_socket_bad_socket(self) -> None:
         client = _make_client()
         with pytest.raises(ValueError, match="socket must be 1 or 2"):
-            set_sid_socket(client, 3, "8580", "$D400")
+            set_sid_socket(client, 3, "Enabled", "$D400")
 
     def test_set_sid_socket_bad_type(self) -> None:
         client = _make_client()
-        with pytest.raises(ValueError, match="Invalid SID type"):
+        with pytest.raises(ValueError, match="Invalid SID socket state"):
             set_sid_socket(client, 1, "FOO", "$D400")
 
     def test_set_sid_socket_bad_address(self) -> None:
         client = _make_client()
         with pytest.raises(ValueError, match="Invalid SID address"):
-            set_sid_socket(client, 1, "8580", "$Z000")
+            set_sid_socket(client, 1, "Enabled", "$Z000")
+
+    def test_get_sid_socket_types_reads_the_detected_item(self) -> None:
+        """Its name says "types", so it must return types.
+
+        It used to read ``SID Socket N`` -- the enable toggle -- and
+        hand back ``{1: "Enabled"}`` labelled as a chip type.
+        """
+        client = _make_client()
+        client.get_config_category.return_value = {
+            CAT_SID_SOCKETS: {
+                "SID Socket 1": "Enabled",
+                "SID Socket 2": "Enabled",
+                "SID Detected Socket 1": "8580",
+                "SID Detected Socket 2": "None",
+            },
+            "errors": [],
+        }
+        assert get_sid_socket_types(client) == {1: "8580", 2: "None"}
+
+    def test_get_physical_sid_sockets_finds_a_fitted_chip(self) -> None:
+        """It used to be unable to return anything but ``[]``.
+
+        Reading the enable item gave ``"Enabled"``, which never matches
+        a chip type, so the filter dropped every socket.
+        """
+        client = _make_client()
+        client.get_config_category.return_value = {
+            CAT_SID_SOCKETS: {
+                "SID Socket 1": "Enabled",
+                "SID Socket 2": "Disabled",
+                "SID Detected Socket 1": "8580",
+                "SID Detected Socket 2": "None",
+            },
+            "errors": [],
+        }
+        assert get_physical_sid_sockets(client) == [1]
+
+    def test_get_physical_sid_sockets_counts_replacement_chips(self) -> None:
+        """A SIDKick or ARMSID is a physical chip in the socket.
+
+        Filtering to ``6581``/``8580`` would report an empty socket on
+        every device fitted with a replacement.
+        """
+        client = _make_client()
+        client.get_config_category.return_value = {
+            CAT_SID_SOCKETS: {
+                "SID Detected Socket 1": "ARMSID",
+                "SID Detected Socket 2": "SIDKick Pico",
+            },
+            "errors": [],
+        }
+        assert get_physical_sid_sockets(client) == [1, 2]
+
+    def test_get_physical_sid_sockets_empty_when_none_detected(self) -> None:
+        client = _make_client()
+        client.get_config_category.return_value = {
+            CAT_SID_SOCKETS: {
+                "SID Detected Socket 1": "None",
+                "SID Detected Socket 2": "None",
+            },
+            "errors": [],
+        }
+        assert get_physical_sid_sockets(client) == []
 
 
 # --------------------------------------------------------------------------- #

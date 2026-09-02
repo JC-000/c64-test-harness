@@ -38,6 +38,51 @@ from c64_test_harness.backends.vice_lifecycle import (
     ethernet_vice_binary,
 )
 
+# ---------------------------------------------------------------------------
+# Bridge IP space — reserved for the harness's own ethernet tests
+# ---------------------------------------------------------------------------
+#
+# The harness owns this /24: the setup scripts put the host at ``.1``
+# (``BRIDGE_ADDR`` in setup-bridge-feth-macos.sh / setup-tap-networking.sh)
+# and the two emulated C64s answer on ``.2`` and ``.3``.
+#
+# These were previously duplicated as literals across five test modules,
+# which made the reservation invisible -- a consumer rig built on top of
+# the harness's bridge (c64-https) ran a DHCP pool of ``.2-.10`` over
+# exactly the addresses the tests hardcode, and moved the host address to
+# a different interface while keeping ``.1``. Nothing detected the clash.
+#
+# Override the whole range with ``C64_BRIDGE_SUBNET`` (first three octets)
+# when the harness has to coexist with a rig that already owns 10.0.65/24.
+# Consumers wanting their own services on the harness bridge should stay
+# clear of ``.1``-``.3`` and use ``.100`` upward.
+BRIDGE_SUBNET = os.environ.get("C64_BRIDGE_SUBNET", "10.0.65").strip().rstrip(".")
+
+
+def bridge_ip(host_octet: int) -> bytes:
+    """4-byte IP in the harness's reserved bridge range."""
+    octets = [int(part) for part in BRIDGE_SUBNET.split(".")]
+    if len(octets) != 3:
+        raise ValueError(
+            f"C64_BRIDGE_SUBNET must be three octets (e.g. '10.0.65'), "
+            f"got {BRIDGE_SUBNET!r}"
+        )
+    return bytes(octets + [host_octet])
+
+
+def bridge_ip_str(host_octet: int) -> str:
+    """Dotted-quad form of :func:`bridge_ip`."""
+    return ".".join(str(b) for b in bridge_ip(host_octet))
+
+
+#: Host side of the bridge (assigned by the setup scripts).
+BRIDGE_HOST_IP = bridge_ip(1)
+#: First emulated C64.
+BRIDGE_IP_A = bridge_ip(2)
+#: Second emulated C64.
+BRIDGE_IP_B = bridge_ip(3)
+
+
 if sys.platform == "darwin":
     ETHERNET_DRIVER = "pcap"
     IFACE_A = "feth0"

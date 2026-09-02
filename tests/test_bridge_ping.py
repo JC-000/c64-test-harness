@@ -28,6 +28,8 @@ import time
 import pytest
 
 from bridge_platform import (
+    BRIDGE_IP_A,
+    BRIDGE_IP_B,
     BRIDGE_NAME,
     IFACE_A,
     IFACE_B,
@@ -105,8 +107,8 @@ CONSUME_ADDR = 0xC200
 
 MAC_A = bytes.fromhex("02C640000001")
 MAC_B = bytes.fromhex("02C640000002")
-IP_A = bytes([10, 0, 65, 2])
-IP_B = bytes([10, 0, 65, 3])
+IP_A = BRIDGE_IP_A
+IP_B = BRIDGE_IP_B
 
 PING_ID = 0xBEEF
 PING_SEQ = 0x0001

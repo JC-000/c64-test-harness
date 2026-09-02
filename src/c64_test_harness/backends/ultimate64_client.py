@@ -22,8 +22,11 @@ import urllib.request
 import uuid
 from typing import TYPE_CHECKING, Any
 
+from .u64_capabilities import DeviceCapabilities
+
 if TYPE_CHECKING:
     from .ultimate64_probe import LivenessResult
+    from .ultimate64_temp_gc import TempGCResult
 
 try:  # device_lock needs fcntl — absent on Windows, optional everywhere
     from .device_lock import advisory_lock_check as _advisory_lock_check
@@ -177,18 +180,18 @@ class Ultimate64Client:
         :param write_mem_query_threshold: payload-size cutoff (in bytes)
             at which :meth:`write_mem` switches from the legacy
             ``PUT ?data=<hex>`` form to the ``POST`` raw-byte form. If
-            ``None`` (the default), the threshold is auto-detected from
-            the device's firmware version on first construction:
+            ``None`` (the default), it is derived from :attr:`capabilities`:
 
-            * fw ``3.14*`` (incl. 3.14d) → **128**. The 48..127 range over
-              the POST path occasionally wedges the runner on this fw,
-              so the higher threshold pushes everything below 128 onto
-              the reliable PUT-with-hex path.
-            * any other / unknown fw → **48** (conservative legacy default).
+            * firmware **without** the Temp-folder GC fix (upstream #686) —
+              every 3.14/3.13 build, and the whole 1.x CBM line — → **128**,
+              which pushes the 48..127 band that wedges the runner off the
+              POST path and onto the reliable PUT-with-hex path;
+            * firmware **with** it (3.15 and later) → **48**.
 
-            If the firmware probe (``get_info()``) fails for any reason,
-            the threshold falls back to 48 silently — construction never
-            raises on probe failure.
+            Passing a value explicitly pins it and skips the probe entirely,
+            so construction issues no HTTP traffic. If the probe fails, the
+            capability set resolves conservatively (fix assumed absent, so
+            128) — construction never raises on probe failure.
         """
         if not isinstance(host, str) or not host:
             raise ValueError("host must be a non-empty string")
@@ -202,39 +205,51 @@ class Ultimate64Client:
         self.timeout = timeout
         self._base = f"http://{host}:{port}" if port != 80 else f"http://{host}"
 
+        self._capabilities: DeviceCapabilities | None = None
         if write_mem_query_threshold is not None:
+            # An explicit threshold pins the behaviour, so the probe is not
+            # needed at construction; ``capabilities`` stays lazy and this
+            # path issues no HTTP traffic at all.
             self.write_mem_query_threshold = int(write_mem_query_threshold)
         else:
-            self.write_mem_query_threshold = self._autodetect_write_mem_threshold()
+            self.write_mem_query_threshold = (
+                self.capabilities.write_mem_query_threshold
+            )
 
     def close(self) -> None:
         """No-op — the client is stateless (uses a fresh connection per call)."""
         return None
 
     #: Bounded timeout (seconds) for the construct-time firmware probe
-    #: used by :meth:`_autodetect_write_mem_threshold`. Decoupled from
+    #: used by :meth:`_probe_info`. Decoupled from
     #: the per-request ``timeout`` so an unreachable host doesn't stall
     #: ``__init__`` for the full default.
     _AUTODETECT_PROBE_TIMEOUT: float = 0.5
 
-    def _autodetect_write_mem_threshold(self) -> int:
+    @property
+    def capabilities(self) -> DeviceCapabilities:
+        """What this device's firmware can do — probed once, then cached.
+
+        A failed probe yields the conservative all-fixes-absent set rather
+        than raising; construction never fails on an unreachable device.
+        """
+        if self._capabilities is None:
+            self._capabilities = DeviceCapabilities.from_info(
+                self._probe_info()
+            )
+        return self._capabilities
+
+    def _probe_info(self) -> dict | None:
+        """``GET /v1/info`` under a short timeout; ``None`` on any failure."""
         original = self.timeout
         self.timeout = min(self._AUTODETECT_PROBE_TIMEOUT, original)
         try:
             info = self.get_info()
         except Exception:
-            return self.WRITE_MEM_QUERY_THRESHOLD
+            return None
         finally:
             self.timeout = original
-        if not isinstance(info, dict):
-            return self.WRITE_MEM_QUERY_THRESHOLD
-        fw = info.get("firmware_version")
-        if not isinstance(fw, str):
-            return self.WRITE_MEM_QUERY_THRESHOLD
-        normalised = fw.lstrip("Vv").lower()
-        if normalised.startswith("3.14"):
-            return 128
-        return self.WRITE_MEM_QUERY_THRESHOLD
+        return info if isinstance(info, dict) else None
 
     # ----------------------------------------------------------------- internal
     def _url(self, path: str) -> str:
@@ -565,8 +580,9 @@ class Ultimate64Client:
     #: Class-level fallback for the raw-byte threshold above which
     #: :meth:`write_mem` switches from the legacy ``PUT ?data=<hex>`` form
     #: to the ``POST`` raw-byte form. Per-instance ``write_mem_query_threshold``
-    #: (set in ``__init__``) takes precedence; this attribute is retained
-    #: for backwards compatibility with callers that poke the class.
+    #: (set in ``__init__`` from :attr:`capabilities`) takes precedence; this
+    #: attribute is retained for backwards compatibility with callers that
+    #: poke the class.
     WRITE_MEM_QUERY_THRESHOLD: int = 48
 
     def write_mem(self, address: int, data: bytes) -> None:
@@ -575,8 +591,9 @@ class Ultimate64Client:
         Uses one of two wire forms depending on payload size:
 
         * **Small payloads**
-          (``len(data) <= self.write_mem_query_threshold``, default 48
-          bytes; auto-bumped to 128 on firmware 3.14*) —
+          (``len(data) <= self.write_mem_query_threshold``; 48 on firmware
+          carrying the Temp-folder fix, 128 without it — see
+          :attr:`capabilities`) —
           ``PUT /v1/machine:writemem?address=0xNNNN&data=<hex>``.  Kept
           for backwards compatibility with existing callers/mocks.
         * **Large payloads** — ``POST /v1/machine:writemem?address=0xNNNN``
@@ -692,6 +709,46 @@ class Ultimate64Client:
         """
         self._post_binary("/v1/runners:load_prg", data)
 
+    def gc_temp_folder(
+        self,
+        *,
+        keep: int | None = None,
+        ftp_port: int | None = None,
+        ftp_username: str | None = None,
+        ftp_password: str | None = None,
+        timeout: float | None = None,
+    ) -> "TempGCResult":
+        """Best-effort GC of the device's leaked ``/Temp`` attachments over FTP.
+
+        Every REST call that carries a body leaks a managed attachment
+        (``temp0000``, ``temp0001``, ...) into ``/Temp``; unreleased
+        firmware never collects them, and enough accumulation wedges
+        the REST API and UCI bridge together (see GitHub issue #153,
+        ``docs/u64_recovery.md``). This deletes them oldest-first,
+        keeping the youngest *keep*.
+
+        Delegates to
+        :func:`~c64_test_harness.backends.ultimate64_temp_gc.gc_temp_folder`
+        with this client's ``host``. Never raises -- any FTP/network
+        failure is captured in the returned result's ``.error``.
+        :meth:`run_prg` calls this automatically when
+        ``U64_AUTO_TEMP_GC`` is set; call it directly for other
+        attachment-heavy paths (e.g. repeated :meth:`load_prg`) or to
+        run a manual hygiene pass.
+
+        Caller responsibility: this does not acquire a DeviceLock. Call
+        it only while already holding the lock for this device.
+        """
+        from .ultimate64_temp_gc import DEFAULT_FTP_TIMEOUT, gc_temp_folder as _gc_temp_folder
+        return _gc_temp_folder(
+            self.host,
+            port=ftp_port,
+            username=ftp_username,
+            password=ftp_password,
+            keep=keep,
+            timeout=timeout if timeout is not None else DEFAULT_FTP_TIMEOUT,
+        )
+
     def run_prg(self, data: bytes, *, fallback_on_404: bool = True) -> None:
         """POST /v1/runners:run_prg — load and RUN a PRG (DESTRUCTIVE).
 
@@ -739,7 +796,17 @@ class Ultimate64Client:
         Do NOT call ``poweroff()`` to clear a stuck runner -- it leaves
         the device unreachable until someone physically power-cycles it.
         ``reboot()`` (via ``recover()``) is the correct escalation.
+
+        **Temp-folder hygiene** (issue #153): when the ``U64_AUTO_TEMP_GC``
+        env var is set, this calls :meth:`gc_temp_folder` before
+        uploading, best-effort, to defuse the writemem-exhaustion wedge
+        described above and in ``docs/u64_recovery.md``. Off by default
+        (opt-in) so callers that never set the var see no behavior
+        change and no network traffic beyond the PRG upload itself.
         """
+        from .ultimate64_temp_gc import auto_gc_enabled as _auto_gc_enabled
+        if _auto_gc_enabled():
+            self.gc_temp_folder()
         try:
             self._post_binary("/v1/runners:run_prg", data)
         except Ultimate64Error as exc:
@@ -826,25 +893,34 @@ class Ultimate64Client:
         image_type: str,
         mode: str = "readwrite",
     ) -> None:
-        """PUT /v1/drives/<drive>:mount — mount a disk image (DESTRUCTIVE).
+        """POST /v1/drives/<drive>:mount — upload and mount an image (DESTRUCTIVE).
 
-        `drive` is the slot id (e.g. "a", "b"). The trailing colon used by
-        the drives endpoint is added automatically. `image_type` is e.g.
-        "d64", "d71", "d81", "g64". `mode` is "readwrite", "readonly",
-        or "unlinked".
+        `drive` is the slot id ("a", "b" or "softiec"). `image_type` is
+        e.g. "d64", "d71", "d81", "g64", "g71". `mode` is "readwrite",
+        "readonly", or "unlinked".
+
+        **POST, not PUT.** The firmware registers two different routes on
+        this path: ``PUT`` mounts an image *already on the device* and
+        takes an ``image`` query argument with no body handler at all,
+        while ``POST`` is the upload-and-mount form that accepts a
+        multipart or ``application/octet-stream`` body.  S: 3.15's
+        ``software/api/route_drives.cc:109`` (``PUT ... NULL,
+        ARRAY({{"image", P_REQUIRED}, ...})``) versus ``:141``
+        (``POST ... &attachment_writer``).
+
+        This used to PUT the body, which reaches the route that wants a
+        query argument and has nowhere to put the bytes -- so it answered
+        400 for every body shape tried, multipart and raw alike.  That
+        looked like "this firmware cannot accept an upload"; it was the
+        wrong verb.  See :meth:`mount_disk_path` for the PUT form.
         """
-        if not isinstance(drive, str) or not drive:
-            raise ValueError("drive must be a non-empty string")
         if not isinstance(image, (bytes, bytearray)):
             raise TypeError("image must be bytes")
         if not isinstance(image_type, str) or not image_type:
             raise ValueError("image_type must be a non-empty string")
         if mode not in ("readwrite", "readonly", "unlinked"):
             raise ValueError(f"mode must be readwrite/readonly/unlinked, got {mode!r}")
-
-        # Normalise "a" -> "a:" — URL-encode the full segment including colon.
-        slot = drive if drive.endswith(":") else drive + ":"
-        path = f"/v1/drives/{_encode(slot)}:mount"
+        path = self._drive_slot_path(drive, "mount")
 
         boundary = "----U64ClientBoundary" + uuid.uuid4().hex
         body = _build_multipart(
@@ -855,27 +931,94 @@ class Ultimate64Client:
             file_bytes=bytes(image),
         )
         self._request(
-            "PUT",
+            "POST",
             path,
             body=body,
             content_type=f"multipart/form-data; boundary={boundary}",
         )
 
+    def mount_disk_path(
+        self,
+        drive: str,
+        image_path: str,
+        image_type: str | None = None,
+        mode: str = "readwrite",
+    ) -> None:
+        """PUT /v1/drives/<drive>:mount — mount an image already on the device.
+
+        The counterpart to :meth:`mount_disk`: no bytes cross the wire,
+        the device opens a path of its own.  ``image_path`` is a device
+        path such as ``/Usb0/games/disk.d64``.
+
+        ``image_type`` may be omitted, in which case the firmware infers
+        it from the file extension (S: ``route_drives.cc:97`` -- "Defaults
+        to the file extension").
+
+        This is the form that works when an upload is impractical, and
+        the one callers were rediscovering by hand as a workaround for
+        :meth:`mount_disk` sending its body by the wrong verb.
+
+        :raises ValueError: on a bad drive, an empty path, or a mode
+            outside readwrite/readonly/unlinked.
+        """
+        if not isinstance(image_path, str) or not image_path:
+            raise ValueError("image_path must be a non-empty string")
+        if mode not in ("readwrite", "readonly", "unlinked"):
+            raise ValueError(f"mode must be readwrite/readonly/unlinked, got {mode!r}")
+        path = self._drive_slot_path(drive, "mount")
+        query: dict[str, Any] = {"image": image_path, "mode": mode}
+        if image_type:
+            query["type"] = image_type
+        self._put_no_body(path, query=query)
+
     def unmount_disk(self, drive: str) -> None:
-        """PUT /v1/drives/<drive>:unmount — unmount a drive (DESTRUCTIVE)."""
-        if not isinstance(drive, str) or not drive:
-            raise ValueError("drive must be a non-empty string")
-        slot = drive if drive.endswith(":") else drive + ":"
-        self._put_no_body(f"/v1/drives/{_encode(slot)}:unmount")
+        """PUT /v1/drives/<drive>:remove — unmount a drive (DESTRUCTIVE).
+
+        Alias for :meth:`drive_remove_disk`, kept for callers that reach for
+        the "unmount" name.
+
+        This used to target ``:unmount``, an endpoint no firmware has ever
+        registered — 3.15's ``software/api/route_drives.cc`` exposes mount /
+        reset / remove / on / off / unlink / load_rom / set_mode, and
+        ``remove`` is the unmount verb. It also percent-encoded a trailing
+        colon into the slot, which draws a 400 ("Invalid Drive 'a:'"). Both
+        are fixed here; the slot now takes the plain letter.
+        """
+        self.drive_remove_disk(drive)
+
+    #: Drive slots the firmware accepts in a ``/v1/drives/{drive}:...``
+    #: path.  ``softiec`` is the IEC file system; S: 3.15's
+    #: ``software/api/route_drives.cc:95``
+    #: ``PATH_PARAM_ENUM("drive", "a,b,softiec")``.
+    _DRIVE_SLOTS = ("a", "b", "softiec")
 
     @staticmethod
     def _drive_slot_path(drive: str, action: str) -> str:
-        # Plain slot letter, no trailing colon: fw 3.14 answers 400
-        # "Invalid Drive 'a:'" for /v1/drives/a%3A:reset but 200 for
-        # /v1/drives/a:reset (verified live 2026-07-28).
-        if drive not in ("a", "b"):
-            raise ValueError(f"drive must be 'a' or 'b', got {drive!r}")
-        return f"/v1/drives/{drive}:{action}"
+        """Build ``/v1/drives/<slot>:<action>``.
+
+        The single place a drive path is constructed.  Every drive
+        method routes through here, because the one that did not --
+        ``mount_disk`` -- kept the over-encoding bug through a live
+        audit that fixed the identical construction in its sibling
+        (issue #167).
+
+        The slot is a plain identifier with no trailing colon and no
+        percent-encoding: the colon after it is the firmware's verb
+        separator, so a slot containing an encoded one draws
+        400 "Invalid Drive 'a:'" (verified live 2026-07-28 on fw 3.14,
+        again on 3.15).  Callers were long told the trailing colon is
+        added for them, so ``"a:"`` and ``"A"`` are accepted and
+        normalised here rather than rejected.
+        """
+        if not isinstance(drive, str):
+            raise ValueError(f"drive must be a string, got {type(drive).__name__}")
+        slot = drive.strip().rstrip(":").lower()
+        if slot not in Ultimate64Client._DRIVE_SLOTS:
+            raise ValueError(
+                f"drive must be one of {list(Ultimate64Client._DRIVE_SLOTS)}, "
+                f"got {drive!r}"
+            )
+        return f"/v1/drives/{slot}:{action}"
 
     def drive_on(self, drive: str) -> None:
         """PUT /v1/drives/<drive>:on — power on a drive slot (DESTRUCTIVE)."""

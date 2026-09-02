@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from .backends.unified_manager import TestTarget
     from .backends.vice_binary import BinaryViceTransport
 
+from .execution_policy import check_execution_policy
 from .transport import TransportError, TimeoutError
 
 _VALID_REGS = {"A", "X", "Y", "SP", "PC"}
@@ -96,6 +97,7 @@ def jsr(
     timeout: float = 5.0,
     *,
     scratch_addr: int = 0x0334,
+    override: str | None = None,
 ) -> dict[str, int]:
     """Call a subroutine at *addr* and wait for it to return.
 
@@ -112,7 +114,24 @@ def jsr(
 
     Returns the register state after the subroutine returns.  The CPU is
     paused when this function returns.
+
+    If the transport carries an :class:`~.execution_policy.ExecutionPolicy`
+    and *addr* falls in a span the caller declared dead, this raises
+    :class:`~.execution_policy.ExecutionPolicyError` **before anything
+    reaches the machine** — no trampoline is written, no breakpoint set,
+    no resume issued. That is the point: calling reclaimed code wedges
+    the CPU somewhere unpredictable and surfaces only as a bare
+    ``TimeoutError``, so the guard has to be prevention rather than
+    recovery. ``override="<reason>"`` permits one call and is logged at
+    WARNING. Permissive by default: no policy, no behaviour change.
+
+    :param override: Reason string permitting a call into a declared
+        dead span. A bare ``True`` is rejected.
     """
+    # Guard first — before the trampoline write, so a refused call leaves
+    # the machine exactly as it was.
+    check_execution_policy(transport, addr, override=override)
+
     # Build trampoline: JSR $xxxx; NOP; NOP
     lo = addr & 0xFF
     hi = (addr >> 8) & 0xFF
@@ -195,6 +214,7 @@ def run_subroutine(
     timeout: float = 30.0,
     poll_cadence: float = 0.005,
     trampoline_addr: int = 0x0360,
+    override: str | None = None,
 ) -> None:
     """Run subroutine at *addr* and wait for it to return. Backend-agnostic.
 
@@ -217,6 +237,10 @@ def run_subroutine(
         A ``TestTarget`` (from ``UnifiedManager.acquire()``).
     addr:
         Address of the 6502 subroutine to invoke. Must end in ``RTS``.
+    override:
+        Reason string permitting a call into a span declared dead by an
+        ``ExecutionPolicy`` on the target's transport. A bare ``True`` is
+        rejected. Permissive by default.
     timeout:
         Wall-clock seconds to wait for the subroutine to return. On U64
         a ``TimeoutError`` is raised if the done flag never reaches
@@ -244,6 +268,11 @@ def run_subroutine(
     TransportError
         Propagated from the underlying transport on hard failures.
     """
+    # Guard before backend dispatch: on either backend this ends up
+    # JSRing *addr*, and a call into reclaimed code wedges the machine
+    # rather than faulting. See jsr() and execution_policy.
+    check_execution_policy(getattr(target, "transport", target), addr,
+                           override=override)
     if _is_u64_target(target):
         _run_subroutine_u64(
             target,
