@@ -44,17 +44,11 @@ from c64_test_harness.capture import (
     PacketCapture,
     open_capture,
 )
-from c64_test_harness.execute import load_code
-from c64_test_harness.memory import read_bytes
 from c64_test_harness.screen import ScreenGrid
 from ethernet_scenarios import (
-    CODE_BASE,
-    PPDATA,
-    PPTR,
-    binary_jsr,
     capture_failure_disposition,
-    clockport_enable_code,
     resolve_capture_ifaces,
+    run_product_id_scenario,
     run_rx_scenario,
     run_tx_scenario,
 )
@@ -258,28 +252,9 @@ class TestCS8900aProbe:
         RR-Net mode: PPPtr lives at $DE02/$DE03 and PPData at $DE04/$DE05.
         The RR clockport bit ($DE01 bit 0) MUST be enabled first.
         """
-        transport = vice_ethernet
-
-        probe_code = clockport_enable_code() + bytes([
-            0xA9, 0x00,                          # LDA #$00
-            0x8D, PPTR & 0xFF, PPTR >> 8,        # STA $DE02 (PPPtr lo)
-            0x8D, (PPTR + 1) & 0xFF, (PPTR + 1) >> 8,  # STA $DE03 (PPPtr hi)
-            0xAD, PPDATA & 0xFF, PPDATA >> 8,    # LDA $DE04 (PPData lo)
-            0x8D, 0x00, 0xC0,                    # STA $C000
-            0xAD, (PPDATA + 1) & 0xFF, (PPDATA + 1) >> 8,  # LDA $DE05 (PPData hi)
-            0x8D, 0x01, 0xC0,                    # STA $C001
-            0x60,                                # RTS
-        ])
-
-        load_code(transport, CODE_BASE, probe_code)
-        binary_jsr(transport, CODE_BASE, timeout=10)
-
-        result = read_bytes(transport, 0xC000, 2)
-        chip_id = result[0] | (result[1] << 8)
-
-        assert result[0] == 0x0E, f"PP Data low: expected 0x0E, got 0x{result[0]:02X}"
-        assert result[1] == 0x63, f"PP Data high: expected 0x63, got 0x{result[1]:02X}"
-        assert chip_id == 0x630E, f"CS8900a Product ID: expected 0x630E, got 0x{chip_id:04X}"
+        # The probe lives in ethernet_scenarios (results in RESULT, never in
+        # its own bytes) so the wiring tests cover it like TX/RX.
+        assert run_product_id_scenario(vice_ethernet) == 0x630E
 
 
 # ---------------------------------------------------------------------------

@@ -265,6 +265,46 @@ def jsr_timeout_report(transport: Any, addr: int, timeout: float, *, window: int
     return "\n".join(lines)
 
 
+#: CS8900a Product ID (PacketPage 0x0000) as VICE reports it.
+CS8900A_PRODUCT_ID = 0x630E
+
+
+def product_id_routine() -> bytes:
+    """Read the CS8900a Product ID (PP 0x0000) into RESULT (lo) / RESULT+1 (hi).
+
+    RR-Net mode: PPPtr at $DE02/$DE03, PPData at $DE04/$DE05; the RR
+    clockport bit must be set first.  Stores go to RESULT, never into the
+    routine's own bytes (the original probe stored into $C000/$C001 -- its
+    first two opcodes -- and only worked because the STAs execute after
+    those bytes were fetched).
+    """
+    return clockport_enable_code() + bytes([
+        0xA9, 0x00,                                    # LDA #$00
+        0x8D, PPTR & 0xFF, PPTR >> 8,                  # STA PPPtr lo
+        0x8D, (PPTR + 1) & 0xFF, (PPTR + 1) >> 8,      # STA PPPtr hi
+        0xAD, PPDATA & 0xFF, PPDATA >> 8,              # LDA PPData lo
+        0x8D, RESULT & 0xFF, RESULT >> 8,              # STA RESULT
+        0xAD, (PPDATA + 1) & 0xFF, (PPDATA + 1) >> 8,  # LDA PPData hi
+        0x8D, (RESULT + 1) & 0xFF, RESULT >> 8,        # STA RESULT+1
+        0x60,                                          # RTS
+    ])
+
+
+def run_product_id_scenario(transport: Any) -> int:
+    """JSR the Product ID probe and return the 16-bit ID; assert it is 0x630E."""
+    write_bytes(transport, RESULT, [0x00, 0x00])
+    load_code(transport, CODE_BASE, product_id_routine())
+    binary_jsr(transport, CODE_BASE, timeout=10)
+    result = read_bytes(transport, RESULT, 2)
+    chip_id = result[0] | (result[1] << 8)
+    if chip_id != CS8900A_PRODUCT_ID:
+        raise AssertionError(
+            f"CS8900a Product ID: expected 0x{CS8900A_PRODUCT_ID:04X}, got 0x{chip_id:04X} "
+            f"(PP Data lo 0x{result[0]:02X}, hi 0x{result[1]:02X})"
+        )
+    return chip_id
+
+
 def tx_routine() -> bytes:
     """6502 TX routine (RR-Net register layout): send FRAME_LEN bytes from FRAME_BUF.
 
