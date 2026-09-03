@@ -794,7 +794,12 @@ def test_routine_hung_chains_the_original_timeout_as_cause():
 
 def test_jsr_recover_on_timeout_with_a_routine_that_returns_is_a_plain_call():
     """The opt-in must cost nothing when the routine behaves: one trampoline
-    write, one resume, no register restore, the normal return value."""
+    write, one resume, no *recovery*, the normal return value.
+
+    ``preserve_state`` (default) does put PC/SP/FL back afterwards -- that
+    is a plain call's behaviour now, not recovery's -- so the assertion is
+    that no *probe* ran, not that no register was written.
+    """
     t = PollBinaryMockTransport(stop_pc=0x0337)
     t._registers.update(_PRE_CALL_REGS)
 
@@ -802,8 +807,12 @@ def test_jsr_recover_on_timeout_with_a_routine_that_returns_is_a_plain_call():
 
     assert regs["PC"] == 0x0337
     assert t.written_memory == [(0x0334, [0x20, 0x00, 0xC1, 0xEA, 0xEA])]
-    assert _restore_calls(t) == []
-    assert t._set_registers_calls == [{"PC": 0x0334}]
+    # The only SP-bearing write is preserve_state's restore of the
+    # pre-call file; recovery's restore would also carry A/X/Y.
+    assert _restore_calls(t) == [
+        {"PC": _PRE_CALL_REGS.get("PC", 0x0800), "SP": 0xF7, "FL": 0x24},
+    ]
+    assert t._set_registers_calls[0] == {"PC": 0x0334}
     assert t._resume_count == 1
     assert len(t._checkpoints) == 0
 
@@ -863,3 +872,144 @@ def test_jsr_recovery_refuses_when_the_transport_reports_no_sp():
     assert _restore_calls(t) == []
     assert t._resume_count == 1
     assert len(t.written_memory) == 1
+
+
+# -- jsr() must not abandon the interrupt it hijacked -------------------------
+#
+# ``jsr()`` forces PC at a CPU the binary monitor halted wherever it
+# happened to be.  When that "wherever" is inside an interrupt handler,
+# forcing PC means the handler never reaches its RTI: its stack frame is
+# abandoned and the I flag interrupt entry set is never cleared.
+#
+# Measured on a stock x64sc, 1400 calls against a controlled idle loop:
+#   * main loop with CLI: 10 calls (0.7%) were issued while the CPU was
+#     halted inside the KERNAL IRQ handler; SP fell $EF -> $78, 119 bytes.
+#   * main loop without CLI: one such call, at iteration 38, masked IRQs
+#     for good -- the jiffy clock at $A0-$A2 stayed frozen at 3814 for the
+#     remaining ~1360 calls.
+
+
+class FlagBinaryMockTransport(PollBinaryMockTransport):
+    """PollBinaryMockTransport whose register file also carries ``FL``.
+
+    ``BinaryViceTransport`` reports the 6502 status register as ``FL``
+    (VICE's own name for it, ``mon_register6502.c:65``); the base mock
+    omits it, and the abandoned-interrupt bug is as much about ``FL`` as
+    about ``SP``.
+    """
+
+    def __init__(self, stop_pc: int = 0x0337, **kwargs):
+        super().__init__(stop_pc=stop_pc, **kwargs)
+        self._registers["FL"] = 0x20
+
+    def park_inside_irq(self) -> None:
+        """Pose as a CPU halted inside the KERNAL IRQ handler.
+
+        ``$EA7B`` is inside the standard handler; ``I`` is set (``$24``)
+        because interrupt entry set it; ``SP`` already carries the
+        hardware's PCH/PCL/P push plus the ``$FF48`` dispatcher's A/X/Y.
+        """
+        self._registers.update({"PC": 0xEA7B, "SP": 0xF2, "FL": 0x24})
+
+    def wait_for_stopped(self, timeout: float | None = None) -> int:
+        # Pose as the routine having run: it leaves its own A behind, and
+        # its own (balanced, but different) SP/FL.
+        pc = super().wait_for_stopped(timeout=timeout)
+        self._registers.update({"A": 0x42, "SP": 0xFD, "FL": 0x33})
+        return pc
+
+
+def test_jsr_restores_the_interrupted_pc_sp_and_flags():
+    """A call issued mid-IRQ must leave the machine able to finish it."""
+    t = FlagBinaryMockTransport()
+    t.park_inside_irq()
+
+    jsr(t, 0xC000, timeout=1.0)
+
+    assert t._set_registers_calls[-1] == {"PC": 0xEA7B, "SP": 0xF2, "FL": 0x24}
+    # And the live register file agrees: resume() would re-enter the
+    # handler at $EA7B with its frame intact and I still set.
+    assert t._registers["PC"] == 0xEA7B
+    assert t._registers["SP"] == 0xF2
+    assert t._registers["FL"] == 0x24
+
+
+def test_jsr_returns_the_routines_registers_not_the_restored_ones():
+    """The restore must not corrupt what callers read out of jsr()."""
+    t = FlagBinaryMockTransport()
+    t.park_inside_irq()
+
+    regs = jsr(t, 0xC000, timeout=1.0)
+
+    assert regs["PC"] == 0x0337   # the post-RTS landing, as documented
+    assert regs["A"] == 0x42      # the routine's accumulator
+    assert regs["SP"] == 0xFD     # the routine's SP, not the restored $F2
+
+    # The three asserts above hold with or without a restore, so on their
+    # own they prove nothing.  What only a restore can produce is
+    # *divergence*: the dict on the routine's register file, the machine
+    # back on the pre-call one.
+    assert t._registers["SP"] == 0xF2, "machine was not restored"
+    assert regs["SP"] != t._registers["SP"], "restore reached into the dict"
+
+
+def test_jsr_preserve_state_false_keeps_the_old_behaviour():
+    t = FlagBinaryMockTransport()
+    t.park_inside_irq()
+
+    jsr(t, 0xC000, timeout=1.0, preserve_state=False)
+
+    # Only the hijack itself; nothing put back, CPU left on the trampoline.
+    assert t._set_registers_calls == [{"PC": 0x0334}]
+    assert t._registers["PC"] == 0x0337
+
+
+def test_jsr_restores_only_registers_the_transport_reports():
+    """A transport without FL still gets PC and SP back."""
+    t = PollBinaryMockTransport(stop_pc=0x0337)   # no FL in _registers
+    t._registers.update({"PC": 0xEA7B, "SP": 0xF2})
+
+    jsr(t, 0xC000, timeout=1.0)
+
+    assert t._set_registers_calls[-1] == {"PC": 0xEA7B, "SP": 0xF2}
+
+
+class WalkingStackMockTransport(FlagBinaryMockTransport):
+    """A mock whose stack actually descends when a hijack abandons a frame.
+
+    ``FlagBinaryMockTransport`` re-poses ``SP`` on every
+    ``wait_for_stopped``, which makes accumulation impossible to observe:
+    every iteration starts from the same number whatever the code under
+    test did.  Here the hijack -- a ``PC``-only ``set_registers`` -- costs
+    six bytes, the hardware's ``PCH``/``PCL``/``P`` push plus the
+    ``$FF48`` dispatcher's ``A``/``X``/``Y``, and the balanced
+    ``JSR``/``RTS`` gives none of them back.  Only the restore does.
+    """
+
+    def set_registers(self, regs: dict[str, int]) -> None:
+        super().set_registers(regs)
+        if set(regs) == {"PC"}:
+            self._registers["SP"] = (self._registers["SP"] - 6) & 0xFF
+
+    def wait_for_stopped(self, timeout: float | None = None) -> int:
+        # Deliberately skips the parent's SP pose: a balanced call leaves
+        # SP where the hijack left it, six bytes down.
+        pc = PollBinaryMockTransport.wait_for_stopped(self, timeout=timeout)
+        self._registers.update({"A": 0x42, "FL": 0x33})
+        return pc
+
+
+def test_jsr_over_many_calls_does_not_walk_the_stack_pointer_down():
+    """The regression the measurement found, in miniature.
+
+    The machine is parked mid-IRQ *once*.  Each call abandons a frame and
+    only the restore puts SP back, so without it the pointer descends six
+    bytes per call and never recovers -- which is the measured bug.
+    """
+    t = WalkingStackMockTransport()
+    t.park_inside_irq()
+
+    for i in range(20):
+        jsr(t, 0xC000, timeout=1.0)
+        assert t._registers["SP"] == 0xF2, f"SP walked at iteration {i}"
+        assert t._registers["FL"] & 0x04, f"I flag lost at iteration {i}"

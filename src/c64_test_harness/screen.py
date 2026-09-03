@@ -6,6 +6,14 @@ extraction.
 
 ``wait_for_text()`` and ``wait_for_stable()`` poll the transport and
 return a ``ScreenGrid`` on success, so callers can immediately extract data.
+
+**CPU contract.**  On VICE every binary-monitor command halts the 6510.
+The two waiters resume between polls *and* in a ``finally``, so they never
+hand back a stopped machine on any exit path.  ``ScreenGrid.from_transport``
+-- and anything built on it, such as ``debug.dump_screen`` -- does not
+resume, by design: it is a snapshot primitive, not a waiter.  A poll loop
+built out of bare snapshots never advances the C64, and a machine that is
+merely stopped looks exactly like one that is wedged.
 """
 
 from __future__ import annotations
@@ -34,7 +42,30 @@ class ScreenGrid:
 
     @classmethod
     def from_transport(cls, transport: C64Transport) -> ScreenGrid:
-        """Capture a screen snapshot from a live transport."""
+        """Capture a screen snapshot from a live transport.
+
+        .. warning::
+
+           **On VICE this leaves the CPU paused.**  The binary monitor
+           halts the machine to service every memory read and it stays
+           halted until something calls
+           :meth:`~.transport.C64Transport.resume`.  This method does not.
+
+           So a poll loop built out of bare ``from_transport`` calls never
+           advances the C64: the screen is identical every time round, and
+           a running machine is indistinguishable from a hung one.  That
+           mistake has cost a bogus emulator bug report more than once.
+           Use :func:`wait_for_text` or :func:`wait_for_stable`, which
+           resume on every exit path, or call ``transport.resume()``
+           yourself after each capture.
+
+           On the Ultimate 64 memory access is DMA-backed and the machine
+           runs throughout, so a resume is not *needed* there -- but it is
+           not free either: it is a real request to the device, so it
+           costs a round trip and it will clear a pause the caller set
+           deliberately.  The resuming helpers are correct on both
+           backends; on hardware they are correct at that price.
+        """
         raw = transport.read_screen_codes()
         return cls(
             codes=tuple(raw),
@@ -105,6 +136,22 @@ class ScreenGrid:
         return "\n".join(lines)
 
 
+def _resume_quietly(transport: C64Transport) -> None:
+    """Resume the CPU, swallowing a transport that cannot or need not.
+
+    Both waiters poll through the binary monitor, which halts the machine
+    for every read; without a resume the C64 does not advance between
+    polls and a running program is indistinguishable from a hung one.
+    Failures are ignored on purpose -- the waiters already treat the
+    transport as best-effort, and a resume that could not be delivered
+    must not turn a successful wait into an exception.
+    """
+    try:
+        transport.resume()
+    except Exception:
+        pass
+
+
 def wait_for_text(
     transport: C64Transport,
     needle: str,
@@ -120,6 +167,19 @@ def wait_for_text(
 
     *on_progress* replaces hardcoded ``print()`` — receives elapsed seconds
     and a snippet of the last non-blank screen row.
+
+    **CPU state on return: running, on every exit path** — match, timeout,
+    or exception.  The binary monitor halts the machine to service each
+    screen read, so this loop resumes after every poll; it also resumes
+    before handing the match back, which it did not always do.  The
+    The returned grid was captured before that resume, so the grid itself
+    is intact -- but the *coincidence* between grid and machine is not.
+    Before this changed, a match handed back a stopped C64 and a following
+    ``read_bytes`` saw memory exactly as it stood at the capture instant.
+    Now the program runs on until that read halts it again, some
+    milliseconds later.  A caller that needs the two to agree should wait
+    on a string the program prints only once it is idle, or halt the
+    machine explicitly before reading.
 
     .. warning::
 
@@ -148,31 +208,35 @@ def wait_for_text(
     """
     needle_upper = needle.upper()
     start = time.monotonic()
-    while True:
-        elapsed = time.monotonic() - start
-        if elapsed >= timeout:
-            return None
-        try:
-            grid = ScreenGrid.from_transport(transport)
-            if needle_upper in grid.continuous_text().upper():
-                return grid
-            if verbose and on_progress is not None:
-                lines = grid.text_lines()
-                last = ""
-                for line in reversed(lines):
-                    if line.strip():
-                        last = line.strip()[:60]
-                        break
-                on_progress(elapsed, last)
-        except Exception:
-            pass
-        # The binary monitor pauses the CPU on every memory read.
-        # Resume so the program can continue executing before we poll again.
-        try:
-            transport.resume()
-        except Exception:
-            pass
-        time.sleep(poll_interval)
+    try:
+        while True:
+            elapsed = time.monotonic() - start
+            if elapsed >= timeout:
+                return None
+            try:
+                grid = ScreenGrid.from_transport(transport)
+                if needle_upper in grid.continuous_text().upper():
+                    return grid
+                if verbose and on_progress is not None:
+                    lines = grid.text_lines()
+                    last = ""
+                    for line in reversed(lines):
+                        if line.strip():
+                            last = line.strip()[:60]
+                            break
+                    on_progress(elapsed, last)
+            except Exception:
+                pass
+            # The binary monitor pauses the CPU on every memory read.
+            # Resume so the program can continue executing before we poll
+            # again.
+            _resume_quietly(transport)
+            time.sleep(poll_interval)
+    finally:
+        # Every exit path, not just the polls: a match used to return with
+        # the machine still halted, so the caller's "it is running now"
+        # depended on which branch it left by.
+        _resume_quietly(transport)
 
 
 def wait_for_stable(
@@ -185,31 +249,32 @@ def wait_for_stable(
 
     Returns the stable ``ScreenGrid``, or ``None`` on timeout —
     matching ``wait_for_text``'s contract (a non-``None`` return always
-    means the condition was met).
+    means the condition was met, and the CPU is running on every exit
+    path).
     """
     prev_text: str | None = None
     count = 0
     start = time.monotonic()
-    while True:
-        elapsed = time.monotonic() - start
-        if elapsed >= timeout:
-            return None
-        try:
-            grid = ScreenGrid.from_transport(transport)
-            current = grid.continuous_text()
-            if current == prev_text:
-                count += 1
-                if count >= stable_count:
-                    return grid
-            else:
-                count = 0
-                prev_text = current
-        except Exception:
-            pass
-        # Resume the CPU so the program keeps running between polls
-        # (the binary monitor pauses on memory reads).
-        try:
-            transport.resume()
-        except Exception:
-            pass
-        time.sleep(poll_interval)
+    try:
+        while True:
+            elapsed = time.monotonic() - start
+            if elapsed >= timeout:
+                return None
+            try:
+                grid = ScreenGrid.from_transport(transport)
+                current = grid.continuous_text()
+                if current == prev_text:
+                    count += 1
+                    if count >= stable_count:
+                        return grid
+                else:
+                    count = 0
+                    prev_text = current
+            except Exception:
+                pass
+            # Resume the CPU so the program keeps running between polls
+            # (the binary monitor pauses on memory reads).
+            _resume_quietly(transport)
+            time.sleep(poll_interval)
+    finally:
+        _resume_quietly(transport)

@@ -234,21 +234,25 @@ All functions take `transport: BinaryViceTransport` as first arg (stateless). Th
 
 - `load_code(transport, addr, code) -> None` -- Write executable bytes (semantic alias for write_memory)
 - `set_register(transport, name, value) -> None` -- Set CPU register via `transport.set_registers({name: value})`
-- `goto(transport, addr) -> None` -- Set PC via `transport.set_registers({"PC": addr})` then `transport.resume()`
+- `goto(transport, addr) -> None` -- Set PC via `transport.set_registers({"PC": addr})` then `transport.resume()`. A **one-way** jump: control never returns, so nothing is restored. The target inherits the stack frame and `I` flag of whatever the monitor halted, interrupt handler included; a target needing a clean machine must rebuild `SP` itself (warm start `JMP ($A002)`).
 - `set_breakpoint(transport, addr) -> int` -- Calls `transport.set_checkpoint(addr)`, returns checkpoint ID
 - `delete_breakpoint(transport, bp_id) -> None` -- Calls `transport.delete_checkpoint(bp_id)`
 - `wait_for_pc(transport, addr, timeout=5.0) -> dict` -- Calls `transport.wait_for_stopped()` then verifies PC; returns register dict; CPU is **paused** on return
-- `jsr(transport, addr, timeout=5.0, *, scratch_addr=0x0334, override=None, recover_on_timeout=False) -> dict` -- Call subroutine via trampoline, wait for RTS; CPU is **paused** on return. Works reliably for both short and long-running computations (event-based, no polling). With `recover_on_timeout=True`, a routine that never returns raises `RoutineHung` (a `TimeoutError` subclass) after restoring SP and proving the trampoline live with an `RTS` probe; `recovered`, `elapsed`, `addr`, `hung_pc`, `detail` carry the outcome (PATTERNS § "Probing a routine that may hang"). Default `False`: a bare `TimeoutError`, as before.
+- `jsr(transport, addr, timeout=5.0, *, scratch_addr=0x0334, override=None, recover_on_timeout=False, preserve_state=True) -> dict` -- Call subroutine via trampoline, wait for RTS; CPU is **paused** on return. Works reliably for both short and long-running computations (event-based, no polling). With `recover_on_timeout=True`, a routine that never returns raises `RoutineHung` (a `TimeoutError` subclass) after restoring SP and proving the trampoline live with an `RTS` probe; `recovered`, `elapsed`, `addr`, `hung_pc`, `detail` carry the outcome (PATTERNS § "Probing a routine that may hang"). Default `False`: a bare `TimeoutError`, as before. `preserve_state=True` (default) reads the pre-call `PC`/`SP`/`FL` before the hijack and writes them back after the `RTS`, so a call that landed mid-interrupt no longer abandons the handler's frame or leaves `I` set forever. `A`/`X`/`Y` are **not** put back, and **nothing** is put back on timeout. Pass `preserve_state=False` where the routine's own flag or stack effects must survive.
 - `RoutineHung(TimeoutError)` -- Raised by `jsr(..., recover_on_timeout=True)` when the routine hangs. `recovered=False` means the next call on that transport is not safe. Re-exported from the package root.
 - `RECOVERY_PROBE_TIMEOUT = 5.0` -- Seconds the recovery `RTS` probe waits for its landing.
 - `run_subroutine(target, addr, *, timeout=30.0, poll_cadence=0.005, trampoline_addr=0x0360) -> None` -- Cross-backend "call sub and wait for RTS". Takes a `TestTarget` (not a transport). On VICE wraps `jsr()`. On U64 installs a 14-byte sentinel trampoline at `trampoline_addr` (default `$0360`, cassette buffer; flag bytes at `$03F0`/`$03F1`), triggers it via `SYS <addr>` keystroke (assumes BASIC READY), and host-polls the done flag every `poll_cadence` seconds — sub-millisecond cadence is permitted and useful for short routines (issue #82). Raises `TimeoutError` on U64 only; the message distinguishes "never started" (running flag still `0x00`) from "started but never returned" (running flag `0x01`, done flag never `0x02`). Re-exported from the package root.
 
 ### `jsr()` internals
+0. Reads `PC`/`SP`/`FL`, unless `preserve_state=False` or the transport has no `read_registers`
 1. Writes trampoline at `scratch_addr`: `JSR $addr; NOP; NOP` (5 bytes)
 2. Sets checkpoint at `scratch_addr + 3`
 3. Sets PC to `scratch_addr` and resumes CPU
 4. Calls `wait_for_stopped()` until checkpoint fires, verifies PC
 5. Deletes checkpoint
+6. Writes `PC`/`SP`/`FL` back. **Success path only** — the restore sits outside the `try`/`finally`, so a timeout leaves the register file alone for the recovery probe to read. Note this is the opposite structural choice from the screen waiters, which resume in a `finally` precisely so every path is uniform; here a hung routine must stay visibly hung.
+
+Step 0/6 preserve `PC`/`SP`/`FL`. Recovery (below) restores `A`/`X`/`Y`/`SP`/`FL`. The sets differ deliberately: recovery is putting a *usable* machine back, step 6 is putting the *interrupted* one back, and only the latter needs `PC`.
 
 With `recover_on_timeout=True`, step 4 timing out adds: read registers (binmon answers while the CPU spins), restore the register file (A, X, Y, SP, FL) captured before step 1 in one command, rewrite the trampoline as `20 lo hi EA 60` — `JSR scratch_addr+4; NOP; RTS`, the spare second `NOP` byte becoming the `RTS` — and run steps 2-5 against it with `RECOVERY_PROBE_TIMEOUT`, require PC == `scratch_addr + 3`, then raise `RoutineHung`. Recovery writes nothing outside the five trampoline bytes the call already owns.
 
@@ -264,8 +268,8 @@ With `recover_on_timeout=True`, step 4 timing out adds: read registers (binmon a
 ## Module: screen
 
 - `ScreenGrid` -- Parsed screen state (40x25 character grid)
-- `wait_for_text(transport, text, timeout=60.0, poll_interval=2.0, verbose=True) -> ScreenGrid | None` -- Poll screen RAM until text appears. Returns `None` on timeout. **Note:** `verbose` defaults to `True` (dumps screen on every poll) — pass `verbose=False` for quiet operation.
-- `wait_for_stable(transport, timeout=10.0, poll_interval=0.5, stable_count=3) -> ScreenGrid | None` -- Wait for screen to stop changing. Returns `None` on timeout.
+- `wait_for_text(transport, text, timeout=60.0, poll_interval=2.0, verbose=True) -> ScreenGrid | None` -- Poll screen RAM until text appears. Returns `None` on timeout. **Note:** `verbose` defaults to `True` (dumps screen on every poll) — pass `verbose=False` for quiet operation. The CPU is **running** on return, on every exit path; the grid was captured before that resume, so if you need the machine halted alongside the grid your next read halts it again.
+- `wait_for_stable(transport, timeout=10.0, poll_interval=0.5, stable_count=3) -> ScreenGrid | None` -- Wait for screen to stop changing. Returns `None` on timeout. The CPU is **running** on return, on every exit path, same caveat as `wait_for_text()`.
 
 ---
 
@@ -418,7 +422,7 @@ transport = BinaryViceTransport(host="127.0.0.1", port=6502, timeout=5.0)
 - No reconnection overhead (persistent connection)
 - Async checkpoint events (no polling needed for `jsr()`/`wait_for_pc()`)
 - `resume()` does NOT destroy the connection
-- CPU auto-pauses on every command -- `wait_for_text()` uses a resume-between-polls pattern so the screen updates
+- CPU auto-pauses on every command -- `wait_for_text()` resumes between polls so the screen updates, and again in a `finally`, so it never hands back a stopped machine
 
 ---
 
@@ -950,7 +954,7 @@ Cross-backend SID playback dispatcher.
 - `DEFAULT_STUB_ADDR = 0xC000`
 - `SidPlaybackError` — raised on dispatch or execution failure
 
-**Key gotcha:** After `jsr()` installs the stub/runs init, the play routine's PC must jump back to BASIC warm-start (`JMP ($A002)`). Otherwise the CPU runs into stale NOPs or hits BRK, resetting IRQ vectors and killing playback.
+**Key gotcha:** After `jsr()` installs the stub/runs init, the play routine's PC must jump back to BASIC warm-start (`JMP ($A002)`). `play_sid_vice` sets PC explicitly rather than relying on whatever `jsr()` leaves behind; before `preserve_state` that was load-bearing, since the CPU would otherwise run into stale NOPs or hit BRK, resetting IRQ vectors and killing playback. It is now belt and braces, and still correct.
 
 ---
 

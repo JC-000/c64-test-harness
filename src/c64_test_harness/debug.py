@@ -14,6 +14,10 @@ def dump_screen(transport: C64Transport, label: str = "") -> str:
     """Capture screen and return formatted debug dump.
 
     Also prints to stdout for immediate visibility during test runs.
+
+    Like :meth:`ScreenGrid.from_transport`, which it wraps, this **leaves
+    the CPU paused on VICE** -- it is a snapshot, not a waiter, and does
+    not resume.  Calling it in a loop never advances the machine.
     """
     try:
         grid = ScreenGrid.from_transport(transport)

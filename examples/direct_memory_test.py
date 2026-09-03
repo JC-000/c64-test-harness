@@ -66,6 +66,8 @@ def main() -> int:
 
         # Safety: write JMP $0339 at $0339 so CPU loops harmlessly
         # after jsr() returns (prevents crash when BASIC ROM is banked out).
+        # Only reachable with preserve_state=False, or on a transport without
+        # read_registers: the default restore parks PC where it was hijacked.
         write_bytes(transport, 0x0339, bytes([0x4C, 0x39, 0x03]))
 
         # Load subroutine into RAM

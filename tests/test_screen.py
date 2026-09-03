@@ -188,3 +188,100 @@ class TestWaitForStable:
             transport, timeout=0.3, poll_interval=0.05, stable_count=3
         )
         assert grid is None
+
+
+# -- the CPU must be running on every exit path -------------------------------
+#
+# On VICE the binary monitor halts the machine to service each screen read
+# and it stays halted until something resumes it.  Both waiters resumed
+# between polls but not before handing a match back, so "is the C64 running
+# after this call?" depended on which branch the function left by -- the
+# shape that makes a running machine look hung and has cost a bogus
+# emulator bug report.  ``ScreenGrid.from_transport`` never resumes at all;
+# that is now documented rather than changed, because it is a snapshot
+# primitive, not a waiter.
+
+
+class ResumeCountingTransport(MockTransport):
+    """MockTransport that logs screen reads and resumes in order.
+
+    ``ops`` is the ordering record, and ordering is the whole point: the
+    waiters resumed *between polls* long before this fix, so a bare
+    ``resume_count >= 1`` is satisfied by that old behaviour and passes
+    whether or not the match path was fixed.  The falsifiable assertion
+    is that the *last* thing done to the transport before returning was
+    a resume -- that is what "the CPU is running on return" means.
+    """
+
+    def __init__(self, *args, fail_reads: bool = False, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.ops: list[str] = []
+        self.fail_reads = fail_reads
+
+    @property
+    def resume_count(self) -> int:
+        return self.ops.count("resume")
+
+    def resume(self) -> None:
+        self.ops.append("resume")
+
+    def read_screen_codes(self) -> list[int]:
+        self.ops.append("read")
+        if self.fail_reads:
+            raise RuntimeError("transport is unhappy")
+        return super().read_screen_codes()
+
+
+def _screen_with(text: str) -> ResumeCountingTransport:
+    t = ResumeCountingTransport()
+    codes = [ord(c) & 0x3F for c in text]
+    grid = list(t.screen_codes)
+    grid[: len(codes)] = codes
+    t.screen_codes = grid
+    return t
+
+
+def test_wait_for_text_resumes_the_cpu_before_returning_a_match():
+    """The match path is the one that used to leave the machine halted."""
+    t = _screen_with("READY.")
+    grid = wait_for_text(t, "READY.", timeout=1.0, poll_interval=0.01,
+                         verbose=False)
+    assert grid is not None
+    assert t.ops[-1] == "resume", t.ops
+
+
+def test_wait_for_text_resumes_the_cpu_before_returning_none():
+    t = ResumeCountingTransport()
+    assert wait_for_text(t, "NEVER", timeout=0.2, poll_interval=0.05,
+                         verbose=False) is None
+    assert t.ops[-1] == "resume", t.ops
+
+
+def test_wait_for_stable_resumes_the_cpu_before_returning_a_grid():
+    t = ResumeCountingTransport()
+    grid = wait_for_stable(t, timeout=1.0, poll_interval=0.01, stable_count=2)
+    assert grid is not None
+    assert t.ops[-1] == "resume", t.ops
+
+
+def test_waiters_resume_even_when_every_screen_read_fails():
+    """A dead read must not leave the machine frozen as well as unread."""
+    t = ResumeCountingTransport(fail_reads=True)
+    assert wait_for_text(t, "READY.", timeout=0.2, poll_interval=0.05,
+                         verbose=False) is None
+    assert t.ops[-1] == "resume", t.ops
+
+    t2 = ResumeCountingTransport(fail_reads=True)
+    assert wait_for_stable(t2, timeout=0.2, poll_interval=0.05,
+                           stable_count=2) is None
+    assert t2.ops[-1] == "resume", t2.ops
+
+
+def test_screen_grid_from_transport_does_not_resume():
+    """Pinning the documented asymmetry: the snapshot primitive is not a
+    waiter, so it leaves the CPU exactly as it found it -- halted, on
+    VICE.  The docstring says so; this makes it a fact the suite defends
+    rather than a comment that can rot."""
+    t = _screen_with("READY.")
+    ScreenGrid.from_transport(t)
+    assert t.resume_count == 0

@@ -113,7 +113,21 @@ class C64Transport(Protocol):
         ...
 
     def resume(self) -> None:
-        """Resume execution (exit monitor / un-pause)."""
+        """Resume execution, exiting the monitor if one holds the machine.
+
+        The backends differ here and the difference is load-bearing.  On
+        VICE **every** binary-monitor command halts the 6510, and it stays
+        halted until this is called -- so a caller that reads memory or
+        the screen and then expects time to pass must resume, or it is
+        timing a stopped machine.  On the Ultimate 64 memory access is
+        DMA-backed and the machine runs throughout, so a resume is not
+        needed; it is still a real request to the device, which costs a
+        round trip and will clear a pause the caller set deliberately.
+
+        The cross-backend screen waiters resume on every exit path for
+        this reason; :meth:`ScreenGrid.from_transport` deliberately does
+        not, because it is a snapshot primitive rather than a waiter.
+        """
         ...
 
     def set_speed(self, multiplier: int | None) -> None:
