@@ -31,7 +31,9 @@ with ViceInstanceManager(config=config) as mgr:
         print("FATAL: Main menu did not appear")
         sys.exit(1)
 
-    # Safety loop for jsr() (prevents crash when BASIC ROM is banked out)
+    # Safety loop for jsr() (prevents crash when BASIC ROM is banked out;
+    # only reachable now with preserve_state=False, or on a transport
+    # without read_registers -- the default restore parks PC elsewhere)
     write_bytes(transport, 0x0339, bytes([0x4C, 0x39, 0x03]))
 
     # ... run tests using transport ...
@@ -82,7 +84,7 @@ def test_routine(transport, labels, input_data):
 ```
 
 ### Why sequential jsr() calls work
-The binary transport maintains a persistent TCP connection. After `jsr()` returns, the CPU is paused at the breakpoint. The breakpoint is deleted, but the connection stays open and the CPU remains paused. The next `jsr()` writes a new trampoline and resumes — no reconnection needed.
+The binary transport maintains a persistent TCP connection. After `jsr()` returns the CPU is paused with its pre-call PC restored (see section 3). The breakpoint is deleted, but the connection stays open and the CPU remains paused. The next `jsr()` writes a new trampoline and resumes — no reconnection needed.
 
 ### Probing a routine that may hang (`recover_on_timeout=True`)
 By default a routine that never returns surfaces as a bare `TimeoutError` and leaves the boot in a bad state: the CPU is still spinning in the routine and the stack holds the trampoline's return frame (two bytes leaked per hang — a suite probing several hangs walks the stack down). To turn a hang into a result row and keep going in the same boot, opt in per call:

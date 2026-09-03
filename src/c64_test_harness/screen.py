@@ -6,6 +6,14 @@ extraction.
 
 ``wait_for_text()`` and ``wait_for_stable()`` poll the transport and
 return a ``ScreenGrid`` on success, so callers can immediately extract data.
+
+**CPU contract.**  On VICE every binary-monitor command halts the 6510.
+The two waiters resume between polls *and* in a ``finally``, so they never
+hand back a stopped machine on any exit path.  ``ScreenGrid.from_transport``
+-- and anything built on it, such as ``debug.dump_screen`` -- does not
+resume, by design: it is a snapshot primitive, not a waiter.  A poll loop
+built out of bare snapshots never advances the C64, and a machine that is
+merely stopped looks exactly like one that is wedged.
 """
 
 from __future__ import annotations

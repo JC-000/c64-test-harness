@@ -289,9 +289,26 @@ JAMAction resource: 1 (continue)
 > instead of continuing silently. The dump above is as captured.
 
 `LIN`/`CYC` are the raster position. They advance whenever the *machine*
-is emulating, whether or not the 6510 is executing, so a frozen raster
-means nothing is being emulated at all — this is not the monitor holding
-the CPU.
+is emulating, whether or not the 6510 is executing.
+
+> **Correction, measured 2026-09-03** (`scripts/vice_raster_hold_probe.py`).
+> This section used to conclude from the frozen raster that "nothing is
+> being emulated at all — this is not the monitor holding the CPU." That
+> inference does not hold, and it had never been measured. Eight
+> consecutive `read_registers` with **no** resume between them — that is,
+> a machine the monitor is simply holding — return `LIN=12 CYC=5` all
+> eight times, one distinct position. The same machine resumed between
+> reads gives three distinct positions across eight samples. A held CPU
+> is therefore indistinguishable from the stall by raster alone, and the
+> stall's own `LIN=12 CYC=2` is a value the *running* arm also returns.
+>
+> This does not refute bug 6. The other rows below still eliminate the
+> mundane explanations, and 442 acknowledged resumes with no progress is
+> not what a merely-held machine looks like. What it removes is one
+> inference: the raster is a weak instrument here, and "frozen raster"
+> should be read as "not observed to advance", not as proof the emulator
+> stopped. Measured on an idle BASIC screen without host load, so it
+> speaks to the inference, not to the stall's own conditions.
 
 **And VICE reports that it resumed.** 442 resumes produced 442 `RESUMED`
 events, including the ones issued while the raster sat frozen. VICE
@@ -305,6 +322,7 @@ perform the transition.
 | a slow screen / marginal timeout | the text is normally found in 0–1s against a 15s limit |
 | a checkpoint leaked by an interrupted `jsr()` pinning the CPU | `CHECKPOINT_LIST` reports zero |
 | a lost resume, or monitor nesting needing more exits | 40 acknowledged resumes, no movement |
+| the harness left the CPU halted after a screen match (the issue #184 defect: `wait_for_text` returned a match from inside its `try` without resuming) | the capture issued 40 explicit acknowledged resumes at the point of measurement, so the machine was not merely un-resumed. Worth listing because it produces the *same* frozen-raster signature — see the correction above — so it is ruled out by the resume count, not by the raster. Fixed 2026-09-03; both waiters now resume in a `finally`. |
 | the 6510 jammed on an illegal opcode | `$CF00` holds `584ccde5`, a valid CLI; and **no `0x61` JAM event** in 1328 queued events; and `JAMAction=1` (continue) would have kept the raster advancing anyway (true at capture time; the harness pin is now `0`, under which a jam stops the machine and surfaces as a `TransportError` from `wait_for_stopped` — so a stall captured today would be distinguished from a jam by that error, not by this row — and **not by the raster either**: measured 2026-09-02, a JAMAction-0 jam pins `LIN`/`CYC` exactly like this stall (`LIN=12 CYC=2` across ten resumes); the poll loop never calls `wait_for_stopped`, so the discriminator is the queued `0x61` event, which `_machine_failure_report` now scans for — see "Mode 2 resolved" below) |
 
 **A CPU-contention experiment was deliberately not run**, and that is a
