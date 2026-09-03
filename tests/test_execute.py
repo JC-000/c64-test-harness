@@ -882,10 +882,11 @@ def test_jsr_recovery_refuses_when_the_transport_reports_no_sp():
 # abandoned and the I flag interrupt entry set is never cleared.
 #
 # Measured on a stock x64sc, 1400 calls against a controlled idle loop:
-#   * main loop with CLI: 18 calls (1.3%) were issued while the CPU was
-#     halted inside the KERNAL IRQ handler; SP fell $C7 -> $4C, 123 bytes.
-#   * main loop without CLI: the *first* such call masked IRQs for good --
-#     the jiffy clock at $A0-$A2 did not advance once in 1400 calls.
+#   * main loop with CLI: 10 calls (0.7%) were issued while the CPU was
+#     halted inside the KERNAL IRQ handler; SP fell $EF -> $78, 119 bytes.
+#   * main loop without CLI: one such call, at iteration 38, masked IRQs
+#     for good -- the jiffy clock at $A0-$A2 stayed frozen at 3814 for the
+#     remaining ~1360 calls.
 
 
 class FlagBinaryMockTransport(PollBinaryMockTransport):
@@ -944,6 +945,13 @@ def test_jsr_returns_the_routines_registers_not_the_restored_ones():
     assert regs["A"] == 0x42      # the routine's accumulator
     assert regs["SP"] == 0xFD     # the routine's SP, not the restored $F2
 
+    # The three asserts above hold with or without a restore, so on their
+    # own they prove nothing.  What only a restore can produce is
+    # *divergence*: the dict on the routine's register file, the machine
+    # back on the pre-call one.
+    assert t._registers["SP"] == 0xF2, "machine was not restored"
+    assert regs["SP"] != t._registers["SP"], "restore reached into the dict"
+
 
 def test_jsr_preserve_state_false_keeps_the_old_behaviour():
     t = FlagBinaryMockTransport()
@@ -966,16 +974,42 @@ def test_jsr_restores_only_registers_the_transport_reports():
     assert t._set_registers_calls[-1] == {"PC": 0xEA7B, "SP": 0xF2}
 
 
+class WalkingStackMockTransport(FlagBinaryMockTransport):
+    """A mock whose stack actually descends when a hijack abandons a frame.
+
+    ``FlagBinaryMockTransport`` re-poses ``SP`` on every
+    ``wait_for_stopped``, which makes accumulation impossible to observe:
+    every iteration starts from the same number whatever the code under
+    test did.  Here the hijack -- a ``PC``-only ``set_registers`` -- costs
+    six bytes, the hardware's ``PCH``/``PCL``/``P`` push plus the
+    ``$FF48`` dispatcher's ``A``/``X``/``Y``, and the balanced
+    ``JSR``/``RTS`` gives none of them back.  Only the restore does.
+    """
+
+    def set_registers(self, regs: dict[str, int]) -> None:
+        super().set_registers(regs)
+        if set(regs) == {"PC"}:
+            self._registers["SP"] = (self._registers["SP"] - 6) & 0xFF
+
+    def wait_for_stopped(self, timeout: float | None = None) -> int:
+        # Deliberately skips the parent's SP pose: a balanced call leaves
+        # SP where the hijack left it, six bytes down.
+        pc = PollBinaryMockTransport.wait_for_stopped(self, timeout=timeout)
+        self._registers.update({"A": 0x42, "FL": 0x33})
+        return pc
+
+
 def test_jsr_over_many_calls_does_not_walk_the_stack_pointer_down():
     """The regression the measurement found, in miniature.
 
-    Each iteration poses as a fresh mid-IRQ halt.  With the restore in
-    place the pre-call SP and the I flag are what the machine is left
-    with every time, so nothing accumulates and IRQs stay live.
+    The machine is parked mid-IRQ *once*.  Each call abandons a frame and
+    only the restore puts SP back, so without it the pointer descends six
+    bytes per call and never recovers -- which is the measured bug.
     """
-    t = FlagBinaryMockTransport()
+    t = WalkingStackMockTransport()
+    t.park_inside_irq()
+
     for i in range(20):
-        t._registers.update({"PC": 0xEA7B, "SP": 0xF2, "FL": 0x24})
         jsr(t, 0xC000, timeout=1.0)
         assert t._registers["SP"] == 0xF2, f"SP walked at iteration {i}"
         assert t._registers["FL"] & 0x04, f"I flag lost at iteration {i}"

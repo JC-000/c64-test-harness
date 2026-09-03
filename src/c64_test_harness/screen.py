@@ -51,8 +51,12 @@ class ScreenGrid:
            resume on every exit path, or call ``transport.resume()``
            yourself after each capture.
 
-           On the Ultimate 64 the machine runs throughout; a resume there
-           is harmless, so the resuming helpers are correct on both.
+           On the Ultimate 64 memory access is DMA-backed and the machine
+           runs throughout, so a resume is not *needed* there -- but it is
+           not free either: it is a real request to the device, so it
+           costs a round trip and it will clear a pause the caller set
+           deliberately.  The resuming helpers are correct on both
+           backends; on hardware they are correct at that price.
         """
         raw = transport.read_screen_codes()
         return cls(
@@ -160,9 +164,14 @@ def wait_for_text(
     or exception.  The binary monitor halts the machine to service each
     screen read, so this loop resumes after every poll; it also resumes
     before handing the match back, which it did not always do.  The
-    returned grid was captured before that resume, so nothing is lost: a
-    caller that wants the machine halted (to read memory consistently with
-    the grid) gets that from its own next read, which halts it again.
+    The returned grid was captured before that resume, so the grid itself
+    is intact -- but the *coincidence* between grid and machine is not.
+    Before this changed, a match handed back a stopped C64 and a following
+    ``read_bytes`` saw memory exactly as it stood at the capture instant.
+    Now the program runs on until that read halts it again, some
+    milliseconds later.  A caller that needs the two to agree should wait
+    on a string the program prints only once it is idle, or halt the
+    machine explicitly before reading.
 
     .. warning::
 

@@ -112,7 +112,7 @@ What recovery does: captures the register file (A, X, Y, SP, FL) before the call
 
 For testing user-facing flows (menu navigation, screen output, disk I/O).
 
-`wait_for_text()` works correctly with binary transport -- it calls `resume()` between polls internally, so the C64 program continues updating the display while polling.
+`wait_for_text()` works correctly with binary transport -- it calls `resume()` between polls internally, so the C64 program continues updating the display while polling, and it resumes again in a `finally`, so every exit path leaves the machine running.
 
 ```python
 def test_via_menu(transport, labels):
@@ -133,7 +133,12 @@ def test_via_menu(transport, labels):
     if grid is None:
         return False, "Operation did not complete"
 
-    # Read result from memory
+    # Read result from memory.  NOTE: wait_for_text() leaves the CPU
+    # RUNNING, so the program executes for a few milliseconds before this
+    # read halts it again -- the read is no longer coincident with the
+    # screen match.  If the routine overwrites its output buffer after
+    # printing the needle, wait on a string it prints only once it is
+    # idle, or halt explicitly before reading.
     result = read_bytes(transport, labels["output"], 32)
     return True, f"Got: {result.hex()}"
 ```
@@ -1050,9 +1055,14 @@ img.write_file("myfile.seq", data, c64_name="myfile")
 ```
 
 ### 3. Program State After jsr()
-After `jsr()` returns, the CPU is paused at the NOP after the trampoline's JSR. The breakpoint is deleted, but the CPU remains paused (binary transport keeps the connection open). To return to the running program:
+After `jsr()` returns the CPU is paused and the breakpoint is deleted, but **where** it is paused depends on `preserve_state`:
+
+- **Default (`preserve_state=True`)** — `PC`/`SP`/`FL` have been written back to their pre-call values, so the CPU is parked wherever the monitor originally halted it, not on the trampoline. `resume()` carries on with the interrupted program, interrupt handler included. This is what stops a mid-IRQ call from abandoning the handler's frame and masking interrupts for the rest of the run.
+- **`preserve_state=False`** — nothing is put back and the CPU sits on the NOP after the trampoline's JSR, which is the pre-0.13 behaviour.
+
+Either way the returned dict holds the *routine's* registers. Read the return value, not the machine. To return to the running program:
 ```python
-transport.resume()  # Resume CPU — it will hit the second NOP and fall through
+transport.resume()  # Resumes the pre-call program (or the trampoline, if preserve_state=False)
 send_text(transport, "RUN")
 time.sleep(0.1)
 send_key(transport, "\r")

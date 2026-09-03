@@ -203,17 +203,30 @@ class TestWaitForStable:
 
 
 class ResumeCountingTransport(MockTransport):
-    """MockTransport that counts resume() and can fail every screen read."""
+    """MockTransport that logs screen reads and resumes in order.
+
+    ``ops`` is the ordering record, and ordering is the whole point: the
+    waiters resumed *between polls* long before this fix, so a bare
+    ``resume_count >= 1`` is satisfied by that old behaviour and passes
+    whether or not the match path was fixed.  The falsifiable assertion
+    is that the *last* thing done to the transport before returning was
+    a resume -- that is what "the CPU is running on return" means.
+    """
 
     def __init__(self, *args, fail_reads: bool = False, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.resume_count = 0
+        self.ops: list[str] = []
         self.fail_reads = fail_reads
 
+    @property
+    def resume_count(self) -> int:
+        return self.ops.count("resume")
+
     def resume(self) -> None:
-        self.resume_count += 1
+        self.ops.append("resume")
 
     def read_screen_codes(self) -> list[int]:
+        self.ops.append("read")
         if self.fail_reads:
             raise RuntimeError("transport is unhappy")
         return super().read_screen_codes()
@@ -234,21 +247,21 @@ def test_wait_for_text_resumes_the_cpu_before_returning_a_match():
     grid = wait_for_text(t, "READY.", timeout=1.0, poll_interval=0.01,
                          verbose=False)
     assert grid is not None
-    assert t.resume_count >= 1
+    assert t.ops[-1] == "resume", t.ops
 
 
 def test_wait_for_text_resumes_the_cpu_before_returning_none():
     t = ResumeCountingTransport()
     assert wait_for_text(t, "NEVER", timeout=0.2, poll_interval=0.05,
                          verbose=False) is None
-    assert t.resume_count >= 1
+    assert t.ops[-1] == "resume", t.ops
 
 
 def test_wait_for_stable_resumes_the_cpu_before_returning_a_grid():
     t = ResumeCountingTransport()
     grid = wait_for_stable(t, timeout=1.0, poll_interval=0.01, stable_count=2)
     assert grid is not None
-    assert t.resume_count >= 1
+    assert t.ops[-1] == "resume", t.ops
 
 
 def test_waiters_resume_even_when_every_screen_read_fails():
@@ -256,12 +269,12 @@ def test_waiters_resume_even_when_every_screen_read_fails():
     t = ResumeCountingTransport(fail_reads=True)
     assert wait_for_text(t, "READY.", timeout=0.2, poll_interval=0.05,
                          verbose=False) is None
-    assert t.resume_count >= 1
+    assert t.ops[-1] == "resume", t.ops
 
     t2 = ResumeCountingTransport(fail_reads=True)
     assert wait_for_stable(t2, timeout=0.2, poll_interval=0.05,
                            stable_count=2) is None
-    assert t2.resume_count >= 1
+    assert t2.ops[-1] == "resume", t2.ops
 
 
 def test_screen_grid_from_transport_does_not_resume():

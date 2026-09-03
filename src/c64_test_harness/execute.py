@@ -116,7 +116,15 @@ def set_register(transport: BinaryViceTransport, name: str, value: int) -> None:
 
 
 def goto(transport: BinaryViceTransport, addr: int) -> None:
-    """Set PC to *addr* and resume CPU execution."""
+    """Set PC to *addr* and resume CPU execution.
+
+    Unlike :func:`jsr` this is a one-way jump: control never comes back,
+    so there is no point at which anything could be restored.  The target
+    inherits the stack frame and ``I`` flag of whatever the monitor
+    happened to halt, interrupt handler included.  A target that needs a
+    clean machine must rebuild it itself -- the warm-start
+    ``JMP ($A002)`` idiom rebuilds ``SP``; see ``sid_player.py``.
+    """
     transport.set_registers({"PC": addr})
     transport.resume()
 
@@ -178,14 +186,17 @@ RECOVERY_PROBE_TIMEOUT = 5.0
 #: and the ``I`` flag interrupt entry set is never restored.  So IRQs stay
 #: masked and the jiffy clock at ``$A0-$A2`` stops.
 #:
-#: Measured on a stock ``x64sc`` (see the commit that added this):
-#: with a main loop that re-enables interrupts, 18 of 1400 calls were
-#: issued while the CPU was halted inside the KERNAL IRQ handler and cost
-#: 123 bytes of stack (SP ``$C7`` -> ``$4C``, ~6.8 B per event, since the
-#: ``$FF48`` dispatcher pushes A/X/Y on top of the hardware frame); with a
-#: main loop that does not re-enable them, the *first* such call masked
-#: IRQs permanently and the jiffy clock did not advance again for the
-#: remaining 1400 calls.
+#: Measured on a stock ``x64sc``, 1400 calls per arm, CPU parked in a
+#: controlled idle loop (figures as published in issue #183): with a main
+#: loop that re-enables interrupts, 10 of 1400 calls were issued while the
+#: CPU was halted inside the KERNAL IRQ handler and cost 119 bytes of stack
+#: (SP ``$EF`` -> ``$78``, since the ``$FF48`` dispatcher pushes A/X/Y on
+#: top of the hardware frame); with a main loop that does not re-enable
+#: them, *one* such call at iteration 38 masked IRQs permanently and the
+#: jiffy clock stayed frozen at 3814 for the remaining ~1360 calls.
+#:
+#: No reproducer for these figures ships in this repo.  Treat them as the
+#: recorded observation they are, not as something the suite re-checks.
 _PRESERVED_REGS = ("PC", "SP", "FL")
 
 #: Trampoline tails.  The normal call parks two NOPs after the JSR; the
@@ -350,9 +361,21 @@ def jsr(
     is abandoned and the ``I`` flag it set is never cleared.  With
     *preserve_state* the pre-call ``PC``, ``SP`` and ``FL`` are read
     before the trampoline is written and put back once the routine has
-    returned, so a later :meth:`~.transport.C64Transport.resume` continues
-    the interrupted instruction stream exactly as it stood.  See
+    returned, so a later :meth:`~.transport.C64Transport.resume` re-enters
+    the interrupted instruction stream at the right address, with its
+    stack frame and interrupt-disable state intact.  See
     :data:`_PRESERVED_REGS` for the measured cost of not doing this.
+
+    Three limits on that.  ``A``/``X``/``Y`` are **not** put back: they
+    hold whatever the called routine left, which is what makes a return
+    value in ``A`` readable off the machine.  **Nothing** is put back when
+    the call times out -- the restore is deliberately outside the
+    ``finally``, because silently unwinding a hung routine would make a
+    hard failure look benign; use *recover_on_timeout* for that path.  And
+    restoring ``FL``/``SP`` **reverts the called routine's own effect on
+    them**: a routine whose point is its ``SEI``/``CLI``, or one that
+    rebuilds the stack with ``LDX #$FF / TXS``, needs
+    ``preserve_state=False`` or its work is undone on return.
 
     Two consequences worth knowing.  The **returned dict is still the
     routine's** post-``RTS`` register state -- it is read before the

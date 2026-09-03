@@ -53,14 +53,18 @@ def test_hung_routine_is_recovered_and_the_next_call_runs(binary_transport):
     assert wait_for_text(t, "READY.", timeout=15.0, poll_interval=0.2,
                          verbose=False) is not None, "C64 never reached READY."
 
-    # Then settle into a known register state.  wait_for_text leaves the
-    # CPU halted at a vsync trap, which now and then lands inside the IRQ
-    # handler with I set; jsr() would capture that FL and recovery would
-    # faithfully restore it, flaking the I-clear checks below.  A trivial
-    # CLI; RTS through the trampoline leaves the CPU halted at the
-    # checkpoint with I deterministically clear.
+    # Then settle into a known register state.  wait_for_text now resumes
+    # on every exit path, so the CPU is running here; the next monitor
+    # command re-halts it, now and then inside the IRQ handler with I set.
+    # jsr() would capture that FL and put it back, flaking the I-clear
+    # checks below -- so this one call opts out.  A trivial CLI; RTS
+    # through the trampoline with preserve_state=False leaves the CPU
+    # halted at the checkpoint with I deterministically clear; the default
+    # restore would write the pre-call FL back over the CLI and make this
+    # settle step a no-op.
     load_code(t, SETTLE_ADDR, [0x58, 0x60])
-    assert jsr(t, SETTLE_ADDR, timeout=5.0)["PC"] == POST_RTS_LANDING
+    assert jsr(t, SETTLE_ADDR, timeout=5.0,
+               preserve_state=False)["PC"] == POST_RTS_LANDING
 
     # SEI; JMP * -- an infinite loop that never RTSes.  The SEI is what
     # makes hung_pc deterministic: the monitor pauses at the next

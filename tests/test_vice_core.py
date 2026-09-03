@@ -77,6 +77,12 @@ def _wait_for_text_binary(transport, needle, timeout=15.0, poll_interval=1.0):
     That costs one extra monitor entry per iteration, taken immediately
     before the next screen read would have trapped the CPU anyway, so it
     does not shorten the window it measures.
+
+    The ``finally`` resumes on **every** exit path.  Returning the match
+    from inside the loop used to hand back a halted machine, so the next
+    step of a test ran against a C64 that had been given zero cycles --
+    the same defect issue #184 fixed in the library waiters, in the helper
+    the README used to point at as the pattern to copy.
     """
     needle_upper = needle.upper()
     deadline = time.monotonic() + timeout
@@ -96,6 +102,11 @@ def _wait_for_text_binary(transport, needle, timeout=15.0, poll_interval=1.0):
         return None
     finally:
         _LAST_POLL_TRACE[:] = trace
+        # Every exit path, match included: see the note above.
+        try:
+            transport.resume()
+        except Exception:
+            pass
 
 
 def _emulator_is_stalled(transport, samples: int = 4) -> tuple[bool, list[str]]:

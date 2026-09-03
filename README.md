@@ -168,7 +168,7 @@ with ViceProcess(config) as vice:
     transport.close()
 ```
 
-**Binary monitor note:** The binary monitor auto-pauses the CPU when any command is sent. Screen and keyboard operations need explicit `transport.resume()` calls between reads so the C64 can process keystrokes and update the screen. The `_wait_for_text_binary()` pattern shown in `tests/test_vice_core.py` demonstrates this.
+**Binary monitor note:** The binary monitor auto-pauses the CPU when any command is sent. Screen and keyboard operations need explicit `transport.resume()` calls between reads so the C64 can process keystrokes and update the screen. Use `wait_for_text()` or `wait_for_stable()`, which resume between polls *and* in a `finally`, so every exit path leaves the machine running. If you hand-roll a poll loop, resume in a `finally` — not just between polls, or a successful match hands back a stopped C64 that is indistinguishable from a hung one.
 
 ## Memory Helpers
 
