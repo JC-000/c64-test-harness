@@ -254,6 +254,13 @@ With `recover_on_timeout=True`, step 4 timing out adds: read registers (binmon a
 
 ---
 
+## Module: disasm
+
+- `disassemble(mem, base, *, upper=True) -> list[str]` -- Render a memory window (`bytes`) as one line per 6502/6510 instruction in classic monitor layout (`C000  AD 01 DE  LDA $DE01`), starting at address `base`. All 256 opcodes decode, illegal ones included, each with its real length, so a listing never desynchronises at an illegal instruction — the exact place a `RoutineHung.hung_pc` diagnostic looks. Dependency-free; not wired into `jsr()`/`RoutineHung` itself, but useful alongside `.hung_pc` for rendering what the CPU was executing. `scripts/dis6502.py` is a thin CLI over this module (no opcode table of its own).
+- `instruction_length(opcode) -> int` -- Byte length of one instruction from its opcode.
+
+---
+
 ## Module: screen
 
 - `ScreenGrid` -- Parsed screen state (40x25 character grid)
@@ -479,6 +486,12 @@ set_cs8900a_mac(transport, mac, base=0xDE00)
 
 ---
 
+## Module: capture
+
+Host-side raw ethernet capture/injection for TX/RX ethernet tests, platform-selected: Linux `AF_PACKET`/`SOCK_RAW` (needs `CAP_NET_RAW`/root), macOS `/dev/bpf*` via `BIOCSETIF` (issue #158 — before this module the TX/RX tests skipped on macOS entirely; needs a world-rw BPF node, see `docs/bridge_networking.md` § "macOS test-author traps" item 4 for the chmod/reboot caveats). `open_capture(iface) -> PacketCapture` returns the platform implementation or raises `CaptureUnavailable` naming the remedy verbatim — skip tests with that message, not a paraphrase. `parse_bpf_records()` is the pure BPF-buffer parser, pinned without a device by `tests/test_capture.py`. Full design in `docs/bridge_networking.md`.
+
+---
+
 ## Module: tests.bridge_platform
 
 Platform-dispatch module for bridge/ethernet tests. **Tests MUST import from here instead of hardcoding `tap-c64-*`, `br-c64`, `/sys/class/net/...`, or `tuntap`.** Lives in `tests/` so it's importable from pytest fixtures and conftest without touching the library package.
@@ -610,7 +623,8 @@ from c64_test_harness.backends.ultimate64_client import Ultimate64Client
 client = Ultimate64Client(host="192.168.1.81", password=None, timeout=10.0)
 
 # Optional: override the per-instance write_mem PUT/POST cutoff (bytes).
-# When omitted, auto-detected from firmware: fw 3.14d -> 128, else 48.
+# When omitted, auto-detected from firmware capabilities: 128 on firmware without the
+# Temp-folder fix (C64U 1.1.0, or Ultimate-line < 3.15); 48 on Ultimate-line >= 3.15.
 client = Ultimate64Client(host="192.168.1.81", write_mem_query_threshold=128)
 ```
 
@@ -634,7 +648,7 @@ Exception mapping: timeouts, unreachable device, and connection drops mid-reques
 
 **Memory (DMA-backed):**
 - `client.read_mem(address, length) -> bytes` -- Raises `Ultimate64ProtocolError` when the device returns a payload shorter or longer than requested (prevents silently short/misaligned chunked reads).
-- `client.write_mem(address, data)` -- DMA-backed write. Uses the legacy `PUT ?data=<hex>` form for payloads `<= self.write_mem_query_threshold` bytes, the `POST` raw-byte form above. Threshold is per-instance and auto-detected at construction (fw 3.14d → 128, else 48); override via the `write_mem_query_threshold=` constructor kwarg.
+- `client.write_mem(address, data)` -- DMA-backed write. Uses the legacy `PUT ?data=<hex>` form for payloads `<= self.write_mem_query_threshold` bytes, the `POST` raw-byte form above. Threshold is per-instance and auto-detected at construction from `DeviceCapabilities.writemem_post_safe` (128 on firmware without the Temp-folder fix — C64U 1.1.0, or Ultimate-line < 3.15; 48 on Ultimate-line ≥ 3.15); override via the `write_mem_query_threshold=` constructor kwarg.
 
 **Config:**
 - `client.get_version() -> dict`
@@ -643,6 +657,8 @@ Exception mapping: timeouts, unreachable device, and connection drops mid-reques
 - `client.get_config_category(name) -> dict`
 - `client.get_config_item(category, item) -> dict`
 - `client.set_config_items(category, items_dict)` -- iterates per-item (no batch endpoint)
+- `client.save_config_to_flash() -> None` -- `PUT /v1/configs:save_to_flash` (DESTRUCTIVE). Config PUTs are otherwise volatile; a reboot/power-cycle reloads flash, not the RAM-side value.
+- `client.load_config_from_flash(category=None) -> None` -- `PUT /v1/configs:load_from_flash` (DESTRUCTIVE). Discards unsaved in-memory changes. With `category` given, reloads only that category (`PUT /v1/configs/<category>:load_from_flash`; path depth >1 is HTTP 400).
 
 ### `ultimate64_helpers` key functions
 ```python

@@ -270,7 +270,7 @@ Read `PATTERNS.md` for the full list. The most common mistakes:
 
 9. **Probe U64 before connecting** — `probe_u64(host)` checks ping + TCP + API. `is_u64_reachable(host)` for a quick boolean. `Ultimate64InstanceManager.acquire()` probes automatically and skips unreachable devices.
 
-10. **UCI networking needs `turbo_safe=True` at ≥ 4 MHz** — without it, tests hang in `uci_wait_idle` or return error 0x85 at 48 MHz. Scripts `probe_uci_network.py` / `test_uci_tcp_echo.py` hand-write 6502 outside the builders and run at 1 MHz only.
+10. **UCI networking needs `turbo_safe=True` at ≥ 4 MHz** — without it, tests hang in `uci_wait_idle` or return error 0x85 at 48 MHz. Scripts `scripts/probe_uci_network.py` / `tests/test_uci_tcp_echo_live.py` hand-write 6502 outside the builders and run at 1 MHz only.
 
 11. **Ethernet: use RR-Net, not TFE** — previously documented as "TFE only"; harness now defaults to RR-Net and c64-https uses it too. TFE was dropped because TX-after-RX and full ICMP round-trip fail without the RR-Net clockport enable at `$DE01` bit 0.
 
