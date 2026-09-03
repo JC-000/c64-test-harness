@@ -180,13 +180,9 @@ The recommended order is cheapest-to-most-targeted: REST first (Tier 1
 will mask any other layer), runner second, UCI last.
 
 ```python
-from c64_test_harness import (
-    Ultimate64Client,
-    liveness_probe,
-    runner_health_check,
-    uci_wedge_probe,
-    Ultimate64RunnerStuckError,
-)
+from c64_test_harness import Ultimate64Client, liveness_probe, uci_wedge_probe
+from c64_test_harness.backends.ultimate64_helpers import runner_health_check
+from c64_test_harness.backends.ultimate64_client import Ultimate64RunnerStuckError
 
 host, port, password = "10.43.23.81", 80, None
 
