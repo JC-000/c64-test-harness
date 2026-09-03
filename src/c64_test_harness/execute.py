@@ -165,6 +165,29 @@ def wait_for_pc(
 #: emulator or the transport, not the probe.
 RECOVERY_PROBE_TIMEOUT = 5.0
 
+#: Registers ``jsr()`` puts back after a normal (non-hanging) call so
+#: that whatever the CPU was doing when the harness hijacked it can carry
+#: on.  ``PC`` returns the machine to the instruction the binary monitor
+#: happened to halt on; ``SP`` and ``FL`` return the stack pointer and the
+#: status register that instruction was running with.
+#:
+#: Without them, a call issued while the CPU sat inside an interrupt
+#: **abandons that interrupt's frame for good**: the hardware's 3-byte
+#: ``PCH/PCL/P`` push -- plus whatever the handler pushed on top of it --
+#: is never popped, because the ``RTI`` that would pop it never executes,
+#: and the ``I`` flag interrupt entry set is never restored.  So IRQs stay
+#: masked and the jiffy clock at ``$A0-$A2`` stops.
+#:
+#: Measured on a stock ``x64sc`` (see the commit that added this):
+#: with a main loop that re-enables interrupts, 18 of 1400 calls were
+#: issued while the CPU was halted inside the KERNAL IRQ handler and cost
+#: 123 bytes of stack (SP ``$C7`` -> ``$4C``, ~6.8 B per event, since the
+#: ``$FF48`` dispatcher pushes A/X/Y on top of the hardware frame); with a
+#: main loop that does not re-enable them, the *first* such call masked
+#: IRQs permanently and the jiffy clock did not advance again for the
+#: remaining 1400 calls.
+_PRESERVED_REGS = ("PC", "SP", "FL")
+
 #: Trampoline tails.  The normal call parks two NOPs after the JSR; the
 #: breakpoint sits on the first, so the second is never executed.  The
 #: hang-recovery probe turns that spare byte into an RTS and JSRs it, so
@@ -181,8 +204,28 @@ def _jsr_once(
     timeout: float,
     scratch_addr: int,
     tail: bytes = _TAIL_NOP_NOP,
+    preserve_state: bool = True,
+    saved: dict[str, int] | None = None,
 ) -> dict[str, int]:
-    """One trampoline round-trip; the machinery :func:`jsr` documents."""
+    """One trampoline round-trip; the machinery :func:`jsr` documents.
+
+    With *preserve_state* the pre-call ``PC``/``SP``/``FL`` are captured
+    before the hijack and put back once the routine has returned -- see
+    :data:`_PRESERVED_REGS` for why.  The returned register dict is the
+    routine's post-``RTS`` state, read *before* the restore, so callers
+    that read ``A``/``X``/``Y``/``PC`` out of it are unaffected.
+    """
+    if not preserve_state:
+        saved = None
+    elif saved is None:
+        # One extra round trip per call (~1 ms on a local binary monitor).
+        # It buys the machine's right to carry on afterwards.  A transport
+        # that does not report registers cannot be preserved and is left
+        # exactly as it was before: ``read_registers`` is deliberately not
+        # part of the cross-backend ``C64Transport`` protocol.
+        reader = getattr(transport, "read_registers", None)
+        saved = reader() if callable(reader) else None
+
     # Build trampoline: JSR $xxxx; NOP; NOP   (or NOP; RTS for the probe)
     lo = addr & 0xFF
     hi = (addr >> 8) & 0xFF
@@ -194,9 +237,15 @@ def _jsr_once(
     try:
         transport.set_registers({"PC": scratch_addr})
         transport.resume()
-        return wait_for_pc(transport, bp_addr, timeout=timeout)
+        regs = wait_for_pc(transport, bp_addr, timeout=timeout)
     finally:
         delete_breakpoint(transport, bp_id)
+
+    if saved is not None:
+        restore = {k: saved[k] for k in _PRESERVED_REGS if k in saved}
+        if restore:
+            transport.set_registers(restore)
+    return regs
 
 
 #: The register file recovery puts back, when the transport reports it.
@@ -246,8 +295,12 @@ def _recover_from_hang(
         # NOP must fire at the post-RTS landing.  _jsr_once so a probe
         # hang cannot recurse.
         rts_addr = scratch_addr + _PROBE_RTS_OFFSET
+        # preserve_state=False: recovery has just *deliberately* rewritten
+        # the register file (step b).  Capturing it again here and putting
+        # it back after the probe would restore the hung PC and undo that.
         regs = _jsr_once(transport, rts_addr, RECOVERY_PROBE_TIMEOUT,
-                         scratch_addr, tail=_TAIL_NOP_RTS)
+                         scratch_addr, tail=_TAIL_NOP_RTS,
+                         preserve_state=False)
     except _RECOVERY_ERRORS as e:
         return False, f"recovery probe failed: {e}", hung_pc
     pc = regs.get("PC")
@@ -271,6 +324,7 @@ def jsr(
     scratch_addr: int = 0x0334,
     override: str | None = None,
     recover_on_timeout: bool = False,
+    preserve_state: bool = True,
 ) -> dict[str, int]:
     """Call a subroutine at *addr* and wait for it to return.
 
@@ -288,6 +342,26 @@ def jsr(
 
     Returns the register state after the subroutine returns.  The CPU is
     paused when this function returns.
+
+    **Not disturbing the machine it hijacked** (*preserve_state*, default
+    ``True``).  Forcing ``PC`` at a CPU the binary monitor halted wherever
+    it happened to be is destructive when that "wherever" is inside an
+    interrupt: the handler never reaches its ``RTI``, so its stack frame
+    is abandoned and the ``I`` flag it set is never cleared.  With
+    *preserve_state* the pre-call ``PC``, ``SP`` and ``FL`` are read
+    before the trampoline is written and put back once the routine has
+    returned, so a later :meth:`~.transport.C64Transport.resume` continues
+    the interrupted instruction stream exactly as it stood.  See
+    :data:`_PRESERVED_REGS` for the measured cost of not doing this.
+
+    Two consequences worth knowing.  The **returned dict is still the
+    routine's** post-``RTS`` register state -- it is read before the
+    restore, so ``regs["A"]`` and friends are unchanged.  And the machine
+    is no longer left parked on the trampoline's stale ``NOP``s, which is
+    the hazard ``sid_player.play_sid_vice`` works around by hand.  Pass
+    ``preserve_state=False`` for the old behaviour: one fewer round trip
+    per call, and the CPU left at *scratch_addr* + 3 with the routine's
+    own ``SP``/``FL``.
 
     If the transport carries an :class:`~.execution_policy.ExecutionPolicy`
     and *addr* falls in a span the caller declared dead, this raises
@@ -351,12 +425,15 @@ def jsr(
     check_execution_policy(transport, addr, override=override)
 
     if not recover_on_timeout:
-        return _jsr_once(transport, addr, timeout, scratch_addr)
+        return _jsr_once(transport, addr, timeout, scratch_addr,
+                         preserve_state=preserve_state)
 
     saved_regs = transport.read_registers()
     started = time.monotonic()
     try:
-        return _jsr_once(transport, addr, timeout, scratch_addr)
+        # The register file is already in hand; no need to read it twice.
+        return _jsr_once(transport, addr, timeout, scratch_addr,
+                         preserve_state=preserve_state, saved=saved_regs)
     except TimeoutError as exc:
         elapsed = time.monotonic() - started
         cause = exc  # the name ``exc`` is unbound once the block ends
