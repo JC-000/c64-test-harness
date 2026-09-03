@@ -17,8 +17,10 @@ opcode reads ``00 BRK``.  No cycle counts, no labels -- this is a
 diagnostic, not a tool.
 
 The opcode table is the one from issue #170's ``scripts/dis6502.py``
-(``assert len == 256``); after both branches merge, that script becomes a
-thin CLI over this module -- this is the consolidation target.
+(``assert len == 256``). The two have since been consolidated: the table
+lives only here, and ``scripts/dis6502.py`` is now a thin CLI over this
+module (via ``disassemble(..., upper=False)``) with no opcode table of
+its own.
 """
 
 from __future__ import annotations
