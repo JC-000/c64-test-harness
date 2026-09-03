@@ -623,7 +623,8 @@ from c64_test_harness.backends.ultimate64_client import Ultimate64Client
 client = Ultimate64Client(host="192.168.1.81", password=None, timeout=10.0)
 
 # Optional: override the per-instance write_mem PUT/POST cutoff (bytes).
-# When omitted, auto-detected from firmware: fw 3.14d -> 128, else 48.
+# When omitted, auto-detected from firmware capabilities: 128 on firmware without the
+# Temp-folder fix (C64U 1.1.0, or Ultimate-line < 3.15); 48 on Ultimate-line >= 3.15.
 client = Ultimate64Client(host="192.168.1.81", write_mem_query_threshold=128)
 ```
 
@@ -647,7 +648,7 @@ Exception mapping: timeouts, unreachable device, and connection drops mid-reques
 
 **Memory (DMA-backed):**
 - `client.read_mem(address, length) -> bytes` -- Raises `Ultimate64ProtocolError` when the device returns a payload shorter or longer than requested (prevents silently short/misaligned chunked reads).
-- `client.write_mem(address, data)` -- DMA-backed write. Uses the legacy `PUT ?data=<hex>` form for payloads `<= self.write_mem_query_threshold` bytes, the `POST` raw-byte form above. Threshold is per-instance and auto-detected at construction (fw 3.14d → 128, else 48); override via the `write_mem_query_threshold=` constructor kwarg.
+- `client.write_mem(address, data)` -- DMA-backed write. Uses the legacy `PUT ?data=<hex>` form for payloads `<= self.write_mem_query_threshold` bytes, the `POST` raw-byte form above. Threshold is per-instance and auto-detected at construction from `DeviceCapabilities.writemem_post_safe` (128 on firmware without the Temp-folder fix — C64U 1.1.0, or Ultimate-line < 3.15; 48 on Ultimate-line ≥ 3.15); override via the `write_mem_query_threshold=` constructor kwarg.
 
 **Config:**
 - `client.get_version() -> dict`
