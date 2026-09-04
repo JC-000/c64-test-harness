@@ -19,14 +19,14 @@ they fail rather than skip when no frame is seen.  They skip only when
 :func:`~c64_test_harness.capture.open_capture` reports the path is
 genuinely unavailable, and then the skip reason *is* the remedy.
 
-See ``test_disk_vice.py`` module docstring for the screen polling /
-``resume()`` interaction explanation.
+Screen polling goes through ``conftest.binary_wait_for_text``, which
+resumes between polls and on every exit path; see the ``test_disk_vice.py``
+module docstring for the ``resume()`` interaction it exists to handle.
 """
 
 from __future__ import annotations
 
 import os
-import time
 
 import pytest
 
@@ -44,7 +44,6 @@ from c64_test_harness.capture import (
     PacketCapture,
     open_capture,
 )
-from c64_test_harness.screen import ScreenGrid
 from ethernet_scenarios import (
     capture_failure_disposition,
     resolve_capture_ifaces,
@@ -53,7 +52,11 @@ from ethernet_scenarios import (
     run_tx_scenario,
 )
 
-from conftest import connect_binary_transport, start_vice_or_skip
+from conftest import (
+    binary_wait_for_text,
+    connect_binary_transport,
+    start_vice_or_skip,
+)
 
 # ---------------------------------------------------------------------------
 # Skip helpers
@@ -108,36 +111,6 @@ pytestmark = [
 
 
 # ---------------------------------------------------------------------------
-# Binary transport helpers
-# ---------------------------------------------------------------------------
-
-def _binary_wait_for_text(
-    transport: BinaryViceTransport,
-    needle: str,
-    timeout: float = 30.0,
-    poll_interval: float = 2.0,
-) -> ScreenGrid | None:
-    """Wait until *needle* appears on screen, resuming between polls.
-
-    See ``test_disk_vice.py`` module docstring for why this is needed.
-    """
-    needle_upper = needle.upper()
-    start = time.monotonic()
-    while True:
-        elapsed = time.monotonic() - start
-        if elapsed >= timeout:
-            return None
-        try:
-            transport.resume()
-            time.sleep(poll_interval)
-            grid = ScreenGrid.from_transport(transport)
-            if needle_upper in grid.continuous_text().upper():
-                return grid
-        except Exception:
-            time.sleep(poll_interval)
-
-
-# ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
@@ -174,7 +147,7 @@ def vice_ethernet():
         vice = start_vice_or_skip(config)
         transport = connect_binary_transport(port, proc=vice)
         try:
-            grid = _binary_wait_for_text(transport, "READY.", timeout=30)
+            grid = binary_wait_for_text(transport, "READY.", timeout=30)
             assert grid is not None, "BASIC READY prompt not found"
             yield transport
         finally:
