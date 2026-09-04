@@ -52,6 +52,18 @@ class HarnessConfig:
     vice_prg_path: str = ""
     vice_warp: bool = True
     vice_ntsc: bool = True
+    #: Run VICE's sound core.  **Not an output switch** -- ``False``
+    #: emits ``+sound``, which stops reSID being clocked, and
+    #: ``$D41B``/``$D41C`` then read back ``maincpu_clk % 256`` (VICE
+    #: 3.10 ``sid.c:137,279``): a clean ramp that looks like a working
+    #: oscillator.  ``sounddev="dummy"`` is *not* a headless-safe
+    #: substitute -- it enables the core and then stalls it.
+    #:
+    #: The default stays ``False`` so a launch never opens a host audio
+    #: device.  For SID measurement use
+    #: :func:`~c64_test_harness.backends.vice_lifecycle.headless_sid_config`,
+    #: which is ``sound=True`` + ``sounddev="wav"`` + ``-soundvolume 0``.
+    #: See ``docs/sid_audio.md``.
     vice_sound: bool = False
     vice_console: bool = True
     vice_minimize: bool = True

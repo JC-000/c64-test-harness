@@ -3,6 +3,26 @@
 Launch x64sc, autostart a .prg, record audio to a WAV file for a
 specified duration via ``-limitcycles``, then cleanly shut down.
 
+Two VICE settings silently produce a well-formed, empty capture rather
+than an error, so both are forced/refused here (issue #196):
+
+**Warp must be off.**  ``sound_flush()`` throws the sample buffer away
+when warp is on and no record device is configured (S ``sound.c:1528``:
+``snddata.bufptr = 0``), and configuring one does *not* rescue it --
+the loop that writes to the play and record devices is
+``while (!warp_mode_enabled)`` (S ``sound.c:1573-1613``), so under warp
+it never runs and ``snddata.bufptr -= nr`` drops the samples anyway.
+``-soundwarpmode 1`` only keeps the SID *emulated* under warp; it does
+not make the audio reach a device.  ``render_wav`` therefore sets
+``warp=False`` and refuses a ``-warp`` smuggled in through
+``extra_args``.
+
+**The volume must not be zero.**  At ``-soundvolume 0`` VICE ``memset``s
+the sample buffer before it reaches any device (S ``sound.c:1441-1449``),
+so the WAV is silence.  (Volume 0 is still safe for *register*-domain
+measurement -- see :attr:`ViceConfig.soundvolume` and
+:func:`~c64_test_harness.backends.vice_lifecycle.headless_sid_config`.)
+
 Public API
 ----------
 - ``render_wav()`` — high-level one-call render
@@ -34,6 +54,45 @@ class RenderResult:
     duration_seconds: float
     cycles: int
     sample_rate: int
+
+
+#: ``extra_args`` entries that would re-enable warp behind
+#: ``render_wav``'s ``warp=False``.  VICE's cmdline parser takes the last
+#: setting of a resource, and ``extra_args`` is appended after the flags
+#: this module emits, so one of these wins.
+_WARP_ENABLING_ARGS = frozenset({"-warp", "-warp=1", "+warp=0"})
+
+
+def _reject_silent_capture(config: ViceConfig | None) -> None:
+    """Refuse a base config that would yield a valid, empty WAV.
+
+    Both failures are silent in VICE: warp discards every sample, and
+    volume 0 zeroes the buffer.  Either way the render "succeeds", the
+    file is a well-formed WAV, and the analysis downstream fits a model
+    to silence (issue #196).
+
+    :param config: The caller's base ``ViceConfig``, or ``None``.
+    :raises ValueError: When the config would silence the capture.
+    """
+    if config is None:
+        return
+    smuggled = [a for a in config.extra_args if a in _WARP_ENABLING_ARGS]
+    if smuggled:
+        raise ValueError(
+            f"render_wav() cannot record under warp: extra_args contains "
+            f"{smuggled!r}, which re-enables warp after render_wav sets "
+            f"warp=False. VICE discards the sample buffer under warp "
+            f"(S sound.c:1528 / 1573), so the WAV would be well-formed "
+            f"and empty. Remove it, or capture on hardware."
+        )
+    if config.soundvolume == 0:
+        raise ValueError(
+            "render_wav() cannot record at soundvolume=0: VICE memsets the "
+            "sample buffer to zero before it reaches the sound device "
+            "(S sound.c:1441-1449), so the WAV would be silence. Volume 0 "
+            "is only safe for register-domain measurement "
+            "(headless_sid_config)."
+        )
 
 
 def render_wav(
@@ -78,6 +137,10 @@ def render_wav(
     ------
     FileNotFoundError
         If *prg_path* does not exist.
+    ValueError
+        If *config* would silently produce an empty capture: a ``-warp``
+        in ``extra_args``, or ``soundvolume=0``.  See the module
+        docstring.
     RuntimeError
         If the output WAV is missing or empty after VICE exits.
     subprocess.TimeoutExpired
@@ -88,6 +151,8 @@ def render_wav(
 
     if not prg_path.exists():
         raise FileNotFoundError(f"PRG file not found: {prg_path}")
+
+    _reject_silent_capture(config)
 
     clock_hz = PAL_CLOCK_HZ if pal else NTSC_CLOCK_HZ
     cycles = int(round(duration_seconds * clock_hz))
