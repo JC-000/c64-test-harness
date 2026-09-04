@@ -157,6 +157,13 @@ from .backends.device_lock import (
     DeviceLockContentionError,
     DeviceLockTimeout,
     advisory_lock_check,
+    device_lock_holder,
+    device_lock_path,
+    suppress_unlocked_warning,
+    unlocked_warning_enabled,
+    warn_unlocked_client,
+    REQUIRE_DEVICE_LOCK_ENV,
+    UNLOCKED_WARNING_ENV,
 )
 from .backends.unified_manager import (
     TestTarget,
@@ -573,6 +580,13 @@ __all__ = [
     "DeviceLockContentionError",
     "DeviceLockTimeout",
     "advisory_lock_check",
+    "device_lock_holder",
+    "device_lock_path",
+    "suppress_unlocked_warning",
+    "unlocked_warning_enabled",
+    "warn_unlocked_client",
+    "REQUIRE_DEVICE_LOCK_ENV",
+    "UNLOCKED_WARNING_ENV",
     # Unified backend manager
     "TestTarget",
     "BackendManager",

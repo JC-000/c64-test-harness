@@ -39,10 +39,39 @@ warns (or raises under ``U64_REQUIRE_DEVICE_LOCK=1``) when *this*
 process doesn't hold the device lock and another live process does.
 Single-user flows never see it: with no live foreign holder the check
 emits at most a debug line.
+
+**The asymmetry that check cannot cover** (issue #194).
+``advisory_lock_check`` only fires when the *other* lane took the lock.
+A lane that never touches this package is invisible to it, so a careful
+lane gets no protection from a careless one and no way to detect the
+collision — it just sees a device that appears to degrade.  Two
+half-measures narrow that gap:
+
+* :func:`warn_unlocked_client` — once per process per host, at
+  construction of a device client, say plainly that this lane is
+  driving the device unlocked and name the lockfile.  Suppressed by
+  ``U64_UNLOCKED_CLIENT_WARNING=0`` and by
+  :func:`suppress_unlocked_warning` (which the harness's own locked
+  manager uses, because it builds the client a moment *before* taking
+  the lock).
+* :func:`device_lock_holder` / :func:`device_lock_path` — the cheap
+  "is anyone holding this right now?" query and the path it reads, for
+  a runner that wants to check without adopting the rest of the
+  package.  See ``docs/device_locking.md`` for the fail-closed wrapper
+  both lanes in #194 converged on.
+
+**The trap in reading lock state.**  :meth:`DeviceLock.read_info` names
+whoever *last* held the lock; :func:`device_lock_holder` /
+:meth:`DeviceLock.foreign_holder` answer who holds it *now*.  Because
+:meth:`DeviceLock.release` deliberately leaves the lockfile behind, a
+file naming a dead PID is the ordinary state after any completed run —
+so a wrapper built on ``read_info`` announces finished runs as current
+holders.  Use ``read_info`` for diagnostics only.
 """
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import logging
@@ -53,6 +82,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 
 _log = logging.getLogger(__name__)
@@ -146,10 +176,26 @@ _PROCESS_HELD_GUARD = threading.Lock()
 #: Environment variable that upgrades the advisory warning to a raise.
 REQUIRE_DEVICE_LOCK_ENV = "U64_REQUIRE_DEVICE_LOCK"
 
+#: Environment variable that silences the once-per-process
+#: unlocked-client notice (:func:`warn_unlocked_client`).  Accepts the
+#: usual falsey spellings; anything else (or unset) leaves it on.
+UNLOCKED_WARNING_ENV = "U64_UNLOCKED_CLIENT_WARNING"
+
 #: (device_host, holder_pid) pairs already warned about, so a chatty
 #: caller (write_mem chunking, a config sweep) warns once per holder
 #: instead of once per request.
 _WARNED_HOLDERS: set[tuple[str, int | None]] = set()
+
+#: Hosts this process has already emitted the unlocked-client notice
+#: for.  Keyed by host alone, deliberately: the point is one line per
+#: process, not one per client object.
+_UNLOCKED_WARNED: set[str] = set()
+
+#: Thread-local suppression depth for :func:`warn_unlocked_client`.
+#: Thread-scoped rather than process-scoped so suppressing the notice
+#: around one manager's client construction cannot silence an unrelated
+#: ad-hoc client built concurrently on another thread.
+_UNLOCKED_SUPPRESS = threading.local()
 
 
 class DeviceLockContentionError(RuntimeError):
@@ -911,6 +957,11 @@ class DeviceLock:
     ) -> dict | None:
         """Return metadata for *another live process* holding this device.
 
+        **This is the "who holds it right now?" query.**  It is the one
+        to build a wrapper on; :meth:`read_info` is not (see its
+        docstring).  :func:`device_lock_holder` is the module-level
+        alias, for callers that would rather not import the class.
+
         ``None`` when the device is unlocked, when the only holder is
         this process, or when the lock state can't be read.  Never
         blocks and never touches the network.
@@ -963,6 +1014,24 @@ class DeviceLock:
 
     def read_info(self) -> dict | None:
         """Read metadata from the lockfile without acquiring the lock.
+
+        .. warning::
+
+           **This names whoever held the lock LAST, not whoever holds it
+           now.**  :meth:`release` deliberately does not unlink the
+           lockfile (unlinking would race a process that has already
+           opened the path and is about to ``flock`` it — flocks are
+           per-inode), so **a lockfile naming a dead PID is the normal
+           state after any completed run**, not a stale or wedged
+           holder.  Nothing here consults the flock.
+
+           A wrapper built on this method therefore announces a finished
+           run's PID as the current holder — the same class of
+           confidently wrong answer the lock exists to prevent, and a
+           mistake two independent lanes made before issue #194 was
+           filed.  For "is anyone holding this right now?" use
+           :meth:`foreign_holder` / :func:`device_lock_holder`, which
+           decide by probing the flock.
 
         Returns the parsed JSON dict, or ``None`` if the file doesn't
         exist or can't be read.  This is for diagnostics only.
@@ -1441,10 +1510,175 @@ def advisory_lock_check(
     )
 
 
+def device_lock_path(device_host: str, lock_dir: Path | None = None) -> Path:
+    """Path of the lockfile that guards *device_host*.
+
+    Pure path arithmetic: nothing is opened, created, or read, and the
+    lock directory is **not** created as a side effect of asking.  The
+    file need not exist — a device nobody has ever locked has no
+    lockfile.
+
+    Exposed so an error message, a wrapper script, or a human can name
+    the exact file rather than reverse-engineering the sanitizing rule.
+    """
+    d = lock_dir or _default_lock_dir(create=False)
+    return d / f"device-{_sanitize_device_id(device_host)}.lock"
+
+
+def device_lock_holder(
+    device_host: str, lock_dir: Path | None = None
+) -> dict | None:
+    """Who holds *device_host*'s lock **right now**, if anyone else does.
+
+    The cheap public "is somebody else on this device?" query: one
+    ``open``, one non-blocking shared ``flock``, one small read.  No
+    network traffic, no blocking, and no interference with a real
+    acquirer (a waiter that collides with the probe just retries on its
+    next 100 ms poll).
+
+    Returns the holder's metadata dict (``pid``, ``ts``,
+    ``device_host``) or ``None`` when nobody holds it, when the only
+    holder is *this* process, or when the state can't be read.  Use
+    :meth:`DeviceLock.held_by_this_process` for the "is it us?" half.
+
+    Module-level alias for :meth:`DeviceLock.foreign_holder`, so a
+    runner that does not otherwise use this package can do::
+
+        from c64_test_harness import device_lock_holder
+        if device_lock_holder("10.43.23.81"):
+            sys.exit("device busy")
+
+    Note what this is **not**: :meth:`DeviceLock.read_info` reads the
+    same file without consulting the flock and so reports the *last*
+    holder, which after any completed run is a dead PID.  Do not build
+    on that one.
+
+    Fail closed.  If importing this package fails, refuse to run rather
+    than falling back to an unlocked run — a silent unlocked run is
+    precisely what the lock exists to prevent (issue #194; the full
+    wrapper pattern is in ``docs/device_locking.md``).
+    """
+    return DeviceLock.foreign_holder(device_host, lock_dir=lock_dir)
+
+
+def unlocked_warning_enabled() -> bool:
+    """Whether the unlocked-client notice is switched on.
+
+    Read at call time (not import time) so tests and long-lived
+    processes can flip it.  Default is on; ``U64_UNLOCKED_CLIENT_WARNING``
+    set to ``0`` / ``false`` / ``no`` / ``off`` turns it off.
+    """
+    raw = os.environ.get(UNLOCKED_WARNING_ENV, "")
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+@contextlib.contextmanager
+def suppress_unlocked_warning() -> Iterator[None]:
+    """Silence :func:`warn_unlocked_client` on this thread, re-entrantly.
+
+    For code that is *about* to take the device lock but must build the
+    client first.  The harness's own ``_LockedU64Manager`` is exactly
+    that case: it asks the inner pool for a device (which constructs the
+    transport, and with it the client) and only then acquires the
+    ``DeviceLock``, because the host isn't known until the pool has
+    chosen it.  Without this, the one lane doing the right thing would
+    be the only lane warned.
+
+    Thread-scoped and depth-counted, so a concurrent ad-hoc client on
+    another thread still gets its notice, and nesting doesn't
+    prematurely re-enable.
+
+    Not a licence to skip the lock: it suppresses a *message*, not a
+    check.  :func:`advisory_lock_check` still runs on every destructive
+    call.
+    """
+    depth = getattr(_UNLOCKED_SUPPRESS, "depth", 0)
+    _UNLOCKED_SUPPRESS.depth = depth + 1
+    try:
+        yield
+    finally:
+        _UNLOCKED_SUPPRESS.depth = depth
+
+
+def warn_unlocked_client(
+    device_host: str,
+    *,
+    what: str = "device client",
+    lock_dir: Path | None = None,
+    logger: logging.Logger | None = None,
+) -> bool:
+    """Say once, per process and host, that this lane is unlocked.
+
+    Called when a device client is constructed while this process holds
+    no :class:`DeviceLock` for *device_host*.  Unlike
+    :func:`advisory_lock_check` this does **not** require a foreign
+    holder to be visible — that is the whole point.  In issue #194 the
+    colliding lane never used this package, so it took no lock and the
+    foreign-holder check had nothing to see; the careful lane needed to
+    be told that *it* was unlocked, before the collision, not that
+    somebody else was.
+
+    Returns ``True`` if a warning was emitted.  Silent (returning
+    ``False``) when this process holds the lock, when the host has
+    already been warned about, inside :func:`suppress_unlocked_warning`,
+    or when ``U64_UNLOCKED_CLIENT_WARNING=0``.
+
+    Never raises: an advisory notice must not be the reason a client
+    fails to construct.
+    """
+    log = logger or _log
+    try:
+        if getattr(_UNLOCKED_SUPPRESS, "depth", 0) > 0:
+            return False
+        if not unlocked_warning_enabled():
+            return False
+        if DeviceLock.held_by_this_process(device_host, lock_dir=lock_dir):
+            return False
+        with _PROCESS_HELD_GUARD:
+            if device_host in _UNLOCKED_WARNED:
+                return False
+            _UNLOCKED_WARNED.add(device_host)
+        path = device_lock_path(device_host, lock_dir=lock_dir)
+        holder = DeviceLock.foreign_holder(device_host, lock_dir=lock_dir)
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+    if holder is not None:
+        holder_tag = (
+            f"  Another live process (PID {holder.get('pid')}) holds it "
+            f"right now — you are about to collide with it."
+        )
+    else:
+        holder_tag = (
+            "  Nobody else holds it *through this mechanism*, which is not "
+            "the same as nobody else using the device: a lane that doesn't "
+            "use this package takes no lock and is invisible here."
+        )
+    log.warning(
+        "%s for %s built without holding this device's lock in this process. "
+        "Device access is advisory: an unlocked lane is invisible to a "
+        "locked one, and a locked lane's run_prg is a load-and-run that "
+        "REPLACES whatever program you are driving (issue #194).%s  "
+        "Lockfile: %s.  Take the lock with "
+        "DeviceLock(%r).acquire_or_raise(timeout=...) or go through "
+        "create_manager(backend='u64').  Set %s=0 to silence this "
+        "(once per process per host).",
+        what,
+        device_host,
+        holder_tag,
+        path,
+        device_host,
+        UNLOCKED_WARNING_ENV,
+    )
+    return True
+
+
 def _reset_advisory_state() -> None:
-    """Clear the warn-once cache and the hold registry (tests only)."""
+    """Clear the warn-once caches and the hold registry (tests only)."""
+    _UNLOCKED_SUPPRESS.depth = 0
     with _PROCESS_HELD_GUARD:
         _WARNED_HOLDERS.clear()
+        _UNLOCKED_WARNED.clear()
         _PROCESS_HELD.clear()
         _PROCESS_HELD_THREADS.clear()
 

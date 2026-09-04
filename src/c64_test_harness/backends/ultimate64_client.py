@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 try:  # device_lock needs fcntl — absent on Windows, optional everywhere
     from .device_lock import advisory_lock_check as _advisory_lock_check
+    from .device_lock import warn_unlocked_client as _warn_unlocked_client
 
     _HAS_DEVICE_LOCK = True
 except Exception:  # pragma: no cover - exercised only without fcntl
@@ -160,6 +161,23 @@ class Ultimate64Client:
 
     The client is stateless between calls — each call opens a fresh
     TCP connection via ``urllib.request.urlopen``.
+
+    **Locking is advisory and this class does not take the lock.**
+    Constructing a client is not permission to drive the device: the
+    machine-global :class:`~c64_test_harness.backends.device_lock.DeviceLock`
+    is what serialises lanes, and a lane that skips it is invisible to
+    every lane that took it.  Because a locked neighbour's
+    :meth:`run_prg` is a *load-and-run* that replaces whatever program
+    you are driving, an unlocked lane is destructive rather than merely
+    rude — and it reads, from the other side, as the device
+    mysteriously degrading (issue #194).
+
+    So either go through ``create_manager(backend="u64")`` (which locks
+    for you) or hold ``DeviceLock(host)`` yourself for the whole run.
+    Constructing a client with no lock held emits one WARNING per
+    process per host; see
+    :func:`~c64_test_harness.backends.device_lock.warn_unlocked_client`
+    and ``docs/device_locking.md``.
     """
 
     def __init__(
@@ -170,6 +188,7 @@ class Ultimate64Client:
         timeout: float = 10.0,
         *,
         write_mem_query_threshold: int | None = None,
+        warn_unlocked: bool = True,
     ) -> None:
         """Construct an Ultimate64 REST client.
 
@@ -192,6 +211,14 @@ class Ultimate64Client:
             so construction issues no HTTP traffic. If the probe fails, the
             capability set resolves conservatively (fix assumed absent, so
             128) — construction never raises on probe failure.
+        :param warn_unlocked: emit the once-per-process "this lane holds
+            no device lock" WARNING (see the class docstring).  Pass
+            ``False`` only where the caller is about to take the lock and
+            simply needs the client first — the harness's own locked
+            manager is that case.  ``U64_UNLOCKED_CLIENT_WARNING=0``
+            silences it globally instead.  Either way nothing about
+            locking *behaviour* changes: this suppresses a message, not
+            a check.
         """
         if not isinstance(host, str) or not host:
             raise ValueError("host must be a non-empty string")
@@ -204,6 +231,13 @@ class Ultimate64Client:
         self.password = password
         self.timeout = timeout
         self._base = f"http://{host}:{port}" if port != 80 else f"http://{host}"
+
+        # Before any network traffic: one line per process per host if
+        # this lane is driving the device without holding its lock.
+        if warn_unlocked and _HAS_DEVICE_LOCK:
+            _warn_unlocked_client(
+                self.host, what="Ultimate64Client", logger=_log
+            )
 
         self._capabilities: DeviceCapabilities | None = None
         if write_mem_query_threshold is not None:
@@ -751,6 +785,23 @@ class Ultimate64Client:
 
     def run_prg(self, data: bytes, *, fallback_on_404: bool = True) -> None:
         """POST /v1/runners:run_prg — load and RUN a PRG (DESTRUCTIVE).
+
+        **This replaces the running program.**  It is a load-and-run,
+        not a call that interleaves with whatever the machine was
+        already doing: the firmware resets the machine, loads *data*,
+        and starts it.  Anything another lane had running — its state,
+        its open UCI sockets, the program it believes it is still
+        talking to — is gone, with no error on either side.
+
+        That is what makes an *unlocked* ``run_prg`` destructive rather
+        than merely rude, and why it is so badly misread from the other
+        end: the displaced lane sees its own protocol answering
+        nonsense (in issue #194, ``OPEN_UDP`` returning ``21,UNKNOWN
+        COMMAND`` where the same opcode answered correctly a minute
+        later, and three runs aborting at *different* points) and
+        diagnoses device degradation.  The variable was the neighbour's
+        timing, not its own code.  Hold the device lock for the whole
+        run — see ``docs/device_locking.md``.
 
         Firmware 3.14 requires POST (PUT returns 400).
 

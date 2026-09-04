@@ -22,7 +22,11 @@ from .vice_lifecycle import ViceConfig
 from .vice_manager import ViceInstanceManager
 
 try:
-    from .device_lock import DeviceLock, DeviceLockTimeout
+    from .device_lock import (
+        DeviceLock,
+        DeviceLockTimeout,
+        suppress_unlocked_warning,
+    )
 
     _HAS_DEVICE_LOCK = True
 except ImportError:  # pragma: no cover
@@ -324,7 +328,17 @@ class _LockedU64Manager:
         callers can distinguish "queued behind a healthy holder" from
         "device wedged/unreachable" without guessing.
         """
-        instance = self._inner.acquire()
+        # The inner pool builds the transport (and with it the
+        # Ultimate64Client) before we can know which host to lock, so
+        # the client is constructed a moment *before* the lock is taken.
+        # Left alone, that would fire the unlocked-client notice on the
+        # one path that does the locking correctly — a false positive on
+        # exactly the careful lane issue #194 is about.  Suppression is
+        # thread-scoped, so an ad-hoc unlocked client built on another
+        # thread still gets its notice.
+        # (This class is only instantiated when device_lock imported.)
+        with suppress_unlocked_warning():
+            instance = self._inner.acquire()
         device_host = instance.device.host
         # allow_nested: a caller that already holds this device's lock
         # (a pytest fixture, a bench tool wrapping its whole run) would
