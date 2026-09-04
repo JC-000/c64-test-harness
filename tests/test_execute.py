@@ -134,11 +134,114 @@ def test_set_register_invalid_raises():
 
 # -- goto --------------------------------------------------------------------
 
+class StrictRegisterMockTransport(BinaryMockTransport):
+    """A mock that rejects register names the way VICE's map does.
+
+    ``BinaryViceTransport.set_registers`` checks every name against the
+    register map VICE reported at connect time and raises *before*
+    sending anything.  The permissive base mock accepts whatever it is
+    handed, so the "nothing is applied" half of ``goto(cold=True)``
+    cannot be exercised against it.  ``FL`` is deliberately absent here:
+    the harness already tolerates a map without it (``_RESTORED_REGS``).
+    """
+
+    known = frozenset({"PC", "A", "X", "Y", "SP"})
+
+    def set_registers(self, regs: dict[str, int]) -> None:
+        for name in regs:
+            if name.upper() not in self.known:
+                raise ValueError(
+                    f"Unknown register {name!r}; known: {sorted(self.known)}"
+                )
+        super().set_registers(regs)
+
+
+class OpLogMockTransport(BinaryMockTransport):
+    """Records the order of register writes and resumes."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.ops: list[str] = []
+
+    def set_registers(self, regs: dict[str, int]) -> None:
+        super().set_registers(regs)
+        self.ops.append("set_registers")
+
+    def resume(self) -> None:
+        super().resume()
+        self.ops.append("resume")
+
+
 def test_goto_sets_pc_and_resumes():
     t = BinaryMockTransport()
     goto(t, 0xC000)
     assert t._set_registers_calls == [{"PC": 0xC000}]
     assert t._resume_count == 1
+
+
+def test_goto_default_leaves_sp_and_flags_alone():
+    # The pre-existing contract: a plain goto() touches PC and nothing
+    # else, so the target inherits the halted machine's stack and flags.
+    t = BinaryMockTransport()
+    t._registers["SP"] = 0x78     # descended, as a mid-IRQ halt leaves it
+    t._registers["FL"] = 0x26     # I set: issue #183's frozen-jiffy state
+    goto(t, 0xC000)
+    assert t._registers["SP"] == 0x78
+    assert t._registers["FL"] == 0x26
+
+
+def test_goto_cold_rebuilds_sp_and_clears_i_and_d():
+    # cold=True is the opt-in for "start this as if nothing was running":
+    # full stack page, IRQs unmasked, binary arithmetic.
+    t = BinaryMockTransport()
+    t._registers["SP"] = 0x78
+    t._registers["FL"] = 0xFF     # every flag set, I and D included
+    goto(t, 0xC000, cold=True)
+    assert t._registers["PC"] == 0xC000
+    assert t._registers["SP"] == 0xFF
+    assert t._registers["FL"] & 0x04 == 0, "I must be clear"
+    assert t._registers["FL"] & 0x08 == 0, "D must be clear"
+    assert t._resume_count == 1
+
+
+def test_goto_cold_writes_every_register_in_one_command():
+    # One wire command, so the machine is never briefly half-built.
+    t = BinaryMockTransport()
+    goto(t, 0xC000, cold=True)
+    assert t._set_registers_calls == [{"PC": 0xC000, "SP": 0xFF, "FL": 0x20}]
+
+
+def test_goto_cold_applies_the_state_before_resuming():
+    # Order is load-bearing: SP written after the resume would land on a
+    # CPU already running the target.
+    t = OpLogMockTransport()
+    goto(t, 0xC000, cold=True)
+    assert t.ops == ["set_registers", "resume"]
+
+
+def test_goto_cold_on_a_transport_without_fl_refuses_and_does_not_resume():
+    t = StrictRegisterMockTransport()
+    t._registers["SP"] = 0x78
+    with pytest.raises(ValueError, match="goto\\(cold=True\\)"):
+        goto(t, 0xC000, cold=True)
+    # Nothing applied, nothing running: the caller still has a halted
+    # machine on its original PC to do something else with.
+    assert t._set_registers_calls == []
+    assert t._registers["PC"] == 0x0800
+    assert t._registers["SP"] == 0x78
+    assert t._resume_count == 0
+
+
+def test_goto_without_cold_does_not_rewrite_a_register_error():
+    # The wrapped message is specific to cold=True; an unrelated
+    # rejection must reach the caller as the transport phrased it.
+    class NoPC(StrictRegisterMockTransport):
+        known = frozenset({"A"})
+
+    t = NoPC()
+    with pytest.raises(ValueError, match="Unknown register 'PC'") as exc:
+        goto(t, 0xC000)
+    assert "cold=True" not in str(exc.value)
 
 
 # -- set_breakpoint ----------------------------------------------------------

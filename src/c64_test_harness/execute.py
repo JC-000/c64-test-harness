@@ -115,17 +115,92 @@ def set_register(transport: BinaryViceTransport, name: str, value: int) -> None:
     transport.set_registers({name: value})
 
 
-def goto(transport: BinaryViceTransport, addr: int) -> None:
+#: Stack pointer :func:`goto` writes for a cold entry.  What the KERNAL's
+#: own reset path leaves before it hands control anywhere (``$FCE2``:
+#: ``SEI`` / ``CLD`` / ``LDX #$FF`` / ``TXS``), so the target starts with
+#: the whole stack page in front of it rather than the remains of
+#: whatever the binary monitor happened to halt.
+_COLD_SP = 0xFF
+
+#: Status register :func:`goto` writes for a cold entry.  Bit 5 is the
+#: 6502's hardwired unused bit; every other bit is clear.  The two that
+#: matter are ``I`` and ``D``:
+#:
+#: * ``I`` clear, because the monitor's halt can land inside the KERNAL
+#:   interrupt handler, whose ``RTI`` then never runs.  Entering a target
+#:   with ``I`` still set silently stops the jiffy clock, the keyboard
+#:   scan, and any interrupt-driven code in the program under test -- the
+#:   severe half of issue #183, which :func:`jsr` avoids by restoring
+#:   ``FL`` and :func:`goto` has no return point to restore at.
+#: * ``D`` clear, because a halt inside a decimal-mode computation would
+#:   otherwise hand the target an ``ADC``/``SBC`` that quietly does BCD.
+#:
+#: ``N``/``V``/``Z``/``C`` are cleared for definiteness only; a jump
+#: target has no business reading them.
+_COLD_FL = 0x20
+
+
+def goto(transport: BinaryViceTransport, addr: int, *, cold: bool = False) -> None:
     """Set PC to *addr* and resume CPU execution.
 
     Unlike :func:`jsr` this is a one-way jump: control never comes back,
-    so there is no point at which anything could be restored.  The target
-    inherits the stack frame and ``I`` flag of whatever the monitor
-    happened to halt, interrupt handler included.  A target that needs a
-    clean machine must rebuild it itself -- the warm-start
-    ``JMP ($A002)`` idiom rebuilds ``SP``; see ``sid_player.py``.
+    so there is no point at which anything could be restored.  ``goto()``
+    does **not** have the :func:`jsr` defect of issue #183 -- that fix is
+    save-and-restore, and a restore needs a moment when control returns.
+    Here there is none, and the abandoned frame is what ``goto()`` is
+    for, not a defect in it.  (Issue #183's text says otherwise; it is
+    wrong, and carries a correction.  See #192.)
+
+    What is true is that by default the target inherits whatever the
+    binary monitor happened to halt -- its stack frame and its ``I``
+    flag, interrupt handler included.  Two ways out:
+
+    * *cold* ``=True`` writes :data:`_COLD_SP` and :data:`_COLD_FL`
+      alongside ``PC`` in the same register write, so the target begins
+      with a full stack page, ``I`` clear and ``D`` clear: "start this as
+      if nothing was running".  This is **not** :func:`jsr`'s
+      ``preserve_state``, which is the opposite request; do not reach for
+      one expecting the other.
+    * Or rebuild the machine in the target itself.  The warm-start
+      ``JMP ($A002)`` idiom rebuilds ``SP`` by re-entering BASIC; see
+      ``sid_player.py``, which wants BASIC running afterwards and so
+      cannot use *cold*.
+
+    What *cold* does not do, and no register write could:
+
+    * It does not reset the machine.  No KERNAL init, no I/O
+      reinitialisation, no zero page, no vectors -- ``$0314``/``$0315``
+      and the CIA/VIC state are exactly as the previous program left
+      them.
+    * It does not acknowledge a pending interrupt.  If the halt landed in
+      an IRQ handler that had not yet read ``$DC0D``, the source is still
+      asserting, so clearing ``I`` means the target takes that interrupt
+      almost immediately, through whatever handler is currently vectored.
+      That is the point -- it is how the machine drains the state
+      ``goto()`` abandoned -- but a target with a tight timing
+      requirement in its first instructions should know it.
+
+    *cold* needs ``SP`` and ``FL`` in the transport's register map.
+    ``BinaryViceTransport`` validates every name before it sends
+    anything, so a transport that lacks them applies nothing at all: the
+    CPU stays halted where it was and ``ValueError`` is raised, rather
+    than the jump happening onto a half-built machine.
     """
-    transport.set_registers({"PC": addr})
+    regs = {"PC": addr}
+    if cold:
+        regs["SP"] = _COLD_SP
+        regs["FL"] = _COLD_FL
+    try:
+        transport.set_registers(regs)
+    except ValueError as e:
+        if not cold:
+            raise
+        raise ValueError(
+            f"goto(cold=True) needs 'SP' and 'FL' in the transport's "
+            f"register map; the write was refused and nothing was applied "
+            f"({e}).  Use goto(transport, addr) and have the target rebuild "
+            f"its own stack."
+        ) from e
     transport.resume()
 
 
