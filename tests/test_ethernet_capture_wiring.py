@@ -782,23 +782,54 @@ def test_rx_header_skip_loop_branches_back_to_its_first_read():
 
 
 def test_rx_scenario_drains_stale_frames_before_sending():
+    """No frame goes on the wire until the drain's poll has timed out.
+
+    The oracle is the per-drain-run check below, not a count taken at send
+    time.  ``run_rx_scenario`` starts the sender on a thread and *immediately*
+    issues the final resume, so which of the two touches its counter first is
+    decided by the OS scheduler: with ``send_delay=0.0`` the sender usually
+    wins (``sent_after_resumes == 3``) but not always (``4``, ~3% of runs on
+    this bench, in isolation and in a whole-file run alike -- issue #187).  A
+    tighter bound would be wrong as well as flaky: with the production default
+    ``send_delay=0.5`` the send is *designed* to land in the middle of the
+    final poll, i.e. at 4.  Both values mean "after the drain"; only "before
+    the drain" is the defect, and ``sent_after_resumes`` cannot see it happen
+    -- the counter would read 0, which is what the lower bound pins.
+    """
+    cap_holder: list[FakeCapture] = []
+
+    def _nothing_sent_yet(step):
+        """Wrap a drain step: the chip must still be draining un-sent-into."""
+        def wrapped(ram: bytearray) -> None:
+            assert cap_holder[0].sent == [], (
+                "the host sent while the CS8900a was still draining stale frames"
+            )
+            step(ram)
+        return wrapped
+
     transport = FakeTransport(on_resume=scripted(
-        _marker_step(STALE_LOOPBACK),          # drain run 1: the TX loopback frame
-        _marker_step(b"\x01\x02\x03\x04"),     # drain run 2: another stale frame
-        _c64_poll_times_out,                   # drain run 3: nothing pending
-        _marker_step(RX_MARKER),               # the real attempt sees our frame
+        _nothing_sent_yet(_marker_step(STALE_LOOPBACK)),       # drain 1: TX loopback frame
+        _nothing_sent_yet(_marker_step(b"\x01\x02\x03\x04")),  # drain 2: another stale frame
+        _nothing_sent_yet(_c64_poll_times_out),                # drain 3: nothing pending
+        _marker_step(RX_MARKER),                               # the real attempt sees our frame
     ))
 
     class OrderCapture(FakeCapture):
+        sent_after_resumes = -1
+
         def send(self, frame: bytes) -> None:
             self.sent_after_resumes = transport.resumes
             super().send(frame)
 
     cap = OrderCapture()
+    cap_holder.append(cap)
     result = run_rx_scenario(transport, cap, send_delay=0.0, timeout=1.0)
     assert result == RX_MARKER + b"\x01"
     assert cap.sent == [RX_FRAME]
-    assert cap.sent_after_resumes == 3, "the frame goes out only after the drain timed out"
+    assert cap.sent_after_resumes >= 3, (
+        "the frame goes out only after the three drain runs, never before them "
+        f"(sent after {cap.sent_after_resumes} resumes)"
+    )
     assert transport.resumes == 4
 
 
