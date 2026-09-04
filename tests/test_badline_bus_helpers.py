@@ -30,6 +30,7 @@ from c64_test_harness.backends.ultimate64_client import Ultimate64Error
 from c64_test_harness.backends.ultimate64_helpers import (
     BUS_SHARING_ITEMS,
     CAT_CART,
+    CAT_SID_ADDRESSING,
     CAT_U64_SPECIFIC,
     BusConfig,
     U64StateSnapshot,
@@ -95,6 +96,18 @@ def _client_for(u64: dict, cart: dict) -> MagicMock:
     client.host = "192.0.2.81"
 
     def side_effect(category: str) -> dict:
+        # ``snapshot_state`` also reads ``SID Addressing`` (issue #196):
+        # anything that remaps SIDs has to put that category back, so it
+        # is part of the snapshot. Served here with a minimal stand-in;
+        # the coverage for it lives in tests/test_sid_isolation.py.
+        if category == CAT_SID_ADDRESSING:
+            return {
+                CAT_SID_ADDRESSING: {
+                    "SID Socket 1 Address": "$D400",
+                    "Auto Address Mirroring": "Enabled",
+                },
+                "errors": [],
+            }
         return {CAT_U64_SPECIFIC: u64, CAT_CART: cart}[category]
 
     client.get_config_category.side_effect = side_effect
