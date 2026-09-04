@@ -881,12 +881,19 @@ def test_jsr_recovery_refuses_when_the_transport_reports_no_sp():
 # forcing PC means the handler never reaches its RTI: its stack frame is
 # abandoned and the I flag interrupt entry set is never cleared.
 #
-# Measured on a stock x64sc, 1400 calls against a controlled idle loop:
-#   * main loop with CLI: 10 calls (0.7%) were issued while the CPU was
-#     halted inside the KERNAL IRQ handler; SP fell $EF -> $78, 119 bytes.
-#   * main loop without CLI: one such call, at iteration 38, masked IRQs
-#     for good -- the jiffy clock at $A0-$A2 stayed frozen at 3814 for the
-#     remaining ~1360 calls.
+# Measured on a stock x64sc (warp off), 1400 calls per arm against a
+# controlled idle loop, by scripts/jsr_mid_irq_occupancy_probe.py -- two
+# runs, figures given as run 1 / run 2:
+#   * main loop with CLI: 16 / 16 calls (1.14%) were issued while the CPU
+#     was halted inside the KERNAL IRQ handler; SP walked 124 / 126 bytes,
+#     i.e. 7.8 bytes per abandoned frame.
+#   * main loop without CLI: one such call, at iteration 125 in both runs,
+#     masked IRQs for good -- the jiffy clock at $A0-$A2 stopped after
+#     ~250 ticks and never moved again.
+#   * control arm, preserve_state=True on the same workload: 18 / 20
+#     mid-IRQ calls, SP walk zero.
+# These supersede the 10-call / 119-byte figures #183 published; see #188
+# and the probe's own docstring for why that run undercounted the events.
 
 
 class FlagBinaryMockTransport(PollBinaryMockTransport):
