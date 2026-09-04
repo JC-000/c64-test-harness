@@ -114,7 +114,7 @@ What recovery does: captures the register file (A, X, Y, SP, FL) before the call
 
 For testing user-facing flows (menu navigation, screen output, disk I/O).
 
-`wait_for_text()` works correctly with binary transport -- it calls `resume()` between polls internally, so the C64 program continues updating the display while polling, and it resumes again in a `finally`, so every exit path leaves the machine running.
+`wait_for_text()` works correctly with binary transport -- it calls `resume()` between polls internally, so the C64 program continues updating the display while polling, and it resumes again in a `finally` when a screen read has halted the machine since the last resume, so every exit path leaves the machine running (the timeout path skips that last resume because its own loop already did it — issues #189/#190).
 
 ```python
 def test_via_menu(transport, labels):
