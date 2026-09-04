@@ -186,17 +186,35 @@ RECOVERY_PROBE_TIMEOUT = 5.0
 #: and the ``I`` flag interrupt entry set is never restored.  So IRQs stay
 #: masked and the jiffy clock at ``$A0-$A2`` stops.
 #:
-#: Measured on a stock ``x64sc``, 1400 calls per arm, CPU parked in a
-#: controlled idle loop (figures as published in issue #183): with a main
-#: loop that re-enables interrupts, 10 of 1400 calls were issued while the
-#: CPU was halted inside the KERNAL IRQ handler and cost 119 bytes of stack
-#: (SP ``$EF`` -> ``$78``, since the ``$FF48`` dispatcher pushes A/X/Y on
-#: top of the hardware frame); with a main loop that does not re-enable
-#: them, *one* such call at iteration 38 masked IRQs permanently and the
-#: jiffy clock stayed frozen at 3814 for the remaining ~1360 calls.
+#: Measured on a stock ``x64sc`` (warp off), 1400 calls per arm, CPU
+#: parked in a controlled idle loop, by
+#: ``scripts/jsr_mid_irq_occupancy_probe.py`` -- two runs, run 1 / run 2:
 #:
-#: No reproducer for these figures ships in this repo.  Treat them as the
-#: recorded observation they are, not as something the suite re-checks.
+#: * Main loop that re-enables interrupts: **16 / 16 of 1400 calls**
+#:   (1.14%) were issued while the CPU was halted inside the KERNAL IRQ
+#:   handler, and the stack pointer walked down **124 / 126 bytes** --
+#:   **7.8 bytes per abandoned frame**, in near-uniform steps of 8.
+#: * Main loop that does not re-enable them: *one* such call, at iteration
+#:   125 in both runs, masked IRQs permanently; the jiffy clock at
+#:   ``$A0-$A2`` stopped after ~250 ticks and never moved again.
+#: * Control, ``preserve_state=True`` on the same workload: 18 / 20
+#:   mid-IRQ calls and **no SP walk at all**.
+#:
+#: Halt depth explains the per-event cost: sampled at the moment the
+#: monitor halts, an in-handler frame is 3 to 8 bytes deep (median 6) --
+#: the hardware's PCH/PCL/P, plus the ``$FF48`` dispatcher's A/X/Y, plus
+#: 2 more inside a ``JSR`` the handler made.
+#:
+#: These figures supersede the 10-call / 119-byte set issue #183
+#: published, which is not reproducible: 119 bytes over 10 events implies
+#: 11.9 bytes per frame, and the deepest frame this path can abandon is 8.
+#: The byte totals of every recorded run agree (119 / 123 / 124 / 126); it
+#: is the event count that was low, and the likely reason is
+#: classification -- the IRQ-path PCs actually observed include
+#: ``$F69D-$F6DC``, ``$EB26-$EB47`` and ``$FFEA``, which a range test
+#: written around ``$EA31-$EA87`` would miss.  The probe classifies by
+#: whether PC is inside the parked loop instead, so it cannot miss any.
+#: See issue #188.
 _PRESERVED_REGS = ("PC", "SP", "FL")
 
 #: Trampoline tails.  The normal call parks two NOPs after the JSR; the
