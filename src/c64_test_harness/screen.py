@@ -14,10 +14,17 @@ hand back a stopped machine on any exit path.  ``ScreenGrid.from_transport``
 resume, by design: it is a snapshot primitive, not a waiter.  A poll loop
 built out of bare snapshots never advances the C64, and a machine that is
 merely stopped looks exactly like one that is wedged.
+
+Two qualifications on that contract, both stated in full on
+``wait_for_text``: the exit resume is *owed* rather than unconditional (it
+is skipped when no screen read has halted the machine since the last
+resume), and it is *best-effort* (a transport whose ``resume`` raises is
+logged at WARNING, never re-raised).
 """
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
@@ -26,6 +33,8 @@ from .encoding.screen_codes import SCREEN_CODE_TABLE
 
 if TYPE_CHECKING:
     from .transport import C64Transport
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -136,20 +145,54 @@ class ScreenGrid:
         return "\n".join(lines)
 
 
-def _resume_quietly(transport: C64Transport) -> None:
-    """Resume the CPU, swallowing a transport that cannot or need not.
+def _resume_quietly(transport: C64Transport) -> bool:
+    """Resume the CPU; return whether the resume was actually delivered.
 
     Both waiters poll through the binary monitor, which halts the machine
     for every read; without a resume the C64 does not advance between
     polls and a running program is indistinguishable from a hung one.
-    Failures are ignored on purpose -- the waiters already treat the
-    transport as best-effort, and a resume that could not be delivered
-    must not turn a successful wait into an exception.
+
+    Failures are logged at WARNING and never re-raised.  Two reasons, and
+    the second is why ``NotImplementedError`` is not allowed out either
+    (issue #191 proposed letting it propagate):
+
+    * Most call sites are ``finally`` bodies.  An exception raised there
+      *replaces* whatever exception the caller was already unwinding, so
+      a transport that cannot resume would mask the transport error that
+      is the actual news -- the same "a symptom hides the cause" shape
+      the waiters exist to avoid.
+    * A resume that could not be delivered must not turn a successful
+      wait into an exception; the grid the caller asked for is valid
+      either way.
+
+    The cost is that the waiters' "the CPU is running on return" line is
+    a best-effort guarantee, not an enforced one: on a transport whose
+    ``resume`` raises -- ``backends/hardware.py`` raises
+    ``NotImplementedError`` -- the machine is *not* running on return and
+    the WARNING is the only record.  Callers that must know can read the
+    return value of this helper or watch the ``c64_test_harness.screen``
+    logger.
     """
     try:
         transport.resume()
-    except Exception:
-        pass
+        return True
+    except NotImplementedError:
+        # Not a transient: this transport structurally cannot resume, so
+        # every waiter run against it silently breaks the contract.
+        logger.warning(
+            "%s.resume() is not implemented; the screen waiters cannot "
+            "guarantee the CPU is running on return for this transport.",
+            type(transport).__name__,
+        )
+        return False
+    except Exception as exc:
+        logger.warning(
+            "%s.resume() failed (%s: %s); the CPU may still be halted.",
+            type(transport).__name__,
+            type(exc).__name__,
+            exc,
+        )
+        return False
 
 
 def wait_for_text(
@@ -172,7 +215,7 @@ def wait_for_text(
     or exception.  The binary monitor halts the machine to service each
     screen read, so this loop resumes after every poll; it also resumes
     before handing the match back, which it did not always do.  The
-    The returned grid was captured before that resume, so the grid itself
+    returned grid was captured before that resume, so the grid itself
     is intact -- but the *coincidence* between grid and machine is not.
     Before this changed, a match handed back a stopped C64 and a following
     ``read_bytes`` saw memory exactly as it stood at the capture instant.
@@ -180,6 +223,34 @@ def wait_for_text(
     milliseconds later.  A caller that needs the two to agree should wait
     on a string the program prints only once it is idle, or halt the
     machine explicitly before reading.
+
+    Two qualifications on that sentence, both deliberate:
+
+    *Owed, not unconditional.*  The exit resume fires only when a screen
+    read has happened since the last resume — the match path and the
+    exception path, never the timeout path, which resumes, sleeps and
+    then returns with nothing having touched the machine in between.
+    Skipping it there leaves nothing halted (the resume would have been
+    for a halt that never happened) and it avoids a second resume that is
+    not free: on the Ultimate 64 ``resume`` is a real
+    ``PUT /v1/machine:resume`` that clears a pause the caller may have set
+    deliberately and costs a full client timeout against an unreachable
+    device (issue #189), and on VICE it bumps
+    ``BinaryViceTransport._resume_generation``, which discards any queued
+    JAM event and so turns a jam into an unattributed later timeout
+    (issue #190).  Residue, accepted rather than chased: the *match* path
+    must resume, so a JAM queued during the previous poll's resume window
+    is still dropped there, and a first-poll match on hardware still
+    clears a deliberate pause.  The waiters cannot tell whether a read
+    halted this particular backend without asking it what backend it is,
+    which is the coupling ``C64Transport`` exists to prevent.
+
+    *Best-effort, not enforced.*  A ``resume`` that raises is logged at
+    WARNING and swallowed (see :func:`_resume_quietly` for why raising
+    from a ``finally`` is worse), so on a transport that cannot resume —
+    ``backends/hardware.py`` raises ``NotImplementedError`` — the CPU is
+    not in fact running on return.  Nothing else reports that; the log
+    record is the signal (issue #191).
 
     .. warning::
 
@@ -208,12 +279,19 @@ def wait_for_text(
     """
     needle_upper = needle.upper()
     start = time.monotonic()
+    # True once a screen read has (possibly) halted the machine and no
+    # resume has followed it.  See the docstring: the exit resume is owed,
+    # not unconditional.
+    pending_resume = False
     try:
         while True:
             elapsed = time.monotonic() - start
             if elapsed >= timeout:
                 return None
             try:
+                # Set before the read, not after: a read that raised
+                # part-way may still have halted the 6510.
+                pending_resume = True
                 grid = ScreenGrid.from_transport(transport)
                 if needle_upper in grid.continuous_text().upper():
                     return grid
@@ -231,12 +309,15 @@ def wait_for_text(
             # Resume so the program can continue executing before we poll
             # again.
             _resume_quietly(transport)
+            pending_resume = False
             time.sleep(poll_interval)
     finally:
         # Every exit path, not just the polls: a match used to return with
         # the machine still halted, so the caller's "it is running now"
-        # depended on which branch it left by.
-        _resume_quietly(transport)
+        # depended on which branch it left by.  Gated so the timeout path
+        # -- resume, sleep, return -- does not resume a second time.
+        if pending_resume:
+            _resume_quietly(transport)
 
 
 def wait_for_stable(
@@ -250,17 +331,21 @@ def wait_for_stable(
     Returns the stable ``ScreenGrid``, or ``None`` on timeout —
     matching ``wait_for_text``'s contract (a non-``None`` return always
     means the condition was met, and the CPU is running on every exit
-    path).
+    path), including its two qualifications: the exit resume is owed
+    rather than unconditional, and it is best-effort.  See
+    :func:`wait_for_text` for both in full.
     """
     prev_text: str | None = None
     count = 0
     start = time.monotonic()
+    pending_resume = False
     try:
         while True:
             elapsed = time.monotonic() - start
             if elapsed >= timeout:
                 return None
             try:
+                pending_resume = True
                 grid = ScreenGrid.from_transport(transport)
                 current = grid.continuous_text()
                 if current == prev_text:
@@ -275,6 +360,8 @@ def wait_for_stable(
             # Resume the CPU so the program keeps running between polls
             # (the binary monitor pauses on memory reads).
             _resume_quietly(transport)
+            pending_resume = False
             time.sleep(poll_interval)
     finally:
-        _resume_quietly(transport)
+        if pending_resume:
+            _resume_quietly(transport)

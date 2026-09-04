@@ -1,8 +1,15 @@
 """Tests for screen.py — ScreenGrid, wrap-aware search, extract_between."""
 
+import logging
+
 import pytest
 
-from c64_test_harness.screen import ScreenGrid, wait_for_text, wait_for_stable
+from c64_test_harness.screen import (
+    ScreenGrid,
+    _resume_quietly,
+    wait_for_stable,
+    wait_for_text,
+)
 from conftest import MockTransport
 
 
@@ -285,3 +292,185 @@ def test_screen_grid_from_transport_does_not_resume():
     t = _screen_with("READY.")
     ScreenGrid.from_transport(t)
     assert t.resume_count == 0
+
+
+# -- the exit resume is *owed*, not unconditional -----------------------------
+#
+# Issues #189 / #190.  Resuming on every exit path is right; resuming when
+# nothing halted the machine since the last resume is not.  The timeout
+# path is exactly that case: it resumes, sleeps, re-enters the loop, sees
+# the deadline and returns, so the pre-fix ``finally`` fired a second
+# resume with no read in between.  That second resume is a real
+# ``PUT /v1/machine:resume`` on the Ultimate 64 (clears a deliberate pause,
+# costs a client timeout against a dead device) and a second
+# ``_resume_generation`` bump on VICE, which drops a queued JAM event.
+
+
+def _consecutive_resumes(ops: list[str]) -> list[int]:
+    """Indices where a resume immediately follows another resume."""
+    return [
+        i for i in range(1, len(ops))
+        if ops[i] == "resume" and ops[i - 1] == "resume"
+    ]
+
+
+def test_wait_for_text_timeout_does_not_resume_twice():
+    """No two resumes back to back: each one costs a round trip and a
+    ``_resume_generation`` bump, and nothing halted the machine between
+    the loop's resume and the return."""
+    t = ResumeCountingTransport()
+    assert wait_for_text(t, "NEVER", timeout=0.2, poll_interval=0.05,
+                         verbose=False) is None
+    assert t.ops[-1] == "resume", t.ops
+    assert _consecutive_resumes(t.ops) == [], t.ops
+
+
+def test_wait_for_stable_timeout_does_not_resume_twice():
+    # stable_count high enough that the screen never counts as settled.
+    t = ResumeCountingTransport()
+    assert wait_for_stable(t, timeout=0.2, poll_interval=0.05,
+                           stable_count=99) is None
+    assert t.ops[-1] == "resume", t.ops
+    assert _consecutive_resumes(t.ops) == [], t.ops
+
+
+def test_failing_reads_do_not_resume_twice_either():
+    """A read that raised may still have halted the machine, so the
+    exception path keeps its resume -- but only one of them."""
+    t = ResumeCountingTransport(fail_reads=True)
+    assert wait_for_text(t, "READY.", timeout=0.2, poll_interval=0.05,
+                         verbose=False) is None
+    assert t.ops[-1] == "resume", t.ops
+    assert _consecutive_resumes(t.ops) == [], t.ops
+
+
+class JamGenerationTransport(ResumeCountingTransport):
+    """Models VICE's resume-generation event bookkeeping (issue #190).
+
+    ``BinaryViceTransport.resume`` increments ``_resume_generation``
+    *before* sending CMD_EXIT (``vice_binary.py:793``), so an unsolicited
+    event arriving in that ack window is tagged at the new generation;
+    ``wait_for_stopped`` then drops every queued event tagged below the
+    current generation (``vice_binary.py:1008-1010``).  A JAM is therefore
+    visible only until the *next* resume.
+
+    A resume that follows a poll opens a run window, and this machine
+    jams in it: the event is queued at the generation that resume just
+    created, replacing whatever was queued in the window before.  The
+    ``finally`` resume on the timeout path follows no poll -- the waiter
+    returns immediately after it -- so it queues nothing and only bumps
+    the generation, which is precisely how it discards the jam.  "Is the
+    jam still attributable when the waiter returns?" therefore reduces to
+    "did the waiter resume again after its last poll?".
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.generation = 0
+        self.jam_generation: int | None = None
+        self._polled_since_resume = False
+
+    def read_screen_codes(self) -> list[int]:
+        self._polled_since_resume = True
+        return super().read_screen_codes()
+
+    def resume(self) -> None:
+        self.generation += 1
+        if self._polled_since_resume:
+            self.jam_generation = self.generation
+            self._polled_since_resume = False
+        super().resume()
+
+    @property
+    def jam_still_queued(self) -> bool:
+        return (
+            self.jam_generation is not None
+            and self.jam_generation >= self.generation
+        )
+
+
+def test_timeout_leaves_a_jam_from_the_last_poll_attributable():
+    """The trailing resume discarded the only signal that separates a
+    6510 jam from upstream VICE bug 6 (a stalled emulator), so the jam
+    resurfaced as an unattributed timeout further down the test."""
+    t = JamGenerationTransport()
+    assert wait_for_text(t, "NEVER", timeout=0.2, poll_interval=0.05,
+                         verbose=False) is None
+    assert t.jam_still_queued, (
+        f"a JAM queued during the last poll's resume window was discarded "
+        f"by a later resume (jam gen {t.jam_generation}, now at generation "
+        f"{t.generation}); ops={t.ops}"
+    )
+
+
+def test_match_path_still_resumes_and_that_residue_is_accepted():
+    """The match path must resume -- the caller gets a running machine --
+    so a JAM queued by the *previous* poll is still dropped there.  Pinned
+    so the trade-off in the docstring is a tested fact, not a hope."""
+    t = JamGenerationTransport()
+    codes = [ord(c) & 0x3F for c in "READY."]
+    grid_codes = list(t.screen_codes)
+    grid_codes[: len(codes)] = codes
+    t.screen_codes = grid_codes
+    grid = wait_for_text(t, "READY.", timeout=1.0, poll_interval=0.01,
+                         verbose=False)
+    assert grid is not None
+    assert t.ops[-1] == "resume", t.ops
+
+
+# -- the guarantee is best-effort, and says so out loud -----------------------
+#
+# Issue #191.  ``_resume_quietly`` swallowed everything, including the
+# ``NotImplementedError`` that ``backends/hardware.py`` raises, so a
+# waiter could document "the CPU is running on return" while nothing had
+# resumed anything.  The swallow stays (raising from a ``finally`` would
+# replace the caller's in-flight exception), but it is now audible.
+
+
+class UnresumableTransport(ResumeCountingTransport):
+    """A transport on the hardware base class: ``resume`` is not implemented."""
+
+    def resume(self) -> None:
+        self.ops.append("resume-attempted")
+        raise NotImplementedError
+
+
+class BrokenResumeTransport(ResumeCountingTransport):
+    """A transport whose resume fails transiently (socket gone, HTTP 500)."""
+
+    def resume(self) -> None:
+        self.ops.append("resume-attempted")
+        raise RuntimeError("connection reset by peer")
+
+
+def test_unimplemented_resume_is_logged_not_raised(caplog):
+    t = UnresumableTransport()
+    codes = [ord(c) & 0x3F for c in "READY."]
+    grid_codes = list(t.screen_codes)
+    grid_codes[: len(codes)] = codes
+    t.screen_codes = grid_codes
+    with caplog.at_level(logging.WARNING, logger="c64_test_harness.screen"):
+        grid = wait_for_text(t, "READY.", timeout=1.0, poll_interval=0.01,
+                             verbose=False)
+    assert grid is not None, "a resume failure must not lose the match"
+    assert t.ops[-1] == "resume-attempted", t.ops
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("not implemented" in m for m in messages), messages
+    assert any("UnresumableTransport" in m for m in messages), messages
+
+
+def test_failing_resume_is_logged_not_raised(caplog):
+    t = BrokenResumeTransport()
+    with caplog.at_level(logging.WARNING, logger="c64_test_harness.screen"):
+        assert wait_for_text(t, "NEVER", timeout=0.2, poll_interval=0.05,
+                             verbose=False) is None
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("connection reset by peer" in m for m in messages), messages
+    assert any("may still be halted" in m for m in messages), messages
+
+
+def test_resume_quietly_reports_delivery():
+    """The bool is what a caller who needs certainty can read."""
+    assert _resume_quietly(ResumeCountingTransport()) is True
+    assert _resume_quietly(UnresumableTransport()) is False
+    assert _resume_quietly(BrokenResumeTransport()) is False

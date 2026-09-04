@@ -18,7 +18,7 @@ from c64_test_harness.backends.device_lock import DeviceLock
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 from c64_test_harness.backends.vice_manager import PortAllocator
-from c64_test_harness.screen import wait_for_text
+from c64_test_harness.screen import ScreenGrid, _resume_quietly, wait_for_text
 
 # ---------------------------------------------------------------------------
 # Device-lock adoption for live tests (issue #136)
@@ -282,6 +282,88 @@ def connect_binary_transport(
     )
 
 
+# ---------------------------------------------------------------------------
+# Binary-monitor screen polling (issue #186)
+# ---------------------------------------------------------------------------
+#
+# Four hand-rolled copies of this loop existed -- two in test_disk_vice.py,
+# one in test_ethernet.py, one right here in _bridge_wait_ready -- and all
+# four carried the #184 defect: they resumed at the *top* of the loop, read
+# the screen at the bottom, and returned the match straight after the read
+# that halted the machine.  So the successful path handed back a stopped
+# C64.  One copy, one fix.
+#
+# These keep the resume-first ordering the live suites rely on (the caller
+# has usually just written memory or injected keys through the monitor, so
+# the C64 needs cycles *before* the first screen read is worth taking).
+# The exit resume is unconditional here, unlike the library waiters': in
+# this shape the last thing done to the transport before any exit is a
+# screen read, so the resume is always owed and there is no double-resume
+# to gate against.
+
+
+def _binary_poll(
+    transport: BinaryViceTransport,
+    predicate,
+    timeout: float,
+    poll_interval: float,
+):
+    """Poll the screen until *predicate* accepts a grid, or *timeout*.
+
+    Returns the accepted ``ScreenGrid`` or ``None``.  The CPU is running
+    on every exit path -- match, timeout, or exception.
+    """
+    start = time.monotonic()
+    try:
+        while time.monotonic() - start < timeout:
+            try:
+                # Resume first so the C64 executes during the sleep.
+                transport.resume()
+                time.sleep(poll_interval)
+                # This read halts the CPU again (binary monitor).
+                grid = ScreenGrid.from_transport(transport)
+                if predicate(grid):
+                    return grid
+            except Exception:
+                time.sleep(poll_interval)
+        return None
+    finally:
+        _resume_quietly(transport)
+
+
+def binary_wait_for_text(
+    transport: BinaryViceTransport,
+    needle: str,
+    timeout: float = 30.0,
+    poll_interval: float = 2.0,
+):
+    """Wait until *needle* appears on screen, resuming between polls."""
+    needle_upper = needle.upper()
+    return _binary_poll(
+        transport,
+        lambda grid: needle_upper in grid.continuous_text().upper(),
+        timeout,
+        poll_interval,
+    )
+
+
+def binary_wait_for_load_complete(
+    transport: BinaryViceTransport,
+    timeout: float = 30.0,
+    poll_interval: float = 2.0,
+):
+    """Wait for a C64 LOAD to complete: "LOADING" then "READY." after it."""
+
+    def loaded(grid) -> bool:
+        text = grid.continuous_text().upper()
+        loading_idx = text.find("LOADING")
+        if loading_idx < 0:
+            return False
+        return text.find("READY.", loading_idx + 7) > loading_idx
+
+    return _binary_poll(transport, loaded, timeout, poll_interval)
+
+
 @pytest.fixture(scope="module")
 def binary_transport():
     """Boot VICE with binary monitor, yield a live BinaryViceTransport."""
@@ -319,18 +401,10 @@ from bridge_platform import BRIDGE_IP_A, BRIDGE_IP_B  # noqa: E402,F401
 
 
 def _bridge_wait_ready(transport: BinaryViceTransport, timeout: float = 30.0) -> None:
-    from c64_test_harness.screen import ScreenGrid
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            transport.resume()
-            time.sleep(2.0)
-            grid = ScreenGrid.from_transport(transport)
-            if "READY" in grid.continuous_text().upper():
-                return
-        except Exception:
-            time.sleep(1.0)
-    raise AssertionError("BASIC READY prompt not found within timeout")
+    # Was a fourth copy of the poll loop, with the same halted-on-match
+    # defect (issue #186 counted three; the sweep missed this one).
+    if binary_wait_for_text(transport, "READY", timeout=timeout) is None:
+        raise AssertionError("BASIC READY prompt not found within timeout")
 
 
 def _bridge_init_cs8900a(transport: BinaryViceTransport, scratch: int, code: int) -> None:

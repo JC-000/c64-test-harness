@@ -789,6 +789,22 @@ class BinaryViceTransport:
         that arrive during the CMD_EXIT ack window are tagged at the current
         generation and will be honoured by a subsequent ``wait_for_stopped``
         call rather than discarded as stale.
+
+        **That bump is also the only garbage collector ``_event_queue``
+        has** — nothing else drains it, not even ``reset``.  So a resume
+        costs more than a round trip: it discards every event queued
+        before it, including a ``RESPONSE_JAM``, which is half the
+        discriminator between a jammed 6510 and upstream VICE bug 6 (the
+        other half being a PC on a KIL opcode; see
+        ``docs/vice_upstream_bugs.md``).  Callers that poll should not
+        resume more often than they have to — the screen waiters in
+        ``screen.py`` skip their exit resume when nothing halted the
+        machine since the last one, for exactly this reason (issue #190).
+        Re-tagging a queued JAM forward instead of dropping it was
+        considered and rejected here: with no other GC, a jam would then
+        outlive the ``reset`` that cleared it and every later
+        ``wait_for_stopped`` would report a machine that has been fine
+        for minutes.
         """
         self._resume_generation += 1
         self._send_and_recv(CMD_EXIT)

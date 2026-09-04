@@ -268,7 +268,7 @@ With `recover_on_timeout=True`, step 4 timing out adds: read registers (binmon a
 ## Module: screen
 
 - `ScreenGrid` -- Parsed screen state (40x25 character grid)
-- `wait_for_text(transport, text, timeout=60.0, poll_interval=2.0, verbose=True) -> ScreenGrid | None` -- Poll screen RAM until text appears. Returns `None` on timeout. **Note:** `verbose` defaults to `True` (dumps screen on every poll) — pass `verbose=False` for quiet operation. The CPU is **running** on return, on every exit path; the grid was captured before that resume, so if you need the machine halted alongside the grid your next read halts it again.
+- `wait_for_text(transport, text, timeout=60.0, poll_interval=2.0, verbose=True) -> ScreenGrid | None` -- Poll screen RAM until text appears. Returns `None` on timeout. **Note:** `verbose` defaults to `True` (dumps screen on every poll) — pass `verbose=False` for quiet operation. The CPU is **running** on return, on every exit path; the grid was captured before that resume, so if you need the machine halted alongside the grid your next read halts it again. Best-effort: a `resume()` that raises is logged at WARNING on `c64_test_harness.screen` and swallowed (issue #191).
 - `wait_for_stable(transport, timeout=10.0, poll_interval=0.5, stable_count=3) -> ScreenGrid | None` -- Wait for screen to stop changing. Returns `None` on timeout. The CPU is **running** on return, on every exit path, same caveat as `wait_for_text()`.
 
 ---
@@ -422,7 +422,7 @@ transport = BinaryViceTransport(host="127.0.0.1", port=6502, timeout=5.0)
 - No reconnection overhead (persistent connection)
 - Async checkpoint events (no polling needed for `jsr()`/`wait_for_pc()`)
 - `resume()` does NOT destroy the connection
-- CPU auto-pauses on every command -- `wait_for_text()` resumes between polls so the screen updates, and again in a `finally`, so it never hands back a stopped machine
+- CPU auto-pauses on every command -- `wait_for_text()` resumes between polls so the screen updates, and again in a `finally` whenever a read has halted the machine since, so it never hands back a stopped machine
 
 ---
 
