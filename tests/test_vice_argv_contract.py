@@ -221,6 +221,10 @@ CONFIG_SURFACE: dict[str, ViceConfig] = {
     "sound-device": ViceConfig(
         port=6510, sounddev="dummy", soundarg="x", soundrate=22050, soundoutput=1
     ),
+    # Volume 0 is the interesting value, not a placeholder: it is what
+    # headless_sid_config() passes, and 0 must survive the "is it set?"
+    # test rather than being read as unset (issue #193).
+    "sound-volume-zero": ViceConfig(port=6510, sound=True, soundvolume=0),
     "ambient-config": ViceConfig(port=6510, load_user_config=True),
     "limit-cycles": ViceConfig(port=6510, limit_cycles=1_000_000),
     "seed": ViceConfig(port=6510, seed=1234),

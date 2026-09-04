@@ -18,7 +18,8 @@ import logging
 import os
 import time
 import weakref
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Mapping
 
 from ..progress import ProgressEvent, ProgressEventKind, watch_progress as _watch_progress
@@ -44,6 +45,8 @@ from .ultimate64_schema import (
     REU_ENABLED_VALUES,
     REU_SIZE_VALUES,
     SID_ADDRESS_VALUES,
+    SID_AUTO_MIRRORING_ITEM,
+    SID_AUTO_MIRRORING_VALUES,
     SID_SLOT_ADDRESS_ITEMS,
     SID_DETECTED_TYPE_VALUES,
     SID_SOCKET_ENABLE_VALUES,
@@ -51,6 +54,7 @@ from .ultimate64_schema import (
     SidAddressConflict,
     SidSlot,
     _as_slot as _as_sid_slot,
+    sid_address_conflicts,
     sid_address_occupancy,
     TURBO_CONTROL_VALUES,
     cpu_speed_enum,
@@ -81,6 +85,8 @@ __all__ = [
     "get_detected_sid_types",
     "get_sid_address_map",
     "set_sid_address_map",
+    "isolated_sid_addressing",
+    "set_sid_auto_mirroring",
     "mount_disk_file",
     "unmount",
     "run_prg_file",
@@ -92,6 +98,8 @@ __all__ = [
     "U64StateSnapshot",
     "snapshot_state",
     "restore_state",
+    "restore_config_items",
+    "Ultimate64RestoreError",
     "CAT_U64_SPECIFIC",
     "CAT_CART",
     "CAT_SID_SOCKETS",
@@ -1151,6 +1159,61 @@ def set_bus_operation_mode(client: Ultimate64Client, mode: str) -> None:
 # State snapshot / restore                                                    #
 # --------------------------------------------------------------------------- #
 
+class Ultimate64RestoreError(Ultimate64Error):
+    """One or more items could not be restored.
+
+    Raised only after *every* item has been attempted, so a single
+    rejected write cannot strand the rest of the user's settings in the
+    test's configuration.  ``failures`` maps item name -> the exception
+    that item raised.
+    """
+
+    def __init__(self, category: str, failures: "dict[str, BaseException]"):
+        self.category = category
+        self.failures = failures
+        detail = "; ".join(
+            f"{item}: {exc}" for item, exc in failures.items()
+        )
+        super().__init__(
+            f"failed to restore {len(failures)} item(s) in {category!r}: "
+            f"{detail}"
+        )
+
+
+def restore_config_items(
+    client: Ultimate64Client, category: str, updates: Mapping[str, Any]
+) -> None:
+    """PUT every item in *updates*, then raise if any of them failed.
+
+    :meth:`Ultimate64Client.set_config_items` is the wrong shape for a
+    restore: it issues one PUT per item in insertion order and does not
+    catch per-item failures, so the first rejection aborts the batch and
+    leaves the remaining items holding the *test's* values rather than
+    the user's.  For a write path that is what you want -- ``set_reu``
+    relies on it so a rejected ``Cartridge`` write cannot half-enable the
+    REU.  For a restore path it is exactly backwards.
+
+    This attempts all of them and reports at the end.
+
+    :param client: Connected Ultimate64 client.
+    :param category: Config category name.
+    :param updates: Item name -> value.
+    :raises Ultimate64RestoreError: If any item failed; the successful
+        ones are still applied.
+    """
+    failures: dict[str, BaseException] = {}
+    for item, value in updates.items():
+        try:
+            client.set_config_item(category, item, value)
+        except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
+            _log.warning(
+                "Restore of %s/%s to %r failed: %s", category, item, value, exc
+            )
+            failures[item] = exc
+    if failures:
+        raise Ultimate64RestoreError(category, failures)
+
+
 @dataclass
 class U64StateSnapshot:
     """Snapshot of the U64 config fields mutated by helpers in this module.
@@ -1164,6 +1227,17 @@ class U64StateSnapshot:
     ``badline_timing`` and ``bus_operation_mode`` default to ``""`` so that
     snapshots constructed positionally by existing callers keep working; an
     empty value is skipped at restore time, exactly like ``reu_size``.
+
+    ``sid_addressing`` is the whole ``SID Addressing`` category as the
+    device reported it -- every slot address, both range splits, the
+    paddle override and ``Auto Address Mirroring`` -- rather than a fixed
+    set of named fields.  Anything that remaps SIDs has to put all of it
+    back, and mirroring in particular: a run that left mirroring disabled
+    silently changes how every later measurement decodes (issue #196).
+    The one category item that is *not* captured is the
+    ``Visual SID Address Editor``, a ``CFG_TYPE_FUNC`` entry the firmware
+    omits from a GET altogether (route_configs.cc:26, the ``continue``).
+    Empty dict means "not captured", and restore skips it.
     """
 
     turbo_control: str
@@ -1173,16 +1247,23 @@ class U64StateSnapshot:
     cartridge: str
     badline_timing: str = ""
     bus_operation_mode: str = ""
+    sid_addressing: dict[str, str] = field(default_factory=dict)
 
 
 def snapshot_state(client: Ultimate64Client) -> U64StateSnapshot:
-    """Capture current turbo + REU + cartridge state for later restore.
+    """Capture turbo, REU, cartridge and SID addressing for later restore.
+
+    Three GETs: ``U64 Specific Settings``, ``C64 and Cartridge
+    Settings``, and the whole ``SID Addressing`` category.
 
     :param client: Connected Ultimate64 client.
     :returns: :class:`U64StateSnapshot` of the current raw values.
     """
     u64 = _unwrap(client.get_config_category(CAT_U64_SPECIFIC), CAT_U64_SPECIFIC)
     cart = _unwrap(client.get_config_category(CAT_CART), CAT_CART)
+    sid_addressing = _unwrap(
+        client.get_config_category(CAT_SID_ADDRESSING), CAT_SID_ADDRESSING
+    )
     return U64StateSnapshot(
         turbo_control=str(u64.get(_ITEM_TURBO_CONTROL, "")),
         cpu_speed=str(u64.get(_ITEM_CPU_SPEED, "")),
@@ -1191,6 +1272,11 @@ def snapshot_state(client: Ultimate64Client) -> U64StateSnapshot:
         cartridge=str(cart.get(_ITEM_CARTRIDGE, "")),
         badline_timing=str(u64.get(_ITEM_BADLINE_TIMING, "")),
         bus_operation_mode=str(cart.get(_ITEM_BUS_OPERATION_MODE, "")),
+        sid_addressing={
+            str(item): str(value)
+            for item, value in sid_addressing.items()
+            if isinstance(value, str) and value
+        },
     )
 
 
@@ -1249,6 +1335,20 @@ def restore_state(client: Ultimate64Client, snap: U64StateSnapshot) -> None:
     if snap.bus_operation_mode:
         cart_updates[_ITEM_BUS_OPERATION_MODE] = snap.bus_operation_mode
     client.set_config_items(CAT_CART, cart_updates)
+    if snap.sid_addressing:
+        # Mirroring last: put the widening back only once every base
+        # address is back, so no intermediate state widens a decode over
+        # an address the test was still using.
+        ordered = {
+            item: value
+            for item, value in snap.sid_addressing.items()
+            if item != SID_AUTO_MIRRORING_ITEM
+        }
+        if SID_AUTO_MIRRORING_ITEM in snap.sid_addressing:
+            ordered[SID_AUTO_MIRRORING_ITEM] = snap.sid_addressing[
+                SID_AUTO_MIRRORING_ITEM
+            ]
+        restore_config_items(client, CAT_SID_ADDRESSING, ordered)
 
 
 # --------------------------------------------------------------------------- #
@@ -1737,3 +1837,215 @@ def set_sid_address_map(
         {SID_SLOT_ADDRESS_ITEMS[slot]: address
          for slot, address in requested.items()},
     )
+
+
+def _sid_addressing_category(client: Ultimate64Client) -> dict[str, str]:
+    """The whole ``SID Addressing`` category as string values."""
+    inner = _unwrap(
+        client.get_config_category(CAT_SID_ADDRESSING), CAT_SID_ADDRESSING
+    )
+    return {
+        str(item): str(value)
+        for item, value in inner.items()
+        if isinstance(value, str) and value
+    }
+
+
+def set_sid_auto_mirroring(client: Ultimate64Client, enabled: bool) -> None:
+    """Set ``Auto Address Mirroring`` and assert the read-back.
+
+    The read-back is the point.  Mirroring is the setting that decides
+    whether an address map means what it says, and a write that was
+    accepted-but-not-applied leaves a measurement run looking correct
+    while it reads mirrors -- so this re-reads the item and raises if the
+    device did not take the value.
+
+    :param client: Connected Ultimate64 client.
+    :param enabled: True to enable mirroring, False to disable it.
+    :raises Ultimate64Error: If the read-back does not match.
+    """
+    value = SID_AUTO_MIRRORING_VALUES[1 if enabled else 0]
+    client.set_config_item(CAT_SID_ADDRESSING, SID_AUTO_MIRRORING_ITEM, value)
+    readback = _sid_addressing_category(client).get(SID_AUTO_MIRRORING_ITEM)
+    if readback != value:
+        raise Ultimate64Error(
+            f"{SID_AUTO_MIRRORING_ITEM} read back as {readback!r} after "
+            f"writing {value!r}; the address map cannot be trusted."
+        )
+
+
+def _distinct_sid_allocation(
+    current: Mapping[SidSlot, str],
+    requested: Mapping[SidSlot, str],
+    choices: "tuple[str, ...] | None",
+) -> dict[SidSlot, str]:
+    """Give every mapped slot a base of its own.
+
+    Slots the caller named keep their requested address.  A slot already
+    sitting on a unique address keeps it.  A slot colliding with another
+    is moved to the lowest free address.  ``"Unmapped"`` slots stay
+    unmapped: the firmware's unmapped offset is odd where every real
+    decode is even, so an unmapped slot cannot alias anything and moving
+    it would put a chip on the bus that was not there before.
+
+    :param current: The device's map now.
+    :param requested: The caller's slots.
+    :param choices: The device's probed address list, or None.
+    :returns: The full resulting map.
+    :raises ValueError: If the address space runs out.
+    """
+    pool = [a for a in SID_ADDRESS_VALUES[1:] if choices is None or a in choices]
+    final: dict[SidSlot, str] = {}
+    used: set[str] = set()
+    for slot, address in requested.items():
+        final[slot] = address
+        used.add(address)
+    for slot in SidSlot:
+        if slot in final:
+            continue
+        address = current.get(slot)
+        if address is None:
+            continue
+        if address == "Unmapped" or address not in used:
+            final[slot] = address
+            if address != "Unmapped":
+                used.add(address)
+            continue
+        replacement = next((a for a in pool if a not in used), None)
+        if replacement is None:
+            raise ValueError(
+                f"no free SID base address left for {slot.value}; "
+                f"{len(used)} of {len(pool)} taken"
+            )
+        _log.info(
+            "Moving %s off the shared base %s to %s so it cannot be "
+            "written by a measurement aimed at another slot",
+            slot.value, address, replacement,
+        )
+        final[slot] = replacement
+        used.add(replacement)
+    return final
+
+
+@contextmanager
+def isolated_sid_addressing(
+    client: Ultimate64Client,
+    mapping: Mapping[SidSlot | str, str],
+    *,
+    others: str = "distinct",
+    restore: bool = True,
+) -> Iterator[dict[SidSlot, str]]:
+    """Map SID slots to addresses that mean what they say, then put it back.
+
+    The safe-remap recipe, in the order the steps have to happen
+    (issue #196):
+
+    1. Snapshot the whole ``SID Addressing`` category, not just the
+       slots being moved.
+    2. Set ``Auto Address Mirroring`` to ``Disabled`` **and assert the
+       read-back**.  This is the step that is easy to skip and expensive
+       to skip: the device ships with mirroring enabled and all four
+       slots on ``$D400``, and mirroring widens decodes across
+       ``$D400-$D7FF`` wherever the in-range slots agree on an address
+       bit (u64_config.cc:2378-2430).  With it on, a read at an address
+       *no* slot occupies is answered by a mirror of one that does -- so
+       a comparison run reads the same chip twice and looks entirely
+       correct while doing it.  Distinct base addresses do not fix this
+       on their own.
+    3. Give *every* slot a base of its own, including the ones not under
+       test: a second real SID left sharing a decode is written by every
+       measurement aimed at the first.
+    4. Restore per item on every exit path, mirroring last.
+
+    Usage::
+
+        with isolated_sid_addressing(
+            client, {SidSlot.SOCKET1: "$D400", SidSlot.SOCKET2: "$D420"}
+        ) as addresses:
+            ...  # addresses is the full four-slot map now in effect
+
+    :param client: Connected Ultimate64 client.
+    :param mapping: Slot (or address-item name) -> address, for the slots
+        under test.
+    :param others: What to do with the slots not named. ``"distinct"``
+        (default) moves any that collide to a free address and leaves
+        unmapped ones unmapped; ``"unmapped"`` unmaps them all, which is
+        the strongest isolation available; ``"leave"`` touches nothing
+        else and only checks the result for conflicts.
+    :param restore: Put the category back on exit. ``False`` leaves the
+        device remapped -- for a caller that is deliberately staging
+        state for a later run.
+    :yields: The full resulting slot -> address map.
+    :raises ValueError: On an unknown slot, an address the device does
+        not offer, an exhausted address space, or -- under
+        ``others="leave"`` -- a resulting map with two slots on one base.
+    :raises Ultimate64Error: If mirroring does not read back as disabled.
+    :raises Ultimate64RestoreError: If the restore could not put every
+        item back; the ones that could be restored still were.
+    """
+    if others not in ("distinct", "unmapped", "leave"):
+        raise ValueError(
+            f"others must be 'distinct', 'unmapped' or 'leave' "
+            f"(got {others!r})"
+        )
+    if not isinstance(mapping, Mapping) or not mapping:
+        raise ValueError(
+            "mapping must be a non-empty mapping of SidSlot to address"
+        )
+
+    requested: dict[SidSlot, str] = {}
+    for key, address in mapping.items():
+        slot = _as_sid_slot(key)
+        validate_enum(address, SID_ADDRESS_VALUES, "SID address")
+        requested[slot] = address
+
+    saved = _sid_addressing_category(client)
+    current = dict(get_sid_address_map(client))
+    choices = _sid_address_choices(client)
+
+    if others == "unmapped":
+        final = dict(requested)
+        for slot in SidSlot:
+            final.setdefault(slot, "Unmapped")
+    elif others == "distinct":
+        final = _distinct_sid_allocation(current, requested, choices)
+    else:
+        final = dict(current)
+        final.update(requested)
+
+    conflicts = sid_address_conflicts(final)
+    if conflicts:
+        detail = "; ".join(
+            f"{c.address} <- {', '.join(s.value for s in c.slots)}"
+            for c in conflicts
+        )
+        raise ValueError(
+            f"resulting SID address map still has two slots on one base: "
+            f"{detail}. Every slot needs its own decode, including the "
+            f"ones not under test."
+        )
+
+    # Mirroring off first: a write that widens the old bases over the new
+    # ones is exactly the state this is protecting against.
+    set_sid_auto_mirroring(client, False)
+    try:
+        changes = {
+            slot: address
+            for slot, address in final.items()
+            if current.get(slot) != address
+        }
+        if changes:
+            set_sid_address_map(client, changes)
+        yield dict(final)
+    finally:
+        if restore and saved:
+            ordered = {
+                item: value
+                for item, value in saved.items()
+                if item != SID_AUTO_MIRRORING_ITEM
+            }
+            if SID_AUTO_MIRRORING_ITEM in saved:
+                ordered[SID_AUTO_MIRRORING_ITEM] = saved[
+                    SID_AUTO_MIRRORING_ITEM
+                ]
+            restore_config_items(client, CAT_SID_ADDRESSING, ordered)

@@ -57,7 +57,14 @@ from .execute import (
 )
 from .disk import DiskImage, DiskFormat, FileType, DirEntry, DiskImageError
 from .backends.vice_binary import BinaryViceTransport
-from .backends.vice_lifecycle import ViceProcess, ViceConfig
+from .backends.vice_lifecycle import (
+    ViceProcess,
+    ViceConfig,
+    headless_sid_config,
+    sid_emulation_enabled,
+    sid_sound_device_drains,
+    warn_if_sid_reads_unemulated,
+)
 from .backends.vice_elevation import (
     ViceEthernetError,
     ViceEthernetBinaryError,
@@ -94,6 +101,8 @@ from .backends.ultimate64_helpers import (
     get_detected_sid_types,
     get_sid_address_map,
     set_sid_address_map,
+    isolated_sid_addressing,
+    set_sid_auto_mirroring,
     get_sid_socket_types,
     get_sid_addresses,
     configure_multi_sid,
@@ -108,6 +117,8 @@ from .backends.ultimate64_helpers import (
     U64StateSnapshot,
     snapshot_state,
     restore_state,
+    restore_config_items,
+    Ultimate64RestoreError,
     CAT_ULTISID,
     CAT_AUDIO_MIXER,
     CAT_DATA_STREAMS,
@@ -173,6 +184,8 @@ from .backends.ultimate64_schema import (
     ULTISID_DIGI_VALUES,
     SidSlot,
     SID_SLOT_ADDRESS_ITEMS,
+    SID_AUTO_MIRRORING_ITEM,
+    SID_AUTO_MIRRORING_VALUES,
     SID_UNMAPPED_OFFSET,
     SID_ADDRESS_OFFSETS,
     sid_address_offset,
@@ -189,13 +202,22 @@ from .backends.ultimate64_schema import (
     SIDSocketConfig,
 )
 from .backends.render_wav import render_wav, RenderResult, PAL_CLOCK_HZ, NTSC_CLOCK_HZ
-from .backends.render_wav_u64 import capture_sid_u64, U64CaptureResult
+from .backends.render_wav_u64 import (
+    capture_sid_u64,
+    capture_u64_audio,
+    U64CaptureResult,
+)
 from .backends.u64_audio_capture import (
     AudioCapture,
     CaptureResult,
     write_wav,
+    coherent_block_cycles,
     DEFAULT_AUDIO_PORT,
     DEFAULT_SAMPLE_RATE,
+    NTSC_COLOR_CARRIER_HZ,
+    NTSC_PHI2_HZ,
+    U64_NTSC_AUDIO_RATE_HZ,
+    PHI2_CYCLES_PER_AUDIO_SAMPLE,
     CHANNELS,
     SAMPLE_WIDTH,
 )
@@ -423,6 +445,10 @@ __all__ = [
     "BinaryViceTransport",
     "ViceProcess",
     "ViceConfig",
+    "headless_sid_config",
+    "sid_emulation_enabled",
+    "sid_sound_device_drains",
+    "warn_if_sid_reads_unemulated",
     # VICE ethernet capability / elevation preflight
     "ViceEthernetError",
     "ViceEthernetBinaryError",
@@ -461,6 +487,8 @@ __all__ = [
     "ULTISID_DIGI_VALUES",
     "SidSlot",
     "SID_SLOT_ADDRESS_ITEMS",
+    "SID_AUTO_MIRRORING_ITEM",
+    "SID_AUTO_MIRRORING_VALUES",
     "SID_UNMAPPED_OFFSET",
     "SID_ADDRESS_OFFSETS",
     "sid_address_offset",
@@ -493,6 +521,8 @@ __all__ = [
     "get_detected_sid_types",
     "get_sid_address_map",
     "set_sid_address_map",
+    "isolated_sid_addressing",
+    "set_sid_auto_mirroring",
     "get_sid_socket_types",
     "get_sid_addresses",
     "configure_multi_sid",
@@ -520,6 +550,8 @@ __all__ = [
     "U64StateSnapshot",
     "snapshot_state",
     "restore_state",
+    "restore_config_items",
+    "Ultimate64RestoreError",
     # Ultimate 64 instance management
     "Ultimate64Device",
     "Ultimate64Instance",
@@ -683,13 +715,19 @@ __all__ = [
     "NTSC_CLOCK_HZ",
     # U64 SID capture
     "capture_sid_u64",
+    "capture_u64_audio",
     "U64CaptureResult",
     # U64 audio capture (low-level)
     "AudioCapture",
     "CaptureResult",
     "write_wav",
+    "coherent_block_cycles",
     "DEFAULT_AUDIO_PORT",
     "DEFAULT_SAMPLE_RATE",
+    "NTSC_COLOR_CARRIER_HZ",
+    "NTSC_PHI2_HZ",
+    "U64_NTSC_AUDIO_RATE_HZ",
+    "PHI2_CYCLES_PER_AUDIO_SAMPLE",
     "CHANNELS",
     "SAMPLE_WIDTH",
     # U64 debug stream capture

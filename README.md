@@ -769,16 +769,25 @@ result = capture_sid_u64(client, sid, out_wav="/tmp/u64_audio.wav", duration_sec
 print(f"{result.packets_received} packets, {result.packets_dropped} dropped")
 ```
 
-For low-level control, use `AudioCapture` directly:
+For low-level control, use `AudioCapture` directly — or `capture_u64_audio()`, which brings the stream up and down around an arbitrary run without resetting the machine (`capture_sid_u64()` resets in its `finally`, which destroys a host-driven run):
 
 ```python
-from c64_test_harness import AudioCapture
+from c64_test_harness import AudioCapture, capture_u64_audio, U64_NTSC_AUDIO_RATE_HZ
 
-cap = AudioCapture(port=11001)
-cap.start()
-# ... play SID on U64 ...
-result = cap.stop(wav_path="/tmp/capture.wav")
+with capture_u64_audio(client, "/tmp/run.wav",
+                       sample_rate=U64_NTSC_AUDIO_RATE_HZ) as captured:
+    target.jsr(0xC000)
+    target.wait_for_text("DONE")
+assert captured[0].time_base_intact      # a dropped packet is never padded
 ```
+
+**Three traps in this area produce plausible data rather than an error**, all documented with source citations in [docs/sid_audio.md](docs/sid_audio.md):
+
+- `ViceConfig.sound=False` (the default) disables SID *emulation*, not just output — `$D41B`/`$D41C` then return `maincpu_clk % 256`, a clean ramp that looks like a working oscillator. Use `headless_sid_config()` for SID measurement. `sounddev="dummy"` is not a substitute; it stalls the SID instead.
+- VICE discards the sample buffer under warp, so a warped audio capture is a well-formed *empty* WAV. `-soundrecdev` does not rescue it; warp must be off. `render_wav()` enforces this.
+- The U64's NTSC stream is `2109375/44 = 47940.34` Hz, not 48000 — 1244 ppm, ~75 ms of slip per minute. `DEFAULT_SAMPLE_RATE` keeps its nominal value; pass `U64_NTSC_AUDIO_RATE_HZ` (an exact `Fraction`) for timing-sensitive work. `phi2 : audio` locks at exactly `64 : 3`.
+
+Remapping SIDs for a comparison run needs `isolated_sid_addressing()`: the device ships with `Auto Address Mirroring` enabled, and distinct base addresses alone are **not** enough to stop one chip answering for another.
 
 ## U64 Data Streams
 

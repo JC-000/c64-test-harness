@@ -84,6 +84,24 @@ def _cart(
     }
 
 
+def _sid_addressing(mirroring: str = "Enabled") -> dict:
+    """``SID Addressing``, which ``snapshot_state`` also captures.
+
+    Anything that remaps SIDs has to put this category back, mirroring
+    included -- see ``tests/test_sid_isolation.py`` for the detail.
+    """
+    return {
+        "SID Addressing": {
+            "SID Socket 1 Address": "$D400",
+            "SID Socket 2 Address": "$D400",
+            "UltiSID 1 Address": "$D400",
+            "UltiSID 2 Address": "$D400",
+            "Auto Address Mirroring": mirroring,
+        },
+        "errors": [],
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Turbo / CPU speed                                                           #
 # --------------------------------------------------------------------------- #
@@ -565,6 +583,8 @@ class TestSnapshotRestore:
                     reu_size="512 KB",
                     cartridge="",
                 )
+            if cat == CAT_SID_ADDRESSING:
+                return _sid_addressing()
             raise AssertionError(f"unexpected {cat}")
 
         client.get_config_category.side_effect = side_effect
@@ -613,6 +633,8 @@ class TestSnapshotRestore:
                     reu_size="1 MB",
                     cartridge="REU",
                 )
+            if cat == CAT_SID_ADDRESSING:
+                return _sid_addressing()
             raise AssertionError(f"unexpected {cat}")
 
         client.get_config_category.side_effect = side_effect

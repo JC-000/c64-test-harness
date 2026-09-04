@@ -284,6 +284,26 @@ SID_SLOT_ADDRESS_ITEMS: dict[SidSlot, str] = {
     slot: f"{slot.value} Address" for slot in SidSlot
 }
 
+#: ``SID Addressing / Auto Address Mirroring``.
+#:
+#: Firmware ``u64_sid_addressing_cfg`` binds CFG_AUTO_MIRRORING to
+#: ``en_dis`` with default **1 = Enabled** (u64_config.cc:411), and the
+#: enabled path calls ``auto_mirror()`` (u64_config.cc:857-858) which
+#: clears decode mask bits A5..A9 wherever all in-range slots agree --
+#: widening every decode into mirrors across ``$D400-$D7FF``.
+#:
+#: The consequence for measurement: **giving the slots distinct base
+#: addresses is not sufficient**.  With mirroring on, a read at ``$D420``
+#: can be answered by a widened ``$D400`` decode, so a two-chip
+#: comparison looks entirely correct while both halves measure the same
+#: chip.  Disable it, and assert the read-back, before trusting an
+#: address map -- see ``ultimate64_helpers.isolated_sid_addressing``.
+SID_AUTO_MIRRORING_ITEM: str = "Auto Address Mirroring"
+
+#: Values for :data:`SID_AUTO_MIRRORING_ITEM` (``en_dis``,
+#: config.cc:927).
+SID_AUTO_MIRRORING_VALUES: tuple[str, ...] = ("Disabled", "Enabled")
+
 #: The value ``u64_sid_offsets[0]`` carries for ``"Unmapped"``
 #: (``#define UNMAPPED_BASE 0x01``, u64_config.cc:193). It is an odd
 #: number, and every real decode is even, so an unmapped slot can never
