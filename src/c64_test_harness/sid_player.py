@@ -198,6 +198,12 @@ def play_sid_vice(
     #    resets $0314/$0315 back to $EA31 — wiping out our IRQ hook.
     #
     #    $A002/$A003 holds BASIC warm-start address (typically $A474).
+    #
+    #    This is the caller-side form of the same hazard goto(cold=True)
+    #    covers: a resume inherits whatever stack the monitor's halt left.
+    #    goto(cold=True) is not usable here — it would enter the target
+    #    with a fresh SP but no BASIC, and this player wants BASIC's idle
+    #    loop running underneath the IRQ hook.
     _PARK_ADDR = 0x0339
     transport.write_memory(_PARK_ADDR, bytes([0x6C, 0x02, 0xA0]))  # JMP ($A002)
     transport.set_registers({"PC": _PARK_ADDR})

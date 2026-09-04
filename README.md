@@ -299,7 +299,7 @@ with ViceProcess(config) as vice:
 |----------|-------------|
 | `load_code(transport, addr, code)` | Write machine code into memory (semantic alias for `write_memory`) |
 | `set_register(transport, name, value)` | Set a CPU register (A/X/Y/SP/PC) via `set_registers()` |
-| `goto(transport, addr)` | Set PC and resume execution |
+| `goto(transport, addr, *, cold=False)` | Set PC and resume execution; `cold=True` also gives the target `SP=$FF` with `I`/`D` clear |
 | `set_breakpoint(transport, addr) -> int` | Set execution checkpoint, returns checkpoint ID |
 | `delete_breakpoint(transport, bp_id)` | Remove a checkpoint |
 | `wait_for_pc(transport, addr)` | Wait for CPU to stop at addr (uses async stopped events) |
@@ -308,6 +308,8 @@ with ViceProcess(config) as vice:
 `jsr()` writes a small trampoline (`JSR addr; NOP; NOP`) into the cassette buffer at `$0334`, sets a checkpoint after the `JSR`, resumes execution, and waits for the CPU to stop via async event. The CPU is paused when `jsr()` returns, so memory reads are safe. Works reliably even for long-running computations in warp mode.
 
 `preserve_state=True`, the default, reads PC, SP and the status register before the hijack and writes them back after the routine returns. Without it, a call issued while the monitor happened to halt the CPU inside an interrupt abandons that handler's stack frame and leaves interrupts masked for the rest of the boot, stopping the jiffy clock and the keyboard scan with no error anywhere (issue #183). Consequences: the machine is left on its pre-call register file while the returned dict holds the routine's, so read the return value rather than the machine; `A`/`X`/`Y` are not restored; nothing is restored on timeout; and a routine whose point is its own `SEI`/`CLI` or `LDX #$FF / TXS` needs `preserve_state=False` or its work is undone. See `examples/direct_memory_test.py` for a complete demo.
+
+`goto()` is the one-way counterpart and does **not** share that defect: there is no point at which control comes back, so there is nothing to restore and nowhere to put it — the abandoned frame is what `goto()` is for. What it does inherit is the halted machine's stack pointer and `I` flag. `cold=True` is the opt-in fix for that, writing `SP=$FF` and a status register with `I` and `D` clear in the same command as `PC`, so the target starts as if nothing had been running. It is not a reset: vectors, I/O and zero page are untouched, and a still-asserting interrupt source will fire as soon as `I` comes clear. The caller-side alternative, when the target should land back in BASIC rather than in your own code, is the warm-start `JMP ($A002)` idiom in `sid_player.py`.
 
 `jsr(..., recover_on_timeout=True)` (issue #156) turns a hung routine into a `RoutineHung` (a `TimeoutError` subclass, so existing `except TimeoutError` callers are unaffected) instead of leaving the machine in an unknown state: on timeout it restores SP and probes the trampoline with an RTS to confirm the machine is callable again, exposing the outcome via `RoutineHung.recovered`, `.hung_pc`, `.elapsed`, and `.detail`.
 
