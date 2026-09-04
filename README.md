@@ -554,6 +554,17 @@ The check is filesystem-only (one `open`, one non-blocking shared `flock`, one s
 
 A process that already holds a device's lock can re-enter the library — `create_manager()`, or a live test acquiring its own lock under the fixture — via `DeviceLock(host, allow_nested=True)`, which joins the existing hold (refcounted) instead of queueing behind itself. Without that flag two `DeviceLock` instances in one process contend exactly as two processes do, which remains the default.
 
+#### The asymmetry the advisory check cannot cover
+
+The advisory check only fires when the *other* lane took the lock. A lane that never touches this package takes no lock, is not a "live holder", and is therefore invisible to it — so the careful lane gets no protection and no way to detect the collision. On 2026-09-03 that cost a neighbouring project three test runs and nearly a physical power-cycle (issue #194): the unlocked lane's `run_prg` is a **load-and-run that replaces the running program**, not something that interleaves, so the displaced lane saw its own protocol answer nonsense and diagnosed device degradation.
+
+Two things narrow the gap:
+
+- **Constructing an `Ultimate64Client` with no lock held logs one `WARNING` per process per host**, naming the lockfile. Unlike the advisory check it needs no visible foreign holder — the point is to tell *you* that *you* are unlocked. Silence with `U64_UNLOCKED_CLIENT_WARNING=0`, `Ultimate64Client(host, warn_unlocked=False)`, or `suppress_unlocked_warning()` around a construction that is about to be followed by an acquire.
+- **`device_lock_holder(host)` / `device_lock_path(host)`** are the cheap public "is anyone holding this right now?" query and the path it reads, for a runner that wants to check without adopting the package. If the import fails, **fail closed and refuse to run** — a silent unlocked run is the failure being guarded against.
+
+**Do not build a wrapper on `read_info()`.** `release()` deliberately does not unlink the lockfile (unlinking would race a process that has opened the path and is about to `flock` it — flocks are per-inode), so **a lockfile naming a dead PID is the normal state after any completed run**, not a stale or wedged holder. `read_info()` names whoever held it *last*; `device_lock_holder()` / `DeviceLock.foreign_holder()` consult the flock and answer who holds it *now*. See [docs/device_locking.md](docs/device_locking.md) for the full contract, the fail-closed wrapper pattern, and why `Ultimate64Client` does not take the lock itself.
+
 ### Liveness Probe
 
 Before connecting, probe whether a U64 device is reachable:
