@@ -76,6 +76,32 @@ device on every launch, which is not what a headless harness should do —
 so the defence is the warning, the predicate
 (`sid_emulation_enabled(cfg)`), and this page.
 
+### Sample the SID from the 6510, never from the host
+
+Under VICE, host-side `transport.read_memory($D41B)` does **not** read the
+SID at all. The binary monitor's memory commands go through bank
+`default`, which returns the RAM under the I/O window rather than the
+chip: `read_memory($D012)` yields a constant instead of a moving raster,
+and `$D400-$D41F` yields whatever bytes happen to be in RAM. Host-side
+*writes* to those addresses land in RAM too, so a SID configured that way
+is never configured at all.
+
+So a register-domain measurement has to run on the machine: a routine
+that writes the voice registers and samples `$D41B` into a RAM buffer,
+called with `jsr()`, with the host reading only the buffer.
+`tests/test_sid_emulation_live.py` is the worked example.
+
+This is worth stating because it makes the obvious probe fail in the most
+misleading possible way. A host-side freeze-and-read test reports "not a
+SID" for **every** configuration, including the healthy one — a confident,
+uniform, entirely wrong answer, and one that looks like a harness defect
+rather than a measurement error.
+
+It also means the "raise when a caller reads `$D400-$D41F` on a
+sound-disabled instance" idea from #193 would guard a path that never
+reaches the SID under either setting. The launch-time warning is the
+defence that actually covers the reported failure.
+
 ---
 
 ## 2. VICE discards audio under warp — `-soundrecdev` does not rescue it
