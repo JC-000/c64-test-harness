@@ -52,18 +52,14 @@ _ITEM_REU_SIZE = "REU Size"
 def _cart_item_response(presets: list[str], current: str = "REU") -> dict:
     """A ``get_config_item(CAT_CART, "Cartridge")`` response shape.
 
-    Mirrors the live-verified structure: the item map is nested under the
-    category name, carrying ``current`` / ``presets`` / ``default``.
+    Mirrors the live-verified structure as the client hands it back since
+    issue #214: the item map itself, carrying ``current`` / ``presets`` /
+    ``default`` (the category/``errors`` envelope is unwrapped).
     """
     return {
-        CAT_CART: {
-            _ITEM_CARTRIDGE: {
-                "current": current,
-                "presets": presets,
-                "default": "",
-            }
-        },
-        "errors": [],
+        "current": current,
+        "presets": presets,
+        "default": "",
     }
 
 

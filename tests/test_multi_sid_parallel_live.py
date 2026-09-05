@@ -16,6 +16,11 @@ Requirements:
     - ``U64_HOST`` env var pointing at a reachable Ultimate 64 device
     - Device has physical 8580 SID chips in both sockets
 
+Output: the capture and its JSON sidecar go to a per-run scratch
+directory by default; ``WAV_CAPTURES_REFRESH=1`` writes them into the
+tracked reference ``tests/wav_captures/multi_sid/`` instead (issue #220;
+see ``tests/wav_capture_paths.py``).
+
 Typical runtime: ~15 seconds.
 """
 from __future__ import annotations
@@ -40,9 +45,9 @@ from c64_test_harness.backends.u64_audio_capture import (
 )
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
 
-logger = logging.getLogger(__name__)
+from wav_capture_paths import capture_dir
 
-WAV_DIR = Path(__file__).parent / "wav_captures" / "multi_sid"
+logger = logging.getLogger(__name__)
 
 pytestmark = [
     pytest.mark.skipif(
@@ -258,16 +263,24 @@ def u64_client():
 
 
 @pytest.fixture(scope="module")
-def quad_wav(u64_client) -> Path:
+def wav_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Where this module's capture goes: scratch unless WAV_CAPTURES_REFRESH=1."""
+    path = capture_dir("multi_sid", tmp_path_factory.mktemp("multi_sid_captures"))
+    path.mkdir(parents=True, exist_ok=True)
+    logger.info("multi-SID capture -> %s", path)
+    return path
+
+
+@pytest.fixture(scope="module")
+def quad_wav(u64_client, wav_dir: Path) -> Path:
     """Capture the quad-SID WAV once for the whole module.
 
     Uses ``run_prg`` (not ``sidplay``) so that the 6502 writes hit the
     actual SID chips at their configured I/O addresses, which routes
     audio through the Audio Mixer panning config.
     """
-    WAV_DIR.mkdir(parents=True, exist_ok=True)
-    wav_path = WAV_DIR / "quad_sid_parallel.wav"
-    meta_path = WAV_DIR / "quad_sid_parallel.json"
+    wav_path = wav_dir / "quad_sid_parallel.wav"
+    meta_path = wav_dir / "quad_sid_parallel.json"
 
     # Configure 4 engines at distinct addresses -- reset required for
     # SID address routing changes to take effect in the FPGA fabric.

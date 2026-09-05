@@ -6,9 +6,14 @@ dependencies — `urllib.request` only.
 Response shape for config queries is always:
     { "<Category Name>": { ...items... }, "errors": [] }
 
-The client does NOT auto-unwrap the category key — callers inspect the
-raw response. `errors` is always passed through; non-empty `errors`
-arrays should be treated as a soft failure by the caller.
+`get_config_category` does NOT auto-unwrap the category key — callers
+inspect the raw response, and `errors` is passed through for them to
+treat as a soft failure. The single-item accessors do unwrap (issue
+#214): `get_config_item` returns the item's own map
+(`{"current": ..., "values": [...], "default": ...}`), `get_config_value`
+returns its `current`, and both raise `Ultimate64ProtocolError` on a
+non-empty `errors` array or a missing item; `get_config_item_raw` is the
+untouched envelope.
 """
 from __future__ import annotations
 
@@ -480,13 +485,92 @@ class Ultimate64Client:
             raise ValueError("category must be a non-empty string")
         return self._get_json(f"/v1/configs/{_encode(category)}")
 
-    def get_config_item(self, category: str, item: str) -> dict:
-        """GET /v1/configs/<category>/<item> — single item with enum/range info."""
+    def get_config_item_raw(self, category: str, item: str) -> dict:
+        """GET /v1/configs/<category>/<item> — the untouched REST envelope.
+
+        Returns exactly what the firmware sent, wrapper key and
+        ``errors`` array included::
+
+            {"C64 and Cartridge Settings":
+                {"Cartridge Preference":
+                    {"current": "External",
+                     "values": ["Auto", "Internal", "External", "Manual"],
+                     "default": "Auto"}},
+             "errors": []}
+
+        Nothing is validated; a non-empty ``errors`` array is passed
+        through for the caller to inspect.  Prefer :meth:`get_config_item`
+        (the item map) or :meth:`get_config_value` (its ``current``).
+        """
         if not isinstance(category, str) or not category:
             raise ValueError("category must be a non-empty string")
         if not isinstance(item, str) or not item:
             raise ValueError("item must be a non-empty string")
         return self._get_json(f"/v1/configs/{_encode(category)}/{_encode(item)}")
+
+    def get_config_item(self, category: str, item: str) -> dict:
+        """GET /v1/configs/<category>/<item> — the item's own map.
+
+        Returns the map the firmware describes the item with, unwrapped
+        from the category/item envelope.  Enum items carry their choices
+        under ``"values"``; preset-file items (``Cartridge``) under
+        ``"presets"``; the live value is ``"current"``::
+
+            >>> client.get_config_item("C64 and Cartridge Settings",
+            ...                        "Cartridge Preference")
+            {'current': 'External',
+             'values': ['Auto', 'Internal', 'External', 'Manual'],
+             'default': 'Auto'}
+
+        Keys beyond those three are whatever the firmware sends for that
+        item (range items add ``"min"`` / ``"max"``).  For just the value
+        use :meth:`get_config_value`; for the whole envelope use
+        :meth:`get_config_item_raw`.
+
+        :raises Ultimate64ProtocolError: if the envelope carries a
+            non-empty ``errors`` array or does not contain
+            ``[category][item]`` as a map (issue #214: an accessor named
+            for the item must not hand back a value from a failed read).
+        """
+        envelope = self.get_config_item_raw(category, item)
+        if not isinstance(envelope, dict):
+            raise Ultimate64ProtocolError(
+                f"expected object for config item {category!r}/{item!r}, "
+                f"got {type(envelope).__name__}"
+            )
+        errors = envelope.get("errors")
+        if errors:
+            raise Ultimate64ProtocolError(
+                f"config item {category!r}/{item!r}: device reported errors {errors!r}"
+            )
+        cat_map = envelope.get(category)
+        if not isinstance(cat_map, dict) or not isinstance(cat_map.get(item), dict):
+            raise Ultimate64ProtocolError(
+                f"config item {category!r}/{item!r} absent from response "
+                f"{envelope!r}"
+            )
+        return cat_map[item]
+
+    def get_config_value(self, category: str, item: str) -> Any:
+        """Return the item's ``current`` value — what snapshot/restore wants.
+
+            >>> prev = client.get_config_value(cat, item)   # 'Auto'
+            >>> client.set_config_item(cat, item, "External")
+            >>> client.set_config_item(cat, item, prev)      # restores 'Auto'
+
+        Enum values come back as the firmware's strings (``" 1"`` keeps
+        its leading space); range items may come back as ints.
+
+        :raises Ultimate64ProtocolError: as :meth:`get_config_item`, and
+            also when the item map has no ``"current"`` key.
+        """
+        item_map = self.get_config_item(category, item)
+        if "current" not in item_map:
+            raise Ultimate64ProtocolError(
+                f"config item {category!r}/{item!r} has no 'current' value: "
+                f"{item_map!r}"
+            )
+        return item_map["current"]
 
     def list_drives(self) -> dict:
         """GET /v1/drives — enumerates all drive slots."""

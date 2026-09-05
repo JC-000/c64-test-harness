@@ -91,16 +91,15 @@ class FakeU64:
         return {category: dict(self.state[category]), "errors": []}
 
     def get_config_item(self, category: str, item: str) -> dict:
+        # Item map, unwrapped from the REST envelope (issue #214).
         return {
-            category: {
-                item: {
-                    "current": self.state[category][item],
-                    "values": list(SID_ADDRESS_VALUES),
-                    "default": "$D400",
-                }
-            },
-            "errors": [],
+            "current": self.state[category][item],
+            "values": list(SID_ADDRESS_VALUES),
+            "default": "$D400",
         }
+
+    def get_config_value(self, category: str, item: str) -> str:
+        return self.state[category][item]
 
     # --- writes ------------------------------------------------------
     def set_config_item(self, category: str, item: str, value) -> None:

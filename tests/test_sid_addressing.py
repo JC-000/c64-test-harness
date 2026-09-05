@@ -270,15 +270,11 @@ def _addressing_category(**overrides: str) -> dict:
 def _client_with_addresses(**overrides: str) -> MagicMock:
     client = MagicMock()
     client.get_config_category.return_value = _addressing_category(**overrides)
+    # Item map, unwrapped from the REST envelope (issue #214).
     client.get_config_item.return_value = {
-        CAT_SID_ADDRESSING: {
-            "SID Socket 1 Address": {
-                "current": "$D400",
-                "values": list(SID_ADDRESS_VALUES),
-                "default": "$D400",
-            }
-        },
-        "errors": [],
+        "current": "$D400",
+        "values": list(SID_ADDRESS_VALUES),
+        "default": "$D400",
     }
     return client
 
@@ -378,14 +374,9 @@ class TestAddressMap:
         """
         client = _client_with_addresses()
         client.get_config_item.return_value = {
-            CAT_SID_ADDRESSING: {
-                "SID Socket 1 Address": {
-                    "current": "$D400",
-                    "values": ["Unmapped", "$D400", "$D420"],
-                    "default": "$D400",
-                }
-            },
-            "errors": [],
+            "current": "$D400",
+            "values": ["Unmapped", "$D400", "$D420"],
+            "default": "$D400",
         }
         with pytest.raises(ValueError, match="not offered by this device"):
             set_sid_address_map(client, {SidSlot.ULTISID2: "$DFE0"})

@@ -661,7 +661,9 @@ Exception mapping: timeouts, unreachable device, and connection drops mid-reques
 - `client.get_info() -> dict`
 - `client.list_configs() -> list[str]`
 - `client.get_config_category(name) -> dict`
-- `client.get_config_item(category, item) -> dict`
+- `client.get_config_item(category, item) -> dict` -- the **item's own map**, unwrapped from the REST envelope (issue #214): `{'current': 'External', 'values': ['Auto', 'Internal', 'External', 'Manual'], 'default': 'Auto'}`. Enum items list choices under `"values"`, the `Cartridge` preset-file item under `"presets"`. Raises `Ultimate64ProtocolError` if the item is absent or the envelope's `errors` is non-empty.
+- `client.get_config_value(category, item) -> Any` -- the item's `"current"` value; the accessor for snapshot-then-restore (`prev = get_config_value(...)`, `set_config_item(..., prev)` puts the original back).
+- `client.get_config_item_raw(category, item) -> dict` -- the untouched envelope `{'<category>': {'<item>': {...}}, 'errors': []}` for callers that had adapted to it.
 - `client.set_config_item(category, item, value) -> None` -- `PUT /v1/configs/<category>/<item>?value=<value>`; the call for one-off items such as `("C64 and Cartridge Settings", "Cartridge Preference", "External")`. Volatile until `save_config_to_flash()`.
 - `client.set_config_items(category, items_dict)` -- iterates per-item (no batch endpoint)
 - `client.save_config_to_flash() -> None` -- `PUT /v1/configs:save_to_flash` (DESTRUCTIVE). Config PUTs are otherwise volatile; a reboot/power-cycle reloads flash, not the RAM-side value.

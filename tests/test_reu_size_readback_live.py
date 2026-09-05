@@ -170,10 +170,14 @@ def _category(client: Ultimate64Client) -> dict:
 
 
 def _item(client: Ultimate64Client, item: str) -> dict:
-    """Return the unwrapped ``{current, default, values|presets}`` for *item*."""
-    resp = client.get_config_item(CAT_CART, item)
-    inner = resp.get(CAT_CART, {}).get(item)
-    assert isinstance(inner, dict), f"unexpected item shape for {item!r}: {resp!r}"
+    """Return the ``{current, default, values|presets}`` map for *item*.
+
+    ``get_config_item`` unwraps the category/``errors`` envelope itself
+    since issue #214; this only pins the shape.
+    """
+    inner = client.get_config_item(CAT_CART, item)
+    assert isinstance(inner, dict), f"unexpected item shape for {item!r}: {inner!r}"
+    assert "current" in inner, f"item {item!r} has no 'current': {inner!r}"
     return inner
 
 
