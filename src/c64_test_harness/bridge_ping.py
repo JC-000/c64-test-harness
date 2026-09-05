@@ -927,11 +927,20 @@ def _emit_read_frame(a: Asm, rx_buf: int) -> None:
     # Skip the rest of the current packet so the CS8900a FIFO is
     # advanced to the start of the next frame.  Needed here because the
     # body read above is a fixed _FIXED_RX_BYTES, so a longer frame leaves
-    # a tail in the FIFO.  Measured on hardware: one frame occupies exactly
-    # 4 header bytes + RxLength data bytes, and every read past that
-    # returns $00 until SkipNow is issued.  ip65 reads the whole frame and
-    # never issues SkipNow; whether the skip is still required after a
-    # complete read is unmeasured.
+    # a tail in the FIFO, and a partially read frame does NOT advance:
+    # the next RTDATA reads keep delivering the rest of the same frame
+    # (measured on a U64E + RR-Net, 2026-09-05, issue #219, n=3 per
+    # variant, two host-queued frames).  A *complete* read (all RxLength
+    # bytes) does release the frame without SkipNow -- but the next
+    # frame's header is presented at RTDATA only after RxEvent's high
+    # byte (PPTR $0124, $DE05) has been read; until then RTDATA reads
+    # $00, however long you wait (10 ms measured), and no other access
+    # (PP $0000, a PPTR write, the RxEvent low byte, $DE00/$DE01, PP
+    # $0400) stands in for it.  That is why ip65, which reads the whole
+    # frame and polls RxEvent before every read, never needs SkipNow.
+    # After SkipNow the next header likewise appears once RxEvent is
+    # polled.  The chip buffered exactly two ~100-byte frames; a third
+    # was dropped with RxMISS=1.  tests/test_cs8900a_fifo_live.py pins it.
     _emit_skip_packet(a)
 
 
