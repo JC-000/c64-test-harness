@@ -439,11 +439,12 @@ def build_udp_frame(
 #: On a real CS8900a the low 6 bits of every control/status register are
 #: **read-only and report the register's own number** -- measured reset
 #: values say so across the board (RxCTL 0x0005, LineCTL 0x0013, SelfCTL
-#: 0x0015, BusCTL 0x0017, BusST 0x0018).  So the harness's old 0x00D8 was
-#: never "RxCTL with flags": writing it reads back as **0x00C5**, with
-#: RxOKA (0x0100) absent, and without RxOKA the receiver accepts nothing.
-#: VICE's rawnetarch forces rx_ok internally, which is the only reason
-#: 0x00D8 ever appeared to work (issue #207).
+#: 0x0015, BusCTL 0x0017, BusST 0x0018).  The harness's old 0x00D8 reads
+#: back as **0x00C5** -- the tell, not the cause.  The cause is that
+#: 0x00D8 never contained RxOKA (0x0100) in the first place, and without
+#: RxOKA the receiver accepts nothing.  It appeared to work under VICE
+#: because cs8900.c's acceptance filter never consults RxOKA -- it accepts
+#: on the address filter alone (issue #207).
 #:
 #: PromiscuousA is kept for one reason only: it is what every harness
 #: routine has always programmed, and dropping it would silently narrow
@@ -460,9 +461,11 @@ CS8900A_RXCTL_VALUE = 0x0D85
 
 #: TxCMD (PP 0x0108): "transmit after the whole frame is in the FIFO"
 #: (0x00C0) **plus the register's own number** in the low 6 bits, which is
-#: 0x09.  The harness wrote a bare 0x00C0 for years -- the same omission
-#: as the old RxCTL 0x00D8 (issue #207).  ip65 writes 0x00C9, and a real
-#: chip reads TxCMD back as 0x00C9.
+#: 0x09.  The harness wrote a bare 0x00C0 for years with no measured
+#: fault -- unlike the RxCTL case this is parity with ip65 (which writes
+#: 0x00C9), adopted so the two drivers program the chip identically, not
+#: a fix.  Whether a real chip reads PP 0x0108 back as 0x00C9 has not been
+#: measured; do not cite it.
 CS8900A_TXCMD_VALUE = 0x00C9
 
 #: Mask applied to the high byte of RxEvent (PP 0x0124) when polling for a
@@ -724,10 +727,13 @@ def _emit_read_frame(a: Asm, rx_buf: int) -> None:
     a.branch(0xD0, "_rf_lp")
 
     # Skip the rest of the current packet so the CS8900a FIFO is
-    # advanced to the start of the next frame.  Always required: the FIFO
-    # does not roll on to the next frame by itself.  Measured on hardware
-    # -- one frame occupies exactly 4 header bytes + RxLength data bytes,
-    # and every read past that returns $00 until SkipNow is issued.
+    # advanced to the start of the next frame.  Needed here because the
+    # body read above is a fixed _FIXED_RX_BYTES, so a longer frame leaves
+    # a tail in the FIFO.  Measured on hardware: one frame occupies exactly
+    # 4 header bytes + RxLength data bytes, and every read past that
+    # returns $00 until SkipNow is issued.  ip65 reads the whole frame and
+    # never issues SkipNow; whether the skip is still required after a
+    # complete read is unmeasured.
     _emit_skip_packet(a)
 
 

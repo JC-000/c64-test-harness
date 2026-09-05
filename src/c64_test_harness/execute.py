@@ -621,7 +621,8 @@ def _is_u64_target(target: Any) -> bool:
     """
     from .backends.ultimate64 import Ultimate64Transport
 
-    return isinstance(target.transport, Ultimate64Transport)
+    # Accept a TestTarget or a bare transport: run_prg_via_sys takes either.
+    return isinstance(getattr(target, "transport", target), Ultimate64Transport)
 
 
 def run_subroutine(
@@ -848,50 +849,84 @@ def parse_basic_sys_address(prg: bytes, *, basic_start: int = 0x0801) -> int | N
 #: How much of the program head :func:`_write_prg_body_verified` re-checks.
 _PRG_HEAD_VERIFY_BYTES = 64
 
+#: Seconds after ``READY.`` before a U64 can be trusted not to zero the
+#: BASIC program pointer.  The event lands between ~2 s and ~5 s after the
+#: banner (see :func:`_write_prg_body_verified`); 6 s leaves a margin.
+_U64_POST_READY_SETTLE = 6.0
+
 
 def _write_prg_body_verified(transport: Any, load_addr: int, body: bytes,
-                             *, timeout: float = 10.0) -> None:
-    """Write *body* at *load_addr* and keep re-writing its head until it
-    reads back intact.
+                             *, ready_at: float, settle_after_ready: float,
+                             timeout: float = 10.0) -> None:
+    """Write *body* at *load_addr* and only return once its head is intact
+    **after the machine has settled**.
 
-    On the U64, a write issued right after ``reset()`` -> ``READY.`` does
-    not reliably retain its first bytes: ``$0801/$0802`` read back as
-    ``00 00`` -- BASIC's empty-program pointer, i.e. possibly *reverted*
-    rather than cleared -- with the remaining 6084 untouched; the same
-    write after a 5 s settle, or with no reset, is clean (c64-wireguard,
-    paired trials, 2026-09-05: write-immediately, +2 s not retained; +5 s
-    and no-reset clean).
-    The best candidate mechanism is the boot sequence's upward RAM walk,
-    which this bench had seen clobber DMA writes at ``$4000+`` for ~1-3 s
-    -- but the two measurements do not agree on the window, so a fixed
-    settle would be a guess.  Read-back-and-retry needs no window: it
-    verifies the head, rewrites it when wrong, and gives up loudly.
+    On the U64, ``READY.`` appearing on screen is not the machine being
+    ready.  A single post-reset event zeroes ``$0801/$0802`` -- BASIC's
+    program pointer -- once, between ~2 s and ~5 s after the banner is
+    drawn.  The control that established this had no write in it at all:
+    stamp ``$DEAD`` at ``$0801``, wait 8 s, read ``00 00``.  It is
+    address-specific (the same 6086-byte image at ``$4000`` or ``$C000`` is
+    untouched), identical with ``Cartridge Preference`` ``Auto`` and
+    ``External``, and unrelated to write length (c64-wireguard, paired
+    trials with the no-write control, 2026-09-05).  A write that lands
+    before the event loses its first two bytes; one that lands after it
+    survives.  Nothing was observed at ``$4000+``; this bench's earlier
+    "post-reset RAM-walk clobbers DMA writes at ``$4000+``" note is a
+    different phenomenon, if it is one.
 
-    The whole body is written once; only the head is re-verified and
-    re-written, because that is where every observed clobber landed.  A
-    final full read-back compare catches anything else and raises rather
-    than retrying, since a mid-body mismatch is a different problem.
+    Tracked as issue #216 (filed by the c64-wireguard project).  So a
+    single successful read-back is **not** sufficient -- it can pass at
+    1 s and be erased at 3 s.  This helper re-verifies the head until
+    at least *settle_after_ready* seconds have elapsed since *ready_at*,
+    rewriting it whenever it is wrong, and refuses to return (raising
+    :class:`TransportError`) if it is still wrong *timeout* seconds after
+    the window closed.  With ``settle_after_ready=0`` (VICE, or a caller
+    that skipped the reset) one intact read-back suffices.
+
+    The re-verification is the guarantee; the settle constant is only an
+    optimisation on top of it.  The 2-5 s window is n=4 on one device and
+    one firmware (U64E ``601A96``, ``4011c97c`` / fpga 125), so a bare
+    sleep tuned to it would decay silently on another model or firmware --
+    do not "simplify" this to a sleep.  No wait when the caller skipped
+    the reset, because the event is reset-triggered, not time-triggered:
+    the no-reset trial was clean.
+
+    Only the head is re-verified and re-written, because that is where
+    every observed clobber landed.  A final full read-back compare raises
+    on any other mismatch rather than retrying, since that would be a
+    different problem and a retry loop that swallowed it would look like
+    it had checked.
     """
     from .memory import write_bytes
 
     write_bytes(transport, load_addr, body)
     head = body[:_PRG_HEAD_VERIFY_BYTES]
-    deadline = time.monotonic() + timeout
-    attempts = 0
-    while transport.read_memory(load_addr, len(head)) != head:
-        attempts += 1
-        if time.monotonic() > deadline:
-            raise TransportError(
-                f"program head at ${load_addr:04X} never read back intact after "
-                f"{attempts} rewrite(s) in {timeout}s -- something is still "
-                "clobbering RAM after the reset (see _write_prg_body_verified)"
-            )
-        time.sleep(0.5)
-        write_bytes(transport, load_addr, head)
-    if attempts:
+    quiet_after = ready_at + settle_after_ready
+    give_up = max(quiet_after, time.monotonic()) + timeout
+    rewrites = 0
+    while True:
+        intact = transport.read_memory(load_addr, len(head)) == head
+        now = time.monotonic()
+        if intact and now >= quiet_after:
+            break
+        if not intact:
+            if now > give_up:
+                raise TransportError(
+                    f"program head at ${load_addr:04X} never read back intact: "
+                    f"{rewrites} rewrite(s), {timeout}s past the {settle_after_ready}s "
+                    "post-READY settle -- something is still clobbering RAM "
+                    "(see _write_prg_body_verified)"
+                )
+            rewrites += 1
+            write_bytes(transport, load_addr, head)
+            time.sleep(0.5)
+        else:
+            time.sleep(min(0.5, max(0.05, quiet_after - now)))
+    if rewrites:
         logger.warning(
             "run_prg_via_sys: program head at $%04X was clobbered after the "
-            "reset and rewritten (%d attempt(s))", load_addr, attempts,
+            "reset and rewritten (%d time(s))", load_addr, rewrites,
         )
     tail_from = len(head)
     if len(body) > tail_from:
@@ -912,18 +947,21 @@ def run_prg_via_sys(
     reset: bool = True,
     boot_timeout: float = 25.0,
     verify_timeout: float = 10.0,
+    settle_after_ready: float | None = None,
 ) -> int:
     """Load *prg* into RAM and start it with a ``SYS`` typed at BASIC.
 
     The reason this exists rather than
     :meth:`~.ultimate64_client.Ultimate64Client.run_prg`: on the U64,
-    ``run_prg``'s DMA-load path **drops an external cartridge**.  A program
-    it loads sees the whole ``$DE00`` I/O window as zeros even while
-    ``Cartridge Preference`` still reads ``External``, so anything driving
-    a cartridge — an RR-Net, most obviously — fails at its first register
-    read.  Stock ip65 reports ``INIT DRIVER: FAILED`` that way.  Writing
-    the program into RAM and typing ``SYS`` keeps the cartridge on the bus
-    (issue #211).
+    after ``run_prg`` an **external cartridge is left deselected**.  A
+    program it loads sees the whole ``$DE00`` I/O window as zeros even
+    while ``Cartridge Preference`` still reads ``External``, so anything
+    driving a cartridge — an RR-Net, most obviously — fails at its first
+    register read.  Stock ip65 reports ``INIT DRIVER: FAILED`` that way.
+    The cause is not isolated (the DMA load, the reset ``run_prg``
+    performs, or something between them); only the outcome is measured
+    (issue #211).  Writing the program into RAM and typing ``SYS`` leaves
+    the cartridge on the bus.
 
     Works on either backend: ``write_memory`` plus keystrokes, then a
     resume so the typed line actually runs under VICE.
@@ -935,9 +973,14 @@ def run_prg_via_sys(
     :param reset: Reset and wait for ``READY.`` first.  Pass ``False`` if
         the machine is already at a BASIC prompt.
     :param boot_timeout: Seconds to wait for ``READY.`` after the reset.
-    :param verify_timeout: Seconds to keep re-writing the head of the
-        program until it reads back intact (see
-        :func:`_write_prg_body_verified`).
+    :param verify_timeout: Seconds past the settle window to keep
+        re-writing the head of the program until it reads back intact
+        (see :func:`_write_prg_body_verified`).
+    :param settle_after_ready: Seconds after ``READY.`` before the
+        program head is trusted.  ``None`` (default) picks
+        :data:`_U64_POST_READY_SETTLE` on an Ultimate 64 after a reset --
+        the U64 zeroes ``$0801/$0802`` once, 2-5 s after the banner --
+        and ``0`` otherwise.
     :returns: The SYS address used.
     :raises ValueError: if *prg* is too short, or no entry point was given
         and none could be parsed from the stub.
@@ -971,9 +1014,17 @@ def run_prg_via_sys(
                 f"machine did not reach READY. within {boot_timeout}s; "
                 "cannot type SYS"
             )
+    ready_at = time.monotonic()
+    if settle_after_ready is None:
+        settle_after_ready = (
+            _U64_POST_READY_SETTLE if reset and _is_u64_target(transport) else 0.0
+        )
 
     load_addr = prg[0] | (prg[1] << 8)
-    _write_prg_body_verified(transport, load_addr, prg[2:], timeout=verify_timeout)
+    _write_prg_body_verified(
+        transport, load_addr, prg[2:], ready_at=ready_at,
+        settle_after_ready=settle_after_ready, timeout=verify_timeout,
+    )
     send_text(transport, f"SYS{sys_addr}\r")
     # Under VICE both write_memory and inject_keys are monitor commands
     # and each halts the 6510; without a resume the typed SYS sits in the

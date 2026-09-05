@@ -684,10 +684,12 @@ because VICE is more forgiving than the chip.
 every control/status register reports its own register number in the low
 6 bits -- measured reset values say so throughout: RxCTL `0x0005`,
 LineCTL `0x0013`, SelfCTL `0x0015`, BusCTL `0x0017`, BusST `0x0018`.  The
-harness's old `0x00D8` therefore reads back as **`0x00C5`**, with `RxOKA`
-(`0x0100`) absent, and without `RxOKA` the receiver accepts nothing.
-VICE's rawnetarch forces `rx_ok` internally, which is the only reason
-`0x00D8` ever appeared to work.  `CS8900A_RXCTL_VALUE` is now `0x0D85`
+harness's old `0x00D8` reads back as **`0x00C5`** (bits 3-4 replaced by
+the register number).  The read-back is the tell, not the cause: the
+cause is that `0x00D8` never contained `RxOKA` (`0x0100`) at all, and
+without `RxOKA` the receiver accepts nothing.  It appeared to work under
+VICE because `cs8900.c`'s acceptance filter never consults `RxOKA` -- it
+accepts on the address filter alone.  `CS8900A_RXCTL_VALUE` is now `0x0D85`
 (PromiscuousA | RxOKA | IndividualA | BroadcastA + register number);
 `CS8900A_RXCTL_VALUE_IP65` (`0x0D05`) is the same without promiscuous,
 which is what ip65 programs and what you want on a busy segment.
@@ -760,9 +762,11 @@ Two more hardware-only facts, both in issues #209 and #211:
   "non-zero" is not "present" either.  The only valid test is the one
   ip65's `eth_init` performs (`drivers/cs8900a.s:133-137`): clockport
   enable, `PPPtr = $0000`, `PPData == $630E`, executed **on the 6510**.
-* **Do not start the program with `client.run_prg()`** -- its DMA-load
-  path drops the external cartridge, and the loaded program sees `$DE00`
-  as zeros even though the config still reads `External`.  Use
+* **Do not start the program with `client.run_prg()`** -- after it, the
+  loaded program sees `$DE00` as zeros even though the config still reads
+  `External`, i.e. the external cartridge is left deselected.  The cause
+  is not isolated (the DMA load, the reset it performs, or something in
+  between); only the outcome is measured.  Use
   `run_prg_via_sys(target, prg)`, which writes the PRG into RAM and types
   `SYS`.  Stock ip65 `ping.prg` reports `INIT DRIVER: FAILED` under
   `run_prg` and pings normally under `run_prg_via_sys`.
