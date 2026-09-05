@@ -936,13 +936,27 @@ def _emit_read_frame(a: Asm, rx_buf: int) -> None:
     # bytes) does release the frame without SkipNow -- but the next
     # frame's header is presented at RTDATA only after RxEvent's high
     # byte (PPTR $0124, $DE05) has been read; until then RTDATA reads
-    # $00, however long you wait (10 ms measured), and no other access
-    # (PP $0000, a PPTR write, the RxEvent low byte, $DE00/$DE01, PP
-    # $0400) stands in for it.  That is why ip65, which reads the whole
-    # frame and polls RxEvent before every read, never needs SkipNow.
+    # $00.  That is the datasheet's I/O-mode receive sequence (CS8900A
+    # data sheet, "Receive Frame Operation / I/O Space": read RxEvent,
+    # then RxStatus and RxLength are read from the Receive/Transmit Data
+    # port, then the data) -- ip65 follows it, reads the whole frame,
+    # and never needs SkipNow.  It is not a settling time: both frames
+    # were injected 200 ms before the routine ran and RxMISS stayed 0,
+    # so frame 2 was already buffered; the only latency possible is the
+    # chip's internal advance after the last data read, the poll that
+    # succeeded took zero iterations, and a plain 10 ms wait (two orders
+    # beyond an 80 us frame time) still read $00.  Accesses measured NOT
+    # to stand in for the RxEvent high-byte read: the RxEvent low byte
+    # alone, a PPTR write alone, PP $0000, PP $0400.  ($DE00/$DE01 on an
+    # RR-Net is the clockport register, not the chip's ISQ; the ISQ
+    # proper is PP $0120 -- see tests/test_cs8900a_fifo_live.py for
+    # -- measured: reading it does not present the next frame either.)
     # After SkipNow the next header likewise appears once RxEvent is
-    # polled.  The chip buffered exactly two ~100-byte frames; a third
-    # was dropped with RxMISS=1.  tests/test_cs8900a_fifo_live.py pins it.
+    # polled.  Buffering: the chip held up to three ~100-byte frames and
+    # keeps the NEWEST -- with 8 queued and no reader it handed back
+    # frames 6-8 and RxMISS counted 5 -- so a poller that falls behind
+    # loses the oldest unread frames, not the latest.  Every row above is
+    # pinned by tests/test_cs8900a_fifo_live.py.
     _emit_skip_packet(a)
 
 

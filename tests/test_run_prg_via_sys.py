@@ -516,7 +516,17 @@ def test_u64_config_failure_is_a_warning_not_an_error(monkeypatch, caplog):
 
 
 def test_vice_transport_never_touches_the_config():
-    """MockTransport has no client and is not a U64: no config traffic."""
-    t = _transport()
-    run_prg_via_sys(t, CC65_PRG)
-    assert not hasattr(t, "client")
+    """A non-U64 transport is left alone even when it carries a ``client``
+    that would accept the calls -- the backend check, not the attribute,
+    is the gate (a VICE transport must never see U64 config traffic)."""
+    t = _U64LikeTransport(screen_codes=_ready_screen(), client=_CartridgeClient())
+    run_prg_via_sys(t, CC65_PRG)          # _is_u64_target is False for a mock
+    assert t.client.puts == []
+
+
+def test_config_failure_warning_names_the_remedy(monkeypatch, caplog):
+    t = _u64_transport(monkeypatch, fail_get=True)
+    with caplog.at_level("WARNING", logger="c64_test_harness.execute"):
+        run_prg_via_sys(t, CC65_PRG)
+    msg = "\n".join(r.getMessage() for r in caplog.records)
+    assert "'Cartridge Preference', 'External'" in msg
