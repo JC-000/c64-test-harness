@@ -428,7 +428,7 @@ VICE warp accelerates TOD (it's virtual-CPU-clocked, not wall-clock-driven — s
 
 An RR-Net-compatible cartridge in the U64's expansion port is a real CS8900a at `$DE00` with the register map above (measured on U64E fw 3.15; the C64U is unverified). Five things differ from the two-VICE bridge, none of which a VICE test can fail on (issues #207–#212; `docs/bridge_networking.md` § "Real silicon diverges from VICE"):
 
-- **The port is invisible until `Cartridge Preference = External`** (`C64 and Cartridge Settings`). On the default `Auto` every byte of `$DE00-$DE0F` reads zero, exactly like an empty slot; `Bus Operation Mode` is irrelevant. Config PUTs are memory-only until `save_config_to_flash()`; set it per run and put `Auto` back in a `finally` as a courtesy — it does not revert by itself (the "reverts to Auto" folk claim was neighbouring lanes' own restores, retracted 2026-09-05).
+- **The port is invisible until `Cartridge Preference = External`** (`CARTRIDGE_SETTINGS_CATEGORY` / `CARTRIDGE_PREFERENCE_ITEM`, package-root constants since #221). On the default `Auto` every byte of `$DE00-$DE0F` reads zero, exactly like an empty slot; `Bus Operation Mode` is irrelevant. Config PUTs are memory-only until `save_config_to_flash()`; set it per run and put the original back in a `finally` as a courtesy — it does not revert by itself (the "reverts to Auto" folk claim was neighbouring lanes' own restores, retracted 2026-09-05). `snapshot_state`/`restore_state` carry the item, so a `snap = snapshot_state(client)` before and `restore_state(client, snap)` in the `finally` covers it along with turbo/REU/SID addressing.
 - **The only presence test is the CS8900a identity read, on the 6510: PPPtr = `$0000`, PPData == `$630E`** — what ip65's `init` does before it will initialise (`drivers/cs8900a.s`; `INIT DRIVER: FAILED` is that read failing). A host-side `read_memory` of the I/O window returns bytes unrelated to the cartridge and not reproducible (`0A` ×16 and `3C 00 00 00 …` have both been observed under the same stated conditions). A 6510 raw read of `$DE00` is not a test either: zeros on `Auto`, zeros after `client.run_prg()`, zeros with no cartridge, and the chip's registers (`FF FF …`) when it is working — non-zero but not self-describing (issues #209, #211).
 - **The firmware's runner load path deselects the cartridge** (#217, n=3/arm): `client.run_prg()` and `client.load_prg()` both leave the program seeing `$DE00` dead while the config still says `External` (stock ip65 prints `INIT DRIVER: FAILED`); the deselection survives every `reset()` and only a re-PUT of `Cartridge Preference` reselects it. Deselected PP `$0000` is not reliably zeros — only `!= $630E` means anything. Start PRGs with `run_prg_via_sys(target, prg)` — write to RAM + typed `SYS` + resume, with the re-PUT done for you on a U64 (`reselect_cartridge=False` opts out).
 - **Host-side `write_memory` never reaches the cartridge on hardware** (and host reads of the window are not meaningful), so `set_cs8900a_mac()` — which works under VICE — is a silent no-op here; program the MAC from the 6510 with `cs8900a_set_mac_inline_code(mac)`.
@@ -437,6 +437,7 @@ An RR-Net-compatible cartridge in the U64's expansion port is a real CS8900a at 
 
 ```python
 from c64_test_harness import (
+    CARTRIDGE_PREFERENCE_ITEM, CARTRIDGE_SETTINGS_CATEGORY, snapshot_state, restore_state,
     create_manager, run_subroutine, write_bytes, read_bytes, wait_for_text,
     build_arp_request_frame, build_echo_request_frame, build_ping_and_wait_tod_code,
     cs8900a_enable_inline_code, cs8900a_set_mac_inline_code, generate_mac, parse_mac,
@@ -451,7 +452,8 @@ ip_c64, ip_host = bytes([10, 0, 66, 200]), bytes([10, 0, 66, 1])
 with create_manager(backend="u64", u64_hosts="10.43.23.81") as mgr:
     with mgr.instance() as target:
         t, client = target.transport, target.client
-        client.set_config_item("C64 and Cartridge Settings", "Cartridge Preference", "External")
+        snap = snapshot_state(client)                        # carries Cartridge Preference (#221)
+        client.set_config_item(CARTRIDGE_SETTINGS_CATEGORY, CARTRIDGE_PREFERENCE_ITEM, "External")
         t.reset()                                            # run_subroutine needs READY.
         assert wait_for_text(t, "READY.", timeout=25.0, poll_interval=0.3, verbose=False)
 
@@ -485,7 +487,7 @@ with create_manager(backend="u64", u64_hosts="10.43.23.81") as mgr:
         run_subroutine(target, CODE, timeout=10.0)
         assert read_bytes(t, RESULT, 1) == b"\x01"
 
-        client.set_config_item("C64 and Cartridge Settings", "Cartridge Preference", "Auto")
+        restore_state(client, snap)                          # puts the preference back too
 ```
 
 Layout is the bridge layout (peek/consume unused here). **Leave ≥ 0.2 s between `ip65_init` and the first transmit, or run at 1 MHz.** The U64 throttles expansion-port cycles (a cartridge-I/O loop runs only 1.7× faster at 48 MHz than at 1 MHz) and the register interface holds up at 48 MHz — `$630E` identity and ip65's `INIT DRIVER: OK` both read fine there. The clock is *not* the variable behind flaky transmits: **stock ip65's cs8900a driver transmits too soon after its own reset.** A 2×2 (init clock × ping clock, 8 pings per arm, a gated build that pauses between init and ping — c64-wireguard, 2026-09-05) came back 40/40 at 48 MHz, init at 48 MHz included; the un-gated `pingstatic`, which goes init→transmit in microseconds, fails `$82 TRANSMIT_FAILED` about 4 in 5 at 48 MHz and never at 1 MHz. The shortest gap measured was a screen read plus a DMA write (~0.2–0.4 s); anything shorter is untested. The earlier "transmit is intermittent at 48 MHz" was true of `pingstatic` and false in general. Nothing has been filed upstream about ip65.
@@ -500,7 +502,7 @@ Layout is the bridge layout (peek/consume unused here). **Leave ≥ 0.2 s betwee
 
 2a. **Read the RX FIFO header high-half-first.** The RxStatus and RxLength words must be read from `$DE09` before `$DE08`; the data body is then read low-half-first. That is ip65's ordering. Getting it backwards desynchronises a real CS8900a by one byte — `RxLength` is garbage and every data word arrives byte-swapped — while VICE tolerates either order, so no VICE test can catch it (issue #210). `_emit_read_frame` does this for you; `tests/test_cs8900a_frame_reader.py` pins it.
 
-2b. **Hardware RR-Net on the U64 needs `Cartridge Preference = External`** (`client.set_config_item("C64 and Cartridge Settings", "Cartridge Preference", "External")`; on the default `Auto` the cartridge does not answer the `$630E` identity read and the raw `$DE00` bytes are not reproducible, `Bus Operation Mode` is irrelevant), and must NOT be started with `client.run_prg()` or `client.load_prg()` — the firmware's load path deselects the external cartridge, stickily across resets, until `Cartridge Preference` is PUT again (#217). Use `run_prg_via_sys(target, prg)` (resets, waits for `READY.`, writes the PRG to RAM, types the `SYS` parsed from its BASIC stub and resumes; `reset=False` / `sys_addr=` override). `set_cs8900a_mac()` works under VICE and is useless on hardware: a U64 host write to `$DE02`/`$DE04` never reaches the expansion port, so program the MAC from the 6510 with `cs8900a_set_mac_inline_code(mac)` (prepend `cs8900a_enable_inline_code()`) or the `cs8900a_set_mac_code(mac)` blob. And resolve before the first ping to a host — `arp_frame_buf=` on the ping builders, `my_mac=` on the responders (issues #209, #211, #212, #218). Full recipe: "Hardware RR-Net on the U64" above.
+2b. **Hardware RR-Net on the U64 needs `Cartridge Preference = External`** (`client.set_config_item(CARTRIDGE_SETTINGS_CATEGORY, CARTRIDGE_PREFERENCE_ITEM, "External")` — named constants since #221, and `snapshot_state`/`restore_state` put the item back; on the default `Auto` the cartridge does not answer the `$630E` identity read and the raw `$DE00` bytes are not reproducible, `Bus Operation Mode` is irrelevant), and must NOT be started with `client.run_prg()` or `client.load_prg()` — the firmware's load path deselects the external cartridge, stickily across resets, until `Cartridge Preference` is PUT again (#217). Use `run_prg_via_sys(target, prg)` (resets, waits for `READY.`, writes the PRG to RAM, types the `SYS` parsed from its BASIC stub and resumes; `reset=False` / `sys_addr=` override). `set_cs8900a_mac()` works under VICE and is useless on hardware: a U64 host write to `$DE02`/`$DE04` never reaches the expansion port, so program the MAC from the 6510 with `cs8900a_set_mac_inline_code(mac)` (prepend `cs8900a_enable_inline_code()`) or the `cs8900a_set_mac_code(mac)` blob. And resolve before the first ping to a host — `arp_frame_buf=` on the ping builders, `my_mac=` on the responders (issues #209, #211, #212, #218). Full recipe: "Hardware RR-Net on the U64" above.
 
 2c. **TxCMD is `$00C9` and the RxEvent poll mask is `$0D`, not `$C0`/`$01`.** Same read-only-register-number rule as RxCTL: `CS8900A_TXCMD_VALUE = 0x00C9` (TxStart-after-full-frame plus regnum 9) and `CS8900A_RXEVENT_MASK = 0x0D` (RxOK | IndividualAdr | Broadcast) are what ip65 writes and what every harness builder now emits (#213). Hand-rolled TX or poll code that still writes `$C0` / masks `$01` matches VICE and misses frames on silicon.
 
@@ -741,6 +743,34 @@ The U64 has NO CPU control (no `jsr()`, no registers, no breakpoints). To execut
 For a program that drives an external cartridge (RR-Net), neither `client.run_prg()` nor `set_cs8900a_mac()` works on hardware — see Pattern 8 § "Hardware RR-Net on the U64" for the `Cartridge Preference` / `run_prg_via_sys` / 6510-side MAC / ARP recipe.
 
 **All U64 access must use DeviceLock** for cross-process safety. Use `UnifiedManager` (automatic) or wrap with `DeviceLock` in pytest fixtures.
+
+### Known state on entry — reset, then assert (issue #227)
+
+Setup is verifiable, teardown is not. A killed run restores nothing; on a shared device the previous lane's turbo, REU size, SID map or `Cartridge Preference` is what you inherit, and a `snapshot_state`/`restore_state` in a `finally` cannot help the lane that never reached its `finally`. Opt in and the manager puts the device at the firmware's factory defaults **inside the `DeviceLock`, before you get the target**:
+
+```python
+from c64_test_harness import create_manager, apply_factory_baseline, U64BaselineError
+
+# env: U64_BASELINE_ON_ENTRY=1   (or HarnessConfig.u64_baseline_on_entry / [u64] baseline_on_entry = true)
+with create_manager(backend="u64", u64_hosts="10.43.23.81", baseline_on_entry=True) as mgr:
+    with mgr.instance() as target:       # acquire(): lock -> reset covered categories -> assert current == default
+        ...                              # build your state on top; restore_state on exit stays a courtesy
+
+# Scripts: the same step by hand, with the report.
+report = apply_factory_baseline(target.client)          # or dry_run=True to look without writing
+print(report.summary())                                 # "14 categories reset; 3 item(s) drifted before; 0 still off after"
+for cat, item in report.drifted_items():                # what the previous lane left behind (logged at INFO too)
+    print(cat, item, report.drifted[cat][item])         # (value_before, default)
+```
+
+Rules the implementation enforces, and why:
+
+- **Reset first, assert second.** `current != default` *before* the reset is the normal state of a shared device — that is the leak the step exists to remove — so it is logged per item as "inherited drift", never raised. `current != default` *after* the reset means the reset did not take (accepted, not applied — the #204 shape) and raises `U64BaselineError` naming category, item, current and default. Downstream tools that assert the baseline without performing the reset will refuse to run on a device in its ordinary shared state.
+- **The baseline is the firmware's `default`, per item, from the item map** (`get_config_item`, #214) — no harness-owned table, self-updating across firmware versions; a release that moves a default is a deliberate bench change. Items without a `default` key (preset/info types) are reported in `report.unasserted`, not compared.
+- **Per-category route only** (`PUT /v1/configs/<category>:reset_to_default`, `BASELINE_CATEGORIES`). **Never** the global `configs:reset_to_default`: it iterates *every* store — `Ethernet Settings` (a static-addressed device flips to DHCP and is stranded) and `Network Settings` (blanks the password, hostname, service flags) included. `BASELINE_EXCLUDED_CATEGORIES` is refused as an argument, so is any glob (the route is a pattern match; `*` is the global reset by another name). Categories the device does not list (the C64U's set differs) are skipped with a log line.
+- **Memory-only.** Flash is untouched; `load_config_from_flash` undoes it and a reboot reloads flash. The bench premise is flash == factory default — `tests/test_flash_baseline_live.py` (`FLASH_BASELINE_LIVE=1`) is the instrument; run it after every firmware flash.
+- **Inside the lock, or with the notice.** The manager path runs the reset after `DeviceLock` is taken; calling `apply_factory_baseline` on a bare client logs the #194 unlocked-client notice. No second mechanism.
+- Cost: one category GET + one reset PUT + one item GET per item per category (~150 items on the U64E); `tests/test_entry_baseline_live.py` records `apply_seconds`. Opt-in until two measurements land: whether any store's `effectuate()` pulses the C64 reset, and the C64U's WiFi store.
 
 ### Two device generations — detect via `get_info()`, don't assume
 

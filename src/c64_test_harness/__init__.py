@@ -124,6 +124,8 @@ from .backends.ultimate64_helpers import (
     CAT_ULTISID,
     CAT_AUDIO_MIXER,
     CAT_DATA_STREAMS,
+    CARTRIDGE_SETTINGS_CATEGORY,
+    CARTRIDGE_PREFERENCE_ITEM,
     get_data_streams_config,
     set_stream_destination,
     get_debug_stream_mode,
@@ -166,6 +168,15 @@ from .backends.device_lock import (
     warn_unlocked_client,
     REQUIRE_DEVICE_LOCK_ENV,
     UNLOCKED_WARNING_ENV,
+)
+from .backends.ultimate64_baseline import (
+    BASELINE_CATEGORIES,
+    BASELINE_EXCLUDED_CATEGORIES,
+    BASELINE_ON_ENTRY_ENV,
+    BaselineReport,
+    U64BaselineError,
+    apply_factory_baseline,
+    baseline_on_entry_enabled,
 )
 from .backends.unified_manager import (
     TestTarget,
@@ -569,6 +580,9 @@ __all__ = [
     "restore_state",
     "restore_config_items",
     "Ultimate64RestoreError",
+    # Cartridge Preference names (issue #221)
+    "CARTRIDGE_SETTINGS_CATEGORY",
+    "CARTRIDGE_PREFERENCE_ITEM",
     # Ultimate 64 instance management
     "Ultimate64Device",
     "Ultimate64Instance",
@@ -602,6 +616,14 @@ __all__ = [
     "BackendManager",
     "UnifiedManager",
     "create_manager",
+    # U64 reset-on-entry to factory default (issue #227)
+    "apply_factory_baseline",
+    "baseline_on_entry_enabled",
+    "BaselineReport",
+    "U64BaselineError",
+    "BASELINE_CATEGORIES",
+    "BASELINE_EXCLUDED_CATEGORIES",
+    "BASELINE_ON_ENTRY_ENV",
     # UCI network driver
     "UCI_IDENTIFIER",
     "UCI_DEVICE_REG",

@@ -100,6 +100,15 @@ class HarnessConfig:
     vice_ethernet_driver: str = ""
     vice_ethernet_base: int = 0xDE00
 
+    # Ultimate 64: reset the covered config categories to the firmware's
+    # factory defaults at run entry, inside the DeviceLock, then assert
+    # ``current == default`` per item (issue #227).  TOML
+    # ``[u64] baseline_on_entry = true``; env ``C64TEST_U64_BASELINE_ON_ENTRY``.
+    # Off by default -- no requests are made.  Wire it with
+    # ``UnifiedManager(..., baseline_on_entry=cfg.u64_baseline_on_entry)``;
+    # the manager also reads ``U64_BASELINE_ON_ENTRY`` when not given.
+    u64_baseline_on_entry: bool = False
+
     # Memory policy enforced at the transport boundary.  Default is
     # permissive (no checks) so existing configs see no behaviour
     # change; consumers opt in by declaring a ``[memory]`` section in

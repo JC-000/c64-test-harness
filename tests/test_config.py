@@ -85,6 +85,37 @@ class TestFromEnv:
         assert cfg.memory_policy.is_permissive()
 
 
+class TestU64BaselineOnEntry:
+    """Issue #227: the entry reset is opt-in through ``[u64]`` in TOML,
+    ``C64TEST_U64_BASELINE_ON_ENTRY`` in the environment, or the field."""
+
+    def test_default_is_off(self):
+        assert HarnessConfig().u64_baseline_on_entry is False
+
+    def test_toml_u64_section(self, tmp_path):
+        toml_file = tmp_path / "c64test.toml"
+        toml_file.write_bytes(b'backend = "u64"\n\n[u64]\nbaseline_on_entry = true\n')
+        try:
+            cfg = HarnessConfig.from_toml(toml_file)
+        except RuntimeError:
+            pytest.skip("TOML support not available (needs Python 3.11+ or tomli)")
+        assert cfg.backend == "u64"
+        assert cfg.u64_baseline_on_entry is True
+
+    def test_toml_without_the_section_stays_off(self, tmp_path):
+        toml_file = tmp_path / "c64test.toml"
+        toml_file.write_bytes(b'backend = "u64"\n')
+        try:
+            cfg = HarnessConfig.from_toml(toml_file)
+        except RuntimeError:
+            pytest.skip("TOML support not available (needs Python 3.11+ or tomli)")
+        assert cfg.u64_baseline_on_entry is False
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv("C64TEST_U64_BASELINE_ON_ENTRY", "1")
+        assert HarnessConfig.from_env().u64_baseline_on_entry is True
+
+
 class TestFromToml:
     def test_basic_toml(self, tmp_path):
         toml_content = b"""
