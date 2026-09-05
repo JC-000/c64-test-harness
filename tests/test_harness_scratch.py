@@ -221,8 +221,15 @@ class TestBoundsMatchCode:
                 load_addr=bp._DEFAULT_CONSUME_ADDR, rx_buf=0x8000,
                 my_ip=bytes(4), result_addr=0xC0FF,
             )),
+            # run_icmp_responder(my_mac=...) loads the ARP-answering variant
+            # at the same default address (#218).
+            len(bp.build_read_and_respond_echo_request_code(
+                load_addr=bp._DEFAULT_CONSUME_ADDR, rx_buf=0x8000,
+                my_ip=bytes(4), my_mac=bytes(6), result_addr=0xC0FF,
+            )),
         )
-        assert consume.length == largest  # tx 79, match 135, respond 349 (post-#213)
+        # tx 79, match 135, respond 349 (post-#213), respond+ARP 585 (#218)
+        assert consume.length == largest
 
     def test_reu_staging_window_matches_snapshot_constants(self) -> None:
         from c64_test_harness import snapshot as s
