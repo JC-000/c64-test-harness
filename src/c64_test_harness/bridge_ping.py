@@ -428,13 +428,57 @@ def build_udp_frame(
 # CS8900a initialisation blobs (same as tests/test_ethernet_bridge.py)
 # ---------------------------------------------------------------------------
 
-#: RxCTL value the live bridge path has always written.  What VICE's
-#: cs8900.c acts on is bit 7, PromiscuousA: with it set the receive filter
-#: (:594) accepts a broadcast without BroadcastA (0x0800), which the reset
-#: value 0x0005 lacks.  Kept at 0x00D8 rather than a datasheet-minimal
-#: 0x0905 so every harness routine programs the chip the one way that is
-#: verified live (tests/test_ethernet_bridge.py, run_ping_and_wait).
-CS8900A_RXCTL_VALUE = 0x00D8
+#: RxCTL (PP 0x0104): PromiscuousA | RxOKA | IndividualA | BroadcastA,
+#: plus the register's own number in the low 6 bits.
+#:
+#: On a real CS8900a the low 6 bits of every control/status register are
+#: **read-only and report the register's own number** -- measured reset
+#: values say so across the board (RxCTL 0x0005, LineCTL 0x0013, SelfCTL
+#: 0x0015, BusCTL 0x0017, BusST 0x0018).  So the harness's old 0x00D8 was
+#: never "RxCTL with flags": writing it reads back as **0x00C5**, with
+#: RxOKA (0x0100) absent, and without RxOKA the receiver accepts nothing.
+#: VICE's rawnetarch forces rx_ok internally, which is the only reason
+#: 0x00D8 ever appeared to work (issue #207).
+#:
+#: PromiscuousA is kept because the harness's own VICE bridge tests lean
+#: on it: ``ethernet.set_cs8900a_mac`` programs the Individual Address
+#: with host-side ``write_memory``, which under VICE lands in the RAM
+#: under the I/O window rather than in the chip, so IndividualA filtering
+#: cannot be relied on there.  ip65's ``cs8900a.s`` uses 0x0D05 -- the
+#: same value without PromiscuousA -- which is the right choice for a
+#: real driver on a busy segment, where promiscuous mode floods the RX
+#: FIFO with traffic the caller does not want.  Pass it explicitly to
+#: :func:`cs8900a_rxctl_inline_code` when that is what you want.
+CS8900A_RXCTL_VALUE = 0x0D85
+
+#: ip65's RxCTL value: the same thing without PromiscuousA, so the chip
+#: accepts only its own unicast plus broadcast.  That is the right choice
+#: for a real stack on a busy segment; the harness keeps promiscuous on by
+#: default because :func:`c64_test_harness.ethernet.set_cs8900a_mac`
+#: cannot reach the chip under VICE, so IndividualA filtering is not
+#: dependable in the bridge tests.  This is the one place the harness
+#: diverges from ip65 deliberately.
+CS8900A_RXCTL_VALUE_IP65 = 0x0D05
+
+#: TxCMD (PP 0x0108): "transmit after the whole frame is in the FIFO"
+#: (0x00C0) **plus the register's own number** in the low 6 bits, which is
+#: 0x09.  The harness wrote a bare 0x00C0 for years -- the same omission
+#: as the old RxCTL 0x00D8 (issue #207).  ip65 writes 0x00C9, and a real
+#: chip reads TxCMD back as 0x00C9.
+CS8900A_TXCMD_VALUE = 0x00C9
+
+#: Mask applied to the high byte of RxEvent (PP 0x0124) when polling for a
+#: received frame: RxOK (0x0100) | IndividualAdr (0x0400) | Broadcast
+#: (0x0800).  The harness used to mask 0x01, i.e. RxOK alone, so a frame
+#: the chip signalled without raising RxOK was invisible and the poll
+#: simply timed out with the reply sitting in the FIFO.  ip65 masks 0x0D.
+CS8900A_RXEVENT_MASK = 0x0D
+
+#: ip65's RxCTL value: RxOKA | IndividualA | BroadcastA + register number,
+#: i.e. :data:`CS8900A_RXCTL_VALUE` without PromiscuousA.  Accepts frames
+#: addressed to the programmed Individual Address plus broadcast, and
+#: nothing else.
+CS8900A_RXCTL_VALUE_IP65 = 0x0D05
 
 #: LineCTL bits that let the chip move frames at all: SerRxON (bit 6) and
 #: SerTxON (bit 7).  cs8900.c clears both on reset (:420-421) and sets them
@@ -459,12 +503,12 @@ def cs8900a_rxctl_inline_code(value: int = CS8900A_RXCTL_VALUE) -> bytes:
 
 
 def cs8900a_rxctl_code() -> bytes:
-    """RxCTL (PP 0x0104) = 0x00D8 (PromiscuousA set), then RTS.
+    """RxCTL (PP 0x0104) = :data:`CS8900A_RXCTL_VALUE`, then RTS.
 
-    Enables the RR clockport first, then programs the register.  The value
-    is VICE-verified only: RxOKA (0x0100) is *not* in 0x00D8, and a real
-    CS8900A programmed this way accepts nothing -- VICE's rawnetarch forces
-    rx_ok, which is why it works there.  See :data:`CS8900A_RXCTL_VALUE`.
+    Enables the RR clockport first, then programs the register.  Verified
+    live on both backends: the two-VICE bridge tests and a real CS8900a on
+    a U64E expansion-port cartridge, which reads the value straight back
+    (issue #207).
     """
     return cs8900a_rxctl_inline_code() + bytes([0x60])
 
@@ -496,6 +540,47 @@ def cs8900a_enable_inline_code() -> bytes:
     has initialised (the RR clockport is enabled as part of it).
     """
     return cs8900a_rxctl_inline_code() + cs8900a_linectl_or_inline_code()
+
+
+def cs8900a_set_mac_inline_code(mac: bytes) -> bytes:
+    """Program the Individual Address (PP 0x0158-0x015D) from the 6510, **no RTS**.
+
+    The 6502-side counterpart to
+    :func:`c64_test_harness.ethernet.set_cs8900a_mac`, which programs the
+    same registers with host-side ``write_memory``.  That host-side route
+    is **VICE-only**: on an Ultimate 64 a host write to ``$DE02``/``$DE04``
+    goes through the machine's DMA engine and never reaches the expansion
+    port, so on real hardware the MAC has to be written by code running on
+    the 6510 (issue #209).
+
+    Must follow a clockport enable -- prepend
+    :func:`cs8900a_enable_inline_code`, which does it as part of bringing
+    the chip up.
+
+    :param mac: 6 raw bytes, in wire order.
+    :raises ValueError: if *mac* is not exactly 6 bytes.
+    """
+    if len(mac) != 6:
+        raise ValueError(f"MAC must be 6 bytes, got {len(mac)}")
+    out = bytearray()
+    for i in range(3):
+        pp = 0x0158 + i * 2
+        out += bytes([
+            0xA9, pp & 0xFF, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8,
+            0xA9, pp >> 8, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8,
+            0xA9, mac[i * 2], 0x8D, PPDATA_LO & 0xFF, PPDATA_LO >> 8,
+            0xA9, mac[i * 2 + 1], 0x8D, PPDATA_HI & 0xFF, PPDATA_HI >> 8,
+        ])
+    return bytes(out)
+
+
+def cs8900a_set_mac_code(mac: bytes) -> bytes:
+    """Clockport enable + program the Individual Address, then RTS.
+
+    Callable-blob form of :func:`cs8900a_set_mac_inline_code`.
+    """
+    return (_clockport_enable_bytes() + cs8900a_set_mac_inline_code(mac)
+            + bytes([0x60]))
 
 
 def cs8900a_read_linectl_code(dest_addr: int) -> bytes:
@@ -541,7 +626,7 @@ def build_tx_code(
     a = Asm(org=load_addr)
     a.emit(0x78)  # SEI
     _emit_clockport_enable(a)
-    a.emit(0xA9, 0xC0, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
+    a.emit(0xA9, CS8900A_TXCMD_VALUE & 0xFF, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
     a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
     a.emit(0xA9, frame_len & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
     a.emit(0xA9, (frame_len >> 8) & 0xFF, 0x8D, TXLEN_HI & 0xFF, TXLEN_HI >> 8)
@@ -592,27 +677,36 @@ def _emit_read_frame(a: Asm, rx_buf: int) -> None:
     Preconditions:
       - a frame is waiting (RxEvent fired)
     Side effects:
-      - RxStatus stored at ZP $F1:$F2
-      - RxLength stored at ZP $F3:$F4
-      - Reads exactly _FIXED_RX_BYTES bytes (32 words) into rx_buf in
-        wire order.  This matches the working pattern in
-        tests/test_ethernet_bridge.py and avoids trusting RxLength
-        (VICE's TFE emulation has been observed to return bogus
-        RxLength on the first ICMP read with this caller pattern).
+      - Reads exactly _FIXED_RX_BYTES bytes into rx_buf in wire order.
+        The fixed-length read avoids trusting RxLength (VICE's TFE
+        emulation has been observed to return bogus RxLength on the
+        first ICMP read with this caller pattern).
+      - Zero page: only $FB/$FC (the destination pointer).
 
     The fixed-length read is sufficient because we only need to inspect
     the IP header (offset 14-33) and ICMP header (34-41), and ethernet
     frames are minimum 60 bytes anyway -- our test sends 60-byte frames.
+
+    **Half ordering is not free choice** (issue #210).  The two-byte
+    header words must be read HIGH half first; reading $DE08 before
+    $DE09 desynchronises a real CS8900a's FIFO by one byte, after which
+    RxLength is garbage and every data word arrives byte-swapped.  VICE's
+    emulation tolerates either order, which is why the bug survived until
+    the harness met real silicon.  This mirrors ip65's ``cs8900a.s``
+    exactly: high-half-first for the two header words, low-half-first for
+    the data body.  Measured against a byte-ramp payload on a U64E with an
+    external RR-Net cartridge; see issue #210 for the raw FIFO dumps.
+
+    Nothing is stored in $F1-$F4 any more.  It used to park RxStatus and
+    RxLength there, which is exactly where the TOD poll loop keeps its
+    deadline ($F2/$F3) and ones table ($F4) -- so every dropped frame
+    corrupted the deadline of the routine that read it (issue #208).
     """
-    # Read 4 status+length bytes (discarded) as separate byte reads.
-    a.emit(0xAD, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
-    a.emit(0x85, 0xF1)
-    a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
-    a.emit(0x85, 0xF2)
-    a.emit(0xAD, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
-    a.emit(0x85, 0xF3)
-    a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
-    a.emit(0x85, 0xF4)
+    # Header: RxStatus then RxLength, two words, HIGH half first.
+    # Both are discarded -- the body read is fixed-length.
+    for _ in range(2):
+        a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
+        a.emit(0xAD, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
 
     a.emit(0xA9, rx_buf & 0xFF, 0x85, 0xFB)
     a.emit(0xA9, (rx_buf >> 8) & 0xFF, 0x85, 0xFC)
@@ -626,8 +720,12 @@ def _emit_read_frame(a: Asm, rx_buf: int) -> None:
     a.emit(0xC8)
     a.emit(0xC0, _FIXED_RX_BYTES)
     a.branch(0xD0, "_rf_lp")
+
     # Skip the rest of the current packet so the CS8900a FIFO is
-    # advanced to the start of the next frame.
+    # advanced to the start of the next frame.  Always required: the FIFO
+    # does not roll on to the next frame by itself.  Measured on hardware
+    # -- one frame occupies exactly 4 header bytes + RxLength data bytes,
+    # and every read past that returns $00 until SkipNow is issued.
     _emit_skip_packet(a)
 
 
@@ -653,7 +751,7 @@ def _emit_poll_rx(
     a.emit(0xA9, outer & 0xFF, 0x85, 0xF2)
     a.label("_pr_lp")
     a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
-    a.emit(0x29, 0x01)
+    a.emit(0x29, CS8900A_RXEVENT_MASK)
     a.branch(0xD0, success_label)  # got frame
     a.emit(0xC6, 0xF0)
     a.branch(0xD0, "_pr_lp")
@@ -776,7 +874,7 @@ def build_ping_and_wait_code(
     _emit_clockport_enable(a)
 
     # --- TX the echo request ---
-    a.emit(0xA9, 0xC0, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
+    a.emit(0xA9, CS8900A_TXCMD_VALUE & 0xFF, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
     a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
     a.emit(0xA9, tx_frame_len & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
     a.emit(0xA9, (tx_frame_len >> 8) & 0xFF, 0x8D, TXLEN_HI & 0xFF, TXLEN_HI >> 8)
@@ -935,7 +1033,7 @@ def build_icmp_responder_code(
     a.label("ck_done")
 
     # Wait for TxRdy, then transmit fixed _FIXED_RX_BYTES from rx_buf
-    a.emit(0xA9, 0xC0, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
+    a.emit(0xA9, CS8900A_TXCMD_VALUE & 0xFF, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
     a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
     a.emit(0xA9, _FIXED_RX_BYTES & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
     a.emit(0xA9, 0x00, 0x8D, TXLEN_HI & 0xFF, TXLEN_HI >> 8)
@@ -1051,7 +1149,7 @@ def build_rx_peek_code(
 
     a.label("peek_loop")
     a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)  # LDA RxEvent hi
-    a.emit(0x29, 0x01)                               # AND #$01
+    a.emit(0x29, CS8900A_RXEVENT_MASK)                               # AND #$01
     a.branch(0xD0, "peek_hit")                       # BNE -> hit
 
     # 16-bit decrement of $F0/$F1
@@ -1209,7 +1307,7 @@ def build_read_and_respond_echo_request_code(
     a.label("_ck2_done")
 
     # Wait for TxRdy then TX _FIXED_RX_BYTES from rx_buf
-    a.emit(0xA9, 0xC0, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
+    a.emit(0xA9, CS8900A_TXCMD_VALUE & 0xFF, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
     a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
     a.emit(0xA9, _FIXED_RX_BYTES & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
     a.emit(0xA9, 0x00, 0x8D, TXLEN_HI & 0xFF, TXLEN_HI >> 8)
@@ -1535,7 +1633,7 @@ def _emit_tod_poll_rxevent(
     """
     a.label(poll_label)
     a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
-    a.emit(0x29, 0x01)
+    a.emit(0x29, CS8900A_RXEVENT_MASK)
     a.branch(0xD0, got_label)
 
     patch = _emit_tod_read_current(a, min_ok_label, done_label)
@@ -1739,7 +1837,7 @@ def build_ping_and_wait_tod_code(
     a.emit(0xA9, (deadline_tenths >> 8) & 0xFF, 0x85, _ZP_DEADLINE_HI)
 
     # --- TX the echo request (mirrors build_ping_and_wait_code) ---
-    a.emit(0xA9, 0xC0, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
+    a.emit(0xA9, CS8900A_TXCMD_VALUE & 0xFF, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
     a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
     a.emit(0xA9, tx_frame_len & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
     a.emit(0xA9, (tx_frame_len >> 8) & 0xFF, 0x8D, TXLEN_HI & 0xFF, TXLEN_HI >> 8)
@@ -1934,7 +2032,7 @@ def build_icmp_responder_tod_code(
     a.label("ck_done")
 
     # Wait TxRdy then TX _FIXED_RX_BYTES from rx_buf
-    a.emit(0xA9, 0xC0, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
+    a.emit(0xA9, CS8900A_TXCMD_VALUE & 0xFF, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
     a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
     a.emit(0xA9, _FIXED_RX_BYTES & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
     a.emit(0xA9, 0x00, 0x8D, TXLEN_HI & 0xFF, TXLEN_HI >> 8)

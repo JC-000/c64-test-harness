@@ -428,7 +428,11 @@ VICE warp accelerates TOD (it's virtual-CPU-clocked, not wall-clock-driven — s
 
 1. **Set `$DE01` bit 0 (clockport enable) before any CS8900a access.** Without it the chip silently drops every register read and write. All harness code builders and `set_cs8900a_mac()` do this automatically; only relevant if you hand-roll.
 
-2. **Initialize RxCTL + LineCTL before TX/RX.** Write `RxCTL` (PP `$0104` = `$00D8`) and enable `SerTxON | SerRxON` in `LineCTL` (PP `$0112 |= $00C0`). Without this the chip silently discards TX frames. `bridge_vice_pair` fixture does this; standalone setups must call it.
+2. **Initialize RxCTL + LineCTL before TX/RX.** Write `RxCTL` (PP `$0104` = `CS8900A_RXCTL_VALUE`, `$0D85`) and enable `SerTxON | SerRxON` in `LineCTL` (PP `$0112 |= $00C0`). Without this the chip silently discards TX frames. `bridge_vice_pair` fixture does this; standalone setups must call it. The old `$00D8` is wrong on real silicon — the low 6 bits are the read-only register number, so it reads back as `$00C5` with `RxOKA` missing and the receiver accepts nothing (issue #207). ip65 uses `$0D05`, the same value without PromiscuousA.
+
+2a. **Read the RX FIFO header high-half-first.** The RxStatus and RxLength words must be read from `$DE09` before `$DE08`; the data body is then read low-half-first. That is ip65's ordering. Getting it backwards desynchronises a real CS8900a by one byte — `RxLength` is garbage and every data word arrives byte-swapped — while VICE tolerates either order, so no VICE test can catch it (issue #210). `_emit_read_frame` does this for you; `tests/test_cs8900a_frame_reader.py` pins it.
+
+2b. **Hardware RR-Net on the U64 needs `Cartridge Preference = External`**, and must NOT be started with `client.run_prg()` — its DMA load drops the external cartridge, so the program reads `$DE00` as zeros. Use `run_prg_via_sys(target, prg)`. Also note `set_cs8900a_mac()` is VICE-only: host-side `write_memory` never reaches a hardware cartridge, so program the MAC from a 6502 routine (issues #209, #211).
 
 3. **VICE flag ordering.** `-ethernetioif` / `-ethernetiodriver` MUST come before `-ethernetcart` (VICE probes the interface on the cart flag; rejects if inaccessible). `ViceConfig` handles this.
 

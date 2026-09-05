@@ -367,10 +367,10 @@ HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
         configurable="code_addr= for the routine; buffers hardcoded",
     ),
     ScratchRegion(
-        0xC100, 0xC265,
+        0xC100, 0xC25D,
         owner="bridge_ping.run_ping_and_wait / run_icmp_responder",
         purpose="TX / echo-match / echo-respond routines (largest "
-                "357 bytes)",
+                "349 bytes)",
         configurable="consume_addr=",
     ),
     ScratchRegion(

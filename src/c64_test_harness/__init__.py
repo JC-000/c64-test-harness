@@ -54,6 +54,8 @@ from .execute import (
     delete_breakpoint,
     set_register,
     run_subroutine,
+    parse_basic_sys_address,
+    run_prg_via_sys,
 )
 from .disk import DiskImage, DiskFormat, FileType, DirEntry, DiskImageError
 from .backends.vice_binary import BinaryViceTransport
@@ -340,6 +342,8 @@ from .bridge_ping import (
     cs8900a_enable_inline_code,
     cs8900a_linectl_or_inline_code,
     cs8900a_rxctl_code,
+    cs8900a_set_mac_code,
+    cs8900a_set_mac_inline_code,
     cs8900a_rxctl_inline_code,
     cs8900a_write_linectl_code,
     EchoRequest,
@@ -554,6 +558,8 @@ __all__ = [
     "unmount",
     "run_prg_file",
     "load_prg_file",
+    "parse_basic_sys_address",
+    "run_prg_via_sys",
     "U64StateSnapshot",
     "snapshot_state",
     "restore_state",
@@ -687,6 +693,8 @@ __all__ = [
     "build_read_and_respond_echo_request_code",
     "build_bridge_tx_code",
     "cs8900a_rxctl_code",
+    "cs8900a_set_mac_code",
+    "cs8900a_set_mac_inline_code",
     "cs8900a_read_linectl_code",
     "cs8900a_write_linectl_code",
     "cs8900a_enable_inline_code",

@@ -24,6 +24,7 @@ from bridge_platform import (
     IFACE_B,
     probe_vice_pcap_ok,
 )
+from c64_test_harness.bridge_ping import CS8900A_RXCTL_VALUE
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 from c64_test_harness.backends.vice_manager import PortAllocator
@@ -140,12 +141,15 @@ def _init_cs8900a(transport: BinaryViceTransport) -> None:
     to the TAP interface.  validate_ping.py does this; our earlier version
     did not, which is why TX frames weren't reaching the bridge.
     """
-    # Step 1: RxCTL (PP 0x0104) = 0x00D8  (promiscuous + RxOK)
+    # Step 1: RxCTL (PP 0x0104) = CS8900A_RXCTL_VALUE.  Not a literal:
+    # real silicon reports the register number in the low 6 bits, so the
+    # old 0x00D8 read back as 0x00C5 with RxOKA missing (issue #207).
     pp_write_code = _clockport_enable() + bytes([
         0xA9, 0x04, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8,        # PPPtr = 0x0104
         0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8,
-        0xA9, 0xD8, 0x8D, PPDATA_LO & 0xFF, PPDATA_LO >> 8,     # PPData = 0x00D8
-        0xA9, 0x00, 0x8D, PPDATA_HI & 0xFF, PPDATA_HI >> 8,
+        0xA9, CS8900A_RXCTL_VALUE & 0xFF, 0x8D, PPDATA_LO & 0xFF, PPDATA_LO >> 8,
+        0xA9, (CS8900A_RXCTL_VALUE >> 8) & 0xFF,
+        0x8D, PPDATA_HI & 0xFF, PPDATA_HI >> 8,
         0x60,
     ])
     load_code(transport, CODE, pp_write_code)
@@ -311,16 +315,21 @@ def _build_rx_code(
 
     # --- got_frame: read RxStatus + RxLength ---
     a.label("rxg")
-    # RxStatus (2 bytes) -- store at RX_META+0/+1
-    a.emit(0xAD, RTDATA_LO & 0xFF, RTDATA_LO >> 8)  # LDA $DE00 (RxStatus lo)
-    a.emit(0x8D, RX_META & 0xFF, (RX_META >> 8) & 0xFF)
-    a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8)  # LDA $DE01 (RxStatus hi)
+    # RxStatus (2 bytes) -- store at RX_META+0/+1.
+    # HIGH half read first: on real silicon reading $DE08 before $DE09
+    # desynchronises the FIFO by one byte (issue #210).  VICE tolerates
+    # either order, so this file could keep the old one and still pass --
+    # it matches ip65 and bridge_ping._emit_read_frame instead, because
+    # CLAUDE.md points agents here as a reference pattern.
+    a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8)  # LDA $DE09 (RxStatus hi)
     a.emit(0x8D, (RX_META + 1) & 0xFF, ((RX_META + 1) >> 8) & 0xFF)
+    a.emit(0xAD, RTDATA_LO & 0xFF, RTDATA_LO >> 8)  # LDA $DE08 (RxStatus lo)
+    a.emit(0x8D, RX_META & 0xFF, (RX_META >> 8) & 0xFF)
     # RxLength (2 bytes) -- store at RX_META+2/+3
-    a.emit(0xAD, RTDATA_LO & 0xFF, RTDATA_LO >> 8)  # LDA $DE00 (RxLength lo)
-    a.emit(0x8D, (RX_META + 2) & 0xFF, ((RX_META + 2) >> 8) & 0xFF)
-    a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8)  # LDA $DE01 (RxLength hi)
+    a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8)  # LDA $DE09 (RxLength hi)
     a.emit(0x8D, (RX_META + 3) & 0xFF, ((RX_META + 3) >> 8) & 0xFF)
+    a.emit(0xAD, RTDATA_LO & 0xFF, RTDATA_LO >> 8)  # LDA $DE08 (RxLength lo)
+    a.emit(0x8D, (RX_META + 2) & 0xFF, ((RX_META + 2) >> 8) & 0xFF)
 
     # Skip dest MAC: 3 word reads (6 bytes, discard)
     a.emit(0xA2, 0x03)  # LDX #3

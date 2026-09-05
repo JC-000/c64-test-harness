@@ -401,12 +401,14 @@ def rx_routine() -> bytes:
         0xA9, 0xFF, 0x8D, RESULT & 0xFF, RESULT >> 8, 0x60,
 
         # .got_packet:
-        # Read RxStatus (2 bytes, discard) -- from RTDATA
-        0xAD, rtd_lo, 0xDE,
+        # Read RxStatus (2 bytes, discard) -- from RTDATA.
+        # HIGH half first: reading $DE08 before $DE09 desynchronises a real
+        # CS8900a's FIFO by one byte (issue #210).  VICE tolerates either.
         0xAD, rtd_h_lo, 0xDE,
+        0xAD, rtd_lo, 0xDE,
         # Read RxLength (2 bytes, discard)
-        0xAD, rtd_lo, 0xDE,
         0xAD, rtd_h_lo, 0xDE,
+        0xAD, rtd_lo, 0xDE,
 
         # Skip ethernet header: 14 bytes = 7 word reads
         0xA2, 0x07,

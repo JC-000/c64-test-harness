@@ -770,3 +770,102 @@ def _run_subroutine_u64(
         sleep_for = min(poll_cadence, max(deadline - now, 0.0))
         if sleep_for > 0:
             time.sleep(sleep_for)
+
+
+# ---------------------------------------------------------------------------
+# Starting a PRG without losing the expansion port (issue #211)
+# ---------------------------------------------------------------------------
+
+#: BASIC token for ``SYS``.
+_BASIC_TOKEN_SYS = 0x9E
+
+
+def parse_basic_sys_address(prg: bytes) -> int | None:
+    """Return the address a PRG's BASIC stub ``SYS``es to, or ``None``.
+
+    Scans the BASIC line for the ``SYS`` token (``$9E``) and reads the
+    decimal digits that follow it, which is the shape cc65 and most
+    assemblers emit (``10 SYS2061``).
+    """
+    body = prg[2:]
+    idx = body.find(bytes([_BASIC_TOKEN_SYS]))
+    if idx < 0:
+        return None
+    digits = ""
+    for byte in body[idx + 1:]:
+        ch = chr(byte)
+        if ch == " " and not digits:
+            continue
+        if ch.isdigit():
+            digits += ch
+        else:
+            break
+    return int(digits) if digits else None
+
+
+def run_prg_via_sys(
+    target: Any,
+    prg: bytes,
+    *,
+    sys_addr: int | None = None,
+    reset: bool = True,
+    boot_timeout: float = 25.0,
+) -> int:
+    """Load *prg* into RAM and start it with a ``SYS`` typed at BASIC.
+
+    The reason this exists rather than
+    :meth:`~.ultimate64_client.Ultimate64Client.run_prg`: on the U64,
+    ``run_prg``'s DMA-load path **drops an external cartridge**.  A program
+    it loads sees the whole ``$DE00`` I/O window as zeros even while
+    ``Cartridge Preference`` still reads ``External``, so anything driving
+    a cartridge — an RR-Net, most obviously — fails at its first register
+    read.  Stock ip65 reports ``INIT DRIVER: FAILED`` that way.  Writing
+    the program into RAM and typing ``SYS`` keeps the cartridge on the bus
+    (issue #211).
+
+    Works on either backend: it is only ``write_memory`` plus keystrokes.
+
+    :param target: A ``TestTarget`` or a bare transport.
+    :param prg: Raw PRG bytes, including the two-byte load address.
+    :param sys_addr: Entry point.  Defaults to the address parsed out of
+        the PRG's own BASIC stub via :func:`parse_basic_sys_address`.
+    :param reset: Reset and wait for ``READY.`` first.  Pass ``False`` if
+        the machine is already at a BASIC prompt.
+    :param boot_timeout: Seconds to wait for ``READY.`` after the reset.
+    :returns: The SYS address used.
+    :raises ValueError: if *prg* is too short, or no entry point was given
+        and none could be parsed from the stub.
+    :raises TimeoutError: if the machine never reaches ``READY.``.
+    """
+    from .keyboard import send_text
+    from .memory import write_bytes
+    from .screen import wait_for_text
+
+    if len(prg) < 3:
+        raise ValueError(f"PRG too short to contain a load address: {len(prg)} bytes")
+
+    transport = getattr(target, "transport", target)
+
+    if sys_addr is None:
+        sys_addr = parse_basic_sys_address(prg)
+        if sys_addr is None:
+            raise ValueError(
+                "no SYS token found in the PRG's BASIC stub; pass sys_addr="
+                "<entry point> explicitly"
+            )
+
+    if reset:
+        transport.reset()
+        if wait_for_text(
+            transport, "READY.", timeout=boot_timeout, poll_interval=0.3,
+            verbose=False,
+        ) is None:
+            raise TimeoutError(
+                f"machine did not reach READY. within {boot_timeout}s; "
+                "cannot type SYS"
+            )
+
+    load_addr = prg[0] | (prg[1] << 8)
+    write_bytes(transport, load_addr, prg[2:])
+    send_text(transport, f"SYS{sys_addr}\r")
+    return sys_addr

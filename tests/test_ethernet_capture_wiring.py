@@ -318,17 +318,22 @@ def test_rx_scenario_rejects_a_wrong_marker():
 # frame before rawnet_arch_transmit.  RX: :1060 `if (!rx_enabled)` means RxOK
 # never appears, and reset RxCTL 0x0005 lacks BroadcastA; :594 accepts a
 # broadcast only when promiscuous.  bridge_ping.py and test_ethernet_bridge.py
-# already write RxCTL=0x00D8 and OR 0x00C0 into LineCTL; these routines must
-# too, and before the first TX command / RxEvent poll.
+# already write RxCTL and OR 0x00C0 into LineCTL; these routines must too,
+# and before the first TX command / RxEvent poll.
 
+from c64_test_harness.bridge_ping import CS8900A_RXCTL_VALUE  # noqa: E402
 from ethernet_scenarios import rx_routine, tx_routine  # noqa: E402
 
 _PPTR_LO, _PPTR_HI, _PPDATA_LO, _PPDATA_HI = 0x02, 0x03, 0x04, 0x05
-# PPPtr = 0x0104 (RxCTL); PPData = 0x00D8 (PromiscuousA + the value the live
-# bridge path uses).
+# PPPtr = 0x0104 (RxCTL); PPData = CS8900A_RXCTL_VALUE.  Derived from the
+# constant rather than pinned as a literal: the value is a property of the
+# chip (issue #207 corrected it from 0x00D8, which real silicon reads back
+# as 0x00C5 with RxOKA missing), while what these tests are actually about
+# is that the write happens *before* the first TX command / RxEvent poll.
 RXCTL_WRITE = bytes([
     0xA9, 0x04, 0x8D, _PPTR_LO, 0xDE, 0xA9, 0x01, 0x8D, _PPTR_HI, 0xDE,
-    0xA9, 0xD8, 0x8D, _PPDATA_LO, 0xDE, 0xA9, 0x00, 0x8D, _PPDATA_HI, 0xDE,
+    0xA9, CS8900A_RXCTL_VALUE & 0xFF, 0x8D, _PPDATA_LO, 0xDE,
+    0xA9, (CS8900A_RXCTL_VALUE >> 8) & 0xFF, 0x8D, _PPDATA_HI, 0xDE,
 ])
 # PPPtr = 0x0112 (LineCTL); PPData lo |= 0xC0 (SerRxON | SerTxON), read-OR-write
 # so the other LineCTL bits survive.
@@ -348,7 +353,7 @@ def _index(hay: bytes, needle: bytes, what: str) -> int:
 
 def test_tx_routine_enables_the_chip_before_the_first_tx_command():
     code = tx_routine()
-    rxctl = _index(code, RXCTL_WRITE, "RxCTL=0x00D8 write")
+    rxctl = _index(code, RXCTL_WRITE, "RxCTL write")
     linectl = _index(code, LINECTL_OR_C0, "LineCTL |= 0x00C0 write-back")
     txcmd = _index(code, STA_TXCMD_LO, "STA TXCMD")
     assert rxctl < txcmd and linectl < txcmd, (
@@ -358,7 +363,7 @@ def test_tx_routine_enables_the_chip_before_the_first_tx_command():
 
 def test_rx_routine_enables_the_chip_before_polling_rxevent():
     code = rx_routine()
-    rxctl = _index(code, RXCTL_WRITE, "RxCTL=0x00D8 write")
+    rxctl = _index(code, RXCTL_WRITE, "RxCTL write")
     linectl = _index(code, LINECTL_OR_C0, "LineCTL |= 0x00C0 write-back")
     poll = _index(code, LDA_RXEVENT_PTR, "PPPtr = RxEvent")
     assert rxctl < poll and linectl < poll, (
