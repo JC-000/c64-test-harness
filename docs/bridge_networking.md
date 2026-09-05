@@ -794,7 +794,13 @@ Two more hardware-only facts, from issues #209, #211 and #217:
   does -- exactly ip65's poll sequence; reading the ISQ (PP `$0120`)
   does not present it either (3/3).  The chip holds up to **three**
   100-byte frames and keeps the **newest** (8 queued -> frames 6, 7, 8
-  delivered, RxMISS 5; n=2 per depth).  An earlier "buffers two, third
+  delivered, RxMISS 5; n=2 per depth).  "Three" is a ceiling for
+  100-byte frames injected 50 ms apart, not a property of the chip: at
+  4 queued one trial kept two, so the effective depth depends on where
+  the injection cadence lands in the chip's overwrite bookkeeping, and
+  the receive buffer is far larger than three such frames in bytes --
+  what is measured is event/frame bookkeeping, not RAM.  The live test
+  admits k in {2, 3} at 8 queued by design.  An earlier "buffers two, third
   dropped" reading was a leftover half-read frame behind a blind
   SkipNow drain, retracted on #219.  `_emit_read_frame` keeps its skip
   because its fixed 60-byte body read is a partial read.  Live:
