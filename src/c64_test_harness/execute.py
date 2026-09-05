@@ -777,7 +777,7 @@ def _run_subroutine_u64(
 
 
 # ---------------------------------------------------------------------------
-# Starting a PRG without losing the expansion port (issue #211)
+# Starting a PRG without losing the expansion port (issues #211, #217)
 # ---------------------------------------------------------------------------
 
 #: BASIC tokens for ``SYS`` and ``REM``.

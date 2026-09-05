@@ -745,21 +745,23 @@ not a bare `0x00C0`), and the RxEvent poll masks `CS8900A_RXEVENT_MASK` =
 
 ### Driving a cartridge on the U64
 
-Two more hardware-only facts, both in issues #209 and #211:
+Two more hardware-only facts, from issues #209, #211 and #217:
 
 * The cartridge is invisible unless `C64 and Cartridge Settings` ->
   **`Cartridge Preference` = `External`**.  On the default `Auto` the
-  whole `$DE00` window reads as zeros, which looks exactly like an empty
-  expansion port.  `Bus Operation Mode` is irrelevant.  **Raw `$DE00`
+  cartridge does not answer the identity read, which looks exactly like
+  an empty expansion port.  `Bus Operation Mode` is irrelevant.  **Raw `$DE00`
   bytes are not a presence test from either side.**  A host-side
   `read_memory` of the I/O window returns bytes that do not depend on the
   cartridge and are not reproducible -- three observers reported three
   different patterns for the same physical cartridge under the same
-  stated conditions (item 3 above).  A 6510 read gives zeros with
-  `Preference = Auto`, zeros after `client.run_prg()`, zeros with no
-  cartridge, and the CS8900a's registers (`FF FF` at `$DE00/$DE01`, then
-  PPPtr/PPData residue; measured 2026-09-04) with a working one -- so
-  "non-zero" is not "present" either.  The only valid test is the one
+  stated conditions (item 3 above).  A 6510 read is no better as a raw
+  byte pattern: zeros were seen with `Preference = Auto` and with no
+  cartridge, but a deselected cartridge after `client.run_prg()` gave
+  `fb fb`, `06 fb`, `7c 00`, `ff ff` and `06 60` at PP `$0000` across
+  runs (#217), and a working one shows the CS8900a's registers (`FF FF`
+  at `$DE00/$DE01`, then PPPtr/PPData residue; measured 2026-09-04) --
+  so neither "zeros" nor "non-zero" means anything.  The only valid test is the one
   ip65's `eth_init` performs (`drivers/cs8900a.s:133-137`): clockport
   enable, `PPPtr = $0000`, `PPData == $630E`, executed **on the 6510**.
 * **Do not start the program with `client.run_prg()`** -- the firmware's
@@ -794,8 +796,12 @@ Two more hardware-only facts, both in issues #209 and #211:
 * **Resolve before the first exchange with a host: pass the ARP frame,
   or use the responder, which now answers ARP (issue #218).**  Until #218
   the harness's ping routines neither sent nor answered ARP, and macOS
-  keeps a stale neighbour entry visible in `arp -n` while queuing every
-  reply behind revalidation -- so a routine that only pinged got 0/8 with
+  holds every reply while it has no *complete* neighbour entry for the
+  C64 (its own ARP request goes unanswered and the entry sits
+  `incomplete`; entry absent 0/8, entry present 8/8 -- #218 paired
+  rounds; the "stale entry behind revalidation" case is inferred, not
+  measured, because the `arp -S` control needs root) -- so a routine
+  that only pinged got 0/8 with
   the requests visibly leaving the wire and the replies still sitting on
   the host, and 6/6 once an ARP request preceded the ping (issue #212,
   closed invalid: it was never a chip fault).  ip65 is immune because

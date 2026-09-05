@@ -272,7 +272,12 @@ and raises `Ultimate64RestoreError` at the end. (The *write* paths keep
 `set_config_items` on purpose — `set_reu()` relies on a rejected
 `Cartridge` write aborting before the REU is half-enabled.)
 
-All of it is packaged:
+All of it is packaged. `isolated_sid_addressing()` reads the whole
+address map back after writing it and raises `Ultimate64Error` on any
+slot that did not take (hardware-verified in #204: with mirroring off a
+two-slot map decodes distinctly, 27/27; with it on the stock map
+aliases). A mocked client whose category read does not reflect writes
+will now raise rather than report a clean run.
 
 ```python
 from c64_test_harness import isolated_sid_addressing, SidSlot

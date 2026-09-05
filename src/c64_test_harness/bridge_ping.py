@@ -439,10 +439,12 @@ def build_udp_frame(
 # ARP (RFC 826) frame builders and parser -- issue #218
 #
 # The 6502 routines below neither sent nor answered ARP until #218.  On a
-# macOS host that costs every echo reply: the host keeps a stale neighbour
-# entry and queues the replies behind revalidation, so a pinger that never
-# ARPs gets 0/8 with the requests visibly leaving the wire, and 6/6 once one
-# ARP request precedes the ping (issue #212).  ip65 does both -- ``icmp_ping``
+# macOS host that costs every echo reply: with no complete neighbour entry
+# for the C64 the host holds the replies (its own ARP request unanswered,
+# entry "incomplete"; absent 0/8, present 8/8 -- #218 rounds), so a pinger
+# that never ARPs gets 0/8 with the requests visibly leaving the wire, and
+# 6/6 once one ARP request precedes the ping (issue #212).  The stale-entry
+# revalidation case is inferred, not measured.  ip65 does both -- ``icmp_ping``
 # resolves first (``ip65/arp.s`` ``arp_lookup``) and ``arp_process`` answers
 # requests for its own address -- and is immune.  These helpers build the
 # frames the 6502 side transmits and parse the ones it receives; the field
