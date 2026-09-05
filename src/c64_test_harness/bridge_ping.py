@@ -773,6 +773,57 @@ def cs8900a_write_linectl_code(lo_value: int, hi_value: int) -> bytes:
 # 6502 code builders
 # ---------------------------------------------------------------------------
 
+def _emit_tx_frame(a: Asm, frame_buf: int, frame_len: int, prefix: str) -> None:
+    """Emit the CS8900a TX handshake for ``frame_len`` bytes at ``frame_buf``.
+
+    TxCMD = :data:`CS8900A_TXCMD_VALUE`, TxLength = ``frame_len``, PPPtr =
+    BusST (0x0138), poll ``Rdy4TxNOW``, then copy the frame into RTDATA
+    low half first through ``($FB),Y``.  This is the one TX sequence every
+    builder emits; ``prefix`` keeps the two labels unique in a routine that
+    transmits more than once (ARP request then echo request, or ARP reply
+    then echo reply -- issue #218).  ``frame_len`` must be even and at
+    most 256: the copy loop counts in Y.
+    """
+    a.emit(0xA9, CS8900A_TXCMD_VALUE & 0xFF, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
+    a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
+    a.emit(0xA9, frame_len & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
+    a.emit(0xA9, (frame_len >> 8) & 0xFF, 0x8D, TXLEN_HI & 0xFF, TXLEN_HI >> 8)
+    a.emit(0xA9, 0x38, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
+    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
+    a.label(f"{prefix}_txw")
+    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
+    a.emit(0x29, 0x01)
+    a.branch(0xF0, f"{prefix}_txw")
+    a.emit(0xA9, frame_buf & 0xFF, 0x85, 0xFB)
+    a.emit(0xA9, (frame_buf >> 8) & 0xFF, 0x85, 0xFC)
+    a.emit(0xA0, 0x00)
+    a.label(f"{prefix}_txlp")
+    a.emit(0xB1, 0xFB)
+    a.emit(0x8D, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
+    a.emit(0xC8)
+    a.emit(0xB1, 0xFB)
+    a.emit(0x8D, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
+    a.emit(0xC8)
+    a.emit(0xC0, frame_len & 0xFF)
+    a.branch(0xD0, f"{prefix}_txlp")
+
+
+def _resolve_arp_frame(
+    arp_frame_buf: int | None, arp_frame_len: int | None,
+) -> tuple[int, int] | None:
+    """``(buf, len)`` for the optional ARP-first transmit, or ``None``.
+
+    ``arp_frame_len`` defaults to :data:`ARP_FRAME_LEN`, what
+    :func:`build_arp_request_frame` returns; giving a length without a
+    buffer is a caller mistake, not a silent no-op.
+    """
+    if arp_frame_buf is None:
+        if arp_frame_len is not None:
+            raise ValueError("arp_frame_len given without arp_frame_buf")
+        return None
+    return arp_frame_buf, (ARP_FRAME_LEN if arp_frame_len is None else arp_frame_len)
+
+
 def build_tx_code(
     load_addr: int,
     frame_buf: int,
@@ -786,28 +837,7 @@ def build_tx_code(
     a = Asm(org=load_addr)
     a.emit(0x78)  # SEI
     _emit_clockport_enable(a)
-    a.emit(0xA9, CS8900A_TXCMD_VALUE & 0xFF, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
-    a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
-    a.emit(0xA9, frame_len & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
-    a.emit(0xA9, (frame_len >> 8) & 0xFF, 0x8D, TXLEN_HI & 0xFF, TXLEN_HI >> 8)
-    a.emit(0xA9, 0x38, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
-    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
-    a.label("tw")
-    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
-    a.emit(0x29, 0x01)
-    a.branch(0xF0, "tw")
-    a.emit(0xA9, frame_buf & 0xFF, 0x85, 0xFB)
-    a.emit(0xA9, (frame_buf >> 8) & 0xFF, 0x85, 0xFC)
-    a.emit(0xA0, 0x00)
-    a.label("tl")
-    a.emit(0xB1, 0xFB)
-    a.emit(0x8D, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
-    a.emit(0xC8)
-    a.emit(0xB1, 0xFB)
-    a.emit(0x8D, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
-    a.emit(0xC8)
-    a.emit(0xC0, frame_len & 0xFF)
-    a.branch(0xD0, "tl")
+    _emit_tx_frame(a, frame_buf, frame_len, "tx")
     a.emit(0xA9, 0x01, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
     a.emit(0x58)
     a.emit(0x60)
@@ -1006,6 +1036,9 @@ def build_ping_and_wait_code(
     result_addr: int,
     identifier: int,
     sequence: int,
+    *,
+    arp_frame_buf: int | None = None,
+    arp_frame_len: int | None = None,
 ) -> bytes:
     """Build a 6502 routine that TXes an echo request and waits for the reply.
 
@@ -1014,6 +1047,14 @@ def build_ping_and_wait_code(
     because while the binary monitor is paused (between JSRs) the CS8900a
     may not pump TAP frames reliably, so TX and RX must happen without
     a CPU pause in between.
+
+    ``arp_frame_buf`` (issue #218): address of a pre-built ARP request
+    (:func:`build_arp_request_frame`; ``arp_frame_len`` defaults to its
+    :data:`ARP_FRAME_LEN`).  When given, the routine transmits it *before*
+    the echo request, in the same run, so a host whose neighbour cache is
+    stale answers the ping instead of queuing the reply (issue #212).  The
+    ARP reply that comes back is drained like any other non-matching frame.
+    Without it the output is byte-identical to the pre-#218 routine.
 
     .. note::
 
@@ -1030,6 +1071,7 @@ def build_ping_and_wait_code(
         deadline, correct on real C64 / U64E / VICE normal), see
         :func:`build_ping_and_wait_tod_code`.
     """
+    arp = _resolve_arp_frame(arp_frame_buf, arp_frame_len)
     id_hi = (identifier >> 8) & 0xFF
     id_lo = identifier & 0xFF
     seq_hi = (sequence >> 8) & 0xFF
@@ -1039,29 +1081,10 @@ def build_ping_and_wait_code(
     a.emit(0x78)  # SEI
     _emit_clockport_enable(a)
 
-    # --- TX the echo request ---
-    a.emit(0xA9, CS8900A_TXCMD_VALUE & 0xFF, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
-    a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
-    a.emit(0xA9, tx_frame_len & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
-    a.emit(0xA9, (tx_frame_len >> 8) & 0xFF, 0x8D, TXLEN_HI & 0xFF, TXLEN_HI >> 8)
-    a.emit(0xA9, 0x38, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
-    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
-    a.label("pw_txw")
-    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
-    a.emit(0x29, 0x01)
-    a.branch(0xF0, "pw_txw")
-    a.emit(0xA9, tx_frame_buf & 0xFF, 0x85, 0xFB)
-    a.emit(0xA9, (tx_frame_buf >> 8) & 0xFF, 0x85, 0xFC)
-    a.emit(0xA0, 0x00)
-    a.label("pw_txlp")
-    a.emit(0xB1, 0xFB)
-    a.emit(0x8D, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
-    a.emit(0xC8)
-    a.emit(0xB1, 0xFB)
-    a.emit(0x8D, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
-    a.emit(0xC8)
-    a.emit(0xC0, tx_frame_len & 0xFF)
-    a.branch(0xD0, "pw_txlp")
+    # --- TX the ARP request first if asked to (issue #218), then the echo ---
+    if arp is not None:
+        _emit_tx_frame(a, arp[0], arp[1], "arp")
+    _emit_tx_frame(a, tx_frame_buf, tx_frame_len, "pw")
 
     # --- Now poll for the reply (same as build_rx_echo_reply_code body) ---
     a.label("reset")
@@ -1532,6 +1555,7 @@ def run_ping_and_wait(
     timeout_s: float = 5.0,
     peek_addr: int = _DEFAULT_PEEK_ADDR,
     consume_addr: int = _DEFAULT_CONSUME_ADDR,
+    arp: bool = True,
 ) -> int:
     """Transmit an echo request, then poll for a matching reply.
 
@@ -1539,6 +1563,14 @@ def run_ping_and_wait(
     ``poll_until_ready`` -> ``read_and_match_echo_reply`` -> on mismatch,
     re-poll; on match, return ``0x01``; on wall-clock timeout, return
     ``0xFF``.
+
+    With ``arp=True`` (the default; issue #218) an ARP request for the
+    echo's destination IP -- built from ``tx_frame``'s own source MAC,
+    source IP and destination IP -- is transmitted first, through the same
+    ``tx_frame_buf`` and TX routine.  That is what ip65's ``icmp_ping``
+    does and what a macOS peer needs before it will deliver replies
+    (issue #212).  The ARP reply is consumed as a non-matching frame.
+    ``tx_frame`` must be IPv4 for this; pass ``arp=False`` to send it raw.
 
     The wall-clock budget is owned by Python via
     :func:`c64_test_harness.poll_until.poll_until_ready`, so this works
@@ -1552,19 +1584,33 @@ def run_ping_and_wait(
     from .memory import read_bytes, write_bytes
     from .poll_until import poll_until_ready
 
-    tx_code = build_tx_code(
-        load_addr=consume_addr,
-        frame_buf=tx_frame_buf,
-        frame_len=len(tx_frame),
-        result_addr=result_addr,
-    )
-    load_code(transport, consume_addr, tx_code)
-    write_bytes(transport, tx_frame_buf, tx_frame)
-    write_bytes(transport, result_addr, [0x00])
-    jsr(transport, consume_addr, timeout=5.0)
-    tx_result = read_bytes(transport, result_addr, 1)[0]
-    if tx_result != 0x01:
-        return tx_result
+    frames = []
+    if arp:
+        if tx_frame[12:14] != b"\x08\x00":
+            raise ValueError(
+                "run_ping_and_wait(arp=True) needs an IPv4 tx_frame to derive the "
+                f"ARP request from; ethertype is {tx_frame[12:14].hex()} "
+                "(pass arp=False to transmit it as-is)"
+            )
+        frames.append(build_arp_request_frame(
+            src_mac=tx_frame[6:12], src_ip=tx_frame[26:30], target_ip=tx_frame[30:34],
+        ))
+    frames.append(tx_frame)
+
+    for frame in frames:
+        tx_code = build_tx_code(
+            load_addr=consume_addr,
+            frame_buf=tx_frame_buf,
+            frame_len=len(frame),
+            result_addr=result_addr,
+        )
+        load_code(transport, consume_addr, tx_code)
+        write_bytes(transport, tx_frame_buf, frame)
+        write_bytes(transport, result_addr, [0x00])
+        jsr(transport, consume_addr, timeout=5.0)
+        tx_result = read_bytes(transport, result_addr, 1)[0]
+        if tx_result != 0x01:
+            return tx_result
 
     peek_code = build_rx_peek_code(load_addr=peek_addr, result_addr=result_addr)
     load_code(transport, peek_addr, peek_code)
@@ -1962,6 +2008,9 @@ def build_ping_and_wait_tod_code(
     identifier: int,
     sequence: int,
     deadline_tenths: int = 50,
+    *,
+    arp_frame_buf: int | None = None,
+    arp_frame_len: int | None = None,
 ) -> bytes:
     """Shippable-application ping-and-wait with CIA1 TOD timeout.
 
@@ -1972,6 +2021,8 @@ def build_ping_and_wait_tod_code(
     Steps:
 
     1. Enable RR clockport; start CIA1 TOD at 00:00:00.0; store deadline.
+    1a. If ``arp_frame_buf`` is given, TX the ARP request there first
+        (issue #218; see :func:`build_ping_and_wait_code`).
     2. TX the frame at ``tx_frame_buf`` (length ``tx_frame_len``).
     3. Poll CS8900a RxEvent with TOD deadline.
     4. Read the received frame into ``rx_buf``.
@@ -1990,11 +2041,15 @@ def build_ping_and_wait_tod_code(
         identifier: Expected ICMP identifier (16-bit).
         sequence: Expected ICMP sequence (16-bit).
         deadline_tenths: Timeout in tenths-of-a-second (1..599).
+        arp_frame_buf: Optional ARP request to transmit first.
+        arp_frame_len: Its length; defaults to :data:`ARP_FRAME_LEN`.
 
     Raises:
-        ValueError: if ``deadline_tenths`` is out of range.
+        ValueError: if ``deadline_tenths`` is out of range, or
+            ``arp_frame_len`` is given without ``arp_frame_buf``.
     """
     _validate_deadline_tenths(deadline_tenths)
+    arp = _resolve_arp_frame(arp_frame_buf, arp_frame_len)
     id_hi = (identifier >> 8) & 0xFF
     id_lo = identifier & 0xFF
     seq_hi = (sequence >> 8) & 0xFF
@@ -2008,29 +2063,10 @@ def build_ping_and_wait_tod_code(
     a.emit(0xA9, deadline_tenths & 0xFF, 0x85, _ZP_DEADLINE_LO)
     a.emit(0xA9, (deadline_tenths >> 8) & 0xFF, 0x85, _ZP_DEADLINE_HI)
 
-    # --- TX the echo request (mirrors build_ping_and_wait_code) ---
-    a.emit(0xA9, CS8900A_TXCMD_VALUE & 0xFF, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
-    a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
-    a.emit(0xA9, tx_frame_len & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
-    a.emit(0xA9, (tx_frame_len >> 8) & 0xFF, 0x8D, TXLEN_HI & 0xFF, TXLEN_HI >> 8)
-    a.emit(0xA9, 0x38, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
-    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
-    a.label("pw_txw")
-    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
-    a.emit(0x29, 0x01)
-    a.branch(0xF0, "pw_txw")
-    a.emit(0xA9, tx_frame_buf & 0xFF, 0x85, 0xFB)
-    a.emit(0xA9, (tx_frame_buf >> 8) & 0xFF, 0x85, 0xFC)
-    a.emit(0xA0, 0x00)
-    a.label("pw_txlp")
-    a.emit(0xB1, 0xFB)
-    a.emit(0x8D, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
-    a.emit(0xC8)
-    a.emit(0xB1, 0xFB)
-    a.emit(0x8D, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
-    a.emit(0xC8)
-    a.emit(0xC0, tx_frame_len & 0xFF)
-    a.branch(0xD0, "pw_txlp")
+    # --- TX the ARP request first if asked to (issue #218), then the echo ---
+    if arp is not None:
+        _emit_tx_frame(a, arp[0], arp[1], "arp")
+    _emit_tx_frame(a, tx_frame_buf, tx_frame_len, "pw")
 
     # --- Poll for reply with TOD deadline ---
     a.emit(0xA9, 0x24, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)

@@ -311,13 +311,17 @@ def test_ping_builder_with_arp_is_the_legacy_routine_plus_one_tx_block(name: str
     tail_old = legacy[legacy_echo_site - 2:]
     assert len(tail_new) == len(tail_old)
     diffs = [i for i, (x, y) in enumerate(zip(tail_new, tail_old)) if x != y]
-    # Every difference must be inside a JMP operand, and equal to the shift.
+    # Every difference must be an absolute operand that moved by the
+    # shift: a JMP target, or (TOD builder) the LDA abs,X table addresses
+    # patched after build.
+    relocatable = {JMP, 0xBD}
     for i in diffs:
-        j = next(k for k in (i - 1, i - 2) if tail_old[k] == JMP and k >= 0)
+        j = next((k for k in (i - 1, i - 2) if k >= 0 and tail_old[k] in relocatable), None)
+        assert j is not None, f"{name}: byte {i} of the echo path differs and is not an operand"
         old_target = tail_old[j + 1] | (tail_old[j + 2] << 8)
         new_target = tail_new[j + 1] | (tail_new[j + 2] << 8)
         assert new_target - old_target == shift, (
-            f"{name}: byte {i} of the echo path differs and is not a relocated JMP"
+            f"{name}: byte {i} of the echo path differs and is not a relocated operand"
         )
 
 
