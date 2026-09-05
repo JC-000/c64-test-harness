@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import socket
 import struct
+import time
 from typing import Optional
 
 from .ultimate64_client import Ultimate64Error
@@ -37,6 +38,7 @@ except Exception:  # pragma: no cover - exercised only without fcntl
     _HAS_DEVICE_LOCK = False
 
 __all__ = [
+    "IDLE_RECONNECT_SECONDS",
     "REU_WRITE_MAX_CHUNK",
     "SocketDMAClient",
     "SocketDMAIdentifyUDP",
@@ -86,6 +88,21 @@ _OPCODE_NAMES = {
 #: wait — the barrier returns as soon as the reply arrives.
 _REU_DRAIN_FLOOR_BPS = 4096.0
 
+#: The firmware closes a SocketDMA connection that has been idle for more
+#: than one second: ``socket_dma.cc`` sets ``SO_RCVTIMEO = 1 s`` on every
+#: accepted socket and the command loop ``break``s (and closes) as soon
+#: as a ``recv`` returns ``<= 0`` (same at v3.15 and on the U64E's post-tag
+#: fork; measured on the U64E 2026-09-05: IDENTIFY after a 0.90 s gap
+#: answered 3/3, after 1.00 s the peer had closed 3/3).  A client that
+#: reuses one connection across commands therefore has to reopen it
+#: before the next command whenever it has been idle for about that long.
+#: This is the default :class:`SocketDMAClient` ``idle_reconnect``
+#: threshold, kept under the firmware's timer with margin for transit.
+IDLE_RECONNECT_SECONDS = 0.8
+
+#: The firmware's own idle timer, for messages.
+_FIRMWARE_IDLE_CLOSE_SECONDS = 1.0
+
 
 class SocketDMAClient:
     """Client for the U64 SocketDMA binary protocol on TCP 64.
@@ -94,6 +111,17 @@ class SocketDMAClient:
     several commands.  When used outside ``with``, each public method opens
     and closes its own connection; this is convenient for one-shot calls
     but slow for chained operations because every connect re-authenticates.
+
+    A reused connection is not held open by the device: the firmware
+    closes it after one second without a command
+    (:data:`IDLE_RECONNECT_SECONDS`), and a command sent into the closed
+    socket is never read -- the send may even succeed, and only the next
+    reply-bearing command (``IDENTIFY``) fails with "connection closed by
+    peer" (issue #223).  So before every command the client checks how
+    long the connection has been idle and, at ``idle_reconnect`` seconds
+    or more, closes and reopens it first (re-authenticating when a
+    password is configured).  ``idle_reconnect=None`` disables that and
+    leaves the failure to the caller.
     """
 
     def __init__(
@@ -102,13 +130,38 @@ class SocketDMAClient:
         port: int = 64,
         password: Optional[str] = None,
         timeout: float = 5.0,
+        *,
+        idle_reconnect: Optional[float] = IDLE_RECONNECT_SECONDS,
     ) -> None:
         self._host = host
         self._port = port
         self._password = password
         self._timeout = timeout
+        if idle_reconnect is not None and idle_reconnect <= 0:
+            raise ValueError(f"idle_reconnect must be > 0 or None, got {idle_reconnect!r}")
+        self._idle_reconnect = idle_reconnect
         self._sock: Optional[socket.socket] = None
         self._authenticated = False
+        self._last_io = 0.0
+        #: Connections reopened because the previous one had been idle
+        #: for ``idle_reconnect`` seconds or more (diagnostics/tests).
+        self.idle_reconnects = 0
+
+    @property
+    def idle_reconnect(self) -> Optional[float]:
+        """Idle threshold (seconds) at which a reused connection is reopened."""
+        return self._idle_reconnect
+
+    @property
+    def idle_seconds(self) -> Optional[float]:
+        """Seconds since the last byte sent or received on the open
+        connection, or ``None`` when no connection is open."""
+        if self._sock is None:
+            return None
+        return time.monotonic() - self._last_io
+
+    def _touch(self) -> None:
+        self._last_io = time.monotonic()
 
     def __enter__(self) -> "SocketDMAClient":
         self._connect()
@@ -139,10 +192,20 @@ class SocketDMAClient:
         sock.settimeout(self._timeout)
         self._sock = sock
         self._authenticated = False
+        self._touch()
         if self._password is not None:
             self.authenticate()
 
     def _ensure_connected(self) -> socket.socket:
+        if (
+            self._sock is not None
+            and self._idle_reconnect is not None
+            and time.monotonic() - self._last_io >= self._idle_reconnect
+        ):
+            # The firmware has (or is about to have) closed this socket
+            # from its side; a command written into it would be lost.
+            self.close()
+            self.idle_reconnects += 1
         if self._sock is None:
             self._connect()
         assert self._sock is not None
@@ -165,9 +228,16 @@ class SocketDMAClient:
         except OSError as exc:
             self.close()
             raise Ultimate64Error(f"SocketDMA send failed: {exc}") from exc
+        self._touch()
 
     def _recv_exact(self, n: int) -> bytes:
-        sock = self._ensure_connected()
+        # A reply is always read right after the command that asked for
+        # it, so no idle check here: reopening the socket between a send
+        # and its reply would lose the reply.
+        if self._sock is None:
+            self._connect()
+        sock = self._sock
+        assert sock is not None
         buf = bytearray()
         while len(buf) < n:
             try:
@@ -175,11 +245,17 @@ class SocketDMAClient:
             except OSError as exc:
                 raise Ultimate64Error(f"SocketDMA recv failed: {exc}") from exc
             if not chunk:
+                idle = time.monotonic() - self._last_io
+                self.close()
                 raise Ultimate64Error(
-                    "SocketDMA connection closed by peer "
-                    "(authentication failure or password required?)"
+                    "SocketDMA connection closed by peer (the firmware drops "
+                    f"a connection idle for >{_FIRMWARE_IDLE_CLOSE_SECONDS:g} s"
+                    f" -- this one was idle {idle:.2f} s before the last "
+                    "command; otherwise an authentication failure or a "
+                    "password is required)"
                 )
             buf.extend(chunk)
+            self._touch()
         return bytes(buf)
 
     # ---- protocol ops ------------------------------------------------
@@ -208,6 +284,7 @@ class SocketDMAClient:
                 ) from exc
             sock.settimeout(self._timeout)
             self._sock = sock
+            self._touch()
         self._send(_CMD_AUTHENTICATE, payload)
         reply = self._recv_exact(1)
         if reply[0] != 1:
