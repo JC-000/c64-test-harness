@@ -51,6 +51,7 @@ from c64_test_harness.backends.device_lock import DeviceLock, DeviceLockTimeout
 from c64_test_harness.backends.ultimate64_baseline import (
     BASELINE_CATEGORIES,
     BASELINE_EXCLUDED_CATEGORIES,
+    DETECTION_DERIVED_ITEMS,
     BaselineReport,
     apply_factory_baseline,
 )
@@ -178,7 +179,12 @@ def _pick_non_default(client: Ultimate64Client, category: str, item: str,
 
 
 def _assert_every_covered_item_at_default(client: Ultimate64Client) -> dict[str, int]:
-    """One item GET per covered item; returns items-checked per category."""
+    """One item GET per covered item; returns items-checked per category.
+
+    The six ``DETECTION_DERIVED_ITEMS`` (SID socket detection results,
+    measured != default and power-cycle-stable on the U64E) are printed
+    and not compared — the same rule ``apply_factory_baseline`` applies.
+    """
     checked: dict[str, int] = {}
     off: list[str] = []
     for cat in _present(client, BASELINE_CATEGORIES):
@@ -186,6 +192,10 @@ def _assert_every_covered_item_at_default(client: Ultimate64Client) -> dict[str,
         for item in _bare(client, cat):
             item_map = client.get_config_item(cat, item)
             if "default" not in item_map:
+                continue
+            if (cat, item) in DETECTION_DERIVED_ITEMS:
+                print(f"[detection-derived] {cat}/{item}: current={item_map.get('current')!r} "
+                      f"default={item_map['default']!r} (not compared)")
                 continue
             n += 1
             if item_map.get("current") != item_map["default"]:
@@ -224,6 +234,9 @@ def test_drifted_items_are_reset_and_every_covered_item_reads_default(
     record_property("categories_reset", list(report.reset))
     record_property("categories_skipped", list(report.skipped))
     record_property("drifted_items", [f"{c}/{i}" for c, i in report.drifted_items()])
+    record_property("detection_derived", {
+        f"{c}/{i}": v for c, items in report.detection_derived.items() for i, v in items.items()
+    })
     print(f"[apply] {elapsed:.2f}s — {report.summary()}")
     for cat, items in report.drifted.items():
         for item, (was, default) in items.items():

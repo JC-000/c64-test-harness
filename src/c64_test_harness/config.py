@@ -24,6 +24,28 @@ if TYPE_CHECKING:
     from .memory_policy import MemoryPolicy
 
 
+#: The one switch for the U64 reset-on-entry (issue #227), shared by
+#: ``UnifiedManager`` and :meth:`HarnessConfig.from_env`.  The generic
+#: ``C64TEST_U64_BASELINE_ON_ENTRY`` form exists because every field has
+#: one by convention; when both are set the prefixed one wins (it is the
+#: config's own override), see :meth:`HarnessConfig.from_env`.
+U64_BASELINE_ON_ENTRY_ENV = "U64_BASELINE_ON_ENTRY"
+
+_TRUE_WORDS = frozenset({"1", "true", "yes", "on"})
+
+
+def env_flag(name: str) -> bool | None:
+    """Parse an on/off environment switch; ``None`` when unset.
+
+    ``1`` / ``true`` / ``yes`` / ``on`` (case-insensitive, surrounding
+    whitespace ignored) are ``True``; any other value is ``False``.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    return raw.strip().lower() in _TRUE_WORDS
+
+
 def _permissive_policy() -> "MemoryPolicy":
     """Default-factory shim — defers the MemoryPolicy import so this
     module stays import-cheap and never participates in cycles."""
@@ -103,10 +125,11 @@ class HarnessConfig:
     # Ultimate 64: reset the covered config categories to the firmware's
     # factory defaults at run entry, inside the DeviceLock, then assert
     # ``current == default`` per item (issue #227).  TOML
-    # ``[u64] baseline_on_entry = true``; env ``C64TEST_U64_BASELINE_ON_ENTRY``.
-    # Off by default -- no requests are made.  Wire it with
-    # ``UnifiedManager(..., baseline_on_entry=cfg.u64_baseline_on_entry)``;
-    # the manager also reads ``U64_BASELINE_ON_ENTRY`` when not given.
+    # ``[u64] baseline_on_entry = true``; env ``U64_BASELINE_ON_ENTRY`` (the
+    # one name, shared with ``UnifiedManager``; the convention form
+    # ``C64TEST_U64_BASELINE_ON_ENTRY`` wins when both are set).  Off by
+    # default -- no requests are made.  Wire it with
+    # ``UnifiedManager(..., baseline_on_entry=cfg.u64_baseline_on_entry)``.
     u64_baseline_on_entry: bool = False
 
     # Memory policy enforced at the transport boundary.  Default is
@@ -135,8 +158,16 @@ class HarnessConfig:
         fields (``memory_policy``) cannot be expressed as an env string;
         setting their env var raises ``ValueError`` rather than smuggling
         a raw string into the config.
+
+        ``u64_baseline_on_entry`` additionally reads the shared, unprefixed
+        :data:`U64_BASELINE_ON_ENTRY_ENV` (the same switch ``UnifiedManager``
+        reads), so one name opts both paths in.  The prefixed
+        ``<prefix>U64_BASELINE_ON_ENTRY`` wins when both are set.
         """
         config = cls()
+        shared = env_flag(U64_BASELINE_ON_ENTRY_ENV)
+        if shared is not None:
+            config.u64_baseline_on_entry = shared
         for fld in config.__dataclass_fields__:
             env_key = prefix + fld.upper()
             env_val = os.environ.get(env_key)

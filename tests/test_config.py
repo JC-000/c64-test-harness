@@ -111,9 +111,36 @@ class TestU64BaselineOnEntry:
             pytest.skip("TOML support not available (needs Python 3.11+ or tomli)")
         assert cfg.u64_baseline_on_entry is False
 
-    def test_env_override(self, monkeypatch):
+    def test_the_one_env_name_is_read(self, monkeypatch):
+        """``U64_BASELINE_ON_ENTRY`` is the single switch shared with the
+        manager path; ``from_env`` reads it too."""
+        monkeypatch.delenv("C64TEST_U64_BASELINE_ON_ENTRY", raising=False)
+        monkeypatch.setenv("U64_BASELINE_ON_ENTRY", "1")
+        assert HarnessConfig.from_env().u64_baseline_on_entry is True
+        monkeypatch.setenv("U64_BASELINE_ON_ENTRY", "on")
+        assert HarnessConfig.from_env().u64_baseline_on_entry is True
+        monkeypatch.setenv("U64_BASELINE_ON_ENTRY", "0")
+        assert HarnessConfig.from_env().u64_baseline_on_entry is False
+
+    def test_prefixed_convention_wins_over_the_shared_name(self, monkeypatch):
+        """``C64TEST_<FIELD>`` exists for every field by convention; when
+        both are set the prefixed one is the config's own override."""
+        monkeypatch.setenv("U64_BASELINE_ON_ENTRY", "1")
+        monkeypatch.setenv("C64TEST_U64_BASELINE_ON_ENTRY", "0")
+        assert HarnessConfig.from_env().u64_baseline_on_entry is False
+        monkeypatch.setenv("U64_BASELINE_ON_ENTRY", "0")
         monkeypatch.setenv("C64TEST_U64_BASELINE_ON_ENTRY", "1")
         assert HarnessConfig.from_env().u64_baseline_on_entry is True
+
+    def test_custom_prefix_still_reads_the_shared_name(self, monkeypatch):
+        monkeypatch.delenv("MYAPP_U64_BASELINE_ON_ENTRY", raising=False)
+        monkeypatch.setenv("U64_BASELINE_ON_ENTRY", "yes")
+        assert HarnessConfig.from_env(prefix="MYAPP_").u64_baseline_on_entry is True
+
+    def test_both_unset_is_off(self, monkeypatch):
+        monkeypatch.delenv("U64_BASELINE_ON_ENTRY", raising=False)
+        monkeypatch.delenv("C64TEST_U64_BASELINE_ON_ENTRY", raising=False)
+        assert HarnessConfig.from_env().u64_baseline_on_entry is False
 
 
 class TestFromToml:
