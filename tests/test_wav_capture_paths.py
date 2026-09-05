@@ -6,12 +6,13 @@ tracked ``tests/wav_captures/`` tree, so every bench run dirtied the
 working tree and silently re-based the committed reference.  The path
 decision now lives in ``tests/wav_capture_paths.py``: scratch by default,
 the tracked tree only under ``WAV_CAPTURES_REFRESH=1``.  No hardware is
-needed to pin that.
+needed to pin that: the live modules' ``wav_dir`` fixtures are called
+directly here with a fake ``tmp_path_factory``.
 """
 from __future__ import annotations
 
-import ast
-import re
+import importlib
+import os
 from pathlib import Path
 
 import pytest
@@ -20,9 +21,10 @@ from wav_capture_paths import REFRESH_ENV, TRACKED_ROOT, capture_dir, refresh_re
 
 TESTS_DIR = Path(__file__).resolve().parent
 
+#: (module name, suite folder under tests/wav_captures/) for each live capture module.
 LIVE_MODULES = (
-    TESTS_DIR / "test_chromatic_capture_live.py",
-    TESTS_DIR / "test_multi_sid_parallel_live.py",
+    ("test_chromatic_capture_live", "chromatic"),
+    ("test_multi_sid_parallel_live", "multi_sid"),
 )
 
 
@@ -50,15 +52,30 @@ def test_default_destination_is_outside_the_tracked_tree(tmp_path: Path, monkeyp
     assert dest.name == "chromatic"
 
 
-def test_scratch_inside_the_tracked_tree_is_refused(monkeypatch) -> None:
+def test_scratch_that_lands_in_the_tracked_tree_is_refused(tmp_path: Path, monkeypatch) -> None:
     """The helper, not pytest's basetemp, is what keeps captures out of the
-    reference: a scratch root under tests/wav_captures/ is refused outright."""
+    reference.  The refusal is on the *destination*: a scratch root under
+    tests/wav_captures/ is refused, and so is ``tests/`` itself (whose
+    ``wav_captures/<suite>`` IS the tracked directory) -- directly or
+    through a symlink."""
     monkeypatch.delenv(REFRESH_ENV, raising=False)
-    for scratch in (TRACKED_ROOT, TRACKED_ROOT / "scratch", TRACKED_ROOT / "chromatic" / ".."):
+    link_to_tests = tmp_path / "t"
+    link_to_tests.symlink_to(TRACKED_ROOT.parent)
+    link_to_tracked = tmp_path / "w"
+    link_to_tracked.symlink_to(TRACKED_ROOT)
+    for scratch in (
+        TRACKED_ROOT,
+        TRACKED_ROOT / "scratch",
+        TRACKED_ROOT / "chromatic" / "..",
+        TRACKED_ROOT.parent,
+        TRACKED_ROOT.parent / "wav_captures" / "..",
+        link_to_tests,
+        link_to_tracked,
+    ):
         with pytest.raises(ValueError, match="tracked"):
             capture_dir("chromatic", scratch)
-    # The refusal is about the scratch root, so a refresh (which ignores it) still works.
-    assert capture_dir("chromatic", TRACKED_ROOT / "scratch", environ={REFRESH_ENV: "1"}) == TRACKED_ROOT / "chromatic"
+    # The refusal is about the destination, so a refresh (which ignores scratch) still works.
+    assert capture_dir("chromatic", TRACKED_ROOT.parent, environ={REFRESH_ENV: "1"}) == TRACKED_ROOT / "chromatic"
 
 
 def test_refresh_env_selects_the_tracked_fixture_dir(tmp_path: Path, monkeypatch) -> None:
@@ -96,71 +113,75 @@ def test_suite_name_must_be_a_plain_component(tmp_path: Path) -> None:
             capture_dir(bad, tmp_path, environ={})
 
 
-def _joined_text(node: ast.AST) -> str:
-    """Literal text of a str Constant or the constant parts of an f-string."""
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
-    if isinstance(node, ast.JoinedStr):
-        return "".join(
-            v.value for v in node.values
-            if isinstance(v, ast.Constant) and isinstance(v.value, str)
-        )
-    return ""
+# ---------------------------------------------------------------------------
+# (c) the live modules really go through the helper -- behavioural, not
+# source inspection: call each module's wav_dir fixture with a fake
+# tmp_path_factory and check what comes back.
+# ---------------------------------------------------------------------------
+
+class _FakeTmpPathFactory:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.made: list[Path] = []
+
+    def mktemp(self, basename: str, numbered: bool = True) -> Path:
+        path = self.root / f"{basename}{len(self.made)}"
+        path.mkdir(parents=True, exist_ok=True)
+        self.made.append(path)
+        return path
 
 
-@pytest.mark.parametrize("module", LIVE_MODULES, ids=lambda p: p.name)
-def test_live_capture_modules_use_the_helper(module: Path) -> None:
-    """(c) structural: both live modules route through ``capture_dir`` and
-    nothing else -- no TRACKED_ROOT, no hand-built path -- and every WAV /
-    JSON path they build hangs off the ``wav_dir`` fixture value."""
-    src = module.read_text()
-    tree = ast.parse(src, filename=str(module))
+def _live_module(name: str, monkeypatch):
+    """Import a live module with no device: its skip marker must not bite."""
+    monkeypatch.delenv("U64_HOST", raising=False)
+    monkeypatch.delenv(REFRESH_ENV, raising=False)
+    return importlib.import_module(name)
 
-    imported = {
-        alias.name
-        for node in tree.body
-        if isinstance(node, ast.ImportFrom) and node.module == "wav_capture_paths"
-        for alias in node.names
-    }
-    assert "capture_dir" in imported, f"{module.name} does not import capture_dir"
-    assert "TRACKED_ROOT" not in src, f"{module.name} names TRACKED_ROOT"
-    literal = re.search(r"Path\(__file__\)[^\n]*[\"']wav_captures[\"']", src)
-    assert literal is None, f"{module.name} builds the tracked path itself: {literal.group(0)!r}"
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and node.value == "wav_captures":
-            raise AssertionError(f"{module.name} has a bare 'wav_captures' literal")
 
-    # The wav_dir fixture returns exactly what capture_dir() handed it.
-    fixtures = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "wav_dir"]
-    assert len(fixtures) == 1, f"{module.name} has no wav_dir fixture"
-    fixture = fixtures[0]
-    returns = [n for n in ast.walk(fixture) if isinstance(n, ast.Return)]
-    assert len(returns) == 1 and isinstance(returns[0].value, ast.Name), (
-        f"{module.name}: wav_dir must return a single name"
+@pytest.mark.parametrize("name,suite", LIVE_MODULES, ids=[m[0] for m in LIVE_MODULES])
+def test_live_module_wav_dir_is_the_helpers_answer(
+    name: str, suite: str, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    module = _live_module(name, monkeypatch)
+    fixture = getattr(module, "wav_dir", None)
+    assert fixture is not None, f"{name} has no wav_dir fixture"
+    func = getattr(fixture, "__wrapped__", fixture)
+
+    factory = _FakeTmpPathFactory(tmp_path)
+    recorded: list[tuple[str, str]] = []
+    result = func(factory, lambda key, value: recorded.append((key, value)))
+
+    assert len(factory.made) == 1, "wav_dir must take exactly one scratch dir from tmp_path_factory"
+    scratch = factory.made[0]
+    assert result == capture_dir(suite, scratch), (
+        f"{name}: wav_dir returned {result}, not capture_dir({suite!r}, {scratch})"
     )
-    returned = returns[0].value.id
-    sources = [
-        n.value
-        for n in fixture.body
-        if isinstance(n, ast.Assign)
-        and any(isinstance(t, ast.Name) and t.id == returned for t in n.targets)
-    ]
-    assert len(sources) == 1, f"{module.name}: {returned!r} must be assigned exactly once in wav_dir"
-    call = sources[0]
-    assert isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "capture_dir", (
-        f"{module.name}: wav_dir returns {returned!r}, which is not the result of capture_dir()"
-    )
+    assert result.resolve() == capture_dir(suite, scratch).resolve()
+    assert _is_inside(result, tmp_path)
+    assert not _is_inside(result, TRACKED_ROOT), result
+    assert result.is_dir(), "wav_dir must create the directory it hands out"
+    # Item 7: the location is discoverable after the run.
+    assert recorded == [(f"{suite}_capture_dir", str(result))]
+    assert str(result) in capsys.readouterr().out
 
-    # Every `<x> / "...wav"` or `<x> / "...json"` in the module is `wav_dir / ...`.
-    joined = 0
-    for node in ast.walk(tree):
-        if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div)):
-            continue
-        text = _joined_text(node.right)
-        if not (text.endswith(".wav") or text.endswith(".json")):
-            continue
-        joined += 1
-        assert isinstance(node.left, ast.Name) and node.left.id == "wav_dir", (
-            f"{module.name}:{node.lineno}: capture path {text!r} is not built from wav_dir"
-        )
-    assert joined >= 1, f"{module.name} builds no capture path from wav_dir"
+
+@pytest.mark.parametrize("name,suite", LIVE_MODULES, ids=[m[0] for m in LIVE_MODULES])
+def test_live_module_wav_dir_honours_refresh(
+    name: str, suite: str, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """With the knob set, the fixture's answer is the tracked directory --
+    proving the env var reaches the fixture through the helper, not a copy."""
+    module = _live_module(name, monkeypatch)
+    monkeypatch.setenv(REFRESH_ENV, "1")
+    func = getattr(module.wav_dir, "__wrapped__", module.wav_dir)
+    result = func(_FakeTmpPathFactory(tmp_path), lambda key, value: None)
+    assert result == TRACKED_ROOT / suite
+
+
+@pytest.mark.parametrize("name,suite", LIVE_MODULES, ids=[m[0] for m in LIVE_MODULES])
+def test_live_module_never_names_the_tracked_root(name: str, suite: str) -> None:
+    src = (TESTS_DIR / f"{name}.py").read_text()
+    assert "TRACKED_ROOT" not in src, f"{name} names TRACKED_ROOT"
+    assert os.sep + "wav_captures" not in src.replace("tests/wav_captures/", ""), (
+        f"{name} spells out a wav_captures path"
+    )

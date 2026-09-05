@@ -65,20 +65,25 @@ def capture_dir(
         else ``<scratch>/wav_captures/<suite>``.  The directory is not
         created; callers ``mkdir(parents=True, exist_ok=True)`` as before.
     :raises ValueError: if *suite* is empty or not a single plain
-        path component, or if *scratch* resolves to somewhere inside
-        :data:`TRACKED_ROOT` -- the helper, not pytest's ``basetemp``,
-        is what keeps a default run out of the reference tree.
+        path component, or if the destination
+        ``<scratch>/wav_captures/<suite>`` resolves to the tracked
+        directory or anywhere inside :data:`TRACKED_ROOT` -- which
+        catches a scratch root under the tracked tree, ``tests/`` itself
+        (whose ``wav_captures/<suite>`` *is* the reference), and symlinks
+        to either.  The helper, not pytest's ``basetemp``, is what keeps a
+        default run out of the reference tree.
     """
     if not suite or Path(suite).name != suite or suite in (".", ".."):
         raise ValueError(f"suite must be a single path component, got {suite!r}")
     if refresh_requested(environ):
         return TRACKED_ROOT / suite
-    scratch_path = Path(scratch)
-    resolved = scratch_path.resolve()
-    if resolved == TRACKED_ROOT or TRACKED_ROOT in resolved.parents:
+    dest = Path(scratch) / "wav_captures" / suite
+    resolved = dest.resolve()
+    tracked = (TRACKED_ROOT / suite).resolve()
+    if resolved == tracked or TRACKED_ROOT in resolved.parents:
         raise ValueError(
-            f"scratch {scratch_path!s} is inside the tracked capture tree "
-            f"{TRACKED_ROOT!s}; set {REFRESH_ENV}=1 to refresh the reference "
-            f"deliberately, otherwise use a scratch root outside it"
+            f"destination {dest!s} resolves to {resolved!s}, inside the tracked "
+            f"capture tree {TRACKED_ROOT!s}; set {REFRESH_ENV}=1 to refresh the "
+            f"reference deliberately, otherwise use a scratch root outside it"
         )
-    return scratch_path / "wav_captures" / suite
+    return dest
