@@ -19,9 +19,11 @@ The contract, as decided by the owner in #227:
   over the fixed covered set :data:`BASELINE_CATEGORIES`.  **Never** the
   global route (it iterates every store, network stores included, and a
   static-addressed device would flip to DHCP and be stranded) and
-  **never** ``Ethernet Settings`` / ``Network Settings`` / the WiFi store
-  (:data:`BASELINE_EXCLUDED_CATEGORIES`).  Categories the device does not
-  list are skipped with a log line — the C64 Ultimate's set differs.
+  **never** a store in :data:`BASELINE_NEVER_TOUCH` — the three network
+  stores, the SID socket store (its ``effectuate`` powers the socketed
+  SIDs off) and the RTC (the next PUT writes the clock chip); each entry
+  carries its reason.  Categories the device does not list are skipped
+  with a log line — the C64 Ultimate's set differs.
 * **Reset, then assert.**  On a shared device ``current != default`` at
   entry is the ordinary state whenever another lane is mid-run or just
   finished; that pre-reset drift is logged per item at INFO ("inherited
@@ -55,7 +57,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from ..config import U64_BASELINE_ON_ENTRY_ENV, env_flag
+from ..config import U64_BASELINE_ON_ENTRY_ENV, resolve_baseline_on_entry_env
 from .ultimate64_client import Ultimate64Client, Ultimate64Error
 
 try:
@@ -71,94 +73,112 @@ __all__ = [
     "BASELINE_ON_ENTRY_ENV",
     "BASELINE_CATEGORIES",
     "BASELINE_EXCLUDED_CATEGORIES",
-    "DETECTION_DERIVED_ITEMS",
+    "BASELINE_NEVER_TOUCH",
     "BaselineReport",
     "U64BaselineError",
     "apply_factory_baseline",
     "baseline_on_entry_enabled",
 ]
 
-#: The one environment switch, shared with ``HarnessConfig.from_env``
-#: (which also honours its ``C64TEST_U64_BASELINE_ON_ENTRY`` convention
-#: form, winning when both are set).  ``1`` / ``true`` / ``yes`` / ``on``,
-#: case-insensitive.
+#: The one environment switch, shared with ``HarnessConfig.from_env``.
+#: Both paths resolve it through
+#: :func:`c64_test_harness.config.resolve_baseline_on_entry_env`, so the
+#: precedence is identical: the convention form
+#: ``C64TEST_U64_BASELINE_ON_ENTRY`` wins when both are set.  ``1`` /
+#: ``true`` / ``yes`` / ``on``, case-insensitive.
 BASELINE_ON_ENTRY_ENV = U64_BASELINE_ON_ENTRY_ENV
 
 #: The stores the entry reset covers, by canonical firmware name (the
 #: per-category route is a case-insensitive exact match for a name with
-#: no glob characters).  Machine, SID, audio, drive, tape, printer, clock,
-#: LED, modem and UI stores.  ``U64 Specific Settings`` is included even
-#: though its ``effectuate()`` rewrites the CPU-speed registers
-#: unconditionally (owner decision, #227; the C64U UCI hazard is
-#: unestablished here).  Absent categories are skipped, not errors.
+#: no glob characters).  Machine, SID addressing, audio, drive, tape,
+#: printer, LED, modem and UI stores — twelve.  ``U64 Specific Settings``
+#: is included even though its ``effectuate()`` rewrites the CPU-speed
+#: registers unconditionally (owner decision, #227; the C64U UCI hazard
+#: is unestablished here).  Absent categories are skipped, not errors.
+#: ``SID Sockets Configuration`` and ``Clock Settings`` are **not** here
+#: and can never be — see :data:`BASELINE_NEVER_TOUCH`.
 BASELINE_CATEGORIES: tuple[str, ...] = (
     "C64 and Cartridge Settings",
     "U64 Specific Settings",
     "SID Addressing",
-    "SID Sockets Configuration",
     "Audio Mixer",
     "Drive A Settings",
     "Drive B Settings",
     "SoftIEC Drive Settings",
     "Tape Settings",
     "Printer Settings",
-    "Clock Settings",
     "LED Strip Settings",
     "Modem Settings",
     "User Interface Settings",
 )
 
-#: Stores the entry reset must never reset, read or otherwise touch.
-#: Resetting ``Ethernet Settings`` flips a static device to DHCP;
-#: ``Network Settings`` reset blanks the password, hostname and service
-#: flags; the C64U's WiFi store has not been read.  Any category whose
-#: name contains one of :data:`_EXCLUDED_MARKERS` is refused too, so a
-#: future firmware store named e.g. ``Ethernet Settings 2`` cannot slip
-#: in through a caller-supplied ``categories``.
-BASELINE_EXCLUDED_CATEGORIES: tuple[str, ...] = (
-    "Ethernet Settings",
-    "Network Settings",
-    "WiFi settings",
-)
+#: Stores the entry reset must never reset, read, PUT or otherwise touch,
+#: each with the reason it is here (firmware citations are to the
+#: 1541ultimate ``v3.15`` line, ``~/Documents/1541u-315preview``).  Passing
+#: one as a category or in ``exempt=`` raises ``ValueError`` carrying the
+#: reason, before any request.  Pinned literally by
+#: ``tests/test_entry_baseline.py``.
+BASELINE_NEVER_TOUCH: dict[str, str] = {
+    "Ethernet Settings": (
+        "reset_to_default flips a static-addressed device to DHCP (Use "
+        "DHCP=Enabled, 192.168.2.64/24) and strands it"
+    ),
+    "Network Settings": (
+        "reset blanks Network Password, hostname and the FTP/Telnet/Web/SNTP "
+        "service flags (and sets Ultimate DMA Service=Enabled)"
+    ),
+    "WiFi settings": (
+        "the C64 Ultimate reaches the bench over WiFi; its store has never "
+        "been read, so a reset there is unassessed"
+    ),
+    "SID Sockets Configuration": (
+        "ConfigStore::reset sets SID Socket 1/2=Disabled, then "
+        "U64SidSockets::effectuate_settings (u64_config.cc:744-800) writes "
+        "regulator bits 0 to the PLD SIDCTRL / I2C: the reset cuts socket "
+        "power and the detection state (measured U64E, two 8580s, 2026-09-05, "
+        "n=3: all six items flip Enabled->Disabled, 8580->None, 22 nF->470 pF) "
+        "while the report reads clean, so the socketed SIDs are POWERED OFF "
+        "with nothing to say so.  Detection never re-runs over REST (only at "
+        "boot or from the on-device menu); recovery is a per-item PUT of the "
+        "detected values, which re-effectuates the regulators (both 8580s "
+        "alive on the OSC3 stride probe afterwards, 3/3) -- and on a 6581 "
+        "bench that PUT applies socket voltage without the human 12 V "
+        "approval detection waits for (u64_config.cc:698-705).  The values "
+        "are detection results, not reset products ('8580'/'Enabled'/'22 nF' "
+        "vs defaults 'None'/'Disabled'/'470 pF', power-cycle-stable, n=1; a "
+        "6581 bench also writes the 1K Ohm Resistor items, "
+        "u64_config.cc:704/708)"
+    ),
+    "Clock Settings": (
+        "the RTC (Year..Seconds, defaults 2015-10-13 16:52:55, rtc.cc:26-34). "
+        "RtcConfigStore::effectuate is empty, so a reset only sets RAM + "
+        "staleEffect and shows neither drift nor mismatch -- the RAM items "
+        "already read the 2015 defaults before any reset, because "
+        "at_open_config fills them from the chip only when the on-device "
+        "menu opens (measured U64E 2026-09-05) -- while arming the rollback: "
+        "the next PUT to the category runs at_close_config (rtc.cc:350-409), "
+        "which writes every item, 2015 included, to the RTC chip"
+    ),
+}
 
+#: The never-touch names as a tuple (the pre-review name; kept as the
+#: public alias of :data:`BASELINE_NEVER_TOUCH`'s keys).
+BASELINE_EXCLUDED_CATEGORIES: tuple[str, ...] = tuple(BASELINE_NEVER_TOUCH)
+
+#: Any category whose name contains one of these is refused too, so a
+#: future firmware store named e.g. ``Ethernet Settings 2`` cannot slip in
+#: through a caller-supplied ``categories``.
 _EXCLUDED_MARKERS: tuple[str, ...] = ("ethernet", "network", "wifi", "wi-fi")
-
-#: ``(category, item)`` pairs whose value the firmware **derives from SID
-#: detection at boot**.  They never equal ``default`` on a device with
-#: SIDs fitted, so ``current == default`` is the wrong assertion for them:
-#: the entry reset still resets their category, but they are reported
-#: (``BaselineReport.detection_derived``, with current and default) and
-#: **never compared and never PUT**.
-#:
-#: Measured on the U64E (fw 3.15 fork, two 8580s fitted) 2026-09-05, lock
-#: held: these six read ``'8580'`` (default ``'None'``), ``'Enabled'``
-#: (``'Disabled'``) and ``'22 nF'`` (``'470 pF'``), identical before and
-#: after a physical power-cycle (n=1), while every other one of the 203
-#: items equalled its default.  Whether a reset of the category moves
-#: them transiently before the firmware re-detects is being measured;
-#: exempting them from the comparison is correct either way.
-#:
-#: The set is pinned literally by ``tests/test_entry_baseline.py``: an
-#: exemption masks a real failure, so it grows only with a measurement
-#: of the same grade.  A one-off exemption for a script goes through
-#: ``apply_factory_baseline(..., exempt=[...])`` instead.
-DETECTION_DERIVED_ITEMS: frozenset[tuple[str, str]] = frozenset({
-    ("SID Sockets Configuration", "SID Detected Socket 1"),
-    ("SID Sockets Configuration", "SID Detected Socket 2"),
-    ("SID Sockets Configuration", "SID Socket 1"),
-    ("SID Sockets Configuration", "SID Socket 2"),
-    ("SID Sockets Configuration", "SID Socket 1 Capacitors"),
-    ("SID Sockets Configuration", "SID Socket 2 Capacitors"),
-})
 
 
 def baseline_on_entry_enabled() -> bool:
-    """Whether :data:`BASELINE_ON_ENTRY_ENV` asks for the entry reset.
+    """Whether the environment asks for the entry reset.
 
     Read at call time (not import time) so tests and long-lived processes
-    can flip it.  Same parser as ``HarnessConfig.from_env``.
+    can flip it.  Same resolution and parser as ``HarnessConfig.from_env``:
+    ``C64TEST_U64_BASELINE_ON_ENTRY`` wins, else :data:`BASELINE_ON_ENTRY_ENV`.
     """
-    return env_flag(BASELINE_ON_ENTRY_ENV) is True
+    return resolve_baseline_on_entry_env() is True
 
 
 # --------------------------------------------------------------------------- #
@@ -191,9 +211,10 @@ class BaselineReport:
         Per category, the items whose map carries no ``default`` key
         (preset-file / info types) — reported, not compared.
     ``detection_derived``
-        Items in :data:`DETECTION_DERIVED_ITEMS` (or the caller's
-        ``exempt=``) as read after the reset, with their default —
-        listed whatever they read, never compared, never PUT.
+        Items the caller passed in ``exempt=`` (the detection-derived
+        class: values the firmware measures rather than resets), as read
+        after the reset, with their default — listed whatever they read,
+        never compared, never PUT.
         ``category -> item -> (current_after, default)``.  Kept apart
         from ``mismatched`` on purpose: one is a detection result, the
         other a reset that did not take.
@@ -266,13 +287,15 @@ class U64BaselineError(Ultimate64Error):
                 f"reset did not take: {len(report.mismatched_items())} item(s) "
                 f"still differ from the firmware default after the per-category "
                 f"reset — {detail}.  If an item's value is derived from "
-                f"detection at boot (never equals its default on this hardware, "
-                f"stable across a power-cycle), it is not a failed reset: exempt "
-                f"it for one run with apply_factory_baseline(..., "
-                f"exempt=[(category, item)]) and, with the measurement, add it to "
-                f"DETECTION_DERIVED_ITEMS in ultimate64_baseline.py (pinned by "
-                f"tests/test_entry_baseline.py).  Detection-derived items already "
-                f"exempt: {len(report.detection_derived_items())}."
+                f"detection or hardware state (never equals its default on this "
+                f"device, stable across a power-cycle), it is not a failed reset: "
+                f"exempt it for one run with apply_factory_baseline(..., "
+                f"exempt=[(category, item)]); if its whole store is a hardware "
+                f"store (a reset there acts on the hardware, as the SID socket "
+                f"store and the RTC do), it belongs in BASELINE_NEVER_TOUCH in "
+                f"ultimate64_baseline.py with its reason and the measurement "
+                f"(pinned by tests/test_entry_baseline.py).  Items exempt in this "
+                f"run: {len(report.detection_derived_items())}."
             )
         super().__init__(message)
 
@@ -290,7 +313,7 @@ def _validate_categories(categories: Iterable[str]) -> tuple[str, ...]:
     stores; neither is ever sent.
     """
     out: list[str] = []
-    excluded_folded = {c.lower() for c in BASELINE_EXCLUDED_CATEGORIES}
+    never = {c.lower(): (c, why) for c, why in BASELINE_NEVER_TOUCH.items()}
     for cat in categories:
         if not isinstance(cat, str) or not cat.strip():
             raise ValueError(f"category must be a non-empty string, got {cat!r}")
@@ -300,11 +323,17 @@ def _validate_categories(categories: Iterable[str]) -> tuple[str, ...]:
                 f"glob (the firmware route would match every store it covers)"
             )
         folded = cat.lower()
-        if folded in excluded_folded or any(m in folded for m in _EXCLUDED_MARKERS):
+        if folded in never:
+            name, why = never[folded]
             raise ValueError(
-                f"category {cat!r} is a network store; the entry reset never "
-                f"touches {BASELINE_EXCLUDED_CATEGORIES!r} (a reset there can "
-                f"strand the device — issue #227)"
+                f"category {name!r} is never touched by the entry reset: {why} "
+                f"(issue #227; never-touch set: {BASELINE_EXCLUDED_CATEGORIES!r})"
+            )
+        if any(m in folded for m in _EXCLUDED_MARKERS):
+            raise ValueError(
+                f"category {cat!r} names a network store; the entry reset never "
+                f"touches one (a reset there can strand the device — issue #227; "
+                f"never-touch set: {BASELINE_EXCLUDED_CATEGORIES!r})"
             )
         out.append(cat)
     if not out:
@@ -389,11 +418,12 @@ def apply_factory_baseline(
     is logged at INFO per item; a post-reset mismatch raises
     :class:`U64BaselineError` after every category has been processed.
 
-    Items in :data:`DETECTION_DERIVED_ITEMS` — and in *exempt* — are
-    **not compared** (their value is what the firmware detected, not what
-    a reset produces); they are reported under
-    ``report.detection_derived`` with current and default.  Their
-    category is still reset.  Nothing is ever PUT by this function.
+    Items in *exempt* are **not compared** (the detection-derived class:
+    a value the firmware measures rather than resets); they are reported
+    under ``report.detection_derived`` with current and default.  Their
+    category is still reset.  Nothing is ever PUT by this function.  A
+    store whose reset itself acts on hardware is not an exemption case
+    but a :data:`BASELINE_NEVER_TOUCH` case, and is refused here.
 
     :param client: connected :class:`Ultimate64Client` — hold the device's
         ``DeviceLock`` (``create_manager(backend="u64")`` does, and runs
@@ -405,10 +435,10 @@ def apply_factory_baseline(
     :param dry_run: read and report only — no reset is sent, ``reset`` is
         empty and ``mismatched`` is empty (nothing was asserted); the
         ``drifted`` map shows what a real run would have reset.
-    :param exempt: extra ``(category, item)`` pairs to treat like
-        :data:`DETECTION_DERIVED_ITEMS` for this call — a one-off for a
-        script on hardware whose detection-derived items are not yet in
-        the pinned set.  Refused for the network stores and globs.
+    :param exempt: ``(category, item)`` pairs to list instead of compare
+        for this call — a one-off for a script on hardware with a
+        detection-derived item in a covered store.  Refused for the
+        never-touch stores and globs.
     :returns: :class:`BaselineReport`.
     :raises ValueError: a glob or an excluded category in *categories*
         or *exempt*.
@@ -418,7 +448,7 @@ def apply_factory_baseline(
     :raises Ultimate64Error: wire / protocol failures from the client.
     """
     wanted = _validate_categories(categories)
-    exempt_pairs = DETECTION_DERIVED_ITEMS | _validate_exempt(exempt)
+    exempt_pairs = _validate_exempt(exempt)
 
     host = getattr(client, "host", None)
     if _HAS_DEVICE_LOCK and isinstance(host, str) and host:
@@ -470,8 +500,8 @@ def apply_factory_baseline(
             default = item_map["default"]
             current = item_map.get("current")
             if (category, item) in exempt_pairs or (requested, item) in exempt_pairs:
-                # Detection-derived: what the firmware found in the socket,
-                # not what a reset produces.  Listed, never compared.
+                # Caller-exempt (detection-derived class): what the firmware
+                # measured, not what a reset produces.  Listed, never compared.
                 detection_derived.setdefault(category, {})[item] = (current, default)
                 continue
             if _differs(before[item], default):

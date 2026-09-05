@@ -25,11 +25,19 @@ default, naming category / item / flash value / default — that is the
 finding this module exists to surface.  Items without a ``default`` key
 are listed, not compared.
 
-Excluded from the reload: ``Ethernet Settings`` (loading it from flash
-could change the address if a static config had ever been saved) and
-the WiFi store (the C64 Ultimate reaches the bench over WiFi; its store
-has not been read).  ``Network Settings`` is included, as in the owner's
-measurement.
+Excluded from the reload: every store in ``BASELINE_NEVER_TOUCH`` —
+``Ethernet Settings`` (loading it from flash could change the address if
+a static config had ever been saved), the WiFi store (the C64 Ultimate
+reaches the bench over WiFi; its store has not been read), ``SID Sockets
+Configuration`` (``load_from_flash`` runs ``at_close_config`` →
+``effectuate``, which with flash's ``Socket=Disabled`` powers the
+socketed SIDs off, and the PUT-back would apply socket voltage) and
+``Clock Settings`` (the reload's ``at_close_config`` writes flash's 2015
+defaults to the RTC chip).  ``Network Settings`` is deliberately **also
+excluded** here although the owner's hand measurement included it: its
+reload re-effectuates the network stack (``NetworkInterface::
+effectuate_settings``), which is not a risk this instrument needs to
+take on a device it reaches over that stack.
 
 Env gates (all unset -> everything skips cleanly):
 
@@ -50,6 +58,7 @@ from typing import Any
 import pytest
 
 from c64_test_harness.backends.device_lock import DeviceLock, DeviceLockTimeout
+from c64_test_harness.backends.ultimate64_baseline import BASELINE_NEVER_TOUCH
 from c64_test_harness.backends.ultimate64_client import (
     Ultimate64Client,
     Ultimate64Error,
@@ -74,8 +83,10 @@ pytestmark = [
     ),
 ]
 
-#: Never reloaded from flash by this module (see the module docstring).
-_NEVER_RELOAD: tuple[str, ...] = ("Ethernet Settings", "WiFi settings")
+#: Never reloaded from flash, never PUT, by this module (see the module
+#: docstring): the harness never-touch set, which already holds the
+#: network stores, the SID socket store and the RTC.
+_NEVER_RELOAD: tuple[str, ...] = tuple(BASELINE_NEVER_TOUCH)
 
 
 @pytest.fixture(scope="module")
@@ -102,8 +113,8 @@ def _bare(client: Ultimate64Client, category: str) -> dict[str, Any]:
 def _categories_to_check(client: Ultimate64Client) -> list[str]:
     listed = client.list_configs()
     never = {n.lower() for n in _NEVER_RELOAD}
-    return [c for c in listed if c.lower() not in never and "wifi" not in c.lower()
-            and "ethernet" not in c.lower()]
+    return [c for c in listed if c.lower() not in never
+            and not any(m in c.lower() for m in ("wifi", "ethernet", "network", "sid socket", "clock"))]
 
 
 def _restore(client: Ultimate64Client, category: str, snapshot: dict[str, Any]) -> list[str]:

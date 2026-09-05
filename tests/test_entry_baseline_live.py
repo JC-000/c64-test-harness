@@ -24,14 +24,22 @@ Env gates (all unset -> everything skips cleanly):
 What it touches: every category in ``BASELINE_CATEGORIES`` present on
 the device is reset to factory default (memory-only; ``configs/
 <category>:reset_to_default``), and ``Cartridge Preference`` / ``REU Size``
-are deliberately PUT to a non-default value first.  The stock value of
-every covered item is snapshotted before any write and PUT back at
-module end (attempt all, raise at the end), so the device leaves as it
-was found — drift included; the entry reset is the lane's contract, not
-this module's.  The excluded stores are only read.
+are deliberately PUT to a non-default value first.  Those two items — and
+**only** those two — are snapshotted before any write and PUT back at
+module end: a PUT re-effectuates every store it touches (for ``U64
+Specific Settings`` that rewrites the CPU-speed registers), so a
+"restore every covered item" sweep would be a second, larger
+side-effect, not a courtesy (adversarial review of #227).  The rest of
+the device is left at the factory baseline the entry reset produced.
+The never-touch stores (``BASELINE_NEVER_TOUCH``: the three network
+stores, ``SID Sockets Configuration``, ``Clock Settings``) are only read,
+once on each side of a reset, and **never PUT** — a PUT of the SID socket
+store applies socket voltage, a PUT of ``Clock Settings`` writes the RTC
+chip.
 
 Never: ``save_config_to_flash``, ``load_config_from_flash``, the global
-``configs:reset_to_default``, ``reset``, ``reboot``, ``poweroff``.
+``configs:reset_to_default``, any request to a never-touch store other
+than a GET, ``reset``, ``reboot``, ``poweroff``.
 
 Not yet measured (record when this runs): the wall-clock cost of one
 ``apply_factory_baseline`` on the U64E (one category GET + one reset PUT
@@ -51,7 +59,6 @@ from c64_test_harness.backends.device_lock import DeviceLock, DeviceLockTimeout
 from c64_test_harness.backends.ultimate64_baseline import (
     BASELINE_CATEGORIES,
     BASELINE_EXCLUDED_CATEGORIES,
-    DETECTION_DERIVED_ITEMS,
     BaselineReport,
     apply_factory_baseline,
 )
@@ -123,40 +130,50 @@ def _present(client: Ultimate64Client, names: tuple[str, ...]) -> list[str]:
     return [n for n in names if n in listed]
 
 
+#: The only items this module PUTs, and therefore the only ones it puts
+#: back (review should-fix 5: a PUT re-effectuates the whole store, so
+#: restoring items the module never changed is a side-effect, not a
+#: restore).
+_DRIFTED_BY_THIS_MODULE: tuple[tuple[str, str], ...] = (
+    (CARTRIDGE_SETTINGS_CATEGORY, CARTRIDGE_PREFERENCE_ITEM),
+    (CAT_CART, _ITEM_REU_SIZE),
+)
+
+
 @pytest.fixture(scope="module")
 def stock(client: Ultimate64Client) -> dict[str, dict[str, Any]]:
-    """Every covered category BEFORE any write, bare values.
-
-    Printed so a run's log shows what the device inherited; PUT back at
-    module end by :func:`restore_stock`.
-    """
+    """Every covered category BEFORE any write, bare values — printed so a
+    run's log shows what the device inherited (the never-touch stores are
+    printed too, read-only).  Only :data:`_DRIFTED_BY_THIS_MODULE` is put
+    back at module end (:func:`restore_drifted`)."""
     snap = {cat: _bare(client, cat) for cat in _present(client, BASELINE_CATEGORIES)}
     for cat, items in snap.items():
         print(f"[stock] {cat}: {items!r}")
+    for cat in _present(client, BASELINE_EXCLUDED_CATEGORIES):
+        print(f"[stock, never-touch] {cat}: {_bare(client, cat)!r}")
     return snap
 
 
 @pytest.fixture(scope="module", autouse=True)
-def restore_stock(client: Ultimate64Client, stock: dict[str, dict[str, Any]]):
-    """Leave the device as found: PUT back every covered item that differs.
+def restore_drifted(client: Ultimate64Client, stock: dict[str, dict[str, Any]]):
+    """PUT back only what this module itself drifted, if it still differs.
 
-    Every PUT is attempted; failures (the firmware answers 400 for
-    ``value=""`` on some items) are raised together at the end.
+    Both PUTs are attempted; failures are raised together at the end.
     """
     yield
     failures: list[str] = []
-    for cat, items in stock.items():
-        now = _bare(client, cat)
-        for item, want in items.items():
-            if now.get(item) == want:
-                continue
-            try:
+    for cat, item in _DRIFTED_BY_THIS_MODULE:
+        want = stock.get(cat, {}).get(item)
+        if want is None or want == "":
+            continue
+        try:
+            if client.get_config_value(cat, item) != want:
                 client.set_config_item(cat, item, want)
-            except Ultimate64Error as exc:
-                failures.append(f"{cat}/{item}={want!r}: {exc}")
+        except Ultimate64Error as exc:
+            failures.append(f"{cat}/{item}={want!r}: {exc}")
     if failures:
         raise Ultimate64Error(
-            f"{len(failures)} stock item(s) could not be restored: " + "; ".join(failures)
+            f"{len(failures)} drifted item(s) could not be put back: " + "; ".join(failures)
         )
 
 
@@ -181,9 +198,8 @@ def _pick_non_default(client: Ultimate64Client, category: str, item: str,
 def _assert_every_covered_item_at_default(client: Ultimate64Client) -> dict[str, int]:
     """One item GET per covered item; returns items-checked per category.
 
-    The six ``DETECTION_DERIVED_ITEMS`` (SID socket detection results,
-    measured != default and power-cycle-stable on the U64E) are printed
-    and not compared — the same rule ``apply_factory_baseline`` applies.
+    Only the covered categories: the SID socket store (detection results)
+    and the RTC are never-touch and are not read here.
     """
     checked: dict[str, int] = {}
     off: list[str] = []
@@ -192,10 +208,6 @@ def _assert_every_covered_item_at_default(client: Ultimate64Client) -> dict[str,
         for item in _bare(client, cat):
             item_map = client.get_config_item(cat, item)
             if "default" not in item_map:
-                continue
-            if (cat, item) in DETECTION_DERIVED_ITEMS:
-                print(f"[detection-derived] {cat}/{item}: current={item_map.get('current')!r} "
-                      f"default={item_map['default']!r} (not compared)")
                 continue
             n += 1
             if item_map.get("current") != item_map["default"]:
@@ -234,10 +246,8 @@ def test_drifted_items_are_reset_and_every_covered_item_reads_default(
     record_property("categories_reset", list(report.reset))
     record_property("categories_skipped", list(report.skipped))
     record_property("drifted_items", [f"{c}/{i}" for c, i in report.drifted_items()])
-    record_property("detection_derived", {
-        f"{c}/{i}": v for c, items in report.detection_derived.items() for i, v in items.items()
-    })
     print(f"[apply] {elapsed:.2f}s — {report.summary()}")
+    assert not set(report.reset) & set(BASELINE_EXCLUDED_CATEGORIES)
     for cat, items in report.drifted.items():
         for item, (was, default) in items.items():
             print(f"[drift] {cat}/{item}: {was!r} -> default {default!r}")
@@ -261,6 +271,10 @@ def test_drifted_items_are_reset_and_every_covered_item_reads_default(
 def test_excluded_stores_are_byte_identical(
     client: Ultimate64Client, stock: dict, record_property
 ) -> None:
+    """The five never-touch stores read the same before and after the
+    entry reset.  For ``SID Sockets Configuration`` this is the proof the
+    sockets kept their detected state (a reset there flips all six items,
+    U64E n=3); for ``Clock Settings`` that the RTC store was not armed."""
     excluded = _present(client, BASELINE_EXCLUDED_CATEGORIES)
     record_property("excluded_present", excluded)
     assert excluded, "the device lists none of the excluded stores?"

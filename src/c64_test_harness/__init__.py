@@ -173,7 +173,7 @@ from .backends.ultimate64_baseline import (
     BASELINE_CATEGORIES,
     BASELINE_EXCLUDED_CATEGORIES,
     BASELINE_ON_ENTRY_ENV,
-    DETECTION_DERIVED_ITEMS,
+    BASELINE_NEVER_TOUCH,
     BaselineReport,
     U64BaselineError,
     apply_factory_baseline,
@@ -625,7 +625,7 @@ __all__ = [
     "BASELINE_CATEGORIES",
     "BASELINE_EXCLUDED_CATEGORIES",
     "BASELINE_ON_ENTRY_ENV",
-    "DETECTION_DERIVED_ITEMS",
+    "BASELINE_NEVER_TOUCH",
     # UCI network driver
     "UCI_IDENTIFIER",
     "UCI_DEVICE_REG",
