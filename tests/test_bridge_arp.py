@@ -17,13 +17,16 @@ inside its test and closed before the test ends, never at module scope.
 
 .. note::
 
-    Written without being run: authoring happened in a worktree that
-    must not spawn VICE (root VICE, sudo'd bridge scripts at canonical
-    paths, and a bench shared with another project's x64sc).  They are
-    modelled line by line on ``tests/test_bridge_ping.py`` (fixture,
-    markers, thread shape, memory layout) and ``tests/ethernet_scenarios.py``
-    (capture open/skip/fail disposition, send/recv).  Run them from the
-    canonical checkout with the bridge up.
+    Authored in a worktree that must not spawn VICE, modelled on
+    ``tests/test_bridge_ping.py`` (fixture, markers, thread shape, memory
+    layout) and ``tests/ethernet_scenarios.py`` (capture open/skip/fail
+    disposition, send/recv), and first run by the integrator on
+    2026-09-05 (bridge up, root VICE): the host-capture responder test
+    passed first time; the peer-VICE test failed on a stale frame in A's
+    promiscuous FIFO (now drained and filtered, see ``_drain_fifo``); the
+    two pinger tests hit an exhausted ``/dev/bpf*`` pool (now reported
+    as environmental, and each test holds at most one capture, only for
+    the exchange).  Run from the canonical checkout with the bridge up.
 
 Memory layout -- the ARP-capable routines are larger than the legacy
 ones (consume routine 585 bytes, full responder 630, TOD responder 754,
@@ -68,6 +71,7 @@ from c64_test_harness.capture import (
     CaptureTimeout,
     CaptureUnavailable,
     PacketCapture,
+    bpf_descriptor_summary,
     open_capture,
 )
 from c64_test_harness.execute import jsr, load_code
@@ -138,13 +142,76 @@ def _open_capture_or_dispose(iface: str) -> PacketCapture:
         verdict, reason = capture_failure_disposition(exc, iface=iface, vice_live=True)
         if verdict == "skip":
             pytest.skip(reason)
+        if exc.cause == "busy":
+            # Environmental, not a defect in the code under test: every
+            # node is held by someone (the two root VICEs take two each,
+            # dnsmasq rigs hold theirs permanently, and any capture left
+            # open -- ours or another agent's on en4 -- eats the rest).
+            # Fail loudly, and name the holders.
+            pytest.fail(
+                f"BPF POOL EXHAUSTED (environmental; nothing here was asserted): {reason}\n"
+                f"holders now:\n{bpf_descriptor_summary()}"
+            )
         pytest.fail(reason)
 
 
-def _is_arp_reply_from(ip: bytes):
+def _describe(frame: bytes) -> str:
+    """One line per frame for failure messages: ARP fields or ethertype+src."""
+    pkt = parse_arp(frame)
+    if pkt is not None:
+        return (
+            f"ARP op{pkt.opcode} {pkt.sender_mac.hex(':')}/{'.'.join(map(str, pkt.sender_ip))}"
+            f" -> {pkt.target_mac.hex(':')}/{'.'.join(map(str, pkt.target_ip))}"
+        )
+    return f"type {frame[12:14].hex()} from {frame[6:12].hex(':')}"
+
+
+def _drain_fifo(
+    transport: BinaryViceTransport,
+    *,
+    max_frames: int = 16,
+    quiet_s: float = 0.5,
+) -> list[bytes]:
+    """Empty the CS8900a RX FIFO through the peek/consume pattern.
+
+    Every VICE on the bridge runs RxCTL promiscuous (``0x0D85``), so a
+    FIFO holds whatever the *previous* test put on the wire -- B's ARP
+    reply to the fake host of the host-capture test sat in A's FIFO and
+    was mistaken for the reply to A (first live run, 2026-09-05).  A test
+    that will read frames must not assume an empty FIFO at its start.
+
+    Returns the drained frames.  Stops after ``quiet_s`` with nothing
+    pending, or at ``max_frames`` (a FIFO that never empties is a wedge,
+    not traffic).
+    """
+    load_code(transport, PEEK_ADDR, build_rx_peek_code(PEEK_ADDR, RESULT))
+    load_code(transport, CONSUME_ADDR,
+              _build_drain_one_frame_code(CONSUME_ADDR, RX_FRAME_BUF, RESULT))
+    drained: list[bytes] = []
+    while len(drained) < max_frames:
+        if poll_until_ready(transport, code_addr=PEEK_ADDR, result_addr=RESULT,
+                            timeout_s=quiet_s) != 0x01:
+            break
+        write_bytes(transport, RESULT, [0x00])
+        jsr(transport, CONSUME_ADDR, timeout=5.0)
+        drained.append(bytes(read_bytes(transport, RX_FRAME_BUF, _RX_BYTES)))
+    return drained
+
+
+def _is_arp_reply_to(sender_ip: bytes, target_mac: bytes, target_ip: bytes):
+    """ARP reply from *sender_ip* addressed to *target_mac*/*target_ip*.
+
+    Filtering on the sender alone is not enough: with promiscuous RxCTL
+    the responder's replies to *other* askers are visible too.
+    """
     def match(frame: bytes) -> bool:
         pkt = parse_arp(frame)
-        return pkt is not None and pkt.is_reply and pkt.sender_ip == ip
+        return (
+            pkt is not None and pkt.is_reply
+            and pkt.sender_ip == sender_ip
+            and pkt.target_mac == target_mac
+            and pkt.target_ip == target_ip
+        )
     return match
 
 
@@ -249,7 +316,7 @@ class TestBridgeArpResponder:
 
             cap.send(build_arp_request_frame(HOST_MAC, HOST_IP, IP_B))
             try:
-                reply = cap.recv(10.0, match=_is_arp_reply_from(IP_B))
+                reply = cap.recv(10.0, match=_is_arp_reply_to(IP_B, HOST_MAC, HOST_IP))
             except CaptureTimeout as exc:
                 b_rx = bytes(read_bytes(transport_b, RX_FRAME_BUF, _RX_BYTES))
                 pytest.fail(
@@ -301,6 +368,11 @@ class TestBridgeArpResponder:
 
         def a_side() -> int:
             time.sleep(1.0)  # B first
+            # A's FIFO is promiscuous and may still hold the previous
+            # test's traffic (B's reply to the fake host, on the first
+            # live run).  Empty it before anything of ours goes out.
+            stale = _drain_fifo(transport_a)
+
             arp = build_arp_request_frame(MAC_A, IP_A, IP_B)
             load_code(transport_a, CONSUME_ADDR,
                       build_tx_code(CONSUME_ADDR, TX_FRAME_BUF, len(arp), RESULT))
@@ -312,27 +384,35 @@ class TestBridgeArpResponder:
             load_code(transport_a, PEEK_ADDR, build_rx_peek_code(PEEK_ADDR, RESULT))
             load_code(transport_a, CONSUME_ADDR,
                       _build_drain_one_frame_code(CONSUME_ADDR, RX_FRAME_BUF, RESULT))
+            is_reply_to_a = _is_arp_reply_to(IP_B, MAC_A, IP_A)
             deadline = time.monotonic() + 10.0
-            seen: list[bytes] = []
-            got_reply = False
-            while time.monotonic() < deadline and not got_reply:
-                if poll_until_ready(transport_a, code_addr=PEEK_ADDR, result_addr=RESULT,
-                                    timeout_s=deadline - time.monotonic()) != 0x01:
+            drained: list[bytes] = []
+            reply: bytes | None = None
+            max_drain = 16
+            while reply is None and len(drained) < max_drain:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or poll_until_ready(
+                        transport_a, code_addr=PEEK_ADDR, result_addr=RESULT,
+                        timeout_s=remaining) != 0x01:
                     break
                 write_bytes(transport_a, RESULT, [0x00])
                 jsr(transport_a, CONSUME_ADDR, timeout=5.0)
                 frame = bytes(read_bytes(transport_a, RX_FRAME_BUF, _RX_BYTES))
-                seen.append(frame)
-                pkt = parse_arp(frame)
-                if pkt is not None and pkt.is_reply and pkt.sender_ip == IP_B:
-                    assert pkt.sender_mac == MAC_B, f"sender MAC {pkt.sender_mac.hex()} != B"
-                    assert pkt.target_mac == MAC_A and pkt.target_ip == IP_A, "target must be A"
-                    assert pkt.dst_mac == MAC_A, "reply must be unicast to A"
-                    got_reply = True
-            if not got_reply:
+                if is_reply_to_a(frame):
+                    reply = frame
+                else:
+                    drained.append(frame)      # not for A: B's reply to another asker, etc.
+            if reply is None:
                 raise AssertionError(
-                    f"no ARP reply from B reached A; frames seen: {[f[:14].hex() for f in seen]}"
+                    f"no ARP reply from B addressed to A within 10 s "
+                    f"({len(drained)}/{max_drain} other frames drained after the request, "
+                    f"{len(stale)} stale before it).\n"
+                    " drained after request:\n  " + "\n  ".join(map(_describe, drained))
+                    + "\n stale before request:\n  " + "\n  ".join(map(_describe, stale))
                 )
+            pkt = parse_arp(reply)
+            assert pkt is not None and pkt.sender_mac == MAC_B, f"sender MAC != B: {_describe(reply)}"
+            assert pkt.dst_mac == MAC_A, f"reply must be unicast to A: {_describe(reply)}"
 
             echo = build_echo_request_frame(
                 src_mac=MAC_A, dst_mac=MAC_B, src_ip=IP_A, dst_ip=IP_B,
@@ -368,9 +448,18 @@ class TestBridgeArpResponder:
 
 
 class TestBridgeArpPinger:
-    """A resolves B before pinging, in one 6502 run and via the orchestrator."""
+    """A resolves B before pinging, in one 6502 run and via the orchestrator.
+
+    Capture discipline: each test opens exactly **one** host capture, on
+    ``IFACE_A``, inside a ``with`` block that also spans the worker
+    threads, and reads frames *while* the threads run (so nothing waits
+    on a BPF buffer across a 30 s ``jsr``).  It is closed before the
+    threads are joined and before the test returns.  Open captures per
+    test: 1 during the run, 0 at exit.
+    """
 
     def _collect_from_a(self, cap: PacketCapture, count: int, timeout: float) -> list[bytes]:
+        """Frames whose source MAC is A's, in wire order, until *count* or *timeout*."""
         frames: list[bytes] = []
         deadline = time.monotonic() + timeout
         while len(frames) < count and time.monotonic() < deadline:
@@ -381,6 +470,17 @@ class TestBridgeArpPinger:
                 ))
             except CaptureTimeout:
                 break
+        return frames
+
+    def _run_with_capture(self, responder, pinger, *, collect_timeout: float) -> list[bytes]:
+        """Start both sides, read A's frames off the wire as they appear, close the capture."""
+        threads = [threading.Thread(target=t, daemon=True) for t in (responder, pinger)]
+        with _open_capture_or_dispose(IFACE_A) as cap:
+            for t in threads:
+                t.start()
+            frames = self._collect_from_a(cap, 2, timeout=collect_timeout)
+        for t in threads:
+            t.join(timeout=45.0)
         return frames
 
     def test_ping_routine_emits_arp_then_icmp_in_one_run(
@@ -422,16 +522,16 @@ class TestBridgeArpPinger:
             jsr(transport_a, PING_CODE, timeout=30.0)
             return read_bytes(transport_a, RESULT, 1)[0]
 
-        with _open_capture_or_dispose(IFACE_A) as cap:
-            _run_threads(
-                lambda: b.run(lambda: run_icmp_responder(
-                    transport_b, rx_buf=RX_FRAME_BUF, my_ip=IP_B, result_addr=RESULT,
-                    timeout_s=20.0, peek_addr=PEEK_ADDR, consume_addr=CONSUME_ADDR,
-                    my_mac=MAC_B,
-                )),
-                lambda: a.run(a_side),
-            )
-            frames = self._collect_from_a(cap, 2, timeout=5.0)
+        # One capture, open only for the duration of the exchange.
+        frames = self._run_with_capture(
+            lambda: b.run(lambda: run_icmp_responder(
+                transport_b, rx_buf=RX_FRAME_BUF, my_ip=IP_B, result_addr=RESULT,
+                timeout_s=20.0, peek_addr=PEEK_ADDR, consume_addr=CONSUME_ADDR,
+                my_mac=MAC_B,
+            )),
+            lambda: a.run(a_side),
+            collect_timeout=20.0,
+        )
 
         kinds = [f[12:14].hex() for f in frames]
         assert len(frames) >= 2, f"expected ARP then ICMP from A on {IFACE_A}, saw {kinds}"
@@ -473,16 +573,15 @@ class TestBridgeArpPinger:
                 timeout_s=15.0, peek_addr=PEEK_ADDR, consume_addr=CONSUME_ADDR,
             )
 
-        with _open_capture_or_dispose(IFACE_A) as cap:
-            _run_threads(
-                lambda: b.run(lambda: run_icmp_responder(
-                    transport_b, rx_buf=RX_FRAME_BUF, my_ip=IP_B, result_addr=RESULT,
-                    timeout_s=20.0, peek_addr=PEEK_ADDR, consume_addr=CONSUME_ADDR,
-                    my_mac=MAC_B,
-                )),
-                lambda: a.run(a_side),
-            )
-            frames = self._collect_from_a(cap, 2, timeout=5.0)
+        frames = self._run_with_capture(
+            lambda: b.run(lambda: run_icmp_responder(
+                transport_b, rx_buf=RX_FRAME_BUF, my_ip=IP_B, result_addr=RESULT,
+                timeout_s=20.0, peek_addr=PEEK_ADDR, consume_addr=CONSUME_ADDR,
+                my_mac=MAC_B,
+            )),
+            lambda: a.run(a_side),
+            collect_timeout=20.0,
+        )
 
         kinds = [f[12:14].hex() for f in frames]
         assert kinds[:2] == ["0806", "0800"], f"wire order from A was {kinds}"
