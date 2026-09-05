@@ -938,6 +938,50 @@ def _write_prg_body_verified(transport: Any, load_addr: int, body: bytes,
                 "after a clean head -- not the known head-clobber; refusing to SYS"
             )
 
+_CARTRIDGE_CATEGORY = "C64 and Cartridge Settings"
+_CARTRIDGE_PREFERENCE_ITEM = "Cartridge Preference"
+
+
+def _reselect_external_cartridge(transport: Any) -> bool:
+    """Re-PUT ``Cartridge Preference`` on a U64 if it reads ``External``.
+
+    Why (issue #217, measured on a U64E fw 3.15 fork with an RR-Net, n=3
+    per arm): the firmware's runner load path -- ``load_prg`` as much as
+    ``run_prg`` -- deselects an external cartridge, and the deselection is
+    *sticky*: it survives every ``reset()`` while the config item still
+    reads ``External``, and only another PUT of that item (same value)
+    re-selects the cartridge.  The PUT alone is enough; no reset is
+    needed afterwards.  The REST reset and host DMA writes (REST or
+    SocketDMA) never touch it.
+
+    So a single ``client.run_prg`` anywhere in a session would leave every
+    later ``run_prg_via_sys`` on this device blind to the cartridge.  One
+    GET + one PUT per call buys immunity from that.  Returns ``True`` when
+    a PUT was issued.  Best-effort: a config-path failure is logged, not
+    raised, because it must not turn a working load into an error on a
+    device whose config API is briefly busy.
+    """
+    client = getattr(transport, "client", None)
+    if client is None:
+        return False
+    try:
+        cat = client.get_config_category(_CARTRIDGE_CATEGORY)
+        items = cat.get(_CARTRIDGE_CATEGORY) if isinstance(cat, dict) else None
+        pref = items.get(_CARTRIDGE_PREFERENCE_ITEM) if isinstance(items, dict) else None
+        if pref != "External":
+            return False
+        client.set_config_item(_CARTRIDGE_CATEGORY, _CARTRIDGE_PREFERENCE_ITEM, pref)
+    except Exception as exc:  # noqa: BLE001 -- best-effort by contract
+        logger.warning(
+            "run_prg_via_sys: could not re-select the external cartridge "
+            "(%s: %s); a prior run_prg/load_prg may have left it deselected "
+            "(issue #217)", type(exc).__name__, exc,
+        )
+        return False
+    logger.debug("run_prg_via_sys: re-PUT %s=External (issue #217)",
+                 _CARTRIDGE_PREFERENCE_ITEM)
+    return True
+
 
 def run_prg_via_sys(
     target: Any,
@@ -948,6 +992,7 @@ def run_prg_via_sys(
     boot_timeout: float = 25.0,
     verify_timeout: float = 10.0,
     settle_after_ready: float | None = None,
+    reselect_cartridge: bool = True,
 ) -> int:
     """Load *prg* into RAM and start it with a ``SYS`` typed at BASIC.
 
@@ -958,10 +1003,16 @@ def run_prg_via_sys(
     while ``Cartridge Preference`` still reads ``External``, so anything
     driving a cartridge — an RR-Net, most obviously — fails at its first
     register read.  Stock ip65 reports ``INIT DRIVER: FAILED`` that way.
-    The cause is not isolated (the DMA load, the reset ``run_prg``
-    performs, or something between them); only the outcome is measured
-    (issue #211).  Writing the program into RAM and typing ``SYS`` leaves
-    the cartridge on the bus.
+    The cause is the firmware's runner load path itself (issue #217,
+    measured n=3 per arm on a U64E fw 3.15 fork): ``load_prg`` alone
+    deselects the cartridge just as ``run_prg`` does, the REST reset and
+    host DMA writes (REST or SocketDMA) do not, and the deselection is
+    sticky -- it survives every ``reset()`` until ``Cartridge Preference``
+    is PUT again (same value; no reset needed after the PUT).  Writing
+    the program into RAM and typing ``SYS`` leaves the cartridge on the
+    bus, and on a U64 this helper re-PUTs the preference first (see
+    *reselect_cartridge*) so a neighbour's earlier ``run_prg`` cannot
+    leave it deselected for this run.
 
     Works on either backend: ``write_memory`` plus keystrokes, then a
     resume so the typed line actually runs under VICE.
@@ -981,6 +1032,12 @@ def run_prg_via_sys(
         :data:`_U64_POST_READY_SETTLE` on an Ultimate 64 after a reset --
         the U64 zeroes ``$0801/$0802`` once, 2-5 s after the banner --
         and ``0`` otherwise.
+    :param reselect_cartridge: On an Ultimate 64, re-PUT ``Cartridge
+        Preference`` when it reads ``External`` before doing anything else
+        (one GET, at most one PUT).  This undoes the sticky deselection a
+        previous ``client.run_prg``/``load_prg`` leaves behind (issue
+        #217).  Ignored on VICE.  Pass ``False`` to skip the config
+        round-trip.
     :returns: The SYS address used.
     :raises ValueError: if *prg* is too short, or no entry point was given
         and none could be parsed from the stub.
@@ -1003,6 +1060,9 @@ def run_prg_via_sys(
                 "no SYS token found in the PRG's BASIC stub; pass sys_addr="
                 "<entry point> explicitly"
             )
+
+    if reselect_cartridge and _is_u64_target(transport):
+        _reselect_external_cartridge(transport)
 
     if reset:
         transport.reset()
