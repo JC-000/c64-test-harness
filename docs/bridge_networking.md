@@ -770,15 +770,46 @@ Two more hardware-only facts, both in issues #209 and #211:
   `run_prg_via_sys(target, prg)`, which writes the PRG into RAM and types
   `SYS`.  Stock ip65 `ping.prg` reports `INIT DRIVER: FAILED` under
   `run_prg` and pings normally under `run_prg_via_sys`.
-* **Send an ARP request before the first exchange with a host.**  The
-  harness's ping routines neither send nor answer ARP, and macOS keeps a
-  stale neighbour entry visible in `arp -n` while queuing every reply
-  behind revalidation -- so a routine that only pings gets 0/8 with the
-  requests visibly leaving the wire and the replies still sitting on the
-  host, and 6/6 once an ARP request precedes the ping (issue #212, closed
-  invalid: it was never a chip fault).  Any of: TX an ARP request first
-  (what ip65's `icmp_ping` does; `scripts/validate_ping.py` builds one),
-  add an ARP responder, or pin a static neighbour entry on the host.
+* **Resolve before the first exchange with a host: pass the ARP frame,
+  or use the responder, which now answers ARP (issue #218).**  Until #218
+  the harness's ping routines neither sent nor answered ARP, and macOS
+  keeps a stale neighbour entry visible in `arp -n` while queuing every
+  reply behind revalidation -- so a routine that only pinged got 0/8 with
+  the requests visibly leaving the wire and the replies still sitting on
+  the host, and 6/6 once an ARP request preceded the ping (issue #212,
+  closed invalid: it was never a chip fault).  ip65 is immune because
+  `icmp_ping` ARPs first and `arp_process` answers requests.  The harness
+  now does the same, opt-in:
+  - **Pinging:** `build_arp_request_frame(src_mac, src_ip, target_ip)`
+    (60 bytes, RFC 826 at ip65's `ap_*` offsets) into RAM, then
+    `build_ping_and_wait_code(..., arp_frame_buf=ADDR)` /
+    `build_ping_and_wait_tod_code(..., arp_frame_buf=ADDR)` transmit it
+    before the echo request in the same run and drain the ARP reply as a
+    non-matching frame.  `run_ping_and_wait` (VICE-only) does this by
+    default (`arp=True`), deriving the request from the echo frame's own
+    MAC/IPs.
+  - **Responding:** `build_icmp_responder_code` /
+    `build_icmp_responder_tod_code` /
+    `build_read_and_respond_echo_request_code` with `my_mac=` answer an
+    ARP request for `my_ip` from the received frame in place and go back
+    to waiting for the echo (`run_icmp_responder(my_mac=...)`; the
+    consume routine reports `RESULT_ARP_REPLY_SENT = 0x03`).  Without
+    `my_mac` -- and without `arp_frame_buf` -- every builder's output is
+    byte-identical to before, so nothing sized to the old routines moves;
+    with ARP on they are larger (consume 585 B, responder 630 B, TOD
+    responder 754 B, ping-and-wait 319 B; the 480-byte `$C000-$C1DF`
+    window does not fit an ARP-enabled responder).
+  - `parse_arp(frame) -> ArpPacket | None` reads either direction back
+    from a buffer or a capture.
+
+  **Measured under VICE and on a simulated CS8900a only** so far: the
+  ARP behaviour is proven by `tests/test_cs8900a_arp.py` (default suite;
+  runs the emitted 6502 on `tests/cs8900a_sim.py`) and by the two-VICE
+  `tests/test_bridge_arp.py`; the 0/8 -> 6/6 figure above is the only
+  hardware measurement, and it was taken with a hand-built ARP frame and
+  `build_tx_code`, not with these builders.  A U64E + RR-Net pass of the
+  new parameters is still owed.  Pinning a static neighbour entry on the
+  host remains a valid workaround for code that cannot change.
 
 ## Capture-only sample (host tcpdump)
 

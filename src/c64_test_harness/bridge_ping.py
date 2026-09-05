@@ -18,6 +18,12 @@ small 6502 routine in each instance handles one network activity:
 * :func:`build_tx_code` -- simple 6502 routine that transmits a pre-built
   frame from memory.
 
+ARP (issue #218): :func:`build_arp_request_frame` / :func:`parse_arp` on
+the host side; the ping builders take ``arp_frame_buf`` to resolve before
+they ping, and the responders take ``my_mac`` to answer requests for
+their IP -- both opt-in, both mirroring ip65's ``arp.s``.  A host that
+never sees an ARP exchange queues every echo reply (issue #212).
+
 Both routines write a single-byte status flag at a well-known address:
 
 * ``0x00`` -- pending

@@ -433,26 +433,20 @@ An RR-Net-compatible cartridge in the U64's expansion port is a real CS8900a at 
 - **`client.run_prg()` leaves the cartridge deselected**: the program it loads sees `$DE00` as zeros while the config still says `External` (stock ip65 prints `INIT DRIVER: FAILED`); the cause is not isolated (#211), only the outcome is measured. Start PRGs with `run_prg_via_sys(target, prg)` — write to RAM + typed `SYS` + resume.
 - **Host-side `write_memory` never reaches the cartridge on hardware** (and host reads of the window are not meaningful), so `set_cs8900a_mac()` — which works under VICE — is a silent no-op here; program the MAC from the 6510 with `cs8900a_set_mac_inline_code(mac)`.
 - **No `jsr()` on hardware**: `run_ping_and_wait` / `run_icmp_responder` / `poll_until_ready` are VICE-only. Use the `*_tod_code` builders (each ends `CLI; RTS`) through `run_subroutine`, which needs BASIC `READY.`.
-- **ARP before the first ping to a host.** The harness routines never send or answer ARP, so a macOS host keeps a stale neighbour entry and *queues* every echo reply behind it — a run that never ARPs gets 0/N with the requests visibly leaving the wire (issue #212, closed invalid: not a chip fault). One ARP request from the C64 flushes the backlog; stock ip65 is immune because `icmp_ping` ARPs first.
+- **Resolve before the first ping to a host: pass the ARP frame (`arp_frame_buf=`), and give responders `my_mac=` so they answer ARP.** A macOS host keeps a stale neighbour entry and *queues* every echo reply behind it — a run that never ARPs gets 0/N with the requests visibly leaving the wire (issue #212, closed invalid: not a chip fault); stock ip65 is immune because `icmp_ping` ARPs first and `arp_process` answers. Since #218 the harness does both, opt-in: `build_arp_request_frame(mac, ip_c64, ip_host)` into RAM and `build_ping_and_wait_tod_code(..., arp_frame_buf=ARP_BUF)` transmits it before the echo in one run (the ARP reply is drained as a non-match); `build_icmp_responder_tod_code(..., my_mac=mac)` answers ARP requests for `my_ip` while waiting. Defaults (`None`) keep every builder byte-identical to before; with ARP on the routines are larger (consume 585 B, responder 630 B, TOD responder 754 B, ping 319 B — size the code window for them). **Measured under VICE and on a simulated chip only**: the 0/8 → 6/6 hardware figure came from a hand-built frame and `build_tx_code`; a U64E pass of these parameters is still owed.
 
 ```python
 from c64_test_harness import (
     create_manager, run_subroutine, write_bytes, read_bytes, wait_for_text,
-    build_echo_request_frame, build_ping_and_wait_tod_code, build_bridge_tx_code,
+    build_arp_request_frame, build_echo_request_frame, build_ping_and_wait_tod_code,
     cs8900a_enable_inline_code, cs8900a_set_mac_inline_code, generate_mac, parse_mac,
 )
 from c64_test_harness.bridge_ping import PPTR_LO, PPTR_HI, PPDATA_LO, PPDATA_HI
 
-CODE, RESULT, TX_BUF, RX_BUF = 0xC000, 0xC1F0, 0xC500, 0xC700
+CODE, RESULT, TX_BUF, ARP_BUF, RX_BUF = 0xC000, 0xC1F0, 0xC500, 0xC580, 0xC700
 mac = generate_mac(1)
 host_mac = parse_mac("c0:56:27:b1:16:38")            # the host NIC on the cartridge's link
 ip_c64, ip_host = bytes([10, 0, 66, 200]), bytes([10, 0, 66, 1])
-
-def arp_request(src_mac: bytes, src_ip: bytes, target_ip: bytes) -> bytes:
-    f = (b"\xff" * 6 + src_mac + b"\x08\x06"           # broadcast, EtherType ARP
-         + b"\x00\x01\x08\x00\x06\x04\x00\x01"           # eth/IPv4, hlen 6, plen 4, request
-         + src_mac + src_ip + b"\x00" * 6 + target_ip)
-    return f + b"\x00" * (60 - len(f))
 
 with create_manager(backend="u64", u64_hosts="10.43.23.81") as mgr:
     with mgr.instance() as target:
@@ -475,19 +469,18 @@ with create_manager(backend="u64", u64_hosts="10.43.23.81") as mgr:
         run_subroutine(target, CODE, timeout=5.0)
         assert read_bytes(t, RESULT, 2) == b"\x0e\x63", "no CS8900a on the bus (PP $0000 != $630E)"
 
-        # Prime the host's neighbour cache (issue #212).
-        arp = arp_request(mac, ip_c64, ip_host)
-        write_bytes(t, TX_BUF, arp)
-        write_bytes(t, CODE, build_bridge_tx_code(CODE, TX_BUF, len(arp), RESULT))
-        write_bytes(t, RESULT, b"\x00")
-        run_subroutine(target, CODE, timeout=5.0)
-
         # Ping with the TOD-timed builder; result 0x01 match / 0xFF deadline.
+        # arp_frame_buf= makes it ARP for the host first, in the same run,
+        # so the host's neighbour cache is fresh before the echo goes out
+        # (issues #212/#218).  Without it the routine is byte-identical to
+        # the pre-#218 one and the host may queue the reply.
         echo = build_echo_request_frame(src_mac=mac, dst_mac=host_mac, src_ip=ip_c64, dst_ip=ip_host)
         write_bytes(t, TX_BUF, echo.frame)
+        write_bytes(t, ARP_BUF, build_arp_request_frame(mac, ip_c64, ip_host))
         write_bytes(t, CODE, build_ping_and_wait_tod_code(
             CODE, TX_BUF, len(echo.frame), RX_BUF, RESULT,
-            echo.identifier, echo.sequence, deadline_tenths=40))
+            echo.identifier, echo.sequence, deadline_tenths=40,
+            arp_frame_buf=ARP_BUF))
         write_bytes(t, RESULT, b"\x00")
         run_subroutine(target, CODE, timeout=10.0)
         assert read_bytes(t, RESULT, 1) == b"\x01"
@@ -507,7 +500,7 @@ Layout is the bridge layout (peek/consume unused here). **Leave ≥ 0.2 s betwee
 
 2a. **Read the RX FIFO header high-half-first.** The RxStatus and RxLength words must be read from `$DE09` before `$DE08`; the data body is then read low-half-first. That is ip65's ordering. Getting it backwards desynchronises a real CS8900a by one byte — `RxLength` is garbage and every data word arrives byte-swapped — while VICE tolerates either order, so no VICE test can catch it (issue #210). `_emit_read_frame` does this for you; `tests/test_cs8900a_frame_reader.py` pins it.
 
-2b. **Hardware RR-Net on the U64 needs `Cartridge Preference = External`** (`client.set_config_item("C64 and Cartridge Settings", "Cartridge Preference", "External")`; on the default `Auto` the whole `$DE00` window reads zeros, `Bus Operation Mode` is irrelevant), and must NOT be started with `client.run_prg()` — its DMA load drops the external cartridge, so the program reads `$DE00` as zeros. Use `run_prg_via_sys(target, prg)` (resets, waits for `READY.`, writes the PRG to RAM, types the `SYS` parsed from its BASIC stub and resumes; `reset=False` / `sys_addr=` override). `set_cs8900a_mac()` works under VICE and is useless on hardware: a U64 host write to `$DE02`/`$DE04` never reaches the expansion port, so program the MAC from the 6510 with `cs8900a_set_mac_inline_code(mac)` (prepend `cs8900a_enable_inline_code()`) or the `cs8900a_set_mac_code(mac)` blob. And send an ARP request before the first ping to a host — see 2c (issues #209, #211, #212). Full recipe: "Hardware RR-Net on the U64" above.
+2b. **Hardware RR-Net on the U64 needs `Cartridge Preference = External`** (`client.set_config_item("C64 and Cartridge Settings", "Cartridge Preference", "External")`; on the default `Auto` the whole `$DE00` window reads zeros, `Bus Operation Mode` is irrelevant), and must NOT be started with `client.run_prg()` — its DMA load drops the external cartridge, so the program reads `$DE00` as zeros. Use `run_prg_via_sys(target, prg)` (resets, waits for `READY.`, writes the PRG to RAM, types the `SYS` parsed from its BASIC stub and resumes; `reset=False` / `sys_addr=` override). `set_cs8900a_mac()` works under VICE and is useless on hardware: a U64 host write to `$DE02`/`$DE04` never reaches the expansion port, so program the MAC from the 6510 with `cs8900a_set_mac_inline_code(mac)` (prepend `cs8900a_enable_inline_code()`) or the `cs8900a_set_mac_code(mac)` blob. And resolve before the first ping to a host — `arp_frame_buf=` on the ping builders, `my_mac=` on the responders (issues #209, #211, #212, #218). Full recipe: "Hardware RR-Net on the U64" above.
 
 2c. **TxCMD is `$00C9` and the RxEvent poll mask is `$0D`, not `$C0`/`$01`.** Same read-only-register-number rule as RxCTL: `CS8900A_TXCMD_VALUE = 0x00C9` (TxStart-after-full-frame plus regnum 9) and `CS8900A_RXEVENT_MASK = 0x0D` (RxOK | IndividualAdr | Broadcast) are what ip65 writes and what every harness builder now emits (#213). Hand-rolled TX or poll code that still writes `$C0` / masks `$01` matches VICE and misses frames on silicon.
 

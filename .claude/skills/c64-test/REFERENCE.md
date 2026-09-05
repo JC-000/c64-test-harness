@@ -1190,18 +1190,22 @@ All address arguments default to the `$C000` UCI block (`code_addr=0xC000`, data
 Bridge networking helpers — two VICE instances on a host bridge (Linux TAP + `br-c64`, or macOS `feth` + `bridge10`) talking L2 + IP + ICMP via CS8900a. See Pattern 8 in `PATTERNS.md`.
 
 ### High-level orchestrators (own the wall-clock deadline in Python; **VICE-only** — they drive the 6510 with `jsr()`)
-- `run_ping_and_wait(transport, *, tx_frame, rx_buf, result_addr, identifier, sequence, tx_frame_buf, timeout_s=5.0, peek_addr=..., consume_addr=...) -> int` — returns `0x01` on matched reply, `0xFF` on timeout
-- `run_icmp_responder(transport, *, rx_buf, my_ip, result_addr, timeout_s=5.0, peek_addr=..., consume_addr=...) -> int` — reply to any echo request addressed to `my_ip`
+- `run_ping_and_wait(transport, *, tx_frame, rx_buf, result_addr, identifier, sequence, tx_frame_buf, timeout_s=5.0, peek_addr=..., consume_addr=..., arp=True) -> int` — returns `0x01` on matched reply, `0xFF` on timeout. `arp=True` (default, #218) first transmits an ARP request derived from `tx_frame`'s source MAC / source IP / destination IP through the same buffer; `ValueError` if `tx_frame` is not IPv4 — pass `arp=False` to send it raw.
+- `run_icmp_responder(transport, *, rx_buf, my_ip, result_addr, timeout_s=5.0, peek_addr=..., consume_addr=..., my_mac=None) -> int` — reply to any echo request addressed to `my_ip`; with `my_mac` also answers ARP requests for `my_ip` while waiting (re-polls on `RESULT_ARP_REPLY_SENT`)
 
 ### Frame + code builders
 - `build_echo_request_frame(src_mac, dst_mac, src_ip, dst_ip, identifier=0x1234, sequence=1, payload=b"PING_FROM_C64") -> EchoRequest` — pass `.frame` (padded to 60 bytes, word-aligned) as `tx_frame`
+- `build_arp_request_frame(src_mac, src_ip, target_ip) -> bytes` — broadcast "who has *target_ip*" (#218); `ARP_FRAME_LEN` = 60 bytes, RFC 826 at ip65's `ap_*` offsets. Feed to `build_bridge_tx_code` or `arp_frame_buf=` below
+- `build_arp_reply_frame(src_mac, src_ip, target_mac, target_ip) -> bytes` — unicast reply; the host-side twin of what the responders emit
+- `parse_arp(frame) -> ArpPacket | None` — `None` unless ethernet/IPv4 ARP (accepts the unpadded 42-byte packet). Both builders raise `ValueError` on a MAC/IP of the wrong length
 - `build_bridge_tx_code(...)` — transmit a pre-built frame via CS8900a
 - `build_rx_peek_code(...)` — bounded peek into RX FIFO (drives orchestrator polling)
 - `build_rx_echo_reply_code(...)` — full-routine echo-reply match (legacy, virtual-cycle timing)
 - `build_read_and_match_echo_reply_code(...)` — read a pending frame, match against expected reply
-- `build_read_and_respond_echo_request_code(...)` — read request, respond with reply in one pass
-- `build_ping_and_wait_code(...)` — legacy TX+RX combined, virtual-cycle timing
-- `build_icmp_responder_code(...)` — legacy responder, virtual-cycle timing
+- `build_read_and_respond_echo_request_code(..., my_mac=None)` — read request, respond with reply in one pass; with `my_mac` an ARP request for `my_ip` is answered and the result is `RESULT_ARP_REPLY_SENT` (`0x03`, re-poll)
+- `build_ping_and_wait_code(..., arp_frame_buf=None, arp_frame_len=None)` — legacy TX+RX combined, virtual-cycle timing; with `arp_frame_buf` the ARP frame there (length defaults to `ARP_FRAME_LEN`) is transmitted before the echo request in the same run, and the ARP reply is drained as a non-match (#218)
+- `build_icmp_responder_code(..., my_mac=None)` — legacy responder, virtual-cycle timing; with `my_mac` answers ARP requests for `my_ip` while waiting, then keeps waiting for the echo
+- ARP defaults (`None`) keep every builder byte-identical to its pre-#218 output (pinned by SHA-256 in `tests/test_cs8900a_arp.py`). ARP on makes them larger — consume 585 B, responder 630 B, TOD responder 754 B, ping-and-wait 319 B, TOD ping 443 B — so size code windows accordingly. Proven under VICE and on the simulated chip (`tests/cs8900a_sim.py`); a hardware pass is still owed.
 - Init helpers (blob = ends in `RTS`; inline = no `RTS`, prepend to a routine). All enable the RR clockport first.
   - `cs8900a_enable_inline_code()` — RxCTL = `CS8900A_RXCTL_VALUE`, then LineCTL |= SerRxON|SerTxON; everything a fresh chip needs
   - `cs8900a_rxctl_inline_code(value=CS8900A_RXCTL_VALUE)` / `cs8900a_rxctl_code()`
@@ -1210,12 +1214,13 @@ Bridge networking helpers — two VICE instances on a host bridge (Linux TAP + `
 - Constants (import from `c64_test_harness.bridge_ping`; not package-root exports): `CS8900A_RXCTL_VALUE = 0x0D85` (PromiscuousA|RxOKA|IndividualA|BroadcastA + regnum), `CS8900A_RXCTL_VALUE_IP65 = 0x0D05` (same, non-promiscuous — ip65's value), `CS8900A_TXCMD_VALUE = 0x00C9`, `CS8900A_RXEVENT_MASK = 0x0D`, `CS8900A_LINECTL_ENABLE = 0x00C0`. The low 6 bits of every CS8900a control register are the read-only register number (issue #207) — the old `0x00D8`/`0x00C0` only ever worked under VICE.
 
 ### TOD-timed variants (shippable on real C64 / U64E / VICE normal; NOT usable under VICE warp)
-- `build_ping_and_wait_tod_code(...)`
-- `build_icmp_responder_tod_code(...)`
+- `build_ping_and_wait_tod_code(..., deadline_tenths=50, *, arp_frame_buf=None, arp_frame_len=None)` — same ARP-first option as the counter variant
+- `build_icmp_responder_tod_code(..., deadline_tenths=50, *, my_mac=None)` — same ARP answer as the counter variant, against the same TOD deadline
 - `build_rx_echo_reply_tod_code(...)`
 
 ### Dataclasses
 - `EchoRequest` — `.frame`, `.identifier`, `.sequence`, `.payload`; what `build_echo_request_frame` returns
+- `ArpPacket` — `.dst_mac`, `.src_mac`, `.opcode`, `.sender_mac`, `.sender_ip`, `.target_mac`, `.target_ip`, `.is_request`, `.is_reply`; what `parse_arp` returns. Package-root exports: `ArpPacket`, `build_arp_request_frame`, `build_arp_reply_frame`, `parse_arp`; `ARP_FRAME_LEN`, `RESULT_ARP_REPLY_SENT`, `ETHERTYPE_ARP` live in `c64_test_harness.bridge_ping`
 
 **Test fixture:** `bridge_vice_pair` in `tests/conftest.py` brings up two VICE instances on `BRIDGE_NAME` (`br-c64` / `bridge10`), RR-Net mode, warp off, unique MACs, CS8900a initialised.
 
