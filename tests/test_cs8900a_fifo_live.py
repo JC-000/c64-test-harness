@@ -1,0 +1,443 @@
+"""Live CS8900a RX FIFO semantics on real silicon (issue #219).
+
+Question: after a *complete* read of a frame (all ``RxLength`` bytes) does
+the chip advance to the next frame on its own, or is SkipNow (RxCFG bit
+6, PP ``$0102``) still required?  ``_emit_read_frame`` always skips
+because it reads a fixed 60 bytes; ip65's ``cs8900a.s`` reads the whole
+frame, never skips, and works.
+
+Measured 2026-09-05 on the U64E (fw 3.15 fork) with an external RR-Net
+cabled point-to-point to the host NIC, RxCTL = ``$0505`` (RxOKA |
+IndividualA only), two host-injected unicast frames (100 B then 80 B,
+unique seed byte per frame) queued before each 6510 routine ran, n=3 per
+variant, interleaved (scratchpad ``exp219c.py`` / ``exp219d.py``):
+
+===============================================  ==========================
+after frame 1 was ...                            the next header read gave
+===============================================  ==========================
+read completely, header read *immediately*       ``$0000`` / zero body 3/3
+read completely, RxEvent polled until set        frame 2, no SkipNow, 3/3
+read completely, SkipNow, RxEvent polled         frame 2 (control)      3/3
+read partially (20 B), header read immediately   frame 1's *remaining
+                                                 data* (not zeros)      3/3
+read partially (20 B), SkipNow, RxEvent polled   frame 2 (control)      3/3
+===============================================  ==========================
+
+Three frames queued: frames 1 and 2 come out, the third never does and
+RxMISS (PP ``$0130``, count in bits 6-15) reads 1 -- the chip buffers
+exactly two frames of this size (3/3).
+
+So: a complete read *does* release the frame -- no SkipNow needed -- but
+the next frame's header is presented at RTDATA only once RxEvent's high
+byte (PPTR ``$0124``, ``$DE05``) has been read.  It is not a latency: the
+poll that succeeded took zero iterations (RxEvent was already set), while
+waiting 100 us / 1.3 ms / 10 ms with no RxEvent access still read ``$00``
+(3/3 each), and so did reading PP ``$0000``, writing PPTR alone, reading
+the RxEvent *low* byte, reading ``$DE00/$DE01``, or reading PP ``$0400``
+(3/3 each).  ip65 is correct because it polls RxEvent before every read.
+A partial read does not advance: the FIFO keeps handing out the rest of
+the current frame, so a fixed-length reader (``_emit_read_frame``) must
+SkipNow -- which is what it does.  The ``$00``-past-the-end observation
+from #210 is this same *between frames, RxEvent not yet read* state.
+
+Gates (all unset -> the module skips cleanly):
+
+* ``RRNET_LIVE=1`` -- master switch.
+* ``U64_HOST``     -- the device (no IPs are committed).
+* ``RRNET_IFACE``  -- host NIC on the cartridge's link (default ``en4``).
+
+Needs a capture node the process can open (macOS: world-rw ``/dev/bpf*``;
+Linux: ``CAP_NET_RAW``).  Sets ``Cartridge Preference = External`` for the
+module and restores it.  No elevation marker: nothing here changes host
+network state, it only injects and reads frames on the given NIC.
+"""
+
+from __future__ import annotations
+
+import os
+import platform
+import subprocess
+import time
+
+import pytest
+
+from c64_test_harness import create_manager
+from c64_test_harness.bridge_ping import (
+    CS8900A_RXEVENT_MASK,
+    PPDATA_HI,
+    PPDATA_LO,
+    PPTR_HI,
+    PPTR_LO,
+    RTDATA_HI,
+    RTDATA_LO,
+    Asm,
+    _emit_clockport_enable,
+    _emit_skip_packet,
+    cs8900a_linectl_or_inline_code,
+    cs8900a_rxctl_inline_code,
+    cs8900a_set_mac_inline_code,
+)
+from c64_test_harness.capture import CaptureUnavailable, open_capture
+from c64_test_harness.ethernet import parse_mac
+from c64_test_harness.execute import load_code, run_subroutine
+from c64_test_harness.memory import read_bytes, write_bytes
+from c64_test_harness.screen import wait_for_text
+
+_LIVE = os.environ.get("RRNET_LIVE")
+_HOST = os.environ.get("U64_HOST")
+_IFACE = os.environ.get("RRNET_IFACE", "en4")
+
+pytestmark = [
+    pytest.mark.skipif(not _LIVE, reason="RRNET_LIVE not set"),
+    pytest.mark.skipif(not _HOST, reason="U64_HOST not set"),
+]
+
+CAT = "C64 and Cartridge Settings"
+ITEM = "Cartridge Preference"
+
+C64_MAC = parse_mac("02:c6:40:00:00:01")
+RXCTL_IA_ONLY = 0x0505          # RxOKA (bit 8) | IndividualA (bit 10) | regnum 5
+
+CODE = 0x4000
+RES = 0x5000                    # result block, layout in _build_variant
+BUF1 = 0x5100                   # frame 1 data (<= 256 B)
+BUF2 = 0x5200                   # 16 bytes read after the second header
+DBUF = 0x5300                   # depth probe: 4 x (4 header + 16 data)
+LEN1, LEN2, LEN3 = 100, 80, 120
+PARTIAL_N = 20
+_tag = [0]
+
+
+def _host_mac(iface: str) -> bytes:
+    if platform.system() == "Darwin":
+        out = subprocess.run(["ifconfig", iface], capture_output=True, text=True).stdout
+        for ln in out.splitlines():
+            if "ether " in ln:
+                return parse_mac(ln.split()[1])
+    else:
+        try:
+            with open(f"/sys/class/net/{iface}/address") as fh:
+                return parse_mac(fh.read().strip())
+        except OSError:
+            pass
+    pytest.skip(f"cannot read the MAC of {iface}")
+
+
+# --------------------------------------------------------------------------- #
+# 6502 builders                                                                #
+# --------------------------------------------------------------------------- #
+
+def _pp_sel(a: Asm, off: int) -> None:
+    a.emit(0xA9, off & 0xFF, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
+    a.emit(0xA9, off >> 8, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
+
+
+def _poll_rxevent(a: Asm, got: str, timeout_lbl: str) -> None:
+    """Bounded RxEvent poll (~2.5 s at 1 MHz); A = masked high byte on exit."""
+    _tag[0] += 1
+    lbl = f"pl{_tag[0]}"
+    a.emit(0xA9, 0x00, 0x85, 0xFD, 0x85, 0xFE)
+    a.label(lbl)
+    _pp_sel(a, 0x0124)
+    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
+    a.emit(0x29, CS8900A_RXEVENT_MASK)
+    a.branch(0xD0, got)
+    a.emit(0xE6, 0xFD)
+    a.branch(0xD0, lbl)
+    a.emit(0xE6, 0xFE)
+    a.branch(0xD0, lbl)
+    a.jmp(timeout_lbl)
+
+
+def _read_header(a: Asm, dst: int) -> None:
+    """RxStatus, RxLength -> dst (lo, hi, lo, hi); high half first (#210)."""
+    a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8, 0x8D, (dst + 1) & 0xFF, (dst + 1) >> 8)
+    a.emit(0xAD, RTDATA_LO & 0xFF, RTDATA_LO >> 8, 0x8D, dst & 0xFF, dst >> 8)
+    a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8, 0x8D, (dst + 3) & 0xFF, (dst + 3) >> 8)
+    a.emit(0xAD, RTDATA_LO & 0xFF, RTDATA_LO >> 8, 0x8D, (dst + 2) & 0xFF, (dst + 2) >> 8)
+
+
+def _read_body(a: Asm, buf: int, count_zp: int | None, fixed: int | None) -> None:
+    _tag[0] += 1
+    lbl = f"rd{_tag[0]}"
+    a.emit(0xA9, buf & 0xFF, 0x85, 0xFB, 0xA9, buf >> 8, 0x85, 0xFC)
+    a.emit(0xA0, 0x00)
+    a.label(lbl)
+    a.emit(0xAD, RTDATA_LO & 0xFF, RTDATA_LO >> 8, 0x91, 0xFB, 0xC8)
+    a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8, 0x91, 0xFB, 0xC8)
+    if count_zp is not None:
+        a.emit(0xC4, count_zp)
+        a.branch(0x90, lbl)
+    else:
+        a.emit(0xC0, fixed)
+        a.branch(0xD0, lbl)
+
+
+def _rxmiss(a: Asm) -> None:
+    _pp_sel(a, 0x0130)
+    a.emit(0xAD, PPDATA_LO & 0xFF, PPDATA_LO >> 8, 0x8D, (RES + 12) & 0xFF, (RES + 12) >> 8)
+    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8, 0x8D, (RES + 13) & 0xFF, (RES + 13) >> 8)
+
+
+def _build_variant(variant: str) -> bytes:
+    """RES: +0 status ($01 ran / $FE no frame 1), +1 RxEvent1, +2..5 hdr1,
+    +6 RxEvent2 ($EE = not polled / $FE = poll timed out), +7..10 hdr2,
+    +11 bytes read of frame 1, +12,13 RxMISS raw."""
+    _tag[0] = 0
+    a = Asm(org=CODE)
+    a.emit(0x78)
+    _emit_clockport_enable(a)
+    a.emit(0xA9, 0xEE, 0x8D, (RES + 6) & 0xFF, (RES + 6) >> 8)
+    _poll_rxevent(a, "got1", "to1")
+    a.label("got1")
+    a.emit(0x8D, (RES + 1) & 0xFF, (RES + 1) >> 8)
+    _read_header(a, RES + 2)
+    if variant.startswith("complete"):
+        a.emit(0x18, 0xAD, (RES + 4) & 0xFF, (RES + 4) >> 8)     # CLC; LDA len lo
+        a.emit(0x69, 0x01, 0x29, 0xFE, 0x85, 0xF7)               # round up to even
+    else:
+        a.emit(0xA9, PARTIAL_N, 0x85, 0xF7)
+    a.emit(0xA5, 0xF7, 0x8D, (RES + 11) & 0xFF, (RES + 11) >> 8)
+    _read_body(a, BUF1, 0xF7, None)
+    if variant.endswith("_skip"):
+        _emit_skip_packet(a)
+    if variant.endswith("_skip") or variant == "complete_poll":
+        _poll_rxevent(a, "got2", "to2")
+        a.label("to2")
+        a.emit(0xA9, 0xFE, 0x8D, (RES + 6) & 0xFF, (RES + 6) >> 8)
+        a.jmp("hdr2")
+        a.label("got2")
+        a.emit(0x8D, (RES + 6) & 0xFF, (RES + 6) >> 8)
+    a.label("hdr2")
+    _read_header(a, RES + 7)
+    _read_body(a, BUF2, None, 16)
+    _rxmiss(a)
+    for _ in range(3):                       # leave nothing half-read behind
+        _emit_skip_packet(a)
+    a.emit(0xA9, 0x01, 0x8D, RES & 0xFF, RES >> 8)
+    a.emit(0x58, 0x60)
+    a.label("to1")
+    _rxmiss(a)
+    a.emit(0xA9, 0xFE, 0x8D, RES & 0xFF, RES >> 8)
+    a.emit(0x58, 0x60)
+    return a.build()
+
+
+def _build_depth() -> bytes:
+    """4 x (poll RxEvent; header + 16 data -> DBUF slot; SkipNow)."""
+    _tag[0] = 0
+    a = Asm(org=CODE)
+    a.emit(0x78)
+    _emit_clockport_enable(a)
+    for i in range(4):
+        slot = DBUF + i * 20
+        _poll_rxevent(a, f"dg{i}", f"dt{i}")
+        a.label(f"dt{i}")
+        a.emit(0xA9, 0xFE)
+        a.label(f"dg{i}")
+        a.emit(0x8D, (RES + 16 + i) & 0xFF, (RES + 16 + i) >> 8)
+        _read_header(a, slot)
+        _read_body(a, slot + 4, None, 16)
+        _emit_skip_packet(a)
+    _rxmiss(a)
+    a.emit(0xA9, 0x01, 0x8D, RES & 0xFF, RES >> 8)
+    a.emit(0x58, 0x60)
+    return a.build()
+
+
+def _build_drain() -> bytes:
+    """8 unconditional SkipNows (a half-read frame with its RxEvent already
+    consumed makes an RxEvent-driven drain a no-op), then clear RxMISS."""
+    a = Asm(org=CODE)
+    a.emit(0x78)
+    _emit_clockport_enable(a)
+    for i in range(8):
+        _emit_skip_packet(a)
+        a.emit(0xA0, 0x00)
+        a.label(f"dw{i}")
+        a.emit(0xC8)
+        a.branch(0xD0, f"dw{i}")
+    _rxmiss(a)
+    a.emit(0x58, 0x60)
+    return a.build()
+
+
+# --------------------------------------------------------------------------- #
+# Fixture and trial runner                                                     #
+# --------------------------------------------------------------------------- #
+
+class _Bench:
+    def __init__(self, target, cap, hmac: bytes) -> None:
+        self.target, self.cap, self.hmac = target, cap, hmac
+        self.t = target.transport
+        self.seed = 0
+        self.sent: dict[int, tuple[str, int]] = {}
+
+    def frame(self, label: str, length: int) -> bytes:
+        self.seed = (self.seed % 255) + 1
+        self.sent[self.seed] = (label, length)
+        body = bytes(((self.seed + i) & 0xFF) for i in range(length - 14))
+        return C64_MAC + self.hmac + b"\x88\xb5" + body
+
+    def classify(self, status: int, length: int, first16: bytes, this: dict[str, int]) -> str:
+        if status == 0 and length == 0 and first16 == bytes(16):
+            return "ZERO"
+        if first16[:14] != C64_MAC + self.hmac + b"\x88\xb5":
+            return "OTHER"
+        seed = first16[14]
+        for lbl, sd in this.items():
+            if sd == seed and length == self.sent[sd][1]:
+                return lbl
+        return "STALE" if seed in self.sent else "OTHER"
+
+    def run(self, code: bytes, frames: list[bytes]) -> bytes:
+        t = self.t
+        write_bytes(t, RES, bytes(32))
+        load_code(t, CODE, _build_drain())
+        run_subroutine(self.target, CODE, timeout=10.0, poll_cadence=0.005)
+        write_bytes(t, RES, bytes(32))
+        write_bytes(t, BUF1, bytes(256))
+        write_bytes(t, BUF2, bytes(16))
+        write_bytes(t, DBUF, bytes(80))
+        load_code(t, CODE, code)
+        for f in frames:
+            self.cap.send(f)
+            time.sleep(0.05)
+        time.sleep(0.2)
+        run_subroutine(self.target, CODE, timeout=15.0, poll_cadence=0.005)
+        return read_bytes(t, RES, 32)
+
+    def trial(self, variant: str) -> dict:
+        f1, f2 = self.frame("F1", LEN1), self.frame("F2", LEN2)
+        this = {"F1": f1[14], "F2": f2[14]}
+        res = self.run(_build_variant(variant), [f1, f2])
+        assert res[0] == 0x01, f"{variant}: frame 1 never arrived (status ${res[0]:02X})"
+        b1 = read_bytes(self.t, BUF1, 256)
+        b2 = read_bytes(self.t, BUF2, 16)
+        n1 = res[11]
+        st1, ln1 = res[2] | (res[3] << 8), res[4] | (res[5] << 8)
+        st2, ln2 = res[7] | (res[8] << 8), res[9] | (res[10] << 8)
+        first = self.classify(st1, ln1, b1[:16], this)
+        assert first == "F1", f"{variant}: the first frame out was {first}, not F1"
+        assert b1[:n1] == f1[:n1], f"{variant}: frame 1 body mismatch"
+        nxt = self.classify(st2, ln2, b2, this)
+        return {
+            "next": nxt, "hdr2": (st2, ln2), "buf2": b2, "f1": f1, "n1": n1,
+            "rxevent2": res[6], "rxmiss": (res[12] | (res[13] << 8)) >> 6,
+        }
+
+
+@pytest.fixture(scope="module")
+def bench():
+    hmac = _host_mac(_IFACE)
+    with create_manager(backend="u64", u64_hosts=_HOST, lock_timeout=600.0) as mgr:
+        with mgr.instance() as target:
+            t = target.transport
+            client = t.client
+            orig = client.get_config_category(CAT)[CAT][ITEM]
+            try:
+                client.set_config_item(CAT, ITEM, "External")
+                time.sleep(0.5)
+                t.reset()
+                assert wait_for_text(t, "READY.", timeout=25.0, poll_interval=0.3,
+                                     verbose=False) is not None, "no READY."
+                time.sleep(6.5)
+                # Bring the chip up from the 6510 and prove it is there: the
+                # IA read-back is the presence test (ip65's is PP $0000).
+                init = (cs8900a_rxctl_inline_code(RXCTL_IA_ONLY)
+                        + cs8900a_linectl_or_inline_code()
+                        + cs8900a_set_mac_inline_code(C64_MAC))
+                a = Asm(org=CODE + len(init))
+                for i, off in enumerate((0x0000, 0x0104, 0x0158)):
+                    _pp_sel(a, off)
+                    a.emit(0xAD, PPDATA_LO & 0xFF, PPDATA_LO >> 8,
+                           0x8D, (RES + 2 * i) & 0xFF, (RES + 2 * i) >> 8)
+                    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8,
+                           0x8D, (RES + 2 * i + 1) & 0xFF, (RES + 2 * i + 1) >> 8)
+                a.emit(0x60)
+                load_code(t, CODE, init + a.build())
+                run_subroutine(target, CODE, timeout=10.0, poll_cadence=0.005)
+                rb = read_bytes(t, RES, 6)
+                if rb[:2] != b"\x0e\x63":
+                    pytest.skip("no CS8900a answers on the 6510 (PP $0000 != $630E); "
+                                "is an RR-Net fitted?")
+                assert rb[2] | (rb[3] << 8) == RXCTL_IA_ONLY, "RxCTL did not take"
+                assert rb[4:6] == C64_MAC[:2], "IA did not take"
+                try:
+                    cap = open_capture(_IFACE)
+                except CaptureUnavailable as exc:
+                    pytest.skip(str(exc))
+                try:
+                    time.sleep(0.5)
+                    yield _Bench(target, cap, hmac)
+                finally:
+                    cap.close()
+            finally:
+                client.set_config_item(CAT, ITEM, orig)
+
+
+# --------------------------------------------------------------------------- #
+# Tests                                                                        #
+# --------------------------------------------------------------------------- #
+
+def test_complete_read_then_rxevent_poll_advances_without_skipnow(bench):
+    r = bench.trial("complete_poll")
+    assert r["rxevent2"] & CS8900A_RXEVENT_MASK, "RxEvent never re-asserted for frame 2"
+    assert r["next"] == "F2", (
+        f"after a complete read and an RxEvent poll the next header was {r['next']} "
+        f"(RxStatus ${r['hdr2'][0]:04X}, RxLength {r['hdr2'][1]}); a complete read "
+        "should release the frame by itself (ip65 relies on this)"
+    )
+    assert r["rxmiss"] == 0
+
+
+def test_immediately_after_a_complete_read_the_fifo_reads_zero(bench):
+    """Without an RxEvent (high byte) read in between, RTDATA is $00 --
+    not a latency (10 ms of waiting changes nothing).  This is the #210
+    'zeros past the end' state."""
+    r = bench.trial("complete")
+    assert r["next"] == "ZERO", (
+        f"header read straight after a complete read gave {r['next']} "
+        f"(RxStatus ${r['hdr2'][0]:04X}, RxLength {r['hdr2'][1]}); measured $0000 3/3"
+    )
+
+
+def test_partial_read_without_skipnow_keeps_delivering_frame_one(bench):
+    r = bench.trial("partial")
+    f1, n1 = r["f1"], r["n1"]
+    # the 4 "header" bytes plus 16 data bytes are simply frame 1 bytes n1..n1+19
+    assert r["buf2"] == f1[n1 + 4:n1 + 20], (
+        f"after a partial read the next bytes were not frame 1's remainder "
+        f"(next classified as {r['next']}); a fixed-length reader must SkipNow"
+    )
+    assert r["next"] != "F2"
+
+
+def test_skipnow_after_partial_read_yields_frame_two(bench):
+    """Positive control: what _emit_read_frame does."""
+    r = bench.trial("partial_skip")
+    assert r["next"] == "F2", f"SkipNow after a partial read gave {r['next']}"
+    assert r["rxmiss"] == 0
+
+
+def test_skipnow_after_complete_read_is_harmless(bench):
+    """The harness's skip after a full-length frame is a no-op-safe extra."""
+    r = bench.trial("complete_skip")
+    assert r["next"] == "F2", f"SkipNow after a complete read gave {r['next']}"
+
+
+def test_chip_buffers_two_frames_and_misses_the_third(bench):
+    f1, f2, f3 = bench.frame("F1", LEN1), bench.frame("F2", LEN2), bench.frame("F3", LEN3)
+    this = {"F1": f1[14], "F2": f2[14], "F3": f3[14]}
+    res = bench.run(_build_depth(), [f1, f2, f3])
+    slots = read_bytes(bench.t, DBUF, 80)
+    seen = []
+    for i in range(4):
+        s = slots[i * 20:(i + 1) * 20]
+        seen.append(bench.classify(s[0] | (s[1] << 8), s[2] | (s[3] << 8), s[4:20], this))
+    rxmiss = (res[12] | (res[13] << 8)) >> 6
+    assert seen[:2] == ["F1", "F2"], f"frames came out as {seen}"
+    assert seen[2] == "ZERO" and res[18] == 0xFE, (
+        f"a third {LEN3}-byte frame was buffered ({seen}); the chip held two on this bench"
+    )
+    assert rxmiss == 1, f"RxMISS {rxmiss}, expected exactly the third frame"
