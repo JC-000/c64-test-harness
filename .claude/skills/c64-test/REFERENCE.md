@@ -1011,7 +1011,8 @@ result = cap.stop(wav_path="output.wav")  # -> CaptureResult
 
 ### `CaptureResult` (dataclass)
 - `.wav_path: Path`, `.duration_seconds: float`, `.sample_rate: int`
-- `.total_samples: int`, `.packets_received: int`, `.packets_dropped: int`
+- `.total_samples: int`, `.packets_received: int`, `.packets_dropped: int`, `.packets_reordered: int` (backward sequence steps — reordered or duplicated packets; counted separately from drops, #205)
+- `.time_base_intact: bool` — `packets_dropped == 0`, forward gaps only; a timing measurement must also require `packets_reordered == 0`, since a gap is never padded and either event breaks the sample index as a clock
 
 ### `write_wav(path, pcm_data, sample_rate=48000, channels=2, sample_width=2) -> Path`
 Write raw PCM data to a WAV file.
