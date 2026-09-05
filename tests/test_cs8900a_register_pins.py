@@ -132,6 +132,9 @@ TX_BUILDERS: dict[str, Callable[[], bytes]] = {
         LOAD, TX_BUF, 60, RX_BUF, RESULT, 0x1234, 1),
     "build_ping_and_wait_code[arp]": lambda: bp.build_ping_and_wait_code(
         LOAD, TX_BUF, 60, RX_BUF, RESULT, 0x1234, 1, arp_frame_buf=ARP_BUF),
+    "build_ping_and_wait_code[drain]": lambda: bp.build_ping_and_wait_code(
+        LOAD, TX_BUF, 60, RX_BUF, RESULT, 0x1234, 1, arp_frame_buf=ARP_BUF,
+        drain_first=True, drain_status_addr=RESULT + 1),
     "build_icmp_responder_code": lambda: bp.build_icmp_responder_code(
         LOAD, RX_BUF, IP, RESULT),
     "build_icmp_responder_code[arp]": lambda: bp.build_icmp_responder_code(
@@ -143,6 +146,9 @@ TX_BUILDERS: dict[str, Callable[[], bytes]] = {
             LOAD, RX_BUF, IP, RESULT, my_mac=MY_MAC),
     "build_ping_and_wait_tod_code": lambda: bp.build_ping_and_wait_tod_code(
         LOAD, TX_BUF, 60, RX_BUF, RESULT, 0x1234, 1),
+    "build_ping_and_wait_tod_code[drain]": lambda: bp.build_ping_and_wait_tod_code(
+        LOAD, TX_BUF, 60, RX_BUF, RESULT, 0x1234, 1, arp_frame_buf=ARP_BUF,
+        drain_first=True, drain_status_addr=RESULT + 1),
     "build_ping_and_wait_tod_code[arp]": lambda: bp.build_ping_and_wait_tod_code(
         LOAD, TX_BUF, 60, RX_BUF, RESULT, 0x1234, 1, arp_frame_buf=ARP_BUF),
     "build_icmp_responder_tod_code": lambda: bp.build_icmp_responder_tod_code(
@@ -157,6 +163,7 @@ RX_POLLERS: dict[str, Callable[[], bytes]] = {
         LOAD, RX_BUF, RESULT, 0x1234, 1),
     "build_ping_and_wait_code": TX_BUILDERS["build_ping_and_wait_code"],
     "build_ping_and_wait_code[arp]": TX_BUILDERS["build_ping_and_wait_code[arp]"],
+    "build_ping_and_wait_code[drain]": TX_BUILDERS["build_ping_and_wait_code[drain]"],
     "build_icmp_responder_code": TX_BUILDERS["build_icmp_responder_code"],
     "build_icmp_responder_code[arp]": TX_BUILDERS["build_icmp_responder_code[arp]"],
     "build_rx_peek_code": lambda: bp.build_rx_peek_code(LOAD, RESULT),
@@ -164,6 +171,7 @@ RX_POLLERS: dict[str, Callable[[], bytes]] = {
         LOAD, RX_BUF, RESULT, 0x1234, 1),
     "build_ping_and_wait_tod_code": TX_BUILDERS["build_ping_and_wait_tod_code"],
     "build_ping_and_wait_tod_code[arp]": TX_BUILDERS["build_ping_and_wait_tod_code[arp]"],
+    "build_ping_and_wait_tod_code[drain]": TX_BUILDERS["build_ping_and_wait_tod_code[drain]"],
     "build_icmp_responder_tod_code": TX_BUILDERS["build_icmp_responder_tod_code"],
     "build_icmp_responder_tod_code[arp]": TX_BUILDERS["build_icmp_responder_tod_code[arp]"],
 }

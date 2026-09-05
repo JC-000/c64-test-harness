@@ -88,16 +88,22 @@ _OPCODE_NAMES = {
 #: wait — the barrier returns as soon as the reply arrives.
 _REU_DRAIN_FLOOR_BPS = 4096.0
 
-#: The firmware closes a SocketDMA connection that has been idle for more
-#: than one second: ``socket_dma.cc`` sets ``SO_RCVTIMEO = 1 s`` on every
-#: accepted socket and the command loop ``break``s (and closes) as soon
-#: as a ``recv`` returns ``<= 0`` (same at v3.15 and on the U64E's post-tag
-#: fork; measured on the U64E 2026-09-05: IDENTIFY after a 0.90 s gap
-#: answered 3/3, after 1.00 s the peer had closed 3/3).  A client that
-#: reuses one connection across commands therefore has to reopen it
-#: before the next command whenever it has been idle for about that long.
-#: This is the default :class:`SocketDMAClient` ``idle_reconnect``
-#: threshold, kept under the firmware's timer with margin for transit.
+#: Firmware from the 2026-05-10 commit fdb521a5 on (the v3.15 line and the
+#: U64E's post-tag fork) closes a SocketDMA connection that has been idle
+#: for more than one second: ``socket_dma.cc`` sets ``SO_RCVTIMEO = 1 s``
+#: on every accepted socket and the command loop ``break``s (and closes)
+#: as soon as a ``recv`` returns ``<= 0`` (measured on the U64E
+#: 2026-09-05: IDENTIFY after a 0.90 s gap answered 3/3, after 1.00 s the
+#: peer had closed 3/3).  v3.14d and the C64U's 1.1.0 predate that commit
+#: and set no socket timeout, so they never close an idle connection.  A
+#: client that reuses one connection across commands therefore has to
+#: reopen it before the next command whenever it has been idle for about
+#: that long; this is the default :class:`SocketDMAClient`
+#: ``idle_reconnect`` threshold, kept under the firmware's timer with
+#: margin for transit.  It is not gated on the firmware version: on the
+#: older firmware the reconnect is a no-harm default -- one TCP handshake
+#: (plus ``authenticate`` when a password is set) per command that
+#: follows an idle gap, and nothing else changes.
 IDLE_RECONNECT_SECONDS = 0.8
 
 #: The firmware's own idle timer, for messages.
@@ -112,9 +118,10 @@ class SocketDMAClient:
     and closes its own connection; this is convenient for one-shot calls
     but slow for chained operations because every connect re-authenticates.
 
-    A reused connection is not held open by the device: the firmware
-    closes it after one second without a command
-    (:data:`IDLE_RECONNECT_SECONDS`), and a command sent into the closed
+    A reused connection is not held open by the device: firmware from
+    fdb521a5 on (v3.15, the U64E fork) closes it after one second without
+    a command (:data:`IDLE_RECONNECT_SECONDS`; v3.14d / 1.1.0 never do,
+    where the reconnect is merely a spare handshake), and a command sent into the closed
     socket is never read -- the send may even succeed, and only the next
     reply-bearing command (``IDENTIFY``) fails with "connection closed by
     peer" (issue #223).  So before every command the client checks how

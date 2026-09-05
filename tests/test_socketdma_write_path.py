@@ -517,6 +517,49 @@ def test_retry_reconnect_failure_falls_back_without_latch(
     assert t._socket_dma_unusable is False
 
 
+@pytest.mark.parametrize(
+    "addr, size",
+    [(0xD000, 8192), (0xCFF0, 0x20), (0xDFF0, 0x20), (0xC000, 0x2000)],
+    ids=["inside", "ends-inside", "starts-inside", "spans-to-DFFF"],
+)
+def test_no_retry_for_a_span_touching_the_io_window(
+    mock_client: MagicMock, install_fake, caplog: pytest.LogCaptureFixture,
+    addr: int, size: int,
+) -> None:
+    """A second DMA into $D000-$DFFF is a second register write with side
+    effects, so a failed fast-path write there is not re-sent: straight to
+    REST (which writes exactly once)."""
+    fake, _ = install_fake
+    fake.identify_fail_first = 1
+    data = _payload(size)
+    t = Ultimate64Transport(host="h", client=mock_client, socket_dma=True,
+                            socket_dma_min_bytes=1)
+
+    with caplog.at_level("WARNING"):
+        t.write_memory(addr, data)
+
+    assert fake.dma_calls == [(addr, data)]
+    assert fake.identify_calls == 1
+    mock_client.write_mem.assert_called_once_with(addr, data)
+    assert any("I/O window" in r.message for r in caplog.records)
+
+
+def test_retry_still_happens_just_below_the_io_window(
+    mock_client: MagicMock, install_fake
+) -> None:
+    fake, _ = install_fake
+    fake.identify_fail_first = 1
+    data = _payload(0x1000)                      # $C000-$CFFF
+    mock_client.read_mem.return_value = data[-16:]
+    t = Ultimate64Transport(host="h", client=mock_client, socket_dma=True,
+                            socket_dma_min_bytes=1)
+
+    t.write_memory(0xC000, data)
+
+    assert fake.dma_calls == [(0xC000, data), (0xC000, data)]
+    mock_client.write_mem.assert_not_called()
+
+
 def test_barrier_timeout_restore_survives_a_socket_closed_by_the_client(
     mock_client: MagicMock, install_fake
 ) -> None:
