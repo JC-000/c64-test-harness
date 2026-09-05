@@ -430,6 +430,164 @@ def build_udp_frame(
 
 
 # ---------------------------------------------------------------------------
+# ARP (RFC 826) frame builders and parser -- issue #218
+#
+# The 6502 routines below neither sent nor answered ARP until #218.  On a
+# macOS host that costs every echo reply: the host keeps a stale neighbour
+# entry and queues the replies behind revalidation, so a pinger that never
+# ARPs gets 0/8 with the requests visibly leaving the wire, and 6/6 once one
+# ARP request precedes the ping (issue #212).  ip65 does both -- ``icmp_ping``
+# resolves first (``ip65/arp.s`` ``arp_lookup``) and ``arp_process`` answers
+# requests for its own address -- and is immune.  These helpers build the
+# frames the 6502 side transmits and parse the ones it receives; the field
+# offsets are ip65's ``ap_*`` constants.
+# ---------------------------------------------------------------------------
+
+#: EtherType of ARP.
+ETHERTYPE_ARP = 0x0806
+#: Length of the frames :func:`build_arp_request_frame` and
+#: :func:`build_arp_reply_frame` return: a 42-byte packet zero-padded to
+#: the ethernet minimum, which is also exactly what the fixed-length frame
+#: reader drains (:data:`_FIXED_RX_BYTES`), so a received request's fields
+#: sit at the same offsets in ``rx_buf`` as in these frames.
+ARP_FRAME_LEN = 60
+ARP_OP_REQUEST = 1
+ARP_OP_REPLY = 2
+
+# Byte offsets within an ethernet+ARP frame (ip65 arp.s ``ap_*``).
+_ARP_HW = 14            # hardware type (ethernet = 0x0001)
+_ARP_PROTO = 16         # protocol type (IPv4 = 0x0800)
+_ARP_HWLEN = 18         # 6
+_ARP_PROTOLEN = 19      # 4
+_ARP_OP = 20            # 1 request, 2 reply
+_ARP_SHW = 22           # sender hardware address
+_ARP_SP = 28            # sender protocol address
+_ARP_THW = 32           # target hardware address
+_ARP_TP = 38            # target protocol address
+_ARP_PACKLEN = 42       # ethernet header + ARP packet
+
+_BROADCAST_MAC = b"\xff" * 6
+
+
+@dataclass(frozen=True)
+class ArpPacket:
+    """The addressing fields of a parsed ethernet+ARP frame.
+
+    ``dst_mac``/``src_mac`` are the ethernet header's; the other four are
+    the ARP body's (RFC 826 SHA/SPA/THA/TPA).
+    """
+
+    dst_mac: bytes
+    src_mac: bytes
+    opcode: int
+    sender_mac: bytes
+    sender_ip: bytes
+    target_mac: bytes
+    target_ip: bytes
+
+    @property
+    def is_request(self) -> bool:
+        return self.opcode == ARP_OP_REQUEST
+
+    @property
+    def is_reply(self) -> bool:
+        return self.opcode == ARP_OP_REPLY
+
+
+def _check_mac(name: str, mac: bytes) -> None:
+    if len(mac) != 6:
+        raise ValueError(f"{name} must be 6 bytes, got {len(mac)}")
+
+
+def _check_ip(name: str, ip: bytes) -> None:
+    if len(ip) != 4:
+        raise ValueError(f"{name} must be 4 bytes, got {len(ip)}")
+
+
+def _arp_frame(
+    dst_mac: bytes,
+    src_mac: bytes,
+    opcode: int,
+    sender_mac: bytes,
+    sender_ip: bytes,
+    target_mac: bytes,
+    target_ip: bytes,
+) -> bytes:
+    body = (
+        dst_mac + src_mac + struct.pack(">H", ETHERTYPE_ARP)
+        + struct.pack(">HHBBH", 0x0001, 0x0800, 6, 4, opcode)
+        + sender_mac + sender_ip + target_mac + target_ip
+    )
+    assert len(body) == _ARP_PACKLEN
+    return body + b"\x00" * (ARP_FRAME_LEN - len(body))
+
+
+def build_arp_request_frame(src_mac: bytes, src_ip: bytes, target_ip: bytes) -> bytes:
+    """Broadcast ARP request "who has *target_ip*, tell *src_ip*".
+
+    What ip65's ``arp_lookup`` sends on a cache miss: ethernet destination
+    ``ff:ff:ff:ff:ff:ff``, sender fields ours, target hardware address
+    zero.  Returns :data:`ARP_FRAME_LEN` (60) bytes, wire-ready for
+    :func:`build_tx_code` or the ``arp_frame_buf`` parameter of the
+    ``build_ping_and_wait*`` builders.  Transmit one before the first ping
+    to a host whose neighbour cache may be stale (issue #212).
+    """
+    _check_mac("src_mac", src_mac)
+    _check_ip("src_ip", src_ip)
+    _check_ip("target_ip", target_ip)
+    return _arp_frame(
+        _BROADCAST_MAC, src_mac, ARP_OP_REQUEST,
+        src_mac, src_ip, b"\x00" * 6, target_ip,
+    )
+
+
+def build_arp_reply_frame(
+    src_mac: bytes, src_ip: bytes, target_mac: bytes, target_ip: bytes,
+) -> bytes:
+    """Unicast ARP reply "*src_ip* is at *src_mac*" to *target_mac*/*target_ip*.
+
+    The frame the 6502 responders emit in reply to a request for their
+    IP (built in place from the request, so this is the host-side twin
+    used to verify them).  Returns :data:`ARP_FRAME_LEN` bytes.
+    """
+    _check_mac("src_mac", src_mac)
+    _check_ip("src_ip", src_ip)
+    _check_mac("target_mac", target_mac)
+    _check_ip("target_ip", target_ip)
+    return _arp_frame(
+        target_mac, src_mac, ARP_OP_REPLY,
+        src_mac, src_ip, target_mac, target_ip,
+    )
+
+
+def parse_arp(frame: bytes) -> ArpPacket | None:
+    """Parse an ethernet frame as ARP; ``None`` unless it is ethernet/IPv4 ARP.
+
+    Accepts the unpadded 42-byte packet as well as a padded one.  Returns
+    ``None`` for any other ethertype, a short frame, or an ARP packet
+    whose hardware/protocol types or address lengths are not ethernet
+    (6-byte) over IPv4 (4-byte) -- the only combination the 6502 side
+    handles.
+    """
+    if len(frame) < _ARP_PACKLEN:
+        return None
+    if frame[12:14] != struct.pack(">H", ETHERTYPE_ARP):
+        return None
+    hw, proto, hwlen, protolen, op = struct.unpack(">HHBBH", frame[_ARP_HW:_ARP_SHW])
+    if (hw, proto, hwlen, protolen) != (0x0001, 0x0800, 6, 4):
+        return None
+    return ArpPacket(
+        dst_mac=bytes(frame[0:6]),
+        src_mac=bytes(frame[6:12]),
+        opcode=op,
+        sender_mac=bytes(frame[_ARP_SHW:_ARP_SP]),
+        sender_ip=bytes(frame[_ARP_SP:_ARP_THW]),
+        target_mac=bytes(frame[_ARP_THW:_ARP_TP]),
+        target_ip=bytes(frame[_ARP_TP:_ARP_PACKLEN]),
+    )
+
+
+# ---------------------------------------------------------------------------
 # CS8900a initialisation blobs (same as tests/test_ethernet_bridge.py)
 # ---------------------------------------------------------------------------
 

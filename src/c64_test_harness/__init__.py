@@ -327,7 +327,11 @@ from .uci_network import (
 )
 from .ethernet import generate_mac, parse_mac, format_mac, set_cs8900a_mac
 from .bridge_ping import (
+    ArpPacket,
+    build_arp_reply_frame,
+    build_arp_request_frame,
     build_echo_request_frame,
+    parse_arp,
     build_icmp_responder_code,
     build_icmp_responder_tod_code,
     build_ping_and_wait_code,
@@ -682,6 +686,11 @@ __all__ = [
     # Bridge ICMP ping
     "EchoRequest",
     "build_echo_request_frame",
+    # ARP (issue #218)
+    "ArpPacket",
+    "build_arp_request_frame",
+    "build_arp_reply_frame",
+    "parse_arp",
     "build_icmp_responder_code",
     "build_icmp_responder_tod_code",
     "build_ping_and_wait_code",
