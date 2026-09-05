@@ -127,10 +127,16 @@ SID_CONFIGS = [
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
-def wav_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Where this module's captures go: scratch unless WAV_CAPTURES_REFRESH=1."""
+def wav_dir(tmp_path_factory: pytest.TempPathFactory, record_testsuite_property) -> Path:
+    """Where this module's captures go: scratch unless WAV_CAPTURES_REFRESH=1.
+
+    The directory is recorded as a testsuite property and printed, so a
+    scratch capture can be found after the run (``-s`` or the junit XML).
+    """
     path = capture_dir("chromatic", tmp_path_factory.mktemp("chromatic_captures"))
     path.mkdir(parents=True, exist_ok=True)
+    record_testsuite_property("chromatic_capture_dir", str(path))
+    print(f"\n[chromatic] captures -> {path}")
     logger.info("chromatic captures -> %s", path)
     return path
 
@@ -249,9 +255,19 @@ def test_chromatic_capture(u64_client, wav_dir: Path, config):
 # ---------------------------------------------------------------------------
 
 def test_all_captures_present(u64_client, wav_dir: Path):
-    """Verify all expected WAV files were generated."""
-    for config in SID_CONFIGS:
-        wav = wav_dir / f"chromatic_{config['name']}.wav"
+    """Verify all expected WAV files were generated.
+
+    Reads the directory the capture tests of *this session* wrote to, so
+    it only means something after them; when none ran (``-k`` selected
+    this test alone) it skips rather than failing on an empty scratch dir.
+    """
+    expected = [wav_dir / f"chromatic_{config['name']}.wav" for config in SID_CONFIGS]
+    if not any(wav.exists() for wav in expected):
+        pytest.skip(
+            f"no chromatic capture ran in this session (nothing under {wav_dir}); "
+            "run the whole module"
+        )
+    for wav in expected:
         assert wav.exists(), f"Missing: {wav.name}"
         assert wav.stat().st_size > 10000, (
             f"Too small: {wav.name} ({wav.stat().st_size} bytes)"

@@ -20,6 +20,7 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import re
 import socket
 import urllib.error
 import urllib.parse
@@ -508,13 +509,49 @@ class Ultimate64Client:
             raise ValueError("item must be a non-empty string")
         return self._get_json(f"/v1/configs/{_encode(category)}/{_encode(item)}")
 
+    @staticmethod
+    def _resolve_config_key(mapping: dict, name: str, kind: str, where: str) -> str:
+        """Return the canonical key in *mapping* that *name* addresses.
+
+        Mirrors how the firmware matched the request: ``route_configs.cc``
+        ``emit_store`` runs the caller's category and item through
+        ``pattern_match`` (``components/pattern.cc``: ``*``/``?`` glob,
+        case-insensitive by default) and keys the JSON by the canonical
+        ``store_name`` / ``item_text``.  So the key is found exact first,
+        then case-insensitively, then as a glob that must match exactly
+        one key.
+
+        :raises Ultimate64ProtocolError: when nothing matches (the message
+            lists the keys that are present) or a glob matches several
+            (one item map cannot carry several; use
+            :meth:`get_config_item_raw` for patterns).
+        """
+        if name in mapping:
+            return name
+        present = sorted(k for k in mapping if isinstance(k, str))
+        folded = [k for k in present if k.lower() == name.lower()]
+        if len(folded) == 1:
+            return folded[0]
+        if "*" in name or "?" in name:
+            regex = re.escape(name).replace(r"\*", ".*").replace(r"\?", ".")
+            matched = [k for k in present if re.fullmatch(regex, k, re.IGNORECASE)]
+            if len(matched) == 1:
+                return matched[0]
+            if matched:
+                raise Ultimate64ProtocolError(
+                    f"{kind} pattern {name!r} matches {len(matched)} of {where}: "
+                    f"{matched!r} -- one item map cannot carry several; "
+                    f"use get_config_item_raw for patterns"
+                )
+        raise Ultimate64ProtocolError(
+            f"{kind} {name!r} absent from {where}; present: {present!r}"
+        )
+
     def get_config_item(self, category: str, item: str) -> dict:
         """GET /v1/configs/<category>/<item> — the item's own map.
 
         Returns the map the firmware describes the item with, unwrapped
-        from the category/item envelope.  Enum items carry their choices
-        under ``"values"``; preset-file items (``Cartridge``) under
-        ``"presets"``; the live value is ``"current"``::
+        from the category/item envelope::
 
             >>> client.get_config_item("C64 and Cartridge Settings",
             ...                        "Cartridge Preference")
@@ -522,15 +559,44 @@ class Ultimate64Client:
              'values': ['Auto', 'Internal', 'External', 'Manual'],
              'default': 'Auto'}
 
-        Keys beyond those three are whatever the firmware sends for that
-        item (range items add ``"min"`` / ``"max"``).  For just the value
-        use :meth:`get_config_value`; for the whole envelope use
-        :meth:`get_config_item_raw`.
+        **The key set is the item's type** (``route_configs.cc``
+        ``emit_store``, identical on 1.1.0, 3.14d and 3.15):
 
-        :raises Ultimate64ProtocolError: if the envelope carries a
-            non-empty ``errors`` array or does not contain
-            ``[category][item]`` as a map (issue #214: an accessor named
-            for the item must not hand back a value from a failed read).
+        * ``"values"`` — enum item.  Built from index 0 to ``max``
+          inclusive, so it is **never empty**.
+        * ``"presets"`` — preset-file item (the ``Cartridge`` .crt chooser).
+          **May be empty** (``[""]`` on the U64E, ``[]`` is possible).
+        * ``"min"`` / ``"max"`` / ``"format"`` (+ ``"default"``) — integer
+          range item; no choice list.
+        * only ``"current"`` / ``"default"`` — free string item.
+
+        So an item map *without* ``"values"`` is a non-enum item, never an
+        empty enum; :meth:`get_config_choices` encodes that rule.  The live
+        value is always ``"current"`` (:meth:`get_config_value`).
+
+        **Name matching** follows the firmware: category and item are
+        ``pattern_match`` globs (``*``/``?``, case-insensitive) and the
+        response is keyed by the canonical names, so ``("u64 specific
+        settings", "cpu speed")`` resolves to ``"U64 Specific Settings"`` /
+        ``"CPU Speed"``.  A glob is accepted only when it matches exactly
+        one category and one item; several matches raise (one item map
+        cannot represent them — use :meth:`get_config_item_raw`), and a
+        plain name that matches nothing raises with the keys present
+        rather than being mapped onto whatever single item is there.
+
+        **Unknown names**: stock firmware (1.1.0 / 3.14d) answers an unknown
+        *category* with HTTP 200 and no category key at all → this raises
+        :class:`Ultimate64ProtocolError`; the 3.15 fork answers 404 → a
+        plain :class:`Ultimate64Error` with ``status == 404`` from the
+        request layer.  An unknown *item* in a known category is HTTP 200
+        with an empty category map on every firmware →
+        :class:`Ultimate64ProtocolError`.
+
+        :raises Ultimate64ProtocolError: non-empty ``errors`` array, no
+            (or several) matching category/item, or the item not being a
+            map (issue #214: an accessor named for the item must not hand
+            back a value from a failed read).
+        :raises Ultimate64Error: HTTP-level failures (404 on the 3.15 fork).
         """
         envelope = self.get_config_item_raw(category, item)
         if not isinstance(envelope, dict):
@@ -543,13 +609,26 @@ class Ultimate64Client:
             raise Ultimate64ProtocolError(
                 f"config item {category!r}/{item!r}: device reported errors {errors!r}"
             )
-        cat_map = envelope.get(category)
-        if not isinstance(cat_map, dict) or not isinstance(cat_map.get(item), dict):
+        request = f"GET config item {category!r}/{item!r}"
+        categories = {k: v for k, v in envelope.items() if k != "errors"}
+        cat_key = self._resolve_config_key(
+            categories, category, "category", f"the categories in the response to {request}"
+        )
+        cat_map = categories[cat_key]
+        if not isinstance(cat_map, dict):
             raise Ultimate64ProtocolError(
-                f"config item {category!r}/{item!r} absent from response "
-                f"{envelope!r}"
+                f"category {cat_key!r} is not a map in response {envelope!r}"
             )
-        return cat_map[item]
+        item_key = self._resolve_config_key(
+            cat_map, item, "item", f"the items of category {cat_key!r} ({request})"
+        )
+        item_map = cat_map[item_key]
+        if not isinstance(item_map, dict):
+            raise Ultimate64ProtocolError(
+                f"config item {cat_key!r}/{item_key!r} is not a map: {item_map!r} "
+                f"(single-item GETs return a map; category GETs return bare values)"
+            )
+        return item_map
 
     def get_config_value(self, category: str, item: str) -> Any:
         """Return the item's ``current`` value — what snapshot/restore wants.
@@ -571,6 +650,35 @@ class Ultimate64Client:
                 f"{item_map!r}"
             )
         return item_map["current"]
+
+    def get_config_choices(self, category: str, item: str) -> list[str]:
+        """Return the settable choices of an enum or preset-file item.
+
+        ``"values"`` for an enum item (never empty — see
+        :meth:`get_config_item`), else ``"presets"`` for a preset-file
+        item (may legitimately be empty).  A free-string or integer-range
+        item has no choice list and **raises** instead of answering ``[]``,
+        so a guard like ``if allowed and prev not in allowed`` cannot be
+        silently switched off by a non-enum item.
+
+        :raises Ultimate64ProtocolError: as :meth:`get_config_item`, and
+            when the item map carries neither ``"values"`` nor
+            ``"presets"``, or the one it carries is not a list.
+        """
+        item_map = self.get_config_item(category, item)
+        for key in ("values", "presets"):
+            if key in item_map:
+                choices = item_map[key]
+                if not isinstance(choices, list):
+                    raise Ultimate64ProtocolError(
+                        f"config item {category!r}/{item!r}: {key!r} is not a list: "
+                        f"{choices!r}"
+                    )
+                return list(choices)
+        raise Ultimate64ProtocolError(
+            f"config item {category!r}/{item!r} is not an enum or preset-file item "
+            f"(no 'values' or 'presets'; keys: {sorted(item_map)!r})"
+        )
 
     def list_drives(self) -> dict:
         """GET /v1/drives — enumerates all drive slots."""

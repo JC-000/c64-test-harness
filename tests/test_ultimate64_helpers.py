@@ -214,9 +214,20 @@ class TestCpuSpeedGenerations:
         client.get_config_item.side_effect = Ultimate64Error("boom")
         assert max_cpu_speed_mhz(client) == 48
 
-    def test_max_cpu_speed_mhz_unparseable_response_falls_back_48(self) -> None:
+    def test_item_without_values_is_non_enum_not_empty_enum(self) -> None:
+        """emit_store only writes ``values`` for enum items (never empty);
+        an item map with no ``values`` key is a non-enum item, so the probe
+        is inconclusive (None -> 48 fallback), not an empty preset list."""
+        from c64_test_harness.backends.ultimate64_helpers import _cpu_speed_presets
+
         client = _make_client()
-        client.get_config_item.return_value = {"errors": []}
+        client.get_config_item.return_value = {"current": " 1", "default": " 1"}
+        assert _cpu_speed_presets(client) is None
+        assert max_cpu_speed_mhz(client) == 48
+
+    def test_max_cpu_speed_mhz_non_dict_item_falls_back_48(self) -> None:
+        client = _make_client()
+        client.get_config_item.return_value = "not a map"
         assert max_cpu_speed_mhz(client) == 48
 
     def test_set_turbo_mhz_5_on_c64u_raises_locally(self) -> None:
