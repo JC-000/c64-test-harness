@@ -801,7 +801,7 @@ assert captured[0].time_base_intact      # a dropped packet is never padded
 
 - `ViceConfig.sound=False` (the default) disables SID *emulation*, not just output — `$D41B`/`$D41C` then return `maincpu_clk % 256`, a clean ramp that looks like a working oscillator. Use `headless_sid_config()` for SID measurement. `sounddev="dummy"` is not a substitute; it stalls the SID instead.
 - VICE discards the sample buffer under warp, so a warped audio capture is a well-formed *empty* WAV. `-soundrecdev` does not rescue it; warp must be off. `render_wav()` enforces this.
-- The U64's NTSC stream is `2109375/44 = 47940.34` Hz, not 48000 — 1244 ppm, ~75 ms of slip per minute. `DEFAULT_SAMPLE_RATE` keeps its nominal value; pass `U64_NTSC_AUDIO_RATE_HZ` (an exact `Fraction`) for timing-sensitive work. `phi2 : audio` locks at exactly `64 : 3`.
+- The U64's NTSC stream is `2109375/44 = 47940.34` Hz, not 48000 — 1244 ppm, ~75 ms of slip per minute. `DEFAULT_SAMPLE_RATE` keeps its nominal value; pass `U64_NTSC_AUDIO_RATE_HZ` (an exact `Fraction`) for timing-sensitive work. `phi2 : audio` locks at exactly `64 : 3` — harness-verified on hardware to +8.8 ppm over a 60 s window (#205, `tests/test_audio_rate_lock_live.py`); runs with any dropped packet are meaningless and the test discards them.
 
 Remapping SIDs for a comparison run needs `isolated_sid_addressing()`: the device ships with `Auto Address Mirroring` enabled, and distinct base addresses alone are **not** enough to stop one chip answering for another.
 
