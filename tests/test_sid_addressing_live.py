@@ -125,8 +125,7 @@ def test_socket_enable_item_offers_only_en_dis(client: Ultimate64Client) -> None
     S basis: u64_config.cc:393-394 binds it to ``en_dis``. If this
     fails, ``SID_SOCKET_ENABLE_VALUES`` is wrong.
     """
-    resp = client.get_config_item(CAT_SID_SOCKETS, "SID Socket 1")
-    values = resp[CAT_SID_SOCKETS]["SID Socket 1"]["values"]
+    values = client.get_config_item(CAT_SID_SOCKETS, "SID Socket 1")["values"]
     assert tuple(values) == SID_SOCKET_ENABLE_VALUES
 
 
@@ -136,8 +135,7 @@ def test_detected_type_item_matches_315_table(client: Ultimate64Client) -> None:
     A 9-entry answer (no PDsid / SIDKick) means the device is running a
     3.14-era build, not the 3.15 the version endpoint reported.
     """
-    resp = client.get_config_item(CAT_SID_SOCKETS, "SID Detected Socket 1")
-    values = resp[CAT_SID_SOCKETS]["SID Detected Socket 1"]["values"]
+    values = client.get_config_item(CAT_SID_SOCKETS, "SID Detected Socket 1")["values"]
     assert tuple(values) == SID_DETECTED_TYPE_VALUES
 
 
@@ -175,19 +173,16 @@ def test_all_four_slots_offer_the_same_address_enum(
 ) -> None:
     """U: all four slots bind ``u64_sid_base`` (u64_config.cc:404-408)."""
     for item in SID_SLOT_ADDRESS_ITEMS.values():
-        resp = client.get_config_item(CAT_SID_ADDRESSING, item)
-        values = resp[CAT_SID_ADDRESSING][item]["values"]
+        values = client.get_config_item(CAT_SID_ADDRESSING, item)["values"]
         assert tuple(values) == SID_ADDRESS_VALUES, item
 
 
 def test_split_items_match_schema(client: Ultimate64Client) -> None:
     """U: ``stereo_addr`` and ``sid_split`` (u64_config.cc:256-257)."""
-    resp = client.get_config_item(CAT_SID_ADDRESSING, "Ext DualSID Range Split")
-    stereo = resp[CAT_SID_ADDRESSING]["Ext DualSID Range Split"]["values"]
+    stereo = client.get_config_item(CAT_SID_ADDRESSING, "Ext DualSID Range Split")["values"]
     assert tuple(stereo) == SID_STEREO_SPLIT_VALUES
 
-    resp = client.get_config_item(CAT_SID_ADDRESSING, "UltiSID Range Split")
-    split = resp[CAT_SID_ADDRESSING]["UltiSID Range Split"]["values"]
+    split = client.get_config_item(CAT_SID_ADDRESSING, "UltiSID Range Split")["values"]
     assert tuple(split) == ULTISID_SPLIT_VALUES
 
 
@@ -200,15 +195,14 @@ def test_ultisid_items_match_schema(client: Ultimate64Client) -> None:
         "UltiSID 1 Digis Level": ULTISID_DIGI_VALUES,
     }
     for item, values in expected.items():
-        resp = client.get_config_item(CAT_ULTISID, item)
-        assert tuple(resp[CAT_ULTISID][item]["values"]) == values, item
+        got = client.get_config_item(CAT_ULTISID, item)["values"]
+        assert tuple(got) == values, item
 
 
 def test_enums_use_values_not_presets(client: Ultimate64Client) -> None:
     """U: enum items serialize under ``"values"`` (route_configs.cc:31-37)."""
     item = SID_SLOT_ADDRESS_ITEMS[SidSlot.SOCKET1]
-    described = client.get_config_item(CAT_SID_ADDRESSING, item)
-    body = described[CAT_SID_ADDRESSING][item]
+    body = client.get_config_item(CAT_SID_ADDRESSING, item)
     assert "values" in body
     assert "presets" not in body
 

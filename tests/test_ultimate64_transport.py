@@ -348,15 +348,11 @@ _C64U_CPU_SPEED_PRESETS = [
 
 
 def _cpu_speed_item_response(presets: list[str]) -> dict:
+    """Item map as ``get_config_item`` returns it (unwrapped, issue #214)."""
     return {
-        "U64 Specific Settings": {
-            "CPU Speed": {
-                "current": " 1",
-                "values": list(presets),
-                "default": " 1",
-            },
-        },
-        "errors": [],
+        "current": " 1",
+        "values": list(presets),
+        "default": " 1",
     }
 
 

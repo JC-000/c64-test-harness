@@ -222,7 +222,7 @@ def _cpu_speed_presets(client: Ultimate64Client) -> tuple[str, ...] | None:
     *superset*: the U64 Elite (firmware 3.14) has ``" 5"`` but no
     ``"64"``, the C64 Ultimate (firmware 1.1.0) has ``"64"`` but no
     ``" 5"``. The device's actual preset list is dug out of the
-    ``get_config_item`` response with the same defensive parsing as
+    ``get_config_item`` item map with the same defensive parsing as
     :func:`_cartridge_preset_supported`: any structural surprise (or a
     probe that raises) yields the inconclusive ``None`` rather than a
     wrong answer. Conclusive results are cached per client (weakly), so
@@ -239,17 +239,11 @@ def _cpu_speed_presets(client: Ultimate64Client) -> tuple[str, ...] | None:
     if cached is not None:
         return cached
     try:
-        resp = client.get_config_item(CAT_U64_SPECIFIC, _ITEM_CPU_SPEED)
+        item = client.get_config_item(CAT_U64_SPECIFIC, _ITEM_CPU_SPEED)
     except (Ultimate64Error, AttributeError, TypeError):
         # AttributeError/TypeError: minimal client stand-ins (test doubles)
         # without get_config_item — inconclusive, same as a wire failure.
         return None
-    if not isinstance(resp, dict):
-        return None
-    category = resp.get(CAT_U64_SPECIFIC)
-    if not isinstance(category, dict):
-        return None
-    item = category.get(_ITEM_CPU_SPEED)
     if not isinstance(item, dict):
         return None
     # NB: enum/value-list items carry their choices under "values";
@@ -403,14 +397,12 @@ def _cartridge_preset_supported(
     400 ("not a valid choice"). This probe separates the 3.14 enum shape
     from the other two.
 
-    Live-verified response shape::
+    Live-verified item shape (``get_config_item`` unwraps the
+    category/item envelope, issue #214)::
 
-        {"C64 and Cartridge Settings":
-            {"Cartridge": {"current": "REU", "presets": [""], "default": ""}},
-         "errors": []}
+        {"current": "REU", "presets": [""], "default": ""}
 
-    Parsed defensively: the presets list is dug out of the nested
-    category/item maps, and any structural surprise (or a probe that
+    Parsed defensively: any structural surprise (or a probe that
     raises) yields the inconclusive ``None`` rather than a wrong answer.
 
     :param client: Connected Ultimate64 client.
@@ -420,15 +412,9 @@ def _cartridge_preset_supported(
         probe failed or the response could not be parsed.
     """
     try:
-        resp = client.get_config_item(CAT_CART, _ITEM_CARTRIDGE)
+        item = client.get_config_item(CAT_CART, _ITEM_CARTRIDGE)
     except Ultimate64Error:
         return None
-    if not isinstance(resp, dict):
-        return None
-    category = resp.get(CAT_CART)
-    if not isinstance(category, dict):
-        return None
-    item = category.get(_ITEM_CARTRIDGE)
     if not isinstance(item, dict):
         return None
     presets = item.get("presets")
@@ -1555,15 +1541,9 @@ def _sid_address_choices(client: Ultimate64Client) -> tuple[str, ...] | None:
     if cached is not None:
         return cached
     try:
-        resp = client.get_config_item(CAT_SID_ADDRESSING, _ITEM_SID_PROBE)
+        item = client.get_config_item(CAT_SID_ADDRESSING, _ITEM_SID_PROBE)
     except (Ultimate64Error, AttributeError, TypeError):
         return None
-    if not isinstance(resp, dict):
-        return None
-    category = resp.get(CAT_SID_ADDRESSING)
-    if not isinstance(category, dict):
-        return None
-    item = category.get(_ITEM_SID_PROBE)
     if not isinstance(item, dict):
         return None
     values = item.get("values")

@@ -70,10 +70,13 @@ def test_get_u64_specific_settings(client: Ultimate64Client) -> None:
 
 
 def test_cpu_speed_enum_preserves_leading_space(client: Ultimate64Client) -> None:
-    resp = client.get_config_item("U64 Specific Settings", "CPU Speed")
-    assert resp.get("errors", []) == []
-    item = resp["U64 Specific Settings"]["CPU Speed"]
+    # Issue #214: the raw accessor is the envelope, the plain one is the item.
+    raw = client.get_config_item_raw("U64 Specific Settings", "CPU Speed")
+    assert raw.get("errors", []) == []
+    item = client.get_config_item("U64 Specific Settings", "CPU Speed")
+    assert item == raw["U64 Specific Settings"]["CPU Speed"]
     assert isinstance(item, dict)
+    assert client.get_config_value("U64 Specific Settings", "CPU Speed") == item["current"]
     values = item.get("values")
     assert isinstance(values, list)
     # Leading space on single-digit values is significant
@@ -85,9 +88,7 @@ def test_cpu_speed_enum_preserves_leading_space(client: Ultimate64Client) -> Non
 
 
 def test_reu_size_enum_present(client: Ultimate64Client) -> None:
-    resp = client.get_config_item("C64 and Cartridge Settings", "REU Size")
-    assert resp.get("errors", []) == []
-    item = resp["C64 and Cartridge Settings"]["REU Size"]
+    item = client.get_config_item("C64 and Cartridge Settings", "REU Size")
     values = item.get("values")
     assert isinstance(values, list)
     assert "512 KB" in values

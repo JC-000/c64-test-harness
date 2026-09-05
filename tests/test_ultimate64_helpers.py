@@ -187,16 +187,12 @@ _C64U_PRESETS = [
 
 
 def _cpu_speed_item(presets: list[str]) -> dict:
-    """Shape of ``get_config_item(CAT_U64_SPECIFIC, "CPU Speed")``."""
+    """Shape of ``get_config_item(CAT_U64_SPECIFIC, "CPU Speed")`` — the
+    item map, unwrapped from the REST envelope (issue #214)."""
     return {
-        "U64 Specific Settings": {
-            "CPU Speed": {
-                "current": " 1",
-                "values": list(presets),
-                "default": " 1",
-            },
-        },
-        "errors": [],
+        "current": " 1",
+        "values": list(presets),
+        "default": " 1",
     }
 
 

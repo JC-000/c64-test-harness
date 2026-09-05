@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import urllib.error
+import urllib.parse
 
 from c64_test_harness.backends.ultimate64_client import (
     Ultimate64AuthError,
@@ -1378,3 +1379,148 @@ def test_client_exposes_capabilities():
         c = Ultimate64Client("h")
         assert c.capabilities.writemem_post_safe is True
         assert c.capabilities.runner_wedge_possible is False
+
+
+# ---------------------------------------------------------------- config item shape (#214)
+_CART_PREF_ENVELOPE = (
+    b'{"C64 and Cartridge Settings":'
+    b'{"Cartridge Preference":'
+    b'{"current":"External","values":["Auto","Internal","External","Manual"],'
+    b'"default":"Auto"}},"errors":[]}'
+)
+
+
+def test_get_config_item_returns_the_item_dict():
+    """#214: the name promises the item, not the REST envelope."""
+    mock, _ = _capture(_CART_PREF_ENVELOPE)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        item = c.get_config_item("C64 and Cartridge Settings", "Cartridge Preference")
+    assert item == {
+        "current": "External",
+        "values": ["Auto", "Internal", "External", "Manual"],
+        "default": "Auto",
+    }
+    assert "C64 and Cartridge Settings" not in item
+    assert "errors" not in item
+
+
+def test_get_config_value_returns_current():
+    mock, _ = _capture(_CART_PREF_ENVELOPE)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        value = c.get_config_value("C64 and Cartridge Settings", "Cartridge Preference")
+    assert value == "External"
+
+
+def test_get_config_item_raw_returns_the_untouched_envelope():
+    mock, captured = _capture(_CART_PREF_ENVELOPE)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        raw = c.get_config_item_raw("C64 and Cartridge Settings", "Cartridge Preference")
+    assert raw == json.loads(_CART_PREF_ENVELOPE)
+    assert raw["errors"] == []
+    assert captured[0][0].get_full_url() == (
+        "http://h/v1/configs/C64%20and%20Cartridge%20Settings/Cartridge%20Preference"
+    )
+
+
+def test_get_config_item_missing_item_raises_naming_it():
+    """An envelope without the item must not come back as a value."""
+    body = b'{"C64 and Cartridge Settings":{}, "errors":[]}'
+    mock, _ = _capture(body)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        with pytest.raises(Ultimate64ProtocolError) as ei:
+            c.get_config_item("C64 and Cartridge Settings", "No Such Item")
+    assert "C64 and Cartridge Settings" in str(ei.value)
+    assert "No Such Item" in str(ei.value)
+
+
+def test_get_config_item_missing_category_raises():
+    body = b'{"errors":[]}'
+    mock, _ = _capture(body)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        with pytest.raises(Ultimate64ProtocolError, match="Cartridge Preference"):
+            c.get_config_item("C64 and Cartridge Settings", "Cartridge Preference")
+
+
+def test_get_config_item_non_empty_errors_raises():
+    """A value-returning accessor must not hand back data from a failed call."""
+    body = (
+        b'{"C64 and Cartridge Settings":{"Cartridge Preference":{"current":"Auto"}},'
+        b'"errors":["item not found"]}'
+    )
+    mock, _ = _capture(body)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        with pytest.raises(Ultimate64ProtocolError, match="item not found"):
+            c.get_config_value("C64 and Cartridge Settings", "Cartridge Preference")
+    # The raw accessor passes the envelope through, errors included.
+    with patch("urllib.request.urlopen", mock):
+        raw = c.get_config_item_raw("C64 and Cartridge Settings", "Cartridge Preference")
+    assert raw["errors"] == ["item not found"]
+
+
+def test_get_config_value_missing_current_raises():
+    body = b'{"C64 and Cartridge Settings":{"Cartridge Preference":{"values":["Auto"]}},"errors":[]}'
+    mock, _ = _capture(body)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        with pytest.raises(Ultimate64ProtocolError, match="current"):
+            c.get_config_value("C64 and Cartridge Settings", "Cartridge Preference")
+
+
+class _FakeConfigDevice:
+    """urlopen stand-in that keeps one config item's state across PUT/GET.
+
+    GET answers with the firmware's envelope shape for the current value;
+    PUT ``?value=`` updates it.  Lets a snapshot -> set -> restore round trip
+    be asserted end to end without hardware.
+    """
+
+    def __init__(self, category: str, item: str, current: str, values: list[str]) -> None:
+        self.category = category
+        self.item = item
+        self.current = current
+        self.values = values
+        self.puts: list[str] = []
+
+    def __call__(self, req, timeout=None):
+        if req.get_method() == "PUT":
+            query = urllib.parse.urlparse(req.get_full_url()).query
+            value = urllib.parse.parse_qs(query)["value"][0]
+            self.puts.append(value)
+            self.current = value
+            return _FakeResponse(b'{"errors":[]}')
+        envelope = {
+            self.category: {
+                self.item: {
+                    "current": self.current,
+                    "values": self.values,
+                    "default": self.values[0],
+                }
+            },
+            "errors": [],
+        }
+        return _FakeResponse(json.dumps(envelope).encode("utf-8"))
+
+
+def test_snapshot_set_restore_round_trip_writes_original_value_back():
+    """The #214 failure mode: a caller that snapshots with the read accessor
+    and restores with ``set_config_item`` must put the ORIGINAL value back,
+    not ``None`` / a dict."""
+    cat, item = "C64 and Cartridge Settings", "Cartridge Preference"
+    device = _FakeConfigDevice(cat, item, "Auto", ["Auto", "Internal", "External", "Manual"])
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", device):
+        prev = c.get_config_value(cat, item)
+        c.set_config_item(cat, item, "External")
+        assert c.get_config_value(cat, item) == "External"
+        c.set_config_item(cat, item, prev)
+        after = c.get_config_value(cat, item)
+    assert prev == "Auto"
+    assert device.puts == ["External", "Auto"]
+    assert after == "Auto"
+    assert device.current == "Auto"

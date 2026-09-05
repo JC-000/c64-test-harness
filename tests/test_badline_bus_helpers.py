@@ -272,9 +272,7 @@ class TestSnapshotRestore:
 
     def test_restore_writes_both_fields(self) -> None:
         client = _client_for(_u64_specific(), _cart())
-        client.get_config_item.return_value = {
-            CAT_CART: {"Cartridge": {"presets": [""]}}
-        }
+        client.get_config_item.return_value = {"presets": [""]}
         restore_state(
             client,
             U64StateSnapshot(
@@ -304,9 +302,7 @@ class TestSnapshotRestore:
         """Writing "" back produces HTTP 400, and an old snapshot (or one from
         a device without the items) carries "" for both."""
         client = _client_for(_u64_specific(), _cart())
-        client.get_config_item.return_value = {
-            CAT_CART: {"Cartridge": {"presets": [""]}}
-        }
+        client.get_config_item.return_value = {"presets": [""]}
         restore_state(client, U64StateSnapshot(" 1", " 1", "Enabled", "512 KB", ""))
         for call in client.set_config_items.call_args_list:
             assert "Badline Timing" not in call.args[1]
@@ -319,9 +315,7 @@ class TestSnapshotRestore:
             _u64_specific(badline="Enabled"), _cart(bus_mode="Quiet")
         )
         snap = snapshot_state(client)
-        client.get_config_item.return_value = {
-            CAT_CART: {"Cartridge": {"presets": [""]}}
-        }
+        client.get_config_item.return_value = {"presets": [""]}
         set_badline_timing(client, False)
         client.set_config_items.reset_mock()
         restore_state(client, snap)
