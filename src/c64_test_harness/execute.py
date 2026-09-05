@@ -20,6 +20,10 @@ if TYPE_CHECKING:
     from .backends.unified_manager import TestTarget
     from .backends.vice_binary import BinaryViceTransport
 
+from .backends.ultimate64_helpers import (
+    CARTRIDGE_PREFERENCE_ITEM,
+    CARTRIDGE_SETTINGS_CATEGORY,
+)
 from .execution_policy import check_execution_policy
 from .memory_policy import MemoryPolicyError
 from .transport import TransportError, TimeoutError
@@ -938,8 +942,10 @@ def _write_prg_body_verified(transport: Any, load_addr: int, body: bytes,
                 "after a clean head -- not the known head-clobber; refusing to SYS"
             )
 
-_CARTRIDGE_CATEGORY = "C64 and Cartridge Settings"
-_CARTRIDGE_PREFERENCE_ITEM = "Cartridge Preference"
+# The category/item names live with the other U64 config names (issue
+# #221); these aliases keep the re-PUT below reading as it did.
+_CARTRIDGE_CATEGORY = CARTRIDGE_SETTINGS_CATEGORY
+_CARTRIDGE_PREFERENCE_ITEM = CARTRIDGE_PREFERENCE_ITEM
 
 
 def _reselect_external_cartridge(transport: Any) -> bool:
