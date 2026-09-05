@@ -23,18 +23,33 @@ read partially (20 B), header read immediately   frame 1's *remaining
 read partially (20 B), SkipNow, RxEvent polled   frame 2 (control)      3/3
 ===============================================  ==========================
 
-Three frames queued: frames 1 and 2 come out, the third never does and
-RxMISS (PP ``$0130``, count in bits 6-15) reads 1 -- the chip buffers
-exactly two frames of this size (3/3).
+Buffering depth (measured on a clean FIFO, 100-byte frames 50 ms apart,
+no reader until all were sent, n=2 per N; scratchpad ``exp219f.py``):
+3 queued -> F1 F2 F3 out, RxMISS 0; 4 queued -> F2 F3 F4 (once F3 F4),
+RxMISS 1 (2); 5 queued -> F3 F4 F5, RxMISS 2; 8 queued -> F6 F7 F8,
+RxMISS 5.  The chip holds up to three such frames and keeps the
+**newest**: an unread frame is overwritten by a later arrival and RxMISS
+(PP ``$0130``, count in bits 6-15) counts each overwrite.  An earlier
+"exactly two, third missed" reading (3/3) came from a leftover half-read
+frame holding a slot behind a blind-SkipNow drain, not from the chip.
 
 So: a complete read *does* release the frame -- no SkipNow needed -- but
 the next frame's header is presented at RTDATA only once RxEvent's high
-byte (PPTR ``$0124``, ``$DE05``) has been read.  It is not a latency: the
-poll that succeeded took zero iterations (RxEvent was already set), while
-waiting 100 us / 1.3 ms / 10 ms with no RxEvent access still read ``$00``
-(3/3 each), and so did reading PP ``$0000``, writing PPTR alone, reading
-the RxEvent *low* byte, reading ``$DE00/$DE01``, or reading PP ``$0400``
-(3/3 each).  ip65 is correct because it polls RxEvent before every read.
+byte (PPTR ``$0124``, ``$DE05``) has been read.  That is the CS8900A data
+sheet's I/O-mode receive sequence ("Receive Frame Operation": read
+RxEvent, then RxStatus and RxLength from the Receive/Transmit Data port,
+then the data), and ip65 follows it.  It is not a latency: both frames
+were injected 200 ms before the routine ran and RxMISS stayed 0, so frame
+2 was already buffered and the only latency possible is the chip's
+internal advance after the last data read; the poll that succeeded took
+zero iterations (RxEvent was already set), while waiting 100 us / 1.3 ms
+/ 10 ms -- two orders beyond an 80 us frame time -- with no RxEvent
+access still read ``$00`` (3/3 each).  Reading PP ``$0000``, writing PPTR
+alone, reading the RxEvent *low* byte, or reading PP ``$0400`` did not
+present it either (3/3 each).  ``$DE00/$DE01`` was read too, but on an
+RR-Net that window is the clockport register, not the chip's ISQ, so it
+says nothing; the ISQ proper (PP ``$0120``), which the data sheet says
+also pops the event queue, is the ``isq`` row below.
 A partial read does not advance: the FIFO keeps handing out the rest of
 the current frame, so a fixed-length reader (``_emit_read_frame``) must
 SkipNow -- which is what it does.  The ``$00``-past-the-end observation
@@ -102,7 +117,8 @@ CODE = 0x4000
 RES = 0x5000                    # result block, layout in _build_variant
 BUF1 = 0x5100                   # frame 1 data (<= 256 B)
 BUF2 = 0x5200                   # 16 bytes read after the second header
-DBUF = 0x5300                   # depth probe: 4 x (4 header + 16 data)
+DBUF = 0x5300                   # depth probe: DEPTH_SLOTS x (4 header + 16 data)
+DEPTH_SLOTS = 8
 LEN1, LEN2, LEN3 = 100, 80, 120
 PARTIAL_N = 20
 _tag = [0]
@@ -199,6 +215,25 @@ def _build_variant(variant: str) -> bytes:
         a.emit(0xA9, PARTIAL_N, 0x85, 0xF7)
     a.emit(0xA5, 0xF7, 0x8D, (RES + 11) & 0xFF, (RES + 11) >> 8)
     _read_body(a, BUF1, 0xF7, None)
+    if variant == "complete_ev1":            # ONE RxEvent read, high byte only
+        _pp_sel(a, 0x0124)
+        a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
+        a.emit(0x8D, (RES + 6) & 0xFF, (RES + 6) >> 8)
+    elif variant == "complete_ev1lo":        # ONE RxEvent read, low byte only
+        _pp_sel(a, 0x0124)
+        a.emit(0xAD, PPDATA_LO & 0xFF, PPDATA_LO >> 8)
+        a.emit(0x8D, (RES + 6) & 0xFF, (RES + 6) >> 8)
+    elif variant == "complete_isq":          # ONE ISQ read (PP $0120), both halves
+        _pp_sel(a, 0x0120)
+        a.emit(0xAD, PPDATA_LO & 0xFF, PPDATA_LO >> 8)
+        a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
+        a.emit(0x8D, (RES + 6) & 0xFF, (RES + 6) >> 8)
+    elif variant == "complete_d8":           # ~10.4 ms of nothing at 1 MHz
+        for i in range(8):
+            a.emit(0xA0, 0x00)
+            a.label(f"dly{i}")
+            a.emit(0x88)
+            a.branch(0xD0, f"dly{i}")
     if variant.endswith("_skip"):
         _emit_skip_packet(a)
     if variant.endswith("_skip") or variant == "complete_poll":
@@ -212,8 +247,7 @@ def _build_variant(variant: str) -> bytes:
     _read_header(a, RES + 7)
     _read_body(a, BUF2, None, 16)
     _rxmiss(a)
-    for _ in range(3):                       # leave nothing half-read behind
-        _emit_skip_packet(a)
+    _ack_and_skip(a, 3)                     # leave nothing half-read behind
     a.emit(0xA9, 0x01, 0x8D, RES & 0xFF, RES >> 8)
     a.emit(0x58, 0x60)
     a.label("to1")
@@ -224,12 +258,12 @@ def _build_variant(variant: str) -> bytes:
 
 
 def _build_depth() -> bytes:
-    """4 x (poll RxEvent; header + 16 data -> DBUF slot; SkipNow)."""
+    """DEPTH_SLOTS x (poll RxEvent; header + 16 data -> DBUF slot; SkipNow)."""
     _tag[0] = 0
     a = Asm(org=CODE)
     a.emit(0x78)
     _emit_clockport_enable(a)
-    for i in range(4):
+    for i in range(DEPTH_SLOTS):
         slot = DBUF + i * 20
         _poll_rxevent(a, f"dg{i}", f"dt{i}")
         a.label(f"dt{i}")
@@ -245,18 +279,35 @@ def _build_depth() -> bytes:
     return a.build()
 
 
+def _ack_and_skip(a: Asm, n: int) -> None:
+    """n x (read RxEvent high byte, SkipNow, ~1.3 ms) -- unconditional, but
+    each skip is preceded by the RxEvent read that acknowledges the current
+    frame, the way ip65's poll/skipframe pair does it.  Blind SkipNows left
+    a half-read frame behind on the first live run of this file."""
+    for i in range(n):
+        _tag[0] += 1
+        _pp_sel(a, 0x0124)
+        a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
+        _emit_skip_packet(a)
+        a.emit(0xA0, 0x00)
+        a.label(f"dw{_tag[0]}")
+        a.emit(0x88)
+        a.branch(0xD0, f"dw{_tag[0]}")
+
+
 def _build_drain() -> bytes:
-    """8 unconditional SkipNows (a half-read frame with its RxEvent already
-    consumed makes an RxEvent-driven drain a no-op), then clear RxMISS."""
+    """8 x (RxEvent read, SkipNow), then RxEvent hi -> RES+15, 4 RTDATA
+    bytes -> RES+16..19 (should be zeros), RxMISS read (clears it)."""
+    _tag[0] = 100
     a = Asm(org=CODE)
     a.emit(0x78)
     _emit_clockport_enable(a)
-    for i in range(8):
-        _emit_skip_packet(a)
-        a.emit(0xA0, 0x00)
-        a.label(f"dw{i}")
-        a.emit(0xC8)
-        a.branch(0xD0, f"dw{i}")
+    _ack_and_skip(a, 8)
+    _pp_sel(a, 0x0124)
+    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
+    a.emit(0x29, CS8900A_RXEVENT_MASK)
+    a.emit(0x8D, (RES + 15) & 0xFF, (RES + 15) >> 8)
+    _read_header(a, RES + 16)
     _rxmiss(a)
     a.emit(0x58, 0x60)
     return a.build()
@@ -295,10 +346,15 @@ class _Bench:
         write_bytes(t, RES, bytes(32))
         load_code(t, CODE, _build_drain())
         run_subroutine(self.target, CODE, timeout=10.0, poll_cadence=0.005)
+        d = read_bytes(t, RES, 20)
+        assert d[15] == 0 and d[16:20] == bytes(4), (
+            f"FIFO not empty after the drain: RxEvent hi ${d[15]:02X}, "
+            f"header {d[16:20].hex()} -- the previous trial left a frame behind"
+        )
         write_bytes(t, RES, bytes(32))
         write_bytes(t, BUF1, bytes(256))
         write_bytes(t, BUF2, bytes(16))
-        write_bytes(t, DBUF, bytes(80))
+        write_bytes(t, DBUF, bytes(DEPTH_SLOTS * 20))
         load_code(t, CODE, code)
         for f in frames:
             self.cap.send(f)
@@ -318,7 +374,11 @@ class _Bench:
         st1, ln1 = res[2] | (res[3] << 8), res[4] | (res[5] << 8)
         st2, ln2 = res[7] | (res[8] << 8), res[9] | (res[10] << 8)
         first = self.classify(st1, ln1, b1[:16], this)
-        assert first == "F1", f"{variant}: the first frame out was {first}, not F1"
+        assert first == "F1", (
+            f"{variant}: the first frame out was {first}, not F1 "
+            f"(RxEvent ${res[1]:02X}, RxStatus ${st1:04X}, RxLength {ln1}, "
+            f"first 16 bytes {b1[:16].hex()}; this trial's seeds {this})"
+        )
         assert b1[:n1] == f1[:n1], f"{variant}: frame 1 body mismatch"
         nxt = self.classify(st2, ln2, b2, this)
         return {
@@ -402,6 +462,34 @@ def test_immediately_after_a_complete_read_the_fifo_reads_zero(bench):
     )
 
 
+def test_a_single_rxevent_high_byte_read_presents_the_next_frame(bench):
+    """One LDA $DE05 with PPTR=$0124 -- no loop, no SkipNow -- is enough."""
+    r = bench.trial("complete_ev1")
+    assert r["rxevent2"] & CS8900A_RXEVENT_MASK, "RxEvent high byte read $00"
+    assert r["next"] == "F2", f"one RxEvent high-byte read gave {r['next']}"
+
+
+def test_the_rxevent_low_byte_alone_does_not_present_it(bench):
+    r = bench.trial("complete_ev1lo")
+    assert r["rxevent2"] == 0x04, f"RxEvent low byte should be the register number, got ${r['rxevent2']:02X}"
+    assert r["next"] == "ZERO", f"the low byte alone gave {r['next']}"
+
+
+def test_ten_milliseconds_of_waiting_does_not_present_it(bench):
+    r = bench.trial("complete_d8")
+    assert r["next"] == "ZERO", f"after ~10 ms with no RxEvent access: {r['next']}"
+
+
+def test_isq_read_and_the_next_frame(bench):
+    """PP $0120 (ISQ) pops the event queue per the data sheet.  Measured
+    live: its high byte reads $00 here and the read does NOT present the
+    next frame -- only the RxEvent register read does."""
+    r = bench.trial("complete_isq")
+    print(f"\nISQ (PP $0120) read after a complete read: hi byte ${r['rxevent2']:02X}, "
+          f"next header -> {r['next']} (RxStatus ${r['hdr2'][0]:04X}, RxLength {r['hdr2'][1]})")
+    assert r["next"] == "ZERO", f"an ISQ read presented the next frame ({r['next']}); measured ZERO before"
+
+
 def test_partial_read_without_skipnow_keeps_delivering_frame_one(bench):
     r = bench.trial("partial")
     f1, n1 = r["f1"], r["n1"]
@@ -426,18 +514,27 @@ def test_skipnow_after_complete_read_is_harmless(bench):
     assert r["next"] == "F2", f"SkipNow after a complete read gave {r['next']}"
 
 
-def test_chip_buffers_two_frames_and_misses_the_third(bench):
-    f1, f2, f3 = bench.frame("F1", LEN1), bench.frame("F2", LEN2), bench.frame("F3", LEN3)
-    this = {"F1": f1[14], "F2": f2[14], "F3": f3[14]}
-    res = bench.run(_build_depth(), [f1, f2, f3])
-    slots = read_bytes(bench.t, DBUF, 80)
+def test_frames_come_out_in_order_and_rxmiss_counts_the_overflow(bench):
+    """Eight 100-byte frames queued with no reader: the chip hands back
+    the NEWEST k (k = 3, once 2 in 4-frame trials) in arrival order, the
+    older ones are gone, and RxMISS == 8 - k.  Pins the measured
+    newest-kept semantics; an oldest-kept FIFO would fail on the first
+    slot."""
+    n = DEPTH_SLOTS
+    frames = [bench.frame(f"F{i + 1}", LEN1) for i in range(n)]
+    this = {f"F{i + 1}": f[14] for i, f in enumerate(frames)}
+    res = bench.run(_build_depth(), frames)
+    slots = read_bytes(bench.t, DBUF, DEPTH_SLOTS * 20)
     seen = []
-    for i in range(4):
-        s = slots[i * 20:(i + 1) * 20]
-        seen.append(bench.classify(s[0] | (s[1] << 8), s[2] | (s[3] << 8), s[4:20], this))
+    for i in range(DEPTH_SLOTS):
+        sl = slots[i * 20:(i + 1) * 20]
+        seen.append(bench.classify(sl[0] | (sl[1] << 8), sl[2] | (sl[3] << 8), sl[4:20], this))
     rxmiss = (res[12] | (res[13] << 8)) >> 6
-    assert seen[:2] == ["F1", "F2"], f"frames came out as {seen}"
-    assert seen[2] == "ZERO" and res[18] == 0xFE, (
-        f"a third {LEN3}-byte frame was buffered ({seen}); the chip held two on this bench"
+    k = next((i for i, x in enumerate(seen) if x == "ZERO"), DEPTH_SLOTS)
+    print(f"\nRX depth: {k} of {n} {LEN1}-byte frames came out {seen}, RxMISS {rxmiss}")
+    assert 2 <= k <= 3, f"{k} frames buffered; 3 (once 2) measured on a clean FIFO: {seen}"
+    assert seen[:k] == [f"F{i + 1}" for i in range(n - k, n)], (
+        f"expected the newest {k} in order, got {seen}"
     )
-    assert rxmiss == 1, f"RxMISS {rxmiss}, expected exactly the third frame"
+    assert all(x == "ZERO" for x in seen[k:]), f"gap in the sequence: {seen}"
+    assert rxmiss == n - k, f"RxMISS {rxmiss} does not account for the {n - k} overwritten frame(s)"

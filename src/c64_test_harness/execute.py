@@ -954,6 +954,17 @@ def _reselect_external_cartridge(transport: Any) -> bool:
     needed afterwards.  The REST reset and host DMA writes (REST or
     SocketDMA) never touch it.
 
+    Measured: the PUT leaves the machine running.  With a marker at
+    ``$C000`` and the jiffy clock (``$A0-$A2``) read before and ~1 s
+    after the PUT, 6/6 trials (3 with the cartridge already selected, 3
+    right after a ``run_prg`` had deselected it) kept the marker, advanced
+    the jiffy by 64-70 ticks without wrapping to zero, and still showed
+    ``READY.``; in the deselected arm the cartridge answered ``$630E``
+    after the PUT with no reset, 3/3.  So calling this with
+    ``reset=False`` on a machine that is busy does not reset or pause it;
+    the firmware's change hook only re-applies the expansion-port
+    selection.
+
     So a single ``client.run_prg`` anywhere in a session would leave every
     later ``run_prg_via_sys`` on this device blind to the cartridge.  One
     GET + one PUT per call buys immunity from that.  Returns ``True`` when
@@ -974,8 +985,11 @@ def _reselect_external_cartridge(transport: Any) -> bool:
     except Exception as exc:  # noqa: BLE001 -- best-effort by contract
         logger.warning(
             "run_prg_via_sys: could not re-select the external cartridge "
-            "(%s: %s); a prior run_prg/load_prg may have left it deselected "
-            "(issue #217)", type(exc).__name__, exc,
+            "(%s: %s). If a prior run_prg/load_prg left it deselected the "
+            "program will see $DE00 as an empty slot; remedy: "
+            "client.set_config_item('C64 and Cartridge Settings', "
+            "'Cartridge Preference', 'External') (issue #217)",
+            type(exc).__name__, exc,
         )
         return False
     logger.debug("run_prg_via_sys: re-PUT %s=External (issue #217)",
@@ -1036,8 +1050,10 @@ def run_prg_via_sys(
         Preference`` when it reads ``External`` before doing anything else
         (one GET, at most one PUT).  This undoes the sticky deselection a
         previous ``client.run_prg``/``load_prg`` leaves behind (issue
-        #217).  Ignored on VICE.  Pass ``False`` to skip the config
-        round-trip.
+        #217).  Measured not to reset or pause the 6510 (marker + jiffy
+        clock, 6/6; see :func:`_reselect_external_cartridge`), so it is
+        safe with ``reset=False`` too.  Ignored on VICE.  Pass ``False``
+        to skip the config round-trip.
     :returns: The SYS address used.
     :raises ValueError: if *prg* is too short, or no entry point was given
         and none could be parsed from the stub.
