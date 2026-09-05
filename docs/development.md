@@ -285,6 +285,26 @@ The unit contract lives in `tests/test_entry_baseline.py` (mocked; no hardware).
 
 The `U64_HOST`-gated capture suites (`tests/test_chromatic_capture_live.py`, `tests/test_multi_sid_parallel_live.py`) write their `.wav` + `.json` output to a per-run `tmp_path` directory by default, so an ordinary bench run never modifies the tracked reference under `tests/wav_captures/` (issue #220: a live run used to leave ten tracked files changed with no test failing, and the reference drifted with every run). Set `WAV_CAPTURES_REFRESH=1` to write into `tests/wav_captures/<suite>/` instead — a deliberate refresh to review and commit on purpose. The path decision is `tests/wav_capture_paths.py:capture_dir()`; `tests/test_wav_capture_paths.py` pins it without hardware. Each live module's `wav_dir` fixture records the directory it used as a testsuite property and prints it, so a scratch capture can be found afterwards (`-s`, or the junit XML).
 
+### Hardware and network live gates (all opt-in, skip cleanly when unset)
+
+Every gate below needs `U64_HOST` (or the test's own host knob) and the
+`DeviceLock` is taken by the test; gates marked *mutate* also need
+`U64_ALLOW_MUTATE=1` because they write device config and restore it.
+
+| Gate | Test | Needs | What it pins |
+|---|---|---|---|
+| `U64_NOTICE_LIVE=1` | `tests/test_unlocked_notice_live.py` | run with `U64_HOST` unset (host via `U64_NOTICE_HOST`) | unlocked-client notice 0× on a locked lane, 1× bare, thread-scoped under `run_parallel` (#206) |
+| `SID_ADDRESSING_LIVE=1` | `tests/test_sid_addressing_isolation_live.py` | two SIDs fitted | distinct decode with mirroring off, aliasing with it on, read-back raises on mismatch (#204) |
+| `AUDIO_RATE_LIVE=1` | `tests/test_audio_rate_lock_live.py` | NTSC, ≥ 60 s capture | `U64_NTSC_AUDIO_RATE_HZ` via the 64:3 identity; drop/reorder runs discarded (#205) |
+| `RRNET_LIVE=1` | `tests/test_run_prg_cartridge_visibility_live.py`, `tests/test_cs8900a_fifo_live.py`, `tests/test_first_exchange_live.py` | RR-Net on the expansion port, cabled to `RRNET_IFACE` (default `en4`) | runner load path deselects the cartridge (#217), FIFO facts (#219), RX-queue drain before the first exchange (#222) |
+| `SOCKETDMA_LIVE=1` (*mutate* for two tests) | `tests/test_socketdma_barrier_live.py` | "Ultimate DMA Service" enabled | idle-reconnect and the one-retry barrier (#223) |
+| `U64_BASELINE_LIVE=1` (*mutate*) | `tests/test_entry_baseline_live.py` | — | reset-on-entry: drift → per-category reset → every covered item at `default`; never-touch stores untouched (#227) |
+| `FLASH_BASELINE_LIVE=1` (*mutate*) | `tests/test_flash_baseline_live.py` | — | flash equals the firmware default per category (never-touch and `Network Settings` not reloaded) (#227) |
+
+`U64_BASELINE_ON_ENTRY=1` (or TOML `[u64] baseline_on_entry = true`;
+`C64TEST_U64_BASELINE_ON_ENTRY` wins when both are set) turns the entry
+reset on for `create_manager(backend="u64")` lanes; it is off by default.
+
 ## Making the `c64-test` Claude Code skill available globally
 
 The harness ships a Claude Code skill at `.claude/skills/c64-test/` that teaches agents how to use the Python package (see the files next to it — `SKILL.md`, `REFERENCE.md`, `PATTERNS.md`). By default the skill is only discovered when Claude Code starts inside the harness repo. Most users work across multiple C64 projects (e.g. `c64-https`, `c64-x25519`, `c64-ChaCha20-Poly1305`) and want the skill loaded in those sessions too.
