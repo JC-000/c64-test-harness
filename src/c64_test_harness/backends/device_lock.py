@@ -191,6 +191,13 @@ _WARNED_HOLDERS: set[tuple[str, int | None]] = set()
 #: process, not one per client object.
 _UNLOCKED_WARNED: set[str] = set()
 
+#: The phrase every unlocked-client notice carries, so a test that
+#: counts notices in a log capture matches the real line and not a
+#: copy of it (``tests/test_unlocked_notice_live.py``).
+UNLOCKED_NOTICE_PHRASE = (
+    "built without holding this device's lock in this process"
+)
+
 #: Thread-local suppression depth for :func:`warn_unlocked_client`.
 #: Thread-scoped rather than process-scoped so suppressing the notice
 #: around one manager's client construction cannot silence an unrelated
@@ -1655,7 +1662,7 @@ def warn_unlocked_client(
             "use this package takes no lock and is invisible here."
         )
     log.warning(
-        "%s for %s built without holding this device's lock in this process. "
+        "%s for %s " + UNLOCKED_NOTICE_PHRASE + ". "
         "Device access is advisory: an unlocked lane is invisible to a "
         "locked one, and a locked lane's run_prg is a load-and-run that "
         "REPLACES whatever program you are driving (issue #194).%s  "

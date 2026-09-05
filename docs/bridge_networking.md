@@ -745,40 +745,110 @@ not a bare `0x00C0`), and the RxEvent poll masks `CS8900A_RXEVENT_MASK` =
 
 ### Driving a cartridge on the U64
 
-Two more hardware-only facts, both in issues #209 and #211:
+Two more hardware-only facts, from issues #209, #211 and #217:
 
 * The cartridge is invisible unless `C64 and Cartridge Settings` ->
   **`Cartridge Preference` = `External`**.  On the default `Auto` the
-  whole `$DE00` window reads as zeros, which looks exactly like an empty
-  expansion port.  `Bus Operation Mode` is irrelevant.  **Raw `$DE00`
+  cartridge does not answer the identity read, which looks exactly like
+  an empty expansion port.  A `Cartridge Preference` PUT leaves a
+  running 6510 alone (marker and jiffy clock intact 6/6, #217), so the
+  re-PUT in `run_prg_via_sys` is safe with `reset=False` too.  `Bus Operation Mode` is irrelevant.  **Raw `$DE00`
   bytes are not a presence test from either side.**  A host-side
   `read_memory` of the I/O window returns bytes that do not depend on the
   cartridge and are not reproducible -- three observers reported three
   different patterns for the same physical cartridge under the same
-  stated conditions (item 3 above).  A 6510 read gives zeros with
-  `Preference = Auto`, zeros after `client.run_prg()`, zeros with no
-  cartridge, and the CS8900a's registers (`FF FF` at `$DE00/$DE01`, then
-  PPPtr/PPData residue; measured 2026-09-04) with a working one -- so
-  "non-zero" is not "present" either.  The only valid test is the one
+  stated conditions (item 3 above).  A 6510 read is no better as a raw
+  byte pattern: zeros were seen with `Preference = Auto` and with no
+  cartridge, but a deselected cartridge after `client.run_prg()` gave
+  `fb fb`, `06 fb`, `7c 00`, `ff ff` and `06 60` at PP `$0000` across
+  runs (#217), and a working one shows the CS8900a's registers (`FF FF`
+  at `$DE00/$DE01`, then PPPtr/PPData residue; measured 2026-09-04) --
+  so neither "zeros" nor "non-zero" means anything.  The only valid test is the one
   ip65's `eth_init` performs (`drivers/cs8900a.s:133-137`): clockport
   enable, `PPPtr = $0000`, `PPData == $630E`, executed **on the 6510**.
-* **Do not start the program with `client.run_prg()`** -- after it, the
-  loaded program sees `$DE00` as zeros even though the config still reads
-  `External`, i.e. the external cartridge is left deselected.  The cause
-  is not isolated (the DMA load, the reset it performs, or something in
-  between); only the outcome is measured.  Use
-  `run_prg_via_sys(target, prg)`, which writes the PRG into RAM and types
-  `SYS`.  Stock ip65 `ping.prg` reports `INIT DRIVER: FAILED` under
-  `run_prg` and pings normally under `run_prg_via_sys`.
-* **Send an ARP request before the first exchange with a host.**  The
-  harness's ping routines neither send nor answer ARP, and macOS keeps a
-  stale neighbour entry visible in `arp -n` while queuing every reply
-  behind revalidation -- so a routine that only pings gets 0/8 with the
-  requests visibly leaving the wire and the replies still sitting on the
-  host, and 6/6 once an ARP request precedes the ping (issue #212, closed
-  invalid: it was never a chip fault).  Any of: TX an ARP request first
-  (what ip65's `icmp_ping` does; `scripts/validate_ping.py` builds one),
-  add an ARP responder, or pin a static neighbour entry on the host.
+* **Do not start the program with `client.run_prg()`** -- the firmware's
+  runner load path deselects the external cartridge.  Isolated in #217
+  (U64E, n=3 per arm, interleaved, re-PUT + reset before every arm):
+  `run_prg` and `load_prg` alone both leave the cartridge absent; the
+  REST `reset()` alone and host DMA writes (REST or SocketDMA) followed
+  by a typed `SYS` leave it present; after a `run_prg` the deselection
+  is **sticky across every `reset()`** and only a re-PUT of `Cartridge
+  Preference` (same value, no reset needed) reselects it.  A deselected
+  cartridge does not read as zeros reliably -- PP `$0000` came back
+  `fb fb`, `06 fb`, `7c 00`, `ff ff` -- only `!= $630E` means anything.
+  Use `run_prg_via_sys(target, prg)`, which writes the PRG into RAM,
+  types `SYS`, and on a U64 whose preference reads `External` re-PUTs
+  it first (`reselect_cartridge=False` opts out).  Stock ip65 `ping.prg`
+  reports `INIT DRIVER: FAILED` under `run_prg` and pings normally under
+  `run_prg_via_sys`.  Live matrix:
+  `tests/test_run_prg_cartridge_visibility_live.py` (`RRNET_LIVE=1`).
+* **A complete RX read releases the frame without SkipNow, but the next
+  header appears only after RxEvent's high byte is read** (#219, U64E,
+  n=3 per variant, two host-queued frames): after reading all RxLength
+  bytes, an immediate RTDATA read gives `$0000`; reading `$DE05`
+  (RxEvent high, PP `$0124`) first presents frame 2 -- zero poll
+  iterations, no skip.  A partial read does not advance: RTDATA keeps
+  delivering the rest of the same frame until SkipNow.  Delays of
+  100 µs-10 ms, PP `$0000` reads, PPTR writes, the RxEvent *low* byte,
+  `$DE00/01`, and PP `$0400` do not present it; only the high-byte read
+  does -- exactly ip65's poll sequence; reading the ISQ (PP `$0120`)
+  does not present it either (3/3).  The chip holds up to **three**
+  100-byte frames and keeps the **newest** (8 queued -> frames 6, 7, 8
+  delivered, RxMISS 5; n=2 per depth).  "Three" is a ceiling for
+  100-byte frames injected 50 ms apart, not a property of the chip: at
+  4 queued one trial kept two, so the effective depth depends on where
+  the injection cadence lands in the chip's overwrite bookkeeping, and
+  the receive buffer is far larger than three such frames in bytes --
+  what is measured is event/frame bookkeeping, not RAM.  The live test
+  admits k in {2, 3} at 8 queued by design.  An earlier "buffers two, third
+  dropped" reading was a leftover half-read frame behind a blind
+  SkipNow drain, retracted on #219.  `_emit_read_frame` keeps its skip
+  because its fixed 60-byte body read is a partial read.  Live:
+  `tests/test_cs8900a_fifo_live.py` (`RRNET_LIVE=1`, `RRNET_IFACE`).
+* **Resolve before the first exchange with a host: pass the ARP frame,
+  or use the responder, which now answers ARP (issue #218).**  Until #218
+  the harness's ping routines neither sent nor answered ARP, and macOS
+  holds every reply while it has no *complete* neighbour entry for the
+  C64 (its own ARP request goes unanswered and the entry sits
+  `incomplete`; entry absent 0/8, entry present 8/8 -- #218 paired
+  rounds; the "stale entry behind revalidation" case is inferred, not
+  measured, because the `arp -S` control needs root) -- so a routine
+  that only pinged got 0/8 with
+  the requests visibly leaving the wire and the replies still sitting on
+  the host, and 6/6 once an ARP request preceded the ping (issue #212,
+  closed invalid: it was never a chip fault).  ip65 is immune because
+  `icmp_ping` ARPs first and `arp_process` answers requests.  The harness
+  now does the same, opt-in:
+  - **Pinging:** `build_arp_request_frame(src_mac, src_ip, target_ip)`
+    (60 bytes, RFC 826 at ip65's `ap_*` offsets) into RAM, then
+    `build_ping_and_wait_code(..., arp_frame_buf=ADDR)` /
+    `build_ping_and_wait_tod_code(..., arp_frame_buf=ADDR)` transmit it
+    before the echo request in the same run and drain the ARP reply as a
+    non-matching frame.  `run_ping_and_wait` (VICE-only) does this by
+    default (`arp=True`), deriving the request from the echo frame's own
+    MAC/IPs.
+  - **Responding:** `build_icmp_responder_code` /
+    `build_icmp_responder_tod_code` /
+    `build_read_and_respond_echo_request_code` with `my_mac=` answer an
+    ARP request for `my_ip` from the received frame in place and go back
+    to waiting for the echo (`run_icmp_responder(my_mac=...)`; the
+    consume routine reports `RESULT_ARP_REPLY_SENT = 0x03`).  Without
+    `my_mac` -- and without `arp_frame_buf` -- every builder's output is
+    byte-identical to before, so nothing sized to the old routines moves;
+    with ARP on they are larger (consume 585 B, responder 630 B, TOD
+    responder 754 B, ping-and-wait 319 B; the 480-byte `$C000-$C1DF`
+    window does not fit an ARP-enabled responder).
+  - `parse_arp(frame) -> ArpPacket | None` reads either direction back
+    from a buffer or a capture.
+
+  **Measured under VICE and on a simulated CS8900a only** so far: the
+  ARP behaviour is proven by `tests/test_cs8900a_arp.py` (default suite;
+  runs the emitted 6502 on `tests/cs8900a_sim.py`) and by the two-VICE
+  `tests/test_bridge_arp.py`; the 0/8 -> 6/6 figure above is the only
+  hardware measurement, and it was taken with a hand-built ARP frame and
+  `build_tx_code`, not with these builders.  A U64E + RR-Net pass of the
+  new parameters is still owed.  Pinning a static neighbour entry on the
+  host remains a valid workaround for code that cannot change.
 
 ## Capture-only sample (host tcpdump)
 

@@ -184,6 +184,16 @@ The WAV header still has to be an integer; passing the exact rate makes
 it 47940 (7 ppm) instead of 48000 (1244 ppm), and
 `CaptureResult.sample_rate_exact` carries the rational.
 
+**Harness-verified on hardware** (issue #205, U64E fw 3.15, 2026-09-05,
+`tests/test_audio_rate_lock_live.py`, gate `AUDIO_RATE_LIVE=1`): a
+6510 window counted by CIA2 A+B chained as a phi2 counter (SEI, screen
+blanked) against the captured sample count gives the 64:3 identity to
++8.8 ppm over 60.2 s (61 565 284 cycles / 2 885 898 samples, n=2
+identical) and −1234 ppm from 48000; 10 s windows read +47..+55 ppm
+from a fixed ~25-sample edge offset that cancels in the slope
+(+0.36/+0.9 ppm, n=2). Two 60 s captures with 7 and 66 dropped packets
+read −457 and −4382 ppm and were discarded — see the next section.
+
 **PAL does not lock**, structurally rather than by a different constant:
 PAL's phi2 divides 17734472 while its colour carrier is 17734475/4 —
 different base integers, and the ratio does not reduce. No PAL audio
@@ -199,7 +209,8 @@ amount. The WAV is well-formed either way, so nothing downstream notices.
 
 ```python
 result = cap.stop(wav_path="run.wav")
-assert result.time_base_intact          # packets_dropped == 0
+assert result.time_base_intact          # packets_dropped == 0 (forward gaps only)
+assert result.packets_reordered == 0    # a backward sequence step is not a drop but still breaks the sample clock (#205)
 ```
 
 ---
@@ -262,7 +273,12 @@ and raises `Ultimate64RestoreError` at the end. (The *write* paths keep
 `set_config_items` on purpose — `set_reu()` relies on a rejected
 `Cartridge` write aborting before the REU is half-enabled.)
 
-All of it is packaged:
+All of it is packaged. `isolated_sid_addressing()` reads the whole
+address map back after writing it and raises `Ultimate64Error` on any
+slot that did not take (hardware-verified in #204: with mirroring off a
+two-slot map decodes distinctly, 27/27; with it on the stock map
+aliases). A mocked client whose category read does not reflect writes
+will now raise rather than report a clean run.
 
 ```python
 from c64_test_harness import isolated_sid_addressing, SidSlot

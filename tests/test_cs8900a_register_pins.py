@@ -119,21 +119,36 @@ _POLL_HI = re.compile(
 )
 
 IP = bytes([10, 0, 0, 2])
-LOAD, TX_BUF, RX_BUF, RESULT = 0xC000, 0xC300, 0xC400, 0xC0FF
+LOAD, TX_BUF, ARP_BUF, RX_BUF, RESULT = 0xC000, 0xC300, 0xC380, 0xC400, 0xC0FF
+MY_MAC = bytes.fromhex("02C640000002")
 
-# Every builder that emits a TxCMD write.
+# Every builder that emits a TxCMD write.  The ``[arp]`` entries are the
+# same builders with issue #218's ARP support switched on (an ARP request
+# transmitted before the echo; an ARP reply transmitted from the responder),
+# which adds a second TX site to each -- every walker below covers both.
 TX_BUILDERS: dict[str, Callable[[], bytes]] = {
     "build_tx_code": lambda: bp.build_tx_code(LOAD, TX_BUF, 60, RESULT),
     "build_ping_and_wait_code": lambda: bp.build_ping_and_wait_code(
         LOAD, TX_BUF, 60, RX_BUF, RESULT, 0x1234, 1),
+    "build_ping_and_wait_code[arp]": lambda: bp.build_ping_and_wait_code(
+        LOAD, TX_BUF, 60, RX_BUF, RESULT, 0x1234, 1, arp_frame_buf=ARP_BUF),
     "build_icmp_responder_code": lambda: bp.build_icmp_responder_code(
         LOAD, RX_BUF, IP, RESULT),
+    "build_icmp_responder_code[arp]": lambda: bp.build_icmp_responder_code(
+        LOAD, RX_BUF, IP, RESULT, my_mac=MY_MAC),
     "build_read_and_respond_echo_request_code":
         lambda: bp.build_read_and_respond_echo_request_code(LOAD, RX_BUF, IP, RESULT),
+    "build_read_and_respond_echo_request_code[arp]":
+        lambda: bp.build_read_and_respond_echo_request_code(
+            LOAD, RX_BUF, IP, RESULT, my_mac=MY_MAC),
     "build_ping_and_wait_tod_code": lambda: bp.build_ping_and_wait_tod_code(
         LOAD, TX_BUF, 60, RX_BUF, RESULT, 0x1234, 1),
+    "build_ping_and_wait_tod_code[arp]": lambda: bp.build_ping_and_wait_tod_code(
+        LOAD, TX_BUF, 60, RX_BUF, RESULT, 0x1234, 1, arp_frame_buf=ARP_BUF),
     "build_icmp_responder_tod_code": lambda: bp.build_icmp_responder_tod_code(
         LOAD, RX_BUF, IP, RESULT),
+    "build_icmp_responder_tod_code[arp]": lambda: bp.build_icmp_responder_tod_code(
+        LOAD, RX_BUF, IP, RESULT, my_mac=MY_MAC),
 }
 
 # Every builder that polls RxEvent.
@@ -141,12 +156,16 @@ RX_POLLERS: dict[str, Callable[[], bytes]] = {
     "build_rx_echo_reply_code": lambda: bp.build_rx_echo_reply_code(
         LOAD, RX_BUF, RESULT, 0x1234, 1),
     "build_ping_and_wait_code": TX_BUILDERS["build_ping_and_wait_code"],
+    "build_ping_and_wait_code[arp]": TX_BUILDERS["build_ping_and_wait_code[arp]"],
     "build_icmp_responder_code": TX_BUILDERS["build_icmp_responder_code"],
+    "build_icmp_responder_code[arp]": TX_BUILDERS["build_icmp_responder_code[arp]"],
     "build_rx_peek_code": lambda: bp.build_rx_peek_code(LOAD, RESULT),
     "build_rx_echo_reply_tod_code": lambda: bp.build_rx_echo_reply_tod_code(
         LOAD, RX_BUF, RESULT, 0x1234, 1),
     "build_ping_and_wait_tod_code": TX_BUILDERS["build_ping_and_wait_tod_code"],
+    "build_ping_and_wait_tod_code[arp]": TX_BUILDERS["build_ping_and_wait_tod_code[arp]"],
     "build_icmp_responder_tod_code": TX_BUILDERS["build_icmp_responder_tod_code"],
+    "build_icmp_responder_tod_code[arp]": TX_BUILDERS["build_icmp_responder_tod_code[arp]"],
 }
 
 # Builders that neither transmit nor poll: they assume RxEvent already fired.
@@ -419,6 +438,22 @@ def test_rxctl_inline_writes_the_promiscuous_value_low_then_high() -> None:
         CS8900A_RXCTL_VALUE & 0xFF, PPDATA_LO) + _lda_sta(CS8900A_RXCTL_VALUE >> 8, PPDATA_HI)
     assert CS8900A_RXCTL_VALUE & 0x3F == 0x05, "low 6 bits must be RxCTL's register number (#207)"
     assert CS8900A_RXCTL_VALUE & 0x0100, "RxOKA must be set or the receiver accepts nothing (#207)"
+    # The ARP responders (#218) depend on two more acceptance bits that
+    # PromiscuousA happens to make redundant under the harness value but
+    # ip65's value relies on outright; nothing else pins them.
+    assert CS8900A_RXCTL_VALUE & 0x0800, (
+        "BroadcastA must be set: an ARP request is a broadcast frame, and without "
+        "it the responder never sees the request it is meant to answer (#218)"
+    )
+    assert CS8900A_RXCTL_VALUE & 0x0400, (
+        "IndividualA must be set: the ARP reply and the echo reply are unicast to the "
+        "programmed IA, and without it the pinger never receives its answer (#218)"
+    )
+    for bit, name in ((0x0800, "BroadcastA"), (0x0400, "IndividualA")):
+        assert bp.CS8900A_RXCTL_VALUE_IP65 & bit, (
+            f"{name} must be set in the ip65 value too: it has no PromiscuousA to "
+            "fall back on, so this bit alone admits the frame (#218)"
+        )
 
 
 def test_linectl_or_is_a_low_byte_read_modify_write_only() -> None:

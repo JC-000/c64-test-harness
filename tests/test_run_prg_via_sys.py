@@ -427,3 +427,106 @@ def test_leaves_the_cpu_running_after_typing_sys() -> None:
     assert "resume" in t.events[t.events.index("keys"):], (
         f"no resume after the SYS keystrokes; events were {t.events}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #217: re-PUT ``Cartridge Preference`` on the U64 before the reset
+# ---------------------------------------------------------------------------
+#
+# Measured on a U64E (fw 3.15 fork, RR-Net fitted): the firmware's runner
+# load path (``load_prg`` and ``run_prg``) deselects an external cartridge
+# and the deselection is sticky across ``reset()`` until the preference is
+# PUT again (same value; no reset needed).  ``run_prg_via_sys`` therefore
+# re-PUTs it on a U64 when it reads ``External``.  These pin the wiring;
+# ``tests/test_run_prg_cartridge_visibility_live.py`` pins the hardware.
+
+
+class _CartridgeClient:
+    """Stub of the two config calls the re-PUT uses."""
+
+    def __init__(self, preference: str = "External", fail_get: bool = False):
+        self.preference = preference
+        self.fail_get = fail_get
+        self.puts: list[tuple[str, str, str]] = []
+
+    def get_config_category(self, category):
+        if self.fail_get:
+            raise RuntimeError("config API busy")
+        return {category: {"Cartridge Preference": self.preference}, "errors": []}
+
+    def set_config_item(self, category, item, value):
+        self.puts.append((category, item, value))
+
+
+class _U64LikeTransport(_ReflectingTransport):
+    def __init__(self, *a, client=None, **k):
+        super().__init__(*a, **k)
+        self.client = client if client is not None else _CartridgeClient()
+
+
+def _u64_transport(monkeypatch, **client_kwargs) -> _U64LikeTransport:
+    t = _U64LikeTransport(screen_codes=_ready_screen(), client=_CartridgeClient(**client_kwargs))
+    monkeypatch.setattr(_execute, "_is_u64_target", lambda target: True)
+    monkeypatch.setattr(_execute, "_U64_POST_READY_SETTLE", 0.0)
+    return t
+
+
+def test_u64_re_puts_external_preference_before_the_reset(monkeypatch):
+    t = _u64_transport(monkeypatch)
+    order: list[str] = []
+    real_reset = t.reset
+    monkeypatch.setattr(t, "reset", lambda *a, **k: (order.append("reset"), real_reset(*a, **k)))
+    real_put = t.client.set_config_item
+    monkeypatch.setattr(
+        t.client, "set_config_item",
+        lambda *a: (order.append("put"), real_put(*a)),
+    )
+    assert run_prg_via_sys(t, CC65_PRG) == 2061
+    assert t.client.puts == [
+        ("C64 and Cartridge Settings", "Cartridge Preference", "External")
+    ]
+    assert order == ["put", "reset"], "the PUT must precede the reset"
+
+
+def test_u64_leaves_a_non_external_preference_alone(monkeypatch):
+    t = _u64_transport(monkeypatch, preference="Auto")
+    run_prg_via_sys(t, CC65_PRG)
+    assert t.client.puts == [], "only an External preference is re-PUT"
+
+
+def test_u64_reselect_can_be_switched_off(monkeypatch):
+    t = _u64_transport(monkeypatch)
+    run_prg_via_sys(t, CC65_PRG, reselect_cartridge=False)
+    assert t.client.puts == []
+
+
+def test_u64_reselect_also_runs_without_a_reset(monkeypatch):
+    """A PUT alone re-selects (measured), so reset=False still gets it."""
+    t = _u64_transport(monkeypatch)
+    run_prg_via_sys(t, CC65_PRG, reset=False)
+    assert len(t.client.puts) == 1
+
+
+def test_u64_config_failure_is_a_warning_not_an_error(monkeypatch, caplog):
+    t = _u64_transport(monkeypatch, fail_get=True)
+    with caplog.at_level("WARNING", logger="c64_test_harness.execute"):
+        assert run_prg_via_sys(t, CC65_PRG) == 2061
+    assert any("re-select the external cartridge" in r.getMessage() for r in caplog.records)
+    assert t.client.puts == []
+
+
+def test_vice_transport_never_touches_the_config():
+    """A non-U64 transport is left alone even when it carries a ``client``
+    that would accept the calls -- the backend check, not the attribute,
+    is the gate (a VICE transport must never see U64 config traffic)."""
+    t = _U64LikeTransport(screen_codes=_ready_screen(), client=_CartridgeClient())
+    run_prg_via_sys(t, CC65_PRG)          # _is_u64_target is False for a mock
+    assert t.client.puts == []
+
+
+def test_config_failure_warning_names_the_remedy(monkeypatch, caplog):
+    t = _u64_transport(monkeypatch, fail_get=True)
+    with caplog.at_level("WARNING", logger="c64_test_harness.execute"):
+        run_prg_via_sys(t, CC65_PRG)
+    msg = "\n".join(r.getMessage() for r in caplog.records)
+    assert "'Cartridge Preference', 'External'" in msg

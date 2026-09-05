@@ -173,6 +173,30 @@ def test_audio_capture_gap_detection() -> None:
     assert result.packets_dropped == 3
 
 
+def test_audio_capture_backward_step_is_counted_not_dropped() -> None:
+    """A reordered or duplicated packet is a backward step, not a gap.
+
+    ``time_base_intact`` counts forward gaps only; a caller that needs
+    the sample index to be a clock must also check ``packets_reordered``.
+    """
+    port, _placeholder = _reserve_port()
+    cap = AudioCapture(port=port)
+    _placeholder.close()
+    cap.start()
+    try:
+        pcm = _make_pcm(10)
+        # seq 0, 1, 2, then 1 again (duplicate), then 3 (a forward gap
+        # of 1 relative to the duplicate's successor, 2)
+        _send_test_packets(port, [(0, pcm), (1, pcm), (2, pcm), (1, pcm), (3, pcm)])
+        time.sleep(0.1)
+    finally:
+        result = cap.stop()
+    assert result.packets_received == 5
+    assert result.packets_reordered == 1
+    assert result.packets_dropped == 1
+    assert result.time_base_intact is False
+
+
 def test_audio_capture_sequence_wrap() -> None:
     port, _placeholder = _reserve_port()
     cap = AudioCapture(port=port)

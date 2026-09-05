@@ -243,7 +243,7 @@ All functions take `transport: BinaryViceTransport` as first arg (stateless). Th
 - `RECOVERY_PROBE_TIMEOUT = 5.0` -- Seconds the recovery `RTS` probe waits for its landing.
 - `run_subroutine(target, addr, *, timeout=30.0, poll_cadence=0.005, trampoline_addr=0x0360, override=None) -> None` -- Cross-backend "call sub and wait for RTS". Takes a `TestTarget` (not a transport). On VICE wraps `jsr()`. On U64 installs a 14-byte sentinel trampoline at `trampoline_addr` (default `$0360`, cassette buffer; flag bytes at `$03F0`/`$03F1`), triggers it via `SYS <addr>` keystroke (assumes BASIC READY), and host-polls the done flag every `poll_cadence` seconds — sub-millisecond cadence is permitted and useful for short routines (issue #82). Raises `TimeoutError` on U64 only; the message distinguishes "never started" (running flag still `0x00`) from "started but never returned" (running flag `0x01`, done flag never `0x02`). Re-exported from the package root.
 - `parse_basic_sys_address(prg, *, basic_start=0x0801) -> int | None` -- Walks the tokenised BASIC stub line by line and returns the `SYS` operand (`10 SYS2061` as cc65 emits it; `SYS(2061)` accepted; text inside quotes and after `REM` ignored), or `None`. A PRG not loading at *basic_start* is not BASIC and yields `None` whatever bytes it holds.
-- `run_prg_via_sys(target, prg, *, sys_addr=None, reset=True, boot_timeout=25.0, verify_timeout=10.0, settle_after_ready=None) -> int` -- Load a PRG by `write_memory`, re-verify its head by read-back until the post-`READY.` settle has elapsed (default 6 s on a U64 after a reset, 0 otherwise — issue #216: a reset-triggered event zeroes `$0801/$0802` 2–5 s after the banner; the re-verification is the guarantee, the settle an optimisation), start it with a typed `SYS`, then resume; returns the entry address used. Raises `TransportError` if the head never reads back intact `verify_timeout` s past the window. Takes a `TestTarget` or a bare transport; works on both backends. Exists because after `Ultimate64Client.run_prg()` an external cartridge is left deselected (`$DE00` reads zeros afterwards; cause not isolated, issue #211). `reset=True` resets and waits for `READY.` (`TimeoutError` if it never appears); `sys_addr` defaults to the stub's own `SYS` (`ValueError` if none). Re-exported from the package root. Unit test: `tests/test_run_prg_via_sys.py`.
+- `run_prg_via_sys(target, prg, *, sys_addr=None, reset=True, boot_timeout=25.0, verify_timeout=10.0, settle_after_ready=None) -> int` -- Load a PRG by `write_memory`, re-verify its head by read-back until the post-`READY.` settle has elapsed (default 6 s on a U64 after a reset, 0 otherwise — issue #216: a reset-triggered event zeroes `$0801/$0802` 2–5 s after the banner; the re-verification is the guarantee, the settle an optimisation), start it with a typed `SYS`, then resume; returns the entry address used. Raises `TransportError` if the head never reads back intact `verify_timeout` s past the window. Takes a `TestTarget` or a bare transport; works on both backends. Exists because the firmware's runner load path (`Ultimate64Client.run_prg()`/`load_prg()`) deselects an external cartridge, stickily across every `reset()`, until `Cartridge Preference` is PUT again (#217); on a U64 whose preference reads `External` the helper re-PUTs it before writing (`reselect_cartridge=False` opts out; a failed PUT is a WARNING). `reset=True` resets and waits for `READY.` (`TimeoutError` if it never appears); `sys_addr` defaults to the stub's own `SYS` (`ValueError` if none). Re-exported from the package root. Unit test: `tests/test_run_prg_via_sys.py`.
 
 ### `jsr()` internals
 0. Reads `PC`/`SP`/`FL`, unless `preserve_state=False` or the transport has no `read_registers`
@@ -661,7 +661,10 @@ Exception mapping: timeouts, unreachable device, and connection drops mid-reques
 - `client.get_info() -> dict`
 - `client.list_configs() -> list[str]`
 - `client.get_config_category(name) -> dict`
-- `client.get_config_item(category, item) -> dict`
+- `client.get_config_item(category, item) -> dict` -- the **item's own map**, unwrapped from the REST envelope (issue #214): `{'current': 'External', 'values': ['Auto', 'Internal', 'External', 'Manual'], 'default': 'Auto'}`. The key set is the item's type (firmware `emit_store`): `"values"` = enum (never empty), `"presets"` = preset-file item such as `Cartridge` (may be empty), `"min"`/`"max"`/`"format"` = integer range, only `"current"`/`"default"` = free string — so "no `values` key" means non-enum, never empty enum. Names resolve the way the firmware matches them (exact, then case-insensitive; a `*`/`?` glob only when it matches exactly one category and one item). Raises `Ultimate64ProtocolError` if the item is absent (message lists the keys present), a glob matches several, or the envelope's `errors` is non-empty; an unknown category is `Ultimate64ProtocolError` on stock firmware (HTTP 200, no category key) but a plain `Ultimate64Error` with `status == 404` on the 3.15 fork.
+- `client.get_config_value(category, item) -> Any` -- the item's `"current"` value; the accessor for snapshot-then-restore (`prev = get_config_value(...)`, `set_config_item(..., prev)` puts the original back).
+- `client.get_config_choices(category, item) -> list[str]` -- `"values"` of an enum item, else `"presets"` of a preset-file item (may be `[]`); a string or range item **raises** `Ultimate64ProtocolError` rather than answering `[]`, so an `if allowed and prev not in allowed` guard cannot be switched off silently.
+- `client.get_config_item_raw(category, item) -> dict` -- the untouched envelope `{'<category>': {'<item>': {...}}, 'errors': []}` for callers that had adapted to it, and the only accessor for a multi-match pattern.
 - `client.set_config_item(category, item, value) -> None` -- `PUT /v1/configs/<category>/<item>?value=<value>`; the call for one-off items such as `("C64 and Cartridge Settings", "Cartridge Preference", "External")`. Volatile until `save_config_to_flash()`.
 - `client.set_config_items(category, items_dict)` -- iterates per-item (no batch endpoint)
 - `client.save_config_to_flash() -> None` -- `PUT /v1/configs:save_to_flash` (DESTRUCTIVE). Config PUTs are otherwise volatile; a reboot/power-cycle reloads flash, not the RAM-side value.
@@ -1008,7 +1011,8 @@ result = cap.stop(wav_path="output.wav")  # -> CaptureResult
 
 ### `CaptureResult` (dataclass)
 - `.wav_path: Path`, `.duration_seconds: float`, `.sample_rate: int`
-- `.total_samples: int`, `.packets_received: int`, `.packets_dropped: int`
+- `.total_samples: int`, `.packets_received: int`, `.packets_dropped: int`, `.packets_reordered: int` (backward sequence steps — reordered or duplicated packets; counted separately from drops, #205)
+- `.time_base_intact: bool` — `packets_dropped == 0`, forward gaps only; a timing measurement must also require `packets_reordered == 0`, since a gap is never padded and either event breaks the sample index as a clock
 
 ### `write_wav(path, pcm_data, sample_rate=48000, channels=2, sample_width=2) -> Path`
 Write raw PCM data to a WAV file.
@@ -1190,18 +1194,22 @@ All address arguments default to the `$C000` UCI block (`code_addr=0xC000`, data
 Bridge networking helpers — two VICE instances on a host bridge (Linux TAP + `br-c64`, or macOS `feth` + `bridge10`) talking L2 + IP + ICMP via CS8900a. See Pattern 8 in `PATTERNS.md`.
 
 ### High-level orchestrators (own the wall-clock deadline in Python; **VICE-only** — they drive the 6510 with `jsr()`)
-- `run_ping_and_wait(transport, *, tx_frame, rx_buf, result_addr, identifier, sequence, tx_frame_buf, timeout_s=5.0, peek_addr=..., consume_addr=...) -> int` — returns `0x01` on matched reply, `0xFF` on timeout
-- `run_icmp_responder(transport, *, rx_buf, my_ip, result_addr, timeout_s=5.0, peek_addr=..., consume_addr=...) -> int` — reply to any echo request addressed to `my_ip`
+- `run_ping_and_wait(transport, *, tx_frame, rx_buf, result_addr, identifier, sequence, tx_frame_buf, timeout_s=5.0, peek_addr=..., consume_addr=..., arp=True) -> int` — returns `0x01` on matched reply, `0xFF` on timeout. `arp=True` (default, #218) first transmits an ARP request derived from `tx_frame`'s source MAC / source IP / destination IP through the same buffer; `ValueError` if `tx_frame` is not IPv4 — pass `arp=False` to send it raw.
+- `run_icmp_responder(transport, *, rx_buf, my_ip, result_addr, timeout_s=5.0, peek_addr=..., consume_addr=..., my_mac=None) -> int` — reply to any echo request addressed to `my_ip`; with `my_mac` also answers ARP requests for `my_ip` while waiting (re-polls on `RESULT_ARP_REPLY_SENT`)
 
 ### Frame + code builders
 - `build_echo_request_frame(src_mac, dst_mac, src_ip, dst_ip, identifier=0x1234, sequence=1, payload=b"PING_FROM_C64") -> EchoRequest` — pass `.frame` (padded to 60 bytes, word-aligned) as `tx_frame`
+- `build_arp_request_frame(src_mac, src_ip, target_ip) -> bytes` — broadcast "who has *target_ip*" (#218); `ARP_FRAME_LEN` = 60 bytes, RFC 826 at ip65's `ap_*` offsets. Feed to `build_bridge_tx_code` or `arp_frame_buf=` below
+- `build_arp_reply_frame(src_mac, src_ip, target_mac, target_ip) -> bytes` — unicast reply; the host-side twin of what the responders emit
+- `parse_arp(frame) -> ArpPacket | None` — `None` unless ethernet/IPv4 ARP (accepts the unpadded 42-byte packet). Both builders raise `ValueError` on a MAC/IP of the wrong length
 - `build_bridge_tx_code(...)` — transmit a pre-built frame via CS8900a
 - `build_rx_peek_code(...)` — bounded peek into RX FIFO (drives orchestrator polling)
 - `build_rx_echo_reply_code(...)` — full-routine echo-reply match (legacy, virtual-cycle timing)
 - `build_read_and_match_echo_reply_code(...)` — read a pending frame, match against expected reply
-- `build_read_and_respond_echo_request_code(...)` — read request, respond with reply in one pass
-- `build_ping_and_wait_code(...)` — legacy TX+RX combined, virtual-cycle timing
-- `build_icmp_responder_code(...)` — legacy responder, virtual-cycle timing
+- `build_read_and_respond_echo_request_code(..., my_mac=None)` — read request, respond with reply in one pass; with `my_mac` an ARP request for `my_ip` is answered and the result is `RESULT_ARP_REPLY_SENT` (`0x03`, re-poll)
+- `build_ping_and_wait_code(..., arp_frame_buf=None, arp_frame_len=None)` — legacy TX+RX combined, virtual-cycle timing; with `arp_frame_buf` the ARP frame there (length defaults to `ARP_FRAME_LEN`) is transmitted before the echo request in the same run, and the ARP reply is drained as a non-match (#218)
+- `build_icmp_responder_code(..., my_mac=None)` — legacy responder, virtual-cycle timing; with `my_mac` answers ARP requests for `my_ip` while waiting, then keeps waiting for the echo
+- ARP defaults (`None`) keep every builder byte-identical to its pre-#218 output (pinned by SHA-256 in `tests/test_cs8900a_arp.py`). ARP on makes them larger — consume 585 B, responder 630 B, TOD responder 754 B, ping-and-wait 319 B, TOD ping 443 B — so size code windows accordingly. Proven under VICE and on the simulated chip (`tests/cs8900a_sim.py`); a hardware pass is still owed.
 - Init helpers (blob = ends in `RTS`; inline = no `RTS`, prepend to a routine). All enable the RR clockport first.
   - `cs8900a_enable_inline_code()` — RxCTL = `CS8900A_RXCTL_VALUE`, then LineCTL |= SerRxON|SerTxON; everything a fresh chip needs
   - `cs8900a_rxctl_inline_code(value=CS8900A_RXCTL_VALUE)` / `cs8900a_rxctl_code()`
@@ -1210,12 +1218,13 @@ Bridge networking helpers — two VICE instances on a host bridge (Linux TAP + `
 - Constants (import from `c64_test_harness.bridge_ping`; not package-root exports): `CS8900A_RXCTL_VALUE = 0x0D85` (PromiscuousA|RxOKA|IndividualA|BroadcastA + regnum), `CS8900A_RXCTL_VALUE_IP65 = 0x0D05` (same, non-promiscuous — ip65's value), `CS8900A_TXCMD_VALUE = 0x00C9`, `CS8900A_RXEVENT_MASK = 0x0D`, `CS8900A_LINECTL_ENABLE = 0x00C0`. The low 6 bits of every CS8900a control register are the read-only register number (issue #207) — the old `0x00D8`/`0x00C0` only ever worked under VICE.
 
 ### TOD-timed variants (shippable on real C64 / U64E / VICE normal; NOT usable under VICE warp)
-- `build_ping_and_wait_tod_code(...)`
-- `build_icmp_responder_tod_code(...)`
+- `build_ping_and_wait_tod_code(..., deadline_tenths=50, *, arp_frame_buf=None, arp_frame_len=None)` — same ARP-first option as the counter variant
+- `build_icmp_responder_tod_code(..., deadline_tenths=50, *, my_mac=None)` — same ARP answer as the counter variant, against the same TOD deadline
 - `build_rx_echo_reply_tod_code(...)`
 
 ### Dataclasses
 - `EchoRequest` — `.frame`, `.identifier`, `.sequence`, `.payload`; what `build_echo_request_frame` returns
+- `ArpPacket` — `.dst_mac`, `.src_mac`, `.opcode`, `.sender_mac`, `.sender_ip`, `.target_mac`, `.target_ip`, `.is_request`, `.is_reply`; what `parse_arp` returns. Package-root exports: `ArpPacket`, `build_arp_request_frame`, `build_arp_reply_frame`, `parse_arp`; `ARP_FRAME_LEN`, `RESULT_ARP_REPLY_SENT`, `ETHERTYPE_ARP` live in `c64_test_harness.bridge_ping`
 
 **Test fixture:** `bridge_vice_pair` in `tests/conftest.py` brings up two VICE instances on `BRIDGE_NAME` (`br-c64` / `bridge10`), RR-Net mode, warp off, unique MACs, CS8900a initialised.
 
