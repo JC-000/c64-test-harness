@@ -407,7 +407,17 @@ def _resolve_bne(code: bytes, bne_off: int) -> int:
 def test_responder_checks_ethertype_opcode_and_target_ip(name: str) -> None:
     """The three compares that make it an ARP responder, at ip65's offsets."""
     code = RESPONDER_ARP_BUILDERS[name]()
-    assert _cmp_at(13, 0x06) in code, f"{name}: no ethertype 0x0806 compare at rx+13"
+    arp_lo = code.find(_cmp_at(13, 0x06))
+    assert arp_lo >= 0, f"{name}: no ethertype 0x0806 compare at rx+13"
+    # The high-byte compare must be *this* block's, immediately before the
+    # 0x06 compare -- the ICMP path has its own rx+12 == 0x08 check further
+    # down, so "somewhere in the code" would be satisfied without it
+    # (adversarial review of #218: that mutation survived).
+    # A check is 7 bytes: LDA abs, CMP #, BNE rel -- _cmp_at is the first six.
+    assert code[arp_lo - 7:arp_lo - 1] == _cmp_at(12, 0x08), (
+        f"{name}: the ARP block does not check the ethertype high byte before "
+        "the 0x06 compare; a frame of ethertype 0xXX06 (e.g. 0x8906) is taken for ARP"
+    )
     assert _cmp_at(20, 0x00) in code and _cmp_at(21, 0x01) in code, (
         f"{name}: no opcode==1 (request) compare at rx+20/21"
     )
@@ -496,13 +506,18 @@ def test_responder_answers_an_arp_request_for_its_ip(name: str) -> None:
 @pytest.mark.parametrize("name", sorted(RESPONDER_ARP_BUILDERS))
 def test_responder_ignores_arp_for_another_ip_and_arp_replies(name: str) -> None:
     other = build_arp_request_frame(MAC_A, IP_A, bytes([10, 0, 65, 99]))
+    # Ethertype 0x8906 with an otherwise perfect ARP body for us: only the
+    # high byte says it is not ARP.
+    lookalike = ARP_REQUEST_A_FOR_B[:12] + b"\x89\x06" + ARP_REQUEST_A_FOR_B[14:]
     echo = build_echo_request_frame(MAC_A, MAC_B, IP_A, IP_B).frame
     if name == "build_read_and_respond_echo_request_code":
-        for frame in (other, ARP_REPLY_B_TO_A):
+        for frame in (other, ARP_REPLY_B_TO_A, lookalike):
             cpu, chip = _run_responder(name, [frame])
-            assert cpu.mem[RESULT] == 0x02 and chip.tx_frames == []
+            assert cpu.mem[RESULT] == 0x02 and chip.tx_frames == [], (
+                f"{name}: answered a frame it must ignore: {frame[:22].hex()}"
+            )
     else:
-        cpu, chip = _run_responder(name, [other, ARP_REPLY_B_TO_A, echo])
+        cpu, chip = _run_responder(name, [other, ARP_REPLY_B_TO_A, lookalike, echo])
         assert cpu.mem[RESULT] == 0x01
         assert len(chip.tx_frames) == 1 and chip.tx_frames[0][12:14] == b"\x08\x00", (
             f"{name}: transmitted {[f[12:14].hex() for f in chip.tx_frames]}"
