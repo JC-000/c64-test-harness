@@ -55,6 +55,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+from ..config import U64_BASELINE_ON_ENTRY_ENV, env_flag
 from .ultimate64_client import Ultimate64Client, Ultimate64Error
 
 try:
@@ -70,15 +71,18 @@ __all__ = [
     "BASELINE_ON_ENTRY_ENV",
     "BASELINE_CATEGORIES",
     "BASELINE_EXCLUDED_CATEGORIES",
+    "DETECTION_DERIVED_ITEMS",
     "BaselineReport",
     "U64BaselineError",
     "apply_factory_baseline",
     "baseline_on_entry_enabled",
 ]
 
-#: Environment switch for the manager path (``create_manager(backend="u64")``).
-#: ``1`` / ``true`` / ``yes`` / ``on``, case-insensitive.
-BASELINE_ON_ENTRY_ENV = "U64_BASELINE_ON_ENTRY"
+#: The one environment switch, shared with ``HarnessConfig.from_env``
+#: (which also honours its ``C64TEST_U64_BASELINE_ON_ENTRY`` convention
+#: form, winning when both are set).  ``1`` / ``true`` / ``yes`` / ``on``,
+#: case-insensitive.
+BASELINE_ON_ENTRY_ENV = U64_BASELINE_ON_ENTRY_ENV
 
 #: The stores the entry reset covers, by canonical firmware name (the
 #: per-category route is a case-insensitive exact match for a name with
@@ -119,15 +123,42 @@ BASELINE_EXCLUDED_CATEGORIES: tuple[str, ...] = (
 
 _EXCLUDED_MARKERS: tuple[str, ...] = ("ethernet", "network", "wifi", "wi-fi")
 
+#: ``(category, item)`` pairs whose value the firmware **derives from SID
+#: detection at boot**.  They never equal ``default`` on a device with
+#: SIDs fitted, so ``current == default`` is the wrong assertion for them:
+#: the entry reset still resets their category, but they are reported
+#: (``BaselineReport.detection_derived``, with current and default) and
+#: **never compared and never PUT**.
+#:
+#: Measured on the U64E (fw 3.15 fork, two 8580s fitted) 2026-09-05, lock
+#: held: these six read ``'8580'`` (default ``'None'``), ``'Enabled'``
+#: (``'Disabled'``) and ``'22 nF'`` (``'470 pF'``), identical before and
+#: after a physical power-cycle (n=1), while every other one of the 203
+#: items equalled its default.  Whether a reset of the category moves
+#: them transiently before the firmware re-detects is being measured;
+#: exempting them from the comparison is correct either way.
+#:
+#: The set is pinned literally by ``tests/test_entry_baseline.py``: an
+#: exemption masks a real failure, so it grows only with a measurement
+#: of the same grade.  A one-off exemption for a script goes through
+#: ``apply_factory_baseline(..., exempt=[...])`` instead.
+DETECTION_DERIVED_ITEMS: frozenset[tuple[str, str]] = frozenset({
+    ("SID Sockets Configuration", "SID Detected Socket 1"),
+    ("SID Sockets Configuration", "SID Detected Socket 2"),
+    ("SID Sockets Configuration", "SID Socket 1"),
+    ("SID Sockets Configuration", "SID Socket 2"),
+    ("SID Sockets Configuration", "SID Socket 1 Capacitors"),
+    ("SID Sockets Configuration", "SID Socket 2 Capacitors"),
+})
+
 
 def baseline_on_entry_enabled() -> bool:
     """Whether :data:`BASELINE_ON_ENTRY_ENV` asks for the entry reset.
 
     Read at call time (not import time) so tests and long-lived processes
-    can flip it.
+    can flip it.  Same parser as ``HarnessConfig.from_env``.
     """
-    raw = os.environ.get(BASELINE_ON_ENTRY_ENV, "")
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return env_flag(BASELINE_ON_ENTRY_ENV) is True
 
 
 # --------------------------------------------------------------------------- #
@@ -159,6 +190,13 @@ class BaselineReport:
     ``unasserted``
         Per category, the items whose map carries no ``default`` key
         (preset-file / info types) — reported, not compared.
+    ``detection_derived``
+        Items in :data:`DETECTION_DERIVED_ITEMS` (or the caller's
+        ``exempt=``) as read after the reset, with their default —
+        listed whatever they read, never compared, never PUT.
+        ``category -> item -> (current_after, default)``.  Kept apart
+        from ``mismatched`` on purpose: one is a detection result, the
+        other a reset that did not take.
     ``dry_run``
         ``True`` when nothing was written.
     """
@@ -169,6 +207,7 @@ class BaselineReport:
     skipped: tuple[str, ...] = ()
     unasserted: dict[str, tuple[str, ...]] = field(default_factory=dict)
     dry_run: bool = False
+    detection_derived: _ItemMap = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -183,6 +222,10 @@ class BaselineReport:
         """``(category, item)`` pairs still off after the reset."""
         return [(cat, item) for cat, items in self.mismatched.items() for item in items]
 
+    def detection_derived_items(self) -> list[tuple[str, str]]:
+        """``(category, item)`` pairs reported as detection-derived."""
+        return [(cat, item) for cat, items in self.detection_derived.items() for item in items]
+
     def summary(self) -> str:
         """One line for a log: counts, plus the mismatches by name."""
         parts = [
@@ -190,6 +233,10 @@ class BaselineReport:
             f"{len(self.drifted_items())} item(s) drifted before",
             f"{len(self.mismatched_items())} still off after",
         ]
+        if self.detection_derived:
+            parts.append(
+                f"{len(self.detection_derived_items())} detection-derived (not compared)"
+            )
         if self.skipped:
             parts.append(f"{len(self.skipped)} skipped (absent): {', '.join(self.skipped)}")
         if self.dry_run:
@@ -218,7 +265,14 @@ class U64BaselineError(Ultimate64Error):
             message = (
                 f"reset did not take: {len(report.mismatched_items())} item(s) "
                 f"still differ from the firmware default after the per-category "
-                f"reset — {detail}"
+                f"reset — {detail}.  If an item's value is derived from "
+                f"detection at boot (never equals its default on this hardware, "
+                f"stable across a power-cycle), it is not a failed reset: exempt "
+                f"it for one run with apply_factory_baseline(..., "
+                f"exempt=[(category, item)]) and, with the measurement, add it to "
+                f"DETECTION_DERIVED_ITEMS in ultimate64_baseline.py (pinned by "
+                f"tests/test_entry_baseline.py).  Detection-derived items already "
+                f"exempt: {len(report.detection_derived_items())}."
             )
         super().__init__(message)
 
@@ -307,11 +361,25 @@ def _differs(value: Any, default: Any) -> bool:
     return str(value) != str(default)
 
 
+def _validate_exempt(exempt: Iterable[tuple[str, str]]) -> frozenset[tuple[str, str]]:
+    out: set[tuple[str, str]] = set()
+    for entry in exempt:
+        if (not isinstance(entry, tuple) or len(entry) != 2
+                or not all(isinstance(x, str) and x for x in entry)):
+            raise ValueError(
+                f"exempt entries are (category, item) string pairs, got {entry!r}"
+            )
+        _validate_categories((entry[0],))   # never a network store, never a glob
+        out.add(entry)
+    return frozenset(out)
+
+
 def apply_factory_baseline(
     client: Ultimate64Client,
     *,
     categories: Iterable[str] = BASELINE_CATEGORIES,
     dry_run: bool = False,
+    exempt: Iterable[tuple[str, str]] = (),
 ) -> BaselineReport:
     """Reset the covered categories to factory default, then assert it.
 
@@ -320,6 +388,12 @@ def apply_factory_baseline(
     item GET per item for its ``current`` and ``default``.  Pre-reset drift
     is logged at INFO per item; a post-reset mismatch raises
     :class:`U64BaselineError` after every category has been processed.
+
+    Items in :data:`DETECTION_DERIVED_ITEMS` — and in *exempt* — are
+    **not compared** (their value is what the firmware detected, not what
+    a reset produces); they are reported under
+    ``report.detection_derived`` with current and default.  Their
+    category is still reset.  Nothing is ever PUT by this function.
 
     :param client: connected :class:`Ultimate64Client` — hold the device's
         ``DeviceLock`` (``create_manager(backend="u64")`` does, and runs
@@ -331,14 +405,20 @@ def apply_factory_baseline(
     :param dry_run: read and report only — no reset is sent, ``reset`` is
         empty and ``mismatched`` is empty (nothing was asserted); the
         ``drifted`` map shows what a real run would have reset.
+    :param exempt: extra ``(category, item)`` pairs to treat like
+        :data:`DETECTION_DERIVED_ITEMS` for this call — a one-off for a
+        script on hardware whose detection-derived items are not yet in
+        the pinned set.  Refused for the network stores and globs.
     :returns: :class:`BaselineReport`.
-    :raises ValueError: a glob or an excluded category in *categories*.
+    :raises ValueError: a glob or an excluded category in *categories*
+        or *exempt*.
     :raises U64BaselineError: an item still reads ``current != default``
         after its category was reset, or a listed category the firmware
         reports it did not reset.
     :raises Ultimate64Error: wire / protocol failures from the client.
     """
     wanted = _validate_categories(categories)
+    exempt_pairs = DETECTION_DERIVED_ITEMS | _validate_exempt(exempt)
 
     host = getattr(client, "host", None)
     if _HAS_DEVICE_LOCK and isinstance(host, str) and host:
@@ -348,6 +428,7 @@ def apply_factory_baseline(
 
     drifted: _ItemMap = {}
     mismatched: _ItemMap = {}
+    detection_derived: _ItemMap = {}
     unasserted: dict[str, tuple[str, ...]] = {}
     reset_done: list[str] = []
     skipped: list[str] = []
@@ -387,11 +468,16 @@ def apply_factory_baseline(
                 no_default.append(item)
                 continue
             default = item_map["default"]
+            current = item_map.get("current")
+            if (category, item) in exempt_pairs or (requested, item) in exempt_pairs:
+                # Detection-derived: what the firmware found in the socket,
+                # not what a reset produces.  Listed, never compared.
+                detection_derived.setdefault(category, {})[item] = (current, default)
+                continue
             if _differs(before[item], default):
                 drifted.setdefault(category, {})[item] = (before[item], default)
             if dry_run:
                 continue
-            current = item_map.get("current")
             if _differs(current, default):
                 mismatched.setdefault(category, {})[item] = (current, default)
         if no_default:
@@ -405,6 +491,13 @@ def apply_factory_baseline(
                 " (reset)" if not dry_run else " (dry run, left as is)",
             )
 
+    for category, items in detection_derived.items():
+        for item, (value, default) in items.items():
+            _log.debug(
+                "entry baseline: detection-derived %r/%r: current=%r default=%r "
+                "(not compared)", category, item, value, default,
+            )
+
     report = BaselineReport(
         drifted=drifted,
         reset=tuple(reset_done),
@@ -412,6 +505,7 @@ def apply_factory_baseline(
         skipped=tuple(skipped),
         unasserted=unasserted,
         dry_run=dry_run,
+        detection_derived=detection_derived,
     )
     _log.info("entry baseline: %s", report.summary())
 

@@ -693,6 +693,130 @@ class TestManagerPath:
         assert mgr.backend == "vice"
 
 
+# --------------------------------------------------------------------------- #
+# Detection-derived items (U64E measurement, 2026-09-05)                      #
+# --------------------------------------------------------------------------- #
+#
+# ``SID Sockets Configuration`` carries six items whose value the firmware
+# derives from SID detection at boot; they never equal ``default`` on a
+# device with SIDs fitted and were identical before and after a physical
+# power-cycle (n=1), while every other one of the 203 items equalled its
+# default.  Asserting ``current == default`` on them is a false failure.
+
+_SID_SOCKETS = "SID Sockets Configuration"
+_DETECTION_DERIVED: dict[str, tuple[str, str]] = {
+    "SID Detected Socket 1": ("8580", "None"),
+    "SID Detected Socket 2": ("8580", "None"),
+    "SID Socket 1": ("Enabled", "Disabled"),
+    "SID Socket 2": ("Enabled", "Disabled"),
+    "SID Socket 1 Capacitors": ("22 nF", "470 pF"),
+    "SID Socket 2 Capacitors": ("22 nF", "470 pF"),
+}
+
+
+def _sid_fitted_factory(extra: dict[str, tuple[Any, Any]] | None = None) -> dict:
+    """The bench shape: the six derived items differ from default and ignore
+    a reset (the fake's ``frozen``); everything else is at default."""
+    factory = {cat: dict(items) for cat, items in _FACTORY.items()}
+    factory[_SID_SOCKETS] = {**_DETECTION_DERIVED, **(extra or {})}
+    return factory
+
+
+class TestDetectionDerivedItems:
+    def test_the_set_is_exactly_the_six_measured_items(self) -> None:
+        """Pinned literally: an exemption masks a real failure, so the set
+        grows only with a measurement (power-cycle-stable, != default)."""
+        from c64_test_harness.backends.ultimate64_baseline import DETECTION_DERIVED_ITEMS
+
+        assert DETECTION_DERIVED_ITEMS == frozenset({
+            (_SID_SOCKETS, "SID Detected Socket 1"),
+            (_SID_SOCKETS, "SID Detected Socket 2"),
+            (_SID_SOCKETS, "SID Socket 1"),
+            (_SID_SOCKETS, "SID Socket 2"),
+            (_SID_SOCKETS, "SID Socket 1 Capacitors"),
+            (_SID_SOCKETS, "SID Socket 2 Capacitors"),
+        })
+
+    def test_every_exemption_names_a_known_detection_derived_item(self) -> None:
+        from c64_test_harness.backends.ultimate64_baseline import DETECTION_DERIVED_ITEMS
+
+        for cat, item in DETECTION_DERIVED_ITEMS:
+            assert cat == _SID_SOCKETS, f"{cat!r}/{item!r}: only the SID socket store is detection-derived"
+            assert item in _DETECTION_DERIVED, f"{item!r} is not one of the six measured items"
+            assert cat in BASELINE_CATEGORIES
+
+    def test_sids_fitted_device_passes_and_reports_the_six(self) -> None:
+        """Today's code raises 'reset did not take' on this shape."""
+        client = FakeBaselineU64(_sid_fitted_factory(), frozen=set(_DETECTION_DERIVED))
+        report = apply_factory_baseline(client)          # must not raise
+        assert report.ok
+        assert report.mismatched == {}
+        assert report.detection_derived == {_SID_SOCKETS: {
+            item: (cur, default) for item, (cur, default) in _DETECTION_DERIVED.items()
+        }}
+        assert _SID_SOCKETS not in report.drifted, "derived items are not drift either"
+
+    def test_the_category_is_still_reset(self) -> None:
+        client = FakeBaselineU64(_sid_fitted_factory(), frozen=set(_DETECTION_DERIVED))
+        report = apply_factory_baseline(client)
+        assert ("reset", _SID_SOCKETS) in client.requests
+        assert _SID_SOCKETS in report.reset
+
+    def test_derived_items_are_never_put(self) -> None:
+        client = FakeBaselineU64(_sid_fitted_factory(), frozen=set(_DETECTION_DERIVED))
+        apply_factory_baseline(client)
+        assert not [r for r in client.requests if r[0] == "put"]
+
+    def test_derived_items_that_happen_to_equal_default_are_still_listed(self) -> None:
+        """A device without SIDs fitted: the six read their defaults.  They
+        are still reported under detection_derived (never compared), so a
+        reader can see the detection result either way."""
+        client = FakeBaselineU64(_sid_fitted_factory({
+            item: (default, default) for item, (_c, default) in _DETECTION_DERIVED.items()
+        }))
+        report = apply_factory_baseline(client)
+        assert set(report.detection_derived[_SID_SOCKETS]) == set(_DETECTION_DERIVED)
+        assert report.ok
+
+    def test_a_non_exempt_mismatch_in_the_same_category_is_still_a_failure(self) -> None:
+        """Generic fallback: mismatches are listed separately from the
+        derived items, and the message says how to declare an exemption."""
+        factory = _sid_fitted_factory({"SID Socket 1 Type": ("6581", "8580")})
+        client = FakeBaselineU64(
+            factory, frozen=set(_DETECTION_DERIVED) | {"SID Socket 1 Type"}
+        )
+        with pytest.raises(U64BaselineError) as ei:
+            apply_factory_baseline(client)
+        msg = str(ei.value)
+        assert "SID Socket 1 Type" in msg and "6581" in msg and "8580" in msg
+        assert "DETECTION_DERIVED_ITEMS" in msg and "exempt=" in msg, (
+            "the message must say how to declare an exemption"
+        )
+        assert ei.value.mismatched == {_SID_SOCKETS: {"SID Socket 1 Type": ("6581", "8580")}}
+        assert set(ei.value.report.detection_derived[_SID_SOCKETS]) == set(_DETECTION_DERIVED)
+        assert "SID Socket 1 Type" not in ei.value.report.detection_derived[_SID_SOCKETS]
+
+    def test_caller_exemption_is_honoured_and_reported(self) -> None:
+        factory = _sid_fitted_factory({"SID Socket 1 Type": ("6581", "8580")})
+        client = FakeBaselineU64(
+            factory, frozen=set(_DETECTION_DERIVED) | {"SID Socket 1 Type"}
+        )
+        report = apply_factory_baseline(client, exempt=[(_SID_SOCKETS, "SID Socket 1 Type")])
+        assert report.ok
+        assert report.detection_derived[_SID_SOCKETS]["SID Socket 1 Type"] == ("6581", "8580")
+
+    def test_caller_exemption_cannot_name_a_network_store(self) -> None:
+        client = FakeBaselineU64()
+        with pytest.raises(ValueError, match="never"):
+            apply_factory_baseline(client, exempt=[("Ethernet Settings", "Use DHCP")])
+        assert client.requests == []
+
+    def test_summary_counts_the_derived_items(self) -> None:
+        client = FakeBaselineU64(_sid_fitted_factory(), frozen=set(_DETECTION_DERIVED))
+        report = apply_factory_baseline(client)
+        assert "6 detection-derived" in report.summary()
+
+
 class TestPackageSurface:
     def test_exported_from_the_package_root(self) -> None:
         import c64_test_harness as pkg
