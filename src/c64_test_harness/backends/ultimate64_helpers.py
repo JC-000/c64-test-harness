@@ -2016,6 +2016,25 @@ def isolated_sid_addressing(
         }
         if changes:
             set_sid_address_map(client, changes)
+        # Read the map back, for the same reason mirroring is read back:
+        # an address write that was accepted-but-not-applied leaves the
+        # slot under test decoding somewhere else, and the measurement
+        # then reads open bus or a neighbour's chip while looking like a
+        # clean run.  On the U64E a PUT to this category takes effect
+        # immediately (issue #204, measured), so a mismatch here is a
+        # write that did not happen, not one that has not happened yet.
+        applied = get_sid_address_map(client)
+        wrong = {
+            slot.value: (address, applied.get(slot))
+            for slot, address in final.items()
+            if applied.get(slot) != address
+        }
+        if wrong:
+            raise Ultimate64Error(
+                f"SID address map read back differently from what was "
+                f"written (slot: (wanted, got)): {wrong}; the decode "
+                f"cannot be trusted."
+            )
         yield dict(final)
     finally:
         if restore and saved:

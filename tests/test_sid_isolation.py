@@ -256,6 +256,36 @@ class TestIsolatedSidAddressing:
                 pass
         assert client.puts == []
 
+    def test_an_address_write_that_did_not_apply_is_refused(self) -> None:
+        """The map is read back after the write, like mirroring is.
+
+        Found on hardware (issue #204): with the address writes dropped,
+        the slot under test decodes nowhere and the 6510 reads open bus
+        at its base, while the helper -- which read back only mirroring
+        -- reported a clean run.  A frozen item models an accepted-but-
+        not-applied PUT.
+        """
+        client = FakeU64()
+        client.frozen.add("SID Socket 2 Address")
+        with pytest.raises(Ultimate64Error, match="SID Socket 2.*D420"):
+            with isolated_sid_addressing(
+                client, {SidSlot.SOCKET1: "$D400", SidSlot.SOCKET2: "$D420"}
+            ):
+                pytest.fail("body ran on an unverified map")
+        # Restore still happened, mirroring last.
+        assert client.state[CAT_SID_ADDRESSING] == _FACTORY
+        assert client.items_put()[-1] == _MIRROR
+
+    def test_the_read_back_passes_when_every_write_applied(self) -> None:
+        client = FakeU64()
+        with isolated_sid_addressing(
+            client, {SidSlot.SOCKET1: "$D400", SidSlot.SOCKET2: "$D420"}
+        ) as final:
+            assert _addresses(client) == {
+                f"{slot.value} Address": address
+                for slot, address in final.items()
+            }
+
 
 # --------------------------------------------------------------------------- #
 # Restore                                                                     #
