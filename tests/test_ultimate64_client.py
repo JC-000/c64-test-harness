@@ -1524,3 +1524,193 @@ def test_snapshot_set_restore_round_trip_writes_original_value_back():
     assert device.puts == ["External", "Auto"]
     assert after == "Auto"
     assert device.current == "Auto"
+
+
+# ------------------------------------------- firmware name matching (#214 review)
+# route_configs.cc emit_store matches category and item with pattern_match()
+# (case-insensitive glob, components/pattern.cc) and keys the JSON by the
+# CANONICAL names, so the caller's spelling need not be a key in the envelope.
+_CPU_SPEED_ENVELOPE = (
+    b'{"U64 Specific Settings":{"CPU Speed":{"current":" 1","values":[" 1","48"],'
+    b'"default":" 1"}},"errors":[]}'
+)
+
+
+@pytest.mark.parametrize(
+    "cat,item",
+    [
+        ("U64 Specific Settings", "cpu speed"),
+        ("u64 specific settings", "CPU Speed"),
+        ("U64 SPECIFIC SETTINGS", "CPU SPEED"),
+    ],
+)
+def test_get_config_item_resolves_case_insensitive_names(cat, item):
+    mock, _ = _capture(_CPU_SPEED_ENVELOPE)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        got = c.get_config_item(cat, item)
+        value = c.get_config_value(cat, item)
+    assert got["current"] == " 1"
+    assert value == " 1"
+
+
+@pytest.mark.parametrize(
+    "cat,item",
+    [
+        ("u64 specific*", "CPU Speed"),
+        ("U64 Specific Settings", "CPU*"),
+        ("U64 Specific Settings", "CPU Spee?"),
+    ],
+)
+def test_get_config_item_pattern_with_a_unique_match_resolves(cat, item):
+    mock, _ = _capture(_CPU_SPEED_ENVELOPE)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        got = c.get_config_item(cat, item)
+    assert got["current"] == " 1"
+
+
+def test_get_config_item_pattern_matching_several_items_raises_listing_them():
+    body = (
+        b'{"U64 Specific Settings":{'
+        b'"CPU Speed":{"current":" 1","values":[" 1"],"default":" 1"},'
+        b'"Turbo Control":{"current":"Off","values":["Off","Manual"],"default":"Off"}},'
+        b'"errors":[]}'
+    )
+    mock, _ = _capture(body)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        with pytest.raises(Ultimate64ProtocolError) as ei:
+            c.get_config_item("U64 Specific Settings", "*")
+    msg = str(ei.value)
+    assert "CPU Speed" in msg and "Turbo Control" in msg
+    assert "get_config_item_raw" in msg
+
+
+def test_get_config_item_pattern_matching_several_categories_raises_listing_them():
+    body = (
+        b'{"Drive A Settings":{"Drive Type":{"current":"1541","values":["1541"],"default":"1541"}},'
+        b'"Drive B Settings":{"Drive Type":{"current":"1571","values":["1571"],"default":"1571"}},'
+        b'"errors":[]}'
+    )
+    mock, _ = _capture(body)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        with pytest.raises(Ultimate64ProtocolError) as ei:
+            c.get_config_item("Drive *", "Drive Type")
+    msg = str(ei.value)
+    assert "Drive A Settings" in msg and "Drive B Settings" in msg
+
+
+def test_get_config_item_plain_name_is_never_mapped_onto_a_lone_sibling():
+    """A misspelt canonical name must not silently return the one item that
+    happens to be present (a firmware rename would then read the wrong item)."""
+    body = (
+        b'{"C64 and Cartridge Settings":{"Cartridge":{"current":"","presets":[""],"default":""}},'
+        b'"errors":[]}'
+    )
+    mock, _ = _capture(body)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        with pytest.raises(Ultimate64ProtocolError) as ei:
+            c.get_config_item("C64 and Cartridge Settings", "Cartridge Preference")
+    msg = str(ei.value)
+    assert "Cartridge Preference" in msg
+    assert "'Cartridge'" in msg  # the keys that ARE present are listed
+
+
+def test_get_config_item_absent_message_lists_keys_present():
+    body = (
+        b'{"U64 Specific Settings":{'
+        b'"CPU Speed":{"current":" 1","values":[" 1"],"default":" 1"},'
+        b'"Turbo Control":{"current":"Off","values":["Off"],"default":"Off"}},'
+        b'"errors":[]}'
+    )
+    mock, _ = _capture(body)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        with pytest.raises(Ultimate64ProtocolError) as ei:
+            c.get_config_item("U64 Specific Settings", "No Such Item")
+    msg = str(ei.value)
+    assert "No Such Item" in msg
+    assert "CPU Speed" in msg and "Turbo Control" in msg
+
+
+def test_get_config_item_unknown_category_on_stock_firmware_raises_protocol_error():
+    """Stock firmware (1.1.0 / 3.14d) answers an unknown category with HTTP
+    200 and no category key at all; the 3.15 fork answers 404 (a plain
+    Ultimate64Error from the request layer)."""
+    mock, _ = _capture(b'{"errors":[]}')
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        with pytest.raises(Ultimate64ProtocolError, match="No Such Category"):
+            c.get_config_item("No Such Category", "CPU Speed")
+
+    def _raise(req, timeout=None):
+        raise _http_error(404, b'{"errors":["No configuration category matches"]}')
+
+    with patch("urllib.request.urlopen", side_effect=_raise):
+        with pytest.raises(Ultimate64Error) as ei:
+            c.get_config_item("No Such Category", "CPU Speed")
+    assert not isinstance(ei.value, Ultimate64ProtocolError)
+    assert ei.value.status == 404
+
+
+# ---------------------------------------------------- get_config_choices (#214 3b)
+# emit_store's key set is the type discriminator: "values" = enum (built from
+# j=0..max inclusive, never empty); "presets" = preset-file item (may be
+# empty); "min"/"max"/"format" = integer range; only "default" = free string.
+def _item_envelope(cat: str, item: str, body: dict) -> bytes:
+    return json.dumps({cat: {item: body}, "errors": []}).encode("utf-8")
+
+
+def test_get_config_choices_enum_item_returns_values():
+    body = _item_envelope("U64 Specific Settings", "CPU Speed",
+                          {"current": " 1", "values": [" 1", " 2", "48"], "default": " 1"})
+    mock, _ = _capture(body)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        choices = c.get_config_choices("U64 Specific Settings", "CPU Speed")
+    assert choices == [" 1", " 2", "48"]
+    assert isinstance(choices, list)
+
+
+def test_get_config_choices_preset_item_may_be_empty():
+    body = _item_envelope("C64 and Cartridge Settings", "Cartridge",
+                          {"current": "", "presets": [], "default": ""})
+    mock, _ = _capture(body)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        choices = c.get_config_choices("C64 and Cartridge Settings", "Cartridge")
+    assert choices == []
+
+
+def test_get_config_choices_preset_item_returns_presets():
+    body = _item_envelope("C64 and Cartridge Settings", "Cartridge",
+                          {"current": "REU", "presets": ["", "REU"], "default": ""})
+    mock, _ = _capture(body)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        assert c.get_config_choices("C64 and Cartridge Settings", "Cartridge") == ["", "REU"]
+
+
+def test_get_config_choices_string_item_raises_not_empty_list():
+    """A free-string item has no enum; handing back [] would silently invert a
+    downstream ``if allowed and prev not in allowed`` guard."""
+    body = _item_envelope("Network Settings", "Host Name",
+                          {"current": "ultimate", "default": "ultimate"})
+    mock, _ = _capture(body)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        with pytest.raises(Ultimate64ProtocolError, match="Host Name"):
+            c.get_config_choices("Network Settings", "Host Name")
+
+
+def test_get_config_choices_range_item_raises():
+    body = _item_envelope("Audio Mixer", "Vol UltiSid 1",
+                          {"current": 0, "min": -20, "max": 6, "format": "%d dB", "default": 0})
+    mock, _ = _capture(body)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        with pytest.raises(Ultimate64ProtocolError, match="Vol UltiSid 1"):
+            c.get_config_choices("Audio Mixer", "Vol UltiSid 1")
