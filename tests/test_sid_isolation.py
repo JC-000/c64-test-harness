@@ -280,6 +280,33 @@ class TestIsolatedSidAddressing:
         assert client.state[CAT_SID_ADDRESSING] == _FACTORY
         assert client.items_put()[-1] == _MIRROR
 
+    def test_the_read_back_covers_slots_that_were_not_written(self) -> None:
+        """Every slot in the final map is checked, not only the ones PUT.
+
+        A firmware side effect that moves a slot the helper did not touch
+        (modelled here: writing one address item also rewrites another)
+        leaves that slot decoding somewhere the map does not say.  A
+        read-back restricted to the changed slots would miss it.
+        """
+
+        class SideEffectU64(FakeU64):
+            def set_config_item(self, category, item, value):
+                super().set_config_item(category, item, value)
+                if item == "SID Socket 2 Address":
+                    self.state[category]["UltiSID 1 Address"] = "$D4A0"
+
+        client = SideEffectU64({
+            **_FACTORY,
+            "SID Socket 2 Address": "$D420",
+            "UltiSID 1 Address": "$D440",
+            "UltiSID 2 Address": "$D460",
+        })
+        with pytest.raises(Ultimate64Error, match="UltiSID 1.*D440.*D4A0"):
+            with isolated_sid_addressing(
+                client, {SidSlot.SOCKET2: "$D480"}, others="leave"
+            ):
+                pytest.fail("body ran on an unverified map")
+
     def test_the_read_back_passes_when_every_write_applied(self) -> None:
         client = FakeU64()
         with isolated_sid_addressing(

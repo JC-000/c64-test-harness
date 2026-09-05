@@ -35,6 +35,11 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+#: The DEBUG line ``_LockedU64Manager.acquire`` logs once it holds the
+#: lock; a test that needs proof its log capture saw the lane matches
+#: this (``tests/test_unlocked_notice_live.py``).
+LANE_LOCKED_PHRASE = "with cross-process lock"
+
 
 # ---------------------------------------------------------------------------
 # TestTarget — backend-agnostic handle
@@ -355,7 +360,7 @@ class _LockedU64Manager:
         with self._map_lock:
             self._locks[id(instance)] = lock
         logger.debug(
-            "Acquired U64 %s with cross-process lock (pid=%d)",
+            "Acquired U64 %s " + LANE_LOCKED_PHRASE + " (pid=%d)",
             device_host,
             os.getpid(),
         )

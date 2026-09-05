@@ -66,7 +66,13 @@ from c64_test_harness import (
     suppress_unlocked_warning,
 )
 from c64_test_harness.backends import device_lock as lock_mod
+from c64_test_harness.backends.device_lock import (
+    UNLOCKED_NOTICE_PHRASE as _NOTICE_PHRASE,
+)
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
+from c64_test_harness.backends.unified_manager import (
+    LANE_LOCKED_PHRASE as _LANE_LOCKED_PHRASE,
+)
 
 NOTICE_HOST = os.environ.get("U64_NOTICE_HOST", "10.43.23.81")
 
@@ -74,12 +80,6 @@ pytestmark = pytest.mark.skipif(
     os.environ.get("U64_NOTICE_LIVE") != "1",
     reason="U64_NOTICE_LIVE=1 not set -- live unlocked-notice test disabled",
 )
-
-#: The phrase every unlocked-client notice carries (device_lock.py,
-#: ``warn_unlocked_client``).
-_NOTICE_PHRASE = "built without holding this device's lock in this process"
-#: The DEBUG line ``_LockedU64Manager.acquire`` logs once it holds the lock.
-_LANE_LOCKED_PHRASE = "with cross-process lock"
 
 #: Scratch byte well clear of every HARNESS_SCRATCH span.
 _SCRATCH = 0xC9F8
