@@ -762,14 +762,35 @@ Two more hardware-only facts, both in issues #209 and #211:
   "non-zero" is not "present" either.  The only valid test is the one
   ip65's `eth_init` performs (`drivers/cs8900a.s:133-137`): clockport
   enable, `PPPtr = $0000`, `PPData == $630E`, executed **on the 6510**.
-* **Do not start the program with `client.run_prg()`** -- after it, the
-  loaded program sees `$DE00` as zeros even though the config still reads
-  `External`, i.e. the external cartridge is left deselected.  The cause
-  is not isolated (the DMA load, the reset it performs, or something in
-  between); only the outcome is measured.  Use
-  `run_prg_via_sys(target, prg)`, which writes the PRG into RAM and types
-  `SYS`.  Stock ip65 `ping.prg` reports `INIT DRIVER: FAILED` under
-  `run_prg` and pings normally under `run_prg_via_sys`.
+* **Do not start the program with `client.run_prg()`** -- the firmware's
+  runner load path deselects the external cartridge.  Isolated in #217
+  (U64E, n=3 per arm, interleaved, re-PUT + reset before every arm):
+  `run_prg` and `load_prg` alone both leave the cartridge absent; the
+  REST `reset()` alone and host DMA writes (REST or SocketDMA) followed
+  by a typed `SYS` leave it present; after a `run_prg` the deselection
+  is **sticky across every `reset()`** and only a re-PUT of `Cartridge
+  Preference` (same value, no reset needed) reselects it.  A deselected
+  cartridge does not read as zeros reliably -- PP `$0000` came back
+  `fb fb`, `06 fb`, `7c 00`, `ff ff` -- only `!= $630E` means anything.
+  Use `run_prg_via_sys(target, prg)`, which writes the PRG into RAM,
+  types `SYS`, and on a U64 whose preference reads `External` re-PUTs
+  it first (`reselect_cartridge=False` opts out).  Stock ip65 `ping.prg`
+  reports `INIT DRIVER: FAILED` under `run_prg` and pings normally under
+  `run_prg_via_sys`.  Live matrix:
+  `tests/test_run_prg_cartridge_visibility_live.py` (`RRNET_LIVE=1`).
+* **A complete RX read releases the frame without SkipNow, but the next
+  header appears only after RxEvent's high byte is read** (#219, U64E,
+  n=3 per variant, two host-queued frames): after reading all RxLength
+  bytes, an immediate RTDATA read gives `$0000`; reading `$DE05`
+  (RxEvent high, PP `$0124`) first presents frame 2 -- zero poll
+  iterations, no skip.  A partial read does not advance: RTDATA keeps
+  delivering the rest of the same frame until SkipNow.  Delays of
+  100 µs-10 ms, PP `$0000` reads, PPTR writes, the RxEvent *low* byte,
+  `$DE00/01`, and PP `$0400` do not present it; only the high-byte read
+  does -- exactly ip65's poll sequence.  The chip buffers two frames; a
+  third is dropped with RxMISS.  `_emit_read_frame` keeps its skip
+  because its fixed 60-byte body read is a partial read.  Live:
+  `tests/test_cs8900a_fifo_live.py` (`RRNET_LIVE=1`, `RRNET_IFACE`).
 * **Resolve before the first exchange with a host: pass the ARP frame,
   or use the responder, which now answers ARP (issue #218).**  Until #218
   the harness's ping routines neither sent nor answered ARP, and macOS
