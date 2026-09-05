@@ -750,7 +750,12 @@ Two more hardware-only facts, from issues #209, #211 and #217:
 * The cartridge is invisible unless `C64 and Cartridge Settings` ->
   **`Cartridge Preference` = `External`**.  On the default `Auto` the
   cartridge does not answer the identity read, which looks exactly like
-  an empty expansion port.  A `Cartridge Preference` PUT leaves a
+  an empty expansion port.  The item is memory-only like every config
+  PUT and does **not** revert by itself: it survives `machine:reboot`
+  (a C64-level reset via `C64::start_cartridge`, firmware RAM config
+  untouched; measured 3/3, 2026-09-05) and only a firmware boot reloads
+  flash.  The earlier "reverts to Auto" reading was neighbouring lanes'
+  own restores.  A `Cartridge Preference` PUT leaves a
   running 6510 alone (marker and jiffy clock intact 6/6, #217), so the
   re-PUT in `run_prg_via_sys` is safe with `reset=False` too.  `Bus Operation Mode` is irrelevant.  **Raw `$DE00`
   bytes are not a presence test from either side.**  A host-side
