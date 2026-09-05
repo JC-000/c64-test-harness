@@ -750,7 +750,9 @@ Two more hardware-only facts, from issues #209, #211 and #217:
 * The cartridge is invisible unless `C64 and Cartridge Settings` ->
   **`Cartridge Preference` = `External`**.  On the default `Auto` the
   cartridge does not answer the identity read, which looks exactly like
-  an empty expansion port.  `Bus Operation Mode` is irrelevant.  **Raw `$DE00`
+  an empty expansion port.  A `Cartridge Preference` PUT leaves a
+  running 6510 alone (marker and jiffy clock intact 6/6, #217), so the
+  re-PUT in `run_prg_via_sys` is safe with `reset=False` too.  `Bus Operation Mode` is irrelevant.  **Raw `$DE00`
   bytes are not a presence test from either side.**  A host-side
   `read_memory` of the I/O window returns bytes that do not depend on the
   cartridge and are not reproducible -- three observers reported three
@@ -789,8 +791,12 @@ Two more hardware-only facts, from issues #209, #211 and #217:
   delivering the rest of the same frame until SkipNow.  Delays of
   100 µs-10 ms, PP `$0000` reads, PPTR writes, the RxEvent *low* byte,
   `$DE00/01`, and PP `$0400` do not present it; only the high-byte read
-  does -- exactly ip65's poll sequence.  The chip buffers two frames; a
-  third is dropped with RxMISS.  `_emit_read_frame` keeps its skip
+  does -- exactly ip65's poll sequence; reading the ISQ (PP `$0120`)
+  does not present it either (3/3).  The chip holds up to **three**
+  100-byte frames and keeps the **newest** (8 queued -> frames 6, 7, 8
+  delivered, RxMISS 5; n=2 per depth).  An earlier "buffers two, third
+  dropped" reading was a leftover half-read frame behind a blind
+  SkipNow drain, retracted on #219.  `_emit_read_frame` keeps its skip
   because its fixed 60-byte body read is a partial read.  Live:
   `tests/test_cs8900a_fifo_live.py` (`RRNET_LIVE=1`, `RRNET_IFACE`).
 * **Resolve before the first exchange with a host: pass the ARP frame,
