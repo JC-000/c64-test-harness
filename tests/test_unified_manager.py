@@ -20,6 +20,13 @@ from c64_test_harness.backends.unified_manager import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _no_baseline_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The #227 entry reset is opt-in via ``U64_BASELINE_ON_ENTRY``; keep
+    a shell that exports it from changing what these tests expect."""
+    monkeypatch.delenv("U64_BASELINE_ON_ENTRY", raising=False)
+
+
 def _make_mock_vice_instance(pid: int = 1234) -> MagicMock:
     """Build a mock that looks like a ViceInstance."""
     inst = MagicMock()
@@ -177,7 +184,11 @@ class TestU64Backend:
     def test_creates_u64_manager(self, mock_build: MagicMock) -> None:
         mock_build.return_value = MagicMock()
         mgr = UnifiedManager(backend="u64", u64_hosts="10.0.0.1")
-        mock_build.assert_called_once_with("10.0.0.1", None, lock_timeout=60.0)
+        # baseline_on_entry=False: the #227 entry reset is opt-in and the
+        # env switch is unset here.
+        mock_build.assert_called_once_with(
+            "10.0.0.1", None, lock_timeout=60.0, baseline_on_entry=False,
+        )
         assert mgr.backend == "u64"
 
     @patch("c64_test_harness.backends.unified_manager.UnifiedManager._build_u64_manager")
@@ -204,7 +215,9 @@ class TestU64Backend:
         mock_build.return_value = MagicMock()
         with patch.dict(os.environ, {"U64_PASSWORD": "secret"}):
             UnifiedManager(backend="u64", u64_hosts="10.0.0.1")
-        mock_build.assert_called_once_with("10.0.0.1", None, lock_timeout=60.0)
+        mock_build.assert_called_once_with(
+            "10.0.0.1", None, lock_timeout=60.0, baseline_on_entry=False,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -494,7 +507,7 @@ class TestCreateManagerLockTimeout:
         mock_build.return_value = MagicMock()
         create_manager(backend="u64", u64_hosts="10.0.0.1", lock_timeout=1234.5)
         mock_build.assert_called_once_with(
-            "10.0.0.1", None, lock_timeout=1234.5,
+            "10.0.0.1", None, lock_timeout=1234.5, baseline_on_entry=False,
         )
 
     @patch("c64_test_harness.backends.unified_manager.DeviceLock")

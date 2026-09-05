@@ -744,6 +744,34 @@ For a program that drives an external cartridge (RR-Net), neither `client.run_pr
 
 **All U64 access must use DeviceLock** for cross-process safety. Use `UnifiedManager` (automatic) or wrap with `DeviceLock` in pytest fixtures.
 
+### Known state on entry — reset, then assert (issue #227)
+
+Setup is verifiable, teardown is not. A killed run restores nothing; on a shared device the previous lane's turbo, REU size, SID map or `Cartridge Preference` is what you inherit, and a `snapshot_state`/`restore_state` in a `finally` cannot help the lane that never reached its `finally`. Opt in and the manager puts the device at the firmware's factory defaults **inside the `DeviceLock`, before you get the target**:
+
+```python
+from c64_test_harness import create_manager, apply_factory_baseline, U64BaselineError
+
+# env: U64_BASELINE_ON_ENTRY=1   (or HarnessConfig.u64_baseline_on_entry / [u64] baseline_on_entry = true)
+with create_manager(backend="u64", u64_hosts="10.43.23.81", baseline_on_entry=True) as mgr:
+    with mgr.instance() as target:       # acquire(): lock -> reset covered categories -> assert current == default
+        ...                              # build your state on top; restore_state on exit stays a courtesy
+
+# Scripts: the same step by hand, with the report.
+report = apply_factory_baseline(target.client)          # or dry_run=True to look without writing
+print(report.summary())                                 # "14 categories reset; 3 item(s) drifted before; 0 still off after"
+for cat, item in report.drifted_items():                # what the previous lane left behind (logged at INFO too)
+    print(cat, item, report.drifted[cat][item])         # (value_before, default)
+```
+
+Rules the implementation enforces, and why:
+
+- **Reset first, assert second.** `current != default` *before* the reset is the normal state of a shared device — that is the leak the step exists to remove — so it is logged per item as "inherited drift", never raised. `current != default` *after* the reset means the reset did not take (accepted, not applied — the #204 shape) and raises `U64BaselineError` naming category, item, current and default. Downstream tools that assert the baseline without performing the reset will refuse to run on a device in its ordinary shared state.
+- **The baseline is the firmware's `default`, per item, from the item map** (`get_config_item`, #214) — no harness-owned table, self-updating across firmware versions; a release that moves a default is a deliberate bench change. Items without a `default` key (preset/info types) are reported in `report.unasserted`, not compared.
+- **Per-category route only** (`PUT /v1/configs/<category>:reset_to_default`, `BASELINE_CATEGORIES`). **Never** the global `configs:reset_to_default`: it iterates *every* store — `Ethernet Settings` (a static-addressed device flips to DHCP and is stranded) and `Network Settings` (blanks the password, hostname, service flags) included. `BASELINE_EXCLUDED_CATEGORIES` is refused as an argument, so is any glob (the route is a pattern match; `*` is the global reset by another name). Categories the device does not list (the C64U's set differs) are skipped with a log line.
+- **Memory-only.** Flash is untouched; `load_config_from_flash` undoes it and a reboot reloads flash. The bench premise is flash == factory default — `tests/test_flash_baseline_live.py` (`FLASH_BASELINE_LIVE=1`) is the instrument; run it after every firmware flash.
+- **Inside the lock, or with the notice.** The manager path runs the reset after `DeviceLock` is taken; calling `apply_factory_baseline` on a bare client logs the #194 unlocked-client notice. No second mechanism.
+- Cost: one category GET + one reset PUT + one item GET per item per category (~150 items on the U64E); `tests/test_entry_baseline_live.py` records `apply_seconds`. Opt-in until two measurements land: whether any store's `effectuate()` pulses the C64 reset, and the C64U's WiFi store.
+
 ### Two device generations — detect via `get_info()`, don't assume
 
 There are two hardware generations with real behavioral differences. Detect with `client.get_info()["product"]`: `"Ultimate 64 Elite"` (fw 3.14/3.15) vs `"C64 Ultimate"` (fw 1.1.0). Never hardcode one generation's behavior; on an unrecognized product, skip with the observed payload rather than guessing. Known asymmetries (each live-verified):

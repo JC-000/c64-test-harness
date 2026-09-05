@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Iterator, Protocol, runtime_checkable
 
 from ..transport import C64Transport
+from .ultimate64_baseline import apply_factory_baseline, baseline_on_entry_enabled
 from .vice_lifecycle import ViceConfig
 from .vice_manager import ViceInstanceManager
 
@@ -127,6 +128,17 @@ class UnifiedManager:
         Cross-process device-lock timeout in seconds (U64 only).
         Defaults to 60.0; long parallel benches typically pass
         ``lock_timeout=1800.0`` (30 min) or higher.
+    baseline_on_entry:
+        U64 only (issue #227).  ``True`` runs
+        :func:`~c64_test_harness.backends.ultimate64_baseline.apply_factory_baseline`
+        on every ``acquire()`` — right after the ``DeviceLock`` is taken
+        and before the transport is handed out — resetting the covered
+        config categories to the firmware's factory defaults and
+        asserting ``current == default`` per item.  ``None`` (the
+        default) reads ``U64_BASELINE_ON_ENTRY``; unset means off, and
+        off means no requests at all.  ``HarnessConfig.u64_baseline_on_entry``
+        is the TOML/env form — pass it here.  Requires ``DeviceLock``
+        to be importable; the manager refuses to run the reset unlocked.
     """
 
     def __init__(
@@ -138,10 +150,14 @@ class UnifiedManager:
         u64_password: str | None = None,
         lock_timeout: float = 60.0,
         memory_policy: "MemoryPolicy | None" = None,
+        baseline_on_entry: bool | None = None,
     ) -> None:
         self._backend = self._resolve_backend(backend)
         self._manager: BackendManager
         self._device_lock: Any = None
+        if baseline_on_entry is None:
+            baseline_on_entry = baseline_on_entry_enabled()
+        self._baseline_on_entry = bool(baseline_on_entry)
         # When set, the policy is stamped onto every transport this
         # manager hands out via :meth:`acquire` / :meth:`instance`.
         # ``None`` keeps the transport's existing (permissive) policy
@@ -156,6 +172,7 @@ class UnifiedManager:
         elif self._backend == "u64":
             self._manager = self._build_u64_manager(
                 u64_hosts, u64_password, lock_timeout=lock_timeout,
+                baseline_on_entry=self._baseline_on_entry,
             )
         else:
             raise ValueError(
@@ -254,11 +271,15 @@ class UnifiedManager:
         hosts: str | list[str] | None,
         password: str | None,
         lock_timeout: float = 60.0,
+        baseline_on_entry: bool = False,
     ) -> Any:
         """Build an Ultimate64InstanceManager from host/password config.
 
         When :class:`DeviceLock` is available, wraps the manager with
-        ``_LockedU64Manager`` for cross-process queueing via flock.
+        ``_LockedU64Manager`` for cross-process queueing via flock.  The
+        entry reset (*baseline_on_entry*, issue #227) lives in that
+        wrapper because it must run inside the lock; without
+        ``DeviceLock`` it is refused rather than run unlocked.
         """
         from .ultimate64_manager import Ultimate64Device, Ultimate64InstanceManager
 
@@ -281,8 +302,17 @@ class UnifiedManager:
 
         if _HAS_DEVICE_LOCK:
             logger.debug("DeviceLock available — cross-process locking enabled")
-            return _LockedU64Manager(inner, lock_timeout=lock_timeout)
+            return _LockedU64Manager(
+                inner, lock_timeout=lock_timeout,
+                baseline_on_entry=baseline_on_entry,
+            )
 
+        if baseline_on_entry:
+            raise RuntimeError(
+                "baseline_on_entry requires DeviceLock (the entry reset runs "
+                "inside the device lock, never on a bare client); device_lock "
+                "could not be imported on this host"
+            )
         logger.debug("DeviceLock not available — in-process pooling only")
         return inner
 
@@ -305,7 +335,10 @@ class _LockedU64Manager:
             1. inner.acquire()  → picks a device from the in-process pool
             2. DeviceLock(device.host).acquire(timeout)
                → blocks if another process holds this device
-            3. return instance
+            3. baseline_on_entry: apply_factory_baseline(client)
+               → reset the covered config stores to factory default and
+                 assert it (issue #227); on failure release 2 and 1
+            4. return instance
 
         release(instance):
             1. DeviceLock.release()
@@ -317,9 +350,11 @@ class _LockedU64Manager:
         self,
         inner: Any,
         lock_timeout: float = 60.0,
+        baseline_on_entry: bool = False,
     ) -> None:
         self._inner = inner
         self._lock_timeout = lock_timeout
+        self._baseline_on_entry = bool(baseline_on_entry)
         # Map instance id → DeviceLock so release() can find the right lock.
         self._locks: dict[int, DeviceLock] = {}
         self._map_lock = __import__("threading").Lock()
@@ -364,6 +399,22 @@ class _LockedU64Manager:
             device_host,
             os.getpid(),
         )
+        if self._baseline_on_entry:
+            # Inside the lock, before the transport is handed out: the
+            # previous lane's leftovers are cleared here, and a reset
+            # that does not take fails the acquire rather than the test.
+            try:
+                report = apply_factory_baseline(instance.transport.client)
+            except BaseException:
+                with self._map_lock:
+                    self._locks.pop(id(instance), None)
+                lock.release()
+                self._inner.release(instance)
+                raise
+            logger.info(
+                "U64 %s at factory baseline on entry: %s",
+                device_host, report.summary(),
+            )
         return instance
 
     def release(self, instance: Any) -> None:
@@ -410,6 +461,9 @@ def create_manager(
         ``lock_timeout=1800.0`` (30 min) or higher.
     **kwargs:
         Forwarded to ``UnifiedManager.__init__``.  Useful keys:
-        ``vice_config``, ``vice_kwargs``, ``u64_hosts``, ``u64_password``.
+        ``vice_config``, ``vice_kwargs``, ``u64_hosts``, ``u64_password``,
+        ``baseline_on_entry`` (U64 reset-on-entry to factory default,
+        issue #227; ``None`` reads ``U64_BASELINE_ON_ENTRY``, off by
+        default).
     """
     return UnifiedManager(backend=backend, lock_timeout=lock_timeout, **kwargs)

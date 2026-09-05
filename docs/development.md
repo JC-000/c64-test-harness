@@ -272,6 +272,15 @@ Run both together for a bench that is supposed to be fully wired (e.g. before tr
 C64_REQUIRE_VICE=1 C64_REQUIRE_ELEVATION=1 ~/.local/share/c64-test-harness/venv/bin/pytest tests/test_ethernet.py tests/test_bpf_attach_detection.py -rs
 ```
 
+### `U64_BASELINE_LIVE` / `FLASH_BASELINE_LIVE` — the factory-default baseline (issue #227)
+
+Two opt-in U64 suites, both also gated on `U64_HOST` and `U64_ALLOW_MUTATE=1` (they write config) and both holding the `DeviceLock` for the module:
+
+- **`U64_BASELINE_LIVE=1`** — `tests/test_entry_baseline_live.py`: drifts `Cartridge Preference` / `REU Size`, runs `apply_factory_baseline`, and asserts every covered item on the device reads `current == default`; checks the excluded stores (`Ethernet Settings`, `Network Settings`, WiFi) are byte-identical before/after; checks the report names the drifted item; `dry_run`; and the `create_manager(backend="u64", baseline_on_entry=True)` path. Stock values of every covered item are snapshotted first and PUT back at module end, so the device leaves as found. Records `apply_seconds` (one category GET + one reset PUT + one item GET per item).
+- **`FLASH_BASELINE_LIVE=1`** — `tests/test_flash_baseline_live.py`: the owner's flash-vs-default procedure. Per category the device lists (never `Ethernet Settings` or the WiFi store): snapshot RAM → `load_config_from_flash(category)` → assert flash `current == default` for every item with a `default` → PUT the snapshot back → verify RAM restored exactly. **Fails, does not skip,** on a flash item that differs from its default, by name — somebody saved to flash, or the firmware was flashed without the format-and-reset option. Run it after every firmware flash and whenever a lane is suspected of saving. Neither suite ever calls `save_config_to_flash`, the global `configs:reset_to_default`, `reset`, `reboot` or `poweroff`.
+
+The unit contract lives in `tests/test_entry_baseline.py` (mocked; no hardware).
+
 ### `WAV_CAPTURES_REFRESH` — refreshing the committed audio captures
 
 The `U64_HOST`-gated capture suites (`tests/test_chromatic_capture_live.py`, `tests/test_multi_sid_parallel_live.py`) write their `.wav` + `.json` output to a per-run `tmp_path` directory by default, so an ordinary bench run never modifies the tracked reference under `tests/wav_captures/` (issue #220: a live run used to leave ten tracked files changed with no test failing, and the reference drifted with every run). Set `WAV_CAPTURES_REFRESH=1` to write into `tests/wav_captures/<suite>/` instead — a deliberate refresh to review and commit on purpose. The path decision is `tests/wav_capture_paths.py:capture_dir()`; `tests/test_wav_capture_paths.py` pins it without hardware. Each live module's `wav_dir` fixture records the directory it used as a testsuite property and prints it, so a scratch capture can be found afterwards (`-s`, or the junit XML).
