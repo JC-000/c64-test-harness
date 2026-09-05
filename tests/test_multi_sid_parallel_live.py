@@ -263,10 +263,16 @@ def u64_client():
 
 
 @pytest.fixture(scope="module")
-def wav_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Where this module's capture goes: scratch unless WAV_CAPTURES_REFRESH=1."""
+def wav_dir(tmp_path_factory: pytest.TempPathFactory, record_testsuite_property) -> Path:
+    """Where this module's capture goes: scratch unless WAV_CAPTURES_REFRESH=1.
+
+    The directory is recorded as a testsuite property and printed, so a
+    scratch capture can be found after the run (``-s`` or the junit XML).
+    """
     path = capture_dir("multi_sid", tmp_path_factory.mktemp("multi_sid_captures"))
     path.mkdir(parents=True, exist_ok=True)
+    record_testsuite_property("multi_sid_capture_dir", str(path))
+    print(f"\n[multi_sid] capture -> {path}")
     logger.info("multi-SID capture -> %s", path)
     return path
 
