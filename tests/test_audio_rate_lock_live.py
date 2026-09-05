@@ -35,6 +35,19 @@ Discrimination: at 48000 Hz the 60 s window would hold ~3580 more
 samples than 64:3 predicts (1244 ppm); the per-window residual from the
 edge detector is ~25 samples, and the slope's is a few.
 
+What the result means: ``64:3`` exactly is the design claim from #195
+(both rates divide down from one crystal).  This measurement does not
+prove exactness; it bounds the ratio -- **consistent with exact to
+~1 ppm** (the slope between window lengths).  Note also that with a
+phase-locked ratio and a fixed cycle count between the edges only two
+adjacent sample counts are possible for a given window, so two runs
+returning the identical count support the lock but add almost nothing
+over n=1; the independent evidence is the different window lengths.
+
+A capture whose sequence numbers ever step backwards or repeat is
+discarded as well (``packets_reordered``): ``time_base_intact`` counts
+forward gaps only, and a duplicated packet would add samples.
+
 Measured 2026-09-05 on the U64E (fw 3.15, NTSC, 1 MHz): see the
 docstring on ``U64_NTSC_AUDIO_RATE_HZ`` for the numbers.
 
@@ -85,10 +98,11 @@ CAPTURE_PORT = 11021
 #: Cycles per pass of the outer loop, and the fixed cost around it --
 #: see ``_build`` for the count.
 _OUTER_PASS = 329226
-#: Fixed cycles between the timer start/stop stores and the volume
-#: stores (LDA #imm + STA abs on each side), the loop count's offset
-#: from the CIA count.
-_TIMER_TO_TONE = 12
+#: The CIA count's offset from the loop's predicted count: LDA #imm +
+#: STA abs on each side of the window is 12 cycles, and the CIA starts
+#: counting one cycle after the write that starts it, so the measured
+#: value is 11 -- 10/10 runs, never anything else.
+_TIMER_TO_TONE = 11
 
 #: Window lengths as outer-loop counts: ~10 s, ~60 s, ~10 s, interleaved
 #: so a drift over the run would show as a difference between the two
@@ -289,10 +303,10 @@ def _measure(target, outer: int, wav_dir: Path, tag: str) -> dict:
         time.sleep(0.5)
         client.stream_audio_stop()
         result = cap.stop(wav_path=wav_dir / f"{tag}-attempt{attempt}.wav")
-        if not result.time_base_intact:
+        if not result.time_base_intact or result.packets_reordered:
             continue
         cycles = _cia_cycles(t.read_memory(RESULT_ADDR, 4))
-        assert abs(cycles - predicted - _TIMER_TO_TONE) <= 4, (
+        assert abs(cycles - predicted - _TIMER_TO_TONE) <= 2, (
             f"CIA counted {cycles} phi2 cycles, loop predicts {predicted} "
             f"(+{_TIMER_TO_TONE} fixed): a badline or a DMA stall reached "
             f"the window"
@@ -303,8 +317,8 @@ def _measure(target, outer: int, wav_dir: Path, tag: str) -> dict:
             "packets": result.packets_received, "attempt": attempt,
         }
     pytest.fail(
-        f"{CAPTURE_ATTEMPTS} captures in a row dropped packets; the "
-        f"sample index is not a clock on this network right now"
+        f"{CAPTURE_ATTEMPTS} captures in a row dropped or reordered packets; "
+        f"the sample index is not a clock on this network right now"
     )
 
 

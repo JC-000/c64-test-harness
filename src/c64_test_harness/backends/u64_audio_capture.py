@@ -109,20 +109,26 @@ NTSC_COLOR_CARRIER_HZ = Fraction(315_000_000, 88)
 #: does not matter; here it does.
 NTSC_PHI2_HZ = NTSC_COLOR_CARRIER_HZ * Fraction(2, 7)
 
-#: The U64's NTSC audio stream rate, exactly: ``Fc * 3/224``.
+#: The U64's NTSC audio stream rate: ``Fc * 3/224``.  Exactness is the
+#: design claim from issue #195 (both rates divide down from one
+#: crystal); the measurement below bounds it.
 #:
 #: Harness-verified on the U64E (fw 3.15, NTSC, 1 MHz) on 2026-09-05
 #: through the ``64:3`` identity below, which is its own instrument:
 #: the 6510 ran cycle-counted windows bracketed by SID master-volume
 #: edges with CIA2 chained as a 32-bit phi2 counter, ``AudioCapture``
 #: counted samples between the edges, and ``samples*64 / (cycles*3)``
-#: came out at +8.8 ppm over one 60.2 s window (61 565 284 cycles,
+#: came out at +8.8 ppm over a 60.2 s window (61 565 284 cycles,
 #: 2 885 898 samples) and +47..+55 ppm over 10 s windows (n=4), the
 #: residual being a fixed ~25-sample edge-detection offset that cancels
-#: in the slope between window lengths: **+0.4 ppm** (n=2 slopes, +0.9
-#: and +0.36).  The nominal 48000 Hz sits at -1234 ppm and is rejected
-#: by ~3600 samples per minute.  Runs with dropped packets were
-#: discarded (they read -457 and -4382 ppm).  Method and gate in
+#: in the slope between window lengths: +0.36 and +0.9 ppm.  So the
+#: ratio is **consistent with exactly 64:3 to ~1 ppm**; it is not
+#: proven exact.  (A second 60.2 s run returned the identical sample
+#: count, which supports the lock but adds almost nothing over n=1:
+#: with a phase-locked ratio and a fixed cycle count only two adjacent
+#: counts are possible.)  The nominal 48000 Hz sits at -1234 ppm and is
+#: rejected by ~3600 samples per minute.  Runs with dropped packets
+#: were discarded (they read -457 and -4382 ppm).  Method and gate in
 #: ``tests/test_audio_rate_lock_live.py`` (``AUDIO_RATE_LIVE=1``);
 #: issue #205.  It was originally quoted (issue #195) as the reporter's
 #: measurement because the FPGA sources are not part of this repo.
@@ -179,6 +185,12 @@ class CaptureResult:
     packets_received: int
     packets_dropped: int
     sample_rate_exact: Fraction | None = None
+    #: Packets whose sequence number stepped backwards or repeated
+    #: (reordered or duplicated on the way).  Their PCM is still
+    #: appended in arrival order, so a non-zero value means the sample
+    #: index is not a clock either; ``time_base_intact`` counts forward
+    #: gaps only.
+    packets_reordered: int = 0
 
     @property
     def time_base_intact(self) -> bool:
@@ -186,7 +198,8 @@ class CaptureResult:
 
         Gaps are not padded, so a single drop shifts every later sample
         by an unknown amount.  Check this before analysing a capture;
-        the file itself looks fine either way.
+        the file itself looks fine either way.  Forward gaps only: see
+        :attr:`packets_reordered` for backward steps.
         """
         return self.packets_dropped == 0
 
@@ -335,6 +348,7 @@ class AudioCapture:
         self._pcm_chunks: list[bytes] = []
         self._packets_received = 0
         self._packets_dropped = 0
+        self._packets_reordered = 0
         self._last_seq: int | None = None
         self._started = False
 
@@ -347,6 +361,7 @@ class AudioCapture:
         self._pcm_chunks = []
         self._packets_received = 0
         self._packets_dropped = 0
+        self._packets_reordered = 0
         self._last_seq = None
 
         # Create and bind UDP socket
@@ -409,6 +424,12 @@ class AudioCapture:
                                 "Audio stream gap: expected seq %d, got %d (%d packets dropped)",
                                 expected, seq, gap,
                             )
+                        else:  # backward step: reordered or duplicated
+                            self._packets_reordered += 1
+                            _log.warning(
+                                "Audio stream backward step: expected seq %d, got %d",
+                                expected, seq,
+                            )
 
                 self._last_seq = seq
                 self._pcm_chunks.append(pcm_payload)
@@ -441,6 +462,7 @@ class AudioCapture:
             pcm_data = b"".join(self._pcm_chunks)
             packets_received = self._packets_received
             packets_dropped = self._packets_dropped
+            packets_reordered = self._packets_reordered
 
         # Calculate actual duration from captured data.  Timed against the
         # exact rate when the caller gave one -- with 48000 assumed, this
@@ -476,6 +498,7 @@ class AudioCapture:
             packets_received=packets_received,
             packets_dropped=packets_dropped,
             sample_rate_exact=self._exact_rate,
+            packets_reordered=packets_reordered,
         )
 
     @property
