@@ -142,6 +142,32 @@ def test_default_output_is_unchanged(name: str) -> None:
     assert BUILDERS[name](drain_first=True) != BUILDERS[name]()
 
 
+STATUS = 0x5301
+
+
+@pytest.mark.parametrize("name", sorted(BUILDERS))
+def test_drain_status_reports_the_budget_left_when_the_queue_emptied(name: str) -> None:
+    cpu, chip = _setup(name, 2, drain_first=True, drain_status_addr=STATUS)
+    assert cpu.mem[STATUS] == DRAIN_RX_MAX_FRAMES - 2
+    assert chip.queue_at_tx[0] == 0
+
+
+@pytest.mark.parametrize("name", sorted(BUILDERS))
+def test_drain_status_is_zero_when_the_bound_was_hit(name: str) -> None:
+    """The host can tell an exhausted drain from a clean one: 0 means the
+    routine transmitted over frames that were still queued."""
+    cpu, chip = _setup(name, DRAIN_RX_MAX_FRAMES + 3, drain_first=True,
+                       drain_status_addr=STATUS)
+    assert cpu.mem[STATUS] == 0
+    assert chip.queue_at_tx[0] == 3
+
+
+@pytest.mark.parametrize("name", sorted(BUILDERS))
+def test_drain_status_without_drain_first_is_rejected(name: str) -> None:
+    with pytest.raises(ValueError, match="drain_status_addr"):
+        BUILDERS[name](drain_status_addr=STATUS)
+
+
 def test_drain_emitter_rejects_a_bad_bound() -> None:
     a = bp.Asm(org=LOAD)
     with pytest.raises(ValueError):

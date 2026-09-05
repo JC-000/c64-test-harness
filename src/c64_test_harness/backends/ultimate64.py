@@ -46,6 +46,12 @@ _SOCKET_DMA_VERIFY_TIMEOUT = 2.0
 #: returns as soon as the IDENTIFY reply arrives.
 _SOCKET_DMA_DRAIN_FLOOR_BPS = 4096.0
 
+#: The 6510's I/O window.  A DMAWRITE that touches it is a register write
+#: with side effects, so the fast path never re-sends such a span after a
+#: failure (issue #223 review).
+_IO_WINDOW_START = 0xD000
+_IO_WINDOW_END = 0xDFFF
+
 
 class Ultimate64Transport(HardwareTransportBase):
     """C64Transport implementation backed by Ultimate 64 REST API.
@@ -260,18 +266,24 @@ class Ultimate64Transport(HardwareTransportBase):
 
         A send or barrier failure on a **reused** connection is retried
         once on a fresh connection before falling back (issue #223).
-        The firmware closes a SocketDMA connection idle for >1 s, and a
-        DMAWRITE written into that closed socket is never read, so the
-        barrier fails with "closed by peer" and the DMA was not applied
-        (U64E fw 3.15, 2026-09-05: 50/50 barrier failures at a 1.5 s
-        inter-write gap, 0/50 at 0.2 s, idle and under REST load alike;
-        the failed write's bytes were in RAM 0/50 times).  The client's
-        own idle reconnect normally reopens the socket in time; the
-        retry covers a connection the device dropped anyway.  Re-sending
-        is safe: the same bytes go to the same address, and the earlier
-        DMA either never happened or wrote a prefix of them.
+        Firmware from fdb521a5 on (v3.15 and the U64E's fork; v3.14d and
+        the C64U's 1.1.0 have no socket timeout) closes a SocketDMA
+        connection idle for >1 s, and a DMAWRITE written into that closed
+        socket is never read, so the barrier fails with "closed by peer"
+        and the DMA was not applied (U64E fw 3.15, 2026-09-05: 50/50
+        barrier failures at a 1.5 s inter-write gap, 0/50 at 0.2 s, idle
+        and under REST load alike; the failed write's bytes were in RAM
+        0/50 times).  The client's own idle reconnect normally reopens
+        the socket in time; the retry covers a connection the device
+        dropped anyway.  Re-sending is safe for RAM: the same bytes go to
+        the same address, and the earlier DMA either never happened or
+        wrote a prefix of them.  It is **not** safe for the I/O window --
+        a second DMA into ``$D000-$DFFF`` is a second register write with
+        side effects -- so a span touching that window is never re-sent:
+        its first failure goes straight to the REST fallback.
         """
         client = self._ensure_socket_dma_client()
+        touches_io = addr <= _IO_WINDOW_END and addr + len(data) - 1 >= _IO_WINDOW_START
 
         # Establish (or reuse) the connection.  ``__enter__`` runs the
         # idempotent connect + optional authenticate; a no-op if already open.
@@ -296,6 +308,15 @@ class Ultimate64Transport(HardwareTransportBase):
                 # and a failed send leaves the stream mid-command; drop the
                 # connection so the next attempt starts clean.
                 client.close()
+                if attempt == 1 and touches_io:
+                    _log.warning(
+                        "SocketDMA write at %#06x: %s; the span touches the "
+                        "I/O window $D000-$DFFF so it is not re-sent over "
+                        "DMA; falling back to REST write_mem for this write",
+                        addr,
+                        exc,
+                    )
+                    return False
                 if attempt == 1:
                     _log.warning(
                         "SocketDMA write at %#06x: %s; retrying once on a "
