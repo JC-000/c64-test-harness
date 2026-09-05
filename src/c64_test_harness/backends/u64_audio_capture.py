@@ -111,10 +111,21 @@ NTSC_PHI2_HZ = NTSC_COLOR_CARRIER_HZ * Fraction(2, 7)
 
 #: The U64's NTSC audio stream rate, exactly: ``Fc * 3/224``.
 #:
-#: Measured downstream (issue #195) rather than read out of the FPGA
-#: sources, which are not part of this repo -- the value is quoted here
-#: as the reporter's measurement, and the ``64:3`` identity below is what
-#: makes it self-checking.
+#: Harness-verified on the U64E (fw 3.15, NTSC, 1 MHz) on 2026-09-05
+#: through the ``64:3`` identity below, which is its own instrument:
+#: the 6510 ran cycle-counted windows bracketed by SID master-volume
+#: edges with CIA2 chained as a 32-bit phi2 counter, ``AudioCapture``
+#: counted samples between the edges, and ``samples*64 / (cycles*3)``
+#: came out at +8.8 ppm over one 60.2 s window (61 565 284 cycles,
+#: 2 885 898 samples) and +47..+55 ppm over 10 s windows (n=4), the
+#: residual being a fixed ~25-sample edge-detection offset that cancels
+#: in the slope between window lengths: **+0.4 ppm** (n=2 slopes, +0.9
+#: and +0.36).  The nominal 48000 Hz sits at -1234 ppm and is rejected
+#: by ~3600 samples per minute.  Runs with dropped packets were
+#: discarded (they read -457 and -4382 ppm).  Method and gate in
+#: ``tests/test_audio_rate_lock_live.py`` (``AUDIO_RATE_LIVE=1``);
+#: issue #205.  It was originally quoted (issue #195) as the reporter's
+#: measurement because the FPGA sources are not part of this repo.
 U64_NTSC_AUDIO_RATE_HZ = NTSC_COLOR_CARRIER_HZ * Fraction(3, 224)
 
 #: phi2 cycles per audio sample: exactly ``64/3``, independent of the
