@@ -247,7 +247,7 @@ init-order cluster that produces the other startup problems here.
 
 **Harness mitigation: yes, incidentally.** Nothing in the harness parses
 `--version`. `vice_features()`
-(`src/c64_test_harness/backends/vice_elevation.py:172`) probes
+(`src/c64_test_harness/backends/vice_elevation.py:180`) probes
 `x64sc -features`, which works, and is what capability decisions are made
 from.
 
