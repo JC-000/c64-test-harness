@@ -28,7 +28,10 @@ it spawns VICE, and none of it can be replaced by the bridge suite, for
 the reason above: VICE tolerates the exact regressions these tests reject.
 The walkers classify each ``LDA PPData_hi / AND #imm`` poll by the most
 recent ``PPPtr`` write before it, so a new poll site is checked the moment
-it is added rather than needing its own test.
+it is added rather than needing its own test.  The ``Rdy4TxNOW`` polls are
+additionally decoded from their ``PPPtr=BusST`` anchor through the branch
+that closes the loop (issue #224): a poll that reads the register once and
+falls through is the one regression the classification cannot see.
 """
 
 from __future__ import annotations
@@ -70,6 +73,7 @@ from c64_test_harness.ethernet import set_cs8900a_mac
 from conftest import MockTransport
 
 LDA_IMM, LDA_ABS, STA_ABS, AND_IMM, ORA_IMM, RTS = 0xA9, 0xAD, 0x8D, 0x29, 0x09, 0x60
+BEQ, BNE = 0xF0, 0xD0
 
 # PacketPage offsets, per the CS8900a datasheet and ip65's cs8900a.s.
 PP_RXCFG = 0x0102
@@ -197,6 +201,45 @@ def _polls_by_register(code: bytes) -> list[tuple[int, int, int]]:
     return out
 
 
+def _expected_tx_sites(name: str) -> int:
+    """One TX handshake per builder; the ``[arp]`` variants add a second (#218)."""
+    return 2 if name.endswith("[arp]") else 1
+
+
+def _rdy4txnow_polls(code: bytes) -> list[dict[str, int]]:
+    """Decode the poll that follows every ``PPPtr=BusST`` write in *code*.
+
+    ip65's ``send`` (``drivers/cs8900a.s:441-457``) aims PPPtr at BusST and
+    then spins ``lda ppdata+1 / and #$01`` until ``Rdy4TxNOW`` is set;
+    :func:`bridge_ping._emit_tx_frame` is the same loop with the branch
+    written as ``BEQ`` back to the ``LDA``.  Each entry carries the byte
+    offset of the ``PPPtr`` write, of the ``LDA`` (the loop head), the
+    ``AND`` immediate, the branch opcode and the offset it resolves to.
+
+    Decoded by position rather than matched by regex on purpose: a regex
+    that *searched* for ``LDA / AND / BEQ`` would simply not match a poll
+    whose branch had been NOPed, which is the escape of issue #224.  Here
+    the ``PPPtr=BusST`` write is the anchor and whatever follows it is
+    reported, so the caller's assertions see the mutated bytes.
+    """
+    out = []
+    for m in re.finditer(re.escape(pptr_set(PP_BUSST)), code):
+        lda = m.end()
+        assert code[lda:lda + 3] == _lda(PPDATA_HI), (
+            f"PPPtr=BusST at offset {m.start()} is not followed by LDA PPData_hi "
+            f"(got {code[lda:lda + 3].hex()})"
+        )
+        assert code[lda + 3] == AND_IMM, (
+            f"BusST poll at offset {lda} does not mask PPData_hi (opcode "
+            f"{code[lda + 3]:#04x} where AND #imm was expected)"
+        )
+        opcode, disp = code[lda + 5], code[lda + 6]
+        target = lda + 7 + (disp - 256 if disp >= 128 else disp)
+        out.append({"pptr": m.start(), "lda": lda, "mask": code[lda + 4],
+                    "opcode": opcode, "target": target})
+    return out
+
+
 # ---------------------------------------------------------------------------
 # TxCMD
 # ---------------------------------------------------------------------------
@@ -240,27 +283,100 @@ def test_every_txcmd_write_is_the_ip65_value(name: str) -> None:
 
 
 @pytest.mark.parametrize("name", sorted(TX_BUILDERS))
-def test_tx_sequence_is_txcmd_txlen_busst_poll_then_data(name: str) -> None:
-    """TxCMD, TxLength, PPPtr=BusST, poll Rdy4TxNOW, then the RTDATA writes.
+def test_every_rdy4txnow_poll_branches_back_to_its_lda(name: str) -> None:
+    """Every BusST poll is ``LDA PPData_hi / AND #$01 / BEQ`` back to the ``LDA``.
 
-    This is the CS8900a's documented TX handshake and ip65's order.  Writing
-    data before the chip has said Rdy4TxNOW, or TxLength before TxCMD,
-    passes under VICE and loses frames on silicon.
+    Issue #224: the walkers above classify a poll by the ``LDA / AND`` pair
+    and never look at what follows, so a builder whose ``BEQ`` had been
+    NOPed -- one that writes the frame whether or not the chip said
+    ``Rdy4TxNOW`` -- passed every structural test and was caught only by
+    the SHA-256 pins of the legacy builders in ``test_cs8900a_arp.py``.
+    The ARP TX block those pins do not cover is exactly a site that could
+    drift.  Three shapes are rejected by name because each is a plausible
+    edit: no branch at all; a branch whose target is past the ``LDA`` (it
+    re-tests a stale accumulator forever, or falls through); and ``BNE``
+    (spins while ready and proceeds when not).
+
+    Only the harness's own loop shape is accepted.  ip65's retry form
+    (``bne`` forward, ``skipframe``, ``dey / bne``) is not emitted by any
+    builder; a builder that adopts it should extend this walker
+    deliberately rather than be waved through.
     """
     code = TX_BUILDERS[name]()
-    txcmd_lo = code.find(_sta(TXCMD_LO))
-    txcmd_hi = code.find(_sta(TXCMD_HI), txcmd_lo)
-    txlen_lo = code.find(_sta(TXLEN_LO), txcmd_hi)
-    txlen_hi = code.find(_sta(TXLEN_HI), txlen_lo)
-    busst = code.find(pptr_set(PP_BUSST), txlen_hi)
-    poll = code.find(_lda(PPDATA_HI) + bytes([AND_IMM, BUSST_RDY4TXNOW_MASK]), busst)
-    data = code.find(_sta(RTDATA_LO), poll)
-    order = [txcmd_lo, txcmd_hi, txlen_lo, txlen_hi, busst, poll, data]
-    assert all(o >= 0 for o in order), (
-        f"{name}: TX handshake step missing (offsets {order}; -1 = not found "
-        "after the previous step)"
+    polls = _rdy4txnow_polls(code)
+    assert len(polls) == _expected_tx_sites(name), (
+        f"{name}: {len(polls)} BusST poll(s), expected {_expected_tx_sites(name)}"
     )
-    assert order == sorted(order)
+    for p in polls:
+        where = f"{name}: BusST poll at offset {p['lda']}"
+        assert p["mask"] == BUSST_RDY4TXNOW_MASK, (
+            f"{where} masks 0x{p['mask']:02X}; Rdy4TxNOW is bit 8 of BusST, "
+            f"0x{BUSST_RDY4TXNOW_MASK:02X} of the high byte"
+        )
+        assert p["opcode"] == BEQ, (
+            f"{where} is followed by opcode {p['opcode']:#04x}, not BEQ: the "
+            "frame would be written without waiting for Rdy4TxNOW"
+            + (" (BNE inverts the wait)" if p["opcode"] == BNE else "")
+        )
+        assert p["target"] == p["lda"], (
+            f"{where}: BEQ resolves to offset {p['target']}, not back to the LDA "
+            f"at {p['lda']}; the loop must re-read BusST every pass"
+        )
+
+
+@pytest.mark.parametrize("name", sorted(TX_BUILDERS))
+def test_tx_sequence_is_txcmd_txlen_busst_poll_then_data(name: str) -> None:
+    """TxCMD, TxLength, PPPtr=BusST, poll Rdy4TxNOW (with its branch), then
+    the RTDATA writes -- at **every** TX site of the builder.
+
+    This is the CS8900a's documented TX handshake and ip65's order
+    (``drivers/cs8900a.s:441-457``: ``txcmd``, ``txlen``, then the BusST
+    spin, then the copy).  Writing data before the chip has said
+    Rdy4TxNOW, or TxLength before TxCMD, passes under VICE and loses
+    frames on silicon.
+
+    Each site is checked inside its own window, from its ``STA TxCMD_lo``
+    to the next site's (or the end of the routine).  The previous form
+    took the first hit of each step from the start of the routine, so on
+    a two-site builder the second site's poll satisfied the first site's
+    search and a poll moved out of place was not seen (found while
+    mutation-testing #224).
+    """
+    code = TX_BUILDERS[name]()
+    sites = [m.start() for m in re.finditer(re.escape(_sta(TXCMD_LO)), code)]
+    assert len(sites) == _expected_tx_sites(name), (
+        f"{name}: {len(sites)} TxCMD write(s), expected {_expected_tx_sites(name)}"
+    )
+    polls = {p["pptr"]: p for p in _rdy4txnow_polls(code)}
+    poll_bytes = _lda(PPDATA_HI) + bytes([AND_IMM, BUSST_RDY4TXNOW_MASK, BEQ])
+    for i, txcmd_lo in enumerate(sites):
+        end = sites[i + 1] if i + 1 < len(sites) else len(code)
+        window = code[:end]
+
+        def step(seq: bytes, after: int) -> int:
+            off = window.find(seq, after) if after >= 0 else -1
+            return off
+
+        txcmd_hi = step(_sta(TXCMD_HI), txcmd_lo)
+        txlen_lo = step(_sta(TXLEN_LO), txcmd_hi)
+        txlen_hi = step(_sta(TXLEN_HI), txlen_lo)
+        busst = step(pptr_set(PP_BUSST), txlen_hi)
+        poll = step(poll_bytes, busst)
+        data = step(_sta(RTDATA_LO), poll)
+        order = [txcmd_lo, txcmd_hi, txlen_lo, txlen_hi, busst, poll, data]
+        assert all(o >= 0 for o in order), (
+            f"{name}: TX site {i} (TxCMD at {txcmd_lo}) has a handshake step "
+            f"missing (offsets {order}; -1 = not found after the previous step "
+            f"before offset {end})"
+        )
+        assert order == sorted(order)
+        assert busst in polls and polls[busst]["target"] == polls[busst]["lda"], (
+            f"{name}: TX site {i}: the poll after PPPtr=BusST at {busst} does "
+            "not branch back to its LDA"
+        )
+        assert polls[busst]["lda"] + 7 <= data, (
+            f"{name}: TX site {i}: RTDATA is written inside the poll loop"
+        )
 
 
 # ---------------------------------------------------------------------------
