@@ -1218,7 +1218,7 @@ Bridge networking helpers — two VICE instances on a host bridge (Linux TAP + `
 - Constants (import from `c64_test_harness.bridge_ping`; not package-root exports): `CS8900A_RXCTL_VALUE = 0x0D85` (PromiscuousA|RxOKA|IndividualA|BroadcastA + regnum), `CS8900A_RXCTL_VALUE_IP65 = 0x0D05` (same, non-promiscuous — ip65's value), `CS8900A_TXCMD_VALUE = 0x00C9`, `CS8900A_RXEVENT_MASK = 0x0D`, `CS8900A_LINECTL_ENABLE = 0x00C0`. The low 6 bits of every CS8900a control register are the read-only register number (issue #207) — the old `0x00D8`/`0x00C0` only ever worked under VICE.
 
 ### TOD-timed variants (shippable on real C64 / U64E / VICE normal; NOT usable under VICE warp)
-- `build_ping_and_wait_tod_code(..., deadline_tenths=50, *, arp_frame_buf=None, arp_frame_len=None)` — same ARP-first option as the counter variant
+- `build_ping_and_wait_tod_code(..., deadline_tenths=50, *, arp_frame_buf=None, arp_frame_len=None)` — same ARP-first option as the counter variant `drain_first=True` (both ping builders, issue #222) SkipNows every frame already queued in the chip (at most `DRAIN_RX_MAX_FRAMES` = 8) before the first transmit — on silicon an exchange started over stale frames loses its reply (RxMISS +1); default `False` keeps the bytes identical.
 - `build_icmp_responder_tod_code(..., deadline_tenths=50, *, my_mac=None)` — same ARP answer as the counter variant, against the same TOD deadline
 - `build_rx_echo_reply_tod_code(...)`
 
