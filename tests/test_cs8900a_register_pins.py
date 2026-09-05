@@ -438,6 +438,22 @@ def test_rxctl_inline_writes_the_promiscuous_value_low_then_high() -> None:
         CS8900A_RXCTL_VALUE & 0xFF, PPDATA_LO) + _lda_sta(CS8900A_RXCTL_VALUE >> 8, PPDATA_HI)
     assert CS8900A_RXCTL_VALUE & 0x3F == 0x05, "low 6 bits must be RxCTL's register number (#207)"
     assert CS8900A_RXCTL_VALUE & 0x0100, "RxOKA must be set or the receiver accepts nothing (#207)"
+    # The ARP responders (#218) depend on two more acceptance bits that
+    # PromiscuousA happens to make redundant under the harness value but
+    # ip65's value relies on outright; nothing else pins them.
+    assert CS8900A_RXCTL_VALUE & 0x0800, (
+        "BroadcastA must be set: an ARP request is a broadcast frame, and without "
+        "it the responder never sees the request it is meant to answer (#218)"
+    )
+    assert CS8900A_RXCTL_VALUE & 0x0400, (
+        "IndividualA must be set: the ARP reply and the echo reply are unicast to the "
+        "programmed IA, and without it the pinger never receives its answer (#218)"
+    )
+    for bit, name in ((0x0800, "BroadcastA"), (0x0400, "IndividualA")):
+        assert bp.CS8900A_RXCTL_VALUE_IP65 & bit, (
+            f"{name} must be set in the ip65 value too: it has no PromiscuousA to "
+            "fall back on, so this bit alone admits the frame (#218)"
+        )
 
 
 def test_linectl_or_is_a_low_byte_read_modify_write_only() -> None:

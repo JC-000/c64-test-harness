@@ -1672,6 +1672,9 @@ def run_ping_and_wait(
     does and what a macOS peer needs before it will deliver replies
     (issue #212).  The ARP reply is consumed as a non-matching frame.
     ``tx_frame`` must be IPv4 for this; pass ``arp=False`` to send it raw.
+    The addresses are read at the fixed offsets 26 and 30, i.e. an IPv4
+    header without options (IHL=5) -- what :func:`build_echo_request_frame`
+    builds and what every 6502 routine here assumes as well.
 
     The wall-clock budget is owned by Python via
     :func:`c64_test_harness.poll_until.poll_until_ready`, so this works

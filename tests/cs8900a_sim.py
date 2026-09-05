@@ -16,12 +16,30 @@ Scope is deliberately narrow:
   PPPtr/PPData for RxEvent (PP ``0x0124``), BusST (PP ``0x0138``), RxCFG
   (PP ``0x0102``, SkipNow), the RTDATA FIFO in both directions, TxCMD and
   TxLength.  RX frames are queued by the test; a TX is complete when
-  ``TxLength`` bytes have been written to RTDATA.  Rdy4TxNOW is always
-  set.  Frames are modelled as the CS8900a presents them: two header
-  words (RxStatus, RxLength) then the body, high half first for the
-  header and low half first for the body -- the ordering issue #210 is
-  about, so a reader with the wrong order sees a byte-shifted frame here
-  too.
+  ``TxLength`` bytes have been written to RTDATA.
+
+  The RX FIFO is a **byte stream in the documented read order**:
+  ``RxStatus`` high, ``RxStatus`` low, ``RxLength`` high, ``RxLength``
+  low, then the body bytes in wire order.  Every RTDATA read -- from
+  either half register -- pops the next byte.  So the harness reader
+  (header high-half-first, body low-half-first; issue #210, ip65's order)
+  observes the right words and the frame in wire order, while a reader
+  that takes the header low-half-first observes byte-swapped ``RxStatus``
+  / ``RxLength`` (``tests/test_cs8900a_sim.py`` pins both).  That is the
+  extent of the claim: the #210 report says real silicon also shifts the
+  *body* by a byte after a wrong-order header, and this model does not
+  reproduce that -- the order itself stays pinned structurally by
+  ``tests/test_cs8900a_frame_reader.py`` and the hash pins.  Reads past
+  the end of the frame return ``0`` until SkipNow (measured, #210).
+
+  **Not modelled** -- nothing run here is evidence about these:
+  RxEvent is not read-to-clear (it reports "frame pending" until the
+  frame is skipped); the TxCMD / TxLength-before-data ordering is not
+  enforced (data written before TxLength is discarded when TxLength is
+  written, no error); ``Rdy4TxNOW`` is always set, so a routine that
+  never polls BusST still transmits; there is no acceptance filter --
+  RxCTL, LineCTL and the IA are accepted and ignored, so every queued
+  frame is "received" whatever its destination address.
 * **CIA1 TOD** (``$DC08-$DC0B``) reads as ``00:00:00.0`` forever, so a
   TOD-deadline routine never times out; ``$DC0F`` is plain RAM.
 
@@ -63,10 +81,11 @@ class Cs8900aSim:
     txcmd: int = 0
     txlen: int = 0
     clockport: int = 0
-    # Current RX frame being drained: byte stream as the chip presents it.
+    # Current RX frame being drained: byte stream in documented read order
+    # (status hi, status lo, length hi, length lo, body...); see the
+    # module docstring.
     _rx_stream: list[int] = field(default_factory=list)
     _rx_pos: int = 0
-    _word_half_read: int = 0
     _tx_buf: bytearray = field(default_factory=bytearray)
     _pending_hi: dict[int, int] = field(default_factory=dict)
     #: Every RTDATA read, in order, as (register, value) -- lets a test
@@ -80,31 +99,22 @@ class Cs8900aSim:
         frame = self.rx_queue.pop(0)
         status = RXEVENT_RXOK
         length = len(frame)
-        # Header words are delivered high half first: reading $DE09 gives
-        # the high byte, then $DE08 the low byte.  We model the FIFO as a
-        # sequence of 16-bit words; each half read pops from the current
-        # word.  Data words are delivered low half first.
-        words = [status, length]
+        # Byte stream in the documented read order: each header word high
+        # half first, then the body in wire order.  A reader pops one byte
+        # per RTDATA read whichever half register it uses, so only a
+        # reader that follows this order sees the right values.
         body = list(frame)
         if len(body) % 2:
             body.append(0)
-        for i in range(0, len(body), 2):
-            words.append(body[i] | (body[i + 1] << 8))
-        self._rx_stream = words
+        self._rx_stream = [status >> 8, status & 0xFF, length >> 8, length & 0xFF] + body
         self._rx_pos = 0
-        self._word_half_read = 0
 
     def _rtdata_read(self, reg: int) -> int:
         self._start_frame()
         if self._rx_pos >= len(self._rx_stream):
             value = 0                       # past the end of the frame
-            self.rtdata_reads.append((reg, value))
-            return value
-        word = self._rx_stream[self._rx_pos]
-        value = (word & 0xFF) if reg == _RTDATA_LO else (word >> 8) & 0xFF
-        self._word_half_read += 1
-        if self._word_half_read == 2:
-            self._word_half_read = 0
+        else:
+            value = self._rx_stream[self._rx_pos]
             self._rx_pos += 1
         self.rtdata_reads.append((reg, value))
         return value
@@ -112,7 +122,6 @@ class Cs8900aSim:
     def _skip_now(self) -> None:
         self._rx_stream = []
         self._rx_pos = 0
-        self._word_half_read = 0
 
     def _rx_event(self) -> int:
         if self._rx_stream or self.rx_queue:
