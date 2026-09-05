@@ -241,7 +241,9 @@ All functions take `transport: BinaryViceTransport` as first arg (stateless). Th
 - `jsr(transport, addr, timeout=5.0, *, scratch_addr=0x0334, override=None, recover_on_timeout=False, preserve_state=True) -> dict` -- Call subroutine via trampoline, wait for RTS; CPU is **paused** on return. Works reliably for both short and long-running computations (event-based, no polling). With `recover_on_timeout=True`, a routine that never returns raises `RoutineHung` (a `TimeoutError` subclass) after restoring SP and proving the trampoline live with an `RTS` probe; `recovered`, `elapsed`, `addr`, `hung_pc`, `detail` carry the outcome (PATTERNS § "Probing a routine that may hang"). Default `False`: a bare `TimeoutError`, as before. `preserve_state=True` (default) reads the pre-call `PC`/`SP`/`FL` before the hijack and writes them back after the `RTS`, so a call that landed mid-interrupt no longer abandons the handler's frame or leaves `I` set forever. `A`/`X`/`Y` are **not** put back, and **nothing** is put back on timeout. Pass `preserve_state=False` where the routine's own flag or stack effects must survive.
 - `RoutineHung(TimeoutError)` -- Raised by `jsr(..., recover_on_timeout=True)` when the routine hangs. `recovered=False` means the next call on that transport is not safe. Re-exported from the package root.
 - `RECOVERY_PROBE_TIMEOUT = 5.0` -- Seconds the recovery `RTS` probe waits for its landing.
-- `run_subroutine(target, addr, *, timeout=30.0, poll_cadence=0.005, trampoline_addr=0x0360) -> None` -- Cross-backend "call sub and wait for RTS". Takes a `TestTarget` (not a transport). On VICE wraps `jsr()`. On U64 installs a 14-byte sentinel trampoline at `trampoline_addr` (default `$0360`, cassette buffer; flag bytes at `$03F0`/`$03F1`), triggers it via `SYS <addr>` keystroke (assumes BASIC READY), and host-polls the done flag every `poll_cadence` seconds — sub-millisecond cadence is permitted and useful for short routines (issue #82). Raises `TimeoutError` on U64 only; the message distinguishes "never started" (running flag still `0x00`) from "started but never returned" (running flag `0x01`, done flag never `0x02`). Re-exported from the package root.
+- `run_subroutine(target, addr, *, timeout=30.0, poll_cadence=0.005, trampoline_addr=0x0360, override=None) -> None` -- Cross-backend "call sub and wait for RTS". Takes a `TestTarget` (not a transport). On VICE wraps `jsr()`. On U64 installs a 14-byte sentinel trampoline at `trampoline_addr` (default `$0360`, cassette buffer; flag bytes at `$03F0`/`$03F1`), triggers it via `SYS <addr>` keystroke (assumes BASIC READY), and host-polls the done flag every `poll_cadence` seconds — sub-millisecond cadence is permitted and useful for short routines (issue #82). Raises `TimeoutError` on U64 only; the message distinguishes "never started" (running flag still `0x00`) from "started but never returned" (running flag `0x01`, done flag never `0x02`). Re-exported from the package root.
+- `parse_basic_sys_address(prg, *, basic_start=0x0801) -> int | None` -- Walks the tokenised BASIC stub line by line and returns the `SYS` operand (`10 SYS2061` as cc65 emits it; `SYS(2061)` accepted; text inside quotes and after `REM` ignored), or `None`. A PRG not loading at *basic_start* is not BASIC and yields `None` whatever bytes it holds.
+- `run_prg_via_sys(target, prg, *, sys_addr=None, reset=True, boot_timeout=25.0, verify_timeout=10.0, settle_after_ready=None) -> int` -- Load a PRG by `write_memory`, re-verify its head by read-back until the post-`READY.` settle has elapsed (default 6 s on a U64 after a reset, 0 otherwise — issue #216: a reset-triggered event zeroes `$0801/$0802` 2–5 s after the banner; the re-verification is the guarantee, the settle an optimisation), start it with a typed `SYS`, then resume; returns the entry address used. Raises `TransportError` if the head never reads back intact `verify_timeout` s past the window. Takes a `TestTarget` or a bare transport; works on both backends. Exists because after `Ultimate64Client.run_prg()` an external cartridge is left deselected (`$DE00` reads zeros afterwards; cause not isolated, issue #211). `reset=True` resets and waits for `READY.` (`TimeoutError` if it never appears); `sys_addr` defaults to the stub's own `SYS` (`ValueError` if none). Re-exported from the package root. Unit test: `tests/test_run_prg_via_sys.py`.
 
 ### `jsr()` internals
 0. Reads `PC`/`SP`/`FL`, unless `preserve_state=False` or the transport has no `read_registers`
@@ -268,7 +270,7 @@ With `recover_on_timeout=True`, step 4 timing out adds: read registers (binmon a
 ## Module: screen
 
 - `ScreenGrid` -- Parsed screen state (40x25 character grid)
-- `wait_for_text(transport, text, timeout=60.0, poll_interval=2.0, verbose=True) -> ScreenGrid | None` -- Poll screen RAM until text appears. Returns `None` on timeout. **Note:** `verbose` defaults to `True` (dumps screen on every poll) — pass `verbose=False` for quiet operation. The CPU is **running** on return, on every exit path; the grid was captured before that resume, so if you need the machine halted alongside the grid your next read halts it again. Best-effort: a `resume()` that raises is logged at WARNING on `c64_test_harness.screen` and swallowed (issue #191).
+- `wait_for_text(transport, needle, timeout=60.0, poll_interval=2.0, verbose=True, on_progress=None) -> ScreenGrid | None` -- Poll screen RAM until text appears. Returns `None` on timeout. **Note:** `verbose` defaults to `True` (dumps screen on every poll) — pass `verbose=False` for quiet operation. The CPU is **running** on return, on every exit path; the grid was captured before that resume, so if you need the machine halted alongside the grid your next read halts it again. Best-effort: a `resume()` that raises is logged at WARNING on `c64_test_harness.screen` and swallowed (issue #191).
 - `wait_for_stable(transport, timeout=10.0, poll_interval=0.5, stable_count=3) -> ScreenGrid | None` -- Wait for screen to stop changing. Returns `None` on timeout. The CPU is **running** on return, on every exit path, same caveat as `wait_for_text()`.
 
 ---
@@ -276,7 +278,7 @@ With `recover_on_timeout=True`, step 4 timing out adds: read registers (binmon a
 ## Module: keyboard
 
 - `send_text(transport, text) -> None` -- Type text into C64 keyboard buffer (max 10 chars at a time, auto-chunks)
-- `send_key(transport, key) -> None` -- Send single keypress (e.g., `"\r"` for RETURN)
+- `send_key(transport, char_or_code) -> None` -- Send single keypress: a one-char `str` (e.g., `"\r"` for RETURN) or a PETSCII `int`
 
 ---
 
@@ -376,8 +378,8 @@ with ViceProcess(config) as vice:
 `ViceInstanceManager._start_or_adopt()` uses a retry-connect pattern to establish a `BinaryViceTransport` connection after starting VICE, rather than a dedicated wait method.
 
 Static methods:
-- `ViceProcess.kill_on_port(port) -> bool` -- Kill process listening on port (Linux /proc)
-- `ViceProcess.get_listener_pid(port) -> int | None` -- Return PID of process listening on port (Linux /proc)
+- `ViceProcess.kill_on_port(port) -> bool` -- Kill process listening on port (Linux `/proc/net/tcp`, macOS `lsof`)
+- `ViceProcess.get_listener_pid(port) -> int | None` -- Return PID of process listening on port (Linux `/proc/net/tcp`, macOS `lsof`)
 
 ---
 
@@ -409,7 +411,7 @@ transport = BinaryViceTransport(host="127.0.0.1", port=6502, timeout=5.0)
 - `screen_rows -> int` (property)
 
 **VICE-only methods (not on the cross-backend protocol):**
-- `read_registers() -> dict[str, int]` -- `{"A": ..., "X": ..., "Y": ..., "SP": ..., "PC": ...}`. The U64 REST API has no CPU-register endpoint, so this was removed from `C64Transport` in PR #121.
+- `read_registers() -> dict[str, int]` -- every register VICE advertises at connect (`PC`, `A`, `X`, `Y`, `SP`, `FL`, `LIN`, `CYC`, …); `jsr()`'s `preserve_state` relies on `FL` being present. The U64 REST API has no CPU-register endpoint, so this was removed from `C64Transport` in PR #121.
 
 **Binary monitor methods (used by execute.py functions):**
 - `set_checkpoint(addr, *, temporary=False, stop_when_hit=True, enabled=True) -> int` -- Set execution checkpoint, returns checkpoint number
@@ -454,7 +456,7 @@ entries = img.list_files()  # -> list[DirEntry]
 
 ### `DiskFormat` -- Enum: `D64`, `D71`, `D81`
 ### `FileType` -- Enum: `PRG`, `SEQ`, `USR`, `REL`
-### `DirEntry` -- `.name`, `.file_type`, `.size_blocks`
+### `DirEntry` -- `.name`, `.blocks`, `.file_type`
 
 ---
 
@@ -472,7 +474,7 @@ Parse `"02:c6:40:00:00:01"` (colon or dash separated) → 6 bytes.
 6 bytes → `"02:c6:40:00:00:01"`.
 
 ### `set_cs8900a_mac(transport, mac, base=0xDE00)`
-Program the CS8900a Individual Address registers via PPPtr/PPData at PP offsets 0x0158-0x015D. CPU must be stopped (normal after binary monitor connect).
+Program the CS8900a Individual Address registers via PPPtr/PPData at PP offsets 0x0158-0x015D with host-side `write_memory`. CPU must be stopped (normal after binary monitor connect). **Works under VICE** (host `write_memory` reaches the emulated chip; measured 2026-09-05 by 6510 read-back of the IA) and is **useless on hardware**: a U64 host write to `$DE02`/`$DE04` never reaches the expansion port and host reads of the window are neither meaningful nor reproducible (issue #209) — use `bridge_ping.cs8900a_set_mac_inline_code(mac)` / `cs8900a_set_mac_code(mac)` from the 6510 there.
 
 ```python
 from c64_test_harness import set_cs8900a_mac, generate_mac, parse_mac
@@ -561,7 +563,7 @@ prg = PrgFile.from_file("build/program.prg")
 
 ## Module: debug
 
-- `dump_screen(transport, label="debug") -> None` -- Save screen contents to file for debugging
+- `dump_screen(transport, label="") -> str` -- Save screen contents to file for debugging; returns the dump text
 
 ---
 
@@ -660,6 +662,7 @@ Exception mapping: timeouts, unreachable device, and connection drops mid-reques
 - `client.list_configs() -> list[str]`
 - `client.get_config_category(name) -> dict`
 - `client.get_config_item(category, item) -> dict`
+- `client.set_config_item(category, item, value) -> None` -- `PUT /v1/configs/<category>/<item>?value=<value>`; the call for one-off items such as `("C64 and Cartridge Settings", "Cartridge Preference", "External")`. Volatile until `save_config_to_flash()`.
 - `client.set_config_items(category, items_dict)` -- iterates per-item (no batch endpoint)
 - `client.save_config_to_flash() -> None` -- `PUT /v1/configs:save_to_flash` (DESTRUCTIVE). Config PUTs are otherwise volatile; a reboot/power-cycle reloads flash, not the RAM-side value.
 - `client.load_config_from_flash(category=None) -> None` -- `PUT /v1/configs:load_from_flash` (DESTRUCTIVE). Discards unsaved in-memory changes. With `category` given, reloads only that category (`PUT /v1/configs/<category>:load_from_flash`; path depth >1 is HTTP 400).
@@ -713,7 +716,7 @@ Cross-backend VICE/U64 snapshot interop using VICE's native `.vsf` format as the
 
 ### Functions
 - `extract_snapshot(transport, *, include_reu=False, reu_size_bytes=None, reu_settle=0.05) -> Snapshot` -- Reads RAM + CPU port via the protocol; `include_reu=True` adds the staging-window REU extract (`reu_size_bytes=None` auto-detects from the U64 config). Same code path for VICE and U64. Re-exported from the package root.
-- `restore_snapshot(transport, snap, *, restore_reu=True) -> None` -- Writes RAM back in three slices (`$0000-$CFFF`, color RAM `$D800-$DBFF`, `$E000-$FFFF` — the live I/O window is skipped, see above) plus the CPU port; when `snap.reu_contents` is present, enables the REU via generation-aware `set_reu` and writes contents via `Ultimate64Transport.socket_dma_reu_write` (SocketDMA `REUWRITE` — **no REST fallback**; unavailable DMA service raises `Ultimate64Error`, VICE-shaped transports raise `SnapshotRestoreError`; `restore_reu=False` opts out). Logs one WARNING per restore and threads `override="snapshot-restore"` through every `write_memory` so the bulk restore crosses `MemoryPolicy`-reserved regions without raising. Re-exported from the package root.
+- `restore_snapshot(transport, snap, *, override_memory_policy=True, restore_reu=True) -> None` -- Writes RAM back in three slices (`$0000-$CFFF`, color RAM `$D800-$DBFF`, `$E000-$FFFF` — the live I/O window is skipped, see above) plus the CPU port; when `snap.reu_contents` is present, enables the REU via generation-aware `set_reu` and writes contents via `Ultimate64Transport.socket_dma_reu_write` (SocketDMA `REUWRITE` — **no REST fallback**; unavailable DMA service raises `Ultimate64Error`, VICE-shaped transports raise `SnapshotRestoreError`; `restore_reu=False` opts out). Logs one WARNING per restore and threads `override="snapshot-restore"` through every `write_memory` so the bulk restore crosses `MemoryPolicy`-reserved regions without raising. Re-exported from the package root.
 - `extract_reu_contents(transport, size_bytes, *, settle=0.05, pause=False) -> bytes` -- Staging-window REU readback ($0800–$87FF, 32 KB banks via REC-programmed REU→C64 transfers). **Must run unpaused on Ultimate hardware** — `machine:pause` freezes the machine clock including REC DMA (live-verified C64U fw 1.1.0), so a paused extract returns stale RAM. Capture is therefore not atomic.
 - `Snapshot.to_bundle(path)` / `Snapshot.from_bundle(path)` -- Sidecar directory round-trip: `snapshot.vsf` + `manifest.json` + `reu.bin`.
 - `Snapshot.to_vsf() -> bytes` -- Emit a complete VICE-consumable `.vsf`. A bundled ~180 KB template captured from VICE 3.10 at BASIC READY supplies the ~30 modules VICE 3.10 requires (MAINCPU, CIA1/2, SID, VIC-II, GLUE, drives, joyports, ...); the codec overwrites only the C64MEM module body.
@@ -729,8 +732,8 @@ The top-level helpers were originally named `extract_state` / `restore_state`. T
 
 Backend-agnostic live memory watcher ("pexpect for DMA"). Polls memory addresses and yields `ProgressEvent` instances (kinds: `Advanced`, `Stalled`, `Finished`) until a sentinel matches or a timeout fires. Originally bound to `Ultimate64Client.read_mem`; lifted to the `C64Transport.read_memory` protocol in PR #123 (commit 9e6dd29).
 
-- `watch_progress(transport, addresses, *, poll_interval=1.0, idle_timeout=120.0, overall_timeout=600.0, stop_when=None) -> Iterator[ProgressEvent]` -- canonical entry point. Re-exported from the package root.
-- `ProgressEvent` -- frozen dataclass with `.kind` ("Advanced" / "Stalled" / "Finished"), `.elapsed`, `.changed` (dict of label → `(old, new)` byte deltas), `.values` (dict of label → current bytes), `.error`.
+- `watch_progress(transport, addresses, *, poll_interval=10.0, idle_timeout=120.0, overall_timeout=5400.0, stop_when=<never>) -> Iterator[ProgressEvent]` -- canonical entry point (defaults are tuned for hour-long DMA benches — pass `poll_interval` explicitly for anything interactive). Re-exported from the package root.
+- `ProgressEvent` -- frozen dataclass with `.kind` ("Advanced" / "Stalled" / "Finished" / "Timeout" / "PollError"), `.elapsed`, `.changed` (dict of label → `(old, new)` byte deltas), `.values` (dict of label → current bytes), `.error`.
 
 ```python
 from c64_test_harness import watch_progress
@@ -911,7 +914,7 @@ Context manager — `with` opens one connection reused across commands; outside 
 - Raises `Ultimate64Error` on connect/send/recv failure
 
 ### `SocketDMAIdentifyUDP`
-- `identify(probe=b"json") -> dict` — UDP/64 discovery; JSON reply with `probe=b"json"`, else `"<echo>,<hostname>,<menu_header>"`. Governed by the separate "Ultimate Ident Service" config item on the C64U (TCP identify works even with it disabled).
+- `identify(host="<broadcast>", timeout=2.0, port=64, probe=b"json") -> list[dict]` — static; UDP/64 discovery, one dict per responding device; JSON reply with `probe=b"json"`, else `"<echo>,<hostname>,<menu_header>"`. Governed by the separate "Ultimate Ident Service" config item on the C64U (TCP identify works even with it disabled).
 
 ---
 
@@ -922,7 +925,7 @@ Parsed PSID/RSID file with all header fields and the raw bytes.
 ```python
 from c64_test_harness import SidFile
 
-sid = SidFile.from_file("tune.sid")
+sid = SidFile.load("tune.sid")        # or SidFile.from_bytes(raw)
 sid.name          # str — title from header
 sid.author        # str
 sid.songs         # int — number of sub-tunes
@@ -933,7 +936,7 @@ sid.effective_load_addr  # int — resolved load address
 sid.song_is_60hz(0)      # bool — True if CIA-timed (60 Hz)
 ```
 
-### `build_test_psid(load_addr, init_addr, play_addr, data, ...) -> bytes`
+### `build_test_psid(load_addr=0x1000, init_code=b"", play_code=b"", name="TEST", author="HARNESS", released="2026", version=2, songs=1) -> bytes`
 Build a minimal PSID v2 binary for testing.
 
 ### Exceptions
@@ -1136,29 +1139,30 @@ Config helpers for the "Data Streams" category (in `ultimate64_helpers`).
 Ultimate Command Interface (UCI) socket-level TCP/UDP networking for U64 Elite. Registers at `$DF1C-$DF1F`; firmware handles TCP/IP via lwIP. **Every builder and helper accepts `turbo_safe: bool = False`** — set to `True` on real U64E at speeds ≥ 4 MHz. See `docs/uci_networking.md` and Pattern 11 in `PATTERNS.md`.
 
 ### High-level helpers (take a `C64Transport`)
-- `uci_probe(transport, *, timeout=5.0, turbo_safe=False) -> int` — returns `0xC9` if UCI present
-- `uci_get_ip(transport, *, timeout=5.0, turbo_safe=False) -> str` — dotted-quad IP
-- `uci_get_interface_count(transport, *, turbo_safe=False) -> int`
-- `uci_tcp_connect(transport, host, port, *, turbo_safe=False) -> int` — returns socket handle
-- `uci_udp_connect(transport, host, port, *, turbo_safe=False) -> int`
-- `uci_socket_write(transport, sock, data, *, turbo_safe=False) -> int` -- `data` must be at most 892 bytes (`SOCKET_WRITE_MAX_BYTES`; empirical firmware ceiling, theoretical 893 truncates by one byte on the wire). For UDP, one call == one datagram (no firmware coalescing). Larger payloads must be split into multiple calls; each emits its own datagram. See `docs/uci_networking.md § Datagram size limits`.
-- `uci_socket_read(transport, sock, *, max_bytes, turbo_safe=False) -> bytes`
-- `uci_socket_close(transport, sock, *, turbo_safe=False) -> None`
-- `uci_tcp_listen_start(transport, port, *, turbo_safe=False) -> int`
-- `uci_tcp_listen_state(transport, listener, *, turbo_safe=False) -> int` — NOT_LISTENING / LISTENING / CONNECTED / BIND_ERROR / PORT_IN_USE
-- `uci_tcp_listen_socket(transport, listener, *, turbo_safe=False) -> int`
-- `uci_tcp_listen_stop(transport, listener, *, turbo_safe=False) -> None`
+- `uci_probe(transport, *, timeout=10.0, turbo_safe=False) -> int` — returns `0xC9` if UCI present
+- `uci_get_ip(transport, *, timeout=10.0, turbo_safe=False) -> str` — dotted-quad IP
+- `uci_get_interface_count(transport, *, timeout=10.0, turbo_safe=False) -> int`
+- `uci_tcp_connect(transport, host, port, *, timeout=10.0, turbo_safe=False) -> int` — returns socket handle
+- `uci_udp_connect(transport, host, port, *, timeout=10.0, turbo_safe=False) -> int`
+- `uci_socket_write(transport, socket_id, data, *, timeout=10.0, turbo_safe=False) -> None` -- `data` must be at most 892 bytes (`SOCKET_WRITE_MAX_BYTES`; empirical firmware ceiling, theoretical 893 truncates by one byte on the wire). For UDP, one call == one datagram (no firmware coalescing). Larger payloads must be split into multiple calls; each emits its own datagram. See `docs/uci_networking.md § Datagram size limits`.
+- `uci_socket_read(transport, socket_id, max_len=255, *, timeout=10.0, turbo_safe=False) -> bytes` — `max_len` above `SOCKET_READ_MAX_BYTES` (253) raises `ValueError`; one call drains one reply block and returns only the payload
+- `uci_socket_close(transport, socket_id, *, timeout=10.0, turbo_safe=False) -> None`
+- `uci_tcp_listen_start(transport, port, *, timeout=10.0, turbo_safe=False) -> None`
+- `uci_tcp_listen_state(transport, *, timeout=10.0, turbo_safe=False) -> int` — NOT_LISTENING / LISTENING / CONNECTED / BIND_ERROR / PORT_IN_USE (one listener per device; no handle argument)
+- `uci_tcp_listen_socket(transport, *, timeout=10.0, turbo_safe=False) -> int`
+- `uci_tcp_listen_stop(transport, *, timeout=10.0, turbo_safe=False) -> None`
 - `get_uci_enabled(client) -> bool` / `enable_uci(client)` / `disable_uci(client)` — config-side helpers, take an `Ultimate64Client`
 
 ### 6502 code builders (return raw bytes — `load_code()` + `jsr()`)
-- `build_uci_probe(*, turbo_safe=False) -> bytes`
-- `build_uci_command(cmd, target, params, *, turbo_safe=False) -> bytes`
-- `build_get_ip(*, turbo_safe=False) -> bytes`
-- `build_tcp_connect(host, port, *, turbo_safe=False) -> bytes`
-- `build_udp_connect(host, port, *, turbo_safe=False) -> bytes`
-- `build_socket_write(sock, data, *, turbo_safe=False) -> bytes`
-- `build_socket_read(sock, max_bytes, *, turbo_safe=False) -> bytes`
-- `build_socket_close(sock, *, turbo_safe=False) -> bytes`
+All address arguments default to the `$C000` UCI block (`code_addr=0xC000`, data `$C100`, `resp_addr=0xC200`, `status_addr=0xC300`, `resp_len_addr=0xC3F0`, `stat_len_addr=0xC3F2`, `sentinel_addr=0xC3FE`, `error_addr=0xC3FF`); `turbo_safe` is a plain keyword, not keyword-only. Host/socket arguments are the RAM addresses the high-level helpers write the value to, not the value itself.
+- `build_uci_probe(result_addr=0xC200, sentinel_addr=0xC3FE, code_addr=0xC000, turbo_safe=False) -> bytes`
+- `build_uci_command(target=3, cmd=2, params=b"", resp_addr=..., status_addr=..., resp_len_addr=..., stat_len_addr=..., error_addr=..., sentinel_addr=..., code_addr=..., turbo_safe=False) -> bytes`
+- `build_get_ip(result_addr=0xC200, ..., turbo_safe=False) -> bytes`
+- `build_tcp_connect(host_addr=0xC100, port=80, result_addr=0xC200, ..., turbo_safe=False) -> bytes` — `host_addr` holds the 4-byte IP
+- `build_udp_connect(host_addr=0xC100, port=53, ..., turbo_safe=False) -> bytes`
+- `build_socket_write(socket_id_addr=0xC100, data_addr=0xC101, data_len_addr=0xC1FF, status_addr=0xC300, ..., turbo_safe=False) -> bytes`
+- `build_socket_read(socket_id_addr=0xC100, result_addr=0xC200, max_len=255, actual_len_addr=0xC3F0, ..., turbo_safe=False) -> bytes`
+- `build_socket_close(socket_id_addr=0xC100, ..., turbo_safe=False) -> bytes`
 
 ### Fence tuning (public constants)
 - `UCI_FENCE_OUTER = 5` — outer-loop iterations (minimum: 3)
@@ -1183,14 +1187,14 @@ Ultimate Command Interface (UCI) socket-level TCP/UDP networking for U64 Elite. 
 
 ## Module: bridge_ping
 
-Bridge networking helpers — two VICE instances on a Linux bridge talking L2 + IP + ICMP via CS8900a. See Pattern 8 in `PATTERNS.md`.
+Bridge networking helpers — two VICE instances on a host bridge (Linux TAP + `br-c64`, or macOS `feth` + `bridge10`) talking L2 + IP + ICMP via CS8900a. See Pattern 8 in `PATTERNS.md`.
 
-### High-level orchestrators (own the wall-clock deadline in Python)
+### High-level orchestrators (own the wall-clock deadline in Python; **VICE-only** — they drive the 6510 with `jsr()`)
 - `run_ping_and_wait(transport, *, tx_frame, rx_buf, result_addr, identifier, sequence, tx_frame_buf, timeout_s=5.0, peek_addr=..., consume_addr=...) -> int` — returns `0x01` on matched reply, `0xFF` on timeout
 - `run_icmp_responder(transport, *, rx_buf, my_ip, result_addr, timeout_s=5.0, peek_addr=..., consume_addr=...) -> int` — reply to any echo request addressed to `my_ip`
 
 ### Frame + code builders
-- `build_echo_request_frame(src_mac, dst_mac, src_ip, dst_ip, identifier, sequence, payload) -> bytes`
+- `build_echo_request_frame(src_mac, dst_mac, src_ip, dst_ip, identifier=0x1234, sequence=1, payload=b"PING_FROM_C64") -> EchoRequest` — pass `.frame` (padded to 60 bytes, word-aligned) as `tx_frame`
 - `build_bridge_tx_code(...)` — transmit a pre-built frame via CS8900a
 - `build_rx_peek_code(...)` — bounded peek into RX FIFO (drives orchestrator polling)
 - `build_rx_echo_reply_code(...)` — full-routine echo-reply match (legacy, virtual-cycle timing)
@@ -1198,7 +1202,12 @@ Bridge networking helpers — two VICE instances on a Linux bridge talking L2 + 
 - `build_read_and_respond_echo_request_code(...)` — read request, respond with reply in one pass
 - `build_ping_and_wait_code(...)` — legacy TX+RX combined, virtual-cycle timing
 - `build_icmp_responder_code(...)` — legacy responder, virtual-cycle timing
-- `cs8900a_rxctl_code(...)` / `cs8900a_write_linectl_code(...)` / `cs8900a_read_linectl_code(...)` — init helpers
+- Init helpers (blob = ends in `RTS`; inline = no `RTS`, prepend to a routine). All enable the RR clockport first.
+  - `cs8900a_enable_inline_code()` — RxCTL = `CS8900A_RXCTL_VALUE`, then LineCTL |= SerRxON|SerTxON; everything a fresh chip needs
+  - `cs8900a_rxctl_inline_code(value=CS8900A_RXCTL_VALUE)` / `cs8900a_rxctl_code()`
+  - `cs8900a_linectl_or_inline_code(mask=CS8900A_LINECTL_ENABLE)` / `cs8900a_write_linectl_code(lo_value, hi_value)` / `cs8900a_read_linectl_code(dest_addr)`
+  - `cs8900a_set_mac_inline_code(mac)` / `cs8900a_set_mac_code(mac)` — program the Individual Address (PP `0x0158-0x015D`) from the 6510; the only route that reaches a hardware cartridge (issue #209). `ValueError` unless `len(mac) == 6`.
+- Constants (import from `c64_test_harness.bridge_ping`; not package-root exports): `CS8900A_RXCTL_VALUE = 0x0D85` (PromiscuousA|RxOKA|IndividualA|BroadcastA + regnum), `CS8900A_RXCTL_VALUE_IP65 = 0x0D05` (same, non-promiscuous — ip65's value), `CS8900A_TXCMD_VALUE = 0x00C9`, `CS8900A_RXEVENT_MASK = 0x0D`, `CS8900A_LINECTL_ENABLE = 0x00C0`. The low 6 bits of every CS8900a control register are the read-only register number (issue #207) — the old `0x00D8`/`0x00C0` only ever worked under VICE.
 
 ### TOD-timed variants (shippable on real C64 / U64E / VICE normal; NOT usable under VICE warp)
 - `build_ping_and_wait_tod_code(...)`
@@ -1206,9 +1215,9 @@ Bridge networking helpers — two VICE instances on a Linux bridge talking L2 + 
 - `build_rx_echo_reply_tod_code(...)`
 
 ### Dataclasses
-- `EchoRequest` — parsed ICMP echo request fields
+- `EchoRequest` — `.frame`, `.identifier`, `.sequence`, `.payload`; what `build_echo_request_frame` returns
 
-**Test fixture:** `bridge_vice_pair` in `tests/conftest.py` brings up two VICE instances on `br-c64`, RR-Net mode, unique MACs, CS8900a initialised.
+**Test fixture:** `bridge_vice_pair` in `tests/conftest.py` brings up two VICE instances on `BRIDGE_NAME` (`br-c64` / `bridge10`), RR-Net mode, warp off, unique MACs, CS8900a initialised.
 
 ---
 
@@ -1247,7 +1256,7 @@ Caller is responsible for loading the peek routine before calling. The peek rout
 Scenario-based sequential test runner with recovery functions.
 
 ### `TestRunner`
-- `runner.add_scenario(name, setup, run, verify, recover=None, timeout=None)`
+- `runner.add_scenario(name, run_fn, recovery_fn=None)` — `run_fn: () -> (bool, str)`, `recovery_fn: () -> bool`
 - `runner.run_all() -> list[TestResult]`
 - `runner.results -> list[TestResult]`
 - `runner.all_passed -> bool`
@@ -1256,7 +1265,7 @@ Scenario-based sequential test runner with recovery functions.
 
 ### `TestScenario` — dataclass for a single scenario
 ### `TestResult` — dataclass with `.status: TestStatus` and metadata
-### `TestStatus` — enum: `PASSED`, `FAILED`, `SKIPPED`, `ERROR`
+### `TestStatus` — enum: `PASS`, `FAIL`, `ERROR`, `SKIP`
 
 ---
 

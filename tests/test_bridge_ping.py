@@ -50,6 +50,7 @@ from c64_test_harness.bridge_ping import (
     build_tx_code,
     run_icmp_responder,
     run_ping_and_wait,
+    CS8900A_RXEVENT_MASK,
 )
 from c64_test_harness.execute import jsr, load_code
 from c64_test_harness.memory import read_bytes, write_bytes
@@ -143,7 +144,7 @@ def _build_rx_match_icmp_code(
     a.emit(0xA9, 0x04, 0x85, 0xF2)
     a.label("poll")
     a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
-    a.emit(0x29, 0x01)
+    a.emit(0x29, CS8900A_RXEVENT_MASK)     # RxOK | IndividualAdr | Broadcast
     a.branch(0xD0, "got")
     a.emit(0xC6, 0xF0)
     a.branch(0xD0, "poll")
@@ -156,11 +157,12 @@ def _build_rx_match_icmp_code(
     a.jmp("timeout")
 
     a.label("got")
-    # Discard 4 bytes (CS8900a status+length header)
-    a.emit(0xAD, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
+    # Discard 4 bytes (CS8900a status+length header), HIGH half first:
+    # the datasheet order, which real silicon requires (issue #210).
     a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
     a.emit(0xAD, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
     a.emit(0xAD, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
+    a.emit(0xAD, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
     # Read _RX_BYTES bytes into rx_buf
     a.emit(0xA9, rx_buf & 0xFF, 0x85, 0xFB)
     a.emit(0xA9, (rx_buf >> 8) & 0xFF, 0x85, 0xFC)

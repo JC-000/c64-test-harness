@@ -78,13 +78,20 @@ so the defence is the warning, the predicate
 
 ### Sample the SID from the 6510, never from the host
 
-Under VICE, host-side `transport.read_memory($D41B)` does **not** read the
-SID at all. The binary monitor's memory commands go through bank
-`default`, which returns the RAM under the I/O window rather than the
-chip: `read_memory($D012)` yields a constant instead of a moving raster,
-and `$D400-$D41F` yields whatever bytes happen to be in RAM. Host-side
-*writes* to those addresses land in RAM too, so a SID configured that way
-is never configured at all.
+Under VICE, host-side `transport.read_memory($D41B)` samples a SID the
+monitor has **halted**. The binary monitor's memory commands go through
+bank `default`, which is the 6510's current memory map, so they do reach
+the chips -- host writes to `$D020`/`$D021` read back on the 6510 as the
+new values, and `read_memory($D020)` returns the VIC's own unused-bit
+pattern (measured, VICE 3.10). The problem is *when* the sample is taken:
+the monitor services commands once per frame from its vsync hook, so a
+command to a running machine always halts it at the same frame phase --
+`read_memory($D012)` returns the same raster line across resume-and-reread
+cycles -- and `$D41B`/`$D41C` read host-side are one sample of a stopped
+oscillator, not a waveform. Configuring the SID host-side does land in the
+chip; *measuring* it host-side measures nothing. (The `ViceConfig.sound=False`
+fallback described in this document is a separate, still-true reason a
+host-side `$D41B` can look like a working oscillator.)
 
 So a register-domain measurement has to run on the machine: a routine
 that writes the voice registers and samples `$D41B` into a RAM buffer,

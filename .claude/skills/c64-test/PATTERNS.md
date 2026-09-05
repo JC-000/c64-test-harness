@@ -7,7 +7,7 @@
 ### Why ViceInstanceManager is mandatory
 
 - **Port safety**: `ViceInstanceManager` uses `PortAllocator` internally with OS-level `bind()` + file-based `flock()` locks. The file lock eliminates the TOCTOU gap between closing the reservation socket and VICE binding to the port. Without it, another agent can steal the port during that window.
-- **PID verification**: After VICE starts, the manager verifies via `/proc/net/tcp` that the correct process is listening. PID mismatches trigger a retry.
+- **PID verification**: After VICE starts, the manager verifies via `/proc/net/tcp` (Linux) or `lsof` (macOS) that the correct process is listening. PID mismatches trigger a retry.
 - **Retry with backoff**: Failed acquisitions retry automatically (configurable `max_retries`, default 3) with exponential backoff.
 - **PID tracking**: `inst.pid` reliably identifies your VICE process. Without it, agents resort to `pkill x64sc` which kills other agents' instances.
 - **Binary transport creation**: `inst.transport` is a `BinaryViceTransport` pre-configured with the correct port. No manual construction needed. The manager uses a retry-connect pattern internally (TCP connect retries until VICE's binary monitor is ready).
@@ -370,7 +370,7 @@ The harness previously used TFE. RR-Net (`ethernet_mode="rrnet"`, emits `-ethern
 
 ### Use the orchestrators — don't hand-roll TX/RX
 
-The harness ships high-level helpers that own the wall-clock deadline in Python and call bounded 6502 peek bursts. These work in BOTH normal and warp mode:
+The harness ships high-level helpers that own the wall-clock deadline in Python and call bounded 6502 peek bursts. These work in BOTH VICE normal and warp mode — and **only on VICE**: every call goes through `jsr()`, which `Ultimate64Transport` cannot do. On hardware use the TOD variants below with `run_subroutine` (see "Hardware RR-Net on the U64").
 
 ```python
 from c64_test_harness import (
@@ -379,7 +379,7 @@ from c64_test_harness import (
 )
 
 # Layout (same as tests/test_bridge_ping.py): peek routine at $C000 (the
-# default peek_addr, 64 B), consume routines at $C200 (up to 357 B), the
+# default peek_addr, 64 B), consume routines at $C200 (up to 349 B), the
 # result byte at $C1F0, TX frame at $C500, RX frame at $C700 (small ping
 # frames; widen the gap for bigger ones).  Never put result_addr on the
 # default consume_addr ($C100): run_ping_and_wait loads the routine there,
@@ -391,13 +391,13 @@ PEEK_ADDR, CONSUME_ADDR, RESULT_ADDR = 0xC000, 0xC200, 0xC1F0
 TX_FRAME_BUF, RX_FRAME_BUF = 0xC500, 0xC700
 
 # One side: send ICMP echo, poll for the reply
-frame = build_echo_request_frame(
+echo = build_echo_request_frame(
     src_mac=mac_a, dst_mac=mac_b, src_ip=ip_a, dst_ip=ip_b,
     identifier=0x1234, sequence=1, payload=b"ping",
-)
+)   # -> EchoRequest; the wire bytes are echo.frame (padded to 60)
 result = run_ping_and_wait(
-    transport_a, tx_frame=frame, rx_buf=RX_FRAME_BUF,
-    result_addr=RESULT_ADDR, identifier=0x1234, sequence=1,
+    transport_a, tx_frame=echo.frame, rx_buf=RX_FRAME_BUF,
+    result_addr=RESULT_ADDR, identifier=echo.identifier, sequence=echo.sequence,
     tx_frame_buf=TX_FRAME_BUF, timeout_s=5.0,
     peek_addr=PEEK_ADDR, consume_addr=CONSUME_ADDR,
 )
@@ -424,15 +424,92 @@ from c64_test_harness import (
 
 VICE warp accelerates TOD (it's virtual-CPU-clocked, not wall-clock-driven — see gotcha below). On real hardware and VICE normal, TOD is a valid timeout source. Deadline cap is 599 tenths (59.9 s).
 
+### Hardware RR-Net on the U64 (external cartridge)
+
+An RR-Net-compatible cartridge in the U64's expansion port is a real CS8900a at `$DE00` with the register map above (measured on U64E fw 3.15; the C64U is unverified). Five things differ from the two-VICE bridge, none of which a VICE test can fail on (issues #207–#212; `docs/bridge_networking.md` § "Real silicon diverges from VICE"):
+
+- **The port is invisible until `Cartridge Preference = External`** (`C64 and Cartridge Settings`). On the default `Auto` every byte of `$DE00-$DE0F` reads zero, exactly like an empty slot; `Bus Operation Mode` is irrelevant. Config PUTs are volatile until `save_config_to_flash()`, so set it per run and put `Auto` back.
+- **The only presence test is the CS8900a identity read, on the 6510: PPPtr = `$0000`, PPData == `$630E`** — what ip65's `init` does before it will initialise (`drivers/cs8900a.s`; `INIT DRIVER: FAILED` is that read failing). A host-side `read_memory` of the I/O window returns bytes unrelated to the cartridge and not reproducible (`0A` ×16 and `3C 00 00 00 …` have both been observed under the same stated conditions). A 6510 raw read of `$DE00` is not a test either: zeros on `Auto`, zeros after `client.run_prg()`, zeros with no cartridge, and the chip's registers (`FF FF …`) when it is working — non-zero but not self-describing (issues #209, #211).
+- **`client.run_prg()` leaves the cartridge deselected**: the program it loads sees `$DE00` as zeros while the config still says `External` (stock ip65 prints `INIT DRIVER: FAILED`); the cause is not isolated (#211), only the outcome is measured. Start PRGs with `run_prg_via_sys(target, prg)` — write to RAM + typed `SYS` + resume.
+- **Host-side `write_memory` never reaches the cartridge on hardware** (and host reads of the window are not meaningful), so `set_cs8900a_mac()` — which works under VICE — is a silent no-op here; program the MAC from the 6510 with `cs8900a_set_mac_inline_code(mac)`.
+- **No `jsr()` on hardware**: `run_ping_and_wait` / `run_icmp_responder` / `poll_until_ready` are VICE-only. Use the `*_tod_code` builders (each ends `CLI; RTS`) through `run_subroutine`, which needs BASIC `READY.`.
+- **ARP before the first ping to a host.** The harness routines never send or answer ARP, so a macOS host keeps a stale neighbour entry and *queues* every echo reply behind it — a run that never ARPs gets 0/N with the requests visibly leaving the wire (issue #212, closed invalid: not a chip fault). One ARP request from the C64 flushes the backlog; stock ip65 is immune because `icmp_ping` ARPs first.
+
+```python
+from c64_test_harness import (
+    create_manager, run_subroutine, write_bytes, read_bytes, wait_for_text,
+    build_echo_request_frame, build_ping_and_wait_tod_code, build_bridge_tx_code,
+    cs8900a_enable_inline_code, cs8900a_set_mac_inline_code, generate_mac, parse_mac,
+)
+from c64_test_harness.bridge_ping import PPTR_LO, PPTR_HI, PPDATA_LO, PPDATA_HI
+
+CODE, RESULT, TX_BUF, RX_BUF = 0xC000, 0xC1F0, 0xC500, 0xC700
+mac = generate_mac(1)
+host_mac = parse_mac("c0:56:27:b1:16:38")            # the host NIC on the cartridge's link
+ip_c64, ip_host = bytes([10, 0, 66, 200]), bytes([10, 0, 66, 1])
+
+def arp_request(src_mac: bytes, src_ip: bytes, target_ip: bytes) -> bytes:
+    f = (b"\xff" * 6 + src_mac + b"\x08\x06"           # broadcast, EtherType ARP
+         + b"\x00\x01\x08\x00\x06\x04\x00\x01"           # eth/IPv4, hlen 6, plen 4, request
+         + src_mac + src_ip + b"\x00" * 6 + target_ip)
+    return f + b"\x00" * (60 - len(f))
+
+with create_manager(backend="u64", u64_hosts="10.43.23.81") as mgr:
+    with mgr.instance() as target:
+        t, client = target.transport, target.client
+        client.set_config_item("C64 and Cartridge Settings", "Cartridge Preference", "External")
+        t.reset()                                            # run_subroutine needs READY.
+        assert wait_for_text(t, "READY.", timeout=25.0, poll_interval=0.3, verbose=False)
+
+        # Bring the chip up FROM THE 6510: clockport + RxCTL + LineCTL, then the MAC.
+        write_bytes(t, CODE, cs8900a_enable_inline_code() + cs8900a_set_mac_inline_code(mac) + b"\x60")
+        run_subroutine(target, CODE, timeout=5.0)
+
+        # Presence test — the only valid one (ip65 init does exactly this).
+        ident = bytes([0xA9, 0x00, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8,      # PPPtr = $0000
+                       0xA9, 0x00, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8,
+                       0xAD, PPDATA_LO & 0xFF, PPDATA_LO >> 8, 0x8D, 0xF0, 0xC1,   # -> $C1F0
+                       0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8, 0x8D, 0xF1, 0xC1,   # -> $C1F1
+                       0x60])
+        write_bytes(t, CODE, ident)
+        run_subroutine(target, CODE, timeout=5.0)
+        assert read_bytes(t, RESULT, 2) == b"\x0e\x63", "no CS8900a on the bus (PP $0000 != $630E)"
+
+        # Prime the host's neighbour cache (issue #212).
+        arp = arp_request(mac, ip_c64, ip_host)
+        write_bytes(t, TX_BUF, arp)
+        write_bytes(t, CODE, build_bridge_tx_code(CODE, TX_BUF, len(arp), RESULT))
+        write_bytes(t, RESULT, b"\x00")
+        run_subroutine(target, CODE, timeout=5.0)
+
+        # Ping with the TOD-timed builder; result 0x01 match / 0xFF deadline.
+        echo = build_echo_request_frame(src_mac=mac, dst_mac=host_mac, src_ip=ip_c64, dst_ip=ip_host)
+        write_bytes(t, TX_BUF, echo.frame)
+        write_bytes(t, CODE, build_ping_and_wait_tod_code(
+            CODE, TX_BUF, len(echo.frame), RX_BUF, RESULT,
+            echo.identifier, echo.sequence, deadline_tenths=40))
+        write_bytes(t, RESULT, b"\x00")
+        run_subroutine(target, CODE, timeout=10.0)
+        assert read_bytes(t, RESULT, 1) == b"\x01"
+
+        client.set_config_item("C64 and Cartridge Settings", "Cartridge Preference", "Auto")
+```
+
+Layout is the bridge layout (peek/consume unused here). **Leave ≥ 0.2 s between `ip65_init` and the first transmit, or run at 1 MHz.** The U64 throttles expansion-port cycles (a cartridge-I/O loop runs only 1.7× faster at 48 MHz than at 1 MHz) and the register interface holds up at 48 MHz — `$630E` identity and ip65's `INIT DRIVER: OK` both read fine there. The clock is *not* the variable behind flaky transmits: **stock ip65's cs8900a driver transmits too soon after its own reset.** A 2×2 (init clock × ping clock, 8 pings per arm, a gated build that pauses between init and ping — c64-wireguard, 2026-09-05) came back 40/40 at 48 MHz, init at 48 MHz included; the un-gated `pingstatic`, which goes init→transmit in microseconds, fails `$82 TRANSMIT_FAILED` about 4 in 5 at 48 MHz and never at 1 MHz. The shortest gap measured was a screen read plus a DMA write (~0.2–0.4 s); anything shorter is untested. The earlier "transmit is intermittent at 48 MHz" was true of `pingstatic` and false in general. Nothing has been filed upstream about ip65.
+
+**Gate-on-a-byte experiments.** The pattern that separated those variables is reusable for any "does X differ across phase boundary Y" question: the C64 program clears a byte, prints a marker, then spins on that byte; the host waits for the marker, changes whatever it wants to vary (clock, a register, a delay), and writes the byte to release. Two arms (init-at-1-then-raise vs init-at-48) would *both* have passed and "proved" the init clock irrelevant while leaving the wrong belief about 48 MHz transmit intact — the 2×2 with a controlled gap is what found the real variable. Source and driver in `.claude/scratch/rrnet-ip65/peer/` (`pingclock.s`, `diag_initclock.py`). Pair trials A/B on this bench: the host's ARP state drifts batch to batch and produced three convincing false "fixes" in #212. The bench-health control is the ip65 static-ping PRG in `.claude/scratch/rrnet-ip65/` (`build-pingstatic.sh`) — run it first; if it fails, the fault is not in your code.
+
 ### Critical networking gotchas
 
 1. **Set `$DE01` bit 0 (clockport enable) before any CS8900a access.** Without it the chip silently drops every register read and write. All harness code builders and `set_cs8900a_mac()` do this automatically; only relevant if you hand-roll.
 
-2. **Initialize RxCTL + LineCTL before TX/RX.** Write `RxCTL` (PP `$0104` = `CS8900A_RXCTL_VALUE`, `$0D85`) and enable `SerTxON | SerRxON` in `LineCTL` (PP `$0112 |= $00C0`). Without this the chip silently discards TX frames. `bridge_vice_pair` fixture does this; standalone setups must call it. The old `$00D8` is wrong on real silicon — the low 6 bits are the read-only register number, so it reads back as `$00C5` with `RxOKA` missing and the receiver accepts nothing (issue #207). ip65 uses `$0D05`, the same value without PromiscuousA.
+2. **Initialize RxCTL + LineCTL before TX/RX.** Write `RxCTL` (PP `$0104` = `CS8900A_RXCTL_VALUE`, `$0D85`) and enable `SerTxON | SerRxON` in `LineCTL` (PP `$0112 |= $00C0`). Without this the chip silently discards TX frames. `bridge_vice_pair` fixture does this; standalone setups prepend `cs8900a_enable_inline_code()` (clockport + RxCTL + LineCTL, no RTS) to their first routine, or call `cs8900a_rxctl_code()` / `cs8900a_write_linectl_code(lo, hi)` as blobs. The old `$00D8` is wrong on real silicon — the low 6 bits are the read-only register number, so it reads back as `$00C5` with `RxOKA` missing and the receiver accepts nothing (issue #207). ip65 uses `$0D05` (`CS8900A_RXCTL_VALUE_IP65`), the same value without PromiscuousA — pass it as `cs8900a_rxctl_inline_code(value=...)` on a busy segment. The `CS8900A_*` constants live in `c64_test_harness.bridge_ping`, not the package root.
 
 2a. **Read the RX FIFO header high-half-first.** The RxStatus and RxLength words must be read from `$DE09` before `$DE08`; the data body is then read low-half-first. That is ip65's ordering. Getting it backwards desynchronises a real CS8900a by one byte — `RxLength` is garbage and every data word arrives byte-swapped — while VICE tolerates either order, so no VICE test can catch it (issue #210). `_emit_read_frame` does this for you; `tests/test_cs8900a_frame_reader.py` pins it.
 
-2b. **Hardware RR-Net on the U64 needs `Cartridge Preference = External`**, and must NOT be started with `client.run_prg()` — its DMA load drops the external cartridge, so the program reads `$DE00` as zeros. Use `run_prg_via_sys(target, prg)`. Also note `set_cs8900a_mac()` is VICE-only: host-side `write_memory` never reaches a hardware cartridge, so program the MAC from a 6502 routine (issues #209, #211).
+2b. **Hardware RR-Net on the U64 needs `Cartridge Preference = External`** (`client.set_config_item("C64 and Cartridge Settings", "Cartridge Preference", "External")`; on the default `Auto` the whole `$DE00` window reads zeros, `Bus Operation Mode` is irrelevant), and must NOT be started with `client.run_prg()` — its DMA load drops the external cartridge, so the program reads `$DE00` as zeros. Use `run_prg_via_sys(target, prg)` (resets, waits for `READY.`, writes the PRG to RAM, types the `SYS` parsed from its BASIC stub and resumes; `reset=False` / `sys_addr=` override). `set_cs8900a_mac()` works under VICE and is useless on hardware: a U64 host write to `$DE02`/`$DE04` never reaches the expansion port, so program the MAC from the 6510 with `cs8900a_set_mac_inline_code(mac)` (prepend `cs8900a_enable_inline_code()`) or the `cs8900a_set_mac_code(mac)` blob. And send an ARP request before the first ping to a host — see 2c (issues #209, #211, #212). Full recipe: "Hardware RR-Net on the U64" above.
+
+2c. **TxCMD is `$00C9` and the RxEvent poll mask is `$0D`, not `$C0`/`$01`.** Same read-only-register-number rule as RxCTL: `CS8900A_TXCMD_VALUE = 0x00C9` (TxStart-after-full-frame plus regnum 9) and `CS8900A_RXEVENT_MASK = 0x0D` (RxOK | IndividualAdr | Broadcast) are what ip65 writes and what every harness builder now emits (#213). Hand-rolled TX or poll code that still writes `$C0` / masks `$01` matches VICE and misses frames on silicon.
 
 3. **VICE flag ordering.** `-ethernetioif` / `-ethernetiodriver` MUST come before `-ethernetcart` (VICE probes the interface on the cart flag; rejects if inaccessible). `ViceConfig` handles this.
 
@@ -447,6 +524,12 @@ VICE warp accelerates TOD (it's virtual-CPU-clocked, not wall-clock-driven — s
 8. **Use the `Asm` helper for 6502 branch offsets.** Hand-coded displacements are a major bug source.
 
 9. **Multi-instance MAC uniqueness.** VICE has no CLI flag for CS8900a MACs. `ViceInstanceManager` auto-generates unique ones and calls `set_cs8900a_mac()` after connect. Standalone `ViceProcess` setups must call it manually.
+
+10. **ip65's `cfg_*` defaults are not zero — "non-zero" proves nothing.** `ip65/config.s` ships `cfg_ip = 192.168.1.64`, `cfg_netmask = 255.255.255.0`, `cfg_gateway = 192.168.1.1` and `cfg_mac = 00:80:10:00:51:00` (only `cfg_dns` ships `0.0.0.0`). A "did DHCP acquire an address?" check written as `cfg_ip != 0` passes with the cable unplugged — the unfalsifiable-default trap, in its networking form (credit: c64-wireguard review). Assert the *specific* value instead:
+    - Unpinned lease: the address lies inside the DHCP pool the test configured.
+    - Pinned host (`dhcp-host` reservation): equals the reservation exactly — reservations sit **outside** the pool by design, so the pool check fails on a correctly pinned host.
+    - Either way, reject the shipped default **by name**, with a message distinct from the zeroed case: `192.168.1.64` means "the DHCP code never ran", `0.0.0.0` means "it ran and cleared it" — opposite next steps, so one "invalid address" verdict conflates them.
+    The same applies to `cfg_mac`: "did `eth_init` run?" via `cfg_mac != 0` is vacuous, and `drivers/cs8900a.s` rewrites the Individual Address from its *own* table on every init (Cirrus OUI `00:0E:3A:…`, or the RR-Net MK3 EEPROM MAC `28:CD:4C:FF:hi:lo`), so a MAC check must compare against what the driver programmed — read PP `$0158-$015D` back on the 6510 — not against non-zero. See memory `feedback_unfalsifiable_default_assertions`.
 
 **End-to-end validation:** `scripts/bridge_ping_demo.py [--warp]` runs a visible two-VICE ping with on-screen counters. Validated 10/10 in both normal and warp modes.
 
@@ -606,7 +689,7 @@ def transport():
 from c64_test_harness import create_manager, DeviceLockTimeout
 
 try:
-    with create_manager(backend="u64", host="10.43.23.81", lock_timeout=120.0) as mgr:
+    with create_manager(backend="u64", u64_hosts="10.43.23.81", lock_timeout=120.0) as mgr:
         with mgr.instance() as target:
             ...
 except DeviceLockTimeout as e:
@@ -640,7 +723,7 @@ Tell whether the flock is **actually** held vs the file just being metadata-stal
 ```python
 import fcntl, os
 
-path = lock._lock_path  # or build it yourself from _default_lock_dir
+path = device_lock_path("10.43.23.81")   # public; identical to lock._lock_path
 fd = os.open(str(path), os.O_RDWR)
 try:
     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -662,11 +745,13 @@ print("held by another process:", held)
 
 The U64 has NO CPU control (no `jsr()`, no registers, no breakpoints). To execute code on hardware, use the **DMA trampoline + main_loop hijack** pattern.
 
+For a program that drives an external cartridge (RR-Net), neither `client.run_prg()` nor `set_cs8900a_mac()` works on hardware — see Pattern 8 § "Hardware RR-Net on the U64" for the `Cartridge Preference` / `run_prg_via_sys` / 6510-side MAC / ARP recipe.
+
 **All U64 access must use DeviceLock** for cross-process safety. Use `UnifiedManager` (automatic) or wrap with `DeviceLock` in pytest fixtures.
 
 ### Two device generations — detect via `get_info()`, don't assume
 
-There are two hardware generations with real behavioral differences. Detect with `client.get_info()["product"]`: `"Ultimate 64 Elite"` (fw 3.14) vs `"C64 Ultimate"` (fw 1.1.0). Never hardcode one generation's behavior; on an unrecognized product, skip with the observed payload rather than guessing. Known asymmetries (each live-verified):
+There are two hardware generations with real behavioral differences. Detect with `client.get_info()["product"]`: `"Ultimate 64 Elite"` (fw 3.14/3.15) vs `"C64 Ultimate"` (fw 1.1.0). Never hardcode one generation's behavior; on an unrecognized product, skip with the observed payload rather than guessing. Known asymmetries (each live-verified):
 
 - **CPU-speed enum**: Elite has `" 5"` but not `"64"`; C64U has `"64"` but not `" 5"`. The harness schema is the cross-generation superset — `set_turbo_mhz` probes the device's actual CPU-Speed presets (once, cached per client) and raises `ValueError` locally for a foreign speed; only when the probe is inconclusive does the write reach the firmware, which rejects it with HTTP 400 *before* Turbo Control is enabled (`set_turbo_mhz` writes CPU Speed first, on purpose). `max_cpu_speed_mhz(client)` / `set_speed(None)` resolve "max" from the same probe (64 on C64U, 48 on U64E; 48 fallback). Contract test: `tests/test_turbo_contract_live.py` (`TURBO_CONTRACT_LIVE=1` gate).
 - **REU / Cartridge preset**: only U64E firmware 3.14 exposed `Cartridge` as an enum with a `"REU"` preset that had to be written to enable the REU. U64E 3.15 replaced it with a `.crt` file chooser (`presets: [""]`; firmware `c64.cc:73`, `CFG_TYPE_STRFUNC`/`list_crts`) and the REU is controlled by `RAM Expansion Unit` + `REU Size` alone; the C64U (1.1.0) likewise has no `"REU"` preset — its `Cartridge` value merely mirrors REU state, and writing it back is rejected with HTTP 400. `set_reu` / `restore_state` handle all three by probing the item's presets (preset write ordered first, so a rejection never half-enables the REU). Don't hand-write `Cartridge: "REU"` config updates; use the helpers. `REU Size` read-back is trustworthy — a value that changes between reads means a config write, a flash reload, or a reboot/power-cycle in between (PUTs are volatile until `save_to_flash`); see `tests/test_reu_size_readback_live.py`.
@@ -867,7 +952,7 @@ print(f"U64 IP: {ip}")
 
 sock = uci_tcp_connect(transport, host="192.168.1.10", port=80)
 uci_socket_write(transport, sock, b"GET / HTTP/1.0\r\n\r\n")
-data = uci_socket_read(transport, sock, max_bytes=1024)
+data = uci_socket_read(transport, sock, max_len=253)   # SOCKET_READ_MAX_BYTES; one call drains one reply block
 uci_socket_close(transport, sock)
 ```
 
@@ -947,9 +1032,10 @@ target.transport.memory_policy = policy
 ```toml
 # config.toml
 [memory]
-unknown = "warn"
-safe = ["$C000-$CFFF", { range = "$0334", note = "jsr scratch" }]
-reserved = [{ range = "$4200-$50FF", note = "X25519 RODATA" }]
+prg = "build/program.prg"          # optional: reserves the PRG load span
+unknown_policy = "warn"            # allow | warn | deny
+safe_regions = ["$C000-$CFFF", { range = "$0334", note = "jsr scratch" }]
+reserved_regions = [{ range = "$4200-$50FF", note = "X25519 RODATA" }]
 ```
 
 ```python
@@ -1054,10 +1140,10 @@ with ViceInstanceManager(config=config) as mgr:
 c1541 stores uppercase ASCII as shifted PETSCII ($C1-$DA), but the C64 keyboard generates unshifted ($41-$5A). Always use **lowercase** `c64_name`:
 ```python
 # WRONG: C64 can't find "MYFILE" from keyboard
-img.write_file("myfile.seq", data, c64_name="MYFILE")
+img.write_file("myfile.seq", c64_name="MYFILE", file_type=FileType.SEQ)
 
 # RIGHT: lowercase matches keyboard input
-img.write_file("myfile.seq", data, c64_name="myfile")
+img.write_file("myfile.seq", c64_name="myfile", file_type=FileType.SEQ)
 ```
 
 ### 3. Program State After jsr()
@@ -1131,7 +1217,7 @@ if my_pid is not None:
 
 After `run_parallel()`, each `SingleTestResult` has a `.pid` field identifying which VICE process ran it.
 
-**Port allocation is cross-process safe.** `ViceInstanceManager` uses `PortAllocator` internally with dual-layer protection: OS-level `bind()` reservations and file-based `flock()` locks. The file lock bridges the TOCTOU gap between closing the reservation socket and VICE binding to the port, so overlapping startup from independent processes is completely safe — no stagger delay needed. After VICE starts, PID ownership is verified via `/proc/net/tcp` to ensure the correct VICE process is listening. Failed acquisitions retry with exponential backoff (configurable via `max_retries`, default 3).
+**Port allocation is cross-process safe.** `ViceInstanceManager` uses `PortAllocator` internally with dual-layer protection: OS-level `bind()` reservations and file-based `flock()` locks. The file lock bridges the TOCTOU gap between closing the reservation socket and VICE binding to the port, so overlapping startup from independent processes is completely safe — no stagger delay needed. After VICE starts, PID ownership is verified via `/proc/net/tcp` (Linux) or `lsof` (macOS) to ensure the correct VICE process is listening. Failed acquisitions retry with exponential backoff (configurable via `max_retries`, default 3).
 
 **VICE startup crashes:** When 5+ VICE instances launch simultaneously, ~2 of 5 may crash with rc=1 due to X11/GTK resource contention. The manager detects this within ~1s and retries automatically. No special handling needed by callers.
 
@@ -1219,7 +1305,7 @@ if not result.reachable:
 ### 15. U64: reset() vs reboot()
 `reset()` is a soft C64 reset (6510 CPU only). `reboot()` reinitializes the entire FPGA including DMA controllers and REU. **Use `reboot()` when switching turbo speeds with REU-heavy workloads** — stale DMA state causes hangs. Allow ~8s for the device to become responsive after reboot.
 
-In backend-agnostic code, prefer `target.transport.reset(scope="cpu")` (soft) and `target.transport.reset(scope="machine")` (full). The dispatch maps to `client.reset()` / `client.reboot()` on U64 and `CMD_RESET 0` / `CMD_RESET 1` on VICE. See Pattern 13 in the named-patterns section above.
+In backend-agnostic code, prefer `target.transport.reset(scope="cpu")` (soft) and `target.transport.reset(scope="machine")` (full). The dispatch maps to `client.reset()` / `client.reboot()` on U64 and `CMD_RESET 0` / `CMD_RESET 1` on VICE. See Pattern 10 § "Cross-backend speed/reset variant".
 
 ### 16. U64: Stale Screen RAM After Reset
 `run_prg()` does a soft reset internally, but screen memory at $0400 persists. Never use `wait_for_text()` alone to detect program startup — poll for known code bytes (e.g. main_loop JMP) instead. See Pattern 10.
@@ -1246,7 +1332,7 @@ The `tod_timer.py` helpers and every `bridge_ping.build_*_tod_code` routine clai
 - `$F4` — BCD ones scratch
 - `$F5` — BCD raw scratch
 
-`bridge_ping._emit_read_frame` internally reuses `$F1-$F4` as temps — safe only because TOD loops fully release those slots before frame reads run. **Do NOT interleave TOD reads with frame reads inside one routine.**
+`bridge_ping._emit_read_frame` used to park RxStatus/RxLength in `$F1-$F4`, corrupting the TOD deadline on every dropped frame (issue #208); since #213 it uses only `$FB/$FC`. Your own routines must still keep `$F0-$F5` clear while a TOD deadline is live.
 
 ### 23. VICE TOD is Virtual-CPU-Clocked — Warp Accelerates It
 CIA TOD behavior differs by platform:

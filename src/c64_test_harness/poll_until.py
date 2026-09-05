@@ -40,9 +40,8 @@ This same pattern works for:
 
   * VICE + CS8900a RX polling (current consumer in
     :mod:`c64_test_harness.bridge_ping`).
-  * Future Ultimate 64 Elite UCI networking (UCI socket status registers
-    at ``$DF1C-$DF1F``): a UCI peek routine would poll its status register
-    instead of the CS8900a RxEvent.
+  * (UCI networking landed separately -- :mod:`c64_test_harness.uci_network`
+    and ``tests/test_uci_*.py`` -- and does not go through this helper.)
   * Any other "is the device ready yet" pattern where polling cost is
     negligible compared to wait time.
 
@@ -78,8 +77,9 @@ class _PollableTransport(Protocol):
 
     Any harness transport that exposes :func:`memory.read_bytes`,
     :func:`memory.write_bytes`, and :func:`execute.jsr` semantics
-    works.  In practice this is :class:`BinaryViceTransport` and
-    :class:`Ultimate64Transport`.
+    works.  In practice that is :class:`BinaryViceTransport` only:
+    :class:`Ultimate64Transport` has no ``jsr`` (issue #209), so on
+    hardware use the ``*_tod_code`` builders with ``run_subroutine``.
     """
 
 

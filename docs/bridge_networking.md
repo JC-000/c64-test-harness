@@ -656,15 +656,20 @@ read-modify-write on `$DE01` before the first PP access.
 
 Programming model:
 
-* **TX**: write `TxCMD = 0x00C0`, `TxLength = N`, then poll BusST
+* **TX**: write `TxCMD = CS8900A_TXCMD_VALUE` (`0x00C9`: transmit-after-full-frame
+  `0x00C0` plus the register number `0x09` in the read-only low 6 bits -- a bare
+  `0x00C0` is the same omission as the old RxCTL `0x00D8`), `TxLength = N`, then poll BusST
   (PP `0x0138` bit 8) for `Rdy4TxNOW`, then write N bytes to RTDATA.
-* **RX**: poll RxEvent (PP `0x0124` bit 8) for `RxOK`, then read 2
+* **RX**: poll the high byte of RxEvent (PP `0x0124`) masked with
+  `CS8900A_RXEVENT_MASK` (`0x0D` = RxOK | IndividualAdr | Broadcast, ip65's mask;
+  the old `AND #$01` missed frames the chip signalled without RxOK), then read 2
   bytes RxStatus + 2 bytes RxLength + N bytes frame data from RTDATA.
   **Read the two header words high-half-first** -- see "Real silicon"
   below; low-half-first works under VICE and desynchronises a real chip.
 * **MAC**: write 3 words to IA registers (PP `0x0158` -- `0x015D`).
-* **RxCTL** (PP `0x0104`): set to `CS8900A_RXCTL_VALUE` (`0x0D85`) to
-  accept broadcast and IA-matching unicast frames.  See
+* **RxCTL** (PP `0x0104`): set to `CS8900A_RXCTL_VALUE` (`0x0D85`, PromiscuousA
+  set -- accepts every frame on the segment; use `CS8900A_RXCTL_VALUE_IP65`
+  (`0x0D05`) for broadcast + IA-matching unicast only).  See
   `cs8900a_rxctl_code()` in `c64_test_harness.bridge_ping`.
 * **LineCTL** (PP `0x0112`): set bits 6 and 7 (`SerRxON` and
   `SerTxON`) to enable RX and TX.
@@ -679,10 +684,12 @@ because VICE is more forgiving than the chip.
 every control/status register reports its own register number in the low
 6 bits -- measured reset values say so throughout: RxCTL `0x0005`,
 LineCTL `0x0013`, SelfCTL `0x0015`, BusCTL `0x0017`, BusST `0x0018`.  The
-harness's old `0x00D8` therefore reads back as **`0x00C5`**, with `RxOKA`
-(`0x0100`) absent, and without `RxOKA` the receiver accepts nothing.
-VICE's rawnetarch forces `rx_ok` internally, which is the only reason
-`0x00D8` ever appeared to work.  `CS8900A_RXCTL_VALUE` is now `0x0D85`
+harness's old `0x00D8` reads back as **`0x00C5`** (bits 3-4 replaced by
+the register number).  The read-back is the tell, not the cause: the
+cause is that `0x00D8` never contained `RxOKA` (`0x0100`) at all, and
+without `RxOKA` the receiver accepts nothing.  It appeared to work under
+VICE because `cs8900.c`'s acceptance filter never consults `RxOKA` -- it
+accepts on the address filter alone.  `CS8900A_RXCTL_VALUE` is now `0x0D85`
 (PromiscuousA | RxOKA | IndividualA | BroadcastA + register number);
 `CS8900A_RXCTL_VALUE_IP65` (`0x0D05`) is the same without promiscuous,
 which is what ip65 programs and what you want on a busy segment.
@@ -693,20 +700,48 @@ first**; the data body is then read low half first.  That is ip65's
 `cs8900a.s` ordering.  Reading `$DE08` before `$DE09` for the header
 desynchronises the FIFO by one byte: `RxLength` comes back garbage and
 every data word arrives byte-swapped, so every offset-based check fails
-against a frame that is perfectly correct on the wire.  VICE tolerates
-either order.  `tests/test_cs8900a_frame_reader.py` pins the ordering as
-a unit test precisely because no VICE test can fail on it.
+against a frame that is perfectly correct on the wire.  VICE's `cs8900.c`
+implements the datasheet order as well (`:817-828`, citing §4.10.9) but
+advances its RX pointer on the *low* read, so a low-first header still
+left the body aligned there -- the four discarded header bytes were wrong
+even under VICE, and nothing checked them.  Real silicon advances
+differently and the body desynchronises.  `tests/test_cs8900a_frame_reader.py`
+pins the ordering as a unit test precisely because no VICE test can fail
+on it.
 
-**3. Host-side writes do not reach a hardware cartridge.**  On the U64,
-`transport.write_memory(0xDE02, ...)` goes through the machine's DMA
-engine and does not reach the expansion port -- a DMA read of `$DE00`
-returns `0A 0A 0A ...`, not the chip.  So `ethernet.set_cs8900a_mac()`,
-which programs the Individual Address host-side, is **VICE-only**: on
-hardware the MAC must be written by a 6502 routine.  (This is why
-`CS8900A_RXCTL_VALUE` keeps PromiscuousA: under VICE the same call also
-fails to reach the chip -- host writes land in the RAM under the I/O
-window -- so IndividualA filtering cannot be relied on in the bridge
-tests either.)
+**3. Host-side access never reaches a hardware cartridge -- but it does
+reach VICE's emulated one.**  On the U64, `transport.write_memory(0xDE02,
+...)` and `read_memory(0xDE00, ...)` go through the machine's REST/DMA
+path, which does not present the access on the expansion port: the bytes
+a read returns are not meaningful and not reproducible (one session read
+a constant `0A` x16; another read values that changed between
+back-to-back reads and a write that did not round-trip -- U64E fw 3.15
+`4011c97c`, `Cartridge Preference = Auto`, no PRG, at READY, cartridge
+fitted and linked; n=4 reads, n=1 write, with a control write to RAM at
+`$0340` round-tripping normally; c64-wireguard project measurement).
+Under VICE the same host path goes through bank `default`, which is the
+6510's current memory map (`c64mem.c:1422-1427` -> `mem_store` ->
+`c64io_de00_store`), so it **does** reach the emulated CS8900a:
+`set_cs8900a_mac(02:c6:40:00:00:77)` reads back on the 6510 as exactly
+that (measured, VICE 3.10, n=1), and `ViceInstanceManager` relies on it
+to assign per-instance MACs.  So `ethernet.set_cs8900a_mac()` is
+**useless on hardware**, not "VICE-only by design": on a real cartridge
+the MAC must be written by a 6502 routine --
+`cs8900a_set_mac_inline_code(mac)` (no RTS; prepend
+`cs8900a_enable_inline_code()`, which does the clockport enable) or the
+callable `cs8900a_set_mac_code(mac)`, both in
+`c64_test_harness.bridge_ping`.  Same advice on both platforms for
+opposite reasons; a reader who learns only one will draw the wrong
+conclusion on the other.  `CS8900A_RXCTL_VALUE` keeps PromiscuousA only
+to preserve the behaviour existing bridge tests and downstream consumers
+were written against -- IA filtering does work under VICE, and
+`CS8900A_RXCTL_VALUE_IP65` (`0x0D05`) is the value to reach for.
+
+**Two more alignments with ip65** landed in the same change and are not
+silicon-vs-VICE failures -- neither caused a measured fault:
+`CS8900A_TXCMD_VALUE` is `0x00C9` (the register number in the low 6 bits,
+not a bare `0x00C0`), and the RxEvent poll masks `CS8900A_RXEVENT_MASK` =
+`0x0D` (RxOK | IndividualAdr | Broadcast) instead of RxOK alone.
 
 ### Driving a cartridge on the U64
 
@@ -715,13 +750,35 @@ Two more hardware-only facts, both in issues #209 and #211:
 * The cartridge is invisible unless `C64 and Cartridge Settings` ->
   **`Cartridge Preference` = `External`**.  On the default `Auto` the
   whole `$DE00` window reads as zeros, which looks exactly like an empty
-  expansion port.  `Bus Operation Mode` is irrelevant.
-* **Do not start the program with `client.run_prg()`** -- its DMA-load
-  path drops the external cartridge, and the loaded program sees `$DE00`
-  as zeros even though the config still reads `External`.  Use
+  expansion port.  `Bus Operation Mode` is irrelevant.  **Raw `$DE00`
+  bytes are not a presence test from either side.**  A host-side
+  `read_memory` of the I/O window returns bytes that do not depend on the
+  cartridge and are not reproducible -- three observers reported three
+  different patterns for the same physical cartridge under the same
+  stated conditions (item 3 above).  A 6510 read gives zeros with
+  `Preference = Auto`, zeros after `client.run_prg()`, zeros with no
+  cartridge, and the CS8900a's registers (`FF FF` at `$DE00/$DE01`, then
+  PPPtr/PPData residue; measured 2026-09-04) with a working one -- so
+  "non-zero" is not "present" either.  The only valid test is the one
+  ip65's `eth_init` performs (`drivers/cs8900a.s:133-137`): clockport
+  enable, `PPPtr = $0000`, `PPData == $630E`, executed **on the 6510**.
+* **Do not start the program with `client.run_prg()`** -- after it, the
+  loaded program sees `$DE00` as zeros even though the config still reads
+  `External`, i.e. the external cartridge is left deselected.  The cause
+  is not isolated (the DMA load, the reset it performs, or something in
+  between); only the outcome is measured.  Use
   `run_prg_via_sys(target, prg)`, which writes the PRG into RAM and types
   `SYS`.  Stock ip65 `ping.prg` reports `INIT DRIVER: FAILED` under
   `run_prg` and pings normally under `run_prg_via_sys`.
+* **Send an ARP request before the first exchange with a host.**  The
+  harness's ping routines neither send nor answer ARP, and macOS keeps a
+  stale neighbour entry visible in `arp -n` while queuing every reply
+  behind revalidation -- so a routine that only pings gets 0/8 with the
+  requests visibly leaving the wire and the replies still sitting on the
+  host, and 6/6 once an ARP request precedes the ping (issue #212, closed
+  invalid: it was never a chip fault).  Any of: TX an ARP request first
+  (what ip65's `icmp_ping` does; `scripts/validate_ping.py` builds one),
+  add an ARP responder, or pin a static neighbour entry on the host.
 
 ## Capture-only sample (host tcpdump)
 
@@ -756,10 +813,9 @@ described here.
 
 The host-side pattern works in **both** normal and warp modes (verified
 10/10 each via `scripts/bridge_ping_demo.py [--warp]`) and is the same
-orchestration shape that will drive future Ultimate 64 Elite UCI
-networking tests -- a UCI peek routine would poll the socket-status
-register at `$DF1C-$DF1F` instead of CS8900a RxEvent and
-`poll_until_ready` would drive it identically.
+orchestration shape.  (UCI networking has since landed separately -- see
+`docs/uci_networking.md` and `tests/test_uci_*.py`; it does not go through
+`poll_until_ready`.)
 
 ### High-level entry points
 
@@ -802,6 +858,24 @@ warp mode independently of the poll-budget issue described above.  The
 plain bridge ping tests in this directory work fine in warp mode --
 the demo opts in via `--warp`.
 
+### ip65's shipped config is not zero
+
+ip65 ships `cfg_ip` pre-initialised to **192.168.1.64**, `cfg_netmask` to
+255.255.255.0, `cfg_gateway` to 192.168.1.1 and `cfg_mac` to
+`00:80:10:00:51:00` (`ip65/ip65/config.s:17-22`; only `cfg_dns` is zero).
+A DHCP check written as "`cfg_ip` is non-zero" therefore passes with the
+cable unplugged, and a "`cfg_mac` is non-zero" check proves nothing about
+whether `eth_init` ran -- the driver programs the chip's IA from its own
+table (`drivers/cs8900a.s:338-349`), and `ip65_init` copies that into
+`cfg_mac` afterwards.  Assert the lease for what it must be: an unpinned
+lease must fall **inside the configured DHCP pool**; a `dhcp-host`
+reservation must **equal the reservation exactly** (reservations normally
+sit outside the pool by design, so "inside the pool" is the wrong test for
+them).  In both branches reject the shipped default **by name**, with a
+message distinct from the zero case, because they mean opposite things:
+`192.168.1.64` = the DHCP code never ran; `0.0.0.0` = it ran and cleared
+the address.  (Found by the c64-wireguard project's red-green review.)
+
 ### Frame minimum size
 
 The CS8900a expects ethernet frames to be at least 60 bytes (minimum
@@ -820,8 +894,12 @@ Used by `tests/test_bridge_ping.py` and `scripts/bridge_ping_demo.py`.
 The Python test harness owns the wall clock: it pauses the 6502
 between iterations via the VICE binary monitor, checks host-side
 monotonic time, and decides when to time out.  This pattern works
-under **VICE normal mode**, **VICE warp mode** (for fast automated
-test runs), and for **Ultimate 64**-backed tests.
+under **VICE normal mode** and **VICE warp mode** (for fast automated
+test runs).  It is **VICE-only**: every orchestrator on it
+(`run_ping_and_wait`, `run_icmp_responder`, `poll_until_ready`) calls
+`jsr()`, which needs the binary monitor's register and checkpoint
+commands; `Ultimate64Transport` has no `jsr` (issue #209).  On the U64 use
+the `*_tod_code` builders below, started with `run_subroutine`.
 
 Relevant helpers: `build_tx_code`, `build_rx_echo_reply_code`,
 `build_ping_and_wait_code`, `build_icmp_responder_code` in
@@ -862,7 +940,7 @@ exposes three code builders:
   user-supplied 6502 "ready?" snippet and bails out when the TOD
   deadline elapses.  `peek_snippet` is raw 6502 bytes that must
   leave `Z=0` when the device is ready -- for CS8900a RxEvent this
-  is `LDA $DE05 / AND #$01`, for a UCI response-ready bit it would
+  is `LDA $DE05 / AND #$0D` (`CS8900A_RXEVENT_MASK`), for a UCI response-ready bit it would
   read the UCI status register, etc.  This is the generalization
   boundary for eventual UCI support.
 
@@ -875,7 +953,7 @@ Zero-page footprint: `$F0`-`$F5`.  Deadline cap: **599 tenths
 | ----------------------------------------------- | --- |
 | Pytest test on VICE normal mode                 | Either (test path is simpler) |
 | Pytest test on VICE warp mode                   | Test path (host-driven) |
-| Pytest test on Ultimate 64                      | Test path (host-driven) |
+| Pytest test on Ultimate 64                      | **Shippable path** (TOD builders via `run_subroutine`; `jsr` is VICE-only) |
 | Validate a 6502 ping routine end-to-end         | Either |
 | Ship a `.prg` on disk to a real C64 user        | **Shippable path** (TOD) |
 | Run on a standalone U64E with no host           | **Shippable path** (TOD) |

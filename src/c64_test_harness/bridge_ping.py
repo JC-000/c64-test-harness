@@ -356,8 +356,13 @@ def build_udp_frame(
     ttl
         IPv4 Time-To-Live.  Default 64 matches Linux/macOS hosts.
     ip_id
-        IPv4 Identification field.  Default 0; not used outside of
-        fragment reassembly, which this builder does not support.
+        IPv4 Identification field.  Default 0; this builder never
+        fragments, but a *receiver* that reassembles keyed on
+        (src, dst, proto, id) will fuse distinct datagrams that share
+        the default -- ip65's own reassembler did exactly that, silently
+        merging seven staged datagrams into two (found by the
+        c64-wireguard project).  Pass a distinct ``ip_id`` per datagram
+        when staging several.
 
     Returns
     -------
@@ -434,37 +439,33 @@ def build_udp_frame(
 #: On a real CS8900a the low 6 bits of every control/status register are
 #: **read-only and report the register's own number** -- measured reset
 #: values say so across the board (RxCTL 0x0005, LineCTL 0x0013, SelfCTL
-#: 0x0015, BusCTL 0x0017, BusST 0x0018).  So the harness's old 0x00D8 was
-#: never "RxCTL with flags": writing it reads back as **0x00C5**, with
-#: RxOKA (0x0100) absent, and without RxOKA the receiver accepts nothing.
-#: VICE's rawnetarch forces rx_ok internally, which is the only reason
-#: 0x00D8 ever appeared to work (issue #207).
+#: 0x0015, BusCTL 0x0017, BusST 0x0018).  The harness's old 0x00D8 reads
+#: back as **0x00C5** -- the tell, not the cause.  The cause is that
+#: 0x00D8 never contained RxOKA (0x0100) in the first place, and without
+#: RxOKA the receiver accepts nothing.  It appeared to work under VICE
+#: because cs8900.c's acceptance filter never consults RxOKA -- it accepts
+#: on the address filter alone (issue #207).
 #:
-#: PromiscuousA is kept because the harness's own VICE bridge tests lean
-#: on it: ``ethernet.set_cs8900a_mac`` programs the Individual Address
-#: with host-side ``write_memory``, which under VICE lands in the RAM
-#: under the I/O window rather than in the chip, so IndividualA filtering
-#: cannot be relied on there.  ip65's ``cs8900a.s`` uses 0x0D05 -- the
-#: same value without PromiscuousA -- which is the right choice for a
-#: real driver on a busy segment, where promiscuous mode floods the RX
+#: PromiscuousA is kept for one reason only: it is what every harness
+#: routine has always programmed, and dropping it would silently narrow
+#: what downstream tests receive.  It is *not* needed for correctness on
+#: either backend -- ``ethernet.set_cs8900a_mac`` does reach VICE's
+#: emulated chip (measured 2026-09-05: the 6510 reads the programmed IA
+#: back), and the VICE bridge suites pass with
+#: :data:`CS8900A_RXCTL_VALUE_IP65`.  ip65's ``cs8900a.s`` uses 0x0D05,
+#: the same value without PromiscuousA, which is the right choice for a
+#: real driver on a busy segment where promiscuous mode floods the RX
 #: FIFO with traffic the caller does not want.  Pass it explicitly to
 #: :func:`cs8900a_rxctl_inline_code` when that is what you want.
 CS8900A_RXCTL_VALUE = 0x0D85
 
-#: ip65's RxCTL value: the same thing without PromiscuousA, so the chip
-#: accepts only its own unicast plus broadcast.  That is the right choice
-#: for a real stack on a busy segment; the harness keeps promiscuous on by
-#: default because :func:`c64_test_harness.ethernet.set_cs8900a_mac`
-#: cannot reach the chip under VICE, so IndividualA filtering is not
-#: dependable in the bridge tests.  This is the one place the harness
-#: diverges from ip65 deliberately.
-CS8900A_RXCTL_VALUE_IP65 = 0x0D05
-
 #: TxCMD (PP 0x0108): "transmit after the whole frame is in the FIFO"
 #: (0x00C0) **plus the register's own number** in the low 6 bits, which is
-#: 0x09.  The harness wrote a bare 0x00C0 for years -- the same omission
-#: as the old RxCTL 0x00D8 (issue #207).  ip65 writes 0x00C9, and a real
-#: chip reads TxCMD back as 0x00C9.
+#: 0x09.  The harness wrote a bare 0x00C0 for years with no measured
+#: fault -- unlike the RxCTL case this is parity with ip65 (which writes
+#: 0x00C9), adopted so the two drivers program the chip identically, not
+#: a fix.  Whether a real chip reads PP 0x0108 back as 0x00C9 has not been
+#: measured; do not cite it.
 CS8900A_TXCMD_VALUE = 0x00C9
 
 #: Mask applied to the high byte of RxEvent (PP 0x0124) when polling for a
@@ -477,7 +478,8 @@ CS8900A_RXEVENT_MASK = 0x0D
 #: ip65's RxCTL value: RxOKA | IndividualA | BroadcastA + register number,
 #: i.e. :data:`CS8900A_RXCTL_VALUE` without PromiscuousA.  Accepts frames
 #: addressed to the programmed Individual Address plus broadcast, and
-#: nothing else.
+#: nothing else.  This is the one place the harness diverges from ip65
+#: on purpose; see :data:`CS8900A_RXCTL_VALUE` for why.
 CS8900A_RXCTL_VALUE_IP65 = 0x0D05
 
 #: LineCTL bits that let the chip move frames at all: SerRxON (bit 6) and
@@ -691,8 +693,11 @@ def _emit_read_frame(a: Asm, rx_buf: int) -> None:
     header words must be read HIGH half first; reading $DE08 before
     $DE09 desynchronises a real CS8900a's FIFO by one byte, after which
     RxLength is garbage and every data word arrives byte-swapped.  VICE's
-    emulation tolerates either order, which is why the bug survived until
-    the harness met real silicon.  This mirrors ip65's ``cs8900a.s``
+    cs8900.c implements the same datasheet order but advances its RX
+    pointer on the low read, so a low-first header still left the body
+    aligned there (the discarded header bytes were wrong even under VICE,
+    and nothing checked them) -- which is why the bug survived until the
+    harness met real silicon.  This mirrors ip65's ``cs8900a.s``
     exactly: high-half-first for the two header words, low-half-first for
     the data body.  Measured against a byte-ramp payload on a U64E with an
     external RR-Net cartridge; see issue #210 for the raw FIFO dumps.
@@ -722,10 +727,13 @@ def _emit_read_frame(a: Asm, rx_buf: int) -> None:
     a.branch(0xD0, "_rf_lp")
 
     # Skip the rest of the current packet so the CS8900a FIFO is
-    # advanced to the start of the next frame.  Always required: the FIFO
-    # does not roll on to the next frame by itself.  Measured on hardware
-    # -- one frame occupies exactly 4 header bytes + RxLength data bytes,
-    # and every read past that returns $00 until SkipNow is issued.
+    # advanced to the start of the next frame.  Needed here because the
+    # body read above is a fixed _FIXED_RX_BYTES, so a longer frame leaves
+    # a tail in the FIFO.  Measured on hardware: one frame occupies exactly
+    # 4 header bytes + RxLength data bytes, and every read past that
+    # returns $00 until SkipNow is issued.  ip65 reads the whole frame and
+    # never issues SkipNow; whether the skip is still required after a
+    # complete read is unmeasured.
     _emit_skip_packet(a)
 
 
@@ -1071,7 +1079,9 @@ def build_icmp_responder_code(
 
 
 # ---------------------------------------------------------------------------
-# Host-side wall-clock pattern (preferred -- works in VICE warp + on U64)
+# Host-side wall-clock pattern (preferred under VICE, warp included; VICE-only:
+# it is built on jsr(), which Ultimate64Transport does not have -- use the
+# *_tod_code builders with run_subroutine on hardware)
 # ---------------------------------------------------------------------------
 #
 # The legacy ``build_*_code`` functions above bake a 6502-cycle-denominated
@@ -1117,7 +1127,8 @@ def build_rx_peek_code(
 ) -> bytes:
     """Build a bounded CS8900a RxEvent peek routine.
 
-    Polls RxEvent (PP 0x0124, hi byte bit 0) for ``batch_size``
+    Polls RxEvent (PP 0x0124, hi byte masked with
+    :data:`CS8900A_RXEVENT_MASK`) for ``batch_size``
     iterations.  Writes ``0x01`` to ``result_addr`` if the bit is set
     on any iteration; writes ``0xFF`` if the loop runs to completion
     without seeing it.  RTSes immediately in either case.
@@ -1149,7 +1160,7 @@ def build_rx_peek_code(
 
     a.label("peek_loop")
     a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)  # LDA RxEvent hi
-    a.emit(0x29, CS8900A_RXEVENT_MASK)                               # AND #$01
+    a.emit(0x29, CS8900A_RXEVENT_MASK)               # AND #CS8900A_RXEVENT_MASK
     a.branch(0xD0, "peek_hit")                       # BNE -> hit
 
     # 16-bit decrement of $F0/$F1
@@ -1373,7 +1384,10 @@ def run_ping_and_wait(
 
     The wall-clock budget is owned by Python via
     :func:`c64_test_harness.poll_until.poll_until_ready`, so this works
-    correctly under VICE warp mode and on Ultimate 64 hardware.
+    correctly under VICE warp mode.  **VICE-only**: it is built on
+    :func:`~c64_test_harness.execute.jsr`, which
+    ``Ultimate64Transport`` does not provide (issue #209).  On hardware
+    use :func:`build_ping_and_wait_tod_code` with ``run_subroutine``.
     """
     import time as _time
     from .execute import jsr, load_code
