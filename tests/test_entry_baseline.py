@@ -450,7 +450,12 @@ class TestExclusions:
         assert ("global-reset", "*") not in client.requests
 
     @pytest.mark.parametrize("bad", ["Ethernet Settings", "Network Settings", "WiFi settings",
-                                     "ethernet settings", "Network*"])
+                                     "ethernet settings", "Network*",
+                                     # Not exact never-touch names: only the substring
+                                     # marker guard (_EXCLUDED_MARKERS) catches these,
+                                     # so a future firmware store cannot slip in.
+                                     "Ethernet Settings 2", "WiFi Client Settings",
+                                     "Wi-Fi settings", "Secondary Network Settings"])
     def test_passing_an_excluded_or_glob_category_is_refused_before_any_request(
         self, bad: str
     ) -> None:
