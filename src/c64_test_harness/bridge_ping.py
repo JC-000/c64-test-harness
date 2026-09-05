@@ -820,6 +820,12 @@ def _emit_tx_frame(a: Asm, frame_buf: int, frame_len: int, prefix: str) -> None:
     a.branch(0xD0, f"{prefix}_txlp")
 
 
+def _check_drain_status(drain_first: bool, drain_status_addr: int | None) -> None:
+    """``drain_status_addr`` without ``drain_first`` is a caller mistake."""
+    if drain_status_addr is not None and not drain_first:
+        raise ValueError("drain_status_addr given without drain_first")
+
+
 def _resolve_arp_frame(
     arp_frame_buf: int | None, arp_frame_len: int | None,
 ) -> tuple[int, int] | None:
@@ -871,6 +877,64 @@ def _emit_skip_packet(a: Asm) -> None:
     a.emit(0xAD, PPDATA_LO & 0xFF, PPDATA_LO >> 8)  # LDA PPData lo
     a.emit(0x09, 0x40)                                # ORA #$40
     a.emit(0x8D, PPDATA_LO & 0xFF, PPDATA_LO >> 8)  # STA PPData lo
+
+
+#: Upper bound on frames :func:`_emit_drain_rx` skips before giving up.
+#: The chip queues at most three (issue #219), so eight is already a
+#: "something keeps arriving" guard, not a capacity figure.
+DRAIN_RX_MAX_FRAMES = 8
+
+
+def _emit_drain_rx(
+    a: Asm,
+    prefix: str,
+    max_frames: int = DRAIN_RX_MAX_FRAMES,
+    status_addr: int | None = None,
+) -> None:
+    """Emit a bounded drain of the CS8900a RX queue: SkipNow every frame
+    that is pending, at most ``max_frames`` of them, then fall through.
+
+    With ``status_addr`` the budget left in X is stored there when the
+    drain ends: ``0`` means the bound was hit and frames may still be
+    queued (the routine goes on and transmits over them), ``n > 0`` means
+    the queue emptied after ``max_frames - n`` skips.  Without it the
+    exhaustion is silent.
+
+    Why (issue #222): frames that arrive while nobody reads sit in the
+    chip's queue, and an exchange started on top of them loses its reply
+    -- the chip counts it in RxMISS and never presents it.  Measured on a
+    U64E with an external RR-Net, point-to-point to a macOS host whose
+    periodic 342-byte UDP broadcasts land in the queue (2026-09-05, arms
+    interleaved, n=6 each): first ping after a fresh reset + init + 5 s
+    idle matched 3/6 without a drain and 6/6 with this drain first; every
+    miss had LinkOK set, the request and the reply on the wire, and
+    RxMISS +1, and every miss had a non-empty queue at the start while
+    every match without a drain had an empty one.
+
+    Uses X as the counter.  PPPtr is left at RxEvent (``$0124``) when the
+    queue emptied and at RxCFG (``$0102``, the last SkipNow) when the bound
+    was hit -- every caller re-sets PPPtr before its own poll.
+    Preconditions: clockport enabled.  Polls RxEvent's high byte (PP
+    ``$0124``, ``$DE05``) -- the read that presents the next frame (issue
+    #219) -- so each SkipNow releases exactly one queued frame.
+    """
+    if not 1 <= max_frames <= 255:
+        raise ValueError(f"max_frames must be 1..255, got {max_frames}")
+    if status_addr is not None and not 0 <= status_addr <= 0xFFFF:
+        raise ValueError(f"status_addr out of range: {status_addr:#x}")
+    a.emit(0xA2, max_frames)                                   # LDX #max
+    a.label(f"{prefix}_drain")
+    a.emit(0xA9, 0x24, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)     # PPPtr = $0124
+    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
+    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)             # LDA RxEvent hi
+    a.emit(0x29, CS8900A_RXEVENT_MASK)
+    a.branch(0xF0, f"{prefix}_drained")                        # BEQ -> nothing pending
+    _emit_skip_packet(a)
+    a.emit(0xCA)                                               # DEX
+    a.branch(0xD0, f"{prefix}_drain")                          # BNE loop
+    a.label(f"{prefix}_drained")
+    if status_addr is not None:
+        a.emit(0x8E, status_addr & 0xFF, status_addr >> 8)     # STX status
 
 
 def _emit_read_frame(a: Asm, rx_buf: int) -> None:
@@ -1169,6 +1233,8 @@ def build_ping_and_wait_code(
     *,
     arp_frame_buf: int | None = None,
     arp_frame_len: int | None = None,
+    drain_first: bool = False,
+    drain_status_addr: int | None = None,
 ) -> bytes:
     """Build a 6502 routine that TXes an echo request and waits for the reply.
 
@@ -1186,6 +1252,16 @@ def build_ping_and_wait_code(
     ARP reply that comes back is drained like any other non-matching frame.
     Without it the output is byte-identical to the pre-#218 routine.
 
+    ``drain_first`` (issue #222): SkipNow every frame already queued in
+    the chip before transmitting anything (:func:`_emit_drain_rx`, at
+    most :data:`DRAIN_RX_MAX_FRAMES`).  On real silicon an exchange
+    started with stale frames in the queue loses its reply (the chip
+    counts RxMISS +1 and never presents it); the first exchange after a
+    reset + init + idle is the usual victim.  Default ``False`` keeps the
+    routine byte-identical.  ``drain_status_addr`` (needs ``drain_first``)
+    receives the drain's remaining budget: ``0`` = bound hit, frames may
+    still be queued; ``n > 0`` = queue emptied after ``8 - n`` skips.
+
     .. note::
 
         Intended to pair with :func:`build_icmp_responder_code` running
@@ -1202,6 +1278,7 @@ def build_ping_and_wait_code(
         :func:`build_ping_and_wait_tod_code`.
     """
     arp = _resolve_arp_frame(arp_frame_buf, arp_frame_len)
+    _check_drain_status(drain_first, drain_status_addr)
     id_hi = (identifier >> 8) & 0xFF
     id_lo = identifier & 0xFF
     seq_hi = (sequence >> 8) & 0xFF
@@ -1210,6 +1287,8 @@ def build_ping_and_wait_code(
     a = Asm(org=load_addr)
     a.emit(0x78)  # SEI
     _emit_clockport_enable(a)
+    if drain_first:
+        _emit_drain_rx(a, "pw", status_addr=drain_status_addr)
 
     # --- TX the ARP request first if asked to (issue #218), then the echo ---
     if arp is not None:
@@ -2139,6 +2218,8 @@ def build_ping_and_wait_tod_code(
     *,
     arp_frame_buf: int | None = None,
     arp_frame_len: int | None = None,
+    drain_first: bool = False,
+    drain_status_addr: int | None = None,
 ) -> bytes:
     """Shippable-application ping-and-wait with CIA1 TOD timeout.
 
@@ -2148,7 +2229,9 @@ def build_ping_and_wait_tod_code(
 
     Steps:
 
-    1. Enable RR clockport; start CIA1 TOD at 00:00:00.0; store deadline.
+    1. Enable RR clockport; with ``drain_first`` SkipNow every frame
+       already queued (issue #222; see :func:`build_ping_and_wait_code`);
+       start CIA1 TOD at 00:00:00.0; store deadline.
     1a. If ``arp_frame_buf`` is given, TX the ARP request there first
         (issue #218; see :func:`build_ping_and_wait_code`).
     2. TX the frame at ``tx_frame_buf`` (length ``tx_frame_len``).
@@ -2171,6 +2254,12 @@ def build_ping_and_wait_tod_code(
         deadline_tenths: Timeout in tenths-of-a-second (1..599).
         arp_frame_buf: Optional ARP request to transmit first.
         arp_frame_len: Its length; defaults to :data:`ARP_FRAME_LEN`.
+        drain_first: Drain the chip's RX queue before transmitting
+            (issue #222).  Default ``False`` keeps the routine
+            byte-identical.
+        drain_status_addr: With ``drain_first``, where to store the
+            drain's remaining budget (``0`` = bound hit, frames may still
+            be queued; ``n > 0`` = queue emptied after ``8 - n`` skips).
 
     Raises:
         ValueError: if ``deadline_tenths`` is out of range, or
@@ -2178,6 +2267,7 @@ def build_ping_and_wait_tod_code(
     """
     _validate_deadline_tenths(deadline_tenths)
     arp = _resolve_arp_frame(arp_frame_buf, arp_frame_len)
+    _check_drain_status(drain_first, drain_status_addr)
     id_hi = (identifier >> 8) & 0xFF
     id_lo = identifier & 0xFF
     seq_hi = (sequence >> 8) & 0xFF
@@ -2186,6 +2276,8 @@ def build_ping_and_wait_tod_code(
     a = Asm(org=load_addr)
     a.emit(0x78)  # SEI
     _emit_clockport_enable(a)
+    if drain_first:
+        _emit_drain_rx(a, "pw", status_addr=drain_status_addr)
 
     _emit_tod_start_inline(a)
     a.emit(0xA9, deadline_tenths & 0xFF, 0x85, _ZP_DEADLINE_LO)

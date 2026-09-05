@@ -425,3 +425,138 @@ def test_inject_joystick_invalid_value_raises():
     with pytest.raises(ValueError, match="out of byte range"):
         t.inject_joystick(1, 0x100)
     fake_client.write_mem.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Issue #223: the firmware closes an idle connection after 1 s
+# ---------------------------------------------------------------------------
+#
+# ``software/network/socket_dma.cc`` sets SO_RCVTIMEO = 1 s on the accepted
+# socket and the command loop closes it on the first recv <= 0.  Measured on
+# the U64E (fw 3.15 fork, 2026-09-05): IDENTIFY after a 0.90 s gap 3/3 ok,
+# after 1.00 s "closed by peer" 3/3.  ``_FirmwareLikeSock`` models exactly
+# that against a fake clock: bytes written after the idle limit are never
+# read and every recv answers EOF.
+
+
+class _FirmwareLikeSock:
+    """One accepted SocketDMA connection as the firmware behaves."""
+
+    IDLE_CLOSE = 1.0
+
+    def __init__(self, clock) -> None:
+        self._clock = clock
+        self._last_cmd = clock()
+        self.closed_by_peer = False
+        self.sent: list[bytes] = []
+        self._replies: list[bytes] = []
+        self.closed = False
+
+    def settimeout(self, value) -> None:
+        pass
+
+    def sendall(self, data: bytes) -> None:
+        if self._clock() - self._last_cmd >= self.IDLE_CLOSE:
+            self.closed_by_peer = True
+        if self.closed_by_peer:
+            # The kernel accepts the bytes; the peer never reads them.
+            return
+        self.sent.append(bytes(data))
+        self._last_cmd = self._clock()
+        opcode = data[0] | (data[1] << 8)
+        if opcode == 0xFF0E:
+            self._replies.append(b"\x04FAKE")
+
+    def recv(self, n: int) -> bytes:
+        if self.closed_by_peer or not self._replies:
+            return b""
+        out = self._replies[0][:n]
+        self._replies[0] = self._replies[0][n:]
+        if not self._replies[0]:
+            self._replies.pop(0)
+        return out
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture
+def firmware_like(monkeypatch):
+    """SocketDMAClient against _FirmwareLikeSock with a controllable clock."""
+    from c64_test_harness.backends import u64_socket_dma as mod
+
+    state = {"now": 1000.0, "socks": []}
+
+    def clock() -> float:
+        return state["now"]
+
+    def create_connection(addr, timeout=None):
+        s = _FirmwareLikeSock(clock)
+        state["socks"].append(s)
+        return s
+
+    monkeypatch.setattr(mod.time, "monotonic", clock)
+    monkeypatch.setattr(mod.socket, "create_connection", create_connection)
+    return state
+
+
+def test_idle_gap_reopens_connection_before_next_command(firmware_like) -> None:
+    state = firmware_like
+    with SocketDMAClient(host="fake") as c:
+        assert c.identify() == {"title": "FAKE"}
+        state["now"] += 1.5                      # device closes the socket
+        assert c.identify() == {"title": "FAKE"}  # transparently reconnected
+        assert len(state["socks"]) == 2
+        assert state["socks"][0].closed is True
+        assert c.idle_reconnects == 1
+
+
+def test_within_idle_window_connection_is_reused(firmware_like) -> None:
+    state = firmware_like
+    with SocketDMAClient(host="fake") as c:
+        c.identify()
+        state["now"] += 0.5
+        c.identify()
+        assert len(state["socks"]) == 1
+        assert c.idle_reconnects == 0
+
+
+def test_idle_reconnect_threshold_is_below_the_firmware_timer(firmware_like) -> None:
+    """The default must reopen strictly before the device's 1 s close."""
+    from c64_test_harness.backends.u64_socket_dma import IDLE_RECONNECT_SECONDS
+
+    assert 0 < IDLE_RECONNECT_SECONDS < _FirmwareLikeSock.IDLE_CLOSE
+    state = firmware_like
+    with SocketDMAClient(host="fake") as c:
+        c.identify()
+        state["now"] += IDLE_RECONNECT_SECONDS + 1e-3   # at-or-past the threshold
+        c.identify()
+        assert len(state["socks"]) == 2
+
+
+def test_idle_reconnect_none_surfaces_the_peer_close(firmware_like) -> None:
+    state = firmware_like
+    with SocketDMAClient(host="fake", idle_reconnect=None) as c:
+        c.identify()
+        state["now"] += 1.5
+        with pytest.raises(Ultimate64Error, match="closed by peer.*idle"):
+            c.identify()
+        assert len(state["socks"]) == 1
+
+
+def test_fire_and_forget_after_idle_gap_is_not_lost(firmware_like) -> None:
+    """The dangerous case: DMAWRITE has no reply, so without the reconnect
+    the bytes vanish silently and only a later barrier notices."""
+    state = firmware_like
+    with SocketDMAClient(host="fake") as c:
+        c.identify()
+        state["now"] += 1.5
+        c.dma_write(0x4000, b"\x01\x02\x03\x04")
+        assert len(state["socks"]) == 2
+        assert state["socks"][1].sent[-1][:2] == b"\x06\xff"   # reached the peer
+        assert state["socks"][0].sent[-1][:2] != b"\x06\xff"
+
+
+def test_idle_reconnect_rejects_non_positive() -> None:
+    with pytest.raises(ValueError):
+        SocketDMAClient(host="fake", idle_reconnect=0)

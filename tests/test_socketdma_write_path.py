@@ -42,6 +42,11 @@ class FakeSocketDMAClient:
         self.connect_error = False          # raise Ultimate64Error on __enter__
         self.send_error_after: int | None = None  # raise on Nth dma_write (0-based)
         self.identify_error = False         # raise Ultimate64Error on identify()
+        # Issue #223 hooks: fail only the first N calls, the way a connection
+        # the firmware closed while idle fails once and a fresh one works.
+        self.identify_fail_first = 0        # identify() raises this many times
+        self.dma_fail_first = 0             # dma_write() raises this many times
+        self.dma_attempts = 0
 
     def __enter__(self) -> "FakeSocketDMAClient":
         self.enter_count += 1
@@ -56,6 +61,9 @@ class FakeSocketDMAClient:
         self.close_count += 1
 
     def dma_write(self, address: int, data: bytes) -> None:
+        self.dma_attempts += 1
+        if self.dma_attempts <= self.dma_fail_first:
+            raise Ultimate64Error("fake send failed: [Errno 32] Broken pipe")
         if (
             self.send_error_after is not None
             and len(self.dma_calls) >= self.send_error_after
@@ -67,6 +75,8 @@ class FakeSocketDMAClient:
     def identify(self) -> dict:
         self.identify_calls += 1
         self.events.append("identify")
+        if self.identify_calls <= self.identify_fail_first:
+            raise Ultimate64Error("SocketDMA connection closed by peer (fake)")
         if self.identify_error:
             raise Ultimate64Error("fake identify failed")
         return {"title": "FAKE ULTIMATE 64"}
@@ -402,6 +412,194 @@ def test_barrier_recv_timeout_scaled_with_payload(
     t.write_memory(0x0000, data)
 
     assert fake._sock.timeouts == [5.0 + 65536 / 4096.0, 5.0]
+
+
+# ---------------------------------------------------------------------------
+# Issue #223: one retry on a fresh connection before the REST fallback
+# ---------------------------------------------------------------------------
+#
+# Measured on the U64E (fw 3.15 fork, 2026-09-05, scratchpad exp223.py): the
+# firmware closes a SocketDMA connection idle for >1 s, the first DMAWRITE
+# into that socket is never read (the data was in RAM 0/50 times), and the
+# barrier then fails with "connection closed by peer" 50/50 -- idle and
+# under a 100 ms REST poll alike -- while 0.2 s gaps never failed (0/50).
+# The fix is to retry the whole send + barrier once on a fresh connection;
+# these tests were red on the pre-fix transport, which fell straight back
+# to REST.
+
+
+def test_barrier_closed_by_peer_retries_once_on_fresh_connection(
+    mock_client: MagicMock, install_fake, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake, _ = install_fake
+    fake.identify_fail_first = 1
+    data = _payload(8192)
+    mock_client.read_mem.return_value = data[-16:]
+    t = Ultimate64Transport(host="h", client=mock_client, socket_dma=True)
+
+    with caplog.at_level("WARNING"):
+        t.write_memory(0x4000, data)
+
+    # Same bytes re-sent to the same address, barrier run again, and the
+    # connection dropped + reopened in between.
+    assert fake.events == ["dma_write", "identify", "dma_write", "identify"]
+    assert fake.dma_calls == [(0x4000, data), (0x4000, data)]
+    assert fake.close_count == 1
+    assert fake.enter_count == 2
+    # The retry succeeded: no REST fallback, tail verified.
+    mock_client.write_mem.assert_not_called()
+    mock_client.read_mem.assert_called()
+    assert any("retrying once" in r.message for r in caplog.records)
+
+
+def test_send_failure_on_reused_connection_retries_once(
+    mock_client: MagicMock, install_fake
+) -> None:
+    """A DMAWRITE into a socket the device already closed can fail at the
+    send (EPIPE) instead of at the barrier; that is retried the same way."""
+    fake, _ = install_fake
+    fake.dma_fail_first = 1
+    data = _payload(8192)
+    mock_client.read_mem.return_value = data[-16:]
+    t = Ultimate64Transport(host="h", client=mock_client, socket_dma=True)
+
+    t.write_memory(0x5000, data)
+
+    assert fake.events == ["dma_write", "identify"]
+    assert fake.dma_calls == [(0x5000, data)]
+    assert fake.dma_attempts == 2
+    assert fake.close_count == 1
+    mock_client.write_mem.assert_not_called()
+
+
+def test_retry_is_exactly_one_then_rest_fallback(
+    mock_client: MagicMock, install_fake, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Two failures in a row -> REST fallback; no third attempt, no latch."""
+    fake, _ = install_fake
+    fake.identify_error = True
+    data = _payload(8192)
+    t = Ultimate64Transport(host="h", client=mock_client, socket_dma=True)
+
+    with caplog.at_level("WARNING"):
+        t.write_memory(0x4000, data)
+
+    assert fake.identify_calls == 2
+    assert fake.dma_calls == [(0x4000, data), (0x4000, data)]
+    mock_client.write_mem.assert_called_once_with(0x4000, data)
+    assert t._socket_dma_unusable is False
+    assert any("on the retry as well" in r.message for r in caplog.records)
+
+
+def test_retry_reconnect_failure_falls_back_without_latch(
+    mock_client: MagicMock, install_fake
+) -> None:
+    """If the fresh connection cannot be opened, this write goes to REST
+    and the fast path is NOT latched off (the device may just be busy)."""
+    fake, _ = install_fake
+    fake.identify_fail_first = 1
+    data = _payload(8192)
+    t = Ultimate64Transport(host="h", client=mock_client, socket_dma=True)
+
+    real_enter = fake.__enter__
+
+    def enter_once_then_refuse():
+        if fake.enter_count >= 1:
+            fake.enter_count += 1
+            raise Ultimate64Error("fake reconnect refused")
+        return real_enter()
+
+    fake.__enter__ = enter_once_then_refuse  # type: ignore[method-assign]
+    t.write_memory(0x4000, data)
+
+    assert fake.identify_calls == 1
+    mock_client.write_mem.assert_called_once_with(0x4000, data)
+    assert t._socket_dma_unusable is False
+
+
+@pytest.mark.parametrize(
+    "addr, size",
+    [(0xD000, 8192), (0xCFF0, 0x20), (0xDFF0, 0x20), (0xC000, 0x2000)],
+    ids=["inside", "ends-inside", "starts-inside", "spans-to-DFFF"],
+)
+def test_no_retry_for_a_span_touching_the_io_window(
+    mock_client: MagicMock, install_fake, caplog: pytest.LogCaptureFixture,
+    addr: int, size: int,
+) -> None:
+    """A second DMA into $D000-$DFFF is a second register write with side
+    effects, so a failed fast-path write there is not re-sent: straight to
+    REST (which writes exactly once)."""
+    fake, _ = install_fake
+    fake.identify_fail_first = 1
+    data = _payload(size)
+    t = Ultimate64Transport(host="h", client=mock_client, socket_dma=True,
+                            socket_dma_min_bytes=1)
+
+    with caplog.at_level("WARNING"):
+        t.write_memory(addr, data)
+
+    assert fake.dma_calls == [(addr, data)]
+    assert fake.identify_calls == 1
+    mock_client.write_mem.assert_called_once_with(addr, data)
+    assert any("I/O window" in r.message for r in caplog.records)
+
+
+def test_retry_still_happens_just_below_the_io_window(
+    mock_client: MagicMock, install_fake
+) -> None:
+    fake, _ = install_fake
+    fake.identify_fail_first = 1
+    data = _payload(0x1000)                      # $C000-$CFFF
+    mock_client.read_mem.return_value = data[-16:]
+    t = Ultimate64Transport(host="h", client=mock_client, socket_dma=True,
+                            socket_dma_min_bytes=1)
+
+    t.write_memory(0xC000, data)
+
+    assert fake.dma_calls == [(0xC000, data), (0xC000, data)]
+    mock_client.write_mem.assert_not_called()
+
+
+def test_barrier_timeout_restore_survives_a_socket_closed_by_the_client(
+    mock_client: MagicMock, install_fake
+) -> None:
+    """Live-caught (U64E, 2026-09-05): when the peer has closed the
+    connection the client closes its socket inside identify(), and the
+    barrier's timeout restore then hits a dead descriptor.  That OSError
+    must not escape the fast path -- the retry has to run."""
+
+    class _ClosingSock:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def settimeout(self, value: float) -> None:
+            if self.closed:
+                raise OSError(9, "Bad file descriptor")
+
+    fake, _ = install_fake
+    sock = _ClosingSock()
+    fake._sock = sock
+    fake._timeout = 5.0
+    real_identify = fake.identify
+
+    def identify_closing_on_first_failure() -> dict:
+        if fake.identify_calls == 0:
+            fake.identify_calls += 1
+            fake.events.append("identify")
+            sock.closed = True                      # what _recv_exact does
+            fake._sock = _ClosingSock()             # ...and the reconnect
+            raise Ultimate64Error("SocketDMA connection closed by peer")
+        return real_identify()
+
+    fake.identify = identify_closing_on_first_failure  # type: ignore[method-assign]
+    data = _payload(8192)
+    mock_client.read_mem.return_value = data[-16:]
+    t = Ultimate64Transport(host="h", client=mock_client, socket_dma=True)
+
+    t.write_memory(0x4000, data)          # must not raise OSError
+
+    assert fake.dma_calls == [(0x4000, data), (0x4000, data)]
+    mock_client.write_mem.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
