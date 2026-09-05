@@ -272,7 +272,9 @@ Run both together for a bench that is supposed to be fully wired (e.g. before tr
 C64_REQUIRE_VICE=1 C64_REQUIRE_ELEVATION=1 ~/.local/share/c64-test-harness/venv/bin/pytest tests/test_ethernet.py tests/test_bpf_attach_detection.py -rs
 ```
 
-## Making the `c64-test` Claude Code skill available globally
+### `WAV_CAPTURES_REFRESH` — refreshing the committed audio captures
+
+The `U64_HOST`-gated capture suites (`tests/test_chromatic_capture_live.py`, `tests/test_multi_sid_parallel_live.py`) write their `.wav` + `.json` output to a per-run `tmp_path` directory by default, so an ordinary bench run never modifies the tracked reference under `tests/wav_captures/` (issue #220: a live run used to leave ten tracked files changed with no test failing, and the reference drifted with every run). Set `WAV_CAPTURES_REFRESH=1` to write into `tests/wav_captures/<suite>/` instead — a deliberate refresh to review and commit on purpose. The path decision is `tests/wav_capture_paths.py:capture_dir()`; `tests/test_wav_capture_paths.py` pins it without hardware.
 
 The harness ships a Claude Code skill at `.claude/skills/c64-test/` that teaches agents how to use the Python package (see the files next to it — `SKILL.md`, `REFERENCE.md`, `PATTERNS.md`). By default the skill is only discovered when Claude Code starts inside the harness repo. Most users work across multiple C64 projects (e.g. `c64-https`, `c64-x25519`, `c64-ChaCha20-Poly1305`) and want the skill loaded in those sessions too.
 

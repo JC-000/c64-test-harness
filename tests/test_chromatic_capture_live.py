@@ -3,12 +3,14 @@
 Captures 14-second WAV files of a 25-note chromatic scale (C3-C5) played
 through four different SID configurations: three UltiSID FPGA emulation
 modes (6581 curve, 8580 Lo curve, 8580 Hi curve) and the physical 8580
-chip.  Each test writes a WAV file and a JSON metadata sidecar to
-``tests/wav_captures/chromatic/``.
+chip.  Each test writes a WAV file and a JSON metadata sidecar.
 
-These WAV outputs are committed artifacts -- they are the primary output
-of this test suite, useful for offline spectral analysis and A/B
-comparison of filter curves.
+The committed reference captures live in ``tests/wav_captures/chromatic/``
+and are useful for offline spectral analysis and A/B comparison of filter
+curves.  A live run writes to a per-run scratch directory by default and
+only refreshes the tracked reference under ``WAV_CAPTURES_REFRESH=1``
+(issue #220; see ``tests/wav_capture_paths.py``), so an ordinary bench
+run never dirties the working tree or silently drifts the reference.
 
 Requirements:
     - ``U64_HOST`` env var pointing at a reachable Ultimate 64 device
@@ -44,9 +46,9 @@ from c64_test_harness.backends.render_wav_u64 import capture_sid_u64  # noqa: E4
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client  # noqa: E402
 from c64_test_harness.sid import SidFile  # noqa: E402
 
-logger = logging.getLogger(__name__)
+from wav_capture_paths import capture_dir  # noqa: E402
 
-WAV_DIR = Path(__file__).parent / "wav_captures" / "chromatic"
+logger = logging.getLogger(__name__)
 
 # Skip entire module when no U64 device is available.
 pytestmark = pytest.mark.skipif(
@@ -125,6 +127,15 @@ SID_CONFIGS = [
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
+def wav_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Where this module's captures go: scratch unless WAV_CAPTURES_REFRESH=1."""
+    path = capture_dir("chromatic", tmp_path_factory.mktemp("chromatic_captures"))
+    path.mkdir(parents=True, exist_ok=True)
+    logger.info("chromatic captures -> %s", path)
+    return path
+
+
+@pytest.fixture(scope="module")
 def u64_client():
     """Connect to the U64, holding a cross-process DeviceLock for the session."""
     host = os.environ.get("U64_HOST")
@@ -166,11 +177,9 @@ def u64_client():
     SID_CONFIGS,
     ids=[c["name"] for c in SID_CONFIGS],
 )
-def test_chromatic_capture(u64_client, config):
+def test_chromatic_capture(u64_client, wav_dir: Path, config):
     """Capture chromatic scale WAV for a given SID configuration."""
-    WAV_DIR.mkdir(parents=True, exist_ok=True)
-
-    wav_path = WAV_DIR / f"chromatic_{config['name']}.wav"
+    wav_path = wav_dir / f"chromatic_{config['name']}.wav"
 
     # 1. Configure SID address routing (isolate source)
     u64_client.set_config_items("SID Addressing", config["addressing"])
@@ -239,10 +248,10 @@ def test_chromatic_capture(u64_client, config):
 # Summary validation
 # ---------------------------------------------------------------------------
 
-def test_all_captures_present(u64_client):
+def test_all_captures_present(u64_client, wav_dir: Path):
     """Verify all expected WAV files were generated."""
     for config in SID_CONFIGS:
-        wav = WAV_DIR / f"chromatic_{config['name']}.wav"
+        wav = wav_dir / f"chromatic_{config['name']}.wav"
         assert wav.exists(), f"Missing: {wav.name}"
         assert wav.stat().st_size > 10000, (
             f"Too small: {wav.name} ({wav.stat().st_size} bytes)"
