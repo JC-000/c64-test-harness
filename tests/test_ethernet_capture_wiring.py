@@ -465,14 +465,19 @@ def test_resolve_capture_ifaces_defaults_to_the_vice_interface():
 
 
 def test_resolve_capture_ifaces_reads_the_two_env_knobs():
+    # Inject the presence check: without it this unit test consults the
+    # real host (bridge_platform.iface_present) and passes only while a
+    # feth pair happens to exist -- it failed the moment the bridge was
+    # torn down.  Presence validation has its own test below.
+    present = lambda _iface: True  # noqa: E731
     env = {"C64_ETH_CAPTURE_IFACE": "feth1"}
-    assert resolve_capture_ifaces("feth0", env) == ("feth1", "feth1"), (
+    assert resolve_capture_ifaces("feth0", env, iface_present=present) == ("feth1", "feth1"), (
         "the send side follows the capture side unless overridden separately"
     )
     env = {"C64_ETH_CAPTURE_IFACE": "feth1", "C64_ETH_SEND_IFACE": "feth0"}
-    assert resolve_capture_ifaces("feth0", env) == ("feth1", "feth0")
+    assert resolve_capture_ifaces("feth0", env, iface_present=present) == ("feth1", "feth0")
     env = {"C64_ETH_SEND_IFACE": "feth1"}
-    assert resolve_capture_ifaces("feth0", env) == ("feth0", "feth1")
+    assert resolve_capture_ifaces("feth0", env, iface_present=present) == ("feth0", "feth1")
 
 
 def test_resolve_capture_ifaces_ignores_blank_values():

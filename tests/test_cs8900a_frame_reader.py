@@ -3,9 +3,11 @@
 These are unit tests on purpose.  Both bugs they guard are invisible to
 the two-VICE bridge suite:
 
-* **#210 (RTDATA half ordering).**  VICE's CS8900a emulation tolerates
-  either order, so ``tests/test_bridge_ping.py`` passes with the reader
-  correct *or* broken.  Real silicon does not: reading ``$DE08`` before
+* **#210 (RTDATA half ordering).**  VICE's cs8900.c advances its RX
+  pointer on the low read, so a low-first header still leaves the body
+  aligned under VICE and ``tests/test_bridge_ping.py`` passes with the
+  reader correct *or* broken (its byte-offset assertions never see the
+  four wrong header bytes).  Real silicon does not: reading ``$DE08`` before
   ``$DE09`` desynchronises the FIFO by one byte, RxLength comes back
   garbage and every data word arrives byte-swapped.  Only hardware can
   fail on that, and hardware is not in the default suite -- so the order

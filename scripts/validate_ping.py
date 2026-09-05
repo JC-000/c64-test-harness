@@ -34,7 +34,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from c64_test_harness.bridge_ping import CS8900A_RXCTL_VALUE
+from c64_test_harness.bridge_ping import CS8900A_RXCTL_VALUE, CS8900A_TXCMD_VALUE
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 from c64_test_harness.backends.vice_manager import PortAllocator
@@ -211,7 +211,7 @@ def _make_tx_then_rx(frame_len: int, rx_words: int = 80) -> bytes:
     a.emit(0x78)  # SEI
     _emit_cp_enable(a)
     # -- TX setup --
-    a.emit(0xA9, 0xC0, 0x8D, _TC_LO, 0xDE)
+    a.emit(0xA9, CS8900A_TXCMD_VALUE & 0xFF, 0x8D, _TC_LO, 0xDE)   # $C9: regnum in low 6 bits (#207/#213)
     a.emit(0xA9, 0x00, 0x8D, _TC_HI, 0xDE)
     a.emit(0xA9, frame_len & 0xFF, 0x8D, _TL_LO, 0xDE)
     a.emit(0xA9, (frame_len >> 8) & 0xFF, 0x8D, _TL_HI, 0xDE)
@@ -253,14 +253,15 @@ def _make_tx_then_rx(frame_len: int, rx_words: int = 80) -> bytes:
            0x58, 0x60)
 
     a.label("rxg")
-    # RxStatus + RxLength -> RX_META
-    a.emit(0xAD, _RT_LO, 0xDE, 0x8D, RX_META & 0xFF, (RX_META >> 8) & 0xFF)
+    # RxStatus + RxLength -> RX_META, HIGH half read first (datasheet
+    # order; real silicon desynchronises on a low-first header, #210)
     a.emit(0xAD, _RT_HI, 0xDE, 0x8D, (RX_META + 1) & 0xFF,
            ((RX_META + 1) >> 8) & 0xFF)
-    a.emit(0xAD, _RT_LO, 0xDE, 0x8D, (RX_META + 2) & 0xFF,
-           ((RX_META + 2) >> 8) & 0xFF)
+    a.emit(0xAD, _RT_LO, 0xDE, 0x8D, RX_META & 0xFF, (RX_META >> 8) & 0xFF)
     a.emit(0xAD, _RT_HI, 0xDE, 0x8D, (RX_META + 3) & 0xFF,
            ((RX_META + 3) >> 8) & 0xFF)
+    a.emit(0xAD, _RT_LO, 0xDE, 0x8D, (RX_META + 2) & 0xFF,
+           ((RX_META + 2) >> 8) & 0xFF)
     # Read frame data
     a.emit(0xA9, RX_BUF & 0xFF, 0x85, 0xFB)
     a.emit(0xA9, (RX_BUF >> 8) & 0xFF, 0x85, 0xFC)

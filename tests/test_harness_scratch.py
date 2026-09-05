@@ -222,7 +222,7 @@ class TestBoundsMatchCode:
                 my_ip=bytes(4), result_addr=0xC0FF,
             )),
         )
-        assert consume.length == largest  # tx 79, match 143, respond 357
+        assert consume.length == largest  # tx 79, match 135, respond 349 (post-#213)
 
     def test_reu_staging_window_matches_snapshot_constants(self) -> None:
         from c64_test_harness import snapshot as s

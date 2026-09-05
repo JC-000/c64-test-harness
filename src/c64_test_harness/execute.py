@@ -12,6 +12,7 @@ Ultimate 64.
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -22,6 +23,8 @@ if TYPE_CHECKING:
 from .execution_policy import check_execution_policy
 from .memory_policy import MemoryPolicyError
 from .transport import TransportError, TimeoutError
+
+logger = logging.getLogger(__name__)
 
 _VALID_REGS = {"A", "X", "Y", "SP", "PC"}
 
@@ -776,31 +779,129 @@ def _run_subroutine_u64(
 # Starting a PRG without losing the expansion port (issue #211)
 # ---------------------------------------------------------------------------
 
-#: BASIC token for ``SYS``.
+#: BASIC tokens for ``SYS`` and ``REM``.
 _BASIC_TOKEN_SYS = 0x9E
+_BASIC_TOKEN_REM = 0x8F
 
 
-def parse_basic_sys_address(prg: bytes) -> int | None:
+def parse_basic_sys_address(prg: bytes, *, basic_start: int = 0x0801) -> int | None:
     """Return the address a PRG's BASIC stub ``SYS``es to, or ``None``.
 
-    Scans the BASIC line for the ``SYS`` token (``$9E``) and reads the
-    decimal digits that follow it, which is the shape cc65 and most
-    assemblers emit (``10 SYS2061``).
+    Walks the tokenised BASIC program the way the interpreter does --
+    ``link(2) line#(2) tokens... $00`` per line, stopping at a zero link --
+    and looks for the ``SYS`` token (``$9E``) **only inside token bytes**,
+    reading its decimal operand (optionally parenthesised).  A PRG whose
+    load address is not *basic_start* is not a BASIC program and yields
+    ``None`` regardless of its contents.
+
+    The structure matters (adversarial review, 2026-09-05): a search for
+    the first ``$9E`` byte anywhere in the body turned a stubless
+    machine-code PRG containing ``A2 9E 31 32`` into ``SYS12`` -- a jump
+    into zero page -- and mistook line number 158 (stored as ``9E 00``)
+    for the token.  ``chr(b).isdigit()`` also accepted ``$B2``/``$B3``/
+    ``$B9`` (superscript digits), so the operand parse could raise.
     """
-    body = prg[2:]
-    idx = body.find(bytes([_BASIC_TOKEN_SYS]))
-    if idx < 0:
+    if len(prg) < 2:
         return None
-    digits = ""
-    for byte in body[idx + 1:]:
-        ch = chr(byte)
-        if ch == " " and not digits:
-            continue
-        if ch.isdigit():
-            digits += ch
-        else:
-            break
-    return int(digits) if digits else None
+    load = prg[0] | (prg[1] << 8)
+    if load != basic_start:
+        return None
+    body = prg[2:]
+    pos = 0
+    while pos + 4 <= len(body):
+        link = body[pos] | (body[pos + 1] << 8)
+        if link == 0:
+            return None
+        end = body.find(b"\x00", pos + 4)
+        if end < 0:
+            return None
+        tokens = body[pos + 4:end]
+        # Scan the line as the interpreter would: bytes inside quotes and
+        # everything after a REM token ($8F) are literal text, not tokens.
+        i, in_string = -1, False
+        for k, b in enumerate(tokens):
+            if b == 0x22:
+                in_string = not in_string
+            elif in_string:
+                continue
+            elif b == _BASIC_TOKEN_REM:
+                break
+            elif b == _BASIC_TOKEN_SYS:
+                i = k
+                break
+        if i >= 0:
+            j = i + 1
+            while j < len(tokens) and tokens[j] in (0x20, 0x28):   # space, '('
+                j += 1
+            digits = bytearray()
+            while j < len(tokens) and 0x30 <= tokens[j] <= 0x39:
+                digits.append(tokens[j])
+                j += 1
+            return int(digits.decode("ascii")) if digits else None
+        nxt = link - load
+        if nxt <= pos or nxt > len(body):
+            return None
+        pos = nxt
+    return None
+
+
+#: How much of the program head :func:`_write_prg_body_verified` re-checks.
+_PRG_HEAD_VERIFY_BYTES = 64
+
+
+def _write_prg_body_verified(transport: Any, load_addr: int, body: bytes,
+                             *, timeout: float = 10.0) -> None:
+    """Write *body* at *load_addr* and keep re-writing its head until it
+    reads back intact.
+
+    On the U64, a write issued right after ``reset()`` -> ``READY.`` does
+    not reliably retain its first bytes: ``$0801/$0802`` read back as
+    ``00 00`` -- BASIC's empty-program pointer, i.e. possibly *reverted*
+    rather than cleared -- with the remaining 6084 untouched; the same
+    write after a 5 s settle, or with no reset, is clean (c64-wireguard,
+    paired trials, 2026-09-05: write-immediately, +2 s not retained; +5 s
+    and no-reset clean).
+    The best candidate mechanism is the boot sequence's upward RAM walk,
+    which this bench had seen clobber DMA writes at ``$4000+`` for ~1-3 s
+    -- but the two measurements do not agree on the window, so a fixed
+    settle would be a guess.  Read-back-and-retry needs no window: it
+    verifies the head, rewrites it when wrong, and gives up loudly.
+
+    The whole body is written once; only the head is re-verified and
+    re-written, because that is where every observed clobber landed.  A
+    final full read-back compare catches anything else and raises rather
+    than retrying, since a mid-body mismatch is a different problem.
+    """
+    from .memory import write_bytes
+
+    write_bytes(transport, load_addr, body)
+    head = body[:_PRG_HEAD_VERIFY_BYTES]
+    deadline = time.monotonic() + timeout
+    attempts = 0
+    while transport.read_memory(load_addr, len(head)) != head:
+        attempts += 1
+        if time.monotonic() > deadline:
+            raise TransportError(
+                f"program head at ${load_addr:04X} never read back intact after "
+                f"{attempts} rewrite(s) in {timeout}s -- something is still "
+                "clobbering RAM after the reset (see _write_prg_body_verified)"
+            )
+        time.sleep(0.5)
+        write_bytes(transport, load_addr, head)
+    if attempts:
+        logger.warning(
+            "run_prg_via_sys: program head at $%04X was clobbered after the "
+            "reset and rewritten (%d attempt(s))", load_addr, attempts,
+        )
+    tail_from = len(head)
+    if len(body) > tail_from:
+        got = transport.read_memory(load_addr + tail_from, len(body) - tail_from)
+        if got != body[tail_from:]:
+            first = next(i for i, (a, b) in enumerate(zip(got, body[tail_from:])) if a != b)
+            raise TransportError(
+                f"program body mismatch at ${load_addr + tail_from + first:04X} "
+                "after a clean head -- not the known head-clobber; refusing to SYS"
+            )
 
 
 def run_prg_via_sys(
@@ -810,6 +911,7 @@ def run_prg_via_sys(
     sys_addr: int | None = None,
     reset: bool = True,
     boot_timeout: float = 25.0,
+    verify_timeout: float = 10.0,
 ) -> int:
     """Load *prg* into RAM and start it with a ``SYS`` typed at BASIC.
 
@@ -823,7 +925,8 @@ def run_prg_via_sys(
     the program into RAM and typing ``SYS`` keeps the cartridge on the bus
     (issue #211).
 
-    Works on either backend: it is only ``write_memory`` plus keystrokes.
+    Works on either backend: ``write_memory`` plus keystrokes, then a
+    resume so the typed line actually runs under VICE.
 
     :param target: A ``TestTarget`` or a bare transport.
     :param prg: Raw PRG bytes, including the two-byte load address.
@@ -832,14 +935,18 @@ def run_prg_via_sys(
     :param reset: Reset and wait for ``READY.`` first.  Pass ``False`` if
         the machine is already at a BASIC prompt.
     :param boot_timeout: Seconds to wait for ``READY.`` after the reset.
+    :param verify_timeout: Seconds to keep re-writing the head of the
+        program until it reads back intact (see
+        :func:`_write_prg_body_verified`).
     :returns: The SYS address used.
     :raises ValueError: if *prg* is too short, or no entry point was given
         and none could be parsed from the stub.
     :raises TimeoutError: if the machine never reaches ``READY.``.
+    :raises TransportError: if the program never reads back intact.
     """
     from .keyboard import send_text
     from .memory import write_bytes
-    from .screen import wait_for_text
+    from .screen import _resume_quietly, wait_for_text
 
     if len(prg) < 3:
         raise ValueError(f"PRG too short to contain a load address: {len(prg)} bytes")
@@ -866,6 +973,13 @@ def run_prg_via_sys(
             )
 
     load_addr = prg[0] | (prg[1] << 8)
-    write_bytes(transport, load_addr, prg[2:])
+    _write_prg_body_verified(transport, load_addr, prg[2:], timeout=verify_timeout)
     send_text(transport, f"SYS{sys_addr}\r")
+    # Under VICE both write_memory and inject_keys are monitor commands
+    # and each halts the 6510; without a resume the typed SYS sits in the
+    # keyboard buffer on a stopped machine until the caller happens to
+    # resume (found by the red/green review, 2026-09-05: a live VICE test
+    # that sleeps and then reads a marker fails without this).  The U64
+    # halts on neither, which is why the hardware validation never saw it.
+    _resume_quietly(transport)
     return sys_addr
