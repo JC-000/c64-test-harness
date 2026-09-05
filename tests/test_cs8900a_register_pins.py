@@ -119,21 +119,36 @@ _POLL_HI = re.compile(
 )
 
 IP = bytes([10, 0, 0, 2])
-LOAD, TX_BUF, RX_BUF, RESULT = 0xC000, 0xC300, 0xC400, 0xC0FF
+LOAD, TX_BUF, ARP_BUF, RX_BUF, RESULT = 0xC000, 0xC300, 0xC380, 0xC400, 0xC0FF
+MY_MAC = bytes.fromhex("02C640000002")
 
-# Every builder that emits a TxCMD write.
+# Every builder that emits a TxCMD write.  The ``[arp]`` entries are the
+# same builders with issue #218's ARP support switched on (an ARP request
+# transmitted before the echo; an ARP reply transmitted from the responder),
+# which adds a second TX site to each -- every walker below covers both.
 TX_BUILDERS: dict[str, Callable[[], bytes]] = {
     "build_tx_code": lambda: bp.build_tx_code(LOAD, TX_BUF, 60, RESULT),
     "build_ping_and_wait_code": lambda: bp.build_ping_and_wait_code(
         LOAD, TX_BUF, 60, RX_BUF, RESULT, 0x1234, 1),
+    "build_ping_and_wait_code[arp]": lambda: bp.build_ping_and_wait_code(
+        LOAD, TX_BUF, 60, RX_BUF, RESULT, 0x1234, 1, arp_frame_buf=ARP_BUF),
     "build_icmp_responder_code": lambda: bp.build_icmp_responder_code(
         LOAD, RX_BUF, IP, RESULT),
+    "build_icmp_responder_code[arp]": lambda: bp.build_icmp_responder_code(
+        LOAD, RX_BUF, IP, RESULT, my_mac=MY_MAC),
     "build_read_and_respond_echo_request_code":
         lambda: bp.build_read_and_respond_echo_request_code(LOAD, RX_BUF, IP, RESULT),
+    "build_read_and_respond_echo_request_code[arp]":
+        lambda: bp.build_read_and_respond_echo_request_code(
+            LOAD, RX_BUF, IP, RESULT, my_mac=MY_MAC),
     "build_ping_and_wait_tod_code": lambda: bp.build_ping_and_wait_tod_code(
         LOAD, TX_BUF, 60, RX_BUF, RESULT, 0x1234, 1),
+    "build_ping_and_wait_tod_code[arp]": lambda: bp.build_ping_and_wait_tod_code(
+        LOAD, TX_BUF, 60, RX_BUF, RESULT, 0x1234, 1, arp_frame_buf=ARP_BUF),
     "build_icmp_responder_tod_code": lambda: bp.build_icmp_responder_tod_code(
         LOAD, RX_BUF, IP, RESULT),
+    "build_icmp_responder_tod_code[arp]": lambda: bp.build_icmp_responder_tod_code(
+        LOAD, RX_BUF, IP, RESULT, my_mac=MY_MAC),
 }
 
 # Every builder that polls RxEvent.
@@ -141,12 +156,16 @@ RX_POLLERS: dict[str, Callable[[], bytes]] = {
     "build_rx_echo_reply_code": lambda: bp.build_rx_echo_reply_code(
         LOAD, RX_BUF, RESULT, 0x1234, 1),
     "build_ping_and_wait_code": TX_BUILDERS["build_ping_and_wait_code"],
+    "build_ping_and_wait_code[arp]": TX_BUILDERS["build_ping_and_wait_code[arp]"],
     "build_icmp_responder_code": TX_BUILDERS["build_icmp_responder_code"],
+    "build_icmp_responder_code[arp]": TX_BUILDERS["build_icmp_responder_code[arp]"],
     "build_rx_peek_code": lambda: bp.build_rx_peek_code(LOAD, RESULT),
     "build_rx_echo_reply_tod_code": lambda: bp.build_rx_echo_reply_tod_code(
         LOAD, RX_BUF, RESULT, 0x1234, 1),
     "build_ping_and_wait_tod_code": TX_BUILDERS["build_ping_and_wait_tod_code"],
+    "build_ping_and_wait_tod_code[arp]": TX_BUILDERS["build_ping_and_wait_tod_code[arp]"],
     "build_icmp_responder_tod_code": TX_BUILDERS["build_icmp_responder_tod_code"],
+    "build_icmp_responder_tod_code[arp]": TX_BUILDERS["build_icmp_responder_tod_code[arp]"],
 }
 
 # Builders that neither transmit nor poll: they assume RxEvent already fired.

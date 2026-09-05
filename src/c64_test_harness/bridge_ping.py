@@ -453,6 +453,10 @@ ETHERTYPE_ARP = 0x0806
 ARP_FRAME_LEN = 60
 ARP_OP_REQUEST = 1
 ARP_OP_REPLY = 2
+#: Result byte :func:`build_read_and_respond_echo_request_code` stores after
+#: answering an ARP request: the frame was consumed and a reply transmitted,
+#: and the caller should keep polling for the echo request.
+RESULT_ARP_REPLY_SENT = 0x03
 
 # Byte offsets within an ethernet+ARP frame (ip65 arp.s ``ap_*``).
 _ARP_HW = 14            # hardware type (ethernet = 0x0001)
@@ -960,6 +964,101 @@ def _emit_poll_rx(
     a.jmp(timeout_label)
 
 
+def _check_my_mac(my_mac: bytes | None) -> None:
+    if my_mac is not None and len(my_mac) != 6:
+        raise ValueError(f"my_mac must be 6 bytes, got {len(my_mac)}")
+
+
+def _emit_arp_responder(
+    a: Asm,
+    rx_buf: int,
+    my_ip: bytes,
+    my_mac: bytes,
+    *,
+    drop_label: str,
+    after_reply_label: str,
+    prefix: str = "arp",
+) -> None:
+    """Answer an ARP request for ``my_ip`` sitting in ``rx_buf``; else fall through.
+
+    ip65's ``arp_process`` ``@request`` path (``ip65/arp.s``), issue #218.
+    Emitted between the frame read and the IPv4 checks of a responder:
+
+    * ethertype != 0x0806 -> fall through to whatever follows (the ICMP
+      path), so a non-ARP frame is handled exactly as before;
+    * ARP but not a request, or a request for another IP -> ``JMP
+      drop_label``;
+    * a request for us -> rewrite ``rx_buf`` in place into the reply
+      (ethernet dst and target hardware address := the sender's, target
+      protocol address := the sender's, ethernet src and sender hardware
+      address := ``my_mac``, sender protocol address := ``my_ip``, opcode
+      := 2), transmit :data:`_FIXED_RX_BYTES` bytes of it, then ``JMP
+      after_reply_label``.
+
+    Offsets are ip65's ``ap_*``; the received request is at the same
+    offsets because the reader drains a fixed 60 bytes and an ARP frame
+    is 42 bytes padded to 60.  Clobbers A, X, and ``$FB/$FC`` (in the TX).
+    """
+    def chk(off: int, val: int, fail: str) -> None:
+        addr = rx_buf + off
+        a.emit(0xAD, addr & 0xFF, (addr >> 8) & 0xFF)
+        a.emit(0xC9, val & 0xFF)
+        a.branch(0xD0, fail)
+
+    def abs_x(opcode: int, addr: int) -> None:
+        a.emit(opcode, addr & 0xFF, (addr >> 8) & 0xFF)
+
+    drop_t, not_t, reply, not_arp = (
+        f"{prefix}_drop_t", f"{prefix}_not_t", f"{prefix}_reply", f"{prefix}_not_arp",
+    )
+    chk(12, 0x08, drop_t)          # ethertype hi (0x08 for both IPv4 and ARP)
+    chk(13, 0x06, not_t)           # ethertype lo: 0x06 = ARP, else fall through
+    chk(_ARP_OP, 0x00, drop_t)     # opcode hi
+    chk(_ARP_OP + 1, ARP_OP_REQUEST, drop_t)
+    for i in range(4):             # target protocol address == my_ip
+        chk(_ARP_TP + i, my_ip[i], drop_t)
+    a.jmp(reply)
+
+    a.label(drop_t)
+    a.jmp(drop_label)
+    a.label(not_t)
+    a.jmp(not_arp)
+
+    a.label(reply)
+    # eth dst [0..5] and target HW [32..37] := sender HW [22..27]
+    a.emit(0xA2, 0x05)                       # LDX #5
+    a.label(f"{prefix}_cp6")
+    abs_x(0xBD, rx_buf + _ARP_SHW)           # LDA rx+22,X
+    abs_x(0x9D, rx_buf + 0)                  # STA rx+0,X
+    abs_x(0x9D, rx_buf + _ARP_THW)           # STA rx+32,X
+    a.emit(0xCA)                             # DEX
+    a.branch(0x10, f"{prefix}_cp6")          # BPL
+    # target IP [38..41] := sender IP [28..31]
+    a.emit(0xA2, 0x03)
+    a.label(f"{prefix}_cp4")
+    abs_x(0xBD, rx_buf + _ARP_SP)
+    abs_x(0x9D, rx_buf + _ARP_TP)
+    a.emit(0xCA)
+    a.branch(0x10, f"{prefix}_cp4")
+    # sender HW [22..27] and eth src [6..11] := my_mac
+    for i in range(6):
+        a.emit(0xA9, my_mac[i])
+        a.emit(0x8D, (rx_buf + _ARP_SHW + i) & 0xFF, ((rx_buf + _ARP_SHW + i) >> 8) & 0xFF)
+        a.emit(0x8D, (rx_buf + 6 + i) & 0xFF, ((rx_buf + 6 + i) >> 8) & 0xFF)
+    # sender IP [28..31] := my_ip
+    for i in range(4):
+        a.emit(0xA9, my_ip[i])
+        a.emit(0x8D, (rx_buf + _ARP_SP + i) & 0xFF, ((rx_buf + _ARP_SP + i) >> 8) & 0xFF)
+    # opcode := reply (high byte already verified 0)
+    a.emit(0xA9, ARP_OP_REPLY)
+    a.emit(0x8D, (rx_buf + _ARP_OP + 1) & 0xFF, ((rx_buf + _ARP_OP + 1) >> 8) & 0xFF)
+
+    _emit_tx_frame(a, rx_buf, _FIXED_RX_BYTES, prefix)
+    a.jmp(after_reply_label)
+
+    a.label(not_arp)
+
+
 def build_rx_echo_reply_code(
     load_addr: int,
     rx_buf: int,
@@ -1130,6 +1229,8 @@ def build_icmp_responder_code(
     rx_buf: int,
     my_ip: bytes,
     result_addr: int,
+    *,
+    my_mac: bytes | None = None,
 ) -> bytes:
     """Build a 6502 routine that receives one ICMP echo request and replies.
 
@@ -1137,6 +1238,14 @@ def build_icmp_responder_code(
     transforms it in place into an echo reply (swap MAC, swap IP, set
     type=0, patch ICMP checksum), and TXes it back.  Writes 0x01 or 0xFF
     to ``result_addr``.
+
+    With ``my_mac`` (issue #218) the routine also answers ARP requests for
+    ``my_ip`` while it waits -- reply transmitted, then back to polling
+    for the echo request -- the way ip65's ``arp_process`` does, so a
+    peer that must resolve us first gets an answer.  ARP frames that are
+    not requests for ``my_ip`` are dropped.  Without ``my_mac`` the
+    output is byte-identical to the pre-#218 routine and ARP is dropped
+    like any other non-ICMP frame.
 
     Uses RR-Net register layout with the clockport enable injected at
     entry.  See ``tests/test_bridge_ping.py`` for a working round-trip
@@ -1151,6 +1260,7 @@ def build_icmp_responder_code(
         :func:`build_icmp_responder_tod_code`.
     """
     assert len(my_ip) == 4
+    _check_my_mac(my_mac)
 
     a = Asm(org=load_addr)
     a.emit(0x78)
@@ -1167,6 +1277,10 @@ def build_icmp_responder_code(
         a.emit(0xAD, addr & 0xFF, (addr >> 8) & 0xFF)
         a.emit(0xC9, val & 0xFF)
         a.branch(0xD0, fail)
+
+    if my_mac is not None:
+        _emit_arp_responder(a, rx_buf, my_ip, my_mac,
+                            drop_label="drop", after_reply_label="drop")
 
     chk(12, 0x08, "drop")   # ethertype hi
     chk(13, 0x00, "drop")   # ethertype lo
@@ -1222,30 +1336,7 @@ def build_icmp_responder_code(
     a.label("ck_done")
 
     # Wait for TxRdy, then transmit fixed _FIXED_RX_BYTES from rx_buf
-    a.emit(0xA9, CS8900A_TXCMD_VALUE & 0xFF, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
-    a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
-    a.emit(0xA9, _FIXED_RX_BYTES & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
-    a.emit(0xA9, 0x00, 0x8D, TXLEN_HI & 0xFF, TXLEN_HI >> 8)
-    a.emit(0xA9, 0x38, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
-    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
-    a.label("tw")
-    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
-    a.emit(0x29, 0x01)
-    a.branch(0xF0, "tw")
-
-    # Transmit fixed _FIXED_RX_BYTES bytes from rx_buf (in place)
-    a.emit(0xA9, rx_buf & 0xFF, 0x85, 0xFB)
-    a.emit(0xA9, (rx_buf >> 8) & 0xFF, 0x85, 0xFC)
-    a.emit(0xA0, 0x00)
-    a.label("txlp")
-    a.emit(0xB1, 0xFB)
-    a.emit(0x8D, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
-    a.emit(0xC8)
-    a.emit(0xB1, 0xFB)
-    a.emit(0x8D, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
-    a.emit(0xC8)
-    a.emit(0xC0, _FIXED_RX_BYTES)
-    a.branch(0xD0, "txlp")
+    _emit_tx_frame(a, rx_buf, _FIXED_RX_BYTES, "reply")
 
     a.emit(0xA9, 0x01, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
     a.emit(0x58)
@@ -1427,6 +1518,8 @@ def build_read_and_respond_echo_request_code(
     rx_buf: int,
     my_ip: bytes,
     result_addr: int,
+    *,
+    my_mac: bytes | None = None,
 ) -> bytes:
     """Drain a waiting echo request, swap+TX a reply, no polling.
 
@@ -1434,8 +1527,13 @@ def build_read_and_respond_echo_request_code(
 
     * ``0x01`` -- request consumed and reply transmitted
     * ``0x02`` -- frame consumed but did not match (host should re-poll)
+    * ``0x03`` (:data:`RESULT_ARP_REPLY_SENT`) -- the frame was an ARP
+      request for ``my_ip`` and a reply was transmitted; host should
+      re-poll.  Only with ``my_mac`` (issue #218); without it ARP is a
+      non-match and the output is byte-identical to the pre-#218 routine.
     """
     assert len(my_ip) == 4
+    _check_my_mac(my_mac)
 
     a = Asm(org=load_addr)
     a.emit(0x78)
@@ -1448,6 +1546,10 @@ def build_read_and_respond_echo_request_code(
         a.emit(0xAD, addr & 0xFF, (addr >> 8) & 0xFF)
         a.emit(0xC9, val & 0xFF)
         a.branch(0xD0, fail)
+
+    if my_mac is not None:
+        _emit_arp_responder(a, rx_buf, my_ip, my_mac,
+                            drop_label="rrm", after_reply_label="rr_arp_done")
 
     chk(12, 0x08, "rrm_tramp")
     chk(13, 0x00, "rrm_tramp")
@@ -1499,29 +1601,7 @@ def build_read_and_respond_echo_request_code(
     a.label("_ck2_done")
 
     # Wait for TxRdy then TX _FIXED_RX_BYTES from rx_buf
-    a.emit(0xA9, CS8900A_TXCMD_VALUE & 0xFF, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
-    a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
-    a.emit(0xA9, _FIXED_RX_BYTES & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
-    a.emit(0xA9, 0x00, 0x8D, TXLEN_HI & 0xFF, TXLEN_HI >> 8)
-    a.emit(0xA9, 0x38, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
-    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
-    a.label("_tw2")
-    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
-    a.emit(0x29, 0x01)
-    a.branch(0xF0, "_tw2")
-
-    a.emit(0xA9, rx_buf & 0xFF, 0x85, 0xFB)
-    a.emit(0xA9, (rx_buf >> 8) & 0xFF, 0x85, 0xFC)
-    a.emit(0xA0, 0x00)
-    a.label("_txlp2")
-    a.emit(0xB1, 0xFB)
-    a.emit(0x8D, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
-    a.emit(0xC8)
-    a.emit(0xB1, 0xFB)
-    a.emit(0x8D, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
-    a.emit(0xC8)
-    a.emit(0xC0, _FIXED_RX_BYTES)
-    a.branch(0xD0, "_txlp2")
+    _emit_tx_frame(a, rx_buf, _FIXED_RX_BYTES, "reply")
 
     a.emit(0xA9, 0x01, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
     a.emit(0x58)
@@ -1531,6 +1611,12 @@ def build_read_and_respond_echo_request_code(
     a.emit(0xA9, 0x02, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
     a.emit(0x58)
     a.emit(0x60)
+
+    if my_mac is not None:
+        a.label("rr_arp_done")
+        a.emit(0xA9, RESULT_ARP_REPLY_SENT, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
+        a.emit(0x58)
+        a.emit(0x60)
 
     return a.build()
 
@@ -1658,12 +1744,19 @@ def run_icmp_responder(
     timeout_s: float = 5.0,
     peek_addr: int = _DEFAULT_PEEK_ADDR,
     consume_addr: int = _DEFAULT_CONSUME_ADDR,
+    my_mac: bytes | None = None,
 ) -> int:
     """Wait for an ICMP echo request and reply to it.
 
     Loops: ``poll_until_ready`` -> ``read_and_respond_echo_request`` ->
     on mismatch, re-poll; on success, return ``0x01``; on wall-clock
     timeout, return ``0xFF``.
+
+    With ``my_mac`` (issue #218) ARP requests for ``my_ip`` are answered
+    while waiting (the consume routine reports
+    :data:`RESULT_ARP_REPLY_SENT` and the loop re-polls), so a peer that
+    resolves before pinging -- :func:`run_ping_and_wait`'s default, ip65,
+    any real IP stack -- gets its reply.
     """
     import time as _time
     from .execute import jsr, load_code
@@ -1678,6 +1771,7 @@ def run_icmp_responder(
         rx_buf=rx_buf,
         my_ip=my_ip,
         result_addr=result_addr,
+        my_mac=my_mac,
     )
     load_code(transport, consume_addr, body_code)
 
@@ -1701,7 +1795,7 @@ def run_icmp_responder(
         body_result = read_bytes(transport, result_addr, 1)[0]
         if body_result == 0x01:
             return 0x01
-        if body_result == 0x02:
+        if body_result in (0x02, RESULT_ARP_REPLY_SENT):
             continue
         return body_result
 
@@ -2132,6 +2226,8 @@ def build_icmp_responder_tod_code(
     my_ip: bytes,
     result_addr: int,
     deadline_tenths: int = 50,
+    *,
+    my_mac: bytes | None = None,
 ) -> bytes:
     """Shippable-application ICMP responder with CIA1 TOD timeout.
 
@@ -2143,7 +2239,9 @@ def build_icmp_responder_tod_code(
 
     Writes ``0x01`` at ``result_addr`` on successful reply TX, ``0xFF``
     on TOD expiry.  Non-matching frames are drained and polling
-    continues against the same deadline.
+    continues against the same deadline.  With ``my_mac`` (issue #218)
+    ARP requests for ``my_ip`` are answered along the way, against the
+    same deadline; see :func:`build_icmp_responder_code`.
 
     Args:
         load_addr: Where the routine will live.
@@ -2151,12 +2249,15 @@ def build_icmp_responder_tod_code(
         my_ip: 4-byte IP address of this C64.
         result_addr: 1-byte status slot.
         deadline_tenths: Timeout in tenths-of-a-second (1..599).
+        my_mac: 6-byte MAC to answer ARP with; ``None`` disables ARP.
 
     Raises:
-        ValueError: if ``deadline_tenths`` is out of range.
+        ValueError: if ``deadline_tenths`` is out of range or ``my_mac``
+            is not 6 bytes.
     """
     _validate_deadline_tenths(deadline_tenths)
     assert len(my_ip) == 4
+    _check_my_mac(my_mac)
 
     a = Asm(org=load_addr)
     a.emit(0x78)
@@ -2186,6 +2287,10 @@ def build_icmp_responder_tod_code(
         a.emit(0xAD, addr & 0xFF, (addr >> 8) & 0xFF)
         a.emit(0xC9, val & 0xFF)
         a.branch(0xD0, fail)
+
+    if my_mac is not None:
+        _emit_arp_responder(a, rx_buf, my_ip, my_mac,
+                            drop_label="drop", after_reply_label="drop")
 
     chk(12, 0x08, "drop")
     chk(13, 0x00, "drop")
@@ -2240,29 +2345,7 @@ def build_icmp_responder_tod_code(
     a.label("ck_done")
 
     # Wait TxRdy then TX _FIXED_RX_BYTES from rx_buf
-    a.emit(0xA9, CS8900A_TXCMD_VALUE & 0xFF, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
-    a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
-    a.emit(0xA9, _FIXED_RX_BYTES & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
-    a.emit(0xA9, 0x00, 0x8D, TXLEN_HI & 0xFF, TXLEN_HI >> 8)
-    a.emit(0xA9, 0x38, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
-    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
-    a.label("tw2")
-    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
-    a.emit(0x29, 0x01)
-    a.branch(0xF0, "tw2")
-
-    a.emit(0xA9, rx_buf & 0xFF, 0x85, 0xFB)
-    a.emit(0xA9, (rx_buf >> 8) & 0xFF, 0x85, 0xFC)
-    a.emit(0xA0, 0x00)
-    a.label("txlp2")
-    a.emit(0xB1, 0xFB)
-    a.emit(0x8D, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
-    a.emit(0xC8)
-    a.emit(0xB1, 0xFB)
-    a.emit(0x8D, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
-    a.emit(0xC8)
-    a.emit(0xC0, _FIXED_RX_BYTES)
-    a.branch(0xD0, "txlp2")
+    _emit_tx_frame(a, rx_buf, _FIXED_RX_BYTES, "reply")
 
     a.emit(0xA9, 0x01, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
     a.emit(0x58)
