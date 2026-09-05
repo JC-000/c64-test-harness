@@ -210,8 +210,10 @@ def _polls_by_register(code: bytes) -> list[tuple[int, int, int]]:
 
 
 def _expected_tx_sites(name: str) -> int:
-    """One TX handshake per builder; the ``[arp]`` variants add a second (#218)."""
-    return 2 if name.endswith("[arp]") else 1
+    """One TX handshake per builder; a variant that transmits an ARP request
+    first (``[arp]``, and ``[drain]`` which is ARP + RX drain, #218/#222)
+    adds a second."""
+    return 2 if name.endswith(("[arp]", "[drain]")) else 1
 
 
 def _rdy4txnow_polls(code: bytes) -> list[dict[str, int]]:
