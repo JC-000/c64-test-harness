@@ -314,6 +314,47 @@ The uninstaller only removes the symlink if it points at this repo's copy — it
 - **Committed copy per project** — three copies drift instantly; hard pass.
 - **Claude Code plugin + marketplace** — the "official" distribution model, but overkill for a single-user multi-repo setup. Consider if the skill grows beyond this repo's audience.
 
+## Review standard: adversarial review and red/green, every change
+
+This is the working method for every change to this repository, whether
+one agent or a team makes it. It is a standard, not a suggestion; a PR
+that skipped a step says so in its body.
+
+1. **Red first.** Every new or changed test is shown failing against the
+   code as it was (stash the source change, run, restore, quote the failing
+   line in the PR). A test whose expected value equals the system default
+   passes whether or not the code ran, so it is not a test until it has
+   been red.
+2. **Mutation-check the green.** Break the code under test on purpose at
+   least once per fix (drop the guard, return the default, swap the order)
+   and record which tests fail. A mutation that survives is either an
+   equivalent mutant (say so) or a missing test (write it).
+3. **Adversarial review before merge.** A reviewer with a standing brief
+   to assume the implementer is wrong reads the diff, the issue and the
+   authority (firmware source, ip65, the datasheet), runs its own red tests
+   and mutations, and returns ranked findings with a verdict: MERGE,
+   FIX-THEN-MERGE, or BLOCK. The implementer answers every finding; the
+   reviewer re-verifies; only MERGE merges. Findings that are nits are
+   still answered, in the PR body if not in code.
+4. **Measurements carry their conditions.** n, arms, interleaving, device,
+   firmware, date. Pair A/B trials on the shared bench (unpaired small-n
+   runs have "confirmed" three wrong causes here). A claim stated without
+   its scope is the defect class this repository has spent the most time
+   removing; the reviewer's brief includes hunting for it.
+5. **Follow-ups are issues, not memory.** The moment a gap is found that
+   the change will not close, `gh issue create` it with the evidence grade
+   stated, and link it from the PR.
+6. **Validation is local and complete.** There is no CI. The PR body
+   quotes the full-suite figure on the final head from the canonical
+   checkout (`U64_HOST` unset, no foreign VICE at start), the bridge
+   suites with root VICE where networking changed, and the live counts
+   from the device with the `DeviceLock` held where hardware changed.
+
+The mechanics — worktrees with `PYTHONPATH=<worktree>/src` and an import
+proof, serialised VICE runs, the `DeviceLock`, closing issues with a
+comment that names the test — are in the `c64-test` skill and in the
+project's local brief.
+
 ## Follow-ups not in this PR
 
 - Real fresh-VM validation of `setup-dev-env.sh` (the authoring was done via `--dry-run` only, on an already-set-up machine)
