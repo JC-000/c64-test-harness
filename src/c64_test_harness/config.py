@@ -46,6 +46,22 @@ def env_flag(name: str) -> bool | None:
     return raw.strip().lower() in _TRUE_WORDS
 
 
+def resolve_baseline_on_entry_env(prefix: str = "C64TEST_") -> bool | None:
+    """The one precedence for the U64 entry-reset switch, both paths.
+
+    ``<prefix>U64_BASELINE_ON_ENTRY`` (the config convention form) wins
+    when set; else the shared :data:`U64_BASELINE_ON_ENTRY_ENV`; else
+    ``None`` (nobody asked).  ``UnifiedManager`` and
+    :meth:`HarnessConfig.from_env` both call this, so
+    ``C64TEST_U64_BASELINE_ON_ENTRY=0 U64_BASELINE_ON_ENTRY=1`` is off
+    through either.
+    """
+    prefixed = env_flag(prefix + "U64_BASELINE_ON_ENTRY")
+    if prefixed is not None:
+        return prefixed
+    return env_flag(U64_BASELINE_ON_ENTRY_ENV)
+
+
 def _permissive_policy() -> "MemoryPolicy":
     """Default-factory shim — defers the MemoryPolicy import so this
     module stays import-cheap and never participates in cycles."""
@@ -127,10 +143,15 @@ class HarnessConfig:
     # ``current == default`` per item (issue #227).  TOML
     # ``[u64] baseline_on_entry = true``; env ``U64_BASELINE_ON_ENTRY`` (the
     # one name, shared with ``UnifiedManager``; the convention form
-    # ``C64TEST_U64_BASELINE_ON_ENTRY`` wins when both are set).  Off by
-    # default -- no requests are made.  Wire it with
-    # ``UnifiedManager(..., baseline_on_entry=cfg.u64_baseline_on_entry)``.
-    u64_baseline_on_entry: bool = False
+    # ``C64TEST_U64_BASELINE_ON_ENTRY`` wins when both are set).
+    #
+    # Tri-state: ``None`` (the default) means "nobody asked" and defers to
+    # the environment at the manager, so the documented wiring
+    # ``UnifiedManager(..., baseline_on_entry=cfg.u64_baseline_on_entry)``
+    # does not pass an explicit False that beats the shell switch.  A TOML
+    # ``false`` is an explicit off.  Unset everywhere means off -- no
+    # requests are made.
+    u64_baseline_on_entry: bool | None = None
 
     # Memory policy enforced at the transport boundary.  Default is
     # permissive (no checks) so existing configs see no behaviour
@@ -159,16 +180,18 @@ class HarnessConfig:
         setting their env var raises ``ValueError`` rather than smuggling
         a raw string into the config.
 
-        ``u64_baseline_on_entry`` additionally reads the shared, unprefixed
+        ``u64_baseline_on_entry`` is resolved by
+        :func:`resolve_baseline_on_entry_env`: the prefixed
+        ``<prefix>U64_BASELINE_ON_ENTRY`` wins, else the shared, unprefixed
         :data:`U64_BASELINE_ON_ENTRY_ENV` (the same switch ``UnifiedManager``
-        reads), so one name opts both paths in.  The prefixed
-        ``<prefix>U64_BASELINE_ON_ENTRY`` wins when both are set.
+        reads), else ``None``.  One name opts both paths in, with one
+        precedence.
         """
         config = cls()
-        shared = env_flag(U64_BASELINE_ON_ENTRY_ENV)
-        if shared is not None:
-            config.u64_baseline_on_entry = shared
+        config.u64_baseline_on_entry = resolve_baseline_on_entry_env(prefix)
         for fld in config.__dataclass_fields__:
+            if fld == "u64_baseline_on_entry":
+                continue        # tri-state; resolved above
             env_key = prefix + fld.upper()
             env_val = os.environ.get(env_key)
             if env_val is not None:

@@ -25,6 +25,7 @@ def _no_baseline_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """The #227 entry reset is opt-in via ``U64_BASELINE_ON_ENTRY``; keep
     a shell that exports it from changing what these tests expect."""
     monkeypatch.delenv("U64_BASELINE_ON_ENTRY", raising=False)
+    monkeypatch.delenv("C64TEST_U64_BASELINE_ON_ENTRY", raising=False)
 
 
 def _make_mock_vice_instance(pid: int = 1234) -> MagicMock:

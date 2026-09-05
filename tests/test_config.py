@@ -89,8 +89,12 @@ class TestU64BaselineOnEntry:
     """Issue #227: the entry reset is opt-in through ``[u64]`` in TOML,
     ``C64TEST_U64_BASELINE_ON_ENTRY`` in the environment, or the field."""
 
-    def test_default_is_off(self):
-        assert HarnessConfig().u64_baseline_on_entry is False
+    def test_default_is_none_meaning_ask_the_env(self):
+        """Tri-state: ``None`` defers to ``U64_BASELINE_ON_ENTRY`` in the
+        manager, so the documented wiring
+        ``UnifiedManager(..., baseline_on_entry=cfg.u64_baseline_on_entry)``
+        does not pass an explicit False that beats the shell switch."""
+        assert HarnessConfig().u64_baseline_on_entry is None
 
     def test_toml_u64_section(self, tmp_path):
         toml_file = tmp_path / "c64test.toml"
@@ -105,6 +109,17 @@ class TestU64BaselineOnEntry:
     def test_toml_without_the_section_stays_off(self, tmp_path):
         toml_file = tmp_path / "c64test.toml"
         toml_file.write_bytes(b'backend = "u64"\n')
+        try:
+            cfg = HarnessConfig.from_toml(toml_file)
+        except RuntimeError:
+            pytest.skip("TOML support not available (needs Python 3.11+ or tomli)")
+        assert cfg.u64_baseline_on_entry is None
+
+    def test_toml_false_is_an_explicit_off(self, tmp_path, monkeypatch):
+        """A TOML ``false`` is a decision and beats the env at the manager."""
+        monkeypatch.setenv("U64_BASELINE_ON_ENTRY", "1")
+        toml_file = tmp_path / "c64test.toml"
+        toml_file.write_bytes(b'[u64]\nbaseline_on_entry = false\n')
         try:
             cfg = HarnessConfig.from_toml(toml_file)
         except RuntimeError:
@@ -137,10 +152,10 @@ class TestU64BaselineOnEntry:
         monkeypatch.setenv("U64_BASELINE_ON_ENTRY", "yes")
         assert HarnessConfig.from_env(prefix="MYAPP_").u64_baseline_on_entry is True
 
-    def test_both_unset_is_off(self, monkeypatch):
+    def test_both_unset_leaves_none(self, monkeypatch):
         monkeypatch.delenv("U64_BASELINE_ON_ENTRY", raising=False)
         monkeypatch.delenv("C64TEST_U64_BASELINE_ON_ENTRY", raising=False)
-        assert HarnessConfig.from_env().u64_baseline_on_entry is False
+        assert HarnessConfig.from_env().u64_baseline_on_entry is None
 
 
 class TestFromToml:

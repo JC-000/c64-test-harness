@@ -135,10 +135,13 @@ class UnifiedManager:
         and before the transport is handed out — resetting the covered
         config categories to the firmware's factory defaults and
         asserting ``current == default`` per item.  ``None`` (the
-        default) reads ``U64_BASELINE_ON_ENTRY``; unset means off, and
-        off means no requests at all.  ``HarnessConfig.u64_baseline_on_entry``
-        is the TOML/env form — pass it here.  Requires ``DeviceLock``
-        to be importable; the manager refuses to run the reset unlocked.
+        default) asks the environment through the same precedence
+        ``HarnessConfig.from_env`` uses (``C64TEST_U64_BASELINE_ON_ENTRY``
+        wins, else ``U64_BASELINE_ON_ENTRY``); unset means off, and off
+        means no requests at all.  ``HarnessConfig.u64_baseline_on_entry``
+        is the TOML/env form and is tri-state for exactly this reason —
+        pass it here as is.  Requires ``DeviceLock`` to be importable;
+        the manager refuses to run the reset unlocked.
     """
 
     def __init__(

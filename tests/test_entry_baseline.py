@@ -89,12 +89,21 @@ _FACTORY: dict[str, dict[str, tuple[Any, Any]]] = {
     "SoftIEC Drive Settings": {"IEC Drive and Printer": ("Disabled", "Disabled")},
     "Tape Settings": {"Datasette Playback Clock": ("PAL", "PAL")},
     "Printer Settings": {"IEC printer": ("Disabled", "Disabled")},
-    "Clock Settings": {"Correction": (0, 0)},
     "LED Strip Settings": {"LED Strip Length": (40, 40)},
     "Modem Settings": {"ACIA": ("Disabled", "Disabled")},
     "User Interface Settings": {"Menu Theme": ("Default", "Default")},
-    "SID Sockets Configuration": {"SID Socket 1": ("Enabled", "Enabled")},
-    # The stores the entry reset must never touch.
+    # The stores the entry reset must never touch.  The RTC and the SID
+    # socket store deliberately read != default: a reset of either would
+    # "fix" them and the never-requested assertions would not notice.
+    "Clock Settings": {"Year": (2026, 2015), "Hours": (9, 16), "Correction": (0, 0)},
+    "SID Sockets Configuration": {
+        "SID Detected Socket 1": ("8580", "None"),
+        "SID Detected Socket 2": ("8580", "None"),
+        "SID Socket 1": ("Enabled", "Disabled"),
+        "SID Socket 2": ("Enabled", "Disabled"),
+        "SID Socket 1 Capacitors": ("22 nF", "470 pF"),
+        "SID Socket 2 Capacitors": ("22 nF", "470 pF"),
+    },
     "Ethernet Settings": {"Use DHCP": ("Enabled", "Enabled")},
     "Network Settings": {"Ultimate DMA Service": ("Enabled", "Enabled")},
     "WiFi settings": {"WiFi": ("Enabled", "Enabled")},
@@ -206,20 +215,82 @@ _DRIFT = {
 # --------------------------------------------------------------------------- #
 
 class TestCoveredSet:
-    def test_the_fourteen_covered_categories(self) -> None:
+    def test_the_twelve_covered_categories(self) -> None:
         assert set(BASELINE_CATEGORIES) == {
             "C64 and Cartridge Settings", "U64 Specific Settings",
-            "SID Addressing", "SID Sockets Configuration", "Audio Mixer",
+            "SID Addressing", "Audio Mixer",
             "Drive A Settings", "Drive B Settings", "SoftIEC Drive Settings",
-            "Tape Settings", "Printer Settings", "Clock Settings",
+            "Tape Settings", "Printer Settings",
             "LED Strip Settings", "Modem Settings", "User Interface Settings",
         }
+
+    def test_the_never_touch_set_is_pinned_with_its_reasons(self) -> None:
+        """Structural: the never-touch set, literally, each with the reason
+        it must stay out — the assertion message carries it (adversarial
+        review of #227, firmware 1541u-315preview)."""
+        from c64_test_harness.backends.ultimate64_baseline import BASELINE_NEVER_TOUCH
+
+        expected = {
+            "Ethernet Settings": (
+                "reset_to_default flips a static-addressed device to DHCP "
+                "(Use DHCP=Enabled, 192.168.2.64/24) and strands it"
+            ),
+            "Network Settings": (
+                "reset blanks Network Password, hostname and the FTP/Telnet/Web/"
+                "SNTP service flags (and sets Ultimate DMA Service=Enabled)"
+            ),
+            "WiFi settings": (
+                "the C64 Ultimate reaches the bench over WiFi; its store has "
+                "never been read, so a reset there is unassessed"
+            ),
+            "SID Sockets Configuration": (
+                "ConfigStore::reset sets SID Socket 1/2=Disabled, then "
+                "U64SidSockets::effectuate_settings (u64_config.cc:744-800) writes "
+                "regulator bits 0 to the PLD SIDCTRL / I2C: the reset cuts socket "
+                "power and detection state (U64E n=3: all six items flip) while the "
+                "report reads clean; detection never re-runs over REST, recovery is "
+                "a PUT of the detected values, which on a 6581 bench applies socket "
+                "voltage without the human 12 V approval (u64_config.cc:698-705)"
+            ),
+            "Clock Settings": (
+                "the RTC (Year..Seconds, defaults 2015-10-13 16:52:55, rtc.cc:26-34): "
+                "RtcConfigStore::effectuate is empty so a reset only sets RAM + "
+                "staleEffect (RAM already reads the 2015 defaults: at_open_config "
+                "fills from the chip only when the menu opens), showing no drift and "
+                "no mismatch while arming the rollback -- the next PUT runs "
+                "at_close_config (rtc.cc:350-409), which writes every item to the chip"
+            ),
+        }
+        for cat in ("SID Sockets Configuration", "Clock Settings"):
+            for token in ("u64_config.cc:744-800", "POWERED OFF") if cat.startswith("SID") \
+                    else ("rtc.cc:350-409", "RTC"):
+                assert token in BASELINE_NEVER_TOUCH[cat], f"{cat}: reason must cite {token}"
+        assert set(BASELINE_NEVER_TOUCH) == set(expected), (
+            f"never-touch set changed: {sorted(BASELINE_NEVER_TOUCH)!r}"
+        )
+        for cat, reason in expected.items():
+            assert BASELINE_NEVER_TOUCH[cat], f"{cat}: a never-touch entry needs its reason: {reason}"
+        assert tuple(BASELINE_NEVER_TOUCH) == BASELINE_EXCLUDED_CATEGORIES
 
     def test_the_network_stores_are_excluded(self) -> None:
         assert {"Ethernet Settings", "Network Settings", "WiFi settings"} <= set(
             BASELINE_EXCLUDED_CATEGORIES
         )
         assert not set(BASELINE_CATEGORIES) & set(BASELINE_EXCLUDED_CATEGORIES)
+
+    @pytest.mark.parametrize("cat,why", [
+        ("SID Sockets Configuration",
+         "its per-category reset powers the socketed SIDs off (u64_config.cc:744-800)"),
+        ("Clock Settings",
+         "it is the RTC; the PUT after a reset writes the chip (rtc.cc:350-409)"),
+    ])
+    def test_these_two_can_never_enter_the_covered_set(self, cat: str, why: str) -> None:
+        assert cat not in BASELINE_CATEGORIES, f"{cat!r} must never be covered: {why}"
+        assert cat in BASELINE_EXCLUDED_CATEGORIES, f"{cat!r} must be never-touch: {why}"
+        client = FakeBaselineU64()
+        with pytest.raises(ValueError, match="never"):
+            apply_factory_baseline(client, categories=(cat,))
+        assert client.requests == [] and client.gets == []
 
     def test_no_covered_name_is_a_glob(self) -> None:
         """The firmware route takes a *pattern*; a wildcard in a covered
@@ -435,6 +506,13 @@ class TestExclusions:
         puts = [p for m, p in wire if m != "GET"]
         assert puts and all(p.endswith(":reset_to_default") for p in puts)
         assert len(puts) == len(BASELINE_CATEGORIES)
+        assert not any("SID%20Sockets%20Configuration" in p or "Clock%20Settings" in p
+                       for p in paths), (
+            "the SID socket store and the RTC are never on the wire"
+        )
+        assert any("Datasette%20Playback%20Clock" in p for p in paths), (
+            "sanity: the Tape Settings item containing 'Clock' is still read"
+        )
 
 
 def _decode_category(segment: str) -> str:
@@ -451,11 +529,15 @@ class TestDeviceShape:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         """The C64U's category set differs; absence is a skip, not an error."""
-        absent = {"LED Strip Settings", "SID Sockets Configuration"}
+        absent = {"LED Strip Settings", "Tape Settings"}
         client = FakeBaselineU64(absent=absent)
         with caplog.at_level(logging.INFO, logger=_BASELINE_LOGGER):
             report = apply_factory_baseline(client)
         assert set(report.skipped) == absent
+        assert set(report.reset).isdisjoint(report.skipped), (
+            "a skipped category cannot also be reported as reset"
+        )
+        assert set(report.reset) == set(BASELINE_CATEGORIES) - absent
         assert not any(cat in absent for _k, cat in client.requests)
         text = "\n".join(r.getMessage() for r in caplog.records)
         for cat in absent:
@@ -564,8 +646,28 @@ class TestOptIn:
         monkeypatch.setenv(BASELINE_ON_ENTRY_ENV, value)
         assert baseline_on_entry_enabled() is expected
 
+    def test_prefixed_config_form_wins_for_the_manager_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One precedence for both paths (review re-read of ce4b0af): with
+        ``C64TEST_U64_BASELINE_ON_ENTRY=0`` and ``U64_BASELINE_ON_ENTRY=1``
+        HarnessConfig says off, so a bare create_manager must say off too."""
+        monkeypatch.setenv("C64TEST_U64_BASELINE_ON_ENTRY", "0")
+        monkeypatch.setenv(BASELINE_ON_ENTRY_ENV, "1")
+        assert baseline_on_entry_enabled() is False
+        with patch("c64_test_harness.backends.unified_manager._LockedU64Manager") as Locked:
+            UnifiedManager(backend="u64", u64_hosts=[HOST])
+        assert Locked.call_args.kwargs["baseline_on_entry"] is False
+        monkeypatch.setenv("C64TEST_U64_BASELINE_ON_ENTRY", "1")
+        monkeypatch.setenv(BASELINE_ON_ENTRY_ENV, "0")
+        assert baseline_on_entry_enabled() is True
+        with patch("c64_test_harness.backends.unified_manager._LockedU64Manager") as Locked:
+            UnifiedManager(backend="u64", u64_hosts=[HOST])
+        assert Locked.call_args.kwargs["baseline_on_entry"] is True
+
     def test_unset_is_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(BASELINE_ON_ENTRY_ENV, raising=False)
+        monkeypatch.delenv("C64TEST_U64_BASELINE_ON_ENTRY", raising=False)
         assert baseline_on_entry_enabled() is False
 
 
@@ -686,6 +788,23 @@ class TestManagerPath:
             UnifiedManager(backend="u64", u64_hosts=[HOST], baseline_on_entry=False)
         assert Locked.call_args.kwargs["baseline_on_entry"] is False
 
+    def test_documented_wiring_lets_the_shell_switch_work(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """REFERENCE says ``UnifiedManager(..., baseline_on_entry=cfg.u64_baseline_on_entry)``.
+        With a default config that must not pass an explicit False that
+        beats ``U64_BASELINE_ON_ENTRY=1`` (review should-fix 3): the field
+        is tri-state and its default defers to the env."""
+        from c64_test_harness.config import HarnessConfig
+
+        cfg = HarnessConfig()
+        assert cfg.u64_baseline_on_entry is None
+        monkeypatch.setenv(BASELINE_ON_ENTRY_ENV, "1")
+        with patch("c64_test_harness.backends.unified_manager._LockedU64Manager") as Locked:
+            UnifiedManager(backend="u64", u64_hosts=[HOST],
+                           baseline_on_entry=cfg.u64_baseline_on_entry)
+        assert Locked.call_args.kwargs["baseline_on_entry"] is True
+
     def test_vice_backend_ignores_the_flag(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(BASELINE_ON_ENTRY_ENV, "1")
         with patch("c64_test_harness.backends.unified_manager.ViceInstanceManager"):
@@ -694,14 +813,17 @@ class TestManagerPath:
 
 
 # --------------------------------------------------------------------------- #
-# Detection-derived items (U64E measurement, 2026-09-05)                      #
+# The SID socket store and the RTC: never touched                             #
 # --------------------------------------------------------------------------- #
 #
-# ``SID Sockets Configuration`` carries six items whose value the firmware
-# derives from SID detection at boot; they never equal ``default`` on a
-# device with SIDs fitted and were identical before and after a physical
-# power-cycle (n=1), while every other one of the 203 items equalled its
-# default.  Asserting ``current == default`` on them is a false failure.
+# ``SID Sockets Configuration`` carries items whose value the firmware
+# derives from SID detection at boot (U64E, two 8580s, 2026-09-05: '8580' /
+# 'Enabled' / '22 nF' against defaults 'None' / 'Disabled' / '470 pF',
+# unchanged across a physical power-cycle, n=1).  Exempting them from the
+# comparison was the first fix; the adversarial review showed the reset PUT
+# itself is the damage (the store's effectuate powers the sockets off), so
+# the whole category is never-touch.  The generic ``exempt=`` fallback stays
+# for the class.
 
 _SID_SOCKETS = "SID Sockets Configuration"
 _DETECTION_DERIVED: dict[str, tuple[str, str]] = {
@@ -714,107 +836,101 @@ _DETECTION_DERIVED: dict[str, tuple[str, str]] = {
 }
 
 
-def _sid_fitted_factory(extra: dict[str, tuple[Any, Any]] | None = None) -> dict:
-    """The bench shape: the six derived items differ from default and ignore
-    a reset (the fake's ``frozen``); everything else is at default."""
-    factory = {cat: dict(items) for cat, items in _FACTORY.items()}
-    factory[_SID_SOCKETS] = {**_DETECTION_DERIVED, **(extra or {})}
-    return factory
+class TestSidSocketStoreIsNeverTouched:
+    def test_no_exemption_set_survives(self) -> None:
+        """The six-item ``DETECTION_DERIVED_ITEMS`` set was dropped with the
+        category: an assertion-level exemption left the reset PUT (the
+        damage) in place, and the literal six were incomplete anyway — on
+        a 6581 bench detection also writes ``SID Socket 1/2 1K Ohm
+        Resistor`` (u64_config.cc:704/708).  The store is never-touch;
+        ``exempt=`` is the per-run fallback for the class."""
+        import c64_test_harness as pkg
+        from c64_test_harness.backends import ultimate64_baseline as mod
 
+        assert not hasattr(mod, "DETECTION_DERIVED_ITEMS")
+        assert "DETECTION_DERIVED_ITEMS" not in pkg.__all__
+        assert not hasattr(pkg, "DETECTION_DERIVED_ITEMS")
 
-class TestDetectionDerivedItems:
-    def test_the_set_is_exactly_the_six_measured_items(self) -> None:
-        """Pinned literally: an exemption masks a real failure, so the set
-        grows only with a measurement (power-cycle-stable, != default)."""
-        from c64_test_harness.backends.ultimate64_baseline import DETECTION_DERIVED_ITEMS
-
-        assert DETECTION_DERIVED_ITEMS == frozenset({
-            (_SID_SOCKETS, "SID Detected Socket 1"),
-            (_SID_SOCKETS, "SID Detected Socket 2"),
-            (_SID_SOCKETS, "SID Socket 1"),
-            (_SID_SOCKETS, "SID Socket 2"),
-            (_SID_SOCKETS, "SID Socket 1 Capacitors"),
-            (_SID_SOCKETS, "SID Socket 2 Capacitors"),
-        })
-
-    def test_every_exemption_names_a_known_detection_derived_item(self) -> None:
-        from c64_test_harness.backends.ultimate64_baseline import DETECTION_DERIVED_ITEMS
-
-        for cat, item in DETECTION_DERIVED_ITEMS:
-            assert cat == _SID_SOCKETS, f"{cat!r}/{item!r}: only the SID socket store is detection-derived"
-            assert item in _DETECTION_DERIVED, f"{item!r} is not one of the six measured items"
-            assert cat in BASELINE_CATEGORIES
-
-    def test_sids_fitted_device_passes_and_reports_the_six(self) -> None:
-        """Today's code raises 'reset did not take' on this shape."""
-        client = FakeBaselineU64(_sid_fitted_factory(), frozen=set(_DETECTION_DERIVED))
-        report = apply_factory_baseline(client)          # must not raise
-        assert report.ok
-        assert report.mismatched == {}
-        assert report.detection_derived == {_SID_SOCKETS: {
-            item: (cur, default) for item, (cur, default) in _DETECTION_DERIVED.items()
-        }}
-        assert _SID_SOCKETS not in report.drifted, "derived items are not drift either"
-
-    def test_the_category_is_still_reset(self) -> None:
-        client = FakeBaselineU64(_sid_fitted_factory(), frozen=set(_DETECTION_DERIVED))
+    def test_sids_fitted_device_passes_with_the_store_untouched(self) -> None:
+        """Before the fix the six raised 'reset did not take'; after the
+        first fix they were exempt but the store was still reset (powering
+        the sockets off).  Now: no reset, no read, clean report."""
+        client = FakeBaselineU64()          # _FACTORY carries the six != default
         report = apply_factory_baseline(client)
-        assert ("reset", _SID_SOCKETS) in client.requests
-        assert _SID_SOCKETS in report.reset
-
-    def test_derived_items_are_never_put(self) -> None:
-        client = FakeBaselineU64(_sid_fitted_factory(), frozen=set(_DETECTION_DERIVED))
-        apply_factory_baseline(client)
-        assert not [r for r in client.requests if r[0] == "put"]
-
-    def test_derived_items_that_happen_to_equal_default_are_still_listed(self) -> None:
-        """A device without SIDs fitted: the six read their defaults.  They
-        are still reported under detection_derived (never compared), so a
-        reader can see the detection result either way."""
-        client = FakeBaselineU64(_sid_fitted_factory({
-            item: (default, default) for item, (_c, default) in _DETECTION_DERIVED.items()
-        }))
-        report = apply_factory_baseline(client)
-        assert set(report.detection_derived[_SID_SOCKETS]) == set(_DETECTION_DERIVED)
         assert report.ok
+        assert _SID_SOCKETS not in report.reset
+        assert _SID_SOCKETS not in report.skipped
+        assert _SID_SOCKETS not in report.mismatched and _SID_SOCKETS not in report.drifted
+        assert not any(cat == _SID_SOCKETS for _k, cat in client.requests), "never reset, never PUT"
+        assert not any(cat == _SID_SOCKETS for cat, _i in client.gets), "not even read"
+        assert client.state[_SID_SOCKETS] == {i: c for i, (c, _d) in _DETECTION_DERIVED.items()}
 
-    def test_a_non_exempt_mismatch_in_the_same_category_is_still_a_failure(self) -> None:
-        """Generic fallback: mismatches are listed separately from the
-        derived items, and the message says how to declare an exemption."""
-        factory = _sid_fitted_factory({"SID Socket 1 Type": ("6581", "8580")})
-        client = FakeBaselineU64(
-            factory, frozen=set(_DETECTION_DERIVED) | {"SID Socket 1 Type"}
-        )
+    def test_the_rtc_is_never_touched_either(self) -> None:
+        client = FakeBaselineU64()          # Clock Settings reads 2026 vs default 2015
+        report = apply_factory_baseline(client)
+        assert report.ok
+        assert "Clock Settings" not in report.reset and "Clock Settings" not in report.skipped
+        assert not any(cat == "Clock Settings" for _k, cat in client.requests)
+        assert not any(cat == "Clock Settings" for cat, _i in client.gets)
+        assert client.state["Clock Settings"]["Year"] == 2026
+
+    @pytest.mark.parametrize("cat", [_SID_SOCKETS, "Clock Settings", "sid sockets configuration"])
+    def test_passing_the_store_as_a_category_is_refused_with_the_reason(self, cat: str) -> None:
+        client = FakeBaselineU64()
+        with pytest.raises(ValueError) as ei:
+            apply_factory_baseline(client, categories=(CAT_CART, cat))
+        msg = str(ei.value)
+        assert "never" in msg
+        assert ("POWERED OFF" in msg) or ("RTC" in msg), "the refusal names the reason"
+        assert client.requests == [] and client.gets == []
+
+
+class TestCallerExemption:
+    """The generic fallback for the detection-derived class, on a covered
+    category: a post-reset mismatch on a non-exempt item is a hard failure
+    whose message says how to exempt; an exempt item is listed apart."""
+
+    _CAT, _ITEM = CAT_U64_SPECIFIC, "Badline Timing"
+
+    def test_a_non_exempt_mismatch_is_a_failure_that_names_the_remedy(self) -> None:
+        client = FakeBaselineU64(drift={self._CAT: {self._ITEM: "Disabled"}}, frozen={self._ITEM})
         with pytest.raises(U64BaselineError) as ei:
             apply_factory_baseline(client)
         msg = str(ei.value)
-        assert "SID Socket 1 Type" in msg and "6581" in msg and "8580" in msg
-        assert "DETECTION_DERIVED_ITEMS" in msg and "exempt=" in msg, (
-            "the message must say how to declare an exemption"
+        assert self._ITEM in msg and "Disabled" in msg and "Enabled" in msg
+        assert "exempt=" in msg and "BASELINE_NEVER_TOUCH" in msg, (
+            "the message must say how to declare an exemption, per run and for good"
         )
-        assert ei.value.mismatched == {_SID_SOCKETS: {"SID Socket 1 Type": ("6581", "8580")}}
-        assert set(ei.value.report.detection_derived[_SID_SOCKETS]) == set(_DETECTION_DERIVED)
-        assert "SID Socket 1 Type" not in ei.value.report.detection_derived[_SID_SOCKETS]
+        assert ei.value.mismatched == {self._CAT: {self._ITEM: ("Disabled", "Enabled")}}
+        assert ei.value.report.detection_derived == {}
 
-    def test_caller_exemption_is_honoured_and_reported(self) -> None:
-        factory = _sid_fitted_factory({"SID Socket 1 Type": ("6581", "8580")})
-        client = FakeBaselineU64(
-            factory, frozen=set(_DETECTION_DERIVED) | {"SID Socket 1 Type"}
-        )
-        report = apply_factory_baseline(client, exempt=[(_SID_SOCKETS, "SID Socket 1 Type")])
+    def test_caller_exemption_is_honoured_and_reported_apart(self) -> None:
+        client = FakeBaselineU64(drift={self._CAT: {self._ITEM: "Disabled"}}, frozen={self._ITEM})
+        report = apply_factory_baseline(client, exempt=[(self._CAT, self._ITEM)])
         assert report.ok
-        assert report.detection_derived[_SID_SOCKETS]["SID Socket 1 Type"] == ("6581", "8580")
+        assert report.mismatched == {}
+        assert report.detection_derived == {self._CAT: {self._ITEM: ("Disabled", "Enabled")}}
+        assert self._ITEM not in report.drifted.get(self._CAT, {})
+        assert ("reset", self._CAT) in client.requests, "the category is still reset"
+        assert not [r for r in client.requests if r[0] == "put"], "never PUT"
 
-    def test_caller_exemption_cannot_name_a_network_store(self) -> None:
+    def test_an_exempt_item_at_default_is_still_listed(self) -> None:
         client = FakeBaselineU64()
-        with pytest.raises(ValueError, match="never"):
-            apply_factory_baseline(client, exempt=[("Ethernet Settings", "Use DHCP")])
+        report = apply_factory_baseline(client, exempt=[(self._CAT, self._ITEM)])
+        assert report.detection_derived[self._CAT][self._ITEM] == ("Enabled", "Enabled")
+
+    @pytest.mark.parametrize("bad", [("Ethernet Settings", "Use DHCP"), (_SID_SOCKETS, "SID Socket 1"),
+                                     ("Clock Settings", "Year"), ("Drive * Settings", "Drive")])
+    def test_exemption_cannot_name_a_never_touch_store_or_a_glob(self, bad) -> None:
+        client = FakeBaselineU64()
+        with pytest.raises(ValueError):
+            apply_factory_baseline(client, exempt=[bad])
         assert client.requests == []
 
-    def test_summary_counts_the_derived_items(self) -> None:
-        client = FakeBaselineU64(_sid_fitted_factory(), frozen=set(_DETECTION_DERIVED))
-        report = apply_factory_baseline(client)
-        assert "6 detection-derived" in report.summary()
+    def test_summary_counts_the_exempt_items(self) -> None:
+        client = FakeBaselineU64()
+        report = apply_factory_baseline(client, exempt=[(self._CAT, self._ITEM)])
+        assert "1 detection-derived" in report.summary()
 
 
 class TestPackageSurface:
