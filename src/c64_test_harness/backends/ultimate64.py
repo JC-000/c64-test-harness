@@ -206,8 +206,45 @@ class Ultimate64Transport(HardwareTransportBase):
         try:
             client.identify()
         finally:
+            # The client closes its socket when the peer has closed the
+            # connection (issue #223), so the object we stretched may be
+            # dead by now; restoring the timeout on it is then a no-op,
+            # not an error to leak past the Ultimate64Error handling.
             if sock is not None:
-                sock.settimeout(base_timeout)
+                try:
+                    sock.settimeout(base_timeout)
+                except OSError:
+                    pass
+
+    def _socket_dma_send_and_barrier(
+        self, client: SocketDMAClient, addr: int, data: bytes
+    ) -> None:
+        """Send *data* in DMAWRITE chunks, then run the IDENTIFY barrier.
+
+        :raises Ultimate64Error: on a send failure or a barrier failure;
+            the message names the phase.
+        """
+        try:
+            for offset in range(0, len(data), _SOCKET_DMA_CHUNK):
+                chunk = data[offset:offset + _SOCKET_DMA_CHUNK]
+                client.dma_write(addr + offset, chunk)
+        except Ultimate64Error as exc:
+            raise Ultimate64Error(f"send failed: {exc}") from exc
+        # DMAWRITE is fire-and-forget with no per-command ack, so finish with
+        # the in-band IDENTIFY completion barrier (FIFO ordering means the
+        # reply proves every chunk above was consumed and applied).  A tail
+        # read-back alone is NOT a completion barrier: if the tail happens to
+        # match pre-existing RAM (zero padding, re-writing the same buffer,
+        # snapshot restores whose last bytes rarely change) it reports success
+        # while the bulk DMA is still in flight, which can then clobber
+        # subsequent REST writes (e.g. restore_snapshot's $0000/$0001
+        # CPU-port writes).
+        try:
+            self._socket_dma_barrier(client, len(data))
+        except Ultimate64Error as exc:
+            raise Ultimate64Error(
+                f"completion barrier (IDENTIFY) failed: {exc}"
+            ) from exc
 
     def _socket_dma_write(self, addr: int, data: bytes) -> bool:
         """Attempt the SocketDMA fast path for one write.
@@ -220,6 +257,19 @@ class Ultimate64Transport(HardwareTransportBase):
         failure additionally latches the fast path off for this
         transport's lifetime; send failures, barrier failures and verify
         mismatches do not latch.
+
+        A send or barrier failure on a **reused** connection is retried
+        once on a fresh connection before falling back (issue #223).
+        The firmware closes a SocketDMA connection idle for >1 s, and a
+        DMAWRITE written into that closed socket is never read, so the
+        barrier fails with "closed by peer" and the DMA was not applied
+        (U64E fw 3.15, 2026-09-05: 50/50 barrier failures at a 1.5 s
+        inter-write gap, 0/50 at 0.2 s, idle and under REST load alike;
+        the failed write's bytes were in RAM 0/50 times).  The client's
+        own idle reconnect normally reopens the socket in time; the
+        retry covers a connection the device dropped anyway.  Re-sending
+        is safe: the same bytes go to the same address, and the earlier
+        DMA either never happened or wrote a prefix of them.
         """
         client = self._ensure_socket_dma_client()
 
@@ -237,42 +287,40 @@ class Ultimate64Transport(HardwareTransportBase):
             self._socket_dma_unusable = True
             return False
 
-        try:
-            for offset in range(0, len(data), _SOCKET_DMA_CHUNK):
-                chunk = data[offset:offset + _SOCKET_DMA_CHUNK]
-                client.dma_write(addr + offset, chunk)
-        except Ultimate64Error as exc:
-            _log.warning(
-                "SocketDMA send failed at %#06x (%s); falling back to REST "
-                "write_mem for this write",
-                addr,
-                exc,
-            )
-            return False
-
-        # DMAWRITE is fire-and-forget with no per-command ack, so finish with
-        # the in-band IDENTIFY completion barrier (FIFO ordering means the
-        # reply proves every chunk above was consumed and applied).  A tail
-        # read-back alone is NOT a completion barrier: if the tail happens to
-        # match pre-existing RAM (zero padding, re-writing the same buffer,
-        # snapshot restores whose last bytes rarely change) it reports success
-        # while the bulk DMA is still in flight, which can then clobber
-        # subsequent REST writes (e.g. restore_snapshot's $0000/$0001
-        # CPU-port writes).
-        try:
-            self._socket_dma_barrier(client, len(data))
-        except Ultimate64Error as exc:
-            _log.warning(
-                "SocketDMA completion barrier (IDENTIFY) failed after write "
-                "at %#06x (%s); falling back to REST write_mem for this "
-                "write",
-                addr,
-                exc,
-            )
-            # A timed-out barrier can leave its reply unread on the wire;
-            # drop the connection so a later fast-path attempt starts clean.
-            client.close()
-            return False
+        for attempt in (1, 2):
+            try:
+                self._socket_dma_send_and_barrier(client, addr, data)
+                break
+            except Ultimate64Error as exc:
+                # A failed barrier can leave its reply unread on the wire
+                # and a failed send leaves the stream mid-command; drop the
+                # connection so the next attempt starts clean.
+                client.close()
+                if attempt == 1:
+                    _log.warning(
+                        "SocketDMA write at %#06x: %s; retrying once on a "
+                        "fresh connection",
+                        addr,
+                        exc,
+                    )
+                    try:
+                        client.__enter__()
+                    except Ultimate64Error as exc2:
+                        _log.warning(
+                            "SocketDMA reconnect to %s:64 failed (%s); "
+                            "falling back to REST write_mem for this write",
+                            self._client.host,
+                            exc2,
+                        )
+                        return False
+                    continue
+                _log.warning(
+                    "SocketDMA write at %#06x: %s on the retry as well; "
+                    "falling back to REST write_mem for this write",
+                    addr,
+                    exc,
+                )
+                return False
 
         # Post-barrier sanity check: the DMA has been applied, so the tail
         # must read back immediately; the short poll budget only covers REST
