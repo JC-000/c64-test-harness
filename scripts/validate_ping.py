@@ -34,6 +34,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from c64_test_harness.bridge_ping import CS8900A_RXCTL_VALUE
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 from c64_test_harness.backends.vice_manager import PortAllocator
@@ -410,7 +411,10 @@ def main() -> int:
             print(f"MAC: {mac_b.hex(':')}")
 
             # --- Configure RxCTL + LineCTL ---
-            pp_write(t, 0x0104, 0x00D8)  # promiscuous + RxOK
+            # Issue #207: 0x00D8 reads back as 0x00C5 on real silicon
+            # (low 6 bits are the read-only register number), so RxOKA
+            # never lands and the receiver accepts nothing.
+            pp_write(t, 0x0104, CS8900A_RXCTL_VALUE)
             linectl = pp_read(t, 0x0112)
             pp_write(t, 0x0112, linectl | 0x00C0)  # SerRxON + SerTxON
 

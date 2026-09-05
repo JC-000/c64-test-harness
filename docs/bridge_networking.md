@@ -604,7 +604,8 @@ transport_b = connect_binary_transport(port_b, proc=vice_b)
 
 # Wait for BASIC READY (omitted: see _bridge_wait_ready in tests/conftest.py)
 
-# Initialise CS8900a on each instance: RxCTL = 0x00D8, LineCTL |= 0x00C0
+# Initialise CS8900a on each instance: RxCTL = CS8900A_RXCTL_VALUE,
+# LineCTL |= 0x00C0
 # (see _bridge_init_cs8900a in tests/conftest.py for the exact sequence)
 
 # Program unique MAC addresses
@@ -659,12 +660,68 @@ Programming model:
   (PP `0x0138` bit 8) for `Rdy4TxNOW`, then write N bytes to RTDATA.
 * **RX**: poll RxEvent (PP `0x0124` bit 8) for `RxOK`, then read 2
   bytes RxStatus + 2 bytes RxLength + N bytes frame data from RTDATA.
+  **Read the two header words high-half-first** -- see "Real silicon"
+  below; low-half-first works under VICE and desynchronises a real chip.
 * **MAC**: write 3 words to IA registers (PP `0x0158` -- `0x015D`).
-* **RxCTL** (PP `0x0104`): set to `0x00D8` to accept broadcast and
-  IA-matching unicast frames.  See `cs8900a_rxctl_code()` in
-  `c64_test_harness.bridge_ping`.
+* **RxCTL** (PP `0x0104`): set to `CS8900A_RXCTL_VALUE` (`0x0D85`) to
+  accept broadcast and IA-matching unicast frames.  See
+  `cs8900a_rxctl_code()` in `c64_test_harness.bridge_ping`.
 * **LineCTL** (PP `0x0112`): set bits 6 and 7 (`SerRxON` and
   `SerTxON`) to enable RX and TX.
+
+## Real silicon diverges from VICE in three ways
+
+All three were found bringing an external RR-Net cartridge up on a U64E
+expansion port; all three are invisible to the two-VICE bridge suite,
+because VICE is more forgiving than the chip.
+
+**1. RxCTL's low 6 bits are read-only** (issue #207).  On a real CS8900a
+every control/status register reports its own register number in the low
+6 bits -- measured reset values say so throughout: RxCTL `0x0005`,
+LineCTL `0x0013`, SelfCTL `0x0015`, BusCTL `0x0017`, BusST `0x0018`.  The
+harness's old `0x00D8` therefore reads back as **`0x00C5`**, with `RxOKA`
+(`0x0100`) absent, and without `RxOKA` the receiver accepts nothing.
+VICE's rawnetarch forces `rx_ok` internally, which is the only reason
+`0x00D8` ever appeared to work.  `CS8900A_RXCTL_VALUE` is now `0x0D85`
+(PromiscuousA | RxOKA | IndividualA | BroadcastA + register number);
+`CS8900A_RXCTL_VALUE_IP65` (`0x0D05`) is the same without promiscuous,
+which is what ip65 programs and what you want on a busy segment.
+
+**2. RTDATA half ordering is not free choice** (issue #210).  The two
+header words (RxStatus, RxLength) must be read **high half (`$DE09`)
+first**; the data body is then read low half first.  That is ip65's
+`cs8900a.s` ordering.  Reading `$DE08` before `$DE09` for the header
+desynchronises the FIFO by one byte: `RxLength` comes back garbage and
+every data word arrives byte-swapped, so every offset-based check fails
+against a frame that is perfectly correct on the wire.  VICE tolerates
+either order.  `tests/test_cs8900a_frame_reader.py` pins the ordering as
+a unit test precisely because no VICE test can fail on it.
+
+**3. Host-side writes do not reach a hardware cartridge.**  On the U64,
+`transport.write_memory(0xDE02, ...)` goes through the machine's DMA
+engine and does not reach the expansion port -- a DMA read of `$DE00`
+returns `0A 0A 0A ...`, not the chip.  So `ethernet.set_cs8900a_mac()`,
+which programs the Individual Address host-side, is **VICE-only**: on
+hardware the MAC must be written by a 6502 routine.  (This is why
+`CS8900A_RXCTL_VALUE` keeps PromiscuousA: under VICE the same call also
+fails to reach the chip -- host writes land in the RAM under the I/O
+window -- so IndividualA filtering cannot be relied on in the bridge
+tests either.)
+
+### Driving a cartridge on the U64
+
+Two more hardware-only facts, both in issues #209 and #211:
+
+* The cartridge is invisible unless `C64 and Cartridge Settings` ->
+  **`Cartridge Preference` = `External`**.  On the default `Auto` the
+  whole `$DE00` window reads as zeros, which looks exactly like an empty
+  expansion port.  `Bus Operation Mode` is irrelevant.
+* **Do not start the program with `client.run_prg()`** -- its DMA-load
+  path drops the external cartridge, and the loaded program sees `$DE00`
+  as zeros even though the config still reads `External`.  Use
+  `run_prg_via_sys(target, prg)`, which writes the PRG into RAM and types
+  `SYS`.  Stock ip65 `ping.prg` reports `INIT DRIVER: FAILED` under
+  `run_prg` and pings normally under `run_prg_via_sys`.
 
 ## Capture-only sample (host tcpdump)
 
