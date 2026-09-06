@@ -1493,8 +1493,57 @@ class Ultimate64Client:
         self._put_no_body(f"/v1/configs/{_encode(category)}:load_from_flash")
 
     def reset_config_to_default(self) -> None:
-        """PUT /v1/configs:reset_to_default — reset all config (DESTRUCTIVE)."""
+        """PUT /v1/configs:reset_to_default — reset all config (DESTRUCTIVE).
+
+        **Every** store, ``Ethernet Settings`` / ``Network Settings`` / the
+        WiFi store included (firmware ``route_configs.cc``: the global form
+        iterates all stores).  A device configured static flips to DHCP.
+        The harness's entry reset (:func:`~c64_test_harness.backends.
+        ultimate64_baseline.apply_factory_baseline`) never uses this
+        route; prefer :meth:`reset_config_category_to_default`.
+        """
         self._put_no_body("/v1/configs:reset_to_default")
+
+    def reset_config_category_to_default(self, category: str) -> list[str]:
+        """PUT /v1/configs/<category>:reset_to_default — reset one store
+        (DESTRUCTIVE, memory-only).
+
+        The firmware resets every store whose name ``pattern_match``-es
+        *category* (``*``/``?`` globs, case-insensitive; a plain name is
+        an exact match) — ``ConfigStore::reset()`` then ``effectuate()``
+        per store — and answers ``{"reset": [<store names>], "errors":
+        []}``.  Flash is not touched: ``load_config_from_flash`` undoes
+        this and ``save_config_to_flash`` makes it permanent.
+
+        :returns: the store names the firmware reports as reset.  Empty
+            when nothing matched — an absent category is not an error on
+            the wire, so callers that need presence check the list.
+        :raises Ultimate64ProtocolError: on a non-empty ``errors`` array
+            or an unparseable body.
+        :raises Ultimate64Error: HTTP 400 when the path depth exceeds 1.
+        """
+        if not isinstance(category, str) or not category:
+            raise ValueError("category must be a non-empty string")
+        _, data = self._request(
+            "PUT", f"/v1/configs/{_encode(category)}:reset_to_default"
+        )
+        payload = self._parse_json(data) if data else {}
+        if not isinstance(payload, dict):
+            raise Ultimate64ProtocolError(
+                f"expected object from reset_to_default of {category!r}, "
+                f"got {type(payload).__name__}"
+            )
+        errors = payload.get("errors")
+        if errors:
+            raise Ultimate64ProtocolError(
+                f"reset_to_default of {category!r}: device reported errors {errors!r}"
+            )
+        names = payload.get("reset", [])
+        if not isinstance(names, list):
+            raise Ultimate64ProtocolError(
+                f"reset_to_default of {category!r}: 'reset' is not a list: {names!r}"
+            )
+        return [str(n) for n in names]
 
 
 def _build_multipart(

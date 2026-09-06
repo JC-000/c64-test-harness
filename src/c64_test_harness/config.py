@@ -24,6 +24,44 @@ if TYPE_CHECKING:
     from .memory_policy import MemoryPolicy
 
 
+#: The one switch for the U64 reset-on-entry (issue #227), shared by
+#: ``UnifiedManager`` and :meth:`HarnessConfig.from_env`.  The generic
+#: ``C64TEST_U64_BASELINE_ON_ENTRY`` form exists because every field has
+#: one by convention; when both are set the prefixed one wins (it is the
+#: config's own override), see :meth:`HarnessConfig.from_env`.
+U64_BASELINE_ON_ENTRY_ENV = "U64_BASELINE_ON_ENTRY"
+
+_TRUE_WORDS = frozenset({"1", "true", "yes", "on"})
+
+
+def env_flag(name: str) -> bool | None:
+    """Parse an on/off environment switch; ``None`` when unset.
+
+    ``1`` / ``true`` / ``yes`` / ``on`` (case-insensitive, surrounding
+    whitespace ignored) are ``True``; any other value is ``False``.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    return raw.strip().lower() in _TRUE_WORDS
+
+
+def resolve_baseline_on_entry_env(prefix: str = "C64TEST_") -> bool | None:
+    """The one precedence for the U64 entry-reset switch, both paths.
+
+    ``<prefix>U64_BASELINE_ON_ENTRY`` (the config convention form) wins
+    when set; else the shared :data:`U64_BASELINE_ON_ENTRY_ENV`; else
+    ``None`` (nobody asked).  ``UnifiedManager`` and
+    :meth:`HarnessConfig.from_env` both call this, so
+    ``C64TEST_U64_BASELINE_ON_ENTRY=0 U64_BASELINE_ON_ENTRY=1`` is off
+    through either.
+    """
+    prefixed = env_flag(prefix + "U64_BASELINE_ON_ENTRY")
+    if prefixed is not None:
+        return prefixed
+    return env_flag(U64_BASELINE_ON_ENTRY_ENV)
+
+
 def _permissive_policy() -> "MemoryPolicy":
     """Default-factory shim — defers the MemoryPolicy import so this
     module stays import-cheap and never participates in cycles."""
@@ -100,6 +138,21 @@ class HarnessConfig:
     vice_ethernet_driver: str = ""
     vice_ethernet_base: int = 0xDE00
 
+    # Ultimate 64: reset the covered config categories to the firmware's
+    # factory defaults at run entry, inside the DeviceLock, then assert
+    # ``current == default`` per item (issue #227).  TOML
+    # ``[u64] baseline_on_entry = true``; env ``U64_BASELINE_ON_ENTRY`` (the
+    # one name, shared with ``UnifiedManager``; the convention form
+    # ``C64TEST_U64_BASELINE_ON_ENTRY`` wins when both are set).
+    #
+    # Tri-state: ``None`` (the default) means "nobody asked" and defers to
+    # the environment at the manager, so the documented wiring
+    # ``UnifiedManager(..., baseline_on_entry=cfg.u64_baseline_on_entry)``
+    # does not pass an explicit False that beats the shell switch.  A TOML
+    # ``false`` is an explicit off.  Unset everywhere means off -- no
+    # requests are made.
+    u64_baseline_on_entry: bool | None = None
+
     # Memory policy enforced at the transport boundary.  Default is
     # permissive (no checks) so existing configs see no behaviour
     # change; consumers opt in by declaring a ``[memory]`` section in
@@ -126,9 +179,19 @@ class HarnessConfig:
         fields (``memory_policy``) cannot be expressed as an env string;
         setting their env var raises ``ValueError`` rather than smuggling
         a raw string into the config.
+
+        ``u64_baseline_on_entry`` is resolved by
+        :func:`resolve_baseline_on_entry_env`: the prefixed
+        ``<prefix>U64_BASELINE_ON_ENTRY`` wins, else the shared, unprefixed
+        :data:`U64_BASELINE_ON_ENTRY_ENV` (the same switch ``UnifiedManager``
+        reads), else ``None``.  One name opts both paths in, with one
+        precedence.
         """
         config = cls()
+        config.u64_baseline_on_entry = resolve_baseline_on_entry_env(prefix)
         for fld in config.__dataclass_fields__:
+            if fld == "u64_baseline_on_entry":
+                continue        # tri-state; resolved above
             env_key = prefix + fld.upper()
             env_val = os.environ.get(env_key)
             if env_val is not None:

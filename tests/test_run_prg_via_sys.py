@@ -19,6 +19,10 @@ import pytest
 import time
 
 from c64_test_harness import execute as _execute
+from c64_test_harness.backends.ultimate64_helpers import (
+    CARTRIDGE_PREFERENCE_ITEM,
+    CARTRIDGE_SETTINGS_CATEGORY,
+)
 from c64_test_harness.execute import parse_basic_sys_address, run_prg_via_sys
 from c64_test_harness.transport import TimeoutError, TransportError
 from conftest import MockTransport
@@ -452,7 +456,7 @@ class _CartridgeClient:
     def get_config_category(self, category):
         if self.fail_get:
             raise RuntimeError("config API busy")
-        return {category: {"Cartridge Preference": self.preference}, "errors": []}
+        return {category: {CARTRIDGE_PREFERENCE_ITEM: self.preference}, "errors": []}
 
     def set_config_item(self, category, item, value):
         self.puts.append((category, item, value))
@@ -483,7 +487,7 @@ def test_u64_re_puts_external_preference_before_the_reset(monkeypatch):
     )
     assert run_prg_via_sys(t, CC65_PRG) == 2061
     assert t.client.puts == [
-        ("C64 and Cartridge Settings", "Cartridge Preference", "External")
+        (CARTRIDGE_SETTINGS_CATEGORY, CARTRIDGE_PREFERENCE_ITEM, "External")
     ]
     assert order == ["put", "reset"], "the PUT must precede the reset"
 

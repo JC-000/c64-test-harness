@@ -107,6 +107,8 @@ __all__ = [
     "CAT_ULTISID",
     "CAT_AUDIO_MIXER",
     "CAT_DATA_STREAMS",
+    "CARTRIDGE_SETTINGS_CATEGORY",
+    "CARTRIDGE_PREFERENCE_ITEM",
     "get_sid_socket_types",
     "get_sid_addresses",
     "configure_multi_sid",
@@ -143,6 +145,17 @@ CAT_SID_ADDRESSING = "SID Addressing"
 CAT_ULTISID = "UltiSID Configuration"
 CAT_AUDIO_MIXER = "Audio Mixer"
 CAT_DATA_STREAMS = "Data Streams"
+
+#: ``C64 and Cartridge Settings`` under the name the RR-Net recipe uses
+#: (issue #221).  Same string as :data:`CAT_CART`; both are public.
+CARTRIDGE_SETTINGS_CATEGORY = CAT_CART
+#: The expansion-port selector in :data:`CARTRIDGE_SETTINGS_CATEGORY`
+#: (``Auto`` / ``Internal`` / ``External`` / ``Manual``).  On the default
+#: ``Auto`` an external cartridge is invisible to the 6510; ``External``
+#: is what a hardware RR-Net run sets.  Memory-only like every config
+#: PUT (survives ``machine:reboot``, measured 3/3 on 2026-09-05; only a
+#: firmware boot reloads flash), so :func:`snapshot_state` carries it.
+CARTRIDGE_PREFERENCE_ITEM = "Cartridge Preference"
 
 _ITEM_TURBO_CONTROL = "Turbo Control"
 _ITEM_CPU_SPEED = "CPU Speed"
@@ -1224,6 +1237,12 @@ class U64StateSnapshot:
     ``Visual SID Address Editor``, a ``CFG_TYPE_FUNC`` entry the firmware
     omits from a GET altogether (route_configs.cc:26, the ``continue``).
     Empty dict means "not captured", and restore skips it.
+
+    ``cartridge_preference`` (issue #221) is the expansion-port selector
+    a hardware RR-Net run flips to ``External``.  It is memory-only and
+    survives ``machine:reboot``, so without this field it leaked between
+    lanes on a shared device.  Defaults to ``""`` (skipped at restore)
+    like the other late additions.
     """
 
     turbo_control: str
@@ -1234,13 +1253,16 @@ class U64StateSnapshot:
     badline_timing: str = ""
     bus_operation_mode: str = ""
     sid_addressing: dict[str, str] = field(default_factory=dict)
+    cartridge_preference: str = ""
 
 
 def snapshot_state(client: Ultimate64Client) -> U64StateSnapshot:
-    """Capture turbo, REU, cartridge and SID addressing for later restore.
+    """Capture turbo, REU, cartridge, cartridge preference and SID addressing.
 
     Three GETs: ``U64 Specific Settings``, ``C64 and Cartridge
-    Settings``, and the whole ``SID Addressing`` category.
+    Settings`` (REU, ``Cartridge``, ``Bus Operation Mode`` and, since
+    issue #221, ``Cartridge Preference``), and the whole ``SID
+    Addressing`` category.
 
     :param client: Connected Ultimate64 client.
     :returns: :class:`U64StateSnapshot` of the current raw values.
@@ -1263,6 +1285,7 @@ def snapshot_state(client: Ultimate64Client) -> U64StateSnapshot:
             for item, value in sid_addressing.items()
             if isinstance(value, str) and value
         },
+        cartridge_preference=str(cart.get(CARTRIDGE_PREFERENCE_ITEM, "")),
     )
 
 
@@ -1320,6 +1343,12 @@ def restore_state(client: Ultimate64Client, snap: U64StateSnapshot) -> None:
         cart_updates[_ITEM_REU_SIZE] = snap.reu_size
     if snap.bus_operation_mode:
         cart_updates[_ITEM_BUS_OPERATION_MODE] = snap.bus_operation_mode
+    # Cartridge Preference LAST (issue #221): it must not displace the
+    # Cartridge-first invariant above, and its PUT is what re-selects the
+    # expansion port (#217), so it goes out once the REU/cartridge items
+    # it selects between are already back.
+    if snap.cartridge_preference:
+        cart_updates[CARTRIDGE_PREFERENCE_ITEM] = snap.cartridge_preference
     client.set_config_items(CAT_CART, cart_updates)
     if snap.sid_addressing:
         # Mirroring last: put the widening back only once every base

@@ -263,6 +263,18 @@ device" — wasting troubleshooting cycles each time.
 
 ## When power-cycle is the only option
 
+**Cost, stated plainly:** a UCI STATE-bit wedge on the C64 Ultimate put
+the device out of service for about two weeks in August–September 2026,
+because nobody was physically present to power-cycle it. No REST endpoint
+restarts the firmware — `machine:reboot` is `C64::start_cartridge(NULL)`,
+a C64-level reset, and the other `machine:*` routes are menu_button,
+reset, pause, resume, poweroff, writemem and debugreg (firmware
+8fb73523) — so nothing re-initialises lwIP or clears stack-level state
+remotely. Before running a sustained UCI `SOCKET_WRITE` load on a device
+that only a remote agent is using, ask whether anyone can reach its power
+switch this week; if not, do not run it.
+
+
 The currently confirmed cases where physical power-cycle is the **only**
 documented recovery:
 

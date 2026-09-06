@@ -76,7 +76,11 @@ import time
 
 import pytest
 
-from c64_test_harness import create_manager
+from c64_test_harness import (
+    CARTRIDGE_PREFERENCE_ITEM,
+    CARTRIDGE_SETTINGS_CATEGORY,
+    create_manager,
+)
 from c64_test_harness.bridge_ping import (
     CS8900A_RXEVENT_MASK,
     PPDATA_HI,
@@ -107,8 +111,9 @@ pytestmark = [
     pytest.mark.skipif(not _HOST, reason="U64_HOST not set"),
 ]
 
-CAT = "C64 and Cartridge Settings"
-ITEM = "Cartridge Preference"
+# Named in ultimate64_helpers since issue #221.
+CAT = CARTRIDGE_SETTINGS_CATEGORY
+ITEM = CARTRIDGE_PREFERENCE_ITEM
 
 C64_MAC = parse_mac("02:c6:40:00:00:01")
 RXCTL_IA_ONLY = 0x0505          # RxOKA (bit 8) | IndividualA (bit 10) | regnum 5

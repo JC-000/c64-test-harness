@@ -272,9 +272,38 @@ Run both together for a bench that is supposed to be fully wired (e.g. before tr
 C64_REQUIRE_VICE=1 C64_REQUIRE_ELEVATION=1 ~/.local/share/c64-test-harness/venv/bin/pytest tests/test_ethernet.py tests/test_bpf_attach_detection.py -rs
 ```
 
+### `U64_BASELINE_LIVE` / `FLASH_BASELINE_LIVE` — the factory-default baseline (issue #227)
+
+Two opt-in U64 suites, both also gated on `U64_HOST` and `U64_ALLOW_MUTATE=1` (they write config) and both holding the `DeviceLock` for the module:
+
+- **`U64_BASELINE_LIVE=1`** — `tests/test_entry_baseline_live.py`: drifts `Cartridge Preference` / `REU Size`, runs `apply_factory_baseline`, and asserts every covered item on the device reads `current == default`; checks the five never-touch stores (`Ethernet Settings`, `Network Settings`, WiFi, `SID Sockets Configuration`, `Clock Settings`) are byte-identical before/after — for the SID socket store that is the proof the sockets kept their detected state and power; checks the report names the drifted item; `dry_run`; and the `create_manager(backend="u64", baseline_on_entry=True)` path. Only the two items the module itself drifts (`Cartridge Preference`, `REU Size`) are put back at module end — a PUT re-effectuates the whole store it touches, so a "restore everything" sweep would be a second side-effect; the rest of the device is left at the factory baseline. Records `apply_seconds` (one category GET + one reset PUT + one item GET per item).
+- **`FLASH_BASELINE_LIVE=1`** — `tests/test_flash_baseline_live.py`: the owner's flash-vs-default procedure. Per category the device lists **except every `BASELINE_NEVER_TOUCH` store** (the reload's `at_close_config` effectuates: with flash's `Socket=Disabled` it would power the SIDs off, and for the RTC it would write 2015 to the chip; the network stores would re-effectuate the stack the device is reached over): snapshot RAM → `load_config_from_flash(category)` → assert flash `current == default` for every item with a `default` → PUT the snapshot back → verify RAM restored exactly. **Fails, does not skip,** on a flash item that differs from its default, by name — somebody saved to flash, or the firmware was flashed without the format-and-reset option. Run it after every firmware flash and whenever a lane is suspected of saving. Neither suite ever calls `save_config_to_flash`, the global `configs:reset_to_default`, `reset`, `reboot` or `poweroff`, and neither ever PUTs a never-touch store.
+
+The unit contract lives in `tests/test_entry_baseline.py` (mocked; no hardware).
+
 ### `WAV_CAPTURES_REFRESH` — refreshing the committed audio captures
 
 The `U64_HOST`-gated capture suites (`tests/test_chromatic_capture_live.py`, `tests/test_multi_sid_parallel_live.py`) write their `.wav` + `.json` output to a per-run `tmp_path` directory by default, so an ordinary bench run never modifies the tracked reference under `tests/wav_captures/` (issue #220: a live run used to leave ten tracked files changed with no test failing, and the reference drifted with every run). Set `WAV_CAPTURES_REFRESH=1` to write into `tests/wav_captures/<suite>/` instead — a deliberate refresh to review and commit on purpose. The path decision is `tests/wav_capture_paths.py:capture_dir()`; `tests/test_wav_capture_paths.py` pins it without hardware. Each live module's `wav_dir` fixture records the directory it used as a testsuite property and prints it, so a scratch capture can be found afterwards (`-s`, or the junit XML).
+
+### Hardware and network live gates (all opt-in, skip cleanly when unset)
+
+Every gate below needs `U64_HOST` (or the test's own host knob) and the
+`DeviceLock` is taken by the test; gates marked *mutate* also need
+`U64_ALLOW_MUTATE=1` because they write device config and restore it.
+
+| Gate | Test | Needs | What it pins |
+|---|---|---|---|
+| `U64_NOTICE_LIVE=1` | `tests/test_unlocked_notice_live.py` | run with `U64_HOST` unset (host via `U64_NOTICE_HOST`) | unlocked-client notice 0× on a locked lane, 1× bare, thread-scoped under `run_parallel` (#206) |
+| `SID_ADDRESSING_LIVE=1` | `tests/test_sid_addressing_isolation_live.py` | two SIDs fitted | distinct decode with mirroring off, aliasing with it on, read-back raises on mismatch (#204) |
+| `AUDIO_RATE_LIVE=1` | `tests/test_audio_rate_lock_live.py` | NTSC, ≥ 60 s capture | `U64_NTSC_AUDIO_RATE_HZ` via the 64:3 identity; drop/reorder runs discarded (#205) |
+| `RRNET_LIVE=1` | `tests/test_run_prg_cartridge_visibility_live.py`, `tests/test_cs8900a_fifo_live.py`, `tests/test_first_exchange_live.py` | RR-Net on the expansion port, cabled to `RRNET_IFACE` (default `en4`) | runner load path deselects the cartridge (#217), FIFO facts (#219), RX-queue drain before the first exchange (#222) |
+| `SOCKETDMA_LIVE=1` (*mutate* for two tests) | `tests/test_socketdma_barrier_live.py` | "Ultimate DMA Service" enabled | idle-reconnect and the one-retry barrier (#223) |
+| `U64_BASELINE_LIVE=1` (*mutate*) | `tests/test_entry_baseline_live.py` | — | reset-on-entry: drift → per-category reset → every covered item at `default`; never-touch stores untouched (#227) |
+| `FLASH_BASELINE_LIVE=1` (*mutate*) | `tests/test_flash_baseline_live.py` | — | flash equals the firmware default per category (never-touch and `Network Settings` not reloaded) (#227) |
+
+`U64_BASELINE_ON_ENTRY=1` (or TOML `[u64] baseline_on_entry = true`;
+`C64TEST_U64_BASELINE_ON_ENTRY` wins when both are set) turns the entry
+reset on for `create_manager(backend="u64")` lanes; it is off by default.
 
 ## Making the `c64-test` Claude Code skill available globally
 
@@ -313,6 +342,47 @@ The uninstaller only removes the symlink if it points at this repo's copy — it
 - **Per-project symlink** into each C64 project's `.claude/skills/` — works, but N symlinks to maintain and each needs `.gitignore`ing since the target path is machine-specific.
 - **Committed copy per project** — three copies drift instantly; hard pass.
 - **Claude Code plugin + marketplace** — the "official" distribution model, but overkill for a single-user multi-repo setup. Consider if the skill grows beyond this repo's audience.
+
+## Review standard: adversarial review and red/green, every change
+
+This is the working method for every change to this repository, whether
+one agent or a team makes it. It is a standard, not a suggestion; a PR
+that skipped a step says so in its body.
+
+1. **Red first.** Every new or changed test is shown failing against the
+   code as it was (stash the source change, run, restore, quote the failing
+   line in the PR). A test whose expected value equals the system default
+   passes whether or not the code ran, so it is not a test until it has
+   been red.
+2. **Mutation-check the green.** Break the code under test on purpose at
+   least once per fix (drop the guard, return the default, swap the order)
+   and record which tests fail. A mutation that survives is either an
+   equivalent mutant (say so) or a missing test (write it).
+3. **Adversarial review before merge.** A reviewer with a standing brief
+   to assume the implementer is wrong reads the diff, the issue and the
+   authority (firmware source, ip65, the datasheet), runs its own red tests
+   and mutations, and returns ranked findings with a verdict: MERGE,
+   FIX-THEN-MERGE, or BLOCK. The implementer answers every finding; the
+   reviewer re-verifies; only MERGE merges. Findings that are nits are
+   still answered, in the PR body if not in code.
+4. **Measurements carry their conditions.** n, arms, interleaving, device,
+   firmware, date. Pair A/B trials on the shared bench (unpaired small-n
+   runs have "confirmed" three wrong causes here). A claim stated without
+   its scope is the defect class this repository has spent the most time
+   removing; the reviewer's brief includes hunting for it.
+5. **Follow-ups are issues, not memory.** The moment a gap is found that
+   the change will not close, `gh issue create` it with the evidence grade
+   stated, and link it from the PR.
+6. **Validation is local and complete.** There is no CI. The PR body
+   quotes the full-suite figure on the final head from the canonical
+   checkout (`U64_HOST` unset, no foreign VICE at start), the bridge
+   suites with root VICE where networking changed, and the live counts
+   from the device with the `DeviceLock` held where hardware changed.
+
+The mechanics — worktrees with `PYTHONPATH=<worktree>/src` and an import
+proof, serialised VICE runs, the `DeviceLock`, closing issues with a
+comment that names the test — are in the `c64-test` skill and in the
+project's local brief.
 
 ## Follow-ups not in this PR
 

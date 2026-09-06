@@ -120,6 +120,12 @@ class Cs8900aSim:
         return value
 
     def _skip_now(self) -> None:
+        # SkipNow discards the frame at the head of the receive buffer
+        # whether or not any of it has been read: a "blind" SkipNow after
+        # polling RxEvent releases a queued-but-unread frame on silicon
+        # (issues #219, #222 -- the drain in _emit_drain_rx relies on it).
+        if not self._rx_stream and self.rx_queue:
+            self.rx_queue.pop(0)
         self._rx_stream = []
         self._rx_pos = 0
 

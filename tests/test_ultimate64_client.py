@@ -577,6 +577,42 @@ def test_config_flash_endpoints():
     ]
 
 
+def test_reset_config_category_to_default_hits_the_per_category_route():
+    """Issue #227: ``PUT /v1/configs/<category>:reset_to_default`` — the
+    firmware answers ``{"reset": [<store names matched>], "errors": []}``
+    (``route_configs.cc``: ``resp->json->add("reset", list)``), which the
+    method returns.  Never the global ``/v1/configs:reset_to_default``.
+    """
+    mock, captured = _capture(b'{"reset":["Drive A Settings"],"errors":[]}')
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        names = c.reset_config_category_to_default("Drive A Settings")
+    assert names == ["Drive A Settings"]
+    assert [r[0].get_full_url() for r in captured] == [
+        "http://h/v1/configs/Drive%20A%20Settings:reset_to_default",
+    ]
+    assert captured[0][0].get_method() == "PUT"
+    assert captured[0][0].data is None
+
+
+def test_reset_config_category_to_default_unmatched_is_an_empty_list():
+    """A pattern that matches no store resets nothing and says so."""
+    mock, _ = _capture(b'{"reset":[],"errors":[]}')
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        assert c.reset_config_category_to_default("No Such Store") == []
+
+
+def test_reset_config_category_to_default_rejects_empty_and_errors():
+    c = Ultimate64Client("h")
+    with pytest.raises(ValueError):
+        c.reset_config_category_to_default("")
+    mock, _ = _capture(b'{"errors":["boom"]}')
+    with patch("urllib.request.urlopen", mock):
+        with pytest.raises(Ultimate64ProtocolError, match="boom"):
+            c.reset_config_category_to_default("Drive A Settings")
+
+
 def test_load_config_from_flash_single_category():
     """Per-category reload hits ``/v1/configs/<category>:load_from_flash``.
 

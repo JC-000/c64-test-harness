@@ -854,6 +854,32 @@ Two more hardware-only facts, from issues #209, #211 and #217:
   `build_tx_code`, not with these builders.  A U64E + RR-Net pass of the
   new parameters is still owed.  Pinning a static neighbour entry on the
   host remains a valid workaround for code that cannot change.
+* **Drain the chip's RX queue before the first exchange (issue #222):**
+  ``build_ping_and_wait_code`` / ``build_ping_and_wait_tod_code`` take
+  ``drain_first=True``, which SkipNows every frame already queued (at
+  most ``DRAIN_RX_MAX_FRAMES`` = 8) before the first transmit.  Frames
+  that arrive while nobody reads sit in the CS8900a's queue, and an
+  exchange started on top of them loses its reply: the chip counts it in
+  RxMISS ("no receive buffer") and never presents it.  Measured on the
+  U64E + RR-Net (2026-09-05, arms interleaved, n=6 each, LineST read on
+  the 6510 microseconds before each TX, host link watched at 100 ms): the
+  first ping after a fresh reset + chip init + 5 s idle matched 3/6, the
+  same preceded by the drain 6/6, ~1 s after init 6/6, in a steady
+  session 12/12; all 7 misses had LinkOK set, both frames on the wire,
+  no ``en4`` link transition and RxMISS +1, and every miss started with
+  frames queued while every match started with an empty queue.  The
+  stale frames on this bench are the host's own DHCP DISCOVER broadcasts
+  from ``en4`` (342 bytes, ~every 10 s; RxCTL ``$0D05`` accepts
+  broadcast), and the REST ``reset()`` does not reset the chip
+  (RxCTL/LineCTL/IA survive it), so a "fresh session" inherits the old
+  queue.  With three such frames injected, no drain misses 3/3 (RxMISS
+  1 each) and the drain matches 3/3; an empty queue matches 3/3 without
+  it.  A second ping 1 s after a miss matched 7/7, so one retry also
+  covers it.  The promiscuous-mode / link-bounce candidate from the #218
+  review is out (no link transition in 30 trials, LinkOK at every TX).
+  Live: ``tests/test_first_exchange_live.py`` (``RRNET_LIVE=1``); the
+  simulator models blind SkipNow releasing a queued frame
+  (``tests/test_cs8900a_drain.py``).
 
 ## Capture-only sample (host tcpdump)
 

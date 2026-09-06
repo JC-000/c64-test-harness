@@ -63,7 +63,12 @@ import time
 
 import pytest
 
-from c64_test_harness import create_manager, run_prg_via_sys
+from c64_test_harness import (
+    CARTRIDGE_PREFERENCE_ITEM,
+    CARTRIDGE_SETTINGS_CATEGORY,
+    create_manager,
+    run_prg_via_sys,
+)
 from c64_test_harness.bridge_ping import (
     PPDATA_HI,
     PPDATA_LO,
@@ -83,8 +88,9 @@ pytestmark = [
     pytest.mark.skipif(not _HOST, reason="U64_HOST not set"),
 ]
 
-CAT = "C64 and Cartridge Settings"
-ITEM = "Cartridge Preference"
+# Named in ultimate64_helpers since issue #221.
+CAT = CARTRIDGE_SETTINGS_CATEGORY
+ITEM = CARTRIDGE_PREFERENCE_ITEM
 
 RESULT = 0xC1F0                  # PPData lo, PPData hi, run counter
 SENTINEL = b"\xAA\xAA\x00"
