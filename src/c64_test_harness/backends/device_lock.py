@@ -464,9 +464,14 @@ class DeviceLock:
         someone who is never the same process twice.
 
         The bound is therefore a count of *overtakes*, not a duration:
-        after ``_MAX_HOLDER_HANDOFFS`` identity changes the deadline
+        ``_MAX_HOLDER_HANDOFFS`` is the number of identity changes
+        **tolerated**, so that many still extend and the
+        ``_MAX_HOLDER_HANDOFFS`` + 1'th is the one on which the deadline
         stops being re-armed and the caller's ``timeout`` runs out
-        normally.  Being overtaken once or twice is ordinary -- arriving
+        normally.  With the current value of 3, the fourth change is
+        what stops extension -- which is the number the runtime WARNING
+        reports (issue #232; pinned in both directions by
+        ``tests/test_device_lock_starvation.py::TestHandoffBoundary``).  Being overtaken once or twice is ordinary -- arriving
         just as a hold ends is a coincidence, not a pathology -- so the
         first few handoffs still extend, and a holder that settles in
         afterwards gets the same indefinite wait it would have got had

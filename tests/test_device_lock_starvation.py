@@ -181,6 +181,64 @@ class TestIdentityTracking:
         )
 
 
+class TestHandoffBoundary:
+    """The exact overtake at which extension stops (issue #232).
+
+    ``_MAX_HOLDER_HANDOFFS`` is the number of overtakes *tolerated*:
+    ``acquire`` extends while ``handoffs <= _MAX_HOLDER_HANDOFFS`` and
+    increments *on* a change, so N changes still extend and the
+    N+1'th is what stops it. The docstring said "after
+    ``_MAX_HOLDER_HANDOFFS`` identity changes", which reads as one
+    lower, and a downstream consumer propagated the wrong number into
+    five places. The boundary had no test in either direction, which
+    is how it survived; these two are that test.
+
+    Both cases are stated because either alone passes against an
+    off-by-one in the tolerant direction or the strict one.
+    """
+
+    @staticmethod
+    def _chain(changes: int):
+        """Identities that change *changes* times, then settle for ever.
+
+        The first identity read establishes ``observed_pid`` without
+        counting; each later distinct value is one overtake.
+        """
+        pids = [1000 + i for i in range(changes + 1)]
+        return _script(pids + [pids[-1]] * 5000)
+
+    def test_max_handoffs_exactly_still_extends(
+        self, lock_dir: Path, blocked
+    ) -> None:
+        waiter = DeviceLock(HOST, lock_dir, heartbeat_interval=None)
+        with patch.object(
+            waiter, "_holder_progress", self._chain(dl._MAX_HOLDER_HANDOFFS)
+        ):
+            t, box = _waiter_thread(waiter, timeout=0.3, progress_window=60.0)
+            t.join(2.0)
+            still_waiting = t.is_alive()
+        assert still_waiting, (
+            f"{dl._MAX_HOLDER_HANDOFFS} identity changes -- the number the "
+            f"constant says is tolerated -- stopped extension after "
+            f"{box.get('elapsed')}s; the bound is one too strict"
+        )
+
+    def test_one_past_max_handoffs_stops_extending(
+        self, lock_dir: Path, blocked
+    ) -> None:
+        waiter = DeviceLock(HOST, lock_dir, heartbeat_interval=None)
+        with patch.object(
+            waiter, "_holder_progress", self._chain(dl._MAX_HOLDER_HANDOFFS + 1)
+        ):
+            t, box = _waiter_thread(waiter, timeout=0.3, progress_window=60.0)
+            t.join(10.0)
+        assert not t.is_alive(), (
+            f"{dl._MAX_HOLDER_HANDOFFS + 1} identity changes still extended "
+            f"the deadline for ever; the bound is one too tolerant"
+        )
+        assert box["value"] is False
+
+
 class TestStarvationWarning:
     def test_extending_waiter_logs_who_it_is_behind(
         self, lock_dir: Path, blocked, caplog
