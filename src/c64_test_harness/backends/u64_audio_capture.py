@@ -480,7 +480,12 @@ class AudioCapture:
             # BSD (so macOS) needs SO_REUSEPORT as well before two
             # wildcard binds may share a port; SO_REUSEADDR alone still
             # gives EADDRINUSE there.  Absent on some platforms, hence
-            # the guard.
+            # the guard.  Only one of the two flags is under test on this
+            # bench: removing SO_REUSEADDR here passes the whole suite on
+            # macOS, because SO_REUSEPORT alone carries the share. It is
+            # kept because on Linux the roles are the other way round and
+            # SO_REUSEADDR is the load-bearing one -- which nothing here
+            # can catch (rev-232 finding 6).
             if hasattr(socket, "SO_REUSEPORT"):
                 self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         try:
