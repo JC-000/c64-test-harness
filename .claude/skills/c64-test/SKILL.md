@@ -38,6 +38,26 @@ See the supporting files in this skill directory for detailed API reference:
 - `REFERENCE.md` — Full API reference for all c64-test-harness modules
 - `PATTERNS.md` — Battle-tested patterns, templates, and gotchas
 
+## Working method (not optional)
+
+Every change to a C64 test or to the harness goes through **red/green with
+a mutation check, then an adversarial review**, before it merges:
+
+1. Write the test and show it **red** against the code as it was (stash the
+   source change, run, restore). A test whose expected value equals the
+   system default passes whether or not the code ran — it is not a test
+   until it has been red.
+2. Make it green, then **mutate the code under test** at least once (drop
+   the guard, return the default, swap the order) and record which tests
+   fail. A surviving mutation is a missing test.
+3. Run the **`adversarial-reviewer` agent** (`.claude/agents/`) on the
+   branch before merge and answer every finding, nits included. Only a
+   `MERGE` verdict merges.
+
+The full standard, including how measurements must carry their conditions
+and why validation here is local-only, is `docs/development.md`
+§ "Review standard".
+
 ## Core Principles
 
 1. **ALWAYS use `ViceInstanceManager`** for VICE tests — it handles port allocation, PID tracking, transport creation, and cleanup. Never use `ViceProcess` or `PortAllocator` directly. This prevents port collisions and PID conflicts when multiple Claude agents run in parallel.
