@@ -10,14 +10,18 @@ constants, so a wrong constant fails rather than agreeing with itself.
 from __future__ import annotations
 
 import logging
+import socket
+import struct
+import time
 import wave
 from fractions import Fraction
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from c64_test_harness.backends import u64_audio_capture as uac
 from c64_test_harness.backends.u64_audio_capture import (
+    EPHEMERAL_AUDIO_PORT,
     AudioCapture,
     CaptureResult,
     CHANNELS,
@@ -339,6 +343,47 @@ class TestCaptureU64Audio:
         client.stream_audio_stop.assert_called_once()
         assert len(captured) == 1
         assert isinstance(captured[0], U64CaptureResult)
+
+    def test_destination_names_the_port_the_capture_is_listening_on(
+        self, tmp_path
+    ) -> None:
+        """#230: the auto-detect branch, with a real socket behind it.
+
+        Every other test here passes ``stream_destination`` explicitly,
+        so the branch that builds one was never entered. A destination
+        built from the *requested* port would name 0 -- the device would
+        stream into nowhere -- so the port in the string is checked by
+        sending a packet to it and seeing the capture count it.
+        """
+        client = _client()
+        with patch(
+            "c64_test_harness.backends.render_wav_u64._detect_local_ip",
+            return_value="127.0.0.1",
+        ):
+            with capture_u64_audio(
+                client, None,
+                listen_port=EPHEMERAL_AUDIO_PORT, settle_time=0.0,
+            ) as captured:
+                dest = client.stream_audio_start.call_args[0][0]
+                host, _, port_text = dest.partition(":")
+                assert host == "127.0.0.1"
+                port = int(port_text)
+                assert port != 0, (
+                    f"destination {dest!r} names the requested port, not "
+                    f"the bound one"
+                )
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    sock.sendto(
+                        struct.pack("<H", 0) + b"\x00\x01" * 8,
+                        ("127.0.0.1", port),
+                    )
+                finally:
+                    sock.close()
+                time.sleep(0.2)
+        assert captured[0].packets_received == 1, (
+            f"nothing arrived on port {port} from destination {dest!r}"
+        )
 
     def test_the_stream_is_stopped_and_the_wav_written_on_error(
         self, tmp_path

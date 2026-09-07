@@ -312,6 +312,50 @@ class TestPortBinding:
         finally:
             squatter.close()
 
+    def test_busy_port_raises_for_the_default_bind_address(self) -> None:
+        """The case a `127.0.0.1`-only test cannot see.
+
+        Production callers get ``bind_addr=""``. With ``SO_REUSEADDR``
+        set unconditionally, a loopback squatter and a wildcard capture
+        bound *both* -- silently, which is the whole failure mode of
+        #230. Measured on this host: 127.0.0.1 vs "" bound with the flag
+        and raised without it, so the flag was the cause, not the
+        address family.
+        """
+        squatter = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        squatter.bind(("127.0.0.1", 0))
+        busy = squatter.getsockname()[1]
+        try:
+            cap = AudioCapture(port=busy)  # default bind_addr=""
+            with pytest.raises(AudioCapturePortInUseError):
+                cap.start()
+        finally:
+            squatter.close()
+
+    def test_multicast_captures_may_still_share_a_port(self) -> None:
+        """The exception, and why the flag is conditional rather than gone.
+
+        Several listeners on one multicast group and port is the normal
+        case -- the live tests use 239.0.1.65 -- so that must keep
+        working, or the loud-collision fix above has broken it silently.
+        """
+        first = AudioCapture(
+            port=EPHEMERAL_AUDIO_PORT,
+            multicast_group="239.0.1.65",
+            bind_addr="",
+        )
+        first.start()
+        try:
+            second = AudioCapture(
+                port=first.port,
+                multicast_group="239.0.1.65",
+                bind_addr="",
+            )
+            second.start()  # must not raise
+            second.stop()
+        finally:
+            first.stop()
+
     def test_restart_redraws_an_ephemeral_port(self) -> None:
         """A second start() must not re-bind the first port.
 

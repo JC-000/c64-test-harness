@@ -353,6 +353,12 @@ class AudioCapture:
     either way, so nothing downstream will notice on its own. See
     :attr:`CaptureResult.time_base_intact`.
 
+    A busy port fails loudly: :meth:`start` raises
+    :class:`AudioCapturePortInUseError` rather than binding alongside the
+    holder.  ``SO_REUSEADDR`` is set only for a multicast capture, where
+    sharing the port is the point -- so two *multicast* captures on one
+    group and port still coexist by design.
+
     The default *sample_rate* is the nominal 48000, which is 1244 ppm
     away from the U64's real NTSC rate. Pass
     :data:`U64_NTSC_AUDIO_RATE_HZ` for anything timing-sensitive; the
@@ -431,7 +437,26 @@ class AudioCapture:
 
         # Create and bind UDP socket
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if self._multicast_group:
+            # Several listeners sharing one multicast group and port is
+            # the normal case, and needs SO_REUSEADDR.  For a unicast
+            # capture it is the opposite: a second binder is the bug, and
+            # SO_REUSEADDR asks the kernel to hide exactly the collision
+            # issue #230 is about.  Measured on this host, squatter vs
+            # capture bind address, with the flag set:
+            #   127.0.0.1 vs 127.0.0.1 -> EADDRINUSE
+            #   127.0.0.1 vs ""        -> BOUND, no error   <- the default
+            #   0.0.0.0   vs 127.0.0.1 -> BOUND, no error
+            #   0.0.0.0   vs ""        -> EADDRINUSE
+            # With it clear, all four raise EADDRINUSE.  So the flag, not
+            # the address family, is what made a busy port bind silently.
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # BSD (so macOS) needs SO_REUSEPORT as well before two
+            # wildcard binds may share a port; SO_REUSEADDR alone still
+            # gives EADDRINUSE there.  Absent on some platforms, hence
+            # the guard.
+            if hasattr(socket, "SO_REUSEPORT"):
+                self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         try:
             self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self._recv_buf_size)
         except OSError:

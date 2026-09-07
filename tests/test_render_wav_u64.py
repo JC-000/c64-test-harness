@@ -12,7 +12,10 @@ from c64_test_harness.backends.render_wav_u64 import (
     _detect_local_ip,
     capture_sid_u64,
 )
-from c64_test_harness.backends.u64_audio_capture import CaptureResult
+from c64_test_harness.backends.u64_audio_capture import (
+    EPHEMERAL_AUDIO_PORT,
+    CaptureResult,
+)
 
 
 # ---------------------------------------------------------------- helpers
@@ -141,6 +144,45 @@ def test_capture_sid_u64_auto_detect_destination(
 
     mock_detect.assert_called_once_with("192.168.1.81")
     mock_client.stream_audio_start.assert_called_once_with("10.0.0.99:11001")
+
+
+# ------------------------------------------------- destination follows the bound port
+
+
+@patch("c64_test_harness.backends.render_wav_u64.time.sleep")
+@patch("c64_test_harness.backends.render_wav_u64.AudioCapture")
+@patch("c64_test_harness.backends.render_wav_u64._detect_local_ip", return_value="10.0.0.99")
+def test_capture_sid_u64_destination_uses_the_bound_port(
+    mock_detect: MagicMock,
+    mock_cap_cls: MagicMock,
+    mock_sleep: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """The requested port and the bound port must differ here (#230).
+
+    Every other test in this file requests the port it then expects, so
+    the assertion holds whether the source reads ``listen_port`` or
+    ``capture.port`` -- it cannot tell the pre-fix behaviour from the
+    fixed one. With an ephemeral request the two are 0 and 54321, and
+    only reading the bound port gives a destination that exists.
+    """
+    wav = tmp_path / "out.wav"
+    mock_client = MagicMock()
+    mock_client.host = "192.168.1.81"
+    mock_cap = mock_cap_cls.return_value
+    mock_cap.port = 54321  # what the OS handed the bind
+    mock_cap.stop.return_value = _fake_capture_result(wav)
+    _write_dummy_wav(wav)
+
+    capture_sid_u64(
+        mock_client,
+        _fake_sid(),
+        wav,
+        duration_seconds=1.0,
+        listen_port=EPHEMERAL_AUDIO_PORT,
+    )
+
+    mock_client.stream_audio_start.assert_called_once_with("10.0.0.99:54321")
 
 
 # ---------------------------------------------------------------- explicit destination
