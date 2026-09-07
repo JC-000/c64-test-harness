@@ -362,7 +362,11 @@ that skipped a step says so in its body.
    to assume the implementer is wrong reads the diff, the issue and the
    authority (firmware source, ip65, the datasheet), runs its own red tests
    and mutations, and returns ranked findings with a verdict: MERGE,
-   FIX-THEN-MERGE, or BLOCK. The implementer answers every finding; the
+   FIX-THEN-MERGE, or BLOCK. That brief is checked in as a Claude Code
+   subagent, `.claude/agents/adversarial-reviewer.md` — invoke it by name
+   (`adversarial-reviewer`) rather than re-deriving the brief per session,
+   and re-invoke the same agent for the round that re-verifies the fixes.
+   It has no edit tools by design: the implementer applies the fixes. The implementer answers every finding; the
    reviewer re-verifies; only MERGE merges. Findings that are nits are
    still answered, in the PR body if not in code.
 4. **Measurements carry their conditions.** n, arms, interleaving, device,

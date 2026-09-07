@@ -1373,33 +1373,28 @@ Route unwanted SID engines to Unmapped addresses (e.g. `$D500`) so they don't co
 ### 25. Labels is a Mapping — Use It as a Dict
 As of v0.12.4, `Labels` inherits from `collections.abc.Mapping[str, int]`. `dict(Labels.from_file(path))` works; `for name, addr in labels.items(): ...` iterates all entries. `.get()`, `__eq__`, and `__ne__` are inherited for free.
 
-### 26. UDP Test Fixtures: Hold the Placeholder Until Bind
-When a test needs a free UDP port to point a listener at (e.g. `AudioCapture`, any future U64 UDP stream consumer), the obvious helper — bind to port 0, return the assigned port as a bare int — is a TOCTOU trap. Between the helper's close and the listener's `bind()`, any other test in the same process can have the OS hand them the same ephemeral port, producing intermittent `OSError [Errno 48] Address already in use` (see #91). UDP has no TIME_WAIT, and `SO_REUSEADDR` does not protect against this because the colliding socket is freshly bound, not in CLOSED state.
+### 26. UDP Test Fixtures: Let the Listener Own the Ephemeral Port
+When a test needs a free UDP port to point a listener at (e.g. `AudioCapture`, any future U64 UDP stream consumer), the obvious helper — bind to port 0, return the assigned port as a bare int — is a TOCTOU trap. Between the helper's close and the listener's `bind()`, any other process on the host can have the OS hand it the same ephemeral port, producing intermittent `OSError [Errno 48] Address already in use` (#91, and again in the PR #229 full suite: #230). UDP has no TIME_WAIT, and `SO_REUSEADDR` does not protect against this because the colliding socket is freshly bound, not in CLOSED state.
+
+The reserve-then-close-just-before-bind workaround (the old advice here) only ever narrowed the window, and only against *sibling tests in the same process* — the collision that actually happened came from another lane's process on a shared host, which that trick cannot see. The fix is not to shrink the race but to remove it: never hand a port number between two sockets.
 
 **Wrong:**
 ```python
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]  # socket closed here — port is loose
-
-port = _free_port()
+port = _free_port()          # or _reserve_port() + close()
 cap = AudioCapture(port=port)
-cap.start()  # races against any sibling test calling _free_port()
+cap.start()                  # races anything else on the host
 ```
 **Right:**
 ```python
-def _reserve_port() -> tuple[int, socket.socket]:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(("127.0.0.1", 0))
-    return s.getsockname()[1], s  # placeholder stays open
+from c64_test_harness import AudioCapture, EPHEMERAL_AUDIO_PORT
 
-port, placeholder = _reserve_port()
-cap = AudioCapture(port=port)
-placeholder.close()  # release immediately before bind
+cap = AudioCapture(port=EPHEMERAL_AUDIO_PORT)   # 0
 cap.start()
+port = cap.port              # the port actually bound; never 0
 ```
-**Why:** Holding the placeholder across construction keeps the OS from handing the port to anyone else. Closing it just before `cap.start()` shrinks the remaining race window to the kernel close→bind transition (microseconds), which is in practice unreachable from another Python test. Reference: `tests/test_u64_audio_capture.py::_reserve_port`. This is the UDP-test analogue to what `PortAllocator` (with its `flock()` bridge) does for VICE TCP ports — a `flock`-based bridge would be overkill here since the race is intra-process only.
+**Why:** the socket that binds the port is the one that keeps it, so there is no window at all. Read `cap.port` after `start()` — before it, the property reports what was *requested*. Anything that must tell the device where to stream (`stream_audio_start`, and so `capture_sid_u64` / `capture_u64_audio`'s auto-detected `stream_destination`) reads it after the bind for the same reason; a destination computed from a requested `0` streams into nowhere.
+
+A genuinely busy fixed port now raises `AudioCapturePortInUseError` (an `OSError` subclass) naming the port and, where `lsof` is available, its holder — rather than a bare `Errno 48` that says neither. That took removing `SO_REUSEADDR` from the unicast path: with it set, a loopback squatter and a wildcard capture (`bind_addr=""`, the default) **both bound and neither complained**, which is the silent half of #230 — measured here 2026-09-07, all four squatter/capture address combinations raise `EADDRINUSE` once the flag is clear, so the flag was the cause, not the address: detection failed whenever the capture bound something *broader* than the holder (wildcard over `127.0.0.1`), and the kernel then delivered to the more specific socket — a neighbour's capture became a silent zero-packet run. Both are AF_INET; it is specificity, not address family. Multicast is the deliberate exception and keeps `SO_REUSEADDR` + `SO_REUSEPORT`: several listeners on one group and port is the normal case, and BSD needs both flags before two wildcard binds may share a port. Reference: `tests/test_u64_audio_capture.py::TestPortBinding`. This is the UDP-test analogue to what `PortAllocator` (with its `flock()` bridge) does for VICE TCP ports.
 
 ### 27. Suspected flakey `read_bytes()`? Use `read_bytes_verified()` as the diagnostic
 If a test reports byte-mismatched `read_bytes()` results that the C64-side math says can't be a 6502 bug (typical telltale: a round-trip operation like `(a+b)-b == a` closes correctly even though the intermediate displayed `a+b` byte sequence disagrees with `(a+b) mod p`), the prime suspect is the **VICE binary monitor protocol parser** — specifically a response-type misrouting where bytes from one response get fed into another response's parser.
