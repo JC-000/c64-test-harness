@@ -477,8 +477,9 @@ class DeviceLock:
         is ordinary -- arriving just as a hold ends is a coincidence,
         not a pathology -- so the first few handoffs still extend, and a
         holder that settles in afterwards gets the same indefinite wait
-        it would have got had the caller arrived a moment later.  Repeatedly losing the race
-        is the signal that no single holder is accountable.  Nothing
+        it would have got had the caller arrived a moment later.
+        Repeatedly losing the race is the signal that no single holder
+        is accountable.  Nothing
         collapses on the first handoff: when extension does stop, the
         full remaining ``timeout`` is still served.
 
