@@ -5,12 +5,14 @@ import errno
 import os
 import socket
 import struct
+import subprocess
 import time
 import wave
 from pathlib import Path
 
 import pytest
 
+from c64_test_harness.backends import u64_audio_capture as uac
 from c64_test_harness.backends.u64_audio_capture import (
     CHANNELS,
     DEFAULT_AUDIO_PORT,
@@ -244,7 +246,6 @@ def test_audio_capture_packets_received_property() -> None:
         cap.stop()
 
 
-
 # ---------------------------------------------------------------- port binding (#230)
 
 
@@ -308,11 +309,14 @@ class TestPortBinding:
             assert exc.value.port == busy
             assert str(busy) in str(exc.value)
             assert cap.is_capturing is False
-            # A failed start must not leave the object half-started, or
-            # the next start() raises "already started" instead.
-            assert cap._sock is None
         finally:
             squatter.close()
+        # A failed start must not leave the object half-started: with the
+        # squatter gone, the same instance must be startable, which is
+        # the consequence a caller would actually notice (a leaked socket
+        # makes the retry raise "already started" instead).
+        cap.start()
+        cap.stop()
 
     def test_busy_port_raises_for_the_default_bind_address(self) -> None:
         """The case a `127.0.0.1`-only test cannot see.
@@ -338,8 +342,16 @@ class TestPortBinding:
         """The exception, and why the flag is conditional rather than gone.
 
         Several listeners on one multicast group and port is the normal
-        case -- the live tests use 239.0.1.65 -- so that must keep
-        working, or the loud-collision fix above has broken it silently.
+        case, so that must keep working or the loud-collision fix above
+        has broken it silently.
+
+        Two successful binds do not demonstrate this: ``SO_REUSEPORT``
+        distributes *unicast* datagrams to exactly one of the sockets,
+        so a probe sent to 127.0.0.1 arrives at one capture and the test
+        would pass with sharing broken. The probe therefore goes to the
+        group address, which is the traffic the property is about.
+        ``IP_MULTICAST_IF`` is left at the default on purpose -- pinning
+        it to 127.0.0.1 makes both captures receive nothing at all.
         """
         first = AudioCapture(
             port=EPHEMERAL_AUDIO_PORT,
@@ -354,7 +366,26 @@ class TestPortBinding:
                 bind_addr="",
             )
             second.start()  # must not raise
-            second.stop()
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+                try:
+                    for seq in range(6):
+                        sock.sendto(
+                            struct.pack("<H", seq) + _make_pcm(4),
+                            ("239.0.1.65", first.port),
+                        )
+                        time.sleep(0.01)
+                finally:
+                    sock.close()
+                time.sleep(0.3)
+                assert first.packets_received == 6
+                assert second.packets_received == 6, (
+                    "only one capture received the group traffic -- the "
+                    "port is shared but the frames are not"
+                )
+            finally:
+                second.stop()
         finally:
             first.stop()
 
@@ -399,6 +430,34 @@ class TestPortBinding:
             "a permission failure was reported as a busy port"
         )
         assert exc.value.errno == errno.EACCES
+
+    def test_port_holder_never_raises_and_never_hangs(
+        self, monkeypatch
+    ) -> None:
+        """The diagnostic must not be able to fail the call it diagnoses.
+
+        ``_port_holder`` runs inside the exception path of ``start()``.
+        A host without ``lsof``, or one where it is slow, must yield a
+        message without a holder rather than an exception on top of the
+        original one.
+        """
+        free = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        free.bind(("127.0.0.1", 0))
+        port = free.getsockname()[1]
+        free.close()
+        assert uac._port_holder(port) is None  # nobody holds it
+
+        def _no_such_binary(*args, **kwargs):
+            raise FileNotFoundError("lsof")
+
+        monkeypatch.setattr(uac.subprocess, "run", _no_such_binary)
+        assert uac._port_holder(port) is None
+
+        def _times_out(*args, **kwargs):
+            raise subprocess.TimeoutExpired("lsof", 2.0)
+
+        monkeypatch.setattr(uac.subprocess, "run", _times_out)
+        assert uac._port_holder(port) is None
 
     def test_restart_redraws_an_ephemeral_port(self) -> None:
         """A second start() must not re-bind the first port.
