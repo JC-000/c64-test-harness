@@ -1,6 +1,8 @@
 """Unit tests for u64_audio_capture module (AudioCapture, write_wav, CaptureResult)."""
 from __future__ import annotations
 
+import errno
+import os
 import socket
 import struct
 import time
@@ -355,6 +357,48 @@ class TestPortBinding:
             second.stop()
         finally:
             first.stop()
+
+    def test_the_error_carries_errno_eaddrinuse(self) -> None:
+        """The OSError-subclass promise has to be real, not prose.
+
+        The idiomatic handler is
+        ``except OSError as e: if e.errno == errno.EADDRINUSE`` -- which
+        is the exact shape of the failure #230 was filed for. Without an
+        errno set, subclassing OSError silently stops such a caller from
+        matching.
+        """
+        squatter = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        squatter.bind(("127.0.0.1", 0))
+        busy = squatter.getsockname()[1]
+        try:
+            cap = AudioCapture(port=busy, bind_addr="127.0.0.1")
+            with pytest.raises(OSError) as exc:
+                cap.start()
+            assert exc.value.errno == errno.EADDRINUSE
+            # ...without the errno leaking into the message, which is
+            # what passing it through OSError.__init__ would have done.
+            assert not str(exc.value).startswith("[Errno")
+        finally:
+            squatter.close()
+
+    @pytest.mark.skipif(
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        reason="root may bind a privileged port, so there is no EACCES",
+    )
+    def test_a_privilege_failure_is_not_reported_as_in_use(self) -> None:
+        """Port 80 as an ordinary user: nobody holds it, we may not have it.
+
+        Reporting that as "already in use" sends the reader after a
+        holder that does not exist, with a remedy (bind an ephemeral
+        port) that does not address the actual problem.
+        """
+        cap = AudioCapture(port=80, bind_addr="127.0.0.1")
+        with pytest.raises(OSError) as exc:
+            cap.start()
+        assert not isinstance(exc.value, AudioCapturePortInUseError), (
+            "a permission failure was reported as a busy port"
+        )
+        assert exc.value.errno == errno.EACCES
 
     def test_restart_redraws_an_ephemeral_port(self) -> None:
         """A second start() must not re-bind the first port.

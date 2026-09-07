@@ -117,6 +117,10 @@ class AudioCapturePortInUseError(OSError):
     about *which* port or who has it.  Subclasses ``OSError`` so callers
     that already handle bind failures keep working.
 
+    ``errno`` is :data:`errno.EADDRINUSE`, so the idiomatic
+    ``except OSError as e: if e.errno == errno.EADDRINUSE`` keeps
+    matching.
+
     Attributes:
         port: The port that could not be bound.
         holder: Best-effort description of the holding process(es), or
@@ -127,11 +131,18 @@ class AudioCapturePortInUseError(OSError):
         self.port = port
         self.holder = holder
         detail = f" (held by {holder})" if holder else ""
+        # Set after super().__init__ rather than through it: passing the
+        # errno positionally would prepend "[Errno 48] " to str(self).
+        # Without it, `except OSError as e: e.errno == EADDRINUSE` -- the
+        # idiomatic handler, and the exact shape of #230's own failure --
+        # silently stops matching, so the OSError-subclass promise below
+        # would be words only.
         super().__init__(
             f"UDP port {port} is already in use{detail}; pass "
             f"port=EPHEMERAL_AUDIO_PORT (0) and read AudioCapture.port after "
             f"start() to listen on a port nobody else can take"
         )
+        self.errno = errno.EADDRINUSE
 
 
 def _port_holder(port: int) -> str | None:
@@ -359,6 +370,14 @@ class AudioCapture:
     sharing the port is the point -- so two *multicast* captures on one
     group and port still coexist by design.
 
+    **Behaviour change (issue #230).**  Before this, ``SO_REUSEADDR`` was
+    set unconditionally, and a unicast capture could bind a port another
+    process already held -- silently, receiving nothing, because the
+    kernel delivers to the more specific socket.  Nothing in this repo
+    relied on that, but a downstream caller that deliberately shares a
+    unicast port now gets ``AudioCapturePortInUseError`` where it used to
+    get a working-looking capture.  Multicast is unaffected.
+
     The default *sample_rate* is the nominal 48000, which is 1244 ppm
     away from the U64's real NTSC rate. Pass
     :data:`U64_NTSC_AUDIO_RATE_HZ` for anything timing-sensitive; the
@@ -448,8 +467,15 @@ class AudioCapture:
             #   127.0.0.1 vs ""        -> BOUND, no error   <- the default
             #   0.0.0.0   vs 127.0.0.1 -> BOUND, no error
             #   0.0.0.0   vs ""        -> EADDRINUSE
-            # With it clear, all four raise EADDRINUSE.  So the flag, not
-            # the address family, is what made a busy port bind silently.
+            # With it clear, all four raise EADDRINUSE.  So the flag,
+            # not the address, is what made a busy port bind silently:
+            # the two BOUND rows are one asymmetry read both ways --
+            # detection failed whenever the capture bound something
+            # *broader* than the holder (wildcard over 127.0.0.1), and
+            # the kernel then delivered to the more specific socket, so
+            # the neighbour's capture was a silent zero-packet run.
+            # Both addresses are AF_INET throughout; it is specificity,
+            # not address family.
             self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             # BSD (so macOS) needs SO_REUSEPORT as well before two
             # wildcard binds may share a port; SO_REUSEADDR alone still
@@ -469,7 +495,12 @@ class AudioCapture:
         except OSError as exc:
             self._sock.close()
             self._sock = None
-            if exc.errno in (errno.EADDRINUSE, errno.EACCES):
+            # EADDRINUSE only.  EACCES is a privilege failure (a
+            # low-numbered port as an ordinary user), and reporting it as
+            # "already in use" sends the reader after a holder that does
+            # not exist, with a remedy that cannot help.  Let it through
+            # with its own strerror.
+            if exc.errno == errno.EADDRINUSE:
                 raise AudioCapturePortInUseError(
                     self._requested_port, _port_holder(self._requested_port)
                 ) from exc
