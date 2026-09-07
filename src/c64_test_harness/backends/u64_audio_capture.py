@@ -67,9 +67,11 @@ Public API
 """
 from __future__ import annotations
 
+import errno
 import logging
 import socket
 import struct
+import subprocess
 import threading
 import time
 import wave
@@ -82,6 +84,8 @@ __all__ = [
     "CaptureResult",
     "write_wav",
     "DEFAULT_AUDIO_PORT",
+    "EPHEMERAL_AUDIO_PORT",
+    "AudioCapturePortInUseError",
     "DEFAULT_SAMPLE_RATE",
     "CHANNELS",
     "SAMPLE_WIDTH",
@@ -95,6 +99,62 @@ __all__ = [
 _log = logging.getLogger(__name__)
 
 DEFAULT_AUDIO_PORT = 11001
+
+#: Bind an ephemeral port instead of a fixed one.  Pass as ``port`` and
+#: read the port the OS chose from :attr:`AudioCapture.port` after
+#: :meth:`AudioCapture.start`.  This is the only collision-free way to
+#: listen on a shared host: reserving a port by binding it, closing the
+#: socket and re-binding later loses the race with any other process
+#: (issue #230).
+EPHEMERAL_AUDIO_PORT = 0
+
+
+class AudioCapturePortInUseError(OSError):
+    """The requested UDP port is already bound by something else.
+
+    Raised by :meth:`AudioCapture.start` instead of a bare
+    ``OSError: [Errno 48] Address already in use``, which says nothing
+    about *which* port or who has it.  Subclasses ``OSError`` so callers
+    that already handle bind failures keep working.
+
+    Attributes:
+        port: The port that could not be bound.
+        holder: Best-effort description of the holding process(es), or
+            ``None`` when the host offers no way to ask.
+    """
+
+    def __init__(self, port: int, holder: str | None = None) -> None:
+        self.port = port
+        self.holder = holder
+        detail = f" (held by {holder})" if holder else ""
+        super().__init__(
+            f"UDP port {port} is already in use{detail}; pass "
+            f"port=EPHEMERAL_AUDIO_PORT (0) and read AudioCapture.port after "
+            f"start() to listen on a port nobody else can take"
+        )
+
+
+def _port_holder(port: int) -> str | None:
+    """Best-effort name of whatever holds *port*, for the error message.
+
+    Never raises and never blocks for long: a diagnostic that can fail
+    the call it is diagnosing is worse than no diagnostic.
+    """
+    try:
+        proc = subprocess.run(
+            ["lsof", "-nP", f"-iUDP:{port}"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = [ln for ln in proc.stdout.splitlines()[1:] if ln.strip()]
+    if not lines:
+        return None
+    return "; ".join(
+        " ".join(ln.split()[:2]) for ln in lines[:3]
+    )
 
 #: Nominal rate, kept for API stability.  It is what the U64
 #: documentation quotes and what every existing caller passes; it is
@@ -309,7 +369,9 @@ class AudioCapture:
     ) -> None:
         """
         Args:
-            port: UDP port to listen on.
+            port: UDP port to listen on.  :data:`EPHEMERAL_AUDIO_PORT` (0)
+                binds a free port chosen by the OS; read it back from
+                :attr:`port` after :meth:`start` (issue #230).
             sample_rate: Rate the capture is timed against, and (rounded)
                 the WAV header value. Accepts a
                 :class:`~fractions.Fraction`.
@@ -317,6 +379,9 @@ class AudioCapture:
             multicast_group: If set, join this multicast group (e.g. "239.0.1.65").
             recv_buf_size: SO_RCVBUF size hint.
         """
+        self._requested_port = port
+        #: The port actually bound.  Equal to the requested one until
+        #: ``start()`` resolves an ephemeral request.
         self._port = port
         # Validates and rounds; raises here rather than at stop() time,
         # after a capture has already been thrown away.
@@ -371,7 +436,20 @@ class AudioCapture:
             self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self._recv_buf_size)
         except OSError:
             pass  # best-effort buffer size
-        self._sock.bind((self._bind_addr, self._port))
+        # Always bind what the *caller* asked for: a second start() after
+        # a stop() must re-draw an ephemeral port, not re-bind the one the
+        # OS happened to give us last time (which may since have gone).
+        try:
+            self._sock.bind((self._bind_addr, self._requested_port))
+        except OSError as exc:
+            self._sock.close()
+            self._sock = None
+            if exc.errno in (errno.EADDRINUSE, errno.EACCES):
+                raise AudioCapturePortInUseError(
+                    self._requested_port, _port_holder(self._requested_port)
+                ) from exc
+            raise
+        self._port = self._sock.getsockname()[1]
 
         # Join multicast group if requested
         if self._multicast_group:
@@ -500,6 +578,17 @@ class AudioCapture:
             sample_rate_exact=self._exact_rate,
             packets_reordered=packets_reordered,
         )
+
+    @property
+    def port(self) -> int:
+        """The UDP port this capture listens on.
+
+        Before :meth:`start`, the port that was requested.  After it, the
+        port actually bound -- which is the only meaningful value when
+        :data:`EPHEMERAL_AUDIO_PORT` was requested, and the one to hand to
+        ``stream_audio_start`` as the stream destination.
+        """
+        return self._port
 
     @property
     def is_capturing(self) -> bool:

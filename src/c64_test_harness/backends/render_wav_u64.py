@@ -123,7 +123,10 @@ def capture_sid_u64(
         :data:`~c64_test_harness.backends.u64_audio_capture.
         U64_NTSC_AUDIO_RATE_HZ` for timing-sensitive work.
     listen_port:
-        Local UDP port to receive audio packets on.
+        Local UDP port to receive audio packets on.  Pass
+        :data:`~c64_test_harness.backends.u64_audio_capture.EPHEMERAL_AUDIO_PORT`
+        (0) on a shared host to let the OS pick a free one; the
+        auto-detected *stream_destination* then names the bound port.
     listen_addr:
         Local address to bind the UDP socket to (empty = all interfaces).
     stream_destination:
@@ -155,12 +158,6 @@ def capture_sid_u64(
     """
     out_wav = Path(out_wav)
 
-    # --- auto-detect stream destination ---
-    if stream_destination is None:
-        local_ip = _detect_local_ip(client.host)
-        stream_destination = f"{local_ip}:{listen_port}"
-        logger.info("Auto-detected stream destination: %s", stream_destination)
-
     capture = AudioCapture(
         port=listen_port,
         sample_rate=sample_rate,
@@ -171,10 +168,21 @@ def capture_sid_u64(
     capture_started = False
 
     try:
-        # 1. Start the UDP receiver
+        # 1. Start the UDP receiver.  The destination is only knowable
+        #    after the bind: with listen_port=EPHEMERAL_AUDIO_PORT the OS picks
+        #    the port here, and telling the device the requested 0 would
+        #    stream into nowhere (issue #230).
         capture.start()
         capture_started = True
-        logger.info("Audio capture started on port %d", listen_port)
+        logger.info("Audio capture started on port %d", capture.port)
+
+        # --- auto-detect stream destination ---
+        if stream_destination is None:
+            local_ip = _detect_local_ip(client.host)
+            stream_destination = f"{local_ip}:{capture.port}"
+            logger.info(
+                "Auto-detected stream destination: %s", stream_destination
+            )
 
         # 2. Tell the U64 to stream audio to us
         client.stream_audio_start(stream_destination)
@@ -302,11 +310,6 @@ def capture_u64_audio(
         yielding, so the block does not begin mid-handshake.
     :yields: A list that receives the :class:`U64CaptureResult` on exit.
     """
-    if stream_destination is None:
-        local_ip = _detect_local_ip(client.host)
-        stream_destination = f"{local_ip}:{listen_port}"
-        logger.info("Auto-detected stream destination: %s", stream_destination)
-
     capture = AudioCapture(
         port=listen_port,
         sample_rate=sample_rate,
@@ -317,6 +320,13 @@ def capture_u64_audio(
 
     capture.start()
     try:
+        # Only knowable after the bind when listen_port is ephemeral.
+        if stream_destination is None:
+            local_ip = _detect_local_ip(client.host)
+            stream_destination = f"{local_ip}:{capture.port}"
+            logger.info(
+                "Auto-detected stream destination: %s", stream_destination
+            )
         client.stream_audio_start(stream_destination)
         stream_started = True
         logger.info("U64 audio stream started -> %s", stream_destination)

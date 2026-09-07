@@ -91,6 +91,9 @@ def test_capture_sid_u64_calls_in_order(
     mock_client = MagicMock()
     mock_client.host = "192.168.1.81"
     mock_cap = mock_cap_cls.return_value
+    # The destination is built from the port actually bound (#230), so a
+    # MagicMock port would silently produce a nonsense destination.
+    mock_cap.port = 11001
     mock_cap.stop.return_value = _fake_capture_result(wav)
 
     # Create a real WAV file so validation passes
@@ -128,6 +131,9 @@ def test_capture_sid_u64_auto_detect_destination(
     mock_client = MagicMock()
     mock_client.host = "192.168.1.81"
     mock_cap = mock_cap_cls.return_value
+    # The destination is built from the port actually bound (#230), so a
+    # MagicMock port would silently produce a nonsense destination.
+    mock_cap.port = 11001
     mock_cap.stop.return_value = _fake_capture_result(wav)
     _write_dummy_wav(wav)
 
@@ -153,6 +159,9 @@ def test_capture_sid_u64_explicit_destination(
     mock_client = MagicMock()
     mock_client.host = "192.168.1.81"
     mock_cap = mock_cap_cls.return_value
+    # The destination is built from the port actually bound (#230), so a
+    # MagicMock port would silently produce a nonsense destination.
+    mock_cap.port = 11001
     mock_cap.stop.return_value = _fake_capture_result(wav)
     _write_dummy_wav(wav)
 
@@ -183,6 +192,9 @@ def test_capture_sid_u64_cleanup_on_error(
     mock_client.host = "192.168.1.81"
     mock_client.sid_play.side_effect = RuntimeError("SID play failed")
     mock_cap = mock_cap_cls.return_value
+    # The destination is built from the port actually bound (#230), so a
+    # MagicMock port would silently produce a nonsense destination.
+    mock_cap.port = 11001
     mock_cap.stop.return_value = _fake_capture_result(wav)
     _write_dummy_wav(wav)
 
@@ -211,6 +223,9 @@ def test_capture_sid_u64_validates_output(
     mock_client = MagicMock()
     mock_client.host = "192.168.1.81"
     mock_cap = mock_cap_cls.return_value
+    # The destination is built from the port actually bound (#230), so a
+    # MagicMock port would silently produce a nonsense destination.
+    mock_cap.port = 11001
     mock_cap.stop.return_value = _fake_capture_result(wav)
     # Don't create the WAV file -- validation should fail
 
@@ -232,6 +247,9 @@ def test_capture_sid_u64_validates_empty_output(
     mock_client = MagicMock()
     mock_client.host = "192.168.1.81"
     mock_cap = mock_cap_cls.return_value
+    # The destination is built from the port actually bound (#230), so a
+    # MagicMock port would silently produce a nonsense destination.
+    mock_cap.port = 11001
     mock_cap.stop.return_value = _fake_capture_result(wav)
 
     with pytest.raises(RuntimeError, match="empty"):
@@ -254,6 +272,9 @@ def test_capture_sid_u64_custom_params(
     mock_client = MagicMock()
     mock_client.host = "192.168.1.81"
     mock_cap = mock_cap_cls.return_value
+    # The destination is built from the port actually bound (#230), so a
+    # MagicMock port would silently produce a nonsense destination.
+    mock_cap.port = 22222  # a non-ephemeral request binds what was asked
     mock_cap.stop.return_value = _fake_capture_result(wav)
     _write_dummy_wav(wav)
 
