@@ -189,8 +189,9 @@ class TestHandoffBoundary:
     increments *on* a change, so N changes still extend and the
     N+1'th is what stops it. The docstring said "after
     ``_MAX_HOLDER_HANDOFFS`` identity changes", which reads as one
-    lower, and a downstream consumer propagated the wrong number into
-    five places. The boundary had no test in either direction, which
+    lower, and (per issue #232) a downstream consumer propagated the
+    wrong number into several places before an adversarial review
+    measured it. The boundary had no test in either direction, which
     is how it survived; these two are that test.
 
     Both cases are stated because either alone passes against an
