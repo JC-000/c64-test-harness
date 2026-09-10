@@ -388,6 +388,36 @@ proof, serialised VICE runs, the `DeviceLock`, closing issues with a
 comment that names the test — are in the `c64-test` skill and in the
 project's local brief.
 
+### Standing hardware-safety clause: the C64U's `/Temp`
+
+Every review also enforces the C64U wedge clause. The C64 Ultimate
+(10.53.21.158, fw 1.1.0) predates GideonZ/1541ultimate#686 and never
+collects the managed `/Temp` attachments left by body-carrying REST
+calls; enough accumulation crashes the device firmware, taking REST and
+the UCI bridge down together, and only a physical power-cycle recovers it
+— with nobody physically present. The one figure in circulation, "~15
+cycles of a 63 KB PRG", was taken on the U64E at 3.14d with n unrecorded
+and is where a single reproduction stopped, not a capacity; the trigger
+threshold and the crash cause are both unestablished, and budgets are
+sized conservatively as a choice about which error to make. So a change that adds, moves, or widens such a call
+must show where its hygiene comes from and must not be reachable in an
+unbounded loop, and a hygiene pass whose failure is swallowed is a
+blocker rather than a nit. Reviewers do not run live hardware
+themselves; live checks are serialised by the supervisor under the
+`DeviceLock`.
+
+The clause is in force until `DeviceCapabilities.writemem_post_safe`
+reports `True` for that device. **It does not lapse on its own.** That
+needs `_CBM_WRITEMEM_FIXED_FROM`
+(`src/c64_test_harness/backends/u64_capabilities.py:59`) set to the first
+fixed C64U version: it is `None` today, and `_writemem_post_safe`
+short-circuits on that (`:192-195`), grading **every** C64U firmware as
+leak-prone by design. So a firmware bump alone changes nothing — someone
+must first establish which version carries #686 and edit that constant,
+and nothing fails if they do not. Tracked as #248.
+Full statement in CLAUDE.md § "Standing hardware-safety clause" and
+`docs/u64_recovery.md`.
+
 ## Follow-ups not in this PR
 
 - Real fresh-VM validation of `setup-dev-env.sh` (the authoring was done via `--dry-run` only, on an already-set-up machine)

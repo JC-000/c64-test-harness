@@ -82,6 +82,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import weakref
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -172,6 +173,15 @@ _PROCESS_HELD: dict[str, int] = {}
 #: as :data:`_PROCESS_HELD`.
 _PROCESS_HELD_THREADS: dict[str, list[int]] = {}
 _PROCESS_HELD_GUARD = threading.Lock()
+
+#: Sanitized device id -> weak references to (object, method name) pairs
+#: to invoke when this process's outermost hold on that device is
+#: released.  The hook exists so a device client can hand the device to
+#: the next lane clean — see
+#: :func:`register_release_callback`.  Weak, so registering never keeps
+#: a client alive; guarded by :data:`_RELEASE_CALLBACK_GUARD`.
+_RELEASE_CALLBACKS: dict[str, list[tuple[weakref.ref, str]]] = {}
+_RELEASE_CALLBACK_GUARD = threading.Lock()
 
 #: Environment variable that upgrades the advisory warning to a raise.
 REQUIRE_DEVICE_LOCK_ENV = "U64_REQUIRE_DEVICE_LOCK"
@@ -867,7 +877,10 @@ class DeviceLock:
 
         A nested holder (see ``allow_nested``) only drops its reference —
         the flock stays with the outermost holder until that one
-        releases.
+        releases.  Release callbacks
+        (:func:`register_release_callback`) fire only on that outermost
+        release, while the flock is still held, so the device is still
+        exclusively ours while they run.
         """
         if self._nested:
             self._nested = False
@@ -875,6 +888,10 @@ class DeviceLock:
             return
         if self._fd is None:
             return
+        # Hand the device on clean: release callbacks run while the flock
+        # is still held, so anything they do to the device is still
+        # exclusive.  Never raises (see _run_release_callbacks).
+        _run_release_callbacks(self._device_host)
         fd = self._fd
         self._fd = None
         # The flock is going away, so the process no longer holds the
@@ -1688,9 +1705,78 @@ def warn_unlocked_client(
     return True
 
 
+def register_release_callback(device_host: str, obj: object, method: str) -> None:
+    """Call ``obj.<method>(reason=...)`` when this device's lock is released.
+
+    Registered *weakly*: the registry never keeps *obj* alive, and a
+    collected entry is dropped the next time the device is released. The
+    callback runs on the releasing thread, immediately before the flock
+    is dropped, so it still has exclusive use of the device — which is
+    the point: it exists so a device client can leave the hardware clean
+    for the next lane (the Ultimate's ``/Temp`` hygiene drain).
+
+    Callbacks must not raise; one that does is logged and ignored, and
+    the release proceeds regardless. Registering the same object and
+    method twice is a no-op.
+    """
+    key = _sanitize_device_id(device_host)
+    with _RELEASE_CALLBACK_GUARD:
+        entries = _RELEASE_CALLBACKS.setdefault(key, [])
+        for ref, name in entries:
+            if name == method and ref() is obj:
+                return
+        entries.append((weakref.ref(obj), method))
+
+
+def unregister_release_callback(device_host: str, obj: object, method: str) -> None:
+    """Undo one :func:`register_release_callback`. Silent if not registered."""
+    key = _sanitize_device_id(device_host)
+    with _RELEASE_CALLBACK_GUARD:
+        entries = _RELEASE_CALLBACKS.get(key)
+        if not entries:
+            return
+        _RELEASE_CALLBACKS[key] = [
+            (ref, name)
+            for ref, name in entries
+            if not (name == method and ref() is obj)
+        ]
+
+
+def _run_release_callbacks(device_host: str) -> None:
+    """Invoke (and prune) the release callbacks for one device. Never raises."""
+    key = _sanitize_device_id(device_host)
+    with _RELEASE_CALLBACK_GUARD:
+        entries = list(_RELEASE_CALLBACKS.get(key, ()))
+    live: list[tuple[weakref.ref, str]] = []
+    for ref, method in entries:
+        obj = ref()
+        if obj is None:
+            continue
+        live.append((ref, method))
+        try:
+            getattr(obj, method)(reason=f"device lock release for {device_host}")
+        except Exception as exc:  # noqa: BLE001 - a release must never fail
+            _log.debug(
+                "DeviceLock release callback %r on %r raised (%s: %s); ignored",
+                method, obj, type(exc).__name__, exc,
+            )
+    with _RELEASE_CALLBACK_GUARD:
+        if key in _RELEASE_CALLBACKS:
+            registered = _RELEASE_CALLBACKS[key]
+            # Keep anything registered while we were running the callbacks.
+            live_ids = {(id(ref), name) for ref, name in live}
+            _RELEASE_CALLBACKS[key] = [
+                (ref, name)
+                for ref, name in registered
+                if ref() is not None or (id(ref), name) in live_ids
+            ]
+
+
 def _reset_advisory_state() -> None:
     """Clear the warn-once caches and the hold registry (tests only)."""
     _UNLOCKED_SUPPRESS.depth = 0
+    with _RELEASE_CALLBACK_GUARD:
+        _RELEASE_CALLBACKS.clear()
     with _PROCESS_HELD_GUARD:
         _WARNED_HOLDERS.clear()
         _UNLOCKED_WARNED.clear()

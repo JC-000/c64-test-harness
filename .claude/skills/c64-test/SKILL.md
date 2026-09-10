@@ -14,6 +14,75 @@ You are an expert at writing and running tests for Commodore 64 assembly program
 
 The harness runs on **Ubuntu 25+** and **macOS 26 Tahoe (Apple Silicon)**. Full parity is a maintained property — tests must work on both or explicitly skip with a platform-specific reason. Bridge/ethernet tests dispatch all platform-specific constants through `tests/bridge_platform.py` (`IFACE_A`, `IFACE_B`, `BRIDGE_NAME`, `ETHERNET_DRIVER`, `SETUP_HINT`, `iface_present()`) — never hardcode `tap-c64-*` / `br-c64` / `/sys/class/net/...`. On macOS, `ViceProcess` wraps x64sc with `sudo -n` whenever `ethernet=True` (VICE selects a pcap driver only at `geteuid()==0`; `/dev/bpf*` permissions are not consulted, and unelevated it SIGSEGVs on reset). The NOPASSWD entry must name the exact x64sc path launched, never `bash`-wrapped; without it the launch raises `ViceElevationRequiredError` telling you what to run. `probe_vice_pcap_ok()` requires a real `/dev/bpf*` attach so those tests skip instead of passing vacuously. See `docs/development.md` for the full setup (VICE via Homebrew, bridge lifecycle scripts, sudoers recipe).
 
+## Do not wedge the C64U (standing clause, in force until its firmware increments)
+
+The C64 Ultimate (10.53.21.158, fw 1.1.0) is a **shared remote** device
+with nobody physically present. Its firmware predates
+GideonZ/1541ultimate#686, so it never collects the managed `/Temp`
+attachments that every body-carrying REST call leaves behind — `POST
+/v1/machine:writemem`, `runners:run_prg` / `load_prg` / `run_crt` /
+`sidplay` / `modplay`, multipart `mount_disk` and `drives:load_rom`.
+Enough accumulation **crashes the device firmware**: REST and the UCI
+bridge go down together and **only a physical power-cycle recovers it**.
+The C64 FPGA keeps running, so the machine looks alive while the firmware
+is dead — it stops answering the network *and* stops responding to the
+physical menu button. `/Temp` does **not** fill: at the one wedge on
+record the RAM disk was ~31% used. The trigger threshold and the crash
+cause are both unestablished. The 2026-08/09 wedge cost about two
+weeks of a shared device. The one datapoint in circulation — "~15 cycles
+of a 63 KB PRG" (`ultimate64_temp_gc.py` docstring) — was taken on the
+**U64E while it ran 3.14d**, n unrecorded, and is simply where one
+reproduction stopped. It is **not** a capacity, and the old
+count-versus-bytes question is retired: both readings asked about
+`/Temp`'s capacity, and capacity is not what fails. Budget conservatively
+as though the limit were a file count — that is a choice about which
+error to make, not a model — and do not cite 15 as a measured budget for
+anything.
+
+When you write a test that can point at the C64U:
+
+- **Do not hand-roll cleanup.** `/Temp` hygiene belongs in the harness,
+  below your test. If your test needs a manual GC call to be safe, the
+  guard is missing one layer down — fix it there.
+- **Prefer the non-leaking paths.** `write_memory` at or under the
+  device's `write_mem_query_threshold` takes `PUT ?data=` and leaves
+  nothing behind (measured exact and inclusive on the C64U: 128 B → zero
+  attachments, 129 B → exactly one); the SocketDMA fast path
+  (`transport.socket_dma = True`, TCP 64) leaves nothing behind, though
+  that one is reasoned from the code path rather than measured. REST POST
+  is the leaking path — a bulk write that falls back to REST is the one
+  to watch.
+- **Do not assume an API chunks because its name suggests it.**
+  `execute.load_code()` is a bare alias for `transport.write_memory` and
+  `_execute_uci_routine` writes its routine directly; neither chunks, and most
+  assembled blobs are over 128 bytes (UCI builders 133-170, tripled by
+  `turbo_safe=True`; RR-Net builders 193-754). A UCI socket write
+  therefore costs one attachment for its routine code, plus a second
+  **only if the payload itself exceeds 128** — two for the 800/892-byte
+  large-send tests, one for a small write. `enable_uci`/`disable_uci`
+  cost nothing (bodyless config PUTs). Note too that UCI driven from
+  host Python costs a POST per operation, while the same protocol driven
+  C64-side inside an uploaded PRG costs only the upload — so moving a
+  many-operation loop onto the 6510 eliminates the leak. The
+  thing that does chunk is `memory.write_bytes` at 84 B, which is why
+  `run_prg_via_sys` costs nothing on a C64U and bare `client.run_prg()`
+  costs one per call.
+- **Never loop an upload.** A parametrised test or retry loop that
+  re-uploads a PRG is the exact ~15-cycle shape that wedged the device.
+- **Hold the `DeviceLock` across the whole run**, hygiene included, and
+  drain on the way out.
+- **A `TempGCResult` with `.error` set is a failed hygiene pass, not a
+  benign skip.** FTP File Service is off by default on 1.1.0, so the GC
+  silently no-ops there unless enabled. Do not keep uploading after one.
+- **Never `poweroff()`.** `reboot()` is the recovery verb, and it does
+  not clear a UCI STATE-bit wedge.
+- **Do not touch the device at all** when the C64U is not the point of
+  your task. Live gates stay unset by default — keep them that way.
+
+Full statement, and the switch that retires this clause
+(`DeviceCapabilities.writemem_post_safe`), in CLAUDE.md § "Standing
+hardware-safety clause" and `docs/u64_recovery.md`.
+
 ## When to Use This Skill
 
 Use this when:

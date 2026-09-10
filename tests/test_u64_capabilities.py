@@ -162,3 +162,52 @@ def test_capabilities_are_frozen():
     caps = DeviceCapabilities.from_info({"firmware_version": "3.15"})
     with pytest.raises(Exception):
         caps.writemem_post_safe = False  # type: ignore[misc]
+
+
+# ------------------------------------------ threshold/fix coupling invariant
+def test_post_threshold_is_a_pure_function_of_writemem_post_safe():
+    """Threshold-48 and carries-#686 are one value read twice, not two that agree.
+
+    ``write_mem_query_threshold`` is derived from ``writemem_post_safe``
+    alone, in all three legs:
+
+    * fix present -> 48
+    * fix absent -> 128
+    * firmware version unreadable -> 128
+
+    The third leg matters most and is the easiest to leave unpinned:
+    ``_writemem_post_safe`` deliberately answers ``False`` for an
+    unreadable version, because guessing "present" would put small writes
+    back on the leaking POST path while guessing "absent" only costs a
+    higher PUT threshold. A new device generation hits that path first,
+    before anyone has written its version rule.
+
+    Why the coupling is load-bearing: ``memory.write_bytes`` chunks at a
+    fixed 84 bytes -- under 128 but *over* 48 -- so on fixed firmware
+    every chunk takes the POST path. That is safe only because the 48
+    threshold is *selected by* ``writemem_post_safe`` being true, i.e.
+    those POSTs land exactly on the firmware that collects them. Sever
+    the coupling and ``write_bytes`` becomes a leak generator at 84 bytes
+    a chunk.
+    """
+    from c64_test_harness.backends.u64_capabilities import (
+        THRESHOLD_POST_RISKY,
+        THRESHOLD_POST_SAFE,
+    )
+    from c64_test_harness.memory import _WRITE_CHUNK_SIZE
+
+    fixed = DeviceCapabilities.from_info({"firmware_version": "3.15"})
+    assert fixed.writemem_post_safe is True
+    assert fixed.write_mem_query_threshold == THRESHOLD_POST_SAFE == 48
+
+    leaky = DeviceCapabilities.from_info({"firmware_version": "1.1.0"})
+    assert leaky.writemem_post_safe is False
+    assert leaky.write_mem_query_threshold == THRESHOLD_POST_RISKY == 128
+
+    for unreadable in (None, {}, {"firmware_version": "not-a-version"}):
+        caps = DeviceCapabilities.from_info(unreadable)
+        assert caps.writemem_post_safe is False, unreadable
+        assert caps.write_mem_query_threshold == THRESHOLD_POST_RISKY, unreadable
+
+    # The chunk size that makes the coupling matter at all.
+    assert THRESHOLD_POST_SAFE < _WRITE_CHUNK_SIZE < THRESHOLD_POST_RISKY
