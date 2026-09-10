@@ -28,7 +28,7 @@ import urllib.request
 import uuid
 from typing import TYPE_CHECKING, Any
 
-from .u64_capabilities import DeviceCapabilities
+from .u64_capabilities import THRESHOLD_POST_RISKY, DeviceCapabilities
 
 if TYPE_CHECKING:
     from .ultimate64_probe import LivenessResult
@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 
 try:  # device_lock needs fcntl — absent on Windows, optional everywhere
     from .device_lock import advisory_lock_check as _advisory_lock_check
+    from .device_lock import register_release_callback as _register_release_callback
     from .device_lock import warn_unlocked_client as _warn_unlocked_client
 
     _HAS_DEVICE_LOCK = True
@@ -49,6 +50,7 @@ __all__ = [
     "Ultimate64TimeoutError",
     "Ultimate64ProtocolError",
     "Ultimate64UnsafeOperationError",
+    "Ultimate64TempHygieneError",
     "Ultimate64UnreachableError",
     "Ultimate64RunnerStuckError",
     "U64UnreachableError",
@@ -117,6 +119,42 @@ class Ultimate64RunnerStuckError(Ultimate64Error):
     ``recover()`` (which issues a soft reset and optionally a reboot)
     typically clears this. Do NOT call ``poweroff()`` -- that's
     irrecoverable over the network.
+    """
+
+
+class Ultimate64TempHygieneError(Ultimate64Error):
+    """Raised when a leak-prone device's ``/Temp`` hygiene pass cannot run.
+
+    Firmware without the upstream ``/Temp`` collector
+    (GideonZ/1541ultimate#686 — every ``3.14``/``3.13`` build and the
+    whole CBM ``1.x`` line) turns every attachment-creating REST call
+    into a permanent file in the device's ``/Temp`` RAM disk. Enough of
+    them wedge the REST API and the UCI bridge together, and only a
+    physical power-cycle recovers — which on a shared remote device has
+    cost weeks of downtime.
+
+    The harness's mitigation is an FTP-based hygiene pass, and it is
+    *prevention, not recovery* — as a consequence of the failure mode,
+    not as a caution. What wedges is the device firmware itself (the C64
+    FPGA keeps running; the firmware stops answering the network and
+    stops responding to the physical menu button), and the FTP server is
+    part of that firmware. So the pass is unavailable exactly when a
+    device is wedged, and a physical power-cycle is the only instrument
+    left.
+
+    That is what makes this worth raising rather than warning: when the
+    pass cannot run at all (FTP File Service off and not enablable, wrong
+    credentials, no route to the FTP port), continuing to upload walks
+    the device towards the wedge with no second chance to clean up
+    afterwards. Refusing is not a cautious default; it is the only lever
+    still attached. So the client refuses further attachment-creating
+    calls instead. Bodyless calls —
+    ``reset``, ``reboot``, config PUTs, ``readmem`` — are unaffected, so
+    a blocked client can still drive recovery.
+
+    Opt out with ``U64_TEMP_GC_REQUIRED=0`` (or ``temp_hygiene=False`` to
+    disarm the whole pass) if you know the device's ``/Temp`` is being
+    kept clean some other way.
     """
 
 
@@ -195,6 +233,8 @@ class Ultimate64Client:
         *,
         write_mem_query_threshold: int | None = None,
         warn_unlocked: bool = True,
+        temp_hygiene: bool | None = None,
+        temp_gc_budget: int | None = None,
     ) -> None:
         """Construct an Ultimate64 REST client.
 
@@ -225,6 +265,15 @@ class Ultimate64Client:
             silences it globally instead.  Either way nothing about
             locking *behaviour* changes: this suppresses a message, not
             a check.
+        :param temp_hygiene: force the ``/Temp`` hygiene pass on
+            (``True``) or off (``False``) for this client.  ``None``
+            (the default) means *decide from the device*: see
+            :attr:`temp_hygiene_armed`.  Beats the ``U64_AUTO_TEMP_GC``
+            environment variable either way.
+        :param temp_gc_budget: how many attachment-creating requests may
+            go out between hygiene passes.  Defaults to
+            ``$U64_TEMP_GC_BUDGET`` or
+            :data:`~c64_test_harness.backends.ultimate64_temp_gc.DEFAULT_LEAK_BUDGET`.
         """
         if not isinstance(host, str) or not host:
             raise ValueError("host must be a non-empty string")
@@ -245,7 +294,49 @@ class Ultimate64Client:
                 self.host, what="Ultimate64Client", logger=_log
             )
 
+        # ---- /Temp hygiene state (see temp_hygiene_armed) ----
+        from .ultimate64_temp_gc import leak_budget as _leak_budget
+
+        if temp_hygiene is not None and not isinstance(temp_hygiene, bool):
+            raise TypeError("temp_hygiene must be True, False or None")
+        self._temp_hygiene_force: bool | None = temp_hygiene
+        if temp_gc_budget is not None:
+            if not isinstance(temp_gc_budget, int) or temp_gc_budget <= 0:
+                raise ValueError(
+                    f"temp_gc_budget must be a positive int, got {temp_gc_budget!r}"
+                )
+            self._temp_gc_budget = int(temp_gc_budget)
+        else:
+            self._temp_gc_budget = _leak_budget()
+        #: Attachment-creating requests issued since the last successful pass.
+        self._pending_temp_attachments = 0
+        #: Set to the reason string once hygiene is known to be impossible.
+        self._temp_hygiene_blocked: str | None = None
+        #: One attempt per client at turning FTP File Service on.
+        self._ftp_enable_attempted = False
+        #: Re-entrancy guard: the hygiene pass's own REST calls must not
+        #: recurse back into the budget check.
+        self._in_temp_hygiene = False
+
         self._capabilities: DeviceCapabilities | None = None
+        #: Has a firmware probe ever actually been issued? ``False`` means
+        #: nothing was asked and this client is inert by contract (the
+        #: caller pinned the threshold); ``True`` with an unreadable grade
+        #: means a device may well be there and simply did not answer in
+        #: time. Collapsing those two into one "unknown" is what hid the
+        #: re-probe hole. Set inside :meth:`_probe_info`, not here: a
+        #: client built with an explicit threshold that *later* touches
+        #: ``.capabilities`` does probe for real, and setting this only in
+        #: ``__init__``'s else-branch would leave the flag saying
+        #: otherwise and block a re-probe the evidence justifies.
+        self._probe_attempted = False
+        #: One post-evidence re-probe per client (see _maybe_reprobe).
+        self._reprobed = False
+        #: Guard so the probe's own GET cannot recurse into the re-probe.
+        self._probing = False
+        #: Has any request to this host ever completed? That is the
+        #: evidence a timed-out construct-time probe cannot supply.
+        self._saw_successful_request = False
         if write_mem_query_threshold is not None:
             # An explicit threshold pins the behaviour, so the probe is not
             # needed at construction; ``capabilities`` stays lazy and this
@@ -256,8 +347,22 @@ class Ultimate64Client:
                 self.capabilities.write_mem_query_threshold
             )
 
+        self.log_device_grading()
+
+        # Drain /Temp when this device's lock is handed to the next lane.
+        # Registered weakly, so a forgotten client is collected normally.
+        if _HAS_DEVICE_LOCK:
+            _register_release_callback(self.host, self, "_drain_temp_attachments")
+
     def close(self) -> None:
-        """No-op — the client is stateless (uses a fresh connection per call)."""
+        """Release client resources.
+
+        The REST side is stateless (a fresh connection per call), so the
+        only work here is the ``/Temp`` hygiene drain: any attachment
+        this client leaked and has not yet collected is collected now,
+        best-effort. See :attr:`temp_hygiene_armed`.
+        """
+        self._drain_temp_attachments(reason="client close")
         return None
 
     #: Bounded timeout (seconds) for the construct-time firmware probe
@@ -279,17 +384,120 @@ class Ultimate64Client:
             )
         return self._capabilities
 
-    def _probe_info(self) -> dict | None:
-        """``GET /v1/info`` under a short timeout; ``None`` on any failure."""
+    def _probe_info(self, timeout: float | None = None) -> dict | None:
+        """``GET /v1/info``; ``None`` on any failure.
+
+        *timeout* defaults to the bounded
+        :data:`_AUTODETECT_PROBE_TIMEOUT` so an unreachable host does not
+        stall ``__init__``; pass the client's own timeout for a re-probe,
+        where the device has already proven it is there and the only
+        question is how slow it is.
+
+        A failure here is logged at DEBUG and surfaced in the INFO grading
+        line as ``firmware=unknown(probe-failed)`` — distinct from
+        ``unknown(not-attempted)``, which is a different fact. The
+        WARNING lives in :meth:`_maybe_reprobe_capabilities` instead,
+        where a failure has consequences: construction against an
+        unreachable host is routine and warning there would be noise (it
+        would also break the existing contract, pinned in
+        ``test_device_lock_visibility.py``, that construction emits at
+        most the unlocked-client notice). A grade still unreadable at the
+        moment it is about to disarm hygiene *on a device that has
+        answered a request* is the alarming case, and that one warns.
+        """
         original = self.timeout
-        self.timeout = min(self._AUTODETECT_PROBE_TIMEOUT, original)
+        self.timeout = (
+            min(self._AUTODETECT_PROBE_TIMEOUT, original)
+            if timeout is None
+            else timeout
+        )
+        # Set here rather than at the call site: the flag means "a probe
+        # was actually issued", and every probe goes through this method.
+        self._probe_attempted = True
+        self._probing = True
         try:
             info = self.get_info()
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - construction never raises
+            _log.debug(
+                "Ultimate device %s: firmware probe failed after %.2fs (%s: %s); "
+                "capabilities grade as unknown (write threshold %d).",
+                self.host, self.timeout, type(exc).__name__, exc,
+                THRESHOLD_POST_RISKY,
+            )
             return None
         finally:
+            self._probing = False
             self.timeout = original
         return info if isinstance(info, dict) else None
+
+    def _maybe_reprobe_capabilities(self) -> None:
+        """Re-probe once, on evidence that a device is actually there.
+
+        The hole this closes: ``__init__`` probes under a 0.5 s cap and
+        collapses *every* failure into ``None``, which is cached forever,
+        and an unreadable grade disarms ``/Temp`` hygiene. So a real C64U
+        that answers ``/v1/info`` in 501 ms gets no accounting, no budget,
+        no drain and no refusal for the life of that client — with an INFO
+        line indistinguishable from a fake host's.
+
+        The correlation runs the wrong way, which is what makes it
+        dangerous rather than merely untidy: a device is slow to answer
+        when it is loaded or distressed, which is exactly the state of a
+        device accumulating uncollected ``/Temp`` attachments. The mechanism would
+        disarm hardest precisely when it is most needed.
+
+        A completed request is the evidence that settles it — a host that
+        is not there cannot answer one. So once this client has completed
+        one, if the cached grade is unreadable, throw it away and probe
+        again at the full timeout. Once per client. This keeps the
+        off-the-network property intact: a client that never completes a
+        request never re-probes.
+
+        The re-probe fires at the two points where the grade decides
+        something — before an attachment-creating request, and before a
+        drain — rather than from inside ``_request`` itself. Firing it
+        there would inject a ``/v1/info`` GET into the middle of every
+        caller's request stream, which changes observable wire behaviour
+        for every consumer (and broke nine existing tests that assert on
+        exactly which requests a call makes). Deferring costs one thing,
+        bounded and harmless: on a slow-probed device the *first*
+        attachment-creating call is decided on the stale unknown grade.
+        It is still counted, and the second call arms — well inside a
+        budget of 6.
+
+        ``write_mem_query_threshold`` is deliberately *not* recomputed. It
+        was fixed at construction and callers may have reasoned about it;
+        the conservative 128 it holds is safe on any firmware, costing
+        only extra PUTs on a device that turns out to carry the fix.
+        """
+        if self._reprobed or self._probing or not self._probe_attempted:
+            return
+        if not self._saw_successful_request:
+            return
+        caps = self._capabilities
+        if caps is None or caps.firmware_version is not None:
+            return
+        self._reprobed = True
+        info = self._probe_info(timeout=self.timeout)
+        if not isinstance(info, dict):
+            # This is the alarming case, and the only one worth a WARNING:
+            # the device has answered a request, so it is demonstrably
+            # there, yet it will not tell us what firmware it runs -- and
+            # an unreadable grade leaves /Temp hygiene disarmed while
+            # attachments accumulate.
+            _log.warning(
+                "Ultimate device %s: firmware probe failed again at the full "
+                "%.1fs timeout, on a device that has answered a request. "
+                "/Temp hygiene stays DISARMED and attachments will accumulate "
+                "uncollected. If this is a C64U (or any firmware without "
+                "upstream #686), set U64_AUTO_TEMP_GC=1 to force the pass on, "
+                "or pass temp_hygiene=True. See docs/u64_recovery.md.",
+                self.host, self.timeout,
+            )
+            return
+        self._capabilities = DeviceCapabilities.from_info(info)
+        # The grade changed, so the logged grade must too.
+        self.log_device_grading()
 
     # ----------------------------------------------------------------- internal
     def _url(self, path: str) -> str:
@@ -308,6 +516,70 @@ class Ultimate64Client:
     ) -> tuple[int, bytes]:
         if method != "GET":
             self._check_device_lock(f"{method} {path}")
+        leaks = self._creates_temp_attachment(method, body)
+        if leaks:
+            self._before_temp_attachment(f"{method} {path}")
+        try:
+            status, data = self._request_uncounted(
+                method, path, body=body, content_type=content_type, query=query
+            )
+        finally:
+            if leaks:
+                # Counted even when the call failed: the firmware writes
+                # the attachment as the body streams in, so a request
+                # that errors afterwards has still left one behind.
+                self._pending_temp_attachments += 1
+        # Reaching here means the device answered, which is the evidence a
+        # construct-time probe failure could not supply. Only the fact is
+        # recorded here, not the re-probe: firing a GET from inside every
+        # request would inject it into every caller's request stream. The
+        # re-probe happens at the points where the grade actually decides
+        # something (see _maybe_reprobe_capabilities).
+        self._saw_successful_request = True
+        return status, data
+
+    @staticmethod
+    def _creates_temp_attachment(method: str, body: bytes | None) -> bool:
+        """Whether this request leaves a managed file in the device's ``/Temp``.
+
+        The firmware's route table is the authority, and it is unambiguous:
+        a route either binds ``&attachment_writer`` (which streams the
+        request body into a managed ``/Temp`` temp file) or binds ``NULL``
+        (the body is ditched). Every ``POST`` route in
+        ``software/api/route_*.cc`` binds a writer —
+        ``configs``, ``drives:mount``, ``drives:load_rom``,
+        ``machine:writemem``, ``runners:{run_prg,load_prg,run_crt,sidplay}``
+        — and **every** ``PUT`` route binds ``NULL``, which is why
+        ``PUT machine:writemem?data=<hex>`` and the config PUTs are free.
+
+        So the rule is: a body plus ``POST``. That covers every current
+        caller and anything added later, by construction.
+
+        Two deliberate conservatisms:
+
+        * ``POST runners:modplay`` binds ``&attachment_reu`` (the body
+          goes to the REU, not to ``/Temp``) and ``POST machine:input``
+          binds ``&input_json_writer``. Both are counted anyway — the
+          cost is an occasional extra hygiene pass, and neither handler
+          has been read closely enough here to certify it never touches
+          ``/Temp``.
+        * The route table read is a 3.15-line checkout. The C64U's 1.1.0
+          table is not available, so this assumes the verb/handler
+          pairing is the same there. Counting POST-with-body is the safe
+          side of that assumption; a PUT that *did* attach on 1.1.0 would
+          be missed, which is the one gap a live run could close.
+        """
+        return body is not None and method == "POST"
+
+    def _request_uncounted(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: bytes | None = None,
+        content_type: str | None = None,
+        query: dict[str, Any] | None = None,
+    ) -> tuple[int, bytes]:
         url = self._url(path)
         if query:
             # Preserve caller-formatted values (e.g. "0x0400") by stringifying as-is
@@ -353,6 +625,241 @@ class Ultimate64Client:
         if status < 200 or status >= 300:
             self._raise_for_status(status, data, method, url)
         return status, data
+
+    # ------------------------------------------------------ /Temp hygiene
+    def log_device_grading(self) -> None:
+        """Say at INFO which device this is and how it graded.
+
+        Emitted once per client, whether or not anything acts on the
+        grade. That "whether or not" is the point. The hazard this whole
+        mechanism exists for is structurally invisible from a machine
+        carrying the firmware fix: a script issuing hundreds of leaking
+        writes runs perfectly on a 3.15 U64E and wedges a C64U, and
+        nothing in its output tells the author which one they are on. A
+        hygiene pass that silently does the right thing preserves that
+        blindness. One line naming the host, the graded firmware, the
+        capability and the resulting threshold makes it legible in every
+        log, including the logs of runs where nothing went wrong.
+        """
+        caps = self._capabilities
+        if caps is None or caps.firmware_version is None:
+            # These two are not the same fact and must not print the same.
+            # "not-attempted" is inert by contract (the caller pinned the
+            # threshold). "probe-failed" means a device may well be there
+            # and simply did not answer in time -- the case that used to
+            # disarm hygiene silently.
+            why = "not-attempted" if not self._probe_attempted else "probe-failed"
+            grade = (
+                f"firmware=unknown({why}) "
+                f"writemem_post_safe={None if caps is None else caps.writemem_post_safe}"
+            )
+        else:
+            grade = (
+                f"firmware={caps.firmware_version} "
+                f"generation={caps.generation} "
+                f"writemem_post_safe={caps.writemem_post_safe}"
+            )
+        _log.info(
+            "Ultimate device %s: %s write_mem_query_threshold=%d "
+            "/Temp hygiene=%s (leak budget %d, keep-count default). "
+            "POSTs above the threshold leak a /Temp attachment on firmware "
+            "without upstream #686.",
+            self.host,
+            grade,
+            self.write_mem_query_threshold,
+            "armed" if self.temp_hygiene_armed else "disarmed",
+            self._temp_gc_budget,
+        )
+
+    @property
+    def temp_hygiene_armed(self) -> bool:
+        """Whether this client collects the device's ``/Temp`` attachments.
+
+        Decided in this order:
+
+        1. the ``temp_hygiene=`` constructor argument, if given;
+        2. ``$U64_AUTO_TEMP_GC`` — truthy forces the pass on for *any*
+           device, falsy forces it off;
+        3. otherwise the device's firmware:
+           :attr:`~c64_test_harness.backends.u64_capabilities.DeviceCapabilities.runner_wedge_possible`
+           ``False`` (the upstream collector is present — U64E 3.15 and
+           later) disarms; ``True`` or ``None`` (absent, or the version
+           string cannot settle it) arms, because unknown firmware
+           resolves conservatively.
+
+        Note what this is *not* keyed on: the device's address. The C64U
+        is reached through ``$U64_HOST``/``--host`` like any other device
+        and moves between addresses, so an IP allowlist would miss the
+        real path. Capabilities come from ``GET /v1/info``, so the
+        protection follows the device.
+
+        With one exception, which is what keeps the unit suite off the
+        network: if nothing ever answered the capability probe
+        (``firmware_version is None``) there is no device on the far end
+        and therefore no ``/Temp`` to collect, so the pass stays inert.
+        Every fake host in the test suite is in that state, as is a
+        client constructed with an explicit ``write_mem_query_threshold``
+        (which by contract issues no HTTP at construction and so never
+        probes). A real device
+        that is merely *slow* — one whose 0.5 s construct-time probe timed
+        out — lands there too and loses hygiene for the client's lifetime;
+        ``U64_AUTO_TEMP_GC=1`` forces it back on, and passing
+        ``write_mem_query_threshold`` explicitly avoids the probe race
+        entirely. That residue is the one part of this that a live run
+        should confirm.
+        """
+        if self._temp_hygiene_force is not None:
+            return self._temp_hygiene_force
+        from .ultimate64_temp_gc import auto_gc_override as _auto_gc_override
+
+        override = _auto_gc_override()
+        if override is not None:
+            return override
+        # Deliberately reads the *cached* capabilities rather than the
+        # probing property: arming must never issue HTTP of its own, so
+        # a client that has never probed (one constructed with an
+        # explicit write_mem_query_threshold, which documents that it
+        # issues no traffic at all) stays disarmed. Pass
+        # temp_hygiene=True, or set U64_AUTO_TEMP_GC=1, to arm one of
+        # those against a leak-prone device.
+        caps = self._capabilities
+        if caps is None or caps.firmware_version is None:
+            return False
+        # runner_wedge_possible is the inverse of writemem_post_safe and
+        # is the honest name at this call site: the question here is not
+        # "may I POST small payloads" but "can this device wedge under
+        # write load". ``is not False`` keeps the tri-state conservative
+        # — True arms, and so does None (a version string that cannot
+        # settle the question).
+        return caps.runner_wedge_possible is not False
+
+    @property
+    def temp_gc_budget(self) -> int:
+        """Attachment-creating requests allowed between hygiene passes."""
+        return self._temp_gc_budget
+
+    @property
+    def pending_temp_attachments(self) -> int:
+        """Attachments this client has created since the last successful pass."""
+        return self._pending_temp_attachments
+
+    def _before_temp_attachment(self, operation: str) -> None:
+        """Refuse or make room before an attachment-creating request.
+
+        :raises Ultimate64TempHygieneError: when hygiene is armed, has
+            been proven impossible, and ``U64_TEMP_GC_REQUIRED`` has not
+            opted out.
+        """
+        if self._in_temp_hygiene:
+            return
+        self._maybe_reprobe_capabilities()
+        if not self.temp_hygiene_armed:
+            return
+        if self._temp_hygiene_blocked is not None:
+            self._refuse_or_warn(operation)
+            return
+        if self._pending_temp_attachments >= self._temp_gc_budget:
+            self._run_temp_hygiene(
+                f"budget of {self._temp_gc_budget} attachment(s) spent before {operation}"
+            )
+            if self._temp_hygiene_blocked is not None:
+                self._refuse_or_warn(operation)
+
+    def _refuse_or_warn(self, operation: str) -> None:
+        from .ultimate64_temp_gc import hygiene_required as _hygiene_required
+
+        message = (
+            f"refusing {operation} on {self.host}: this firmware "
+            f"({self.capabilities.firmware_version or 'unknown'}) leaks a /Temp "
+            "attachment for every request that carries a body and never collects "
+            "them, and the harness's hygiene pass cannot run: "
+            f"{self._temp_hygiene_blocked}. Continuing would walk the device "
+            "towards the /Temp-accumulation wedge, which only a physical "
+            "power-cycle clears. Remedy: enable Network Settings > FTP File "
+            "Service on the device (and save it to flash), or power-cycle it to "
+            "empty /Temp. To proceed anyway set U64_TEMP_GC_REQUIRED=0, or pass "
+            "temp_hygiene=False to disarm the pass entirely. See "
+            "docs/u64_recovery.md."
+        )
+        if _hygiene_required():
+            raise Ultimate64TempHygieneError(message)
+        _log.warning("U64_TEMP_GC_REQUIRED=0: proceeding anyway. %s", message)
+
+    def _run_temp_hygiene(self, reason: str) -> bool:
+        """Run one hygiene pass; ``True`` if ``/Temp`` was collected.
+
+        Never raises. On failure it makes exactly one attempt, per client,
+        at enabling the device's FTP File Service (off by default on C64U
+        1.1.0, which is the one device that needs this pass) and retries.
+        The enable is a bodyless config PUT — it creates no attachment of
+        its own — and is runtime-only: it lives in firmware RAM until
+        ``save_config_to_flash``, and the power-on that reverts it also
+        empties ``/Temp`` (a RAM disk).
+        """
+        self._in_temp_hygiene = True
+        try:
+            _log.debug("U64 /Temp hygiene on %s: %s", self.host, reason)
+            result = self.gc_temp_folder()
+            if getattr(result, "ok", False):
+                self._pending_temp_attachments = 0
+                self._temp_hygiene_blocked = None
+                return True
+
+            first_error = getattr(result, "error", None)
+            if not self._ftp_enable_attempted:
+                self._ftp_enable_attempted = True
+                # WARNING, not INFO: this mutates the device's config and
+                # the change persists until a firmware power-on (it lives
+                # in firmware RAM; machine:reboot does not clear it). A
+                # deliberate, persistent change to a shared device is not
+                # an INFO-level fact about this run.
+                _log.warning(
+                    "U64 /Temp hygiene on %s failed (%s); enabling Network "
+                    "Settings > FTP File Service and retrying. This config "
+                    "write persists until a firmware power-on -- it is not "
+                    "restored on drain, and machine:reboot does not clear it.",
+                    self.host, first_error,
+                )
+                try:
+                    self.set_config_item(
+                        "Network Settings", "FTP File Service", "Enabled"
+                    )
+                except Exception as exc:  # noqa: BLE001 - hygiene never raises here
+                    _log.info(
+                        "U64 /Temp hygiene on %s: could not enable FTP File "
+                        "Service (%s: %s)",
+                        self.host, type(exc).__name__, exc,
+                    )
+                else:
+                    result = self.gc_temp_folder()
+                    if getattr(result, "ok", False):
+                        self._pending_temp_attachments = 0
+                        self._temp_hygiene_blocked = None
+                        return True
+
+            self._temp_hygiene_blocked = str(
+                getattr(result, "error", None) or first_error or "unknown FTP failure"
+            )
+            return False
+        finally:
+            self._in_temp_hygiene = False
+
+    def _drain_temp_attachments(self, reason: str = "drain") -> None:
+        """Collect whatever this client leaked. Never raises."""
+        try:
+            if self._pending_temp_attachments <= 0:
+                return
+            # Something leaked, so a device is demonstrably there: settle
+            # the grade before deciding not to clean up after it.
+            self._maybe_reprobe_capabilities()
+            if not self.temp_hygiene_armed:
+                return
+            self._run_temp_hygiene(reason)
+        except Exception as exc:  # noqa: BLE001 - a drain must never fail a run
+            _log.debug(
+                "U64 /Temp drain on %s raised (%s: %s); ignored",
+                self.host, type(exc).__name__, exc,
+            )
 
     def _check_device_lock(self, operation: str) -> None:
         """Advisory device-lock check for a state-changing request.
@@ -957,10 +1464,12 @@ class Ultimate64Client:
         :func:`~c64_test_harness.backends.ultimate64_temp_gc.gc_temp_folder`
         with this client's ``host``. Never raises -- any FTP/network
         failure is captured in the returned result's ``.error``.
-        :meth:`run_prg` calls this automatically when
-        ``U64_AUTO_TEMP_GC`` is set; call it directly for other
-        attachment-heavy paths (e.g. repeated :meth:`load_prg`) or to
-        run a manual hygiene pass.
+
+        You rarely need to call this: on a leak-prone device the client
+        calls it for you once the leak budget is spent, on
+        :meth:`close`, and when the device lock is released (see
+        :attr:`temp_hygiene_armed`). Call it directly for a manual pass,
+        or with a non-default ``keep``/credentials.
 
         Caller responsibility: this does not acquire a DeviceLock. Call
         it only while already holding the lock for this device.
@@ -1040,16 +1549,15 @@ class Ultimate64Client:
         the device unreachable until someone physically power-cycles it.
         ``reboot()`` (via ``recover()``) is the correct escalation.
 
-        **Temp-folder hygiene** (issue #153): when the ``U64_AUTO_TEMP_GC``
-        env var is set, this calls :meth:`gc_temp_folder` before
-        uploading, best-effort, to defuse the writemem-exhaustion wedge
-        described above and in ``docs/u64_recovery.md``. Off by default
-        (opt-in) so callers that never set the var see no behavior
-        change and no network traffic beyond the PRG upload itself.
+        **Temp-folder hygiene** (issue #153): this upload is one
+        of the calls that leaks a ``/Temp`` attachment on firmware
+        without the upstream collector, and it is accounted for at the
+        request layer rather than here — see
+        :attr:`temp_hygiene_armed`. On such a device the hygiene pass
+        runs automatically once the budget is spent, on
+        :meth:`close`, and when the device lock is released; on firmware
+        that carries the fix nothing arms and no FTP traffic happens.
         """
-        from .ultimate64_temp_gc import auto_gc_enabled as _auto_gc_enabled
-        if _auto_gc_enabled():
-            self.gc_temp_folder()
         try:
             self._post_binary("/v1/runners:run_prg", data)
         except Ultimate64Error as exc:
@@ -1068,6 +1576,16 @@ class Ultimate64Client:
                 trigger,
             )
             if body:
+                # /Temp accounting: this sideload is a *second* attachment
+                # on a leak-prone device. The runner POST above already
+                # carried the whole body before answering 404, and this
+                # write_mem is unchunked, so it POSTs the body again.
+                # Nothing here has to say so — the request choke point
+                # counts what was actually issued rather than one per
+                # verb — but it is worth knowing that a 404 from
+                # runners:run_prg is itself a wedge symptom, so the path
+                # that costs double fires exactly when the device is
+                # closest to the edge.
                 self.write_mem(load_addr, body)
             self.send_text(trigger, finish_with_return=True)
 
