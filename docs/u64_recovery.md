@@ -20,7 +20,17 @@ order. Each layer has its own probe + recovery primitive.
 This whole wedge family (issues #112, #129, #137) was traced to firmware
 Temp-folder accumulation after the tiers below were first characterised,
 and the mitigations here are **temporary**. `POST /v1/machine:writemem`
-uploads arrive as multipart attachments that land in Temp, and without
+uploads arrive as multipart attachments that land in Temp — visible in the
+firmware route table itself, `software/api/route_machine.cc` at tag `1.1.0`:
+`API_CALL(POST, machine, writemem, &attachment_writer, ...)`, where all
+eleven other `machine:*` registrations pass `NULL`. So POST `writemem` is
+the only attachment-carrying route in that family, from firmware source
+rather than from observed behaviour. (Two limits on what this citation
+buys: it covers the `machine:*` family only — the `runners:*` routes and
+the multipart `mount_disk`/`drives:load_rom` bodies are registered
+elsewhere and are not evidenced by it — and it establishes that
+attachments are *created*, not that accumulation crashes the firmware,
+which remains unestablished as stated below.) and without
 garbage collection the accumulation produces the latency drift and
 eventual wedge described in every tier below.
 
@@ -201,7 +211,9 @@ precisely because nobody has to maintain that table: every one of those
 distinctions falls out of the same choke point.
 
 **Where the protocol is driven decides the exposure.** UCI driven from
-host Python costs an attachment per `_execute_uci_routine` code write, so an
+host Python costs an attachment per `_execute_uci_routine` code write
+*when the emitted routine exceeds the threshold* — which the builders
+mostly do (133-170 B), though probe, peek and `socket_close` do not — so an
 operation made of many `socket_read`s is many attachments; the same
 protocol driven C64-side from inside an uploaded PRG costs only the one
 upload. That is leak *elimination*, not hygiene, and it is the first
@@ -589,13 +601,68 @@ device" — wasting troubleshooting cycles each time.
 the device out of service for about two weeks in August–September 2026,
 because nobody was physically present to power-cycle it. No REST endpoint
 restarts the firmware — `machine:reboot` is `C64::start_cartridge(NULL)`,
-a C64-level reset, and the other `machine:*` routes are menu_button,
-reset, pause, resume, poweroff, writemem and debugreg (firmware
-8fb73523) — so nothing re-initialises lwIP or clears stack-level state
-remotely. Before running a sustained UCI `SOCKET_WRITE` load on a device
+a C64-level reset, and no `machine:*` route restarts the firmware itself —
+so nothing re-initialises lwIP or clears stack-level state remotely.
+(The route list was last enumerated at firmware 8fb73523 as menu_button,
+reset, pause, resume, poweroff, writemem and debugreg. That enumeration was
+**never complete**: at tag `1.1.0` `software/api/route_machine.cc` has twelve
+registrations across ten route names (`writemem` and `debugreg` each
+register two verbs), including the `GET machine:readmem` the harness uses constantly and
+a `GET machine:measure` nothing in this repo mentions. The conclusion is
+unaffected — none of them restarts the firmware — but the seven-route list
+was wrong when written, not outdated: `GET machine:readmem` is the route
+the harness has called since 3.14d and existed at 8fb73523 too. Do not
+re-enumerate at each firmware bump; the method was the problem.) Before running a sustained UCI `SOCKET_WRITE` load on a device
 that only a remote agent is using, ask whether anyone can reach its power
 switch this week; if not, do not run it.
 
+**Was that outage a `/Temp` consequence? Unsettled, and it matters.**
+The two-week outage above is recorded as a UCI STATE-bit wedge. This repo
+elsewhere asserts that the whole wedge family — REST writemem, the runner
+subsystem, **and UCI STATE bits** (issues #112/#129/#137) — was root-caused
+to firmware Temp-folder accumulation. Both claims are in the repo and they
+have never been reconciled for *this* outage.
+
+There is a reason to think they may not be separable: #112 is a
+`SOCKET_WRITE` reproduction, and *that* load does accumulate attachments:
+`build_socket_write` emits 170 B, over the 128-byte PUT threshold, so each
+routine write takes POST. (Not every UCI call does — probe, peek and
+`socket_close` fit under the threshold and cost nothing; the emitted
+routine's size decides. See § "Cost on leak-prone firmware" in
+`uci_networking.md`.) So a `SOCKET_WRITE` load accumulates `/Temp`
+attachments by the same mechanism an upload loop does.
+A UCI wedge and a `/Temp` crash may be one failure reached two ways.
+
+**And there is real evidence the other way, in this same document.** Tier 3's
+"What we've ruled out" records that a UCI STATE-bit wedge is *not* REST —
+`liveness_probe` and `runner_health_check` **both return healthy throughout
+the wedge**. A `/Temp` crash presents in the opposite way: REST and the UCI
+bridge go down *together* with the firmware. Those are mutually exclusive
+presentations, which is a genuine argument that the two failures are
+distinct, whatever shares a trigger upstream.
+
+**A third branch, which may matter most for this particular outage.** The
+canonical Tier-3 UCI STATE-bit wedge **self-clears after ~161 s**. The
+2026-08/09 outage lasted two weeks. That leaves three readings, not two:
+it was not a canonical Tier-3 wedge; or something held it in a state the
+FPGA's own timeout does not reach; **or** — the reading this document
+itself supports — the ~161 s self-clear is *per command*, not device
+recovery, since #112's wedge is recorded as physical-power-cycle-only
+precisely because the next run wedges identically after a reboot. On that
+reading a canonical wedge can leave a device unusable indefinitely with
+nothing unusual involved at all. That is the most that can be said about the outage without the
+owner — and it means the label "UCI STATE-bit wedge" on a two-week outage
+is itself unverified.
+
+What follows regardless: **a duration is not a capacity measurement**, so
+the two-week figure is not evidence for any `/Temp` budget and must not be
+cited as one (CLAUDE.md's hardware-safety clause says the same). What turns
+on the answer: if UCI wedges are `/Temp`-driven, then UCI-heavy work on a
+leak-prone device needs the same budget discipline as upload loops, and the
+hygiene regime covers more failure modes than it currently claims.
+
+**Open question for the owner** — nobody else can settle what happened in
+August–September 2026. Raised by the 2026-09-10 documentation scrub.
 
 The currently confirmed cases where physical power-cycle is the **only**
 documented recovery:
