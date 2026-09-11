@@ -597,9 +597,11 @@ device" — wasting troubleshooting cycles each time.
 
 ## When power-cycle is the only option
 
-**Cost, stated plainly:** a UCI STATE-bit wedge on the C64 Ultimate put
+**Cost, stated plainly:** a `/Temp` firmware crash on the C64 Ultimate put
 the device out of service for about two weeks in August–September 2026,
-because nobody was physically present to power-cycle it. No REST endpoint
+because nobody was physically present to power-cycle it. (Recorded here as
+a UCI STATE-bit wedge until 2026-09-11, when the owner confirmed REST was
+down throughout — see below.) No REST endpoint
 restarts the firmware — `machine:reboot` is `C64::start_cartridge(NULL)`,
 a C64-level reset, and no `machine:*` route restarts the firmware itself —
 so nothing re-initialises lwIP or clears stack-level state remotely.
@@ -616,53 +618,45 @@ re-enumerate at each firmware bump; the method was the problem.) Before running 
 that only a remote agent is using, ask whether anyone can reach its power
 switch this week; if not, do not run it.
 
-**Was that outage a `/Temp` consequence? Unsettled, and it matters.**
-The two-week outage above is recorded as a UCI STATE-bit wedge. This repo
-elsewhere asserts that the whole wedge family — REST writemem, the runner
-subsystem, **and UCI STATE bits** (issues #112/#129/#137) — was root-caused
-to firmware Temp-folder accumulation. Both claims are in the repo and they
-have never been reconciled for *this* outage.
+**Was that outage a `/Temp` consequence? Yes — settled by the owner,
+2026-09-11.** This section previously recorded the two-week outage as a UCI
+STATE-bit wedge, and the Status section above attributes the whole wedge
+family to Temp-folder accumulation. The two labels were never reconciled.
+The owner has now settled it from direct observation: **REST was down**
+during those two weeks.
 
-There is a reason to think they may not be separable: #112 is a
-`SOCKET_WRITE` reproduction, and *that* load does accumulate attachments:
-`build_socket_write` emits 170 B, over the 128-byte PUT threshold, so each
-routine write takes POST. (Not every UCI call does — probe, peek and
-`socket_close` fit under the threshold and cost nothing; the emitted
-routine's size decides. See § "Cost on leak-prone firmware" in
-`uci_networking.md`.) So a `SOCKET_WRITE` load accumulates `/Temp`
-attachments by the same mechanism an upload loop does.
-A UCI wedge and a `/Temp` crash may be one failure reached two ways.
+That is decisive, because this document already records the discriminator.
+A UCI STATE-bit wedge leaves REST *healthy* — Tier 3's "What we've ruled
+out" states that `liveness_probe` and `runner_health_check` both return
+healthy throughout. A `/Temp` crash takes REST and the UCI bridge down
+together with the firmware. REST being down rules the UCI wedge out and
+matches the `/Temp` crash exactly.
 
-**And there is real evidence the other way, in this same document.** Tier 3's
-"What we've ruled out" records that a UCI STATE-bit wedge is *not* REST —
-`liveness_probe` and `runner_health_check` **both return healthy throughout
-the wedge**. A `/Temp` crash presents in the opposite way: REST and the UCI
-bridge go down *together* with the firmware. Those are mutually exclusive
-presentations, which is a genuine argument that the two failures are
-distinct, whatever shares a trigger upstream.
+The owner's account of the presentation, which matches the crash model
+recorded above: the FPGA keeps running and the C64 keyboard stays
+responsive, so the machine looks alive, but the firmware is dead — the
+button on the side of the case will neither soft-power-off nor bring up
+the firmware menu.
 
-**A third branch, which may matter most for this particular outage.** The
-canonical Tier-3 UCI STATE-bit wedge **self-clears after ~161 s**. The
-2026-08/09 outage lasted two weeks. That leaves three readings, not two:
-it was not a canonical Tier-3 wedge; or something held it in a state the
-FPGA's own timeout does not reach; **or** — the reading this document
-itself supports — the ~161 s self-clear is *per command*, not device
-recovery, since #112's wedge is recorded as physical-power-cycle-only
-precisely because the next run wedges identically after a reboot. On that
-reading a canonical wedge can leave a device unusable indefinitely with
-nothing unusual involved at all. That is the most that can be said about the outage without the
-owner — and it means the label "UCI STATE-bit wedge" on a two-week outage
-is itself unverified.
+**Consequences.**
 
-What follows regardless: **a duration is not a capacity measurement**, so
-the two-week figure is not evidence for any `/Temp` budget and must not be
-cited as one (CLAUDE.md's hardware-safety clause says the same). What turns
-on the answer: if UCI wedges are `/Temp`-driven, then UCI-heavy work on a
-leak-prone device needs the same budget discipline as upload loops, and the
-hygiene regime covers more failure modes than it currently claims.
-
-**Open question for the owner** — nobody else can settle what happened in
-August–September 2026. Raised by the 2026-09-10 documentation scrub.
+* The two-week cost **does** belong to the `/Temp` regime and may be cited
+  as such. An earlier revision of this scrub removed that citation from
+  CLAUDE.md and the skill files on the grounds that it belonged to a
+  different mechanism; that removal was based on this document's own
+  mislabelling and has been reversed.
+* This section's "UCI STATE-bit wedge" label on the 2026-08/09 outage is
+  **wrong** and is corrected above. Tier 3's UCI STATE-bit wedge is a real
+  and separate failure (#112) — it simply is not what cost two weeks.
+* What is still **not** established is the crash mechanism. The owner's
+  operating theory is space exhaustion in the RAM disk. That is plausible
+  for this outage, whose `/Temp` occupancy nobody recorded, but note it is
+  not what the one measured reproduction shows: the U64E/3.14d repro
+  wedged with ~5.8% of a 16 MiB RAM disk used (#261). Those are different
+  devices, different firmware and different events, so the repro does not
+  refute exhaustion here — but at least one wedge happened nowhere near
+  full, so "ran out of space" cannot be the whole story for the failure
+  class. Accumulation triggers the crash; why it crashes remains open.
 
 The currently confirmed cases where physical power-cycle is the **only**
 documented recovery:
