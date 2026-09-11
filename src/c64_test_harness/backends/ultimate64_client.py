@@ -1219,6 +1219,22 @@ class Ultimate64Client:
         * **lwIP / UCI stack state survives.** No REST endpoint restarts
           the firmware, so a UCI STATE-bit wedge needs a physical
           power-cycle.
+        * **C64 RAM survives.** The firmware has a separate command for
+          that: ``MENU_C64_CLEARMEM`` is ``clear_ram()`` *plus*
+          ``start_cartridge(NULL)`` (``c64_subsys.cc:232-234``), while
+          this route dispatches ``MENU_C64_REBOOT``, which is
+          ``start_cartridge(NULL)`` alone (``:258-264``) and contains no
+          ``clear_ram``. It does poke ``$8005 = 0`` to clear the CBM80
+          autostart signature, so a cartridge image in RAM will not
+          restart itself — but the bytes are still there.
+
+        What it *does* clear, which the "survives" list above can make
+        easy to miss: ``start_cartridge`` zeroes ``C64_CARTRIDGE_TYPE``,
+        ``C64_REU_ENABLE``, ``C64_SAMPLER_ENABLE`` and
+        ``CMD_IF_SLOT_ENABLE`` (``c64.cc:852+``). So a reboot leaves the
+        REU and the Command Interface slot **disabled** — which is why
+        ``enable_uci`` needs a ``reset()`` and a settle afterwards rather
+        than working straight away.
 
         This docstring used to read "full reboot of the Ultimate device".
         That wording was load-bearing in the wrong direction: it is the
