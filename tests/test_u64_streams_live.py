@@ -5,7 +5,7 @@ DeviceLock is used for cross-process safety.
 
 Example::
 
-    U64_HOST=192.168.1.81 python3 -m pytest tests/test_u64_streams_live.py -v
+    U64_HOST=<device> python3 -m pytest tests/test_u64_streams_live.py -v
 """
 from __future__ import annotations
 
@@ -37,6 +37,20 @@ _PW = os.environ.get("U64_PASSWORD")
 pytestmark = pytest.mark.skipif(
     not _HOST, reason="U64_HOST not set -- live Ultimate device tests disabled",
 )
+
+#: Acceptance band for the fraction of PHI2-high cycles on which BA is
+#: high.  ``BusCycle.is_cpu`` is PHI2-high, so the denominator is every
+#: PHI2 cycle of the capture, and the VIC holds BA low for 3 + 40 cycles
+#: on each of the 25 badlines in a frame.  That puts an idle machine at
+#: 0.9371 (NTSC 6567R8), 0.9359 (6567R56A) or 0.9453 (PAL) -- the U64E
+#: measured 0.93747 -- so the old ">= 0.99" was unreachable rather than
+#: unmet (issue #273).  The band is wide enough for either video
+#: standard and for some sprite DMA, narrow enough to still fail loudly
+#: if ``BusCycle.ba`` is reading ``phi2``, ``rwn`` or the cart-ROM bit.
+#: Pinned against the arithmetic by ``tests/test_ba_badline_band.py``
+#: -- edit there and here together.
+BA_HIGH_MIN = 0.90
+BA_HIGH_MAX = 0.96
 
 
 def _local_ip() -> str:
@@ -145,12 +159,13 @@ def test_debug_bus_cycle_fields(client: Ultimate64Client) -> None:
     )
 
     # BA is active-high on bit 27 per the 1541ultimate firmware
-    # (slot_server_v4.vhd:1196). During normal operation BA stays high
-    # for the overwhelming majority of CPU cycles — the VIC only pulls
-    # BA low during badlines (≤25 per frame out of 312, and only while
-    # PHI2 is in the VIC half). On a 6510-only capture this should be
-    # ≥99% high. If this assertion regresses, the bit positions in
-    # `BusCycle` are almost certainly wrong again.
+    # (slot_server_v4.vhd:1196).  `is_cpu` is PHI2-high, so the
+    # denominator below is every PHI2 cycle -- and the VIC pulls BA low
+    # for 3 + 40 cycles on each of the 25 badlines per frame, which is
+    # ~6.3% of them.  Hence a band, not a ">= 99%": see BA_HIGH_MIN /
+    # BA_HIGH_MAX above and tests/test_ba_badline_band.py.  If this
+    # assertion fires, the bit positions in `BusCycle` are the first
+    # thing to suspect.
     cpu_cycles = [c for c in result.trace if c.is_cpu]
     assert len(cpu_cycles) > 0, "No CPU cycles to evaluate BA on"
     ba_high = sum(1 for c in cpu_cycles if c.ba)
@@ -159,11 +174,19 @@ def test_debug_bus_cycle_fields(client: Ultimate64Client) -> None:
         "BA high on %d / %d CPU cycles (%.4f%%)",
         ba_high, len(cpu_cycles), 100.0 * ba_fraction,
     )
-    assert ba_fraction >= 0.99, (
-        f"Expected BA high on >=99% of CPU cycles (firmware guarantee "
-        f"when VIC isn't stealing badlines), got {100.0 * ba_fraction:.2f}%. "
-        f"This likely means BusCycle.ba reads the wrong bit position — "
-        f"see slot_server_v4.vhd:1183-1228 for the authoritative layout."
+    assert BA_HIGH_MIN <= ba_fraction <= BA_HIGH_MAX, (
+        f"BA high on {100.0 * ba_fraction:.3f}% of PHI2 cycles, outside "
+        f"[{100.0 * BA_HIGH_MIN:.0f}%, {100.0 * BA_HIGH_MAX:.0f}%]. "
+        f"An idle machine sits at 100 * (L*C - 25*(3+40)) / (L*C): "
+        f"93.71% NTSC 6567R8 (263x65), 93.59% 6567R56A (262x64), "
+        f"94.53% PAL (312x63) -- the VIC holds BA low for 3 lead-in "
+        f"cycles plus 40 c-accesses on each of 25 badlines per frame, "
+        f"and BusCycle.is_cpu is PHI2-high so those cycles are in the "
+        f"denominator. Above the band, BusCycle.ba is probably reading "
+        f"phi2 or a stuck-high bit; below it, a dead bit or heavy "
+        f"sprite DMA. See slot_server_v4.vhd:1183-1228 for the "
+        f"authoritative layout and tests/test_ba_badline_band.py for "
+        f"the arithmetic."
     )
 
 

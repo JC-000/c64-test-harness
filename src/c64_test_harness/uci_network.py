@@ -1683,6 +1683,51 @@ class UCIError(Exception):
     """UCI command returned an error."""
 
 
+def _read_status_string(
+    transport: C64Transport,
+    *,
+    status_addr: int = _STATUS_ADDR,
+    stat_len_addr: int = _STAT_LEN_ADDR,
+) -> str:
+    """Read the status string the routine collected, or ``""``.
+
+    Every routine ``build_uci_command`` emits ends with
+    ``_build_read_status``, so the firmware's ASCII status sits at
+    *status_addr* with its length at *stat_len_addr* whenever the
+    command completed -- including for the well-formed replies that
+    leave the ``$C3FF`` error flag clear.  ``$C3FF`` is a *protocol*
+    fault flag (PUSH while non-idle, ``command_protocol.vhd:157``), not
+    the error channel for command outcomes, so this string is the only
+    thing that tells e.g. the firmware's three zero-length
+    ``GET_IPADDR`` branches apart (``network_target.cc:80-100``).
+
+    Only the low byte of the length is read, matching every other
+    length read in this module.
+    """
+    stat_len = transport.read_memory(stat_len_addr, 1)[0]
+    if stat_len == 0:
+        return ""
+    raw = transport.read_memory(status_addr, stat_len)
+    return raw.decode("ascii", errors="replace").rstrip("\x00")
+
+
+def _empty_reply_message(command: str, transport: C64Transport) -> str:
+    """Message for a command that completed with a zero-length reply.
+
+    The firmware answers several failures this way -- a status string
+    and no data -- so the status is the whole diagnosis.  Reporting only
+    "no data" is what made this indistinguishable from "this device has
+    no IP address" for a whole session (issue #273).
+    """
+    status = _read_status_string(transport)
+    if status:
+        return f"UCI {command} returned no data: {status}"
+    return (
+        f"UCI {command} returned no data and no status string "
+        f"(${_STAT_LEN_ADDR:04X} was zero)"
+    )
+
+
 def _execute_uci_routine(
     transport: C64Transport,
     code: bytes,
@@ -1761,11 +1806,7 @@ def _execute_uci_routine(
     # Check error flag
     err = transport.read_memory(error_addr, 1)
     if err[0] != 0x00:
-        stat_len = transport.read_memory(_STAT_LEN_ADDR, 1)[0]
-        status_msg = ""
-        if stat_len > 0:
-            raw = transport.read_memory(_STATUS_ADDR, stat_len)
-            status_msg = raw.decode("ascii", errors="replace")
+        status_msg = _read_status_string(transport)
         raise UCIError(f"UCI command failed: {status_msg}" if status_msg
                        else "UCI command returned error")
 
@@ -1810,12 +1851,18 @@ def uci_get_ip(
         Gateway(4).  This helper extracts the first 4 bytes and formats
         them.  If the response looks like ASCII text (firmware variation),
         it is returned as-is.
+
+    :raises UCIError: on a zero-length reply, carrying the firmware's
+        status string.  The firmware has three such branches
+        (``network_target.cc:80-100``) and they are only distinguishable
+        by that string; this used to return ``""``, which reads as "the
+        device has no IP address" (issue #273).
     """
     code = build_get_ip(turbo_safe=turbo_safe)
     _execute_uci_routine(transport, code, timeout=timeout)
     resp_len = transport.read_memory(_RESP_LEN_ADDR, 1)[0]
     if resp_len == 0:
-        return ""
+        raise UCIError(_empty_reply_message("GET_IP_ADDRESS", transport))
     raw = transport.read_memory(_RESP_ADDR, resp_len)
     # Firmware returns 12 raw bytes: IP(4)+Netmask(4)+Gateway(4).
     # If the response is exactly 12 bytes and looks binary, parse it.
@@ -1834,6 +1881,10 @@ def uci_get_interface_count(
     """Query the number of network interfaces via UCI.
 
     :param turbo_safe: see :func:`build_uci_command`.
+    :raises UCIError: on a zero-length reply, carrying the firmware's
+        status string.  ``0`` is a plausible interface count, so
+        returning it for a failed query was indistinguishable from an
+        answer (issue #273).
     """
     code = build_uci_command(
         target=TARGET_NETWORK,
@@ -1843,7 +1894,7 @@ def uci_get_interface_count(
     _execute_uci_routine(transport, code, timeout=timeout)
     resp_len = transport.read_memory(_RESP_LEN_ADDR, 1)[0]
     if resp_len == 0:
-        return 0
+        raise UCIError(_empty_reply_message("GET_INTERFACE_COUNT", transport))
     return transport.read_memory(_RESP_ADDR, 1)[0]
 
 

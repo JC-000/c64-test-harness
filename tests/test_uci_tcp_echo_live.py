@@ -10,7 +10,7 @@ on the U64 that:
   5. Stores results in C64 memory for readback
 
 Usage:
-    U64_HOST=192.168.1.81 pytest tests/test_uci_tcp_echo_live.py -v
+    U64_HOST=<device> pytest tests/test_uci_tcp_echo_live.py -v
 
 Note on CPU speed:
     This test hand-writes its own 6502 routine (not via the uci_network
@@ -505,7 +505,9 @@ def test_uci_tcp_echo_roundtrip() -> None:
     print(f"Echo server listening on {test_host_ip}:{ECHO_PORT}")
 
     # Acquire device lock
-    lock = DeviceLock(u64_host)
+    # allow_nested: the autouse device_lock_guard in conftest already
+    # holds this device's flock on this thread (issue #273).
+    lock = DeviceLock(u64_host, allow_nested=True)
     if not lock.acquire(timeout=60.0):
         pytest.fail("Could not acquire device lock within 60s")
 
