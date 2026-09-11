@@ -648,15 +648,27 @@ the firmware menu.
 * This section's "UCI STATE-bit wedge" label on the 2026-08/09 outage is
   **wrong** and is corrected above. Tier 3's UCI STATE-bit wedge is a real
   and separate failure (#112) — it simply is not what cost two weeks.
-* What is still **not** established is the crash mechanism. The owner's
-  operating theory is space exhaustion in the RAM disk. That is plausible
-  for this outage, whose `/Temp` occupancy nobody recorded, but note it is
-  not what the one measured reproduction shows: the U64E/3.14d repro
-  wedged with ~5.8% of a 16 MiB RAM disk used (#261). Those are different
-  devices, different firmware and different events, so the repro does not
-  refute exhaustion here — but at least one wedge happened nowhere near
-  full, so "ran out of space" cannot be the whole story for the failure
-  class. Accumulation triggers the crash; why it crashes remains open.
+* The **driver is settled**: `writemem` attachment accumulation. The owner
+  states it directly (2026-09-11), this document's Status section says the
+  same, and upstream removed it — GideonZ/1541ultimate#686, "Add automatic
+  cleanup of Temp folder" (chrisgleissner, merged 2026-04-26, building on
+  Gee-64's #474), which keeps the youngest 10 *managed* files and deletes
+  older ones. The harness's own defence attacks the same driver one step
+  earlier: staying at or below `write_mem_query_threshold` uses the
+  bodyless `PUT ...?data=` path, which creates no attachment at all.
+* The **crash mechanism is still not established**, and #686 does not
+  settle it. Read it and it documents no crash, hang or exhaustion — it is
+  framed as housekeeping, and it explicitly **removed the disk-use trigger
+  in favour of a file count**, because keeping the youngest 10 conflicted
+  with a usage threshold. So upstream's remedy is count-shaped, but that is
+  a design choice in the cleaner, not evidence about what fails.
+* The owner's operating theory is RAM-disk space exhaustion. Nothing
+  contradicts it for *this* outage, whose `/Temp` occupancy nobody
+  recorded. But the one wedge anyone measured went the other way: the
+  U64E/3.14d repro wedged with ~5.8% of a 16 MiB RAM disk used (#261).
+  Different device, firmware and event, so it does not refute exhaustion
+  here — yet at least one wedge in this family happened nowhere near full.
+  Accumulation triggers the crash; why it crashes remains open.
 
 The currently confirmed cases where physical power-cycle is the **only**
 documented recovery:
