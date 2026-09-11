@@ -31,8 +31,10 @@ physical menu button. `/Temp` does **not** fill: the RAM disk is
 in `target/u64{,ii}/riscv/ultimate/linker.x` at tag `1.1.0`; its "3 MB"
 comment is stale — issue #261), so at the one wedge on record it was
 ~5.8% used. The trigger threshold and the crash
-cause are both unestablished. The 2026-08/09 wedge cost about two
-weeks of a shared device. The one datapoint in circulation — "~15 cycles
+cause are both unestablished, and the two-week 2026-08/09 outage often
+quoted here is recorded as a **UCI STATE-bit** wedge — whether that was a
+`/Temp` consequence is unsettled, so its duration is not a `/Temp`
+measurement (see CLAUDE.md § hardware-safety clause). The one datapoint in circulation — "~15 cycles
 of a 63 KB PRG" (`ultimate64_temp_gc.py` docstring) — was taken on the
 **U64E while it ran 3.14d**, n unrecorded, and is simply where one
 reproduction stopped. It is **not** a capacity, and the old
