@@ -67,8 +67,6 @@ If `verify-dev-env.sh` reports NOT READY at the end, its own output lists exactl
 
 ## Quick check: `scripts/verify-dev-env.sh`
 
-## Quick check: `scripts/verify-dev-env.sh`
-
 ```bash
 ./scripts/verify-dev-env.sh
 ```
@@ -174,8 +172,8 @@ Unlike the Ubuntu flow there is no one-shot installer — `scripts/setup-dev-env
 
 6. **BPF permission for the VICE pcap driver.** VICE's `pcap` ethernet driver opens `/dev/bpf*`, which is root-only on a fresh macOS install. Grant user access via one of:
 
-   - Install Wireshark and run its **ChmodBPF** helper (recommended — persists across reboots and is the standard Wireshark path).
-   - One-shot `sudo chmod 666 /dev/bpf*` (resets on the next boot).
+   - **On this bench, use the `chmod` below** — there is no ChmodBPF daemon installed here. On a fresh machine, installing Wireshark and running its **ChmodBPF** helper is the better answer: it persists across reboots and is the standard Wireshark path.
+   - One-shot `sudo chmod o+rw /dev/bpf*` (resets on the next boot). Cover more than `bpf0-3`: a root VICE takes the two lowest free nodes and each dnsmasq DHCP rig on the bench holds one node permanently, so the low four alone cannot serve a root VICE plus the harness capture. Nodes above `bpf3` exist only once some root process has opened them, so re-run the `chmod` after that.
 
    Without this, VICE errors out with a `pcap_open_live` / BPF permission message when you try to attach `feth0`/`feth1`.
 
@@ -287,9 +285,14 @@ The `U64_HOST`-gated capture suites (`tests/test_chromatic_capture_live.py`, `te
 
 ### Hardware and network live gates (all opt-in, skip cleanly when unset)
 
-Every gate below needs `U64_HOST` (or the test's own host knob) and the
-`DeviceLock` is taken by the test; gates marked *mutate* also need
-`U64_ALLOW_MUTATE=1` because they write device config and restore it.
+Most gates below also need `U64_HOST` (or the test's own host knob), and
+the `DeviceLock` is taken by the test. Three need no device at all:
+`RRNET_UDP_LIVE` and `READ_BYTES_STRESS` drive VICE, and
+`BRIDGE_CLEANUP_LIVE` mutates host network state. Gates marked *mutate*
+also need `U64_ALLOW_MUTATE=1` because they write device config or RAM
+and restore it. That annotation reflects what each suite actually
+gates on today, and the convention is not applied uniformly across the
+live suites — see [#268](https://github.com/JC-000/c64-test-harness/issues/268).
 
 | Gate | Test | Needs | What it pins |
 |---|---|---|---|
@@ -297,9 +300,17 @@ Every gate below needs `U64_HOST` (or the test's own host knob) and the
 | `SID_ADDRESSING_LIVE=1` | `tests/test_sid_addressing_isolation_live.py` | two SIDs fitted | distinct decode with mirroring off, aliasing with it on, read-back raises on mismatch (#204) |
 | `AUDIO_RATE_LIVE=1` | `tests/test_audio_rate_lock_live.py` | NTSC, ≥ 60 s capture | `U64_NTSC_AUDIO_RATE_HZ` via the 64:3 identity; drop/reorder runs discarded (#205) |
 | `RRNET_LIVE=1` | `tests/test_run_prg_cartridge_visibility_live.py`, `tests/test_cs8900a_fifo_live.py`, `tests/test_first_exchange_live.py` | RR-Net on the expansion port, cabled to `RRNET_IFACE` (default `en4`) | runner load path deselects the cartridge (#217), FIFO facts (#219), RX-queue drain before the first exchange (#222) |
-| `SOCKETDMA_LIVE=1` (*mutate* for two tests) | `tests/test_socketdma_barrier_live.py` | "Ultimate DMA Service" enabled | idle-reconnect and the one-retry barrier (#223) |
+| `SOCKETDMA_LIVE=1` (*mutate* for the RAM/REU-writing tests) | `tests/test_socketdma_barrier_live.py`, `tests/test_socketdma_live.py` | "Ultimate DMA Service" enabled | idle-reconnect and the one-retry barrier (#223); `REUWRITE` byte fidelity. **SocketDMA writes are disabled pending a stability review** — do not run these to "check it still works" |
 | `U64_BASELINE_LIVE=1` (*mutate*) | `tests/test_entry_baseline_live.py` | — | reset-on-entry: drift → per-category reset → every covered item at `default`; never-touch stores untouched (#227) |
 | `FLASH_BASELINE_LIVE=1` (*mutate*) | `tests/test_flash_baseline_live.py` | — | flash equals the firmware default per category (never-touch and `Network Settings` not reloaded) (#227) |
+| `TEMP_GC_LIVE=1` (*mutate*) | `tests/test_temp_gc_live.py` | FTP File Service enabled | `gc_temp_folder` against a real FTP server: leak `temp####` attachments via `run_prg`, trim to the keep-count, idempotent re-run (#153). **This one leaks on purpose** — read the `/Temp` clause before running it on a leak-prone device. Its three mutating tests need `U64_ALLOW_MUTATE=1` (`test_temp_gc_live.py:40-43`); set only the gate and they skip |
+| `REU_READBACK_LIVE=1` (*mutate*) | `tests/test_reu_size_readback_live.py` | — | `REU Size` read-back is not stale: a differing value means a write, a flash reload or a boot in between (#168). Four tests need `U64_ALLOW_MUTATE=1` (`:112-115`) |
+| `TURBO_CONTRACT_LIVE=1` (*mutate*) | `tests/test_turbo_contract_live.py` | — | the CPU-Speed enum is a cross-generation superset; a generation-foreign speed raises locally off the probed presets |
+| `UCI_UDP_LIVE=1` | `tests/test_uci_udp_send_live.py`, `tests/test_uci_udp_send_large_live.py` | UCI enabled, `reset()` + 3 s settle | one `uci_socket_write` = one datagram, no firmware coalescing; the 892-byte write ceiling. Writes device config and RAM but gates on neither `U64_ALLOW_MUTATE` nor anything else — see [#268](https://github.com/JC-000/c64-test-harness/issues/268) |
+| `RRNET_UDP_LIVE=1` | `tests/test_rrnet_udp_send_live.py` | VICE + bridge (no U64) | VICE-side RR-Net UDP TX of a >512-byte payload, received by a host socket |
+| `U64_DESTRUCTIVE=1` | `tests/test_ultimate64_transport_live.py` | — | **the one `reset(scope='machine')` test** (`:308-316`) — a C64-level reset, ~8 s to come back. The rest of the module, `set_speed`/`get_speed` and `reset(scope='cpu'\|'drive')`, runs on `U64_HOST` alone (`:39-41`); those writes are **not** behind this opt-in |
+| `READ_BYTES_STRESS=1` | `tests/test_read_bytes_stress_live.py` | VICE | the issue #88 `read_bytes` corruption reproducer; iteration counts and the wall cap are themselves env knobs |
+| `BRIDGE_CLEANUP_LIVE=1` | `tests/test_cleanup_vice_ports_live.py` (Linux), `tests/test_cleanup_vice_ports_macos_live.py` (macOS) | bridge up, elevation | the paired reference for live tests that mutate host network state |
 
 `U64_BASELINE_ON_ENTRY=1` (or TOML `[u64] baseline_on_entry = true`;
 `C64TEST_U64_BASELINE_ON_ENTRY` wins when both are set) turns the entry
