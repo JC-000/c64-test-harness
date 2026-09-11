@@ -3,7 +3,9 @@
 Quick reachability checks — ICMP ping, TCP connect, REST API version —
 useful for pre-flight validation before creating a transport.  All
 functions use only the standard library (``subprocess``, ``socket``,
-``urllib.request``).
+``urllib.request``) plus ``ultimate64_client._wire_hex16``, which is
+imported rather than reimplemented so this module cannot drift back to
+the ``0x``-prefixed wire format (issue #272).
 
 Each check returns a ``(ok, detail)`` tuple so callers can inspect
 individual results.  The top-level :func:`probe_u64` runs all checks
@@ -20,6 +22,13 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+
+# The one place a REST hex argument is formatted (issue #272).  The probe
+# builds its own query strings rather than going through
+# ``Ultimate64Client``, so without this import it would be a second
+# formatter and a second chance to send the ``0x`` prefix that firmware
+# carrying GideonZ/1541ultimate#884 rejects.
+from .ultimate64_client import _wire_hex16
 
 __all__ = [
     "ProbeResult",
@@ -311,7 +320,8 @@ class LivenessResult:
         ``GET /v1/info``, or ``None`` if it could not be read.
     :ivar failure: short tag identifying the failure mode, one of
         ``"unreachable"``, ``"writemem_404"``, ``"writemem_timeout"``,
-        ``"tcp_stack_wedged"``, ``"connection_reset"``, ``"unknown"``,
+        ``"tcp_stack_wedged"``, ``"connection_reset"``, ``"wire_format"``,
+        ``"unknown"``,
         or ``None`` when healthy.  ``"connection_reset"`` is a one-shot
         TCP RST mid-request — empirically transient on fw 3.14d; callers
         may retry once before treating it as a wedged stack.
@@ -376,6 +386,51 @@ def _liveness_request(
         except Exception:
             data = b""
         return e.code, data
+
+
+#: What a route that parses hex strictly answers when the argument is not
+#: bare hexadecimal (GideonZ/1541ultimate#884).  A harness older than
+#: issue #272 sends ``address=0x0334`` and gets this from every memory
+#: call — including this probe's own.
+_WIRE_FORMAT_STATUS: int = 400
+
+_WIRE_FORMAT_RECOMMENDATION: str = (
+    "{method} {path} returned HTTP 400. On firmware carrying "
+    "GideonZ/1541ultimate#884 that route accepts only bare hexadecimal "
+    "arguments (no 0x prefix) — see issue #272. The device refused a "
+    "malformed request; it is NOT degraded and NOT wedged, so do not "
+    "reboot it and do not send anyone to the power switch. Check the "
+    "harness version first. The other candidate for a 400 here is an "
+    "out-of-range address/length."
+)
+
+
+def _wire_format_result(
+    host: str,
+    port: int,
+    firmware_version: str | None,
+    method: str,
+    path: str,
+    *,
+    writemem_ok: bool | None,
+) -> "LivenessResult":
+    """Build the ``failure="wire_format"`` result for an HTTP 400.
+
+    Separate from the degraded/wedged tags on purpose: those recommend a
+    physical power-cycle, which on the C64 Ultimate nobody is present to
+    perform and which would be the wrong response to a request the
+    firmware was right to reject.
+    """
+    return LivenessResult(
+        host=host,
+        port=port,
+        healthy=False,
+        reachable=True,
+        writemem_ok=writemem_ok,
+        firmware_version=firmware_version,
+        failure="wire_format",
+        recommendation=_WIRE_FORMAT_RECOMMENDATION.format(method=method, path=path),
+    )
 
 
 def liveness_probe(
@@ -469,7 +524,7 @@ def liveness_probe(
     # ----------------------------------------------------------------- #
     probe_addr = _LIVENESS_PROBE_ADDR
     probe_len = _LIVENESS_PROBE_LEN
-    addr_query = f"address=0x{probe_addr:04X}&length={probe_len}"
+    addr_query = f"address={_wire_hex16(probe_addr)}&length={probe_len}"
 
     # Read the original bytes so we can restore them after the POST.
     # Failure here is treated as "unknown" — the device answered version
@@ -513,6 +568,11 @@ def liveness_probe(
                 "device may need a physical power-cycle"
             ),
         )
+    if rd_status == _WIRE_FORMAT_STATUS:
+        return _wire_format_result(
+            host, port, firmware_version,
+            "GET", "/v1/machine:readmem", writemem_ok=None,
+        )
     if rd_status != 200 or len(original_bytes) != probe_len:
         return LivenessResult(
             host=host,
@@ -531,7 +591,7 @@ def liveness_probe(
     # Build a deterministic probe pattern that is NOT the original bytes
     # (so a stuck-but-not-erroring write would still produce a mismatch).
     probe_pattern = bytes((i ^ 0x5A) & 0xFF for i in range(probe_len))
-    post_query = f"address=0x{probe_addr:04X}"
+    post_query = f"address={_wire_hex16(probe_addr)}"
 
     try:
         post_status, post_body = _liveness_request(
@@ -605,6 +665,12 @@ def liveness_probe(
                 f"POST /v1/machine:writemem connection failed ({reason!s}); "
                 "device may need a physical power-cycle"
             ),
+        )
+
+    if post_status == _WIRE_FORMAT_STATUS:
+        return _wire_format_result(
+            host, port, firmware_version,
+            "POST", "/v1/machine:writemem", writemem_ok=False,
         )
 
     if post_status == 404:
@@ -685,6 +751,12 @@ def liveness_probe(
                 "may be wedged"
             ),
         )
+    # No wire-format mapping at this checkpoint, deliberately: the
+    # readback reuses the very ``addr_query`` the readmem above already
+    # got a 200 for, so a 400 here cannot be the #272 prefix and would
+    # be some other fault.  Telling that reader to check their harness
+    # version would be a new misdiagnosis in place of the old one.  The
+    # generic branch below restores and reports it as ``unknown``.
     if rb_status != 200 or readback != probe_pattern:
         # Restore best-effort even on mismatch, then report.
         _restore_quiet(
@@ -750,7 +822,7 @@ def _restore_quiet(
             timeout,
             body=original,
             content_type="application/octet-stream",
-            query=f"address=0x{addr:04X}",
+            query=f"address={_wire_hex16(addr)}",
         )
     except Exception as exc:
         _log.debug("liveness_probe restore at $%04X failed: %s", addr, exc)

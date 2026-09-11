@@ -49,6 +49,7 @@ __all__ = [
     "Ultimate64AuthError",
     "Ultimate64TimeoutError",
     "Ultimate64ProtocolError",
+    "Ultimate64WireFormatError",
     "Ultimate64UnsafeOperationError",
     "Ultimate64TempHygieneError",
     "Ultimate64UnreachableError",
@@ -83,6 +84,45 @@ class Ultimate64ProtocolError(Ultimate64Error):
     """Raised when a response cannot be parsed (invalid JSON) or has an
     unexpected shape — e.g. a ``readmem`` payload whose length differs
     from the requested length."""
+
+
+class Ultimate64WireFormatError(Ultimate64Error):
+    """Raised on HTTP 400 from a route whose hex arguments the firmware parses strictly.
+
+    GideonZ/1541ultimate#884 made ``/v1/machine:readmem``, ``:writemem``
+    and ``:debugreg`` reject any argument that is not bare hexadecimal.
+    A harness older than issue #272 sends ``address=0xC000`` and gets a
+    400 from every memory read and write on such firmware.
+
+    This exists because of what the *undiagnosed* form of that failure
+    leads to: a lane that has always been able to read this device sees
+    a bare HTTP 400 and concludes the hardware is faulty, then reaches
+    for ``reboot()`` and ``recover()``. On the C64 Ultimate nobody is
+    physically present to power-cycle if that reasoning goes astray, so
+    the 400 has to name the contract change itself.
+
+    A 400 from these routes is not *necessarily* the wire format — an
+    out-of-range ``address + length`` is the other candidate the
+    firmware rejects the same way — so the message says so and carries
+    the device's own body text.
+
+    Also raised by :meth:`Ultimate64Client.assert_healthy` when the
+    liveness probe comes back tagged ``wire_format``, in place of
+    :class:`U64WritememDegradedError` — the device is not degraded, and
+    the exception type should not say it is.  ``result`` carries the
+    :class:`~c64_test_harness.backends.ultimate64_probe.LivenessResult`
+    in that case, matching ``U64WritememDegradedError``'s shape.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        status: int | None = None,
+        body: str | None = None,
+        result: object | None = None,
+    ) -> None:
+        super().__init__(message, status=status, body=body)
+        self.result = result
 
 
 class Ultimate64UnsafeOperationError(Ultimate64Error):
@@ -185,6 +225,15 @@ class U64WritememDegradedError(Ultimate64Error):
     The :class:`~c64_test_harness.backends.ultimate64_probe.LivenessResult`
     is attached at ``.result`` for callers that want the structured
     failure tag.
+
+    **Since issue #272 this no longer covers a wire-format 400.** A probe
+    that comes back tagged ``wire_format`` raises
+    :class:`Ultimate64WireFormatError` instead, because the firmware
+    refused a malformed request and the device is not degraded — an
+    ``except U64WritememDegradedError:`` that used to fire on it will
+    stop firing.  That is deliberate: a handler that escalates to
+    ``reboot()`` and ``recover()`` would be running recovery against a
+    healthy device.  Catch :class:`Ultimate64Error` to handle both.
     """
 
     def __init__(self, message: str, result: object | None = None) -> None:
@@ -195,6 +244,69 @@ class U64WritememDegradedError(Ultimate64Error):
 def _encode(value: str) -> str:
     """URL-encode a single path segment (including spaces and colons)."""
     return urllib.parse.quote(value, safe="")
+
+
+#: Shared tail: true of any 400 from these routes, whatever the cause.
+_REFUSED_NOT_WEDGED = (
+    " Either way it is a request the firmware refused, not a wedged "
+    "device: do not reboot() or recover() on the strength of it."
+)
+
+#: For routes that carry an ``address`` this harness formats.
+_HEX_ARG_HINT = (
+    " — this route needs bare hexadecimal arguments (no 0x prefix) on "
+    "firmware carrying GideonZ/1541ultimate#884; see issue #272. If this "
+    "harness is current, the other candidate is an out-of-range "
+    "address/length." + _REFUSED_NOT_WEDGED
+)
+
+#: For routes #884 tightened that take no hex argument from this harness.
+#: Saying what the cause is *not* is the honest half of the diagnosis:
+#: whatever the firmware objected to is in the response body above.
+_NO_HEX_ARG_HINT = (
+    " — GideonZ/1541ultimate#884 tightened argument parsing on this "
+    "route (see issue #272), but this harness sends it no hex argument, "
+    "so the 0x prefix is not the cause here; what the firmware objected "
+    "to is in its response body above." + _REFUSED_NOT_WEDGED
+)
+
+#: REST routes whose hex arguments GideonZ/1541ultimate#884 (merged
+#: 2026-09-11, with #888) tightened to *bare* hexadecimal.  Before it the
+#: firmware parsed them with ``strtol(..., 16)``, which tolerated a ``0x``
+#: prefix; after it a prefixed value is an HTTP 400.  See issue #272.
+#: Maps each of those routes to what this harness can honestly say about
+#: a 400 from it.  ``readmem``/``writemem`` carry an ``address`` this
+#: harness formats, so the prefix is a real candidate there.
+#: ``debugreg`` takes no address and no length — ``get_debug_register``
+#: sends no arguments at all and ``set_debug_register`` sends an int —
+#: so naming the prefix there would assert a cause that cannot apply.
+#: The route stays in the table because #884 did tighten it and a caller
+#: building the query by hand can still trip it.
+_STRICT_HEX_ROUTE_HINTS: dict[str, str] = {
+    "machine:readmem": _HEX_ARG_HINT,
+    "machine:writemem": _HEX_ARG_HINT,
+    "machine:debugreg": _NO_HEX_ARG_HINT,
+}
+
+
+def _wire_hex16(value: int) -> str:
+    """Format a 16-bit address for a REST query argument.
+
+    Bare uppercase hex, no ``0x`` prefix, zero-padded to four digits —
+    the only form firmware carrying GideonZ/1541ultimate#884 accepts
+    (issue #272).  Every ``readmem``/``writemem`` query argument goes
+    through here rather than being formatted at the call site: the
+    prefix survived as long as it did because three call sites each
+    formatted their own.
+
+    :raises ValueError: if *value* does not fit 16 bits.  A five-digit
+        address is not a thing the C64 window has, and the function that
+        claims to be the single formatting choke point should not emit
+        one silently.
+    """
+    if not isinstance(value, int) or value < 0 or value > 0xFFFF:
+        raise ValueError(f"address out of range 0..0xFFFF: {value!r}")
+    return "%04X" % value
 
 
 class Ultimate64Client:
@@ -582,7 +694,7 @@ class Ultimate64Client:
     ) -> tuple[int, bytes]:
         url = self._url(path)
         if query:
-            # Preserve caller-formatted values (e.g. "0x0400") by stringifying as-is
+            # Preserve caller-formatted values (e.g. "0400") by stringifying as-is
             qs = "&".join(f"{urllib.parse.quote(str(k))}={urllib.parse.quote(str(v))}" for k, v in query.items())
             url = f"{url}?{qs}"
         req = urllib.request.Request(url, data=body, method=method)
@@ -887,6 +999,12 @@ class Ultimate64Client:
             msg += f": {body_text[:256]}"
         if status in (401, 403):
             raise Ultimate64AuthError(msg, status=status, body=body_text)
+        if status == 400:
+            for route, hint in _STRICT_HEX_ROUTE_HINTS.items():
+                if route in url:
+                    raise Ultimate64WireFormatError(
+                        msg + hint, status=status, body=body_text
+                    )
         raise Ultimate64Error(msg, status=status, body=body_text)
 
     def _get_json(self, path: str, query: dict[str, Any] | None = None) -> Any:
@@ -957,11 +1075,26 @@ class Ultimate64Client:
         :raises U64WritememDegradedError: if the device is reachable but
             the writemem POST round-trip failed (HTTP 404, timeout, or
             wedged TCP stack).
+        :raises Ultimate64WireFormatError: if the probe came back tagged
+            ``wire_format`` — an HTTP 400 from a route that parses hex
+            strictly (issue #272).  The device is healthy; the request
+            was not.
         :returns: the :class:`LivenessResult` on success (healthy device).
         """
         result = self.liveness_probe(http_timeout=http_timeout)
         if result.healthy:
             return result
+        if result.failure == "wire_format":
+            # Not a degraded device: the firmware refused a malformed
+            # request (issue #272).  Raising the degraded error here
+            # would put the wrong word in front of whoever is deciding
+            # whether to escalate to a physical power-cycle.
+            raise Ultimate64WireFormatError(
+                f"U64 at {self.host}:{self.port} rejected the request "
+                f"({result.failure}): {result.recommendation}",
+                status=400,
+                result=result,
+            )
         if result.failure == "unreachable":
             raise U64UnreachableError(
                 f"U64 at {self.host}:{self.port} unreachable: "
@@ -1348,7 +1481,9 @@ class Ultimate64Client:
     def read_mem(self, address: int, length: int) -> bytes:
         """GET /v1/machine:readmem — read `length` bytes from C64 memory via DMA.
 
-        Returns the raw byte payload. Address is formatted as 0xNNNN.
+        Returns the raw byte payload. Address is formatted as bare
+        uppercase hex (``NNNN``, no ``0x`` prefix) — the only form
+        firmware carrying GideonZ/1541ultimate#884 accepts (issue #272).
 
         :raises Ultimate64ProtocolError: if the device returns a payload
             whose length differs from the requested `length`.  Without
@@ -1359,7 +1494,7 @@ class Ultimate64Client:
             raise ValueError(f"address out of range 0..0xFFFF: {address}")
         if not isinstance(length, int) or length <= 0:
             raise ValueError(f"length must be positive, got {length}")
-        query = {"address": "0x%04X" % address, "length": "%d" % length}
+        query = {"address": _wire_hex16(address), "length": "%d" % length}
         _, data = self._request("GET", "/v1/machine:readmem", query=query)
         if len(data) != length:
             raise Ultimate64ProtocolError(
@@ -1385,9 +1520,9 @@ class Ultimate64Client:
           (``len(data) <= self.write_mem_query_threshold``; 48 on firmware
           carrying the Temp-folder fix, 128 without it — see
           :attr:`capabilities`) —
-          ``PUT /v1/machine:writemem?address=0xNNNN&data=<hex>``.  Kept
+          ``PUT /v1/machine:writemem?address=NNNN&data=<hex>``.  Kept
           for backwards compatibility with existing callers/mocks.
-        * **Large payloads** — ``POST /v1/machine:writemem?address=0xNNNN``
+        * **Large payloads** — ``POST /v1/machine:writemem?address=NNNN``
           with the raw bytes as the request body
           (``Content-Type: application/octet-stream``). Required for
           anything past the device's 128-hex-char cap on the ``data=``
@@ -1407,7 +1542,7 @@ class Ultimate64Client:
         payload = bytes(data)
         if len(payload) <= self.write_mem_query_threshold:
             query = {
-                "address": "0x%04X" % address,
+                "address": _wire_hex16(address),
                 "data": payload.hex().upper(),
             }
             self._request("PUT", "/v1/machine:writemem", query=query)
@@ -1418,7 +1553,7 @@ class Ultimate64Client:
                 "/v1/machine:writemem",
                 body=payload,
                 content_type="application/octet-stream",
-                query={"address": "0x%04X" % address},
+                query={"address": _wire_hex16(address)},
             )
 
     # ------------------------------------------------------------ keyboard

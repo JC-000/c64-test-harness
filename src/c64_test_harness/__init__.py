@@ -84,6 +84,7 @@ from .backends.ultimate64_client import (
     Ultimate64AuthError,
     Ultimate64TimeoutError,
     Ultimate64ProtocolError,
+    Ultimate64WireFormatError,
 )
 from .backends.ultimate64_helpers import (
     get_turbo_mhz,
@@ -497,6 +498,7 @@ __all__ = [
     "Ultimate64AuthError",
     "Ultimate64TimeoutError",
     "Ultimate64ProtocolError",
+    "Ultimate64WireFormatError",
     "CPU_SPEED_VALUES",
     "CPU_SPEED_BY_MHZ",
     "TURBO_CONTROL_VALUES",
