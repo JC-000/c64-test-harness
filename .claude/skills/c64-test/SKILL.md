@@ -26,8 +26,11 @@ Enough accumulation **crashes the device firmware**: REST and the UCI
 bridge go down together and **only a physical power-cycle recovers it**.
 The C64 FPGA keeps running, so the machine looks alive while the firmware
 is dead — it stops answering the network *and* stops responding to the
-physical menu button. `/Temp` does **not** fill: at the one wedge on
-record the RAM disk was ~31% used. The trigger threshold and the crash
+physical menu button. `/Temp` does **not** fill: the RAM disk is
+16 MiB (`ramdisk.cc` sizes it from `__ram_disk_start`/`__ram_disk_limit`
+in `target/u64{,ii}/riscv/ultimate/linker.x` at tag `1.1.0`; its "3 MB"
+comment is stale — issue #261), so at the one wedge on record it was
+~5.8% used. The trigger threshold and the crash
 cause are both unestablished. The 2026-08/09 wedge cost about two
 weeks of a shared device. The one datapoint in circulation — "~15 cycles
 of a 63 KB PRG" (`ultimate64_temp_gc.py` docstring) — was taken on the
@@ -42,16 +45,32 @@ anything.
 When you write a test that can point at the C64U:
 
 - **Do not hand-roll cleanup.** `/Temp` hygiene belongs in the harness,
-  below your test. If your test needs a manual GC call to be safe, the
-  guard is missing one layer down — fix it there.
+  below your test, and **it is there now** (f2b46ce): on leak-prone
+  firmware `Ultimate64Client` arms a hygiene pass by itself, spends a
+  budget of 6 attachment-creating requests before sweeping, and drains
+  again on `close()` and on `DeviceLock` release. **It can also refuse** —
+  once a pass has proven impossible (FTP down), every later
+  attachment-creating request raises `Ultimate64TempHygieneError` rather
+  than walking the device toward the wedge; `U64_TEMP_GC_REQUIRED=0`
+  downgrades that to a WARNING and `temp_hygiene=False` disarms the pass.
+  So if your test needs a manual GC call to be safe, the guard is missing
+  a case one layer down — fix it there. Details: PATTERNS § "`/Temp`
+  attachment hygiene" rule 1.
 - **Prefer the non-leaking paths.** `write_memory` at or under the
   device's `write_mem_query_threshold` takes `PUT ?data=` and leaves
   nothing behind (measured exact and inclusive on the C64U: 128 B → zero
-  attachments, 129 B → exactly one); the SocketDMA fast path
-  (`transport.socket_dma = True`, TCP 64) leaves nothing behind, though
-  that one is reasoned from the code path rather than measured. REST POST
-  is the leaking path — a bulk write that falls back to REST is the one
-  to watch.
+  attachments, 129 B → exactly one). The SocketDMA fast path
+  (`transport.socket_dma`, TCP 64) is **disabled pending a stability
+  review — do not enable it**; it would leave nothing behind, but that was
+  only ever reasoned from the code path rather than measured, and it is
+  not an option today, which leaves no fast bulk-write path on a C64U at
+  all. The non-leaking bulk route is `write_bytes` /
+  `run_prg_via_sys`, whose 84-byte chunks stay on the PUT path **on a
+  C64U** (84 is under its 128 ceiling; on threshold-48 firmware they take
+  POST, harmless only because that firmware self-collects) — but that is
+  ~196 round trips for 16 KiB and is **untimed** anywhere in this repo
+  (issue #267), so budget for it being slow. REST POST is the leaking path — a bulk write that falls back to
+  REST is the one to watch.
 - **Do not assume an API chunks because its name suggests it.**
   `execute.load_code()` is a bare alias for `transport.write_memory` and
   `_execute_uci_routine` writes its routine directly; neither chunks, and most
@@ -68,7 +87,7 @@ When you write a test that can point at the C64U:
   `run_prg_via_sys` costs nothing on a C64U and bare `client.run_prg()`
   costs one per call.
 - **Never loop an upload.** A parametrised test or retry loop that
-  re-uploads a PRG is the exact ~15-cycle shape that wedged the device.
+  re-uploads a PRG is the exact re-upload shape that wedged the device.
 - **Hold the `DeviceLock` across the whole run**, hygiene included, and
   drain on the way out.
 - **A `TempGCResult` with `.error` set is a failed hygiene pass, not a
@@ -82,6 +101,12 @@ When you write a test that can point at the C64U:
 Full statement, and the switch that retires this clause
 (`DeviceCapabilities.writemem_post_safe`), in CLAUDE.md § "Standing
 hardware-safety clause" and `docs/u64_recovery.md`.
+
+Device *state* in CLAUDE.md — which device is up, wedged, or reachable —
+can lag reality; the firmware-conditional rules above do not. REST
+answering is not health either, since a UCI STATE-bit wedge leaves REST
+up. Check the device-hosts memory, or establish state yourself with a
+bodyless `GET /v1/info`, before assuming a device is up or down.
 
 ## When to Use This Skill
 
@@ -143,7 +168,7 @@ and why validation here is local-only, is `docs/development.md`
 12. **Build before testing** — always `make clean && make` and verify the PRG exists.
 13. **Use `inst.pid` and `inst.port` from the ViceInstance** — never hardcode ports, never use `vice.pid` from ViceProcess directly.
 14. **Never `pkill x64sc`** — use PID-targeted cleanup only; other agents may have VICE instances running.
-15. **Probe before connecting to U64** — `probe_u64(host)` checks ping + TCP + REST API with short timeouts. `Ultimate64InstanceManager.acquire()` does this automatically, skipping unreachable devices.
+15. **Probe before connecting to U64** — `probe_u64(host)` checks ping + TCP + REST API with short timeouts. `Ultimate64InstanceManager.acquire()` does this automatically, skipping unreachable devices. It is a *reachability* check only: it reports `reachable=True` on a device whose `writemem` path is dead (issue #241), and the probe that would catch that, `liveness_probe()`, costs two `/Temp` attachments per call on leak-prone firmware (issue #250).
 16. **Pass `turbo_safe=True` to UCI helpers at U64 speeds ≥ 4 MHz** — the FPGA behind `$DF1C-$DF1F` needs ~38 µs between accesses; without the fence, turbo-speed code double-latches writes and corrupts the UCI protocol. Every `uci_*` builder and helper accepts the kwarg. Default is `False` for backward compat.
 
 17. **`DebugCapture` is only cycle-accurate at 1 MHz** — the U64E FPGA emits the UDP debug stream at a fixed ~850k entries/sec regardless of CPU turbo speed. At 1 MHz you get an essentially complete trace; at 4 MHz you get 1/4 of cycles, at 48 MHz ~1/48 (uniformly sampled, `packets_dropped` stays at zero because the rate limit is at the FPGA source). For complete traces, drop to `set_turbo_mhz(client, 1)` for the capture window. Turbo-speed capture is only sound for aggregate statistics (PC distribution, frequency maps); it is not sound for call-graph reconstruction, exact cycle counts, or sequential bus-state analysis. Measurement: `tests/test_u64_debug_stream_speed_live.py`. **For multi-routine benches, use `DebugCapture.with_fresh_fpga(client)` per routine** to clear sustained-workload UDP-rate degradation (only `client.reboot()` recovers it; soft `reset()` is insufficient).
@@ -162,11 +187,11 @@ and why validation here is local-only, is `docs/development.md`
 
 24. **If `read_bytes()` returns surprising bytes that the C64-side math says it can't be, suspect the VICE binary monitor protocol, not your 6502.** PR #88 tightened the binary read path to validate `response_type` against `CMD_TO_RESPONSE_TYPE` — a wire-level desync now raises `TransportError` naming both expected and actual response types. As a diagnostic, use `read_bytes_verified(transport, addr, length, *, max_attempts=2)`: re-reads on disagreement and raises `FlakeyReadError` with all attempts captured. Standard `read_bytes()` everywhere else — `read_bytes_verified()` doubles wire traffic and is only worth it when a flake is actively suspected.
 
-25. **For cross-backend CPU speed and reset control, use `target.transport.set_speed(...)` / `target.transport.reset(scope=...)` — not backend-branching.** PR #122 (4e70c84) lifted both onto the `C64Transport` protocol. `set_speed(1)` is "1 MHz / warp off / turbo off"; `set_speed(None)` is "max speed" — VICE warp on / U64 the device's probed maximum (64 MHz on a C64 Ultimate, 48 on a U64E; 48 fallback when the preset probe is inconclusive). `reset(scope="cpu")` is a soft 6510 reset; `reset(scope="machine")` is a full reset (VICE hard / U64 `reboot()` with ~8 s settle); `reset(scope="drive", drive=...)` resets a specific drive (0..3 on VICE, "a"/"b" on U64). VICE raises `NotImplementedError` for any `set_speed` multiplier other than `1`/`None` (no native discrete CPU-speed steps); U64 accepts the cross-generation superset 2/3/4/5/6/8/10/12/14/16/20/24/32/40/48/64 (U64E fw 3.14 lacks 64; C64 Ultimate fw 1.1.0 lacks 5; the device's CPU-Speed presets are probed once per client and a generation-foreign speed raises `ValueError` locally — only when the probe is inconclusive does it reach the firmware, which rejects it with HTTP 400 before turbo is enabled). The legacy `set_turbo_mhz(client, mhz)` / `client.reset()` / `client.reboot()` calls still work and remain appropriate when you hold a raw `Ultimate64Client` rather than a transport. See PATTERNS § "Pattern 10 / Cross-backend speed/reset variant" and § "Gotcha 15".
+25. **For cross-backend CPU speed and reset control, use `target.transport.set_speed(...)` / `target.transport.reset(scope=...)` — not backend-branching.** PR #122 (4e70c84) lifted both onto the `C64Transport` protocol. `set_speed(1)` is "1 MHz / warp off / turbo off"; `set_speed(None)` is "max speed" — VICE warp on / U64 the device's probed maximum (64 MHz on a C64 Ultimate, 48 on a U64E; 48 fallback when the preset probe is inconclusive). `reset(scope="cpu")` is a soft 6510 reset; `reset(scope="machine")` is the backend's fullest reset — loose on purpose: VICE hard reset, but on U64 a C64-level `reboot()` that leaves the firmware running, ~8 s settle; `reset(scope="drive", drive=...)` resets a specific drive (0..3 on VICE, "a"/"b" on U64). VICE raises `NotImplementedError` for any `set_speed` multiplier other than `1`/`None` (no native discrete CPU-speed steps); U64 accepts the cross-generation superset 2/3/4/5/6/8/10/12/14/16/20/24/32/40/48/64 (the U64E lacks 64 on both 3.14 and the bench post-tag 3.15 fork; C64 Ultimate fw 1.1.0 lacks 5; the device's CPU-Speed presets are probed once per client and a generation-foreign speed raises `ValueError` locally — only when the probe is inconclusive does it reach the firmware, which rejects it with HTTP 400 before turbo is enabled). The legacy `set_turbo_mhz(client, mhz)` / `client.reset()` / `client.reboot()` calls still work and remain appropriate when you hold a raw `Ultimate64Client` rather than a transport. See PATTERNS § "Pattern 10 / Cross-backend speed/reset variant" and § "Gotcha 15".
 
 26. **`watch_progress(transport, addresses=...)` is now backend-agnostic.** PR #123 (9e6dd29) lifted it from `Ultimate64Client.read_mem` to the `C64Transport.read_memory` protocol — re-exported as `from c64_test_harness import watch_progress, ProgressEvent`. Use it instead of hand-rolled `time.monotonic()` polling loops when watching a sentinel or progress counter; the generator emits `Advanced` / `Stalled` / `Finished` / `Timeout` / `PollError` events (default `poll_interval` is 10 s — set it) with elapsed timing and changed-region diffs. The legacy `from c64_test_harness.backends.ultimate64_helpers import watch_progress` path is preserved as a backwards-compat shim — new code should use the top-level import.
 
-27. **Two Ultimate hardware generations exist — detect via `client.get_info()["product"]`, never assume.** `"Ultimate 64 Elite"` (fw 3.14/3.15) vs `"C64 Ultimate"` (fw 1.1.0). Live-verified asymmetries: CPU-speed enum (Elite has `" 5"` not `"64"`, C64U the reverse; foreign speeds raise `ValueError` locally via a cached preset probe, with the firmware's HTTP 400 as backstop when the probe is inconclusive), Cartridge presets (only U64E 3.14 had a `"REU"` preset; U64E 3.15 made `Cartridge` a `.crt` chooser and the C64U has no `"REU"` preset either — `set_reu`/`restore_state` probe and adapt; don't hand-write that config item), and the C64U's REST `POST writemem` degrading to ~6 s/request at ≥16 KiB. For bulk writes, enable the opt-in SocketDMA fast path (`transport.socket_dma = True`; C64U ships the "Ultimate DMA Service" disabled under Network Settings; refused connect falls back to REST). See PATTERNS § "Pattern 10 / Two device generations" and § "SocketDMA write fast path".
+27. **Two Ultimate hardware generations exist — detect via `client.get_info()["product"]`, never assume.** `"Ultimate 64 Elite"` (fw 3.14/3.15) vs `"C64 Ultimate"` (fw 1.1.0). Live-verified asymmetries: CPU-speed enum (Elite has `" 5"` not `"64"`, C64U the reverse; foreign speeds raise `ValueError` locally via a cached preset probe, with the firmware's HTTP 400 as backstop when the probe is inconclusive), Cartridge presets (only U64E 3.14 had a `"REU"` preset; U64E 3.15 made `Cartridge` a `.crt` chooser and the C64U has no `"REU"` preset either — `set_reu`/`restore_state` probe and adapt; don't hand-write that config item), and the C64U's REST `POST writemem` degrading to ~6 s/request at ≥16 KiB. For bulk writes use `write_bytes` / `run_prg_via_sys` (84-byte chunks, PUT path on a C64U) — **do not enable the SocketDMA write fast path (`transport.socket_dma`); it is disabled pending a stability review**. See PATTERNS § "Pattern 10 / Two device generations" and § "SocketDMA write fast path".
 
 ## Test File Template
 
