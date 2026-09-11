@@ -882,7 +882,8 @@ def recover(
     Strategy: :meth:`Ultimate64Client.reset` (instant; recovers most
     CPU-stuck states) then probe for liveness; if still unreachable AND
     *escalate_to_reboot* is ``True``, :meth:`Ultimate64Client.reboot`
-    (full FPGA reinit ~8s; recovers REU/DMA stuck state) then probe
+    (C64-level reset ~8s; recovers REU/DMA stuck state, but leaves
+    firmware RAM -- config and /Temp -- intact) then probe
     again.
 
     NEVER calls :meth:`Ultimate64Client.poweroff` -- that's irrecoverable

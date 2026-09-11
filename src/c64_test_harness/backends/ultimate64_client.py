@@ -1197,7 +1197,51 @@ class Ultimate64Client:
         self._put_no_body("/v1/machine:reset")
 
     def reboot(self) -> None:
-        """PUT /v1/machine:reboot — full reboot of the Ultimate device (DESTRUCTIVE)."""
+        """PUT /v1/machine:reboot — C64-level reset (DESTRUCTIVE).
+
+        **Not a firmware reboot**, despite the endpoint's name. It is
+        ``C64::start_cartridge(NULL)``: the C64 side restarts with
+        cartridge and REU re-initialised, ~8 s before it is reachable
+        again, which is why it clears REU/DMA stuck state. The firmware
+        itself keeps running.
+
+        What that means for state you might expect it to clear:
+
+        * **Config in firmware RAM survives.** A runtime-only REST config
+          write (e.g. enabling FTP File Service) is still in effect after
+          this call; only a firmware power-on reverts it.
+        * **``/Temp`` attachments survive.** ``/Temp`` is a firmware RAM
+          disk (``software/filesystem/ramdisk.cc``) and only a firmware
+          power-on empties it. Measured on the C64U: one POST leaves
+          ``temp0008``; ``reboot()`` plus a 6 s settle leaves
+          ``temp0008`` still there. **Do not treat this as cross-run
+          ``/Temp`` protection** — see :doc:`../docs/u64_recovery`.
+        * **lwIP / UCI stack state survives.** No REST endpoint restarts
+          the firmware, so a UCI STATE-bit wedge needs a physical
+          power-cycle.
+        * **C64 RAM survives.** The firmware has a separate command for
+          that: ``MENU_C64_CLEARMEM`` is ``clear_ram()`` *plus*
+          ``start_cartridge(NULL)`` (``c64_subsys.cc:232-234``), while
+          this route dispatches ``MENU_C64_REBOOT``, which is
+          ``start_cartridge(NULL)`` alone (``:258-264``) and contains no
+          ``clear_ram``. It does poke ``$8005 = 0`` to clear the CBM80
+          autostart signature, so a cartridge image in RAM will not
+          restart itself — but the bytes are still there.
+
+        What it *does* clear, which the "survives" list above can make
+        easy to miss: ``start_cartridge`` zeroes ``C64_CARTRIDGE_TYPE``,
+        ``C64_REU_ENABLE``, ``C64_SAMPLER_ENABLE`` and
+        ``CMD_IF_SLOT_ENABLE`` (``c64.cc:852+``). So a reboot leaves the
+        REU and the Command Interface slot **disabled** — which is why
+        ``enable_uci`` needs a ``reset()`` and a settle afterwards rather
+        than working straight away.
+
+        This docstring used to read "full reboot of the Ultimate device".
+        That wording was load-bearing in the wrong direction: it is the
+        line a caller reads before reaching for this method to "clear"
+        something, and it licensed exactly the reboot-as-hygiene
+        assumption the measurement above refutes.
+        """
         self._put_no_body("/v1/machine:reboot")
 
     def pause(self) -> None:
@@ -1220,7 +1264,9 @@ class Ultimate64Client:
 
         For "the device looks stuck, recover it" scenarios, prefer:
             * ``reset()``   — soft 6510 reset, instant
-            * ``reboot()``  — full FPGA reinit, ~8s, recovers REU/DMA state
+            * ``reboot()``  — C64-level reset, ~8s, recovers REU/DMA
+              state (but does NOT clear firmware RAM: config and
+              ``/Temp`` survive it)
 
         Pass ``confirm_irrecoverable=True`` only if you (a) intend to
         leave the device off and (b) have physical access to power-cycle
