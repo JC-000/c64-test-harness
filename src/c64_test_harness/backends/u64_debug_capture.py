@@ -30,9 +30,10 @@ emitter exhibits *delivery-rate degradation* over time when the
 device is under sustained adjacent workload. Observed delivery
 drops to **30-90% of the configured rate** after a long run, with
 ``packets_received`` falling well below the expected ~2,400/sec
-even at 1 MHz. Recovery requires a full :meth:`Ultimate64Client.reboot`
-(FPGA reinit, ~8s); a soft :meth:`Ultimate64Client.reset` is
-**insufficient**. For multi-routine benches, prefer constructing
+even at 1 MHz. Recovery requires :meth:`Ultimate64Client.reboot`
+(a C64-level reset, ~8s -- it restarts the C64 side and re-inits
+the cartridge/REU, but does not restart the firmware); a soft
+:meth:`Ultimate64Client.reset` is **insufficient**. For multi-routine benches, prefer constructing
 the capture via :meth:`DebugCapture.with_fresh_fpga` so each
 routine starts on a fresh emitter.
 
