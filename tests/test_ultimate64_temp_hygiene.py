@@ -8,6 +8,7 @@ suite) does no FTP at all -- see ``test_no_hygiene_when_device_never_answered``.
 from __future__ import annotations
 
 import io
+import re
 import urllib.error
 from unittest.mock import MagicMock, patch
 
@@ -814,3 +815,46 @@ def test_reboot_does_not_reset_the_pending_count():
         c.run_prg(b"\x01\x08x")
         c.reboot()
     assert c.pending_temp_attachments == 1
+
+
+# --------------------------------------------------------------------------- #
+# The docstrings that describe the two mechanisms above (#262, #283)          #
+# --------------------------------------------------------------------------- #
+
+def _flat(text: str) -> str:
+    """Docstring text with RST markup and wrapping removed, nothing else."""
+    return re.sub(r"\s+", " ", (text or "").replace("`", "").replace("*", ""))
+
+
+def test_the_counter_docstring_names_the_permissive_direction():
+    """#283: the residual was labelled "the safe side" and is the opposite.
+
+    An uncounted attachment never advances ``_pending_temp_attachments``,
+    so the budget is never reached, the hygiene pass never fires, and the
+    counter reads zero while the device accumulates. That is the reading
+    that gets someone to keep uploading, so the label is load-bearing and
+    the word "safe" may not stand next to it.
+    """
+    flat = _flat(Ultimate64Client._creates_temp_attachment.__doc__)
+    assert "Counting POST-with-body only is the permissive side" in flat
+    assert "not the conservative one" in flat
+    assert "the gap to close, not the margin to rely on" in flat
+    assert "is the safe side of that assumption" not in flat
+
+
+def test_the_arming_docstring_does_not_resurrect_the_closed_hole():
+    """#262: it claimed a slow-probed device loses hygiene for the client's
+    lifetime, which ``_maybe_reprobe_capabilities`` — in the same file —
+    exists to prevent. The claim propagated into the skill docs once
+    already, so it is pinned rather than merely corrected.
+
+    The explicit-threshold half of the paragraph is genuinely true and
+    must survive; asserting only the absence would let it be deleted.
+    """
+    flat = _flat(Ultimate64Client.temp_hygiene_armed.__doc__)
+    assert "loses hygiene for the client's lifetime" not in flat
+    assert "the one part of this that a live run should confirm" not in flat
+    assert "does not stay disarmed" in flat
+    assert "arms from the second" in flat
+    # the still-true half
+    assert "never probes" in flat

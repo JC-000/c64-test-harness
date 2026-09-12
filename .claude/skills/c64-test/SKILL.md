@@ -367,6 +367,8 @@ def transport():
         lock.release()
 ```
 
+**Reconcile the device at entry, don't rely on the last run's teardown.** Inside the lock, before the tests get the transport, put the device at a known baseline with `apply_factory_baseline()` and then set only what the module needs; restore-on-exit is a courtesy, since no `finally` runs on a SIGKILL (issue #276, a real incident that left the bench at CPU Speed 8). Never reach for the raw `configs:reset_to_default` — it touches stores that cut SID socket power or drop the device's DHCP lease mid-request. **A `create_manager(backend="u64")` lane already does this and takes no argument for it**: since #285 the reset resolves from the device's generation at `acquire()` — on for the U64E, off for the C64U, off for an unreadable generation — with `U64_BASELINE_ON_ENTRY=1`/`=0` overriding either way. Pattern, reasons and a worked fixture: PATTERNS § "Known state on entry — reset, then set only what you need".
+
 ## Critical Gotchas
 
 Read `PATTERNS.md` for the full list. The most common mistakes:

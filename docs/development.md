@@ -270,6 +270,106 @@ Run both together for a bench that is supposed to be fully wired (e.g. before tr
 C64_REQUIRE_VICE=1 C64_REQUIRE_ELEVATION=1 ~/.local/share/c64-test-harness/venv/bin/pytest tests/test_ethernet.py tests/test_bpf_attach_detection.py -rs
 ```
 
+### Live tests reconcile at entry; they do not rely on the last run's teardown
+
+**A live test resets the device to a known baseline when it starts, and then
+sets only what it needs.** It does not assume the previous run cleaned up after
+itself. Restore-on-exit stays as a courtesy; it is not the guarantee.
+
+The reason is that teardown is missing exactly when you need it. On 2026-09-10 a
+live run against the bench U64E was SIGKILLed about 30 s in.
+`tests/test_ultimate64_transport_live.py` leaves the device at 1 MHz in the
+teardown of its module-scoped `transport` fixture — the statements after its
+`yield t` — and a SIGKILL runs none of it. The device had been flashed to defaults minutes
+earlier, so the residue was unambiguous — `U64 Specific Settings / CPU Speed`
+read `' 8'` against a default of `' 1'` — and nothing in the harness noticed or
+told anyone ([#276](https://github.com/JC-000/c64-test-harness/issues/276); the
+measurement is a per-item `current`-vs-`default` comparison over 201 items, the
+attribution to that window strong but circumstantial). An 8× device does not
+fail a test. It produces plausible, wrong timing numbers for every later run on
+a bench several projects share. That particular fixture is weaker than a
+`finally`, too: its teardown is a bare post-`yield` sequence with no
+`try`/`finally`, so an exception arriving at the `yield` skips the restore, the
+`close()` and the `lock.release()` alike.
+
+`finally` covers exceptions and normal exit. It does not cover SIGKILL, a host
+crash, or a worker reaped by a parallel launcher — which is the shape that
+occurred. Entry is the only moment at which a process is present to notice the
+leftovers and fix them.
+
+**The mechanism is `apply_factory_baseline()`
+(`src/c64_test_harness/backends/ultimate64_baseline.py`), never the raw
+`configs:reset_to_default` route.** The naive form of this advice is dangerous
+on this bench, and `BASELINE_NEVER_TOUCH` in that module records why, one reason
+per refused store:
+
+- **`SID Sockets Configuration`** — the reset **cuts socket power**.
+  `ConfigStore::reset` sets `SID Socket 1/2=Disabled` and the store's
+  `effectuate_settings` writes regulator bits 0 to the PLD SIDCTRL / I2C
+  (`u64_config.cc:744-800`). Measured on the U64E with two 8580s, n=3,
+  2026-09-05: all six items flip (`Enabled→Disabled`, `8580→None`,
+  `22 nF→470 pF`), and because every item then equals its default, "the report
+  reads clean, so the socketed SIDs are POWERED OFF with nothing to say so".
+  Detection never re-runs over REST — only at boot or from the on-device menu.
+- **`Ethernet Settings`** — the reset **drops the DHCP lease mid-request**.
+  `ConfigStore::reset` is followed by `effectuate()`, and
+  `NetworkInterface::effectuate_settings` on an initialised, link-up interface
+  calls `dhcp_stop()` → `dhcp_release_and_stop`
+  (`lwip/src/core/ipv4/dhcp.c:1325-1390`): DHCP_RELEASE goes out and
+  `netif_set_addr(netif, IP4_ADDR_ANY4, ...)` zeroes the address the REST
+  request arrived on. The 3.15-line guard that makes this a live no-op arrived
+  **post-tag** in `6b5ffc21` and exists only in the `v3.15-8x` fork this bench
+  flashed onto the U64E — upstream and the C64U's 1.1.0 line call `dhcp_stop()`
+  unconditionally, so the no-op holds for exactly one device here and must never
+  be generalised. On a statically addressed device the same path takes the
+  `else` branch, which is why **tests must never configure a static address**.
+- **`Network Settings`** — the reset blanks the Network Password and the syslog
+  server, restores the hostname to the product default, and **re-enables** every
+  service: Ultimate Ident/DMA, Telnet, FTP, Web and SNTP all default to
+  `1 = Enabled` (`network_config.cc:15-36`). It turns them on, not off — a
+  security-shaped change on a shared bench that silently undoes a deliberate
+  service-off state.
+- **`WiFi settings`** — device-loss risk, not a connectivity inconvenience. The
+  C64 Ultimate reaches the bench over WiFi and its **reconnection after a power
+  cycle is known unreliable**: the owner has seen it fail to rejoin, saved a
+  working configuration to flash deliberately, and confirmed the rejoin only by
+  standing at the device (owner testimony, 2026-09-11). A reset would discard
+  that configuration in RAM and re-effectuate the stack the device is reached
+  over; if it does not come back there is no remote remedy at all.
+- **`Clock Settings`** — the RTC: the reset shows neither drift nor mismatch
+  while arming the next PUT to the category to write the 2015 defaults to the
+  clock chip (`rtc.cc:350-409`).
+
+The global route touches all five, which is why it is never sent, and a glob is
+the global route by another name — the firmware's per-category route is a
+pattern match. `apply_factory_baseline()` resets per category over
+`BASELINE_CATEGORIES`, refuses every never-touch store and every glob with
+`ValueError` before a single request goes out, asserts per item that the reset
+took (`U64BaselineError` if it did not), logs pre-existing drift at INFO rather
+than failing on it, and accepts `exempt=[(category, item)]` for
+detection-derived values inside a covered store. Hold the device's `DeviceLock`
+when calling it: `create_manager(backend="u64")` runs it for you inside the lock
+before the transport is handed out; a bare client only gets the #194
+unlocked-client notice, which is a notice, not a refusal. On a host where
+`device_lock` will not import the two cases differ, and the difference is
+deliberate: `create_manager(backend="u64", baseline_on_entry=True)` — or
+`U64_BASELINE_ON_ENTRY=1` — is an explicit ask and is a **hard refusal**
+(`RuntimeError`, "baseline_on_entry requires DeviceLock"), while a reset merely
+*inherited* from the generation default **degrades to off with a WARNING** naming
+the switch rather than turning a working configuration into a crash
+(`unified_manager.py:196-212`, `:368-376`; pinned by
+`tests/test_entry_baseline_default_on.py`
+`TestDefaultDoesNotSilentlyArmWithoutTheLock`). **You do not have to ask for it.** Since #285 the manager
+resolves the reset from the device's generation at `acquire()` — on for the
+U64E, off for the C64U, off for an unreadable generation — so a U64E lane gets a
+reconciled device without passing anything, and `U64_BASELINE_ON_ENTRY` is the
+override in both directions. The gate table's entry below spells out the
+precedence.
+
+The worked fixture, and the rest of the contract, are in the `c64-test` skill:
+`.claude/skills/c64-test/PATTERNS.md` § "Known state on entry — reset, then set
+only what you need".
+
 ### `U64_BASELINE_LIVE` / `FLASH_BASELINE_LIVE` — the factory-default baseline (issue #227)
 
 Two opt-in U64 suites, both also gated on `U64_HOST` and `U64_ALLOW_MUTATE=1` (they write config) and both holding the `DeviceLock` for the module:
@@ -312,9 +412,34 @@ live suites — see [#268](https://github.com/JC-000/c64-test-harness/issues/268
 | `READ_BYTES_STRESS=1` | `tests/test_read_bytes_stress_live.py` | VICE | the issue #88 `read_bytes` corruption reproducer; iteration counts and the wall cap are themselves env knobs |
 | `BRIDGE_CLEANUP_LIVE=1` | `tests/test_cleanup_vice_ports_live.py` (Linux), `tests/test_cleanup_vice_ports_macos_live.py` (macOS) | bridge up, elevation | the paired reference for live tests that mutate host network state |
 
-`U64_BASELINE_ON_ENTRY=1` (or TOML `[u64] baseline_on_entry = true`;
-`C64TEST_U64_BASELINE_ON_ENTRY` wins when both are set) turns the entry
-reset on for `create_manager(backend="u64")` lanes; it is off by default.
+**The entry reset is not a flag you turn on: it resolves per device
+generation at `acquire()`**
+([#285](https://github.com/JC-000/c64-test-harness/pull/285), closing
+[#266](https://github.com/JC-000/c64-test-harness/issues/266)). With nothing
+set, `create_manager(backend="u64")` asks the device what it is
+(`DeviceCapabilities.generation`) and the answer is
+`BASELINE_ON_ENTRY_DEFAULT_BY_GENERATION` — on for the U64E, off for the C64U,
+off for an unreadable generation. `U64_BASELINE_ON_ENTRY=1`/`=0` (or TOML
+`[u64] baseline_on_entry`; `C64TEST_U64_BASELINE_ON_ENTRY` wins when both are
+set) overrides either way, and an explicit `baseline_on_entry=` beats both. Off
+means no requests at all, and the resolved value plus what decided it is logged
+at INFO on every acquire.
+
+**Why the C64 Ultimate is the exception, deliberately and not by oversight.**
+Not `/Temp`: every request the reset makes is bodyless, so it costs no
+attachment even there. It is the link. That device reaches the bench over WiFi
+whose reconnection after a power cycle is known unreliable, with nobody present,
+and nothing in `BASELINE_NEVER_TOUCH` protects against a future edit adding a
+network store to the covered set by mistake — see the `Ethernet Settings` and
+`WiFi settings` reasons above. `U64_BASELINE_ON_ENTRY=1` opts a C64U in for
+somebody standing at the bench, and the manager logs a WARNING naming the risk
+when it does. An `unknown` generation — an unreadable or timed-out capability
+probe ([#262](https://github.com/JC-000/c64-test-harness/issues/262)) — resolves
+**off**: a reset must never arm on a device the harness failed to identify, and
+the C64U is exactly the device a slow probe mis-grades.
+`HarnessConfig.u64_baseline_on_entry` stays `None`-by-default (tri-state,
+"nobody asked") so that wiring the config through does not turn an inherited
+default into an explicit request.
 
 ## Making the `c64-test` Claude Code skill available globally
 

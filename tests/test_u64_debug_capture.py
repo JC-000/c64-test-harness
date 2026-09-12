@@ -621,3 +621,31 @@ class TestDebugCaptureFilterAndMaxBytes:
         assert all(c.address == 0xCAFE for c in result.trace)
         # At most two chunks worth of post-filter entries.
         assert result.total_cycles <= 2 * (ENTRIES_PER_PACKET // 2)
+
+
+# --------------------------------------------------------------------------- #
+# #269 — the method docstring must not restate the retired mechanism          #
+# --------------------------------------------------------------------------- #
+
+def test_with_fresh_fpga_does_not_claim_it_reboots_the_fpga():
+    """The module docstring was corrected and the method's was not, so one
+    file said both things ~270 lines apart — and the method's is the text
+    ``help()`` and an IDE surface at the call site.
+
+    This is the shape a vocabulary sweep cannot catch: "Reboot the U64
+    FPGA" uses none of the retired phrases and is wrong by *referent*.
+    The empirical #81 claim is unaffected and must survive, so it is
+    asserted too rather than only asserting the absence.
+    """
+    import re
+
+    from c64_test_harness.backends.u64_debug_capture import DebugCapture
+
+    doc = re.sub(r"\s+", " ", (DebugCapture.with_fresh_fpga.__doc__ or "")
+                 .replace("`", "").replace("*", ""))
+    assert "Reboot the U64 FPGA" not in doc
+    assert "Reboot the C64 side" in doc
+    assert "the FPGA is not what gets rebooted" in doc
+    # the empirical claim the correction must not take with it
+    assert "degrades over time" in doc
+    assert "issue #81" in doc

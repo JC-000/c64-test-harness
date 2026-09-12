@@ -904,16 +904,35 @@ So on a leak-prone device **`run_prg_via_sys(target, prg)` is the low-risk way t
    building the query themselves, or calling `_request` directly, gets a silent
    zero-page clobber reported as success.
 
-### Known state on entry — reset, then assert (issue #227)
+### Known state on entry — reset, then set only what you need (issues #227, #276)
 
-Setup is verifiable, teardown is not. A killed run restores nothing; on a shared device the previous lane's turbo, REU size, SID map or `Cartridge Preference` is what you inherit, and a `snapshot_state`/`restore_state` in a `finally` cannot help the lane that never reached its `finally`. Opt in and the manager puts the device at the firmware's factory defaults **inside the `DeviceLock`, before you get the target**:
+**The practice: a live test reconciles the device to a known baseline when it starts, and then sets only the items it needs. It does not depend on the previous run having cleaned up after itself.** Entry-time reconciliation, not exit-time restore.
+
+Setup is verifiable, teardown is not — and teardown is missing exactly when it matters most. On 2026-09-10 a live run against the bench U64E was SIGKILLed about 30 s in. `tests/test_ultimate64_transport_live.py` leaves the device at 1 MHz in the teardown of its module-scoped `transport` fixture — the statements after its `yield t` — and a SIGKILL runs none of them. The device had been flashed to defaults minutes earlier, so the residue was unambiguous: `U64 Specific Settings / CPU Speed` read `' 8'` against a default of `' 1'`, and nothing in the harness noticed or said so (issue #276; the per-item `current`-vs-`default` comparison is the measurement, 201 items, and the attribution to that window is strong but circumstantial). An 8× device does not fail anybody's test — it produces plausible, wrong timing numbers for every later run, on a bench shared by several projects. That fixture is in fact weaker than the `finally` #276 describes it as: its teardown is a bare post-`yield` sequence with no `try`/`finally`, so an exception arriving at the `yield` skips the `set_speed(1)`, the `t.close()` and the `lock.release()` alike.
+
+`finally` covers exceptions and normal exit. It does not cover SIGKILL, a host crash, or a worker reaped by a parallel launcher — which is the shape that occurred. So **restore-on-exit is a courtesy; the correctness mechanism is reconciliation at entry**, the only point at which a process is present to notice the leftovers and fix them.
+
+> **Do not hand-roll this, and never with the raw endpoint.** The naive form of the advice — "just call `configs:reset_to_default`" — is dangerous on this bench, and the repo already knows why: see `BASELINE_NEVER_TOUCH` in `src/c64_test_harness/backends/ultimate64_baseline.py`, where each of the five refused stores carries its reason.
+>
+> - **`SID Sockets Configuration`** — the reset **cuts socket power**. `ConfigStore::reset` sets `SID Socket 1/2=Disabled` and the store's `effectuate_settings` writes regulator bits 0 to the PLD SIDCTRL/I2C (`u64_config.cc:744-800`). Measured on the U64E with two 8580s, n=3, 2026-09-05: all six items flip (`Enabled→Disabled`, `8580→None`, `22 nF→470 pF`) — and because every item now equals its default, "the report reads clean, so the socketed SIDs are POWERED OFF with nothing to say so". Detection never re-runs over REST (only at boot or from the on-device menu).
+> - **`Ethernet Settings`** — the reset **drops the DHCP lease mid-request**. `ConfigStore::reset` is followed by `effectuate()`, and `NetworkInterface::effectuate_settings` on an initialised, link-up interface calls `dhcp_stop()` → `dhcp_release_and_stop` (`lwip/src/core/ipv4/dhcp.c:1325-1390`): DHCP_RELEASE goes out and `netif_set_addr(netif, IP4_ADDR_ANY4, ...)` zeroes the address the REST request arrived on. The guard that makes this a live no-op arrived **post-tag** in `6b5ffc21` and exists only in the `v3.15-8x` fork this bench flashed onto the U64E; upstream and the C64U's 1.1.0 line call `dhcp_stop()` unconditionally. On a statically addressed device the same path takes the `else` branch — which is why **tests must never configure a static address**.
+> - **`Network Settings`** — the reset blanks the Network Password and the syslog server, restores the hostname to the product default, and **re-enables** every service (Ultimate Ident/DMA, Telnet, FTP, Web, SNTP all default to `1 = Enabled`, `network_config.cc:15-36`). It turns them on, not off: a security-shaped change on a shared bench that silently undoes a deliberate service-off state.
+> - **`WiFi settings`** — device-loss risk. The C64 Ultimate reaches the bench over WiFi and its **reconnection after a power cycle is known unreliable**: the owner has seen it fail to rejoin, saved a working configuration to flash deliberately, and confirmed the rejoin only by standing at the device (owner testimony, 2026-09-11). A reset would discard that configuration in RAM and re-effectuate the stack the device is reached over, and if it does not come back there is no remote remedy at all.
+> - **`Clock Settings`** — the RTC: the reset shows neither drift nor mismatch while arming the next PUT to the category to write the 2015 defaults to the clock chip (`rtc.cc:350-409`).
+>
+> The global route touches every one of them, which is why it is never sent; and a glob is the global route by another name, because the firmware's per-category route is a pattern match.
+
+The supported form is `apply_factory_baseline()` (same module). It resets **per category** over the fixed `BASELINE_CATEGORIES`, refuses every `BASELINE_NEVER_TOUCH` store and every glob with `ValueError` *before any request*, asserts per item that the reset took, logs pre-existing drift at INFO rather than failing on it, and takes an `exempt=[(category, item)]` list for detection-derived values inside a covered store. Hold the device's `DeviceLock` when you call it — the manager path does; a bare client gets the #194 unlocked-client notice, which is a notice and not a refusal, while `create_manager(backend="u64", baseline_on_entry=True)` refuses outright if `device_lock` cannot be imported (`backends/unified_manager.py`, the `"baseline_on_entry requires DeviceLock"` `RuntimeError`).
+
+**You do not opt in — a U64E lane already gets this.** Since [#285](https://github.com/JC-000/c64-test-harness/pull/285) (closing #266) the manager resolves the reset from the device's generation at `acquire()`, not from a flag: `BASELINE_ON_ENTRY_DEFAULT_BY_GENERATION` is on for the U64E, off for the C64U, off for an unreadable generation. `U64_BASELINE_ON_ENTRY=1`/`=0` overrides either way and an explicit `baseline_on_entry=` beats both; off means no requests at all, and the resolved value plus what decided it is logged at INFO on every acquire. So the manager puts the device at the firmware's factory defaults **inside the `DeviceLock`, before you get the target** (`_LockedU64Manager.acquire` in `backends/unified_manager.py`: a reset that does not take fails the acquire, not your test):
 
 ```python
 from c64_test_harness import create_manager, apply_factory_baseline, U64BaselineError
 
-# env: U64_BASELINE_ON_ENTRY=1   (the one name, read by the manager and HarnessConfig.from_env;
-#                                 or HarnessConfig.u64_baseline_on_entry / [u64] baseline_on_entry = true)
-with create_manager(backend="u64", u64_hosts="10.43.23.81", baseline_on_entry=True) as mgr:
+# No argument needed on a U64E: the reset resolves from the device generation.
+# baseline_on_entry=True/False is the explicit override; U64_BASELINE_ON_ENTRY=1/0
+# (or HarnessConfig.u64_baseline_on_entry / [u64] baseline_on_entry) is the env one.
+with create_manager(backend="u64", u64_hosts="10.43.23.81") as mgr:
     with mgr.instance() as target:       # acquire(): lock -> reset covered categories -> assert current == default
         ...                              # build your state on top; restore_state on exit stays a courtesy
 
@@ -928,11 +947,66 @@ Rules the implementation enforces, and why:
 
 - **Reset first, assert second.** `current != default` *before* the reset is the normal state of a shared device — that is the leak the step exists to remove — so it is logged per item as "inherited drift", never raised. `current != default` *after* the reset means the reset did not take (accepted, not applied — the #204 shape) and raises `U64BaselineError` naming category, item, current and default. Downstream tools that assert the baseline without performing the reset will refuse to run on a device in its ordinary shared state.
 - **The baseline is the firmware's `default`, per item, from the item map** (`get_config_item`, #214) — no harness-owned table, self-updating across firmware versions; a release that moves a default is a deliberate bench change. Items without a `default` key (preset/info types) are reported in `report.unasserted`, not compared.
-- **Per-category route only** (`PUT /v1/configs/<category>:reset_to_default`, the twelve `BASELINE_CATEGORIES`). **Never** the global `configs:reset_to_default`: it iterates *every* store — `Ethernet Settings` (a static-addressed device flips to DHCP and is stranded), `Network Settings` (blanks the password, hostname, service flags), the SID socket store and the RTC included. Every `BASELINE_NEVER_TOUCH` store is refused as an argument with its reason, so is any glob (the route is a pattern match; `*` is the global reset by another name). Categories the device does not list (the C64U's set differs) are skipped with a log line.
+- **Per-category route only** (`PUT /v1/configs/<category>:reset_to_default`, the twelve `BASELINE_CATEGORIES`). **Never** the global `configs:reset_to_default`: it iterates *every* store — `Ethernet Settings` (drops the DHCP lease mid-request), `Network Settings` (blanks the password and syslog server, re-enables every service), the WiFi store, the SID socket store and the RTC included. Every `BASELINE_NEVER_TOUCH` store is refused as an argument with its reason, so is any glob (the route is a pattern match; `*` is the global reset by another name). Categories the device does not list (the C64U's set differs) are skipped with a log line.
 - **Two hardware stores are never touched, and the reason is the reset itself, not the assertion.** `SID Sockets Configuration`: `ConfigStore::reset` sets `SID Socket 1/2=Disabled` and the store's `effectuate` writes regulator bits 0 to the PLD SIDCTRL/I2C (`u64_config.cc:744-800`) — measured on the U64E (n=3): all six detection items flip (`Enabled→Disabled`, `8580→None`, `22 nF→470 pF`), the socketed SIDs lose power, and the report reads *clean* because every item now equals its default. Detection never re-runs over REST; recovery is a per-item PUT of the detected values (which re-effectuates the regulators — both 8580s alive on the OSC3 stride probe afterwards, 3/3), and on a 6581 bench that PUT applies socket voltage without the human 12 V approval detection waits for (`u64_config.cc:698-705`). `Clock Settings` is the RTC: `effectuate` is empty, RAM already reads the 2015 defaults (`at_open_config` fills from the chip only when the on-device menu opens), so a reset shows neither drift nor mismatch while arming the next PUT to write 2015 to the chip (`rtc.cc:350-409`). Both live in `BASELINE_NEVER_TOUCH` with these reasons, are refused as arguments, and can never enter the covered set (structural test). An assertion-level exemption (the first fix) would have left the reset PUT — the damage — in place. `exempt=[(category, item)]` remains for a detection-derived *item* inside a covered store.
 - **Memory-only.** Flash is untouched; `load_config_from_flash` undoes it and a reboot reloads flash. The bench premise is flash == factory default — `tests/test_flash_baseline_live.py` (`FLASH_BASELINE_LIVE=1`) is the instrument; run it after every firmware flash.
 - **Inside the lock, or with the notice.** The manager path runs the reset after `DeviceLock` is taken; calling `apply_factory_baseline` on a bare client logs the #194 unlocked-client notice. No second mechanism.
-- Cost: one category GET + one reset PUT + one item GET per item per category (~150 items on the U64E); `tests/test_entry_baseline_live.py` records `apply_seconds`. Opt-in until two measurements land: whether any store's `effectuate()` pulses the C64 reset, and the C64U's WiFi store.
+- Cost: one category GET + one reset PUT + one item GET per item per category; `tests/test_entry_baseline_live.py` records `apply_seconds`. **No item count is measured for the covered set** — the only measured figure on this bench is 201 items over *every* category the U64E lists (2026-09-10, #276), and the twelve in `BASELINE_CATEGORIES` are an uncounted subset of that, necessarily smaller because the five never-touch stores are excluded. An earlier "~150 items" here was an estimate that traced only to the same sentence in the live test's docstring — a doc repeating a doc is one claim, not two — and is withdrawn rather than re-derived. **That figure is a U64E observation only** — the C64U's category and item lists have never been read, so it does not carry over to the CBM line. Every one of those requests is bodyless, so the reset costs **zero `/Temp` attachments** even on the leak-prone C64U; the residual is that the zero-length gate (`routes.cc:40-46`) was read on the 3.15 line and 1.1.0 is an inference, not a read.
+- **Why the C64U defaults off anyway, deliberately and not by oversight.** Not `/Temp` — the link. That device is reached over WiFi whose reconnection after a power cycle is known unreliable, with nobody present, and nothing in `BASELINE_NEVER_TOUCH` protects against a future edit adding a network store to the covered set by mistake. `U64_BASELINE_ON_ENTRY=1` opts a C64U in for somebody at the bench, and the manager logs a WARNING naming the risk when it does. An `unknown` generation (unreadable or timed-out probe, #262) resolves off for the same reason: never arm a reset on a device the harness failed to identify. `HarnessConfig.u64_baseline_on_entry` stays `None`-by-default (tri-state, "nobody asked") so wiring the config through does not turn an inherited default into an explicit request (`config.py`; the contract is in the `ultimate64_baseline` module docstring, pinned by `tests/test_entry_baseline_default_on.py` and `tests/test_entry_baseline_docs.py`).
+
+**Worked example — a module that constructs its own transport.** Reconcile first, then set the one item the module needs, on top of a state you have asserted rather than inherited:
+
+```python
+import os, pytest
+from c64_test_harness import DeviceLock, apply_factory_baseline
+from c64_test_harness.backends.ultimate64 import Ultimate64Transport
+from c64_test_harness.backends.ultimate64_helpers import (
+    check_measurement_environment, set_turbo_mhz,
+)
+
+_HOST = os.environ.get("U64_HOST")
+_MUTATE = os.environ.get("U64_ALLOW_MUTATE") == "1"   # this module writes config — gate it (#268)
+
+@pytest.fixture(scope="module")
+def transport():
+    if not (_HOST and _MUTATE):
+        pytest.skip("needs U64_HOST and U64_ALLOW_MUTATE=1")
+    lock = DeviceLock(_HOST)
+    if not lock.acquire(timeout=120.0):
+        pytest.skip(f"could not acquire device lock for {_HOST}")
+    t = None
+    try:
+        # Inside the try, not before it: a constructor raise (unreachable host,
+        # bad password) would otherwise leak the lock we just took.
+        t = Ultimate64Transport(host=_HOST, password=os.environ.get("U64_PASSWORD"), timeout=8.0)
+
+        # 1. Entry reconciliation, inside the lock: clears whatever the last
+        #    lane left — including a lane that was killed and restored nothing.
+        #    NOTE: apply_factory_baseline has NO generation gate — that lives in
+        #    _LockedU64Manager.acquire, so calling it by hand arms the reset on
+        #    whatever U64_HOST names, C64U included, with no cbm WARNING. This
+        #    fixture is U64E-only unless somebody is physically at the bench.
+        report = apply_factory_baseline(t.client)     # raises U64BaselineError if a reset did not take
+        print("inherited drift:", report.drifted_items())   # INFO-logged too; never a failure
+
+        # 2. Set only what this module needs, on top of the asserted baseline.
+        set_turbo_mhz(t.client, 8)
+        yield t
+    finally:
+        # Courtesy, not the guarantee. What actually guarantees the next lane a
+        # known device is *its own* step 1 — this block does not run on SIGKILL.
+        if t is not None:
+            try:
+                set_turbo_mhz(t.client, 1)
+            except Exception:
+                pass
+            t.close()
+        lock.release()
+```
+
+Three things the example is making a point of. The `try`/`finally` opens **immediately after `lock.acquire()` succeeds** and the transport is built inside it, so the `DeviceLock` is released on every path a live process survives — including a constructor that raises. Put the construction above the `try`, as the obvious version does, and an unreachable host leaks the lock for the heartbeat's lifetime; the module in #276 does not wrap the `yield` at all. The `t is not None` guard is what makes that ordering safe. And a measurement module that needs 1 MHz should still call `check_measurement_environment(t.client)` after step 1 (gotcha 28): the entry reset makes turbo-at-default *likely*, the guard makes it *checked*, and the two are not the same claim.
+
+`create_manager(backend="u64")` does step 1 for you — no argument needed on a U64E — and is the better choice whenever the module can take its target from the manager; roll the fixture by hand only when it cannot.
 
 ### Two device generations — detect via `get_info()`, don't assume
 
