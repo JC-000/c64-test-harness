@@ -22,8 +22,9 @@ from c64_test_harness.backends.unified_manager import (
 
 @pytest.fixture(autouse=True)
 def _no_baseline_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The #227 entry reset is opt-in via ``U64_BASELINE_ON_ENTRY``; keep
-    a shell that exports it from changing what these tests expect."""
+    """The #227 entry reset defaults per device generation (#266) and
+    ``U64_BASELINE_ON_ENTRY`` overrides it either way; keep a shell that
+    exports it from changing what these tests expect."""
     monkeypatch.delenv("U64_BASELINE_ON_ENTRY", raising=False)
     monkeypatch.delenv("C64TEST_U64_BASELINE_ON_ENTRY", raising=False)
 
@@ -185,10 +186,11 @@ class TestU64Backend:
     def test_creates_u64_manager(self, mock_build: MagicMock) -> None:
         mock_build.return_value = MagicMock()
         mgr = UnifiedManager(backend="u64", u64_hosts="10.0.0.1")
-        # baseline_on_entry=False: the #227 entry reset is opt-in and the
-        # env switch is unset here.
+        # baseline_on_entry=None: with neither switch set, the #227 entry
+        # reset is left undecided here and resolved per device at acquire
+        # (#266 — on for the U64E, off for the C64U, off for unknown).
         mock_build.assert_called_once_with(
-            "10.0.0.1", None, lock_timeout=60.0, baseline_on_entry=False,
+            "10.0.0.1", None, lock_timeout=60.0, baseline_on_entry=None,
         )
         assert mgr.backend == "u64"
 
@@ -217,7 +219,7 @@ class TestU64Backend:
         with patch.dict(os.environ, {"U64_PASSWORD": "secret"}):
             UnifiedManager(backend="u64", u64_hosts="10.0.0.1")
         mock_build.assert_called_once_with(
-            "10.0.0.1", None, lock_timeout=60.0, baseline_on_entry=False,
+            "10.0.0.1", None, lock_timeout=60.0, baseline_on_entry=None,
         )
 
 
@@ -508,7 +510,7 @@ class TestCreateManagerLockTimeout:
         mock_build.return_value = MagicMock()
         create_manager(backend="u64", u64_hosts="10.0.0.1", lock_timeout=1234.5)
         mock_build.assert_called_once_with(
-            "10.0.0.1", None, lock_timeout=1234.5, baseline_on_entry=False,
+            "10.0.0.1", None, lock_timeout=1234.5, baseline_on_entry=None,
         )
 
     @patch("c64_test_harness.backends.unified_manager.DeviceLock")

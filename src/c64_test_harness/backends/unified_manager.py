@@ -18,7 +18,12 @@ from dataclasses import dataclass
 from typing import Any, Iterator, Protocol, runtime_checkable
 
 from ..transport import C64Transport
-from .ultimate64_baseline import apply_factory_baseline, baseline_on_entry_enabled
+from ..config import resolve_baseline_on_entry_env
+from .ultimate64_baseline import (
+    BASELINE_ON_ENTRY_ENV,
+    apply_factory_baseline,
+    resolve_baseline_on_entry,
+)
 from .vice_lifecycle import ViceConfig
 from .vice_manager import ViceInstanceManager
 
@@ -137,11 +142,23 @@ class UnifiedManager:
         asserting ``current == default`` per item.  ``None`` (the
         default) asks the environment through the same precedence
         ``HarnessConfig.from_env`` uses (``C64TEST_U64_BASELINE_ON_ENTRY``
-        wins, else ``U64_BASELINE_ON_ENTRY``); unset means off, and off
-        means no requests at all.  ``HarnessConfig.u64_baseline_on_entry``
-        is the TOML/env form and is tri-state for exactly this reason —
-        pass it here as is.  Requires ``DeviceLock`` to be importable;
-        the manager refuses to run the reset unlocked.
+        wins, else ``U64_BASELINE_ON_ENTRY``); with **neither** set the
+        answer comes from the device's generation at acquire time —
+        :data:`~c64_test_harness.backends.ultimate64_baseline.BASELINE_ON_ENTRY_DEFAULT_BY_GENERATION`,
+        on for ``"ultimate"``, off for ``"cbm"`` and off for ``"unknown"``
+        (#266).  ``None`` is therefore carried through undecided rather
+        than collapsed to a bool here, and ``False`` is the opt-out for a
+        series that needs the previous lane's state preserved; off means no
+        requests at all.  ``HarnessConfig.u64_baseline_on_entry`` is the
+        TOML/env form and is tri-state for exactly this reason — pass it
+        here as is.  The resolved value is logged at INFO on every acquire
+        with the device, its generation and what decided it.  The reset
+        never runs outside the ``DeviceLock``: on a host where
+        ``device_lock`` will not import, an *explicit* ``True`` (here or
+        through the env var) raises ``RuntimeError``, while the inherited
+        default degrades to off with a WARNING naming the switch.  It costs
+        no ``/Temp`` attachment on any device — every request it makes is a
+        GET or a bodyless PUT.
     """
 
     def __init__(
@@ -158,9 +175,41 @@ class UnifiedManager:
         self._backend = self._resolve_backend(backend)
         self._manager: BackendManager
         self._device_lock: Any = None
-        if baseline_on_entry is None:
-            baseline_on_entry = baseline_on_entry_enabled()
-        self._baseline_on_entry = bool(baseline_on_entry)
+        # Deliberately **not** collapsed to a bool here.  The default
+        # depends on the device's generation and no device is in hand at
+        # construction, so ``None`` is carried through to ``acquire()``
+        # and resolved there against the generation the device reported
+        # (``resolve_baseline_on_entry``).
+        #
+        # ``requested`` is what somebody actually asked for, by the same
+        # precedence acquire uses: the parameter, else the env var, else
+        # ``None`` for "nobody asked".  Three-valued on purpose -- an
+        # earlier version asked only *whether* someone had spoken, which
+        # made an explicit **off** look like a request and turned the
+        # documented opt-out into a RuntimeError on a host with no
+        # DeviceLock.  Only ``True`` is a request this host cannot honour.
+        requested = (
+            baseline_on_entry if baseline_on_entry is not None
+            else resolve_baseline_on_entry_env()
+        )
+        self._baseline_on_entry: bool | None = baseline_on_entry
+        if not _HAS_DEVICE_LOCK and requested is not True:
+            # The entry reset never runs outside the DeviceLock, so decide
+            # it off now.  ``requested is True`` is left undecided and
+            # refused in _build_u64_manager.  Asked-for-off is honoured
+            # silently -- there is nothing to warn about, and warning
+            # anyway would make the advice in the message below unusable.
+            if requested is None:
+                logger.warning(
+                    "U64 entry baseline defaults on for the 'ultimate' "
+                    "generation, but DeviceLock could not be imported on this "
+                    "host and the entry reset never runs outside the lock — "
+                    "continuing WITHOUT it, so this lane inherits whatever "
+                    "config the previous one left. Set %s=1 to make this a "
+                    "hard failure instead, or %s=0 to silence this.",
+                    BASELINE_ON_ENTRY_ENV, BASELINE_ON_ENTRY_ENV,
+                )
+            self._baseline_on_entry = False
         # When set, the policy is stamped onto every transport this
         # manager hands out via :meth:`acquire` / :meth:`instance`.
         # ``None`` keeps the transport's existing (permissive) policy
@@ -274,7 +323,7 @@ class UnifiedManager:
         hosts: str | list[str] | None,
         password: str | None,
         lock_timeout: float = 60.0,
-        baseline_on_entry: bool = False,
+        baseline_on_entry: bool | None = None,
     ) -> Any:
         """Build an Ultimate64InstanceManager from host/password config.
 
@@ -310,7 +359,10 @@ class UnifiedManager:
                 baseline_on_entry=baseline_on_entry,
             )
 
-        if baseline_on_entry:
+        if baseline_on_entry is not False:
+            # Only an *explicit* request reaches here: ``UnifiedManager``
+            # degrades an inherited default to False before building the
+            # manager, so anything still un-False was asked for.
             raise RuntimeError(
                 "baseline_on_entry requires DeviceLock (the entry reset runs "
                 "inside the device lock, never on a bare client); device_lock "
@@ -353,11 +405,13 @@ class _LockedU64Manager:
         self,
         inner: Any,
         lock_timeout: float = 60.0,
-        baseline_on_entry: bool = False,
+        baseline_on_entry: bool | None = False,
     ) -> None:
         self._inner = inner
         self._lock_timeout = lock_timeout
-        self._baseline_on_entry = bool(baseline_on_entry)
+        #: Tri-state.  ``None`` = resolve per device at acquire time (env,
+        #: else the generation default); a bool short-circuits that.
+        self._baseline_on_entry: bool | None = baseline_on_entry
         # Map instance id → DeviceLock so release() can find the right lock.
         self._locks: dict[int, DeviceLock] = {}
         self._map_lock = __import__("threading").Lock()
@@ -402,7 +456,27 @@ class _LockedU64Manager:
             device_host,
             os.getpid(),
         )
-        if self._baseline_on_entry:
+        # Resolved here, not at construction: the default depends on the
+        # device's generation.  An explicit value short-circuits the
+        # lookup entirely, so an opted-out lane never touches the client.
+        enabled, why, generation = self._resolve_baseline(instance)
+        if enabled and generation is None:
+            # The switch decided, so the grade was not needed to *resolve*
+            # it -- but it is needed to say what is about to be reset.
+            # Consulted here, after the decision, so a device that will not
+            # grade is still opted in (it just logs "not consulted").
+            generation = self._generation_of(instance)
+        if enabled and generation == "cbm":
+            logger.warning(
+                "U64 %s is a C64 Ultimate (generation=cbm) and the entry "
+                "baseline was armed explicitly (%s) — it does NOT default on "
+                "for this generation. That device is reached over WiFi whose "
+                "reconnection after a power cycle is known unreliable, and "
+                "nobody is at the bench: if a reset takes the link down there "
+                "is no remote remedy. Proceeding. Set %s=0 to opt out.",
+                device_host, why, BASELINE_ON_ENTRY_ENV,
+            )
+        if enabled:
             # Inside the lock, before the transport is handed out: the
             # previous lane's leftovers are cleared here, and a reset
             # that does not take fails the acquire rather than the test.
@@ -415,10 +489,62 @@ class _LockedU64Manager:
                 self._inner.release(instance)
                 raise
             logger.info(
-                "U64 %s at factory baseline on entry: %s",
-                device_host, report.summary(),
+                "U64 %s [generation=%s]: entry baseline RAN (%s) — %s",
+                device_host, generation or "not consulted", why,
+                report.summary(),
+            )
+        else:
+            logger.info(
+                "U64 %s [generation=%s]: entry baseline SKIPPED (%s) — this "
+                "lane inherits whatever config the previous one left",
+                device_host, generation or "not consulted", why,
             )
         return instance
+
+    @staticmethod
+    def _generation_of(instance: Any) -> str:
+        """The device's generation, or ``"unknown"`` if it will not say.
+
+        Never raises and never fails an acquire: a device that cannot be
+        graded is exactly the case that must resolve to *off*, so any
+        failure along ``instance.transport.client.capabilities.generation``
+        -- a transport with no client, a probe that timed out (#262), a
+        grade that is not a string -- is answered with ``"unknown"``.  The
+        probe itself is a bodyless ``GET /v1/info``, cached on the client,
+        so consulting it costs nothing in ``/Temp`` on any device.
+        """
+        try:
+            generation = instance.transport.client.capabilities.generation
+        except Exception as exc:  # noqa: BLE001 - grading never fails acquire
+            logger.debug(
+                "entry baseline: could not read device generation (%s: %s); "
+                "grading as unknown", type(exc).__name__, exc,
+            )
+            return "unknown"
+        return generation if isinstance(generation, str) else "unknown"
+
+    def _resolve_baseline(self, instance: Any) -> tuple[bool, str, str | None]:
+        """``(enabled, reason, generation)`` for this device, this acquire.
+
+        The generation is consulted **only** when nobody asked: an explicit
+        ``baseline_on_entry=`` or the env var decides without going near
+        the device, so an opted-out lane touches nothing and opting a C64U
+        in stays possible even on a device that will not grade.  The third
+        element is ``None`` in that case -- "not consulted", which the log
+        line says rather than printing a generation nothing depended on.
+        """
+        if self._baseline_on_entry is not None:
+            enabled, why = resolve_baseline_on_entry(
+                requested=self._baseline_on_entry
+            )
+            return enabled, why, None
+        asked = resolve_baseline_on_entry_env()
+        if asked is not None:
+            enabled, why = resolve_baseline_on_entry(requested=asked)
+            return asked, f"{BASELINE_ON_ENTRY_ENV}={'on' if asked else 'off'}", None
+        generation = self._generation_of(instance)
+        enabled, why = resolve_baseline_on_entry(generation)
+        return enabled, why, generation
 
     def release(self, instance: Any) -> None:
         """Release device and its cross-process lock."""
@@ -466,7 +592,9 @@ def create_manager(
         Forwarded to ``UnifiedManager.__init__``.  Useful keys:
         ``vice_config``, ``vice_kwargs``, ``u64_hosts``, ``u64_password``,
         ``baseline_on_entry`` (U64 reset-on-entry to factory default,
-        issue #227; ``None`` reads ``U64_BASELINE_ON_ENTRY``, off by
-        default).
+        issue #227; ``None`` reads ``U64_BASELINE_ON_ENTRY`` and, with
+        neither switch set, defers to the device's generation — on for the
+        U64E, off for the C64U, off for unknown, #266.  Pass ``True``, or
+        set ``U64_BASELINE_ON_ENTRY=1``, to opt a C64U in).
     """
     return UnifiedManager(backend=backend, lock_timeout=lock_timeout, **kwargs)

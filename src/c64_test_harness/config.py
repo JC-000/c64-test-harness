@@ -149,8 +149,16 @@ class HarnessConfig:
     # the environment at the manager, so the documented wiring
     # ``UnifiedManager(..., baseline_on_entry=cfg.u64_baseline_on_entry)``
     # does not pass an explicit False that beats the shell switch.  A TOML
-    # ``false`` is an explicit off.  Unset everywhere means off -- no
-    # requests are made.
+    # ``false`` is an explicit off.  Unset everywhere defers to the
+    # device's generation at acquire time since #266
+    # (``ultimate64_baseline.BASELINE_ON_ENTRY_DEFAULT_BY_GENERATION``): on
+    # for the U64E, off for the C64U (it is reached over a WiFi link whose
+    # reconnection is known unreliable) and off for an unreadable grade.
+    # ``false`` here, or ``U64_BASELINE_ON_ENTRY=0``, is the opt-out and
+    # means no requests are made.  Keep this field ``None``-by-default:
+    # making it a bool would turn the documented wiring into an explicit
+    # request, stop the shell switch from turning it off, and decide the
+    # question before any device is in hand.
     u64_baseline_on_entry: bool | None = None
 
     # Memory policy enforced at the transport boundary.  Default is

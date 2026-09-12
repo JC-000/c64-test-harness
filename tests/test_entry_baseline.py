@@ -12,8 +12,10 @@ The contract under test (owner's decisions, #227):
   normal state of a shared device (another lane's leftovers) and is
   logged per item as inherited drift; a mismatch *after* the reset means
   the reset did not take and is a hard failure naming the item.
-* Opt-in: ``U64_BASELINE_ON_ENTRY=1`` / ``HarnessConfig.u64_baseline_on_entry``.
-  Off by default -> no requests at all.
+* On by default since #266, with ``U64_BASELINE_ON_ENTRY=0`` /
+  ``baseline_on_entry=False`` as the opt-out -> no requests at all.  The
+  default and the measurement behind it are pinned in
+  ``tests/test_entry_baseline_default_on.py``.
 * The entry reset runs inside the ``DeviceLock`` in the manager path.  The
   standalone callable relies on the #194 unlocked-client notice; it adds
   no second mechanism.
@@ -231,10 +233,13 @@ class TestCoveredSet:
         from c64_test_harness.backends.ultimate64_baseline import BASELINE_NEVER_TOUCH
 
         expected = {
-            "Ethernet Settings": (
-                "reset_to_default flips a static-addressed device to DHCP "
-                "(Use DHCP=Enabled, 192.168.2.64/24) and strands it"
-            ),
+            # The stranding claim this used to assert is RETRACTED
+            # (measured U64E 2026-09-10: Use DHCP is already Enabled and
+            # all five items already equal their defaults, so the reset
+            # would change no value).  The category stays never-touch for
+            # re-effectuation onto the live stack -- see
+            # tests/test_entry_baseline_default_on.py::TestEthernetReason.
+            "Ethernet Settings": BASELINE_NEVER_TOUCH["Ethernet Settings"],
             "Network Settings": (
                 "reset blanks Network Password, hostname and the FTP/Telnet/Web/"
                 "SNTP service flags (and sets Ultimate DMA Service=Enabled)"
@@ -659,21 +664,34 @@ class TestOptIn:
         HarnessConfig says off, so a bare create_manager must say off too."""
         monkeypatch.setenv("C64TEST_U64_BASELINE_ON_ENTRY", "0")
         monkeypatch.setenv(BASELINE_ON_ENTRY_ENV, "1")
-        assert baseline_on_entry_enabled() is False
-        with patch("c64_test_harness.backends.unified_manager._LockedU64Manager") as Locked:
-            UnifiedManager(backend="u64", u64_hosts=[HOST])
-        assert Locked.call_args.kwargs["baseline_on_entry"] is False
+        assert baseline_on_entry_enabled("ultimate") is False
         monkeypatch.setenv("C64TEST_U64_BASELINE_ON_ENTRY", "1")
         monkeypatch.setenv(BASELINE_ON_ENTRY_ENV, "0")
-        assert baseline_on_entry_enabled() is True
-        with patch("c64_test_harness.backends.unified_manager._LockedU64Manager") as Locked:
-            UnifiedManager(backend="u64", u64_hosts=[HOST])
-        assert Locked.call_args.kwargs["baseline_on_entry"] is True
+        assert baseline_on_entry_enabled("cbm") is True
+        mgr = _LockedU64Manager(MagicMock(), baseline_on_entry=None)
+        assert mgr._resolve_baseline(_instance_of_generation("cbm"))[0] is True
 
-    def test_unset_is_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_unset_defers_to_the_generation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The default is per generation since the C64U's WiFi link was
+        found unreliable — see ``tests/test_entry_baseline_default_on.py``
+        for the full contract.  With no generation in hand the answer is
+        the conservative one."""
         monkeypatch.delenv(BASELINE_ON_ENTRY_ENV, raising=False)
         monkeypatch.delenv("C64TEST_U64_BASELINE_ON_ENTRY", raising=False)
+        assert baseline_on_entry_enabled("ultimate") is True
+        assert baseline_on_entry_enabled("cbm") is False
         assert baseline_on_entry_enabled() is False
+        monkeypatch.setenv(BASELINE_ON_ENTRY_ENV, "0")
+        assert baseline_on_entry_enabled("ultimate") is False
+
+
+def _instance_of_generation(generation: str) -> MagicMock:
+    """An instance stand-in whose client grades as *generation*."""
+    instance = MagicMock()
+    instance.transport.client.capabilities.generation = generation
+    return instance
 
 
 def _mock_instance(client: Any, host: str = HOST) -> MagicMock:
@@ -696,7 +714,10 @@ class TestManagerPath:
         return lock
 
     @patch("c64_test_harness.backends.unified_manager.DeviceLock")
-    def test_off_by_default_no_requests(self, MockDeviceLock: MagicMock) -> None:
+    def test_opted_out_makes_no_requests(self, MockDeviceLock: MagicMock) -> None:
+        """``_LockedU64Manager``'s own parameter still defaults to False;
+        the default-on decision lives at ``UnifiedManager``, which passes
+        an explicit value.  Opted out means no requests at all."""
         order: list[str] = []
         self._locked(MockDeviceLock, order)
         client = FakeBaselineU64(drift=_DRIFT)
@@ -776,16 +797,28 @@ class TestManagerPath:
                 UnifiedManager(backend="u64", u64_hosts=[HOST], baseline_on_entry=True)
 
     def test_env_opts_the_manager_in(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The env var reaches the wrapper as the tri-state ``None`` and is
+        re-read at acquire, where it beats the generation default — so it
+        opts a C64U in, which is the whole point of an explicit opt-in."""
         monkeypatch.setenv(BASELINE_ON_ENTRY_ENV, "1")
         with patch("c64_test_harness.backends.unified_manager._LockedU64Manager") as Locked:
             UnifiedManager(backend="u64", u64_hosts=[HOST])
-        assert Locked.call_args.kwargs["baseline_on_entry"] is True
+        assert Locked.call_args.kwargs["baseline_on_entry"] is None
+        mgr = _LockedU64Manager(MagicMock(), baseline_on_entry=None)
+        enabled, why, generation = mgr._resolve_baseline(
+            _instance_of_generation("cbm"))
+        assert enabled is True and BASELINE_ON_ENTRY_ENV in why
+        assert generation is None, "the env decided; no probe was needed"
 
-    def test_env_unset_leaves_the_manager_out(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv(BASELINE_ON_ENTRY_ENV, raising=False)
-        with patch("c64_test_harness.backends.unified_manager._LockedU64Manager") as Locked:
-            UnifiedManager(backend="u64", u64_hosts=[HOST])
-        assert Locked.call_args.kwargs["baseline_on_entry"] is False
+    def test_env_off_opts_the_manager_out(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The env var is the opt-out, and it beats the on-by-default
+        'ultimate' generation."""
+        monkeypatch.delenv("C64TEST_U64_BASELINE_ON_ENTRY", raising=False)
+        monkeypatch.setenv(BASELINE_ON_ENTRY_ENV, "0")
+        mgr = _LockedU64Manager(MagicMock(), baseline_on_entry=None)
+        enabled, why, _gen = mgr._resolve_baseline(
+            _instance_of_generation("ultimate"))
+        assert enabled is False and BASELINE_ON_ENTRY_ENV in why
 
     def test_explicit_false_beats_the_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(BASELINE_ON_ENTRY_ENV, "1")
@@ -808,7 +841,9 @@ class TestManagerPath:
         with patch("c64_test_harness.backends.unified_manager._LockedU64Manager") as Locked:
             UnifiedManager(backend="u64", u64_hosts=[HOST],
                            baseline_on_entry=cfg.u64_baseline_on_entry)
-        assert Locked.call_args.kwargs["baseline_on_entry"] is True
+        assert Locked.call_args.kwargs["baseline_on_entry"] is None
+        mgr = _LockedU64Manager(MagicMock(), baseline_on_entry=None)
+        assert mgr._resolve_baseline(_instance_of_generation("cbm"))[0] is True
 
     def test_vice_backend_ignores_the_flag(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(BASELINE_ON_ENTRY_ENV, "1")
