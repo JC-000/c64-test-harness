@@ -190,11 +190,33 @@ _MAX_HOLDER_HANDOFFS = 3
 #: up at 2.00 s).  Both pinned rescue tests release after 0.2 s, so they
 #: would pass just as well at 0.5 s or 60 s -- they bound the value from
 #: below by two orders of magnitude and no more.  The thing that would
-#: fix the value is a real rescuing caller's latency, and there is no
-#: such caller: outside those two tests nothing in this repo releases a
-#: ``DeviceLock`` from a thread other than the one that acquired it.
-#: So this is "ten times the only rescue latency anyone has
-#: demonstrated", chosen against 600 s of certain failure.  A rescue
+#: fix the value is a real rescuing caller's latency, and none has been
+#: demonstrated.  Enumerated rather than asserted, there are **three**
+#: cross-thread releases, all of them in the lock tests:
+#: ``test_device_lock.py`` (a plain ``Thread``, 0.2 s),
+#: ``test_device_lock_self_deadlock.py`` (a ``Timer``, 0.2 s), and
+#: ``test_device_lock_self_held_fast_fail.py`` (a ``Timer`` at 1.0 s and
+#: 3.0 s).  Only the first two can size anything: the third takes its
+#: delays from ``_SELF_HELD_WAIT_GRACE * 0.5`` and ``* 1.5``, derived
+#: from this very constant, so it is self-referential and cannot be
+#: evidence for the value it is computed from.  So this is "ten times
+#: the only rescue latency anyone has demonstrated", chosen against
+#: 600 s of certain failure.
+#:
+#: **Scope of that, stated exactly, because the stronger version was
+#: asserted and withdrawn.**  It is a claim about what has been
+#: *demonstrated*, not a survey: nobody has established that no
+#: longer-latency cross-thread releaser exists.  What is checked is the
+#: library surface only -- ``src/`` builds exactly one ``DeviceLock``
+#: (``unified_manager.py``, in ``acquire``, with ``allow_nested=True``;
+#: the other six ``src/`` hits are docstrings and error-message text).
+#: ``tests/`` and ``scripts/`` were **not** swept, and a grep narrow
+#: enough to miss ``threading.Thread`` would miss most of what it was
+#: looking for anyway -- it already missed
+#: ``test_acquire_succeeds_after_release``, which releases cross-thread
+#: through a plain ``Thread``.  So if a caller with a longer rescue
+#: latency turns up in tests or tooling, this value is too small and the
+#: right response is to raise it, not to defend it.  A rescue
 #: that needs longer fails where it used to succeed -- the WARNING in
 #: :meth:`acquire` names the cap so that failure is diagnosable rather
 #: than mysterious.  The cliff is pinned by

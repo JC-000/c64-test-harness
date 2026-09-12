@@ -334,3 +334,104 @@ class TestTheRescueWindow:
             "return",
             False,
         )
+
+
+class TestNestingIsTheAcquirersProperty:
+    """The other half of the sentence in ``tests/conftest.py``.
+
+    That paragraph now says nesting is a property of the **acquirer**,
+    never of the holder.  The first half is pinned in two places already
+    -- ``test_allow_nested_joins_instead_of_waiting`` above and
+    ``test_device_lock_self_deadlock.py::TestSelfHeldDoesNotExtendDeadline::
+    test_allow_nested_still_joins`` -- but both set the flag on the
+    *inner* lock, as does every other ``allow_nested=True`` in the suite.
+    Nothing set it on the holder while the acquirer went without, which
+    is the direction the sentence is actually about, and the direction
+    the four broken live modules got wrong.
+
+    **This is a consistency test, not a hazard control, and the
+    distinction matters enough to spell out.**  If the gate in
+    :meth:`DeviceLock.acquire` ever did start consulting the holder's
+    flag, the effect would be **fail-safe**: a plain acquirer under
+    ``conftest``'s guard (which holds with ``allow_nested=True``) would
+    join, and the self-deadlock of issue #273 would quietly *disappear*.
+    Nobody would deadlock.  What would actually go wrong is one step
+    further out -- ``tests/test_live_device_lock_nesting.py`` would begin
+    flagging call sites that were no longer broken, somebody would read
+    a screenful of false positives as obsolete noise, and the guard
+    would be deleted.  That is the failure this closes, and it is a
+    minor one.
+
+    It earns its place on the commit's own logic rather than on risk:
+    the thesis here is that an unpinned paragraph in ``conftest.py``
+    about this exact semantic produced a two-week-class defect.
+    Shipping the corrected paragraph with precisely the protection the
+    wrong one had would contradict that reasoning.
+    """
+
+    def test_the_holders_flag_does_not_nest_the_acquirer(
+        self, lock_dir: Path
+    ) -> None:
+        """Holder opts in, acquirer does not: the acquirer must not join.
+
+        Nesting is a property of the acquirer.  A holder that set
+        ``allow_nested=True`` does not confer it on anyone else -- which
+        is the proposition ``tests/conftest.py``'s ``device_lock_guard``
+        docstring asserts, and the **inverse** of that belief is what
+        produced #273 class 2: four live modules built a plain
+        ``DeviceLock`` in the test body on the understanding that the
+        guard's flag covered them.
+
+        Three conditions, and dropping any one turns this into a test
+        that already exists: the holder carries the flag, the acquirer
+        does not, and both are on the same thread.
+
+        The whole scenario runs on one thread, so the acquirer is asking
+        for a lock its own thread holds -- the arrangement
+        ``conftest``'s autouse guard creates for every live test body.
+
+        Asserted on the outcome, not on the clock: a joined hold returns
+        ``True`` immediately, a refused one returns ``False``.  The wall
+        time it takes to say ``False`` is ``_SELF_HELD_WAIT_GRACE``
+        expiring, which is this module's own constant and would restate
+        the implementation rather than test it.
+        """
+
+        def scenario():
+            outer = DeviceLock(
+                HOST, lock_dir, heartbeat_interval=0.05, allow_nested=True
+            )
+            # Condition 1, asserted rather than assumed.  Drop the
+            # holder's flag and this test still passes -- the inner
+            # acquire is self-held and capped either way, so ``got`` is
+            # ``False`` for a reason with nothing to do with nesting.
+            # Unasserted, a refactor that dropped it would leave this
+            # green while silently demoting it to a duplicate of
+            # ``test_self_held_acquire_gives_up_within_the_grace``.  A
+            # scaffolding precondition that can rot unnoticed is the
+            # same silent-decay shape this test was added to close.
+            assert outer._allow_nested is True, (
+                "the holder must opt in, or this stops being a test about "
+                "nesting at all"
+            )
+            assert outer.acquire(timeout=5.0)
+            try:
+                # No allow_nested here -- that is the point.
+                inner = DeviceLock(HOST, lock_dir, heartbeat_interval=0.05)
+                got = inner.acquire(timeout=CALLER_TIMEOUT)
+                if got:
+                    inner.release()
+                return got, inner.held
+            finally:
+                outer.release()
+
+        kind, result = _run_bounded(scenario)
+        assert kind == "return", f"unexpected raise: {result!r}"
+        got, held = result
+        assert got is False, (
+            "a plain DeviceLock joined a hold whose *holder* set "
+            "allow_nested=True -- nesting is the acquirer's property, and "
+            "the holder's flag must not stand in for it (see the paragraph "
+            "in tests/conftest.py)"
+        )
+        assert held is False, "refused acquire must not leave the lock held"
