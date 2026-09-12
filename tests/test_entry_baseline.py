@@ -787,7 +787,12 @@ class TestManagerPath:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """No DeviceLock available -> a bare client would run the reset
-        unlocked.  The manager path refuses rather than degrading."""
+        unlocked.  An *explicit* ``baseline_on_entry=True``, which is what
+        this test passes, is refused rather than degraded.  An *inherited*
+        generation default is the other case and degrades to off with a
+        WARNING instead (``TestDefaultDoesNotSilentlyArmWithoutTheLock`` in
+        tests/test_entry_baseline_default_on.py); do not read this
+        docstring as covering it."""
         monkeypatch.setattr(
             "c64_test_harness.backends.unified_manager._HAS_DEVICE_LOCK", False
         )

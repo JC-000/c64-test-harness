@@ -330,8 +330,14 @@ class UnifiedManager:
         When :class:`DeviceLock` is available, wraps the manager with
         ``_LockedU64Manager`` for cross-process queueing via flock.  The
         entry reset (*baseline_on_entry*, issue #227) lives in that
-        wrapper because it must run inside the lock; without
-        ``DeviceLock`` it is refused rather than run unlocked.
+        wrapper because it must run inside the lock, and is never run
+        unlocked.  Without ``DeviceLock`` the two ways of asking part
+        company, deliberately: an *explicit* request (the parameter, or
+        ``U64_BASELINE_ON_ENTRY``) is refused here with ``RuntimeError``,
+        while a reset merely *inherited* from the generation default was
+        already degraded to ``False`` with a WARNING by
+        :class:`UnifiedManager` before this runs — turning an inherited
+        default into a crash would break a working configuration.
         """
         from .ultimate64_manager import Ultimate64Device, Ultimate64InstanceManager
 

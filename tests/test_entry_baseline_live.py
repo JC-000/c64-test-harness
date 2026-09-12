@@ -43,8 +43,15 @@ than a GET, ``reset``, ``reboot``, ``poweroff``.
 
 Not yet measured (record when this runs): the wall-clock cost of one
 ``apply_factory_baseline`` on the U64E (one category GET + one reset PUT
-+ one item GET per item, ~150 items) — ``record_property("apply_seconds")``
-captures it; and whether any store's ``effectuate()`` pulses the C64
++ one item GET per item) — ``record_property("apply_seconds")`` captures
+it, and it should also record the **item count**, which is what makes the
+seconds interpretable. The "~150 items" this docstring used to assert was
+an estimate with no n and no date, and it was quoted downstream as though
+it were measured; the only measured count on this bench is **201 items
+over every category the U64E lists** (2026-09-10, #276), of which the
+twelve in ``BASELINE_CATEGORIES`` are a subset nobody has counted —
+the five never-touch stores are excluded, so the covered figure is
+strictly lower and cannot be derived from 201 without the device; and whether any store's ``effectuate()`` pulses the C64
 reset (a separate #217-style marker+jiffy arm, not in this module).
 """
 from __future__ import annotations

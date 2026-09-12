@@ -15,6 +15,8 @@ to decide the ``write_mem`` POST threshold. That string match has two holes:
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from c64_test_harness.backends.u64_capabilities import DeviceCapabilities
@@ -211,3 +213,73 @@ def test_post_threshold_is_a_pure_function_of_writemem_post_safe():
 
     # The chunk size that makes the coupling matter at all.
     assert THRESHOLD_POST_SAFE < _WRITE_CHUNK_SIZE < THRESHOLD_POST_RISKY
+
+
+# --------------------------------------------------------------------------- #
+# #258 — both dispositions argued, and the two "unknown"s told apart          #
+# --------------------------------------------------------------------------- #
+
+def _flat(text: str) -> str:
+    import re
+    return re.sub(r"\s+", " ", (text or "").replace("`", "").replace("*", ""))
+
+
+def test_the_future_major_disposition_is_argued_where_the_constant_lives():
+    """The module grades an unreadable version closed and a future major
+    open.  Both are defensible; what was wrong was that only one carried a
+    reason, so the next reader could not tell the asymmetry was deliberate.
+
+    Read from the source rather than from ``__doc__`` because the argument
+    lives in a ``#:`` comment on the constant — and asserted against the
+    lines **immediately above the assignment**, not against the file, so
+    that it actually checks what it claims to: that somebody about to
+    change ``>=`` to ``==`` reads the reason without going looking for it.
+    Flattening the whole file passed with the block cut out and appended
+    to the bottom, which is the shape this test exists to prevent.
+    """
+    import re as _re
+
+    import c64_test_harness.backends.u64_capabilities as mod
+
+    lines = Path(mod.__file__).read_text().splitlines()
+    assign = [
+        i for i, ln in enumerate(lines)
+        if ln.startswith("_ULTIMATE_WRITEMEM_FIXED_FROM = ")
+    ]
+    assert len(assign) == 1, f"expected one assignment, found {len(assign)}"
+    # The comment block that documents the constant, and nothing else.
+    window = lines[max(0, assign[0] - 25):assign[0]]
+    # Strip the ``#:`` markers before flattening: without that, a claim
+    # wrapping across two comment lines comes back with a "#:" welded into
+    # the middle and no phrase spanning the break can ever match — a pin
+    # that is green because it can never fire.
+    src = _flat(_re.sub(r"(?m)^\s*#:?", " ", "\n".join(window)))
+    assert "a future major grades as fixed" in src
+    assert "That is deliberate" in src
+    assert "opposite disposition to the unreadable-version branch" in src
+    # and the behaviour the sentence describes
+    assert DeviceCapabilities.from_info({"firmware_version": "4.0"}).writemem_post_safe
+
+
+def test_the_two_unknown_generations_are_distinguishable():
+    """A ``2.x`` string parses cleanly and still grades ``unknown``.
+
+    Both unknowns are graded off, which is right; only one is transient.
+    A consumer that re-reads ``/v1/info`` on "generation is unknown" burns
+    its reads on the parsed case, then refuses with "no usable version"
+    two lines below a line printing the version.  ``firmware_version`` is
+    the discriminator, so it has to survive the unrecognised-major path.
+    """
+    parsed = DeviceCapabilities.from_info({"firmware_version": "2.5"})
+    assert parsed.generation == "unknown"
+    assert parsed.firmware_version == "2.5", "re-reading this cannot help"
+
+    nothing = DeviceCapabilities.from_info({})
+    assert nothing.generation == "unknown"
+    assert nothing.firmware_version is None, "this one is the transient"
+
+
+def test_the_generation_docstring_says_which_unknown_is_transient():
+    flat = _flat(DeviceCapabilities._generation_for.__doc__)
+    assert "only one of them is transient" in flat
+    assert "Re-reading cannot help" in flat

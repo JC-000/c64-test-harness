@@ -12,9 +12,28 @@ Module-, class-, session- and package-scoped fixtures are safe: they run
 acquisitions that happen at function time can self-deadlock, so that is
 exactly what this module checks, structurally, without a device.
 
-It also pins the second half: a live test that cannot take the device
-lock must **fail**, not skip.  ``test_sid_u64_live`` skipped, which is
-why its 120 s self-deadlock went unnoticed in every run.
+It also pins part of the second half — a live test that cannot take the
+device lock must **fail**, not skip.  ``test_sid_u64_live`` skipped, which
+is why its 120 s self-deadlock went unnoticed in every run.
+
+**Part, not all of it, and the gap is in the scanner rather than in the
+rule** (#279).  ``_skip_offenders`` matches one shape:
+``if not <x>.acquire(...)`` guarding a ``pytest.skip`` whose callee is an
+attribute.  ``_device_lock_calls`` matches a callee spelled literally
+``DeviceLock``.  Five plausible shapes therefore evade them, measured by
+driving both scanners on synthetic sources:
+``import DeviceLock as DL``; a module-level helper returning a lock;
+``from pytest import skip`` then a bare ``skip(...)``;
+``got = lock.acquire(...)`` then ``if not got:``; and
+``if lock.acquire(...) is False:``.
+
+That is a floor, not a guarantee, and it is a floor in the safe
+direction: the guard is fail-closed where it does match (a variable
+``allow_nested=`` is flagged), and it is not vacuous on the real corpus —
+26 ``DeviceLock(`` sites across the live modules, the 5 that run at
+function time all carrying ``allow_nested=True``.  Read this module as
+"these shapes cannot regress", not as "no live test can skip on a lock
+failure".
 """
 from __future__ import annotations
 
@@ -211,3 +230,21 @@ class TestTheScannerItselfCanFail:
         """It wins the flock before the function-scoped guard runs."""
         assert _nesting_offenders(self.SAFE, "x.py") == []
         assert _skip_offenders(self.SAFE, "x.py") == []
+
+
+def test_the_module_docstring_does_not_overstate_the_scanners_reach():
+    """#279: it claimed to pin "a live test that cannot take the device
+    lock must fail, not skip" without qualification, while
+    ``_skip_offenders`` matches exactly one shape.
+
+    Pinned here because the overstatement is the kind that makes a later
+    reader stop looking: a guard believed to be complete is not extended.
+    The evaded shapes are named in the docstring, so the assertion is that
+    the qualification is present, not merely that the claim is softened.
+    """
+    doc = __doc__ or ""
+    assert "Part, not all of it" in doc
+    assert "floor, not a guarantee" in doc
+    for shape in ("import DeviceLock as DL", "from pytest import skip",
+                  "is False:"):
+        assert shape in doc, shape

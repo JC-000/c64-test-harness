@@ -311,7 +311,14 @@ class DebugCapture:
         capture_kwargs: dict | None = None,
         reboot_settle_seconds: float = 12.0,
     ) -> "DebugCapture":
-        """Reboot the U64 FPGA, then construct a fresh DebugCapture ready to start.
+        """Reboot the C64 side, then construct a fresh DebugCapture ready to start.
+
+        Despite the method's name, **the FPGA is not what gets rebooted**:
+        :meth:`Ultimate64Client.reboot` is a C64-level reset that restarts
+        the C64 and re-inits the cartridge/REU, and does not restart the
+        firmware or reconfigure the FPGA. The name predates that
+        correction and is kept because it is public API (#269); the
+        empirical behaviour below is unaffected either way.
 
         The U64E FPGA's debug-stream emitter degrades over time under
         sustained workload — observed delivery drops to 30-90% of the
@@ -334,7 +341,8 @@ class DebugCapture:
         This helper NEVER calls :meth:`Ultimate64Client.poweroff` —
         ``poweroff`` is irrecoverable over the network and requires
         physical access to power-cycle. ``reboot()`` is the right
-        primitive for clearing FPGA state.
+        primitive here — empirically it restores the emitter and
+        ``reset()`` does not (#81).
 
         :param client: Connected Ultimate64 client.
         :param capture_kwargs: Forwarded as ``**kwargs`` to the

@@ -677,9 +677,16 @@ class Ultimate64Client:
           ``/Temp``.
         * The route table read is a 3.15-line checkout. The C64U's 1.1.0
           table is not available, so this assumes the verb/handler
-          pairing is the same there. Counting POST-with-body is the safe
-          side of that assumption; a PUT that *did* attach on 1.1.0 would
-          be missed, which is the one gap a live run could close.
+          pairing is the same there. Counting POST-with-body only is the
+          **permissive** side of that assumption, not the conservative
+          one: a PUT that *did* attach on 1.1.0 is never counted, so it
+          never advances ``_pending_temp_attachments``, the budget
+          comparison in :meth:`_before_temp_attachment` is never reached,
+          the hygiene pass never fires
+          and ``pending_temp_attachments`` reads zero while the device
+          accumulates. That is the gap to close, not the margin to rely
+          on, and one live run on a 1.1.0 device closes it. The genuinely
+          conservative half is the over-counting in the bullet above.
         """
         return body is not None and method == "POST"
 
@@ -812,13 +819,19 @@ class Ultimate64Client:
         Every fake host in the test suite is in that state, as is a
         client constructed with an explicit ``write_mem_query_threshold``
         (which by contract issues no HTTP at construction and so never
-        probes). A real device
-        that is merely *slow* — one whose 0.5 s construct-time probe timed
-        out — lands there too and loses hygiene for the client's lifetime;
-        ``U64_AUTO_TEMP_GC=1`` forces it back on, and passing
-        ``write_mem_query_threshold`` explicitly avoids the probe race
-        entirely. That residue is the one part of this that a live run
-        should confirm.
+        probes, and therefore stays disarmed for its lifetime —
+        ``U64_AUTO_TEMP_GC=1`` is what forces it back on).
+
+        A real device that is merely *slow* — one whose 0.5 s
+        construct-time probe timed out — does **not** stay disarmed:
+        :meth:`_maybe_reprobe_capabilities` exists to close exactly that
+        hole and runs before every attachment-creating request, re-probing
+        at the full timeout once one request has completed. The residue is
+        narrower and worth stating precisely: the **first**
+        attachment-creating call is decided on the stale unknown grade —
+        it is still counted — and the client arms from the second. Pinned
+        in ``tests/test_ultimate64_temp_hygiene.py`` by
+        ``test_a_device_that_answered_late_is_regraded_after_a_successful_request``.
         """
         if self._temp_hygiene_force is not None:
             return self._temp_hygiene_force
@@ -2208,7 +2221,13 @@ class Ultimate64Client:
 
         **Every** store, ``Ethernet Settings`` / ``Network Settings`` / the
         WiFi store included (firmware ``route_configs.cc``: the global form
-        iterates all stores).  A device configured static flips to DHCP.
+        iterates all stores).  The ``Ethernet Settings`` reset drops the
+        DHCP lease mid-request (``effectuate_settings`` -> ``dhcp_stop()``
+        zeroes the address the request arrived on) and the WiFi reset
+        re-effectuates the link a C64U is reached over.  Not the retracted
+        "flips a static-addressed device to DHCP and strands it" reading --
+        see :data:`~c64_test_harness.backends.ultimate64_baseline.
+        BASELINE_NEVER_TOUCH`, retracted reading (1).
         The harness's entry reset (:func:`~c64_test_harness.backends.
         ultimate64_baseline.apply_factory_baseline`) never uses this
         route; prefer :meth:`reset_config_category_to_default`.

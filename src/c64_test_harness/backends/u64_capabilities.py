@@ -51,6 +51,18 @@ THRESHOLD_POST_RISKY = 128
 #: First Ultimate-line release containing the Temp-folder GC fix
 #: (GideonZ/1541ultimate#686), which is what makes the POST ``writemem`` path
 #: safe to use for small payloads. The merge is an ancestor of the 3.15 bump.
+#:
+#: The comparison in :meth:`DeviceCapabilities._writemem_post_safe` is ``>=``,
+#: so **a future major grades as fixed**: ``4.0`` is post-safe by a rule
+#: written before 4.x existed. That is deliberate, and it is the opposite
+#: disposition to the unreadable-version branch beside it, which grades
+#: conservatively — so both are argued here rather than one being silent
+#: (#258). A merged fix normally stays merged, and grading 4.x as unfixed
+#: would forgo the 48-byte threshold forever on firmware that almost
+#: certainly carries the collector; the cost of being wrong is a small write
+#: back on the leaking POST path, on a device generation that does not exist
+#: yet and can be re-graded the moment it does. The unreadable-version branch
+#: is conservative for the opposite reason: there, nothing is known at all.
 _ULTIMATE_WRITEMEM_FIXED_FROM = (3, 15)
 
 #: The CBM line has no release carrying that fix yet: tag ``1.1.0`` is not a
@@ -168,6 +180,26 @@ class DeviceCapabilities:
 
     @staticmethod
     def _generation_for(version: tuple[int, ...] | None) -> str:
+        """The device line, or ``"unknown"``.
+
+        ``"unknown"`` covers **two different situations, and only one of
+        them is transient** (#258).  A caller that re-reads ``/v1/info``
+        hoping the grade improves must tell them apart:
+
+        * ``version is None`` — nothing parsed.  A genuine transient: the
+          probe timed out, the device was mid-boot, the payload was
+          malformed.  Re-reading may help.
+        * a version parsed, but its major is neither ``>= 3`` nor ``1`` —
+          a ``2.x`` string parses perfectly and still grades ``unknown``.
+          Re-reading **cannot** help: the same string parses identically
+          every time.  A consumer that keys a retry loop on "generation is
+          unknown" burns its reads and then refuses with "no usable
+          version", two lines below a line printing the version it read.
+
+        Both are graded off for safety, which is right.  Only the
+        diagnosis differs, and ``firmware_version`` is what distinguishes
+        them: ``None`` for the first, a string for the second.
+        """
         if version is None:
             return "unknown"
         if version[0] >= 3:
