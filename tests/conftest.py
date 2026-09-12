@@ -84,9 +84,24 @@ def device_lock_guard(request):
     device out from under another job's measurement.  Unit tests — the
     overwhelming majority — return before touching anything.
 
-    ``allow_nested=True`` so the test body can still go through
-    ``create_manager`` (or acquire its own ``DeviceLock``) without
-    queueing behind the lock this fixture already holds.
+    ``allow_nested=True`` on *this* lock lets the fixture join a hold
+    this process already has -- e.g. a module-scoped fixture that locked
+    the device before the first test ran -- instead of contending with
+    it.
+
+    **It does nothing for the test body, and reading it otherwise is
+    what produced issue #273.**  Nesting is a property of the
+    *acquirer*, checked as ``self._allow_nested`` in
+    :meth:`DeviceLock.acquire`; the holder's flag is never consulted.
+    So a test that constructs a plain ``DeviceLock(host)`` queues behind
+    the flock **this fixture holds on that same thread**, waits out its
+    full timeout -- 600 s in two live modules -- and then fails.  Four
+    modules were written against the earlier wording of this paragraph,
+    which claimed the opposite.
+
+    A test body that needs its own lock must pass ``allow_nested=True``
+    itself.  ``create_manager`` and the other library paths already do.
+    Pinned structurally by ``tests/test_live_device_lock_nesting.py``.
 
     Scope note: a live test that drives only VICE will also take the
     device lock when ``U64_HOST`` is set.  That is deliberately

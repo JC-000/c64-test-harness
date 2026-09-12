@@ -25,7 +25,7 @@ A 1-byte cap regression in :func:`uci_socket_write` would cause:
 
 Usage::
 
-    UCI_UDP_LIVE=1 U64_HOST=192.168.1.81 \\
+    UCI_UDP_LIVE=1 U64_HOST=<device> \\
     ~/.local/share/c64-test-harness/venv/bin/pytest \\
         tests/test_uci_udp_send_large_live.py -xvs
 """
@@ -270,7 +270,9 @@ def test_uci_udp_send_large_payload() -> None:
     )
     print("=" * 60, flush=True)
 
-    lock = DeviceLock(U64_HOST)
+    # allow_nested: the autouse device_lock_guard in conftest already
+    # holds this device's flock on this thread (issue #273).
+    lock = DeviceLock(U64_HOST, allow_nested=True)
     print(
         f"Acquiring device lock (timeout={LOCK_TIMEOUT:.0f}s, queue-aware)...",
         flush=True,

@@ -6,7 +6,7 @@ this test mutates device state — it always resets the device afterwards.
 
 Example::
 
-    U64_HOST=192.168.1.81 python3 -m pytest tests/test_sid_u64_live.py -v
+    U64_HOST=<device> python3 -m pytest tests/test_sid_u64_live.py -v
 """
 
 from __future__ import annotations
@@ -46,9 +46,13 @@ def test_play_sid_on_ultimate64() -> None:
     Client targets ``POST /v1/runners:sidplay`` (firmware 3.14 endpoint).
     """
     sid = _build_test_sid()
-    lock = DeviceLock(_HOST)
+    # allow_nested: the autouse device_lock_guard in conftest already
+    # holds this device's flock on this thread (issue #273).  A lock we
+    # still cannot get is a failure to report -- skipping here is what
+    # kept this module's 120 s self-deadlock invisible for so long.
+    lock = DeviceLock(_HOST, allow_nested=True)
     if not lock.acquire(timeout=120.0):
-        pytest.skip(f"Could not acquire device lock for {_HOST}")
+        pytest.fail(f"Could not acquire device lock for {_HOST} within 120s")
     transport = Ultimate64Transport(host=_HOST, password=_PW, timeout=8.0)
     try:
         # sid_play is a DMA load + run — device starts playing the SID.

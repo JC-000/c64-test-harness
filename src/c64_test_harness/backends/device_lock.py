@@ -166,6 +166,69 @@ _EXTENSION_LOG_INTERVAL = 30.0
 #: two cases need separating and why the bound sits here.
 _MAX_HOLDER_HANDOFFS = 3
 
+#: How long an :meth:`acquire` blocked on a lock **its own thread holds**
+#: is allowed to wait before giving up, regardless of the caller's
+#: ``timeout``.  The waiter cannot resolve this wait itself -- it is the
+#: thread that would have to release -- so the only thing the caller's
+#: full timeout buys is the same ``False``, later.  Two of the live UCI
+#: modules pass 600 s, which is how a 13-test diagnostic run became 22
+#: minutes (issue #273).
+#:
+#: Not zero, because the wait is not *unconditionally* stuck: a second
+#: thread holding a reference to the holder can release it, a pattern
+#: pinned by ``test_device_lock.py::TestBlockingTimeout::
+#: test_acquire_succeeds_after_release`` and by
+#: ``test_device_lock_self_deadlock.py::TestSelfHeldDoesNotExtendDeadline::
+#: test_helper_thread_can_still_rescue_a_self_held_wait``.  This keeps
+#: that rescue window open and cuts the pathological case to seconds.
+#: Applied as a cap, never a floor: a shorter caller ``timeout`` wins.
+#:
+#: **2.0 is a chosen trade, not a derived value, and nothing here
+#: establishes it as sufficient.**  The rescue window closes exactly at
+#: this constant (measured 2026-09-11, no device: a helper releasing at
+#: 1.95 s rescues, one releasing at 2.20 s does not, the waiter giving
+#: up at 2.00 s).  Both pinned rescue tests release after 0.2 s, so they
+#: would pass just as well at 0.5 s or 60 s -- they bound the value from
+#: below by two orders of magnitude and no more.  The thing that would
+#: fix the value is a real rescuing caller's latency, and none has been
+#: demonstrated.  Enumerated rather than asserted, there are **three**
+#: cross-thread releases, all of them in the lock tests:
+#: ``test_device_lock.py`` (a plain ``Thread``, 0.2 s),
+#: ``test_device_lock_self_deadlock.py`` (a ``Timer``, 0.2 s), and
+#: ``test_device_lock_self_held_fast_fail.py`` (a ``Timer`` at 1.0 s and
+#: 3.0 s).  Only the first two can size anything: the third takes its
+#: delays from ``_SELF_HELD_WAIT_GRACE * 0.5`` and ``* 1.5``, derived
+#: from this very constant, so it is self-referential and cannot be
+#: evidence for the value it is computed from.  So this is "ten times
+#: the only rescue latency anyone has demonstrated", chosen against
+#: 600 s of certain failure.
+#:
+#: **Scope of that, stated exactly, because the stronger version was
+#: asserted and withdrawn.**  It is a claim about what has been
+#: *demonstrated*, not a survey: nobody has established that no
+#: longer-latency cross-thread releaser exists.  What is checked is the
+#: library surface only -- ``src/`` builds exactly one ``DeviceLock``
+#: (``unified_manager.py``, in ``acquire``, with ``allow_nested=True``;
+#: the other six ``src/`` hits are docstrings and error-message text).
+#: ``tests/`` and ``scripts/`` were **not** swept, and a grep narrow
+#: enough to miss ``threading.Thread`` would miss most of what it was
+#: looking for anyway -- it already missed
+#: ``test_acquire_succeeds_after_release``, which releases cross-thread
+#: through a plain ``Thread``.  So if a caller with a longer rescue
+#: latency turns up in tests or tooling, this value is too small and the
+#: right response is to raise it, not to defend it.  A rescue
+#: that needs longer fails where it used to succeed -- the WARNING in
+#: :meth:`acquire` names the cap so that failure is diagnosable rather
+#: than mysterious.  The cliff is pinned by
+#: ``test_device_lock_self_held_fast_fail.py::TestTheRescueWindow``;
+#: raise this constant rather than working around it.
+#:
+#: The residual -- a documented supported pattern now carrying an
+#: undocumented time limit -- is tracked as **#277**, which records the
+#: two ways to close it (state the budget in the API, or add an opt-out)
+#: and carries the measurements above as its evidence.
+_SELF_HELD_WAIT_GRACE = 2.0
+
 _PROCESS_HELD: dict[str, int] = {}
 #: Thread idents that took a flock for each lockfile path, one entry per
 #: outstanding hold.  Only used to spot a thread waiting on a lock it
@@ -554,6 +617,24 @@ class DeviceLock:
             self._start_heartbeat()
             return True
 
+        # A lock this very thread holds can only be released by this
+        # thread, which is about to block here -- so the caller's timeout
+        # buys nothing but the same False, later.  Cap it (never extend
+        # it) at the grace: long enough for the supported
+        # rescue-by-another-thread pattern, short enough that a 600 s
+        # live-test timeout no longer costs 600 s.
+        if self._held_by_this_thread() and timeout > _SELF_HELD_WAIT_GRACE:
+            _log.warning(
+                "DeviceLock %s: acquiring a lock this thread already holds; "
+                "only another thread can release it, so the %.0fs timeout is "
+                "capped at %.1fs. Pass allow_nested=True if this is a nested "
+                "hold by the same owner.",
+                self._device_host,
+                timeout,
+                _SELF_HELD_WAIT_GRACE,
+            )
+            timeout = _SELF_HELD_WAIT_GRACE
+
         deadline = time.monotonic() + timeout
         queued_since = time.monotonic()
         # Identity of the holder we are queued behind, and how many times
@@ -738,9 +819,25 @@ class DeviceLock:
         * Not the process-wide count either.  Two worker *threads*
           sharing a device are concurrent users, and one waiting on the
           other is legitimate and terminates: the holding thread can
-          still reach :meth:`release`.  Only a thread waiting on a lock
-          it holds itself is unconditionally stuck, because the one
-          thread that could release is the one blocked in ``acquire``.
+          still reach :meth:`release`.  A thread waiting on a lock it
+          holds itself is the different case -- it cannot end its own
+          wait, because the thread that would have to call
+          :meth:`release` is the one blocked in ``acquire``.
+
+        That is *not* the same as "unconditionally stuck", and this
+        docstring used to say it was (issue #273).  Another thread
+        holding a reference to the holder can release it mid-wait: a
+        supported pattern, pinned by
+        ``test_device_lock.py::TestBlockingTimeout::test_acquire_succeeds_after_release``
+        and by ``test_device_lock_self_deadlock.py::
+        TestSelfHeldDoesNotExtendDeadline::
+        test_helper_thread_can_still_rescue_a_self_held_wait``.  So the
+        predicate means "this wait cannot resolve itself", and the two
+        things :meth:`acquire` does with it are both bounds rather than
+        refusals: it declines to treat the hold as progress, and it caps
+        the wait at :data:`_SELF_HELD_WAIT_GRACE`.  Anyone tempted to
+        turn it into an immediate failure should read those two tests
+        first.
         """
         key = str(self._lock_path)
         me = threading.get_ident()

@@ -260,17 +260,18 @@ def test_read_mem_returns_raw_bytes():
     assert data == b"\x01\x02\x03\x04"
     url = captured[0][0].get_full_url()
     assert "/v1/machine:readmem" in url
-    assert "address=0x0400" in url
+    assert "address=0400" in url
     assert "length=4" in url
 
 
 def test_read_mem_address_formatted_uppercase_hex():
+    """Bare uppercase hex — no 0x prefix (issue #272)."""
     mock, captured = _capture(b"\x00" * 16)
     c = Ultimate64Client("h")
     with patch("urllib.request.urlopen", mock):
         c.read_mem(0xABCD, 16)
     url = captured[0][0].get_full_url()
-    assert "address=0xABCD" in url
+    assert "address=ABCD" in url
 
 
 def test_read_mem_short_payload_raises_protocol_error():
@@ -313,7 +314,7 @@ def test_write_mem_uses_hex_data_query_param():
     # Device expects data as hex in a query string; no HTTP body.
     assert req.data is None
     url = req.get_full_url()
-    assert "address=0x0400" in url
+    assert "address=0400" in url
     assert "data=DEADBEEF" in url
 
 
@@ -328,7 +329,7 @@ def test_write_mem_small_payload_at_threshold_uses_put_query():
     assert req.get_method() == "PUT"
     assert req.data is None
     url = req.get_full_url()
-    assert "address=0x0400" in url
+    assert "address=0400" in url
     assert f"data={payload.hex().upper()}" in url
 
 
@@ -351,7 +352,7 @@ def test_write_mem_large_payload_uses_post_with_body():
     assert req.data == payload
     assert req.get_header("Content-type") == "application/octet-stream"
     url = req.get_full_url()
-    assert "address=0xC000" in url
+    assert "address=C000" in url
     # No data= query string in POST form.
     assert "data=" not in url
 
