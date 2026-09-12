@@ -469,74 +469,144 @@ class TestTheCitationsResolve:
         assert "transport fixture" in flat
 
 
-class TestTheWithdrawnItemCount:
-    """The ``~150 items`` figure traced to one sentence in a live test's
-    docstring, with no n and no date, eleven lines from a figure carrying
-    both.  It was withdrawn rather than re-derived: the covered-category
-    count cannot be got from the measured 201 without a device, because
-    the five never-touch stores are excluded and nobody has counted the
-    remainder.  Pinned so it does not come back as a round number.
+class TestTheItemCountCarriesItsScope:
+    """The item count may be stated — it must not be stated bare.
+
+    ``~150 items`` circulated for months with no device and no date, was
+    quoted downstream as though measured, and was withdrawn on exactly
+    that ground.  It has since been measured (U64E, fw 3.15, 2026-09-12,
+    read-only) and is **151** across the twelve covered categories, so the
+    figure was accurate all along.  That is the outcome this pin has to
+    survive: the defect was never the number, it was the missing scope, and
+    a pin that only forbade the number would now be forbidding a
+    measurement.
+
+    So the polarity is inverted from the withdrawal version.  Every
+    occurrence of the count must carry the device and the date in its own
+    sentence.  A bare restatement fails, and so does silence at a site that
+    is supposed to state it.
     """
 
-    #: Cues that mark a mention of the figure as a *withdrawal* of it
-    #: rather than an assertion of it.  A bare absence pin was the first
-    #: attempt and it was wrong in a way worth recording: it forbade the
-    #: string outright, which forbids naming the figure in the sentence
-    #: that retracts it — and an unnamed retraction is unfindable by the
-    #: reader who met "~150" somewhere else and came looking.
-    _WITHDRAWAL = ("withdrawn", "was an estimate", "used to assert")
+    #: What "carrying its scope" means: which device, and when.  Both, in
+    #: the same sentence as the number — a date three paragraphs away is
+    #: how "~150" became scopeless in the first place.
+    _DEVICE = ("U64E", "Ultimate 64 Elite")
+    _DATE = ("2026-09-12", "2026-09-10")
+    #: Every spelling of the count this repo has used or might reach for.
+    _FIGURES = ("~150 items", "151 items", "150 items", "201 items", "203 items")
 
     @classmethod
-    def _asserted_occurrences(cls, text: str) -> list[str]:
-        """Occurrences of the figure whose own sentence does not retract it.
+    def _bare_occurrences(cls, text: str) -> list[str]:
+        """Sentences stating a count without naming a device and a date.
 
-        Scoped to the sentence, not to a character window.  A 400-character
-        window was the first attempt and it failed its own job: reasserting
-        the figure a line above the paragraph that withdraws it left the
-        withdrawal inside the window, so the relapse read as a retraction.
-        The retraction has to be in the sentence making the claim, which is
-        also the only place a reader would see it.
+        Splits on ``:`` as well as ``.!?`` — the **opposite** choice from
+        :meth:`TestTheDefaultIsDocumented._sentences`, deliberately, and
+        the asymmetry is not an inconsistency.  That pin *forbids* a claim,
+        so a smaller unit is a hole: it can put the subject in one fragment
+        and the relapse in the next, and neither fragment is damning.  This
+        pin *requires* an accompaniment, so a smaller unit is stricter: the
+        scope has to sit closer to the number.  Without the colon split, a
+        lead-in ending in ``:`` merges with every bullet under it and one
+        date at the top vouches for a whole list — which is how a figure
+        becomes scopeless while looking cited.
         """
         out: list[str] = []
-        for sentence in re.split(r"(?<=[.!?])\s+", _flat(text)):
-            if "~150 items" not in sentence:
+        for sentence in re.split(r"(?<=[.!?:])\s+", _flat(text)):
+            if not any(fig in sentence for fig in cls._FIGURES):
                 continue
-            if not any(cue in sentence for cue in cls._WITHDRAWAL):
-                out.append(sentence)
+            if any(d in sentence for d in cls._DEVICE) and any(
+                d in sentence for d in cls._DATE
+            ):
+                continue
+            out.append(sentence)
         return out
 
     @pytest.mark.parametrize("name", sorted(LANE_DOCS))
-    def test_no_lane_doc_asserts_an_uncounted_item_figure(self, name: str) -> None:
-        bad = self._asserted_occurrences(LANE_DOCS[name].read_text(encoding="utf-8"))
-        assert not bad, f"{name}: asserts ~150 items without withdrawing it — {bad!r}"
+    def test_no_lane_doc_states_a_bare_item_count(self, name: str) -> None:
+        bad = self._bare_occurrences(LANE_DOCS[name].read_text(encoding="utf-8"))
+        assert not bad, (
+            f"{name}: states an item count without the device and the date in "
+            f"the same sentence — {bad!r}"
+        )
 
-    def test_the_live_test_docstring_no_longer_asserts_it_either(self) -> None:
-        """The origin, not just the copy — otherwise the next doc sweep
-        reads the docstring, trusts it, and reintroduces the figure."""
+    def test_the_live_test_docstring_states_it_with_scope(self) -> None:
+        """The origin, not just the copy.  A scopeless figure here is what
+        the copy downstream will inherit."""
         origin = (_REPO / "tests" / "test_entry_baseline_live.py").read_text(
             encoding="utf-8"
         )
-        assert not self._asserted_occurrences(origin)
+        assert not self._bare_occurrences(origin)
+        flat = _flat(origin)
+        assert "151" in flat, "the measured covered-set count is gone"
+        assert "fw 3.15" in flat and "2026-09-12" in flat
 
-    def test_the_withdrawal_pin_is_not_satisfied_by_any_mention(self) -> None:
-        """Positive control.  A cue-window pin degenerates into "the string
-        may appear anywhere" if the window is wide enough or the cue list
-        loose enough, and nothing else here would notice."""
-        assert self._asserted_occurrences("The reset touches ~150 items on the U64E.")
-        assert not self._asserted_occurrences(
-            "The ~150 items figure was an estimate and is withdrawn."
-        )
-        # And the case that defeated the character-window version: a fresh
-        # assertion standing next to, but outside, the retraction.
-        assert self._asserted_occurrences(
-            "The reset touches ~150 items on the U64E. "
-            "An earlier figure was an estimate and is withdrawn."
-        )
-
-    def test_patterns_keeps_the_measured_figure_with_its_scope(self) -> None:
+    def test_patterns_states_the_measured_count_and_its_scope(self) -> None:
         flat = _doc("skill/PATTERNS.md")
-        assert "201 items over every category the U64E lists" in flat
-        assert "uncounted subset" in flat
+        assert "151 items across the twelve covered categories" in flat
+        assert "U64E (fw 3.15) 2026-09-12" in flat
+
+    def test_both_all_category_counts_survive_with_their_dates(self) -> None:
+        """201 (2026-09-10, #276) and 203 (2026-09-12) on the same device.
+
+        Two items appeared and the cause is not established.  The failure
+        mode this guards is the tidy one: dropping a figure or averaging
+        them, which would turn an open question into a false settlement.
+        """
+        for where, text in (
+            ("skill/PATTERNS.md", _doc("skill/PATTERNS.md")),
+            ("test_entry_baseline_live.py",
+             _flat((_REPO / "tests" / "test_entry_baseline_live.py")
+                   .read_text(encoding="utf-8"))),
+        ):
+            # Both counts, in ONE sentence, so the comparison survives as a
+            # comparison. A bare ``"201" in text`` passed against a version
+            # that had deleted the residual entirely, because 201 still
+            # appeared in the #276 narrative elsewhere in the file.
+            paired = [
+                sent
+                for sent in re.split(r"(?<=[.!?:])\s+", text)
+                if "201" in sent and "203" in sent
+            ]
+            assert paired, (
+                f"{where}: the 201-vs-203 comparison is gone — one count was "
+                f"dropped, or they were separated so the difference reads as "
+                f"settled"
+            )
+            assert "2026-09-10" in text and "2026-09-12" in text, where
+            # One exact phrase, no disjunction. An ``or "unexplained"``
+            # alternative passed against a version that had replaced
+            # "nobody has established why" with an asserted cause, because
+            # the heading "Unexplained residual" still stood above it — the
+            # label survived while the claim under it was reversed.
+            assert "nobody has established why" in text.lower(), (
+                f"{where}: the 2-item difference is stated as explained, or "
+                f"the phrase recording that it is not has been dropped"
+            )
+
+    def test_the_scope_pin_fails_in_both_directions(self) -> None:
+        """Positive control, both ways.
+
+        A pin that only required the number would pass a bare
+        restatement; a pin that only forbade the number would fail the
+        measurement it now has to permit.  Both cases are exercised, so
+        neither degeneration is silent.
+        """
+        # bare — must be caught
+        assert self._bare_occurrences("The reset touches 151 items.")
+        assert self._bare_occurrences(
+            "The reset touches 151 items. Measured on the U64E 2026-09-12."
+        ), "scope in a neighbouring sentence is how ~150 became scopeless"
+        # scope on the far side of a colon lead-in — the case that let a
+        # single date at the top of a bullet list vouch for every bullet.
+        assert self._bare_occurrences(
+            "Measured on the U64E 2026-09-12: 151 items across the covered "
+            "categories."
+        ), "a colon lead-in must not carry scope down into its list"
+        # scoped — must be allowed
+        assert not self._bare_occurrences(
+            "151 items across the covered categories, measured on the U64E "
+            "(fw 3.15) 2026-09-12."
+        )
 
 
 class TestTheSubjectScopedPinsCanFail:

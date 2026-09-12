@@ -41,18 +41,38 @@ Never: ``save_config_to_flash``, ``load_config_from_flash``, the global
 ``configs:reset_to_default``, any request to a never-touch store other
 than a GET, ``reset``, ``reboot``, ``poweroff``.
 
-Not yet measured (record when this runs): the wall-clock cost of one
-``apply_factory_baseline`` on the U64E (one category GET + one reset PUT
-+ one item GET per item) — ``record_property("apply_seconds")`` captures
-it, and it should also record the **item count**, which is what makes the
-seconds interpretable. The "~150 items" this docstring used to assert was
-an estimate with no n and no date, and it was quoted downstream as though
-it were measured; the only measured count on this bench is **201 items
-over every category the U64E lists** (2026-09-10, #276), of which the
-twelve in ``BASELINE_CATEGORIES`` are a subset nobody has counted —
-the five never-touch stores are excluded, so the covered figure is
-strictly lower and cannot be derived from 201 without the device; and whether any store's ``effectuate()`` pulses the C64
-reset (a separate #217-style marker+jiffy arm, not in this module).
+Item counts, **measured on the U64E (fw 3.15) 2026-09-12** — read-only,
+``DeviceLock`` held, bodyless GETs, nothing written:
+
+* **151** items across the twelve ``BASELINE_CATEGORIES`` on the U64E,
+  2026-09-12 — the covered set, and therefore the number of item GETs one
+  ``apply_factory_baseline`` makes.  Per category: C64 and Cartridge 19,
+  U64 Specific 27, SID Addressing 8, Audio Mixer 21, Drive A 14,
+  Drive B 14, SoftIEC 2, Tape 1, Printer 11, LED Strip 8, Modem 16,
+  User Interface 10.
+* 40 in the five ``BASELINE_NEVER_TOUCH`` stores, and 12 in two
+  categories belonging to neither list (``UltiSID Configuration`` 8,
+  ``Data Streams`` 4) — **203 items** across all 19 categories the U64E
+  lists, 2026-09-12.
+
+The figure carries its device and date inline on purpose.  The earlier
+"~150" in this docstring had neither, was quoted downstream as though it
+were a measurement, and was withdrawn for that reason before anybody
+counted.  It turned out to be right, which is the point: a scopeless
+figure is unusable whether or not it is accurate, and being accurate is
+what let it survive unexamined for months.
+
+**Unexplained residual, recorded rather than resolved:** #276 counted
+**201** all-category items on 2026-09-10; this read counts **203** on
+2026-09-12, same device.  Two items appeared and nobody has established
+why — device state and a different counting basis are both open and
+neither is evidenced.  Do not average them, and do not drop one.
+
+Still not measured (record when this runs): the wall-clock cost of one
+``apply_factory_baseline`` — ``record_property("apply_seconds")`` captures
+it, and 151 is what makes those seconds interpretable; and whether any
+store's ``effectuate()`` pulses the C64 reset (a separate #217-style
+marker+jiffy arm, not in this module).
 """
 from __future__ import annotations
 
