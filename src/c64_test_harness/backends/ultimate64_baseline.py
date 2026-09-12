@@ -15,10 +15,19 @@ The contract, as decided by the owner in #227:
   (``get_config_item``, #214) and the check is ``current == default`` per
   item.  Items without a ``default`` key (preset-file and info types) are
   reported, never asserted.
+* **Scope of the guard.**  :func:`apply_factory_baseline` refuses the
+  :data:`BASELINE_NEVER_TOUCH` names outright, in any casing, before any
+  request.  Two boundaries worth knowing, both pre-existing:
+  ``Ultimate64Client.reset_config_category_to_default`` type-checks its
+  argument and nothing else, so **a direct client call bypasses the
+  never-touch list entirely** -- the guard is in this module, not on the
+  wire; and :data:`_EXCLUDED_MARKERS` is a spelling guard for those three
+  names, not a network-store detector (see its own note).
 * **Mechanism:** per-category ``PUT /v1/configs/{category}:reset_to_default``
   over the fixed covered set :data:`BASELINE_CATEGORIES`.  **Never** the
-  global route (it iterates every store, network stores included, and a
-  static-addressed device would flip to DHCP and be stranded) and
+  global route (it iterates every store, network stores included, and each
+  network store re-effectuates onto the live stack the device is reached
+  over) and
   **never** a store in :data:`BASELINE_NEVER_TOUCH` — the three network
   stores, the SID socket store (its ``effectuate`` powers the socketed
   SIDs off) and the RTC (the next PUT writes the clock chip); each entry
@@ -35,11 +44,45 @@ The contract, as decided by the owner in #227:
   store's ``effectuate()`` (~100 ms per category); items the C64 only
   picks up at its own reset (cartridge ``.crt``, kernal, REU enable) take
   effect at the next ``reset()``, which a run does anyway.
-* **Opt-in** until two measurements land (whether any store's
-  ``effectuate()`` pulses the C64 reset; the C64U WiFi store):
-  ``U64_BASELINE_ON_ENTRY=1`` or ``HarnessConfig.u64_baseline_on_entry``
-  (TOML ``[u64] baseline_on_entry = true``).  Off by default, and off
-  means no requests at all.
+* **Default on for the Ultimate line, off for the CBM line, off for
+  unknown** (#266; it was globally opt-in before, "until the C64U is
+  measured").  Two things settled it and they point opposite ways.  The
+  ``/Temp`` question is answered, and **the argument is the body gate, not
+  the route table**: every request this module makes carries **no body at
+  all**, and ``attachment_writer`` returns ``NULL`` for a body-less request
+  before it constructs any ``TempfileWriter`` -- an explicit zero-length
+  branch (``software/api/routes.cc:40-46``), not a property of which route
+  was hit.  For this route the writer slot is ``NULL`` anyway
+  (``API_CALL(PUT, configs, reset_to_default, NULL, ...)``,
+  ``route_configs.cc:473``).  So the hypothetical "a PUT that attaches"
+  cannot reach a request with no body, and the reset is free even on the
+  leak-prone C64 Ultimate.
+  **The residual, and its direction**: ``routes.cc`` was read on the 3.15
+  line (``v3.15-84-g871ad034``) and whether 1.1.0 carries the same
+  five-line gate is an **inference, not a read**.  Note which way that
+  error runs -- counting POST-with-body only is the **permissive** side,
+  not the conservative one: an uncounted attachment never advances
+  ``_pending_temp_attachments``, so the budget is never reached, the
+  hygiene pass never fires, and the counter reads zero while the device
+  accumulates.  That is the gap to close, not the margin to rely on.  One
+  cheap live check closes it: ``/Temp`` count, one ``reset_to_default``
+  PUT, count again, next time somebody is at that bench.  But ``/Temp`` was not the
+  only hazard on that device -- it reaches the bench over WiFi whose
+  reconnection after a power cycle is known unreliable, with nobody
+  present -- so the default consults
+  :data:`BASELINE_ON_ENTRY_DEFAULT_BY_GENERATION` rather than being one
+  global boolean.  An ``unknown`` generation (an unreadable or timed-out
+  probe, #262) resolves **off**: a reset must never arm on a device the
+  harness failed to identify.  Above that the switch is tri-state and
+  device-independent (:func:`resolve_baseline_on_entry`): an explicit
+  ``baseline_on_entry=`` wins, then ``U64_BASELINE_ON_ENTRY`` either way
+  -- which is how a C64U is opted in, for someone at the bench -- then the
+  generation default.  ``HarnessConfig.u64_baseline_on_entry = None`` still
+  means "nobody asked".  Opting out means no requests at all, and the
+  resolved value is logged at INFO on every acquire with the device, the
+  generation and what decided it.  One measurement remains open and is
+  *not* what any of this rests on: whether a covered store's
+  ``effectuate()`` pulses the C64 reset.
 * **Inside the lock.**  ``create_manager(backend="u64")`` runs the reset
   right after the ``DeviceLock`` is acquired and before the transport is
   handed out.  Calling :func:`apply_factory_baseline` directly without the
@@ -70,6 +113,7 @@ except ImportError:  # pragma: no cover
 _log = logging.getLogger(__name__)
 
 __all__ = [
+    "BASELINE_ON_ENTRY_DEFAULT_BY_GENERATION",
     "BASELINE_ON_ENTRY_ENV",
     "BASELINE_CATEGORIES",
     "BASELINE_EXCLUDED_CATEGORIES",
@@ -77,7 +121,9 @@ __all__ = [
     "BaselineReport",
     "U64BaselineError",
     "apply_factory_baseline",
+    "baseline_default_for_generation",
     "baseline_on_entry_enabled",
+    "resolve_baseline_on_entry",
 ]
 
 #: The one environment switch, shared with ``HarnessConfig.from_env``.
@@ -87,6 +133,33 @@ __all__ = [
 #: ``C64TEST_U64_BASELINE_ON_ENTRY`` wins when both are set.  ``1`` /
 #: ``true`` / ``yes`` / ``on``, case-insensitive.
 BASELINE_ON_ENTRY_ENV = U64_BASELINE_ON_ENTRY_ENV
+
+#: What a lane gets when **neither** switch is set, **per device
+#: generation** (``DeviceCapabilities.generation``).  Deliberately not a
+#: single global boolean: the two lines are not equally recoverable.
+#:
+#: * ``"ultimate"`` (the U64E, 3.x) -- **on**.  The entry reset is bodyless
+#:   throughout (category GET, bodyless ``reset_to_default`` PUT, item
+#:   GETs), so it costs no ``/Temp`` attachment, and the device is on
+#:   wired ethernet.
+#: * ``"cbm"`` (the C64 Ultimate, 1.x) -- **off**.  Not because of
+#:   ``/Temp`` (free there too, on the 3.15-route-table assumption above --
+#:   unverified against 1.1.0), but because that device reaches the
+#:   bench **over WiFi** and its reconnection after a power cycle is known
+#:   to be unreliable; nothing on the never-touch list protects a store
+#:   that a future edit adds to the covered set by mistake, and there is no
+#:   remote remedy if it does not come back.  Opt in explicitly when
+#:   someone is at the bench.
+#: * ``"unknown"`` -- **off**.  An unreadable or timed-out probe (#262)
+#:   must never arm a reset on a device the harness failed to identify;
+#:   the C64U is exactly the device a slow probe mis-grades.
+#:
+#: Anything not listed resolves off (:func:`baseline_default_for_generation`).
+BASELINE_ON_ENTRY_DEFAULT_BY_GENERATION: dict[str, bool] = {
+    "ultimate": True,
+    "cbm": False,
+    "unknown": False,
+}
 
 #: The stores the entry reset covers, by canonical firmware name (the
 #: per-category route is a case-insensitive exact match for a name with
@@ -120,16 +193,72 @@ BASELINE_CATEGORIES: tuple[str, ...] = (
 #: ``tests/test_entry_baseline.py``.
 BASELINE_NEVER_TOUCH: dict[str, str] = {
     "Ethernet Settings": (
-        "reset_to_default flips a static-addressed device to DHCP (Use "
-        "DHCP=Enabled, 192.168.2.64/24) and strands it"
+        "a reset DROPS THE LEASE MID-REQUEST on a DHCP device.  "
+        "ConfigStore::reset is followed by effectuate(), and "
+        "NetworkInterface::effectuate_settings, on an initialised, link-up "
+        "interface, calls dhcp_stop() -> dhcp_release_and_stop "
+        "(lwip/src/core/ipv4/dhcp.c:1325-1390), which sends DHCP_RELEASE and "
+        "then netif_set_addr(netif, IP4_ADDR_ANY4, ...): the address the "
+        "REST request arrived on is zeroed and DISCOVER re-runs.  On a "
+        "statically addressed device the same path takes the else branch, "
+        "dhcp_stop() + netif_set_addr(my_ip, ...) -- which is why TESTS MUST "
+        "NEVER CONFIGURE A STATIC ADDRESS: it is this code path, reached "
+        "through a store that looks inert (pinned by "
+        "tests/test_entry_baseline_default_on.py).  On the C64 Ultimate, "
+        "reached over a WiFi link whose reconnection is known unreliable "
+        "with nobody present, that is the device-loss path -- see the WiFi "
+        "settings entry.  "
+        "TWO RETRACTED READINGS, both of which looked cited and were not: "
+        "(1) 'reset_to_default flips a static-addressed device to DHCP "
+        "(192.168.2.64/24) and strands it' -- wrong, the device is already "
+        "on DHCP and those static fields are unused factory defaults "
+        "(net_config[], network_interface.cc:26-38), measured U64E "
+        "2026-09-10, all five items already at default.  (2) 'the 3.15 "
+        "source only re-starts DHCP when it is not already running, so the "
+        "reset is a live no-op' -- that guard is REAL but it is NOT a "
+        "property of 3.15: it arrived post-tag in 6b5ffc21 (upstream #805) "
+        "and exists only in the v3.15-8x fork line this bench flashed onto "
+        "the U64E.  Upstream (v3.14e checkout, network_interface.cc:406) "
+        "and the C64U's 1.1.0 line call dhcp_stop() UNCONDITIONALLY on a "
+        "link-up interface.  So the no-op holds for exactly one device on "
+        "this bench and must never be generalised to the line"
     ),
     "Network Settings": (
-        "reset blanks Network Password, hostname and the FTP/Telnet/Web/SNTP "
-        "service flags (and sets Ultimate DMA Service=Enabled)"
+        "reset blanks Network Password (default \"\") and the syslog server, "
+        "restores Host Name to the product default, and re-ENABLES every "
+        "service: Ultimate Ident/DMA, Telnet, FTP, Web and SNTP all default "
+        "to 1 = Enabled (network_config.cc:15-36), and "
+        "NetworkConfig::effectuate_settings restarts SNTP (:71-75).  "
+        "CORRECTED 2026-09-11 from the 3.15 source: the earlier reason said "
+        "the reset \"blanks ... the FTP/Telnet/Web/SNTP service flags\", "
+        "which has the direction backwards -- it turns them on, which is a "
+        "security-shaped change on a shared bench rather than a loss of "
+        "function, and it would silently undo a deliberate service-off "
+        "state.  It does not touch the addressing, so it is a milder case "
+        "than Ethernet Settings; it stays never-touch for the blanked "
+        "password"
     ),
     "WiFi settings": (
-        "the C64 Ultimate reaches the bench over WiFi; its store has never "
-        "been read, so a reset there is unassessed"
+        "DEVICE-LOSS RISK, not a connectivity inconvenience.  The C64 "
+        "Ultimate reaches the bench over WiFi, and its reconnection after a "
+        "power cycle is KNOWN UNRELIABLE: the owner has seen it fail to "
+        "rejoin the wireless network after a hard power cycle, saved a "
+        "working WiFi configuration to flash deliberately, and confirmed the "
+        "rejoin only by standing at the device (owner testimony, measured "
+        "2026-09-11).  Nobody is at the bench now.  reset_to_default here "
+        "would discard that saved-and-verified configuration in RAM and "
+        "re-effectuate the stack the device is reached over "
+        "(NetworkLWIP_WiFi::effectuate_settings, network_esp32.cc:126-147 -> "
+        "NetworkInterface::effectuate_settings, network_interface.cc:364-423; "
+        "the store carries the same Use DHCP / 192.168.2.64 addressing block, "
+        "wifi_config[] :34-58).  If it does not come back there is no remote "
+        "remedy AT ALL -- not reboot(), not FTP, not any REST route -- only "
+        "someone physically present.  This is also why the entry baseline "
+        "defaults OFF for the cbm generation "
+        "(BASELINE_ON_ENTRY_DEFAULT_BY_GENERATION).  Read from the 3.15 "
+        "source; the C64U runs the 1.1.0 line, and on U64 == 2 the radio "
+        "on/off inside that effectuate is commented out, so what a reset "
+        "does to a live C64U WiFi link is unmeasured and must stay that way"
     ),
     "SID Sockets Configuration": (
         "ConfigStore::reset sets SID Socket 1/2=Disabled, then "
@@ -165,20 +294,89 @@ BASELINE_NEVER_TOUCH: dict[str, str] = {
 #: public alias of :data:`BASELINE_NEVER_TOUCH`'s keys).
 BASELINE_EXCLUDED_CATEGORIES: tuple[str, ...] = tuple(BASELINE_NEVER_TOUCH)
 
-#: Any category whose name contains one of these is refused too, so a
-#: future firmware store named e.g. ``Ethernet Settings 2`` cannot slip in
-#: through a caller-supplied ``categories``.
+#: Extra spelling guard for the three named stores: a caller-supplied
+#: ``Ethernet Settings 2`` or ``WiFi Client Settings`` is refused too.
+#:
+#: **This is not a general network-store filter and must not be described
+#: as one.**  It matches four substrings, so every plausibly network-named
+#: store that does not contain them is accepted -- measured against the
+#: live validator 2026-09-11: ``LAN Settings``, ``IP Configuration``,
+#: ``TCP/IP``, ``Wireless``, ``ESP32 Settings`` and ``Modem Settings`` all
+#: pass.  A store that must never be reset belongs in
+#: :data:`BASELINE_NEVER_TOUCH` by name; this list only stops a near-miss
+#: spelling of one already there.
+#:
+#: There is already one accepted store that touches the network stack, and
+#: it is in :data:`BASELINE_CATEGORIES` on purpose: ``Modem Settings``.
+#: ``Modem::effectuate_settings`` ends at ``software/io/acia/modem.cc:889-890``
+#: with ``listenerSocket->Start(newPort)`` -- it binds a listener on a
+#: separate port.  It does **not** call ``dhcp_stop``/``netif_set_addr``,
+#: does not touch the interface, and does not disturb the REST path, so it
+#: is not the device-loss shape the never-touch list exists for.  Reviewed
+#: and kept 2026-09-11; the point of recording it here is that "the marker
+#: scan keeps network stores out of the covered set" is false, and the
+#: covered set is the thing to check when widening it.
 _EXCLUDED_MARKERS: tuple[str, ...] = ("ethernet", "network", "wifi", "wi-fi")
 
 
-def baseline_on_entry_enabled() -> bool:
-    """Whether the environment asks for the entry reset.
+def baseline_default_for_generation(generation: str | None) -> bool:
+    """The default for a device of this generation; unknown resolves off.
 
-    Read at call time (not import time) so tests and long-lived processes
-    can flip it.  Same resolution and parser as ``HarnessConfig.from_env``:
-    ``C64TEST_U64_BASELINE_ON_ENTRY`` wins, else :data:`BASELINE_ON_ENTRY_ENV`.
+    Anything that is not a generation name this module has decided about
+    -- ``None``, a non-string, a generation a future firmware line
+    introduces -- is ``False``.  The failure mode of guessing ``True`` is a
+    config reset on an unattended device reached over a link that may not
+    come back; the failure mode of guessing ``False`` is a lane inheriting
+    the previous lane's config.  Those are not comparable.
     """
-    return resolve_baseline_on_entry_env() is True
+    if not isinstance(generation, str):
+        return False
+    return BASELINE_ON_ENTRY_DEFAULT_BY_GENERATION.get(generation, False)
+
+
+def resolve_baseline_on_entry(
+    generation: str | None = None, *, requested: bool | None = None
+) -> tuple[bool, str]:
+    """Resolve the entry-reset switch, with the reason, for the INFO line.
+
+    Precedence, highest first:
+
+    1. *requested* -- an explicit ``baseline_on_entry=`` from the caller.
+    2. The environment: ``C64TEST_U64_BASELINE_ON_ENTRY`` wins, else
+       :data:`BASELINE_ON_ENTRY_ENV`.  Same parser as
+       ``HarnessConfig.from_env``, so one name opts both paths in or out.
+    3. :func:`baseline_default_for_generation` for *generation*.
+
+    Resolved at call time, not import time, so a long-lived process can
+    flip the env var, and per acquire, so the generation is the one the
+    device actually reported.
+
+    :returns: ``(enabled, reason)`` -- the reason is a short phrase naming
+        which of the three decided it, for the acquire-time log.  A default
+        that varies by hardware has to say so out loud or it becomes "it
+        worked on my device" a month later.
+    """
+    if requested is not None:
+        return bool(requested), f"explicit baseline_on_entry={bool(requested)}"
+    asked = resolve_baseline_on_entry_env()
+    if asked is not None:
+        return asked, f"{BASELINE_ON_ENTRY_ENV}={'on' if asked else 'off'}"
+    enabled = baseline_default_for_generation(generation)
+    return enabled, (
+        f"default for generation {generation!r}"
+        + ("" if enabled else " (only the 'ultimate' line defaults on)")
+    )
+
+
+def baseline_on_entry_enabled(generation: str | None = None) -> bool:
+    """:func:`resolve_baseline_on_entry` without the reason.
+
+    Called with no *generation* the answer is the environment's, or off --
+    which is the conservative reading and the right one for any caller
+    that does not have a device in hand.
+    """
+    enabled, _why = resolve_baseline_on_entry(generation)
+    return enabled
 
 
 # --------------------------------------------------------------------------- #
@@ -331,9 +529,14 @@ def _validate_categories(categories: Iterable[str]) -> tuple[str, ...]:
             )
         if any(m in folded for m in _EXCLUDED_MARKERS):
             raise ValueError(
-                f"category {cat!r} names a network store; the entry reset never "
-                f"touches one (a reset there can strand the device — issue #227; "
-                f"never-touch set: {BASELINE_EXCLUDED_CATEGORIES!r})"
+                f"category {cat!r} is a near-miss spelling of a never-touch "
+                f"network store (matched marker in {_EXCLUDED_MARKERS!r}); those "
+                f"stores re-effectuate onto the live stack the device is "
+                f"reached over — issue #227; never-touch set: "
+                f"{BASELINE_EXCLUDED_CATEGORIES!r}.  Note this marker check is "
+                f"a spelling guard, not a general network-store filter: a "
+                f"differently named network store would be accepted, so widen "
+                f"BASELINE_CATEGORIES by review, not by trusting this."
             )
         out.append(cat)
     if not out:
@@ -412,9 +615,28 @@ def apply_factory_baseline(
 ) -> BaselineReport:
     """Reset the covered categories to factory default, then assert it.
 
-    Per category (present on the device): one category GET (the values
-    before), one ``PUT /v1/configs/<category>:reset_to_default``, then one
-    item GET per item for its ``current`` and ``default``.  Pre-reset drift
+    Twelve categories are requested; those the device does not list are
+    skipped silently.  Per category actually present: one category GET (the
+    values before), one ``PUT /v1/configs/<category>:reset_to_default``,
+    then one item GET per item for its ``current`` and ``default``.
+    **The total request count is therefore device-dependent and has only
+    been observed on the U64E** -- the C64U's category and item lists have
+    never been read, so any figure quoted for the Ultimate line (such as
+    the one in ``PATTERNS.md``) does not carry over to the CBM line.  Every one of
+    those requests carries **no body at all**, and ``attachment_writer``
+    returns ``NULL`` for a body-less request before constructing any
+    ``TempfileWriter`` -- an explicit zero-length branch
+    (``software/api/routes.cc:40-46``); this route's writer slot is
+    ``NULL`` regardless (``route_configs.cc:473``).  So the call creates no
+    ``/Temp`` attachment, on any route binding.
+    **The residual, and its direction**: ``routes.cc`` was read on the 3.15
+    line (``v3.15-84-g871ad034``) and whether 1.1.0 carries the same
+    five-line gate is an **inference, not a read**.  Note which way that
+    error runs -- counting POST-with-body only is the **permissive** side,
+    not the conservative one: an uncounted attachment never advances
+    ``_pending_temp_attachments``, so the budget is never reached, the
+    hygiene pass never fires, and the counter reads zero while the device
+    accumulates.  That is the gap to close, not the margin to rely on.  Pre-reset drift
     is logged at INFO per item; a post-reset mismatch raises
     :class:`U64BaselineError` after every category has been processed.
 
