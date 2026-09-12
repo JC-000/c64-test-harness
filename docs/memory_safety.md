@@ -303,6 +303,17 @@ The policy lives at the host→device boundary.  It cannot see:
 * **Dynamic growth** — if a program extends a table into the scratch
   region at runtime, the policy won't notice.  A `policy.refresh()`
   hook would address this; deferred until a consumer hits it.
+* **Payload size relative to the device's write path** — the policy
+  checks *where* a write lands, never *how big* it is, and on a
+  leak-prone Ultimate the size is what decides whether the write takes
+  the bodyless PUT path or the `/Temp`-leaking POST path.  The
+  trampolines in the table above (5 B, 6 B, 14 B) are comfortably under
+  either threshold, but that is arithmetic a reader has to redo rather
+  than a property any test pins —
+  [#254](https://github.com/JC-000/c64-test-harness/issues/254).  A
+  future builder that grows one past the threshold would leak an
+  attachment per call with nothing failing.  See
+  [`docs/u64_recovery.md`](u64_recovery.md).
 
 ## Migration
 

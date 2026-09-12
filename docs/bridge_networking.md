@@ -680,6 +680,14 @@ All three were found bringing an external RR-Net cartridge up on a U64E
 expansion port; all three are invisible to the two-VICE bridge suite,
 because VICE is more forgiving than the chip.
 
+"Three" counts the silicon-vs-VICE *divergences* only, and it is the
+right count for this list. The two ip65 alignments at the end of this
+section are not divergences (neither caused a measured fault), and the
+operational steps for a cartridge on real hardware — `Cartridge
+Preference`, `run_prg_via_sys`, ARP-first, RX drain — are in
+§ "Driving a cartridge on the U64" below. A summary elsewhere that
+counts five is spanning both sections, not contradicting this one.
+
 **1. RxCTL's low 6 bits are read-only** (issue #207).  On a real CS8900a
 every control/status register reports its own register number in the low
 6 bits -- measured reset values say so throughout: RxCTL `0x0005`,
@@ -950,6 +958,49 @@ VICE normal mode) use the `*_tod_code` variants in the "Test harness
 vs shippable application" section below instead.
 
 ## Known limitations
+
+### Open hazards in the TX builders (issues #234, #235, #236, #238)
+
+All four are open as of 2026-09-10, all four are hardware-only (an
+emulated CS8900a asserts `Rdy4TxNOW` promptly, so no VICE test fails on
+any of them), and all four are reached through `_emit_tx_frame`
+(`src/c64_test_harness/bridge_ping.py:788-820`), the single TX sequence
+every builder emits.
+
+- **The result byte is a completion flag, not a success flag**
+  ([#235](https://github.com/JC-000/c64-test-harness/issues/235)). The
+  `0x01` store sits on `build_bridge_tx_code`'s sole exit path with
+  nothing guarding it, and nothing reads `TxEvent` or `TxBidErr`
+  afterwards. It means "the routine reached its end", no more. Measured:
+  a throughput sweep reported **3072 successes and zero failures while
+  the host NIC's packet counter did not move**. Confirm delivery out of
+  band — a host-side counter or capture — never from this byte.
+- **The `Rdy4TxNOW` poll is unbounded**
+  ([#236](https://github.com/JC-000/c64-test-harness/issues/236)). `BEQ`
+  back to itself, no timeout, no counter, no failure exit; a chip that
+  never asserts hangs the 6510 with no diagnosis, in all nine call sites
+  across seven builders that reach `_emit_tx_frame` — one of the seven is
+  the private `_emit_arp_responder`.
+- **`frame_len` must be even and at most 256 — and only the private
+  helper says so**
+  ([#238](https://github.com/JC-000/c64-test-harness/issues/238)). The
+  copy loop counts in Y. Measured on hardware, 8 frames per length,
+  delivery classified by host NIC counter deltas: an **odd** length puts
+  exactly one frame on the wire and then hangs the 6510 unrecoverably
+  (machine reset only), and an **even** length above 256 is a silent
+  no-op — 8/8 "done", zero bytes delivered. `build_bridge_tx_code`'s
+  docstring mentions neither, and nothing is checked at emit time.
+- **There is no way to reset the chip, and no probe that would catch it
+  wedged** ([#234](https://github.com/JC-000/c64-test-harness/issues/234)).
+  Measured: `Rdy4TxNOW` dead across 65,536 polls while every register the
+  harness exposes read healthy (`$630E` identity, `RxCTL $0D85`,
+  `LineST $1294` LinkOK, `SelfST $00D6` INITD, `BusST $0018`). The wedge
+  survives a C64 reset, `reset(scope="machine")`, and re-running
+  bring-up; an explicit SelfCTL (`$0114`) bit-6 RESET plus re-init clears
+  it. ip65's driver resets the chip as part of init and polls the
+  self-clearing RESET bit (`drivers/cs8900a.s:317-328`);
+  `cs8900a_enable_inline_code` does not, so **an ip65-based path always
+  works and a harness-based path only works on an already-fresh chip**.
 
 ### Warp mode and ip65 DHCP
 

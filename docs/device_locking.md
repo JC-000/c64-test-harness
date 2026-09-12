@@ -163,6 +163,26 @@ last-writer-wins slot, and unheld files are swept by unrelated acquires.
 Nothing in this package can tell you which lane held a device an hour
 ago.
 
+## Releasing the lock can now make network calls
+
+Since the `/Temp` hygiene work, releasing a `DeviceLock` is no longer
+purely local. `Ultimate64Client` registers a drain callback against the
+device host (`backends/ultimate64_client.py:355` →
+`backends/device_lock.py:1708`), and the release path fires it **while
+the flock is still held**, so the device is still exclusively ours when
+the drain runs. Nested acquires fire it only on the outermost release
+(`device_lock.py:881`). The registry holds weak references, so
+registering never keeps a client alive (`device_lock.py:181`).
+
+Two consequences for a lane author: a release may take FTP round trips
+on a leak-prone device (it is best-effort and swallows its own errors —
+it never fails the run, so **a clean release does not prove a clean
+device**), and it is *why* handing the device to the next
+lane clean is automatic rather than something each lane remembers to do.
+The mechanism, the budget and the failure modes are in
+[`docs/u64_recovery.md`](u64_recovery.md) § "Harness-side mitigation:
+FTP `/Temp` GC".
+
 ## The two warnings, and why there are two
 
 ### `advisory_lock_check` — at destructive-call time

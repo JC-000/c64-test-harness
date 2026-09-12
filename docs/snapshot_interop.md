@@ -89,6 +89,24 @@ Neither backend banks out I/O for host memory access — the VICE binary monitor
 
 So the RAM round-trip guarantee is `$0000–$CFFF`, color RAM `$D800–$DBFF`, and `$E000–$FFFF` — **not** the full 64 KB. `restore_snapshot` writes those three slices, then re-asserts the CPU port bytes at `$0000`/`$0001`.
 
+### SocketDMA writes are disabled pending a stability review
+
+Everything below describes the SocketDMA (TCP/64) path as implemented, and it
+is accurate as a description of the code. **It is not current operating
+procedure.** Bulk `write_memory` over SocketDMA is disabled pending a
+stability review: do not set `transport.socket_dma = True`, and do not
+re-enable it on the strength of the performance figures in this section.
+`socket_dma` already defaults to `False`
+(`backends/ultimate64.py:79`), so the default configuration is the correct
+one and nothing has to be changed to comply — this note exists so that a
+reader who finds the fast path described here does not switch it on.
+
+The REU restore path is the exception in the code, not in the rule:
+`socket_dma_reu_write` does not consult the `socket_dma` master switch
+(`backends/ultimate64.py:371-382`) because REU memory has no REST fallback at
+all. Treat a REU restore as a deliberate, supervised operation rather than
+something to reach for casually.
+
 ### REU layer status (wired — issue #134)
 
 The REU layer is implemented, not just designed:
@@ -127,7 +145,7 @@ The snapshot work introduces two new harness scratch usages:
 
 ## Upstream firmware feature request
 
-The U64 REU extract path is currently slow (DMA-via-staging) because firmware 3.14d has no REST endpoint for REU memory readback. A feature request for `GET /v1/machine:reumem` is filed at `https://github.com/GideonZ/1541ultimate/issues` (2026-05-19). When/if it lands, the staging-window dance in `extract_reu_contents` can be swapped for a direct chunked GET — see `project_reu_readback_feature_request` in agent memory for the swap target. The restore path is already on the fast SocketDMA `REUWRITE` (opcode `0xFF07`) and doesn't change.
+The U64 REU extract path is currently slow (DMA-via-staging) because **no firmware on this bench exposes a REST endpoint for REU memory readback** — not the U64E's post-tag 3.15 build and not the C64U's 1.1.0. (This paragraph used to name "firmware 3.14d"; that was the U64E's firmware when the staging extract was written, and the limitation is not specific to it.) A feature request for `GET /v1/machine:reumem` is filed upstream as [GideonZ/1541ultimate#697](https://github.com/GideonZ/1541ultimate/issues/697), "REST endpoint for REU memory read back" (opened 2026-05-19; still open as of 2026-09-10). When/if it lands, the staging-window dance in `extract_reu_contents` can be swapped for a direct chunked GET — see `project_reu_readback_feature_request` in agent memory for the swap target. The restore path is already on the fast SocketDMA `REUWRITE` (opcode `0xFF07`) and doesn't change.
 
 ## Files
 
@@ -136,7 +154,7 @@ The U64 REU extract path is currently slow (DMA-via-staging) because firmware 3.
 - `tests/test_snapshot.py` — Phase A round-trip + .vsf format guards
 - `tests/test_snapshot_reu.py` — REU staging extract, `REUWRITE` chunking, SocketDMA restore routing, sidecar round-trip (mock-only)
 - `tests/test_socketdma_live.py` — gated live tests (`SOCKETDMA_LIVE`), including the `REUWRITE` byte-fidelity validation (passed on C64U fw 1.1.0, 2026-07-21)
-- `tests/test_snapshot_drives.py` — disk side-channel (planned phase)
-- `tests/test_snapshot_registers.py` — CIA/VIC/SID + shadow-SID (planned phase)
-- `tests/test_snapshot_cpu_regs.py` — active snoop + trampoline (planned phase)
-- `tests/test_snapshot_cartridge.py` — cart sidecar with VICE allowlist (planned phase)
+The drive, register, CPU-register and cartridge phases have **no test files
+yet** — `tests/test_snapshot_drives.py`, `tests/test_snapshot_registers.py`,
+`tests/test_snapshot_cpu_regs.py` and `tests/test_snapshot_cartridge.py` are
+names reserved for those phases, not files on disk (verified 2026-09-10).

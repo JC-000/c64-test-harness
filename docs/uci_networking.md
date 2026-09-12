@@ -1,27 +1,49 @@
 # UCI Networking (Ultimate Command Interface)
 
-The `uci_network` module drives the Ultimate 64 Elite's host-visible Command
+The `uci_network` module drives the Ultimate firmware's host-visible Command
 Interface at `$DF1C-$DF1F` to open TCP/UDP sockets from C64 code. The
 firmware's lwIP stack handles TCP/IP internally; C64 code just pushes commands
-and reads responses.
+and reads responses. The register interface is the same on both device
+generations on this bench (U64E, C64 Ultimate); everything measured below was
+measured on the U64E unless it says otherwise.
 
-- High-level helpers: `uci_probe`, `uci_get_ip`, `uci_tcp_connect`,
-  `uci_udp_connect`, `uci_socket_write`, `uci_socket_read`,
+- High-level helpers: `uci_probe`, `uci_get_ip`, `uci_get_interface_count`,
+  `uci_tcp_connect`, `uci_udp_connect`, `uci_socket_write`, `uci_socket_read`,
   `uci_socket_close`, `uci_tcp_listen_*`.
+- Diagnostics: `uci_status_peek`, `uci_wedge_probe` — non-blocking reads of
+  `$DF1C` that never enter the unbounded wait-idle spin. See
+  [`docs/u64_recovery.md`](u64_recovery.md) § "Tier 3 — UCI STATE bit".
 - Low-level 6502 builders: `build_uci_probe`, `build_uci_command`,
-  `build_get_ip`, `build_tcp_connect`, `build_socket_read`,
-  `build_socket_write`, `build_socket_close`.
+  `build_get_ip`, `build_tcp_connect`, `build_udp_connect`,
+  `build_socket_read`, `build_socket_write`, `build_socket_close`,
+  `build_uci_status_peek`.
 - Config helpers (REST): `get_uci_enabled`, `enable_uci`, `disable_uci`.
 
 **Prerequisite:** UCI must be enabled in the device settings:
 *C64 and Cartridge Settings → Command Interface → Enabled*.
+`enable_uci(client)` flips that item over REST, but the `$DF1C-$DF1F`
+registers do not go live until the next machine reset: the live suites
+follow it with `client.reset()` and a 3 s settle before the first routine
+(`tests/test_uci_udp_send_live.py:242-249`), and without that every routine
+times out at the sentinel. The write is memory-only — it is a config PUT, so
+it survives `machine:reboot` but not a firmware power-on, and it is never
+saved to flash (`uci_network.py:2316-2329`). (`enable_uci`'s own
+docstring still says "a device reboot reverts to the default state";
+that is wrong on the corrected model — `machine:reboot` is a C64-level
+reset and leaves firmware RAM config alone. See
+[`docs/u64_recovery.md`](u64_recovery.md) § "Harness-side mitigation: FTP
+`/Temp` GC", which carries the correction.)
 
 ## How the 6502 routine is dispatched
 
-The host (`_execute_uci_routine` in `uci_network.py`) writes the
-generated 6502 routine at `code_addr` (default `$C000`), then injects
-the string `SYS <code_addr>\r` into the keyboard buffer at `$0277` and
-sets the keyboard fill count at `$00C6` to the command length. BASIC's
+The host (`_execute_uci_routine` in `uci_network.py`, `:1686`) clears the
+sentinel and error bytes, writes `CTL_ABORT` to `$DF1C` and sleeps 0.1 s to
+drain stale UCI state, writes the generated 6502 routine at `code_addr`
+(default `$C000`), then injects the string `SYS <code_addr>\r` into the
+keyboard buffer at `$0277` and sets the keyboard fill count at `$00C6` to the
+command length. That injection is why `code_addr` is constrained: the
+`SYS<addr>\r` string must fit the 10-byte KERNAL buffer, and a longer one
+raises `ValueError` before anything is written (`:1741-1745`). BASIC's
 command-line processor reads the buffer on its next cycle as if the user
 typed the `SYS` command and RETURN, which JSRs into the routine. The
 routine does its work, writes the sentinel byte, and executes `RTS` to
@@ -48,7 +70,61 @@ Custom builders MUST end with `RTS` (0x60), not `JMP` or `BRK`.
 
 For UDP, one `uci_socket_write` call produces exactly one `lwip_send` on the firmware side, which is one UDP datagram on the wire (empirically confirmed by `tests/test_uci_udp_send_live.py`'s per-call-per-datagram probe). No firmware-side coalescing. For payloads larger than 892 bytes, call `uci_socket_write` in a loop; each call emits its own UDP datagram. Receivers must reassemble in application code.
 
-`uci_socket_read` has a documented theoretical cap of 894 bytes per call (`CMD_MAX_REPLY_LEN - 2`); the empirical read-side ceiling has not been probed and may share the same off-by-one as the write side.
+`uci_socket_read` is capped far lower, at **253 bytes** per call
+(`SOCKET_READ_MAX_BYTES = 255 - _SOCKET_READ_HEADER_LEN`,
+`uci_network.py:261-265`), and a larger `max_len` raises `ValueError` rather
+than being truncated. The limit is the harness's, not the firmware's: the
+6502 drain loop indexes with Y, so the two-byte `[len_lo][len_hi]` reply
+header plus 254 payload bytes would wrap it. (An earlier revision of this
+page quoted a "theoretical 894 bytes (`CMD_MAX_REPLY_LEN - 2`)"; whatever the
+firmware would allow, no caller can ask for it through this helper.) Lifting
+the cap needs a 16-bit drain, which is the same work as draining the
+multi-block replies firmware 3.15 can return — tracked separately. Until
+then, a reply whose header reports more bytes than arrived in the block logs
+a WARNING and returns the first block only (`:1993-2004`).
+
+## Cost on leak-prone firmware: zero, one or two attachments per routine
+
+On a device without the upstream `/Temp` collector — the C64 Ultimate on
+1.1.0 today — **most UCI calls from host Python cost one managed `/Temp`
+attachment; a large `socket_write` costs two and a probe or peek costs
+none — the size of the emitted routine decides**, and enough attachments
+crash the device firmware. The mechanism, the budget and the hygiene pass
+are in [`docs/u64_recovery.md`](u64_recovery.md); what matters here is the
+shape:
+
+- `_execute_uci_routine` writes its routine with a single
+  `transport.write_memory(code_addr, code)` (`uci_network.py:1735`). It does
+  **not** chunk. Measured host-side by `len()` (no device traffic,
+  2026-09-10), every command builder emits more than the C64U's 128-byte PUT
+  threshold — `build_uci_command` 133, `build_get_ip` 138,
+  `build_socket_read` 149, `build_tcp_connect` / `build_udp_connect` 159,
+  `build_socket_write` 170 — so the routine write takes the POST path and
+  leaks one attachment. Only `build_uci_probe` / `build_uci_status_peek`
+  (12 bytes) and `build_socket_close` (112) fit under it — those three
+  calls cost nothing. `turbo_safe=True` changes that unevenly: it pushes
+  `build_socket_close` to 341, over the threshold and onto POST, while
+  probe and peek reach only 28 and stay comfortably under it. Turbo makes
+  a free call cost one; it does not make every call cost three times as
+  much.
+- `uci_socket_write` costs a **second** attachment only when the payload
+  itself exceeds the threshold (`uci_network.py:1936-1943` writes the
+  socket-id byte, the payload and the two length bytes separately; only the
+  payload can cross). The 800/892-byte large-send tests pay two; a small
+  write pays one.
+- The three other writes `_execute_uci_routine` makes are all far under the
+  threshold and add nothing: the `CTL_ABORT` byte to `$DF1C`, the
+  `SYS<addr>\r` string (at most 10 bytes) to `$0277`, and the fill count to
+  `$00C6` (`uci_network.py:1735-1747`).
+- `enable_uci` / `disable_uci` are `set_config_items` — bodyless config PUTs
+  that cost nothing.
+
+**The same protocol driven C64-side costs only the upload that put it
+there.** A fetch made of many `socket_read`s is many attachments when the
+loop runs in host Python, and one attachment when the loop runs inside an
+uploaded PRG. On a leak-prone device, moving the loop onto the 6510 removes
+the leak rather than cleaning up after it, and it is the first thing to
+reach for.
 
 ## Turbo speed support (`turbo_safe=True`)
 

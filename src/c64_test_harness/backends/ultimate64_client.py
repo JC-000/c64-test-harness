@@ -1219,14 +1219,26 @@ class Ultimate64Client:
         * **lwIP / UCI stack state survives.** No REST endpoint restarts
           the firmware, so a UCI STATE-bit wedge needs a physical
           power-cycle.
-        * **C64 RAM survives.** The firmware has a separate command for
-          that: ``MENU_C64_CLEARMEM`` is ``clear_ram()`` *plus*
-          ``start_cartridge(NULL)`` (``c64_subsys.cc:232-234``), while
-          this route dispatches ``MENU_C64_REBOOT``, which is
-          ``start_cartridge(NULL)`` alone (``:258-264``) and contains no
-          ``clear_ram``. It does poke ``$8005 = 0`` to clear the CBM80
-          autostart signature, so a cartridge image in RAM will not
-          restart itself — but the bytes are still there.
+        * **The firmware does not clear C64 RAM — but the reset that
+          follows does clear low memory.** Two separate facts, and only
+          the first is about the firmware. ``clear_ram()`` belongs to
+          ``MENU_C64_CLEARMEM``, not to the ``MENU_C64_REBOOT`` this
+          route dispatches (``c64_subsys.cc``, tag ``1.1.0``:
+          ``MENU_C64_CLEARMEM`` at :200-208 with ``clear_ram()`` at
+          :206, ``MENU_C64_REBOOT`` at :231-237). But
+          ``start_cartridge`` pokes ``$8005 = 0`` and asserts
+          ``C64_MODE_RESET`` (``c64.cc``), so the 6510 runs the KERNAL
+          reset sequence: **RAMTAS clears ``$0000-$0101`` and
+          ``$0200-$03FF``**, the screen init clears ``$0400-$07E7``, and
+          BASIC's cold start writes ``$0800`` and rebuilds its pointers.
+
+          So **every harness scratch span below ``$0400`` is wiped** by a
+          ``reboot()`` — ``$0000-$0001``, ``$00C6``, ``$0277-$0280``,
+          ``$0314-$0315``, ``$0334-$0341``, ``$0360-$036D``,
+          ``$03F0-$03F1`` (see :mod:`c64_test_harness.memory_policy`).
+          Scratch at ``$C000`` and above is not touched by any of this.
+          Do not treat ``reboot()`` as preserving anything below
+          ``$0801``.
 
         What it *does* clear, which the "survives" list above can make
         easy to miss: ``start_cartridge`` zeroes ``C64_CARTRIDGE_TYPE``,

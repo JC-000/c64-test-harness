@@ -745,13 +745,15 @@ For a program that drives an external cartridge (RR-Net), neither `client.run_pr
 
 **All U64 access must use DeviceLock** for cross-process safety. Use `UnifiedManager` (automatic) or wrap with `DeviceLock` in pytest fixtures.
 
+**`probe_u64(host)` is a reachability check, not a health check.** It reports `reachable=True` on a device whose `writemem` path is dead, because it never exercises a body-carrying call (issue #241). The check that would catch it, `liveness_probe()`, costs two `/Temp` attachments on leak-prone firmware (issue #250) — so there is currently no free way to tell a healthy C64U from a writemem-degraded one.
+
 ### `/Temp` attachment hygiene — the C64U wedge (read before writing any upload loop)
 
-Every REST call that carries a **body** leaves a managed attachment (`temp0000`, `temp0001`, ...) in the device's `/Temp` folder. Firmware predating GideonZ/1541ultimate#686 never collects them, and enough accumulation **crashes the device firmware** — the REST API and the UCI bridge go down together and **only a physical power-cycle** recovers it. That is the C64 Ultimate (fw 1.1.0) today, with nobody physically present — the 2026-08/09 wedge cost about two weeks of a shared device. Ultimate-line >= 3.15 builds (the bench U64E) carry the fix and self-collect.
+Every REST call that carries a **body** leaves a managed attachment (`temp0000`, `temp0001`, ...) in the device's `/Temp` folder. Firmware predating GideonZ/1541ultimate#686 never collects them, and enough accumulation **crashes the device firmware** — the REST API and the UCI bridge go down together and **only a physical power-cycle** recovers it. That is the C64 Ultimate (fw 1.1.0) today, with nobody physically present. The 2026-08/09 outage cost about two weeks of a shared device and was this failure (owner-confirmed 2026-09-11: REST was down throughout, which rules out a UCI STATE-bit wedge). Its duration is still not a capacity measurement. Every rule in this section is keyed to that firmware and applies whether or not the device is answering right now. Do not take this file's word for device *state*: REST answering is not health (a UCI STATE-bit wedge leaves REST up), so establish state yourself with a bodyless `GET /v1/info` before assuming a device is up or down. Ultimate-line >= 3.15 builds (the bench U64E) carry the fix and self-collect.
 
 **"`/Temp` fills up" is the wrong model — the firmware crashes.** Owner's operational observation from wedged machines (2026-09-10): the C64 FPGA keeps running, so the machine looks alive, but the **device firmware is dead** — it stops answering the network *and* stops responding to the physical **menu button** on the case. A full filesystem does not do that. What is established is that `/Temp` accumulation triggers it; the **trigger threshold and the crash cause are both unestablished**, and nothing here names a cause.
 
-The arithmetic never supported a capacity story either. The one figure in circulation — "~15 cycles of **a 63 KB PRG**" (`ultimate64_temp_gc.py:6-9`) — was measured on the **U64E while it ran 3.14d**, **n unrecorded**, on a device that now runs 3.15 and is no longer leak-prone; nothing has measured any threshold on a C64U at 1.1.0. And the firmware's RAM disk is about **3 MB** (`ramdisk.cc:25`), so those fifteen PRGs are ~945 KB — roughly **31% used** at the one wedge on record. Neither free clusters nor directory entries were plausibly exhausted.
+The arithmetic never supported a capacity story either. The one figure in circulation — "~15 cycles of **a 63 KB PRG**" (that module docstring and the constant comment beside it in `backends/ultimate64_temp_gc.py`; note both still carry the stale ~3 MB / ~31% arithmetic corrected below — issue #261; **delete this parenthetical when #261 lands**) — was measured on the **U64E while it ran 3.14d**, **n unrecorded**, on a device that now runs 3.15 and is no longer leak-prone; nothing has measured any threshold on a C64U at 1.1.0. And the firmware's RAM disk is **16 MiB** — `ramdisk.cc` takes its size from the linker symbols `__ram_disk_start` (`0x02000000`) and `__ram_disk_limit` (`0x03000000`) in `target/u64/riscv/ultimate/linker.x` and `target/u64ii/riscv/ultimate/linker.x` at tag `1.1.0`; the "3 MB" in that file is a stale trailing comment and was repeated across this repo (issue #261). So those fifteen PRGs are 967,680 B — about **5.8% used** at the one wedge on record. Neither free clusters nor directory entries were plausibly exhausted.
 
 So **the count-versus-bytes question is retired, not open**: it was a category error on both sides, because both readings asked about `/Temp`'s *capacity* and capacity is not what fails. Size conservatively as though attachments were counted — it remains the safe way to be wrong — but treat that as a choice about which error to make, not as a model of the failure, and do not cite 15 as a budget for anything, least of all small attachments.
 
@@ -762,12 +764,12 @@ So **the count-versus-bytes question is retired, not open**: it was a category e
 | Call | Wire form | Leaves a `/Temp` attachment? |
 |---|---|---|
 | `client.run_prg` / `load_prg` / `run_crt` / `sid_play` / `mod_play` | POST + body | **Yes — one per call** |
-| `client.mount_disk(...)` | **POST** + multipart body (`ultimate64_client.py:1176-1181`) | **Yes — one per call** |
-| `client.drive_load_rom(..., bytes)` | **PUT** + multipart body (`:1314-1318`) | **Yes — one per call** |
+| `client.mount_disk(...)` | **POST** + multipart body (`mount_disk` in `ultimate64_client.py`) | **Yes — one per call** |
+| `client.drive_load_rom(..., bytes)` | **PUT** + multipart body (`drive_load_rom`, same module) | **Yes — one per call** |
 | `client.write_mem(addr, data)` where `len(data) > write_mem_query_threshold` | POST + body | **Yes — one per call** |
 | `client.write_mem(addr, data)` where `len(data) <= write_mem_query_threshold` | `PUT ?data=<hex>` | No |
 | `reset` / `reboot` / `pause` / `resume` / `menu_button`, every `configs:*`, the drive-slot verbs, `mount_disk_path`, stream start/stop | PUT, no body | No |
-| SocketDMA fast path on TCP 64 (`transport.socket_dma = True`, `socket_dma_reu_write`, `SocketDMAClient`) | raw TCP, never HTTP | No — but **do not enable it** while #257 is open, and read the caveat below |
+| SocketDMA fast path on TCP 64 (`transport.socket_dma = True`, `socket_dma_reu_write`, `SocketDMAClient`) | raw TCP, never HTTP | No — but **do not enable the write fast path** `transport.socket_dma` (disabled pending a stability review), and read the caveat below. The prohibition covers the **bulk-write** path only: `socket_dma_reu_write` / `restore_snapshot(restore_reu=True)` is a separate REUWRITE route that never consults the `socket_dma` switch and is **not** covered by it |
 
 **The threshold is 128 on a C64U, not 48** — and that asymmetry decides most of what follows. `write_mem` picks its wire form at `write_mem_query_threshold`, auto-detected from `DeviceCapabilities.writemem_post_safe`: **48** on Ultimate-line >= 3.15 (which self-collects, so those POSTs are harmless) and **128** on leak-prone firmware.
 
@@ -788,9 +790,9 @@ So: the ceiling is **exact and inclusive** (128 is still PUT), the POST path lea
 Four consequences to know before writing the loop:
 
 - `memory.write_bytes()` chunks at **84 bytes**, under the C64U's 128-byte PUT ceiling. Everything routed through it — including `run_prg_via_sys(target, prg)`, whose body write goes through `write_bytes` — **stays on the PUT path and leaks nothing on a C64U**, however large the PRG.
-- `transport.write_memory(addr, blob)` does **not** chunk. One 16 KiB call is one POST and one attachment.
+- `transport.write_memory(addr, blob)` does **not** chunk. One 16 KiB call is one POST and one attachment. (Whether it *should* chunk at the client's threshold — making the leak unreachable rather than merely avoidable — is open as issue #252.)
 - **`execute.load_code(transport, addr, code)` does not chunk either** — it is a bare alias for `transport.write_memory`, and the name makes it look like a harness helper that handles this for you. It does not.
-- `client.run_prg(prg)` is one attachment per call, whatever the PRG's size — **or two when the 404 sideload fires, which is precisely when you can least afford it.** With `fallback_on_404=True` (the default), a 404 from `runners:run_prg` makes the client re-send the whole PRG body through `write_mem(load_addr, body)`, **unchunked** (`ultimate64_client.py:1071`) and so far above either threshold that it is always a POST — a second body-carrying request on top of the runner POST that already carried the body and 404'd. **And a 404 from that endpoint is itself a wedge symptom**, so the fallback doubles the attachment cost exactly at the moment the device is closest to the edge: a positive-feedback loop you meet for the first time at the worst possible moment. Pass `fallback_on_404=False` on a leak-prone device if you would rather see the 404. (Whether a POST that *returns* 404 still leaves its attachment behind is **unmeasured** — assume it does, which is the conservative reading; the sideload's own POST is not in doubt, only the doubling. Note for anyone who goes to settle it: the cheap version of that experiment — POST past the threshold to a bogus `/v1/runners:*` path, count `/Temp` either side — **is informative in only one direction**. A bogus path 404s at *routing*, possibly before the firmware ever materialises the attachment, whereas the real case is a 404 from a *known* route on a distressed device. A positive result (attachment appears) would be strong evidence that creation precedes routing, so the real case leaks too; a negative result proves nothing, because a known route may behave differently. Design for the positive case or find a way to 404 a real route.)
+- `client.run_prg(prg)` is one attachment per call, whatever the PRG's size — **or two when the 404 sideload fires, which is precisely when you can least afford it.** With `fallback_on_404=True` (the default), a 404 from `runners:run_prg` makes the client re-send the whole PRG body through `write_mem(load_addr, body)`, **unchunked** (`run_prg`'s 404 sideload path in `ultimate64_client.py`) and so far above either threshold that it is always a POST — a second body-carrying request on top of the runner POST that already carried the body and 404'd. **And a 404 from that endpoint is itself a wedge symptom**, so the fallback doubles the attachment cost exactly at the moment the device is closest to the edge: a positive-feedback loop you meet for the first time at the worst possible moment. Pass `fallback_on_404=False` on a leak-prone device if you would rather see the 404. (Whether a POST that *returns* 404 still leaves its attachment behind is **unmeasured** — assume it does, which is the conservative reading; the sideload's own POST is not in doubt, only the doubling. Note for anyone who goes to settle it: the cheap version of that experiment — POST past the threshold to a bogus `/v1/runners:*` path, count `/Temp` either side — **is informative in only one direction**. A bogus path 404s at *routing*, possibly before the firmware ever materialises the attachment, whereas the real case is a 404 from a *known* route on a distressed device. A positive result (attachment appears) would be strong evidence that creation precedes routing, so the real case leaks too; a negative result proves nothing, because a known route may behave differently. Design for the positive case or find a way to 404 a real route.)
 
 **Assembled routines are usually *over* the ceiling, so a code write is normally a POST.** Measured host-side at this head (`len()` of the builder output — no device involved), against the 128-byte C64U ceiling. **Blob size depends on the arguments**, so each figure carries the ones it was taken under; a figure quoted without them is not reproducible, which is how the first version of this table was wrong.
 
@@ -830,7 +832,11 @@ The `turbo_safe=True` fence roughly triples every UCI blob, so a turbo-safe rout
 - **`enable_uci` / `disable_uci` cost nothing.** They are `set_config_items` (`uci_network.py:2316`/`:2331`) — bodyless config PUTs, not the code-write path. Enabling UCI does not leak.
 - **An RR-Net ping or responder blob loaded with `load_code` is one attachment each.**
 
-If you need a code write not to leak, put it through `write_bytes` — same bytes, 84-byte chunks, PUT path.
+If you need a code write not to leak, put it through `write_bytes` — same bytes, 84-byte chunks, PUT path on a C64U.
+
+**The U64 trampoline is under the ceiling, but nothing holds it there.** Only one trampoline reaches REST at all: `run_subroutine`'s 14-byte U64 sentinel (`$0360`). `jsr()`'s 5-byte trampoline is the **VICE branch** — `run_subroutine` dispatches to `_run_subroutine_u64` on a U64 target and calls `jsr()` only otherwise (`execute.py:698-709`), and `jsr()` needs checkpoints and register writes `Ultimate64Transport` does not have — so its bytes never cross a REST wire and it has no `/Temp` cost on any firmware. The 14 bytes take the PUT path on either threshold, but that is arithmetic on today's constants, not a pinned property: no test asserts the size stays below `write_mem_query_threshold`, so a few bytes of growth would silently move a per-call harness primitive onto the leaking POST path (issue #254 — whose body carries the same VICE/U64 error this paragraph did; **delete this paragraph's "nothing holds it there" claim when #254 lands a test**). If you grow it, check the size yourself.
+
+**Two routes that can exceed any chunk ceiling** — a SocketDMA write that falls back to REST, and a `uci_socket_write` payload — are tracked as issue #242.
 
 So on a leak-prone device **`run_prg_via_sys(target, prg)` is the low-risk way to start a program and `client.run_prg(prg)` is the costly one** — the opposite of the intuition that the purpose-built endpoint must be the cheaper path. (`run_prg_via_sys` is also what an external cartridge needs; see Pattern 8 § "Hardware RR-Net on the U64".)
 
@@ -839,13 +845,64 @@ So on a leak-prone device **`run_prg_via_sys(target, prg)` is the low-risk way t
 **Rules for tests and scripts:**
 
 1. **Hygiene is the harness's job, not the test author's.** If you find yourself adding a manual cleanup call to a test, the guard belongs one layer down instead.
-   <!-- SLOT: gc-core hygiene API pointer — supervisor to fill in when that work lands. -->
+   That guard has landed (merged 2026-09-10, commit f2b46ce): `Ultimate64Client`
+   arms a `/Temp` hygiene pass on its own when the device's capabilities say the
+   firmware is leak-prone — `client.temp_hygiene_armed`
+   (`backends/ultimate64_client.py`) decides from `temp_hygiene=` first, then
+   `$U64_AUTO_TEMP_GC` (truthy forces on for *any* device, falsy forces off), then
+   `DeviceCapabilities.runner_wedge_possible is not False`. Armed, the client
+   spends a leak budget of `client.temp_gc_budget`
+   (`DEFAULT_LEAK_BUDGET = 6` in `backends/ultimate64_temp_gc.py`; override with
+   `temp_gc_budget=` or `$U64_TEMP_GC_BUDGET`) of attachment-creating requests and
+   sweeps when it runs out, and drains again on `close()` and on `DeviceLock`
+   release. **The guard also refuses.** Once hygiene is armed and a pass has been
+   proven impossible (FTP down, say), every later attachment-creating request
+   raises `Ultimate64TempHygieneError` (`_before_temp_attachment` /
+   `_refuse_or_warn` in `backends/ultimate64_client.py`) rather than walking the
+   device toward the wedge. **It is not a package-root export**: import it from
+   `c64_test_harness.backends.ultimate64_client`, or catch the root-level
+   `Ultimate64Error`, which is its base class.
+   That is a hard exception from a layer below your test, and its message names the
+   remedy. Both opt-outs are deliberate: set `U64_TEMP_GC_REQUIRED=0` to downgrade
+   the refusal to a WARNING and proceed, or pass `temp_hygiene=False` to disarm the
+   pass entirely.
+   One residue to know: a client that never probed capabilities — one constructed
+   with an explicit `write_mem_query_threshold=`, which by contract issues no HTTP
+   at construction — stays **disarmed**. A device whose construct-time probe merely
+   timed out is *not* in that class: `_maybe_reprobe_capabilities` re-probes once
+   at the full timeout after the client completes any
+   request, so a slow-probed device arms from its **second** attachment-creating
+   request, the first having been decided on the stale unknown grade — well inside
+   a budget of 6. Only if that second probe also fails does it stay disarmed, with
+   a WARNING saying so. (An earlier revision of this paragraph said the timed-out
+   case stays disarmed for the client's lifetime; that came from a stale docstring
+   and is wrong — issue #262.) Force arming with `temp_hygiene=True` or
+   `U64_AUTO_TEMP_GC=1`. **The budget is per client instance** (issue #264): two
+   clients against the same device get six each, so count budget per process, not
+   per device, when a run constructs more than one. Twelve is the peak before a
+   sweep rather than a running total, because `gc_temp_folder` collects `/Temp`
+   **device-wide**: whichever client spends its budget first sweeps the other's
+   attachments too.
 2. **Never loop an upload against a leak-prone device without a hygiene pass.** Treat a handful as the budget and do not approach it. Fifteen is *not* a measured budget for this device or this workload — see the conditions above; it is a PRG-sized figure from another device on other firmware, and the mechanism behind it is unknown. **Budget across runs, not within one:** a `reboot()` does not delete attachments (measured), so what you are spending is whatever the device has accumulated since its last GC or power-cycle — including everything the previous lane left behind. Parametrization multiplies quietly: four `mhz` params x three vectors is twelve uploads in one session.
-3. **A hygiene result with `.error` set is a failed pass, not a benign skip.** `gc_temp_folder` never raises — it reports. The GC needs the device's **FTP File Service**, which is **`Disabled` by default on 1.1.0**: verify it is on before relying on a hygiene pass, never assume it. Where it is off the sweep silently no-ops and the failure mode is "cleanup appeared to run, device wedged anyway". Stop uploading after an `.error`; do not keep going. (On this bench the C64U currently reads `current=Enabled, default=Disabled`; the provenance of that setting is unconfirmed and whether it survives a power-cycle has **not** been established here — checking would mean writing `Network Settings` on a device nobody can recover.)
+3. **A hygiene result with `.error` set is a failed pass, not a benign skip.** `gc_temp_folder` never raises — it reports. The GC needs the device's **FTP File Service**, which is **`Disabled` by default on 1.1.0**: verify it is on before relying on a hygiene pass, never assume it. Where it is off the sweep silently no-ops and the failure mode is "cleanup appeared to run, device wedged anyway". Stop uploading after an `.error`; do not keep going. And know what the harness does about it: on a failed pass `_run_temp_hygiene` (`ultimate64_client.py:812-834`) **enables FTP File Service itself** — a `Network Settings` write it logs at WARNING and never restores, persisting until a firmware power-on, since `machine:reboot` does not clear firmware RAM. So the setting you find on a device may be a previous lane's hygiene pass rather than anyone's decision, and that write targets a store the entry-baseline code lists in `BASELINE_NEVER_TOUCH`.
 4. **Run hygiene while holding the `DeviceLock`.** `gc_temp_folder` acquires no lock of its own.
-5. **Prefer the routes that do not leak** for bulk data — **but do not enable SocketDMA writes; the write fast path is disabled pending a stability review** (see § "SocketDMA write fast path" below). The non-leaking route for bulk data is `write_bytes` / `run_prg_via_sys`, whose 84-byte chunks stay on the PUT path on a C64U.
+5. **Prefer the routes that do not leak** for bulk data — **but do not enable SocketDMA writes; the write fast path is disabled pending a stability review** (see § "SocketDMA write fast path" below). The non-leaking route for bulk data is `write_bytes` / `run_prg_via_sys`, whose 84-byte chunks stay on the PUT path on a C64U — and there is no fast replacement: that route is untimed (issue #267).
 6. **Where you drive the protocol decides your exposure.** UCI driven from host Python costs a POST per `_execute_uci_routine` call (one per `uci_socket_*` operation), so a fetch made of many `socket_read`s is many attachments. The same protocol driven C64-side, inside an uploaded PRG, costs only the upload that put it there. When a run needs many operations against a leak-prone device, **moving the loop onto the 6510 removes the leak rather than cleaning up after it** — which beats managing it with a GC.
 7. **Do not export a live gate as a side effect of unrelated work.** Every live test here skips unless its gate is set; keep it that way unless the device run is the point of the task.
+8. **Diagnose a suspected wedge with bodyless calls.** `liveness_probe()` costs
+   **two attachments per call** on leak-prone firmware (measured on the C64U
+   2026-09-10: `/Temp` 0 -> 2 for one call) because it deliberately exercises the
+   POST `writemem` path, and `assert_healthy()` wraps it — so the call you reach
+   for when you already suspect a wedge spends a third of the default budget, and
+   probing again on a bad result converges on the wedge you are diagnosing
+   (issue #250). `get_info()`, `get_version()` and `read_mem()` cost nothing; use
+   those, and reach for `liveness_probe` once, deliberately, knowing the price.
+9. **A malformed `address` is not rejected by the firmware — it writes to `$0000`.**
+   `PUT /v1/machine:writemem?address=0xZZZZ&data=...` returns HTTP 200 and lands at
+   zero page (measured 2026-09-10, issue #251). `Ultimate64Client.write_mem`
+   validates `0..0xFFFF` before sending, so ordinary callers are safe; anyone
+   building the query themselves, or calling `_request` directly, gets a silent
+   zero-page clobber reported as success.
 
 ### Known state on entry — reset, then assert (issue #227)
 
@@ -883,21 +940,15 @@ There are two hardware generations with real behavioral differences. Detect with
 
 - **CPU-speed enum**: Elite has `" 5"` but not `"64"`; C64U has `"64"` but not `" 5"`. The harness schema is the cross-generation superset — `set_turbo_mhz` probes the device's actual CPU-Speed presets (once, cached per client) and raises `ValueError` locally for a foreign speed; only when the probe is inconclusive does the write reach the firmware, which rejects it with HTTP 400 *before* Turbo Control is enabled (`set_turbo_mhz` writes CPU Speed first, on purpose). `max_cpu_speed_mhz(client)` / `set_speed(None)` resolve "max" from the same probe (64 on C64U, 48 on U64E; 48 fallback). Contract test: `tests/test_turbo_contract_live.py` (`TURBO_CONTRACT_LIVE=1` gate).
 - **REU / Cartridge preset**: only U64E firmware 3.14 exposed `Cartridge` as an enum with a `"REU"` preset that had to be written to enable the REU. U64E 3.15 replaced it with a `.crt` file chooser (`presets: [""]`; firmware `c64.cc:73`, `CFG_TYPE_STRFUNC`/`list_crts`) and the REU is controlled by `RAM Expansion Unit` + `REU Size` alone; the C64U (1.1.0) likewise has no `"REU"` preset — its `Cartridge` value merely mirrors REU state, and writing it back is rejected with HTTP 400. `set_reu` / `restore_state` handle all three by probing the item's presets (preset write ordered first, so a rejection never half-enables the REU). Don't hand-write `Cartridge: "REU"` config updates; use the helpers. `REU Size` read-back is trustworthy — a value that changes between reads means a config write, a flash reload, or a reboot/power-cycle in between (PUTs are volatile until `save_to_flash`); see `tests/test_reu_size_readback_live.py`.
-- **REST `POST writemem` cliff (C64U)**: ~100–160 ms up to 12 KiB, then ~6 s per request at ≥16 KiB (sometimes exceeding a 10 s client timeout). Per-request pathology, not a wedge — the device stays healthy. For bulk writes use the SocketDMA fast path below.
+- **REST `POST writemem` cliff (C64U)**: ~100–160 ms up to 12 KiB, then ~6 s per request at ≥16 KiB (sometimes exceeding a 10 s client timeout). Per-request pathology, not a wedge — the device stays healthy. **There is no fast bulk-write path on a C64U today.** The SocketDMA fast path is disabled (see below), which leaves `write_bytes` / `run_prg_via_sys` — and those are ~196 84-byte PUT round trips for 16 KiB **on a C64U** (84 is under its 128 ceiling; on threshold-48 firmware those same chunks take POST, which is harmless only because that firmware self-collects), with **no published timing anywhere in this repo** (issue #267). Budget for it being slow; do not assume it beats the ~6 s cliff until someone measures it.
 
 ### SocketDMA write fast path (TCP 64)
 
-> **Do not enable SocketDMA writes.** The write fast path is disabled pending a stability review. For bulk data use `write_bytes` / `run_prg_via_sys`, whose 84-byte chunks stay on the PUT path. Details are tracked privately.
+> **Do not enable SocketDMA writes.** The write fast path is disabled pending a stability review. For bulk data use `write_bytes` / `run_prg_via_sys`, whose 84-byte chunks stay on the PUT path **on a C64U**. Details are tracked privately.
 
-The firmware serves a binary "SocketDMA" channel on TCP port 64 (client: `SocketDMAClient`, package-root export; capabilities: DMA load/run, raw memory write, REU write, keyboard inject, reset, identify). On the C64U it ships disabled — enable **Network Settings → "Ultimate DMA Service"**. `Ultimate64Transport` wires it in as an opt-in bulk-write route:
+The firmware serves a binary "SocketDMA" channel on TCP port 64 (client: `SocketDMAClient`, package-root export; capabilities: DMA load/run, raw memory write, REU write, keyboard inject, reset, identify). On the C64U it ships disabled — enable **Network Settings → "Ultimate DMA Service"**. `Ultimate64Transport` wires it in as an opt-in bulk-write route gated on two attributes: **`socket_dma`** (the master switch, default `False`) and **`socket_dma_min_bytes`** (default 8192 — the payload size at or above which `write_memory` takes DMAWRITE instead of REST). They are named here so you can recognise the path in someone else's code or in a traceback; **do not set either**. No runnable recipe is given, deliberately — a copy-pasteable one outlives the prohibition that sits above it.
 
-```python
-transport.socket_dma = True            # default False — zero behavior change until enabled
-transport.socket_dma_min_bytes = 8192  # payloads >= this go via DMAWRITE
-transport.write_memory(0x4000, blob)   # 16 KiB in ~150 ms vs >6 s REST POST on C64U
-```
-
-Semantics to rely on: same `MemoryPolicy` checks as the REST path; chunked at 32 KiB (full 64 KiB writes work); `DMAWRITE` is fire-and-forget (no per-command ack), so the transport finishes each write with an in-band **`IDENTIFY` completion barrier** — commands on one connection are serviced strictly in order, so the reply proves every chunk was consumed and applied (same pattern as `reu_write`; recv timeout scales with payload size) — followed by a REST tail read-back as a post-barrier sanity check (`socket_dma_verify_timeout`, default 2 s). A tail read-back alone is NOT a completion barrier: a tail that matches pre-existing RAM reports success while the bulk DMA is still in flight. Connect/send/barrier/verify failure logs a WARNING and falls back to REST, and a connect failure latches the fast path off for the transport's lifetime. **Firmware from fdb521a5 (2026-05-10) on — v3.15 and the U64E fork — closes a SocketDMA connection idle for >1 s** (`SO_RCVTIMEO = 1 s` in `socket_dma.cc`; U64E 3.15: 0.90 s gap ok 3/3, 1.00 s closed 3/3; v3.14d / 1.1.0 have no socket timeout, where the reconnect is a spare handshake), and a command sent into that socket is never read — that was issue #223's "intermittent" barrier failure (50/50 at a 1.5 s inter-write gap, 0/50 at 0.2 s, load irrelevant, failed DMA applied 0/50). `SocketDMAClient` now reopens a connection idle for `IDLE_RECONNECT_SECONDS` (0.8 s) before the next command, and the transport retries a failed send/barrier once on a fresh connection before falling back (re-send is idempotent for RAM: same bytes, same address; a span touching `$D000-$DFFF` is never re-sent — straight to REST). Live: `tests/test_socketdma_barrier_live.py`. Live tests: `tests/test_socketdma_live.py` (`SOCKETDMA_LIVE=1` gate). U64E fw 3.14 availability is untested. The fallback used to be described here as making it "safe everywhere" — **that is now false**: the fallback only covers *reachability*, and says nothing about the unbounded-write hazard in #257 above.
+Semantics to rely on: same `MemoryPolicy` checks as the REST path; chunked at 32 KiB (full 64 KiB writes work); `DMAWRITE` is fire-and-forget (no per-command ack), so the transport finishes each write with an in-band **`IDENTIFY` completion barrier** — commands on one connection are serviced strictly in order, so the reply proves every chunk was consumed and applied (same pattern as `reu_write`; recv timeout scales with payload size) — followed by a REST tail read-back as a post-barrier sanity check (`socket_dma_verify_timeout`, default 2 s). A tail read-back alone is NOT a completion barrier: a tail that matches pre-existing RAM reports success while the bulk DMA is still in flight. Connect/send/barrier/verify failure logs a WARNING and falls back to REST, and a connect failure latches the fast path off for the transport's lifetime. **Firmware from fdb521a5 (2026-05-10) on — v3.15 and the U64E fork — closes a SocketDMA connection idle for >1 s** (`SO_RCVTIMEO = 1 s` in `socket_dma.cc`; U64E 3.15: 0.90 s gap ok 3/3, 1.00 s closed 3/3; v3.14d / 1.1.0 have no socket timeout, where the reconnect is a spare handshake), and a command sent into that socket is never read — that was issue #223's "intermittent" barrier failure (50/50 at a 1.5 s inter-write gap, 0/50 at 0.2 s, load irrelevant, failed DMA applied 0/50). `SocketDMAClient` now reopens a connection idle for `IDLE_RECONNECT_SECONDS` (0.8 s) before the next command, and the transport retries a failed send/barrier once on a fresh connection before falling back (re-send is idempotent for RAM: same bytes, same address; a span touching `$D000-$DFFF` is never re-sent — straight to REST). Live: `tests/test_socketdma_barrier_live.py`. Live tests: `tests/test_socketdma_live.py` (`SOCKETDMA_LIVE=1` gate). The service is present on the bench U64E's post-tag 3.15 fork (the #223 measurements above ran there); availability on 3.14 builds is untested. The fallback used to be described here as making it "safe everywhere" — **that is now false**: the fallback only covers *reachability*, and says nothing about the concern behind the standing do-not-enable rule at the top of this section.
 
 ### DMA Trampoline Pattern
 ```python
@@ -949,9 +1000,9 @@ client.reset()
 set_turbo_mhz(client, 32)
 client.run_prg(prg_data)  # may hang!
 
-# RIGHT: full reboot clears all FPGA/DMA state
+# RIGHT: reboot() restarts the C64 side with cartridge + REU re-initialised
 client.reboot()
-time.sleep(8.0)  # FPGA reinit takes ~8s
+time.sleep(8.0)  # ~8s before the device answers again
 set_reu(client, enabled=True, size="512 KB")  # re-enable after reboot
 set_turbo_mhz(client, 32)
 client.run_prg(prg_data)  # works reliably
@@ -1016,7 +1067,7 @@ The `multicast_group=` argument on `DebugCapture` is the portable receive path �
 
 ### Recovering from FPGA UDP-rate degradation
 
-The U64E FPGA's debug-stream emitter degrades over time under sustained workload — observed delivery drops to 30–90% of the configured rate after a long run, and only a full `reboot()` restores it (`reset()` is not enough; see issue #81). For multi-routine benches, use `DebugCapture.with_fresh_fpga(client)` to reboot + settle (12s default) and return a freshly-constructed `DebugCapture` ready to `.start()`.
+The U64E FPGA's debug-stream emitter degrades over time under sustained workload — observed delivery drops to 30–90% of the configured rate after a long run, and only `reboot()` restores it (`reset()` is not enough; see issue #81) — an empirical result, not a claim that the FPGA is re-loaded: `reboot()` is a C64-level reset and the firmware keeps running. For multi-routine benches, use `DebugCapture.with_fresh_fpga(client)` to reboot + settle (12s default) and return a freshly-constructed `DebugCapture` ready to `.start()`.
 
 ```python
 from c64_test_harness.backends.u64_debug_capture import DebugCapture
@@ -1032,14 +1083,14 @@ for routine in routines:
     result = cap.stop()
 ```
 
-This helper never calls `poweroff()` — `reboot()` is the right primitive for clearing FPGA state.
+This helper never calls `poweroff()` — `reboot()` is the right primitive for clearing REU/DMA stuck state.
 
 ### Recovering a stuck Ultimate 64
 
 Three failure modes show up when driving a U64 hard from a test run:
 
 - **CPU stuck (alive-but-hung 6510):** HTTP still works, but the running program has wedged the CPU. A soft `reset()` clears it instantly.
-- **FPGA / REU / DMA stuck:** typically after turbo-speed switches with REU-heavy workloads. A soft reset is not enough; only a full `reboot()` (~8s FPGA reinit) clears it.
+- **FPGA / REU / DMA stuck:** typically after turbo-speed switches with REU-heavy workloads. A soft reset is not enough; only `reboot()` (~8s, a C64-level restart with cartridge and REU re-initialised) clears it.
 - **Runner subsystem wedged:** the device is otherwise reachable (HTTP + `/v1/version` respond) but `run_prg` returns the firmware's `"Cannot open file"` signature and refuses new programs. `recover()` clears it **when the cause is runner state**.
 - **`/Temp` attachment accumulation (leak-prone firmware only):** the *same* `"Cannot open file"` signature, and the one failure mode on this list that `recover()` cannot touch — because past a point it is not a runner fault at all but a **firmware crash** (issue #153; the C64 keeps running while the firmware stops answering both the network and the physical menu button). The attachments are the trigger and **neither `reset()` nor `reboot()` deletes them**, so both "succeed" and the next upload wedges identically, and the UCI bridge goes with it. That is measured, not inferred: on the C64U (2026-09-10, under the lock, FTP either side) one POST left `temp0008`, and a `reboot()` plus 6 s settle left `temp0008` exactly where it was. The mechanism agrees — `/Temp` is a FAT filesystem on a firmware **RAM disk** (`ramdisk.cc:25-42`) and `machine:reboot` is a C64-level reset that never restarts the firmware. **So accumulation is across runs, not within one**: a fresh test session inherits every attachment the previous one left, and "I rebooted between runs" is not cross-run protection. Distinguish it by history, not by the error: if the session has been uploading (`run_prg`, `load_prg`, POST `writemem` above the threshold) against a device whose `DeviceCapabilities.writemem_post_safe` is `False`, assume this one first. The fix is a `/Temp` GC, not a reboot; once the device is in this state it is out until someone is physically present to power-cycle it. See § "`/Temp` attachment hygiene" above.
 
@@ -1438,15 +1489,15 @@ if not result.reachable:
 `Ultimate64InstanceManager.acquire()` probes automatically and skips unreachable devices.
 
 ### 15. U64: reset() vs reboot()
-`reset()` is a soft C64 reset (6510 CPU only). `reboot()` reinitializes the entire FPGA including DMA controllers and REU. **Use `reboot()` when switching turbo speeds with REU-heavy workloads** — stale DMA state causes hangs. Allow ~8s for the device to become responsive after reboot.
+`reset()` is a soft C64 reset (6510 CPU only). `reboot()` is a **C64-level reset**, not a firmware reboot (`C64::start_cartridge(NULL)`): the C64 side restarts with cartridge and REU re-initialised, which is why it clears REU/DMA stuck state, while the firmware keeps running — so firmware-RAM config, `/Temp` attachments and lwIP/UCI state all survive it. **Use `reboot()` when switching turbo speeds with REU-heavy workloads** — stale DMA state causes hangs. Allow ~8s for the device to become responsive after reboot.
 
-In backend-agnostic code, prefer `target.transport.reset(scope="cpu")` (soft) and `target.transport.reset(scope="machine")` (full). The dispatch maps to `client.reset()` / `client.reboot()` on U64 and `CMD_RESET 0` / `CMD_RESET 1` on VICE. See Pattern 10 § "Cross-backend speed/reset variant".
+In backend-agnostic code, prefer `target.transport.reset(scope="cpu")` (soft) and `target.transport.reset(scope="machine")` (the backend's fullest — VICE hard reset, U64 C64-level `reboot()`). The dispatch maps to `client.reset()` / `client.reboot()` on U64 and `CMD_RESET 0` / `CMD_RESET 1` on VICE. See Pattern 10 § "Cross-backend speed/reset variant".
 
 ### 16. U64: Stale Screen RAM After Reset
 `run_prg()` does a soft reset internally, but screen memory at $0400 persists. Never use `wait_for_text()` alone to detect program startup — poll for known code bytes (e.g. main_loop JMP) instead. See Pattern 10.
 
 ### 17. U64: Runner Endpoints Use POST
-All U64 runner endpoints (`run_prg`, `load_prg`, `run_crt`, `sidplay`, `modplay`) require HTTP POST. PUT returns HTTP 400 on firmware 3.14.
+All U64 runner endpoints (`run_prg`, `load_prg`, `run_crt`, `sidplay`, `modplay`) require HTTP POST. PUT returned HTTP 400 on firmware 3.14 and the harness still POSTs on both bench devices (U64E post-tag 3.15 fork, C64U 1.1.0); PUT has not been re-tried on either.
 
 That POST carries the program as its body, so on firmware predating GideonZ/1541ultimate#686 (the C64U on 1.1.0) **each of these calls leaks one `/Temp` attachment**, and enough of them wedge the device (the only figure, ~15, is for 63 KB PRGs on another device's 3.14d — see the conditions in that section) — see Pattern 10 § "`/Temp` attachment hygiene". `run_prg_via_sys(target, prg)` writes the program through `write_bytes` (84-byte chunks, under that firmware's 128-byte PUT ceiling) and leaks nothing there.
 
