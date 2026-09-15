@@ -259,6 +259,28 @@ def test_a_frame_len_the_copy_loop_cannot_honour_is_refused(route: str, n: int) 
         LEN_ROUTES[route](n)
 
 
+def test_the_1066_byte_udp_live_test_is_a_strict_xfail_on_valueerror() -> None:
+    """#304: ``tests/test_rrnet_udp_send_live.py`` builds a 1066-byte frame,
+    which the #238 check refuses.  It must stay a strict xfail on exactly
+    ``ValueError`` -- read from source, since the module needs a live
+    gate to import usefully -- and the builder must really refuse 1066."""
+    import ast
+    from pathlib import Path
+
+    src = Path(__file__).with_name("test_rrnet_udp_send_live.py").read_text()
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef)
+              and n.name == "test_c64_sends_1024_byte_udp_datagram_to_host")
+    marks = [d for d in fn.decorator_list
+             if isinstance(d, ast.Call) and ast.unparse(d.func) == "pytest.mark.xfail"]
+    assert len(marks) == 1, "the 1066-byte live test lost its xfail marker"
+    kw = {k.arg: ast.unparse(k.value) for k in marks[0].keywords}
+    assert kw.get("raises") == "ValueError" and kw.get("strict") == "True", kw
+    assert "#304" in kw.get("reason", "")
+    with pytest.raises(ValueError):
+        bp.build_tx_code(LOAD, TX_BUF, 1066, RESULT)
+
+
 @pytest.mark.parametrize("n", GOOD_LENS)
 @pytest.mark.parametrize("route", sorted(LEN_ROUTES))
 def test_even_lengths_up_to_256_are_accepted(route: str, n: int) -> None:
