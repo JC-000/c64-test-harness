@@ -28,7 +28,11 @@ import urllib.request
 import uuid
 from typing import TYPE_CHECKING, Any
 
-from .u64_capabilities import THRESHOLD_POST_RISKY, DeviceCapabilities
+from .u64_capabilities import (
+    THRESHOLD_POST_RISKY,
+    THRESHOLD_POST_SAFE,
+    DeviceCapabilities,
+)
 
 if TYPE_CHECKING:
     from .ultimate64_probe import LivenessResult
@@ -289,6 +293,33 @@ _STRICT_HEX_ROUTE_HINTS: dict[str, str] = {
 }
 
 
+class _ShippedThreshold(int):
+    """The untouched value of ``Ultimate64Client.WRITE_MEM_QUERY_THRESHOLD``.
+
+    An ``int`` in every respect callers can observe; the subclass exists
+    only so ``__init__`` can tell the shipped value from a poke (#249).
+    A caller that re-assigns the same number stores a plain ``int``, which
+    is still a poke and is still honoured.
+    """
+
+    __slots__ = ()
+
+
+def _validate_poked_threshold(value: Any) -> int:
+    """A poked ``WRITE_MEM_QUERY_THRESHOLD`` must be a non-negative int."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(
+            "WRITE_MEM_QUERY_THRESHOLD must be an int, got "
+            f"{type(value).__name__} {value!r}; prefer the "
+            "write_mem_query_threshold= constructor kwarg"
+        )
+    if value < 0:
+        raise ValueError(
+            f"WRITE_MEM_QUERY_THRESHOLD must be >= 0, got {value}"
+        )
+    return int(value)
+
+
 def _wire_hex16(value: int) -> str:
     """Format a 16-bit address for a REST query argument.
 
@@ -449,15 +480,32 @@ class Ultimate64Client:
         #: Has any request to this host ever completed? That is the
         #: evidence a timed-out construct-time probe cannot supply.
         self._saw_successful_request = False
+        poked = type(self).WRITE_MEM_QUERY_THRESHOLD
+        class_poked = not isinstance(poked, _ShippedThreshold)
         if write_mem_query_threshold is not None:
             # An explicit threshold pins the behaviour, so the probe is not
             # needed at construction; ``capabilities`` stays lazy and this
             # path issues no HTTP traffic at all.
             self.write_mem_query_threshold = int(write_mem_query_threshold)
+            if class_poked:
+                _log.warning(
+                    "Ultimate64Client(%s): %s.WRITE_MEM_QUERY_THRESHOLD = %r "
+                    "ignored because the write_mem_query_threshold=%d kwarg "
+                    "takes precedence.",
+                    self.host, type(self).__name__, poked,
+                    self.write_mem_query_threshold,
+                )
         else:
             self.write_mem_query_threshold = (
                 self.capabilities.write_mem_query_threshold
             )
+            if class_poked:
+                # Applied (#249) after the probe, so a poke never disarms
+                # /Temp hygiene the way the kwarg's skipped probe does, and
+                # so the grade is known when deciding whether to refuse it.
+                self.write_mem_query_threshold = self._effective_poked_threshold(
+                    poked, f"{type(self).__name__}."
+                )
 
         self.log_device_grading()
 
@@ -1730,13 +1778,97 @@ class Ultimate64Client:
             )
         return data
 
-    #: Class-level fallback for the raw-byte threshold above which
-    #: :meth:`write_mem` switches from the legacy ``PUT ?data=<hex>`` form
-    #: to the ``POST`` raw-byte form. Per-instance ``write_mem_query_threshold``
-    #: (set in ``__init__`` from :attr:`capabilities`) takes precedence; this
-    #: attribute is retained for backwards compatibility with callers that
-    #: poke the class.
-    WRITE_MEM_QUERY_THRESHOLD: int = 48
+    #: Override for the raw-byte threshold above which :meth:`write_mem`
+    #: switches from the ``PUT ?data=<hex>`` form to the ``POST`` form.
+    #: Its shipped value, 48, is the post-safe grade's threshold and is
+    #: **not** applied as a default: an untouched client takes its
+    #: threshold from :attr:`capabilities` (128 on leak-prone or unknown
+    #: firmware). Precedence, highest first: the ``write_mem_query_threshold=``
+    #: constructor kwarg (the supported path); then a poke of this name on
+    #: the class, a subclass, or -- after construction -- an instance; then
+    #: the capability grade. A poke is applied with a WARNING naming the
+    #: kwarg, and unlike the kwarg it does not skip the capability probe, so
+    #: ``/Temp`` hygiene still arms. It is clamped to 128 (the firmware's
+    #: ``data=`` cap) and, on a device not graded post-safe, a poke below 128
+    #: is refused and 128 kept -- see :meth:`_effective_poked_threshold`.
+    #: A class poke is process-global, and re-assigning a plain ``48`` still
+    #: counts as a poke. To undo one, restore the saved original object
+    #: (``orig = Ultimate64Client.WRITE_MEM_QUERY_THRESHOLD`` before poking,
+    #: then assign ``orig`` back), or poke under pytest's ``monkeypatch``,
+    #: which does that for you. Before issue #249 this attribute was never
+    #: read and every poke was a silent no-op.
+    WRITE_MEM_QUERY_THRESHOLD: int = _ShippedThreshold(THRESHOLD_POST_SAFE)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # An instance poke of the uppercase name is honoured (#249): it
+        # moves the live threshold, which is the only thing it could mean.
+        if name == "WRITE_MEM_QUERY_THRESHOLD":
+            # A subclass that assigns this before ``super().__init__()`` has
+            # no grade cached yet, so it gets a "refused, keeping 128"
+            # WARNING here -- and ``__init__`` then sets the threshold from
+            # the grade anyway (48 on a post-safe device).  Safe, merely
+            # noisy; poke on the class body or after construction instead.
+            threshold = self._effective_poked_threshold(value, "instance ")
+            object.__setattr__(self, "write_mem_query_threshold", threshold)
+            # Store the effective value, not the request, so the uppercase
+            # name never reads back a refused or clamped poke (review
+            # round 2).  ``write_mem_query_threshold`` stays authoritative.
+            object.__setattr__(self, name, threshold)
+            return
+        object.__setattr__(self, name, value)
+
+    def _effective_poked_threshold(self, value: Any, source: str) -> int:
+        """The threshold a poke of ``WRITE_MEM_QUERY_THRESHOLD`` may set.
+
+        Review round 1 of #249.  A poke is a blunt, process-global control,
+        so two directions are not honoured:
+
+        * **Above 128** it is clamped to 128: the firmware refuses a
+          ``PUT ?data=`` payload over 128 bytes on every grade (the
+          transport's ``_PUT_DATA_CAP`` is the same limit).
+        * **Below 128 on a device not graded post-safe** it is refused and
+          128 kept: there a lower threshold only moves writes onto the POST
+          path, which leaves a ``/Temp`` attachment per request (hardware
+          rule 8).  The explicit ``write_mem_query_threshold=`` kwarg is the
+          deliberate way to force it.
+
+        Reads the private ``_capabilities`` cache, never the probing
+        property; the public ``cached_capabilities`` accessor (#291) was not
+        on master when this landed.  An unprobed client counts as not
+        post-safe.
+        """
+        requested = _validate_poked_threshold(value)
+        host = getattr(self, "host", "?")
+        if requested > THRESHOLD_POST_RISKY:
+            _log.warning(
+                "Ultimate64Client(%s): %sWRITE_MEM_QUERY_THRESHOLD = %d clamped "
+                "to %d: the firmware refuses a PUT ?data= payload over %d bytes "
+                "on every grade. Prefer the write_mem_query_threshold= "
+                "constructor kwarg.",
+                host, source, requested, THRESHOLD_POST_RISKY, THRESHOLD_POST_RISKY,
+            )
+            return THRESHOLD_POST_RISKY
+        caps = getattr(self, "_capabilities", None)
+        if requested < THRESHOLD_POST_RISKY and getattr(
+            caps, "writemem_post_safe", None
+        ) is not True:
+            firmware = getattr(caps, "firmware_version", None) or "unknown"
+            _log.warning(
+                "Ultimate64Client(%s): %sWRITE_MEM_QUERY_THRESHOLD = %d refused, "
+                "keeping %d: this device is not graded post-safe (firmware %s), "
+                "so a lower threshold only moves writes onto the POST path, "
+                "which leaves a /Temp attachment per request. Pass the "
+                "write_mem_query_threshold= constructor kwarg to force it "
+                "deliberately.",
+                host, source, requested, THRESHOLD_POST_RISKY, firmware,
+            )
+            return THRESHOLD_POST_RISKY
+        _log.warning(
+            "Ultimate64Client(%s): honouring %sWRITE_MEM_QUERY_THRESHOLD = %d. "
+            "Prefer the write_mem_query_threshold= constructor kwarg.",
+            host, source, requested,
+        )
+        return requested
 
     def write_mem(self, address: int, data: bytes) -> None:
         """Write bytes to C64 memory via DMA (DESTRUCTIVE).
