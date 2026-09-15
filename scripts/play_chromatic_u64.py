@@ -11,7 +11,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _u64_host import hold_device_lock, require_u64_host  # noqa: E402
 
 from c64_test_harness.sid import SidFile, build_test_psid
 from c64_test_harness.sid_player import play_sid
@@ -182,8 +187,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Play chromatic scale C3-C5 on U64")
     parser.add_argument("--sid", choices=["6581", "8580"], default="6581",
                         help="SID chip model for instrument params (default: 6581)")
-    parser.add_argument("--host", default="192.168.1.81",
-                        help="Ultimate 64 host (default: 192.168.1.81)")
+    parser.add_argument("--host", default=None,
+                        help="Ultimate 64 host/IP (or set $U64_HOST). No default.")
     parser.add_argument("--save", metavar="PATH",
                         help="Save PSID to file (e.g. /tmp/chromatic.sid)")
     args = parser.parse_args()
@@ -234,20 +239,26 @@ def main() -> None:
     print()
 
     # Play on U64
-    print(f"Connecting to Ultimate 64 at {args.host} ...")
-    transport = Ultimate64Transport(host=args.host)
+    host = require_u64_host(
+        args.host, argv0="python3 scripts/play_chromatic_u64.py",
+        usage="python3 scripts/play_chromatic_u64.py --host <HOST>",
+    )
+    # sid_play replaces the program on the machine: hold the lock (#244).
+    with hold_device_lock(host):
+        print(f"Connecting to Ultimate 64 at {host} ...")
+        transport = Ultimate64Transport(host=host)
 
-    print("Calling play_sid() ...")
-    play_sid(transport, sf)
-    print(f"Playing chromatic scale for {meta['duration_s']:.1f}s ...")
+        print("Calling play_sid() ...")
+        play_sid(transport, sf)
+        print(f"Playing chromatic scale for {meta['duration_s']:.1f}s ...")
 
-    time.sleep(meta["duration_s"] + 1.0)
+        time.sleep(meta["duration_s"] + 1.0)
 
-    print()
-    print("Resetting device to stop audio...")
-    transport._client.reset()
-    transport.close()
-    print("Done.")
+        print()
+        print("Resetting device to stop audio...")
+        transport._client.reset()
+        transport.close()
+        print("Done.")
 
 
 if __name__ == "__main__":

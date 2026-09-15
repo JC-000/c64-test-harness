@@ -13,7 +13,24 @@ _AUTO_CHUNK_THRESHOLD = 256
 #: VICE's text monitor silently truncates ``>`` (write) commands at ~261
 #: characters, which corresponds to 84 data bytes.  Writes larger than
 #: this threshold are automatically split into multiple commands.
+#: Used by :func:`write_bytes` for any transport that does not report a
+#: REST PUT chunk size; an Ultimate transport chunks at its client's
+#: threshold instead (#252).  Kept importable for downstream callers.
 _WRITE_CHUNK_SIZE = 84
+
+
+def _write_chunk_size(transport: object) -> int:
+    """Chunk size :func:`write_bytes` uses for *transport*.
+
+    An Ultimate transport reports ``rest_put_chunk_size`` (its client's
+    ``write_mem_query_threshold``, capped at the PUT limit), so every
+    chunk takes the leak-free PUT form on any firmware grade.  Anything
+    else — VICE, test doubles — keeps :data:`_WRITE_CHUNK_SIZE`.
+    """
+    size = getattr(transport, "rest_put_chunk_size", None)
+    if isinstance(size, int) and not isinstance(size, bool) and size > 0:
+        return size
+    return _WRITE_CHUNK_SIZE
 
 
 class ShortReadError(Exception):
@@ -147,15 +164,22 @@ def write_bytes(transport: C64Transport, addr: int, data: bytes | list[int]) -> 
     characters (84 data bytes).  This function transparently splits
     larger writes into *_WRITE_CHUNK_SIZE*-byte pieces so callers
     never need to worry about the limit.
+
+    On an Ultimate transport the chunk is the transport's
+    ``rest_put_chunk_size`` instead — the client's
+    ``write_mem_query_threshold`` (128 leak-prone, 48 post-safe) — so
+    each chunk takes the PUT form and none leaves a ``/Temp`` attachment,
+    whatever the device grade (#252, #247).
     """
     if isinstance(data, list):
         data = bytes(data)
-    if len(data) <= _WRITE_CHUNK_SIZE:
+    chunk = _write_chunk_size(transport)
+    if len(data) <= chunk:
         transport.write_memory(addr, data)
         return
     offset = 0
     while offset < len(data):
-        end = min(offset + _WRITE_CHUNK_SIZE, len(data))
+        end = min(offset + chunk, len(data))
         transport.write_memory(addr + offset, data[offset:end])
         offset = end
 

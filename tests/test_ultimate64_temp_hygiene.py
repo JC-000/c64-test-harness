@@ -123,21 +123,29 @@ def test_arming_is_not_keyed_on_the_device_address():
 
 
 def test_transport_write_memory_above_threshold_is_accounted():
-    """The raw transport large-write path leaks and must be counted.
+    """The raw client large-write path leaks and must be counted; the
+    transport no longer reaches it on a leak-prone grade (#252).
 
-    ``Ultimate64Transport.write_memory`` does not chunk: above the
-    threshold it hands the whole payload to ``client.write_mem``, which
-    takes the body-POST path. A consumer doing hundreds of such writes
-    in one run is a wedge with no ``run_prg`` anywhere in it.
+    ``client.write_mem`` above the threshold takes the body-POST path, and
+    that attachment is counted. ``Ultimate64Transport.write_memory`` now
+    chunks at the threshold on a device not graded post-safe, so the same
+    256 bytes arrive as two leak-free PUTs and cost nothing.
     """
     from c64_test_harness.backends.ultimate64 import Ultimate64Transport
 
     c = _client(LEAKY)
+    mock, captured = _urlopen_mock()
+    with patch("urllib.request.urlopen", mock):
+        c.write_mem(0xC000, b"x" * 256)
+    assert c.pending_temp_attachments == 1
+
+    c = _client(LEAKY)
     t = Ultimate64Transport(host="fake-host", client=c)
-    mock, _ = _urlopen_mock()
+    mock, captured = _urlopen_mock()
     with patch("urllib.request.urlopen", mock):
         t.write_memory(0xC000, b"x" * 256)
-    assert c.pending_temp_attachments == 1
+    assert [r.get_method() for r in captured] == ["PUT", "PUT"]
+    assert c.pending_temp_attachments == 0
 
 
 def test_uci_socket_write_shape_is_accounted_per_attachment():
@@ -666,11 +674,54 @@ def test_close_drains_pending_attachments():
     assert c.pending_temp_attachments == 0
 
 
-def test_close_does_not_drain_when_nothing_leaked():
+def _lock_held(value: bool):
+    return patch(
+        "c64_test_harness.backends.device_lock.DeviceLock.held_by_this_process",
+        return_value=value,
+    )
+
+
+def test_close_sweeps_inherited_temp_when_this_client_leaked_nothing():
+    """#264: this used to pin the early return as correct. The wedge is a
+    property of the device, not of this object: ``gc_temp_folder`` sweeps
+    ``/Temp`` device-wide, so declining it because *this* client's counter
+    is zero leaves a crashed neighbour's attachments in place for the next
+    lane. Arming, not the counter, is what keeps fake hosts off FTP.
+
+    Round 1: an inherited-only sweep deletes other lanes' attachments, so
+    on the ``close()`` path it runs only under this process's DeviceLock.
+    """
     c = _client(LEAKY)
-    with patch.object(c, "gc_temp_folder") as gc:
+    assert c.pending_temp_attachments == 0
+    with _lock_held(True), patch.object(
+        c, "gc_temp_folder", return_value=TempGCResult(host="fake-host")
+    ) as gc:
+        c.close()
+    gc.assert_called_once()
+
+
+def test_close_does_not_sweep_inherited_temp_without_the_device_lock():
+    """An unlocked read-only client must not delete another lane's /Temp
+    attachments (review round 1, E1b). Nothing on close() -> drain ->
+    gc_temp_folder takes the lock, so the drain has to ask."""
+    c = _client(LEAKY)
+    with _lock_held(False), patch.object(c, "gc_temp_folder") as gc:
         c.close()
     gc.assert_not_called()
+
+
+def test_close_still_drains_what_this_client_leaked_without_the_lock():
+    """The pre-#264 behaviour for a client that DID leak is unchanged:
+    its own attachments are collected on close whether or not it holds
+    the lock (restricting that is not this change's call)."""
+    c = _client(LEAKY)
+    mock, _ = _urlopen_mock()
+    with _lock_held(False), patch.object(
+        c, "gc_temp_folder", return_value=TempGCResult(host="fake-host")
+    ) as gc, patch("urllib.request.urlopen", mock):
+        c.run_prg(b"\x01\x08x")
+        c.close()
+    gc.assert_called_once()
 
 
 def test_device_lock_release_drains_the_client(tmp_path):
@@ -858,3 +909,437 @@ def test_the_arming_docstring_does_not_resurrect_the_closed_hole():
     assert "arms from the second" in flat
     # the still-true half
     assert "never probes" in flat
+
+
+# --------------------------------------------------------------------------- #
+# #250: the liveness probe is accounted and gated like every other POST       #
+# --------------------------------------------------------------------------- #
+
+def _device_urlopen():
+    """A fake device: POST writemem stores, GET readmem returns what is there.
+
+    Returns ``(mock, wire, ram)``. ``wire`` records ``(method, url)`` per
+    request so a test counts the body-carrying POSTs on the wire rather than
+    trusting the counter alone.
+    """
+    import json as _json
+    import urllib.parse as _up
+
+    ram = bytearray(0x10000)
+    wire: list[tuple[str, str]] = []
+
+    def _fake(req, timeout=None):
+        method = req.get_method()
+        url = req.full_url
+        wire.append((method, url))
+        parsed = _up.urlparse(url)
+        q = dict(_up.parse_qsl(parsed.query))
+        if parsed.path == "/v1/info":
+            return _FakeResponse(_json.dumps({"firmware_version": "1.1.0"}).encode())
+        if parsed.path == "/v1/machine:readmem":
+            addr, length = int(q["address"], 16), int(q["length"])
+            return _FakeResponse(bytes(ram[addr:addr + length]))
+        if parsed.path == "/v1/machine:writemem" and method == "POST":
+            addr = int(q["address"], 16)
+            ram[addr:addr + len(req.data)] = req.data
+        return _FakeResponse()
+
+    return MagicMock(side_effect=_fake), wire, ram
+
+
+def _reachable():
+    return patch(
+        "c64_test_harness.backends.ultimate64_probe.probe_u64",
+        return_value=MagicMock(reachable=True, error=None),
+    )
+
+
+def _writemem_posts(wire):
+    return [u for m, u in wire if m == "POST" and "machine:writemem" in u]
+
+
+def test_liveness_probe_counts_both_of_its_posts():
+    """Measured on the C64U: one probe, two attachments (#250).
+
+    The probe used to build its own ``urllib`` requests and never reach the
+    client's choke point, so the counter read zero while ``/Temp`` gained two.
+    """
+    c = _client(LEAKY)
+    mock, wire, _ = _device_urlopen()
+    with _reachable(), patch.object(c, "gc_temp_folder") as gc, \
+            patch("urllib.request.urlopen", mock):
+        result = c.liveness_probe()
+    assert result.healthy, result
+    assert len(_writemem_posts(wire)) == 2, "sanity: probe write + restore"
+    assert c.pending_temp_attachments == 2
+    gc.assert_not_called()
+
+
+def test_liveness_probe_is_refused_once_hygiene_is_known_impossible():
+    c = _client(LEAKY, temp_gc_budget=1)
+    mock, wire, _ = _device_urlopen()
+    with _reachable(), \
+            patch.object(c, "gc_temp_folder", side_effect=lambda **kw: _refused()), \
+            patch.object(c, "set_config_item"), \
+            patch("urllib.request.urlopen", mock):
+        c.run_prg(b"\x01\x08x")
+        with pytest.raises(Ultimate64TempHygieneError):
+            c.run_prg(b"\x01\x08x")          # hygiene now proven impossible
+        wire.clear()
+        with pytest.raises(Ultimate64TempHygieneError):
+            c.liveness_probe()
+        with pytest.raises(Ultimate64TempHygieneError):
+            c.assert_healthy()
+    assert _writemem_posts(wire) == []
+
+
+def test_liveness_probe_makes_room_for_both_attachments_before_it_starts():
+    """The pass runs *before* the probe when its two POSTs would overrun.
+
+    Budget 3 with two spent: 2 + 2 > 3, so the pass runs first. A
+    single-attachment check (2 >= 3 is false) would let the probe take the
+    device to 4 uncollected.
+    """
+    c = _client(LEAKY, temp_gc_budget=3)
+    mock, wire, _ = _device_urlopen()
+    order: list[str] = []
+
+    def _gc(**kw):
+        order.append(f"gc@{len(_writemem_posts(wire))}")
+        return TempGCResult(host="fake-host")
+
+    with _reachable(), patch.object(c, "gc_temp_folder", side_effect=_gc) as gc, \
+            patch("urllib.request.urlopen", mock):
+        c.run_prg(b"\x01\x08x")
+        c.run_prg(b"\x01\x08x")
+        assert c.pending_temp_attachments == 2
+        c.liveness_probe()
+    assert gc.call_count == 1
+    assert order == ["gc@0"], "the pass must precede the probe's first POST"
+    assert c.pending_temp_attachments == 2
+
+
+def test_liveness_probe_restore_is_never_the_request_that_gets_refused():
+    """A refusal between the probe write and its restore would leave the
+    probe pattern in RAM at $0334 (``_restore_quiet`` swallows every
+    exception). So the whole two-attachment cost is reserved up front: when
+    hygiene fails, the probe is refused before it writes anything.
+    """
+    c = _client(LEAKY, temp_gc_budget=2)
+    mock, wire, _ = _device_urlopen()
+    with _reachable(), \
+            patch.object(c, "gc_temp_folder", side_effect=lambda **kw: _refused()), \
+            patch.object(c, "set_config_item"), \
+            patch("urllib.request.urlopen", mock):
+        c.run_prg(b"\x01\x08x")               # 1 spent; 1 + 2 > 2
+        wire.clear()
+        with pytest.raises(Ultimate64TempHygieneError):
+            c.liveness_probe()
+    assert _writemem_posts(wire) == []
+
+
+def test_liveness_probe_price_is_stated_where_callers_read_it():
+    for fn in (Ultimate64Client.liveness_probe, Ultimate64Client.assert_healthy):
+        flat = _flat(fn.__doc__)
+        assert "two /Temp attachments" in flat, fn.__name__
+    assert Ultimate64Client.LIVENESS_PROBE_TEMP_ATTACHMENTS == 2
+
+
+def test_free_liveness_probe_docstring_counts_the_restore():
+    from c64_test_harness.backends.ultimate64_probe import liveness_probe
+
+    flat = _flat(liveness_probe.__doc__)
+    assert "exactly one writemem POST" not in flat
+    assert "two body-carrying POSTs" in flat
+
+
+# --------------------------------------------------------------------------- #
+# #264: the drain sweeps the device, not just this client's own leaks         #
+# --------------------------------------------------------------------------- #
+
+def test_lock_release_sweeps_inherited_temp_when_this_client_leaked_nothing(tmp_path):
+    """A lane that inherits a dirty /Temp from a crashed neighbour must sweep
+    it on the way out; the sweep is device-wide and idempotent."""
+    from c64_test_harness.backends.device_lock import DeviceLock
+
+    c = _client(LEAKY)
+    assert c.pending_temp_attachments == 0
+    with patch.object(
+        c, "gc_temp_folder", return_value=TempGCResult(host="fake-host")
+    ) as gc:
+        lock = DeviceLock("fake-host", lock_dir=tmp_path)
+        assert lock.acquire(timeout=5.0)
+        lock.release()
+    gc.assert_called_once()
+
+
+def test_disarmed_clients_with_nothing_leaked_do_not_sweep():
+    """The off-the-network property rides on arming, not on the counter."""
+    for caps in (FIXED, NO_ANSWER):
+        c = _client(caps)
+        with patch.object(c, "gc_temp_folder") as gc:
+            c.close()
+        gc.assert_not_called()
+
+
+def test_a_failed_inherited_sweep_neither_enables_ftp_nor_blocks(
+    tmp_path, caplog: pytest.LogCaptureFixture
+):
+    """Review round 1, E1: a lane that only made bodyless calls must not
+    write ``Network Settings > FTP File Service`` -- a BASELINE_NEVER_TOUCH
+    store, persisting until a firmware power-on, and an anonymous file
+    service on a device whose Network Password defaults empty (#263 is the
+    owner's call). So an inherited-only sweep that fails logs the manual
+    remedy and leaves this client unblocked: it has spent nothing."""
+    from c64_test_harness.backends.device_lock import DeviceLock
+
+    c = _client(LEAKY)
+    mock, captured = _urlopen_mock()
+    with patch.object(c, "gc_temp_folder", side_effect=lambda **kw: _refused()) as gc, \
+            patch.object(c, "set_config_item") as set_item, \
+            patch("urllib.request.urlopen", mock), \
+            caplog.at_level("WARNING"):
+        lock = DeviceLock("fake-host", lock_dir=tmp_path)
+        assert lock.acquire(timeout=5.0)
+        lock.release()
+        assert gc.call_count == 1
+        set_item.assert_not_called()
+        assert c._temp_hygiene_blocked is None
+        c.run_prg(b"\x01\x08x")            # not refused
+    assert len(captured) == 1
+    warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    inherited = [m for m in warned if "inherited sweep" in m]
+    assert len(inherited) == 1, warned
+    # The remedy is the point of the WARNING (mutation R11 survived a
+    # check that matched only words the message repeats elsewhere).
+    assert "enable FTP File Service manually" in inherited[0]
+    assert "power-cycled" in inherited[0]
+    assert "issue #263" in inherited[0]
+
+
+def test_a_failed_sweep_by_a_lane_that_leaked_keeps_the_existing_behaviour():
+    """#263 is the owner's: a client that DID leak still gets the one
+    FTP-enable attempt and then blocks. Pinned so the round-1 carve-out
+    for inherited-only sweeps cannot widen into it unnoticed."""
+    c = _client(LEAKY)
+    mock, _ = _urlopen_mock()
+    with patch.object(c, "gc_temp_folder", side_effect=lambda **kw: _refused()), \
+            patch.object(c, "set_config_item") as set_item, \
+            patch("urllib.request.urlopen", mock):
+        c.run_prg(b"\x01\x08x")
+        c.close()
+        set_item.assert_called_once_with(
+            "Network Settings", "FTP File Service", "Enabled"
+        )
+        with pytest.raises(Ultimate64TempHygieneError):
+            c.run_prg(b"\x01\x08x")
+
+
+# --------------------------------------------------------------------------- #
+# Review round 1, finding 2: correct behaviours that mutations showed unpinned #
+# --------------------------------------------------------------------------- #
+
+def test_a_post_that_raises_mid_request_is_still_counted():
+    """The firmware writes the attachment as the body streams in, so a
+    request that fails afterwards has still left one behind."""
+    from c64_test_harness.backends.ultimate64_client import Ultimate64Error
+
+    c = _client(LEAKY)
+    with patch("urllib.request.urlopen", side_effect=ConnectionResetError("rst")):
+        with pytest.raises(Ultimate64Error):
+            c.run_prg(b"\x01\x08x")
+    assert c.pending_temp_attachments == 1
+
+
+def test_a_fresh_budget_one_client_probes_without_sweeping_first():
+    """Kept behaviour, stated in ``_before_temp_attachment``: with nothing
+    pending a pass could collect nothing this client spent, so the
+    two-attachment reservation does not sweep; the probe runs one over a
+    budget of 1 and the next attachment-creating request sweeps."""
+    c = _client(LEAKY, temp_gc_budget=1)
+    mock, wire, _ = _device_urlopen()
+    with _reachable(), patch.object(
+        c, "gc_temp_folder", return_value=TempGCResult(host="fake-host")
+    ) as gc, patch("urllib.request.urlopen", mock):
+        c.liveness_probe()
+        gc.assert_not_called()
+        assert c.pending_temp_attachments == 2
+        c.run_prg(b"\x01\x08x")
+        gc.assert_called_once()
+
+
+def test_a_probe_post_that_raises_mid_request_is_still_counted():
+    """Review round 2: the probe's own sender counts in ``finally`` too.
+
+    ``test_a_post_that_raises_mid_request_is_still_counted`` drives
+    ``_request``; this drives ``liveness_probe``'s sender. A writemem POST
+    that dies with a TCP reset has still streamed its body into ``/Temp``,
+    and the probe swallows the reset into a ``connection_reset`` result,
+    so nothing else would ever notice the attachment.
+    """
+    c = _client(LEAKY)
+    mock, wire, _ = _device_urlopen()
+
+    def _reset_on_post(req, timeout=None):
+        if req.get_method() == "POST":
+            wire.append((req.get_method(), req.full_url))
+            raise ConnectionResetError("reset mid-body")
+        return mock(req, timeout=timeout)
+
+    with _reachable(), patch.object(c, "gc_temp_folder") as gc, \
+            patch("urllib.request.urlopen", side_effect=_reset_on_post):
+        result = c.liveness_probe()
+    assert result.failure == "connection_reset", result
+    assert len(_writemem_posts(wire)) == 1, "sanity: the probe write only, no restore"
+    assert c.pending_temp_attachments == 1
+    gc.assert_not_called()
+
+
+def test_the_probe_sender_runs_the_advisory_lock_check_per_post():
+    c = _client(LEAKY)
+    mock, _, _ = _device_urlopen()
+    with _reachable(), patch.object(c, "gc_temp_folder"), \
+            patch.object(c, "_check_device_lock") as check, \
+            patch("urllib.request.urlopen", mock):
+        c.liveness_probe()
+    assert [a.args[0] for a in check.call_args_list] == [
+        "POST /v1/machine:writemem", "POST /v1/machine:writemem",
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# #242: a SocketDMA write that falls back to REST is an attachment            #
+# --------------------------------------------------------------------------- #
+
+class _FakeDMA:
+    """Minimal SocketDMAClient stand-in; never touches a socket."""
+
+    def __init__(self, *, connect_error=False, identify_error=False):
+        self.connect_error = connect_error
+        self.identify_error = identify_error
+        self.enter_count = 0
+        self.dma_calls = 0
+
+    def __enter__(self):
+        from c64_test_harness.backends.ultimate64_client import Ultimate64Error
+
+        self.enter_count += 1
+        if self.connect_error:
+            raise Ultimate64Error("fake connect refused")
+        return self
+
+    def __exit__(self, *exc):
+        return None
+
+    def close(self):
+        return None
+
+    def dma_write(self, address, data):
+        self.dma_calls += 1
+
+    def identify(self):
+        from c64_test_harness.backends.ultimate64_client import Ultimate64Error
+
+        if self.identify_error:
+            raise Ultimate64Error("fake barrier: closed by peer")
+        return {"title": "FAKE"}
+
+
+def _dma_transport(monkeypatch, client, fake):
+    from c64_test_harness.backends.ultimate64 import Ultimate64Transport
+
+    monkeypatch.setattr(
+        "c64_test_harness.backends.ultimate64.SocketDMAClient",
+        lambda **kw: fake,
+    )
+    return Ultimate64Transport(host="fake-host", client=client, socket_dma=True)
+
+
+def _bulk(n=8192):
+    return bytes(i % 251 for i in range(n))
+
+
+def test_socket_dma_fast_path_costs_no_attachment(monkeypatch):
+    """Positive control for the fallback tests below: same transport, same
+    payload, the fast path succeeds -- nothing POSTed, nothing counted."""
+    c = _client(LEAKY)
+    fake = _FakeDMA()
+    t = _dma_transport(monkeypatch, c, fake)
+    data = _bulk()
+    mock, wire, ram = _device_urlopen()
+    ram[0x4000:0x4000 + len(data)] = data   # as the DMA would have left it
+    with patch("urllib.request.urlopen", mock):
+        t.write_memory(0x4000, data)
+    assert fake.dma_calls > 0
+    assert wire, "sanity: the tail read-back went over REST"
+    assert _writemem_posts(wire) == []
+    assert c.pending_temp_attachments == 0
+
+
+#: The REST fallback's wire shape depends on whether the transport chunks
+#: for this grade (the chunking lane, #252, moves leak-prone writes onto
+#: PUT). ``FIXED`` with hygiene forced on is the grade on which the fallback
+#: is a whole-payload POST on every branch, so exact counts and the refusal
+#: are pinned there; the leak-prone grade is held to the invariant that
+#: matters on any branch -- every body-carrying POST is counted.
+
+
+def _armed_fixed_client(**kwargs) -> Ultimate64Client:
+    return _client(FIXED, temp_hygiene=True, **kwargs)
+
+
+def test_socket_dma_connect_fallback_is_accounted_and_the_latch_keeps_leaking(monkeypatch):
+    """A refused connect latches the fast path off for the transport's
+    lifetime (``_socket_dma_unusable`` is never cleared), so every later
+    bulk write takes REST -- each POST counted."""
+    c = _armed_fixed_client()
+    fake = _FakeDMA(connect_error=True)
+    t = _dma_transport(monkeypatch, c, fake)
+    mock, wire, _ = _device_urlopen()
+    with patch("urllib.request.urlopen", mock):
+        t.write_memory(0x4000, _bulk())
+        t.write_memory(0x6000, _bulk())
+    assert fake.enter_count == 1, "sanity: latched after the first failure"
+    assert fake.dma_calls == 0
+    assert len(_writemem_posts(wire)) == 2
+    assert c.pending_temp_attachments == 2
+
+
+def test_socket_dma_barrier_fallback_is_accounted(monkeypatch):
+    c = _armed_fixed_client()
+    fake = _FakeDMA(identify_error=True)
+    t = _dma_transport(monkeypatch, c, fake)
+    mock, wire, _ = _device_urlopen()
+    with patch("urllib.request.urlopen", mock):
+        t.write_memory(0x4000, _bulk())
+    assert fake.enter_count == 2, "sanity: one retry on a fresh connection"
+    assert len(_writemem_posts(wire)) == 1
+    assert c.pending_temp_attachments == 1
+
+
+@pytest.mark.parametrize("fake_kwargs", [
+    {"connect_error": True}, {"identify_error": True},
+], ids=["connect", "barrier"])
+def test_socket_dma_fallback_on_leak_prone_grade_counts_every_post(monkeypatch, fake_kwargs):
+    c = _client(LEAKY)
+    fake = _FakeDMA(**fake_kwargs)
+    t = _dma_transport(monkeypatch, c, fake)
+    mock, wire, _ = _device_urlopen()
+    with patch("urllib.request.urlopen", mock):
+        t.write_memory(0x4000, _bulk())
+    assert any("machine:writemem" in u for _, u in wire), "sanity: REST fallback ran"
+    assert c.pending_temp_attachments == len(_writemem_posts(wire))
+
+
+def test_socket_dma_fallback_is_refused_once_hygiene_is_known_impossible(monkeypatch):
+    c = _armed_fixed_client(temp_gc_budget=1)
+    fake = _FakeDMA(connect_error=True)
+    t = _dma_transport(monkeypatch, c, fake)
+    mock, wire, _ = _device_urlopen()
+    with patch.object(c, "gc_temp_folder", side_effect=lambda **kw: _refused()), \
+            patch.object(c, "set_config_item"), \
+            patch("urllib.request.urlopen", mock):
+        t.write_memory(0x4000, _bulk())
+        with pytest.raises(Ultimate64TempHygieneError):
+            t.write_memory(0x6000, _bulk())
+    assert len(_writemem_posts(wire)) == 1

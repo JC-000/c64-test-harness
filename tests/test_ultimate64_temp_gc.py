@@ -220,3 +220,105 @@ def test_auto_gc_enabled_truthy_values(monkeypatch: pytest.MonkeyPatch, val: str
 def test_auto_gc_disabled_falsy_values(monkeypatch: pytest.MonkeyPatch, val: str):
     monkeypatch.setenv(gc_mod.AUTO_GC_ENV, val)
     assert auto_gc_enabled() is False
+
+
+# --------------------------------------------------------------------------- #
+# #261 (dup #256): the RAM disk is 16 MiB, cited by its computation            #
+# --------------------------------------------------------------------------- #
+
+import inspect as _inspect
+import re as _re
+
+#: The stale figures. "31%" is matched with or without a space or tilde.
+_STALE_RAMDISK = _re.compile(r"~?\s*3\s*MB\b|\b31\s*%|945\s*KB\b")
+
+
+def test_stale_ramdisk_scan_detects_what_it_is_looking_for():
+    """Positive control: the scan must fire on each stale phrasing it
+    exists to catch, or a clean result below proves nothing."""
+    for bad in (
+        "a ~3 MB RAM disk",
+        "that is ~31% of it",
+        "at 31% full with 15 entries",
+        "so 945 KB is",
+    ):
+        assert _STALE_RAMDISK.search(bad), bad
+    for good in ("16 MiB", "~5.8%", "967,680 bytes", "63 KB PRG"):
+        assert not _STALE_RAMDISK.search(good), good
+
+
+def test_temp_gc_source_no_longer_states_the_3_mb_ramdisk():
+    from c64_test_harness.backends import ultimate64_temp_gc as mod
+
+    src = _inspect.getsource(mod)
+    # Vacuity guard: this is the file that carries the provenance figure,
+    # both in the module docstring and in the budget comment.
+    assert src.count("63 KB PRG") >= 2
+    assert "DEFAULT_LEAK_BUDGET = " in src
+    hits = [ln.strip() for ln in src.splitlines() if _STALE_RAMDISK.search(ln)]
+    assert hits == []
+    # The durable fix cites the computation, not just a new number -- at
+    # BOTH sites that state the size (module docstring and the budget
+    # comment), since a reader copies from whichever one they found.
+    assert src.count("__ram_disk_start") >= 2
+    assert src.count("__ram_disk_limit") >= 2
+    assert src.count("16 MiB") >= 2
+    assert src.count("967,680") >= 2
+    # Review round 1, finding 3: the reproduction was a U64E on 3.14d and the
+    # C64U runs 1.1.0 -- each figure cites the tree it came from.
+    # Bound to the path, not merely present somewhere in the file: "v3.14d"
+    # and "1.1.0" also occur in unrelated prose (mutation R10 survived a
+    # membership check).
+    flat = _re.sub(r"[\s`]+", " ", src)
+    # #316: the shipped U64E image is the nios2 build, whose linker script
+    # is the BSP's -- cite that tree, and the build chain that selects it.
+    assert _re.search(r"software/nios_appl_bsp/linker\.x at v3\.14d", flat)
+    assert _re.search(r"target/u64/nios2/ultimate/Makefile", flat)
+    assert _re.search(r"target/u64ii/riscv/ultimate/linker\.x at 1\.1\.0", flat)
+    assert "target/u64/riscv/ultimate/linker.x at v3.14d" not in flat
+    assert "is not established. So" not in flat
+    assert "carry no RAM-disk symbols" not in flat
+
+
+def test_budget_comment_prices_uci_writes_by_grade():
+    """#294 chunks ``Ultimate64Transport.write_memory`` into PUT-sized pieces
+    unless the cached grade is ``writemem_post_safe is True``, and UCI
+    routines and payloads go through the transport. So a UCI socket write
+    costs no attachment on a leak-prone or unknown grade; only a post-safe
+    grade (whose firmware collects) or a direct ``client.write_mem`` caller
+    pays. The budget comment used to state the pre-#294 cost unqualified.
+
+    Named limit (#318 review round 2): these are phrase pins. They catch a
+    rewrite of the pinned claims and the specific wrong wordings forbidden
+    below, but not a *contradicting sentence appended* after them (V1: "In
+    practice a UCI socket write still leaks one attachment on the C64U."
+    survives). Proving the paragraph's meaning is beyond a text test; the
+    reviewer accepted this limit.
+    """
+    from c64_test_harness.backends import ultimate64_temp_gc as mod
+
+    src = _inspect.getsource(mod)
+    start = src.index("#: Note the unit:")
+    end = src.index("DEFAULT_LEAK_BUDGET = ")
+    # Strip only the "#:" comment prefixes, so "#294" survives the flattening.
+    note = _re.sub(r"[\s`]+", " ", src[start:end].replace("\n#:", " "))
+    # Vacuity guard: this is the paragraph about UCI costs.
+    assert "build_socket_write" in note and "enable_uci" in note
+    assert "write spends one of the budget for its routine code" not in note
+    assert "writemem_post_safe is True" in note
+    assert "transport.write_memory" in note
+    assert "client.write_mem" in note
+    assert "#294" in note
+    # Review round 1 (#318): keywords let two wrong rewrites through (U1
+    # "costs one attachment ... on every grade", U2 "... which that firmware
+    # never collects"). Pin each grade-bound claim as one contiguous phrase.
+    claim = note.lower()
+    assert ("on a leak-prone or unknown grade (the c64u) a uci socket write "
+            "costs no attachment") in claim
+    assert ("on a post-safe grade the routine, and a payload over the "
+            "ceiling, are one post each, which that firmware collects") in claim
+    assert "on every grade" not in claim
+    assert "never collects" not in claim
+    # The same qualifier applies to the "raw write_memory" parenthetical
+    # above the note: the transport now chunks those on a leak-prone grade.
+    assert "those are lane bugs to fix by chunking" not in src

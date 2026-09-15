@@ -29,13 +29,20 @@ where the answer is knowable. Pass ``overrides=`` to record a probe result.
 """
 from __future__ import annotations
 
+import logging
+import os
 import re
+import sys
+import warnings
 from dataclasses import dataclass, replace
 from typing import Any, Mapping
+
+_log = logging.getLogger(__name__)
 
 __all__ = [
     "DeviceCapabilities",
     "CAPABILITY_NAMES",
+    "CbmFixConstantStaleWarning",
     "THRESHOLD_POST_SAFE",
     "THRESHOLD_POST_RISKY",
 ]
@@ -67,8 +74,97 @@ _ULTIMATE_WRITEMEM_FIXED_FROM = (3, 15)
 
 #: The CBM line has no release carrying that fix yet: tag ``1.1.0`` is not a
 #: descendant of the merge, and no later CBM build has been verified. Set this
-#: to the first fixed version when one ships.
+#: to the first fixed version when one ships — either ``(1, 2)`` or
+#: ``(1, 2, 0)`` works; the comparison pads both sides.
+#:
+#: **Nothing changes on its own while this is ``None``** (#248). The C64U
+#: firmware is the ``u64ii`` build of the same 1541ultimate tree, so a later
+#: release will carry #686 — but it still grades ``writemem_post_safe=False``
+#: here, keeping the device on the 128 threshold and the CLAUDE.md
+#: hardware-safety clause in force after it stopped being true. Staying on
+#: 128 is safe, so the grade does not guess; instead a CBM device reporting a
+#: version above :data:`_CBM_LAST_KNOWN_UNFIXED` while this is still ``None``
+#: emits :class:`CbmFixConstantStaleWarning` (a log line alone is invisible in
+#: a green pytest run) and logs a WARNING, both naming this constant. When you
+#: see it, establish whether that release descends from the #686 merge and
+#: edit this line.
 _CBM_WRITEMEM_FIXED_FROM: tuple[int, ...] | None = None
+
+#: The newest CBM release known to lack #686 (tag ``1.1.0``). Anything newer
+#: is *unverified*, not known-leaky — which is what the #248 notice reports.
+_CBM_LAST_KNOWN_UNFIXED: tuple[int, ...] = (1, 1, 0)
+
+#: Versions the #248 notice has already been logged for in this process. Every
+#: client probes capabilities, so the notice is once per version, not per call.
+_CBM_STALE_NOTICE_ISSUED: set[tuple[int, ...]] = set()
+
+
+def _padded(version: tuple[int, ...]) -> tuple[int, ...]:
+    """``(1, 2)`` -> ``(1, 2, 0)``, so two- and three-part versions order."""
+    return tuple(version) + (0,) * max(0, 3 - len(version))
+
+
+def _dotted(version: tuple[int, ...]) -> str:
+    return ".".join(str(part) for part in version)
+
+
+class CbmFixConstantStaleWarning(UserWarning):
+    """A C64U reports firmware newer than the last release known to lack
+    GideonZ/1541ultimate#686, but ``_CBM_WRITEMEM_FIXED_FROM`` is still
+    ``None``, so it is graded leak-prone without anyone having checked (#248).
+
+    A dedicated category so a suite can escalate or silence exactly this:
+    ``-W error::c64_test_harness.CbmFixConstantStaleWarning``.
+
+    Under an error filter (that one, a generic ``-W error::UserWarning``, or
+    ``filterwarnings = error``) it raises **once per firmware version per
+    process**, from the first ``DeviceCapabilities.from_info``, which in
+    practice is ``Ultimate64Client`` construction. Later probes of the same
+    version in that process do not raise, because the version is recorded
+    as noticed before the warning is issued.
+    """
+
+
+_PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _stacklevel_outside_package() -> int:
+    """``stacklevel`` for a ``warnings.warn`` in the *caller* of this helper
+    that names the first frame outside ``c64_test_harness``: the test or
+    script that built the client, not the client's own property.
+    (``skip_file_prefixes`` would do this, but it needs Python 3.12.)"""
+    frame = sys._getframe(1)
+    level = 1
+    prefix = _PACKAGE_DIR + os.sep
+    while frame is not None and os.path.abspath(frame.f_code.co_filename).startswith(prefix):
+        frame = frame.f_back
+        level += 1
+    return level if frame is not None else 1
+
+
+def _notice_cbm_constant_stale(version: tuple[int, ...]) -> None:
+    """Warn and log, once per version per process, that a newer CBM release
+    is graded unfixed only because :data:`_CBM_WRITEMEM_FIXED_FROM` was never
+    set (#248)."""
+    if version in _CBM_STALE_NOTICE_ISSUED:
+        return
+    _CBM_STALE_NOTICE_ISSUED.add(version)
+    message = (
+        f"C64U firmware {_dotted(version)} is newer than "
+        f"{_dotted(_CBM_LAST_KNOWN_UNFIXED)}, the last CBM release known to lack "
+        "the /Temp fix (GideonZ/1541ultimate#686), but _CBM_WRITEMEM_FIXED_FROM "
+        "in backends/u64_capabilities.py is still None, so it is graded "
+        f"writemem_post_safe=False (threshold {THRESHOLD_POST_RISKY}) without "
+        f"anyone having checked. Establish whether {_dotted(version)} carries "
+        "#686 and set that constant (#248); until then the CLAUDE.md "
+        "hardware-safety clause stays in force."
+    )
+    # Log first: under ``-W error`` the warning raises, and the log line
+    # should survive that.
+    _log.warning("%s", message)
+    warnings.warn(
+        message, CbmFixConstantStaleWarning, stacklevel=_stacklevel_outside_package()
+    )
 
 #: Capabilities that no version string can settle on the ``3.x`` line, because
 #: they landed after the version was bumped. Knowable (and False) elsewhere.
@@ -176,6 +272,17 @@ class DeviceCapabilities:
                     f"known names are {list(CAPABILITY_NAMES)}"
                 )
             caps = replace(caps, **dict(overrides))
+
+        # #248: only once overrides are applied, and only if the final grade
+        # is still False. A probe that pinned writemem_post_safe has checked.
+        if (
+            generation == "cbm"
+            and version is not None
+            and _CBM_WRITEMEM_FIXED_FROM is None
+            and caps.writemem_post_safe is False
+            and _padded(version) > _padded(_CBM_LAST_KNOWN_UNFIXED)
+        ):
+            _notice_cbm_constant_stale(version)
         return caps
 
     @staticmethod
@@ -223,8 +330,9 @@ class DeviceCapabilities:
             return version[:2] >= _ULTIMATE_WRITEMEM_FIXED_FROM
         if generation == "cbm":
             if _CBM_WRITEMEM_FIXED_FROM is None:
+                # The #248 notice is emitted by from_info, after overrides.
                 return False
-            return version[:2] >= _CBM_WRITEMEM_FIXED_FROM
+            return _padded(version) >= _padded(_CBM_WRITEMEM_FIXED_FROM)
         return False
 
     @property

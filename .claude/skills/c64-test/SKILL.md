@@ -67,27 +67,33 @@ When you write a test that can point at the C64U:
   only ever reasoned from the code path rather than measured, and it is
   not an option today, which leaves no fast bulk-write path on a C64U at
   all. The non-leaking bulk route is `write_bytes` /
-  `run_prg_via_sys`, whose 84-byte chunks stay on the PUT path **on a
-  C64U** (84 is under its 128 ceiling; on threshold-48 firmware they take
-  POST, harmless only because that firmware self-collects) — but that is
-  ~196 round trips for 16 KiB and is **untimed** anywhere in this repo
+  `run_prg_via_sys`. On an Ultimate transport these chunk at the
+  transport's `rest_put_chunk_size` (the client threshold, capped at 128),
+  so they stay on the PUT path on **every** grade (#252; on a post-safe
+  device that means more, smaller requests, accepted by owner decision
+  2026-09-15). But on a C64U that is ~128 round trips for 16 KiB, and it
+  is **untimed** anywhere in this repo
   (issue #267), so budget for it being slow. REST POST is the leaking path — a bulk write that falls back to
   REST is the one to watch.
 - **Do not assume an API chunks because its name suggests it.**
-  `execute.load_code()` is a bare alias for `transport.write_memory` and
-  `_execute_uci_routine` writes its routine directly; neither chunks, and most
-  assembled blobs are over 128 bytes (UCI builders 133-170, tripled by
-  `turbo_safe=True`; RR-Net builders 193-754). A UCI socket write
-  therefore costs one attachment for its routine code, plus a second
-  **only if the payload itself exceeds 128** — two for the 800/892-byte
-  large-send tests, one for a small write. `enable_uci`/`disable_uci`
+  `execute.load_code()` is a bare alias for `transport.write_memory`, and
+  `_execute_uci_routine` writes its routine through `transport.write_memory`
+  as well (`uci_network.py:1780`). Most assembled blobs are over 128 bytes
+  (UCI builders 133-170, tripled by `turbo_safe=True`; RR-Net builders
+  193-754). Since #252, `transport.write_memory` chunks at the client
+  threshold on any grade that is not post-safe. On a C64U a UCI socket
+  write through the transport is therefore all PUTs and costs **no**
+  attachment for its routine code or its payload; on a post-safe device
+  each over-threshold write is one collected POST. Before #252 it cost one
+  attachment for the routine, plus a second when the payload exceeded 128.
+  A direct `client.write_mem` call still does not chunk. `enable_uci`/`disable_uci`
   cost nothing (bodyless config PUTs). Note too that UCI driven from
   host Python costs a POST per operation, while the same protocol driven
   C64-side inside an uploaded PRG costs only the upload — so moving a
   many-operation loop onto the 6510 eliminates the leak. The
-  thing that does chunk is `memory.write_bytes` at 84 B, which is why
-  `run_prg_via_sys` costs nothing on a C64U and bare `client.run_prg()`
-  costs one per call.
+  `memory.write_bytes` chunks at the transport's `rest_put_chunk_size` on
+  every grade (#252), which is why `run_prg_via_sys` costs nothing on a
+  C64U, while bare `client.run_prg()` costs one per call.
 - **Never loop an upload.** A parametrised test or retry loop that
   re-uploads a PRG is the exact re-upload shape that wedged the device.
 - **Hold the `DeviceLock` across the whole run**, hygiene included, and
@@ -179,9 +185,11 @@ and why validation here is local-only, is `docs/development.md`
 
 20. **Use the public `target.client` / `transport.client` accessors** for U64 low-level operations not yet wrapped on the transport — e.g. `client.run_prg`, `client.mount_disk`, `client.reset`, `client.reboot`, `client.send_text`, `client.sid_play`. Never reach `target.transport._client` or `transport._client`; those private attrs are internal and may be renamed without notice.
 
-21. **`lock_timeout` now bounds against wedged/dead holders only — not healthy long-running peers.** `DeviceLock` heartbeats the lockfile mtime every ~15 s while held, and `acquire(progress_window=60.0)` (the default) extends a waiter's deadline indefinitely as long as the holder PID is alive AND the lockfile mtime is fresh. So a peer running a multi-hour suite no longer causes you to time out — bumping `lock_timeout` past 60 s only helps against **wedged or dead** holders, which is rarely what you want. 120 s is a reasonable ceiling for ad-hoc work. Use `lock.acquire_or_raise(timeout=...)` (and `_LockedU64Manager.acquire()` via `create_manager`) to surface a structured `DeviceLockTimeout` with `holder_pid`, `pid_alive`, `lockfile_age_seconds`, `device_reachable_rest`, and a diagnosed-state message ("queued behind live, progressing PID X" / "holder PID X is alive but the lockfile hasn't been touched in Ns" / "stale lock from dead PID X" / "no holder metadata found", plus a REST-reachability suffix). `DeviceLockTimeout` is exported from the top-level package and is a `TimeoutError` subclass. Pass `progress_window=None` to opt out of queue-aware behavior (legacy hard timeout). Never reboot the U64 in response to a `DeviceLockTimeout` without first checking `pid_alive` and `device_reachable_rest` — see PATTERNS § "Pattern 9a".
+21. **`lock_timeout` now bounds against wedged/dead holders only — not healthy long-running peers.** `DeviceLock` heartbeats the lockfile mtime every ~15 s while held, and `acquire(progress_window=60.0)` (the default) extends a waiter's deadline indefinitely as long as the holder PID is alive AND the lockfile mtime is fresh. So a peer running a multi-hour suite no longer causes you to time out — bumping `lock_timeout` past 60 s only helps against **wedged or dead** holders, which is rarely what you want. Use `lock.acquire_or_raise(timeout=...)` (and `_LockedU64Manager.acquire()` via `create_manager`) to surface a structured `DeviceLockTimeout` with `holder_pid`, `pid_alive`, `lockfile_age_seconds`, `device_reachable_rest`, and a diagnosed-state message ("queued behind live, progressing PID X" / "holder PID X is alive but the lockfile hasn't been touched in Ns" / "stale lock from dead PID X" / "no holder metadata found", plus a REST-reachability suffix). `DeviceLockTimeout` is exported from the top-level package and is a `TimeoutError` subclass. Pass `progress_window=None` to opt out of queue-aware behavior (legacy hard timeout). Never reboot the U64 in response to a `DeviceLockTimeout` without first checking `pid_alive` and `device_reachable_rest` — see PATTERNS § "Pattern 9a".
 
 21a. **An unlocked `Ultimate64Client` now says so, once per process.** Constructing one while this process holds no `DeviceLock` for that host logs a WARNING naming the lockfile. It is a notice, not a refusal — the client still works — but if you see it in your own lane, you are the careless lane of issue #194: `run_prg` is a load-and-run that **resets the machine and replaces whatever program is on it**, so an unlocked one destroys a neighbouring lane's run and presents as device degradation. Silence it only when you mean it (`Ultimate64Client(host, warn_unlocked=False)`, `U64_UNLOCKED_CLIENT_WARNING=0`, or the thread-scoped `suppress_unlocked_warning()`); `create_manager` already suppresses it around the one construction that legitimately precedes the lock. To ask who holds a device **right now** without importing the manager machinery, use `device_lock_holder(host)` — **not** `read_info()`, which names whoever held it *last* and keeps naming a dead PID after every completed run, because `release()` deliberately does not unlink the lockfile. `device_lock_path(host)` gives the path. See `docs/device_locking.md`.
+
+21b. **The acquire budget is `U64_DEVICE_LOCK_TIMEOUT` — a budget, not a gate.** Where a caller passes no timeout, the variable supplies it, read at call time; unset, `DeviceLock.acquire()` waits 30 s (`DEFAULT_ACQUIRE_TIMEOUT`) and `create_manager()` 60 s (`unified_manager.DEFAULT_LOCK_TIMEOUT`). An explicit `timeout=` / `lock_timeout=` wins. It changes how long a wait may last, never whether anything runs, so it is the knob for a longer queue without editing code; a live, progressing holder still extends the deadline regardless. A malformed, zero/negative or non-finite value raises `DeviceLockTimeoutConfigError` (a `ValueError`, so `except TimeoutError` does not swallow a typo). A blocked acquire is not silent: it logs a periodic progress line (holder PID, lockfile age, queue depth; `STALE, holder may be wedged` only when acquire is not extending) and `acquire(..., on_wait=cb)` / `acquire_or_raise(..., on_wait=cb)` calls `cb(elapsed, holder_pid, lockfile_age, queue_depth)` from the waiting thread; an exception from `cb` abandons the wait. Another thread can rescue a wait on a lock this thread already holds only within the 2.0 s grace (`_SELF_HELD_WAIT_GRACE`): a longer timeout is capped with a WARNING, and a later release is too late (`acquire()` returns `False`). For one owner re-entering, pass `allow_nested=True` instead. See `docs/device_locking.md` § "The acquire budget", § "Seeing the wait" and § "Rescuing a self-held wait from another thread".
 
 22. **For U64 unresponsive scenarios, know `recover(client)`'s blind spot before reaching for it.** `recover()` (in `ultimate64_helpers`) escalates `reset()` → probe → `reboot()` → probe — but its liveness probe is **REST-only**, so for wedges below REST (FPGA / REU / DMA / UCI state, where REST typically stays healthy) it returns `"reset"` without fixing anything. For FPGA-tier symptoms call `client.reboot()` directly. The UCI STATE-bit wedge (issue #112) survives even `reboot()` — fail fast and require a physical power-cycle. Never call `poweroff()` for recovery: it disconnects the device until manual physical power-cycle. Use `runner_health_check(client)` to detect the firmware's "Cannot open file" wedged-runner state before resorting to recovery. See PATTERNS § "Recovering a stuck Ultimate 64".
 
@@ -193,7 +201,7 @@ and why validation here is local-only, is `docs/development.md`
 
 26. **`watch_progress(transport, addresses=...)` is now backend-agnostic.** PR #123 (9e6dd29) lifted it from `Ultimate64Client.read_mem` to the `C64Transport.read_memory` protocol — re-exported as `from c64_test_harness import watch_progress, ProgressEvent`. Use it instead of hand-rolled `time.monotonic()` polling loops when watching a sentinel or progress counter; the generator emits `Advanced` / `Stalled` / `Finished` / `Timeout` / `PollError` events (default `poll_interval` is 10 s — set it) with elapsed timing and changed-region diffs. The legacy `from c64_test_harness.backends.ultimate64_helpers import watch_progress` path is preserved as a backwards-compat shim — new code should use the top-level import.
 
-27. **Two Ultimate hardware generations exist — detect via `client.get_info()["product"]`, never assume.** `"Ultimate 64 Elite"` (fw 3.14/3.15) vs `"C64 Ultimate"` (fw 1.1.0). Live-verified asymmetries: CPU-speed enum (Elite has `" 5"` not `"64"`, C64U the reverse; foreign speeds raise `ValueError` locally via a cached preset probe, with the firmware's HTTP 400 as backstop when the probe is inconclusive), Cartridge presets (only U64E 3.14 had a `"REU"` preset; U64E 3.15 made `Cartridge` a `.crt` chooser and the C64U has no `"REU"` preset either — `set_reu`/`restore_state` probe and adapt; don't hand-write that config item), and the C64U's REST `POST writemem` degrading to ~6 s/request at ≥16 KiB. For bulk writes use `write_bytes` / `run_prg_via_sys` (84-byte chunks, PUT path on a C64U) — **do not enable the SocketDMA write fast path (`transport.socket_dma`); it is disabled pending a stability review**. See PATTERNS § "Pattern 10 / Two device generations" and § "SocketDMA write fast path".
+27. **Two Ultimate hardware generations exist — detect via `client.get_info()["product"]`, never assume.** `"Ultimate 64 Elite"` (fw 3.14/3.15) vs `"C64 Ultimate"` (fw 1.1.0). Live-verified asymmetries: CPU-speed enum (Elite has `" 5"` not `"64"`, C64U the reverse; foreign speeds raise `ValueError` locally via a cached preset probe, with the firmware's HTTP 400 as backstop when the probe is inconclusive), Cartridge presets (only U64E 3.14 had a `"REU"` preset; U64E 3.15 made `Cartridge` a `.crt` chooser and the C64U has no `"REU"` preset either — `set_reu`/`restore_state` probe and adapt; don't hand-write that config item), and the C64U's REST `POST writemem` degrading to ~6 s/request at ≥16 KiB. For bulk writes use `write_bytes` / `run_prg_via_sys` (chunked at the client threshold, capped at 128, so a PUT on every grade; #252) — **do not enable the SocketDMA write fast path (`transport.socket_dma`); it is disabled pending a stability review**. See PATTERNS § "Pattern 10 / Two device generations" and § "SocketDMA write fast path".
 
 ## Test File Template
 

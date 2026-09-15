@@ -55,7 +55,7 @@ NTSC only: the device's ``System Mode`` is checked and a PAL device
 skips.  No PAL constant is published (it does not reduce to a small
 ratio, and it is unmeasured).
 
-Gate: ``AUDIO_RATE_LIVE=1``.  Host: ``U64_HOST`` (default ``10.43.23.81``).
+Gate: ``AUDIO_RATE_LIVE=1`` **and** ``U64_HOST`` (no default).
 """
 from __future__ import annotations
 
@@ -81,12 +81,21 @@ from c64_test_harness.backends.ultimate64_helpers import (
     check_measurement_environment,
 )
 
-_HOST = os.environ.get("U64_HOST", "10.43.23.81")
+#: No default (#243): a live module that invents a device drives real
+#: hardware for anyone who sets only the feature gate. The host is part of
+#: the gate, like every other live module in this repo.
+_HOST = os.environ.get("U64_HOST") or None
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("AUDIO_RATE_LIVE") != "1",
-    reason="AUDIO_RATE_LIVE=1 not set -- live audio rate-lock test disabled",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        os.environ.get("AUDIO_RATE_LIVE") != "1",
+        reason="AUDIO_RATE_LIVE=1 not set -- live audio rate-lock test disabled",
+    ),
+    pytest.mark.skipif(
+        _HOST is None,
+        reason="U64_HOST not set -- name the device explicitly",
+    ),
+]
 
 #: Clear of every HARNESS_SCRATCH span and of the $0360 trampoline.
 CODE_ADDR = 0xC900

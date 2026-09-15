@@ -42,12 +42,23 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _u64_host import require_u64_host  # noqa: E402
 
 os.environ.setdefault("C64_BACKEND", "u64")
-HOST = os.environ.setdefault("U64_HOST", "10.43.23.81")
+# Never invent a device (#243). No export: create_manager is passed
+# u64_hosts=HOST explicitly below, and UnifiedManager._parse_u64_hosts only
+# consults $U64_HOST when hosts is None -- at call time, not import time.
+HOST = require_u64_host(
+    argv0="python3 scripts/rrnet_first_exchange_probe.py",
+    usage="U64_HOST=<device> python3 scripts/rrnet_first_exchange_probe.py",
+)
 os.environ.setdefault("U64_UNLOCKED_CLIENT_WARNING", "0")
 
 from c64_test_harness import create_manager  # noqa: E402
+from c64_test_harness.backends.device_lock import resolve_lock_timeout  # noqa: E402
 from c64_test_harness.bridge_ping import (  # noqa: E402
     CS8900A_RXCTL_VALUE_IP65, PPDATA_HI, PPDATA_LO, PPTR_HI, PPTR_LO,
     build_arp_request_frame, build_echo_request_frame, build_ping_and_wait_tod_code,
@@ -246,7 +257,9 @@ def main() -> int:
               f"({dt:.2f}s)", flush=True)
         return r
 
-    with create_manager(backend="u64", u64_hosts=HOST, lock_timeout=600.0) as mgr:
+    # U64_DEVICE_LOCK_TIMEOUT when set, else this probe's own 600 s (#244).
+    with create_manager(backend="u64", u64_hosts=HOST,
+                        lock_timeout=resolve_lock_timeout(None, default=600.0)) as mgr:
         with mgr.instance() as target:
             t = target.transport
             client = t.client

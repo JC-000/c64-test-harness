@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Play a C-major scale on the Ultimate 64 Elite at 192.168.1.81 via SID.
+"""Play a C-major scale on an Ultimate 64 Elite via SID.
+
+Usage:
+    python3 scripts/play_scale_u64.py <HOST>
+    U64_HOST=<device> python3 scripts/play_scale_u64.py
+
+No default host: it used to construct the transport against a literal with
+no way to override at all (#243).
 
 Demonstrates the play_sid infrastructure: builds a PSID v2 file in memory
 with a 6502 init + play routine + note-frequency table, parses it, then
@@ -7,7 +14,12 @@ sends it to the U64's native sid_play REST endpoint.
 """
 from __future__ import annotations
 
+import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _u64_host import hold_device_lock, require_u64_host  # noqa: E402
 
 from c64_test_harness.sid import SidFile, build_test_psid
 from c64_test_harness.sid_player import play_sid
@@ -143,41 +155,47 @@ def main() -> None:
     print("  validation OK")
     print()
 
-    print("Connecting to Ultimate 64 at 192.168.1.81 ...")
-    transport = Ultimate64Transport(host="192.168.1.81")
+    host = require_u64_host(
+        sys.argv[1] if len(sys.argv) > 1 else None,
+        argv0="python3 scripts/play_scale_u64.py",
+    )
+    # sid_play replaces the program on the machine: hold the lock (#244).
+    with hold_device_lock(host):
+        print(f"Connecting to Ultimate 64 at {host} ...")
+        transport = Ultimate64Transport(host=host)
 
-    try:
-        before = transport.read_memory(LOAD_ADDR, 32)
-        print(f"Before sid_play, memory ${LOAD_ADDR:04X}: {before.hex()}")
-    except Exception as e:
-        print(f"(read_memory before failed: {e})")
+        try:
+            before = transport.read_memory(LOAD_ADDR, 32)
+            print(f"Before sid_play, memory ${LOAD_ADDR:04X}: {before.hex()}")
+        except Exception as e:
+            print(f"(read_memory before failed: {e})")
 
-    print()
-    print("Scale notes to play:")
-    for name, freq in NOTES:
-        print(f"  {name}  freq=${freq:04X} ({freq})")
-    print()
+        print()
+        print("Scale notes to play:")
+        for name, freq in NOTES:
+            print(f"  {name}  freq=${freq:04X} ({freq})")
+        print()
 
-    print("Calling play_sid() ...")
-    play_sid(transport, sf)
-    print("Playing C-major scale for 5 seconds...")
+        print("Calling play_sid() ...")
+        play_sid(transport, sf)
+        print("Playing C-major scale for 5 seconds...")
 
-    time.sleep(0.2)
-    try:
-        after = transport.read_memory(LOAD_ADDR, len(init_code))
-        match = after == init_code
-        print(f"After sid_play, memory ${LOAD_ADDR:04X}: {after.hex()}")
-        print(f"Matches init_code: {match}")
-    except Exception as e:
-        print(f"(read_memory after failed: {e})")
+        time.sleep(0.2)
+        try:
+            after = transport.read_memory(LOAD_ADDR, len(init_code))
+            match = after == init_code
+            print(f"After sid_play, memory ${LOAD_ADDR:04X}: {after.hex()}")
+            print(f"Matches init_code: {match}")
+        except Exception as e:
+            print(f"(read_memory after failed: {e})")
 
-    time.sleep(5.3)
+        time.sleep(5.3)
 
-    print()
-    print("Resetting device to stop audio...")
-    transport._client.reset()
-    transport.close()
-    print("Done.")
+        print()
+        print("Resetting device to stop audio...")
+        transport._client.reset()
+        transport.close()
+        print("Done.")
 
 
 if __name__ == "__main__":

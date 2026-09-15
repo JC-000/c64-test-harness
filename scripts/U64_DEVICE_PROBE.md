@@ -205,22 +205,25 @@ slots.
 
 ## 7. Handy curl recipes (read-only)
 
+`$U64_HOST` is the device you are pointing at — set it, do not paste an
+address in (#243).
+
 ```bash
 # Identity and API version
-curl -s http://192.168.1.81/v1/version
-curl -s http://192.168.1.81/v1/info
+curl -s http://$U64_HOST/v1/version
+curl -s http://$U64_HOST/v1/info
 
 # List all config categories
-curl -s http://192.168.1.81/v1/configs
+curl -s http://$U64_HOST/v1/configs
 
 # Dump one category (current values)
-curl -s "http://192.168.1.81/v1/configs/U64%20Specific%20Settings"
+curl -s "http://$U64_HOST/v1/configs/U64%20Specific%20Settings"
 
 # Fetch a single item with its enum / min-max
-curl -s "http://192.168.1.81/v1/configs/U64%20Specific%20Settings/CPU%20Speed"
+curl -s "http://$U64_HOST/v1/configs/U64%20Specific%20Settings/CPU%20Speed"
 
 # Drives
-curl -s http://192.168.1.81/v1/drives
+curl -s http://$U64_HOST/v1/drives
 ```
 
 If the device has a password set, add `-H "X-Password: <pw>"`.

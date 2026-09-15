@@ -1109,7 +1109,13 @@ class TestDocumentedBoundaries:
         flat = re.sub(r"\s+", " ", doc.replace("``", "").replace("*", ""))
         assert "never been read, so any figure quoted for the Ultimate line" in flat, (
             "the U64E request-count figure must not be presented as covering "
-            "the C64U, whose category list has never been read"
+            "the C64U, whose item lists have never been read"
+        )
+        # The C64U's category list HAS been read (2026-09-15, #287); the
+        # docstring must say so rather than keep the pre-read claim.
+        assert "category list was read once (2026-09-15, 20 categories" in flat, (
+            "the docstring must record the C64U category read, not claim "
+            "that list was never read"
         )
         # And no bare total may be quoted here at all: a number beside the
         # caveat is what gets copied out without it.

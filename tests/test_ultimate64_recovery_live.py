@@ -5,7 +5,7 @@ set. ``recover()`` issues ``reset()`` (and possibly ``reboot()``) on the
 device, so this is destructive in the same sense as the turbo round-trip
 in ``test_ultimate64_helpers_live.py``.
 
-Device used in development: 192.168.1.81 (Ultimate 64 Elite, fw 3.14).
+Device used in development: an Ultimate 64 Elite on fw 3.14.
 """
 from __future__ import annotations
 

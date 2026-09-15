@@ -10,9 +10,12 @@ Queries the device's HTTP API (v1) and prints a structured summary:
 All requests are strictly GET. No mutation, no reset, no reboot.
 
 Usage:
-    python3 scripts/probe_u64.py --host 192.168.1.81
-    python3 scripts/probe_u64.py --host 192.168.1.81 --password secret
-    python3 scripts/probe_u64.py --host 192.168.1.81 --raw-dir /tmp/u64_dump
+    python3 scripts/probe_u64.py --host <device>
+    U64_HOST=<device> python3 scripts/probe_u64.py
+    python3 scripts/probe_u64.py --host <device> --password secret
+    python3 scripts/probe_u64.py --host <device> --raw-dir /tmp/u64_dump
+
+No default host: --host or $U64_HOST, or the probe refuses (#243).
 
 Zero external deps (urllib only).
 """
@@ -25,10 +28,13 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _u64_host import hold_device_lock, require_u64_host  # noqa: E402
 
-DEFAULT_HOST = "192.168.1.81"
+
 TIMEOUT = 8.0
 
 # Authoritative list of config categories exposed by /v1/configs
@@ -118,132 +124,138 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Read-only probe of an Ultimate 64 / Ultimate II REST API."
     )
-    parser.add_argument("--host", default=DEFAULT_HOST,
-                        help=f"Device host/IP (default: {DEFAULT_HOST})")
+    parser.add_argument("--host", default=None,
+                        help="Device host/IP (or set $U64_HOST). No default.")
     parser.add_argument("--password", default=None,
                         help="Optional password; sent as X-Password header.")
     parser.add_argument("--raw-dir", default=None,
                         help="If set, dump every raw JSON response into this dir.")
     args = parser.parse_args()
 
-    host = args.host
+    host = require_u64_host(
+        args.host, argv0="python3 scripts/probe_u64.py",
+        usage="python3 scripts/probe_u64.py --host <HOST>",
+    )
     pw = args.password
     raw_dir = args.raw_dir
 
-    print_header(f"Ultimate device probe: http://{host}")
+    # Read-only, but still under the lock: a neighbour mid-measurement
+    # should not see config reads interleaved with its run (#244).
+    with hold_device_lock(host):
+        print_header(f"Ultimate device probe: http://{host}")
 
-    version = _get_json(host, "/v1/version", pw)
-    info = _get_json(host, "/v1/info", pw)
-    configs = _get_json(host, "/v1/configs", pw)
-    drives = _get_json(host, "/v1/drives", pw)
+        version = _get_json(host, "/v1/version", pw)
+        info = _get_json(host, "/v1/info", pw)
+        configs = _get_json(host, "/v1/configs", pw)
+        drives = _get_json(host, "/v1/drives", pw)
 
-    if raw_dir:
-        _dump_raw(raw_dir, "_version", version)
-        _dump_raw(raw_dir, "_info", info)
-        _dump_raw(raw_dir, "_configs", configs)
-        _dump_raw(raw_dir, "_drives", drives)
-
-    # Identity
-    print(f"API version      : {version.get('version', '?')}")
-    print(f"product          : {info.get('product', '?')}")
-    print(f"firmware_version : {info.get('firmware_version', '?')}")
-    print(f"fpga_version     : {info.get('fpga_version', '?')}")
-    print(f"core_version     : {info.get('core_version', '?')}")
-    print(f"hostname         : {info.get('hostname', '?')}")
-    print(f"unique_id        : {info.get('unique_id', '?')}")
-
-    # Categories
-    cats = configs.get("categories", []) if isinstance(configs, dict) else []
-    print(f"\nconfig categories ({len(cats)}):")
-    for c in cats:
-        print(f"  - {c}")
-
-    # Fetch every category
-    category_data: dict[str, dict] = {}
-    for cat in CATEGORIES:
-        data = _fetch_category(host, cat, pw)
         if raw_dir:
-            _dump_raw(raw_dir, _slug(cat), data)
-        category_data[cat] = _unwrap(data, cat)
+            _dump_raw(raw_dir, "_version", version)
+            _dump_raw(raw_dir, "_info", info)
+            _dump_raw(raw_dir, "_configs", configs)
+            _dump_raw(raw_dir, "_drives", drives)
 
-    # U64 Specific: CPU Speed enum (authoritative turbo table)
-    print_header("U64 Specific Settings  ->  CPU Speed (turbo table)")
-    cpu_item = _fetch_item(host, "U64 Specific Settings", "CPU Speed", pw)
-    if raw_dir:
-        _dump_raw(raw_dir, "_item_cpu_speed", cpu_item)
-    cs = _unwrap(cpu_item, "U64 Specific Settings").get("CPU Speed", {})
-    print(f"current : {cs.get('current')!r}")
-    print(f"default : {cs.get('default')!r}")
-    print(f"values  : {cs.get('values')}")
-    print("Interpretation: CPU speed multiplier in MHz (approx). Values are")
-    print("strings, right-aligned to width 2. Max on this device is 48 MHz.")
+        # Identity
+        print(f"API version      : {version.get('version', '?')}")
+        print(f"product          : {info.get('product', '?')}")
+        print(f"firmware_version : {info.get('firmware_version', '?')}")
+        print(f"fpga_version     : {info.get('fpga_version', '?')}")
+        print(f"core_version     : {info.get('core_version', '?')}")
+        print(f"hostname         : {info.get('hostname', '?')}")
+        print(f"unique_id        : {info.get('unique_id', '?')}")
 
-    # C64 and Cartridge Settings
-    print_header("C64 and Cartridge Settings  ->  Cartridge / REU Size")
-    cart_item = _fetch_item(host, "C64 and Cartridge Settings", "Cartridge", pw)
-    reu_item = _fetch_item(host, "C64 and Cartridge Settings", "REU Size", pw)
-    if raw_dir:
-        _dump_raw(raw_dir, "_item_cartridge", cart_item)
-        _dump_raw(raw_dir, "_item_reu_size", reu_item)
-    cart = _unwrap(cart_item, "C64 and Cartridge Settings").get("Cartridge", {})
-    reu = _unwrap(reu_item, "C64 and Cartridge Settings").get("REU Size", {})
-    print(f"Cartridge presets : {cart.get('presets')}")
-    print(f"Cartridge current : {cart.get('current')!r}")
-    print(f"REU Size current  : {reu.get('current')!r}")
-    print(f"REU Size default  : {reu.get('default')!r}")
-    print(f"REU Size values   : {reu.get('values')}")
-    cc = category_data.get("C64 and Cartridge Settings", {})
-    print(f"RAM Expansion Unit: {cc.get('RAM Expansion Unit')!r} (master enable)")
+        # Categories
+        cats = configs.get("categories", []) if isinstance(configs, dict) else []
+        print(f"\nconfig categories ({len(cats)}):")
+        for c in cats:
+            print(f"  - {c}")
 
-    # SID config
-    print_header("SID Config (Sockets / UltiSID / Addressing)")
-    sk = category_data.get("SID Sockets Configuration", {})
-    us = category_data.get("UltiSID Configuration", {})
-    sa = category_data.get("SID Addressing", {})
-    print("Sockets:")
-    for k, v in sk.items():
-        print(f"  {k:32} = {v!r}")
-    print("UltiSID:")
-    for k, v in us.items():
-        print(f"  {k:32} = {v!r}")
-    print("Addressing:")
-    for k, v in sa.items():
-        print(f"  {k:32} = {v!r}")
+        # Fetch every category
+        category_data: dict[str, dict] = {}
+        for cat in CATEGORIES:
+            data = _fetch_category(host, cat, pw)
+            if raw_dir:
+                _dump_raw(raw_dir, _slug(cat), data)
+            category_data[cat] = _unwrap(data, cat)
 
-    # Drives
-    print_header("Drive Enumeration  (/v1/drives)")
-    if isinstance(drives, dict):
-        for entry in drives.get("drives", []):
-            for slot, spec in entry.items():
-                print(f"slot {slot}:")
-                for k, v in spec.items():
-                    print(f"  {k:18} = {v!r}")
+        # U64 Specific: CPU Speed enum (authoritative turbo table)
+        print_header("U64 Specific Settings  ->  CPU Speed (turbo table)")
+        cpu_item = _fetch_item(host, "U64 Specific Settings", "CPU Speed", pw)
+        if raw_dir:
+            _dump_raw(raw_dir, "_item_cpu_speed", cpu_item)
+        cs = _unwrap(cpu_item, "U64 Specific Settings").get("CPU Speed", {})
+        print(f"current : {cs.get('current')!r}")
+        print(f"default : {cs.get('default')!r}")
+        print(f"values  : {cs.get('values')}")
+        print("Interpretation: CPU speed multiplier in MHz (approx). Values are")
+        print("strings, right-aligned to width 2. Max on this device is 48 MHz.")
 
-    da = category_data.get("Drive A Settings", {})
-    db = category_data.get("Drive B Settings", {})
-    print("\nDrive A Settings:")
-    for k, v in da.items():
-        print(f"  {k:26} = {v!r}")
-    print("Drive B Settings:")
-    for k, v in db.items():
-        print(f"  {k:26} = {v!r}")
+        # C64 and Cartridge Settings
+        print_header("C64 and Cartridge Settings  ->  Cartridge / REU Size")
+        cart_item = _fetch_item(host, "C64 and Cartridge Settings", "Cartridge", pw)
+        reu_item = _fetch_item(host, "C64 and Cartridge Settings", "REU Size", pw)
+        if raw_dir:
+            _dump_raw(raw_dir, "_item_cartridge", cart_item)
+            _dump_raw(raw_dir, "_item_reu_size", reu_item)
+        cart = _unwrap(cart_item, "C64 and Cartridge Settings").get("Cartridge", {})
+        reu = _unwrap(reu_item, "C64 and Cartridge Settings").get("REU Size", {})
+        print(f"Cartridge presets : {cart.get('presets')}")
+        print(f"Cartridge current : {cart.get('current')!r}")
+        print(f"REU Size current  : {reu.get('current')!r}")
+        print(f"REU Size default  : {reu.get('default')!r}")
+        print(f"REU Size values   : {reu.get('values')}")
+        cc = category_data.get("C64 and Cartridge Settings", {})
+        print(f"RAM Expansion Unit: {cc.get('RAM Expansion Unit')!r} (master enable)")
 
-    # Brief summary of remaining categories
-    print_header("Remaining categories (current values)")
-    remaining = [
-        "Audio Mixer", "Clock Settings", "SoftIEC Drive Settings",
-        "Printer Settings", "Network Settings", "Ethernet Settings",
-        "WiFi settings", "Tape Settings", "LED Strip Settings",
-        "Data Streams", "Modem Settings", "User Interface Settings",
-    ]
-    for cat in remaining:
-        d = category_data.get(cat, {})
-        print(f"\n[{cat}]  ({len(d)} items)")
-        for k, v in d.items():
-            print(f"  {k:36} = {v!r}")
+        # SID config
+        print_header("SID Config (Sockets / UltiSID / Addressing)")
+        sk = category_data.get("SID Sockets Configuration", {})
+        us = category_data.get("UltiSID Configuration", {})
+        sa = category_data.get("SID Addressing", {})
+        print("Sockets:")
+        for k, v in sk.items():
+            print(f"  {k:32} = {v!r}")
+        print("UltiSID:")
+        for k, v in us.items():
+            print(f"  {k:32} = {v!r}")
+        print("Addressing:")
+        for k, v in sa.items():
+            print(f"  {k:32} = {v!r}")
 
-    print_header("Probe complete (read-only)")
-    return 0
+        # Drives
+        print_header("Drive Enumeration  (/v1/drives)")
+        if isinstance(drives, dict):
+            for entry in drives.get("drives", []):
+                for slot, spec in entry.items():
+                    print(f"slot {slot}:")
+                    for k, v in spec.items():
+                        print(f"  {k:18} = {v!r}")
+
+        da = category_data.get("Drive A Settings", {})
+        db = category_data.get("Drive B Settings", {})
+        print("\nDrive A Settings:")
+        for k, v in da.items():
+            print(f"  {k:26} = {v!r}")
+        print("Drive B Settings:")
+        for k, v in db.items():
+            print(f"  {k:26} = {v!r}")
+
+        # Brief summary of remaining categories
+        print_header("Remaining categories (current values)")
+        remaining = [
+            "Audio Mixer", "Clock Settings", "SoftIEC Drive Settings",
+            "Printer Settings", "Network Settings", "Ethernet Settings",
+            "WiFi settings", "Tape Settings", "LED Strip Settings",
+            "Data Streams", "Modem Settings", "User Interface Settings",
+        ]
+        for cat in remaining:
+            d = category_data.get(cat, {})
+            print(f"\n[{cat}]  ({len(d)} items)")
+            for k, v in d.items():
+                print(f"  {k:36} = {v!r}")
+
+        print_header("Probe complete (read-only)")
+        return 0
 
 
 if __name__ == "__main__":

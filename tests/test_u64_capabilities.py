@@ -184,13 +184,16 @@ def test_post_threshold_is_a_pure_function_of_writemem_post_safe():
     higher PUT threshold. A new device generation hits that path first,
     before anyone has written its version rule.
 
-    Why the coupling is load-bearing: ``memory.write_bytes`` chunks at a
-    fixed 84 bytes -- under 128 but *over* 48 -- so on fixed firmware
-    every chunk takes the POST path. That is safe only because the 48
-    threshold is *selected by* ``writemem_post_safe`` being true, i.e.
-    those POSTs land exactly on the firmware that collects them. Sever
-    the coupling and ``write_bytes`` becomes a leak generator at 84 bytes
-    a chunk.
+    Why the coupling used to be load-bearing: ``memory.write_bytes``
+    chunked at a fixed 84 bytes -- under 128 but *over* 48 -- so on fixed
+    firmware every chunk took the POST path, safe only because the 48
+    threshold is *selected by* ``writemem_post_safe``. Since #252 an
+    Ultimate transport chunks ``write_bytes`` at its own threshold, so
+    every chunk is a PUT on any grade
+    (``tests/test_u64_leak_prone_write_chunking.py``); 84 survives only
+    for transports with no REST threshold (VICE). The three legs are still
+    pinned because ``Ultimate64Transport.write_memory`` keys its
+    single-request path on the same grade.
     """
     from c64_test_harness.backends.u64_capabilities import (
         THRESHOLD_POST_RISKY,
@@ -283,3 +286,254 @@ def test_the_generation_docstring_says_which_unknown_is_transient():
     flat = _flat(DeviceCapabilities._generation_for.__doc__)
     assert "only one of them is transient" in flat
     assert "Re-reading cannot help" in flat
+
+
+# --------------------------------------------------------------------------- #
+# #248 — a CBM firmware update must not be silently graded leak-prone forever #
+# --------------------------------------------------------------------------- #
+#
+# ``_CBM_WRITEMEM_FIXED_FROM`` is ``None`` until someone establishes which
+# ``u64ii`` 1.x release carries GideonZ/1541ultimate#686.  Staying on the
+# 128 threshold is safe, so the grade itself must stay ``False``; what must
+# not happen is that a C64U reporting a *newer* release than the last one
+# known to leak is graded ``False`` in silence.  Every test here either reads
+# the module constants live or pins them with ``monkeypatch``, so none of
+# them passes whatever the constant is.
+
+import logging
+
+import c64_test_harness.backends.u64_capabilities as caps_mod
+
+_CAPS_LOGGER = "c64_test_harness.backends.u64_capabilities"
+
+
+@pytest.fixture
+def fresh_stale_notice(monkeypatch):
+    """The stale-constant notice is once per version per process; reset it."""
+    monkeypatch.setattr(caps_mod, "_CBM_STALE_NOTICE_ISSUED", set(), raising=False)
+
+
+def _stale_records(caplog):
+    return [
+        r for r in caplog.records
+        if r.name == _CAPS_LOGGER
+        and r.levelno >= logging.WARNING
+        and "_CBM_WRITEMEM_FIXED_FROM" in r.getMessage()
+    ]
+
+
+@pytest.mark.parametrize("raw", ["1.1.1", "1.2.0", "1.2", "1.10.0"])
+def test_newer_cbm_release_with_unset_constant_warns_loudly(
+    raw, caplog, fresh_stale_notice, monkeypatch
+):
+    monkeypatch.setattr(caps_mod, "_CBM_WRITEMEM_FIXED_FROM", None)
+    caplog.set_level(logging.WARNING, logger=_CAPS_LOGGER)
+    with pytest.warns(caps_mod.CbmFixConstantStaleWarning):
+        caps = DeviceCapabilities.from_info({"firmware_version": raw})
+    # still conservative: the grade does not guess
+    assert caps.writemem_post_safe is False
+    assert caps.write_mem_query_threshold == 128
+    records = _stale_records(caplog)
+    assert len(records) == 1, [r.getMessage() for r in caplog.records]
+    msg = records[0].getMessage()
+    assert raw in msg
+    assert "#248" in msg
+    assert "1.1.0" in msg  # names the last release known to leak
+
+
+@pytest.mark.parametrize("raw", ["1.1.0", "1.0.9", "1.1"])
+def test_last_known_unfixed_or_older_cbm_release_is_quiet(
+    raw, caplog, fresh_stale_notice, monkeypatch
+):
+    """Guards the opposite mutation: a notice on every C64U is noise nobody reads."""
+    monkeypatch.setattr(caps_mod, "_CBM_WRITEMEM_FIXED_FROM", None)
+    caplog.set_level(logging.WARNING, logger=_CAPS_LOGGER)
+    caps = DeviceCapabilities.from_info({"firmware_version": raw})
+    assert caps.writemem_post_safe is False
+    assert _stale_records(caplog) == []
+
+
+def test_ultimate_line_never_raises_the_cbm_notice(caplog, fresh_stale_notice):
+    caplog.set_level(logging.WARNING, logger=_CAPS_LOGGER)
+    for raw in ("3.15", "V3.14d", "4.0", "2.5"):
+        DeviceCapabilities.from_info({"firmware_version": raw})
+    assert _stale_records(caplog) == []
+
+
+def test_stale_notice_is_once_per_version_per_process(
+    caplog, fresh_stale_notice, monkeypatch
+):
+    """Every client probes capabilities; one line per version, not per client."""
+    monkeypatch.setattr(caps_mod, "_CBM_WRITEMEM_FIXED_FROM", None)
+    caplog.set_level(logging.WARNING, logger=_CAPS_LOGGER)
+    with pytest.warns(caps_mod.CbmFixConstantStaleWarning):
+        for _ in range(3):
+            DeviceCapabilities.from_info({"firmware_version": "1.2.0"})
+        DeviceCapabilities.from_info({"firmware_version": "1.3.0"})
+    assert len(_stale_records(caplog)) == 2
+
+
+@pytest.mark.parametrize("fixed_from", [(1, 2), (1, 2, 0)])
+def test_setting_the_cbm_constant_actually_grades_post_safe(
+    fixed_from, caplog, fresh_stale_notice, monkeypatch
+):
+    """The day the constant is set, it must work in either spelling.
+
+    The C64U reports three-part versions (``1.1.0``), so the natural edit is
+    ``(1, 2, 0)``.  A comparison that truncates the device version to two
+    parts compares ``(1, 2) >= (1, 2, 0)``, which is ``False``, and the fix
+    would stay silently ungraded after someone did exactly what the comment
+    asked.
+    """
+    monkeypatch.setattr(caps_mod, "_CBM_WRITEMEM_FIXED_FROM", fixed_from)
+    caplog.set_level(logging.WARNING, logger=_CAPS_LOGGER)
+    for raw in ("1.2.0", "1.2", "1.2.1", "1.10.0"):
+        caps = DeviceCapabilities.from_info({"firmware_version": raw})
+        assert caps.writemem_post_safe is True, (fixed_from, raw)
+        assert caps.runner_wedge_possible is False, (fixed_from, raw)
+        assert caps.write_mem_query_threshold == 48, (fixed_from, raw)
+    for raw in ("1.1.0", "1.1.9", "1.1"):
+        caps = DeviceCapabilities.from_info({"firmware_version": raw})
+        assert caps.writemem_post_safe is False, (fixed_from, raw)
+        assert caps.write_mem_query_threshold == 128, (fixed_from, raw)
+    # once the constant is set there is nothing stale to report
+    assert _stale_records(caplog) == []
+
+
+# ---------------------------------------------- #248 review round 1 (PR #290)
+
+import warnings
+
+
+def _stale_warnings(recorded):
+    return [
+        w for w in recorded
+        if issubclass(w.category, caps_mod.CbmFixConstantStaleWarning)
+    ]
+
+
+def _assert_remedy_text(msg: str, raw: str) -> None:
+    """The message must say *what to do*, with each version in its own slot."""
+    assert msg.startswith(f"C64U firmware {raw} is newer than 1.1.0,"), msg
+    assert f"Establish whether {raw} carries #686 and set that constant" in msg, msg
+    assert "backends/u64_capabilities.py" in msg, msg
+    assert "_CBM_WRITEMEM_FIXED_FROM" in msg, msg
+    assert "#248" in msg, msg
+
+
+def test_stale_notice_is_a_python_warning_a_green_pytest_run_shows(
+    fresh_stale_notice, monkeypatch
+):
+    """A log line is invisible in a passing pytest run, which is #248's exact
+    scenario (a live C64U suite, green, after a firmware bump).  A warning
+    lands in pytest's warnings summary and can be escalated by category."""
+    monkeypatch.setattr(caps_mod, "_CBM_WRITEMEM_FIXED_FROM", None)
+    category = caps_mod.CbmFixConstantStaleWarning
+    assert issubclass(category, UserWarning)
+    with pytest.warns(category) as recorded:
+        caps = DeviceCapabilities.from_info({"firmware_version": "1.2.0"})
+    assert caps.writemem_post_safe is False
+    stale = _stale_warnings(recorded)
+    assert len(stale) == 1
+    _assert_remedy_text(str(stale[0].message), "1.2.0")
+    # stacklevel: the warning names the caller of from_info, not this module
+    assert Path(stale[0].filename).resolve() == Path(__file__).resolve(), stale[0].filename
+
+
+def test_stale_log_line_names_the_remedy_and_versions_in_their_slots(
+    caplog, fresh_stale_notice, monkeypatch
+):
+    monkeypatch.setattr(caps_mod, "_CBM_WRITEMEM_FIXED_FROM", None)
+    caplog.set_level(logging.WARNING, logger=_CAPS_LOGGER)
+    with pytest.warns(caps_mod.CbmFixConstantStaleWarning):
+        DeviceCapabilities.from_info({"firmware_version": "1.3.7"})
+    records = _stale_records(caplog)
+    assert len(records) == 1
+    _assert_remedy_text(records[0].getMessage(), "1.3.7")
+
+
+def test_no_stale_warning_where_the_log_is_quiet(fresh_stale_notice, monkeypatch):
+    monkeypatch.setattr(caps_mod, "_CBM_WRITEMEM_FIXED_FROM", None)
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        for raw in ("1.1.0", "1.0.9", "1.1", "3.15", "V3.14d", "4.0", "2.5"):
+            DeviceCapabilities.from_info({"firmware_version": raw})
+    assert _stale_warnings(recorded) == []
+    monkeypatch.setattr(caps_mod, "_CBM_WRITEMEM_FIXED_FROM", (1, 2, 0))
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        DeviceCapabilities.from_info({"firmware_version": "1.3.0"})
+    assert _stale_warnings(recorded) == []
+
+
+def test_stale_warning_is_once_per_version_per_process(fresh_stale_notice, monkeypatch):
+    monkeypatch.setattr(caps_mod, "_CBM_WRITEMEM_FIXED_FROM", None)
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        for _ in range(3):
+            DeviceCapabilities.from_info({"firmware_version": "1.2.0"})
+        DeviceCapabilities.from_info({"firmware_version": "1.3.0"})
+    assert len(_stale_warnings(recorded)) == 2
+
+
+@pytest.mark.parametrize("pinned", [True, None])
+def test_override_that_lifts_the_grade_suppresses_the_notice(
+    pinned, caplog, fresh_stale_notice, monkeypatch
+):
+    """A probe that pinned ``writemem_post_safe`` has, by definition, checked:
+    "graded False without anyone having checked" would be false."""
+    monkeypatch.setattr(caps_mod, "_CBM_WRITEMEM_FIXED_FROM", None)
+    caplog.set_level(logging.WARNING, logger=_CAPS_LOGGER)
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        caps = DeviceCapabilities.from_info(
+            {"firmware_version": "1.2.0"},
+            overrides={"writemem_post_safe": pinned},
+        )
+    assert caps.writemem_post_safe is pinned
+    assert _stale_records(caplog) == []
+    assert _stale_warnings(recorded) == []
+    # and suppression did not use up the once-per-version notice
+    with pytest.warns(caps_mod.CbmFixConstantStaleWarning):
+        DeviceCapabilities.from_info({"firmware_version": "1.2.0"})
+    assert len(_stale_records(caplog)) == 1
+
+
+@pytest.mark.parametrize("overrides", [
+    {"writemem_post_safe": False},
+    {"uci_socket_read_multiblock": True},
+])
+def test_override_that_leaves_the_grade_false_still_notices(
+    overrides, caplog, fresh_stale_notice, monkeypatch
+):
+    monkeypatch.setattr(caps_mod, "_CBM_WRITEMEM_FIXED_FROM", None)
+    caplog.set_level(logging.WARNING, logger=_CAPS_LOGGER)
+    with pytest.warns(caps_mod.CbmFixConstantStaleWarning):
+        caps = DeviceCapabilities.from_info(
+            {"firmware_version": "1.2.0"}, overrides=overrides
+        )
+    assert caps.writemem_post_safe is False
+    assert len(_stale_records(caplog)) == 1
+
+
+def test_stale_warning_category_is_exported_from_the_package_root():
+    """Downstream ``-W error::...`` / ``filterwarnings`` need a stable name."""
+    import c64_test_harness
+
+    assert c64_test_harness.CbmFixConstantStaleWarning is caps_mod.CbmFixConstantStaleWarning
+    assert "CbmFixConstantStaleWarning" in c64_test_harness.__all__
+    assert "CbmFixConstantStaleWarning" in caps_mod.__all__
+
+
+def test_cbm_constants_are_mutually_consistent():
+    """Reads the real constants: the last known leak-prone release must grade
+    unfixed, and a fix floor, once set, must lie above it."""
+    last = caps_mod._CBM_LAST_KNOWN_UNFIXED
+    assert last == (1, 1, 0)
+    raw = ".".join(str(p) for p in last)
+    assert DeviceCapabilities.from_info({"firmware_version": raw}).writemem_post_safe is False
+    fixed = caps_mod._CBM_WRITEMEM_FIXED_FROM
+    if fixed is not None:
+        def pad(t):
+            return tuple(t) + (0,) * (3 - len(t))
+        assert pad(fixed) > pad(last), (fixed, last)

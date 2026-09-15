@@ -21,11 +21,70 @@ measured on the U64E unless it says otherwise.
 
 **Prerequisite:** UCI must be enabled in the device settings:
 *C64 and Cartridge Settings → Command Interface → Enabled*.
-`enable_uci(client)` flips that item over REST, but the `$DF1C-$DF1F`
-registers do not go live until the next machine reset: the live suites
-follow it with `client.reset()` and a 3 s settle before the first routine
-(`tests/test_uci_udp_send_live.py:242-249`), and without that every routine
-times out at the sentinel. The write is memory-only — it is a config PUT, so
+`enable_uci(client)` flips that item over REST. The live suites follow it
+with `client.reset()` and a 3 s settle before the first routine
+(`tests/test_uci_udp_send_live.py:242-249`); without that, every routine
+times out at the sentinel. Keep that sequence. It is a recorded
+observation, and **its cause is not explained by firmware source**. From
+source, read at tag `1.1.0` (the C64U) and `7f6fcb51` (the U64E's
+v3.15-85), not measured:
+
+- The item drives the FPGA register `CMD_IF_SLOT_ENABLE`, which
+  `C64::set_emulation_flags()` sets to `!!cfg->get_value(CFG_CMD_ENABLE)`
+  (`software/io/c64/c64.cc:326-327` at `1.1.0`; `:329-330` at `7f6fcb51`).
+- A REST single-item config PUT reaches that function when the PUT
+  closes, with no reset in between. The route's `set_item` calls
+  `item->setValue(n)` (`software/api/route_configs.cc:63-85` at `1.1.0`).
+  `setValue` is `value = v; return setChanged();` (`config.h:121`).
+  `setChanged` calls `store->set_need_effectuate()` unless the item has a
+  change hook (`config.cc:901-911`; `:902` at `7f6fcb51`). No hook is
+  registered for `CFG_CMD_ENABLE` anywhere in the whole `software/` tree
+  at either ref (whole-tree search from #309's review, re-checked here).
+  The item appears only at its definition (`c64.cc:115`), the read in
+  `set_emulation_flags` (`:326`; `:329` at `7f6fcb51`), a menu-group append
+  (`:1580`; `:1863`) and its `#define` (`c64.h:222`; `:224`). The only
+  direct `setChangeHook` call is inside `ConfigStore::set_change_hook`
+  (`config.cc:493`; `:494`), which looks the id up in its own store; the
+  id-looping hook calls in `software/u64/u64_config.cc` register mixer
+  items in the Audio Mixer and Speaker Mixer stores. The route then calls
+  `st->at_close_config()`
+  (`route_configs.cc:244` at `1.1.0`, `:313` at `7f6fcb51`), which
+  effectuates only `if (need_effectuate())` (`config.h:165-168`; `:201`
+  at `7f6fcb51`). Because `setChanged` sets that flag on every set, even
+  one that leaves the value unchanged, the gate is "the item was set",
+  not "the item changed". The chain continues `effectuate()` →
+  `C64::effectuate_settings()` → `set_emulation_flags()`
+  (`c64.cc:267-277`). So by source the enable takes effect without a
+  reset.
+- #270 proposed a cause that is half the path: `machine:reboot` →
+  `MENU_C64_REBOOT` → `C64::start_cartridge(NULL)` (`route_machine.cc:40`,
+  `c64_subsys.cc:231-236`) zeroes `CMD_IF_SLOT_ENABLE` (`c64.cc:913`). But
+  when no external cartridge holds the bus it then calls
+  `set_cartridge(NULL)` (`c64.cc:923-924`), which calls
+  `set_emulation_flags()` again (`c64.cc:992`) and restores the enable
+  from config. Two cases leave it at 0 all the same:
+  - **An external cartridge holds the bus.** `ConfigureU64SystemBus()`
+    reports one (Cartridge Preference *Automatic* with a cart present, or
+    *External*), so `set_cartridge` is skipped (`c64.cc:921-924`).
+  - **The configured cartridge image prohibits UCI.** `set_cartridge(NULL)`
+    loads the `.crt` named by `CFG_C64_CART_CRT` (`c64.cc:962-964`;
+    `:1241-1243` at `7f6fcb51`) and restores the enable in
+    `set_emulation_flags()`. It then zeroes the enable again if that
+    definition's `prohibit` mask includes `CART_UCI`, `CART_UCI_DFFC` or
+    `CART_UCI_DE1C` (`c64.cc:1062-1068`; `:1341-1346` at `7f6fcb51`).
+    `CART_PROHIBIT_DFXX` includes `CART_UCI` (`c64.h:254`; `:256` at
+    `7f6fcb51`). GeoRAM's `CART_PROHIBIT_ALL_BUT_REU` does not
+    (`c64.h:256`; `:258`). Which `.crt` types carry such a mask is not
+    traced here.
+
+  The REU enable follows the same two cases; its prohibit check is
+  `c64.cc:1056-1061` (`:1335-1339` at `7f6fcb51`).
+  `Ultimate64Client.reboot`'s docstring stated the unconditional version
+  until #299 corrected it to this account
+  (`tests/test_reboot_docstring.py` pins the two together).
+
+To find the real cause, drop the reset on a device and see which step
+fails. Nobody has done that. The write is memory-only — it is a config PUT, so
 it survives `machine:reboot` but not a firmware power-on, and it is never
 saved to flash (`uci_network.py:2316-2329`). (`enable_uci`'s own
 docstring still says "a device reboot reverts to the default state";
@@ -48,6 +107,51 @@ command-line processor reads the buffer on its next cycle as if the user
 typed the `SYS` command and RETURN, which JSRs into the routine. The
 routine does its work, writes the sentinel byte, and executes `RTS` to
 return to BASIC, which resumes its READY prompt loop.
+
+**If the sentinel never arrives, the host resets the 6510 before it
+raises** (issue #313, PR #332). The routine's wait fragments
+(`_build_wait_idle`, `_build_push_and_wait`, the turbo `JMP busy_loop`
+forms) are unbounded, so a timed-out routine may still be executing at
+`code_addr`, and the next call's chunked upload would land on live code.
+On a timeout the host:
+
+1. calls `transport.reset(scope="cpu")`. On a U64 that is the bodyless
+   `PUT /v1/machine:reset`, so it costs no `/Temp` attachment;
+2. sleeps `_TIMEOUT_RESET_SETTLE` (3 s), because the KERNAL reset clears
+   `$0200-$03FF` and a `SYS` typed before `READY.` would be lost. The 3 s
+   is borrowed from the live suites' post-`reset()` settle and is
+   unmeasured for this path;
+3. raises `TimeoutError`. If the reset itself raised, the `TimeoutError`
+   is still what the caller gets, chained from the reset error, with no
+   settle taken.
+
+It never uses `scope="machine"`, which on a U64 is `machine:reboot`, a
+different operation (see #299). **By source, the UCI enable survives the
+reset:**
+
+- `machine:reset` runs `MENU_C64_RESET` → `C64::reset()`.
+- `C64::reset()` only pulses `C64_MODE_RESET`; it calls neither
+  `set_emulation_flags()` nor `start_cartridge()`.
+- Read at tag `1.1.0` (`c64.cc:593-601`, `c64_subsys.cc:183-190`,
+  `route_machine.cc:30-36`) and at `7f6fcb51` (`c64.cc:612-620`,
+  `c64_subsys.cc:217-224`, `route_machine.cc:73-85`).
+- Two side effects, neither of which affects UCI:
+  - on both refs, `MENU_C64_RESET` calls `release_host()` before
+    resetting (`c64_subsys.cc:184-187` at `1.1.0`,
+    `c64_subsys.cc:218-221` at `7f6fcb51`), which closes an open menu, on
+    the C64U as well;
+  - at `7f6fcb51` only, on success the route also releases REST-held
+    keyboard keys and the joystick (`route_machine.cc:77-81`:
+    `restReleaseAll`, `releaseAllRest`, under `#if U64`; the `1.1.0`
+    route has no such block).
+
+  So a timeout closes an open menu, and on `7f6fcb51` also releases held
+  keys and joystick.
+- This has not been measured on a device.
+
+The reset does not clear a UCI STATE-bit wedge (#112); that still needs a
+physical power-cycle. Whatever program was running on the C64 is gone
+after a timeout.
 
 ```asm
 ; Tail of every UCI routine:
@@ -93,14 +197,21 @@ crash the device firmware. The mechanism, the budget and the hygiene pass
 are in [`docs/u64_recovery.md`](u64_recovery.md); what matters here is the
 shape:
 
+- **Since [#252](https://github.com/JC-000/c64-test-harness/issues/252)
+  the costs in this list apply only where `transport.write_memory` does not
+  chunk.** That means a post-safe device, where every POST is collected, or
+  a transport other than `Ultimate64Transport`. On a leak-prone or unknown
+  grade `Ultimate64Transport.write_memory` chunks every write below at the
+  client threshold, so none of them costs an attachment. The costs are
+  kept as the record of the pre-#252 behaviour and of the blob sizes.
 - `_execute_uci_routine` writes its routine with a single
-  `transport.write_memory(code_addr, code)` (`uci_network.py:1735`). It does
-  **not** chunk. Measured host-side by `len()` (no device traffic,
-  2026-09-10), every command builder emits more than the C64U's 128-byte PUT
-  threshold — `build_uci_command` 133, `build_get_ip` 138,
+  `transport.write_memory(code_addr, code)` (`uci_network.py:1780`). Before
+  #252 that did **not** chunk. Measured host-side by `len()` (no device
+  traffic, 2026-09-10), every command builder emits more than the C64U's
+  128-byte PUT threshold — `build_uci_command` 133, `build_get_ip` 138,
   `build_socket_read` 149, `build_tcp_connect` / `build_udp_connect` 159,
-  `build_socket_write` 170 — so the routine write takes the POST path and
-  leaks one attachment. Only `build_uci_probe` / `build_uci_status_peek`
+  `build_socket_write` 170 — so the routine write took the POST path and
+  leaked one attachment. Only `build_uci_probe` / `build_uci_status_peek`
   (12 bytes) and `build_socket_close` (112) fit under it — those three
   calls cost nothing. `turbo_safe=True` changes that unevenly: it pushes
   `build_socket_close` to 341, over the threshold and onto POST, while

@@ -36,7 +36,7 @@ Reusable test harness for Commodore 64 programs. Automates C64 programs via the 
 - **`run_prg_via_sys(target, prg)`** — loads a PRG by `write_memory` and starts it with a typed `SYS` (entry parsed from the BASIC stub by `parse_basic_sys_address`, or `sys_addr=`), then resumes; the load path that keeps an external cartridge on the U64's bus: the firmware's runner load (`run_prg`/`load_prg`) deselects it stickily across resets until `Cartridge Preference` is re-PUT, which this helper does (#211, #217). Works on both backends.
 - **Ultimate64Client robustness** — public `send_text(text, *, finish_with_return=True)` for KERNAL keyboard-buffer injection (waits for the buffer to fully drain — `$C6 == 0` — before each chunk, so keystrokes can't land at stale offsets); `run_prg(..., fallback_on_404=True)` transparently sideloads via `write_mem` when a wedged runner answers HTTP 404 (observed on fw 3.14d; not looked for on other firmware), triggering with `RUN` for `$0801` BASIC-stub PRGs and `SYS <addr>` for pure-ML; connection drops mid-request (reset / broken pipe / truncated response) map to `Ultimate64TimeoutError` and short `readmem` payloads raise `Ultimate64ProtocolError`; `write_mem_query_threshold` is per-instance with auto-detect (128 on firmware without the Temp-folder fix — C64U 1.1.0, or Ultimate-line < 3.15; 48 on Ultimate-line ≥ 3.15) and a kwarg override
 - **Automatic `/Temp` hygiene (firmware predating 1541ultimate#686)** — on a device whose firmware never collects the managed `/Temp` attachments that every body-carrying REST call leaves behind (the C64 Ultimate on 1.1.0; any Ultimate-line < 3.15), enough accumulation wedges the device, recoverable only by a physical power-cycle. `Ultimate64Client` arms a capability-gated hygiene pass automatically on such firmware: it counts attachment-creating requests, runs an FTP-based GC when a per-client budget is reached and again on `DeviceLock` release, and refuses further body-carrying calls if the GC cannot run rather than walking the device toward the wedge. What that wedge *is* matters for what the pass can do: it is a firmware **crash**, not a full filesystem. The C64 FPGA keeps running while the firmware stops answering the network *and* stops responding to the physical menu button — and in the one reproduction anyone has, the accumulation at that point was 15 directory entries holding 967,680 bytes (945 KiB) on a **16 MiB** RAM disk, nowhere near exhaustion. Treat that as a datapoint and not a limit: it was taken on a *different* device and firmware (a U64E while it ran 3.14d), n unrecorded, and it has no standing for a C64U on 1.1.0. (16 MiB because `ramdisk.cc:25` sizes the disk from the linker symbols `__ram_disk_start` / `__ram_disk_limit`, `0x02000000`-`0x03000000` at tag `1.1.0`; the `3 * 1024 * 1024` written beside them is a stale comment — issue #261.) The FTP server is part of the firmware that crashes, so the GC is unavailable exactly when a device is wedged: the pass is **prevention only**, `gc_temp_folder` is never a recovery step, and `machine:reboot` does not clear `/Temp` either (it is a C64-level reset; the RAM disk survives it and only a power-on clears it). It stays disarmed on firmware that self-collects (Ultimate-line ≥ 3.15), so there is no behaviour change there. Env: `U64_AUTO_TEMP_GC` (force on/off), `U64_TEMP_GC_BUDGET`, `U64_TEMP_GC_KEEP`, `U64_TEMP_GC_REQUIRED=0` (downgrade the refusal to a warning). See [docs/u64_recovery.md](docs/u64_recovery.md).
-- **Queue-aware device locking** — `DeviceLock` heartbeats the lockfile mtime every ~15 s while held (configurable via `heartbeat_interval`), and `acquire(timeout, *, progress_window=60.0)` extends a waiter's deadline indefinitely against any live, heartbeating holder — so multi-hour holders no longer cause waiter timeouts. `acquire_or_raise()` raises `DeviceLockTimeout` (a `TimeoutError` subclass; exported from the top-level package) with structured diagnostics — holder PID, liveness, lockfile age, REST reachability — and a diagnosed-state message that distinguishes "queued behind live, progressing" / "holder may be wedged" / "stale lock from dead PID" / "no holder metadata" so callers stop conflating "queued" with "device broken". `create_manager(lock_timeout=...)` threads through to `_LockedU64Manager`, which now raises `DeviceLockTimeout` on failure; default 60 s and 120 s ceiling for ad-hoc work — widening past that is rarely useful with the heartbeat in place. Optional `c64-test-harness[notify]` extra adds `watchdog`-based fs-event wakeups
+- **Queue-aware device locking** — `DeviceLock` heartbeats the lockfile mtime every ~15 s while held (configurable via `heartbeat_interval`), and `acquire(timeout, *, progress_window=60.0)` extends a waiter's deadline indefinitely against any live, heartbeating holder — so multi-hour holders no longer cause waiter timeouts. `acquire_or_raise()` raises `DeviceLockTimeout` (a `TimeoutError` subclass; exported from the top-level package) with structured diagnostics — holder PID, liveness, lockfile age, REST reachability — and a diagnosed-state message that distinguishes "queued behind live, progressing" / "holder may be wedged" / "stale lock from dead PID" / "no holder metadata" so callers stop conflating "queued" with "device broken". `create_manager(lock_timeout=...)` threads through to `_LockedU64Manager`, which now raises `DeviceLockTimeout` on failure; 60 s default, widen via `lock_timeout=` or `U64_DEVICE_LOCK_TIMEOUT` — though widening is rarely useful with the heartbeat in place. Where no timeout is passed, `U64_DEVICE_LOCK_TIMEOUT` supplies it, read at call time: a budget, not a gate (it changes how long a wait may last, never whether anything runs; unset, `DeviceLock.acquire()` waits 30 s via `DEFAULT_ACQUIRE_TIMEOUT` and `create_manager()` 60 s via `unified_manager.DEFAULT_LOCK_TIMEOUT`; a malformed, non-positive or non-finite value raises `DeviceLockTimeoutConfigError`). A blocked acquire logs a periodic progress line (holder PID, lockfile age, queue depth) and calls `on_wait(elapsed, holder_pid, lockfile_age, queue_depth)` when given one. Another thread can rescue a wait on a lock this thread already holds only within the 2.0 s grace (`_SELF_HELD_WAIT_GRACE`): a longer timeout is capped with a WARNING. Details in `docs/device_locking.md`. Optional `c64-test-harness[notify]` extra adds `watchdog`-based fs-event wakeups
 - **Per-routine capture refresh** — `DebugCapture.with_fresh_fpga(client, *, capture_kwargs=None, reboot_settle_seconds=12.0)` classmethod reboots the U64 before each capture to recover from the UDP debug-stream rate degradation that builds up during sustained workloads (issue #81)
 - **VICE Darwin autostart fix** — `ViceProcess` auto-injects `-autostartprgmode 1` on macOS when `prg_path` is set, unless the caller has already passed `-autostartprgmode` via `extra_args`
 - **Flexible configuration** — `HarnessConfig` with TOML file and environment variable support
@@ -476,7 +476,7 @@ Key fields: `vice_host`, `vice_port`, `vice_executable`, `vice_prg_path`, `vice_
 
 `Ultimate64Transport` talks to an Ultimate 64 / U64 Elite (1541ultimate **Ultimate-line** firmware, versioned `3.x`) or a C64 Ultimate (**CBM-line**, versioned `1.x`) via its REST API over HTTP. No emulator, no TCP monitor — memory reads/writes and keyboard injection go through the device's DMA endpoints.
 
-The two lines' firmware fixes land on separate schedules, so the harness never branches on a version-string prefix. `DeviceCapabilities` (`backends/u64_capabilities.py`) resolves each behaviour as a named capability with its own version rule, and reports `None` — not a guess — for anything the version string genuinely cannot settle (work merged after the `3.15` bump ships in builds that all report `"3.15"`). One gap to know about: `_CBM_WRITEMEM_FIXED_FROM` is `None`, so **no** CBM-line firmware can grade as carrying the Temp-folder fix — including the build that eventually ships it. The constant has to be set by hand when that firmware lands, and nothing fails if it is not; the device simply stays on the conservative threshold forever (issue #248).
+The two lines' firmware fixes land on separate schedules, so the harness never branches on a version-string prefix. `DeviceCapabilities` (`backends/u64_capabilities.py`) resolves each behaviour as a named capability with its own version rule, and reports `None` — not a guess — for anything the version string genuinely cannot settle (work merged after the `3.15` bump ships in builds that all report `"3.15"`). One gap to know about: `_CBM_WRITEMEM_FIXED_FROM` is `None`, so **no** CBM-line firmware can grade as carrying the Temp-folder fix — including the build that eventually ships it. The constant has to be set by hand when that firmware lands; the grade never changes on its own. What the harness does instead is say so: a C64U reporting firmware newer than `_CBM_LAST_KNOWN_UNFIXED` (1.1.0) while the constant is still `None` emits a `CbmFixConstantStaleWarning` (visible in pytest's warnings summary; escalate it with `-W error::c64_test_harness.CbmFixConstantStaleWarning`) plus a WARNING log line, once per version per process — and the device stays on the conservative threshold until someone checks that release and edits the constant (issue #248).
 
 ```python
 from c64_test_harness import (
@@ -484,7 +484,7 @@ from c64_test_harness import (
     wait_for_text, wait_for_stable,
 )
 
-transport = Ultimate64Transport(host="192.168.1.81")  # optional: password="..."
+transport = Ultimate64Transport(host="<device>")  # optional: password="..."
 try:
     wait_for_text(transport, "READY.", timeout=10)
     send_text(transport, "PRINT 2+2\r")
@@ -495,7 +495,7 @@ finally:
     transport.close()
 ```
 
-**Large single-call `write_memory()` on hardware is not byte-verified.** `Ultimate64Client.write_mem`'s POST form declares no upper bound and is verified only to 2048 bytes (`backends/ultimate64_client.py:1371`); a 47 kB body written in one call came back with exactly one wrong byte at a different offset each time, while the same bytes through `write_bytes()` (84-byte chunks) were byte-exact (issue #231, U64E fw `v3.15-78-g71480a9d`, n=2 — sporadic, so absence in a given run proves nothing). Verify large writes, or chunk them.
+**Large single-call `write_memory()` on hardware is not byte-verified.** `Ultimate64Client.write_mem`'s POST form declares no upper bound and is verified only to 2048 bytes (`backends/ultimate64_client.py:1371`); a 47 kB body written in one call came back with exactly one wrong byte at a different offset each time, while the same bytes through `write_bytes()` (84-byte chunks at the time; it now chunks at the transport's threshold, #252) were byte-exact (issue #231, U64E fw `v3.15-78-g71480a9d`, n=2 — sporadic, so absence in a given run proves nothing). Verify large writes, or chunk them.
 
 Multiple devices can be pooled with `Ultimate64InstanceManager` — the same pattern as `ViceInstanceManager`, compatible with `run_parallel()`:
 
@@ -503,8 +503,8 @@ Multiple devices can be pooled with `Ultimate64InstanceManager` — the same pat
 from c64_test_harness import Ultimate64Device, Ultimate64InstanceManager, run_parallel
 
 devices = [
-    Ultimate64Device(host="192.168.1.81"),
-    Ultimate64Device(host="192.168.1.82"),
+    Ultimate64Device(host="<device-a>"),
+    Ultimate64Device(host="<device-b>"),
 ]
 with Ultimate64InstanceManager(devices) as mgr:
     with mgr.instance() as inst:
@@ -585,12 +585,12 @@ Before connecting, probe whether a U64 device is reachable:
 from c64_test_harness import probe_u64, is_u64_reachable
 
 # Quick boolean check
-if is_u64_reachable("192.168.1.81"):
+if is_u64_reachable("<device>"):
     print("Device is up")
 
 # Detailed probe: ICMP ping -> TCP connect -> REST API check
-result = probe_u64("192.168.1.81")
-print(result.summary)  # "U64 at 192.168.1.81: reachable (ping=1.2ms, port=0.8ms, api=5.3ms)"
+result = probe_u64("<device>")
+print(result.summary)  # "U64 at <device>: reachable (ping=1.2ms, port=0.8ms, api=5.3ms)"
 # result.reachable, result.ping_ok, result.port_ok, result.api_ok, result.latency_ms, result.error
 ```
 
@@ -627,7 +627,7 @@ See `examples/ultimate64_hello.py` for a full BASIC round-trip demo and `scripts
 
 ### SocketDMA write fast path
 
-> **Do not enable SocketDMA writes.** The write fast path is disabled pending a stability review; prefer `write_bytes` / `run_prg_via_sys` for bulk data (they chunk at a fixed 84 bytes, `memory.py:16`). Note what that fixed 84 does and does not buy you: it is under the 128-byte threshold of leak-prone firmware, so those chunks take the non-leaking `PUT ...?data=` path there — but it is *over* the 48-byte threshold of fixed firmware, where they take POST instead. That is harmless only because threshold-48 and carries-#686 are the same condition today, so those POSTs land on firmware that collects them. The description below documents the mechanism for when it is re-enabled.
+> **Do not enable SocketDMA writes.** The write fast path is disabled pending a stability review; prefer `write_bytes` / `run_prg_via_sys` for bulk data. On an Ultimate transport they chunk at the transport's `rest_put_chunk_size` — the client's `write_mem_query_threshold`, capped at 128 — so every chunk takes the non-leaking `PUT ...?data=` path on **every** firmware grade, leak-prone, unknown and post-safe alike; VICE and other transports keep the fixed 84 bytes (`memory.py`, the text-monitor limit). On a post-safe device that means more, smaller requests (48-byte PUTs where it used to send 84-byte POSTs, roughly 1.75x as many), a cost accepted by owner decision 2026-09-15 (#252). The description below documents the mechanism for when it is re-enabled.
 
 The Ultimate firmware serves a binary "SocketDMA" channel on TCP port 64 (on the C64 Ultimate it ships disabled — enable **Network Settings → "Ultimate DMA Service"** — and a refused connect simply falls back to REST). `Ultimate64Transport` can route bulk `write_memory` calls through it:
 
@@ -792,7 +792,7 @@ Capture SID audio from a U64 via its UDP audio stream:
 ```python
 from c64_test_harness import capture_sid_u64, SidFile, Ultimate64Client
 
-client = Ultimate64Client(host="192.168.1.81")
+client = Ultimate64Client(host="<device>")
 sid = SidFile.from_file("tune.sid")
 result = capture_sid_u64(client, sid, out_wav="/tmp/u64_audio.wav", duration_seconds=10.0)
 print(f"{result.packets_received} packets, {result.packets_dropped} dropped")
@@ -893,7 +893,7 @@ from c64_test_harness import uci_socket_write, uci_socket_read, uci_socket_close
 ident = uci_probe(transport)
 
 # Query assigned IP address
-ip = uci_get_ip(transport)   # e.g. "192.168.1.81"
+ip = uci_get_ip(transport)   # e.g. "192.0.2.64" (dotted quad)
 
 # TCP socket roundtrip
 sock_id = uci_tcp_connect(transport, "example.com", 80)
@@ -1043,16 +1043,19 @@ pytest tests/test_vice_binary.py -v      # VICE binary monitor protocol tests
 # Ultimate 64 live tests (requires U64_HOST; suites that mutate device
 # state — reset, RAM writes, config changes — additionally require
 # U64_ALLOW_MUTATE=1)
-U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 pytest tests/test_u64_feature_parity_live.py -v
-U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 pytest tests/test_u64_turbo_bench_live.py -v
-TURBO_CONTRACT_LIVE=1 U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 pytest tests/test_turbo_contract_live.py -v  # cross-generation CPU-speed contract
-SOCKETDMA_LIVE=1 U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 pytest tests/test_socketdma_live.py -v  # SocketDMA fast path + cross-generation REU contract
+U64_HOST=<device> U64_ALLOW_MUTATE=1 pytest tests/test_u64_feature_parity_live.py -v
+U64_HOST=<device> U64_ALLOW_MUTATE=1 X25519_PRG=/path/to/x25519.prg pytest tests/test_u64_turbo_bench_live.py -v  # 12 run_prg uploads
+TURBO_CONTRACT_LIVE=1 U64_HOST=<device> U64_ALLOW_MUTATE=1 pytest tests/test_turbo_contract_live.py -v  # cross-generation CPU-speed contract
+SOCKETDMA_LIVE=1 U64_HOST=<device> U64_ALLOW_MUTATE=1 pytest tests/test_socketdma_live.py -v  # SocketDMA fast path + cross-generation REU contract
 
 # Run all U64 live tests in parallel (DeviceLock serializes access)
-python3 scripts/run_u64_parallel_locked.py 192.168.1.81
+python3 scripts/run_u64_parallel_locked.py <device>
 
 # Stress test the cross-process queueing (6 workers, 5 rounds each)
-python3 scripts/stress_u64_queue.py 192.168.1.81 --workers 6 --rounds 5
+python3 scripts/stress_u64_queue.py <device> --workers 6 --rounds 5
+
+# No script or live module has a default host: name the device (argument
+# or U64_HOST) or it refuses with exit 2 / skips (#243, #275).
 ```
 
 Every live test runs inside the autouse `device_lock_guard` fixture, so `DeviceLock` serializes access to the physical device whether or not the test asks for it. Multiple agents (separate OS processes) can safely run tests in parallel — the lock file queues them automatically. See [Shared-device contract](#shared-device-contract-devicelock) for what that obliges non-test tools to do, and set `U64_REQUIRE_DEVICE_LOCK=1` to make an unlocked destructive call an error instead of a warning.

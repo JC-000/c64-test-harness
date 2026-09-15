@@ -8,10 +8,10 @@ correctness against RFC 7748.
 Requires U64_HOST environment variable (and optionally U64_PASSWORD).
 
 Usage:
-    U64_HOST=192.168.1.81 python3 scripts/bench_x25519_u64_turbo.py
-    U64_HOST=192.168.1.81 python3 scripts/bench_x25519_u64_turbo.py --all
-    U64_HOST=192.168.1.81 python3 scripts/bench_x25519_u64_turbo.py --speeds 48,16,4,1
-    U64_HOST=192.168.1.81 python3 scripts/bench_x25519_u64_turbo.py --timeout 1800
+    U64_HOST=<device> python3 scripts/bench_x25519_u64_turbo.py
+    U64_HOST=<device> python3 scripts/bench_x25519_u64_turbo.py --all
+    U64_HOST=<device> python3 scripts/bench_x25519_u64_turbo.py --speeds 48,16,4,1
+    U64_HOST=<device> python3 scripts/bench_x25519_u64_turbo.py --timeout 1800
 """
 from __future__ import annotations
 
@@ -25,6 +25,9 @@ import time
 # ---------------------------------------------------------------------------
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from _u64_host import hold_device_lock, require_u64_host  # noqa: E402
 
 from c64_test_harness.backends.ultimate64 import Ultimate64Transport
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
@@ -405,11 +408,10 @@ def main() -> None:
     speeds.sort(reverse=True)
 
     # Connect to U64
-    host = os.environ.get("U64_HOST")
-    if not host:
-        print("ERROR: U64_HOST environment variable not set.")
-        print("Usage: U64_HOST=192.168.1.81 python3 scripts/bench_x25519_u64_turbo.py")
-        sys.exit(1)
+    host = require_u64_host(
+        argv0="python3 scripts/bench_x25519_u64_turbo.py",
+        usage="U64_HOST=<device> python3 scripts/bench_x25519_u64_turbo.py",
+    )
     password = os.environ.get("U64_PASSWORD")
 
     # Load PRG and labels
@@ -442,55 +444,58 @@ def main() -> None:
     )
     print(f"\nBenchmark subroutine: {len(bench_code)} bytes at ${BENCH_SUB:04X}")
 
-    # Connect to device
-    print(f"\nConnecting to U64 at {host} ...")
-    client = Ultimate64Client(host=host, password=password, timeout=30.0)
-    transport = Ultimate64Transport(host=host, password=password, client=client)
+    # Connect to device -- under the DeviceLock from the first request to
+    # the last restore: run_prg replaces whatever a neighbouring lane has
+    # on the machine (#244, docs/device_locking.md).
+    with hold_device_lock(host):
+        print(f"\nConnecting to U64 at {host} ...")
+        client = Ultimate64Client(host=host, password=password, timeout=30.0)
+        transport = Ultimate64Transport(host=host, password=password, client=client)
 
-    # Verify connectivity
-    try:
-        info = client.get_info()
-        product = info.get("product", "unknown")
-        firmware = info.get("firmware_version", "unknown")
-        print(f"  Connected: {product}, firmware {firmware}")
-    except Exception as e:
-        print(f"ERROR: Cannot reach U64 at {host}: {e}")
-        sys.exit(1)
-
-    # Snapshot original state for restore
-    print("  Snapshotting turbo state ...")
-    original_state = snapshot_state(client)
-    original_mhz = get_turbo_mhz(client)
-    print(f"  Original turbo: {original_mhz} MHz" if original_mhz else "  Original turbo: Off")
-
-    # Enable REU — x25519 program requires 512 KB REU for lookup tables
-    print("  Enabling REU (512 KB) ...")
-    set_reu(client, enabled=True, size="512 KB")
-    time.sleep(0.5)
-
-    print(f"\nWill benchmark {len(speeds)} speed(s): {speeds}")
-    print(f"Per-speed timeout: {args.timeout:.0f}s")
-
-    # Run benchmarks
-    results: list[dict] = []
-    try:
-        for mhz in speeds:
-            result = run_one_speed(
-                client, transport, prg_data, labels, mhz, args.timeout,
-            )
-            if result is not None:
-                results.append(result)
-    except KeyboardInterrupt:
-        print("\n\nInterrupted by user.")
-    finally:
-        # Restore original turbo state
-        print(f"\nRestoring original turbo state ...")
+        # Verify connectivity
         try:
-            restore_state(client, original_state)
-            restored = get_turbo_mhz(client)
-            print(f"  Restored: {restored} MHz" if restored else "  Restored: Off")
+            info = client.get_info()
+            product = info.get("product", "unknown")
+            firmware = info.get("firmware_version", "unknown")
+            print(f"  Connected: {product}, firmware {firmware}")
         except Exception as e:
-            print(f"  WARNING: Failed to restore state: {e}")
+            print(f"ERROR: Cannot reach U64 at {host}: {e}")
+            sys.exit(1)
+
+        # Snapshot original state for restore
+        print("  Snapshotting turbo state ...")
+        original_state = snapshot_state(client)
+        original_mhz = get_turbo_mhz(client)
+        print(f"  Original turbo: {original_mhz} MHz" if original_mhz else "  Original turbo: Off")
+
+        # Enable REU — x25519 program requires 512 KB REU for lookup tables
+        print("  Enabling REU (512 KB) ...")
+        set_reu(client, enabled=True, size="512 KB")
+        time.sleep(0.5)
+
+        print(f"\nWill benchmark {len(speeds)} speed(s): {speeds}")
+        print(f"Per-speed timeout: {args.timeout:.0f}s")
+
+        # Run benchmarks
+        results: list[dict] = []
+        try:
+            for mhz in speeds:
+                result = run_one_speed(
+                    client, transport, prg_data, labels, mhz, args.timeout,
+                )
+                if result is not None:
+                    results.append(result)
+        except KeyboardInterrupt:
+            print("\n\nInterrupted by user.")
+        finally:
+            # Restore original turbo state
+            print(f"\nRestoring original turbo state ...")
+            try:
+                restore_state(client, original_state)
+                restored = get_turbo_mhz(client)
+                print(f"  Restored: {restored} MHz" if restored else "  Restored: Off")
+            except Exception as e:
+                print(f"  WARNING: Failed to restore state: {e}")
 
     # Summary
     print_summary(results)

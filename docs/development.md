@@ -284,8 +284,9 @@ teardown of its module-scoped `transport` fixture — the statements after its
 earlier, so the residue was unambiguous — `U64 Specific Settings / CPU Speed`
 read `' 8'` against a default of `' 1'` — and nothing in the harness noticed or
 told anyone ([#276](https://github.com/JC-000/c64-test-harness/issues/276); the
-measurement is a per-item `current`-vs-`default` comparison over 201 items, the
-attribution to that window strong but circumstantial). An 8× device does not
+measurement is a per-item `current`-vs-`default` comparison over 201 items on
+the U64E, 2026-09-10, and the attribution to that window is strong but
+circumstantial). An 8× device does not
 fail a test. It produces plausible, wrong timing numbers for every later run on
 a bench several projects share. That particular fixture is weaker than a
 `finally`, too: its teardown is a bare post-`yield` sequence with no
@@ -383,6 +384,28 @@ The unit contract lives in `tests/test_entry_baseline.py` (mocked; no hardware).
 
 The `U64_HOST`-gated capture suites (`tests/test_chromatic_capture_live.py`, `tests/test_multi_sid_parallel_live.py`) write their `.wav` + `.json` output to a per-run `tmp_path` directory by default, so an ordinary bench run never modifies the tracked reference under `tests/wav_captures/` (issue #220: a live run used to leave ten tracked files changed with no test failing, and the reference drifted with every run). Set `WAV_CAPTURES_REFRESH=1` to write into `tests/wav_captures/<suite>/` instead — a deliberate refresh to review and commit on purpose. The path decision is `tests/wav_capture_paths.py:capture_dir()`; `tests/test_wav_capture_paths.py` pins it without hardware. Each live module's `wav_dir` fixture records the directory it used as a testsuite property and prints it, so a scratch capture can be found afterwards (`-s`, or the junit XML).
 
+### `U64_DEVICE_LOCK_TIMEOUT` — a budget, not a gate
+
+`U64_DEVICE_LOCK_TIMEOUT` is a budget, not a gate: unlike every variable
+in the tables around it, it never decides whether a test or a request
+runs, only how long a device-lock acquire may wait (issue #233). Unset,
+`DeviceLock.acquire()` waits 30 s and `create_manager()` / `UnifiedManager`
+wait 60 s, exactly as before. Set, it replaces both wherever the caller did
+not pass `timeout=` / `lock_timeout=`; an explicit argument always wins.
+It is read at call time. A malformed, non-positive or non-finite value
+raises `DeviceLockTimeoutConfigError` before any device is contacted, and
+an empty value means unset, with a WARNING. A live, progressing holder
+still extends the deadline indefinitely, so the budget bounds waits on
+wedged or dead holders. Details and the progress reporting that goes with
+it: [docs/device_locking.md](device_locking.md) § "The acquire budget".
+
+`tests/conftest.py`'s `device_lock_guard`, the autouse lock around every
+live test, reads `U64_DEVICE_LOCK_TIMEOUT` through the same resolver, with
+its own 300 s default when the variable is unset. Before #301 it parsed the
+value itself: a malformed value silently became 300 s, and `0`, `inf` or
+`nan` reached the lock as an unchecked explicit timeout. Now a bad value
+fails the live test up front.
+
 ### Hardware and network live gates (all opt-in, skip cleanly when unset)
 
 Most gates below also need `U64_HOST` (or the test's own host knob), and
@@ -396,7 +419,7 @@ live suites — see [#268](https://github.com/JC-000/c64-test-harness/issues/268
 
 | Gate | Test | Needs | What it pins |
 |---|---|---|---|
-| `U64_NOTICE_LIVE=1` | `tests/test_unlocked_notice_live.py` | run with `U64_HOST` unset (host via `U64_NOTICE_HOST`) | unlocked-client notice 0× on a locked lane, 1× bare, thread-scoped under `run_parallel` (#206) |
+| `U64_NOTICE_LIVE=1` | `tests/test_unlocked_notice_live.py` | run with `U64_HOST` unset; `U64_NOTICE_HOST` names the device and is required (no default, #275) | unlocked-client notice 0× on a locked lane, 1× bare, thread-scoped under `run_parallel` (#206) |
 | `SID_ADDRESSING_LIVE=1` | `tests/test_sid_addressing_isolation_live.py` | two SIDs fitted | distinct decode with mirroring off, aliasing with it on, read-back raises on mismatch (#204) |
 | `AUDIO_RATE_LIVE=1` | `tests/test_audio_rate_lock_live.py` | NTSC, ≥ 60 s capture | `U64_NTSC_AUDIO_RATE_HZ` via the 64:3 identity; drop/reorder runs discarded (#205) |
 | `RRNET_LIVE=1` | `tests/test_run_prg_cartridge_visibility_live.py`, `tests/test_cs8900a_fifo_live.py`, `tests/test_first_exchange_live.py` | RR-Net on the expansion port, cabled to `RRNET_IFACE` (default `en4`) | runner load path deselects the cartridge (#217), FIFO facts (#219), RX-queue drain before the first exchange (#222) |
@@ -544,13 +567,21 @@ themselves; live checks are serialised by the supervisor under the
 
 The clause is in force until `DeviceCapabilities.writemem_post_safe`
 reports `True` for that device. **It does not lapse on its own.** That
-needs `_CBM_WRITEMEM_FIXED_FROM`
-(`src/c64_test_harness/backends/u64_capabilities.py:59`) set to the first
-fixed C64U version: it is `None` today, and `_writemem_post_safe`
-short-circuits on that (`:192-195`), grading **every** C64U firmware as
-leak-prone by design. So a firmware bump alone changes nothing — someone
-must first establish which version carries #686 and edit that constant,
-and nothing fails if they do not. Tracked as #248.
+needs `_CBM_WRITEMEM_FIXED_FROM` (in
+`src/c64_test_harness/backends/u64_capabilities.py`) set to the first
+fixed C64U version: it is `None` today, and
+`DeviceCapabilities._writemem_post_safe` short-circuits on that, grading
+**every** C64U firmware as leak-prone by design. So a firmware bump alone
+changes no grade — someone must first establish which version carries
+#686 and edit that constant. What a bump does change is that it is no
+longer silent: a C64U reporting firmware newer than
+`_CBM_LAST_KNOWN_UNFIXED` (1.1.0) while the constant is still `None`
+emits a `CbmFixConstantStaleWarning` (shown in pytest's warnings summary
+even on a green run; exported from the package root so suites can
+escalate it with `-W error::c64_test_harness.CbmFixConstantStaleWarning`)
+and a WARNING log line, once per version per process. The grade stays
+`False`, and the threshold stays 128, until the constant is edited.
+Tracked as #248.
 Full statement in CLAUDE.md § "Standing hardware-safety clause" and
 `docs/u64_recovery.md`.
 

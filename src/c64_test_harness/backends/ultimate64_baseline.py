@@ -30,9 +30,14 @@ The contract, as decided by the owner in #227:
   over) and
   **never** a store in :data:`BASELINE_NEVER_TOUCH` — the three network
   stores, the SID socket store (its ``effectuate`` powers the socketed
-  SIDs off) and the RTC (the next PUT writes the clock chip); each entry
-  carries its reason.  Categories the device does not list are skipped
-  with a log line — the C64 Ultimate's set differs.
+  SIDs off) and the RTC (the next PUT writes the clock chip -- Ultimate
+  line only; the C64 Ultimate has no ``Clock Settings`` store at all);
+  each entry carries its reason, and
+  :data:`BASELINE_NEVER_TOUCH_BY_GENERATION` says whether each store
+  exists on each generation and what its reason was read against.
+  Categories the device does not list are skipped with a log line — the
+  C64 Ultimate's set differs (both devices' lists are recorded, with
+  their source, in :data:`BASELINE_RECORDED_CATEGORY_SETS`).
 * **Reset, then assert.**  On a shared device ``current != default`` at
   entry is the ordinary state whenever another lane is mid-run or just
   finished; that pre-reset drift is logged per item at INFO ("inherited
@@ -118,7 +123,11 @@ __all__ = [
     "BASELINE_CATEGORIES",
     "BASELINE_EXCLUDED_CATEGORIES",
     "BASELINE_NEVER_TOUCH",
+    "BASELINE_NEVER_TOUCH_BY_GENERATION",
+    "BASELINE_RECORDED_CATEGORY_SETS",
+    "BASELINE_UNCLASSIFIED_CATEGORIES",
     "BaselineReport",
+    "RecordedCategorySet",
     "U64BaselineError",
     "apply_factory_baseline",
     "baseline_default_for_generation",
@@ -279,6 +288,9 @@ BASELINE_NEVER_TOUCH: dict[str, str] = {
         "u64_config.cc:704/708)"
     ),
     "Clock Settings": (
+        "ULTIMATE LINE ONLY (read at 7f6fcb51 = v3.15-85, the U64E's flashed "
+        "build: rtc_i2c.cc:79-80 registers the store, "
+        "target/u64/nios2/ultimate/Makefile:67 builds it).  "
         "the RTC (Year..Seconds, defaults 2015-10-13 16:52:55, rtc.cc:26-34). "
         "RtcConfigStore::effectuate is empty, so a reset only sets RAM + "
         "staleEffect and shows neither drift nor mismatch -- the RAM items "
@@ -286,13 +298,205 @@ BASELINE_NEVER_TOUCH: dict[str, str] = {
         "at_open_config fills them from the chip only when the on-device "
         "menu opens (measured U64E 2026-09-05) -- while arming the rollback: "
         "the next PUT to the category runs at_close_config (rtc.cc:350-409), "
-        "which writes every item, 2015 included, to the RTC chip"
+        "which writes every item, 2015 included, to the RTC chip.  "
+        "ON THE C64 ULTIMATE THIS STORE DOES NOT EXIST and this reason has "
+        "no subject: the u64ii target at tag 1.1.0 builds rtc_dummy.cc "
+        "(target/u64ii/riscv/ultimate/Makefile:70), which registers no store "
+        "(read from source), and Clock Settings is absent from that device's "
+        "GET /v1/configs (measured C64U fw 1.1.0, 2026-09-15, n=1, #287).  "
+        "The entry stays: on the C64U its absence is harmless -- "
+        "apply_factory_baseline skips unlisted categories, and refusing a "
+        "name that cannot be passed costs nothing -- while removing it would "
+        "unprotect the U64E, where the rollback argument above holds"
     ),
 }
 
 #: The never-touch names as a tuple (the pre-review name; kept as the
 #: public alias of :data:`BASELINE_NEVER_TOUCH`'s keys).
 BASELINE_EXCLUDED_CATEGORIES: tuple[str, ...] = tuple(BASELINE_NEVER_TOUCH)
+
+
+@dataclass(frozen=True)
+class RecordedCategorySet:
+    """One device's ``GET /v1/configs`` category list, and where it came from.
+
+    The category set is a compile-time property of a firmware build, so a
+    record is per generation *and* firmware: a store appearing in a newer
+    build's list is exactly what these records exist to make visible.
+    """
+
+    generation: str
+    device: str
+    firmware: str
+    date: str
+    source: str
+    categories: frozenset[str]
+
+
+#: The category list each device generation reports, each with its
+#: source.  The C64U record is a device listing taken verbatim, never
+#: projected from source; the U64E names were read directly on 2026-09-15
+#: (and earlier reconstructed from a per-category read and cross-checked
+#: against an older listing and the firmware source -- its ``source`` says
+#: which).  ``tests/test_entry_baseline.py`` asserts that every name in
+#: every record is classified (in :data:`BASELINE_CATEGORIES`,
+#: :data:`BASELINE_NEVER_TOUCH` or :data:`BASELINE_UNCLASSIFIED_CATEGORIES`),
+#: so a store a device lists without anyone having decided about it fails
+#: a test instead of being silently never reset.  When a firmware update
+#: changes a device's list, re-read it (one bodyless ``GET /v1/configs``,
+#: zero ``/Temp`` cost) and update the record's date and firmware too.
+BASELINE_RECORDED_CATEGORY_SETS: dict[str, RecordedCategorySet] = {
+    "ultimate": RecordedCategorySet(
+        generation="ultimate",
+        device="U64E (Ultimate 64 Elite, 10.43.23.81)",
+        firmware="3.15 (v3.15-85, 7f6fcb51)",
+        date="2026-09-15",
+        source=(
+            "category names reconstructed from the 2026-09-12 read-only "
+            "per-category read (U64E fw 3.15, DeviceLock held; #288) -- 19 "
+            "categories = the twelve covered + the five never-touch + UltiSID "
+            "Configuration + Data Streams; no saved listing of the names.  "
+            "Cross-checked against scripts/U64_DEVICE_PROBE.md section 5 "
+            "(fw 3.14, 2026-04-05, 'all 19') and against firmware source at "
+            "7f6fcb51 (v3.15-85): target/u64/nios2/ultimate/Makefile builds "
+            "rtc_i2c.cc (:67, Clock Settings), network_esp32.cc (:143, WiFi "
+            "settings) and data_streamer.cc (:170, Data Streams) and not "
+            "bling_board.cc; Speaker Mixer is #if U64 == 2 only.  "
+            "Confirmed when the names were read directly on 2026-09-15 "
+            "(U64E fw 3.15, one bodyless GET /v1/configs, DeviceLock held; "
+            "#287): 19 categories, identical to this record (#316); the "
+            "record's date is that read's.  The firmware identity "
+            "'v3.15-85, 7f6fcb51' comes from the flash record, not from that "
+            "read, which reported only firmware 3.15, fpga 125, core 1.4F"
+        ),
+        categories=frozenset({
+            "Audio Mixer", "SID Sockets Configuration", "UltiSID Configuration",
+            "SID Addressing", "U64 Specific Settings",
+            "C64 and Cartridge Settings", "Clock Settings",
+            "SoftIEC Drive Settings", "Printer Settings", "Network Settings",
+            "Ethernet Settings", "WiFi settings", "Tape Settings",
+            "LED Strip Settings", "Drive A Settings", "Drive B Settings",
+            "Data Streams", "Modem Settings", "User Interface Settings",
+        }),
+    ),
+    "cbm": RecordedCategorySet(
+        generation="cbm",
+        device="C64U (C64 Ultimate, 10.53.21.158)",
+        firmware="1.1.0 (tag 1.1.0 = 7b628eb1, u64ii target)",
+        date="2026-09-15",
+        source=(
+            "one bodyless GET /v1/configs, DeviceLock held, zero /Temp cost, "
+            "n=1, taken by the supervisor and recorded in #287; item counts "
+            "per category NOT read"
+        ),
+        categories=frozenset({
+            "Audio Mixer", "Speaker Mixer", "SID Sockets Configuration",
+            "UltiSID Configuration", "SID Addressing", "U64 Specific Settings",
+            "C64 and Cartridge Settings", "SoftIEC Drive Settings",
+            "Printer Settings", "Network Settings", "Ethernet Settings",
+            "WiFi settings", "Tape Settings", "LED Strip Settings",
+            "Keyboard Lighting", "Drive A Settings", "Drive B Settings",
+            "Data Streams", "Modem Settings", "User Interface Settings",
+        }),
+    ),
+}
+
+#: Categories a recorded device lists that are **in neither list**: not in
+#: the covered set (so the entry reset never resets them) and not refused
+#: as an argument either.  Recorded explicitly so "nobody has decided" is
+#: a stated fact rather than an absence.  Moving one into
+#: :data:`BASELINE_CATEGORIES` or :data:`BASELINE_NEVER_TOUCH` is an owner
+#: decision (#227), not an edit to make because a test went green.
+BASELINE_UNCLASSIFIED_CATEGORIES: dict[str, str] = {
+    "UltiSID Configuration": (
+        "both generations; outside the #227 covered set and never reviewed "
+        "for it.  No firmware reading recorded here"
+    ),
+    "Data Streams": (
+        "both generations; outside the #227 covered set and never reviewed "
+        "for it.  No firmware reading recorded here"
+    ),
+    "Speaker Mixer": (
+        "UNCLASSIFIED, C64U-ONLY (measured present on the C64U 2026-09-15, "
+        "absent from the U64E's list 2026-09-12).  Read from source at tag "
+        "1.1.0: compiled only under #if U64 == 2 "
+        "(software/u64/u64_config.cc:433-449); 11 ENUM items, Speaker Enable "
+        "default Enabled plus ten Vol items (:396-408).  effectuate_settings "
+        "calls enableDisableSpeaker then setSpeakerMixer (:443-447), which "
+        "toggle the ten Vol items' enabled flag and write 20 volume bytes to "
+        "the U64_SPEAKER_MIXER register block (:1164-1199).  No network, "
+        "power-rail, detection or chip write-back path was found, so a reset "
+        "(software/components/config.cc:567-576, then effectuate via "
+        "software/api/route_configs.cc:357-361) reads as an audible "
+        "speaker-level change only -- a source reading, not a measurement; "
+        "classification is the owner's call (#310)"
+    ),
+    "Keyboard Lighting": (
+        "UNCLASSIFIED, C64U-ONLY (measured present on the C64U 2026-09-15, "
+        "absent from the U64E's list 2026-09-12).  Read from source at tag "
+        "1.1.0: software/u64/bling_board.cc, built by "
+        "target/u64ii/riscv/ultimate/Makefile:151; the store is registered "
+        "unconditionally from the BlingBoard constructor (:26-30, :156) and "
+        "hidden from the menu (:165), which does not hide it from REST.  "
+        "7 items (:42-51: LedStrip Mode default 'Default', Auto SID Mode, "
+        "Pattern, SID Select, Strip Intensity, Fixed Color, Color tint).  "
+        "BlingBoard::effectuate_settings (:757-787) copies the items into "
+        "members and rewrites the LED map registers at U64II_BLINGBOARD_LEDS "
+        "(MapSingleColor / ConfigurePattern).  No network, power-rail or "
+        "persistent-chip path was found; a reset reads as a keyboard-LED "
+        "change only -- a source reading, not a measurement; classification "
+        "is the owner's call (#310)"
+    ),
+}
+
+#: Per never-touch store, per generation: whether the store exists there
+#: and what its reason was read against.  Every value starts with
+#: ``"present"`` or ``"absent"``, and ``tests/test_entry_baseline.py``
+#: checks that word against :data:`BASELINE_RECORDED_CATEGORY_SETS`.  All
+#: five reasons in :data:`BASELINE_NEVER_TOUCH` were written from the 3.15
+#: line (``~/Documents/1541u-315preview``); on the C64U only *presence* is
+#: measured, and a reason has been re-read against the 1.1.0 source only
+#: where its value says so.
+BASELINE_NEVER_TOUCH_BY_GENERATION: dict[str, dict[str, str]] = {
+    "Ethernet Settings": {
+        "ultimate": "present; reason read from the 3.15 line",
+        "cbm": (
+            "present (measured 2026-09-15); reason read from the 3.15 line -- "
+            "its note that 1.1.0 calls dhcp_stop() unconditionally is the "
+            "only part stated for this line"
+        ),
+    },
+    "Network Settings": {
+        "ultimate": "present; reason read from the 3.15 line",
+        "cbm": (
+            "present (measured 2026-09-15); reason read from the 3.15 line, "
+            "not re-read against 1.1.0"
+        ),
+    },
+    "WiFi settings": {
+        "ultimate": "present; reason read from the 3.15 line",
+        "cbm": (
+            "present (measured 2026-09-15); the device-loss reason is C64U "
+            "owner testimony (2026-09-11), its code path read from 3.15"
+        ),
+    },
+    "SID Sockets Configuration": {
+        "ultimate": "present; reason read from the 3.15 line, measured U64E n=3",
+        "cbm": (
+            "present (measured 2026-09-15); registered at tag 1.1.0 "
+            "software/u64/u64_config.cc:456, effectuate at :673 -- the "
+            "power-off consequence was measured on the U64E only"
+        ),
+    },
+    "Clock Settings": {
+        "ultimate": "present; reason read at 7f6fcb51 (rtc_i2c.cc, rtc.cc)",
+        "cbm": (
+            "absent (measured 2026-09-15; source: tag 1.1.0 builds "
+            "rtc_dummy.cc, target/u64ii/riscv/ultimate/Makefile:70) -- the "
+            "entry protects nothing here and is kept for the U64E"
+        ),
+    },
+}
 
 #: Extra spelling guard for the three named stores: a caller-supplied
 #: ``Ethernet Settings 2`` or ``WiFi Client Settings`` is refused too.
@@ -620,9 +824,11 @@ def apply_factory_baseline(
     values before), one ``PUT /v1/configs/<category>:reset_to_default``,
     then one item GET per item for its ``current`` and ``default``.
     **The total request count is therefore device-dependent and has only
-    been observed on the U64E** -- the C64U's category and item lists have
-    never been read, so any figure quoted for the Ultimate line (such as
-    the one in ``PATTERNS.md``) does not carry over to the CBM line.  Every one of
+    been observed on the U64E** -- the C64U's category list was read once
+    (2026-09-15, 20 categories, :data:`BASELINE_RECORDED_CATEGORY_SETS`)
+    but its item lists have never been read, so any figure quoted for the
+    Ultimate line (such as the one in ``PATTERNS.md``) does not carry over
+    to the CBM line.  Every one of
     those requests carries **no body at all**, and ``attachment_writer``
     returns ``NULL`` for a body-less request before constructing any
     ``TempfileWriter`` -- an explicit zero-length branch

@@ -7,7 +7,7 @@ import socket
 import subprocess
 import urllib.error
 from io import BytesIO
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -823,9 +823,13 @@ def test_client_liveness_probe_delegates(mock_lp):
     )
     r = client.liveness_probe()
     assert r is sentinel
+    # #250: the client also hands over a request sender, so the probe's two
+    # writemem POSTs are counted against the /Temp budget.
     mock_lp.assert_called_once_with(
         "10.0.0.1", port=80, password="secret", http_timeout=2.0,
+        request=ANY,
     )
+    assert callable(mock_lp.call_args.kwargs["request"])
 
 
 @patch(

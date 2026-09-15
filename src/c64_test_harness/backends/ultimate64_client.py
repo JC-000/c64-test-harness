@@ -28,7 +28,11 @@ import urllib.request
 import uuid
 from typing import TYPE_CHECKING, Any
 
-from .u64_capabilities import THRESHOLD_POST_RISKY, DeviceCapabilities
+from .u64_capabilities import (
+    THRESHOLD_POST_RISKY,
+    THRESHOLD_POST_SAFE,
+    DeviceCapabilities,
+)
 
 if TYPE_CHECKING:
     from .ultimate64_probe import LivenessResult
@@ -289,6 +293,33 @@ _STRICT_HEX_ROUTE_HINTS: dict[str, str] = {
 }
 
 
+class _ShippedThreshold(int):
+    """The untouched value of ``Ultimate64Client.WRITE_MEM_QUERY_THRESHOLD``.
+
+    An ``int`` in every respect callers can observe; the subclass exists
+    only so ``__init__`` can tell the shipped value from a poke (#249).
+    A caller that re-assigns the same number stores a plain ``int``, which
+    is still a poke and is still honoured.
+    """
+
+    __slots__ = ()
+
+
+def _validate_poked_threshold(value: Any) -> int:
+    """A poked ``WRITE_MEM_QUERY_THRESHOLD`` must be a non-negative int."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(
+            "WRITE_MEM_QUERY_THRESHOLD must be an int, got "
+            f"{type(value).__name__} {value!r}; prefer the "
+            "write_mem_query_threshold= constructor kwarg"
+        )
+    if value < 0:
+        raise ValueError(
+            f"WRITE_MEM_QUERY_THRESHOLD must be >= 0, got {value}"
+        )
+    return int(value)
+
+
 def _wire_hex16(value: int) -> str:
     """Format a 16-bit address for a REST query argument.
 
@@ -449,30 +480,55 @@ class Ultimate64Client:
         #: Has any request to this host ever completed? That is the
         #: evidence a timed-out construct-time probe cannot supply.
         self._saw_successful_request = False
+        poked = type(self).WRITE_MEM_QUERY_THRESHOLD
+        class_poked = not isinstance(poked, _ShippedThreshold)
         if write_mem_query_threshold is not None:
             # An explicit threshold pins the behaviour, so the probe is not
             # needed at construction; ``capabilities`` stays lazy and this
             # path issues no HTTP traffic at all.
             self.write_mem_query_threshold = int(write_mem_query_threshold)
+            if class_poked:
+                _log.warning(
+                    "Ultimate64Client(%s): %s.WRITE_MEM_QUERY_THRESHOLD = %r "
+                    "ignored because the write_mem_query_threshold=%d kwarg "
+                    "takes precedence.",
+                    self.host, type(self).__name__, poked,
+                    self.write_mem_query_threshold,
+                )
         else:
             self.write_mem_query_threshold = (
                 self.capabilities.write_mem_query_threshold
             )
+            if class_poked:
+                # Applied (#249) after the probe, so a poke never disarms
+                # /Temp hygiene the way the kwarg's skipped probe does, and
+                # so the grade is known when deciding whether to refuse it.
+                self.write_mem_query_threshold = self._effective_poked_threshold(
+                    poked, f"{type(self).__name__}."
+                )
 
         self.log_device_grading()
 
         # Drain /Temp when this device's lock is handed to the next lane.
         # Registered weakly, so a forgotten client is collected normally.
         if _HAS_DEVICE_LOCK:
-            _register_release_callback(self.host, self, "_drain_temp_attachments")
+            _register_release_callback(self.host, self, "_drain_on_lock_release")
 
     def close(self) -> None:
         """Release client resources.
 
         The REST side is stateless (a fresh connection per call), so the
-        only work here is the ``/Temp`` hygiene drain: any attachment
-        this client leaked and has not yet collected is collected now,
-        best-effort. See :attr:`temp_hygiene_armed`.
+        only work here is the ``/Temp`` hygiene drain, best-effort, on an
+        armed client (a disarmed one does nothing):
+
+        * if this client leaked, its hygiene pass runs as before;
+        * if it leaked nothing, the device's ``/Temp`` is still swept for
+          attachments an earlier lane left behind (issue #264) -- but only
+          when this process holds the device's ``DeviceLock``, since that
+          sweep deletes other lanes' files, and a failed one never enables
+          FTP File Service and never blocks this client.
+
+        See :attr:`temp_hygiene_armed` and :meth:`_drain_temp_attachments`.
         """
         self._drain_temp_attachments(reason="client close")
         return None
@@ -494,6 +550,21 @@ class Ultimate64Client:
             self._capabilities = DeviceCapabilities.from_info(
                 self._probe_info()
             )
+        return self._capabilities
+
+    @property
+    def cached_capabilities(self) -> DeviceCapabilities | None:
+        """The capability grade if one is cached, else ``None`` -- never probes.
+
+        :attr:`capabilities` issues ``GET /v1/info`` on a cold cache.  Use
+        this instead wherever a read must not generate device traffic or
+        change cached state: hygiene arming, the grading log line, a
+        transport's chunking decision, an error message.  ``None`` means
+        nothing has been probed (for example a client constructed with an
+        explicit ``write_mem_query_threshold``); a probe that ran and got no
+        answer caches a grade whose ``firmware_version`` is ``None``, which
+        is a different fact.  Read-only (issue #291).
+        """
         return self._capabilities
 
     def _probe_info(self, timeout: float | None = None) -> dict | None:
@@ -586,7 +657,7 @@ class Ultimate64Client:
             return
         if not self._saw_successful_request:
             return
-        caps = self._capabilities
+        caps = self.cached_capabilities
         if caps is None or caps.firmware_version is not None:
             return
         self._reprobed = True
@@ -760,7 +831,7 @@ class Ultimate64Client:
         capability and the resulting threshold makes it legible in every
         log, including the logs of runs where nothing went wrong.
         """
-        caps = self._capabilities
+        caps = self.cached_capabilities
         if caps is None or caps.firmware_version is None:
             # These two are not the same fact and must not print the same.
             # "not-attempted" is inert by contract (the caller pinned the
@@ -847,7 +918,7 @@ class Ultimate64Client:
         # issues no traffic at all) stays disarmed. Pass
         # temp_hygiene=True, or set U64_AUTO_TEMP_GC=1, to arm one of
         # those against a leak-prone device.
-        caps = self._capabilities
+        caps = self.cached_capabilities
         if caps is None or caps.firmware_version is None:
             return False
         # runner_wedge_possible is the inverse of writemem_post_safe and
@@ -868,8 +939,22 @@ class Ultimate64Client:
         """Attachments this client has created since the last successful pass."""
         return self._pending_temp_attachments
 
-    def _before_temp_attachment(self, operation: str) -> None:
-        """Refuse or make room before an attachment-creating request.
+    def _before_temp_attachment(self, operation: str, count: int = 1) -> None:
+        """Refuse or make room before *count* attachment-creating requests.
+
+        *count* > 1 reserves an operation's whole cost up front, so a
+        multi-POST operation is never refused half-way through (see
+        :meth:`liveness_probe`, whose second POST restores RAM).
+
+        The pass runs when ``pending > 0 and pending + count > budget``.
+        For ``count=1`` that is exactly ``pending >= budget`` -- which
+        relies on the budget being at least 1, as ``__init__`` validates
+        and :func:`~c64_test_harness.backends.ultimate64_temp_gc.leak_budget`
+        enforces. The ``pending > 0`` guard is kept deliberately: with
+        nothing pending a pass could collect nothing this client spent, so a
+        reservation larger than the whole budget (a probe on a fresh
+        ``temp_gc_budget=1`` client) runs one over and the next
+        attachment-creating request sweeps.
 
         :raises Ultimate64TempHygieneError: when hygiene is armed, has
             been proven impossible, and ``U64_TEMP_GC_REQUIRED`` has not
@@ -883,7 +968,8 @@ class Ultimate64Client:
         if self._temp_hygiene_blocked is not None:
             self._refuse_or_warn(operation)
             return
-        if self._pending_temp_attachments >= self._temp_gc_budget:
+        pending = self._pending_temp_attachments
+        if pending > 0 and pending + count > self._temp_gc_budget:
             self._run_temp_hygiene(
                 f"budget of {self._temp_gc_budget} attachment(s) spent before {operation}"
             )
@@ -893,9 +979,14 @@ class Ultimate64Client:
     def _refuse_or_warn(self, operation: str) -> None:
         from .ultimate64_temp_gc import hygiene_required as _hygiene_required
 
+        # The cached grade, never the probing property: building an error
+        # message must not issue HTTP or fill the cache, on a device the
+        # harness has just concluded it cannot clean up after (#265).
+        caps = self.cached_capabilities
+        firmware = (caps.firmware_version if caps is not None else None) or "unknown"
         message = (
             f"refusing {operation} on {self.host}: this firmware "
-            f"({self.capabilities.firmware_version or 'unknown'}) leaks a /Temp "
+            f"({firmware}) leaks a /Temp "
             "attachment for every request that carries a body and never collects "
             "them, and the harness's hygiene pass cannot run: "
             f"{self._temp_hygiene_blocked}. Continuing would walk the device "
@@ -969,22 +1060,115 @@ class Ultimate64Client:
         finally:
             self._in_temp_hygiene = False
 
-    def _drain_temp_attachments(self, reason: str = "drain") -> None:
-        """Collect whatever this client leaked. Never raises."""
+    def _drain_on_lock_release(self, reason: str = "device lock release") -> None:
+        """Release-callback entry point (``device_lock.register_release_callback``).
+
+        ``DeviceLock.release`` fires callbacks only on the outermost release
+        and while the flock is still held, so this drain runs under the lock
+        by construction.
+        """
+        self._drain_temp_attachments(reason=reason, under_lock=True)
+
+    def _holds_device_lock(self) -> bool:
+        """Whether this process holds this device's ``DeviceLock`` (no I/O).
+
+        Asks :meth:`DeviceLock.held_by_this_process` about the **default**
+        lock directory only. A process that holds the lock under a custom
+        ``lock_dir`` therefore reads as not holding it here, so its
+        ``close()`` does not sweep inherited ``/Temp``. Its lock-release
+        callback still does: :meth:`_drain_on_lock_release` runs under the
+        flock by construction and never consults this. Accepted in review
+        (PR #297, round 2) as the conservative direction.
+        """
+        if not _HAS_DEVICE_LOCK:
+            return False
         try:
-            if self._pending_temp_attachments <= 0:
-                return
-            # Something leaked, so a device is demonstrably there: settle
-            # the grade before deciding not to clean up after it.
-            self._maybe_reprobe_capabilities()
+            from .device_lock import DeviceLock
+
+            return bool(DeviceLock.held_by_this_process(self.host))
+        except Exception:  # noqa: BLE001 - a lock query must never fail a drain
+            return False
+
+    def _drain_temp_attachments(
+        self, reason: str = "drain", *, under_lock: bool = False
+    ) -> None:
+        """Sweep the device's ``/Temp`` on the way out. Never raises.
+
+        Two cases, and they are deliberately not treated alike:
+
+        * **This client leaked** (``pending_temp_attachments > 0``): the
+          ordinary hygiene pass, unchanged -- including its one FTP-enable
+          attempt and the block on failure. Whether a lane that leaked may
+          write that config is issue #263 and is not decided here.
+        * **This client leaked nothing** (issue #264): the wedge is a
+          property of the device and :meth:`gc_temp_folder` sweeps ``/Temp``
+          device-wide, so a lane that inherited a crashed neighbour's
+          attachments still collects them. But that sweep deletes files
+          this client did not create, so it runs only **under the device
+          lock** (the lock-release callback, or a ``close()`` while this
+          process holds the lock); and a lane that made only bodyless calls
+          must not write ``Network Settings > FTP File Service`` (a
+          BASELINE_NEVER_TOUCH store that persists until a firmware
+          power-on) or be refused for a failure it did not cause. So a
+          failed inherited sweep logs a WARNING naming the manual remedy,
+          enables nothing and blocks nothing.
+
+        What keeps a fake host off FTP is arming (a never-answered probe
+        stays disarmed), not the counter.
+        """
+        try:
+            leaked = self._pending_temp_attachments > 0
+            if leaked:
+                # Something leaked, so a device is demonstrably there:
+                # settle the grade before deciding not to clean up after
+                # it. Deliberately not done on a zero count -- that would
+                # put a /v1/info GET into close() for every client that
+                # ever completed a request, fake hosts included.
+                self._maybe_reprobe_capabilities()
             if not self.temp_hygiene_armed:
                 return
-            self._run_temp_hygiene(reason)
+            if leaked:
+                self._run_temp_hygiene(reason)
+                return
+            if not (under_lock or self._holds_device_lock()):
+                _log.debug(
+                    "U64 /Temp drain on %s (%s): this client leaked nothing and "
+                    "does not hold the device lock; not sweeping other lanes' "
+                    "attachments",
+                    self.host, reason,
+                )
+                return
+            self._sweep_inherited_temp(reason)
         except Exception as exc:  # noqa: BLE001 - a drain must never fail a run
             _log.debug(
                 "U64 /Temp drain on %s raised (%s: %s); ignored",
                 self.host, type(exc).__name__, exc,
             )
+
+    def _sweep_inherited_temp(self, reason: str) -> None:
+        """Best-effort sweep for attachments this client did not create.
+
+        No FTP-enable attempt and no block on failure -- see
+        :meth:`_drain_temp_attachments`.
+        """
+        self._in_temp_hygiene = True
+        try:
+            _log.debug("U64 /Temp inherited sweep on %s: %s", self.host, reason)
+            result = self.gc_temp_folder()
+        finally:
+            self._in_temp_hygiene = False
+        if getattr(result, "ok", False):
+            return
+        _log.warning(
+            "U64 /Temp inherited sweep on %s failed (%s). This client leaked "
+            "nothing, so the harness neither enables Network Settings > FTP "
+            "File Service on its behalf (issue #263) nor refuses its requests; "
+            "but /Temp may still hold attachments an earlier lane left behind. "
+            "Before uploading to this device, enable FTP File Service manually "
+            "(it persists until a firmware power-on) or have it power-cycled. "
+            "See docs/u64_recovery.md.",
+            self.host, getattr(result, "error", None) or "unknown FTP failure",
+        )
 
     def _check_device_lock(self, operation: str) -> None:
         """Advisory device-lock check for a state-changing request.
@@ -1055,33 +1239,90 @@ class Ultimate64Client:
         """GET /v1/info — product, firmware_version, fpga_version, etc."""
         return self._get_json("/v1/info")
 
+    #: Body-carrying POSTs one :meth:`liveness_probe` issues: the probe
+    #: write and the restore of the original bytes. Each is a ``/Temp``
+    #: attachment on firmware without upstream #686 (measured on the C64U,
+    #: fw 1.1.0: ``/Temp`` 0 -> 2 for one call; issue #250).
+    LIVENESS_PROBE_TEMP_ATTACHMENTS = 2
+
     def liveness_probe(self, http_timeout: float = 2.0) -> "LivenessResult":
         """Run the writemem-degradation liveness probe against this device.
 
+        **Not free: on leak-prone firmware one call costs two /Temp
+        attachments** (:attr:`LIVENESS_PROBE_TEMP_ATTACHMENTS`). It
+        deliberately exercises ``POST /v1/machine:writemem`` -- a probe
+        write and a restore -- which is the point of it and also the price.
+        Both POSTs count against :attr:`temp_gc_budget` like any other
+        attachment-creating request, and the whole cost is reserved before
+        the probe sends anything: if the budget cannot hold both, the
+        hygiene pass runs first, and if hygiene has been proven impossible
+        this raises :class:`Ultimate64TempHygieneError` without touching the
+        device (so the restore is never the request that gets refused).
+        Diagnose a suspected wedge with bodyless calls first --
+        :meth:`get_info`, :meth:`get_version` and :meth:`read_mem` cost
+        nothing -- and probe once, deliberately.
+
         Delegates to
         :func:`c64_test_harness.backends.ultimate64_probe.liveness_probe`,
-        passing the client's ``host``, ``port``, and ``password``.  Unlike
-        :meth:`get_version` / :meth:`get_info`, this method actively
-        exercises the ``POST /v1/machine:writemem`` path that
-        :func:`probe_u64` does not, and so detects the fw 3.14d
-        writemem-degraded transient state described in issue #107.
+        passing the client's ``host``, ``port`` and ``password`` and a
+        request sender that routes the accounting through this client.
+        Unlike :meth:`get_version` / :meth:`get_info`, it detects the fw
+        3.14d writemem-degraded transient state described in issue #107.
 
         :param http_timeout: per-request socket timeout (default 2 s);
             kept short so a wedged TCP stack returns
             ``failure="tcp_stack_wedged"`` quickly.
         :returns: a structured
             :class:`~c64_test_harness.backends.ultimate64_probe.LivenessResult`.
+        :raises Ultimate64TempHygieneError: see above.
         """
-        from .ultimate64_probe import liveness_probe as _liveness_probe
-        return _liveness_probe(
+        from . import ultimate64_probe as _probe
+
+        cost = self.LIVENESS_PROBE_TEMP_ATTACHMENTS
+        self._before_temp_attachment(
+            f"liveness_probe ({cost} x POST /v1/machine:writemem)", count=cost
+        )
+        if self.temp_hygiene_armed:
+            _log.info(
+                "liveness_probe on %s spends %d /Temp attachments on this "
+                "firmware (%d of %d already pending)",
+                self.host, cost, self._pending_temp_attachments,
+                self._temp_gc_budget,
+            )
+
+        def _accounted(method, host, port, path, password, timeout, **kwargs):
+            # The probe keeps its own raw sender and failure classification;
+            # this only adds what _request adds: the lock check and the
+            # count. The gate already ran above for the whole operation.
+            leaks = self._creates_temp_attachment(method, kwargs.get("body"))
+            if method != "GET":
+                self._check_device_lock(f"{method} {path}")
+            try:
+                result = _probe._liveness_request(
+                    method, host, port, path, password, timeout, **kwargs
+                )
+            finally:
+                if leaks:
+                    self._pending_temp_attachments += 1
+            self._saw_successful_request = True
+            return result
+
+        return _probe.liveness_probe(
             self.host,
             port=self.port,
             password=self.password,
             http_timeout=http_timeout,
+            request=_accounted,
         )
 
     def assert_healthy(self, http_timeout: float = 2.0) -> "LivenessResult":
         """Run :meth:`liveness_probe` and raise on failure.
+
+        Costs what :meth:`liveness_probe` costs: two /Temp attachments per
+        call on leak-prone firmware, and it raises
+        :class:`Ultimate64TempHygieneError` before probing when the hygiene
+        pass cannot run. It reads like a free precondition check and is not
+        one; do not call it in a loop against a C64U.
 
         :raises U64UnreachableError: if the device fails the reachability
             portion (TCP / version GET).
@@ -1386,13 +1627,34 @@ class Ultimate64Client:
           Do not treat ``reboot()`` as preserving anything below
           ``$0801``.
 
-        What it *does* clear, which the "survives" list above can make
-        easy to miss: ``start_cartridge`` zeroes ``C64_CARTRIDGE_TYPE``,
+        What it does to the REU and the Command Interface slot, read from
+        firmware source at tag ``1.1.0`` (the C64U; the same shape at
+        ``7f6fcb51``, the U64E's v3.15-85) and **unmeasured** on a device:
+        ``start_cartridge`` first zeroes ``C64_CARTRIDGE_TYPE``,
         ``C64_REU_ENABLE``, ``C64_SAMPLER_ENABLE`` and
-        ``CMD_IF_SLOT_ENABLE`` (``c64.cc:852+``). So a reboot leaves the
-        REU and the Command Interface slot **disabled** — which is why
-        ``enable_uci`` needs a ``reset()`` and a settle afterwards rather
-        than working straight away.
+        ``CMD_IF_SLOT_ENABLE`` (``c64.cc:913``), then, when no external
+        cartridge holds the bus, calls ``set_cartridge(NULL)``
+        (``c64.cc:923-924``), whose ``set_emulation_flags()``
+        (``c64.cc:992``) restores them from config. So after a reboot the
+        REU and the Command Interface come back as configured, except in
+        two cases that leave the enables at 0:
+
+        * **An external cartridge holds the bus** (Cartridge Preference
+          *External*, or *Automatic* with a cart present):
+          ``ConfigureU64SystemBus()`` reports it and ``set_cartridge`` is
+          skipped.
+        * **The configured ``.crt`` prohibits them.** ``set_cartridge(NULL)``
+          loads the image named by ``CFG_C64_CART_CRT``, and that
+          definition's ``prohibit`` mask zeroes the UCI enable again
+          (``c64.cc:1062-1068``) or the REU enable (``c64.cc:1056-1061``).
+
+        Line numbers are for ``1.1.0``; ``docs/uci_networking.md`` carries
+        the ``7f6fcb51`` equivalents and the full trace. The recorded
+        observation that ``enable_uci`` needs a ``reset()`` and a ~3 s
+        settle before routines answer still stands, but this path does not
+        explain it and its cause is open. An earlier revision of this
+        docstring gave the unconditional version as that cause (issue
+        #299).
 
         This docstring used to read "full reboot of the Ultimate device".
         That wording was load-bearing in the wrong direction: it is the
@@ -1516,13 +1778,97 @@ class Ultimate64Client:
             )
         return data
 
-    #: Class-level fallback for the raw-byte threshold above which
-    #: :meth:`write_mem` switches from the legacy ``PUT ?data=<hex>`` form
-    #: to the ``POST`` raw-byte form. Per-instance ``write_mem_query_threshold``
-    #: (set in ``__init__`` from :attr:`capabilities`) takes precedence; this
-    #: attribute is retained for backwards compatibility with callers that
-    #: poke the class.
-    WRITE_MEM_QUERY_THRESHOLD: int = 48
+    #: Override for the raw-byte threshold above which :meth:`write_mem`
+    #: switches from the ``PUT ?data=<hex>`` form to the ``POST`` form.
+    #: Its shipped value, 48, is the post-safe grade's threshold and is
+    #: **not** applied as a default: an untouched client takes its
+    #: threshold from :attr:`capabilities` (128 on leak-prone or unknown
+    #: firmware). Precedence, highest first: the ``write_mem_query_threshold=``
+    #: constructor kwarg (the supported path); then a poke of this name on
+    #: the class, a subclass, or -- after construction -- an instance; then
+    #: the capability grade. A poke is applied with a WARNING naming the
+    #: kwarg, and unlike the kwarg it does not skip the capability probe, so
+    #: ``/Temp`` hygiene still arms. It is clamped to 128 (the firmware's
+    #: ``data=`` cap) and, on a device not graded post-safe, a poke below 128
+    #: is refused and 128 kept -- see :meth:`_effective_poked_threshold`.
+    #: A class poke is process-global, and re-assigning a plain ``48`` still
+    #: counts as a poke. To undo one, restore the saved original object
+    #: (``orig = Ultimate64Client.WRITE_MEM_QUERY_THRESHOLD`` before poking,
+    #: then assign ``orig`` back), or poke under pytest's ``monkeypatch``,
+    #: which does that for you. Before issue #249 this attribute was never
+    #: read and every poke was a silent no-op.
+    WRITE_MEM_QUERY_THRESHOLD: int = _ShippedThreshold(THRESHOLD_POST_SAFE)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # An instance poke of the uppercase name is honoured (#249): it
+        # moves the live threshold, which is the only thing it could mean.
+        if name == "WRITE_MEM_QUERY_THRESHOLD":
+            # A subclass that assigns this before ``super().__init__()`` has
+            # no grade cached yet, so it gets a "refused, keeping 128"
+            # WARNING here -- and ``__init__`` then sets the threshold from
+            # the grade anyway (48 on a post-safe device).  Safe, merely
+            # noisy; poke on the class body or after construction instead.
+            threshold = self._effective_poked_threshold(value, "instance ")
+            object.__setattr__(self, "write_mem_query_threshold", threshold)
+            # Store the effective value, not the request, so the uppercase
+            # name never reads back a refused or clamped poke (review
+            # round 2).  ``write_mem_query_threshold`` stays authoritative.
+            object.__setattr__(self, name, threshold)
+            return
+        object.__setattr__(self, name, value)
+
+    def _effective_poked_threshold(self, value: Any, source: str) -> int:
+        """The threshold a poke of ``WRITE_MEM_QUERY_THRESHOLD`` may set.
+
+        Review round 1 of #249.  A poke is a blunt, process-global control,
+        so two directions are not honoured:
+
+        * **Above 128** it is clamped to 128: the firmware refuses a
+          ``PUT ?data=`` payload over 128 bytes on every grade (the
+          transport's ``_PUT_DATA_CAP`` is the same limit).
+        * **Below 128 on a device not graded post-safe** it is refused and
+          128 kept: there a lower threshold only moves writes onto the POST
+          path, which leaves a ``/Temp`` attachment per request (hardware
+          rule 8).  The explicit ``write_mem_query_threshold=`` kwarg is the
+          deliberate way to force it.
+
+        Reads the private ``_capabilities`` cache, never the probing
+        property; the public ``cached_capabilities`` accessor (#291) was not
+        on master when this landed.  An unprobed client counts as not
+        post-safe.
+        """
+        requested = _validate_poked_threshold(value)
+        host = getattr(self, "host", "?")
+        if requested > THRESHOLD_POST_RISKY:
+            _log.warning(
+                "Ultimate64Client(%s): %sWRITE_MEM_QUERY_THRESHOLD = %d clamped "
+                "to %d: the firmware refuses a PUT ?data= payload over %d bytes "
+                "on every grade. Prefer the write_mem_query_threshold= "
+                "constructor kwarg.",
+                host, source, requested, THRESHOLD_POST_RISKY, THRESHOLD_POST_RISKY,
+            )
+            return THRESHOLD_POST_RISKY
+        caps = getattr(self, "_capabilities", None)
+        if requested < THRESHOLD_POST_RISKY and getattr(
+            caps, "writemem_post_safe", None
+        ) is not True:
+            firmware = getattr(caps, "firmware_version", None) or "unknown"
+            _log.warning(
+                "Ultimate64Client(%s): %sWRITE_MEM_QUERY_THRESHOLD = %d refused, "
+                "keeping %d: this device is not graded post-safe (firmware %s), "
+                "so a lower threshold only moves writes onto the POST path, "
+                "which leaves a /Temp attachment per request. Pass the "
+                "write_mem_query_threshold= constructor kwarg to force it "
+                "deliberately.",
+                host, source, requested, THRESHOLD_POST_RISKY, firmware,
+            )
+            return THRESHOLD_POST_RISKY
+        _log.warning(
+            "Ultimate64Client(%s): honouring %sWRITE_MEM_QUERY_THRESHOLD = %d. "
+            "Prefer the write_mem_query_threshold= constructor kwarg.",
+            host, source, requested,
+        )
+        return requested
 
     def write_mem(self, address: int, data: bytes) -> None:
         """Write bytes to C64 memory via DMA (DESTRUCTIVE).
