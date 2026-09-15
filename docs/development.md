@@ -544,13 +544,21 @@ themselves; live checks are serialised by the supervisor under the
 
 The clause is in force until `DeviceCapabilities.writemem_post_safe`
 reports `True` for that device. **It does not lapse on its own.** That
-needs `_CBM_WRITEMEM_FIXED_FROM`
-(`src/c64_test_harness/backends/u64_capabilities.py:59`) set to the first
-fixed C64U version: it is `None` today, and `_writemem_post_safe`
-short-circuits on that (`:192-195`), grading **every** C64U firmware as
-leak-prone by design. So a firmware bump alone changes nothing — someone
-must first establish which version carries #686 and edit that constant,
-and nothing fails if they do not. Tracked as #248.
+needs `_CBM_WRITEMEM_FIXED_FROM` (in
+`src/c64_test_harness/backends/u64_capabilities.py`) set to the first
+fixed C64U version: it is `None` today, and
+`DeviceCapabilities._writemem_post_safe` short-circuits on that, grading
+**every** C64U firmware as leak-prone by design. So a firmware bump alone
+changes no grade — someone must first establish which version carries
+#686 and edit that constant. What a bump does change is that it is no
+longer silent: a C64U reporting firmware newer than
+`_CBM_LAST_KNOWN_UNFIXED` (1.1.0) while the constant is still `None`
+emits a `CbmFixConstantStaleWarning` (shown in pytest's warnings summary
+even on a green run; exported from the package root so suites can
+escalate it with `-W error::c64_test_harness.CbmFixConstantStaleWarning`)
+and a WARNING log line, once per version per process. The grade stays
+`False`, and the threshold stays 128, until the constant is edited.
+Tracked as #248.
 Full statement in CLAUDE.md § "Standing hardware-safety clause" and
 `docs/u64_recovery.md`.
 

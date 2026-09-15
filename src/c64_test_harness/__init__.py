@@ -150,6 +150,7 @@ from .backends.ultimate64_temp_gc import (
     gc_temp_folder,
     auto_gc_enabled,
 )
+from .backends.u64_capabilities import CbmFixConstantStaleWarning
 from .backends.ultimate64_probe import (
     LivenessResult,
     ProbeResult,
@@ -598,6 +599,8 @@ __all__ = [
     "TempGCResult",
     "gc_temp_folder",
     "auto_gc_enabled",
+    # CBM /Temp-fix constant never set for a newer C64U release (issue #248)
+    "CbmFixConstantStaleWarning",
     # Ultimate 64 liveness probe
     "ProbeResult",
     "LivenessResult",
