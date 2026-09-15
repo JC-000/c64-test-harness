@@ -477,25 +477,70 @@ class TestProgressLogLine:
         A line that judged staleness from the age alone would say STALE
         here while the deadline is being re-armed behind the holder --
         exactly the disagreement #233 rules out.
+
+        **No assertion depends on how fast the waiter runs (#385).**  An
+        earlier revision joined the waiter for 1.5 s, then left the ``with``
+        while the waiter was still queued.  The stacked patches exit in
+        reverse, so ``_holder_progress`` was un-scripted while the 0.1 s
+        interval was still patched, and a waiter that woke in that gap (main
+        thread descheduled under host load) ran the *real* check against the
+        hour-old file and logged a genuine STALE line into the records under
+        test.  Separately, its ``timeout=0.3`` expired if the waiter lost the
+        CPU for longer than that, failing ``still_extending``.  Now:
+
+        * the wait is observed through ``on_wait`` (two reports), not a
+          wall-clock join, and ``_PROGRESS_LOG_INTERVAL`` is 0 so a report is
+          due on every iteration;
+        * ``timeout`` is far longer than any stall; the wait ends because the
+          holder releases, so acquire must *take the lock*, not time out;
+        * the holder is released and the waiter joined *inside* the patches,
+          so nothing is un-scripted while the waiter can still run.
         """
         self._age_lockfile(lock_dir, 3600)
         waiter = DeviceLock(HOST, lock_dir, heartbeat_interval=None)
+        reports: list[tuple[int | None, float | None]] = []
+        two_reports = threading.Event()
+
+        def on_wait(elapsed, holder_pid, age, depth) -> None:
+            reports.append((holder_pid, age))
+            if len(reports) >= 2:
+                two_reports.set()
+
+        box: dict[str, object] = {}
+
+        def run() -> None:
+            try:
+                box["value"] = waiter.acquire(
+                    timeout=30.0, progress_window=60.0, on_wait=on_wait
+                )
+            except BaseException as exc:  # noqa: BLE001 -- reported below
+                box["exc"] = exc
+
         with caplog.at_level(logging.DEBUG, logger=dl.__name__), patch.object(
-            dl, "_PROGRESS_LOG_INTERVAL", 0.1
+            dl, "_PROGRESS_LOG_INTERVAL", 0.0
         ), patch.object(waiter, "_holder_progress", lambda pw: (True, 4242)):
-            box = _bounded(lambda: waiter.acquire(timeout=0.3, progress_window=60.0), 1.5)
-        still_extending = box["alive"]
-        lines = [r.getMessage() for r in _progress_records(caplog)]
-        # Let the scripted waiter finish (it takes the flock once the
-        # holder goes), then give its hold back so nothing leaks.
-        held_elsewhere.release()
-        deadline = time.monotonic() + 5.0
-        while "value" not in box and time.monotonic() < deadline:
-            time.sleep(0.05)
+            t = threading.Thread(target=run, daemon=True)
+            t.start()
+            saw_two_reports = two_reports.wait(10.0)
+            # Nothing can have ended the wait yet: the holder still holds the
+            # flock and the deadline is 30 s past the latest extension.
+            still_queued = not box
+            held_elsewhere.release()
+            t.join(10.0)
+            finished = not t.is_alive()
         if box.get("value") is True:
             waiter.release()
-        assert still_extending, "scripted progress should have kept extending"
-        assert lines, f"no progress line while extending: {caplog.text!r}"
+        assert finished, "the waiter did not finish after the holder released"
+        assert "exc" not in box, box.get("exc")
+        assert saw_two_reports, f"fewer than two progress reports: {caplog.text!r}"
+        assert still_queued, f"acquire ended while it should have been extending: {box!r}"
+        assert box.get("value") is True, "acquire should take the lock once the holder goes"
+        # The property is exercised: every report was made behind the scripted
+        # holder, with the file on disk older than progress_window.
+        assert reports and all(pid == 4242 for pid, _ in reports), reports
+        assert all(age is not None and age > 60.0 for _, age in reports), reports
+        lines = [r.getMessage() for r in _progress_records(caplog)]
+        assert len(lines) >= 2, f"no progress lines while extending: {caplog.text!r}"
         for m in lines:
             assert "STALE" not in m and "wedged" not in m, m
             assert "extended" in m and "not extended" not in m, m
