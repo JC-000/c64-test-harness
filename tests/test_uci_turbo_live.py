@@ -46,6 +46,7 @@ from c64_test_harness.uci_network import (
     uci_probe,
     uci_get_ip,
 )
+from live_fixture_teardown import attempt_steps, raise_teardown_failures
 
 
 # ---------------------------------------------------------------------------
@@ -105,20 +106,23 @@ def uci_enabled(client: Ultimate64Client):
     Captures the original state and restores it after."""
     snap = snapshot_state(client)
     original_uci = get_uci_enabled(client)
-    if not original_uci:
-        enable_uci(client)
-        # Reset so the UCI registers come online
-        client.reset()
-        time.sleep(3.0)
-    yield
-    # Restore original state
-    if not original_uci:
-        try:
-            disable_uci(client)
-        except Exception:
-            pass
-    restore_state(client, snap)
-    time.sleep(0.5)
+    failures: list = []
+    try:
+        if not original_uci:
+            enable_uci(client)
+            # Reset so the UCI registers come online
+            client.reset()
+            time.sleep(3.0)
+        yield
+    finally:
+        # Restore original state: each step attempted, failures reported (#368)
+        steps = []
+        if not original_uci:
+            steps.append(("disable_uci(client)", lambda: disable_uci(client)))
+        steps.append(("restore_state(client, snap)", lambda: restore_state(client, snap)))
+        failures = attempt_steps(steps)
+        time.sleep(0.5)
+    raise_teardown_failures("uci_enabled restore", failures)
 
 
 # ---------------------------------------------------------------------------

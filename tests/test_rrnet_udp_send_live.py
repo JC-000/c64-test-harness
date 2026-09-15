@@ -40,6 +40,7 @@ import time
 import pytest
 
 from bridge_platform import BRIDGE_HOST_IP, BRIDGE_IP_A, bridge_ip_str
+from live_fixture_teardown import attempt_steps, raise_teardown_failures
 
 # Skip the entire module if the gate is unset -- collection still works,
 # but tests will be marked skipped.  Module-level skip keeps the imports
@@ -189,19 +190,23 @@ def single_vice_with_rrnet():
     )
 
     vice = ViceProcess(config)
+    transport = None
+    failures: list = []
     try:
         vice.start()
         transport = connect_binary_transport(port, proc=vice)
-        try:
-            _bridge_wait_ready(transport)
-            _bridge_init_cs8900a(transport, SCRATCH, CODE)
-            set_cs8900a_mac(transport, C64_MAC)
-            yield transport
-        finally:
-            transport.close()
+        _bridge_wait_ready(transport)
+        _bridge_init_cs8900a(transport, SCRATCH, CODE)
+        set_cs8900a_mac(transport, C64_MAC)
+        yield transport
     finally:
-        vice.stop()
-        allocator.release(port)
+        # Every step on its own, in the old order (#368).
+        failures = attempt_steps([
+            ("transport.close()", transport.close if transport is not None else None),
+            ("vice.stop()", vice.stop),
+            (f"allocator.release({port})", lambda: allocator.release(port)),
+        ])
+    raise_teardown_failures("single_vice_with_rrnet teardown", failures)
 
 
 # ---------------------------------------------------------------------------
