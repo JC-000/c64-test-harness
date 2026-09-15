@@ -233,13 +233,28 @@ class TestTheBandStillRejectsDerivedMiswirings:
         from c64_test_harness.backends.u64_debug_capture import BusCycle
 
         lines, cycles = 263, 65
-        total = lines * cycles
+        total_phi2_high = lines * cycles
         low = BADLINES_PER_FRAME * BADLINE_BA_LOW_CYCLES
-        idle_high = (1 << 31) | (1 << 30) | (1 << 29) | (1 << 25)
-        frame = [BusCycle(idle_high | (0 if i < low else 1 << 27))
-                 for i in range(total)]
+        # Lines that idle high on both clock phases with no cartridge and
+        # no NMI source.
+        idle_lines = (1 << 30) | (1 << 29) | (1 << 25)
+        frame = []
+        for i in range(total_phi2_high):
+            # PHI2-high (6510) word: BA low on the badline cycles.
+            frame.append(BusCycle((1 << 31) | idle_lines
+                                  | (0 if i < low else 1 << 27)))
+            # PHI2-low (VIC) word: bit 31 clear, GAME#/EXROM#/NMI# still
+            # high, BA low.  is_cpu must drop every one of these, so a phi2
+            # that reads any other always-high bit (e.g. bit 30) counts
+            # them and fails the length check below.
+            frame.append(BusCycle(idle_lines))
         cpu = [c for c in frame if c.is_cpu]
-        assert len(cpu) == total
+        assert len(frame) == 2 * total_phi2_high
+        assert len(cpu) == total_phi2_high, (
+            f"is_cpu kept {len(cpu)} of {len(frame)} words; expected only the "
+            f"{total_phi2_high} PHI2-high ones"
+        )
+        assert all(c.raw >> 31 & 1 for c in cpu)
 
         def frac(bit: int) -> float:
             return sum(1 for c in cpu if c.raw >> bit & 1) / len(cpu)
