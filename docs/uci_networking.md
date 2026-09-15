@@ -24,7 +24,7 @@ measured on the U64E unless it says otherwise.
 `enable_uci(client)` flips that item over REST. The live suites follow it
 with `client.reset()` and a 3 s settle before the first routine
 (`tests/test_uci_udp_send_live.py:274-280`); without that, every routine
-times out at the sentinel. Keep that sequence. It is a recorded
+times out at the sentinel. Keep that sequence. On an Ultimate transport every routine except `uci_probe` first reads the UCI identifier at `$DF1D` (one bodyless GET, zero `/Temp` cost) and raises `UCIInterfaceAbsentError` if it is not `$C9`, because with `Cartridge Preference` = External the slot stays off the bus after the reset while `Command Interface` still reads Enabled (#359: U64E, paired ABBAAB, identifier present and routine completing 3/3 with Auto, 0/3 with External). It is a recorded
 observation, and **its cause is not explained by firmware source**. From
 source, read at tag `1.1.0` (the C64U) and `7f6fcb51` (the U64E's
 v3.15-85), not measured:
