@@ -115,6 +115,13 @@ class CbmFixConstantStaleWarning(UserWarning):
 
     A dedicated category so a suite can escalate or silence exactly this:
     ``-W error::c64_test_harness.CbmFixConstantStaleWarning``.
+
+    Under an error filter (that one, a generic ``-W error::UserWarning``, or
+    ``filterwarnings = error``) it raises **once per firmware version per
+    process**, from the first ``DeviceCapabilities.from_info``, which in
+    practice is ``Ultimate64Client`` construction. Later probes of the same
+    version in that process do not raise, because the version is recorded
+    as noticed before the warning is issued.
     """
 
 
