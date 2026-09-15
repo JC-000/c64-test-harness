@@ -58,11 +58,16 @@ one.**
    run does **not** give whole-run exclusion: a neighbouring lane can take
    the device between two tests of your run, and device state one test
    leaves can be seen by another lane's next test. The reason is `/Temp`
-   hygiene (issue #324). `Ultimate64Client` drains `/Temp` from a lock
-   release callback, and those callbacks fire only on the **outermost**
-   release. An outer whole-run hold would therefore turn every per-test
-   drain on a leak-prone device (the C64U) into one drain at the end of
-   the run, trading a courtesy problem for a hardware-safety one. If you
+   hygiene (issue #324). `Ultimate64Client` drains `/Temp` in two places.
+   `close()` drains a client that leaked with no lock or nesting check,
+   so `close()` still drains a leaking client under any hold. A lock
+   release callback drains it as well, and that is the only drain that
+   catches a client the test never closes. Those callbacks fire only on
+   the **outermost** release and are held weakly. An outer hold would
+   therefore defer the lock-release drain on a leak-prone device (the
+   C64U) to the end of the run, and a leaked client garbage-collected
+   before then would never drain at all. That trades a courtesy problem
+   for a hardware-safety one. If you
    need whole-run exclusion, you need a different mechanism, not a wrapper
    around `pytest.main`.
 2. **`run_prg` replaces the running program.** So does `run_crt`,

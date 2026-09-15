@@ -2220,9 +2220,10 @@ def test_the_tests_scans_are_not_vacuous() -> None:
 #    which lock for you (``allow_nested=True`` in ``unified_manager``);
 # 3. **the pytest runners**, which reach the device only through ``*_live.py``
 #    modules that conftest locks per test. They deliberately do *not* hold the
-#    lock across ``pytest.main``: the client's ``/Temp`` drain runs on the
-#    *outermost* release, so an outer hold would defer every per-test drain
-#    on the C64U to the end of the run.
+#    lock across ``pytest.main``: the client's lock-release ``/Temp`` drain,
+#    the only one that catches a client a test never closes, runs on the
+#    *outermost* release, so an outer hold would defer it on the C64U to the
+#    end of the run (``close()`` still drains a leaking client; #324).
 #
 # What reaches a device, for this scan: constructing a harness client,
 # transport or device manager, or issuing HTTP. Anything reached *through*
