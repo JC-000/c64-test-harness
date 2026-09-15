@@ -62,15 +62,21 @@ counted.  It turned out to be right, which is the point: a scopeless
 figure is unusable whether or not it is accurate, and being accurate is
 what let it survive unexamined for months.
 
-**Unexplained residual, recorded rather than resolved:** #276 counted
-**201** all-category items on 2026-09-10; this read counts **203** on
-2026-09-12, same device.  Two items appeared and nobody has established
-why — device state and a different counting basis are both open and
-neither is evidenced.  Do not average them, and do not drop one.
+**Unexplained residual, recorded rather than resolved (#292):** #276
+records "201 items compared" (category scope and firmware build not
+recorded) on the U64E on 2026-09-10; this read counts **203** on the U64E
+on 2026-09-12.  The candidates are a different counting basis or a
+different firmware build: firmware source rules out drift within one
+build — store items are appended only when a store is constructed, and
+the REST listing emits every item of the five value types — except for
+stores registered at runtime (the monitor-bookmarks store, the per-device
+SID stores).  Nobody has established why.  Do not average them, and do
+not drop one.
 
 Still not measured (record when this runs): the wall-clock cost of one
 ``apply_factory_baseline`` — ``record_property("apply_seconds")`` captures
-it, and 151 is what makes those seconds interpretable; and whether any
+it, and 151 (U64E, 2026-09-12) is what makes those seconds interpretable;
+and whether any
 store's ``effectuate()`` pulses the C64 reset (a separate #217-style
 marker+jiffy arm, not in this module).
 """
