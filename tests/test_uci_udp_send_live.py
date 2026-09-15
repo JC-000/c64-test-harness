@@ -272,9 +272,9 @@ def test_uci_udp_send_one_write_per_datagram() -> None:
         uci_prior = get_uci_enabled(client)
         print("Enabling UCI (Command Interface)...", flush=True)
         enable_uci(client)
-        # The reset + settle is kept as a harmless precaution; it is not
-        # required on the U64E per #270 (see enable_uci's docstring).
-        print("Resetting machine (precaution, not required per #270)...", flush=True)
+        # The reset is kept as a harmless precaution (not required on the U64E per #270);
+        # the 3 s settle is kept because a routine at +0 was not measured.
+        print("Resetting machine (precaution per #270) and settling 3 s...", flush=True)
         client.reset()
         time.sleep(3.0)
 

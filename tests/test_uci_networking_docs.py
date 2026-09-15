@@ -216,6 +216,8 @@ MEASUREMENT = (
     "the 3 s settle is not retired",
     # R7: the live suites' reset is kept deliberately.
     "The reset in the live suites is harmless and stays.",
+    # Re-verify round (A13): the C64U remains source-read.
+    "on it this is still source-read",
     # Finding 6: the open cause has an issue.
     "not established (#422)",
     # Finding 5: what arms B and C measured, and what they did not.
@@ -289,6 +291,8 @@ class TestEnableUciDocstring:
         "``$DF1D`` read ``$C9`` at +0",
         "run at +3 s with no reset",
         "keep a settle",
+        # Re-verify round (A12): the premise the settle rests on.
+        "A routine at +0 was not run",
     ))
     def test_carries(self, doc: str, phrase: str) -> None:
         assert phrase in doc, phrase
