@@ -216,20 +216,41 @@ def _expected_tx_sites(name: str) -> int:
     return 2 if name.endswith(("[arp]", "[drain]")) else 1
 
 
-def _rdy4txnow_polls(code: bytes) -> list[dict[str, int]]:
-    """Decode the poll that follows every ``PPPtr=BusST`` write in *code*.
+LDX_IMM, LDY_IMM, DEX, DEY, JMP_ABS, CLI = 0xA2, 0xA0, 0xCA, 0x88, 0x4C, 0x58
+#: The Rdy4TxNOW poll bound (issue #236), as a literal: the 65,536 polls
+#: across which #234 measured a wedged chip never asserting.  Encoded in
+#: the emitted ``LDY #lo / LDX #hi`` as ``$00 / $00``.
+RDY4TXNOW_MAX_POLLS = 65536
+#: Result byte a builder stores when Rdy4TxNOW never asserted (issue #236).
+TX_NOT_READY = 0x04
 
-    ip65's ``send`` (``drivers/cs8900a.s:441-457``) aims PPPtr at BusST and
-    then spins ``lda ppdata+1 / and #$01`` until ``Rdy4TxNOW`` is set;
-    :func:`bridge_ping._emit_tx_frame` is the same loop with the branch
-    written as ``BEQ`` back to the ``LDA``.  Each entry carries the byte
-    offset of the ``PPPtr`` write, of the ``LDA`` (the loop head), the
-    ``AND`` immediate, the branch opcode and the offset it resolves to.
+
+def _disp(code: bytes, at: int) -> int:
+    """Resolve the relative branch whose opcode sits at *at*."""
+    d = code[at + 1]
+    return at + 2 + (d - 256 if d >= 128 else d)
+
+
+def _rdy4txnow_polls(code: bytes) -> list[dict[str, int]]:
+    """Decode the bounded poll around every ``PPPtr=BusST`` write in *code*.
+
+    Emitted shape (:func:`bridge_ping._emit_tx_frame`, issue #236)::
+
+        LDY #lo / LDX #hi                 ; poll budget, X:Y
+        PPPtr = BusST
+        lda:  LDA PPData_hi / AND #$01 / BNE go
+              DEY / BNE lda / DEX / BNE lda
+              JMP not_ready               ; budget spent, Rdy4TxNOW never set
+        go:   ...copy loop
+
+    ip65's ``send`` (``drivers/cs8900a.s:441-466``) is also a bounded loop
+    (eight passes, ``skipframe`` in between); before #236 the harness spun
+    ``BEQ`` back to the ``LDA`` forever.
 
     Decoded by position rather than matched by regex on purpose: a regex
-    that *searched* for ``LDA / AND / BEQ`` would simply not match a poll
-    whose branch had been NOPed, which is the escape of issue #224.  Here
-    the ``PPPtr=BusST`` write is the anchor and whatever follows it is
+    that *searched* for the loop would simply not match one whose branch
+    had been NOPed, which is the escape of issue #224.  Here the
+    ``PPPtr=BusST`` write is the anchor and whatever surrounds it is
     reported, so the caller's assertions see the mutated bytes.
     """
     out = []
@@ -243,10 +264,19 @@ def _rdy4txnow_polls(code: bytes) -> list[dict[str, int]]:
             f"BusST poll at offset {lda} does not mask PPData_hi (opcode "
             f"{code[lda + 3]:#04x} where AND #imm was expected)"
         )
-        opcode, disp = code[lda + 5], code[lda + 6]
-        target = lda + 7 + (disp - 256 if disp >= 128 else disp)
-        out.append({"pptr": m.start(), "lda": lda, "mask": code[lda + 4],
-                    "opcode": opcode, "target": target})
+        pre = code[m.start() - 4:m.start()]
+        jmp_abs = code[lda + 14] | code[lda + 15] << 8
+        out.append({
+            "pptr": m.start(), "lda": lda, "mask": code[lda + 4],
+            "counter_ops": (pre[0], pre[2]), "counter": (pre[1], pre[3]),
+            "exit_op": code[lda + 5], "exit_target": _disp(code, lda + 5),
+            "dey": code[lda + 7], "dey_op": code[lda + 8],
+            "dey_target": _disp(code, lda + 8),
+            "dex": code[lda + 10], "dex_op": code[lda + 11],
+            "dex_target": _disp(code, lda + 11),
+            "jmp": code[lda + 13], "jmp_off": jmp_abs - LOAD,
+            "go": lda + 16,
+        })
     return out
 
 
@@ -293,24 +323,25 @@ def test_every_txcmd_write_is_the_ip65_value(name: str) -> None:
 
 
 @pytest.mark.parametrize("name", sorted(TX_BUILDERS))
-def test_every_rdy4txnow_poll_branches_back_to_its_lda(name: str) -> None:
-    """Every BusST poll is ``LDA PPData_hi / AND #$01 / BEQ`` back to the ``LDA``.
+def test_every_rdy4txnow_poll_is_bounded_and_exits_to_not_ready(name: str) -> None:
+    """Every BusST poll waits for ``Rdy4TxNOW``, re-reads BusST every pass,
+    gives up after :data:`RDY4TXNOW_MAX_POLLS` passes, and gives up into an
+    exit that stores ``0x04`` and returns.
 
     Issue #224: the walkers above classify a poll by the ``LDA / AND`` pair
-    and never look at what follows, so a builder whose ``BEQ`` had been
-    NOPed -- one that writes the frame whether or not the chip said
-    ``Rdy4TxNOW`` -- passed every structural test and was caught only by
-    the SHA-256 pins of the legacy builders in ``test_cs8900a_arp.py``.
-    The ARP TX block those pins do not cover is exactly a site that could
-    drift.  Three shapes are rejected by name because each is a plausible
-    edit: no branch at all; a branch whose target is past the ``LDA`` (it
-    re-tests a stale accumulator forever, or falls through); and ``BNE``
-    (spins while ready and proceeds when not).
+    and never look at what follows, so a builder whose wait branch had
+    been NOPed -- one that writes the frame whether or not the chip said
+    ``Rdy4TxNOW`` -- passed every structural test.  Issue #236: the wait
+    had no bound, so a wedged chip (#234) hung the 6510 with no diagnosis;
+    under VICE the chip is always ready, so only these bytes and the
+    simulator tests in ``test_cs8900a_tx_bound.py`` can see a regression.
 
-    Only the harness's own loop shape is accepted.  ip65's retry form
-    (``bne`` forward, ``skipframe``, ``dey / bne``) is not emitted by any
-    builder; a builder that adopts it should extend this walker
-    deliberately rather than be waved through.
+    Rejected by name, each a plausible edit: a wait branch that is not
+    ``BNE`` to the copy (``BEQ`` inverts it, a NOP drops it); a counter
+    branch that does not return to the ``LDA`` (re-tests a stale
+    accumulator or never re-reads BusST); a lost ``DEX`` stage (the bound
+    shrinks to 256); a bound other than 65,536; a give-up path that jumps
+    anywhere but a ``RESULT_TX_NOT_READY`` exit.
     """
     code = TX_BUILDERS[name]()
     polls = _rdy4txnow_polls(code)
@@ -323,14 +354,34 @@ def test_every_rdy4txnow_poll_branches_back_to_its_lda(name: str) -> None:
             f"{where} masks 0x{p['mask']:02X}; Rdy4TxNOW is bit 8 of BusST, "
             f"0x{BUSST_RDY4TXNOW_MASK:02X} of the high byte"
         )
-        assert p["opcode"] == BEQ, (
-            f"{where} is followed by opcode {p['opcode']:#04x}, not BEQ: the "
-            "frame would be written without waiting for Rdy4TxNOW"
-            + (" (BNE inverts the wait)" if p["opcode"] == BNE else "")
+        assert p["exit_op"] == BNE and p["exit_target"] == p["go"], (
+            f"{where}: after AND #$01 expected BNE to the copy at {p['go']}, got "
+            f"opcode {p['exit_op']:#04x} -> {p['exit_target']}"
+            + (" (BEQ inverts the wait)" if p["exit_op"] == BEQ else "")
         )
-        assert p["target"] == p["lda"], (
-            f"{where}: BEQ resolves to offset {p['target']}, not back to the LDA "
-            f"at {p['lda']}; the loop must re-read BusST every pass"
+        assert (p["dey"], p["dey_op"], p["dey_target"]) == (DEY, BNE, p["lda"]), (
+            f"{where}: inner count is not DEY / BNE back to the LDA "
+            f"(got {p['dey']:#04x} {p['dey_op']:#04x} -> {p['dey_target']})"
+        )
+        assert (p["dex"], p["dex_op"], p["dex_target"]) == (DEX, BNE, p["lda"]), (
+            f"{where}: outer count is not DEX / BNE back to the LDA "
+            f"(got {p['dex']:#04x} {p['dex_op']:#04x} -> {p['dex_target']})"
+        )
+        assert p["counter_ops"] == (LDY_IMM, LDX_IMM), (
+            f"{where}: the poll budget is not loaded as LDY #lo / LDX #hi "
+            f"immediately before PPPtr=BusST (got {p['counter_ops']})"
+        )
+        lo, hi = p["counter"]
+        polls_allowed = ((lo or 256) - 1) + 256 * ((hi or 256) - 1) + 1
+        assert polls_allowed == RDY4TXNOW_MAX_POLLS, (
+            f"{where}: budget LDY #${lo:02X} / LDX #${hi:02X} allows "
+            f"{polls_allowed} polls, expected {RDY4TXNOW_MAX_POLLS}"
+        )
+        assert p["jmp"] == JMP_ABS, f"{where}: budget exhaustion does not JMP out"
+        exit_ = code[p["jmp_off"]:p["jmp_off"] + 7]
+        assert exit_ == bytes([LDA_IMM, TX_NOT_READY]) + _sta(RESULT) + bytes([CLI, RTS]), (
+            f"{where}: give-up JMP lands on {exit_.hex()}, not "
+            f"LDA #${TX_NOT_READY:02X} / STA result / CLI / RTS"
         )
 
 
@@ -358,7 +409,7 @@ def test_tx_sequence_is_txcmd_txlen_busst_poll_then_data(name: str) -> None:
         f"{name}: {len(sites)} TxCMD write(s), expected {_expected_tx_sites(name)}"
     )
     polls = {p["pptr"]: p for p in _rdy4txnow_polls(code)}
-    poll_bytes = _lda(PPDATA_HI) + bytes([AND_IMM, BUSST_RDY4TXNOW_MASK, BEQ])
+    poll_bytes = _lda(PPDATA_HI) + bytes([AND_IMM, BUSST_RDY4TXNOW_MASK, BNE])
     for i, txcmd_lo in enumerate(sites):
         end = sites[i + 1] if i + 1 < len(sites) else len(code)
         window = code[:end]
@@ -380,11 +431,11 @@ def test_tx_sequence_is_txcmd_txlen_busst_poll_then_data(name: str) -> None:
             f"before offset {end})"
         )
         assert order == sorted(order)
-        assert busst in polls and polls[busst]["target"] == polls[busst]["lda"], (
+        assert busst in polls and polls[busst]["dey_target"] == polls[busst]["lda"], (
             f"{name}: TX site {i}: the poll after PPPtr=BusST at {busst} does "
             "not branch back to its LDA"
         )
-        assert polls[busst]["lda"] + 7 <= data, (
+        assert polls[busst]["go"] <= data, (
             f"{name}: TX site {i}: RTDATA is written inside the poll loop"
         )
 

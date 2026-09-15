@@ -197,13 +197,22 @@ def test_arp_builders_reject_an_ip_that_is_not_four_bytes(bad_ip: bytes) -> None
 # loaded as a scratch module.  Hard-coded rather than recomputed from
 # ``git show`` at test time: once this branch merges, master *is* the new
 # code and a live recomputation would compare the builder with itself.
+#
+# Re-pinned deliberately for issue #236 (bounded Rdy4TxNOW poll): each of
+# these builders has exactly one TX site and grew by exactly 20 bytes --
+# 13 for the poll budget and counter (LDY/LDX, BNE go, DEY/BNE, DEX/BNE,
+# JMP) and 7 for the RESULT_TX_NOT_READY exit.  6c81160's digests, for the
+# record: tx f05938fe.. 79, ping 6710d1e4.. 256, ping_tod 9b5e5ed1.. 380,
+# responder 7ec06447.. 401, responder_tod 15392373.. 525, respond 47afe09e.. 349.
+# What "opt-in means opt-in" still guards: ARP support adds nothing to
+# these bytes; the #236 structure is pinned in test_cs8900a_register_pins.py.
 _MASTER_DIGESTS: dict[str, tuple[str, int]] = {
-    "build_tx_code": ("f05938fe33a1563cc2cc5c5e2ee85353503f95f41f9eb5822b8e32f006071853", 79),
-    "build_ping_and_wait_code": ("6710d1e4735071870114017d26e3b9806c2e5b2fa1006a4693b57b46655e38d7", 256),
-    "build_ping_and_wait_tod_code": ("9b5e5ed178f5328f0173c57f87dbb9fdeef1630a6468fb4c59311ca74b4b79ef", 380),
-    "build_icmp_responder_code": ("7ec06447be98d246675e46591156869593cb6cb0774a995481e8028c2c07ba7d", 401),
-    "build_icmp_responder_tod_code": ("15392373d6fae3b6158e9dcd6a7d2e419bd8898371062c58ce89bcba50f997a8", 525),
-    "build_read_and_respond_echo_request_code": ("47afe09e52942f69f14fecbafa98c39fec354030a08026e4a00a647427023c65", 349),
+    "build_tx_code": ("98bc94956e032bb67ef34a05bed24fc7a6976d4c18de4aa3cc73fb47f4dbb5f4", 99),
+    "build_ping_and_wait_code": ("23374cb0d0056ff32018bd5324f0a7f8136ab836250ed3b5272065a25d3ed224", 276),
+    "build_ping_and_wait_tod_code": ("1955f33e3c5d4a3c1a5625fdb743082804497877b43d6c23caa660f4c2316d53", 400),
+    "build_icmp_responder_code": ("1c8e89b402a60e00c37aed6db4c3b9bc45accaaef1e6c7b33590f5240bc59ca1", 421),
+    "build_icmp_responder_tod_code": ("ee754e1d26c06ce3f3b68c918e12129ff470ba1c86eb5333ed3f1b091f60dfe3", 545),
+    "build_read_and_respond_echo_request_code": ("e98e97f7df9544f6c28b15b001889f6d37eb7aa991dea13cc9a0d70f435a419f", 369),
 }
 
 _LEGACY_CALLS = {
