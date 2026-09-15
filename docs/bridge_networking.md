@@ -1014,8 +1014,20 @@ Result bytes the TX builders can now store:
   does) and then the even remainder; up to 256 the emitted bytes are
   unchanged. `build_tx_code` is 99 bytes up to 256, 104 at a whole number
   of pages and 120 otherwise — still at or under the 128-byte PUT
-  threshold. Delivery above 256 on silicon is covered by the simulated
-  chip only until the #404 device run is recorded here.
+  threshold. **Measured on silicon** (U64E fw 3.15 `bce4535e`, external
+  RR-Net, 2026-09-15; ip65 `pingstatic` control passed first, `$630E`
+  identity): `build_tx_code` frames of 256/258/512/1514 bytes plus a
+  no-transmit null arm, interleaved in 8 rounds with a rotated order, one
+  UDP frame to en4's MAC per trial. Delivery was counted by `netstat -I
+  en4 -b` deltas, not by the result byte: 256 **8/8**, 258 **7/8**, 512
+  **8/8**, 1514 **8/8**, null 0/8. Every delivered trial's Ibytes delta
+  equals the frame length exactly. The one 258 miss stored
+  `RESULT_TX_NOT_READY` (`0x04`, nothing copied — the #236 bound, not the
+  copy loop), and the next trial sent normally without a reset. Cartridge
+  Preference was set `External` inside the lock and read back `Auto`
+  afterwards. Odd lengths stay refused; pad the frame by one byte
+  (the IP total-length field governs the datagram). Odd-length support is
+  [#438](https://github.com/JC-000/c64-test-harness/issues/438).
 - **The chip can be reset: `build_cs8900a_reset_code`**
   ([#234](https://github.com/JC-000/c64-test-harness/issues/234)).
   Measured: `Rdy4TxNOW` dead across 65,536 polls while every register the

@@ -708,8 +708,12 @@ def _poll_budget(max_polls: int) -> tuple[int, int]:
 
 
 #: Longest ``frame_len`` the TX builders accept (issue #404): a standard
-#: Ethernet frame without its CRC, which the chip appends.  The CS8900a
-#: refuses a longer TxLength with TxBidErr.
+#: Ethernet frame without its CRC, which the chip appends.  VICE 3.10
+#: ``cs8900.c:984`` (``MAX_TXLENGTH`` 1518, ``:277``) rejects a TxLength
+#: above 1518, or above 1514 unless TxCMD has InhibitCRC (``0x1000``),
+#: flagging a bid error; :data:`CS8900A_TXCMD_VALUE` ``0x00C9`` does not set
+#: it.  That is the emulator's model, source-read; silicon delivered 1514
+#: 8/8 on the U64E (issue #404) and nothing longer was tried.
 CS8900A_TX_MAX_FRAME_LEN = 1514
 
 
@@ -729,8 +733,10 @@ def _check_tx_frame_len(frame_len: int, what: str = "frame_len") -> None:
         raise ValueError(
             f"{what} must be even and 2..{CS8900A_TX_MAX_FRAME_LEN}, got "
             f"{frame_len!r}: the TX copy loop copies two bytes at a time, so an "
-            "odd length hangs the 6510 after one frame (issue #238), and no "
-            "Ethernet frame is longer than 1514 bytes without its CRC (issue #404)"
+            "odd length hangs the 6510 after one frame (issue #238) -- pad an "
+            "odd frame by one byte, the IP total-length field governs the "
+            "datagram -- and no Ethernet frame is longer than 1514 bytes "
+            "without its CRC (issue #404)"
         )
 
 

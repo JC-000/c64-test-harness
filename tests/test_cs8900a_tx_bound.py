@@ -313,6 +313,13 @@ def test_even_lengths_up_to_1514_are_accepted(route: str, n: int) -> None:
     LEN_ROUTES[route](n)
 
 
+@pytest.mark.parametrize("n", [61, 257, 1513])
+def test_an_odd_length_refusal_tells_the_caller_to_pad(n: int) -> None:
+    """Odd support is #438; until then the error says what to do instead."""
+    with pytest.raises(ValueError, match=r"pad an odd frame by one byte"):
+        bp.build_tx_code(LOAD, TX_BUF, n, RESULT)
+
+
 def test_the_maximum_is_the_documented_literal() -> None:
     assert bp.CS8900A_TX_MAX_FRAME_LEN == MAX_FRAME_LEN
 
