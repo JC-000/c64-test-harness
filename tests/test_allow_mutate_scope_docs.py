@@ -22,10 +22,17 @@ Pinned two ways:
   additionally, guard, "skip unless/without", "must run/be set", "only
   with/when", "set ... before" -- the last four added in review round 1),
   unless it carries a narrowing phrase ("config changes only", "``U64_HOST``
-  alone", "stricter than the contract", "not for the reset", ...).  A config
-  reason is removed from the sentence before the terms are looked for, so
-  "the reload changes RAM config" and "tests that write Data Streams config"
-  are not resets or RAM writes.
+  alone", "stricter than the contract", ...).  A config reason is removed from
+  the sentence before the terms are looked for, so "the reload changes RAM
+  config", "tests that write Data Streams config" and the category name "Data
+  Streams" itself are not resets, RAM writes or stream starts (#383).  A
+  **contrast** that denies a term -- ", not the reset", "(not the RAM write)",
+  "but not a stream start", "rather than / instead of / never the reboot" --
+  is removed too, together with a code-shaped mention of the term it denies
+  (the identifier in ``reset(scope=...)``).  Prose mentions stay, so a
+  contrast narrows nothing else: "Resets need U64_ALLOW_MUTATE, not the RAM
+  write" and "RAM writes need U64_ALLOW_MUTATE, not the RAM read" are still
+  claims (#384 review rounds 1 and 2).
 
 The corpus is ``README.md``, ``docs/**/*.md``, ``.claude/skills/c64-test/*.md``
 and the module docstring plus full-line ``#`` comments of every
@@ -40,9 +47,19 @@ and the module docstring plus full-line ``#`` comments of every
 * a wrong claim written in a sentence that also carries a narrowing phrase
   or a config reason that swallows the term;
 * the gate named without its literal name ("the mutation gate") beside a
-  reset;
+  reset, or through a pronoun across a sentence split: "Config writes, not
+  the reset alone, need U64_ALLOW_MUTATE; resets need it too." -- ``;`` ends
+  the sentence and "it" does not name the gate;
+* a claim written as the identifier a contrast denies: "reset(scope=...)
+  needs U64_ALLOW_MUTATE, not for the reset" passes, because the code-shaped
+  mention is discounted (that is what lets the ``U64_DESTRUCTIVE`` row in
+  ``docs/development.md`` through);
 * ``src/`` docstrings, inline trailing comments, and files outside the
   corpus above.
+
+Each sentence-shaped limit above is asserted to escape by
+:meth:`TestThePinCanFail.test_a_declared_limit_still_escapes`, so a change
+that closes (or moves) one is noticed and this list is updated.
 
 Nothing here proves the docs are right; it stops this specific regression.
 """
@@ -76,17 +93,59 @@ _REQUIRE = re.compile(
 #: A config write given as the reason; removed before the terms are looked for.
 _CONFIG_REASON = re.compile(
     r"\b(writes?|wrote|writing|rewrites?|changes?|changing)\s+(\S+\s+){0,3}?"
-    r"(config(uration)?|CPU speed)\b",
+    r"(config(uration)?|CPU speed)\b"
+    r"|\bdata streams?\b",  # the config category, not a stream start (#383)
     re.I,
 )
 #: Phrases that state the narrow contract, or that a gate is stricter than it.
 _NARROWING = re.compile(
     r"config(uration)? changes only|config writes only|U64_HOST alone"
     r"|stricter than the contract|beyond the contract|outside the contract"
-    r"|\bnot (for|because of) (the |a )?(reset|reboot|RAM|stream)"
     r"|\bnot (gated|required)\b",
     re.I,
 )
+#: What a contrast denies: the term, with an optional article and one more word.
+_CONTRAST_TERM = r"(?:the\s+|a\s+)?(?:reset|reboot|RAM|stream)\w*(?:\s+\w+)?"
+
+#: A contrast clause that denies a term (#384 review round 1).  ``not`` must
+#: follow one of the anchors, so a sentence that *opens* "Not the RAM write
+#: alone: resets also need ..." keeps its claim.  One anchor per line.
+_CONTRAST = re.compile(
+    r"(?:(?!x)x"  # never matches; every anchor below is an alternative
+    r"|,"
+    r"|:"
+    r"|\("
+    r"|\u2014"
+    r"|\u2013"
+    r"|\bbut"
+    r"|\band"
+    r")\s*not\s+(?:for\s+|because\s+of\s+)?" + _CONTRAST_TERM
+    + r"|\brather\s+than\s+" + _CONTRAST_TERM
+    + r"|\binstead\s+of\s+" + _CONTRAST_TERM
+    + r"|\bnever\s+" + _CONTRAST_TERM,
+    re.I,
+)
+
+
+def _without_contrasts(sentence: str) -> str:
+    """*sentence* with each contrast clause, and each code-shaped mention of its term, removed."""
+    denied: set[str] = set()
+
+    def cut(match: re.Match) -> str:
+        term = re.search(r"\b(reset|reboot|RAM|stream)", match.group(0), re.I)
+        if term is not None:
+            denied.add(term.group(1).lower())
+        return " "
+
+    rest = _CONTRAST.sub(cut, sentence)
+    # Only a code-shaped mention of a denied term is discounted -- the
+    # identifier in "reset(scope=...) tests need it ..., not for the reset" --
+    # so prose "RAM writes need ..., not the RAM read" stays a claim (#384 r2).
+    for family in denied:
+        rest = re.sub(r"\b" + family + r"\w*\s*\(", " ", rest, flags=re.I)
+    return rest
+
+
 _SENTENCE = re.compile(r"(?<=[.;!?])\s+|\s\|\s")
 
 
@@ -103,7 +162,7 @@ def wider_contract_claims(text: str) -> list[str]:
         for sentence in _SENTENCE.split(plain):
             if GATE not in sentence or _NARROWING.search(sentence):
                 continue
-            rest = _CONFIG_REASON.sub(" ", sentence)
+            rest = _CONFIG_REASON.sub(" ", _without_contrasts(sentence))
             if _TERMS.search(rest) and _REQUIRE.search(rest):
                 claims.append(sentence.strip())
     return claims
@@ -217,10 +276,31 @@ class TestThePinCanFail:
         "Anything that starts a stream must run with U64_ALLOW_MUTATE.",
         "Set U64_ALLOW_MUTATE before any test that writes RAM.",
         "Resets run only with U64_ALLOW_MUTATE=1.",
+        # #383: the exemptions must not reach a real claim
+        "Stream start/stop in the Data Streams tests needs U64_ALLOW_MUTATE.",
+        "Not the RAM write alone: resets also need U64_ALLOW_MUTATE.",
+        # #384 review round 1: a contrast denies its own term only
+        "Resets need U64_ALLOW_MUTATE, not the RAM write.",
+        "Stream start/stop needs U64_ALLOW_MUTATE, not the reset.",
+        "A reboot requires U64_ALLOW_MUTATE, but not a stream start.",
+        "RAM writes need U64_ALLOW_MUTATE \u2014 not the reboot.",
+        # an un-anchored 'not' is a negated verb, not a contrast: stripping it
+        # would drop the only term (kills S11, anchor made optional)
+        "The suite does not reset the C64 unless U64_ALLOW_MUTATE is set, so it "
+        "needs the gate.",
+        # #384 review round 2: denying a term discounts no prose mention of it
+        "RAM writes need U64_ALLOW_MUTATE, not the RAM read.",
+        "Stream start needs U64_ALLOW_MUTATE, never the stream stop.",
+        "Resets need U64_ALLOW_MUTATE, not the reset counter.",
+        "A reboot requires U64_ALLOW_MUTATE, not a reset.",
     ], ids=["dev-setup", "dev-mutate-marker", "readme-comment", "readme-uci",
             "capabilities-docstring", "feature-parity-docstring", "stream", "reboot",
             "r1-skip-unless", "r1-guards", "r1-must-run", "r1-set-before",
-            "r1-only-with"])
+            "r1-only-with", "383-stream-beside-data-streams", "383-leading-not",
+            "r2-not-the-ram-write", "r2-stream-not-reset", "r2-but-not-stream",
+            "r2-dash-not-reboot", "r2-unanchored-not",
+            "r3-ram-not-ram-read", "r3-stream-never-stream-stop",
+            "r3-reset-not-reset-counter", "r3-reboot-not-a-reset"])
     def test_a_retired_sentence_is_caught(self, text: str) -> None:
         assert wider_contract_claims(text)
 
@@ -244,8 +324,52 @@ class TestThePinCanFail:
         # tests/test_ultimate64_helpers_live.py
         "(turbo flip) runs only when ``U64_ALLOW_MUTATE`` is also set.",
         "Set U64_ALLOW_MUTATE before any test that writes device config.",
+        # #383 false positives, from the adversarial review of #379
+        "The Data Streams tests run only when U64_ALLOW_MUTATE is set, because "
+        "they change stream config.",
+        "The gate U64_ALLOW_MUTATE guards the Cartridge Preference write, not the "
+        "reset.",
+        # #384 review round 1: every contrast form and anchor strips its term
+        "U64_ALLOW_MUTATE guards the Cartridge Preference write (not the reset).",
+        "U64_ALLOW_MUTATE guards the Cartridge Preference write rather than the reset.",
+        "U64_ALLOW_MUTATE guards the config write and not the reset.",
+        "U64_ALLOW_MUTATE guards the config write, instead of the reset.",
+        "U64_ALLOW_MUTATE guards config writes, never the reset.",
+        "U64_ALLOW_MUTATE guards the config write but not the reset.",
+        "U64_ALLOW_MUTATE guards the config write \u2014 not the reset.",
+        "U64_ALLOW_MUTATE guards the config write \u2013 not the reset.",
+        "U64_ALLOW_MUTATE guards the config write: not the reset.",
+        # docs/development.md's U64_DESTRUCTIVE row, as the pin reads it
+        "The set_speed/get_speed tests and the device-touching "
+        "reset(scope='cpu'\\|'drive') tests need U64_ALLOW_MUTATE=1 for the "
+        "CPU-speed writes of speed_baseline, not for the reset (#268, #333);",
     ], ids=["narrow", "allowed", "streams-config", "ram-config", "not-for-the-reset",
             "stricter", "no-gate-named", "r1-skip-without-but-stricter",
-            "r1-corpus-capabilities", "r1-corpus-helpers-only-when", "r1-set-before-config"])
+            "r1-corpus-capabilities", "r1-corpus-helpers-only-when", "r1-set-before-config",
+            "383-data-streams-category", "383-not-the-reset",
+            "r2-paren", "r2-rather-than", "r2-and-not", "r2-instead-of", "r2-never",
+            "r2-but-not", "r2-em-dash", "r2-en-dash", "r2-colon", "r2-dev-row"])
     def test_a_narrow_sentence_is_not_caught(self, text: str) -> None:
+        assert wider_contract_claims(text) == []
+
+    @pytest.mark.parametrize("text", [
+        "Power-cycles need U64_ALLOW_MUTATE.",
+        "DMA writes need U64_ALLOW_MUTATE.",
+        "Resets are only run with U64_ALLOW_MUTATE.",
+        "Opt in with U64_ALLOW_MUTATE for resets.",
+        "Resets need U64_ALLOW_MUTATE, which covers config changes only.",
+        "Resets need the mutation gate.",
+        "Config writes, not the reset alone, need U64_ALLOW_MUTATE; resets need it too.",
+        "reset(scope=...) needs U64_ALLOW_MUTATE, not for the reset.",
+        "reset (scope=...) needs U64_ALLOW_MUTATE, not for the reset.",
+    ], ids=["synonym-power-cycles", "synonym-dma-writes", "requirement-only-run-with",
+            "requirement-opt-in", "beside-a-narrowing-phrase", "gate-not-named",
+            "pronoun-across-a-split", "denied-identifier",
+            "denied-identifier-spaced"])
+    def test_a_declared_limit_still_escapes(self, text: str) -> None:
+        """Each sentence-shaped limit in the module docstring, pinned as an escape.
+
+        A failure here means a limit closed or moved: update the docstring's
+        "What still gets through" list, then this test.
+        """
         assert wider_contract_claims(text) == []
