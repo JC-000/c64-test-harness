@@ -8,9 +8,29 @@ Most tests are read-only and run on ``U64_HOST`` alone. The
 ``TestSetSpeed`` class and the device-touching ``TestResetScopes`` tests
 added for PR #122 coverage exercise the protocol's ``set_speed`` /
 ``get_speed`` / ``reset(scope=...)`` surface on real hardware; they write
-CPU speed and therefore also need ``U64_ALLOW_MUTATE=1`` (#268). Each
-restores the device to 1 MHz in a ``finally`` block so downstream
-CIA-timer measurements still see the expected native clock.
+CPU speed and therefore also need ``U64_ALLOW_MUTATE=1`` (#268), and they
+request the module-scoped ``speed_baseline`` fixture.
+
+**Known state on entry, not on exit (#276).** ``speed_baseline``
+reconciles the device when it starts, through the merged entry-baseline
+mechanism: ``resolve_baseline_on_entry`` for the device's generation, then
+``apply_factory_baseline`` -- on by default for the Ultimate line (U64E),
+off for the C64 Ultimate and for a device that cannot be identified.  This
+module is stricter than the manager in one respect: it **never** resets a
+device that is not graded ``ultimate``, not even when
+``U64_BASELINE_ON_ENTRY=1`` asks, because ``apply_factory_baseline`` has no
+generation gate of its own.  It then sets 1 MHz, the one item these tests
+own, on every generation.  The 1 MHz restore at exit and the
+``DeviceLock`` release are attempted on every path a live process survives
+-- an exception at the ``yield``, a raising ``close()``, a raising
+constructor -- and a restore that fails is raised, not swallowed.  Neither
+runs on SIGKILL: on the U64E the next run's entry reset clears what a killed
+run left; **on a C64 Ultimate nothing does**, so after an abnormal exit
+read ``U64 Specific Settings`` / ``Turbo Control`` and ``CPU Speed`` with
+``get_config_item`` (``current`` against ``default``; bodyless GETs) before
+trusting a timing measurement.  Pinned offline by
+``tests/test_transport_live_fixture_teardown.py``.  Each test still
+restores 1 MHz in its own ``finally`` as well.
 
 The ``reset(scope='machine')`` case triggers a full FPGA reboot (~8 s
 to recover) and is therefore gated by an additional ``U64_DESTRUCTIVE=1``
@@ -19,13 +39,16 @@ module-scoped state is never disturbed by default.
 """
 from __future__ import annotations
 
+import logging
 import os
 import time
 
 import pytest
 
+from c64_test_harness import apply_factory_baseline
 from c64_test_harness.backends.device_lock import DeviceLock
 from c64_test_harness.backends.ultimate64 import Ultimate64Transport
+from c64_test_harness.backends.ultimate64_baseline import resolve_baseline_on_entry
 from c64_test_harness.backends.ultimate64_helpers import (
     get_turbo_mhz,
     max_cpu_speed_mhz,
@@ -52,22 +75,128 @@ _requires_mutate = pytest.mark.skipif(
 )
 
 
-@pytest.fixture(scope="module")
-def transport() -> Ultimate64Transport:
-    lock = DeviceLock(_HOST)
-    if not lock.acquire(timeout=120.0):
-        pytest.skip(f"Could not acquire device lock for {_HOST}")
-    t = Ultimate64Transport(host=_HOST, password=_PW, timeout=8.0)
-    yield t
-    # Only a lane allowed to mutate can have changed the speed, and only
-    # such a lane may write it back (#268).
-    if _ALLOW_MUTATE:
+_log = logging.getLogger(__name__)
+
+
+def _teardown_steps(steps):
+    """Attempt every step; return ``(label, exception)`` for each that raised.
+
+    Nothing stops early: a step that raises is logged at WARNING and the
+    next one still runs (#276 -- a raising ``close()`` used to orphan the
+    ``DeviceLock``).
+    """
+    failures = []
+    for label, step in steps:
         try:
-            t.set_speed(1)  # leave device at native clock for downstream tests
-        except Exception:
-            pass
-    t.close()
-    lock.release()
+            step()
+        except Exception as exc:  # noqa: BLE001 -- collected, raised below
+            _log.warning("teardown step %s failed: %r", label, exc)
+            failures.append((label, exc))
+    return failures
+
+
+def _raise_teardown_failures(what, failures):
+    """A restore that did not happen says so."""
+    if failures:
+        detail = "; ".join(f"{label} failed: {exc!r}" for label, exc in failures)
+        raise RuntimeError(f"{what}: {detail}") from failures[0][1]
+
+
+def _locked_transport(host, password):
+    """Lock, construct, yield; then close and release -- the lock last, always.
+
+    The ``try`` opens immediately after the lock is taken, so a constructor
+    that raises, an exception arriving at the ``yield`` (``throw``,
+    ``GeneratorExit``) and a raising ``close()`` all still release it.  A
+    failed ``close()`` is raised after the release when nothing else is
+    already propagating.
+    """
+    lock = DeviceLock(host)
+    if not lock.acquire(timeout=120.0):
+        pytest.skip(f"Could not acquire device lock for {host}")
+    t = None
+    failures = []
+    try:
+        t = Ultimate64Transport(host=host, password=password, timeout=8.0)
+        yield t
+    finally:
+        try:
+            if t is not None:
+                failures = _teardown_steps([("transport.close()", t.close)])
+        finally:
+            lock.release()
+    _raise_teardown_failures("transport teardown", failures)
+
+
+def _reconcile_on_entry(client):
+    """Entry-time reconciliation through the merged mechanism (#276, #285).
+
+    ``resolve_baseline_on_entry`` decides exactly as the manager's acquire
+    does -- the generation default (on for ``ultimate`` only), overridden
+    by ``U64_BASELINE_ON_ENTRY`` -- and ``apply_factory_baseline`` performs
+    it.  One refusal the manager does not make: a device not graded
+    ``ultimate`` is never reset here, even when the override asks, because
+    ``apply_factory_baseline`` itself has no generation gate and the C64
+    Ultimate must never be reset at entry by an unattended run.
+    """
+    try:
+        generation = client.capabilities.generation
+    except Exception as exc:  # noqa: BLE001 -- an ungradeable device resolves off
+        _log.info("entry baseline: generation unreadable (%r), grading unknown", exc)
+        generation = "unknown"
+    if not isinstance(generation, str):
+        generation = "unknown"
+    enabled, why = resolve_baseline_on_entry(generation)
+    if generation != "ultimate":
+        if enabled:
+            _log.warning(
+                "entry baseline REFUSED on %s (generation=%s) although %s: this "
+                "module never resets a device not graded 'ultimate' at entry",
+                _HOST, generation, why,
+            )
+        else:
+            _log.info(
+                "entry baseline skipped on %s (generation=%s): %s",
+                _HOST, generation, why,
+            )
+        return None
+    if not enabled:
+        _log.info("entry baseline skipped on %s (generation=%s): %s", _HOST, generation, why)
+        return None
+    report = apply_factory_baseline(client)
+    _log.info("entry baseline ran on %s (%s): %s", _HOST, why, report.summary())
+    return report
+
+
+def _speed_session(t):
+    """Reconcile at entry, set 1 MHz, and restore 1 MHz on every exit path."""
+    _reconcile_on_entry(t.client)
+    t.set_speed(1)
+    failures = []
+    try:
+        yield t
+    finally:
+        failures = _teardown_steps([("set_speed(1)", lambda: t.set_speed(1))])
+    _raise_teardown_failures("CPU speed restore", failures)
+
+
+@pytest.fixture(scope="module")
+def transport():
+    """The module's locked transport; read-only tests use it on its own."""
+    yield from _locked_transport(_HOST, _PW)
+
+
+@pytest.fixture(scope="module")
+def speed_baseline(transport):
+    """For the tests that write CPU speed: gate, reconcile at entry, restore.
+
+    Entry reconciliation is the guarantee -- a SIGKILLed predecessor's
+    residue (CPU Speed 8 on a freshly flashed U64E, #276) is cleared by the
+    *next* run.  The exit restore is a courtesy that SIGKILL skips.
+    """
+    if not _ALLOW_MUTATE:
+        pytest.skip("U64_ALLOW_MUTATE not set — CPU-speed tests write device config")
+    yield from _speed_session(transport)
 
 
 def test_protocol_conformance(transport: Ultimate64Transport) -> None:
@@ -159,6 +288,7 @@ def test_read_framebuffer_returns_one_frame(transport: Ultimate64Transport) -> N
 
 
 @_requires_mutate
+@pytest.mark.usefixtures("speed_baseline")
 class TestSetSpeed:
     """``set_speed`` / ``get_speed`` round-trip through real U64 turbo state.
 
@@ -260,6 +390,7 @@ class TestResetScopes:
     """
 
     @_requires_mutate
+    @pytest.mark.usefixtures("speed_baseline")
     def test_reset_scope_cpu_keeps_device_responsive(
         self, transport: Ultimate64Transport
     ) -> None:
@@ -280,6 +411,7 @@ class TestResetScopes:
             transport.set_speed(1)
 
     @_requires_mutate
+    @pytest.mark.usefixtures("speed_baseline")
     def test_reset_scope_default_is_cpu(
         self, transport: Ultimate64Transport
     ) -> None:
@@ -295,6 +427,7 @@ class TestResetScopes:
             transport.set_speed(1)
 
     @_requires_mutate
+    @pytest.mark.usefixtures("speed_baseline")
     def test_reset_scope_drive_a(
         self, transport: Ultimate64Transport
     ) -> None:
@@ -330,6 +463,7 @@ class TestResetScopes:
         ),
     )
     @_requires_mutate
+    @pytest.mark.usefixtures("speed_baseline")
     def test_reset_scope_machine_reboots_and_recovers(
         self, transport: Ultimate64Transport
     ) -> None:
