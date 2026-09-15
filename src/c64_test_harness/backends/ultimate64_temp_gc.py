@@ -79,6 +79,7 @@ import threading
 import weakref
 from dataclasses import dataclass, field
 from ftplib import FTP, all_errors as _FTP_ALL_ERRORS
+from typing import NamedTuple
 
 _log = logging.getLogger(__name__)
 
@@ -201,6 +202,15 @@ DEFAULT_KEEP = 2
 #: Override with :data:`BUDGET_ENV` or the client's ``temp_gc_budget=``.
 DEFAULT_LEAK_BUDGET = 6
 
+#: The device's REST port (``Ultimate64Client``'s ``port`` default). A
+#: ``host:80`` spelling names the same device as a bare ``host``, so
+#: :func:`temp_ledger_key` folds that one port and keeps every other.
+#: ``DeviceLock._sanitize_device_id`` keeps ``gw:8080`` and ``gw:8081``
+#: apart, so a ledger that folded all ports would let a failed pass
+#: against one device refuse requests to a different one behind the same
+#: name (#434 follow-up).
+DEFAULT_REST_PORT = 80
+
 DEFAULT_FTP_PORT = 21
 DEFAULT_FTP_TIMEOUT = 10.0
 DEFAULT_FTP_USER = "anonymous"
@@ -214,8 +224,10 @@ __all__ = [
     "hygiene_required",
     "leak_budget",
     "TempLedger",
+    "TempReservation",
     "temp_ledger_for",
     "temp_ledger_key",
+    "DEFAULT_REST_PORT",
     "AUTO_GC_ENV",
     "KEEP_ENV",
     "BUDGET_ENV",
@@ -314,9 +326,17 @@ def temp_ledger_key(host: str) -> str:
     """Normalise a client's host string to the key its device's ledger uses.
 
     Folds together spellings of one address: surrounding whitespace, case,
-    an ``http://``/``https://`` scheme, a trailing path, a trailing ``:port``,
-    IPv6 brackets, a trailing dot, and the textual forms of one IP address
+    an ``http://``/``https://`` scheme, a trailing path, IPv6 brackets, a
+    trailing dot, and the textual forms of one IP address
     (``0:0:0:0:0:0:0:1`` and ``::1``).
+
+    **A non-default port is kept.** Only ``:80`` folds
+    (:data:`DEFAULT_REST_PORT`, the client's own default), because
+    ``host:80`` and ``host`` name one device. ``gw:8080`` and ``gw:8081``
+    are two devices as far as ``DeviceLock`` is concerned -- its
+    ``_sanitize_device_id`` keys them apart -- so merging them would let a
+    failed pass against one refuse attachment-creating requests to the
+    other (#434 follow-up).
 
     **A name and the address it resolves to are not folded.** That would need
     a DNS lookup in the accounting path, which can block for seconds and can
@@ -330,20 +350,30 @@ def temp_ledger_key(host: str) -> str:
             s = s[len(scheme):]
             break
     s = s.split("/", 1)[0]
+    port = ""
     if s.startswith("["):
         end = s.find("]")
         if end != -1:
+            rest = s[end + 1:]
             s = s[1:end]
+            if rest.startswith(":") and rest[1:].isdigit():
+                port = rest[1:]
     elif s.count(":") == 1:
-        name, _, port = s.partition(":")
-        if port.isdigit():
-            s = name
+        name, _, maybe_port = s.partition(":")
+        if maybe_port.isdigit():
+            s, port = name, maybe_port
     s = s.rstrip(".")
     try:
         s = str(ipaddress.ip_address(s))
     except ValueError:
         pass
-    return s or str(host)
+    if not s:
+        return str(host)
+    if port and int(port) != DEFAULT_REST_PORT:
+        # Re-bracket an IPv6 literal so "address" and "port" stay readable
+        # (and so ``::1`` with a port cannot collide with a bare address).
+        return f"[{s}]:{port}" if ":" in s else f"{s}:{port}"
+    return s
 
 
 class TempLedger:
@@ -386,6 +416,13 @@ class TempLedger:
         #: The host string of the most recently attached client, for that
         #: orphaned sweep.
         self.host: str | None = None
+        #: Attachments reserved (counted) whose request has not returned yet.
+        #: A sweep cannot collect what is still being sent, so :meth:`collected`
+        #: carries these into the new generation instead of zeroing them.
+        self.in_flight = 0
+        #: How many of :attr:`in_flight` an **armed** client reserved, so the
+        #: carry-over can restore :attr:`armed_pending` truthfully.
+        self.in_flight_armed = 0
         self._clients: weakref.WeakSet = weakref.WeakSet()
 
     def attach(self, client: object) -> None:
@@ -399,12 +436,47 @@ class TempLedger:
             return list(self._clients)
 
     def collected(self) -> None:
-        """A sweep succeeded: nothing is pending and nothing is blocked."""
+        """A sweep succeeded: only still-in-flight reservations stay pending.
+
+        **Not a reset to zero.** A sweep that lands between another client's
+        reservation and its send cannot have collected that attachment --
+        the request has not finished sending -- so zeroing here would leave
+        the count reading 0 while the device holds one. In-flight
+        reservations are therefore carried into the new generation, and
+        :meth:`end_reservation` refunds whatever of them was never sent.
+        """
         with self.lock:
-            self.pending = 0
+            self.pending = self.in_flight
             self.blocked = None
-            self.armed_pending = False
+            self.armed_pending = self.in_flight_armed > 0
             self.generation += 1
+
+    def begin_reservation(self, count: int, *, armed: bool) -> None:
+        """Note *count* counted attachments whose request has not returned."""
+        with self.lock:
+            self.in_flight += count
+            if armed:
+                self.in_flight_armed += count
+
+    def end_reservation(self, reservation: "TempReservation", *, sent: int) -> int:
+        """End *reservation*: it is no longer in flight; refund what was not sent.
+
+        Safe across a sweep: :meth:`collected` carried the whole reservation
+        into the new generation, so the unsent part is still counted there
+        and is still owed back.
+
+        :returns: the refunded (unsent) count, for the caller to take off its
+            own share too.
+        """
+        with self.lock:
+            count = reservation.count
+            unsent = max(0, min(count, count - sent))
+            self.in_flight = max(0, self.in_flight - count)
+            if reservation.armed:
+                self.in_flight_armed = max(0, self.in_flight_armed - count)
+            if unsent:
+                self.pending = max(0, self.pending - unsent)
+            return unsent
 
     def drain_on_lock_release(self, reason: str = "device lock release") -> bool:
         """Release callback: **one** drain for this device, however many clients.
@@ -465,6 +537,25 @@ class TempLedger:
                 self.host, self.pending, self.blocked,
             )
             return True
+
+
+class TempReservation(NamedTuple):
+    """One client's counted-but-not-yet-sent attachment reservation (#295).
+
+    Returned by ``Ultimate64Client._reserve_temp_attachments`` and handed
+    back to :meth:`TempLedger.end_reservation` when the request returns.
+    Carrying ``armed`` and ``count`` on the token (rather than re-reading
+    them at the end) keeps the in-flight accounting symmetric even if the
+    client's grade is re-probed mid-request.
+
+    ``pending_before`` is the device's count as it stood **inside the
+    ledger lock** at reservation time -- the only non-racy value to log.
+    """
+
+    generation: int
+    pending_before: int
+    armed: bool
+    count: int
 
 
 _TEMP_LEDGERS: dict[str, TempLedger] = {}

@@ -883,8 +883,14 @@ So on a leak-prone device **`run_prg_via_sys(target, prg)` is the low-risk way t
    every client of one host shares one count, so a fresh client per upload does not
    reset it, and a lock release sweeps once per host however many clients exist. A
    name and its IP address are separate ledgers (no DNS), so use one spelling per
-   device. It is **not** shared across processes: two processes against one device
+   device; a non-default `:port` in the host string is likewise a separate ledger,
+   matching how `DeviceLock` keys devices (only `:80` folds). It is **not** shared
+   across processes: two processes against one device
    each spend a budget, and only the lock-release drain covers the hand-off.
+   Because the budget counts the **device**, the client that crosses it need not be
+   the one that leaked — so the FTP-enable write is gated separately, on the
+   client's *own* uncollected share. A client that leaked nothing sweeps and may
+   block, but never writes config.
 2. **Never loop an upload against a leak-prone device without a hygiene pass.** Nobody knows how many uploads an unpatched device survives before `/Temp` fills and the firmware crashes, so there is no count to stay under: the harness's per-device budget (`DEFAULT_LEAK_BUDGET`, #295) is a conservative choice, not a measured limit. **Budget across runs, not within one:** a `reboot()` does not delete attachments (measured), so what you are spending is whatever the device has accumulated since its last GC or power-cycle — including everything the previous lane left behind. Parametrization multiplies quietly: four `mhz` params x three vectors is twelve uploads in one session.
 3. **A hygiene result with `.error` set is a failed pass, not a benign skip.** `gc_temp_folder` never raises — it reports. The GC needs the device's **FTP File Service**, which is **`Disabled` by default on 1.1.0**: verify it is on before relying on a hygiene pass, never assume it. Where it is off the sweep silently no-ops and the failure mode is "cleanup appeared to run, device wedged anyway". Stop uploading after an `.error`; do not keep going. And know what the harness does about it: on a failed pass `_run_temp_hygiene` (`ultimate64_client.py:812-834`) **enables FTP File Service itself** — a `Network Settings` write it logs at WARNING and never restores, persisting until a firmware power-on, since `machine:reboot` does not clear firmware RAM. So the setting you find on a device may be a previous lane's hygiene pass rather than anyone's decision, and that write targets a store the entry-baseline code lists in `BASELINE_NEVER_TOUCH`. Those are two contracts, not a contradiction (owner decision on #263): `BASELINE_NEVER_TOUCH` means `apply_factory_baseline` never resets or asserts those stores, while the hygiene pass may write exactly this one item, once per device per process (#295), and only for a client that leaked — a client that leaked nothing writes no config.
 4. **Run hygiene while holding the `DeviceLock`.** `gc_temp_folder` acquires no lock of its own.

@@ -175,6 +175,17 @@ def _reset_temp_ledgers(request):
     ``fake-host`` would otherwise leave a count, or a hygiene block, for the
     next test that builds a client on that name.  Live tests keep it: there
     the count describes a real device across tests.
+
+    **Test-only, and deliberately not a full reset.**  It clears the
+    registry, so clients built afterwards get fresh ledgers, while a client
+    built *earlier* keeps the ledger object it already holds.  A
+    module- or session-scoped fixture that yields a client therefore keeps
+    accounting that later tests in that module cannot see through
+    ``pending_temp_attachments`` on a freshly built client.  That is
+    acceptable here because it only ever loses a count between unit tests;
+    nothing in the harness's own behaviour depends on this hook.  Unit
+    tests that need one client's accounting should build the client inside
+    the test.
     """
     node_path = getattr(request.node, "path", None) or request.node.fspath
     if is_live_test_file(node_path):

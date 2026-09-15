@@ -355,9 +355,14 @@ device to the next one clean. The two drain cases differ:
 **The budget is per device, within one process** (issue #295). The count,
 the refusal state and the one FTP-enable attempt live in a process-wide
 `TempLedger` (`ultimate64_temp_gc.py`), keyed by the normalised host.
-Normalising folds together case, scheme, `:port`, a trailing dot and the
+Normalising folds together case, scheme, a trailing dot and the
 spellings of one IP address. It does **not** fold a name with its
-address, because that needs DNS; use one spelling per device. So:
+address, because that needs DNS; use one spelling per device. A
+**non-default port is kept**: only `:80` folds (`DEFAULT_REST_PORT`, the
+client's own default), because `host:80` and `host` name one device while
+`gw:8080` and `gw:8081` do not — `DeviceLock` keys those apart, so a
+ledger that merged them would let a failed pass against one refuse
+requests to the other. So:
 
 - a fresh client per upload no longer resets the budget;
 - two clients of one device spend one budget between them;
@@ -368,9 +373,22 @@ address, because that needs DNS; use one spelling per device. So:
   **every** armed client of that device, until any client's sweep succeeds.
   Bodyless calls, `temp_hygiene=False` clients and `U64_TEMP_GC_REQUIRED=0`
   are not blocked.
-- Whether a drain may take the leaking-lane path (the FTP-enable attempt,
-  the block) is still decided by that client's own uncollected share. A
-  client that leaked nothing never writes config.
+- Whether a client may take the leaking-lane path (the FTP-enable attempt)
+  is decided by that client's own uncollected share, on **both** routes
+  into the pass. **A client that leaked nothing never writes config** —
+  not on the drain, where the inherited sweep writes none, and not on the
+  budget path either, which a client whose own share is zero can reach
+  precisely because the budget counts the *device*: another client's
+  attachments, or a `temp_hygiene=False` client's, can be what crosses it.
+  Such a client still sweeps, and still blocks the device if its sweep
+  fails; it just makes no `Network Settings` write.
+- **A counted attachment is in flight until its request returns.** The
+  count happens before the send, so that the budget check and the count
+  are one atomic step, which leaves a window where a sweep could otherwise
+  zero a count the attachment is about to land into. A successful sweep
+  therefore resets the count to the still-in-flight reservations rather
+  than to zero, and whatever a reservation never sent is refunded when it
+  ends.
 - **A leak outlives its client.** Release callbacks hold nothing strongly,
   so before the ledger a client that leaked and was garbage-collected
   before the lock release never drained. The ledger outlives its clients:

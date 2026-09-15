@@ -715,15 +715,27 @@ class Ultimate64Client:
     ) -> tuple[int, bytes]:
         if method != "GET":
             self._check_device_lock(f"{method} {path}")
+        reservation = None
         if self._creates_temp_attachment(method, body):
             # Gate and count in one step under the device ledger's lock
             # (#295), before sending. Counted whether or not the call then
             # fails: the firmware writes the attachment as the body streams
             # in, so a request that errors afterwards has still left one.
-            self._reserve_temp_attachments(f"{method} {path}")
-        status, data = self._request_uncounted(
-            method, path, body=body, content_type=content_type, query=query
-        )
+            reservation = self._reserve_temp_attachments(f"{method} {path}")
+        try:
+            status, data = self._request_uncounted(
+                method, path, body=body, content_type=content_type, query=query
+            )
+        finally:
+            if reservation is not None:
+                # The send has returned, so the attachment has landed and a
+                # sweep from here on can collect it. While it was *in
+                # flight* one could not -- which is why the ledger carries
+                # in-flight reservations across a sweep instead of zeroing
+                # them, so a sweep between this reservation and its send
+                # cannot leave the count reading 0 against a device that
+                # holds one.
+                self._end_temp_reservation(reservation, sent=reservation.count)
         # Reaching here means the device answered, which is the evidence a
         # construct-time probe failure could not supply. Only the fact is
         # recorded here, not the re-probe: firing a GET from inside every
@@ -985,7 +997,13 @@ class Ultimate64Client:
                 return 0
             return self._own_temp_attachments
 
-    def _count_temp_attachments(self, count: int) -> None:
+    def _count_temp_attachments(self, count: int, armed: bool | None = None) -> None:
+        """Add *count* to this client's share and the device's count.
+
+        *armed* lets a caller reuse the arming decision it already made under
+        the ledger lock, so a re-probe mid-request cannot make the in-flight
+        accounting asymmetric.
+        """
         ledger = self._temp_ledger
         with ledger.lock:
             if self._own_temp_generation != ledger.generation:
@@ -993,38 +1011,55 @@ class Ultimate64Client:
                 self._own_temp_attachments = 0
             self._own_temp_attachments += count
             ledger.pending += count
-            if self.temp_hygiene_armed:
+            if self.temp_hygiene_armed if armed is None else armed:
                 # So the ledger can still sweep these if every client that
                 # counted them is collected before the lock release.
                 ledger.armed_pending = True
 
-    def _uncount_temp_attachments(self, count: int, generation: int) -> None:
-        """Refund a reservation that was not sent, unless a sweep since
-        *generation* has already zeroed the count."""
+    def _end_temp_reservation(self, reservation, sent: int) -> None:
+        """The request has returned: end *reservation* and refund the unsent part.
+
+        The device's ledger refunds whatever of the reservation never went
+        out (correct even if a sweep intervened -- ``collected()`` carried
+        the reservation into the new generation), and this client takes the
+        same refund off its own share, so a probe that sent nothing does not
+        leave the client looking as though it leaked. That matters beyond the
+        count: the own share is what decides whether a client may make the
+        FTP-enable config write (#263).
+        """
         ledger = self._temp_ledger
         with ledger.lock:
-            if count <= 0 or ledger.generation != generation:
-                return
-            ledger.pending = max(0, ledger.pending - count)
-            if self._own_temp_generation == generation:
+            unsent = ledger.end_reservation(reservation, sent=sent)
+            if unsent and self._own_temp_generation == reservation.generation:
                 self._own_temp_attachments = max(
-                    0, self._own_temp_attachments - count
+                    0, self._own_temp_attachments - unsent
                 )
 
-    def _reserve_temp_attachments(self, operation: str, count: int = 1) -> int:
+    def _reserve_temp_attachments(self, operation: str, count: int = 1):
         """Gate, then count, *count* attachments as one step on the device.
 
         Holding the ledger lock across both is what keeps two clients (or two
         threads) from each passing the budget check and then both counting.
+        The reservation is also marked **in flight** until the caller ends it
+        with :meth:`_end_temp_reservation`, so a sweep that runs while the
+        request is still being sent cannot zero a count the attachment is
+        about to land into.
 
-        :returns: the ledger generation the reservation was counted in.
+        :returns: a
+            :class:`~c64_test_harness.backends.ultimate64_temp_gc.TempReservation`
+            to hand back to :meth:`_end_temp_reservation`.
         :raises Ultimate64TempHygieneError: see :meth:`_before_temp_attachment`.
         """
+        from .ultimate64_temp_gc import TempReservation as _TempReservation
+
         ledger = self._temp_ledger
         with ledger.lock:
             self._before_temp_attachment(operation, count)
-            self._count_temp_attachments(count)
-            return ledger.generation
+            pending_before = ledger.pending
+            armed = self.temp_hygiene_armed
+            self._count_temp_attachments(count, armed=armed)
+            ledger.begin_reservation(count, armed=armed)
+            return _TempReservation(ledger.generation, pending_before, armed, count)
 
     def _before_temp_attachment(self, operation: str, count: int = 1) -> None:
         """Refuse or make room before *count* attachment-creating requests.
@@ -1108,11 +1143,13 @@ class Ultimate64Client:
         the entry-baseline reset never resets or asserts those stores -- and
         says nothing about this pass, which may write exactly one item,
         ``Network Settings > FTP File Service``, once per device per process,
-        only for a client that has leaked or is about to (the drain requires
-        this client's own uncollected attachments; the budget gate runs
-        before an attachment-creating request) and only after its sweep
-        failed.  A client that leaked nothing never
-        reaches it: :meth:`_sweep_inherited_temp` writes no config.
+        only for a client holding an uncollected leak **of its own**
+        (``_own_pending_temp_attachments() > 0``) and only after its sweep
+        failed.  A client that leaked nothing never writes config by either
+        route: :meth:`_sweep_inherited_temp` writes none on the drain path,
+        and the gate above withholds it on the budget path, which a client
+        whose own share is zero can reach because the budget counts the
+        *device* (#295).
         """
         self._in_temp_hygiene = True
         try:
@@ -1124,7 +1161,17 @@ class Ultimate64Client:
                 return True
 
             first_error = getattr(result, "error", None)
-            if not self._ftp_enable_attempted:
+            # Only a client holding an uncollected leak of its own may make
+            # this config write (#263). The budget gate fires on the
+            # *device's* count (#295), so a client whose own share is zero
+            # can reach this pass having leaked nothing -- for example when
+            # another client, or a temp_hygiene=False one, spent the budget.
+            # Such a client still sweeps, and still blocks the device on
+            # failure; it just writes no config.
+            if (
+                not self._ftp_enable_attempted
+                and self._own_pending_temp_attachments() > 0
+            ):
                 self._ftp_enable_attempted = True
                 # WARNING, not INFO: this mutates the device's config and
                 # the change persists until a firmware power-on (it lives
@@ -1400,14 +1447,14 @@ class Ultimate64Client:
         cost = self.LIVENESS_PROBE_TEMP_ATTACHMENTS
         # The whole cost is gated and counted up front against the device's
         # count (#295); whatever the probe does not send is refunded below.
-        generation = self._reserve_temp_attachments(
+        reservation = self._reserve_temp_attachments(
             f"liveness_probe ({cost} x POST /v1/machine:writemem)", count=cost
         )
-        if self.temp_hygiene_armed:
+        if reservation.armed:
             _log.info(
                 "liveness_probe on %s spends %d /Temp attachments on this "
                 "firmware (%d of %d already pending)",
-                self.host, cost, self._temp_ledger.pending - cost,
+                self.host, cost, reservation.pending_before,
                 self._temp_gc_budget,
             )
         sent = [0]
@@ -1439,9 +1486,10 @@ class Ultimate64Client:
             )
         finally:
             if sent[0] > cost:
-                self._count_temp_attachments(sent[0] - cost)
-            else:
-                self._uncount_temp_attachments(cost - sent[0], generation)
+                self._count_temp_attachments(
+                    sent[0] - cost, armed=reservation.armed
+                )
+            self._end_temp_reservation(reservation, sent=min(sent[0], cost))
 
     def assert_healthy(self, http_timeout: float = 2.0) -> "LivenessResult":
         """Run :meth:`liveness_probe` and raise on failure.

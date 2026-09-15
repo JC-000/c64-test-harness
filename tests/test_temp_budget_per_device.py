@@ -544,3 +544,190 @@ def test_the_reset_hook_clears_the_registry(host):
     _client(host).run_prg(PRG)
     gc_mod._reset_temp_ledgers()
     assert _client(host).pending_temp_attachments == 0
+
+
+# --------------------------------------------------------------------------- #
+# Who may write config (reviewer-6 round 1, #263)                             #
+# --------------------------------------------------------------------------- #
+
+def test_a_client_that_leaked_nothing_writes_no_config_on_the_budget_path(host):
+    """The budget gate fires on the **device's** count, so an armed client
+    whose own share is zero can be the one that runs the pass.  It sweeps,
+    and it blocks on failure -- but the FTP-enable write belongs only to a
+    client holding an uncollected leak of its own (owner ruling on #263)."""
+    leaker = _client(host, temp_gc_budget=3)
+    bystander = _client(host, temp_gc_budget=3)
+    with _FTP(default=REFUSED) as ftp, _no_config_writes() as set_item:
+        for _ in range(3):
+            leaker.run_prg(PRG)
+        assert bystander._own_pending_temp_attachments() == 0
+        with pytest.raises(Ultimate64TempHygieneError):
+            bystander.run_prg(PRG)     # crosses the device budget; pass fails
+        assert ftp.hosts == [host], "it must still sweep"
+        set_item.assert_not_called()
+
+
+def test_a_disarmed_clients_leak_does_not_make_an_armed_client_write_config(host):
+    """Every pending attachment here was counted by a ``temp_hygiene=False``
+    client, so no armed client has leaked anything -- and none may write
+    ``Network Settings > FTP File Service`` on the strength of it."""
+    quiet = _client(host, temp_hygiene=False)
+    armed = _client(host, temp_gc_budget=3)
+    with _FTP(default=REFUSED) as ftp, _no_config_writes() as set_item:
+        for _ in range(3):
+            quiet.run_prg(PRG)
+        assert armed._own_pending_temp_attachments() == 0
+        with pytest.raises(Ultimate64TempHygieneError):
+            armed.run_prg(PRG)
+        assert ftp.hosts == [host]
+        set_item.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# A reservation is in flight until its request returns                        #
+# --------------------------------------------------------------------------- #
+
+def test_a_sweep_between_a_reservation_and_its_send_does_not_lose_the_attachment(host):
+    """A sweep cannot collect an attachment whose request is still being
+    sent.  Counting before the send (so the budget gate is atomic) must
+    therefore not let a concurrent sweep zero a count the attachment is
+    about to land into: the ledger carries in-flight reservations across."""
+    a = _client(host)
+    b = _client(host)
+    in_send = threading.Event()
+    may_send = threading.Event()
+    real = Ultimate64Client._request_uncounted
+
+    def _blocking(self, method, path, **kwargs):
+        if self is a and method == "POST":
+            in_send.set()
+            assert may_send.wait(5), "test deadlock"
+        return real(self, method, path, **kwargs)
+
+    with _FTP() as ftp, patch.object(Ultimate64Client, "_request_uncounted", _blocking):
+        sender = threading.Thread(target=lambda: a.run_prg(PRG))
+        sender.start()
+        try:
+            assert in_send.wait(5), "a never reached its send"
+            with _lock_held(True):
+                b.close()              # inherited sweep succeeds mid-flight
+            assert ftp.hosts == [host]
+        finally:
+            may_send.set()
+            sender.join(5)
+    assert _client(host).pending_temp_attachments == 1, \
+        "a's POST landed after the sweep, so the device holds one"
+
+
+def test_a_sweep_during_a_probe_refunds_what_the_probe_never_sent(host):
+    """The carry is per reservation, not a licence to over-count: what the
+    probe never sent is still refunded, even though a sweep bumped the
+    generation underneath it."""
+    c = _client(host)
+    other = _client(host)
+
+    def _probe_run(*args, **kwargs):
+        with _lock_held(True):
+            other.close()              # a sweep lands mid-reservation
+        return MagicMock(healthy=True, failure=None)
+
+    with _FTP() as ftp, patch(
+        "c64_test_harness.backends.ultimate64_probe.liveness_probe",
+        side_effect=_probe_run,
+    ):
+        c.liveness_probe()
+    assert ftp.hosts == [host]
+    assert _client(host).pending_temp_attachments == 0, \
+        "the probe sent nothing and the sweep collected the rest"
+
+
+# --------------------------------------------------------------------------- #
+# Ports are part of the device's identity (#434 follow-up)                    #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("one,other", [
+    ("gw.example:8080", "gw.example:8081"),
+    ("[::1]:8080", "[::1]:8081"),
+], ids=["name-ports", "ipv6-ports"])
+def test_a_different_port_is_a_different_device(one, other):
+    """``DeviceLock`` keys ports apart, so the ledger must too: two devices
+    behind one name would otherwise share a budget, and a failed pass
+    against one would refuse attachment-creating requests to the other."""
+    from c64_test_harness.backends.device_lock import _sanitize_device_id
+
+    assert gc_mod.temp_ledger_key(one) != gc_mod.temp_ledger_key(other)
+    assert _sanitize_device_id(one) != _sanitize_device_id(other)
+
+
+@pytest.mark.parametrize("spelling,bare", [
+    ("gw.example:80", "gw.example"),
+    ("10.0.0.7:80", "10.0.0.7"),
+    ("[::1]:80", "::1"),
+], ids=["name", "ipv4", "ipv6"])
+def test_the_default_rest_port_still_folds(spelling, bare):
+    """``host:80`` and ``host`` name one device -- 80 is the client's own
+    ``port`` default -- so that one port still folds."""
+    assert gc_mod.temp_ledger_key(spelling) == gc_mod.temp_ledger_key(bare)
+
+
+def test_two_ports_on_one_name_do_not_share_a_budget():
+    """The behavioural half: ``Ultimate64Client("name:8080")`` is a working
+    spelling (``_base`` keeps the port when ``port`` is the default 80), and
+    such a client must not spend another port's budget."""
+    with _FTP() as ftp:
+        for _ in range(3):
+            _client("gw.example:8080", temp_gc_budget=3).run_prg(PRG)
+        _client("gw.example:8081", temp_gc_budget=3).run_prg(PRG)
+    assert ftp.hosts == [], "a different port is a different device"
+
+
+# --------------------------------------------------------------------------- #
+# States no other test reaches (reviewer-6 round 1, surviving mutants)         #
+# --------------------------------------------------------------------------- #
+
+def test_an_orphan_drain_does_not_sweep_when_a_refund_left_nothing_pending(host, tmp_path):
+    """A fully-refunded reservation leaves ``armed_pending`` set with
+    ``pending`` at 0.  The orphan drain must require **both**: with nothing
+    pending there is nothing of ours to collect, and a failed sweep would
+    block a device on behalf of attachments that were never created."""
+    def _fake_probe(*args, **kwargs):
+        # A plain function, not a Mock: a Mock records the call, and the
+        # recorded arguments include the ``request=`` closure over the
+        # client -- which would keep it alive past ``del`` and leave a live
+        # client to drain, defeating the orphan path this exercises.
+        return MagicMock(healthy=True, failure=None)
+
+    with _FTP() as ftp, patch(
+        "c64_test_harness.backends.ultimate64_probe.liveness_probe", _fake_probe
+    ):
+        c = _client(host)
+        c.liveness_probe()             # reserves 2, sends 0, refunds 2
+        ledger = c._temp_ledger
+        assert ledger.pending == 0 and ledger.armed_pending, \
+            "the state this guards is meant to be reachable"
+        del c
+        _pygc.collect()
+        _release_lock(host, tmp_path)
+    assert ftp.hosts == []
+
+
+def test_the_release_drain_prefers_the_client_that_leaked(host, tmp_path, caplog):
+    """The ledger ranks an armed client holding its own leak ahead of an
+    armed idle one, whatever order they were built in.  The two take
+    different paths, so which one ran is observable: the leaker's pass makes
+    the FTP-enable attempt and blocks the device, an inherited sweep does
+    neither."""
+    idle = _client(host)               # built first, so insertion order differs
+    leaker = _client(host)
+    with _FTP(default=REFUSED) as ftp, _no_config_writes() as set_item:
+        leaker.run_prg(PRG)
+        with caplog.at_level("WARNING"):
+            _release_lock(host, tmp_path)
+        # The leaking path sweeps, enables FTP File Service, then retries:
+        # two sessions.  An inherited sweep is one session and no config
+        # write, so the count discriminates as well as the mock does.
+        assert ftp.hosts == [host, host]
+        set_item.assert_called_once()
+        assert leaker._temp_hygiene_blocked is not None
+        assert not any("inherited sweep" in r.getMessage() for r in caplog.records)
+    assert idle.pending_temp_attachments == 1
