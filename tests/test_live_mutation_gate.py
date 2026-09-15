@@ -25,10 +25,16 @@ The condition is evaluated, not just searched:
   with a literal default (so ``not get(GATE, '0')`` never skips), and a
   non-literal default fails closed;
 * ``U64_HOST`` reads as set; every other environment variable is unknown,
-  and the condition must skip for **every** set/unset combination of those
-  it reads (at most six; more fails closed), so ``not <gate> and get('CI')``
-  and ``not get('X_LIVE') or get(GATE)`` are refused while the multi-gate
-  ``not _LIVE or not <gate>`` stays a gate;
+  and the condition must skip for **every** combination of candidate values
+  of those it reads.  A variable's candidates are: unset (its literal
+  default), ``"1"``, every literal the condition compares a read of it
+  against -- strings, integers as their string, and the elements of an
+  ``in`` container -- and, when there is at least one such literal, one
+  value equal to none of them (#353).  At most 64 combinations are
+  enumerated (six set/unset variables); more fails closed.  So
+  ``not <gate> and get('CI')``, ``not get('X_LIVE') or get(GATE)`` and
+  ``get('X_LIVE') != 'yes' or get(GATE) == '1'`` are refused while the
+  multi-gate ``not _LIVE or not <gate>`` stays a gate;
 * only a single-Name assignment at module level binds a name, in source
   order -- a literal to itself, anything else to its expression -- and a
   name rebound to anything the evaluator cannot decide, stored any other
@@ -77,11 +83,11 @@ reads more into a green run:**
   ``os.environ[...] =``, ``setdefault``, ``update``, ``putenv``,
   ``monkeypatch.setenv``, anywhere in the file) arms its own gate.  A store
   through an alias or a computed key is not seen.
-* An unknown environment variable is tried only **unset (or its literal
-  default) and as ``"1"``**, so a comparison against another literal escapes:
-  ``get('X_LIVE') != 'yes' or get(GATE) == '1'`` never skips with
-  ``X_LIVE=yes`` and the gate unset, yet is scored as a gate.  Tracked as
-  #353; pinned by two ``xfail(strict=True)`` cases that flip when it is fixed.
+* An unknown variable's candidates come from the literals the condition
+  compares it with (#353), so a value that changes truthiness without being
+  compared is not tried: set to the **empty string**, ``get('X', '1')``
+  reads falsy, and ``not get('X', '1') or get(GATE) == '1'`` is scored as a
+  gate although ``X=`` (set, empty) with the gate unset does not skip.
 * A rebinding through ``globals()['_M'] = '1'`` (or ``setattr`` on the
   module) is not seen by the binder.
 """
@@ -90,6 +96,7 @@ from __future__ import annotations
 import ast
 import copy
 import itertools
+import math
 from pathlib import Path
 
 import pytest
@@ -295,28 +302,37 @@ def _is_gate_env_read(node: ast.AST) -> bool:
 #: while the multi-gate ``not _LIVE or not _MUTATE`` stays a gate.
 _ASSUMED_SET = frozenset({"U64_HOST"})
 
-#: Most other environment variables a condition may combine with the gate;
-#: above this it fails closed rather than enumerate.
+#: Most other environment variables a condition may combine with the gate,
+#: when each is tried only unset and set -- the cap below is ``2 ** 6``.
 _MAX_OTHER_ENV_VARS = 6
+
+#: Most combinations of candidate values a condition is evaluated under
+#: (:func:`_candidate_values`); above this it fails closed rather than
+#: enumerate.  Literal candidates count against the same cap (#353).
+_MAX_COMBINATIONS = 2 ** _MAX_OTHER_ENV_VARS
+
+#: A variable's "unset" candidate: it reads as its default.
+_UNSET = object()
 
 
 class _FailClosed(Exception):
     """A condition, or a binding it depends on, cannot be decided."""
 
 
-def _read_value(read: tuple[str, ast.AST | None], env: dict[str, bool]) -> object:
+def _read_value(read: tuple[str, ast.AST | None], env: dict[str, object]) -> object:
     """What an environment read evaluates to for one combination *env*.
 
-    ``U64_HOST`` reads as set, and a variable *env* marks set reads as
-    ``"1"``.  Otherwise -- always, for the gate -- it reads as its default:
+    ``U64_HOST`` reads as set, and a variable *env* gives a value reads as
+    that value.  Otherwise -- always, for the gate -- it reads as its default:
     ``None`` when there is none, the literal when the default is one, and a
     non-literal default fails closed.
     """
     variable, default = read
     if variable in _ASSUMED_SET:
         return "set"
-    if env.get(variable):
-        return "1"
+    value = env.get(variable, _UNSET)
+    if value is not _UNSET:
+        return value
     if default is None:
         return None
     if isinstance(default, ast.Constant):
@@ -332,6 +348,66 @@ def _other_env_vars(expr: ast.AST) -> list[str]:
         if read is not None and read[0] != GATE and read[0] not in _ASSUMED_SET:
             found.add(read[0])
     return sorted(found)
+
+
+def _literal_strings(node: ast.AST) -> list[str]:
+    """The values an environment variable would need to equal *node*.
+
+    A string literal is itself, an integer literal its string (``bool``
+    excluded), and a tuple, list or set of literals each element.
+    """
+    if isinstance(node, ast.Constant):
+        value = node.value
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, int) and not isinstance(value, bool):
+            return [str(value)]
+        return []
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return [s for element in node.elts for s in _literal_strings(element)]
+    return []
+
+
+#: Prefix of the candidate that equals none of a variable's literals.
+_NONE_OF_THE_LITERALS = "\x00none-of-the-literals"
+
+
+def _candidate_values(expr: ast.AST) -> dict[str, list[object]]:
+    """Per other environment variable *expr* reads, the values it is tried as.
+
+    Unset (:data:`_UNSET`, so it reads as its default), ``"1"``, then every
+    literal a ``Compare`` sets against an operand that reads the variable
+    (:func:`_literal_strings`, so ``in`` containers count), and -- when there
+    is at least one such literal -- one value equal to none of them, so
+    ``get('X', 'a') in ('a', '1')`` is also tried false (#353).
+    """
+    candidates: dict[str, list[object]] = {
+        variable: [_UNSET, "1"] for variable in _other_env_vars(expr)
+    }
+    literals: dict[str, list[str]] = {variable: [] for variable in candidates}
+    for node in ast.walk(expr):
+        if not isinstance(node, ast.Compare):
+            continue
+        operands = [node.left, *node.comparators]
+        for i, operand in enumerate(operands):
+            read_here = {
+                read[0] for sub in ast.walk(operand)
+                if (read := _env_read(sub)) is not None
+            }
+            for variable in read_here & candidates.keys():
+                for j, other in enumerate(operands):
+                    if j != i:
+                        literals[variable] += _literal_strings(other)
+    for variable, found in literals.items():
+        for literal in found:
+            if literal not in candidates[variable]:
+                candidates[variable].append(literal)
+        if found:
+            other = _NONE_OF_THE_LITERALS
+            while other in found:
+                other += "'"
+            candidates[variable].append(other)
+    return candidates
 
 
 def _unsafe_names(tree: ast.AST) -> set[str]:
@@ -431,8 +507,9 @@ ACCEPTED_GATE_SHAPES = (
     "`if not _MUTATE: pytest.skip(...)` in a fixture or test",
     "the variable name and any default must be string literals; conditions "
     "may use and/or/not, comparisons, literals and bool()/str()/int(); every "
-    "other environment variable except U64_HOST may be set or unset and the "
-    "condition must skip in every combination; bind names with a plain "
+    "other environment variable except U64_HOST may be unset, '1', or any "
+    "value the condition compares it with, and the condition must skip in "
+    "every combination; bind names with a plain "
     "module-level `NAME = ...`",
 )
 
@@ -535,21 +612,22 @@ class _GateContext:
         """``(inlined expression, value per combination)``, or ``None`` if undecidable.
 
         Bound names are inlined, then the expression is evaluated for every
-        set/unset combination of the other environment variables it reads
-        (:func:`_read_value`).  An unbound name, more than
-        :data:`_MAX_OTHER_ENV_VARS` other variables, or a combination that
-        :func:`_evaluate_once` cannot decide makes it undecidable.
+        combination of candidate values of the other environment variables it
+        reads (:func:`_candidate_values`, :func:`_read_value`).  An unbound
+        name, more than :data:`_MAX_COMBINATIONS` combinations, or a
+        combination that :func:`_evaluate_once` cannot decide makes it
+        undecidable.
         """
         try:
             inlined = self._inline(expr)
         except _FailClosed:
             return None
-        others = _other_env_vars(inlined)
-        if len(others) > _MAX_OTHER_ENV_VARS:
+        candidates = _candidate_values(inlined)
+        if math.prod(len(values) for values in candidates.values()) > _MAX_COMBINATIONS:
             return None
         results: list[object] = []
-        for bits in itertools.product((False, True), repeat=len(others)):
-            ok, value = _evaluate_once(inlined, dict(zip(others, bits)))
+        for values in itertools.product(*candidates.values()):
+            ok, value = _evaluate_once(inlined, dict(zip(candidates, values)))
             if not ok:
                 return None
             results.append(value)
@@ -1272,23 +1350,77 @@ class TestTheScannerItselfCanFail:
         )
         assert self._offence(src) == set()
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="#353: an unknown env var is tried only unset/default and as '1', "
-        "so a comparison against another literal escapes",
-    )
-    @pytest.mark.parametrize("condition", [
+    #: #353: each skips when the other variable is unset or "1", and not at
+    #: some literal the condition itself names (or at a value naming none).
+    LITERAL_ESCAPES = [
         "os.environ.get('X_LIVE') != 'yes' or os.environ.get('U64_ALLOW_MUTATE') == '1'",
         "not os.environ.get('U64_ALLOW_MUTATE') and os.environ.get('X_LIVE') != 'yes'",
-    ], ids=["353-or", "353-and"])
+        "os.environ.get('X_LIVE', '1') != '0' or os.environ.get('U64_ALLOW_MUTATE') == '1'",
+        "os.environ.get('X_LIVE') not in ('yes', 'on') or os.environ.get('U64_ALLOW_MUTATE') == '1'",
+        "int(os.environ.get('X_LIVE', '0')) != 2 or os.environ.get('U64_ALLOW_MUTATE') == '1'",
+        "os.environ.get('X_LIVE') != _WANT or os.environ.get('U64_ALLOW_MUTATE') == '1'",
+        "os.environ.get('X_LIVE', 'a') in ('a', '1') or os.environ.get('U64_ALLOW_MUTATE') == '1'",
+        "'yes' != os.environ.get('X_LIVE') or os.environ.get('U64_ALLOW_MUTATE') == '1'",
+    ]
+    LITERAL_ESCAPE_IDS = [
+        "353-or", "353-and", "353-default-literal", "in-container", "int-literal",
+        "bound-literal", "none-of-the-literals", "read-on-the-right",
+    ]
+
+    @pytest.mark.parametrize("condition", LITERAL_ESCAPES, ids=LITERAL_ESCAPE_IDS)
     def test_a_comparison_against_another_literal_is_not_a_gate(self, condition) -> None:
-        """With X_LIVE='yes' and the gate unset neither skips, so the module writes."""
+        """At the literal (X_LIVE='yes', '0', ...) with the gate unset none skips."""
+        src = (
+            "import os, pytest\n"
+            "_WANT = 'yes'\n"
+            f"pytestmark = pytest.mark.skipif({condition}, reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == {"enable_uci"}
+
+    @pytest.mark.parametrize("condition", [
+        "os.environ.get('X_LIVE') != 'yes' or not os.environ.get('U64_ALLOW_MUTATE')",
+        "os.environ.get('X_LIVE') not in ('yes', 'on') or os.environ.get('U64_ALLOW_MUTATE') != '1'",
+        "os.environ.get('X_LIVE', 'a') in ('a', '1') and not os.environ.get('U64_ALLOW_MUTATE')"
+        " or os.environ.get('U64_ALLOW_MUTATE') != '1'",
+    ], ids=["literal-or-gate", "container-or-gate", "none-of-the-literals-still-gated"])
+    def test_literals_beside_a_real_gate_still_gate(self, condition) -> None:
+        """Control for #353: extra candidates must not refuse a condition that skips."""
         src = (
             "import os, pytest\n"
             f"pytestmark = pytest.mark.skipif({condition}, reason='x')\n"
             "def test_x(client):\n    enable_uci(client)\n"
         )
-        assert self._offence(src) == {"enable_uci"}
+        assert self._offence(src) == set()
+
+    @pytest.mark.parametrize("plain, offence", [(4, set()), (5, {"enable_uci"})])
+    def test_literal_candidates_count_against_the_cap(self, plain, offence) -> None:
+        """One variable compared with 'yes' has four candidates: 4 * 2**4 = 64 is
+        enumerated, 4 * 2**5 = 128 fails closed, although six variables pass."""
+        others = " or ".join(f"not os.environ.get('X{i}')" for i in range(plain))
+        src = (
+            "import os, pytest\n"
+            "pytestmark = pytest.mark.skipif(\n"
+            f"    not os.environ.get('U64_ALLOW_MUTATE') or {others}"
+            " or os.environ.get('Y') != 'yes', reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == offence
+
+    def test_candidate_values_are_what_the_rule_says(self) -> None:
+        expr = ast.parse(
+            "get(GATE) or os.environ.get('A', '0') not in ('yes', 2, True)"
+            " or str(os.getenv('B')) == 'on' or os.environ.get('C')"
+            " or ('q', os.environ.get('D')) == ('r', 's')",
+            mode="eval",
+        ).body
+        got = _candidate_values(expr)
+        assert list(got) == ["A", "B", "C", "D"]
+        # Only the *other* operands supply literals: 'q' shares D's operand.
+        assert got["D"] == [_UNSET, "1", "r", "s", _NONE_OF_THE_LITERALS]
+        assert got["A"] == [_UNSET, "1", "yes", "2", _NONE_OF_THE_LITERALS]
+        assert got["B"] == [_UNSET, "1", "on", _NONE_OF_THE_LITERALS]
+        assert got["C"] == [_UNSET, "1"]
 
     def test_read_only_module_needs_no_gate(self) -> None:
         src = "def test_x(client):\n    client.get_config_item('C', 'I')\n"
@@ -1414,6 +1546,23 @@ class TestTheTestLevelScannerCanFail:
         body = (
             "os.environ['U64_ALLOW_MUTATE'] = '1'\n"
             "@needs\n"
+            "def test_a(t):\n    t.set_speed(4)\n"
+        )
+        assert self._offenders(body) == ["test_a (set_speed)"]
+
+    @pytest.mark.parametrize(
+        "condition",
+        TestTheScannerItselfCanFail.LITERAL_ESCAPES,
+        ids=TestTheScannerItselfCanFail.LITERAL_ESCAPE_IDS,
+    )
+    def test_a_marker_comparing_another_literal_does_not_cover_the_test(
+        self, condition
+    ) -> None:
+        """#353 at test level: the marker does not skip at the literal."""
+        body = (
+            "_WANT = 'yes'\n"
+            f"literal = pytest.mark.skipif({condition}, reason='y')\n"
+            "@literal\n"
             "def test_a(t):\n    t.set_speed(4)\n"
         )
         assert self._offenders(body) == ["test_a (set_speed)"]
