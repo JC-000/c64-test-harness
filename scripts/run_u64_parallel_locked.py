@@ -1,9 +1,23 @@
 #!/usr/bin/env python3
-"""Run U64 live test files in parallel with cross-process DeviceLock.
+"""Run U64 live test files in parallel pytest processes.
 
-Each test file runs in its own subprocess.  Before pytest starts, the
-subprocess acquires a DeviceLock for the U64 device, ensuring exclusive
-access.  This lets multiple agents/processes safely share a single device.
+Each test file runs in its own ``python -m pytest`` child.  **This script takes
+no DeviceLock itself** (#323).  What serialises the device is
+``tests/conftest.py``'s autouse ``device_lock_guard``, which every child applies
+to each ``*_live.py`` test: tests from different files interleave on the device,
+no two tests hold it at once, and other lanes queue on the same lock.
+
+Be clear about what the pool does *not* serialise.  A file does not have the
+device to itself for its whole run, so device state one test leaves behind can
+be seen by the next test of another file, just as it can between lanes.  The
+90 s per-file subprocess timeout also includes that child's per-test waits
+behind the other workers' tests and behind other lanes.
+
+It used to take ``DeviceLock(host)`` in the pool worker before launching
+pytest.  The child's guard then queued on the flock its own parent held --
+``allow_nested`` joins holds within one process only -- and, with the parent
+alive and heartbeating, kept extending its wait until the 90 s timeout killed
+it.  ``tests/test_parallel_runner_lock_shape.py`` reproduces that offline.
 
 Usage:
     python3 scripts/run_u64_parallel_locked.py <HOST> [--workers N]
@@ -28,7 +42,7 @@ from _u64_host import require_u64_host  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# Test files to run (each in its own locked subprocess)
+# Test files to run (each in its own pytest subprocess; conftest locks each test)
 TEST_FILES = [
     "tests/test_ultimate64_client_live.py",
     "tests/test_ultimate64_transport_live.py",
@@ -37,38 +51,20 @@ TEST_FILES = [
 ]
 
 
-def _run_locked(test_file: str, host: str, password: str | None) -> dict:
-    """Acquire DeviceLock, run pytest, release lock."""
-    src = str(PROJECT_ROOT / "src")
-    if src not in sys.path:
-        sys.path.insert(0, src)
+def _run_file(test_file: str, host: str, password: str | None) -> dict:
+    """Run one live test file in a pytest child.  Takes no lock (#323).
 
-    from c64_test_harness.backends.device_lock import DeviceLock, resolve_lock_timeout
-
+    The child's conftest ``device_lock_guard`` locks each test; a lock held
+    here would be one that guard queues on.
+    """
     pid = os.getpid()
     t0 = time.monotonic()
 
-    lock = DeviceLock(host)
-    t_pre = time.monotonic()
-    # U64_DEVICE_LOCK_TIMEOUT when set, else this runner's own 120 s (#244).
-    acquired = lock.acquire(timeout=resolve_lock_timeout(None, default=120.0))
-    lock_wait = time.monotonic() - t_pre
-
-    if not acquired:
-        return {
-            "file": test_file,
-            "pid": pid,
-            "returncode": 1,
-            "summary": "TIMEOUT acquiring DeviceLock",
-            "elapsed": time.monotonic() - t0,
-            "lock_wait": lock_wait,
-        }
+    env = {**os.environ, "U64_HOST": host}
+    if password:
+        env["U64_PASSWORD"] = password
 
     try:
-        env = {**os.environ, "U64_HOST": host}
-        if password:
-            env["U64_PASSWORD"] = password
-
         result = subprocess.run(
             [sys.executable, "-m", "pytest", test_file, "-v", "--tb=short"],
             capture_output=True,
@@ -77,7 +73,7 @@ def _run_locked(test_file: str, host: str, password: str | None) -> dict:
             cwd=str(PROJECT_ROOT),
             env=env,
         )
-
+        returncode = result.returncode
         # Extract summary line
         summary = "no output"
         for line in reversed(result.stdout.splitlines()):
@@ -85,18 +81,15 @@ def _run_locked(test_file: str, host: str, password: str | None) -> dict:
                 summary = line.strip()
                 break
     except subprocess.TimeoutExpired:
-        result = type("R", (), {"returncode": 1})()
-        summary = "SUBPROCESS TIMEOUT"
-    finally:
-        lock.release()
+        returncode = 1
+        summary = "SUBPROCESS TIMEOUT (the 90 s includes per-test lock waits)"
 
     return {
         "file": test_file,
         "pid": pid,
-        "returncode": result.returncode,
+        "returncode": returncode,
         "summary": summary,
         "elapsed": round(time.monotonic() - t0, 1),
-        "lock_wait": round(lock_wait, 3),
     }
 
 
@@ -113,7 +106,7 @@ def main() -> int:
     password = os.environ.get("U64_PASSWORD")
 
     print(
-        f"=== U64 Live Tests — Parallel with DeviceLock ===\n"
+        f"=== U64 Live Tests — parallel files, per-test DeviceLock via conftest ===\n"
         f"  Host:    {args.host}\n"
         f"  Workers: {args.workers}\n"
         f"  Files:   {len(TEST_FILES)}\n"
@@ -124,7 +117,7 @@ def main() -> int:
 
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         futures = {
-            pool.submit(_run_locked, f, args.host, password): f
+            pool.submit(_run_file, f, args.host, password): f
             for f in TEST_FILES
         }
         for future in as_completed(futures):
@@ -133,7 +126,7 @@ def main() -> int:
             status = "PASS" if r["returncode"] == 0 else "FAIL"
             print(
                 f"  [{status}] {r['file']}  "
-                f"(pid={r['pid']}, {r['elapsed']}s, lock_wait={r['lock_wait']}s)"
+                f"(pid={r['pid']}, {r['elapsed']}s)"
             )
             print(f"         {r['summary']}")
             print()
@@ -152,7 +145,7 @@ def main() -> int:
         print(f"\n  {failed} file(s) FAILED")
         return 1
 
-    print(f"\n  ALL PASSED — parallel locked execution works")
+    print(f"\n  ALL PASSED")
     return 0
 
 

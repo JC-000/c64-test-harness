@@ -2898,11 +2898,166 @@ def test_the_lock_scan_flags_planted_regressions() -> None:
     )
 
 
+#: Scripts that launch pytest over live modules, and the module-level list of
+#: modules each launches.  All of them rely on conftest's per-test guard, so
+#: none may hold the device lock itself (#323).
+_PYTEST_RUNNERS = {
+    "run_all_u64_live.py": "_MODULES",
+    "run_sid_u64_live.py": "_MODULES",
+    "run_u64_parallel_locked.py": "TEST_FILES",
+}
+
+#: Scripts that launch pytest but are not live runners, and why.
+_PYTEST_LAUNCHERS_EXCLUDED = {
+    "run_all_tests.py": "runs the offline unit and integration phases; it "
+    "launches no *_live.py module",
+}
+
+#: Calls that take or join the device lock.
+_LOCK_TAKING_CALLS = frozenset({
+    "DeviceLock", "hold_device_lock", "acquire", "acquire_or_raise", "create_manager",
+})
+
+
+def _launches_pytest(tree: ast.AST) -> bool:
+    """``pytest.main(...)`` in-process, or ``"pytest"`` in a child's argv."""
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "main"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "pytest"
+        ):
+            return True
+        if isinstance(node, ast.Constant) and node.value == "pytest":
+            return True
+    return False
+
+
+def _pytest_runner_problems(source: str, list_name: str, is_live) -> list[str]:
+    """What stops a pytest runner relying on conftest's per-test lock.
+
+    Three requirements: it launches pytest; the module-level *list_name* is a
+    non-empty list of modules conftest's guard locks; and it takes **no**
+    device lock itself.  The last is #323: ``run_u64_parallel_locked.py`` held
+    ``DeviceLock(host)`` in a pool worker around a ``python -m pytest`` child,
+    whose autouse guard then queued on that flock (``allow_nested`` joins holds
+    within one process only) until the parent killed it.
+    """
+    tree = ast.parse(source)
+    problems: list[str] = []
+    values = [
+        node.value for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(getattr(t, "id", None) == list_name for t in node.targets)
+    ]
+    if not values or not isinstance(values[0], (ast.List, ast.Tuple)) or not values[0].elts:
+        problems.append(f"launches nothing: no non-empty module-level {list_name}")
+    else:
+        for elt in values[0].elts:
+            name = getattr(elt, "value", None)
+            if not isinstance(name, str) or not is_live(name):
+                problems.append(
+                    f"launches {name!r}, which conftest's device_lock_guard does not lock"
+                )
+    aliases = _import_aliases(tree)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and _callee_name(node, aliases) in _LOCK_TAKING_CALLS:
+            problems.append(
+                f"line {node.lineno}: {ast.unparse(node.func)}(...) takes the device "
+                f"lock around children whose conftest guard queues on it (#323)"
+            )
+    if not _launches_pytest(tree):
+        problems.append("does not launch pytest")
+    return problems
+
+
+def test_the_pytest_runner_check_can_fail() -> None:
+    """Positive and negative controls for :func:`_pytest_runner_problems`."""
+    import conftest
+
+    live = conftest.is_live_test_file
+    subprocess_runner = (
+        "import subprocess, sys\n"
+        'TEST_FILES = ["tests/test_a_live.py", "tests/test_b_live.py"]\n'
+        "def run(f, host):\n"
+        '    subprocess.run([sys.executable, "-m", "pytest", f])\n'
+    )
+    in_process_runner = (
+        "import pytest\n"
+        '_MODULES = ["tests/test_a_live.py"]\n'
+        "def main():\n"
+        "    return pytest.main([*_MODULES])\n"
+    )
+    assert _pytest_runner_problems(subprocess_runner, "TEST_FILES", live) == []
+    assert _pytest_runner_problems(in_process_runner, "_MODULES", live) == []
+
+    must_flag = {
+        "the #323 shape: DeviceLock held around the child": (
+            "import subprocess, sys\n"
+            "from c64_test_harness.backends.device_lock import DeviceLock\n"
+            'TEST_FILES = ["tests/test_a_live.py"]\n'
+            "def run(f, host):\n"
+            "    lock = DeviceLock(host)\n"
+            "    lock.acquire(timeout=t)\n"
+            '    subprocess.run([sys.executable, "-m", "pytest", f])\n'
+        ),
+        "hold_device_lock around pytest.main": (
+            "import pytest\n"
+            "from _u64_host import hold_device_lock\n"
+            '_MODULES = ["tests/test_a_live.py"]\n'
+            "def main(host):\n"
+            "    with hold_device_lock(host):\n"
+            "        return pytest.main([*_MODULES])\n"
+        ),
+        "an aliased DeviceLock": (
+            "import subprocess, sys\n"
+            "from c64_test_harness.backends.device_lock import DeviceLock as L\n"
+            'TEST_FILES = ["tests/test_a_live.py"]\n'
+            "def run(f, host):\n"
+            "    L(host)\n"
+            '    subprocess.run([sys.executable, "-m", "pytest", f])\n'
+        ),
+        "a module conftest does not lock": subprocess_runner.replace(
+            "tests/test_b_live.py", "tests/test_b.py"
+        ),
+        "an empty module list": subprocess_runner.replace(
+            '["tests/test_a_live.py", "tests/test_b_live.py"]', "[]"
+        ),
+        "no pytest launched": subprocess_runner.replace('"pytest"', '"pyflakes"'),
+    }
+    for label, source in must_flag.items():
+        assert source not in (subprocess_runner, in_process_runner), f"{label}: plant changed nothing"
+        assert _pytest_runner_problems(source, "TEST_FILES" if "TEST_FILES" in source else "_MODULES", live), (
+            f"the runner check missed: {label}"
+        )
+
+
+def test_every_pytest_launcher_is_classified() -> None:
+    """Vacuity guard: the runner table is every script that launches pytest."""
+    launchers = {
+        p.name for p in _scripts_only() if _launches_pytest(ast.parse(p.read_text()))
+    }
+    assert launchers == set(_PYTEST_RUNNERS) | set(_PYTEST_LAUNCHERS_EXCLUDED), (
+        f"scripts launching pytest: {sorted(launchers)}; classify each in "
+        f"_PYTEST_RUNNERS or _PYTEST_LAUNCHERS_EXCLUDED"
+    )
+    assert not set(_PYTEST_RUNNERS) & set(_PYTEST_LAUNCHERS_EXCLUDED)
+    for excluded in _PYTEST_LAUNCHERS_EXCLUDED:
+        assert "_live.py" not in (_SCRIPTS / excluded).read_text(), (
+            f"{excluded} is excluded as not a live runner but names a live module"
+        )
+
+
 def test_the_pytest_runners_are_locked_by_conftest() -> None:
     """Accepted shape 3, pinned rather than assumed.
 
     The runners hold no lock of their own, so they are safe only while every
     module they launch is one conftest's autouse ``device_lock_guard`` locks.
+    ``run_u64_parallel_locked.py`` is classified with them since #323: a lock
+    taken by the runner around a pytest child is one the child's guard waits
+    on, so "hold no lock" is a requirement, not just a description.
     """
     import inspect
 
@@ -2926,20 +3081,11 @@ def test_the_pytest_runners_are_locked_by_conftest() -> None:
 
     import conftest  # the suite's own conftest, already imported by pytest
 
-    for runner in ("run_all_u64_live.py", "run_sid_u64_live.py"):
-        runner_tree = ast.parse((_SCRIPTS / runner).read_text())
-        modules = next(
-            node.value for node in runner_tree.body
-            if isinstance(node, ast.Assign)
-            and any(getattr(t, "id", None) == "_MODULES" for t in node.targets)
+    for runner, list_name in _PYTEST_RUNNERS.items():
+        problems = _pytest_runner_problems(
+            (_SCRIPTS / runner).read_text(), list_name, conftest.is_live_test_file
         )
-        names = [elt.value for elt in modules.elts]  # type: ignore[attr-defined]
-        assert names, f"{runner} launches nothing"
-        for name in names:
-            assert conftest.is_live_test_file(name), (
-                f"{runner} launches {name}, which conftest's device_lock_guard "
-                f"does not lock"
-            )
+        assert problems == [], f"{runner}: {problems}"
     assert inspect.isfunction(conftest.is_live_test_file)
 
 
