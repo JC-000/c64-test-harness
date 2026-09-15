@@ -166,7 +166,7 @@ the code, the code won (issue #169).
 | `$0277-$0280` | 10 | `uci_network._execute_uci_routine`, `backends.ultimate64.Ultimate64Transport.inject_keys`, `backends.ultimate64_client.Ultimate64Client.send_text` | KERNAL KEYD — 10-byte keyboard buffer receiving "SYS<addr>\r" or injected text | KERNAL-mandated (keybuf_addr= on U64 transport) |
 | `$0314-$0315` | 2 | `sid_player.stop_sid_vice` | RAM IRQ vector (CINV) restored to $EA31; the installer stub also patches it from 6502 code | hardcoded |
 | `$0334-$0338` | 5 | `execute.jsr` | JSR addr / NOP / NOP trampoline; checkpoint at +3 | scratch_addr= |
-| `$0334-$03B3` † | 128 | `backends.ultimate64_probe.liveness_probe` | 128-byte writemem POST round-trip payload via the raw REST client (bypasses the transport MemoryPolicy); original bytes written back on success only — the readback-failure branches leave the pattern in place | hardcoded |
+| `$0334-$03B3` † | 128 | `backends.ultimate64_probe.liveness_probe` | 128-byte writemem POST round-trip payload via the raw REST client (bypasses the transport MemoryPolicy); original bytes written back after a round-trip or a readback mismatch; a refused restore, or a failure after the write, leaves the pattern in place and reports LivenessResult.scratch_restored=False with a WARNING | hardcoded |
 | `$0339-$033B` | 3 | `sid_player.play_sid_vice` | park JMP ($A002) executed after the installer so resume() lands in BASIC warm start | _PARK_ADDR constant |
 | `$033C-$0341` | 6 | `sid_player.play_sid_vice` | song trampoline: LDA #song / JSR init / RTS | _SONG_TRAMPOLINE_ADDR constant |
 | `$0360-$036D` | 14 | `execute.run_subroutine (U64 path)` | 14-byte sentinel trampoline; on VICE the 5-byte jsr() trampoline is written here instead | trampoline_addr= |

@@ -22,6 +22,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+import dataclasses
 from dataclasses import dataclass
 
 # The one place a REST hex argument is formatted (issue #272).  The probe
@@ -328,6 +329,19 @@ class LivenessResult:
         may retry once before treating it as a wedged stack.
     :ivar recommendation: optional human-readable hint about what to do
         next (e.g. ``"physical power-cycle required"``), or ``None``.
+    :ivar scratch_restored: whether the probe's scratch span
+        (``$0334-$03B3``, declared *transient* in
+        :data:`c64_test_harness.memory_policy.HARNESS_SCRATCH`) holds its
+        original bytes again.  ``True``: the probe wrote its pattern and
+        the restore POST answered 2xx.  ``False``: the probe sent its
+        write and the original bytes were **not** confirmed written back
+        -- the restore was refused or raised, or the probe stopped after
+        the write without restoring (deliberately: no further POST
+        against an endpoint that just failed, issue #107).  Treat the span
+        as holding the ``0x5A`` pattern.  ``None``: the probe never sent
+        its write, so the span was not touched.  Defaults to ``None`` so
+        results built with the original eight fields still construct
+        (issue #274).
     """
 
     host: str
@@ -338,15 +352,21 @@ class LivenessResult:
     firmware_version: str | None
     failure: str | None
     recommendation: str | None
+    scratch_restored: bool | None = None
 
     @property
     def summary(self) -> str:
         """One-line status for logging."""
+        dirty = (
+            f"; scratch ${_LIVENESS_PROBE_ADDR:04X}-"
+            f"${_LIVENESS_PROBE_ADDR + _LIVENESS_PROBE_LEN - 1:04X} NOT restored"
+            if self.scratch_restored is False else ""
+        )
         if self.healthy:
             fw = f" fw {self.firmware_version}" if self.firmware_version else ""
-            return f"U64 at {self.host}:{self.port} healthy{fw}"
+            return f"U64 at {self.host}:{self.port} healthy{fw}{dirty}"
         tag = self.failure or "unknown"
-        return f"U64 at {self.host}:{self.port} UNHEALTHY ({tag})"
+        return f"U64 at {self.host}:{self.port} UNHEALTHY ({tag}){dirty}"
 
 
 def _liveness_request(
@@ -482,9 +502,50 @@ def liveness_probe(
         :func:`_liveness_request`.  :class:`Ultimate64Client` passes a
         wrapper that counts body-carrying POSTs against its ``/Temp``
         budget.
-    :returns: :class:`LivenessResult` summarising the probe.
+    :returns: :class:`LivenessResult` summarising the probe.  Its
+        ``scratch_restored`` says whether ``$0334-$03B3`` holds its
+        original bytes again; ``False`` is also logged at WARNING.
     """
-    send = request if request is not None else _liveness_request
+    state: dict[str, bool | None] = {"wrote": False, "restored": None}
+    result = _liveness_probe_steps(
+        host, port, password,
+        http_timeout=http_timeout, skip_ping=skip_ping,
+        send=request if request is not None else _liveness_request,
+        state=state,
+    )
+    if not state["wrote"]:
+        return result
+    restored = state["restored"] is True
+    if state["restored"] is None:
+        # The probe stopped after its write without restoring; the restore
+        # helper did not run, so nothing has said so yet.
+        _log.warning(
+            "liveness_probe on %s:%d stopped after writing its 0x5A pattern "
+            "to $%04X-$%04X (failure=%s) and did not restore the original "
+            "bytes; the span may still hold the pattern although "
+            "memory_policy declares it transient.",
+            host, port, _LIVENESS_PROBE_ADDR,
+            _LIVENESS_PROBE_ADDR + _LIVENESS_PROBE_LEN - 1, result.failure,
+        )
+    return dataclasses.replace(result, scratch_restored=restored)
+
+
+def _liveness_probe_steps(
+    host: str,
+    port: int,
+    password: str | None,
+    *,
+    http_timeout: float,
+    skip_ping: bool,
+    send: "Callable[..., tuple[int, bytes]]",
+    state: "dict[str, bool | None]",
+) -> LivenessResult:
+    """The probe itself; records in *state* whether it wrote and restored.
+
+    ``state["wrote"]`` is set just before the probe POST is sent (a timed-out
+    POST may still have landed); ``state["restored"]`` holds the restore
+    helper's return value when a restore was attempted.
+    """
     # ----------------------------------------------------------------- #
     # Step 1: reachability                                              #
     # ----------------------------------------------------------------- #
@@ -608,6 +669,9 @@ def liveness_probe(
     probe_pattern = bytes((i ^ 0x5A) & 0xFF for i in range(probe_len))
     post_query = f"address={_wire_hex16(probe_addr)}"
 
+    # From here on the pattern may be in RAM: a POST that times out or is
+    # reset mid-request can still have landed.
+    state["wrote"] = True
     try:
         post_status, post_body = send(
             "POST",
@@ -774,7 +838,7 @@ def liveness_probe(
     # generic branch below restores and reports it as ``unknown``.
     if rb_status != 200 or readback != probe_pattern:
         # Restore best-effort even on mismatch, then report.
-        _restore_quiet(
+        state["restored"] = _restore_quiet(
             host, port, password, http_timeout,
             probe_addr, original_bytes, request=send,
         )
@@ -796,7 +860,7 @@ def liveness_probe(
     # ----------------------------------------------------------------- #
     # Step 5: restore original bytes (best-effort)                      #
     # ----------------------------------------------------------------- #
-    _restore_quiet(
+    state["restored"] = _restore_quiet(
         host, port, password, http_timeout,
         probe_addr, original_bytes, request=send,
     )
@@ -822,16 +886,21 @@ def _restore_quiet(
     original: bytes,
     *,
     request: "Callable[..., tuple[int, bytes]] | None" = None,
-) -> None:
-    """Restore *original* bytes at *addr* via POST writemem.
+) -> bool:
+    """Restore *original* bytes at *addr* via POST writemem; ``True`` on 2xx.
 
-    Best-effort: swallows all exceptions.  Used by :func:`liveness_probe`
-    to undo its scratch write after the round-trip verification, so the
-    probe is side-effect-free on a healthy device.
+    Never raises, but no longer silent (issue #274): the sender returns a
+    non-2xx status as an ordinary ``(code, body)`` rather than raising, so
+    the status is checked, and a refused or raised restore is logged at
+    WARNING naming the span that still holds the probe pattern.  The name
+    is kept for compatibility; "quiet" now means "does not raise".
+    Used by :func:`liveness_probe` to undo its scratch write, so the probe
+    is side-effect-free on a healthy device.
     """
     send = request if request is not None else _liveness_request
+    span = f"${addr:04X}-${addr + len(original) - 1:04X}"
     try:
-        send(
+        status, body = send(
             "POST",
             host,
             port,
@@ -843,4 +912,19 @@ def _restore_quiet(
             query=f"address={_wire_hex16(addr)}",
         )
     except Exception as exc:
-        _log.debug("liveness_probe restore at $%04X failed: %s", addr, exc)
+        _log.warning(
+            "liveness_probe restore of %s failed (%s: %s); the span still "
+            "holds the probe's 0x5A pattern although memory_policy declares "
+            "it transient.",
+            span, type(exc).__name__, exc,
+        )
+        return False
+    if not 200 <= status < 300:
+        _log.warning(
+            "liveness_probe restore of %s was refused with HTTP %d "
+            "(body=%r); the span still holds the probe's 0x5A pattern "
+            "although memory_policy declares it transient.",
+            span, status, body[:128],
+        )
+        return False
+    return True

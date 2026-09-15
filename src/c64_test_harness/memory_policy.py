@@ -303,8 +303,10 @@ HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
         owner="backends.ultimate64_probe.liveness_probe",
         purpose="128-byte writemem POST round-trip payload via the raw "
                 "REST client (bypasses the transport MemoryPolicy); "
-                "original bytes written back on success only — the "
-                "readback-failure branches leave the pattern in place",
+                "original bytes written back after a round-trip or a "
+                "readback mismatch; a refused restore, or a failure after "
+                "the write, leaves the pattern in place and reports "
+                "LivenessResult.scratch_restored=False with a WARNING",
         configurable="hardcoded",
         transient=True,
     ),
