@@ -494,14 +494,27 @@ class TestProgressLogLine:
         * ``timeout`` is far longer than any stall; the wait ends because the
           holder releases, so acquire must *take the lock*, not time out;
         * the holder is released and the waiter joined *inside* the patches,
-          so nothing is un-scripted while the waiter can still run.
+          so nothing is un-scripted while the waiter can still run;
+        * on a failing run the waiter is stopped before the patches exit: a
+          ``finally`` sets ``abort``, and ``on_wait`` raises on its next report
+          (a raising callback aborts the wait cleanly, pinned by
+          ``TestOnWaitCallback``), so the thread cannot outlive the test and
+          log into the next test's records (#389 review).
+
+        This test does **not** guard the deadline re-arm: with ``timeout=30``
+        a waiter that never re-arms its deadline still reports and still takes
+        the lock when the holder goes.  That property is pinned by
+        ``tests/test_device_lock.py::TestProgressWindow::test_acquire_extends_on_live_progressing_holder``.
         """
         self._age_lockfile(lock_dir, 3600)
         waiter = DeviceLock(HOST, lock_dir, heartbeat_interval=None)
         reports: list[tuple[int | None, float | None]] = []
         two_reports = threading.Event()
+        abort = threading.Event()
 
         def on_wait(elapsed, holder_pid, age, depth) -> None:
+            if abort.is_set():
+                raise RuntimeError("test finished: abort the wait (#389)")
             reports.append((holder_pid, age))
             if len(reports) >= 2:
                 two_reports.set()
@@ -520,14 +533,22 @@ class TestProgressLogLine:
             dl, "_PROGRESS_LOG_INTERVAL", 0.0
         ), patch.object(waiter, "_holder_progress", lambda pw: (True, 4242)):
             t = threading.Thread(target=run, daemon=True)
-            t.start()
-            saw_two_reports = two_reports.wait(10.0)
-            # Nothing can have ended the wait yet: the holder still holds the
-            # flock and the deadline is 30 s past the latest extension.
-            still_queued = not box
-            held_elsewhere.release()
-            t.join(10.0)
-            finished = not t.is_alive()
+            saw_two_reports = still_queued = finished = False
+            try:
+                t.start()
+                saw_two_reports = two_reports.wait(10.0)
+                # Nothing can have ended the wait yet: the holder still holds
+                # the flock and the deadline is 30 s past the latest extension.
+                still_queued = not box
+                held_elsewhere.release()
+                t.join(10.0)
+                finished = not t.is_alive()
+            finally:
+                # A waiter still queued here (a failing run) is stopped while
+                # its script is in force: its next report raises in on_wait.
+                abort.set()
+                if t.is_alive():
+                    t.join(5.0)
         if box.get("value") is True:
             waiter.release()
         assert finished, "the waiter did not finish after the holder released"
