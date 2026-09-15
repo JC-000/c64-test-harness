@@ -165,10 +165,7 @@ reset:**
 
   So a timeout closes an open menu, and on `7f6fcb51` also releases held
   keys and joystick.
-- The enable surviving `client.reset()` is measured on the U64E
-  (bce4535e, Cartridge Preference Auto, #270): after the enable,
-  `client.reset()` + 3 s, the identifier and `uci_probe` answered 4/4. The
-  timeout path itself, its side effects and the C64U are unmeasured.
+- This has not been measured on a device.
 
 The reset does not clear a UCI STATE-bit wedge (#112); that still needs a
 physical power-cycle. Whatever program was running on the C64 is gone

@@ -225,18 +225,17 @@ MEASUREMENT = (
     "The REU half, the External and `.crt` cases, and the C64U are unmeasured.",
 )
 
-#: Finding 5, outside the prerequisite section (the timeout-reset account).
-MEASUREMENT_ELSEWHERE = (
-    "The enable surviving `client.reset()` is measured on the U64E",
-    "The timeout path itself, its side effects and the C64U are unmeasured.",
-)
+#: The timeout-reset trace in the dispatch section keeps #332's evidence grade
+#: (``tests/test_uci_dispatch_timeout_docs.py`` pins the phrase).  #270 did
+#: not run the timeout path, so no #270 measurement may be written there.
+_DISPATCH_HEADING = "## How the 6502 routine is dispatched"
+
 
 #: Present-tense requirement wording the measurement retires.
 RETIRED_REQUIREMENT = (
     "Keep that sequence",
     "Nobody has done that",
     "drop the reset on a device and see which step fails",
-    "This has not been measured on a device.",
     "It is a recorded observation",
 )
 
@@ -246,9 +245,13 @@ class TestTheMeasurementIsRecorded:
     def test_present(self, section: str, phrase: str) -> None:
         assert phrase in section, f"#270 measurement lost {phrase!r}"
 
-    @pytest.mark.parametrize("phrase", MEASUREMENT_ELSEWHERE)
-    def test_present_elsewhere(self, whole: str, phrase: str) -> None:
-        assert phrase in whole, f"#270 measurement lost {phrase!r}"
+    def test_dispatch_section_carries_no_270_measurement(self) -> None:
+        """#409 serial suite: the timeout trace is not what #270 measured."""
+        text = DOC.read_text(encoding="utf-8")
+        start = text.index(_DISPATCH_HEADING)
+        dispatch = _flat(text[start:text.index("\n## ", start + 1)])
+        assert "#270" not in dispatch and "bce4535e" not in dispatch
+        assert "This has not been measured on a device." in dispatch
 
     @pytest.mark.parametrize("phrase", RETIRED_REQUIREMENT)
     def test_retired_requirement_absent(self, whole: str, phrase: str) -> None:
