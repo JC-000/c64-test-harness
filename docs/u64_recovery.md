@@ -162,8 +162,12 @@ on that device, so the enable-then-refuse path was not exercised there —
 it remains required for the general case.)
 
 The path that makes this urgent has no `run_prg` in it at all:
-`Ultimate64Transport.write_memory` does not chunk, so a payload above the
-threshold goes straight to the body-POST path. That path is also the one
+before #252, `Ultimate64Transport.write_memory` did not chunk, so a payload
+above the threshold went straight to the body-POST path. It now chunks at the
+client's threshold (every piece a PUT) on any device not graded
+`writemem_post_safe` — leak-prone, unprobed, or unknown — and keeps the single
+POST only on a post-safe device; a direct `client.write_mem` call above the
+threshold still POSTs. The body-POST path is also the one
 with an open correctness question: `write_mem`'s docstring says the POST
 form "has no upper bound verified at 2048 bytes"
 (`Ultimate64Client.write_mem`'s docstring, `ultimate64_client.py:1371`),

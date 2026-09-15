@@ -251,3 +251,100 @@ def test_write_bytes_keeps_84_on_transports_without_a_threshold() -> None:
     write_bytes(t, 0x1000, _payload(200))
     assert [len(d) for _, d in t.calls] == [84, 84, 32]
     assert memory._WRITE_CHUNK_SIZE == 84  # importable for downstream repos
+
+
+def test_write_bytes_ignores_a_non_positive_reported_chunk_size() -> None:
+    """``_write_chunk_size``'s ``size > 0`` guard (review N3): a transport
+    reporting 0 must not reach ``range(step=0)``; it keeps the 84 default."""
+
+    class _ZeroReporter:
+        rest_put_chunk_size = 0
+
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        def write_memory(self, addr, data):
+            self.calls.append(len(data))
+
+    t = _ZeroReporter()
+    write_bytes(t, 0x1000, _payload(100))
+    assert t.calls == [84, 16]
+
+
+# --------------------------------------------------------------------------- #
+# Review round 1                                                               #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("info,threshold", [(LEAK_PRONE, 128), (POST_SAFE, 48)])
+def test_write_crossing_ffff_is_refused_before_any_request(info, threshold) -> None:
+    """Finding 1: chunking must not half-write a span the firmware refuses whole."""
+    client, wire = _client(threshold, info)
+    with pytest.raises(ValueError, match=r"\$FFFF"):
+        _transport(client).write_memory(0xFF00, _payload(300))
+    assert wire.requests == []
+
+
+@pytest.mark.parametrize("info,threshold", [(LEAK_PRONE, 128), (POST_SAFE, 48)])
+def test_write_crossing_ffff_is_refused_before_the_policy_check(info, threshold) -> None:
+    client, wire = _client(threshold, info)
+    policy = MagicMock(spec=MemoryPolicy)
+    policy.is_permissive.return_value = False
+    t = _transport(client)
+    t._memory_policy = policy
+    with pytest.raises(ValueError):
+        t.write_memory(0xFFFF, _payload(2))
+    policy.check_write.assert_not_called()
+    assert wire.requests == []
+
+
+@pytest.mark.parametrize("info,threshold", [(LEAK_PRONE, 128), (POST_SAFE, 48)])
+def test_write_ending_exactly_at_ffff_is_allowed(info, threshold) -> None:
+    client, wire = _client(threshold, info)
+    data = _payload(256)  # $FF00 + 256 == 0x10000
+    _transport(client).write_memory(0xFF00, data)
+    assert wire.reassemble(0xFF00) == data
+
+
+def test_negative_address_is_refused_before_any_request() -> None:
+    client, wire = _client(128, LEAK_PRONE)
+    # The transport's own whole-span message, not the client's start check.
+    with pytest.raises(ValueError, match=r"outside \$0000-\$FFFF"):
+        _transport(client).write_memory(-1, _payload(4))
+    assert wire.requests == []
+
+
+def test_zero_threshold_post_safe_both_entry_points_send() -> None:
+    """Finding 4: at threshold 0 there is no PUT-sized chunk.  A post-safe
+    device needs none, so neither entry point refuses."""
+    client, wire = _client(48, POST_SAFE)
+    client.write_mem_query_threshold = 0
+    t = _transport(client)
+    assert t.rest_put_chunk_size is None
+    data = _payload(100)
+    t.write_memory(0x4000, data)
+    assert wire.requests == [("POST", 0x4000, data)]
+    wire.requests.clear()
+    write_bytes(t, 0x4000, data)
+    assert wire.methods == ["POST", "POST"]  # the 84-byte default, collected
+    assert wire.reassemble(0x4000) == data
+
+
+def test_zero_threshold_leak_prone_both_entry_points_refuse() -> None:
+    client, wire = _client(128, LEAK_PRONE)
+    client.write_mem_query_threshold = 0
+    t = _transport(client)
+    with pytest.raises(ValueError, match="positive"):
+        t.write_memory(0x4000, _payload(100))
+    with pytest.raises(ValueError, match="positive"):
+        write_bytes(t, 0x4000, _payload(100))
+    assert wire.requests == []
+
+
+def test_client_without_integer_threshold_chunks_at_the_put_cap() -> None:
+    """Review N1: a test double with no integer threshold gets 128, not 84."""
+    client = MagicMock()
+    client._capabilities.writemem_post_safe = False
+    t = Ultimate64Transport(host="h", client=client)
+    assert t.rest_put_chunk_size == 128
+    t.write_memory(0x4000, _payload(300))
+    assert [len(c.args[1]) for c in client.write_mem.call_args_list] == [128, 128, 44]
