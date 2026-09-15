@@ -119,6 +119,20 @@ class _FakeClient(_Fake):
             (category, item), {"current": _entry(item), "default": _default(item)}
         ))
 
+    # The entry-value reads the pre-#412 RR-Net fixtures made, so their red run
+    # fails on the restored value rather than on a missing method.
+    def get_config_value(self, category: str, item: str):
+        return self.get_config_item(category, item).get("current")
+
+    def get_config_category(self, category: str) -> dict:
+        client = self
+
+        class _Currents:
+            def __getitem__(self, item: str):
+                return client.get_config_value(category, item)
+
+        return {category: _Currents()}
+
     def set_config_item(self, category: str, item: str, value) -> None:
         self._do(("config", category, item, value))
         self.config.setdefault((category, item), {"default": _default(item)})
@@ -629,8 +643,7 @@ class TestFirstExchangeSession:
 
         module = _load_module(self.FILE)
         journal, fail = probe.journal, probe.fail
-        client = _FakeClient(journal, fail, {})
-        client.get_config_value = lambda category, item: "ENTRY"
+        client = _FakeClient(journal, fail, probe.config)
         target = SimpleNamespace(
             transport=SimpleNamespace(client=client, reset=lambda: journal.append("reset"))
         )
@@ -658,7 +671,7 @@ class TestFirstExchangeSession:
     @staticmethod
     def _teardown(module) -> list:
         return [
-            "cap.close", ("config", module.CAT, module.ITEM, "ENTRY"),
+            "cap.close", ("config", module.CAT, module.ITEM, _default(module.ITEM)),
             "instance exit", "manager exit",
         ]
 
@@ -692,7 +705,7 @@ class TestFirstExchangeSession:
     def test_a_raising_restore_is_reported(self, probe) -> None:
         module, gen = self._gen(probe)
         next(gen)
-        probe.fail.add(("config", module.CAT, module.ITEM, "ENTRY"))
+        probe.fail.add(("config", module.CAT, module.ITEM, _default(module.ITEM)))
         mark = len(probe.journal)
         with pytest.raises(RuntimeError, match="session teardown"):
             next(gen)
@@ -719,6 +732,129 @@ class TestFirstExchangeSession:
         with pytest.raises(pytest.skip.Exception, match="no 10BASE-T link"):
             next(gen)
         assert probe.journal[-4:] == self._teardown(module)
+
+
+def _scope(journal: list, label: str, value):
+    from contextlib import contextmanager
+
+    @contextmanager
+    def scope():
+        try:
+            yield value
+        finally:
+            journal.append(f"{label} exit")
+
+    return scope()
+
+
+def _rrnet_manager(probe, module, transport) -> None:
+    target = SimpleNamespace(transport=transport, client=transport.client)
+    manager = SimpleNamespace(instance=lambda: _scope(probe.journal, "instance", target))
+    module.create_manager = lambda **_kw: _scope(probe.journal, "manager", manager)
+    module.time = SimpleNamespace(sleep=lambda seconds: None, monotonic=lambda: 0.0)
+
+
+def _rrnet_fifo(probe):
+    filename = "test_cs8900a_fifo_live.py"
+    module = _load_module(filename)
+    client = _FakeClient(probe.journal, probe.fail, probe.config)
+    transport = SimpleNamespace(client=client, reset=lambda: probe.journal.append("reset"))
+    _rrnet_manager(probe, module, transport)
+    module._host_mac = lambda iface: bytes(6)
+    module.wait_for_text = lambda *_a, **_kw: True
+    module.load_code = lambda *_a, **_kw: None
+    module.run_subroutine = lambda *_a, **_kw: None
+    rxctl = module.RXCTL_IA_ONLY
+    module.read_bytes = lambda *_a, **_kw: (
+        b"\x0e\x63" + bytes([rxctl & 0xFF, rxctl >> 8]) + module.C64_MAC[:2]
+    )
+    module.open_capture = lambda iface: _FakeCapture(probe.journal, probe.fail)
+    module._Bench = lambda *_a: SimpleNamespace()
+    gen = _fixture_body(module, filename, "bench")()
+    probe.generators.append(gen)
+    return module, gen
+
+
+def _rrnet_visibility(probe):
+    filename = "test_run_prg_cartridge_visibility_live.py"
+    module = _load_module(filename)
+    client = _FakeClient(probe.journal, probe.fail, probe.config)
+    transport = SimpleNamespace(client=client, reset=lambda: probe.journal.append("reset"))
+    _rrnet_manager(probe, module, transport)
+
+    def fresh(target, settle: float = 1.0) -> None:
+        target.transport.client.set_config_item(module.CAT, module.ITEM, "External")
+
+    module._fresh = fresh
+    module._probe_at_ready = lambda target: module.IDENT + b"\x01"
+    gen = _fixture_body(module, filename, "target")()
+    probe.generators.append(gen)
+    return module, gen
+
+
+RRNET_FIXTURES = {
+    "first_exchange::session": lambda probe: TestFirstExchangeSession()._gen(probe),
+    "cs8900a_fifo::bench": _rrnet_fifo,
+    "run_prg_cartridge_visibility::target": _rrnet_visibility,
+}
+
+
+@pytest.mark.parametrize("start", RRNET_FIXTURES.values(), ids=RRNET_FIXTURES.keys())
+class TestRrnetPreferenceRestoresTheDefault:
+    """#412: the three RR-Net fixtures that set ``Cartridge Preference =
+    External`` put it back to the ``default`` the device reports, read before
+    the ``External`` PUT -- not the value read at entry, which can be a
+    SIGKILLed RR-Net lane's ``External`` (the #334 baseline rule)."""
+
+    def test_normal_exit_writes_the_default_not_the_entry_value(self, probe, start) -> None:
+        module, gen = start(probe)
+        next(gen)
+        assert ("config", module.CAT, module.ITEM, "External") in probe.journal
+        with pytest.raises(StopIteration):
+            next(gen)
+        restores = [e for e in probe.journal if isinstance(e, tuple) and e[3] != "External"]
+        assert restores == [("config", module.CAT, module.ITEM, _default(module.ITEM))]
+        assert probe.config[(module.CAT, module.ITEM)]["current"] == _default(module.ITEM)
+        assert probe.journal[-2:] == ["instance exit", "manager exit"]
+
+    def test_an_exception_at_the_yield_still_writes_the_default(self, probe, start) -> None:
+        module, gen = start(probe)
+        next(gen)
+        with pytest.raises(KeyError, match="test body"):
+            gen.throw(KeyError("test body"))
+        assert probe.config[(module.CAT, module.ITEM)]["current"] == _default(module.ITEM)
+        assert probe.journal[-2:] == ["instance exit", "manager exit"]
+
+    def test_a_failed_restore_is_reported(self, probe, start) -> None:
+        module, gen = start(probe)
+        next(gen)
+        probe.fail.add(("config", module.CAT, module.ITEM, _default(module.ITEM)))
+        with pytest.raises(RuntimeError, match="teardown") as info:
+            next(gen)
+        assert "FAKE" in str(info.value.__cause__)
+        assert probe.journal[-2:] == ["instance exit", "manager exit"]
+
+    @pytest.mark.parametrize("breakage", ["missing", "empty"])
+    def test_no_default_refuses_before_the_external_put(self, probe, start, breakage) -> None:
+        module, gen = start(probe)
+        probe.config[(module.CAT, module.ITEM)] = (
+            {"current": "External"} if breakage == "missing"
+            else {"current": "External", "default": ""}
+        )
+        with pytest.raises(RuntimeError, match="no default"):
+            next(gen)
+        assert not [e for e in probe.journal if isinstance(e, tuple)], probe.journal
+        assert probe.journal[-2:] == ["instance exit", "manager exit"]
+
+    def test_a_drifted_entry_warns_naming_the_entry_value(self, probe, start, caplog) -> None:
+        module, gen = start(probe)
+        with caplog.at_level(logging.WARNING):
+            next(gen)
+        drift = [r.getMessage() for r in caplog.records if "drifted at entry" in r.getMessage()]
+        assert len(drift) == 1, drift
+        assert f"{module.CAT} / {module.ITEM} drifted at entry" in drift[0]
+        assert repr(_entry(module.ITEM)) in drift[0]
+        assert repr(_default(module.ITEM)) in drift[0]
 
 
 class _FakeManager(_Fake):

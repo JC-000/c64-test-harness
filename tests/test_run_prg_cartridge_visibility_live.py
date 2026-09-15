@@ -53,8 +53,9 @@ Gates (all unset -> the module skips cleanly):
 * ``U64_HOST``     -- the device (no IPs are committed).
 
 Requirements: an RR-Net-compatible cartridge in the expansion port.  The
-tests set ``Cartridge Preference = External`` and restore the original
-value afterwards; config PUTs are volatile (nothing is saved to flash).
+tests set ``Cartridge Preference = External`` and restore the ``default``
+the device reports afterwards, never the value read at entry (#412); config
+PUTs are volatile (nothing is saved to flash).
 Never: ``poweroff``, ``reboot``, ``save_config_to_flash``.  No elevation
 markers -- nothing here touches the host's network state.
 """
@@ -82,6 +83,12 @@ from c64_test_harness.bridge_ping import (
 from c64_test_harness.execute import load_code, run_subroutine
 from c64_test_harness.memory import read_bytes, write_bytes
 from c64_test_harness.screen import wait_for_text
+from live_fixture_teardown import (
+    attempt_steps,
+    raise_teardown_failures,
+    read_restore_defaults,
+    restore_default_steps,
+)
 
 _LIVE = os.environ.get("RRNET_LIVE")
 _HOST = os.environ.get("U64_HOST")
@@ -171,14 +178,17 @@ def _fresh(target, settle: float = 1.0) -> None:
 def target():
     """A locked U64 with ``Cartridge Preference = External`` for the module.
 
-    The original preference is restored on the way out (volatile PUT, no
-    flash write).  ``create_manager`` holds the ``DeviceLock``; the
+    The preference is put back to the ``default`` the device reports, read
+    before the first write, on the way out (volatile PUT, no flash write) --
+    not the value read at entry, which can be a killed RR-Net lane's
+    ``External`` (#412, #334).  ``create_manager`` holds the ``DeviceLock``; the
     autouse ``device_lock_guard`` already holds it too (``allow_nested``).
     """
     with create_manager(backend="u64", u64_hosts=_HOST, lock_timeout=600.0) as mgr:
         with mgr.instance() as tgt:
             client = tgt.transport.client
-            orig = client.get_config_category(CAT)[CAT][ITEM]
+            plan = read_restore_defaults(client, {CAT: [ITEM]})
+            failures: list = []
             try:
                 _fresh(tgt)
                 raw = _probe_at_ready(tgt)
@@ -189,7 +199,8 @@ def target():
                     )
                 yield tgt
             finally:
-                client.set_config_item(CAT, ITEM, orig)
+                failures = attempt_steps(restore_default_steps(client, plan))
+            raise_teardown_failures("target teardown", failures)
 
 
 def test_run_prg_via_sys_leaves_cartridge_selected(target):
