@@ -1416,7 +1416,11 @@ def build_socket_write(
     (:data:`_TURBO_WRITE_DATA_ADDR`) and ``$C87C``
     (:data:`_TURBO_WRITE_LEN_ADDR`, just past a maximum payload).  An
     explicit address inside the emitted routine -- the socket id, the data
-    start, or either length byte -- raises ``ValueError``.
+    start, or either length byte -- raises ``ValueError``.  The guard checks
+    the data *start* only, not the data span: the builder cannot know the
+    payload length, so an explicit ``data_addr`` below ``code_addr`` (e.g.
+    ``$BF80``) with a runtime payload longer than the gap still runs into
+    the routine.
 
     :param turbo_safe: see :func:`build_uci_command`.
     """
