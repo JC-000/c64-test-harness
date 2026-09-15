@@ -27,9 +27,15 @@ check (or ``$C9``) *rules out*, *proves the absence of*, or *clears* a wedge,
 or that ``$C9`` means the UCI is *healthy*.  The check reads only the
 identifier register; a STATE-bit wedge lives in ``$DF1C`` (``uci_wedge_probe``).
 
-**Declared limits:** the presence pins are token checks inside the located
-unit, so a unit that carries every token but garbles the claim passes; the
-absence rule matches only the verb phrases listed in :data:`_OVERCLAIM`.
+**Phrases, not only tokens.**  The remedy ("Auto, then reset() and ...
+settle"), the RR-Net/UCI session sentence, the STATE-bit limit and the
+REFERENCE attributes are pinned as regexes: in the first mutation round each
+survived as a token check, because the unit repeats "reset()", "settle",
+"RR-Net" and ``cartridge_preference`` elsewhere (mutants D2, D4, D6, P6).
+
+**Declared limits:** the remaining presence pins are token checks inside the
+located unit, so a unit that carries those tokens but garbles the claim
+passes; the absence rule matches only the verb phrases in :data:`_OVERCLAIM`.
 """
 from __future__ import annotations
 
@@ -70,20 +76,33 @@ def _section(text: str, heading: str) -> str:
     return text[start:end]
 
 
-#: (file, unit locator, tokens the unit must carry).
-SKILL_TOKENS = ("External", "Auto", "reset()", "settle", "RR-Net", "#359",
-                "Command Interface", "STATE-bit", "uci_wedge_probe", "$C9")
-REFERENCE_TOKENS = ("UCIError", "identifier", "cartridge_preference", "$DF1D",
-                    "bodyless", "/Temp", "uci_probe")
+#: The remedy as one phrase: the preference back to Auto, *then* the reset and settle.
+REMEDY = re.compile(r"Auto\W{0,3},?\s+then reset\(\) and (?:a )?(?:~?\d+ s )?settle")
+SHARING = re.compile(r"RR-Net runs and UCI runs cannot share a device session")
+WEDGE_LIMIT = re.compile(r"does not rule out a (?:UCI )?STATE-bit wedge[^.]*uci_wedge_probe")
+ATTRIBUTES = re.compile(r"Attributes: identifier \([^)]*\) and cartridge_preference \(")
+
+#: What the unit that names the error must carry: a literal token or a phrase.
+SKILL_TOKENS = ("External", "#359", "Command Interface", "$C9",
+                REMEDY, SHARING, WEDGE_LIMIT)
+REFERENCE_TOKENS = ("UCIError", "$DF1D", "bodyless", "/Temp", "uci_probe", ATTRIBUTES)
 PATTERNS_RRNET_HEADING = "### Hardware RR-Net on the U64"
-PATTERNS_TOKENS = (ERROR, "Auto", "UCI", "reset()")
+PATTERNS_TOKENS = (ERROR, "UCI", REMEDY)
 
 
-def missing_tokens(unit_texts: list[str], tokens: tuple[str, ...]) -> list[str]:
-    """Tokens no single unit carries in full: the claim must be in one place."""
-    best: list[str] = list(tokens)
+def _has(unit: str, need) -> bool:
+    return bool(need.search(unit)) if isinstance(need, re.Pattern) else need in unit
+
+
+def _label(need) -> str:
+    return need.pattern if isinstance(need, re.Pattern) else need
+
+
+def missing_tokens(unit_texts: list[str], tokens: tuple) -> list[str]:
+    """Needs no single unit carries in full: the claim must be in one place."""
+    best: list[str] = [_label(t) for t in tokens]
     for unit in unit_texts:
-        miss = [t for t in tokens if t not in unit]
+        miss = [_label(t) for t in tokens if not _has(unit, t)]
         if len(miss) < len(best):
             best = miss
     return best
@@ -140,6 +159,18 @@ class TestThePinCanFail:
         units = ["UCIInterfaceAbsentError: set Auto.", "Then reset() and settle."]
         assert missing_tokens(units, ("Auto", "reset()")) == ["reset()"]
         assert missing_tokens(["Auto, then reset()."], ("Auto", "reset()")) == []
+
+    def test_a_phrase_need_is_not_met_by_its_scattered_tokens(self) -> None:
+        scattered = "After reset() and settle, set Auto."
+        assert missing_tokens([scattered], (REMEDY,)) == [REMEDY.pattern]
+        for ok in ('set_config_item(..., "Auto"), then reset() and a ~3 s settle',
+                   "back to Auto, then reset() and settle, before"):
+            assert missing_tokens([ok], (REMEDY,)) == [], ok
+        assert missing_tokens(["RR-Net and UCI"], (SHARING,)) == [SHARING.pattern]
+        assert missing_tokens(["it rules out a UCI STATE-bit wedge (uci_wedge_probe)"],
+                              (WEDGE_LIMIT,)) == [WEDGE_LIMIT.pattern]
+        assert missing_tokens(["UCIInterfaceAbsentError(identifier, cartridge_preference=None)"],
+                              (ATTRIBUTES,)) == [ATTRIBUTES.pattern]
 
     def test_list_items_are_separate_units(self) -> None:
         text = "- one UCIInterfaceAbsentError\n- two Auto\n\nthree"
