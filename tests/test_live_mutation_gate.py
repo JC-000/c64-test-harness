@@ -72,6 +72,18 @@ reads more into a green run:**
   so a future ``acquire`` that writes config would be missed.
 * It covers **config writes only**.  Resets and RAM writes are also state
   changes under ``docs/development.md``'s wording, and are not scanned.
+* **Setting the gate is always an offence**, whatever the module skips on:
+  a module that stores ``U64_ALLOW_MUTATE`` itself (:func:`gate_stores`:
+  ``os.environ[...] =``, ``setdefault``, ``update``, ``putenv``,
+  ``monkeypatch.setenv``, anywhere in the file) arms its own gate.  A store
+  through an alias or a computed key is not seen.
+* An unknown environment variable is tried only **unset (or its literal
+  default) and as ``"1"``**, so a comparison against another literal escapes:
+  ``get('X_LIVE') != 'yes' or get(GATE) == '1'`` never skips with
+  ``X_LIVE=yes`` and the gate unset, yet is scored as a gate.  Tracked as
+  #353; pinned by two ``xfail(strict=True)`` cases that flip when it is fixed.
+* A rebinding through ``globals()['_M'] = '1'`` (or ``setattr`` on the
+  module) is not seen by the binder.
 """
 from __future__ import annotations
 
@@ -620,13 +632,67 @@ def config_writes(tree: ast.AST, vocabulary: set[str]) -> set[str]:
     return _called_names(tree) & vocabulary
 
 
+#: Calls whose first argument is an environment key they set.
+_KEY_SETTERS = frozenset({"setdefault", "putenv", "setenv", "__setitem__"})
+
+
+def gate_stores(tree: ast.AST) -> list[str]:
+    """Every place the module sets ``U64_ALLOW_MUTATE`` itself, anywhere in the file.
+
+    A module that arms the gate skips on it and writes anyway, and an
+    import-time store leaks into every later module in the run.  Recognised:
+    a subscript store on ``environ`` keyed with the gate; ``setdefault`` /
+    ``putenv`` / ``setenv`` (``monkeypatch.setenv`` included) / ``__setitem__``
+    with the gate as the first argument; ``update`` with the gate as a
+    dict-literal key or a keyword.  Only the key counts -- the gate's name as
+    a *value* is not a store.
+    """
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.ctx, ast.Store)
+            and _is_environ(node.value)
+            and isinstance(node.slice, ast.Constant)
+            and node.slice.value == GATE
+        ):
+            found.append(f"line {node.lineno}: {ast.unparse(node)} = ...")
+        elif isinstance(node, ast.Call):
+            name = _callee_name(node)
+            first = node.args[0] if node.args else None
+            if (
+                name in _KEY_SETTERS
+                and isinstance(first, ast.Constant)
+                and first.value == GATE
+            ):
+                found.append(f"line {node.lineno}: {ast.unparse(node)}")
+            elif name == "update" and (
+                any(
+                    isinstance(arg, ast.Dict)
+                    and any(isinstance(k, ast.Constant) and k.value == GATE for k in arg.keys)
+                    for arg in node.args
+                )
+                or any(kw.arg == GATE for kw in node.keywords)
+            ):
+                found.append(f"line {node.lineno}: {ast.unparse(node)}")
+    return found
+
+
 def gate_offence(source: str, name: str, vocabulary: set[str]) -> set[str]:
-    """The config writes of an ungated module; empty when it is fine."""
+    """The module's offences; empty when it is fine.
+
+    Its config writes, when it never skips on the gate; and, whatever it
+    skips on, ``"sets U64_ALLOW_MUTATE"`` plus its writes when it sets the
+    gate itself (:func:`gate_stores`).
+    """
     tree = ast.parse(source, filename=name)
     writes = config_writes(tree, vocabulary)
+    offence: set[str] = set()
     if writes and not module_is_gated(tree):
-        return writes
-    return set()
+        offence |= writes
+    if gate_stores(tree):
+        offence |= writes | {f"sets {GATE}"}
+    return offence
 
 
 def _pytestmark_gated(body: list[ast.stmt], ctx: _GateContext) -> bool:
@@ -679,7 +745,9 @@ def _gated_fixtures(tree: ast.Module, ctx: _GateContext) -> set[str]:
 def ungated_tests_that_write(tree: ast.Module, vocabulary: set[str]) -> list[str]:
     """``test_*`` functions that call a config writer and are not gated themselves."""
     ctx = _GateContext(tree)
-    if _pytestmark_gated(tree.body, ctx):
+    # A module that sets the gate itself is covered by none of its skips.
+    arms_gate = bool(gate_stores(tree))
+    if _pytestmark_gated(tree.body, ctx) and not arms_gate:
         return []
     gated_fixtures = _gated_fixtures(tree, ctx)
     offenders: list[str] = []
@@ -698,7 +766,7 @@ def ungated_tests_that_write(tree: ast.Module, vocabulary: set[str]) -> list[str
                 and child.name.startswith("test")
             ):
                 writes = sorted(_called_names(child) & vocabulary)
-                covered = (
+                covered = not arms_gate and (
                     inherited
                     or any(ctx.mark_gates(d) for d in child.decorator_list)
                     or _skips_on_gate(child, ctx)
@@ -730,11 +798,14 @@ def _live_modules() -> list[Path]:
 def test_a_live_module_that_writes_config_is_gated(path: Path, vocabulary) -> None:
     source = path.read_text()
     writes = gate_offence(source, path.name, vocabulary)
+    stores = gate_stores(ast.parse(source))
     assert not writes, (
-        f"{path.name} writes device config ({', '.join(sorted(writes))}) but "
-        f"never skips when {GATE} is unset; an operator who has not set it "
-        f"expects no suite to reconfigure the shared device (#268). Gate the "
-        f"module or the tests that write." + gate_hint(ast.parse(source))
+        f"{path.name}: {', '.join(sorted(writes))}. A live module that writes "
+        f"device config must skip when {GATE} is unset, and must never set it "
+        f"itself; an operator who has not set it expects no suite to "
+        f"reconfigure the shared device (#268)."
+        + (f"\nIt sets {GATE} at: " + "; ".join(stores) if stores else "")
+        + gate_hint(ast.parse(source))
     )
 
 
@@ -1162,6 +1233,63 @@ class TestTheScannerItselfCanFail:
         )
         assert self._offence(src) == {"enable_uci"}
 
+    @pytest.mark.parametrize("store", [
+        "os.environ['U64_ALLOW_MUTATE'] = '1'\n",
+        "os.environ.setdefault('U64_ALLOW_MUTATE', '1')\n",
+        "os.environ.update({'U64_ALLOW_MUTATE': '1'})\n",
+        "os.putenv('U64_ALLOW_MUTATE', '1')\n",
+        "@pytest.fixture(autouse=True)\ndef _arm(monkeypatch):\n"
+        "    monkeypatch.setenv('U64_ALLOW_MUTATE', '1')\n",
+    ], ids=["C4-subscript", "C5-setdefault", "update", "putenv", "monkeypatch-setenv"])
+    def test_a_module_that_sets_the_gate_itself_is_an_offence(self, store) -> None:
+        """It skips on the gate but arms it first, so it writes on every run."""
+        src = (
+            "import os, pytest\n"
+            f"{store}"
+            "pytestmark = pytest.mark.skipif(\n"
+            "    not os.environ.get('U64_ALLOW_MUTATE'), reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == {"enable_uci", "sets U64_ALLOW_MUTATE"}
+
+    def test_setting_the_gate_is_an_offence_even_without_a_config_write(self) -> None:
+        """Arming the gate at import leaks into every later module in the run."""
+        src = (
+            "import os\n"
+            "os.environ['U64_ALLOW_MUTATE'] = '1'\n"
+            "def test_x(client):\n    client.get_config_item('C', 'I')\n"
+        )
+        assert self._offence(src) == {"sets U64_ALLOW_MUTATE"}
+
+    def test_the_gate_name_as_a_value_is_not_setting_the_gate(self) -> None:
+        src = (
+            "import os, pytest\n"
+            "os.environ['X_LIVE'] = 'U64_ALLOW_MUTATE'\n"
+            "os.environ.setdefault('X_OTHER', 'U64_ALLOW_MUTATE')\n"
+            "pytestmark = pytest.mark.skipif(\n"
+            "    not os.environ.get('U64_ALLOW_MUTATE'), reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == set()
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="#353: an unknown env var is tried only unset/default and as '1', "
+        "so a comparison against another literal escapes",
+    )
+    @pytest.mark.parametrize("condition", [
+        "os.environ.get('X_LIVE') != 'yes' or os.environ.get('U64_ALLOW_MUTATE') == '1'",
+        "not os.environ.get('U64_ALLOW_MUTATE') and os.environ.get('X_LIVE') != 'yes'",
+    ], ids=["353-or", "353-and"])
+    def test_a_comparison_against_another_literal_is_not_a_gate(self, condition) -> None:
+        """With X_LIVE='yes' and the gate unset neither skips, so the module writes."""
+        src = (
+            "import os, pytest\n"
+            f"pytestmark = pytest.mark.skipif({condition}, reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == {"enable_uci"}
+
     def test_read_only_module_needs_no_gate(self) -> None:
         src = "def test_x(client):\n    client.get_config_item('C', 'I')\n"
         assert self._offence(src) == set()
@@ -1277,6 +1405,14 @@ class TestTheTestLevelScannerCanFail:
         """S9: ``needs`` rebound to ``skipif(False)`` before ``@needs`` gates nothing."""
         body = (
             "needs = pytest.mark.skipif(False, reason='y')\n"
+            "@needs\n"
+            "def test_a(t):\n    t.set_speed(4)\n"
+        )
+        assert self._offenders(body) == ["test_a (set_speed)"]
+
+    def test_a_module_that_sets_the_gate_covers_no_test(self) -> None:
+        body = (
+            "os.environ['U64_ALLOW_MUTATE'] = '1'\n"
             "@needs\n"
             "def test_a(t):\n    t.set_speed(4)\n"
         )
