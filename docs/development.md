@@ -413,10 +413,18 @@ the `DeviceLock` is taken by the test. Three need no device at all:
 `RRNET_UDP_LIVE` and `READ_BYTES_STRESS` drive VICE, and
 `BRIDGE_CLEANUP_LIVE` mutates host network state. Gates marked *mutate*
 also need `U64_ALLOW_MUTATE=1` because they write device config or RAM
-and restore it. For config writes the convention has no exceptions:
-`tests/test_live_mutation_gate.py` fails, without a device, on any live
-module that writes device config and never skips on `U64_ALLOW_MUTATE`
-([#268](https://github.com/JC-000/c64-test-harness/issues/268)). That
+and restore it. For a live test's own config writes the convention has no
+exceptions: `tests/test_live_mutation_gate.py` fails, without a device, on
+any live module that writes device config and never skips on
+`U64_ALLOW_MUTATE`
+([#268](https://github.com/JC-000/c64-test-harness/issues/268)). Two
+harness-driven config writes are not the tests' and are **not** gated on it:
+the manager's generation-resolved entry baseline reset
+([#285](https://github.com/JC-000/c64-test-harness/pull/285)) runs on a U64E
+whenever a lane acquires the device through `create_manager`, whether or not
+`U64_ALLOW_MUTATE` is set — opt out with `U64_BASELINE_ON_ENTRY=0`; and the
+`/Temp` hygiene pass enables FTP File Service on a leak-prone device after a
+failed pass (#263, owner-approved). That
 includes the `U64_HOST`-only suites outside this table:
 `test_chromatic_capture_live.py` and `test_uci_tcp_echo_live.py` as a whole,
 and the config-writing tests of `test_u64_audio_capture_live.py`,

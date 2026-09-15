@@ -16,11 +16,18 @@ against the client source).  The vocabulary is every function in
 ``restore_state``, ``isolated_sid_addressing`` and the rest -- minus the
 named :data:`EXCLUDED` entry points, each with its reason.
 
-**What counts as gated**: the module reads ``U64_ALLOW_MUTATE`` from the
-environment and that read (directly, or through a name bound to an
-expression containing it) decides a ``skipif`` condition or an ``if`` that
-calls ``skip``.  A module that only mentions the variable in a docstring, or
-reads it and never skips on it, is not gated.
+**What counts as gated**: a ``skipif`` condition, or the test of an ``if``
+that calls ``skip``, that reads ``U64_ALLOW_MUTATE`` (directly, or through
+a name bound from such a read) **and is true when the variable is unset**.
+The condition is evaluated, not just searched: every gate read becomes
+``None``, names bound from it take their unset values, any other name is
+assumed set, and only a small expression grammar (boolean operators,
+comparisons, constants, ``bool``/``str``/``int``) is evaluated.  So
+``skipif(os.environ.get(GATE) == '1')`` -- which skips when the gate is
+*set* and writes when it is not -- is not a gate, nor is
+``skipif(False and ...)``, nor a condition outside the grammar (fail closed).
+A module that only mentions the variable in a docstring, or reads it and
+never skips on it, is not gated.
 
 **A floor, not a proof -- the limits are the scanner's, stated so nobody
 reads more into a green run:**
@@ -40,12 +47,16 @@ reads more into a green run:**
   calling ``transport.set_speed`` would be flagged (none does today) -- the
   safe direction.  A write through an alias (``f = client.set_config_item``)
   or through a helper defined in the test module itself is missed.
+  :data:`EXCLUDED` matches by bare name too: excluding ``acquire`` excludes
+  every function of that name in ``src`` (``DeviceLock.acquire`` included),
+  so a future ``acquire`` that writes config would be missed.
 * It covers **config writes only**.  Resets and RAM writes are also state
   changes under ``docs/development.md``'s wording, and are not scanned.
 """
 from __future__ import annotations
 
 import ast
+import copy
 from pathlib import Path
 
 import pytest
@@ -85,8 +96,11 @@ EXCLUDED: dict[str, str] = {
     ),
     "run_prg_via_sys": (
         "re-PUTs Cartridge Preference only when it already reads External "
-        "(#217): the same value, no state change -- and it is also the "
-        "VICE start path (test_run_prg_via_sys_vice_live.py)"
+        "(#217) and PUTs that same value back: it restores the preference "
+        "rather than changing it (a same-value PUT still effectuates -- "
+        "config.cc set_item -> setChanged -> set_need_effectuate -- which "
+        "is how it reselects the cartridge) -- and it is also the VICE "
+        "start path (test_run_prg_via_sys_vice_live.py)"
     ),
 }
 
@@ -220,51 +234,160 @@ def _is_gate_env_read(node: ast.AST) -> bool:
     return False
 
 
-def _gate_names(tree: ast.AST) -> set[str]:
-    """Names bound to an expression that reads the gate, or to such a name.
+def _is_other_env_read(node: ast.AST) -> bool:
+    """An environment read of some variable other than the gate."""
+    if isinstance(node, ast.Call):
+        return (
+            _callee_name(node) in {"get", "getenv"}
+            and isinstance(node.func, ast.Attribute)
+            and bool(node.args)
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+            and not _is_gate_env_read(node)
+        )
+    if isinstance(node, ast.Subscript):
+        return (
+            isinstance(node.value, ast.Attribute)
+            and node.value.attr == "environ"
+            and not _is_gate_env_read(node)
+        )
+    return False
 
-    One pass in ``ast.walk`` order, which visits module-level statements in
-    source order, so ``_M = os.environ.get(GATE)`` followed by
-    ``needs = pytest.mark.skipif(not _M, ...)`` binds both names.
+
+#: Callables a condition may use and still be evaluated.
+_SAFE_CALLS = {"bool": bool, "str": str, "int": int}
+
+#: The expression grammar a condition must stay inside to be evaluated.
+_SAFE_NODES = (
+    ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.UnaryOp, ast.Not,
+    ast.Compare, ast.Eq, ast.NotEq, ast.Is, ast.IsNot, ast.In, ast.NotIn,
+    ast.Constant, ast.Name, ast.Load, ast.Call, ast.Tuple, ast.List,
+)
+
+
+class _GateContext:
+    """What one module's source says about the gate, evaluated with it unset.
+
+    ``values`` maps each name bound from a gate read (directly or through
+    another such name) to its value when the gate is unset; ``marks`` holds
+    names bound to a ``skipif`` mark that skips with the gate unset.  One
+    pass in ``ast.walk`` order, which visits module-level statements in
+    source order.
     """
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
-            if any(
-                _is_gate_env_read(sub)
-                or (isinstance(sub, ast.Name) and sub.id in names)
-                for sub in ast.walk(node.value)
+
+    def __init__(self, tree: ast.AST) -> None:
+        self.values: dict[str, object] = {}
+        self.marks: set[str] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            names = [t.id for t in targets if isinstance(t, ast.Name)]
+            if not names:
+                continue
+            if self.mark_gates(node.value):
+                self.marks.update(names)
+            elif self.references_gate(node.value):
+                ok, value = self.evaluate(node.value)
+                if ok:
+                    self.values.update(dict.fromkeys(names, value))
+
+    def references_gate(self, expr: ast.AST) -> bool:
+        return any(
+            _is_gate_env_read(sub)
+            or (isinstance(sub, ast.Name) and sub.id in self.values)
+            for sub in ast.walk(expr)
+        )
+
+    def evaluate(self, expr: ast.AST) -> tuple[bool, object]:
+        """``(True, value)`` of *expr* with the gate unset; ``(False, None)`` if unevaluable.
+
+        Gate reads become ``None``, gate-bound names their unset values,
+        other environment reads and every other name the string ``"set"``
+        (assume every other requirement is met).  Anything outside
+        :data:`_SAFE_NODES` / :data:`_SAFE_CALLS` is refused -- fail closed.
+        """
+        values = self.values
+
+        class _Unset(ast.NodeTransformer):
+            def visit_Call(self, node: ast.Call) -> ast.AST:
+                if _is_gate_env_read(node):
+                    return ast.copy_location(ast.Constant(None), node)
+                if _is_other_env_read(node):
+                    return ast.copy_location(ast.Constant("set"), node)
+                return self.generic_visit(node)
+
+            def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+                if _is_gate_env_read(node):
+                    return ast.copy_location(ast.Constant(None), node)
+                if _is_other_env_read(node):
+                    return ast.copy_location(ast.Constant("set"), node)
+                return self.generic_visit(node)
+
+            def visit_Name(self, node: ast.Name) -> ast.AST:
+                if node.id in values:
+                    return ast.copy_location(ast.Constant(values[node.id]), node)
+                if node.id in _SAFE_CALLS:
+                    return node
+                return ast.copy_location(ast.Constant("set"), node)
+
+        tree = ast.fix_missing_locations(
+            _Unset().visit(ast.Expression(body=copy.deepcopy(expr)))
+        )
+        for node in ast.walk(tree):
+            if not isinstance(node, _SAFE_NODES):
+                return False, None
+            if isinstance(node, ast.Call) and not (
+                isinstance(node.func, ast.Name)
+                and node.func.id in _SAFE_CALLS
+                and not node.keywords
             ):
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                names.update(t.id for t in targets if isinstance(t, ast.Name))
-    return names
+                return False, None
+        try:
+            code = compile(tree, "<gate condition>", "eval")
+            return True, eval(code, {"__builtins__": {}}, dict(_SAFE_CALLS))  # noqa: S307
+        except Exception:  # noqa: BLE001 -- unevaluable means not a gate
+            return False, None
 
+    def condition_gates(self, condition: ast.AST) -> bool:
+        """Reads the gate and is true -- skips -- when the gate is unset."""
+        if not self.references_gate(condition):
+            return False
+        ok, value = self.evaluate(condition)
+        return ok and bool(value)
 
-def _references_gate(expr: ast.AST, gate_names: set[str]) -> bool:
-    return any(
-        _is_gate_env_read(sub)
-        or (isinstance(sub, ast.Name) and sub.id in gate_names)
-        for sub in ast.walk(expr)
-    )
-
-
-def module_is_gated(tree: ast.AST) -> bool:
-    gate_names = _gate_names(tree)
-    for node in ast.walk(tree):
+    def mark_gates(self, node: ast.AST) -> bool:
+        """A ``skipif`` mark, a list of marks, or a name bound to one, that gates."""
+        if isinstance(node, ast.Name):
+            return node.id in self.marks
+        if isinstance(node, (ast.List, ast.Tuple)):
+            return any(self.mark_gates(element) for element in node.elts)
         if isinstance(node, ast.Call) and _callee_name(node) == "skipif":
             conditions = list(node.args[:1]) + [
                 kw.value for kw in node.keywords if kw.arg == "condition"
             ]
-            if any(_references_gate(c, gate_names) for c in conditions):
-                return True
-        if isinstance(node, ast.If) and _references_gate(node.test, gate_names):
-            if any(
+            return any(self.condition_gates(c) for c in conditions)
+        return False
+
+    def if_skip_gates(self, node: ast.AST) -> bool:
+        """``if <condition>: ... skip(...)`` whose condition gates."""
+        return (
+            isinstance(node, ast.If)
+            and self.condition_gates(node.test)
+            and any(
                 isinstance(sub, ast.Call) and _callee_name(sub) == "skip"
                 for stmt in node.body
                 for sub in ast.walk(stmt)
-            ):
-                return True
-    return False
+            )
+        )
+
+
+def module_is_gated(tree: ast.AST) -> bool:
+    ctx = _GateContext(tree)
+    return any(
+        (isinstance(node, ast.Call) and ctx.mark_gates(node)) or ctx.if_skip_gates(node)
+        for node in ast.walk(tree)
+    )
 
 
 def config_writes(tree: ast.AST, vocabulary: set[str]) -> set[str]:
@@ -280,26 +403,17 @@ def gate_offence(source: str, name: str, vocabulary: set[str]) -> set[str]:
     return set()
 
 
-def _pytestmark_gated(body: list[ast.stmt], gate_names: set[str]) -> bool:
+def _pytestmark_gated(body: list[ast.stmt], ctx: _GateContext) -> bool:
     return any(
         isinstance(stmt, ast.Assign)
         and any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in stmt.targets)
-        and _references_gate(stmt.value, gate_names)
+        and ctx.mark_gates(stmt.value)
         for stmt in body
     )
 
 
-def _skips_on_gate(fn: ast.AST, gate_names: set[str]) -> bool:
-    return any(
-        isinstance(node, ast.If)
-        and _references_gate(node.test, gate_names)
-        and any(
-            isinstance(sub, ast.Call) and _callee_name(sub) == "skip"
-            for stmt in node.body
-            for sub in ast.walk(stmt)
-        )
-        for node in ast.walk(fn)
-    )
+def _skips_on_gate(fn: ast.AST, ctx: _GateContext) -> bool:
+    return any(ctx.if_skip_gates(node) for node in ast.walk(fn))
 
 
 def _is_fixture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
@@ -319,13 +433,13 @@ def _param_names(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
     return {a.arg for a in args.posonlyargs + args.args + args.kwonlyargs}
 
 
-def _gated_fixtures(tree: ast.Module, gate_names: set[str]) -> set[str]:
+def _gated_fixtures(tree: ast.Module, ctx: _GateContext) -> set[str]:
     """Module-level fixtures that skip on the gate, or request one that does."""
     fixtures = [
         n for n in tree.body
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and _is_fixture(n)
     ]
-    gated = {f.name for f in fixtures if _skips_on_gate(f, gate_names)}
+    gated = {f.name for f in fixtures if _skips_on_gate(f, ctx)}
     changed = True
     while changed:
         changed = False
@@ -338,10 +452,10 @@ def _gated_fixtures(tree: ast.Module, gate_names: set[str]) -> set[str]:
 
 def ungated_tests_that_write(tree: ast.Module, vocabulary: set[str]) -> list[str]:
     """``test_*`` functions that call a config writer and are not gated themselves."""
-    gate_names = _gate_names(tree)
-    if _pytestmark_gated(tree.body, gate_names):
+    ctx = _GateContext(tree)
+    if _pytestmark_gated(tree.body, ctx):
         return []
-    gated_fixtures = _gated_fixtures(tree, gate_names)
+    gated_fixtures = _gated_fixtures(tree, ctx)
     offenders: list[str] = []
 
     def visit(node: ast.AST, inherited: bool) -> None:
@@ -350,8 +464,8 @@ def ungated_tests_that_write(tree: ast.Module, vocabulary: set[str]) -> list[str
                 visit(
                     child,
                     inherited
-                    or any(_references_gate(d, gate_names) for d in child.decorator_list)
-                    or _pytestmark_gated(child.body, gate_names),
+                    or any(ctx.mark_gates(d) for d in child.decorator_list)
+                    or _pytestmark_gated(child.body, ctx),
                 )
             elif (
                 isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -360,8 +474,8 @@ def ungated_tests_that_write(tree: ast.Module, vocabulary: set[str]) -> list[str
                 writes = sorted(_called_names(child) & vocabulary)
                 covered = (
                     inherited
-                    or any(_references_gate(d, gate_names) for d in child.decorator_list)
-                    or _skips_on_gate(child, gate_names)
+                    or any(ctx.mark_gates(d) for d in child.decorator_list)
+                    or _skips_on_gate(child, ctx)
                     or bool(_param_names(child) & gated_fixtures)
                 )
                 if writes and not covered:
@@ -525,6 +639,101 @@ class TestTheScannerItselfCanFail:
         )
         assert self._offence(src) == set()
 
+    def test_an_inverted_skipif_is_not_a_gate(self) -> None:
+        """Skips when the gate is SET and writes when it is unset (#268's hazard)."""
+        src = (
+            "import os, pytest\n"
+            "pytestmark = pytest.mark.skipif(\n"
+            "    os.environ.get('U64_ALLOW_MUTATE') == '1', reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == {"enable_uci"}
+
+    def test_a_skipif_that_can_never_skip_is_not_a_gate(self) -> None:
+        src = (
+            "import os, pytest\n"
+            "pytestmark = pytest.mark.skipif(\n"
+            "    False and os.environ.get('U64_ALLOW_MUTATE'), reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == {"enable_uci"}
+
+    def test_an_inverted_bound_name_is_not_a_gate(self) -> None:
+        src = (
+            "import os, pytest\n"
+            "_ON = os.environ.get('U64_ALLOW_MUTATE') == '1'\n"
+            "pytestmark = pytest.mark.skipif(_ON, reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == {"enable_uci"}
+
+    def test_an_inverted_fixture_skip_is_not_a_gate(self) -> None:
+        src = (
+            "import os, pytest\n"
+            "_M = os.environ.get('U64_ALLOW_MUTATE')\n"
+            "@pytest.fixture\n"
+            "def client():\n"
+            "    if _M:\n"
+            "        pytest.skip('x')\n"
+            "def test_x(client):\n    client.set_config_item('C', 'I', 'V')\n"
+        )
+        assert self._offence(src) == {"set_config_item"}
+
+    def test_an_unevaluable_condition_is_not_a_gate(self) -> None:
+        """Fail closed: a condition the scanner cannot evaluate proves nothing."""
+        src = (
+            "import os, pytest\n"
+            "pytestmark = pytest.mark.skipif(\n"
+            "    not helper(os.environ.get('U64_ALLOW_MUTATE')), reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == {"enable_uci"}
+
+    def test_a_bool_bound_gate_and_a_compound_condition_are_gates(self) -> None:
+        src = (
+            "import os, pytest\n"
+            "_HOST = os.environ.get('U64_HOST')\n"
+            "_A = bool(os.environ.get('U64_ALLOW_MUTATE'))\n"
+            "pytestmark = pytest.mark.skipif(not (_HOST and _A), reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == set()
+
+    def test_code_outside_the_grammar_is_never_evaluated(self) -> None:
+        """A lambda would evaluate cleanly to a skip; it must be refused unrun."""
+        src = (
+            "import os, pytest\n"
+            "pytestmark = pytest.mark.skipif(\n"
+            "    not (lambda: os.environ.get('U64_ALLOW_MUTATE'))(), reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == {"enable_uci"}
+
+    def test_attribute_access_is_never_evaluated(self) -> None:
+        """``().__class__`` would evaluate to a truthy skip; the grammar refuses it.
+
+        Attribute access is how an ``eval`` with empty builtins is escaped, so
+        the grammar check is a sandbox, not only a shape filter.
+        """
+        src = (
+            "import os, pytest\n"
+            "pytestmark = pytest.mark.skipif(\n"
+            "    not os.environ.get('U64_ALLOW_MUTATE') or ().__class__, reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == {"enable_uci"}
+
+    def test_other_requirements_are_assumed_met(self) -> None:
+        """``_HOST and not _A`` skips on an unset gate once a host is configured."""
+        src = (
+            "import os, pytest\n"
+            "_HOST = os.environ.get('U64_HOST')\n"
+            "_A = os.environ.get('U64_ALLOW_MUTATE')\n"
+            "pytestmark = pytest.mark.skipif(_HOST and not _A, reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == set()
+
     def test_read_only_module_needs_no_gate(self) -> None:
         src = "def test_x(client):\n    client.get_config_item('C', 'I')\n"
         assert self._offence(src) == set()
@@ -616,6 +825,25 @@ class TestTheTestLevelScannerCanFail:
             "def test_b(t):\n    t.set_speed(4)\n"
         )
         assert self._offenders(body) == ["test_b (set_speed)"]
+
+    def test_an_inverted_marker_does_not_cover_the_test(self) -> None:
+        body = (
+            "inverted = pytest.mark.skipif(_M == '1', reason='y')\n"
+            "@inverted\n"
+            "def test_a(t):\n    t.set_speed(4)\n"
+        )
+        assert self._offenders(body) == ["test_a (set_speed)"]
+
+    def test_an_inverted_in_body_skip_does_not_cover_the_test(self) -> None:
+        body = "def test_a(t):\n    if _M:\n        pytest.skip('x')\n    t.set_speed(4)\n"
+        assert self._offenders(body) == ["test_a (set_speed)"]
+
+    def test_an_inverted_module_pytestmark_does_not_cover_the_tests(self) -> None:
+        body = (
+            "pytestmark = pytest.mark.skipif(bool(_M), reason='y')\n"
+            "def test_a(t):\n    t.set_speed(4)\n"
+        )
+        assert self._offenders(body) == ["test_a (set_speed)"]
 
     def test_an_ungated_fixture_does_not_cover_the_test(self) -> None:
         body = (
