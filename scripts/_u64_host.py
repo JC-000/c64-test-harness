@@ -176,6 +176,9 @@ def hold_device_lock(
     ``allow_nested=True``: a script that re-enters the library while holding
     the device (e.g. ``create_manager`` inside this block) joins the hold
     instead of waiting on its own flock, which could never end (#273).
+    Nesting joins any hold in this *process*, whatever the thread, so it is
+    not for threads that outlive the block: the outer release drops the
+    flock even while a nested joiner on another thread is still inside.
 
     Fails closed, never falls back to an unlocked run: if the harness will
     not import, or the budget runs out behind another holder, the refusal

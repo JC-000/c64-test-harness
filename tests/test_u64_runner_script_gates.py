@@ -1945,10 +1945,23 @@ def _device_lock_offenders(source: str) -> list[str]:
     ``U64_DEVICE_LOCK_TIMEOUT``) and a ``hold_device_lock`` that is used but
     never imported — the ``NameError`` class that only execution sees.
 
+    A device object bound inside a locking ``with`` (``c = Ultimate64Client(...)``
+    or ``with Ultimate64Transport(...) as t``) and then referenced after the
+    block, in the same scope, is flagged too: the construction was locked but
+    the ``c.reset()`` in a trailing ``finally`` is not.
+
     Known limits: functions are matched by bare name, so two same-named
     functions share one verdict; a call through an attribute
     (``self._get()``) is not a call site. Both err towards flagging, because
-    an uncounted call site leaves the function uncovered.
+    an uncounted call site leaves the function uncovered. Three evasive
+    shapes are **missed**, by design, since the threat model is a forgotten
+    lock and not an author hiding one: ``functools.partial(Ultimate64Client,
+    h)`` called outside the lock (the constructor is an argument, not a
+    callee); ``getattr(module, "Ultimate64Client")(h)`` (the callee is not a
+    name); and a local ``def hold_device_lock`` that does not lock, which
+    also satisfies the missing-import rule. Escape tracking follows plain
+    names only: an object stored on an attribute or in a container, or
+    returned out of the block, is not followed.
     """
     tree = ast.parse(source)
     aliases = _import_aliases(tree)
@@ -2023,6 +2036,8 @@ def _device_lock_offenders(source: str) -> list[str]:
                     f"ignores U64_DEVICE_LOCK_TIMEOUT; use resolve_lock_timeout"
                 )
 
+    offenders += _escaped_device_objects(tree, aliases, parents, locking_with)
+
     uses_helper = any(
         isinstance(n, ast.Name) and n.id == "hold_device_lock" for n in ast.walk(tree)
     )
@@ -2034,6 +2049,56 @@ def _device_lock_offenders(source: str) -> list[str]:
     )
     if uses_helper and not (imports_helper or "hold_device_lock" in call_sites):
         offenders.append("hold_device_lock is used but never imported from _u64_host")
+    return offenders
+
+
+def _escaped_device_objects(tree, aliases, parents, locking_with) -> list[str]:
+    """Names bound to a device object inside a locking ``with``, used after it.
+
+    Binding shapes: ``name = <device call>`` and ``with <device call> as name``
+    anywhere in the block's body. A later reference is any ``Load`` of that
+    name in the same scope (the nearest enclosing function, else the module)
+    that starts after the block ends. Plain names only; see the scan's
+    known limits.
+    """
+    offenders: list[str] = []
+
+    def is_device_call(node: ast.AST) -> bool:
+        return isinstance(node, ast.Call) and _callee_name(node, aliases) in _DEVICE_CALLEES
+
+    for block in ast.walk(tree):
+        if not locking_with(block):
+            continue
+        bound: set[str] = set()
+        for stmt in block.body:
+            for node in ast.walk(stmt):
+                if isinstance(node, ast.Assign) and is_device_call(node.value):
+                    bound |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+                elif isinstance(node, (ast.With, ast.AsyncWith)):
+                    for item in node.items:
+                        if is_device_call(item.context_expr) and isinstance(
+                            item.optional_vars, ast.Name
+                        ):
+                            bound.add(item.optional_vars.id)
+        if not bound:
+            continue
+        scope = parents.get(block)
+        while scope is not None and not isinstance(
+            scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)
+        ):
+            scope = parents.get(scope)
+        end = block.end_lineno or block.lineno
+        for node in ast.walk(scope if scope is not None else tree):
+            if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id in bound
+                and node.lineno > end
+            ):
+                offenders.append(
+                    f"line {node.lineno}: {node.id} was built under the lock at "
+                    f"line {block.lineno} but is used after the lock is released"
+                )
     return offenders
 
 
@@ -2136,6 +2201,22 @@ def test_the_lock_scan_flags_planted_regressions() -> None:
         "helper used without its import": (
             client + "with hold_device_lock('h'):\n    Ultimate64Client(host='h')\n"
         ),
+        "device object used after the lock is released": (
+            helper + client
+            + "def main(h):\n"
+            + "    with hold_device_lock(h):\n"
+            + "        c = Ultimate64Client(host=h)\n"
+            + "        c.run_prg(b'')\n"
+            + "    c.reset()\n"
+        ),
+        "device object from `with ... as` used after the lock": (
+            helper
+            + "from c64_test_harness.backends.ultimate64 import Ultimate64Transport\n"
+            + "with hold_device_lock('h'):\n"
+            + "    with Ultimate64Transport(host='h') as t:\n"
+            + "        pass\n"
+            + "try:\n    pass\nfinally:\n    t.close()\n"
+        ),
         "a with that is not a lock": (
             client + "from contextlib import nullcontext as hold_lock\n"
             "with hold_lock():\n    Ultimate64Client(host='h')\n"
@@ -2164,6 +2245,16 @@ def test_the_lock_scan_flags_planted_regressions() -> None:
         "resolved acquire budget": (
             "from c64_test_harness.backends.device_lock import DeviceLock, resolve_lock_timeout\n"
             "DeviceLock('h').acquire(timeout=resolve_lock_timeout(None, default=120.0))\n"
+        ),
+        "device object used only inside the lock, name reused before it": (
+            helper + client
+            + "def main(h):\n"
+            + "    c = None\n"
+            + "    print(c)\n"
+            + "    with hold_device_lock(h):\n"
+            + "        c = Ultimate64Client(host=h)\n"
+            + "        c.reset()\n"
+            + "    print('done')\n"
         ),
         "nested function defined under the lock": (
             helper + client
