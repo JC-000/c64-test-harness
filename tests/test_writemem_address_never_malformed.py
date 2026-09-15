@@ -3,9 +3,10 @@
 Firmware without GideonZ/1541ultimate#884 parses ``address`` with a bare
 ``strtol(..., 16)``: unparseable input becomes ``0``, passes the range check,
 and the write lands at ``$0000`` with **HTTP 200** (measured on the C64U,
-fw 1.1.0, 2026-09-10).  The device will not help, so the harness guard is the
-only protection until the C64U runs a release carrying #884.  #251 stays open
-for that; these tests pin the guard.
+fw 1.1.0, 2026-09-10).  #884 (``bce4535e`` in the 1541ultimate tree) replaces
+that parse with a strict one answering ``400 Invalid address``, but the C64U's
+1.1.0 predates it, so there the harness guard is the only protection.  #251 is
+closed as harness-guarded (owner, 2026-09-15) on the strength of these tests.
 
 What is pinned:
 
@@ -107,6 +108,43 @@ def test_read_mem_refuses_a_malformed_address_before_any_request(client, bad):
     mock, seen = _wire()
     with patch("urllib.request.urlopen", mock), pytest.raises((ValueError, TypeError)):
         client.read_mem(bad, 1)  # type: ignore[arg-type]
+    assert seen == []
+
+
+#: The three shapes #251 is closed on: one past the top of the window, the
+#: literal string the firmware turned into ``$0000``, and a non-integral float.
+_CLOSING_VALUES = [0x10000, "0x0000", 1.5]
+
+
+@pytest.mark.parametrize("bad", _CLOSING_VALUES, ids=repr)
+@pytest.mark.parametrize("size", [0, 1, 48, 49], ids=lambda n: f"{n}B")
+def test_write_mem_refuses_the_closing_values_as_an_address_error(client, bad, size):
+    """#251 closes as harness-guarded, so the guard itself is pinned.
+
+    ``match="address"`` and the empty payload are what make this test more
+    than a restatement of the one above.  ``write_mem`` checks the address
+    *before* its ``if not data: return``; drop that check and an empty
+    write returns silently, while ``_wire_hex16`` still catches the
+    non-empty ones.  Both halves are needed to kill the mutant that
+    removes the caller-side range check.
+    """
+    mock, seen = _wire()
+    with patch("urllib.request.urlopen", mock), \
+            pytest.raises(ValueError, match="address"):
+        client.write_mem(bad, bytes(size))  # type: ignore[arg-type]
+    assert seen == []
+
+
+@pytest.mark.parametrize("bad", _CLOSING_VALUES, ids=repr)
+@pytest.mark.parametrize("length", [1, 0], ids=lambda n: f"len{n}")
+def test_read_mem_refuses_the_closing_values_as_an_address_error(client, bad, length):
+    """``length=0`` separates the address check from the length check: without
+    the address check the length error fires first and does not say
+    ``address``."""
+    mock, seen = _wire()
+    with patch("urllib.request.urlopen", mock), \
+            pytest.raises(ValueError, match="address"):
+        client.read_mem(bad, length)  # type: ignore[arg-type]
     assert seen == []
 
 
