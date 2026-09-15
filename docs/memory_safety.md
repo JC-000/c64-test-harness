@@ -175,7 +175,7 @@ the code, the code won (issue #169).
 | `$C000-$C011` | 18 | `sid_player.play_sid_vice` | 18-byte IRQ installer + wrapper stub | stub_addr= (DEFAULT_STUB_ADDR) |
 | `$C000-$C03F` | 64 | `bridge_ping.run_ping_and_wait / run_icmp_responder` | 64-byte CS8900a RX peek routine | peek_addr= |
 | `$C000-$C3FF` | 1024 | `uci_network._execute_uci_routine / build_uci_command` | UCI stub block: code $C000, data $C100 (plain routines only — turbo routines cover it), response $C200, status $C300, lengths $C3F0-$C3F3, sentinel $C3FE, error $C3FF | code_addr= for the routine; buffers hardcoded |
-| `$C100-$C348` | 585 | `bridge_ping.run_ping_and_wait / run_icmp_responder` | TX / echo-match / echo-respond routines (largest: the ARP-answering echo-respond routine of run_icmp_responder(my_mac=...), 585 bytes; 349 without my_mac) | consume_addr= |
+| `$C100-$C369` | 618 | `bridge_ping.run_ping_and_wait / run_icmp_responder` | TX / echo-match / echo-respond routines (largest: the ARP-answering echo-respond routine of run_icmp_responder(my_mac=...), 618 bytes; 369 without my_mac) | consume_addr= |
 | `$C400-$C402` | 3 | `uci_network.build_socket_write` | 16-bit inner-loop countdown (lo, hi) + Y save slot across the turbo fence | hardcoded |
 | `$C403` | 1 | `uci_network.uci_socket_write (also uci_socket_read / uci_socket_close with turbo_safe=True)` | socket-id slot for the lifted-cap write routine and the turbo read/close routines | hardcoded |
 | `$C500-$C87D` | 894 | `uci_network.uci_socket_write (also uci_tcp_connect / uci_udp_connect with turbo_safe=True)` | data buffer (up to 892 bytes) followed by the 2-byte LE length; turbo connect routines read the NUL-terminated hostname here | hardcoded |

@@ -659,6 +659,76 @@ CS8900A_RXCTL_VALUE_IP65 = 0x0D05
 #: never raised (:1060).
 CS8900A_LINECTL_ENABLE = 0x00C0
 
+#: Upper bound on ``Rdy4TxNOW`` polls at every TX site before the routine
+#: gives up with :data:`RESULT_TX_NOT_READY` (issue #236).  Before it the
+#: poll was a ``BEQ`` to itself: a chip that never asserted -- the wedge of
+#: issue #234, measured dead across exactly this many polls while every
+#: status register read healthy -- hung the 6510 with no diagnosis, and no
+#: VICE test could notice because the emulated chip is always ready.
+#:
+#: 65,536 polls is 13 CPU cycles each (``LDA abs / AND / BNE / DEY /
+#: BNE``), about 0.85 s at 1 MHz -- two orders of magnitude beyond a
+#: maximum-length 10BASE-T frame.  Under turbo it is shorter, but the U64
+#: throttles expansion-port cycles (a cartridge-I/O loop measured only 1.7x
+#: faster at 48 MHz), so roughly half a second -- inferred, not measured.
+#: The constant is the chosen bound, not a characterised chip limit.
+CS8900A_TX_READY_MAX_POLLS = 65536
+
+#: Result byte every TX builder stores when ``Rdy4TxNOW`` did not assert
+#: within :data:`CS8900A_TX_READY_MAX_POLLS` polls (issue #236): nothing was
+#: copied into the chip.  A chip that returns this is the #234 wedge until
+#: shown otherwise -- :func:`build_cs8900a_reset_code` is the remedy.
+RESULT_TX_NOT_READY = 0x04
+
+#: Upper bound on SelfCTL reads :func:`build_cs8900a_reset_code` spends
+#: waiting for the self-clearing RESET bit (issue #234).  25 CPU cycles a
+#: pass (PPPtr re-aimed every pass, as ip65 does), about 1.6 s at 1 MHz.
+CS8900A_RESET_MAX_POLLS = 65536
+
+#: Result byte :func:`build_cs8900a_reset_code` stores when RESET did not
+#: self-clear within :data:`CS8900A_RESET_MAX_POLLS` reads.  The chip is not
+#: re-initialised in that case.
+RESULT_RESET_TIMEOUT = 0x05
+
+#: PacketPage SelfCTL; bit 6 is the chip-wide, self-clearing RESET.
+PP_SELFCTL = 0x0114
+_SELFCTL_RESET = 0x40
+
+
+def _poll_budget(max_polls: int) -> tuple[int, int]:
+    """``(Y, X)`` start values so ``DEY / BNE loop / DEX / BNE loop`` runs
+    the loop body exactly *max_polls* times (1..65536; 0 encodes 256)."""
+    if isinstance(max_polls, bool) or not isinstance(max_polls, int) \
+            or not 1 <= max_polls <= 0x10000:
+        raise ValueError(f"max_polls must be 1..65536, got {max_polls!r}")
+    n = max_polls - 1
+    return ((n & 0xFF) + 1) & 0xFF, ((n >> 8) + 1) & 0xFF
+
+
+def _check_tx_frame_len(frame_len: int, what: str = "frame_len") -> None:
+    """Refuse a length the TX copy loop cannot honour (issue #238).
+
+    The loop copies two bytes a pass and compares an 8-bit ``Y`` against
+    ``frame_len & 0xFF`` while TxLength gets all 16 bits.  Measured on
+    hardware: an odd length puts one frame on the wire and then hangs the
+    6510 forever with ``SEI`` in force; an even length above 256 is a
+    silent no-op that still reports ``0x01``.
+    """
+    if isinstance(frame_len, bool) or not isinstance(frame_len, int) \
+            or frame_len % 2 or not 2 <= frame_len <= 256:
+        raise ValueError(
+            f"{what} must be even and 2..256, got {frame_len!r}: the TX copy "
+            "loop counts in an 8-bit Y two bytes at a time, so an odd length "
+            "hangs the 6510 after one frame and a longer one transmits "
+            "nothing (issue #238)"
+        )
+
+
+def _emit_result_exit(a: "Asm", value: int, result_addr: int) -> None:
+    """``LDA #value / STA result_addr / CLI / RTS``."""
+    a.emit(0xA9, value & 0xFF, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
+    a.emit(0x58, 0x60)
+
 
 def cs8900a_rxctl_inline_code(value: int = CS8900A_RXCTL_VALUE) -> bytes:
     """Clockport enable + ``RxCTL (PP 0x0104) = value``, **no RTS**.
@@ -781,31 +851,138 @@ def cs8900a_write_linectl_code(lo_value: int, hi_value: int) -> bytes:
     ])
 
 
+def build_cs8900a_reset_code(
+    load_addr: int,
+    result_addr: int,
+    *,
+    mac: bytes | None = None,
+    rxctl_value: int = CS8900A_RXCTL_VALUE,
+    max_polls: int = CS8900A_RESET_MAX_POLLS,
+) -> bytes:
+    """Reset the CS8900a through SelfCTL, wait (bounded) for it, re-initialise.
+
+    Issue #234: a chip can wedge so that ``Rdy4TxNOW`` never asserts while
+    every status register reads healthy, and the wedge survives a C64
+    reset, ``reset(scope="machine")`` and re-running
+    :func:`cs8900a_enable_inline_code`.  An explicit SelfCTL RESET plus
+    re-init cleared it (measured by the 1541ultimate lane).  This is that
+    sequence, in ip65's ``drivers/cs8900a.s`` ``reset`` order:
+
+    1. clockport enable, ``SelfCTL (PP 0x0114)`` low byte ``= $40`` (RESET;
+       the high byte is not written, as in ip65);
+    2. re-aim PPPtr at SelfCTL and read it until bit 6 self-clears, at most
+       ``max_polls`` reads;
+    3. clockport enable, ``RxCTL = rxctl_value``, the Individual Address
+       when ``mac`` is given, then ``LineCTL |= SerRxON | SerTxON``.
+
+    Stores ``0x01`` at ``result_addr`` when RESET cleared and the chip was
+    re-initialised, or :data:`RESULT_RESET_TIMEOUT` (``0x05``) when it did
+    not clear within the bound -- in which case nothing is programmed.
+    Loads at ``load_addr``; ``SEI`` on entry, ``CLI`` before ``RTS``;
+    clobbers A, X and Y.
+
+    ``0x01`` does not prove the wedge is gone.  The readiness probe #234
+    asks for is a transmit through the bounded poll afterwards:
+    :func:`build_tx_code` answers :data:`RESULT_TX_NOT_READY` instead of
+    hanging when ``Rdy4TxNOW`` stays dead.  A register-read probe cannot
+    substitute, since the wedged chip's registers all read healthy.
+
+    **Divergence from ip65, read from source, not measured.**  ip65's loop
+    (``:321-328``) is ``jsr packetpp_a1 / ldy ppdata / and #$40 / bne``:
+    it loads SelfCTL into Y but tests A, which ``packetpp_a1`` leaves at
+    ``$14``, so ``$14 & $40 = 0`` exits on the first pass and ip65 never
+    actually waits for RESET to clear.  This routine tests the byte it
+    read.  Whether real silicon reads bit 6 as set during reset, and so
+    whether this wait is ever non-zero, has not been measured; the bound
+    guarantees it cannot hang either way.  The re-init also re-enables the
+    clockport, per the INITCODE -> RESET -> INITCODE order #234 reports;
+    whether a chip reset disturbs the RR-Net clockport bit is not known.
+
+    :raises ValueError: *mac* not 6 bytes, or *max_polls* outside 1..65536.
+    """
+    if mac is not None and len(mac) != 6:
+        raise ValueError(f"MAC must be 6 bytes, got {len(mac)}")
+    poll_y, poll_x = _poll_budget(max_polls)
+    selfctl_ptr = bytes([
+        0xA9, PP_SELFCTL & 0xFF, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8,
+        0xA9, PP_SELFCTL >> 8, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8,
+    ])
+    a = Asm(org=load_addr)
+    a.emit(0x78)                                               # SEI
+    _emit_clockport_enable(a)
+    a.emit(*selfctl_ptr)
+    a.emit(0xA9, _SELFCTL_RESET, 0x8D, PPDATA_LO & 0xFF, PPDATA_LO >> 8)
+    a.emit(0xA0, poll_y, 0xA2, poll_x)                         # poll budget
+    a.label("rst_poll")
+    a.emit(*selfctl_ptr)
+    a.emit(0xAD, PPDATA_LO & 0xFF, PPDATA_LO >> 8)             # LDA SelfCTL lo
+    a.emit(0x29, _SELFCTL_RESET)                               # AND #RESET
+    a.branch(0xF0, "rst_done")                                 # BEQ -> cleared
+    a.emit(0x88)                                               # DEY
+    a.branch(0xD0, "rst_poll")
+    a.emit(0xCA)                                               # DEX
+    a.branch(0xD0, "rst_poll")
+    _emit_result_exit(a, RESULT_RESET_TIMEOUT, result_addr)
+    a.label("rst_done")
+    a.emit(*cs8900a_rxctl_inline_code(rxctl_value))
+    if mac is not None:
+        a.emit(*cs8900a_set_mac_inline_code(mac))
+    a.emit(*cs8900a_linectl_or_inline_code())
+    _emit_result_exit(a, 0x01, result_addr)
+    return a.build()
+
+
 # ---------------------------------------------------------------------------
 # 6502 code builders
 # ---------------------------------------------------------------------------
 
-def _emit_tx_frame(a: Asm, frame_buf: int, frame_len: int, prefix: str) -> None:
+def _emit_tx_frame(
+    a: Asm,
+    frame_buf: int,
+    frame_len: int,
+    prefix: str,
+    fail_label: str,
+    *,
+    max_polls: int = CS8900A_TX_READY_MAX_POLLS,
+    what: str = "frame_len",
+) -> None:
     """Emit the CS8900a TX handshake for ``frame_len`` bytes at ``frame_buf``.
 
     TxCMD = :data:`CS8900A_TXCMD_VALUE`, TxLength = ``frame_len``, PPPtr =
-    BusST (0x0138), poll ``Rdy4TxNOW``, then copy the frame into RTDATA
-    low half first through ``($FB),Y``.  This is the one TX sequence every
-    builder emits; ``prefix`` keeps the two labels unique in a routine that
-    transmits more than once (ARP request then echo request, or ARP reply
-    then echo reply -- issue #218).  ``frame_len`` must be even and at
-    most 256: the copy loop counts in Y.
+    BusST (0x0138), poll ``Rdy4TxNOW`` at most ``max_polls`` times, then
+    copy the frame into RTDATA low half first through ``($FB),Y``.  This is
+    the one TX sequence every builder emits; ``prefix`` keeps the labels
+    unique in a routine that transmits more than once (ARP request then
+    echo request, or ARP reply then echo reply -- issue #218).
+
+    If ``Rdy4TxNOW`` never asserts the routine ``JMP``\\ s to ``fail_label``
+    with nothing copied (issue #236); the caller emits the exit there,
+    conventionally storing :data:`RESULT_TX_NOT_READY`.  The poll counts in
+    ``X:Y``, so X is clobbered (Y always was, by the copy loop).
+
+    ``frame_len`` must be even and 2..256 -- the copy loop counts in Y --
+    and anything else raises :class:`ValueError` here rather than hanging
+    or no-opping on the 6510 (issue #238); ``what`` names it in the error.
     """
+    _check_tx_frame_len(frame_len, what)
+    poll_y, poll_x = _poll_budget(max_polls)
     a.emit(0xA9, CS8900A_TXCMD_VALUE & 0xFF, 0x8D, TXCMD_LO & 0xFF, TXCMD_LO >> 8)
     a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
     a.emit(0xA9, frame_len & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
     a.emit(0xA9, (frame_len >> 8) & 0xFF, 0x8D, TXLEN_HI & 0xFF, TXLEN_HI >> 8)
+    a.emit(0xA0, poll_y, 0xA2, poll_x)             # LDY #lo / LDX #hi: poll budget
     a.emit(0xA9, 0x38, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
     a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
     a.label(f"{prefix}_txw")
-    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)
-    a.emit(0x29, 0x01)
-    a.branch(0xF0, f"{prefix}_txw")
+    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)  # LDA BusST hi
+    a.emit(0x29, 0x01)                               # AND #Rdy4TxNOW
+    a.branch(0xD0, f"{prefix}_txgo")                 # BNE -> ready, copy
+    a.emit(0x88)                                     # DEY
+    a.branch(0xD0, f"{prefix}_txw")
+    a.emit(0xCA)                                     # DEX
+    a.branch(0xD0, f"{prefix}_txw")
+    a.jmp(fail_label)                                # budget spent: not ready
+    a.label(f"{prefix}_txgo")
     a.emit(0xA9, frame_buf & 0xFF, 0x85, 0xFB)
     a.emit(0xA9, (frame_buf >> 8) & 0xFF, 0x85, 0xFC)
     a.emit(0xA0, 0x00)
@@ -848,17 +1025,34 @@ def build_tx_code(
     frame_len: int,
     result_addr: int,
 ) -> bytes:
-    """Build a 6502 routine that transmits ``frame_len`` bytes from ``frame_buf``.
+    """Build a 6502 routine that hands ``frame_len`` bytes from ``frame_buf``
+    to the CS8900a for transmission.  Loads at ``load_addr``.
 
-    Writes 0x01 to ``result_addr`` on success.  Loads at ``load_addr``.
+    ``frame_len`` must be even and 2..256; anything else raises
+    :class:`ValueError` (issue #238 -- on hardware an odd length hangs the
+    6510 after one frame and a longer one silently sends nothing).
+
+    Stores one byte at ``result_addr``:
+
+    * ``0x01`` -- ``Rdy4TxNOW`` asserted and the frame was copied into
+      RTDATA.  It does **not** say the chip accepted or transmitted the
+      frame: nothing reads TxEvent or TxBidErr afterwards, so delivery must
+      be confirmed out of band, e.g. a host-side counter or capture (issue
+      #235: 3072 of these with zero packets on the wire).
+    * :data:`RESULT_TX_NOT_READY` (``0x04``) -- ``Rdy4TxNOW`` did not assert
+      within :data:`CS8900A_TX_READY_MAX_POLLS` polls and nothing was
+      copied; the chip is probably wedged (issues #234/#236), see
+      :func:`build_cs8900a_reset_code`.
     """
     a = Asm(org=load_addr)
     a.emit(0x78)  # SEI
     _emit_clockport_enable(a)
-    _emit_tx_frame(a, frame_buf, frame_len, "tx")
+    _emit_tx_frame(a, frame_buf, frame_len, "tx", "tx_fail")
     a.emit(0xA9, 0x01, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
     a.emit(0x58)
     a.emit(0x60)
+    a.label("tx_fail")
+    _emit_result_exit(a, RESULT_TX_NOT_READY, result_addr)
     return a.build()
 
 
@@ -1072,6 +1266,7 @@ def _emit_arp_responder(
     *,
     drop_label: str,
     after_reply_label: str,
+    tx_fail_label: str,
     prefix: str = "arp",
 ) -> None:
     """Answer an ARP request for ``my_ip`` sitting in ``rx_buf``; else fall through.
@@ -1088,7 +1283,8 @@ def _emit_arp_responder(
       protocol address := the sender's, ethernet src and sender hardware
       address := ``my_mac``, sender protocol address := ``my_ip``, opcode
       := 2), transmit :data:`_FIXED_RX_BYTES` bytes of it, then ``JMP
-      after_reply_label``.
+      after_reply_label`` -- or ``JMP tx_fail_label`` if ``Rdy4TxNOW``
+      never asserts (issue #236).
 
     Offsets are ip65's ``ap_*``; the received request is at the same
     offsets because the reader drains a fixed 60 bytes and an ARP frame
@@ -1148,7 +1344,7 @@ def _emit_arp_responder(
     a.emit(0xA9, ARP_OP_REPLY)
     a.emit(0x8D, (rx_buf + _ARP_OP + 1) & 0xFF, ((rx_buf + _ARP_OP + 1) >> 8) & 0xFF)
 
-    _emit_tx_frame(a, rx_buf, _FIXED_RX_BYTES, prefix)
+    _emit_tx_frame(a, rx_buf, _FIXED_RX_BYTES, prefix, tx_fail_label)
     a.jmp(after_reply_label)
 
     a.label(not_arp)
@@ -1238,6 +1434,12 @@ def build_ping_and_wait_code(
 ) -> bytes:
     """Build a 6502 routine that TXes an echo request and waits for the reply.
 
+    Stores 0x01 (reply matched), 0xFF (timeout) or
+    :data:`RESULT_TX_NOT_READY` (0x04: ``Rdy4TxNOW`` never asserted for a
+    transmit, nothing polled -- issue #236) at ``result_addr``.
+    ``tx_frame_len`` and ``arp_frame_len`` must be even and 2..256, else
+    :class:`ValueError` (issue #238).
+
     This combines :func:`build_tx_code` and :func:`build_rx_echo_reply_code`
     into a single routine, run via one ``jsr()`` call.  This is important
     because while the binary monitor is paused (between JSRs) the CS8900a
@@ -1292,8 +1494,8 @@ def build_ping_and_wait_code(
 
     # --- TX the ARP request first if asked to (issue #218), then the echo ---
     if arp is not None:
-        _emit_tx_frame(a, arp[0], arp[1], "arp")
-    _emit_tx_frame(a, tx_frame_buf, tx_frame_len, "pw")
+        _emit_tx_frame(a, arp[0], arp[1], "arp", "tx_fail", what="arp_frame_len")
+    _emit_tx_frame(a, tx_frame_buf, tx_frame_len, "pw", "tx_fail", what="tx_frame_len")
 
     # --- Now poll for the reply (same as build_rx_echo_reply_code body) ---
     a.label("reset")
@@ -1331,6 +1533,9 @@ def build_ping_and_wait_code(
     a.emit(0x58)
     a.emit(0x60)
 
+    a.label("tx_fail")
+    _emit_result_exit(a, RESULT_TX_NOT_READY, result_addr)
+
     return a.build()
 
 
@@ -1347,7 +1552,8 @@ def build_icmp_responder_code(
     Polls RX, checks for an IPv4/ICMP echo request addressed to ``my_ip``,
     transforms it in place into an echo reply (swap MAC, swap IP, set
     type=0, patch ICMP checksum), and TXes it back.  Writes 0x01 or 0xFF
-    to ``result_addr``.
+    to ``result_addr``, or :data:`RESULT_TX_NOT_READY` (0x04) when a reply
+    was due but ``Rdy4TxNOW`` never asserted (issue #236).
 
     With ``my_mac`` (issue #218) the routine also answers ARP requests for
     ``my_ip`` while it waits -- reply transmitted, then back to polling
@@ -1390,7 +1596,8 @@ def build_icmp_responder_code(
 
     if my_mac is not None:
         _emit_arp_responder(a, rx_buf, my_ip, my_mac,
-                            drop_label="drop", after_reply_label="drop")
+                            drop_label="drop", after_reply_label="drop",
+                            tx_fail_label="tx_fail")
 
     chk(12, 0x08, "drop")   # ethertype hi
     chk(13, 0x00, "drop")   # ethertype lo
@@ -1446,7 +1653,7 @@ def build_icmp_responder_code(
     a.label("ck_done")
 
     # Wait for TxRdy, then transmit fixed _FIXED_RX_BYTES from rx_buf
-    _emit_tx_frame(a, rx_buf, _FIXED_RX_BYTES, "reply")
+    _emit_tx_frame(a, rx_buf, _FIXED_RX_BYTES, "reply", "tx_fail")
 
     a.emit(0xA9, 0x01, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
     a.emit(0x58)
@@ -1456,6 +1663,9 @@ def build_icmp_responder_code(
     a.emit(0xA9, 0xFF, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
     a.emit(0x58)
     a.emit(0x60)
+
+    a.label("tx_fail")
+    _emit_result_exit(a, RESULT_TX_NOT_READY, result_addr)
 
     return a.build()
 
@@ -1641,6 +1851,8 @@ def build_read_and_respond_echo_request_code(
       request for ``my_ip`` and a reply was transmitted; host should
       re-poll.  Only with ``my_mac`` (issue #218); without it ARP is a
       non-match and the output is byte-identical to the pre-#218 routine.
+    * :data:`RESULT_TX_NOT_READY` (``0x04``) -- a reply was due but
+      ``Rdy4TxNOW`` never asserted, so nothing was transmitted (issue #236).
     """
     assert len(my_ip) == 4
     _check_my_mac(my_mac)
@@ -1659,7 +1871,8 @@ def build_read_and_respond_echo_request_code(
 
     if my_mac is not None:
         _emit_arp_responder(a, rx_buf, my_ip, my_mac,
-                            drop_label="rrm", after_reply_label="rr_arp_done")
+                            drop_label="rrm", after_reply_label="rr_arp_done",
+                            tx_fail_label="tx_fail")
 
     chk(12, 0x08, "rrm_tramp")
     chk(13, 0x00, "rrm_tramp")
@@ -1711,7 +1924,7 @@ def build_read_and_respond_echo_request_code(
     a.label("_ck2_done")
 
     # Wait for TxRdy then TX _FIXED_RX_BYTES from rx_buf
-    _emit_tx_frame(a, rx_buf, _FIXED_RX_BYTES, "reply")
+    _emit_tx_frame(a, rx_buf, _FIXED_RX_BYTES, "reply", "tx_fail")
 
     a.emit(0xA9, 0x01, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
     a.emit(0x58)
@@ -1727,6 +1940,9 @@ def build_read_and_respond_echo_request_code(
         a.emit(0xA9, RESULT_ARP_REPLY_SENT, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
         a.emit(0x58)
         a.emit(0x60)
+
+    a.label("tx_fail")
+    _emit_result_exit(a, RESULT_TX_NOT_READY, result_addr)
 
     return a.build()
 
@@ -1758,7 +1974,10 @@ def run_ping_and_wait(
     Loads a TX routine, transmits ``tx_frame``, then loops:
     ``poll_until_ready`` -> ``read_and_match_echo_reply`` -> on mismatch,
     re-poll; on match, return ``0x01``; on wall-clock timeout, return
-    ``0xFF``.
+    ``0xFF``.  A transmit whose ``Rdy4TxNOW`` never asserts returns
+    :data:`RESULT_TX_NOT_READY` (``0x04``) at once (issue #236); a
+    ``tx_frame`` that is odd-length or longer than 256 bytes raises
+    :class:`ValueError` (issue #238).
 
     With ``arp=True`` (the default; issue #218) an ARP request for the
     echo's destination IP -- built from ``tx_frame``'s own source MAC,
@@ -1863,7 +2082,8 @@ def run_icmp_responder(
 
     Loops: ``poll_until_ready`` -> ``read_and_respond_echo_request`` ->
     on mismatch, re-poll; on success, return ``0x01``; on wall-clock
-    timeout, return ``0xFF``.
+    timeout, return ``0xFF``; a reply whose ``Rdy4TxNOW`` never asserts
+    returns :data:`RESULT_TX_NOT_READY` (``0x04``) (issue #236).
 
     With ``my_mac`` (issue #218) ARP requests for ``my_ip`` are answered
     while waiting (the consume routine reports
@@ -2241,12 +2461,15 @@ def build_ping_and_wait_tod_code(
        identifier, sequence (all big-endian on the wire).
     6. On match, store 0x01 at ``result_addr``.  On mismatch, drop the
        frame and re-poll against the same TOD deadline.  On TOD expiry,
-       store 0xFF.
+       store 0xFF.  If ``Rdy4TxNOW`` never asserts for either transmit
+       (bounded, issue #236), store :data:`RESULT_TX_NOT_READY` (0x04)
+       without polling.
 
     Args:
         load_addr: Where the routine will live.
         tx_frame_buf: Address of the pre-built echo request frame.
-        tx_frame_len: Frame length in bytes (<= 256).
+        tx_frame_len: Frame length in bytes: even and 2..256, else
+            :class:`ValueError` (issue #238).
         rx_buf: RX buffer, at least 64 bytes.
         result_addr: 1-byte status slot (0x01 success, 0xFF timeout).
         identifier: Expected ICMP identifier (16-bit).
@@ -2262,8 +2485,9 @@ def build_ping_and_wait_tod_code(
             be queued; ``n > 0`` = queue emptied after ``8 - n`` skips).
 
     Raises:
-        ValueError: if ``deadline_tenths`` is out of range, or
-            ``arp_frame_len`` is given without ``arp_frame_buf``.
+        ValueError: if ``deadline_tenths`` is out of range,
+            ``arp_frame_len`` is given without ``arp_frame_buf``, or
+            either frame length is odd or outside 2..256 (issue #238).
     """
     _validate_deadline_tenths(deadline_tenths)
     arp = _resolve_arp_frame(arp_frame_buf, arp_frame_len)
@@ -2285,8 +2509,8 @@ def build_ping_and_wait_tod_code(
 
     # --- TX the ARP request first if asked to (issue #218), then the echo ---
     if arp is not None:
-        _emit_tx_frame(a, arp[0], arp[1], "arp")
-    _emit_tx_frame(a, tx_frame_buf, tx_frame_len, "pw")
+        _emit_tx_frame(a, arp[0], arp[1], "arp", "tx_fail", what="arp_frame_len")
+    _emit_tx_frame(a, tx_frame_buf, tx_frame_len, "pw", "tx_fail", what="tx_frame_len")
 
     # --- Poll for reply with TOD deadline ---
     a.emit(0xA9, 0x24, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
@@ -2324,6 +2548,9 @@ def build_ping_and_wait_tod_code(
     a.emit(0xA9, 0x24, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
     a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
     a.jmp("poll_top")
+
+    a.label("tx_fail")
+    _emit_result_exit(a, RESULT_TX_NOT_READY, result_addr)
 
     a.label("success")
     a.emit(0xA9, 0x01, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
@@ -2364,7 +2591,10 @@ def build_icmp_responder_tod_code(
     CIA1 Time-of-Day for the poll deadline.
 
     Writes ``0x01`` at ``result_addr`` on successful reply TX, ``0xFF``
-    on TOD expiry.  Non-matching frames are drained and polling
+    on TOD expiry, :data:`RESULT_TX_NOT_READY` (``0x04``) when a reply was
+    due but ``Rdy4TxNOW`` never asserted (issue #236; the ``0x01`` means
+    the frame was handed to the chip, not that it reached the wire -- issue
+    #235).  Non-matching frames are drained and polling
     continues against the same deadline.  With ``my_mac`` (issue #218)
     ARP requests for ``my_ip`` are answered along the way, against the
     same deadline; see :func:`build_icmp_responder_code`.
@@ -2416,7 +2646,8 @@ def build_icmp_responder_tod_code(
 
     if my_mac is not None:
         _emit_arp_responder(a, rx_buf, my_ip, my_mac,
-                            drop_label="drop", after_reply_label="drop")
+                            drop_label="drop", after_reply_label="drop",
+                            tx_fail_label="tx_fail")
 
     chk(12, 0x08, "drop")
     chk(13, 0x00, "drop")
@@ -2471,7 +2702,7 @@ def build_icmp_responder_tod_code(
     a.label("ck_done")
 
     # Wait TxRdy then TX _FIXED_RX_BYTES from rx_buf
-    _emit_tx_frame(a, rx_buf, _FIXED_RX_BYTES, "reply")
+    _emit_tx_frame(a, rx_buf, _FIXED_RX_BYTES, "reply", "tx_fail")
 
     a.emit(0xA9, 0x01, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
     a.emit(0x58)
@@ -2481,6 +2712,9 @@ def build_icmp_responder_tod_code(
     a.emit(0xA9, 0xFF, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
     a.emit(0x58)
     a.emit(0x60)
+
+    a.label("tx_fail")
+    _emit_result_exit(a, RESULT_TX_NOT_READY, result_addr)
 
     _emit_tod_sec_table(a, "sec_tab")
     _emit_tod_ones_table(a, "ones_tab")
