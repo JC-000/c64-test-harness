@@ -207,7 +207,9 @@ _ERROR_ADDR    = 0xC3FF   # error flag
 
 #: Room in the status buffer: ``$C300`` up to the next field (``$C3F0``).
 #: The firmware may send up to ``CMD_MAX_STATUS_LEN`` = 256 status bytes
-#: (``software/io/command_interface/command_intf.h:58``), more than fits,
+#: (``software/io/command_interface/command_intf.h:58`` at tag ``1.1.0``,
+#: 7b628eb1; ``:59`` at ``7f6fcb51``/v3.15-85, also defined in
+#: ``command_target.h:57`` there), more than fits,
 #: so both the 6502 drain and :func:`_read_status_string` clamp here
 #: (issue #281).
 _STATUS_BUF_LEN = _RESP_LEN_ADDR - _STATUS_ADDR

@@ -216,6 +216,33 @@ class TestTheDrain:
         assert cpu.consumed == n and not cpu.queue
 
 
+class TestTheMaxLenGuard:
+    """``max_len`` outside 1..255 must be refused, not emitted.
+
+    At 0 the drain's ``CPY #0 / BEQ loop`` stores nothing and records
+    length 0 -- a silent empty status.  At 256 the operand does not fit a
+    byte.  Both are rejected at build time.
+    """
+
+    @pytest.mark.parametrize("bad", [0, 256])
+    def test_plain_rejects(self, bad: int) -> None:
+        with pytest.raises(ValueError):
+            _build_read_status(_STATUS_ADDR, _STAT_LEN_ADDR, max_len=bad)
+
+    @pytest.mark.parametrize("bad", [0, 256])
+    def test_turbo_rejects(self, bad: int) -> None:
+        with pytest.raises(ValueError):
+            _build_read_status_tsx(FRAGMENT_ADDR, _STATUS_ADDR,
+                                   _STAT_LEN_ADDR, max_len=bad)
+
+    @pytest.mark.parametrize("good", [1, 255])
+    def test_edges_are_accepted(self, good: int) -> None:
+        """Positive control: the guard is not simply refusing everything."""
+        _build_read_status(_STATUS_ADDR, _STAT_LEN_ADDR, max_len=good)
+        _build_read_status_tsx(FRAGMENT_ADDR, _STATUS_ADDR,
+                               _STAT_LEN_ADDR, max_len=good)
+
+
 class TestTheFencedDrainHasTheSameBound:
     """The fenced turbo variant runs in this interpreter, but its fence
     zeroes Y on every pass (issue #298), so behavioural results for it
