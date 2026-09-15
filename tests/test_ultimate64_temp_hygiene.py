@@ -123,21 +123,29 @@ def test_arming_is_not_keyed_on_the_device_address():
 
 
 def test_transport_write_memory_above_threshold_is_accounted():
-    """The raw transport large-write path leaks and must be counted.
+    """The raw client large-write path leaks and must be counted; the
+    transport no longer reaches it on a leak-prone grade (#252).
 
-    ``Ultimate64Transport.write_memory`` does not chunk: above the
-    threshold it hands the whole payload to ``client.write_mem``, which
-    takes the body-POST path. A consumer doing hundreds of such writes
-    in one run is a wedge with no ``run_prg`` anywhere in it.
+    ``client.write_mem`` above the threshold takes the body-POST path, and
+    that attachment is counted. ``Ultimate64Transport.write_memory`` now
+    chunks at the threshold on a device not graded post-safe, so the same
+    256 bytes arrive as two leak-free PUTs and cost nothing.
     """
     from c64_test_harness.backends.ultimate64 import Ultimate64Transport
 
     c = _client(LEAKY)
+    mock, captured = _urlopen_mock()
+    with patch("urllib.request.urlopen", mock):
+        c.write_mem(0xC000, b"x" * 256)
+    assert c.pending_temp_attachments == 1
+
+    c = _client(LEAKY)
     t = Ultimate64Transport(host="fake-host", client=c)
-    mock, _ = _urlopen_mock()
+    mock, captured = _urlopen_mock()
     with patch("urllib.request.urlopen", mock):
         t.write_memory(0xC000, b"x" * 256)
-    assert c.pending_temp_attachments == 1
+    assert [r.get_method() for r in captured] == ["PUT", "PUT"]
+    assert c.pending_temp_attachments == 0
 
 
 def test_uci_socket_write_shape_is_accounted_per_attachment():

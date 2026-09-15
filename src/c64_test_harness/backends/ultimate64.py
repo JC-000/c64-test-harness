@@ -49,6 +49,11 @@ _SOCKET_DMA_DRAIN_FLOOR_BPS = 4096.0
 #: The 6510's I/O window.  A DMAWRITE that touches it is a register write
 #: with side effects, so the fast path never re-sends such a span after a
 #: failure (issue #223 review).
+#: Firmware cap on the ``PUT /v1/machine:writemem?data=`` payload, in bytes
+#: ("Maximum length of 128 bytes exceeded").  Chunks sent to avoid the
+#: leaking POST form must fit under it.
+_PUT_DATA_CAP = 128
+
 _IO_WINDOW_START = 0xD000
 _IO_WINDOW_END = 0xDFFF
 
@@ -151,10 +156,37 @@ class Ultimate64Transport(HardwareTransportBase):
 
         Routes through ``self.memory_policy.check_write`` before any byte
         crosses the wire — a violating write raises
-        :class:`MemoryPolicyError`.  Pass ``override="<reason>"`` to
+        :class:`MemoryPolicyError`.  The check covers the **whole** write,
+        once, before any chunk is sent.  Pass ``override="<reason>"`` to
         bypass for a single call (logged at WARNING).  The default
         policy is permissive, so existing callers see no behaviour
         change.
+
+        **Chunking on leak-prone devices (#252).**  On firmware without
+        the Temp-folder collector (upstream #686) every REST ``POST``
+        ``writemem`` leaves an uncollected ``/Temp`` attachment, and
+        enough of them crash the device firmware.  So unless the client's
+        cached grade says ``writemem_post_safe is True``, the REST path
+        splits the write into pieces of at most
+        :attr:`rest_put_chunk_size` bytes, each of which takes the
+        leak-free ``PUT ?data=`` form.  *Unknown counts as leak-prone*:
+        a client that was never probed (constructed with an explicit
+        ``write_mem_query_threshold``), a failed probe, and a hand-built
+        ``writemem_post_safe=None`` all chunk.  The grade is read from the
+        client's cache only — this method never issues a probe of its own.
+
+        A device graded post-safe keeps the single-request path unchanged.
+
+        **Accepted cost:** on a leak-prone device a large write is no
+        longer one DMA transaction.  The 6510 keeps running between
+        chunks, so a program executing under the write can observe a
+        partially written region.  There is no pause/resume bracket;
+        pause the machine yourself if that matters.  It also costs one
+        HTTP round trip per chunk (a 16 KiB write is ~128 requests).
+
+        The SocketDMA fast path, when enabled and eligible, is tried
+        first on the whole payload and is not chunked here; a write that
+        falls back from it to REST is chunked like any other.
         """
         if isinstance(data, list):
             data = bytes(data)
@@ -170,7 +202,48 @@ class Ultimate64Transport(HardwareTransportBase):
             and self._socket_dma_write(addr, bytes(data))
         ):
             return
-        self._client.write_mem(addr, data)
+        if self._rest_write_is_post_safe():
+            self._client.write_mem(addr, data)
+            return
+        chunk = self.rest_put_chunk_size
+        payload = bytes(data)
+        for offset in range(0, len(payload), chunk):
+            self._client.write_mem(addr + offset, payload[offset:offset + chunk])
+
+    def _rest_write_is_post_safe(self) -> bool:
+        """Whether this client's *cached* grade says POST ``writemem`` is safe.
+
+        Reads ``_capabilities`` rather than the probing ``capabilities``
+        property so a write never triggers HTTP of its own.  Anything but
+        an explicit ``True`` — no cache, a failed probe, ``None`` — is
+        treated as leak-prone.
+        """
+        caps = getattr(self._client, "_capabilities", None)
+        return getattr(caps, "writemem_post_safe", None) is True
+
+    @property
+    def rest_put_chunk_size(self) -> int:
+        """Largest REST write that takes the leak-free ``PUT ?data=`` form.
+
+        ``client.write_mem_query_threshold`` (``write_mem`` uses PUT at or
+        below it, inclusive), capped at the firmware's 128-byte ``data=``
+        limit so that a nonsensical explicit threshold cannot turn chunks
+        into rejected PUTs.  A client exposing no integer threshold (a
+        test double) gets the cap.  Used by :meth:`write_memory` on
+        leak-prone devices and by :func:`c64_test_harness.memory.write_bytes`.
+
+        :raises ValueError: if the threshold is not positive — every
+            write would then be a POST and no chunk size avoids that.
+        """
+        threshold = getattr(self._client, "write_mem_query_threshold", None)
+        if not isinstance(threshold, int) or isinstance(threshold, bool):
+            return _PUT_DATA_CAP
+        if threshold <= 0:
+            raise ValueError(
+                f"write_mem_query_threshold must be positive to chunk onto "
+                f"the PUT path, got {threshold}"
+            )
+        return min(threshold, _PUT_DATA_CAP)
 
     def _ensure_socket_dma_client(self) -> SocketDMAClient:
         """Return the lazily-created, connection-reusing SocketDMA client.

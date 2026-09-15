@@ -184,13 +184,16 @@ def test_post_threshold_is_a_pure_function_of_writemem_post_safe():
     higher PUT threshold. A new device generation hits that path first,
     before anyone has written its version rule.
 
-    Why the coupling is load-bearing: ``memory.write_bytes`` chunks at a
-    fixed 84 bytes -- under 128 but *over* 48 -- so on fixed firmware
-    every chunk takes the POST path. That is safe only because the 48
-    threshold is *selected by* ``writemem_post_safe`` being true, i.e.
-    those POSTs land exactly on the firmware that collects them. Sever
-    the coupling and ``write_bytes`` becomes a leak generator at 84 bytes
-    a chunk.
+    Why the coupling used to be load-bearing: ``memory.write_bytes``
+    chunked at a fixed 84 bytes -- under 128 but *over* 48 -- so on fixed
+    firmware every chunk took the POST path, safe only because the 48
+    threshold is *selected by* ``writemem_post_safe``. Since #252 an
+    Ultimate transport chunks ``write_bytes`` at its own threshold, so
+    every chunk is a PUT on any grade
+    (``tests/test_u64_leak_prone_write_chunking.py``); 84 survives only
+    for transports with no REST threshold (VICE). The three legs are still
+    pinned because ``Ultimate64Transport.write_memory`` keys its
+    single-request path on the same grade.
     """
     from c64_test_harness.backends.u64_capabilities import (
         THRESHOLD_POST_RISKY,

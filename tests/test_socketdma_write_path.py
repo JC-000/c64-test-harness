@@ -88,6 +88,11 @@ def mock_client() -> MagicMock:
     client.host = "192.0.2.1"
     client.password = None
     client.read_mem.return_value = b""
+    # Graded post-safe so the REST fallback stays one request (#252: a
+    # leak-prone or unknown grade chunks it; see
+    # test_rest_fallback_on_leak_prone_grade_is_chunked).
+    client._capabilities.writemem_post_safe = True
+    client.write_mem_query_threshold = 48
     return client
 
 
@@ -261,6 +266,26 @@ def test_connect_failure_falls_back_and_latches(
     t.write_memory(0x5000, data)
     mock_client.write_mem.assert_called_once_with(0x5000, data)
     assert fake.enter_count == 1  # no second connect attempt
+
+
+def test_rest_fallback_on_leak_prone_grade_is_chunked(
+    mock_client: MagicMock, install_fake
+) -> None:
+    """#252: a SocketDMA write that falls back to REST on a device not
+    graded post-safe is chunked at the threshold, not sent as one POST."""
+    fake, _ = install_fake
+    fake.connect_error = True
+    mock_client._capabilities.writemem_post_safe = False
+    mock_client.write_mem_query_threshold = 128
+    data = _payload(8192)
+    t = Ultimate64Transport(host="h", client=mock_client, socket_dma=True)
+
+    t.write_memory(0x4000, data)
+    calls = mock_client.write_mem.call_args_list
+    assert len(calls) == 64
+    assert all(len(c.args[1]) == 128 for c in calls)
+    assert b"".join(c.args[1] for c in calls) == data
+    assert [c.args[0] for c in calls] == [0x4000 + 128 * i for i in range(64)]
 
 
 def test_send_failure_falls_back_no_latch(
