@@ -388,7 +388,15 @@ requests to the other. So:
   zero a count the attachment is about to land into. A successful sweep
   therefore resets the count to the still-in-flight reservations rather
   than to zero, and whatever a reservation never sent is refunded when it
-  ends.
+  ends. **The carry is approximate in one direction, and deliberately so:**
+  if a sweep lands after the attachment has been written but before the
+  reservation ends, `collected()` carries a reservation whose attachment
+  that sweep already collected, and the count reads one higher than the
+  device holds. That is the conservative direction — the cost is an extra
+  hygiene pass nobody needed, never an uncounted attachment — but it means
+  `pending_temp_attachments` is an **upper bound** on what the device
+  holds, not a reading of the device. Do not treat it as device truth; the
+  FTP listing is the only thing that is.
 - **A leak outlives its client.** Release callbacks hold nothing strongly,
   so before the ledger a client that leaked and was garbage-collected
   before the lock release never drained. The ledger outlives its clients:

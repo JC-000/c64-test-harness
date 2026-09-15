@@ -731,3 +731,52 @@ def test_the_release_drain_prefers_the_client_that_leaked(host, tmp_path, caplog
         assert leaker._temp_hygiene_blocked is not None
         assert not any("inherited sweep" in r.getMessage() for r in caplog.records)
     assert idle.pending_temp_attachments == 1
+
+
+# --------------------------------------------------------------------------- #
+# reviewer-6's round-1 probes, adopted verbatim (PR #435 re-check)            #
+#                                                                             #
+# Both cover consequences of the round-1 fixes that my own tests missed: the  #
+# own-share refund's stated purpose (it gates the config write), and the      #
+# armed half of the in-flight carry (whose failure direction is an            #
+# under-sweep -- a real attachment left on a leak-prone device).  Only the    #
+# ``r6_helpers`` import and the probes' own ``_clean`` fixture are dropped;   #
+# this module's autouse fixture already does exactly that work.               #
+# --------------------------------------------------------------------------- #
+
+def test_N5_consequence_unsent_probe_must_not_authorise_a_config_write():
+    """The commit justifies the own-share refund by the config write it gates:
+    a probe that sent nothing must not leave the client looking like a leaker."""
+    a = _client("n5dev", temp_gc_budget=6)
+    with patch("c64_test_harness.backends.ultimate64_probe.probe_u64",
+               return_value=type("R", (), {"reachable": False, "error": "x"})()):
+        a.liveness_probe()
+    assert a._own_pending_temp_attachments() == 0
+    with _FTP(default=REFUSED), _no_config_writes() as si, _lock_held(True):
+        a.close()
+    assert si.call_count == 0, f"unsent probe authorised a config write: {si.call_args_list}"
+
+
+def test_N2_armed_carry_decides_whether_an_orphaned_attachment_is_swept(tmp_path):
+    """An armed client's reservation is in flight when another client's sweep
+    lands. The carry must remember an ARMED client counted it, or the orphan
+    drain skips a real attachment after that client is collected."""
+    h = "n2dev"
+    a = _client(h, temp_gc_budget=100); b = _client(h, temp_gc_budget=100)
+    reserved, go = threading.Event(), threading.Event()
+    real = Ultimate64Client._request_uncounted
+    def slow(self, *ar, **kw):
+        if self is a:
+            reserved.set(); go.wait(5)
+        return real(self, *ar, **kw)
+    with _FTP() as ftp, patch.object(Ultimate64Client, "_request_uncounted", slow), _lock_held(True):
+        t = threading.Thread(target=a.run_prg, args=(PRG,)); t.start()
+        assert reserved.wait(5)
+        b.close()                      # sweep lands mid-flight; carry keeps the reservation
+        go.set(); t.join()
+        assert a.pending_temp_attachments == 1
+        del a, b, t, slow, real
+        _pygc.collect()
+        ftp.hosts.clear()
+        _release_lock(h, tmp_path)     # no live client: orphan drain must sweep
+    assert ftp.hosts == [h], "orphaned armed attachment was not swept"
