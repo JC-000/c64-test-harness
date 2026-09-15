@@ -89,6 +89,7 @@ from .backends.ultimate64_client import (
 from .backends.ultimate64_helpers import (
     get_turbo_mhz,
     set_turbo_mhz,
+    restore_speed_defaults,
     get_turbo_enabled,
     get_reu_config,
     set_reu,
@@ -539,6 +540,7 @@ __all__ = [
     # Ultimate 64 helpers
     "get_turbo_mhz",
     "set_turbo_mhz",
+    "restore_speed_defaults",
     "get_turbo_enabled",
     "get_reu_config",
     "set_reu",

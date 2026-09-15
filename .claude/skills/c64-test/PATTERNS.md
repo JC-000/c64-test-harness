@@ -966,7 +966,7 @@ import os, pytest
 from c64_test_harness import DeviceLock, apply_factory_baseline
 from c64_test_harness.backends.ultimate64 import Ultimate64Transport
 from c64_test_harness.backends.ultimate64_helpers import (
-    check_measurement_environment, set_turbo_mhz,
+    check_measurement_environment, restore_speed_defaults, set_turbo_mhz,
 )
 
 _HOST = os.environ.get("U64_HOST")
@@ -1002,7 +1002,10 @@ def transport():
         # known device is *its own* step 1 — this block does not run on SIGKILL.
         if t is not None:
             try:
-                set_turbo_mhz(t.client, 1)
+                # Both speed items back to the firmware default (#365). Not
+                # set_turbo_mhz(t.client, 1): that runs at 1 MHz but writes
+                # Turbo Control = Manual, which is != default.
+                restore_speed_defaults(t.client)
             except Exception:
                 pass
             t.close()
@@ -1132,8 +1135,11 @@ client.stream_debug_start("239.0.1.66:11002")
 # statistics; useless for exact call graphs, cycle counts, or sequential
 # bus-state analysis.
 
-# RIGHT: drop to 1 MHz for the capture window when you need completeness
-set_turbo_mhz(client, 1)
+# RIGHT: drop to 1 MHz for the capture window when you need completeness.
+# restore_speed_defaults writes CPU Speed and Turbo Control back to the
+# firmware defaults (1 MHz, turbo Off on a factory-default device);
+# set_turbo_mhz(client, 1) also runs at 1 MHz but leaves Turbo Control = Manual.
+restore_speed_defaults(client)
 cap.start()
 client.stream_debug_start("239.0.1.66:11002")
 # ... run the target routine ... (it runs 48x slower — budget accordingly)
@@ -1667,18 +1673,19 @@ except FlakeyReadError as e:
 ```python
 from c64_test_harness.backends.ultimate64_helpers import (
     check_measurement_environment,
-    set_turbo_mhz,
+    restore_speed_defaults,
 )
 
 # Guard — raises if a prior session left turbo on:
 check_measurement_environment(client)
 
-# If you want to enforce 1 MHz explicitly (e.g., after reset()):
-set_turbo_mhz(client, 1)
+# If you want to enforce 1 MHz explicitly (e.g., after reset()): both speed
+# items back to the firmware default, turbo Off on a factory-default device.
+restore_speed_defaults(client)
 check_measurement_environment(client)  # now guaranteed clean
 ```
 
-`check_measurement_environment` calls `get_turbo_mhz()` internally and raises `Ultimate64MeasurementEnvironmentError` (a subclass of `Ultimate64Error`) with a message naming the actual MHz and pointing at `set_turbo_mhz(client, 1)` as the fix. See GitHub issue #102.
+`check_measurement_environment` calls `get_turbo_mhz()` internally and raises `Ultimate64MeasurementEnvironmentError` (a subclass of `Ultimate64Error`) with a message naming the actual MHz and pointing at `restore_speed_defaults(client)` as the fix (`set_turbo_mhz(client, 1)` also runs at 1 MHz but writes `Turbo Control = Manual`, which is off its default — #365). See GitHub issue #102.
 
 ---
 

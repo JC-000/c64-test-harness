@@ -272,21 +272,36 @@ class TestTodPrimitiveU64Live:
 
     @pytest.fixture(scope="class")
     def u64_client(self):
-        """Acquire DeviceLock + Ultimate64Client; skip if unavailable."""
+        """Acquire DeviceLock + Ultimate64Client; skip if unavailable.
+
+        ``test_tod_runs_at_wall_clock`` sweeps turbo up to 48 MHz, so on the
+        way out ``CPU Speed`` and ``Turbo Control`` go back to the device's
+        defaults (#365 -- this fixture used to restore nothing).  The restore
+        runs before the lock is released, and the release runs even when the
+        restore raises; a failed restore is raised, not swallowed.
+        """
         from c64_test_harness.backends.device_lock import DeviceLock
         from c64_test_harness.backends.ultimate64 import Ultimate64Transport
         from c64_test_harness.backends.ultimate64_client import Ultimate64Client
+        from c64_test_harness.backends.ultimate64_helpers import (
+            restore_speed_defaults,
+        )
 
         lock = DeviceLock(_U64_HOST)
         if not lock.acquire(timeout=120.0):
             pytest.skip(f"Could not acquire device lock for {_U64_HOST}")
+        client = None
         try:
             pw = os.environ.get("U64_PASSWORD")
             client = Ultimate64Client(host=_U64_HOST, password=pw, timeout=10.0)
             transport = Ultimate64Transport(host=_U64_HOST, password=pw, client=client)
             yield client, transport
         finally:
-            lock.release()
+            try:
+                if client is not None:
+                    restore_speed_defaults(client)
+            finally:
+                lock.release()
 
     @staticmethod
     def _make_idle_prg() -> bytes:

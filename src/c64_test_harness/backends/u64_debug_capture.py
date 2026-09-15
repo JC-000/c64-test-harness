@@ -18,8 +18,10 @@ the source. See ``tests/test_u64_debug_stream_speed_live.py`` for
 the measurement.
 
 **Practical implication**: if your test needs a complete trace
-(call-graph, exact cycle count, bus-state transitions), set
-``set_turbo_mhz(client, 1)`` for the capture window. If you only need
+(call-graph, exact cycle count, bus-state transitions), drop to 1 MHz
+for the capture window with ``restore_speed_defaults(client)`` (both speed
+items back to the firmware default; ``set_turbo_mhz(client, 1)`` also runs at
+1 MHz but leaves ``Turbo Control = Manual``, off its default -- #365). If you only need
 aggregate statistics (PC distribution, frequency maps), turbo-speed
 capture is fine because the sampling is uniform.
 
