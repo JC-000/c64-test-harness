@@ -1182,7 +1182,7 @@ All address arguments default to the `$C000` UCI block (`code_addr=0xC000`, data
 - `build_get_ip(result_addr=0xC200, ..., turbo_safe=False) -> bytes`
 - `build_tcp_connect(host_addr=None, port=80, result_addr=0xC200, ..., turbo_safe=False) -> bytes` — `host_addr` holds the NUL-terminated hostname; `None` resolves to `$C100` for a plain routine and `$C500` for a turbo one (a turbo routine covers `$C100`); an explicit address inside the emitted routine raises `ValueError` (#322)
 - `build_udp_connect(host_addr=None, port=53, ..., turbo_safe=False) -> bytes` — `host_addr` as for `build_tcp_connect`
-- `build_socket_write(socket_id_addr=0xC100, data_addr=0xC101, data_len_addr=0xC1FF, status_addr=0xC300, ..., turbo_safe=False) -> bytes`
+- `build_socket_write(socket_id_addr=None, data_addr=None, data_len_addr=None, status_addr=0xC300, ..., turbo_safe=False) -> bytes` — `None` resolves to `$C100` / `$C101` / `$C1FF` for a plain routine and `$C403` / `$C500` / `$C87C` for a turbo one; an explicit socket id, data start or either length byte inside the emitted routine raises `ValueError` (#346)
 - `build_socket_read(socket_id_addr=None, result_addr=0xC200, max_len=255, actual_len_addr=0xC3F0, ..., turbo_safe=False) -> bytes` — `None` resolves to `$C100` for a plain routine and `$C403` for a turbo one; an explicit address inside the emitted routine raises `ValueError` (#322)
 - `build_socket_close(socket_id_addr=None, ..., turbo_safe=False) -> bytes` — `socket_id_addr` as for `build_socket_read`
 
