@@ -202,6 +202,18 @@ class DeviceCapabilities:
 
     Every capability is tri-state: ``True`` present, ``False`` absent,
     ``None`` not determinable from the version alone.
+
+    **``writemem_post_safe`` is the exception, and its ``None`` is explicit
+    (#247).**  :meth:`from_info` always grades it ``True`` or ``False`` --
+    an unreadable version grades ``False`` -- so ``None`` never comes from
+    probing.  It is still a legal value, because a caller may build or
+    ``replace`` an instance to mean "unknown, do not assume" (the transport
+    and hygiene tests do), and every consumer resolves it to the leak-prone
+    side: :attr:`write_mem_query_threshold` gives 128, and
+    ``Ultimate64Transport`` chunks onto PUT unless the grade ``is True``.
+    Anything other than ``True``, ``False`` or ``None`` is rejected with
+    ``TypeError`` on construction: a truthy non-bool such as ``"no"`` or
+    ``1`` used to grade post-safe.
     """
 
     firmware_version: str | None
@@ -211,6 +223,7 @@ class DeviceCapabilities:
 
     #: POST ``/v1/machine:writemem`` does not accumulate Temp-folder entries
     #: (upstream #686). When False, small payloads must take the PUT path.
+    #: ``None`` only when hand-built; see the class docstring (#247).
     writemem_post_safe: bool | None
     #: The runner subsystem can wedge under write load (the inverse of above).
     runner_wedge_possible: bool | None
@@ -220,6 +233,14 @@ class DeviceCapabilities:
     uci_sockets_close_on_reset: bool | None
     #: ``GET /v1/machine:readmem?length=0`` answers 400 rather than 200.
     readmem_rejects_zero_length: bool | None
+
+    def __post_init__(self) -> None:
+        grade = self.writemem_post_safe
+        if grade is not None and type(grade) is not bool:
+            raise TypeError(
+                "writemem_post_safe must be True, False or None (unknown, "
+                f"treated as leak-prone); got {grade!r} (#247)"
+            )
 
     @classmethod
     def from_info(
@@ -338,9 +359,12 @@ class DeviceCapabilities:
     @property
     def write_mem_query_threshold(self) -> int:
         """Payload size at which ``write_mem`` switches from PUT to POST."""
+        # ``is True``, not truthiness: only an explicit True reaches 48, the
+        # same test ``Ultimate64Transport`` applies before its single-request
+        # path (#247).
         return (
             THRESHOLD_POST_SAFE
-            if self.writemem_post_safe
+            if self.writemem_post_safe is True
             else THRESHOLD_POST_RISKY
         )
 

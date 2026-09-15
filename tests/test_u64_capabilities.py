@@ -184,22 +184,19 @@ def test_post_threshold_is_a_pure_function_of_writemem_post_safe():
     higher PUT threshold. A new device generation hits that path first,
     before anyone has written its version rule.
 
-    Why the coupling used to be load-bearing: ``memory.write_bytes``
-    chunked at a fixed 84 bytes -- under 128 but *over* 48 -- so on fixed
-    firmware every chunk took the POST path, safe only because the 48
-    threshold is *selected by* ``writemem_post_safe``. Since #252 an
-    Ultimate transport chunks ``write_bytes`` at its own threshold, so
-    every chunk is a PUT on any grade
-    (``tests/test_u64_leak_prone_write_chunking.py``); 84 survives only
-    for transports with no REST threshold (VICE). The three legs are still
-    pinned because ``Ultimate64Transport.write_memory`` keys its
-    single-request path on the same grade.
+    What the coupling guards today (#294/#252): ``memory.write_bytes`` on
+    an Ultimate transport chunks at ``transport.rest_put_chunk_size`` (the
+    client threshold, capped at the 128-byte PUT limit), so every chunk is a
+    PUT on any grade, and no fixed chunk size is involved.  What still keys
+    on the grade is ``Ultimate64Transport.write_memory``'s single-request
+    path (``_rest_write_is_post_safe``), and that must agree with the
+    threshold leg by leg: see
+    :func:`test_the_transport_single_request_path_agrees_with_the_threshold`.
     """
     from c64_test_harness.backends.u64_capabilities import (
         THRESHOLD_POST_RISKY,
         THRESHOLD_POST_SAFE,
     )
-    from c64_test_harness.memory import _WRITE_CHUNK_SIZE
 
     fixed = DeviceCapabilities.from_info({"firmware_version": "3.15"})
     assert fixed.writemem_post_safe is True
@@ -214,8 +211,150 @@ def test_post_threshold_is_a_pure_function_of_writemem_post_safe():
         assert caps.writemem_post_safe is False, unreadable
         assert caps.write_mem_query_threshold == THRESHOLD_POST_RISKY, unreadable
 
-    # The chunk size that makes the coupling matter at all.
-    assert THRESHOLD_POST_SAFE < _WRITE_CHUNK_SIZE < THRESHOLD_POST_RISKY
+    # The hand-built unknown grade (#247): not produced by from_info, but a
+    # legal value, and it lands on the conservative leg.
+    unknown = replace_grade(fixed, None)
+    assert unknown.write_mem_query_threshold == THRESHOLD_POST_RISKY == 128
+
+
+def replace_grade(caps, grade):
+    from dataclasses import replace
+
+    return replace(caps, writemem_post_safe=grade)
+
+
+# ------------------------------------------------ #247: the domain, made explicit
+#: Every ``info`` shape from_info can meet: probe failed, empty, unparseable,
+#: non-string, an unknown major, both lines below and at their fixes, a
+#: future major, and a CBM release newer than the last known unfixed one.
+_EVERY_INFO_SHAPE = (
+    None,
+    {},
+    {"firmware_version": "not-a-version"},
+    {"firmware_version": 315},
+    {"firmware_version": "2.5"},
+    {"firmware_version": "V3.14d"},
+    {"firmware_version": "3.14e"},
+    {"firmware_version": "3.15"},
+    {"firmware_version": "4.0"},
+    {"firmware_version": "1.0.9"},
+    {"firmware_version": "1.1.0"},
+    {"firmware_version": "1.2.0"},
+)
+
+
+@pytest.mark.parametrize("info", _EVERY_INFO_SHAPE, ids=repr)
+def test_from_info_always_grades_writemem_post_safe_as_a_bool(info):
+    """``None`` is never produced by probing (#247); only a hand-built value is.
+
+    ``type(...) is bool``, not truthiness: a probe path that returned ``0``
+    or ``None`` would pass an ``in (True, False)`` check.
+    """
+    import warnings
+
+    from c64_test_harness.backends.u64_capabilities import CbmFixConstantStaleWarning
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", CbmFixConstantStaleWarning)
+        caps = DeviceCapabilities.from_info(info)
+    assert type(caps.writemem_post_safe) is bool, (info, caps.writemem_post_safe)
+    assert type(caps.runner_wedge_possible) is bool, info
+
+
+def test_the_info_shapes_reach_both_answers():
+    """Vacuity guard for the enumeration above: it is not all one answer."""
+    import warnings
+
+    from c64_test_harness.backends.u64_capabilities import CbmFixConstantStaleWarning
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", CbmFixConstantStaleWarning)
+        grades = {DeviceCapabilities.from_info(i).writemem_post_safe for i in _EVERY_INFO_SHAPE}
+        generations = {DeviceCapabilities.from_info(i).generation for i in _EVERY_INFO_SHAPE}
+    assert grades == {True, False}
+    assert generations == {"ultimate", "cbm", "unknown"}
+
+
+@pytest.mark.parametrize("grade", [True, False, None])
+def test_hand_built_true_false_and_none_are_accepted(grade):
+    caps = replace_grade(DeviceCapabilities.from_info({"firmware_version": "3.15"}), grade)
+    assert caps.writemem_post_safe is grade
+    overridden = DeviceCapabilities.from_info(
+        {"firmware_version": "3.15"}, overrides={"writemem_post_safe": grade}
+    )
+    assert overridden.writemem_post_safe is grade
+
+
+@pytest.mark.parametrize("bad", [1, 0, "no", "True", 48, 1.0])
+def test_a_non_bool_grade_is_rejected(bad):
+    """A truthy non-bool used to grade post-safe: ``"no"`` read as 48."""
+    fixed = DeviceCapabilities.from_info({"firmware_version": "3.15"})
+    with pytest.raises(TypeError, match="writemem_post_safe"):
+        replace_grade(fixed, bad)
+    with pytest.raises(TypeError, match="writemem_post_safe"):
+        DeviceCapabilities.from_info(
+            {"firmware_version": "3.15"}, overrides={"writemem_post_safe": bad}
+        )
+
+
+def test_the_threshold_keys_on_is_true_even_if_validation_is_bypassed():
+    """Defence in depth: a value forced past ``__post_init__`` (``object.__setattr__``
+    on the frozen instance) still only reaches 48 through an explicit ``True``."""
+    from c64_test_harness.backends.u64_capabilities import (
+        THRESHOLD_POST_RISKY,
+        THRESHOLD_POST_SAFE,
+    )
+
+    caps = DeviceCapabilities.from_info({"firmware_version": "3.15"})
+    assert caps.write_mem_query_threshold == THRESHOLD_POST_SAFE
+    for forced in (1, "no", object()):
+        object.__setattr__(caps, "writemem_post_safe", forced)
+        assert caps.write_mem_query_threshold == THRESHOLD_POST_RISKY, forced
+
+
+@pytest.mark.parametrize("grade", [True, False, None])
+def test_the_transport_single_request_path_agrees_with_the_threshold(grade):
+    """The coupling that still guards something (CLAUDE.md 2c after #294/#252).
+
+    ``Ultimate64Transport.write_memory`` sends one request, POST-eligible,
+    only when ``_rest_write_is_post_safe()``; otherwise it chunks onto PUT.
+    That decision and the capability's threshold must be the same leg for
+    every legal grade, or a device could get the 48 threshold on the
+    leaking path or the single-request path at 128.
+    """
+    from types import SimpleNamespace
+
+    from c64_test_harness.backends.u64_capabilities import THRESHOLD_POST_SAFE
+    from c64_test_harness.backends.ultimate64 import Ultimate64Transport
+
+    caps = replace_grade(DeviceCapabilities.from_info({"firmware_version": "3.15"}), grade)
+    fake = SimpleNamespace(_client=SimpleNamespace(cached_capabilities=caps))
+    single_request = Ultimate64Transport._rest_write_is_post_safe(fake)
+    assert single_request is (caps.write_mem_query_threshold == THRESHOLD_POST_SAFE), grade
+    assert single_request is (grade is True)
+
+
+@pytest.mark.parametrize("put_size", [48, 128])
+def test_write_bytes_chunks_at_the_transports_put_size_not_a_literal(put_size):
+    """Restated for #247 as the invariant now is: ``write_bytes`` on a
+    transport reporting ``rest_put_chunk_size`` chunks at exactly that size,
+    on either grade's threshold; the 84-byte VICE constant is only the
+    fallback for a transport that reports none."""
+    from types import SimpleNamespace
+
+    from c64_test_harness import memory
+
+    writes: list[tuple[int, bytes]] = []
+    transport = SimpleNamespace(
+        rest_put_chunk_size=put_size,
+        write_memory=lambda addr, data: writes.append((addr, bytes(data))),
+    )
+    memory.write_bytes(transport, 0x4000, bytes(range(256)) * 2)
+    assert {len(d) for _, d in writes[:-1]} == {put_size}
+    assert b"".join(d for _, d in writes) == bytes(range(256)) * 2
+
+    vice_like = SimpleNamespace(write_memory=lambda addr, data: None)
+    assert memory._write_chunk_size(vice_like) == memory._WRITE_CHUNK_SIZE
 
 
 # --------------------------------------------------------------------------- #
