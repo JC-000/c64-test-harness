@@ -15,9 +15,9 @@ firmware crashes" are one failure, not rival models.  This pin's job:
   two upward, "a few", "several", "a dozen", "a handful") of uploads, runs,
   cycles or PRGs in a sentence that also has a crash word (wedge, crash,
   brick, dies, kills, survives) or a bound word (budget, allowance, limit,
-  bound, threshold, safe, within, at most, up to, short of, under, below,
-  between).  Or "a handful"/"a dozen"/"a few" placed beside a budget or
-  limit.  **No retirement phrase waives it** (#386): "retired", "not a
+  bound, threshold, each also plural; safe, within, at most, up to, short of,
+  under, below, between).  Or "a handful"/"a dozen"/"a few" placed beside a
+  budget or limit.  **No retirement phrase waives it** (#386): "retired", "not a
   limit", "where one reproduction stopped" and the like used to, and a
   numbered count came back beside one ('The "~15 uploads" wedge ... is where
   one reproduction stopped, not a bound').  The ruling is that no guess is
@@ -134,7 +134,8 @@ def _is_a_price(sentence: str, match: re.Match[str]) -> bool:
                 or _COST_VERB_BEFORE.search(sentence[:match.start()]))
 _CRASH = re.compile(r"\b(?:wedg\w*|crash\w*|brick\w*|dies|die|kills?|survives?)\b", re.IGNORECASE)
 _BOUND = re.compile(
-    r"\b(?:budget|allowance|limit|bound|threshold|safe|within|between|under|below)\b"
+    # Plurals too (#386 mutant D2b: "so budgets are sized" beside a count passed).
+    r"\b(?:budgets?|allowances?|limits?|bounds?|thresholds?|safe|within|between|under|below)\b"
     r"|\bat\s+most\b|\bup\s+to\b|\bshort\s+of\b",
     re.IGNORECASE,
 )
@@ -142,8 +143,8 @@ _TEMP_PARAGRAPH = re.compile(r"/Temp|attachment|writemem|unpatched|leak-prone|#6
 #: The gap may cross a dot inside a word ("CLAUDE.md"), not a sentence end.
 _IN_SENTENCE = r"(?:[^.;]|\.(?=\w))"
 _HANDFUL_BOUND = re.compile(
-    rf"\ba\s+(?:handful|dozen|few)\b{_IN_SENTENCE}{{0,90}}\b(?:budget|limit|allowance)\b"
-    rf"|\b(?:budget|limit|allowance)\b{_IN_SENTENCE}{{0,90}}\ba\s+(?:handful|dozen|few)\b",
+    rf"\ba\s+(?:handful|dozen|few)\b{_IN_SENTENCE}{{0,90}}\b(?:budgets?|limits?|allowances?)\b"
+    rf"|\b(?:budgets?|limits?|allowances?)\b{_IN_SENTENCE}{{0,90}}\ba\s+(?:handful|dozen|few)\b",
     re.IGNORECASE,
 )
 #: Filling set against crashing (#386): the ruling makes them one failure.
@@ -351,6 +352,12 @@ class TestTheRulesCanFail:
         # #382 accepted survivor G1: the first direction ("a handful ... budget")
         # across the dot in "CLAUDE.md", past the old 30-character gap.
         "Treat a handful, as the note in CLAUDE.md puts it, as the budget.",
+        # #386 (D2b): plural bound words.
+        'The figure, "~15 cycles of a 63 KB PRG", is where it stopped; so /Temp budgets '
+        "are sized conservatively.",
+        "Budgets allow 15 uploads.",
+        "Our limits are a handful.",
+        "A handful sets the budgets.",
     ])
     def test_a_count_guess_is_flagged(self, text: str) -> None:
         assert "count before a crash" in {r for r, _ in count_and_figure_problems(text)}, text
