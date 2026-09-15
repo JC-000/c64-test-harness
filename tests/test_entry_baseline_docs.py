@@ -559,11 +559,16 @@ class TestTheItemCountCarriesItsScope:
     #: #372: also ``u64ii`` (the C64U firmware target), "C-64 Ultimate",
     #: "Commodore-64 Ultimate" and "Commodore 64U"; and a trailing boundary,
     #: without which "the C64 ultimately reads" was flagged.  Review of #407:
-    #: the plural ("the C64 Ultimates"), a space or underscore anywhere in
-    #: "C 64 Ultimate" / "c64_ultimate", the "U" suffix after either spelling
-    #: ("C-64U", "C64-U"), and ``u64ii`` joined by an underscore.
+    #: the plural ("the C64 Ultimates"), a space in "C 64 Ultimate", a space,
+    #: hyphen or underscore between "64" and the suffix ("c64_ultimate"), the
+    #: "U" suffix after either spelling ("C-64U", "C64-U"), and an identifier
+    #: that continues with an underscore after the C64 or u64ii spellings
+    #: ("c64_ultimate_baseline", "C64U_CAPS", "u64ii_build").  Known misses,
+    #: pinned in :func:`test_the_count_scan_known_misses`: an underscore in the
+    #: Commodore spelling ("Commodore_64 Ultimate") and a doubled separator
+    #: ("C--64 Ultimate").
     _OTHER_DEVICE = re.compile(
-        r"\bcbm\b|\bc[\s-]?64[\s_-]?(?:ultimates?\b|u\b)"
+        r"\bcbm\b|\bc[\s-]?64[\s_-]?(?:ultimates?|u)(?:_|\b)"
         r"|\bcommodore[\s-]?64[\s-]?(?:ultimates?\b|u\b)|\bu64ii(?:_|\b)",
         re.IGNORECASE,
     )
@@ -1317,6 +1322,9 @@ _OTHER_DEVICE_VARIANTS = {
     "C 64 Ultimate": "the C 64 Ultimate",
     "c64_ultimate": "the c64_ultimate generation",
     "u64ii_build": "the u64ii_build tree",
+    # Re-verify of #407: identifiers continuing with an underscore.
+    "c64_ultimate_baseline": "c64_ultimate_baseline",
+    "C64U_CAPS": "C64U_CAPS",
 }
 
 #: The base sentence each variant is planted into.  It must pass alone, so
@@ -1384,6 +1392,22 @@ def test_the_count_scan_flags_every_spelling_of_the_other_device(variant: str) -
     f"{_OTHER_DEVICE_BASE} for C64 users.",
     # The u64ii guard stops at a letter (synthetic boundary control).
     f"{_OTHER_DEVICE_BASE}, built from a u64iib tree.",
+    # Re-verify of #407 (X1, X2): each spelling starts at a word boundary.
+    f"{_OTHER_DEVICE_BASE}, with the rc64u flag.",
+    f"{_OTHER_DEVICE_BASE}, from the au64ii mirror.",
 ])
 def test_the_count_scan_leaves_near_misses_alone(sentence: str) -> None:
+    assert TestTheItemCountCarriesItsScope._unscoped(sentence) == []
+
+
+@pytest.mark.parametrize("sentence", [
+    f"{_OTHER_DEVICE_BASE}, unlike the Commodore_64 Ultimate.",
+    f"{_OTHER_DEVICE_BASE}, unlike the C--64 Ultimate.",
+])
+def test_the_count_scan_known_misses(sentence: str) -> None:
+    """The declared misses in ``_OTHER_DEVICE``'s comment (review of #407).
+
+    If one starts being flagged, the limit has closed: move it to
+    ``_OTHER_DEVICE_VARIANTS`` and update the comment.
+    """
     assert TestTheItemCountCarriesItsScope._unscoped(sentence) == []

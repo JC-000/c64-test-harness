@@ -45,7 +45,9 @@ written is *not* flagged, and the same claim with the escaping part removed
   on" are flagged only when "on" ends the phrase (at most six words between),
   because "switches Network Settings based on the host" is not a write.  So
   "Nothing in the harness switches FTP File Service on for a lane" is not
-  flagged.  ("on or off" at the end of the phrase is flagged like "on".)
+  flagged.  ("on or off" at the end of the phrase is flagged like "on";
+  "on and off" is not: "Nothing in the harness switches FTP File Service on
+  and off" passes.)
 * **Split "on" past six words (#372 review):** the window between the verb
   and a split "on" is at most six words, so "Nothing in the harness switches
   the Network Settings > FTP File Service item on." (eight) is not flagged.
@@ -149,6 +151,8 @@ _NEGATED_WRITE = re.compile(
     # it logs a WARNING that FTP File Service must be enabled by hand" (#358).
     # #372: the phrasal forms "turns on X" and "switches X on", where a
     # split "on" must end the phrase ("switches ... based on the host" is not).
+    # The ``\b`` after ``off`` is redundant with the lookahead that follows
+    # (which already forbids a word character): an equivalent mutant.
     r"|[^.;:]{0,50}?\b(?:enabl\w*|(?:turn|switch)\w*\s+on\b"
     r"|(?:turn|switch)\w*(?:\s+[\w>-]+){1,6}?\s+on\b(?:\s+or\s+off\b)?(?![\s-]*\w))"
     r")",
@@ -340,6 +344,10 @@ class TestNoDocClaimsTheStoreIsNeverWritten:
         # #372: "on" that starts a prepositional phrase is not "switch ... on".
         "No lane in the harness switches Network Settings based on the host.",
         "Nothing in the harness turns FTP File Service logs on disk into config.",
+        # Re-verify of #407 (X4, X6): only "or off" extends the phrase.
+        "Nothing in the harness switches FTP File Service on or before boot.",
+        "Nothing in the harness switches FTP File Service on or before.",
+        "Nothing in the harness switches FTP File Service on or offline.",
     ])
     def test_the_scan_leaves_scoped_statements_alone(self, text: str) -> None:
         assert not _unscoped_absolute_claims(text), text
@@ -380,6 +388,10 @@ class TestTheDeclaredLimitsStayKnown:
         "split on past six words": (
             "Nothing in the harness switches the Network Settings > FTP File Service item on.",
             "Nothing in the harness switches the FTP File Service item on.",
+        ),
+        "on and off": (
+            "Nothing in the harness switches FTP File Service on and off.",
+            "Nothing in the harness switches FTP File Service on or off.",
         ),
     }
 
