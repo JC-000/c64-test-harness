@@ -666,17 +666,52 @@ def test_close_drains_pending_attachments():
     assert c.pending_temp_attachments == 0
 
 
+def _lock_held(value: bool):
+    return patch(
+        "c64_test_harness.backends.device_lock.DeviceLock.held_by_this_process",
+        return_value=value,
+    )
+
+
 def test_close_sweeps_inherited_temp_when_this_client_leaked_nothing():
     """#264: this used to pin the early return as correct. The wedge is a
     property of the device, not of this object: ``gc_temp_folder`` sweeps
     ``/Temp`` device-wide, so declining it because *this* client's counter
     is zero leaves a crashed neighbour's attachments in place for the next
-    lane. Arming, not the counter, is what keeps fake hosts off FTP."""
+    lane. Arming, not the counter, is what keeps fake hosts off FTP.
+
+    Round 1: an inherited-only sweep deletes other lanes' attachments, so
+    on the ``close()`` path it runs only under this process's DeviceLock.
+    """
     c = _client(LEAKY)
     assert c.pending_temp_attachments == 0
-    with patch.object(
+    with _lock_held(True), patch.object(
         c, "gc_temp_folder", return_value=TempGCResult(host="fake-host")
     ) as gc:
+        c.close()
+    gc.assert_called_once()
+
+
+def test_close_does_not_sweep_inherited_temp_without_the_device_lock():
+    """An unlocked read-only client must not delete another lane's /Temp
+    attachments (review round 1, E1b). Nothing on close() -> drain ->
+    gc_temp_folder takes the lock, so the drain has to ask."""
+    c = _client(LEAKY)
+    with _lock_held(False), patch.object(c, "gc_temp_folder") as gc:
+        c.close()
+    gc.assert_not_called()
+
+
+def test_close_still_drains_what_this_client_leaked_without_the_lock():
+    """The pre-#264 behaviour for a client that DID leak is unchanged:
+    its own attachments are collected on close whether or not it holds
+    the lock (restricting that is not this change's call)."""
+    c = _client(LEAKY)
+    mock, _ = _urlopen_mock()
+    with _lock_held(False), patch.object(
+        c, "gc_temp_folder", return_value=TempGCResult(host="fake-host")
+    ) as gc, patch("urllib.request.urlopen", mock):
+        c.run_prg(b"\x01\x08x")
         c.close()
     gc.assert_called_once()
 
@@ -1039,22 +1074,96 @@ def test_disarmed_clients_with_nothing_leaked_do_not_sweep():
         gc.assert_not_called()
 
 
-def test_a_failed_inherited_sweep_refuses_the_next_upload(tmp_path):
-    """A GC that returns ``.error`` is a failed pass, not a benign skip --
-    whoever's attachments it was trying to collect."""
+def test_a_failed_inherited_sweep_neither_enables_ftp_nor_blocks(
+    tmp_path, caplog: pytest.LogCaptureFixture
+):
+    """Review round 1, E1: a lane that only made bodyless calls must not
+    write ``Network Settings > FTP File Service`` -- a BASELINE_NEVER_TOUCH
+    store, persisting until a firmware power-on, and an anonymous file
+    service on a device whose Network Password defaults empty (#263 is the
+    owner's call). So an inherited-only sweep that fails logs the manual
+    remedy and leaves this client unblocked: it has spent nothing."""
     from c64_test_harness.backends.device_lock import DeviceLock
 
+    c = _client(LEAKY)
+    mock, captured = _urlopen_mock()
+    with patch.object(c, "gc_temp_folder", side_effect=lambda **kw: _refused()) as gc, \
+            patch.object(c, "set_config_item") as set_item, \
+            patch("urllib.request.urlopen", mock), \
+            caplog.at_level("WARNING"):
+        lock = DeviceLock("fake-host", lock_dir=tmp_path)
+        assert lock.acquire(timeout=5.0)
+        lock.release()
+        assert gc.call_count == 1
+        set_item.assert_not_called()
+        assert c._temp_hygiene_blocked is None
+        c.run_prg(b"\x01\x08x")            # not refused
+    assert len(captured) == 1
+    warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("FTP File Service" in m and "inherited" in m for m in warned), warned
+
+
+def test_a_failed_sweep_by_a_lane_that_leaked_keeps_the_existing_behaviour():
+    """#263 is the owner's: a client that DID leak still gets the one
+    FTP-enable attempt and then blocks. Pinned so the round-1 carve-out
+    for inherited-only sweeps cannot widen into it unnoticed."""
     c = _client(LEAKY)
     mock, _ = _urlopen_mock()
     with patch.object(c, "gc_temp_folder", side_effect=lambda **kw: _refused()), \
             patch.object(c, "set_config_item") as set_item, \
             patch("urllib.request.urlopen", mock):
-        lock = DeviceLock("fake-host", lock_dir=tmp_path)
-        assert lock.acquire(timeout=5.0)
-        lock.release()
-        set_item.assert_called_once()        # the one FTP-enable attempt
+        c.run_prg(b"\x01\x08x")
+        c.close()
+        set_item.assert_called_once_with(
+            "Network Settings", "FTP File Service", "Enabled"
+        )
         with pytest.raises(Ultimate64TempHygieneError):
             c.run_prg(b"\x01\x08x")
+
+
+# --------------------------------------------------------------------------- #
+# Review round 1, finding 2: correct behaviours that mutations showed unpinned #
+# --------------------------------------------------------------------------- #
+
+def test_a_post_that_raises_mid_request_is_still_counted():
+    """The firmware writes the attachment as the body streams in, so a
+    request that fails afterwards has still left one behind."""
+    from c64_test_harness.backends.ultimate64_client import Ultimate64Error
+
+    c = _client(LEAKY)
+    with patch("urllib.request.urlopen", side_effect=ConnectionResetError("rst")):
+        with pytest.raises(Ultimate64Error):
+            c.run_prg(b"\x01\x08x")
+    assert c.pending_temp_attachments == 1
+
+
+def test_a_fresh_budget_one_client_probes_without_sweeping_first():
+    """Kept behaviour, stated in ``_before_temp_attachment``: with nothing
+    pending a pass could collect nothing this client spent, so the
+    two-attachment reservation does not sweep; the probe runs one over a
+    budget of 1 and the next attachment-creating request sweeps."""
+    c = _client(LEAKY, temp_gc_budget=1)
+    mock, wire, _ = _device_urlopen()
+    with _reachable(), patch.object(
+        c, "gc_temp_folder", return_value=TempGCResult(host="fake-host")
+    ) as gc, patch("urllib.request.urlopen", mock):
+        c.liveness_probe()
+        gc.assert_not_called()
+        assert c.pending_temp_attachments == 2
+        c.run_prg(b"\x01\x08x")
+        gc.assert_called_once()
+
+
+def test_the_probe_sender_runs_the_advisory_lock_check_per_post():
+    c = _client(LEAKY)
+    mock, _, _ = _device_urlopen()
+    with _reachable(), patch.object(c, "gc_temp_folder"), \
+            patch.object(c, "_check_device_lock") as check, \
+            patch("urllib.request.urlopen", mock):
+        c.liveness_probe()
+    assert [a.args[0] for a in check.call_args_list] == [
+        "POST /v1/machine:writemem", "POST /v1/machine:writemem",
+    ]
 
 
 # --------------------------------------------------------------------------- #

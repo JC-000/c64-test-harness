@@ -464,17 +464,23 @@ class Ultimate64Client:
         # Drain /Temp when this device's lock is handed to the next lane.
         # Registered weakly, so a forgotten client is collected normally.
         if _HAS_DEVICE_LOCK:
-            _register_release_callback(self.host, self, "_drain_temp_attachments")
+            _register_release_callback(self.host, self, "_drain_on_lock_release")
 
     def close(self) -> None:
         """Release client resources.
 
         The REST side is stateless (a fresh connection per call), so the
-        only work here is the ``/Temp`` hygiene drain: on an armed client
-        the device's ``/Temp`` is swept now, best-effort -- including
-        attachments some earlier client or lane left behind, even when
-        this client leaked nothing (issue #264). A disarmed client does
-        nothing. See :attr:`temp_hygiene_armed`.
+        only work here is the ``/Temp`` hygiene drain, best-effort, on an
+        armed client (a disarmed one does nothing):
+
+        * if this client leaked, its hygiene pass runs as before;
+        * if it leaked nothing, the device's ``/Temp`` is still swept for
+          attachments an earlier lane left behind (issue #264) -- but only
+          when this process holds the device's ``DeviceLock``, since that
+          sweep deletes other lanes' files, and a failed one never enables
+          FTP File Service and never blocks this client.
+
+        See :attr:`temp_hygiene_armed` and :meth:`_drain_temp_attachments`.
         """
         self._drain_temp_attachments(reason="client close")
         return None
@@ -875,8 +881,17 @@ class Ultimate64Client:
 
         *count* > 1 reserves an operation's whole cost up front, so a
         multi-POST operation is never refused half-way through (see
-        :meth:`liveness_probe`, whose second POST restores RAM). For
-        ``count=1`` the condition is exactly ``pending >= budget``.
+        :meth:`liveness_probe`, whose second POST restores RAM).
+
+        The pass runs when ``pending > 0 and pending + count > budget``.
+        For ``count=1`` that is exactly ``pending >= budget`` -- which
+        relies on the budget being at least 1, as ``__init__`` validates
+        and :func:`~c64_test_harness.backends.ultimate64_temp_gc.leak_budget`
+        enforces. The ``pending > 0`` guard is kept deliberately: with
+        nothing pending a pass could collect nothing this client spent, so a
+        reservation larger than the whole budget (a probe on a fresh
+        ``temp_gc_budget=1`` client) runs one over and the next
+        attachment-creating request sweeps.
 
         :raises Ultimate64TempHygieneError: when hygiene is armed, has
             been proven impossible, and ``U64_TEMP_GC_REQUIRED`` has not
@@ -977,23 +992,56 @@ class Ultimate64Client:
         finally:
             self._in_temp_hygiene = False
 
-    def _drain_temp_attachments(self, reason: str = "drain") -> None:
+    def _drain_on_lock_release(self, reason: str = "device lock release") -> None:
+        """Release-callback entry point (``device_lock.register_release_callback``).
+
+        ``DeviceLock.release`` fires callbacks only on the outermost release
+        and while the flock is still held, so this drain runs under the lock
+        by construction.
+        """
+        self._drain_temp_attachments(reason=reason, under_lock=True)
+
+    def _holds_device_lock(self) -> bool:
+        """Whether this process holds this device's ``DeviceLock`` (no I/O)."""
+        if not _HAS_DEVICE_LOCK:
+            return False
+        try:
+            from .device_lock import DeviceLock
+
+            return bool(DeviceLock.held_by_this_process(self.host))
+        except Exception:  # noqa: BLE001 - a lock query must never fail a drain
+            return False
+
+    def _drain_temp_attachments(
+        self, reason: str = "drain", *, under_lock: bool = False
+    ) -> None:
         """Sweep the device's ``/Temp`` on the way out. Never raises.
 
-        Runs whether or not *this* client leaked anything (issue #264).
-        The wedge is a property of the device, accumulated across clients,
-        lanes and runs, and :meth:`gc_temp_folder` sweeps ``/Temp``
-        device-wide, so a lane that inherited a crashed neighbour's
-        attachments collects them here instead of handing them on. What
-        keeps a fake host off FTP is arming (a never-answered probe stays
-        disarmed), not the counter.
+        Two cases, and they are deliberately not treated alike:
 
-        A failed sweep is a failed hygiene pass like any other: it gets the
-        one FTP-enable attempt and, if that fails too, blocks this client's
-        later attachment-creating requests.
+        * **This client leaked** (``pending_temp_attachments > 0``): the
+          ordinary hygiene pass, unchanged -- including its one FTP-enable
+          attempt and the block on failure. Whether a lane that leaked may
+          write that config is issue #263 and is not decided here.
+        * **This client leaked nothing** (issue #264): the wedge is a
+          property of the device and :meth:`gc_temp_folder` sweeps ``/Temp``
+          device-wide, so a lane that inherited a crashed neighbour's
+          attachments still collects them. But that sweep deletes files
+          this client did not create, so it runs only **under the device
+          lock** (the lock-release callback, or a ``close()`` while this
+          process holds the lock); and a lane that made only bodyless calls
+          must not write ``Network Settings > FTP File Service`` (a
+          BASELINE_NEVER_TOUCH store that persists until a firmware
+          power-on) or be refused for a failure it did not cause. So a
+          failed inherited sweep logs a WARNING naming the manual remedy,
+          enables nothing and blocks nothing.
+
+        What keeps a fake host off FTP is arming (a never-answered probe
+        stays disarmed), not the counter.
         """
         try:
-            if self._pending_temp_attachments > 0:
+            leaked = self._pending_temp_attachments > 0
+            if leaked:
                 # Something leaked, so a device is demonstrably there:
                 # settle the grade before deciding not to clean up after
                 # it. Deliberately not done on a zero count -- that would
@@ -1002,12 +1050,48 @@ class Ultimate64Client:
                 self._maybe_reprobe_capabilities()
             if not self.temp_hygiene_armed:
                 return
-            self._run_temp_hygiene(reason)
+            if leaked:
+                self._run_temp_hygiene(reason)
+                return
+            if not (under_lock or self._holds_device_lock()):
+                _log.debug(
+                    "U64 /Temp drain on %s (%s): this client leaked nothing and "
+                    "does not hold the device lock; not sweeping other lanes' "
+                    "attachments",
+                    self.host, reason,
+                )
+                return
+            self._sweep_inherited_temp(reason)
         except Exception as exc:  # noqa: BLE001 - a drain must never fail a run
             _log.debug(
                 "U64 /Temp drain on %s raised (%s: %s); ignored",
                 self.host, type(exc).__name__, exc,
             )
+
+    def _sweep_inherited_temp(self, reason: str) -> None:
+        """Best-effort sweep for attachments this client did not create.
+
+        No FTP-enable attempt and no block on failure -- see
+        :meth:`_drain_temp_attachments`.
+        """
+        self._in_temp_hygiene = True
+        try:
+            _log.debug("U64 /Temp inherited sweep on %s: %s", self.host, reason)
+            result = self.gc_temp_folder()
+        finally:
+            self._in_temp_hygiene = False
+        if getattr(result, "ok", False):
+            return
+        _log.warning(
+            "U64 /Temp inherited sweep on %s failed (%s). This client leaked "
+            "nothing, so the harness neither enables Network Settings > FTP "
+            "File Service on its behalf (issue #263) nor refuses its requests; "
+            "but /Temp may still hold attachments an earlier lane left behind. "
+            "Before uploading to this device, enable FTP File Service manually "
+            "(it persists until a firmware power-on) or have it power-cycled. "
+            "See docs/u64_recovery.md.",
+            self.host, getattr(result, "error", None) or "unknown FTP failure",
+        )
 
     def _check_device_lock(self, operation: str) -> None:
         """Advisory device-lock check for a state-changing request.

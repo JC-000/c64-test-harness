@@ -15,11 +15,16 @@ cycles of a 63 KB PRG (n unrecorded), which is the reproduction that
 prompted this module — a datapoint, not a limit, and with no standing for
 a C64U on 1.1.0. It is emphatically *not* a capacity figure: ``/Temp`` is
 a 16 MiB RAM disk -- ``ramdisk.cc`` sizes it as ``__ram_disk_limit -
-__ram_disk_start`` (``0x02000000``-``0x03000000`` in
-``target/{u64,u64ii}/riscv/ultimate/linker.x`` at tag ``1.1.0``; the
-"3 * 1024 * 1024" comment beside that computation is stale, issue #261) --
-so 15 x 63 KiB = 967,680 bytes is ~5.8% of it across 15 directory entries,
-and nothing was near exhaustion. ``/Temp`` "filling" does not describe this
+__ram_disk_start``, and the "3 * 1024 * 1024" comment beside that
+computation is stale (issue #261). For the reproduction's firmware that is
+``0x2000000``-``0x3000000`` in ``target/u64/riscv/ultimate/linker.x`` at
+``v3.14d`` (the same at ``v3.14c``, ``v3.14e`` and ``7f6fcb51``); for the
+C64U it is ``0x02000000``-``0x03000000`` in
+``target/u64ii/riscv/ultimate/linker.x`` at ``1.1.0``. The
+``target/u64/nios2`` build directories carry no RAM-disk symbols, and which
+of the two built the 3.14d image that wedged is not established. So
+15 x 63 KiB = 967,680 bytes is ~5.8% of the disk across 15 directory
+entries, and nothing was near exhaustion. ``/Temp`` "filling" does not describe this
 wedge and earlier versions of this docstring were wrong to say it did.
 **The crash cause**: the pre-fix ``attachment_writer`` created
 ``/Temp/temp%04x`` from a static counter and never deleted the files, but
@@ -124,11 +129,11 @@ DEFAULT_KEEP = 2
 #: U64E on 3.14d wedged at about **15** uploads of a 63 KB PRG, n
 #: unrecorded. It has no standing for a C64U on 1.1.0, and it is not a
 #: capacity measurement -- the RAM disk is 16 MiB (``ramdisk.cc`` computes
-#: ``__ram_disk_limit - __ram_disk_start``, ``0x02000000``-``0x03000000``
-#: in ``target/{u64,u64ii}/riscv/ultimate/linker.x`` at tag ``1.1.0``; cite
-#: that computation, not the stale "3 * 1024 * 1024" comment beside it --
-#: issue #261), so 967,680 bytes is ~5.8% of it with 15 directory entries
-#: used. Treat 15 as "a device once wedged here", not as a limit.
+#: ``__ram_disk_limit - __ram_disk_start``; cite that computation, not the
+#: stale "3 * 1024 * 1024" comment beside it -- issue #261; per-tree values
+#: in the module docstring: u64 riscv at v3.14d for the reproduction, u64ii
+#: at 1.1.0 for the C64U), so 967,680 bytes is ~5.8% of it with 15
+#: directory entries used. Treat 15 as "a device once wedged here", not as a limit.
 #:
 #: **What actually fails is the firmware, not the folder.** On a wedged
 #: machine the C64 FPGA keeps running while the device firmware is dead:
