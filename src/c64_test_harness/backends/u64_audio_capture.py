@@ -79,6 +79,8 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 
+from . import _stream_seq
+
 __all__ = [
     "AudioCapture",
     "CaptureResult",
@@ -256,11 +258,14 @@ class CaptureResult:
     packets_received: int
     packets_dropped: int
     sample_rate_exact: Fraction | None = None
-    #: Packets whose sequence number stepped backwards or repeated
-    #: (reordered or duplicated on the way).  Their PCM is still
-    #: appended in arrival order, so a non-zero value means the sample
-    #: index is not a clock either; ``time_base_intact`` counts forward
-    #: gaps only.
+    #: Packets whose sequence number was not ahead of the highest seen
+    #: (#205, #430).  A late packet un-counts the drop its gap charged and
+    #: its PCM goes into its own slot; a duplicate's PCM is discarded.  So
+    #: neither shifts the sample index, and neither is in
+    #: ``packets_dropped``.  The exceptions: a packet more than
+    #: ``_stream_seq.SEQ_REORDER_WINDOW`` (1024) positions late is discarded
+    #: with its drop still counted, and a backward jump at least that far
+    #: is taken as a restarted counter (kept, appended, nothing dropped).
     packets_reordered: int = 0
 
     @property
@@ -269,8 +274,10 @@ class CaptureResult:
 
         Gaps are not padded, so a single drop shifts every later sample
         by an unknown amount.  Check this before analysing a capture;
-        the file itself looks fine either way.  Forward gaps only: see
-        :attr:`packets_reordered` for backward steps.
+        the file itself looks fine either way.  A reordered or duplicated
+        packet is not a drop and does not shift the index (see
+        :attr:`packets_reordered`); a timing measurement that also wants
+        to reject a stream restart can require it to be zero.
         """
         return self.packets_dropped == 0
 
@@ -440,6 +447,7 @@ class AudioCapture:
         self._packets_dropped = 0
         self._packets_reordered = 0
         self._last_seq: int | None = None
+        self._seq = _stream_seq.SequenceTracker()
         self._started = False
 
     def start(self) -> None:
@@ -453,6 +461,7 @@ class AudioCapture:
         self._packets_dropped = 0
         self._packets_reordered = 0
         self._last_seq = None
+        self._seq = _stream_seq.SequenceTracker()
 
         # Create and bind UDP socket
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -552,27 +561,50 @@ class AudioCapture:
             pcm_payload = data[_SEQ_HEADER_LEN:]
 
             with self._lock:
-                # Gap detection
-                if self._last_seq is not None:
-                    expected = (self._last_seq + 1) & 0xFFFF
-                    if seq != expected:
-                        gap = (seq - expected) & 0xFFFF
-                        if gap < 0x8000:  # forward gap (not reorder)
-                            self._packets_dropped += gap
-                            _log.warning(
-                                "Audio stream gap: expected seq %d, got %d (%d packets dropped)",
-                                expected, seq, gap,
-                            )
-                        else:  # backward step: reordered or duplicated
-                            self._packets_reordered += 1
-                            _log.warning(
-                                "Audio stream backward step: expected seq %d, got %d",
-                                expected, seq,
-                            )
-
-                self._last_seq = seq
-                self._pcm_chunks.append(pcm_payload)
                 self._packets_received += 1
+                ev = self._seq.observe(seq)
+                if ev.kind == _stream_seq.GAP:
+                    gap = len(ev.tracked_missing) + ev.untracked
+                    _log.warning(
+                        "Audio stream gap: expected seq %d, got %d (%d packets dropped)",
+                        ev.expected, seq, gap,
+                    )
+                    # One empty placeholder per remembered missing packet,
+                    # so a late arrival can take its own slot (#430).
+                    for missing in ev.tracked_missing:
+                        self._seq.bind(missing, len(self._pcm_chunks))
+                        self._pcm_chunks.append(b"")
+                elif ev.kind == _stream_seq.LATE:
+                    _log.warning(
+                        "Audio stream late packet: seq %d arrived after %d; "
+                        "placed in its own slot",
+                        seq, self._seq.highest,
+                    )
+                    self._pcm_chunks[ev.slot] = pcm_payload
+                    self._sync_counters()
+                    continue
+                elif ev.kind == _stream_seq.DUPLICATE:
+                    _log.warning(
+                        "Audio stream duplicate or over-late packet: seq %d "
+                        "(expected %d); payload discarded",
+                        seq, ev.expected,
+                    )
+                    self._sync_counters()
+                    continue
+                elif ev.kind == _stream_seq.RESYNC:
+                    _log.warning(
+                        "Audio stream backward step: expected seq %d, got %d; "
+                        "resynchronising on the new sequence",
+                        ev.expected, seq,
+                    )
+                self._pcm_chunks.append(pcm_payload)
+                self._sync_counters()
+
+    def _sync_counters(self) -> None:
+        """Mirror the tracker's counts into the historical attributes."""
+        self._packets_dropped = self._seq.dropped
+        self._packets_reordered = self._seq.reordered
+        self._last_seq = self._seq.highest
 
     def stop(self, wav_path: str | Path | None = None) -> CaptureResult:
         """Stop capturing and optionally write a WAV file.

@@ -807,8 +807,9 @@ with capture_u64_audio(client, "/tmp/run.wav",
                        sample_rate=U64_NTSC_AUDIO_RATE_HZ) as captured:
     target.jsr(0xC000)
     target.wait_for_text("DONE")
-assert captured[0].time_base_intact      # a dropped packet is never padded (forward gaps only)
-assert captured[0].packets_reordered == 0  # reordered/duplicated packets are counted separately (#205)
+assert captured[0].time_base_intact      # a dropped packet is never padded
+# A late packet goes back into its own slot and a duplicate is discarded, so
+# neither is a drop; packets_reordered counts them (#205, #430).
 ```
 
 **Three traps in this area produce plausible data rather than an error**, all documented with source citations in [docs/sid_audio.md](docs/sid_audio.md):

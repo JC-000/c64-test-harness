@@ -68,6 +68,8 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 
+from . import _stream_seq
+
 if TYPE_CHECKING:
     from .ultimate64_client import Ultimate64Client
 
@@ -227,6 +229,10 @@ class DebugCaptureResult:
     packets_received: int
     packets_dropped: int
     total_cycles: int
+    #: Datagrams whose sequence number was not ahead of the highest seen:
+    #: late arrivals (their drop is un-counted and their cycles appended in
+    #: arrival order) and duplicates (their cycles discarded).  #430.
+    packets_reordered: int = 0
 
 
 class DebugCapture:
@@ -301,7 +307,9 @@ class DebugCapture:
         self._raw_bytes_total = 0
         self._packets_received = 0
         self._packets_dropped = 0
+        self._packets_reordered = 0
         self._last_seq: int | None = None
+        self._seq = _stream_seq.SequenceTracker()
         self._started = False
         self._start_time = 0.0
 
@@ -371,7 +379,9 @@ class DebugCapture:
         self._raw_bytes_total = 0
         self._packets_received = 0
         self._packets_dropped = 0
+        self._packets_reordered = 0
         self._last_seq = None
+        self._seq = _stream_seq.SequenceTracker()
 
         # Create and bind UDP socket
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -436,19 +446,24 @@ class DebugCapture:
 
             with self._lock:
                 # Gap detection (always on raw packet sequence)
-                if self._last_seq is not None:
-                    expected = (self._last_seq + 1) & 0xFFFF
-                    if seq != expected:
-                        gap = (seq - expected) & 0xFFFF
-                        if gap < 0x8000:  # forward gap (not reorder)
-                            self._packets_dropped += gap
-                            _log.warning(
-                                "Debug stream gap: expected seq %d, got %d (%d packets dropped)",
-                                expected, seq, gap,
-                            )
-
-                self._last_seq = seq
                 self._packets_received += 1
+                ev = self._seq.observe(seq)
+                self._packets_dropped = self._seq.dropped
+                self._packets_reordered = self._seq.reordered
+                self._last_seq = self._seq.highest
+                if ev.kind == _stream_seq.GAP:
+                    _log.warning(
+                        "Debug stream gap: expected seq %d, got %d (%d packets dropped)",
+                        ev.expected, seq, len(ev.tracked_missing) + ev.untracked,
+                    )
+                elif ev.kind == _stream_seq.DUPLICATE:
+                    # Same cycles twice would double-count them (#430).
+                    continue
+                elif ev.kind in (_stream_seq.LATE, _stream_seq.RESYNC):
+                    _log.warning(
+                        "Debug stream backward step (%s): expected seq %d, got %d",
+                        ev.kind, ev.expected, seq,
+                    )
 
                 if entry_payload:
                     self._raw_chunks.append(entry_payload)
@@ -491,6 +506,7 @@ class DebugCapture:
             raw_data = b"".join(self._raw_chunks)
             packets_received = self._packets_received
             packets_dropped = self._packets_dropped
+            packets_reordered = self._packets_reordered
 
         # Parse raw bytes into BusCycle objects
         total_words = len(raw_data) // ENTRY_SIZE
@@ -512,6 +528,7 @@ class DebugCapture:
             packets_received=packets_received,
             packets_dropped=packets_dropped,
             total_cycles=len(trace),
+            packets_reordered=packets_reordered,
         )
 
     @property

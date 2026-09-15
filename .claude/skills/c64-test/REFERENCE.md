@@ -1030,8 +1030,8 @@ result = cap.stop(wav_path="output.wav")  # -> CaptureResult
 
 ### `CaptureResult` (dataclass)
 - `.wav_path: Path`, `.duration_seconds: float`, `.sample_rate: int`
-- `.total_samples: int`, `.packets_received: int`, `.packets_dropped: int`, `.packets_reordered: int` (backward sequence steps — reordered or duplicated packets; counted separately from drops, #205)
-- `.time_base_intact: bool` — `packets_dropped == 0`, forward gaps only; a timing measurement must also require `packets_reordered == 0`, since a gap is never padded and either event breaks the sample index as a clock
+- `.total_samples: int`, `.packets_received: int`, `.packets_dropped: int`, `.packets_reordered: int` (late or duplicated packets, #205; since #430 a late packet un-counts its drop and fills its own slot, a duplicate is discarded, so neither is a drop or shifts the index)
+- `.time_base_intact: bool` — `packets_dropped == 0`; a gap is never padded, so any true drop breaks the sample index as a clock
 
 ### `write_wav(path, pcm_data, sample_rate=48000, channels=2, sample_width=2) -> Path`
 Write raw PCM data to a WAV file.
@@ -1084,7 +1084,7 @@ Accumulates raw bytes in the recv loop; parses into `BusCycle` objects on `stop(
 
 ### `DebugCaptureResult` (dataclass)
 - `.trace: list[BusCycle]`, `.duration_seconds: float`
-- `.packets_received: int`, `.packets_dropped: int`, `.total_cycles: int`
+- `.packets_received: int`, `.packets_dropped: int`, `.total_cycles: int`, `.packets_reordered: int` (late or duplicated datagrams, #430: a late one un-counts its drop and its cycles are appended in arrival order; a duplicate's cycles are discarded)
 
 ### Constants
 - `DEFAULT_DEBUG_PORT = 11002`
