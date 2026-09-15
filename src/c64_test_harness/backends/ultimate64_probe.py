@@ -14,6 +14,7 @@ in sequence (fail-fast) and returns a :class:`ProbeResult` dataclass.
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import socket
@@ -70,14 +71,25 @@ class ProbeResult:
     #: ``False`` when it did not, ``None`` when not asked.  ``reachable``
     #: stays a reads-only verdict and is not demoted by this field.
     write_ok: bool | None = None
+    #: Whether the write check put ``$0334-$033B`` back (#429 review):
+    #: ``True`` restored and verified, ``False`` written but not confirmed
+    #: restored (also logged at WARNING), ``None`` when nothing was written.
+    #: Mirrors ``LivenessResult.scratch_restored`` (#274/#328); ``write_ok``
+    #: is not demoted by it.
+    scratch_restored: bool | None = None
 
     @property
     def summary(self) -> str:
         """One-line status for logging."""
+        dirty = (
+            f"; scratch ${_WRITE_CHECK_ADDR:04X}-"
+            f"${_WRITE_CHECK_ADDR + _WRITE_CHECK_LEN - 1:04X} not restored"
+            if self.scratch_restored is False else ""
+        )
         if self.reachable:
             lat = f" ({self.latency_ms:.1f}ms)" if self.latency_ms is not None else ""
             dead = f" but WRITE PATH FAILED: {self.error}" if self.write_ok is False else ""
-            return f"U64 at {self.host}:{self.port} reachable{lat}{dead}"
+            return f"U64 at {self.host}:{self.port} reachable{lat}{dead}{dirty}"
         return f"U64 at {self.host}:{self.port} UNREACHABLE: {self.error}"
 
 
@@ -186,6 +198,13 @@ def probe_u64(
     alone is degraded can pass it, and :func:`liveness_probe` remains the
     POST check.
 
+    **The write check mutates RAM; hold the device's DeviceLock** while
+    calling it.  It writes through the raw REST client, so the transport
+    ``MemoryPolicy`` never sees it, and a neighbouring lane's program at
+    ``$0334`` would be clobbered.  The default probe stays read-only and
+    needs no lock.  ``ProbeResult.scratch_restored`` reports whether the
+    span was put back (``False`` is also logged at WARNING).
+
     :param request: the HTTP sender for the write check, with
         :func:`_liveness_request`'s signature (the default).
     """
@@ -259,8 +278,9 @@ def probe_u64(
             )
 
     write_ok: bool | None = None
+    scratch_restored: bool | None = None
     if check_write:
-        write_ok, error = _check_write_path(
+        write_ok, error, scratch_restored = _check_write_path(
             host, port, password, api_timeout,
             request if request is not None else _liveness_request,
         )
@@ -275,6 +295,7 @@ def probe_u64(
         latency_ms=best_latency,
         error=error,
         write_ok=write_ok,
+        scratch_restored=scratch_restored,
     )
 
 
@@ -284,7 +305,7 @@ def _check_write_path(
     password: str | None,
     timeout: float,
     send: "Callable[..., tuple[int, bytes]]",
-) -> tuple[bool, str | None]:
+) -> tuple[bool, str | None, bool | None]:
     """Round-trip 8 bytes at ``$0334`` through ``PUT writemem?data=`` (#241).
 
     Reads the original bytes, writes their bitwise inverse (so a write that
@@ -298,13 +319,18 @@ def _check_write_path(
     It exercises the PUT path only: a device whose POST ``writemem`` alone is
     degraded can pass it; :func:`liveness_probe` is the POST check.
 
-    Returns ``(write_ok, error)``; never raises.
+    Returns ``(write_ok, error, scratch_restored)``.  ``scratch_restored``
+    is ``None`` when nothing was written, else whether the restore was
+    confirmed.  Never raises: ``OSError`` (``URLError``, timeouts, resets),
+    ``ValueError`` and ``http.client.HTTPException`` (``IncompleteRead``)
+    become a failure verdict.
     """
     where = "$%04X-$%04X" % (_WRITE_CHECK_ADDR, _WRITE_CHECK_ADDR + _WRITE_CHECK_LEN - 1)
     read_q = f"address={_wire_hex16(_WRITE_CHECK_ADDR)}&length={_WRITE_CHECK_LEN}"
     original: bytes | None = None
     sent = False
     verdict: tuple[bool, str | None] = (False, f"U64 at {host} write check did not complete")
+    restored: bool | None = None
     try:
         status, data = send(
             "GET", host, port, "/v1/machine:readmem", password, timeout, query=read_q,
@@ -313,7 +339,7 @@ def _check_write_path(
             return False, (
                 f"U64 at {host} write check: readmem of {where} answered "
                 f"HTTP {status} with {len(data)} bytes"
-            )
+            ), None
         original = bytes(data)
         pattern = bytes(b ^ 0xFF for b in original)
         sent = True  # set before the PUT: a timed-out PUT may still have landed
@@ -327,7 +353,18 @@ def _check_write_path(
             status, back = send(
                 "GET", host, port, "/v1/machine:readmem", password, timeout, query=read_q,
             )
-            if status == 200 and bytes(back) == pattern:
+            if status != 200:
+                verdict = (
+                    False,
+                    f"U64 at {host} write check: read-back of {where} answered HTTP {status}",
+                )
+            elif len(back) != _WRITE_CHECK_LEN:
+                verdict = (
+                    False,
+                    f"U64 at {host} write check: read-back of {where} returned "
+                    f"{len(back)} bytes, expected {_WRITE_CHECK_LEN}",
+                )
+            elif bytes(back) == pattern:
                 verdict = (True, None)
             else:
                 verdict = (
@@ -335,12 +372,14 @@ def _check_write_path(
                     f"U64 at {host} write path dead: PUT writemem answered 200 but "
                     f"{where} did not change",
                 )
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, http.client.HTTPException) as exc:
         verdict = (False, f"U64 at {host} write check failed: {type(exc).__name__}: {exc}")
     finally:
         if sent and original is not None:
-            _restore_write_check(host, port, password, timeout, send, original, read_q, where)
-    return verdict
+            restored = _restore_write_check(
+                host, port, password, timeout, send, original, read_q, where,
+            )
+    return verdict[0], verdict[1], restored
 
 
 def _restore_write_check(
@@ -365,7 +404,7 @@ def _restore_write_check(
             )
             if status == 200 and bytes(back) == original:
                 return True
-    except (OSError, ValueError):
+    except (OSError, ValueError, http.client.HTTPException):
         pass
     _log.warning(
         "probe_u64 write check on %s:%d could not confirm %s was restored; the "

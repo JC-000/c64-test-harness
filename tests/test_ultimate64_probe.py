@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import http.client
 import json
+import logging
 import socket
 import subprocess
 import urllib.error
@@ -141,9 +143,20 @@ def test_check_write_non_200_put_fails_even_if_the_bytes_landed():
     assert result.error and "500" in result.error
 
 
-def test_check_write_connection_error_is_a_failure():
+_TRANSPORT_ERRORS = [
+    urllib.error.URLError("reset"),
+    TimeoutError("timed out"),
+    ConnectionResetError("reset by peer"),
+    http.client.IncompleteRead(b"ab"),
+]
+_ERROR_IDS = ["URLError", "TimeoutError", "ConnectionResetError", "IncompleteRead"]
+
+
+@pytest.mark.parametrize("exc", _TRANSPORT_ERRORS, ids=_ERROR_IDS)
+def test_check_write_connection_error_is_a_failure(exc):
+    """#429 review (E3): the check never raises, whatever the transport throws."""
     def boom(*a, **k):
-        raise urllib.error.URLError("reset")
+        raise exc
 
     result = _probe_with(boom, check_write=True)
     assert result.write_ok is False
@@ -161,6 +174,154 @@ def test_check_write_span_is_a_declared_transient_scratch_region():
              if "ultimate64_probe.probe_u64" in r.owner and r.transient
              and r.start <= lo and hi <= r.end]
     assert owned, (lo, hi)
+
+
+class _ScriptedSender:
+    """Replies to the write check's requests in order.
+
+    The check's sequence is: GET read, PUT write, GET read-back, PUT restore,
+    GET restore read-back.  Each step is ``(status, data)`` or an exception
+    instance to raise.  Steps past the script answer 500.
+    """
+
+    ORIGINAL = bytes([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88])
+    PATTERN = bytes(b ^ 0xFF for b in ORIGINAL)
+
+    def __init__(self, steps):
+        self.steps = list(steps)
+        self.calls: list[tuple[str, str, str | None]] = []
+
+    def __call__(self, method, host, port, path, password, timeout, *,
+                 body=None, content_type=None, query=None):
+        self.calls.append((method, path, query))
+        step = self.steps.pop(0) if self.steps else (500, b"")
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+
+_O, _P = _ScriptedSender.ORIGINAL, _ScriptedSender.PATTERN
+_PROBE_LOGGER = "c64_test_harness.backends.ultimate64_probe"
+
+
+def test_check_write_healthy_reports_scratch_restored_true():
+    dev = _ScriptedSender([(200, _O), (200, b"{}"), (200, _P), (200, b"{}"), (200, _O)])
+    r = _probe_with(dev, check_write=True)
+    assert r.write_ok is True
+    assert r.scratch_restored is True
+
+
+def test_scratch_restored_is_none_when_the_check_is_not_asked():
+    r = _probe_with(_FakeDevice())
+    assert r.scratch_restored is None
+
+
+@pytest.mark.parametrize("restore_steps", [
+    [(500, b"")],                                   # E1: restore PUT answers 500
+    [TimeoutError("restore timed out")],            # E2: restore PUT raises
+    [(200, b"{}"), (200, _P)],                      # restore landed nowhere: read-back still inverted
+], ids=["restore-put-500", "restore-put-raises", "restore-readback-wrong"])
+def test_a_failed_restore_is_reported_not_healthy(restore_steps, caplog):
+    """#429 review (MAJOR 2): the scratch span still holds the inverted bytes.
+
+    Mirrors ``LivenessResult.scratch_restored`` (#274/#328): the write
+    verdict stands, but the restore is reported, logged at WARNING and
+    flagged in ``summary``.
+    """
+    dev = _ScriptedSender([(200, _O), (200, b"{}"), (200, _P), *restore_steps])
+    with caplog.at_level(logging.WARNING, logger=_PROBE_LOGGER):
+        r = _probe_with(dev, check_write=True)
+    assert r.write_ok is True
+    assert r.scratch_restored is False
+    assert "not restored" in r.summary
+    warnings = [rec for rec in caplog.records
+                if rec.name == _PROBE_LOGGER and rec.levelno == logging.WARNING]
+    assert warnings, "no WARNING for the unconfirmed restore"
+
+
+@pytest.mark.parametrize("exc", _TRANSPORT_ERRORS, ids=_ERROR_IDS)
+def test_an_error_on_the_readback_is_a_failure_and_still_restores(exc):
+    """#429 review (E3): an exception after the write, e.g. IncompleteRead."""
+    dev = _ScriptedSender([(200, _O), (200, b"{}"), exc, (200, b"{}"), (200, _O)])
+    r = _probe_with(dev, check_write=True)
+    assert r.write_ok is False
+    assert r.scratch_restored is True
+    assert [m for m, _, _ in dev.calls] == ["GET", "PUT", "GET", "PUT", "GET"]
+
+
+def test_a_non_200_readback_is_a_failure():
+    """#429 review (R6)."""
+    dev = _ScriptedSender([(200, _O), (200, b"{}"), (503, b""), (200, b"{}"), (200, _O)])
+    r = _probe_with(dev, check_write=True)
+    assert r.write_ok is False
+    assert r.error and "503" in r.error
+
+
+def test_a_short_initial_read_is_a_failure_and_sends_no_write():
+    """#429 review (R7): nothing to restore, so nothing is written."""
+    dev = _ScriptedSender([(200, _O[:4])])
+    r = _probe_with(dev, check_write=True)
+    assert r.write_ok is False
+    assert r.error and "4 bytes" in r.error
+    assert [m for m, _, _ in dev.calls] == ["GET"]
+    assert r.scratch_restored is None
+
+
+def test_a_short_readback_says_how_many_bytes_came_back():
+    """#429 review (E4)."""
+    dev = _ScriptedSender([(200, _O), (200, b"{}"), (200, _P[:3]), (200, b"{}"), (200, _O)])
+    r = _probe_with(dev, check_write=True)
+    assert r.write_ok is False
+    assert r.error and "3 bytes" in r.error
+
+
+def test_probe_u64_docstring_says_the_write_check_needs_the_device_lock():
+    """#429 review (4): the check mutates RAM through the raw REST client."""
+    import inspect
+
+    doc = " ".join((inspect.getdoc(probe_u64) or "").split())
+    assert "mutates RAM" in doc
+    assert "DeviceLock" in doc
+
+
+def test_write_check_scratch_purpose_names_the_raw_client_bypass():
+    from c64_test_harness.memory_policy import HARNESS_SCRATCH
+
+    region = next(r for r in HARNESS_SCRATCH if r.owner == "backends.ultimate64_probe.probe_u64")
+    assert "raw REST client (bypasses the transport MemoryPolicy)" in region.purpose
+
+
+_REPO_ROOT = __import__("pathlib").Path(__file__).resolve().parent.parent
+
+
+def _doc(rel: str) -> str:
+    return " ".join((_REPO_ROOT / rel).read_text(encoding="utf-8").split())
+
+
+def test_memory_safety_doc_names_the_write_check_in_every_transient_passage():
+    """#429 review (5): three passages still listed only the old transient set."""
+    text = (_REPO_ROOT / "docs/memory_safety.md").read_text(encoding="utf-8")
+    footnote = next(ln for ln in text.splitlines() if ln.startswith("† *transient*"))
+    assert "probe_u64" in footnote, footnote
+    reading = text[text.index("Reading the table:"):]
+    assert "* `backends.ultimate64_probe.probe_u64`" in reading
+    flat = " ".join(text.split())
+    i = flat.index("Transient entries (")
+    assert "probe_u64" in flat[i:i + 200], flat[i:i + 200]
+
+
+def test_readme_and_patterns_say_the_write_check_needs_the_device_lock():
+    """#429 review (4)."""
+    for rel in ("README.md", ".claude/skills/c64-test/PATTERNS.md"):
+        flat = _doc(rel)
+        i = flat.index("check_write=True")
+        window = flat[max(0, i - 300): i + 600]
+        assert "DeviceLock" in window, rel
+
+
+def test_skill_item_15_has_no_comma_splice():
+    """#429 review (7): two sentences were joined by a comma before probe_u64."""
+    assert "(issue #241), `probe_u64(host, check_write=True)`" not in _doc(".claude/skills/c64-test/SKILL.md")
 
 
 def test_check_write_is_off_by_default_and_sends_nothing():
