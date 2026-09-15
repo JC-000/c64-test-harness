@@ -194,7 +194,7 @@ class TestDroppedPacketsBreakTheTimeBase:
         assert _result(0).time_base_intact is True
 
     def test_a_single_drop_invalidates_the_run(self) -> None:
-        """Gaps are counted, never padded, so index stops being a clock."""
+        """A result built without fill has an unfilled drop, so the index is not a clock."""
         assert _result(1).time_base_intact is False
 
     def test_u64_result_carries_the_same_check(self) -> None:

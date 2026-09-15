@@ -30,7 +30,9 @@ the window, because a REST read is a DMA that halts the 6510):
    the slope across windows of two lengths (a fixed edge offset cancels
    in the slope).  Lost packets are zero-filled (#410), so a lossy capture
    keeps its time base; it is retried only if the time base is not
-   intact, more than ``MAX_FILL_FRACTION`` of it is fill, or fill lies
+   intact, more than ``MAX_LOST_TIME_FRACTION`` of the stream was
+   discarded rather than delivered (#443),
+   more than ``MAX_FILL_FRACTION`` of it is fill, or fill lies
    within one packet of a detected tone edge (a fill boundary is a step
    the edge detector could take for the tone).
 
@@ -80,7 +82,15 @@ from c64_test_harness.backends.u64_audio_capture import (
     AUDIO_FRAMES_PER_PACKET,
     AudioCapture,
 )
-from audio_link_loss import CAPTURE_ATTEMPTS, MAX_FILL_FRACTION, capture_usable, fill_near
+from audio_link_loss import (
+    CAPTURE_ATTEMPTS,
+    MAX_FILL_FRACTION,
+    MAX_LOST_TIME_FRACTION,
+    capture_usable,
+    fill_near,
+    lost_time_fraction,
+    payloads_discarded,
+)
 from c64_test_harness.backends.ultimate64_helpers import (
     CAT_U64_SPECIFIC,
     check_measurement_environment,
@@ -334,11 +344,19 @@ def _measure(target, outer: int, wav_dir: Path, tag: str) -> dict:
             "outer": outer, "cycles": cycles, "samples": last - first,
             "packets": result.packets_received, "attempt": attempt,
             "fill_fraction": result.fill_fraction,
+            "packets_dropped": result.packets_dropped,
+            "payloads_discarded": payloads_discarded(result),
+            "lost_time_fraction": lost_time_fraction(result),
         }
     pytest.fail(
         f"{CAPTURE_ATTEMPTS} captures in a row had a broken time base, more "
-        f"than {MAX_FILL_FRACTION:.0%} fill, or fill at a tone edge; the link "
-        f"is too lossy to measure on right now (#410)"
+        f"than {MAX_FILL_FRACTION:.0%} fill, more than "
+        f"{MAX_LOST_TIME_FRACTION:.0%} lost time (#443), or fill at a tone "
+        f"edge; the last one dropped {result.packets_dropped} packet(s), was "
+        f"{result.fill_fraction:.1%} fill, and discarded "
+        f"{payloads_discarded(result)} datagram(s)' PCM "
+        f"({lost_time_fraction(result):.1%} of the stream). The link is too "
+        f"lossy to measure on right now (#410)"
     )
 
 

@@ -214,6 +214,29 @@ bytes at its own position, so sample index stays a clock across loss.
   unfilled drop, no sequence resync, and no datagram of another size. It no
   longer means nothing was lost; `packets_dropped == 0` does.
 - A late packet overwrites its own fill and a duplicate is discarded (#430).
+- **Discarded payloads are lost stream time, and no fill field shows it
+  (#443).** Two paths reach it, and both leave `packets_dropped`,
+  `packets_filled` and `fill_fraction` at 0, `filled_frame_ranges` at `()`,
+  `sequence_resyncs` at 0 and `time_base_intact` True:
+  - **a counter that restarts over a number that was itself lost** reads as a
+    run of duplicates, so their PCM is discarded (loopback: 52 datagrams in,
+    41 packets in the WAV, 11 never delivered). This path depends on **#452**
+    — it is constructed today only because nobody has established whether
+    starting a stream resets the FPGA's sequence counter; if it does, it
+    becomes routine and this note stops being enough.
+  - **a tail of duplicate-looking datagrams still held at `stop()`**, which
+    `flush_held` discards (106 in, 100 packets in the WAV, 6 discarded). No
+    loss and no restart is needed, so this path does **not** depend on #452;
+    it is bounded by `MAX_HELD_DUPLICATES` (8 packets, 32 ms).
+
+  The harm is **duration, not content**: the discarded bytes are identical to
+  PCM already in the file, but the stream time they carried is gone, so the
+  count is an *upper bound on packets of lost time*. `packets_reordered` is
+  the **only trace** on the result (it counts every datagram behind the
+  highest number, held ones included), so reorders without drops do not mean
+  the capture is complete. A discard is not in itself a fault — a genuine
+  retransmission is discarded correctly (101 in, 100 in the WAV, 1 discarded)
+  — so `tests/audio_link_loss.py` bounds lost time rather than requiring zero.
 - **Older captures:** before #410 gaps were not padded (the capture was the
   concatenation of what arrived) and `time_base_intact` was
   `packets_dropped == 0`. #430 on its own left zero-length placeholders,

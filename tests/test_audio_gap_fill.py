@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from c64_test_harness.backends import u64_audio_capture as uac
+from c64_test_harness.backends._stream_seq import MAX_HELD_DUPLICATES
 from c64_test_harness.backends.render_wav_u64 import U64CaptureResult, _to_u64_result
 from c64_test_harness.backends.u64_audio_capture import (
     AUDIO_FRAMES_PER_PACKET,
@@ -30,20 +31,33 @@ from c64_test_harness.backends.u64_audio_capture import (
 
 from audio_link_loss import (
     MAX_FILL_FRACTION,
+    MAX_LOST_TIME_FRACTION,
     MEASURED_IDLE_LOSS_MAX,
     MEASURED_LOADED_LOSS_MIN,
     capture_usable,
     fill_near,
+    lost_time_fraction,
+    payloads_discarded,
 )
 
 FILL = None  # marker for an all-zero packet in the decoded order
+
+#: A payload every datagram shares, so a re-sent number is digest-identical
+#: to the one already received -- what makes a discard possible at all.
+#: Not all-zero, so it is never confused with fill.
+SILENT = struct.pack("<H", 0xA5A5) * (AUDIO_PCM_BYTES_PER_PACKET // 2)
 
 
 def _payload(seq: int, size: int = AUDIO_PCM_BYTES_PER_PACKET) -> bytes:
     return struct.pack("<H", (seq + 1) & 0xFFFF or 1) * (size // 2)
 
 
-def _capture(seqs, tmp_path: Path, size: int = AUDIO_PCM_BYTES_PER_PACKET):
+def _capture(
+    seqs,
+    tmp_path: Path,
+    size: int = AUDIO_PCM_BYTES_PER_PACKET,
+    payload: bytes | None = None,
+):
     cap = AudioCapture(
         port=EPHEMERAL_AUDIO_PORT, bind_addr="127.0.0.1",
         sample_rate=U64_NTSC_AUDIO_RATE_HZ, recv_buf_size=1 << 20,
@@ -52,7 +66,8 @@ def _capture(seqs, tmp_path: Path, size: int = AUDIO_PCM_BYTES_PER_PACKET):
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as tx:
             for i, s in enumerate(seqs):
-                tx.sendto(struct.pack("<H", s) + _payload(s, size), ("127.0.0.1", cap.port))
+                body = payload if payload is not None else _payload(s, size)
+                tx.sendto(struct.pack("<H", s) + body, ("127.0.0.1", cap.port))
                 if i % 20 == 19:
                     time.sleep(0.005)
         deadline = time.monotonic() + 5.0
@@ -118,6 +133,47 @@ def test_a_late_packet_inside_a_filled_burst_splits_the_range(tmp_path) -> None:
     assert (result.packets_dropped, result.packets_filled) == (4, 4)
     assert _order(pcm) == list(range(50)) + [FILL, FILL, 52, FILL, FILL] + list(range(55, 100))
     assert result.filled_frame_ranges == ((50 * 192, 2 * 192), (53 * 192, 2 * 192))
+    assert result.time_base_intact is True
+
+
+def test_a_late_packet_takes_its_own_slot_in_an_asymmetric_burst(tmp_path) -> None:
+    """Slot *order*, not just slot count (#449 review).
+
+    Missing 50-54 with seq 51 arriving late: it belongs at offset 1 of the
+    burst.  The centre-of-burst case above is symmetric, so it reads the
+    same whichever end of ``tracked_missing`` the slots are bound from.
+    """
+    seqs = list(range(50)) + list(range(55, 60)) + [51]
+    result, pcm = _capture(seqs, tmp_path)
+    assert (result.packets_dropped, result.packets_filled) == (4, 4)
+    assert _order(pcm) == (
+        list(range(50)) + [FILL, 51, FILL, FILL, FILL] + list(range(55, 60))
+    )
+    assert result.filled_frame_ranges == ((50 * 192, 1 * 192), (52 * 192, 3 * 192))
+    assert result.time_base_intact is True
+
+
+def test_a_late_packet_after_an_over_window_gap_keeps_its_absolute_position(
+    tmp_path,
+) -> None:
+    """Untracked fill precedes the tracked slots, so packet 1400 sits at 1400.
+
+    A 1500-packet gap is 477 untracked plus 1023 tracked.  Appending the
+    untracked block *after* the tracked slots leaves every count identical
+    and moves the late packet 477 positions early (#449 review).
+    """
+    result, pcm = _capture([0, 1501, 1502, 1503, 1504, 1400], tmp_path)
+    assert (result.packets_dropped, result.packets_filled) == (1499, 1499)
+    order = _order(pcm)
+    assert len(order) == 1505
+    assert order.index(1400) == 1400
+    assert order[0] == 0
+    assert order[1501:] == [1501, 1502, 1503, 1504]
+    assert set(order[1:1400]) == {FILL}
+    assert set(order[1401:1501]) == {FILL}
+    assert result.filled_frame_ranges == (
+        (1 * 192, 1399 * 192), (1401 * 192, 100 * 192),
+    )
     assert result.time_base_intact is True
 
 
@@ -205,6 +261,93 @@ def test_capture_usable_applies_both_conditions() -> None:
     assert capture_usable(_r(6, 6, 100 * 192)) is False         # 0.06
     assert capture_usable(_r(1, 0, 100 * 192)) is False         # unfilled drop
     assert capture_usable(_r(0, 0, 100 * 192, resyncs=1)) is False
+
+
+def test_the_contract_says_a_held_discard_is_invisible_in_every_fill_field() -> None:
+    """The reorder count is the only trace, and it depends on #452 (#449 review)."""
+    doc = uac.__doc__ or ""
+    md = (Path(__file__).resolve().parent.parent / "docs" / "sid_audio.md").read_text()
+    for where, text in (("module docstring", doc), ("docs/sid_audio.md", md)):
+        assert "#443" in text, where
+        assert "#452" in text, where
+        assert "packets_reordered" in text, where
+        assert "only trace" in text, where
+
+
+def _discarding(discarded: int, *, packets_in_wav: int, **kw) -> CaptureResult:
+    """A result with *packets_in_wav* packets that discarded *discarded* more.
+
+    ``payloads_discarded`` is set as an attribute so these stand both before
+    #443 lands the field and after, when it is a real field on both types.
+    """
+    r = _r(kw.pop("dropped", 0), kw.pop("filled", 0), packets_in_wav * 192, **kw)
+    r.payloads_discarded = discarded
+    return r
+
+
+def test_a_genuine_duplicate_is_discarded_and_the_capture_stays_usable(tmp_path) -> None:
+    """The must-pass control: a correct discard must not fail a live run (#443).
+
+    Reviewer-8's row 2 stream, verbatim.  Gating on ``discarded == 0`` fails
+    here, which is why the rule bounds lost time instead.
+    """
+    seqs = list(range(50)) + [48] + list(range(50, 100))
+    result, pcm = _capture(seqs, tmp_path)
+    assert result.packets_received == 101
+    assert len(pcm) // AUDIO_PCM_BYTES_PER_PACKET == 100
+    assert (result.packets_dropped, result.packets_filled) == (0, 0)
+    assert (result.packets_reordered, result.sequence_resyncs) == (1, 0)
+    assert result.time_base_intact is True
+    assert _order(pcm) == list(range(100))
+    assert capture_usable(result) is True
+    # And still usable once #443 lands the counter: 1 of 101 is under bound.
+    assert capture_usable(_discarding(1, packets_in_wav=100)) is True
+    assert lost_time_fraction(_discarding(1, packets_in_wav=100)) == pytest.approx(1 / 101)
+
+
+def test_a_restart_over_a_lost_number_reads_clean_in_every_fill_field(tmp_path) -> None:
+    """11 datagrams' PCM never delivered, and nothing but the reorder count says so."""
+    seqs = [0, 1, 2] + list(range(4, 41)) + list(range(12))
+    result, pcm = _capture(seqs, tmp_path, payload=SILENT)
+    assert result.packets_received == 52
+    assert len(pcm) // AUDIO_PCM_BYTES_PER_PACKET == 41
+    assert (result.packets_dropped, result.packets_filled) == (0, 0)
+    assert result.fill_fraction == 0.0
+    assert result.filled_frame_ranges == ()
+    assert result.sequence_resyncs == 0
+    assert result.time_base_intact is True
+    assert result.packets_reordered > 0, "the only trace there is"
+    # 11 of 52 is 21% of the stream: over bound once #443 counts it.
+    assert capture_usable(_discarding(11, packets_in_wav=41)) is False
+    assert lost_time_fraction(_discarding(11, packets_in_wav=41)) == pytest.approx(11 / 52)
+
+
+def test_a_held_tail_at_stop_discards_without_loss_or_restart(tmp_path) -> None:
+    """The second discard path: no lost packet, no restart, so no #452 dependency."""
+    seqs = list(range(100)) + list(range(MAX_HELD_DUPLICATES - 2))
+    result, pcm = _capture(seqs, tmp_path, payload=SILENT)
+    assert result.packets_received == 106
+    assert len(pcm) // AUDIO_PCM_BYTES_PER_PACKET == 100
+    assert (result.packets_dropped, result.packets_filled) == (0, 0)
+    assert result.sequence_resyncs == 0
+    assert result.time_base_intact is True
+
+
+def test_lost_time_is_bounded_by_share_not_by_count() -> None:
+    """The same 6-packet held tail is 5.7% of 106 packets and 0.4% of 1380."""
+    assert capture_usable(_discarding(6, packets_in_wav=100)) is False
+    real = _discarding(6, packets_in_wav=1380)
+    assert lost_time_fraction(real) < MAX_LOST_TIME_FRACTION
+    assert capture_usable(real) is True
+
+
+def test_a_result_without_the_counter_reads_as_none_discarded() -> None:
+    """#449 must keep working against a head that has not landed #443 yet."""
+    r = _r(0, 0, 100 * 192)
+    assert not hasattr(r, "payloads_discarded") or r.payloads_discarded == 0
+    assert payloads_discarded(r) == 0
+    assert lost_time_fraction(r) == 0.0
+    assert capture_usable(r) is True
 
 
 def test_fill_near_an_edge() -> None:

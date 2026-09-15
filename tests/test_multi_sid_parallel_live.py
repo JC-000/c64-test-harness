@@ -45,7 +45,14 @@ from c64_test_harness.backends.u64_audio_capture import (
 )
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
 
-from audio_link_loss import CAPTURE_ATTEMPTS, MAX_FILL_FRACTION, capture_usable
+from audio_link_loss import (
+    CAPTURE_ATTEMPTS,
+    MAX_FILL_FRACTION,
+    MAX_LOST_TIME_FRACTION,
+    capture_usable,
+    lost_time_fraction,
+    payloads_discarded,
+)
 from live_fixture_teardown import (
     raise_teardown_failures,
     read_restore_defaults,
@@ -366,6 +373,12 @@ def quad_wav(u64_client, wav_dir: Path) -> Path:
                 "attempt": attempt,
                 "packets_received": result.packets_received,
                 "packets_dropped": result.packets_dropped,
+                # Loss that no fill field shows: a discarded payload is
+                # stream time missing from the WAV while every other figure
+                # here reads clean (#443).  Bounded, not forbidden -- a
+                # genuine retransmission is discarded correctly.
+                "payloads_discarded": payloads_discarded(result),
+                "lost_time_fraction": lost_time_fraction(result),
                 "fill_fraction": result.fill_fraction,
                 "time_base_intact": result.time_base_intact,
             })
@@ -398,6 +411,8 @@ def quad_wav(u64_client, wav_dir: Path) -> Path:
             "duration_seconds": result.duration_seconds,
             "packets_received": result.packets_received,
             "packets_dropped": result.packets_dropped,
+            "payloads_discarded": payloads_discarded(result),
+            "lost_time_fraction": lost_time_fraction(result),
             "packets_filled": result.packets_filled,
             "fill_fraction": result.fill_fraction,
             "time_base_intact": result.time_base_intact,
@@ -505,9 +520,14 @@ def test_capture_metadata(quad_wav: Path) -> None:
     # Not packets_dropped == 0: that fails most runs on this Wi-Fi bench,
     # which is link loss, not firmware (#410).  Lost packets are zero-filled,
     # so what matters is an exact time base and a bounded share of silence.
-    assert cap["time_base_intact"] and cap["fill_fraction"] <= MAX_FILL_FRACTION, (
+    assert (
+        cap["time_base_intact"]
+        and cap["fill_fraction"] <= MAX_FILL_FRACTION
+        and cap["lost_time_fraction"] <= MAX_LOST_TIME_FRACTION
+    ), (
         f"no usable capture in {cap['attempts']} attempt(s) "
-        f"(fill bound {MAX_FILL_FRACTION}): {cap['attempt_log']}"
+        f"(fill bound {MAX_FILL_FRACTION}, lost-time bound "
+        f"{MAX_LOST_TIME_FRACTION}): {cap['attempt_log']}"
     )
     for engine in ENGINE_META:
         assert engine in meta["engines"], f"Missing engine: {engine}"
