@@ -188,6 +188,11 @@ class Ultimate64Transport(HardwareTransportBase):
         first on the whole payload and is not chunked here; a write that
         falls back from it to REST is chunked like any other.
         """
+        # bool subclasses int, so True would pass the span check below and
+        # reach the SocketDMA path, which never goes through the client's
+        # address validation (#340).  Refused with the bad-address error.
+        if isinstance(addr, bool):
+            raise ValueError(f"write_memory address must be an int, not bool: {addr!r}")
         if isinstance(data, list):
             data = bytes(data)
         if not data:
