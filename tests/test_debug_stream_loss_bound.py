@@ -103,21 +103,24 @@ def test_the_receiver_counts_a_known_gap_exactly() -> None:
 
 
 def test_a_backward_step_is_not_counted_as_a_huge_gap() -> None:
-    """Control: 0..49, 48, 50..99 is 101 received and exactly 1 dropped.
+    """Control: 0..49, 48, 50..99 is 101 received, 0 dropped, 1 reordered.
 
-    The step back to 48 is a duplicate.  Without the ``gap < 0x8000`` guard,
-    49 -> 48 is read as a forward gap of 65,535 packets, a loss fraction near
-    1.0; with it the step is ignored.
+    The step back to 48 is a duplicate: the same sequence number, already
+    received, with an identical payload.  Without the ``gap < 0x8000`` guard,
+    49 -> 48 would read as a forward gap of 65,535 packets, a loss fraction
+    near 1.0.
 
-    The 1 is current receiver behaviour, pinned rather than endorsed:
-    ``_recv_loop`` sets ``_last_seq`` to the backward sequence number, so the
-    next packet (50, expected 49) counts as one drop.  A duplicate therefore
-    overcounts ``packets_dropped`` by one (an adjacent swap by two); filed as
-    #430, where this pin must move with the fix.
+    Since #430 the receiver does not move its position back to 48, so the
+    next packet (50) is in order and nothing is charged as dropped.  The
+    duplicate's cycles are discarded, and it is counted once in
+    ``packets_reordered``.  Before #430 this read 1 dropped (an adjacent swap
+    read 2), and this pin held that figure until the fix landed.
     """
     result = _capture(list(range(0, 50)) + [48] + list(range(50, 100)))
-    assert (result.packets_received, result.packets_dropped) == (101, 1)
-    assert _debug_loss_fraction(result) == pytest.approx(1 / 102)
+    assert (result.packets_received, result.packets_dropped) == (101, 0)
+    assert result.packets_reordered == 1
+    assert result.total_cycles == 100 * ENTRIES_PER_PACKET
+    assert _debug_loss_fraction(result) == pytest.approx(0.0)
     assert _debug_loss_within_bound(result) is True
 
 
