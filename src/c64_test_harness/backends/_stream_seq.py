@@ -9,39 +9,78 @@ late or duplicated datagram arrived, so the next in-order datagram was
 charged as a gap too: an adjacent swap read as 2 dropped, a duplicate as 1,
 and a datagram *d* positions late as *d* + 1 (#430).  This tracker keeps the
 highest sequence number seen, remembers which recent numbers a gap charged as
-dropped, and un-charges one when it turns up late.
-
-Rules, with ``d = (highest - seq) & 0xFFFF`` for a datagram that is not the
-next expected one:
+dropped and which it actually received (with a payload digest), and
+classifies each datagram that is not the next expected one:
 
 * **Forward gap** (``0 < seq - expected < 0x8000``): every skipped number is
   counted dropped.  The most recent ``window - 1`` of them are remembered.
-* **Late** (``seq`` is a remembered missing number): one drop is un-counted
-  and one backward event is counted.
-* **Duplicate** (otherwise, ``d < window``): nothing dropped, one backward
-  event; the caller should discard the payload.  A datagram later than the
-  window whose drop was already charged also lands here -- its drop stays
-  counted, which is the only overcount left and needs ``window`` datagrams of
-  lateness.
-* **Resync** (``d >= window``): the stream's counter restarted, or a packet
-  arrived absurdly late.  Treated as the new position: one backward event,
-  nothing dropped, remembered gaps forgotten, payload kept.  Without this a
-  restarted counter would have every later datagram discarded as a duplicate.
+* **Late** (``seq`` is a remembered missing number not yet arrived): one drop
+  is un-counted and one reorder is counted.
+* **Held** (``seq`` was actually received within the window **and** its
+  payload digest is identical): one reorder; the caller sets the payload
+  aside, undecided.  A true network duplicate and a counter that restarted
+  over byte-identical payloads (digital silence) look the same here, so the
+  *next* datagram decides:
+
+  - it **continues the held run** (last held + 1, still behind the highest
+    number, not a missing number): the stream restarted.  Resync, and the
+    held payloads are **re-admitted** ahead of it, so nothing is lost.  A
+    continuation that is itself identical is held too, up to
+    ``MAX_HELD_DUPLICATES``; one more is a restart.
+  - anything else (the stream carries on past the highest number, a late
+    packet, another backward step): the held datagrams were duplicates and
+    are discarded.
+
+* **Resync** (anything else behind the highest number): one reorder, nothing
+  dropped, remembered state forgotten, and ``seq`` becomes the tracker's
+  position; the caller keeps the payload and counts a resync.  This covers:
+
+  - a restarted counter whose payloads differ, including one restarting
+    below numbers already received (#443 review);
+  - a forward loss of 32,768..65,535 packets, which reads as a backward step;
+  - **a packet at least ``window`` positions late.**  Its missing entry has
+    been pruned, so it resyncs: it is appended where it arrived, the highest
+    number moves back to it, and the next in-order datagram is charged a gap
+    back up to where the stream really is.  That overcounts ``dropped`` by
+    about the lateness, as before #430, and is the known overcount left.
+
+**Declared residuals of the held rule** (grade: no UDP duplication has been
+measured on this bench, so none of these has been seen):
+
+- a run of more than ``MAX_HELD_DUPLICATES`` consecutive, consecutively
+  numbered network duplicates is taken as a restart (resync, re-admitted);
+- datagrams still held when the capture stops are discarded as duplicates
+  (:meth:`SequenceTracker.flush_held`), so a silent restart in the last
+  ``MAX_HELD_DUPLICATES`` packets of a capture loses those packets;
+- a duplicate run immediately followed by the next number *after the run*
+  that is still behind the highest reads as a restart (re-sent 48, 49 and
+  then a re-sent 50 with different bytes).
+
+Memory: the missing and received books each hold at most ``window`` entries,
+pruned by age as the highest number advances; at most
+``MAX_HELD_DUPLICATES`` payloads are held.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-#: Datagrams of reordering the tracker can repair.  The longest loss burst
-#: measured on the U64E was 313 debug packets (#356) and no reorder has been
-#: seen at all (#410, #430), so 1024 covers both with room: ~4 s of audio
-#: (250 packets/s), ~0.4 s of debug stream (~2,400 packets/s).
+#: Datagrams of reordering the tracker can repair, and how far back it
+#: remembers what it received.  **No measured basis:** no reorder or
+#: duplicate has been observed on this bench (#410, #430: zero backward steps
+#: in 28 captures), so there is no lateness distribution to size it from.  It
+#: bounds memory, and lateness at ~4 s of audio (250 packets/s) or ~0.4 s of
+#: debug stream (~2,400 packets/s).
 SEQ_REORDER_WINDOW = 1024
+
+#: Digest-identical datagrams held at once before a continuing run is taken
+#: as a restart.  Chosen, not measured: no duplicate has been seen at all.
+#: 8 audio packets are 32 ms; 8 debug packets ~3 ms.
+MAX_HELD_DUPLICATES = 8
 
 NEXT = "next"
 GAP = "gap"
 LATE = "late"
-DUPLICATE = "duplicate"
+HELD = "held"
 RESYNC = "resync"
 
 
@@ -56,34 +95,114 @@ class SeqEvent:
     untracked: int = 0
     #: LATE: the value :meth:`SequenceTracker.bind` attached to this number.
     slot: object = None
-    #: The step the receiver logs: expected sequence number.
+    #: The next sequence number the tracker expected.
     expected: int | None = None
+    #: RESYNC: tokens of held datagrams to keep, in arrival order, *before*
+    #: this datagram.
+    readmit: tuple = ()
+    #: Held datagrams this event decided were duplicates (discard them).
+    discarded_held: int = 0
+
+
+@dataclass(frozen=True)
+class _Arrived:
+    """A missing entry whose packet has since arrived late."""
+
+    digest: object
 
 
 @dataclass
 class SequenceTracker:
-    """Counts true loss and backward events for a 16-bit sequence stream."""
+    """Counts true loss, reorders and resyncs for a 16-bit sequence stream."""
 
     window: int = SEQ_REORDER_WINDOW
+    max_held: int = MAX_HELD_DUPLICATES
     dropped: int = 0
+    #: Datagrams that arrived behind the highest number seen (late, held or
+    #: resync) -- one per datagram, not one per backward step.
     reordered: int = 0
+    resyncs: int = 0
     highest: int | None = None
     _missing: dict[int, object] = field(default_factory=dict)
+    _received: dict[int, object] = field(default_factory=dict)
+    _held: list[tuple[int, object, object]] = field(default_factory=list)
 
     def bind(self, seq: int, slot: object) -> None:
         """Attach *slot* to a remembered missing number (returned when LATE)."""
-        if seq in self._missing:
+        if seq in self._missing and not isinstance(self._missing[seq], _Arrived):
             self._missing[seq] = slot
 
-    def observe(self, seq: int) -> SeqEvent:
+    def flush_held(self) -> int:
+        """Decide every held datagram is a duplicate; returns how many."""
+        n = len(self._held)
+        self._held.clear()
+        return n
+
+    def _age(self, seq: int) -> int:
+        assert self.highest is not None
+        return (self.highest - seq) & 0xFFFF
+
+    def _behind(self, seq: int) -> bool:
+        assert self.highest is not None
+        return ((seq - self.highest - 1) & 0xFFFF) >= 0x8000
+
+    def _unarrived_missing(self, seq: int) -> bool:
+        return (
+            seq in self._missing
+            and not isinstance(self._missing[seq], _Arrived)
+            and self._age(seq) < self.window
+        )
+
+    def _seen_identical(self, seq: int, digest: object) -> bool:
+        if self._age(seq) >= self.window:
+            return False
+        entry = self._missing.get(seq)
+        if isinstance(entry, _Arrived):
+            return entry.digest == digest
+        return seq in self._received and self._received[seq] == digest
+
+    def _advance(self, seq: int, digest: object) -> None:
+        self.highest = seq
+        self._received[seq] = digest
+        self._prune()
+
+    def observe(self, seq: int, digest: object = None, token: object = None) -> SeqEvent:
+        """Classify one datagram.
+
+        :param digest: An equality-comparable fingerprint of the payload
+            (the receivers pass ``zlib.crc32``).
+        :param token: What to hand back in ``readmit`` if this datagram is
+            held and later re-admitted (the receivers pass the payload).
+        """
         seq &= 0xFFFF
         if self.highest is None:
-            self.highest = seq
+            self._advance(seq, digest)
             return SeqEvent(NEXT)
+
+        discarded = 0
+        if self._held:
+            last = self._held[-1][0]
+            if (
+                seq == (last + 1) & 0xFFFF
+                and self._behind(seq)
+                and not self._unarrived_missing(seq)
+            ):
+                self.reordered += 1
+                if self._seen_identical(seq, digest) and len(self._held) < self.max_held:
+                    self._held.append((seq, digest, token))
+                    return SeqEvent(HELD)
+                return self._restart(seq, digest)
+            discarded = self.flush_held()
+
+        ev = self._classify(seq, digest, token)
+        ev.discarded_held = discarded
+        return ev
+
+    def _classify(self, seq: int, digest: object, token: object) -> SeqEvent:
+        assert self.highest is not None
         expected = (self.highest + 1) & 0xFFFF
         if seq == expected:
-            self.highest = seq
-            self._prune()
+            self._advance(seq, digest)
             return SeqEvent(NEXT)
         gap = (seq - expected) & 0xFFFF
         if gap < 0x8000:
@@ -94,26 +213,46 @@ class SequenceTracker:
             )
             for s in tracked:
                 self._missing[s] = None
-            self.highest = seq
-            self._prune()
+            self._advance(seq, digest)
             return SeqEvent(
                 GAP, tracked_missing=tracked, untracked=gap - n_tracked,
                 expected=expected,
             )
+
         self.reordered += 1
-        if seq in self._missing:
+        if self._unarrived_missing(seq):
             self.dropped -= 1
-            return SeqEvent(LATE, slot=self._missing.pop(seq), expected=expected)
-        if (self.highest - seq) & 0xFFFF < self.window:
-            return SeqEvent(DUPLICATE, expected=expected)
-        self.highest = seq
+            slot = self._missing[seq]
+            self._missing[seq] = _Arrived(digest)
+            return SeqEvent(LATE, slot=slot, expected=expected)
+        if self._seen_identical(seq, digest):
+            self._held.append((seq, digest, token))
+            return SeqEvent(HELD, expected=expected)
+        self.resyncs += 1
         self._missing.clear()
+        self._received.clear()
+        self._advance(seq, digest)
         return SeqEvent(RESYNC, expected=expected)
 
-    def _prune(self) -> None:
+    def _restart(self, seq: int, digest: object) -> SeqEvent:
+        """The held run continued: a restarted counter.  Re-admit it."""
         assert self.highest is not None
-        while self._missing:
-            oldest = next(iter(self._missing))
-            if (self.highest - oldest) & 0xFFFF < self.window:
-                break
-            del self._missing[oldest]
+        expected = (self.highest + 1) & 0xFFFF
+        held, self._held = self._held, []
+        self.resyncs += 1
+        self._missing.clear()
+        self._received.clear()
+        for s, d, _ in held:
+            self._received[s] = d
+        self._advance(seq, digest)
+        return SeqEvent(
+            RESYNC, expected=expected, readmit=tuple(t for _, _, t in held)
+        )
+
+    def _prune(self) -> None:
+        for book in (self._missing, self._received):
+            while book:
+                oldest = next(iter(book))
+                if self._age(oldest) < self.window:
+                    break
+                del book[oldest]

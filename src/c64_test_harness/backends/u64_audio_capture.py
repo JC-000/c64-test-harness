@@ -75,6 +75,7 @@ import subprocess
 import threading
 import time
 import wave
+import zlib
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
@@ -258,15 +259,29 @@ class CaptureResult:
     packets_received: int
     packets_dropped: int
     sample_rate_exact: Fraction | None = None
-    #: Packets whose sequence number was not ahead of the highest seen
-    #: (#205, #430).  A late packet un-counts the drop its gap charged and
-    #: its PCM goes into its own slot; a duplicate's PCM is discarded.  So
-    #: neither shifts the sample index, and neither is in
-    #: ``packets_dropped``.  The exceptions: a packet more than
-    #: ``_stream_seq.SEQ_REORDER_WINDOW`` (1024) positions late is discarded
-    #: with its drop still counted, and a backward jump at least that far
-    #: is taken as a restarted counter (kept, appended, nothing dropped).
+    #: Packets that arrived behind the highest sequence number seen (#205,
+    #: #430), **one per packet**.  Before #430 this counted backward *steps*:
+    #: ``[0, 5, 1, 2, 3, 4, 6]`` read 1 then and reads 4 now.
+    #:
+    #: - A late packet un-counts the drop its gap charged, and its PCM goes
+    #:   into its own slot.
+    #: - A duplicate (number already received, identical PCM, not followed by
+    #:   a continuation of the re-sent run) is discarded.
+    #:
+    #: Neither shifts the sample index, and neither is in ``packets_dropped``.
+    #: Everything else behind the highest number is a resync, also counted in
+    #: :attr:`sequence_resyncs`: a restarted counter, a forward loss of 32,768 or more, or a
+    #: packet ``_stream_seq.SEQ_REORDER_WINDOW`` (1024) or more positions late.
+    #: A resync's PCM is appended where it arrived (a restart over identical
+    #: PCM is recognised when the re-sent run continues, and its held packets
+    #: are kept).  An over-late packet also overcounts ``packets_dropped`` by
+    #: about its lateness, because the next in-order packet is charged a gap
+    #: back up to the stream's real position.  Residuals: see
+    #: ``backends/_stream_seq.py``.
     packets_reordered: int = 0
+    #: Backward steps taken as a new stream position (see
+    #: :attr:`packets_reordered`).  The sample index is not a clock across one.
+    sequence_resyncs: int = 0
 
     @property
     def time_base_intact(self) -> bool:
@@ -446,6 +461,7 @@ class AudioCapture:
         self._packets_received = 0
         self._packets_dropped = 0
         self._packets_reordered = 0
+        self._sequence_resyncs = 0
         self._last_seq: int | None = None
         self._seq = _stream_seq.SequenceTracker()
         self._started = False
@@ -460,6 +476,7 @@ class AudioCapture:
         self._packets_received = 0
         self._packets_dropped = 0
         self._packets_reordered = 0
+        self._sequence_resyncs = 0
         self._last_seq = None
         self._seq = _stream_seq.SequenceTracker()
 
@@ -562,7 +579,12 @@ class AudioCapture:
 
             with self._lock:
                 self._packets_received += 1
-                ev = self._seq.observe(seq)
+                ev = self._seq.observe(seq, zlib.crc32(pcm_payload), pcm_payload)
+                if ev.discarded_held:
+                    _log.warning(
+                        "Audio stream: %d re-sent packet(s) were duplicates; "
+                        "payload discarded", ev.discarded_held,
+                    )
                 if ev.kind == _stream_seq.GAP:
                     gap = len(ev.tracked_missing) + ev.untracked
                     _log.warning(
@@ -583,12 +605,9 @@ class AudioCapture:
                     self._pcm_chunks[ev.slot] = pcm_payload
                     self._sync_counters()
                     continue
-                elif ev.kind == _stream_seq.DUPLICATE:
-                    _log.warning(
-                        "Audio stream duplicate or over-late packet: seq %d "
-                        "(expected %d); payload discarded",
-                        seq, ev.expected,
-                    )
+                elif ev.kind == _stream_seq.HELD:
+                    # Duplicate or restart over identical PCM: the next
+                    # packet decides (see _stream_seq).
                     self._sync_counters()
                     continue
                 elif ev.kind == _stream_seq.RESYNC:
@@ -597,6 +616,7 @@ class AudioCapture:
                         "resynchronising on the new sequence",
                         ev.expected, seq,
                     )
+                    self._pcm_chunks.extend(ev.readmit)
                 self._pcm_chunks.append(pcm_payload)
                 self._sync_counters()
 
@@ -604,6 +624,7 @@ class AudioCapture:
         """Mirror the tracker's counts into the historical attributes."""
         self._packets_dropped = self._seq.dropped
         self._packets_reordered = self._seq.reordered
+        self._sequence_resyncs = self._seq.resyncs
         self._last_seq = self._seq.highest
 
     def stop(self, wav_path: str | Path | None = None) -> CaptureResult:
@@ -630,10 +651,17 @@ class AudioCapture:
             self._sock = None
 
         with self._lock:
+            held = self._seq.flush_held()
+            if held:
+                _log.warning(
+                    "Audio capture stopped with %d re-sent packet(s) "
+                    "undecided; discarded as duplicates", held,
+                )
             pcm_data = b"".join(self._pcm_chunks)
             packets_received = self._packets_received
             packets_dropped = self._packets_dropped
             packets_reordered = self._packets_reordered
+            sequence_resyncs = self._sequence_resyncs
 
         # Calculate actual duration from captured data.  Timed against the
         # exact rate when the caller gave one -- with 48000 assumed, this
@@ -670,6 +698,7 @@ class AudioCapture:
             packets_dropped=packets_dropped,
             sample_rate_exact=self._exact_rate,
             packets_reordered=packets_reordered,
+            sequence_resyncs=sequence_resyncs,
         )
 
     @property

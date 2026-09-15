@@ -1030,7 +1030,7 @@ result = cap.stop(wav_path="output.wav")  # -> CaptureResult
 
 ### `CaptureResult` (dataclass)
 - `.wav_path: Path`, `.duration_seconds: float`, `.sample_rate: int`
-- `.total_samples: int`, `.packets_received: int`, `.packets_dropped: int`, `.packets_reordered: int` (late or duplicated packets, #205; since #430 a late packet un-counts its drop and fills its own slot, a duplicate is discarded, so neither is a drop or shifts the index)
+- `.total_samples: int`, `.packets_received: int`, `.packets_dropped: int`, `.packets_reordered: int` (packets that arrived behind the highest sequence seen, #205; **one per packet since #430** — it counted backward steps before, so `[0,5,1,2,3,4,6]` read 1 and now reads 4; a late packet un-counts its drop and fills its own slot, a duplicate — same number already received, identical PCM — is discarded, so neither is a drop or shifts the index), `.sequence_resyncs: int` (restarted counter, forward loss ≥ 32,768, second consecutive duplicate, or a packet ≥ 1024 late — appended where it arrived; the over-late case overcounts `packets_dropped` by about its lateness)
 - `.time_base_intact: bool` — `packets_dropped == 0`; a gap is never padded, so any true drop breaks the sample index as a clock
 
 ### `write_wav(path, pcm_data, sample_rate=48000, channels=2, sample_width=2) -> Path`
