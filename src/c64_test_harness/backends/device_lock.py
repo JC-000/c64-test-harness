@@ -522,7 +522,7 @@ class DeviceLock:
 
     Usage::
 
-        lock = DeviceLock("192.168.1.81")
+        lock = DeviceLock("<device>")
         if lock.acquire(timeout=30.0):
             try:
                 # device is exclusively ours
@@ -532,7 +532,7 @@ class DeviceLock:
 
     Or as a context manager (acquires on enter, releases on exit)::
 
-        with DeviceLock("192.168.1.81") as lock:
+        with DeviceLock("<device>") as lock:
             ...
     """
 

@@ -484,7 +484,7 @@ from c64_test_harness import (
     wait_for_text, wait_for_stable,
 )
 
-transport = Ultimate64Transport(host="192.168.1.81")  # optional: password="..."
+transport = Ultimate64Transport(host="<device>")  # optional: password="..."
 try:
     wait_for_text(transport, "READY.", timeout=10)
     send_text(transport, "PRINT 2+2\r")
@@ -503,8 +503,8 @@ Multiple devices can be pooled with `Ultimate64InstanceManager` — the same pat
 from c64_test_harness import Ultimate64Device, Ultimate64InstanceManager, run_parallel
 
 devices = [
-    Ultimate64Device(host="192.168.1.81"),
-    Ultimate64Device(host="192.168.1.82"),
+    Ultimate64Device(host="<device-a>"),
+    Ultimate64Device(host="<device-b>"),
 ]
 with Ultimate64InstanceManager(devices) as mgr:
     with mgr.instance() as inst:
@@ -585,12 +585,12 @@ Before connecting, probe whether a U64 device is reachable:
 from c64_test_harness import probe_u64, is_u64_reachable
 
 # Quick boolean check
-if is_u64_reachable("192.168.1.81"):
+if is_u64_reachable("<device>"):
     print("Device is up")
 
 # Detailed probe: ICMP ping -> TCP connect -> REST API check
-result = probe_u64("192.168.1.81")
-print(result.summary)  # "U64 at 192.168.1.81: reachable (ping=1.2ms, port=0.8ms, api=5.3ms)"
+result = probe_u64("<device>")
+print(result.summary)  # "U64 at <device>: reachable (ping=1.2ms, port=0.8ms, api=5.3ms)"
 # result.reachable, result.ping_ok, result.port_ok, result.api_ok, result.latency_ms, result.error
 ```
 
@@ -792,7 +792,7 @@ Capture SID audio from a U64 via its UDP audio stream:
 ```python
 from c64_test_harness import capture_sid_u64, SidFile, Ultimate64Client
 
-client = Ultimate64Client(host="192.168.1.81")
+client = Ultimate64Client(host="<device>")
 sid = SidFile.from_file("tune.sid")
 result = capture_sid_u64(client, sid, out_wav="/tmp/u64_audio.wav", duration_seconds=10.0)
 print(f"{result.packets_received} packets, {result.packets_dropped} dropped")
@@ -893,7 +893,7 @@ from c64_test_harness import uci_socket_write, uci_socket_read, uci_socket_close
 ident = uci_probe(transport)
 
 # Query assigned IP address
-ip = uci_get_ip(transport)   # e.g. "192.168.1.81"
+ip = uci_get_ip(transport)   # e.g. "192.0.2.64" (dotted quad)
 
 # TCP socket roundtrip
 sock_id = uci_tcp_connect(transport, "example.com", 80)
