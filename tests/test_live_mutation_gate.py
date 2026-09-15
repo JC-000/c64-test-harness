@@ -27,13 +27,15 @@ The condition is evaluated, not just searched:
 * ``U64_HOST`` reads as set; every other environment variable is unknown,
   and the condition must skip for **every** combination of candidate values
   of those it reads.  A variable's candidates are: unset (its literal
-  default), ``"1"``, every literal the condition compares a read of it
+  default), ``"1"``, the empty string when a read of it has a non-empty
+  literal default (#374), every literal the condition compares a read of it
   against -- strings, integers as their string, and the elements of an
   ``in`` container -- and, when there is at least one such literal, one
   value equal to none of them (#353).  At most 64 combinations are
   enumerated (six set/unset variables); more fails closed.  So
-  ``not <gate> and get('CI')``, ``not get('X_LIVE') or get(GATE)`` and
-  ``get('X_LIVE') != 'yes' or get(GATE) == '1'`` are refused while the
+  ``not <gate> and get('CI')``, ``not get('X_LIVE') or get(GATE)``,
+  ``get('X_LIVE') != 'yes' or get(GATE) == '1'`` and
+  ``not get('X_LIVE', '1') or get(GATE) == '1'`` are refused while the
   multi-gate ``not _LIVE or not <gate>`` stays a gate;
 * only a single-Name assignment at module level binds a name, in source
   order -- a literal to itself, anything else to its expression -- and a
@@ -51,6 +53,22 @@ So
 ``skipif(False and ...)``, nor a condition outside the grammar (fail closed).
 A module that only mentions the variable in a docstring, or reads it and
 never skips on it, is not gated.
+
+**Which modules are scanned** (#375): every ``test_*_live.py``, plus any
+``tests/**/test_*.py`` that reads ``U64_HOST`` from the environment -- at
+import time always, and anywhere else unless the module supplies its own
+``U64_HOST`` (``monkeypatch.setenv``/``delenv``/``setitem``,
+``mock.patch.dict``, ``putenv``, an ``os.environ`` store or delete).  The gate
+protects the device the operator named, and a test reaches that device only
+through the ``U64_HOST`` the operator exported: a module that sets the
+variable itself is driving the harness against a host it chose
+(``test_device_lock_advisory.py`` patches ``urlopen`` and sets a fake
+``U64_HOST``), whereas an import-time read happens before any of its own
+patches run, so it still counts.  Constructing an ``Ultimate64Client`` or
+``Ultimate64Transport`` does not select a module by itself: two dozen unit
+tests do that against documentation-range addresses with the network
+mocked, and a real device address written into a test is refused on its own
+by ``tests/test_u64_runner_script_gates.py``.
 
 **A floor, not a proof -- the limits are the scanner's, stated so nobody
 reads more into a green run:**
@@ -84,11 +102,10 @@ reads more into a green run:**
   ``os.environ[...] =``, ``setdefault``, ``update``, ``putenv``,
   ``monkeypatch.setenv``, anywhere in the file) arms its own gate.  A store
   through an alias or a computed key is not seen.
-* An unknown variable's candidates come from the literals the condition
-  compares it with (#353), so a value that changes truthiness without being
-  compared is not tried: set to the **empty string**, ``get('X', '1')``
-  reads falsy, and ``not get('X', '1') or get(GATE) == '1'`` is scored as a
-  gate although ``X=`` (set, empty) with the gate unset does not skip.
+* Module selection is by name as well: a module outside ``test_*_live.py``
+  that reads the host through an alias or a helper, or reads it only inside
+  a function while also setting ``U64_HOST`` elsewhere in the file, is not
+  scanned (#375).
 * A rebinding through ``globals()['_M'] = '1'`` (or ``setattr`` on the
   module) is not seen by the binder.
 """
@@ -376,15 +393,29 @@ _NONE_OF_THE_LITERALS = "\x00none-of-the-literals"
 def _candidate_values(expr: ast.AST) -> dict[str, list[object]]:
     """Per other environment variable *expr* reads, the values it is tried as.
 
-    Unset (:data:`_UNSET`, so it reads as its default), ``"1"``, then every
-    literal a ``Compare`` sets against an operand that reads the variable
-    (:func:`_literal_strings`, so ``in`` containers count), and -- when there
-    is at least one such literal -- one value equal to none of them, so
-    ``get('X', 'a') in ('a', '1')`` is also tried false (#353).
+    Unset (:data:`_UNSET`, so it reads as its default), ``"1"``, the empty
+    string when some read of the variable has a non-empty literal default --
+    unset then reads truthy, and set-but-empty is the value that reads falsy
+    without ever being compared, so ``not get('X', '1') or ...`` is tried
+    false (#374) -- then every literal a ``Compare`` sets against an operand
+    that reads the variable (:func:`_literal_strings`, so ``in`` containers
+    count), and -- when there is at least one such literal -- one value equal
+    to none of them, so ``get('X', 'a') in ('a', '1')`` is also tried false
+    (#353).
     """
     candidates: dict[str, list[object]] = {
         variable: [_UNSET, "1"] for variable in _other_env_vars(expr)
     }
+    for node in ast.walk(expr):
+        read = _env_read(node)
+        if (
+            read is not None
+            and read[0] in candidates
+            and isinstance(read[1], ast.Constant)
+            and read[1].value not in (None, "")
+            and "" not in candidates[read[0]]
+        ):
+            candidates[read[0]].append("")
     literals: dict[str, list[str]] = {variable: [] for variable in candidates}
     for node in ast.walk(expr):
         if not isinstance(node, ast.Compare):
@@ -508,7 +539,8 @@ ACCEPTED_GATE_SHAPES = (
     "`if not _MUTATE: pytest.skip(...)` in a fixture or test",
     "the variable name and any default must be string literals; conditions "
     "may use and/or/not, comparisons, literals and bool()/str()/int(); every "
-    "other environment variable except U64_HOST may be unset, '1', or any "
+    "other environment variable except U64_HOST may be unset, '1', set empty "
+    "(when its read has a non-empty default), or any "
     "value the condition compares it with, and the condition must skip in "
     "every combination; bind names with a plain "
     "module-level `NAME = ...`",
@@ -873,7 +905,101 @@ def _live_modules() -> list[Path]:
     return mods
 
 
-@pytest.mark.parametrize("path", _live_modules(), ids=lambda p: p.name)
+#: The environment variable that names the device a test drives.
+HOST_VAR = "U64_HOST"
+
+#: Calls that set or remove an environment key given as the first argument.
+_HOST_KEY_FIRST = frozenset({
+    "setenv", "delenv", "putenv", "unsetenv", "setdefault", "pop", "__setitem__", "__delitem__",
+})
+#: Calls that set or remove a mapping key given as the second argument (``monkeypatch.setitem``).
+_HOST_KEY_SECOND = frozenset({"setitem", "delitem"})
+
+
+def _is_host_key(node: ast.AST | None) -> bool:
+    return isinstance(node, ast.Constant) and node.value == HOST_VAR
+
+
+def _reads_the_host(node: ast.AST) -> bool:
+    read = _env_read(node)
+    return read is not None and read[0] == HOST_VAR
+
+
+def reads_the_host_at_import(tree: ast.Module) -> bool:
+    """A module-level assignment whose value reads ``U64_HOST``."""
+    return any(
+        isinstance(stmt, (ast.Assign, ast.AnnAssign))
+        and stmt.value is not None
+        and any(_reads_the_host(sub) for sub in ast.walk(stmt.value))
+        for stmt in tree.body
+    )
+
+
+def supplies_its_own_host(tree: ast.AST) -> bool:
+    """The module sets or removes ``U64_HOST`` itself, anywhere in the file."""
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            and _is_environ(node.value)
+            and _is_host_key(node.slice)
+        ):
+            return True
+        if isinstance(node, ast.Call):
+            name = _callee_name(node)
+            args = node.args
+            if name in _HOST_KEY_FIRST and args and _is_host_key(args[0]):
+                return True
+            if name in _HOST_KEY_SECOND and len(args) > 1 and _is_host_key(args[1]):
+                return True
+            if name in ("dict", "update") and (
+                any(
+                    isinstance(arg, ast.Dict) and any(_is_host_key(k) for k in arg.keys)
+                    for arg in args
+                )
+                or any(kw.arg == HOST_VAR for kw in node.keywords)
+            ):
+                return True
+    return False
+
+
+def drives_a_named_device(tree: ast.Module) -> bool:
+    """Whether a test module reaches the device the operator named (#375).
+
+    An import-time read of ``U64_HOST`` always counts: it happens before any
+    of the module's own patches can run.  A read anywhere else counts unless
+    the module supplies its own ``U64_HOST`` -- then it is exercising the
+    harness against a host it chose, not the operator's device.
+    """
+    if reads_the_host_at_import(tree):
+        return True
+    return not supplies_its_own_host(tree) and any(
+        _reads_the_host(node) for node in ast.walk(tree)
+    )
+
+
+def _scanned_modules(root: Path = TESTS_DIR) -> list[Path]:
+    """Every ``test_*_live.py`` in *root*, then every other ``test_*.py`` under
+    it, recursively, that :func:`drives_a_named_device` (#375)."""
+    live = sorted(root.glob("test_*_live.py"))
+    floor = set(live)
+    others = sorted(
+        (
+            p for p in root.rglob("test_*.py")
+            if "__pycache__" not in p.parts
+            and p not in floor
+            and drives_a_named_device(ast.parse(p.read_text(), filename=str(p)))
+        ),
+        key=lambda p: p.relative_to(root).parts,
+    )
+    return live + others
+
+
+def _module_id(path: Path) -> str:
+    return str(path.relative_to(TESTS_DIR))
+
+
+@pytest.mark.parametrize("path", _scanned_modules(), ids=_module_id)
 def test_a_live_module_that_writes_config_is_gated(path: Path, vocabulary) -> None:
     source = path.read_text()
     writes = gate_offence(source, path.name, vocabulary)
@@ -888,7 +1014,7 @@ def test_a_live_module_that_writes_config_is_gated(path: Path, vocabulary) -> No
     )
 
 
-@pytest.mark.parametrize("path", _live_modules(), ids=lambda p: p.name)
+@pytest.mark.parametrize("path", _scanned_modules(), ids=_module_id)
 def test_every_test_that_writes_config_is_gated_itself(path: Path, vocabulary) -> None:
     """A module gate somewhere is not enough: each writing test carries one."""
     tree = ast.parse(path.read_text())
@@ -938,6 +1064,71 @@ def test_the_corpus_scan_is_not_vacuous(vocabulary) -> None:
     ]
     assert len(writing) >= 20, writing
     assert len(gated) >= 17, gated
+
+
+def test_the_scan_reaches_device_modules_outside_the_live_glob() -> None:
+    """#375: ``test_bridge_ping_tod.py`` drives the U64 and writes CPU speed
+    but is not named ``*_live.py``; it is scanned, and the mocked
+    ``test_device_lock_advisory.py`` (sets U64_HOST itself) is not."""
+    names = {str(p.relative_to(TESTS_DIR)) for p in _scanned_modules()}
+    live = {p.name for p in _live_modules()}
+    assert live <= names, sorted(live - names)
+    assert "test_bridge_ping_tod.py" in names
+    assert "test_device_lock_advisory.py" not in names
+    assert "conftest.py" not in names
+
+
+class TestModuleSelection:
+    """#375: which test modules the gate rules are applied to."""
+
+    @pytest.mark.parametrize("source, drives", [
+        ("import os\n_H = os.environ.get('U64_HOST')\n", True),
+        ("import os\nHOST = os.getenv('U64_HOST', '')\n", True),
+        ("import os\ndef test_a():\n    c = Client(os.environ['U64_HOST'])\n", True),
+        ("import os\n", False),
+        ("NAME = 'U64_HOST'\ndef test_a():\n    return 'needs U64_HOST'\n", False),
+        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.setenv('U64_HOST', '10.0.0.1')\n"
+         "    Client(os.environ.get('U64_HOST'))\n", False),
+        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.delenv('U64_HOST', raising=False)\n"
+         "    os.environ.get('U64_HOST')\n", False),
+        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.setitem(os.environ, 'U64_HOST', 'x')\n"
+         "    os.environ.get('U64_HOST')\n", False),
+        ("import os\nfrom unittest import mock\n"
+         "@mock.patch.dict(os.environ, {'U64_HOST': 'x'})\ndef test_a():\n    os.environ.get('U64_HOST')\n", False),
+        ("import os\ndef test_a():\n    os.environ['U64_HOST'] = 'x'\n    os.environ.get('U64_HOST')\n", False),
+        ("import os\n_H = os.environ.get('U64_HOST')\n"
+         "def test_a(monkeypatch):\n    monkeypatch.setenv('U64_HOST', 'x')\n", True),
+    ], ids=[
+        "import-time-get", "import-time-getenv", "in-test-subscript", "no-read", "name-only",
+        "setenv-mocked", "delenv-mocked", "setitem-mocked", "patch-dict-mocked", "environ-store-mocked",
+        "import-time-read-beats-a-later-setenv",
+    ])
+    def test_drives_a_named_device(self, source, drives) -> None:
+        assert drives_a_named_device(ast.parse(source)) is drives
+
+    def test_selection_recurses_and_keeps_the_live_floor(self, tmp_path) -> None:
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "test_plain_live.py").write_text("x = 1\n")
+        (tmp_path / "sub" / "test_deep.py").write_text("import os\nH = os.environ.get('U64_HOST')\n")
+        (tmp_path / "test_mocked.py").write_text(
+            "import os\ndef test_a(monkeypatch):\n    monkeypatch.setenv('U64_HOST', 'x')\n"
+            "    os.environ.get('U64_HOST')\n")
+        (tmp_path / "conftest.py").write_text("import os\nH = os.environ.get('U64_HOST')\n")
+        got = [str(p.relative_to(tmp_path)) for p in _scanned_modules(tmp_path)]
+        assert got == ["test_plain_live.py", "sub/test_deep.py"]
+
+    def test_an_ungated_write_in_a_selected_module_is_an_offence(self) -> None:
+        src = (
+            "import os, pytest\n"
+            "_U64_HOST = os.environ.get('U64_HOST')\n"
+            "@pytest.mark.skipif(not _U64_HOST, reason='x')\n"
+            "class TestT:\n"
+            "    def test_a(self, client):\n        set_turbo_mhz(client, 48)\n"
+        )
+        tree = ast.parse(src)
+        assert drives_a_named_device(tree)
+        assert gate_offence(src, "test_x.py", {"set_turbo_mhz"}) == {"set_turbo_mhz"}
+        assert ungated_tests_that_write(tree, {"set_turbo_mhz"}) == ["test_a (set_turbo_mhz)"]
 
 
 class TestTheScannerItselfCanFail:
@@ -1362,10 +1553,18 @@ class TestTheScannerItselfCanFail:
         "os.environ.get('X_LIVE') != _WANT or os.environ.get('U64_ALLOW_MUTATE') == '1'",
         "os.environ.get('X_LIVE', 'a') in ('a', '1') or os.environ.get('U64_ALLOW_MUTATE') == '1'",
         "'yes' != os.environ.get('X_LIVE') or os.environ.get('U64_ALLOW_MUTATE') == '1'",
+        # #374: a truthy literal default, never compared: unset and "1" both skip,
+        # and only an empty value (set, empty) reads falsy and does not.
+        "os.environ.get('X_LIVE', '1') or os.environ.get('U64_ALLOW_MUTATE') == '1'",
+        "os.getenv('X_LIVE', 'yes') or os.environ.get('U64_ALLOW_MUTATE') == '1'",
+        # #374's own example: already refused before the fix (unset reads '1',
+        # so ``not`` is False and it does not skip); kept as a guard.
+        "not os.environ.get('X_LIVE', '1') or os.environ.get('U64_ALLOW_MUTATE') == '1'",
     ]
     LITERAL_ESCAPE_IDS = [
         "353-or", "353-and", "353-default-literal", "in-container", "int-literal",
         "bound-literal", "none-of-the-literals", "read-on-the-right",
+        "374-truthy-default", "374-getenv-default", "374-issue-example",
     ]
 
     @pytest.mark.parametrize("condition", LITERAL_ESCAPES, ids=LITERAL_ESCAPE_IDS)
@@ -1384,7 +1583,9 @@ class TestTheScannerItselfCanFail:
         "os.environ.get('X_LIVE') not in ('yes', 'on') or os.environ.get('U64_ALLOW_MUTATE') != '1'",
         "os.environ.get('X_LIVE', 'a') in ('a', '1') and not os.environ.get('U64_ALLOW_MUTATE')"
         " or os.environ.get('U64_ALLOW_MUTATE') != '1'",
-    ], ids=["literal-or-gate", "container-or-gate", "none-of-the-literals-still-gated"])
+        "not os.environ.get('X_LIVE', '1') or not os.environ.get('U64_ALLOW_MUTATE')",
+    ], ids=["literal-or-gate", "container-or-gate", "none-of-the-literals-still-gated",
+            "truthy-default-or-gate"])
     def test_literals_beside_a_real_gate_still_gate(self, condition) -> None:
         """Control for #353: extra candidates must not refuse a condition that skips."""
         src = (
@@ -1408,20 +1609,42 @@ class TestTheScannerItselfCanFail:
         )
         assert self._offence(src) == offence
 
+    @pytest.mark.parametrize("plain, offence", [(4, set()), (5, {"enable_uci"})])
+    def test_the_empty_candidate_counts_against_the_cap(self, plain, offence) -> None:
+        """#374: a variable with a truthy literal default has three candidates, so
+        3 * 2**4 = 48 is enumerated and 3 * 2**5 = 96 fails closed -- where the
+        same condition without the empty value (2 * 2**5 = 64) was a gate."""
+        others = " or ".join(f"not os.environ.get('X{i}')" for i in range(plain))
+        src = (
+            "import os, pytest\n"
+            "pytestmark = pytest.mark.skipif(\n"
+            f"    not os.environ.get('U64_ALLOW_MUTATE') or {others}"
+            " or not os.environ.get('Y', '1'), reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == offence
+
     def test_candidate_values_are_what_the_rule_says(self) -> None:
         expr = ast.parse(
             "get(GATE) or os.environ.get('A', '0') not in ('yes', 2, True)"
             " or str(os.getenv('B')) == 'on' or os.environ.get('C')"
-            " or ('q', os.environ.get('D')) == ('r', 's')",
+            " or ('q', os.environ.get('D')) == ('r', 's')"
+            " or os.environ.get('E', '') or os.getenv('F', 'on') or os.environ.get('G', '1') != ''",
             mode="eval",
         ).body
         got = _candidate_values(expr)
-        assert list(got) == ["A", "B", "C", "D"]
+        assert list(got) == ["A", "B", "C", "D", "E", "F", "G"]
         # Only the *other* operands supply literals: 'q' shares D's operand.
         assert got["D"] == [_UNSET, "1", "r", "s", _NONE_OF_THE_LITERALS]
-        assert got["A"] == [_UNSET, "1", "yes", "2", _NONE_OF_THE_LITERALS]
+        # #374: a non-empty literal default adds the empty value, right after "1".
+        assert got["A"] == [_UNSET, "1", "", "yes", "2", _NONE_OF_THE_LITERALS]
         assert got["B"] == [_UNSET, "1", "on", _NONE_OF_THE_LITERALS]
         assert got["C"] == [_UNSET, "1"]
+        # An empty default already reads "" when unset; nothing to add.
+        assert got["E"] == [_UNSET, "1"]
+        assert got["F"] == [_UNSET, "1", ""]
+        # The compared literal '' is the empty value: listed once.
+        assert got["G"] == [_UNSET, "1", "", _NONE_OF_THE_LITERALS]
 
     def test_read_only_module_needs_no_gate(self) -> None:
         src = "def test_x(client):\n    client.get_config_item('C', 'I')\n"
