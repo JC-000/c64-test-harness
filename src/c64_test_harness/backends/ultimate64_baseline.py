@@ -335,9 +335,10 @@ class RecordedCategorySet:
 
 #: The category list each device generation reports, each with its
 #: source.  The C64U record is a device listing taken verbatim, never
-#: projected from source; the U64E names are reconstructed from a
-#: per-category read and cross-checked against an older listing and the
-#: firmware source (its ``source`` says which).  ``tests/test_entry_baseline.py`` asserts that every name in
+#: projected from source; the U64E names were read directly on 2026-09-15
+#: (and earlier reconstructed from a per-category read and cross-checked
+#: against an older listing and the firmware source -- its ``source`` says
+#: which).  ``tests/test_entry_baseline.py`` asserts that every name in
 #: every record is classified (in :data:`BASELINE_CATEGORIES`,
 #: :data:`BASELINE_NEVER_TOUCH` or :data:`BASELINE_UNCLASSIFIED_CATEGORIES`),
 #: so a store a device lists without anyone having decided about it fails
@@ -349,7 +350,7 @@ BASELINE_RECORDED_CATEGORY_SETS: dict[str, RecordedCategorySet] = {
         generation="ultimate",
         device="U64E (Ultimate 64 Elite, 10.43.23.81)",
         firmware="3.15 (v3.15-85, 7f6fcb51)",
-        date="2026-09-12",
+        date="2026-09-15",
         source=(
             "category names reconstructed from the 2026-09-12 read-only "
             "per-category read (U64E fw 3.15, DeviceLock held; #288) -- 19 "
@@ -363,7 +364,10 @@ BASELINE_RECORDED_CATEGORY_SETS: dict[str, RecordedCategorySet] = {
             "bling_board.cc; Speaker Mixer is #if U64 == 2 only.  "
             "Confirmed when the names were read directly on 2026-09-15 "
             "(U64E fw 3.15, one bodyless GET /v1/configs, DeviceLock held; "
-            "#287): 19 categories, identical to this record (#316)"
+            "#287): 19 categories, identical to this record (#316); the "
+            "record's date is that read's.  The firmware identity "
+            "'v3.15-85, 7f6fcb51' comes from the flash record, not from that "
+            "read, which reported only firmware 3.15, fpga 125, core 1.4F"
         ),
         categories=frozenset({
             "Audio Mixer", "SID Sockets Configuration", "UltiSID Configuration",

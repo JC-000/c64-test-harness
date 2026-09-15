@@ -1237,3 +1237,23 @@ class TestTheNormaliser:
                 f"{phrase!r} is lost when its source file wraps it; the pin "
                 f"would silently stop protecting anything"
             )
+
+
+def test_reference_uci_socket_write_prices_by_grade():
+    """#318 review round 1: the REFERENCE.md ``uci_socket_write`` bullet was
+    rewritten for #294 (the transport chunks unless post-safe), and restoring
+    master's unqualified "each call costs one attachment" survived. Scoped to
+    that one bullet -- other lanes edit the skill files concurrently."""
+    from pathlib import Path
+
+    ref = Path(__file__).resolve().parents[1] / ".claude/skills/c64-test/REFERENCE.md"
+    bullets = [ln for ln in ref.read_text(encoding="utf-8").splitlines()
+               if ln.startswith("- `uci_socket_write(")]
+    # Vacuity guard: exactly the one bullet this is about.
+    assert len(bullets) == 1, bullets
+    bullet = bullets[0]
+    assert "SOCKET_WRITE_MAX_BYTES" in bullet
+    assert "leak-prone or unknown grade" in bullet
+    assert "writemem_post_safe is True" in bullet
+    assert "each call costs one `/Temp` attachment" not in bullet
+

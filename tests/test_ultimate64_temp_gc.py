@@ -302,6 +302,16 @@ def test_budget_comment_prices_uci_writes_by_grade():
     assert "transport.write_memory" in note
     assert "client.write_mem" in note
     assert "#294" in note
+    # Review round 1 (#318): keywords let two wrong rewrites through (U1
+    # "costs one attachment ... on every grade", U2 "... which that firmware
+    # never collects"). Pin each grade-bound claim as one contiguous phrase.
+    claim = note.lower()
+    assert ("on a leak-prone or unknown grade (the c64u) a uci socket write "
+            "costs no attachment") in claim
+    assert ("on a post-safe grade the routine, and a payload over the "
+            "ceiling, are one post each, which that firmware collects") in claim
+    assert "on every grade" not in claim
+    assert "never collects" not in claim
     # The same qualifier applies to the "raw write_memory" parenthetical
     # above the note: the transport now chunks those on a leak-prone grade.
     assert "those are lane bugs to fix by chunking" not in src

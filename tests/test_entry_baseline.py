@@ -367,7 +367,10 @@ class TestRecordedCategorySets:
             assert r.generation == gen
             assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", r.date), r.date
             assert r.device and r.firmware and r.source, gen
-        assert rec["ultimate"].date == "2026-09-12"
+        # #318 review round 1: the record's date is the direct read's, the
+        # stronger instrument (the reconstruction was 2026-09-12).
+        assert rec["ultimate"].date == "2026-09-15"
+        assert "3.15" in rec["ultimate"].firmware
         assert "3.15" in rec["ultimate"].firmware
         assert "U64E" in rec["ultimate"].device
         assert rec["cbm"].date == "2026-09-15"
@@ -383,7 +386,9 @@ class TestRecordedCategorySets:
                       "nios2",
                       # #316 comment: the direct read that confirmed it
                       "2026-09-15", "read directly", "bodyless get /v1/configs",
-                      "identical"):
+                      "identical",
+                      # the build identity is not what that read reported
+                      "flash record", "fpga 125", "core 1.4f"):
             assert token in u64e_source, f"U64E source lacks {token!r}"
         assert "projected" not in u64e_source
         assert "bodyless GET /v1/configs" in rec["cbm"].source
