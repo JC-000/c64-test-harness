@@ -575,13 +575,12 @@ project's local brief.
 Every review also enforces the C64U wedge clause. The C64 Ultimate
 (10.53.21.158, fw 1.1.0) predates GideonZ/1541ultimate#686 and never
 collects the managed `/Temp` attachments left by body-carrying REST
-calls; enough accumulation crashes the device firmware, taking REST and
-the UCI bridge down together, and only a physical power-cycle recovers it
-— with nobody physically present. The one figure in circulation, "~15
-cycles of a 63 KB PRG", was taken on the U64E at 3.14d with n unrecorded
-and is where a single reproduction stopped, not a capacity; the trigger
-threshold and the crash cause are both unestablished, and budgets are
-sized conservatively as a choice about which error to make. So a change that adds, moves, or widens such a call
+calls. The attachments fill `/Temp`, and a full `/Temp` crashes the device
+firmware, taking REST and the UCI bridge down together; only a physical
+power-cycle recovers it — with nobody physically present. No count of
+uploads before that crash is known, and none is kept (owner ruling,
+2026-09-15; #256), so budgets are sized conservatively as a choice about
+which error to make. So a change that adds, moves, or widens such a call
 must show where its hygiene comes from and must not be reachable in an
 unbounded loop, and a hygiene pass whose failure is swallowed is a
 blocker rather than a nit. Reviewers do not run live hardware
