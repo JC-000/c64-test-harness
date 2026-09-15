@@ -287,6 +287,13 @@ def test_budget_comment_prices_uci_writes_by_grade():
     costs no attachment on a leak-prone or unknown grade; only a post-safe
     grade (whose firmware collects) or a direct ``client.write_mem`` caller
     pays. The budget comment used to state the pre-#294 cost unqualified.
+
+    Named limit (#318 review round 2): these are phrase pins. They catch a
+    rewrite of the pinned claims and the specific wrong wordings forbidden
+    below, but not a *contradicting sentence appended* after them (V1: "In
+    practice a UCI socket write still leaks one attachment on the C64U."
+    survives). Proving the paragraph's meaning is beyond a text test; the
+    reviewer accepted this limit.
     """
     from c64_test_harness.backends import ultimate64_temp_gc as mod
 

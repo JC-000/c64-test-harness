@@ -1253,7 +1253,14 @@ def test_reference_uci_socket_write_prices_by_grade():
     assert len(bullets) == 1, bullets
     bullet = bullets[0]
     assert "SOCKET_WRITE_MAX_BYTES" in bullet
-    assert "leak-prone or unknown grade" in bullet
     assert "writemem_post_safe is True" in bullet
     assert "each call costs one `/Temp` attachment" not in bullet
+    # Review round 2 (#318): "leak-prone or unknown grade" as a keyword let
+    # the wrong cost on the right grade through (V2: "costs **one** /Temp
+    # attachment"). Pin the claim as one phrase, markup stripped.
+    claim = bullet.replace("*", "").replace("`", "").lower()
+    assert ("on a leak-prone or unknown grade (the c64u) a call costs no "
+            "/temp attachment") in claim
+    # The post-safe sentence says "one POST", so this cannot collide.
+    assert "costs one /temp attachment" not in claim
 
