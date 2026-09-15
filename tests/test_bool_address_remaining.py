@@ -92,6 +92,25 @@ def test_helper_passes_everything_else(value):
     refuse_bool_address(value)
 
 
+@pytest.mark.parametrize("spelling", ["bool", "bool_"])
+def test_helper_detects_both_numpy_spellings_without_numpy(spelling):
+    """numpy 2.x names its scalar ``numpy.bool``; numpy 1.x ``numpy.bool_``.
+    The venv only has one of them, so both are pinned with synthetic types
+    (review round 1 on #376: dropping ``"bool_"`` otherwise survived)."""
+    fake = type(spelling, (), {"__module__": "numpy"})()
+    assert is_bool_like(fake)
+    with pytest.raises(ValueError, match="not bool"):
+        refuse_bool_address(fake)
+
+
+@pytest.mark.parametrize("spelling", ["bool", "bool_"])
+def test_helper_ignores_same_named_types_outside_numpy(spelling):
+    """Control: the module check is load-bearing, not just the name."""
+    other = type(spelling, (), {"__module__": "mylib"})()
+    assert not is_bool_like(other)
+    refuse_bool_address(other)
+
+
 def test_helper_passes_numpy_ints():
     if np is None:
         pytest.skip("numpy not installed")
