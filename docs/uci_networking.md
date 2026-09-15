@@ -134,16 +134,18 @@ reset:**
 - Read at tag `1.1.0` (`c64.cc:593-601`, `c64_subsys.cc:183-190`,
   `route_machine.cc:30-36`) and at `7f6fcb51` (`c64.cc:612-620`,
   `c64_subsys.cc:217-224`, `route_machine.cc:73-85`).
-- Two side effects at `7f6fcb51`, neither of which affects UCI:
-  - on success the route releases REST-held keyboard keys and the
-    joystick (`route_machine.cc:77-81`: `restReleaseAll`,
-    `releaseAllRest`, under `#if U64`; the `1.1.0` route has no such
-    block);
-  - `MENU_C64_RESET` calls `release_host()` before resetting
-    (`c64_subsys.cc:218-221`), which closes an open menu.
+- Two side effects, neither of which affects UCI:
+  - on both refs, `MENU_C64_RESET` calls `release_host()` before
+    resetting (`c64_subsys.cc:184-187` at `1.1.0`,
+    `c64_subsys.cc:218-221` at `7f6fcb51`), which closes an open menu, on
+    the C64U as well;
+  - at `7f6fcb51` only, on success the route also releases REST-held
+    keyboard keys and the joystick (`route_machine.cc:77-81`:
+    `restReleaseAll`, `releaseAllRest`, under `#if U64`; the `1.1.0`
+    route has no such block).
 
-  So a timeout also releases held keys and joystick and closes an open
-  menu.
+  So a timeout closes an open menu, and on `7f6fcb51` also releases held
+  keys and joystick.
 - This has not been measured on a device.
 
 The reset does not clear a UCI STATE-bit wedge (#112); that still needs a

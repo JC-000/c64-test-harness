@@ -46,6 +46,11 @@ REQUIRED = [
     "at `7f6fcb51` (`c64.cc:612-620`",
     # The evidence grade of the source trace (review round 1, N7).
     "not been measured on a device",
+    # The side-effect citations (review round 2): release_host() on both
+    # refs, the key/joystick release at 7f6fcb51 only.
+    "`c64_subsys.cc:184-187` at `1.1.0`",
+    "`c64_subsys.cc:218-221` at `7f6fcb51`",
+    "`route_machine.cc:77-81`",
 ]
 
 
