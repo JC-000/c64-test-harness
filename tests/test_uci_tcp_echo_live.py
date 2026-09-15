@@ -10,7 +10,7 @@ on the U64 that:
   5. Stores results in C64 memory for readback
 
 Usage:
-    U64_HOST=<device> pytest tests/test_uci_tcp_echo_live.py -v
+    U64_HOST=<device> U64_ALLOW_MUTATE=1 pytest tests/test_uci_tcp_echo_live.py -v
 
 Note on CPU speed:
     This test hand-writes its own 6502 routine (not via the uci_network
@@ -31,16 +31,24 @@ import time
 import pytest
 
 U64_HOST = os.environ.get("U64_HOST")
-pytestmark = pytest.mark.skipif(
-    not U64_HOST,
-    reason="U64_HOST not set — live Ultimate 64 tests disabled",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not U64_HOST,
+        reason="U64_HOST not set — live Ultimate 64 tests disabled",
+    ),
+    # Enables the Command Interface and resets the machine (#268).
+    pytest.mark.skipif(
+        not os.environ.get("U64_ALLOW_MUTATE"),
+        reason="U64_ALLOW_MUTATE not set — test enables the Command "
+        "Interface and resets the machine",
+    ),
+]
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from c64_test_harness.backends.device_lock import DeviceLock
 from c64_test_harness.backends.ultimate64 import Ultimate64Transport
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
-from c64_test_harness.uci_network import enable_uci, disable_uci
+from c64_test_harness.uci_network import disable_uci, enable_uci, get_uci_enabled
 
 # ---------------------------------------------------------------------------
 # UCI registers and constants (same as uci_network.py)
@@ -511,12 +519,18 @@ def test_uci_tcp_echo_roundtrip() -> None:
     if not lock.acquire(timeout=60.0):
         pytest.fail("Could not acquire device lock within 60s")
 
+    client: Ultimate64Client | None = None
+    # What to put back, read before the first write (#268); ``None`` means
+    # nothing has been written.  Bound before ``enable_uci`` so a PUT that
+    # applied and then raised is still restored.
+    uci_prior: bool | None = None
     try:
         client = Ultimate64Client(host=u64_host, timeout=timeout)
         transport = Ultimate64Transport(host=u64_host, timeout=timeout,
                                         client=client)
 
         # Enable UCI transiently (not saved to flash)
+        uci_prior = get_uci_enabled(client)
         print("Enabling UCI (Command Interface)...")
         enable_uci(client)
 
@@ -612,11 +626,29 @@ def test_uci_tcp_echo_roundtrip() -> None:
 
     finally:
         try:
-            print("Disabling UCI (Command Interface)...")
-            disable_uci(client)
-        except Exception as exc:
-            print(f"WARNING: Failed to disable UCI: {exc}")
-        lock.release()
+            if uci_prior is not None and client is not None:
+                _restore_command_interface(client, uci_prior)
+        finally:
+            lock.release()
+
+
+def _restore_command_interface(client: Ultimate64Client, prior: bool) -> None:
+    """Put ``Command Interface`` back to the value read before the first write.
+
+    Restoring to a fixed ``Disabled`` would itself drift a device that
+    arrived with the interface enabled (#268).  A failed restore is
+    reported loudly, not raised, so it cannot mask the test's own failure.
+    """
+    target = "Enabled" if prior else "Disabled"
+    try:
+        print(f"Restoring Command Interface to {target}...", flush=True)
+        (enable_uci if prior else disable_uci)(client)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"WARNING: Command Interface NOT restored to {target}: {exc!r} "
+            "-- the device is left drifted",
+            flush=True,
+        )
 
 
 def _detect_local_ip(target: str) -> str:

@@ -47,6 +47,8 @@ when an exchange misses -- +1 means the chip discarded the reply.
 Gates (all unset -> the module skips cleanly):
 
 * ``RRNET_LIVE=1`` -- master switch.
+* ``U64_ALLOW_MUTATE=1`` -- required: the module writes ``Cartridge
+  Preference`` (restored) and resets the machine (#268).
 * ``U64_HOST``     -- the device (no IPs are committed).
 * ``RRNET_IFACE``  -- host NIC on the cartridge's link (default ``en4``);
   its IP is read from ``ifconfig`` (macOS) or ``ip`` (Linux).
@@ -93,6 +95,11 @@ _IFACE = os.environ.get("RRNET_IFACE", "en4")
 pytestmark = [
     pytest.mark.skipif(not _LIVE, reason="RRNET_LIVE not set"),
     pytest.mark.skipif(not _HOST, reason="U64_HOST not set"),
+    pytest.mark.skipif(
+        not os.environ.get("U64_ALLOW_MUTATE"),
+        reason="U64_ALLOW_MUTATE not set -- writes Cartridge Preference and "
+        "resets the machine",
+    ),
 ]
 
 CAT = "C64 and Cartridge Settings"

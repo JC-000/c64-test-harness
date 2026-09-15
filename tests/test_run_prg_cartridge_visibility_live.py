@@ -47,6 +47,8 @@ answer and the host reads three bytes.
 Gates (all unset -> the module skips cleanly):
 
 * ``RRNET_LIVE=1`` -- master switch.
+* ``U64_ALLOW_MUTATE=1`` -- required: the module writes ``Cartridge
+  Preference`` (restored) and resets the machine (#268).
 * ``U64_HOST``     -- the device (no IPs are committed).
 
 Requirements: an RR-Net-compatible cartridge in the expansion port.  The
@@ -86,6 +88,11 @@ _HOST = os.environ.get("U64_HOST")
 pytestmark = [
     pytest.mark.skipif(not _LIVE, reason="RRNET_LIVE not set"),
     pytest.mark.skipif(not _HOST, reason="U64_HOST not set"),
+    pytest.mark.skipif(
+        not os.environ.get("U64_ALLOW_MUTATE"),
+        reason="U64_ALLOW_MUTATE not set -- writes Cartridge Preference and "
+        "resets the machine",
+    ),
 ]
 
 # Named in ultimate64_helpers since issue #221.

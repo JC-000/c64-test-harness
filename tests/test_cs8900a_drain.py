@@ -17,7 +17,8 @@ These tests pin the emitted behaviour on ``tests/cs8900a_sim.py``: with
 reply (which only arrives after the echo request goes out) is still
 matched; without it the stale frames are still queued at TX time; the
 drain is bounded; and the default output is byte-identical to before.
-Live counterpart: ``tests/test_first_exchange_live.py`` (``RRNET_LIVE=1``).
+Live counterpart: ``tests/test_first_exchange_live.py`` (``RRNET_LIVE=1``,
+``U64_ALLOW_MUTATE=1``).
 """
 from __future__ import annotations
 
