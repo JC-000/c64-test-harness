@@ -21,7 +21,8 @@ and its qualifier in another does not count):
   states the grace *value* (from the constant; the bare name is not a
   value) and cites ``docs/device_locking.md``.
 
-* **no invented ceiling** -- no paragraph calls 120 s a ceiling.  Nothing
+* **no invented ceiling** -- no paragraph calls 120 s a ceiling, cap,
+  maximum, max, "at most" or limit (#331).  Nothing
   in ``device_lock.py`` or ``unified_manager.py`` defines one, and it
   contradicted the budget text (review round 1).
 
@@ -100,8 +101,25 @@ def _bound(call: str, value: float) -> re.Pattern[str]:
     )
 
 
+#: Words that turn "120 s" into an invented limit (#331). Each needs a
+#: literal control in TestThePinCanFail.CEILING_CLAIMS; a guard test checks
+#: that every word here has one.
+CEILING_WORDS = ("ceiling", "cap", "maximum", "max", "at most", "limit")
+
+#: "120 s", "120.0 s", "120s", "120 seconds", "120-second". A bare number with
+#: no unit (``timeout=120.0``) is a code example, not a claim.
+_ONE_TWENTY = r"(?<![\d.])120(?:\.0+)?(?:\s?s\b|\s?seconds?\b|-seconds?\b)"
+_WORD = r"\b(?:" + "|".join(
+    re.escape(w).replace(r"\ ", r"\s+") + r"(?:s|ped|ping)?" for w in CEILING_WORDS
+) + r")\b"
+
+#: The gap between the word and the figure may not cross a sentence or
+#: clause end, or another number: "the heartbeat limit is 15 s; a 120 s run"
+#: names two figures, and the limit is the other one.
+_GAP = r"[^.;\d]{0,40}"
+
 _INVENTED_CEILING = re.compile(
-    r"(?<![\d.])120(?:\.0+)?\s?s\b[^.]{0,40}\bceiling|\bceiling[^.]{0,40}(?<![\d.])120(?:\.0+)?\s?s\b",
+    rf"{_ONE_TWENTY}{_GAP}{_WORD}|{_WORD}{_GAP}{_ONE_TWENTY}",
     re.IGNORECASE,
 )
 
@@ -246,13 +264,30 @@ class TestThePinCanFail:
         assert mangled != self.PASSING, f"the mangle for {call} changed nothing"
         assert any("defaults" in p for p in doc_problems(mangled, defaults=True))
 
+    #: One literal sentence per word in CEILING_WORDS (and the review's
+    #: three), written out rather than generated from the tuple: a control
+    #: built from the list it checks would vanish with a deleted word.
+    CEILING_CLAIMS = {
+        "ceiling": "default 60 s and 120 s ceiling for ad-hoc work.",
+        "ceiling (word first)": "120 s is a reasonable ceiling for ad-hoc work.",
+        "ceiling (decimal)": "a ceiling of 120.0 s applies.",
+        "maximum": "The lock timeout has a 120 s maximum for ad-hoc work.",
+        "at most": "Keep lock_timeout at most 120 s for ad-hoc work.",
+        "cap": "There is a 120-second cap on lock_timeout.",
+        "max": "Use a max of 120 s for lock_timeout.",
+        "limit": "lock_timeout has a 120 seconds limit.",
+    }
+
+    def test_every_ceiling_word_has_a_control(self) -> None:
+        covered = {label.split(" (")[0] for label in self.CEILING_CLAIMS}
+        assert covered == set(CEILING_WORDS), (
+            f"controls {sorted(covered)} vs words {sorted(CEILING_WORDS)}"
+        )
+        for label, claim in self.CEILING_CLAIMS.items():
+            assert label.split(" (")[0] in claim.lower(), (label, claim)
+
     @pytest.mark.parametrize(
-        "claim",
-        [
-            "default 60 s and 120 s ceiling for ad-hoc work.",
-            "120 s is a reasonable ceiling for ad-hoc work.",
-            "a ceiling of 120.0 s applies.",
-        ],
+        "claim", list(CEILING_CLAIMS.values()), ids=list(CEILING_CLAIMS)
     )
     def test_an_invented_ceiling_is_flagged(self, claim: str) -> None:
         planted = self.PASSING + "\n\n" + claim
@@ -261,6 +296,22 @@ class TestThePinCanFail:
         assert doc_problems(
             self.PASSING + "\n\nlock.acquire_or_raise(timeout=120.0)", defaults=True
         ) == []
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "lock.acquire_or_raise(timeout=120.0)  # at most one retry",
+            "ProcessPoolExecutor(max_workers=4); acquire_or_raise(timeout=120)",
+            "The heartbeat limit is 15 s; a 120 s run is ordinary.",
+            # Word boundaries, one control per side: "cap" at the end of
+            # "handicap" needs the leading boundary, "cap" at the start of
+            # "capital" needs the trailing one.
+            "A 120 s run is no handicap.",
+            "A 120 s run is no capital offence.",
+        ],
+    )
+    def test_code_examples_and_unrelated_numbers_are_not_claims(self, text: str) -> None:
+        assert doc_problems(self.PASSING + "\n\n" + text, defaults=True) == []
 
     def test_the_bare_constant_name_is_not_the_grace(self) -> None:
         named = self.PASSING.replace(f"{GRACE:.1f} s", "_SELF_HELD_WAIT_GRACE")
