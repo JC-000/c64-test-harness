@@ -25,7 +25,9 @@ firmware crashes" are one failure, not rival models.  This pin's job:
 * **the wrong model** (#386): "a crash, not a full filesystem", "rather than a
   full filesystem", "nowhere near exhaustion", "anywhere near full", "far from
   full", "/Temp does not fill", "never fills up", "capacity is not what fails"
-  / "is not the failure", "nothing to do with capacity", '"fills up" is the
+  / "is not the failure" / "is not the thing that fails", "far from exhausted",
+  "short of exhaustion", "not a filesystem that fills up", "nothing to do with
+  capacity", '"fills up" is the
   wrong model' -- each sets filling against crashing, which the ruling makes
   one thing.  **Only in a /Temp paragraph** (:data:`_TEMP_PARAGRAPH`: /Temp,
   attachment, writemem, unpatched, leak-prone, #686), because "nowhere near
@@ -45,14 +47,20 @@ wedge it"), except as a *price*: followed by "per call/request/probe", or
 preceded by a cost verb ("costs two attachments").  "per run", "a run",
 "per client" and "an upload" are not prices.
 
-**Scope is declared, not exhaustive.**  ``src/**`` is not globbed in: five
-sentences outside the scanned modules would be flagged although none is a
-count before a /Temp crash -- four in ``backends/ultimate64_probe.py`` (the
-"48..127 POST wedge range" of #84, twice; "two body-carrying POSTs" beside
-"degraded"; "repeated 404 POSTs are the TCP-wedge trigger" of #107) and one in
-``poll_until.py`` ("within a few milliseconds" beside "budget").
-:class:`TestTheDeclaredLimitsStayKnown` asserts their shapes are flagged, so
-widening :data:`SCANNED` is a deliberate change that meets them.
+**Scope is the listed files, not exhaustive.**  :data:`SCANNED` is exactly
+the files listed above.  Neither ``src/**`` nor ``tests/**`` is globbed in, and
+both hold sentences the rules flag although none is a count kept in the docs
+(measured in #403 review round 2).  In ``src/**``, five: four in
+``backends/ultimate64_probe.py`` (the "48..127 POST wedge range" of #84, twice;
+"two body-carrying POSTs" beside "degraded"; "repeated 404 POSTs are the
+TCP-wedge trigger" of #107) and one in ``poll_until.py`` ("within a few
+milliseconds" beside "budget").  In ``tests/**``, besides this file's own
+controls: three in ``test_ultimate64_temp_gc.py`` (its stale-RAM-disk scan's
+positive control, the sentence recording that the "63 KB PRG" count it used to
+carry is retired, and the assert that checks it is gone) and one in
+``test_audio_rate_lock_live.py`` (a phase-lock note on cycle and sample
+counts).  :class:`TestTheDeclaredLimitsStayKnown` asserts the ``src/**`` shapes
+are flagged, so widening :data:`SCANNED` is a deliberate change that meets them.
 
 **Declared limits, not design.**  The harness's own numbers pass because of
 these limits, not because the rule understands them, and
@@ -161,12 +169,14 @@ _HANDFUL_BOUND = re.compile(
 #: Filling set against crashing (#386): the ruling makes them one failure.
 _WRONG_MODEL = re.compile(
     r"\bnot (?:a |because of a )?full (?:file ?system|folder|disk(?!\s+image)|RAM disk)\b"
+    r"|\bnot a (?:file ?system|folder|disk|RAM disk) that (?:fills?|filled)\b"
     r"|\brather than (?:a )?full\b"
-    r"|\b(?:nowhere|anywhere) near (?:exhaustion\b|full\b(?!\s+speed))"
-    r"|\bfar from full\b(?!\s+speed)"
+    r"|\b(?:nowhere|anywhere) near (?:exhaust\w*|full\b(?!\s+speed))"
+    r"|\bfar from (?:exhaust\w*|full\b(?!\s+speed))"
+    r"|\bshort of exhaust\w*"
     r"|\bdoes(?:n't| not) (?:actually )?fill\b"
     r"|\bnever (?:\w+ )?fills?\b"
-    r"|\bcapacity (?:is|was) (?:not|never) (?:what (?:fails|failed)|the failure)\b"
+    r"|\bcapacity (?:is|was) (?:not|never) (?:(?:what|the thing that) fail(?:s|ed)|the failure)\b"
     r"|\bnothing to do with capacity\b"
     r"|\b(?:fills?|filling) up\W{0,3}\s+(?:is|was) the wrong model\b",
     re.IGNORECASE,
@@ -384,6 +394,11 @@ class TestTheRulesCanFail:
         'The figure, "~15 cycles of a 63 KB PRG", is where it stopped; so /Temp budgets '
         "are sized conservatively.",
         "Budgets allow 15 uploads.",
+        # Review round 2 (reviewer-5): one case per plural, no other bound word.
+        "Our limits allow 15 uploads.",
+        "Allowances permit 15 uploads.",
+        "Bounds stop at 15 uploads.",
+        "Thresholds sit at 15 uploads.",
         "Our limits are a handful.",
         "A handful sets the budgets.",
     ])
@@ -472,6 +487,11 @@ class TestTheRulesCanFail:
         "The wedge has nothing to do with capacity.",
         "Capacity is not the failure; the firmware crashes.",
         "The disk was far from full when it crashed.",
+        # Review round 2 (reviewer-5).
+        "It is a firmware crash, not a filesystem that fills up.",
+        "Capacity is not the thing that fails.",
+        "The disk was far from exhausted when it crashed.",
+        "It crashed well short of exhaustion.",
     ])
     def test_filling_set_against_crashing_is_flagged(self, text: str) -> None:
         found = count_and_figure_problems(_IN_TEMP + text)
