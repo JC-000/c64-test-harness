@@ -15,6 +15,7 @@ import logging
 import os
 import socket
 import time
+import warnings
 
 import pytest
 
@@ -106,12 +107,13 @@ BA_HIGH_MAX = 0.96
 #: ``print``s the loss fraction and packets received (pytest shows it with
 #: ``-s``, and in the captured-stdout section when the test fails; the
 #: project sets no log level, so ``logger.info`` alone is never shown), and
-#: loss above 25% also emits a WARNING, which pytest reports by default.  The edge is chosen, not
-#: derived.  A receiver that stops reading is caught by the cycle-count
-#: assertion instead.
+#: loss above 25% also emits a UserWarning, which appears in pytest's
+#: warnings summary (a ``logger.warning`` on a passing test does not appear
+#: with default options).  The edge is chosen, not derived.  A receiver that
+#: stops reading is caught by the cycle-count assertion instead.
 DEBUG_STREAM_LOSS_MAX = 0.75
 
-#: Loss fraction above which a passing capture still logs a WARNING.  Not a
+#: Loss fraction above which a passing capture still emits a UserWarning.  Not a
 #: pass/fail edge: it only makes a heavy-loss run visible in the default
 #: pytest report.  Chosen, not derived -- above audio-alone loss (<= 1.4%)
 #: and at the top of the audio-plus-debug range (12-26%).
@@ -203,10 +205,15 @@ def test_debug_stream_captures_cycles(client: Ultimate64Client) -> None:
     print(loss_line, flush=True)
     logger.info(loss_line)
     if _debug_loss_fraction(result) > DEBUG_STREAM_LOSS_WARN:
-        logger.warning(
-            "%s -- above %.0f%%; bench loss this high usually means competing "
-            "traffic on this host (the DeviceLock does not isolate it)",
-            loss_line, 100.0 * DEBUG_STREAM_LOSS_WARN,
+        # warnings.warn, not logger.warning: on a passing test only a
+        # warning reaches pytest's default report, in the warnings summary
+        # (#356 review round 3).  Default stacklevel, so the summary names
+        # this line rather than pytest's own call site.
+        warnings.warn(
+            f"{loss_line} -- above {100.0 * DEBUG_STREAM_LOSS_WARN:.0f}%; "
+            "bench loss this high usually means competing traffic on this "
+            "host (the DeviceLock does not isolate it)",
+            UserWarning,
         )
     assert result.total_cycles > 10000, (
         f"Expected >10000 cycles, got {result.total_cycles}"
