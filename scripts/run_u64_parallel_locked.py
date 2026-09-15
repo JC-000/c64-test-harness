@@ -43,14 +43,15 @@ def _run_locked(test_file: str, host: str, password: str | None) -> dict:
     if src not in sys.path:
         sys.path.insert(0, src)
 
-    from c64_test_harness.backends.device_lock import DeviceLock
+    from c64_test_harness.backends.device_lock import DeviceLock, resolve_lock_timeout
 
     pid = os.getpid()
     t0 = time.monotonic()
 
     lock = DeviceLock(host)
     t_pre = time.monotonic()
-    acquired = lock.acquire(timeout=120.0)
+    # U64_DEVICE_LOCK_TIMEOUT when set, else this runner's own 120 s (#244).
+    acquired = lock.acquire(timeout=resolve_lock_timeout(None, default=120.0))
     lock_wait = time.monotonic() - t_pre
 
     if not acquired:

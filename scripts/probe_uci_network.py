@@ -35,9 +35,8 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from _u64_host import require_u64_host  # noqa: E402
+from _u64_host import hold_device_lock, require_u64_host  # noqa: E402
 
-from c64_test_harness.backends.device_lock import DeviceLock
 from c64_test_harness.backends.ultimate64 import Ultimate64Transport
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
 from c64_test_harness.uci_network import enable_uci, disable_uci
@@ -410,16 +409,19 @@ def main() -> int:
     print(f"UCI Network Probe -- target: {host}")
     print("=" * 60)
 
-    # Acquire device lock for cross-process safety
-    lock = DeviceLock(host)
-    if not lock.acquire(timeout=60.0):
-        print("ERROR: Could not acquire device lock (another process holds it)")
-        return 1
+    # Acquire device lock for cross-process safety (#244: through the shared
+    # helper, so U64_DEVICE_LOCK_TIMEOUT is honoured; 60 s when it is unset).
+    with hold_device_lock(host, default_timeout=60.0):
+        return _probe(host, password, args.timeout)
 
+
+def _probe(host: str, password: str | None, timeout: float) -> int:
+    """The device work. Only ever called with the DeviceLock held."""
+    client = None
     try:
-        client = Ultimate64Client(host=host, password=password, timeout=args.timeout)
+        client = Ultimate64Client(host=host, password=password, timeout=timeout)
         transport = Ultimate64Transport(host=host, password=password,
-                                        timeout=args.timeout, client=client)
+                                        timeout=timeout, client=client)
 
         # Enable UCI transiently (not saved to flash)
         print("Enabling UCI (Command Interface)...")
@@ -482,12 +484,12 @@ def main() -> int:
         _dump_results(transport)
 
     finally:
-        try:
-            print("Disabling UCI (Command Interface)...")
-            disable_uci(client)
-        except Exception as exc:
-            print(f"WARNING: Failed to disable UCI: {exc}")
-        lock.release()
+        if client is not None:
+            try:
+                print("Disabling UCI (Command Interface)...")
+                disable_uci(client)
+            except Exception as exc:
+                print(f"WARNING: Failed to disable UCI: {exc}")
 
     return 0
 

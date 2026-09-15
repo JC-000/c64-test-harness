@@ -61,6 +61,9 @@ from pathlib import Path
 # Allow running from worktree without install
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _u64_host import hold_device_lock  # noqa: E402
 
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess  # noqa: E402
 from c64_test_harness.backends.vice_manager import PortAllocator  # noqa: E402
@@ -170,30 +173,32 @@ def run_vice_case(label: str, warp: bool) -> tuple[float, float]:
 def run_u64_case(host: str) -> tuple[float, float]:
     from c64_test_harness.backends.ultimate64 import Ultimate64Transport
     print(f"\n=== Ultimate 64 Elite: {host} ===", flush=True)
-    transport = Ultimate64Transport(host=host)
+    # Writes CIA1 TOD on a live machine: hold the lock (#244).
+    with hold_device_lock(host):
+        transport = Ultimate64Transport(host=host)
 
-    def _read():
-        h = transport.read_memory(0xDC0B, 1)[0]
-        m = transport.read_memory(0xDC0A, 1)[0]
-        s = transport.read_memory(0xDC09, 1)[0]
-        t = transport.read_memory(0xDC08, 1)[0]
-        return h, m, s, t
+        def _read():
+            h = transport.read_memory(0xDC0B, 1)[0]
+            m = transport.read_memory(0xDC0A, 1)[0]
+            s = transport.read_memory(0xDC09, 1)[0]
+            t = transport.read_memory(0xDC08, 1)[0]
+            return h, m, s, t
 
-    def _start():
-        crb = transport.read_memory(0xDC0F, 1)[0]
-        if crb & 0x80:
-            transport.write_memory(0xDC0F, bytes([crb & 0x7F]))
-        transport.write_memory(0xDC0B, bytes([0x00]))
-        transport.write_memory(0xDC0A, bytes([0x00]))
-        transport.write_memory(0xDC09, bytes([0x00]))
-        transport.write_memory(0xDC08, bytes([0x00]))
+        def _start():
+            crb = transport.read_memory(0xDC0F, 1)[0]
+            if crb & 0x80:
+                transport.write_memory(0xDC0F, bytes([crb & 0x7F]))
+            transport.write_memory(0xDC0B, bytes([0x00]))
+            transport.write_memory(0xDC0A, bytes([0x00]))
+            transport.write_memory(0xDC09, bytes([0x00]))
+            transport.write_memory(0xDC08, bytes([0x00]))
 
-    wall, tod_delta = measure(_read, _start)
-    final = _read()
-    print(f"wall: {wall:.2f}s   tod delta: {tod_delta:.1f}s   "
-          f"ratio: {tod_delta / wall:.2f}x   "
-          f"(final clock: {format_tod(*final)})", flush=True)
-    return wall, tod_delta
+        wall, tod_delta = measure(_read, _start)
+        final = _read()
+        print(f"wall: {wall:.2f}s   tod delta: {tod_delta:.1f}s   "
+              f"ratio: {tod_delta / wall:.2f}x   "
+              f"(final clock: {format_tod(*final)})", flush=True)
+        return wall, tod_delta
 
 
 def classify(ratio: float) -> str:
