@@ -853,6 +853,32 @@ class TestTheItemCountCarriesItsScope:
         dropped = flat.replace("of 203", "")
         assert dropped != flat and self._residual_errors(dropped)
 
+    def test_the_residual_records_the_292_investigation(self) -> None:
+        """#292's 2026-09-15 findings travel with the residual.
+
+        The fresh read after the owner's power-cycle, the counting basis it
+        ruled out (every item carries ``default``), the build the device
+        reported, and the arithmetic candidate -- graded inferred, never
+        stated as the cause.
+        """
+        flat = _flat(self._u64e_record().residuals)
+        for token in (
+            "2026-09-15",
+            "power-cycle",
+            "every one of the 203 items carries both current and default",
+            "bce4535e",
+            "v3.15-132",
+            "7f6fcb51..bce4535e",
+            "SID Detected Socket 1",
+            "inferred",
+            "unrecoverable",
+        ):
+            assert token in flat, token
+        # The candidate may not be promoted to the cause.
+        cand = [s for s in re.split(r"(?<=[.!?:])\s+", flat)
+                if "SID Detected Socket 1" in s]
+        assert cand and all("inferred" in s or "not established" in s for s in cand), cand
+
     # -- positive controls for the scan itself -------------------------------
 
     @pytest.mark.parametrize("label,text", [
