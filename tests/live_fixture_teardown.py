@@ -8,7 +8,10 @@ restore skips everything after it.  #276 repaired that shape in
 the other live fixtures, shared so the shape is written once:
 
 * :func:`teardown_then_release` attempts every step, each on its own, and
-  calls the lock release **last**, in a ``finally``, whatever the steps did;
+  calls the lock release **last**, in a ``finally``, whatever the steps did.
+  A release that raises is logged and returned with the step failures
+  rather than raised on the spot, so it never replaces an exception already
+  leaving the ``yield`` (#368);
 * :func:`raise_teardown_failures` raises what failed, so a restore that did
   not happen is reported rather than swallowed.  Fixtures call it *after*
   their ``finally``, so it never masks an exception already propagating
@@ -40,9 +43,15 @@ Step = tuple[str, Callable[[], Any]]
 
 
 def attempt_steps(steps: Iterable[Step]) -> list[tuple[str, BaseException]]:
-    """Attempt every step; return ``(label, exception)`` for each that raised."""
+    """Attempt every step; return ``(label, exception)`` for each that raised.
+
+    A step whose callable is ``None`` is skipped -- a resource that was never
+    created (``transport.close if transport is not None else None``).
+    """
     failures: list[tuple[str, BaseException]] = []
     for label, step in steps:
+        if step is None:
+            continue
         try:
             step()
         except Exception as exc:  # noqa: BLE001 -- collected, raised by the caller
@@ -54,11 +63,22 @@ def attempt_steps(steps: Iterable[Step]) -> list[tuple[str, BaseException]]:
 def teardown_then_release(
     steps: Iterable[Step], release: Callable[[], Any]
 ) -> list[tuple[str, BaseException]]:
-    """Attempt every step, then *release* -- last, always."""
+    """Attempt every step, then *release* -- last, always.
+
+    A release that raises is logged and appended to the returned failures,
+    not raised here: raised from this ``finally`` it would replace the
+    exception leaving the fixture's ``yield`` and the step failures (#368).
+    """
+    failures: list[tuple[str, BaseException]] = []
     try:
-        return attempt_steps(steps)
+        failures = attempt_steps(steps)
     finally:
-        release()
+        try:
+            release()
+        except Exception as exc:  # noqa: BLE001 -- reported by the caller
+            _log.warning("teardown step release() failed: %r", exc)
+            failures.append(("release()", exc))
+    return failures
 
 
 def raise_teardown_failures(

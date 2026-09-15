@@ -394,13 +394,18 @@ def binary_transport():
         port=port, warp=True, sound=False,
     )
 
+    failures: list = []
     with ViceProcess(config) as vice:
-        transport = connect_binary_transport(port, proc=vice)
+        transport = None
         try:
+            transport = connect_binary_transport(port, proc=vice)
             yield transport
         finally:
-            transport.close()
-            allocator.release(port)
+            failures = attempt_steps([
+                ("transport.close()", transport.close if transport is not None else None),
+                (f"allocator.release({port})", lambda: allocator.release(port)),
+            ])
+    raise_teardown_failures("binary_transport teardown", failures)
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +418,7 @@ BRIDGE_MAC_A = bytes.fromhex("02C640000001")
 BRIDGE_MAC_B = bytes.fromhex("02C640000002")
 # Reserved harness range; see tests/bridge_platform.py.
 from bridge_platform import BRIDGE_IP_A, BRIDGE_IP_B  # noqa: E402,F401
+from live_fixture_teardown import attempt_steps, raise_teardown_failures
 
 
 def _bridge_wait_ready(transport: BinaryViceTransport, timeout: float = 30.0) -> None:
@@ -511,30 +517,32 @@ def bridge_vice_pair():
     # bare fixture error the notice below never learns about.
     vice_a: ViceProcess | None = None
     vice_b: ViceProcess | None = None
+    transport_a = transport_b = None
+    failures: list = []
 
     try:
         vice_a = start_vice_or_skip(config_a)
         vice_b = start_vice_or_skip(config_b)
         transport_a = connect_binary_transport(port_a, proc=vice_a)
         transport_b = connect_binary_transport(port_b, proc=vice_b)
-        try:
-            _bridge_wait_ready(transport_a)
-            _bridge_wait_ready(transport_b)
-            _bridge_init_cs8900a(transport_a, scratch, code)
-            _bridge_init_cs8900a(transport_b, scratch, code)
-            set_cs8900a_mac(transport_a, BRIDGE_MAC_A)
-            set_cs8900a_mac(transport_b, BRIDGE_MAC_B)
-            yield transport_a, transport_b
-        finally:
-            transport_a.close()
-            transport_b.close()
+        _bridge_wait_ready(transport_a)
+        _bridge_wait_ready(transport_b)
+        _bridge_init_cs8900a(transport_a, scratch, code)
+        _bridge_init_cs8900a(transport_b, scratch, code)
+        set_cs8900a_mac(transport_a, BRIDGE_MAC_A)
+        set_cs8900a_mac(transport_b, BRIDGE_MAC_B)
+        yield transport_a, transport_b
     finally:
-        if vice_a is not None:
-            vice_a.stop()
-        if vice_b is not None:
-            vice_b.stop()
-        allocator.release(port_a)
-        allocator.release(port_b)
+        # Every step on its own, in the old order (#368).
+        failures = attempt_steps([
+            ("transport_a.close()", transport_a.close if transport_a is not None else None),
+            ("transport_b.close()", transport_b.close if transport_b is not None else None),
+            ("vice_a.stop()", vice_a.stop if vice_a is not None else None),
+            ("vice_b.stop()", vice_b.stop if vice_b is not None else None),
+            (f"allocator.release({port_a})", lambda: allocator.release(port_a)),
+            (f"allocator.release({port_b})", lambda: allocator.release(port_b)),
+        ])
+    raise_teardown_failures("bridge_vice_pair teardown", failures)
 
 
 # ---------------------------------------------------------------------------

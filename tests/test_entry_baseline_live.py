@@ -88,6 +88,11 @@ from c64_test_harness.backends.ultimate64_helpers import (
     CAT_CART,
 )
 from c64_test_harness.backends.unified_manager import create_manager
+from live_fixture_teardown import (
+    attempt_steps,
+    raise_teardown_failures,
+    teardown_then_release,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -128,10 +133,15 @@ def client() -> Ultimate64Client:
         lock.acquire_or_raise(timeout=120.0, progress_window=60.0)
     except DeviceLockTimeout as exc:
         pytest.skip(str(exc))
+    client = None
+    failures: list = []
     try:
-        yield Ultimate64Client(host=_HOST, password=_PW, timeout=10.0)
+        client = Ultimate64Client(host=_HOST, password=_PW, timeout=10.0)
+        yield client
     finally:
-        lock.release()
+        steps = [] if client is None else [("client.close()", client.close)]
+        failures = teardown_then_release(steps, lock.release)
+    raise_teardown_failures("client teardown", failures)
 
 
 def _bare(client: Ultimate64Client, category: str) -> dict[str, Any]:
@@ -174,23 +184,35 @@ def stock(client: Ultimate64Client) -> dict[str, dict[str, Any]]:
 def restore_drifted(client: Ultimate64Client, stock: dict[str, dict[str, Any]]):
     """PUT back only what this module itself drifted, if it still differs.
 
-    Both PUTs are attempted; failures are raised together at the end.
+    Every PUT is attempted on every exit -- an exception at the ``yield``
+    included -- whatever an earlier one raised; failures are raised together
+    after the ``finally`` (#368).
     """
-    yield
-    failures: list[str] = []
-    for cat, item in _DRIFTED_BY_THIS_MODULE:
-        want = stock.get(cat, {}).get(item)
-        if want is None or want == "":
-            continue
-        try:
-            if client.get_config_value(cat, item) != want:
-                client.set_config_item(cat, item, want)
-        except Ultimate64Error as exc:
-            failures.append(f"{cat}/{item}={want!r}: {exc}")
+    failures: list = []
+    try:
+        yield
+    finally:
+        steps = []
+        for cat, item in _DRIFTED_BY_THIS_MODULE:
+            want = stock.get(cat, {}).get(item)
+            if want is None or want == "":
+                continue
+            steps.append((
+                f"{cat}/{item}={want!r}",
+                lambda cat=cat, item=item, want=want: _put_back(client, cat, item, want),
+            ))
+        failures = attempt_steps(steps)
     if failures:
         raise Ultimate64Error(
-            f"{len(failures)} drifted item(s) could not be put back: " + "; ".join(failures)
+            f"{len(failures)} drifted item(s) could not be put back: "
+            + "; ".join(f"{label}: {exc}" for label, exc in failures)
         )
+
+
+def _put_back(client: Ultimate64Client, cat: str, item: str, want: str) -> None:
+    """PUT *item* back to *want* only if it still differs."""
+    if client.get_config_value(cat, item) != want:
+        client.set_config_item(cat, item, want)
 
 
 # --------------------------------------------------------------------------- #

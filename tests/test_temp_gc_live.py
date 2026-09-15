@@ -28,6 +28,7 @@ import pytest
 from c64_test_harness.backends.device_lock import DeviceLock, DeviceLockTimeout
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
 from c64_test_harness.backends.ultimate64_temp_gc import gc_temp_folder
+from live_fixture_teardown import raise_teardown_failures, teardown_then_release
 
 _LIVE = os.environ.get("TEMP_GC_LIVE")
 _HOST = os.environ.get("U64_HOST")
@@ -58,10 +59,15 @@ def client() -> Ultimate64Client:
         lock.acquire_or_raise(timeout=120.0, progress_window=60.0)
     except DeviceLockTimeout as exc:
         pytest.skip(str(exc))
+    client = None
+    failures: list = []
     try:
-        yield Ultimate64Client(host=_HOST, password=_PW, timeout=10.0)
+        client = Ultimate64Client(host=_HOST, password=_PW, timeout=10.0)
+        yield client
     finally:
-        lock.release()
+        steps = [] if client is None else [("client.close()", client.close)]
+        failures = teardown_then_release(steps, lock.release)
+    raise_teardown_failures("client teardown", failures)
 
 
 def test_gc_trims_leaked_attachments_after_repeated_run_prg(client: Ultimate64Client) -> None:

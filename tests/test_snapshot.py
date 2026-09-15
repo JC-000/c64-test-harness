@@ -52,6 +52,7 @@ from c64_test_harness.snapshot import (
     _iter_modules,
     _load_template,
 )
+from live_fixture_teardown import attempt_steps, raise_teardown_failures
 
 
 # ---------------------------------------------------------------------------
@@ -95,15 +96,20 @@ def vice_transport():
         reservation.close()
 
     config = ViceConfig(port=port, warp=True, sound=False)
+    failures: list = []
     with ViceProcess(config) as vice:
-        transport = _connect_vice(port, proc=vice)
+        transport = None
         try:
+            transport = _connect_vice(port, proc=vice)
             # Let VICE finish coming up so RAM is in a steady state.
             time.sleep(3.0)
             yield transport
         finally:
-            transport.close()
-            allocator.release(port)
+            failures = attempt_steps([
+                ("transport.close()", transport.close if transport is not None else None),
+                (f"allocator.release({port})", lambda: allocator.release(port)),
+            ])
+    raise_teardown_failures("vice_transport teardown", failures)
 
 
 class _MockTransport:

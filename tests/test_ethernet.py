@@ -57,6 +57,7 @@ from conftest import (
     connect_binary_transport,
     start_vice_or_skip,
 )
+from live_fixture_teardown import attempt_steps, raise_teardown_failures
 
 # ---------------------------------------------------------------------------
 # Skip helpers
@@ -143,19 +144,22 @@ def vice_ethernet():
     # allocator.release(port), matching conftest.bridge_vice_pair's
     # pattern of putting the allocator release in the outermost finally.
     vice: ViceProcess | None = None
+    transport = None
+    failures: list = []
     try:
         vice = start_vice_or_skip(config)
         transport = connect_binary_transport(port, proc=vice)
-        try:
-            grid = binary_wait_for_text(transport, "READY.", timeout=30)
-            assert grid is not None, "BASIC READY prompt not found"
-            yield transport
-        finally:
-            transport.close()
+        grid = binary_wait_for_text(transport, "READY.", timeout=30)
+        assert grid is not None, "BASIC READY prompt not found"
+        yield transport
     finally:
-        if vice is not None:
-            vice.stop()
-        allocator.release(port)
+        # Every step on its own, in the old order (#368).
+        failures = attempt_steps([
+            ("transport.close()", transport.close if transport is not None else None),
+            ("vice.stop()", vice.stop if vice is not None else None),
+            (f"allocator.release({port})", lambda: allocator.release(port)),
+        ])
+    raise_teardown_failures("vice_ethernet teardown", failures)
 
 
 def _open_capture_or_verdict(iface: str) -> PacketCapture:

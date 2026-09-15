@@ -33,6 +33,7 @@ from c64_test_harness.execute import jsr, load_code
 from c64_test_harness.memory import read_bytes, write_bytes
 
 from conftest import connect_binary_transport, start_vice_or_skip
+from live_fixture_teardown import attempt_steps, raise_teardown_failures
 
 # ---------------------------------------------------------------------------
 # Skip conditions
@@ -666,6 +667,8 @@ def vice_bridge_pair():
     # marker uses, instead of a bare fixture error.
     vice_a: ViceProcess | None = None
     vice_b: ViceProcess | None = None
+    transport_a = transport_b = None
+    failures: list = []
 
     try:
         vice_a = start_vice_or_skip(config_a)
@@ -674,29 +677,29 @@ def vice_bridge_pair():
         transport_a = connect_binary_transport(port_a, proc=vice_a)
         transport_b = connect_binary_transport(port_b, proc=vice_b)
 
-        try:
-            _wait_for_ready(transport_a)
-            _wait_for_ready(transport_b)
+        _wait_for_ready(transport_a)
+        _wait_for_ready(transport_b)
 
-            # Initialize CS8900a on both instances (enable TX/RX)
-            _init_cs8900a(transport_a)
-            _init_cs8900a(transport_b)
+        # Initialize CS8900a on both instances (enable TX/RX)
+        _init_cs8900a(transport_a)
+        _init_cs8900a(transport_b)
 
-            # Program unique MAC addresses into the CS8900a IA registers
-            set_cs8900a_mac(transport_a, SRC_MAC_A)
-            set_cs8900a_mac(transport_b, SRC_MAC_B)
+        # Program unique MAC addresses into the CS8900a IA registers
+        set_cs8900a_mac(transport_a, SRC_MAC_A)
+        set_cs8900a_mac(transport_b, SRC_MAC_B)
 
-            yield transport_a, transport_b
-        finally:
-            transport_a.close()
-            transport_b.close()
+        yield transport_a, transport_b
     finally:
-        if vice_a is not None:
-            vice_a.stop()
-        if vice_b is not None:
-            vice_b.stop()
-        allocator.release(port_a)
-        allocator.release(port_b)
+        # Every step on its own, in the old order (#368).
+        failures = attempt_steps([
+            ("transport_a.close()", transport_a.close if transport_a is not None else None),
+            ("transport_b.close()", transport_b.close if transport_b is not None else None),
+            ("vice_a.stop()", vice_a.stop if vice_a is not None else None),
+            ("vice_b.stop()", vice_b.stop if vice_b is not None else None),
+            (f"allocator.release({port_a})", lambda: allocator.release(port_a)),
+            (f"allocator.release({port_b})", lambda: allocator.release(port_b)),
+        ])
+    raise_teardown_failures("vice_bridge_pair teardown", failures)
 
 
 # ---------------------------------------------------------------------------

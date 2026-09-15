@@ -86,6 +86,7 @@ from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 # The builder under test, imported from the module it serves so that a
 # change to it is caught here.
 from test_vice_binary_unit import _build_response_bytes
+from live_fixture_teardown import attempt_steps, raise_teardown_failures
 
 pytestmark = pytest.mark.vice_live
 
@@ -103,6 +104,7 @@ def raw_monitor():
     proc = ViceProcess(cfg)
     proc.start()
     sock = None
+    failures: list = []
     try:
         deadline = __import__("time").monotonic() + 30.0
         while __import__("time").monotonic() < deadline:
@@ -116,9 +118,11 @@ def raw_monitor():
         sock.settimeout(10.0)
         yield sock
     finally:
-        if sock is not None:
-            sock.close()
-        proc.stop()
+        failures = attempt_steps([
+            ("sock.close()", sock.close if sock is not None else None),
+            ("proc.stop()", proc.stop),
+        ])
+    raise_teardown_failures("raw_monitor teardown", failures)
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:

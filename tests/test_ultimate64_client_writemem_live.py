@@ -29,6 +29,7 @@ import pytest
 
 from c64_test_harness import DeviceLock, DeviceLockTimeout
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
+from live_fixture_teardown import raise_teardown_failures, teardown_then_release
 
 _HOST = os.environ.get("U64_HOST")
 _PW = os.environ.get("U64_PASSWORD")
@@ -57,11 +58,15 @@ def client() -> Ultimate64Client:
         lock.acquire_or_raise(timeout=120.0)
     except DeviceLockTimeout as e:
         pytest.skip(str(e))
-    c = Ultimate64Client(_HOST, password=_PW, timeout=8.0)
+    client = None
+    failures: list = []
     try:
-        yield c
+        client = Ultimate64Client(_HOST, password=_PW, timeout=8.0)
+        yield client
     finally:
-        lock.release()
+        steps = [] if client is None else [("client.close()", client.close)]
+        failures = teardown_then_release(steps, lock.release)
+    raise_teardown_failures("client teardown", failures)
 
 
 def _zero(client: Ultimate64Client, addr: int, length: int) -> None:

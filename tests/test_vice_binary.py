@@ -24,6 +24,7 @@ from c64_test_harness.backends.vice_manager import PortAllocator
 from c64_test_harness.transport import TransportError
 
 from conftest import connect_binary_transport
+from live_fixture_teardown import attempt_steps, raise_teardown_failures
 
 # Skip entire module if x64sc is not installed
 pytestmark = pytest.mark.vice_live
@@ -46,13 +47,18 @@ def binary_transport():
         port=port, warp=True, sound=False,
     )
 
+    failures: list = []
     with ViceProcess(config) as vice:
-        transport = connect_binary_transport(port, proc=vice)
+        transport = None
         try:
+            transport = connect_binary_transport(port, proc=vice)
             yield transport
         finally:
-            transport.close()
-            allocator.release(port)
+            failures = attempt_steps([
+                ("transport.close()", transport.close if transport is not None else None),
+                (f"allocator.release({port})", lambda: allocator.release(port)),
+            ])
+    raise_teardown_failures("binary_transport teardown", failures)
 
 
 # ======================================================================
