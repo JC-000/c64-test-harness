@@ -91,6 +91,100 @@ finally:
 A live, progressing holder extends a waiter's deadline indefinitely, so
 a neighbour running a multi-hour suite does not time you out.
 
+## Rescuing a self-held wait from another thread
+
+An `acquire()` on a lock **its own thread already holds** (through a
+second `DeviceLock` instance, without `allow_nested=True`) cannot end its
+own wait: the thread that would have to call `release()` is the one
+blocked. Such a wait never extends its deadline, and since issue #273 it
+is also capped.
+
+Another thread holding a reference to the holder may release it
+mid-wait, and the blocked acquire then succeeds. That rescue is supported
+**within the grace only**: `_SELF_HELD_WAIT_GRACE` = 2.0 s. When the
+caller's timeout is longer than that, the acquire logs a WARNING naming
+the device, the requested timeout and the cap, and the timeout is capped
+at 2.0 s. A helper that releases later than that is too late: `acquire()`
+returns `False` and `acquire_or_raise()` raises `DeviceLockTimeout`. A
+timeout shorter than the grace is served as given; the grace is a cap,
+never a floor.
+
+There is no opt-out keyword and no environment variable for this
+(owner decision on #277, 2026-09-14). The measured cliff sits exactly at
+the constant: a helper releasing at 1.95 s rescues, one releasing at
+2.20 s does not. If what you actually have is one owner re-entering the
+library while it already holds the device, pass `allow_nested=True`
+instead; that joins the hold rather than waiting on it.
+
+## The acquire budget: `U64_DEVICE_LOCK_TIMEOUT`
+
+Where a caller does not pass a timeout, the budget comes from the
+environment (issue #233):
+
+| Call | Explicit argument | `U64_DEVICE_LOCK_TIMEOUT` unset |
+|---|---|---|
+| `DeviceLock.acquire()` / `acquire_or_raise()` | `timeout=` | 30 s (`DEFAULT_ACQUIRE_TIMEOUT`) |
+| `create_manager()` / `UnifiedManager` | `lock_timeout=` | 60 s (`unified_manager.DEFAULT_LOCK_TIMEOUT`) |
+
+- **An explicit argument always wins**, and when one is given the
+  variable is not read at all. An explicit value is not checked against
+  the rules below, with one exception: NaN raises `ValueError`, because a
+  NaN deadline never expires. An explicit `inf` waits for ever, and zero or
+  less makes a single attempt.
+- **The variable is read at call time**, on every acquire. A long-lived
+  manager sees a change.
+- **Neither default moved.** A caller that set nothing gets exactly what
+  it got before.
+- **Malformed, zero or negative, or non-finite is fatal**:
+  `DeviceLockTimeoutConfigError`, a `ValueError`, so an `except
+  TimeoutError` retry arm will not swallow a typo. It is raised before the
+  lock is tried, and on the manager path before the device pool probes
+  any device. `U64_DEVICE_LOCK_TIMEOUT` values of `30m`, `0`, `inf` and
+  `nan` are all refused, including by the live-test guard in
+  `tests/conftest.py`, which reads the variable through the same resolver
+  with its own 300 s default. A budget of
+  zero fails every queued run at once, and an infinite one makes a wedged
+  device look the same as a busy one.
+- **Empty (`U64_DEVICE_LOCK_TIMEOUT=`) means unset**: the default, plus
+  one WARNING saying so.
+
+This is the harness's first environment variable that is a *budget*
+rather than a gate: it changes how long a wait may last, never whether
+anything runs. What it bounds is unchanged, too. A live, progressing
+holder still extends the deadline indefinitely, so raising the budget
+buys time against wedged or dead holders and against the handoff-chain
+bound, not against one long healthy run.
+
+## Seeing the wait: progress lines and `on_wait`
+
+A blocked acquire reports every 30 s, whether or not its deadline is
+being extended. Before #233 a wait behind a non-extending holder said
+nothing until it timed out. Two forms carry the same four fields:
+
+- **A log line** from `c64_test_harness.backends.device_lock`:
+  `DeviceLock <host>: still waiting after Ns; holder pid=P, lockfile
+  age=As, queue depth=D; <state>`. It is logged at INFO while the deadline
+  is being extended (the existing extension WARNING already covers that
+  case) and at WARNING otherwise.
+- **A callback**: `acquire(..., on_wait=cb)` and `acquire_or_raise(...,
+  on_wait=cb)` call `cb(elapsed, holder_pid, lockfile_age, queue_depth)`
+  from the waiting thread. It is never called for an uncontended acquire.
+  `queue_depth` counts the caller too. An exception the callback raises
+  propagates out of `acquire`, abandons the wait and deregisters the
+  waiter, so a caller can use it to cancel.
+
+`lockfile_age` is the field that separates "healthy long run" from
+"wedged". The line's `<state>` says `STALE, holder may be wedged` only
+when two things hold: acquire is **not** extending on that poll, and the
+age exceeds `progress_window`. That is the same threshold acquire extends
+on, checked against acquire's own decision. So a progress line can never
+call a holder wedged while acquire is still extending behind it. The
+other states are "deadline extended", "held by this thread" (the
+self-held cap above, which still logs its own WARNING),
+"`progress_window=None`", "handoff chain", and "holder not progressing".
+
+`DeviceLockTimeout` and its diagnostics are unchanged.
+
 ## Checking without adopting the package
 
 For a runner that wants to be a good neighbour without restructuring

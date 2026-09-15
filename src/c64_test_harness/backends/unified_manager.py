@@ -31,6 +31,7 @@ try:
     from .device_lock import (
         DeviceLock,
         DeviceLockTimeout,
+        resolve_lock_timeout,
         suppress_unlocked_warning,
     )
 
@@ -45,6 +46,13 @@ logger = logging.getLogger(__name__)
 #: lock; a test that needs proof its log capture saw the lane matches
 #: this (``tests/test_unlocked_notice_live.py``).
 LANE_LOCKED_PHRASE = "with cross-process lock"
+
+#: The manager path's device-lock budget when neither ``lock_timeout`` nor
+#: ``U64_DEVICE_LOCK_TIMEOUT`` gives one (issue #233).  Unchanged: it was
+#: the signature default before.  Deliberately distinct from
+#: ``device_lock.DEFAULT_ACQUIRE_TIMEOUT`` (30 s), which was bare
+#: ``DeviceLock.acquire``'s default and is also unchanged.
+DEFAULT_LOCK_TIMEOUT = 60.0
 
 
 # ---------------------------------------------------------------------------
@@ -130,9 +138,16 @@ class UnifiedManager:
         Optional password for Ultimate 64 devices.  Defaults to the
         ``U64_PASSWORD`` environment variable.
     lock_timeout:
-        Cross-process device-lock timeout in seconds (U64 only).
-        Defaults to 60.0; long parallel benches typically pass
-        ``lock_timeout=1800.0`` (30 min) or higher.
+        Cross-process device-lock timeout in seconds (U64 only).  ``None``
+        (the default) reads ``U64_DEVICE_LOCK_TIMEOUT`` on every
+        ``acquire()``, else :data:`DEFAULT_LOCK_TIMEOUT` (60 s); an
+        explicit value always wins.  A malformed, non-positive or
+        non-finite ``U64_DEVICE_LOCK_TIMEOUT`` raises
+        ``DeviceLockTimeoutConfigError`` from ``acquire()`` before the
+        device pool probes any device.  Long parallel benches typically
+        pass ``lock_timeout=1800.0`` (30 min) or higher, or set the
+        variable.  It bounds waits on wedged or dead holders; a live,
+        progressing holder extends the deadline indefinitely.
     baseline_on_entry:
         U64 only (issue #227).  ``True`` runs
         :func:`~c64_test_harness.backends.ultimate64_baseline.apply_factory_baseline`
@@ -168,7 +183,7 @@ class UnifiedManager:
         vice_kwargs: dict[str, Any] | None = None,
         u64_hosts: str | list[str] | None = None,
         u64_password: str | None = None,
-        lock_timeout: float = 60.0,
+        lock_timeout: float | None = None,
         memory_policy: "MemoryPolicy | None" = None,
         baseline_on_entry: bool | None = None,
     ) -> None:
@@ -322,7 +337,7 @@ class UnifiedManager:
     def _build_u64_manager(
         hosts: str | list[str] | None,
         password: str | None,
-        lock_timeout: float = 60.0,
+        lock_timeout: float | None = None,
         baseline_on_entry: bool | None = None,
     ) -> Any:
         """Build an Ultimate64InstanceManager from host/password config.
@@ -410,7 +425,7 @@ class _LockedU64Manager:
     def __init__(
         self,
         inner: Any,
-        lock_timeout: float = 60.0,
+        lock_timeout: float | None = None,
         baseline_on_entry: bool | None = False,
     ) -> None:
         self._inner = inner
@@ -440,6 +455,13 @@ class _LockedU64Manager:
         # thread-scoped, so an ad-hoc unlocked client built on another
         # thread still gets its notice.
         # (This class is only instantiated when device_lock imported.)
+        # The budget first (#233): the inner pool's acquire probes the
+        # device, and a malformed U64_DEVICE_LOCK_TIMEOUT must fail before
+        # any device is contacted.  Resolved per acquire, not at
+        # construction, so a long-lived manager sees the current value.
+        lock_timeout = resolve_lock_timeout(
+            self._lock_timeout, default=DEFAULT_LOCK_TIMEOUT
+        )
         with suppress_unlocked_warning():
             instance = self._inner.acquire()
         device_host = instance.device.host
@@ -450,7 +472,7 @@ class _LockedU64Manager:
         # user per device, so joining the existing hold is safe.
         lock = DeviceLock(device_host, allow_nested=True)
         try:
-            lock.acquire_or_raise(timeout=self._lock_timeout)
+            lock.acquire_or_raise(timeout=lock_timeout)
         except BaseException:
             # Couldn't get cross-process lock — return device to pool.
             self._inner.release(instance)
@@ -581,7 +603,7 @@ class _LockedU64Manager:
 def create_manager(
     backend: str = "auto",
     *,
-    lock_timeout: float = 60.0,
+    lock_timeout: float | None = None,
     **kwargs: Any,
 ) -> UnifiedManager:
     """Create a ``UnifiedManager`` from environment and keyword overrides.
@@ -591,9 +613,11 @@ def create_manager(
     backend:
         ``"vice"``, ``"u64"``, or ``"auto"`` (reads ``C64_BACKEND``).
     lock_timeout:
-        Cross-process device-lock timeout in seconds (U64 only).
-        Defaults to 60.0; long parallel benches typically pass
-        ``lock_timeout=1800.0`` (30 min) or higher.
+        Cross-process device-lock timeout in seconds (U64 only).  ``None``
+        (the default) reads ``U64_DEVICE_LOCK_TIMEOUT`` on every
+        ``acquire()``, else 60 s; an explicit value always wins.  Long
+        parallel benches typically pass ``lock_timeout=1800.0`` (30 min)
+        or higher, or set the variable.
     **kwargs:
         Forwarded to ``UnifiedManager.__init__``.  Useful keys:
         ``vice_config``, ``vice_kwargs``, ``u64_hosts``, ``u64_password``,

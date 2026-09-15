@@ -383,6 +383,28 @@ The unit contract lives in `tests/test_entry_baseline.py` (mocked; no hardware).
 
 The `U64_HOST`-gated capture suites (`tests/test_chromatic_capture_live.py`, `tests/test_multi_sid_parallel_live.py`) write their `.wav` + `.json` output to a per-run `tmp_path` directory by default, so an ordinary bench run never modifies the tracked reference under `tests/wav_captures/` (issue #220: a live run used to leave ten tracked files changed with no test failing, and the reference drifted with every run). Set `WAV_CAPTURES_REFRESH=1` to write into `tests/wav_captures/<suite>/` instead — a deliberate refresh to review and commit on purpose. The path decision is `tests/wav_capture_paths.py:capture_dir()`; `tests/test_wav_capture_paths.py` pins it without hardware. Each live module's `wav_dir` fixture records the directory it used as a testsuite property and prints it, so a scratch capture can be found afterwards (`-s`, or the junit XML).
 
+### `U64_DEVICE_LOCK_TIMEOUT` — a budget, not a gate
+
+`U64_DEVICE_LOCK_TIMEOUT` is a budget, not a gate: unlike every variable
+in the tables around it, it never decides whether a test or a request
+runs, only how long a device-lock acquire may wait (issue #233). Unset,
+`DeviceLock.acquire()` waits 30 s and `create_manager()` / `UnifiedManager`
+wait 60 s, exactly as before. Set, it replaces both wherever the caller did
+not pass `timeout=` / `lock_timeout=`; an explicit argument always wins.
+It is read at call time. A malformed, non-positive or non-finite value
+raises `DeviceLockTimeoutConfigError` before any device is contacted, and
+an empty value means unset, with a WARNING. A live, progressing holder
+still extends the deadline indefinitely, so the budget bounds waits on
+wedged or dead holders. Details and the progress reporting that goes with
+it: [docs/device_locking.md](device_locking.md) § "The acquire budget".
+
+`tests/conftest.py`'s `device_lock_guard`, the autouse lock around every
+live test, reads `U64_DEVICE_LOCK_TIMEOUT` through the same resolver, with
+its own 300 s default when the variable is unset. Before #301 it parsed the
+value itself: a malformed value silently became 300 s, and `0`, `inf` or
+`nan` reached the lock as an unchecked explicit timeout. Now a bad value
+fails the live test up front.
+
 ### Hardware and network live gates (all opt-in, skip cleanly when unset)
 
 Most gates below also need `U64_HOST` (or the test's own host knob), and

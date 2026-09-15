@@ -50,6 +50,12 @@ def _make_mock_u64_instance(host: str = "192.168.1.81") -> MagicMock:
 # BackendManager protocol
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _no_ambient_lock_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``U64_DEVICE_LOCK_TIMEOUT`` in the shell must not decide these tests (#233)."""
+    monkeypatch.delenv("U64_DEVICE_LOCK_TIMEOUT", raising=False)
+
+
 class TestBackendManagerProtocol:
     """Verify BackendManager is a structural protocol."""
 
@@ -190,7 +196,7 @@ class TestU64Backend:
         # reset is left undecided here and resolved per device at acquire
         # (#266 — on for the U64E, off for the C64U, off for unknown).
         mock_build.assert_called_once_with(
-            "10.0.0.1", None, lock_timeout=60.0, baseline_on_entry=None,
+            "10.0.0.1", None, lock_timeout=None, baseline_on_entry=None,
         )
         assert mgr.backend == "u64"
 
@@ -219,7 +225,7 @@ class TestU64Backend:
         with patch.dict(os.environ, {"U64_PASSWORD": "secret"}):
             UnifiedManager(backend="u64", u64_hosts="10.0.0.1")
         mock_build.assert_called_once_with(
-            "10.0.0.1", None, lock_timeout=60.0, baseline_on_entry=None,
+            "10.0.0.1", None, lock_timeout=None, baseline_on_entry=None,
         )
 
 
