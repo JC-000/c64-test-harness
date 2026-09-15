@@ -262,3 +262,59 @@ def test_the_runner_file_timeout_flag_reaches_every_worker(
         with pytest.raises(SystemExit) as exc:
             runner.main()
         assert exc.value.code == 2, bad
+
+
+# --------------------------------------------------------------------------- #
+# #405 review round 1 (reviewer-4): the docstring states what "no cap" costs  #
+# --------------------------------------------------------------------------- #
+
+_PARALLEL_RUNNER = (
+    Path(__file__).resolve().parent.parent / "scripts" / "run_u64_parallel_locked.py"
+)
+
+
+def _parallel_runner_docstring() -> str:
+    import ast
+
+    return ast.get_docstring(ast.parse(_PARALLEL_RUNNER.read_text())) or ""
+
+
+#: A child hung inside a test keeps heartbeating, so the guard's timeout never
+#: fires behind it; the docstring must say so, and say what to do about it.
+_NO_CAP_COST = (
+    "A child that hangs *inside* a test still holds the device lock",
+    "its heartbeat thread keeps the lockfile fresh",
+    "waits until someone kills it",
+    "bounds only a wait behind a holder that stops heartbeating",
+    "it never bounds a wait behind a single hung holder",
+    "Defaulting to ``None`` is a deliberate trade-off",
+    "For an unattended run, pass a generous ``--file-timeout SECONDS``",
+)
+
+#: The sentence reviewer-4 (and reviewer-2's nit) found contradicting
+#: "extends indefinitely": the guard does not bound a wait behind a live holder.
+_RETIRED_BOUND_CLAIM = (
+    "The bound on a lock wait is the guard's own",
+    "which fails that test with the holder named",
+)
+
+
+@pytest.mark.parametrize("phrase", _NO_CAP_COST)
+def test_the_docstring_states_what_no_default_cap_costs(phrase: str) -> None:
+    doc = " ".join(_parallel_runner_docstring().split())
+    assert phrase in doc, phrase
+
+
+@pytest.mark.parametrize("phrase", _RETIRED_BOUND_CLAIM)
+def test_the_docstring_does_not_claim_the_guard_bounds_a_hang(phrase: str) -> None:
+    doc = " ".join(_parallel_runner_docstring().split())
+    assert phrase not in doc, phrase
+
+
+def test_the_usage_block_shows_the_file_timeout_flag() -> None:
+    raw = _parallel_runner_docstring()
+    head, sep, tail = raw.partition("Usage:")
+    assert sep, "the Usage block is missing"
+    lines = [ln for ln in tail.split("\n\n", 1)[0].splitlines() if ln.strip()]
+    assert len(lines) == 2, lines
+    assert all("[--file-timeout SECONDS]" in ln for ln in lines), lines

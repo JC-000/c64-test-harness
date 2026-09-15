@@ -15,11 +15,20 @@ be seen by the next test of another file, just as it can between lanes.
 its tests *plus* every per-test wait for the lock -- behind the other workers'
 tests and behind other lanes -- and the guard extends that wait indefinitely
 behind a live, progressing holder.  So any fixed cap measures contention, not
-a hang: the old 90 s killed files whose own tests were fast.  The bound on a
-lock wait is the guard's own (``U64_DEVICE_LOCK_TIMEOUT``, else conftest's
-300 s), which fails that test with the holder named.  ``--file-timeout
-SECONDS`` restores a cap for a caller who wants one, knowing it includes those
-waits.
+a hang: the old 90 s killed files whose own tests were fast.
+
+The cost of no cap is a hang that nothing bounds.  A child that hangs *inside*
+a test still holds the device lock, and while its heartbeat thread keeps the
+lockfile fresh it reads to every waiter as a live, progressing holder: every
+lane behind it -- the other workers and other lanes -- waits until someone
+kills it.  The guard's timeout (``U64_DEVICE_LOCK_TIMEOUT``, else conftest's
+300 s) bounds only a wait behind a holder that stops heartbeating (dead PID or
+stale lockfile), or a wait overtaken by repeated handoffs; it never bounds a
+wait behind a single hung holder.  Defaulting to ``None`` is a deliberate
+trade-off: no file is killed for contention, at the price of an unbounded hang.
+For an unattended run, pass a generous ``--file-timeout SECONDS``, sized to the
+file's tests plus the lock waits you are willing to serve, since the cap
+includes those waits.
 
 It used to take ``DeviceLock(host)`` in the pool worker before launching
 pytest.  The child's guard then queued on the flock its own parent held --
@@ -28,8 +37,8 @@ alive and heartbeating, kept extending its wait until the 90 s timeout killed
 it.  ``tests/test_parallel_runner_lock_shape.py`` reproduces that offline.
 
 Usage:
-    python3 scripts/run_u64_parallel_locked.py <HOST> [--workers N]
-    U64_HOST=<device> python3 scripts/run_u64_parallel_locked.py [--workers N]
+    python3 scripts/run_u64_parallel_locked.py <HOST> [--workers N] [--file-timeout SECONDS]
+    U64_HOST=<device> python3 scripts/run_u64_parallel_locked.py [--workers N] [--file-timeout SECONDS]
 
 No default host -- this script runs the live suite in parallel against
 whatever it is pointed at, so it refuses to pick one (#243). Default
