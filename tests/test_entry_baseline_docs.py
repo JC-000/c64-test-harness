@@ -469,74 +469,513 @@ class TestTheCitationsResolve:
         assert "transport fixture" in flat
 
 
-class TestTheWithdrawnItemCount:
-    """The ``~150 items`` figure traced to one sentence in a live test's
-    docstring, with no n and no date, eleven lines from a figure carrying
-    both.  It was withdrawn rather than re-derived: the covered-category
-    count cannot be got from the measured 201 without a device, because
-    the five never-touch stores are excluded and nobody has counted the
-    remainder.  Pinned so it does not come back as a round number.
+class TestTheItemCountCarriesItsScope:
+    """The item count may be stated — it must not be stated bare.
+
+    ``~150 items`` circulated for months with no device and no date, was
+    quoted downstream as though measured, and was withdrawn on exactly
+    that ground.  It has since been measured (U64E, fw 3.15, 2026-09-12,
+    read-only) and is **151** across the twelve covered categories, so the
+    figure was accurate all along.  That is the outcome this pin has to
+    survive: the defect was never the number, it was the missing scope, and
+    a pin that only forbade the number would now be forbidding a
+    measurement.
+
+    So every occurrence of a count must carry the device and **its own**
+    date in its own sentence.  A bare restatement fails, a restatement with
+    the other measurement's date fails, and so does silence at a site that
+    is supposed to state it (the vacuity floor).
+
+    **The scan is over the number, not over a spelling of it.**  The first
+    cut matched the literal ``"151 items"`` family and a review walked four
+    bare sentences past it — ``203 across all 19 categories``, ``151 is
+    what makes those seconds interpretable``, ``151 covered items``, ``203
+    settings`` — because none of them said "N items".  Any standalone
+    occurrence of a scanned token is now a count unless it is on the
+    enumerated allowlist below.
+
+    What it still does not promise: a count spelled in words ("two hundred
+    and three"), a figure outside :data:`_TOKENS`, and a per-category
+    number (those are pinned by arithmetic instead, see
+    :meth:`test_the_per_category_breakdown_adds_up`).
+
+    **Declared limit: the "respectively" construction.**  A figure takes
+    the date inside its own clause (split at ``,`` ``;`` ``—``), and
+    otherwise the date whose *nearer edge* is closest.  "201 and 203 items
+    were counted on 2026-09-10 and 2026-09-12 respectively" puts both
+    figures and both dates in one clause, so 203 binds to 2026-09-10 and a
+    correct sentence fails.  Write one clause per figure.  An exact
+    distance tie between two *different* dates is flagged as ambiguous —
+    before round 2 such a tie was broken by string order, which is luck.
     """
 
-    #: Cues that mark a mention of the figure as a *withdrawal* of it
-    #: rather than an assertion of it.  A bare absence pin was the first
-    #: attempt and it was wrong in a way worth recording: it forbade the
-    #: string outright, which forbids naming the figure in the sentence
-    #: that retracts it — and an unnamed retraction is unfindable by the
-    #: reader who met "~150" somewhere else and came looking.
-    _WITHDRAWAL = ("withdrawn", "was an estimate", "used to assert")
+    #: Device naming, in the same sentence as the number.
+    _DEVICE = ("U64E", "Ultimate 64 Elite")
+    #: Presence of the U64E is not enough: "The C64U counted 151 items on
+    #: 2026-09-12, unlike the U64E." names it and passed.  No C64U item
+    #: count has ever been read, so a count sentence that names the C64U at
+    #: all is flagged.
+    #: Every alias the repo uses for that device line: the product name in
+    #: both spellings, and ``CBM`` — the harness's own generation name
+    #: (``u64_capabilities`` ``cbm``), which also covers "CBM line".
+    #: Case-sensitive on purpose: no count sentence in the lane docs uses
+    #: any of them, and lower-case ``cbm`` is a code identifier.
+    _OTHER_DEVICE = ("C64U", "C64 Ultimate", "Commodore 64 Ultimate", "CBM")
 
-    @classmethod
-    def _asserted_occurrences(cls, text: str) -> list[str]:
-        """Occurrences of the figure whose own sentence does not retract it.
+    #: Each measured figure bound to the **one** date it was measured on,
+    #: and the date that binds to the figure (see the class docstring's
+    #: declared limit) must be that date.
+    #: A set of acceptable dates let any figure borrow either one — the
+    #: covered count re-dated to 2026-09-10 passed.
+    #:
+    #: A closed table **on purpose**: a remeasurement is expected to edit it
+    #: in the same commit as the docs.  That edit is the point at which
+    #: somebody states the new scope; do not replace it with a date regex.
+    _SCOPE = {"151": "2026-09-12", "203": "2026-09-12", "201": "2026-09-10"}
 
-        Scoped to the sentence, not to a character window.  A 400-character
-        window was the first attempt and it failed its own job: reasserting
-        the figure a line above the paragraph that withdraws it left the
-        withdrawal inside the window, so the relapse read as a retraction.
-        The retraction has to be in the sentence making the claim, which is
-        also the only place a reader would see it.
-        """
-        out: list[str] = []
-        for sentence in re.split(r"(?<=[.!?])\s+", _flat(text)):
-            if "~150 items" not in sentence:
-                continue
-            if not any(cue in sentence for cue in cls._WITHDRAWAL):
-                out.append(sentence)
-        return out
+    #: Scanned tokens.  The three measured figures, plus two that are
+    #: always wrong as an item count and therefore bound to no date at all:
+    #: **150** is the withdrawn, never-measured figure, and **214** is the
+    #: figure a wrong all-category edit reaches for (the review planted it).
+    _TOKENS = ("150", "151", "201", "203", "214")
+    #: Standalone only: not part of a longer number, a version (``3.151``),
+    #: a line range (``145-150``), a path, a hex literal or an issue
+    #: reference (``#150``, ``#214`` — both occur in REFERENCE/PATTERNS).
+    _TOKEN_RE = re.compile(r"(?<![\w#.$/-])(150|151|201|203|214)(?!\w|\.\d|-\d)")
+    _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
-    @pytest.mark.parametrize("name", sorted(LANE_DOCS))
-    def test_no_lane_doc_asserts_an_uncounted_item_figure(self, name: str) -> None:
-        bad = self._asserted_occurrences(LANE_DOCS[name].read_text(encoding="utf-8"))
-        assert not bad, f"{name}: asserts ~150 items without withdrawing it — {bad!r}"
+    #: Known non-count occurrences, enumerated by grepping the five lane
+    #: docs and the live docstring for the tokens at ``78aa38e`` (issue
+    #: references are excluded by :data:`_TOKEN_RE` itself):
+    #:
+    #: * ``~150 ms`` — a SocketDMA timing, README.md and REFERENCE.md;
+    #: * ``"~150"`` in double quotes — the withdrawn figure *named* as a
+    #:   mention, never stated as a count, and anchored to the **whole
+    #:   sentence** at each of its two sites (PATTERNS.md and the live
+    #:   docstring), start to end.  Two narrower anchors each let an
+    #:   assertion ride along: bare quotes passed 'The entry reset touches
+    #:   "~150" items on every device.', and a phrase anchor passed 'The
+    #:   "~150" that circulated is the reset item count on every device.'
+    #:   Rewording either sentence therefore fails the scan by design —
+    #:   update the sentence here in the same commit.
+    #:
+    #: Each entry's group 1 is the exempted token.  Add to this only with a
+    #: referent, and never a bare token.
+    _ALLOWED = (
+        re.compile(r"~(150) ms\b"),
+        re.compile(
+            "^" + re.escape(
+                "So the covered figure and the all-category figure differ by "
+                "scope, not by disagreement — the \"~"
+            ) + "(150)" + re.escape(
+                "\" that circulated for months was accurate and was withdrawn "
+                "only because nobody had measured it."
+            ) + "$"
+        ),
+        re.compile(
+            "^" + re.escape("The earlier \"~") + "(150)" + re.escape(
+                "\" in this docstring had neither, was quoted downstream as "
+                "though it were a measurement, and was withdrawn for that "
+                "reason before anybody counted."
+            ) + "$"
+        ),
+    )
 
-    def test_the_live_test_docstring_no_longer_asserts_it_either(self) -> None:
-        """The origin, not just the copy — otherwise the next doc sweep
-        reads the docstring, trusts it, and reintroduces the figure."""
-        origin = (_REPO / "tests" / "test_entry_baseline_live.py").read_text(
+    #: Vacuity floor: the scanned, non-allowlisted count occurrences each
+    #: site actually contains.  A scan that finds nothing passes; so does a
+    #: site whose count sentences were deleted.  Raise it when a site gains
+    #: one; lowering it is a deletion and should say so in its commit.
+    _FLOOR = {"skill/PATTERNS.md": 7, "docs/development.md": 1, "live": 5}
+
+    @staticmethod
+    def _live_docstring() -> str:
+        import ast
+
+        src = (_REPO / "tests" / "test_entry_baseline_live.py").read_text(
             encoding="utf-8"
         )
-        assert not self._asserted_occurrences(origin)
+        return ast.get_docstring(ast.parse(src)) or ""
 
-    def test_the_withdrawal_pin_is_not_satisfied_by_any_mention(self) -> None:
-        """Positive control.  A cue-window pin degenerates into "the string
-        may appear anywhere" if the window is wide enough or the cue list
-        loose enough, and nothing else here would notice."""
-        assert self._asserted_occurrences("The reset touches ~150 items on the U64E.")
-        assert not self._asserted_occurrences(
-            "The ~150 items figure was an estimate and is withdrawn."
-        )
-        # And the case that defeated the character-window version: a fresh
-        # assertion standing next to, but outside, the retraction.
-        assert self._asserted_occurrences(
-            "The reset touches ~150 items on the U64E. "
-            "An earlier figure was an estimate and is withdrawn."
+    @classmethod
+    def _count_occurrences(cls, text: str) -> list[tuple[str, str, int]]:
+        """``(token, sentence, offset-in-sentence)`` for every scanned count.
+
+        Sentences split on ``:`` as well as ``.!?`` — the **opposite**
+        choice from :meth:`TestTheDefaultIsDocumented._sentences`, and
+        deliberately.  That pin *forbids* a claim, so a smaller unit is a
+        hole; this pin *requires* an accompaniment, so a smaller unit is
+        stricter.  Without the colon split a lead-in ending in ``:`` merges
+        with every bullet under it and one date at the top vouches for a
+        whole list.
+        """
+        out: list[tuple[str, str, int]] = []
+        for sentence in re.split(r"(?<=[.!?:])\s+", _flat(text)):
+            allowed = {
+                m.span(1) for pat in cls._ALLOWED for m in pat.finditer(sentence)
+            }
+            for m in cls._TOKEN_RE.finditer(sentence):
+                if m.span(1) in allowed:
+                    continue
+                out.append((m.group(1), sentence, m.start(1)))
+        return out
+
+    @classmethod
+    def _unscoped(cls, text: str) -> list[str]:
+        """One message per count occurrence that lacks its own scope."""
+        bad: list[str] = []
+        for token, sentence, pos in cls._count_occurrences(text):
+            want = cls._SCOPE.get(token)
+            if want is None:
+                bad.append(f"{token} is not a measured item count: {sentence!r}")
+                continue
+            if not any(d in sentence for d in cls._DEVICE):
+                bad.append(f"{token} names no device: {sentence!r}")
+                continue
+            if any(o in sentence for o in cls._OTHER_DEVICE):
+                bad.append(f"{token} shares its sentence with the C64U, whose "
+                           f"item counts have never been read: {sentence!r}")
+                continue
+            dates = list(cls._DATE_RE.finditer(sentence))
+            if not dates:
+                bad.append(f"{token} carries no date: {sentence!r}")
+                continue
+            end = pos + len(token)
+            lo = max((m.end() for m in re.finditer(r"[,;—]", sentence[:pos])),
+                     default=0)
+            nxt = re.search(r"[,;—]", sentence[end:])
+            hi = end + nxt.start() if nxt else len(sentence)
+            local = [d for d in dates if d.start() >= lo and d.end() <= hi]
+            pool = local or dates
+            ranked = sorted(
+                ((pos - d.end()) if d.end() <= pos else (d.start() - end), d.group())
+                for d in pool
+            )
+            if (len(ranked) > 1 and ranked[0][0] == ranked[1][0]
+                    and ranked[0][1] != ranked[1][1]):
+                bad.append(f"{token} is equidistant from {ranked[0][1]} and "
+                           f"{ranked[1][1]}: {sentence!r}")
+                continue
+            nearest = ranked[0][1]
+            if nearest != want:
+                bad.append(
+                    f"{token} is dated {nearest}, but was measured {want}: "
+                    f"{sentence!r}"
+                )
+        return bad
+
+    @pytest.mark.parametrize("name", sorted(LANE_DOCS))
+    def test_no_lane_doc_states_a_bare_item_count(self, name: str) -> None:
+        bad = self._unscoped(LANE_DOCS[name].read_text(encoding="utf-8"))
+        assert not bad, f"{name}: item count without its own scope — {bad!r}"
+
+    def test_the_live_test_docstring_states_it_with_scope(self) -> None:
+        """The origin, not just the copy.  A scopeless figure here is what
+        the copy downstream will inherit."""
+        doc = self._live_docstring()
+        assert not self._unscoped(doc), self._unscoped(doc)
+        flat = _flat(doc)
+        assert "fw 3.15" in flat and "2026-09-12" in flat
+
+    @pytest.mark.parametrize("site", sorted(_FLOOR))
+    def test_the_count_sites_have_not_gone_quiet(self, site: str) -> None:
+        """Vacuity floor.  Deleting development.md's scoped #276 clause
+        passed every other pin here: an absent count is never unscoped."""
+        text = (self._live_docstring() if site == "live"
+                else LANE_DOCS[site].read_text(encoding="utf-8"))
+        found = self._count_occurrences(text)
+        assert len(found) >= self._FLOOR[site], (
+            f"{site}: {len(found)} count occurrences, floor "
+            f"{self._FLOOR[site]} — a count sentence was deleted; "
+            f"found {[t for t, _, _ in found]}"
         )
 
-    def test_patterns_keeps_the_measured_figure_with_its_scope(self) -> None:
+    def test_patterns_states_the_measured_count_and_its_scope(self) -> None:
         flat = _doc("skill/PATTERNS.md")
-        assert "201 items over every category the U64E lists" in flat
-        assert "uncounted subset" in flat
+        assert "151 items across the twelve covered categories" in flat
+        assert "U64E (fw 3.15) 2026-09-12" in flat
+        # The C64U's category list HAS been read (2026-09-15, #287); only its
+        # item lists have not.  The superseded "category and item lists have
+        # never been read" must not come back beside the corrected claim.
+        assert "category and item lists have never been read" not in flat
+        assert "category list was read once (2026-09-15, 20 categories" in flat
+        assert "but its item lists never have" in flat
+
+    @pytest.mark.parametrize("where", ["skill/PATTERNS.md", "live"])
+    def test_the_source_derivation_is_cited_beside_the_device_read(
+        self, where: str
+    ) -> None:
+        """Two instruments, both named.  The device read is n=1; the
+        reviewer's derivation from firmware source at the flashed build is
+        the second, and dropping its citation silently halves the evidence."""
+        text = (self._live_docstring() if where == "live"
+                else LANE_DOCS[where].read_text(encoding="utf-8"))
+        errs = self._citation_errors(
+            text, must_name=("151", "40", "12", "203") if where != "live" else ()
+        )
+        assert not errs, (where, errs)
+
+    _CITATION = "reproduced from firmware source at 7f6fcb51 (v3.15-85)"
+
+    @classmethod
+    def _citation_errors(cls, text: str, *, must_name: tuple[str, ...] = ()) -> list[str]:
+        """The citation must not claim the one figure source did NOT reproduce.
+
+        Source gives 203, #276 recorded 201 — that disagreement is the
+        residual.  So the citation sentence may not contain 201, must come
+        before the residual paragraph, and where it sits inside a bullet
+        that also quotes 201 (PATTERNS) it must name the figures it covers
+        rather than claim "every figure in this bullet", which was the
+        round-3 overclaim.
+        """
+        flat = _flat(text)
+        sents = [s for s in re.split(r"(?<=[.!?:])\s+", flat) if cls._CITATION in s]
+        if not sents:
+            return ["the source-derivation citation is gone"]
+        errs: list[str] = []
+        for s in sents:
+            nums = set(re.findall(r"(?<![\w#.$/-])\d+(?!\w|\.\d|-\d)", s))
+            if "201" in nums:
+                errs.append(f"claims #276's 201 was reproduced: {s!r}")
+            missing = [n for n in must_name if n not in nums]
+            if missing:
+                errs.append(f"does not name the figures it covers {missing}: {s!r}")
+        residual = flat.find("Unexplained residual")
+        if residual != -1 and flat.find(cls._CITATION) > residual:
+            errs.append("the citation follows the residual, so it covers 201")
+        return errs
+
+    @pytest.mark.parametrize("label,text,must_name", [
+        ("the round-3 overclaim: bullet-wide scope, figures unnamed",
+         "Cost — 151 items on the U64E 2026-09-12 (read-only; every figure in "
+         "this bullet was also reproduced from firmware source at 7f6fcb51 "
+         "(v3.15-85) in review). Unexplained residual: #276 records \"201 "
+         "items compared\".", ("151", "40", "12", "203")),
+        ("201 named as reproduced",
+         "The 151, 40, 12, 201 and 203 figures were also reproduced from "
+         "firmware source at 7f6fcb51 (v3.15-85).", ()),
+        ("placed after the residual",
+         "Unexplained residual: two counts differ. Every figure above was "
+         "reproduced from firmware source at 7f6fcb51 (v3.15-85).", ()),
+    ])
+    def test_the_citation_check_can_fail(self, label, text, must_name) -> None:
+        assert self._citation_errors(text, must_name=must_name), label
+
+    # -- the breakdown: pinned by arithmetic, not by spelling ---------------
+
+    @staticmethod
+    def _breakdown_errors(text: str) -> list[str]:
+        """Inconsistencies in the per-category and all-category arithmetic.
+
+        Checks what a reader would compute: the twelve per-category figures
+        name each ``BASELINE_CATEGORIES`` entry once and sum to 151; the two
+        neither-list categories sum to the stated 12; and 151 + 40 + 12 is
+        the stated 203.  A *compensating* pair of edits (one category +2,
+        another −2) still passes — named, not closed.
+        """
+        from c64_test_harness.backends.ultimate64_baseline import (
+            BASELINE_CATEGORIES,
+        )
+
+        flat = _flat(text)
+        errs: list[str] = []
+        per = re.search(r"Per category: (.*?)\.(?:\s|$)", flat)
+        if per is None:
+            return ["no 'Per category:' breakdown"]
+        seen: dict[str, int] = {}
+        for entry in per.group(1).split(", "):
+            name, _, num = entry.rpartition(" ")
+            owners = [c for c in BASELINE_CATEGORIES if c.startswith(name)]
+            if len(owners) != 1 or not num.isdigit():
+                errs.append(f"unparseable or ambiguous entry {entry!r}")
+                continue
+            if owners[0] in seen:
+                errs.append(f"{owners[0]} listed twice")
+            seen[owners[0]] = int(num)
+        if set(seen) != set(BASELINE_CATEGORIES):
+            errs.append(f"covers {sorted(seen)}, not BASELINE_CATEGORIES")
+        if sum(seen.values()) != 151:
+            errs.append(f"per-category figures sum to {sum(seen.values())}, not 151")
+        never = re.search(r"\b(\d+)(?: items)? in the five", flat)
+        neither = re.search(r"\b(\d+)(?: more)? in two categories", flat)
+        parts = re.search(r"UltiSID Configuration (\d+), Data Streams (\d+)", flat)
+        total = re.search(r"\b(\d+)(?: items)? across all 19 categories", flat)
+        if not (never and neither and parts and total):
+            return errs + ["all-category arithmetic not found"]
+        if int(parts[1]) + int(parts[2]) != int(neither[1]):
+            errs.append("UltiSID + Data Streams != the stated neither-list count")
+        if 151 + int(never[1]) + int(neither[1]) != int(total[1]):
+            errs.append("151 + never-touch + neither != the stated all-category total")
+        return errs
+
+    def test_the_per_category_breakdown_adds_up(self) -> None:
+        doc = self._live_docstring()
+        assert not self._breakdown_errors(doc), self._breakdown_errors(doc)
+
+    @pytest.mark.parametrize("label,old,new", [
+        ("one category miscounted", "U64 Specific 27", "U64 Specific 29"),
+        ("a category dropped", "Tape 1, ", ""),
+        ("never-touch miscounted", "40 in the five", "42 in the five"),
+    ])
+    def test_the_breakdown_check_can_fail(self, label, old, new) -> None:
+        doc = self._live_docstring()
+        mangled = doc.replace(old, new)
+        assert mangled != doc, f"{label}: the mangle did nothing"
+        assert self._breakdown_errors(mangled), label
+
+    # -- the residual -------------------------------------------------------
+
+    #: Words that turn "nobody has established why" into its opposite when
+    #: they share its sentence.  Only that sentence is checked: an asserted
+    #: cause in a *neighbouring* sentence is not caught.
+    _CAUSAL_RE = re.compile(
+        r"\b(because|due to|caused by|as a result|since|owing to|explained by|"
+        r"results? from)\b",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _residual_errors(cls, text: str) -> list[str]:
+        flat = _flat(text)
+        sentences = re.split(r"(?<=[.!?:])\s+", flat)
+        errs: list[str] = []
+        # Both counts, in ONE sentence, so the comparison survives as a
+        # comparison. A bare ``"201" in text`` passed against a version that
+        # had deleted the residual, because 201 still appeared elsewhere.
+        if not [s for s in sentences if "201" in s and "203" in s]:
+            errs.append("the 201-vs-203 comparison is gone")
+        # #276's own words, and what it did not record.  The earlier text
+        # called 201 an "all-category" count; #276 says only "201 items
+        # compared".
+        # One contiguous phrase: the quote and what it did not record travel
+        # together, so the caveat cannot be dropped while the quote stays.
+        if ('"201 items compared" (category scope and firmware build not '
+                'recorded)') not in flat:
+            errs.append("#276 is no longer quoted as '201 items compared' with "
+                        "its unrecorded category scope and firmware build")
+        if "#292" not in flat:
+            errs.append("the residual no longer links its follow-up issue #292")
+        # One exact phrase, no disjunction: an ``or "unexplained"`` passed
+        # under a heading that survived while the claim under it was reversed.
+        why = [s for s in sentences if "nobody has established why" in s.lower()]
+        if not why:
+            errs.append("'nobody has established why' is gone")
+        for s in why:
+            m = cls._CAUSAL_RE.search(s)
+            if m:
+                errs.append(f"asserts a cause ({m.group()!r}) beside it: {s!r}")
+        return errs
+
+    @pytest.mark.parametrize("where", ["skill/PATTERNS.md", "live"])
+    def test_both_all_category_counts_survive_with_their_dates(self, where) -> None:
+        """#276's 201 (U64E, 2026-09-10) and this read's 203 (U64E, 2026-09-12).
+
+        #276 recorded "201 items compared" with neither the category scope
+        nor the firmware build, so the two figures may not even count the
+        same thing.  The candidates are a different counting basis or a
+        different build — firmware source rules out drift within one build
+        except for stores registered at runtime — and nobody has established
+        which (#292).  The failure mode guarded is the tidy one: dropping a
+        figure, averaging them, or asserting a cause, any of which turns an
+        open question into a false settlement.
+        """
+        text = (self._live_docstring() if where == "live"
+                else LANE_DOCS[where].read_text(encoding="utf-8"))
+        assert not self._residual_errors(text), (where, self._residual_errors(text))
+
+    def test_the_residual_guard_can_fail(self) -> None:
+        text = LANE_DOCS["skill/PATTERNS.md"].read_text(encoding="utf-8")
+        flat = _flat(text)
+        assert not self._residual_errors(flat)
+        cause = flat.replace(
+            "Nobody has established why",
+            "Two items appeared because the device state changed, though "
+            "nobody has established why",
+        )
+        assert cause != flat and self._residual_errors(cause)
+        unquoted = flat.replace("201 items compared", "201 all-category items")
+        assert unquoted != flat and self._residual_errors(unquoted)
+
+    # -- positive controls for the scan itself -------------------------------
+
+    @pytest.mark.parametrize("label,text", [
+        ("bare", "The reset touches 151 items."),
+        ("no 'items' after the number",
+         "for 203 across all 19 categories the device lists."),
+        ("a count used as a noun", "151 is what makes those seconds interpretable."),
+        ("scope in the neighbouring sentence",
+         "The reset touches 151 items. Measured on the U64E 2026-09-12."),
+        ("scope above a colon lead-in",
+         "Measured on the U64E 2026-09-12: 151 items across the covered categories."),
+        ("device but no date", "151 covered items on the U64E."),
+        ("date but no device", "151 covered items, measured 2026-09-12."),
+        ("the other measurement's date", "151 covered items, U64E, 2026-09-10."),
+        ("dates swapped inside the residual sentence",
+         "#276 counted 201 on the U64E on 2026-09-12 and this read counts 203 "
+         "on 2026-09-10."),
+        ("the withdrawn figure, even scoped", "150 items on the U64E, 2026-09-12."),
+        ("the planted all-category figure", "214 across all 19 categories on the "
+         "U64E, 2026-09-12."),
+        ("the withdrawn figure unquoted", "The reset touches ~150 items."),
+        ("the C64U named beside the U64E",
+         "The C64U counted 151 items on 2026-09-12, unlike the U64E."),
+        ("the C64 Ultimate named beside the U64E",
+         "The C64 Ultimate and the U64E both list 203 items, 2026-09-12."),
+        ("the withdrawn figure quoted but stated as a count",
+         'The entry reset touches "~150" items on every device.'),
+        ("an unbroken tie between two different dates",
+         "2026-09-10 201 2026-09-12 on the U64E."),
+        ("the Commodore 64 Ultimate named beside the U64E",
+         "The Commodore 64 Ultimate lists 151 items too, like the U64E, "
+         "2026-09-12."),
+        ("the CBM line named beside the U64E",
+         "On the CBM line the U64E's 203 items carry over, 2026-09-12."),
+        ("the anchored ~150 mention carrying an assertion",
+         'The "~150" that circulated is the reset item count on every device.'),
+        ("the live mention's opening carrying an assertion",
+         'The earlier "~150" in this docstring is the count.'),
+    ])
+    def test_the_scan_flags(self, label, text) -> None:
+        assert self._unscoped(text), label
+
+    @pytest.mark.parametrize("label,text", [
+        ("scoped", "151 items across the covered categories, measured on the "
+         "U64E (fw 3.15) 2026-09-12."),
+        ("the residual, correctly dated",
+         "#276 counted 201 on the U64E on 2026-09-10 and this read counts 203 "
+         "on 2026-09-12."),
+        ("a timing", "16 KiB in ~150 ms instead of >6 s."),
+        ("the withdrawn figure named, not stated (PATTERNS sentence)",
+         'So the covered figure and the all-category figure differ by scope, '
+         'not by disagreement — the "~150" that circulated for months was '
+         'accurate and was withdrawn only because nobody had measured it.'),
+        ("the live docstring's mention of the withdrawn figure",
+         'The earlier "~150" in this docstring had neither, was quoted '
+         'downstream as though it were a measurement, and was withdrawn for '
+         'that reason before anybody counted.'),
+        ("two clauses, each date before its figure (round-2 false failure)",
+         "On 2026-09-10 #276 compared 201 items, and on 2026-09-12 the U64E "
+         "read counted 203 items."),
+        ("issue references", "See #150 and #214 for that."),
+        ("versions and ranges", "fw 3.151, machine.c:145-150, 0x151, 1.203."),
+    ])
+    def test_the_scan_leaves_non_counts_alone(self, label, text) -> None:
+        assert not self._unscoped(text), (label, self._unscoped(text))
+        assert not self._count_occurrences(text) or label in (
+            "scoped", "the residual, correctly dated",
+            "two clauses, each date before its figure (round-2 false failure)",
+        ), label
+
+    # Tuned offsets, do not reflow: 201's own date ends 1 character before
+    # it and the other starts 7 after it, while measured from each date's
+    # START the other one is nearer (10 vs 11).  No comma, so the
+    # own-clause preference cannot rescue it — this is the only case that
+    # separates edge distance from start distance.
+    @pytest.mark.parametrize("label,text", [
+        ("edge distance, not start distance",
+         "U64E read 2026-09-10 201 items 2026-09-12."),
+    ])
+    def test_the_scan_binds_by_nearer_edge(self, label, text) -> None:
+        assert not self._unscoped(text), (label, self._unscoped(text))
 
 
 class TestTheSubjectScopedPinsCanFail:

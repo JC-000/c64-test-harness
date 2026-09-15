@@ -284,8 +284,9 @@ teardown of its module-scoped `transport` fixture — the statements after its
 earlier, so the residue was unambiguous — `U64 Specific Settings / CPU Speed`
 read `' 8'` against a default of `' 1'` — and nothing in the harness noticed or
 told anyone ([#276](https://github.com/JC-000/c64-test-harness/issues/276); the
-measurement is a per-item `current`-vs-`default` comparison over 201 items, the
-attribution to that window strong but circumstantial). An 8× device does not
+measurement is a per-item `current`-vs-`default` comparison over 201 items on
+the U64E, 2026-09-10, and the attribution to that window is strong but
+circumstantial). An 8× device does not
 fail a test. It produces plausible, wrong timing numbers for every later run on
 a bench several projects share. That particular fixture is weaker than a
 `finally`, too: its teardown is a bare post-`yield` sequence with no
