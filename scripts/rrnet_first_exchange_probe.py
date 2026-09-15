@@ -58,6 +58,7 @@ HOST = require_u64_host(
 os.environ.setdefault("U64_UNLOCKED_CLIENT_WARNING", "0")
 
 from c64_test_harness import create_manager  # noqa: E402
+from c64_test_harness.backends.device_lock import resolve_lock_timeout  # noqa: E402
 from c64_test_harness.bridge_ping import (  # noqa: E402
     CS8900A_RXCTL_VALUE_IP65, PPDATA_HI, PPDATA_LO, PPTR_HI, PPTR_LO,
     build_arp_request_frame, build_echo_request_frame, build_ping_and_wait_tod_code,
@@ -256,7 +257,9 @@ def main() -> int:
               f"({dt:.2f}s)", flush=True)
         return r
 
-    with create_manager(backend="u64", u64_hosts=HOST, lock_timeout=600.0) as mgr:
+    # U64_DEVICE_LOCK_TIMEOUT when set, else this probe's own 600 s (#244).
+    with create_manager(backend="u64", u64_hosts=HOST,
+                        lock_timeout=resolve_lock_timeout(None, default=600.0)) as mgr:
         with mgr.instance() as target:
             t = target.transport
             client = t.client

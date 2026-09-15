@@ -1857,3 +1857,672 @@ def test_the_tests_scans_are_not_vacuous() -> None:
         f"only {len(reading)} modules read a host at import; the default rule "
         "is scanning nothing it could fail on"
     )
+
+
+
+# ---------------------------------------------------------------------------
+# 5. Scripts hold the DeviceLock while they drive a device (issue #244)
+# ---------------------------------------------------------------------------
+#
+# Live *tests* are locked by construction (``tests/conftest.py``
+# ``device_lock_guard``). Scripts were not: eight device-driving scripts took
+# no lock, so a ``run_prg``/``sid_play``/``reset`` from one of them replaced a
+# neighbouring lane's program and presented to that lane as device
+# degradation (#194). Three shapes are accepted, and each is pinned:
+#
+# 1. **``with hold_device_lock(host):``** from ``scripts/_u64_host.py`` around
+#    every construct that reaches the device — the one helper, so the budget
+#    always goes through ``resolve_lock_timeout``;
+# 2. **the manager path** — ``with create_manager(...)`` / ``UnifiedManager``,
+#    which lock for you (``allow_nested=True`` in ``unified_manager``);
+# 3. **the pytest runners**, which reach the device only through ``*_live.py``
+#    modules that conftest locks per test. They deliberately do *not* hold the
+#    lock across ``pytest.main``: the client's ``/Temp`` drain runs on the
+#    *outermost* release, so an outer hold would defer every per-test drain
+#    on the C64U to the end of the run.
+#
+# What reaches a device, for this scan: constructing a harness client,
+# transport or device manager, or issuing HTTP. Anything reached *through*
+# one of those (``play_sid(transport)``, ``set_reu(client)``) is covered by
+# the construction being covered.
+
+#: Callee names that reach a device. Resolved through import aliases.
+_DEVICE_CALLEES = frozenset({
+    "Ultimate64Client",
+    "Ultimate64Transport",
+    "Ultimate64InstanceManager",
+    "SocketDMAClient",
+    "urlopen",
+    "HTTPConnection",
+    "HTTPSConnection",
+})
+
+#: ``with`` context expressions that hold the device for their body.
+_LOCKING_WITH_CALLEES = frozenset({"hold_device_lock", "create_manager"})
+
+_ACQUIRE_METHODS = frozenset({"acquire", "acquire_or_raise"})
+
+
+def _import_aliases(tree: ast.AST) -> dict[str, str]:
+    """Local name -> original name, for every ``import ... as`` in *tree*."""
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                original = alias.name.rsplit(".", 1)[-1]
+                aliases[alias.asname or original] = original
+    return aliases
+
+
+def _callee_name(call: ast.Call, aliases: dict[str, str]) -> str | None:
+    func = call.func
+    if isinstance(func, ast.Name):
+        return aliases.get(func.id, func.id)
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _parents(tree: ast.AST) -> dict[ast.AST, ast.AST]:
+    parents: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    return parents
+
+
+def _device_lock_offenders(source: str) -> list[str]:
+    """Every device-reaching construct in *source* not held under the lock.
+
+    A node is **covered** when it is lexically inside the body of a ``with``
+    whose context expression calls one of :data:`_LOCKING_WITH_CALLEES`, or
+    inside a named function whose every direct call site is covered
+    (computed to a fixpoint, so ``_get`` -> ``_get_json`` -> ``main`` chains
+    resolve). A function with no direct call site is uncovered: a callback
+    or a dead helper cannot be proven to run under the lock.
+
+    Also flags a literal acquire budget (the lock must honour
+    ``U64_DEVICE_LOCK_TIMEOUT``) and a ``hold_device_lock`` that is used but
+    never imported — the ``NameError`` class that only execution sees.
+
+    Known limits: functions are matched by bare name, so two same-named
+    functions share one verdict; a call through an attribute
+    (``self._get()``) is not a call site. Both err towards flagging, because
+    an uncounted call site leaves the function uncovered.
+    """
+    tree = ast.parse(source)
+    aliases = _import_aliases(tree)
+    parents = _parents(tree)
+    offenders: list[str] = []
+
+    def locking_with(node: ast.AST) -> bool:
+        return isinstance(node, (ast.With, ast.AsyncWith)) and any(
+            isinstance(item.context_expr, ast.Call)
+            and _callee_name(item.context_expr, aliases) in _LOCKING_WITH_CALLEES
+            for item in node.items
+        )
+
+    call_sites: dict[str, list[ast.Call]] = {
+        node.name: []
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in call_sites
+        ):
+            call_sites[node.func.id].append(node)
+
+    covered_functions: set[str] = set()
+
+    def covered(node: ast.AST) -> bool:
+        child, parent = node, parents.get(node)
+        while parent is not None:
+            # Only the *body* of a with is held; its context expressions
+            # run before the lock is taken.
+            if locking_with(parent) and child in parent.body:
+                return True
+            if (
+                isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and parent.name in covered_functions
+            ):
+                return True
+            child, parent = parent, parents.get(parent)
+        return False
+
+    changed = True
+    while changed:
+        changed = False
+        for name, sites in call_sites.items():
+            if name in covered_functions or not sites:
+                continue
+            if all(covered(site) for site in sites):
+                covered_functions.add(name)
+                changed = True
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _callee_name(node, aliases)
+        if name in _DEVICE_CALLEES and not covered(node):
+            offenders.append(
+                f"line {node.lineno}: {name}(...) reaches the device outside "
+                f"hold_device_lock/create_manager"
+            )
+        budgets = [kw.value for kw in node.keywords if kw.arg == "lock_timeout"]
+        if name in _ACQUIRE_METHODS and isinstance(node.func, ast.Attribute):
+            budgets += [kw.value for kw in node.keywords if kw.arg == "timeout"]
+            budgets += node.args[:1]
+        for value in budgets:
+            inner = value.operand if isinstance(value, ast.UnaryOp) else value
+            if isinstance(inner, ast.Constant) and isinstance(inner.value, (int, float)):
+                offenders.append(
+                    f"line {node.lineno}: literal lock budget {inner.value!r} "
+                    f"ignores U64_DEVICE_LOCK_TIMEOUT; use resolve_lock_timeout"
+                )
+
+    uses_helper = any(
+        isinstance(n, ast.Name) and n.id == "hold_device_lock" for n in ast.walk(tree)
+    )
+    imports_helper = any(
+        isinstance(n, ast.ImportFrom)
+        and n.module == "_u64_host"
+        and any(a.name == "hold_device_lock" and a.asname is None for a in n.names)
+        for n in ast.walk(tree)
+    )
+    if uses_helper and not (imports_helper or "hold_device_lock" in call_sites):
+        offenders.append("hold_device_lock is used but never imported from _u64_host")
+    return offenders
+
+
+def _device_reaching_calls(source: str) -> int:
+    tree = ast.parse(source)
+    aliases = _import_aliases(tree)
+    return sum(
+        1 for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and _callee_name(n, aliases) in _DEVICE_CALLEES
+    )
+
+
+def _scripts_only() -> list[Path]:
+    return sorted(p for p in _script_paths() if _SCRIPTS in p.parents)
+
+
+@pytest.mark.parametrize("script_path", _scripts_only(), ids=lambda p: p.name)
+def test_every_script_holds_the_device_lock(script_path: Path) -> None:
+    """No script reaches a device without holding its ``DeviceLock`` (#244)."""
+    offenders = _device_lock_offenders(script_path.read_text())
+    assert not offenders, (
+        f"{script_path.name} drives a device without the DeviceLock. Wrap "
+        f"the device work in `with hold_device_lock(host):` from "
+        f"scripts/_u64_host.py (or go through create_manager):\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+#: Scripts that must be found reaching a device. If the scan stops seeing
+#: them it is scanning nothing it could fail on.
+_KNOWN_DEVICE_SCRIPTS = frozenset({
+    "bench_x25519_u64_turbo.py",
+    "play_chromatic_u64.py",
+    "play_scale_u64.py",
+    "probe_u64.py",
+    "probe_uci_network.py",
+    "verify_tod_warp.py",
+})
+
+
+def test_the_lock_scan_sees_the_device_scripts() -> None:
+    """Vacuity guard: the scan finds real device work, in the scripts known to do it."""
+    counts = {
+        p.name: _device_reaching_calls(p.read_text()) for p in _scripts_only()
+    }
+    reaching = {name for name, n in counts.items() if n}
+    assert reaching == _KNOWN_DEVICE_SCRIPTS, (
+        f"device-reaching scripts changed: found {sorted(reaching)}. A new one "
+        f"must be added to _KNOWN_DEVICE_SCRIPTS and to the runtime probe (or "
+        f"its exclusion list)."
+    )
+    # Measured 8 at this commit (bench 2, probe_uci 2, one each elsewhere).
+    assert sum(counts.values()) >= 8, counts
+    assert "rrnet_first_exchange_probe.py" in counts, "scripts/ not scanned"
+
+
+def test_the_lock_scan_flags_planted_regressions() -> None:
+    """Positive control: each shape the scan claims to reject, it rejects."""
+    helper = "from _u64_host import hold_device_lock\n"
+    client = "from c64_test_harness.backends.ultimate64_client import Ultimate64Client\n"
+    must_flag = {
+        "no lock at all": client + "c = Ultimate64Client(host='h')\n",
+        "client built before the lock": (
+            helper + client
+            + "c = Ultimate64Client(host='h')\n"
+            + "with hold_device_lock('h'):\n    c.reset()\n"
+        ),
+        "client built in the with's own expression": (
+            helper + client
+            + "with hold_device_lock('h'), Ultimate64Client(host='h') as c:\n    pass\n"
+        ),
+        "aliased import": (
+            "from c64_test_harness.backends.ultimate64 import "
+            "Ultimate64Transport as T\nt = T(host='h')\n"
+        ),
+        "http helper called once outside the lock": (
+            helper + "import urllib.request\n"
+            + "def _get(u):\n    return urllib.request.urlopen(u)\n"
+            + "def main():\n"
+            + "    with hold_device_lock('h'):\n        _get('a')\n"
+            + "    _get('b')\n"
+        ),
+        "http helper never called directly": (
+            "import urllib.request\n"
+            "def _get(u):\n    return urllib.request.urlopen(u)\n"
+            "CALLBACK = _get\n"
+        ),
+        "literal acquire timeout": (
+            "from c64_test_harness.backends.device_lock import DeviceLock\n"
+            "lock = DeviceLock('h')\nlock.acquire(timeout=60.0)\n"
+        ),
+        "literal positional acquire budget": (
+            "from c64_test_harness.backends.device_lock import DeviceLock\n"
+            "DeviceLock('h').acquire_or_raise(120)\n"
+        ),
+        "literal manager lock_timeout": (
+            "from c64_test_harness import create_manager\n"
+            "with create_manager(backend='u64', lock_timeout=600.0) as m:\n    pass\n"
+        ),
+        "helper used without its import": (
+            client + "with hold_device_lock('h'):\n    Ultimate64Client(host='h')\n"
+        ),
+        "a with that is not a lock": (
+            client + "from contextlib import nullcontext as hold_lock\n"
+            "with hold_lock():\n    Ultimate64Client(host='h')\n"
+        ),
+    }
+    for label, source in must_flag.items():
+        assert _device_lock_offenders(source), f"the lock scan missed: {label}"
+
+    must_pass = {
+        "locked client": (
+            helper + client + "with hold_device_lock('h'):\n    Ultimate64Client(host='h')\n"
+        ),
+        "http helper only called under the lock, through a chain": (
+            helper + "import urllib.request\n"
+            + "def _get(u):\n    return urllib.request.urlopen(u)\n"
+            + "def _json(u):\n    return _get(u)\n"
+            + "def main():\n    with hold_device_lock('h'):\n        _json('a')\n"
+        ),
+        "manager path": (
+            "from c64_test_harness import create_manager\n"
+            "from c64_test_harness.backends.device_lock import resolve_lock_timeout\n"
+            "with create_manager(backend='u64',\n"
+            "        lock_timeout=resolve_lock_timeout(None, default=600.0)) as m:\n"
+            "    pass\n"
+        ),
+        "resolved acquire budget": (
+            "from c64_test_harness.backends.device_lock import DeviceLock, resolve_lock_timeout\n"
+            "DeviceLock('h').acquire(timeout=resolve_lock_timeout(None, default=120.0))\n"
+        ),
+        "nested function defined under the lock": (
+            helper + client
+            + "def run(h):\n    with hold_device_lock(h):\n"
+            + "        t = Ultimate64Client(host=h)\n"
+            + "        def _read():\n            return t.read_memory(0, 1)\n"
+            + "        return _read()\n"
+        ),
+    }
+    for label, source in must_pass.items():
+        assert not _device_lock_offenders(source), (
+            f"the lock scan false-positived ({label}): {_device_lock_offenders(source)}"
+        )
+
+
+def test_the_pytest_runners_are_locked_by_conftest() -> None:
+    """Accepted shape 3, pinned rather than assumed.
+
+    The runners hold no lock of their own, so they are safe only while every
+    module they launch is one conftest's autouse ``device_lock_guard`` locks.
+    """
+    import inspect
+
+    conftest_path = Path(__file__).resolve().parent / "conftest.py"
+    tree = ast.parse(conftest_path.read_text())
+    guard = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "device_lock_guard"
+    )
+    autouse = any(
+        isinstance(dec, ast.Call)
+        and any(
+            kw.arg == "autouse" and getattr(kw.value, "value", None) is True
+            for kw in dec.keywords
+        )
+        for dec in guard.decorator_list
+    )
+    assert autouse, "conftest's device_lock_guard is no longer autouse"
+    guard_source = ast.get_source_segment(conftest_path.read_text(), guard) or ""
+    assert "is_live_test_file(" in guard_source and "acquire_or_raise(" in guard_source
+
+    import conftest  # the suite's own conftest, already imported by pytest
+
+    for runner in ("run_all_u64_live.py", "run_sid_u64_live.py"):
+        runner_tree = ast.parse((_SCRIPTS / runner).read_text())
+        modules = next(
+            node.value for node in runner_tree.body
+            if isinstance(node, ast.Assign)
+            and any(getattr(t, "id", None) == "_MODULES" for t in node.targets)
+        )
+        names = [elt.value for elt in modules.elts]  # type: ignore[attr-defined]
+        assert names, f"{runner} launches nothing"
+        for name in names:
+            assert conftest.is_live_test_file(name), (
+                f"{runner} launches {name}, which conftest's device_lock_guard "
+                f"does not lock"
+            )
+    assert inspect.isfunction(conftest.is_live_test_file)
+
+
+# -- The helper's behaviour, in-process, against a private lock directory --
+
+_TEST_NET_HOST = "192.0.2.1"  # RFC 5737: reaches nothing if anything leaks
+
+
+@pytest.fixture
+def private_lock_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Every DeviceLock in the test resolves here, never the shared lock dir."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.delenv("U64_DEVICE_LOCK_TIMEOUT", raising=False)
+    return tmp_path
+
+
+@pytest.fixture
+def acquire_spy(monkeypatch: pytest.MonkeyPatch) -> list:
+    from c64_test_harness.backends import device_lock
+
+    seen: list = []
+    real = device_lock.DeviceLock.acquire_or_raise
+
+    def spy(self, timeout=None, **kwargs):
+        seen.append(timeout)
+        return real(self, timeout, **kwargs)
+
+    monkeypatch.setattr(device_lock.DeviceLock, "acquire_or_raise", spy)
+    # A timeout's diagnostics probe the device's REST API; never here.
+    monkeypatch.setattr(
+        device_lock.DeviceLock, "_probe_rest_reachable", lambda self: None
+    )
+    return seen
+
+
+def test_hold_device_lock_holds_for_the_block_and_releases(
+    u64_host_module: ModuleType, private_lock_dir: Path, acquire_spy: list
+) -> None:
+    from c64_test_harness.backends.device_lock import DeviceLock
+
+    assert not DeviceLock.held_by_this_process(_TEST_NET_HOST)
+    with u64_host_module.hold_device_lock(_TEST_NET_HOST):
+        assert DeviceLock.held_by_this_process(_TEST_NET_HOST)
+        assert any(private_lock_dir.rglob("*.lock")), "not the private lock dir"
+    assert not DeviceLock.held_by_this_process(_TEST_NET_HOST)
+
+    with pytest.raises(SystemExit):
+        with u64_host_module.hold_device_lock(_TEST_NET_HOST):
+            raise SystemExit(1)
+    assert not DeviceLock.held_by_this_process(_TEST_NET_HOST), (
+        "the lock outlived a script exiting inside the block"
+    )
+
+
+def test_hold_device_lock_budget_goes_through_the_resolver(
+    u64_host_module: ModuleType,
+    private_lock_dir: Path,
+    acquire_spy: list,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Env wins over the script's default; the default wins over the manager's.
+
+    None of the expected values is a system default, so each can only pass
+    if the helper actually read the source it claims to.
+    """
+    from c64_test_harness.backends import unified_manager
+
+    monkeypatch.setattr(unified_manager, "DEFAULT_LOCK_TIMEOUT", 43.0)
+    with u64_host_module.hold_device_lock(_TEST_NET_HOST):
+        pass
+    with u64_host_module.hold_device_lock(_TEST_NET_HOST, default_timeout=7.5):
+        pass
+    monkeypatch.setenv("U64_DEVICE_LOCK_TIMEOUT", "12.5")
+    with u64_host_module.hold_device_lock(_TEST_NET_HOST, default_timeout=7.5):
+        pass
+    assert acquire_spy == [43.0, 7.5, 12.5]
+
+
+def test_hold_device_lock_refuses_a_malformed_budget_before_locking(
+    u64_host_module: ModuleType,
+    private_lock_dir: Path,
+    acquire_spy: list,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from c64_test_harness.backends.device_lock import (
+        DeviceLock,
+        DeviceLockTimeoutConfigError,
+    )
+
+    monkeypatch.setenv("U64_DEVICE_LOCK_TIMEOUT", "30m")
+    entered = False
+    with pytest.raises(DeviceLockTimeoutConfigError):
+        with u64_host_module.hold_device_lock(_TEST_NET_HOST):
+            entered = True
+    assert not entered and acquire_spy == []
+    assert not DeviceLock.held_by_this_process(_TEST_NET_HOST)
+
+
+def test_hold_device_lock_fails_closed_on_timeout(
+    u64_host_module: ModuleType,
+    private_lock_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from c64_test_harness.backends import device_lock
+
+    def timed_out(self, timeout=None, **kwargs):
+        raise device_lock.DeviceLockTimeout(
+            device_host=self.device_host, holder_pid=4242, pid_alive=True,
+            lockfile_age_seconds=1.0, device_reachable_rest=None,
+            timeout=timeout, progress_window=60.0,
+        )
+
+    monkeypatch.setattr(device_lock.DeviceLock, "acquire_or_raise", timed_out)
+    err = io.StringIO()
+    entered = False
+    with pytest.raises(SystemExit) as exc:
+        with u64_host_module.hold_device_lock(_TEST_NET_HOST, stderr=err):
+            entered = True
+    assert not entered, "the script body ran without the lock"
+    assert exc.value.code == u64_host_module.NO_LOCK_EXIT == 3
+    assert "4242" in err.getvalue(), "the holder diagnostics were not reported"
+
+
+def test_hold_device_lock_fails_closed_without_the_harness(
+    u64_host_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(sys.modules, "c64_test_harness.backends.device_lock", None)
+    err = io.StringIO()
+    entered = False
+    with pytest.raises(SystemExit) as exc:
+        with u64_host_module.hold_device_lock(_TEST_NET_HOST, stderr=err):
+            entered = True
+    assert not entered
+    assert exc.value.code == 3
+    assert "will not import" in err.getvalue()
+
+
+def test_hold_device_lock_joins_a_hold_this_process_already_has(
+    u64_host_module: ModuleType,
+    private_lock_dir: Path,
+    acquire_spy: list,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``allow_nested``: a script re-entering the helper must not wait on itself.
+
+    Without it the inner acquire queues on its own thread's flock (#273),
+    serves the whole budget and exits 3. The budget is kept short so that
+    failure mode costs well under a second.
+    """
+    import time as _time
+
+    from c64_test_harness.backends.device_lock import DeviceLock
+
+    monkeypatch.setenv("U64_DEVICE_LOCK_TIMEOUT", "0.3")
+    with u64_host_module.hold_device_lock(_TEST_NET_HOST):
+        start = _time.monotonic()
+        with u64_host_module.hold_device_lock(_TEST_NET_HOST):
+            assert DeviceLock.held_by_this_process(_TEST_NET_HOST)
+        assert _time.monotonic() - start < 0.25
+        assert DeviceLock.held_by_this_process(_TEST_NET_HOST), (
+            "the inner release dropped the outer hold"
+        )
+
+
+# -- Runtime: at the moment a script first reaches out, does it hold the lock? --
+#
+# The AST scan proves lexical containment; this proves it is real when the
+# script runs: the helper imports from where the script runs, the lock is
+# actually held, and no request precedes it through a path the scan does not
+# model. It reuses :data:`_SANDBOX` verbatim except for two checked
+# substitutions, so the forbid list is the one the sandbox controls verified.
+
+_PROBE_FORBID_OLD = '''def _forbid(what):
+    def _raise(*args, **kwargs):
+        raise _Breach(what)
+    return _raise
+'''
+_PROBE_FORBID_NEW = '''def _lock_state():
+    try:
+        from c64_test_harness.backends.device_lock import DeviceLock
+        held = DeviceLock.held_by_this_process(os.environ["U64_HOST"])
+        return "HELD" if held else "NOT-HELD"
+    except BaseException as exc:
+        return "UNKNOWN(%r)" % (exc,)
+
+def _forbid(what):
+    def _raise(*args, **kwargs):
+        sys.stderr.write("LOCK STATE AT BREACH: %s %s\\n" % (_lock_state(), what))
+        raise _Breach(what)
+    return _raise
+'''
+_PROBE_ARGV_OLD = "sys.argv = [_script]\n"
+_PROBE_ARGV_NEW = "sys.argv = [_script, *sys.argv[2:]]\n"
+
+
+def _lock_probe_preamble() -> str:
+    assert _SANDBOX.count(_PROBE_FORBID_OLD) == 1, "_SANDBOX's _forbid changed shape"
+    assert _SANDBOX.count(_PROBE_ARGV_OLD) == 1, "_SANDBOX's argv reset changed shape"
+    return _SANDBOX.replace(_PROBE_FORBID_OLD, _PROBE_FORBID_NEW).replace(
+        _PROBE_ARGV_OLD, _PROBE_ARGV_NEW
+    )
+
+
+def _run_lock_probe(
+    script: Path, lock_dir: Path, *args: str
+) -> "subprocess.CompletedProcess[str]":
+    import subprocess
+
+    env = {
+        k: v for k, v in os.environ.items()
+        if k not in ("U64_HOST", "U64_DEVICE_LOCK_TIMEOUT")
+    }
+    env["U64_HOST"] = _TEST_NET_HOST
+    env["XDG_RUNTIME_DIR"] = str(lock_dir)
+    return subprocess.run(
+        [sys.executable, "-c", _lock_probe_preamble(), str(script), *args],
+        capture_output=True, text=True, env=env, timeout=30,
+    )
+
+
+def _first_lock_state(proc: "subprocess.CompletedProcess[str]") -> str | None:
+    for line in proc.stderr.splitlines():
+        if line.startswith("LOCK STATE AT BREACH: "):
+            return line.split(": ", 1)[1].split(" ", 1)[0]
+    return None
+
+
+@pytest.fixture(scope="module")
+def verified_lock_probe(
+    verified_sandbox: dict[str, int], tmp_path_factory: pytest.TempPathFactory
+) -> Path:
+    """The lock probe, proven able to report both answers, before any script runs."""
+    work = tmp_path_factory.mktemp("lock_probe_controls")
+    reach = "import socket\nsocket.create_connection(('192.0.2.1', 80), 1)\n"
+    unlocked = work / "unlocked.py"
+    unlocked.write_text(reach)
+    locked = work / "locked.py"
+    locked.write_text(
+        f"import sys\nsys.path.insert(0, {str(_SCRIPTS)!r})\n"
+        "from _u64_host import hold_device_lock\n"
+        "with hold_device_lock('192.0.2.1'):\n"
+        + "".join("    " + line + "\n" for line in reach.splitlines())
+    )
+    for script, expected in ((unlocked, "NOT-HELD"), (locked, "HELD")):
+        proc = _run_lock_probe(script, work)
+        assert proc.returncode == _BREACH_EXIT, (script.name, proc.stderr[-1500:])
+        assert _first_lock_state(proc) == expected, (
+            f"the lock probe reported {_first_lock_state(proc)!r} for "
+            f"{script.name}, expected {expected}:\n{proc.stderr[-1500:]}"
+        )
+    return work
+
+
+def _bench_args(work: Path) -> tuple[str, ...]:
+    prg = work / "x25519.prg"
+    prg.write_bytes(b"\x01\x08" + bytes(16))
+    labels = work / "labels.txt"
+    labels.write_text("".join(
+        f"al C:{0xC000 + i:04x} .{name}\n"
+        for i, name in enumerate((
+            "x25519_base", "x25_scalar", "x25_result",
+            "bench_ticks", "vic_blank", "vic_unblank", "main_loop",
+        ))
+    ))
+    return ("--prg", str(prg), "--labels", str(labels), "--speeds", "1")
+
+
+#: Scripts the runtime probe drives, with the arguments that get them past
+#: their offline setup to the first device contact.
+_LOCK_PROBED_SCRIPTS = (
+    "bench_x25519_u64_turbo.py",
+    "play_chromatic_u64.py",
+    "play_scale_u64.py",
+    "probe_u64.py",
+    "probe_uci_network.py",
+)
+
+#: Device scripts the runtime probe cannot drive, and why. The AST scan still
+#: covers them; the partition test keeps this list from absorbing new scripts.
+_LOCK_PROBE_EXCLUDED = {
+    "verify_tod_warp.py": "launches VICE before its U64 case; the first "
+    "breach is that spawn, which is local, not device traffic",
+}
+
+
+@pytest.mark.parametrize("script_name", _LOCK_PROBED_SCRIPTS)
+def test_script_holds_the_lock_at_its_first_device_contact(
+    script_name: str, verified_lock_probe: Path, tmp_path: Path
+) -> None:
+    args = _bench_args(tmp_path) if script_name.startswith("bench_") else ()
+    proc = _run_lock_probe(_SCRIPTS / script_name, tmp_path, *args)
+    assert proc.returncode == _BREACH_EXIT, (
+        f"{script_name} never reached out (exit {proc.returncode}), so this "
+        f"probe proved nothing about it:\n{proc.stderr[-2000:]}"
+    )
+    assert _first_lock_state(proc) == "HELD", (
+        f"{script_name} reached out without holding the DeviceLock:\n"
+        f"{proc.stderr[-2000:]}"
+    )
+
+
+def test_the_lock_probe_covers_every_device_script() -> None:
+    assert set(_LOCK_PROBED_SCRIPTS) | set(_LOCK_PROBE_EXCLUDED) == _KNOWN_DEVICE_SCRIPTS
+    assert not set(_LOCK_PROBED_SCRIPTS) & set(_LOCK_PROBE_EXCLUDED)
+    assert len(_LOCK_PROBED_SCRIPTS) >= 5

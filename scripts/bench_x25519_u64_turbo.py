@@ -27,7 +27,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from _u64_host import require_u64_host  # noqa: E402
+from _u64_host import hold_device_lock, require_u64_host  # noqa: E402
 
 from c64_test_harness.backends.ultimate64 import Ultimate64Transport
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
@@ -444,55 +444,58 @@ def main() -> None:
     )
     print(f"\nBenchmark subroutine: {len(bench_code)} bytes at ${BENCH_SUB:04X}")
 
-    # Connect to device
-    print(f"\nConnecting to U64 at {host} ...")
-    client = Ultimate64Client(host=host, password=password, timeout=30.0)
-    transport = Ultimate64Transport(host=host, password=password, client=client)
+    # Connect to device -- under the DeviceLock from the first request to
+    # the last restore: run_prg replaces whatever a neighbouring lane has
+    # on the machine (#244, docs/device_locking.md).
+    with hold_device_lock(host):
+        print(f"\nConnecting to U64 at {host} ...")
+        client = Ultimate64Client(host=host, password=password, timeout=30.0)
+        transport = Ultimate64Transport(host=host, password=password, client=client)
 
-    # Verify connectivity
-    try:
-        info = client.get_info()
-        product = info.get("product", "unknown")
-        firmware = info.get("firmware_version", "unknown")
-        print(f"  Connected: {product}, firmware {firmware}")
-    except Exception as e:
-        print(f"ERROR: Cannot reach U64 at {host}: {e}")
-        sys.exit(1)
-
-    # Snapshot original state for restore
-    print("  Snapshotting turbo state ...")
-    original_state = snapshot_state(client)
-    original_mhz = get_turbo_mhz(client)
-    print(f"  Original turbo: {original_mhz} MHz" if original_mhz else "  Original turbo: Off")
-
-    # Enable REU — x25519 program requires 512 KB REU for lookup tables
-    print("  Enabling REU (512 KB) ...")
-    set_reu(client, enabled=True, size="512 KB")
-    time.sleep(0.5)
-
-    print(f"\nWill benchmark {len(speeds)} speed(s): {speeds}")
-    print(f"Per-speed timeout: {args.timeout:.0f}s")
-
-    # Run benchmarks
-    results: list[dict] = []
-    try:
-        for mhz in speeds:
-            result = run_one_speed(
-                client, transport, prg_data, labels, mhz, args.timeout,
-            )
-            if result is not None:
-                results.append(result)
-    except KeyboardInterrupt:
-        print("\n\nInterrupted by user.")
-    finally:
-        # Restore original turbo state
-        print(f"\nRestoring original turbo state ...")
+        # Verify connectivity
         try:
-            restore_state(client, original_state)
-            restored = get_turbo_mhz(client)
-            print(f"  Restored: {restored} MHz" if restored else "  Restored: Off")
+            info = client.get_info()
+            product = info.get("product", "unknown")
+            firmware = info.get("firmware_version", "unknown")
+            print(f"  Connected: {product}, firmware {firmware}")
         except Exception as e:
-            print(f"  WARNING: Failed to restore state: {e}")
+            print(f"ERROR: Cannot reach U64 at {host}: {e}")
+            sys.exit(1)
+
+        # Snapshot original state for restore
+        print("  Snapshotting turbo state ...")
+        original_state = snapshot_state(client)
+        original_mhz = get_turbo_mhz(client)
+        print(f"  Original turbo: {original_mhz} MHz" if original_mhz else "  Original turbo: Off")
+
+        # Enable REU — x25519 program requires 512 KB REU for lookup tables
+        print("  Enabling REU (512 KB) ...")
+        set_reu(client, enabled=True, size="512 KB")
+        time.sleep(0.5)
+
+        print(f"\nWill benchmark {len(speeds)} speed(s): {speeds}")
+        print(f"Per-speed timeout: {args.timeout:.0f}s")
+
+        # Run benchmarks
+        results: list[dict] = []
+        try:
+            for mhz in speeds:
+                result = run_one_speed(
+                    client, transport, prg_data, labels, mhz, args.timeout,
+                )
+                if result is not None:
+                    results.append(result)
+        except KeyboardInterrupt:
+            print("\n\nInterrupted by user.")
+        finally:
+            # Restore original turbo state
+            print(f"\nRestoring original turbo state ...")
+            try:
+                restore_state(client, original_state)
+                restored = get_turbo_mhz(client)
+                print(f"  Restored: {restored} MHz" if restored else "  Restored: Off")
+            except Exception as e:
+                print(f"  WARNING: Failed to restore state: {e}")
 
     # Summary
     print_summary(results)
