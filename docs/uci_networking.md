@@ -79,8 +79,9 @@ v3.15-85), not measured:
 
   The REU enable follows the same two cases; its prohibit check is
   `c64.cc:1056-1061` (`:1335-1339` at `7f6fcb51`).
-  `Ultimate64Client.reboot`'s docstring states the unconditional version;
-  that contradiction is #299.
+  `Ultimate64Client.reboot`'s docstring stated the unconditional version
+  until #299 corrected it to this account
+  (`tests/test_reboot_docstring.py` pins the two together).
 
 To find the real cause, drop the reset on a device and see which step
 fails. Nobody has done that. The write is memory-only — it is a config PUT, so
