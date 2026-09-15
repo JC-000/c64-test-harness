@@ -92,8 +92,9 @@ AUTO_GC_ENV = "U64_AUTO_TEMP_GC"
 #: Override the default keep-count (see DEFAULT_KEEP).
 KEEP_ENV = "U64_TEMP_GC_KEEP"
 
-#: Override the per-client leak budget -- how many attachment-creating
-#: requests may go out between hygiene passes (see DEFAULT_LEAK_BUDGET).
+#: Override the leak budget -- how many attachment-creating requests may go
+#: out to one device between hygiene passes, counted across every client of
+#: that host in the process (see DEFAULT_LEAK_BUDGET and TempLedger, #295).
 BUDGET_ENV = "U64_TEMP_GC_BUDGET"
 
 #: Set to a falsy value to opt out of the *refusal*: by default, once a

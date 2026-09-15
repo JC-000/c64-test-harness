@@ -385,6 +385,27 @@ def test_the_ftp_enable_is_attempted_once_per_device(host):
     assert set_item.call_count == 1
 
 
+def test_a_second_leaking_client_does_not_repeat_the_ftp_enable(host):
+    """The block does not hide a per-client attempt: once a successful sweep
+    lifts it, a different client's failing pass still must not write config
+    again (one attempt per device per process)."""
+    a = _client(host, temp_gc_budget=1)
+    b = _client(host, temp_gc_budget=1)
+    idle = _client(host)
+    with _FTP(REFUSED, REFUSED, None, default=REFUSED), \
+            _no_config_writes() as set_item:
+        a.run_prg(PRG)
+        with pytest.raises(Ultimate64TempHygieneError):
+            a.run_prg(PRG)                 # fail, enable, fail: blocked
+        assert set_item.call_count == 1
+        with _lock_held(True):
+            idle.close()                   # a sweep succeeds: block lifted
+        b.run_prg(PRG)
+        with pytest.raises(Ultimate64TempHygieneError):
+            b.run_prg(PRG)                 # b's own pass fails
+    assert set_item.call_count == 1
+
+
 def test_a_client_that_leaked_nothing_writes_no_config_even_with_device_pending(host, tmp_path, caplog):
     leaker = _client(host)
     with _FTP(default=REFUSED), _no_config_writes() as set_item:

@@ -260,13 +260,15 @@ ago.
 ## Releasing the lock can now make network calls
 
 Since the `/Temp` hygiene work, releasing a `DeviceLock` is no longer
-purely local. `Ultimate64Client` registers a drain callback against the
-device host (`backends/ultimate64_client.py:355` →
-`backends/device_lock.py:1708`), and the release path fires it **while
+purely local. Each `Ultimate64Client` registers its device's `/Temp`
+ledger (`ultimate64_temp_gc.TempLedger.drain_on_lock_release`) through
+`device_lock.register_release_callback`. The release path fires it **while
 the flock is still held**, so the device is still exclusively ours when
-the drain runs. Nested acquires fire it only on the outermost release
-(`device_lock.py:881`). The registry holds weak references, so
-registering never keeps a client alive (`device_lock.py:181`).
+the drain runs. Nested acquires fire it only on the outermost release. The
+ledger is registered once per host, not once per client, so one release
+drains once however many clients the process built (issue #295). The
+callback registry holds weak references, and the ledger holds its clients
+weakly, so registering never keeps a client alive.
 
 Two consequences for a lane author: a release may take FTP round trips
 on a leak-prone device (it is best-effort and swallows its own errors —

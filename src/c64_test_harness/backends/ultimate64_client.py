@@ -1089,8 +1089,9 @@ class Ultimate64Client:
     def _run_temp_hygiene(self, reason: str) -> bool:
         """Run one hygiene pass; ``True`` if ``/Temp`` was collected.
 
-        Never raises. On failure it makes exactly one attempt, per client,
-        at enabling the device's FTP File Service (off by default on C64U
+        Never raises. On failure it makes exactly one attempt per device per
+        process (the ledger's ``ftp_enable_attempted``, #295) at enabling
+        the device's FTP File Service (off by default on C64U
         1.1.0, which is the one device that needs this pass) and retries.
         The enable is a bodyless config PUT — it creates no attachment of
         its own — and is runtime-only: it lives in firmware RAM until
@@ -1102,9 +1103,11 @@ class Ultimate64Client:
         ``BASELINE_NEVER_TOUCH`` is ``apply_factory_baseline``'s contract --
         the entry-baseline reset never resets or asserts those stores -- and
         says nothing about this pass, which may write exactly one item,
-        ``Network Settings > FTP File Service``, once per client, only for a
-        client that leaked (both callers require pending attachments) and
-        only after its sweep failed.  A client that leaked nothing never
+        ``Network Settings > FTP File Service``, once per device per process,
+        only for a client that has leaked or is about to (the drain requires
+        this client's own uncollected attachments; the budget gate runs
+        before an attachment-creating request) and only after its sweep
+        failed.  A client that leaked nothing never
         reaches it: :meth:`_sweep_inherited_temp` writes no config.
         """
         self._in_temp_hygiene = True

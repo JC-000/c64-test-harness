@@ -259,9 +259,10 @@ That touches paths with live timing constraints (the ip65 "≥ 0.2 s after
 a C64U. A direct `client.write_mem` call is not covered and still POSTs
 above the threshold.
 
-**Cadence.** A per-client budget of
+**Cadence.** A per-device budget of
 `ultimate64_temp_gc.DEFAULT_LEAK_BUDGET` = **6** attachment-creating
-calls, then the pass runs before the call that would overrun it, and a
+calls, counted across every client of that host in the process (issue
+#295). The pass runs before the call that would overrun it, and only a
 successful pass resets the count.
 
 Why 6. Upstream is the only firm bound: the firmware's
@@ -351,10 +352,34 @@ device to the next one clean. The two drain cases differ:
   still hold an earlier lane's attachments and that FTP File Service must
   be enabled by hand, or the device power-cycled, before uploading.
 
-The budget itself is still per client instance — two clients against one
-device spend six each (issue #295). `machine:reboot` does **not** reset the
-count: it is a C64-level reset, and `/Temp` is a firmware RAM disk
-(`software/filesystem/ramdisk.cc`) that only a firmware power-on clears.
+**The budget is per device, within one process** (issue #295). The count,
+the refusal state and the one FTP-enable attempt live in a process-wide
+`TempLedger` (`ultimate64_temp_gc.py`), keyed by the normalised host.
+Normalising folds together case, scheme, `:port`, a trailing dot and the
+spellings of one IP address. It does **not** fold a name with its
+address, because that needs DNS; use one spelling per device. So:
+
+- a fresh client per upload no longer resets the budget;
+- two clients of one device spend one budget between them;
+- a lock release drains **once per host**, however many clients were built.
+  The ledger is what registers the release callback, and it picks one
+  client to drain: armed with a leak of its own first, then armed.
+- A leaking client whose pass fails blocks attachment-creating calls on
+  **every** armed client of that device, until any client's sweep succeeds.
+  Bodyless calls, `temp_hygiene=False` clients and `U64_TEMP_GC_REQUIRED=0`
+  are not blocked.
+- Whether a drain may take the leaking-lane path (the FTP-enable attempt,
+  the block) is still decided by that client's own uncollected share. A
+  client that leaked nothing never writes config.
+
+**Cross-process accounting is still open.** Two processes against one
+device keep two ledgers, and each spends a budget. The hand-off between
+processes is covered only by the lock-release drain, which sweeps while the
+releasing process still holds the device's lock.
+
+`machine:reboot` does **not** reset the count: it is a C64-level reset, and
+`/Temp` is a firmware RAM disk (`software/filesystem/ramdisk.cc`) that only
+a firmware power-on clears.
 
 **A `run_prg` that takes the 404 fallback costs two attachments**, not
 one — on the reading that the firmware writes an attachment for the
