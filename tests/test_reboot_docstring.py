@@ -171,6 +171,12 @@ def test_marks_it_unmeasured_and_links_the_doc(doc):
     assert "#299" in doc
 
 
+def test_the_enable_uci_requirement_is_not_restated_as_standing(doc):
+    """#270 measured the enable live without a reset on the U64E (bce4535e)."""
+    assert "still stands" not in doc
+    assert "bce4535e" in doc and "#270" in doc
+
+
 def test_the_enable_uci_observation_is_not_dropped(doc):
     """Removing the wrong cause must not remove the recorded observation."""
     assert "enable_uci" in doc and "reset()" in doc

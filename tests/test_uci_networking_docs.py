@@ -185,6 +185,60 @@ def _relapses(flat: str) -> list[str]:
     return _restates_refuted_cause(flat) + _claims_deferred_apply(flat)
 
 
+#: The #270 measurement (U64E bce4535e, 2026-09-15): the enable is live with
+#: no reset.  The doc must carry it with its conditions, and must stop
+#: telling readers the reset is required.
+MEASUREMENT = (
+    "bce4535e",
+    "2026-09-15",
+    "n=4 per arm",
+    "`Cartridge Preference` `Auto`",
+    "without `reset()`",
+    "not reproduced",
+)
+
+#: Present-tense requirement wording the measurement retires.
+RETIRED_REQUIREMENT = (
+    "Keep that sequence",
+    "Nobody has done that",
+    "drop the reset on a device and see which step fails",
+)
+
+
+class TestTheMeasurementIsRecorded:
+    @pytest.mark.parametrize("phrase", MEASUREMENT)
+    def test_present(self, section: str, phrase: str) -> None:
+        assert phrase in section, f"#270 measurement lost {phrase!r}"
+
+    @pytest.mark.parametrize("phrase", RETIRED_REQUIREMENT)
+    def test_retired_requirement_absent(self, whole: str, phrase: str) -> None:
+        assert phrase not in whole, phrase
+
+    def test_c64u_is_not_claimed_measured(self, section: str) -> None:
+        sents = [s for s in _sentences(section) if "C64U" in s and "bce4535e" in s]
+        assert all("not" in s.lower() for s in sents), sents
+
+
+class TestEnableUciDocstring:
+    @pytest.fixture(scope="class")
+    def doc(self) -> str:
+        import inspect
+
+        from c64_test_harness.uci_network import enable_uci
+
+        return _flat(inspect.getdoc(enable_uci) or "")
+
+    def test_does_not_say_a_reset_is_needed(self, doc: str) -> None:
+        assert "typically needed" not in doc
+        assert not _relapses(doc)
+
+    def test_does_not_say_reboot_reverts_it(self, doc: str) -> None:
+        assert "reboot reverts" not in doc
+
+    def test_cites_the_measurement(self, doc: str) -> None:
+        assert "bce4535e" in doc and "#270" in doc and "docs/uci_networking.md" in doc
+
+
 class TestTheObservationSurvives:
     @pytest.mark.parametrize("phrase", OBSERVATION)
     def test_present(self, section: str, phrase: str) -> None:

@@ -2733,10 +2733,16 @@ def enable_uci(client: "Ultimate64Client") -> None:
 
     Sets ``Command Interface`` to ``"Enabled"`` in the
     ``C64 and Cartridge Settings`` category.  The change is **not**
-    saved to flash — a device reboot reverts to the default state.
+    saved to flash: it lives in firmware RAM, survives ``reboot()`` (a
+    C64-level reset) and is lost only at a firmware power-on.
 
-    A machine reset is typically needed after enabling UCI so that
-    the I/O registers at $DF1C-$DF1F become active.
+    No reset is needed for ``$DF1C-$DF1F`` to answer.  Measured on the
+    U64E (fw 3.15, bce4535e, 2026-09-15, ``Cartridge Preference`` Auto,
+    n=4 per arm, #270): ``$DF1D`` read ``$C9`` on the first read after
+    this call and ``uci_probe`` completed with no reset, as it did after
+    ``reset()`` or ``reboot()``.  The C64U is not measured.  With
+    ``Cartridge Preference`` External the slot stays off the bus whatever
+    this item says (#359).  See docs/uci_networking.md.
 
     :param client: Connected :class:`Ultimate64Client` instance.
     """

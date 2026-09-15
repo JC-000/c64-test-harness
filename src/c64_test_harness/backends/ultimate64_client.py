@@ -1667,8 +1667,10 @@ class Ultimate64Client:
         Line numbers are for ``1.1.0``; ``docs/uci_networking.md`` carries
         the ``7f6fcb51`` equivalents and the full trace. The recorded
         observation that ``enable_uci`` needs a ``reset()`` and a ~3 s
-        settle before routines answer still stands, but this path does not
-        explain it and its cause is open. An earlier revision of this
+        settle before routines answer was not reproduced on the U64E (fw
+        3.15, bce4535e, 2026-09-15, #270): with Cartridge Preference Auto
+        the enable answered with no reset, and after this call, 4/4 per
+        arm; why the earlier runs timed out is open. An earlier revision of this
         docstring gave the unconditional version as that cause (issue
         #299).
 
