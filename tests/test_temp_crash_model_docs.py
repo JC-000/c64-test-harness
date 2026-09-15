@@ -8,20 +8,36 @@ And, of the ~15-uploads figure: "this was a guess about the writemem exhaustion
 issue. Now that we know the actual cause we should not maintain guesses about the
 number of runs before an unpatched device crashes."
 
-So "/Temp fills" is the mechanism and stays sayable.  This pin's job is the
-retired **count**:
+So "/Temp fills" is the mechanism and stays sayable: "/Temp fills" and "the
+firmware crashes" are one failure, not rival models.  This pin's job:
 
 * **a count before the crash** -- a number (digits, or a written number from
   two upward, "a few", "several", "a dozen", "a handful") of uploads, runs,
   cycles or PRGs in a sentence that also has a crash word (wedge, crash,
   brick, dies, kills, survives) or a bound word (budget, allowance, limit,
-  bound, threshold, safe, within, at most, up to, short of, under, below,
-  between).  Or "a handful"/"a dozen"/"a few" placed beside a budget or
-  limit.  A sentence escapes only if an explicit retirement phrase ("retired",
-  "not a limit", "a budget for nothing", "no standing", "where one
-  reproduction stopped", "do not size/cite/restate/maintain", "is a guess")
-  sits within :data:`RETIRE_WINDOW` characters of the count.  A bare "not"
-  anywhere in the sentence is **not** a retirement;
+  bound, threshold, each also plural; safe, within, at most, up to, short of,
+  under, below, between).  Or "a handful"/"a dozen"/"a few" placed beside a
+  budget or limit.  **No retirement phrase waives it** (#386): "retired", "not a
+  limit", "where one reproduction stopped" and the like used to, and a
+  numbered count came back beside one ('The "~15 uploads" wedge ... is where
+  one reproduction stopped, not a bound').  The ruling is that no guess is
+  kept, retired or not;
+* **the wrong model** (#386): "a crash, not a full filesystem", "rather than a
+  full filesystem", "nowhere near exhaustion", "anywhere near full", "far from
+  full", "/Temp does not fill", "never fills up", "capacity is not what fails"
+  / "is not the failure" / "is not the thing that fails", "far from exhausted",
+  "short of exhaustion", "not a filesystem that fills up", "nothing to do with
+  capacity", '"fills up" is the
+  wrong model' -- each sets filling against crashing, which the ruling makes
+  one thing.  **Only in a /Temp paragraph** (:data:`_TEMP_PARAGRAPH`: /Temp,
+  attachment, writemem, unpatched, leak-prone, #686; or, for this rule only,
+  "ramdisk", or "C64U"/"RAM disk" in a paragraph that also has a crash word --
+  review round 4), because "nowhere near
+  full speed" and "not a full folder dump" are ordinary prose elsewhere
+  (review round 1); "full speed" and "full disk image" are excluded even there.
+  "does not fill" and "never fills" count only beside a crash word in the same
+  sentence, because "PUT machine:writemem?data= never fills /Temp" is a true
+  zero-cost statement (review round 3);
 * **the stale RAM-disk figures** (#261): "3 MB"/"3 MiB", "31%", "945 KB",
   "3 * 1024 * 1024", unless "stale", "corrected", "used to claim" or "#261"
   sits within :data:`STALE_WINDOW` characters of the figure.
@@ -34,8 +50,22 @@ exemption's reason must cite an issue number; there are none today.
 attachments / POSTs / calls / requests / writes also count ("Fifteen POSTs
 wedge it"), except as a *price*: followed by "per call/request/probe", or
 preceded by a cost verb ("costs two attachments").  "per run", "a run",
-"per client" and "an upload" are not prices.  A retirement does
-not waive a count when "but" or "still" follows it in the same sentence.
+"per client" and "an upload" are not prices.
+
+**Scope is the listed files, not exhaustive.**  :data:`SCANNED` is exactly
+the files listed above.  Neither ``src/**`` nor ``tests/**`` is globbed in, and
+both hold sentences the rules flag although none is a count kept in the docs
+(measured in #403 review round 2).  In ``src/**``, five: four in
+``backends/ultimate64_probe.py`` (the "48..127 POST wedge range" of #84, twice;
+"two body-carrying POSTs" beside "degraded"; "repeated 404 POSTs are the
+TCP-wedge trigger" of #107) and one in ``poll_until.py`` ("within a few
+milliseconds" beside "budget").  In ``tests/**``, besides this file's own
+controls: three in ``test_ultimate64_temp_gc.py`` (its stale-RAM-disk scan's
+positive control, the sentence recording that the "63 KB PRG" count it used to
+carry is retired, and the assert that checks it is gone) and one in
+``test_audio_rate_lock_live.py`` (a phase-lock note on cycle and sample
+counts).  :class:`TestTheDeclaredLimitsStayKnown` asserts the ``src/**`` shapes
+are flagged, so widening :data:`SCANNED` is a deliberate change that meets them.
 
 **Declared limits, not design.**  The harness's own numbers pass because of
 these limits, not because the rule understands them, and
@@ -46,9 +76,7 @@ noun is not read), nor is "a few dozen uploads"; and "the budget is 6 uploads
 per client" **is** flagged although it is a rate, not a crash count.
 "One upload" is not a count (a single call is not a crash count, and the
 corpus says "one PRG per iteration" often).  Also flagged although arguably
-not a crash count: a retirement taken back by a following "but"/"still"
-even when what follows is harmless ("... is not a budget, but a datapoint";
-#386 drops the retirement escape altogether), and a harness count that
+not a crash count: a harness count that
 merely shares a sentence with a crash word ("The bench made 3 POSTs and
 nothing crashed.", "Each of the 4 calls can wedge the runner if it is
 already stuck.").  A number of
@@ -56,6 +84,15 @@ already stuck.").  A number of
 attachments or writemem, because "a budget denominated in 6502 cycles" is
 ordinary prose elsewhere.  A count spelled some other way ("a score of runs")
 is not caught.
+The wrong-model rule has its own limits, asserted both ways in the same class:
+without a /Temp word anywhere in its paragraph, "It is a crash rather than a
+full filesystem." is **not** caught; inside one, "The listing is not a full
+folder dump." **is** flagged although it does not set filling against
+crashing.  "Capacity was never what failed on the C64U." is **not** caught:
+"C64U" is a subject only beside a crash word (review round 4).  A true
+zero-cost statement that also names a crash **is** flagged ("PUT
+machine:writemem?data= never fills /Temp, so it cannot wedge the C64U."), because
+"does not fill"/"never fills" need only a crash word in the same sentence.
 """
 from __future__ import annotations
 
@@ -83,7 +120,6 @@ SCANNED: tuple[Path, ...] = tuple(sorted(
 #: (file relative to the repo, exact flattened sentence, reason citing an issue).
 EXEMPT: tuple[tuple[str, str, str], ...] = ()
 
-RETIRE_WINDOW = 80
 STALE_WINDOW = 120
 
 _WRITTEN = (
@@ -126,7 +162,8 @@ def _is_a_price(sentence: str, match: re.Match[str]) -> bool:
                 or _COST_VERB_BEFORE.search(sentence[:match.start()]))
 _CRASH = re.compile(r"\b(?:wedg\w*|crash\w*|brick\w*|dies|die|kills?|survives?)\b", re.IGNORECASE)
 _BOUND = re.compile(
-    r"\b(?:budget|allowance|limit|bound|threshold|safe|within|between|under|below)\b"
+    # Plurals too (#386 mutant D2b: "so budgets are sized" beside a count passed).
+    r"\b(?:budgets?|allowances?|limits?|bounds?|thresholds?|safe|within|between|under|below)\b"
     r"|\bat\s+most\b|\bup\s+to\b|\bshort\s+of\b",
     re.IGNORECASE,
 )
@@ -134,17 +171,38 @@ _TEMP_PARAGRAPH = re.compile(r"/Temp|attachment|writemem|unpatched|leak-prone|#6
 #: The gap may cross a dot inside a word ("CLAUDE.md"), not a sentence end.
 _IN_SENTENCE = r"(?:[^.;]|\.(?=\w))"
 _HANDFUL_BOUND = re.compile(
-    rf"\ba\s+(?:handful|dozen|few)\b{_IN_SENTENCE}{{0,90}}\b(?:budget|limit|allowance)\b"
-    rf"|\b(?:budget|limit|allowance)\b{_IN_SENTENCE}{{0,90}}\ba\s+(?:handful|dozen|few)\b",
+    rf"\ba\s+(?:handful|dozen|few)\b{_IN_SENTENCE}{{0,90}}\b(?:budgets?|limits?|allowances?)\b"
+    rf"|\b(?:budgets?|limits?|allowances?)\b{_IN_SENTENCE}{{0,90}}\ba\s+(?:handful|dozen|few)\b",
     re.IGNORECASE,
 )
-_RETIRES = re.compile(
-    r"\bretired?\b|\bnot a (?:capacity|limit|budget|bound|measured budget)\b"
-    r"|\bbudget for nothing\b|\bno standing\b|\bwhere (?:one|a single) reproduction stopped\b"
-    r"|\bdo not (?:size|restate|maintain|cite)\b|\bis a guess\b|\bnot as a limit\b",
+#: Filling set against crashing (#386): the ruling makes them one failure.
+_WRONG_MODEL = re.compile(
+    r"\bnot (?:a |because of a )?full (?:file ?system|folder|disk(?!\s+image)|RAM disk)\b"
+    r"|\bnot a (?:file ?system|folder|disk|RAM disk) that (?:fills?|filled)\b"
+    r"|\brather than (?:a )?full\b"
+    r"|\b(?:nowhere|anywhere) near (?:exhaust\w*|full\b(?!\s+speed))"
+    r"|\bfar from (?:exhaust\w*|full\b(?!\s+speed))"
+    r"|\bshort of exhaust\w*"
+    r"|\bcapacity (?:is|was) (?:not|never) (?:(?:what|the thing that) fail(?:s|ed)|the failure)\b"
+    r"|\bnothing to do with capacity\b"
+    r"|\b(?:fills?|filling) up\W{0,3}\s+(?:is|was) the wrong model\b",
     re.IGNORECASE,
 )
-_TAKEN_BACK = re.compile(r"\b(?:but|still)\b", re.IGNORECASE)
+#: These two set filling against crashing only beside a crash word in the same
+#: sentence: "PUT machine:writemem?data= never fills /Temp." is true (review round 3).
+_WRONG_MODEL_BESIDE_CRASH = re.compile(
+    r"\bdoes(?:n't| not) (?:actually )?fill\b"
+    r"|\bnever (?:\w+ )?fills?\b",
+    re.IGNORECASE,
+)
+#: The wrong-model rule's own extra subject words (review rounds 3-4, reviewer-4's
+#: candidate B).  Kept out of _TEMP_PARAGRAPH, which the count rule shares.
+#: "ramdisk" (the firmware source file) is a subject on its own; "C64U" and "RAM
+#: disk" only in a paragraph that also has a crash word, because "The C64U's REU
+#: is nowhere near full" and "not a full RAM disk snapshot" are ordinary prose.
+#: "wedg" is not one: it is itself a crash word, so it gated on itself.
+_WRONG_MODEL_SUBJECT = re.compile(r"ramdisk", re.IGNORECASE)
+_WRONG_MODEL_SUBJECT_BESIDE_CRASH = re.compile(r"C64U|RAM disk", re.IGNORECASE)
 _STALE = re.compile(r"\b3\s*Mi?B\b|\b31\s*%|\b945\s*KB\b|3 \* 1024 \* 1024", re.IGNORECASE)
 _STALE_MARKER = re.compile(r"\bstale\b|used to claim|#261|\bcorrected\b", re.IGNORECASE)
 
@@ -163,36 +221,28 @@ def _sentences(paragraph: str) -> list[str]:
     return [s for s in re.split(r"(?<=[.!?])\s+", paragraph) if s]
 
 
-def _retired_near(sentence: str, match: re.Match[str]) -> bool:
-    """A retirement phrase that *starts* within the window after the count, or
-    *ends* within the window before it."""
-    return any(
-        r.start() <= match.end() + RETIRE_WINDOW
-        and r.end() >= match.start() - RETIRE_WINDOW
-        # "retired as a hard rule but still a good budget" retires nothing.
-        and not _TAKEN_BACK.search(sentence, r.end())
-        for r in _RETIRES.finditer(sentence)
-    )
-
-
 def _states_a_count(sentence: str, paragraph: str) -> bool:
-    handful = _HANDFUL_BOUND.search(sentence)
-    if handful and not _retired_near(sentence, handful):
+    if _HANDFUL_BOUND.search(sentence):
         return True
     for pattern, needs_temp in ((_COUNT_RUNS, False), (_COUNT_CYCLES, True)):
-        for match in pattern.finditer(sentence):
-            if _retired_near(sentence, match):
-                continue
+        if pattern.search(sentence):
             if _CRASH.search(sentence):
                 return True
             if _BOUND.search(sentence) and (not needs_temp or _TEMP_PARAGRAPH.search(paragraph)):
                 return True
     if _CRASH.search(sentence):
         for match in _COUNT_HARNESS.finditer(sentence):
-            if _is_a_price(sentence, match) or _retired_near(sentence, match):
-                continue
-            return True
+            if not _is_a_price(sentence, match):
+                return True
     return False
+
+
+def _sets_filling_against_crashing(sentence: str, paragraph: str) -> bool:
+    if not (_TEMP_PARAGRAPH.search(paragraph) or _WRONG_MODEL_SUBJECT.search(paragraph)
+            or (_WRONG_MODEL_SUBJECT_BESIDE_CRASH.search(paragraph) and _CRASH.search(paragraph))):
+        return False
+    return bool(_WRONG_MODEL.search(sentence)
+                or (_WRONG_MODEL_BESIDE_CRASH.search(sentence) and _CRASH.search(sentence)))
 
 
 def _stale_unmarked(paragraph: str) -> bool:
@@ -210,6 +260,8 @@ def count_and_figure_problems(text: str) -> list[tuple[str, str]]:
         for sentence in _sentences(paragraph):
             if _states_a_count(sentence, paragraph):
                 out.append(("count before a crash", sentence))
+            if _sets_filling_against_crashing(sentence, paragraph):
+                out.append(("filling set against crashing", sentence))
         if _stale_unmarked(paragraph):
             out.append(("stale figure", paragraph))
     return out
@@ -306,8 +358,11 @@ def test_a_count_planted_into_a_real_file_is_flagged() -> None:
     assert _PLANT_ANCHOR in text, "the PATTERNS /Temp sentence the plant is spliced after is gone"
     assert count_and_figure_problems(text) == []
     anchor_end = text.index(".", text.index(_PLANT_ANCHOR)) + 1
+    rules_fired: set[str] = set()
     for planted in ("Stay within 15 uploads.", "Fifteen POSTs wedge it.",
-                    "The /Temp RAM disk is 3 MiB."):
+                    "The /Temp RAM disk is 3 MiB.",
+                    # reviewer-4: the wrong-model rule shown firing on real scanned text.
+                    "/Temp does not fill; the firmware crashes."):
         spliced = text[:anchor_end] + " " + planted + text[anchor_end:]
         assert spliced.count("\n\n") == text.count("\n\n"), "the plant opened a new paragraph"
         found = count_and_figure_problems(spliced)
@@ -315,6 +370,15 @@ def test_a_count_planted_into_a_real_file_is_flagged() -> None:
         assert any(planted in excerpt for _, excerpt in found), (
             f"planted {planted!r} into PATTERNS.md was not flagged: {found}"
         )
+        rules_fired.update(rule for rule, excerpt in found if planted in excerpt)
+    # Every rule is shown firing on real text: dropping a plant is not silent.
+    assert rules_fired == {"count before a crash", "filling set against crashing", "stale figure"}, (
+        rules_fired
+    )
+
+
+#: A /Temp subject for the paragraph a wrong-model control sits in.
+_IN_TEMP = "Uncollected writemem attachments accumulate in /Temp. "
 
 
 class TestTheRulesCanFail:
@@ -353,6 +417,20 @@ class TestTheRulesCanFail:
         "CLAUDE.md says to treat as a handful.",
         # Needs the wide gap: 90 characters, crossing the dot in "CLAUDE.md" (mutant G).
         "The budget the standing hardware-safety clause in CLAUDE.md describes is a handful.",
+        # #382 accepted survivor G1: the first direction ("a handful ... budget")
+        # across the dot in "CLAUDE.md", past the old 30-character gap.
+        "Treat a handful, as the note in CLAUDE.md puts it, as the budget.",
+        # #386 (D2b): plural bound words.
+        'The figure, "~15 cycles of a 63 KB PRG", is where it stopped; so /Temp budgets '
+        "are sized conservatively.",
+        "Budgets allow 15 uploads.",
+        # Review round 2 (reviewer-5): one case per plural, no other bound word.
+        "Our limits allow 15 uploads.",
+        "Allowances permit 15 uploads.",
+        "Bounds stop at 15 uploads.",
+        "Thresholds sit at 15 uploads.",
+        "Our limits are a handful.",
+        "A handful sets the budgets.",
     ])
     def test_a_count_guess_is_flagged(self, text: str) -> None:
         assert "count before a crash" in {r for r, _ in count_and_figure_problems(text)}, text
@@ -364,9 +442,22 @@ class TestTheRulesCanFail:
         "Accumulated attachments fill /Temp and crash unpatched firmware.",
         "Nobody knows how many uploads an unpatched device survives.",
         "A device approaching /Temp exhaustion is slow.",
-        # A count that retires itself, beside the figure.
-        "The retired guess of 15 uploads is not a budget.",
-        "It wedged at ~15 cycles of a 63 KB PRG, a datapoint, not a limit.",
+        "No count of uploads before the crash is known or kept.",
+        "A full /Temp crashes the firmware.",
+        "Accumulated attachments fill /Temp, and a full /Temp crashes the firmware.",
+        "The old guess about uploads before a crash is retired.",
+        # The #386 ruling, verbatim.
+        "When /Temp is filled then the device firmware crashes. the c64 appears to continue "
+        "to run but the rest api becomes unresponsive and the local firmware menu switch no "
+        "longer has an effect. This is the outcome of the writemem garbage collection issue "
+        "on unpatched firmware.",
+        "this was a guess about the writemem exhaustion issue. Now that we know the actual "
+        "cause we should not maintain guesses about the number of runs before an unpatched "
+        "device crashes.",
+        # The wrong-model rule's near misses in the real corpus.
+        "Its duration is still not a capacity measurement.",
+        "The bisection ends up nowhere near the actual root cause.",
+        "That is a design choice in the cleaner, not evidence about what fails.",
         # Counts that are not a count before a crash.
         "The bench U64E held zero attachments before and after fifteen run_prg uploads.",
         "Four mhz params times three vectors is twelve uploads in one session.",
@@ -379,21 +470,127 @@ class TestTheRulesCanFail:
         "uci_socket_write costs two attachments when the payload exceeds the threshold, "
         "and a wedged device crashes anyway.",
         "liveness_probe() takes two attachments per call, so probing a suspected wedge spends budget.",
-        # Review round 3 (H5): a retired harness-unit count.
-        "The retired guess of 15 POSTs is not a budget.",
-        "The retired guess that 15 POSTs wedge a device is not a budget.",
         "liveness_probe() costs two attachments per call, so probing a suspected wedge spends budget.",
     ])
     def test_the_owner_model_and_ordinary_counts_pass(self, text: str) -> None:
         assert count_and_figure_problems(text) == [], text
 
-    def test_the_retire_window_is_what_decides(self) -> None:
-        """The same sentence flips on the distance alone (reviewer-2's S1)."""
-        near = "Keep under 15 uploads, a retired guess."
-        far = "Keep under 15 uploads" + ", and so on" * 12 + ", a retired guess."
-        assert len(far) - len("Keep under 15 uploads") > RETIRE_WINDOW + 20
-        assert count_and_figure_problems(near) == []
-        assert "count before a crash" in {r for r, _ in count_and_figure_problems(far)}
+    @pytest.mark.parametrize("text", [
+        # #386: each of these passed under the retirement waiver #382 shipped.
+        "The retired guess of 15 uploads is not a budget.",
+        "It wedged at ~15 cycles of a 63 KB PRG, a datapoint, not a limit.",
+        "The retired guess that 15 POSTs wedge a device is not a budget.",
+        "Keep under 15 uploads, a retired guess.",
+        "Keep under 15 uploads, which is retired as a hard rule.",
+        "The ~15 uploads that wedged it are not a budget, but a datapoint.",
+        # reviewer-2, #382 round 3: tests/test_ultimate64_temp_hygiene.py:649 reverted.
+        'The "~15 uploads" wedge (U64E, 3.14d, n unrecorded) is where one reproduction '
+        "stopped, not a bound to size against (#256)",
+        # docs/development.md before #386.
+        'The one figure in circulation, "~15 cycles of a 63 KB PRG", was taken on the U64E '
+        "at 3.14d with n unrecorded and is where a single reproduction stopped, not a "
+        "capacity; the trigger threshold and the crash cause are both unestablished.",
+        "A handful is the budget, a guess we do not maintain.",
+    ])
+    def test_a_retirement_phrase_no_longer_waives_a_count(self, text: str) -> None:
+        assert "count before a crash" in {r for r, _ in count_and_figure_problems(text)}, text
+
+    @pytest.mark.parametrize("text", [
+        # README.md before #386.
+        "What that wedge is matters for what the pass can do: it is a firmware crash, "
+        "not a full filesystem.",
+        "The accumulation at that point was 945 KiB on a 16 MiB RAM disk, nowhere near exhaustion.",
+        "Capacity is not what fails.",
+        '"Fills up" is the wrong model.',
+        "It crashed, not because of a full folder.",
+        # Review round 1 (reviewer-2): near-variants that escaped.
+        "/Temp does not fill; the firmware crashes.",
+        "/Temp doesn't fill; the firmware crashes.",
+        '"Fills up" was the wrong model.',
+        "Filling up is the wrong model; the firmware crashes.",
+        "It is a crash rather than a full filesystem.",
+        "It crashes long before /Temp is anywhere near full.",
+        "The folder never actually fills up before the crash.",
+        "Capacity was never what failed.",
+        # Review round 1 (reviewer-4).
+        "It is a firmware crash rather than a full filesystem.",
+        "The wedge has nothing to do with capacity.",
+        "Capacity is not the failure; the firmware crashes.",
+        "The disk was far from full when it crashed.",
+        # Review round 2 (reviewer-5).
+        "It is a firmware crash, not a filesystem that fills up.",
+        "Capacity is not the thing that fails.",
+        "The disk was far from exhausted when it crashed.",
+        "It crashed well short of exhaustion.",
+        # Mutant N13 ("nowhere near exhaust\w*" back to "exhaustion") survived without it.
+        "/Temp was nowhere near exhausted when the firmware crashed.",
+        # Review round 3 (reviewer-4): the optional "a" in "rather than (?:a )?full".
+        "It is a firmware crash rather than full exhaustion of /Temp.",
+    ])
+    def test_filling_set_against_crashing_is_flagged(self, text: str) -> None:
+        found = count_and_figure_problems(_IN_TEMP + text)
+        assert "filling set against crashing" in {r for r, _ in found}, text
+
+    @pytest.mark.parametrize("text", [
+        # Ordinary prose the ungated rule flagged (review round 1, reviewer-2);
+        # the rule still matches each, so the /Temp gate is what passes it.
+        "The listing is not a full folder dump.",
+        "The REU is nowhere near full after the test.",
+        "The partial read is not a full RAM disk snapshot.",
+    ])
+    def test_wrong_model_shapes_outside_a_temp_paragraph_pass(self, text: str) -> None:
+        assert _WRONG_MODEL.search(text), f"the gate is not what passes {text!r}"
+        assert count_and_figure_problems(text) == [], text
+
+    @pytest.mark.parametrize("text", [
+        # Review round 3 (reviewer-4): true zero-cost statements, no crash word.
+        "PUT machine:writemem?data= never fills /Temp.",
+        "A post-safe device never fills /Temp: its firmware collects the attachments.",
+        "128 B costs zero attachments; that path does not fill /Temp.",
+        # Was a declared false positive before round 3.
+        "A bodyless PUT never fills /Temp.",
+        # Review round 4: the crash word must be in the same sentence, not merely the paragraph.
+        "The firmware crashes. A bodyless PUT never fills /Temp.",
+    ])
+    def test_does_not_fill_without_a_crash_word_passes(self, text: str) -> None:
+        assert _WRONG_MODEL_BESIDE_CRASH.search(text), f"the crash requirement is not what passes {text!r}"
+        assert count_and_figure_problems(_IN_TEMP + text) == [], text
+
+    @pytest.mark.parametrize("text", [
+        # Review round 3 (reviewer-4): the rule's own subject words, one each,
+        # with no _TEMP_PARAGRAPH word in the paragraph.
+        "The C64U firmware crash came with the RAM disk nowhere near full.",
+        "The ramdisk.cc disk was far from full when the firmware crashed.",
+        "The wedge came long before the RAM disk was anywhere near full.",
+        # Review round 4 (candidate B): each beside-crash subject on its own.
+        "The firmware crashed with the RAM disk nowhere near full.",
+        "The C64U firmware crashed long before anything was anywhere near full.",
+    ])
+    def test_the_wrong_model_rule_has_its_own_subject_words(self, text: str) -> None:
+        assert not _TEMP_PARAGRAPH.search(text), text
+        assert "filling set against crashing" in {r for r, _ in count_and_figure_problems(text)}, text
+
+    @pytest.mark.parametrize("text", [
+        # Review round 4 (reviewer-4): flagged by round 3's ramdisk|C64U|wedg gate.
+        "The C64U's REU is nowhere near full after the test.",
+        "The UCI wedge left the socket table far from full.",
+        "On the C64U the listing is not a full folder dump.",
+        "A runner wedge is not a full disk problem; reset the runner.",
+        "The RAM disk was nowhere near full; the snapshot restore still failed.",
+    ])
+    def test_subject_words_without_their_crash_word_pass(self, text: str) -> None:
+        assert _WRONG_MODEL.search(text), f"the gate is not what passes {text!r}"
+        assert count_and_figure_problems(text) == [], text
+
+    @pytest.mark.parametrize("text", [
+        # reviewer-2's other two: excluded by the rule itself, not only by the gate.
+        "At 1 MHz the loop runs nowhere near full speed.",
+        "The mount is not a full disk image, only a header.",
+        "The loop was far from full speed.",
+    ])
+    def test_speed_and_disk_image_pass_even_in_a_temp_paragraph(self, text: str) -> None:
+        assert count_and_figure_problems(text) == [], text
+        assert count_and_figure_problems(_IN_TEMP + text) == [], text
 
     @pytest.mark.parametrize("text", [
         "The /Temp RAM disk is ~3 MB.",
@@ -404,12 +601,6 @@ class TestTheRulesCanFail:
     ])
     def test_a_stale_figure_is_flagged(self, text: str) -> None:
         assert "stale figure" in {r for r, _ in count_and_figure_problems(text)}, text
-
-    def test_a_retraction_after_the_retirement_is_what_decides(self) -> None:
-        retired = "Keep under 15 uploads, which is retired as a hard rule."
-        taken_back = "Keep under 15 uploads, which is retired as a hard rule but still a good budget."
-        assert count_and_figure_problems(retired) == []
-        assert "count before a crash" in {r for r, _ in count_and_figure_problems(taken_back)}
 
     def test_a_stale_figure_marked_beside_it_passes(self) -> None:
         assert count_and_figure_problems(
@@ -431,11 +622,46 @@ class TestTheDeclaredLimitsStayKnown:
         )
 
     @pytest.mark.parametrize("text", [
+        "It is a crash rather than a full filesystem.",
+        # Review round 4: the one recall loss of candidate B (C64U, no crash word).
+        "Capacity was never what failed on the C64U.",
+    ])
+    def test_a_wrong_model_sentence_without_a_temp_subject_is_not_caught(self, text: str) -> None:
+        assert "filling set against crashing" in {
+            r for r, _ in count_and_figure_problems(_IN_TEMP + text)}
+        assert count_and_figure_problems(text) == [], (
+            f"now caught: {text!r}; update the module docstring's declared limits"
+        )
+
+    @pytest.mark.parametrize("text", [
+        "The listing is not a full folder dump.",
+        # Review round 4 (reviewer-4): true zero-cost statements that also name a crash.
+        "PUT machine:writemem?data= never fills /Temp, so it cannot wedge the C64U.",
+        "A post-safe device never fills /Temp, so this crash does not happen there.",
+        "The zero-cost PUT path does not fill /Temp and cannot crash the firmware.",
+    ])
+    def test_a_declared_wrong_model_false_positive_is_still_flagged(self, text: str) -> None:
+        assert "filling set against crashing" in {
+            r for r, _ in count_and_figure_problems(_IN_TEMP + text)}, (
+            f"no longer flagged: {text!r}; update the module docstring's declared limits"
+        )
+
+    @pytest.mark.parametrize("text", [
         "The budget is 6 uploads per client.",
         # Review round 3.
-        "The ~15 uploads that wedged it are not a budget, but a datapoint.",
         "The bench made 3 POSTs and nothing crashed.",
         "Each of the 4 calls can wedge the runner if it is already stuck.",
+        # #386: the five out-of-scope sentences, verbatim in shape, that keep
+        # src/** out of SCANNED (ultimate64_probe.py x4, poll_until.py x1).
+        "It is firmware-aware: on fw 3.14* it uses a >=128-byte payload to stay out "
+        "of the 48..127 POST wedge range covered by issue #84.",
+        "Must be >= 128 on fw 3.14* to stay out of the 48..127 POST wedge range (issue #84).",
+        "A healthy run issues two body-carrying POSTs, the probe write and the restore, "
+        "and never retries the probe write: retrying against an already-degraded "
+        "endpoint is the documented wedge trigger.",
+        "Per issue #107, do NOT retry with varying shapes: repeated 404 POSTs are the "
+        "TCP-wedge trigger.",
+        "The wall-clock budget is honoured to within a few milliseconds.",
     ])
     def test_a_declared_false_positive_is_still_flagged(self, text: str) -> None:
         assert count_and_figure_problems(text), (

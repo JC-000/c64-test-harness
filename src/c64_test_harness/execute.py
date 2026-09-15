@@ -1095,6 +1095,9 @@ def run_prg_via_sys(
     from .memory import write_bytes
     from .screen import _resume_quietly, wait_for_text
 
+    # First, before any config, reset, RAM write or keystroke: a flag would
+    # otherwise be typed as ``SYSTrue`` and surface as a timeout (#390).
+    refuse_bool_address(sys_addr, "run_prg_via_sys sys_addr")
     if len(prg) < 3:
         raise ValueError(f"PRG too short to contain a load address: {len(prg)} bytes")
 

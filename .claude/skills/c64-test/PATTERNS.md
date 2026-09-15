@@ -426,9 +426,10 @@ VICE warp accelerates TOD (it's virtual-CPU-clocked, not wall-clock-driven — s
 
 ### Hardware RR-Net on the U64 (external cartridge)
 
-An RR-Net-compatible cartridge in the U64's expansion port is a real CS8900a at `$DE00` with the register map above (measured on U64E fw 3.15; the C64U is unverified). Five things differ from the two-VICE bridge, none of which a VICE test can fail on (issues #207–#212; `docs/bridge_networking.md` § "Real silicon diverges from VICE"):
+An RR-Net-compatible cartridge in the U64's expansion port is a real CS8900a at `$DE00` with the register map above (measured on U64E fw 3.15; the C64U is unverified). Several things differ from the two-VICE bridge, none of which a VICE test can fail on (issues #207–#212; `docs/bridge_networking.md` § "Real silicon diverges from VICE"):
 
 - **The port is invisible until `Cartridge Preference = External`** (`CARTRIDGE_SETTINGS_CATEGORY` / `CARTRIDGE_PREFERENCE_ITEM`, package-root constants since #221). On the default `Auto` every byte of `$DE00-$DE0F` reads zero, exactly like an empty slot; `Bus Operation Mode` is irrelevant. Config PUTs are memory-only until `save_config_to_flash()`; set it per run and put the original back in a `finally` as a courtesy — it does not revert by itself (the "reverts to Auto" folk claim was neighbouring lanes' own restores, retracted 2026-09-05). `snapshot_state`/`restore_state` carry the item, so a `snap = snapshot_state(client)` before and `restore_state(client, snap)` in the `finally` covers it along with turbo/REU/SID addressing.
+- **Put `Cartridge Preference` back to `Auto`, then `reset()` and settle (the measured sequence; see SKILL 15), before any UCI use on the same device.** With External, the Command Interface slot is off the bus (measured after a reset, #359) while `Command Interface` still reads Enabled, so UCI routines raise `UCIInterfaceAbsentError` (they used to time out; #359, U64E, measured 0/3 on External against 3/3 on Auto). `restore_state(client, snap)` in the recipe below does the restore when the snapshot was taken on Auto; the reset and settle are still yours. SKILL pitfall 15 has the rest.
 - **The only presence test is the CS8900a identity read, on the 6510: PPPtr = `$0000`, PPData == `$630E`** — what ip65's `init` does before it will initialise (`drivers/cs8900a.s`; `INIT DRIVER: FAILED` is that read failing). A host-side `read_memory` of the I/O window returns bytes unrelated to the cartridge and not reproducible (`0A` ×16 and `3C 00 00 00 …` have both been observed under the same stated conditions). A 6510 raw read of `$DE00` is not a test either: zeros on `Auto`, zeros after `client.run_prg()`, zeros with no cartridge, and the chip's registers (`FF FF …`) when it is working — non-zero but not self-describing (issues #209, #211).
 - **The firmware's runner load path deselects the cartridge** (#217, n=3/arm): `client.run_prg()` and `client.load_prg()` both leave the program seeing `$DE00` dead while the config still says `External` (stock ip65 prints `INIT DRIVER: FAILED`); the deselection survives every `reset()` and only a re-PUT of `Cartridge Preference` reselects it. Deselected PP `$0000` is not reliably zeros — only `!= $630E` means anything. Start PRGs with `run_prg_via_sys(target, prg)` — write to RAM + typed `SYS` + resume, with the re-PUT done for you on a U64 (`reselect_cartridge=False` opts out).
 - **Host-side `write_memory` never reaches the cartridge on hardware** (and host reads of the window are not meaningful), so `set_cs8900a_mac()` — which works under VICE — is a silent no-op here; program the MAC from the 6510 with `cs8900a_set_mac_inline_code(mac)`.
@@ -766,8 +767,8 @@ So size the budget conservatively, as though attachments were counted: that is a
 | Call | Wire form | Leaves a `/Temp` attachment? |
 |---|---|---|
 | `client.run_prg` / `load_prg` / `run_crt` / `sid_play` / `mod_play` | POST + body | **Yes — one per call** |
-| `client.mount_disk(...)` | **POST** + multipart body (`mount_disk` in `ultimate64_client.py`) | **Yes — one per call** |
-| `client.drive_load_rom(..., bytes)` | **PUT** + multipart body (`drive_load_rom`, same module) | **Yes — one per call** |
+| `client.mount_disk(...)` | **POST** + single-part multipart body, `type`/`mode` as query arguments (`mount_disk` in `ultimate64_client.py`; before #311 it sent them as form fields ahead of the image, which the U64E rejected with HTTP 400 `Invalid Type ''`) | **Yes — one per call** |
+| `client.drive_load_rom(..., bytes)` | **POST** + single-part multipart body with no `filename=`, so the attachment keeps its GC-collectable `temp%04x` name; only 16384/32768-byte ROMs are sent (`drive_load_rom`, same module; it PUT the body until #253, which the firmware rejects with HTTP 400) | **Yes — one per call** |
 | `client.write_mem(addr, data)` where `len(data) > write_mem_query_threshold` | POST + body | **Yes — one per call** |
 | `client.write_mem(addr, data)` where `len(data) <= write_mem_query_threshold` | `PUT ?data=<hex>` | No |
 | `reset` / `reboot` / `pause` / `resume` / `menu_button`, every `configs:*`, the drive-slot verbs, `mount_disk_path`, stream start/stop | PUT, no body | No |
@@ -807,7 +808,7 @@ Four consequences to know before writing the loop:
 | `build_socket_read` | **149** (**449**) | defaults | **yes** |
 | `build_tcp_connect`, `build_udp_connect` | **159** (**484**) | defaults | **yes** |
 | `build_socket_write` | **170** (**421**) | payload-independent — 170 at payloads 0, 10, 128, 800, 892 | **yes** |
-| `build_tx_code` / `build_rx_peek_code` | 79 / 64 | size-invariant — 79 at `frame_len` 42, 64, 256; 64 at `batch_size` 1, 8, 32 | no |
+| `build_tx_code` / `build_rx_peek_code` | 99-120 / 64 | 99 at `frame_len` 42, 60, 256; 104 at 512, 1024 (whole pages); 120 at 258, 1514 (#404 page loop); 64 at `batch_size` 1, 8, 32 | no |
 | the eight `cs8900a_*` snippets | **18-69** | `linectl_or_inline` 18, `rxctl_inline` 28, `rxctl` 29, `write_linectl(0,0)` 29, `read_linectl` 31, `enable_inline` 46, `set_mac_inline` 60, `set_mac` 69 (`bridge_ping.py:663,677,688,707,717,749,758,773`) | no |
 | `build_rx_echo_reply_code` | **193** | invariant in `identifier` / `sequence` | **yes** |
 | `build_ping_and_wait_code` | **256** | plain — no ARP, no drain | **yes** |

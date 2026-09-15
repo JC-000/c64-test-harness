@@ -57,8 +57,18 @@ never skips on it, is not gated.
 **Which modules are scanned** (#375): every ``test_*_live.py``, plus any
 ``tests/**/test_*.py`` that reads ``U64_HOST`` from the environment -- at
 import time always, and anywhere else unless the module supplies its own
-``U64_HOST`` (``monkeypatch.setenv``/``delenv``/``setitem``,
-``mock.patch.dict``, ``putenv``, an ``os.environ`` store or delete).  The gate
+``U64_HOST`` (``monkeypatch.setenv``/``setitem``, ``mock.patch.dict``,
+``putenv``, ``setdefault``, an ``os.environ`` store).  Removing the variable
+(``delenv``, ``delitem``, ``unsetenv``, ``pop``, ``del``) supplies nothing --
+it means "no host" and cannot make a read elsewhere in the file safe -- so it
+does not exempt a module (#396); nor does storing a blank literal -- ``""``,
+whitespace such as ``" "``, or an f-string of only such text (``f''``) --
+which the harness strips and reads as "no host" too (#411).  Literals only:
+a blank value the scanner would have to compute still counts as a supply --
+``str()``, a name bound to ``""``, a for-loop target
+(``for os.environ['U64_HOST'] in ['']``), a tuple unpack
+(``os.environ['U64_HOST'], x = '', 1``), an augmented store (``+= ''``), and a
+dict literal that repeats the key with a real value before a blank one.  The gate
 protects the device the operator named, and a test reaches that device only
 through the ``U64_HOST`` the operator exported: a module that sets the
 variable itself is driving the harness against a host it chose
@@ -103,9 +113,12 @@ reads more into a green run:**
   ``monkeypatch.setenv``, anywhere in the file) arms its own gate.  A store
   through an alias or a computed key is not seen.
 * Module selection is by name as well: a module outside ``test_*_live.py``
-  that reads the host through an alias or a helper, or reads it only inside
-  a function while also setting ``U64_HOST`` elsewhere in the file, is not
-  scanned (#375).
+  that reads the host through an alias or a helper is not scanned (#375).
+  The supply check is **file-wide**: a module that reads the operator's host
+  inside one function while *setting* ``U64_HOST`` (not removing it) in
+  another is not scanned either (#396 narrowed this to stores; scoping it to
+  the reading function would newly select ``test_device_lock_advisory.py``,
+  whose read and store sit in different tests).
 * A rebinding through ``globals()['_M'] = '1'`` (or ``setattr`` on the
   module) is not seen by the binder.
 """
@@ -908,12 +921,13 @@ def _live_modules() -> list[Path]:
 #: The environment variable that names the device a test drives.
 HOST_VAR = "U64_HOST"
 
-#: Calls that set or remove an environment key given as the first argument.
-_HOST_KEY_FIRST = frozenset({
-    "setenv", "delenv", "putenv", "unsetenv", "setdefault", "pop", "__setitem__", "__delitem__",
-})
-#: Calls that set or remove a mapping key given as the second argument (``monkeypatch.setitem``).
-_HOST_KEY_SECOND = frozenset({"setitem", "delitem"})
+#: Calls that set an environment key given as the first argument.  Removals
+#: (``delenv``, ``unsetenv``, ``pop``, ``__delitem__``) are deliberately absent:
+#: they supply no host (#396).
+_HOST_KEY_FIRST = frozenset({"setenv", "putenv", "setdefault", "__setitem__"})
+#: Calls that set a mapping key given as the second argument (``monkeypatch.setitem``;
+#: ``delitem`` is a removal, absent for the same reason).
+_HOST_KEY_SECOND = frozenset({"setitem"})
 
 
 def _is_host_key(node: ast.AST | None) -> bool:
@@ -935,29 +949,80 @@ def reads_the_host_at_import(tree: ast.Module) -> bool:
     )
 
 
+def _names_a_host(value: ast.AST | None) -> bool:
+    """Whether a stored value can name a host: anything but a blank literal.
+
+    The harness strips ``U64_HOST`` before deciding there is a host
+    (``tests/conftest.py`` ``env.strip()``, ``backends/unified_manager.py``
+    ``h.strip()``), so storing ``""`` or ``" "`` -- or an f-string made only of
+    such literal text, ``f''`` included -- supplies nothing, exactly like a
+    removal (#411).  A missing or non-literal value is assumed to name one.
+    """
+    if isinstance(value, ast.Constant):
+        return not (isinstance(value.value, str) and not value.value.strip())
+    if isinstance(value, ast.JoinedStr):
+        parts = value.values
+        literal = all(isinstance(p, ast.Constant) and isinstance(p.value, str) for p in parts)
+        return not (literal and not "".join(p.value for p in parts).strip())
+    return True
+
+
+def _call_value(call: ast.Call, index: int, keywords: tuple[str, ...]) -> ast.AST | None:
+    """The value argument of a store call: positional *index*, else a keyword."""
+    if len(call.args) > index:
+        return call.args[index]
+    return next((kw.value for kw in call.keywords if kw.arg in keywords), None)
+
+
 def supplies_its_own_host(tree: ast.AST) -> bool:
-    """The module sets or removes ``U64_HOST`` itself, anywhere in the file."""
+    """The module sets ``U64_HOST`` to a host itself, anywhere in the file.
+
+    Only a store counts.  A removal (``delenv``, ``del os.environ[...]``) says
+    "no host": it cannot make a read of the operator's host in another
+    function of the same file safe, so it does not exempt the module (#396).
+    A store of the literal empty string says the same and is treated alike
+    (#411).
+    """
+    # Subscript stores whose assigned value is the literal "" (plain, chained
+    # or annotated assignment); every other environ subscript store supplies.
+    empty_targets: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and not _names_a_host(node.value):
+            empty_targets.update(id(t) for t in node.targets)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None and not _names_a_host(node.value):
+            empty_targets.add(id(node.target))
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Subscript)
-            and isinstance(node.ctx, (ast.Store, ast.Del))
+            and isinstance(node.ctx, ast.Store)
             and _is_environ(node.value)
             and _is_host_key(node.slice)
+            and id(node) not in empty_targets
         ):
             return True
         if isinstance(node, ast.Call):
             name = _callee_name(node)
             args = node.args
-            if name in _HOST_KEY_FIRST and args and _is_host_key(args[0]):
+            if (
+                name in _HOST_KEY_FIRST and args and _is_host_key(args[0])
+                and _names_a_host(_call_value(node, 1, ("value", "default")))
+            ):
                 return True
-            if name in _HOST_KEY_SECOND and len(args) > 1 and _is_host_key(args[1]):
+            if (
+                name in _HOST_KEY_SECOND and len(args) > 1 and _is_host_key(args[1])
+                and _names_a_host(_call_value(node, 2, ("value",)))
+            ):
                 return True
             if name in ("dict", "update") and (
                 any(
-                    isinstance(arg, ast.Dict) and any(_is_host_key(k) for k in arg.keys)
+                    isinstance(arg, ast.Dict)
+                    and any(
+                        _is_host_key(k) and _names_a_host(v)
+                        for k, v in zip(arg.keys, arg.values)
+                    )
                     for arg in args
                 )
-                or any(kw.arg == HOST_VAR for kw in node.keywords)
+                or any(kw.arg == HOST_VAR and _names_a_host(kw.value) for kw in node.keywords)
             ):
                 return True
     return False
@@ -1089,19 +1154,97 @@ class TestModuleSelection:
         ("NAME = 'U64_HOST'\ndef test_a():\n    return 'needs U64_HOST'\n", False),
         ("import os\ndef test_a(monkeypatch):\n    monkeypatch.setenv('U64_HOST', '10.0.0.1')\n"
          "    Client(os.environ.get('U64_HOST'))\n", False),
-        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.delenv('U64_HOST', raising=False)\n"
-         "    os.environ.get('U64_HOST')\n", False),
         ("import os\ndef test_a(monkeypatch):\n    monkeypatch.setitem(os.environ, 'U64_HOST', 'x')\n"
          "    os.environ.get('U64_HOST')\n", False),
         ("import os\nfrom unittest import mock\n"
          "@mock.patch.dict(os.environ, {'U64_HOST': 'x'})\ndef test_a():\n    os.environ.get('U64_HOST')\n", False),
         ("import os\ndef test_a():\n    os.environ['U64_HOST'] = 'x'\n    os.environ.get('U64_HOST')\n", False),
+        ("import os\ndef test_a():\n    os.environ.setdefault('U64_HOST', 'x')\n    os.environ.get('U64_HOST')\n", False),
         ("import os\n_H = os.environ.get('U64_HOST')\n"
          "def test_a(monkeypatch):\n    monkeypatch.setenv('U64_HOST', 'x')\n", True),
+        # #396: removing the variable says "no host"; it supplies nothing, so it
+        # cannot make a read of the operator's host elsewhere in the file safe.
+        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.delenv('U64_HOST', raising=False)\n"
+         "    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.delitem(os.environ, 'U64_HOST', raising=False)\n"
+         "    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a():\n    os.environ.pop('U64_HOST', None)\n    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a():\n    os.unsetenv('U64_HOST')\n    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a():\n    del os.environ['U64_HOST']\n    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a():\n    os.environ.__delitem__('U64_HOST')\n    os.environ.get('U64_HOST')\n", True),
+        # #411: storing the literal empty string is "no host" too -- the harness
+        # treats ``U64_HOST=`` as unset -- so, like a removal, it exempts nothing.
+        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.setenv('U64_HOST', '')\n"
+         "    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.setenv('U64_HOST', value='')\n"
+         "    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.setitem(os.environ, 'U64_HOST', '')\n"
+         "    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a():\n    os.environ['U64_HOST'] = ''\n    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a():\n    os.environ['U64_HOST']: str = ''\n    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a():\n    os.environ.setdefault('U64_HOST', '')\n    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a():\n    os.putenv('U64_HOST', '')\n    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a():\n    os.environ.__setitem__('U64_HOST', '')\n    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a():\n    os.environ.update({'U64_HOST': ''})\n    os.environ.get('U64_HOST')\n", True),
+        ("import os\nfrom unittest import mock\n"
+         "@mock.patch.dict(os.environ, {'U64_HOST': ''})\ndef test_a():\n    os.environ.get('U64_HOST')\n", True),
+        ("import os\nfrom unittest import mock\n"
+         "@mock.patch.dict(os.environ, U64_HOST='')\ndef test_a():\n    os.environ.get('U64_HOST')\n", True),
+        # #441 review: the remaining recognised store forms, one case each.
+        ("import os\ndef test_a():\n    os.environ.setdefault('U64_HOST', default='')\n"
+         "    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.setitem(os.environ, 'U64_HOST', value='')\n"
+         "    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a():\n    os.environ['U64_HOST'] = y = ''\n    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a():\n    y = os.environ['U64_HOST'] = ''\n    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a():\n    os.environ.update(U64_HOST='')\n    os.environ.get('U64_HOST')\n", True),
+        # The harness strips the host, so blank text is "no host" as well.
+        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.setenv('U64_HOST', ' ')\n"
+         "    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.setenv('U64_HOST', f'')\n"
+         "    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.setenv('U64_HOST', f' \\t')\n"
+         "    os.environ.get('U64_HOST')\n", True),
+        # #411 controls: a non-blank or non-literal value still supplies a host,
+        # and one real store anywhere keeps the file-wide exemption.
+        ("import os\ndef test_a(monkeypatch, h):\n    monkeypatch.setenv('U64_HOST', f' {h}')\n"
+         "    os.environ.get('U64_HOST')\n", False),
+        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.setenv('U64_HOST', f' h')\n"
+         "    os.environ.get('U64_HOST')\n", False),
+        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.setenv('U64_HOST', 0)\n"
+         "    os.environ.get('U64_HOST')\n", False),
+        ("import os\ndef test_a(monkeypatch, fake):\n    monkeypatch.setenv('U64_HOST', fake)\n"
+         "    os.environ.get('U64_HOST')\n", False),
+        ("import os\ndef test_a():\n    os.environ['U64_HOST'] = x = 'h'\n    os.environ.get('U64_HOST')\n", False),
+        ("import os\nfrom unittest import mock\n"
+         "@mock.patch.dict(os.environ, U64_HOST='h')\ndef test_a():\n    os.environ.get('U64_HOST')\n", False),
+        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.setenv('U64_HOST', '')\n"
+         "def test_b(monkeypatch):\n    monkeypatch.setenv('U64_HOST', 'h')\n"
+         "    os.environ.get('U64_HOST')\n", False),
+        ("import os\ndef test_a():\n    os.environ.update({'U64_HOST': '', 'U64_HOST': 'h'})\n"
+         "    os.environ.get('U64_HOST')\n", False),
     ], ids=[
         "import-time-get", "import-time-getenv", "in-test-subscript", "no-read", "name-only",
-        "setenv-mocked", "delenv-mocked", "setitem-mocked", "patch-dict-mocked", "environ-store-mocked",
-        "import-time-read-beats-a-later-setenv",
+        "setenv-mocked", "setitem-mocked", "patch-dict-mocked", "environ-store-mocked",
+        "setdefault-mocked", "import-time-read-beats-a-later-setenv",
+        "396-delenv-is-not-a-host", "396-delitem-is-not-a-host", "396-pop-is-not-a-host",
+        "396-unsetenv-is-not-a-host", "396-del-subscript-is-not-a-host", "396-dunder-delitem-is-not-a-host",
+        "411-empty-setenv-is-not-a-host", "411-empty-setenv-value-kw-is-not-a-host",
+        "411-empty-setitem-is-not-a-host", "411-empty-environ-store-is-not-a-host",
+        "411-empty-annotated-store-is-not-a-host", "411-empty-setdefault-is-not-a-host",
+        "411-empty-putenv-is-not-a-host", "411-empty-dunder-setitem-is-not-a-host",
+        "411-empty-update-dict-is-not-a-host", "411-empty-patch-dict-is-not-a-host",
+        "411-empty-patch-dict-kw-is-not-a-host",
+        "411-empty-setdefault-default-kw-is-not-a-host", "411-empty-setitem-value-kw-is-not-a-host",
+        "411-empty-chained-store-is-not-a-host", "411-empty-chained-store-second-target-is-not-a-host",
+        "411-empty-update-kw-is-not-a-host",
+        "411-whitespace-is-not-a-host", "411-empty-fstring-is-not-a-host",
+        "411-whitespace-fstring-is-not-a-host",
+        "411-fstring-with-a-field-still-supplies-control", "411-fstring-with-text-still-supplies-control",
+        "411-non-str-constant-still-supplies-control",
+        "411-name-value-still-supplies-control",
+        "411-chained-store-still-supplies-control", "411-patch-dict-kw-still-supplies-control",
+        "411-one-real-store-keeps-the-file-exempt-control", "411-dict-with-a-real-value-supplies-control",
     ])
     def test_drives_a_named_device(self, source, drives) -> None:
         assert drives_a_named_device(ast.parse(source)) is drives
@@ -1129,6 +1272,72 @@ class TestModuleSelection:
         assert drives_a_named_device(tree)
         assert gate_offence(src, "test_x.py", {"set_turbo_mhz"}) == {"set_turbo_mhz"}
         assert ungated_tests_that_write(tree, {"set_turbo_mhz"}) == ["test_a (set_turbo_mhz)"]
+
+    #: #396, the reviewer's planted module: the fixture reads the operator's
+    #: host inside a function, one test removes the variable, another writes
+    #: config ungated.  On the base the ``delenv`` exempted the whole file.
+    PLANTED = (
+        "import os\n"
+        "import pytest\n"
+        "from c64_test_harness.backends.ultimate64_helpers import enable_uci\n"
+        "\n"
+        "@pytest.fixture\n"
+        "def client():\n"
+        "    host = os.environ.get('U64_HOST')\n"
+        "    if not host:\n"
+        "        pytest.skip('no host')\n"
+        "    return host\n"
+        "\n"
+        "def test_skips_cleanly_without_a_host(monkeypatch):\n"
+        "    monkeypatch.delenv('U64_HOST', raising=False)\n"
+        "\n"
+        "def test_enables_uci(client):\n"
+        "    enable_uci(client)\n"
+    )
+
+    def test_a_delenv_does_not_exempt_the_planted_module(self, tmp_path) -> None:
+        (tmp_path / "test_planted.py").write_text(self.PLANTED)
+        assert [p.name for p in _scanned_modules(tmp_path)] == ["test_planted.py"]
+        tree = ast.parse(self.PLANTED)
+        assert gate_offence(self.PLANTED, "test_planted.py", {"enable_uci"}) == {"enable_uci"}
+        assert ungated_tests_that_write(tree, {"enable_uci"}) == ["test_enables_uci (enable_uci)"]
+
+    @pytest.mark.parametrize("empty", [
+        "monkeypatch.setenv('U64_HOST', '')",
+        "os.environ['U64_HOST'] = ''",
+    ], ids=["setenv", "environ-store"])
+    def test_an_empty_host_store_does_not_exempt_the_planted_module(self, tmp_path, empty) -> None:
+        """#411: the reviewer's probe -- ``U64_HOST=''`` is "no host", like a removal."""
+        src = self.PLANTED.replace("monkeypatch.delenv('U64_HOST', raising=False)", empty)
+        assert src != self.PLANTED
+        (tmp_path / "test_planted.py").write_text(src)
+        assert [p.name for p in _scanned_modules(tmp_path)] == ["test_planted.py"]
+        assert gate_offence(src, "test_planted.py", {"enable_uci"}) == {"enable_uci"}
+        assert ungated_tests_that_write(ast.parse(src), {"enable_uci"}) == [
+            "test_enables_uci (enable_uci)"
+        ]
+
+    def test_the_planted_module_with_a_setenv_is_still_exempt_control(self, tmp_path) -> None:
+        """Control: the same module supplying a host (not removing it) stays out,
+        so the negative above is the delete rule, not selection of every reader."""
+        src = self.PLANTED.replace(
+            "monkeypatch.delenv('U64_HOST', raising=False)", "monkeypatch.setenv('U64_HOST', 'x')"
+        )
+        assert src != self.PLANTED
+        (tmp_path / "test_planted.py").write_text(src)
+        assert _scanned_modules(tmp_path) == []
+
+    @pytest.mark.parametrize("name", [
+        "test_device_lock_advisory.py", "test_live_fixture_teardowns.py",
+        "test_u64_runner_script_gates.py", "test_unified_manager.py", "test_wav_capture_paths.py",
+    ])
+    def test_the_corpus_modules_that_mock_the_host_stay_unselected(self, name) -> None:
+        """Controls from #396: all mocked unit/scan tests that supply or remove
+        ``U64_HOST``.  Each still exists, and none is selected."""
+        path = TESTS_DIR / name
+        assert path.is_file(), f"{name} is gone; drop it from the controls"
+        assert "U64_HOST" in path.read_text()
+        assert path not in _scanned_modules()
 
 
 class TestTheScannerItselfCanFail:

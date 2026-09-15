@@ -40,8 +40,8 @@ import pytest
 from c64_test_harness.backends.device_lock import DeviceLock, DeviceLockTimeout
 from c64_test_harness.backends.u64_audio_capture import (
     AudioCapture,
-    DEFAULT_AUDIO_PORT,
     DEFAULT_SAMPLE_RATE,
+    EPHEMERAL_AUDIO_PORT,
 )
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
 
@@ -314,12 +314,11 @@ def quad_wav(u64_client, wav_dir: Path) -> Path:
 
     # Set up audio capture
     local_ip = _detect_local_ip(u64_client.host)
-    listen_port = DEFAULT_AUDIO_PORT
-    stream_dest = f"{local_ip}:{listen_port}"
-    logger.info("Audio stream destination: %s", stream_dest)
-
+    # Ephemeral bind (#237): a fixed DEFAULT_AUDIO_PORT fails this module
+    # whenever another lane on the host holds 11001.  The destination is
+    # built from capture.port after start(), so it names the bound port.
     capture = AudioCapture(
-        port=listen_port,
+        port=EPHEMERAL_AUDIO_PORT,
         sample_rate=DEFAULT_SAMPLE_RATE,
     )
     duration = 5.0
@@ -333,7 +332,9 @@ def quad_wav(u64_client, wav_dir: Path) -> Path:
         capture.start()
         capture_started = True
 
-        # 2. Start U64 audio stream
+        # 2. Start U64 audio stream to the port actually bound
+        stream_dest = f"{local_ip}:{capture.port}"
+        logger.info("Audio stream destination: %s", stream_dest)
         u64_client.stream_audio_start(stream_dest)
         stream_started = True
         logger.info("Audio stream started")

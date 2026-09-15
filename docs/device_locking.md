@@ -46,7 +46,30 @@ one.**
 ## The rules
 
 1. **Hold the lock for the whole run, not per call.** The unit of
-   exclusion is the program on the machine, not the HTTP request.
+   exclusion is the program on the machine, not the HTTP request. This
+   is what a script does: everything under `scripts/` that drives a
+   device holds it through `scripts/_u64_host.py` `hold_device_lock(host)`.
+
+   **One deliberate exception: pytest runs lock per test, not per run.**
+   `tests/conftest.py`'s autouse `device_lock_guard` takes the lock around
+   each live test and releases it between tests, and the pytest runner
+   scripts (`run_all_u64_live.py`, `run_sid_u64_live.py`,
+   `run_u64_parallel_locked.py`) take no lock of their own. So a pytest
+   run does **not** give whole-run exclusion: a neighbouring lane can take
+   the device between two tests of your run, and device state one test
+   leaves can be seen by another lane's next test. The reason is `/Temp`
+   hygiene (issue #324). `Ultimate64Client` drains `/Temp` in two places.
+   `close()` drains a client that leaked with no lock or nesting check,
+   so `close()` still drains a leaking client under any hold. A lock
+   release callback drains it as well, and that is the only drain that
+   catches a client the test never closes. Those callbacks fire only on
+   the **outermost** release and are held weakly. An outer hold would
+   therefore defer the lock-release drain on a leak-prone device (the
+   C64U) to the end of the run, and a leaked client garbage-collected
+   before then would never drain at all. That trades a courtesy problem
+   for a hardware-safety one. If you
+   need whole-run exclusion, you need a different mechanism, not a wrapper
+   around `pytest.main`.
 2. **`run_prg` replaces the running program.** So does `run_crt`,
    `sid_play`, `reset()`, `reboot()`, and a `writemem` over live code.
    An unlocked `run_prg` is destructive, not merely rude.

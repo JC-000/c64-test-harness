@@ -509,6 +509,11 @@ def test_grading_is_logged_once_at_construction(caplog: pytest.LogCaptureFixture
         pytest.param(lambda c: c.sid_play(b"PSID"), id="sid_play"),
         pytest.param(lambda c: c.mod_play(b"MOD"), id="mod_play"),
         pytest.param(lambda c: c.mount_disk("a", b"D64", "d64"), id="mount_disk"),
+        # #253: the upload form is POST (``&attachment_writer``), so an
+        # uploaded drive ROM is one managed attachment like any other.
+        pytest.param(
+            lambda c: c.drive_load_rom("a", bytes(16384)), id="drive_load_rom_bytes_post"
+        ),
         pytest.param(
             lambda c: c.set_config_items_batch({"Cat": {"Item": "v"}}),
             id="set_config_items_batch",
@@ -538,17 +543,6 @@ def test_body_carrying_post_counts_as_a_leak(call):
         ),
         pytest.param(
             lambda c: c.drive_load_rom("a", "/Usb0/x.rom"), id="drive_load_rom_path"
-        ),
-        # The one call in this client that PUTs an actual body. The
-        # firmware's PUT drives:load_rom route binds NULL and takes a
-        # ``file`` query, so the body is ditched and no attachment is
-        # created -- a PUT with a body must not be counted just because
-        # it has one. (That the firmware's upload form for this is POST,
-        # so this call shape looks wrong on its own terms, is a separate
-        # bug; if it is fixed to POST the choke point starts counting it
-        # with no change here.)
-        pytest.param(
-            lambda c: c.drive_load_rom("a", b"ROMBYTES"), id="drive_load_rom_bytes_put"
         ),
     ],
 )
@@ -883,19 +877,22 @@ def _flat(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").replace("`", "").replace("*", ""))
 
 
-def test_the_counter_docstring_names_the_permissive_direction():
-    """#283: the residual was labelled "the safe side" and is the opposite.
+def test_the_counter_docstring_closes_the_1_1_0_gap_by_source():
+    """#283, then #417 review: the 1.1.0 PUT gap is closed by reading 1.1.0.
 
-    An uncounted attachment never advances ``_pending_temp_attachments``,
-    so the budget is never reached, the hygiene pass never fires, and the
-    counter reads zero while the device accumulates. That is the reading
-    that gets someone to keep uploading, so the label is load-bearing and
-    the word "safe" may not stand next to it.
+    #283 pinned the residual's direction: with the C64U's 1.1.0 route table
+    unread, counting POST-with-body only was the *permissive* side -- a PUT
+    that attached on 1.1.0 would never be counted, and the counter would
+    read zero while the device accumulated.  That table has now been read
+    at tag 1.1.0 (7b628eb1): every PUT route binds NULL, so no PUT attaches
+    there and the residual is gone rather than merely labelled.  The
+    docstring must carry that citation, and the "safe side" label #283
+    removed may still not come back.
     """
     flat = _flat(Ultimate64Client._creates_temp_attachment.__doc__)
-    assert "Counting POST-with-body only is the permissive side" in flat
-    assert "not the conservative one" in flat
-    assert "the gap to close, not the margin to rely on" in flat
+    assert "7b628eb1" in flat
+    assert "every PUT route binds NULL" in flat
+    assert "not available" not in flat
     assert "is the safe side of that assumption" not in flat
 
 

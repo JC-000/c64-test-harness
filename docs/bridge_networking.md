@@ -997,16 +997,43 @@ Result bytes the TX builders can now store:
   (#238), so it does not by itself show the chip dropping valid frames.
   Confirm delivery out of band — a host-side counter or capture — never
   from this byte. `build_tx_code`'s docstring now says so.
-- **`frame_len` must be even and 2..256, and violations raise at emit
-  time** ([#238](https://github.com/JC-000/c64-test-harness/issues/238)).
-  The copy loop counts in an 8-bit Y two bytes a pass. Measured on
-  hardware, 8 frames per length, delivery classified by host NIC counter
-  deltas: an **odd** length puts exactly one frame on the wire and then
-  hangs the 6510 unrecoverably, and an **even** length above 256 is a
-  silent no-op that still stores `0x01`. `build_tx_code`,
+- **`frame_len` must be even and 2..1514, and violations raise at emit
+  time** ([#238](https://github.com/JC-000/c64-test-harness/issues/238),
+  [#404](https://github.com/JC-000/c64-test-harness/issues/404)).
+  The copy loop copies two bytes a pass. Measured on hardware against the
+  old 8-bit-Y loop, 8 frames per length, delivery classified by host NIC
+  counter deltas: an **odd** length puts exactly one frame on the wire and
+  then hangs the 6510 unrecoverably, and even lengths 258–512 were each a
+  silent no-op that still stored `0x01` (longer ones fail by the same
+  mechanism, not by measurement). `build_tx_code`,
   `build_ping_and_wait_code` and `build_ping_and_wait_tod_code`
-  (`tx_frame_len`, `arp_frame_len`) now raise `ValueError` instead. Longer
-  frames would need a 16-bit counted copy — a feature, not done.
+  (`tx_frame_len`, `arp_frame_len`) raise `ValueError` for odd lengths and
+  for anything above `CS8900A_TX_MAX_FRAME_LEN` = 1514 (an Ethernet frame
+  without CRC). Since #404 a frame above 256 bytes is copied in whole pages
+  (`X` counts pages, `INC $FC` advances the pointer, as ip65's `send`
+  does) and then the even remainder; up to 256 the emitted bytes are
+  unchanged. `build_tx_code` is 99 bytes up to 256, 104 at a whole number
+  of pages and 120 otherwise — still at or under the 128-byte PUT
+  threshold. **Measured on silicon** (U64E fw 3.15 `bce4535e`, external
+  RR-Net, 2026-09-15, at 1 MHz (Turbo Control Off); not tried at 48 MHz;
+  ip65 `pingstatic` control passed first, `$630E` identity; conditions,
+  all 40 trial rows and the driver script in
+  [#404's evidence comment](https://github.com/JC-000/c64-test-harness/issues/404#issuecomment-5688922093)):
+  `build_tx_code` frames of 256/258/512/1514 bytes plus a
+  no-transmit null arm, interleaved in 8 rounds with a rotated order, one
+  UDP frame to en4's MAC per trial. Delivery was counted by `netstat -I
+  en4 -b` deltas, not by the result byte: 256 **8/8**, 258 **7/8**, 512
+  **8/8**, 1514 **8/8**, null 0/8. Every delivered trial's Ibytes delta
+  equals the frame length exactly. The one 258 miss stored
+  `RESULT_TX_NOT_READY` (`0x04`, nothing copied — the #236 bound, not the
+  copy loop), and the next trial sent normally without a reset. Its cause
+  is not established: 1 of 32 transmits, preceded by a delivered 256
+  frame (so not a busy-after-large-frame effect), and nothing
+  length-specific is shown at n=8. Cartridge
+  Preference was set `External` inside the lock and read back `Auto`
+  afterwards. Odd lengths stay refused; pad the frame by one byte
+  (the IP total-length field governs the datagram). Odd-length support is
+  [#438](https://github.com/JC-000/c64-test-harness/issues/438).
 - **The chip can be reset: `build_cs8900a_reset_code`**
   ([#234](https://github.com/JC-000/c64-test-harness/issues/234)).
   Measured: `Rdy4TxNOW` dead across 65,536 polls while every register the

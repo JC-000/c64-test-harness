@@ -453,7 +453,7 @@ resets, RAM writes and stream start/stop are outside it and not scanned.
 | `REU_READBACK_LIVE=1` (*mutate*) | `tests/test_reu_size_readback_live.py` | — | `REU Size` read-back is not stale: a differing value means a write, a flash reload or a boot in between (#168). Four tests need `U64_ALLOW_MUTATE=1` (`:112-115`) |
 | `TURBO_CONTRACT_LIVE=1` (*mutate*) | `tests/test_turbo_contract_live.py` | — | the CPU-Speed enum is a cross-generation superset; a generation-foreign speed raises locally off the probed presets |
 | `UCI_UDP_LIVE=1` (*mutate*) | `tests/test_uci_udp_send_live.py`, `tests/test_uci_udp_send_large_live.py` | UCI enabled, `reset()` + 3 s settle | one `uci_socket_write` = one datagram, no firmware coalescing; the 892-byte write ceiling. Enables `Command Interface` and puts back the value it read first (#268) |
-| `RRNET_UDP_LIVE=1` | `tests/test_rrnet_udp_send_live.py` | VICE + bridge (no U64) | VICE-side RR-Net UDP TX of a >512-byte payload, received by a host socket |
+| `RRNET_UDP_LIVE=1` | `tests/test_rrnet_udp_send_live.py` | VICE + bridge (no U64) | VICE-side RR-Net UDP TX of a 256-byte frame (the largest `build_tx_code` accepts; larger frames never delivered, #304), received by a host socket |
 | `U64_DESTRUCTIVE=1` | `tests/test_ultimate64_transport_live.py` | — | **the one `reset(scope='machine')` test** — a C64-level reset, ~8 s to come back; it also needs `U64_ALLOW_MUTATE=1`, for the same CPU-speed writes. The `set_speed`/`get_speed` tests and the device-touching `reset(scope='cpu'\|'drive')` tests need `U64_ALLOW_MUTATE=1` for the CPU-speed writes of `speed_baseline`, not for the reset (#268, #333); the read-only tests run on `U64_HOST` alone |
 | `READ_BYTES_STRESS=1` | `tests/test_read_bytes_stress_live.py` | VICE | the issue #88 `read_bytes` corruption reproducer; iteration counts and the wall cap are themselves env knobs |
 | `BRIDGE_CLEANUP_LIVE=1` | `tests/test_cleanup_vice_ports_live.py` (Linux), `tests/test_cleanup_vice_ports_macos_live.py` (macOS) | bridge up, elevation | the paired reference for live tests that mutate host network state |
@@ -575,13 +575,12 @@ project's local brief.
 Every review also enforces the C64U wedge clause. The C64 Ultimate
 (10.53.21.158, fw 1.1.0) predates GideonZ/1541ultimate#686 and never
 collects the managed `/Temp` attachments left by body-carrying REST
-calls; enough accumulation crashes the device firmware, taking REST and
-the UCI bridge down together, and only a physical power-cycle recovers it
-— with nobody physically present. The one figure in circulation, "~15
-cycles of a 63 KB PRG", was taken on the U64E at 3.14d with n unrecorded
-and is where a single reproduction stopped, not a capacity; the trigger
-threshold and the crash cause are both unestablished, and budgets are
-sized conservatively as a choice about which error to make. So a change that adds, moves, or widens such a call
+calls. The attachments fill `/Temp`, and a full `/Temp` crashes the device
+firmware, taking REST and the UCI bridge down together; only a physical
+power-cycle recovers it — with nobody physically present. No count of
+uploads before that crash is known, and none is kept (owner ruling,
+2026-09-15; #256), so budgets are sized conservatively as a choice about
+which error to make. So a change that adds, moves, or widens such a call
 must show where its hygiene comes from and must not be reachable in an
 unbounded loop, and a hygiene pass whose failure is swallowed is a
 blocker rather than a nit. Reviewers do not run live hardware

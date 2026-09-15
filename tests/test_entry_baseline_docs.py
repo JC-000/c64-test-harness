@@ -556,8 +556,21 @@ class TestTheItemCountCarriesItsScope:
     #: ``cbm`` is the harness's generation name and :func:`_flat` strips the
     #: backticks around it, so the case-sensitive tuple this replaced let
     #: "the cbm generation", "C64 ultimate" and "C64-Ultimate" through.
+    #: #372: also ``u64ii`` (the C64U firmware target), "C-64 Ultimate",
+    #: "Commodore-64 Ultimate" and "Commodore 64U"; and a trailing boundary,
+    #: without which "the C64 ultimately reads" was flagged.  Review of #407:
+    #: the plural ("the C64 Ultimates"), a space in "C 64 Ultimate", a space,
+    #: hyphen or underscore between "64" and the suffix ("c64_ultimate"), the
+    #: "U" suffix after either spelling ("C-64U", "C64-U"), and an identifier
+    #: that continues with an underscore after the C64 or u64ii spellings
+    #: ("c64_ultimate_baseline", "C64U_CAPS", "u64ii_build").  Known misses,
+    #: pinned in :func:`test_the_count_scan_known_misses`: an underscore in the
+    #: Commodore spelling ("Commodore_64 Ultimate") and a doubled separator
+    #: ("C--64 Ultimate").
     _OTHER_DEVICE = re.compile(
-        r"\bcbm\b|c64[\s-]?ultimate|commodore 64 ultimate|\bc64u\b", re.IGNORECASE
+        r"\bcbm\b|\bc[\s-]?64[\s_-]?(?:ultimates?|u)(?:_|\b)"
+        r"|\bcommodore[\s-]?64[\s-]?(?:ultimates?\b|u\b)|\bu64ii(?:_|\b)",
+        re.IGNORECASE,
     )
 
     #: The historical figure prose may still quote, bound to the one date it
@@ -852,6 +865,43 @@ class TestTheItemCountCarriesItsScope:
         assert unquoted != flat and self._residual_errors(unquoted)
         dropped = flat.replace("of 203", "")
         assert dropped != flat and self._residual_errors(dropped)
+
+    def test_the_residual_records_the_292_investigation(self) -> None:
+        """#292's 2026-09-15 findings travel with the residual.
+
+        The fresh read after the owner's power-cycle, the counting basis it
+        ruled out (every item carries ``default``), the build the device
+        reported, and the arithmetic candidate -- graded inferred, never
+        stated as the cause.
+        """
+        flat = _flat(self._u64e_record().residuals)
+        for token in (
+            "2026-09-15",
+            "power-cycle",
+            "every one of the 203 items carries both current and default",
+            "bce4535e",
+            "v3.15-132",
+            "tree diff 7f6fcb51 -> bce4535e (not a linear range)",
+            "the device read is the authority",
+            "203 was also recorded on 2026-09-05 (ce4b0af)",
+            "no counting basis for it is evidenced",
+            "unrecoverable",
+        ):
+            assert token in flat, token
+        # Review round 1 (#401): picking two items of 203 to reach 201 was
+        # number-fitting on a false premise (ce4b0af exempted six, and
+        # be99a1a removed the exemption the same day).  Deleted, not caveated.
+        assert "SID Detected Socket" not in flat
+        assert "arithmetic candidate" not in flat
+
+    def test_the_record_source_names_the_running_build(self) -> None:
+        """#401 round 1: 7f6fcb51 is where the counts were derived, not what
+        the device runs; the source field may not present it as the latter."""
+        src = _flat(self._u64e_record().source)
+        assert "comes from the flash record, not from that read" not in src
+        for token in ("v3.15-85 (7f6fcb51)", "bce4535e (v3.15-132)",
+                      "derived at 7f6fcb51"):
+            assert token in src, token
 
     # -- positive controls for the scan itself -------------------------------
 
@@ -1296,6 +1346,22 @@ _OTHER_DEVICE_VARIANTS = {
     "c64u": "the c64u",
     "C64U": "the C64U",
     "Commodore 64 ultimate": "the Commodore 64 ultimate",
+    # #372: the firmware target PATTERNS.md cites, and three more spellings.
+    "u64ii": "the u64ii build",
+    "C-64 Ultimate": "the C-64 Ultimate",
+    "Commodore-64 Ultimate": "the Commodore-64 Ultimate",
+    "Commodore 64U": "the Commodore 64U",
+    # Review of #407: plurals, and spellings the #372 pattern still missed.
+    "C64 Ultimates": "the C64 Ultimates",
+    "Commodore 64 Ultimates": "the Commodore 64 Ultimates",
+    "C-64U": "the C-64U",
+    "C64-U": "the C64-U",
+    "C 64 Ultimate": "the C 64 Ultimate",
+    "c64_ultimate": "the c64_ultimate generation",
+    "u64ii_build": "the u64ii_build tree",
+    # Re-verify of #407: identifiers continuing with an underscore.
+    "c64_ultimate_baseline": "c64_ultimate_baseline",
+    "C64U_CAPS": "C64U_CAPS",
 }
 
 #: The base sentence each variant is planted into.  It must pass alone, so
@@ -1356,6 +1422,29 @@ def test_the_count_scan_flags_every_spelling_of_the_other_device(variant: str) -
     f"{_OTHER_DEVICE_BASE}, logged with opencbm.",
     # The U64E's own product name contains "Ultimate".
     f"{_OTHER_DEVICE_BASE} on the Ultimate 64 Elite.",
+    # #372: no trailing boundary flagged "C64 ultimately".
+    f"{_OTHER_DEVICE_BASE}; the C64 ultimately reads the same.",
+    # Review of #407 (O6): the "U" suffix is a whole letter, not a word start.
+    f"{_OTHER_DEVICE_BASE} on the Commodore 64 users' machines.",
+    f"{_OTHER_DEVICE_BASE} for C64 users.",
+    # The u64ii guard stops at a letter (synthetic boundary control).
+    f"{_OTHER_DEVICE_BASE}, built from a u64iib tree.",
+    # Re-verify of #407 (X1, X2): each spelling starts at a word boundary.
+    f"{_OTHER_DEVICE_BASE}, with the rc64u flag.",
+    f"{_OTHER_DEVICE_BASE}, from the au64ii mirror.",
 ])
 def test_the_count_scan_leaves_near_misses_alone(sentence: str) -> None:
+    assert TestTheItemCountCarriesItsScope._unscoped(sentence) == []
+
+
+@pytest.mark.parametrize("sentence", [
+    f"{_OTHER_DEVICE_BASE}, unlike the Commodore_64 Ultimate.",
+    f"{_OTHER_DEVICE_BASE}, unlike the C--64 Ultimate.",
+])
+def test_the_count_scan_known_misses(sentence: str) -> None:
+    """The declared misses in ``_OTHER_DEVICE``'s comment (review of #407).
+
+    If one starts being flagged, the limit has closed: move it to
+    ``_OTHER_DEVICE_VARIANTS`` and update the comment.
+    """
     assert TestTheItemCountCarriesItsScope._unscoped(sentence) == []

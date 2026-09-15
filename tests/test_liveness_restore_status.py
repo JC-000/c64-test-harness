@@ -239,6 +239,73 @@ def test_client_liveness_probe_carries_the_restore_status(monkeypatch):
     assert r.scratch_restored is False
 
 
+# --------------------------------------------------------------------------- #
+# #328: a refused restore keeps healthy=True                                  #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("restore", [
+    (404, b""), (400, b""), (500, b""),
+    socket.timeout("t"), ConnectionResetError("r"),
+], ids=["404", "400", "500", "timeout", "reset"])
+def test_a_refused_restore_keeps_the_probe_healthy(caplog, restore):
+    """Owner decision on #328: ``healthy`` is the probe write's round trip.
+
+    The restore outcome is carried by ``scratch_restored`` and a WARNING,
+    never by demoting ``healthy`` and never by a retry POST (#107).
+    """
+    s = _Script(restore=restore)
+    with caplog.at_level(logging.DEBUG, logger=_LOGGER):
+        r = _run(s)
+    assert (r.healthy, r.failure, r.writemem_ok, r.scratch_restored) == (
+        True, None, True, False
+    )
+    assert any("$0334" in m for m in _warnings(caplog)), _warnings(caplog)
+    assert [c for c in s.calls if c[0] == "POST"] == [("POST", "write"), ("POST", "restore")]
+
+
+def test_assert_healthy_passes_on_a_refused_restore(monkeypatch, caplog):
+    """The client gate follows ``healthy``: no raise, the flag on the result."""
+    from c64_test_harness.backends.ultimate64_client import Ultimate64Client
+
+    for var in ("U64_AUTO_TEMP_GC", "U64_TEMP_GC_REQUIRED"):
+        monkeypatch.delenv(var, raising=False)
+    c = Ultimate64Client("10.0.0.1", write_mem_query_threshold=128,
+                         warn_unlocked=False, temp_hygiene=False)
+    s = _Script(restore=(404, b""))
+
+    def _sender(method, host, port, path, password, timeout, **kw):
+        return s(method, host, port, path, password, timeout, **kw)
+
+    with patch.object(probe_mod, "probe_u64", return_value=_REACHABLE), \
+            patch.object(probe_mod, "_liveness_request", _sender), \
+            caplog.at_level(logging.DEBUG, logger=_LOGGER):
+        r = c.assert_healthy()
+    assert r.healthy is True
+    assert r.scratch_restored is False
+    assert any("$0334" in m for m in _warnings(caplog)), _warnings(caplog)
+
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def test_the_328_contract_is_written_where_callers_read_it():
+    """Docs pin: the ``healthy`` field, ``assert_healthy`` and the recovery
+    doc all say a refused restore does not demote ``healthy``."""
+    from pathlib import Path
+
+    from c64_test_harness.backends.ultimate64_client import Ultimate64Client
+
+    field = _flat(LivenessResult.__doc__ or "")
+    assert "does **not** demote it" in field and "#328" in field, field
+    gate = _flat(Ultimate64Client.assert_healthy.__doc__ or "")
+    assert "Success includes a refused restore" in gate and "#328" in gate
+    recovery = _flat((Path(__file__).resolve().parent.parent
+                      / "docs" / "u64_recovery.md").read_text())
+    assert "A refused restore does not make the probe unhealthy" in recovery
+    assert "healthy=True, failure=None, scratch_restored=False" in recovery
+
+
 def test_summary_mentions_a_dirty_span():
     r = LivenessResult(
         host="h", port=80, healthy=True, reachable=True, writemem_ok=True,

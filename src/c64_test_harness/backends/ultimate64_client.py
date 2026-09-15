@@ -752,36 +752,31 @@ class Ultimate64Client:
         The firmware's route table is the authority, and it is unambiguous:
         a route either binds ``&attachment_writer`` (which streams the
         request body into a managed ``/Temp`` temp file) or binds ``NULL``
-        (the body is ditched). Every ``POST`` route in
-        ``software/api/route_*.cc`` binds a writer —
-        ``configs``, ``drives:mount``, ``drives:load_rom``,
-        ``machine:writemem``, ``runners:{run_prg,load_prg,run_crt,sidplay}``
-        — and **every** ``PUT`` route binds ``NULL``, which is why
+        (the body is ditched). Read at tag ``1.1.0`` (``7b628eb1``, the
+        C64U's firmware) in ``software/api/route_*.cc``: the upload
+        ``POST`` routes bind ``&attachment_writer`` --
+        ``route_configs.cc:251`` (``configs``), ``route_drives.cc:78``
+        (``drives:mount``), ``route_drives.cc:149`` (``drives:load_rom``),
+        ``route_machine.cc:125`` (``machine:writemem``) and
+        ``route_runners.cc:24`` / ``:60`` / ``:68`` / ``:91`` (``sidplay``,
+        ``load_prg``, ``run_prg``, ``run_crt``) -- while
+        ``route_runners.cc:125`` (``modplay``) binds ``&attachment_reu``,
+        and **every** ``PUT`` route binds ``NULL``, which is why
         ``PUT machine:writemem?data=<hex>`` and the config PUTs are free.
+        The 3.15 line pairs verbs and handlers the same way.
 
         So the rule is: a body plus ``POST``. That covers every current
-        caller and anything added later, by construction.
+        caller and anything added later, by construction.  The route table
+        establishes only that such a request *creates* an attachment; that
+        accumulated attachments crash the firmware is the owner's account
+        (CLAUDE.md), not something this citation shows.
 
-        Two deliberate conservatisms:
-
-        * ``POST runners:modplay`` binds ``&attachment_reu`` (the body
-          goes to the REU, not to ``/Temp``) and ``POST machine:input``
-          binds ``&input_json_writer``. Both are counted anyway — the
-          cost is an occasional extra hygiene pass, and neither handler
-          has been read closely enough here to certify it never touches
-          ``/Temp``.
-        * The route table read is a 3.15-line checkout. The C64U's 1.1.0
-          table is not available, so this assumes the verb/handler
-          pairing is the same there. Counting POST-with-body only is the
-          **permissive** side of that assumption, not the conservative
-          one: a PUT that *did* attach on 1.1.0 is never counted, so it
-          never advances ``_pending_temp_attachments``, the budget
-          comparison in :meth:`_before_temp_attachment` is never reached,
-          the hygiene pass never fires
-          and ``pending_temp_attachments`` reads zero while the device
-          accumulates. That is the gap to close, not the margin to rely
-          on, and one live run on a 1.1.0 device closes it. The genuinely
-          conservative half is the over-counting in the bullet above.
+        One deliberate conservatism: ``POST runners:modplay``
+        (``&attachment_reu`` -- the body goes to the REU, not to ``/Temp``)
+        and, on the 3.15 line, ``POST machine:input``
+        (``&input_json_writer``) are counted anyway.  The cost is an
+        occasional extra hygiene pass, and neither handler has been read
+        closely enough here to certify it never touches ``/Temp``.
         """
         return body is not None and method == "POST"
 
@@ -1510,6 +1505,10 @@ class Ultimate64Client:
             strictly (issue #272).  The device is healthy; the request
             was not.
         :returns: the :class:`LivenessResult` on success (healthy device).
+            **Success includes a refused restore** (issue #328): the probe
+            write round-tripped, so this returns rather than raising, with
+            ``scratch_restored=False`` and a WARNING. Check
+            ``result.scratch_restored`` if ``$0334-$03B3`` matters to you.
         """
         result = self.liveness_probe(http_timeout=http_timeout)
         if result.healthy:
@@ -2415,6 +2414,40 @@ class Ultimate64Client:
         400 for every body shape tried, multipart and raw alike.  That
         looked like "this firmware cannot accept an upload"; it was the
         wrong verb.  See :meth:`mount_disk_path` for the PUT form.
+
+        **One file part; ``type`` and ``mode`` go in the query** (#311).
+        The POST route mounts ``handler->get_filename(0)`` -- the file
+        written for the *first* multipart part -- and reads ``type`` and
+        ``mode`` from the URI query, not from form fields
+        (``route_drives.cc:140-152`` at bce4535e).  The firmware writes a
+        file for every part, form fields included, so the body used to
+        send ``mode`` and ``type`` as fields ahead of the image and part 0
+        was the ``mode`` field's text.  Measured on the U64E (fw 3.15,
+        bce4535e, 2026-09-15, n=3 per arm): that body answered HTTP 400
+        ``Invalid Type ''`` 3/3 and mounted nothing; this shape answered 200
+        3/3 and ``GET /v1/drives`` reported the uploaded image mounted.
+        ``mode`` is not visible in ``GET /v1/drives``, so that half is
+        source-read.  On the C64U (1.1.0) the same route shape is
+        source-read, not measured.
+
+        **Cost: one managed ``/Temp`` attachment per call**, which is what
+        the request choke point counts.  The part is named
+        ``image.<type>``, so on 1.1.0 (by source) it lands at
+        ``/Temp/image.<type>``, is overwritten per type rather than
+        accumulating, and never matches the GC's ``temp%04x`` pattern --
+        a sweep cannot delete the mounted image, and cannot collect it
+        either (#418).
+
+        **Same-type re-mount on 1.1.0 overwrites the mounted file**
+        (source-read, #427): ``attachment_writer.h`` ``collect()`` opens
+        ``/Temp/<filename>`` with ``FA_CREATE_ALWAYS``, so a second
+        ``mount_disk`` of the same image type overwrites that file even
+        while it is mounted.  Whether the drive holds it open is not read.
+        This exposure is new with #311 -- the old body never mounted at
+        all.  Remove the image (``drives/<d>:remove``, i.e.
+        :meth:`unmount_disk`) before mounting another of the same type.
+        On the U64E (bce4535e) a repeated name is uniquified instead
+        (``image_1.d64``; measured 2026-09-15, n=1).
         """
         if not isinstance(image, (bytes, bytearray)):
             raise TypeError("image must be bytes")
@@ -2427,7 +2460,7 @@ class Ultimate64Client:
         boundary = "----U64ClientBoundary" + uuid.uuid4().hex
         body = _build_multipart(
             boundary,
-            fields={"mode": mode, "type": image_type},
+            fields={},
             file_field="file",
             file_name=f"image.{image_type}",
             file_bytes=bytes(image),
@@ -2437,6 +2470,7 @@ class Ultimate64Client:
             path,
             body=body,
             content_type=f"multipart/form-data; boundary={boundary}",
+            query={"type": image_type, "mode": mode},
         )
 
     def mount_disk_path(
@@ -2555,23 +2589,74 @@ class Ultimate64Client:
         """Load a custom ROM into a drive slot (DESTRUCTIVE).
 
         If *rom_path_or_data* is a ``bytes``-like object, the ROM is uploaded
-        as a multipart body via PUT /v1/drives/<drive>:load_rom (mirrors the
-        ``mount_disk`` shape).  If it is a ``str``, it is treated as a
+        as a single-part multipart body via **POST**
+        /v1/drives/<drive>:load_rom.  If it is a ``str``, it is treated as a
         filename on the device's filesystem and passed via PUT
-        /v1/drives/<drive>:load_rom?file=<path>.
+        /v1/drives/<drive>:load_rom?file=<path>, with no body.
+
+        **POST for the upload, not PUT** (#253).  The firmware registers two
+        routes on this path: ``PUT`` binds ``NULL`` as its body handler and
+        requires a ``file`` query naming a ROM already on the device, while
+        ``POST`` binds ``&attachment_writer`` and loads
+        ``get_filename(0)`` -- the first multipart part, which is why the
+        body carries the file part and nothing else
+        (``software/api/route_drives.cc:290`` vs ``:312`` at bce4535e).
+        This used to PUT the body, which the route rejects.  Measured on
+        the U64E (fw 3.15, bce4535e, 2026-09-15, n=3 per arm, an empty ROM
+        part so nothing was loaded): the body-carrying PUT answered HTTP
+        400, the POST answered 412 "Drive ROM is invalid" -- the body
+        reached the ROM loader.  A successful load of a real ROM was not
+        measured, and the C64U is source-read only.
+
+        **The upload costs one managed ``/Temp`` attachment** on leak-prone
+        firmware, counted by the request choke point like every
+        body-carrying POST; the ``str`` form costs nothing.  **The part
+        carries no ``filename=``** (#417 review).  Source-read at tag 1.1.0
+        (the C64U), not measured: ``attachment_writer.h`` ``collect()``
+        creates every part as ``/Temp/temp%04x`` and renames it to
+        ``/Temp/<filename>`` only when ``filename=`` is present, and
+        ``gc_temp_folder``'s ``^temp[0-9a-fA-F]+$`` never collects the
+        renamed file -- the upload would be counted, the sweep would
+        "succeed", and the file would stay.  Unnamed, it keeps the managed
+        ``temp%04x`` name; deleting it later is harmless because
+        ``load_file`` copies the ROM into drive memory and closes the file.
+        (The U64E's bce4535e names uploads differently, via
+        ``create_temp_file("upload", ...)``, so this naming concern is a
+        1.1.0-line one.)  Measured on the U64E (fw 3.15, bce4535e,
+        2026-09-15, named vs unnamed empty part interleaved, n=3 per arm):
+        both answered 412 "Drive ROM is invalid" with drive ``a`` still on
+        ``1541.rom``, so the route accepts the unnamed part; the resulting
+        file name was not observed.
+
+        **Only 16384- or 32768-byte ROMs are sent** (#417 review).
+        ``C1541::load_dos_from_file`` (``software/drive/c1541.cc``, read at
+        bce4535e) resets the drive whenever it transferred any bytes and
+        only *then* checks the size, so a wrong-size upload leaves the
+        drive running a partial ROM and answers 412 -- and on leak-prone
+        firmware still costs the attachment.  Any other length raises
+        :class:`ValueError` before a request is made.
         """
         path = self._drive_slot_path(drive, "load_rom")
         if isinstance(rom_path_or_data, (bytes, bytearray)):
+            if len(rom_path_or_data) not in _DRIVE_ROM_SIZES:
+                raise ValueError(
+                    f"drive ROM must be {' or '.join(map(str, _DRIVE_ROM_SIZES))} bytes, "
+                    f"got {len(rom_path_or_data)}: the firmware resets the drive "
+                    f"before checking the size, so a wrong-size ROM half-loads"
+                )
             boundary = "----U64ClientBoundary" + uuid.uuid4().hex
             body = _build_multipart(
                 boundary,
                 fields={},
                 file_field="file",
-                file_name="drive.rom",
+                # No filename=: the upload keeps the GC-collectable temp%04x
+                # name (#417 review).  load_file copies the ROM into drive
+                # memory and closes the file, so a later sweep is harmless.
+                file_name=None,
                 file_bytes=bytes(rom_path_or_data),
             )
             self._request(
-                "PUT",
+                "POST",
                 path,
                 body=body,
                 content_type=f"multipart/form-data; boundary={boundary}",
@@ -2811,17 +2896,29 @@ class Ultimate64Client:
         return [str(n) for n in names]
 
 
+#: The two drive ROM lengths ``C1541::load_dos_from_file`` accepts (a 16 KiB
+#: ROM is mirrored to 32 KiB).  Anything else half-loads after a drive reset
+#: (#417 review).
+_DRIVE_ROM_SIZES = (16384, 32768)
+
+
 def _build_multipart(
     boundary: str,
     *,
     fields: dict[str, str],
     file_field: str,
-    file_name: str,
+    file_name: str | None,
     file_bytes: bytes,
 ) -> bytes:
     """Build an RFC 2388 multipart/form-data body.
 
     Order: simple fields first, file last. Line endings are CRLF.
+
+    ``file_name=None`` omits the ``filename=`` attribute from the file
+    part's ``Content-Disposition``.  The firmware's attachment writer then
+    keeps the managed ``temp%04x`` name instead of renaming the upload to
+    ``/Temp/<filename>`` (``attachment_writer.h`` ``collect()``), which is
+    the only name ``gc_temp_folder`` collects (#417 review).
     """
     crlf = b"\r\n"
     out = bytearray()
@@ -2832,11 +2929,10 @@ def _build_multipart(
         out += crlf
         out += value.encode("utf-8") + crlf
     out += b"--" + b + crlf
-    out += (
-        f'Content-Disposition: form-data; name="{file_field}"; filename="{file_name}"'
-        .encode("utf-8")
-        + crlf
-    )
+    disposition = f'Content-Disposition: form-data; name="{file_field}"'
+    if file_name is not None:
+        disposition += f'; filename="{file_name}"'
+    out += disposition.encode("utf-8") + crlf
     out += b"Content-Type: application/octet-stream" + crlf
     out += crlf
     out += file_bytes + crlf

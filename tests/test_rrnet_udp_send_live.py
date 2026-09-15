@@ -1,4 +1,4 @@
-"""Live RR-Net UDP send exemplar (VICE -> host, >512-byte payload).
+"""Live RR-Net UDP send exemplar (VICE -> host, largest frame build_tx_code takes).
 
 What this exercises
 -------------------
@@ -13,9 +13,20 @@ and asserts the payload bytes match exactly.
 
 This is the **first** UDP-aware live test in the harness -- the existing
 two-VICE bridge tests only do raw L2 frames or ICMP echo.  It is
-deliberately one-directional (C64 -> host) and uses a fixed 1024-byte
-payload so the path also covers the "frame longer than 512 bytes"
-regime that earlier exemplars never hit.
+deliberately one-directional (C64 -> host) and sends a 214-byte payload,
+which makes a 256-byte frame: the largest the original 8-bit-``Y`` copy
+loop could send (issue #238).
+
+Frames above 256 bytes are **not covered here**, and they never were.
+Until #304 this test sent a 1024-byte payload (1066-byte frame), but the
+TX copy loop then counted in an 8-bit ``Y``.  It stopped after
+``1066 & 0xFF = 42`` bytes, and VICE 3.10 ``cs8900.c:775`` transmits only
+when ``tx_count == tx_length``, so that frame never left the chip.  #238
+measured the same on hardware for even lengths 258-512; longer lengths
+fail by the same copy-loop mechanism rather than by measurement.  Since
+#404 :func:`build_tx_code` counts pages above 256 and accepts even lengths
+up to 1514; that path is pinned on the simulated chip in
+``test_cs8900a_tx_bound.py``, not by this live test.
 
 Gate
 ----
@@ -118,9 +129,13 @@ HOST_MAC_BROADCAST = b"\xff\xff\xff\xff\xff\xff"
 SRC_PORT = 49152
 DST_PORT = 51234
 
-# Payload: 1024 bytes of an easy-to-spot pattern (matches the brief).
-PAYLOAD = bytes(range(256)) * 4
-assert len(PAYLOAD) == 1024
+# Payload: an easy-to-spot pattern, sized so the frame is exactly the
+# largest the 8-bit copy loop sends: 14 + 20 + 8 + 214 = 256 (issue
+# #238/#304; longer frames take the #404 page loop, not exercised here).  tests/test_cs8900a_tx_bound.py runs this frame through
+# the simulated chip offline, since this module only runs on Linux.
+PAYLOAD = bytes(range(214))
+FRAME_LEN = 14 + 20 + 8 + len(PAYLOAD)
+assert FRAME_LEN == 256
 
 # Memory layout (mirrors test_ethernet_bridge.py: code in $C000-$C0DF,
 # result flag at $C0F0, TX frame buffer at $C100).
@@ -216,21 +231,11 @@ def single_vice_with_rrnet():
 class TestRrnetUdpSend:
     """C64 -> host UDP send via the RR-Net cartridge on the L2 bridge."""
 
-    # #304: a 1066-byte frame is beyond build_tx_code's 8-bit copy loop, so
-    # it now raises at emit time (#238).  It never delivered, even under
-    # VICE: the old loop stopped after 1066 & 0xFF = 42 bytes, and VICE 3.10
-    # cs8900.c:775 transmits only when tx_count == tx_length.  strict=True
-    # makes this fail loudly once the builder (or this payload) changes.
-    @pytest.mark.xfail(
-        raises=ValueError,
-        strict=True,
-        reason="#304: frame_len 1066 exceeds the TX copy loop; could never deliver",
-    )
-    def test_c64_sends_1024_byte_udp_datagram_to_host(
+    def test_c64_sends_256_byte_udp_frame_to_host(
         self,
         single_vice_with_rrnet: "BinaryViceTransport",
     ) -> None:
-        """Build a 1024-byte UDP frame on the host, TX from C64, host receives it."""
+        """Build a 256-byte UDP frame on the host, TX from C64, host receives it."""
         transport = single_vice_with_rrnet
 
         # ---- Build the frame on the host ----
@@ -244,8 +249,8 @@ class TestRrnetUdpSend:
             payload=PAYLOAD,
         )
         frame_len = len(frame)
-        # 14 + 20 + 8 + 1024 = 1066; no Ethernet padding for this size.
-        assert frame_len == 1066
+        # 14 + 20 + 8 + 214 = 256; no Ethernet padding for this size.
+        assert frame_len == FRAME_LEN == 256
 
         # ---- Stage host listener BEFORE C64 transmit ----
         # Bind to 0.0.0.0 (not just HOST_IP) -- the kernel still routes
