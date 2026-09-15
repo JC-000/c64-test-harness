@@ -515,7 +515,12 @@ class TestTheItemCountCarriesItsScope:
     #: 2026-09-12, unlike the U64E." names it and passed.  No C64U item
     #: count has ever been read, so a count sentence that names the C64U at
     #: all is flagged.
-    _OTHER_DEVICE = ("C64U", "C64 Ultimate")
+    #: Every alias the repo uses for that device line: the product name in
+    #: both spellings, and ``CBM`` — the harness's own generation name
+    #: (``u64_capabilities`` ``cbm``), which also covers "CBM line".
+    #: Case-sensitive on purpose: no count sentence in the lane docs uses
+    #: any of them, and lower-case ``cbm`` is a code identifier.
+    _OTHER_DEVICE = ("C64U", "C64 Ultimate", "Commodore 64 Ultimate", "CBM")
 
     #: Each measured figure bound to the **one** date it was measured on,
     #: and the date that binds to the figure (see the class docstring's
@@ -545,25 +550,42 @@ class TestTheItemCountCarriesItsScope:
     #:
     #: * ``~150 ms`` — a SocketDMA timing, README.md and REFERENCE.md;
     #: * ``"~150"`` in double quotes — the withdrawn figure *named* as a
-    #:   mention, never stated as a count, and anchored to its two actual
-    #:   sites (PATTERNS.md ``the "~150" that circulated``, the live
-    #:   docstring ``The earlier "~150" in this docstring``).  Bare quotes
-    #:   were too wide: 'The entry reset touches "~150" items on every
-    #:   device.' passed.
+    #:   mention, never stated as a count, and anchored to the **whole
+    #:   sentence** at each of its two sites (PATTERNS.md and the live
+    #:   docstring), start to end.  Two narrower anchors each let an
+    #:   assertion ride along: bare quotes passed 'The entry reset touches
+    #:   "~150" items on every device.', and a phrase anchor passed 'The
+    #:   "~150" that circulated is the reset item count on every device.'
+    #:   Rewording either sentence therefore fails the scan by design —
+    #:   update the sentence here in the same commit.
     #:
     #: Each entry's group 1 is the exempted token.  Add to this only with a
     #: referent, and never a bare token.
     _ALLOWED = (
         re.compile(r"~(150) ms\b"),
-        re.compile(r'\b[Tt]he "~(150)" that circulated\b'),
-        re.compile(r'\bThe earlier "~(150)" in this docstring\b'),
+        re.compile(
+            "^" + re.escape(
+                "So the covered figure and the all-category figure differ by "
+                "scope, not by disagreement — the \"~"
+            ) + "(150)" + re.escape(
+                "\" that circulated for months was accurate and was withdrawn "
+                "only because nobody had measured it."
+            ) + "$"
+        ),
+        re.compile(
+            "^" + re.escape("The earlier \"~") + "(150)" + re.escape(
+                "\" in this docstring had neither, was quoted downstream as "
+                "though it were a measurement, and was withdrawn for that "
+                "reason before anybody counted."
+            ) + "$"
+        ),
     )
 
     #: Vacuity floor: the scanned, non-allowlisted count occurrences each
     #: site actually contains.  A scan that finds nothing passes; so does a
     #: site whose count sentences were deleted.  Raise it when a site gains
     #: one; lowering it is a deletion and should say so in its commit.
-    _FLOOR = {"skill/PATTERNS.md": 5, "docs/development.md": 1, "live": 5}
+    _FLOOR = {"skill/PATTERNS.md": 7, "docs/development.md": 1, "live": 5}
 
     @staticmethod
     def _live_docstring() -> str:
@@ -671,6 +693,12 @@ class TestTheItemCountCarriesItsScope:
         flat = _doc("skill/PATTERNS.md")
         assert "151 items across the twelve covered categories" in flat
         assert "U64E (fw 3.15) 2026-09-12" in flat
+        # The C64U's category list HAS been read (2026-09-15, #287); only its
+        # item lists have not.  The superseded "category and item lists have
+        # never been read" must not come back beside the corrected claim.
+        assert "category and item lists have never been read" not in flat
+        assert "category list was read once (2026-09-15, 20 categories" in flat
+        assert "but its item lists never have" in flat
 
     @pytest.mark.parametrize("where", ["skill/PATTERNS.md", "live"])
     def test_the_source_derivation_is_cited_beside_the_device_read(
@@ -679,9 +707,58 @@ class TestTheItemCountCarriesItsScope:
         """Two instruments, both named.  The device read is n=1; the
         reviewer's derivation from firmware source at the flashed build is
         the second, and dropping its citation silently halves the evidence."""
-        text = _flat(self._live_docstring() if where == "live"
-                     else LANE_DOCS[where].read_text(encoding="utf-8"))
-        assert "reproduced from firmware source at 7f6fcb51 (v3.15-85)" in text, where
+        text = (self._live_docstring() if where == "live"
+                else LANE_DOCS[where].read_text(encoding="utf-8"))
+        errs = self._citation_errors(
+            text, must_name=("151", "40", "12", "203") if where != "live" else ()
+        )
+        assert not errs, (where, errs)
+
+    _CITATION = "reproduced from firmware source at 7f6fcb51 (v3.15-85)"
+
+    @classmethod
+    def _citation_errors(cls, text: str, *, must_name: tuple[str, ...] = ()) -> list[str]:
+        """The citation must not claim the one figure source did NOT reproduce.
+
+        Source gives 203, #276 recorded 201 — that disagreement is the
+        residual.  So the citation sentence may not contain 201, must come
+        before the residual paragraph, and where it sits inside a bullet
+        that also quotes 201 (PATTERNS) it must name the figures it covers
+        rather than claim "every figure in this bullet", which was the
+        round-3 overclaim.
+        """
+        flat = _flat(text)
+        sents = [s for s in re.split(r"(?<=[.!?:])\s+", flat) if cls._CITATION in s]
+        if not sents:
+            return ["the source-derivation citation is gone"]
+        errs: list[str] = []
+        for s in sents:
+            nums = set(re.findall(r"(?<![\w#.$/-])\d+(?!\w|\.\d|-\d)", s))
+            if "201" in nums:
+                errs.append(f"claims #276's 201 was reproduced: {s!r}")
+            missing = [n for n in must_name if n not in nums]
+            if missing:
+                errs.append(f"does not name the figures it covers {missing}: {s!r}")
+        residual = flat.find("Unexplained residual")
+        if residual != -1 and flat.find(cls._CITATION) > residual:
+            errs.append("the citation follows the residual, so it covers 201")
+        return errs
+
+    @pytest.mark.parametrize("label,text,must_name", [
+        ("the round-3 overclaim: bullet-wide scope, figures unnamed",
+         "Cost — 151 items on the U64E 2026-09-12 (read-only; every figure in "
+         "this bullet was also reproduced from firmware source at 7f6fcb51 "
+         "(v3.15-85) in review). Unexplained residual: #276 records \"201 "
+         "items compared\".", ("151", "40", "12", "203")),
+        ("201 named as reproduced",
+         "The 151, 40, 12, 201 and 203 figures were also reproduced from "
+         "firmware source at 7f6fcb51 (v3.15-85).", ()),
+        ("placed after the residual",
+         "Unexplained residual: two counts differ. Every figure above was "
+         "reproduced from firmware source at 7f6fcb51 (v3.15-85).", ()),
+    ])
+    def test_the_citation_check_can_fail(self, label, text, must_name) -> None:
+        assert self._citation_errors(text, must_name=must_name), label
 
     # -- the breakdown: pinned by arithmetic, not by spelling ---------------
 
@@ -847,6 +924,15 @@ class TestTheItemCountCarriesItsScope:
          'The entry reset touches "~150" items on every device.'),
         ("an unbroken tie between two different dates",
          "2026-09-10 201 2026-09-12 on the U64E."),
+        ("the Commodore 64 Ultimate named beside the U64E",
+         "The Commodore 64 Ultimate lists 151 items too, like the U64E, "
+         "2026-09-12."),
+        ("the CBM line named beside the U64E",
+         "On the CBM line the U64E's 203 items carry over, 2026-09-12."),
+        ("the anchored ~150 mention carrying an assertion",
+         'The "~150" that circulated is the reset item count on every device.'),
+        ("the live mention's opening carrying an assertion",
+         'The earlier "~150" in this docstring is the count.'),
     ])
     def test_the_scan_flags(self, label, text) -> None:
         assert self._unscoped(text), label
@@ -858,10 +944,14 @@ class TestTheItemCountCarriesItsScope:
          "#276 counted 201 on the U64E on 2026-09-10 and this read counts 203 "
          "on 2026-09-12."),
         ("a timing", "16 KiB in ~150 ms instead of >6 s."),
-        ("the withdrawn figure named, not stated",
-         'The "~150" that circulated was accurate.'),
+        ("the withdrawn figure named, not stated (PATTERNS sentence)",
+         'So the covered figure and the all-category figure differ by scope, '
+         'not by disagreement — the "~150" that circulated for months was '
+         'accurate and was withdrawn only because nobody had measured it.'),
         ("the live docstring's mention of the withdrawn figure",
-         'The earlier "~150" in this docstring had neither.'),
+         'The earlier "~150" in this docstring had neither, was quoted '
+         'downstream as though it were a measurement, and was withdrawn for '
+         'that reason before anybody counted.'),
         ("two clauses, each date before its figure (round-2 false failure)",
          "On 2026-09-10 #276 compared 201 items, and on 2026-09-12 the U64E "
          "read counted 203 items."),
