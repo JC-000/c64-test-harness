@@ -19,6 +19,7 @@ Point this at the U64E, or at nothing.
 
 from __future__ import annotations
 
+import functools
 import os
 import time
 from pathlib import Path
@@ -36,6 +37,11 @@ from c64_test_harness.backends.ultimate64_helpers import (
 )
 from c64_test_harness.memory import read_bytes, write_bytes
 from c64_test_harness.screen import wait_for_text
+from live_fixture_teardown import (
+    attempt_steps,
+    raise_teardown_failures,
+    teardown_then_release,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -126,10 +132,15 @@ def client() -> Ultimate64Client:
         lock.acquire_or_raise(timeout=120.0)
     except DeviceLockTimeout as e:
         pytest.skip(str(e))
+    client = None
+    failures: list = []
     try:
-        yield Ultimate64Client(host=_HOST, password=_PW, timeout=10.0)
+        client = Ultimate64Client(host=_HOST, password=_PW, timeout=10.0)
+        yield client
     finally:
-        lock.release()
+        steps = [] if client is None else [("client.close()", client.close)]
+        failures = teardown_then_release(steps, lock.release)
+    raise_teardown_failures("client teardown", failures)
 
 
 @pytest.fixture(scope="module")
@@ -141,12 +152,19 @@ def prg_data() -> bytes:
 @pytest.fixture(scope="module")
 def original_state(client: Ultimate64Client):
     snap = snapshot_state(client)
-    # x25519 program requires 512 KB REU for lookup tables
-    set_reu(client, enabled=True, size="512 KB")
-    time.sleep(0.5)
-    yield snap
-    restore_state(client, snap)
-    time.sleep(0.5)
+    failures: list = []
+    try:
+        # x25519 program requires 512 KB REU for lookup tables
+        set_reu(client, enabled=True, size="512 KB")
+        time.sleep(0.5)
+        yield snap
+    finally:
+        # Every exit puts the snapshot back; a failed restore is reported (#391).
+        failures = attempt_steps([
+            ("restore_state(client, snap)", functools.partial(restore_state, client, snap)),
+        ])
+        time.sleep(0.5)
+    raise_teardown_failures("original_state restore", failures)
 
 
 # ---------------------------------------------------------------------------
