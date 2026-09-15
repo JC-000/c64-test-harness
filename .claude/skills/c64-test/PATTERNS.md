@@ -748,7 +748,7 @@ For a program that drives an external cartridge (RR-Net), neither `client.run_pr
 
 **All U64 access must use DeviceLock** for cross-process safety. Use `UnifiedManager` (automatic) or wrap with `DeviceLock` in pytest fixtures.
 
-**`probe_u64(host)` is a reachability check, not a health check.** It reports `reachable=True` on a device whose `writemem` path is dead, because it never exercises a body-carrying call (issue #241). The check that would catch it, `liveness_probe()`, costs two `/Temp` attachments on leak-prone firmware (issue #250) — so there is currently no free way to tell a healthy C64U from a writemem-degraded one.
+**`probe_u64(host)` is a reachability check, not a health check.** It reports `reachable=True` on a device whose `writemem` path is dead, because it never exercises a body-carrying call (issue #241). `probe_u64(host, check_write=True)` adds a free write check, reported as `result.write_ok`. It is a query-string `PUT writemem` round trip of 8 bytes at `$0334`, restored afterwards, with zero `/Temp` cost on any firmware (#241). It mutates RAM, so hold the device's `DeviceLock`; `result.scratch_restored` says whether the span was put back. It exercises the PUT path, not POST: a device whose POST path alone is degraded still passes it. The POST check is `liveness_probe()`, which costs two `/Temp` attachments on leak-prone firmware (issue #250).
 
 ### `/Temp` attachment hygiene — the C64U wedge (read before writing any upload loop)
 

@@ -166,6 +166,7 @@ the code, the code won (issue #169).
 | `$0277-$0280` | 10 | `uci_network._execute_uci_routine`, `backends.ultimate64.Ultimate64Transport.inject_keys`, `backends.ultimate64_client.Ultimate64Client.send_text` | KERNAL KEYD — 10-byte keyboard buffer receiving "SYS<addr>\r" or injected text | KERNAL-mandated (keybuf_addr= on U64 transport) |
 | `$0314-$0315` | 2 | `sid_player.stop_sid_vice` | RAM IRQ vector (CINV) restored to $EA31; the installer stub also patches it from 6502 code | hardcoded |
 | `$0334-$0338` | 5 | `execute.jsr` | JSR addr / NOP / NOP trampoline; checkpoint at +3 | scratch_addr= |
+| `$0334-$033B` † | 8 | `backends.ultimate64_probe.probe_u64` | check_write=True only (#241): 8 bytes read, overwritten with their inverse by a query-string PUT writemem via the raw REST client (bypasses the transport MemoryPolicy) with no body and so no /Temp attachment, read back, then written back and verified; an unconfirmed restore reports ProbeResult.scratch_restored=False with a WARNING | hardcoded |
 | `$0334-$03B3` † | 128 | `backends.ultimate64_probe.liveness_probe` | 128-byte writemem POST round-trip payload via the raw REST client (bypasses the transport MemoryPolicy); original bytes written back after a round-trip or a readback mismatch; a refused restore, or a failure after the write, leaves the pattern in place and reports LivenessResult.scratch_restored=False with a WARNING | hardcoded |
 | `$0339-$033B` | 3 | `sid_player.play_sid_vice` | park JMP ($A002) executed after the installer so resume() lands in BASIC warm start | _PARK_ADDR constant |
 | `$033C-$0341` | 6 | `sid_player.play_sid_vice` | song trampoline: LDA #song / JSR init / RTS | _SONG_TRAMPOLINE_ADDR constant |
@@ -181,7 +182,7 @@ the code, the code won (issue #169).
 | `$C500-$C87D` | 894 | `uci_network.uci_socket_write (also uci_tcp_connect / uci_udp_connect with turbo_safe=True`, `and the build_socket_write turbo defaults)` | data buffer (up to 892 bytes) followed by the 2-byte LE length; turbo connect routines read the NUL-terminated hostname here; build_socket_write's turbo defaults are data $C500 and length $C87C-$C87D | hardcoded |
 | `$CF00-$CF03` | 4 | `tests/test_vice_core.py::_restore_basic (also scripts/vice_keyecho_probe.py + scripts/vice_stall_probe.py)` | CLI; JMP $E5CD stub returning the CPU to BASIC MAINLOOP before every screen/keyboard test — test-suite scratch, not library | hardcoded |
 
-† *transient* — the prior contents are written back afterwards (best-effort for the liveness probe: only on success). It does NOT mean the span is safe to execute from while the operation runs: the REU window is filled by REC DMA with the CPU live and `MemoryPolicy` cannot see that fill; on Ultimate transports `extract_reu_contents` warns when the policy declares RAM inside it (VICE's monitor holds the machine, so no warning there). Declared like every other write, but not withheld by `MemoryArbiter` by default.
+† *transient* — the prior contents are written back afterwards (best-effort for the liveness probe: only on success; for probe_u64's write check, ProbeResult.scratch_restored reports whether it was). It does NOT mean the span is safe to execute from while the operation runs: the REU window is filled by REC DMA with the CPU live and `MemoryPolicy` cannot see that fill; on Ultimate transports `extract_reu_contents` warns when the policy declares RAM inside it (VICE's monitor holds the machine, so no warning there). Declared like every other write, but not withheld by `MemoryArbiter` by default.
 <!-- END HARNESS_SCRATCH TABLE -->
 
 Reading the table:
@@ -207,6 +208,13 @@ Reading the table:
   through the raw REST client, so the transport-level policy never
   sees it.  It writes the original bytes back on success (the readback-
   failure branches leave the pattern in place), hence *transient*.
+* `backends.ultimate64_probe.probe_u64` (`check_write=True` only)
+  round-trips 8 bytes at `$0334-$033B` through the raw REST client too,
+  so the transport-level policy never sees it either.  It restores and
+  verifies the original bytes whatever the verdict; an unconfirmed
+  restore is reported as `ProbeResult.scratch_restored=False` with a
+  WARNING, hence *transient*.  Hold the device's `DeviceLock` while it
+  runs.
 * *Transient* is a narrow promise: the prior bytes are written back
   afterwards.  It does **not** mean the span is safe to execute from
   while the operation runs.  The REU staging window is the sharp case:
@@ -270,7 +278,7 @@ pass a policy whose `safe_regions` name their own window.  Pass
 allocation over the policy alone — appropriate when the caller *is*
 the harness, or has relocated every scratch address via the kwargs in
 the table.  Transient entries (the REU staging window, the liveness
-probe payload) are not withheld either way; `arbiter.reserve(...)`
+probe payload, the `probe_u64` write check) are not withheld either way; `arbiter.reserve(...)`
 them if a test needs that.
 
 The arbiter is **not** the safety mechanism — the policy on the

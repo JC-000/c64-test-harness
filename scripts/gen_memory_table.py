@@ -59,7 +59,9 @@ def render_table(regions: tuple[ScratchRegion, ...] = HARNESS_SCRATCH) -> str:
         lines.append("")
         lines.append(
             "† *transient* — the prior contents are written back afterwards "
-            "(best-effort for the liveness probe: only on success). It does "
+            "(best-effort for the liveness probe: only on success; for "
+            "probe_u64's write check, ProbeResult.scratch_restored reports "
+            "whether it was). It does "
             "NOT mean the span is safe to execute from while the operation "
             "runs: the REU window is filled by REC DMA with the CPU live and "
             "`MemoryPolicy` cannot see that fill; on Ultimate transports "

@@ -872,7 +872,7 @@ Autouse fixture in `tests/conftest.py`. Holds the device lock around every `*_li
 - `ping_host(host, timeout=2.0) -> tuple[bool, float | None]` -- ICMP ping via subprocess
 - `check_port(host, port=80, timeout=2.0) -> tuple[bool, float | None]` -- TCP connect
 - `check_api(host, port=80, timeout=3.0, password=None) -> tuple[bool, dict | None]` -- GET /v1/version
-- `probe_u64(host, port=80, password=None, ping_timeout=2.0, tcp_timeout=2.0, api_timeout=3.0, skip_ping=False, skip_api=False) -> ProbeResult` -- Full probe, fail-fast
+- `probe_u64(host, port=80, password=None, ping_timeout=2.0, tcp_timeout=2.0, api_timeout=3.0, skip_ping=False, skip_api=False, check_write=False, request=None) -> ProbeResult` -- Full probe, fail-fast. `check_write=True` adds a zero-cost query-string `PUT writemem` round trip of 8 bytes at `$0334` (inverse written, read back, restored), reported as `ProbeResult.write_ok` (`None` when not asked; `reachable` stays reads-only; PUT path only, not POST — #241). `request` is the injectable HTTP sender for that check.
 - `is_u64_reachable(host, port=80, password=None) -> bool` -- Quick boolean check
 
 **Fail-fast:** If ping fails, TCP and API checks are skipped. If TCP fails, API is skipped.

@@ -546,16 +546,20 @@ primitive that clears this state.
 The recommended order is cheapest-to-most-targeted: REST first (Tier 1
 will mask any other layer), runner second, UCI last.
 
-Start from the right instrument. **`probe_u64()` cannot see a dead write
-path**: it is an ICMP ping, a TCP connect and `GET /v1/version`, all
+Start from the right instrument. **`probe_u64()` on its defaults cannot see
+a dead write path**: it is an ICMP ping, a TCP connect and `GET /v1/version`, all
 read-only, so a device that answers every GET while rejecting memory
 writes reports `reachable=True`, `api_ok=True`, `error=None` — exactly
 the Tier-1 shape above
 ([#241](https://github.com/JC-000/c64-test-harness/issues/241)).
-`liveness_probe()` is the one that exercises a write, which is also why
+`probe_u64(..., check_write=True)` adds a write round trip: 8 bytes at
+`$0334` are read, overwritten with their inverse by a query-string
+`PUT writemem`, read back and restored, and the verdict is `write_ok`. It
+carries no body, so it costs no `/Temp` attachment on any firmware. But it
+exercises the PUT path only. A device whose POST `writemem` alone is
+degraded can still pass it; the #241 report had `PUT ?data=` answering
+200. `liveness_probe()` is the one that exercises POST, which is also why
 it costs two `/Temp` attachments on leak-prone firmware (see Tier 1).
-Those are the two halves of the same trade: the free check is blind to
-this failure, and the check that sees it is the expensive one.
 
 ```python
 from c64_test_harness import Ultimate64Client, liveness_probe, uci_wedge_probe
