@@ -582,6 +582,8 @@ The U64 path requires BASIC-READY state (the trampoline is triggered via the key
 
 See "Pattern 9a" below for the full queueing semantics, the structured `DeviceLockTimeout` diagnostics, and the anti-patterns agents repeatedly hit. The short version: with the heartbeat in place, `lock_timeout` now bounds the wait against **wedged or dead** holders only — a live, progressing holder extends the deadline indefinitely, so widening `lock_timeout` to "wait out" a busy peer is almost never the right move.
 
+Three things the short version leaves out, all in `docs/device_locking.md`: where no timeout is passed, `U64_DEVICE_LOCK_TIMEOUT` supplies it — a budget, not a gate (it changes how long a wait may last, never whether anything runs); a blocked acquire logs a periodic progress line and accepts `on_wait=cb` to observe or cancel the wait; and another thread can rescue a wait on a lock this thread already holds only within the 2.0 s grace (`_SELF_HELD_WAIT_GRACE`), past which the timeout is capped with a WARNING.
+
 ---
 
 ## Pattern 9a: Queueing for the U64 / Interpreting `DeviceLockTimeout`
@@ -679,7 +681,7 @@ def transport():
         lock.release()
 ```
 
-**`UnifiedManager` path:** `_LockedU64Manager.acquire()` now raises `DeviceLockTimeout` (previously a bare `RuntimeError`). `lock_timeout` bounds against **wedged or dead** holders only — the heartbeat makes live holders extend the deadline implicitly. 120 s is a reasonable ceiling for ad-hoc work; the historic "long benches need 1800 s" guidance no longer applies (see anti-patterns).
+**`UnifiedManager` path:** `_LockedU64Manager.acquire()` now raises `DeviceLockTimeout` (previously a bare `RuntimeError`). `lock_timeout` bounds against **wedged or dead** holders only — the heartbeat makes live holders extend the deadline implicitly. The historic "long benches need 1800 s" guidance no longer applies (see anti-patterns).
 
 ```python
 from c64_test_harness import create_manager, DeviceLockTimeout
