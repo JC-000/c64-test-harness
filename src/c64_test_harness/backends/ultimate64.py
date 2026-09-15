@@ -13,6 +13,8 @@ is intentionally **not** part of :class:`C64Transport`; consult
 """
 from __future__ import annotations
 
+from .._address import refuse_bool_address
+
 import logging
 import socket
 import time
@@ -140,7 +142,12 @@ class Ultimate64Transport(HardwareTransportBase):
     # ----- C64Transport protocol -----
 
     def read_memory(self, addr: int, length: int) -> bytes:
-        """Read *length* bytes from C64 memory via DMA."""
+        """Read *length* bytes from C64 memory via DMA.
+
+        A ``bool`` address raises :class:`ValueError` before anything else,
+        the zero-length early return included (#357).
+        """
+        refuse_bool_address(addr, "read_memory address")
         if length <= 0:
             return b""
         return self._client.read_mem(addr, length)
@@ -191,8 +198,7 @@ class Ultimate64Transport(HardwareTransportBase):
         # bool subclasses int, so True would pass the span check below and
         # reach the SocketDMA path, which never goes through the client's
         # address validation (#340).  Refused with the bad-address error.
-        if isinstance(addr, bool):
-            raise ValueError(f"write_memory address must be an int, not bool: {addr!r}")
+        refuse_bool_address(addr, "write_memory address")
         if isinstance(data, list):
             data = bytes(data)
         if not data:
@@ -491,6 +497,9 @@ class Ultimate64Transport(HardwareTransportBase):
         :raises Ultimate64Error: if SocketDMA is latched off, the connect
             fails (which also latches), or a send fails mid-transfer.
         """
+        # Before the empty-data return, the latch and the connect (#357):
+        # True would be REU offset 1.
+        refuse_bool_address(offset, "socket_dma_reu_write offset")
         if not data:
             return
         unavailable_hint = (

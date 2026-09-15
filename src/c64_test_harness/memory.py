@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ._address import refuse_bool_address
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -86,6 +88,7 @@ def read_bytes(transport: C64Transport, addr: int, length: int) -> bytes:
     Reads larger than 256 bytes are automatically chunked for reliability
     (VICE's text monitor can return incomplete data on very large reads).
     """
+    refuse_bool_address(addr, "read_bytes address")
     if length > _AUTO_CHUNK_THRESHOLD:
         return read_bytes_chunked(transport, addr, length)
     return transport.read_memory(addr, length)
@@ -109,6 +112,7 @@ def read_bytes_verified(
     else — this helper doubles the wire traffic per read and is only
     worth the cost when a flake is suspected.
     """
+    refuse_bool_address(addr, "read_bytes_verified address")
     if max_attempts < 2:
         raise ValueError(
             f"max_attempts must be >= 2 (need two reads to compare); "
@@ -139,7 +143,12 @@ def read_bytes_chunked(
     A chunk that comes back short is retried once; if it is still short,
     :class:`ShortReadError` is raised rather than silently returning a
     truncated, misaligned result.
+
+    A ``bool`` *addr* raises :class:`ValueError` before any read: ``addr +
+    offset`` would turn ``True`` into the int ``1``, hiding the flag from
+    the transport's own guard (#357).
     """
+    refuse_bool_address(addr, "read_bytes_chunked address")
     result = bytearray()
     offset = 0
     while offset < length:
@@ -170,7 +179,12 @@ def write_bytes(transport: C64Transport, addr: int, data: bytes | list[int]) -> 
     ``write_mem_query_threshold`` (128 leak-prone, 48 post-safe) — so
     each chunk takes the PUT form and none leaves a ``/Temp`` attachment,
     whatever the device grade (#252, #247).
+
+    A ``bool`` *addr* raises :class:`ValueError` before any write: the
+    chunked path's ``addr + offset`` would launder ``True`` into ``1`` past
+    the transport's own guard (#357).
     """
+    refuse_bool_address(addr, "write_bytes address")
     if isinstance(data, list):
         data = bytes(data)
     chunk = _write_chunk_size(transport)
@@ -186,12 +200,14 @@ def write_bytes(transport: C64Transport, addr: int, data: bytes | list[int]) -> 
 
 def read_word_le(transport: C64Transport, addr: int) -> int:
     """Read a 16-bit little-endian value from *addr*."""
+    refuse_bool_address(addr, "read_word_le address")
     data = transport.read_memory(addr, 2)
     return data[0] | (data[1] << 8)
 
 
 def read_dword_le(transport: C64Transport, addr: int) -> int:
     """Read a 32-bit little-endian value from *addr*."""
+    refuse_bool_address(addr, "read_dword_le address")
     data = transport.read_memory(addr, 4)
     return data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24)
 
@@ -204,6 +220,7 @@ def hex_dump(transport: C64Transport, addr: int, length: int) -> str:
         $0400: 05 18 10 20 0b 05 19 3a 20 37 03 20 06 04 20 03
         $0410: ...
     """
+    refuse_bool_address(addr, "hex_dump address")
     data = read_bytes(transport, addr, length)
     lines = []
     for i in range(0, len(data), 16):
