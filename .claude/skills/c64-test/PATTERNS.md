@@ -767,7 +767,7 @@ So size the budget conservatively, as though attachments were counted: that is a
 |---|---|---|
 | `client.run_prg` / `load_prg` / `run_crt` / `sid_play` / `mod_play` | POST + body | **Yes — one per call** |
 | `client.mount_disk(...)` | **POST** + multipart body (`mount_disk` in `ultimate64_client.py`) | **Yes — one per call** |
-| `client.drive_load_rom(..., bytes)` | **PUT** + multipart body (`drive_load_rom`, same module) | **Yes — one per call** |
+| `client.drive_load_rom(..., bytes)` | **POST** + single-part multipart body (`drive_load_rom`, same module; it PUT the body until #253, which the firmware rejects with HTTP 400) | **Yes — one per call** |
 | `client.write_mem(addr, data)` where `len(data) > write_mem_query_threshold` | POST + body | **Yes — one per call** |
 | `client.write_mem(addr, data)` where `len(data) <= write_mem_query_threshold` | `PUT ?data=<hex>` | No |
 | `reset` / `reboot` / `pause` / `resume` / `menu_button`, every `configs:*`, the drive-slot verbs, `mount_disk_path`, stream start/stop | PUT, no body | No |

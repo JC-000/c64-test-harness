@@ -917,18 +917,34 @@ def test_drive_methods_reject_invalid_drive():
         c.drive_set_mode("c", "1541")
 
 
-def test_drive_load_rom_with_bytes_uses_multipart_put():
+def test_drive_load_rom_with_bytes_uses_multipart_post():
+    """Upload is the POST form; PUT is load-from-device-path (#253).
+
+    S: ``route_drives.cc`` at bce4535e registers ``PUT drives:load_rom``
+    with a NULL body handler and ``file`` P_REQUIRED (:290), and
+    ``POST drives:load_rom`` with ``&attachment_writer`` (:312), which
+    loads ``get_filename(0)`` -- the first multipart part.  Measured on the
+    U64E (fw 3.15 bce4535e, 2026-09-15, n=3 per arm, empty ROM part so no
+    ROM loads): the body-carrying PUT answers 400; the POST answers 412
+    "Drive ROM is invalid", i.e. the body reached the ROM loader.
+    """
     mock, captured = _capture(b"")
     c = Ultimate64Client("h")
     with patch("urllib.request.urlopen", mock):
         c.drive_load_rom("a", b"\xaa\xbb\xcc")
     req = captured[0][0]
-    assert req.get_method() == "PUT"
+    assert req.get_method() == "POST"
+    # No query: the POST route takes none, and a ``file`` query would name
+    # a device path the upload does not have.
     assert req.get_full_url() == "http://h/v1/drives/a:load_rom"
     ct = req.get_header("Content-type")
     assert ct.startswith("multipart/form-data; boundary=")
-    assert b'name="file"' in req.data
-    assert b"\xaa\xbb\xcc" in req.data
+    body = req.data
+    # Exactly one part, and it is the file: get_filename(0) is what loads.
+    boundary = ct.split("boundary=", 1)[1].encode()
+    assert body.count(b"--" + boundary + b"\r\n") == 1
+    assert b'name="file"' in body and b'filename="drive.rom"' in body
+    assert b"\xaa\xbb\xcc" in body
 
 
 def test_drive_load_rom_with_str_uses_file_query():

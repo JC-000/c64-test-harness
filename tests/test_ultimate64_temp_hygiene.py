@@ -504,6 +504,11 @@ def test_grading_is_logged_once_at_construction(caplog: pytest.LogCaptureFixture
         pytest.param(lambda c: c.sid_play(b"PSID"), id="sid_play"),
         pytest.param(lambda c: c.mod_play(b"MOD"), id="mod_play"),
         pytest.param(lambda c: c.mount_disk("a", b"D64", "d64"), id="mount_disk"),
+        # #253: the upload form is POST (``&attachment_writer``), so an
+        # uploaded drive ROM is one managed attachment like any other.
+        pytest.param(
+            lambda c: c.drive_load_rom("a", b"ROMBYTES"), id="drive_load_rom_bytes_post"
+        ),
         pytest.param(
             lambda c: c.set_config_items_batch({"Cat": {"Item": "v"}}),
             id="set_config_items_batch",
@@ -533,17 +538,6 @@ def test_body_carrying_post_counts_as_a_leak(call):
         ),
         pytest.param(
             lambda c: c.drive_load_rom("a", "/Usb0/x.rom"), id="drive_load_rom_path"
-        ),
-        # The one call in this client that PUTs an actual body. The
-        # firmware's PUT drives:load_rom route binds NULL and takes a
-        # ``file`` query, so the body is ditched and no attachment is
-        # created -- a PUT with a body must not be counted just because
-        # it has one. (That the firmware's upload form for this is POST,
-        # so this call shape looks wrong on its own terms, is a separate
-        # bug; if it is fixed to POST the choke point starts counting it
-        # with no change here.)
-        pytest.param(
-            lambda c: c.drive_load_rom("a", b"ROMBYTES"), id="drive_load_rom_bytes_put"
         ),
     ],
 )

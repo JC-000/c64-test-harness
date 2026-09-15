@@ -2395,10 +2395,28 @@ class Ultimate64Client:
         """Load a custom ROM into a drive slot (DESTRUCTIVE).
 
         If *rom_path_or_data* is a ``bytes``-like object, the ROM is uploaded
-        as a multipart body via PUT /v1/drives/<drive>:load_rom (mirrors the
-        ``mount_disk`` shape).  If it is a ``str``, it is treated as a
+        as a single-part multipart body via **POST**
+        /v1/drives/<drive>:load_rom.  If it is a ``str``, it is treated as a
         filename on the device's filesystem and passed via PUT
-        /v1/drives/<drive>:load_rom?file=<path>.
+        /v1/drives/<drive>:load_rom?file=<path>, with no body.
+
+        **POST for the upload, not PUT** (#253).  The firmware registers two
+        routes on this path: ``PUT`` binds ``NULL`` as its body handler and
+        requires a ``file`` query naming a ROM already on the device, while
+        ``POST`` binds ``&attachment_writer`` and loads
+        ``get_filename(0)`` -- the first multipart part, which is why the
+        body carries the file part and nothing else
+        (``software/api/route_drives.cc:290`` vs ``:312`` at bce4535e).
+        This used to PUT the body, which the route rejects.  Measured on
+        the U64E (fw 3.15, bce4535e, 2026-09-15, n=3 per arm, an empty ROM
+        part so nothing was loaded): the body-carrying PUT answered HTTP
+        400, the POST answered 412 "Drive ROM is invalid" -- the body
+        reached the ROM loader.  A successful load of a real ROM was not
+        measured, and the C64U is source-read only.
+
+        **The upload costs one managed ``/Temp`` attachment** on leak-prone
+        firmware, counted by the request choke point like every
+        body-carrying POST; the ``str`` form costs nothing.
         """
         path = self._drive_slot_path(drive, "load_rom")
         if isinstance(rom_path_or_data, (bytes, bytearray)):
@@ -2411,7 +2429,7 @@ class Ultimate64Client:
                 file_bytes=bytes(rom_path_or_data),
             )
             self._request(
-                "PUT",
+                "POST",
                 path,
                 body=body,
                 content_type=f"multipart/form-data; boundary={boundary}",
