@@ -49,6 +49,7 @@ from c64_test_harness.memory import (
 from c64_test_harness.screen import ScreenGrid, wait_for_text
 from c64_test_harness.sid import SidFile, build_test_psid
 from c64_test_harness.sid_player import SidPlaybackError, play_sid
+from live_fixture_teardown import raise_teardown_failures, teardown_then_release
 
 _HOST = os.environ.get("U64_HOST")
 _PW = os.environ.get("U64_PASSWORD")
@@ -75,10 +76,15 @@ def transport() -> Ultimate64Transport:
     lock = DeviceLock(_HOST)
     if not lock.acquire(timeout=120.0):
         pytest.skip(f"Could not acquire device lock for {_HOST}")
-    t = Ultimate64Transport(host=_HOST, password=_PW, timeout=8.0)
-    yield t
-    t.close()
-    lock.release()
+    t = None
+    failures: list = []
+    try:
+        t = Ultimate64Transport(host=_HOST, password=_PW, timeout=8.0)
+        yield t
+    finally:
+        steps = [] if t is None else [("t.close()", t.close)]
+        failures = teardown_then_release(steps, lock.release)
+    raise_teardown_failures('feature_parity transport teardown', failures)
 
 
 # ======================================================================
