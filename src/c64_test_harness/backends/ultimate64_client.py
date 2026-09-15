@@ -2278,6 +2278,17 @@ class Ultimate64Client:
         accumulating, and never matches the GC's ``temp%04x`` pattern --
         a sweep cannot delete the mounted image, and cannot collect it
         either (#418).
+
+        **Same-type re-mount on 1.1.0 overwrites the mounted file**
+        (source-read, #427): ``attachment_writer.h`` ``collect()`` opens
+        ``/Temp/<filename>`` with ``FA_CREATE_ALWAYS``, so a second
+        ``mount_disk`` of the same image type overwrites that file even
+        while it is mounted.  Whether the drive holds it open is not read.
+        This exposure is new with #311 -- the old body never mounted at
+        all.  Remove the image (``drives/<d>:remove``, i.e.
+        :meth:`unmount_disk`) before mounting another of the same type.
+        On the U64E (bce4535e) a repeated name is uniquified instead
+        (``image_1.d64``; measured 2026-09-15, n=1).
         """
         if not isinstance(image, (bytes, bytearray)):
             raise TypeError("image must be bytes")
