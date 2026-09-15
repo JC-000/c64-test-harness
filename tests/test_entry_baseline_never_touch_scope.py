@@ -24,6 +24,23 @@ keep it that way:
   a never-touch store) at all.  That last pin is a heuristic over prose
   with positive controls below; it found no offender on master, so its red
   evidence is the planted cases, not the tree.
+
+**Declared limits of that heuristic (#358)**, each asserted in
+:class:`TestTheDeclaredLimitsStayKnown` in both directions: the sentence as
+written is *not* flagged, and the same claim with the escaping part removed
+*is*.
+
+* **E1:** "except" followed by "hygiene" waives the sentence even when the
+  hygiene pass is not the exception ("... except when the hygiene pass is
+  disabled").
+* **E2:** the entry reset as the subject of one clause waives a universal
+  claim in the next clause of the same sentence.
+* **E3:** an incidental lane-scoping phrase ("a lane that leaked nothing is
+  irrelevant here") waives the sentence.
+* **Enable after a colon:** the ``enabl...`` verb alone may not reach across a ``:``,
+  because the real corpus has "blocks nothing: it logs a WARNING that FTP File
+  Service must be enabled by hand", so "Nothing in the harness is exempt: it
+  enables FTP File Service" is not flagged.
 """
 
 from __future__ import annotations
@@ -113,17 +130,24 @@ _WHOLE = re.compile(r"\b(?:harness|package|no code|nothing|no lane|any lane|ever
                     re.IGNORECASE)
 #: A universal negation of writing.
 _NEGATED_WRITE = re.compile(
-    r"\b(?:never|nothing|no|must not|may not|cannot|does not|doesn't)\b[^.;]{0,50}?"
+    r"\b(?:never|nothing|no|must not|may not|cannot|does not|doesn't)\b(?:"
     # Not the second half of "never-touch": the red run on master matched
     # "argument and nothing else, so a direct client call bypasses the
     # never-touch list" in the baseline module, which claims nothing of the kind.
-    r"(?<!-)\b(?:writ\w*|PUT\w*|touch\w*|modif\w*)",
+    # chang/alter/set added for #358 (E6); ``set`` as a whole word only.
+    r"[^.;]{0,50}?(?<!-)\b(?:writ\w*|PUT\w*|touch\w*|modif\w*|chang\w*|alter\w*|set\b)"
+    # ``enabl`` may not reach across a colon: the corpus has "blocks nothing:
+    # it logs a WARNING that FTP File Service must be enabled by hand" (#358).
+    r"|[^.;:]{0,50}?\benabl\w*"
+    r")",
     re.IGNORECASE,
 )
 #: Phrases that scope the claim to one kind of lane or name the exception
 #: mechanism outright.
 _LANE_SCOPED = re.compile(
-    r"leaked nothing|leaks nothing|only bodyless|neither suite|"
+    # ``[\s"']+``: a source docstring split across adjacent string literals
+    # flattens to ``leaked " "nothing`` (ultimate64_client.py, #358).
+    r"leak(?:ed|s)[\s\"']+nothing|only bodyless|neither suite|"
     r"_run_temp_hygiene|hygiene pass may",
     re.IGNORECASE,
 )
@@ -221,6 +245,11 @@ class TestNoDocClaimsTheStoreIsNeverWritten:
         "No lane ever writes FTP File Service; the entry baseline is unrelated.",
         # "except" naming the item, but not as the exception.
         "The harness never writes FTP File Service, except in an emergency.",
+        # #358 (E6): the verbs past writ/PUT/touch/modif.
+        "The harness never changes FTP File Service.",
+        "Nothing in the harness alters Network Settings.",
+        "No lane may set FTP File Service.",
+        "The harness never enables FTP File Service.",
     ])
     def test_the_scan_flags(self, text: str) -> None:
         assert _unscoped_absolute_claims(text), text
@@ -241,6 +270,62 @@ class TestNoDocClaimsTheStoreIsNeverWritten:
         "Ultimate64Client.reset_config_category_to_default type-checks its "
         "argument and nothing else, so a direct client call bypasses the "
         "never-touch list entirely.",
+        # #358: the two real-corpus sentences the widened verbs would have
+        # flagged, verbatim in shape.  PATTERNS.md: "nothing" reaching across
+        # a colon to "enabled".
+        "If it fails it writes no config and blocks nothing: it logs a WARNING "
+        "that FTP File Service must be enabled by hand.",
+        # ultimate64_client.py: adjacent string literals split "leaked nothing".
+        'This client leaked " "nothing, so the harness neither enables Network '
+        'Settings > FTP " "File Service on its behalf.',
+        # ``set`` as a whole word only: "sets up" is not "set".
+        "No lane in the harness sets up Network Settings for a test.",
     ])
     def test_the_scan_leaves_scoped_statements_alone(self, text: str) -> None:
         assert not _unscoped_absolute_claims(text), text
+
+
+class TestTheDeclaredLimitsStayKnown:
+    """The module docstring's declared limits, asserted both ways (#358).
+
+    Each pair is (the sentence that escapes, the same claim without the
+    escaping part).  The first must pass and the second must be flagged, so a
+    limit that silently closes, or a heuristic that silently stops flagging
+    the underlying claim, both fail here.
+    """
+
+    PAIRS = {
+        "E1 except + hygiene": (
+            "No lane ever writes Network Settings, except when the hygiene pass is disabled.",
+            "No lane ever writes Network Settings.",
+        ),
+        "E2 entry reset subject in another clause": (
+            "The entry reset never writes it, and nothing else in the harness writes "
+            "Network Settings either.",
+            "Nothing else in the harness writes Network Settings either.",
+        ),
+        "E3 incidental lane scope": (
+            "Nothing in the harness writes FTP File Service; a lane that leaked nothing "
+            "is irrelevant here.",
+            "Nothing in the harness writes FTP File Service.",
+        ),
+        "enable after a colon": (
+            "Nothing in the harness is exempt: it enables FTP File Service.",
+            "Nothing in the harness enables FTP File Service.",
+        ),
+    }
+
+    @pytest.mark.parametrize("label", list(PAIRS))
+    def test_the_escape_is_not_flagged(self, label: str) -> None:
+        escape, _ = self.PAIRS[label]
+        assert not _unscoped_absolute_claims(escape), (
+            f"declared limit {label} is now flagged; update the module docstring"
+        )
+
+    @pytest.mark.parametrize("label", list(PAIRS))
+    def test_the_claim_without_the_escape_is_flagged(self, label: str) -> None:
+        _, bare = self.PAIRS[label]
+        assert _unscoped_absolute_claims(bare), (
+            f"{label}: the underlying claim is not flagged, so the limit is not "
+            f"what lets it through"
+        )
