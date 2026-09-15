@@ -18,7 +18,9 @@ Pinned two ways:
   contract;
 * **absence** -- no sentence in the corpus names ``U64_ALLOW_MUTATE``, a
   non-config state change (reset, reboot, RAM, memory writes, streams, "mutate
-  device state") and a requirement word (require, need, gate, additionally),
+  device state") and a requirement word or shape (require, need, gate,
+  additionally, guard, "skip unless/without", "must run/be set", "only
+  with/when", "set ... before" -- the last four added in review round 1),
   unless it carries a narrowing phrase ("config changes only", "``U64_HOST``
   alone", "stricter than the contract", "not for the reset", ...).  A config
   reason is removed from the sentence before the terms are looked for, so
@@ -63,7 +65,12 @@ _TERMS = re.compile(
 )
 #: Words that make a sentence a requirement.
 _REQUIRE = re.compile(
-    r"\b(requires?|required|requiring|needs?|needed|gated?|gates|double-gated|additionally)\b",
+    r"\b(requires?|required|requiring|needs?|needed|gated?|gates|double-gated|additionally)\b"
+    r"|\bguard(s|ed)?\b"
+    r"|\bskip(s|ped)?\s+(unless|without)\b"
+    r"|\bmust\s+(run|be\s+set)\b"
+    r"|\bonly\s+(with|when)\b"
+    r"|\bset\b[^.;]{0,60}?\bbefore\b",
     re.I,
 )
 #: A config write given as the reason; removed before the terms are looked for.
@@ -203,8 +210,17 @@ class TestThePinCanFail:
         # paraphrases
         "Stream start/stop needs U64_ALLOW_MUTATE.",
         "A test that reboots the C64 is gated on U64_ALLOW_MUTATE=1.",
+        # review round 1 (#379): requirement shapes outside require/need/gate
+        "The debug stream tests skip unless U64_ALLOW_MUTATE is set, because they "
+        "start a stream.",
+        "U64_ALLOW_MUTATE guards every state change: resets, RAM writes and streams.",
+        "Anything that starts a stream must run with U64_ALLOW_MUTATE.",
+        "Set U64_ALLOW_MUTATE before any test that writes RAM.",
+        "Resets run only with U64_ALLOW_MUTATE=1.",
     ], ids=["dev-setup", "dev-mutate-marker", "readme-comment", "readme-uci",
-            "capabilities-docstring", "feature-parity-docstring", "stream", "reboot"])
+            "capabilities-docstring", "feature-parity-docstring", "stream", "reboot",
+            "r1-skip-unless", "r1-guards", "r1-must-run", "r1-set-before",
+            "r1-only-with"])
     def test_a_retired_sentence_is_caught(self, text: str) -> None:
         assert wider_contract_claims(text)
 
@@ -219,7 +235,17 @@ class TestThePinCanFail:
         "This module also gates its resets on ``U64_ALLOW_MUTATE``, stricter than "
         "the contract.",
         "A reset needs no gate.",  # no gate named: not this pin's business
+        "They also skip without U64_ALLOW_MUTATE because they reset the C64, "
+        "stricter than the contract.",
+        # corpus near-misses for the round-1 requirement shapes, verbatim
+        # tests/test_u64_capabilities_live.py
+        "which reset the C64.  They also skip without ``U64_ALLOW_MUTATE``: stricter\n"
+        "than the contract, which covers config changes only (#333).",
+        # tests/test_ultimate64_helpers_live.py
+        "(turbo flip) runs only when ``U64_ALLOW_MUTATE`` is also set.",
+        "Set U64_ALLOW_MUTATE before any test that writes device config.",
     ], ids=["narrow", "allowed", "streams-config", "ram-config", "not-for-the-reset",
-            "stricter", "no-gate-named"])
+            "stricter", "no-gate-named", "r1-skip-without-but-stricter",
+            "r1-corpus-capabilities", "r1-corpus-helpers-only-when", "r1-set-before-config"])
     def test_a_narrow_sentence_is_not_caught(self, text: str) -> None:
         assert wider_contract_claims(text) == []
