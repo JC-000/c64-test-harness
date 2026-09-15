@@ -70,8 +70,9 @@ reads more into a green run:**
   :data:`EXCLUDED` matches by bare name too: excluding ``acquire`` excludes
   every function of that name in ``src`` (``DeviceLock.acquire`` included),
   so a future ``acquire`` that writes config would be missed.
-* It covers **config writes only**.  Resets and RAM writes are also state
-  changes under ``docs/development.md``'s wording, and are not scanned.
+* It covers **config writes only**, which is the whole contract: resets,
+  RAM writes and stream start/stop are outside ``U64_ALLOW_MUTATE`` (owner
+  decision 2026-09-15, #333) and are not scanned.
 * **Setting the gate is always an offence**, whatever the module skips on:
   a module that stores ``U64_ALLOW_MUTATE`` itself (:func:`gate_stores`:
   ``os.environ[...] =``, ``setdefault``, ``update``, ``putenv``,

@@ -9,7 +9,8 @@ Gated by ``U64_HOST`` like the other live suites, so they skip cleanly until
 a device is deliberately pointed at.
 
 Everything here is **read-only** except the tests in ``TestSocketLifetime``,
-which reset the C64 and so additionally require ``U64_ALLOW_MUTATE``.
+which reset the C64.  They also skip without ``U64_ALLOW_MUTATE``: stricter
+than the contract, which covers config changes only (#333).
 
 What each probe distinguishes
 -----------------------------
