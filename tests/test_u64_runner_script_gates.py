@@ -681,16 +681,41 @@ _BREACH_PROBES = {
         "p = ctx.Process(target=print, args=('hi',))\n"
         "p.start(); p.join()\n"
     ),
+    # Direct socket-method probes, one per forbid-list entry that nothing
+    # above reaches (``create_connection`` is blocked first, so removing
+    # ``connect``/``sendto``/``getaddrinfo`` survived as mutants). Each is a
+    # shape the harness really uses: UDP ``connect`` (render_wav_u64.py),
+    # ``sendto`` (u64_socket_dma.py), and name resolution. TEST-NET-1 only.
+    "socket.connect directly (UDP)": (
+        "import socket\n"
+        "socket.socket(socket.AF_INET, socket.SOCK_DGRAM).connect(('192.0.2.1', 9))\n"
+    ),
+    "socket.sendto directly (UDP)": (
+        "import socket\n"
+        "socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b'x', ('192.0.2.1', 9))\n"
+    ),
+    "socket.getaddrinfo directly": (
+        "import socket\nsocket.getaddrinfo('192.0.2.1', 9)\n"
+    ),
 }
 
 
-def _run_in_sandbox(script: Path) -> "subprocess.CompletedProcess[str]":
+def _run_in_sandbox(
+    script: Path, *, env: dict[str, str] | None = None
+) -> "subprocess.CompletedProcess[str]":
+    """The one sandboxed invocation. The controls verify it; the tripwire uses it.
+
+    Keeping these the same function is the point: a control that proves one
+    command line and a tripwire that runs another proves nothing about the
+    tripwire (review round 1 — a preamble-less tripwire stayed green).
+    """
     import subprocess
 
     return subprocess.run(
         [sys.executable, "-c", _SANDBOX, str(script)],
         capture_output=True,
         text=True,
+        env=env,
         timeout=10,
     )
 
@@ -776,16 +801,8 @@ def test_script_refuses_cleanly_with_no_host(
     script runs further before hitting the fork boundary). Ten subprocesses
     at ``timeout=10`` each is the worst case if one ever hangs instead.
     """
-    import subprocess
-
     env = {k: v for k, v in os.environ.items() if k != "U64_HOST"}
-    proc = subprocess.run(
-        [sys.executable, "-c", _SANDBOX, str(_SCRIPTS / script_name)],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=10,
-    )
+    proc = _run_in_sandbox(_SCRIPTS / script_name, env=env)
 
     assert proc.returncode != _BREACH_EXIT, (
         f"{script_name} got past the refusal and tried to reach the outside "
@@ -854,7 +871,24 @@ def test_the_tripwire_cannot_run_before_its_controls() -> None:
     assert "_BREACH_PROBES" in verify_source and "sys.exit(2)" in verify_source, (
         "_verify_sandbox no longer runs both the breach probes and the clean refusal"
     )
-    assert len(_BREACH_PROBES) >= 7, "breach probes were dropped"
+    assert len(_BREACH_PROBES) >= 10, "breach probes were dropped"
+
+    # The controls verify one invocation; the tripwire must use that same
+    # invocation, not build its own. Review round 1 showed the gap: a
+    # tripwire running ``[sys.executable, script]`` with no preamble left
+    # every test here green while the scripts ran with the network intact.
+    tripwire_source = inspect.getsource(test_script_refuses_cleanly_with_no_host)
+    assert "_run_in_sandbox(" in tripwire_source, (
+        "the tripwire no longer runs scripts through _run_in_sandbox, the "
+        "invocation the controls verified"
+    )
+    assert "subprocess.run" not in tripwire_source, (
+        "the tripwire builds its own subprocess invocation; the controls "
+        "verified a different one"
+    )
+    assert "_SANDBOX" in inspect.getsource(_run_in_sandbox) and (
+        "_run_in_sandbox(" in verify_source
+    ), "the controls and the tripwire no longer share one sandboxed invocation"
 
 
 @pytest.mark.parametrize(
@@ -1259,30 +1293,33 @@ def test_the_gating_scan_finds_the_modules_it_should() -> None:
         assert expected in names, f"{expected} not detected as host-binding"
 
 
-#: Lines that legitimately contain a device address, as (filename, fragment)
-#: pairs. Line-granular on purpose: a file-level exemption means one mock
-#: string disables the check for everything else in that file, and the next
-#: real regression hides behind it. Each fragment names *why* the line is
-#: allowed — a lock identity, a mock attribute, a parser input — so a new
-#: address on a new line still fails even in these files.
+#: Lines that legitimately contain a device address, as
+#: (filename, fragment, addresses) triples. Line-granular on purpose: a
+#: file-level exemption means one mock string disables the check for
+#: everything else in that file, and the next real regression hides behind
+#: it. Each fragment names *why* the line is allowed — a lock identity, a
+#: mock attribute, a parser input — and *addresses* names which device
+#: addresses that reason covers. Without the third element an entry granted
+#: for the phantom mock host also excused a real bench address on the same
+#: kind of line (review round 1).
 _ADDRESS_ALLOWLIST_LINES = {
     # Lock-file identity: the address is an arbitrary opaque key here.
-    ("test_device_lock.py", "DeviceLock("),
-    ("test_device_lock.py", "_sanitize_device_id("),
-    ("test_device_lock.py", 'info["device_host"]'),
+    ("test_device_lock.py", "DeviceLock(", frozenset({_PHANTOM_HOST})),
+    ("test_device_lock.py", "_sanitize_device_id(", frozenset({_PHANTOM_HOST})),
+    ("test_device_lock.py", 'info["device_host"]', frozenset({_PHANTOM_HOST})),
     # Mock attributes and assertions about them.
-    ("test_render_wav_u64.py", "mock_client.host"),
-    ("test_render_wav_u64.py", "mock_detect.assert_called_once_with("),
+    ("test_render_wav_u64.py", "mock_client.host", frozenset({_PHANTOM_HOST})),
+    ("test_render_wav_u64.py", "mock_detect.assert_called_once_with(", frozenset({_PHANTOM_HOST})),
     # Parser / protocol inputs and their expected outputs.
-    ("test_uci_network.py", "_make_mock_transport("),
-    ("test_uci_network.py", "assert result =="),
-    ("test_uci_network.py", "uci_tcp_connect("),
-    ("test_unified_manager.py", "_make_mock_u64_instance("),
-    ("test_unified_manager.py", "_parse_u64_hosts("),
-    ("test_unified_manager.py", "patch.dict("),
+    ("test_uci_network.py", "_make_mock_transport(", frozenset({_PHANTOM_HOST})),
+    ("test_uci_network.py", "assert result ==", frozenset({_PHANTOM_HOST})),
+    ("test_uci_network.py", "uci_tcp_connect(", frozenset({_PHANTOM_HOST})),
+    ("test_unified_manager.py", "_make_mock_u64_instance(", frozenset({_PHANTOM_HOST})),
+    ("test_unified_manager.py", "_parse_u64_hosts(", frozenset({_PHANTOM_HOST})),
+    ("test_unified_manager.py", "patch.dict(", frozenset({_PHANTOM_HOST})),
     # Parametrizes over host strings to prove hygiene is not keyed on the
     # device's address; the addresses are the test data.
-    ("test_ultimate64_temp_hygiene.py", "for host in ("),
+    ("test_ultimate64_temp_hygiene.py", "for host in (", frozenset(_BENCH_HOSTS)),
 }
 
 #: The single whole-file exemption, and the only place file granularity is
@@ -1294,10 +1331,24 @@ _ADDRESS_ALLOWLIST_LINES = {
 _ADDRESS_ALLOWLIST_FILES = {Path(__file__).name}
 
 
+def _addresses_named(text: str) -> frozenset[str]:
+    """Which device addresses *text* names, whole or by a distinctive tail."""
+    named = set()
+    for address in _DEVICE_ADDRESSES:
+        octets = address.split(".")
+        tails = {".".join(octets[i:]) for i in range(len(octets) - 1)}
+        if any(tail in text for tail in tails):
+            named.add(address)
+    return frozenset(named)
+
+
 def _allowed_address_line(filename: str, line: str) -> bool:
+    """Allowed only if a granted entry's fragment is on the line **and** every
+    address the line names is one that entry was granted for."""
+    named = _addresses_named(line)
     return any(
-        filename == allowed_file and fragment in line
-        for allowed_file, fragment in _ADDRESS_ALLOWLIST_LINES
+        filename == allowed_file and fragment in line and named <= addresses
+        for allowed_file, fragment, addresses in _ADDRESS_ALLOWLIST_LINES
     )
 
 
@@ -1448,6 +1499,18 @@ def test_an_allowlisted_file_is_not_exempt_as_a_whole() -> None:
     legitimate = '        lock = DeviceLock("192.168.1.81", lock_dir=lock_dir)'
     assert _allowed_address_line("test_device_lock.py", legitimate)
 
+    # ...and an entry is scoped to its address, not just its fragment:
+    # "uci_tcp_connect(" was granted for the phantom mock host, so a bench
+    # address on such a line is a new regression (review round 1).
+    bench_on_phantom_entry = '    uci_tcp_connect(None, "10.43.23.81", 80)'
+    assert _names_a_device(bench_on_phantom_entry)
+    assert not _allowed_address_line("test_uci_network.py", bench_on_phantom_entry), (
+        "an allowlist entry granted for one address excused a different one"
+    )
+    assert _allowed_address_line(
+        "test_uci_network.py", '    uci_tcp_connect(None, "192.168.1.81", 80)'
+    )
+
     # ...and a fragment does not leak across files.
     assert not _allowed_address_line("test_u64_syslog.py", legitimate), (
         "an allowlist fragment matched in a file it was not granted for"
@@ -1462,16 +1525,21 @@ def test_every_allowlisted_line_is_still_needed() -> None:
     stops matching, so entries are removed when their reason goes away.
     """
     unused = []
-    for allowed_file, fragment in sorted(_ADDRESS_ALLOWLIST_LINES):
+    for allowed_file, fragment, addresses in sorted(
+        _ADDRESS_ALLOWLIST_LINES, key=lambda e: (e[0], e[1])
+    ):
         path = Path(__file__).resolve().parent / allowed_file
         if not path.exists():
             unused.append(f"{allowed_file} (file is gone)")
             continue
-        if not any(
-            fragment in line and _names_a_device(line)
-            for line in path.read_text().splitlines()
-        ):
-            unused.append(f"{allowed_file}: {fragment!r}")
+        # Each granted address must still be used on such a line, so an
+        # entry cannot keep excusing an address its reason no longer needs.
+        lines = [
+            line for line in path.read_text().splitlines() if fragment in line
+        ]
+        for address in sorted(addresses):
+            if not any(address in _addresses_named(line) for line in lines):
+                unused.append(f"{allowed_file}: {fragment!r} for {address}")
     assert unused == [], f"dead allowlist entries, remove them: {unused}"
 
 
@@ -1573,14 +1641,19 @@ def _is_unset_marker(node: ast.AST) -> bool:
 
 
 def _import_time_nodes(tree: ast.Module) -> list[ast.AST]:
-    """Every node that executes at import — the binding rule's scope."""
+    """Every node that executes at import.
+
+    Class bodies are included: they run when the module is imported, so a
+    ``HOST = os.environ.get("U64_HOST", ...)`` class attribute arms a module
+    exactly like a module-level one (review round 1). Function and lambda
+    bodies, including methods, are not import-time and are skipped.
+    """
     found: list[ast.AST] = []
 
     def descend(node: ast.AST) -> None:
         for child in ast.iter_child_nodes(node):
             if isinstance(
-                child,
-                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
             ):
                 continue
             if isinstance(child, ast.If) and _is_type_checking_guard(child):
@@ -1599,8 +1672,16 @@ def _host_default_offenders(source: str) -> list[str]:
     so this catches an address no list knows about. Flags a non-empty
     default argument (positional or ``default=``), an ``or <fallback>`` after
     the read, any ``setdefault`` (which also exports the gate), and an
-    assignment into ``os.environ[...HOST...]``. Function bodies are out of
-    scope, as for the binding rule: they are not import-time.
+    assignment into ``os.environ[...HOST...]``, and a conditional expression
+    that touches a ``*HOST*`` variable while one of its branches supplies a
+    non-empty value (``env["U64_HOST"] if env.get("U64_HOST") else "..."``).
+    Class bodies are in scope (they run at import); function, method and
+    lambda bodies are not.
+
+    **Declared limit:** the variable name must be a string constant at the
+    call. ``_VAR = "U64_HOST"; os.environ.get(_VAR, "...")`` is not resolved
+    and is not flagged; the planted-regressions test asserts that, so the
+    limit stays known rather than becoming a surprise.
     """
     offenders: list[str] = []
     for node in _import_time_nodes(ast.parse(source)):
@@ -1618,6 +1699,13 @@ def _host_default_offenders(source: str) -> list[str]:
                 if _host_env_access(value) == "read" and any(
                     not _is_unset_marker(v) for v in node.values[i + 1:]
                 ):
+                    offenders.append(f"line {node.lineno}: {ast.unparse(node)}")
+                    break
+        if isinstance(node, ast.IfExp) and any(
+            _host_env_access(sub) for sub in ast.walk(node)
+        ):
+            for branch in (node.body, node.orelse):
+                if _host_env_access(branch) != "read" and not _is_unset_marker(branch):
                     offenders.append(f"line {node.lineno}: {ast.unparse(node)}")
                     break
         if (
@@ -1692,15 +1780,41 @@ def test_the_tests_scans_flag_planted_regressions(tmp_path: Path) -> None:
             'import os\ntry:\n    H = os.environ.get("U64_HOST", "x")\n'
             "except Exception:\n    pass\n"
         ),
+        # A class body executes at import (review round 1).
+        "class body": (
+            'import os\nclass TestX:\n'
+            '    HOST = os.environ.get("U64_HOST", "203.0.113.9")\n'
+        ),
+        # A conditional expression is a default in other clothes.
+        "IfExp fallback": (
+            'import os\n_HOST = os.environ["U64_HOST"] '
+            'if os.environ.get("U64_HOST") else "203.0.113.9"\n'
+        ),
     }
     for label, source in must_flag.items():
         assert _host_default_offenders(source), f"default rule missed ({label})"
+
+    # Declared limit, asserted so it stays known: an env name held in a
+    # variable is not a constant the rule can read. If this starts being
+    # caught, update _host_default_offenders' docstring.
+    held_in_variable = 'import os\n_VAR = "U64_HOST"\n_H = os.environ.get(_VAR, "203.0.113.9")\n'
+    assert not _host_default_offenders(held_in_variable), (
+        "the default rule now resolves a variable-held env name; its "
+        "docstring's declared limits say it does not"
+    )
 
     must_pass = {
         "no default": 'import os\nH = os.environ.get("U64_HOST")\n',
         "empty default": 'import os\nH = os.environ.get("U64_HOST", "")\n',
         "or None": 'import os\nH = os.environ.get("U64_HOST") or None\n',
         "function scope": 'import os\ndef f():\n    return os.environ.get("U64_HOST", "x")\n',
+        "method inside a class": (
+            'import os\nclass T:\n    def f(self):\n'
+            '        return os.environ.get("U64_HOST", "x")\n'
+        ),
+        "IfExp with only unset branches": (
+            'import os\n_H = os.environ["U64_HOST"] if os.environ.get("U64_HOST") else None\n'
+        ),
         "not a host var": 'import os\nP = os.environ.get("U64_PASSWORD", "secret")\n',
     }
     for label, source in must_pass.items():
