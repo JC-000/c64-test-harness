@@ -120,32 +120,64 @@ _NEGATED_WRITE = re.compile(
     r"(?<!-)\b(?:writ\w*|PUT\w*|touch\w*|modif\w*)",
     re.IGNORECASE,
 )
-#: Phrases that scope the claim to one mechanism or one kind of lane.
-_SCOPED = re.compile(
-    r"entry reset|entry-baseline|entry baseline|apply_factory_baseline|"
-    r"leaked nothing|leaks nothing|only bodyless|neither suite|except|exception|"
+#: Phrases that scope the claim to one kind of lane or name the exception
+#: mechanism outright.
+_LANE_SCOPED = re.compile(
+    r"leaked nothing|leaks nothing|only bodyless|neither suite|"
     r"_run_temp_hygiene|hygiene pass may",
     re.IGNORECASE,
 )
+#: "except"/"exception" scopes the claim only when what follows it names the
+#: hygiene pass or the one item it writes.  A bare keyword waived "... except
+#: in an emergency" (review round 1, Q5).
+_EXCEPTION_SCOPED = re.compile(
+    r"\bexcept(?:ion)?\b[^.;]{0,80}?(?:hygiene|FTP File Service)",
+    re.IGNORECASE,
+)
+#: The entry reset scopes the claim only as the **subject** of the negated
+#: write.  A mention elsewhere in the sentence waived "No lane ever writes FTP
+#: File Service; the entry baseline is unrelated." (review round 1, Q6).
+_ENTRY_SUBJECT = re.compile(
+    r"(?:entry[- ](?:reset|baseline)|apply_factory_baseline)(?:\s+reset)?\s+"
+    r"(?:never|must not|may not|does not|cannot)\b",
+    re.IGNORECASE,
+)
 
-_SCANNED: tuple[Path, ...] = (
+_MODULES: tuple[Path, ...] = (
+    _REPO / "src" / "c64_test_harness" / "backends" / "ultimate64_baseline.py",
+    _REPO / "src" / "c64_test_harness" / "backends" / "ultimate64_client.py",
+    _REPO / "src" / "c64_test_harness" / "backends" / "ultimate64_temp_gc.py",
+)
+#: Every doc a reader might take a rule from, globbed so a new doc is scanned
+#: without an edit here (review round 1, Q8), plus the three modules.
+_SCANNED: tuple[Path, ...] = tuple(sorted(
+    {_REPO / "README.md"}
+    | set((_REPO / "docs").glob("*.md"))
+    | set((_REPO / ".claude" / "skills" / "c64-test").glob("*.md"))
+)) + _MODULES
+#: The files that state one contract or the other.  The subject-mention
+#: vacuity guard applies to these only: most globbed docs never name the
+#: store, and that is not a hole.
+_CURATED: tuple[Path, ...] = (
     _REPO / "README.md",
     _REPO / "docs" / "development.md",
     _REPO / "docs" / "u64_recovery.md",
     _REPO / ".claude" / "skills" / "c64-test" / "SKILL.md",
     _REPO / ".claude" / "skills" / "c64-test" / "PATTERNS.md",
     _REPO / ".claude" / "skills" / "c64-test" / "REFERENCE.md",
-    _REPO / "src" / "c64_test_harness" / "backends" / "ultimate64_baseline.py",
-    _REPO / "src" / "c64_test_harness" / "backends" / "ultimate64_client.py",
-    _REPO / "src" / "c64_test_harness" / "backends" / "ultimate64_temp_gc.py",
-)
+) + _MODULES
+
+
+def _is_scoped(sentence: str) -> bool:
+    return bool(_LANE_SCOPED.search(sentence) or _EXCEPTION_SCOPED.search(sentence)
+                or _ENTRY_SUBJECT.search(sentence))
 
 
 def _unscoped_absolute_claims(text: str) -> list[str]:
     out: list[str] = []
     for sentence in re.split(r"(?<=[.!?])\s+", _flat(text)):
         if (_SUBJECT.search(sentence) and _WHOLE.search(sentence)
-                and _NEGATED_WRITE.search(sentence) and not _SCOPED.search(sentence)):
+                and _NEGATED_WRITE.search(sentence) and not _is_scoped(sentence)):
             out.append(sentence)
     return out
 
@@ -160,9 +192,22 @@ class TestNoDocClaimsTheStoreIsNeverWritten:
             f"(#263): {found!r}"
         )
 
+    def test_the_scan_covers_every_doc(self) -> None:
+        """Review round 1 (Q8): an absolute claim in a doc outside a curated
+        list (``docs/bridge_networking.md``) passed."""
+        expected = ({_REPO / "README.md"}
+                    | set((_REPO / "docs").glob("*.md"))
+                    | set((_REPO / ".claude" / "skills" / "c64-test").glob("*.md")))
+        missing = sorted(str(p.relative_to(_REPO)) for p in expected - set(_SCANNED))
+        assert not missing, missing
+        assert _REPO / "docs" / "bridge_networking.md" in _SCANNED
+
     def test_the_scanned_files_mention_the_subject(self) -> None:
-        """Vacuity guard: a scan over files that never name the store passes."""
-        for path in _SCANNED:
+        """Vacuity guard: a scan over files that never name the store passes.
+
+        Curated list only -- the globbed docs need not mention the store."""
+        assert set(_CURATED) <= set(_SCANNED)
+        for path in _CURATED:
             assert _SUBJECT.search(path.read_text(encoding="utf-8")), path
 
     @pytest.mark.parametrize("text", [
@@ -171,6 +216,11 @@ class TestNoDocClaimsTheStoreIsNeverWritten:
         "No lane may modify the never-touch stores.",
         "BASELINE_NEVER_TOUCH means the harness does not touch Network Settings at all.",
         "The package must not write FTP File Service on a shared device.",
+        # Review round 1 (Q5, Q6): a bare scoping keyword waived these.
+        "The harness never writes Network Settings, except in an emergency.",
+        "No lane ever writes FTP File Service; the entry baseline is unrelated.",
+        # "except" naming the item, but not as the exception.
+        "The harness never writes FTP File Service, except in an emergency.",
     ])
     def test_the_scan_flags(self, text: str) -> None:
         assert _unscoped_absolute_claims(text), text
@@ -184,6 +234,9 @@ class TestNoDocClaimsTheStoreIsNeverWritten:
         "Settings; it stays never-touch for the blanked password.",
         "The harness never writes a BASELINE_NEVER_TOUCH store except the one "
         "FTP File Service item the hygiene pass enables.",
+        # An exception that names the item it permits.
+        "No lane writes Network Settings, with one exception: the hygiene pass "
+        "enables FTP File Service for a client that leaked.",
         # The master-tree false positive, verbatim in shape.
         "Ultimate64Client.reset_config_category_to_default type-checks its "
         "argument and nothing else, so a direct client call bypasses the "
