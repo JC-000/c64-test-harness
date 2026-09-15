@@ -112,22 +112,23 @@ def test_a_child_process_cannot_join_the_lock_its_parent_holds(child_env) -> Non
         hard = _child(child_env, 0.5, "hard", wall=20.0)
         assert hard.stdout.split() == ["WAITING", "NOT-ACQUIRED"], hard.stderr[-800:]
 
-        proc = subprocess.Popen(
+        # ``with`` closes both pipes on exit, after the kill (#381 round 2).
+        with subprocess.Popen(
             [sys.executable, "-c", _CHILD, _HOST, "0.5", "default"],
             env=child_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        try:
-            assert _await_line(proc, "WAITING", deadline=20.0), (
-                "the default-window child never reached acquire"
-            )
-            time.sleep(0.5 + 2.5)  # its own timeout, plus a margin
-            assert proc.poll() is None, (
-                "the default-window child returned instead of extending its "
-                f"wait (exit {proc.returncode})"
-            )
-        finally:
-            proc.kill()
-            proc.wait()
+        ) as proc:
+            try:
+                assert _await_line(proc, "WAITING", deadline=20.0), (
+                    "the default-window child never reached acquire"
+                )
+                time.sleep(0.5 + 2.5)  # its own timeout, plus a margin
+                assert proc.poll() is None, (
+                    "the default-window child returned instead of extending its "
+                    f"wait (exit {proc.returncode})"
+                )
+            finally:
+                proc.kill()
+                proc.wait()
     finally:
         parent.release()
 
