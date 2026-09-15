@@ -226,6 +226,42 @@ class TestNoDocClaimsTheStoreIsNeverWritten:
         assert not missing, missing
         assert _REPO / "docs" / "bridge_networking.md" in _SCANNED
 
+    def test_the_widened_verbs_meet_the_real_corpus(self) -> None:
+        """Vacuity guard for #358: the new verb branches reach real sentences.
+
+        The controls prove the regexes on planted text.  This proves the scan,
+        as wired to :data:`_SCANNED`, actually meets the two corpus sentences
+        the widening had to accommodate: the quote-split client docstring is a
+        candidate the ``enabl`` branch matches and the scope then waives, and
+        the PATTERNS.md colon sentence is present but not matched.  If either
+        sentence is edited away this fails, and whoever edits it re-checks the
+        widening against the new corpus instead of trusting a green scan.
+        """
+        by_path = {
+            path: re.split(r"(?<=[.!?])\s+", _flat(path.read_text(encoding="utf-8")))
+            for path in _SCANNED
+        }
+        client = [
+            s for s in by_path[_MODULES[1]]
+            if "neither enables Network Settings" in s
+        ]
+        assert client, "the quote-split client sentence is no longer in the corpus"
+        assert all(_SUBJECT.search(s) and _WHOLE.search(s) for s in client)
+        assert all(_NEGATED_WRITE.search(s) for s in client), (
+            "the enabl branch does not reach the real client sentence"
+        )
+        assert all(_is_scoped(s) for s in client), (
+            "the real client sentence is matched but not scoped"
+        )
+
+        patterns = _REPO / ".claude" / "skills" / "c64-test" / "PATTERNS.md"
+        colon = [s for s in by_path[patterns] if "must be enabled by hand" in s]
+        assert colon, "the PATTERNS.md colon sentence is no longer in the corpus"
+        assert all(_SUBJECT.search(s) and _WHOLE.search(s) for s in colon)
+        assert not any(_NEGATED_WRITE.search(s) for s in colon), (
+            "the enabl branch reaches across the colon in the real PATTERNS.md sentence"
+        )
+
     def test_the_scanned_files_mention_the_subject(self) -> None:
         """Vacuity guard: a scan over files that never name the store passes.
 
