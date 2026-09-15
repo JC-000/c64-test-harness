@@ -67,9 +67,11 @@ When you write a test that can point at the C64U:
   transport's `rest_put_chunk_size` (the client threshold, capped at 128),
   so they stay on the PUT path on **every** grade (#252; on a post-safe
   device that means more, smaller requests, accepted by owner decision
-  2026-09-15). But on a C64U that is ~128 round trips for 16 KiB, and it
-  is **untimed** anywhere in this repo
-  (issue #267), so budget for it being slow. REST POST is the leaking path — a bulk write that falls back to
+  2026-09-15). But on a C64U that is ~128 round trips for 16 KiB. Measured
+  on the U64E (fw 3.15, bce4535e, 2026-09-15, #267), that path runs about
+  1.3 KiB/s at 48-byte chunks and 3.2 KiB/s at 128-byte chunks (~35–55 ms
+  per PUT). The rate is not measured on the C64U, whose link latency is
+  unknown, so budget for it being slow. REST POST is the leaking path — a bulk write that falls back to
   REST is the one to watch.
 - **Do not assume an API chunks because its name suggests it.**
   `execute.load_code()` is a bare alias for `transport.write_memory`, and
