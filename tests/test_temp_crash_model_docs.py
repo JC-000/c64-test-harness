@@ -492,6 +492,8 @@ class TestTheRulesCanFail:
         "Capacity is not the thing that fails.",
         "The disk was far from exhausted when it crashed.",
         "It crashed well short of exhaustion.",
+        # Mutant N13 ("nowhere near exhaust\w*" back to "exhaustion") survived without it.
+        "/Temp was nowhere near exhausted when the firmware crashed.",
     ])
     def test_filling_set_against_crashing_is_flagged(self, text: str) -> None:
         found = count_and_figure_problems(_IN_TEMP + text)
