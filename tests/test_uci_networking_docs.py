@@ -257,6 +257,9 @@ class TestTheMeasurementIsRecorded:
         dispatch = _flat(text[start:text.index("\n## ", start + 1)])
         assert "#270" not in dispatch and "bce4535e" not in dispatch
         assert "not been measured on a device" in dispatch
+        # Re-verify round 4 (T4): the scope clause, not just the grade.
+        assert ("The enable surviving the same `machine:reset` from `READY.` "
+                "is measured on the U64E") in dispatch
 
     @pytest.mark.parametrize("phrase", RETIRED_REQUIREMENT)
     def test_retired_requirement_absent(self, whole: str, phrase: str) -> None:
