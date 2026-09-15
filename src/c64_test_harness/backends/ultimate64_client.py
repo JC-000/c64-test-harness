@@ -1559,13 +1559,34 @@ class Ultimate64Client:
           Do not treat ``reboot()`` as preserving anything below
           ``$0801``.
 
-        What it *does* clear, which the "survives" list above can make
-        easy to miss: ``start_cartridge`` zeroes ``C64_CARTRIDGE_TYPE``,
+        What it does to the REU and the Command Interface slot, read from
+        firmware source at tag ``1.1.0`` (the C64U; the same shape at
+        ``7f6fcb51``, the U64E's v3.15-85) and **unmeasured** on a device:
+        ``start_cartridge`` first zeroes ``C64_CARTRIDGE_TYPE``,
         ``C64_REU_ENABLE``, ``C64_SAMPLER_ENABLE`` and
-        ``CMD_IF_SLOT_ENABLE`` (``c64.cc:852+``). So a reboot leaves the
-        REU and the Command Interface slot **disabled** — which is why
-        ``enable_uci`` needs a ``reset()`` and a settle afterwards rather
-        than working straight away.
+        ``CMD_IF_SLOT_ENABLE`` (``c64.cc:913``), then, when no external
+        cartridge holds the bus, calls ``set_cartridge(NULL)``
+        (``c64.cc:923-924``), whose ``set_emulation_flags()``
+        (``c64.cc:992``) restores them from config. So after a reboot the
+        REU and the Command Interface come back as configured, except in
+        two cases that leave the enables at 0:
+
+        * **An external cartridge holds the bus** (Cartridge Preference
+          *External*, or *Automatic* with a cart present):
+          ``ConfigureU64SystemBus()`` reports it and ``set_cartridge`` is
+          skipped.
+        * **The configured ``.crt`` prohibits them.** ``set_cartridge(NULL)``
+          loads the image named by ``CFG_C64_CART_CRT``, and that
+          definition's ``prohibit`` mask zeroes the UCI enable again
+          (``c64.cc:1062-1068``) or the REU enable (``c64.cc:1056-1061``).
+
+        Line numbers are for ``1.1.0``; ``docs/uci_networking.md`` carries
+        the ``7f6fcb51`` equivalents and the full trace. The recorded
+        observation that ``enable_uci`` needs a ``reset()`` and a ~3 s
+        settle before routines answer still stands, but this path does not
+        explain it and its cause is open. An earlier revision of this
+        docstring gave the unconditional version as that cause (issue
+        #299).
 
         This docstring used to read "full reboot of the Ultimate device".
         That wording was load-bearing in the wrong direction: it is the
