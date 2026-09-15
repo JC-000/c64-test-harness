@@ -312,7 +312,15 @@ class LivenessResult:
     :ivar host: device hostname/IP that was probed.
     :ivar port: HTTP port that was probed.
     :ivar healthy: ``True`` iff reachable AND the writemem POST round-trip
-        succeeded.  This is the recommended top-level gate.
+        succeeded.  This is the recommended top-level gate.  It is decided
+        by the probe write and its read-back alone: a **restore** that is
+        refused (any non-2xx) or raises does **not** demote it (owner
+        decision on issue #328, 2026-09-15).  That outcome is reported as
+        ``healthy=True, failure=None, scratch_restored=False`` plus a
+        WARNING naming the span, so :meth:`Ultimate64Client.assert_healthy`
+        passes on it.  A caller that needs ``$0334-$03B3`` back, or that
+        treats a refused restore as a degraded endpoint, must check
+        ``scratch_restored`` itself.
     :ivar reachable: ``True`` iff the device's REST API answered the
         version GET (equivalent to ``probe_u64(...).reachable``).
     :ivar writemem_ok: ``True`` if the POST writemem round-trip succeeded;
@@ -504,7 +512,9 @@ def liveness_probe(
         budget.
     :returns: :class:`LivenessResult` summarising the probe.  Its
         ``scratch_restored`` says whether ``$0334-$03B3`` holds its
-        original bytes again; ``False`` is also logged at WARNING.
+        original bytes again; ``False`` is also logged at WARNING.  A
+        refused or raised restore leaves ``healthy`` ``True`` (issue #328):
+        ``scratch_restored`` and the WARNING are the only report of it.
     """
     state: dict[str, bool | None] = {"wrote": False, "restored": None}
     result = _liveness_probe_steps(

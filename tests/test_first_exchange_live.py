@@ -60,6 +60,7 @@ Preference = External`` and restores it.  Never: ``save_config_to_flash``,
 """
 from __future__ import annotations
 
+import functools
 import os
 import platform
 import re
@@ -88,6 +89,7 @@ from c64_test_harness.ethernet import parse_mac
 from c64_test_harness.execute import load_code, run_subroutine
 from c64_test_harness.memory import read_bytes, write_bytes
 from c64_test_harness.screen import wait_for_text
+from live_fixture_teardown import attempt_steps, raise_teardown_failures
 
 _LIVE = os.environ.get("RRNET_LIVE")
 _HOST = os.environ.get("U64_HOST")
@@ -165,6 +167,7 @@ def session():
             t = target.transport
             client = t.client
             orig = client.get_config_value(CAT, ITEM)
+            failures: list = []
             try:
                 client.set_config_item(CAT, ITEM, "External")
                 time.sleep(0.5)
@@ -181,8 +184,14 @@ def session():
                     pytest.skip(f"no 10BASE-T link on the cartridge (LineST ${linest:04X})")
                 yield target, cap, host_mac, host_ip
             finally:
-                cap.close()
-                client.set_config_item(CAT, ITEM, orig)
+                # Each step on its own: a raising close must not leave the
+                # preference unrestored (#391).
+                failures = attempt_steps([
+                    ("cap.close()", cap.close),
+                    (f"restore {CAT} / {ITEM} = {orig!r}",
+                     functools.partial(client.set_config_item, CAT, ITEM, orig)),
+                ])
+            raise_teardown_failures("session teardown", failures)
 
 
 def _exchange(session, *, drain_first: bool, stale: int) -> tuple[bool, int]:

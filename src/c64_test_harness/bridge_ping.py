@@ -707,22 +707,37 @@ def _poll_budget(max_polls: int) -> tuple[int, int]:
     return ((n & 0xFF) + 1) & 0xFF, ((n >> 8) + 1) & 0xFF
 
 
-def _check_tx_frame_len(frame_len: int, what: str = "frame_len") -> None:
-    """Refuse a length the TX copy loop cannot honour (issue #238).
+#: Longest ``frame_len`` the TX builders accept (issue #404): a standard
+#: Ethernet frame without its CRC, which the chip appends.  VICE 3.10
+#: ``cs8900.c:984`` (``MAX_TXLENGTH`` 1518, ``:277``) rejects a TxLength
+#: above 1518, or above 1514 unless TxCMD has InhibitCRC (``0x1000``),
+#: flagging a bid error; :data:`CS8900A_TXCMD_VALUE` ``0x00C9`` does not set
+#: it.  That is the emulator's model, source-read; silicon delivered 1514
+#: 8/8 on the U64E at 1 MHz (issue #404); nothing longer, and nothing at
+#: 48 MHz, was tried.
+CS8900A_TX_MAX_FRAME_LEN = 1514
 
-    The loop copies two bytes a pass and compares an 8-bit ``Y`` against
-    ``frame_len & 0xFF`` while TxLength gets all 16 bits.  Measured on
-    hardware: an odd length puts one frame on the wire and then hangs the
-    6510 forever with ``SEI`` in force; an even length above 256 is a
-    silent no-op that still reports ``0x01``.
+
+def _check_tx_frame_len(frame_len: int, what: str = "frame_len") -> None:
+    """Refuse a length the TX copy loop cannot honour (issues #238, #404).
+
+    The loop copies two bytes a pass.  Measured on hardware before #404,
+    when it compared an 8-bit ``Y`` against ``frame_len & 0xFF``: an odd
+    length puts one frame on the wire and then hangs the 6510 forever with
+    ``SEI`` in force, and an even length from 258 to 512 was a silent no-op
+    that still reported ``0x01``.  Above 256 the loop now counts pages as
+    well (#404), so even lengths up to :data:`CS8900A_TX_MAX_FRAME_LEN` are
+    copied whole; odd lengths are still refused.
     """
     if isinstance(frame_len, bool) or not isinstance(frame_len, int) \
-            or frame_len % 2 or not 2 <= frame_len <= 256:
+            or frame_len % 2 or not 2 <= frame_len <= CS8900A_TX_MAX_FRAME_LEN:
         raise ValueError(
-            f"{what} must be even and 2..256, got {frame_len!r}: the TX copy "
-            "loop counts in an 8-bit Y two bytes at a time, so an odd length "
-            "hangs the 6510 after one frame and a longer one transmits "
-            "nothing (issue #238)"
+            f"{what} must be even and 2..{CS8900A_TX_MAX_FRAME_LEN}, got "
+            f"{frame_len!r}: the TX copy loop copies two bytes at a time, so an "
+            "odd length hangs the 6510 after one frame (issue #238) -- pad an "
+            "odd frame by one byte, the IP total-length field governs the "
+            "datagram -- and no Ethernet frame is longer than 1514 bytes "
+            "without its CRC (issue #404)"
         )
 
 
@@ -964,9 +979,15 @@ def _emit_tx_frame(
     conventionally storing :data:`RESULT_TX_NOT_READY`.  The poll counts in
     ``X:Y``, so X is clobbered (Y always was, by the copy loop).
 
-    ``frame_len`` must be even and 2..256 -- the copy loop counts in Y --
-    and anything else raises :class:`ValueError` here rather than hanging
-    or no-opping on the 6510 (issue #238); ``what`` names it in the error.
+    ``frame_len`` must be even and 2..1514; anything else raises
+    :class:`ValueError` here rather than hanging or no-opping on the 6510
+    (issues #238, #404); ``what`` names it in the error.  Up to 256 bytes
+    the copy loop counts in ``Y`` alone, byte-identical to the loop #238
+    measured on silicon.  Above 256 it copies ``frame_len >> 8`` whole
+    pages (``X`` counts pages, ``Y`` wraps, ``INC $FC`` advances the
+    pointer, as ip65's ``send`` does) and then the even remainder, if any,
+    under the same ``CPY`` test; ``$FC`` is left pointing past the last
+    whole page.
     """
     _check_tx_frame_len(frame_len, what)
     poll_y, poll_x = _poll_budget(max_polls)
@@ -990,6 +1011,23 @@ def _emit_tx_frame(
     a.emit(0xA9, frame_buf & 0xFF, 0x85, 0xFB)
     a.emit(0xA9, (frame_buf >> 8) & 0xFF, 0x85, 0xFC)
     a.emit(0xA0, 0x00)
+    if frame_len > 0x100:
+        # issue #404: whole pages first, X counting them.  frame_len is at
+        # most 1514, so 1..5 pages; the remainder is even and 0..254.
+        a.emit(0xA2, frame_len >> 8)                 # LDX #pages
+        a.label(f"{prefix}_txpg")
+        a.emit(0xB1, 0xFB)
+        a.emit(0x8D, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
+        a.emit(0xC8)
+        a.emit(0xB1, 0xFB)
+        a.emit(0x8D, RTDATA_HI & 0xFF, RTDATA_HI >> 8)
+        a.emit(0xC8)
+        a.branch(0xD0, f"{prefix}_txpg")             # BNE: Y wraps after 256
+        a.emit(0xE6, 0xFC)                           # INC $FC: next page
+        a.emit(0xCA)                                 # DEX
+        a.branch(0xD0, f"{prefix}_txpg")
+        if not frame_len & 0xFF:
+            return
     a.label(f"{prefix}_txlp")
     a.emit(0xB1, 0xFB)
     a.emit(0x8D, RTDATA_LO & 0xFF, RTDATA_LO >> 8)
@@ -1033,9 +1071,11 @@ def build_tx_code(
     """Build a 6502 routine that hands ``frame_len`` bytes from ``frame_buf``
     to the CS8900a for transmission.  Loads at ``load_addr``.
 
-    ``frame_len`` must be even and 2..256; anything else raises
+    ``frame_len`` must be even and 2..1514
+    (:data:`CS8900A_TX_MAX_FRAME_LEN`); anything else raises
     :class:`ValueError` (issue #238 -- on hardware an odd length hangs the
-    6510 after one frame and a longer one silently sends nothing).
+    6510 after one frame).  Frames above 256 bytes use a page-counted copy
+    (issue #404); ones up to 256 emit the same bytes as before.
 
     Stores one byte at ``result_addr``:
 
@@ -1444,8 +1484,8 @@ def build_ping_and_wait_code(
     Stores 0x01 (reply matched), 0xFF (timeout) or
     :data:`RESULT_TX_NOT_READY` (0x04: ``Rdy4TxNOW`` never asserted for a
     transmit, nothing polled -- issue #236) at ``result_addr``.
-    ``tx_frame_len`` and ``arp_frame_len`` must be even and 2..256, else
-    :class:`ValueError` (issue #238).
+    ``tx_frame_len`` and ``arp_frame_len`` must be even and 2..1514, else
+    :class:`ValueError` (issues #238, #404).
 
     This combines :func:`build_tx_code` and :func:`build_rx_echo_reply_code`
     into a single routine, run via one ``jsr()`` call.  This is important
@@ -1988,8 +2028,8 @@ def run_ping_and_wait(
     re-poll; on match, return ``0x01``; on wall-clock timeout, return
     ``0xFF``.  A transmit whose ``Rdy4TxNOW`` never asserts returns
     :data:`RESULT_TX_NOT_READY` (``0x04``) at once (issue #236); a
-    ``tx_frame`` that is odd-length or longer than 256 bytes raises
-    :class:`ValueError` (issue #238).
+    ``tx_frame`` that is odd-length or longer than 1514 bytes raises
+    :class:`ValueError` (issues #238, #404).
 
     With ``arp=True`` (the default; issue #218) an ARP request for the
     echo's destination IP -- built from ``tx_frame``'s own source MAC,
@@ -2483,8 +2523,8 @@ def build_ping_and_wait_tod_code(
     Args:
         load_addr: Where the routine will live.
         tx_frame_buf: Address of the pre-built echo request frame.
-        tx_frame_len: Frame length in bytes: even and 2..256, else
-            :class:`ValueError` (issue #238).
+        tx_frame_len: Frame length in bytes: even and 2..1514, else
+            :class:`ValueError` (issues #238, #404).
         rx_buf: RX buffer, at least 64 bytes.
         result_addr: 1-byte status slot (0x01 success, 0xFF timeout).
         identifier: Expected ICMP identifier (16-bit).
@@ -2502,7 +2542,7 @@ def build_ping_and_wait_tod_code(
     Raises:
         ValueError: if ``deadline_tenths`` is out of range,
             ``arp_frame_len`` is given without ``arp_frame_buf``, or
-            either frame length is odd or outside 2..256 (issue #238).
+            either frame length is odd or outside 2..1514 (issues #238, #404).
     """
     _validate_deadline_tenths(deadline_tenths)
     arp = _resolve_arp_frame(arp_frame_buf, arp_frame_len)

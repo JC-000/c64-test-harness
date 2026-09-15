@@ -1350,6 +1350,10 @@ class Ultimate64Client:
             strictly (issue #272).  The device is healthy; the request
             was not.
         :returns: the :class:`LivenessResult` on success (healthy device).
+            **Success includes a refused restore** (issue #328): the probe
+            write round-tripped, so this returns rather than raising, with
+            ``scratch_restored=False`` and a WARNING. Check
+            ``result.scratch_restored`` if ``$0334-$03B3`` matters to you.
         """
         result = self.liveness_probe(http_timeout=http_timeout)
         if result.healthy:
@@ -2255,6 +2259,40 @@ class Ultimate64Client:
         400 for every body shape tried, multipart and raw alike.  That
         looked like "this firmware cannot accept an upload"; it was the
         wrong verb.  See :meth:`mount_disk_path` for the PUT form.
+
+        **One file part; ``type`` and ``mode`` go in the query** (#311).
+        The POST route mounts ``handler->get_filename(0)`` -- the file
+        written for the *first* multipart part -- and reads ``type`` and
+        ``mode`` from the URI query, not from form fields
+        (``route_drives.cc:140-152`` at bce4535e).  The firmware writes a
+        file for every part, form fields included, so the body used to
+        send ``mode`` and ``type`` as fields ahead of the image and part 0
+        was the ``mode`` field's text.  Measured on the U64E (fw 3.15,
+        bce4535e, 2026-09-15, n=3 per arm): that body answered HTTP 400
+        ``Invalid Type ''`` 3/3 and mounted nothing; this shape answered 200
+        3/3 and ``GET /v1/drives`` reported the uploaded image mounted.
+        ``mode`` is not visible in ``GET /v1/drives``, so that half is
+        source-read.  On the C64U (1.1.0) the same route shape is
+        source-read, not measured.
+
+        **Cost: one managed ``/Temp`` attachment per call**, which is what
+        the request choke point counts.  The part is named
+        ``image.<type>``, so on 1.1.0 (by source) it lands at
+        ``/Temp/image.<type>``, is overwritten per type rather than
+        accumulating, and never matches the GC's ``temp%04x`` pattern --
+        a sweep cannot delete the mounted image, and cannot collect it
+        either (#418).
+
+        **Same-type re-mount on 1.1.0 overwrites the mounted file**
+        (source-read, #427): ``attachment_writer.h`` ``collect()`` opens
+        ``/Temp/<filename>`` with ``FA_CREATE_ALWAYS``, so a second
+        ``mount_disk`` of the same image type overwrites that file even
+        while it is mounted.  Whether the drive holds it open is not read.
+        This exposure is new with #311 -- the old body never mounted at
+        all.  Remove the image (``drives/<d>:remove``, i.e.
+        :meth:`unmount_disk`) before mounting another of the same type.
+        On the U64E (bce4535e) a repeated name is uniquified instead
+        (``image_1.d64``; measured 2026-09-15, n=1).
         """
         if not isinstance(image, (bytes, bytearray)):
             raise TypeError("image must be bytes")
@@ -2267,7 +2305,7 @@ class Ultimate64Client:
         boundary = "----U64ClientBoundary" + uuid.uuid4().hex
         body = _build_multipart(
             boundary,
-            fields={"mode": mode, "type": image_type},
+            fields={},
             file_field="file",
             file_name=f"image.{image_type}",
             file_bytes=bytes(image),
@@ -2277,6 +2315,7 @@ class Ultimate64Client:
             path,
             body=body,
             content_type=f"multipart/form-data; boundary={boundary}",
+            query={"type": image_type, "mode": mode},
         )
 
     def mount_disk_path(

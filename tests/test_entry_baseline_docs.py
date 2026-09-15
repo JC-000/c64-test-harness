@@ -853,6 +853,43 @@ class TestTheItemCountCarriesItsScope:
         dropped = flat.replace("of 203", "")
         assert dropped != flat and self._residual_errors(dropped)
 
+    def test_the_residual_records_the_292_investigation(self) -> None:
+        """#292's 2026-09-15 findings travel with the residual.
+
+        The fresh read after the owner's power-cycle, the counting basis it
+        ruled out (every item carries ``default``), the build the device
+        reported, and the arithmetic candidate -- graded inferred, never
+        stated as the cause.
+        """
+        flat = _flat(self._u64e_record().residuals)
+        for token in (
+            "2026-09-15",
+            "power-cycle",
+            "every one of the 203 items carries both current and default",
+            "bce4535e",
+            "v3.15-132",
+            "tree diff 7f6fcb51 -> bce4535e (not a linear range)",
+            "the device read is the authority",
+            "203 was also recorded on 2026-09-05 (ce4b0af)",
+            "no counting basis for it is evidenced",
+            "unrecoverable",
+        ):
+            assert token in flat, token
+        # Review round 1 (#401): picking two items of 203 to reach 201 was
+        # number-fitting on a false premise (ce4b0af exempted six, and
+        # be99a1a removed the exemption the same day).  Deleted, not caveated.
+        assert "SID Detected Socket" not in flat
+        assert "arithmetic candidate" not in flat
+
+    def test_the_record_source_names_the_running_build(self) -> None:
+        """#401 round 1: 7f6fcb51 is where the counts were derived, not what
+        the device runs; the source field may not present it as the latter."""
+        src = _flat(self._u64e_record().source)
+        assert "comes from the flash record, not from that read" not in src
+        for token in ("v3.15-85 (7f6fcb51)", "bce4535e (v3.15-132)",
+                      "derived at 7f6fcb51"):
+            assert token in src, token
+
     # -- positive controls for the scan itself -------------------------------
 
     @pytest.mark.parametrize("label,text", [
