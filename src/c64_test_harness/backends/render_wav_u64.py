@@ -43,6 +43,8 @@ from .u64_audio_capture import (
     CaptureResult,
     DEFAULT_AUDIO_PORT,
     DEFAULT_SAMPLE_RATE,
+    _fill_fraction,
+    _time_base_intact,
 )
 from .ultimate64_client import Ultimate64Client
 
@@ -66,16 +68,27 @@ class U64CaptureResult:
     packets_received: int
     packets_dropped: int
     sample_rate_exact: Fraction | None = None
+    #: Carried from :class:`CaptureResult`; same meanings (#410, #430).
+    packets_reordered: int = 0
+    packets_filled: int = 0
+    sequence_resyncs: int = 0
+    nonstandard_payloads: int = 0
+    filled_frame_ranges: tuple[tuple[int, int], ...] = ()
 
     @property
     def time_base_intact(self) -> bool:
-        """False when a dropped packet broke the index-to-time mapping.
+        """True when sample index maps exactly to time.
 
         See :attr:`c64_test_harness.backends.u64_audio_capture.
-        CaptureResult.time_base_intact` -- gaps are counted, never
-        padded.
+        CaptureResult.time_base_intact` -- lost packets are filled with
+        silence, and a result without fill reads as broken on any drop.
         """
-        return self.packets_dropped == 0
+        return _time_base_intact(self)
+
+    @property
+    def fill_fraction(self) -> float:
+        """Share of samples that is fill; see ``CaptureResult.fill_fraction``."""
+        return _fill_fraction(self)
 
 
 def _detect_local_ip(remote_host: str, remote_port: int = 80) -> str:
@@ -262,6 +275,11 @@ def _to_u64_result(result: CaptureResult) -> U64CaptureResult:
         packets_received=result.packets_received,
         packets_dropped=result.packets_dropped,
         sample_rate_exact=result.sample_rate_exact,
+        packets_reordered=result.packets_reordered,
+        packets_filled=result.packets_filled,
+        sequence_resyncs=result.sequence_resyncs,
+        nonstandard_payloads=result.nonstandard_payloads,
+        filled_frame_ranges=result.filled_frame_ranges,
     )
 
 

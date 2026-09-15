@@ -40,7 +40,9 @@ _AUDIO_PAYLOAD_LEN = 768
 
 
 def _audio_payload(seq: int) -> bytes:
-    return struct.pack("<H", seq) * (_AUDIO_PAYLOAD_LEN // 2)
+    # A nonzero marker word beside the sequence, so an all-zero packet in the
+    # WAV can only be gap fill (#410), whatever the sequence number.
+    return struct.pack("<HH", seq, 0xA5A5) * (_AUDIO_PAYLOAD_LEN // 4)
 
 
 def _debug_payload(seq: int) -> bytes:
@@ -78,7 +80,8 @@ def _audio(seqs: list[int], tmp_path: Path):
         pcm = wf.readframes(wf.getnframes())
     assert len(pcm) % _AUDIO_PAYLOAD_LEN == 0
     order = [
-        struct.unpack_from("<H", pcm, i)[0]
+        None if pcm[i:i + _AUDIO_PAYLOAD_LEN] == bytes(_AUDIO_PAYLOAD_LEN)
+        else struct.unpack_from("<H", pcm, i)[0]
         for i in range(0, len(pcm), _AUDIO_PAYLOAD_LEN)
     ]
     return result, order
@@ -109,7 +112,7 @@ _R = list(range(100))
 CASES = {
     "clean": (_R, 0, 0, _R),
     "one_gap": (list(range(60)) + list(range(70, 100)), 10, 0,
-                list(range(60)) + list(range(70, 100))),
+                list(range(60)) + [None] * 10 + list(range(70, 100))),
     "duplicate": (list(range(50)) + [48] + list(range(50, 100)), 0, 1, _R),
     "adjacent_swap": (list(range(51)) + [52, 51] + list(range(53, 100)), 0, 1, _R),
     "late_by_4": (list(range(51)) + [52, 53, 54, 55, 51] + list(range(56, 100)),
@@ -129,7 +132,8 @@ def test_audio_capture_counts_only_true_loss(name: str, tmp_path: Path) -> None:
     result, order = _audio(seqs, tmp_path)
     assert result.packets_dropped == dropped
     assert result.packets_reordered == backward
-    assert result.time_base_intact is (dropped == 0)
+    # Every drop is zero-filled (#410), so the time base survives all of these.
+    assert result.time_base_intact is True
     if placed is not None:
         # A late packet lands in its own slot; a duplicate adds no samples.
         assert order == placed
@@ -139,7 +143,7 @@ def test_audio_late_packet_after_gap_fills_its_own_slot(tmp_path: Path) -> None:
     """55..59 arrived before 52: 52 goes back between 51 and 55, not after 59."""
     seqs, *_ = CASES["gap_then_late_fill_of_part"]
     _, order = _audio(seqs, tmp_path)
-    assert order == list(range(50)) + [52] + list(range(55, 100))
+    assert order == list(range(50)) + [None, None, 52, None, None] + list(range(55, 100))
 
 
 @pytest.mark.parametrize("name", list(CASES))
@@ -303,7 +307,10 @@ def test_silent_restart_is_recognised_and_loses_nothing(tmp_path: Path) -> None:
     assert len(pcm) == 1101 * _AUDIO_PAYLOAD_LEN
     assert result.packets_dropped == 0
     assert result.sequence_resyncs == 1
-    assert result.time_base_intact is True
+    # Every packet is kept, but a restart hides how many packets the device
+    # never sent between the two runs, so the index is not a clock across it
+    # (#410: a resync breaks time_base_intact).
+    assert result.time_base_intact is False
     zero_d = bytes(ENTRIES_PER_PACKET * ENTRY_SIZE)
     d = _debug_raw([(s, zero_d) for s in seqs])
     assert d.total_cycles == 1101 * ENTRIES_PER_PACKET
@@ -386,9 +393,14 @@ def test_an_over_late_packet_resyncs_and_overcounts_as_documented(tmp_path: Path
     silently."""
     seqs = [0] + list(range(2, 1100)) + [1] + list(range(1100, 1110))
     result, pcm = _audio_raw([(s, _apcm(s, _A)) for s in seqs], tmp_path)
-    assert [s for s, _ in _apackets(pcm)] == seqs
+    fill = (0, 0)  # an all-zero packet: gap fill (#410)
+    assert _apackets(pcm) == (
+        [(0, _A), fill] + [(s, _A) for s in range(2, 1100)] + [(1, _A)]
+        + [fill] * 1098 + [(s, _A) for s in range(1100, 1110)]
+    )
     assert (result.packets_dropped, result.packets_reordered,
             result.sequence_resyncs) == (1099, 1, 1)
+    assert result.packets_filled == 1099
 
 
 def test_tracker_memory_is_bounded_by_the_window() -> None:

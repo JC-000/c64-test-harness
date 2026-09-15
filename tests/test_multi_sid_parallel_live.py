@@ -45,6 +45,7 @@ from c64_test_harness.backends.u64_audio_capture import (
 )
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
 
+from audio_link_loss import CAPTURE_ATTEMPTS, MAX_FILL_FRACTION, capture_usable
 from live_fixture_teardown import (
     raise_teardown_failures,
     read_restore_defaults,
@@ -317,45 +318,63 @@ def quad_wav(u64_client, wav_dir: Path) -> Path:
     # Ephemeral bind (#237): a fixed DEFAULT_AUDIO_PORT fails this module
     # whenever another lane on the host holds 11001.  The destination is
     # built from capture.port after start(), so it names the bound port.
-    capture = AudioCapture(
-        port=EPHEMERAL_AUDIO_PORT,
-        sample_rate=DEFAULT_SAMPLE_RATE,
-    )
     duration = 5.0
     settle = 0.5
 
-    stream_started = False
-    capture_started = False
-
+    # Lost packets are zero-filled (#410), so a lossy capture keeps its time
+    # base; one is retried only when it is not intact or has more fill than
+    # MAX_FILL_FRACTION (tests/audio_link_loss.py has the measured figures).
+    # The PRG loops forever, so it is uploaded once: a retry re-captures the
+    # same tones with only bodyless stream start/stop calls, and adds no
+    # run_prg upload.
+    attempt_log: list[dict] = []
+    result = None
+    prg_started = False
     try:
-        # 1. Start UDP receiver
-        capture.start()
-        capture_started = True
+        for attempt in range(1, CAPTURE_ATTEMPTS + 1):
+            capture = AudioCapture(
+                port=EPHEMERAL_AUDIO_PORT,
+                sample_rate=DEFAULT_SAMPLE_RATE,
+            )
+            # 1. Start UDP receiver
+            capture.start()
+            stream_started = False
+            try:
+                # 2. Start U64 audio stream to the port actually bound
+                stream_dest = f"{local_ip}:{capture.port}"
+                logger.info("Audio stream destination: %s", stream_dest)
+                u64_client.stream_audio_start(stream_dest)
+                stream_started = True
+                logger.info("Audio stream started (attempt %d)", attempt)
 
-        # 2. Start U64 audio stream to the port actually bound
-        stream_dest = f"{local_ip}:{capture.port}"
-        logger.info("Audio stream destination: %s", stream_dest)
-        u64_client.stream_audio_start(stream_dest)
-        stream_started = True
-        logger.info("Audio stream started")
+                # 3. Run the PRG on the real C64 CPU, once
+                if not prg_started:
+                    u64_client.run_prg(prg_data)
+                    prg_started = True
+                    logger.info("PRG loaded and running on C64 CPU")
 
-        # 3. Run the PRG on the real C64 CPU
-        u64_client.run_prg(prg_data)
-        logger.info("PRG loaded and running on C64 CPU")
-
-        # 4. Wait for settle + capture duration
-        time.sleep(settle + duration)
+                # 4. Wait for settle + capture duration
+                time.sleep(settle + duration)
+            finally:
+                if stream_started:
+                    try:
+                        u64_client.stream_audio_stop()
+                    except Exception:
+                        logger.warning("Failed to stop audio stream", exc_info=True)
+                result = capture.stop(wav_path=wav_path)
+            attempt_log.append({
+                "attempt": attempt,
+                "packets_received": result.packets_received,
+                "packets_dropped": result.packets_dropped,
+                "fill_fraction": result.fill_fraction,
+                "time_base_intact": result.time_base_intact,
+            })
+            if capture_usable(result):
+                break
+            logger.warning("Quad-SID capture attempt %d not usable: %s",
+                           attempt, attempt_log[-1])
 
     finally:
-        if stream_started:
-            try:
-                u64_client.stream_audio_stop()
-            except Exception:
-                logger.warning("Failed to stop audio stream", exc_info=True)
-
-        if capture_started:
-            result = capture.stop(wav_path=wav_path)
-
         try:
             u64_client.reset()
             logger.info("C64 reset to stop playback")
@@ -379,8 +398,13 @@ def quad_wav(u64_client, wav_dir: Path) -> Path:
             "duration_seconds": result.duration_seconds,
             "packets_received": result.packets_received,
             "packets_dropped": result.packets_dropped,
+            "packets_filled": result.packets_filled,
+            "fill_fraction": result.fill_fraction,
+            "time_base_intact": result.time_base_intact,
             "total_samples": result.total_samples,
             "sample_rate": result.sample_rate,
+            "attempts": len(attempt_log),
+            "attempt_log": attempt_log,
         },
     }
     meta_path.write_text(json.dumps(meta, indent=2) + "\n")
@@ -476,7 +500,14 @@ def test_capture_metadata(quad_wav: Path) -> None:
     meta = json.loads(meta_path.read_text())
     assert "engines" in meta
     assert len(meta["engines"]) == 4
-    assert meta["capture"]["packets_received"] > 0
-    assert meta["capture"]["packets_dropped"] == 0
+    cap = meta["capture"]
+    assert cap["packets_received"] > 0
+    # Not packets_dropped == 0: that fails most runs on this Wi-Fi bench,
+    # which is link loss, not firmware (#410).  Lost packets are zero-filled,
+    # so what matters is an exact time base and a bounded share of silence.
+    assert cap["time_base_intact"] and cap["fill_fraction"] <= MAX_FILL_FRACTION, (
+        f"no usable capture in {cap['attempts']} attempt(s) "
+        f"(fill bound {MAX_FILL_FRACTION}): {cap['attempt_log']}"
+    )
     for engine in ENGINE_META:
         assert engine in meta["engines"], f"Missing engine: {engine}"
