@@ -320,6 +320,27 @@ def test_instance_poke_reads_back_the_effective_value(firmware, poked, effective
     assert c.WRITE_MEM_QUERY_THRESHOLD == effective
 
 
+def test_subclass_poking_before_super_init_neither_raises_nor_probes(caplog):
+    """#343: the helper reads the public accessor, which needs the cache
+    attribute ``__init__`` creates.  A subclass that pokes first must still
+    get the documented "refused, keeping 128" path (no AttributeError, no
+    request), and ``__init__`` then takes the grade."""
+
+    class Early(Ultimate64Client):
+        def __init__(self, *a, **kw):
+            self.WRITE_MEM_QUERY_THRESHOLD = 16
+            super().__init__(*a, **kw)
+
+    mock, wire = _device("3.15")
+    with caplog.at_level(logging.WARNING, logger=_LOGGER), \
+            patch("urllib.request.urlopen", mock):
+        c = Early("h", warn_unlocked=False)
+    assert _refused(caplog)
+    # Only the construct-time probe, never one from the poke.
+    assert [r.get_full_url() for r in wire] == ["http://h/v1/info"]
+    assert c.write_mem_query_threshold == THRESHOLD_POST_SAFE
+
+
 def test_instance_poke_above_the_cap_is_clamped():
     mock, _ = _device("3.15")
     with patch("urllib.request.urlopen", mock):

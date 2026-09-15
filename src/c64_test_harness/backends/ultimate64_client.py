@@ -1806,8 +1806,9 @@ class Ultimate64Client:
             # A subclass that assigns this before ``super().__init__()`` has
             # no grade cached yet, so it gets a "refused, keeping 128"
             # WARNING here -- and ``__init__`` then sets the threshold from
-            # the grade anyway (48 on a post-safe device).  Safe, merely
-            # noisy; poke on the class body or after construction instead.
+            # the grade anyway (48 on a post-safe device), which leaves the
+            # uppercase name's read-back stale at 128.  Safe, merely noisy;
+            # poke on the class body or after construction instead.
             threshold = self._effective_poked_threshold(value, "instance ")
             object.__setattr__(self, "write_mem_query_threshold", threshold)
             # Store the effective value, not the request, so the uppercase
@@ -1832,10 +1833,9 @@ class Ultimate64Client:
           rule 8).  The explicit ``write_mem_query_threshold=`` kwarg is the
           deliberate way to force it.
 
-        Reads the private ``_capabilities`` cache, never the probing
-        property; the public ``cached_capabilities`` accessor (#291) was not
-        on master when this landed.  An unprobed client counts as not
-        post-safe.
+        Reads the non-probing :attr:`cached_capabilities` (#291), never
+        the probing :attr:`capabilities` property, so a poke issues no
+        HTTP (#343).  An unprobed client counts as not post-safe.
         """
         requested = _validate_poked_threshold(value)
         host = getattr(self, "host", "?")
@@ -1848,7 +1848,14 @@ class Ultimate64Client:
                 host, source, requested, THRESHOLD_POST_RISKY, THRESHOLD_POST_RISKY,
             )
             return THRESHOLD_POST_RISKY
-        caps = getattr(self, "_capabilities", None)
+        # A subclass poking before super().__init__() has no cache attribute
+        # yet (the accessor would raise AttributeError); that reads as
+        # "never probed".
+        caps = (
+            self.cached_capabilities
+            if "_capabilities" in self.__dict__
+            else None
+        )
         if requested < THRESHOLD_POST_RISKY and getattr(
             caps, "writemem_post_safe", None
         ) is not True:
