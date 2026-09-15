@@ -363,3 +363,46 @@ def test_every_public_address_taking_function_in_the_builder_modules_is_guarded(
                 missing.append(f"{modname}.{name}{tuple(params)}")
     assert missing == []
     assert seen == 31  # vacuity guard: the enumeration found the whole surface
+
+
+def test_decorator_carries_positional_and_keyword_defaults():
+    """#390: ``functools.wraps`` copies neither ``__defaults__`` nor
+    ``__kwdefaults__``, so the wrapper reported ``None`` for both."""
+    def build(load_addr: int, frame_len: int = 3, *, arp_buf: int | None = None) -> bytes:
+        return bytes([load_addr & 0xFF, frame_len])
+
+    wrapped = refuses_bool_address_args(build)
+    assert wrapped.__defaults__ == (3,)
+    assert wrapped.__kwdefaults__ == {"arp_buf": None}
+    # Call behaviour is unchanged: the defaults still come from the real body.
+    assert wrapped(0xC0) == b"\xc0\x03"
+    with pytest.raises(ValueError, match="build arp_buf must be an int, not bool"):
+        wrapped(0xC0, arp_buf=True)
+
+
+def test_decorator_leaves_defaultless_functions_defaultless():
+    def build(load_addr, frame_len):
+        return bytes([load_addr & 0xFF, frame_len])
+
+    wrapped = refuses_bool_address_args(build)
+    assert wrapped.__defaults__ is None and wrapped.__kwdefaults__ is None
+
+
+def test_every_decorated_builder_reports_its_real_defaults():
+    """Over the whole guarded surface: the wrapper's defaults are the body's."""
+    with_defaults = 0
+    seen = 0
+    for modname in _GUARDED_MODULES:
+        mod = importlib.import_module(f"c64_test_harness.{modname}")
+        for name, obj in vars(mod).items():
+            if not hasattr(obj, "__refuses_bool_addresses__"):
+                continue
+            if getattr(obj, "__module__", None) != mod.__name__:
+                continue
+            seen += 1
+            inner = obj.__wrapped__
+            assert obj.__defaults__ == inner.__defaults__, f"{modname}.{name}"
+            assert obj.__kwdefaults__ == inner.__kwdefaults__, f"{modname}.{name}"
+            with_defaults += bool(inner.__defaults__ or inner.__kwdefaults__)
+    assert seen == 31
+    assert with_defaults >= 16  # vacuity guard: the defaults exist to be lost

@@ -77,6 +77,11 @@ def refuses_bool_address_args(fn: _F) -> _F:
     byte-identical for every valid call.  A call that does not bind to the
     signature is passed through so the function raises its own
     ``TypeError``.
+
+    The wrapper reports *fn*'s ``__defaults__`` and ``__kwdefaults__``
+    (#390), which ``functools.wraps`` does not copy.  They are informational
+    only: the wrapper takes ``*args, **kwargs``, so its own code has no
+    parameter they could fill, and *fn* still applies its defaults itself.
     """
     sig = inspect.signature(fn)
     names = tuple(p for p in sig.parameters if ADDRESS_PARAM_RE.search(p))
@@ -92,5 +97,7 @@ def refuses_bool_address_args(fn: _F) -> _F:
                 refuse_bool_address(bound.arguments[name], f"{fn.__name__} {name}")
         return fn(*args, **kwargs)
 
+    wrapper.__defaults__ = fn.__defaults__
+    wrapper.__kwdefaults__ = fn.__kwdefaults__
     wrapper.__refuses_bool_addresses__ = names  # type: ignore[attr-defined]
     return wrapper  # type: ignore[return-value]
