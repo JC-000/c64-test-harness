@@ -22,10 +22,11 @@ Pinned two ways:
   additionally, guard, "skip unless/without", "must run/be set", "only
   with/when", "set ... before" -- the last four added in review round 1),
   unless it carries a narrowing phrase ("config changes only", "``U64_HOST``
-  alone", "stricter than the contract", "not for the reset", ...).  A config
-  reason is removed from the sentence before the terms are looked for, so
-  "the reload changes RAM config" and "tests that write Data Streams config"
-  are not resets or RAM writes.
+  alone", "stricter than the contract", a trailing ", not the reset" or
+  ", not for the reset", ...).  A config reason is removed from the sentence
+  before the terms are looked for, so "the reload changes RAM config", "tests
+  that write Data Streams config" and the category name "Data Streams" itself
+  are not resets, RAM writes or stream starts (#383).
 
 The corpus is ``README.md``, ``docs/**/*.md``, ``.claude/skills/c64-test/*.md``
 and the module docstring plus full-line ``#`` comments of every
@@ -76,14 +77,17 @@ _REQUIRE = re.compile(
 #: A config write given as the reason; removed before the terms are looked for.
 _CONFIG_REASON = re.compile(
     r"\b(writes?|wrote|writing|rewrites?|changes?|changing)\s+(\S+\s+){0,3}?"
-    r"(config(uration)?|CPU speed)\b",
+    r"(config(uration)?|CPU speed)\b"
+    r"|\bdata streams?\b",  # the config category, not a stream start (#383)
     re.I,
 )
 #: Phrases that state the narrow contract, or that a gate is stricter than it.
 _NARROWING = re.compile(
     r"config(uration)? changes only|config writes only|U64_HOST alone"
     r"|stricter than the contract|beyond the contract|outside the contract"
-    r"|\bnot (for|because of) (the |a )?(reset|reboot|RAM|stream)"
+    # A trailing contrast only (#383): ', not the reset' narrows; a sentence
+    # that opens 'Not the RAM write alone: resets also need ...' does not.
+    r"|(?:[,;:\u2014\u2013]|\bbut)\s*not (for |because of )?(the |a )?(reset|reboot|RAM|stream)"
     r"|\bnot (gated|required)\b",
     re.I,
 )
@@ -217,10 +221,13 @@ class TestThePinCanFail:
         "Anything that starts a stream must run with U64_ALLOW_MUTATE.",
         "Set U64_ALLOW_MUTATE before any test that writes RAM.",
         "Resets run only with U64_ALLOW_MUTATE=1.",
+        # #383: the exemptions must not reach a real claim
+        "Stream start/stop in the Data Streams tests needs U64_ALLOW_MUTATE.",
+        "Not the RAM write alone: resets also need U64_ALLOW_MUTATE.",
     ], ids=["dev-setup", "dev-mutate-marker", "readme-comment", "readme-uci",
             "capabilities-docstring", "feature-parity-docstring", "stream", "reboot",
             "r1-skip-unless", "r1-guards", "r1-must-run", "r1-set-before",
-            "r1-only-with"])
+            "r1-only-with", "383-stream-beside-data-streams", "383-leading-not"])
     def test_a_retired_sentence_is_caught(self, text: str) -> None:
         assert wider_contract_claims(text)
 
@@ -244,8 +251,14 @@ class TestThePinCanFail:
         # tests/test_ultimate64_helpers_live.py
         "(turbo flip) runs only when ``U64_ALLOW_MUTATE`` is also set.",
         "Set U64_ALLOW_MUTATE before any test that writes device config.",
+        # #383 false positives, from the adversarial review of #379
+        "The Data Streams tests run only when U64_ALLOW_MUTATE is set, because "
+        "they change stream config.",
+        "The gate U64_ALLOW_MUTATE guards the Cartridge Preference write, not the "
+        "reset.",
     ], ids=["narrow", "allowed", "streams-config", "ram-config", "not-for-the-reset",
             "stricter", "no-gate-named", "r1-skip-without-but-stricter",
-            "r1-corpus-capabilities", "r1-corpus-helpers-only-when", "r1-set-before-config"])
+            "r1-corpus-capabilities", "r1-corpus-helpers-only-when", "r1-set-before-config",
+            "383-data-streams-category", "383-not-the-reset"])
     def test_a_narrow_sentence_is_not_caught(self, text: str) -> None:
         assert wider_contract_claims(text) == []
