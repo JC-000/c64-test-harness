@@ -235,3 +235,92 @@ def test_the_scan_walks_real_files():
     """Vacuity guard: the walk reaches the transport and the client."""
     names = {p.name for p in _SRC.rglob("*.py")}
     assert {"ultimate64.py", "ultimate64_client.py"} <= names
+
+
+# --------------------------------------------------------------------------- #
+# #343: inside the client, only the two accessors read the private cache      #
+# --------------------------------------------------------------------------- #
+
+import ast  # noqa: E402
+
+#: The only functions allowed to *read* ``_capabilities``: the probing
+#: property and the non-probing accessor.  Stores (``__init__``, the probe,
+#: the re-probe) are not reads and are not restricted here.
+_READERS_ALLOWED = {"capabilities", "cached_capabilities"}
+
+
+def _private_reads_by_function(source: str) -> dict[str, int]:
+    """Count reads of ``_capabilities`` per enclosing function name.
+
+    A read is ``<expr>._capabilities`` in a load context, or the string
+    ``"_capabilities"`` passed to ``getattr``/``hasattr``.  AST-based so
+    docstrings and comments naming the attribute do not count.
+    """
+    counts: dict[str, int] = {}
+
+    class _Visitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.stack: list[str] = []
+
+        def _func(self, node):
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        visit_FunctionDef = _func
+        visit_AsyncFunctionDef = _func
+
+        def _hit(self) -> None:
+            name = self.stack[-1] if self.stack else "<module>"
+            counts[name] = counts.get(name, 0) + 1
+
+        def visit_Attribute(self, node):
+            if node.attr == "_capabilities" and isinstance(node.ctx, ast.Load):
+                self._hit()
+            self.generic_visit(node)
+
+        def visit_Call(self, node):
+            if (isinstance(node.func, ast.Name) and node.func.id in ("getattr", "hasattr")
+                    and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant)
+                    and node.args[1].value == "_capabilities"):
+                self._hit()
+            self.generic_visit(node)
+
+    _Visitor().visit(ast.parse(source))
+    return counts
+
+
+def test_only_the_accessors_read_private_capabilities_inside_the_client():
+    source = (_SRC / "backends" / "ultimate64_client.py").read_text()
+    reads = _private_reads_by_function(source)
+    offenders = {k: v for k, v in reads.items() if k not in _READERS_ALLOWED}
+    assert offenders == {}, offenders
+
+
+def test_the_in_client_scan_sees_the_accessors():
+    """Vacuity guard: the real accessors are found, so an empty result above
+    is not a scan that matches nothing."""
+    source = (_SRC / "backends" / "ultimate64_client.py").read_text()
+    reads = _private_reads_by_function(source)
+    assert reads.get("capabilities", 0) >= 1
+    assert reads.get("cached_capabilities", 0) >= 1
+
+
+@pytest.mark.parametrize("body", [
+    "caps = getattr(self, '_capabilities', None)",
+    "caps = self._capabilities",
+    "return self._capabilities.writemem_post_safe",
+])
+def test_the_in_client_scan_fires_on_a_planted_reader(body):
+    planted = f"class C:\n    def _effective_poked_threshold(self):\n        {body}\n"
+    assert _private_reads_by_function(planted) == {"_effective_poked_threshold": 1}
+
+
+@pytest.mark.parametrize("body", [
+    "self._capabilities = None",
+    "caps = self.cached_capabilities",
+    '"""Reads the private ``_capabilities`` cache."""',
+])
+def test_the_in_client_scan_ignores_stores_accessors_and_prose(body):
+    planted = f"class C:\n    def helper(self):\n        {body}\n"
+    assert _private_reads_by_function(planted) == {}
