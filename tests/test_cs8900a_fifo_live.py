@@ -66,7 +66,8 @@ Gates (all unset -> the module skips cleanly):
 
 Needs a capture node the process can open (macOS: world-rw ``/dev/bpf*``;
 Linux: ``CAP_NET_RAW``).  Sets ``Cartridge Preference = External`` for the
-module and restores it.  No elevation marker: nothing here changes host
+module and restores it to the ``default`` the device reports, never the value
+read at entry (#412).  No elevation marker: nothing here changes host
 network state, it only injects and reads frames on the given NIC.
 """
 
@@ -104,6 +105,12 @@ from c64_test_harness.ethernet import parse_mac
 from c64_test_harness.execute import load_code, run_subroutine
 from c64_test_harness.memory import read_bytes, write_bytes
 from c64_test_harness.screen import wait_for_text
+from live_fixture_teardown import (
+    attempt_steps,
+    raise_teardown_failures,
+    read_restore_defaults,
+    restore_default_steps,
+)
 
 _LIVE = os.environ.get("RRNET_LIVE")
 _HOST = os.environ.get("U64_HOST")
@@ -407,7 +414,10 @@ def bench():
         with mgr.instance() as target:
             t = target.transport
             client = t.client
-            orig = client.get_config_category(CAT)[CAT][ITEM]
+            # The device's default, read before the External PUT: an entry
+            # value can be a killed RR-Net lane's External (#412, #334).
+            plan = read_restore_defaults(client, {CAT: [ITEM]})
+            failures: list = []
             try:
                 client.set_config_item(CAT, ITEM, "External")
                 time.sleep(0.5)
@@ -446,7 +456,8 @@ def bench():
                 finally:
                     cap.close()
             finally:
-                client.set_config_item(CAT, ITEM, orig)
+                failures = attempt_steps(restore_default_steps(client, plan))
+            raise_teardown_failures("bench teardown", failures)
 
 
 # --------------------------------------------------------------------------- #
