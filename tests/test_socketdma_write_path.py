@@ -91,7 +91,7 @@ def mock_client() -> MagicMock:
     # Graded post-safe so the REST fallback stays one request (#252: a
     # leak-prone or unknown grade chunks it; see
     # test_rest_fallback_on_leak_prone_grade_is_chunked).
-    client._capabilities.writemem_post_safe = True
+    client.cached_capabilities.writemem_post_safe = True
     client.write_mem_query_threshold = 48
     return client
 
@@ -275,7 +275,7 @@ def test_rest_fallback_on_leak_prone_grade_is_chunked(
     graded post-safe is chunked at the threshold, not sent as one POST."""
     fake, _ = install_fake
     fake.connect_error = True
-    mock_client._capabilities.writemem_post_safe = False
+    mock_client.cached_capabilities.writemem_post_safe = False
     mock_client.write_mem_query_threshold = 128
     data = _payload(8192)
     t = Ultimate64Transport(host="h", client=mock_client, socket_dma=True)

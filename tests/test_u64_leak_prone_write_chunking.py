@@ -351,7 +351,7 @@ def test_zero_threshold_leak_prone_both_entry_points_refuse() -> None:
 def test_client_without_integer_threshold_chunks_at_the_put_cap() -> None:
     """Review N1: a test double with no integer threshold gets 128, not 84."""
     client = MagicMock()
-    client._capabilities.writemem_post_safe = False
+    client.cached_capabilities.writemem_post_safe = False
     t = Ultimate64Transport(host="h", client=client)
     assert t.rest_put_chunk_size == 128
     t.write_memory(0x4000, _payload(300))
