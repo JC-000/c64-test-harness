@@ -470,9 +470,11 @@ class Ultimate64Client:
         """Release client resources.
 
         The REST side is stateless (a fresh connection per call), so the
-        only work here is the ``/Temp`` hygiene drain: any attachment
-        this client leaked and has not yet collected is collected now,
-        best-effort. See :attr:`temp_hygiene_armed`.
+        only work here is the ``/Temp`` hygiene drain: on an armed client
+        the device's ``/Temp`` is swept now, best-effort -- including
+        attachments some earlier client or lane left behind, even when
+        this client leaked nothing (issue #264). A disarmed client does
+        nothing. See :attr:`temp_hygiene_armed`.
         """
         self._drain_temp_attachments(reason="client close")
         return None
@@ -868,8 +870,13 @@ class Ultimate64Client:
         """Attachments this client has created since the last successful pass."""
         return self._pending_temp_attachments
 
-    def _before_temp_attachment(self, operation: str) -> None:
-        """Refuse or make room before an attachment-creating request.
+    def _before_temp_attachment(self, operation: str, count: int = 1) -> None:
+        """Refuse or make room before *count* attachment-creating requests.
+
+        *count* > 1 reserves an operation's whole cost up front, so a
+        multi-POST operation is never refused half-way through (see
+        :meth:`liveness_probe`, whose second POST restores RAM). For
+        ``count=1`` the condition is exactly ``pending >= budget``.
 
         :raises Ultimate64TempHygieneError: when hygiene is armed, has
             been proven impossible, and ``U64_TEMP_GC_REQUIRED`` has not
@@ -883,7 +890,8 @@ class Ultimate64Client:
         if self._temp_hygiene_blocked is not None:
             self._refuse_or_warn(operation)
             return
-        if self._pending_temp_attachments >= self._temp_gc_budget:
+        pending = self._pending_temp_attachments
+        if pending > 0 and pending + count > self._temp_gc_budget:
             self._run_temp_hygiene(
                 f"budget of {self._temp_gc_budget} attachment(s) spent before {operation}"
             )
@@ -970,13 +978,28 @@ class Ultimate64Client:
             self._in_temp_hygiene = False
 
     def _drain_temp_attachments(self, reason: str = "drain") -> None:
-        """Collect whatever this client leaked. Never raises."""
+        """Sweep the device's ``/Temp`` on the way out. Never raises.
+
+        Runs whether or not *this* client leaked anything (issue #264).
+        The wedge is a property of the device, accumulated across clients,
+        lanes and runs, and :meth:`gc_temp_folder` sweeps ``/Temp``
+        device-wide, so a lane that inherited a crashed neighbour's
+        attachments collects them here instead of handing them on. What
+        keeps a fake host off FTP is arming (a never-answered probe stays
+        disarmed), not the counter.
+
+        A failed sweep is a failed hygiene pass like any other: it gets the
+        one FTP-enable attempt and, if that fails too, blocks this client's
+        later attachment-creating requests.
+        """
         try:
-            if self._pending_temp_attachments <= 0:
-                return
-            # Something leaked, so a device is demonstrably there: settle
-            # the grade before deciding not to clean up after it.
-            self._maybe_reprobe_capabilities()
+            if self._pending_temp_attachments > 0:
+                # Something leaked, so a device is demonstrably there:
+                # settle the grade before deciding not to clean up after
+                # it. Deliberately not done on a zero count -- that would
+                # put a /v1/info GET into close() for every client that
+                # ever completed a request, fake hosts included.
+                self._maybe_reprobe_capabilities()
             if not self.temp_hygiene_armed:
                 return
             self._run_temp_hygiene(reason)
@@ -1055,33 +1078,90 @@ class Ultimate64Client:
         """GET /v1/info — product, firmware_version, fpga_version, etc."""
         return self._get_json("/v1/info")
 
+    #: Body-carrying POSTs one :meth:`liveness_probe` issues: the probe
+    #: write and the restore of the original bytes. Each is a ``/Temp``
+    #: attachment on firmware without upstream #686 (measured on the C64U,
+    #: fw 1.1.0: ``/Temp`` 0 -> 2 for one call; issue #250).
+    LIVENESS_PROBE_TEMP_ATTACHMENTS = 2
+
     def liveness_probe(self, http_timeout: float = 2.0) -> "LivenessResult":
         """Run the writemem-degradation liveness probe against this device.
 
+        **Not free: on leak-prone firmware one call costs two /Temp
+        attachments** (:attr:`LIVENESS_PROBE_TEMP_ATTACHMENTS`). It
+        deliberately exercises ``POST /v1/machine:writemem`` -- a probe
+        write and a restore -- which is the point of it and also the price.
+        Both POSTs count against :attr:`temp_gc_budget` like any other
+        attachment-creating request, and the whole cost is reserved before
+        the probe sends anything: if the budget cannot hold both, the
+        hygiene pass runs first, and if hygiene has been proven impossible
+        this raises :class:`Ultimate64TempHygieneError` without touching the
+        device (so the restore is never the request that gets refused).
+        Diagnose a suspected wedge with bodyless calls first --
+        :meth:`get_info`, :meth:`get_version` and :meth:`read_mem` cost
+        nothing -- and probe once, deliberately.
+
         Delegates to
         :func:`c64_test_harness.backends.ultimate64_probe.liveness_probe`,
-        passing the client's ``host``, ``port``, and ``password``.  Unlike
-        :meth:`get_version` / :meth:`get_info`, this method actively
-        exercises the ``POST /v1/machine:writemem`` path that
-        :func:`probe_u64` does not, and so detects the fw 3.14d
-        writemem-degraded transient state described in issue #107.
+        passing the client's ``host``, ``port`` and ``password`` and a
+        request sender that routes the accounting through this client.
+        Unlike :meth:`get_version` / :meth:`get_info`, it detects the fw
+        3.14d writemem-degraded transient state described in issue #107.
 
         :param http_timeout: per-request socket timeout (default 2 s);
             kept short so a wedged TCP stack returns
             ``failure="tcp_stack_wedged"`` quickly.
         :returns: a structured
             :class:`~c64_test_harness.backends.ultimate64_probe.LivenessResult`.
+        :raises Ultimate64TempHygieneError: see above.
         """
-        from .ultimate64_probe import liveness_probe as _liveness_probe
-        return _liveness_probe(
+        from . import ultimate64_probe as _probe
+
+        cost = self.LIVENESS_PROBE_TEMP_ATTACHMENTS
+        self._before_temp_attachment(
+            f"liveness_probe ({cost} x POST /v1/machine:writemem)", count=cost
+        )
+        if self.temp_hygiene_armed:
+            _log.info(
+                "liveness_probe on %s spends %d /Temp attachments on this "
+                "firmware (%d of %d already pending)",
+                self.host, cost, self._pending_temp_attachments,
+                self._temp_gc_budget,
+            )
+
+        def _accounted(method, host, port, path, password, timeout, **kwargs):
+            # The probe keeps its own raw sender and failure classification;
+            # this only adds what _request adds: the lock check and the
+            # count. The gate already ran above for the whole operation.
+            leaks = self._creates_temp_attachment(method, kwargs.get("body"))
+            if method != "GET":
+                self._check_device_lock(f"{method} {path}")
+            try:
+                result = _probe._liveness_request(
+                    method, host, port, path, password, timeout, **kwargs
+                )
+            finally:
+                if leaks:
+                    self._pending_temp_attachments += 1
+            self._saw_successful_request = True
+            return result
+
+        return _probe.liveness_probe(
             self.host,
             port=self.port,
             password=self.password,
             http_timeout=http_timeout,
+            request=_accounted,
         )
 
     def assert_healthy(self, http_timeout: float = 2.0) -> "LivenessResult":
         """Run :meth:`liveness_probe` and raise on failure.
+
+        Costs what :meth:`liveness_probe` costs: two /Temp attachments per
+        call on leak-prone firmware, and it raises
+        :class:`Ultimate64TempHygieneError` before probing when the hygiene
+        pass cannot run. It reads like a free precondition check and is not
+        one; do not call it in a loop against a C64U.
 
         :raises U64UnreachableError: if the device fails the reachability
             portion (TCP / version GET).

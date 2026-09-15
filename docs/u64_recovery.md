@@ -317,7 +317,14 @@ state is at most 8 resident. Override with `U64_TEMP_GC_BUDGET` or
 and when the device's `DeviceLock` is released (registered via
 `device_lock.register_release_callback`, fired while the flock is still
 held so the device is still exclusively ours) — so a lane hands the
-device to the next one clean. `machine:reboot` does **not** reset the
+device to the next one clean. The drain sweeps whenever the client is
+armed, **even if that client leaked nothing** (issue #264): the wedge is
+per device and `gc_temp_folder` sweeps `/Temp` device-wide, so a lane
+that inherits a crashed neighbour's attachments collects them on the way
+out rather than passing them on. A failed drain is a failed pass like any
+other (one FTP-enable attempt, then later uploads on that client refuse).
+The budget itself is still per client instance — two clients against one
+device spend six each. `machine:reboot` does **not** reset the
 count: it is a C64-level reset, and `/Temp` is a firmware RAM disk
 (`software/filesystem/ramdisk.cc`) that only a firmware power-on clears.
 
@@ -433,8 +440,17 @@ and probing again on a bad result converges on the wedge you are
 diagnosing.** Under the conservative count reading, seven or eight health
 checks are the whole budget. Diagnose with bodyless calls first —
 `get_info()`, `get_version()` and `read_mem()` all cost nothing — and
-reach for `liveness_probe` deliberately, once, knowing the price. Tracked
-as [#250](https://github.com/JC-000/c64-test-harness/issues/250).
+reach for `liveness_probe` deliberately, once, knowing the price.
+
+**Since #250 the client accounts for it.** `Ultimate64Client.liveness_probe`
+(and so `assert_healthy`) routes both POSTs through the client's
+`/Temp` accounting — `LIVENESS_PROBE_TEMP_ATTACHMENTS = 2` — and reserves
+both before sending anything: if the budget cannot hold two, the hygiene
+pass runs first, and if hygiene has been proven impossible it raises
+`Ultimate64TempHygieneError` without touching the device, so the restore
+is never the refused request. The module-level
+`ultimate64_probe.liveness_probe(host, ...)` has no client and no
+accounting; on a leak-prone device call it through the client.
 
 ### Tier 2 — Runner subsystem
 

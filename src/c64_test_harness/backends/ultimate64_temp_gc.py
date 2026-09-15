@@ -14,8 +14,12 @@ established. **The trigger threshold**: one U64E on 3.14d wedged at ~15
 cycles of a 63 KB PRG (n unrecorded), which is the reproduction that
 prompted this module — a datapoint, not a limit, and with no standing for
 a C64U on 1.1.0. It is emphatically *not* a capacity figure: ``/Temp`` is
-a ~3 MB RAM disk, so that is ~31% of it across 15 directory entries, and
-nothing was near exhaustion. ``/Temp`` "filling" does not describe this
+a 16 MiB RAM disk -- ``ramdisk.cc`` sizes it as ``__ram_disk_limit -
+__ram_disk_start`` (``0x02000000``-``0x03000000`` in
+``target/{u64,u64ii}/riscv/ultimate/linker.x`` at tag ``1.1.0``; the
+"3 * 1024 * 1024" comment beside that computation is stale, issue #261) --
+so 15 x 63 KiB = 967,680 bytes is ~5.8% of it across 15 directory entries,
+and nothing was near exhaustion. ``/Temp`` "filling" does not describe this
 wedge and earlier versions of this docstring were wrong to say it did.
 **The crash cause**: the pre-fix ``attachment_writer`` created
 ``/Temp/temp%04x`` from a static counter and never deleted the files, but
@@ -119,16 +123,18 @@ DEFAULT_KEEP = 2
 #: The measurement is much weaker than it is usually quoted as being: one
 #: U64E on 3.14d wedged at about **15** uploads of a 63 KB PRG, n
 #: unrecorded. It has no standing for a C64U on 1.1.0, and it is not a
-#: capacity measurement -- the RAM disk is ~3 MB
-#: (``software/filesystem/ramdisk.cc``), so 945 KB is ~31% of it with 15
-#: directory entries used. Treat 15 as "a device once wedged here", not
-#: as a limit.
+#: capacity measurement -- the RAM disk is 16 MiB (``ramdisk.cc`` computes
+#: ``__ram_disk_limit - __ram_disk_start``, ``0x02000000``-``0x03000000``
+#: in ``target/{u64,u64ii}/riscv/ultimate/linker.x`` at tag ``1.1.0``; cite
+#: that computation, not the stale "3 * 1024 * 1024" comment beside it --
+#: issue #261), so 967,680 bytes is ~5.8% of it with 15 directory entries
+#: used. Treat 15 as "a device once wedged here", not as a limit.
 #:
 #: **What actually fails is the firmware, not the folder.** On a wedged
 #: machine the C64 FPGA keeps running while the device firmware is dead:
 #: it stops answering the network *and* stops responding to the physical
 #: menu button. So this was never about ``/Temp`` running out of room --
-#: at 31% full with 15 entries, nothing was near exhausted, which is why
+#: at ~5.8% of a 16 MiB disk with 15 entries, nothing was near exhausted, which is why
 #: no capacity story ever fit. Accumulation crashes the firmware; the
 #: **cause is not established** (the pre-fix ``attachment_writer``
 #: created ``/Temp/temp%04x`` from a static counter and never deleted
