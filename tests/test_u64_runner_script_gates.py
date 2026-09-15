@@ -856,18 +856,35 @@ def test_the_sandbox_does_not_break_a_clean_refusal(
     assert verified_sandbox["clean refusal"] == 2
 
 
-def _tripwire_invocation_problems(source: str) -> list[str]:
+#: ``os`` attributes that start a process. Called inside the tripwire through
+#: a name bound to ``os``, or imported from it, each bypasses the sandboxed
+#: invocation just as ``subprocess`` would.
+_SPAWNING_OS_ATTRS = frozenset({
+    "system", "popen", "fork", "forkpty", "posix_spawn", "posix_spawnp",
+    "execl", "execle", "execlp", "execlpe", "execv", "execve", "execvp", "execvpe",
+    "spawnl", "spawnle", "spawnlp", "spawnlpe", "spawnv", "spawnve", "spawnvp", "spawnvpe",
+})
+
+
+def _tripwire_invocation_problems(source: str, module_source: str = "") -> list[str]:
     """What is wrong with how *source* (a test function) runs a script.
 
     Structural, not textual (#315): a ``Call`` whose callee is the name
-    ``_run_in_sandbox`` must exist, and ``subprocess`` must not be touched at
-    all -- no import of it, and no call through a name bound to it. The
+    ``_run_in_sandbox`` must exist; ``subprocess`` must not be touched at all
+    (no import of it, no call through a name bound to it); and no process-
+    starting ``os`` function (:data:`_SPAWNING_OS_ATTRS`) may be called. The
     textual version passed a tripwire that ran ``subprocess.Popen`` with
     ``_run_in_sandbox(`` present only in a comment.
 
-    Known limit: a primitive reached some other way (``os.posix_spawn``,
-    ``importlib.import_module("subprocess")``) is not modelled. That is a
-    deliberate evasion; the threat model is an accidental rewrite.
+    Names are bound from the function's own imports **and** from
+    *module_source*'s import-time imports (review round 1 of #361): a
+    module-level ``import subprocess as sp`` or ``from subprocess import
+    run`` is otherwise invisible to a scan of one function.
+
+    Known limits: a primitive reached without a name bound by an import
+    (``importlib.import_module("subprocess")``, ``getattr(os, "system")``,
+    ``__import__``, ``ctypes``) is not modelled. That is a deliberate
+    evasion; the threat model is an accidental rewrite.
     """
     import textwrap
 
@@ -880,23 +897,54 @@ def _tripwire_invocation_problems(source: str) -> list[str]:
         for n in ast.walk(tree)
     ):
         problems.append("no call to _run_in_sandbox")
-    bound = {"subprocess"}
+
+    subprocess_names = {"subprocess"}
+    os_names = {"os"}
+    spawn_names: set[str] = set()
+
+    def bind(node: ast.AST, report: bool) -> None:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top == "subprocess":
+                    subprocess_names.add(alias.asname or "subprocess")
+                    if report:
+                        problems.append(f"line {node.lineno}: imports subprocess")
+                elif top == "os":
+                    os_names.add(alias.asname or "os")
+        elif isinstance(node, ast.ImportFrom):
+            top = (node.module or "").split(".")[0]
+            if top == "subprocess":
+                spawn_names.update(a.asname or a.name for a in node.names)
+                if report:
+                    problems.append(f"line {node.lineno}: imports from subprocess")
+            elif top == "os":
+                spawn_names.update(
+                    a.asname or a.name for a in node.names if a.name in _SPAWNING_OS_ATTRS
+                )
+
+    if module_source:
+        for node in _import_time_nodes(ast.parse(module_source)):
+            bind(node, report=False)
+    for node in ast.walk(tree):
+        bind(node, report=True)
+
     for n in ast.walk(tree):
-        if isinstance(n, ast.Import):
-            for alias in n.names:
-                if alias.name.split(".")[0] == "subprocess":
-                    bound.add(alias.asname or "subprocess")
-                    problems.append(f"line {n.lineno}: imports subprocess")
-        elif isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[0] == "subprocess":
-            bound |= {a.asname or a.name for a in n.names}
-            problems.append(f"line {n.lineno}: imports from subprocess")
-    for n in ast.walk(tree):
-        if isinstance(n, ast.Call):
-            root = n.func
-            while isinstance(root, ast.Attribute):
-                root = root.value
-            if isinstance(root, ast.Name) and root.id in bound:
-                problems.append(f"line {n.lineno}: calls {ast.unparse(n.func)}")
+        if not isinstance(n, ast.Call):
+            continue
+        chain: list[str] = []
+        root = n.func
+        while isinstance(root, ast.Attribute):
+            chain.append(root.attr)
+            root = root.value
+        if not isinstance(root, ast.Name):
+            continue
+        if (
+            root.id in subprocess_names
+            or (not chain and root.id in spawn_names)
+            or (chain and root.id in os_names and chain[-1] in _SPAWNING_OS_ATTRS)
+        ):
+            problems.append(f"line {n.lineno}: calls {ast.unparse(n.func)}")
     return problems
 
 
@@ -934,6 +982,43 @@ def test_the_tripwire_invocation_check_can_fail() -> None:
     for label, source in must_flag.items():
         assert _tripwire_invocation_problems(source), f"missed: {label}"
 
+    # Review round 1 of #361: names bound at module level. Each body passes
+    # without the module's imports, so the control proves the seeding.
+    fn = clean
+    module_level = {
+        "module-level `import subprocess as sp` + sp.run": (
+            "import subprocess as sp\n",
+            fn + "    sp.run([sys.executable, script_name])\n",
+        ),
+        "module-level `from subprocess import run` + run(...)": (
+            "from subprocess import run\n",
+            fn + "    run([sys.executable, script_name])\n",
+        ),
+        "module-level `import os as o` + o.posix_spawn": (
+            "import os as o\n",
+            fn + "    o.posix_spawn('/bin/echo', ['/bin/echo'], {})\n",
+        ),
+        "module-level `from os import system` + system(...)": (
+            "from os import system\n",
+            fn + "    system('echo hi')\n",
+        ),
+    }
+    for label, (module, body) in module_level.items():
+        assert _tripwire_invocation_problems(body, module), f"missed: {label}"
+        assert _tripwire_invocation_problems(body) == [], (
+            f"{label}: flagged without the module's imports, so this control "
+            f"does not test the seeding"
+        )
+    assert _tripwire_invocation_problems(fn + "    os.system('echo hi')\n"), (
+        "missed: os.system"
+    )
+    # ...while reading os.environ and building paths is not a spawn.
+    assert _tripwire_invocation_problems(
+        fn + "    env = {k: v for k, v in os.environ.items()}\n"
+        + "    p = os.path.join('a', 'b')\n",
+        "import os\n",
+    ) == []
+
 
 def test_the_tripwire_cannot_run_before_its_controls() -> None:
     """Pin the ordering as a dependency, since order in the file is not one.
@@ -965,7 +1050,9 @@ def test_the_tripwire_cannot_run_before_its_controls() -> None:
     # tripwire running ``[sys.executable, script]`` with no preamble left
     # every test here green while the scripts ran with the network intact.
     tripwire_source = inspect.getsource(test_script_refuses_cleanly_with_no_host)
-    problems = _tripwire_invocation_problems(tripwire_source)
+    problems = _tripwire_invocation_problems(
+        tripwire_source, Path(__file__).read_text()
+    )
     assert problems == [], (
         "the tripwire no longer runs scripts only through _run_in_sandbox, the "
         f"invocation the controls verified: {problems}"
@@ -2277,16 +2364,21 @@ def _escaped_device_objects(tree, aliases, parents, locking_with) -> list[str]:
     Binding shapes: ``name = <device call>`` and ``with <device call> as name``
     anywhere in the block's body. A later reference is any ``Load`` of that
     name in the same scope (the nearest enclosing function, else the module)
-    that starts after the block ends **and before the name's first
-    rebinding** after the block (#338): ``c = None`` then ``print(c)`` is not
-    the device object. The rebinding takes effect where its value has been
-    evaluated, so ``c = c.reset()`` still flags the ``c`` it reads.
+    that starts after the block ends and is not **hidden by a rebinding**
+    (#338). A rebinding statement S hides the object only from a ``Load``
+    that is either nested inside S and evaluated after the binding takes
+    effect (``for c in range(3): print(c)``, while ``c = c.reset()`` still
+    reads the object), or nested inside a later sibling of S in the
+    statement list that owns S (``c = None`` then ``print(c)``). So a
+    rebinding in one branch (``if x: c = None``) does not hide a
+    ``c.reset()`` after the ``if``, and that read is flagged. This is a
+    dominance approximation, not flow analysis (review round 1 of #361).
 
-    Stated limits (asserted as not flagged in the planted-regressions test):
+    Stated limits (asserted in the planted-regressions test):
 
-    * the first rebinding is **textual, not flow-sensitive**: a rebinding in
-      one branch (``if x: c = None``) stops tracking for a later
-      unconditional ``c.reset()`` too;
+    * **conservative:** a rebinding in *every* branch (``if x: c = None`` /
+      ``else: c = None``) does not hide a read after the ``if``, which is
+      flagged although no path reaches it holding the device object;
     * a tuple target ``c, n = Ultimate64Client(h), 1`` is not a binding;
     * an attribute target (``self.c = ...`` then ``self.c.reset()``);
     * a walrus ``(c := Ultimate64Client(h))``;
@@ -2321,7 +2413,7 @@ def _escaped_device_objects(tree, aliases, parents, locking_with) -> list[str]:
             scope = parents.get(scope)
         end = block.end_lineno or block.lineno
         region = scope if scope is not None else tree
-        rebound_at: dict[str, tuple[int, int]] = {}
+        hiders: dict[str, list[tuple[ast.stmt, tuple[int, int]]]] = {}
         for node in ast.walk(region):
             if (
                 isinstance(node, ast.Name)
@@ -2330,24 +2422,59 @@ def _escaped_device_objects(tree, aliases, parents, locking_with) -> list[str]:
                 and node.lineno > end
             ):
                 position = _rebinding_position(node, parents)
-                if position is not None and position < rebound_at.get(
-                    node.id, (float("inf"), 0)
-                ):
-                    rebound_at[node.id] = position
+                stmt = _enclosing_statement(node, parents)
+                if position is not None and stmt is not None:
+                    hiders.setdefault(node.id, []).append((stmt, position))
         for node in ast.walk(region):
             if (
                 isinstance(node, ast.Name)
                 and isinstance(node.ctx, ast.Load)
                 and node.id in bound
                 and node.lineno > end
-                and (node.lineno, node.col_offset)
-                < rebound_at.get(node.id, (float("inf"), 0))
+                and not any(
+                    _rebinding_hides(stmt, position, node, parents)
+                    for stmt, position in hiders.get(node.id, ())
+                )
             ):
                 offenders.append(
                     f"line {node.lineno}: {node.id} was built under the lock at "
                     f"line {block.lineno} but is used after the lock is released"
                 )
     return offenders
+
+
+def _enclosing_statement(node: ast.AST, parents) -> ast.stmt | None:
+    while node is not None and not isinstance(node, ast.stmt):
+        node = parents.get(node)
+    return node
+
+
+def _is_within(node: ast.AST, ancestor: ast.AST, parents) -> bool:
+    while node is not None:
+        if node is ancestor:
+            return True
+        node = parents.get(node)
+    return False
+
+
+def _rebinding_hides(stmt: ast.stmt, position, load: ast.Name, parents) -> bool:
+    """Whether the rebinding statement *stmt* hides the device object from *load*.
+
+    Nested inside *stmt* and evaluated after the binding takes effect, or
+    nested inside a later sibling of *stmt* in the statement list that owns it.
+    """
+    if _is_within(load, stmt, parents):
+        return (load.lineno, load.col_offset) >= position
+    owner = parents.get(stmt)
+    for field in ("body", "orelse", "finalbody", "handlers"):
+        siblings = getattr(owner, field, None)
+        if not isinstance(siblings, list):
+            continue
+        for index, sibling in enumerate(siblings):
+            if sibling is stmt:
+                later = siblings[index + 1:]
+                return any(_is_within(load, s, parents) for s in later)
+    return False
 
 
 def _rebinding_position(name: ast.Name, parents) -> tuple[int, int] | None:
@@ -2508,6 +2635,34 @@ def test_the_lock_scan_flags_planted_regressions() -> None:
             + "    c.reset()\n"
             + "    c = None\n"
         ),
+        # Review round 1 of #361: a rebinding in one branch does not hide a
+        # read after the branch.
+        "rebinding in one branch does not hide a later read": (
+            helper + client
+            + "def main(h, x):\n"
+            + "    with hold_device_lock(h):\n"
+            + "        c = Ultimate64Client(host=h)\n"
+            + "    if x:\n"
+            + "        c = None\n"
+            + "    c.reset()\n"
+        ),
+        "a store before the block does not hide a read after it": (
+            helper + client
+            + "def main(h):\n"
+            + "    c = None\n"
+            + "    with hold_device_lock(h):\n"
+            + "        c = Ultimate64Client(host=h)\n"
+            + "    c.reset()\n"
+        ),
+        "rebinding in a loop body does not hide a read after the loop": (
+            helper + client
+            + "def main(h, items):\n"
+            + "    with hold_device_lock(h):\n"
+            + "        c = Ultimate64Client(host=h)\n"
+            + "    while items:\n"
+            + "        c = None\n"
+            + "    c.reset()\n"
+        ),
         "device object from `with ... as` used after the lock": (
             helper
             + "from c64_test_harness.backends.ultimate64 import Ultimate64Transport\n"
@@ -2555,7 +2710,7 @@ def test_the_lock_scan_flags_planted_regressions() -> None:
             + "        c.reset()\n"
             + "    print('done')\n"
         ),
-        # #338: tracking stops at the first rebinding after the block.
+        # #338: a rebinding hides the object from what it dominates.
         "name rebound after the lock, then read": (
             helper + client
             + "def main(h):\n"
@@ -2580,6 +2735,24 @@ def test_the_lock_scan_flags_planted_regressions() -> None:
             + "    for c in range(3):\n"
             + "        print(c)\n"
         ),
+        "rebinding, then a read nested in a later block": (
+            helper + client
+            + "def main(h, x):\n"
+            + "    with hold_device_lock(h):\n"
+            + "        c = Ultimate64Client(host=h)\n"
+            + "    c = None\n"
+            + "    if x:\n"
+            + "        print(c)\n"
+        ),
+        "rebinding inside a branch hides a read later in that branch": (
+            helper + client
+            + "def main(h, x):\n"
+            + "    with hold_device_lock(h):\n"
+            + "        c = Ultimate64Client(host=h)\n"
+            + "    if x:\n"
+            + "        c = None\n"
+            + "        print(c)\n"
+        ),
         "nested function defined under the lock": (
             helper + client
             + "def run(h):\n    with hold_device_lock(h):\n"
@@ -2596,15 +2769,6 @@ def test_the_lock_scan_flags_planted_regressions() -> None:
     # Stated limits of the escape tracking (_escaped_device_objects), asserted
     # so each stays known. If one starts being flagged, update that docstring.
     known_misses = {
-        "rebinding in one branch stops tracking (textual, not flow-sensitive)": (
-            helper + client
-            + "def main(h, x):\n"
-            + "    with hold_device_lock(h):\n"
-            + "        c = Ultimate64Client(host=h)\n"
-            + "    if x:\n"
-            + "        c = None\n"
-            + "    c.reset()\n"
-        ),
         "tuple target": (
             helper + client
             + "def main(h):\n"
@@ -2642,6 +2806,24 @@ def test_the_lock_scan_flags_planted_regressions() -> None:
             f"a stated limit of the escape tracking is now flagged ({label}); "
             f"update _escaped_device_objects' docstring"
         )
+
+    # Conservative by design, stated in the docstring: a rebinding in every
+    # branch does not hide the read after the ``if``.
+    every_branch = (
+        helper + client
+        + "def main(h, x):\n"
+        + "    with hold_device_lock(h):\n"
+        + "        c = Ultimate64Client(host=h)\n"
+        + "    if x:\n"
+        + "        c = None\n"
+        + "    else:\n"
+        + "        c = None\n"
+        + "    c.reset()\n"
+    )
+    assert _device_lock_offenders(every_branch), (
+        "a rebinding in every branch now hides the read after the if; update "
+        "the conservative limit in _escaped_device_objects' docstring"
+    )
 
 
 def test_the_pytest_runners_are_locked_by_conftest() -> None:
