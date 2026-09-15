@@ -299,6 +299,16 @@ HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
         configurable="scratch_addr=",
     ),
     ScratchRegion(
+        0x0334, 0x033C,
+        owner="backends.ultimate64_probe.probe_u64",
+        purpose="check_write=True only (#241): 8 bytes read, overwritten "
+                "with their inverse by a query-string PUT writemem (no "
+                "body, no /Temp attachment), read back, then written back "
+                "and verified; an unconfirmed restore logs a WARNING",
+        configurable="hardcoded",
+        transient=True,
+    ),
+    ScratchRegion(
         0x0334, 0x03B4,
         owner="backends.ultimate64_probe.liveness_probe",
         purpose="128-byte writemem POST round-trip payload via the raw "

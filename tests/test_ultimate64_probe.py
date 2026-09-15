@@ -23,6 +23,153 @@ from c64_test_harness.backends.ultimate64_probe import (
 )
 
 
+# ---- probe_u64(check_write=True): the write path (#241) ------------------
+
+
+class _FakeDevice:
+    """A REST memory map behind probe_u64's injectable sender.
+
+    ``put_applies=False`` models the #241 degraded state: every request
+    answers, ``PUT machine:writemem`` returns 200, but memory never changes.
+    """
+
+    def __init__(self, *, put_applies: bool = True, put_status: int = 200,
+                 apply_on_error: bool = False) -> None:
+        self.mem = bytearray(0x10000)
+        self.mem[0x0334:0x033C] = bytes([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88])
+        self.put_applies = put_applies
+        self.put_status = put_status
+        #: Apply the write even when answering non-200 (a device whose status
+        #: is wrong while its memory path works).
+        self.apply_on_error = apply_on_error
+        self.calls: list[tuple[str, str, str | None, bytes | None]] = []
+
+    def __call__(self, method, host, port, path, password, timeout, *,
+                 body=None, content_type=None, query=None):
+        self.calls.append((method, path, query, body))
+        args = dict(kv.split("=", 1) for kv in (query or "").split("&") if kv)
+        addr = int(args.get("address", "0"), 16)
+        if method == "GET" and path == "/v1/machine:readmem":
+            n = int(args["length"])
+            return 200, bytes(self.mem[addr:addr + n])
+        if method == "PUT" and path == "/v1/machine:writemem":
+            data = bytes.fromhex(args["data"])
+            if self.put_applies and (self.put_status == 200 or self.apply_on_error):
+                self.mem[addr:addr + len(data)] = data
+            return self.put_status, b"{}"
+        return 404, b""
+
+
+_PROBE_OK = dict(
+    ping=(True, 1.0), port=(True, 1.0), api=(True, {"version": "0.1"}),
+)
+
+
+def _probe_with(device, **kwargs):
+    with patch("c64_test_harness.backends.ultimate64_probe.ping_host",
+               return_value=_PROBE_OK["ping"]), \
+         patch("c64_test_harness.backends.ultimate64_probe.check_port",
+               return_value=_PROBE_OK["port"]), \
+         patch("c64_test_harness.backends.ultimate64_probe.check_api",
+               return_value=_PROBE_OK["api"]):
+        return probe_u64("10.0.0.1", request=device, **kwargs)
+
+
+def test_check_write_reports_a_dead_write_path():
+    """#241: reads answer, the PUT answers 200, memory does not change."""
+    dev = _FakeDevice(put_applies=False)
+    result = _probe_with(dev, check_write=True)
+    assert result.write_ok is False
+    # ``reachable`` keeps its reads-only meaning; the write verdict is its own field.
+    assert result.reachable is True
+    assert result.error and "write" in result.error.lower()
+
+
+def test_check_write_passes_and_restores_on_a_healthy_device():
+    dev = _FakeDevice()
+    before = bytes(dev.mem)
+    result = _probe_with(dev, check_write=True)
+    assert result.write_ok is True
+    assert result.error is None
+    assert bytes(dev.mem) == before, "scratch bytes not restored"
+    assert any(m == "PUT" for m, _, _, _ in dev.calls), "no write was attempted"
+
+
+def test_check_write_never_sends_a_body():
+    """Zero /Temp cost on any firmware: only GETs and query-string PUTs."""
+    dev = _FakeDevice()
+    _probe_with(dev, check_write=True)
+    assert dev.calls
+    assert {m for m, _, _, _ in dev.calls} <= {"GET", "PUT"}
+    assert all(body is None for _, _, _, body in dev.calls)
+    for method, path, query, _ in dev.calls:
+        if method == "PUT":
+            args = dict(kv.split("=", 1) for kv in query.split("&"))
+            assert len(bytes.fromhex(args["data"])) <= 128
+            addr = int(args["address"], 16)
+            # Inside the liveness probe's declared-transient span.
+            assert 0x0334 <= addr and addr + len(bytes.fromhex(args["data"])) <= 0x03B4
+
+
+def test_check_write_pattern_differs_from_the_original():
+    """A write of the bytes already there cannot tell a dead path from a live one."""
+    dev = _FakeDevice()
+    original = bytes(dev.mem[0x0334:0x033C])
+    _probe_with(dev, check_write=True)
+    first_put = next(q for m, p, q, _ in dev.calls if m == "PUT")
+    args = dict(kv.split("=", 1) for kv in first_put.split("&"))
+    assert bytes.fromhex(args["data"]) != original
+
+
+def test_check_write_non_200_put_is_a_failure():
+    dev = _FakeDevice(put_status=404)
+    result = _probe_with(dev, check_write=True)
+    assert result.write_ok is False
+    assert result.reachable is True
+
+
+def test_check_write_non_200_put_fails_even_if_the_bytes_landed():
+    """The status is part of the contract, not only the read-back.
+
+    A route answering 500 while memory changes is not a healthy write path
+    for any caller that checks status (every client call does).  Kills the
+    mutant that drops the status branch and trusts the read-back alone.
+    """
+    dev = _FakeDevice(put_status=500, apply_on_error=True)
+    result = _probe_with(dev, check_write=True)
+    assert result.write_ok is False
+    assert result.error and "500" in result.error
+
+
+def test_check_write_connection_error_is_a_failure():
+    def boom(*a, **k):
+        raise urllib.error.URLError("reset")
+
+    result = _probe_with(boom, check_write=True)
+    assert result.write_ok is False
+    assert result.reachable is True
+
+
+def test_check_write_span_is_a_declared_transient_scratch_region():
+    """The write check's span is registered in HARNESS_SCRATCH (docs/memory_safety.md)."""
+    from c64_test_harness.backends import ultimate64_probe as probe_mod
+    from c64_test_harness.memory_policy import HARNESS_SCRATCH
+
+    lo = probe_mod._WRITE_CHECK_ADDR
+    hi = lo + probe_mod._WRITE_CHECK_LEN
+    owned = [r for r in HARNESS_SCRATCH
+             if "ultimate64_probe.probe_u64" in r.owner and r.transient
+             and r.start <= lo and hi <= r.end]
+    assert owned, (lo, hi)
+
+
+def test_check_write_is_off_by_default_and_sends_nothing():
+    dev = _FakeDevice()
+    result = _probe_with(dev)
+    assert result.write_ok is None
+    assert dev.calls == []
+
+
 # ---- ping_host ---------------------------------------------------------
 
 
