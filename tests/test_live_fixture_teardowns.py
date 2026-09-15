@@ -122,16 +122,30 @@ class _FakeClient(_Fake):
     # The entry-value reads the pre-#412 RR-Net fixtures made, so their red run
     # fails on the restored value rather than on a missing method.
     def get_config_value(self, category: str, item: str):
-        return self.get_config_item(category, item).get("current")
+        entry = self.get_config_item(category, item)
+        if "current" not in entry:  # as the real client
+            from c64_test_harness import Ultimate64ProtocolError
+
+            raise Ultimate64ProtocolError(
+                f"config item {category!r}/{item!r} has no 'current' value: {entry!r}"
+            )
+        return entry["current"]
 
     def get_config_category(self, category: str) -> dict:
+        """The real envelope: ``{category: {item: current, ...}, "errors": []}``.
+        An item never written falls back to its entry value, as above."""
         client = self
 
-        class _Currents:
-            def __getitem__(self, item: str):
+        class _Items(dict):
+            def __missing__(self, item: str):
                 return client.get_config_value(category, item)
 
-        return {category: _Currents()}
+        items = _Items({
+            item: entry["current"]
+            for (cat, item), entry in self.config.items()
+            if cat == category and "current" in entry
+        })
+        return {category: items, "errors": []}
 
     def set_config_item(self, category: str, item: str, value) -> None:
         self._do(("config", category, item, value))
@@ -844,6 +858,23 @@ class TestRrnetPreferenceRestoresTheDefault:
         with pytest.raises(RuntimeError, match="no default"):
             next(gen)
         assert not [e for e in probe.journal if isinstance(e, tuple)], probe.journal
+        assert probe.journal[-2:] == ["instance exit", "manager exit"]
+        if module.__name__.endswith("first_exchange_live"):
+            # session opens the capture before the manager: a refusal still
+            # closes it (the plan read sits inside the try; #448 review R7)
+            assert "cap.close" in probe.journal, probe.journal
+
+    def test_a_failed_restore_does_not_mask_the_test_body_exception(
+        self, probe, start
+    ) -> None:
+        """The failures are raised after the ``finally``, so an exception
+        leaving the ``yield`` wins (#448 review R4/R4b)."""
+        module, gen = start(probe)
+        next(gen)
+        probe.fail.add(("config", module.CAT, module.ITEM, _default(module.ITEM)))
+        with pytest.raises(KeyError, match="test body"):
+            gen.throw(KeyError("test body"))
+        assert ("config", module.CAT, module.ITEM, _default(module.ITEM)) in probe.journal
         assert probe.journal[-2:] == ["instance exit", "manager exit"]
 
     def test_a_drifted_entry_warns_naming_the_entry_value(self, probe, start, caplog) -> None:
