@@ -182,6 +182,7 @@ _DEC_ABS = 0xCE
 _BNE     = 0xD0
 _BEQ     = 0xF0
 _INY     = 0xC8
+_CPY_IMM = 0xC0
 _DEX     = 0xCA
 _JMP_ABS = 0x4C
 _TAX     = 0xAA
@@ -203,6 +204,13 @@ _RESP_LEN_ADDR = 0xC3F0   # 2-byte LE response length
 _STAT_LEN_ADDR = 0xC3F2   # 2-byte LE status length
 _SENTINEL_ADDR = 0xC3FE   # completion sentinel
 _ERROR_ADDR    = 0xC3FF   # error flag
+
+#: Room in the status buffer: ``$C300`` up to the next field (``$C3F0``).
+#: The firmware may send up to ``CMD_MAX_STATUS_LEN`` = 256 status bytes
+#: (``software/io/command_interface/command_intf.h:58``), more than fits,
+#: so both the 6502 drain and :func:`_read_status_string` clamp here
+#: (issue #281).
+_STATUS_BUF_LEN = _RESP_LEN_ADDR - _STATUS_ADDR
 
 _SENTINEL_DONE = 0x42     # magic value written on completion
 
@@ -435,27 +443,59 @@ def _build_read_response(resp_addr: int, resp_len_addr: int) -> list[int]:
     ]
 
 
-def _build_read_status(status_addr: int, stat_len_addr: int) -> list[int]:
+def _check_status_max_len(max_len: int) -> None:
+    if not 1 <= max_len <= 0xFF:
+        raise ValueError(
+            f"status max_len must be 1..255 (Y-indexed store), got {max_len}"
+        )
+
+
+def _build_read_status(
+    status_addr: int,
+    stat_len_addr: int,
+    max_len: int = _STATUS_BUF_LEN,
+) -> list[int]:
     """6502 fragment: read status string into status_addr, count into stat_len_addr.
 
     Same structure as _build_read_response but reads from $DF1F and
     checks BIT_STAT_AV (bit 6). No control write between reads — see
     :func:`_build_read_response`. The status queue must be fully drained
     *before* the accept, which destroys it.
+
+    At most *max_len* bytes are stored (default :data:`_STATUS_BUF_LEN`,
+    240); the rest are still read, so the queue is drained, but not
+    stored.  The firmware may send 256 (``CMD_MAX_STATUS_LEN``), and the
+    old ``INY / BNE`` loop stored all of them, through the length fields,
+    sentinel and error flag at ``$C3F0-$C3FF`` (issue #281).  The length
+    is written as two bytes, high byte an explicit zero.
+
+    ::
+
+            LDY #0 ; STY len ; STY len+1
+        loop:
+            LDA $DF1C ; AND #STAT_AV ; BEQ done
+            LDA $DF1F
+            CPY #max_len ; BEQ loop      ; full: drain without storing
+            STA status,Y ; INY ; BNE loop  ; Y <= max_len < 256, always taken
+        done:
+            STY len
     """
+    _check_status_max_len(max_len)
     return [
         _LDY_IMM, 0x00,
-        _STA_ABS, _lo(stat_len_addr), _hi(stat_len_addr),
-        _STA_ABS, _lo(stat_len_addr + 1), _hi(stat_len_addr + 1),
-        # loop:
+        _STY_ABS, _lo(stat_len_addr), _hi(stat_len_addr),
+        _STY_ABS, _lo(stat_len_addr + 1), _hi(stat_len_addr + 1),
+        # loop (+0):
         _LDA_ABS, _lo(UCI_CONTROL_STATUS_REG), _hi(UCI_CONTROL_STATUS_REG),
         _AND_IMM, BIT_STAT_AV,
-        _BEQ, 9,
+        _BEQ, 13,                       # +5  -> done (+20)
         _LDA_ABS, _lo(UCI_STATUS_DATA_REG), _hi(UCI_STATUS_DATA_REG),
+        _CPY_IMM, max_len,              # +10
+        _BEQ, 0xF2,                     # +12 -> loop (-14)
         _STA_ABS_Y, _lo(status_addr), _hi(status_addr),
         _INY,
-        _BNE, 0xF0,
-        # done:
+        _BNE, 0xEC,                     # +18 -> loop (-20)
+        # done (+20):
         _STY_ABS, _lo(stat_len_addr), _hi(stat_len_addr),
     ]
 
@@ -694,13 +734,24 @@ def _build_read_status_tsx(
     status_addr: int,
     stat_len_addr: int,
     fence: bool = True,
+    max_len: int = _STATUS_BUF_LEN,
 ) -> list[int]:
     """Turbo-safe ``_build_read_status`` — same shape as the response
-    reader but reads $DF1F and tests BIT_STAT_AV."""
+    reader but reads $DF1F and tests BIT_STAT_AV.
+
+    Stores at most *max_len* bytes and drains the rest, as
+    :func:`_build_read_status` does (issue #281)::
+
+        LDA $DF1F ; <fence>
+        CPY #max_len ; BNE store ; JMP loop   ; full: drain without storing
+    store:
+        STA status,Y ; INY ; JMP loop
+    """
+    _check_status_max_len(max_len)
     out: list[int] = []
     out.extend([_LDY_IMM, 0x00])
-    out.extend([_STA_ABS, _lo(stat_len_addr), _hi(stat_len_addr)])
-    out.extend([_STA_ABS, _lo(stat_len_addr + 1),
+    out.extend([_STY_ABS, _lo(stat_len_addr), _hi(stat_len_addr)])
+    out.extend([_STY_ABS, _lo(stat_len_addr + 1),
                 _hi(stat_len_addr + 1)])
 
     loop_abs = pc + len(out)
@@ -722,6 +773,9 @@ def _build_read_status_tsx(
                 _hi(UCI_STATUS_DATA_REG)])
     if fence:
         out.extend(_build_fence())
+    out.extend([_CPY_IMM, max_len])
+    out.extend([_BNE, 0x03])            # -> store
+    out.extend([_JMP_ABS, _lo(loop_abs), _hi(loop_abs)])  # full: drain only
     out.extend([_STA_ABS_Y, _lo(status_addr), _hi(status_addr)])
     out.append(_INY)
     out.extend([_JMP_ABS, _lo(loop_abs), _hi(loop_abs)])
@@ -1688,6 +1742,7 @@ def _read_status_string(
     *,
     status_addr: int = _STATUS_ADDR,
     stat_len_addr: int = _STAT_LEN_ADDR,
+    max_len: int = _STATUS_BUF_LEN,
 ) -> str:
     """Read the status string the routine collected, or ``""``.
 
@@ -1701,10 +1756,15 @@ def _read_status_string(
     thing that tells e.g. the firmware's three zero-length
     ``GET_IPADDR`` branches apart (``network_target.cc:80-100``).
 
-    Only the low byte of the length is read, matching every other
-    length read in this module.
+    The length is the full 2-byte little-endian field, clamped to
+    *max_len* (default :data:`_STATUS_BUF_LEN`, the 240 bytes before
+    ``$C3F0``).  The drain never records more than that, but a
+    one-byte read of a stale or foreign ``$0100`` would report no status
+    at all, and an unclamped length would read past the buffer into the
+    length fields (issue #281).
     """
-    stat_len = transport.read_memory(stat_len_addr, 1)[0]
+    lo, hi = transport.read_memory(stat_len_addr, 2)[:2]
+    stat_len = min(lo | (hi << 8), max_len)
     if stat_len == 0:
         return ""
     raw = transport.read_memory(status_addr, stat_len)

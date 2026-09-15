@@ -58,7 +58,8 @@ def _empty_reply_transport(status: bytes = STATUS_82) -> MagicMock:
         if addr == _RESP_LEN_ADDR:
             return b"\x00"           # zero-length reply
         if addr == _STAT_LEN_ADDR:
-            return bytes([len(status)])
+            # 2-byte little-endian field (issue #281).
+            return bytes([len(status), 0])[:length]
         if _STATUS_ADDR <= addr < _STATUS_ADDR + max(len(status), 1):
             off = addr - _STATUS_ADDR
             return status[off:off + length]
