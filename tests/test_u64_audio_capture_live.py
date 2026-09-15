@@ -13,13 +13,17 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
 import time
 
 import pytest
 
 from c64_test_harness.backends.device_lock import DeviceLock
 from c64_test_harness.backends.render_wav_u64 import capture_sid_u64
-from c64_test_harness.backends.u64_audio_capture import AudioCapture
+from c64_test_harness.backends.u64_audio_capture import (
+    EPHEMERAL_AUDIO_PORT,
+    AudioCapture,
+)
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
 from c64_test_harness.backends.ultimate64_helpers import (
     CAT_SID_SOCKETS,
@@ -187,14 +191,35 @@ def test_stream_audio_start_stop(u64_client: Ultimate64Client) -> None:
 # Capture tests
 # ======================================================================
 
+def _local_ip_towards(host: str) -> str:
+    """The local address the kernel would use to reach *host*."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect((host, 80))
+        return s.getsockname()[0]
+
+
 def test_capture_silence(u64_client: Ultimate64Client, tmp_path) -> None:
-    """Capture audio without playing a SID -- U64 still streams PCM."""
+    """Capture audio without playing a SID -- U64 still streams PCM.
+
+    Streams **unicast** to this host on an OS-chosen port, and asserts
+    packets arrived.  It used to stream to the multicast default
+    ``239.0.1.65:11001`` with a receiver that never joined the group, and
+    asserted only that a WAV existed -- which a zero-packet capture
+    satisfies, because ``write_wav`` writes a 44-byte header for no frames
+    (#239).  Measured on the U64E 2026-09-15, 3 interleaved rounds of 1 s:
+    unjoined, joined on INADDR_ANY and joined on the en0 address all
+    received **0** packets; unicast received 278/281/339.  So the old
+    pass never proved a capture on this bench.  The fixed port was also a
+    cross-lane collision (#237); ``EPHEMERAL_AUDIO_PORT`` removes it.
+    """
     wav_path = tmp_path / "silence.wav"
-    capture = AudioCapture(port=11001)
+    capture = AudioCapture(port=EPHEMERAL_AUDIO_PORT)
     stream_started = False
     try:
         capture.start()
-        u64_client.stream_audio_start(f"239.0.1.65:11001")
+        u64_client.stream_audio_start(
+            f"{_local_ip_towards(u64_client.host)}:{capture.port}"
+        )
         stream_started = True
         time.sleep(1.0)
     finally:
@@ -206,7 +231,11 @@ def test_capture_silence(u64_client: Ultimate64Client, tmp_path) -> None:
         result = capture.stop(wav_path=wav_path)
 
     assert wav_path.exists(), "WAV file was not created"
-    assert wav_path.stat().st_size > 0, "WAV file is empty"
+    assert result.packets_received > 0, (
+        "No audio packets received -- a WAV exists either way, so this "
+        "is the assertion that proves the stream reached the capture"
+    )
+    assert result.total_samples > 0, "Capture holds no PCM frames"
     logger.info(
         "Silence capture: %.2fs, %d packets, %d dropped",
         result.duration_seconds,
