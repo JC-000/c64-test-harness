@@ -753,7 +753,7 @@ Every REST call that carries a **body** leaves a managed attachment (`temp0000`,
 
 **"`/Temp` fills up" is the wrong model — the firmware crashes.** Owner's operational observation from wedged machines (2026-09-10): the C64 FPGA keeps running, so the machine looks alive, but the **device firmware is dead** — it stops answering the network *and* stops responding to the physical **menu button** on the case. A full filesystem does not do that. What is established is that `/Temp` accumulation triggers it; the **trigger threshold and the crash cause are both unestablished**, and nothing here names a cause.
 
-The arithmetic never supported a capacity story either. The one figure in circulation — "~15 cycles of **a 63 KB PRG**" (that module docstring and the constant comment beside it in `backends/ultimate64_temp_gc.py`; note both still carry the stale ~3 MB / ~31% arithmetic corrected below — issue #261; **delete this parenthetical when #261 lands**) — was measured on the **U64E while it ran 3.14d**, **n unrecorded**, on a device that now runs 3.15 and is no longer leak-prone; nothing has measured any threshold on a C64U at 1.1.0. And the firmware's RAM disk is **16 MiB** — `ramdisk.cc` takes its size from the linker symbols `__ram_disk_start` (`0x02000000`) and `__ram_disk_limit` (`0x03000000`) in `target/u64/riscv/ultimate/linker.x` and `target/u64ii/riscv/ultimate/linker.x` at tag `1.1.0`; the "3 MB" in that file is a stale trailing comment and was repeated across this repo (issue #261). So those fifteen PRGs are 967,680 B — about **5.8% used** at the one wedge on record. Neither free clusters nor directory entries were plausibly exhausted.
+The arithmetic never supported a capacity story either. The one figure in circulation — "~15 cycles of **a 63 KB PRG**" (that module docstring and the constant comment beside it in `backends/ultimate64_temp_gc.py`) — was measured on the **U64E while it ran 3.14d**, **n unrecorded**, on a device that now runs 3.15 and is no longer leak-prone; nothing has measured any threshold on a C64U at 1.1.0. And the firmware's RAM disk is **16 MiB** — `ramdisk.cc` takes its size from the linker symbols `__ram_disk_start` (`0x02000000`) and `__ram_disk_limit` (`0x03000000`) in `target/u64/riscv/ultimate/linker.x` and `target/u64ii/riscv/ultimate/linker.x` at tag `1.1.0`; the "3 MB" in that file is a stale trailing comment and was repeated across this repo (issue #261). So those fifteen PRGs are 967,680 B — about **5.8% used** at the one wedge on record. Neither free clusters nor directory entries were plausibly exhausted.
 
 So **the count-versus-bytes question is retired, not open**: it was a category error on both sides, because both readings asked about `/Temp`'s *capacity* and capacity is not what fails. Size conservatively as though attachments were counted — it remains the safe way to be wrong — but treat that as a choice about which error to make, not as a model of the failure, and do not cite 15 as a budget for anything, least of all small attachments.
 
@@ -877,7 +877,7 @@ So on a leak-prone device **`run_prg_via_sys(target, prg)` is the low-risk way t
    a WARNING saying so. (An earlier revision of this paragraph said the timed-out
    case stays disarmed for the client's lifetime; that came from a stale docstring
    and is wrong — issue #262.) Force arming with `temp_hygiene=True` or
-   `U64_AUTO_TEMP_GC=1`. **The budget is per client instance** (issue #264): two
+   `U64_AUTO_TEMP_GC=1`. The drain on `close()` / `DeviceLock` release also sweeps for a client that **leaked nothing**, so a lane inheriting a dirty `/Temp` collects it on the way out (issue #264). That inherited-only sweep runs only under the device lock (lock release, or `close()` while holding it). If it fails it writes no config and blocks nothing: it logs a WARNING that FTP File Service must be enabled by hand. Only a client that leaked gets the automatic FTP-enable attempt — a `Network Settings` write that persists until a firmware power-on (issue #263). **The budget is still per client instance**: two
    clients against the same device get six each, so count budget per process, not
    per device, when a run constructs more than one. Twelve is the peak before a
    sweep rather than a running total, because `gc_temp_folder` collects `/Temp`
@@ -897,6 +897,9 @@ So on a leak-prone device **`run_prg_via_sys(target, prg)` is the low-risk way t
    probing again on a bad result converges on the wedge you are diagnosing
    (issue #250). `get_info()`, `get_version()` and `read_mem()` cost nothing; use
    those, and reach for `liveness_probe` once, deliberately, knowing the price.
+   The client now counts both POSTs, reserves them before probing, and raises
+   `Ultimate64TempHygieneError` instead of probing once hygiene is known to be
+   impossible; the module-level `ultimate64_probe.liveness_probe` does none of that.
 9. **A malformed `address` is not rejected by the firmware — it writes to `$0000`.**
    `PUT /v1/machine:writemem?address=0xZZZZ&data=...` returns HTTP 200 and lands at
    zero page (measured 2026-09-10, issue #251). `Ultimate64Client.write_mem`

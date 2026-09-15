@@ -220,3 +220,56 @@ def test_auto_gc_enabled_truthy_values(monkeypatch: pytest.MonkeyPatch, val: str
 def test_auto_gc_disabled_falsy_values(monkeypatch: pytest.MonkeyPatch, val: str):
     monkeypatch.setenv(gc_mod.AUTO_GC_ENV, val)
     assert auto_gc_enabled() is False
+
+
+# --------------------------------------------------------------------------- #
+# #261 (dup #256): the RAM disk is 16 MiB, cited by its computation            #
+# --------------------------------------------------------------------------- #
+
+import inspect as _inspect
+import re as _re
+
+#: The stale figures. "31%" is matched with or without a space or tilde.
+_STALE_RAMDISK = _re.compile(r"~?\s*3\s*MB\b|\b31\s*%|945\s*KB\b")
+
+
+def test_stale_ramdisk_scan_detects_what_it_is_looking_for():
+    """Positive control: the scan must fire on each stale phrasing it
+    exists to catch, or a clean result below proves nothing."""
+    for bad in (
+        "a ~3 MB RAM disk",
+        "that is ~31% of it",
+        "at 31% full with 15 entries",
+        "so 945 KB is",
+    ):
+        assert _STALE_RAMDISK.search(bad), bad
+    for good in ("16 MiB", "~5.8%", "967,680 bytes", "63 KB PRG"):
+        assert not _STALE_RAMDISK.search(good), good
+
+
+def test_temp_gc_source_no_longer_states_the_3_mb_ramdisk():
+    from c64_test_harness.backends import ultimate64_temp_gc as mod
+
+    src = _inspect.getsource(mod)
+    # Vacuity guard: this is the file that carries the provenance figure,
+    # both in the module docstring and in the budget comment.
+    assert src.count("63 KB PRG") >= 2
+    assert "DEFAULT_LEAK_BUDGET = " in src
+    hits = [ln.strip() for ln in src.splitlines() if _STALE_RAMDISK.search(ln)]
+    assert hits == []
+    # The durable fix cites the computation, not just a new number -- at
+    # BOTH sites that state the size (module docstring and the budget
+    # comment), since a reader copies from whichever one they found.
+    assert src.count("__ram_disk_start") >= 2
+    assert src.count("__ram_disk_limit") >= 2
+    assert src.count("16 MiB") >= 2
+    assert src.count("967,680") >= 2
+    # Review round 1, finding 3: the reproduction was a U64E on 3.14d and the
+    # C64U runs 1.1.0 -- each figure cites the tree it came from.
+    # Bound to the path, not merely present somewhere in the file: "v3.14d"
+    # and "1.1.0" also occur in unrelated prose (mutation R10 survived a
+    # membership check).
+    flat = _re.sub(r"[\s`]+", " ", src)
+    assert _re.search(r"target/u64/riscv/ultimate/linker\.x at v3\.14d", flat)
+    assert _re.search(r"target/u64ii/riscv/ultimate/linker\.x at 1\.1\.0", flat)
+    assert _re.search(r"target/u64/nios2 build directories carry no RAM-disk symbols", flat)

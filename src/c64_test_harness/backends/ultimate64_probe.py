@@ -21,6 +21,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 
 # The one place a REST hex argument is formatted (issue #272).  The probe
@@ -440,6 +441,7 @@ def liveness_probe(
     *,
     http_timeout: float = _LIVENESS_PROBE_HTTP_TIMEOUT,
     skip_ping: bool = True,
+    request: "Callable[..., tuple[int, bytes]] | None" = None,
 ) -> LivenessResult:
     """Full writemem-degradation liveness probe.
 
@@ -450,14 +452,20 @@ def liveness_probe(
         ``failure="unreachable"`` and skips everything else.
     2.  Firmware-version discovery — GET /v1/info.  Failure here is
         non-fatal; the probe proceeds with ``firmware_version=None``.
-    3.  Single POST writemem of 128 bytes at $0334 (harness-owned
+    3.  One probe POST writemem of 128 bytes at $0334 (harness-owned
         cassette-buffer scratch).  The original bytes are read first and
-        restored after, so a healthy device sees no net side effect.
-        Round-trip is verified via GET /v1/machine:readmem.
+        restored after by a second POST, so a healthy device sees no net
+        side effect.  Round-trip is verified via GET /v1/machine:readmem.
 
-    The probe issues **exactly one** writemem POST.  Retrying with
+    A healthy run issues **two body-carrying POSTs** — the probe write
+    and the restore — and never retries the probe write: retrying with
     varying payload shapes against an already-degraded endpoint is the
-    documented TCP-wedge trigger (see issue #107).
+    documented TCP-wedge trigger (see issue #107).  On firmware without
+    GideonZ/1541ultimate#686 (the C64U on 1.1.0) each POST leaves a
+    ``/Temp`` attachment, so one call costs two (measured, issue #250).
+    This free function has no hygiene accounting of its own; call it
+    through :meth:`Ultimate64Client.liveness_probe`, which counts both and
+    refuses when the hygiene pass cannot run.
 
     :param host: device hostname or IP.
     :param port: HTTP port (default 80).
@@ -468,8 +476,15 @@ def liveness_probe(
     :param skip_ping: skip the ICMP ping step (default ``True``); the
         TCP connect and version GET are enough to declare reachability,
         and ``ping`` can be unavailable in CI/container environments.
+    :param request: the HTTP sender for every request the probe makes,
+        called with :func:`_liveness_request`'s signature and contract
+        (non-2xx returned, connection failures raised raw).  Defaults to
+        :func:`_liveness_request`.  :class:`Ultimate64Client` passes a
+        wrapper that counts body-carrying POSTs against its ``/Temp``
+        budget.
     :returns: :class:`LivenessResult` summarising the probe.
     """
+    send = request if request is not None else _liveness_request
     # ----------------------------------------------------------------- #
     # Step 1: reachability                                              #
     # ----------------------------------------------------------------- #
@@ -498,7 +513,7 @@ def liveness_probe(
     # ----------------------------------------------------------------- #
     firmware_version: str | None = None
     try:
-        status, data = _liveness_request(
+        status, data = send(
             "GET", host, port, "/v1/info", password, http_timeout
         )
         if 200 <= status < 300 and data:
@@ -530,7 +545,7 @@ def liveness_probe(
     # Failure here is treated as "unknown" — the device answered version
     # but readmem failed, which is unusual.
     try:
-        rd_status, original_bytes = _liveness_request(
+        rd_status, original_bytes = send(
             "GET",
             host,
             port,
@@ -594,7 +609,7 @@ def liveness_probe(
     post_query = f"address={_wire_hex16(probe_addr)}"
 
     try:
-        post_status, post_body = _liveness_request(
+        post_status, post_body = send(
             "POST",
             host,
             port,
@@ -713,7 +728,7 @@ def liveness_probe(
     # Step 4: readback to confirm round-trip                            #
     # ----------------------------------------------------------------- #
     try:
-        rb_status, readback = _liveness_request(
+        rb_status, readback = send(
             "GET",
             host,
             port,
@@ -761,7 +776,7 @@ def liveness_probe(
         # Restore best-effort even on mismatch, then report.
         _restore_quiet(
             host, port, password, http_timeout,
-            probe_addr, original_bytes,
+            probe_addr, original_bytes, request=send,
         )
         return LivenessResult(
             host=host,
@@ -783,7 +798,7 @@ def liveness_probe(
     # ----------------------------------------------------------------- #
     _restore_quiet(
         host, port, password, http_timeout,
-        probe_addr, original_bytes,
+        probe_addr, original_bytes, request=send,
     )
 
     return LivenessResult(
@@ -805,6 +820,8 @@ def _restore_quiet(
     timeout: float,
     addr: int,
     original: bytes,
+    *,
+    request: "Callable[..., tuple[int, bytes]] | None" = None,
 ) -> None:
     """Restore *original* bytes at *addr* via POST writemem.
 
@@ -812,8 +829,9 @@ def _restore_quiet(
     to undo its scratch write after the round-trip verification, so the
     probe is side-effect-free on a healthy device.
     """
+    send = request if request is not None else _liveness_request
     try:
-        _liveness_request(
+        send(
             "POST",
             host,
             port,

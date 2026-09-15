@@ -464,15 +464,23 @@ class Ultimate64Client:
         # Drain /Temp when this device's lock is handed to the next lane.
         # Registered weakly, so a forgotten client is collected normally.
         if _HAS_DEVICE_LOCK:
-            _register_release_callback(self.host, self, "_drain_temp_attachments")
+            _register_release_callback(self.host, self, "_drain_on_lock_release")
 
     def close(self) -> None:
         """Release client resources.
 
         The REST side is stateless (a fresh connection per call), so the
-        only work here is the ``/Temp`` hygiene drain: any attachment
-        this client leaked and has not yet collected is collected now,
-        best-effort. See :attr:`temp_hygiene_armed`.
+        only work here is the ``/Temp`` hygiene drain, best-effort, on an
+        armed client (a disarmed one does nothing):
+
+        * if this client leaked, its hygiene pass runs as before;
+        * if it leaked nothing, the device's ``/Temp`` is still swept for
+          attachments an earlier lane left behind (issue #264) -- but only
+          when this process holds the device's ``DeviceLock``, since that
+          sweep deletes other lanes' files, and a failed one never enables
+          FTP File Service and never blocks this client.
+
+        See :attr:`temp_hygiene_armed` and :meth:`_drain_temp_attachments`.
         """
         self._drain_temp_attachments(reason="client close")
         return None
@@ -868,8 +876,22 @@ class Ultimate64Client:
         """Attachments this client has created since the last successful pass."""
         return self._pending_temp_attachments
 
-    def _before_temp_attachment(self, operation: str) -> None:
-        """Refuse or make room before an attachment-creating request.
+    def _before_temp_attachment(self, operation: str, count: int = 1) -> None:
+        """Refuse or make room before *count* attachment-creating requests.
+
+        *count* > 1 reserves an operation's whole cost up front, so a
+        multi-POST operation is never refused half-way through (see
+        :meth:`liveness_probe`, whose second POST restores RAM).
+
+        The pass runs when ``pending > 0 and pending + count > budget``.
+        For ``count=1`` that is exactly ``pending >= budget`` -- which
+        relies on the budget being at least 1, as ``__init__`` validates
+        and :func:`~c64_test_harness.backends.ultimate64_temp_gc.leak_budget`
+        enforces. The ``pending > 0`` guard is kept deliberately: with
+        nothing pending a pass could collect nothing this client spent, so a
+        reservation larger than the whole budget (a probe on a fresh
+        ``temp_gc_budget=1`` client) runs one over and the next
+        attachment-creating request sweeps.
 
         :raises Ultimate64TempHygieneError: when hygiene is armed, has
             been proven impossible, and ``U64_TEMP_GC_REQUIRED`` has not
@@ -883,7 +905,8 @@ class Ultimate64Client:
         if self._temp_hygiene_blocked is not None:
             self._refuse_or_warn(operation)
             return
-        if self._pending_temp_attachments >= self._temp_gc_budget:
+        pending = self._pending_temp_attachments
+        if pending > 0 and pending + count > self._temp_gc_budget:
             self._run_temp_hygiene(
                 f"budget of {self._temp_gc_budget} attachment(s) spent before {operation}"
             )
@@ -969,22 +992,115 @@ class Ultimate64Client:
         finally:
             self._in_temp_hygiene = False
 
-    def _drain_temp_attachments(self, reason: str = "drain") -> None:
-        """Collect whatever this client leaked. Never raises."""
+    def _drain_on_lock_release(self, reason: str = "device lock release") -> None:
+        """Release-callback entry point (``device_lock.register_release_callback``).
+
+        ``DeviceLock.release`` fires callbacks only on the outermost release
+        and while the flock is still held, so this drain runs under the lock
+        by construction.
+        """
+        self._drain_temp_attachments(reason=reason, under_lock=True)
+
+    def _holds_device_lock(self) -> bool:
+        """Whether this process holds this device's ``DeviceLock`` (no I/O).
+
+        Asks :meth:`DeviceLock.held_by_this_process` about the **default**
+        lock directory only. A process that holds the lock under a custom
+        ``lock_dir`` therefore reads as not holding it here, so its
+        ``close()`` does not sweep inherited ``/Temp``. Its lock-release
+        callback still does: :meth:`_drain_on_lock_release` runs under the
+        flock by construction and never consults this. Accepted in review
+        (PR #297, round 2) as the conservative direction.
+        """
+        if not _HAS_DEVICE_LOCK:
+            return False
         try:
-            if self._pending_temp_attachments <= 0:
-                return
-            # Something leaked, so a device is demonstrably there: settle
-            # the grade before deciding not to clean up after it.
-            self._maybe_reprobe_capabilities()
+            from .device_lock import DeviceLock
+
+            return bool(DeviceLock.held_by_this_process(self.host))
+        except Exception:  # noqa: BLE001 - a lock query must never fail a drain
+            return False
+
+    def _drain_temp_attachments(
+        self, reason: str = "drain", *, under_lock: bool = False
+    ) -> None:
+        """Sweep the device's ``/Temp`` on the way out. Never raises.
+
+        Two cases, and they are deliberately not treated alike:
+
+        * **This client leaked** (``pending_temp_attachments > 0``): the
+          ordinary hygiene pass, unchanged -- including its one FTP-enable
+          attempt and the block on failure. Whether a lane that leaked may
+          write that config is issue #263 and is not decided here.
+        * **This client leaked nothing** (issue #264): the wedge is a
+          property of the device and :meth:`gc_temp_folder` sweeps ``/Temp``
+          device-wide, so a lane that inherited a crashed neighbour's
+          attachments still collects them. But that sweep deletes files
+          this client did not create, so it runs only **under the device
+          lock** (the lock-release callback, or a ``close()`` while this
+          process holds the lock); and a lane that made only bodyless calls
+          must not write ``Network Settings > FTP File Service`` (a
+          BASELINE_NEVER_TOUCH store that persists until a firmware
+          power-on) or be refused for a failure it did not cause. So a
+          failed inherited sweep logs a WARNING naming the manual remedy,
+          enables nothing and blocks nothing.
+
+        What keeps a fake host off FTP is arming (a never-answered probe
+        stays disarmed), not the counter.
+        """
+        try:
+            leaked = self._pending_temp_attachments > 0
+            if leaked:
+                # Something leaked, so a device is demonstrably there:
+                # settle the grade before deciding not to clean up after
+                # it. Deliberately not done on a zero count -- that would
+                # put a /v1/info GET into close() for every client that
+                # ever completed a request, fake hosts included.
+                self._maybe_reprobe_capabilities()
             if not self.temp_hygiene_armed:
                 return
-            self._run_temp_hygiene(reason)
+            if leaked:
+                self._run_temp_hygiene(reason)
+                return
+            if not (under_lock or self._holds_device_lock()):
+                _log.debug(
+                    "U64 /Temp drain on %s (%s): this client leaked nothing and "
+                    "does not hold the device lock; not sweeping other lanes' "
+                    "attachments",
+                    self.host, reason,
+                )
+                return
+            self._sweep_inherited_temp(reason)
         except Exception as exc:  # noqa: BLE001 - a drain must never fail a run
             _log.debug(
                 "U64 /Temp drain on %s raised (%s: %s); ignored",
                 self.host, type(exc).__name__, exc,
             )
+
+    def _sweep_inherited_temp(self, reason: str) -> None:
+        """Best-effort sweep for attachments this client did not create.
+
+        No FTP-enable attempt and no block on failure -- see
+        :meth:`_drain_temp_attachments`.
+        """
+        self._in_temp_hygiene = True
+        try:
+            _log.debug("U64 /Temp inherited sweep on %s: %s", self.host, reason)
+            result = self.gc_temp_folder()
+        finally:
+            self._in_temp_hygiene = False
+        if getattr(result, "ok", False):
+            return
+        _log.warning(
+            "U64 /Temp inherited sweep on %s failed (%s). This client leaked "
+            "nothing, so the harness neither enables Network Settings > FTP "
+            "File Service on its behalf (issue #263) nor refuses its requests; "
+            "but /Temp may still hold attachments an earlier lane left behind. "
+            "Before uploading to this device, enable FTP File Service manually "
+            "(it persists until a firmware power-on) or have it power-cycled. "
+            "See docs/u64_recovery.md.",
+            self.host, getattr(result, "error", None) or "unknown FTP failure",
+        )
 
     def _check_device_lock(self, operation: str) -> None:
         """Advisory device-lock check for a state-changing request.
@@ -1055,33 +1171,90 @@ class Ultimate64Client:
         """GET /v1/info — product, firmware_version, fpga_version, etc."""
         return self._get_json("/v1/info")
 
+    #: Body-carrying POSTs one :meth:`liveness_probe` issues: the probe
+    #: write and the restore of the original bytes. Each is a ``/Temp``
+    #: attachment on firmware without upstream #686 (measured on the C64U,
+    #: fw 1.1.0: ``/Temp`` 0 -> 2 for one call; issue #250).
+    LIVENESS_PROBE_TEMP_ATTACHMENTS = 2
+
     def liveness_probe(self, http_timeout: float = 2.0) -> "LivenessResult":
         """Run the writemem-degradation liveness probe against this device.
 
+        **Not free: on leak-prone firmware one call costs two /Temp
+        attachments** (:attr:`LIVENESS_PROBE_TEMP_ATTACHMENTS`). It
+        deliberately exercises ``POST /v1/machine:writemem`` -- a probe
+        write and a restore -- which is the point of it and also the price.
+        Both POSTs count against :attr:`temp_gc_budget` like any other
+        attachment-creating request, and the whole cost is reserved before
+        the probe sends anything: if the budget cannot hold both, the
+        hygiene pass runs first, and if hygiene has been proven impossible
+        this raises :class:`Ultimate64TempHygieneError` without touching the
+        device (so the restore is never the request that gets refused).
+        Diagnose a suspected wedge with bodyless calls first --
+        :meth:`get_info`, :meth:`get_version` and :meth:`read_mem` cost
+        nothing -- and probe once, deliberately.
+
         Delegates to
         :func:`c64_test_harness.backends.ultimate64_probe.liveness_probe`,
-        passing the client's ``host``, ``port``, and ``password``.  Unlike
-        :meth:`get_version` / :meth:`get_info`, this method actively
-        exercises the ``POST /v1/machine:writemem`` path that
-        :func:`probe_u64` does not, and so detects the fw 3.14d
-        writemem-degraded transient state described in issue #107.
+        passing the client's ``host``, ``port`` and ``password`` and a
+        request sender that routes the accounting through this client.
+        Unlike :meth:`get_version` / :meth:`get_info`, it detects the fw
+        3.14d writemem-degraded transient state described in issue #107.
 
         :param http_timeout: per-request socket timeout (default 2 s);
             kept short so a wedged TCP stack returns
             ``failure="tcp_stack_wedged"`` quickly.
         :returns: a structured
             :class:`~c64_test_harness.backends.ultimate64_probe.LivenessResult`.
+        :raises Ultimate64TempHygieneError: see above.
         """
-        from .ultimate64_probe import liveness_probe as _liveness_probe
-        return _liveness_probe(
+        from . import ultimate64_probe as _probe
+
+        cost = self.LIVENESS_PROBE_TEMP_ATTACHMENTS
+        self._before_temp_attachment(
+            f"liveness_probe ({cost} x POST /v1/machine:writemem)", count=cost
+        )
+        if self.temp_hygiene_armed:
+            _log.info(
+                "liveness_probe on %s spends %d /Temp attachments on this "
+                "firmware (%d of %d already pending)",
+                self.host, cost, self._pending_temp_attachments,
+                self._temp_gc_budget,
+            )
+
+        def _accounted(method, host, port, path, password, timeout, **kwargs):
+            # The probe keeps its own raw sender and failure classification;
+            # this only adds what _request adds: the lock check and the
+            # count. The gate already ran above for the whole operation.
+            leaks = self._creates_temp_attachment(method, kwargs.get("body"))
+            if method != "GET":
+                self._check_device_lock(f"{method} {path}")
+            try:
+                result = _probe._liveness_request(
+                    method, host, port, path, password, timeout, **kwargs
+                )
+            finally:
+                if leaks:
+                    self._pending_temp_attachments += 1
+            self._saw_successful_request = True
+            return result
+
+        return _probe.liveness_probe(
             self.host,
             port=self.port,
             password=self.password,
             http_timeout=http_timeout,
+            request=_accounted,
         )
 
     def assert_healthy(self, http_timeout: float = 2.0) -> "LivenessResult":
         """Run :meth:`liveness_probe` and raise on failure.
+
+        Costs what :meth:`liveness_probe` costs: two /Temp attachments per
+        call on leak-prone firmware, and it raises
+        :class:`Ultimate64TempHygieneError` before probing when the hygiene
+        pass cannot run. It reads like a free precondition check and is not
+        one; do not call it in a loop against a C64U.
 
         :raises U64UnreachableError: if the device fails the reachability
             portion (TCP / version GET).

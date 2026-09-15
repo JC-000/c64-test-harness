@@ -341,7 +341,25 @@ state is at most 8 resident. Override with `U64_TEMP_GC_BUDGET` or
 and when the device's `DeviceLock` is released (registered via
 `device_lock.register_release_callback`, fired while the flock is still
 held so the device is still exclusively ours) — so a lane hands the
-device to the next one clean. `machine:reboot` does **not** reset the
+device to the next one clean. The two drain cases differ:
+
+- **The client leaked:** the ordinary pass runs, on `close()` or lock
+  release. If FTP is refused, it makes one attempt to enable
+  `Network Settings > FTP File Service` — a config write that persists
+  until a firmware power-on (`machine:reboot` does not clear it) — and if
+  the pass still fails, later uploads on that client refuse. Whether a
+  lane may make that write at all is open in issue #263.
+- **The client leaked nothing** (issue #264): the wedge is per device and
+  `gc_temp_folder` sweeps `/Temp` device-wide, so the drain still sweeps
+  inherited attachments — but only **under the device lock** (the
+  lock-release callback, or `close()` while this process holds the lock),
+  because it deletes files other lanes created. A failed inherited sweep
+  writes no config and blocks nothing: it logs a WARNING that `/Temp` may
+  still hold an earlier lane's attachments and that FTP File Service must
+  be enabled by hand, or the device power-cycled, before uploading.
+
+The budget itself is still per client instance — two clients against one
+device spend six each (issue #295). `machine:reboot` does **not** reset the
 count: it is a C64-level reset, and `/Temp` is a firmware RAM disk
 (`software/filesystem/ramdisk.cc`) that only a firmware power-on clears.
 
@@ -457,8 +475,17 @@ and probing again on a bad result converges on the wedge you are
 diagnosing.** Under the conservative count reading, seven or eight health
 checks are the whole budget. Diagnose with bodyless calls first —
 `get_info()`, `get_version()` and `read_mem()` all cost nothing — and
-reach for `liveness_probe` deliberately, once, knowing the price. Tracked
-as [#250](https://github.com/JC-000/c64-test-harness/issues/250).
+reach for `liveness_probe` deliberately, once, knowing the price.
+
+**Since #250 the client accounts for it.** `Ultimate64Client.liveness_probe`
+(and so `assert_healthy`) routes both POSTs through the client's
+`/Temp` accounting — `LIVENESS_PROBE_TEMP_ATTACHMENTS = 2` — and reserves
+both before sending anything: if the budget cannot hold two, the hygiene
+pass runs first, and if hygiene has been proven impossible it raises
+`Ultimate64TempHygieneError` without touching the device, so the restore
+is never the refused request. The module-level
+`ultimate64_probe.liveness_probe(host, ...)` has no client and no
+accounting; on a leak-prone device call it through the client.
 
 ### Tier 2 — Runner subsystem
 
