@@ -109,11 +109,16 @@ class _Queue6502:
             elif op == 0xAD: self.a = self._nz(self.read(abs_)); pc += 3  # LDA abs
             elif op == 0x8D: self.write(abs_, self.a); pc += 3          # STA abs
             elif op == 0x8C: self.write(abs_, self.y); pc += 3          # STY abs
+            elif op == 0x8E: self.write(abs_, self.x); pc += 3          # STX abs
             elif op == 0x99: self.write((abs_ + self.y) & 0xFFFF, self.a); pc += 3
+            elif op == 0x9D: self.write((abs_ + self.x) & 0xFFFF, self.a); pc += 3
             elif op == 0x29: self.a = self._nz(self.a & imm); pc += 2   # AND #
             elif op == 0xC0:                                           # CPY #
                 self.z = self.y == imm; self.c = self.y >= imm; pc += 2
+            elif op == 0xE0:                                           # CPX #
+                self.z = self.x == imm; self.c = self.x >= imm; pc += 2
             elif op == 0xC8: self.y = self._nz(self.y + 1); pc += 1     # INY
+            elif op == 0xE8: self.x = self._nz(self.x + 1); pc += 1     # INX
             elif op == 0x88: self.y = self._nz(self.y - 1); pc += 1     # DEY
             elif op == 0xCA: self.x = self._nz(self.x - 1); pc += 1     # DEX
             elif op == 0xAA: self.x = self._nz(self.a); pc += 1         # TAX
@@ -140,14 +145,19 @@ def _drain(kind: str, n: int) -> _Queue6502:
     elif kind == "tsx-unfenced":
         code = _build_read_status_tsx(
             FRAGMENT_ADDR, _STATUS_ADDR, _STAT_LEN_ADDR, fence=False)
+    elif kind == "tsx-fenced":
+        # What every turbo_safe=True routine emits.  Runnable here since
+        # the drain indexes with X, which the fence preserves (issue #298).
+        code = _build_read_status_tsx(
+            FRAGMENT_ADDR, _STATUS_ADDR, _STAT_LEN_ADDR, fence=True)
     else:
         raise ValueError(kind)
     cpu = _Queue6502(list(code), status)
-    cpu.run()
+    cpu.run(max_steps=3_000_000)
     return cpu
 
 
-KINDS = ["plain", "tsx-unfenced"]
+KINDS = ["plain", "tsx-unfenced", "tsx-fenced"]
 #: Either side of the buffer edge, plus the firmware maximum.
 LENGTHS = [0, 1, 28, BUFFER - 1, BUFFER, BUFFER + 1, 255, FIRMWARE_MAX_STATUS]
 
@@ -241,20 +251,6 @@ class TestTheMaxLenGuard:
         _build_read_status(_STATUS_ADDR, _STAT_LEN_ADDR, max_len=good)
         _build_read_status_tsx(FRAGMENT_ADDR, _STATUS_ADDR,
                                _STAT_LEN_ADDR, max_len=good)
-
-
-class TestTheFencedDrainHasTheSameBound:
-    """The fenced turbo variant runs in this interpreter, but its fence
-    zeroes Y on every pass (issue #298), so behavioural results for it
-    would be about that defect, not this one.  Pin structurally that it
-    carries the same compare; the unfenced runs above check the loop."""
-
-    def test_fenced_fragment_compares_y_against_the_buffer(self) -> None:
-        code = list(_build_read_status_tsx(FRAGMENT_ADDR, _STATUS_ADDR,
-                                           _STAT_LEN_ADDR, fence=True))
-        cpy = [i for i in range(len(code) - 1)
-               if code[i] == 0xC0 and code[i + 1] == BUFFER]
-        assert cpy, "fenced status drain has no CPY #buffer bound"
 
 
 def _transport(len_lo: int, len_hi: int, fill: int = 0x41) -> MagicMock:

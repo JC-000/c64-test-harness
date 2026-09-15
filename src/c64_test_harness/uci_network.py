@@ -189,6 +189,13 @@ _TAX     = 0xAA
 _TXA     = 0x8A
 _LDA_ABS_Y = 0xB9
 _STA_ABS_Y = 0x99
+# X-indexed forms: loops that cross a turbo fence index with X, because the
+# fence restores X but exits with Y = 0 (issue #298).
+_LDA_ABS_X = 0xBD
+_STA_ABS_X = 0x9D
+_STX_ABS = 0x8E
+_INX     = 0xE8
+_CPX_IMM = 0xE0
 _PHA     = 0x48
 _PLA     = 0x68
 _RTS = 0x60  # 6502 RTS opcode — used to end UCI routines dispatched via SYS.
@@ -313,6 +320,11 @@ def _build_fence() -> list[int]:
     Matches c64-https `uci_fence` macro semantics (preserves A/X, ~52 us
     at 48 MHz), implemented with LDY/DEY/BNE to avoid importing SBC into
     the builder opcode set.
+
+    **Y is not preserved: the fence always exits with Y = 0.**  A loop that
+    crosses a fence must index with X (the turbo reply drains and the
+    hostname loop do), or save Y around it (``build_socket_write`` does).
+    Indexing with Y lost the index on every pass (issue #298).
     """
     _DEY = 0x88
     return [
@@ -659,9 +671,9 @@ def _build_read_response_tsx(
 
     Layout::
 
-        LDY #$00
-        STA  resp_len_lo
-        STA  resp_len_hi
+        LDX #$00
+        STX  resp_len_lo
+        STX  resp_len_hi
     loop (pc_loop):
         LDA  $DF1C
         <fence>
@@ -673,21 +685,25 @@ def _build_read_response_tsx(
     read:
         LDA  $DF1E
         <fence>
-        STA  resp_addr,Y
-        INY
+        STA  resp_addr,X
+        INX
         JMP  loop
     done:
-        STY  resp_len
+        STX  resp_len
+
+    The index is X, not Y as in :func:`_build_read_response`: the fence
+    exits with Y = 0, so a Y index stored every byte at *resp_addr* and
+    recorded length 0 (issue #298). Same size as the Y form.
 
     No control write inside the loop: that would be a DATA_ACC accept, which
     resets both queues (issue #155). The single accept lives in
     :func:`_build_acknowledge_tsx`.
     """
     out: list[int] = []
-    # Preamble: LDY #0; STA resp_len; STA resp_len+1
-    out.extend([_LDY_IMM, 0x00])
-    out.extend([_STA_ABS, _lo(resp_len_addr), _hi(resp_len_addr)])
-    out.extend([_STA_ABS, _lo(resp_len_addr + 1),
+    # Preamble: LDX #0; STX resp_len; STX resp_len+1
+    out.extend([_LDX_IMM, 0x00])
+    out.extend([_STX_ABS, _lo(resp_len_addr), _hi(resp_len_addr)])
+    out.extend([_STX_ABS, _lo(resp_len_addr + 1),
                 _hi(resp_len_addr + 1)])
 
     loop_abs = pc + len(out)
@@ -715,9 +731,9 @@ def _build_read_response_tsx(
                 _hi(UCI_RESP_DATA_REG)])
     if fence:
         out.extend(_build_fence())
-    # STA resp_addr,Y
-    out.extend([_STA_ABS_Y, _lo(resp_addr), _hi(resp_addr)])
-    out.append(_INY)
+    # STA resp_addr,X
+    out.extend([_STA_ABS_X, _lo(resp_addr), _hi(resp_addr)])
+    out.append(_INX)
     # JMP loop  (no control write — see the docstring)
     out.extend([_JMP_ABS, _lo(loop_abs), _hi(loop_abs)])
 
@@ -725,8 +741,8 @@ def _build_read_response_tsx(
     done_abs = pc + len(out)
     out[jmp_done_pos + 1] = _lo(done_abs)
     out[jmp_done_pos + 2] = _hi(done_abs)
-    # STY resp_len
-    out.extend([_STY_ABS, _lo(resp_len_addr), _hi(resp_len_addr)])
+    # STX resp_len
+    out.extend([_STX_ABS, _lo(resp_len_addr), _hi(resp_len_addr)])
 
     return out
 
@@ -745,15 +761,18 @@ def _build_read_status_tsx(
     :func:`_build_read_status` does (issue #281)::
 
         LDA $DF1F ; <fence>
-        CPY #max_len ; BNE store ; JMP loop   ; full: drain without storing
+        CPX #max_len ; BNE store ; JMP loop   ; full: drain without storing
     store:
-        STA status,Y ; INY ; JMP loop
+        STA status,X ; INX ; JMP loop
+
+    The index is X because the fence exits with Y = 0 (issue #298); see
+    :func:`_build_read_response_tsx`.
     """
     _check_status_max_len(max_len)
     out: list[int] = []
-    out.extend([_LDY_IMM, 0x00])
-    out.extend([_STY_ABS, _lo(stat_len_addr), _hi(stat_len_addr)])
-    out.extend([_STY_ABS, _lo(stat_len_addr + 1),
+    out.extend([_LDX_IMM, 0x00])
+    out.extend([_STX_ABS, _lo(stat_len_addr), _hi(stat_len_addr)])
+    out.extend([_STX_ABS, _lo(stat_len_addr + 1),
                 _hi(stat_len_addr + 1)])
 
     loop_abs = pc + len(out)
@@ -775,17 +794,17 @@ def _build_read_status_tsx(
                 _hi(UCI_STATUS_DATA_REG)])
     if fence:
         out.extend(_build_fence())
-    out.extend([_CPY_IMM, max_len])
+    out.extend([_CPX_IMM, max_len])
     out.extend([_BNE, 0x03])            # -> store
     out.extend([_JMP_ABS, _lo(loop_abs), _hi(loop_abs)])  # full: drain only
-    out.extend([_STA_ABS_Y, _lo(status_addr), _hi(status_addr)])
-    out.append(_INY)
+    out.extend([_STA_ABS_X, _lo(status_addr), _hi(status_addr)])
+    out.append(_INX)
     out.extend([_JMP_ABS, _lo(loop_abs), _hi(loop_abs)])
 
     done_abs = pc + len(out)
     out[jmp_done_pos + 1] = _lo(done_abs)
     out[jmp_done_pos + 2] = _hi(done_abs)
-    out.extend([_STY_ABS, _lo(stat_len_addr), _hi(stat_len_addr)])
+    out.extend([_STX_ABS, _lo(stat_len_addr), _hi(stat_len_addr)])
 
     return out
 
@@ -1164,9 +1183,9 @@ def _build_connect_routine(
         # Turbo-safe hostname loop — fence after each STA $DF1D, JMP back
         # for loop (short branch can't reach past a fence expansion).
         #
-        #   LDY #0
+        #   LDX #0
         #   loop:
-        #     LDA host,Y       (3)
+        #     LDA host,X       (3)
         #     BEQ +3           (2)  -> skip JMP write_host  (i.e. reached null)
         #     JMP write_host   (3)
         #     ; null: write terminator and fall through
@@ -1176,15 +1195,18 @@ def _build_connect_routine(
         #   write_host:
         #     STA $DF1D        (3)
         #     <fence>
-        #     INY              (1)
-        #     BEQ +3           (2)  -> Y wrapped 255->0, bail
+        #     INX              (1)
+        #     BEQ +3           (2)  -> X wrapped 255->0, bail
         #     JMP loop         (3)
-        #     ; fall through on Y wrap
+        #     ; fall through on X wrap
         #   after_host:
+        #
+        # X, not Y: the fence exits with Y = 0, so a Y index re-sent
+        # host[1] forever and never reached the terminator (issue #298).
         host_loop_abs = pc()
-        code.extend([_LDY_IMM, 0x00])
+        code.extend([_LDX_IMM, 0x00])
         loop_abs = pc()
-        code.extend([_LDA_ABS_Y, _lo(host_addr), _hi(host_addr)])
+        code.extend([_LDA_ABS_X, _lo(host_addr), _hi(host_addr)])
         # BEQ +3 -> skip "JMP write_host" (3 bytes)
         code.extend([_BEQ, 0x03])
         jmp_write_pos = len(code)
@@ -1202,8 +1224,8 @@ def _build_connect_routine(
         code.extend([_STA_ABS, _lo(UCI_CMD_DATA_REG),
                      _hi(UCI_CMD_DATA_REG)])
         code.extend(_build_fence())
-        code.append(_INY)
-        code.extend([_BEQ, 0x03])  # Y wrapped — bail
+        code.append(_INX)
+        code.extend([_BEQ, 0x03])  # X wrapped — bail
         code.extend([_JMP_ABS, _lo(loop_abs), _hi(loop_abs)])
         # after_host:
         after_abs = pc()
@@ -1904,7 +1926,7 @@ def uci_get_ip(
 ) -> str:
     """Query the U64's IP address via UCI GET_IP_ADDRESS.
 
-    Returns the IP address as a dotted-quad string (e.g. ``"192.168.1.81"``).
+    Returns the IP address as a dotted-quad string (e.g. ``"192.0.2.64"``).
 
     :param turbo_safe: see :func:`build_uci_command`.
 
@@ -2085,7 +2107,7 @@ def uci_socket_read(
 
     .. warning::
         *max_len* is capped at :data:`SOCKET_READ_MAX_BYTES` (253) rather
-        than 255 because the drain loop indexes with an 8-bit Y register:
+        than 255 because the drain loop indexes with an 8-bit register:
         the two header bytes plus 254 payload bytes would wrap it. Lifting
         the cap needs a 16-bit drain, which is the same work as draining the
         multi-block replies firmware 3.15 can return — tracked separately.
