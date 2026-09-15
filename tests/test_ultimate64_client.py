@@ -820,6 +820,23 @@ def test_unmount_disk_url():
 
 
 # ---------------------------------------------------------------- multipart helper
+def test_build_multipart_file_name_none_omits_the_filename_attribute():
+    """``file_name=None`` emits ``name="file"`` with no ``filename=`` (#417 review).
+
+    A string ``file_name`` still emits the attribute, so ``mount_disk``'s
+    named part (#421) is unchanged.
+    """
+    unnamed = _build_multipart(
+        "B", fields={}, file_field="file", file_name=None, file_bytes=b"\x01",
+    ).decode("latin-1")
+    assert 'Content-Disposition: form-data; name="file"\r\n' in unnamed
+    assert "filename=" not in unnamed
+    named = _build_multipart(
+        "B", fields={}, file_field="file", file_name="image.d64", file_bytes=b"\x01",
+    ).decode("latin-1")
+    assert 'name="file"; filename="image.d64"' in named
+
+
 def test_build_multipart_structure():
     body = _build_multipart(
         "BOUNDARY",
@@ -943,7 +960,15 @@ def test_drive_load_rom_with_bytes_uses_multipart_post():
     # Exactly one part, and it is the file: get_filename(0) is what loads.
     boundary = ct.split("boundary=", 1)[1].encode()
     assert body.count(b"--" + boundary + b"\r\n") == 1
-    assert b'name="file"' in body and b'filename="drive.rom"' in body
+    # #417 review (reviewer-5): no filename= attribute, so at 1.1.0 the
+    # firmware keeps the managed temp%04x name the GC can collect.  A named
+    # part is renamed to /Temp/<filename> (attachment_writer.h collect(),
+    # source-read) and is invisible to gc_temp_folder's ^temp[0-9a-fA-F]+$.
+    # Pinned on the part's own Content-Disposition line, not by counting.
+    dispositions = [ln for ln in body.split(b"\r\n")
+                    if ln.lower().startswith(b"content-disposition:")]
+    assert dispositions == [b'Content-Disposition: form-data; name="file"']
+    assert b"filename=" not in body
     assert b"\xaa\xbb\xcc" in body
 
 

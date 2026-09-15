@@ -2411,7 +2411,23 @@ class Ultimate64Client:
 
         **The upload costs one managed ``/Temp`` attachment** on leak-prone
         firmware, counted by the request choke point like every
-        body-carrying POST; the ``str`` form costs nothing.
+        body-carrying POST; the ``str`` form costs nothing.  **The part
+        carries no ``filename=``** (#417 review).  Source-read at tag 1.1.0
+        (the C64U), not measured: ``attachment_writer.h`` ``collect()``
+        creates every part as ``/Temp/temp%04x`` and renames it to
+        ``/Temp/<filename>`` only when ``filename=`` is present, and
+        ``gc_temp_folder``'s ``^temp[0-9a-fA-F]+$`` never collects the
+        renamed file -- the upload would be counted, the sweep would
+        "succeed", and the file would stay.  Unnamed, it keeps the managed
+        ``temp%04x`` name; deleting it later is harmless because
+        ``load_file`` copies the ROM into drive memory and closes the file.
+        (The U64E's bce4535e names uploads differently, via
+        ``create_temp_file("upload", ...)``, so this naming concern is a
+        1.1.0-line one.)  Measured on the U64E (fw 3.15, bce4535e,
+        2026-09-15, named vs unnamed empty part interleaved, n=3 per arm):
+        both answered 412 "Drive ROM is invalid" with drive ``a`` still on
+        ``1541.rom``, so the route accepts the unnamed part; the resulting
+        file name was not observed.
 
         **Only 16384- or 32768-byte ROMs are sent** (#417 review).
         ``C1541::load_dos_from_file`` (``software/drive/c1541.cc``, read at
@@ -2434,7 +2450,10 @@ class Ultimate64Client:
                 boundary,
                 fields={},
                 file_field="file",
-                file_name="drive.rom",
+                # No filename=: the upload keeps the GC-collectable temp%04x
+                # name (#417 review).  load_file copies the ROM into drive
+                # memory and closes the file, so a later sweep is harmless.
+                file_name=None,
                 file_bytes=bytes(rom_path_or_data),
             )
             self._request(
@@ -2689,12 +2708,18 @@ def _build_multipart(
     *,
     fields: dict[str, str],
     file_field: str,
-    file_name: str,
+    file_name: str | None,
     file_bytes: bytes,
 ) -> bytes:
     """Build an RFC 2388 multipart/form-data body.
 
     Order: simple fields first, file last. Line endings are CRLF.
+
+    ``file_name=None`` omits the ``filename=`` attribute from the file
+    part's ``Content-Disposition``.  The firmware's attachment writer then
+    keeps the managed ``temp%04x`` name instead of renaming the upload to
+    ``/Temp/<filename>`` (``attachment_writer.h`` ``collect()``), which is
+    the only name ``gc_temp_folder`` collects (#417 review).
     """
     crlf = b"\r\n"
     out = bytearray()
@@ -2705,11 +2730,10 @@ def _build_multipart(
         out += crlf
         out += value.encode("utf-8") + crlf
     out += b"--" + b + crlf
-    out += (
-        f'Content-Disposition: form-data; name="{file_field}"; filename="{file_name}"'
-        .encode("utf-8")
-        + crlf
-    )
+    disposition = f'Content-Disposition: form-data; name="{file_field}"'
+    if file_name is not None:
+        disposition += f'; filename="{file_name}"'
+    out += disposition.encode("utf-8") + crlf
     out += b"Content-Type: application/octet-stream" + crlf
     out += crlf
     out += file_bytes + crlf
