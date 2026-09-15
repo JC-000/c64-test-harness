@@ -991,7 +991,7 @@ Additional scripts in `scripts/`:
 | `scripts/play_scale_u64.py` | Build + play a C-major scale PSID on an Ultimate 64 |
 | `scripts/bench_x25519_u64_turbo.py` | X25519 benchmark across U64 turbo speeds (1–48 MHz) |
 | `scripts/stress_u64_queue.py` | Cross-process DeviceLock stress test (N workers × M rounds) |
-| `scripts/run_u64_parallel_locked.py` | Run all U64 live tests in parallel with cross-process locking |
+| `scripts/run_u64_parallel_locked.py` | Run all U64 live tests in parallel files, per-test DeviceLock via conftest |
 | `scripts/play_chromatic_u64.py` | Chromatic scale capture through 4 SID configs on U64 |
 | `scripts/setup-bridge-tap.sh` | Create bridge + 2 TAP interfaces for multi-VICE ethernet |
 | `scripts/teardown-bridge-tap.sh` | Tear down bridge + TAP interfaces |
@@ -1048,7 +1048,7 @@ U64_HOST=<device> U64_ALLOW_MUTATE=1 X25519_PRG=/path/to/x25519.prg pytest tests
 TURBO_CONTRACT_LIVE=1 U64_HOST=<device> U64_ALLOW_MUTATE=1 pytest tests/test_turbo_contract_live.py -v  # cross-generation CPU-speed contract
 SOCKETDMA_LIVE=1 U64_HOST=<device> U64_ALLOW_MUTATE=1 pytest tests/test_socketdma_live.py -v  # SocketDMA fast path + cross-generation REU contract
 
-# Run all U64 live tests in parallel (DeviceLock serializes access)
+# Run all U64 live tests in parallel files (per-test DeviceLock via conftest)
 python3 scripts/run_u64_parallel_locked.py <device>
 
 # Stress test the cross-process queueing (6 workers, 5 rounds each)
