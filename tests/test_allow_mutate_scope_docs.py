@@ -28,9 +28,11 @@ Pinned two ways:
   Streams" itself are not resets, RAM writes or stream starts (#383).  A
   **contrast** that denies a term -- ", not the reset", "(not the RAM write)",
   "but not a stream start", "rather than / instead of / never the reboot" --
-  is removed too, together with every other mention of the term it denies.
-  It narrows that term only: "Resets need U64_ALLOW_MUTATE, not the RAM
-  write" is still a claim (#384 review round 1).
+  is removed too, together with a code-shaped mention of the term it denies
+  (the identifier in ``reset(scope=...)``).  Prose mentions stay, so a
+  contrast narrows nothing else: "Resets need U64_ALLOW_MUTATE, not the RAM
+  write" and "RAM writes need U64_ALLOW_MUTATE, not the RAM read" are still
+  claims (#384 review rounds 1 and 2).
 
 The corpus is ``README.md``, ``docs/**/*.md``, ``.claude/skills/c64-test/*.md``
 and the module docstring plus full-line ``#`` comments of every
@@ -48,13 +50,16 @@ and the module docstring plus full-line ``#`` comments of every
   reset, or through a pronoun across a sentence split: "Config writes, not
   the reset alone, need U64_ALLOW_MUTATE; resets need it too." -- ``;`` ends
   the sentence and "it" does not name the gate;
-* a claim that names the term a contrast denies a second time: every
-  mention of a denied term is discounted, so "Resets need U64_ALLOW_MUTATE,
-  not the reset counter" passes (that is what lets "the device-touching
-  reset(scope=...) tests need it for CPU-speed writes, not for the reset"
-  through);
+* a claim written as the identifier a contrast denies: "reset(scope=...)
+  needs U64_ALLOW_MUTATE, not for the reset" passes, because the code-shaped
+  mention is discounted (that is what lets the ``U64_DESTRUCTIVE`` row in
+  ``docs/development.md`` through);
 * ``src/`` docstrings, inline trailing comments, and files outside the
   corpus above.
+
+Each sentence-shaped limit above is asserted to escape by
+:meth:`TestThePinCanFail.test_a_declared_limit_still_escapes`, so a change
+that closes (or moves) one is noticed and this list is updated.
 
 Nothing here proves the docs are right; it stops this specific regression.
 """
@@ -121,17 +126,9 @@ _CONTRAST = re.compile(
     re.I,
 )
 
-#: Every mention of a term family, for discounting the one a contrast denied.
-_TERM_FAMILY = {
-    "reset": r"\breset\w*",
-    "reboot": r"\breboot\w*",
-    "ram": r"\bRAM\b",
-    "stream": r"\bstream\w*",
-}
-
 
 def _without_contrasts(sentence: str) -> str:
-    """*sentence* with each contrast clause, and every mention of its term, removed."""
+    """*sentence* with each contrast clause, and each code-shaped mention of its term, removed."""
     denied: set[str] = set()
 
     def cut(match: re.Match) -> str:
@@ -141,8 +138,11 @@ def _without_contrasts(sentence: str) -> str:
         return " "
 
     rest = _CONTRAST.sub(cut, sentence)
+    # Only a code-shaped mention of a denied term is discounted -- the
+    # identifier in "reset(scope=...) tests need it ..., not for the reset" --
+    # so prose "RAM writes need ..., not the RAM read" stays a claim (#384 r2).
     for family in denied:
-        rest = re.sub(_TERM_FAMILY[family], " ", rest, flags=re.I)
+        rest = re.sub(r"\b" + family + r"\w*\s*\(", " ", rest, flags=re.I)
     return rest
 
 
@@ -288,12 +288,19 @@ class TestThePinCanFail:
         # would drop the only term (kills S11, anchor made optional)
         "The suite does not reset the C64 unless U64_ALLOW_MUTATE is set, so it "
         "needs the gate.",
+        # #384 review round 2: denying a term discounts no prose mention of it
+        "RAM writes need U64_ALLOW_MUTATE, not the RAM read.",
+        "Stream start needs U64_ALLOW_MUTATE, never the stream stop.",
+        "Resets need U64_ALLOW_MUTATE, not the reset counter.",
+        "A reboot requires U64_ALLOW_MUTATE, not a reset.",
     ], ids=["dev-setup", "dev-mutate-marker", "readme-comment", "readme-uci",
             "capabilities-docstring", "feature-parity-docstring", "stream", "reboot",
             "r1-skip-unless", "r1-guards", "r1-must-run", "r1-set-before",
             "r1-only-with", "383-stream-beside-data-streams", "383-leading-not",
             "r2-not-the-ram-write", "r2-stream-not-reset", "r2-but-not-stream",
-            "r2-dash-not-reboot", "r2-unanchored-not"])
+            "r2-dash-not-reboot", "r2-unanchored-not",
+            "r3-ram-not-ram-read", "r3-stream-never-stream-stop",
+            "r3-reset-not-reset-counter", "r3-reboot-not-a-reset"])
     def test_a_retired_sentence_is_caught(self, text: str) -> None:
         assert wider_contract_claims(text)
 
@@ -343,4 +350,26 @@ class TestThePinCanFail:
             "r2-paren", "r2-rather-than", "r2-and-not", "r2-instead-of", "r2-never",
             "r2-but-not", "r2-em-dash", "r2-en-dash", "r2-colon", "r2-dev-row"])
     def test_a_narrow_sentence_is_not_caught(self, text: str) -> None:
+        assert wider_contract_claims(text) == []
+
+    @pytest.mark.parametrize("text", [
+        "Power-cycles need U64_ALLOW_MUTATE.",
+        "DMA writes need U64_ALLOW_MUTATE.",
+        "Resets are only run with U64_ALLOW_MUTATE.",
+        "Opt in with U64_ALLOW_MUTATE for resets.",
+        "Resets need U64_ALLOW_MUTATE, which covers config changes only.",
+        "Resets need the mutation gate.",
+        "Config writes, not the reset alone, need U64_ALLOW_MUTATE; resets need it too.",
+        "reset(scope=...) needs U64_ALLOW_MUTATE, not for the reset.",
+        "reset (scope=...) needs U64_ALLOW_MUTATE, not for the reset.",
+    ], ids=["synonym-power-cycles", "synonym-dma-writes", "requirement-only-run-with",
+            "requirement-opt-in", "beside-a-narrowing-phrase", "gate-not-named",
+            "pronoun-across-a-split", "denied-identifier",
+            "denied-identifier-spaced"])
+    def test_a_declared_limit_still_escapes(self, text: str) -> None:
+        """Each sentence-shaped limit in the module docstring, pinned as an escape.
+
+        A failure here means a limit closed or moved: update the docstring's
+        "What still gets through" list, then this test.
+        """
         assert wider_contract_claims(text) == []
