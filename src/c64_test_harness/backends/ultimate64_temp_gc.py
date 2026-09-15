@@ -9,24 +9,22 @@ the device firmware**: the C64 FPGA keeps running, while the firmware
 stops answering the network and stops responding to the physical menu
 button on the case. Only a physical power-cycle recovers.
 
-Two things are deliberately not claimed here, because neither is
-established. **The trigger threshold**: one U64E on 3.14d wedged at ~15
-cycles of a 63 KB PRG (n unrecorded), which is the reproduction that
-prompted this module — a datapoint, not a limit, and with no standing for
-a C64U on 1.1.0. It is emphatically *not* a capacity figure: ``/Temp`` is
-a 16 MiB RAM disk -- ``ramdisk.cc`` sizes it as ``__ram_disk_limit -
-__ram_disk_start``, and the "3 * 1024 * 1024" comment beside that
-computation is stale (issue #261). For the reproduction's firmware that is
+The owner's account (2026-09-15) is that the attachments fill ``/Temp``
+and a full ``/Temp`` crashes unpatched firmware. **No count is claimed**:
+nobody knows how many uploads an unpatched device survives, and the earlier
+guessed wedge count is retired. The RAM disk's size is known but is not a
+count of uploads either: ``/Temp`` is a 16 MiB RAM disk -- ``ramdisk.cc``
+sizes it as ``__ram_disk_limit - __ram_disk_start``, and the
+"3 * 1024 * 1024" comment beside that computation is stale (issue #261).
+For the U64E's 3.14d firmware that is
 ``0x2000000``-``0x3000000`` in ``software/nios_appl_bsp/linker.x`` at
 ``v3.14d`` (:389-390): the shipped U64E image is the nios2 build, and
 ``target/u64/nios2/ultimate/Makefile`` sets ``BSP = $(PATH_SW)/nios_appl_bsp``
 (:11), links with ``LINK = $(BSP)/linker.x`` (:236) and builds
 ``ramdisk.cc`` (:168) -- issue #316. For the C64U it is
 ``0x02000000``-``0x03000000`` in ``target/u64ii/riscv/ultimate/linker.x``
-at ``1.1.0``. So 15 x 63 KiB = 967,680 bytes is ~5.8% of the disk across 15 directory
-entries, and nothing was near exhaustion. ``/Temp`` "filling" does not describe this
-wedge and earlier versions of this docstring were wrong to say it did.
-**The crash cause**: the pre-fix ``attachment_writer`` created
+at ``1.1.0``.
+**Why a full /Temp crashes the firmware** is not claimed either: the pre-fix ``attachment_writer`` created
 ``/Temp/temp%04x`` from a static counter and never deleted the files, but
 ``TempfileWriter``'s destructor freed both the ``strdup``'d filenames and
 the buffers *before* the fix too (``4c40e9db^:software/api/attachment_writer.h``
@@ -121,10 +119,7 @@ DEFAULT_KEEP = 2
 #: How many attachment-creating requests one client may issue before the
 #: next one triggers a hygiene pass.
 #:
-#: One measurement and one upstream precedent bound this from above --
-#: not two enforced limits, and the difference matters.
-#:
-#: The precedent is the firm one: the firmware's own post-#686 collector
+#: Upstream is the only firm bound: the firmware's own post-#686 collector
 #: keeps at most **10** managed files
 #: (``software/filemanager/filemanager.cc``: ``kManagedTempMaxFiles``),
 #: which is upstream's own statement of a safe resident count. The
@@ -132,23 +127,20 @@ DEFAULT_KEEP = 2
 #: point -- but it is upstream's judgement about the same folder on the
 #: same device family, and it needs no conditions attached.
 #:
-#: The measurement is much weaker than it is usually quoted as being: one
-#: U64E on 3.14d wedged at about **15** uploads of a 63 KB PRG, n
-#: unrecorded. It has no standing for a C64U on 1.1.0, and it is not a
-#: capacity measurement -- the RAM disk is 16 MiB (``ramdisk.cc`` computes
+#: Nothing bounds it from the other side. The owner's account
+#: (2026-09-15) is that attachments fill ``/Temp`` and a full ``/Temp``
+#: crashes the firmware; nobody knows how many uploads that takes, the
+#: earlier guessed wedge count is retired, and none is kept here. The RAM
+#: disk is 16 MiB (``ramdisk.cc`` computes
 #: ``__ram_disk_limit - __ram_disk_start``; cite that computation, not the
 #: stale "3 * 1024 * 1024" comment beside it -- issue #261; per-tree values
-#: in the module docstring: the nios2 BSP at v3.14d for the reproduction,
-#: u64ii at 1.1.0 for the C64U), so 967,680 bytes is ~5.8% of it with 15
-#: directory entries used. Treat 15 as "a device once wedged here", not as a limit.
+#: in the module docstring: the nios2 BSP at v3.14d for the U64E, u64ii at
+#: 1.1.0 for the C64U), but that size is not a count of uploads either.
 #:
-#: **What actually fails is the firmware, not the folder.** On a wedged
-#: machine the C64 FPGA keeps running while the device firmware is dead:
-#: it stops answering the network *and* stops responding to the physical
-#: menu button. So this was never about ``/Temp`` running out of room --
-#: at ~5.8% of a 16 MiB disk with 15 entries, nothing was near exhausted, which is why
-#: no capacity story ever fit. Accumulation crashes the firmware; the
-#: **cause is not established** (the pre-fix ``attachment_writer``
+#: On a crashed machine the C64 FPGA keeps running while the device
+#: firmware is dead: it stops answering the network *and* stops responding
+#: to the physical menu button. Why a full ``/Temp`` does that is
+#: **not established** (the pre-fix ``attachment_writer``
 #: created ``/Temp/temp%04x`` from a static counter and never deleted
 #: them, but ``TempfileWriter``'s destructor does free the ``strdup``'d
 #: names and the buffers, so a naive per-request heap-leak story does not

@@ -251,9 +251,10 @@ def test_temp_gc_source_no_longer_states_the_3_mb_ramdisk():
     from c64_test_harness.backends import ultimate64_temp_gc as mod
 
     src = _inspect.getsource(mod)
-    # Vacuity guard: this is the file that carries the provenance figure,
-    # both in the module docstring and in the budget comment.
-    assert src.count("63 KB PRG") >= 2
+    # This file states the RAM-disk size in both the module docstring and
+    # the budget comment.  The guessed wedge count it used to carry ("63 KB
+    # PRG", "967,680") is retired (owner, 2026-09-15; #256) and must not return.
+    assert "63 KB PRG" not in src
     assert "DEFAULT_LEAK_BUDGET = " in src
     hits = [ln.strip() for ln in src.splitlines() if _STALE_RAMDISK.search(ln)]
     assert hits == []
@@ -263,7 +264,7 @@ def test_temp_gc_source_no_longer_states_the_3_mb_ramdisk():
     assert src.count("__ram_disk_start") >= 2
     assert src.count("__ram_disk_limit") >= 2
     assert src.count("16 MiB") >= 2
-    assert src.count("967,680") >= 2
+    assert "967,680" not in src
     # Review round 1, finding 3: the reproduction was a U64E on 3.14d and the
     # C64U runs 1.1.0 -- each figure cites the tree it came from.
     # Bound to the path, not merely present somewhere in the file: "v3.14d"

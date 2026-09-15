@@ -238,9 +238,8 @@ def test_a_device_that_answered_late_is_regraded_after_a_successful_request():
     "unknown", which is cached forever and disarms hygiene. So a real
     C64U answering ``/v1/info`` in 501 ms would get no accounting, no
     budget, no drain and no refusal -- and the correlation runs the wrong
-    way: a device is slow when it is loaded or distressed, which is how a
-    device with accumulating /Temp attachments may well present before the
-    firmware crashes (#256: the failure is a crash, not a full /Temp).
+    way: a device is slow when it is loaded or distressed, which is the
+    state of a device approaching /Temp exhaustion.
 
     A completed request is the evidence a timed-out probe could not
     supply. The re-probe fires at the decision points -- before an

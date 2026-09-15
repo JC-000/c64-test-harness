@@ -14,8 +14,9 @@ not owed one. You do not edit code — you read, run, break, and report.
 CLAUDE.md § "Standing hardware-safety clause: do not wedge the C64U"
 is part of this brief. The short form: the C64 Ultimate at
 10.53.21.158 (fw 1.1.0) never collects the managed `/Temp` attachments
-that body-carrying REST calls leave behind, ~15 uploads wedge it, and
-only a physical power-cycle recovers it — with nobody physically
+that body-carrying REST calls leave behind; accumulated attachments fill
+`/Temp` and crash its firmware (no safe count is known), and only a
+physical power-cycle recovers it — with nobody physically
 present. You review under it and you enforce it. In force until
 `DeviceCapabilities.writemem_post_safe` is `True` for that device.
 
@@ -106,10 +107,11 @@ this brief enforces. Then work these seven axes, in this order:
    attached deserves more suspicion than an uncited one.** The citation
    has already done the work of making the figure feel settled, so
    nobody opens the source to check. In this repo's own case, a
-   "~15 uploads wedges it" figure carried a docstring citation and
-   travelled through three agents and two sessions — and the conditions
-   that refuted its use (63 KB PRG, a different device, a different
-   firmware, n unrecorded) were sitting in the very lines being cited.
+   wedge-count figure carried a docstring citation and travelled
+   through three agents and two sessions — and the conditions that
+   refuted its use (a different device, a different firmware, n
+   unrecorded) were sitting in the very lines being cited. It has since
+   been retired as a guess.
    The uncited claim beside it got caveated properly, because it had no
    citation to hide behind. Check the handed-down numbers hardest.
 3a. **Has anything ever been put against the device?** The hardest
