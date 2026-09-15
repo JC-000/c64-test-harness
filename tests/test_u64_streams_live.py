@@ -86,9 +86,11 @@ BA_HIGH_MAX = 0.96
 #: ~19 Mbps host download that never touches the U64 lost a median 186.5
 #: (9-17%), about 27 times as much.  Audio alongside this debug stream lost
 #: 12-26% (n=8), and audio and debug losses coincided in 63-77% of time bins
-#: against 7-16% by chance.  Arrival delay climbs before each loss, peaking
-#: at 348 ms against the device's exact 4.00 ms packet period: queue
-#: tail-drop, not a receiver fault.  en0 input errors and drops stayed at 0.
+#: against 7-16% by chance.  Arrival delay is higher before losses than in
+#: random windows (every lossy trial, 23 of 23, median difference 2-60 ms;
+#: largest delay seen 348 ms against the audio stream's nominal ~4.005 ms
+#: packet period, 192 frames at 2109375/44 Hz), consistent with queue
+#: tail-drop rather than a receiver fault.  en0 input errors and drops stayed at 0.
 #: **Not established:** whether the FPGA packetizer (proprietary) advances
 #: the sequence number on an in-device discard, so a small device-side
 #: residual is not excluded.  Consequence for anyone reading a failure here:
@@ -100,11 +102,20 @@ BA_HIGH_MAX = 0.96
 #: step into a +256 jump, a loss fraction near 0.99; the band between the
 #: worst bench loss measured (0.446) and that is what 0.75 sits in.  It
 #: does **not** detect emitter-side degradation of the #81 kind, or any
-#: loss below 75%; the loss fraction and packets received are logged on
-#: every run so such a trend stays visible.  The edge is chosen, not
+#: loss below 75%.  So that such a trend stays visible, every run
+#: ``print``s the loss fraction and packets received (pytest shows it with
+#: ``-s``, and in the captured-stdout section when the test fails; the
+#: project sets no log level, so ``logger.info`` alone is never shown), and
+#: loss above 25% also emits a WARNING, which pytest reports by default.  The edge is chosen, not
 #: derived.  A receiver that stops reading is caught by the cycle-count
 #: assertion instead.
 DEBUG_STREAM_LOSS_MAX = 0.75
+
+#: Loss fraction above which a passing capture still logs a WARNING.  Not a
+#: pass/fail edge: it only makes a heavy-loss run visible in the default
+#: pytest report.  Chosen, not derived -- above audio-alone loss (<= 1.4%)
+#: and at the top of the audio-plus-debug range (12-26%).
+DEBUG_STREAM_LOSS_WARN = 0.25
 
 
 def _debug_loss_fraction(result) -> float:
@@ -181,13 +192,22 @@ def test_debug_stream_captures_cycles(client: Ultimate64Client) -> None:
         time.sleep(0.3)
         result = cap.stop()
 
-    logger.info(
-        "Debug capture: %d cycles, %d packets received, %d dropped, "
-        "loss fraction %.4f, %.2fs",
-        result.total_cycles, result.packets_received,
-        result.packets_dropped, _debug_loss_fraction(result),
-        result.duration_seconds,
+    loss_line = (
+        f"Debug capture: {result.total_cycles} cycles, "
+        f"{result.packets_received} packets received, "
+        f"{result.packets_dropped} dropped, loss fraction "
+        f"{_debug_loss_fraction(result):.4f}, {result.duration_seconds:.2f}s"
     )
+    # print, not only logger.info: pyproject sets no log level, so an INFO
+    # record never reaches the report (#356 review).
+    print(loss_line, flush=True)
+    logger.info(loss_line)
+    if _debug_loss_fraction(result) > DEBUG_STREAM_LOSS_WARN:
+        logger.warning(
+            "%s -- above %.0f%%; bench loss this high usually means competing "
+            "traffic on this host (the DeviceLock does not isolate it)",
+            loss_line, 100.0 * DEBUG_STREAM_LOSS_WARN,
+        )
     assert result.total_cycles > 10000, (
         f"Expected >10000 cycles, got {result.total_cycles}"
     )

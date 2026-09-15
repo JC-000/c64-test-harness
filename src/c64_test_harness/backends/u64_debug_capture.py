@@ -34,7 +34,8 @@ items back to the firmware default; ``set_turbo_mhz(client, 1)`` also runs at
 aggregate statistics (PC distribution, frequency maps), turbo-speed
 capture is fine because the sampling is uniform.
 
-**FPGA degradation under sustained workload (issue #81)**
+**FPGA degradation under sustained workload (issue #81)** (re-grade pending:
+Wi-Fi loss is a confound, #431)
 
 Independent of the rate cap above, the U64E FPGA's debug-stream
 emitter exhibits *delivery-rate degradation* over time when the
