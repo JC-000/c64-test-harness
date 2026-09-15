@@ -32,9 +32,21 @@ v3.15-85), not measured:
 - The item drives the FPGA register `CMD_IF_SLOT_ENABLE`, which
   `C64::set_emulation_flags()` sets to `!!cfg->get_value(CFG_CMD_ENABLE)`
   (`software/io/c64/c64.cc:326-327` at `1.1.0`; `:329-330` at `7f6fcb51`).
-- A REST single-item config PUT reaches that function at once:
-  `st->at_close_config()` (`software/api/route_configs.cc:244` at `1.1.0`,
-  `:313` at `7f6fcb51`) → `effectuate()` (`config.h:163-169`) →
+- A REST single-item config PUT reaches that function when the PUT
+  closes, with no reset in between. The route's `set_item` calls
+  `item->setValue(n)` (`software/api/route_configs.cc:63-85` at `1.1.0`).
+  `setValue` is `value = v; return setChanged();` (`config.h:121`).
+  `setChanged` calls `store->set_need_effectuate()` unless the item has a
+  change hook (`config.cc:901-911`; `:902` at `7f6fcb51`). No hook is
+  registered for `CFG_CMD_ENABLE` in `software/io/c64`, `software/u64` or
+  `software/api` at either ref; the only C64 hook there is
+  `CFG_C64_CART_PREF` (`c64.cc:136`). The rest of the tree was not
+  searched. The route then calls `st->at_close_config()`
+  (`route_configs.cc:244` at `1.1.0`, `:313` at `7f6fcb51`), which
+  effectuates only `if (need_effectuate())` (`config.h:165-168`; `:201`
+  at `7f6fcb51`). Because `setChanged` sets that flag on every set, even
+  one that leaves the value unchanged, the gate is "the item was set",
+  not "the item changed". The chain continues `effectuate()` →
   `C64::effectuate_settings()` → `set_emulation_flags()`
   (`c64.cc:267-277`). So by source the enable takes effect without a
   reset.
@@ -44,11 +56,25 @@ v3.15-85), not measured:
   when no external cartridge holds the bus it then calls
   `set_cartridge(NULL)` (`c64.cc:923-924`), which calls
   `set_emulation_flags()` again (`c64.cc:992`) and restores the enable
-  from config. Only when `ConfigureU64SystemBus()` reports an external
-  cartridge with the bus (Cartridge Preference *Automatic* with a cart
-  present, or *External*) is `set_cartridge` skipped, leaving the slot at
-  0. The same applies to the REU enable. `Ultimate64Client.reboot`'s
-  docstring states the unconditional version; that contradiction is #299.
+  from config. Two cases leave it at 0 all the same:
+  - **An external cartridge holds the bus.** `ConfigureU64SystemBus()`
+    reports one (Cartridge Preference *Automatic* with a cart present, or
+    *External*), so `set_cartridge` is skipped (`c64.cc:921-924`).
+  - **The configured cartridge image prohibits UCI.** `set_cartridge(NULL)`
+    loads the `.crt` named by `CFG_C64_CART_CRT` (`c64.cc:961-963`;
+    `:1241-1243` at `7f6fcb51`) and restores the enable in
+    `set_emulation_flags()`. It then zeroes the enable again if that
+    definition's `prohibit` mask includes `CART_UCI`, `CART_UCI_DFFC` or
+    `CART_UCI_DE1C` (`c64.cc:1062-1068`; `:1341-1346` at `7f6fcb51`).
+    `CART_PROHIBIT_DFXX` includes `CART_UCI` (`c64.h:254`; `:256` at
+    `7f6fcb51`). GeoRAM's `CART_PROHIBIT_ALL_BUT_REU` does not
+    (`c64.h:256`; `:258`). Which `.crt` types carry such a mask is not
+    traced here.
+
+  The REU enable follows the same two cases; its prohibit check is
+  `c64.cc:1056-1061` (`:1335-1339` at `7f6fcb51`).
+  `Ultimate64Client.reboot`'s docstring states the unconditional version;
+  that contradiction is #299.
 
 To find the real cause, drop the reset on a device and see which step
 fails. Nobody has done that. The write is memory-only — it is a config PUT, so

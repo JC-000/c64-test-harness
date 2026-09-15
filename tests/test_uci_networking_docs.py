@@ -21,10 +21,31 @@ Pinned three ways, the same shape as ``test_entry_baseline_docs.py``:
 * the refuted cause is not restated as the reason.  Matched through a
   whitespace-folding normaliser, because prose wraps.
 
-The absence pins are an enumeration plus one subject-scoped check (a
-sentence that pairs the slot/REU enable with reboot and "disabled" and
-does not also carry the restoring call).  A paraphrase that names none
-of those can still get through; nothing here proves the doc is right.
+The absence pins are an enumeration plus two sentence-level checks, both
+reached through :func:`_relapses`:
+
+* *reboot leaves it disabled* -- a sentence naming the enable (slot,
+  ``CMD_IF_SLOT_ENABLE``, REU, Command Interface, UCI), reboot or
+  ``start_cartridge``, and ``disabled`` or ``off``, without naming either
+  real condition (``set_cartridge``, external cartridge, ``prohibit``);
+* *the PUT waits for a reset* -- "only applied/takes effect at the next
+  reset", "not applied/live until reset", "does not go live until".
+
+Review round 1 (PR #309) found three plain paraphrases that walked through
+the first version (E1-E3 in :class:`TestThePinsCanFail`); both checks were
+widened for them.  **What still gets through**, concretely:
+
+* a state word outside the list: "comes back inactive", "is cleared",
+  "reverts to Disabled" spelt without ``disabled``, "you have to switch it
+  on again";
+* reboot not named: "after the C64 restarts the interface is off";
+* a deferral without those shapes: "the reset is what makes the PUT
+  stick", "the setting needs a reset to land";
+* any relapse that also mentions ``external``, ``prohibit`` or
+  ``set_cartridge`` in the same sentence -- those words waive the check,
+  so a wrong claim written next to the qualifier passes.
+
+Nothing here proves the doc is right; it stops these specific regressions.
 """
 from __future__ import annotations
 
@@ -78,6 +99,12 @@ SOURCE_TRACE = (
     "c64.cc:913",
     "c64.cc:923-924",
     "c64.cc:992",
+    # The second exception (review round 1): a configured .crt whose
+    # prohibit mask includes UCI zeroes the enable after it is restored.
+    "CFG_C64_CART_CRT",
+    "c64.cc:1062-1068",
+    "CART_PROHIBIT_DFXX",
+    "c64.cc:1056-1061",
 )
 
 #: The honesty clause: the requirement's cause is not established.
@@ -107,17 +134,50 @@ def _sentences(flat: str) -> list[str]:
     return re.split(r"(?<=[.;?!])\s+", flat)
 
 
+#: What the enable is called.  Review round 1 added the two plain names:
+#: "the Command Interface" and "UCI" passed a subject list that only knew
+#: the slot, the register and the REU.
+_SUBJECT = re.compile(r"\bslot\b|cmd_if_slot_enable|\breu\b|command interface|\buci\b")
+#: What reboot is called.
+_REBOOT = re.compile(r"reboot|start_cartridge")
+#: What "left disabled" is called.  "off" is matched as a word so that
+#: "power-on", "offset" and the like do not count.
+_DISABLED = re.compile(r"\bdisabled\b|\boff\b")
+#: The two conditions under which source really does leave the enable at 0.
+#: A sentence naming either is the qualified statement, not the relapse.
+_QUALIFIERS = ("set_cartridge", "external", "prohibit")
+
+
 def _restates_refuted_cause(flat: str) -> list[str]:
     """Sentences that say reboot leaves the enable disabled, unqualified."""
     hits = []
     for s in _sentences(flat):
         low = s.lower()
-        if ("slot" in low or "cmd_if_slot_enable" in low or "reu" in low) \
-                and ("reboot" in low or "start_cartridge" in low) \
-                and "disabled" in low \
-                and "set_cartridge" not in low and "external" not in low:
+        if _SUBJECT.search(low) and _REBOOT.search(low) and _DISABLED.search(low) \
+                and not any(q in low for q in _QUALIFIERS):
             hits.append(s)
     return hits
+
+
+#: "The PUT only takes effect at the next reset": the deferral shape.  By
+#: source a changed item is effectuated when the PUT closes, so any sentence
+#: saying the setting waits for a reset is the inference this doc removed.
+_DEFERRAL = re.compile(
+    r"only (?:be )?(?:applied|applies|takes? effect|goes? live|active)"
+    r"(?: \w+)? (?:at|on|after|by) the next (?:machine )?reset"
+    r"|not (?:be )?(?:applied|live|active|effective|take effect|go live)"
+    r" until(?: the next)?(?: machine)? reset"
+    r"|(?:do|does) not go live until"
+)
+
+
+def _claims_deferred_apply(flat: str) -> list[str]:
+    return [s for s in _sentences(flat) if _DEFERRAL.search(s.lower())]
+
+
+def _relapses(flat: str) -> list[str]:
+    """Every sentence-level absence check, as one entry point."""
+    return _restates_refuted_cause(flat) + _claims_deferred_apply(flat)
 
 
 class TestTheObservationSurvives:
@@ -144,7 +204,13 @@ class TestTheRefutedCauseIsNotTheReason:
         assert phrase.lower() not in whole.lower(), phrase
 
     def test_no_sentence_restates_it(self, whole: str) -> None:
-        assert not _restates_refuted_cause(whole)
+        """Both sentence-level checks, against the doc itself.
+
+        Review round 1 follow-up: this called only the reboot check, so the
+        deferral check ran in the vacuity tests but never on the doc -- E3
+        inserted into the doc passed.
+        """
+        assert not _relapses(whole)
 
 
 class TestThePinsCanFail:
@@ -162,6 +228,33 @@ class TestThePinsCanFail:
     ])
     def test_subject_scoped_check_fires(self, whole: str, claim: str) -> None:
         assert _restates_refuted_cause(whole + " " + claim)
+
+    @pytest.mark.parametrize("claim", [
+        # Review round 1 (PR #309): plain paraphrases that passed the pin.
+        "After `client.reboot()` the UCI registers come back off until the next reset.",
+        "A reboot turns the Command Interface off again, so re-enable it afterwards.",
+        "The config PUT is only applied at the next reset, which is why the reset is needed.",
+    ], ids=["E1-uci-come-back-off", "E2-command-interface-turned-off",
+            "E3-deferred-apply"])
+    def test_plain_paraphrase_is_detected(self, whole: str, claim: str) -> None:
+        assert _relapses(whole + " " + claim), claim
+
+    @pytest.mark.parametrize("benign", [
+        "After a reboot the UCI register offset is still $DF1C.",
+        "A reboot of the C64 does not change the Command Interface's offset table.",
+    ])
+    def test_off_is_matched_as_a_word(self, benign: str) -> None:
+        """Positive control: 'offset' is not 'off'.
+
+        A substring match would flag these; the pin promises a word match.
+        """
+        assert not _relapses(benign)
+
+    def test_qualified_external_cart_exception_passes(self) -> None:
+        """E4: the exception, stated with its condition, is not a relapse."""
+        ok = ("With Cartridge Preference External and a cartridge holding the "
+              "bus, set_cartridge is skipped and the slot stays at 0.")
+        assert not _relapses(ok)
 
     def test_subject_scoped_check_spares_the_qualified_statement(self) -> None:
         """Positive control: the exception, stated with its condition, passes."""
