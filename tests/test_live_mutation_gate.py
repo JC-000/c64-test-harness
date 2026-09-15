@@ -61,9 +61,14 @@ import time always, and anywhere else unless the module supplies its own
 ``putenv``, ``setdefault``, an ``os.environ`` store).  Removing the variable
 (``delenv``, ``delitem``, ``unsetenv``, ``pop``, ``del``) supplies nothing --
 it means "no host" and cannot make a read elsewhere in the file safe -- so it
-does not exempt a module (#396); nor does storing the literal empty string,
-which the harness reads as "no host" too (#411).  Only the literal ``""`` is
-recognised: a value computed to empty still counts as a supply.  The gate
+does not exempt a module (#396); nor does storing a blank literal -- ``""``,
+whitespace such as ``" "``, or an f-string of only such text (``f''``) --
+which the harness strips and reads as "no host" too (#411).  Literals only:
+a blank value the scanner would have to compute still counts as a supply --
+``str()``, a name bound to ``""``, a for-loop target
+(``for os.environ['U64_HOST'] in ['']``), a tuple unpack
+(``os.environ['U64_HOST'], x = '', 1``), an augmented store (``+= ''``), and a
+dict literal that repeats the key with a real value before a blank one.  The gate
 protects the device the operator named, and a test reaches that device only
 through the ``U64_HOST`` the operator exported: a module that sets the
 variable itself is driving the harness against a host it chose
@@ -945,13 +950,21 @@ def reads_the_host_at_import(tree: ast.Module) -> bool:
 
 
 def _names_a_host(value: ast.AST | None) -> bool:
-    """Whether a stored value can name a host: anything but the literal ``""``.
+    """Whether a stored value can name a host: anything but a blank literal.
 
-    ``U64_HOST=`` is "no host" to the harness (a falsy ``U64_HOST`` skips), so
-    storing ``""`` supplies nothing, exactly like a removal (#411).  A missing
-    or non-literal value is assumed to name one.
+    The harness strips ``U64_HOST`` before deciding there is a host
+    (``tests/conftest.py`` ``env.strip()``, ``backends/unified_manager.py``
+    ``h.strip()``), so storing ``""`` or ``" "`` -- or an f-string made only of
+    such literal text, ``f''`` included -- supplies nothing, exactly like a
+    removal (#411).  A missing or non-literal value is assumed to name one.
     """
-    return not (isinstance(value, ast.Constant) and value.value == "")
+    if isinstance(value, ast.Constant):
+        return not (isinstance(value.value, str) and not value.value.strip())
+    if isinstance(value, ast.JoinedStr):
+        parts = value.values
+        literal = all(isinstance(p, ast.Constant) and isinstance(p.value, str) for p in parts)
+        return not (literal and not "".join(p.value for p in parts).strip())
+    return True
 
 
 def _call_value(call: ast.Call, index: int, keywords: tuple[str, ...]) -> ast.AST | None:
@@ -1177,9 +1190,28 @@ class TestModuleSelection:
          "@mock.patch.dict(os.environ, {'U64_HOST': ''})\ndef test_a():\n    os.environ.get('U64_HOST')\n", True),
         ("import os\nfrom unittest import mock\n"
          "@mock.patch.dict(os.environ, U64_HOST='')\ndef test_a():\n    os.environ.get('U64_HOST')\n", True),
-        # #411 controls: a non-empty or non-literal value still supplies a host,
-        # and one real store anywhere keeps the file-wide exemption.
+        # #441 review: the remaining recognised store forms, one case each.
+        ("import os\ndef test_a():\n    os.environ.setdefault('U64_HOST', default='')\n"
+         "    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.setitem(os.environ, 'U64_HOST', value='')\n"
+         "    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a():\n    os.environ['U64_HOST'] = y = ''\n    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a():\n    y = os.environ['U64_HOST'] = ''\n    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a():\n    os.environ.update(U64_HOST='')\n    os.environ.get('U64_HOST')\n", True),
+        # The harness strips the host, so blank text is "no host" as well.
         ("import os\ndef test_a(monkeypatch):\n    monkeypatch.setenv('U64_HOST', ' ')\n"
+         "    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.setenv('U64_HOST', f'')\n"
+         "    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.setenv('U64_HOST', f' \\t')\n"
+         "    os.environ.get('U64_HOST')\n", True),
+        # #411 controls: a non-blank or non-literal value still supplies a host,
+        # and one real store anywhere keeps the file-wide exemption.
+        ("import os\ndef test_a(monkeypatch, h):\n    monkeypatch.setenv('U64_HOST', f' {h}')\n"
+         "    os.environ.get('U64_HOST')\n", False),
+        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.setenv('U64_HOST', f' h')\n"
+         "    os.environ.get('U64_HOST')\n", False),
+        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.setenv('U64_HOST', 0)\n"
          "    os.environ.get('U64_HOST')\n", False),
         ("import os\ndef test_a(monkeypatch, fake):\n    monkeypatch.setenv('U64_HOST', fake)\n"
          "    os.environ.get('U64_HOST')\n", False),
@@ -1203,7 +1235,14 @@ class TestModuleSelection:
         "411-empty-putenv-is-not-a-host", "411-empty-dunder-setitem-is-not-a-host",
         "411-empty-update-dict-is-not-a-host", "411-empty-patch-dict-is-not-a-host",
         "411-empty-patch-dict-kw-is-not-a-host",
-        "411-space-still-supplies-control", "411-name-value-still-supplies-control",
+        "411-empty-setdefault-default-kw-is-not-a-host", "411-empty-setitem-value-kw-is-not-a-host",
+        "411-empty-chained-store-is-not-a-host", "411-empty-chained-store-second-target-is-not-a-host",
+        "411-empty-update-kw-is-not-a-host",
+        "411-whitespace-is-not-a-host", "411-empty-fstring-is-not-a-host",
+        "411-whitespace-fstring-is-not-a-host",
+        "411-fstring-with-a-field-still-supplies-control", "411-fstring-with-text-still-supplies-control",
+        "411-non-str-constant-still-supplies-control",
+        "411-name-value-still-supplies-control",
         "411-chained-store-still-supplies-control", "411-patch-dict-kw-still-supplies-control",
         "411-one-real-store-keeps-the-file-exempt-control", "411-dict-with-a-real-value-supplies-control",
     ])
