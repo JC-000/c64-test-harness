@@ -15,6 +15,7 @@ import logging
 import os
 import socket
 import time
+import warnings
 
 import pytest
 
@@ -66,6 +67,79 @@ _requires_mutate = pytest.mark.skipif(
 #: by ``tests/test_ba_badline_band.py`` -- edit there and here together.
 BA_HIGH_MIN = 0.90
 BA_HIGH_MAX = 0.96
+
+#: Largest tolerated fraction of the debug stream lost to sequence gaps,
+#: ``dropped / (received + dropped)``, in one ~1.3 s capture (#356).
+#:
+#: This used to be a fixed ``packets_dropped < 50`` out of ~2,900, and it
+#: failed on master most runs.  Measured on the U64E (fw 3.15 bce4535e),
+#: 2026-09-15, 28 captures in two paired runs (SO_RCVBUF 256 KiB vs 8 MiB,
+#: interleaved): loss fraction min 0.004, median 0.073, max 0.446; 24 of 28
+#: had >= 50 drops, in bursts of 1-313 packets.  Neither buffer size helped
+#: (median 55-492 drops either way), and in the 12 captures bracketed by
+#: ``netstat -s -p udp`` the kernel's "dropped due to full socket buffers"
+#: counter moved by **zero** every time, so the loss happens before this
+#: host's socket buffer, and a count limit measured the bench, not the code.
+#:
+#: Where it happens was then measured (owner's stream-loss research, same
+#: device and day): **the host's Wi-Fi downlink, load-dependent.**  Paired
+#: n=6, audio alone lost a median 7 packets per ~1,390; audio alongside a
+#: ~19 Mbps host download that never touches the U64 lost a median 186.5
+#: (9-17%), about 27 times as much.  Audio alongside this debug stream lost
+#: 12-26% (n=8), and audio and debug losses coincided in 63-77% of time bins
+#: against 7-16% by chance.  Arrival delay is higher before losses than in
+#: random windows (every lossy trial, 23 of 23, median difference 2-60 ms;
+#: largest delay seen 348 ms against the audio stream's nominal ~4.005 ms
+#: packet period, 192 frames at 2109375/44 Hz), consistent with queue
+#: tail-drop rather than a receiver fault.  en0 input errors and drops stayed at 0.
+#: **Not established:** whether the FPGA packetizer (proprietary) advances
+#: the sequence number on an in-device discard, so a small device-side
+#: residual is not excluded.  Consequence for anyone reading a failure here:
+#: other lanes' traffic on this host raises the loss, and the DeviceLock
+#: does not isolate it.
+#:
+#: What the bound catches is the receiver's own sequence accounting going
+#: wrong.  A sequence number read in the wrong byte order turns each +1
+#: step into a +256 jump, a loss fraction near 0.99; the band between the
+#: worst bench loss measured (0.446) and that is what 0.75 sits in.  It
+#: does **not** detect emitter-side degradation of the #81 kind, or any
+#: loss below 75%.  So that such a trend stays visible, every run
+#: ``print``s the loss fraction and packets received (pytest shows it with
+#: ``-s``, and in the captured-stdout section when the test fails; the
+#: project sets no log level, so ``logger.info`` alone is never shown), and
+#: loss above 25% also emits a UserWarning, which appears in pytest's
+#: warnings summary (a ``logger.warning`` on a passing test does not appear
+#: with default options).  The edge is chosen, not derived.  A receiver that
+#: stops reading is caught by the cycle-count assertion instead.
+DEBUG_STREAM_LOSS_MAX = 0.75
+
+#: Loss fraction above which a passing capture still emits a UserWarning.  Not a
+#: pass/fail edge: it only makes a heavy-loss run visible in the default
+#: pytest report.  Chosen, not derived -- above audio-alone loss (<= 1.4%)
+#: and at the top of the audio-plus-debug range (12-26%).
+DEBUG_STREAM_LOSS_WARN = 0.25
+
+
+def _debug_loss_fraction(result) -> float:
+    """``dropped / (received + dropped)`` for a debug capture result.
+
+    The denominator is every packet the sequence numbers say was sent, not
+    only those received, so a capture that received nothing but counted
+    gaps reads 1.0, and one with no gaps reads 0.0.  Module-level so the
+    offline pin (``tests/test_debug_stream_loss_bound.py``) checks the same
+    arithmetic the live assertion uses (#356 review).
+    """
+    sent = result.packets_received + result.packets_dropped
+    return result.packets_dropped / sent if sent else 0.0
+
+
+def _debug_loss_within_bound(result) -> bool:
+    """Whether a capture's loss fraction is at or under the bound.
+
+    The live assertion's comparison, kept here so the offline pin exercises
+    the comparison itself rather than a copy of it (#356 review).
+    """
+    return _debug_loss_fraction(result) <= DEBUG_STREAM_LOSS_MAX
 
 
 def _local_ip() -> str:
@@ -120,17 +194,41 @@ def test_debug_stream_captures_cycles(client: Ultimate64Client) -> None:
         time.sleep(0.3)
         result = cap.stop()
 
-    logger.info(
-        "Debug capture: %d cycles, %d packets, %d dropped, %.2fs",
-        result.total_cycles, result.packets_received,
-        result.packets_dropped, result.duration_seconds,
+    loss_line = (
+        f"Debug capture: {result.total_cycles} cycles, "
+        f"{result.packets_received} packets received, "
+        f"{result.packets_dropped} dropped, loss fraction "
+        f"{_debug_loss_fraction(result):.4f}, {result.duration_seconds:.2f}s"
     )
+    # print, not only logger.info: pyproject sets no log level, so an INFO
+    # record never reaches the report (#356 review).
+    print(loss_line, flush=True)
+    logger.info(loss_line)
+    if _debug_loss_fraction(result) > DEBUG_STREAM_LOSS_WARN:
+        # warnings.warn, not logger.warning: on a passing test only a
+        # warning reaches pytest's default report, in the warnings summary
+        # (#356 review round 3).  Default stacklevel, so the summary names
+        # this line rather than pytest's own call site.
+        warnings.warn(
+            f"{loss_line} -- above {100.0 * DEBUG_STREAM_LOSS_WARN:.0f}%; "
+            "bench loss this high usually means competing traffic on this "
+            "host (the DeviceLock does not isolate it)",
+            UserWarning,
+        )
     assert result.total_cycles > 10000, (
         f"Expected >10000 cycles, got {result.total_cycles}"
     )
     assert len(result.trace) > 0, "Trace is empty"
-    assert result.packets_dropped < 50, (
-        f"Too many drops: {result.packets_dropped}"
+    assert result.packets_received > 0, "No debug packets received"
+    loss = _debug_loss_fraction(result)
+    assert _debug_loss_within_bound(result), (
+        f"sequence gaps account for {100.0 * loss:.1f}% of the stream "
+        f"({result.packets_dropped} dropped, {result.packets_received} "
+        f"received), above {100.0 * DEBUG_STREAM_LOSS_MAX:.0f}%. Loss on "
+        "this bench (the host's Wi-Fi downlink, load-dependent; a small "
+        "device-side residual not excluded) has reached 45%; a figure far "
+        "above that points at the receiver's sequence accounting (byte "
+        "order) -- see DEBUG_STREAM_LOSS_MAX (#356)"
     )
 
 
