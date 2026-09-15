@@ -333,9 +333,11 @@ class RecordedCategorySet:
     categories: frozenset[str]
 
 
-#: The category list each device generation actually reports -- recorded
-#: from a device read, never projected from source -- each with its
-#: source.  ``tests/test_entry_baseline.py`` asserts that every name in
+#: The category list each device generation reports, each with its
+#: source.  The C64U record is a device listing taken verbatim, never
+#: projected from source; the U64E names are reconstructed from a
+#: per-category read and cross-checked against an older listing and the
+#: firmware source (its ``source`` says which).  ``tests/test_entry_baseline.py`` asserts that every name in
 #: every record is classified (in :data:`BASELINE_CATEGORIES`,
 #: :data:`BASELINE_NEVER_TOUCH` or :data:`BASELINE_UNCLASSIFIED_CATEGORIES`),
 #: so a store a device lists without anyone having decided about it fails
@@ -349,12 +351,16 @@ BASELINE_RECORDED_CATEGORY_SETS: dict[str, RecordedCategorySet] = {
         firmware="3.15 (v3.15-85, 7f6fcb51)",
         date="2026-09-12",
         source=(
-            "read-only GET /v1/configs plus per-category GETs, DeviceLock "
-            "held (commit 78aa38e, per-category item counts in "
-            "tests/test_entry_baseline_live.py): 19 categories = the twelve "
-            "covered + the five never-touch + UltiSID Configuration + Data "
-            "Streams.  Names agree with scripts/U64_DEVICE_PROBE.md section 5 "
-            "(fw 3.14, 2026-04-05)"
+            "category names reconstructed from the 2026-09-12 read-only "
+            "per-category read (U64E fw 3.15, DeviceLock held; #288) -- 19 "
+            "categories = the twelve covered + the five never-touch + UltiSID "
+            "Configuration + Data Streams; no saved listing of the names.  "
+            "Cross-checked against scripts/U64_DEVICE_PROBE.md section 5 "
+            "(fw 3.14, 2026-04-05, 'all 19') and against firmware source at "
+            "7f6fcb51 (v3.15-85): target/u64/nios2/ultimate/Makefile builds "
+            "rtc_i2c.cc (:67, Clock Settings), network_esp32.cc (:143, WiFi "
+            "settings) and data_streamer.cc (:170, Data Streams) and not "
+            "bling_board.cc; Speaker Mixer is #if U64 == 2 only"
         ),
         categories=frozenset({
             "Audio Mixer", "SID Sockets Configuration", "UltiSID Configuration",
