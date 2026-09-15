@@ -63,7 +63,7 @@ from c64_test_harness.backends.ultimate64_client import Ultimate64Client
 from c64_test_harness.backends.ultimate64_helpers import (
     DEBUG_MODE_6510,
     get_debug_stream_mode,
-    get_turbo_mhz,
+    restore_speed_defaults,
     set_debug_stream_mode,
     set_turbo_mhz,
 )
@@ -250,13 +250,20 @@ def client():
 
 @pytest.fixture(scope="module")
 def original_state(client: Ultimate64Client):
-    """Snapshot and restore turbo + debug-stream-mode around the sweep.
+    """Put the CPU speed and the debug-stream mode back after the sweep.
 
     We don't use :func:`snapshot_state` / :func:`restore_state` here because
-    only two settings are in play and we want a targeted restore (the broad
+    only these settings are in play and we want a targeted restore (the broad
     snapshot helpers can churn unrelated config on some firmwares).
+
+    ``CPU Speed`` and ``Turbo Control`` go back to the device's **defaults**
+    through :func:`restore_speed_defaults` (#365).  The previous restore,
+    ``set_turbo_mhz(client, get_turbo_mhz(client))``, wrote only
+    ``Turbo Control = Off`` whenever turbo was off at entry and left
+    ``CPU Speed`` at the sweep's last value (48).  The debug-stream mode goes
+    back to its entry value.  Both restores are attempted; a failure is logged
+    and raised once the other has run, not swallowed.
     """
-    orig_mhz = get_turbo_mhz(client)  # int | None
     orig_mode = get_debug_stream_mode(client)
 
     set_debug_stream_mode(client, DEBUG_MODE_6510)
@@ -265,18 +272,20 @@ def original_state(client: Ultimate64Client):
     try:
         yield
     finally:
-        # Best-effort restore: turbo first (back to 1 MHz or original), then
-        # the debug stream mode.  Ignore individual failures so one broken
-        # restore doesn't prevent the other from running.
+        failures: list[Exception] = []
         try:
-            set_turbo_mhz(client, orig_mhz)
-        except Exception:  # noqa: BLE001
-            logger.exception("failed to restore turbo to %r", orig_mhz)
+            restore_speed_defaults(client)
+        except Exception as exc:  # noqa: BLE001 -- raised below
+            logger.exception("failed to restore CPU Speed / Turbo Control to default")
+            failures.append(exc)
         try:
             if orig_mode:
                 set_debug_stream_mode(client, orig_mode)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 -- raised below
             logger.exception("failed to restore debug stream mode to %r", orig_mode)
+            failures.append(exc)
+        if failures:
+            raise failures[0]
 
 
 # ---------------------------------------------------------------------------

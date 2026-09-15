@@ -26,6 +26,7 @@ from ..progress import ProgressEvent, ProgressEventKind, watch_progress as _watc
 from .ultimate64_client import (
     Ultimate64Client,
     Ultimate64Error,
+    Ultimate64ProtocolError,
     Ultimate64RunnerStuckError,
     Ultimate64UnreachableError,
 )
@@ -68,6 +69,7 @@ _log = logging.getLogger(__name__)
 __all__ = [
     "get_turbo_mhz",
     "set_turbo_mhz",
+    "restore_speed_defaults",
     "get_turbo_enabled",
     "max_cpu_speed_mhz",
     "get_reu_config",
@@ -346,6 +348,67 @@ def set_turbo_mhz(client: Ultimate64Client, mhz: int | None) -> None:
             _ITEM_TURBO_CONTROL: "Manual",
         },
     )
+
+
+def restore_speed_defaults(client: Ultimate64Client) -> dict[str, str]:
+    """Write ``CPU Speed`` and ``Turbo Control`` back to their firmware defaults.
+
+    The restore for anything that changed CPU speed.  Neither
+    :func:`set_turbo_mhz` form leaves ``U64 Specific Settings`` at
+    ``current == default``, the bench's known state:
+
+    * ``set_turbo_mhz(client, None)`` -- and so
+      ``Ultimate64Transport.set_speed(1)`` -- writes only
+      ``Turbo Control = "Off"`` and leaves ``CPU Speed`` at whatever was
+      last set (#360);
+    * ``set_turbo_mhz(client, 1)`` runs at 1 MHz but writes
+      ``Turbo Control = "Manual"``, which is not its default (#365).
+
+    Both items' ``default`` is read first (:meth:`Ultimate64Client.get_config_item`,
+    bodyless GETs), so an item with no usable default raises before anything
+    is written.  The writes then go through :func:`restore_config_items`: one
+    ``PUT /v1/configs/<category>/<item>?value=`` per item, ``CPU Speed``
+    first (the order :func:`set_turbo_mhz` writes them in), and every item is
+    attempted even when one is rejected.  No request carries a body, so the
+    restore costs zero ``/Temp`` attachments on every firmware grade; the
+    body-carrying ``POST /v1/configs``
+    (:meth:`Ultimate64Client.set_config_items_batch`) is never used.
+
+    The value written is the device's own ``default`` string, so the
+    generation-specific ``CPU Speed`` presets (the U64E has ``" 5"`` and no
+    ``"64"``, the C64 Ultimate the reverse) never enter into it.  Both items
+    are written unconditionally, whether or not they had drifted: on a device
+    whose entry baseline already set ``current == default`` (the U64E) the
+    drift is created *after* entry, by the speed change this restores.
+
+    **Scope: not a replacement for** :func:`snapshot_state` /
+    :func:`restore_state`.  Modules that snapshot at entry and restore the
+    snapshot (``test_uci_turbo_live``, ``test_u64_turbo_bench_live``,
+    ``test_ultimate64_helpers_live``, ``test_turbo_contract_live``,
+    ``scripts/bench_x25519_u64_turbo.py``) put both speed items back to their
+    *entry* values, which equals the default on a clean entry; they were left
+    on that path deliberately (#365).  Use this helper where a module changed
+    speed and restores nothing, or restores through :func:`set_turbo_mhz`.
+
+    :param client: Connected Ultimate64 client (hold its ``DeviceLock``).
+    :returns: ``{item: value}`` exactly as written, in write order.
+    :raises Ultimate64ProtocolError: an item map has no non-empty string
+        ``default``; nothing has been written.
+    :raises Ultimate64RestoreError: one or both writes failed; the other was
+        still attempted.
+    """
+    defaults: dict[str, str] = {}
+    for item in (_ITEM_CPU_SPEED, _ITEM_TURBO_CONTROL):
+        entry = client.get_config_item(CAT_U64_SPECIFIC, item)
+        default = entry.get("default") if isinstance(entry, dict) else None
+        if not isinstance(default, str) or not default:
+            raise Ultimate64ProtocolError(
+                f"{CAT_U64_SPECIFIC} / {item}: no usable default in {entry!r}; "
+                "nothing was restored"
+            )
+        defaults[item] = default
+    restore_config_items(client, CAT_U64_SPECIFIC, defaults)
+    return defaults
 
 
 # --------------------------------------------------------------------------- #
@@ -997,7 +1060,7 @@ def check_measurement_environment(client: Ultimate64Client) -> None:
     if mhz is not None and mhz != 1:
         raise Ultimate64MeasurementEnvironmentError(
             f"CPU turbo is enabled at {mhz} MHz; CIA-timer measurements will read as "
-            f"target_cycles/{mhz}. Call set_turbo_mhz(client, 1) before benchmarking. "
+            f"target_cycles/{mhz}. Call restore_speed_defaults(client) before benchmarking. "
             f"See GitHub issue #102."
         )
     try:

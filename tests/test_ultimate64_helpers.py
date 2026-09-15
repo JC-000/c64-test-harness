@@ -815,7 +815,9 @@ class TestCheckMeasurementEnvironment:
             check_measurement_environment(client)
         msg = str(exc_info.value)
         assert "48" in msg
-        assert "set_turbo_mhz" in msg
+        assert "restore_speed_defaults(client)" in msg
+        # #365: set_turbo_mhz(client, 1) leaves Turbo Control = Manual.
+        assert "set_turbo_mhz(client, 1)" not in msg
 
     def test_turbo_6mhz_raises_with_value(self) -> None:
         """Non-standard turbo value (6 MHz) raises with '6' in the message."""
@@ -824,7 +826,9 @@ class TestCheckMeasurementEnvironment:
             check_measurement_environment(client)
         msg = str(exc_info.value)
         assert "6" in msg
-        assert "set_turbo_mhz" in msg
+        assert "restore_speed_defaults(client)" in msg
+        # #365: set_turbo_mhz(client, 1) leaves Turbo Control = Manual.
+        assert "set_turbo_mhz(client, 1)" not in msg
 
     def test_raises_is_subclass_of_ultimate64_error(self) -> None:
         """Ultimate64MeasurementEnvironmentError is an Ultimate64Error subclass."""
