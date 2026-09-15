@@ -242,6 +242,7 @@ class TestRestoreSpeedDefaults:
         assert _currents(client) == _DEFAULTS
 
     @pytest.mark.parametrize("supplied", [
+        {},                                                         # empty: not "read them here" (#387 review, Q4)
         {"Turbo Control": "Off"},                                   # CPU Speed missing
         {"CPU Speed": " 1"},                                        # Turbo Control missing
         {"CPU Speed": "", "Turbo Control": "Off"},                  # empty
