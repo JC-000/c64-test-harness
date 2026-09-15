@@ -2,19 +2,25 @@
 
 Until #267 four sites said the only non-leaking bulk-write path was
 "untimed".  It has since been measured on the U64E (fw 3.15, bce4535e,
-2026-09-15, wired LAN, write-verified, n=4 per arm at 1/4 KiB and n=2 at
-16 KiB): about 1.3 KiB/s at the 48-byte chunk a post-safe device uses and
-about 3.2 KiB/s at 128 bytes, i.e. roughly 35-55 ms per PUT round trip.
-A single 16 KiB POST took about 0.1 s on that device.
+2026-09-15, host on Wi-Fi (en0), link not instrumented, write-verified,
+n=2-4 per arm, interleaved): about 1.3 KiB/s at 48-byte chunks and about
+3.2 KiB/s at 128-byte chunks, median ~36-52 ms per PUT, observed 34-79 ms.
+The per-PUT time barely moves with chunk size, so it is dominated by the
+host link and per-request overhead, not the payload.  A single 16 KiB POST
+took ~0.1 s on that device.
 
 Pinned per site, on the list item that carries the claim (every site is a
 bullet or numbered item, so the extractor bounds one item, not a
 blank-line paragraph that would swallow the whole list):
 
-* the "untimed" / "no published timing" claims are gone;
-* the figures travel with their conditions (device, build, date);
+* the "untimed" / "no published timing" claims are gone -- and, file-wide,
+  no other skill file, README.md or docs/ page reintroduces them;
+* the load-bearing sentences are present verbatim (flattened), with the
+  numbers bound to their chunk sizes, so swapped arms or scaled numbers
+  fail -- not just the presence of tokens;
+* the conditions (device, build, date, link, sample size) travel with them;
 * the C64U is never stated as measured: the 128-byte arm is the chunk it
-  uses, not its number, and every site says so.
+  uses, not its number, every site says so, and no site inverts that.
 """
 from __future__ import annotations
 
@@ -38,8 +44,33 @@ SITES = [
 ]
 
 RETIRED = ("untimed", "no published timing")
-MEASURED = ("U64E", "bce4535e", "2026-09-15", "KiB/s")
+MEASURED = ("U64E", "bce4535e", "2026-09-15")
 NOT_C64U = "not measured on the C64U"
+
+#: Load-bearing sentences, as regexes over the flattened item.  A figure is
+#: anchored so it cannot sit inside a larger number (1.3 vs 11.3 / 13).
+_NUM = r"(?<![\d.])"
+LOAD_BEARING = {
+    "48-byte rate": _NUM + r"1\.3 KiB/s at 48-byte chunks",
+    "128-byte rate": _NUM + r"3\.2 KiB/s at 128-byte chunks",
+    "POST figure": r"a single 16 KiB POST took ~0\.1 s",
+    "per-PUT latency": _NUM + r"median ~36-52 ms per PUT, observed 34-79 ms",
+    "link": r"host on Wi-Fi \(en0\), link not instrumented",
+    "sample size": r"n=2-4 per arm, interleaved",
+}
+
+#: Item-wide claims that would put the U64E figure on the C64U, or the link
+#: back on a wire nobody measured.
+REFUSED_IN_ITEM = (
+    "c64u's rate",
+    "c64u's throughput",
+    "applies to the c64u",
+    "wired",
+)
+
+#: Words that invert the disclaimer when they sit near it.
+INVERTERS = ("no longer", "retired", "outdated", "superseded", "was wrong", "not true")
+_NEAR = 160
 
 _ITEM_START = re.compile(r"^(\s*)(?:[-*] |\d+\. )")
 
@@ -74,6 +105,16 @@ def _item(path: Path, anchor: str) -> str:
     return _flat("\n".join(lines[start:end]))
 
 
+def _inverted_disclaimers(text: str) -> list[str]:
+    """Inverting words within ``_NEAR`` chars of any C64U disclaimer."""
+    low = text.lower()
+    hits = []
+    for m in re.finditer(re.escape(NOT_C64U.lower()), low):
+        window = low[max(0, m.start() - _NEAR): m.end() + _NEAR]
+        hits += [w for w in INVERTERS if w in window]
+    return hits
+
+
 @pytest.mark.parametrize("label,path,anchor", SITES, ids=[s[0] for s in SITES])
 class TestEachSite:
     def test_retired_claims_are_gone(self, label, path, anchor):
@@ -86,9 +127,66 @@ class TestEachSite:
         for token in MEASURED:
             assert token in item, f"{label}: missing {token!r}"
 
+    @pytest.mark.parametrize("name", sorted(LOAD_BEARING))
+    def test_load_bearing_sentence(self, label, path, anchor, name):
+        item = _item(path, anchor)
+        assert re.search(LOAD_BEARING[name], item), (
+            f"{label}: {name} sentence missing or altered "
+            f"(want /{LOAD_BEARING[name]}/)")
+
     def test_c64u_is_not_claimed_measured(self, label, path, anchor):
         item = _item(path, anchor)
         assert NOT_C64U in item, f"{label}: missing {NOT_C64U!r}"
+        low = item.lower()
+        for phrase in REFUSED_IN_ITEM:
+            assert phrase not in low, f"{label}: says {phrase!r}"
+        assert not _inverted_disclaimers(item), (
+            f"{label}: C64U disclaimer inverted by {_inverted_disclaimers(item)}")
+
+
+def _scan_files() -> list[Path]:
+    files = sorted(SKILL.glob("*.md")) + [_REPO / "README.md"]
+    files += sorted((_REPO / "docs").rglob("*.md"))
+    return files
+
+
+def _retired_hits(text: str) -> list[str]:
+    """'untimed' within ``_NEAR`` chars of write_bytes, or 'no published timing'."""
+    flat = _flat(text).lower()
+    hits = []
+    if "no published timing" in flat:
+        hits.append("no published timing")
+    for m in re.finditer("untimed", flat):
+        if "write_bytes" in flat[max(0, m.start() - _NEAR): m.end() + _NEAR]:
+            hits.append(flat[max(0, m.start() - 60): m.end() + 60])
+    return hits
+
+
+def test_scan_covers_the_skill_files_readme_and_docs():
+    """Vacuity guard: the file-wide scan actually reads the doc set."""
+    names = {p.name for p in _scan_files()}
+    assert {"SKILL.md", "PATTERNS.md", "REFERENCE.md", "README.md"} <= names
+    assert any(p.parent.name == "docs" for p in _scan_files())
+
+
+def test_retired_scanner_detects_both_shapes():
+    """Vacuity guard: the scanner fires on the retired wording."""
+    assert _retired_hits("the `write_bytes` route is\n  untimed (issue #267)")
+    assert _retired_hits("there is no published\ntiming anywhere")
+    assert not _retired_hits("the stream is untimed " + "x" * 400 + " write_bytes")
+
+
+@pytest.mark.parametrize("path", _scan_files(), ids=lambda p: str(p.relative_to(_REPO)))
+def test_no_doc_reintroduces_untimed_write_bytes(path):
+    hits = _retired_hits(path.read_text(encoding="utf-8"))
+    assert not hits, f"{path.relative_to(_REPO)}: retired timing claim {hits}"
+
+
+def test_inversion_detector_fires():
+    """Vacuity guard: an inverted disclaimer is caught."""
+    assert _inverted_disclaimers(
+        "the rate is not measured on the C64U -- that caveat is no longer true")
+    assert not _inverted_disclaimers("the rate is not measured on the C64U.")
 
 
 @pytest.mark.parametrize("label,path,anchor,sibling", [
