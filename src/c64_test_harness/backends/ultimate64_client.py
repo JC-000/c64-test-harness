@@ -28,7 +28,11 @@ import urllib.request
 import uuid
 from typing import TYPE_CHECKING, Any
 
-from .u64_capabilities import THRESHOLD_POST_RISKY, DeviceCapabilities
+from .u64_capabilities import (
+    THRESHOLD_POST_RISKY,
+    THRESHOLD_POST_SAFE,
+    DeviceCapabilities,
+)
 
 if TYPE_CHECKING:
     from .ultimate64_probe import LivenessResult
@@ -289,6 +293,33 @@ _STRICT_HEX_ROUTE_HINTS: dict[str, str] = {
 }
 
 
+class _ShippedThreshold(int):
+    """The untouched value of ``Ultimate64Client.WRITE_MEM_QUERY_THRESHOLD``.
+
+    An ``int`` in every respect callers can observe; the subclass exists
+    only so ``__init__`` can tell the shipped value from a poke (#249).
+    A caller that re-assigns the same number stores a plain ``int``, which
+    is still a poke and is still honoured.
+    """
+
+    __slots__ = ()
+
+
+def _validate_poked_threshold(value: Any) -> int:
+    """A poked ``WRITE_MEM_QUERY_THRESHOLD`` must be a non-negative int."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(
+            "WRITE_MEM_QUERY_THRESHOLD must be an int, got "
+            f"{type(value).__name__} {value!r}; prefer the "
+            "write_mem_query_threshold= constructor kwarg"
+        )
+    if value < 0:
+        raise ValueError(
+            f"WRITE_MEM_QUERY_THRESHOLD must be >= 0, got {value}"
+        )
+    return int(value)
+
+
 def _wire_hex16(value: int) -> str:
     """Format a 16-bit address for a REST query argument.
 
@@ -449,15 +480,37 @@ class Ultimate64Client:
         #: Has any request to this host ever completed? That is the
         #: evidence a timed-out construct-time probe cannot supply.
         self._saw_successful_request = False
+        poked = type(self).WRITE_MEM_QUERY_THRESHOLD
+        class_poked = not isinstance(poked, _ShippedThreshold)
         if write_mem_query_threshold is not None:
             # An explicit threshold pins the behaviour, so the probe is not
             # needed at construction; ``capabilities`` stays lazy and this
             # path issues no HTTP traffic at all.
             self.write_mem_query_threshold = int(write_mem_query_threshold)
+            if class_poked:
+                _log.warning(
+                    "Ultimate64Client(%s): %s.WRITE_MEM_QUERY_THRESHOLD = %r "
+                    "ignored because the write_mem_query_threshold=%d kwarg "
+                    "takes precedence.",
+                    self.host, type(self).__name__, poked,
+                    self.write_mem_query_threshold,
+                )
         else:
             self.write_mem_query_threshold = (
                 self.capabilities.write_mem_query_threshold
             )
+            if class_poked:
+                # Honoured (#249), after the probe: a poke must not disarm
+                # /Temp hygiene the way the kwarg's skipped probe does.
+                threshold = _validate_poked_threshold(poked)
+                _log.warning(
+                    "Ultimate64Client(%s): honouring %s.WRITE_MEM_QUERY_THRESHOLD "
+                    "= %d over the capability grade's %d. Prefer the "
+                    "write_mem_query_threshold= constructor kwarg.",
+                    self.host, type(self).__name__, threshold,
+                    self.write_mem_query_threshold,
+                )
+                self.write_mem_query_threshold = threshold
 
         self.log_device_grading()
 
@@ -1689,13 +1742,35 @@ class Ultimate64Client:
             )
         return data
 
-    #: Class-level fallback for the raw-byte threshold above which
-    #: :meth:`write_mem` switches from the legacy ``PUT ?data=<hex>`` form
-    #: to the ``POST`` raw-byte form. Per-instance ``write_mem_query_threshold``
-    #: (set in ``__init__`` from :attr:`capabilities`) takes precedence; this
-    #: attribute is retained for backwards compatibility with callers that
-    #: poke the class.
-    WRITE_MEM_QUERY_THRESHOLD: int = 48
+    #: Override for the raw-byte threshold above which :meth:`write_mem`
+    #: switches from the ``PUT ?data=<hex>`` form to the ``POST`` form.
+    #: Its shipped value, 48, is the post-safe grade's threshold and is
+    #: **not** applied as a default: an untouched client takes its
+    #: threshold from :attr:`capabilities` (128 on leak-prone or unknown
+    #: firmware). Precedence, highest first: the ``write_mem_query_threshold=``
+    #: constructor kwarg (the supported path); then a poke of this name on
+    #: the class, a subclass, or -- after construction -- an instance; then
+    #: the capability grade. A poke is honoured with a WARNING naming the
+    #: kwarg, and unlike the kwarg it does not skip the capability probe, so
+    #: ``/Temp`` hygiene still arms. Before issue #249 this attribute was
+    #: never read and every poke was a silent no-op.
+    WRITE_MEM_QUERY_THRESHOLD: int = _ShippedThreshold(THRESHOLD_POST_SAFE)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # An instance poke of the uppercase name is honoured (#249): it
+        # moves the live threshold, which is the only thing it could mean.
+        if name == "WRITE_MEM_QUERY_THRESHOLD":
+            threshold = _validate_poked_threshold(value)
+            _log.warning(
+                "Ultimate64Client(%s): honouring an instance assignment "
+                "WRITE_MEM_QUERY_THRESHOLD = %d (write_mem_query_threshold "
+                "was %s). Prefer the write_mem_query_threshold= constructor "
+                "kwarg.",
+                getattr(self, "host", "?"), threshold,
+                getattr(self, "write_mem_query_threshold", "unset"),
+            )
+            object.__setattr__(self, "write_mem_query_threshold", threshold)
+        object.__setattr__(self, name, value)
 
     def write_mem(self, address: int, data: bytes) -> None:
         """Write bytes to C64 memory via DMA (DESTRUCTIVE).
