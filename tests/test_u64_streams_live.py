@@ -67,6 +67,28 @@ _requires_mutate = pytest.mark.skipif(
 BA_HIGH_MIN = 0.90
 BA_HIGH_MAX = 0.96
 
+#: Largest tolerated fraction of the debug stream lost to sequence gaps,
+#: ``dropped / (received + dropped)``, in one ~1.3 s capture (#356).
+#:
+#: This used to be a fixed ``packets_dropped < 50`` out of ~2,900, and it
+#: failed on master most runs.  Measured on the U64E (fw 3.15 bce4535e),
+#: 2026-09-15, 28 captures in two paired runs (SO_RCVBUF 256 KiB vs 8 MiB,
+#: interleaved): loss fraction min 0.004, median 0.073, max 0.446; 24 of 28
+#: had >= 50 drops, in bursts of 1-313 packets.  Neither buffer size helped
+#: (median 55-492 drops either way), and in the 12 captures bracketed by
+#: ``netstat -s -p udp`` the kernel's "dropped due to full socket buffers"
+#: counter moved by **zero** every time.  So the loss is upstream of this
+#: host's socket -- the Mac reaches the U64E over Wi-Fi (en0), carrying a
+#: ~32 Mbps stream -- and a count limit measured the bench, not the code.
+#:
+#: What the bound still catches is the receiver miscounting.  A sequence
+#: number read in the wrong byte order turns each +1 step into a +256
+#: jump, i.e. a loss fraction near 0.99; the band between the worst
+#: observed network loss and that is what 0.75 sits in.  The edge is
+#: chosen, not derived.  A receiver that stops reading is caught by the
+#: cycle-count assertion instead.
+DEBUG_STREAM_LOSS_MAX = 0.75
+
 
 def _local_ip() -> str:
     """Detect the local IP address that can reach the U64."""
@@ -129,8 +151,17 @@ def test_debug_stream_captures_cycles(client: Ultimate64Client) -> None:
         f"Expected >10000 cycles, got {result.total_cycles}"
     )
     assert len(result.trace) > 0, "Trace is empty"
-    assert result.packets_dropped < 50, (
-        f"Too many drops: {result.packets_dropped}"
+    assert result.packets_received > 0, "No debug packets received"
+    loss = result.packets_dropped / (
+        result.packets_received + result.packets_dropped
+    )
+    assert loss <= DEBUG_STREAM_LOSS_MAX, (
+        f"sequence gaps account for {100.0 * loss:.1f}% of the stream "
+        f"({result.packets_dropped} dropped, {result.packets_received} "
+        f"received), above {100.0 * DEBUG_STREAM_LOSS_MAX:.0f}%. Network "
+        "loss on this bench tops out near 45%; a figure far above that "
+        "points at the receiver's sequence accounting (byte order, header "
+        "offset) rather than the link -- see DEBUG_STREAM_LOSS_MAX (#356)"
     )
 
 
