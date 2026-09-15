@@ -19,10 +19,22 @@ named :data:`EXCLUDED` entry points, each with its reason.
 **What counts as gated**: a ``skipif`` condition, or the test of an ``if``
 that calls ``skip``, that reads ``U64_ALLOW_MUTATE`` (directly, or through
 a name bound from such a read) **and is true when the variable is unset**.
-The condition is evaluated, not just searched: every gate read becomes
-``None``, names bound from it take their unset values, any other name is
-assumed set, and only a small expression grammar (boolean operators,
-comparisons, constants, ``bool``/``str``/``int``) is evaluated.  So
+The condition is evaluated, not just searched:
+
+* a gate read evaluates to its default -- ``None`` without one, the literal
+  with a literal default (so ``not get(GATE, '0')`` never skips), and a
+  non-literal default fails closed;
+* ``U64_HOST`` reads as set and every other environment variable as unset
+  (or its literal default), so ``not <gate> and get('CI')`` is refused while
+  the multi-gate ``not _LIVE or not <gate>`` stays a gate;
+* names take the value of their latest binding in source order -- a literal
+  binds to itself, a gate read to its unset value -- and a name rebound to
+  anything the evaluator cannot decide, or never bound, fails closed;
+* only a small expression grammar (boolean operators, comparisons,
+  constants, ``bool``/``str``/``int``) is evaluated, and an evaluation that
+  raises is not a gate.
+
+So
 ``skipif(os.environ.get(GATE) == '1')`` -- which skips when the gate is
 *set* and writes when it is not -- is not a gate, nor is
 ``skipif(False and ...)``, nor a condition outside the grammar (fail closed).
@@ -214,44 +226,73 @@ def config_writer_vocabulary(
 # Gate detection                                                              #
 # --------------------------------------------------------------------------- #
 
+def _is_environ(node: ast.AST) -> bool:
+    return (isinstance(node, ast.Attribute) and node.attr == "environ") or (
+        isinstance(node, ast.Name) and node.id == "environ"
+    )
+
+
+def _env_read(node: ast.AST) -> tuple[str, ast.AST | None] | None:
+    """``(variable, default node or None)`` for an environment read, else ``None``.
+
+    Recognised, with the variable a string literal: ``os.environ.get(NAME
+    [, default])``, ``os.getenv(NAME[, default])`` (``default=`` too) and
+    ``os.environ[NAME]``.
+    """
+    if isinstance(node, ast.Call):
+        func = node.func
+        environ_get = isinstance(func, ast.Attribute) and func.attr == "get" and _is_environ(func.value)
+        if not (environ_get or _callee_name(node) == "getenv"):
+            return None
+        if not (node.args and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)):
+            return None
+        default = node.args[1] if len(node.args) > 1 else next(
+            (kw.value for kw in node.keywords if kw.arg == "default"), None
+        )
+        return node.args[0].value, default
+    if (
+        isinstance(node, ast.Subscript)
+        and _is_environ(node.value)
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, str)
+    ):
+        return node.slice.value, None
+    return None
+
+
 def _is_gate_env_read(node: ast.AST) -> bool:
     """``os.environ.get(GATE)``, ``os.getenv(GATE)`` or ``os.environ[GATE]``."""
-    if isinstance(node, ast.Call):
-        name = _callee_name(node)
-        return (
-            name in {"get", "getenv"}
-            and bool(node.args)
-            and isinstance(node.args[0], ast.Constant)
-            and node.args[0].value == GATE
-        )
-    if isinstance(node, ast.Subscript):
-        return (
-            isinstance(node.value, ast.Attribute)
-            and node.value.attr == "environ"
-            and isinstance(node.slice, ast.Constant)
-            and node.slice.value == GATE
-        )
-    return False
+    read = _env_read(node)
+    return read is not None and read[0] == GATE
 
 
-def _is_other_env_read(node: ast.AST) -> bool:
-    """An environment read of some variable other than the gate."""
-    if isinstance(node, ast.Call):
-        return (
-            _callee_name(node) in {"get", "getenv"}
-            and isinstance(node.func, ast.Attribute)
-            and bool(node.args)
-            and isinstance(node.args[0], ast.Constant)
-            and isinstance(node.args[0].value, str)
-            and not _is_gate_env_read(node)
-        )
-    if isinstance(node, ast.Subscript):
-        return (
-            isinstance(node.value, ast.Attribute)
-            and node.value.attr == "environ"
-            and not _is_gate_env_read(node)
-        )
-    return False
+#: The one other requirement assumed met while a condition is evaluated.
+#: Every other environment variable reads as unset, which is conservative for
+#: the legitimate multi-gate form (``not _LIVE or not _MUTATE``) and refuses
+#: ``not _MUTATE and os.environ.get('CI')``, which never skips outside CI.
+_ASSUMED_SET = frozenset({"U64_HOST"})
+
+
+class _FailClosed(Exception):
+    """A condition, or a binding it depends on, cannot be decided."""
+
+
+def _unset_read_value(read: tuple[str, ast.AST | None]) -> object:
+    """What an environment read evaluates to for this scan.
+
+    ``U64_HOST`` reads as set; any other variable -- the gate included --
+    reads as its default: ``None`` when there is none, the literal when the
+    default is one, and a non-literal default fails closed.
+    """
+    variable, default = read
+    if variable in _ASSUMED_SET:
+        return "set"
+    if default is None:
+        return None
+    if isinstance(default, ast.Constant):
+        return default.value
+    raise _FailClosed(f"non-literal default for {variable}")
 
 
 #: Callables a condition may use and still be evaluated.
@@ -264,20 +305,47 @@ _SAFE_NODES = (
     ast.Constant, ast.Name, ast.Load, ast.Call, ast.Tuple, ast.List,
 )
 
+#: What a binding may contain before it is worth evaluating (env reads add
+#: attribute and subscript nodes that the substitution removes).
+_BINDING_NODES = _SAFE_NODES + (ast.Attribute, ast.Subscript, ast.keyword)
+
+#: Shown when a module fails the gate rules, so an author knows what to write.
+ACCEPTED_GATE_SHAPES = (
+    f"pytest.mark.skipif(not os.environ.get({GATE!r}), reason=...)",
+    f"pytest.mark.skipif(os.environ.get({GATE!r}) != '1', reason=...)",
+    f"_MUTATE = os.environ.get({GATE!r})  # or os.getenv(...) / os.environ[...]; "
+    "then skipif(not _MUTATE, ...), a mark bound to that skipif, or "
+    "`if not _MUTATE: pytest.skip(...)` in a fixture or test",
+    "the variable name and any default must be string literals; conditions "
+    "may use and/or/not, comparisons, literals and bool()/str()/int(); every "
+    "other environment variable except U64_HOST is treated as unset",
+)
+
 
 class _GateContext:
     """What one module's source says about the gate, evaluated with it unset.
 
-    ``values`` maps each name bound from a gate read (directly or through
-    another such name) to its value when the gate is unset; ``marks`` holds
-    names bound to a ``skipif`` mark that skips with the gate unset.  One
-    pass in ``ast.walk`` order, which visits module-level statements in
-    source order.
+    One pass over assignments in ``ast.walk`` order, which visits
+    module-level statements in source order:
+
+    * ``values`` -- every name bound to an expression the evaluator can
+      decide, mapped to its value with the gate unset.  A literal binds to
+      itself.  A later binding replaces the value; a later binding to
+      anything undecidable removes the name, and referencing a name not in
+      ``values`` fails closed.
+    * ``derived`` -- the names in ``values`` whose current binding read the
+      gate (so ``_M = get(GATE)`` then ``_M = '1'`` is no longer the gate).
+    * ``marks`` -- names bound to a ``skipif`` mark that gates.
+    * ``rejected`` -- conditions met after construction that mention the gate
+      but were not accepted, with the reason, for failure messages.
     """
 
     def __init__(self, tree: ast.AST) -> None:
         self.values: dict[str, object] = {}
+        self.derived: set[str] = set()
         self.marks: set[str] = set()
+        self.rejected: dict[str, str] = {}
+        self._recording = False
         for node in ast.walk(tree):
             if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
                 continue
@@ -287,53 +355,74 @@ class _GateContext:
                 continue
             if self.mark_gates(node.value):
                 self.marks.update(names)
-            elif self.references_gate(node.value):
-                ok, value = self.evaluate(node.value)
+                continue
+            self.marks.difference_update(names)
+            reads_gate = self.references_gate(node.value)
+            ok, value = (
+                self.evaluate(node.value)
+                if all(isinstance(n, _BINDING_NODES) for n in ast.walk(node.value))
+                else (False, None)
+            )
+            for name in names:
                 if ok:
-                    self.values.update(dict.fromkeys(names, value))
+                    self.values[name] = value
+                    if reads_gate:
+                        self.derived.add(name)
+                    else:
+                        self.derived.discard(name)
+                else:
+                    self.values.pop(name, None)
+                    self.derived.discard(name)
+        self._recording = True
 
     def references_gate(self, expr: ast.AST) -> bool:
         return any(
             _is_gate_env_read(sub)
-            or (isinstance(sub, ast.Name) and sub.id in self.values)
+            or (isinstance(sub, ast.Name) and sub.id in self.derived)
+            for sub in ast.walk(expr)
+        )
+
+    def mentions_gate(self, expr: ast.AST) -> bool:
+        """Names the gate at all -- a literal, or a name bound to the literal."""
+        return self.references_gate(expr) or any(
+            (isinstance(sub, ast.Constant) and sub.value == GATE)
+            or (isinstance(sub, ast.Name) and self.values.get(sub.id) == GATE)
             for sub in ast.walk(expr)
         )
 
     def evaluate(self, expr: ast.AST) -> tuple[bool, object]:
-        """``(True, value)`` of *expr* with the gate unset; ``(False, None)`` if unevaluable.
+        """``(True, value)`` of *expr* with the gate unset; ``(False, None)`` if undecidable.
 
-        Gate reads become ``None``, gate-bound names their unset values,
-        other environment reads and every other name the string ``"set"``
-        (assume every other requirement is met).  Anything outside
-        :data:`_SAFE_NODES` / :data:`_SAFE_CALLS` is refused -- fail closed.
+        Environment reads become :func:`_unset_read_value`; names bound in
+        ``values`` their values; any other name fails closed.  Anything
+        outside :data:`_SAFE_NODES` / :data:`_SAFE_CALLS` is refused, and an
+        evaluation that raises proves nothing -- fail closed throughout.
         """
         values = self.values
 
         class _Unset(ast.NodeTransformer):
-            def visit_Call(self, node: ast.Call) -> ast.AST:
-                if _is_gate_env_read(node):
-                    return ast.copy_location(ast.Constant(None), node)
-                if _is_other_env_read(node):
-                    return ast.copy_location(ast.Constant("set"), node)
+            def _read(self, node: ast.AST) -> ast.AST:
+                read = _env_read(node)
+                if read is not None:
+                    return ast.copy_location(ast.Constant(_unset_read_value(read)), node)
                 return self.generic_visit(node)
 
-            def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
-                if _is_gate_env_read(node):
-                    return ast.copy_location(ast.Constant(None), node)
-                if _is_other_env_read(node):
-                    return ast.copy_location(ast.Constant("set"), node)
-                return self.generic_visit(node)
+            visit_Call = _read
+            visit_Subscript = _read
 
             def visit_Name(self, node: ast.Name) -> ast.AST:
                 if node.id in values:
                     return ast.copy_location(ast.Constant(values[node.id]), node)
                 if node.id in _SAFE_CALLS:
                     return node
-                return ast.copy_location(ast.Constant("set"), node)
+                raise _FailClosed(f"unbound name {node.id!r}")
 
-        tree = ast.fix_missing_locations(
-            _Unset().visit(ast.Expression(body=copy.deepcopy(expr)))
-        )
+        try:
+            tree = ast.fix_missing_locations(
+                _Unset().visit(ast.Expression(body=copy.deepcopy(expr)))
+            )
+        except _FailClosed:
+            return False, None
         for node in ast.walk(tree):
             if not isinstance(node, _SAFE_NODES):
                 return False, None
@@ -349,12 +438,27 @@ class _GateContext:
         except Exception:  # noqa: BLE001 -- unevaluable means not a gate
             return False, None
 
+    def _reject(self, condition: ast.AST, why: str) -> None:
+        if self._recording:
+            self.rejected.setdefault(ast.unparse(condition), why)
+
     def condition_gates(self, condition: ast.AST) -> bool:
         """Reads the gate and is true -- skips -- when the gate is unset."""
         if not self.references_gate(condition):
+            if self.mentions_gate(condition):
+                self._reject(
+                    condition,
+                    "names the gate but does not read it with a literal key",
+                )
             return False
         ok, value = self.evaluate(condition)
-        return ok and bool(value)
+        if not ok:
+            self._reject(condition, "cannot be evaluated")
+            return False
+        if not value:
+            self._reject(condition, "does not skip when the gate is unset")
+            return False
+        return True
 
     def mark_gates(self, node: ast.AST) -> bool:
         """A ``skipif`` mark, a list of marks, or a name bound to one, that gates."""
@@ -373,12 +477,12 @@ class _GateContext:
         """``if <condition>: ... skip(...)`` whose condition gates."""
         return (
             isinstance(node, ast.If)
-            and self.condition_gates(node.test)
             and any(
                 isinstance(sub, ast.Call) and _callee_name(sub) == "skip"
                 for stmt in node.body
                 for sub in ast.walk(stmt)
             )
+            and self.condition_gates(node.test)
         )
 
 
@@ -388,6 +492,22 @@ def module_is_gated(tree: ast.AST) -> bool:
         (isinstance(node, ast.Call) and ctx.mark_gates(node)) or ctx.if_skip_gates(node)
         for node in ast.walk(tree)
     )
+
+
+def gate_hint(tree: ast.AST) -> str:
+    """Failure-message text: rejected gate conditions, then the accepted shapes."""
+    ctx = _GateContext(tree)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            ctx.mark_gates(node)
+        else:
+            ctx.if_skip_gates(node)
+    text = ""
+    if ctx.rejected:
+        text += f"\nConditions that mention {GATE} but were not accepted as a gate:\n"
+        text += "\n".join(f"  {cond}   -- {why}" for cond, why in ctx.rejected.items())
+    text += "\nAccepted gate shapes:\n" + "\n".join(f"  {s}" for s in ACCEPTED_GATE_SHAPES)
+    return text
 
 
 def config_writes(tree: ast.AST, vocabulary: set[str]) -> set[str]:
@@ -502,24 +622,26 @@ def _live_modules() -> list[Path]:
 
 @pytest.mark.parametrize("path", _live_modules(), ids=lambda p: p.name)
 def test_a_live_module_that_writes_config_is_gated(path: Path, vocabulary) -> None:
-    writes = gate_offence(path.read_text(), path.name, vocabulary)
+    source = path.read_text()
+    writes = gate_offence(source, path.name, vocabulary)
     assert not writes, (
         f"{path.name} writes device config ({', '.join(sorted(writes))}) but "
-        f"never skips on {GATE}; an operator who has not set it expects no "
-        f"suite to reconfigure the shared device (#268). Add "
-        f"pytest.mark.skipif(not os.environ.get({GATE!r}) == '1', ...) to the "
-        f"module or to the tests that write."
+        f"never skips when {GATE} is unset; an operator who has not set it "
+        f"expects no suite to reconfigure the shared device (#268). Gate the "
+        f"module or the tests that write." + gate_hint(ast.parse(source))
     )
 
 
 @pytest.mark.parametrize("path", _live_modules(), ids=lambda p: p.name)
 def test_every_test_that_writes_config_is_gated_itself(path: Path, vocabulary) -> None:
     """A module gate somewhere is not enough: each writing test carries one."""
-    offenders = ungated_tests_that_write(ast.parse(path.read_text()), vocabulary)
+    tree = ast.parse(path.read_text())
+    offenders = ungated_tests_that_write(tree, vocabulary)
     assert not offenders, (
         f"{path.name}: these tests write device config but are not themselves "
         f"gated on {GATE} (module pytestmark, class or test marker, an in-body "
         f"skip, or a gated fixture they request): " + "; ".join(offenders)
+        + gate_hint(tree)
     )
 
 
@@ -733,6 +855,147 @@ class TestTheScannerItselfCanFail:
             "def test_x(client):\n    enable_uci(client)\n"
         )
         assert self._offence(src) == set()
+
+    @pytest.mark.parametrize("condition", [
+        "not os.environ.get('U64_ALLOW_MUTATE', '1')",
+        "not os.getenv('U64_ALLOW_MUTATE', 'yes')",
+        "not os.environ.get('U64_ALLOW_MUTATE', '0')",
+        "not os.getenv('U64_ALLOW_MUTATE', default='1')",
+        "not os.environ.get('U64_ALLOW_MUTATE', FALLBACK)",
+    ])
+    def test_a_read_with_a_default_skips_only_if_the_default_does(self, condition) -> None:
+        """The default is what an unset gate reads as; an unknown default fails closed."""
+        src = (
+            "import os, pytest\n"
+            f"pytestmark = pytest.mark.skipif({condition}, reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == {"enable_uci"}
+
+    def test_a_default_that_still_skips_is_a_gate(self) -> None:
+        src = (
+            "import os, pytest\n"
+            "pytestmark = pytest.mark.skipif(\n"
+            "    os.environ.get('U64_ALLOW_MUTATE', '0') != '1', reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == set()
+
+    def test_a_name_bound_to_a_false_literal_is_not_assumed_set(self) -> None:
+        """P6: ``_OFF = False`` makes ``_OFF and not <gate>`` never skip."""
+        src = (
+            "import os, pytest\n"
+            "_OFF = False\n"
+            "pytestmark = pytest.mark.skipif(\n"
+            "    _OFF and not os.environ.get('U64_ALLOW_MUTATE'), reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == {"enable_uci"}
+
+    @pytest.mark.parametrize("rebinding", ["_M = '1'", "_M = compute()"])
+    def test_a_rebound_gate_name_is_no_longer_the_gate(self, rebinding) -> None:
+        """P7: a later rebinding replaces the gate read (literal) or fails closed."""
+        src = (
+            "import os, pytest\n"
+            "_M = os.environ.get('U64_ALLOW_MUTATE')\n"
+            f"{rebinding}\n"
+            "pytestmark = pytest.mark.skipif(not _M, reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == {"enable_uci"}
+
+    def test_a_name_rebound_to_a_literal_no_longer_reads_the_gate(self) -> None:
+        """``_M = ''`` after the gate read: ``not _M`` always skips, the gate decides nothing."""
+        src = (
+            "import os, pytest\n"
+            "_M = os.environ.get('U64_ALLOW_MUTATE')\n"
+            "_M = ''\n"
+            "pytestmark = pytest.mark.skipif(not _M, reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == {"enable_uci"}
+
+    def test_another_env_requirement_is_assumed_unset(self) -> None:
+        """P8: ``not <gate> and os.environ.get('CI')`` does not skip outside CI."""
+        src = (
+            "import os, pytest\n"
+            "pytestmark = pytest.mark.skipif(\n"
+            "    not os.environ.get('U64_ALLOW_MUTATE') and os.environ.get('CI'),\n"
+            "    reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == {"enable_uci"}
+
+    def test_a_multi_gate_or_condition_is_a_gate(self) -> None:
+        """The legitimate multi-gate form: skip if any requirement is missing."""
+        src = (
+            "import os, pytest\n"
+            "_LIVE = os.environ.get('RRNET_LIVE')\n"
+            "pytestmark = pytest.mark.skipif(\n"
+            "    not _LIVE or not os.environ.get('U64_ALLOW_MUTATE'), reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == set()
+
+    def test_an_error_inside_the_grammar_is_not_a_gate(self) -> None:
+        """Q5: ``int(None)`` raises; an evaluation that errors proves nothing."""
+        src = (
+            "import os, pytest\n"
+            "pytestmark = pytest.mark.skipif(\n"
+            "    not int(os.environ.get('U64_ALLOW_MUTATE')), reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == {"enable_uci"}
+
+    def test_an_unbound_name_fails_closed(self) -> None:
+        """An imported or undefined flag might be False: it is not assumed set."""
+        src = (
+            "import os, pytest\n"
+            "from somewhere import FLAG\n"
+            "pytestmark = pytest.mark.skipif(\n"
+            "    FLAG and not os.environ.get('U64_ALLOW_MUTATE'), reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == {"enable_uci"}
+
+    @pytest.mark.parametrize("condition, why", [
+        ("not helper(os.environ.get('U64_ALLOW_MUTATE'))", "cannot be evaluated"),
+        ("os.environ.get('U64_ALLOW_MUTATE', '').lower() != '1'", "cannot be evaluated"),
+        ("'U64_ALLOW_MUTATE' not in os.environ",
+         "names the gate but does not read it with a literal key"),
+        ("not os.environ.get(_VAR)",
+         "names the gate but does not read it with a literal key"),
+        ("os.environ.get('U64_ALLOW_MUTATE') == '1'", "does not skip when the gate is unset"),
+    ])
+    def test_a_rejected_condition_is_named_with_the_accepted_shapes(
+        self, condition: str, why: str
+    ) -> None:
+        src = (
+            "import os, pytest\n"
+            "_VAR = 'U64_ALLOW_MUTATE'\n"
+            f"pytestmark = pytest.mark.skipif({condition}, reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == {"enable_uci"}
+        hint = gate_hint(ast.parse(src))
+        assert "were not accepted as a gate" in hint
+        assert f"{ast.unparse(ast.parse(condition, mode='eval').body)}   -- {why}" in hint
+        assert "skipif(not os.environ.get('U64_ALLOW_MUTATE'), reason=...)" in hint
+
+    def test_a_gated_module_has_no_rejected_conditions(self) -> None:
+        src = (
+            "import os, pytest\n"
+            "_HOST = os.environ.get('U64_HOST')\n"
+            "_MUTATE = os.environ.get('U64_ALLOW_MUTATE')\n"
+            "pytestmark = [pytest.mark.skipif(not _HOST, reason='x'),\n"
+            "              pytest.mark.skipif(not _MUTATE, reason='y')]\n"
+            "def test_x(client):\n"
+            "    if _MUTATE:\n        print('guard, not a skip')\n"
+            "    enable_uci(client)\n"
+        )
+        hint = gate_hint(ast.parse(src))
+        assert "not accepted" not in hint
+        assert "Accepted gate shapes" in hint
 
     def test_read_only_module_needs_no_gate(self) -> None:
         src = "def test_x(client):\n    client.get_config_item('C', 'I')\n"
