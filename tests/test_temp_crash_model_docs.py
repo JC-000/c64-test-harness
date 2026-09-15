@@ -31,7 +31,8 @@ firmware crashes" are one failure, not rival models.  This pin's job:
   wrong model' -- each sets filling against crashing, which the ruling makes
   one thing.  **Only in a /Temp paragraph** (:data:`_TEMP_PARAGRAPH`: /Temp,
   attachment, writemem, unpatched, leak-prone, #686; or, for this rule only,
-  :data:`_WRONG_MODEL_SUBJECT`: ramdisk, C64U, wedg-), because "nowhere near
+  "ramdisk", or "C64U"/"RAM disk" in a paragraph that also has a crash word --
+  review round 4), because "nowhere near
   full speed" and "not a full folder dump" are ordinary prose elsewhere
   (review round 1); "full speed" and "full disk image" are excluded even there.
   "does not fill" and "never fills" count only beside a crash word in the same
@@ -87,9 +88,11 @@ The wrong-model rule has its own limits, asserted both ways in the same class:
 without a /Temp word anywhere in its paragraph, "It is a crash rather than a
 full filesystem." is **not** caught; inside one, "The listing is not a full
 folder dump." **is** flagged although it does not set filling against
-crashing.  "RAM disk" is not a subject word, although reviewer-4 suggested it,
-because "The partial read is not a full RAM disk snapshot." is ordinary prose
-and a must-pass control.
+crashing.  "Capacity was never what failed on the C64U." is **not** caught:
+"C64U" is a subject only beside a crash word (review round 4).  A true
+zero-cost statement that also names a crash **is** flagged ("PUT
+machine:writemem?data= never fills /Temp, so it cannot wedge the C64U."), because
+"does not fill"/"never fills" need only a crash word in the same sentence.
 """
 from __future__ import annotations
 
@@ -192,10 +195,14 @@ _WRONG_MODEL_BESIDE_CRASH = re.compile(
     r"|\bnever (?:\w+ )?fills?\b",
     re.IGNORECASE,
 )
-#: The wrong-model rule's own extra subject words (review round 3).  Kept out of
-#: _TEMP_PARAGRAPH, which the count rule shares.  "RAM disk" is left out:
-#: "The partial read is not a full RAM disk snapshot." is ordinary prose.
-_WRONG_MODEL_SUBJECT = re.compile(r"ramdisk|C64U|wedg", re.IGNORECASE)
+#: The wrong-model rule's own extra subject words (review rounds 3-4, reviewer-4's
+#: candidate B).  Kept out of _TEMP_PARAGRAPH, which the count rule shares.
+#: "ramdisk" (the firmware source file) is a subject on its own; "C64U" and "RAM
+#: disk" only in a paragraph that also has a crash word, because "The C64U's REU
+#: is nowhere near full" and "not a full RAM disk snapshot" are ordinary prose.
+#: "wedg" is not one: it is itself a crash word, so it gated on itself.
+_WRONG_MODEL_SUBJECT = re.compile(r"ramdisk", re.IGNORECASE)
+_WRONG_MODEL_SUBJECT_BESIDE_CRASH = re.compile(r"C64U|RAM disk", re.IGNORECASE)
 _STALE = re.compile(r"\b3\s*Mi?B\b|\b31\s*%|\b945\s*KB\b|3 \* 1024 \* 1024", re.IGNORECASE)
 _STALE_MARKER = re.compile(r"\bstale\b|used to claim|#261|\bcorrected\b", re.IGNORECASE)
 
@@ -231,7 +238,8 @@ def _states_a_count(sentence: str, paragraph: str) -> bool:
 
 
 def _sets_filling_against_crashing(sentence: str, paragraph: str) -> bool:
-    if not (_TEMP_PARAGRAPH.search(paragraph) or _WRONG_MODEL_SUBJECT.search(paragraph)):
+    if not (_TEMP_PARAGRAPH.search(paragraph) or _WRONG_MODEL_SUBJECT.search(paragraph)
+            or (_WRONG_MODEL_SUBJECT_BESIDE_CRASH.search(paragraph) and _CRASH.search(paragraph))):
         return False
     return bool(_WRONG_MODEL.search(sentence)
                 or (_WRONG_MODEL_BESIDE_CRASH.search(sentence) and _CRASH.search(sentence)))
@@ -541,6 +549,8 @@ class TestTheRulesCanFail:
         "128 B costs zero attachments; that path does not fill /Temp.",
         # Was a declared false positive before round 3.
         "A bodyless PUT never fills /Temp.",
+        # Review round 4: the crash word must be in the same sentence, not merely the paragraph.
+        "The firmware crashes. A bodyless PUT never fills /Temp.",
     ])
     def test_does_not_fill_without_a_crash_word_passes(self, text: str) -> None:
         assert _WRONG_MODEL_BESIDE_CRASH.search(text), f"the crash requirement is not what passes {text!r}"
@@ -552,10 +562,25 @@ class TestTheRulesCanFail:
         "The C64U firmware crash came with the RAM disk nowhere near full.",
         "The ramdisk.cc disk was far from full when the firmware crashed.",
         "The wedge came long before the RAM disk was anywhere near full.",
+        # Review round 4 (candidate B): each beside-crash subject on its own.
+        "The firmware crashed with the RAM disk nowhere near full.",
+        "The C64U firmware crashed long before anything was anywhere near full.",
     ])
     def test_the_wrong_model_rule_has_its_own_subject_words(self, text: str) -> None:
         assert not _TEMP_PARAGRAPH.search(text), text
         assert "filling set against crashing" in {r for r, _ in count_and_figure_problems(text)}, text
+
+    @pytest.mark.parametrize("text", [
+        # Review round 4 (reviewer-4): flagged by round 3's ramdisk|C64U|wedg gate.
+        "The C64U's REU is nowhere near full after the test.",
+        "The UCI wedge left the socket table far from full.",
+        "On the C64U the listing is not a full folder dump.",
+        "A runner wedge is not a full disk problem; reset the runner.",
+        "The RAM disk was nowhere near full; the snapshot restore still failed.",
+    ])
+    def test_subject_words_without_their_crash_word_pass(self, text: str) -> None:
+        assert _WRONG_MODEL.search(text), f"the gate is not what passes {text!r}"
+        assert count_and_figure_problems(text) == [], text
 
     @pytest.mark.parametrize("text", [
         # reviewer-2's other two: excluded by the rule itself, not only by the gate.
@@ -596,8 +621,12 @@ class TestTheDeclaredLimitsStayKnown:
             f"now caught: {text!r}; update the module docstring's declared limits"
         )
 
-    def test_a_wrong_model_sentence_without_a_temp_subject_is_not_caught(self) -> None:
-        text = "It is a crash rather than a full filesystem."
+    @pytest.mark.parametrize("text", [
+        "It is a crash rather than a full filesystem.",
+        # Review round 4: the one recall loss of candidate B (C64U, no crash word).
+        "Capacity was never what failed on the C64U.",
+    ])
+    def test_a_wrong_model_sentence_without_a_temp_subject_is_not_caught(self, text: str) -> None:
         assert "filling set against crashing" in {
             r for r, _ in count_and_figure_problems(_IN_TEMP + text)}
         assert count_and_figure_problems(text) == [], (
@@ -606,6 +635,10 @@ class TestTheDeclaredLimitsStayKnown:
 
     @pytest.mark.parametrize("text", [
         "The listing is not a full folder dump.",
+        # Review round 4 (reviewer-4): true zero-cost statements that also name a crash.
+        "PUT machine:writemem?data= never fills /Temp, so it cannot wedge the C64U.",
+        "A post-safe device never fills /Temp, so this crash does not happen there.",
+        "The zero-cost PUT path does not fill /Temp and cannot crash the firmware.",
     ])
     def test_a_declared_wrong_model_false_positive_is_still_flagged(self, text: str) -> None:
         assert "filling set against crashing" in {
