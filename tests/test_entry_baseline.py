@@ -217,14 +217,18 @@ _DRIFT = {
 # --------------------------------------------------------------------------- #
 
 class TestCoveredSet:
-    def test_the_twelve_covered_categories(self) -> None:
+    def test_the_covered_categories(self) -> None:
+        """Twelve stores both generations can list, plus the two C64U-only
+        stores the owner classified as covered on 2026-09-15 (#310)."""
         assert set(BASELINE_CATEGORIES) == {
             "C64 and Cartridge Settings", "U64 Specific Settings",
             "SID Addressing", "Audio Mixer",
             "Drive A Settings", "Drive B Settings", "SoftIEC Drive Settings",
             "Tape Settings", "Printer Settings",
             "LED Strip Settings", "Modem Settings", "User Interface Settings",
+            "Speaker Mixer", "Keyboard Lighting",
         }
+        assert len(BASELINE_CATEGORIES) == len(set(BASELINE_CATEGORIES)) == 14
 
     def test_the_never_touch_set_is_pinned_with_its_reasons(self) -> None:
         """Structural: the never-touch set, literally, each with the reason
@@ -416,8 +420,8 @@ class TestRecordedCategorySets:
         assert _unclassified(listed | {"Bogus Store"}, *lists,
                              mod.BASELINE_UNCLASSIFIED_CATEGORIES) == {"Bogus Store"}
         without = {k: v for k, v in mod.BASELINE_UNCLASSIFIED_CATEGORIES.items()
-                   if k != "Speaker Mixer"}
-        assert _unclassified(listed, *lists, without) == {"Speaker Mixer"}
+                   if k != "Data Streams"}
+        assert _unclassified(listed, *lists, without) == {"Data Streams"}
 
     def test_the_three_lists_are_disjoint(self) -> None:
         mod = self._mod()
@@ -440,22 +444,33 @@ class TestRecordedCategorySets:
                  | set(mod.BASELINE_UNCLASSIFIED_CATEGORIES))
         assert named - seen == set(), sorted(named - seen)
 
-    @pytest.mark.parametrize("cat,citation", [
-        ("Speaker Mixer", "u64_config.cc:433-449"),
-        ("Keyboard Lighting", "bling_board.cc"),
+    @pytest.mark.parametrize("cat,citations", [
+        ("Speaker Mixer", ("u64_config.cc:433-449", "u64_config.cc:1164-1199")),
+        ("Keyboard Lighting", ("bling_board.cc:757-787",)),
     ])
-    def test_c64u_only_stores_are_unclassified_with_evidence(
-        self, cat: str, citation: str
+    def test_c64u_only_stores_are_covered_with_evidence(
+        self, cat: str, citations: tuple[str, ...]
     ) -> None:
+        """Owner decision 2026-09-15 (#310): both C64U-only stores are covered.
+
+        The source reading that supported it moves with them, into the
+        comment above ``BASELINE_CATEGORIES`` -- a classification without
+        its basis is how the never-touch reasons came to be re-litigated.
+        """
+        import inspect
+
         mod = self._mod()
         assert cat in _C64U_CATEGORIES_2026_09_15
         assert cat not in _U64E_CATEGORIES_2026_09_12
-        assert cat not in mod.BASELINE_CATEGORIES
+        assert cat in mod.BASELINE_CATEGORIES
+        assert cat not in mod.BASELINE_UNCLASSIFIED_CATEGORIES
         assert cat not in mod.BASELINE_NEVER_TOUCH
-        reason = mod.BASELINE_UNCLASSIFIED_CATEGORIES[cat]
-        for token in ("C64U-ONLY", "1.1.0", citation, "2026-09-15", "#310",
-                      "not a measurement"):
-            assert token in reason, f"{cat}: evidence must carry {token!r}"
+        src = inspect.getsource(mod)
+        start = src.index("#: The stores the entry reset covers")
+        block = src[start:src.index("BASELINE_CATEGORIES: tuple", start)]
+        for token in (cat, "#310", "2026-09-15", "tag 1.1.0", *citations,
+                      "U64_BASELINE_ON_ENTRY", "not a measurement"):
+            assert token in block, f"{cat}: covered-set comment must carry {token!r}"
 
     def test_never_touch_presence_agrees_with_the_recorded_sets(self) -> None:
         mod = self._mod()
@@ -499,6 +514,182 @@ class TestRecordedCategorySets:
 
 
 # --------------------------------------------------------------------------- #
+# Per-generation item counts (#342)                                           #
+# --------------------------------------------------------------------------- #
+
+#: Item counts per category, literally -- duplicated from the module on
+#: purpose, like the category sets above.
+#: U64E fw 3.15: device-read 2026-09-15 (#342), identical per category to
+#: firmware source at 7f6fcb51 (v3.15-85).
+_U64E_COUNTS = {
+    "Audio Mixer": 21, "SID Sockets Configuration": 8,
+    "UltiSID Configuration": 8, "SID Addressing": 8,
+    "U64 Specific Settings": 27, "C64 and Cartridge Settings": 19,
+    "Clock Settings": 7, "SoftIEC Drive Settings": 2, "Printer Settings": 11,
+    "Network Settings": 14, "Ethernet Settings": 5, "WiFi settings": 6,
+    "Tape Settings": 1, "LED Strip Settings": 8, "Drive A Settings": 14,
+    "Drive B Settings": 14, "Data Streams": 4, "Modem Settings": 16,
+    "User Interface Settings": 10,
+}
+#: C64U fw 1.1.0: SOURCE-DERIVED ONLY at tag 1.1.0 (7b628eb1, u64ii flags),
+#: never read on the device.
+_C64U_COUNTS = {
+    "Audio Mixer": 20, "Speaker Mixer": 11, "SID Sockets Configuration": 8,
+    "UltiSID Configuration": 8, "SID Addressing": 8,
+    "U64 Specific Settings": 22, "C64 and Cartridge Settings": 19,
+    "SoftIEC Drive Settings": 3, "Printer Settings": 11,
+    "Network Settings": 14, "Ethernet Settings": 5, "WiFi settings": 5,
+    "Tape Settings": 1, "LED Strip Settings": 7, "Keyboard Lighting": 7,
+    "Drive A Settings": 13, "Drive B Settings": 13, "Data Streams": 4,
+    "Modem Settings": 16, "User Interface Settings": 6,
+}
+_BASES = frozenset({"device-read", "source-derived"})
+
+
+def _count_errors(record: Any, covered: Any, never_touch: Any) -> list[str]:
+    """Everything wrong with one record's counts, computed from the lists.
+
+    The totals are recomputed here from the per-category counts and the
+    classification lists, never read from a helper in the module, so a
+    module that computed them wrongly cannot also vouch for itself.
+    """
+    errs: list[str] = []
+    counts = record.item_counts
+    if set(counts) != set(record.categories):
+        errs.append(
+            f"{record.generation}: counted {sorted(set(counts) ^ set(record.categories))}"
+            f" differ from the recorded category list"
+        )
+    n = {c: e.items for c, e in counts.items()}
+    expected = {
+        "covered": sum(v for c, v in n.items() if c in covered),
+        "never_touch": sum(v for c, v in n.items() if c in never_touch),
+        "neither": sum(v for c, v in n.items()
+                       if c not in covered and c not in never_touch),
+        "all": sum(n.values()),
+    }
+    if dict(record.totals) != expected:
+        errs.append(f"{record.generation}: totals {dict(record.totals)} != "
+                    f"recomputed {expected}")
+    for c, e in counts.items():
+        if not isinstance(e.items, int) or isinstance(e.items, bool) or e.items <= 0:
+            errs.append(f"{record.generation}/{c}: count {e.items!r}")
+        if not e.basis or not set(e.basis) <= _BASES:
+            errs.append(f"{record.generation}/{c}: basis {e.basis!r}")
+        if not (e.firmware and e.date):
+            errs.append(f"{record.generation}/{c}: firmware/date missing")
+    return errs
+
+
+class TestRecordedItemCounts:
+    """One table owns the item counts, per generation (#342).
+
+    The figure changed position four times in three days because it lived
+    only in prose (#286, #288, #292).  Docs now cite
+    ``BASELINE_RECORDED_CATEGORY_SETS`` by name; this class is where the
+    numbers are pinned and where their arithmetic is checked.
+    """
+
+    @staticmethod
+    def _mod():
+        from c64_test_harness.backends import ultimate64_baseline as mod
+        return mod
+
+    def test_the_counts_are_the_recorded_reads(self) -> None:
+        rec = self._mod().BASELINE_RECORDED_CATEGORY_SETS
+        assert {c: e.items for c, e in rec["ultimate"].item_counts.items()} == _U64E_COUNTS
+        assert {c: e.items for c, e in rec["cbm"].item_counts.items()} == _C64U_COUNTS
+
+    @pytest.mark.parametrize("gen,totals", [
+        ("ultimate", {"covered": 151, "never_touch": 40, "neither": 12, "all": 203}),
+        ("cbm", {"covered": 157, "never_touch": 32, "neither": 12, "all": 201}),
+    ])
+    def test_totals_agree_with_the_lists_and_the_per_category_sum(
+        self, gen: str, totals: dict[str, int]
+    ) -> None:
+        mod = self._mod()
+        record = mod.BASELINE_RECORDED_CATEGORY_SETS[gen]
+        assert not _count_errors(record, mod.BASELINE_CATEGORIES,
+                                 mod.BASELINE_NEVER_TOUCH)
+        assert dict(record.totals) == totals
+        # Vacuity guard: every bucket is exercised on both generations.
+        assert all(v > 0 for v in record.totals.values())
+
+    def test_the_neither_bucket_is_the_unclassified_list(self) -> None:
+        mod = self._mod()
+        for record in mod.BASELINE_RECORDED_CATEGORY_SETS.values():
+            neither = {c for c in record.categories
+                       if c not in mod.BASELINE_CATEGORIES
+                       and c not in mod.BASELINE_NEVER_TOUCH}
+            assert neither == set(mod.BASELINE_UNCLASSIFIED_CATEGORIES) & set(
+                record.categories), record.generation
+
+    @pytest.mark.parametrize("label", [
+        "one count +1", "a covered total off by one", "a category uncounted",
+        "classification moved without the total", "unknown basis",
+        "a zero count",
+    ])
+    def test_the_count_check_can_fail(self, label: str) -> None:
+        """Positive controls: each mangle must change something, and be caught."""
+        import dataclasses
+
+        mod = self._mod()
+        record = mod.BASELINE_RECORDED_CATEGORY_SETS["cbm"]
+        covered, never = mod.BASELINE_CATEGORIES, mod.BASELINE_NEVER_TOUCH
+        counts = dict(record.item_counts)
+        totals = dict(record.totals)
+        if label == "one count +1":
+            e = counts["Keyboard Lighting"]
+            counts["Keyboard Lighting"] = dataclasses.replace(e, items=e.items + 1)
+        elif label == "a covered total off by one":
+            totals["covered"] += 1
+        elif label == "a category uncounted":
+            del counts["Speaker Mixer"]
+        elif label == "classification moved without the total":
+            covered = tuple(c for c in covered if c != "Speaker Mixer")
+        elif label == "unknown basis":
+            e = counts["Audio Mixer"]
+            counts["Audio Mixer"] = dataclasses.replace(e, basis=("guessed",))
+        elif label == "a zero count":
+            e = counts["Tape Settings"]
+            counts["Tape Settings"] = dataclasses.replace(e, items=0)
+            totals = {k: v - (1 if k in ("covered", "all") else 0)
+                      for k, v in totals.items()}
+        mangled = dataclasses.replace(record, item_counts=counts, totals=totals)
+        assert (mangled != record or covered != mod.BASELINE_CATEGORIES), (
+            f"{label}: the mangle did nothing"
+        )
+        assert _count_errors(mangled, covered, never), label
+
+    def test_basis_firmware_and_date_per_category(self) -> None:
+        rec = self._mod().BASELINE_RECORDED_CATEGORY_SETS
+        for c, e in rec["ultimate"].item_counts.items():
+            assert e.basis == ("device-read", "source-derived"), c
+            assert "3.15" in e.firmware and "7f6fcb51" in e.firmware, c
+            assert e.date == "2026-09-15", c
+        for c, e in rec["cbm"].item_counts.items():
+            # Never read on the device: source-derived ONLY, and it must say so.
+            assert e.basis == ("source-derived",), c
+            assert "1.1.0" in e.firmware and "7b628eb1" in e.firmware, c
+            assert e.date == "2026-09-15", c
+
+    @pytest.mark.parametrize("gen,tokens", [
+        ("ultimate", ("device-read", "2026-09-15", "fpga 125", "core 1.4F",
+                      "7f6fcb51", "-DU64=1", "-DDEVELOPER=0",
+                      "-DCLOCK_FREQ=66666667", "cc -E -P")),
+        ("cbm", ("UNVERIFIED", "never been read", "tag 1.1.0", "7b628eb1",
+                 "target/u64ii/riscv/ultimate/Makefile:226", "-DU64=2",
+                 "-DCLOCK_FREQ=100000000", "-DCOMMODORE=1", "cc -E -P",
+                 "STRING", "STRFUNC", "STRPASS", "ENUM", "VALUE",
+                 "7f6fcb51", "194", "Keyboard Lighting", "hide()")),
+    ])
+    def test_each_count_record_names_its_derivation(self, gen: str, tokens) -> None:
+        source = self._mod().BASELINE_RECORDED_CATEGORY_SETS[gen].counts_source
+        for token in tokens:
+            assert token in source, f"{gen}: counts_source lacks {token!r}"
+
+
+# --------------------------------------------------------------------------- #
 # Entry after a simulated kill                                                #
 # --------------------------------------------------------------------------- #
 
@@ -529,9 +720,10 @@ class TestEntryAfterKill:
         client = FakeBaselineU64()
         report = apply_factory_baseline(client)
         resets = [cat for kind, cat in client.requests if kind == "reset"]
-        assert set(resets) == set(BASELINE_CATEGORIES)
-        assert set(report.reset) == set(BASELINE_CATEGORIES)
-        assert len(resets) == len(BASELINE_CATEGORIES), "one reset per category"
+        # _FACTORY is U64E-shaped: every covered store it lists is reset.
+        assert set(resets) == _U64E_COVERED
+        assert set(report.reset) == _U64E_COVERED
+        assert len(resets) == len(_U64E_COVERED), "one reset per category"
 
     def test_nothing_drifted_is_still_reset_and_reported_clean(self) -> None:
         client = FakeBaselineU64()
@@ -582,7 +774,7 @@ class TestOrdering:
         client.reset_config_category_to_default = _reset  # type: ignore[method-assign]
         client.get_config_item = _item  # type: ignore[method-assign]
         apply_factory_baseline(client)
-        for cat in BASELINE_CATEGORIES:
+        for cat in sorted(_U64E_COVERED):
             kinds = [k for k, c in events if c == cat]
             assert kinds and kinds[0] == "reset", f"{cat}: reads before the reset: {kinds}"
             assert "item" in kinds
@@ -607,9 +799,9 @@ class TestOrdering:
         with pytest.raises(U64BaselineError) as ei:
             apply_factory_baseline(client)
         resets = {cat for kind, cat in client.requests if kind == "reset"}
-        assert resets == set(BASELINE_CATEGORIES)
+        assert resets == _U64E_COVERED
         assert set(ei.value.mismatched) == {CAT_CART, CAT_U64_SPECIFIC}
-        assert ei.value.report.reset and set(ei.value.report.reset) == set(BASELINE_CATEGORIES)
+        assert ei.value.report.reset and set(ei.value.report.reset) == _U64E_COVERED
 
     def test_post_reset_mismatch_is_not_a_warning(
         self, caplog: pytest.LogCaptureFixture
@@ -709,7 +901,7 @@ class TestExclusions:
         assert not any("Ethernet" in p or "Network" in p or "WiFi" in p for p in paths)
         puts = [p for m, p in wire if m != "GET"]
         assert puts and all(p.endswith(":reset_to_default") for p in puts)
-        assert len(puts) == len(BASELINE_CATEGORIES)
+        assert len(puts) == len(_U64E_COVERED)
         assert not any("SID%20Sockets%20Configuration" in p or "Clock%20Settings" in p
                        for p in paths), (
             "the SID socket store and the RTC are never on the wire"
@@ -728,7 +920,59 @@ def _decode_category(segment: str) -> str:
 # Categories missing on the device / items without a default                  #
 # --------------------------------------------------------------------------- #
 
+#: The two covered stores only the C64U lists (#310), in C64U factory shape.
+_C64U_ONLY_COVERED = frozenset({"Speaker Mixer", "Keyboard Lighting"})
+#: What a U64E-shaped device (``_FACTORY``) actually resets.
+_U64E_COVERED = frozenset(BASELINE_CATEGORIES) - _C64U_ONLY_COVERED
+_C64U_ONLY_FACTORY: dict[str, dict[str, tuple[Any, Any]]] = {
+    "Speaker Mixer": {"Speaker Enable": ("Enabled", "Enabled"),
+                      "Vol UltiSid 1": ("0 dB", "0 dB")},
+    "Keyboard Lighting": {"LedStrip Mode": ("Default", "Default"),
+                          "Strip Intensity": (15, 15)},
+}
+
+
 class TestDeviceShape:
+    def test_c64u_only_covered_stores_are_skipped_on_a_u64e(self) -> None:
+        """#310 must not change a U64E run: neither store is listed there, so
+        neither is requested, read or reported as reset."""
+        client = FakeBaselineU64()            # U64E-shaped: lists neither
+        assert not _C64U_ONLY_COVERED & set(client.list_configs())
+        assert _C64U_ONLY_COVERED <= set(BASELINE_CATEGORIES)
+        report = apply_factory_baseline(client)
+        assert _C64U_ONLY_COVERED <= set(report.skipped)
+        assert not _C64U_ONLY_COVERED & set(report.reset)
+        assert not any(cat in _C64U_ONLY_COVERED for _k, cat in client.requests)
+        assert not any(cat in _C64U_ONLY_COVERED for cat, _i in client.gets)
+        assert report.ok
+
+    def test_c64u_only_covered_stores_are_reset_where_listed(self) -> None:
+        client = FakeBaselineU64(
+            {**_FACTORY, **_C64U_ONLY_FACTORY},
+            absent={"Clock Settings"},        # C64U-shaped
+            drift={"Speaker Mixer": {"Speaker Enable": "Disabled"},
+                   "Keyboard Lighting": {"LedStrip Mode": "Off"}},
+        )
+        report = apply_factory_baseline(client)
+        assert _C64U_ONLY_COVERED <= set(report.reset)
+        assert not _C64U_ONLY_COVERED & set(report.skipped)
+        assert report.drifted["Speaker Mixer"]["Speaker Enable"] == ("Disabled", "Enabled")
+        assert report.drifted["Keyboard Lighting"]["LedStrip Mode"] == ("Off", "Default")
+        assert client.state["Speaker Mixer"]["Speaker Enable"] == "Enabled"
+        assert client.state["Keyboard Lighting"]["LedStrip Mode"] == "Default"
+        assert report.ok
+
+    def test_a_c64u_only_reset_that_did_not_take_is_a_mismatch(self) -> None:
+        client = FakeBaselineU64(
+            {**_FACTORY, **_C64U_ONLY_FACTORY},
+            drift={"Speaker Mixer": {"Speaker Enable": "Disabled"}},
+            frozen={"Speaker Enable"},
+        )
+        with pytest.raises(U64BaselineError) as exc:
+            apply_factory_baseline(client)
+        assert exc.value.mismatched["Speaker Mixer"]["Speaker Enable"] == (
+            "Disabled", "Enabled")
+
     def test_missing_categories_are_skipped_with_a_log_line(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -737,11 +981,12 @@ class TestDeviceShape:
         client = FakeBaselineU64(absent=absent)
         with caplog.at_level(logging.INFO, logger=_BASELINE_LOGGER):
             report = apply_factory_baseline(client)
-        assert set(report.skipped) == absent
+        # _FACTORY is U64E-shaped: the C64U-only covered stores are absent too.
+        assert set(report.skipped) == absent | _C64U_ONLY_COVERED
         assert set(report.reset).isdisjoint(report.skipped), (
             "a skipped category cannot also be reported as reset"
         )
-        assert set(report.reset) == set(BASELINE_CATEGORIES) - absent
+        assert set(report.reset) == set(BASELINE_CATEGORIES) - absent - _C64U_ONLY_COVERED
         assert not any(cat in absent for _k, cat in client.requests)
         text = "\n".join(r.getMessage() for r in caplog.records)
         for cat in absent:
@@ -943,7 +1188,7 @@ class TestManagerPath:
         got = mgr.acquire()
         assert got is inst
         assert order[0] == "lock", "the reset must run INSIDE the lock"
-        assert order.count("reset") == len(BASELINE_CATEGORIES)
+        assert order.count("reset") == len(_U64E_COVERED)
         assert "unlock" not in order
         assert client.mismatches() == {}
 
@@ -1186,3 +1431,90 @@ class TestPackageSurface:
         from c64_test_harness.backends.ultimate64_client import Ultimate64Error
 
         assert issubclass(U64BaselineError, Ultimate64Error)
+
+
+# --------------------------------------------------------------------------- #
+# The read-only table comparison (tests/test_entry_baseline_table_live.py)     #
+# --------------------------------------------------------------------------- #
+
+_TABLE_LIVE = Path(__file__).resolve().parent / "test_entry_baseline_table_live.py"
+#: The only client methods the table comparison may call: bodyless GETs.
+_TABLE_LIVE_CLIENT_CALLS = frozenset({"get_info", "list_configs", "get_config_category"})
+
+
+def _table_live_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_table_live_under_test", _TABLE_LIVE)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _client_calls(source: str) -> set[str]:
+    """Every ``client.<method>(...)`` called in *source*."""
+    import ast
+
+    return {
+        node.func.attr
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "client"
+    }
+
+
+class TestTableLiveModule:
+    """Gating and read-only-ness of the #342 live comparison, without a device."""
+
+    def test_the_c64u_needs_its_own_gate(self) -> None:
+        mod = _table_live_module()
+        rec, why = mod.record_for("cbm", c64u_allowed=False)
+        assert rec is None and mod.C64U_ENV in why
+        rec, _why = mod.record_for("cbm", c64u_allowed=True)
+        assert rec is mod.BASELINE_RECORDED_CATEGORY_SETS["cbm"]
+
+    def test_the_u64e_needs_no_second_gate(self) -> None:
+        mod = _table_live_module()
+        rec, why = mod.record_for("ultimate", c64u_allowed=False)
+        assert rec is mod.BASELINE_RECORDED_CATEGORY_SETS["ultimate"] and why == ""
+
+    @pytest.mark.parametrize("generation", ["unknown", None, "future-line"])
+    @pytest.mark.parametrize("allowed", [False, True])
+    def test_an_ungraded_device_has_no_record(self, generation, allowed) -> None:
+        rec, why = _table_live_module().record_for(generation, c64u_allowed=allowed)
+        assert rec is None and "no recorded table" in why
+
+    @pytest.mark.parametrize("gen", ["ultimate", "cbm"])
+    def test_live_totals_bucket_like_the_record(self, gen: str) -> None:
+        mod = _table_live_module()
+        record = mod.BASELINE_RECORDED_CATEGORY_SETS[gen]
+        counts = {c: e.items for c, e in record.item_counts.items()}
+        assert mod.totals_for(counts) == dict(record.totals)
+        bumped = {**counts, "Tape Settings": counts["Tape Settings"] + 1}
+        assert mod.totals_for(bumped) != dict(record.totals)
+
+    def test_the_module_calls_only_bodyless_gets(self) -> None:
+        calls = _client_calls(_TABLE_LIVE.read_text(encoding="utf-8"))
+        # Vacuity guard: the scan must see the calls the module does make.
+        assert calls == _TABLE_LIVE_CLIENT_CALLS, sorted(calls)
+
+    @pytest.mark.parametrize("added", [
+        "client.set_config_item('Audio Mixer', 'Vol UltiSid 1', '0 dB')",
+        "client.liveness_probe()",
+        "client._request('POST', '/v1/machine:writemem')",
+    ])
+    def test_the_read_only_scan_can_fail(self, added: str) -> None:
+        source = _TABLE_LIVE.read_text(encoding="utf-8") + f"\n\ndef _x(client):\n    {added}\n"
+        assert _client_calls(source) - _TABLE_LIVE_CLIENT_CALLS, added
+
+    def test_the_module_is_gated_and_never_asks_to_mutate(self) -> None:
+        mod = _table_live_module()
+        reasons = [m.kwargs.get("reason", "") for m in mod.pytestmark]
+        assert any(mod.LIVE_ENV in r for r in reasons)
+        assert any("U64_HOST" in r for r in reasons)
+        # Read-only, so no mutate gate: nothing may read that switch.
+        assert not any("U64_ALLOW_MUTATE" in r for r in reasons)
+        assert "environ.get(\"U64_ALLOW_MUTATE\")" not in _TABLE_LIVE.read_text(encoding="utf-8")
