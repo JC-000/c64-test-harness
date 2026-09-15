@@ -1011,6 +1011,16 @@ class Ultimate64Client:
         its own — and is runtime-only: it lives in firmware RAM until
         ``save_config_to_flash``, and the power-on that reverts it also
         empties ``/Temp`` (a RAM disk).
+
+        **Two contracts, not one** (owner decision on #263): that enable is
+        the one sanctioned write into a ``BASELINE_NEVER_TOUCH`` store.
+        ``BASELINE_NEVER_TOUCH`` is ``apply_factory_baseline``'s contract --
+        the entry-baseline reset never resets or asserts those stores -- and
+        says nothing about this pass, which may write exactly one item,
+        ``Network Settings > FTP File Service``, once per client, only for a
+        client that leaked (both callers require pending attachments) and
+        only after its sweep failed.  A client that leaked nothing never
+        reaches it: :meth:`_sweep_inherited_temp` writes no config.
         """
         self._in_temp_hygiene = True
         try:
@@ -1098,8 +1108,9 @@ class Ultimate64Client:
 
         * **This client leaked** (``pending_temp_attachments > 0``): the
           ordinary hygiene pass, unchanged -- including its one FTP-enable
-          attempt and the block on failure. Whether a lane that leaked may
-          write that config is issue #263 and is not decided here.
+          attempt and the block on failure. A lane that leaked may make that
+          write (owner decision on #263); :meth:`_run_temp_hygiene` says why
+          it is not a ``BASELINE_NEVER_TOUCH`` violation.
         * **This client leaked nothing** (issue #264): the wedge is a
           property of the device and :meth:`gc_temp_folder` sweeps ``/Temp``
           device-wide, so a lane that inherited a crashed neighbour's
