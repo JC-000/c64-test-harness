@@ -321,6 +321,9 @@ class TestLockedClientFixtures:
         with pytest.raises(RuntimeError, match="teardown") as info:
             next(gen)
         assert "close" in str(info.value) and "release" in str(info.value)
+        # chained from the first recorded failure, the close (#392 review, M17)
+        assert isinstance(info.value.__cause__, RuntimeError)
+        assert str(info.value.__cause__) == "FAKE 'close' failed"
         assert _after(probe.journal, mark) == [*case.steps(module), "release"]
 
     def test_a_raising_constructor_still_releases(self, probe, case) -> None:
@@ -779,8 +782,10 @@ class TestViceFixtures:
             gen = _vice_gen(run, case, monkeypatch)
             next(gen)
             mark = len(run.journal)
-            with pytest.raises(RuntimeError, match=r"teardown: .*FAKE"):
+            with pytest.raises(RuntimeError, match=r"teardown: .*FAKE") as info:
                 next(gen)
+            # chained from the step that failed (#392 review, M17)
+            assert str(info.value.__cause__) == f"FAKE {failing!r} failed", failing
             assert tuple(_after(run.journal, mark)) == case.teardown, failing
 
     def test_a_resource_never_created_is_skipped_not_failed(
