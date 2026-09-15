@@ -226,6 +226,12 @@ _SENTINEL_DONE = 0x42     # magic value written on completion
 # Timeout for polling sentinel (seconds)
 _DEFAULT_TIMEOUT = 10.0
 _POLL_INTERVAL   = 0.05
+#: Host sleep after the reset :func:`_execute_uci_routine` issues on a
+#: timeout (issue #313).  The KERNAL reset clears ``$0200-$03FF``, so a
+#: ``SYS`` typed before ``READY.`` is lost.  3 s is the settle the live UCI
+#: suites use after ``reset()`` (``docs/uci_networking.md``); it is borrowed
+#: from there, not measured for this path.
+_TIMEOUT_RESET_SETTLE = 3.0
 
 # Default addresses for socket operations
 _SOCKET_ID_ADDR = 0xC100
@@ -1846,9 +1852,30 @@ def _execute_uci_routine(
 
     Routines dispatched this way MUST end with RTS, not JMP or BRK.
 
+    **On timeout the machine is reset.** The wait fragments
+    (:func:`_build_wait_idle`, :func:`_build_push_and_wait` and the turbo
+    ``JMP busy_loop`` forms) are unbounded, so a routine whose sentinel never
+    arrived may still be executing; the caller's next upload would land on
+    live code, in several chunked writes (issue #313). So before raising,
+    this calls ``transport.reset(scope="cpu")`` -- on a U64 the bodyless
+    ``PUT machine:reset`` (no ``/Temp`` cost), which pulses the 6510 reset
+    only and leaves the ``Command Interface`` config and FPGA enable alone
+    (firmware ``MENU_C64_RESET`` -> ``C64::reset``, read at tag ``1.1.0``
+    and at ``871ad034`` of the 3.15 preview tree, not measured) -- then
+    sleeps :data:`_TIMEOUT_RESET_SETTLE` so the KERNAL is back at
+    ``READY.`` before the next ``SYS`` is typed. It never uses
+    ``scope="machine"``: on a U64 that is ``machine:reboot``, which returns
+    with the Command-Interface slot disabled. Whatever program was running
+    on the C64 is gone after a timeout. It does **not** clear a UCI
+    STATE-bit wedge (issue #112): that needs a physical power-cycle.
+
     Raises:
-        UCIError: If the error flag is set after execution.
-        TimeoutError: If sentinel is not set within *timeout* seconds.
+        UCIError: If the error flag is set after execution (no reset: the
+            routine returned).
+        TimeoutError: If sentinel is not set within *timeout* seconds, after
+            the reset above. If the reset itself raises, the timeout is still
+            what is raised, chained ``from`` the reset's exception, and no
+            settle is taken.
     """
     from .transport import TimeoutError
 
@@ -1882,9 +1909,28 @@ def _execute_uci_routine(
             break
         time.sleep(_POLL_INTERVAL)
     else:
-        raise TimeoutError(
+        message = (
             f"UCI routine did not complete within {timeout}s "
             f"(sentinel at ${sentinel_addr:04X} never set)"
+        )
+        # The routine's wait fragments are unbounded busy-waits, so it may
+        # still be executing at code_addr. Stop it before the caller's next
+        # upload lands on top of it (issue #313).
+        try:
+            transport.reset(scope="cpu")
+        except Exception as exc:
+            _log.warning(
+                "UCI routine timed out and the reset that should stop it "
+                "failed: %r", exc,
+            )
+            raise TimeoutError(
+                f"{message}; the reset to stop it failed ({exc!r}), so the "
+                f"routine may still be running at ${code_addr:04X}"
+            ) from exc
+        time.sleep(_TIMEOUT_RESET_SETTLE)
+        raise TimeoutError(
+            f"{message}; the 6510 was reset (scope='cpu') so the routine "
+            f"is not left running"
         )
 
     # Check error flag
