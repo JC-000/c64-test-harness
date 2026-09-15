@@ -350,7 +350,11 @@ def set_turbo_mhz(client: Ultimate64Client, mhz: int | None) -> None:
     )
 
 
-def restore_speed_defaults(client: Ultimate64Client) -> dict[str, str]:
+def restore_speed_defaults(
+    client: Ultimate64Client,
+    *,
+    defaults: Mapping[str, str] | None = None,
+) -> dict[str, str]:
     """Write ``CPU Speed`` and ``Turbo Control`` back to their firmware defaults.
 
     The restore for anything that changed CPU speed.  Neither
@@ -390,25 +394,57 @@ def restore_speed_defaults(client: Ultimate64Client) -> dict[str, str]:
     on that path deliberately (#365).  Use this helper where a module changed
     speed and restores nothing, or restores through :func:`set_turbo_mhz`.
 
+    **Pre-read defaults.**  A caller that has already read and validated the
+    defaults passes them as *defaults*, and then nothing is read here: the
+    restore still goes out if a read would fail at exit, and exactly the
+    validated values are written.  ``speed_baseline`` in
+    ``tests/test_ultimate64_transport_live.py`` does this (#370): it reads at
+    entry, so a missing default refuses the tests before any write and drift
+    is warned about there.  The mapping must name exactly ``CPU Speed`` and
+    ``Turbo Control``, each with a non-empty string; anything else raises
+    :class:`ValueError` before a write.  Its order does not matter:
+    ``CPU Speed`` is still written first.
+
     :param client: Connected Ultimate64 client (hold its ``DeviceLock``).
+    :param defaults: keyword-only; ``{item: default}`` already read by the
+        caller, or ``None`` (the default) to read them here.
     :returns: ``{item: value}`` exactly as written, in write order.
-    :raises Ultimate64ProtocolError: an item map has no non-empty string
-        ``default``; nothing has been written.
+    :raises Ultimate64ProtocolError: an item map read here has no non-empty
+        string ``default``; nothing has been written.
+    :raises ValueError: *defaults* was given but does not name exactly the two
+        items with non-empty string values; nothing has been written.
     :raises Ultimate64RestoreError: one or both writes failed; the other was
         still attempted.
     """
-    defaults: dict[str, str] = {}
-    for item in (_ITEM_CPU_SPEED, _ITEM_TURBO_CONTROL):
-        entry = client.get_config_item(CAT_U64_SPECIFIC, item)
-        default = entry.get("default") if isinstance(entry, dict) else None
-        if not isinstance(default, str) or not default:
-            raise Ultimate64ProtocolError(
-                f"{CAT_U64_SPECIFIC} / {item}: no usable default in {entry!r}; "
+    items = (_ITEM_CPU_SPEED, _ITEM_TURBO_CONTROL)
+    chosen: dict[str, str] = {}
+    if defaults is not None:
+        extra = sorted(set(defaults) - set(items))
+        if extra:
+            raise ValueError(
+                f"defaults may only name {list(items)}; got {extra}; "
                 "nothing was restored"
             )
-        defaults[item] = default
-    restore_config_items(client, CAT_U64_SPECIFIC, defaults)
-    return defaults
+        for item in items:
+            value = defaults.get(item)
+            if not isinstance(value, str) or not value:
+                raise ValueError(
+                    f"defaults[{item!r}] must be a non-empty string, got {value!r}; "
+                    "nothing was restored"
+                )
+            chosen[item] = value
+    else:
+        for item in items:
+            entry = client.get_config_item(CAT_U64_SPECIFIC, item)
+            default = entry.get("default") if isinstance(entry, dict) else None
+            if not isinstance(default, str) or not default:
+                raise Ultimate64ProtocolError(
+                    f"{CAT_U64_SPECIFIC} / {item}: no usable default in {entry!r}; "
+                    "nothing was restored"
+                )
+            chosen[item] = default
+    restore_config_items(client, CAT_U64_SPECIFIC, chosen)
+    return chosen
 
 
 # --------------------------------------------------------------------------- #
