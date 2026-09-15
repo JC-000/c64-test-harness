@@ -877,7 +877,7 @@ So on a leak-prone device **`run_prg_via_sys(target, prg)` is the low-risk way t
    a WARNING saying so. (An earlier revision of this paragraph said the timed-out
    case stays disarmed for the client's lifetime; that came from a stale docstring
    and is wrong — issue #262.) Force arming with `temp_hygiene=True` or
-   `U64_AUTO_TEMP_GC=1`. The drain on `close()` / `DeviceLock` release sweeps whenever the client is armed, **even if that client leaked nothing** — a lane inheriting a dirty `/Temp` collects it on the way out (issue #264). **The budget is still per client instance**: two
+   `U64_AUTO_TEMP_GC=1`. The drain on `close()` / `DeviceLock` release also sweeps for a client that **leaked nothing**, so a lane inheriting a dirty `/Temp` collects it on the way out (issue #264). That inherited-only sweep runs only under the device lock (lock release, or `close()` while holding it). If it fails it writes no config and blocks nothing: it logs a WARNING that FTP File Service must be enabled by hand. Only a client that leaked gets the automatic FTP-enable attempt — a `Network Settings` write that persists until a firmware power-on (issue #263). **The budget is still per client instance**: two
    clients against the same device get six each, so count budget per process, not
    per device, when a run constructs more than one. Twelve is the peak before a
    sweep rather than a running total, because `gc_temp_folder` collects `/Temp`

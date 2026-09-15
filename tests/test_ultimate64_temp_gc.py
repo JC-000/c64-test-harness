@@ -266,6 +266,10 @@ def test_temp_gc_source_no_longer_states_the_3_mb_ramdisk():
     assert src.count("967,680") >= 2
     # Review round 1, finding 3: the reproduction was a U64E on 3.14d and the
     # C64U runs 1.1.0 -- each figure cites the tree it came from.
-    assert "target/u64/riscv/ultimate/linker.x" in src and "v3.14d" in src
-    assert "target/u64ii/riscv/ultimate/linker.x" in src and "1.1.0" in src
-    assert "nios2" in src
+    # Bound to the path, not merely present somewhere in the file: "v3.14d"
+    # and "1.1.0" also occur in unrelated prose (mutation R10 survived a
+    # membership check).
+    flat = _re.sub(r"[\s`]+", " ", src)
+    assert _re.search(r"target/u64/riscv/ultimate/linker\.x at v3\.14d", flat)
+    assert _re.search(r"target/u64ii/riscv/ultimate/linker\.x at 1\.1\.0", flat)
+    assert _re.search(r"target/u64/nios2 build directories carry no RAM-disk symbols", flat)

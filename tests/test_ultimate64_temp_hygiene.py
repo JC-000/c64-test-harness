@@ -1100,7 +1100,13 @@ def test_a_failed_inherited_sweep_neither_enables_ftp_nor_blocks(
         c.run_prg(b"\x01\x08x")            # not refused
     assert len(captured) == 1
     warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-    assert any("FTP File Service" in m and "inherited" in m for m in warned), warned
+    inherited = [m for m in warned if "inherited sweep" in m]
+    assert len(inherited) == 1, warned
+    # The remedy is the point of the WARNING (mutation R11 survived a
+    # check that matched only words the message repeats elsewhere).
+    assert "enable FTP File Service manually" in inherited[0]
+    assert "power-cycled" in inherited[0]
+    assert "issue #263" in inherited[0]
 
 
 def test_a_failed_sweep_by_a_lane_that_leaked_keeps_the_existing_behaviour():
