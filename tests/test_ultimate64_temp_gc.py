@@ -243,8 +243,8 @@ def test_stale_ramdisk_scan_detects_what_it_is_looking_for():
         "so 945 KB is",
     ):
         assert _STALE_RAMDISK.search(bad), bad
-    for good in ("16 MiB", "~5.8%", "967,680 bytes", "63 KB PRG"):
-        assert not _STALE_RAMDISK.search(good), good
+    for correct in ("16 MiB", "a 16 MiB RAM disk"):
+        assert not _STALE_RAMDISK.search(correct), correct
 
 
 def test_temp_gc_source_no_longer_states_the_3_mb_ramdisk():

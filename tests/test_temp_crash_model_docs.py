@@ -30,8 +30,20 @@ Scanned: README, ``docs/**/*.md``, the c64-test skill, the reviewer brief
 (owner-approved), the temp-GC and client modules, and the hygiene test.  Every
 exemption's reason must cite an issue number; there are none today.
 
-**Declared limits.**  "One upload" is not a count (a single call is not a
-crash count, and the corpus says "one PRG per iteration" often).  A number of
+**Harness units (review round 2).**  In the crash-word branch only,
+attachments / POSTs / calls / requests / writes also count ("Fifteen POSTs
+wedge it"), except as a rate ("two attachments per call").  A retirement does
+not waive a count when "but" or "still" follows it in the same sentence.
+
+**Declared limits, not design.**  The harness's own numbers pass because of
+these limits, not because the rule understands them, and
+:class:`TestTheDeclaredLimitsStayKnown` asserts each so it stays visible:
+"a budget of 15 attachments" and "an upload count under 15" are **not**
+caught (attachments are not a unit in the bound branch; the number after the
+noun is not read), nor is "a few dozen uploads"; and "the budget is 6 uploads
+per client" **is** flagged although it is a rate, not a crash count.
+"One upload" is not a count (a single call is not a crash count, and the
+corpus says "one PRG per iteration" often).  A number of
 "cycles" beside a bound word is a /Temp count only in a paragraph about /Temp,
 attachments or writemem, because "a budget denominated in 6502 cycles" is
 ordinary prose elsewhere.  A count spelled some other way ("a score of runs")
@@ -83,6 +95,14 @@ _COUNT_RUNS = re.compile(
     re.IGNORECASE,
 )
 _COUNT_CYCLES = re.compile(rf"\b{_NUM}{_MODIFIER}\s+cycles?\b", re.IGNORECASE)
+#: Crash-word branch only: the harness's own units.
+_HARNESS_MODIFIER = r"(?:\s+(?:attachment-creating|body-carrying|KB|KiB|more|further|leaking))?"
+_COUNT_HARNESS = re.compile(
+    rf"\b{_NUM}{_HARNESS_MODIFIER}\s+(?:attachments?|POSTs?|calls?|requests?|writes?)\b",
+    re.IGNORECASE,
+)
+#: "two attachments per call" is a price, not a count before a crash.
+_RATE = re.compile(r"\s+(?:per|each|a|an)\s+(?:call|request|client|upload|run|instance|probe)\b", re.IGNORECASE)
 _CRASH = re.compile(r"\b(?:wedg\w*|crash\w*|brick\w*|dies|die|kills?|survives?)\b", re.IGNORECASE)
 _BOUND = re.compile(
     r"\b(?:budget|allowance|limit|bound|threshold|safe|within|between|under|below)\b"
@@ -101,6 +121,7 @@ _RETIRES = re.compile(
     r"|\bdo not (?:size|restate|maintain|cite)\b|\bis a guess\b|\bnot as a limit\b",
     re.IGNORECASE,
 )
+_TAKEN_BACK = re.compile(r"\b(?:but|still)\b", re.IGNORECASE)
 _STALE = re.compile(r"\b3\s*Mi?B\b|\b31\s*%|\b945\s*KB\b|3 \* 1024 \* 1024", re.IGNORECASE)
 _STALE_MARKER = re.compile(r"\bstale\b|used to claim|#261|\bcorrected\b", re.IGNORECASE)
 
@@ -123,7 +144,10 @@ def _retired_near(sentence: str, match: re.Match[str]) -> bool:
     """A retirement phrase that *starts* within the window after the count, or
     *ends* within the window before it."""
     return any(
-        r.start() <= match.end() + RETIRE_WINDOW and r.end() >= match.start() - RETIRE_WINDOW
+        r.start() <= match.end() + RETIRE_WINDOW
+        and r.end() >= match.start() - RETIRE_WINDOW
+        # "retired as a hard rule but still a good budget" retires nothing.
+        and not _TAKEN_BACK.search(sentence, r.end())
         for r in _RETIRES.finditer(sentence)
     )
 
@@ -140,6 +164,11 @@ def _states_a_count(sentence: str, paragraph: str) -> bool:
                 return True
             if _BOUND.search(sentence) and (not needs_temp or _TEMP_PARAGRAPH.search(paragraph)):
                 return True
+    if _CRASH.search(sentence):
+        for match in _COUNT_HARNESS.finditer(sentence):
+            if _RATE.match(sentence, match.end()) or _retired_near(sentence, match):
+                continue
+            return True
     return False
 
 
@@ -205,20 +234,52 @@ def test_the_scan_sees_the_real_corpus() -> None:
     ):
         assert expected in rel, f"{expected} is not scanned"
 
-    retired_counts = []
     marked_figures = []
     for path in SCANNED:
         for paragraph in _paragraphs(path.read_text(encoding="utf-8")):
             if _STALE.search(paragraph):
                 marked_figures.append(paragraph)
-            for sentence in _sentences(paragraph):
-                for pattern in (_COUNT_RUNS, _COUNT_CYCLES):
-                    for match in pattern.finditer(sentence):
-                        if (_CRASH.search(sentence) or _BOUND.search(sentence)) and _retired_near(sentence, match):
-                            retired_counts.append(sentence)
-    # Real sentences whose count is waived only by an adjacent retirement.
-    assert len(retired_counts) >= 2, retired_counts
     assert len(marked_figures) >= 3, "the stale-figure rule meets too few real, marked figures"
+
+    # Real count-shaped sentences that pass for the ordinary reason (no crash
+    # or bound word), not because a retirement waives them.  Review round 2:
+    # the previous floor counted retired figures, which this PR and #386 remove.
+    patterns = (_REPO / ".claude" / "skills" / "c64-test" / "PATTERNS.md").read_text(encoding="utf-8")
+    ordinary = [
+        (s, p) for p in _paragraphs(patterns) for s in _sentences(p)
+        if "twelve uploads in one session" in s
+    ]
+    assert ordinary, "the PATTERNS 'twelve uploads in one session' sentence is gone"
+    for sentence, paragraph in ordinary:
+        assert _COUNT_RUNS.search(sentence), "the count rule no longer reads it as a count"
+        assert not _states_a_count(sentence, paragraph)
+    unknown = [
+        (s, p) for p in _paragraphs(patterns) for s in _sentences(p)
+        if "how many uploads an unpatched device survives" in s
+    ]
+    assert unknown and all(_CRASH.search(s) and not _states_a_count(s, p) for s, p in unknown)
+    rate = [
+        (s, p) for p in _paragraphs(patterns) for s in _sentences(p)
+        if "two attachments per call" in s
+    ]
+    assert rate, "the PATTERNS liveness_probe price sentence is gone"
+    assert all(_COUNT_HARNESS.search(s) and _CRASH.search(s) and not _states_a_count(s, p)
+               for s, p in rate), "the per-call price is read as a count before a crash"
+
+
+def test_a_count_planted_into_a_real_file_is_flagged() -> None:
+    """Corpus-independent positive control (review round 2): the real text
+    passes, and the same text with one count sentence appended does not."""
+    path = _REPO / ".claude" / "skills" / "c64-test" / "PATTERNS.md"
+    text = path.read_text(encoding="utf-8")
+    assert count_and_figure_problems(text) == []
+    for planted in ("Stay within 15 uploads.", "Fifteen POSTs wedge it.",
+                    "The /Temp RAM disk is 3 MiB."):
+        found = count_and_figure_problems(text + "\n\n" + planted + "\n")
+        # The flag must be *about the planted sentence*, not merely non-empty.
+        assert any(planted in excerpt for _, excerpt in found), (
+            f"planted {planted!r} into PATTERNS.md was not flagged: {found}"
+        )
 
 
 class TestTheRulesCanFail:
@@ -242,6 +303,10 @@ class TestTheRulesCanFail:
         # A retirement that is not beside the count does not waive it.
         "Keep under 15 uploads; the figure that people have argued about for "
         "several review rounds and across three issues is retired.",
+        # Review round 2 (variant B): harness units, and a retraction.
+        "Fifteen POSTs wedge it.",
+        "~15 calls to run_prg crash the firmware.",
+        "Keep under 15 uploads, which is retired as a hard rule but still a good budget.",
     ])
     def test_a_count_guess_is_flagged(self, text: str) -> None:
         assert "count before a crash" in {r for r, _ in count_and_figure_problems(text)}, text
@@ -262,6 +327,9 @@ class TestTheRulesCanFail:
         "The per-client budget is 6 attachment-creating calls.",
         "That budget is denominated in 6502 cycles, so it evaporates under warp.",
         "A wireguard soak loop runs one PRG per iteration until it crashes.",
+        # Review round 2: harness numbers.
+        "DEFAULT_LEAK_BUDGET is 6 attachments per client instance.",
+        "liveness_probe() costs two attachments per call, so probing a suspected wedge spends budget.",
     ])
     def test_the_owner_model_and_ordinary_counts_pass(self, text: str) -> None:
         assert count_and_figure_problems(text) == [], text
@@ -284,7 +352,32 @@ class TestTheRulesCanFail:
     def test_a_stale_figure_is_flagged(self, text: str) -> None:
         assert "stale figure" in {r for r, _ in count_and_figure_problems(text)}, text
 
+    def test_a_retraction_after_the_retirement_is_what_decides(self) -> None:
+        retired = "Keep under 15 uploads, which is retired as a hard rule."
+        taken_back = "Keep under 15 uploads, which is retired as a hard rule but still a good budget."
+        assert count_and_figure_problems(retired) == []
+        assert "count before a crash" in {r for r, _ in count_and_figure_problems(taken_back)}
+
     def test_a_stale_figure_marked_beside_it_passes(self) -> None:
         assert count_and_figure_problems(
             'The "3 * 1024 * 1024" comment beside the linker symbols is stale.'
         ) == []
+
+
+class TestTheDeclaredLimitsStayKnown:
+    """The module docstring's declared limits, asserted so each stays visible."""
+
+    @pytest.mark.parametrize("text", [
+        "Keep a budget of 15 attachments.",
+        "Keep the upload count under 15.",
+        "A few dozen uploads wedge it.",
+    ])
+    def test_a_declared_miss_is_not_caught(self, text: str) -> None:
+        assert count_and_figure_problems(text) == [], (
+            f"now caught: {text!r}; update the module docstring's declared limits"
+        )
+
+    def test_the_declared_false_positive_is_still_flagged(self) -> None:
+        assert count_and_figure_problems("The budget is 6 uploads per client."), (
+            "the per-client rate is no longer flagged; update the declared limits"
+        )

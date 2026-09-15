@@ -146,8 +146,11 @@ this brief enforces. Then work these seven axes, in this order:
    three files immediately under their own corrected crash paragraphs,
    and "once `/Temp` fills" survived in the two skill files that are
    loaded when someone sits down to write a test. Both were found by
-   grepping the dead terms (`fills`, `count-based`, `byte total`), not
-   by re-reading the fix. Check the best-read file last and hardest: a
+   grepping the dead terms (`count-based`, `byte total`), not by
+   re-reading the fix. `fills` was on that list too, until the owner
+   reinstated "`/Temp` fills" as the mechanism on 2026-09-15: a retirement
+   can itself be overturned, so check that a dead term is still dead
+   before treating a hit as stale. Check the best-read file last and hardest: a
    contradiction between a reference doc and a lead paragraph resolves,
    for most readers, in favour of whichever they open first.
 

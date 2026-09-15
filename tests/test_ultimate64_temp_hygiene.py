@@ -646,9 +646,8 @@ def test_budget_override_via_env(monkeypatch: pytest.MonkeyPatch):
 
 def test_default_budget_is_below_the_firmware_keep_limit():
     # The firmware's own post-#686 collector keeps at most 10 managed files;
-    # the default must sit under that.  The "~15 uploads" wedge (U64E, 3.14d,
-    # n unrecorded) is where one reproduction stopped, not a bound to size
-    # against (#256).
+    # the default must sit under that.  The earlier guessed wedge count is
+    # retired (#256): no count of uploads before the crash is known.
     assert 0 < gc_mod.DEFAULT_LEAK_BUDGET <= 8
     assert _client(LEAKY).temp_gc_budget == gc_mod.DEFAULT_LEAK_BUDGET
 
