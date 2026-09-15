@@ -45,10 +45,15 @@ pytestmark = pytest.mark.skipif(
 #: 0.9371 (NTSC 6567R8), 0.9359 (6567R56A) or 0.9453 (PAL) -- the U64E
 #: measured 0.93747 -- so the old ">= 0.99" was unreachable rather than
 #: unmet (issue #273).  The band is wide enough for either video
-#: standard and for some sprite DMA, narrow enough to still fail loudly
-#: if ``BusCycle.ba`` is reading ``phi2``, ``rwn`` or the cart-ROM bit.
-#: Pinned against the arithmetic by ``tests/test_ba_badline_band.py``
-#: -- edit there and here together.
+#: standard and for some sprite DMA.  It rejects the mis-wirings whose
+#: high-fraction can be derived from the bit layout -- ``BusCycle.ba``
+#: reading ``phi2`` (1.0), inverted polarity (~0.06), or the cart-ROM,
+#: GAME#, EXROM# or NMI# bit on a machine with no cartridge or NMI source
+#: (0.0 or 1.0).  It makes no claim about R/W# or IRQ#: their occupancy
+#: depends on the running program, and neither has been derived or
+#: measured, so a BA read from either could sit inside the band (#280).
+#: The edges are chosen, not derived; both are pinned, with the reasoning,
+#: by ``tests/test_ba_badline_band.py`` -- edit there and here together.
 BA_HIGH_MIN = 0.90
 BA_HIGH_MAX = 0.96
 
