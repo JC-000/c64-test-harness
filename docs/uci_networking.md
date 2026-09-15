@@ -165,7 +165,10 @@ reset:**
 
   So a timeout closes an open menu, and on `7f6fcb51` also releases held
   keys and joystick.
-- This has not been measured on a device.
+- The timeout path itself has not been measured on a device: its side
+  effects, a reset while a routine is executing, and the C64U. The enable
+  surviving the same `machine:reset` from `READY.` is measured on the U64E;
+  see the prerequisite section above.
 
 The reset does not clear a UCI STATE-bit wedge (#112); that still needs a
 physical power-cycle. Whatever program was running on the C64 is gone

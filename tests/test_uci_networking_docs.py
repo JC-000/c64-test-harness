@@ -207,6 +207,8 @@ MEASUREMENT = (
     "`Cartridge Preference` `Auto`",
     "without `reset()`",
     "not reproduced",
+    # Re-verify round 3: the build the measurement ran on.
+    "fw 3.15, `git_commit_hash` bce4535e",
     # PR #409 review round 1 (R3, finding 3): arm A's +0 is the identifier
     # read; its routine ran at +3 s.  Each arm's count is pinned.
     "`$DF1D` read `$C9` at +0",
@@ -237,6 +239,9 @@ RETIRED_REQUIREMENT = (
     "Nobody has done that",
     "drop the reset on a device and see which step fails",
     "It is a recorded observation",
+    # Re-verify round 3 (P1): the blanket grade must not return beside the
+    # arm-A/B/C measurement; the dispatch line is scoped to the timeout path.
+    "This has not been measured on a device.",
 )
 
 
@@ -251,7 +256,7 @@ class TestTheMeasurementIsRecorded:
         start = text.index(_DISPATCH_HEADING)
         dispatch = _flat(text[start:text.index("\n## ", start + 1)])
         assert "#270" not in dispatch and "bce4535e" not in dispatch
-        assert "This has not been measured on a device." in dispatch
+        assert "not been measured on a device" in dispatch
 
     @pytest.mark.parametrize("phrase", RETIRED_REQUIREMENT)
     def test_retired_requirement_absent(self, whole: str, phrase: str) -> None:
