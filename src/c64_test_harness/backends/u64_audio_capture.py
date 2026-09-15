@@ -278,6 +278,20 @@ class CaptureResult:
     #: about its lateness, because the next in-order packet is charged a gap
     #: back up to the stream's real position.  Residuals: see
     #: ``backends/_stream_seq.py``.
+    #:
+    #: **A silent restart can lose packets and still report the time base
+    #: intact** -- when its PCM is byte-identical to the old stream's
+    #: (digital silence), *and* a number the old stream lost falls inside
+    #: the restart's held run (its first 8 numbers), *and* that number is
+    #: still inside the 1024-packet window.  The packets held for it are
+    #: then discarded as duplicates and that datagram fills the old missing
+    #: slot, un-counting its drop.  Offline loopback, n=1, no device (#443
+    #: review round 2): an old stream 0..500 that never received 5, then a
+    #: restart 0..599, keeps 1,095 of the 1,100 packets sent while
+    #: ``packets_dropped`` is 0, :attr:`sequence_resyncs` is 1 and
+    #: :attr:`time_base_intact` is ``True``.  A silent restart with no such
+    #: lost number keeps every packet.  Declared and accepted, not fixed;
+    #: the full residual list is in ``backends/_stream_seq.py``.
     packets_reordered: int = 0
     #: Backward steps taken as a new stream position (see
     #: :attr:`packets_reordered`).  The sample index is not a clock across one.

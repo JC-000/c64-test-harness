@@ -444,3 +444,89 @@ def test_tracker_restart_with_new_content_after_a_hold_readmits() -> None:
     assert t.observe(0, "old", "h0").kind == _stream_seq.HELD
     ev = t.observe(1, "new", "n1")
     assert (ev.kind, ev.readmit, t.resyncs) == (_stream_seq.RESYNC, ("h0",), 1)
+
+
+# ----------------------------------------------------------------------------
+# #443 review round 2: the declared silent-restart residual, and the three
+# tracker rules that survived round 1's mutations.
+# ----------------------------------------------------------------------------
+
+
+def test_a_silent_restart_over_a_missing_number_loses_the_held_packets(
+    tmp_path: Path,
+) -> None:
+    """Declared residual (#443 round 2), pinned so it cannot change silently.
+
+    The old stream never received 5.  The silent restart's held run 0..4
+    reaches 5, which is an unarrived missing number, so it does not read as a
+    continuation: the five held packets are discarded as duplicates and the
+    restart's 5 fills the old stream's slot.  1,095 of the 1,100 datagrams
+    sent survive, while ``packets_dropped`` stays 0 and ``time_base_intact``
+    True -- the capture loses packets and still presents as intact.  Accepted
+    behaviour, not a bug to fix here; see ``backends/_stream_seq.py``.
+    """
+    zero = bytes(_AUDIO_PAYLOAD_LEN)
+    seqs = [s for s in range(501) if s != 5] + list(range(600))
+    assert len(seqs) == 1100
+    result, pcm = _audio_raw([(s, zero) for s in seqs], tmp_path)
+    assert len(pcm) // _AUDIO_PAYLOAD_LEN == 1095
+    assert (result.packets_dropped, result.packets_reordered,
+            result.sequence_resyncs) == (0, 15, 1)
+    assert result.time_base_intact is True
+
+
+def test_a_late_packet_continuing_a_duplicate_run_is_late_not_a_restart() -> None:
+    """The continuation test also requires the number not to be one the
+    stream is still owed (mutation H3).
+
+    48 is re-sent after 50 while 49 is missing, then 49 genuinely arrives
+    late.  49 continues the held run numerically, but it is an unarrived
+    missing number, so it is LATE and the held 48 was a duplicate.  Drop the
+    guard and the tracker calls it a restart, charging 51 a phantom gap.
+    """
+    t = _stream_seq.SequenceTracker()
+    for s in range(49):
+        t.observe(s, "x", s)
+    assert t.observe(50, "x50", 50).kind == _stream_seq.GAP  # 49 goes missing
+    assert t.observe(48, "x", 48).kind == _stream_seq.HELD  # a duplicate
+    ev = t.observe(49, "x49", 49)
+    assert (ev.kind, ev.discarded_held) == (_stream_seq.LATE, 1)
+    assert t.observe(51, "x51", 51).kind == _stream_seq.NEXT
+    assert (t.dropped, t.resyncs) == (0, 0)
+
+
+def test_a_second_packet_for_a_late_number_with_new_content_resyncs() -> None:
+    """A late arrival is remembered with its digest (mutation H5).
+
+    51 arrives late, then a second 51 with different bytes: not the same
+    datagram, so it resyncs instead of being held as a duplicate.
+    """
+    t = _stream_seq.SequenceTracker()
+    for s in range(51):
+        t.observe(s, "x", s)
+    assert t.observe(53, "x53", 53).kind == _stream_seq.GAP  # 51, 52 missing
+    assert t.observe(51, "a", 51).kind == _stream_seq.LATE
+    assert t.observe(51, "b", 51).kind == _stream_seq.RESYNC
+    assert (t.dropped, t.resyncs) == (1, 1)
+
+
+def test_a_duplicate_of_a_re_admitted_packet_is_a_duplicate() -> None:
+    """``_restart`` puts the re-admitted datagrams back into the received
+    book (mutation H10).
+
+    After a silent restart re-admits the held run, one of those numbers
+    arriving again is recognised as a duplicate.  Without the re-insertion
+    the tracker resyncs a second time and charges the next in-order datagram
+    a phantom gap.
+    """
+    cap = _stream_seq.MAX_HELD_DUPLICATES
+    t = _stream_seq.SequenceTracker()
+    for s in range(20):
+        t.observe(s, "x", s)
+    for s in range(cap):  # the restarted counter, held as possible duplicates
+        assert t.observe(s, "x", ("again", s)).kind == _stream_seq.HELD
+    assert t.observe(cap, "x", ("again", cap)).kind == _stream_seq.RESYNC
+    assert t.resyncs == 1
+    assert t.observe(0, "x", 0).kind == _stream_seq.HELD  # re-admitted 0 again
+    assert t.observe(cap + 1, "x", cap + 1).kind == _stream_seq.NEXT
+    assert (t.dropped, t.resyncs) == (0, 1)

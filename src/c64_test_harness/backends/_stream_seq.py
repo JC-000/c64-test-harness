@@ -54,7 +54,36 @@ measured on this bench, so none of these has been seen):
   ``MAX_HELD_DUPLICATES`` packets of a capture loses those packets;
 - a duplicate run immediately followed by the next number *after the run*
   that is still behind the highest reads as a restart (re-sent 48, 49 and
-  then a re-sent 50 with different bytes).
+  then a re-sent 50 with different bytes);
+- **a silent restart can lose the datagrams held for it and still report
+  the time base intact** -- but only when all three of these hold:
+
+  1. the restart's payloads are byte-identical to the old stream's
+     (digital silence), so the digest cannot tell a restart from a
+     duplicate and the run is held;
+  2. a number the *old* stream lost falls inside that held run, i.e.
+     within the first ``max_held`` numbers of the restart;
+  3. that number is still inside the window, so it is remembered as an
+     unarrived missing number.
+
+  The held run then reaches a number the stream is still owed, which does
+  not read as a continuation: the held datagrams are taken as duplicates
+  and discarded, and the restart's datagram fills the old stream's missing
+  slot instead.  An old stream 0..500 that never received 5, followed by a
+  restart 0..599, keeps **1,095 of the 1,100 datagrams sent** with
+  ``dropped`` 0, one resync, and -- for audio -- ``time_base_intact``
+  ``True``.  A silent restart with no such lost number keeps every
+  datagram, so this is not "silent restarts lose packets".  Declared and
+  accepted rather than fixed: it is the same ambiguity as the residual
+  above (a re-sent 48, 49 then a late 50 is indistinguishable from a
+  restart), and no duplication or restart has been measured on the device.
+
+  More generally, **a restart whose first number is an unarrived missing
+  number inside the window places that datagram in the old stream's slot
+  and un-counts the old drop.**
+
+Evidence grade for every residual above: **offline loopback through the
+real receivers, n=1 per case, no device** (#443 review round 2).
 
 Memory: the missing and received books each hold at most ``window`` entries,
 pruned by age as the highest number advances; at most
