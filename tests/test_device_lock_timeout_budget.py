@@ -168,6 +168,24 @@ class TestResolveLockTimeout:
         assert not issubclass(dl.DeviceLockTimeoutConfigError, TimeoutError)
         assert issubclass(dl.DeviceLockTimeoutConfigError, ValueError)
 
+    def test_an_explicit_nan_is_refused(self) -> None:
+        """NaN never compares <= 0, so it is an unbounded wait that looks bounded."""
+        with pytest.raises(ValueError, match="NaN"):
+            dl.resolve_lock_timeout(float("nan"), default=12.5)
+
+    @pytest.mark.parametrize("value", [math.inf, 0.0, -1.0])
+    def test_other_explicit_values_keep_their_literal_meaning(
+        self, monkeypatch: pytest.MonkeyPatch, value: float
+    ) -> None:
+        """Documented choice: only NaN is refused on the explicit path.
+
+        ``inf`` is a deliberate wait-forever and ``<= 0`` a single attempt;
+        neither is a typo in an environment variable.  Set against a malformed
+        env to prove the explicit value never consults it.
+        """
+        monkeypatch.setenv(ENV, "30m")
+        assert dl.resolve_lock_timeout(value, default=12.5) == value
+
     def test_fractional_values_are_accepted(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -224,6 +242,18 @@ class TestAcquireReadsTheBudget:
             with pytest.raises(dl.DeviceLockTimeoutConfigError):
                 waiter.acquire()
         assert spy.call_count == 0
+        assert not waiter.held
+
+    def test_an_explicit_nan_timeout_fails_instead_of_waiting_for_ever(
+        self, lock_dir: Path, held_elsewhere
+    ) -> None:
+        """Review round 1: ``acquire(timeout=nan)`` was still waiting after 2.5 s."""
+        waiter = DeviceLock(HOST, lock_dir, heartbeat_interval=None)
+        box = _bounded(
+            lambda: waiter.acquire(timeout=float("nan"), progress_window=None), 3.0
+        )
+        assert not box["alive"], "acquire(timeout=nan) is an unbounded wait"
+        assert isinstance(box.get("exc"), ValueError), box
         assert not waiter.held
 
     def test_acquire_or_raise_is_fatal_before_any_device_contact(
@@ -593,6 +623,28 @@ def budget_doc_problems(lock_doc: str, dev_doc: str) -> list[str]:
     ):
         if needle not in lock_doc:
             problems.append(f"device_locking.md does not state {needle!r}")
+    # Review round 1: the refusal list must be scoped to the variable, and
+    # the explicit path's rule stated where the budget is documented.
+    if not any(
+        "explicit" in p.lower() and "NaN" in p and "not checked" in p.lower()
+        for p in _paragraphs(lock_doc)
+    ):
+        problems.append(
+            "device_locking.md does not say an explicit timeout is not checked "
+            "(except NaN)"
+        )
+    # #301: the live guard now goes through the resolver; the old caveat is
+    # retired and its own default is stated.
+    if "falls back silently" in dev_doc:
+        problems.append("development.md still describes the conftest silent fallback")
+    # "300 s default", not "300 s": the same paragraph's history sentence
+    # ("silently became 300 s") kept a looser pin green when the default
+    # itself was deleted (review-round mutation R1g).
+    if not any(
+        "conftest.py" in p and "300 s default" in p and ENV in p
+        for p in _paragraphs(dev_doc)
+    ):
+        problems.append("development.md does not state the live guard's 300 s default")
     # development.md lists gates; the budget must say it is not one, in the
     # same body paragraph that names it.  Headings do not count: mutation
     # N17 deleted the sentence and survived on the section title alone.

@@ -398,10 +398,12 @@ still extends the deadline indefinitely, so the budget bounds waits on
 wedged or dead holders. Details and the progress reporting that goes with
 it: [docs/device_locking.md](device_locking.md) § "The acquire budget".
 
-`tests/conftest.py`'s `device_lock_guard` has read the same variable for
-its own live-test lock since #142, with its own 300 s default, and it
-still falls back silently on a malformed value. That silent fallback is
-the behaviour this section describes as fatal everywhere else.
+`tests/conftest.py`'s `device_lock_guard`, the autouse lock around every
+live test, reads `U64_DEVICE_LOCK_TIMEOUT` through the same resolver, with
+its own 300 s default when the variable is unset. Before #301 it parsed the
+value itself: a malformed value silently became 300 s, and `0`, `inf` or
+`nan` reached the lock as an unchecked explicit timeout. Now a bad value
+fails the live test up front.
 
 ### Hardware and network live gates (all opt-in, skip cleanly when unset)
 

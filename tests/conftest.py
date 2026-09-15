@@ -14,7 +14,7 @@ import pytest
 
 pytest_plugins = ["pytester"]
 
-from c64_test_harness.backends.device_lock import DeviceLock
+from c64_test_harness.backends.device_lock import DeviceLock, resolve_lock_timeout
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 from c64_test_harness.backends.vice_manager import PortAllocator
@@ -68,11 +68,11 @@ def _first_host(raw: str) -> str | None:
 
 
 def _lock_timeout() -> float:
-    raw = os.environ.get("U64_DEVICE_LOCK_TIMEOUT", "").strip()
-    try:
-        return float(raw) if raw else _DEFAULT_LOCK_TIMEOUT
-    except ValueError:
-        return _DEFAULT_LOCK_TIMEOUT
+    # Through the harness resolver (#301): a malformed, non-positive or
+    # non-finite U64_DEVICE_LOCK_TIMEOUT fails the live test instead of
+    # silently becoming 300 s or reaching acquire as an unchecked explicit
+    # timeout.  The guard keeps its own 300 s default.
+    return resolve_lock_timeout(None, default=_DEFAULT_LOCK_TIMEOUT)
 
 
 @pytest.fixture(autouse=True)

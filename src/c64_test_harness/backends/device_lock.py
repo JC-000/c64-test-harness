@@ -298,6 +298,10 @@ def resolve_lock_timeout(timeout: float | None, *, default: float) -> float:
 
     * *timeout* not ``None`` -> returned unchanged; the variable is not
       read at all, so a malformed value cannot break an explicit caller.
+      An explicit value is **not checked** against the rules below, with
+      one exception: NaN raises ``ValueError``, because ``nan <= 0`` is
+      never true and the wait would never end while looking bounded.
+      ``inf`` is a deliberate wait-forever, and ``<= 0`` a single attempt.
     * :data:`LOCK_TIMEOUT_ENV` unset -> *default*, silently.
     * set but empty (or whitespace) -> *default*, with a WARNING: ``VAR=``
       is the shell's spelling of "unset", but a variable that expanded to
@@ -310,6 +314,12 @@ def resolve_lock_timeout(timeout: float | None, *, default: float) -> float:
     Read on every call, never cached.
     """
     if timeout is not None:
+        if isinstance(timeout, float) and math.isnan(timeout):
+            raise ValueError(
+                "DeviceLock timeout is NaN: a NaN deadline never expires, so "
+                "the wait would be unbounded. Pass a number of seconds, "
+                "math.inf to wait for ever, or None for the default."
+            )
         return timeout
     raw = os.environ.get(LOCK_TIMEOUT_ENV)
     if raw is None:

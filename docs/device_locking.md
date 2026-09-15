@@ -127,7 +127,10 @@ environment (issue #233):
 | `create_manager()` / `UnifiedManager` | `lock_timeout=` | 60 s (`unified_manager.DEFAULT_LOCK_TIMEOUT`) |
 
 - **An explicit argument always wins**, and when one is given the
-  variable is not read at all.
+  variable is not read at all. An explicit value is not checked against
+  the rules below, with one exception: NaN raises `ValueError`, because a
+  NaN deadline never expires. An explicit `inf` waits for ever, and zero or
+  less makes a single attempt.
 - **The variable is read at call time**, on every acquire. A long-lived
   manager sees a change.
 - **Neither default moved.** A caller that set nothing gets exactly what
@@ -136,7 +139,10 @@ environment (issue #233):
   `DeviceLockTimeoutConfigError`, a `ValueError`, so an `except
   TimeoutError` retry arm will not swallow a typo. It is raised before the
   lock is tried, and on the manager path before the device pool probes
-  any device. `30m`, `0`, `inf` and `nan` are all refused. A budget of
+  any device. `U64_DEVICE_LOCK_TIMEOUT` values of `30m`, `0`, `inf` and
+  `nan` are all refused, including by the live-test guard in
+  `tests/conftest.py`, which reads the variable through the same resolver
+  with its own 300 s default. A budget of
   zero fails every queued run at once, and an infinite one makes a wedged
   device look the same as a busy one.
 - **Empty (`U64_DEVICE_LOCK_TIMEOUT=`) means unset**: the default, plus
