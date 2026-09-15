@@ -101,9 +101,64 @@ def test_source_trace_agrees_with_the_doc(phrase):
     assert phrase in _flat(_DOC.read_text()), phrase
 
 
-@pytest.mark.parametrize("condition", ["external cartridge", "prohibit"])
-def test_both_exceptions_are_named(doc, condition):
-    assert condition in doc.lower()
+def _exception_bullets(raw: str) -> list[str]:
+    """The bullet items that follow "except in two cases", flattened.
+
+    Scoped to the list, not the whole docstring: the qualifier words also
+    appear in the sentence that introduces ``set_cartridge`` and in the
+    bullet headings, so a whole-docstring substring check let a mutation
+    that dropped a bullet's actual condition survive (R3/R4 in the #299
+    mutation run).
+    """
+    _, sep, tail = raw.partition("except in")
+    assert sep, "the exceptions sentence is missing"
+    bullets: list[str] = []
+    for line in tail.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("* "):
+            bullets.append(stripped[2:])
+        elif bullets and stripped and line.startswith("  "):
+            bullets[-1] += " " + stripped
+        elif bullets and not stripped:
+            break
+    return [_flat(b) for b in bullets]
+
+
+@pytest.fixture(scope="module")
+def raw() -> str:
+    return inspect.getdoc(Ultimate64Client.reboot) or ""
+
+
+def test_there_are_exactly_two_exceptions(raw):
+    assert len(_exception_bullets(raw)) == 2, _exception_bullets(raw)
+
+
+def test_one_exception_is_an_external_cartridge_on_the_bus(raw):
+    hits = [b for b in _exception_bullets(raw)
+            if "external cartridge" in b.lower() and "set_cartridge" in b]
+    assert len(hits) == 1, _exception_bullets(raw)
+
+
+def test_one_exception_is_the_crt_prohibit_mask(raw):
+    hits = [b for b in _exception_bullets(raw)
+            if "``prohibit``" in b and ".crt" in b]
+    assert len(hits) == 1, _exception_bullets(raw)
+
+
+@pytest.mark.parametrize("mangled, expected", [
+    ("* **A cartridge holds the bus**: ``set_cartridge`` is skipped.", 0),
+    ("* **An external cartridge holds the bus**: ``set_cartridge`` is skipped.", 1),
+])
+def test_bullet_scoping_can_fail(mangled, expected):
+    """Vacuity guard: a bullet without its condition is not counted, even
+    when the qualifier words appear elsewhere in the text."""
+    text = (
+        "when no external cartridge holds the bus, calls set_cartridge, "
+        "except in two cases:\n\n" + mangled + "\n* **The .crt prohibits them.** x\n"
+    )
+    hits = [b for b in _exception_bullets(text)
+            if "external cartridge" in b.lower() and "set_cartridge" in b]
+    assert len(hits) == expected
 
 
 def test_says_restored_from_config(doc):
