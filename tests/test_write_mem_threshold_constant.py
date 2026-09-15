@@ -127,25 +127,133 @@ def test_unpoked_client_takes_the_grade(firmware, expected):
 # The pokes are honoured                                                      #
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.parametrize("firmware", ["3.15", "1.1.0", None])
-@pytest.mark.parametrize("poked", [100, 32])
-def test_class_poke_is_honoured(monkeypatch, firmware, poked):
+@pytest.mark.parametrize("poked", [1, 32, 100, 128])
+def test_class_poke_is_honoured_on_a_post_safe_grade(monkeypatch, poked):
+    """Review round 1: a post-safe grade honours any poke in 1..128."""
     monkeypatch.setattr(Ultimate64Client, "WRITE_MEM_QUERY_THRESHOLD", poked)
-    mock, _ = _device(firmware)
+    mock, _ = _device("3.15")
     with patch("urllib.request.urlopen", mock):
         c = Ultimate64Client("h", warn_unlocked=False)
     assert c.write_mem_query_threshold == poked
     assert _boundary(c, poked) == ["PUT", "POST"]
 
 
-def test_class_poke_to_the_shipped_value_is_honoured(monkeypatch):
-    """Re-assigning 48 is a poke too: on a leak-prone grade it must lower the
-    threshold to 48, not be mistaken for the untouched default."""
-    monkeypatch.setattr(Ultimate64Client, "WRITE_MEM_QUERY_THRESHOLD", 48)
+def _refused(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and "refused" in r.getMessage()
+            and "WRITE_MEM_QUERY_THRESHOLD" in r.getMessage()]
+
+
+@pytest.mark.parametrize("firmware", ["1.1.0", None])
+@pytest.mark.parametrize("poked", [0, 1, 16, 48, 100, 127])
+def test_downward_class_poke_is_refused_when_not_post_safe(monkeypatch, caplog, firmware, poked):
+    """Review round 1 finding 1 (hardware rule 8): below 128 on a grade that
+    is not post-safe a poke only moves writes onto the leaking POST path, so
+    it is refused -- the threshold stays 128 and a WARNING says why."""
+    monkeypatch.setattr(Ultimate64Client, "WRITE_MEM_QUERY_THRESHOLD", poked)
+    mock, _ = _device(firmware)
+    with caplog.at_level(logging.WARNING, logger=_LOGGER), \
+            patch("urllib.request.urlopen", mock):
+        c = Ultimate64Client("h", warn_unlocked=False)
+    assert c.write_mem_query_threshold == THRESHOLD_POST_RISKY
+    assert _boundary(c, THRESHOLD_POST_RISKY) == ["PUT", "POST"]
+    msgs = _refused(caplog)
+    assert msgs and all("/Temp" in m for m in msgs), msgs
+
+
+def test_upward_poke_to_the_cap_is_honoured_when_not_post_safe(monkeypatch, caplog):
+    monkeypatch.setattr(Ultimate64Client, "WRITE_MEM_QUERY_THRESHOLD", 128)
     mock, _ = _device("1.1.0")
+    with caplog.at_level(logging.WARNING, logger=_LOGGER), \
+            patch("urllib.request.urlopen", mock):
+        c = Ultimate64Client("h", warn_unlocked=False)
+    assert c.write_mem_query_threshold == 128
+    assert _refused(caplog) == []
+
+
+@pytest.mark.parametrize("firmware", ["3.15", "1.1.0", None])
+@pytest.mark.parametrize("poked", [129, 200, 1000])
+def test_poke_above_the_put_cap_is_clamped(monkeypatch, caplog, firmware, poked):
+    """Review round 1 finding 2: the firmware refuses a ``data=`` PUT over
+    128 bytes on every grade, so a poke above 128 is clamped to 128."""
+    monkeypatch.setattr(Ultimate64Client, "WRITE_MEM_QUERY_THRESHOLD", poked)
+    mock, _ = _device(firmware)
+    with caplog.at_level(logging.WARNING, logger=_LOGGER), \
+            patch("urllib.request.urlopen", mock):
+        c = Ultimate64Client("h", warn_unlocked=False)
+    assert c.write_mem_query_threshold == 128
+    assert _boundary(c, 128) == ["PUT", "POST"]
+    assert any("clamped" in m and "128" in m for m in
+               (r.getMessage() for r in caplog.records if r.levelno == logging.WARNING))
+
+
+def test_reviewer_wire_experiment_downward_poke_no_longer_posts(monkeypatch):
+    """The review's measurement: leak-prone grade, class poke 16, a direct
+    100-byte write_mem went POST (one attachment).  It must stay PUT."""
+    monkeypatch.setattr(Ultimate64Client, "WRITE_MEM_QUERY_THRESHOLD", 16)
+    mock, wire = _device("1.1.0")
+    with patch("urllib.request.urlopen", mock):
+        c = Ultimate64Client("h", warn_unlocked=False, temp_hygiene=False)
+        wire.clear()
+        c.write_mem(0x4000, bytes(100))
+    assert _writemem_methods(wire) == ["PUT"]
+
+
+def test_reviewer_wire_experiment_huge_poke_no_longer_sends_an_oversized_put(monkeypatch):
+    """The review's measurement: poke 1000 sent a 200-byte ``data=`` PUT the
+    firmware refuses.  Clamped, a 200-byte write is a POST on a post-safe grade."""
+    monkeypatch.setattr(Ultimate64Client, "WRITE_MEM_QUERY_THRESHOLD", 1000)
+    mock, wire = _device("3.15")
     with patch("urllib.request.urlopen", mock):
         c = Ultimate64Client("h", warn_unlocked=False)
-    assert c.write_mem_query_threshold == 48
+        wire.clear()
+        c.write_mem(0x4000, bytes(200))
+    assert _writemem_methods(wire) == ["POST"]
+
+
+def test_class_poke_to_the_shipped_value_counts_as_a_poke(monkeypatch, caplog):
+    """Re-assigning a plain 48 is a poke, not the untouched default: on a
+    leak-prone grade it is seen (and refused), not silently ignored."""
+    monkeypatch.setattr(Ultimate64Client, "WRITE_MEM_QUERY_THRESHOLD", 48)
+    mock, _ = _device("1.1.0")
+    with caplog.at_level(logging.WARNING, logger=_LOGGER), \
+            patch("urllib.request.urlopen", mock):
+        c = Ultimate64Client("h", warn_unlocked=False)
+    assert c.write_mem_query_threshold == 128
+    assert _refused(caplog), "a plain 48 was mistaken for the shipped default"
+
+
+def test_restoring_the_saved_original_undoes_a_class_poke(caplog):
+    """Review round 1 nit 3: the documented undo.  Only the saved original
+    object clears a poke; monkeypatch does this automatically."""
+    original = Ultimate64Client.WRITE_MEM_QUERY_THRESHOLD
+    try:
+        Ultimate64Client.WRITE_MEM_QUERY_THRESHOLD = 100
+        Ultimate64Client.WRITE_MEM_QUERY_THRESHOLD = 48  # still a poke
+        mock, _ = _device("1.1.0")
+        with caplog.at_level(logging.WARNING, logger=_LOGGER), \
+                patch("urllib.request.urlopen", mock):
+            Ultimate64Client("h", warn_unlocked=False)
+        assert _refused(caplog)
+        caplog.clear()
+    finally:
+        Ultimate64Client.WRITE_MEM_QUERY_THRESHOLD = original
+    mock, _ = _device("1.1.0")
+    with caplog.at_level(logging.WARNING, logger=_LOGGER), \
+            patch("urllib.request.urlopen", mock):
+        c = Ultimate64Client("h", warn_unlocked=False)
+    assert c.write_mem_query_threshold == 128
+    assert not any("WRITE_MEM_QUERY_THRESHOLD" in r.getMessage() for r in caplog.records)
+
+
+def test_constant_docstring_documents_the_undo():
+    import inspect
+    import re
+
+    from c64_test_harness.backends import ultimate64_client as mod
+
+    flat = re.sub(r"\s*#:\s*|\s+", " ", inspect.getsource(mod.Ultimate64Client))
+    assert "monkeypatch" in flat and "saved original" in flat
 
 
 def test_subclass_override_is_honoured():
@@ -173,6 +281,30 @@ def test_instance_poke_is_honoured():
     assert Ultimate64Client.WRITE_MEM_QUERY_THRESHOLD == 48
 
 
+@pytest.mark.parametrize("firmware", ["1.1.0", "unprobed"])
+def test_downward_instance_poke_is_refused_when_not_post_safe(caplog, firmware):
+    """Same rule for an instance poke; an unprobed (pinned) client has no
+    grade at all and is treated as not post-safe."""
+    if firmware == "unprobed":
+        c = Ultimate64Client("h", write_mem_query_threshold=128, warn_unlocked=False)
+    else:
+        mock, _ = _device(firmware)
+        with patch("urllib.request.urlopen", mock):
+            c = Ultimate64Client("h", warn_unlocked=False)
+    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+        c.WRITE_MEM_QUERY_THRESHOLD = 16
+    assert c.write_mem_query_threshold == 128
+    assert _refused(caplog)
+
+
+def test_instance_poke_above_the_cap_is_clamped():
+    mock, _ = _device("3.15")
+    with patch("urllib.request.urlopen", mock):
+        c = Ultimate64Client("h", warn_unlocked=False)
+    c.WRITE_MEM_QUERY_THRESHOLD = 500
+    assert c.write_mem_query_threshold == 128
+
+
 def test_kwarg_beats_a_class_poke(monkeypatch, caplog):
     monkeypatch.setattr(Ultimate64Client, "WRITE_MEM_QUERY_THRESHOLD", 100)
     mock, wire = _device("3.15")
@@ -190,7 +322,7 @@ def test_class_poke_still_probes_so_hygiene_still_arms(monkeypatch):
     """Honouring a poke must not silently disarm /Temp hygiene the way an
     explicit kwarg does: a lane that poked 128 against a C64U was armed
     before #249 (the probe ran) and must stay armed."""
-    monkeypatch.setattr(Ultimate64Client, "WRITE_MEM_QUERY_THRESHOLD", 100)
+    monkeypatch.setattr(Ultimate64Client, "WRITE_MEM_QUERY_THRESHOLD", 128)
     mock, _ = _device("1.1.0")
     with patch("urllib.request.urlopen", mock):
         c = Ultimate64Client("h", warn_unlocked=False)
