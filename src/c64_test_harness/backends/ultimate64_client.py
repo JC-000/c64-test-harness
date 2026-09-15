@@ -1002,7 +1002,16 @@ class Ultimate64Client:
         self._drain_temp_attachments(reason=reason, under_lock=True)
 
     def _holds_device_lock(self) -> bool:
-        """Whether this process holds this device's ``DeviceLock`` (no I/O)."""
+        """Whether this process holds this device's ``DeviceLock`` (no I/O).
+
+        Asks :meth:`DeviceLock.held_by_this_process` about the **default**
+        lock directory only. A process that holds the lock under a custom
+        ``lock_dir`` therefore reads as not holding it here, so its
+        ``close()`` does not sweep inherited ``/Temp``. Its lock-release
+        callback still does: :meth:`_drain_on_lock_release` runs under the
+        flock by construction and never consults this. Accepted in review
+        (PR #297, round 2) as the conservative direction.
+        """
         if not _HAS_DEVICE_LOCK:
             return False
         try:

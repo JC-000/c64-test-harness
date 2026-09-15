@@ -1160,6 +1160,33 @@ def test_a_fresh_budget_one_client_probes_without_sweeping_first():
         gc.assert_called_once()
 
 
+def test_a_probe_post_that_raises_mid_request_is_still_counted():
+    """Review round 2: the probe's own sender counts in ``finally`` too.
+
+    ``test_a_post_that_raises_mid_request_is_still_counted`` drives
+    ``_request``; this drives ``liveness_probe``'s sender. A writemem POST
+    that dies with a TCP reset has still streamed its body into ``/Temp``,
+    and the probe swallows the reset into a ``connection_reset`` result,
+    so nothing else would ever notice the attachment.
+    """
+    c = _client(LEAKY)
+    mock, wire, _ = _device_urlopen()
+
+    def _reset_on_post(req, timeout=None):
+        if req.get_method() == "POST":
+            wire.append((req.get_method(), req.full_url))
+            raise ConnectionResetError("reset mid-body")
+        return mock(req, timeout=timeout)
+
+    with _reachable(), patch.object(c, "gc_temp_folder") as gc, \
+            patch("urllib.request.urlopen", side_effect=_reset_on_post):
+        result = c.liveness_probe()
+    assert result.failure == "connection_reset", result
+    assert len(_writemem_posts(wire)) == 1, "sanity: the probe write only, no restore"
+    assert c.pending_temp_attachments == 1
+    gc.assert_not_called()
+
+
 def test_the_probe_sender_runs_the_advisory_lock_check_per_post():
     c = _client(LEAKY)
     mock, _, _ = _device_urlopen()
