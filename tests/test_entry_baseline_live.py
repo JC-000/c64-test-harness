@@ -55,6 +55,14 @@ Item counts, **measured on the U64E (fw 3.15) 2026-09-12** — read-only,
   ``Data Streams`` 4) — **203 items** across all 19 categories the U64E
   lists, 2026-09-12.
 
+Every figure above, per category included, was also reproduced from
+firmware source at 7f6fcb51 (v3.15-85) in #288's adversarial review: each
+store's ``t_cfg_definition[]`` preprocessed with the U64E build flags
+(``-DU64=1 -DDEVELOPER=0 -DCLOCK_FREQ=66666667``, from that build's
+``target/u64/nios2/ultimate/Makefile``), counting the five REST-visible
+item types.  So the counts rest on two instruments for that build: one
+device read (n=1) and one source derivation.
+
 The figure carries its device and date inline on purpose.  The earlier
 "~150" in this docstring had neither, was quoted downstream as though it
 were a measurement, and was withdrawn for that reason before anybody

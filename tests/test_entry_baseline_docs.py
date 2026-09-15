@@ -498,13 +498,28 @@ class TestTheItemCountCarriesItsScope:
     and three"), a figure outside :data:`_TOKENS`, and a per-category
     number (those are pinned by arithmetic instead, see
     :meth:`test_the_per_category_breakdown_adds_up`).
+
+    **Declared limit: the "respectively" construction.**  A figure takes
+    the date inside its own clause (split at ``,`` ``;`` ``—``), and
+    otherwise the date whose *nearer edge* is closest.  "201 and 203 items
+    were counted on 2026-09-10 and 2026-09-12 respectively" puts both
+    figures and both dates in one clause, so 203 binds to 2026-09-10 and a
+    correct sentence fails.  Write one clause per figure.  An exact
+    distance tie between two *different* dates is flagged as ambiguous —
+    before round 2 such a tie was broken by string order, which is luck.
     """
 
     #: Device naming, in the same sentence as the number.
     _DEVICE = ("U64E", "Ultimate 64 Elite")
+    #: Presence of the U64E is not enough: "The C64U counted 151 items on
+    #: 2026-09-12, unlike the U64E." names it and passed.  No C64U item
+    #: count has ever been read, so a count sentence that names the C64U at
+    #: all is flagged.
+    _OTHER_DEVICE = ("C64U", "C64 Ultimate")
 
     #: Each measured figure bound to the **one** date it was measured on,
-    #: and the date nearest the figure in its sentence must be that date.
+    #: and the date that binds to the figure (see the class docstring's
+    #: declared limit) must be that date.
     #: A set of acceptable dates let any figure borrow either one — the
     #: covered count re-dated to 2026-09-10 passed.
     #:
@@ -530,13 +545,18 @@ class TestTheItemCountCarriesItsScope:
     #:
     #: * ``~150 ms`` — a SocketDMA timing, README.md and REFERENCE.md;
     #: * ``"~150"`` in double quotes — the withdrawn figure *named* as a
-    #:   mention (PATTERNS.md, the live docstring), never stated as a count.
+    #:   mention, never stated as a count, and anchored to its two actual
+    #:   sites (PATTERNS.md ``the "~150" that circulated``, the live
+    #:   docstring ``The earlier "~150" in this docstring``).  Bare quotes
+    #:   were too wide: 'The entry reset touches "~150" items on every
+    #:   device.' passed.
     #:
     #: Each entry's group 1 is the exempted token.  Add to this only with a
     #: referent, and never a bare token.
     _ALLOWED = (
         re.compile(r"~(150) ms\b"),
-        re.compile(r'"~(150)"'),
+        re.compile(r'\b[Tt]he "~(150)" that circulated\b'),
+        re.compile(r'\bThe earlier "~(150)" in this docstring\b'),
     )
 
     #: Vacuity floor: the scanned, non-allowlisted count occurrences each
@@ -589,12 +609,31 @@ class TestTheItemCountCarriesItsScope:
             if not any(d in sentence for d in cls._DEVICE):
                 bad.append(f"{token} names no device: {sentence!r}")
                 continue
-            dates = [(abs(d.start() - pos), d.group()) for d in
-                     cls._DATE_RE.finditer(sentence)]
+            if any(o in sentence for o in cls._OTHER_DEVICE):
+                bad.append(f"{token} shares its sentence with the C64U, whose "
+                           f"item counts have never been read: {sentence!r}")
+                continue
+            dates = list(cls._DATE_RE.finditer(sentence))
             if not dates:
                 bad.append(f"{token} carries no date: {sentence!r}")
                 continue
-            nearest = min(dates)[1]
+            end = pos + len(token)
+            lo = max((m.end() for m in re.finditer(r"[,;—]", sentence[:pos])),
+                     default=0)
+            nxt = re.search(r"[,;—]", sentence[end:])
+            hi = end + nxt.start() if nxt else len(sentence)
+            local = [d for d in dates if d.start() >= lo and d.end() <= hi]
+            pool = local or dates
+            ranked = sorted(
+                ((pos - d.end()) if d.end() <= pos else (d.start() - end), d.group())
+                for d in pool
+            )
+            if (len(ranked) > 1 and ranked[0][0] == ranked[1][0]
+                    and ranked[0][1] != ranked[1][1]):
+                bad.append(f"{token} is equidistant from {ranked[0][1]} and "
+                           f"{ranked[1][1]}: {sentence!r}")
+                continue
+            nearest = ranked[0][1]
             if nearest != want:
                 bad.append(
                     f"{token} is dated {nearest}, but was measured {want}: "
@@ -632,6 +671,17 @@ class TestTheItemCountCarriesItsScope:
         flat = _doc("skill/PATTERNS.md")
         assert "151 items across the twelve covered categories" in flat
         assert "U64E (fw 3.15) 2026-09-12" in flat
+
+    @pytest.mark.parametrize("where", ["skill/PATTERNS.md", "live"])
+    def test_the_source_derivation_is_cited_beside_the_device_read(
+        self, where: str
+    ) -> None:
+        """Two instruments, both named.  The device read is n=1; the
+        reviewer's derivation from firmware source at the flashed build is
+        the second, and dropping its citation silently halves the evidence."""
+        text = _flat(self._live_docstring() if where == "live"
+                     else LANE_DOCS[where].read_text(encoding="utf-8"))
+        assert "reproduced from firmware source at 7f6fcb51 (v3.15-85)" in text, where
 
     # -- the breakdown: pinned by arithmetic, not by spelling ---------------
 
@@ -789,6 +839,14 @@ class TestTheItemCountCarriesItsScope:
         ("the planted all-category figure", "214 across all 19 categories on the "
          "U64E, 2026-09-12."),
         ("the withdrawn figure unquoted", "The reset touches ~150 items."),
+        ("the C64U named beside the U64E",
+         "The C64U counted 151 items on 2026-09-12, unlike the U64E."),
+        ("the C64 Ultimate named beside the U64E",
+         "The C64 Ultimate and the U64E both list 203 items, 2026-09-12."),
+        ("the withdrawn figure quoted but stated as a count",
+         'The entry reset touches "~150" items on every device.'),
+        ("an unbroken tie between two different dates",
+         "2026-09-10 201 2026-09-12 on the U64E."),
     ])
     def test_the_scan_flags(self, label, text) -> None:
         assert self._unscoped(text), label
@@ -802,14 +860,32 @@ class TestTheItemCountCarriesItsScope:
         ("a timing", "16 KiB in ~150 ms instead of >6 s."),
         ("the withdrawn figure named, not stated",
          'The "~150" that circulated was accurate.'),
+        ("the live docstring's mention of the withdrawn figure",
+         'The earlier "~150" in this docstring had neither.'),
+        ("two clauses, each date before its figure (round-2 false failure)",
+         "On 2026-09-10 #276 compared 201 items, and on 2026-09-12 the U64E "
+         "read counted 203 items."),
         ("issue references", "See #150 and #214 for that."),
         ("versions and ranges", "fw 3.151, machine.c:145-150, 0x151, 1.203."),
     ])
     def test_the_scan_leaves_non_counts_alone(self, label, text) -> None:
         assert not self._unscoped(text), (label, self._unscoped(text))
         assert not self._count_occurrences(text) or label in (
-            "scoped", "the residual, correctly dated"
+            "scoped", "the residual, correctly dated",
+            "two clauses, each date before its figure (round-2 false failure)",
         ), label
+
+    # Tuned offsets, do not reflow: 201's own date ends 1 character before
+    # it and the other starts 7 after it, while measured from each date's
+    # START the other one is nearer (10 vs 11).  No comma, so the
+    # own-clause preference cannot rescue it — this is the only case that
+    # separates edge distance from start distance.
+    @pytest.mark.parametrize("label,text", [
+        ("edge distance, not start distance",
+         "U64E read 2026-09-10 201 items 2026-09-12."),
+    ])
+    def test_the_scan_binds_by_nearer_edge(self, label, text) -> None:
+        assert not self._unscoped(text), (label, self._unscoped(text))
 
 
 class TestTheSubjectScopedPinsCanFail:
