@@ -14,7 +14,10 @@ and ``lock.release()`` alike, and a raising ``close()`` orphaned the
   -- ``resolve_baseline_on_entry`` plus ``apply_factory_baseline`` -- which
   runs on the Ultimate line by default and **never** on a C64 Ultimate or an
   unidentified device, not even when ``U64_BASELINE_ON_ENTRY=1`` asks;
-* every test in the module that writes CPU speed requests that fixture.
+* every test in the module that writes CPU speed requests that fixture;
+* its exit restore puts **both** ``CPU Speed`` and ``Turbo Control`` back to
+  the ``default`` each reported at entry (#360 -- ``set_speed(1)`` alone left
+  ``CPU Speed`` at the last test's value).
 
 The fixture bodies are lifted from the module source (decorators stripped)
 and executed in a private copy of the module's namespace, so the fakes
@@ -83,9 +86,34 @@ class _FakeLock:
         self.journal.append("release")
 
 
+#: The fake device's ``U64 Specific Settings`` store.  The defaults are
+#: deliberately NOT the factory ``" 1"``/``"Off"``, and the entry currents
+#: differ from both, so a restore that hardcodes 1 MHz, writes ``current``
+#: back, or skips an item cannot produce the expected end state (#360).
+_FAKE_DEFAULTS = {"CPU Speed": " 3", "Turbo Control": "U64 Turbo Registers"}
+_FAKE_ENTRY = {"CPU Speed": " 8", "Turbo Control": "Manual"}
+
+
 class _FakeClient:
-    def __init__(self, generation) -> None:
+    def __init__(self, generation, journal: list | None = None) -> None:
         self._generation = generation
+        self.journal = journal if journal is not None else []
+        self.fail_items: set[str] = set()
+        self.store = {
+            item: {"current": _FAKE_ENTRY[item], "default": _FAKE_DEFAULTS[item]}
+            for item in _FAKE_DEFAULTS
+        }
+
+    def get_config_item(self, category, item):
+        assert category == "U64 Specific Settings"
+        return dict(self.store[item])
+
+    def set_config_item(self, category, item, value) -> None:
+        assert category == "U64 Specific Settings"
+        self.journal.append(("config", item, value))
+        if item in self.fail_items:
+            raise RuntimeError(f"PUT {item} failed")
+        self.store[item]["current"] = value
 
     @property
     def capabilities(self):
@@ -99,7 +127,7 @@ class _FakeTransport:
         self.journal = journal
         self.fail_close = False
         self.fail_speed = False
-        self.client = _FakeClient("ultimate")
+        self.client = _FakeClient("ultimate", journal)
 
     def close(self) -> None:
         self.journal.append("close")
@@ -110,6 +138,14 @@ class _FakeTransport:
         self.journal.append(("set_speed", multiplier))
         if self.fail_speed:
             raise RuntimeError("set_speed failed")
+        # What Ultimate64Transport.set_speed does to the store: 1 writes only
+        # Turbo Control, N writes CPU Speed then Turbo Control (#360).
+        store = self.client.store
+        if multiplier == 1:
+            store["Turbo Control"]["current"] = "Off"
+        else:
+            store["CPU Speed"]["current"] = f"{multiplier:>2}"
+            store["Turbo Control"]["current"] = "Manual"
 
 
 @pytest.fixture
@@ -147,6 +183,13 @@ def probe(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
 def _after(journal: list, mark: int) -> list:
     return journal[mark:]
+
+
+#: The exit restore, as the journal records it.
+_RESTORE = [
+    ("config", "CPU Speed", _FAKE_DEFAULTS["CPU Speed"]),
+    ("config", "Turbo Control", _FAKE_DEFAULTS["Turbo Control"]),
+]
 
 
 # --------------------------------------------------------------------------- #
@@ -198,7 +241,7 @@ class TestTransportFixture:
 
 
 # --------------------------------------------------------------------------- #
-# speed_baseline: gate, entry reconciliation, 1 MHz restore                   #
+# speed_baseline: gate, entry reconciliation, restore to default             #
 # --------------------------------------------------------------------------- #
 
 class TestSpeedFixture:
@@ -214,7 +257,8 @@ class TestSpeedFixture:
         with pytest.raises(pytest.skip.Exception):
             next(self._gen(probe))
         assert not any(
-            e == "baseline" or (isinstance(e, tuple) and e[0] == "set_speed")
+            e == "baseline"
+            or (isinstance(e, tuple) and e[0] in ("set_speed", "config"))
             for e in probe.journal
         )
 
@@ -229,13 +273,15 @@ class TestSpeedFixture:
     ) -> None:
         if env is not None:
             monkeypatch.setenv(BASELINE_ON_ENTRY_ENV, env)
-        probe.transport.client = _FakeClient(generation)
+        probe.transport.client = _FakeClient(generation, probe.journal)
         next(self._gen(probe))
         assert "baseline" not in probe.journal
         assert probe.journal == [("set_speed", 1)]
 
     def test_an_unreadable_generation_is_never_reset_at_entry(self, probe) -> None:
-        probe.transport.client = _FakeClient(TimeoutError("probe timed out"))
+        probe.transport.client = _FakeClient(
+            TimeoutError("probe timed out"), probe.journal
+        )
         next(self._gen(probe))
         assert probe.journal == [("set_speed", 1)]
 
@@ -244,20 +290,66 @@ class TestSpeedFixture:
         next(self._gen(probe))
         assert probe.journal == [("set_speed", 1)]
 
-    def test_an_exception_at_the_yield_still_restores_1_mhz(self, probe) -> None:
+    def test_an_exception_at_the_yield_still_restores_both_items(self, probe) -> None:
         gen = self._gen(probe)
         next(gen)
         mark = len(probe.journal)
         with pytest.raises(RuntimeError, match="test body"):
             gen.throw(RuntimeError("test body"))
-        assert _after(probe.journal, mark) == [("set_speed", 1)]
+        assert _after(probe.journal, mark) == _RESTORE
 
     def test_a_failed_restore_is_reported_not_swallowed(self, probe) -> None:
         gen = self._gen(probe)
         next(gen)
-        probe.transport.fail_speed = True
-        with pytest.raises(RuntimeError, match="set_speed failed"):
+        probe.transport.client.fail_items = {"CPU Speed"}
+        with pytest.raises(RuntimeError, match="PUT CPU Speed failed"):
             next(gen)
+
+    def test_a_failed_cpu_speed_put_still_restores_turbo_control(self, probe) -> None:
+        gen = self._gen(probe)
+        next(gen)
+        probe.transport.client.fail_items = {"CPU Speed"}
+        mark = len(probe.journal)
+        with pytest.raises(RuntimeError):
+            next(gen)
+        assert _after(probe.journal, mark) == _RESTORE
+        assert probe.transport.client.store["Turbo Control"]["current"] == (
+            _FAKE_DEFAULTS["Turbo Control"]
+        )
+
+
+# --------------------------------------------------------------------------- #
+# #360: after a speed test, both owned items are back at their default        #
+# --------------------------------------------------------------------------- #
+
+class TestSpeedRestoreEndsAtDefault:
+    def test_fake_defaults_are_not_what_the_old_restore_leaves(self) -> None:
+        """Guard the fixture of this class: its expectations must be falsifiable."""
+        assert _FAKE_DEFAULTS["CPU Speed"] not in (" 1", _FAKE_ENTRY["CPU Speed"], " 8")
+        assert _FAKE_DEFAULTS["Turbo Control"] not in ("Off", _FAKE_ENTRY["Turbo Control"])
+
+    @pytest.mark.parametrize("generation", ["ultimate", "cbm", "unknown"])
+    def test_a_speed_test_leaves_current_equal_to_default(self, probe, generation) -> None:
+        client = _FakeClient(generation, probe.journal)
+        probe.transport.client = client
+        gen = _fixture_body(probe.module, "speed_baseline")(probe.transport)
+        probe.generators.append(gen)
+        t = next(gen)
+        t.set_speed(8)  # what TestSetSpeed does between entry and exit
+        assert client.store["CPU Speed"]["current"] == " 8"
+        mark = len(probe.journal)
+        with pytest.raises(StopIteration):
+            next(gen)
+        assert _after(probe.journal, mark) == _RESTORE
+        assert {i: e["current"] for i, e in client.store.items()} == _FAKE_DEFAULTS
+
+    def test_a_map_without_a_default_refuses_to_start(self, probe) -> None:
+        del probe.transport.client.store["CPU Speed"]["default"]
+        gen = _fixture_body(probe.module, "speed_baseline")(probe.transport)
+        probe.generators.append(gen)
+        with pytest.raises(RuntimeError, match="no default"):
+            next(gen)
+        assert ("set_speed", 1) not in probe.journal
 
 
 # --------------------------------------------------------------------------- #
@@ -275,7 +367,7 @@ def test_an_exception_reaches_every_restore_and_the_lock_is_released_last(probe)
         inner.throw(boom)
     with pytest.raises(RuntimeError, match="killed mid-test"):
         outer.throw(boom)
-    assert _after(probe.journal, mark) == [("set_speed", 1), "close", "release"]
+    assert _after(probe.journal, mark) == [*_RESTORE, "close", "release"]
 
 
 def test_a_failing_restore_does_not_skip_close_or_release(probe) -> None:
@@ -283,13 +375,13 @@ def test_a_failing_restore_does_not_skip_close_or_release(probe) -> None:
     t = next(outer)
     inner = _fixture_body(probe.module, "speed_baseline")(t)
     next(inner)
-    probe.transport.fail_speed = True
+    probe.transport.client.fail_items = {"CPU Speed", "Turbo Control"}
     mark = len(probe.journal)
-    with pytest.raises(RuntimeError, match="set_speed failed"):
+    with pytest.raises(RuntimeError, match="PUT CPU Speed failed"):
         next(inner)
     with pytest.raises(StopIteration):
         next(outer)
-    assert _after(probe.journal, mark) == [("set_speed", 1), "close", "release"]
+    assert _after(probe.journal, mark) == [*_RESTORE, "close", "release"]
 
 
 # --------------------------------------------------------------------------- #
@@ -345,7 +437,7 @@ def test_every_cpu_speed_test_requests_the_speed_fixture() -> None:
     assert seen >= 9, f"only {seen} speed-writing tests found; the scan is broken"
     assert not offenders, (
         "these tests write CPU speed without requesting speed_baseline, so "
-        "they get neither entry reconciliation nor the 1 MHz restore: "
+        "they get neither entry reconciliation nor the exit restore: "
         + ", ".join(offenders)
     )
 
