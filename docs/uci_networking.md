@@ -93,14 +93,21 @@ crash the device firmware. The mechanism, the budget and the hygiene pass
 are in [`docs/u64_recovery.md`](u64_recovery.md); what matters here is the
 shape:
 
+- **Since [#252](https://github.com/JC-000/c64-test-harness/issues/252)
+  the costs in this list apply only where `transport.write_memory` does not
+  chunk.** That means a post-safe device, where every POST is collected, or
+  a transport other than `Ultimate64Transport`. On a leak-prone or unknown
+  grade `Ultimate64Transport.write_memory` chunks every write below at the
+  client threshold, so none of them costs an attachment. The costs are
+  kept as the record of the pre-#252 behaviour and of the blob sizes.
 - `_execute_uci_routine` writes its routine with a single
-  `transport.write_memory(code_addr, code)` (`uci_network.py:1735`). It does
-  **not** chunk. Measured host-side by `len()` (no device traffic,
-  2026-09-10), every command builder emits more than the C64U's 128-byte PUT
-  threshold — `build_uci_command` 133, `build_get_ip` 138,
+  `transport.write_memory(code_addr, code)` (`uci_network.py:1780`). Before
+  #252 that did **not** chunk. Measured host-side by `len()` (no device
+  traffic, 2026-09-10), every command builder emits more than the C64U's
+  128-byte PUT threshold — `build_uci_command` 133, `build_get_ip` 138,
   `build_socket_read` 149, `build_tcp_connect` / `build_udp_connect` 159,
-  `build_socket_write` 170 — so the routine write takes the POST path and
-  leaks one attachment. Only `build_uci_probe` / `build_uci_status_peek`
+  `build_socket_write` 170 — so the routine write took the POST path and
+  leaked one attachment. Only `build_uci_probe` / `build_uci_status_peek`
   (12 bytes) and `build_socket_close` (112) fit under it — those three
   calls cost nothing. `turbo_safe=True` changes that unevenly: it pushes
   `build_socket_close` to 341, over the threshold and onto POST, while

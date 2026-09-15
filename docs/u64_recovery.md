@@ -175,11 +175,16 @@ and a 47,103-byte
 single-call write on the U64E (fw `v3.15-78-g71480a9d`, n=2, under the
 `DeviceLock`) came back with **exactly one wrong byte, at a different
 offset each time** (2715, then 3181 — both past 2048), while the same
-bytes through `write_bytes`'s 84-byte chunks were byte-exact 2/2. Not
+bytes through `write_bytes`'s chunks (84 bytes at the time) were byte-exact 2/2. Not
 truncation and not a fixed boundary; unexplained. So chunking is the
 better path for two independent reasons, not one —
 [#231](https://github.com/JC-000/c64-test-harness/issues/231). Callers that route through
-`write_bytes` (84-byte chunks) stay on the PUT path and never leak; so
+`write_bytes` stay on the PUT path and never leak, on every grade. On an
+Ultimate transport it chunks at the transport's `rest_put_chunk_size` (the
+client's `write_mem_query_threshold`, capped at 128), while VICE and other
+transports keep 84. On a post-safe device the cost is more, smaller
+requests, accepted by owner decision 2026-09-15
+([#252](https://github.com/JC-000/c64-test-harness/issues/252)). So
 does the SocketDMA fast path — but **SocketDMA writes are disabled
 pending a stability review**, so it is not a route off the POST path that
 anyone may take today. `socket_dma` defaults to `False`
@@ -203,41 +208,56 @@ the data lives separately at `data_addr`), `build_rx_echo_reply_code` 193,
 (112) fit under the ceiling — but `turbo_safe=True` roughly triples every
 one of these, which pushes even `build_socket_close` to 341.
 
-So a UCI socket write (`uci_network.py:1936-1943`) costs **one**
-attachment for its always-POST 170-byte routine code, plus a **second
-only when the payload itself exceeds the ceiling** — the 800/892-byte
-large-send tests do, a small write stays on PUT. Its `socket_id` (1 byte)
-and `data_len` (2 bytes) writes are PUTs and cost nothing, and
+Before [#252](https://github.com/JC-000/c64-test-harness/issues/252), a UCI
+socket write (`uci_network.py:1936-1943`) cost **one** attachment for its
+always-POST 170-byte routine code, plus a **second only when the payload
+itself exceeded the ceiling**. The 800/892-byte large-send tests did; a
+small write stayed on PUT. Since #252 every one of those writes goes
+through `Ultimate64Transport.write_memory`, which on a leak-prone or unknown
+grade chunks each of them into PUTs, so a UCI socket write through the
+transport costs **nothing**. On a post-safe device the over-threshold
+writes are single POSTs, and that firmware collects them. The table above
+still gives the blob sizes. Its `socket_id` (1 byte) and `data_len` (2
+bytes) writes are PUTs on every grade and cost nothing, and
 `enable_uci` / `disable_uci` are `set_config_items` — bodyless, zero
 attachments. Each RR-Net ping/responder load costs one. The budget counts
 *attachments* rather than logical operations, which is the right unit
 precisely because nobody has to maintain that table: every one of those
 distinctions falls out of the same choke point.
 
-**Where the protocol is driven decides the exposure.** UCI driven from
-host Python costs an attachment per `_execute_uci_routine` code write
-*when the emitted routine exceeds the threshold* — which the builders
-mostly do (133-170 B), though probe, peek and `socket_close` do not — so an
-operation made of many `socket_read`s is many attachments; the same
-protocol driven C64-side from inside an uploaded PRG costs only the one
-upload. That is leak *elimination*, not hygiene, and it is the first
+**Where the protocol is driven decided the exposure before #252.** UCI
+driven from host Python cost an attachment per `_execute_uci_routine` code
+write *when the emitted routine exceeded the threshold*. The builders mostly
+do (133-170 B), though probe, peek and `socket_close` do not, so an
+operation made of many `socket_read`s was many attachments. Since #252,
+through `Ultimate64Transport` on a leak-prone or unknown grade, those code
+writes are chunked PUTs and cost nothing. What remains is a round trip per
+chunk, and no chunked write is atomic. The same protocol driven C64-side
+from inside an uploaded PRG still costs only the one upload and none of
+the round trips, and it is the only route that avoids a leak for a caller
+that bypasses the transport. That is leak *elimination*, not hygiene, and it is the first
 thing to reach for — the GC is what covers the traffic you cannot move.
 
-These arrive via `execute.load_code()`, which is a bare alias for
-`transport.write_memory` and does **not** chunk despite the name
-(`execute.py:104-110`); `_execute_uci_routine` writes directly the same way
-(`uci_network.py:1735`). That is the third independent confirmation that
-hooking the *request* is the only workable choke point: a budget keyed on
-runner verb names sees none of this traffic.
+These arrive via `execute.load_code()`, a bare alias for
+`transport.write_memory` (`execute.py:104-110`), and via
+`_execute_uci_routine`, which writes its routine with
+`transport.write_memory` too (`uci_network.py:1780`). Before #252 neither
+chunked. That was the third independent confirmation that hooking the
+*request* is the only workable choke point: a budget keyed on runner verb
+names sees none of this traffic.
 
-Making `load_code` chunk through the same 84-byte PUT path `write_bytes`
-uses would eliminate this class of leak rather than clean up after it,
-which is strictly better where it is available — but it is a separate
-change, not a docs note: it converts one POST into up to nine round trips
-for a 754-byte blob, on paths with live timing constraints (the ip65
-"≥ 0.2 s after `ip65_init`" rule, the SocketDMA barrier). It needs its own
-red/green and its own live verification. Filed as
-[#252](https://github.com/JC-000/c64-test-harness/issues/252).
+Since [#252](https://github.com/JC-000/c64-test-harness/issues/252),
+`Ultimate64Transport.write_memory` chunks at the client's threshold on
+any device not graded `writemem_post_safe`. On a leak-prone or unknown
+grade, both routes above therefore send ≤128-byte PUTs and leave nothing
+in `/Temp`, which eliminates this class of leak rather than cleaning up
+after it. On a post-safe device they remain one POST, which that firmware
+collects. The cost is paid on the leak-prone grade: a 754-byte blob
+becomes six round trips instead of one, and the 6510 runs between them.
+That touches paths with live timing constraints (the ip65 "≥ 0.2 s after
+`ip65_init`" rule, the SocketDMA barrier) and is **not live-verified** on
+a C64U. A direct `client.write_mem` call is not covered and still POSTs
+above the threshold.
 
 **Cadence.** A per-client budget of
 `ultimate64_temp_gc.DEFAULT_LEAK_BUDGET` = **6** attachment-creating

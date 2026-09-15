@@ -495,7 +495,7 @@ finally:
     transport.close()
 ```
 
-**Large single-call `write_memory()` on hardware is not byte-verified.** `Ultimate64Client.write_mem`'s POST form declares no upper bound and is verified only to 2048 bytes (`backends/ultimate64_client.py:1371`); a 47 kB body written in one call came back with exactly one wrong byte at a different offset each time, while the same bytes through `write_bytes()` (84-byte chunks) were byte-exact (issue #231, U64E fw `v3.15-78-g71480a9d`, n=2 — sporadic, so absence in a given run proves nothing). Verify large writes, or chunk them.
+**Large single-call `write_memory()` on hardware is not byte-verified.** `Ultimate64Client.write_mem`'s POST form declares no upper bound and is verified only to 2048 bytes (`backends/ultimate64_client.py:1371`); a 47 kB body written in one call came back with exactly one wrong byte at a different offset each time, while the same bytes through `write_bytes()` (84-byte chunks at the time; it now chunks at the transport's threshold, #252) were byte-exact (issue #231, U64E fw `v3.15-78-g71480a9d`, n=2 — sporadic, so absence in a given run proves nothing). Verify large writes, or chunk them.
 
 Multiple devices can be pooled with `Ultimate64InstanceManager` — the same pattern as `ViceInstanceManager`, compatible with `run_parallel()`:
 
@@ -627,7 +627,7 @@ See `examples/ultimate64_hello.py` for a full BASIC round-trip demo and `scripts
 
 ### SocketDMA write fast path
 
-> **Do not enable SocketDMA writes.** The write fast path is disabled pending a stability review; prefer `write_bytes` / `run_prg_via_sys` for bulk data (they chunk at a fixed 84 bytes, `memory.py:16`). Note what that fixed 84 does and does not buy you: it is under the 128-byte threshold of leak-prone firmware, so those chunks take the non-leaking `PUT ...?data=` path there — but it is *over* the 48-byte threshold of fixed firmware, where they take POST instead. That is harmless only because threshold-48 and carries-#686 are the same condition today, so those POSTs land on firmware that collects them. The description below documents the mechanism for when it is re-enabled.
+> **Do not enable SocketDMA writes.** The write fast path is disabled pending a stability review; prefer `write_bytes` / `run_prg_via_sys` for bulk data. On an Ultimate transport they chunk at the transport's `rest_put_chunk_size` — the client's `write_mem_query_threshold`, capped at 128 — so every chunk takes the non-leaking `PUT ...?data=` path on **every** firmware grade, leak-prone, unknown and post-safe alike; VICE and other transports keep the fixed 84 bytes (`memory.py`, the text-monitor limit). On a post-safe device that means more, smaller requests (48-byte PUTs where it used to send 84-byte POSTs, roughly 1.75x as many), a cost accepted by owner decision 2026-09-15 (#252). The description below documents the mechanism for when it is re-enabled.
 
 The Ultimate firmware serves a binary "SocketDMA" channel on TCP port 64 (on the C64 Ultimate it ships disabled — enable **Network Settings → "Ultimate DMA Service"** — and a refused connect simply falls back to REST). `Ultimate64Transport` can route bulk `write_memory` calls through it:
 

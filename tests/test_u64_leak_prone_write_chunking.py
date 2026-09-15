@@ -223,11 +223,19 @@ def test_policy_check_called_once_with_full_length() -> None:
     "threshold,info,expected",
     [
         (128, LEAK_PRONE, [128, 128, 44]),
+        (128, "unprobed", [128, 128, 44]),  # unknown grade: explicit threshold
+        (128, None, [128, 128, 44]),  # unknown grade: probe failed
         (48, POST_SAFE, [48] * 6 + [12]),
     ],
+    ids=["leak-prone", "unknown-unprobed", "unknown-probe-failed", "post-safe"],
 )
 def test_write_bytes_never_posts_on_any_grade(threshold, info, expected) -> None:
-    """#247's hazard: at a fixed 84 a 48-threshold device took POST chunks."""
+    """#247's hazard: at a fixed 84 a 48-threshold device took POST chunks.
+
+    Owner ruling on #252 (2026-09-15): ``write_bytes`` derives its chunk from
+    the transport's ``rest_put_chunk_size``, so every chunk is a PUT on every
+    grade, accepting more, smaller requests on a post-safe device.
+    """
     client, wire = _client(threshold, info)
     data = _payload(300)
     write_bytes(_transport(client), 0x7000, data)

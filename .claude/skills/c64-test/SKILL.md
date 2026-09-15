@@ -67,27 +67,33 @@ When you write a test that can point at the C64U:
   only ever reasoned from the code path rather than measured, and it is
   not an option today, which leaves no fast bulk-write path on a C64U at
   all. The non-leaking bulk route is `write_bytes` /
-  `run_prg_via_sys`, whose 84-byte chunks stay on the PUT path **on a
-  C64U** (84 is under its 128 ceiling; on threshold-48 firmware they take
-  POST, harmless only because that firmware self-collects) — but that is
-  ~196 round trips for 16 KiB and is **untimed** anywhere in this repo
+  `run_prg_via_sys`. On an Ultimate transport these chunk at the
+  transport's `rest_put_chunk_size` (the client threshold, capped at 128),
+  so they stay on the PUT path on **every** grade (#252; on a post-safe
+  device that means more, smaller requests, accepted by owner decision
+  2026-09-15). But on a C64U that is ~128 round trips for 16 KiB, and it
+  is **untimed** anywhere in this repo
   (issue #267), so budget for it being slow. REST POST is the leaking path — a bulk write that falls back to
   REST is the one to watch.
 - **Do not assume an API chunks because its name suggests it.**
-  `execute.load_code()` is a bare alias for `transport.write_memory` and
-  `_execute_uci_routine` writes its routine directly; neither chunks, and most
-  assembled blobs are over 128 bytes (UCI builders 133-170, tripled by
-  `turbo_safe=True`; RR-Net builders 193-754). A UCI socket write
-  therefore costs one attachment for its routine code, plus a second
-  **only if the payload itself exceeds 128** — two for the 800/892-byte
-  large-send tests, one for a small write. `enable_uci`/`disable_uci`
+  `execute.load_code()` is a bare alias for `transport.write_memory`, and
+  `_execute_uci_routine` writes its routine through `transport.write_memory`
+  as well (`uci_network.py:1780`). Most assembled blobs are over 128 bytes
+  (UCI builders 133-170, tripled by `turbo_safe=True`; RR-Net builders
+  193-754). Since #252, `transport.write_memory` chunks at the client
+  threshold on any grade that is not post-safe. On a C64U a UCI socket
+  write through the transport is therefore all PUTs and costs **no**
+  attachment for its routine code or its payload; on a post-safe device
+  each over-threshold write is one collected POST. Before #252 it cost one
+  attachment for the routine, plus a second when the payload exceeded 128.
+  A direct `client.write_mem` call still does not chunk. `enable_uci`/`disable_uci`
   cost nothing (bodyless config PUTs). Note too that UCI driven from
   host Python costs a POST per operation, while the same protocol driven
   C64-side inside an uploaded PRG costs only the upload — so moving a
   many-operation loop onto the 6510 eliminates the leak. The
-  thing that does chunk is `memory.write_bytes` at 84 B, which is why
-  `run_prg_via_sys` costs nothing on a C64U and bare `client.run_prg()`
-  costs one per call.
+  `memory.write_bytes` chunks at the transport's `rest_put_chunk_size` on
+  every grade (#252), which is why `run_prg_via_sys` costs nothing on a
+  C64U, while bare `client.run_prg()` costs one per call.
 - **Never loop an upload.** A parametrised test or retry loop that
   re-uploads a PRG is the exact re-upload shape that wedged the device.
 - **Hold the `DeviceLock` across the whole run**, hygiene included, and
@@ -193,7 +199,7 @@ and why validation here is local-only, is `docs/development.md`
 
 26. **`watch_progress(transport, addresses=...)` is now backend-agnostic.** PR #123 (9e6dd29) lifted it from `Ultimate64Client.read_mem` to the `C64Transport.read_memory` protocol — re-exported as `from c64_test_harness import watch_progress, ProgressEvent`. Use it instead of hand-rolled `time.monotonic()` polling loops when watching a sentinel or progress counter; the generator emits `Advanced` / `Stalled` / `Finished` / `Timeout` / `PollError` events (default `poll_interval` is 10 s — set it) with elapsed timing and changed-region diffs. The legacy `from c64_test_harness.backends.ultimate64_helpers import watch_progress` path is preserved as a backwards-compat shim — new code should use the top-level import.
 
-27. **Two Ultimate hardware generations exist — detect via `client.get_info()["product"]`, never assume.** `"Ultimate 64 Elite"` (fw 3.14/3.15) vs `"C64 Ultimate"` (fw 1.1.0). Live-verified asymmetries: CPU-speed enum (Elite has `" 5"` not `"64"`, C64U the reverse; foreign speeds raise `ValueError` locally via a cached preset probe, with the firmware's HTTP 400 as backstop when the probe is inconclusive), Cartridge presets (only U64E 3.14 had a `"REU"` preset; U64E 3.15 made `Cartridge` a `.crt` chooser and the C64U has no `"REU"` preset either — `set_reu`/`restore_state` probe and adapt; don't hand-write that config item), and the C64U's REST `POST writemem` degrading to ~6 s/request at ≥16 KiB. For bulk writes use `write_bytes` / `run_prg_via_sys` (84-byte chunks, PUT path on a C64U) — **do not enable the SocketDMA write fast path (`transport.socket_dma`); it is disabled pending a stability review**. See PATTERNS § "Pattern 10 / Two device generations" and § "SocketDMA write fast path".
+27. **Two Ultimate hardware generations exist — detect via `client.get_info()["product"]`, never assume.** `"Ultimate 64 Elite"` (fw 3.14/3.15) vs `"C64 Ultimate"` (fw 1.1.0). Live-verified asymmetries: CPU-speed enum (Elite has `" 5"` not `"64"`, C64U the reverse; foreign speeds raise `ValueError` locally via a cached preset probe, with the firmware's HTTP 400 as backstop when the probe is inconclusive), Cartridge presets (only U64E 3.14 had a `"REU"` preset; U64E 3.15 made `Cartridge` a `.crt` chooser and the C64U has no `"REU"` preset either — `set_reu`/`restore_state` probe and adapt; don't hand-write that config item), and the C64U's REST `POST writemem` degrading to ~6 s/request at ≥16 KiB. For bulk writes use `write_bytes` / `run_prg_via_sys` (chunked at the client threshold, capped at 128, so a PUT on every grade; #252) — **do not enable the SocketDMA write fast path (`transport.socket_dma`); it is disabled pending a stability review**. See PATTERNS § "Pattern 10 / Two device generations" and § "SocketDMA write fast path".
 
 ## Test File Template
 
