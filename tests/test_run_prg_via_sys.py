@@ -534,3 +534,79 @@ def test_config_failure_warning_names_the_remedy(monkeypatch, caplog):
         run_prg_via_sys(t, CC65_PRG)
     msg = "\n".join(r.getMessage() for r in caplog.records)
     assert "'Cartridge Preference', 'External'" in msg
+
+
+# --- a flag is not an entry point (#390) ------------------------------------
+# ``sys_addr=True`` used to reach the keyboard as ``SYSTrue`` -- a BASIC
+# syntax error that surfaced as a confusing timeout, after the PRG body had
+# already been written and the cartridge re-selected.  The refusal comes
+# first: no config call, no reset, no RAM write, no keystroke.
+
+try:  # numpy is not a harness dependency; its bool is tested when present.
+    import numpy as _np
+except ImportError:  # pragma: no cover
+    _np = None
+
+_SYS_FLAGS = [True, False] + ([_np.True_, _np.False_] if _np is not None else [])
+_SYS_FLAG_IDS = [f"{type(f).__module__}.{f!r}" for f in _SYS_FLAGS]
+
+_RECORDED = ("reset", "read_memory", "write_memory", "read_screen_codes", "inject_keys", "resume")
+
+
+class _RecordingU64Transport(_U64LikeTransport):
+    """Every transport and config call the helper can make, in one journal."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.journal: list[str] = []
+        for name in _RECORDED:
+            real = getattr(self, name, None)
+            if real is None:  # MockTransport has no resume(); _resume_quietly skips it
+                continue
+            setattr(self, name, self._recorded(name, real))
+        client = self.client
+        for name in ("get_config_category", "set_config_item"):
+            setattr(client, name, self._recorded(f"client.{name}", getattr(client, name)))
+
+    def _recorded(self, name, real):
+        def call(*a, **k):
+            self.journal.append(name)
+            return real(*a, **k)
+        return call
+
+
+def _recording_transport(monkeypatch) -> _RecordingU64Transport:
+    t = _RecordingU64Transport(screen_codes=_ready_screen(), client=_CartridgeClient())
+    monkeypatch.setattr(_execute, "_is_u64_target", lambda target: True)
+    monkeypatch.setattr(_execute, "_U64_POST_READY_SETTLE", 0.0)
+    return t
+
+
+@pytest.mark.parametrize("flag", _SYS_FLAGS, ids=_SYS_FLAG_IDS)
+def test_a_flag_sys_addr_is_refused_before_any_io(monkeypatch, flag):
+    t = _recording_transport(monkeypatch)
+    with pytest.raises(ValueError, match=r"^run_prg_via_sys sys_addr must be an int, not bool"):
+        run_prg_via_sys(t, CC65_PRG, sys_addr=flag)
+    assert t.journal == []
+    assert t.injected_keys == []
+    assert t.client.puts == []
+
+
+def test_an_int_sys_addr_still_runs_control(monkeypatch):
+    """Control: the same fake records the whole load path for a real int,
+    so the empty journal above is the refusal, not a fake that sees nothing."""
+    t = _recording_transport(monkeypatch)
+    assert run_prg_via_sys(t, CC65_PRG, sys_addr=1) == 1
+    assert "client.set_config_item" in t.journal
+    assert "reset" in t.journal and "write_memory" in t.journal and "inject_keys" in t.journal
+    assert _typed(t).upper().endswith("SYS1\r")
+
+
+def test_sys_addr_none_still_parses_the_stub_control(monkeypatch):
+    t = _recording_transport(monkeypatch)
+    assert run_prg_via_sys(t, CC65_PRG, sys_addr=None) == 2061
+    assert _typed(t).upper().endswith("SYS2061\r")
+
+
+def _typed(t) -> str:
+    return "".join(chr(c) for batch in t.injected_keys for c in batch)
