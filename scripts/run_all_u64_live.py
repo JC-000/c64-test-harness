@@ -10,6 +10,16 @@ This script therefore never invents a host. If you name one on the command
 line it is exported for the test modules; if you already set ``U64_HOST`` it
 is used verbatim and left alone; if neither, the run is refused.
 
+**Locking is per test, not per run.** This script takes no ``DeviceLock``;
+``tests/conftest.py``'s autouse ``device_lock_guard`` locks each live test and
+releases it between tests, so another lane can take the device between two
+tests of this run.  That is deliberate (#324).  ``close()`` still drains a
+leaking client whatever the lock state, but the lock-release ``/Temp`` drain --
+the only one that catches a client a test never closes -- fires only on the
+outermost release, and its callbacks are held weakly.  A hold here would defer
+that drain on a leak-prone device to the end of the run, and a client collected
+before then would never drain.  See ``docs/device_locking.md`` rule 1.
+
 See CLAUDE.md § "Standing hardware-safety clause" before pointing this at the
 C64 Ultimate.
 """

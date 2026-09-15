@@ -480,6 +480,15 @@ is never the refused request. The module-level
 `ultimate64_probe.liveness_probe(host, ...)` has no client and no
 accounting; on a leak-prone device call it through the client.
 
+**A refused restore does not make the probe unhealthy** (owner decision on
+#328, 2026-09-15). `healthy` is decided by the probe write and its
+read-back. If the restore POST then answers non-2xx or raises, the result
+is `healthy=True, failure=None, scratch_restored=False`, with a WARNING
+naming `$0334-$03B3`, and `assert_healthy()` passes. That is the same
+404 that yields `failure="writemem_404"` when it lands on the first POST,
+so read `scratch_restored` whenever the span, or that signal, matters.
+No retry POST is added either way (#107).
+
 ### Tier 2 — Runner subsystem
 
 Canonical evidence:

@@ -93,7 +93,14 @@ When you write a test that can point at the C64U:
 - **Never loop an upload.** A parametrised test or retry loop that
   re-uploads a PRG is the exact re-upload shape that wedged the device.
 - **Hold the `DeviceLock` across the whole run**, hygiene included, and
-  drain on the way out.
+  drain on the way out. That applies to scripts and hand-driven sessions.
+  **Pytest runs are the exception:** conftest locks per live test, so a
+  pytest run does not exclude other lanes between tests. That is
+  deliberate. An outer hold would defer the lock-release `/Temp` drain,
+  the only one that catches a client a test never closes, to the end of
+  the run, and a client collected before then would never drain;
+  `close()` still drains a leaking client (#324; `docs/device_locking.md`
+  rule 1).
 - **A `TempGCResult` with `.error` set is a failed hygiene pass, not a
   benign skip.** FTP File Service is off by default on 1.1.0, so the GC
   silently no-ops there unless enabled. Do not keep uploading after one.

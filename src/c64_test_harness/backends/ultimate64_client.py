@@ -1350,6 +1350,10 @@ class Ultimate64Client:
             strictly (issue #272).  The device is healthy; the request
             was not.
         :returns: the :class:`LivenessResult` on success (healthy device).
+            **Success includes a refused restore** (issue #328): the probe
+            write round-tripped, so this returns rather than raising, with
+            ``scratch_restored=False`` and a WARNING. Check
+            ``result.scratch_restored`` if ``$0334-$03B3`` matters to you.
         """
         result = self.liveness_probe(http_timeout=http_timeout)
         if result.healthy:
