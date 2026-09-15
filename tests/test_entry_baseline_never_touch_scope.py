@@ -41,6 +41,11 @@ written is *not* flagged, and the same claim with the escaping part removed
   because the real corpus has "blocks nothing: it logs a WARNING that FTP File
   Service must be enabled by hand", so "Nothing in the harness is exempt: it
   enables FTP File Service" is not flagged.
+* **Split "on" followed by more words (#372):** "switches X on" and "turns X
+  on" are flagged only when "on" ends the phrase (at most six words between),
+  because "switches Network Settings based on the host" is not a write.  So
+  "Nothing in the harness switches FTP File Service on for a lane" is not
+  flagged.
 """
 
 from __future__ import annotations
@@ -134,11 +139,15 @@ _NEGATED_WRITE = re.compile(
     # Not the second half of "never-touch": the red run on master matched
     # "argument and nothing else, so a direct client call bypasses the
     # never-touch list" in the baseline module, which claims nothing of the kind.
-    # chang/alter/set added for #358 (E6); ``set`` as a whole word only.
-    r"[^.;]{0,50}?(?<!-)\b(?:writ\w*|PUT\w*|touch\w*|modif\w*|chang\w*|alter\w*|set\b)"
+    # chang/alter/set added for #358 (E6); ``set`` as a whole word only, and
+    # not the noun in "a different set of Network Settings" (#372).
+    r"[^.;]{0,50}?(?<!-)\b(?:writ\w*|PUT\w*|touch\w*|modif\w*|chang\w*|alter\w*|set\b(?!\s+of\b))"
     # ``enabl`` may not reach across a colon: the corpus has "blocks nothing:
     # it logs a WARNING that FTP File Service must be enabled by hand" (#358).
-    r"|[^.;:]{0,50}?\benabl\w*"
+    # #372: the phrasal forms "turns on X" and "switches X on", where a
+    # split "on" must end the phrase ("switches ... based on the host" is not).
+    r"|[^.;:]{0,50}?\b(?:enabl\w*|(?:turn|switch)\w*\s+on\b"
+    r"|(?:turn|switch)\w*(?:\s+[\w>-]+){1,6}?\s+on\b(?![\s-]*\w))"
     r")",
     re.IGNORECASE,
 )
@@ -286,6 +295,11 @@ class TestNoDocClaimsTheStoreIsNeverWritten:
         "Nothing in the harness alters Network Settings.",
         "No lane may set FTP File Service.",
         "The harness never enables FTP File Service.",
+        # #372: phrasal verbs for enabling.
+        "The harness never turns on FTP File Service.",
+        "Nothing in the harness switches FTP File Service on.",
+        "No lane in the harness ever turned Network Settings > FTP File Service on.",
+        "Nothing in the harness switches on FTP File Service.",
     ])
     def test_the_scan_flags(self, text: str) -> None:
         assert _unscoped_absolute_claims(text), text
@@ -316,6 +330,11 @@ class TestNoDocClaimsTheStoreIsNeverWritten:
         'Settings > FTP " "File Service on its behalf.',
         # ``set`` as a whole word only: "sets up" is not "set".
         "No lane in the harness sets up Network Settings for a test.",
+        # #372: ``set`` as a noun is not a write.
+        "No lane in the harness uses a different set of Network Settings.",
+        # #372: "on" that starts a prepositional phrase is not "switch ... on".
+        "No lane in the harness switches Network Settings based on the host.",
+        "Nothing in the harness turns FTP File Service logs on disk into config.",
     ])
     def test_the_scan_leaves_scoped_statements_alone(self, text: str) -> None:
         assert not _unscoped_absolute_claims(text), text
@@ -348,6 +367,10 @@ class TestTheDeclaredLimitsStayKnown:
         "enable after a colon": (
             "Nothing in the harness is exempt: it enables FTP File Service.",
             "Nothing in the harness enables FTP File Service.",
+        ),
+        "split on followed by more words": (
+            "Nothing in the harness switches FTP File Service on for a lane.",
+            "Nothing in the harness switches FTP File Service on.",
         ),
     }
 

@@ -556,8 +556,13 @@ class TestTheItemCountCarriesItsScope:
     #: ``cbm`` is the harness's generation name and :func:`_flat` strips the
     #: backticks around it, so the case-sensitive tuple this replaced let
     #: "the cbm generation", "C64 ultimate" and "C64-Ultimate" through.
+    #: #372: also ``u64ii`` (the C64U firmware target), "C-64 Ultimate",
+    #: "Commodore-64 Ultimate" and "Commodore 64U"; and a trailing boundary,
+    #: without which "the C64 ultimately reads" was flagged.
     _OTHER_DEVICE = re.compile(
-        r"\bcbm\b|c64[\s-]?ultimate|commodore 64 ultimate|\bc64u\b", re.IGNORECASE
+        r"\bcbm\b|\bc-?64[\s-]?ultimate\b|\bcommodore[\s-]?64[\s-]?(?:ultimate\b|u\b)"
+        r"|\bc64u\b|\bu64ii\b",
+        re.IGNORECASE,
     )
 
     #: The historical figure prose may still quote, bound to the one date it
@@ -1296,6 +1301,11 @@ _OTHER_DEVICE_VARIANTS = {
     "c64u": "the c64u",
     "C64U": "the C64U",
     "Commodore 64 ultimate": "the Commodore 64 ultimate",
+    # #372: the firmware target PATTERNS.md cites, and three more spellings.
+    "u64ii": "the u64ii build",
+    "C-64 Ultimate": "the C-64 Ultimate",
+    "Commodore-64 Ultimate": "the Commodore-64 Ultimate",
+    "Commodore 64U": "the Commodore 64U",
 }
 
 #: The base sentence each variant is planted into.  It must pass alone, so
@@ -1356,6 +1366,8 @@ def test_the_count_scan_flags_every_spelling_of_the_other_device(variant: str) -
     f"{_OTHER_DEVICE_BASE}, logged with opencbm.",
     # The U64E's own product name contains "Ultimate".
     f"{_OTHER_DEVICE_BASE} on the Ultimate 64 Elite.",
+    # #372: no trailing boundary flagged "C64 ultimately".
+    f"{_OTHER_DEVICE_BASE}; the C64 ultimately reads the same.",
 ])
 def test_the_count_scan_leaves_near_misses_alone(sentence: str) -> None:
     assert TestTheItemCountCarriesItsScope._unscoped(sentence) == []
