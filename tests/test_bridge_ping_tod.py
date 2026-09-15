@@ -14,8 +14,9 @@ Two test classes:
   timeouts expire ~31x too fast.  This is documentation in the form
   of a test.
 
-Ultimate 64 live tests live in ``TestTodPrimitiveU64Live`` (gated on
-``U64_HOST`` env var).  These validate that CIA1 TOD runs at wall-
+Ultimate 64 live tests live in ``TestTodPrimitiveU64Live`` (gated on the
+``U64_HOST`` and ``U64_ALLOW_MUTATE`` env vars -- it changes CPU speed and
+restores the speed defaults, #333/#367).  These validate that CIA1 TOD runs at wall-
 clock rate on real hardware across several turbo speeds using the
 ``build_tod_start_code`` / ``build_tod_read_tenths_code`` primitives.
 """
@@ -238,13 +239,23 @@ class TestBridgeIcmpRoundTripTodViceWarp:
 
 
 # ---------------------------------------------------------------------------
-# Ultimate 64 live primitive test (gated on U64_HOST)
+# Ultimate 64 live primitive test (gated on U64_HOST and U64_ALLOW_MUTATE)
 # ---------------------------------------------------------------------------
 
 _U64_HOST = os.environ.get("U64_HOST")
+#: The TOD test sweeps CPU speed and its fixture restores the speed defaults:
+#: config PUTs on the shared device, so it needs U64_ALLOW_MUTATE (#333, #367).
+_ALLOW_MUTATE = os.environ.get("U64_ALLOW_MUTATE")
 
 
 @pytest.mark.skipif(not _U64_HOST, reason="U64_HOST not set")
+@pytest.mark.skipif(
+    not _ALLOW_MUTATE,
+    reason=(
+        "U64_ALLOW_MUTATE not set -- this class changes CPU speed on the device "
+        "(restored to the device defaults on teardown)"
+    ),
+)
 class TestTodPrimitiveU64Live:
     """Validate CIA1 TOD ticks at wall-clock rate on real U64 hardware.
 
