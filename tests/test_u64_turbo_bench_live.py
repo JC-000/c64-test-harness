@@ -13,8 +13,8 @@ turbo speeds x three vectors = **12 full-PRG ``run_prg`` uploads per
 session**, each preceded by a ``reboot()`` — which does not collect ``/Temp``
 attachments, because ``/Temp`` is a firmware RAM disk that only a power-on
 clears. On firmware without upstream #686 (the C64 Ultimate on 1.1.0) that is
-12 attachments against a budget the standing hardware-safety clause in
-CLAUDE.md says to treat as a handful. Point this at the U64E, or at nothing.
+12 attachments against a device on which no safe number of uploads is known.
+Point this at the U64E, or at nothing.
 """
 
 from __future__ import annotations

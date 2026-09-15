@@ -26,23 +26,19 @@ Enough accumulation **crashes the device firmware**: REST and the UCI
 bridge go down together and **only a physical power-cycle recovers it**.
 The C64 FPGA keeps running, so the machine looks alive while the firmware
 is dead — it stops answering the network *and* stops responding to the
-physical menu button. `/Temp` does **not** fill: the RAM disk is
+physical menu button. Accumulated attachments fill `/Temp`, and a full
+`/Temp` crashes the firmware (owner, 2026-09-15). The RAM disk is
 16 MiB (`ramdisk.cc` sizes it from `__ram_disk_start`/`__ram_disk_limit`
 in `target/u64{,ii}/riscv/ultimate/linker.x` at tag `1.1.0`; its "3 MB"
-comment is stale — issue #261), so at the one wedge on record it was
-~5.8% used. The trigger threshold and the crash
-cause are both unestablished. The 2026-08/09 outage cost about two weeks of
+comment is stale — issue #261), and nobody knows how many uploads fill it
+before the crash. The 2026-08/09 outage cost about two weeks of
 a shared device and **was** this failure — owner-confirmed 2026-09-11 that
 REST was down throughout, which rules out a UCI STATE-bit wedge. Its
-duration is still not a capacity measurement. The one datapoint in circulation — "~15 cycles
-of a 63 KB PRG" (`ultimate64_temp_gc.py` docstring) — was taken on the
-**U64E while it ran 3.14d**, n unrecorded, and is simply where one
-reproduction stopped. It is **not** a capacity, and the old
-count-versus-bytes question is retired: both readings asked about
-`/Temp`'s capacity, and capacity is not what fails. Budget conservatively
-as though the limit were a file count — that is a choice about which
-error to make, not a model — and do not cite 15 as a measured budget for
-anything.
+duration is not a count of uploads either. The earlier guessed wedge
+count (one U64E on 3.14d, n unrecorded) is retired (owner, 2026-09-15):
+no count of uploads before the crash is kept. Budget conservatively as
+though the limit were a file count — that is a choice about which error
+to make, not a measured limit.
 
 When you write a test that can point at the C64U:
 

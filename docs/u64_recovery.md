@@ -29,19 +29,19 @@ rather than from observed behaviour. (Two limits on what this citation
 buys: it covers the `machine:*` family only — the `runners:*` routes and
 the multipart `mount_disk`/`drives:load_rom` bodies are registered
 elsewhere and are not evidenced by it — and it establishes that
-attachments are *created*, not that accumulation crashes the firmware,
-which remains unestablished as stated below.) and without
+attachments are *created*, not that accumulation crashes the firmware;
+that is the owner's settled account (2026-09-15), not this citation's.) and without
 garbage collection the accumulation produces the latency drift and
 eventual wedge described in every tier below.
 
 Two cautions about how far that goes, both expanded under "The hygiene
-pass is prevention, not recovery" below. The accumulation does not fill
-`/Temp` — the wedge arrives at under 6% of a **16 MiB** RAM disk — it
-**crashes the device firmware**: the C64 FPGA keeps running while the firmware
-stops answering the network and stops responding to the physical menu
-button. And "root cause" overstates it: upstream #686 removes the
-accumulation and thereby the wedge, but the mechanism connecting the two
-is not established, and this document names no cause.
+pass is prevention, not recovery" below. The accumulation fills `/Temp`,
+and a full `/Temp` **crashes the device firmware** (owner, 2026-09-15): the
+C64 FPGA keeps running while the firmware stops answering the network and
+stops responding to the physical menu button. And nobody knows how many
+uploads that takes: no count of uploads before the crash is kept here, and
+why a full `/Temp` crashes the firmware, rather than failing writes, is not
+established.
 
 The fix is upstream in
 [GideonZ/1541ultimate#686 "Add automatic cleanup of Temp folder"](https://github.com/GideonZ/1541ultimate/pull/686)
@@ -264,29 +264,23 @@ above the threshold.
 calls, then the pass runs before the call that would overrun it, and a
 successful pass resets the count.
 
-Why 6. One measurement and one upstream precedent bound it from above —
-not two enforced limits. The precedent is the firm one: the firmware's
+Why 6. Upstream is the only firm bound: the firmware's
 own post-#686 collector keeps at most **10** managed files
 (`kManagedTempMaxFiles`), upstream's own statement of a safe resident
-count for this folder on this device family, needing no conditions. The
-measurement is far weaker than it is usually quoted as being: one U64E on
-3.14d wedged at ~15 uploads of a 63 KB PRG, n unrecorded, for reasons
-never established — and it is not a capacity measurement at all. The RAM
-disk is **16 MiB**: `ramdisk.cc:25` computes its size as
+count for this folder on this device family, needing no conditions.
+Nothing bounds it from the other side. How many uploads an unpatched
+device survives before `/Temp` fills and the firmware crashes has never
+been measured, and the earlier guessed wedge count (one U64E on 3.14d,
+n unrecorded) is retired (owner, 2026-09-15): do not size against it.
+The RAM disk is **16 MiB**: `ramdisk.cc:25` computes its size as
 `__ram_disk_limit - __ram_disk_start`, and at tag `1.1.0` both
 `target/u64/riscv/ultimate/linker.x` and
 `target/u64ii/riscv/ultimate/linker.x` set those symbols to `0x02000000`
 and `0x03000000` — a 16 MiB span. (The `// 3 * 1024 * 1024` on that same
 line is a stale trailing comment, not the value; a "~3 MB RAM disk"
 propagated through five documents on the strength of it. Corrected in
-[#261](https://github.com/JC-000/c64-test-harness/issues/261).) So 15
-uploads of a 63 KB PRG is 967,680 bytes, or **~5.8%** of the disk, with
-15 directory entries used; neither free clusters nor directory slots were
-anywhere near exhaustion, so "`/Temp` filled" does not describe that
-wedge under *either* model — and at 5.8% it describes it far less well
-than the ~31% this paragraph used to claim. The correction strengthens
-the conclusion rather than softening it. Treat 15 as "a device once wedged here", not as a limit,
-and size the budget against an **unknown mechanism**. Consumer call counts (recounted
+[#261](https://github.com/JC-000/c64-test-harness/issues/261).) That size
+is not a count of uploads. Consumer call counts (recounted
 across all six consumer lanes, 2026-09-10; reported, not verified here)
 bound it from below and show a low budget costs normal consumers nothing:
 
@@ -295,7 +289,7 @@ bound it from below and show a low budget costs normal consumers nothing:
 | Ordinary runner-verb consumers (~14 sites) | 1–2 |
 | One host-Python UCI driver | 4–8 |
 | `bench_p256_u64.py` / `bench_p384_u64.py` `ALL_SPEEDS` sweep | **17** |
-| A wireguard soak loop, one PRG per iteration | N (`--soak 15`+ wedges) |
+| A wireguard soak loop, one PRG per iteration | N (a long soak fills `/Temp`) |
 | Two multi-hundred-write lanes | lane bugs, to be chunked onto PUT |
 
 **The 17-per-run sweep is the case this budget exists for.** It would
@@ -311,19 +305,16 @@ c64-https rigs already run a lane-local GC keeping 2 — this design should
 make those redundant, and does not conflict with them (both delete
 oldest-first by the same pattern).
 
-**What actually fails is the firmware, not the folder.** On a wedged
-machine the C64 FPGA keeps running while the device firmware is dead: it
-stops answering the network *and* stops responding to the physical menu
-button on the case. So the question this section used to ask — is the
-limit a file count or a byte budget? — was a category error on both
-sides. Both asked about `/Temp`'s capacity, and capacity is not what
-fails; at **~5.8%** full with 15 directory entries (16 MiB disk —
-`ramdisk.cc:25` plus the `1.1.0` linker symbols, see above), nothing was
-remotely near exhaustion, which is why no capacity story ever fit the
-arithmetic.
+**Why the budget counts attachments.** On a wedged machine the C64 FPGA
+keeps running while the device firmware is dead: it stops answering the
+network *and* stops responding to the physical menu button on the case,
+and the owner's account (2026-09-15) is that a full `/Temp` does this. The
+RAM disk's byte size (16 MiB — `ramdisk.cc:25` plus the `1.1.0` linker
+symbols, see above) does not translate into a count of uploads for any
+workload, so the budget counts attachments conservatively instead.
 
-Accumulation crashes the firmware. The **cause is not established** and
-should not be asserted: pre-fix, `attachment_writer` created
+A full `/Temp` crashes the firmware. **Why** it crashes, rather than
+failing writes, is not established and should not be asserted: pre-fix, `attachment_writer` created
 `/Temp/temp%04x` from a static counter and never deleted the files, but
 `TempfileWriter`'s destructor *does* free both the `strdup`'d filenames
 and the buffers, so a naive per-request heap-leak story does not hold on
@@ -709,19 +700,15 @@ the firmware menu.
   older ones. The harness's own defence attacks the same driver one step
   earlier: staying at or below `write_mem_query_threshold` uses the
   bodyless `PUT ...?data=` path, which creates no attachment at all.
-* The **crash mechanism is still not established**, and #686 does not
+* **Why a full `/Temp` crashes the firmware** is not established, and #686 does not
   settle it. Read it and it documents no crash, hang or exhaustion — it is
   framed as housekeeping, and it explicitly **removed the disk-use trigger
   in favour of a file count**, because keeping the youngest 10 conflicted
   with a usage threshold. So upstream's remedy is count-shaped, but that is
   a design choice in the cleaner, not evidence about what fails.
-* The owner's operating theory is RAM-disk space exhaustion. Nothing
-  contradicts it for *this* outage, whose `/Temp` occupancy nobody
-  recorded. But the one wedge anyone measured went the other way: the
-  U64E/3.14d repro wedged with ~5.8% of a 16 MiB RAM disk used (#261).
-  Different device, firmware and event, so it does not refute exhaustion
-  here — yet at least one wedge in this family happened nowhere near full.
-  Accumulation triggers the crash; why it crashes remains open.
+* **The mechanism is settled** (owner, 2026-09-15): "When /Temp is filled then the device firmware crashes. the c64 appears to continue to run but the rest api becomes unresponsive and the local firmware menu switch no longer has an effect. This is the outcome of the writemem garbage collection issue on unpatched firmware."
+  How many uploads it takes is not known, and no count is kept here: the
+  earlier guessed wedge count is retired.
 
 The currently confirmed cases where physical power-cycle is the **only**
 documented recovery:

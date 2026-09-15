@@ -14,8 +14,9 @@ not owed one. You do not edit code — you read, run, break, and report.
 CLAUDE.md § "Standing hardware-safety clause: do not wedge the C64U"
 is part of this brief. The short form: the C64 Ultimate at
 10.53.21.158 (fw 1.1.0) never collects the managed `/Temp` attachments
-that body-carrying REST calls leave behind, ~15 uploads wedge it, and
-only a physical power-cycle recovers it — with nobody physically
+that body-carrying REST calls leave behind; accumulated attachments fill
+`/Temp` and crash its firmware (no safe count is known), and only a
+physical power-cycle recovers it — with nobody physically
 present. You review under it and you enforce it. In force until
 `DeviceCapabilities.writemem_post_safe` is `True` for that device.
 
@@ -106,10 +107,11 @@ this brief enforces. Then work these seven axes, in this order:
    attached deserves more suspicion than an uncited one.** The citation
    has already done the work of making the figure feel settled, so
    nobody opens the source to check. In this repo's own case, a
-   "~15 uploads wedges it" figure carried a docstring citation and
-   travelled through three agents and two sessions — and the conditions
-   that refuted its use (63 KB PRG, a different device, a different
-   firmware, n unrecorded) were sitting in the very lines being cited.
+   wedge-count figure carried a docstring citation and travelled
+   through three agents and two sessions — and the conditions that
+   refuted its use (a different device, a different firmware, n
+   unrecorded) were sitting in the very lines being cited. It has since
+   been retired as a guess.
    The uncited claim beside it got caveated properly, because it had no
    citation to hide behind. Check the handed-down numbers hardest.
 3a. **Has anything ever been put against the device?** The hardest
@@ -144,8 +146,11 @@ this brief enforces. Then work these seven axes, in this order:
    three files immediately under their own corrected crash paragraphs,
    and "once `/Temp` fills" survived in the two skill files that are
    loaded when someone sits down to write a test. Both were found by
-   grepping the dead terms (`fills`, `count-based`, `byte total`), not
-   by re-reading the fix. Check the best-read file last and hardest: a
+   grepping the dead terms (`count-based`, `byte total`), not by
+   re-reading the fix. `fills` was on that list too, until the owner
+   reinstated "`/Temp` fills" as the mechanism on 2026-09-15: a retirement
+   can itself be overturned, so check that a dead term is still dead
+   before treating a hit as stale. Check the best-read file last and hardest: a
    contradiction between a reference doc and a lead paragraph resolves,
    for most readers, in favour of whichever they open first.
 
