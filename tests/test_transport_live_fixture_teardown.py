@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -170,6 +171,12 @@ def probe(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
     def fake_baseline(client, **_kw):
         journal.append("baseline")
+        # What apply_factory_baseline does to the owned items: current ==
+        # default.  Without this the fake starts every run drifted, and a
+        # restore of only the items drifted at entry survives (#364 N6).
+        for entry in getattr(client, "store", {}).values():
+            if "default" in entry:
+                entry["current"] = entry["default"]
         return SimpleNamespace(summary=lambda: "fake", drifted_items=lambda: [])
 
     module.DeviceLock = lambda host, **_kw: _FakeLock(journal, host)
@@ -343,13 +350,69 @@ class TestSpeedRestoreEndsAtDefault:
         assert _after(probe.journal, mark) == _RESTORE
         assert {i: e["current"] for i, e in client.store.items()} == _FAKE_DEFAULTS
 
-    def test_a_map_without_a_default_refuses_to_start(self, probe) -> None:
-        del probe.transport.client.store["CPU Speed"]["default"]
+    @pytest.mark.parametrize("generation", ["ultimate", "cbm"])
+    def test_a_clean_entry_is_still_restored_after_a_speed_test(
+        self, probe, generation
+    ) -> None:
+        """#364 N6 -- #360's real U64E path.  The entry baseline leaves
+        ``current == default``, the speed tests then drift ``CPU Speed``; a
+        restore limited to the items drifted at entry would write nothing."""
+        client = _FakeClient(generation, probe.journal)
+        for entry in client.store.values():  # clean at entry on every path
+            entry["current"] = entry["default"]
+        probe.transport.client = client
+        gen = _fixture_body(probe.module, "speed_baseline")(probe.transport)
+        probe.generators.append(gen)
+        t = next(gen)
+        assert client.store["CPU Speed"]["current"] == _FAKE_DEFAULTS["CPU Speed"]
+        t.set_speed(8)
+        mark = len(probe.journal)
+        with pytest.raises(StopIteration):
+            next(gen)
+        assert _after(probe.journal, mark) == _RESTORE
+        assert {i: e["current"] for i, e in client.store.items()} == _FAKE_DEFAULTS
+
+    @pytest.mark.parametrize("breakage", ["missing", "empty"])
+    def test_a_map_without_a_default_refuses_to_start(self, probe, breakage) -> None:
+        entry = probe.transport.client.store["CPU Speed"]
+        if breakage == "missing":
+            del entry["default"]
+        else:
+            entry["default"] = ""  # #364 N3: "" is not a restorable default
         gen = _fixture_body(probe.module, "speed_baseline")(probe.transport)
         probe.generators.append(gen)
         with pytest.raises(RuntimeError, match="no default"):
             next(gen)
         assert ("set_speed", 1) not in probe.journal
+        assert not any(isinstance(e, tuple) and e[0] == "config" for e in probe.journal)
+
+    def test_a_drifted_entry_warns_that_exit_writes_the_default(
+        self, probe, caplog
+    ) -> None:
+        """#364 N4: a C64 Ultimate never resets at entry, so drift is only
+        visible in this WARNING -- which must say what exit will do."""
+        probe.transport.client = _FakeClient("cbm", probe.journal)
+        gen = _fixture_body(probe.module, "speed_baseline")(probe.transport)
+        probe.generators.append(gen)
+        with caplog.at_level(logging.WARNING):
+            next(gen)
+        drift = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and "drifted at entry" in r.getMessage()
+        ]
+        assert len(drift) == 2, drift
+        for item, message in zip(("CPU Speed", "Turbo Control"), drift):
+            assert f"U64 Specific Settings / {item} drifted at entry" in message
+            assert repr(_FAKE_ENTRY[item]) in message
+            assert repr(_FAKE_DEFAULTS[item]) in message
+            assert "will be written to its default at exit" in message
+
+    def test_a_clean_entry_does_not_warn(self, probe, caplog) -> None:
+        gen = _fixture_body(probe.module, "speed_baseline")(probe.transport)
+        probe.generators.append(gen)
+        with caplog.at_level(logging.WARNING):
+            next(gen)  # generation "ultimate": the fake baseline cleans the store
+        assert not [r for r in caplog.records if "drifted at entry" in r.getMessage()]
 
 
 # --------------------------------------------------------------------------- #

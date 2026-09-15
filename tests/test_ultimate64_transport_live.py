@@ -197,7 +197,8 @@ def _speed_item_defaults(client):
             )
         if entry.get("current") != default:
             _log.warning(
-                "%s / %s drifted at entry: current=%r default=%r",
+                "%s / %s drifted at entry: current=%r default=%r; it will be "
+                "written to its default at exit",
                 CAT_U64_SPECIFIC, item, entry.get("current"), default,
             )
         defaults[item] = default
