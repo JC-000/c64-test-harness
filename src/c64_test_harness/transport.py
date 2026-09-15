@@ -52,6 +52,13 @@ class C64Transport(Protocol):
         """Read ``length`` bytes starting at ``addr``.
 
         Returns a ``bytes`` object of exactly ``length`` bytes.
+
+        A ``bool`` ``addr`` (``bool`` subclasses ``int``; ``True`` is
+        ``$0001``, the 6510 processor port) MUST raise ``ValueError``
+        **first** -- before any range check, before any early return
+        (``length <= 0`` included) and before any wire use.  An early
+        ``b""`` would hide the same caller bug that ``length=1`` exposes
+        (#340, #352, #357).
         """
         ...
 
@@ -69,6 +76,10 @@ class C64Transport(Protocol):
         bypass the policy for a single call; the bypass is logged at
         WARNING level so the use stays visible.  Backends without policy
         support ignore the kwarg.
+
+        A ``bool`` ``addr`` MUST raise ``ValueError`` **first** -- before
+        the empty-data early return, the span check, the memory policy
+        and any wire use (#340, #352, #357).
         """
         ...
 

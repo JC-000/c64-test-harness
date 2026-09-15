@@ -348,7 +348,11 @@ pattern match. `apply_factory_baseline()` resets per category over
 `ValueError` before a single request goes out, asserts per item that the reset
 took (`U64BaselineError` if it did not), logs pre-existing drift at INFO rather
 than failing on it, and accepts `exempt=[(category, item)]` for
-detection-derived values inside a covered store. Hold the device's `DeviceLock`
+detection-derived values inside a covered store. Which stores a device
+generation lists, and how many items each has (device-read on the U64E,
+source-derived only on the C64U), is recorded in
+`BASELINE_RECORDED_CATEGORY_SETS` in the same module — cite that table by name
+rather than a figure copied out of it. Hold the device's `DeviceLock`
 when calling it: `create_manager(backend="u64")` runs it for you inside the lock
 before the transport is handed out; a bare client only gets the #194
 unlocked-client notice, which is a notice, not a refusal. On a host where

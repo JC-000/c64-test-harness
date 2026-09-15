@@ -20,7 +20,9 @@ module is stricter than the manager in one respect: it **never** resets a
 device that is not graded ``ultimate``, not even when
 ``U64_BASELINE_ON_ENTRY=1`` asks, because ``apply_factory_baseline`` has no
 generation gate of its own.  It then sets 1 MHz, the one item these tests
-own, on every generation.  The 1 MHz restore at exit and the
+own, on every generation.  At exit it writes ``CPU Speed`` and ``Turbo
+Control`` back to the ``default`` each reported at entry (#360: ``set_speed(1)``
+alone left ``CPU Speed`` behind); that restore and the
 ``DeviceLock`` release are attempted on every path a live process survives
 -- an exception at the ``yield``, a raising ``close()``, a raising
 constructor -- and a restore that fails is raised, not swallowed.  Neither
@@ -50,6 +52,7 @@ from c64_test_harness.backends.device_lock import DeviceLock
 from c64_test_harness.backends.ultimate64 import Ultimate64Transport
 from c64_test_harness.backends.ultimate64_baseline import resolve_baseline_on_entry
 from c64_test_harness.backends.ultimate64_helpers import (
+    CAT_U64_SPECIFIC,
     get_turbo_mhz,
     max_cpu_speed_mhz,
 )
@@ -168,15 +171,66 @@ def _reconcile_on_entry(client):
     return report
 
 
+#: The two config items the speed tests write, in the order they are
+#: restored -- ``CPU Speed`` before ``Turbo Control``, the order
+#: ``set_turbo_mhz`` writes them in.
+_SPEED_ITEMS = ("CPU Speed", "Turbo Control")
+
+
+def _speed_item_defaults(client):
+    """``{item: default}`` for :data:`_SPEED_ITEMS`, read at entry (#360).
+
+    Bodyless GETs.  An item whose ``current`` already differs from its
+    ``default`` is logged at WARNING -- on a C64 Ultimate, where the entry
+    reset never runs, that is a predecessor's residue this module is about
+    to clear.  A map with no usable ``default`` raises: the exit restore
+    could not honour ``current == default``, so the tests do not start.
+    """
+    defaults = {}
+    for item in _SPEED_ITEMS:
+        entry = client.get_config_item(CAT_U64_SPECIFIC, item)
+        default = entry.get("default") if isinstance(entry, dict) else None
+        if not isinstance(default, str) or not default:
+            raise RuntimeError(
+                f"{CAT_U64_SPECIFIC} / {item}: no default in {entry!r}; "
+                "cannot restore it at exit"
+            )
+        if entry.get("current") != default:
+            _log.warning(
+                "%s / %s drifted at entry: current=%r default=%r; it will be "
+                "written to its default at exit",
+                CAT_U64_SPECIFIC, item, entry.get("current"), default,
+            )
+        defaults[item] = default
+    return defaults
+
+
 def _speed_session(t):
-    """Reconcile at entry, set 1 MHz, and restore 1 MHz on every exit path."""
+    """Reconcile at entry, set 1 MHz, restore both speed items on every exit.
+
+    ``set_speed(1)`` writes only ``Turbo Control = Off`` and leaves the
+    ``CPU Speed`` the tests set behind (#360), so the exit writes each of
+    :data:`_SPEED_ITEMS` back to the ``default`` read at entry -- not the
+    entry ``current``, which on a C64 Ultimate may be a killed run's
+    residue.  Each item is its own step, so one failed PUT does not skip
+    the other.
+    """
     _reconcile_on_entry(t.client)
+    defaults = _speed_item_defaults(t.client)
     t.set_speed(1)
     failures = []
     try:
         yield t
     finally:
-        failures = _teardown_steps([("set_speed(1)", lambda: t.set_speed(1))])
+        failures = _teardown_steps([
+            (
+                f"restore {item}={value!r}",
+                lambda item=item, value=value: t.client.set_config_item(
+                    CAT_U64_SPECIFIC, item, value
+                ),
+            )
+            for item, value in defaults.items()
+        ])
     _raise_teardown_failures("CPU speed restore", failures)
 
 

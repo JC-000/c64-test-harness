@@ -18,15 +18,19 @@ from c64_test_harness.backends.unified_manager import UnifiedManager
 @pytest.fixture(scope="module")
 def manager():
     mgr = UnifiedManager(backend="u64", u64_hosts=[os.environ["U64_HOST"]])
-    yield mgr
-    mgr.shutdown()
+    try:
+        yield mgr
+    finally:
+        mgr.shutdown()
 
 
 @pytest.fixture(scope="module")
 def transport(manager):
     target = manager.acquire()
-    yield target.transport
-    manager.release(target)
+    try:
+        yield target.transport
+    finally:
+        manager.release(target)
 
 
 class TestMemoryRoundTrip:

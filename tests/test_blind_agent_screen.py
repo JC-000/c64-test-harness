@@ -19,10 +19,14 @@ def target():
 
     host = os.environ["U64_HOST"]
     mgr = UnifiedManager(backend="u64", u64_hosts=[host])
-    tgt = mgr.acquire()
-    yield tgt
-    mgr.release(tgt)
-    mgr.shutdown()
+    try:
+        tgt = mgr.acquire()
+        try:
+            yield tgt
+        finally:
+            mgr.release(tgt)
+    finally:
+        mgr.shutdown()
 
 
 class TestScreenBasics:

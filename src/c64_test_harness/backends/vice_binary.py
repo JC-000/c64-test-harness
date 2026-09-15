@@ -28,6 +28,8 @@ covers it.
 
 from __future__ import annotations
 
+from .._address import refuse_bool_address
+
 import logging
 import socket
 import struct
@@ -529,8 +531,13 @@ class BinaryViceTransport:
 
         The address space is 16-bit (``$0000``-``$FFFF``); a read that
         would run past ``$FFFF`` raises :class:`ValueError` rather than
-        silently wrapping back to ``$0000``.
+        silently wrapping back to ``$0000``.  A ``bool`` address raises
+        :class:`ValueError` before anything else (#352).
         """
+        # bool subclasses int: True would read $0001, the 6510 processor
+        # port.  Refused first, like the Ultimate 64 entry points (#340,
+        # shared helper since #357).
+        refuse_bool_address(addr, "read_memory address")
         if length <= 0:
             return b""
         if addr + length > 0x10000:
@@ -605,8 +612,13 @@ class BinaryViceTransport:
         A write that would run past ``$FFFF`` raises :class:`ValueError`
         rather than silently wrapping back to ``$0000`` — wrapping could
         clobber page zero *after* the memory policy approved the
-        un-wrapped range.
+        un-wrapped range.  A ``bool`` address raises :class:`ValueError`
+        before anything else, the memory policy included (#352).
         """
+        # bool subclasses int: True would write $0001, the 6510 processor
+        # port.  Refused first, like the Ultimate 64 entry points (#340,
+        # shared helper since #357).
+        refuse_bool_address(addr, "write_memory address")
         if isinstance(data, list):
             data = bytes(data)
         if not data:
@@ -838,8 +850,10 @@ class BinaryViceTransport:
     ) -> int:
         """Set an execution breakpoint at *addr*.
 
-        Returns the checkpoint number assigned by VICE.
+        Returns the checkpoint number assigned by VICE.  A ``bool`` *addr*
+        raises :class:`ValueError` before any monitor command (#357).
         """
+        refuse_bool_address(addr, "set_checkpoint address")
         # start_addr(2) end_addr(2) stop_when_hit(1) enabled(1)
         # cpu_operation(1) temporary(1)
         body = struct.pack(

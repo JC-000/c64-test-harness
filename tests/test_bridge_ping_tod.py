@@ -14,8 +14,9 @@ Two test classes:
   timeouts expire ~31x too fast.  This is documentation in the form
   of a test.
 
-Ultimate 64 live tests live in ``TestTodPrimitiveU64Live`` (gated on
-``U64_HOST`` env var).  These validate that CIA1 TOD runs at wall-
+Ultimate 64 live tests live in ``TestTodPrimitiveU64Live`` (gated on the
+``U64_HOST`` and ``U64_ALLOW_MUTATE`` env vars -- it changes CPU speed and
+restores the speed defaults, #333/#367).  These validate that CIA1 TOD runs at wall-
 clock rate on real hardware across several turbo speeds using the
 ``build_tod_start_code`` / ``build_tod_read_tenths_code`` primitives.
 """
@@ -238,13 +239,23 @@ class TestBridgeIcmpRoundTripTodViceWarp:
 
 
 # ---------------------------------------------------------------------------
-# Ultimate 64 live primitive test (gated on U64_HOST)
+# Ultimate 64 live primitive test (gated on U64_HOST and U64_ALLOW_MUTATE)
 # ---------------------------------------------------------------------------
 
 _U64_HOST = os.environ.get("U64_HOST")
+#: The TOD test sweeps CPU speed and its fixture restores the speed defaults:
+#: config PUTs on the shared device, so it needs U64_ALLOW_MUTATE (#333, #367).
+_ALLOW_MUTATE = os.environ.get("U64_ALLOW_MUTATE")
 
 
 @pytest.mark.skipif(not _U64_HOST, reason="U64_HOST not set")
+@pytest.mark.skipif(
+    not _ALLOW_MUTATE,
+    reason=(
+        "U64_ALLOW_MUTATE not set -- this class changes CPU speed on the device "
+        "(restored to the device defaults on teardown)"
+    ),
+)
 class TestTodPrimitiveU64Live:
     """Validate CIA1 TOD ticks at wall-clock rate on real U64 hardware.
 
@@ -272,21 +283,36 @@ class TestTodPrimitiveU64Live:
 
     @pytest.fixture(scope="class")
     def u64_client(self):
-        """Acquire DeviceLock + Ultimate64Client; skip if unavailable."""
+        """Acquire DeviceLock + Ultimate64Client; skip if unavailable.
+
+        ``test_tod_runs_at_wall_clock`` sweeps turbo up to 48 MHz, so on the
+        way out ``CPU Speed`` and ``Turbo Control`` go back to the device's
+        defaults (#365 -- this fixture used to restore nothing).  The restore
+        runs before the lock is released, and the release runs even when the
+        restore raises; a failed restore is raised, not swallowed.
+        """
         from c64_test_harness.backends.device_lock import DeviceLock
         from c64_test_harness.backends.ultimate64 import Ultimate64Transport
         from c64_test_harness.backends.ultimate64_client import Ultimate64Client
+        from c64_test_harness.backends.ultimate64_helpers import (
+            restore_speed_defaults,
+        )
 
         lock = DeviceLock(_U64_HOST)
         if not lock.acquire(timeout=120.0):
             pytest.skip(f"Could not acquire device lock for {_U64_HOST}")
+        client = None
         try:
             pw = os.environ.get("U64_PASSWORD")
             client = Ultimate64Client(host=_U64_HOST, password=pw, timeout=10.0)
             transport = Ultimate64Transport(host=_U64_HOST, password=pw, client=client)
             yield client, transport
         finally:
-            lock.release()
+            try:
+                if client is not None:
+                    restore_speed_defaults(client)
+            finally:
+                lock.release()
 
     @staticmethod
     def _make_idle_prg() -> bytes:

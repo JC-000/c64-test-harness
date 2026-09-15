@@ -40,6 +40,7 @@ from c64_test_harness.backends.ultimate64_schema import (
     SidSlot,
 )
 from c64_test_harness.sid import SidFile, build_test_psid
+from live_fixture_teardown import raise_teardown_failures, teardown_then_release
 
 logger = logging.getLogger(__name__)
 
@@ -76,14 +77,15 @@ def u64_client():
     lock = DeviceLock(host)
     if not lock.acquire(timeout=120.0):
         pytest.skip(f"Could not acquire device lock for {host}")
-    client = Ultimate64Client(host=host, password=pw, timeout=15.0)
-    yield client
+    client = None
+    failures: list = []
     try:
-        client.reset()
-    except Exception:
-        pass
-    client.close()
-    lock.release()
+        client = Ultimate64Client(host=host, password=pw, timeout=15.0)
+        yield client
+    finally:
+        steps = [] if client is None else [("client.reset()", client.reset), ("client.close()", client.close)]
+        failures = teardown_then_release(steps, lock.release)
+    raise_teardown_failures('audio u64_client teardown', failures)
 
 
 @pytest.fixture(autouse=True)

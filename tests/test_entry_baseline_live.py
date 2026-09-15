@@ -41,52 +41,27 @@ Never: ``save_config_to_flash``, ``load_config_from_flash``, the global
 ``configs:reset_to_default``, any request to a never-touch store other
 than a GET, ``reset``, ``reboot``, ``poweroff``.
 
-Item counts, **measured on the U64E (fw 3.15) 2026-09-12** — read-only,
-``DeviceLock`` held, bodyless GETs, nothing written:
-
-* **151** items across the twelve ``BASELINE_CATEGORIES`` on the U64E,
-  2026-09-12 — the covered set, and therefore the number of item GETs one
-  ``apply_factory_baseline`` makes.  Per category: C64 and Cartridge 19,
-  U64 Specific 27, SID Addressing 8, Audio Mixer 21, Drive A 14,
-  Drive B 14, SoftIEC 2, Tape 1, Printer 11, LED Strip 8, Modem 16,
-  User Interface 10.
-* 40 in the five ``BASELINE_NEVER_TOUCH`` stores, and 12 in two
-  categories belonging to neither list (``UltiSID Configuration`` 8,
-  ``Data Streams`` 4) — **203 items** across all 19 categories the U64E
-  lists, 2026-09-12.
-
-Every figure above, per category included, was also reproduced from
-firmware source at 7f6fcb51 (v3.15-85) in #288's adversarial review: each
-store's ``t_cfg_definition[]`` preprocessed with the U64E build flags
-(``-DU64=1 -DDEVELOPER=0 -DCLOCK_FREQ=66666667``, from that build's
-``target/u64/nios2/ultimate/Makefile``), counting the five REST-visible
-item types.  So the counts rest on two instruments for that build: one
-device read (n=1) and one source derivation.
-
-The figure carries its device and date inline on purpose.  The earlier
-"~150" in this docstring had neither, was quoted downstream as though it
-were a measurement, and was withdrawn for that reason before anybody
-counted.  It turned out to be right, which is the point: a scopeless
-figure is unusable whether or not it is accurate, and being accurate is
-what let it survive unexamined for months.
-
-**Unexplained residual, recorded rather than resolved (#292):** #276
-records "201 items compared" (category scope and firmware build not
-recorded) on the U64E on 2026-09-10; this read counts **203** on the U64E
-on 2026-09-12.  The candidates are a different counting basis or a
-different firmware build: firmware source rules out drift within one
-build — store items are appended only when a store is constructed, and
-the REST listing emits every item of the five value types — except for
-stores registered at runtime (the monitor-bookmarks store, the per-device
-SID stores).  Nobody has established why.  Do not average them, and do
-not drop one.
+Item counts are not restated here.  How many items each covered store
+has, per device generation and with each count's basis (device-read and
+source-derived on the U64E, source-derived only on the C64U), is recorded
+in ``BASELINE_RECORDED_CATEGORY_SETS`` in
+``src/c64_test_harness/backends/ultimate64_baseline.py``, together with
+the covered / never-touch / neither / all totals and the unexplained #292
+residual against #276's compared-item count.  The covered total for the
+device's generation is the number of item GETs one
+``apply_factory_baseline`` makes there.
+``tests/test_entry_baseline_table_live.py`` (``BASELINE_TABLE_LIVE=1``,
+read-only) compares a device against its record.  The figure used to live
+in this docstring with its device and date inline, and still moved four
+times in three days as copies lost their scope (#286, #288, #292; #342),
+so it now lives in one place and is cited by name.
 
 Still not measured (record when this runs): the wall-clock cost of one
-``apply_factory_baseline`` — ``record_property("apply_seconds")`` captures
-it, and 151 (U64E, 2026-09-12) is what makes those seconds interpretable;
-and whether any
-store's ``effectuate()`` pulses the C64 reset (a separate #217-style
-marker+jiffy arm, not in this module).
+``apply_factory_baseline`` -- ``record_property("apply_seconds")``
+captures it, and the record's covered total for the device's generation
+is what makes those seconds interpretable; and whether any store's
+``effectuate()`` pulses the C64 reset (a separate #217-style marker+jiffy
+arm, not in this module).
 """
 from __future__ import annotations
 

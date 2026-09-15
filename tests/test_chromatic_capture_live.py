@@ -48,6 +48,12 @@ from c64_test_harness.backends.render_wav_u64 import capture_sid_u64  # noqa: E4
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client  # noqa: E402
 from c64_test_harness.sid import SidFile  # noqa: E402
 
+from live_fixture_teardown import (  # noqa: E402
+    raise_teardown_failures,
+    read_restore_defaults,
+    restore_default_steps,
+    teardown_then_release,
+)
 from wav_capture_paths import capture_dir  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -131,6 +137,18 @@ SID_CONFIGS = [
     },
 ]
 
+#: Every item a capture test writes, by category -- what the exit restore
+#: puts back to the device's own ``default`` (#334; previously hard-coded
+#: values that were not the defaults).
+_RESTORED_ITEMS = {
+    "SID Addressing": list(dict.fromkeys(
+        item for config in SID_CONFIGS for item in config["addressing"]
+    )),
+    "UltiSID Configuration": list(dict.fromkeys(
+        item for config in SID_CONFIGS for item in (config["ultisid_settings"] or {})
+    )),
+}
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -153,7 +171,14 @@ def wav_dir(tmp_path_factory: pytest.TempPathFactory, record_testsuite_property)
 
 @pytest.fixture(scope="module")
 def u64_client():
-    """Connect to the U64, holding a cross-process DeviceLock for the session."""
+    """Connect to the U64, holding a cross-process DeviceLock for the session.
+
+    Before any test writes, the ``default`` of every item in
+    :data:`_RESTORED_ITEMS` is read; at exit each is PUT back to it (one
+    bodyless PUT per item), then the machine is reset, the client closed and
+    the lock released last -- every step attempted, failures raised after
+    the release (#334, ``live_fixture_teardown``).
+    """
     host = os.environ.get("U64_HOST")
     pw = os.environ.get("U64_PASSWORD")
     lock = DeviceLock(host)
@@ -162,26 +187,22 @@ def u64_client():
     except DeviceLockTimeout as e:
         pytest.skip(str(e))
 
-    client = Ultimate64Client(host=host, password=pw, timeout=15.0)
-    yield client
-
-    # Teardown: restore defaults
+    client = None
+    plan: list = []
+    failures: list = []
     try:
-        client.set_config_items("SID Addressing", {
-            "SID Socket 1 Address": "$D400",
-            "SID Socket 2 Address": "$D420",
-            "UltiSID 1 Address": "$D400",
-            "UltiSID 2 Address": "$D400",
-        })
-        client.set_config_items("UltiSID Configuration", {
-            "UltiSID 1 Filter Curve": "8580 Lo",
-            "UltiSID 1 Combined Waveforms": "6581",
-        })
-        client.reset()
-    except Exception:
-        pass
-    client.close()
-    lock.release()
+        client = Ultimate64Client(host=host, password=pw, timeout=15.0)
+        plan = read_restore_defaults(client, _RESTORED_ITEMS)
+        yield client
+    finally:
+        steps = []
+        if client is not None:
+            steps += restore_default_steps(client, plan)
+            if plan:
+                steps.append(("client.reset()", client.reset))
+            steps.append(("client.close()", client.close))
+        failures = teardown_then_release(steps, lock.release)
+    raise_teardown_failures("chromatic u64_client teardown", failures)
 
 
 # ---------------------------------------------------------------------------
