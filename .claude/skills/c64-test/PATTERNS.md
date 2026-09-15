@@ -807,7 +807,7 @@ Four consequences to know before writing the loop:
 | `build_socket_read` | **149** (**449**) | defaults | **yes** |
 | `build_tcp_connect`, `build_udp_connect` | **159** (**484**) | defaults | **yes** |
 | `build_socket_write` | **170** (**421**) | payload-independent — 170 at payloads 0, 10, 128, 800, 892 | **yes** |
-| `build_tx_code` / `build_rx_peek_code` | 79 / 64 | size-invariant — 79 at `frame_len` 42, 64, 256; 64 at `batch_size` 1, 8, 32 | no |
+| `build_tx_code` / `build_rx_peek_code` | 99-120 / 64 | 99 at `frame_len` 42, 60, 256; 104 at 512, 1024 (whole pages); 120 at 258, 1514 (#404 page loop); 64 at `batch_size` 1, 8, 32 | no |
 | the eight `cs8900a_*` snippets | **18-69** | `linectl_or_inline` 18, `rxctl_inline` 28, `rxctl` 29, `write_linectl(0,0)` 29, `read_linectl` 31, `enable_inline` 46, `set_mac_inline` 60, `set_mac` 69 (`bridge_ping.py:663,677,688,707,717,749,758,773`) | no |
 | `build_rx_echo_reply_code` | **193** | invariant in `identifier` / `sequence` | **yes** |
 | `build_ping_and_wait_code` | **256** | plain — no ARP, no drain | **yes** |

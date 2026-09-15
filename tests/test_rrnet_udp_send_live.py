@@ -14,17 +14,19 @@ and asserts the payload bytes match exactly.
 This is the **first** UDP-aware live test in the harness -- the existing
 two-VICE bridge tests only do raw L2 frames or ICMP echo.  It is
 deliberately one-directional (C64 -> host) and sends a 214-byte payload,
-which makes a 256-byte frame: the largest :func:`build_tx_code` accepts
-(even, 2..256; issue #238).
+which makes a 256-byte frame: the largest the original 8-bit-``Y`` copy
+loop could send (issue #238).
 
-Frames above 256 bytes are **not covered**, and they never were.  Until
-#304 this test sent a 1024-byte payload (1066-byte frame), but the TX copy
-loop counts in an 8-bit ``Y``.  It stopped after ``1066 & 0xFF = 42``
-bytes, and VICE 3.10 ``cs8900.c:775`` transmits only when
-``tx_count == tx_length``, so that frame never left the chip.  #238
-measured the same on hardware: every even length above 256 is a silent
-no-op.  Larger frames need a 16-bit counted copy loop, which is a
-builder feature, not a test change.
+Frames above 256 bytes are **not covered here**, and they never were.
+Until #304 this test sent a 1024-byte payload (1066-byte frame), but the
+TX copy loop then counted in an 8-bit ``Y``.  It stopped after
+``1066 & 0xFF = 42`` bytes, and VICE 3.10 ``cs8900.c:775`` transmits only
+when ``tx_count == tx_length``, so that frame never left the chip.  #238
+measured the same on hardware for even lengths 258-512; longer lengths
+fail by the same copy-loop mechanism rather than by measurement.  Since
+#404 :func:`build_tx_code` counts pages above 256 and accepts even lengths
+up to 1514; that path is pinned on the simulated chip in
+``test_cs8900a_tx_bound.py``, not by this live test.
 
 Gate
 ----
@@ -128,8 +130,8 @@ SRC_PORT = 49152
 DST_PORT = 51234
 
 # Payload: an easy-to-spot pattern, sized so the frame is exactly the
-# largest build_tx_code accepts: 14 + 20 + 8 + 214 = 256 (even, <= 256;
-# issue #238/#304).  tests/test_cs8900a_tx_bound.py runs this frame through
+# largest the 8-bit copy loop sends: 14 + 20 + 8 + 214 = 256 (issue
+# #238/#304; longer frames take the #404 page loop, not exercised here).  tests/test_cs8900a_tx_bound.py runs this frame through
 # the simulated chip offline, since this module only runs on Linux.
 PAYLOAD = bytes(range(214))
 FRAME_LEN = 14 + 20 + 8 + len(PAYLOAD)
