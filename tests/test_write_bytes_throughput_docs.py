@@ -21,6 +21,11 @@ blank-line paragraph that would swallow the whole list):
 * the conditions (device, build, date, link, sample size) travel with them;
 * the C64U is never stated as measured: the 128-byte arm is the chunk it
   uses, not its number, every site says so, and no site inverts that.
+
+The inversion check is a word list (INVERTERS) and cannot know every
+phrasing that reverses the disclaimer, so each site's own disclaimer
+sentence is also pinned verbatim in SITE_SENTENCES; a rewording of it
+fails there even when no listed word appears.
 """
 from __future__ import annotations
 
@@ -57,6 +62,36 @@ LOAD_BEARING = {
     "per-PUT latency": _NUM + r"median ~36-52 ms per PUT, observed 34-79 ms",
     "link": r"host on Wi-Fi \(en0\), link not instrumented",
     "sample size": r"n=2-4 per arm, interleaved",
+    "link dominates": r"(?<!not )dominated by the host link",
+}
+
+#: Per-site sentences: the device bound to its build, and the site's own
+#: C64U disclaimer verbatim (anchored to what follows it, or to the item's
+#: end), so an inversion the INVERTERS list does not know still fails.
+SITE_SENTENCES = {
+    "PATTERNS rule 5": {
+        "device attribution": r"Measured on the U64E \(fw 3\.15, bce4535e, 2026-09-15",
+        "disclaimer": (r"The 128-byte arm is the chunk a C64U uses, but its per-request "
+                       r"latency over its own link is not measured on the C64U, so do not "
+                       r"read 3\.2 KiB/s as that device's rate\.\s*$"),
+    },
+    "PATTERNS cliff": {
+        "device attribution": (r"the only timing is from the U64E\. Measured there "
+                               r"\(fw 3\.15, bce4535e, 2026-09-15"),
+        "disclaimer": (r"It is not measured on the C64U: the 128-byte chunk is the same arm, "
+                       r"but the latency over that device's link is unknown, so budget for "
+                       r"it being slow and do not assume it beats the ~6 s cliff\.\s*$"),
+    },
+    "SKILL non-leaking": {
+        "device attribution": r"Measured on the U64E \(fw 3\.15, bce4535e, 2026-09-15",
+        "disclaimer": (r"\. The rate is not measured on the C64U, whose link latency is "
+                       r"unknown, so budget for it being slow\. REST POST is the leaking path"),
+    },
+    "REFERENCE write_memory": {
+        "device attribution": r"Measured on the U64E \(fw 3\.15, bce4535e, 2026-09-15",
+        "single request": r"on a post-safe U64E `write_memory` itself is a single request\.",
+        "disclaimer": r"single request\. The rate is not measured on the C64U\. What the disabled path does",
+    },
 }
 
 #: Item-wide claims that would put the U64E figure on the C64U, or the link
@@ -133,6 +168,12 @@ class TestEachSite:
         assert re.search(LOAD_BEARING[name], item), (
             f"{label}: {name} sentence missing or altered "
             f"(want /{LOAD_BEARING[name]}/)")
+
+    def test_site_sentences(self, label, path, anchor):
+        item = _item(path, anchor)
+        for name, pattern in SITE_SENTENCES[label].items():
+            assert re.search(pattern, item), (
+                f"{label}: {name} sentence missing or altered (want /{pattern}/)")
 
     def test_c64u_is_not_claimed_measured(self, label, path, anchor):
         item = _item(path, anchor)
