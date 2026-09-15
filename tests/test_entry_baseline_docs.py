@@ -551,9 +551,14 @@ class TestTheItemCountCarriesItsScope:
 
     #: Device naming, in the same sentence as the number.
     _DEVICE = ("U64E", "Ultimate 64 Elite")
-    #: Every alias the repo uses for the C64U line (``CBM`` is the harness's
-    #: generation name).  Case-sensitive on purpose.
-    _OTHER_DEVICE = ("C64U", "C64 Ultimate", "Commodore 64 Ultimate", "CBM")
+    #: Every alias the repo uses for the C64U line, in any case and with a
+    #: space, a hyphen or nothing between "C64" and "Ultimate" (#317).
+    #: ``cbm`` is the harness's generation name and :func:`_flat` strips the
+    #: backticks around it, so the case-sensitive tuple this replaced let
+    #: "the cbm generation", "C64 ultimate" and "C64-Ultimate" through.
+    _OTHER_DEVICE = re.compile(
+        r"\bcbm\b|c64[\s-]?ultimate|commodore 64 ultimate|\bc64u\b", re.IGNORECASE
+    )
 
     #: The historical figure prose may still quote, bound to the one date it
     #: was recorded on (#276).  A closed table on purpose.
@@ -628,7 +633,7 @@ class TestTheItemCountCarriesItsScope:
             if not any(d in sentence for d in cls._DEVICE):
                 bad.append(f"{token} names no device: {sentence!r}")
                 continue
-            if any(o in sentence for o in cls._OTHER_DEVICE):
+            if cls._OTHER_DEVICE.search(sentence):
                 bad.append(f"{token} shares its sentence with the C64U, whose "
                            f"item counts have never been read: {sentence!r}")
                 continue
@@ -1278,3 +1283,79 @@ def test_reference_uci_socket_write_prices_by_grade():
     # The post-safe sentence says "one POST", so this cannot collide.
     assert "costs one /temp attachment" not in claim
 
+
+#: #317: every spelling of the C64U line a count sentence may use.  ``cbm``
+#: is written in backticks in the docs, and ``_flat`` strips them.
+_OTHER_DEVICE_VARIANTS = {
+    "cbm": "the cbm generation",
+    "`cbm`": "the `cbm` generation",
+    "CBM line": "the CBM line",
+    "C64 ultimate": "the C64 ultimate",
+    "C64-Ultimate": "the C64-Ultimate",
+    "C64 Ultimate": "the C64 Ultimate",
+    "c64u": "the c64u",
+    "C64U": "the C64U",
+    "Commodore 64 ultimate": "the Commodore 64 ultimate",
+}
+
+#: The base sentence each variant is planted into.  It must pass alone, so
+#: the variant is the only thing a flag can be about.
+_OTHER_DEVICE_BASE = "The U64E counted 201 items on 2026-09-10"
+
+
+def test_the_other_device_matcher_meets_the_real_corpus() -> None:
+    """Vacuity guard for #317: the new matcher is exercised by real docs.
+
+    Two facts, both measured on the lane docs when this was written: real
+    count sentences reach the other-device check (so it runs on the corpus,
+    not only on the planted controls below), and the corpus itself writes
+    the generation name in lower case, a spelling the old case-sensitive
+    tuple did not see.
+    """
+    pin = TestTheItemCountCarriesItsScope
+    reached = [
+        (name, token, sentence)
+        for name, path in LANE_DOCS.items()
+        for token, sentence, _ in pin._count_occurrences(path.read_text(encoding="utf-8"))
+        if token in pin._SCOPE and any(dev in sentence for dev in pin._DEVICE)
+    ]
+    assert reached, "no real count sentence reaches the other-device check"
+
+    spellings = {
+        m.group(0)
+        for path in LANE_DOCS.values()
+        for m in pin._OTHER_DEVICE.finditer(_flat(path.read_text(encoding="utf-8")))
+    }
+    # The lower-case generation name the old tuple missed ...
+    assert "cbm" in spellings, (
+        f"no lane doc writes `cbm`; the matcher meets nothing the old tuple did not: "
+        f"{sorted(spellings)}"
+    )
+    # ... and capitalised product names, which the lower-case pattern reaches
+    # only through IGNORECASE.  A case-sensitive pattern still matches the
+    # literal "cbm", so without this the guard did not see case at all
+    # (mutation O1 survived it).
+    assert any(s != s.lower() for s in spellings), (
+        f"the matcher found no capitalised spelling in the lane docs: {sorted(spellings)}"
+    )
+
+
+def test_the_other_device_base_sentence_passes() -> None:
+    assert TestTheItemCountCarriesItsScope._unscoped(_OTHER_DEVICE_BASE + ".") == []
+
+
+@pytest.mark.parametrize("variant", list(_OTHER_DEVICE_VARIANTS))
+def test_the_count_scan_flags_every_spelling_of_the_other_device(variant: str) -> None:
+    sentence = f"{_OTHER_DEVICE_BASE}, unlike {_OTHER_DEVICE_VARIANTS[variant]}."
+    bad = TestTheItemCountCarriesItsScope._unscoped(sentence)
+    assert any("shares its sentence with the C64U" in b for b in bad), (variant, bad)
+
+
+@pytest.mark.parametrize("sentence", [
+    # ``cbm`` inside a longer word is not the generation name.
+    f"{_OTHER_DEVICE_BASE}, logged with opencbm.",
+    # The U64E's own product name contains "Ultimate".
+    f"{_OTHER_DEVICE_BASE} on the Ultimate 64 Elite.",
+])
+def test_the_count_scan_leaves_near_misses_alone(sentence: str) -> None:
+    assert TestTheItemCountCarriesItsScope._unscoped(sentence) == []
