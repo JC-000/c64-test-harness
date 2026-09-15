@@ -1892,6 +1892,49 @@ class UCIError(Exception):
     """UCI command returned an error."""
 
 
+class UCIInterfaceAbsentError(UCIError):
+    """The UCI identifier is not on the bus, so no UCI routine can run (#359).
+
+    Raised by :func:`_execute_uci_routine` on an Ultimate transport when a
+    host read of ``$DF1D`` does not return :data:`UCI_IDENTIFIER` (``$C9``)
+    -- before anything is written or typed, instead of the sentinel timeout
+    the routine would otherwise end in.
+
+    Measured on the U64E (fw 3.15, paired ABBAAB, n=3 per arm, #359): with
+    ``Cartridge Preference`` = External the identifier was absent after
+    ``enable_uci`` + ``reset()`` + settle in 3/3 trials and every routine
+    timed out, while ``Command Interface`` still read Enabled; with Auto it
+    read ``$C9`` and every routine completed.  A config read-back therefore
+    cannot detect this state; the identifier register can.
+
+    :ivar identifier: the byte read from ``$DF1D``.
+    :ivar cartridge_preference: ``Cartridge Preference``'s current value
+        when a single bodyless GET could read it, else ``None``.
+    """
+
+    def __init__(self, identifier: int, cartridge_preference: str | None = None) -> None:
+        self.identifier = identifier
+        self.cartridge_preference = cartridge_preference
+        if cartridge_preference is None:
+            pref = "could not be read"
+        else:
+            pref = f"currently reads {cartridge_preference!r}"
+        super().__init__(
+            f"UCI identifier missing: ${UCI_CMD_DATA_REG:04X} read "
+            f"${identifier:02X}, expected ${UCI_IDENTIFIER:02X}. The Command "
+            f"Interface slot is not on the C64 bus, so no UCI routine can run "
+            f"(it would only time out at the sentinel). Likely cause: "
+            f"Cartridge Preference = External ({pref}), or an external "
+            f"cartridge holding the bus (e.g. an RR-Net): after a reset the "
+            f"slot stays off the bus even while 'Command Interface' reads "
+            f"Enabled. Remedy: client.set_config_item('C64 and Cartridge "
+            f"Settings', 'Cartridge Preference', 'Auto'), then reset() and "
+            f"settle; also confirm the Command Interface is enabled "
+            f"(enable_uci). The harness does not change the preference for "
+            f"you (issue #359)."
+        )
+
+
 def _read_status_string(
     transport: C64Transport,
     *,
@@ -1943,6 +1986,46 @@ def _empty_reply_message(command: str, transport: C64Transport) -> str:
     )
 
 
+def _check_uci_identifier(transport: C64Transport) -> None:
+    """Raise :class:`UCIInterfaceAbsentError` unless ``$DF1D`` reads ``$C9`` (#359).
+
+    Only on an :class:`~.backends.ultimate64.Ultimate64Transport`.  The
+    failure this detects -- the Command Interface slot left off the bus by
+    the firmware's cartridge/bus configuration -- exists only in Ultimate
+    firmware, and every other transport keeps its behaviour exactly (no
+    extra read).
+
+    Cost: one ``read_memory`` of one byte, which on the U64 is
+    ``GET /v1/machine:readmem`` -- bodyless, so zero ``/Temp`` attachments
+    on any firmware (only a body-carrying ``POST`` creates one).  On the
+    failure path only, one more bodyless ``GET`` of the ``Cartridge
+    Preference`` item for the message; it never changes the preference and
+    its own failure is swallowed.
+    """
+    from .backends.ultimate64 import Ultimate64Transport
+
+    if not isinstance(transport, Ultimate64Transport):
+        return
+    identifier = transport.read_memory(UCI_CMD_DATA_REG, 1)[0]
+    if identifier == UCI_IDENTIFIER:
+        return
+    preference: str | None = None
+    try:
+        from .backends.ultimate64_helpers import (
+            CARTRIDGE_PREFERENCE_ITEM,
+            CARTRIDGE_SETTINGS_CATEGORY,
+        )
+
+        item = transport.client.get_config_item(
+            CARTRIDGE_SETTINGS_CATEGORY, CARTRIDGE_PREFERENCE_ITEM,
+        )
+        current = item.get("current") if isinstance(item, dict) else None
+        preference = current if isinstance(current, str) else None
+    except Exception as exc:  # noqa: BLE001 -- diagnostic only
+        _log.debug("could not read Cartridge Preference for #359 message: %r", exc)
+    raise UCIInterfaceAbsentError(identifier, preference)
+
+
 def _execute_uci_routine(
     transport: C64Transport,
     code: bytes,
@@ -1950,6 +2033,8 @@ def _execute_uci_routine(
     sentinel_addr: int = _SENTINEL_ADDR,
     error_addr: int = _ERROR_ADDR,
     timeout: float = _DEFAULT_TIMEOUT,
+    *,
+    check_identifier: bool = True,
 ) -> None:
     """Inject and execute a UCI routine on the U64.
 
@@ -1996,7 +2081,19 @@ def _execute_uci_routine(
     on the C64 is gone after a timeout. It does **not** clear a UCI
     STATE-bit wedge (issue #112): that needs a physical power-cycle.
 
+    **The UCI identifier is checked first** (#359). On an Ultimate
+    transport, before anything is written, ``$DF1D`` must read ``$C9``;
+    otherwise :class:`UCIInterfaceAbsentError` is raised at once instead of
+    the sentinel timeout below. One bodyless GET per routine, zero ``/Temp``
+    cost; see :func:`_check_uci_identifier`. It runs per routine, not once
+    per ``enable_uci``, because the bus state can change between routines
+    (a reset, a runner load, a preference PUT) and the harness has no single
+    enable-and-reset site to hang it on. ``check_identifier=False`` skips it
+    -- :func:`uci_probe` does, because reporting the identifier is its job.
+
     Raises:
+        UCIInterfaceAbsentError: On an Ultimate transport whose ``$DF1D``
+            does not read ``$C9``, before any write (see above).
         UCIError: If the error flag is set after execution (no reset: the
             routine returned).
         TimeoutError: If sentinel is not set within *timeout* seconds, after
@@ -2005,6 +2102,10 @@ def _execute_uci_routine(
             settle is taken.
     """
     from .transport import TimeoutError
+
+    # The slot must be on the bus before anything is written or typed (#359).
+    if check_identifier:
+        _check_uci_identifier(transport)
 
     # Clear sentinel and error
     transport.write_memory(sentinel_addr, bytes([0x00]))
@@ -2087,7 +2188,8 @@ def uci_probe(
         :func:`build_uci_command` for background.
     """
     code = build_uci_probe(turbo_safe=turbo_safe)
-    _execute_uci_routine(transport, code, timeout=timeout)
+    # Reporting the identifier is this helper's job: no pre-check (#359).
+    _execute_uci_routine(transport, code, timeout=timeout, check_identifier=False)
     return transport.read_memory(_RESP_ADDR, 1)[0]
 
 
