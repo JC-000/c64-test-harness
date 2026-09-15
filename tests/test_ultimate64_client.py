@@ -851,6 +851,23 @@ def test_unmount_disk_url():
 
 
 # ---------------------------------------------------------------- multipart helper
+def test_build_multipart_file_name_none_omits_the_filename_attribute():
+    """``file_name=None`` emits ``name="file"`` with no ``filename=`` (#417 review).
+
+    A string ``file_name`` still emits the attribute, so ``mount_disk``'s
+    named part (#421) is unchanged.
+    """
+    unnamed = _build_multipart(
+        "B", fields={}, file_field="file", file_name=None, file_bytes=b"\x01",
+    ).decode("latin-1")
+    assert 'Content-Disposition: form-data; name="file"\r\n' in unnamed
+    assert "filename=" not in unnamed
+    named = _build_multipart(
+        "B", fields={}, file_field="file", file_name="image.d64", file_bytes=b"\x01",
+    ).decode("latin-1")
+    assert 'name="file"; filename="image.d64"' in named
+
+
 def test_build_multipart_structure():
     body = _build_multipart(
         "BOUNDARY",
@@ -948,18 +965,42 @@ def test_drive_methods_reject_invalid_drive():
         c.drive_set_mode("c", "1541")
 
 
-def test_drive_load_rom_with_bytes_uses_multipart_put():
+def test_drive_load_rom_with_bytes_uses_multipart_post():
+    """Upload is the POST form; PUT is load-from-device-path (#253).
+
+    S: ``route_drives.cc`` at bce4535e registers ``PUT drives:load_rom``
+    with a NULL body handler and ``file`` P_REQUIRED (:290), and
+    ``POST drives:load_rom`` with ``&attachment_writer`` (:312), which
+    loads ``get_filename(0)`` -- the first multipart part.  Measured on the
+    U64E (fw 3.15 bce4535e, 2026-09-15, n=3 per arm, empty ROM part so no
+    ROM loads): the body-carrying PUT answers 400; the POST answers 412
+    "Drive ROM is invalid", i.e. the body reached the ROM loader.
+    """
     mock, captured = _capture(b"")
     c = Ultimate64Client("h")
     with patch("urllib.request.urlopen", mock):
-        c.drive_load_rom("a", b"\xaa\xbb\xcc")
+        c.drive_load_rom("a", b"\xaa\xbb\xcc" + bytes(16384 - 3))
     req = captured[0][0]
-    assert req.get_method() == "PUT"
+    assert req.get_method() == "POST"
+    # No query: the POST route takes none, and a ``file`` query would name
+    # a device path the upload does not have.
     assert req.get_full_url() == "http://h/v1/drives/a:load_rom"
     ct = req.get_header("Content-type")
     assert ct.startswith("multipart/form-data; boundary=")
-    assert b'name="file"' in req.data
-    assert b"\xaa\xbb\xcc" in req.data
+    body = req.data
+    # Exactly one part, and it is the file: get_filename(0) is what loads.
+    boundary = ct.split("boundary=", 1)[1].encode()
+    assert body.count(b"--" + boundary + b"\r\n") == 1
+    # #417 review (reviewer-5): no filename= attribute, so at 1.1.0 the
+    # firmware keeps the managed temp%04x name the GC can collect.  A named
+    # part is renamed to /Temp/<filename> (attachment_writer.h collect(),
+    # source-read) and is invisible to gc_temp_folder's ^temp[0-9a-fA-F]+$.
+    # Pinned on the part's own Content-Disposition line, not by counting.
+    dispositions = [ln for ln in body.split(b"\r\n")
+                    if ln.lower().startswith(b"content-disposition:")]
+    assert dispositions == [b'Content-Disposition: form-data; name="file"']
+    assert b"filename=" not in body
+    assert b"\xaa\xbb\xcc" in body
 
 
 def test_drive_load_rom_with_str_uses_file_query():
@@ -972,6 +1013,44 @@ def test_drive_load_rom_with_str_uses_file_query():
     assert req.data is None
     url = req.get_full_url()
     assert url == "http://h/v1/drives/b:load_rom?file=/Roms/dos1541.rom"
+
+
+@pytest.mark.parametrize("size", [0, 1, 16383, 16385, 32767, 32769, 65536])
+def test_drive_load_rom_rejects_a_wrong_size_rom_before_any_request(size):
+    """#417 review: refuse a ROM the firmware would half-load.
+
+    ``C1541::load_dos_from_file`` calls ``drive_reset(1)`` whenever it
+    transferred any bytes, *before* checking for 16384/32768, so a
+    wrong-size upload leaves the drive running a partial ROM and answers
+    412 -- and on the C64U the POST also costs a ``/Temp`` attachment.
+    The guard runs before any request.
+    """
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        with pytest.raises(ValueError):
+            c.drive_load_rom("a", bytes(size))
+    assert captured == []
+
+
+@pytest.mark.parametrize("size", [16384, 32768])
+def test_drive_load_rom_accepts_the_two_rom_sizes(size):
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        c.drive_load_rom("a", bytes(size))
+    assert [r[0].get_method() for r in captured] == ["POST"]
+
+
+def test_creates_temp_attachment_docstring_cites_the_1_1_0_route_table():
+    """#417 review: the 1.1.0 table has been read (7b628eb1); it is not 'not available'."""
+    import inspect
+    import re as _re
+
+    doc = _re.sub(r"\s+", " ", inspect.getdoc(Ultimate64Client._creates_temp_attachment) or "")
+    assert "not available" not in doc
+    for token in ("7b628eb1", "route_drives.cc:149", "route_machine.cc:125", "attachment_reu"):
+        assert token in doc, token
 
 
 def test_drive_load_rom_rejects_bad_type():
