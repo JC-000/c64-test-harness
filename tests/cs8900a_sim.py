@@ -36,8 +36,11 @@ Scope is deliberately narrow:
   RxEvent is not read-to-clear (it reports "frame pending" until the
   frame is skipped); the TxCMD / TxLength-before-data ordering is not
   enforced (data written before TxLength is discarded when TxLength is
-  written, no error); ``Rdy4TxNOW`` is always set, so a routine that
-  never polls BusST still transmits; there is no acceptance filter --
+  written, no error); ``Rdy4TxNOW`` is set for every bid unless
+  ``tx_ready_budget`` withholds it (issues #234/#236), and it gates
+  nothing -- a routine that never polls BusST still transmits; SelfCTL
+  (PP ``0x0114``) models only the self-clearing RESET bit and resets no
+  other state; there is no acceptance filter --
   RxCTL, LineCTL and the IA are accepted and ignored, so every queued
   frame is "received" whatever its destination address.
 * **CIA1 TOD** (``$DC08-$DC0B``) reads as ``00:00:00.0`` forever, so a
@@ -59,6 +62,7 @@ _TXCMD_LO, _TXCMD_HI = 0xDE0C, 0xDE0D
 _TXLEN_LO, _TXLEN_HI = 0xDE0E, 0xDE0F
 
 PP_RXCFG = 0x0102
+PP_SELFCTL = 0x0114
 PP_RXEVENT = 0x0124
 PP_BUSST = 0x0138
 
@@ -91,6 +95,23 @@ class Cs8900aSim:
     #: Every RTDATA read, in order, as (register, value) -- lets a test
     #: assert the #210 half ordering directly.
     rtdata_reads: list[tuple[int, int]] = field(default_factory=list)
+    #: How many transmit bids get ``Rdy4TxNOW``.  ``None`` (the default)
+    #: is the old model, every bid ready at once; ``k`` readies the first
+    #: ``k`` bids (a bid is a TxLength high-byte write) and never another,
+    #: which is the wedged chip of issues #234/#236.
+    tx_ready_budget: int | None = None
+    #: Number of TxLength high-byte writes seen so far.
+    tx_bids: int = 0
+    #: Every read of BusST's high byte -- one per ``Rdy4TxNOW`` poll pass.
+    busst_hi_reads: int = 0
+    #: SelfCTL reads that still report RESET (bit 6) after a RESET write;
+    #: ``None`` means RESET never self-clears.
+    reset_clears_after: int | None = 0
+    resets: int = 0
+    selfctl_reads: int = 0
+    _reset_reads_left: int | None = 0
+    #: Every PacketPage data write, in order, as (pp, high_half, value).
+    pp_writes: list[tuple[int, bool, int]] = field(default_factory=list)
 
     # -- RX side -------------------------------------------------------
     def _start_frame(self) -> None:
@@ -145,6 +166,8 @@ class Cs8900aSim:
         if addr == _PPTR_HI:
             return self.pptr >> 8
         if addr in (_PPDATA_LO, _PPDATA_HI):
+            if addr == _PPDATA_HI and self.pptr == PP_BUSST and self.clockport:
+                self.busst_hi_reads += 1
             word = self._pp_read(self.pptr)
             return (word & 0xFF) if addr == _PPDATA_LO else (word >> 8) & 0xFF
         if addr in (_RTDATA_LO, _RTDATA_HI):
@@ -182,6 +205,7 @@ class Cs8900aSim:
         if addr == _TXLEN_HI:
             self.txlen = (self.txlen & 0x00FF) | (value << 8)
             self._tx_buf = bytearray()
+            self.tx_bids += 1
             return
         if addr in (_RTDATA_LO, _RTDATA_HI):
             self._tx_write(addr, value)
@@ -194,12 +218,26 @@ class Cs8900aSim:
         if pp == PP_RXEVENT:
             return self._rx_event()
         if pp == PP_BUSST:
-            return BUSST_RDY4TXNOW
+            ready = self.tx_ready_budget is None or self.tx_bids <= self.tx_ready_budget
+            return (BUSST_RDY4TXNOW if ready else 0) | 0x0018
+        if pp == PP_SELFCTL:
+            self.selfctl_reads += 1
+            if self._reset_reads_left is None:
+                return 0x0055                 # RESET stuck set
+            if self._reset_reads_left > 0:
+                self._reset_reads_left -= 1
+                return 0x0055
+            return 0x0015
         if pp == PP_RXCFG:
             return self.rxcfg
         return 0
 
     def _pp_write_half(self, pp: int, value: int, *, high: bool) -> None:
+        self.pp_writes.append((pp, high, value))
+        if pp == PP_SELFCTL and not high and value & 0x40:
+            self.resets += 1
+            self._reset_reads_left = self.reset_clears_after
+            return
         if pp == PP_RXCFG:
             if high:
                 raise SimError("RxCFG high byte written (drops chip state on silicon)")

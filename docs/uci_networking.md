@@ -23,7 +23,7 @@ measured on the U64E unless it says otherwise.
 *C64 and Cartridge Settings → Command Interface → Enabled*.
 `enable_uci(client)` flips that item over REST. The live suites follow it
 with `client.reset()` and a 3 s settle before the first routine
-(`tests/test_uci_udp_send_live.py:242-249`); without that, every routine
+(`tests/test_uci_udp_send_live.py:274-280`); without that, every routine
 times out at the sentinel. Keep that sequence. It is a recorded
 observation, and **its cause is not explained by firmware source**. From
 source, read at tag `1.1.0` (the C64U) and `7f6fcb51` (the U64E's
@@ -79,8 +79,9 @@ v3.15-85), not measured:
 
   The REU enable follows the same two cases; its prohibit check is
   `c64.cc:1056-1061` (`:1335-1339` at `7f6fcb51`).
-  `Ultimate64Client.reboot`'s docstring states the unconditional version;
-  that contradiction is #299.
+  `Ultimate64Client.reboot`'s docstring stated the unconditional version
+  until #299 corrected it to this account
+  (`tests/test_reboot_docstring.py` pins the two together).
 
 To find the real cause, drop the reset on a device and see which step
 fails. Nobody has done that. The write is memory-only — it is a config PUT, so
@@ -106,6 +107,51 @@ command-line processor reads the buffer on its next cycle as if the user
 typed the `SYS` command and RETURN, which JSRs into the routine. The
 routine does its work, writes the sentinel byte, and executes `RTS` to
 return to BASIC, which resumes its READY prompt loop.
+
+**If the sentinel never arrives, the host resets the 6510 before it
+raises** (issue #313, PR #332). The routine's wait fragments
+(`_build_wait_idle`, `_build_push_and_wait`, the turbo `JMP busy_loop`
+forms) are unbounded, so a timed-out routine may still be executing at
+`code_addr`, and the next call's chunked upload would land on live code.
+On a timeout the host:
+
+1. calls `transport.reset(scope="cpu")`. On a U64 that is the bodyless
+   `PUT /v1/machine:reset`, so it costs no `/Temp` attachment;
+2. sleeps `_TIMEOUT_RESET_SETTLE` (3 s), because the KERNAL reset clears
+   `$0200-$03FF` and a `SYS` typed before `READY.` would be lost. The 3 s
+   is borrowed from the live suites' post-`reset()` settle and is
+   unmeasured for this path;
+3. raises `TimeoutError`. If the reset itself raised, the `TimeoutError`
+   is still what the caller gets, chained from the reset error, with no
+   settle taken.
+
+It never uses `scope="machine"`, which on a U64 is `machine:reboot`, a
+different operation (see #299). **By source, the UCI enable survives the
+reset:**
+
+- `machine:reset` runs `MENU_C64_RESET` → `C64::reset()`.
+- `C64::reset()` only pulses `C64_MODE_RESET`; it calls neither
+  `set_emulation_flags()` nor `start_cartridge()`.
+- Read at tag `1.1.0` (`c64.cc:593-601`, `c64_subsys.cc:183-190`,
+  `route_machine.cc:30-36`) and at `7f6fcb51` (`c64.cc:612-620`,
+  `c64_subsys.cc:217-224`, `route_machine.cc:73-85`).
+- Two side effects, neither of which affects UCI:
+  - on both refs, `MENU_C64_RESET` calls `release_host()` before
+    resetting (`c64_subsys.cc:184-187` at `1.1.0`,
+    `c64_subsys.cc:218-221` at `7f6fcb51`), which closes an open menu, on
+    the C64U as well;
+  - at `7f6fcb51` only, on success the route also releases REST-held
+    keyboard keys and the joystick (`route_machine.cc:77-81`:
+    `restReleaseAll`, `releaseAllRest`, under `#if U64`; the `1.1.0`
+    route has no such block).
+
+  So a timeout closes an open menu, and on `7f6fcb51` also releases held
+  keys and joystick.
+- This has not been measured on a device.
+
+The reset does not clear a UCI STATE-bit wedge (#112); that still needs a
+physical power-cycle. Whatever program was running on the C64 is gone
+after a timeout.
 
 ```asm
 ; Tail of every UCI routine:

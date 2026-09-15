@@ -303,8 +303,10 @@ HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
         owner="backends.ultimate64_probe.liveness_probe",
         purpose="128-byte writemem POST round-trip payload via the raw "
                 "REST client (bypasses the transport MemoryPolicy); "
-                "original bytes written back on success only — the "
-                "readback-failure branches leave the pattern in place",
+                "original bytes written back after a round-trip or a "
+                "readback mismatch; a refused restore, or a failure after "
+                "the write, leaves the pattern in place and reports "
+                "LivenessResult.scratch_restored=False with a WARNING",
         configurable="hardcoded",
         transient=True,
     ),
@@ -361,17 +363,18 @@ HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
     ScratchRegion(
         0xC000, 0xC400,
         owner="uci_network._execute_uci_routine / build_uci_command",
-        purpose="UCI stub block: code $C000, data $C100, response $C200, "
+        purpose="UCI stub block: code $C000, data $C100 (plain routines "
+                "only — turbo routines cover it), response $C200, "
                 "status $C300, lengths $C3F0-$C3F3, sentinel $C3FE, "
                 "error $C3FF",
         configurable="code_addr= for the routine; buffers hardcoded",
     ),
     ScratchRegion(
-        0xC100, 0xC349,
+        0xC100, 0xC36A,
         owner="bridge_ping.run_ping_and_wait / run_icmp_responder",
         purpose="TX / echo-match / echo-respond routines (largest: the "
                 "ARP-answering echo-respond routine of "
-                "run_icmp_responder(my_mac=...), 585 bytes; 349 without "
+                "run_icmp_responder(my_mac=...), 618 bytes; 369 without "
                 "my_mac)",
         configurable="consume_addr=",
     ),
@@ -384,15 +387,19 @@ HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
     ),
     ScratchRegion(
         0xC403, 0xC404,
-        owner="uci_network.uci_socket_write",
-        purpose="socket-id slot for the lifted-cap write routine",
+        owner="uci_network.uci_socket_write (also uci_socket_read / "
+              "uci_socket_close with turbo_safe=True)",
+        purpose="socket-id slot for the lifted-cap write routine and the "
+                "turbo read/close routines",
         configurable="hardcoded",
     ),
     ScratchRegion(
         0xC500, 0xC87E,
-        owner="uci_network.uci_socket_write",
+        owner="uci_network.uci_socket_write (also uci_tcp_connect / "
+              "uci_udp_connect with turbo_safe=True)",
         purpose="data buffer (up to 892 bytes) followed by the 2-byte LE "
-                "length",
+                "length; turbo connect routines read the NUL-terminated "
+                "hostname here",
         configurable="hardcoded",
     ),
     ScratchRegion(

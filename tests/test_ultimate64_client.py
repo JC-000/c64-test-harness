@@ -319,18 +319,30 @@ def test_write_mem_uses_hex_data_query_param():
 
 
 def test_write_mem_small_payload_at_threshold_uses_put_query():
-    """Exactly WRITE_MEM_QUERY_THRESHOLD bytes still takes the legacy PUT path."""
+    """Exactly ``write_mem_query_threshold`` bytes still takes the PUT path,
+    and one byte more takes POST.
+
+    Replaces a version that sized its payload from the class constant (48)
+    on a client whose failed probe graded it 128: a 48-byte write is a PUT
+    under any threshold from 48 to 128, so it passed whatever the constant
+    was (#249).  The threshold here is pinned to 100, which is neither grade
+    value, and both sides of the boundary are asserted.
+    """
     mock, captured = _capture(b"")
-    c = Ultimate64Client("h")
-    payload = bytes(range(Ultimate64Client.WRITE_MEM_QUERY_THRESHOLD))
+    c = Ultimate64Client("h", write_mem_query_threshold=100)
+    payload = bytes(i & 0xFF for i in range(100))
     with patch("urllib.request.urlopen", mock):
         c.write_mem(0x0400, payload)
+        c.write_mem(0x0400, payload + b"\x01")
     req = captured[0][0]
     assert req.get_method() == "PUT"
     assert req.data is None
     url = req.get_full_url()
     assert "address=0400" in url
     assert f"data={payload.hex().upper()}" in url
+    over = captured[1][0]
+    assert over.get_method() == "POST"
+    assert over.data == payload + b"\x01"
 
 
 def test_write_mem_large_payload_uses_post_with_body():

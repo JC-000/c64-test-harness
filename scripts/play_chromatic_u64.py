@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _u64_host import require_u64_host  # noqa: E402
+from _u64_host import hold_device_lock, require_u64_host  # noqa: E402
 
 from c64_test_harness.sid import SidFile, build_test_psid
 from c64_test_harness.sid_player import play_sid
@@ -243,20 +243,22 @@ def main() -> None:
         args.host, argv0="python3 scripts/play_chromatic_u64.py",
         usage="python3 scripts/play_chromatic_u64.py --host <HOST>",
     )
-    print(f"Connecting to Ultimate 64 at {host} ...")
-    transport = Ultimate64Transport(host=host)
+    # sid_play replaces the program on the machine: hold the lock (#244).
+    with hold_device_lock(host):
+        print(f"Connecting to Ultimate 64 at {host} ...")
+        transport = Ultimate64Transport(host=host)
 
-    print("Calling play_sid() ...")
-    play_sid(transport, sf)
-    print(f"Playing chromatic scale for {meta['duration_s']:.1f}s ...")
+        print("Calling play_sid() ...")
+        play_sid(transport, sf)
+        print(f"Playing chromatic scale for {meta['duration_s']:.1f}s ...")
 
-    time.sleep(meta["duration_s"] + 1.0)
+        time.sleep(meta["duration_s"] + 1.0)
 
-    print()
-    print("Resetting device to stop audio...")
-    transport._client.reset()
-    transport.close()
-    print("Done.")
+        print()
+        print("Resetting device to stop audio...")
+        transport._client.reset()
+        transport.close()
+        print("Done.")
 
 
 if __name__ == "__main__":

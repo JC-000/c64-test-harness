@@ -211,7 +211,7 @@ class TestBoundsMatchCode:
         largest = max(
             len(bp.build_tx_code(
                 load_addr=bp._DEFAULT_CONSUME_ADDR, frame_buf=0xC400,
-                frame_len=1514, result_addr=0xC0FF,
+                frame_len=256, result_addr=0xC0FF,  # the #238 maximum
             )),
             len(bp.build_read_and_match_echo_reply_code(
                 load_addr=bp._DEFAULT_CONSUME_ADDR, rx_buf=0x8000,
@@ -228,7 +228,8 @@ class TestBoundsMatchCode:
                 my_ip=bytes(4), my_mac=bytes(6), result_addr=0xC0FF,
             )),
         )
-        # tx 79, match 135, respond 349 (post-#213), respond+ARP 585 (#218)
+        # tx 99, match 135, respond 369, respond+ARP 618 (#218, then +20/+33
+        # for the bounded Rdy4TxNOW poll of #236)
         assert consume.length == largest
 
     def test_reu_staging_window_matches_snapshot_constants(self) -> None:

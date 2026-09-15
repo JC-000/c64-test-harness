@@ -211,6 +211,16 @@ def single_vice_with_rrnet():
 class TestRrnetUdpSend:
     """C64 -> host UDP send via the RR-Net cartridge on the L2 bridge."""
 
+    # #304: a 1066-byte frame is beyond build_tx_code's 8-bit copy loop, so
+    # it now raises at emit time (#238).  It never delivered, even under
+    # VICE: the old loop stopped after 1066 & 0xFF = 42 bytes, and VICE 3.10
+    # cs8900.c:775 transmits only when tx_count == tx_length.  strict=True
+    # makes this fail loudly once the builder (or this payload) changes.
+    @pytest.mark.xfail(
+        raises=ValueError,
+        strict=True,
+        reason="#304: frame_len 1066 exceeds the TX copy loop; could never deliver",
+    )
     def test_c64_sends_1024_byte_udp_datagram_to_host(
         self,
         single_vice_with_rrnet: "BinaryViceTransport",

@@ -228,12 +228,13 @@ class Ultimate64Transport(HardwareTransportBase):
     def _rest_write_is_post_safe(self) -> bool:
         """Whether this client's *cached* grade says POST ``writemem`` is safe.
 
-        Reads ``_capabilities`` rather than the probing ``capabilities``
-        property so a write never triggers HTTP of its own.  Anything but
-        an explicit ``True`` — no cache, a failed probe, ``None`` — is
-        treated as leak-prone.
+        Reads the client's public, non-probing ``cached_capabilities``
+        (issue #291) rather than the probing ``capabilities`` property, so
+        a write never triggers HTTP of its own.  Anything but an explicit
+        ``True`` — no cache, a failed probe, ``None``, a client double
+        without the accessor — is treated as leak-prone.
         """
-        caps = getattr(self._client, "_capabilities", None)
+        caps = getattr(self._client, "cached_capabilities", None)
         return getattr(caps, "writemem_post_safe", None) is True
 
     @property

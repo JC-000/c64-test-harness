@@ -25,7 +25,7 @@ A 1-byte cap regression in :func:`uci_socket_write` would cause:
 
 Usage::
 
-    UCI_UDP_LIVE=1 U64_HOST=<device> \\
+    UCI_UDP_LIVE=1 U64_ALLOW_MUTATE=1 U64_HOST=<device> \\
     ~/.local/share/c64-test-harness/venv/bin/pytest \\
         tests/test_uci_udp_send_large_live.py -xvs
 """
@@ -49,6 +49,12 @@ pytestmark = [
         not U64_HOST,
         reason="U64_HOST not set — live Ultimate 64 tests disabled",
     ),
+    # Enables the Command Interface and resets the machine (#268).
+    pytest.mark.skipif(
+        not os.environ.get("U64_ALLOW_MUTATE"),
+        reason="U64_ALLOW_MUTATE not set — test enables the Command "
+        "Interface and resets the machine",
+    ),
 ]
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -60,6 +66,7 @@ from c64_test_harness.backends.ultimate64_client import (  # noqa: E402
 from c64_test_harness.uci_network import (  # noqa: E402
     disable_uci,
     enable_uci,
+    get_uci_enabled,
     uci_get_ip,
     uci_socket_close,
     uci_socket_write,
@@ -79,6 +86,25 @@ INVALID_SOCKET_ID = 0xFF
 MID_PAYLOAD_SIZE = 800   # crosses 6502 page boundaries; well past the old 255 cap
 MAX_PAYLOAD_SIZE = 892   # empirical firmware ceiling (theoretical 893 truncates)
 OVER_CAP_SIZE    = 893   # one byte over — must raise ValueError host-side
+
+
+def _restore_command_interface(client: Ultimate64Client, prior: bool) -> None:
+    """Put ``Command Interface`` back to the value read before the first write.
+
+    Restoring to a fixed ``Disabled`` would itself drift a device that
+    arrived with the interface enabled (#268).  A failed restore is
+    reported loudly, not raised, so it cannot mask the test's own failure.
+    """
+    target = "Enabled" if prior else "Disabled"
+    try:
+        print(f"Restoring Command Interface to {target}...", flush=True)
+        (enable_uci if prior else disable_uci)(client)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"WARNING: Command Interface NOT restored to {target}: {exc!r} "
+            "-- the device is left drifted",
+            flush=True,
+        )
 
 
 def _detect_local_ip(target: str) -> str:
@@ -285,16 +311,19 @@ def test_uci_udp_send_large_payload() -> None:
 
     client: Ultimate64Client | None = None
     transport: Ultimate64Transport | None = None
-    uci_was_enabled = False
+    # What to put back, read before the first write (#268).  ``None`` means
+    # nothing has been written yet.  Bound before ``enable_uci`` so a PUT that
+    # applied and then raised is still restored.
+    uci_prior: bool | None = None
     try:
         client = Ultimate64Client(host=U64_HOST, timeout=30.0)
         transport = Ultimate64Transport(
             host=U64_HOST, timeout=30.0, client=client,
         )
 
+        uci_prior = get_uci_enabled(client)
         print("Enabling UCI (Command Interface)...", flush=True)
         enable_uci(client)
-        uci_was_enabled = True
         # enable_uci flips the config item but the I/O registers at
         # $DF1C-$DF1F do not go live until the next machine reset.
         # (See enable_uci docstring; matches the pattern used by
@@ -365,13 +394,8 @@ def test_uci_udp_send_large_payload() -> None:
         )
 
     finally:
-        if uci_was_enabled and client is not None:
-            try:
-                print("Disabling UCI...", flush=True)
-                disable_uci(client)
-            except Exception as exc:  # noqa: BLE001
-                print(
-                    f"WARNING: failed to disable UCI on teardown: {exc!r}",
-                    flush=True,
-                )
-        lock.release()
+        try:
+            if uci_prior is not None and client is not None:
+                _restore_command_interface(client, uci_prior)
+        finally:
+            lock.release()

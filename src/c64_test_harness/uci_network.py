@@ -189,6 +189,13 @@ _TAX     = 0xAA
 _TXA     = 0x8A
 _LDA_ABS_Y = 0xB9
 _STA_ABS_Y = 0x99
+# X-indexed forms: loops that cross a turbo fence index with X, because the
+# fence restores X but exits with Y = 0 (issue #298).
+_LDA_ABS_X = 0xBD
+_STA_ABS_X = 0x9D
+_STX_ABS = 0x8E
+_INX     = 0xE8
+_CPX_IMM = 0xE0
 _PHA     = 0x48
 _PLA     = 0x68
 _RTS = 0x60  # 6502 RTS opcode — used to end UCI routines dispatched via SYS.
@@ -219,6 +226,12 @@ _SENTINEL_DONE = 0x42     # magic value written on completion
 # Timeout for polling sentinel (seconds)
 _DEFAULT_TIMEOUT = 10.0
 _POLL_INTERVAL   = 0.05
+#: Host sleep after the reset :func:`_execute_uci_routine` issues on a
+#: timeout (issue #313).  The KERNAL reset clears ``$0200-$03FF``, so a
+#: ``SYS`` typed before ``READY.`` is lost.  3 s is the settle the live UCI
+#: suites use after ``reset()`` (``docs/uci_networking.md``); it is borrowed
+#: from there, not measured for this path.
+_TIMEOUT_RESET_SETTLE = 3.0
 
 # Default addresses for socket operations
 _SOCKET_ID_ADDR = 0xC100
@@ -252,6 +265,14 @@ _INNER_LOOP_Y_SAVE = 0xC402   # Y register save slot across turbo fence
 _WRITE_SOCKET_ID_ADDR = 0xC403
 _WRITE_DATA_BUF_ADDR  = 0xC500
 
+# Where turbo-safe connect/read/close routines read their staged input.
+# Turbo routines are 348-491 bytes at $C000 and cover the legacy $C100 slot,
+# so the upload overwrote the hostname / socket id (issue #322). These reuse
+# the uci_socket_write slots above, which already clear every routine. Plain
+# routines keep $C100, so their bytes are unchanged.
+_TURBO_HOST_ADDR      = _WRITE_DATA_BUF_ADDR   # $C500 — hostname + NUL
+_TURBO_SOCKET_ID_ADDR = _WRITE_SOCKET_ID_ADDR  # $C403 — 1 byte
+
 # EMPIRICAL firmware-side ceiling for one WRITE_SOCKET command.
 #
 # The theoretical ceiling from Gideon's source is CMD_MAX_COMMAND_LEN
@@ -273,6 +294,38 @@ _SOCKET_READ_HEADER_LEN = 2
 #: Maximum payload a single :func:`uci_socket_read` can return. The drain
 #: loop indexes with Y, so header + payload must stay under 256.
 SOCKET_READ_MAX_BYTES = 255 - _SOCKET_READ_HEADER_LEN
+
+
+def _input_addr(addr: int | None, turbo_safe: bool, plain: int,
+                turbo: int) -> int:
+    """Resolve a staged-input address a builder reads (issue #322).
+
+    ``None`` picks the default for the routine's size class: plain routines
+    (116-174 B at ``$C000``) end below ``$C100`` and keep that legacy slot,
+    so their bytes are unchanged; turbo routines (348-491 B) cover ``$C100``,
+    so their input is staged past every routine's footprint, in the
+    ``uci_socket_write`` slots (``$C403`` socket id, ``$C500`` buffer).
+    """
+    if addr is not None:
+        return addr
+    return turbo if turbo_safe else plain
+
+
+def _refuse_input_in_routine(name: str, addr: int, code_addr: int,
+                             code: list[int] | bytes) -> None:
+    """Refuse an input address inside the routine that reads it (#322).
+
+    ``_execute_uci_routine`` writes the routine after the helper staged its
+    input, so an input byte in ``[code_addr, code_addr + len(code))`` is
+    overwritten by the routine's own code before it runs.
+    """
+    end = code_addr + len(code)
+    if code_addr <= addr < end:
+        raise ValueError(
+            f"{name}=${addr:04X} lies inside the {len(code)}-byte routine at "
+            f"${code_addr:04X}-${end - 1:04X}; the upload would overwrite the "
+            f"staged input (issue #322)"
+        )
 
 
 def _lo(addr: int) -> int:
@@ -313,6 +366,11 @@ def _build_fence() -> list[int]:
     Matches c64-https `uci_fence` macro semantics (preserves A/X, ~52 us
     at 48 MHz), implemented with LDY/DEY/BNE to avoid importing SBC into
     the builder opcode set.
+
+    **Y is not preserved: the fence always exits with Y = 0.**  A loop that
+    crosses a fence must index with X (the turbo reply drains and the
+    hostname loop do), or save Y around it (``build_socket_write`` does).
+    Indexing with Y lost the index on every pass (issue #298).
     """
     _DEY = 0x88
     return [
@@ -659,9 +717,9 @@ def _build_read_response_tsx(
 
     Layout::
 
-        LDY #$00
-        STA  resp_len_lo
-        STA  resp_len_hi
+        LDX #$00
+        STX  resp_len_lo
+        STX  resp_len_hi
     loop (pc_loop):
         LDA  $DF1C
         <fence>
@@ -673,21 +731,25 @@ def _build_read_response_tsx(
     read:
         LDA  $DF1E
         <fence>
-        STA  resp_addr,Y
-        INY
+        STA  resp_addr,X
+        INX
         JMP  loop
     done:
-        STY  resp_len
+        STX  resp_len
+
+    The index is X, not Y as in :func:`_build_read_response`: the fence
+    exits with Y = 0, so a Y index stored every byte at *resp_addr* and
+    recorded length 0 (issue #298). Same size as the Y form.
 
     No control write inside the loop: that would be a DATA_ACC accept, which
     resets both queues (issue #155). The single accept lives in
     :func:`_build_acknowledge_tsx`.
     """
     out: list[int] = []
-    # Preamble: LDY #0; STA resp_len; STA resp_len+1
-    out.extend([_LDY_IMM, 0x00])
-    out.extend([_STA_ABS, _lo(resp_len_addr), _hi(resp_len_addr)])
-    out.extend([_STA_ABS, _lo(resp_len_addr + 1),
+    # Preamble: LDX #0; STX resp_len; STX resp_len+1
+    out.extend([_LDX_IMM, 0x00])
+    out.extend([_STX_ABS, _lo(resp_len_addr), _hi(resp_len_addr)])
+    out.extend([_STX_ABS, _lo(resp_len_addr + 1),
                 _hi(resp_len_addr + 1)])
 
     loop_abs = pc + len(out)
@@ -715,9 +777,9 @@ def _build_read_response_tsx(
                 _hi(UCI_RESP_DATA_REG)])
     if fence:
         out.extend(_build_fence())
-    # STA resp_addr,Y
-    out.extend([_STA_ABS_Y, _lo(resp_addr), _hi(resp_addr)])
-    out.append(_INY)
+    # STA resp_addr,X
+    out.extend([_STA_ABS_X, _lo(resp_addr), _hi(resp_addr)])
+    out.append(_INX)
     # JMP loop  (no control write — see the docstring)
     out.extend([_JMP_ABS, _lo(loop_abs), _hi(loop_abs)])
 
@@ -725,8 +787,8 @@ def _build_read_response_tsx(
     done_abs = pc + len(out)
     out[jmp_done_pos + 1] = _lo(done_abs)
     out[jmp_done_pos + 2] = _hi(done_abs)
-    # STY resp_len
-    out.extend([_STY_ABS, _lo(resp_len_addr), _hi(resp_len_addr)])
+    # STX resp_len
+    out.extend([_STX_ABS, _lo(resp_len_addr), _hi(resp_len_addr)])
 
     return out
 
@@ -745,15 +807,18 @@ def _build_read_status_tsx(
     :func:`_build_read_status` does (issue #281)::
 
         LDA $DF1F ; <fence>
-        CPY #max_len ; BNE store ; JMP loop   ; full: drain without storing
+        CPX #max_len ; BNE store ; JMP loop   ; full: drain without storing
     store:
-        STA status,Y ; INY ; JMP loop
+        STA status,X ; INX ; JMP loop
+
+    The index is X because the fence exits with Y = 0 (issue #298); see
+    :func:`_build_read_response_tsx`.
     """
     _check_status_max_len(max_len)
     out: list[int] = []
-    out.extend([_LDY_IMM, 0x00])
-    out.extend([_STY_ABS, _lo(stat_len_addr), _hi(stat_len_addr)])
-    out.extend([_STY_ABS, _lo(stat_len_addr + 1),
+    out.extend([_LDX_IMM, 0x00])
+    out.extend([_STX_ABS, _lo(stat_len_addr), _hi(stat_len_addr)])
+    out.extend([_STX_ABS, _lo(stat_len_addr + 1),
                 _hi(stat_len_addr + 1)])
 
     loop_abs = pc + len(out)
@@ -775,17 +840,17 @@ def _build_read_status_tsx(
                 _hi(UCI_STATUS_DATA_REG)])
     if fence:
         out.extend(_build_fence())
-    out.extend([_CPY_IMM, max_len])
+    out.extend([_CPX_IMM, max_len])
     out.extend([_BNE, 0x03])            # -> store
     out.extend([_JMP_ABS, _lo(loop_abs), _hi(loop_abs)])  # full: drain only
-    out.extend([_STA_ABS_Y, _lo(status_addr), _hi(status_addr)])
-    out.append(_INY)
+    out.extend([_STA_ABS_X, _lo(status_addr), _hi(status_addr)])
+    out.append(_INX)
     out.extend([_JMP_ABS, _lo(loop_abs), _hi(loop_abs)])
 
     done_abs = pc + len(out)
     out[jmp_done_pos + 1] = _lo(done_abs)
     out[jmp_done_pos + 2] = _hi(done_abs)
-    out.extend([_STY_ABS, _lo(stat_len_addr), _hi(stat_len_addr)])
+    out.extend([_STX_ABS, _lo(stat_len_addr), _hi(stat_len_addr)])
 
     return out
 
@@ -1038,7 +1103,7 @@ def build_get_ip(
 
 
 def build_tcp_connect(
-    host_addr: int = _HOST_ADDR,
+    host_addr: int | None = None,
     port: int = 80,
     result_addr: int = _RESP_ADDR,
     status_addr: int = _STATUS_ADDR,
@@ -1055,6 +1120,11 @@ def build_tcp_connect(
     ASCII string.  *port* is encoded little-endian in the command params.
     The socket ID is stored in the first byte of *result_addr*.
 
+    *host_addr* defaults to ``$C100`` for a plain routine and ``$C500``
+    (:data:`_TURBO_HOST_ADDR`) for a turbo-safe one, whose 491 bytes cover
+    ``$C100``; an explicit address inside the routine raises ``ValueError``
+    (issue #322).
+
     :param turbo_safe: see :func:`build_uci_command`.
     """
     return _build_connect_routine(
@@ -1066,7 +1136,7 @@ def build_tcp_connect(
 
 
 def build_udp_connect(
-    host_addr: int = _HOST_ADDR,
+    host_addr: int | None = None,
     port: int = 53,
     result_addr: int = _RESP_ADDR,
     status_addr: int = _STATUS_ADDR,
@@ -1078,6 +1148,8 @@ def build_udp_connect(
     turbo_safe: bool = False,
 ) -> bytes:
     """Build routine: UDP_SOCKET_CONNECT (same structure as TCP).
+
+    *host_addr* resolves and is checked as in :func:`build_tcp_connect`.
 
     :param turbo_safe: see :func:`build_uci_command`.
     """
@@ -1091,7 +1163,7 @@ def build_udp_connect(
 
 def _build_connect_routine(
     cmd: int,
-    host_addr: int,
+    host_addr: int | None,
     port: int,
     result_addr: int,
     status_addr: int,
@@ -1103,6 +1175,29 @@ def _build_connect_routine(
     turbo_safe: bool = False,
 ) -> bytes:
     """Build TCP or UDP connect routine with hostname from C64 memory."""
+    host_addr = _input_addr(host_addr, turbo_safe, _HOST_ADDR,
+                            _TURBO_HOST_ADDR)
+    code = _emit_connect_routine(
+        cmd, host_addr, port, result_addr, status_addr, resp_len_addr,
+        stat_len_addr, error_addr, sentinel_addr, code_addr, turbo_safe,
+    )
+    _refuse_input_in_routine("host_addr", host_addr, code_addr, code)
+    return code
+
+
+def _emit_connect_routine(
+    cmd: int,
+    host_addr: int,
+    port: int,
+    result_addr: int,
+    status_addr: int,
+    resp_len_addr: int,
+    stat_len_addr: int,
+    error_addr: int,
+    sentinel_addr: int,
+    code_addr: int,
+    turbo_safe: bool,
+) -> bytes:
     port_lo = port & 0xFF
     port_hi = (port >> 8) & 0xFF
 
@@ -1164,9 +1259,9 @@ def _build_connect_routine(
         # Turbo-safe hostname loop — fence after each STA $DF1D, JMP back
         # for loop (short branch can't reach past a fence expansion).
         #
-        #   LDY #0
+        #   LDX #0
         #   loop:
-        #     LDA host,Y       (3)
+        #     LDA host,X       (3)
         #     BEQ +3           (2)  -> skip JMP write_host  (i.e. reached null)
         #     JMP write_host   (3)
         #     ; null: write terminator and fall through
@@ -1176,15 +1271,18 @@ def _build_connect_routine(
         #   write_host:
         #     STA $DF1D        (3)
         #     <fence>
-        #     INY              (1)
-        #     BEQ +3           (2)  -> Y wrapped 255->0, bail
+        #     INX              (1)
+        #     BEQ +3           (2)  -> X wrapped 255->0, bail
         #     JMP loop         (3)
-        #     ; fall through on Y wrap
+        #     ; fall through on X wrap
         #   after_host:
+        #
+        # X, not Y: the fence exits with Y = 0, so a Y index re-sent
+        # host[1] forever and never reached the terminator (issue #298).
         host_loop_abs = pc()
-        code.extend([_LDY_IMM, 0x00])
+        code.extend([_LDX_IMM, 0x00])
         loop_abs = pc()
-        code.extend([_LDA_ABS_Y, _lo(host_addr), _hi(host_addr)])
+        code.extend([_LDA_ABS_X, _lo(host_addr), _hi(host_addr)])
         # BEQ +3 -> skip "JMP write_host" (3 bytes)
         code.extend([_BEQ, 0x03])
         jmp_write_pos = len(code)
@@ -1202,8 +1300,8 @@ def _build_connect_routine(
         code.extend([_STA_ABS, _lo(UCI_CMD_DATA_REG),
                      _hi(UCI_CMD_DATA_REG)])
         code.extend(_build_fence())
-        code.append(_INY)
-        code.extend([_BEQ, 0x03])  # Y wrapped — bail
+        code.append(_INX)
+        code.extend([_BEQ, 0x03])  # X wrapped — bail
         code.extend([_JMP_ABS, _lo(loop_abs), _hi(loop_abs)])
         # after_host:
         after_abs = pc()
@@ -1527,7 +1625,7 @@ def build_socket_write(
 
 
 def build_socket_read(
-    socket_id_addr: int = _SOCKET_ID_ADDR,
+    socket_id_addr: int | None = None,
     result_addr: int = _RESP_ADDR,
     max_len: int = 255,
     actual_len_addr: int = _RESP_LEN_ADDR,
@@ -1543,8 +1641,15 @@ def build_socket_read(
     Params: socket_id, length (2 bytes LE).
     Response data goes to *result_addr*, actual length to *actual_len_addr*.
 
+    *socket_id_addr* defaults to ``$C100`` for a plain routine and ``$C403``
+    (:data:`_TURBO_SOCKET_ID_ADDR`) for a turbo-safe one, which covers
+    ``$C100``; an explicit address inside the routine raises ``ValueError``
+    (issue #322).
+
     :param turbo_safe: see :func:`build_uci_command`.
     """
+    socket_id_addr = _input_addr(socket_id_addr, turbo_safe, _SOCKET_ID_ADDR,
+                                 _TURBO_SOCKET_ID_ADDR)
     len_lo = max_len & 0xFF
     len_hi = (max_len >> 8) & 0xFF
 
@@ -1638,11 +1743,12 @@ def build_socket_read(
     code.extend(_build_sentinel(sentinel_addr))
     code.append(_RTS)
 
+    _refuse_input_in_routine("socket_id_addr", socket_id_addr, code_addr, code)
     return bytes(code)
 
 
 def build_socket_close(
-    socket_id_addr: int = _SOCKET_ID_ADDR,
+    socket_id_addr: int | None = None,
     status_addr: int = _STATUS_ADDR,
     stat_len_addr: int = _STAT_LEN_ADDR,
     error_addr: int = _ERROR_ADDR,
@@ -1652,10 +1758,13 @@ def build_socket_close(
 ) -> bytes:
     """Build routine: SOCKET_CLOSE.
 
-    Socket ID is read from *socket_id_addr* (1 byte).
+    Socket ID is read from *socket_id_addr* (1 byte), which resolves and is
+    checked as in :func:`build_socket_read`.
 
     :param turbo_safe: see :func:`build_uci_command`.
     """
+    socket_id_addr = _input_addr(socket_id_addr, turbo_safe, _SOCKET_ID_ADDR,
+                                 _TURBO_SOCKET_ID_ADDR)
     code: list[int] = []
 
     def pc() -> int:
@@ -1728,6 +1837,7 @@ def build_socket_close(
     code.extend(_build_sentinel(sentinel_addr))
     code.append(_RTS)
 
+    _refuse_input_in_routine("socket_id_addr", socket_id_addr, code_addr, code)
     return bytes(code)
 
 
@@ -1824,9 +1934,32 @@ def _execute_uci_routine(
 
     Routines dispatched this way MUST end with RTS, not JMP or BRK.
 
+    **On timeout the machine is reset.** The wait fragments
+    (:func:`_build_wait_idle`, :func:`_build_push_and_wait` and the turbo
+    ``JMP busy_loop`` forms) are unbounded, so a routine whose sentinel never
+    arrived may still be executing; the caller's next upload would land on
+    live code, in several chunked writes (issue #313). So before raising,
+    this calls ``transport.reset(scope="cpu")`` -- on a U64 the bodyless
+    ``PUT machine:reset`` (no ``/Temp`` cost), which pulses the 6510 reset
+    only and leaves the ``Command Interface`` config and FPGA enable alone
+    (firmware ``MENU_C64_RESET`` -> ``C64::reset``, not measured; read at
+    tag ``1.1.0``, ``c64.cc:593-601``, and at ``7f6fcb51`` (the U64E's
+    v3.15-85), ``c64.cc:612-620``, ``c64_subsys.cc:217-224``,
+    ``route_machine.cc:73-85``; unchanged at ``871ad034``) -- then
+    sleeps :data:`_TIMEOUT_RESET_SETTLE` so the KERNAL is back at
+    ``READY.`` before the next ``SYS`` is typed. It never uses
+    ``scope="machine"``: on a U64 that is ``machine:reboot``, which returns
+    with the Command-Interface slot disabled. Whatever program was running
+    on the C64 is gone after a timeout. It does **not** clear a UCI
+    STATE-bit wedge (issue #112): that needs a physical power-cycle.
+
     Raises:
-        UCIError: If the error flag is set after execution.
-        TimeoutError: If sentinel is not set within *timeout* seconds.
+        UCIError: If the error flag is set after execution (no reset: the
+            routine returned).
+        TimeoutError: If sentinel is not set within *timeout* seconds, after
+            the reset above. If the reset itself raises, the timeout is still
+            what is raised, chained ``from`` the reset's exception, and no
+            settle is taken.
     """
     from .transport import TimeoutError
 
@@ -1860,9 +1993,28 @@ def _execute_uci_routine(
             break
         time.sleep(_POLL_INTERVAL)
     else:
-        raise TimeoutError(
+        message = (
             f"UCI routine did not complete within {timeout}s "
             f"(sentinel at ${sentinel_addr:04X} never set)"
+        )
+        # The routine's wait fragments are unbounded busy-waits, so it may
+        # still be executing at code_addr. Stop it before the caller's next
+        # upload lands on top of it (issue #313).
+        try:
+            transport.reset(scope="cpu")
+        except Exception as exc:
+            _log.warning(
+                "UCI routine timed out and the reset that should stop it "
+                "failed: %r", exc,
+            )
+            raise TimeoutError(
+                f"{message}; the reset to stop it failed ({exc!r}), so the "
+                f"routine may still be running at ${code_addr:04X}"
+            ) from exc
+        time.sleep(_TIMEOUT_RESET_SETTLE)
+        raise TimeoutError(
+            f"{message}; the 6510 was reset (scope='cpu') so the routine "
+            f"is not left running"
         )
 
     # Check error flag
@@ -1904,7 +2056,7 @@ def uci_get_ip(
 ) -> str:
     """Query the U64's IP address via UCI GET_IP_ADDRESS.
 
-    Returns the IP address as a dotted-quad string (e.g. ``"192.168.1.81"``).
+    Returns the IP address as a dotted-quad string (e.g. ``"192.0.2.64"``).
 
     :param turbo_safe: see :func:`build_uci_command`.
 
@@ -1975,8 +2127,9 @@ def uci_tcp_connect(
     :param turbo_safe: see :func:`build_uci_command`.
     """
     host_bytes = host.encode("ascii") + b"\x00"
-    transport.write_memory(_DATA_ADDR, host_bytes)
-    code = build_tcp_connect(_DATA_ADDR, port, turbo_safe=turbo_safe)
+    host_addr = _input_addr(None, turbo_safe, _DATA_ADDR, _TURBO_HOST_ADDR)
+    transport.write_memory(host_addr, host_bytes)
+    code = build_tcp_connect(host_addr, port, turbo_safe=turbo_safe)
     _execute_uci_routine(transport, code, timeout=timeout)
     return transport.read_memory(_RESP_ADDR, 1)[0]
 
@@ -1996,8 +2149,9 @@ def uci_udp_connect(
     :param turbo_safe: see :func:`build_uci_command`.
     """
     host_bytes = host.encode("ascii") + b"\x00"
-    transport.write_memory(_DATA_ADDR, host_bytes)
-    code = build_udp_connect(_DATA_ADDR, port, turbo_safe=turbo_safe)
+    host_addr = _input_addr(None, turbo_safe, _DATA_ADDR, _TURBO_HOST_ADDR)
+    transport.write_memory(host_addr, host_bytes)
+    code = build_udp_connect(host_addr, port, turbo_safe=turbo_safe)
     _execute_uci_routine(transport, code, timeout=timeout)
     return transport.read_memory(_RESP_ADDR, 1)[0]
 
@@ -2085,7 +2239,7 @@ def uci_socket_read(
 
     .. warning::
         *max_len* is capped at :data:`SOCKET_READ_MAX_BYTES` (253) rather
-        than 255 because the drain loop indexes with an 8-bit Y register:
+        than 255 because the drain loop indexes with an 8-bit register:
         the two header bytes plus 254 payload bytes would wrap it. Lifting
         the cap needs a 16-bit drain, which is the same work as draining the
         multi-block replies firmware 3.15 can return — tracked separately.
@@ -2095,7 +2249,8 @@ def uci_socket_read(
             f"max_len must be <= {SOCKET_READ_MAX_BYTES}, got {max_len}"
         )
 
-    socket_id_addr = _DATA_ADDR
+    socket_id_addr = _input_addr(None, turbo_safe, _DATA_ADDR,
+                                 _TURBO_SOCKET_ID_ADDR)
     transport.write_memory(socket_id_addr, bytes([socket_id]))
 
     code = build_socket_read(
@@ -2140,7 +2295,8 @@ def uci_socket_close(
 
     :param turbo_safe: see :func:`build_uci_command`.
     """
-    socket_id_addr = _DATA_ADDR
+    socket_id_addr = _input_addr(None, turbo_safe, _DATA_ADDR,
+                                 _TURBO_SOCKET_ID_ADDR)
     transport.write_memory(socket_id_addr, bytes([socket_id]))
 
     code = build_socket_close(socket_id_addr, turbo_safe=turbo_safe)

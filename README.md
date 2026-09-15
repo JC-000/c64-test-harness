@@ -1060,7 +1060,7 @@ python3 scripts/stress_u64_queue.py <device> --workers 6 --rounds 5
 
 Every live test runs inside the autouse `device_lock_guard` fixture, so `DeviceLock` serializes access to the physical device whether or not the test asks for it. Multiple agents (separate OS processes) can safely run tests in parallel — the lock file queues them automatically. See [Shared-device contract](#shared-device-contract-devicelock) for what that obliges non-test tools to do, and set `U64_REQUIRE_DEVICE_LOCK=1` to make an unlocked destructive call an error instead of a warning.
 
-Live suites that mutate device state (`test_u64_feature_parity_live.py`, `test_multi_sid_parallel_live.py`, `test_ultimate64_client_writemem_live.py`, the turbo/SocketDMA suites above) are double-gated behind `U64_HOST` **and** `U64_ALLOW_MUTATE=1`; with either unset they skip cleanly. The UCI UDP live probes (`test_uci_udp_send_live.py`, `test_uci_udp_send_large_live.py`) read the device address from `U64_HOST` (plus their `UCI_UDP_LIVE=1` gate) — no hardcoded IPs.
+Live suites that mutate device state (`test_u64_feature_parity_live.py`, `test_multi_sid_parallel_live.py`, `test_ultimate64_client_writemem_live.py`, the turbo/SocketDMA suites above) are double-gated behind `U64_HOST` **and** `U64_ALLOW_MUTATE=1`; with either unset they skip cleanly. The UCI UDP live probes (`test_uci_udp_send_live.py`, `test_uci_udp_send_large_live.py`) read the device address from `U64_HOST` (plus their `UCI_UDP_LIVE=1` gate, and `U64_ALLOW_MUTATE=1` because they enable the Command Interface and reset the machine, #268) — no hardcoded IPs.
 
 ## Contributing
 

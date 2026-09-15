@@ -22,23 +22,52 @@ so a script only exports it (``export=True``) when it has to hand the gate to
 a child — the pytest runners. See CLAUDE.md § "Standing hardware-safety
 clause" before pointing any of this at the C64 Ultimate.
 
+Issue #244 adds the second half: naming a device is consent to drive it,
+not permission to drive it *while someone else is*. :func:`hold_device_lock`
+is the one way a script takes the cross-process ``DeviceLock`` — after the
+host is resolved, before the first request, released in ``finally`` — so
+that ``run_prg``/``sid_play``/``reset`` in a script cannot replace a
+neighbouring lane's program (docs/device_locking.md, #194). Scripts that go
+through ``create_manager``/``UnifiedManager`` are already locked by the
+manager and do not need it; the pytest-launching wrappers are locked per
+test by ``tests/conftest.py``. ``tests/test_u64_runner_script_gates.py``
+pins all three shapes structurally.
+
 Imported by sibling scripts as::
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _u64_host import require_u64_host
+    from _u64_host import hold_device_lock, require_u64_host
 """
 from __future__ import annotations
 
 import os
 import sys
-from typing import TextIO
+from contextlib import contextmanager
+from pathlib import Path
+from typing import TYPE_CHECKING, Iterator, TextIO
+
+if TYPE_CHECKING:  # pragma: no cover
+    from c64_test_harness.backends.device_lock import DeviceLock
 
 
-__all__ = ["resolve_u64_host", "require_u64_host", "no_host_message", "NO_HOST_EXIT"]
+__all__ = [
+    "resolve_u64_host",
+    "require_u64_host",
+    "no_host_message",
+    "hold_device_lock",
+    "NO_HOST_EXIT",
+    "NO_LOCK_EXIT",
+]
 
 #: Exit status used when no device was named. Distinct from 1 (the scripts'
 #: own "ran and failed") so a refusal is not read as a device fault.
 NO_HOST_EXIT = 2
+
+#: Exit status when the ``DeviceLock`` could not be taken — the harness would
+#: not import, or the acquire budget ran out behind another holder. Distinct
+#: from 2 (nothing named) and 1 (ran and failed): the script never touched
+#: the device, and a queue is not a device fault.
+NO_LOCK_EXIT = 3
 
 _NO_HOST = """\
 refusing to run: no Ultimate device named.
@@ -116,3 +145,75 @@ def require_u64_host(
         # A no-op when the caller already set it to this value.
         os.environ["U64_HOST"] = host
     return host
+
+
+@contextmanager
+def hold_device_lock(
+    host: str,
+    *,
+    default_timeout: float | None = None,
+    lock_dir: Path | None = None,
+    stderr: TextIO | None = None,
+) -> Iterator["DeviceLock"]:
+    """Hold *host*'s ``DeviceLock`` for the body of a ``with`` block.
+
+    Use it around **everything** that drives the device, from constructing
+    the client to the last restore — the unit of exclusion is the program on
+    the machine, not the HTTP request (docs/device_locking.md, rule 1)::
+
+        host = require_u64_host(args.host, ...)
+        with hold_device_lock(host):
+            client = Ultimate64Client(host=host)
+            ...
+
+    The budget is resolved through the harness's own
+    ``resolve_lock_timeout``: ``U64_DEVICE_LOCK_TIMEOUT`` when set, else
+    *default_timeout*, else the manager path's
+    ``unified_manager.DEFAULT_LOCK_TIMEOUT`` — so a script queues exactly as
+    long as ``create_manager`` would, and a malformed variable fails here
+    (``DeviceLockTimeoutConfigError``) before any lock or device is touched.
+
+    ``allow_nested=True``: a script that re-enters the library while holding
+    the device (e.g. ``create_manager`` inside this block) joins the hold
+    instead of waiting on its own flock, which could never end (#273).
+    Nesting joins any hold in this *process*, whatever the thread, so it is
+    not for threads that outlive the block: the outer release drops the
+    flock even while a nested joiner on another thread is still inside.
+
+    Fails closed, never falls back to an unlocked run: if the harness will
+    not import, or the budget runs out behind another holder, the refusal
+    goes to stderr and the script exits :data:`NO_LOCK_EXIT` without having
+    sent a request. A timeout's diagnostics (holder PID, liveness, lockfile
+    age) are printed; do **not** reboot a device because a lock timed out.
+    """
+    out = stderr if stderr is not None else sys.stderr
+    try:
+        from c64_test_harness.backends.device_lock import (
+            DeviceLock,
+            DeviceLockTimeout,
+            resolve_lock_timeout,
+        )
+        from c64_test_harness.backends.unified_manager import DEFAULT_LOCK_TIMEOUT
+    except ImportError as exc:
+        print(
+            f"refusing to run: cannot take the DeviceLock for {host} because "
+            f"c64_test_harness will not import ({exc}). Driving the device "
+            f"unlocked is the failure the lock exists to prevent.",
+            file=out,
+        )
+        raise SystemExit(NO_LOCK_EXIT) from exc
+
+    timeout = resolve_lock_timeout(
+        None,
+        default=DEFAULT_LOCK_TIMEOUT if default_timeout is None else default_timeout,
+    )
+    lock = DeviceLock(host, lock_dir=lock_dir, allow_nested=True)
+    try:
+        lock.acquire_or_raise(timeout=timeout)
+    except DeviceLockTimeout as exc:
+        print(f"refusing to run: {exc}", file=out)
+        raise SystemExit(NO_LOCK_EXIT) from exc
+    try:
+        yield lock
+    finally:
+        lock.release()

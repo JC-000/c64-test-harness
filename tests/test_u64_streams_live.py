@@ -1,6 +1,8 @@
 """Live integration tests for U64 debug and video stream capture.
 
-Gated by ``U64_HOST`` env var. These tests use the real hardware.
+Gated by ``U64_HOST`` env var. These tests use the real hardware. The three
+tests that write ``Data Streams`` config additionally need
+``U64_ALLOW_MUTATE=1`` (#268).
 DeviceLock is used for cross-process safety.
 
 Example::
@@ -36,6 +38,13 @@ _PW = os.environ.get("U64_PASSWORD")
 
 pytestmark = pytest.mark.skipif(
     not _HOST, reason="U64_HOST not set -- live Ultimate device tests disabled",
+)
+
+#: The tests that write Data Streams config also need ``U64_ALLOW_MUTATE``
+#: (#268); the capture-only tests run on ``U64_HOST``.
+_requires_mutate = pytest.mark.skipif(
+    not os.environ.get("U64_ALLOW_MUTATE"),
+    reason="U64_ALLOW_MUTATE not set -- this test writes device config",
 )
 
 #: Acceptance band for the fraction of PHI2-high cycles on which BA is
@@ -118,6 +127,7 @@ def test_debug_stream_captures_cycles(client: Ultimate64Client) -> None:
     )
 
 
+@_requires_mutate
 def test_debug_bus_cycle_fields(client: Ultimate64Client) -> None:
     """Capture briefly, verify BusCycle field ranges on a CPU read cycle."""
     local = _local_ip()
@@ -224,6 +234,7 @@ def test_debug_stream_irq_detection(client: Ultimate64Client) -> None:
     )
 
 
+@_requires_mutate
 def test_debug_stream_mode_config(client: Ultimate64Client) -> None:
     """Read current mode, set to '6510 & VIC', verify, restore original."""
     orig_mode = get_debug_stream_mode(client)
@@ -357,6 +368,7 @@ def test_data_streams_config_readable(client: Ultimate64Client) -> None:
         logger.info("Data Streams: %s = %s", key, value)
 
 
+@_requires_mutate
 def test_set_stream_destination_roundtrip(client: Ultimate64Client) -> None:
     """Save original debug destination, set test value, read back, restore."""
     config = get_data_streams_config(client)
