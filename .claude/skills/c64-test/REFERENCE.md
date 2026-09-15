@@ -64,7 +64,7 @@ with create_manager() as mgr:
         target.pid        # VICE PID or None for hardware
 
 # Explicit backend
-mgr = UnifiedManager(backend="u64", u64_hosts=["192.168.1.81"])
+mgr = UnifiedManager(backend="u64", u64_hosts=["<device>"])
 target = mgr.acquire()
 mgr.release(target)
 mgr.shutdown()
@@ -613,7 +613,7 @@ Hardware transport for Ultimate 64 via REST API. Implements `C64Transport` proto
 
 ```python
 from c64_test_harness import Ultimate64Transport
-transport = Ultimate64Transport(host="192.168.1.81", password=None, timeout=10.0)
+transport = Ultimate64Transport(host="<device>", password=None, timeout=10.0)
 ```
 
 **C64Transport methods** (memory ops DMA-backed, no CPU pause):
@@ -638,12 +638,12 @@ transport = Ultimate64Transport(host="192.168.1.81", password=None, timeout=10.0
 REST API wrapper for U64 firmware endpoints.
 ```python
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
-client = Ultimate64Client(host="192.168.1.81", password=None, timeout=10.0)
+client = Ultimate64Client(host="<device>", password=None, timeout=10.0)
 
 # Optional: override the per-instance write_mem PUT/POST cutoff (bytes).
 # When omitted, auto-detected from firmware capabilities: 128 on firmware without the
 # Temp-folder fix (C64U 1.1.0, or Ultimate-line < 3.15); 48 on Ultimate-line >= 3.15.
-client = Ultimate64Client(host="192.168.1.81", write_mem_query_threshold=128)
+client = Ultimate64Client(host="<device>", write_mem_query_threshold=128)
 ```
 
 Exception mapping: timeouts, unreachable device, and connection drops mid-request (`ConnectionResetError` / `BrokenPipeError` / truncated HTTP response — fw 3.14d drops connections under load) all raise `Ultimate64TimeoutError`; unparseable or wrong-shaped responses raise `Ultimate64ProtocolError`. Catch `Ultimate64Error` to cover the whole hierarchy — raw socket exceptions no longer escape.
@@ -781,7 +781,7 @@ Cross-process exclusive lock for hardware devices using `fcntl.flock()`. The key
 from c64_test_harness import DeviceLock, DeviceLockTimeout
 
 # Preferred: structured diagnostics on timeout.
-lock = DeviceLock("192.168.1.81")
+lock = DeviceLock("<device>")
 try:
     lock.acquire_or_raise(timeout=120.0)
 except DeviceLockTimeout as e:
@@ -794,7 +794,7 @@ finally:
     lock.release()
 
 # Bool API (legacy) is still supported and unchanged.
-lock = DeviceLock("192.168.1.81")
+lock = DeviceLock("<device>")
 if lock.acquire(timeout=30.0):
     try:
         ...
@@ -879,9 +879,9 @@ Autouse fixture in `tests/conftest.py`. Holds the device lock around every `*_li
 **Integration:** `Ultimate64InstanceManager.acquire()` calls `probe_u64(..., skip_api=True)` before creating a transport. Unreachable devices are rotated to the end of the pool and the next device is tried. If all devices fail, raises `Ultimate64PoolExhaustedError` with collected probe errors.
 
 ### Error message examples
-- `"U64 at 192.168.1.81 unreachable (ping failed, timeout 2.0s)"`
-- `"U64 at 192.168.1.81 port 80 not responding (TCP connect failed, timeout 2.0s)"`
-- `"U64 at 192.168.1.81 API not responding (GET /v1/version failed: <reason>)"`
+- `"U64 at <device> unreachable (ping failed, timeout 2.0s)"`
+- `"U64 at <device> port 80 not responding (TCP connect failed, timeout 2.0s)"`
+- `"U64 at <device> API not responding (GET /v1/version failed: <reason>)"`
 
 ---
 

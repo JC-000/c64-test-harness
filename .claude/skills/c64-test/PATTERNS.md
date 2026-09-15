@@ -1520,7 +1520,7 @@ for name in required:
 **Wrong:**
 ```python
 # NO LOCK — another agent's tests will corrupt yours
-transport = Ultimate64Transport(host="192.168.1.81")
+transport = Ultimate64Transport(host="<device>")
 transport.write_memory(0xC000, b"\xDE\xAD")
 ```
 **Right (pytest fixture):**
@@ -1544,7 +1544,7 @@ def transport():
 See Pattern 9a for how to read `DeviceLockTimeout` (queued vs wedged vs dead vs unreachable) and which branches warrant a reboot vs a retry.
 **Right (standalone script):**
 ```python
-with create_manager(backend="u64", u64_hosts=["192.168.1.81"]) as mgr:
+with create_manager(backend="u64", u64_hosts=["<device>"]) as mgr:
     with mgr.instance() as target:
         target.transport.write_memory(0xC000, b"\xDE\xAD")
 ```
@@ -1555,11 +1555,11 @@ with create_manager(backend="u64", u64_hosts=["192.168.1.81"]) as mgr:
 from c64_test_harness import probe_u64, is_u64_reachable
 
 # Quick check
-if not is_u64_reachable("192.168.1.81"):
+if not is_u64_reachable("<device>"):
     print("Device offline — skipping")
 
 # Detailed probe (ping -> TCP -> API, fail-fast)
-result = probe_u64("192.168.1.81")
+result = probe_u64("<device>")
 if not result.reachable:
     print(f"Probe failed: {result.error}")
 ```

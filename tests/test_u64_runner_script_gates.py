@@ -913,6 +913,91 @@ def test_no_device_address_is_taught_in_usage_text(script_path: Path) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Issue #293: the phantom in README, docs/ and the c64-test skill
+# ---------------------------------------------------------------------------
+
+_REPO = Path(__file__).resolve().parents[1]
+
+#: The skill directory CLAUDE.md sends agents to before they write a test.
+_SKILL_DIR = _REPO / ".claude" / "skills" / "c64-test"
+
+
+def _doc_prose_paths() -> list[Path]:
+    """Markdown outside ``scripts/``/``examples/``/``tests/`` that teaches API use.
+
+    README, every ``docs/**/*.md`` (recursively) and the c64-test skill.
+    """
+    paths = [_REPO / "README.md"]
+    paths += (_REPO / "docs").rglob("*.md")
+    paths += _SKILL_DIR.rglob("*.md")
+    return sorted(p for p in paths if p.is_file())
+
+
+#: Suffix tails of the phantom only, three octets and up. Unlike the scans
+#: above this rule does not cover the bench addresses: the docs name those
+#: deliberately (recovery notes, device facts). Two-octet tails are not used
+#: here because a ``1.81`` tail would match version strings in prose.
+_PHANTOM_TAILS = frozenset(
+    ".".join(_PHANTOM_HOST.split(".")[i:]) for i in range(2)
+)
+
+
+def _phantom_prose_hits(text: str) -> list[tuple[int, str]]:
+    return [
+        (i, line.strip())
+        for i, line in enumerate(text.splitlines(), 1)
+        if any(tail in line for tail in _PHANTOM_TAILS)
+    ]
+
+
+@pytest.mark.parametrize(
+    "doc_path", _doc_prose_paths(), ids=lambda p: str(p.relative_to(_REPO))
+)
+def test_no_doc_teaches_the_phantom_host(doc_path: Path) -> None:
+    """README, docs and the skill show ``<device>``, never the phantom.
+
+    The skill files are what an agent reads before writing a test, so a
+    pasted example there becomes a hard-coded host in a new module (#293).
+    """
+    hits = _phantom_prose_hits(doc_path.read_text(encoding="utf-8"))
+    assert hits == [], (
+        f"{doc_path.relative_to(_REPO)} teaches the phantom device address; "
+        f"use a <device> placeholder: {hits}"
+    )
+
+
+def test_the_doc_phantom_scan_is_not_vacuous() -> None:
+    """Vacuity guard and positive control for the #293 doc scan."""
+    scanned = {str(p.relative_to(_REPO)) for p in _doc_prose_paths()}
+    for expected in (
+        "README.md",
+        "docs/device_locking.md",
+        ".claude/skills/c64-test/SKILL.md",
+        ".claude/skills/c64-test/PATTERNS.md",
+        ".claude/skills/c64-test/REFERENCE.md",
+    ):
+        assert expected in scanned, f"{expected} is not being scanned"
+    assert len(scanned) > 10, f"only {len(scanned)} markdown files scanned"
+
+    # The tails really are the phantom's, and nothing wider.
+    assert _PHANTOM_HOST in _PHANTOM_TAILS
+    assert all(t.count(".") >= 2 for t in _PHANTOM_TAILS)
+
+    # Positive control: the real README with one planted example must fail,
+    # both as the whole address and as a concatenated tail.
+    readme = (_REPO / "README.md").read_text(encoding="utf-8")
+    head, _, tail = _PHANTOM_HOST.partition(".")
+    for planted in (
+        f'client = Ultimate64Client("{_PHANTOM_HOST}")',
+        f'addr = "{head}." + "{tail}"',
+    ):
+        mangled = readme + "\n" + planted + "\n"
+        assert _phantom_prose_hits(mangled), f"planted line not flagged: {planted}"
+    # ...and the placeholder the docs use instead is not flagged.
+    assert _phantom_prose_hits('client = Ultimate64Client("<device>")') == []
+
+
 def _test_module_paths(include_allowlisted: bool = False) -> list[Path]:
     """Test modules to scan.
 
