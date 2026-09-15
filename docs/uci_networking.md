@@ -38,10 +38,16 @@ v3.15-85), not measured:
   `setValue` is `value = v; return setChanged();` (`config.h:121`).
   `setChanged` calls `store->set_need_effectuate()` unless the item has a
   change hook (`config.cc:901-911`; `:902` at `7f6fcb51`). No hook is
-  registered for `CFG_CMD_ENABLE` in `software/io/c64`, `software/u64` or
-  `software/api` at either ref; the only C64 hook there is
-  `CFG_C64_CART_PREF` (`c64.cc:136`). The rest of the tree was not
-  searched. The route then calls `st->at_close_config()`
+  registered for `CFG_CMD_ENABLE` anywhere in the whole `software/` tree
+  at either ref (whole-tree search from #309's review, re-checked here).
+  The item appears only at its definition (`c64.cc:115`), the read in
+  `set_emulation_flags` (`:326`; `:329` at `7f6fcb51`), a menu-group append
+  (`:1580`; `:1863`) and its `#define` (`c64.h:222`; `:224`). The only
+  direct `setChangeHook` call is inside `ConfigStore::set_change_hook`
+  (`config.cc:493`; `:494`), which looks the id up in its own store; the
+  id-looping hook calls in `software/u64/u64_config.cc` register mixer
+  items in the Audio Mixer and Speaker Mixer stores. The route then calls
+  `st->at_close_config()`
   (`route_configs.cc:244` at `1.1.0`, `:313` at `7f6fcb51`), which
   effectuates only `if (need_effectuate())` (`config.h:165-168`; `:201`
   at `7f6fcb51`). Because `setChanged` sets that flag on every set, even
@@ -61,7 +67,7 @@ v3.15-85), not measured:
     reports one (Cartridge Preference *Automatic* with a cart present, or
     *External*), so `set_cartridge` is skipped (`c64.cc:921-924`).
   - **The configured cartridge image prohibits UCI.** `set_cartridge(NULL)`
-    loads the `.crt` named by `CFG_C64_CART_CRT` (`c64.cc:961-963`;
+    loads the `.crt` named by `CFG_C64_CART_CRT` (`c64.cc:962-964`;
     `:1241-1243` at `7f6fcb51`) and restores the enable in
     `set_emulation_flags()`. It then zeroes the enable again if that
     definition's `prohibit` mask includes `CART_UCI`, `CART_UCI_DFFC` or

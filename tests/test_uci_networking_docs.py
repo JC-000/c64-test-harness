@@ -102,6 +102,9 @@ SOURCE_TRACE = (
     # The second exception (review round 1): a configured .crt whose
     # prohibit mask includes UCI zeroes the enable after it is restored.
     "CFG_C64_CART_CRT",
+    # Review round 2: the .crt read-and-load is :962-964 at 1.1.0 (:961 is
+    # the #ifndef); round 1 had it one line early.
+    "c64.cc:962-964",
     "c64.cc:1062-1068",
     "CART_PROHIBIT_DFXX",
     "c64.cc:1056-1061",
@@ -142,7 +145,7 @@ _SUBJECT = re.compile(r"\bslot\b|cmd_if_slot_enable|\breu\b|command interface|\b
 _REBOOT = re.compile(r"reboot|start_cartridge")
 #: What "left disabled" is called.  "off" is matched as a word so that
 #: "power-on", "offset" and the like do not count.
-_DISABLED = re.compile(r"\bdisabled\b|\boff\b")
+_DISABLED = re.compile(r"\bdisabled\b|\bdisables?\b|\boff\b")
 #: The two conditions under which source really does leave the enable at 0.
 #: A sentence naming either is the qualified statement, not the relapse.
 _QUALIFIERS = ("set_cartridge", "external", "prohibit")
@@ -168,6 +171,8 @@ _DEFERRAL = re.compile(
     r"|not (?:be )?(?:applied|live|active|effective|take effect|go live)"
     r" until(?: the next)?(?: machine)? reset"
     r"|(?:do|does) not go live until"
+    # Review round 2 (F2): "takes effect only after a reset".
+    r"|takes? effect only (?:at|on|after|by)(?: the next| a)?(?: machine)? reset"
 )
 
 
@@ -234,8 +239,11 @@ class TestThePinsCanFail:
         "After `client.reboot()` the UCI registers come back off until the next reset.",
         "A reboot turns the Command Interface off again, so re-enable it afterwards.",
         "The config PUT is only applied at the next reset, which is why the reset is needed.",
+        # Review round 2 (PR #309): two more natural paraphrases.
+        "A reboot disables the Command Interface again.",
+        "The Command Interface PUT takes effect only after a reset.",
     ], ids=["E1-uci-come-back-off", "E2-command-interface-turned-off",
-            "E3-deferred-apply"])
+            "E3-deferred-apply", "F1-reboot-disables", "F2-takes-effect-only-after"])
     def test_plain_paraphrase_is_detected(self, whole: str, claim: str) -> None:
         assert _relapses(whole + " " + claim), claim
 
