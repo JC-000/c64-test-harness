@@ -931,7 +931,7 @@ def test_drive_load_rom_with_bytes_uses_multipart_post():
     mock, captured = _capture(b"")
     c = Ultimate64Client("h")
     with patch("urllib.request.urlopen", mock):
-        c.drive_load_rom("a", b"\xaa\xbb\xcc")
+        c.drive_load_rom("a", b"\xaa\xbb\xcc" + bytes(16384 - 3))
     req = captured[0][0]
     assert req.get_method() == "POST"
     # No query: the POST route takes none, and a ``file`` query would name
@@ -957,6 +957,44 @@ def test_drive_load_rom_with_str_uses_file_query():
     assert req.data is None
     url = req.get_full_url()
     assert url == "http://h/v1/drives/b:load_rom?file=/Roms/dos1541.rom"
+
+
+@pytest.mark.parametrize("size", [0, 1, 16383, 16385, 32767, 32769, 65536])
+def test_drive_load_rom_rejects_a_wrong_size_rom_before_any_request(size):
+    """#417 review: refuse a ROM the firmware would half-load.
+
+    ``C1541::load_dos_from_file`` calls ``drive_reset(1)`` whenever it
+    transferred any bytes, *before* checking for 16384/32768, so a
+    wrong-size upload leaves the drive running a partial ROM and answers
+    412 -- and on the C64U the POST also costs a ``/Temp`` attachment.
+    The guard runs before any request.
+    """
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        with pytest.raises(ValueError):
+            c.drive_load_rom("a", bytes(size))
+    assert captured == []
+
+
+@pytest.mark.parametrize("size", [16384, 32768])
+def test_drive_load_rom_accepts_the_two_rom_sizes(size):
+    mock, captured = _capture(b"")
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", mock):
+        c.drive_load_rom("a", bytes(size))
+    assert [r[0].get_method() for r in captured] == ["POST"]
+
+
+def test_creates_temp_attachment_docstring_cites_the_1_1_0_route_table():
+    """#417 review: the 1.1.0 table has been read (7b628eb1); it is not 'not available'."""
+    import inspect
+    import re as _re
+
+    doc = _re.sub(r"\s+", " ", inspect.getdoc(Ultimate64Client._creates_temp_attachment) or "")
+    assert "not available" not in doc
+    for token in ("7b628eb1", "route_drives.cc:149", "route_machine.cc:125", "attachment_reu"):
+        assert token in doc, token
 
 
 def test_drive_load_rom_rejects_bad_type():

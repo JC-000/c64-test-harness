@@ -733,36 +733,31 @@ class Ultimate64Client:
         The firmware's route table is the authority, and it is unambiguous:
         a route either binds ``&attachment_writer`` (which streams the
         request body into a managed ``/Temp`` temp file) or binds ``NULL``
-        (the body is ditched). Every ``POST`` route in
-        ``software/api/route_*.cc`` binds a writer —
-        ``configs``, ``drives:mount``, ``drives:load_rom``,
-        ``machine:writemem``, ``runners:{run_prg,load_prg,run_crt,sidplay}``
-        — and **every** ``PUT`` route binds ``NULL``, which is why
+        (the body is ditched). Read at tag ``1.1.0`` (``7b628eb1``, the
+        C64U's firmware) in ``software/api/route_*.cc``: the upload
+        ``POST`` routes bind ``&attachment_writer`` --
+        ``route_configs.cc:251`` (``configs``), ``route_drives.cc:78``
+        (``drives:mount``), ``route_drives.cc:149`` (``drives:load_rom``),
+        ``route_machine.cc:125`` (``machine:writemem``) and
+        ``route_runners.cc:24`` / ``:60`` / ``:68`` / ``:91`` (``sidplay``,
+        ``load_prg``, ``run_prg``, ``run_crt``) -- while
+        ``route_runners.cc:125`` (``modplay``) binds ``&attachment_reu``,
+        and **every** ``PUT`` route binds ``NULL``, which is why
         ``PUT machine:writemem?data=<hex>`` and the config PUTs are free.
+        The 3.15 line pairs verbs and handlers the same way.
 
         So the rule is: a body plus ``POST``. That covers every current
-        caller and anything added later, by construction.
+        caller and anything added later, by construction.  The route table
+        establishes only that such a request *creates* an attachment; that
+        accumulated attachments crash the firmware is the owner's account
+        (CLAUDE.md), not something this citation shows.
 
-        Two deliberate conservatisms:
-
-        * ``POST runners:modplay`` binds ``&attachment_reu`` (the body
-          goes to the REU, not to ``/Temp``) and ``POST machine:input``
-          binds ``&input_json_writer``. Both are counted anyway — the
-          cost is an occasional extra hygiene pass, and neither handler
-          has been read closely enough here to certify it never touches
-          ``/Temp``.
-        * The route table read is a 3.15-line checkout. The C64U's 1.1.0
-          table is not available, so this assumes the verb/handler
-          pairing is the same there. Counting POST-with-body only is the
-          **permissive** side of that assumption, not the conservative
-          one: a PUT that *did* attach on 1.1.0 is never counted, so it
-          never advances ``_pending_temp_attachments``, the budget
-          comparison in :meth:`_before_temp_attachment` is never reached,
-          the hygiene pass never fires
-          and ``pending_temp_attachments`` reads zero while the device
-          accumulates. That is the gap to close, not the margin to rely
-          on, and one live run on a 1.1.0 device closes it. The genuinely
-          conservative half is the over-counting in the bullet above.
+        One deliberate conservatism: ``POST runners:modplay``
+        (``&attachment_reu`` -- the body goes to the REU, not to ``/Temp``)
+        and, on the 3.15 line, ``POST machine:input``
+        (``&input_json_writer``) are counted anyway.  The cost is an
+        occasional extra hygiene pass, and neither handler has been read
+        closely enough here to certify it never touches ``/Temp``.
         """
         return body is not None and method == "POST"
 
@@ -2417,9 +2412,23 @@ class Ultimate64Client:
         **The upload costs one managed ``/Temp`` attachment** on leak-prone
         firmware, counted by the request choke point like every
         body-carrying POST; the ``str`` form costs nothing.
+
+        **Only 16384- or 32768-byte ROMs are sent** (#417 review).
+        ``C1541::load_dos_from_file`` (``software/drive/c1541.cc``, read at
+        bce4535e) resets the drive whenever it transferred any bytes and
+        only *then* checks the size, so a wrong-size upload leaves the
+        drive running a partial ROM and answers 412 -- and on leak-prone
+        firmware still costs the attachment.  Any other length raises
+        :class:`ValueError` before a request is made.
         """
         path = self._drive_slot_path(drive, "load_rom")
         if isinstance(rom_path_or_data, (bytes, bytearray)):
+            if len(rom_path_or_data) not in _DRIVE_ROM_SIZES:
+                raise ValueError(
+                    f"drive ROM must be {' or '.join(map(str, _DRIVE_ROM_SIZES))} bytes, "
+                    f"got {len(rom_path_or_data)}: the firmware resets the drive "
+                    f"before checking the size, so a wrong-size ROM half-loads"
+                )
             boundary = "----U64ClientBoundary" + uuid.uuid4().hex
             body = _build_multipart(
                 boundary,
@@ -2667,6 +2676,12 @@ class Ultimate64Client:
                 f"reset_to_default of {category!r}: 'reset' is not a list: {names!r}"
             )
         return [str(n) for n in names]
+
+
+#: The two drive ROM lengths ``C1541::load_dos_from_file`` accepts (a 16 KiB
+#: ROM is mirrored to 32 KiB).  Anything else half-loads after a drive reset
+#: (#417 review).
+_DRIVE_ROM_SIZES = (16384, 32768)
 
 
 def _build_multipart(
