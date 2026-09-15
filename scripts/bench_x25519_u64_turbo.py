@@ -8,10 +8,10 @@ correctness against RFC 7748.
 Requires U64_HOST environment variable (and optionally U64_PASSWORD).
 
 Usage:
-    U64_HOST=192.168.1.81 python3 scripts/bench_x25519_u64_turbo.py
-    U64_HOST=192.168.1.81 python3 scripts/bench_x25519_u64_turbo.py --all
-    U64_HOST=192.168.1.81 python3 scripts/bench_x25519_u64_turbo.py --speeds 48,16,4,1
-    U64_HOST=192.168.1.81 python3 scripts/bench_x25519_u64_turbo.py --timeout 1800
+    U64_HOST=<device> python3 scripts/bench_x25519_u64_turbo.py
+    U64_HOST=<device> python3 scripts/bench_x25519_u64_turbo.py --all
+    U64_HOST=<device> python3 scripts/bench_x25519_u64_turbo.py --speeds 48,16,4,1
+    U64_HOST=<device> python3 scripts/bench_x25519_u64_turbo.py --timeout 1800
 """
 from __future__ import annotations
 
@@ -25,6 +25,9 @@ import time
 # ---------------------------------------------------------------------------
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from _u64_host import require_u64_host  # noqa: E402
 
 from c64_test_harness.backends.ultimate64 import Ultimate64Transport
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
@@ -405,11 +408,10 @@ def main() -> None:
     speeds.sort(reverse=True)
 
     # Connect to U64
-    host = os.environ.get("U64_HOST")
-    if not host:
-        print("ERROR: U64_HOST environment variable not set.")
-        print("Usage: U64_HOST=192.168.1.81 python3 scripts/bench_x25519_u64_turbo.py")
-        sys.exit(1)
+    host = require_u64_host(
+        argv0="python3 scripts/bench_x25519_u64_turbo.py",
+        usage="U64_HOST=<device> python3 scripts/bench_x25519_u64_turbo.py",
+    )
     password = os.environ.get("U64_PASSWORD")
 
     # Load PRG and labels

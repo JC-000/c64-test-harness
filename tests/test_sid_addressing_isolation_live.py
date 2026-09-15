@@ -60,8 +60,8 @@ to ``SID Addressing`` takes effect with **no reset** (route_configs.cc
 ``at_close_config`` reprogramming the decode), so no settle is needed
 between arms.
 
-Gate: ``SID_ADDRESSING_LIVE=1``.  Host: ``U64_HOST`` (default
-``10.43.23.81``).  Restores the whole ``SID Addressing`` category to the
+Gate: ``SID_ADDRESSING_LIVE=1`` **and** ``U64_HOST`` (no
+default).  Restores the whole ``SID Addressing`` category to the
 snapshot taken before the first write and asserts the read-back matches.
 """
 from __future__ import annotations
@@ -89,12 +89,21 @@ from c64_test_harness.backends.ultimate64_schema import (
     SidSlot,
 )
 
-_HOST = os.environ.get("U64_HOST", "10.43.23.81")
+#: No default (#243): a live module that invents a device drives real
+#: hardware for anyone who sets only the feature gate. The host is part of
+#: the gate, like every other live module in this repo.
+_HOST = os.environ.get("U64_HOST") or None
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("SID_ADDRESSING_LIVE") != "1",
-    reason="SID_ADDRESSING_LIVE=1 not set -- live SID addressing test disabled",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        os.environ.get("SID_ADDRESSING_LIVE") != "1",
+        reason="SID_ADDRESSING_LIVE=1 not set -- live SID addressing test disabled",
+    ),
+    pytest.mark.skipif(
+        _HOST is None,
+        reason="U64_HOST not set -- name the device explicitly",
+    ),
+]
 
 #: Clear of every HARNESS_SCRATCH span and of the $0360 trampoline.
 CODE_ADDR = 0xC900

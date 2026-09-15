@@ -22,11 +22,14 @@ effect is a few keystrokes typed into BASIC — user can clear with
 RUN/STOP+RESTORE if desired.
 
 Usage:
-    python3 examples/ultimate64_hello.py --host 192.168.1.81
+    python3 examples/ultimate64_hello.py --host <device>
 
     # Or via environment variables (handy in CI / scripted runs):
-    U64_HOST=192.168.1.81 U64_PASSWORD=secret \
+    U64_HOST=<device> U64_PASSWORD=secret \
         python3 examples/ultimate64_hello.py
+
+There is no default host (#243/#275): name the device or the example
+refuses, rather than reaching whatever answers at a baked-in address.
 """
 from __future__ import annotations
 
@@ -34,6 +37,13 @@ import argparse
 import os
 import sys
 import time
+from pathlib import Path
+
+# One definition of "which device am I allowed to talk to", shared with the
+# scripts/ runners so an example cannot teach a different rule than the
+# tooling enforces.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from _u64_host import require_u64_host  # noqa: E402
 
 from c64_test_harness import (
     DeviceLock,
@@ -51,8 +61,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--host",
-        default=os.environ.get("U64_HOST", "192.168.1.81"),
-        help="Ultimate 64 host / IP (default: $U64_HOST or 192.168.1.81)",
+        default=None,
+        help="Ultimate 64 host / IP (or set $U64_HOST). No default.",
     )
     parser.add_argument(
         "--password",
@@ -64,6 +74,10 @@ def main() -> int:
     parser.add_argument("--lock-timeout", type=float, default=60.0,
                         help="Seconds to wait for the device lock (default: 60)")
     args = parser.parse_args()
+    args.host = require_u64_host(
+        args.host, argv0="python3 examples/ultimate64_hello.py",
+        usage="python3 examples/ultimate64_hello.py --host <HOST>",
+    )
 
     # Cross-process device lock: prevents concurrent agents / scripts
     # from talking to the same U64 at the same time. If somebody else

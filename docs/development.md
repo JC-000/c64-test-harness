@@ -396,7 +396,7 @@ live suites — see [#268](https://github.com/JC-000/c64-test-harness/issues/268
 
 | Gate | Test | Needs | What it pins |
 |---|---|---|---|
-| `U64_NOTICE_LIVE=1` | `tests/test_unlocked_notice_live.py` | run with `U64_HOST` unset (host via `U64_NOTICE_HOST`) | unlocked-client notice 0× on a locked lane, 1× bare, thread-scoped under `run_parallel` (#206) |
+| `U64_NOTICE_LIVE=1` | `tests/test_unlocked_notice_live.py` | run with `U64_HOST` unset; `U64_NOTICE_HOST` names the device and is required (no default, #275) | unlocked-client notice 0× on a locked lane, 1× bare, thread-scoped under `run_parallel` (#206) |
 | `SID_ADDRESSING_LIVE=1` | `tests/test_sid_addressing_isolation_live.py` | two SIDs fitted | distinct decode with mirroring off, aliasing with it on, read-back raises on mismatch (#204) |
 | `AUDIO_RATE_LIVE=1` | `tests/test_audio_rate_lock_live.py` | NTSC, ≥ 60 s capture | `U64_NTSC_AUDIO_RATE_HZ` via the 64:3 identity; drop/reorder runs discarded (#205) |
 | `RRNET_LIVE=1` | `tests/test_run_prg_cartridge_visibility_live.py`, `tests/test_cs8900a_fifo_live.py`, `tests/test_first_exchange_live.py` | RR-Net on the expansion port, cabled to `RRNET_IFACE` (default `en4`) | runner load path deselects the cartridge (#217), FIFO facts (#219), RX-queue drain before the first exchange (#222) |

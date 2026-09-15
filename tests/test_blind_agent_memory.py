@@ -1,6 +1,6 @@
 """Memory tests against an Ultimate 64 device via UnifiedManager.
 
-Requires U64_HOST environment variable to be set (e.g. U64_HOST=192.168.1.81).
+Requires U64_HOST environment variable to be set (e.g. U64_HOST=<device>).
 """
 
 import os

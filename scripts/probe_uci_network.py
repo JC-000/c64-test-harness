@@ -10,8 +10,11 @@ Injects a 6502 routine via DMA that:
 UCI register interface at $DF1C-$DF1F.
 
 Usage:
-    U64_HOST=192.168.1.81 python3 scripts/probe_uci_network.py
-    python3 scripts/probe_uci_network.py --host 192.168.1.81
+    U64_HOST=<device> python3 scripts/probe_uci_network.py
+    python3 scripts/probe_uci_network.py --host <device>
+
+No default host: the old os.environ.get("U64_HOST", ...) read the
+environment correctly, then supplied a device when it named none (#243).
 
 Note on CPU speed:
     This script hand-writes its own 6502 routine (not via the uci_network
@@ -30,6 +33,9 @@ import sys
 import time
 # Allow running from the repo root without install
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from _u64_host import require_u64_host  # noqa: E402
 
 from c64_test_harness.backends.device_lock import DeviceLock
 from c64_test_harness.backends.ultimate64 import Ultimate64Transport
@@ -388,14 +394,17 @@ def main() -> int:
         description="Probe UCI networking on a U64E device via 6502 code injection."
     )
     parser.add_argument("--host", default=None,
-                        help="U64 host/IP (default: $U64_HOST or 192.168.1.81)")
+                        help="U64 host/IP (or set $U64_HOST). No default.")
     parser.add_argument("--password", default=None,
                         help="Optional API password (default: $U64_PASSWORD)")
     parser.add_argument("--timeout", type=float, default=10.0,
                         help="HTTP request timeout in seconds (default: 10)")
     args = parser.parse_args()
 
-    host = args.host or os.environ.get("U64_HOST", "192.168.1.81")
+    host = require_u64_host(
+        args.host, argv0="python3 scripts/probe_uci_network.py",
+        usage="python3 scripts/probe_uci_network.py --host <HOST>",
+    )
     password = args.password or os.environ.get("U64_PASSWORD")
 
     print(f"UCI Network Probe -- target: {host}")

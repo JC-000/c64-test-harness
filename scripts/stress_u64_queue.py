@@ -12,9 +12,12 @@ This validates:
   - The UnifiedManager → _LockedU64Manager path works end-to-end
 
 Usage:
-    python3 scripts/stress_u64_queue.py [HOST] [--workers N] [--rounds N]
+    python3 scripts/stress_u64_queue.py <HOST> [--workers N] [--rounds N]
+    U64_HOST=<device> python3 scripts/stress_u64_queue.py [--workers N]
 
-Defaults: HOST=192.168.1.81, workers=4, rounds=3
+No default host -- this script puts sustained parallel load on whatever it
+is pointed at, so it refuses to pick one (#243). Defaults: workers=4,
+rounds=3.
 Each worker runs `rounds` sequential iterations = workers*rounds total
 lock acquisitions against a single device.
 """
@@ -29,6 +32,9 @@ import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _u64_host import require_u64_host  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -123,10 +129,15 @@ def _worker(
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("host", nargs="?", default="192.168.1.81")
+    ap.add_argument("host", nargs="?", default=None,
+                    help="Device host/IP (or set $U64_HOST). No default.")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--rounds", type=int, default=3)
     args = ap.parse_args()
+
+    args.host = require_u64_host(
+        args.host, argv0="python3 scripts/stress_u64_queue.py"
+    )
 
     password = os.environ.get("U64_PASSWORD")
 

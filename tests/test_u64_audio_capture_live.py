@@ -5,7 +5,7 @@ DeviceLock is used for cross-process safety.
 
 Example::
 
-    U64_HOST=192.168.1.81 python3 -m pytest tests/test_u64_audio_capture_live.py -v
+    U64_HOST=<device> python3 -m pytest tests/test_u64_audio_capture_live.py -v
 """
 from __future__ import annotations
 

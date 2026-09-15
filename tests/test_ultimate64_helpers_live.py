@@ -4,7 +4,7 @@ Gated by the ``U64_HOST`` environment variable so CI never touches
 hardware unintentionally. A single destructive round-trip test
 (turbo flip) runs only when ``U64_ALLOW_MUTATE`` is also set.
 
-Device used in development: 192.168.1.81 (Ultimate 64 Elite, fw 3.14).
+Device used in development: an Ultimate 64 Elite on fw 3.14.
 """
 from __future__ import annotations
 

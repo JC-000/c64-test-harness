@@ -2,7 +2,7 @@
 
 Gated by the ``U64_HOST`` env var — e.g.:
 
-    U64_HOST=192.168.1.81 python3 -m pytest tests/test_ultimate64_transport_live.py -v
+    U64_HOST=<device> python3 -m pytest tests/test_ultimate64_transport_live.py -v
 
 Most tests are read-only. The ``TestSetSpeed`` and ``TestResetScopes``
 classes added for PR #122 coverage exercise the protocol's

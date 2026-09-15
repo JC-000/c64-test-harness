@@ -1,8 +1,20 @@
 """Live turbo-sweep test: x25519_clamp correctness at multiple U64 CPU speeds.
 
-Gated by U64_HOST and U64_ALLOW_MUTATE env vars.
+Gated by three env vars — U64_HOST, U64_ALLOW_MUTATE, and X25519_PRG, which
+must point at an ``x25519.prg`` build (issue #245: it used to be a hard-coded
+path into a Linux home directory, so on any other machine the module skipped
+silently and nobody noticed).
 
-    U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 python3 -m pytest tests/test_u64_turbo_bench_live.py -v
+    U64_HOST=<host> U64_ALLOW_MUTATE=1 X25519_PRG=/path/to/x25519.prg \
+        python3 -m pytest tests/test_u64_turbo_bench_live.py -v
+
+**Upload budget.** This is the heaviest upload loop in the repository: four
+turbo speeds x three vectors = **12 full-PRG ``run_prg`` uploads per
+session**, each preceded by a ``reboot()`` — which does not collect ``/Temp``
+attachments, because ``/Temp`` is a firmware RAM disk that only a power-on
+clears. On firmware without upstream #686 (the C64 Ultimate on 1.1.0) that is
+12 attachments against a budget the standing hardware-safety clause in
+CLAUDE.md says to treat as a handful. Point this at the U64E, or at nothing.
 """
 
 from __future__ import annotations
@@ -34,12 +46,40 @@ _HOST = os.environ.get("U64_HOST")
 _PW = os.environ.get("U64_PASSWORD")
 _ALLOW_MUTATE = os.environ.get("U64_ALLOW_MUTATE")
 
-_PRG_PATH = Path("/home/someone/c64-x25519/build/x25519.prg")
+#: Env var naming the x25519 PRG to upload. No default: a path that happens
+#: to resolve on one machine is not a gate (#245).
+_PRG_ENV = "X25519_PRG"
+
+
+def _resolve_prg_path() -> tuple[Path | None, str]:
+    """Resolve the PRG under test, or say why the module is skipping.
+
+    Returns ``(path, "")`` when armed, and ``(None, reason)`` otherwise.
+    The two skip reasons are deliberately distinguishable: an unset
+    variable is a decision, an unresolvable one is an environment defect
+    that the caller meant to avoid and should be told about.
+    """
+    raw = os.environ.get(_PRG_ENV)
+    if not raw:
+        return None, (
+            f"{_PRG_ENV} not set — point it at an x25519.prg build to arm "
+            "this module (12 run_prg uploads per session; see its docstring)"
+        )
+    path = Path(raw).expanduser()
+    if not path.is_file():
+        return None, (
+            f"{_PRG_ENV}={path} does not name a readable file — "
+            "environment defect, not a deliberate skip"
+        )
+    return path, ""
+
+
+_PRG_PATH, _PRG_SKIP_REASON = _resolve_prg_path()
 
 pytestmark = [
     pytest.mark.skipif(not _HOST, reason="U64_HOST not set"),
     pytest.mark.skipif(not _ALLOW_MUTATE, reason="U64_ALLOW_MUTATE not set"),
-    pytest.mark.skipif(not _PRG_PATH.exists(), reason=f"{_PRG_PATH} not found"),
+    pytest.mark.skipif(_PRG_PATH is None, reason=_PRG_SKIP_REASON),
 ]
 
 
@@ -94,6 +134,7 @@ def client() -> Ultimate64Client:
 
 @pytest.fixture(scope="module")
 def prg_data() -> bytes:
+    assert _PRG_PATH is not None  # guaranteed by the module-level skipif
     return _PRG_PATH.read_bytes()
 
 
