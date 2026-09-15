@@ -17,6 +17,7 @@ from c64_test_harness.backends.device_lock import DeviceLock
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
 from c64_test_harness.backends.ultimate64_helpers import recover
 from c64_test_harness.backends.ultimate64_probe import is_u64_reachable
+from live_fixture_teardown import raise_teardown_failures, teardown_then_release
 
 _HOST = os.environ.get("U64_HOST")
 _ALLOW_MUTATE = os.environ.get("U64_ALLOW_MUTATE")
@@ -39,8 +40,15 @@ def client() -> Ultimate64Client:
     lock = DeviceLock(_HOST or "")
     if not lock.acquire(timeout=120.0):
         pytest.skip(f"Could not acquire device lock for {_HOST}")
-    yield Ultimate64Client(host=_HOST or "", password=password, timeout=10.0)
-    lock.release()
+    client = None
+    failures: list = []
+    try:
+        client = Ultimate64Client(host=_HOST or "", password=password, timeout=10.0)
+        yield client
+    finally:
+        steps = [] if client is None else [("client.close()", client.close)]
+        failures = teardown_then_release(steps, lock.release)
+    raise_teardown_failures('recovery_live client teardown', failures)
 
 
 def test_recover_against_live_device(client: Ultimate64Client) -> None:

@@ -217,6 +217,79 @@ class TestRestoreSpeedDefaults:
         )
         assert client._pending_temp_attachments == 0
 
+    # ---- #370: pre-read defaults ----------------------------------------
+
+    _SUPPLIED = {"Turbo Control": "Manual-X", "CPU Speed": " 6"}   # not the store's defaults, reversed order
+
+    def test_pre_read_defaults_are_written_without_reading(self) -> None:
+        client = _FakeClient()
+        written = restore_speed_defaults(client, defaults=self._SUPPLIED)
+        assert client.journal == [
+            ("put", "CPU Speed", " 6"),
+            ("put", "Turbo Control", "Manual-X"),
+        ]
+        assert list(written) == ["CPU Speed", "Turbo Control"]
+        assert written == {"CPU Speed": " 6", "Turbo Control": "Manual-X"}
+
+    def test_pre_read_path_survives_failing_reads(self, monkeypatch) -> None:
+        client = _FakeClient()
+
+        def unreadable(*_a):
+            raise Ultimate64Error("GET failed (injected)")
+
+        monkeypatch.setattr(client, "get_config_item", unreadable)
+        restore_speed_defaults(client, defaults=_DEFAULTS)
+        assert _currents(client) == _DEFAULTS
+
+    @pytest.mark.parametrize("supplied", [
+        {},                                                         # empty: not "read them here" (#387 review, Q4)
+        {"Turbo Control": "Off"},                                   # CPU Speed missing
+        {"CPU Speed": " 1"},                                        # Turbo Control missing
+        {"CPU Speed": "", "Turbo Control": "Off"},                  # empty
+        {"CPU Speed": " 1", "Turbo Control": None},                 # not a string
+        {"CPU Speed": " 1", "Turbo Control": "Off", "REU Size": "16 MB"},  # extra item
+    ])
+    def test_pre_read_defaults_are_validated_before_any_write(self, supplied) -> None:
+        client = _FakeClient()
+        with pytest.raises(ValueError, match="nothing was restored"):
+            restore_speed_defaults(client, defaults=supplied)
+        assert client.journal == []
+        assert _currents(client) == _ENTRY
+
+    def test_pre_read_rejected_cpu_speed_still_attempts_turbo_control(self) -> None:
+        client = _FakeClient()
+        client.fail_items = {"CPU Speed"}
+        with pytest.raises(Ultimate64RestoreError) as info:
+            restore_speed_defaults(client, defaults=_DEFAULTS)
+        assert set(info.value.failures) == {"CPU Speed"}
+        assert client.store["Turbo Control"]["current"] == _DEFAULTS["Turbo Control"]
+
+    def test_defaults_is_keyword_only_and_the_old_call_still_works(self) -> None:
+        with pytest.raises(TypeError):
+            restore_speed_defaults(_FakeClient(), _DEFAULTS)  # type: ignore[misc]
+        assert restore_speed_defaults(_FakeClient()) == _DEFAULTS
+
+    def test_pre_read_on_a_real_client_sends_only_the_two_bodyless_puts(self, monkeypatch) -> None:
+        client = Ultimate64Client(
+            "192.0.2.64", write_mem_query_threshold=128,
+            warn_unlocked=False, temp_hygiene=False,
+        )
+        sent: list[tuple] = []
+
+        def wire(method, path, *, body=None, content_type=None, query=None):
+            sent.append((method, unquote(path), body, dict(query or {})))
+            return 200, b""
+
+        monkeypatch.setattr(client, "_request_uncounted", wire)
+        monkeypatch.setattr(client, "_check_device_lock", lambda *_a, **_kw: None)
+        restore_speed_defaults(client, defaults=_DEFAULTS)
+        cat = f"/v1/configs/{CAT_U64_SPECIFIC}"
+        assert [(m, p, b, q.get("value")) for m, p, b, q in sent] == [
+            ("PUT", f"{cat}/CPU Speed", None, _DEFAULTS["CPU Speed"]),
+            ("PUT", f"{cat}/Turbo Control", None, _DEFAULTS["Turbo Control"]),
+        ]
+        assert client._pending_temp_attachments == 0
+
     def test_exported_beside_set_turbo_mhz(self) -> None:
         assert "restore_speed_defaults" in ultimate64_helpers.__all__
         assert "restore_speed_defaults" in c64_test_harness.__all__

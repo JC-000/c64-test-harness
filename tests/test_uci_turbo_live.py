@@ -72,20 +72,30 @@ def device_lock():
     lock = DeviceLock(_HOST)
     if not lock.acquire(timeout=120.0):
         pytest.skip(f"Could not acquire device lock for {_HOST}")
-    yield lock
-    lock.release()
+    try:
+        yield lock
+    finally:
+        lock.release()
 
 
 @pytest.fixture(scope="module")
 def client(device_lock) -> Ultimate64Client:  # noqa: ARG001
-    return Ultimate64Client(host=_HOST, password=_PW, timeout=10.0)
+    # Closed before device_lock releases: pytest tears a fixture down
+    # before the fixtures it requested (#334).
+    c = Ultimate64Client(host=_HOST, password=_PW, timeout=10.0)
+    try:
+        yield c
+    finally:
+        c.close()
 
 
 @pytest.fixture(scope="module")
 def transport(device_lock) -> Ultimate64Transport:  # noqa: ARG001
     t = Ultimate64Transport(host=_HOST, password=_PW, timeout=10.0)
-    yield t
-    t.close()
+    try:
+        yield t
+    finally:
+        t.close()
 
 
 @pytest.fixture(scope="module")

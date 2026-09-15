@@ -30,6 +30,7 @@ from c64_test_harness.backends.ultimate64_helpers import (
     DEBUG_MODE_6510,
     DEBUG_MODE_6510_VIC,
 )
+from live_fixture_teardown import raise_teardown_failures, teardown_then_release
 
 logger = logging.getLogger(__name__)
 
@@ -87,9 +88,15 @@ def client():
     lock = DeviceLock(host, allow_nested=True)
     if not lock.acquire(timeout=120.0):
         pytest.skip(f"Could not acquire device lock for {host}")
-    c = Ultimate64Client(host=host, password=pw, timeout=8.0)
-    yield c
-    lock.release()
+    c = None
+    failures: list = []
+    try:
+        c = Ultimate64Client(host=host, password=pw, timeout=8.0)
+        yield c
+    finally:
+        steps = [] if c is None else [("c.close()", c.close)]
+        failures = teardown_then_release(steps, lock.release)
+    raise_teardown_failures('streams client teardown', failures)
 
 
 # ======================================================================

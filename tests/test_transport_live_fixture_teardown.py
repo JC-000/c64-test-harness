@@ -17,7 +17,11 @@ and ``lock.release()`` alike, and a raising ``close()`` orphaned the
 * every test in the module that writes CPU speed requests that fixture;
 * its exit restore puts **both** ``CPU Speed`` and ``Turbo Control`` back to
   the ``default`` each reported at entry (#360 -- ``set_speed(1)`` alone left
-  ``CPU Speed`` at the last test's value).
+  ``CPU Speed`` at the last test's value);
+* that exit is one ``restore_speed_defaults(client, defaults=<the entry read>)``
+  call (#370): it reads nothing, writes exactly the values validated at entry,
+  and a failed PUT surfaces as the module's teardown ``RuntimeError`` whose
+  ``__cause__`` is the helper's ``Ultimate64RestoreError`` naming each item.
 
 The fixture bodies are lifted from the module source (decorators stripped)
 and executed in a private copy of the module's namespace, so the fakes
@@ -36,6 +40,7 @@ from types import SimpleNamespace
 import pytest
 
 from c64_test_harness import BASELINE_ON_ENTRY_ENV
+from c64_test_harness.backends.ultimate64_helpers import Ultimate64RestoreError
 
 MODULE_PATH = Path(__file__).parent / "test_ultimate64_transport_live.py"
 
@@ -100,6 +105,7 @@ class _FakeClient:
         self._generation = generation
         self.journal = journal if journal is not None else []
         self.fail_items: set[str] = set()
+        self.fail_gets = False
         self.store = {
             item: {"current": _FAKE_ENTRY[item], "default": _FAKE_DEFAULTS[item]}
             for item in _FAKE_DEFAULTS
@@ -107,6 +113,8 @@ class _FakeClient:
 
     def get_config_item(self, category, item):
         assert category == "U64 Specific Settings"
+        if self.fail_gets:
+            raise RuntimeError(f"GET {item} failed (injected)")
         return dict(self.store[item])
 
     def set_config_item(self, category, item, value) -> None:
@@ -309,8 +317,48 @@ class TestSpeedFixture:
         gen = self._gen(probe)
         next(gen)
         probe.transport.client.fail_items = {"CPU Speed"}
-        with pytest.raises(RuntimeError, match="PUT CPU Speed failed"):
+        with pytest.raises(RuntimeError, match="PUT CPU Speed failed") as info:
             next(gen)
+        # #370: the helper's error, naming each failed item, is the cause.
+        assert isinstance(info.value.__cause__, Ultimate64RestoreError)
+        assert set(info.value.__cause__.failures) == {"CPU Speed"}
+
+    def test_the_exit_restore_reads_nothing(self, probe) -> None:
+        """#370: the defaults were read and validated at entry; exit only writes,
+        so the restore still goes out when a read would fail by then."""
+        gen = self._gen(probe)
+        next(gen)
+        probe.transport.client.fail_gets = True
+        mark = len(probe.journal)
+        with pytest.raises(StopIteration):
+            next(gen)
+        assert _after(probe.journal, mark) == _RESTORE
+
+    def test_the_exit_writes_the_values_validated_at_entry(self, probe) -> None:
+        """#370: exactly what was read at entry is written, not a second read."""
+        gen = self._gen(probe)
+        next(gen)
+        store = probe.transport.client.store
+        store["CPU Speed"]["default"] = " 9"
+        store["Turbo Control"]["default"] = "Off"
+        mark = len(probe.journal)
+        with pytest.raises(StopIteration):
+            next(gen)
+        assert _after(probe.journal, mark) == _RESTORE
+
+    def test_the_exit_is_one_helper_call_with_the_entry_defaults(self, probe) -> None:
+        calls: list = []
+
+        def recorder(client, **kwargs):
+            calls.append((client, kwargs))
+            return dict(kwargs.get("defaults") or {})
+
+        probe.module.restore_speed_defaults = recorder
+        gen = self._gen(probe)
+        next(gen)
+        with pytest.raises(StopIteration):
+            next(gen)
+        assert calls == [(probe.transport.client, {"defaults": _FAKE_DEFAULTS})]
 
     def test_a_failed_cpu_speed_put_still_restores_turbo_control(self, probe) -> None:
         gen = self._gen(probe)
@@ -440,8 +488,10 @@ def test_a_failing_restore_does_not_skip_close_or_release(probe) -> None:
     next(inner)
     probe.transport.client.fail_items = {"CPU Speed", "Turbo Control"}
     mark = len(probe.journal)
-    with pytest.raises(RuntimeError, match="PUT CPU Speed failed"):
+    with pytest.raises(RuntimeError, match="PUT CPU Speed failed") as info:
         next(inner)
+    assert isinstance(info.value.__cause__, Ultimate64RestoreError)
+    assert set(info.value.__cause__.failures) == {"CPU Speed", "Turbo Control"}
     with pytest.raises(StopIteration):
         next(outer)
     assert _after(probe.journal, mark) == [*_RESTORE, "close", "release"]

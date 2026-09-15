@@ -19,8 +19,9 @@ NOT covered here (protocol surface added after this module was written):
   Some of these are exercised by ``tests/test_ultimate64_transport_live.py``;
   turbo has its own contract test in ``tests/test_turbo_contract_live.py``.
 
-Double-gated by ``U64_HOST`` and ``U64_ALLOW_MUTATE`` (the suite resets
-the machine and writes to RAM) — e.g.:
+Double-gated by ``U64_HOST`` and ``U64_ALLOW_MUTATE``.  The suite resets the
+machine and writes to RAM but changes no config, so the second gate is
+stricter than the contract (#333) — e.g.:
 
     U64_HOST=<device> U64_ALLOW_MUTATE=1 \\
         python3 -m pytest tests/test_u64_feature_parity_live.py -v
@@ -49,6 +50,7 @@ from c64_test_harness.memory import (
 from c64_test_harness.screen import ScreenGrid, wait_for_text
 from c64_test_harness.sid import SidFile, build_test_psid
 from c64_test_harness.sid_player import SidPlaybackError, play_sid
+from live_fixture_teardown import raise_teardown_failures, teardown_then_release
 
 _HOST = os.environ.get("U64_HOST")
 _PW = os.environ.get("U64_PASSWORD")
@@ -75,10 +77,15 @@ def transport() -> Ultimate64Transport:
     lock = DeviceLock(_HOST)
     if not lock.acquire(timeout=120.0):
         pytest.skip(f"Could not acquire device lock for {_HOST}")
-    t = Ultimate64Transport(host=_HOST, password=_PW, timeout=8.0)
-    yield t
-    t.close()
-    lock.release()
+    t = None
+    failures: list = []
+    try:
+        t = Ultimate64Transport(host=_HOST, password=_PW, timeout=8.0)
+        yield t
+    finally:
+        steps = [] if t is None else [("t.close()", t.close)]
+        failures = teardown_then_release(steps, lock.release)
+    raise_teardown_failures('feature_parity transport teardown', failures)
 
 
 # ======================================================================

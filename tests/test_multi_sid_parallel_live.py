@@ -45,6 +45,12 @@ from c64_test_harness.backends.u64_audio_capture import (
 )
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
 
+from live_fixture_teardown import (
+    raise_teardown_failures,
+    read_restore_defaults,
+    restore_default_steps,
+    teardown_then_release,
+)
 from wav_capture_paths import capture_dir
 
 logger = logging.getLogger(__name__)
@@ -80,19 +86,13 @@ QUAD_PANNING = {
     "Pan UltiSID 2": "Right 5",
 }
 
-DEFAULT_ADDRESSING = {
-    "Auto Address Mirroring": "Enabled",
-    "SID Socket 1 Address": "$D400",
-    "SID Socket 2 Address": "$D420",
-    "UltiSID 1 Address": "$D400",
-    "UltiSID 2 Address": "$D400",
-}
-
-DEFAULT_PANNING = {
-    "Pan Socket 1": "Left 3",
-    "Pan Socket 2": "Right 3",
-    "Pan UltiSID 1": "Center",
-    "Pan UltiSID 2": "Center",
+#: Every item ``quad_wav`` writes, by category -- what the exit restore
+#: puts back to the device's own ``default`` (#334; previously hard-coded
+#: ``DEFAULT_ADDRESSING`` / ``DEFAULT_PANNING`` values that were not read
+#: from the device).
+_RESTORED_ITEMS = {
+    "SID Addressing": list(QUAD_ADDRESSING),
+    "Audio Mixer": list(QUAD_PANNING),
 }
 
 ENGINE_META = {
@@ -240,7 +240,14 @@ def _correlation(a: list[int], b: list[int]) -> float:
 
 @pytest.fixture(scope="module")
 def u64_client():
-    """Connect to U64E with cross-process DeviceLock."""
+    """Connect to U64E with cross-process DeviceLock.
+
+    Before any test writes, the ``default`` of every item in
+    :data:`_RESTORED_ITEMS` is read; at exit each is PUT back to it (one
+    bodyless PUT per item), then the machine is reset, the client closed and
+    the lock released last -- every step attempted, failures raised after
+    the release (#334, ``live_fixture_teardown``).
+    """
     host = os.environ.get("U64_HOST")
     pw = os.environ.get("U64_PASSWORD")
     # allow_nested: the autouse device_lock_guard fixture already holds
@@ -250,16 +257,22 @@ def u64_client():
         lock.acquire_or_raise(timeout=120.0)
     except DeviceLockTimeout as e:
         pytest.skip(str(e))
-    client = Ultimate64Client(host=host, password=pw, timeout=15.0)
-    yield client
+    client = None
+    plan: list = []
+    failures: list = []
     try:
-        client.set_config_items("SID Addressing", DEFAULT_ADDRESSING)
-        client.set_config_items("Audio Mixer", DEFAULT_PANNING)
-        client.reset()
-    except Exception:
-        pass
-    client.close()
-    lock.release()
+        client = Ultimate64Client(host=host, password=pw, timeout=15.0)
+        plan = read_restore_defaults(client, _RESTORED_ITEMS)
+        yield client
+    finally:
+        steps = []
+        if client is not None:
+            steps += restore_default_steps(client, plan)
+            if plan:
+                steps.append(("client.reset()", client.reset))
+            steps.append(("client.close()", client.close))
+        failures = teardown_then_release(steps, lock.release)
+    raise_teardown_failures("multi_sid u64_client teardown", failures)
 
 
 @pytest.fixture(scope="module")
