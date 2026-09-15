@@ -19,6 +19,8 @@ enable bit ($DE01 bit 0), otherwise the chip silently drops the writes.
 
 from __future__ import annotations
 
+from ._address import refuse_bool_address
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -96,7 +98,12 @@ def set_cs8900a_mac(
 
     The transport must be connected and the CPU should be stopped
     (normal state after binary monitor connect).
+
+    A ``bool`` *base* raises :class:`ValueError` before any access: ``base
+    + offset`` would turn ``True`` into zero-page addresses no transport
+    guard can recognise as a flag (#357).
     """
+    refuse_bool_address(base, "set_cs8900a_mac base")
     if len(mac) != 6:
         raise ValueError(f"MAC must be 6 bytes, got {len(mac)}")
 

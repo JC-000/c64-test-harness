@@ -17,6 +17,8 @@ untouched envelope.
 """
 from __future__ import annotations
 
+from .._address import refuse_bool_address
+
 import http.client
 import json
 import logging
@@ -337,8 +339,7 @@ def _wire_hex16(value: int) -> str:
     """
     # bool is an int subclass: True would format as "0001", the 6510
     # processor port (#340).  Refused with the bad-address error.
-    if isinstance(value, bool):
-        raise ValueError(f"address must be an int, not bool: {value!r}")
+    refuse_bool_address(value)
     if not isinstance(value, int) or value < 0 or value > 0xFFFF:
         raise ValueError(f"address out of range 0..0xFFFF: {value!r}")
     return "%04X" % value
@@ -1780,10 +1781,9 @@ class Ultimate64Client:
             this check, downstream chunked readers would silently
             produce short / misaligned results.
         """
-        if isinstance(address, bool):
-            # bool subclasses int; True would address $0001, the 6510
-            # processor port (#340).
-            raise ValueError(f"address must be an int, not bool: {address!r}")
+        # bool subclasses int; True would address $0001, the 6510
+        # processor port (#340).
+        refuse_bool_address(address)
         if not isinstance(address, int) or address < 0 or address > 0xFFFF:
             raise ValueError(f"address out of range 0..0xFFFF: {address}")
         if not isinstance(length, int) or length <= 0:
@@ -1918,10 +1918,9 @@ class Ultimate64Client:
         Both forms are functionally equivalent for supported sizes; the
         POST form has no upper bound verified at 2048 bytes.
         """
-        if isinstance(address, bool):
-            # bool subclasses int; True would address $0001, the 6510
-            # processor port (#340).
-            raise ValueError(f"address must be an int, not bool: {address!r}")
+        # bool subclasses int; True would address $0001, the 6510
+        # processor port (#340).
+        refuse_bool_address(address)
         if not isinstance(address, int) or address < 0 or address > 0xFFFF:
             raise ValueError(f"address out of range 0..0xFFFF: {address}")
         if not isinstance(data, (bytes, bytearray)):

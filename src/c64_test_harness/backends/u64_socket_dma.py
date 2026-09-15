@@ -22,6 +22,8 @@ device closes the socket.
 """
 from __future__ import annotations
 
+from .._address import refuse_bool_address
+
 import json
 import socket
 import struct
@@ -366,6 +368,9 @@ class SocketDMAClient:
         at the worst-observed drain rate).  Pass ``sync=False`` only
         when a later same-connection command or barrier follows anyway.
         """
+        # First, before the range check and the empty-data return (#357):
+        # True would pass 0 <= offset and target REU offset 1.
+        refuse_bool_address(offset, "REU offset")
         if not (0 <= offset <= 0xFFFFFF):
             raise Ultimate64Error(f"REU offset {offset:#x} out of range (24-bit)")
         if not data:
@@ -412,6 +417,8 @@ class SocketDMAClient:
         Payload is a 2-byte LE load address followed by program bytes.  When
         ``run=True`` the device starts execution immediately after load.
         """
+        # bool first (#357): True would load at $0001, the processor port.
+        refuse_bool_address(address, "DMA load address")
         if not (0 <= address <= 0xFFFF):
             raise Ultimate64Error(f"DMA load address {address:#x} out of range")
         payload = struct.pack("<H", address) + bytes(data)
@@ -425,6 +432,8 @@ class SocketDMAClient:
 
     def dma_jump(self, address: int) -> None:
         """Send 0xFF09 DMAJUMP: 2-byte LE address."""
+        # bool first (#357): True would jump the CPU to $0001.
+        refuse_bool_address(address, "DMA jump address")
         if not (0 <= address <= 0xFFFF):
             raise Ultimate64Error(f"DMA jump address {address:#x} out of range")
         opened = self._sock is None
@@ -436,6 +445,9 @@ class SocketDMAClient:
 
     def dma_write(self, address: int, data: bytes) -> None:
         """Send 0xFF06 DMAWRITE: 2-byte LE address + data (no autostart)."""
+        # bool first, before the empty-data return (#357): True would write
+        # $0001, the processor port.
+        refuse_bool_address(address, "DMA write address")
         if not (0 <= address <= 0xFFFF):
             raise Ultimate64Error(f"DMA write address {address:#x} out of range")
         if not data:

@@ -12,6 +12,8 @@ Ultimate 64.
 
 from __future__ import annotations
 
+from ._address import refuse_bool_address
+
 import logging
 import time
 from typing import TYPE_CHECKING, Any
@@ -105,8 +107,10 @@ def load_code(transport: BinaryViceTransport, addr: int, code: bytes | list[int]
     """Write executable code into memory.
 
     Semantic alias for ``transport.write_memory()`` — makes intent clear
-    when loading machine code rather than data.
+    when loading machine code rather than data.  A ``bool`` *addr* raises
+    :class:`ValueError` before the transport is touched (#357).
     """
+    refuse_bool_address(addr, "load_code address")
     transport.write_memory(addr, code)
 
 
@@ -192,7 +196,12 @@ def goto(transport: BinaryViceTransport, addr: int, *, cold: bool = False) -> No
     anything, so a transport that lacks them applies nothing at all: the
     CPU stays halted where it was and ``ValueError`` is raised, rather
     than the jump happening onto a half-built machine.
+
+    A ``bool`` (or ``numpy.bool_``) *addr* raises :class:`ValueError`
+    before any register write: ``set_registers`` masks the value with
+    ``& 0xFFFF``, which turns ``True`` into a jump to ``$0001`` (#357).
     """
+    refuse_bool_address(addr, "goto address")
     regs = {"PC": addr}
     if cold:
         regs["SP"] = _COLD_SP
@@ -214,8 +223,10 @@ def goto(transport: BinaryViceTransport, addr: int, *, cold: bool = False) -> No
 def set_breakpoint(transport: BinaryViceTransport, addr: int) -> int:
     """Set an execution breakpoint at *addr*.
 
-    Returns the checkpoint ID assigned by VICE.
+    Returns the checkpoint ID assigned by VICE.  A ``bool`` *addr* raises
+    :class:`ValueError` before the transport is touched (#357).
     """
+    refuse_bool_address(addr, "set_breakpoint address")
     return transport.set_checkpoint(addr)
 
 
@@ -238,8 +249,10 @@ def wait_for_pc(
     at that point, so memory reads are safe.
 
     Raises ``TimeoutError`` if *addr* is not reached within *timeout*
-    seconds.
+    seconds.  A ``bool`` *addr* raises :class:`ValueError` before waiting:
+    ``PC == True`` would otherwise match a stop at ``$0001`` (#357).
     """
+    refuse_bool_address(addr, "wait_for_pc address")
     pc = transport.wait_for_stopped(timeout=timeout)
     regs = transport.read_registers()
     if regs.get("PC") != addr:
@@ -543,6 +556,12 @@ def jsr(
         timeout, raising :class:`RoutineHung` instead of a bare
         ``TimeoutError``.  Default ``False``.
     """
+    # A flag is not an address (#357): the trampoline assembles ``addr &
+    # 0xFF``, so True would become ``JSR $0001`` with no guard downstream
+    # able to see the bool.  Refused before the policy and every register
+    # read, trampoline write and checkpoint -- scratch_addr included.
+    refuse_bool_address(addr, "jsr address")
+    refuse_bool_address(scratch_addr, "jsr scratch_addr")
     # Guard first — before the trampoline write, so a refused call leaves
     # the machine exactly as it was.
     check_execution_policy(transport, addr, override=override)
@@ -690,6 +709,11 @@ def run_subroutine(
     TransportError
         Propagated from the underlying transport on hard failures.
     """
+    # A flag is not an address (#357): both branches assemble *addr* into
+    # a JSR, so the transport's own guard never sees the bool.  Refused
+    # before the policy and backend dispatch, trampoline_addr included.
+    refuse_bool_address(addr, "run_subroutine address")
+    refuse_bool_address(trampoline_addr, "run_subroutine trampoline_addr")
     # Guard before backend dispatch: on either backend this ends up
     # JSRing *addr*, and a call into reclaimed code wedges the machine
     # rather than faulting. See jsr() and execution_policy.
