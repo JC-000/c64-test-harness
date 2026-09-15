@@ -504,6 +504,21 @@ class Ultimate64Client:
             )
         return self._capabilities
 
+    @property
+    def cached_capabilities(self) -> DeviceCapabilities | None:
+        """The capability grade if one is cached, else ``None`` -- never probes.
+
+        :attr:`capabilities` issues ``GET /v1/info`` on a cold cache.  Use
+        this instead wherever a read must not generate device traffic or
+        change cached state: hygiene arming, the grading log line, a
+        transport's chunking decision, an error message.  ``None`` means
+        nothing has been probed (for example a client constructed with an
+        explicit ``write_mem_query_threshold``); a probe that ran and got no
+        answer caches a grade whose ``firmware_version`` is ``None``, which
+        is a different fact.  Read-only (issue #291).
+        """
+        return self._capabilities
+
     def _probe_info(self, timeout: float | None = None) -> dict | None:
         """``GET /v1/info``; ``None`` on any failure.
 
@@ -594,7 +609,7 @@ class Ultimate64Client:
             return
         if not self._saw_successful_request:
             return
-        caps = self._capabilities
+        caps = self.cached_capabilities
         if caps is None or caps.firmware_version is not None:
             return
         self._reprobed = True
@@ -768,7 +783,7 @@ class Ultimate64Client:
         capability and the resulting threshold makes it legible in every
         log, including the logs of runs where nothing went wrong.
         """
-        caps = self._capabilities
+        caps = self.cached_capabilities
         if caps is None or caps.firmware_version is None:
             # These two are not the same fact and must not print the same.
             # "not-attempted" is inert by contract (the caller pinned the
@@ -855,7 +870,7 @@ class Ultimate64Client:
         # issues no traffic at all) stays disarmed. Pass
         # temp_hygiene=True, or set U64_AUTO_TEMP_GC=1, to arm one of
         # those against a leak-prone device.
-        caps = self._capabilities
+        caps = self.cached_capabilities
         if caps is None or caps.firmware_version is None:
             return False
         # runner_wedge_possible is the inverse of writemem_post_safe and
@@ -916,9 +931,14 @@ class Ultimate64Client:
     def _refuse_or_warn(self, operation: str) -> None:
         from .ultimate64_temp_gc import hygiene_required as _hygiene_required
 
+        # The cached grade, never the probing property: building an error
+        # message must not issue HTTP or fill the cache, on a device the
+        # harness has just concluded it cannot clean up after (#265).
+        caps = self.cached_capabilities
+        firmware = (caps.firmware_version if caps is not None else None) or "unknown"
         message = (
             f"refusing {operation} on {self.host}: this firmware "
-            f"({self.capabilities.firmware_version or 'unknown'}) leaks a /Temp "
+            f"({firmware}) leaks a /Temp "
             "attachment for every request that carries a body and never collects "
             "them, and the harness's hygiene pass cannot run: "
             f"{self._temp_hygiene_blocked}. Continuing would walk the device "
