@@ -257,7 +257,10 @@ def test_temp_gc_source_no_longer_states_the_3_mb_ramdisk():
     assert "DEFAULT_LEAK_BUDGET = " in src
     hits = [ln.strip() for ln in src.splitlines() if _STALE_RAMDISK.search(ln)]
     assert hits == []
-    # The durable fix cites the computation, not just a new number.
-    assert "__ram_disk_start" in src and "__ram_disk_limit" in src
-    assert "16 MiB" in src
-    assert "967,680" in src
+    # The durable fix cites the computation, not just a new number -- at
+    # BOTH sites that state the size (module docstring and the budget
+    # comment), since a reader copies from whichever one they found.
+    assert src.count("__ram_disk_start") >= 2
+    assert src.count("__ram_disk_limit") >= 2
+    assert src.count("16 MiB") >= 2
+    assert src.count("967,680") >= 2
