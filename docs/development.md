@@ -413,25 +413,32 @@ the `DeviceLock` is taken by the test. Three need no device at all:
 `RRNET_UDP_LIVE` and `READ_BYTES_STRESS` drive VICE, and
 `BRIDGE_CLEANUP_LIVE` mutates host network state. Gates marked *mutate*
 also need `U64_ALLOW_MUTATE=1` because they write device config or RAM
-and restore it. That annotation reflects what each suite actually
-gates on today, and the convention is not applied uniformly across the
-live suites — see [#268](https://github.com/JC-000/c64-test-harness/issues/268).
+and restore it. For config writes the convention has no exceptions:
+`tests/test_live_mutation_gate.py` fails, without a device, on any live
+module that writes device config and never skips on `U64_ALLOW_MUTATE`
+([#268](https://github.com/JC-000/c64-test-harness/issues/268)). That
+includes the `U64_HOST`-only suites outside this table:
+`test_chromatic_capture_live.py` and `test_uci_tcp_echo_live.py` as a whole,
+and the config-writing tests of `test_u64_audio_capture_live.py`,
+`test_u64_streams_live.py` and `test_ultimate64_transport_live.py`. The scan
+is module-level and covers config writes only; resets and RAM writes are
+not scanned.
 
 | Gate | Test | Needs | What it pins |
 |---|---|---|---|
 | `U64_NOTICE_LIVE=1` | `tests/test_unlocked_notice_live.py` | run with `U64_HOST` unset; `U64_NOTICE_HOST` names the device and is required (no default, #275) | unlocked-client notice 0× on a locked lane, 1× bare, thread-scoped under `run_parallel` (#206) |
-| `SID_ADDRESSING_LIVE=1` | `tests/test_sid_addressing_isolation_live.py` | two SIDs fitted | distinct decode with mirroring off, aliasing with it on, read-back raises on mismatch (#204) |
+| `SID_ADDRESSING_LIVE=1` (*mutate*) | `tests/test_sid_addressing_isolation_live.py` | two SIDs fitted | distinct decode with mirroring off, aliasing with it on, read-back raises on mismatch (#204) |
 | `AUDIO_RATE_LIVE=1` | `tests/test_audio_rate_lock_live.py` | NTSC, ≥ 60 s capture | `U64_NTSC_AUDIO_RATE_HZ` via the 64:3 identity; drop/reorder runs discarded (#205) |
-| `RRNET_LIVE=1` | `tests/test_run_prg_cartridge_visibility_live.py`, `tests/test_cs8900a_fifo_live.py`, `tests/test_first_exchange_live.py` | RR-Net on the expansion port, cabled to `RRNET_IFACE` (default `en4`) | runner load path deselects the cartridge (#217), FIFO facts (#219), RX-queue drain before the first exchange (#222) |
+| `RRNET_LIVE=1` (*mutate*: `Cartridge Preference`) | `tests/test_run_prg_cartridge_visibility_live.py`, `tests/test_cs8900a_fifo_live.py`, `tests/test_first_exchange_live.py` | RR-Net on the expansion port, cabled to `RRNET_IFACE` (default `en4`) | runner load path deselects the cartridge (#217), FIFO facts (#219), RX-queue drain before the first exchange (#222) |
 | `SOCKETDMA_LIVE=1` (*mutate* for the RAM/REU-writing tests) | `tests/test_socketdma_barrier_live.py`, `tests/test_socketdma_live.py` | "Ultimate DMA Service" enabled | idle-reconnect and the one-retry barrier (#223); `REUWRITE` byte fidelity. **SocketDMA writes are disabled pending a stability review** — do not run these to "check it still works" |
 | `U64_BASELINE_LIVE=1` (*mutate*) | `tests/test_entry_baseline_live.py` | — | reset-on-entry: drift → per-category reset → every covered item at `default`; never-touch stores untouched (#227) |
 | `FLASH_BASELINE_LIVE=1` (*mutate*) | `tests/test_flash_baseline_live.py` | — | flash equals the firmware default per category (never-touch and `Network Settings` not reloaded) (#227) |
 | `TEMP_GC_LIVE=1` (*mutate*) | `tests/test_temp_gc_live.py` | FTP File Service enabled | `gc_temp_folder` against a real FTP server: leak `temp####` attachments via `run_prg`, trim to the keep-count, idempotent re-run (#153). **This one leaks on purpose** — read the `/Temp` clause before running it on a leak-prone device. Its three mutating tests need `U64_ALLOW_MUTATE=1` (`test_temp_gc_live.py:40-43`); set only the gate and they skip |
 | `REU_READBACK_LIVE=1` (*mutate*) | `tests/test_reu_size_readback_live.py` | — | `REU Size` read-back is not stale: a differing value means a write, a flash reload or a boot in between (#168). Four tests need `U64_ALLOW_MUTATE=1` (`:112-115`) |
 | `TURBO_CONTRACT_LIVE=1` (*mutate*) | `tests/test_turbo_contract_live.py` | — | the CPU-Speed enum is a cross-generation superset; a generation-foreign speed raises locally off the probed presets |
-| `UCI_UDP_LIVE=1` | `tests/test_uci_udp_send_live.py`, `tests/test_uci_udp_send_large_live.py` | UCI enabled, `reset()` + 3 s settle | one `uci_socket_write` = one datagram, no firmware coalescing; the 892-byte write ceiling. Writes device config and RAM but gates on neither `U64_ALLOW_MUTATE` nor anything else — see [#268](https://github.com/JC-000/c64-test-harness/issues/268) |
+| `UCI_UDP_LIVE=1` (*mutate*) | `tests/test_uci_udp_send_live.py`, `tests/test_uci_udp_send_large_live.py` | UCI enabled, `reset()` + 3 s settle | one `uci_socket_write` = one datagram, no firmware coalescing; the 892-byte write ceiling. Enables `Command Interface` and puts back the value it read first (#268) |
 | `RRNET_UDP_LIVE=1` | `tests/test_rrnet_udp_send_live.py` | VICE + bridge (no U64) | VICE-side RR-Net UDP TX of a >512-byte payload, received by a host socket |
-| `U64_DESTRUCTIVE=1` | `tests/test_ultimate64_transport_live.py` | — | **the one `reset(scope='machine')` test** (`:308-316`) — a C64-level reset, ~8 s to come back. The rest of the module, `set_speed`/`get_speed` and `reset(scope='cpu'\|'drive')`, runs on `U64_HOST` alone (`:39-41`); those writes are **not** behind this opt-in |
+| `U64_DESTRUCTIVE=1` | `tests/test_ultimate64_transport_live.py` | — | **the one `reset(scope='machine')` test** — a C64-level reset, ~8 s to come back; it also needs `U64_ALLOW_MUTATE=1`. The `set_speed`/`get_speed` tests and the device-touching `reset(scope='cpu'\|'drive')` tests need `U64_ALLOW_MUTATE=1` (they write CPU speed, #268); the read-only tests run on `U64_HOST` alone |
 | `READ_BYTES_STRESS=1` | `tests/test_read_bytes_stress_live.py` | VICE | the issue #88 `read_bytes` corruption reproducer; iteration counts and the wall cap are themselves env knobs |
 | `BRIDGE_CLEANUP_LIVE=1` | `tests/test_cleanup_vice_ports_live.py` (Linux), `tests/test_cleanup_vice_ports_macos_live.py` (macOS) | bridge up, elevation | the paired reference for live tests that mutate host network state |
 

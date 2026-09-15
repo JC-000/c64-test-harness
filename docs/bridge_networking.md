@@ -794,7 +794,7 @@ Two more hardware-only facts, from issues #209, #211 and #217:
   it first (`reselect_cartridge=False` opts out).  Stock ip65 `ping.prg`
   reports `INIT DRIVER: FAILED` under `run_prg` and pings normally under
   `run_prg_via_sys`.  Live matrix:
-  `tests/test_run_prg_cartridge_visibility_live.py` (`RRNET_LIVE=1`).
+  `tests/test_run_prg_cartridge_visibility_live.py` (`RRNET_LIVE=1`, `U64_ALLOW_MUTATE=1`).
 * **A complete RX read releases the frame without SkipNow, but the next
   header appears only after RxEvent's high byte is read** (#219, U64E,
   n=3 per variant, two host-queued frames): after reading all RxLength
@@ -817,7 +817,7 @@ Two more hardware-only facts, from issues #209, #211 and #217:
   dropped" reading was a leftover half-read frame behind a blind
   SkipNow drain, retracted on #219.  `_emit_read_frame` keeps its skip
   because its fixed 60-byte body read is a partial read.  Live:
-  `tests/test_cs8900a_fifo_live.py` (`RRNET_LIVE=1`, `RRNET_IFACE`).
+  `tests/test_cs8900a_fifo_live.py` (`RRNET_LIVE=1`, `U64_ALLOW_MUTATE=1`, `RRNET_IFACE`).
 * **Resolve before the first exchange with a host: pass the ARP frame,
   or use the responder, which now answers ARP (issue #218).**  Until #218
   the harness's ping routines neither sent nor answered ARP, and macOS
@@ -885,7 +885,7 @@ Two more hardware-only facts, from issues #209, #211 and #217:
   it.  A second ping 1 s after a miss matched 7/7, so one retry also
   covers it.  The promiscuous-mode / link-bounce candidate from the #218
   review is out (no link transition in 30 trials, LinkOK at every TX).
-  Live: ``tests/test_first_exchange_live.py`` (``RRNET_LIVE=1``); the
+  Live: ``tests/test_first_exchange_live.py`` (``RRNET_LIVE=1``, ``U64_ALLOW_MUTATE=1``); the
   simulator models blind SkipNow releasing a queued frame
   (``tests/test_cs8900a_drain.py``).
 

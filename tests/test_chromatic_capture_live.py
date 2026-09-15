@@ -14,6 +14,8 @@ run never dirties the working tree or silently drifts the reference.
 
 Requirements:
     - ``U64_HOST`` env var pointing at a reachable Ultimate 64 device
+    - ``U64_ALLOW_MUTATE=1`` -- the suite rewrites ``SID Addressing`` and
+      ``UltiSID Configuration`` and resets the machine (#268)
     - Device has physical 8580 SID chips (NEVER use sid_type "6581")
     - Network path for UDP audio streaming between host and device
 
@@ -51,10 +53,18 @@ from wav_capture_paths import capture_dir  # noqa: E402
 logger = logging.getLogger(__name__)
 
 # Skip entire module when no U64 device is available.
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("U64_HOST"),
-    reason="U64_HOST not set -- skipping live U64 tests",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not os.environ.get("U64_HOST"),
+        reason="U64_HOST not set -- skipping live U64 tests",
+    ),
+    # Rewrites SID Addressing / UltiSID Configuration and resets (#268).
+    pytest.mark.skipif(
+        not os.environ.get("U64_ALLOW_MUTATE"),
+        reason="U64_ALLOW_MUTATE not set -- suite rewrites SID Addressing "
+        "and UltiSID Configuration and resets the machine",
+    ),
+]
 
 # ---------------------------------------------------------------------------
 # SID configurations to capture

@@ -23,7 +23,7 @@ measured on the U64E unless it says otherwise.
 *C64 and Cartridge Settings → Command Interface → Enabled*.
 `enable_uci(client)` flips that item over REST. The live suites follow it
 with `client.reset()` and a 3 s settle before the first routine
-(`tests/test_uci_udp_send_live.py:242-249`); without that, every routine
+(`tests/test_uci_udp_send_live.py:274-280`); without that, every routine
 times out at the sentinel. Keep that sequence. It is a recorded
 observation, and **its cause is not explained by firmware source**. From
 source, read at tag `1.1.0` (the C64U) and `7f6fcb51` (the U64E's

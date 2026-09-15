@@ -60,7 +60,8 @@ to ``SID Addressing`` takes effect with **no reset** (route_configs.cc
 ``at_close_config`` reprogramming the decode), so no settle is needed
 between arms.
 
-Gate: ``SID_ADDRESSING_LIVE=1`` **and** ``U64_HOST`` (no
+Gate: ``SID_ADDRESSING_LIVE=1``, ``U64_ALLOW_MUTATE=1`` (the module
+rewrites ``SID Addressing``, #268) **and** ``U64_HOST`` (no
 default).  Restores the whole ``SID Addressing`` category to the
 snapshot taken before the first write and asserts the read-back matches.
 """
@@ -102,6 +103,10 @@ pytestmark = [
     pytest.mark.skipif(
         _HOST is None,
         reason="U64_HOST not set -- name the device explicitly",
+    ),
+    pytest.mark.skipif(
+        not os.environ.get("U64_ALLOW_MUTATE"),
+        reason="U64_ALLOW_MUTATE not set -- module rewrites SID Addressing",
     ),
 ]
 

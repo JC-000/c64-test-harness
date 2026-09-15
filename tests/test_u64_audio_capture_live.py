@@ -1,6 +1,8 @@
 """Live integration tests for U64 SID audio capture over the network.
 
-Gated by ``U64_HOST`` env var. These tests use the real hardware.
+Gated by ``U64_HOST`` env var. These tests use the real hardware. The two
+tests that write SID socket/addressing config additionally need
+``U64_ALLOW_MUTATE=1`` (#268).
 DeviceLock is used for cross-process safety.
 
 Example::
@@ -46,6 +48,13 @@ _PW = os.environ.get("U64_PASSWORD")
 
 pytestmark = pytest.mark.skipif(
     not _HOST, reason="U64_HOST not set -- live Ultimate device tests disabled",
+)
+
+#: The tests that write SID socket/addressing config also need
+#: ``U64_ALLOW_MUTATE`` (#268); the read-only probes run on ``U64_HOST``.
+_requires_mutate = pytest.mark.skipif(
+    not os.environ.get("U64_ALLOW_MUTATE"),
+    reason="U64_ALLOW_MUTATE not set -- this test writes device config",
 )
 
 
@@ -240,6 +249,7 @@ def test_capture_sid_basic(u64_client: Ultimate64Client, tmp_path) -> None:
     )
 
 
+@_requires_mutate
 def test_capture_sid_with_physical_sids(
     u64_client: Ultimate64Client, tmp_path
 ) -> None:
@@ -335,6 +345,7 @@ def test_probe_sid_sockets(u64_client: Ultimate64Client) -> None:
 # Multi-SID addressing
 # ======================================================================
 
+@_requires_mutate
 def test_multi_sid_addressing(u64_client: Ultimate64Client, tmp_path) -> None:
     """Configure two SIDs at $D400 and $D420, capture audio."""
     types = get_sid_socket_types(u64_client)

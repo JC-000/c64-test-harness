@@ -2,14 +2,15 @@
 
 Gated by the ``U64_HOST`` env var — e.g.:
 
-    U64_HOST=<device> python3 -m pytest tests/test_ultimate64_transport_live.py -v
+    U64_HOST=<device> U64_ALLOW_MUTATE=1 python3 -m pytest tests/test_ultimate64_transport_live.py -v
 
-Most tests are read-only. The ``TestSetSpeed`` and ``TestResetScopes``
-classes added for PR #122 coverage exercise the protocol's
-``set_speed`` / ``get_speed`` / ``reset(scope=...)`` surface on real
-hardware; every test in those classes restores the device to 1 MHz in
-a ``finally`` block so downstream CIA-timer measurements still see the
-expected native clock.
+Most tests are read-only and run on ``U64_HOST`` alone. The
+``TestSetSpeed`` class and the device-touching ``TestResetScopes`` tests
+added for PR #122 coverage exercise the protocol's ``set_speed`` /
+``get_speed`` / ``reset(scope=...)`` surface on real hardware; they write
+CPU speed and therefore also need ``U64_ALLOW_MUTATE=1`` (#268). Each
+restores the device to 1 MHz in a ``finally`` block so downstream
+CIA-timer measurements still see the expected native clock.
 
 The ``reset(scope='machine')`` case triggers a full FPGA reboot (~8 s
 to recover) and is therefore gated by an additional ``U64_DESTRUCTIVE=1``
@@ -36,9 +37,18 @@ _HOST = os.environ.get("U64_HOST")
 _PW = os.environ.get("U64_PASSWORD")
 _DESTRUCTIVE = os.environ.get("U64_DESTRUCTIVE") == "1"
 
+_ALLOW_MUTATE = bool(os.environ.get("U64_ALLOW_MUTATE"))
+
 pytestmark = pytest.mark.skipif(
     not _HOST,
     reason="U64_HOST not set — live Ultimate device tests disabled",
+)
+
+#: Tests that write CPU speed (every ``set_speed`` call is a config PUT)
+#: need ``U64_ALLOW_MUTATE`` as well (#268).
+_requires_mutate = pytest.mark.skipif(
+    not _ALLOW_MUTATE,
+    reason="U64_ALLOW_MUTATE not set — this test writes CPU speed",
 )
 
 
@@ -49,10 +59,13 @@ def transport() -> Ultimate64Transport:
         pytest.skip(f"Could not acquire device lock for {_HOST}")
     t = Ultimate64Transport(host=_HOST, password=_PW, timeout=8.0)
     yield t
-    try:
-        t.set_speed(1)  # leave device at native clock for downstream tests
-    except Exception:
-        pass
+    # Only a lane allowed to mutate can have changed the speed, and only
+    # such a lane may write it back (#268).
+    if _ALLOW_MUTATE:
+        try:
+            t.set_speed(1)  # leave device at native clock for downstream tests
+        except Exception:
+            pass
     t.close()
     lock.release()
 
@@ -145,6 +158,7 @@ def test_read_framebuffer_returns_one_frame(transport: Ultimate64Transport) -> N
 # ---------------------------------------------------------------------------
 
 
+@_requires_mutate
 class TestSetSpeed:
     """``set_speed`` / ``get_speed`` round-trip through real U64 turbo state.
 
@@ -245,6 +259,7 @@ class TestResetScopes:
     ``U64_DESTRUCTIVE=1`` so default test runs are not disrupted.
     """
 
+    @_requires_mutate
     def test_reset_scope_cpu_keeps_device_responsive(
         self, transport: Ultimate64Transport
     ) -> None:
@@ -264,6 +279,7 @@ class TestResetScopes:
         finally:
             transport.set_speed(1)
 
+    @_requires_mutate
     def test_reset_scope_default_is_cpu(
         self, transport: Ultimate64Transport
     ) -> None:
@@ -278,6 +294,7 @@ class TestResetScopes:
         finally:
             transport.set_speed(1)
 
+    @_requires_mutate
     def test_reset_scope_drive_a(
         self, transport: Ultimate64Transport
     ) -> None:
@@ -312,6 +329,7 @@ class TestResetScopes:
             "set U64_DESTRUCTIVE=1 to opt in"
         ),
     )
+    @_requires_mutate
     def test_reset_scope_machine_reboots_and_recovers(
         self, transport: Ultimate64Transport
     ) -> None:
