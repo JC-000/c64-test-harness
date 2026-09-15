@@ -39,6 +39,8 @@ Response formats:
 
 from __future__ import annotations
 
+from ._address import refuses_bool_address_args
+
 import logging
 import time
 from dataclasses import dataclass
@@ -938,6 +940,7 @@ def _build_park(code_so_far_len: int, base: int = _CODE_ADDR) -> list[int]:
 # Public assembly builders
 # ---------------------------------------------------------------------------
 
+@refuses_bool_address_args
 def build_uci_probe(
     result_addr: int = _RESP_ADDR,
     sentinel_addr: int = _SENTINEL_ADDR,
@@ -965,6 +968,7 @@ def build_uci_probe(
     return bytes(code)
 
 
+@refuses_bool_address_args
 def build_uci_command(
     target: int = TARGET_NETWORK,
     cmd: int = NET_CMD_GET_INTERFACE_COUNT,
@@ -1081,6 +1085,7 @@ def build_uci_command(
     return bytes(code)
 
 
+@refuses_bool_address_args
 def build_get_ip(
     result_addr: int = _RESP_ADDR,
     status_addr: int = _STATUS_ADDR,
@@ -1110,6 +1115,7 @@ def build_get_ip(
     )
 
 
+@refuses_bool_address_args
 def build_tcp_connect(
     host_addr: int | None = None,
     port: int = 80,
@@ -1143,6 +1149,7 @@ def build_tcp_connect(
     )
 
 
+@refuses_bool_address_args
 def build_udp_connect(
     host_addr: int | None = None,
     port: int = 53,
@@ -1370,6 +1377,7 @@ def _emit_connect_routine(
     return bytes(code)
 
 
+@refuses_bool_address_args
 def build_socket_write(
     socket_id_addr: int | None = None,
     data_addr: int | None = None,
@@ -1657,6 +1665,7 @@ def build_socket_write(
     return bytes(code)
 
 
+@refuses_bool_address_args
 def build_socket_read(
     socket_id_addr: int | None = None,
     result_addr: int = _RESP_ADDR,
@@ -1780,6 +1789,7 @@ def build_socket_read(
     return bytes(code)
 
 
+@refuses_bool_address_args
 def build_socket_close(
     socket_id_addr: int | None = None,
     status_addr: int = _STATUS_ADDR,
@@ -2453,6 +2463,7 @@ _WEDGE_RECOMMEND_WEDGED = (
 )
 
 
+@refuses_bool_address_args
 def build_uci_status_peek(
     result_addr: int = _RESP_ADDR,
     sentinel_addr: int = _SENTINEL_ADDR,

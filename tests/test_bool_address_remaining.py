@@ -103,10 +103,14 @@ def test_helper_detects_both_numpy_spellings_without_numpy(spelling):
         refuse_bool_address(fake)
 
 
+@pytest.mark.parametrize("module", ["mylib", "numba", "numpy.ma", "Numpy"])
 @pytest.mark.parametrize("spelling", ["bool", "bool_"])
-def test_helper_ignores_same_named_types_outside_numpy(spelling):
-    """Control: the module check is load-bearing, not just the name."""
-    other = type(spelling, (), {"__module__": "mylib"})()
+def test_helper_ignores_same_named_types_outside_numpy(spelling, module):
+    """Control: the module check is exact, not just the name.  ``numba``
+    kills a ``startswith("num")`` loosening (M30, #376 review NIT recorded
+    on #373); ``numpy.ma`` a ``startswith("numpy")``; ``Numpy`` a
+    case-folding comparison."""
+    other = type(spelling, (), {"__module__": module})()
     assert not is_bool_like(other)
     refuse_bool_address(other)
 

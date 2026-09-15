@@ -10,6 +10,8 @@ Reference: HVSC PSIDv2NG specification.
 
 from __future__ import annotations
 
+from ._address import refuses_bool_address_args
+
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -199,6 +201,7 @@ def _encode_text(text: str, width: int = 32) -> bytes:
     return encoded + b"\x00" * (width - len(encoded))
 
 
+@refuses_bool_address_args
 def build_test_psid(
     load_addr: int = 0x1000,
     init_code: bytes = b"",

@@ -965,6 +965,11 @@ class BinaryViceTransport:
           reg_id(1)     -- register ID
           value(val_bytes) -- register value, little-endian
         """
+        # A flag is not a register value (#373): True packs exactly like 1,
+        # so {"PC": True} jumps to $0001.  Refused for every register, before
+        # the name check and any monitor command.
+        for name, value in regs.items():
+            refuse_bool_address(value, f"register {name} value")
         items = []
         for name, value in regs.items():
             key = name.upper()
