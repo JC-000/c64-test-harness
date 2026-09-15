@@ -18,7 +18,9 @@ import importlib.util
 import os
 import subprocess
 import sys
+import select
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -34,6 +36,7 @@ _CHILD = textwrap.dedent(
     host, timeout, window = sys.argv[1], float(sys.argv[2]), sys.argv[3]
     lock = DeviceLock(host, allow_nested=True)
     kwargs = {} if window == "default" else {"progress_window": None}
+    print("WAITING", flush=True)
     got = lock.acquire(timeout=timeout, **kwargs)
     print("ACQUIRED" if got else "NOT-ACQUIRED", flush=True)
     if got:
@@ -63,6 +66,21 @@ def _child(env: dict[str, str], timeout: float, window: str, wall: float):
     )
 
 
+def _await_line(proc: subprocess.Popen, want: str, deadline: float) -> bool:
+    """True once *proc* prints the line *want*, False at EOF or *deadline* s."""
+    end = time.monotonic() + deadline
+    while (left := end - time.monotonic()) > 0:
+        ready, _, _ = select.select([proc.stdout], [], [], left)
+        if not ready:
+            return False
+        line = proc.stdout.readline()
+        if not line:
+            return False
+        if line.strip() == want:
+            return True
+    return False
+
+
 def test_a_child_process_cannot_join_the_lock_its_parent_holds(child_env) -> None:
     """The #323 shape, reproduced without a device.
 
@@ -75,7 +93,10 @@ def test_a_child_process_cannot_join_the_lock_its_parent_holds(child_env) -> Non
        a process boundary.
     3. A child with the guard's default ``progress_window`` never returns at
        all: the holder is alive and its lockfile fresh, so the child keeps
-       extending its own 0.5 s deadline.  That is the runner's hang.
+       extending its own 0.5 s deadline.  That is the runner's hang.  It is
+       timed from the child's ``WAITING`` line, printed just before
+       ``acquire``, so a child that is merely slow to start cannot pass
+       (#381 review round 1, mutant D2).
 
     Then, with the hold released, the same child acquires at once (control).
     """
@@ -89,15 +110,29 @@ def test_a_child_process_cannot_join_the_lock_its_parent_holds(child_env) -> Non
         nested.release()
 
         hard = _child(child_env, 0.5, "hard", wall=20.0)
-        assert hard.stdout.split() == ["NOT-ACQUIRED"], hard.stderr[-800:]
+        assert hard.stdout.split() == ["WAITING", "NOT-ACQUIRED"], hard.stderr[-800:]
 
-        with pytest.raises(subprocess.TimeoutExpired):
-            _child(child_env, 0.5, "default", wall=4.0)
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _CHILD, _HOST, "0.5", "default"],
+            env=child_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            assert _await_line(proc, "WAITING", deadline=20.0), (
+                "the default-window child never reached acquire"
+            )
+            time.sleep(0.5 + 2.5)  # its own timeout, plus a margin
+            assert proc.poll() is None, (
+                "the default-window child returned instead of extending its "
+                f"wait (exit {proc.returncode})"
+            )
+        finally:
+            proc.kill()
+            proc.wait()
     finally:
         parent.release()
 
     free = _child(child_env, 5.0, "default", wall=20.0)
-    assert free.stdout.split() == ["ACQUIRED"], free.stderr[-800:]
+    assert free.stdout.split() == ["WAITING", "ACQUIRED"], free.stderr[-800:]
 
 
 def _load_runner():
@@ -140,3 +175,15 @@ def test_the_runner_launches_its_child_without_taking_the_lock(
     assert cmd[1:4] == ["-m", "pytest", "tests/test_ultimate64_client_live.py"]
     assert kwargs["env"]["U64_HOST"] == _HOST
     assert result["returncode"] == 0 and "passed" in result["summary"]
+
+    # The timeout branch (#381 review round 1, mutant R5): a child that
+    # outlives the 90 s budget is a failed file, and the summary says why.
+    def time_out(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        raise subprocess.TimeoutExpired(cmd, 90)
+
+    monkeypatch.setattr(runner.subprocess, "run", time_out)
+    timed = worker("tests/test_ultimate64_client_live.py", _HOST, None)
+    assert len(calls) == 2, calls
+    assert timed["returncode"] == 1, timed
+    assert "TIMEOUT" in timed["summary"], timed

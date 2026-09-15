@@ -3026,6 +3026,32 @@ def test_the_pytest_runner_check_can_fail() -> None:
             '["tests/test_a_live.py", "tests/test_b_live.py"]', "[]"
         ),
         "no pytest launched": subprocess_runner.replace('"pytest"', '"pyflakes"'),
+        # #381 review round 1 (G1, G2): each remaining lock-taking name is the
+        # only one in its plant, so dropping it from _LOCK_TAKING_CALLS fails.
+        "acquire on a lock from a factory not named DeviceLock": (
+            "import subprocess, sys\n"
+            "from somewhere import make_lock\n"
+            'TEST_FILES = ["tests/test_a_live.py"]\n'
+            "def run(f, host, t):\n"
+            "    lock = make_lock(host)\n"
+            "    lock.acquire(timeout=t)\n"
+            '    subprocess.run([sys.executable, "-m", "pytest", f])\n'
+        ),
+        "acquire_or_raise on any receiver": (
+            "import subprocess, sys\n"
+            'TEST_FILES = ["tests/test_a_live.py"]\n'
+            "def run(f, x):\n"
+            "    x.acquire_or_raise()\n"
+            '    subprocess.run([sys.executable, "-m", "pytest", f])\n'
+        ),
+        "create_manager around pytest": (
+            "import subprocess, sys\n"
+            "from c64_test_harness import create_manager\n"
+            'TEST_FILES = ["tests/test_a_live.py"]\n'
+            "def run(f, cfg):\n"
+            "    create_manager(cfg)\n"
+            '    subprocess.run([sys.executable, "-m", "pytest", f])\n'
+        ),
     }
     for label, source in must_flag.items():
         assert source not in (subprocess_runner, in_process_runner), f"{label}: plant changed nothing"
