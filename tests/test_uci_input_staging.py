@@ -139,6 +139,27 @@ def test_no_staged_write_lands_inside_the_routine(turbo: bool, name, call) -> No
     assert not clash, f"writes inside routine span ${lo:04X}-${hi - 1:04X}: {clash}"
 
 
+class TestTheTurboSlotsMatchTheScratchTable:
+    """The turbo slots are what ``HARNESS_SCRATCH`` (and the generated
+    ``docs/memory_safety.md``) says those helpers use.  Swapping them would
+    still clear the routine, so behaviour alone cannot catch it."""
+
+    @staticmethod
+    def _rows(owner: str, start: int):
+        from c64_test_harness.memory_policy import HARNESS_SCRATCH
+        return [r for r in HARNESS_SCRATCH
+                if r.start == start and owner in r.owner]
+
+    @pytest.mark.parametrize("helper", ["uci_tcp_connect", "uci_udp_connect"])
+    def test_host_slot_row_names_the_connect_helpers(self, helper: str) -> None:
+        assert len(self._rows(helper, u._TURBO_HOST_ADDR)) == 1
+
+    @pytest.mark.parametrize("helper", ["uci_socket_read", "uci_socket_close"])
+    def test_socket_id_slot_row_names_read_and_close(self, helper: str) -> None:
+        rows = self._rows(helper, u._TURBO_SOCKET_ID_ADDR)
+        assert len(rows) == 1 and rows[0].length == 1
+
+
 class TestTheBuilderGuard:
     """A caller who passes an input address inside the routine gets an error
     at build time instead of a routine that reads its own code."""
@@ -168,6 +189,17 @@ class TestTheBuilderGuard:
         n = len(build_socket_close(turbo_safe=True))
         with pytest.raises(ValueError):
             build_socket_close(_CODE_ADDR + n - 1, turbo_safe=True)
+
+    @pytest.mark.parametrize("build", [
+        lambda a: build_tcp_connect(a, 80, turbo_safe=True),
+        lambda a: build_udp_connect(a, 53, turbo_safe=True),
+        lambda a: build_socket_read(a, turbo_safe=True),
+        lambda a: build_socket_close(a, turbo_safe=True),
+    ], ids=["tcp", "udp", "read", "close"])
+    def test_an_address_at_the_first_routine_byte_is_refused(self, build) -> None:
+        """Lower bound is inclusive: ``code_addr`` itself is inside."""
+        with pytest.raises(ValueError):
+            build(_CODE_ADDR)
 
     @pytest.mark.parametrize("builder", [build_tcp_connect, build_udp_connect,
                                          build_socket_read, build_socket_close])
