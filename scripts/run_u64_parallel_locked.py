@@ -9,9 +9,26 @@ no two tests hold it at once, and other lanes queue on the same lock.
 
 Be clear about what the pool does *not* serialise.  A file does not have the
 device to itself for its whole run, so device state one test leaves behind can
-be seen by the next test of another file, just as it can between lanes.  The
-90 s per-file subprocess timeout also includes that child's per-test waits
-behind the other workers' tests and behind other lanes.
+be seen by the next test of another file, just as it can between lanes.
+
+**No per-file wall-clock timeout by default** (#380).  A child's run time is
+its tests *plus* every per-test wait for the lock -- behind the other workers'
+tests and behind other lanes -- and the guard extends that wait indefinitely
+behind a live, progressing holder.  So any fixed cap measures contention, not
+a hang: the old 90 s killed files whose own tests were fast.
+
+The cost of no cap is a hang that nothing bounds.  A child that hangs *inside*
+a test still holds the device lock, and while its heartbeat thread keeps the
+lockfile fresh it reads to every waiter as a live, progressing holder: every
+lane behind it -- the other workers and other lanes -- waits until someone
+kills it.  The guard's timeout (``U64_DEVICE_LOCK_TIMEOUT``, else conftest's
+300 s) bounds only a wait behind a holder that stops heartbeating (dead PID or
+stale lockfile), or a wait overtaken by repeated handoffs; it never bounds a
+wait behind a single hung holder.  Defaulting to ``None`` is a deliberate
+trade-off: no file is killed for contention, at the price of an unbounded hang.
+For an unattended run, pass a generous ``--file-timeout SECONDS``, sized to the
+file's tests plus the lock waits you are willing to serve, since the cap
+includes those waits.
 
 **Locking is per test, not per run**, and that is deliberate beyond #323 (#324).
 ``close()`` still drains a leaking client whatever the lock state, but the
@@ -28,8 +45,8 @@ alive and heartbeating, kept extending its wait until the 90 s timeout killed
 it.  ``tests/test_parallel_runner_lock_shape.py`` reproduces that offline.
 
 Usage:
-    python3 scripts/run_u64_parallel_locked.py <HOST> [--workers N]
-    U64_HOST=<device> python3 scripts/run_u64_parallel_locked.py [--workers N]
+    python3 scripts/run_u64_parallel_locked.py <HOST> [--workers N] [--file-timeout SECONDS]
+    U64_HOST=<device> python3 scripts/run_u64_parallel_locked.py [--workers N] [--file-timeout SECONDS]
 
 No default host -- this script runs the live suite in parallel against
 whatever it is pointed at, so it refuses to pick one (#243). Default
@@ -38,6 +55,7 @@ workers=4 (one per test file).
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import subprocess
 import sys
@@ -59,11 +77,18 @@ TEST_FILES = [
 ]
 
 
-def _run_file(test_file: str, host: str, password: str | None) -> dict:
+def _run_file(
+    test_file: str,
+    host: str,
+    password: str | None,
+    file_timeout: float | None = None,
+) -> dict:
     """Run one live test file in a pytest child.  Takes no lock (#323).
 
     The child's conftest ``device_lock_guard`` locks each test; a lock held
-    here would be one that guard queues on.
+    here would be one that guard queues on.  *file_timeout* ``None`` (the
+    default) puts no wall-clock cap on the child, because its run time
+    includes those per-test lock waits (#380).
     """
     pid = os.getpid()
     t0 = time.monotonic()
@@ -77,7 +102,7 @@ def _run_file(test_file: str, host: str, password: str | None) -> dict:
             [sys.executable, "-m", "pytest", test_file, "-v", "--tb=short"],
             capture_output=True,
             text=True,
-            timeout=90,
+            timeout=file_timeout,
             cwd=str(PROJECT_ROOT),
             env=env,
         )
@@ -90,7 +115,10 @@ def _run_file(test_file: str, host: str, password: str | None) -> dict:
                 break
     except subprocess.TimeoutExpired:
         returncode = 1
-        summary = "SUBPROCESS TIMEOUT (the 90 s includes per-test lock waits)"
+        summary = (
+            f"SUBPROCESS TIMEOUT after --file-timeout {file_timeout:g} s "
+            "(the cap includes per-test lock waits, #380)"
+        )
 
     return {
         "file": test_file,
@@ -101,11 +129,29 @@ def _run_file(test_file: str, host: str, password: str | None) -> dict:
     }
 
 
+def _positive_seconds(raw: str) -> float:
+    """argparse type for ``--file-timeout``: a finite number of seconds > 0."""
+    try:
+        value = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number of seconds: {raw!r}")
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(
+            f"must be finite and > 0 (omit the flag for no cap): {raw!r}"
+        )
+    return value
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("host", nargs="?", default=None,
                     help="Device host/IP (or set $U64_HOST). No default.")
     ap.add_argument("--workers", type=int, default=len(TEST_FILES))
+    ap.add_argument(
+        "--file-timeout", type=_positive_seconds, default=None, metavar="SECONDS",
+        help="Wall-clock cap per file. Default: none -- a file's run includes "
+        "its per-test lock waits, which the conftest guard bounds (#380).",
+    )
     args = ap.parse_args()
 
     args.host = require_u64_host(
@@ -125,7 +171,7 @@ def main() -> int:
 
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         futures = {
-            pool.submit(_run_file, f, args.host, password): f
+            pool.submit(_run_file, f, args.host, password, args.file_timeout): f
             for f in TEST_FILES
         }
         for future in as_completed(futures):
