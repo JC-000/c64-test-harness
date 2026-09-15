@@ -697,6 +697,14 @@ _BREACH_PROBES = {
     "socket.getaddrinfo directly": (
         "import socket\nsocket.getaddrinfo('192.0.2.1', 9)\n"
     ),
+    # ``sendmsg`` is on the forbid list but nothing above reaches it, so
+    # removing it survived (#315). Nothing in src/ uses it today: this is
+    # defence in depth, made falsifiable the same way as ``posix_spawn``.
+    "socket.sendmsg directly (UDP)": (
+        "import socket\n"
+        "socket.socket(socket.AF_INET, socket.SOCK_DGRAM)"
+        ".sendmsg([b'x'], [], 0, ('192.0.2.1', 9))\n"
+    ),
 }
 
 
@@ -848,6 +856,85 @@ def test_the_sandbox_does_not_break_a_clean_refusal(
     assert verified_sandbox["clean refusal"] == 2
 
 
+def _tripwire_invocation_problems(source: str) -> list[str]:
+    """What is wrong with how *source* (a test function) runs a script.
+
+    Structural, not textual (#315): a ``Call`` whose callee is the name
+    ``_run_in_sandbox`` must exist, and ``subprocess`` must not be touched at
+    all -- no import of it, and no call through a name bound to it. The
+    textual version passed a tripwire that ran ``subprocess.Popen`` with
+    ``_run_in_sandbox(`` present only in a comment.
+
+    Known limit: a primitive reached some other way (``os.posix_spawn``,
+    ``importlib.import_module("subprocess")``) is not modelled. That is a
+    deliberate evasion; the threat model is an accidental rewrite.
+    """
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(source))
+    problems: list[str] = []
+    if not any(
+        isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "_run_in_sandbox"
+        for n in ast.walk(tree)
+    ):
+        problems.append("no call to _run_in_sandbox")
+    bound = {"subprocess"}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for alias in n.names:
+                if alias.name.split(".")[0] == "subprocess":
+                    bound.add(alias.asname or "subprocess")
+                    problems.append(f"line {n.lineno}: imports subprocess")
+        elif isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[0] == "subprocess":
+            bound |= {a.asname or a.name for a in n.names}
+            problems.append(f"line {n.lineno}: imports from subprocess")
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call):
+            root = n.func
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if isinstance(root, ast.Name) and root.id in bound:
+                problems.append(f"line {n.lineno}: calls {ast.unparse(n.func)}")
+    return problems
+
+
+def test_the_tripwire_invocation_check_can_fail() -> None:
+    """Positive controls for :func:`_tripwire_invocation_problems`."""
+    clean = (
+        "def test_x(script_name, verified_sandbox):\n"
+        "    proc = _run_in_sandbox(_SCRIPTS / script_name, env=env)\n"
+    )
+    assert _tripwire_invocation_problems(clean) == []
+    must_flag = {
+        # The review's shape: the name survives only in a comment.
+        "Popen, sandbox call only in a comment": (
+            "def test_x(script_name, verified_sandbox):\n"
+            "    # _run_in_sandbox(\n"
+            "    proc = subprocess.Popen([sys.executable, script_name])\n"
+        ),
+        "aliased import": (
+            "def test_x(script_name, verified_sandbox):\n"
+            "    proc = _run_in_sandbox(script_name)\n"
+            "    import subprocess as sp\n"
+            "    sp.run([sys.executable, script_name])\n"
+        ),
+        "from-import": (
+            "def test_x(script_name, verified_sandbox):\n"
+            "    from subprocess import Popen as P\n"
+            "    proc = _run_in_sandbox(script_name)\n"
+            "    P([sys.executable, script_name])\n"
+        ),
+        "sandbox referenced but never called": (
+            "def test_x(script_name, verified_sandbox):\n"
+            "    runner = _run_in_sandbox\n"
+        ),
+    }
+    for label, source in must_flag.items():
+        assert _tripwire_invocation_problems(source), f"missed: {label}"
+
+
 def test_the_tripwire_cannot_run_before_its_controls() -> None:
     """Pin the ordering as a dependency, since order in the file is not one.
 
@@ -878,13 +965,10 @@ def test_the_tripwire_cannot_run_before_its_controls() -> None:
     # tripwire running ``[sys.executable, script]`` with no preamble left
     # every test here green while the scripts ran with the network intact.
     tripwire_source = inspect.getsource(test_script_refuses_cleanly_with_no_host)
-    assert "_run_in_sandbox(" in tripwire_source, (
-        "the tripwire no longer runs scripts through _run_in_sandbox, the "
-        "invocation the controls verified"
-    )
-    assert "subprocess.run" not in tripwire_source, (
-        "the tripwire builds its own subprocess invocation; the controls "
-        "verified a different one"
+    problems = _tripwire_invocation_problems(tripwire_source)
+    assert problems == [], (
+        "the tripwire no longer runs scripts only through _run_in_sandbox, the "
+        f"invocation the controls verified: {problems}"
     )
     assert "_SANDBOX" in inspect.getsource(_run_in_sandbox) and (
         "_run_in_sandbox(" in verify_source
@@ -938,6 +1022,10 @@ def _doc_prose_paths() -> list[Path]:
 #: above this rule does not cover the bench addresses: the docs name those
 #: deliberately (recovery notes, device facts). Two-octet tails are not used
 #: here because a ``1.81`` tail would match version strings in prose.
+#:
+#: **Stated limit:** so a phantom split at the two-octet boundary
+#: (``"192.168." "1.81"``) is not flagged. Pinned in
+#: :func:`test_the_doc_phantom_scan_is_not_vacuous` so it stays known (#327).
 _PHANTOM_TAILS = frozenset(
     ".".join(_PHANTOM_HOST.split(".")[i:]) for i in range(2)
 )
@@ -996,6 +1084,40 @@ def test_the_doc_phantom_scan_is_not_vacuous() -> None:
         assert _phantom_prose_hits(mangled), f"planted line not flagged: {planted}"
     # ...and the placeholder the docs use instead is not flagged.
     assert _phantom_prose_hits('client = Ultimate64Client("<device>")') == []
+
+    # Stated limit (#327): a split at the two-octet boundary is not flagged.
+    octets = _PHANTOM_HOST.split(".")
+    two_octet_split = f'"{".".join(octets[:2])}." "{".".join(octets[2:])}"'
+    assert _phantom_prose_hits(two_octet_split) == [], (
+        "the doc scan now catches a two-octet split; update the _PHANTOM_TAILS "
+        "comment's stated limit"
+    )
+
+
+def test_the_doc_phantom_scan_recurses_into_docs_subdirectories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``docs/`` has no subdirectories today, so ``rglob`` vs ``glob`` was an
+    equivalent mutant on the real tree (#327). A tmp repo root makes it not.
+    """
+    (tmp_path / "README.md").write_text("clean\n")
+    nested = tmp_path / "docs" / "sub" / "x.md"
+    nested.parent.mkdir(parents=True)
+    nested.write_text(f'client = Ultimate64Client("{_PHANTOM_HOST}")\n')
+    skill = tmp_path / ".claude" / "skills" / "c64-test"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("clean\n")
+
+    this_module = sys.modules[__name__]
+    monkeypatch.setattr(this_module, "_REPO", tmp_path)
+    monkeypatch.setattr(this_module, "_SKILL_DIR", skill)
+
+    scanned = _doc_prose_paths()
+    assert all(tmp_path in p.parents for p in scanned), (
+        "the doc scan did not follow the monkeypatched repo root"
+    )
+    assert nested in scanned, "docs/ is not scanned recursively"
+    assert _phantom_prose_hits(nested.read_text()), "the planted phantom was not found"
 
 
 def _test_module_paths(include_allowlisted: bool = False) -> list[Path]:
@@ -1763,10 +1885,15 @@ def _host_default_offenders(source: str) -> list[str]:
     Class bodies are in scope (they run at import); function, method and
     lambda bodies are not.
 
-    **Declared limit:** the variable name must be a string constant at the
-    call. ``_VAR = "U64_HOST"; os.environ.get(_VAR, "...")`` is not resolved
-    and is not flagged; the planted-regressions test asserts that, so the
-    limit stays known rather than becoming a surprise.
+    **Declared limits**, each asserted by the planted-regressions test so it
+    stays known rather than becoming a surprise:
+
+    * the variable name must be a string constant at the call.
+      ``_VAR = "U64_HOST"; os.environ.get(_VAR, "...")`` is not resolved and
+      is not flagged;
+    * an **immediately invoked lambda** is not flagged:
+      ``_HOST = (lambda: os.environ.get("U64_HOST", "..."))()`` runs at
+      import, but lambda bodies are skipped as not-import-time (#315).
     """
     offenders: list[str] = []
     for node in _import_time_nodes(ast.parse(source)):
@@ -1886,6 +2013,13 @@ def test_the_tests_scans_flag_planted_regressions(tmp_path: Path) -> None:
     assert not _host_default_offenders(held_in_variable), (
         "the default rule now resolves a variable-held env name; its "
         "docstring's declared limits say it does not"
+    )
+    invoked_lambda = (
+        'import os\n_HOST = (lambda: os.environ.get("U64_HOST", "203.0.113.9"))()\n'
+    )
+    assert not _host_default_offenders(invoked_lambda), (
+        "the default rule now catches an immediately invoked lambda; update "
+        "its docstring's declared limits"
     )
 
     must_pass = {
@@ -2143,8 +2277,21 @@ def _escaped_device_objects(tree, aliases, parents, locking_with) -> list[str]:
     Binding shapes: ``name = <device call>`` and ``with <device call> as name``
     anywhere in the block's body. A later reference is any ``Load`` of that
     name in the same scope (the nearest enclosing function, else the module)
-    that starts after the block ends. Plain names only; see the scan's
-    known limits.
+    that starts after the block ends **and before the name's first
+    rebinding** after the block (#338): ``c = None`` then ``print(c)`` is not
+    the device object. The rebinding takes effect where its value has been
+    evaluated, so ``c = c.reset()`` still flags the ``c`` it reads.
+
+    Stated limits (asserted as not flagged in the planted-regressions test):
+
+    * the first rebinding is **textual, not flow-sensitive**: a rebinding in
+      one branch (``if x: c = None``) stops tracking for a later
+      unconditional ``c.reset()`` too;
+    * a tuple target ``c, n = Ultimate64Client(h), 1`` is not a binding;
+    * an attribute target (``self.c = ...`` then ``self.c.reset()``);
+    * a walrus ``(c := Ultimate64Client(h))``;
+    * a read at the top of the next loop iteration, on a line above the
+      ``with``.
     """
     offenders: list[str] = []
 
@@ -2173,18 +2320,62 @@ def _escaped_device_objects(tree, aliases, parents, locking_with) -> list[str]:
         ):
             scope = parents.get(scope)
         end = block.end_lineno or block.lineno
-        for node in ast.walk(scope if scope is not None else tree):
+        region = scope if scope is not None else tree
+        rebound_at: dict[str, tuple[int, int]] = {}
+        for node in ast.walk(region):
+            if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Store)
+                and node.id in bound
+                and node.lineno > end
+            ):
+                position = _rebinding_position(node, parents)
+                if position is not None and position < rebound_at.get(
+                    node.id, (float("inf"), 0)
+                ):
+                    rebound_at[node.id] = position
+        for node in ast.walk(region):
             if (
                 isinstance(node, ast.Name)
                 and isinstance(node.ctx, ast.Load)
                 and node.id in bound
                 and node.lineno > end
+                and (node.lineno, node.col_offset)
+                < rebound_at.get(node.id, (float("inf"), 0))
             ):
                 offenders.append(
                     f"line {node.lineno}: {node.id} was built under the lock at "
                     f"line {block.lineno} but is used after the lock is released"
                 )
     return offenders
+
+
+def _rebinding_position(name: ast.Name, parents) -> tuple[int, int] | None:
+    """Where a ``Store`` of *name* takes effect, or ``None`` if it does not rebind.
+
+    A binding takes effect once its value is evaluated: after the right-hand
+    side of an assignment, the iterable of a ``for``, the context expression
+    of a ``with``, the value of a walrus. An augmented assignment reads the
+    old object first, so it is a use and not a rebinding.
+    """
+    node: ast.AST = name
+    parent = parents.get(node)
+    while parent is not None:
+        if isinstance(parent, ast.AugAssign):
+            return None
+        if isinstance(parent, (ast.Assign, ast.AnnAssign)) and parent.value is not None:
+            return (parent.value.end_lineno, parent.value.end_col_offset)
+        if isinstance(parent, (ast.For, ast.AsyncFor)):
+            return (parent.iter.end_lineno, parent.iter.end_col_offset)
+        if isinstance(parent, ast.withitem):
+            expr = parent.context_expr
+            return (expr.end_lineno, expr.end_col_offset)
+        if isinstance(parent, ast.NamedExpr):
+            return (parent.value.end_lineno, parent.value.end_col_offset)
+        if isinstance(parent, ast.stmt):
+            break
+        node, parent = parent, parents.get(parent)
+    return (name.end_lineno, name.end_col_offset)
 
 
 def _device_reaching_calls(source: str) -> int:
@@ -2294,6 +2485,29 @@ def test_the_lock_scan_flags_planted_regressions() -> None:
             + "        c.run_prg(b'')\n"
             + "    c.reset()\n"
         ),
+        "rebinding reads the old object (`c = c.reset()`)": (
+            helper + client
+            + "def main(h):\n"
+            + "    with hold_device_lock(h):\n"
+            + "        c = Ultimate64Client(host=h)\n"
+            + "    c = c.reset()\n"
+        ),
+        "augmented assignment does not stop tracking": (
+            helper + client
+            + "def main(h):\n"
+            + "    with hold_device_lock(h):\n"
+            + "        c = Ultimate64Client(host=h)\n"
+            + "    c += 1\n"
+            + "    c.reset()\n"
+        ),
+        "use after the lock, rebinding only later": (
+            helper + client
+            + "def main(h):\n"
+            + "    with hold_device_lock(h):\n"
+            + "        c = Ultimate64Client(host=h)\n"
+            + "    c.reset()\n"
+            + "    c = None\n"
+        ),
         "device object from `with ... as` used after the lock": (
             helper
             + "from c64_test_harness.backends.ultimate64 import Ultimate64Transport\n"
@@ -2341,6 +2555,31 @@ def test_the_lock_scan_flags_planted_regressions() -> None:
             + "        c.reset()\n"
             + "    print('done')\n"
         ),
+        # #338: tracking stops at the first rebinding after the block.
+        "name rebound after the lock, then read": (
+            helper + client
+            + "def main(h):\n"
+            + "    with hold_device_lock(h):\n"
+            + "        c = Ultimate64Client(host=h)\n"
+            + "        c.reset()\n"
+            + "    c = None\n"
+            + "    print(c)\n"
+        ),
+        "name rebound after the lock on the same line as the read": (
+            helper + client
+            + "def main(h):\n"
+            + "    with hold_device_lock(h):\n"
+            + "        c = Ultimate64Client(host=h)\n"
+            + "    c = None; print(c)\n"
+        ),
+        "name rebound by a for loop after the lock": (
+            helper + client
+            + "def main(h):\n"
+            + "    with hold_device_lock(h):\n"
+            + "        c = Ultimate64Client(host=h)\n"
+            + "    for c in range(3):\n"
+            + "        print(c)\n"
+        ),
         "nested function defined under the lock": (
             helper + client
             + "def run(h):\n    with hold_device_lock(h):\n"
@@ -2352,6 +2591,56 @@ def test_the_lock_scan_flags_planted_regressions() -> None:
     for label, source in must_pass.items():
         assert not _device_lock_offenders(source), (
             f"the lock scan false-positived ({label}): {_device_lock_offenders(source)}"
+        )
+
+    # Stated limits of the escape tracking (_escaped_device_objects), asserted
+    # so each stays known. If one starts being flagged, update that docstring.
+    known_misses = {
+        "rebinding in one branch stops tracking (textual, not flow-sensitive)": (
+            helper + client
+            + "def main(h, x):\n"
+            + "    with hold_device_lock(h):\n"
+            + "        c = Ultimate64Client(host=h)\n"
+            + "    if x:\n"
+            + "        c = None\n"
+            + "    c.reset()\n"
+        ),
+        "tuple target": (
+            helper + client
+            + "def main(h):\n"
+            + "    with hold_device_lock(h):\n"
+            + "        c, n = Ultimate64Client(host=h), 1\n"
+            + "    c.reset()\n"
+        ),
+        "attribute target": (
+            helper + client
+            + "class R:\n    def main(self, h):\n"
+            + "        with hold_device_lock(h):\n"
+            + "            self.c = Ultimate64Client(host=h)\n"
+            + "        self.c.reset()\n"
+        ),
+        "walrus": (
+            helper + client
+            + "def main(h):\n"
+            + "    with hold_device_lock(h):\n"
+            + "        (c := Ultimate64Client(host=h))\n"
+            + "    c.reset()\n"
+        ),
+        "read at the top of the next loop iteration": (
+            helper + client
+            + "def main(h):\n"
+            + "    c = None\n"
+            + "    for _ in range(2):\n"
+            + "        if c:\n"
+            + "            c.reset()\n"
+            + "        with hold_device_lock(h):\n"
+            + "            c = Ultimate64Client(host=h)\n"
+        ),
+    }
+    for label, source in known_misses.items():
+        assert not _device_lock_offenders(source), (
+            f"a stated limit of the escape tracking is now flagged ({label}); "
+            f"update _escaped_device_objects' docstring"
         )
 
 
