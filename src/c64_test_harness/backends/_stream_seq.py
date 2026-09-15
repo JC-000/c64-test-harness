@@ -51,7 +51,8 @@ measured on this bench, so none of these has been seen):
   numbered network duplicates is taken as a restart (resync, re-admitted);
 - datagrams still held when the capture stops are discarded as duplicates
   (:meth:`SequenceTracker.flush_held`), so a silent restart in the last
-  ``MAX_HELD_DUPLICATES`` packets of a capture loses those packets;
+  ``MAX_HELD_DUPLICATES`` packets of a capture loses those packets
+  (counted in :attr:`SequenceTracker.discarded`);
 - a duplicate run immediately followed by the next number *after the run*
   that is still behind the highest reads as a restart (re-sent 48, 49 and
   then a re-sent 50 with different bytes);
@@ -61,8 +62,11 @@ measured on this bench, so none of these has been seen):
   1. the restart's payloads are byte-identical to the old stream's
      (digital silence), so the digest cannot tell a restart from a
      duplicate and the run is held;
-  2. a number the *old* stream lost falls inside that held run, i.e.
-     within the first ``max_held`` numbers of the restart;
+  2. a number the *old* stream lost falls inside that held run.  The
+     triggering set is **exactly 1..``max_held``, inclusive at the top**
+     (#451): ``max_held`` itself still triggers it, ``max_held`` + 1 does
+     not, and 0 never does, because nothing precedes the first number the
+     tracker observes so 0 is never a tracked missing number;
   3. that number is still inside the window, so it is remembered as an
      unarrived missing number.
 
@@ -77,6 +81,24 @@ measured on this bench, so none of these has been seen):
   accepted rather than fixed: it is the same ambiguity as the residual
   above (a re-sent 48, 49 then a late 50 is indistinguishable from a
   restart), and no duplication or restart has been measured on the device.
+
+  **The loss is countable**: those discarded payloads are in
+  :attr:`SequenceTracker.discarded`, surfaced as ``payloads_discarded`` on
+  both ``CaptureResult`` and ``DebugCaptureResult``, and
+  ``packets_received`` == delivered + ``payloads_discarded`` closes the
+  books.  Without it a capture missing a fifth of its audio reads clean in
+  every field a caller can assert on -- ``packets_dropped`` 0,
+  ``sequence_resyncs`` 0, ``time_base_intact`` ``True`` -- with only
+  ``packets_reordered`` and two WARNING lines as evidence (#443 round 3,
+  reviewer-8: 52 datagrams sent, 52 received, 41 in the WAV, 11
+  discarded).  The flag is deliberately *not* moved: a true duplicate's
+  payload is a correct discard, so a non-zero count is not by itself a
+  fault.  It is the caller's to assert on.
+
+  **How reachable any of this is on hardware is unestablished** (#452):
+  the sequence number is generated FPGA-side and nobody has established
+  whether starting a stream resets it, so a mid-capture restart may be
+  routine or may be unreachable.  That question grades this residual.
 
   More generally, **a restart whose first number is an unarrived missing
   number inside the window places that datagram in the old stream's slot
@@ -151,6 +173,12 @@ class SequenceTracker:
     #: resync) -- one per datagram, not one per backward step.
     reordered: int = 0
     resyncs: int = 0
+    #: Datagrams whose payload was discarded rather than delivered: held
+    #: runs decided to be duplicates, both mid-stream and at ``stop()``.
+    #: A true duplicate's payload is a correct discard, but a silent
+    #: restart's is a genuine loss the other counters cannot show (#443
+    #: round 3) -- see the fourth declared residual in the module docstring.
+    discarded: int = 0
     highest: int | None = None
     _missing: dict[int, object] = field(default_factory=dict)
     _received: dict[int, object] = field(default_factory=dict)
@@ -162,9 +190,17 @@ class SequenceTracker:
             self._missing[seq] = slot
 
     def flush_held(self) -> int:
-        """Decide every held datagram is a duplicate; returns how many."""
+        """Decide every held datagram is a duplicate; returns how many.
+
+        This is the **only** place a received datagram's payload is dropped
+        on the floor, from either caller -- :meth:`observe` when a held run
+        turns out not to continue, and the receivers' ``stop()`` for
+        whatever is still held.  It counts them in :attr:`discarded` so the
+        loss is assertable rather than only logged (#443 round 3).
+        """
         n = len(self._held)
         self._held.clear()
+        self.discarded += n
         return n
 
     def _age(self, seq: int) -> int:

@@ -530,3 +530,143 @@ def test_a_duplicate_of_a_re_admitted_packet_is_a_duplicate() -> None:
     assert t.observe(0, "x", 0).kind == _stream_seq.HELD  # re-admitted 0 again
     assert t.observe(cap + 1, "x", cap + 1).kind == _stream_seq.NEXT
     assert (t.dropped, t.resyncs) == (0, 1)
+
+
+# ----------------------------------------------------------------------------
+# #443 review round 3: every payload dropped on the floor is counted.
+#
+# The five streams below are reviewer-8's fixtures, which found the case and
+# re-check it.  The discard is measured from the written WAV --
+# ``packets_received`` minus the packets actually in it -- so the measurement
+# is independent of ``payloads_discarded``, the field under test.
+# Offline loopback through the real receivers, n=1 per case, no device.
+# ----------------------------------------------------------------------------
+
+_MAX_HELD = _stream_seq.MAX_HELD_DUPLICATES
+
+#: One identical payload for every datagram: digital silence, which is what
+#: makes the duplicate-versus-restart ambiguity fire.
+_SILENT = struct.pack("<H", 0xA5A5) * (_AUDIO_PAYLOAD_LEN // 2)
+
+
+def _uniq(seq: int) -> bytes:
+    """Distinct per sequence number and never all-zero, so an unfilled gap
+    placeholder is distinguishable from a delivered packet."""
+    return struct.pack("<H", (seq + 1) & 0xFFFF or 1) * (_AUDIO_PAYLOAD_LEN // 2)
+
+
+#: name -> (sequence list, payload or None for _uniq, packets in the WAV,
+#:          payloads discarded)
+R8_FIXTURES = {
+    # Control: nothing re-sent, nothing discarded.
+    "clean": (list(range(100)), None, 100, 0),
+    # A confirmed retransmission: its PCM is already in the WAV, so the
+    # discard is correct.  Counted, and documented as harmless -- this is
+    # the must-pass control for any live gate.
+    "genuine_duplicate": (
+        list(range(50)) + [48] + list(range(50, 100)), None, 100, 1),
+    # A silent restart the tracker recognises (the run continues past
+    # MAX_HELD_DUPLICATES): every packet re-admitted, nothing discarded.
+    # The control separating a recognised restart from the row below.
+    "restart_recognised": (list(range(100)) + list(range(60)), _SILENT, 160, 0),
+    # The blind spot: a silent restart over a number the old stream lost.
+    # 3 must be inside 1..MAX_HELD_DUPLICATES, and the restart must run past
+    # it, or the stream resyncs instead and this stops being the case.
+    "restart_over_lost_number": (
+        [0, 1, 2] + list(range(4, 41)) + list(range(12)), _SILENT, 41, 11),
+    # Second discard path: a tail of re-sent datagrams still held when the
+    # capture stops.  Fewer than MAX_HELD_DUPLICATES, so they are never
+    # decided.  Needs no restart and no loss -- reachable today.
+    "held_at_stop_only": (
+        list(range(100)) + list(range(_MAX_HELD - 2)), _SILENT, 100, 6),
+}
+
+
+@pytest.mark.parametrize("name", list(R8_FIXTURES))
+def test_reviewer_8_fixture_discards_are_counted(name: str, tmp_path: Path) -> None:
+    """Both discard paths count, a recognised restart counts 0, and the
+    counter matches what the WAV itself shows was thrown away."""
+    seqs, payload, kept, discarded = R8_FIXTURES[name]
+    result, pcm = _audio_raw(
+        [(s, payload if payload is not None else _uniq(s)) for s in seqs],
+        tmp_path,
+    )
+    blocks = [
+        pcm[i:i + _AUDIO_PAYLOAD_LEN]
+        for i in range(0, len(pcm), _AUDIO_PAYLOAD_LEN)
+    ]
+    delivered = sum(1 for b in blocks if any(b))
+    assert result.packets_received == len(seqs)
+    assert delivered == kept
+    # Measured from the WAV, not from the field under test.
+    assert result.packets_received - delivered == discarded
+    assert result.payloads_discarded == discarded
+    # Every row reads intact: the flag is deliberately not moved.
+    assert result.time_base_intact is True
+
+
+def test_reviewer_8_silent_restart_discards_eleven_payloads(tmp_path: Path) -> None:
+    """The case itself, pinned with exact numbers in both directions.
+
+    52 datagrams sent, 52 received, 41 packets in the WAV: 11 payloads never
+    reach the output -- three flushed when the restart's held run reaches the
+    number the old stream is still owed (3), and eight still held at
+    ``stop()``.  Every other field a caller can assert on reads clean, so
+    ``payloads_discarded`` is what makes the loss assertable.
+    """
+    seqs, payload, *_ = R8_FIXTURES["restart_over_lost_number"]
+    assert len(seqs) == 52
+    result, pcm = _audio_raw([(s, payload) for s in seqs], tmp_path)
+    assert result.packets_received == 52
+    assert len(pcm) // _AUDIO_PAYLOAD_LEN == 41
+    assert result.payloads_discarded == 11
+    # 52 received = 41 delivered + 11 discarded: the accounting closes.
+    assert result.packets_received == 41 + result.payloads_discarded
+    assert (result.packets_dropped, result.packets_reordered,
+            result.sequence_resyncs) == (0, 12, 0)
+    assert result.time_base_intact is True
+
+
+def test_reviewer_8_silent_restart_discards_eleven_payloads_debug() -> None:
+    """The same stream through DebugCapture: 52 received, 41 kept, 11 counted."""
+    seqs, *_ = R8_FIXTURES["restart_over_lost_number"]
+    zero = bytes(ENTRIES_PER_PACKET * ENTRY_SIZE)
+    result = _debug_raw([(s, zero) for s in seqs])
+    assert result.packets_received == 52
+    assert result.total_cycles == 41 * ENTRIES_PER_PACKET
+    assert result.payloads_discarded == 11
+    assert (result.packets_dropped, result.packets_reordered,
+            result.sequence_resyncs) == (0, 12, 0)
+
+
+def test_debug_counts_datagrams_held_at_stop() -> None:
+    """The stop() path on the debug receiver too (no restart, no loss)."""
+    seqs, _payload, _kept, discarded = R8_FIXTURES["held_at_stop_only"]
+    zero = bytes(ENTRIES_PER_PACKET * ENTRY_SIZE)
+    result = _debug_raw([(s, zero) for s in seqs])
+    assert result.packets_received == len(seqs)
+    assert result.total_cycles == 100 * ENTRIES_PER_PACKET
+    assert result.payloads_discarded == discarded == 6
+
+
+def test_a_real_gap_discards_no_payload(tmp_path: Path) -> None:
+    """A lost packet is not a discarded one: the two counters are distinct."""
+    gapped, _ = _audio(CASES["one_gap"][0], tmp_path)
+    assert (gapped.packets_dropped, gapped.payloads_discarded) == (10, 0)
+
+
+def test_the_declared_residual_counts_its_five_lost_packets(
+    tmp_path: Path,
+) -> None:
+    """The fourth residual's own stream: the 5 packets it loses are counted.
+
+    1,100 sent, 1,095 kept, ``packets_dropped`` 0 and ``time_base_intact``
+    True -- and ``payloads_discarded`` 5, which is exactly the difference.
+    """
+    zero = bytes(_AUDIO_PAYLOAD_LEN)
+    seqs = [s for s in range(501) if s != 5] + list(range(600))
+    result, pcm = _audio_raw([(s, zero) for s in seqs], tmp_path)
+    assert len(pcm) // _AUDIO_PAYLOAD_LEN == 1095
+    assert result.payloads_discarded == 5
+    assert result.packets_received == 1095 + result.payloads_discarded
+    assert result.time_base_intact is True
