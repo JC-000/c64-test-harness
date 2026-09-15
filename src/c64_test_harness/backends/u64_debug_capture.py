@@ -13,9 +13,13 @@ at 1 MHz, so at 1 MHz you get an essentially complete cycle-accurate
 trace. At higher turbo speeds you get a **uniformly sampled 1/N view**
 of the real bus: at 4 MHz you see ~1/4 of cycles, at 48 MHz ~1/48.
 The FPGA does NOT attempt to send everything and drop on overflow
-(sequence-number gaps stay at zero across speeds); it rate-limits at
-the source. See ``tests/test_u64_debug_stream_speed_live.py`` for
-the measurement.
+(the speed sweep saw no extra sequence-number gaps at higher speeds);
+it rate-limits at the source. See
+``tests/test_u64_debug_stream_speed_live.py`` for the measurement.
+Turbo speed adds no gaps, but the bench's own loss does: a 1 s capture
+on the U64E measured 0.4-45% of packets lost to gaps, with the host's
+socket buffer never full (#356). ``packets_dropped`` is not zero in
+general.
 
 **Practical implication**: if your test needs a complete trace
 (call-graph, exact cycle count, bus-state transitions), drop to 1 MHz
@@ -256,9 +260,10 @@ class DebugCapture:
        The U64E debug stream is rate-capped at ~850k entries/sec at the
        FPGA source (see the module docstring). At CPU turbo speeds you
        receive a uniformly sampled ``1/N`` view of the bus, not a
-       dropped-during-send slice. ``packets_dropped`` stays at zero
-       regardless of turbo speed because the rate limit is applied
-       before emission. Drop to 1 MHz if you need a complete trace.
+       dropped-during-send slice. Turbo speed adds no sequence gaps,
+       because the rate limit is applied before emission; loss on the
+       path to this host still does (#356), so ``packets_dropped`` is
+       not zero in general. Drop to 1 MHz if you need a complete trace.
     """
 
     def __init__(

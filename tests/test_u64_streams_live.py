@@ -90,6 +90,28 @@ BA_HIGH_MAX = 0.96
 DEBUG_STREAM_LOSS_MAX = 0.75
 
 
+def _debug_loss_fraction(result) -> float:
+    """``dropped / (received + dropped)`` for a debug capture result.
+
+    The denominator is every packet the sequence numbers say was sent, not
+    only those received, so a capture that received nothing but counted
+    gaps reads 1.0, and one with no gaps reads 0.0.  Module-level so the
+    offline pin (``tests/test_debug_stream_loss_bound.py``) checks the same
+    arithmetic the live assertion uses (#356 review).
+    """
+    sent = result.packets_received + result.packets_dropped
+    return result.packets_dropped / sent if sent else 0.0
+
+
+def _debug_loss_within_bound(result) -> bool:
+    """Whether a capture's loss fraction is at or under the bound.
+
+    The live assertion's comparison, kept here so the offline pin exercises
+    the comparison itself rather than a copy of it (#356 review).
+    """
+    return _debug_loss_fraction(result) <= DEBUG_STREAM_LOSS_MAX
+
+
 def _local_ip() -> str:
     """Detect the local IP address that can reach the U64."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -152,16 +174,14 @@ def test_debug_stream_captures_cycles(client: Ultimate64Client) -> None:
     )
     assert len(result.trace) > 0, "Trace is empty"
     assert result.packets_received > 0, "No debug packets received"
-    loss = result.packets_dropped / (
-        result.packets_received + result.packets_dropped
-    )
-    assert loss <= DEBUG_STREAM_LOSS_MAX, (
+    loss = _debug_loss_fraction(result)
+    assert _debug_loss_within_bound(result), (
         f"sequence gaps account for {100.0 * loss:.1f}% of the stream "
         f"({result.packets_dropped} dropped, {result.packets_received} "
         f"received), above {100.0 * DEBUG_STREAM_LOSS_MAX:.0f}%. Network "
         "loss on this bench tops out near 45%; a figure far above that "
-        "points at the receiver's sequence accounting (byte order, header "
-        "offset) rather than the link -- see DEBUG_STREAM_LOSS_MAX (#356)"
+        "points at the receiver's sequence accounting (byte order) rather "
+        "than the link -- see DEBUG_STREAM_LOSS_MAX (#356)"
     )
 
 
