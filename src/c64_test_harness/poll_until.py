@@ -68,6 +68,8 @@ peek routines should not assume a particular incoming value.
 
 from __future__ import annotations
 
+from ._address import refuses_bool_address_args
+
 import time
 from typing import Protocol
 
@@ -83,6 +85,7 @@ class _PollableTransport(Protocol):
     """
 
 
+@refuses_bool_address_args
 def poll_until_ready(
     transport: _PollableTransport,
     code_addr: int,

@@ -14,6 +14,8 @@ directly — the firmware handles everything.
 
 from __future__ import annotations
 
+from ._address import refuses_bool_address_args
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -45,6 +47,7 @@ class SidPlaybackError(Exception):
     """Raised when SID playback dispatch or execution fails."""
 
 
+@refuses_bool_address_args
 def build_vice_stub(play_addr: int, stub_addr: int = DEFAULT_STUB_ADDR) -> bytes:
     """Build the 6502 IRQ installer + wrapper stub.
 
@@ -125,6 +128,7 @@ def _validate_song(sid: SidFile, song: int) -> None:
         )
 
 
+@refuses_bool_address_args
 def play_sid_vice(
     transport: BinaryViceTransport,
     sid: SidFile,
@@ -248,6 +252,7 @@ def stop_sid_vice(transport: BinaryViceTransport) -> None:
     )
 
 
+@refuses_bool_address_args
 def play_sid(
     transport,
     sid: SidFile,

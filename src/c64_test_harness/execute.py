@@ -120,6 +120,7 @@ def set_register(transport: BinaryViceTransport, name: str, value: int) -> None:
     *name* must be one of ``A``, ``X``, ``Y``, ``SP``, or ``PC``
     (case-insensitive).
     """
+    refuse_bool_address(value, f"register {name} value")  # #373
     name = name.upper()
     if name not in _VALID_REGS:
         raise ValueError(f"Unknown register {name!r}; expected one of {_VALID_REGS}")
