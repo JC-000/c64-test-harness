@@ -766,7 +766,7 @@ So size the budget conservatively, as though attachments were counted: that is a
 | Call | Wire form | Leaves a `/Temp` attachment? |
 |---|---|---|
 | `client.run_prg` / `load_prg` / `run_crt` / `sid_play` / `mod_play` | POST + body | **Yes — one per call** |
-| `client.mount_disk(...)` | **POST** + multipart body (`mount_disk` in `ultimate64_client.py`) | **Yes — one per call** |
+| `client.mount_disk(...)` | **POST** + single-part multipart body, `type`/`mode` as query arguments (`mount_disk` in `ultimate64_client.py`; before #311 it sent them as form fields ahead of the image, which the U64E rejected with HTTP 400 `Invalid Type ''`) | **Yes — one per call** |
 | `client.drive_load_rom(..., bytes)` | **PUT** + multipart body (`drive_load_rom`, same module) | **Yes — one per call** |
 | `client.write_mem(addr, data)` where `len(data) > write_mem_query_threshold` | POST + body | **Yes — one per call** |
 | `client.write_mem(addr, data)` where `len(data) <= write_mem_query_threshold` | `PUT ?data=<hex>` | No |
