@@ -17,9 +17,14 @@ The FPGA does NOT attempt to send everything and drop on overflow
 it rate-limits at the source. See
 ``tests/test_u64_debug_stream_speed_live.py`` for the measurement.
 Turbo speed adds no gaps, but the bench's own loss does: a 1 s capture
-on the U64E measured 0.4-45% of packets lost to gaps, with the host's
-socket buffer never full (#356). ``packets_dropped`` is not zero in
-general.
+on the U64E measured 0.4-45% of packets lost to gaps (#356). The host's
+socket buffer was never full in the 12 of those 28 captures where the
+kernel counter was bracketed. Paired runs place the loss at the host's
+Wi-Fi downlink, load-dependent: other traffic on the host raised audio
+loss about 27-fold (measured, paired n=6). Whether the FPGA also
+discards packets while advancing the sequence number is not
+established, so a small device-side residual is not excluded.
+``packets_dropped`` is not zero in general.
 
 **Practical implication**: if your test needs a complete trace
 (call-graph, exact cycle count, bus-state transitions), drop to 1 MHz
@@ -261,9 +266,10 @@ class DebugCapture:
        FPGA source (see the module docstring). At CPU turbo speeds you
        receive a uniformly sampled ``1/N`` view of the bus, not a
        dropped-during-send slice. Turbo speed adds no sequence gaps,
-       because the rate limit is applied before emission; loss on the
-       path to this host still does (#356), so ``packets_dropped`` is
-       not zero in general. Drop to 1 MHz if you need a complete trace.
+       because the rate limit is applied before emission. Loss still
+       does: on the bench it is the host's Wi-Fi downlink,
+       load-dependent, with a small device-side residual not excluded
+       (#356). So ``packets_dropped`` is not zero in general. Drop to 1 MHz if you need a complete trace.
     """
 
     def __init__(

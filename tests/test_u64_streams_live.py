@@ -77,16 +77,33 @@ BA_HIGH_MAX = 0.96
 #: had >= 50 drops, in bursts of 1-313 packets.  Neither buffer size helped
 #: (median 55-492 drops either way), and in the 12 captures bracketed by
 #: ``netstat -s -p udp`` the kernel's "dropped due to full socket buffers"
-#: counter moved by **zero** every time.  So the loss is upstream of this
-#: host's socket -- the Mac reaches the U64E over Wi-Fi (en0), carrying a
-#: ~32 Mbps stream -- and a count limit measured the bench, not the code.
+#: counter moved by **zero** every time, so the loss happens before this
+#: host's socket buffer, and a count limit measured the bench, not the code.
 #:
-#: What the bound still catches is the receiver miscounting.  A sequence
-#: number read in the wrong byte order turns each +1 step into a +256
-#: jump, i.e. a loss fraction near 0.99; the band between the worst
-#: observed network loss and that is what 0.75 sits in.  The edge is
-#: chosen, not derived.  A receiver that stops reading is caught by the
-#: cycle-count assertion instead.
+#: Where it happens was then measured (owner's stream-loss research, same
+#: device and day): **the host's Wi-Fi downlink, load-dependent.**  Paired
+#: n=6, audio alone lost a median 7 packets per ~1,390; audio alongside a
+#: ~19 Mbps host download that never touches the U64 lost a median 186.5
+#: (9-17%), about 27 times as much.  Audio alongside this debug stream lost
+#: 12-26% (n=8), and audio and debug losses coincided in 63-77% of time bins
+#: against 7-16% by chance.  Arrival delay climbs before each loss, peaking
+#: at 348 ms against the device's exact 4.00 ms packet period: queue
+#: tail-drop, not a receiver fault.  en0 input errors and drops stayed at 0.
+#: **Not established:** whether the FPGA packetizer (proprietary) advances
+#: the sequence number on an in-device discard, so a small device-side
+#: residual is not excluded.  Consequence for anyone reading a failure here:
+#: other lanes' traffic on this host raises the loss, and the DeviceLock
+#: does not isolate it.
+#:
+#: What the bound catches is the receiver's own sequence accounting going
+#: wrong.  A sequence number read in the wrong byte order turns each +1
+#: step into a +256 jump, a loss fraction near 0.99; the band between the
+#: worst bench loss measured (0.446) and that is what 0.75 sits in.  It
+#: does **not** detect emitter-side degradation of the #81 kind, or any
+#: loss below 75%; the loss fraction and packets received are logged on
+#: every run so such a trend stays visible.  The edge is chosen, not
+#: derived.  A receiver that stops reading is caught by the cycle-count
+#: assertion instead.
 DEBUG_STREAM_LOSS_MAX = 0.75
 
 
@@ -165,9 +182,11 @@ def test_debug_stream_captures_cycles(client: Ultimate64Client) -> None:
         result = cap.stop()
 
     logger.info(
-        "Debug capture: %d cycles, %d packets, %d dropped, %.2fs",
+        "Debug capture: %d cycles, %d packets received, %d dropped, "
+        "loss fraction %.4f, %.2fs",
         result.total_cycles, result.packets_received,
-        result.packets_dropped, result.duration_seconds,
+        result.packets_dropped, _debug_loss_fraction(result),
+        result.duration_seconds,
     )
     assert result.total_cycles > 10000, (
         f"Expected >10000 cycles, got {result.total_cycles}"
@@ -178,10 +197,11 @@ def test_debug_stream_captures_cycles(client: Ultimate64Client) -> None:
     assert _debug_loss_within_bound(result), (
         f"sequence gaps account for {100.0 * loss:.1f}% of the stream "
         f"({result.packets_dropped} dropped, {result.packets_received} "
-        f"received), above {100.0 * DEBUG_STREAM_LOSS_MAX:.0f}%. Network "
-        "loss on this bench tops out near 45%; a figure far above that "
-        "points at the receiver's sequence accounting (byte order) rather "
-        "than the link -- see DEBUG_STREAM_LOSS_MAX (#356)"
+        f"received), above {100.0 * DEBUG_STREAM_LOSS_MAX:.0f}%. Loss on "
+        "this bench (the host's Wi-Fi downlink, load-dependent; a small "
+        "device-side residual not excluded) has reached 45%; a figure far "
+        "above that points at the receiver's sequence accounting (byte "
+        "order) -- see DEBUG_STREAM_LOSS_MAX (#356)"
     )
 
 
