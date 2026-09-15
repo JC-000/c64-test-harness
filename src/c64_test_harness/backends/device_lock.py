@@ -175,9 +175,13 @@ _MAX_HOLDER_HANDOFFS = 3
 #: minutes (issue #273).
 #:
 #: Not zero, because the wait is not *unconditionally* stuck: a second
-#: thread holding a reference to the holder can release it, a pattern
-#: pinned by ``test_device_lock.py::TestBlockingTimeout::
-#: test_acquire_succeeds_after_release`` and by
+#: thread holding a reference to the holder can release it.  That rescue
+#: is supported **within the grace** -- 2.0 s, this constant -- and no
+#: longer: past it :meth:`DeviceLock.acquire` has already logged a
+#: WARNING naming the cap, the caller's timeout is capped at 2.0 s, and
+#: the acquire returns ``False`` (``acquire_or_raise`` raises
+#: ``DeviceLockTimeout``).  Pinned by ``test_device_lock.py::
+#: TestBlockingTimeout::test_acquire_succeeds_after_release`` and by
 #: ``test_device_lock_self_deadlock.py::TestSelfHeldDoesNotExtendDeadline::
 #: test_helper_thread_can_still_rescue_a_self_held_wait``.  This keeps
 #: that rescue window open and cuts the pathological case to seconds.
@@ -223,10 +227,14 @@ _MAX_HOLDER_HANDOFFS = 3
 #: ``test_device_lock_self_held_fast_fail.py::TestTheRescueWindow``;
 #: raise this constant rather than working around it.
 #:
-#: The residual -- a documented supported pattern now carrying an
-#: undocumented time limit -- is tracked as **#277**, which records the
-#: two ways to close it (state the budget in the API, or add an opt-out)
-#: and carries the measurements above as its evidence.
+#: **#277 decided (owner, 2026-09-14): keep the value and state the
+#: budget, no opt-out keyword and no env var.**  Every place the rescue
+#: is called a pattern that works now names this value, the WARNING and
+#: the cap -- the :meth:`DeviceLock.acquire` docstring and
+#: ``docs/device_locking.md`` § "Rescuing a self-held wait from another
+#: thread" -- and ``tests/test_device_lock_rescue_grace_docs.py`` fails
+#: if one stops doing so.  Reconsider only if a real consumer needs a
+#: rescue slower than the grace.
 _SELF_HELD_WAIT_GRACE = 2.0
 
 _PROCESS_HELD: dict[str, int] = {}
@@ -565,15 +573,23 @@ class DeviceLock:
         identity has been changing -- so a starved waiter can say what
         it is behind instead of sitting silently.
 
-        **A lock held by this same thread never extends the deadline.**
-        Its heartbeat keeps the mtime fresh and its PID is alive by
-        definition, so it would otherwise read as a perfectly healthy
-        holder for ever and *timeout would be unreachable* -- a permanent
-        hang that looks exactly like a healthy queue.  The wait is still
-        allowed (another thread may hold a reference to the holder and
-        release it in time, which is a supported pattern); it is simply
-        bounded by *timeout* again.  Holders in other threads or other
-        processes extend the deadline as before.
+        **A lock held by this same thread never extends the deadline,
+        and its wait is capped.**  Its heartbeat keeps the mtime fresh and
+        its PID is alive by definition, so it would otherwise read as a
+        perfectly healthy holder for ever and *timeout would be
+        unreachable* -- a permanent hang that looks exactly like a healthy
+        queue.  The wait is still allowed, and another thread holding a
+        reference to the holder may release it mid-wait: that rescue is
+        supported **within the grace**, ``_SELF_HELD_WAIT_GRACE`` = 2.0 s.
+        When *timeout* exceeds the grace, the acquire logs a WARNING naming
+        the device, the requested timeout and the cap, and the timeout is
+        capped at 2.0 s; a rescue that releases later than that is too
+        late, and the acquire returns ``False`` (``acquire_or_raise``
+        raises :class:`DeviceLockTimeout`).  A *timeout* shorter than the
+        grace is served as given -- a cap, never a floor.  There is no
+        opt-out (#277).  Pass ``allow_nested=True`` if this is a nested
+        hold by the same owner rather than a rescue.  Holders in other
+        threads or other processes extend the deadline as before.
 
         :param timeout: maximum wall time (seconds) to wait against
             stuck/dead holders.  With queue-aware semantics, total
@@ -617,11 +633,12 @@ class DeviceLock:
             self._start_heartbeat()
             return True
 
-        # A lock this very thread holds can only be released by this
+        # A lock this very thread holds cannot be released by this
         # thread, which is about to block here -- so the caller's timeout
         # buys nothing but the same False, later.  Cap it (never extend
-        # it) at the grace: long enough for the supported
-        # rescue-by-another-thread pattern, short enough that a 600 s
+        # it) at the grace: a rescue by another thread is supported only
+        # within the grace (2.0 s); past it this WARNING has fired and the
+        # capped timeout returns False.  Short enough that a 600 s
         # live-test timeout no longer costs 600 s.
         if self._held_by_this_thread() and timeout > _SELF_HELD_WAIT_GRACE:
             _log.warning(
@@ -827,16 +844,20 @@ class DeviceLock:
         That is *not* the same as "unconditionally stuck", and this
         docstring used to say it was (issue #273).  Another thread
         holding a reference to the holder can release it mid-wait: a
-        supported pattern, pinned by
+        pattern supported within the grace (2.0 s,
+        :data:`_SELF_HELD_WAIT_GRACE`) -- past it :meth:`acquire` has
+        logged a WARNING and the capped timeout returns ``False`` --
+        pinned by
         ``test_device_lock.py::TestBlockingTimeout::test_acquire_succeeds_after_release``
         and by ``test_device_lock_self_deadlock.py::
         TestSelfHeldDoesNotExtendDeadline::
-        test_helper_thread_can_still_rescue_a_self_held_wait``.  So the
-        predicate means "this wait cannot resolve itself", and the two
-        things :meth:`acquire` does with it are both bounds rather than
-        refusals: it declines to treat the hold as progress, and it caps
-        the wait at :data:`_SELF_HELD_WAIT_GRACE`.  Anyone tempted to
-        turn it into an immediate failure should read those two tests
+        test_helper_thread_can_still_rescue_a_self_held_wait``.
+
+        So the predicate means "this wait cannot resolve itself", and the
+        two things :meth:`acquire` does with it are both bounds rather
+        than refusals: it declines to treat the hold as progress, and it
+        caps the wait at :data:`_SELF_HELD_WAIT_GRACE`.  Anyone tempted
+        to turn it into an immediate failure should read those two tests
         first.
         """
         key = str(self._lock_path)
@@ -882,8 +903,9 @@ class DeviceLock:
         # -- a permanent hang indistinguishable from a healthy queue.
         # Refusing to extend makes the wait bounded again.  It does not
         # forbid the wait: another thread holding a reference to the
-        # holder can still release it in time, which is a tested and
-        # supported pattern.  A hold owned by a *different* thread is a
+        # holder can still release it, a tested pattern supported within
+        # the grace (2.0 s) -- acquire() caps the timeout there and logs a
+        # WARNING when it does.  A hold owned by a *different* thread is a
         # normal queue and still extends the deadline.
         if self._held_by_this_thread():
             return False, None

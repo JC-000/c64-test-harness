@@ -91,6 +91,31 @@ finally:
 A live, progressing holder extends a waiter's deadline indefinitely, so
 a neighbour running a multi-hour suite does not time you out.
 
+## Rescuing a self-held wait from another thread
+
+An `acquire()` on a lock **its own thread already holds** (through a
+second `DeviceLock` instance, without `allow_nested=True`) cannot end its
+own wait: the thread that would have to call `release()` is the one
+blocked. Such a wait never extends its deadline, and since issue #273 it
+is also capped.
+
+Another thread holding a reference to the holder may release it
+mid-wait, and the blocked acquire then succeeds. That rescue is supported
+**within the grace only**: `_SELF_HELD_WAIT_GRACE` = 2.0 s. When the
+caller's timeout is longer than that, the acquire logs a WARNING naming
+the device, the requested timeout and the cap, and the timeout is capped
+at 2.0 s. A helper that releases later than that is too late: `acquire()`
+returns `False` and `acquire_or_raise()` raises `DeviceLockTimeout`. A
+timeout shorter than the grace is served as given; the grace is a cap,
+never a floor.
+
+There is no opt-out keyword and no environment variable for this
+(owner decision on #277, 2026-09-14). The measured cliff sits exactly at
+the constant: a helper releasing at 1.95 s rescues, one releasing at
+2.20 s does not. If what you actually have is one owner re-entering the
+library while it already holds the device, pass `allow_nested=True`
+instead; that joins the hold rather than waiting on it.
+
 ## Checking without adopting the package
 
 For a runner that wants to be a good neighbour without restructuring
