@@ -16,6 +16,8 @@ directory, not anywhere -- and no device is contacted.
 """
 from __future__ import annotations
 
+import ast
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -63,8 +65,31 @@ def _request(path: str) -> SimpleNamespace:
     )
 
 
+def _resolve_fixture_function(fixture):
+    """The generator function behind a ``@pytest.fixture``, without private API (#314).
+
+    pytest 9's ``FixtureFunctionDefinition`` is built with
+    ``functools.update_wrapper``, so the standard ``__wrapped__`` reaches the
+    original function. A pytest whose decorator returns the function itself
+    is used directly. Anything else skips *naming the pytest version*, so a
+    pytest refactor reads as "this harness needs updating", not as a lock
+    timeout regression. :class:`TestTheGuardIsResolvedPublicly` asserts the
+    skip path is not taken on the pytest this repo installs.
+    """
+    wrapped = getattr(fixture, "__wrapped__", None)
+    if wrapped is not None:
+        return wrapped
+    if inspect.isgeneratorfunction(fixture):
+        return fixture
+    pytest.skip(
+        f"pytest {pytest.__version__}: cannot reach the function behind "
+        f"{type(fixture).__name__} (no __wrapped__); update "
+        f"_resolve_fixture_function"
+    )
+
+
 def _guard():
-    return conftest.device_lock_guard._get_wrapped_function()
+    return _resolve_fixture_function(conftest.device_lock_guard)
 
 
 def _run_guard(request) -> object:
@@ -131,3 +156,54 @@ class TestTheGuardFixture:
         assert all(not lk.timeouts for lk in fake_lock.instances), (
             "the guard reached acquire_or_raise with a refused budget"
         )
+
+
+def _resolve_or_fail(fixture):
+    """For the controls below: a skip here would hide the defect, so fail."""
+    try:
+        return _resolve_fixture_function(fixture)
+    except pytest.skip.Exception as exc:
+        pytest.fail(f"resolution fell through to the skip path: {exc}")
+
+
+class TestTheGuardIsResolvedPublicly:
+    """#314: no dependency on pytest's private ``_get_wrapped_function``.
+
+    The positive controls resolve through :func:`_resolve_or_fail`: a broken
+    resolver otherwise *skips*, the run exits 0, and the mutation survives.
+    """
+
+    def test_this_module_never_names_the_private_method(self) -> None:
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        private = [
+            n.lineno for n in ast.walk(tree)
+            if isinstance(n, ast.Attribute) and n.attr == "_get_wrapped_function"
+        ]
+        assert private == [], f"private pytest API used at lines {private}"
+
+    def test_a_fixture_object_with_only_wrapped_is_resolved(self, monkeypatch) -> None:
+        """What a pytest without ``_get_wrapped_function`` looks like."""
+        fn = conftest.device_lock_guard.__wrapped__
+        stand_in = SimpleNamespace(__wrapped__=fn)
+        assert not hasattr(stand_in, "_get_wrapped_function")
+        monkeypatch.setattr(conftest, "device_lock_guard", stand_in)
+        assert _resolve_or_fail(conftest.device_lock_guard) is fn
+
+    def test_a_bare_generator_function_is_used_directly(self) -> None:
+        def fixture_fn(request):
+            yield None
+
+        assert _resolve_or_fail(fixture_fn) is fixture_fn
+
+    def test_an_unreachable_fixture_skips_naming_the_pytest_version(self) -> None:
+        with pytest.raises(pytest.skip.Exception, match=rf"pytest {pytest.__version__}:"):
+            _resolve_fixture_function(SimpleNamespace())
+
+    def test_vacuity_guard_the_skip_path_is_not_taken_here(self) -> None:
+        """Every TestTheGuardFixture case would skip, not fail, otherwise."""
+        try:
+            fn = _guard()
+        except pytest.skip.Exception as exc:
+            pytest.fail(f"_guard() fell through to the skip path: {exc}")
+        assert inspect.isgeneratorfunction(fn)
+        assert fn.__name__ == "device_lock_guard"
