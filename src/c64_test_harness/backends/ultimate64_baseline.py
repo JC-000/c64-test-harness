@@ -360,7 +360,10 @@ BASELINE_RECORDED_CATEGORY_SETS: dict[str, RecordedCategorySet] = {
             "7f6fcb51 (v3.15-85): target/u64/nios2/ultimate/Makefile builds "
             "rtc_i2c.cc (:67, Clock Settings), network_esp32.cc (:143, WiFi "
             "settings) and data_streamer.cc (:170, Data Streams) and not "
-            "bling_board.cc; Speaker Mixer is #if U64 == 2 only"
+            "bling_board.cc; Speaker Mixer is #if U64 == 2 only.  "
+            "Confirmed when the names were read directly on 2026-09-15 "
+            "(U64E fw 3.15, one bodyless GET /v1/configs, DeviceLock held; "
+            "#287): 19 categories, identical to this record (#316)"
         ),
         categories=frozenset({
             "Audio Mixer", "SID Sockets Configuration", "UltiSID Configuration",

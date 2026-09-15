@@ -378,7 +378,12 @@ class TestRecordedCategorySets:
         # instruments and must keep saying so (review round 1, #312).
         u64e_source = rec["ultimate"].source.lower()
         for token in ("reconstructed", "cross-checked", "#288", "7f6fcb51",
-                      "u64_device_probe.md"):
+                      "u64_device_probe.md",
+                      # #316: the build variant that makes the list 19 names
+                      "nios2",
+                      # #316 comment: the direct read that confirmed it
+                      "2026-09-15", "read directly", "bodyless get /v1/configs",
+                      "identical"):
             assert token in u64e_source, f"U64E source lacks {token!r}"
         assert "projected" not in u64e_source
         assert "bodyless GET /v1/configs" in rec["cbm"].source

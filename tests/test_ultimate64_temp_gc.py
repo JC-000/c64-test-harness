@@ -270,6 +270,38 @@ def test_temp_gc_source_no_longer_states_the_3_mb_ramdisk():
     # and "1.1.0" also occur in unrelated prose (mutation R10 survived a
     # membership check).
     flat = _re.sub(r"[\s`]+", " ", src)
-    assert _re.search(r"target/u64/riscv/ultimate/linker\.x at v3\.14d", flat)
+    # #316: the shipped U64E image is the nios2 build, whose linker script
+    # is the BSP's -- cite that tree, and the build chain that selects it.
+    assert _re.search(r"software/nios_appl_bsp/linker\.x at v3\.14d", flat)
+    assert _re.search(r"target/u64/nios2/ultimate/Makefile", flat)
     assert _re.search(r"target/u64ii/riscv/ultimate/linker\.x at 1\.1\.0", flat)
-    assert _re.search(r"target/u64/nios2 build directories carry no RAM-disk symbols", flat)
+    assert "target/u64/riscv/ultimate/linker.x at v3.14d" not in flat
+    assert "is not established. So" not in flat
+    assert "carry no RAM-disk symbols" not in flat
+
+
+def test_budget_comment_prices_uci_writes_by_grade():
+    """#294 chunks ``Ultimate64Transport.write_memory`` into PUT-sized pieces
+    unless the cached grade is ``writemem_post_safe is True``, and UCI
+    routines and payloads go through the transport. So a UCI socket write
+    costs no attachment on a leak-prone or unknown grade; only a post-safe
+    grade (whose firmware collects) or a direct ``client.write_mem`` caller
+    pays. The budget comment used to state the pre-#294 cost unqualified.
+    """
+    from c64_test_harness.backends import ultimate64_temp_gc as mod
+
+    src = _inspect.getsource(mod)
+    start = src.index("#: Note the unit:")
+    end = src.index("DEFAULT_LEAK_BUDGET = ")
+    # Strip only the "#:" comment prefixes, so "#294" survives the flattening.
+    note = _re.sub(r"[\s`]+", " ", src[start:end].replace("\n#:", " "))
+    # Vacuity guard: this is the paragraph about UCI costs.
+    assert "build_socket_write" in note and "enable_uci" in note
+    assert "write spends one of the budget for its routine code" not in note
+    assert "writemem_post_safe is True" in note
+    assert "transport.write_memory" in note
+    assert "client.write_mem" in note
+    assert "#294" in note
+    # The same qualifier applies to the "raw write_memory" parenthetical
+    # above the note: the transport now chunks those on a leak-prone grade.
+    assert "those are lane bugs to fix by chunking" not in src
