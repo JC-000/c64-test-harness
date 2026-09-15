@@ -55,6 +55,7 @@ from c64_test_harness.backends.ultimate64_helpers import (
     CAT_U64_SPECIFIC,
     get_turbo_mhz,
     max_cpu_speed_mhz,
+    restore_speed_defaults,
 )
 from c64_test_harness.backends.ultimate64_probe import is_u64_reachable
 from c64_test_harness.transport import C64Transport
@@ -212,8 +213,16 @@ def _speed_session(t):
     ``CPU Speed`` the tests set behind (#360), so the exit writes each of
     :data:`_SPEED_ITEMS` back to the ``default`` read at entry -- not the
     entry ``current``, which on a C64 Ultimate may be a killed run's
-    residue.  Each item is its own step, so one failed PUT does not skip
-    the other.
+    residue.
+
+    The exit is :func:`restore_speed_defaults` with ``defaults=`` the entry
+    read (#370): the entry read stays, so a missing default refuses the tests
+    before anything is written and drift is warned about there, and the exit
+    reads nothing.  The helper attempts both items even when one PUT is
+    rejected and raises ``Ultimate64RestoreError`` naming each failure; that
+    is raised here as the module's teardown ``RuntimeError``, with the
+    helper's error as its ``__cause__``, the same shape the transport
+    teardown uses.
     """
     _reconcile_on_entry(t.client)
     defaults = _speed_item_defaults(t.client)
@@ -224,12 +233,9 @@ def _speed_session(t):
     finally:
         failures = _teardown_steps([
             (
-                f"restore {item}={value!r}",
-                lambda item=item, value=value: t.client.set_config_item(
-                    CAT_U64_SPECIFIC, item, value
-                ),
-            )
-            for item, value in defaults.items()
+                "restore_speed_defaults",
+                lambda: restore_speed_defaults(t.client, defaults=defaults),
+            ),
         ])
     _raise_teardown_failures("CPU speed restore", failures)
 
