@@ -558,10 +558,13 @@ class TestTheItemCountCarriesItsScope:
     #: "the cbm generation", "C64 ultimate" and "C64-Ultimate" through.
     #: #372: also ``u64ii`` (the C64U firmware target), "C-64 Ultimate",
     #: "Commodore-64 Ultimate" and "Commodore 64U"; and a trailing boundary,
-    #: without which "the C64 ultimately reads" was flagged.
+    #: without which "the C64 ultimately reads" was flagged.  Review of #407:
+    #: the plural ("the C64 Ultimates"), a space or underscore anywhere in
+    #: "C 64 Ultimate" / "c64_ultimate", the "U" suffix after either spelling
+    #: ("C-64U", "C64-U"), and ``u64ii`` joined by an underscore.
     _OTHER_DEVICE = re.compile(
-        r"\bcbm\b|\bc-?64[\s-]?ultimate\b|\bcommodore[\s-]?64[\s-]?(?:ultimate\b|u\b)"
-        r"|\bc64u\b|\bu64ii\b",
+        r"\bcbm\b|\bc[\s-]?64[\s_-]?(?:ultimates?\b|u\b)"
+        r"|\bcommodore[\s-]?64[\s-]?(?:ultimates?\b|u\b)|\bu64ii(?:_|\b)",
         re.IGNORECASE,
     )
 
@@ -1306,6 +1309,14 @@ _OTHER_DEVICE_VARIANTS = {
     "C-64 Ultimate": "the C-64 Ultimate",
     "Commodore-64 Ultimate": "the Commodore-64 Ultimate",
     "Commodore 64U": "the Commodore 64U",
+    # Review of #407: plurals, and spellings the #372 pattern still missed.
+    "C64 Ultimates": "the C64 Ultimates",
+    "Commodore 64 Ultimates": "the Commodore 64 Ultimates",
+    "C-64U": "the C-64U",
+    "C64-U": "the C64-U",
+    "C 64 Ultimate": "the C 64 Ultimate",
+    "c64_ultimate": "the c64_ultimate generation",
+    "u64ii_build": "the u64ii_build tree",
 }
 
 #: The base sentence each variant is planted into.  It must pass alone, so
@@ -1368,6 +1379,11 @@ def test_the_count_scan_flags_every_spelling_of_the_other_device(variant: str) -
     f"{_OTHER_DEVICE_BASE} on the Ultimate 64 Elite.",
     # #372: no trailing boundary flagged "C64 ultimately".
     f"{_OTHER_DEVICE_BASE}; the C64 ultimately reads the same.",
+    # Review of #407 (O6): the "U" suffix is a whole letter, not a word start.
+    f"{_OTHER_DEVICE_BASE} on the Commodore 64 users' machines.",
+    f"{_OTHER_DEVICE_BASE} for C64 users.",
+    # The u64ii guard stops at a letter (synthetic boundary control).
+    f"{_OTHER_DEVICE_BASE}, built from a u64iib tree.",
 ])
 def test_the_count_scan_leaves_near_misses_alone(sentence: str) -> None:
     assert TestTheItemCountCarriesItsScope._unscoped(sentence) == []

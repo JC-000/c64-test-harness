@@ -45,7 +45,10 @@ written is *not* flagged, and the same claim with the escaping part removed
   on" are flagged only when "on" ends the phrase (at most six words between),
   because "switches Network Settings based on the host" is not a write.  So
   "Nothing in the harness switches FTP File Service on for a lane" is not
-  flagged.
+  flagged.  ("on or off" at the end of the phrase is flagged like "on".)
+* **Split "on" past six words (#372 review):** the window between the verb
+  and a split "on" is at most six words, so "Nothing in the harness switches
+  the Network Settings > FTP File Service item on." (eight) is not flagged.
 """
 
 from __future__ import annotations
@@ -147,7 +150,7 @@ _NEGATED_WRITE = re.compile(
     # #372: the phrasal forms "turns on X" and "switches X on", where a
     # split "on" must end the phrase ("switches ... based on the host" is not).
     r"|[^.;:]{0,50}?\b(?:enabl\w*|(?:turn|switch)\w*\s+on\b"
-    r"|(?:turn|switch)\w*(?:\s+[\w>-]+){1,6}?\s+on\b(?![\s-]*\w))"
+    r"|(?:turn|switch)\w*(?:\s+[\w>-]+){1,6}?\s+on\b(?:\s+or\s+off\b)?(?![\s-]*\w))"
     r")",
     re.IGNORECASE,
 )
@@ -300,6 +303,8 @@ class TestNoDocClaimsTheStoreIsNeverWritten:
         "Nothing in the harness switches FTP File Service on.",
         "No lane in the harness ever turned Network Settings > FTP File Service on.",
         "Nothing in the harness switches on FTP File Service.",
+        # Review of #407: "on or off" ends the phrase too.
+        "Nothing in the harness switches FTP File Service on or off.",
     ])
     def test_the_scan_flags(self, text: str) -> None:
         assert _unscoped_absolute_claims(text), text
@@ -371,6 +376,10 @@ class TestTheDeclaredLimitsStayKnown:
         "split on followed by more words": (
             "Nothing in the harness switches FTP File Service on for a lane.",
             "Nothing in the harness switches FTP File Service on.",
+        ),
+        "split on past six words": (
+            "Nothing in the harness switches the Network Settings > FTP File Service item on.",
+            "Nothing in the harness switches the FTP File Service item on.",
         ),
     }
 
