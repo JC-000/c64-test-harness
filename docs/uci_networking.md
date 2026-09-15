@@ -21,11 +21,37 @@ measured on the U64E unless it says otherwise.
 
 **Prerequisite:** UCI must be enabled in the device settings:
 *C64 and Cartridge Settings → Command Interface → Enabled*.
-`enable_uci(client)` flips that item over REST, but the `$DF1C-$DF1F`
-registers do not go live until the next machine reset: the live suites
-follow it with `client.reset()` and a 3 s settle before the first routine
-(`tests/test_uci_udp_send_live.py:242-249`), and without that every routine
-times out at the sentinel. The write is memory-only — it is a config PUT, so
+`enable_uci(client)` flips that item over REST. The live suites follow it
+with `client.reset()` and a 3 s settle before the first routine
+(`tests/test_uci_udp_send_live.py:242-249`); without that, every routine
+times out at the sentinel. Keep that sequence. It is a recorded
+observation, and **its cause is not explained by firmware source**. From
+source, read at tag `1.1.0` (the C64U) and `7f6fcb51` (the U64E's
+v3.15-85), not measured:
+
+- The item drives the FPGA register `CMD_IF_SLOT_ENABLE`, which
+  `C64::set_emulation_flags()` sets to `!!cfg->get_value(CFG_CMD_ENABLE)`
+  (`software/io/c64/c64.cc:326-327` at `1.1.0`; `:329-330` at `7f6fcb51`).
+- A REST single-item config PUT reaches that function at once:
+  `st->at_close_config()` (`software/api/route_configs.cc:244` at `1.1.0`,
+  `:313` at `7f6fcb51`) → `effectuate()` (`config.h:163-169`) →
+  `C64::effectuate_settings()` → `set_emulation_flags()`
+  (`c64.cc:267-277`). So by source the enable takes effect without a
+  reset.
+- #270 proposed a cause that is half the path: `machine:reboot` →
+  `MENU_C64_REBOOT` → `C64::start_cartridge(NULL)` (`route_machine.cc:40`,
+  `c64_subsys.cc:231-236`) zeroes `CMD_IF_SLOT_ENABLE` (`c64.cc:913`). But
+  when no external cartridge holds the bus it then calls
+  `set_cartridge(NULL)` (`c64.cc:923-924`), which calls
+  `set_emulation_flags()` again (`c64.cc:992`) and restores the enable
+  from config. Only when `ConfigureU64SystemBus()` reports an external
+  cartridge with the bus (Cartridge Preference *Automatic* with a cart
+  present, or *External*) is `set_cartridge` skipped, leaving the slot at
+  0. The same applies to the REU enable. `Ultimate64Client.reboot`'s
+  docstring states the unconditional version; that contradiction is #299.
+
+To find the real cause, drop the reset on a device and see which step
+fails. Nobody has done that. The write is memory-only — it is a config PUT, so
 it survives `machine:reboot` but not a firmware power-on, and it is never
 saved to flash (`uci_network.py:2316-2329`). (`enable_uci`'s own
 docstring still says "a device reboot reverts to the default state";
