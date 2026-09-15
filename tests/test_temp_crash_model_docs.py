@@ -32,7 +32,9 @@ exemption's reason must cite an issue number; there are none today.
 
 **Harness units (review round 2).**  In the crash-word branch only,
 attachments / POSTs / calls / requests / writes also count ("Fifteen POSTs
-wedge it"), except as a rate ("two attachments per call").  A retirement does
+wedge it"), except as a *price*: followed by "per call/request/probe", or
+preceded by a cost verb ("costs two attachments").  "per run", "a run",
+"per client" and "an upload" are not prices.  A retirement does
 not waive a count when "but" or "still" follows it in the same sentence.
 
 **Declared limits, not design.**  The harness's own numbers pass because of
@@ -43,7 +45,13 @@ caught (attachments are not a unit in the bound branch; the number after the
 noun is not read), nor is "a few dozen uploads"; and "the budget is 6 uploads
 per client" **is** flagged although it is a rate, not a crash count.
 "One upload" is not a count (a single call is not a crash count, and the
-corpus says "one PRG per iteration" often).  A number of
+corpus says "one PRG per iteration" often).  Also flagged although arguably
+not a crash count: a retirement taken back by a following "but"/"still"
+even when what follows is harmless ("... is not a budget, but a datapoint";
+#386 drops the retirement escape altogether), and a harness count that
+merely shares a sentence with a crash word ("The bench made 3 POSTs and
+nothing crashed.", "Each of the 4 calls can wedge the runner if it is
+already stuck.").  A number of
 "cycles" beside a bound word is a /Temp count only in a paragraph about /Temp,
 attachments or writemem, because "a budget denominated in 6502 cycles" is
 ordinary prose elsewhere.  A count spelled some other way ("a score of runs")
@@ -67,6 +75,8 @@ SCANNED: tuple[Path, ...] = tuple(sorted(
         _REPO / "src" / "c64_test_harness" / "backends" / "ultimate64_temp_gc.py",
         _REPO / "src" / "c64_test_harness" / "backends" / "ultimate64_client.py",
         _REPO / "tests" / "test_ultimate64_temp_hygiene.py",
+        # Its docstring once priced its upload loop against "a handful" (#382 round 3).
+        _REPO / "tests" / "test_u64_turbo_bench_live.py",
     }
 ))
 
@@ -96,13 +106,24 @@ _COUNT_RUNS = re.compile(
 )
 _COUNT_CYCLES = re.compile(rf"\b{_NUM}{_MODIFIER}\s+cycles?\b", re.IGNORECASE)
 #: Crash-word branch only: the harness's own units.
-_HARNESS_MODIFIER = r"(?:\s+(?:attachment-creating|body-carrying|KB|KiB|more|further|leaking))?"
+_HARNESS_MODIFIER = r"(?:\s+(?:attachment-creating|body-carrying|run_prg|KB|KiB|more|further|leaking))?"
 _COUNT_HARNESS = re.compile(
     rf"\b{_NUM}{_HARNESS_MODIFIER}\s+(?:attachments?|POSTs?|calls?|requests?|writes?)\b",
     re.IGNORECASE,
 )
-#: "two attachments per call" is a price, not a count before a crash.
-_RATE = re.compile(r"\s+(?:per|each|a|an)\s+(?:call|request|client|upload|run|instance|probe)\b", re.IGNORECASE)
+#: A count is skipped only when it is a *price*: "two attachments per call",
+#: "costs two attachments".  "per run", "a run", "per client" and "an upload"
+#: are not prices -- "Fifteen POSTs per run wedge it" is a crash count
+#: (review round 3; the earlier per|each|a|an + noun rule waved those through).
+_PER_CALL = re.compile(r"\s+per\s+(?:call|request|probe)\b", re.IGNORECASE)
+_COST_VERB_BEFORE = re.compile(
+    r"\b(?:costs?|costing|leaves?|spends?|creates?)\s+(?:exactly\s+|only\s+)?$", re.IGNORECASE
+)
+
+
+def _is_a_price(sentence: str, match: re.Match[str]) -> bool:
+    return bool(_PER_CALL.match(sentence, match.end())
+                or _COST_VERB_BEFORE.search(sentence[:match.start()]))
 _CRASH = re.compile(r"\b(?:wedg\w*|crash\w*|brick\w*|dies|die|kills?|survives?)\b", re.IGNORECASE)
 _BOUND = re.compile(
     r"\b(?:budget|allowance|limit|bound|threshold|safe|within|between|under|below)\b"
@@ -110,9 +131,11 @@ _BOUND = re.compile(
     re.IGNORECASE,
 )
 _TEMP_PARAGRAPH = re.compile(r"/Temp|attachment|writemem|unpatched|leak-prone|#686", re.IGNORECASE)
+#: The gap may cross a dot inside a word ("CLAUDE.md"), not a sentence end.
+_IN_SENTENCE = r"(?:[^.;]|\.(?=\w))"
 _HANDFUL_BOUND = re.compile(
-    r"\ba\s+(?:handful|dozen|few)\b[^.;]{0,30}\b(?:budget|limit|allowance)\b"
-    r"|\b(?:budget|limit|allowance)\b[^.;]{0,30}\ba\s+(?:handful|dozen|few)\b",
+    rf"\ba\s+(?:handful|dozen|few)\b{_IN_SENTENCE}{{0,90}}\b(?:budget|limit|allowance)\b"
+    rf"|\b(?:budget|limit|allowance)\b{_IN_SENTENCE}{{0,90}}\ba\s+(?:handful|dozen|few)\b",
     re.IGNORECASE,
 )
 _RETIRES = re.compile(
@@ -166,7 +189,7 @@ def _states_a_count(sentence: str, paragraph: str) -> bool:
                 return True
     if _CRASH.search(sentence):
         for match in _COUNT_HARNESS.finditer(sentence):
-            if _RATE.match(sentence, match.end()) or _retired_near(sentence, match):
+            if _is_a_price(sentence, match) or _retired_near(sentence, match):
                 continue
             return True
     return False
@@ -231,6 +254,7 @@ def test_the_scan_sees_the_real_corpus() -> None:
         ".claude/agents/adversarial-reviewer.md",
         "src/c64_test_harness/backends/ultimate64_temp_gc.py",
         "tests/test_ultimate64_temp_hygiene.py",
+        "tests/test_u64_turbo_bench_live.py",
     ):
         assert expected in rel, f"{expected} is not scanned"
 
@@ -267,15 +291,26 @@ def test_the_scan_sees_the_real_corpus() -> None:
                for s, p in rate), "the per-call price is read as a count before a crash"
 
 
+#: The real /Temp sentence a count is planted beside (review round 3).
+_PLANT_ANCHOR = "how many uploads an unpatched device survives"
+
+
 def test_a_count_planted_into_a_real_file_is_flagged() -> None:
-    """Corpus-independent positive control (review round 2): the real text
-    passes, and the same text with one count sentence appended does not."""
+    """Corpus-independent positive control: the real text passes, and the same
+    text with one count sentence **spliced into a real /Temp paragraph** does
+    not.  Round 2 appended the plant as its own paragraph, so the control also
+    passed on empty text (mutant P2); the anchor check makes that fail, and the
+    splice puts the plant beside real budget and retirement vocabulary."""
     path = _REPO / ".claude" / "skills" / "c64-test" / "PATTERNS.md"
     text = path.read_text(encoding="utf-8")
+    assert _PLANT_ANCHOR in text, "the PATTERNS /Temp sentence the plant is spliced after is gone"
     assert count_and_figure_problems(text) == []
+    anchor_end = text.index(".", text.index(_PLANT_ANCHOR)) + 1
     for planted in ("Stay within 15 uploads.", "Fifteen POSTs wedge it.",
                     "The /Temp RAM disk is 3 MiB."):
-        found = count_and_figure_problems(text + "\n\n" + planted + "\n")
+        spliced = text[:anchor_end] + " " + planted + text[anchor_end:]
+        assert spliced.count("\n\n") == text.count("\n\n"), "the plant opened a new paragraph"
+        found = count_and_figure_problems(spliced)
         # The flag must be *about the planted sentence*, not merely non-empty.
         assert any(planted in excerpt for _, excerpt in found), (
             f"planted {planted!r} into PATTERNS.md was not flagged: {found}"
@@ -307,6 +342,15 @@ class TestTheRulesCanFail:
         "Fifteen POSTs wedge it.",
         "~15 calls to run_prg crash the firmware.",
         "Keep under 15 uploads, which is retired as a hard rule but still a good budget.",
+        # Review round 3: "per run", "a run", "per client", "an upload" are not prices.
+        "Fifteen POSTs per run wedge it.",
+        "Six attachments a run crash the firmware within a session.",
+        "15 writes per client crash it.",
+        "Fifteen attachment-creating requests an upload wedge it.",
+        "It wedges after 15 run_prg calls.",
+        # Review round 3 (D2): the turbo bench docstring's old wording, a dot inside "CLAUDE.md".
+        "That is 12 attachments against a budget the standing hardware-safety clause in "
+        "CLAUDE.md says to treat as a handful.",
     ])
     def test_a_count_guess_is_flagged(self, text: str) -> None:
         assert "count before a crash" in {r for r, _ in count_and_figure_problems(text)}, text
@@ -329,6 +373,13 @@ class TestTheRulesCanFail:
         "A wireguard soak loop runs one PRG per iteration until it crashes.",
         # Review round 2: harness numbers.
         "DEFAULT_LEAK_BUDGET is 6 attachments per client instance.",
+        # Review round 3: prices, with a crash word in the sentence.
+        "uci_socket_write costs two attachments when the payload exceeds the threshold, "
+        "and a wedged device crashes anyway.",
+        "liveness_probe() takes two attachments per call, so probing a suspected wedge spends budget.",
+        # Review round 3 (H5): a retired harness-unit count.
+        "The retired guess of 15 POSTs is not a budget.",
+        "The retired guess that 15 POSTs wedge a device is not a budget.",
         "liveness_probe() costs two attachments per call, so probing a suspected wedge spends budget.",
     ])
     def test_the_owner_model_and_ordinary_counts_pass(self, text: str) -> None:
@@ -377,7 +428,14 @@ class TestTheDeclaredLimitsStayKnown:
             f"now caught: {text!r}; update the module docstring's declared limits"
         )
 
-    def test_the_declared_false_positive_is_still_flagged(self) -> None:
-        assert count_and_figure_problems("The budget is 6 uploads per client."), (
-            "the per-client rate is no longer flagged; update the declared limits"
+    @pytest.mark.parametrize("text", [
+        "The budget is 6 uploads per client.",
+        # Review round 3.
+        "The ~15 uploads that wedged it are not a budget, but a datapoint.",
+        "The bench made 3 POSTs and nothing crashed.",
+        "Each of the 4 calls can wedge the runner if it is already stuck.",
+    ])
+    def test_a_declared_false_positive_is_still_flagged(self, text: str) -> None:
+        assert count_and_figure_problems(text), (
+            f"no longer flagged: {text!r}; update the module docstring's declared limits"
         )
