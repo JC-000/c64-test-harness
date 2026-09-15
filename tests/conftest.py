@@ -167,6 +167,26 @@ def _clear_vice_elevation_process_caches():
         cache.cache_clear()
 
 
+@pytest.fixture(autouse=True)
+def _reset_temp_ledgers(request):
+    """Forget per-device ``/Temp`` accounting around every unit test (#295).
+
+    The ledger is process-wide by design, so a unit test that leaks against
+    ``fake-host`` would otherwise leave a count, or a hygiene block, for the
+    next test that builds a client on that name.  Live tests keep it: there
+    the count describes a real device across tests.
+    """
+    node_path = getattr(request.node, "path", None) or request.node.fspath
+    if is_live_test_file(node_path):
+        yield
+        return
+    from c64_test_harness.backends.ultimate64_temp_gc import _reset_temp_ledgers as reset
+
+    reset()
+    yield
+    reset()
+
+
 class MockTransport:
     """In-memory C64Transport for testing screen/keyboard/memory modules.
 

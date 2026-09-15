@@ -139,13 +139,16 @@ def test_transport_write_memory_above_threshold_is_accounted():
         c.write_mem(0xC000, b"x" * 256)
     assert c.pending_temp_attachments == 1
 
+    # Same host, so the count is the device's and already holds the POST
+    # above (#295): measure what the transport write adds.
     c = _client(LEAKY)
     t = Ultimate64Transport(host="fake-host", client=c)
+    before = c.pending_temp_attachments
     mock, captured = _urlopen_mock()
     with patch("urllib.request.urlopen", mock):
         t.write_memory(0xC000, b"x" * 256)
     assert [r.get_method() for r in captured] == ["PUT", "PUT"]
-    assert c.pending_temp_attachments == 0
+    assert c.pending_temp_attachments - before == 0
 
 
 def test_uci_socket_write_shape_is_accounted_per_attachment():
@@ -168,14 +171,16 @@ def test_uci_socket_write_shape_is_accounted_per_attachment():
     assert [r.get_method() for r in captured] == ["PUT", "PUT", "PUT", "POST"]
     assert c.pending_temp_attachments == 1
 
-    # A large send adds the payload as a second attachment.
+    # A large send adds the payload as a second attachment.  Same host, so
+    # the count is the device's (#295): measure what this send adds.
     c2 = _client(LEAKY)
+    before = c2.pending_temp_attachments
     mock2, captured2 = _urlopen_mock()
     with patch("urllib.request.urlopen", mock2):
         c2.write_mem(0xC800, b"\x01" * 892)   # large payload -> POST
         c2.write_mem(0xC000, b"\xEA" * 170)   # routine       -> POST
     assert [r.get_method() for r in captured2] == ["POST", "POST"]
-    assert c2.pending_temp_attachments == 2
+    assert c2.pending_temp_attachments - before == 2
 
 
 def test_arming_never_probes(monkeypatch: pytest.MonkeyPatch):

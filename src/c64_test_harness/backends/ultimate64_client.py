@@ -456,12 +456,18 @@ class Ultimate64Client:
             self._temp_gc_budget = int(temp_gc_budget)
         else:
             self._temp_gc_budget = _leak_budget()
-        #: Attachment-creating requests issued since the last successful pass.
-        self._pending_temp_attachments = 0
-        #: Set to the reason string once hygiene is known to be impossible.
-        self._temp_hygiene_blocked: str | None = None
-        #: One attempt per client at turning FTP File Service on.
-        self._ftp_enable_attempted = False
+        from .ultimate64_temp_gc import temp_ledger_for as _temp_ledger_for
+
+        #: The device's accounting, shared by every client of this host in
+        #: the process (#295): the pending count, the refusal state and the
+        #: one FTP-enable attempt. See ``TempLedger``.
+        self._temp_ledger = _temp_ledger_for(host)
+        #: This client's own share of the device's pending count, valid only
+        #: for the ledger generation it was counted in (a successful sweep by
+        #: any client collects it).
+        self._own_temp_attachments = 0
+        self._own_temp_generation = self._temp_ledger.generation
+        self._temp_ledger.attach(self)
         #: Re-entrancy guard: the hygiene pass's own REST calls must not
         #: recurse back into the budget check.
         self._in_temp_hygiene = False
@@ -515,9 +521,14 @@ class Ultimate64Client:
         self.log_device_grading()
 
         # Drain /Temp when this device's lock is handed to the next lane.
-        # Registered weakly, so a forgotten client is collected normally.
+        # The device's ledger registers, not the client, so one release
+        # drains once however many clients this process built (#295).
+        # Registration is weak and idempotent; the ledger holds its clients
+        # weakly, so a forgotten client is collected normally.
         if _HAS_DEVICE_LOCK:
-            _register_release_callback(self.host, self, "_drain_on_lock_release")
+            _register_release_callback(
+                self.host, self._temp_ledger, "drain_on_lock_release"
+            )
 
     def close(self) -> None:
         """Release client resources.
@@ -704,19 +715,15 @@ class Ultimate64Client:
     ) -> tuple[int, bytes]:
         if method != "GET":
             self._check_device_lock(f"{method} {path}")
-        leaks = self._creates_temp_attachment(method, body)
-        if leaks:
-            self._before_temp_attachment(f"{method} {path}")
-        try:
-            status, data = self._request_uncounted(
-                method, path, body=body, content_type=content_type, query=query
-            )
-        finally:
-            if leaks:
-                # Counted even when the call failed: the firmware writes
-                # the attachment as the body streams in, so a request
-                # that errors afterwards has still left one behind.
-                self._pending_temp_attachments += 1
+        if self._creates_temp_attachment(method, body):
+            # Gate and count in one step under the device ledger's lock
+            # (#295), before sending. Counted whether or not the call then
+            # fails: the firmware writes the attachment as the body streams
+            # in, so a request that errors afterwards has still left one.
+            self._reserve_temp_attachments(f"{method} {path}")
+        status, data = self._request_uncounted(
+            method, path, body=body, content_type=content_type, query=query
+        )
         # Reaching here means the device answered, which is the evidence a
         # construct-time probe failure could not supply. Only the fact is
         # recorded here, not the re-probe: firing a GET from inside every
@@ -941,8 +948,79 @@ class Ultimate64Client:
 
     @property
     def pending_temp_attachments(self) -> int:
-        """Attachments this client has created since the last successful pass."""
-        return self._pending_temp_attachments
+        """Attachments counted on this client's **device** since the last
+        successful sweep, by any client of that host in this process (#295).
+
+        Not this client's own share, and not other processes' uploads.
+        """
+        return self._temp_ledger.pending
+
+    # The device ledger (#295) backs what used to be instance state; these
+    # keep the old attribute names working for callers and tests.
+    @property
+    def _pending_temp_attachments(self) -> int:
+        return self._temp_ledger.pending
+
+    @property
+    def _temp_hygiene_blocked(self) -> str | None:
+        return self._temp_ledger.blocked
+
+    @_temp_hygiene_blocked.setter
+    def _temp_hygiene_blocked(self, value: str | None) -> None:
+        self._temp_ledger.blocked = value
+
+    @property
+    def _ftp_enable_attempted(self) -> bool:
+        return self._temp_ledger.ftp_enable_attempted
+
+    @_ftp_enable_attempted.setter
+    def _ftp_enable_attempted(self, value: bool) -> None:
+        self._temp_ledger.ftp_enable_attempted = value
+
+    def _own_pending_temp_attachments(self) -> int:
+        """This client's attachments not yet collected by any sweep."""
+        ledger = self._temp_ledger
+        with ledger.lock:
+            if self._own_temp_generation != ledger.generation:
+                return 0
+            return self._own_temp_attachments
+
+    def _count_temp_attachments(self, count: int) -> None:
+        ledger = self._temp_ledger
+        with ledger.lock:
+            if self._own_temp_generation != ledger.generation:
+                self._own_temp_generation = ledger.generation
+                self._own_temp_attachments = 0
+            self._own_temp_attachments += count
+            ledger.pending += count
+
+    def _uncount_temp_attachments(self, count: int, generation: int) -> None:
+        """Refund a reservation that was not sent, unless a sweep since
+        *generation* has already zeroed the count."""
+        ledger = self._temp_ledger
+        with ledger.lock:
+            if count <= 0 or ledger.generation != generation:
+                return
+            ledger.pending = max(0, ledger.pending - count)
+            if self._own_temp_generation == generation:
+                self._own_temp_attachments = max(
+                    0, self._own_temp_attachments - count
+                )
+
+    def _reserve_temp_attachments(self, operation: str, count: int = 1) -> int:
+        """Gate, then count, *count* attachments as one step on the device.
+
+        Holding the ledger lock across both is what keeps two clients (or two
+        threads) from each passing the budget check and then both counting.
+
+        :returns: the ledger generation the reservation was counted in.
+        :raises Ultimate64TempHygieneError: see :meth:`_before_temp_attachment`.
+        """
+        ledger = self._temp_ledger
+        with ledger.lock:
+            self._before_temp_attachment(operation, count)
+            self._count_temp_attachments(count)
+            return ledger.generation
 
     def _before_temp_attachment(self, operation: str, count: int = 1) -> None:
         """Refuse or make room before *count* attachment-creating requests.
@@ -973,7 +1051,9 @@ class Ultimate64Client:
         if self._temp_hygiene_blocked is not None:
             self._refuse_or_warn(operation)
             return
-        pending = self._pending_temp_attachments
+        # The device's count, not this client's (#295). Callers hold the
+        # ledger lock: go through _reserve_temp_attachments.
+        pending = self._temp_ledger.pending
         if pending > 0 and pending + count > self._temp_gc_budget:
             self._run_temp_hygiene(
                 f"budget of {self._temp_gc_budget} attachment(s) spent before {operation}"
@@ -1032,8 +1112,8 @@ class Ultimate64Client:
             _log.debug("U64 /Temp hygiene on %s: %s", self.host, reason)
             result = self.gc_temp_folder()
             if getattr(result, "ok", False):
-                self._pending_temp_attachments = 0
-                self._temp_hygiene_blocked = None
+                # Only a successful sweep zeroes the device's count (#295).
+                self._temp_ledger.collected()
                 return True
 
             first_error = getattr(result, "error", None)
@@ -1064,8 +1144,7 @@ class Ultimate64Client:
                 else:
                     result = self.gc_temp_folder()
                     if getattr(result, "ok", False):
-                        self._pending_temp_attachments = 0
-                        self._temp_hygiene_blocked = None
+                        self._temp_ledger.collected()
                         return True
 
             self._temp_hygiene_blocked = str(
@@ -1075,14 +1154,16 @@ class Ultimate64Client:
         finally:
             self._in_temp_hygiene = False
 
-    def _drain_on_lock_release(self, reason: str = "device lock release") -> None:
-        """Release-callback entry point (``device_lock.register_release_callback``).
+    def _drain_on_lock_release(self, reason: str = "device lock release") -> bool:
+        """Lock-release drain for this client; ``True`` if it attempted a sweep.
 
-        ``DeviceLock.release`` fires callbacks only on the outermost release
-        and while the flock is still held, so this drain runs under the lock
-        by construction.
+        Called by the device's ``TempLedger.drain_on_lock_release``, which is
+        what is registered with ``device_lock.register_release_callback``
+        (one registration per host, #295). ``DeviceLock.release`` fires
+        callbacks only on the outermost release and while the flock is still
+        held, so this drain runs under the lock by construction.
         """
-        self._drain_temp_attachments(reason=reason, under_lock=True)
+        return self._drain_temp_attachments(reason=reason, under_lock=True)
 
     def _holds_device_lock(self) -> bool:
         """Whether this process holds this device's ``DeviceLock`` (no I/O).
@@ -1106,8 +1187,13 @@ class Ultimate64Client:
 
     def _drain_temp_attachments(
         self, reason: str = "drain", *, under_lock: bool = False
-    ) -> None:
+    ) -> bool:
         """Sweep the device's ``/Temp`` on the way out. Never raises.
+
+        Returns ``True`` if a hygiene pass or inherited sweep was attempted,
+        so the device ledger's release drain can stop after one (#295).
+        "Leaked" below is this client's own share of the device's count, not
+        yet collected by any client's sweep.
 
         Two cases, and they are deliberately not treated alike:
 
@@ -1133,33 +1219,39 @@ class Ultimate64Client:
         stays disarmed), not the counter.
         """
         try:
-            leaked = self._pending_temp_attachments > 0
-            if leaked:
-                # Something leaked, so a device is demonstrably there:
-                # settle the grade before deciding not to clean up after
-                # it. Deliberately not done on a zero count -- that would
-                # put a /v1/info GET into close() for every client that
-                # ever completed a request, fake hosts included.
-                self._maybe_reprobe_capabilities()
-            if not self.temp_hygiene_armed:
-                return
-            if leaked:
-                self._run_temp_hygiene(reason)
-                return
-            if not (under_lock or self._holds_device_lock()):
-                _log.debug(
-                    "U64 /Temp drain on %s (%s): this client leaked nothing and "
-                    "does not hold the device lock; not sweeping other lanes' "
-                    "attachments",
-                    self.host, reason,
-                )
-                return
-            self._sweep_inherited_temp(reason)
+            with self._temp_ledger.lock:
+                # This client's own uncollected share: whether it may take
+                # the leaking-lane path (the FTP-enable attempt, the block on
+                # failure) is still decided by what *it* did (#263, #264).
+                leaked = self._own_pending_temp_attachments() > 0
+                if leaked:
+                    # Something leaked, so a device is demonstrably there:
+                    # settle the grade before deciding not to clean up after
+                    # it. Deliberately not done on a zero count -- that would
+                    # put a /v1/info GET into close() for every client that
+                    # ever completed a request, fake hosts included.
+                    self._maybe_reprobe_capabilities()
+                if not self.temp_hygiene_armed:
+                    return False
+                if leaked:
+                    self._run_temp_hygiene(reason)
+                    return True
+                if not (under_lock or self._holds_device_lock()):
+                    _log.debug(
+                        "U64 /Temp drain on %s (%s): this client leaked nothing and "
+                        "does not hold the device lock; not sweeping other lanes' "
+                        "attachments",
+                        self.host, reason,
+                    )
+                    return False
+                self._sweep_inherited_temp(reason)
+                return True
         except Exception as exc:  # noqa: BLE001 - a drain must never fail a run
             _log.debug(
                 "U64 /Temp drain on %s raised (%s: %s); ignored",
                 self.host, type(exc).__name__, exc,
             )
+            return False
 
     def _sweep_inherited_temp(self, reason: str) -> None:
         """Best-effort sweep for attachments this client did not create.
@@ -1174,6 +1266,10 @@ class Ultimate64Client:
         finally:
             self._in_temp_hygiene = False
         if getattr(result, "ok", False):
+            # The sweep is device-wide, so it collected every client's
+            # attachments, and FTP answered: clear the device's count and
+            # any block another client's failed pass left (#295).
+            self._temp_ledger.collected()
             return
         _log.warning(
             "U64 /Temp inherited sweep on %s failed (%s). This client leaked "
@@ -1295,16 +1391,19 @@ class Ultimate64Client:
         from . import ultimate64_probe as _probe
 
         cost = self.LIVENESS_PROBE_TEMP_ATTACHMENTS
-        self._before_temp_attachment(
+        # The whole cost is gated and counted up front against the device's
+        # count (#295); whatever the probe does not send is refunded below.
+        generation = self._reserve_temp_attachments(
             f"liveness_probe ({cost} x POST /v1/machine:writemem)", count=cost
         )
         if self.temp_hygiene_armed:
             _log.info(
                 "liveness_probe on %s spends %d /Temp attachments on this "
                 "firmware (%d of %d already pending)",
-                self.host, cost, self._pending_temp_attachments,
+                self.host, cost, self._temp_ledger.pending - cost,
                 self._temp_gc_budget,
             )
+        sent = [0]
 
         def _accounted(method, host, port, path, password, timeout, **kwargs):
             # The probe keeps its own raw sender and failure classification;
@@ -1319,17 +1418,23 @@ class Ultimate64Client:
                 )
             finally:
                 if leaks:
-                    self._pending_temp_attachments += 1
+                    sent[0] += 1
             self._saw_successful_request = True
             return result
 
-        return _probe.liveness_probe(
-            self.host,
-            port=self.port,
-            password=self.password,
-            http_timeout=http_timeout,
-            request=_accounted,
-        )
+        try:
+            return _probe.liveness_probe(
+                self.host,
+                port=self.port,
+                password=self.password,
+                http_timeout=http_timeout,
+                request=_accounted,
+            )
+        finally:
+            if sent[0] > cost:
+                self._count_temp_attachments(sent[0] - cost)
+            else:
+                self._uncount_temp_attachments(cost - sent[0], generation)
 
     def assert_healthy(self, http_timeout: float = 2.0) -> "LivenessResult":
         """Run :meth:`liveness_probe` and raise on failure.
