@@ -305,6 +305,182 @@ class TestCoveredSet:
 
 
 # --------------------------------------------------------------------------- #
+# Per-generation category sets (#287)                                          #
+# --------------------------------------------------------------------------- #
+
+#: The device reads, literally, duplicated from the module on purpose: a
+#: change to a recorded set has to change this file too.
+#: U64E fw 3.15, 2026-09-12, read-only (commit 78aa38e).
+_U64E_CATEGORIES_2026_09_12 = frozenset({
+    "Audio Mixer", "SID Sockets Configuration", "UltiSID Configuration",
+    "SID Addressing", "U64 Specific Settings", "C64 and Cartridge Settings",
+    "Clock Settings", "SoftIEC Drive Settings", "Printer Settings",
+    "Network Settings", "Ethernet Settings", "WiFi settings", "Tape Settings",
+    "LED Strip Settings", "Drive A Settings", "Drive B Settings",
+    "Data Streams", "Modem Settings", "User Interface Settings",
+})
+#: C64U fw 1.1.0, 2026-09-15, one bodyless GET /v1/configs, n=1 (#287).
+_C64U_CATEGORIES_2026_09_15 = frozenset({
+    "Audio Mixer", "Speaker Mixer", "SID Sockets Configuration",
+    "UltiSID Configuration", "SID Addressing", "U64 Specific Settings",
+    "C64 and Cartridge Settings", "SoftIEC Drive Settings", "Printer Settings",
+    "Network Settings", "Ethernet Settings", "WiFi settings", "Tape Settings",
+    "LED Strip Settings", "Keyboard Lighting", "Drive A Settings",
+    "Drive B Settings", "Data Streams", "Modem Settings",
+    "User Interface Settings",
+})
+
+
+def _unclassified(listed, covered, never_touch, unclassified) -> set[str]:
+    """Names a device lists that no list decides about."""
+    return set(listed) - set(covered) - set(never_touch) - set(unclassified)
+
+
+class TestRecordedCategorySets:
+    """Every category a recorded device lists is classified (#287).
+
+    A store that appears in a device's ``GET /v1/configs`` without being
+    covered, never-touch or explicitly unclassified is exactly how the
+    C64U's ``Speaker Mixer`` and ``Keyboard Lighting`` went unexamined, and
+    how ``Clock Settings``'s RTC reason came to read as covering a device
+    that has no RTC store.
+    """
+
+    @staticmethod
+    def _mod():
+        from c64_test_harness.backends import ultimate64_baseline as mod
+        return mod
+
+    def test_the_recorded_sets_are_the_device_reads(self) -> None:
+        rec = self._mod().BASELINE_RECORDED_CATEGORY_SETS
+        assert set(rec) == {"ultimate", "cbm"}
+        assert rec["ultimate"].categories == _U64E_CATEGORIES_2026_09_12
+        assert rec["cbm"].categories == _C64U_CATEGORIES_2026_09_15
+        assert len(_U64E_CATEGORIES_2026_09_12) == 19
+        assert len(_C64U_CATEGORIES_2026_09_15) == 20
+
+    def test_each_record_names_its_source(self) -> None:
+        import re
+
+        rec = self._mod().BASELINE_RECORDED_CATEGORY_SETS
+        for gen, r in rec.items():
+            assert r.generation == gen
+            assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", r.date), r.date
+            assert r.device and r.firmware and r.source, gen
+        assert rec["ultimate"].date == "2026-09-12"
+        assert "3.15" in rec["ultimate"].firmware
+        assert "U64E" in rec["ultimate"].device
+        assert rec["cbm"].date == "2026-09-15"
+        assert "1.1.0" in rec["cbm"].firmware
+        assert "C64U" in rec["cbm"].device
+        assert "#287" in rec["cbm"].source
+
+    @pytest.mark.parametrize("gen", ["ultimate", "cbm"])
+    def test_every_listed_category_is_classified(self, gen: str) -> None:
+        mod = self._mod()
+        listed = mod.BASELINE_RECORDED_CATEGORY_SETS[gen].categories
+        # Vacuity guard: a subset check passes on an empty record.
+        assert len(listed) >= 19, f"{gen}: recorded set is implausibly small"
+        missing = _unclassified(listed, mod.BASELINE_CATEGORIES,
+                                mod.BASELINE_NEVER_TOUCH,
+                                mod.BASELINE_UNCLASSIFIED_CATEGORIES)
+        assert not missing, (
+            f"{gen} lists {sorted(missing)!r}, which is in no list: add it to "
+            f"BASELINE_UNCLASSIFIED_CATEGORIES with its evidence, and ask the "
+            f"owner to classify it"
+        )
+
+    def test_the_classification_check_can_fail(self) -> None:
+        """Positive control for the check above, on the real lists."""
+        mod = self._mod()
+        listed = mod.BASELINE_RECORDED_CATEGORY_SETS["cbm"].categories
+        lists = (mod.BASELINE_CATEGORIES, mod.BASELINE_NEVER_TOUCH)
+        assert _unclassified(listed | {"Bogus Store"}, *lists,
+                             mod.BASELINE_UNCLASSIFIED_CATEGORIES) == {"Bogus Store"}
+        without = {k: v for k, v in mod.BASELINE_UNCLASSIFIED_CATEGORIES.items()
+                   if k != "Speaker Mixer"}
+        assert _unclassified(listed, *lists, without) == {"Speaker Mixer"}
+
+    def test_the_three_lists_are_disjoint(self) -> None:
+        mod = self._mod()
+        covered = set(mod.BASELINE_CATEGORIES)
+        never = set(mod.BASELINE_NEVER_TOUCH)
+        unclassified = set(mod.BASELINE_UNCLASSIFIED_CATEGORIES)
+        assert not covered & never
+        assert not covered & unclassified
+        assert not never & unclassified
+
+    def test_no_classified_name_is_stale(self) -> None:
+        """Every listed name is one some recorded device reports (catches a
+        misspelling, which the classification check cannot)."""
+        mod = self._mod()
+        seen: set[str] = set()
+        for r in mod.BASELINE_RECORDED_CATEGORY_SETS.values():
+            seen |= r.categories
+        assert seen, "no recorded category sets"
+        named = (set(mod.BASELINE_CATEGORIES) | set(mod.BASELINE_NEVER_TOUCH)
+                 | set(mod.BASELINE_UNCLASSIFIED_CATEGORIES))
+        assert named - seen == set(), sorted(named - seen)
+
+    @pytest.mark.parametrize("cat,citation", [
+        ("Speaker Mixer", "u64_config.cc:433-449"),
+        ("Keyboard Lighting", "bling_board.cc"),
+    ])
+    def test_c64u_only_stores_are_unclassified_with_evidence(
+        self, cat: str, citation: str
+    ) -> None:
+        mod = self._mod()
+        assert cat in _C64U_CATEGORIES_2026_09_15
+        assert cat not in _U64E_CATEGORIES_2026_09_12
+        assert cat not in mod.BASELINE_CATEGORIES
+        assert cat not in mod.BASELINE_NEVER_TOUCH
+        reason = mod.BASELINE_UNCLASSIFIED_CATEGORIES[cat]
+        for token in ("C64U-ONLY", "1.1.0", citation, "2026-09-15", "#310",
+                      "not a measurement"):
+            assert token in reason, f"{cat}: evidence must carry {token!r}"
+
+    def test_never_touch_presence_agrees_with_the_recorded_sets(self) -> None:
+        mod = self._mod()
+        rec = mod.BASELINE_RECORDED_CATEGORY_SETS
+        by_gen = mod.BASELINE_NEVER_TOUCH_BY_GENERATION
+        assert set(by_gen) == set(mod.BASELINE_NEVER_TOUCH)
+        for store, per in by_gen.items():
+            assert set(per) == set(rec), store
+            for gen, note in per.items():
+                expected = "present" if store in rec[gen].categories else "absent"
+                assert note.startswith(expected), (
+                    f"{store} on {gen}: note says {note.split(';')[0]!r}, "
+                    f"the recorded device read says {expected}"
+                )
+        # Vacuity guard: the 'absent' branch must actually be exercised.
+        assert by_gen["Clock Settings"]["cbm"].startswith("absent")
+
+    def test_the_clock_reason_is_scoped_to_the_ultimate_line(self) -> None:
+        mod = self._mod()
+        assert "Clock Settings" in _U64E_CATEGORIES_2026_09_12
+        assert "Clock Settings" not in _C64U_CATEGORIES_2026_09_15
+        # Kept: absent on the C64U is harmless, removing it unprotects the U64E.
+        assert "Clock Settings" in mod.BASELINE_NEVER_TOUCH
+        reason = mod.BASELINE_NEVER_TOUCH["Clock Settings"]
+        for token in ("ULTIMATE LINE ONLY", "DOES NOT EXIST", "rtc_dummy.cc",
+                      "target/u64ii/riscv/ultimate/Makefile:70", "2026-09-15",
+                      "rtc.cc:350-409"):
+            assert token in reason, f"Clock Settings reason must carry {token!r}"
+
+    def test_patterns_never_touch_bullet_scopes_the_clock_reason(self) -> None:
+        patterns = (Path(__file__).resolve().parents[1]
+                    / ".claude" / "skills" / "c64-test" / "PATTERNS.md")
+        bullets = [line for line in patterns.read_text().splitlines()
+                   if line.startswith("- **Two hardware stores are never touched")]
+        # Vacuity guard: a renamed bullet must fail here, not pass silently.
+        assert len(bullets) == 1, "PATTERNS.md never-touch bullet not found"
+        for token in ("**Ultimate-line only**", "rtc_dummy.cc",
+                      "measured 2026-09-15", "BASELINE_RECORDED_CATEGORY_SETS",
+                      "BASELINE_UNCLASSIFIED_CATEGORIES", "#310"):
+            assert token in bullets[0], f"PATTERNS never-touch bullet lacks {token!r}"
+
+
+# --------------------------------------------------------------------------- #
 # Entry after a simulated kill                                                #
 # --------------------------------------------------------------------------- #
 
