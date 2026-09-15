@@ -22,7 +22,14 @@ and its qualifier in another does not count):
   value) and cites ``docs/device_locking.md``.
 
 * **no invented ceiling** -- no paragraph calls 120 s a ceiling, cap,
-  maximum, max, "at most" or limit (#331).  Nothing
+  maximum, max, "at most" or limit, inflections included ("capped",
+  "limited", "limiting", "limits") (#331).
+
+  Declared limits of that ban, asserted in ``TestThePinCanFail`` so each
+  stays known: it does **not** catch "up to", "no more than", "cannot
+  exceed", "upper bound", "maximal", a "120 sec" unit, or a "two-minute
+  ceiling"; and it **does** flag "A 120 s run hits the heartbeat limit
+  sometimes." although that sentence claims no limit on the lock.  Nothing
   in ``device_lock.py`` or ``unified_manager.py`` defines one, and it
   contradicted the budget text (review round 1).
 
@@ -110,7 +117,7 @@ CEILING_WORDS = ("ceiling", "cap", "maximum", "max", "at most", "limit")
 #: no unit (``timeout=120.0``) is a code example, not a claim.
 _ONE_TWENTY = r"(?<![\d.])120(?:\.0+)?(?:\s?s\b|\s?seconds?\b|-seconds?\b)"
 _WORD = r"\b(?:" + "|".join(
-    re.escape(w).replace(r"\ ", r"\s+") + r"(?:s|ped|ping)?" for w in CEILING_WORDS
+    re.escape(w).replace(r"\ ", r"\s+") + r"(?:s|ed|ing|ped|ping)?" for w in CEILING_WORDS
 ) + r")\b"
 
 #: The gap between the word and the figure may not cross a sentence or
@@ -276,6 +283,11 @@ class TestThePinCanFail:
         "cap": "There is a 120-second cap on lock_timeout.",
         "max": "Use a max of 120 s for lock_timeout.",
         "limit": "lock_timeout has a 120 seconds limit.",
+        # Inflections (#363 review round 1).
+        "limit (limited)": "lock_timeout is limited to 120 s for ad-hoc work.",
+        "limit (limiting)": "a policy limiting waits to 120 s.",
+        "limit (limits)": "There are no limits beyond 120 s here.",
+        "cap (capped)": "lock_timeout is capped at 120 s.",
     }
 
     def test_every_ceiling_word_has_a_control(self) -> None:
@@ -303,6 +315,11 @@ class TestThePinCanFail:
             "lock.acquire_or_raise(timeout=120.0)  # at most one retry",
             "ProcessPoolExecutor(max_workers=4); acquire_or_raise(timeout=120)",
             "The heartbeat limit is 15 s; a 120 s run is ordinary.",
+            # One exclusion per sentence, so each survives only on its own
+            # (#363 review round 1): another number without a `;` ...
+            "The heartbeat limit is 15 s and a 120 s run is ordinary.",
+            # ... and a `;` without another number.
+            "The limit is generous; a 120 s run is ordinary.",
             # Word boundaries, one control per side: "cap" at the end of
             # "handicap" needs the leading boundary, "cap" at the start of
             # "capital" needs the trailing one.
@@ -312,6 +329,32 @@ class TestThePinCanFail:
     )
     def test_code_examples_and_unrelated_numbers_are_not_claims(self, text: str) -> None:
         assert doc_problems(self.PASSING + "\n\n" + text, defaults=True) == []
+
+    #: Declared limits of the ceiling ban (see the module docstring).
+    KNOWN_MISSES = (
+        "Keep lock_timeout up to 120 s.",
+        "Use no more than 120 s for lock_timeout.",
+        "lock_timeout cannot exceed 120 s.",
+        "There is an upper bound of 120 s on lock_timeout.",
+        "A maximal lock_timeout of 120 s is fine.",
+        "A lock_timeout ceiling of 120 sec.",
+        "lock_timeout has a two-minute ceiling.",
+    )
+    KNOWN_FALSE_POSITIVE = "A 120 s run hits the heartbeat limit sometimes."
+
+    @pytest.mark.parametrize("text", KNOWN_MISSES)
+    def test_declared_miss_stays_known(self, text: str) -> None:
+        assert doc_problems(self.PASSING + "\n\n" + text, defaults=True) == [], (
+            "the ban now catches a declared miss; update the module docstring"
+        )
+
+    def test_declared_false_positive_stays_known(self) -> None:
+        problems = doc_problems(
+            self.PASSING + "\n\n" + self.KNOWN_FALSE_POSITIVE, defaults=True
+        )
+        assert any("ceiling" in p for p in problems), (
+            "the declared false positive no longer flags; update the module docstring"
+        )
 
     def test_the_bare_constant_name_is_not_the_grace(self) -> None:
         named = self.PASSING.replace(f"{GRACE:.1f} s", "_SELF_HELD_WAIT_GRACE")
