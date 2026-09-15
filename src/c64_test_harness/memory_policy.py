@@ -388,18 +388,21 @@ HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
     ScratchRegion(
         0xC403, 0xC404,
         owner="uci_network.uci_socket_write (also uci_socket_read / "
-              "uci_socket_close with turbo_safe=True)",
+              "uci_socket_close with turbo_safe=True, and the "
+              "build_socket_write turbo default)",
         purpose="socket-id slot for the lifted-cap write routine and the "
-                "turbo read/close routines",
+                "turbo read/close/write routines",
         configurable="hardcoded",
     ),
     ScratchRegion(
         0xC500, 0xC87E,
         owner="uci_network.uci_socket_write (also uci_tcp_connect / "
-              "uci_udp_connect with turbo_safe=True)",
+              "uci_udp_connect with turbo_safe=True, and the "
+              "build_socket_write turbo defaults)",
         purpose="data buffer (up to 892 bytes) followed by the 2-byte LE "
                 "length; turbo connect routines read the NUL-terminated "
-                "hostname here",
+                "hostname here; build_socket_write's turbo defaults are "
+                "data $C500 and length $C87C-$C87D",
         configurable="hardcoded",
     ),
     ScratchRegion(

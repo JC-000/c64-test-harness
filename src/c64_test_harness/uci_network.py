@@ -288,6 +288,14 @@ _TURBO_SOCKET_ID_ADDR = _WRITE_SOCKET_ID_ADDR  # $C403 — 1 byte
 # the discrepancy is firmware-side, not harness-side.
 SOCKET_WRITE_MAX_BYTES = 892
 
+# Default input slots for build_socket_write(turbo_safe=True) (issue #346).
+# The turbo routine is 428 B at $C000 and covers the legacy $C100/$C101/$C1FF
+# defaults. Data goes in the uci_socket_write buffer; the length sits right
+# after a maximum payload -- the slot uci_socket_write itself uses for 892
+# bytes -- so it clears every payload the builder accepts and every routine.
+_TURBO_WRITE_DATA_ADDR = _WRITE_DATA_BUF_ADDR                          # $C500
+_TURBO_WRITE_LEN_ADDR  = _WRITE_DATA_BUF_ADDR + SOCKET_WRITE_MAX_BYTES  # $C87C
+
 #: Bytes of ``[len_lo][len_hi]`` the firmware prefixes to a socket-read reply.
 _SOCKET_READ_HEADER_LEN = 2
 
@@ -1363,9 +1371,9 @@ def _emit_connect_routine(
 
 
 def build_socket_write(
-    socket_id_addr: int = _SOCKET_ID_ADDR,
-    data_addr: int = _DATA_BUF_ADDR,
-    data_len_addr: int = _DATA_LEN_ADDR,
+    socket_id_addr: int | None = None,
+    data_addr: int | None = None,
+    data_len_addr: int | None = None,
     status_addr: int = _STATUS_ADDR,
     stat_len_addr: int = _STAT_LEN_ADDR,
     error_addr: int = _ERROR_ADDR,
@@ -1400,8 +1408,28 @@ def build_socket_write(
     Use :func:`uci_socket_write` for the safe layout, or pass an
     explicit ``data_len_addr`` clear of the response/status block.
 
+    The three input addresses default to ``None``, which resolves per
+    *turbo_safe* (issue #346): a plain routine keeps ``$C100`` (socket id),
+    ``$C101`` (data) and ``$C1FF`` (length), so its bytes are unchanged; a
+    turbo-safe routine, whose 428 bytes cover those, uses ``$C403``
+    (:data:`_TURBO_SOCKET_ID_ADDR`), ``$C500``
+    (:data:`_TURBO_WRITE_DATA_ADDR`) and ``$C87C``
+    (:data:`_TURBO_WRITE_LEN_ADDR`, just past a maximum payload).  An
+    explicit address inside the emitted routine -- the socket id, the data
+    start, or either length byte -- raises ``ValueError``.  The guard checks
+    the data *start* only, not the data span: the builder cannot know the
+    payload length, so an explicit ``data_addr`` below ``code_addr`` (e.g.
+    ``$BF80``) with a runtime payload longer than the gap still runs into
+    the routine.
+
     :param turbo_safe: see :func:`build_uci_command`.
     """
+    socket_id_addr = _input_addr(socket_id_addr, turbo_safe, _SOCKET_ID_ADDR,
+                                 _TURBO_SOCKET_ID_ADDR)
+    data_addr = _input_addr(data_addr, turbo_safe, _DATA_BUF_ADDR,
+                            _TURBO_WRITE_DATA_ADDR)
+    data_len_addr = _input_addr(data_len_addr, turbo_safe, _DATA_LEN_ADDR,
+                                _TURBO_WRITE_LEN_ADDR)
     code: list[int] = []
 
     def pc() -> int:
@@ -1621,6 +1649,11 @@ def build_socket_write(
     code.extend(_build_sentinel(sentinel_addr))
     code.append(_RTS)
 
+    _refuse_input_in_routine("socket_id_addr", socket_id_addr, code_addr, code)
+    _refuse_input_in_routine("data_addr", data_addr, code_addr, code)
+    _refuse_input_in_routine("data_len_addr", data_len_addr, code_addr, code)
+    _refuse_input_in_routine("data_len_addr (high byte)", data_len_addr + 1,
+                             code_addr, code)
     return bytes(code)
 
 
