@@ -149,6 +149,36 @@ def test_patterns_rrnet_section_requires_auto_before_uci() -> None:
     assert missing_tokens(units, PATTERNS_TOKENS) == []
 
 
+def _real_units() -> dict[str, tuple[list[str], tuple]]:
+    ref = FILES["REFERENCE.md"].read_text(encoding="utf-8")
+    ref = ref[ref.index("## Module: uci_network"):]
+    return {
+        "SKILL.md": (_units_naming(FILES["SKILL.md"].read_text(encoding="utf-8"), ERROR),
+                     SKILL_TOKENS),
+        "REFERENCE.md": (_units_naming(ref, ERROR), REFERENCE_TOKENS),
+        "PATTERNS.md": (_units_naming(_section(FILES["PATTERNS.md"].read_text(encoding="utf-8"),
+                                               PATTERNS_RRNET_HEADING), ERROR), PATTERNS_TOKENS),
+    }
+
+
+#: Every phrase need, by file.  Stripping it from the real unit must make the
+#: pin report it: a need list that silently drops a phrase fails here (P6).
+_PHRASE_NEEDS = [("SKILL.md", REMEDY), ("SKILL.md", SHARING), ("SKILL.md", WEDGE_LIMIT),
+                 ("REFERENCE.md", ATTRIBUTES), ("PATTERNS.md", REMEDY)]
+
+
+@pytest.mark.parametrize("name,need", _PHRASE_NEEDS, ids=lambda v: getattr(v, "pattern", v)[:24])
+def test_stripping_a_phrase_from_the_real_unit_is_reported(name: str, need: re.Pattern[str]) -> None:
+    units, tokens = _real_units()[name]
+    assert units, name
+    stripped = [need.sub("", u) for u in units]
+    # The mangle must have done something, or this proves nothing.
+    assert stripped != units, f"{need.pattern!r} matched nothing in {name}"
+    assert need.pattern in missing_tokens(stripped, tokens), (
+        f"{name}: removing {need.pattern!r} is not reported; is it still in the need list?"
+    )
+
+
 @pytest.mark.parametrize("name", list(FILES))
 def test_no_file_says_the_identifier_rules_out_a_wedge(name: str) -> None:
     assert overclaims(FILES[name].read_text(encoding="utf-8")) == []
