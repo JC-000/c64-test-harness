@@ -948,6 +948,46 @@ def _tripwire_invocation_problems(source: str, module_source: str = "") -> list[
     return problems
 
 
+def _tripwire_problems_for(fn) -> list[str]:
+    """:func:`_tripwire_invocation_problems` for *fn*, with its module's source.
+
+    The helper reads the defining module itself (review round 2 of #361), so
+    there is no call site that can forget to pass it: a module-level
+    ``import subprocess as sp`` plus ``sp.run`` inside *fn* is always seen.
+    """
+    import inspect
+
+    module_source = Path(inspect.getsourcefile(fn)).read_text()
+    return _tripwire_invocation_problems(inspect.getsource(fn), module_source)
+
+
+def test_the_tripwire_helper_reads_the_defining_module(tmp_path: Path) -> None:
+    """Positive control for :func:`_tripwire_problems_for` on a real module."""
+    import inspect
+
+    probe = tmp_path / "tripwire_module_probe.py"
+    probe.write_text(
+        "import subprocess as sp\n"
+        "\n"
+        "\n"
+        "def test_x(script_name):\n"
+        "    proc = _run_in_sandbox(script_name)\n"
+        "    sp.run([script_name])\n"
+    )
+    spec = importlib.util.spec_from_file_location("tripwire_module_probe", probe)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    # The function alone looks clean, so only the module read can flag it.
+    assert _tripwire_invocation_problems(inspect.getsource(module.test_x)) == [], (
+        "control broken: the function source alone is already flagged"
+    )
+    problems = _tripwire_problems_for(module.test_x)
+    assert any("sp.run" in p for p in problems), (
+        f"the helper did not see the module-level import: {problems}"
+    )
+
+
 def test_the_tripwire_invocation_check_can_fail() -> None:
     """Positive controls for :func:`_tripwire_invocation_problems`."""
     clean = (
@@ -1049,10 +1089,7 @@ def test_the_tripwire_cannot_run_before_its_controls() -> None:
     # invocation, not build its own. Review round 1 showed the gap: a
     # tripwire running ``[sys.executable, script]`` with no preamble left
     # every test here green while the scripts ran with the network intact.
-    tripwire_source = inspect.getsource(test_script_refuses_cleanly_with_no_host)
-    problems = _tripwire_invocation_problems(
-        tripwire_source, Path(__file__).read_text()
-    )
+    problems = _tripwire_problems_for(test_script_refuses_cleanly_with_no_host)
     assert problems == [], (
         "the tripwire no longer runs scripts only through _run_in_sandbox, the "
         f"invocation the controls verified: {problems}"
@@ -2466,7 +2503,7 @@ def _rebinding_hides(stmt: ast.stmt, position, load: ast.Name, parents) -> bool:
     if _is_within(load, stmt, parents):
         return (load.lineno, load.col_offset) >= position
     owner = parents.get(stmt)
-    for field in ("body", "orelse", "finalbody", "handlers"):
+    for field in ("body", "orelse", "finalbody"):
         siblings = getattr(owner, field, None)
         if not isinstance(siblings, list):
             continue
@@ -2750,6 +2787,41 @@ def test_the_lock_scan_flags_planted_regressions() -> None:
             + "    with hold_device_lock(h):\n"
             + "        c = Ultimate64Client(host=h)\n"
             + "    if x:\n"
+            + "        c = None\n"
+            + "        print(c)\n"
+        ),
+        # Review round 2 of #361: the rebinding and the read share a statement
+        # list other than ``body``.
+        "rebinding and read in the same `else:` list": (
+            helper + client
+            + "def main(h, x):\n"
+            + "    with hold_device_lock(h):\n"
+            + "        c = Ultimate64Client(host=h)\n"
+            + "    if x:\n"
+            + "        pass\n"
+            + "    else:\n"
+            + "        c = None\n"
+            + "        print(c)\n"
+        ),
+        "rebinding and read in the same `finally:` list": (
+            helper + client
+            + "def main(h):\n"
+            + "    with hold_device_lock(h):\n"
+            + "        c = Ultimate64Client(host=h)\n"
+            + "    try:\n"
+            + "        pass\n"
+            + "    finally:\n"
+            + "        c = None\n"
+            + "        print(c)\n"
+        ),
+        "rebinding and read in the same `except:` handler": (
+            helper + client
+            + "def main(h):\n"
+            + "    with hold_device_lock(h):\n"
+            + "        c = Ultimate64Client(host=h)\n"
+            + "    try:\n"
+            + "        pass\n"
+            + "    except Exception:\n"
             + "        c = None\n"
             + "        print(c)\n"
         ),
