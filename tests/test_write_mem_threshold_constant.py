@@ -291,10 +291,33 @@ def test_downward_instance_poke_is_refused_when_not_post_safe(caplog, firmware):
         mock, _ = _device(firmware)
         with patch("urllib.request.urlopen", mock):
             c = Ultimate64Client("h", warn_unlocked=False)
-    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+    # Review round 2: a *post-safe* device sits behind the wire here, so a
+    # decision that probed (``self.capabilities``) would learn "3.15" and
+    # honour the poke.  The decision must read only the cache: no request,
+    # and the unprobed client stays refused.
+    mock, wire = _device("3.15")
+    with caplog.at_level(logging.WARNING, logger=_LOGGER), \
+            patch("urllib.request.urlopen", mock):
         c.WRITE_MEM_QUERY_THRESHOLD = 16
+    assert wire == [], [r.get_full_url() for r in wire]
     assert c.write_mem_query_threshold == 128
     assert _refused(caplog)
+    if firmware == "unprobed":
+        assert c._capabilities is None
+
+
+@pytest.mark.parametrize("firmware, poked, effective", [
+    ("1.1.0", 16, 128), ("3.15", 500, 128), ("3.15", 100, 100),
+])
+def test_instance_poke_reads_back_the_effective_value(firmware, poked, effective):
+    """Review round 2 nit: after a refused or clamped instance poke the
+    uppercase name must not read back the rejected request."""
+    mock, _ = _device(firmware)
+    with patch("urllib.request.urlopen", mock):
+        c = Ultimate64Client("h", warn_unlocked=False)
+    c.WRITE_MEM_QUERY_THRESHOLD = poked
+    assert c.write_mem_query_threshold == effective
+    assert c.WRITE_MEM_QUERY_THRESHOLD == effective
 
 
 def test_instance_poke_above_the_cap_is_clamped():

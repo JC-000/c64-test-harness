@@ -1762,8 +1762,18 @@ class Ultimate64Client:
         # An instance poke of the uppercase name is honoured (#249): it
         # moves the live threshold, which is the only thing it could mean.
         if name == "WRITE_MEM_QUERY_THRESHOLD":
+            # A subclass that assigns this before ``super().__init__()`` has
+            # no grade cached yet, so it gets a "refused, keeping 128"
+            # WARNING here -- and ``__init__`` then sets the threshold from
+            # the grade anyway (48 on a post-safe device).  Safe, merely
+            # noisy; poke on the class body or after construction instead.
             threshold = self._effective_poked_threshold(value, "instance ")
             object.__setattr__(self, "write_mem_query_threshold", threshold)
+            # Store the effective value, not the request, so the uppercase
+            # name never reads back a refused or clamped poke (review
+            # round 2).  ``write_mem_query_threshold`` stays authoritative.
+            object.__setattr__(self, name, threshold)
+            return
         object.__setattr__(self, name, value)
 
     def _effective_poked_threshold(self, value: Any, source: str) -> int:
