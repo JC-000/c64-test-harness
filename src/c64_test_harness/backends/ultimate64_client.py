@@ -335,6 +335,10 @@ def _wire_hex16(value: int) -> str:
         claims to be the single formatting choke point should not emit
         one silently.
     """
+    # bool is an int subclass: True would format as "0001", the 6510
+    # processor port (#340).  Refused with the bad-address error.
+    if isinstance(value, bool):
+        raise ValueError(f"address must be an int, not bool: {value!r}")
     if not isinstance(value, int) or value < 0 or value > 0xFFFF:
         raise ValueError(f"address out of range 0..0xFFFF: {value!r}")
     return "%04X" % value
@@ -1011,6 +1015,16 @@ class Ultimate64Client:
         its own — and is runtime-only: it lives in firmware RAM until
         ``save_config_to_flash``, and the power-on that reverts it also
         empties ``/Temp`` (a RAM disk).
+
+        **Two contracts, not one** (owner decision on #263): that enable is
+        the one sanctioned write into a ``BASELINE_NEVER_TOUCH`` store.
+        ``BASELINE_NEVER_TOUCH`` is ``apply_factory_baseline``'s contract --
+        the entry-baseline reset never resets or asserts those stores -- and
+        says nothing about this pass, which may write exactly one item,
+        ``Network Settings > FTP File Service``, once per client, only for a
+        client that leaked (both callers require pending attachments) and
+        only after its sweep failed.  A client that leaked nothing never
+        reaches it: :meth:`_sweep_inherited_temp` writes no config.
         """
         self._in_temp_hygiene = True
         try:
@@ -1098,8 +1112,9 @@ class Ultimate64Client:
 
         * **This client leaked** (``pending_temp_attachments > 0``): the
           ordinary hygiene pass, unchanged -- including its one FTP-enable
-          attempt and the block on failure. Whether a lane that leaked may
-          write that config is issue #263 and is not decided here.
+          attempt and the block on failure. A lane that leaked may make that
+          write (owner decision on #263); :meth:`_run_temp_hygiene` says why
+          it is not a ``BASELINE_NEVER_TOUCH`` violation.
         * **This client leaked nothing** (issue #264): the wedge is a
           property of the device and :meth:`gc_temp_folder` sweeps ``/Temp``
           device-wide, so a lane that inherited a crashed neighbour's
@@ -1765,6 +1780,10 @@ class Ultimate64Client:
             this check, downstream chunked readers would silently
             produce short / misaligned results.
         """
+        if isinstance(address, bool):
+            # bool subclasses int; True would address $0001, the 6510
+            # processor port (#340).
+            raise ValueError(f"address must be an int, not bool: {address!r}")
         if not isinstance(address, int) or address < 0 or address > 0xFFFF:
             raise ValueError(f"address out of range 0..0xFFFF: {address}")
         if not isinstance(length, int) or length <= 0:
@@ -1806,8 +1825,9 @@ class Ultimate64Client:
             # A subclass that assigns this before ``super().__init__()`` has
             # no grade cached yet, so it gets a "refused, keeping 128"
             # WARNING here -- and ``__init__`` then sets the threshold from
-            # the grade anyway (48 on a post-safe device).  Safe, merely
-            # noisy; poke on the class body or after construction instead.
+            # the grade anyway (48 on a post-safe device), which leaves the
+            # uppercase name's read-back stale at 128.  Safe, merely noisy;
+            # poke on the class body or after construction instead.
             threshold = self._effective_poked_threshold(value, "instance ")
             object.__setattr__(self, "write_mem_query_threshold", threshold)
             # Store the effective value, not the request, so the uppercase
@@ -1832,10 +1852,9 @@ class Ultimate64Client:
           rule 8).  The explicit ``write_mem_query_threshold=`` kwarg is the
           deliberate way to force it.
 
-        Reads the private ``_capabilities`` cache, never the probing
-        property; the public ``cached_capabilities`` accessor (#291) was not
-        on master when this landed.  An unprobed client counts as not
-        post-safe.
+        Reads the non-probing :attr:`cached_capabilities` (#291), never
+        the probing :attr:`capabilities` property, so a poke issues no
+        HTTP (#343).  An unprobed client counts as not post-safe.
         """
         requested = _validate_poked_threshold(value)
         host = getattr(self, "host", "?")
@@ -1848,7 +1867,14 @@ class Ultimate64Client:
                 host, source, requested, THRESHOLD_POST_RISKY, THRESHOLD_POST_RISKY,
             )
             return THRESHOLD_POST_RISKY
-        caps = getattr(self, "_capabilities", None)
+        # A subclass poking before super().__init__() has no cache attribute
+        # yet (the accessor would raise AttributeError); that reads as
+        # "never probed".
+        caps = (
+            self.cached_capabilities
+            if "_capabilities" in self.__dict__
+            else None
+        )
         if requested < THRESHOLD_POST_RISKY and getattr(
             caps, "writemem_post_safe", None
         ) is not True:
@@ -1892,6 +1918,10 @@ class Ultimate64Client:
         Both forms are functionally equivalent for supported sizes; the
         POST form has no upper bound verified at 2048 bytes.
         """
+        if isinstance(address, bool):
+            # bool subclasses int; True would address $0001, the 6510
+            # processor port (#340).
+            raise ValueError(f"address must be an int, not bool: {address!r}")
         if not isinstance(address, int) or address < 0 or address > 0xFFFF:
             raise ValueError(f"address out of range 0..0xFFFF: {address}")
         if not isinstance(data, (bytes, bytearray)):

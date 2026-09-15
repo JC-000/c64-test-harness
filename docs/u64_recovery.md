@@ -347,8 +347,10 @@ device to the next one clean. The two drain cases differ:
   release. If FTP is refused, it makes one attempt to enable
   `Network Settings > FTP File Service` — a config write that persists
   until a firmware power-on (`machine:reboot` does not clear it) — and if
-  the pass still fails, later uploads on that client refuse. Whether a
-  lane may make that write at all is open in issue #263.
+  the pass still fails, later uploads on that client refuse. A lane that
+  leaked may make that write (owner decision on #263): it is the one
+  sanctioned write into a `BASELINE_NEVER_TOUCH` store, whose contract
+  covers the entry-baseline reset (`apply_factory_baseline`) only.
 - **The client leaked nothing** (issue #264): the wedge is per device and
   `gc_temp_folder` sweeps `/Temp` device-wide, so the drain still sweeps
   inherited attachments — but only **under the device lock** (the

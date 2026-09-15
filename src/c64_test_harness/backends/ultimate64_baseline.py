@@ -214,12 +214,24 @@ BASELINE_CATEGORIES: tuple[str, ...] = (
     "Keyboard Lighting",
 )
 
-#: Stores the entry reset must never reset, read, PUT or otherwise touch,
-#: each with the reason it is here (firmware citations are to the
-#: 1541ultimate ``v3.15`` line, ``~/Documents/1541u-315preview``).  Passing
-#: one as a category or in ``exempt=`` raises ``ValueError`` carrying the
-#: reason, before any request.  Pinned literally by
-#: ``tests/test_entry_baseline.py``.
+#: Stores the entry-baseline reset never resets and never asserts, each with
+#: the reason it is here (firmware citations are to the 1541ultimate
+#: ``v3.15`` line, ``~/Documents/1541u-315preview``).  Passing one to
+#: :func:`apply_factory_baseline` as a category or in ``exempt=`` raises
+#: ``ValueError`` carrying the reason, before any request.  Pinned literally
+#: by ``tests/test_entry_baseline.py``.
+#:
+#: **This is apply_factory_baseline's contract, not a claim that the harness
+#: never writes these stores** (owner decision on #263, 2026-09-15).  The one
+#: sanctioned write is the ``/Temp`` hygiene pass,
+#: ``Ultimate64Client._run_temp_hygiene``: it may write exactly one item,
+#: ``Network Settings > FTP File Service = Enabled``, at most once per
+#: client, only for a client that has leaked attachments, and only after that
+#: client's sweep failed (FTP refused is the case it exists for -- the
+#: service is off by default on C64U 1.1.0).  A client that leaked nothing
+#: never writes config.  The write persists until a firmware power-on and is
+#: not restored, so a ``Network Settings`` state found on a device may be a
+#: hygiene pass rather than anyone's decision.
 BASELINE_NEVER_TOUCH: dict[str, str] = {
     "Ethernet Settings": (
         "a reset DROPS THE LEASE MID-REQUEST on a DHCP device.  "
