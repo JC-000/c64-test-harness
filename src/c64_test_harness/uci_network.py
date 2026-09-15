@@ -265,6 +265,14 @@ _INNER_LOOP_Y_SAVE = 0xC402   # Y register save slot across turbo fence
 _WRITE_SOCKET_ID_ADDR = 0xC403
 _WRITE_DATA_BUF_ADDR  = 0xC500
 
+# Where turbo-safe connect/read/close routines read their staged input.
+# Turbo routines are 348-491 bytes at $C000 and cover the legacy $C100 slot,
+# so the upload overwrote the hostname / socket id (issue #322). These reuse
+# the uci_socket_write slots above, which already clear every routine. Plain
+# routines keep $C100, so their bytes are unchanged.
+_TURBO_HOST_ADDR      = _WRITE_DATA_BUF_ADDR   # $C500 — hostname + NUL
+_TURBO_SOCKET_ID_ADDR = _WRITE_SOCKET_ID_ADDR  # $C403 — 1 byte
+
 # EMPIRICAL firmware-side ceiling for one WRITE_SOCKET command.
 #
 # The theoretical ceiling from Gideon's source is CMD_MAX_COMMAND_LEN
@@ -286,6 +294,38 @@ _SOCKET_READ_HEADER_LEN = 2
 #: Maximum payload a single :func:`uci_socket_read` can return. The drain
 #: loop indexes with Y, so header + payload must stay under 256.
 SOCKET_READ_MAX_BYTES = 255 - _SOCKET_READ_HEADER_LEN
+
+
+def _input_addr(addr: int | None, turbo_safe: bool, plain: int,
+                turbo: int) -> int:
+    """Resolve a staged-input address a builder reads (issue #322).
+
+    ``None`` picks the default for the routine's size class: plain routines
+    (116-174 B at ``$C000``) end below ``$C100`` and keep that legacy slot,
+    so their bytes are unchanged; turbo routines (348-491 B) cover ``$C100``,
+    so their input is staged past every routine's footprint, in the
+    ``uci_socket_write`` slots (``$C403`` socket id, ``$C500`` buffer).
+    """
+    if addr is not None:
+        return addr
+    return turbo if turbo_safe else plain
+
+
+def _refuse_input_in_routine(name: str, addr: int, code_addr: int,
+                             code: list[int] | bytes) -> None:
+    """Refuse an input address inside the routine that reads it (#322).
+
+    ``_execute_uci_routine`` writes the routine after the helper staged its
+    input, so an input byte in ``[code_addr, code_addr + len(code))`` is
+    overwritten by the routine's own code before it runs.
+    """
+    end = code_addr + len(code)
+    if code_addr <= addr < end:
+        raise ValueError(
+            f"{name}=${addr:04X} lies inside the {len(code)}-byte routine at "
+            f"${code_addr:04X}-${end - 1:04X}; the upload would overwrite the "
+            f"staged input (issue #322)"
+        )
 
 
 def _lo(addr: int) -> int:
@@ -1063,7 +1103,7 @@ def build_get_ip(
 
 
 def build_tcp_connect(
-    host_addr: int = _HOST_ADDR,
+    host_addr: int | None = None,
     port: int = 80,
     result_addr: int = _RESP_ADDR,
     status_addr: int = _STATUS_ADDR,
@@ -1080,6 +1120,11 @@ def build_tcp_connect(
     ASCII string.  *port* is encoded little-endian in the command params.
     The socket ID is stored in the first byte of *result_addr*.
 
+    *host_addr* defaults to ``$C100`` for a plain routine and ``$C500``
+    (:data:`_TURBO_HOST_ADDR`) for a turbo-safe one, whose 491 bytes cover
+    ``$C100``; an explicit address inside the routine raises ``ValueError``
+    (issue #322).
+
     :param turbo_safe: see :func:`build_uci_command`.
     """
     return _build_connect_routine(
@@ -1091,7 +1136,7 @@ def build_tcp_connect(
 
 
 def build_udp_connect(
-    host_addr: int = _HOST_ADDR,
+    host_addr: int | None = None,
     port: int = 53,
     result_addr: int = _RESP_ADDR,
     status_addr: int = _STATUS_ADDR,
@@ -1103,6 +1148,8 @@ def build_udp_connect(
     turbo_safe: bool = False,
 ) -> bytes:
     """Build routine: UDP_SOCKET_CONNECT (same structure as TCP).
+
+    *host_addr* resolves and is checked as in :func:`build_tcp_connect`.
 
     :param turbo_safe: see :func:`build_uci_command`.
     """
@@ -1116,7 +1163,7 @@ def build_udp_connect(
 
 def _build_connect_routine(
     cmd: int,
-    host_addr: int,
+    host_addr: int | None,
     port: int,
     result_addr: int,
     status_addr: int,
@@ -1128,6 +1175,29 @@ def _build_connect_routine(
     turbo_safe: bool = False,
 ) -> bytes:
     """Build TCP or UDP connect routine with hostname from C64 memory."""
+    host_addr = _input_addr(host_addr, turbo_safe, _HOST_ADDR,
+                            _TURBO_HOST_ADDR)
+    code = _emit_connect_routine(
+        cmd, host_addr, port, result_addr, status_addr, resp_len_addr,
+        stat_len_addr, error_addr, sentinel_addr, code_addr, turbo_safe,
+    )
+    _refuse_input_in_routine("host_addr", host_addr, code_addr, code)
+    return code
+
+
+def _emit_connect_routine(
+    cmd: int,
+    host_addr: int,
+    port: int,
+    result_addr: int,
+    status_addr: int,
+    resp_len_addr: int,
+    stat_len_addr: int,
+    error_addr: int,
+    sentinel_addr: int,
+    code_addr: int,
+    turbo_safe: bool,
+) -> bytes:
     port_lo = port & 0xFF
     port_hi = (port >> 8) & 0xFF
 
@@ -1555,7 +1625,7 @@ def build_socket_write(
 
 
 def build_socket_read(
-    socket_id_addr: int = _SOCKET_ID_ADDR,
+    socket_id_addr: int | None = None,
     result_addr: int = _RESP_ADDR,
     max_len: int = 255,
     actual_len_addr: int = _RESP_LEN_ADDR,
@@ -1571,8 +1641,15 @@ def build_socket_read(
     Params: socket_id, length (2 bytes LE).
     Response data goes to *result_addr*, actual length to *actual_len_addr*.
 
+    *socket_id_addr* defaults to ``$C100`` for a plain routine and ``$C403``
+    (:data:`_TURBO_SOCKET_ID_ADDR`) for a turbo-safe one, which covers
+    ``$C100``; an explicit address inside the routine raises ``ValueError``
+    (issue #322).
+
     :param turbo_safe: see :func:`build_uci_command`.
     """
+    socket_id_addr = _input_addr(socket_id_addr, turbo_safe, _SOCKET_ID_ADDR,
+                                 _TURBO_SOCKET_ID_ADDR)
     len_lo = max_len & 0xFF
     len_hi = (max_len >> 8) & 0xFF
 
@@ -1666,11 +1743,12 @@ def build_socket_read(
     code.extend(_build_sentinel(sentinel_addr))
     code.append(_RTS)
 
+    _refuse_input_in_routine("socket_id_addr", socket_id_addr, code_addr, code)
     return bytes(code)
 
 
 def build_socket_close(
-    socket_id_addr: int = _SOCKET_ID_ADDR,
+    socket_id_addr: int | None = None,
     status_addr: int = _STATUS_ADDR,
     stat_len_addr: int = _STAT_LEN_ADDR,
     error_addr: int = _ERROR_ADDR,
@@ -1680,10 +1758,13 @@ def build_socket_close(
 ) -> bytes:
     """Build routine: SOCKET_CLOSE.
 
-    Socket ID is read from *socket_id_addr* (1 byte).
+    Socket ID is read from *socket_id_addr* (1 byte), which resolves and is
+    checked as in :func:`build_socket_read`.
 
     :param turbo_safe: see :func:`build_uci_command`.
     """
+    socket_id_addr = _input_addr(socket_id_addr, turbo_safe, _SOCKET_ID_ADDR,
+                                 _TURBO_SOCKET_ID_ADDR)
     code: list[int] = []
 
     def pc() -> int:
@@ -1756,6 +1837,7 @@ def build_socket_close(
     code.extend(_build_sentinel(sentinel_addr))
     code.append(_RTS)
 
+    _refuse_input_in_routine("socket_id_addr", socket_id_addr, code_addr, code)
     return bytes(code)
 
 
@@ -2043,8 +2125,9 @@ def uci_tcp_connect(
     :param turbo_safe: see :func:`build_uci_command`.
     """
     host_bytes = host.encode("ascii") + b"\x00"
-    transport.write_memory(_DATA_ADDR, host_bytes)
-    code = build_tcp_connect(_DATA_ADDR, port, turbo_safe=turbo_safe)
+    host_addr = _input_addr(None, turbo_safe, _DATA_ADDR, _TURBO_HOST_ADDR)
+    transport.write_memory(host_addr, host_bytes)
+    code = build_tcp_connect(host_addr, port, turbo_safe=turbo_safe)
     _execute_uci_routine(transport, code, timeout=timeout)
     return transport.read_memory(_RESP_ADDR, 1)[0]
 
@@ -2064,8 +2147,9 @@ def uci_udp_connect(
     :param turbo_safe: see :func:`build_uci_command`.
     """
     host_bytes = host.encode("ascii") + b"\x00"
-    transport.write_memory(_DATA_ADDR, host_bytes)
-    code = build_udp_connect(_DATA_ADDR, port, turbo_safe=turbo_safe)
+    host_addr = _input_addr(None, turbo_safe, _DATA_ADDR, _TURBO_HOST_ADDR)
+    transport.write_memory(host_addr, host_bytes)
+    code = build_udp_connect(host_addr, port, turbo_safe=turbo_safe)
     _execute_uci_routine(transport, code, timeout=timeout)
     return transport.read_memory(_RESP_ADDR, 1)[0]
 
@@ -2163,7 +2247,8 @@ def uci_socket_read(
             f"max_len must be <= {SOCKET_READ_MAX_BYTES}, got {max_len}"
         )
 
-    socket_id_addr = _DATA_ADDR
+    socket_id_addr = _input_addr(None, turbo_safe, _DATA_ADDR,
+                                 _TURBO_SOCKET_ID_ADDR)
     transport.write_memory(socket_id_addr, bytes([socket_id]))
 
     code = build_socket_read(
@@ -2208,7 +2293,8 @@ def uci_socket_close(
 
     :param turbo_safe: see :func:`build_uci_command`.
     """
-    socket_id_addr = _DATA_ADDR
+    socket_id_addr = _input_addr(None, turbo_safe, _DATA_ADDR,
+                                 _TURBO_SOCKET_ID_ADDR)
     transport.write_memory(socket_id_addr, bytes([socket_id]))
 
     code = build_socket_close(socket_id_addr, turbo_safe=turbo_safe)
