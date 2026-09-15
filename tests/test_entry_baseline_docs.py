@@ -868,16 +868,27 @@ class TestTheItemCountCarriesItsScope:
             "every one of the 203 items carries both current and default",
             "bce4535e",
             "v3.15-132",
-            "7f6fcb51..bce4535e",
-            "SID Detected Socket 1",
-            "inferred",
+            "tree diff 7f6fcb51 -> bce4535e (not a linear range)",
+            "the device read is the authority",
+            "203 was also recorded on 2026-09-05 (ce4b0af)",
+            "no counting basis for it is evidenced",
             "unrecoverable",
         ):
             assert token in flat, token
-        # The candidate may not be promoted to the cause.
-        cand = [s for s in re.split(r"(?<=[.!?:])\s+", flat)
-                if "SID Detected Socket 1" in s]
-        assert cand and all("inferred" in s or "not established" in s for s in cand), cand
+        # Review round 1 (#401): picking two items of 203 to reach 201 was
+        # number-fitting on a false premise (ce4b0af exempted six, and
+        # be99a1a removed the exemption the same day).  Deleted, not caveated.
+        assert "SID Detected Socket" not in flat
+        assert "arithmetic candidate" not in flat
+
+    def test_the_record_source_names_the_running_build(self) -> None:
+        """#401 round 1: 7f6fcb51 is where the counts were derived, not what
+        the device runs; the source field may not present it as the latter."""
+        src = _flat(self._u64e_record().source)
+        assert "comes from the flash record, not from that read" not in src
+        for token in ("v3.15-85 (7f6fcb51)", "bce4535e (v3.15-132)",
+                      "derived at 7f6fcb51"):
+            assert token in src, token
 
     # -- positive controls for the scan itself -------------------------------
 
