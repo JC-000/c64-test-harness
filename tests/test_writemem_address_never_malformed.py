@@ -192,11 +192,33 @@ def test_liveness_probe_and_its_restore_send_strict_addresses():
 # No hand-built address query anywhere in src                                  #
 # --------------------------------------------------------------------------- #
 
-#: A line that builds an ``address`` query argument in code: a dict key
-#: ``"address":`` / ``'address':``, or an f-string / literal starting
-#: ``address=``.  Prose in docstrings uses ``address=`` inside double
-#: backticks and is excluded below.
-_BUILDS_ADDRESS = re.compile(r"""["']address["']\s*:|["']address=|[?&]address=\{""")
+#: A line that builds an ``address`` query argument in code:
+#:
+#: * a dict key ``"address":`` / ``'address':``;
+#: * an f-string / literal starting ``address=``, or an inline URL
+#:   ``?address=`` / ``&address=`` in any form -- f-string, concatenation
+#:   or ``%``-formatting (review round 1 of #351 dropped a ``{``
+#:   requirement that let the latter two escape);
+#: * a subscript assignment ``q["address"] = ...`` (not ``==``; #341);
+#: * a keyword argument ``address=`` inside a ``dict(...)`` or
+#:   ``.update(...)`` call (#341).
+#:
+#: Prose in docstrings uses ``address=`` inside double backticks and is
+#: excluded below.  **Known limits**: a keyword ``address=`` in any *other*
+#: call is deliberately not matched -- ``SidAddressConflict(address=...)``
+#: in src is not a query -- so a query built through some other function
+#: taking ``address=`` (or ``setdefault("address", ...)``) is missed, as is
+#: a builder whose key and formatter call sit on different lines.  Also
+#: missed, and deliberately not handled: ``dict([("address", hex(a))])``,
+#: an indirect key (``key = "address"; q[key] = ...``) and
+#: ``q.__setitem__("address", ...)``.
+_BUILDS_ADDRESS = re.compile(
+    r"""["']address["']\s*:"""
+    r"""|["']address="""
+    r"""|[?&]address="""
+    r"""|\[\s*["']address["']\s*\]\s*=(?!=)"""
+    r"""|\b(?:dict|update)\s*\(.*\baddress\s*=(?!=)"""
+)
 
 
 def _unguarded_address_builders(text: str) -> list[str]:
@@ -240,6 +262,40 @@ def test_the_scan_sees_the_real_builders():
 ])
 def test_the_scan_fires_on_hand_built_queries(line):
     assert _unguarded_address_builders(line) == [line]
+
+
+@pytest.mark.parametrize("line", [
+    'q["address"] = hex(a)',
+    "params['address'] = f\"{a:X}\"",
+    'query[ "address" ]="%x" % addr',
+    "query = dict(address=hex(addr), length=n)",
+    'params.update(address="%04x" % a)',
+    "query = dict(length=len(data), address=hex(a))",
+    # Review round 1 (#351): the two most natural hand-built URLs, which the
+    # inline-URL shape missed while it required ``{`` after ``address=``.
+    'url = "/v1/machine:readmem?address=" + hex(addr)',
+    'url = "/v1/machine:writemem?address=%04X&data=%s" % (addr, h)',
+    # ``address`` as a later parameter, after ``&``.
+    'url = "/v1/machine:readmem?length=4&address=" + hex(addr)',
+], ids=["subscript-dq", "subscript-sq", "subscript-spaced", "dict-kwarg", "update-kwarg",
+        "dict-kwarg-after-a-call", "url-concatenation", "url-percent-format",
+        "url-ampersand"])
+def test_the_scan_fires_on_subscript_and_keyword_shapes(line):
+    """#341: shapes the first version of the scan missed."""
+    assert _unguarded_address_builders(line) == [line]
+
+
+@pytest.mark.parametrize("line", [
+    'q["address"] = _wire_hex16(a)',
+    "query = dict(address=_wire_hex16(addr), length=n)",
+    # Not query builders: a comparison, a plain variable, and the one
+    # keyword-argument ``address=`` that exists in src today.
+    'if q["address"] == "0000":',
+    "address = 0x0400",
+    "SidAddressConflict(address=address, slots=slots)",
+], ids=["subscript-guarded", "dict-guarded", "comparison", "plain-variable", "sid-conflict"])
+def test_the_widened_scan_passes_guarded_and_non_query_shapes(line):
+    assert _unguarded_address_builders(line) == []
 
 
 @pytest.mark.parametrize("line", [
