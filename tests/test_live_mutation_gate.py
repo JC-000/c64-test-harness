@@ -24,12 +24,17 @@ The condition is evaluated, not just searched:
 * a gate read evaluates to its default -- ``None`` without one, the literal
   with a literal default (so ``not get(GATE, '0')`` never skips), and a
   non-literal default fails closed;
-* ``U64_HOST`` reads as set and every other environment variable as unset
-  (or its literal default), so ``not <gate> and get('CI')`` is refused while
-  the multi-gate ``not _LIVE or not <gate>`` stays a gate;
-* names take the value of their latest binding in source order -- a literal
-  binds to itself, a gate read to its unset value -- and a name rebound to
-  anything the evaluator cannot decide, or never bound, fails closed;
+* ``U64_HOST`` reads as set; every other environment variable is unknown,
+  and the condition must skip for **every** set/unset combination of those
+  it reads (at most six; more fails closed), so ``not <gate> and get('CI')``
+  and ``not get('X_LIVE') or get(GATE)`` are refused while the multi-gate
+  ``not _LIVE or not <gate>`` stays a gate;
+* only a single-Name assignment at module level binds a name, in source
+  order -- a literal to itself, anything else to its expression -- and a
+  name rebound to anything the evaluator cannot decide, stored any other
+  way (tuple or ``for``/``with`` target, ``+=``, walrus, import alias,
+  parameter, function, class, or any assignment inside a function or
+  class), or never bound, fails closed;
 * only a small expression grammar (boolean operators, comparisons,
   constants, ``bool``/``str``/``int``) is evaluated, and an evaluation that
   raises is not a gate.
@@ -53,7 +58,10 @@ reads more into a green run:**
   fixture that writes back what a gated test moved passes, and so would a
   fixture that writes on its own in a module that gates some other test.
   Writes reached through a module helper the test calls are not
-  attributed to the test.
+  attributed to the test.  ``module_is_gated`` accepts any gating
+  ``skipif`` call anywhere in the module, even one bound to a name that is
+  later rebound or never applied; the test-level check, which follows
+  marks by name, is what catches that.
 * Matching is **by name**.  ``set_speed`` is a writer because
   ``Ultimate64Transport.set_speed`` is one, so a VICE-only live module
   calling ``transport.set_speed`` would be flagged (none does today) -- the
@@ -69,6 +77,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import itertools
 from pathlib import Path
 
 import pytest
@@ -268,31 +277,123 @@ def _is_gate_env_read(node: ast.AST) -> bool:
 
 
 #: The one other requirement assumed met while a condition is evaluated.
-#: Every other environment variable reads as unset, which is conservative for
-#: the legitimate multi-gate form (``not _LIVE or not _MUTATE``) and refuses
-#: ``not _MUTATE and os.environ.get('CI')``, which never skips outside CI.
+#: Every other environment variable is unknown: a condition must skip for
+#: every set/unset combination of the ones it reads.  That refuses
+#: ``not _MUTATE and get('CI')`` and ``not get('X_LIVE') or get(GATE)``,
+#: while the multi-gate ``not _LIVE or not _MUTATE`` stays a gate.
 _ASSUMED_SET = frozenset({"U64_HOST"})
+
+#: Most other environment variables a condition may combine with the gate;
+#: above this it fails closed rather than enumerate.
+_MAX_OTHER_ENV_VARS = 6
 
 
 class _FailClosed(Exception):
     """A condition, or a binding it depends on, cannot be decided."""
 
 
-def _unset_read_value(read: tuple[str, ast.AST | None]) -> object:
-    """What an environment read evaluates to for this scan.
+def _read_value(read: tuple[str, ast.AST | None], env: dict[str, bool]) -> object:
+    """What an environment read evaluates to for one combination *env*.
 
-    ``U64_HOST`` reads as set; any other variable -- the gate included --
-    reads as its default: ``None`` when there is none, the literal when the
-    default is one, and a non-literal default fails closed.
+    ``U64_HOST`` reads as set, and a variable *env* marks set reads as
+    ``"1"``.  Otherwise -- always, for the gate -- it reads as its default:
+    ``None`` when there is none, the literal when the default is one, and a
+    non-literal default fails closed.
     """
     variable, default = read
     if variable in _ASSUMED_SET:
         return "set"
+    if env.get(variable):
+        return "1"
     if default is None:
         return None
     if isinstance(default, ast.Constant):
         return default.value
     raise _FailClosed(f"non-literal default for {variable}")
+
+
+def _other_env_vars(expr: ast.AST) -> list[str]:
+    """The environment variables *expr* reads, other than the gate and ``U64_HOST``."""
+    found: set[str] = set()
+    for node in ast.walk(expr):
+        read = _env_read(node)
+        if read is not None and read[0] != GATE and read[0] not in _ASSUMED_SET:
+            found.add(read[0])
+    return sorted(found)
+
+
+def _unsafe_names(tree: ast.AST) -> set[str]:
+    """Names stored any way other than a single-Name module-level assignment."""
+    body = tree.body if isinstance(tree, ast.Module) else []
+    blessed = {
+        id(stmt.targets[0] if isinstance(stmt, ast.Assign) else stmt.target)
+        for stmt in body
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+        )
+        or (
+            isinstance(stmt, ast.AnnAssign)
+            and stmt.value is not None
+            and isinstance(stmt.target, ast.Name)
+        )
+    }
+    unsafe: set[str] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            and id(node) not in blessed
+        ):
+            unsafe.add(node.id)
+        elif isinstance(node, ast.alias):
+            unsafe.add((node.asname or node.name).split(".")[0])
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            unsafe.add(node.name)
+        elif isinstance(node, ast.arg):
+            unsafe.add(node.arg)
+    return unsafe
+
+
+def _evaluate_once(expr: ast.AST, env: dict[str, bool]) -> tuple[bool, object]:
+    """``(True, value)`` of an inlined *expr* for one combination; ``(False, None)`` if not.
+
+    Anything outside :data:`_SAFE_NODES` / :data:`_SAFE_CALLS` is refused, and
+    an evaluation that raises proves nothing -- fail closed.
+    """
+    class _Substitute(ast.NodeTransformer):
+        def _read(self, node: ast.AST) -> ast.AST:
+            read = _env_read(node)
+            if read is not None:
+                return ast.copy_location(ast.Constant(_read_value(read, env)), node)
+            return self.generic_visit(node)
+
+        visit_Call = _read
+        visit_Subscript = _read
+
+    try:
+        tree = ast.fix_missing_locations(
+            _Substitute().visit(ast.Expression(body=copy.deepcopy(expr)))
+        )
+    except _FailClosed:
+        return False, None
+    for node in ast.walk(tree):
+        if not isinstance(node, _SAFE_NODES):
+            return False, None
+        if isinstance(node, ast.Name) and node.id not in _SAFE_CALLS:
+            return False, None
+        if isinstance(node, ast.Call) and not (
+            isinstance(node.func, ast.Name)
+            and node.func.id in _SAFE_CALLS
+            and not node.keywords
+        ):
+            return False, None
+    try:
+        code = compile(tree, "<gate condition>", "eval")
+        return True, eval(code, {"__builtins__": {}}, dict(_SAFE_CALLS))  # noqa: S307
+    except Exception:  # noqa: BLE001 -- unevaluable means not a gate
+        return False, None
 
 
 #: Callables a condition may use and still be evaluated.
@@ -318,61 +419,65 @@ ACCEPTED_GATE_SHAPES = (
     "`if not _MUTATE: pytest.skip(...)` in a fixture or test",
     "the variable name and any default must be string literals; conditions "
     "may use and/or/not, comparisons, literals and bool()/str()/int(); every "
-    "other environment variable except U64_HOST is treated as unset",
+    "other environment variable except U64_HOST may be set or unset and the "
+    "condition must skip in every combination; bind names with a plain "
+    "module-level `NAME = ...`",
 )
 
 
 class _GateContext:
     """What one module's source says about the gate, evaluated with it unset.
 
-    One pass over assignments in ``ast.walk`` order, which visits
-    module-level statements in source order:
+    One pass over the module body's single-Name assignments, in source order:
 
-    * ``values`` -- every name bound to an expression the evaluator can
-      decide, mapped to its value with the gate unset.  A literal binds to
-      itself.  A later binding replaces the value; a later binding to
-      anything undecidable removes the name, and referencing a name not in
+    * ``values`` -- each name bound to an expression the scanner can decide,
+      mapped to that expression with earlier names inlined (a literal is its
+      own expression).  A later binding replaces it; a binding to anything
+      undecidable removes the name.  A name stored any other way
+      (:func:`_unsafe_names`) is never bound, and referencing a name not in
       ``values`` fails closed.
-    * ``derived`` -- the names in ``values`` whose current binding read the
-      gate (so ``_M = get(GATE)`` then ``_M = '1'`` is no longer the gate).
+    * ``derived`` -- the names whose current binding reads the gate (so
+      ``_M = get(GATE)`` then ``_M = '1'`` is no longer the gate).
     * ``marks`` -- names bound to a ``skipif`` mark that gates.
     * ``rejected`` -- conditions met after construction that mention the gate
       but were not accepted, with the reason, for failure messages.
     """
 
     def __init__(self, tree: ast.AST) -> None:
-        self.values: dict[str, object] = {}
+        self.values: dict[str, ast.AST] = {}
         self.derived: set[str] = set()
         self.marks: set[str] = set()
         self.rejected: dict[str, str] = {}
         self._recording = False
-        for node in ast.walk(tree):
+        unsafe = _unsafe_names(tree)
+        for node in tree.body if isinstance(tree, ast.Module) else []:
             if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
                 continue
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            names = [t.id for t in targets if isinstance(t, ast.Name)]
-            if not names:
+            if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+                continue
+            name = targets[0].id
+            if name in unsafe:
                 continue
             if self.mark_gates(node.value):
-                self.marks.update(names)
+                self.marks.add(name)
                 continue
-            self.marks.difference_update(names)
-            reads_gate = self.references_gate(node.value)
-            ok, value = (
-                self.evaluate(node.value)
+            self.marks.discard(name)
+            decided = (
+                self.decide(node.value)
                 if all(isinstance(n, _BINDING_NODES) for n in ast.walk(node.value))
-                else (False, None)
+                else None
             )
-            for name in names:
-                if ok:
-                    self.values[name] = value
-                    if reads_gate:
-                        self.derived.add(name)
-                    else:
-                        self.derived.discard(name)
-                else:
-                    self.values.pop(name, None)
-                    self.derived.discard(name)
+            if decided is None:
+                self.values.pop(name, None)
+                self.derived.discard(name)
+                continue
+            inlined, _results = decided
+            self.values[name] = inlined
+            if any(_is_gate_env_read(n) for n in ast.walk(inlined)):
+                self.derived.add(name)
+            else:
+                self.derived.discard(name)
         self._recording = True
 
     def references_gate(self, expr: ast.AST) -> bool:
@@ -386,57 +491,57 @@ class _GateContext:
         """Names the gate at all -- a literal, or a name bound to the literal."""
         return self.references_gate(expr) or any(
             (isinstance(sub, ast.Constant) and sub.value == GATE)
-            or (isinstance(sub, ast.Name) and self.values.get(sub.id) == GATE)
+            or (
+                isinstance(sub, ast.Name)
+                and isinstance(self.values.get(sub.id), ast.Constant)
+                and self.values[sub.id].value == GATE
+            )
             for sub in ast.walk(expr)
         )
 
-    def evaluate(self, expr: ast.AST) -> tuple[bool, object]:
-        """``(True, value)`` of *expr* with the gate unset; ``(False, None)`` if undecidable.
-
-        Environment reads become :func:`_unset_read_value`; names bound in
-        ``values`` their values; any other name fails closed.  Anything
-        outside :data:`_SAFE_NODES` / :data:`_SAFE_CALLS` is refused, and an
-        evaluation that raises proves nothing -- fail closed throughout.
-        """
+    def _inline(self, expr: ast.AST) -> ast.AST:
+        """A copy of *expr* with bound names replaced by their expressions."""
         values = self.values
 
-        class _Unset(ast.NodeTransformer):
+        class _Inline(ast.NodeTransformer):
             def _read(self, node: ast.AST) -> ast.AST:
-                read = _env_read(node)
-                if read is not None:
-                    return ast.copy_location(ast.Constant(_unset_read_value(read)), node)
-                return self.generic_visit(node)
+                return node if _env_read(node) is not None else self.generic_visit(node)
 
             visit_Call = _read
             visit_Subscript = _read
 
             def visit_Name(self, node: ast.Name) -> ast.AST:
                 if node.id in values:
-                    return ast.copy_location(ast.Constant(values[node.id]), node)
+                    return copy.deepcopy(values[node.id])
                 if node.id in _SAFE_CALLS:
                     return node
                 raise _FailClosed(f"unbound name {node.id!r}")
 
+        return _Inline().visit(copy.deepcopy(expr))
+
+    def decide(self, expr: ast.AST) -> tuple[ast.AST, list[object]] | None:
+        """``(inlined expression, value per combination)``, or ``None`` if undecidable.
+
+        Bound names are inlined, then the expression is evaluated for every
+        set/unset combination of the other environment variables it reads
+        (:func:`_read_value`).  An unbound name, more than
+        :data:`_MAX_OTHER_ENV_VARS` other variables, or a combination that
+        :func:`_evaluate_once` cannot decide makes it undecidable.
+        """
         try:
-            tree = ast.fix_missing_locations(
-                _Unset().visit(ast.Expression(body=copy.deepcopy(expr)))
-            )
+            inlined = self._inline(expr)
         except _FailClosed:
-            return False, None
-        for node in ast.walk(tree):
-            if not isinstance(node, _SAFE_NODES):
-                return False, None
-            if isinstance(node, ast.Call) and not (
-                isinstance(node.func, ast.Name)
-                and node.func.id in _SAFE_CALLS
-                and not node.keywords
-            ):
-                return False, None
-        try:
-            code = compile(tree, "<gate condition>", "eval")
-            return True, eval(code, {"__builtins__": {}}, dict(_SAFE_CALLS))  # noqa: S307
-        except Exception:  # noqa: BLE001 -- unevaluable means not a gate
-            return False, None
+            return None
+        others = _other_env_vars(inlined)
+        if len(others) > _MAX_OTHER_ENV_VARS:
+            return None
+        results: list[object] = []
+        for bits in itertools.product((False, True), repeat=len(others)):
+            ok, value = _evaluate_once(inlined, dict(zip(others, bits)))
+            if not ok:
+                return None
+            results.append(value)
+        return inlined, results
 
     def _reject(self, condition: ast.AST, why: str) -> None:
         if self._recording:
@@ -451,11 +556,12 @@ class _GateContext:
                     "names the gate but does not read it with a literal key",
                 )
             return False
-        ok, value = self.evaluate(condition)
-        if not ok:
+        decided = self.decide(condition)
+        if decided is None:
             self._reject(condition, "cannot be evaluated")
             return False
-        if not value:
+        _inlined, results = decided
+        if not all(results):
             self._reject(condition, "does not skip when the gate is unset")
             return False
         return True
@@ -997,6 +1103,65 @@ class TestTheScannerItselfCanFail:
         assert "not accepted" not in hint
         assert "Accepted gate shapes" in hint
 
+    @pytest.mark.parametrize("condition", [
+        "not _LIVE or os.environ.get('U64_ALLOW_MUTATE') == '1'",
+        "not os.environ.get('X_LIVE') or os.environ.get('U64_ALLOW_MUTATE')",
+    ], ids=["R4-bound", "R4b-inline"])
+    def test_an_inverted_gate_inside_a_multi_gate_or_is_not_a_gate(self, condition) -> None:
+        """With X_LIVE set and the gate unset these do not skip, so the module writes."""
+        src = (
+            "import os, pytest\n"
+            "_LIVE = os.environ.get('X_LIVE')\n"
+            f"pytestmark = pytest.mark.skipif({condition}, reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == {"enable_uci"}
+
+    @pytest.mark.parametrize("count, offence", [(6, set()), (7, {"enable_uci"})])
+    def test_more_other_env_vars_than_the_cap_fail_closed(self, count, offence) -> None:
+        """Six other variables are enumerated (64 combinations); a seventh fails closed."""
+        others = " or ".join(f"not os.environ.get('X{i}')" for i in range(count))
+        src = (
+            "import os, pytest\n"
+            "pytestmark = pytest.mark.skipif(\n"
+            f"    not os.environ.get('U64_ALLOW_MUTATE') or {others}, reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == offence
+
+    @pytest.mark.parametrize("binding", [
+        "_M = os.environ.get('U64_ALLOW_MUTATE')\n_M, _Z = '1', 0\n",
+        "_M = '1'\ndef helper():\n    _M = os.environ.get('U64_ALLOW_MUTATE')\n",
+        "_M = os.environ.get('U64_ALLOW_MUTATE')\nfrom string import digits as _M\n",
+        "_M = os.environ.get('U64_ALLOW_MUTATE')\n_Y = (_M := '1')\n",
+        "_M = os.environ.get('U64_ALLOW_MUTATE')\n_M += '1'\n",
+        "_M = os.environ.get('U64_ALLOW_MUTATE')\nfor _M in ['1']:\n    pass\n",
+        "_M = os.environ.get('U64_ALLOW_MUTATE')\ndef _M():\n    pass\n",
+        "_M = os.environ.get('U64_ALLOW_MUTATE')\ndef helper(_M='1'):\n    pass\n",
+    ], ids=["R5-tuple", "R6-function-local", "R7-import-alias", "R8-walrus",
+            "R9-augassign", "R10-for-target", "def-name", "parameter"])
+    def test_a_name_stored_any_other_way_fails_closed(self, binding) -> None:
+        """Only a single-Name module-level assignment binds; any other store of the name fails closed."""
+        src = (
+            "import os, pytest\n"
+            f"{binding}"
+            "pytestmark = pytest.mark.skipif(not _M, reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == {"enable_uci"}
+
+    def test_a_falsy_flag_rebound_to_something_undecidable_fails_closed(self) -> None:
+        """S6: after ``_OFF = compute()`` nothing is known about ``_OFF``."""
+        src = (
+            "import os, pytest\n"
+            "_OFF = False\n"
+            "_OFF = compute()\n"
+            "pytestmark = pytest.mark.skipif(\n"
+            "    _OFF or not os.environ.get('U64_ALLOW_MUTATE'), reason='x')\n"
+            "def test_x(client):\n    enable_uci(client)\n"
+        )
+        assert self._offence(src) == {"enable_uci"}
+
     def test_read_only_module_needs_no_gate(self) -> None:
         src = "def test_x(client):\n    client.get_config_item('C', 'I')\n"
         assert self._offence(src) == set()
@@ -1104,6 +1269,15 @@ class TestTheTestLevelScannerCanFail:
     def test_an_inverted_module_pytestmark_does_not_cover_the_tests(self) -> None:
         body = (
             "pytestmark = pytest.mark.skipif(bool(_M), reason='y')\n"
+            "def test_a(t):\n    t.set_speed(4)\n"
+        )
+        assert self._offenders(body) == ["test_a (set_speed)"]
+
+    def test_a_mark_name_rebound_to_a_non_gate_does_not_cover_the_test(self) -> None:
+        """S9: ``needs`` rebound to ``skipif(False)`` before ``@needs`` gates nothing."""
+        body = (
+            "needs = pytest.mark.skipif(False, reason='y')\n"
+            "@needs\n"
             "def test_a(t):\n    t.set_speed(4)\n"
         )
         assert self._offenders(body) == ["test_a (set_speed)"]
