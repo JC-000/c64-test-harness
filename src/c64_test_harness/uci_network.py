@@ -1926,7 +1926,7 @@ def uci_get_ip(
 ) -> str:
     """Query the U64's IP address via UCI GET_IP_ADDRESS.
 
-    Returns the IP address as a dotted-quad string (e.g. ``"192.168.1.81"``).
+    Returns the IP address as a dotted-quad string (e.g. ``"192.0.2.64"``).
 
     :param turbo_safe: see :func:`build_uci_command`.
 
