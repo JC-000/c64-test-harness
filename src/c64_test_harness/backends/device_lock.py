@@ -75,6 +75,7 @@ import contextlib
 import fcntl
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -83,7 +84,7 @@ import urllib.error
 import urllib.request
 import uuid
 import weakref
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 _log = logging.getLogger(__name__)
@@ -256,6 +257,88 @@ _RELEASE_CALLBACK_GUARD = threading.Lock()
 
 #: Environment variable that upgrades the advisory warning to a raise.
 REQUIRE_DEVICE_LOCK_ENV = "U64_REQUIRE_DEVICE_LOCK"
+
+#: Environment variable that sets the acquire **budget**, in seconds,
+#: wherever a caller did not pass one explicitly (issue #233).  Unlike
+#: every other ``U64_*`` variable in this package it is not a gate or a
+#: switch: it changes how long a wait may run, never whether anything
+#: runs.  Read at call time by :func:`resolve_lock_timeout`, so a
+#: long-lived process sees a change.  An explicit argument always wins.
+LOCK_TIMEOUT_ENV = "U64_DEVICE_LOCK_TIMEOUT"
+
+#: :meth:`DeviceLock.acquire` / :meth:`DeviceLock.acquire_or_raise`'s
+#: budget when neither the caller nor :data:`LOCK_TIMEOUT_ENV` gives one.
+#: Unchanged by #233 (it was the signature default before).  The manager
+#: path has its own, ``unified_manager.DEFAULT_LOCK_TIMEOUT``.
+DEFAULT_ACQUIRE_TIMEOUT = 30.0
+
+#: How often a blocked :meth:`DeviceLock.acquire` reports progress -- the
+#: built-in log line and the ``on_wait`` callback -- whether or not the
+#: deadline is being extended (issue #233).
+_PROGRESS_LOG_INTERVAL = 30.0
+
+
+class DeviceLockTimeoutConfigError(ValueError):
+    """``U64_DEVICE_LOCK_TIMEOUT`` cannot be read as a budget.
+
+    Deliberately fatal, never a fall-back to the default: the variable
+    exists so a lane can say "I know I am behind a long run", and a typo
+    (``30m``, ``2 min``) that silently reinstated the default would fail
+    that lane much later against a budget nobody asked for.  Raised
+    before the lock is tried and before any device is contacted.
+
+    A ``ValueError``, not a ``TimeoutError``: an ``except
+    DeviceLockTimeout`` / ``except TimeoutError`` retry arm must not
+    swallow a misconfiguration as if it were contention.
+    """
+
+
+def resolve_lock_timeout(timeout: float | None, *, default: float) -> float:
+    """The acquire budget: *timeout* if given, else the env, else *default*.
+
+    * *timeout* not ``None`` -> returned unchanged; the variable is not
+      read at all, so a malformed value cannot break an explicit caller.
+    * :data:`LOCK_TIMEOUT_ENV` unset -> *default*, silently.
+    * set but empty (or whitespace) -> *default*, with a WARNING: ``VAR=``
+      is the shell's spelling of "unset", but a variable that expanded to
+      nothing usually meant to expand to something.
+    * otherwise parsed as a float; anything unparseable, ``<= 0``, or not
+      finite raises :class:`DeviceLockTimeoutConfigError`.  Zero would
+      make every queued run an instant failure; infinity would make a
+      wedged device indistinguishable from a busy one.
+
+    Read on every call, never cached.
+    """
+    if timeout is not None:
+        return timeout
+    raw = os.environ.get(LOCK_TIMEOUT_ENV)
+    if raw is None:
+        return float(default)
+    text = raw.strip()
+    if not text:
+        _log.warning(
+            "%s is set but empty; treating it as unset and using the "
+            "default %gs",
+            LOCK_TIMEOUT_ENV,
+            default,
+        )
+        return float(default)
+    try:
+        value = float(text)
+    except ValueError:
+        raise DeviceLockTimeoutConfigError(
+            f"{LOCK_TIMEOUT_ENV}={raw!r} is not a number of seconds. Give a "
+            f"positive number (e.g. {LOCK_TIMEOUT_ENV}=1800), or unset it for "
+            f"the default {default:g}s."
+        ) from None
+    if not math.isfinite(value) or value <= 0:
+        raise DeviceLockTimeoutConfigError(
+            f"{LOCK_TIMEOUT_ENV}={raw!r} is not a positive, finite number of "
+            f"seconds. Zero or less would fail every queued run at once, and "
+            f"an infinite budget would make a wedged device indistinguishable "
+            f"from a busy one; unset it for the default {default:g}s."
+        )
+    return value
 
 #: Environment variable that silences the once-per-process
 #: unlocked-client notice (:func:`warn_unlocked_client`).  Accepts the
@@ -505,9 +588,11 @@ class DeviceLock:
 
     def acquire(
         self,
-        timeout: float = 30.0,
+        timeout: float | None = None,
         *,
         progress_window: float | None = 60.0,
+        on_wait: Callable[[float, int | None, float | None, int | None], object]
+        | None = None,
     ) -> bool:
         """Acquire the lock, blocking up to *timeout* seconds.
 
@@ -591,14 +676,46 @@ class DeviceLock:
         hold by the same owner rather than a rescue.  Holders in other
         threads or other processes extend the deadline as before.
 
+        **Progress while blocked** (issue #233).  Every
+        ``_PROGRESS_LOG_INTERVAL`` seconds (30) a blocked waiter logs one
+        line -- ``still waiting after Ns; holder pid=..., lockfile age=...,
+        queue depth=...; <state>`` -- and calls *on_wait* with the same
+        fields.  This happens whether or not the deadline is being
+        extended; before #233 a wait behind a non-extending holder said
+        nothing at all.  The line is INFO while the deadline is being
+        extended (the extension WARNING above already speaks for that
+        case) and WARNING otherwise.  *State* is derived from this
+        iteration's own extend decision, and the lockfile age is compared
+        with *progress_window* -- the same criterion that decides
+        extension -- only when acquire is *not* extending, so a progress
+        line can never call a holder wedged (``STALE``) while acquire is
+        still extending behind it.
+
         :param timeout: maximum wall time (seconds) to wait against
             stuck/dead holders.  With queue-aware semantics, total
             wall time may exceed *timeout* if the holder keeps making
-            progress.
+            progress.  ``None`` (the default) reads
+            ``U64_DEVICE_LOCK_TIMEOUT`` at call time, else
+            :data:`DEFAULT_ACQUIRE_TIMEOUT` (30 s); an explicit value
+            always wins.  See :func:`resolve_lock_timeout`.
         :param progress_window: how recently the holder must have touched
             the lockfile (seconds) for it to count as "progressing".
             ``None`` disables queue-aware behavior (legacy mode: hard
             timeout).
+        :param on_wait: optional ``on_wait(elapsed, holder_pid,
+            lockfile_age, queue_depth)``, called from this thread every
+            ``_PROGRESS_LOG_INTERVAL`` seconds while blocked, never on an
+            uncontended acquire.  *elapsed* is seconds since blocking
+            began; *holder_pid* is the holder's recorded PID or ``None``;
+            *lockfile_age* is seconds since the lockfile mtime or
+            ``None``; *queue_depth* is :attr:`queue_depth`, which counts
+            this waiter too, or ``None``.  An exception it raises
+            propagates out of ``acquire`` -- which abandons the wait,
+            deregisters this waiter, and leaves the lock unheld -- so a
+            caller can use it to cancel.
+        :raises DeviceLockTimeoutConfigError: *timeout* is ``None`` and
+            ``U64_DEVICE_LOCK_TIMEOUT`` is malformed, non-positive or
+            non-finite -- raised before the lock is tried.
         :raises DeviceLockContentionError: never from this method; see
             :meth:`acquire_or_raise` for the raising variant.
 
@@ -609,6 +726,10 @@ class DeviceLock:
         best-effort and never changes acquire semantics; an uncontended
         acquire takes the fast path and registers nothing.
         """
+        # First, before any lock or device state is touched: a malformed
+        # U64_DEVICE_LOCK_TIMEOUT is a misconfiguration, and it fails the
+        # same way whether or not the lock happens to be free (#233).
+        timeout = resolve_lock_timeout(timeout, default=DEFAULT_ACQUIRE_TIMEOUT)
         if self._fd is not None:
             # Already held by us; ensure heartbeat is running (idempotent).
             self._start_heartbeat()
@@ -661,6 +782,7 @@ class DeviceLock:
         handoffs = 0
         stopped_extending = False
         last_extension_log = time.monotonic()
+        last_progress_report = queued_since
         notifier = _LockNotifier(self._lock_path) if _HAS_WATCHDOG else None
         # We are about to block: register wait intent so queue_depth /
         # peek_queue_depth observers see this waiter.  Best-effort — a
@@ -668,6 +790,11 @@ class DeviceLock:
         intent = self._register_wait_intent()
         try:
             while True:
+                # This iteration's extend decision and holder identity,
+                # handed to the progress report so its verdict can never
+                # disagree with what acquire actually did (#233).
+                extended_now = False
+                iteration_pid: int | None = None
                 # Queue-aware: if the current holder is live and recently
                 # progressing, extend the deadline -- but only while it is
                 # the *same* holder.  Freshness alone cannot tell one long
@@ -677,6 +804,7 @@ class DeviceLock:
                     progressing, holder_pid = self._holder_progress(
                         progress_window
                     )
+                    iteration_pid = holder_pid
                     if progressing:
                         # An unreadable identity is not evidence of a new
                         # holder; treating it as one would turn a flaky
@@ -690,6 +818,7 @@ class DeviceLock:
                             observed_pid = holder_pid
                         if handoffs <= _MAX_HOLDER_HANDOFFS:
                             deadline = time.monotonic() + timeout
+                            extended_now = True
                             now = time.monotonic()
                             if (
                                 now - last_extension_log
@@ -723,6 +852,17 @@ class DeviceLock:
                                 time.monotonic() - queued_since,
                                 observed_pid,
                             )
+                now = time.monotonic()
+                if now - last_progress_report >= _PROGRESS_LOG_INTERVAL:
+                    last_progress_report = now
+                    self._report_wait(
+                        elapsed=now - queued_since,
+                        holder_pid=iteration_pid,
+                        extended=extended_now,
+                        stopped_extending=stopped_extending,
+                        progress_window=progress_window,
+                        on_wait=on_wait,
+                    )
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
@@ -743,9 +883,11 @@ class DeviceLock:
 
     def acquire_or_raise(
         self,
-        timeout: float = 30.0,
+        timeout: float | None = None,
         *,
         progress_window: float | None = 60.0,
+        on_wait: Callable[[float, int | None, float | None, int | None], object]
+        | None = None,
     ) -> None:
         """Acquire the lock or raise :class:`DeviceLockTimeout` with diagnostics.
 
@@ -760,12 +902,22 @@ class DeviceLock:
           from "device broken"
 
         ``acquire()``'s contract is unchanged — this method is purely
-        additive.
+        additive.  *timeout* ``None`` resolves exactly as in
+        :meth:`acquire` (``U64_DEVICE_LOCK_TIMEOUT``, else 30 s), and it is
+        resolved here first, so a malformed value raises
+        :class:`DeviceLockTimeoutConfigError` before the REST
+        reachability probe -- the one device contact in this module --
+        can run, and ``DeviceLockTimeout.timeout`` reports the budget
+        that was actually served.  *on_wait* is passed through.
 
         :raises DeviceLockTimeout: when the underlying ``acquire`` returns
             ``False``.
+        :raises DeviceLockTimeoutConfigError: see :meth:`acquire`.
         """
-        if self.acquire(timeout=timeout, progress_window=progress_window):
+        timeout = resolve_lock_timeout(timeout, default=DEFAULT_ACQUIRE_TIMEOUT)
+        if self.acquire(
+            timeout=timeout, progress_window=progress_window, on_wait=on_wait
+        ):
             return
         # Acquire failed — gather diagnostics before raising.
         info = self.read_info()
@@ -797,6 +949,74 @@ class DeviceLock:
             timeout=timeout,
             progress_window=progress_window,
         )
+
+    def _report_wait(
+        self,
+        *,
+        elapsed: float,
+        holder_pid: int | None,
+        extended: bool,
+        stopped_extending: bool,
+        progress_window: float | None,
+        on_wait: Callable[[float, int | None, float | None, int | None], object]
+        | None,
+    ) -> None:
+        """One progress report from a blocked :meth:`acquire` (issue #233).
+
+        Filesystem-only: one ``read_info`` when the loop did not learn the
+        holder's PID, one ``stat``, and the queue count.
+
+        The verdict is taken from *extended* -- the loop's own decision on
+        this iteration -- before the lockfile age is consulted at all, so
+        ``STALE`` is reachable only when acquire is not extending.  Age is
+        compared with *progress_window*, the threshold ``_holder_progress``
+        extends on, never with some other number.
+        """
+        if holder_pid is None:
+            info = self.read_info()
+            if isinstance(info, dict) and isinstance(info.get("pid"), int):
+                holder_pid = info["pid"]
+        try:
+            age: float | None = max(
+                0.0, time.time() - os.stat(str(self._lock_path)).st_mtime
+            )
+        except OSError:
+            age = None
+        depth = self.queue_depth
+        level = logging.WARNING
+        if extended:
+            level = logging.INFO
+            state = "deadline extended behind a progressing holder"
+        elif self._held_by_this_thread():
+            state = (
+                f"not extended: held by this thread, wait capped at the "
+                f"{_SELF_HELD_WAIT_GRACE:.1f}s grace"
+            )
+        elif progress_window is None:
+            state = "not extended: progress_window=None (hard timeout)"
+        elif age is not None and age > progress_window:
+            state = (
+                f"not extended: lockfile older than "
+                f"progress_window={progress_window:g}s -- STALE, holder may "
+                f"be wedged"
+            )
+        elif stopped_extending:
+            state = "not extended: handoff chain"
+        else:
+            state = "not extended: holder not progressing (dead or unreadable)"
+        _log.log(
+            level,
+            "DeviceLock %s: still waiting after %.0fs; holder pid=%s, "
+            "lockfile age=%s, queue depth=%s; %s",
+            self._device_host,
+            elapsed,
+            holder_pid,
+            "unknown" if age is None else f"{age:.0f}s",
+            depth,
+            state,
+        )
+        if on_wait is not None:
+            on_wait(elapsed, holder_pid, age, depth)
 
     def _probe_rest_reachable(self) -> bool | None:
         """Best-effort ``GET /v1/version`` against the device.
