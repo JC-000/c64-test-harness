@@ -238,8 +238,9 @@ def test_a_device_that_answered_late_is_regraded_after_a_successful_request():
     "unknown", which is cached forever and disarms hygiene. So a real
     C64U answering ``/v1/info`` in 501 ms would get no accounting, no
     budget, no drain and no refusal -- and the correlation runs the wrong
-    way: a device is slow when it is loaded or distressed, which is the
-    state of a device approaching /Temp exhaustion.
+    way: a device is slow when it is loaded or distressed, which is how a
+    device with accumulating /Temp attachments may well present before the
+    firmware crashes (#256: the failure is a crash, not a full /Temp).
 
     A completed request is the evidence a timed-out probe could not
     supply. The re-probe fires at the decision points -- before an
@@ -645,8 +646,10 @@ def test_budget_override_via_env(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_default_budget_is_below_the_firmware_keep_limit():
-    # The firmware's own post-#686 limit is 10 managed files and the
-    # measured wedge was ~15 uploads; the default must sit under both.
+    # The firmware's own post-#686 collector keeps at most 10 managed files;
+    # the default must sit under that.  The "~15 uploads" wedge (U64E, 3.14d,
+    # n unrecorded) is where one reproduction stopped, not a bound to size
+    # against (#256).
     assert 0 < gc_mod.DEFAULT_LEAK_BUDGET <= 8
     assert _client(LEAKY).temp_gc_budget == gc_mod.DEFAULT_LEAK_BUDGET
 

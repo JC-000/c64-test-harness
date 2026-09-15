@@ -1175,7 +1175,7 @@ Three failure modes show up when driving a U64 hard from a test run:
 
 `recover()` escalates `reset()` -> probe -> `reboot()` -> probe and returns `"reset"` or `"reboot"` to indicate which step succeeded. `runner_health_check()` posts a tiny no-op PRG and raises `Ultimate64RunnerStuckError` on the wedged-runner signature.
 
-**`runner_health_check()` is itself a body-carrying call** — it POSTs that tiny no-op PRG, so on leak-prone firmware every probe costs one more attachment. Never poll it in a retry loop on such a device: a health check used to "wait for the runner to come back" is the fastest way to finish filling the `/Temp` that wedged it.
+**`runner_health_check()` is itself a body-carrying call** — it POSTs that tiny no-op PRG, so on leak-prone firmware every probe costs one more attachment. Never poll it in a retry loop on such a device: a health check used to "wait for the runner to come back" is the fastest way to add attachments to the `/Temp` accumulation that crashed it.
 
 **Caveat — `recover()`'s liveness probe is REST-only.** It declares success the moment REST answers, so for wedges that live *below* REST (FPGA / REU / DMA / UCI state, where REST typically stays healthy throughout) it returns `"reset"` without fixing anything, and the next run wedges identically. For FPGA-tier symptoms call `client.reboot()` directly instead of `recover()`. Known worst case: the UCI STATE-bit wedge after sustained `SOCKET_WRITE` (issue #112) survives even `reboot()` — fail fast and require a physical power-cycle rather than papering over it with a retry loop.
 
