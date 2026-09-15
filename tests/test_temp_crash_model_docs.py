@@ -351,6 +351,8 @@ class TestTheRulesCanFail:
         # Review round 3 (D2): the turbo bench docstring's old wording, a dot inside "CLAUDE.md".
         "That is 12 attachments against a budget the standing hardware-safety clause in "
         "CLAUDE.md says to treat as a handful.",
+        # Needs the wide gap: 90 characters, crossing the dot in "CLAUDE.md" (mutant G).
+        "The budget the standing hardware-safety clause in CLAUDE.md describes is a handful.",
     ])
     def test_a_count_guess_is_flagged(self, text: str) -> None:
         assert "count before a crash" in {r for r, _ in count_and_figure_problems(text)}, text
