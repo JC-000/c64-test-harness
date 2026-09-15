@@ -13,6 +13,11 @@ be seen by the next test of another file, just as it can between lanes.  The
 90 s per-file subprocess timeout also includes that child's per-test waits
 behind the other workers' tests and behind other lanes.
 
+**Locking is per test, not per run**, and that is deliberate beyond #323 (#324):
+the client drains ``/Temp`` from a lock-release callback that fires only on the
+outermost release, so any whole-run hold would defer every per-test drain on a
+leak-prone device to the end of the run.  See ``docs/device_locking.md`` rule 1.
+
 It used to take ``DeviceLock(host)`` in the pool worker before launching
 pytest.  The child's guard then queued on the flock its own parent held --
 ``allow_nested`` joins holds within one process only -- and, with the parent
