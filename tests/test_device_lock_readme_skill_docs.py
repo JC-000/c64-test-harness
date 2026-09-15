@@ -21,6 +21,20 @@ and its qualifier in another does not count):
   states the grace *value* (from the constant; the bare name is not a
   value) and cites ``docs/device_locking.md``.
 
+* **no invented ceiling** -- no paragraph calls 120 s a ceiling.  Nothing
+  in ``device_lock.py`` or ``unified_manager.py`` defines one, and it
+  contradicted the budget text (review round 1).
+
+In README and SKILL.md each default is **bound to its call**: the figure
+must be the first number after ``acquire(...)`` / ``create_manager(...)``,
+within 60 non-digit characters, so swapping the two figures fails.
+
+**Scope, stated rather than implied.**  This pins the presence and binding
+of the claims above and nothing else.  Any *other* claim added to these
+paragraphs (a wrong NaN rule, a wrong progress interval) passes here;
+``docs/device_locking.md`` is the source of truth and
+``test_device_lock_timeout_budget.py`` pins that document.
+
 Vacuity guard: every scanned file exists and is non-empty.  Positive
 control: :class:`TestThePinCanFail` strips each qualifier from a
 passing paragraph and requires the checker to flag it.
@@ -72,6 +86,26 @@ def _seconds(value: float) -> re.Pattern[str]:
     return re.compile(rf"(?<![\d.]){re.escape(whole)}(?:\.0+)?\s?(?:s\b|seconds?\b)")
 
 
+def _bound(call: str, value: float) -> re.Pattern[str]:
+    """*value* in seconds as the first figure after ``call(...)``.
+
+    At most 60 non-digit characters between the call and the figure: no other number may sit
+    in between, so ``acquire() waits 60 s ... create_manager() 30 s`` does
+    not bind 30 s to ``acquire``.
+    """
+    whole = f"{value:g}"
+    return re.compile(
+        rf"\b{re.escape(call)}\([^)]*\)[^\d]{{0,60}}"
+        rf"(?<![\d.]){re.escape(whole)}(?:\.0+)?\s?(?:s\b|seconds?\b)"
+    )
+
+
+_INVENTED_CEILING = re.compile(
+    r"(?<![\d.])120(?:\.0+)?\s?s\b[^.]{0,40}\bceiling|\bceiling[^.]{0,40}(?<![\d.])120(?:\.0+)?\s?s\b",
+    re.IGNORECASE,
+)
+
+
 def doc_problems(text: str, *, defaults: bool) -> list[str]:
     paras = _paragraphs(text)
     problems = []
@@ -85,8 +119,8 @@ def doc_problems(text: str, *, defaults: bool) -> list[str]:
                 return False
             if defaults:
                 return bool(
-                    _seconds(dl.DEFAULT_ACQUIRE_TIMEOUT).search(p)
-                    and _seconds(um.DEFAULT_LOCK_TIMEOUT).search(p)
+                    _bound("acquire", dl.DEFAULT_ACQUIRE_TIMEOUT).search(p)
+                    and _bound("create_manager", um.DEFAULT_LOCK_TIMEOUT).search(p)
                 )
             return True
 
@@ -108,6 +142,9 @@ def doc_problems(text: str, *, defaults: bool) -> list[str]:
         problems.append(
             f"no cross-thread rescue paragraph states the {GRACE:g} s grace and cites {CITE}"
         )
+    for p in paras:
+        if _INVENTED_CEILING.search(p):
+            problems.append(f"claims a 120 s ceiling nothing defines: {p[:160]}")
     return problems
 
 
@@ -181,6 +218,49 @@ class TestThePinCanFail:
         )
         assert drifted != self.PASSING
         assert any("defaults" in p for p in doc_problems(drifted, defaults=True))
+
+    def test_swapped_defaults_are_flagged(self) -> None:
+        """Review round 1: numbers present but bound to the wrong calls."""
+        a, m = dl.DEFAULT_ACQUIRE_TIMEOUT, um.DEFAULT_LOCK_TIMEOUT
+        assert a != m, "the swap control needs two different defaults"
+        swapped = self.PASSING.replace(
+            f"acquire() waits {a:g} s and create_manager() {m:g} s",
+            f"acquire() waits {m:g} s and create_manager() {a:g} s",
+        )
+        assert swapped != self.PASSING, "the swap changed nothing"
+        assert any("defaults" in p for p in doc_problems(swapped, defaults=True))
+
+    @pytest.mark.parametrize("call", ["acquire()", "create_manager()"])
+    def test_a_wrong_first_figure_is_flagged_per_call(self, call: str) -> None:
+        """The figure must be the *first* one after the call.
+
+        Isolates each half of the binding: the swap control above is killed
+        by either half alone, so a binding that let ``acquire()`` reach past
+        a wrong figure to the right one survived it (mutation M11).
+        """
+        value = {"acquire()": dl.DEFAULT_ACQUIRE_TIMEOUT,
+                 "create_manager()": um.DEFAULT_LOCK_TIMEOUT}[call]
+        right = f"{call} waits {value:g} s" if call == "acquire()" else f"{call} {value:g} s"
+        wrong = right.replace(f"{value:g} s", f"{value * 3:g} s (formerly {value:g} s)")
+        mangled = self.PASSING.replace(right, wrong)
+        assert mangled != self.PASSING, f"the mangle for {call} changed nothing"
+        assert any("defaults" in p for p in doc_problems(mangled, defaults=True))
+
+    @pytest.mark.parametrize(
+        "claim",
+        [
+            "default 60 s and 120 s ceiling for ad-hoc work.",
+            "120 s is a reasonable ceiling for ad-hoc work.",
+            "a ceiling of 120.0 s applies.",
+        ],
+    )
+    def test_an_invented_ceiling_is_flagged(self, claim: str) -> None:
+        planted = self.PASSING + "\n\n" + claim
+        assert any("ceiling" in p for p in doc_problems(planted, defaults=True))
+        # ...while a plain 120 s timeout in an example is not a claim.
+        assert doc_problems(
+            self.PASSING + "\n\nlock.acquire_or_raise(timeout=120.0)", defaults=True
+        ) == []
 
     def test_the_bare_constant_name_is_not_the_grace(self) -> None:
         named = self.PASSING.replace(f"{GRACE:.1f} s", "_SELF_HELD_WAIT_GRACE")

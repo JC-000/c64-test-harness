@@ -681,7 +681,7 @@ def transport():
         lock.release()
 ```
 
-**`UnifiedManager` path:** `_LockedU64Manager.acquire()` now raises `DeviceLockTimeout` (previously a bare `RuntimeError`). `lock_timeout` bounds against **wedged or dead** holders only — the heartbeat makes live holders extend the deadline implicitly. 120 s is a reasonable ceiling for ad-hoc work; the historic "long benches need 1800 s" guidance no longer applies (see anti-patterns).
+**`UnifiedManager` path:** `_LockedU64Manager.acquire()` now raises `DeviceLockTimeout` (previously a bare `RuntimeError`). `lock_timeout` bounds against **wedged or dead** holders only — the heartbeat makes live holders extend the deadline implicitly. The historic "long benches need 1800 s" guidance no longer applies (see anti-patterns).
 
 ```python
 from c64_test_harness import create_manager, DeviceLockTimeout
