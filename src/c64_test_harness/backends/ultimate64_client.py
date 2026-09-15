@@ -993,6 +993,10 @@ class Ultimate64Client:
                 self._own_temp_attachments = 0
             self._own_temp_attachments += count
             ledger.pending += count
+            if self.temp_hygiene_armed:
+                # So the ledger can still sweep these if every client that
+                # counted them is collected before the lock release.
+                ledger.armed_pending = True
 
     def _uncount_temp_attachments(self, count: int, generation: int) -> None:
         """Refund a reservation that was not sent, unless a sweep since

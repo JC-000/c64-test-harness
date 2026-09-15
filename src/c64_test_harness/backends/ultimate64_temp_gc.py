@@ -378,12 +378,21 @@ class TempLedger:
         self.blocked: str | None = None
         #: One attempt per device per process at enabling FTP File Service.
         self.ftp_enable_attempted = False
+        #: Whether an **armed** client counted any of :attr:`pending`. Lets a
+        #: lock release sweep the device after every client that leaked has
+        #: been garbage-collected, without sweeping for a disarmed or
+        #: post-safe client's attachments.
+        self.armed_pending = False
+        #: The host string of the most recently attached client, for that
+        #: orphaned sweep.
+        self.host: str | None = None
         self._clients: weakref.WeakSet = weakref.WeakSet()
 
     def attach(self, client: object) -> None:
         """Remember *client* weakly, so a lock release can pick a drainer."""
         with self.lock:
             self._clients.add(client)
+            self.host = getattr(client, "host", None) or self.host
 
     def clients(self) -> list:
         with self.lock:
@@ -394,6 +403,7 @@ class TempLedger:
         with self.lock:
             self.pending = 0
             self.blocked = None
+            self.armed_pending = False
             self.generation += 1
 
     def drain_on_lock_release(self, reason: str = "device lock release") -> bool:
@@ -407,6 +417,14 @@ class TempLedger:
         armed, then leaked but not yet armed (whose drain re-probes first),
         then the rest. The first client whose drain attempts a pass or sweep
         ends the loop. Never raises.
+
+        **When no live client attempts one** but armed clients counted
+        attachments that are still pending (they were garbage-collected
+        before the release), the ledger sweeps the device itself with the
+        default FTP settings. A failure writes no config: no client is left
+        to write it for. It logs a WARNING and blocks later
+        attachment-creating requests to the device until a sweep succeeds,
+        as a leaking client's failed pass would.
         """
         with self.lock:
             candidates = []
@@ -427,7 +445,26 @@ class TempLedger:
                         "U64 /Temp release drain on %s raised (%s: %s); ignored",
                         self.key, type(exc).__name__, exc,
                     )
-            return False
+            if not (self.pending > 0 and self.armed_pending and self.host):
+                return False
+            try:
+                result = gc_temp_folder(self.host)
+            except Exception as exc:  # noqa: BLE001 - a release must never fail
+                result = TempGCResult(host=self.host, error=f"{type(exc).__name__}: {exc}")
+            if result.ok:
+                self.collected()
+                return True
+            self.blocked = str(result.error or "unknown FTP failure")
+            _log.warning(
+                "U64 /Temp release drain on %s: no live client was left to drain, "
+                "and sweeping the %d uncollected attachment(s) it counted failed "
+                "(%s). No config was written. Later attachment-creating requests "
+                "to this device are refused until a sweep succeeds; enable FTP "
+                "File Service on the device or power-cycle it. See "
+                "docs/u64_recovery.md.",
+                self.host, self.pending, self.blocked,
+            )
+            return True
 
 
 _TEMP_LEDGERS: dict[str, TempLedger] = {}

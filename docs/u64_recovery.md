@@ -371,6 +371,16 @@ address, because that needs DNS; use one spelling per device. So:
 - Whether a drain may take the leaking-lane path (the FTP-enable attempt,
   the block) is still decided by that client's own uncollected share. A
   client that leaked nothing never writes config.
+- **A leak outlives its client.** Release callbacks hold nothing strongly,
+  so before the ledger a client that leaked and was garbage-collected
+  before the lock release never drained. The ledger outlives its clients:
+  if no live client attempts a drain, but armed clients counted
+  attachments that are still pending, the ledger sweeps the device itself
+  with the default FTP settings.
+  - On failure it writes no config, logs a WARNING and blocks later
+    attachment-creating requests until a sweep succeeds.
+  - Attachments counted only by disarmed or post-safe clients are never
+    swept this way.
 
 **Cross-process accounting is still open.** Two processes against one
 device keep two ledgers, and each spends a budget. The hand-off between

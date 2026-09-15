@@ -421,6 +421,52 @@ def test_a_client_that_leaked_nothing_writes_no_config_even_with_device_pending(
     assert idle.pending_temp_attachments == 2
 
 
+def test_a_leak_whose_clients_were_collected_still_drains_on_release(host, tmp_path, caplog):
+    """Release callbacks hold nothing strongly, so before the ledger a client
+    that leaked and was garbage-collected before the lock release never
+    drained (review note on #406).  The ledger outlives its clients and
+    sweeps the device itself when no live client can."""
+    leaker = _client(host)
+    with _FTP() as ftp:
+        leaker.run_prg(PRG)
+        leaker.run_prg(PRG)
+        del leaker
+        _pygc.collect()
+        _release_lock(host, tmp_path)
+    assert ftp.hosts == [host]
+    assert _client(host).pending_temp_attachments == 0
+
+
+def test_an_orphaned_drain_that_fails_keeps_the_count_blocks_and_writes_no_config(host, tmp_path, caplog):
+    leaker = _client(host, temp_gc_budget=6)
+    with _FTP(default=REFUSED) as ftp, _no_config_writes() as set_item:
+        leaker.run_prg(PRG)
+        del leaker
+        _pygc.collect()
+        with caplog.at_level("WARNING"):
+            _release_lock(host, tmp_path)
+        assert ftp.hosts == [host]
+        set_item.assert_not_called()
+        later = _client(host)
+        assert later.pending_temp_attachments == 1
+        with pytest.raises(Ultimate64TempHygieneError):
+            later.run_prg(PRG)
+    assert any("no live client" in r.getMessage() for r in caplog.records)
+
+
+def test_an_orphaned_leak_from_a_disarmed_or_post_safe_client_is_not_swept(host, tmp_path):
+    fixed = _client(host, FIXED)
+    quiet = _client(host + "-q", temp_hygiene=False)
+    with _FTP() as ftp:
+        fixed.run_prg(PRG)
+        quiet.run_prg(PRG)
+        del fixed, quiet
+        _pygc.collect()
+        _release_lock(host, tmp_path)
+        _release_lock(host + "-q", tmp_path)
+    assert ftp.hosts == []
+
+
 def test_post_safe_devices_never_sweep_or_block_across_clients(host, tmp_path):
     with _FTP(default=REFUSED) as ftp, _no_config_writes() as set_item:
         for _ in range(5):
