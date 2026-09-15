@@ -37,7 +37,12 @@ survived as a token check, because the unit repeats "reset()", "settle",
 located unit, so a unit that carries those tokens but garbles the claim
 passes; the absence rule matches only the verb phrases in :data:`_OVERCLAIM`,
 plus a ``reset()``/``reboot()`` "clears" in a sentence that names the STATE-bit
-wedge (``STATE-bit``, ``uci_wedge_probe`` or ``$DF1C``).  The review-round-1
+wedge (``STATE-bit``, ``uci_wedge_probe`` or ``$DF1C``), and "the reset is
+required/needed" or "needs a reset()" in a sentence that names Auto or
+``Cartridge Preference``.  Round 2 adds phrase needs for the evidence grades:
+SKILL's "unmeasured; the reset is a precaution, not a known requirement" and
+its source-read note on the external-cartridge cause, and PATTERNS's "(the
+measured sequence; see SKILL 15)".  The review-round-1
 phrase needs (#359 result, C64U unmeasured, the harness leaves the preference
 alone, ``Command Interface`` still Enabled, reset/reboot do not clear the
 wedge, zero ``/Temp``, raises before writing, ``uci_probe`` does not pre-check,
@@ -102,15 +107,22 @@ REF_NEVER_CHANGES = re.compile(r"the harness never changes it for you")
 NO_PRECHECK = re.compile(r"uci_probe does not pre-check \(check_identifier=False\)")
 PATTERNS_RESULT = re.compile(r"0/3 on External against 3/3 on Auto")
 STILL_YOURS = re.compile(r"the reset and settle are still yours")
+# Review round 2 (#413, reviewer-3 S7/S8/S9/P3b): the evidence grades.
+PRECAUTION = re.compile(r"puts the slot back on the bus — unmeasured; "
+                        r"the reset is a precaution, not a known requirement")
+SOURCE_READ_CAUSE = re.compile(r"\(source-read, c64\.cc ConfigureU64SystemBus: under Auto only a "
+                               r"cartridge the detect lines see; #359's RR-Net under Auto did not\)")
+MEASURED_SEQUENCE = re.compile(r"then reset\(\) and settle \(the measured sequence; see SKILL 15\)")
 
 #: What the unit that names the error must carry: a literal token or a phrase.
 SKILL_TOKENS = ("External", "#359", "Command Interface", "$C9",
                 REMEDY, SHARING, WEDGE_LIMIT, RESULT_359, NOT_MEASURED_C64U,
-                SKILL_NO_CHANGE, STILL_ENABLED, DO_NOT_CLEAR)
+                SKILL_NO_CHANGE, STILL_ENABLED, DO_NOT_CLEAR, PRECAUTION, SOURCE_READ_CAUSE)
 REFERENCE_TOKENS = ("UCIError", "$DF1D", "bodyless", "/Temp", "uci_probe", ATTRIBUTES,
                     ZERO_TEMP, BEFORE_WRITTEN, REF_NEVER_CHANGES, NO_PRECHECK)
 PATTERNS_RRNET_HEADING = "### Hardware RR-Net on the U64"
-PATTERNS_TOKENS = (ERROR, "UCI", REMEDY, STILL_ENABLED, PATTERNS_RESULT, STILL_YOURS)
+PATTERNS_TOKENS = (ERROR, "UCI", REMEDY, STILL_ENABLED, PATTERNS_RESULT, STILL_YOURS,
+                   MEASURED_SEQUENCE)
 
 
 def _has(unit: str, need) -> bool:
@@ -150,9 +162,21 @@ _RESET_CLEARS = re.compile(
 )
 
 
+#: The reset after the preference PUT stated as a requirement (review round 2):
+#: #359 measured PUT + reset + settle, and by source the PUT alone moves the bus.
+#: Gated on the preference being named in the sentence.
+_PREFERENCE_SUBJECT = re.compile(r"\bAuto\b|Cartridge Preference", re.IGNORECASE)
+_RESET_REQUIRED = re.compile(
+    r"\b(?:the )?reset(?:\(\))? (?:is|are|was) (?:still |always )?(?:required|needed|necessary|mandatory)\b"
+    r"|\b(?:requires|needs) (?:a )?reset\(\)",
+    re.IGNORECASE,
+)
+
+
 def overclaims(text: str) -> list[str]:
     return [s for s in re.split(r"(?<=[.!?])\s+", _flat(text))
-            if _OVERCLAIM.search(s) or (_WEDGE_SUBJECT.search(s) and _RESET_CLEARS.search(s))]
+            if _OVERCLAIM.search(s) or (_WEDGE_SUBJECT.search(s) and _RESET_CLEARS.search(s))
+            or (_PREFERENCE_SUBJECT.search(s) and _RESET_REQUIRED.search(s))]
 
 
 def test_the_skill_files_exist() -> None:
@@ -199,12 +223,14 @@ def _real_units() -> dict[str, tuple[list[str], tuple]]:
 _PHRASE_NEEDS = [("SKILL.md", REMEDY), ("SKILL.md", SHARING), ("SKILL.md", WEDGE_LIMIT),
                  ("SKILL.md", RESULT_359), ("SKILL.md", NOT_MEASURED_C64U),
                  ("SKILL.md", SKILL_NO_CHANGE), ("SKILL.md", STILL_ENABLED),
-                 ("SKILL.md", DO_NOT_CLEAR),
+                 ("SKILL.md", DO_NOT_CLEAR), ("SKILL.md", PRECAUTION),
+                 ("SKILL.md", SOURCE_READ_CAUSE),
                  ("REFERENCE.md", ATTRIBUTES), ("REFERENCE.md", ZERO_TEMP),
                  ("REFERENCE.md", BEFORE_WRITTEN), ("REFERENCE.md", REF_NEVER_CHANGES),
                  ("REFERENCE.md", NO_PRECHECK),
                  ("PATTERNS.md", REMEDY), ("PATTERNS.md", STILL_ENABLED),
-                 ("PATTERNS.md", PATTERNS_RESULT), ("PATTERNS.md", STILL_YOURS)]
+                 ("PATTERNS.md", PATTERNS_RESULT), ("PATTERNS.md", STILL_YOURS),
+                 ("PATTERNS.md", MEASURED_SEQUENCE)]
 
 
 @pytest.mark.parametrize("name,need", _PHRASE_NEEDS, ids=lambda v: getattr(v, "pattern", v)[:24])
@@ -266,6 +292,8 @@ class TestThePinCanFail:
         "The identifier check clears a wedged device.",
         "It does not rule out a STATE-bit wedge (uci_wedge_probe; reboot() clears it).",
         "A UCI STATE-bit wedge in $DF1C: reset()/reboot() clears it.",
+        "Set the preference back to Auto; the reset is required before the first routine.",
+        "Putting Cartridge Preference back to Auto needs a reset() to take effect.",
     ])
     def test_an_overclaim_is_flagged(self, text: str) -> None:
         assert overclaims(text), text
@@ -277,6 +305,8 @@ class TestThePinCanFail:
         "It does not rule out a STATE-bit wedge (uci_wedge_probe; reset()/reboot() do not clear it).",
         "The running program has wedged the CPU. A soft reset() clears it instantly.",
         "reboot() clears REU/DMA stuck state.",
+        "Back to Auto, then reset(); the reset is a precaution, not a known requirement.",
+        "enable_uci's reset is required: every routine times out at the sentinel without it.",
     ])
     def test_the_correct_limit_is_not_an_overclaim(self, text: str) -> None:
         assert overclaims(text) == [], text
