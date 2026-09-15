@@ -36,8 +36,9 @@ The contract, as decided by the owner in #227:
   :data:`BASELINE_NEVER_TOUCH_BY_GENERATION` says whether each store
   exists on each generation and what its reason was read against.
   Categories the device does not list are skipped with a log line — the
-  C64 Ultimate's set differs (both devices' lists are recorded, with
-  their source, in :data:`BASELINE_RECORDED_CATEGORY_SETS`).
+  C64 Ultimate's set differs (both devices' lists and per-category item
+  counts are recorded, with their basis, in
+  :data:`BASELINE_RECORDED_CATEGORY_SETS`).
 * **Reset, then assert.**  On a shared device ``current != default`` at
   entry is the ordinary state whenever another lane is mid-run or just
   finished; that pre-reset drift is logged per item at INFO ("inherited
@@ -103,7 +104,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from ..config import U64_BASELINE_ON_ENTRY_ENV, resolve_baseline_on_entry_env
 from .ultimate64_client import Ultimate64Client, Ultimate64Error
@@ -127,6 +128,7 @@ __all__ = [
     "BASELINE_RECORDED_CATEGORY_SETS",
     "BASELINE_UNCLASSIFIED_CATEGORIES",
     "BaselineReport",
+    "CategoryItemCount",
     "RecordedCategorySet",
     "U64BaselineError",
     "apply_factory_baseline",
@@ -173,10 +175,26 @@ BASELINE_ON_ENTRY_DEFAULT_BY_GENERATION: dict[str, bool] = {
 #: The stores the entry reset covers, by canonical firmware name (the
 #: per-category route is a case-insensitive exact match for a name with
 #: no glob characters).  Machine, SID addressing, audio, drive, tape,
-#: printer, LED, modem and UI stores — twelve.  ``U64 Specific Settings``
+#: printer, LED, modem and UI stores, plus the two C64U-only stores
+#: ``Speaker Mixer`` and ``Keyboard Lighting``.  ``U64 Specific Settings``
 #: is included even though its ``effectuate()`` rewrites the CPU-speed
 #: registers unconditionally (owner decision, #227; the C64U UCI hazard
-#: is unestablished here).  Absent categories are skipped, not errors.
+#: is unestablished here).  Absent categories are skipped, not errors --
+#: which is what makes the two C64U-only stores no-ops on the U64E.
+#:
+#: ``Speaker Mixer`` and ``Keyboard Lighting`` are covered by owner decision
+#: 2026-09-15 (#310), on a source reading at tag 1.1.0 -- not a measurement;
+#: nobody has reset either on the device.  ``Speaker Mixer`` is compiled
+#: only under ``#if U64 == 2`` (``software/u64/u64_config.cc:433-449``) and
+#: its apply step only sets speaker enable, volume and pan
+#: (``u64_config.cc:1164-1199``); ``Keyboard Lighting``'s rewrites the
+#: keyboard LED registers (``software/u64/bling_board.cc:757-787``).
+#: Neither has a network, power-rail, detection or persistent-chip
+#: write-back path.  The C64U entry reset stays off by default, so they are
+#: reset only on a run that opts in with ``U64_BASELINE_ON_ENTRY=1``.
+#:
+#: Per-store item counts, per generation and with their basis, are in
+#: :data:`BASELINE_RECORDED_CATEGORY_SETS`.
 #: ``SID Sockets Configuration`` and ``Clock Settings`` are **not** here
 #: and can never be — see :data:`BASELINE_NEVER_TOUCH`.
 BASELINE_CATEGORIES: tuple[str, ...] = (
@@ -192,6 +210,8 @@ BASELINE_CATEGORIES: tuple[str, ...] = (
     "LED Strip Settings",
     "Modem Settings",
     "User Interface Settings",
+    "Speaker Mixer",
+    "Keyboard Lighting",
 )
 
 #: Stores the entry-baseline reset never resets and never asserts, each with
@@ -329,12 +349,47 @@ BASELINE_EXCLUDED_CATEGORIES: tuple[str, ...] = tuple(BASELINE_NEVER_TOUCH)
 
 
 @dataclass(frozen=True)
-class RecordedCategorySet:
-    """One device's ``GET /v1/configs`` category list, and where it came from.
+class CategoryItemCount:
+    """One category's REST-visible item count, and how it is known.
 
-    The category set is a compile-time property of a firmware build, so a
-    record is per generation *and* firmware: a store appearing in a newer
-    build's list is exactly what these records exist to make visible.
+    ``basis`` is ``("device-read",)``, ``("source-derived",)`` or both.  A
+    device read is one bodyless ``GET /v1/configs/<category>``; a source
+    derivation preprocesses the store's ``t_cfg_definition[]`` with the
+    target's own build flags and counts the five types ``emit_store``
+    emits (STRING, STRFUNC, STRPASS, ENUM, VALUE).  The count is a
+    compile-time property of the build (items are appended only when a
+    store is constructed), so ``firmware`` is part of the claim.
+    """
+
+    items: int
+    basis: tuple[str, ...]
+    firmware: str
+    date: str
+
+
+def _counted(
+    counts: Mapping[str, int], *, basis: tuple[str, ...], firmware: str, date: str
+) -> dict[str, CategoryItemCount]:
+    return {
+        cat: CategoryItemCount(items=n, basis=basis, firmware=firmware, date=date)
+        for cat, n in counts.items()
+    }
+
+
+@dataclass(frozen=True)
+class RecordedCategorySet:
+    """One device's ``GET /v1/configs`` category list and item counts.
+
+    The category set and the item counts are compile-time properties of a
+    firmware build, so a record is per generation *and* firmware: a store
+    appearing in a newer build's list, or an item count moving, is exactly
+    what these records exist to make visible.
+
+    ``totals`` holds ``covered`` / ``never_touch`` / ``neither`` / ``all``
+    item totals over this record's categories, bucketed by
+    :data:`BASELINE_CATEGORIES` and :data:`BASELINE_NEVER_TOUCH`;
+    ``counts_source`` says how the counts were obtained and ``residuals``
+    records what is known to disagree with them and is not resolved.
     """
 
     generation: str
@@ -343,20 +398,40 @@ class RecordedCategorySet:
     date: str
     source: str
     categories: frozenset[str]
+    item_counts: Mapping[str, CategoryItemCount]
+    totals: Mapping[str, int]
+    counts_source: str
+    residuals: str = ""
 
 
-#: The category list each device generation reports, each with its
-#: source.  The C64U record is a device listing taken verbatim, never
-#: projected from source; the U64E names were read directly on 2026-09-15
-#: (and earlier reconstructed from a per-category read and cross-checked
-#: against an older listing and the firmware source -- its ``source`` says
-#: which).  ``tests/test_entry_baseline.py`` asserts that every name in
-#: every record is classified (in :data:`BASELINE_CATEGORIES`,
-#: :data:`BASELINE_NEVER_TOUCH` or :data:`BASELINE_UNCLASSIFIED_CATEGORIES`),
-#: so a store a device lists without anyone having decided about it fails
-#: a test instead of being silently never reset.  When a firmware update
-#: changes a device's list, re-read it (one bodyless ``GET /v1/configs``,
-#: zero ``/Temp`` cost) and update the record's date and firmware too.
+#: **The one place the entry baseline's category lists and item counts
+#: live, per device generation.**  Docs cite this table by name instead of
+#: restating its figures: the item count moved four times in three days
+#: while it lived only in prose (#286, #288, #292; #342).
+#:
+#: Each record has its category list and source, then per category an item
+#: count with basis, firmware and date, then the covered / never-touch /
+#: neither / all totals.  The C64U category list is a device listing taken
+#: verbatim, never projected from source; the U64E names were read directly
+#: on 2026-09-15 (and earlier reconstructed from a per-category read and
+#: cross-checked against an older listing and the firmware source -- its
+#: ``source`` says which).  The U64E counts are device-read and match
+#: source; the C64U counts are **source-derived only, unverified** until a
+#: per-category read succeeds.  The counts are a derivation, not a
+#: literal to copy: re-derive them with the method each record's
+#: ``counts_source`` names (and a device read) rather than trusting the
+#: literal copies in the tests, which only catch an edit, not a wrong count.
+#:
+#: ``tests/test_entry_baseline.py`` asserts that every name in every record
+#: is classified (in :data:`BASELINE_CATEGORIES`, :data:`BASELINE_NEVER_TOUCH`
+#: or :data:`BASELINE_UNCLASSIFIED_CATEGORIES`), so a store a device lists
+#: without anyone having decided about it fails a test instead of being
+#: silently never reset.  It also asserts that each record's totals agree
+#: with those lists and with the sum of its per-category counts, and
+#: ``tests/test_entry_baseline_table_live.py`` compares a device against
+#: its record.  When a firmware update changes a device's list or counts,
+#: re-read them (bodyless GETs, zero ``/Temp`` cost) and update the record's
+#: firmware and date too.
 BASELINE_RECORDED_CATEGORY_SETS: dict[str, RecordedCategorySet] = {
     "ultimate": RecordedCategorySet(
         generation="ultimate",
@@ -366,7 +441,8 @@ BASELINE_RECORDED_CATEGORY_SETS: dict[str, RecordedCategorySet] = {
         source=(
             "category names reconstructed from the 2026-09-12 read-only "
             "per-category read (U64E fw 3.15, DeviceLock held; #288) -- 19 "
-            "categories = the twelve covered + the five never-touch + UltiSID "
+            "categories = the covered set as it then stood (12 stores) + the "
+            "five never-touch + UltiSID "
             "Configuration + Data Streams; no saved listing of the names.  "
             "Cross-checked against scripts/U64_DEVICE_PROBE.md section 5 "
             "(fw 3.14, 2026-04-05, 'all 19') and against firmware source at "
@@ -390,6 +466,48 @@ BASELINE_RECORDED_CATEGORY_SETS: dict[str, RecordedCategorySet] = {
             "LED Strip Settings", "Drive A Settings", "Drive B Settings",
             "Data Streams", "Modem Settings", "User Interface Settings",
         }),
+        item_counts=_counted(
+            {
+                "Audio Mixer": 21, "SID Sockets Configuration": 8,
+                "UltiSID Configuration": 8, "SID Addressing": 8,
+                "U64 Specific Settings": 27, "C64 and Cartridge Settings": 19,
+                "Clock Settings": 7, "SoftIEC Drive Settings": 2,
+                "Printer Settings": 11, "Network Settings": 14,
+                "Ethernet Settings": 5, "WiFi settings": 6, "Tape Settings": 1,
+                "LED Strip Settings": 8, "Drive A Settings": 14,
+                "Drive B Settings": 14, "Data Streams": 4, "Modem Settings": 16,
+                "User Interface Settings": 10,
+            },
+            basis=("device-read", "source-derived"),
+            firmware="3.15 (v3.15-85, 7f6fcb51)",
+            date="2026-09-15",
+        ),
+        totals={"covered": 151, "never_touch": 40, "neither": 12, "all": 203},
+        counts_source=(
+            "device-read 2026-09-15: one bodyless per-category GET on the U64E "
+            "(fw 3.15, fpga 125, core 1.4F; DeviceLock held; #342).  "
+            "The same per-category counts were reproduced from firmware source "
+            "at 7f6fcb51 (v3.15-85) -- first in #288's adversarial review, "
+            "against the 2026-09-12 read-only count, and again for #342: each "
+            "store's t_cfg_definition[] run through cc -E -P with the U64E "
+            "build flags (-DU64=1 -DDEVELOPER=0 -DCLOCK_FREQ=66666667, "
+            "target/u64/nios2/ultimate/Makefile:251), counting the five "
+            "REST-visible types STRING, STRFUNC, STRPASS, ENUM and VALUE "
+            "(route_configs.cc emit_store).  Two instruments, no per-category "
+            "delta"
+        ),
+        residuals=(
+            "Unexplained residual (#292): #276 records \"201 items compared\" "
+            "(category scope and firmware build not recorded) on the U64E on "
+            "2026-09-10, against this record's all-category total of 203.  The "
+            "candidates are a different counting basis or a different firmware "
+            "build: firmware source rules out drift within one build -- store "
+            "items are appended only when a store is constructed, and the REST "
+            "listing emits every item of the five value types -- except for "
+            "stores registered at runtime (the monitor-bookmarks store, the "
+            "per-device SID stores).  Nobody has established why.  Do not "
+            "average the two figures, and do not drop one"
+        ),
     ),
     "cbm": RecordedCategorySet(
         generation="cbm",
@@ -410,6 +528,50 @@ BASELINE_RECORDED_CATEGORY_SETS: dict[str, RecordedCategorySet] = {
             "Keyboard Lighting", "Drive A Settings", "Drive B Settings",
             "Data Streams", "Modem Settings", "User Interface Settings",
         }),
+        item_counts=_counted(
+            {
+                "Audio Mixer": 20, "Speaker Mixer": 11,
+                "SID Sockets Configuration": 8, "UltiSID Configuration": 8,
+                "SID Addressing": 8, "U64 Specific Settings": 22,
+                "C64 and Cartridge Settings": 19, "SoftIEC Drive Settings": 3,
+                "Printer Settings": 11, "Network Settings": 14,
+                "Ethernet Settings": 5, "WiFi settings": 5, "Tape Settings": 1,
+                "LED Strip Settings": 7, "Keyboard Lighting": 7,
+                "Drive A Settings": 13, "Drive B Settings": 13,
+                "Data Streams": 4, "Modem Settings": 16,
+                "User Interface Settings": 6,
+            },
+            basis=("source-derived",),
+            firmware="1.1.0 (tag 1.1.0 = 7b628eb1, u64ii target)",
+            date="2026-09-15",
+        ),
+        totals={"covered": 157, "never_touch": 32, "neither": 12, "all": 201},
+        counts_source=(
+            "SOURCE-DERIVED ONLY, UNVERIFIED: the C64U's item lists have never "
+            "been read on the device (a bodyless per-category GET costs zero "
+            "/Temp attachments; the device was unreachable when last "
+            "attempted).  Derived 2026-09-15 for #342 from firmware source at "
+            "tag 1.1.0 (7b628eb1): each store's t_cfg_definition[] run through "
+            "cc -E -P with the u64ii build flags from "
+            "target/u64ii/riscv/ultimate/Makefile:226 (-DRISCV -DU64=2 "
+            "-DUSB2513 -DOS -DCLOCK_FREQ=100000000 -DFP_SUPPORT=1 "
+            "-DCOMMODORE=1; no DEVELOPER), counting the five REST-visible types "
+            "STRING, STRFUNC, STRPASS, ENUM and VALUE.  Drive A and Drive B "
+            "each copy the one c1541_config array (drive/c1541.cc:44-65; the "
+            "constructor edits defaults, not the item list).  The same script "
+            "reproduces the U64E record exactly at 7f6fcb51, per category.  "
+            "The 194 quoted for this device before #342 was the same projection "
+            "with Keyboard Lighting (7 items, u64/bling_board.cc:42-51) left "
+            "out: that store calls cfg->hide(), which hides it from the "
+            "on-device menu only -- emit_store and GET /v1/configs do not "
+            "consult it, so it is REST-visible and counts.  The flags matter: "
+            "without -DCOMMODORE=1 User Interface Settings has 8 items, not 6"
+        ),
+        residuals=(
+            "This record's all-category total equals #276's U64E figure in the "
+            "#292 residual by coincidence -- a different device, firmware and "
+            "basis -- and bears on that residual not at all"
+        ),
     ),
 }
 
@@ -427,37 +589,6 @@ BASELINE_UNCLASSIFIED_CATEGORIES: dict[str, str] = {
     "Data Streams": (
         "both generations; outside the #227 covered set and never reviewed "
         "for it.  No firmware reading recorded here"
-    ),
-    "Speaker Mixer": (
-        "UNCLASSIFIED, C64U-ONLY (measured present on the C64U 2026-09-15, "
-        "absent from the U64E's list 2026-09-12).  Read from source at tag "
-        "1.1.0: compiled only under #if U64 == 2 "
-        "(software/u64/u64_config.cc:433-449); 11 ENUM items, Speaker Enable "
-        "default Enabled plus ten Vol items (:396-408).  effectuate_settings "
-        "calls enableDisableSpeaker then setSpeakerMixer (:443-447), which "
-        "toggle the ten Vol items' enabled flag and write 20 volume bytes to "
-        "the U64_SPEAKER_MIXER register block (:1164-1199).  No network, "
-        "power-rail, detection or chip write-back path was found, so a reset "
-        "(software/components/config.cc:567-576, then effectuate via "
-        "software/api/route_configs.cc:357-361) reads as an audible "
-        "speaker-level change only -- a source reading, not a measurement; "
-        "classification is the owner's call (#310)"
-    ),
-    "Keyboard Lighting": (
-        "UNCLASSIFIED, C64U-ONLY (measured present on the C64U 2026-09-15, "
-        "absent from the U64E's list 2026-09-12).  Read from source at tag "
-        "1.1.0: software/u64/bling_board.cc, built by "
-        "target/u64ii/riscv/ultimate/Makefile:151; the store is registered "
-        "unconditionally from the BlingBoard constructor (:26-30, :156) and "
-        "hidden from the menu (:165), which does not hide it from REST.  "
-        "7 items (:42-51: LedStrip Mode default 'Default', Auto SID Mode, "
-        "Pattern, SID Select, Strip Intensity, Fixed Color, Color tint).  "
-        "BlingBoard::effectuate_settings (:757-787) copies the items into "
-        "members and rewrites the LED map registers at U64II_BLINGBOARD_LEDS "
-        "(MapSingleColor / ConfigurePattern).  No network, power-rail or "
-        "persistent-chip path was found; a reset reads as a keyboard-LED "
-        "change only -- a source reading, not a measurement; classification "
-        "is the owner's call (#310)"
     ),
 }
 
@@ -831,16 +962,18 @@ def apply_factory_baseline(
 ) -> BaselineReport:
     """Reset the covered categories to factory default, then assert it.
 
-    Twelve categories are requested; those the device does not list are
-    skipped silently.  Per category actually present: one category GET (the
-    values before), one ``PUT /v1/configs/<category>:reset_to_default``,
-    then one item GET per item for its ``current`` and ``default``.
+    Every :data:`BASELINE_CATEGORIES` store is requested; those the device
+    does not list are skipped with a log line.  Per category actually
+    present: one category GET (the values before), one
+    ``PUT /v1/configs/<category>:reset_to_default``, then one item GET per
+    item for its ``current`` and ``default``.
     **The total request count is therefore device-dependent and has only
     been observed on the U64E** -- the C64U's category list was read once
-    (2026-09-15, 20 categories, :data:`BASELINE_RECORDED_CATEGORY_SETS`)
-    but its item lists have never been read, so any figure quoted for the
-    Ultimate line (such as the one in ``PATTERNS.md``) does not carry over
-    to the CBM line.  Every one of
+    (2026-09-15, 20 categories) but its item lists have never been read, so
+    any figure quoted for the Ultimate line does not carry over to the CBM
+    line.  Both generations' per-category item counts, with their basis
+    (device-read on the U64E, source-derived only on the C64U), are in
+    :data:`BASELINE_RECORDED_CATEGORY_SETS`.  Every one of
     those requests carries **no body at all**, and ``attachment_writer``
     returns ``NULL`` for a body-less request before constructing any
     ``TempfileWriter`` -- an explicit zero-length branch
