@@ -220,7 +220,9 @@ def test_scratch_restored_is_none_when_the_check_is_not_asked():
     [(500, b"")],                                   # E1: restore PUT answers 500
     [TimeoutError("restore timed out")],            # E2: restore PUT raises
     [(200, b"{}"), (200, _P)],                      # restore landed nowhere: read-back still inverted
-], ids=["restore-put-500", "restore-put-raises", "restore-readback-wrong"])
+    [(200, b"{}"), http.client.IncompleteRead(b"x")],  # restore PUT ok, read-back raises HTTPException
+], ids=["restore-put-500", "restore-put-raises", "restore-readback-wrong",
+        "restore-readback-incompleteread"])
 def test_a_failed_restore_is_reported_not_healthy(restore_steps, caplog):
     """#429 review (MAJOR 2): the scratch span still holds the inverted bytes.
 
@@ -312,7 +314,8 @@ def test_memory_safety_doc_names_the_write_check_in_every_transient_passage():
 
 def test_readme_and_patterns_say_the_write_check_needs_the_device_lock():
     """#429 review (4)."""
-    for rel in ("README.md", ".claude/skills/c64-test/PATTERNS.md"):
+    for rel in ("README.md", ".claude/skills/c64-test/PATTERNS.md",
+                ".claude/skills/c64-test/SKILL.md"):
         flat = _doc(rel)
         i = flat.index("check_write=True")
         window = flat[max(0, i - 300): i + 600]
