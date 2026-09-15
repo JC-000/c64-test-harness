@@ -22,9 +22,15 @@ firmware crashes" are one failure, not rival models.  This pin's job:
   numbered count came back beside one ('The "~15 uploads" wedge ... is where
   one reproduction stopped, not a bound').  The ruling is that no guess is
   kept, retired or not;
-* **the wrong model** (#386): "a crash, not a full filesystem", "nowhere near
-  exhaustion", "capacity is not what fails", '"fills up" is the wrong model'
-  -- each sets filling against crashing, which the ruling makes one thing;
+* **the wrong model** (#386): "a crash, not a full filesystem", "rather than a
+  full filesystem", "nowhere near exhaustion", "anywhere near full", "far from
+  full", "/Temp does not fill", "never fills up", "capacity is not what fails"
+  / "is not the failure", "nothing to do with capacity", '"fills up" is the
+  wrong model' -- each sets filling against crashing, which the ruling makes
+  one thing.  **Only in a /Temp paragraph** (:data:`_TEMP_PARAGRAPH`: /Temp,
+  attachment, writemem, unpatched, leak-prone, #686), because "nowhere near
+  full speed" and "not a full folder dump" are ordinary prose elsewhere
+  (review round 1); "full speed" and "full disk image" are excluded even there;
 * **the stale RAM-disk figures** (#261): "3 MB"/"3 MiB", "31%", "945 KB",
   "3 * 1024 * 1024", unless "stale", "corrected", "used to claim" or "#261"
   sits within :data:`STALE_WINDOW` characters of the figure.
@@ -65,6 +71,11 @@ already stuck.").  A number of
 attachments or writemem, because "a budget denominated in 6502 cycles" is
 ordinary prose elsewhere.  A count spelled some other way ("a score of runs")
 is not caught.
+The wrong-model rule has its own limits, asserted both ways in the same class:
+without a /Temp word anywhere in its paragraph, "It is a crash rather than a
+full filesystem." is **not** caught; inside one, "The listing is not a full
+folder dump." and "A bodyless PUT never fills /Temp." **are** flagged although
+neither sets filling against crashing.
 """
 from __future__ import annotations
 
@@ -149,10 +160,15 @@ _HANDFUL_BOUND = re.compile(
 )
 #: Filling set against crashing (#386): the ruling makes them one failure.
 _WRONG_MODEL = re.compile(
-    r"\bnot (?:a |because of a )?full (?:file ?system|folder|disk|RAM disk)\b"
-    r"|\bnowhere near (?:exhaustion|full)\b"
-    r"|\bcapacity is not what fails\b"
-    r"|\bfills? up\W{0,3}\s+is the wrong model\b",
+    r"\bnot (?:a |because of a )?full (?:file ?system|folder|disk(?!\s+image)|RAM disk)\b"
+    r"|\brather than (?:a )?full\b"
+    r"|\b(?:nowhere|anywhere) near (?:exhaustion\b|full\b(?!\s+speed))"
+    r"|\bfar from full\b(?!\s+speed)"
+    r"|\bdoes(?:n't| not) (?:actually )?fill\b"
+    r"|\bnever (?:\w+ )?fills?\b"
+    r"|\bcapacity (?:is|was) (?:not|never) (?:what (?:fails|failed)|the failure)\b"
+    r"|\bnothing to do with capacity\b"
+    r"|\b(?:fills?|filling) up\W{0,3}\s+(?:is|was) the wrong model\b",
     re.IGNORECASE,
 )
 _STALE = re.compile(r"\b3\s*Mi?B\b|\b31\s*%|\b945\s*KB\b|3 \* 1024 \* 1024", re.IGNORECASE)
@@ -204,7 +220,7 @@ def count_and_figure_problems(text: str) -> list[tuple[str, str]]:
         for sentence in _sentences(paragraph):
             if _states_a_count(sentence, paragraph):
                 out.append(("count before a crash", sentence))
-            if _WRONG_MODEL.search(sentence):
+            if _WRONG_MODEL.search(sentence) and _TEMP_PARAGRAPH.search(paragraph):
                 out.append(("filling set against crashing", sentence))
         if _stale_unmarked(paragraph):
             out.append(("stale figure", paragraph))
@@ -302,8 +318,11 @@ def test_a_count_planted_into_a_real_file_is_flagged() -> None:
     assert _PLANT_ANCHOR in text, "the PATTERNS /Temp sentence the plant is spliced after is gone"
     assert count_and_figure_problems(text) == []
     anchor_end = text.index(".", text.index(_PLANT_ANCHOR)) + 1
+    rules_fired: set[str] = set()
     for planted in ("Stay within 15 uploads.", "Fifteen POSTs wedge it.",
-                    "The /Temp RAM disk is 3 MiB."):
+                    "The /Temp RAM disk is 3 MiB.",
+                    # reviewer-4: the wrong-model rule shown firing on real scanned text.
+                    "/Temp does not fill; the firmware crashes."):
         spliced = text[:anchor_end] + " " + planted + text[anchor_end:]
         assert spliced.count("\n\n") == text.count("\n\n"), "the plant opened a new paragraph"
         found = count_and_figure_problems(spliced)
@@ -311,6 +330,15 @@ def test_a_count_planted_into_a_real_file_is_flagged() -> None:
         assert any(planted in excerpt for _, excerpt in found), (
             f"planted {planted!r} into PATTERNS.md was not flagged: {found}"
         )
+        rules_fired.update(rule for rule, excerpt in found if planted in excerpt)
+    # Every rule is shown firing on real text: dropping a plant is not silent.
+    assert rules_fired == {"count before a crash", "filling set against crashing", "stale figure"}, (
+        rules_fired
+    )
+
+
+#: A /Temp subject for the paragraph a wrong-model control sits in.
+_IN_TEMP = "Uncollected writemem attachments accumulate in /Temp. "
 
 
 class TestTheRulesCanFail:
@@ -370,6 +398,17 @@ class TestTheRulesCanFail:
         "Nobody knows how many uploads an unpatched device survives.",
         "A device approaching /Temp exhaustion is slow.",
         "No count of uploads before the crash is known or kept.",
+        "A full /Temp crashes the firmware.",
+        "Accumulated attachments fill /Temp, and a full /Temp crashes the firmware.",
+        "The old guess about uploads before a crash is retired.",
+        # The #386 ruling, verbatim.
+        "When /Temp is filled then the device firmware crashes. the c64 appears to continue "
+        "to run but the rest api becomes unresponsive and the local firmware menu switch no "
+        "longer has an effect. This is the outcome of the writemem garbage collection issue "
+        "on unpatched firmware.",
+        "this was a guess about the writemem exhaustion issue. Now that we know the actual "
+        "cause we should not maintain guesses about the number of runs before an unpatched "
+        "device crashes.",
         # The wrong-model rule's near misses in the real corpus.
         "Its duration is still not a capacity measurement.",
         "The bisection ends up nowhere near the actual root cause.",
@@ -419,9 +458,45 @@ class TestTheRulesCanFail:
         "Capacity is not what fails.",
         '"Fills up" is the wrong model.',
         "It crashed, not because of a full folder.",
+        # Review round 1 (reviewer-2): near-variants that escaped.
+        "/Temp does not fill; the firmware crashes.",
+        "/Temp doesn't fill; the firmware crashes.",
+        '"Fills up" was the wrong model.',
+        "Filling up is the wrong model; the firmware crashes.",
+        "It is a crash rather than a full filesystem.",
+        "It crashes long before /Temp is anywhere near full.",
+        "The folder never actually fills up before the crash.",
+        "Capacity was never what failed.",
+        # Review round 1 (reviewer-4).
+        "It is a firmware crash rather than a full filesystem.",
+        "The wedge has nothing to do with capacity.",
+        "Capacity is not the failure; the firmware crashes.",
+        "The disk was far from full when it crashed.",
     ])
     def test_filling_set_against_crashing_is_flagged(self, text: str) -> None:
-        assert "filling set against crashing" in {r for r, _ in count_and_figure_problems(text)}, text
+        found = count_and_figure_problems(_IN_TEMP + text)
+        assert "filling set against crashing" in {r for r, _ in found}, text
+
+    @pytest.mark.parametrize("text", [
+        # Ordinary prose the ungated rule flagged (review round 1, reviewer-2);
+        # the rule still matches each, so the /Temp gate is what passes it.
+        "The listing is not a full folder dump.",
+        "The REU is nowhere near full after the test.",
+        "The partial read is not a full RAM disk snapshot.",
+    ])
+    def test_wrong_model_shapes_outside_a_temp_paragraph_pass(self, text: str) -> None:
+        assert _WRONG_MODEL.search(text), f"the gate is not what passes {text!r}"
+        assert count_and_figure_problems(text) == [], text
+
+    @pytest.mark.parametrize("text", [
+        # reviewer-2's other two: excluded by the rule itself, not only by the gate.
+        "At 1 MHz the loop runs nowhere near full speed.",
+        "The mount is not a full disk image, only a header.",
+        "The loop was far from full speed.",
+    ])
+    def test_speed_and_disk_image_pass_even_in_a_temp_paragraph(self, text: str) -> None:
+        assert count_and_figure_problems(text) == [], text
+        assert count_and_figure_problems(_IN_TEMP + text) == [], text
 
     @pytest.mark.parametrize("text", [
         "The /Temp RAM disk is ~3 MB.",
@@ -450,6 +525,24 @@ class TestTheDeclaredLimitsStayKnown:
     def test_a_declared_miss_is_not_caught(self, text: str) -> None:
         assert count_and_figure_problems(text) == [], (
             f"now caught: {text!r}; update the module docstring's declared limits"
+        )
+
+    def test_a_wrong_model_sentence_without_a_temp_subject_is_not_caught(self) -> None:
+        text = "It is a crash rather than a full filesystem."
+        assert "filling set against crashing" in {
+            r for r, _ in count_and_figure_problems(_IN_TEMP + text)}
+        assert count_and_figure_problems(text) == [], (
+            f"now caught: {text!r}; update the module docstring's declared limits"
+        )
+
+    @pytest.mark.parametrize("text", [
+        "The listing is not a full folder dump.",
+        "A bodyless PUT never fills /Temp.",
+    ])
+    def test_a_declared_wrong_model_false_positive_is_still_flagged(self, text: str) -> None:
+        assert "filling set against crashing" in {
+            r for r, _ in count_and_figure_problems(_IN_TEMP + text)}, (
+            f"no longer flagged: {text!r}; update the module docstring's declared limits"
         )
 
     @pytest.mark.parametrize("text", [
