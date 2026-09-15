@@ -272,10 +272,9 @@ def test_uci_udp_send_one_write_per_datagram() -> None:
         uci_prior = get_uci_enabled(client)
         print("Enabling UCI (Command Interface)...", flush=True)
         enable_uci(client)
-        # enable_uci flips the config item but the I/O registers at
-        # $DF1C-$DF1F don't go live until the next machine reset
-        # (per enable_uci docstring; matches test_uci_tcp_echo_live.py).
-        print("Resetting machine to activate UCI I/O registers...", flush=True)
+        # The reset is kept as a harmless precaution (not required on the U64E per #270);
+        # the 3 s settle is kept because a routine at +0 was not measured.
+        print("Resetting machine (precaution per #270) and settling 3 s...", flush=True)
         client.reset()
         time.sleep(3.0)
 

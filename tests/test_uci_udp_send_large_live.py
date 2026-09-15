@@ -324,11 +324,9 @@ def test_uci_udp_send_large_payload() -> None:
         uci_prior = get_uci_enabled(client)
         print("Enabling UCI (Command Interface)...", flush=True)
         enable_uci(client)
-        # enable_uci flips the config item but the I/O registers at
-        # $DF1C-$DF1F do not go live until the next machine reset.
-        # (See enable_uci docstring; matches the pattern used by
-        # test_uci_tcp_echo_live.py and test_uci_udp_send_live.py.)
-        print("Resetting machine to activate UCI I/O registers...", flush=True)
+        # The reset is kept as a harmless precaution; it is not required
+        # on the U64E per #270 (see enable_uci's docstring).
+        print("Resetting machine (precaution, not required per #270)...", flush=True)
         client.reset()
         time.sleep(3.0)
 

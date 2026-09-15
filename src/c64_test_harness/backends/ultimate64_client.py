@@ -1644,7 +1644,10 @@ class Ultimate64Client:
 
         What it does to the REU and the Command Interface slot, read from
         firmware source at tag ``1.1.0`` (the C64U; the same shape at
-        ``7f6fcb51``, the U64E's v3.15-85) and **unmeasured** on a device:
+        ``7f6fcb51``, the U64E's v3.15-85). The Command Interface half is
+        measured on the U64E (bce4535e, Cartridge Preference Auto, #270);
+        the REU half, the External and ``.crt`` cases and the C64U are
+        **unmeasured**:
         ``start_cartridge`` first zeroes ``C64_CARTRIDGE_TYPE``,
         ``C64_REU_ENABLE``, ``C64_SAMPLER_ENABLE`` and
         ``CMD_IF_SLOT_ENABLE`` (``c64.cc:913``), then, when no external
@@ -1666,8 +1669,12 @@ class Ultimate64Client:
         Line numbers are for ``1.1.0``; ``docs/uci_networking.md`` carries
         the ``7f6fcb51`` equivalents and the full trace. The recorded
         observation that ``enable_uci`` needs a ``reset()`` and a ~3 s
-        settle before routines answer still stands, but this path does not
-        explain it and its cause is open. An earlier revision of this
+        settle before routines answer was not reproduced on the U64E (fw
+        3.15, bce4535e, 2026-09-15, #270): with Cartridge Preference Auto,
+        ``$DF1D`` read ``$C9`` at +0 and ``uci_probe``, run at +3 s, completed
+        with no reset, and after ``reboot()`` + 5 s, 4/4 per arm (arms
+        interleaved). Why the earlier runs timed out is open (#422). An
+        earlier revision of this
         docstring gave the unconditional version as that cause (issue
         #299).
 
