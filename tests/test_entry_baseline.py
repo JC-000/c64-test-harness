@@ -1496,6 +1496,39 @@ class TestTableLiveModule:
         bumped = {**counts, "Tape Settings": counts["Tape Settings"] + 1}
         assert mod.totals_for(bumped) != dict(record.totals)
 
+    @pytest.mark.parametrize("gen,reported", [
+        ("ultimate", "3.15"),
+        ("ultimate", " 3.15\n"),            # whitespace around the version
+        ("cbm", "1.1.0"),
+    ])
+    def test_firmware_version_string_matches(self, gen: str, reported: str) -> None:
+        mod = _table_live_module()
+        record = mod.BASELINE_RECORDED_CATEGORY_SETS[gen]
+        # The record's firmware carries a build suffix ("3.15 (v3.15-85, ...)");
+        # only the version string is compared.
+        assert " " in record.firmware
+        assert mod.firmware_mismatch(record, reported) == ""
+
+    @pytest.mark.parametrize("gen,reported", [
+        ("ultimate", "3.16"),
+        ("ultimate", "3.15-85"),            # a build suffix the device does not report
+        ("ultimate", "3.15 (v3.15-85, 7f6fcb51)"),
+        ("cbm", "1.1.1"),
+        ("cbm", None),
+        ("cbm", ""),
+    ])
+    def test_firmware_version_string_mismatch_names_both(self, gen, reported) -> None:
+        mod = _table_live_module()
+        record = mod.BASELINE_RECORDED_CATEGORY_SETS[gen]
+        why = mod.firmware_mismatch(record, reported)
+        assert why and record.firmware in why and repr(reported).strip("'") in why
+
+    def test_the_firmware_check_documents_its_limit(self) -> None:
+        doc = _table_live_module().firmware_mismatch.__doc__ or ""
+        flat = " ".join(doc.split())
+        for token in ("version string only", "not the build", "per-category"):
+            assert token in flat, f"firmware_mismatch docstring lacks {token!r}"
+
     def test_the_module_calls_only_bodyless_gets(self) -> None:
         calls = _client_calls(_TABLE_LIVE.read_text(encoding="utf-8"))
         # Vacuity guard: the scan must see the calls the module does make.

@@ -405,7 +405,10 @@ class RecordedCategorySet:
 #: cross-checked against an older listing and the firmware source -- its
 #: ``source`` says which).  The U64E counts are device-read and match
 #: source; the C64U counts are **source-derived only, unverified** until a
-#: per-category read succeeds.
+#: per-category read succeeds.  The counts are a derivation, not a
+#: literal to copy: re-derive them with the method each record's
+#: ``counts_source`` names (and a device read) rather than trusting the
+#: literal copies in the tests, which only catch an edit, not a wrong count.
 #:
 #: ``tests/test_entry_baseline.py`` asserts that every name in every record
 #: is classified (in :data:`BASELINE_CATEGORIES`, :data:`BASELINE_NEVER_TOUCH`
