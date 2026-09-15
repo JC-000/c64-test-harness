@@ -333,6 +333,16 @@ def test_the_transport_single_request_path_agrees_with_the_threshold(grade):
     assert single_request is (caps.write_mem_query_threshold == THRESHOLD_POST_SAFE), grade
     assert single_request is (grade is True)
 
+    # A duck-typed cache never passes through ``__post_init__``, so the
+    # transport's own ``is True`` is the only guard: a truthy non-bool grade
+    # must not open the single-request path (#378 review round 1; ``bool()``
+    # there survived every other test).
+    for duck in (1, "no"):
+        duck_fake = SimpleNamespace(
+            _client=SimpleNamespace(cached_capabilities=SimpleNamespace(writemem_post_safe=duck))
+        )
+        assert Ultimate64Transport._rest_write_is_post_safe(duck_fake) is False, duck
+
 
 @pytest.mark.parametrize("put_size", [48, 128])
 def test_write_bytes_chunks_at_the_transports_put_size_not_a_literal(put_size):

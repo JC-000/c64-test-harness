@@ -214,6 +214,13 @@ class DeviceCapabilities:
     Anything other than ``True``, ``False`` or ``None`` is rejected with
     ``TypeError`` on construction: a truthy non-bool such as ``"no"`` or
     ``1`` used to grade post-safe.
+
+    Only ``writemem_post_safe`` is validated.  ``runner_wedge_possible`` and
+    the post-tag fields (``uci_socket_read_multiblock``,
+    ``uci_sockets_close_on_reset``, ``readmem_rejects_zero_length``) are
+    not: they accept whatever a caller passes.  Validation also cannot reach
+    duck-typed stand-ins that never construct this class, which is why
+    ``Ultimate64Transport`` keeps its own ``is True``.
     """
 
     firmware_version: str | None
