@@ -1043,16 +1043,19 @@ pytest tests/test_vice_binary.py -v      # VICE binary monitor protocol tests
 # Ultimate 64 live tests (requires U64_HOST; suites that mutate device
 # state — reset, RAM writes, config changes — additionally require
 # U64_ALLOW_MUTATE=1)
-U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 pytest tests/test_u64_feature_parity_live.py -v
-U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 pytest tests/test_u64_turbo_bench_live.py -v
-TURBO_CONTRACT_LIVE=1 U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 pytest tests/test_turbo_contract_live.py -v  # cross-generation CPU-speed contract
-SOCKETDMA_LIVE=1 U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 pytest tests/test_socketdma_live.py -v  # SocketDMA fast path + cross-generation REU contract
+U64_HOST=<device> U64_ALLOW_MUTATE=1 pytest tests/test_u64_feature_parity_live.py -v
+U64_HOST=<device> U64_ALLOW_MUTATE=1 X25519_PRG=/path/to/x25519.prg pytest tests/test_u64_turbo_bench_live.py -v  # 12 run_prg uploads
+TURBO_CONTRACT_LIVE=1 U64_HOST=<device> U64_ALLOW_MUTATE=1 pytest tests/test_turbo_contract_live.py -v  # cross-generation CPU-speed contract
+SOCKETDMA_LIVE=1 U64_HOST=<device> U64_ALLOW_MUTATE=1 pytest tests/test_socketdma_live.py -v  # SocketDMA fast path + cross-generation REU contract
 
 # Run all U64 live tests in parallel (DeviceLock serializes access)
-python3 scripts/run_u64_parallel_locked.py 192.168.1.81
+python3 scripts/run_u64_parallel_locked.py <device>
 
 # Stress test the cross-process queueing (6 workers, 5 rounds each)
-python3 scripts/stress_u64_queue.py 192.168.1.81 --workers 6 --rounds 5
+python3 scripts/stress_u64_queue.py <device> --workers 6 --rounds 5
+
+# No script or live module has a default host: name the device (argument
+# or U64_HOST) or it refuses with exit 2 / skips (#243, #275).
 ```
 
 Every live test runs inside the autouse `device_lock_guard` fixture, so `DeviceLock` serializes access to the physical device whether or not the test asks for it. Multiple agents (separate OS processes) can safely run tests in parallel — the lock file queues them automatically. See [Shared-device contract](#shared-device-contract-devicelock) for what that obliges non-test tools to do, and set `U64_REQUIRE_DEVICE_LOCK=1` to make an unlocked destructive call an error instead of a warning.

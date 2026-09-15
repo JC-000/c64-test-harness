@@ -10,9 +10,12 @@ Queries the device's HTTP API (v1) and prints a structured summary:
 All requests are strictly GET. No mutation, no reset, no reboot.
 
 Usage:
-    python3 scripts/probe_u64.py --host 192.168.1.81
-    python3 scripts/probe_u64.py --host 192.168.1.81 --password secret
-    python3 scripts/probe_u64.py --host 192.168.1.81 --raw-dir /tmp/u64_dump
+    python3 scripts/probe_u64.py --host <device>
+    U64_HOST=<device> python3 scripts/probe_u64.py
+    python3 scripts/probe_u64.py --host <device> --password secret
+    python3 scripts/probe_u64.py --host <device> --raw-dir /tmp/u64_dump
+
+No default host: --host or $U64_HOST, or the probe refuses (#243).
 
 Zero external deps (urllib only).
 """
@@ -25,10 +28,13 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _u64_host import require_u64_host  # noqa: E402
 
-DEFAULT_HOST = "192.168.1.81"
+
 TIMEOUT = 8.0
 
 # Authoritative list of config categories exposed by /v1/configs
@@ -118,15 +124,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Read-only probe of an Ultimate 64 / Ultimate II REST API."
     )
-    parser.add_argument("--host", default=DEFAULT_HOST,
-                        help=f"Device host/IP (default: {DEFAULT_HOST})")
+    parser.add_argument("--host", default=None,
+                        help="Device host/IP (or set $U64_HOST). No default.")
     parser.add_argument("--password", default=None,
                         help="Optional password; sent as X-Password header.")
     parser.add_argument("--raw-dir", default=None,
                         help="If set, dump every raw JSON response into this dir.")
     args = parser.parse_args()
 
-    host = args.host
+    host = require_u64_host(
+        args.host, argv0="python3 scripts/probe_u64.py",
+        usage="python3 scripts/probe_u64.py --host <HOST>",
+    )
     pw = args.password
     raw_dir = args.raw_dir
 

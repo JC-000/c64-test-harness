@@ -35,8 +35,8 @@ thread while a lane holds the lock is, by definition, not unlocked and is
 correctly silent.  The thread-scoping question is about the suppression,
 and step 3 asks it directly.
 
-Gate: ``U64_NOTICE_LIVE=1``.  Host: ``U64_NOTICE_HOST`` (default
-``10.43.23.81``).  The host is deliberately **not** stored in ``_HOST``:
+Gate: ``U64_NOTICE_LIVE=1`` **and** ``U64_NOTICE_HOST`` (no
+default).  The host is deliberately **not** stored in ``_HOST``:
 ``conftest.device_lock_guard`` keys on that attribute (and on
 ``U64_HOST``) and would hold the device lock around the whole test, which
 would make every "unlocked" phase here measure the guard instead of the
@@ -74,12 +74,21 @@ from c64_test_harness.backends.unified_manager import (
     LANE_LOCKED_PHRASE as _LANE_LOCKED_PHRASE,
 )
 
-NOTICE_HOST = os.environ.get("U64_NOTICE_HOST", "10.43.23.81")
+#: No default (#243): a live module that invents a device drives real
+#: hardware for anyone who sets only the feature gate. The host is part of
+#: the gate, like every other live module in this repo.
+NOTICE_HOST = os.environ.get("U64_NOTICE_HOST") or None
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("U64_NOTICE_LIVE") != "1",
-    reason="U64_NOTICE_LIVE=1 not set -- live unlocked-notice test disabled",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        os.environ.get("U64_NOTICE_LIVE") != "1",
+        reason="U64_NOTICE_LIVE=1 not set -- live unlocked-notice test disabled",
+    ),
+    pytest.mark.skipif(
+        NOTICE_HOST is None,
+        reason="U64_NOTICE_HOST not set -- name the device explicitly",
+    ),
+]
 
 #: Scratch byte well clear of every HARNESS_SCRATCH span.
 _SCRATCH = 0xC9F8

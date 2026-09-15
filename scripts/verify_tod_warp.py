@@ -48,7 +48,7 @@ $DC09, $DC08 (writing tenths unlatches and starts the counter).
 Usage::
 
     python3 scripts/verify_tod_warp.py                 # VICE normal + warp
-    U64_HOST=192.168.1.81 python3 scripts/verify_tod_warp.py --u64   # add U64 probe
+    U64_HOST=<device> python3 scripts/verify_tod_warp.py --u64   # add U64 probe
 """
 from __future__ import annotations
 

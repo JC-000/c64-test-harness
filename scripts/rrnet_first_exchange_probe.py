@@ -42,9 +42,19 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _u64_host import require_u64_host  # noqa: E402
 
 os.environ.setdefault("C64_BACKEND", "u64")
-HOST = os.environ.setdefault("U64_HOST", "10.43.23.81")
+# Never invent a device (#243). No export: create_manager is passed
+# u64_hosts=HOST explicitly below, and UnifiedManager._parse_u64_hosts only
+# consults $U64_HOST when hosts is None -- at call time, not import time.
+HOST = require_u64_host(
+    argv0="python3 scripts/rrnet_first_exchange_probe.py",
+    usage="U64_HOST=<device> python3 scripts/rrnet_first_exchange_probe.py",
+)
 os.environ.setdefault("U64_UNLOCKED_CLIENT_WARNING", "0")
 
 from c64_test_harness import create_manager  # noqa: E402

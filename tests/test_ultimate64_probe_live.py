@@ -4,7 +4,7 @@ Gated by the ``U64_HOST`` environment variable.  Skipped when unset.
 
 Run::
 
-    U64_HOST=192.168.1.81 python3 -m pytest tests/test_ultimate64_probe_live.py -v
+    U64_HOST=<device> python3 -m pytest tests/test_ultimate64_probe_live.py -v
 """
 
 from __future__ import annotations

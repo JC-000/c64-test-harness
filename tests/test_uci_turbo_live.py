@@ -19,7 +19,7 @@ to work everywhere.
 
 Run::
 
-    U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 \\
+    U64_HOST=<device> U64_ALLOW_MUTATE=1 \\
         python3 -m pytest tests/test_uci_turbo_live.py -v
 """
 
@@ -173,7 +173,7 @@ def test_uci_get_ip_turbo_safe(
     _set_speed(client, mhz)
     try:
         ip = uci_get_ip(transport, timeout=15.0, turbo_safe=True)
-        # Device at 192.168.1.81 returns its own IP; accept any valid-looking
+        # The device returns its own IP; accept any valid-looking
         # dotted quad (exact value depends on the LAN).
         parts = ip.split(".") if ip else []
         assert len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255

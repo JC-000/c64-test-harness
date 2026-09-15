@@ -6,9 +6,12 @@ subprocess acquires a DeviceLock for the U64 device, ensuring exclusive
 access.  This lets multiple agents/processes safely share a single device.
 
 Usage:
-    python3 scripts/run_u64_parallel_locked.py [HOST] [--workers N]
+    python3 scripts/run_u64_parallel_locked.py <HOST> [--workers N]
+    U64_HOST=<device> python3 scripts/run_u64_parallel_locked.py [--workers N]
 
-Defaults: HOST=192.168.1.81, workers=4 (one per test file)
+No default host -- this script runs the live suite in parallel against
+whatever it is pointed at, so it refuses to pick one (#243). Default
+workers=4 (one per test file).
 """
 from __future__ import annotations
 
@@ -19,6 +22,9 @@ import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _u64_host import require_u64_host  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -95,9 +101,14 @@ def _run_locked(test_file: str, host: str, password: str | None) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("host", nargs="?", default="192.168.1.81")
+    ap.add_argument("host", nargs="?", default=None,
+                    help="Device host/IP (or set $U64_HOST). No default.")
     ap.add_argument("--workers", type=int, default=len(TEST_FILES))
     args = ap.parse_args()
+
+    args.host = require_u64_host(
+        args.host, argv0="python3 scripts/run_u64_parallel_locked.py"
+    )
     password = os.environ.get("U64_PASSWORD")
 
     print(

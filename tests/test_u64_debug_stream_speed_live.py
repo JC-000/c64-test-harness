@@ -44,7 +44,7 @@ Gates:
 
 Example::
 
-    U64_HOST=192.168.1.81 U64_ALLOW_MUTATE=1 \\
+    U64_HOST=<device> U64_ALLOW_MUTATE=1 \\
         python3 -m pytest tests/test_u64_debug_stream_speed_live.py -v -s
 """
 from __future__ import annotations

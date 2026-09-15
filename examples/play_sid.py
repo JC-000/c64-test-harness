@@ -3,7 +3,7 @@
 
 Usage:
     python3 examples/play_sid.py --vice mysong.sid
-    python3 examples/play_sid.py --u64 192.168.1.81 mysong.sid
+    python3 examples/play_sid.py --u64 <device> mysong.sid
     python3 examples/play_sid.py --vice --self-test   # uses built-in test SID
 
 Requires a .sid file (PSID v1/v2 with explicit load_addr; IRQ-driven SIDs
