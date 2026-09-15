@@ -259,26 +259,46 @@ def test_a_frame_len_the_copy_loop_cannot_honour_is_refused(route: str, n: int) 
         LEN_ROUTES[route](n)
 
 
-def test_the_1066_byte_udp_live_test_is_a_strict_xfail_on_valueerror() -> None:
-    """#304: ``tests/test_rrnet_udp_send_live.py`` builds a 1066-byte frame,
-    which the #238 check refuses.  It must stay a strict xfail on exactly
-    ``ValueError`` -- read from source, since the module needs a live
-    gate to import usefully -- and the builder must really refuse 1066."""
+def test_the_udp_live_test_frame_is_one_the_tx_code_delivers_whole() -> None:
+    """#304: ``tests/test_rrnet_udp_send_live.py`` used to build a 1066-byte
+    frame, which never left the chip (the old copy loop stopped at
+    ``1066 & 0xFF = 42`` bytes) and which #238 now refuses.  Its datagram
+    must be one ``build_tx_code`` accepts **and** copies out whole.
+
+    The live module is Linux + gate only, so its frame is rebuilt here from
+    the module's own constants and run through the simulated chip: the bytes
+    that reach TX must be the whole UDP datagram with the whole payload.
+    And the live test must no longer be an xfail, or a pass would prove
+    nothing again.
+    """
     import ast
     from pathlib import Path
 
-    src = Path(__file__).with_name("test_rrnet_udp_send_live.py").read_text()
+    import test_rrnet_udp_send_live as live
+
+    frame = bp.build_udp_frame(
+        src_mac=live.C64_MAC, dst_mac=live.HOST_MAC_BROADCAST,
+        src_ip=live.C64_IP, dst_ip=live.HOST_IP,
+        src_port=live.SRC_PORT, dst_port=live.DST_PORT, payload=live.PAYLOAD,
+    )
+    chip = Cs8900aSim()
+    cpu = _run(bp.build_tx_code(LOAD, TX_BUF, len(frame), RESULT), chip, {TX_BUF: frame})
+    assert len(frame) == live.FRAME_LEN
+    assert cpu.mem[RESULT] == 0x01
+    assert chip.tx_frames == [frame]
+    sent = chip.tx_frames[0]
+    assert int.from_bytes(sent[38:40], "big") == 8 + len(live.PAYLOAD)   # UDP length
+    assert sent[42:42 + len(live.PAYLOAD)] == live.PAYLOAD
+
+    src = Path(live.__file__).read_text()
     fn = next(n for n in ast.walk(ast.parse(src))
-              if isinstance(n, ast.FunctionDef)
-              and n.name == "test_c64_sends_1024_byte_udp_datagram_to_host")
-    marks = [d for d in fn.decorator_list
-             if isinstance(d, ast.Call) and ast.unparse(d.func) == "pytest.mark.xfail"]
-    assert len(marks) == 1, "the 1066-byte live test lost its xfail marker"
-    kw = {k.arg: ast.unparse(k.value) for k in marks[0].keywords}
-    assert kw.get("raises") == "ValueError" and kw.get("strict") == "True", kw
-    assert "#304" in kw.get("reason", "")
-    with pytest.raises(ValueError):
-        bp.build_tx_code(LOAD, TX_BUF, 1066, RESULT)
+              if isinstance(n, ast.FunctionDef) and n.name.startswith("test_c64_sends_"))
+    marks = [ast.unparse(d.func if isinstance(d, ast.Call) else d) for d in fn.decorator_list]
+    assert not any("xfail" in m for m in marks), marks
+    payloads = [ast.unparse(k.value) for c in ast.walk(fn)
+                if isinstance(c, ast.Call) and ast.unparse(c.func) == "build_udp_frame"
+                for k in c.keywords if k.arg == "payload"]
+    assert payloads == ["PAYLOAD"], payloads
 
 
 @pytest.mark.parametrize("n", GOOD_LENS)
