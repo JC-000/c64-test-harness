@@ -19,8 +19,9 @@ NOT covered here (protocol surface added after this module was written):
   Some of these are exercised by ``tests/test_ultimate64_transport_live.py``;
   turbo has its own contract test in ``tests/test_turbo_contract_live.py``.
 
-Double-gated by ``U64_HOST`` and ``U64_ALLOW_MUTATE`` (the suite resets
-the machine and writes to RAM) — e.g.:
+Double-gated by ``U64_HOST`` and ``U64_ALLOW_MUTATE``.  The suite resets the
+machine and writes to RAM but changes no config, so the second gate is
+stricter than the contract (#333) — e.g.:
 
     U64_HOST=<device> U64_ALLOW_MUTATE=1 \\
         python3 -m pytest tests/test_u64_feature_parity_live.py -v

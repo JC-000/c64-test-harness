@@ -78,6 +78,8 @@ shippable applications).
 
 from __future__ import annotations
 
+from ._address import refuses_bool_address_args
+
 from .bridge_ping import Asm
 
 # CIA1 Time-of-Day registers
@@ -267,6 +269,7 @@ def _finalize_with_tables(
 # Public API
 # ---------------------------------------------------------------------------
 
+@refuses_bool_address_args
 def build_tod_start_code(load_addr: int) -> bytes:
     """Build a standalone 6502 routine that starts CIA1 TOD at 00:00:00.0.
 
@@ -289,6 +292,7 @@ def build_tod_start_code(load_addr: int) -> bytes:
     return a.build()
 
 
+@refuses_bool_address_args
 def build_tod_read_tenths_code(load_addr: int, result_addr: int) -> bytes:
     """Build a 6502 routine that reads CIA1 TOD and stores "elapsed
     tenths since TOD start" at ``result_addr`` as a little-endian
@@ -319,6 +323,7 @@ def build_tod_read_tenths_code(load_addr: int, result_addr: int) -> bytes:
     return _finalize_with_tables(a, load_addr, patch_positions)
 
 
+@refuses_bool_address_args
 def build_poll_with_tod_deadline_code(
     load_addr: int,
     peek_check_snippet: bytes,

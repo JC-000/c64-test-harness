@@ -48,6 +48,8 @@ callers do not have to remember this.
 
 from __future__ import annotations
 
+from ._address import refuses_bool_address_args
+
 import struct
 from dataclasses import dataclass
 
@@ -825,6 +827,7 @@ def cs8900a_set_mac_code(mac: bytes) -> bytes:
             + bytes([0x60]))
 
 
+@refuses_bool_address_args
 def cs8900a_read_linectl_code(dest_addr: int) -> bytes:
     """Read LineCTL (PP 0x0112) into dest_addr / dest_addr+1."""
     lo = dest_addr & 0xFF
@@ -851,6 +854,7 @@ def cs8900a_write_linectl_code(lo_value: int, hi_value: int) -> bytes:
     ])
 
 
+@refuses_bool_address_args
 def build_cs8900a_reset_code(
     load_addr: int,
     result_addr: int,
@@ -1019,6 +1023,7 @@ def _resolve_arp_frame(
     return arp_frame_buf, (ARP_FRAME_LEN if arp_frame_len is None else arp_frame_len)
 
 
+@refuses_bool_address_args
 def build_tx_code(
     load_addr: int,
     frame_buf: int,
@@ -1350,6 +1355,7 @@ def _emit_arp_responder(
     a.label(not_arp)
 
 
+@refuses_bool_address_args
 def build_rx_echo_reply_code(
     load_addr: int,
     rx_buf: int,
@@ -1418,6 +1424,7 @@ def build_rx_echo_reply_code(
     return a.build()
 
 
+@refuses_bool_address_args
 def build_ping_and_wait_code(
     load_addr: int,
     tx_frame_buf: int,
@@ -1539,6 +1546,7 @@ def build_ping_and_wait_code(
     return a.build()
 
 
+@refuses_bool_address_args
 def build_icmp_responder_code(
     load_addr: int,
     rx_buf: int,
@@ -1711,6 +1719,7 @@ def build_icmp_responder_code(
 _RX_PEEK_BATCH_DEFAULT = 500
 
 
+@refuses_bool_address_args
 def build_rx_peek_code(
     load_addr: int,
     result_addr: int,
@@ -1779,6 +1788,7 @@ def build_rx_peek_code(
     return a.build()
 
 
+@refuses_bool_address_args
 def build_read_and_match_echo_reply_code(
     load_addr: int,
     rx_buf: int,
@@ -1833,6 +1843,7 @@ def build_read_and_match_echo_reply_code(
     return a.build()
 
 
+@refuses_bool_address_args
 def build_read_and_respond_echo_request_code(
     load_addr: int,
     rx_buf: int,
@@ -1955,6 +1966,7 @@ _DEFAULT_PEEK_ADDR = 0xC000
 _DEFAULT_CONSUME_ADDR = 0xC100
 
 
+@refuses_bool_address_args
 def run_ping_and_wait(
     transport,
     *,
@@ -2067,6 +2079,7 @@ def run_ping_and_wait(
         return match_result
 
 
+@refuses_bool_address_args
 def run_icmp_responder(
     transport,
     *,
@@ -2319,6 +2332,7 @@ def _validate_deadline_tenths(deadline_tenths: int) -> None:
         )
 
 
+@refuses_bool_address_args
 def build_rx_echo_reply_tod_code(
     load_addr: int,
     rx_buf: int,
@@ -2426,6 +2440,7 @@ def build_rx_echo_reply_tod_code(
     return bytes(buf)
 
 
+@refuses_bool_address_args
 def build_ping_and_wait_tod_code(
     load_addr: int,
     tx_frame_buf: int,
@@ -2573,6 +2588,7 @@ def build_ping_and_wait_tod_code(
     return bytes(buf)
 
 
+@refuses_bool_address_args
 def build_icmp_responder_tod_code(
     load_addr: int,
     rx_buf: int,
