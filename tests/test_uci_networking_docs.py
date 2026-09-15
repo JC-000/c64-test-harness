@@ -10,7 +10,8 @@ zeroes the enable and then, when no external cartridge holds the bus,
 calls ``set_cartridge(NULL)`` -> ``set_emulation_flags()``, which restores it
 from config.  A REST config PUT reaches ``set_emulation_flags()`` as well,
 through ``at_close_config`` -> ``effectuate`` -> ``effectuate_settings``.
-So the observation stands and its cause is unexplained by source.  That is
+The observation was not reproduced on bce4535e (#270), and its cause is
+unexplained by source (#422).  That is
 what the doc must say (read from source, unmeasured; see #270 and #299).
 
 Pinned three ways, the same shape as ``test_entry_baseline_docs.py``:
@@ -173,11 +174,22 @@ _DEFERRAL = re.compile(
     r"|(?:do|does) not go live until"
     # Review round 2 (F2): "takes effect only after a reset".
     r"|takes? effect only (?:at|on|after|by)(?: the next| a)?(?: machine)? reset"
+    # PR #409 review round 1 (R4): "A reset is needed" survived every shape
+    # above.  "no reset was needed" is the measured claim, not the relapse.
+    r"|(?<!\bno )(?<!\bno machine )\breset (?:is|was) (?:still |typically |always )?"
+    r"(?:needed|required)"
 )
 
 
 def _claims_deferred_apply(flat: str) -> list[str]:
     return [s for s in _sentences(flat) if _DEFERRAL.search(s.lower())]
+
+
+def _c64u_claimed_measured(flat: str) -> list[str]:
+    """Sentences naming the C64U as measured, without a whole-word negation."""
+    return [s for s in _sentences(flat)
+            if "C64U" in s and re.search(r"\bmeasured\b", s)
+            and not re.search(r"\bnot\b|\bunmeasured\b", s.lower())]
 
 
 def _relapses(flat: str) -> list[str]:
@@ -195,6 +207,26 @@ MEASUREMENT = (
     "`Cartridge Preference` `Auto`",
     "without `reset()`",
     "not reproduced",
+    # PR #409 review round 1 (R3, finding 3): arm A's +0 is the identifier
+    # read; its routine ran at +3 s.  Each arm's count is pinned.
+    "`$DF1D` read `$C9` at +0",
+    "`uci_probe`, run at +3 s with no reset, completed 4/4",
+    "with `client.reset()` + 3 s, 4/4",
+    "with `reboot()` + 5 s, 4/4",
+    "the 3 s settle is not retired",
+    # R7: the live suites' reset is kept deliberately.
+    "The reset in the live suites is harmless and stays.",
+    # Finding 6: the open cause has an issue.
+    "not established (#422)",
+    # Finding 5: what arms B and C measured, and what they did not.
+    "The Command Interface half of that account is measured on the U64E",
+    "The REU half, the External and `.crt` cases, and the C64U are unmeasured.",
+)
+
+#: Finding 5, outside the prerequisite section (the timeout-reset account).
+MEASUREMENT_ELSEWHERE = (
+    "The enable surviving `client.reset()` is measured on the U64E",
+    "The timeout path itself, its side effects and the C64U are unmeasured.",
 )
 
 #: Present-tense requirement wording the measurement retires.
@@ -202,6 +234,8 @@ RETIRED_REQUIREMENT = (
     "Keep that sequence",
     "Nobody has done that",
     "drop the reset on a device and see which step fails",
+    "This has not been measured on a device.",
+    "It is a recorded observation",
 )
 
 
@@ -210,13 +244,21 @@ class TestTheMeasurementIsRecorded:
     def test_present(self, section: str, phrase: str) -> None:
         assert phrase in section, f"#270 measurement lost {phrase!r}"
 
+    @pytest.mark.parametrize("phrase", MEASUREMENT_ELSEWHERE)
+    def test_present_elsewhere(self, whole: str, phrase: str) -> None:
+        assert phrase in whole, f"#270 measurement lost {phrase!r}"
+
     @pytest.mark.parametrize("phrase", RETIRED_REQUIREMENT)
     def test_retired_requirement_absent(self, whole: str, phrase: str) -> None:
         assert phrase not in whole, phrase
 
+    def test_c64u_is_said_to_be_unmeasured(self, section: str) -> None:
+        """Non-vacuous (PR #409 R1): the disclaimer itself must be there."""
+        assert [s for s in _sentences(section)
+                if "C64U" in s and re.search(r"\bnot measured\b", s)]
+
     def test_c64u_is_not_claimed_measured(self, section: str) -> None:
-        sents = [s for s in _sentences(section) if "C64U" in s and "bce4535e" in s]
-        assert all("not" in s.lower() for s in sents), sents
+        assert not _c64u_claimed_measured(section), _c64u_claimed_measured(section)
 
 
 class TestEnableUciDocstring:
@@ -237,6 +279,27 @@ class TestEnableUciDocstring:
 
     def test_cites_the_measurement(self, doc: str) -> None:
         assert "bce4535e" in doc and "#270" in doc and "docs/uci_networking.md" in doc
+
+    #: PR #409 review round 1 (R2, R6, R8, finding 3): each carries a
+    #: condition or a count that a rewrite could drop silently.
+    @pytest.mark.parametrize("phrase", (
+        "The C64U is not measured.",
+        "survives ``reboot()``",
+        "completed 4/4",
+        "``$DF1D`` read ``$C9`` at +0",
+        "run at +3 s with no reset",
+        "keep a settle",
+    ))
+    def test_carries(self, doc: str, phrase: str) -> None:
+        assert phrase in doc, phrase
+
+    def test_no_reset_claim_carries_its_conditions(self, doc: str) -> None:
+        """Finding 2: the claim and its scope sit in one sentence."""
+        claims = [s for s in _sentences(doc)
+                  if re.search(r"\bno reset (?:is|was) needed", s.lower())]
+        assert len(claims) == 1, claims
+        for cond in ("U64E", "bce4535e", "Auto"):
+            assert cond in claims[0], (cond, claims[0])
 
 
 class TestTheObservationSurvives:
@@ -296,8 +359,12 @@ class TestThePinsCanFail:
         # Review round 2 (PR #309): two more natural paraphrases.
         "A reboot disables the Command Interface again.",
         "The Command Interface PUT takes effect only after a reset.",
+        # PR #409 review round 1 (R4).
+        "A reset is needed for $DF1C-$DF1F to answer.",
+        "A machine reset is still required after enable_uci.",
     ], ids=["E1-uci-come-back-off", "E2-command-interface-turned-off",
-            "E3-deferred-apply", "F1-reboot-disables", "F2-takes-effect-only-after"])
+            "E3-deferred-apply", "F1-reboot-disables", "F2-takes-effect-only-after",
+            "R4-reset-is-needed", "R4-reset-is-still-required"])
     def test_plain_paraphrase_is_detected(self, whole: str, claim: str) -> None:
         assert _relapses(whole + " " + claim), claim
 
@@ -311,6 +378,23 @@ class TestThePinsCanFail:
         A substring match would flag these; the pin promises a word match.
         """
         assert not _relapses(benign)
+
+    @pytest.mark.parametrize("benign", [
+        "On the U64E no reset was needed for $DF1C-$DF1F to answer.",
+        "No machine reset is needed on that build.",
+    ])
+    def test_measured_no_reset_is_not_a_deferral(self, benign: str) -> None:
+        """Positive control for R4's shape: the negated claim passes."""
+        assert not _claims_deferred_apply(benign)
+
+    @pytest.mark.parametrize("claim", [
+        "The C64U was measured too.",
+        "The C64U was measured too, and on it this is still source-read.",
+        "The C64U was measured nothing like the U64E.",
+    ])
+    def test_c64u_measured_claim_is_detected(self, claim: str) -> None:
+        """R1: whole-word negation, and 'source-read' does not waive it."""
+        assert _c64u_claimed_measured(claim), claim
 
     def test_qualified_external_cart_exception_passes(self) -> None:
         """E4: the exception, stated with its condition, is not a relapse."""

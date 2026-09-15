@@ -2736,11 +2736,12 @@ def enable_uci(client: "Ultimate64Client") -> None:
     saved to flash: it lives in firmware RAM, survives ``reboot()`` (a
     C64-level reset) and is lost only at a firmware power-on.
 
-    No reset is needed for ``$DF1C-$DF1F`` to answer.  Measured on the
-    U64E (fw 3.15, bce4535e, 2026-09-15, ``Cartridge Preference`` Auto,
-    n=4 per arm, #270): ``$DF1D`` read ``$C9`` on the first read after
-    this call and ``uci_probe`` completed with no reset, as it did after
-    ``reset()`` or ``reboot()``.  The C64U is not measured.  With
+    On the U64E (fw 3.15, bce4535e, 2026-09-15, ``Cartridge Preference``
+    Auto) no reset was needed for ``$DF1C-$DF1F`` to answer (n=4 per arm,
+    #270): ``$DF1D`` read ``$C9`` at +0, and ``uci_probe``, run at +3 s
+    with no reset, completed 4/4, as it did after ``reset()`` or
+    ``reboot()``.  A routine at +0 was not run, so keep a settle.  The
+    C64U is not measured.  With
     ``Cartridge Preference`` External the slot stays off the bus whatever
     this item says (#359).  See docs/uci_networking.md.
 
