@@ -35,7 +35,13 @@ survived as a token check, because the unit repeats "reset()", "settle",
 
 **Declared limits:** the remaining presence pins are token checks inside the
 located unit, so a unit that carries those tokens but garbles the claim
-passes; the absence rule matches only the verb phrases in :data:`_OVERCLAIM`.
+passes; the absence rule matches only the verb phrases in :data:`_OVERCLAIM`,
+plus a ``reset()``/``reboot()`` "clears" in a sentence that names the STATE-bit
+wedge (``STATE-bit``, ``uci_wedge_probe`` or ``$DF1C``).  The review-round-1
+phrase needs (#359 result, C64U unmeasured, the harness leaves the preference
+alone, ``Command Interface`` still Enabled, reset/reboot do not clear the
+wedge, zero ``/Temp``, raises before writing, ``uci_probe`` does not pre-check,
+"still yours") pin the exact current wording: a rewording must update them.
 """
 from __future__ import annotations
 
@@ -82,12 +88,29 @@ SHARING = re.compile(r"RR-Net runs and UCI runs cannot share a device session")
 WEDGE_LIMIT = re.compile(r"does not rule out a (?:UCI )?STATE-bit wedge[^.]*uci_wedge_probe")
 ATTRIBUTES = re.compile(r"Attributes: identifier \([^)]*\) and cartridge_preference \(")
 
+# Review round 1 (#413): each of these facts survived an outright reversal as a
+# token check (the unit keeps "/Temp", "Command Interface", "uci_probe", ...).
+RESULT_359 = re.compile(r"Auto gave identifier \$C9 and a completed routine 3/3; "
+                        r"External gave neither, 0/3")
+NOT_MEASURED_C64U = re.compile(r"Not measured on the C64U\.")
+SKILL_NO_CHANGE = re.compile(r"The harness does not change the preference for you")
+STILL_ENABLED = re.compile(r"Command Interface still reads Enabled")
+DO_NOT_CLEAR = re.compile(r"reset\(\)/reboot\(\) do not clear it")
+ZERO_TEMP = re.compile(r"one bodyless GET, so zero /Temp cost")
+BEFORE_WRITTEN = re.compile(r"raises before anything is written or typed")
+REF_NEVER_CHANGES = re.compile(r"the harness never changes it for you")
+NO_PRECHECK = re.compile(r"uci_probe does not pre-check \(check_identifier=False\)")
+PATTERNS_RESULT = re.compile(r"0/3 on External against 3/3 on Auto")
+STILL_YOURS = re.compile(r"the reset and settle are still yours")
+
 #: What the unit that names the error must carry: a literal token or a phrase.
 SKILL_TOKENS = ("External", "#359", "Command Interface", "$C9",
-                REMEDY, SHARING, WEDGE_LIMIT)
-REFERENCE_TOKENS = ("UCIError", "$DF1D", "bodyless", "/Temp", "uci_probe", ATTRIBUTES)
+                REMEDY, SHARING, WEDGE_LIMIT, RESULT_359, NOT_MEASURED_C64U,
+                SKILL_NO_CHANGE, STILL_ENABLED, DO_NOT_CLEAR)
+REFERENCE_TOKENS = ("UCIError", "$DF1D", "bodyless", "/Temp", "uci_probe", ATTRIBUTES,
+                    ZERO_TEMP, BEFORE_WRITTEN, REF_NEVER_CHANGES, NO_PRECHECK)
 PATTERNS_RRNET_HEADING = "### Hardware RR-Net on the U64"
-PATTERNS_TOKENS = (ERROR, "UCI", REMEDY)
+PATTERNS_TOKENS = (ERROR, "UCI", REMEDY, STILL_ENABLED, PATTERNS_RESULT, STILL_YOURS)
 
 
 def _has(unit: str, need) -> bool:
@@ -117,9 +140,19 @@ _OVERCLAIM = re.compile(
     re.IGNORECASE,
 )
 
+#: A reset verb that clears the STATE-bit wedge.  Gated on a STATE-bit subject in
+#: the same sentence, because "A soft reset() clears it" (a hung 6510) and
+#: "reboot() clears REU/DMA stuck state" are true elsewhere in PATTERNS/REFERENCE.
+_WEDGE_SUBJECT = re.compile(r"STATE-bit|uci_wedge_probe|\$DF1C", re.IGNORECASE)
+_RESET_CLEARS = re.compile(
+    r"\b(?:reset|reboot)\(\)(?:/(?:reset|reboot)\(\))? (?:also |will |does )?clears?\b",
+    re.IGNORECASE,
+)
+
 
 def overclaims(text: str) -> list[str]:
-    return [s for s in re.split(r"(?<=[.!?])\s+", _flat(text)) if _OVERCLAIM.search(s)]
+    return [s for s in re.split(r"(?<=[.!?])\s+", _flat(text))
+            if _OVERCLAIM.search(s) or (_WEDGE_SUBJECT.search(s) and _RESET_CLEARS.search(s))]
 
 
 def test_the_skill_files_exist() -> None:
@@ -164,7 +197,14 @@ def _real_units() -> dict[str, tuple[list[str], tuple]]:
 #: Every phrase need, by file.  Stripping it from the real unit must make the
 #: pin report it: a need list that silently drops a phrase fails here (P6).
 _PHRASE_NEEDS = [("SKILL.md", REMEDY), ("SKILL.md", SHARING), ("SKILL.md", WEDGE_LIMIT),
-                 ("REFERENCE.md", ATTRIBUTES), ("PATTERNS.md", REMEDY)]
+                 ("SKILL.md", RESULT_359), ("SKILL.md", NOT_MEASURED_C64U),
+                 ("SKILL.md", SKILL_NO_CHANGE), ("SKILL.md", STILL_ENABLED),
+                 ("SKILL.md", DO_NOT_CLEAR),
+                 ("REFERENCE.md", ATTRIBUTES), ("REFERENCE.md", ZERO_TEMP),
+                 ("REFERENCE.md", BEFORE_WRITTEN), ("REFERENCE.md", REF_NEVER_CHANGES),
+                 ("REFERENCE.md", NO_PRECHECK),
+                 ("PATTERNS.md", REMEDY), ("PATTERNS.md", STILL_ENABLED),
+                 ("PATTERNS.md", PATTERNS_RESULT), ("PATTERNS.md", STILL_YOURS)]
 
 
 @pytest.mark.parametrize("name,need", _PHRASE_NEEDS, ids=lambda v: getattr(v, "pattern", v)[:24])
@@ -177,6 +217,14 @@ def test_stripping_a_phrase_from_the_real_unit_is_reported(name: str, need: re.P
     assert need.pattern in missing_tokens(stripped, tokens), (
         f"{name}: removing {need.pattern!r} is not reported; is it still in the need list?"
     )
+
+
+def test_every_phrase_need_has_a_strip_case() -> None:
+    # A phrase need with no strip case is never shown to be reportable (T3).
+    for name, (_units_, tokens) in _real_units().items():
+        for need in tokens:
+            if isinstance(need, re.Pattern):
+                assert (name, need) in _PHRASE_NEEDS, f"{name}: no strip case for {need.pattern!r}"
 
 
 @pytest.mark.parametrize("name", list(FILES))
@@ -216,6 +264,8 @@ class TestThePinCanFail:
         "The identifier check proves there is no wedge.",
         "Reading C9 means the UCI is healthy.",
         "The identifier check clears a wedged device.",
+        "It does not rule out a STATE-bit wedge (uci_wedge_probe; reboot() clears it).",
+        "A UCI STATE-bit wedge in $DF1C: reset()/reboot() clears it.",
     ])
     def test_an_overclaim_is_flagged(self, text: str) -> None:
         assert overclaims(text), text
@@ -224,6 +274,9 @@ class TestThePinCanFail:
         "A $C9 at $DF1D does not rule out a UCI STATE-bit wedge.",
         "$C9 only means the slot is on the bus; run uci_wedge_probe for the STATE bits.",
         "The identifier check costs one bodyless GET.",
+        "It does not rule out a STATE-bit wedge (uci_wedge_probe; reset()/reboot() do not clear it).",
+        "The running program has wedged the CPU. A soft reset() clears it instantly.",
+        "reboot() clears REU/DMA stuck state.",
     ])
     def test_the_correct_limit_is_not_an_overclaim(self, text: str) -> None:
         assert overclaims(text) == [], text
