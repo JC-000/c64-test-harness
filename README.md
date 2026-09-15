@@ -1040,9 +1040,9 @@ pytest tests/test_disk_vice.py -v        # VICE disk I/O integration tests
 pytest tests/test_vice_core.py -v        # VICE core module integration tests
 pytest tests/test_vice_binary.py -v      # VICE binary monitor protocol tests
 
-# Ultimate 64 live tests (requires U64_HOST; suites that mutate device
-# state — reset, RAM writes, config changes — additionally require
-# U64_ALLOW_MUTATE=1)
+# Ultimate 64 live tests (requires U64_HOST; suites that change device
+# config additionally require U64_ALLOW_MUTATE=1 — resets, RAM writes and
+# stream start/stop run on U64_HOST alone, #333)
 U64_HOST=<device> U64_ALLOW_MUTATE=1 pytest tests/test_u64_feature_parity_live.py -v
 U64_HOST=<device> U64_ALLOW_MUTATE=1 X25519_PRG=/path/to/x25519.prg pytest tests/test_u64_turbo_bench_live.py -v  # 12 run_prg uploads
 TURBO_CONTRACT_LIVE=1 U64_HOST=<device> U64_ALLOW_MUTATE=1 pytest tests/test_turbo_contract_live.py -v  # cross-generation CPU-speed contract
@@ -1060,7 +1060,7 @@ python3 scripts/stress_u64_queue.py <device> --workers 6 --rounds 5
 
 Every live test runs inside the autouse `device_lock_guard` fixture, so `DeviceLock` serializes access to the physical device whether or not the test asks for it. Multiple agents (separate OS processes) can safely run tests in parallel — the lock file queues them automatically. See [Shared-device contract](#shared-device-contract-devicelock) for what that obliges non-test tools to do, and set `U64_REQUIRE_DEVICE_LOCK=1` to make an unlocked destructive call an error instead of a warning.
 
-Live suites that mutate device state (`test_u64_feature_parity_live.py`, `test_multi_sid_parallel_live.py`, `test_ultimate64_client_writemem_live.py`, the turbo/SocketDMA suites above) are double-gated behind `U64_HOST` **and** `U64_ALLOW_MUTATE=1`; with either unset they skip cleanly. The UCI UDP live probes (`test_uci_udp_send_live.py`, `test_uci_udp_send_large_live.py`) read the device address from `U64_HOST` (plus their `UCI_UDP_LIVE=1` gate, and `U64_ALLOW_MUTATE=1` because they enable the Command Interface and reset the machine, #268) — no hardcoded IPs.
+`U64_ALLOW_MUTATE=1` covers device config changes only; resets, RAM writes and stream start/stop run on `U64_HOST` alone (owner decision 2026-09-15, #333). Live suites that change device config (`test_multi_sid_parallel_live.py`, the turbo/SocketDMA suites above) are double-gated behind `U64_HOST` **and** `U64_ALLOW_MUTATE=1`; with either unset they skip cleanly. A few suites also skip their resets or RAM writes without the gate (`test_u64_feature_parity_live.py`, `test_ultimate64_client_writemem_live.py`, `test_socketdma_barrier_live.py`), which is stricter than the contract. The UCI UDP live probes (`test_uci_udp_send_live.py`, `test_uci_udp_send_large_live.py`) read the device address from `U64_HOST` (plus their `UCI_UDP_LIVE=1` gate, and `U64_ALLOW_MUTATE=1` because they enable the Command Interface, a config write, #268) — no hardcoded IPs.
 
 ## Contributing
 

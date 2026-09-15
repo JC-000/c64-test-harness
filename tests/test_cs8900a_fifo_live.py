@@ -59,7 +59,8 @@ Gates (all unset -> the module skips cleanly):
 
 * ``RRNET_LIVE=1`` -- master switch.
 * ``U64_ALLOW_MUTATE=1`` -- required: the module writes ``Cartridge
-  Preference`` (restored) and resets the machine (#268).
+  Preference`` (restored) (#268).  Its machine resets are allowed on
+  ``U64_HOST`` alone (#333).
 * ``U64_HOST``     -- the device (no IPs are committed).
 * ``RRNET_IFACE``  -- host NIC on the cartridge's link (default ``en4``).
 
