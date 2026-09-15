@@ -713,7 +713,8 @@ def _poll_budget(max_polls: int) -> tuple[int, int]:
 #: above 1518, or above 1514 unless TxCMD has InhibitCRC (``0x1000``),
 #: flagging a bid error; :data:`CS8900A_TXCMD_VALUE` ``0x00C9`` does not set
 #: it.  That is the emulator's model, source-read; silicon delivered 1514
-#: 8/8 on the U64E (issue #404) and nothing longer was tried.
+#: 8/8 on the U64E at 1 MHz (issue #404); nothing longer, and nothing at
+#: 48 MHz, was tried.
 CS8900A_TX_MAX_FRAME_LEN = 1514
 
 

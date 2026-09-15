@@ -1015,15 +1015,21 @@ Result bytes the TX builders can now store:
   unchanged. `build_tx_code` is 99 bytes up to 256, 104 at a whole number
   of pages and 120 otherwise — still at or under the 128-byte PUT
   threshold. **Measured on silicon** (U64E fw 3.15 `bce4535e`, external
-  RR-Net, 2026-09-15; ip65 `pingstatic` control passed first, `$630E`
-  identity): `build_tx_code` frames of 256/258/512/1514 bytes plus a
+  RR-Net, 2026-09-15, at 1 MHz (Turbo Control Off); not tried at 48 MHz;
+  ip65 `pingstatic` control passed first, `$630E` identity; conditions,
+  all 40 trial rows and the driver script in
+  [#404's evidence comment](https://github.com/JC-000/c64-test-harness/issues/404#issuecomment-5688922093)):
+  `build_tx_code` frames of 256/258/512/1514 bytes plus a
   no-transmit null arm, interleaved in 8 rounds with a rotated order, one
   UDP frame to en4's MAC per trial. Delivery was counted by `netstat -I
   en4 -b` deltas, not by the result byte: 256 **8/8**, 258 **7/8**, 512
   **8/8**, 1514 **8/8**, null 0/8. Every delivered trial's Ibytes delta
   equals the frame length exactly. The one 258 miss stored
   `RESULT_TX_NOT_READY` (`0x04`, nothing copied — the #236 bound, not the
-  copy loop), and the next trial sent normally without a reset. Cartridge
+  copy loop), and the next trial sent normally without a reset. Its cause
+  is not established: 1 of 32 transmits, preceded by a delivered 256
+  frame (so not a busy-after-large-frame effect), and nothing
+  length-specific is shown at n=8. Cartridge
   Preference was set `External` inside the lock and read back `Auto`
   afterwards. Odd lengths stay refused; pad the frame by one byte
   (the IP total-length field governs the datagram). Odd-length support is
