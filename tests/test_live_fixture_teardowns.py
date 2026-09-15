@@ -228,6 +228,9 @@ CASES = [
             "test_ultimate64_client_writemem_live.py",
         )
     ),
+    # #391: released the lock in a finally but never closed the client; left
+    # out of #368 because another open PR owned the file then.
+    Case("test_u64_turbo_bench_live.py", "client", "Ultimate64Client", lambda m: ["close"]),
 ]
 
 
@@ -550,6 +553,174 @@ class TestRestoreDrifted:
         assert probe.journal == sets
 
 
+class TestTurboBenchOriginalState:
+    """``test_u64_turbo_bench_live.py::original_state``: the snapshot goes back
+    on every exit, and a restore that fails is reported (#391)."""
+
+    FILE = "test_u64_turbo_bench_live.py"
+    RESTORE = [("restore", "SNAP")]
+
+    def _gen(self, probe):
+        module = _load_module(self.FILE)
+        fake = _Fake(probe.journal, probe.fail)
+        module.snapshot_state = lambda client: "SNAP"
+        module.set_reu = lambda client, **_kw: fake._do("set_reu")
+        module.restore_state = lambda client, snap: fake._do(("restore", snap))
+        module.time = SimpleNamespace(sleep=lambda seconds: None)
+        gen = _fixture_body(module, self.FILE, "original_state")(object())
+        probe.generators.append(gen)
+        return gen
+
+    def test_normal_exit_restores(self, probe) -> None:
+        gen = self._gen(probe)
+        assert next(gen) == "SNAP"
+        mark = len(probe.journal)
+        with pytest.raises(StopIteration):
+            next(gen)
+        assert _after(probe.journal, mark) == self.RESTORE
+
+    def test_an_exception_at_the_yield_still_restores_and_propagates(self, probe) -> None:
+        gen = self._gen(probe)
+        next(gen)
+        mark = len(probe.journal)
+        with pytest.raises(KeyError, match="test body"):
+            gen.throw(KeyError("test body"))
+        assert _after(probe.journal, mark) == self.RESTORE
+
+    def test_a_failed_restore_is_reported(self, probe) -> None:
+        gen = self._gen(probe)
+        next(gen)
+        probe.fail.add(("restore", "SNAP"))
+        with pytest.raises(RuntimeError, match="original_state restore") as info:
+            next(gen)
+        assert str(info.value.__cause__) == "FAKE ('restore', 'SNAP') failed"
+
+    def test_a_failed_restore_does_not_mask_the_test_body_exception(self, probe) -> None:
+        gen = self._gen(probe)
+        next(gen)
+        probe.fail.add(("restore", "SNAP"))
+        mark = len(probe.journal)
+        with pytest.raises(KeyError, match="test body"):
+            gen.throw(KeyError("test body"))
+        assert _after(probe.journal, mark) == self.RESTORE
+
+    def test_a_failed_set_reu_still_restores(self, probe) -> None:
+        gen = self._gen(probe)
+        probe.fail.add("set_reu")
+        with pytest.raises(RuntimeError, match="FAKE 'set_reu'"):
+            next(gen)
+        assert probe.journal == ["set_reu", *self.RESTORE]
+
+
+class _FakeCapture(_Fake):
+    def close(self) -> None:
+        self._do("cap.close")
+
+
+class TestFirstExchangeSession:
+    """``test_first_exchange_live.py::session``: the capture is closed and
+    ``Cartridge Preference`` put back on every exit, each step on its own, and
+    a failed step is reported without masking the test body (#391)."""
+
+    FILE = "test_first_exchange_live.py"
+
+    def _gen(self, probe, *, linest: int = 0x80):
+        from contextlib import contextmanager
+
+        module = _load_module(self.FILE)
+        journal, fail = probe.journal, probe.fail
+        client = _FakeClient(journal, fail, {})
+        client.get_config_value = lambda category, item: "ENTRY"
+        target = SimpleNamespace(
+            transport=SimpleNamespace(client=client, reset=lambda: journal.append("reset"))
+        )
+
+        @contextmanager
+        def scope(label, value):
+            try:
+                yield value
+            finally:
+                journal.append(f"{label} exit")
+
+        manager = SimpleNamespace(instance=lambda: scope("instance", target))
+        module.create_manager = lambda **_kw: scope("manager", manager)
+        module.open_capture = lambda iface: _FakeCapture(journal, fail)
+        module._host_addr = lambda iface: (bytes(6), bytes([10, 0, 0, 1]))
+        module.time = SimpleNamespace(sleep=lambda seconds: None)
+        module.wait_for_text = lambda *_a, **_kw: True
+        module.load_code = lambda *_a, **_kw: None
+        module.run_subroutine = lambda *_a, **_kw: None
+        module._stat = lambda target: (linest, 0)
+        gen = _fixture_body(module, self.FILE, "session")()
+        probe.generators.append(gen)
+        return module, gen
+
+    @staticmethod
+    def _teardown(module) -> list:
+        return [
+            "cap.close", ("config", module.CAT, module.ITEM, "ENTRY"),
+            "instance exit", "manager exit",
+        ]
+
+    def test_normal_exit_closes_restores_and_leaves_the_manager(self, probe) -> None:
+        module, gen = self._gen(probe)
+        next(gen)
+        assert ("config", module.CAT, module.ITEM, "External") in probe.journal
+        mark = len(probe.journal)
+        with pytest.raises(StopIteration):
+            next(gen)
+        assert _after(probe.journal, mark) == self._teardown(module)
+
+    def test_an_exception_at_the_yield_runs_every_step_and_propagates(self, probe) -> None:
+        module, gen = self._gen(probe)
+        next(gen)
+        mark = len(probe.journal)
+        with pytest.raises(KeyError, match="test body"):
+            gen.throw(KeyError("test body"))
+        assert _after(probe.journal, mark) == self._teardown(module)
+
+    def test_a_raising_close_still_restores_the_preference_and_is_reported(self, probe) -> None:
+        module, gen = self._gen(probe)
+        next(gen)
+        probe.fail.add("cap.close")
+        mark = len(probe.journal)
+        with pytest.raises(RuntimeError, match="session teardown") as info:
+            next(gen)
+        assert str(info.value.__cause__) == "FAKE 'cap.close' failed"
+        assert _after(probe.journal, mark) == self._teardown(module)
+
+    def test_a_raising_restore_is_reported(self, probe) -> None:
+        module, gen = self._gen(probe)
+        next(gen)
+        probe.fail.add(("config", module.CAT, module.ITEM, "ENTRY"))
+        mark = len(probe.journal)
+        with pytest.raises(RuntimeError, match="session teardown"):
+            next(gen)
+        assert _after(probe.journal, mark) == self._teardown(module)
+
+    def test_a_raising_close_does_not_mask_the_test_body_exception(self, probe) -> None:
+        module, gen = self._gen(probe)
+        next(gen)
+        probe.fail.add("cap.close")
+        mark = len(probe.journal)
+        with pytest.raises(KeyError, match="test body"):
+            gen.throw(KeyError("test body"))
+        assert _after(probe.journal, mark) == self._teardown(module)
+
+    def test_a_failed_external_put_still_closes_and_restores(self, probe) -> None:
+        module, gen = self._gen(probe)
+        probe.fail.add(("config", module.CAT, module.ITEM, "External"))
+        with pytest.raises(RuntimeError, match="FAKE"):
+            next(gen)
+        assert probe.journal[-4:] == self._teardown(module)
+
+    def test_no_link_skips_and_still_tears_down(self, probe) -> None:
+        module, gen = self._gen(probe, linest=0x00)
+        with pytest.raises(pytest.skip.Exception, match="no 10BASE-T link"):
+            next(gen)
+        assert probe.journal[-4:] == self._teardown(module)
+
+
 class _FakeManager(_Fake):
     def __init__(self, journal, fail) -> None:
         super().__init__(journal, fail)
@@ -808,8 +979,21 @@ class TestViceFixtures:
 # Structure: no fixture's finally runs two teardown calls in a row (#368)     #
 # --------------------------------------------------------------------------- #
 
-#: Calls that count as a teardown step inside a ``finally``.
-FINALLY_STEP_CALLS = frozenset({"close", "release", "stop", "shutdown"})
+#: Calls that count as a teardown step inside a ``finally``.  A config restore
+#: is one too (#391): ``cap.close()`` then ``client.set_config_item(...)`` in one
+#: ``finally`` left ``Cartridge Preference`` unrestored when the close raised.
+FINALLY_STEP_CALLS = frozenset(
+    {"close", "release", "stop", "shutdown", "set_config_item", "restore_state"}
+)
+
+
+def _callee(call: ast.Call) -> str | None:
+    """``x.close()`` -> ``close``; ``restore_state(c, s)`` -> ``restore_state``."""
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    return None
 
 
 def multi_step_finally_bodies(source: str) -> list[str]:
@@ -833,9 +1017,7 @@ def multi_step_finally_bodies(source: str) -> list[str]:
                 stmt for stmt in node.finalbody
                 if not isinstance(stmt, ast.Try)
                 and any(
-                    isinstance(sub, ast.Call)
-                    and isinstance(sub.func, ast.Attribute)
-                    and sub.func.attr in FINALLY_STEP_CALLS
+                    isinstance(sub, ast.Call) and _callee(sub) in FINALLY_STEP_CALLS
                     for sub in ast.walk(stmt)
                 )
             ]
@@ -876,12 +1058,28 @@ def test_the_multi_step_finally_scan_can_fail() -> None:
     assert multi_step_finally_bodies(source) == ["two:5", "conditional:16"]
 
 
+def test_the_multi_step_finally_scan_sees_a_config_restore() -> None:
+    """#391: the ``session`` shape -- a close then a config PUT -- and a bare
+    ``restore_state`` call beside a close are both two steps."""
+    source = (
+        "def session():\n    try:\n        yield 1\n    finally:\n"
+        "        cap.close()\n        client.set_config_item(CAT, ITEM, orig)\n"
+        "def snapshot():\n    try:\n        yield 1\n    finally:\n"
+        "        restore_state(client, snap)\n        client.close()\n"
+        "def one_put():\n    try:\n        yield 1\n    finally:\n"
+        "        client.set_config_item(CAT, ITEM, orig)\n"
+    )
+    assert multi_step_finally_bodies(source) == ["session:5", "snapshot:11"]
+
+
 # --------------------------------------------------------------------------- #
 # Structure: no live module keeps a bare post-yield release/close/shutdown   #
 # --------------------------------------------------------------------------- #
 
-#: Teardown calls that must not sit bare after a ``yield``.
-TEARDOWN_CALLS = frozenset({"release", "close", "shutdown"})
+#: Teardown calls that must not sit bare after a ``yield``.  A restore is one
+#: (#391): a bare ``restore_state(client, snap)`` after the ``yield`` never ran
+#: when the test body raised.
+TEARDOWN_CALLS = frozenset({"release", "close", "shutdown", "restore_state", "set_config_item"})
 
 def bare_teardown_calls(source: str) -> list[str]:
     """``fn:line call`` for each teardown call after a ``yield`` outside a ``finally``."""
@@ -901,8 +1099,7 @@ def bare_teardown_calls(source: str) -> list[str]:
         for node in ast.walk(fn):
             if (
                 isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr in TEARDOWN_CALLS
+                and _callee(node) in TEARDOWN_CALLS
                 and node.lineno > min(yields)
                 and id(node) not in protected
             ):
@@ -940,4 +1137,20 @@ def test_the_structure_scan_can_fail() -> None:
     )
     assert bare_teardown_calls(source) == [
         "bare:4 c.close()", "bare:5 lock.release()", "half:24 mgr.shutdown()",
+    ]
+
+
+def test_the_structure_scan_sees_a_bare_restore() -> None:
+    """#391: the ``original_state`` shape -- a bare ``restore_state`` call, a
+    plain function rather than a method -- and a bare config PUT after a
+    ``yield`` are flagged; the same calls in a ``finally`` are not."""
+    source = (
+        "def original_state(client):\n    snap = snapshot_state(client)\n"
+        "    yield snap\n    restore_state(client, snap)\n"
+        "def put_back(client):\n    yield 1\n    client.set_config_item(C, I, V)\n"
+        "def guarded(client):\n    try:\n        yield 1\n    finally:\n"
+        "        restore_state(client, snap)\n"
+    )
+    assert bare_teardown_calls(source) == [
+        "original_state:4 restore_state()", "put_back:7 client.set_config_item()",
     ]

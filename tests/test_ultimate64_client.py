@@ -656,6 +656,17 @@ def test_load_config_from_flash_single_category():
 
 # ---------------------------------------------------------------- drives mount
 def test_mount_disk_multipart_body():
+    """One file part, with ``type``/``mode`` as query arguments (#311).
+
+    ``POST drives:mount`` mounts ``get_filename(0)`` -- the first multipart
+    part -- and reads ``type``/``mode`` from the URI query
+    (``route_drives.cc:140-152`` at bce4535e).  The old body sent ``mode``
+    and ``type`` as form fields ahead of the file, so part 0 was the
+    ``mode`` field's temp file.  Measured on the U64E (fw 3.15 bce4535e,
+    2026-09-15, n=3 per arm): that body answered HTTP 400 "Invalid Type ''"
+    3/3 and mounted nothing; one file part plus ``?type=d64&mode=readonly``
+    answered 200 3/3 and mounted the uploaded image.
+    """
     mock, captured = _capture(b"")
     c = Ultimate64Client("h")
     with patch("urllib.request.urlopen", mock):
@@ -664,17 +675,22 @@ def test_mount_disk_multipart_body():
     # POST is the upload-and-mount route; PUT is mount-by-device-path and
     # has no body handler at all. See test_mount_disk_with_a_body_uses_post.
     assert req.get_method() == "POST"
+    # Parsed, not string-compared: the route reads type/mode by name, so
+    # their order in the query is not part of the contract (#421 review).
+    url = urllib.parse.urlsplit(req.get_full_url())
+    assert url.path == "/v1/drives/a:mount"
+    assert urllib.parse.parse_qs(url.query) == {"type": ["d64"], "mode": ["readonly"]}
     ct = req.get_header("Content-type")
     assert ct.startswith("multipart/form-data; boundary=")
     boundary = ct.split("boundary=", 1)[1]
     body = req.data
-    assert boundary.encode() in body
-    assert b'name="mode"' in body
-    assert b"readonly" in body
-    assert b'name="type"' in body
-    assert b"d64" in body
-    assert b'name="file"' in body
-    assert b"image.d64" in body
+    # Exactly one part, and it is the image: part 0 is what gets mounted.
+    assert body.count(f"--{boundary}\r\n".encode()) == 1
+    assert b'name="mode"' not in body
+    assert b'name="type"' not in body
+    # The mounted file is the part's filename; the field name is not read
+    # by the route (get_filename(0)), so only the filename is pinned.
+    assert b'filename="image.d64"' in body
     assert b"\x01\x02\x03" in body
     # terminated with closing boundary
     assert body.rstrip(b"\r\n").endswith(f"--{boundary}--".encode())
@@ -695,7 +711,8 @@ def test_mount_disk_slot_is_a_plain_letter():
         c.mount_disk("a", b"x", "d64")
     url = captured[0][0].get_full_url()
     assert "%3A" not in url, url
-    assert url == "http://h/v1/drives/a:mount"
+    # The query (type/mode, #311) follows the path; the slot is the path.
+    assert url.split("?", 1)[0] == "http://h/v1/drives/a:mount"
 
 
 def test_mount_disk_with_a_body_uses_post():
@@ -714,6 +731,20 @@ def test_mount_disk_with_a_body_uses_post():
     with patch("urllib.request.urlopen", mock):
         c.mount_disk("a", b"x", "d64")
     assert captured[0][0].get_method() == "POST"
+
+
+def test_mount_disk_docstring_warns_about_same_type_overwrite():
+    """#421 review / #427: on 1.1.0 a same-type re-mount overwrites the mounted file.
+
+    By source (attachment_writer.h collect(), FA_CREATE_ALWAYS on
+    /Temp/<filename>); new exposure since #311 made mount_disk work at all.
+    """
+    import inspect
+    import re as _re
+
+    doc = _re.sub(r"\s+", " ", inspect.getdoc(Ultimate64Client.mount_disk) or "")
+    for token in ("FA_CREATE_ALWAYS", "overwrites", "Remove the image", "#427", "source-read"):
+        assert token in doc, token
 
 
 def test_mount_disk_image_accepts_a_device_path():

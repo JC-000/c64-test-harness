@@ -57,8 +57,11 @@ never skips on it, is not gated.
 **Which modules are scanned** (#375): every ``test_*_live.py``, plus any
 ``tests/**/test_*.py`` that reads ``U64_HOST`` from the environment -- at
 import time always, and anywhere else unless the module supplies its own
-``U64_HOST`` (``monkeypatch.setenv``/``delenv``/``setitem``,
-``mock.patch.dict``, ``putenv``, an ``os.environ`` store or delete).  The gate
+``U64_HOST`` (``monkeypatch.setenv``/``setitem``, ``mock.patch.dict``,
+``putenv``, ``setdefault``, an ``os.environ`` store).  Removing the variable
+(``delenv``, ``delitem``, ``unsetenv``, ``pop``, ``del``) supplies nothing --
+it means "no host" and cannot make a read elsewhere in the file safe -- so it
+does not exempt a module (#396).  The gate
 protects the device the operator named, and a test reaches that device only
 through the ``U64_HOST`` the operator exported: a module that sets the
 variable itself is driving the harness against a host it chose
@@ -103,9 +106,12 @@ reads more into a green run:**
   ``monkeypatch.setenv``, anywhere in the file) arms its own gate.  A store
   through an alias or a computed key is not seen.
 * Module selection is by name as well: a module outside ``test_*_live.py``
-  that reads the host through an alias or a helper, or reads it only inside
-  a function while also setting ``U64_HOST`` elsewhere in the file, is not
-  scanned (#375).
+  that reads the host through an alias or a helper is not scanned (#375).
+  The supply check is **file-wide**: a module that reads the operator's host
+  inside one function while *setting* ``U64_HOST`` (not removing it) in
+  another is not scanned either (#396 narrowed this to stores; scoping it to
+  the reading function would newly select ``test_device_lock_advisory.py``,
+  whose read and store sit in different tests).
 * A rebinding through ``globals()['_M'] = '1'`` (or ``setattr`` on the
   module) is not seen by the binder.
 """
@@ -908,12 +914,13 @@ def _live_modules() -> list[Path]:
 #: The environment variable that names the device a test drives.
 HOST_VAR = "U64_HOST"
 
-#: Calls that set or remove an environment key given as the first argument.
-_HOST_KEY_FIRST = frozenset({
-    "setenv", "delenv", "putenv", "unsetenv", "setdefault", "pop", "__setitem__", "__delitem__",
-})
-#: Calls that set or remove a mapping key given as the second argument (``monkeypatch.setitem``).
-_HOST_KEY_SECOND = frozenset({"setitem", "delitem"})
+#: Calls that set an environment key given as the first argument.  Removals
+#: (``delenv``, ``unsetenv``, ``pop``, ``__delitem__``) are deliberately absent:
+#: they supply no host (#396).
+_HOST_KEY_FIRST = frozenset({"setenv", "putenv", "setdefault", "__setitem__"})
+#: Calls that set a mapping key given as the second argument (``monkeypatch.setitem``;
+#: ``delitem`` is a removal, absent for the same reason).
+_HOST_KEY_SECOND = frozenset({"setitem"})
 
 
 def _is_host_key(node: ast.AST | None) -> bool:
@@ -936,11 +943,16 @@ def reads_the_host_at_import(tree: ast.Module) -> bool:
 
 
 def supplies_its_own_host(tree: ast.AST) -> bool:
-    """The module sets or removes ``U64_HOST`` itself, anywhere in the file."""
+    """The module sets ``U64_HOST`` itself, anywhere in the file.
+
+    Only a store counts.  A removal (``delenv``, ``del os.environ[...]``) says
+    "no host": it cannot make a read of the operator's host in another
+    function of the same file safe, so it does not exempt the module (#396).
+    """
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Subscript)
-            and isinstance(node.ctx, (ast.Store, ast.Del))
+            and isinstance(node.ctx, ast.Store)
             and _is_environ(node.value)
             and _is_host_key(node.slice)
         ):
@@ -1089,19 +1101,30 @@ class TestModuleSelection:
         ("NAME = 'U64_HOST'\ndef test_a():\n    return 'needs U64_HOST'\n", False),
         ("import os\ndef test_a(monkeypatch):\n    monkeypatch.setenv('U64_HOST', '10.0.0.1')\n"
          "    Client(os.environ.get('U64_HOST'))\n", False),
-        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.delenv('U64_HOST', raising=False)\n"
-         "    os.environ.get('U64_HOST')\n", False),
         ("import os\ndef test_a(monkeypatch):\n    monkeypatch.setitem(os.environ, 'U64_HOST', 'x')\n"
          "    os.environ.get('U64_HOST')\n", False),
         ("import os\nfrom unittest import mock\n"
          "@mock.patch.dict(os.environ, {'U64_HOST': 'x'})\ndef test_a():\n    os.environ.get('U64_HOST')\n", False),
         ("import os\ndef test_a():\n    os.environ['U64_HOST'] = 'x'\n    os.environ.get('U64_HOST')\n", False),
+        ("import os\ndef test_a():\n    os.environ.setdefault('U64_HOST', 'x')\n    os.environ.get('U64_HOST')\n", False),
         ("import os\n_H = os.environ.get('U64_HOST')\n"
          "def test_a(monkeypatch):\n    monkeypatch.setenv('U64_HOST', 'x')\n", True),
+        # #396: removing the variable says "no host"; it supplies nothing, so it
+        # cannot make a read of the operator's host elsewhere in the file safe.
+        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.delenv('U64_HOST', raising=False)\n"
+         "    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a(monkeypatch):\n    monkeypatch.delitem(os.environ, 'U64_HOST', raising=False)\n"
+         "    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a():\n    os.environ.pop('U64_HOST', None)\n    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a():\n    os.unsetenv('U64_HOST')\n    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a():\n    del os.environ['U64_HOST']\n    os.environ.get('U64_HOST')\n", True),
+        ("import os\ndef test_a():\n    os.environ.__delitem__('U64_HOST')\n    os.environ.get('U64_HOST')\n", True),
     ], ids=[
         "import-time-get", "import-time-getenv", "in-test-subscript", "no-read", "name-only",
-        "setenv-mocked", "delenv-mocked", "setitem-mocked", "patch-dict-mocked", "environ-store-mocked",
-        "import-time-read-beats-a-later-setenv",
+        "setenv-mocked", "setitem-mocked", "patch-dict-mocked", "environ-store-mocked",
+        "setdefault-mocked", "import-time-read-beats-a-later-setenv",
+        "396-delenv-is-not-a-host", "396-delitem-is-not-a-host", "396-pop-is-not-a-host",
+        "396-unsetenv-is-not-a-host", "396-del-subscript-is-not-a-host", "396-dunder-delitem-is-not-a-host",
     ])
     def test_drives_a_named_device(self, source, drives) -> None:
         assert drives_a_named_device(ast.parse(source)) is drives
@@ -1129,6 +1152,57 @@ class TestModuleSelection:
         assert drives_a_named_device(tree)
         assert gate_offence(src, "test_x.py", {"set_turbo_mhz"}) == {"set_turbo_mhz"}
         assert ungated_tests_that_write(tree, {"set_turbo_mhz"}) == ["test_a (set_turbo_mhz)"]
+
+    #: #396, the reviewer's planted module: the fixture reads the operator's
+    #: host inside a function, one test removes the variable, another writes
+    #: config ungated.  On the base the ``delenv`` exempted the whole file.
+    PLANTED = (
+        "import os\n"
+        "import pytest\n"
+        "from c64_test_harness.backends.ultimate64_helpers import enable_uci\n"
+        "\n"
+        "@pytest.fixture\n"
+        "def client():\n"
+        "    host = os.environ.get('U64_HOST')\n"
+        "    if not host:\n"
+        "        pytest.skip('no host')\n"
+        "    return host\n"
+        "\n"
+        "def test_skips_cleanly_without_a_host(monkeypatch):\n"
+        "    monkeypatch.delenv('U64_HOST', raising=False)\n"
+        "\n"
+        "def test_enables_uci(client):\n"
+        "    enable_uci(client)\n"
+    )
+
+    def test_a_delenv_does_not_exempt_the_planted_module(self, tmp_path) -> None:
+        (tmp_path / "test_planted.py").write_text(self.PLANTED)
+        assert [p.name for p in _scanned_modules(tmp_path)] == ["test_planted.py"]
+        tree = ast.parse(self.PLANTED)
+        assert gate_offence(self.PLANTED, "test_planted.py", {"enable_uci"}) == {"enable_uci"}
+        assert ungated_tests_that_write(tree, {"enable_uci"}) == ["test_enables_uci (enable_uci)"]
+
+    def test_the_planted_module_with_a_setenv_is_still_exempt_control(self, tmp_path) -> None:
+        """Control: the same module supplying a host (not removing it) stays out,
+        so the negative above is the delete rule, not selection of every reader."""
+        src = self.PLANTED.replace(
+            "monkeypatch.delenv('U64_HOST', raising=False)", "monkeypatch.setenv('U64_HOST', 'x')"
+        )
+        assert src != self.PLANTED
+        (tmp_path / "test_planted.py").write_text(src)
+        assert _scanned_modules(tmp_path) == []
+
+    @pytest.mark.parametrize("name", [
+        "test_device_lock_advisory.py", "test_live_fixture_teardowns.py",
+        "test_u64_runner_script_gates.py", "test_unified_manager.py", "test_wav_capture_paths.py",
+    ])
+    def test_the_corpus_modules_that_mock_the_host_stay_unselected(self, name) -> None:
+        """Controls from #396: all mocked unit/scan tests that supply or remove
+        ``U64_HOST``.  Each still exists, and none is selected."""
+        path = TESTS_DIR / name
+        assert path.is_file(), f"{name} is gone; drop it from the controls"
+        assert "U64_HOST" in path.read_text()
+        assert path not in _scanned_modules()
 
 
 class TestTheScannerItselfCanFail:
