@@ -1942,8 +1942,10 @@ def _execute_uci_routine(
     this calls ``transport.reset(scope="cpu")`` -- on a U64 the bodyless
     ``PUT machine:reset`` (no ``/Temp`` cost), which pulses the 6510 reset
     only and leaves the ``Command Interface`` config and FPGA enable alone
-    (firmware ``MENU_C64_RESET`` -> ``C64::reset``, read at tag ``1.1.0``
-    and at ``871ad034`` of the 3.15 preview tree, not measured) -- then
+    (firmware ``MENU_C64_RESET`` -> ``C64::reset``, not measured; read at
+    tag ``1.1.0``, ``c64.cc:593-601``, and at ``7f6fcb51`` (the U64E's
+    v3.15-85), ``c64.cc:612-620``, ``c64_subsys.cc:217-224``,
+    ``route_machine.cc:73-85``; unchanged at ``871ad034``) -- then
     sleeps :data:`_TIMEOUT_RESET_SETTLE` so the KERNAL is back at
     ``READY.`` before the next ``SYS`` is typed. It never uses
     ``scope="machine"``: on a U64 that is ``machine:reboot``, which returns
