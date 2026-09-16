@@ -74,9 +74,6 @@ network state, it only injects and reads frames on the given NIC.
 from __future__ import annotations
 
 import os
-import platform
-import re
-import subprocess
 import time
 
 import pytest

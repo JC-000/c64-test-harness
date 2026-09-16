@@ -62,9 +62,6 @@ reports, never the value read at entry (#412).  Never: ``save_config_to_flash``,
 from __future__ import annotations
 
 import os
-import platform
-import re
-import subprocess
 import time
 
 import pytest
