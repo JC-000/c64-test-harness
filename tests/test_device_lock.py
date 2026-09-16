@@ -15,7 +15,10 @@ import pytest
 
 from c64_test_harness.backends.device_lock import (
     DeviceLock,
+    _device_lock_key,
     _sanitize_device_id,
+    device_lock_path,
+    normalize_device_host,
 )
 
 
@@ -45,6 +48,101 @@ class TestSanitizeDeviceId:
 
     def test_collapses_underscores(self) -> None:
         assert _sanitize_device_id("a@@b") == "a_b"
+
+
+# -- One device, one lockfile (#434) --
+
+
+#: Spellings of one device.  Each reaches the same hardware, so each must
+#: reach the same lockfile, or the lock stops excluding anything.
+_ONE_DEVICE = (
+    "u64.lan",
+    "U64.Lan",
+    "http://u64.lan/",
+    "u64.lan:80",
+    " u64.lan. ",
+)
+
+
+def _try_acquire(spelling: str, lock_dir: Path, out: list[str]) -> None:
+    """Take the device under *spelling*, record it, release immediately."""
+    other = DeviceLock(spelling, lock_dir=lock_dir)
+    if other.acquire(timeout=20.0):
+        out.append(spelling)
+        other.release()
+
+
+class TestOneDeviceOneLockfile:
+    """Aliasing in the lock key defeats device exclusion (#434).
+
+    Keying on the raw string gave these five spellings four different
+    lockfiles, so two lanes could each hold "the lock" and drive one
+    device at the same time.
+    """
+
+    def test_spellings_of_one_device_name_one_lockfile(self, lock_dir: Path) -> None:
+        paths = {str(device_lock_path(s, lock_dir=lock_dir)) for s in _ONE_DEVICE}
+        assert paths == {str(lock_dir / "device-u64.lan.lock")}
+
+    def test_a_second_spelling_cannot_acquire_while_the_first_holds(
+        self, lock_dir: Path
+    ) -> None:
+        """The kernel-level half: genuine second flocks, taken on other
+        threads (not the same-thread self-held short-circuit), must not
+        get the device under any other spelling.
+
+        The waiters get a *long* timeout deliberately. A live holder
+        extends a waiter's deadline indefinitely -- the anti-starvation
+        contract -- so "acquire returned False quickly" is not available
+        as a signal, and asking for it is how an earlier draft of this
+        test failed on the fixed code. What is observable is that no
+        waiter acquires while the holder holds. Before #434 each spelling
+        took a *different* lockfile and acquired at once.
+        """
+        held = DeviceLock(_ONE_DEVICE[0], lock_dir=lock_dir)
+        assert held.acquire(timeout=5.0)
+        acquired: list[str] = []
+        threads = [
+            threading.Thread(target=_try_acquire, args=(s, lock_dir, acquired))
+            for s in _ONE_DEVICE[1:]
+        ]
+        try:
+            for t in threads:
+                t.start()
+            time.sleep(1.0)  # observation window, with the device held
+            took_it = list(acquired)
+        finally:
+            held.release()
+
+        for t in threads:
+            t.join(timeout=30.0)
+            assert not t.is_alive(), "a waiter never finished after the release"
+
+        assert took_it == [], (
+            f"these spellings took the device while it was held as "
+            f"{_ONE_DEVICE[0]!r}: {took_it}"
+        )
+
+    def test_a_different_port_is_still_a_different_device(
+        self, lock_dir: Path
+    ) -> None:
+        """Folding every port would be the opposite bug: two devices
+        behind one name sharing one lock."""
+        assert device_lock_path("gw.example:8080", lock_dir=lock_dir) != (
+            device_lock_path("gw.example:8081", lock_dir=lock_dir)
+        )
+
+    def test_a_name_and_its_ip_stay_separate_documented_limit(self) -> None:
+        """No DNS in the keying path: taking a lock must not wait on a
+        resolver.  Pinned so the limit is a decision, not an accident."""
+        with patch("socket.getaddrinfo", side_effect=AssertionError("no DNS")):
+            assert _device_lock_key("localhost") != _device_lock_key("127.0.0.1")
+
+    def test_the_sanitizer_still_runs_after_normalising(self) -> None:
+        """Normalising may leave characters that must not go in a filename
+        (a kept port's colon), so the sanitiser is still applied."""
+        assert normalize_device_host("GW.Example:8080") == "gw.example:8080"
+        assert _device_lock_key("GW.Example:8080") == "gw.example_8080"
 
 
 # -- Basic acquire / release --
