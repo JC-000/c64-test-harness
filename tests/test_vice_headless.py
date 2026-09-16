@@ -49,13 +49,27 @@ def gui_app_count(pid: int) -> int:
 
     A GTK3 process that creates its window registers with LaunchServices
     and acquires a display name; a ``-console`` process never builds the
-    UI and stays unregistered, so ``lsappinfo`` reports the name as
-    ``[ NULL ]``.  This is the observable difference between a windowed
-    and a headless launch, and it needs no extra Python dependency and no
+    UI and stays unregistered, so ``lsappinfo`` has nothing to report for
+    it.  This is the observable difference between a windowed and a
+    headless launch, and it needs no extra Python dependency and no
     accessibility permission.
 
-    Measured on this bench across repeated launches: windowed →
-    ``"LSDisplayName"="x64sc"``, headless → ``"LSDisplayName"=[ NULL ]``.
+    Only the *name* field decides, and it is the first line of the
+    output.  Measured on this bench 2026-09-16 (macOS Darwin 27,
+    VICE 3.10):
+
+    * windowed → ``"x64sc" ASN:0x0-0x1ebfebe:``, followed by further
+      lines in which ``bundleID``, ``bundle path`` and ``executable
+      path`` are each ``[ NULL ]`` — an unbundled binary has no such
+      metadata even when its window is up.
+    * headless → the empty string; the process never registers at all.
+
+    So a blanket ``"[ NULL ]" in text`` test is wrong: it matches those
+    unrelated bundle fields and reports 0 for *every* process.  Measured
+    the same day, that spelling returned 0 for Finder, Dock, loginwindow
+    and launchd alike, which made the two ``-console`` assertions below
+    pass vacuously and left this module's positive control as the only
+    test in it that could still fail.
     """
     try:
         out = subprocess.run(
@@ -66,8 +80,9 @@ def gui_app_count(pid: int) -> int:
         )
     except (OSError, subprocess.TimeoutExpired):  # pragma: no cover - bench-dependent
         pytest.skip("lsappinfo unavailable")
-    text = out.stdout.strip()
-    if not text or "[ NULL ]" in text:
+    lines = out.stdout.strip().splitlines()
+    name = lines[0].strip() if lines else ""
+    if not name or name.startswith("[ NULL ]"):
         return 0
     return 1
 
