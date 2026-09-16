@@ -653,10 +653,10 @@ def test_a_different_port_is_a_different_device(one, other):
     """``DeviceLock`` keys ports apart, so the ledger must too: two devices
     behind one name would otherwise share a budget, and a failed pass
     against one would refuse attachment-creating requests to the other."""
-    from c64_test_harness.backends.device_lock import _sanitize_device_id
+    from c64_test_harness.backends.device_lock import _device_lock_key
 
     assert gc_mod.temp_ledger_key(one) != gc_mod.temp_ledger_key(other)
-    assert _sanitize_device_id(one) != _sanitize_device_id(other)
+    assert _device_lock_key(one) != _device_lock_key(other)
 
 
 @pytest.mark.parametrize("spelling,bare", [
@@ -668,6 +668,41 @@ def test_the_default_rest_port_still_folds(spelling, bare):
     """``host:80`` and ``host`` name one device -- 80 is the client's own
     ``port`` default -- so that one port still folds."""
     assert gc_mod.temp_ledger_key(spelling) == gc_mod.temp_ledger_key(bare)
+
+
+# --------------------------------------------------------------------------- #
+# The lock and the ledger share one normaliser (#434)                         #
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("one,other,same_device", [
+    ("u64.lan", "U64.Lan", True),
+    ("u64.lan", "http://u64.lan/", True),
+    ("u64.lan", "u64.lan:80", True),
+    ("u64.lan", "u64.lan.", True),
+    ("10.0.0.7", " 10.0.0.7 ", True),
+    ("::1", "[::1]", True),
+    ("gw.example:8080", "gw.example:8081", False),
+    ("gw.example:8080", "gw.example", False),
+    ("localhost", "127.0.0.1", False),       # documented limit: no DNS
+])
+def test_the_lock_and_the_ledger_agree_on_what_one_device_is(one, other, same_device):
+    """The two keyers must fold and separate the *same* spellings.
+
+    They key per device for the same reason, so a disagreement is a real
+    defect: a lane could hold the ``DeviceLock`` under one spelling while
+    another spelling of the same device spent a second ``/Temp`` budget on
+    that hardware, or two genuinely different devices could share one.
+    Nothing pinned this before #434, and the two were in fact different
+    functions.
+    """
+    from c64_test_harness.backends.device_lock import _device_lock_key
+
+    ledger_folds = gc_mod.temp_ledger_key(one) == gc_mod.temp_ledger_key(other)
+    lock_folds = _device_lock_key(one) == _device_lock_key(other)
+    assert ledger_folds is lock_folds is same_device, (
+        f"ledger folds={ledger_folds}, lock folds={lock_folds}, "
+        f"expected {same_device} for {one!r} vs {other!r}"
+    )
 
 
 def test_two_ports_on_one_name_do_not_share_a_budget():

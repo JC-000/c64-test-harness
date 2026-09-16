@@ -299,6 +299,39 @@ calls, counted across every client of that host in the process (issue
 #295). The pass runs before the call that would overrun it, and only a
 successful pass resets the count.
 
+**The budget is per device only *within a process*, and that is an
+accepted limit** ([#433](https://github.com/JC-000/c64-test-harness/issues/433)).
+`TempLedger` is a module-level registry, so two processes driving one
+leak-prone device keep two ledgers and each spends its own budget: the
+worst peak before a sweep is `budget x processes`, not `budget`. Two
+things bound the cross-process case today, and it is worth being precise
+about which case each one covers:
+
+- the **lock-release drain**, which sweeps the device while the releasing
+  process still holds its `DeviceLock`, so the next lane inherits a clean
+  `/Temp`;
+- the **inherited sweep** ([#264](https://github.com/JC-000/c64-test-harness/issues/264)),
+  by which an armed client that leaked nothing still collects what it
+  found while holding the lock.
+
+Both act at a hand-off. **Neither bounds two processes uploading
+concurrently.** Held as intended the lock prevents that — the uploads are
+destructive, and taking turns is what the lock is for — but the lock is
+advisory ([`device_locking.md`](device_locking.md)), and
+`run_u64_parallel_locked.py` interleaves tests from several processes on
+one device, releasing between them. So the real bound on the peak is the
+lock discipline, not the ledger.
+
+Closing it properly was considered and declined. Counting **on the
+device** (an FTP `/Temp` listing before each attachment-creating request)
+is the only count that cannot drift, but it adds a round trip to every
+such call and needs FTP File Service, which is off by default on 1.1.0.
+Counting **in the lockfile** reuses a file that is already per-device and
+already shared, but it is a last-writer-wins slot and a crash between the
+upload and the write loses the count — an undercount, which is the
+dangerous direction. Neither was judged worth its cost against a bound
+the lock already provides.
+
 Why 6. Upstream is the only firm bound: the firmware's
 own post-#686 collector keeps at most **10** managed files
 (`kManagedTempMaxFiles`), upstream's own statement of a safe resident

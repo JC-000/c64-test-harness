@@ -71,7 +71,6 @@ that lock -- this module does not acquire one itself.
 """
 from __future__ import annotations
 
-import ipaddress
 import json
 import logging
 import os
@@ -83,6 +82,8 @@ import weakref
 from dataclasses import dataclass, field
 from ftplib import FTP, all_errors as _FTP_ALL_ERRORS
 from typing import Any, Callable, NamedTuple
+
+from .device_lock import DEFAULT_DEVICE_PORT, normalize_device_host
 
 _log = logging.getLogger(__name__)
 
@@ -208,11 +209,12 @@ DEFAULT_LEAK_BUDGET = 6
 #: The device's REST port (``Ultimate64Client``'s ``port`` default). A
 #: ``host:80`` spelling names the same device as a bare ``host``, so
 #: :func:`temp_ledger_key` folds that one port and keeps every other.
-#: ``DeviceLock._sanitize_device_id`` keeps ``gw:8080`` and ``gw:8081``
-#: apart, so a ledger that folded all ports would let a failed pass
-#: against one device refuse requests to a different one behind the same
-#: name (#434 follow-up).
-DEFAULT_REST_PORT = 80
+#: ``DeviceLock`` keys ``gw:8080`` and ``gw:8081`` apart, so a ledger that
+#: folded all ports would let a failed pass against one device refuse
+#: requests to a different one behind the same name (#434). Since #434 both
+#: sides read this one constant, through the one shared normaliser, so the
+#: two cannot drift apart.
+DEFAULT_REST_PORT = DEFAULT_DEVICE_PORT
 
 DEFAULT_FTP_PORT = 21
 DEFAULT_FTP_TIMEOUT = 10.0
@@ -356,55 +358,23 @@ def leak_budget(default: int = DEFAULT_LEAK_BUDGET) -> int:
 def temp_ledger_key(host: str) -> str:
     """Normalise a client's host string to the key its device's ledger uses.
 
-    Folds together spellings of one address: surrounding whitespace, case,
-    an ``http://``/``https://`` scheme, a trailing path, IPv6 brackets, a
-    trailing dot, and the textual forms of one IP address
-    (``0:0:0:0:0:0:0:1`` and ``::1``).
+    **This delegates to**
+    :func:`~c64_test_harness.backends.device_lock.normalize_device_host`
+    and adds nothing -- the ledger and the ``DeviceLock`` key their state
+    through one normaliser, deliberately
+    (#434). They key per device for the same reason, so a spelling that
+    reaches one lockfile must reach one ledger: if they disagreed, a lane
+    could hold the lock under one spelling while another spelling of the
+    same device spent its own ``/Temp`` budget on the same hardware.
 
-    **A non-default port is kept.** Only ``:80`` folds
-    (:data:`DEFAULT_REST_PORT`, the client's own default), because
-    ``host:80`` and ``host`` name one device. ``gw:8080`` and ``gw:8081``
-    are two devices as far as ``DeviceLock`` is concerned -- its
-    ``_sanitize_device_id`` keys them apart -- so merging them would let a
-    failed pass against one refuse attachment-creating requests to the
-    other (#434 follow-up).
-
-    **A name and the address it resolves to are not folded.** That would need
-    a DNS lookup in the accounting path, which can block for seconds and can
-    answer differently over time. ``/Temp`` is a property of the device, so
-    two spellings that reach one device through different names keep two
-    ledgers; use one spelling per device within a process.
+    Folds surrounding whitespace, case, an ``http://``/``https://`` scheme,
+    a trailing path, IPv6 brackets, a trailing dot, and the textual forms of
+    one IP address. Keeps a non-default port -- ``gw:8080`` and ``gw:8081``
+    are two devices, in the lock and in the ledger alike. Does **not** fold
+    a name with the address it resolves to (no DNS in the keying path); see
+    that function for both rules and why.
     """
-    s = str(host).strip().lower()
-    for scheme in ("http://", "https://"):
-        if s.startswith(scheme):
-            s = s[len(scheme):]
-            break
-    s = s.split("/", 1)[0]
-    port = ""
-    if s.startswith("["):
-        end = s.find("]")
-        if end != -1:
-            rest = s[end + 1:]
-            s = s[1:end]
-            if rest.startswith(":") and rest[1:].isdigit():
-                port = rest[1:]
-    elif s.count(":") == 1:
-        name, _, maybe_port = s.partition(":")
-        if maybe_port.isdigit():
-            s, port = name, maybe_port
-    s = s.rstrip(".")
-    try:
-        s = str(ipaddress.ip_address(s))
-    except ValueError:
-        pass
-    if not s:
-        return str(host)
-    if port and int(port) != DEFAULT_REST_PORT:
-        # Re-bracket an IPv6 literal so "address" and "port" stay readable
-        # (and so ``::1`` with a port cannot collide with a bare address).
-        return f"[{s}]:{port}" if ":" in s else f"{s}:{port}"
-    return s
+    return normalize_device_host(host)
 
 
 class TempLedger:
@@ -420,10 +390,26 @@ class TempLedger:
     pass, so concurrent clients of one device take turns rather than both
     sweeping, and the count never rises above the budget between them.
 
-    **In-process only.** Two processes against one device still keep two
-    ledgers. What covers the hand-off between processes is the lock-release
-    drain (:meth:`drain_on_lock_release`), which runs while the releasing
-    process still holds the device's ``DeviceLock``.
+    **In-process only, and that is an accepted limit (#433).** Two processes
+    against one device keep two ledgers and each spends its own budget, so
+    the worst peak before a sweep is ``budget x processes``. What covers the
+    hand-off between processes is the lock-release drain
+    (:meth:`drain_on_lock_release`), which runs while the releasing process
+    still holds the device's ``DeviceLock``, plus the inherited sweep (#264)
+    by which the next lane collects what it found. **Neither bounds two
+    processes uploading concurrently** -- with the lock held as intended
+    that does not happen, because the uploads are destructive and the lock
+    is how lanes take turns, but the lock is advisory
+    (``docs/device_locking.md``) and ``run_u64_parallel_locked.py``
+    interleaves tests from several processes on one device, releasing
+    between tests.
+
+    Closing it properly means counting on the device rather than in the
+    process -- an FTP ``/Temp`` listing before each attachment-creating
+    request (no attachment, but a round trip, and FTP File Service is off by
+    default on 1.1.0), or a count in the lockfile (shared, but
+    last-writer-wins and lossy across a crash). Neither was judged worth its
+    cost against a bound the lock already provides.
     """
 
     def __init__(self, key: str) -> None:
