@@ -1171,7 +1171,7 @@ client.stream_debug_start("239.0.1.66:11002")
 
 What to use turbo-speed capture for: aggregate statistics that tolerate uniform subsampling (which addresses are hit, hot-path frequency, read/write ratios). What *not* to use it for: call-graph reconstruction, exact cycle counting, transition chains (any read-modify-write, IRQ-entry sequence, or timing-sensitive inspection).
 
-The `multicast_group=` argument on `DebugCapture` is the portable receive path — the U64's default `Stream Debug to` destination is the multicast group `239.0.1.66:11002`. Unicast (`<local-ip>:11002`) only works when the Mac/Linux host and the U64 share an L2 segment; multicast works as long as your switch forwards admin-scoped multicast to the host NIC.
+The `multicast_group=` argument on `DebugCapture` is the portable receive path — the U64's default `Stream Debug to` destination is the multicast group `239.0.1.66:11002`. Unicast (`<local-ip>:11002`) only works when the Mac/Linux host and the U64 share an L2 segment. **Multicast has not been observed to deliver on this bench**: #399 measured zero packets in every arm — including a raw socket joined on the en0 address that routes to the device — against a unicast control of 278/281/339 (n=3 paired, interleaved, U64E fw bce4535e, 2026-09-15). The cause is unestablished and open as #461. Use unicast. If you try the group anyway, name the interface: `multicast_interface=` (or `device_host=`, which resolves it) on `AudioCapture`/`DebugCapture`/`VideoCapture` — the join was INADDR_ANY before #399, and on this bench the kernel routes `239.0.1.x` via the VPN.
 
 ### Recovering from FPGA UDP-rate degradation
 
