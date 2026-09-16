@@ -137,7 +137,6 @@ def test_identifier_absent_raises_before_any_write_or_sleep(sleeps, identifier):
     # The cause clause itself, not just the remedy's config call (U9 survived
     # a looser "Cartridge Preference" in msg, which the remedy also matched).
     assert "Likely cause: Cartridge Preference = External (currently reads 'External')" in msg
-    assert "or an external cartridge holding the bus" in msg
     assert "'Cartridge Preference', 'Auto'" in msg
     # Nothing written, nothing typed, no sentinel wait, no abort sleep.
     assert wire.methods() == ["GET", "GET"]

@@ -12,9 +12,15 @@ of the CPU's actual turbo speed. This matches the 6510's native rate
 at 1 MHz, so at 1 MHz you get an essentially complete cycle-accurate
 trace. At higher turbo speeds you get a **uniformly sampled 1/N view**
 of the real bus: at 4 MHz you see ~1/4 of cycles, at 48 MHz ~1/48.
-The FPGA does NOT attempt to send everything and drop on overflow
-(the speed sweep saw no extra sequence-number gaps at higher speeds);
-it rate-limits at the source. See
+The speed sweep saw no extra sequence-number gaps at higher speeds,
+which reads as the FPGA rate-limiting at the source rather than
+sending everything and dropping on overflow. **That reading is
+unverified (#431)**: the emitter is proprietary FPGA IP absent from
+the public source, so it cannot be checked there, and the Wi-Fi
+downlink is a confound -- sequence gaps are a property of this
+bench's link as much as of the emitter, and how quiet the link was
+during the sweep was never recorded. A wired-host reproduction
+would settle it. See
 ``tests/test_u64_debug_stream_speed_live.py`` for the measurement.
 Turbo speed adds no gaps, but the bench's own loss does: a 1 s capture
 on the U64E measured 0.4-45% of packets lost to gaps (#356). The host's
@@ -34,20 +40,28 @@ items back to the firmware default; ``set_turbo_mhz(client, 1)`` also runs at
 aggregate statistics (PC distribution, frequency maps), turbo-speed
 capture is fine because the sampling is uniform.
 
-**FPGA degradation under sustained workload (issue #81)** (re-grade pending:
-Wi-Fi loss is a confound, #431)
+**Delivery degradation under sustained workload (issue #81) -- unverified (#431)**
 
-Independent of the rate cap above, the U64E FPGA's debug-stream
-emitter exhibits *delivery-rate degradation* over time when the
-device is under sustained adjacent workload. Observed delivery
-drops to **30-90% of the configured rate** after a long run, with
-``packets_received`` falling well below the expected ~2,400/sec
-even at 1 MHz. Recovery requires :meth:`Ultimate64Client.reboot`
-(a C64-level reset, ~8s -- it restarts the C64 side and re-inits
-the cartridge/REU, but does not restart the firmware); a soft
-:meth:`Ultimate64Client.reset` is **insufficient**. For multi-routine benches, prefer constructing
-the capture via :meth:`DebugCapture.with_fresh_fpga` so each
-routine starts on a fresh emitter.
+What was *observed*: over a long run with sustained adjacent
+workload, delivery fell to **30-90% of the configured rate**, with
+``packets_received`` well below the expected ~2,400/sec even at
+1 MHz, and :meth:`Ultimate64Client.reboot` restored it where a soft
+:meth:`Ultimate64Client.reset` did not.
+
+What is **not** established is that the FPGA's emitter is the cause.
+The Wi-Fi downlink is a confound and reproduces the same signature
+without any FPGA involvement: a ~32 Mbps debug stream shares this
+bench's host link with whatever else is on it, and adjacent host
+load that never touches the device raised audio loss about 27-fold
+(#410, paired n=6). Nobody recorded which host path the #81 runs
+used, and there has been no wired-host reproduction. The emitter is
+proprietary FPGA IP absent from the public source, so the claim
+cannot be checked there either.
+
+So treat :meth:`DebugCapture.with_fresh_fpga` as a remedy that was
+observed to help, not as a diagnosis -- and on a degraded stream
+look for load on the host link first, since that is the one
+mechanism here that has been measured.
 
 **Cycle-counting on real silicon: use a tolerance window**
 
@@ -371,11 +385,15 @@ class DebugCapture:
         correction and is kept because it is public API (#269); the
         empirical behaviour below is unaffected either way.
 
-        The U64E FPGA's debug-stream emitter degrades over time under
-        sustained workload — observed delivery drops to 30-90% of the
-        configured rate after a long run, and only a full
-        :meth:`Ultimate64Client.reboot` restores it. A soft
-        :meth:`Ultimate64Client.reset` is insufficient (see issue #81).
+        Debug-stream delivery was observed to degrade over a long run
+        under sustained workload — down to 30-90% of the configured
+        rate — with a full :meth:`Ultimate64Client.reboot` restoring it
+        where a soft :meth:`Ultimate64Client.reset` did not (issue #81).
+        **That the FPGA emitter is the cause is unverified (#431)**: the
+        Wi-Fi downlink is a confound that reproduces the same signature
+        (see the module docstring). This constructor is worth using
+        because the reboot was observed to help, not because the
+        mechanism is settled.
 
         Use this constructor before each routine in a multi-routine bench::
 
@@ -392,8 +410,9 @@ class DebugCapture:
         This helper NEVER calls :meth:`Ultimate64Client.poweroff` —
         ``poweroff`` is irrecoverable over the network and requires
         physical access to power-cycle. ``reboot()`` is the right
-        primitive here — empirically it restores the emitter and
-        ``reset()`` does not (#81).
+        primitive here — empirically it restored delivery where
+        ``reset()`` did not (#81), whatever the mechanism turns out to
+        be (#431).
 
         :param client: Connected Ultimate64 client.
         :param capture_kwargs: Forwarded as ``**kwargs`` to the

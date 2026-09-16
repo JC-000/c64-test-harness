@@ -256,7 +256,11 @@ _TRANSIENT_OWNERS = (
     "snapshot.extract_reu_contents",
 )
 _NON_TRANSIENT_STARTS = [
-    0x0000, 0x00C6, 0x0277, 0x0314, 0x0334, 0x0339, 0x033C, 0x0360, 0x03F0,
+    # $00F0 and $00FB are the 6510-side zero-page scratch (#437): written
+    # by the emitted 6502 code, not by a host write_memory, so no policy
+    # check can see them.  Non-transient — nothing writes them back.
+    0x0000, 0x00C6, 0x00F0, 0x00FB, 0x0277, 0x0314, 0x0334, 0x0339, 0x033C,
+    0x0360, 0x03F0,
     0xC000, 0xC100, 0xC400, 0xC403, 0xC500, 0xCF00,
 ]
 

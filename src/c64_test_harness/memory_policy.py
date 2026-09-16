@@ -249,7 +249,24 @@ class ScratchRegion:
 
 #: Every fixed C64 RAM address the harness writes as part of normal
 #: operation, verified against the code that performs the write (the
-#: owner column).  Inclusion criterion: library writes under ``src/``
+#: owner column).
+#:
+#: **Two kinds of write are listed, and they are guarded differently**
+#: (#437).  Most entries are *host-side*: the harness DMAs them through
+#: ``transport.write_memory``, so :class:`MemoryPolicy` sees them and can
+#: refuse a collision.  The zero-page entries at ``$F0-$F5`` and
+#: ``$FB-$FC`` are *6510-side*: they are written by the emitted 6502 code
+#: while a harness routine runs on the C64, so **no host-side guard can
+#: see or stop them** -- a consumer whose own pointers live there is
+#: clobbered silently.  They are listed anyway because the two consumers
+#: of this table that matter for them do work: the generated table in
+#: ``docs/memory_safety.md`` tells an author the address is taken, and
+#: :meth:`MemoryPolicy.from_prg` warns when a load image sits on one.
+#: The ``owner`` and ``purpose`` columns say which kind each entry is;
+#: there is deliberately no structural flag for it yet (that would ripple
+#: through the generator, the doc and every consumer of this tuple).
+#:
+#: Inclusion criterion: library writes under ``src/``
 #: at fixed default addresses, plus the one live-suite stub at ``$CF00``
 #: (``tests/test_vice_core.py::_restore_basic``) because every screen
 #: and keyboard test runs it.  Caller-supplied addresses (required
@@ -275,6 +292,33 @@ HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
         purpose="KERNAL NDX — keyboard-buffer fill count set after a "
                 "SYS/text injection",
         configurable="KERNAL-mandated (keybuf_count_addr= on U64 transport)",
+    ),
+    ScratchRegion(
+        0x00F0, 0x00F3,
+        owner="bridge_ping._emit_poll_rx",
+        purpose="6510-side (not a host write): RxEvent poll counters — "
+                "$F0/$F1 inner 16-bit counter, $F2 outer — written by the "
+                "emitted routine while it polls the CS8900a",
+        configurable="hardcoded",
+    ),
+    ScratchRegion(
+        0x00F0, 0x00F6,
+        owner="tod_timer.build_* (ZP_CUR_LO..ZP_RAW), "
+              "bridge_ping._emit_tod_* helpers",
+        purpose="6510-side (not a host write): CIA1 TOD poll scratch — "
+                "$F0/$F1 elapsed tenths, $F2/$F3 deadline, $F4 BCD "
+                "ones-digit, $F5 raw BCD seconds; released when the poll "
+                "loop completes, before any frame read in the same JSR",
+        configurable="hardcoded",
+    ),
+    ScratchRegion(
+        0x00FB, 0x00FD,
+        owner="bridge_ping._emit_tx_frame, bridge_ping._emit_read_frame",
+        purpose="6510-side (not a host write): pointer for the CS8900a "
+                "frame copy loops, used as ($FB),Y; past 256 bytes the TX "
+                "loop also does INC $FC, leaving $FC past the last whole "
+                "page",
+        configurable="hardcoded",
     ),
     ScratchRegion(
         0x0277, 0x0281,

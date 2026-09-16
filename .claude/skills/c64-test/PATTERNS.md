@@ -1129,7 +1129,7 @@ while time.monotonic() < boot_deadline:
 
 ### Debug stream is rate-capped at 1 MHz-equivalent (turbo gives a 1/N sampled view)
 
-The U64E FPGA emits the UDP debug stream at a fixed rate of roughly **~850k bus-cycle entries/sec** (≈ 2,400 packets/sec) regardless of the CPU's actual turbo speed. That matches the 6510's native rate at 1 MHz, so `DebugCapture` at 1 MHz is essentially cycle-accurate. At higher turbo speeds you receive a **uniformly sampled 1/N view** of the real bus — at 48 MHz only ~2% of cycles reach the host, but the sampling is uniform and `packets_dropped` stays at zero (the rate limit is at the FPGA source, not the UDP path). Measured in `tests/test_u64_debug_stream_speed_live.py`.
+The U64E FPGA emits the UDP debug stream at a fixed rate of roughly **~850k bus-cycle entries/sec** (≈ 2,400 packets/sec) regardless of the CPU's actual turbo speed. That matches the 6510's native rate at 1 MHz, so `DebugCapture` at 1 MHz is essentially cycle-accurate. At higher turbo speeds you receive a **uniformly sampled 1/N view** of the real bus — at 48 MHz only ~2% of cycles reach the host, but the sampling is uniform and turbo speed itself adds no sequence gaps (the rate limit is at the FPGA source, not the UDP path). Measured in `tests/test_u64_debug_stream_speed_live.py`. **`packets_dropped` is not zero in general** (#424): the bench's own loss ran 0.4-45% of packets per 1 s capture, placed at the host's Wi-Fi downlink, load-dependent, with a small device-side residual not excluded (#356).
 
 ```python
 # WRONG: try to capture a complete trace while running at turbo speed
