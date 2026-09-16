@@ -414,6 +414,28 @@ VICE checks: with `/dev/bpf0` at `crw----rw-` (world read/write) and uid
 > one, but a pool exhausted by another capturing process can still bite a
 > multi-instance run.
 
+**3. `ifconfig` reports a REDACTED MAC under a Homebrew-python parent.**
+On macOS 27.0 (build 26A428) a process launched from Homebrew's Python --
+and every process it spawns, so `subprocess.run(["ifconfig", iface])` too --
+reads the interface's `ether` line as `02:00:00:00:00:00`, and
+`uuid.getnode()` returns `020000000000` likewise.  Apple's
+`/usr/bin/python3` and a plain shell see the real address.  It is the
+*interpreter*, not the venv and not this package: `-S` and `-E -S` still
+redact, no `.pth` or `sitecustomize` is involved, and the value is
+identical before and after importing the harness with no environment
+variable changing.  **`networksetup -getmacaddress <iface>` is not
+redacted**, and is what the live RR-Net fixtures read.
+
+The failure it caused (2026-09-16): `_host_addr` / `_host_mac` returned the
+placeholder, the ping builders set `dst_mac` to a MAC nobody owns, the Mac
+never saw a frame addressed to itself and so never replied -- every
+exchange missed with `RxMISS` **0**, which reads exactly like a dead link
+or an absent cartridge.  A wire capture showed the ARP handshake
+completing correctly and the echo request then leaving for the placeholder
+address.  Rule: **`RxMISS` 0 means the frame never reached the chip --
+check the addressing before suspecting the cartridge or the link**, and
+`RxMISS` +1 is the separate queue-overflow case of issue #222.
+
 ### Issue #144 is refuted: the Homebrew bottle captures fine
 
 #144 recorded that *as root*, VICE answers the binary monitor while

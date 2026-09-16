@@ -122,7 +122,13 @@ _seq = [0x2200]
 def _host_addr(iface: str) -> tuple[bytes, bytes]:
     if platform.system() == "Darwin":
         out = subprocess.run(["ifconfig", iface], capture_output=True, text=True).stdout
-        mac = re.search(r"ether ([0-9a-f:]{17})", out)
+        # ``ifconfig``'s ether line is REDACTED to 02:00:00:00:00:00 for a
+        # Homebrew-python parent (and everything it spawns); ``networksetup``
+        # is not.  Addressing frames to the placeholder means the host never
+        # sees a frame for itself and never replies.
+        ns = subprocess.run(["/usr/sbin/networksetup", "-getmacaddress", iface],
+                            capture_output=True, text=True).stdout
+        mac = re.search(r"([0-9a-f:]{17})", ns) or re.search(r"ether ([0-9a-f:]{17})", out)
         ip = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
     else:
         out = subprocess.run(["ip", "addr", "show", iface], capture_output=True, text=True).stdout

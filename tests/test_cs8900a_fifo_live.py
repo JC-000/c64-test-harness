@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import subprocess
 import time
 
@@ -146,6 +147,15 @@ _tag = [0]
 
 def _host_mac(iface: str) -> bytes:
     if platform.system() == "Darwin":
+        # ``ifconfig``'s ether line is REDACTED to 02:00:00:00:00:00 under a
+        # Homebrew-python parent (and every process it spawns), which silently
+        # misaddresses every frame this module builds; ``networksetup`` is not
+        # redacted.  Measured on macOS 27.0 (26A428), 2026-09-16.
+        ns = subprocess.run(["/usr/sbin/networksetup", "-getmacaddress", iface],
+                            capture_output=True, text=True).stdout
+        m = re.search(r"([0-9a-f:]{17})", ns)
+        if m:
+            return parse_mac(m.group(1))
         out = subprocess.run(["ifconfig", iface], capture_output=True, text=True).stdout
         for ln in out.splitlines():
             if "ether " in ln:
