@@ -323,3 +323,138 @@ def test_budget_comment_prices_uci_writes_by_grade():
     # The same qualifier applies to the "raw write_memory" parenthetical
     # above the note: the transport now chunks those on a leak-prone grade.
     assert "those are lane bugs to fix by chunking" not in src
+
+
+# ------------------------------------------------- mounted images (#418)
+def _drives(*image_files: str) -> dict:
+    """A GET /v1/drives document mounting *image_files* on a, b, ..."""
+    return {
+        "drives": [
+            {chr(ord("a") + i): {"enabled": True, "image_file": f}}
+            for i, f in enumerate(image_files)
+        ],
+        "errors": [],
+    }
+
+
+def test_mounted_managed_image_is_not_deleted():
+    """A temp%04x name a drive has mounted survives the sweep (#418).
+
+    Raw-body uploads (and multipart parts with no filename=) keep the
+    firmware's managed name and are mounted from that file, so the
+    oldest-first sweep would otherwise delete a mounted image's backing
+    store.
+    """
+    _FakeFTP.files = ["temp0001", "temp0002", "temp0003", "temp0004"]
+    result = gc_temp_folder(
+        "dev", mounted_probe=lambda: _drives("/Temp/temp0001", "/Temp/image.d64")
+    )
+    assert "temp0001" not in _FakeFTP.deleted
+    assert result.deleted == ["temp0002"]
+    assert result.mounted_excluded == ["temp0001"]
+    assert result.ok
+
+
+def test_mounted_image_in_a_subdirectory_is_excluded_by_basename():
+    """The U64E reports /Temp/cache/upload/temp0082; the name still matches.
+
+    Measured on the U64E (fw 3.15 bce4535e, 2026-09-15, n=1). Comparing
+    basenames rather than full paths is what makes the exclusion hold
+    across the two generations' differing layouts.
+    """
+    _FakeFTP.files = ["temp0082", "temp0083", "temp0084"]
+    result = gc_temp_folder(
+        "dev", keep=1, mounted_probe=lambda: _drives("/Temp/cache/upload/temp0082")
+    )
+    assert _FakeFTP.deleted == ["temp0083"]
+    assert result.mounted_excluded == ["temp0082"]
+
+
+def test_excluding_a_mounted_image_never_widens_the_delete_set():
+    """Excluding the *youngest* name must not promote an older one into deletion.
+
+    Mounted names are dropped before the keep-count is applied, so the
+    survivors are re-chosen from what is left: the delete set can only
+    shrink. Applying the keep-count first and subtracting afterwards
+    would still delete temp0001 AND temp0002 here.
+    """
+    _FakeFTP.files = ["temp0001", "temp0002", "temp0003", "temp0004"]
+    result = gc_temp_folder("dev", mounted_probe=lambda: _drives("/Temp/temp0004"))
+    assert result.deleted == ["temp0001"]
+    assert result.kept == ["temp0002", "temp0003"]
+    assert result.mounted_excluded == ["temp0004"]
+
+
+def test_unmanaged_mounted_names_leave_the_sweep_untouched():
+    """A normally-named mounted image excludes nothing (harness uploads, #311)."""
+    _FakeFTP.files = ["temp0001", "temp0002", "temp0003"]
+    result = gc_temp_folder("dev", mounted_probe=lambda: _drives("/Temp/image.d64"))
+    assert result.deleted == ["temp0001"]
+    assert result.mounted_excluded == []
+
+
+def test_probe_failure_still_sweeps_and_is_not_a_failed_pass():
+    """An unreadable drives listing must not stop hygiene, and must say so.
+
+    Skipping the sweep would trade a recoverable data hazard for the
+    unrecoverable one this module prevents, and setting .error would
+    block later attachment-creating requests to a healthy device.
+    """
+    _FakeFTP.files = ["temp0001", "temp0002", "temp0003"]
+
+    def boom():
+        raise OSError("connection reset")
+
+    result = gc_temp_folder("dev", mounted_probe=boom)
+    assert result.deleted == ["temp0001"]
+    assert result.ok and result.error is None
+    assert "connection reset" in (result.mounted_probe_error or "")
+
+
+def test_probe_is_not_consulted_when_nothing_would_be_deleted():
+    """No drives request on a device the keep-count already spares."""
+    _FakeFTP.files = ["temp0001", "temp0002"]
+    calls = []
+
+    def probe():
+        calls.append(1)
+        return _drives()
+
+    result = gc_temp_folder("dev", mounted_probe=probe)
+    assert calls == []
+    assert result.deleted == []
+
+
+def test_default_probe_is_a_bodyless_drives_get():
+    """The built-in probe costs no /Temp attachment: GET, no body.
+
+    A body-carrying request here would make every hygiene pass leak the
+    very thing it is sweeping for.
+    """
+    from unittest.mock import patch
+
+    captured = []
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+        def read(self):
+            return b'{"drives":[{"a":{"image_file":"/Temp/temp0001"}}]}'
+
+    def fake_urlopen(req, timeout=None):
+        captured.append(req)
+        return _Resp()
+
+    _FakeFTP.files = ["temp0001", "temp0002", "temp0003"]
+    with patch("urllib.request.urlopen", fake_urlopen):
+        result = gc_temp_folder("10.0.0.5")
+
+    assert len(captured) == 1
+    assert captured[0].get_full_url() == "http://10.0.0.5/v1/drives"
+    assert captured[0].get_method() == "GET"
+    assert captured[0].data is None
+    assert result.mounted_excluded == ["temp0001"]

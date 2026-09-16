@@ -72,14 +72,17 @@ that lock -- this module does not acquire one itself.
 from __future__ import annotations
 
 import ipaddress
+import json
 import logging
 import os
 import re
 import threading
+import urllib.error
+import urllib.request
 import weakref
 from dataclasses import dataclass, field
 from ftplib import FTP, all_errors as _FTP_ALL_ERRORS
-from typing import NamedTuple
+from typing import Any, Callable, NamedTuple
 
 _log = logging.getLogger(__name__)
 
@@ -216,9 +219,16 @@ DEFAULT_FTP_TIMEOUT = 10.0
 DEFAULT_FTP_USER = "anonymous"
 DEFAULT_FTP_PASSWORD = "anonymous@"
 
+#: Socket timeout for the bodyless ``GET /v1/drives`` the sweep uses to
+#: learn which managed names are currently mounted (#418). Deliberately
+#: short: the listing is a safety refinement, and a device too slow to
+#: answer it must not delay the hygiene pass that keeps it off the wedge.
+DEFAULT_DRIVES_PROBE_TIMEOUT = 5.0
+
 __all__ = [
     "TempGCResult",
     "gc_temp_folder",
+    "DEFAULT_DRIVES_PROBE_TIMEOUT",
     "auto_gc_enabled",
     "auto_gc_override",
     "hygiene_required",
@@ -251,10 +261,24 @@ class TempGCResult:
     deleted: list[str] = field(default_factory=list)
     kept: list[str] = field(default_factory=list)
     error: str | None = None
+    #: Managed names left alone because a drive has them mounted (#418).
+    #: Disjoint from ``kept``, which is the keep-count's own survivors.
+    mounted_excluded: list[str] = field(default_factory=list)
+    #: Why the mounted-image listing could not be read, if it could not.
+    #: **Not** a failed hygiene pass: the sweep still ran (see
+    #: :func:`gc_temp_folder`), so this never clears :attr:`ok`.
+    mounted_probe_error: str | None = None
 
     @property
     def ok(self) -> bool:
-        """True when the pass ran without an FTP/network failure (skips still count as ok)."""
+        """True when the pass ran without an FTP/network failure (skips still count as ok).
+
+        A :attr:`mounted_probe_error` does not clear this. The drives
+        listing only narrows what the sweep may delete; failing to read
+        it leaves the sweep exactly as protective of the *device* as it
+        was before #418, and treating that as a failed pass would block
+        the hygiene the wedge clause depends on.
+        """
         return self.error is None
 
 
@@ -582,6 +606,61 @@ def _reset_temp_ledgers() -> None:
         _TEMP_LEDGERS.clear()
 
 
+def _split_by_keep(names: list[str], keep: int) -> tuple[list[str], list[str]]:
+    """Split *names* (oldest-first) into (to_delete, to_keep) for *keep*."""
+    if keep <= 0:
+        return list(names), []
+    if keep >= len(names):
+        return [], list(names)
+    return names[:-keep], names[-keep:]
+
+
+def _managed_names_in(payload: Any) -> set[str]:
+    """Every managed ``temp%04x`` **basename** mentioned anywhere in *payload*.
+
+    *payload* is a parsed ``GET /v1/drives`` document. This walks the
+    whole structure rather than reading the two keys the firmware happens
+    to use today (``image_file``/``image_path`` in ``route_drives.cc``'s
+    ``drive_info``), and compares basenames rather than full paths, for
+    one reason: the failure modes are not symmetric. Over-matching costs
+    a deferred deletion -- the file is swept on the next pass once it is
+    unmounted. Under-matching deletes the backing file of a mounted image
+    (#418). A mounted name also appears at different depths across
+    generations: measured on the U64E (fw 3.15 bce4535e, 2026-09-15,
+    n=1) as ``/Temp/cache/upload/temp0082``, while the C64U's 1.1.0
+    writes it at ``/Temp/temp%04x`` (source-read, #311), which is the one
+    the top-level sweep actually lists.
+    """
+    found: set[str] = set()
+    stack: list[Any] = [payload]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            stack.extend(current.values())
+        elif isinstance(current, (list, tuple)):
+            stack.extend(current)
+        elif isinstance(current, str):
+            basename = current.replace("\\", "/").rsplit("/", 1)[-1]
+            if _MANAGED_ATTACHMENT_RE.match(basename):
+                found.add(basename)
+    return found
+
+
+def _default_mounted_probe(host: str, timeout: float = DEFAULT_DRIVES_PROBE_TIMEOUT) -> Any:
+    """Read ``GET /v1/drives`` without a client. Bodyless: no ``/Temp`` cost.
+
+    :func:`gc_temp_folder` takes a host, not a client, so it needs a way
+    to ask what is mounted on its own. Callers that *have* a client
+    should pass its :meth:`~c64_test_harness.backends.ultimate64_client.Ultimate64Client.list_drives`
+    as ``mounted_probe`` instead -- this default sends no ``X-Password``
+    and so reads nothing on a password-protected device.
+    """
+    req = urllib.request.Request(f"http://{host}/v1/drives", method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+    return json.loads(raw.decode("utf-8")) if raw else {}
+
+
 def gc_temp_folder(
     host: str,
     *,
@@ -590,15 +669,32 @@ def gc_temp_folder(
     password: str | None = None,
     keep: int | None = None,
     timeout: float = DEFAULT_FTP_TIMEOUT,
+    mounted_probe: Callable[[], Any] | None = None,
 ) -> TempGCResult:
     """Best-effort GC of the U64's managed ``/Temp`` attachments over FTP.
 
     Deletes ``^temp[0-9a-fA-F]+$``-named files in ``/Temp``, oldest-first
     (by the suffix parsed as base-16 -- the firmware's counter is hex, so
     ``temp0009`` is followed by ``temp000A``), keeping the *keep*
-    youngest. Nothing else in ``/Temp`` (user files, mounted
-    ``.d64``/``.crt`` images) matches the pattern and so is never
-    touched.
+    youngest, and **skipping any whose name a drive currently has
+    mounted**.
+
+    That last exclusion is #418. The pattern was described here as
+    matching nothing but leaked attachments; that was wrong for one
+    shape. An image uploaded as a **raw** body, or as a multipart part
+    with no ``filename=``, keeps the firmware's managed ``temp%04x``
+    name and is then mounted *from that file*, so a sweep -- including
+    one a later lane runs under the device lock -- could delete a
+    mounted image's backing store. Harness uploads are not exposed
+    (:meth:`~c64_test_harness.backends.ultimate64_client.Ultimate64Client.mount_disk`
+    has sent a named ``image.<type>`` part since #311/PR #421, which the
+    pattern never matches); other clients' raw uploads are. What the
+    1541 emulation does when a mounted read-write image's backing file
+    disappears is not established, which is the reason not to find out.
+
+    The exclusion can only ever **shrink** the delete set: mounted names
+    are dropped before the keep-count is applied, so the youngest
+    survivors are re-chosen from what is left.
 
     :param host: Device hostname/IP (the REST host -- FTP is a separate
         port on the same device).
@@ -611,9 +707,22 @@ def gc_temp_folder(
         Defaults to ``$U64_TEMP_GC_KEEP`` or :data:`DEFAULT_KEEP`. A
         value <= 0 deletes everything managed.
     :param timeout: Socket timeout in seconds for the whole FTP session.
+    :param mounted_probe: Zero-argument callable returning a parsed
+        ``GET /v1/drives`` document. Defaults to
+        :func:`_default_mounted_probe`. It is called **only when the
+        sweep would otherwise delete something**, so a device with
+        nothing to collect gets no extra request at all.
     :returns: A :class:`TempGCResult`. Never raises -- any connect,
         login, or delete failure is captured in ``.error`` and logged at
         INFO/WARNING; the caller's run must never fail on hygiene.
+
+    **A probe failure is not a failed hygiene pass.** If the listing
+    cannot be read, the sweep proceeds on the keep-count alone and
+    records why in ``.mounted_probe_error``, leaving ``.ok`` true. The
+    alternative -- skipping the sweep -- would trade a recoverable data
+    hazard (a deleted image that can be re-uploaded) for the
+    unrecoverable one this module exists to prevent: a ``/Temp`` that
+    fills and crashes the firmware, which no remote instrument can undo.
     """
     resolved_port = port if port is not None else DEFAULT_FTP_PORT
     resolved_user = username if username is not None else os.environ.get(FTP_USER_ENV, DEFAULT_FTP_USER)
@@ -638,13 +747,41 @@ def gc_temp_folder(
             managed.sort(key=lambda pair: pair[0])
             managed_names = [name for _, name in managed]
 
-            if resolved_keep <= 0:
-                to_delete, to_keep = managed_names, []
-            elif resolved_keep >= len(managed_names):
-                to_delete, to_keep = [], managed_names
-            else:
-                to_delete = managed_names[:-resolved_keep]
-                to_keep = managed_names[-resolved_keep:]
+            to_delete, to_keep = _split_by_keep(managed_names, resolved_keep)
+
+            mounted_excluded: list[str] = []
+            probe_error: str | None = None
+            if to_delete:
+                # Only asked when something would actually be deleted, so a
+                # device with nothing to collect costs no extra request.
+                probe = mounted_probe
+                if probe is None:
+                    def probe() -> Any:  # noqa: E306 - local default
+                        return _default_mounted_probe(host)
+                try:
+                    mounted = _managed_names_in(probe())
+                except Exception as exc:  # noqa: BLE001 - hygiene must not fail
+                    probe_error = f"{type(exc).__name__}: {exc}"
+                    _log.warning(
+                        "gc_temp_folder: could not read the mounted-image listing on %s "
+                        "(%s); sweeping on the keep-count alone. A managed name another "
+                        "client mounted from a raw upload could be deleted (#418).",
+                        host, probe_error,
+                    )
+                else:
+                    survivors = []
+                    for name in managed_names:
+                        if name.rsplit("/", 1)[-1] in mounted:
+                            mounted_excluded.append(name)
+                        else:
+                            survivors.append(name)
+                    if mounted_excluded:
+                        to_delete, to_keep = _split_by_keep(survivors, resolved_keep)
+                        _log.info(
+                            "gc_temp_folder: %d managed /Temp name(s) on %s are mounted "
+                            "on a drive and were left alone: %s",
+                            len(mounted_excluded), host, ", ".join(mounted_excluded),
+                        )
 
             deleted: list[str] = []
             for name in to_delete:
@@ -659,7 +796,13 @@ def gc_temp_folder(
                     "gc_temp_folder: removed %d stale /Temp attachment(s) on %s (kept %d)",
                     len(deleted), host, len(to_keep),
                 )
-            return TempGCResult(host=host, deleted=deleted, kept=to_keep)
+            return TempGCResult(
+                host=host,
+                deleted=deleted,
+                kept=to_keep,
+                mounted_excluded=mounted_excluded,
+                mounted_probe_error=probe_error,
+            )
     except ConnectionRefusedError as exc:
         error = (
             f"ConnectionRefusedError: {exc} -- FTP File Service may be disabled on this "
