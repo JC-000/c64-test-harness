@@ -40,7 +40,9 @@ _AUDIO_PAYLOAD_LEN = 768
 
 
 def _audio_payload(seq: int) -> bytes:
-    return struct.pack("<H", seq) * (_AUDIO_PAYLOAD_LEN // 2)
+    # A nonzero marker word beside the sequence, so an all-zero packet in the
+    # WAV can only be gap fill (#410), whatever the sequence number.
+    return struct.pack("<HH", seq, 0xA5A5) * (_AUDIO_PAYLOAD_LEN // 4)
 
 
 def _debug_payload(seq: int) -> bytes:
@@ -78,7 +80,8 @@ def _audio(seqs: list[int], tmp_path: Path):
         pcm = wf.readframes(wf.getnframes())
     assert len(pcm) % _AUDIO_PAYLOAD_LEN == 0
     order = [
-        struct.unpack_from("<H", pcm, i)[0]
+        None if pcm[i:i + _AUDIO_PAYLOAD_LEN] == bytes(_AUDIO_PAYLOAD_LEN)
+        else struct.unpack_from("<H", pcm, i)[0]
         for i in range(0, len(pcm), _AUDIO_PAYLOAD_LEN)
     ]
     return result, order
@@ -109,7 +112,7 @@ _R = list(range(100))
 CASES = {
     "clean": (_R, 0, 0, _R),
     "one_gap": (list(range(60)) + list(range(70, 100)), 10, 0,
-                list(range(60)) + list(range(70, 100))),
+                list(range(60)) + [None] * 10 + list(range(70, 100))),
     "duplicate": (list(range(50)) + [48] + list(range(50, 100)), 0, 1, _R),
     "adjacent_swap": (list(range(51)) + [52, 51] + list(range(53, 100)), 0, 1, _R),
     "late_by_4": (list(range(51)) + [52, 53, 54, 55, 51] + list(range(56, 100)),
@@ -129,7 +132,8 @@ def test_audio_capture_counts_only_true_loss(name: str, tmp_path: Path) -> None:
     result, order = _audio(seqs, tmp_path)
     assert result.packets_dropped == dropped
     assert result.packets_reordered == backward
-    assert result.time_base_intact is (dropped == 0)
+    # Every drop is zero-filled (#410), so the time base survives all of these.
+    assert result.time_base_intact is True
     if placed is not None:
         # A late packet lands in its own slot; a duplicate adds no samples.
         assert order == placed
@@ -139,7 +143,7 @@ def test_audio_late_packet_after_gap_fills_its_own_slot(tmp_path: Path) -> None:
     """55..59 arrived before 52: 52 goes back between 51 and 55, not after 59."""
     seqs, *_ = CASES["gap_then_late_fill_of_part"]
     _, order = _audio(seqs, tmp_path)
-    assert order == list(range(50)) + [52] + list(range(55, 100))
+    assert order == list(range(50)) + [None, None, 52, None, None] + list(range(55, 100))
 
 
 @pytest.mark.parametrize("name", list(CASES))
@@ -303,7 +307,10 @@ def test_silent_restart_is_recognised_and_loses_nothing(tmp_path: Path) -> None:
     assert len(pcm) == 1101 * _AUDIO_PAYLOAD_LEN
     assert result.packets_dropped == 0
     assert result.sequence_resyncs == 1
-    assert result.time_base_intact is True
+    # Every packet is kept, but a restart hides how many packets the device
+    # never sent between the two runs, so the index is not a clock across it
+    # (#410: a resync breaks time_base_intact).
+    assert result.time_base_intact is False
     zero_d = bytes(ENTRIES_PER_PACKET * ENTRY_SIZE)
     d = _debug_raw([(s, zero_d) for s in seqs])
     assert d.total_cycles == 1101 * ENTRIES_PER_PACKET
@@ -386,9 +393,14 @@ def test_an_over_late_packet_resyncs_and_overcounts_as_documented(tmp_path: Path
     silently."""
     seqs = [0] + list(range(2, 1100)) + [1] + list(range(1100, 1110))
     result, pcm = _audio_raw([(s, _apcm(s, _A)) for s in seqs], tmp_path)
-    assert [s for s, _ in _apackets(pcm)] == seqs
+    fill = (0, 0)  # an all-zero packet: gap fill (#410)
+    assert _apackets(pcm) == (
+        [(0, _A), fill] + [(s, _A) for s in range(2, 1100)] + [(1, _A)]
+        + [fill] * 1098 + [(s, _A) for s in range(1100, 1110)]
+    )
     assert (result.packets_dropped, result.packets_reordered,
             result.sequence_resyncs) == (1099, 1, 1)
+    assert result.packets_filled == 1099
 
 
 def test_tracker_memory_is_bounded_by_the_window() -> None:
@@ -461,9 +473,14 @@ def test_a_silent_restart_over_a_missing_number_loses_the_held_packets(
     reaches 5, which is an unarrived missing number, so it does not read as a
     continuation: the five held packets are discarded as duplicates and the
     restart's 5 fills the old stream's slot.  1,095 of the 1,100 datagrams
-    sent survive, while ``packets_dropped`` stays 0 and ``time_base_intact``
-    True -- the capture loses packets and still presents as intact.  Accepted
-    behaviour, not a bug to fix here; see ``backends/_stream_seq.py``.
+    sent survive, while ``packets_dropped`` stays 0.  Accepted behaviour,
+    not a bug to fix here; see ``backends/_stream_seq.py``.
+
+    **Since #410 this row is no longer silent.**  It resyncs, and a resync
+    now breaks ``time_base_intact``, so the capture loses the five packets
+    *and reports the damage*.  On #443 alone the flag was
+    ``packets_dropped == 0`` and read True here.  Silence now survives only
+    where nothing resyncs -- see ``_BOUNDARY_SWEEP``.
     """
     zero = bytes(_AUDIO_PAYLOAD_LEN)
     seqs = [s for s in range(501) if s != 5] + list(range(600))
@@ -472,7 +489,7 @@ def test_a_silent_restart_over_a_missing_number_loses_the_held_packets(
     assert len(pcm) // _AUDIO_PAYLOAD_LEN == 1095
     assert (result.packets_dropped, result.packets_reordered,
             result.sequence_resyncs) == (0, 15, 1)
-    assert result.time_base_intact is True
+    assert result.time_base_intact is False
 
 
 def test_a_late_packet_continuing_a_duplicate_run_is_late_not_a_restart() -> None:
@@ -601,8 +618,12 @@ def test_reviewer_8_fixture_discards_are_counted(name: str, tmp_path: Path) -> N
     # Measured from the WAV, not from the field under test.
     assert result.packets_received - delivered == discarded
     assert result.payloads_discarded == discarded
-    # Every row reads intact: the flag is deliberately not moved.
-    assert result.time_base_intact is True
+    # The flag is deliberately not moved *by a discard* -- that part of
+    # #443's declaration stands.  But since #410 a resync breaks it, and
+    # ``restart_recognised`` is the one fixture here that resyncs.  None of
+    # these rows has an unfilled drop, so intact is exactly "did not
+    # resync".  Re-measured on the #410 merge.
+    assert result.time_base_intact is (name != "restart_recognised")
 
 
 def test_reviewer_8_silent_restart_discards_eleven_payloads(tmp_path: Path) -> None:
@@ -660,16 +681,22 @@ def test_the_declared_residual_counts_its_five_lost_packets(
 ) -> None:
     """The fourth residual's own stream: the 5 packets it loses are counted.
 
-    1,100 sent, 1,095 kept, ``packets_dropped`` 0 and ``time_base_intact``
-    True -- and ``payloads_discarded`` 5, which is exactly the difference.
+    1,100 sent, 1,095 kept, ``packets_dropped`` 0 -- and
+    ``payloads_discarded`` 5, which is exactly the difference.
+
+    Since #410 this stream also resyncs into a broken time base, so the
+    counter is no longer the *only* thing that shows the loss here; it is
+    still the only thing that shows how much.  Nothing is filled on this
+    stream, so the invariant keeps its plain form.
     """
     zero = bytes(_AUDIO_PAYLOAD_LEN)
     seqs = [s for s in range(501) if s != 5] + list(range(600))
     result, pcm = _audio_raw([(s, zero) for s in seqs], tmp_path)
     assert len(pcm) // _AUDIO_PAYLOAD_LEN == 1095
     assert result.payloads_discarded == 5
+    assert result.packets_filled == 0
     assert result.packets_received == 1095 + result.payloads_discarded
-    assert result.time_base_intact is True
+    assert result.time_base_intact is False
 
 
 # ----------------------------------------------------------------------------
@@ -691,16 +718,21 @@ def test_the_declared_residual_counts_its_five_lost_packets(
 _BOUNDARY_SWEEP = {
     # Nothing precedes the first number the tracker observes, so 0 is never
     # a tracked missing number: the restart resyncs and keeps everything.
-    0: (0, 0, True),
-    # 1..max_held: the held run reaches a number the old stream is still
-    # owed, so the held packets are discarded -- silently, with the time
-    # base still reported intact.  This is the residual.
-    1: (1, 0, True),
-    2: (2, 0, True),
-    3: (3, 0, True),
-    4: (4, 0, True),
+    # The resync itself breaks the time base since #410.
+    0: (0, 0, False),
+    # 1..4: the held run reaches a number the old stream is still owed, so
+    # the held packets are discarded.  These rows also resync, and since
+    # #410 a resync breaks ``time_base_intact`` -- so the payloads are
+    # still lost but the capture now *says so*.  Re-measured on the #410
+    # merge (was True on #443 alone, when the flag was
+    # ``packets_dropped == 0``).
+    1: (1, 0, False),
+    2: (2, 0, False),
+    3: (3, 0, False),
+    4: (4, 0, False),
     # From 5 the rest of the restart is too short to be recognised as one,
-    # so its tail is still held at stop() and discarded there too.
+    # so its tail is still held at stop() and discarded there too -- and
+    # with no resync, these are the rows where the loss is still silent.
     5: (13, 0, True),
     6: (13, 0, True),
     7: (13, 0, True),
@@ -734,16 +766,29 @@ def test_the_silent_loss_set_is_exactly_1_to_max_held(
     assert result.packets_dropped == dropped
     assert result.time_base_intact is intact
     # The books close in every row, however the packets were classified.
-    assert result.packets_received == kept + result.payloads_discarded
+    # Since #410 the WAV also holds a zero packet per *filled* gap, which
+    # was never received, so that term comes back out.
+    assert result.packets_received == (
+        kept + result.payloads_discarded - result.packets_filled
+    )
 
-    # The claim itself: silent loss is exactly 1..max_held, inclusive.
-    # "Silent" = payloads thrown away while the capture still reports a
-    # sound time base.
-    silently_lossy = discarded > 0 and intact
-    assert silently_lossy is (1 <= lost <= _MAX_HELD), (
+    # The #451 boundary is about which lost numbers *trigger* the discard,
+    # and #410 does not move it: still exactly 1..max_held, inclusive.
+    assert (discarded > 0) is (1 <= lost <= _MAX_HELD), (
         f"lost={lost} changes the #451 boundary: the prose in "
         f"_stream_seq.py and CaptureResult.packets_reordered says the set "
         f"is exactly 1..{_MAX_HELD}"
+    )
+
+    # What #410 *does* move is whether that loss is silent.  "Silent" =
+    # payloads thrown away while the capture still reports a sound time
+    # base.  Rows 1..4 resync, and a resync now breaks time_base_intact,
+    # so they are lossy-and-loud; silence survives only from 5, where the
+    # restart is never recognised and nothing resyncs.
+    silently_lossy = discarded > 0 and intact
+    assert silently_lossy is (5 <= lost <= _MAX_HELD), (
+        f"lost={lost} changes the silent subset: since #410 only 5..{_MAX_HELD} "
+        f"lose payloads while still reporting an intact time base"
     )
 
 

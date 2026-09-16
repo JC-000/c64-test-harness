@@ -200,19 +200,59 @@ different base integers, and the ratio does not reduce. No PAL audio
 constant is published here because the U64's PAL stream rate has not been
 measured on this bench.
 
-### A dropped packet destroys the time base
+### A dropped packet is filled with silence (#410)
 
-`AudioCapture` counts gaps but does **not** pad them: the capture is the
-concatenation of the payloads that arrived. After a drop, sample index no
-longer maps to time and every downstream alignment is off by an unknown
-amount. The WAV is well-formed either way, so nothing downstream notices.
+Every audio datagram carries 192 stereo frames (768 PCM bytes; the Ultimate
+"Data Streams" format, 770 B with the sequence number, measured on every
+datagram in #410). `AudioCapture` replaces each lost packet with 768 zero
+bytes at its own position, so sample index stays a clock across loss.
+
+- The zeros are **not signal**. `packets_filled`, `fill_fraction` and
+  `filled_frame_ranges` (`(start_frame, frame_count)`) say how much and
+  where. Bound the fraction, or skip the ranges, before analysing.
+- `time_base_intact` means every drop was filled at a trusted length: no
+  unfilled drop, no sequence resync, and no datagram of another size. It no
+  longer means nothing was lost; `packets_dropped == 0` does.
+- A late packet overwrites its own fill and a duplicate is discarded (#430).
+- **Discarded payloads are lost stream time, and no fill field shows it
+  (#443).** Two paths reach it, and both leave `packets_dropped`,
+  `packets_filled` and `fill_fraction` at 0, `filled_frame_ranges` at `()`,
+  `sequence_resyncs` at 0 and `time_base_intact` True:
+  - **a counter that restarts over a number that was itself lost** reads as a
+    run of duplicates, so their PCM is discarded (loopback: 52 datagrams in,
+    41 packets in the WAV, 11 never delivered). This path depends on **#452**
+    — it is constructed today only because nobody has established whether
+    starting a stream resets the FPGA's sequence counter; if it does, it
+    becomes routine and this note stops being enough.
+  - **a tail of duplicate-looking datagrams still held at `stop()`**, which
+    `flush_held` discards (106 in, 100 packets in the WAV, 6 discarded). No
+    lost packet and no restart is needed, so this path does not depend on
+    #452 — it is the one that justifies counting discards at all — and it is
+    bounded by `MAX_HELD_DUPLICATES` (8 packets, 32 ms).
+
+  The harm is **duration, not content**: the discarded bytes are identical to
+  PCM already in the file, but the stream time they carried is gone, so the
+  count is an *upper bound on packets of lost time*. `payloads_discarded`
+  (#443) counts these datagrams directly; on a result built before that field
+  existed, `packets_reordered` is the **only trace** (it counts every datagram
+  behind the highest number, held ones included), so reorders without drops do
+  not mean the capture is complete. A discard is not in itself a fault — a
+  genuine retransmission is discarded correctly (101 in, 100 in the WAV, 1
+  discarded) — so `tests/audio_link_loss.py` bounds lost time rather than
+  requiring zero.
+- **Older captures:** before #410 gaps were not padded (the capture was the
+  concatenation of what arrived) and `time_base_intact` was
+  `packets_dropped == 0`. #430 on its own left zero-length placeholders,
+  which is the same concatenation. A result without `packets_filled` never
+  padded.
+- On this bench's Wi-Fi link, loss is 0-1.4% of a capture when idle and
+  9-26% under other host traffic (#410). `tests/audio_link_loss.py` holds
+  the live tests' bound and retry count.
 
 ```python
 result = cap.stop(wav_path="run.wav")
-assert result.time_base_intact          # packets_dropped == 0
-# packets_reordered counts late and duplicated packets (#205).  Since #430
-# neither is a drop and neither shifts the sample index: a late packet goes
-# into its own slot, a duplicate is discarded.
+assert result.time_base_intact          # every drop zero-filled in place
+assert result.fill_fraction <= 0.05     # bound the silence you analyse
 ```
 
 ---

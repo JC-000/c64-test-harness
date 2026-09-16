@@ -28,8 +28,13 @@ the window, because a REST read is a DMA that halts the 6510):
    counts/sample and would put an amplitude threshold ~150 samples late.
 4. ``samples * 64 == cycles * 3`` within tolerance, per window and as
    the slope across windows of two lengths (a fixed edge offset cancels
-   in the slope).  A capture with ``packets_dropped != 0`` has no time
-   base and is retried, never analysed.
+   in the slope).  Lost packets are zero-filled (#410), so a lossy capture
+   keeps its time base; it is retried only if the time base is not
+   intact, more than ``MAX_LOST_TIME_FRACTION`` of the stream was
+   discarded rather than delivered (#443),
+   more than ``MAX_FILL_FRACTION`` of it is fill, or fill lies
+   within one packet of a detected tone edge (a fill boundary is a step
+   the edge detector could take for the tone).
 
 Discrimination: at 48000 Hz the 60 s window would hold ~3580 more
 samples than 64:3 predicts (1244 ppm); the per-window residual from the
@@ -44,10 +49,9 @@ adjacent sample counts are possible for a given window, so two runs
 returning the identical count support the lock but add almost nothing
 over n=1; the independent evidence is the different window lengths.
 
-A capture whose sequence numbers ever step backwards or repeat is
-discarded as well (``packets_reordered``).  Since #430 a late packet is
-placed in its own slot and a duplicate discarded, so this is stricter than
-the time base needs; it also rejects a restarted sequence counter.
+A reordered or duplicated packet no longer costs a retry: since #430 a late
+packet takes its own slot and a duplicate is discarded.  A restarted
+sequence counter still breaks ``time_base_intact`` and is retried.
 
 Measured 2026-09-05 on the U64E (fw 3.15, NTSC, 1 MHz): see the
 docstring on ``U64_NTSC_AUDIO_RATE_HZ`` for the numbers.
@@ -75,7 +79,17 @@ from c64_test_harness.backends.u64_audio_capture import (
     NTSC_PHI2_HZ,
     PHI2_CYCLES_PER_AUDIO_SAMPLE,
     U64_NTSC_AUDIO_RATE_HZ,
+    AUDIO_FRAMES_PER_PACKET,
     AudioCapture,
+)
+from audio_link_loss import (
+    CAPTURE_ATTEMPTS,
+    MAX_FILL_FRACTION,
+    MAX_LOST_TIME_FRACTION,
+    capture_usable,
+    fill_near,
+    lost_time_fraction,
+    payloads_discarded,
 )
 from c64_test_harness.backends.ultimate64_helpers import (
     CAT_U64_SPECIFIC,
@@ -125,8 +139,8 @@ PER_WINDOW_PPM = 150.0
 SLOPE_PPM = 30.0
 #: How far the nominal 48000 Hz hypothesis sits from 64:3.
 NOMINAL_48K_PPM = 1244.0
-#: Retries for a capture that dropped packets (no time base).
-CAPTURE_ATTEMPTS = 3
+#: A fill boundary this close to a detected tone edge voids the capture.
+EDGE_GUARD_FRAMES = AUDIO_FRAMES_PER_PACKET
 
 
 class _Asm:
@@ -313,7 +327,7 @@ def _measure(target, outer: int, wav_dir: Path, tag: str) -> dict:
         time.sleep(0.5)
         client.stream_audio_stop()
         result = cap.stop(wav_path=wav_dir / f"{tag}-attempt{attempt}.wav")
-        if not result.time_base_intact or result.packets_reordered:
+        if not capture_usable(result):
             continue
         cycles = _cia_cycles(t.read_memory(RESULT_ADDR, 4))
         assert abs(cycles - predicted - _TIMER_TO_TONE) <= 2, (
@@ -322,13 +336,27 @@ def _measure(target, outer: int, wav_dir: Path, tag: str) -> dict:
             f"the window"
         )
         first, last = _tone_edges(result.wav_path)
+        if fill_near(result, first, EDGE_GUARD_FRAMES) or fill_near(
+            result, last, EDGE_GUARD_FRAMES
+        ):
+            continue
         return {
             "outer": outer, "cycles": cycles, "samples": last - first,
             "packets": result.packets_received, "attempt": attempt,
+            "fill_fraction": result.fill_fraction,
+            "packets_dropped": result.packets_dropped,
+            "payloads_discarded": payloads_discarded(result),
+            "lost_time_fraction": lost_time_fraction(result),
         }
     pytest.fail(
-        f"{CAPTURE_ATTEMPTS} captures in a row dropped or reordered packets; "
-        f"the sample index is not a clock on this network right now"
+        f"{CAPTURE_ATTEMPTS} captures in a row had a broken time base, more "
+        f"than {MAX_FILL_FRACTION:.0%} fill, more than "
+        f"{MAX_LOST_TIME_FRACTION:.0%} lost time (#443), or fill at a tone "
+        f"edge; the last one dropped {result.packets_dropped} packet(s), was "
+        f"{result.fill_fraction:.1%} fill, and discarded "
+        f"{payloads_discarded(result)} datagram(s)' PCM "
+        f"({lost_time_fraction(result):.1%} of the stream). The link is too "
+        f"lossy to measure on right now (#410)"
     )
 
 
@@ -351,7 +379,8 @@ def test_audio_rate_locks_64_to_3(target, tmp_path: Path) -> None:
             f"outer={p['outer']:3d} cycles={p['cycles']:9d} samples={p['samples']:8d} "
             f"64:3 -> {p['cycles'] * 3 / 64:10.1f} ({p['ppm']:+7.1f} ppm) "
             f"48000 -> {seconds * 48000:10.1f} ({p['ppm_vs_48000']:+7.1f} ppm) "
-            f"packets={p['packets']} attempt={p['attempt']}"
+            f"packets={p['packets']} attempt={p['attempt']} "
+            f"fill={p['fill_fraction']:.4f}"
         )
     print("\n".join(lines))
 

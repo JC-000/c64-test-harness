@@ -43,14 +43,66 @@ does not reduce.  No exact PAL constant is published here because the
 U64's PAL stream rate has not been measured on this bench -- quoting the
 NTSC construction for PAL would be a guess.
 
-Dropped packets destroy the time base
--------------------------------------
-Gaps are detected and counted, but **not padded**: the capture is the
-concatenation of the payloads that arrived.  After a drop, sample index
-no longer maps to time, and every downstream alignment is wrong by an
-unknown offset.  The WAV is perfectly well-formed either way, so a run
-with ``packets_dropped != 0`` must be *discarded*, not analysed --
-:attr:`CaptureResult.time_base_intact` is the check.
+Dropped packets are filled with silence (#410)
+----------------------------------------------
+Every audio datagram carries exactly :data:`AUDIO_PCM_BYTES_PER_PACKET`
+(768) bytes of PCM, and the 16-bit sequence number says exactly how many
+datagrams went missing.  So each lost packet is replaced by 768 zero bytes
+at its own position, and sample index stays a clock across the loss.  The
+contract, for anyone reading samples:
+
+* ``packets_filled`` lost packets are zeros in the WAV, at the frame
+  ranges listed in ``filled_frame_ranges`` (``(start_frame, frame_count)``,
+  merged, ascending).  ``fill_fraction`` is the share of samples that are
+  fill.  Zeros are not the signal: analysis that must not see them should
+  skip those ranges or bound ``fill_fraction``.
+* A packet that arrives late (#430) overwrites its own zeros, so it is
+  neither dropped nor filled.  A duplicate is discarded.
+* ``time_base_intact`` is True when every dropped packet was filled at a
+  trusted length: no unfilled drop, no sequence resync (a restarted
+  counter hides an unknown number of packets), and no datagram whose PCM
+  was not 768 bytes if anything was filled.  It no longer means "nothing
+  was lost"; ``packets_dropped == 0`` still does.
+* **Discarded payloads are lost stream time, and no fill field shows it
+  (#443).**  Two paths reach it, and both leave ``packets_dropped``,
+  ``packets_filled`` and ``fill_fraction`` at 0, ``filled_frame_ranges``
+  at ``()``, ``sequence_resyncs`` at 0 and ``time_base_intact`` True:
+
+  - **a counter that restarts over a number that was itself lost** reads
+    as a run of duplicates, so their PCM is discarded.  Measured on a
+    loopback stream: 52 datagrams in, 41 packets in the WAV, 11 never
+    delivered.  This path depends on **#452**: it is constructed today
+    only because nobody has established whether starting a stream resets
+    the FPGA's sequence counter.  If it does, a restart over a lost
+    number is routine rather than contrived, and this clause stops being
+    enough on its own.
+  - **a tail of duplicate-looking datagrams still held at** ``stop()``,
+    which :meth:`_stream_seq.SequenceTracker.flush_held` discards.
+    Measured: 106 in, 100 packets in the WAV, 6 discarded.  No lost
+    packet and no restart is needed, so this path does not depend on #452
+    -- it is the one that justifies counting discards at all -- and it is
+    bounded by ``_stream_seq.MAX_HELD_DUPLICATES`` (8 packets, 32 ms of
+    audio).
+
+  **The harm is duration, not content.**  The discarded bytes are
+  byte-identical to PCM already in the file; what is gone is the stream
+  time they carried, so the count is an *upper bound on packets of lost
+  time*.  ``payloads_discarded`` (#443) counts these datagrams directly;
+  on a result built before that field existed, ``packets_reordered`` is
+  the only trace -- it counts every datagram that arrived behind the
+  highest number, held ones included -- so reorders without drops do not
+  mean the capture is complete.  A discard is not in itself a fault: a
+  genuine retransmission is discarded correctly (101 in, 100 in the WAV,
+  1 discarded), which is why ``tests/audio_link_loss.py`` bounds lost
+  time rather than requiring zero.
+
+**Older behaviour, for readers of older captures.**  Before #410 gaps were
+not padded: the capture was the concatenation of the payloads that arrived,
+so any drop shifted every later sample, and ``time_base_intact`` was
+``packets_dropped == 0``.  #430 alone (the sequence fix without this fill)
+left a *zero-length* placeholder per missing packet, which is the same
+concatenation.  A result without a ``packets_filled`` attribute comes from
+a version that never padded.
 
 Public API
 ----------
@@ -64,6 +116,8 @@ Public API
 - ``PHI2_CYCLES_PER_AUDIO_SAMPLE`` — 64/3 (exact)
 - ``CHANNELS`` — 2 (stereo)
 - ``SAMPLE_WIDTH`` — 2 (16-bit)
+- ``AUDIO_FRAMES_PER_PACKET`` — 192 stereo frames per datagram
+- ``AUDIO_PCM_BYTES_PER_PACKET`` — 768 PCM bytes per datagram
 """
 from __future__ import annotations
 
@@ -92,6 +146,8 @@ __all__ = [
     "DEFAULT_SAMPLE_RATE",
     "CHANNELS",
     "SAMPLE_WIDTH",
+    "AUDIO_FRAMES_PER_PACKET",
+    "AUDIO_PCM_BYTES_PER_PACKET",
     "NTSC_COLOR_CARRIER_HZ",
     "NTSC_PHI2_HZ",
     "U64_NTSC_AUDIO_RATE_HZ",
@@ -216,6 +272,16 @@ CHANNELS = 2          # stereo
 SAMPLE_WIDTH = 2      # 16-bit (2 bytes per sample per channel)
 _SEQ_HEADER_LEN = 2   # 2-byte LE sequence number prefix
 
+#: Stereo frames in one audio datagram.  Ultimate documentation, "Data
+#: Streams": "192 stereo samples in 16-bit signed, little endian format ...
+#: Thus, the total UDP packet size is 770 bytes"; every datagram in the 28
+#: U64E captures of #410 was 770 B.  The gap fill relies on it, and a
+#: datagram of another size is counted in ``nonstandard_payloads``.
+AUDIO_FRAMES_PER_PACKET = 192
+
+#: PCM bytes in one audio datagram (768): the length of one packet's fill.
+AUDIO_PCM_BYTES_PER_PACKET = AUDIO_FRAMES_PER_PACKET * CHANNELS * SAMPLE_WIDTH
+
 
 def coherent_block_cycles(samples: int) -> int:
     """phi2 cycles spanning exactly *samples* audio samples.
@@ -291,8 +357,11 @@ class CaptureResult:
     #: slot, un-counting its drop.  Offline loopback, n=1, no device (#443
     #: review round 2): an old stream 0..500 that never received 5, then a
     #: restart 0..599, keeps 1,095 of the 1,100 packets sent while
-    #: ``packets_dropped`` is 0, :attr:`sequence_resyncs` is 1 and
-    #: :attr:`time_base_intact` is ``True``.  A silent restart with no such
+    #: ``packets_dropped`` is 0 and :attr:`sequence_resyncs` is 1 -- and
+    #: since #410 that resync makes :attr:`time_base_intact` ``False``, so
+    #: this row loses packets and reports the damage.  The loss stays
+    #: silent only where nothing resyncs (a lost number of 5..8, measured
+    #: on the #410 merge).  A silent restart with no such
     #: lost number keeps every packet.  Declared and accepted, not fixed;
     #: the full residual list is in ``backends/_stream_seq.py``.  The
     #: packets it loses are counted in :attr:`payloads_discarded`, which is
@@ -301,12 +370,27 @@ class CaptureResult:
     #: sequence counter is an open question (#452).
     packets_reordered: int = 0
     #: Backward steps taken as a new stream position (see
-    #: :attr:`packets_reordered`).  The sample index is not a clock across one.
+    #: :attr:`packets_reordered`).  The number of packets lost across one is
+    #: unknown, so the sample index is not a clock across it.
     sequence_resyncs: int = 0
+    #: Lost packets replaced by :data:`AUDIO_PCM_BYTES_PER_PACKET` zero
+    #: bytes at their own position (#410).  0 on a result constructed
+    #: without it, which then reads as unfilled.
+    packets_filled: int = 0
+    #: Datagrams whose PCM was not :data:`AUDIO_PCM_BYTES_PER_PACKET` bytes.
+    #: A fill's length is only trusted while this is 0.
+    nonstandard_payloads: int = 0
+    #: ``(start_frame, frame_count)`` of every run of fill in the capture,
+    #: ascending and merged.
+    filled_frame_ranges: tuple[tuple[int, int], ...] = ()
     #: Packets whose PCM was discarded instead of written: a held run of
     #: re-sent packets decided to be duplicates, either mid-capture or at
     #: :meth:`AudioCapture.stop`.  ``packets_received`` equals the packets
-    #: in the WAV plus this, so the accounting closes.
+    #: in the WAV, less any ``packets_filled``, plus this, so the
+    #: accounting closes.  (The ``packets_filled`` term is #410's: a
+    #: filled gap puts a packet in the WAV that was never received.  It is
+    #: 0 on a capture with no loss, which is why the plain form held
+    #: before #410.)
     #:
     #: **Read it as an upper bound on packets of lost time, not lost
     #: content.**  Two things land here and the tracker cannot tell them
@@ -332,16 +416,33 @@ class CaptureResult:
 
     @property
     def time_base_intact(self) -> bool:
-        """False when a dropped packet broke the index-to-time mapping.
+        """True when sample index maps exactly to time.
 
-        Gaps are not padded, so a single drop shifts every later sample
-        by an unknown amount.  Check this before analysing a capture;
-        the file itself looks fine either way.  A reordered or duplicated
-        packet is not a drop and does not shift the index (see
-        :attr:`packets_reordered`); a timing measurement that also wants
-        to reject a stream restart can require it to be zero.
+        See the module docstring, "Dropped packets are filled with silence".
         """
-        return self.packets_dropped == 0
+        return _time_base_intact(self)
+
+    @property
+    def fill_fraction(self) -> float:
+        """Share of :attr:`total_samples` that is fill, 0.0 to 1.0."""
+        return _fill_fraction(self)
+
+
+def _time_base_intact(result) -> bool:
+    """Shared by :class:`CaptureResult` and ``render_wav_u64.U64CaptureResult``."""
+    filled = getattr(result, "packets_filled", 0)
+    return (
+        result.packets_dropped == filled
+        and getattr(result, "sequence_resyncs", 0) == 0
+        and (filled == 0 or getattr(result, "nonstandard_payloads", 0) == 0)
+    )
+
+
+def _fill_fraction(result) -> float:
+    total = result.total_samples
+    if total <= 0:
+        return 0.0
+    return min(1.0, getattr(result, "packets_filled", 0) * AUDIO_FRAMES_PER_PACKET / total)
 
 
 def _wav_header_rate(sample_rate: int | float | Fraction) -> int:
@@ -411,6 +512,27 @@ def write_wav(
     return path
 
 
+def _filled_ranges(
+    chunks: list[bytes], fill_chunks: dict[int, int]
+) -> tuple[tuple[int, int], ...]:
+    """``(start_frame, frame_count)`` of each run of fill, merged."""
+    if not fill_chunks:
+        return ()
+    bytes_per_frame = CHANNELS * SAMPLE_WIDTH
+    ranges: list[list[int]] = []
+    offset = 0
+    for i, chunk in enumerate(chunks):
+        if i in fill_chunks:
+            start = offset // bytes_per_frame
+            count = len(chunk) // bytes_per_frame
+            if ranges and ranges[-1][0] + ranges[-1][1] == start:
+                ranges[-1][1] += count
+            else:
+                ranges.append([start, count])
+        offset += len(chunk)
+    return tuple((s, c) for s, c in ranges)
+
+
 class AudioCapture:
     """Background-thread UDP receiver for U64 audio streams.
 
@@ -425,13 +547,15 @@ class AudioCapture:
     packets into an internal buffer. ``stop()`` halts capture and
     optionally writes a WAV file.
 
-    Sequence numbers are tracked for gap detection. Gaps are logged
-    but do NOT insert silence — the captured audio is simply the
-    concatenation of received PCM payloads in order. **A capture whose
-    ``packets_dropped`` is non-zero has no usable time base and should be
-    discarded rather than analysed**; the resulting WAV is well-formed
-    either way, so nothing downstream will notice on its own. See
-    :attr:`CaptureResult.time_base_intact`.
+    Sequence numbers are tracked for gap detection. Each lost packet is
+    logged and replaced by one packet of silence at its own position, so
+    the sample index stays a clock (#410); late packets overwrite their
+    fill and duplicates are discarded (#430). **Zeros are not signal**:
+    check :attr:`CaptureResult.time_base_intact`, and bound
+    :attr:`CaptureResult.fill_fraction` or skip
+    :attr:`CaptureResult.filled_frame_ranges` before analysing. A capture
+    whose time base is not intact should be discarded; the WAV is
+    well-formed either way.
 
     A busy port fails loudly: :meth:`start` raises
     :class:`AudioCapturePortInUseError` rather than binding alongside the
@@ -512,6 +636,9 @@ class AudioCapture:
         self._payloads_discarded = 0
         self._last_seq: int | None = None
         self._seq = _stream_seq.SequenceTracker()
+        self._fill_chunks: dict[int, int] = {}  # chunk index -> packets
+        self._packets_filled = 0
+        self._nonstandard_payloads = 0
         self._started = False
 
     def start(self) -> None:
@@ -528,6 +655,9 @@ class AudioCapture:
         self._payloads_discarded = 0
         self._last_seq = None
         self._seq = _stream_seq.SequenceTracker()
+        self._fill_chunks = {}
+        self._packets_filled = 0
+        self._nonstandard_payloads = 0
 
         # Create and bind UDP socket
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -628,6 +758,15 @@ class AudioCapture:
 
             with self._lock:
                 self._packets_received += 1
+                if len(pcm_payload) != AUDIO_PCM_BYTES_PER_PACKET:
+                    if not self._nonstandard_payloads:
+                        _log.warning(
+                            "Audio datagram carries %d PCM bytes, not the "
+                            "documented %d: gap fill length is not trusted "
+                            "for this capture",
+                            len(pcm_payload), AUDIO_PCM_BYTES_PER_PACKET,
+                        )
+                    self._nonstandard_payloads += 1
                 ev = self._seq.observe(seq, zlib.crc32(pcm_payload), pcm_payload)
                 if ev.discarded_held:
                     _log.warning(
@@ -640,11 +779,20 @@ class AudioCapture:
                         "Audio stream gap: expected seq %d, got %d (%d packets dropped)",
                         ev.expected, seq, gap,
                     )
-                    # One empty placeholder per remembered missing packet,
-                    # so a late arrival can take its own slot (#430).
+                    # Silence for every lost packet (#410).  Packets older
+                    # than the reorder window get one block with no slot;
+                    # each remembered one gets its own, which a late
+                    # arrival overwrites (#430).
+                    if ev.untracked:
+                        self._fill_chunks[len(self._pcm_chunks)] = ev.untracked
+                        self._pcm_chunks.append(
+                            bytes(AUDIO_PCM_BYTES_PER_PACKET * ev.untracked)
+                        )
                     for missing in ev.tracked_missing:
                         self._seq.bind(missing, len(self._pcm_chunks))
-                        self._pcm_chunks.append(b"")
+                        self._fill_chunks[len(self._pcm_chunks)] = 1
+                        self._pcm_chunks.append(bytes(AUDIO_PCM_BYTES_PER_PACKET))
+                    self._packets_filled += gap
                 elif ev.kind == _stream_seq.LATE:
                     _log.warning(
                         "Audio stream late packet: seq %d arrived after %d; "
@@ -652,6 +800,8 @@ class AudioCapture:
                         seq, self._seq.highest,
                     )
                     self._pcm_chunks[ev.slot] = pcm_payload
+                    del self._fill_chunks[ev.slot]
+                    self._packets_filled -= 1
                     self._sync_counters()
                     continue
                 elif ev.kind == _stream_seq.HELD:
@@ -711,7 +861,10 @@ class AudioCapture:
             packets_received = self._packets_received
             packets_dropped = self._packets_dropped
             packets_reordered = self._packets_reordered
+            packets_filled = self._packets_filled
             sequence_resyncs = self._sequence_resyncs
+            nonstandard_payloads = self._nonstandard_payloads
+            filled_frame_ranges = _filled_ranges(self._pcm_chunks, self._fill_chunks)
             # After the flush above, so the still-held packets are in it.
             payloads_discarded = self._seq.discarded
 
@@ -722,7 +875,23 @@ class AudioCapture:
         total_frames = len(pcm_data) // bytes_per_frame if bytes_per_frame > 0 else 0
         duration = float(total_frames / self._sample_rate) if self._sample_rate > 0 else 0.0
 
-        if packets_dropped:
+        intact = _time_base_intact(CaptureResult(
+            wav_path=Path("/dev/null"), duration_seconds=0.0, sample_rate=0,
+            total_samples=total_frames, packets_received=packets_received,
+            packets_dropped=packets_dropped, packets_filled=packets_filled,
+            sequence_resyncs=sequence_resyncs,
+            nonstandard_payloads=nonstandard_payloads,
+        ))
+        if packets_dropped and intact:
+            _log.warning(
+                "Audio capture lost %d packet(s), filled with silence "
+                "(%.2f%% of samples; CaptureResult.filled_frame_ranges). The "
+                "time base is intact, but the zeros are not signal.",
+                packets_dropped,
+                100.0 * packets_filled * AUDIO_FRAMES_PER_PACKET / total_frames
+                if total_frames else 0.0,
+            )
+        elif not intact:
             _log.warning(
                 "Audio capture lost %d packet(s): sample index no longer "
                 "maps to time, every later sample is offset by an unknown "
@@ -750,7 +919,10 @@ class AudioCapture:
             packets_dropped=packets_dropped,
             sample_rate_exact=self._exact_rate,
             packets_reordered=packets_reordered,
+            packets_filled=packets_filled,
             sequence_resyncs=sequence_resyncs,
+            nonstandard_payloads=nonstandard_payloads,
+            filled_frame_ranges=filled_frame_ranges,
             payloads_discarded=payloads_discarded,
         )
 

@@ -114,13 +114,21 @@ PRESENT = [
     ("invariant (tracker)", _SEQ,
      "``packets_received`` == delivered + ``payloads_discarded`` closes the "
      "books"),
+    # #410 added gap fill, so the WAV also holds packets that were never
+    # received; the invariant carries that term since the #449 merge.
     ("invariant (CaptureResult)", _AUDIO,
-     "``packets_received`` equals the packets in the WAV plus this, so the "
-     "accounting closes"),
+     "``packets_received`` equals the packets in the WAV, less any "
+     "``packets_filled``, plus this, so the accounting closes"),
     ("invariant (DebugCaptureResult)", _DEBUG,
      "``packets_received`` equals the datagrams in the trace plus this"),
+    # The `- packets_filled` term must be pinned too: the pre-merge
+    # sentence is a *prefix* of the corrected one, so a substring check for
+    # the short form passes on both, and reverting REFERENCE.md to the form
+    # the #449 merge proved false would go unnoticed (#449 round 4, R2/R3).
     ("invariant (REFERENCE audio)", _REFERENCE,
-     "`packets_received` == packets in the WAV + `payloads_discarded`"),
+     "`packets_received` == packets in the WAV + `payloads_discarded` − "
+     "`packets_filled` (the filled packets are in the WAV but were never "
+     "received; before #410 nothing was filled and the term was zero)"),
     ("invariant (REFERENCE debug)", _REFERENCE,
      "`packets_received` == datagrams in the trace + this"),
     # -- the second discard path, which nothing else declares ---------------
@@ -129,6 +137,22 @@ PRESENT = [
     ("stop() path (DebugCaptureResult)", _DEBUG,
      "including datagrams still held at ``stop()`` -- which needs no "
      "restart and no loss at all"),
+    # -- 5. the silent set, narrowed by #410's fill (#449 merge) ------------
+    # #451 was closed on the prose and the behaviour agreeing.  The
+    # behaviour is held by _BOUNDARY_SWEEP; these hold the prose, which the
+    # merge rewrote into a *narrower* claim that nothing else pins.
+    ("narrowed silent set (tracker)", _SEQ,
+     "For audio since #410 that resync makes ``time_base_intact`` "
+     "``False``, so this row loses packets and says so; the loss is still "
+     "silent only where nothing resyncs (a lost number of 5..``max_held``, "
+     "measured on the #410 merge)"),
+    # Single-spaced after the full stop: _flat() collapses whitespace, so a
+    # pin copied verbatim from the double-spaced source can never match.
+    ("narrowed silent set (CaptureResult)", _AUDIO,
+     "since #410 that resync makes :attr:`time_base_intact` ``False``, so "
+     "this row loses packets and reports the damage. The loss stays "
+     "silent only where nothing resyncs (a lost number of 5..8, measured "
+     "on the #410 merge)"),
 ]
 
 
