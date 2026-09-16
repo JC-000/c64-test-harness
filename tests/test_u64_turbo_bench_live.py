@@ -219,15 +219,29 @@ def _clamp_ref(scalar: bytes) -> bytes:
     return bytes(s)
 
 
-def _self_jmp_bytes(address: int) -> bytes:
-    """The three bytes of ``JMP *`` assembled *at* ``address``.
+def _jmp_bytes(target: int) -> bytes:
+    """``JMP target``, assembled little-endian.
 
-    The boot check looks for the parked ``main_loop``. Spelling those bytes
-    as a literal is what #439 was: the literal kept saying ``4C 2A 08``
-    after the label moved to ``$082D``, so the poll could never match and
-    the failure surfaced only after the uploads.
+    This module needs the same three bytes in three places: the parked
+    ``main_loop`` the boot check waits for (a self-``JMP``), the
+    trampoline's own park, and the hijack written over ``main_loop``.
+    Spelling any of them as a literal is what #439 was: the literal kept
+    saying ``4C 2A 08`` after the label moved to ``$082D``, so the poll
+    could never match and the failure surfaced only after the uploads.
     """
-    return bytes([0x4C, address & 0xFF, (address >> 8) & 0xFF])
+    return bytes([0x4C, target & 0xFF, (target >> 8) & 0xFF])
+
+
+def _hijack_code() -> bytes:
+    """``JMP TRAMPOLINE`` — written over ``main_loop`` to divert the 6510.
+
+    Reads ``TRAMPOLINE`` at call time, so relocating the trampoline moves
+    the hijack with it. This one stayed a literal in the first pass at
+    #439: with the trampoline moved, the hijack would have jumped into
+    whatever happened to sit at ``$0360`` — on hardware, after all 12
+    uploads, which is the failure shape #439 exists to remove.
+    """
+    return _jmp_bytes(TRAMPOLINE)
 
 
 def _trampoline_code(clamp_address: int) -> bytes:
@@ -242,7 +256,7 @@ def _trampoline_code(clamp_address: int) -> bytes:
         0x20, clamp_address & 0xFF, (clamp_address >> 8) & 0xFF,  # JSR clamp
         0xA9, 0x42,                                               # LDA #$42
         0x8D, SENTINEL & 0xFF, (SENTINEL >> 8) & 0xFF,           # STA sentinel
-        0x4C, park & 0xFF, (park >> 8) & 0xFF,                   # JMP park
+        *_jmp_bytes(park),                                        # JMP park
     ])
 
 
@@ -324,7 +338,7 @@ def _run_clamp_fresh(
     # Verify program started via main_loop bytes (not stale screen text).
     # The expected bytes are assembled from the build's own main_loop
     # address, so a relinked PRG moves the poll with it (#439).
-    parked = _self_jmp_bytes(MAIN_LOOP)
+    parked = _jmp_bytes(MAIN_LOOP)
     ml = b""
     boot_deadline = time.monotonic() + 120.0
     while time.monotonic() < boot_deadline:
@@ -348,8 +362,8 @@ def _run_clamp_fresh(
     # DMA flush
     _ = transport.read_memory(SENTINEL, 1)
 
-    # Hijack main_loop → JMP $0360
-    write_bytes(transport, MAIN_LOOP, bytes([0x4C, 0x60, 0x03]))
+    # Hijack main_loop → JMP TRAMPOLINE (assembled, never spelled out)
+    write_bytes(transport, MAIN_LOOP, _hijack_code())
 
     # Poll sentinel
     deadline = time.monotonic() + 30.0

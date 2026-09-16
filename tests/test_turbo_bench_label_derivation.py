@@ -201,10 +201,10 @@ def test_boot_poll_bytes_are_assembled_at_the_build_main_loop(
     """
     module = _arm(monkeypatch, tmp_path)
 
-    assert module._self_jmp_bytes(module.MAIN_LOOP) == bytes([0x4C, 0x2D, 0x08])
-    assert module._self_jmp_bytes(0x0900) == bytes([0x4C, 0x00, 0x09])
+    assert module._jmp_bytes(module.MAIN_LOOP) == bytes([0x4C, 0x2D, 0x08])
+    assert module._jmp_bytes(0x0900) == bytes([0x4C, 0x00, 0x09])
     # And never the bytes the stale constant produced.
-    assert module._self_jmp_bytes(module.MAIN_LOOP) != bytes(
+    assert module._jmp_bytes(module.MAIN_LOOP) != bytes(
         [0x4C, _STALE_MAIN_LOOP & 0xFF, _STALE_MAIN_LOOP >> 8]
     )
 
@@ -224,6 +224,72 @@ def test_trampoline_jsrs_the_build_clamp_address(
     assert code[5:8] == bytes([0x8D, module.SENTINEL & 0xFF, module.SENTINEL >> 8])
     park = module.TRAMPOLINE + 8
     assert code[8:11] == bytes([0x4C, park & 0xFF, park >> 8])
+
+
+def test_hijack_jumps_to_the_trampoline_wherever_it_is(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The hijack written over ``main_loop`` must follow ``TRAMPOLINE``.
+
+    This was the last literal left in the module: ``4C 60 03`` spelled out.
+    Move the trampoline and the jump stayed behind, landing the 6510 in
+    whatever sits at ``$0360`` — on hardware, after all 12 uploads.
+    """
+    module = _arm(monkeypatch, tmp_path)
+    assert module._hijack_code() == bytes([0x4C, 0x60, 0x03])
+
+    monkeypatch.setattr(module, "TRAMPOLINE", 0x0370)
+
+    assert module._hijack_code() == bytes([0x4C, 0x70, 0x03]), (
+        "the hijack is a literal again: it does not track TRAMPOLINE"
+    )
+
+
+def test_run_clamp_fresh_hijacks_main_loop_to_the_trampoline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Drive the real helper against fakes and inspect what it writes.
+
+    The unit test above pins ``_hijack_code``; this one pins the *call
+    site*, so a literal reintroduced at the ``write_bytes`` call cannot
+    pass by leaving the helper correct and unused. No device: the client,
+    the transport, the memory helpers and ``sleep`` are all doubles.
+    """
+    module = _arm(monkeypatch, tmp_path)
+    monkeypatch.setattr(module, "TRAMPOLINE", 0x0370)
+
+    writes: list[tuple[int, bytes]] = []
+
+    class _FakeTransport:
+        def read_memory(self, address: int, count: int) -> bytes:
+            if address == module.MAIN_LOOP:
+                return module._jmp_bytes(module.MAIN_LOOP)  # booted, parked
+            return bytes([0x42])  # sentinel: clamp already finished
+
+    class _FakeClient:
+        def reboot(self) -> None:
+            pass
+
+        def run_prg(self, data: bytes) -> None:
+            pass
+
+    monkeypatch.setattr(module, "write_bytes",
+                        lambda t, addr, data: writes.append((addr, bytes(data))))
+    monkeypatch.setattr(module, "read_bytes", lambda t, addr, n: bytes(n))
+    monkeypatch.setattr(module, "set_reu", lambda *a, **k: None)
+    monkeypatch.setattr(module, "set_turbo_mhz", lambda *a, **k: None)
+    monkeypatch.setattr(module.time, "sleep", lambda *a, **k: None)
+
+    module._run_clamp_fresh(_FakeClient(), _FakeTransport(), b"", bytes(32), 1)
+
+    hijacks = [data for addr, data in writes if addr == module.MAIN_LOOP]
+    assert hijacks == [bytes([0x4C, 0x70, 0x03])], (
+        f"the write over main_loop must be JMP $0370, got {hijacks!r}"
+    )
+    # And the trampoline itself went to the relocated address.
+    assert any(addr == 0x0370 for addr, _ in writes), (
+        f"trampoline not written at the relocated address: {writes!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -317,11 +383,71 @@ def test_good_listing_leaves_the_label_gate_open(
     """The gate must not skip the module whenever the build *is* fine."""
     module = _arm(monkeypatch, tmp_path)
 
-    labels_gate = [
-        m for m in module.pytestmark
-        if m.name == "skipif" and m.kwargs.get("reason") == module._LABELS_SKIP_REASON
-    ]
-    assert labels_gate, "the labels gate is missing from pytestmark"
-    assert not any(m.args[0] for m in labels_gate), (
+    # Select the gate by position, not by its reason. On the happy path the
+    # labels reason is "" and so is the PRG gate's, so a reason-based filter
+    # is satisfied by the wrong mark: it stayed green under a mutant that
+    # deleted the labels gate from pytestmark outright, while its own
+    # message claimed the gate was present (reviewer finding 2).
+    assert len(module.pytestmark) == 4, (
+        f"expected four collection-time gates, got {module.pytestmark!r}"
+    )
+    labels_gate = module.pytestmark[3]
+    assert labels_gate.name == "skipif"
+    assert labels_gate.kwargs.get("reason") == module._LABELS_SKIP_REASON == ""
+    assert labels_gate.args[0] is False, (
         "the labels gate fires even though every required symbol resolved"
     )
+
+
+# ---------------------------------------------------------------------------
+# Real ld65 output, not only listings this file wrote
+# ---------------------------------------------------------------------------
+
+def test_parses_the_checked_in_real_ld65_listing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, labels_path: Path
+) -> None:
+    """Parse genuine ``ld65 -Ln`` output rather than text this test wrote.
+
+    ``tests/fixtures/labels.txt`` is a real listing from another C64
+    project, already checked in and used by other tests — and it is a
+    *different shape* from x25519's: four lowercase hex digits
+    (``al C:df0a``) rather than six uppercase (``al C:00082D``). Both are
+    real ld65 output, so the parser has to take both.
+    """
+    module = _arm(monkeypatch, tmp_path)
+
+    labels, unparseable = module._parse_ca65_labels(labels_path.read_text())
+
+    assert unparseable == [], f"real ld65 output did not parse: {unparseable[:3]}"
+    assert len(labels) > 700
+    assert labels["main_loop"] == 0x0883      # that project's, not x25519's
+    assert labels["reu_addr_ctrl"] == 0xDF0A  # four lowercase digits
+
+
+def test_resolves_addresses_from_a_verbatim_x25519_listing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """End-to-end on bytes the x25519 build itself emitted.
+
+    ``tests/fixtures/x25519_labels_excerpt.txt`` holds three lines copied
+    verbatim from that build's ``labels.txt`` (2026-09-10), including the
+    ``C:`` prefix its Makefile's ``sed`` adds to ``ld65 -Ln`` output. Put
+    where the module looks for it, the filename, the regex and the
+    resolver all run against real output instead of a fixture's idea of it.
+    """
+    excerpt = (Path(__file__).resolve().parent
+               / "fixtures" / "x25519_labels_excerpt.txt")
+    build = tmp_path / "build"
+    build.mkdir()
+    prg = build / "x25519.prg"
+    prg.write_bytes(b"\x01\x08")
+    (build / "labels.txt").write_text(excerpt.read_text())
+    monkeypatch.setenv("X25519_PRG", str(prg))
+
+    module = _load()
+
+    assert module._LABELS_SKIP_REASON == ""
+    assert (module.MAIN_LOOP, module.X25519_CLAMP, module.X25_SCALAR) == (
+        0x082D, 0x148E, 0x19A0
+    )
+    assert module._jmp_bytes(module.MAIN_LOOP) == bytes([0x4C, 0x2D, 0x08])
