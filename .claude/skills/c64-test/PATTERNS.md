@@ -906,9 +906,20 @@ So on a leak-prone device **`run_prg_via_sys(target, prg)` is the low-risk way t
    probing again on a bad result converges on the wedge you are diagnosing
    (issue #250). `get_info()`, `get_version()` and `read_mem()` cost nothing; use
    those, and reach for `liveness_probe` once, deliberately, knowing the price.
-   The client now counts both POSTs, reserves them before probing, and raises
+   The client counts both POSTs, reserves them before probing, and raises
    `Ultimate64TempHygieneError` instead of probing once hygiene is known to be
-   impossible; the module-level `ultimate64_probe.liveness_probe` does none of that.
+   impossible — and since #450 the module-level `ultimate64_probe.liveness_probe`
+   (the `c64_test_harness.liveness_probe` re-export) does the same against the
+   same per-device ledger, grading the firmware from its own bodyless
+   `/v1/info`. Neither spelling is a free health check. Three consequences for
+   the free one: it now **raises** where it used to return, it now **sweeps**
+   on a budget crossing (and a sweep can delete a raw or filename-less `/Temp`
+   image another lane mounted — #418), and it says once per process and host
+   when nothing here holds the device's `DeviceLock` (#194/#460) — a notice,
+   not a refusal, because it writes `$0334-$03B3` and writes it back. An
+   unreadable `/v1/info` **arms** rather than disarms: step 1 has already
+   reported the device reachable, so a version that will not parse is the
+   half-wedged device, not an empty address.
 9. **A malformed `address` is not rejected by the firmware — it writes to `$0000`.**
    `PUT /v1/machine:writemem?address=0xZZZZ&data=...` returns HTTP 200 and lands at
    zero page (measured 2026-09-10, issue #251). `Ultimate64Client.write_mem`

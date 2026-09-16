@@ -1478,6 +1478,10 @@ class Ultimate64Client:
                 password=self.password,
                 http_timeout=http_timeout,
                 request=_accounted,
+                # This method reserved, counted and gated the whole cost
+                # above; the free function must not do it a second time
+                # against the same device ledger (#450).
+                accounted=True,
             )
         finally:
             if sent[0] > cost:
