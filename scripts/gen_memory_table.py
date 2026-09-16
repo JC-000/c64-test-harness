@@ -5,7 +5,7 @@
 markdown, and it drifted from the code three ways (issue #169).  The
 table is now *generated* from ``c64_test_harness.memory_policy
 .HARNESS_SCRATCH`` and the doc carries it between marker comments;
-``tests/test_memory_table_doc.py`` fails the suite when they differ.
+``gen_memory_table.py --check`` exits 1 when they differ.
 
 Usage::
 
