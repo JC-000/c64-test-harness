@@ -1049,8 +1049,13 @@ from c64_test_harness.memory import write_bytes, read_bytes
 
 SENTINEL = 0x0350      # Scratch byte for completion signaling
 TRAMPOLINE = 0x0360    # Scratch area for injected code
-MAIN_LOOP = 0x082A     # Program's parking JMP (from labels)
-TARGET_SUB = 0x1509    # Subroutine to call (from labels)
+# These two belong to the program under test, not to you. Read them from that
+# build's ld65 label listing instead of pasting an address: the literals that
+# used to sit here went stale when the layout moved, and the mismatch only
+# surfaced from the polling loop — after a full session of uploads (#439; see
+# _resolve_labels in tests/test_u64_turbo_bench_live.py).
+MAIN_LOOP = labels["main_loop"]      # Program's parking JMP
+TARGET_SUB = labels["x25519_clamp"]  # Subroutine to call
 
 # Build trampoline: JSR target; LDA #$42; STA sentinel; JMP * (park)
 trampoline = bytes([
@@ -1122,7 +1127,7 @@ grid = wait_for_text(transport, "Q=QUIT", timeout=60.0)
 boot_deadline = time.monotonic() + 60.0
 while time.monotonic() < boot_deadline:
     ml = transport.read_memory(MAIN_LOOP, 3)
-    if ml == bytes([0x4C, 0x2A, 0x08]):  # expected JMP $082A
+    if ml == bytes([0x4C, MAIN_LOOP & 0xFF, (MAIN_LOOP >> 8) & 0xFF]):  # parked
         break
     time.sleep(0.5)
 ```
