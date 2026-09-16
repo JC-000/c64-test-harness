@@ -93,7 +93,7 @@ import zlib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 
-from . import _stream_seq
+from . import _stream_iface, _stream_seq
 
 if TYPE_CHECKING:
     from .ultimate64_client import Ultimate64Client
@@ -328,6 +328,9 @@ class DebugCapture:
         recv_buf_size: int = 262144,
         max_bytes: int | None = None,
         filter: Callable[[int], bool] | None = None,
+        *,
+        multicast_interface: str | None = None,
+        device_host: str | None = None,
     ) -> None:
         """
         Args:
@@ -342,10 +345,23 @@ class DebugCapture:
                 thread; return True to keep the entry, False to drop.
                 Lets the caller restrict capture to e.g. CPU cycles in a
                 given PC range. Default None = keep everything.
+            multicast_interface: Local interface address to join the group
+                on. Default (and the behaviour before #399) is INADDR_ANY,
+                which lets the kernel route the group -- via the VPN on this
+                bench. Ignored without ``multicast_group``: naming one
+                without the other raises ``ValueError``.
+            device_host: Resolve ``multicast_interface`` as the local
+                address that reaches this host (a UDP connect, no traffic).
+                An explicit ``multicast_interface`` wins over it.
         """
+        _stream_iface.validate_request(
+            multicast_group, multicast_interface, device_host
+        )
         self._port = port
         self._bind_addr = bind_addr
         self._multicast_group = multicast_group
+        self._multicast_interface = multicast_interface
+        self._device_host = device_host
         self._recv_buf_size = recv_buf_size
         self._max_bytes = max_bytes
         self._filter = filter
@@ -456,12 +472,10 @@ class DebugCapture:
 
         # Join multicast group if requested
         if self._multicast_group:
-            mreq = struct.pack(
-                "4s4s",
-                socket.inet_aton(self._multicast_group),
-                socket.inet_aton("0.0.0.0"),
+            _stream_iface.join_group(
+                self._sock, self._multicast_group,
+                self._multicast_interface, self._device_host,
             )
-            self._sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
         self._sock.settimeout(0.5)  # so recv loop can check stop_event
 

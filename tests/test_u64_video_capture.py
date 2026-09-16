@@ -30,17 +30,23 @@ def _build_video_packet(
     frame_end: bool = False,
     width: int = 384,
     lines: int = 4,
+    fill: int = 0,
 ) -> bytes:
     """Build a video capture UDP packet.
 
     Header (12 bytes LE):
         seq(u16), frame_num(u16), raw_line(u16), pixels_per_line(u16),
         lines_per_packet(u8), bpp(u8), encoding(u16)
+
+    ``fill`` is the byte the 4-bit pixel payload repeats.  It is what the
+    sequence tracker digests, so two packets with different fills are
+    distinct datagrams and two with the same fill are indistinguishable
+    from a re-send.
     """
     raw_line = line_num | (0x8000 if frame_end else 0)
     header = struct.pack("<HHHHBBH", seq, frame_num, raw_line, width, lines, 4, 0)
     # 4-bit packed: width * lines / 2 bytes
-    payload = bytes(width * lines // 2)
+    payload = bytes([fill]) * (width * lines // 2)
     return header + payload
 
 
@@ -236,3 +242,152 @@ class TestVideoCapture:
         cap = VideoCapture()
         with pytest.raises(RuntimeError):
             cap.stop()
+
+
+# ------------------------------------------------- frame assembly vs reorder
+
+
+def _capture(packets: list[bytes]) -> VideoCaptureResult:
+    """Feed *packets* to a VideoCapture through a mocked socket."""
+    mock_sock = MagicMock()
+    mock_sock.recvfrom = MagicMock(
+        side_effect=itertools.chain(
+            [(p, ("10.0.0.1", 11000)) for p in packets],
+            itertools.repeat(socket.timeout()),
+        )
+    )
+    with patch(
+        "c64_test_harness.backends.u64_video_capture.socket.socket",
+        return_value=mock_sock,
+    ):
+        cap = VideoCapture()
+        cap.start()
+        deadline = time.monotonic() + 2.0
+        while cap.packets_received < len(packets) and time.monotonic() < deadline:
+            time.sleep(0.005)
+        return cap.stop()
+
+
+class TestReorderAndFrameAssembly:
+    """What a late, duplicated or re-admitted datagram does to a frame (#442).
+
+    The decision under test: **assembly is driven by each datagram's own
+    ``frame_num``/``line_num`` header, and the sequence tracker governs the
+    counters plus one assembly rule** -- a late datagram is applied only if
+    it belongs to the frame still being assembled.  A late datagram for a
+    frame already finalised cannot repair it (it has been emitted or
+    counted dropped), and letting it through would finalise the frame in
+    progress early and start re-assembling the old frame number.
+    """
+
+    def test_a_swap_inside_the_current_frame_still_completes_it(self) -> None:
+        """Control: the lines arrive out of order but all before frame end."""
+        result = _capture([
+            _build_video_packet(seq=0, frame_num=0, line_num=0, fill=0x11),
+            _build_video_packet(seq=2, frame_num=0, line_num=8, fill=0x33),
+            _build_video_packet(seq=1, frame_num=0, line_num=4, fill=0x22),
+            _build_video_packet(
+                seq=3, frame_num=0, line_num=12, frame_end=True, fill=0x44
+            ),
+        ])
+        assert result.packets_dropped == 0
+        assert result.packets_reordered == 1
+        assert result.frames_dropped == 0
+        assert [(f.frame_number, f.height) for f in result.frames] == [(0, 16)]
+        assert result.frames[0].row(4) == bytes([2]) * 384
+
+    def test_a_late_packet_for_a_finished_frame_does_not_corrupt_the_next(
+        self,
+    ) -> None:
+        """Frame 0 is already out when its missing line turns up.
+
+        Applying it would finalise frame 1 after one packet (emitting a
+        truncated frame) and then re-open frame 0, which is finalised
+        incomplete in turn: one reordered datagram, two corrupted frames.
+        """
+        result = _capture([
+            _build_video_packet(
+                seq=0, frame_num=0, line_num=0, frame_end=True, fill=0x11
+            ),
+            _build_video_packet(seq=2, frame_num=1, line_num=0, fill=0x22),
+            _build_video_packet(seq=1, frame_num=0, line_num=4, fill=0x33),
+            _build_video_packet(
+                seq=3, frame_num=1, line_num=4, frame_end=True, fill=0x44
+            ),
+        ])
+        assert result.packets_dropped == 0
+        assert result.packets_reordered == 1
+        assert result.stale_packets == 1
+        assert result.frames_dropped == 0
+        assert [(f.frame_number, f.height) for f in result.frames] == [
+            (0, 4), (1, 8)
+        ]
+
+    def test_a_duplicate_datagram_is_discarded_not_counted_as_loss(self) -> None:
+        result = _capture([
+            _build_video_packet(seq=0, frame_num=0, line_num=0, fill=0x11),
+            _build_video_packet(seq=1, frame_num=0, line_num=4, fill=0x22),
+            _build_video_packet(seq=1, frame_num=0, line_num=4, fill=0x22),
+            _build_video_packet(
+                seq=2, frame_num=0, line_num=8, frame_end=True, fill=0x33
+            ),
+        ])
+        assert result.packets_dropped == 0
+        assert result.packets_reordered == 1
+        assert result.payloads_discarded == 1
+        assert [(f.frame_number, f.height) for f in result.frames] == [(0, 12)]
+
+    def test_a_restart_re_admits_the_lines_it_held(self) -> None:
+        """A held run that turns out to be a restarted counter, not a duplicate.
+
+        Datagram 4 repeats sequence 1 with byte-identical pixels for a
+        different line, so the tracker holds it undecided; datagram 5
+        continues that run with new pixels, which makes it a restart, and
+        the held datagram's line is re-admitted ahead of it.  Without the
+        re-admission line 12 never reaches the frame and it is finalised
+        incomplete.
+        """
+        result = _capture([
+            _build_video_packet(seq=0, frame_num=0, line_num=0, fill=0x11),
+            _build_video_packet(seq=1, frame_num=0, line_num=4, fill=0x22),
+            _build_video_packet(seq=2, frame_num=0, line_num=8, fill=0x33),
+            _build_video_packet(seq=1, frame_num=0, line_num=12, fill=0x22),
+            _build_video_packet(
+                seq=2, frame_num=0, line_num=8, frame_end=True, fill=0x44
+            ),
+        ])
+        assert result.sequence_resyncs == 1
+        assert result.packets_dropped == 0
+        assert result.frames_dropped == 0
+        assert [(f.frame_number, f.height) for f in result.frames] == [(0, 16)]
+        assert result.frames[0].row(12) == bytes([2]) * 384
+        assert result.frames[0].row(8) == bytes([4]) * 384
+
+    def test_a_duplicate_of_an_earlier_frame_does_not_reopen_it(self) -> None:
+        """The held rule earns its keep here (mutation M4 of the #442 PR).
+
+        Datagram 4 duplicates sequence 1, which belonged to frame 0 -- long
+        finalised.  Applying it, rather than holding it undecided, finalises
+        frame 1 after one packet and re-opens frame 0, so one duplicate
+        costs two frames.  Pixel-identical payloads make the duplicate
+        invisible *within* a frame, which is why the case that proves the
+        rule has to cross a frame boundary.
+        """
+        result = _capture([
+            _build_video_packet(seq=0, frame_num=0, line_num=0, fill=0x11),
+            _build_video_packet(
+                seq=1, frame_num=0, line_num=4, frame_end=True, fill=0x22
+            ),
+            _build_video_packet(seq=2, frame_num=1, line_num=0, fill=0x33),
+            _build_video_packet(seq=1, frame_num=0, line_num=4, fill=0x22),
+            _build_video_packet(
+                seq=3, frame_num=1, line_num=4, frame_end=True, fill=0x44
+            ),
+        ])
+        assert result.packets_dropped == 0
+        assert result.packets_reordered == 1
+        assert result.payloads_discarded == 1
+        assert result.frames_dropped == 0
+        assert [(f.frame_number, f.height) for f in result.frames] == [
+            (0, 8), (1, 8)
+        ]

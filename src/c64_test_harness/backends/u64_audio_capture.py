@@ -134,7 +134,7 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 
-from . import _stream_seq
+from . import _stream_iface, _stream_seq
 
 __all__ = [
     "AudioCapture",
@@ -584,6 +584,9 @@ class AudioCapture:
         bind_addr: str = "",
         multicast_group: str | None = None,
         recv_buf_size: int = 65536,
+        *,
+        multicast_interface: str | None = None,
+        device_host: str | None = None,
     ) -> None:
         """
         Args:
@@ -596,7 +599,18 @@ class AudioCapture:
             bind_addr: Address to bind to (empty = all interfaces).
             multicast_group: If set, join this multicast group (e.g. "239.0.1.65").
             recv_buf_size: SO_RCVBUF size hint.
+            multicast_interface: Local interface address to join the group
+                on.  Default (and the behaviour before #399) is INADDR_ANY,
+                which lets the kernel route the group -- via the VPN on this
+                bench.  Ignored without ``multicast_group``: naming one
+                without the other raises ``ValueError``.
+            device_host: Resolve ``multicast_interface`` as the local
+                address that reaches this host (a UDP connect, no traffic).
+                An explicit ``multicast_interface`` wins over it.
         """
+        _stream_iface.validate_request(
+            multicast_group, multicast_interface, device_host
+        )
         self._requested_port = port
         #: The port actually bound.  Equal to the requested one until
         #: ``start()`` resolves an ephemeral request.
@@ -620,6 +634,8 @@ class AudioCapture:
             )
         self._bind_addr = bind_addr
         self._multicast_group = multicast_group
+        self._multicast_interface = multicast_interface
+        self._device_host = device_host
         self._recv_buf_size = recv_buf_size
 
         self._sock: socket.socket | None = None
@@ -719,12 +735,10 @@ class AudioCapture:
 
         # Join multicast group if requested
         if self._multicast_group:
-            mreq = struct.pack(
-                "4s4s",
-                socket.inet_aton(self._multicast_group),
-                socket.inet_aton("0.0.0.0"),
+            _stream_iface.join_group(
+                self._sock, self._multicast_group,
+                self._multicast_interface, self._device_host,
             )
-            self._sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
         self._sock.settimeout(0.5)  # so recv loop can check stop_event
 

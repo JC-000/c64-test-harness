@@ -33,6 +33,7 @@ from c64_test_harness.backends.u64_debug_capture import (
     ENTRY_SIZE,
     DebugCapture,
 )
+from c64_test_harness.backends.u64_video_capture import VideoCapture
 
 #: PCM bytes per audio packet; each packet's frames carry its own sequence
 #: number so the WAV's packet order can be read back.
@@ -804,3 +805,87 @@ def test_a_loss_past_max_held_is_reported_not_swallowed(tmp_path: Path) -> None:
     result, _ = _audio_raw([(s, _SILENT) for s in seqs], tmp_path)
     assert (result.packets_dropped, result.payloads_discarded) == (1, 0)
     assert result.time_base_intact is False
+
+
+# ----------------------------------------------------------------------------
+# #442: VideoCapture carried the same defect.  It was a source read on the
+# issue -- never reproduced -- so the same table is driven through the real
+# receiver over loopback here.
+# ----------------------------------------------------------------------------
+
+_VIDEO_WIDTH = 384
+_VIDEO_LINES_PER_PACKET = 4
+
+
+def _video_packet(
+    seq: int, frame_num: int, line_num: int, *, frame_end: bool = False,
+    fill: int | None = None,
+) -> bytes:
+    """One video datagram: 12-byte header + 768 bytes of 4-bit pixels.
+
+    The pixels are keyed to *fill* (the sequence number by default), so a
+    re-sent datagram is digest-identical and a distinct one is not.
+    """
+    raw_line = line_num | (0x8000 if frame_end else 0)
+    header = struct.pack(
+        "<HHHHBBH", seq & 0xFFFF, frame_num, raw_line, _VIDEO_WIDTH,
+        _VIDEO_LINES_PER_PACKET, 4, 0,
+    )
+    word = seq & 0xFFFF if fill is None else fill
+    payload = struct.pack("<H", word) * (
+        _VIDEO_WIDTH * _VIDEO_LINES_PER_PACKET // 4
+    )
+    return header + payload
+
+
+def _video(seqs: list[int]):
+    """Capture *seqs* as lines of one frame; returns the result.
+
+    Every datagram carries its own frame and line number, so frame assembly
+    does not depend on the sequence number: these cases are about the
+    counters.  Frame-assembly decisions are tested in
+    ``tests/test_u64_video_capture.py``.
+    """
+    cap = VideoCapture(port=0, bind_addr="127.0.0.1", recv_buf_size=1 << 20)
+    cap.start()
+    try:
+        assert cap._sock is not None
+        _send(
+            cap._sock.getsockname(),
+            [
+                _video_packet(s, 0, (i * _VIDEO_LINES_PER_PACKET) & 0x7FFF)
+                for i, s in enumerate(seqs)
+            ],
+            lambda: cap.packets_received,
+        )
+    finally:
+        result = cap.stop()
+    assert result.packets_received == len(seqs), "loopback lost packets"
+    return result
+
+
+@pytest.mark.parametrize("name", list(CASES))
+def test_video_capture_counts_only_true_loss(name: str) -> None:
+    seqs, dropped, backward, _ = CASES[name]
+    result = _video(seqs)
+    assert result.packets_dropped == dropped
+    assert result.packets_reordered == backward
+
+
+def test_video_capture_counts_a_duplicate_as_discarded() -> None:
+    seqs, *_ = CASES["duplicate"]
+    result = _video(seqs)
+    assert (result.packets_dropped, result.packets_reordered,
+            result.payloads_discarded) == (0, 1, 1)
+
+
+def test_video_far_backward_jump_resyncs_rather_than_discarding() -> None:
+    seqs = list(range(3000, 3100)) + list(range(10))
+    result = _video(seqs)
+    assert (result.packets_dropped, result.packets_reordered,
+            result.sequence_resyncs) == (0, 1, 1)
+
+
+@pytest.mark.parametrize("name", list(CASES))
+def test_none_of_the_video_reorder_cases_resyncs(name: str) -> None:
+    assert _video(CASES[name][0]).sequence_resyncs == 0
