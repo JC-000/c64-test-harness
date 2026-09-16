@@ -89,7 +89,11 @@ measured on this bench, so none of these has been seen):
   :attr:`SequenceTracker.discarded`, surfaced as ``payloads_discarded`` on
   both ``CaptureResult`` and ``DebugCaptureResult``, and
   ``packets_received`` == delivered + ``payloads_discarded`` closes the
-  books.  Without it a capture missing a fifth of its audio reads clean in
+  books -- *delivered* meaning packets whose PCM reached the WAV, fill
+  excluded.  That word carries the whole difference from the WAV-count
+  form: since #410 the WAV also holds a zero packet per filled gap, which
+  was never received, so a count of packets *in the WAV* needs
+  ``packets_filled`` subtracted back out (see ``CaptureResult``).  Without it a capture missing a fifth of its audio reads clean in
   every field a caller can assert on -- ``packets_dropped`` 0,
   ``sequence_resyncs`` 0, ``time_base_intact`` ``True`` -- with only
   ``packets_reordered`` and two WARNING lines as evidence (#443 round 3,
