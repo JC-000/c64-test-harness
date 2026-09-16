@@ -566,20 +566,31 @@ def test_ledger_probe_falls_back_to_the_registered_port_and_password():
     This is the path that deletes files the process did not create -- the
     cross-lane case #418 is actually about -- so it is the one that most
     needs the listing.
+
+    The state is built the way production builds it -- ``attach()``
+    records the client's credentials, then every client is
+    garbage-collected -- rather than by assigning the three attributes by
+    hand. Assigning them pinned only the *read* side, which left
+    ``attach`` free to stop recording them with no test noticing: mutant
+    r2m12 replaced both recording lines with ``pass`` and survived all
+    308 tests, silently reverting the orphaned sweep to port 80 with no
+    ``X-Password`` (#418 re-verify, finding A).
     """
+
+    class _FakeClient:
+        host, port, password = "10.0.0.5", 8080, "hunter2"
+
     ledger = gc_mod.TempLedger("10.0.0.5")
-    ledger.host = "10.0.0.5"
-    ledger.probe_port = 8080
-    ledger.probe_password = "hunter2"
-    seen = []
-    monkey = gc_mod._default_mounted_probe
-    try:
-        gc_mod._default_mounted_probe = lambda host, **kw: seen.append((host, kw)) or {}
-        probe = ledger.mounted_probe()
-        probe()
-    finally:
-        gc_mod._default_mounted_probe = monkey
-    assert seen == [("10.0.0.5", {"port": 8080, "password": "hunter2"})]
+    ledger.attach(_FakeClient())
+    # The recording half of the wiring, on the tested route.
+    assert (ledger.host, ledger.probe_port, ledger.probe_password) == (
+        "10.0.0.5", 8080, "hunter2",
+    )
+    # The orphaned case: no client object survives to drain.
+    ledger._clients.clear()
+    probe = ledger.mounted_probe()
+    assert probe() == {}
+    assert _default_probe_calls == [("10.0.0.5", None, 8080, "hunter2")]
 
 
 def test_unit_tests_never_dial_a_real_device():
