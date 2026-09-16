@@ -55,6 +55,13 @@ from live_fixture_teardown import (  # noqa: E402
     teardown_then_release,
 )
 from wav_capture_paths import capture_dir  # noqa: E402
+from audio_link_loss import (  # noqa: E402
+    CAPTURE_ATTEMPTS,
+    MAX_FILL_FRACTION,
+    MAX_LOST_TIME_FRACTION,
+    capture_usable,
+    payloads_discarded,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -232,15 +239,46 @@ def test_chromatic_capture(u64_client, wav_dir: Path, config):
     # 4. Allow the config to take effect
     time.sleep(0.5)
 
-    # 5. Capture audio -- duration is 25 notes * 0.5s = 12.5s, add margin
-    result = capture_sid_u64(
-        client=u64_client,
-        sid=sid,
-        out_wav=wav_path,
-        duration_seconds=14.0,
-        song=0,
-        settle_time=0.5,
-    )
+    # 5. Capture audio -- duration is 25 notes * 0.5s = 12.5s, add margin.
+    #
+    #    #453: since #410 a lost packet is zero-filled rather than dropped,
+    #    so a lossy capture keeps an exact time base but carries runs of
+    #    silence.  This module analyses amplitude, and fill enters that
+    #    analysis silently -- it depresses the peak and puts a step edge
+    #    where the signal has none.  ``packets_dropped`` alone does not see
+    #    it (a filled drop leaves the time base intact by design), so the
+    #    capture is gated on ``capture_usable`` and retried, exactly as the
+    #    other audio live tests do.  Each attempt is a fresh
+    #    ``capture_sid_u64``, which resets the machine and restarts the
+    #    player -- that is the same cost those tests pay.
+    for attempt in range(CAPTURE_ATTEMPTS):
+        result = capture_sid_u64(
+            client=u64_client,
+            sid=sid,
+            out_wav=wav_path,
+            duration_seconds=14.0,
+            song=0,
+            settle_time=0.5,
+        )
+        if capture_usable(result):
+            break
+        logger.warning(
+            "%s: attempt %d unusable (time_base_intact=%s, fill=%.1f%%, "
+            "dropped=%d, discarded=%d); retrying",
+            config["name"], attempt + 1, result.time_base_intact,
+            result.fill_fraction * 100, result.packets_dropped,
+            payloads_discarded(result),
+        )
+    else:
+        pytest.fail(
+            f"{CAPTURE_ATTEMPTS} captures in a row had a broken time base, "
+            f"more than {MAX_FILL_FRACTION:.0%} fill, or more than "
+            f"{MAX_LOST_TIME_FRACTION:.0%} lost time; the last was "
+            f"{result.fill_fraction:.1%} fill with "
+            f"{result.packets_dropped} packet(s) dropped and "
+            f"{payloads_discarded(result)} discarded. The link is too lossy "
+            f"to measure amplitude on right now (#410, #453)"
+        )
 
     # 6. Validate file was created
     assert wav_path.exists(), f"WAV not created: {wav_path}"
@@ -263,6 +301,15 @@ def test_chromatic_capture(u64_client, wav_dir: Path, config):
             "duration_seconds": result.duration_seconds,
             "packets_received": result.packets_received,
             "packets_dropped": result.packets_dropped,
+            # #453: what the amplitude figure below was measured over.
+            # A peak read off a capture that is part silence is not
+            # comparable with one that is not, so the fill bookkeeping
+            # travels with it.
+            "packets_filled": result.packets_filled,
+            "fill_fraction": result.fill_fraction,
+            "time_base_intact": result.time_base_intact,
+            "payloads_discarded": payloads_discarded(result),
+            "capture_attempts": attempt + 1,
             "total_samples": result.total_samples,
             "sample_rate": result.sample_rate,
             "peak_amplitude": int(peak),
