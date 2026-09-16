@@ -1142,7 +1142,7 @@ PAL: 384×272 @ 50fps (68 packets/frame). NTSC: 384×240 @ 60fps. 4-bit packed p
 - `.packets_reordered: int` — datagrams that arrived behind the highest sequence number seen (late, held or resync), one per datagram (#442)
 - `.sequence_resyncs: int` — backward steps the tracker could not repair (restarted counter, forward loss ≥ 32768, a datagram past the 1024-packet reorder window)
 - `.payloads_discarded: int` — datagrams held as possible duplicates and then decided to be duplicates; a true duplicate is a correct discard, so non-zero is not by itself a fault
-- `.stale_packets: int` — late datagrams whose frame was already finalised; **their lines are lost and no other counter shows it** (`packets_dropped` stays 0 — the datagram did arrive; `frames_dropped` stays 0 — the frame was finalised from the lines it had, emitted complete but short), so a test bounding video loss must assert on this field too
+- `.stale_packets: int` — late datagrams whose frame was already finalised; **their lines are lost and no other counter shows it** (`packets_dropped` stays 0 — the datagram did arrive; `frames_dropped` stays 0 **for tail loss** — the frame is finalised from the lines it had and emitted complete but short, since its height comes from the highest line present, whereas an **interior** hole counts `frames_dropped` 1 and that frame never reaches `.frames` at all), so a test bounding video loss must assert on this field too
 
 ### `VIC_PALETTE`
 Tuple of 16 `(R, G, B)` tuples — standard VIC-II colors (index 0=black, 1=white, ..., 15=light grey).
