@@ -74,8 +74,6 @@ network state, it only injects and reads frames on the given NIC.
 from __future__ import annotations
 
 import os
-import platform
-import subprocess
 import time
 
 import pytest
@@ -144,19 +142,10 @@ PARTIAL_N = 20
 _tag = [0]
 
 
-def _host_mac(iface: str) -> bytes:
-    if platform.system() == "Darwin":
-        out = subprocess.run(["ifconfig", iface], capture_output=True, text=True).stdout
-        for ln in out.splitlines():
-            if "ether " in ln:
-                return parse_mac(ln.split()[1])
-    else:
-        try:
-            with open(f"/sys/class/net/{iface}/address") as fh:
-                return parse_mac(fh.read().strip())
-        except OSError:
-            pass
-    pytest.skip(f"cannot read the MAC of {iface}")
+# Bound as a module attribute on purpose: tests/test_live_fixture_teardowns.py
+# monkeypatches ``_host_mac`` here.  See bridge_platform.host_mac for why
+# ``ifconfig``'s ether line must not be trusted (#444).
+from bridge_platform import host_mac as _host_mac  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
