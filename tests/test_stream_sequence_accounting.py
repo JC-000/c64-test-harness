@@ -670,3 +670,92 @@ def test_the_declared_residual_counts_its_five_lost_packets(
     assert result.payloads_discarded == 5
     assert result.packets_received == 1095 + result.payloads_discarded
     assert result.time_base_intact is True
+
+
+# ----------------------------------------------------------------------------
+# #443 review round 4: the #451 boundary, pinned behaviourally.
+#
+# reviewer-8 swept the lost number through a silent restart in 12 loopback
+# captures; this reproduces that sweep through the real AudioCapture.  The
+# stream is the old counter 0..59 with exactly one number lost, then a silent
+# restart 0..13, every payload identical -- 73 datagrams, all received.
+#
+# The prose in ``_stream_seq.py`` and ``CaptureResult.packets_reordered``
+# says the silent-loss set is exactly 1..``max_held``, inclusive at the top.
+# That claim is asserted here from behaviour, so it cannot regress into a
+# comment that merely says so.  Offline loopback, n=1 per row, no device.
+# ----------------------------------------------------------------------------
+
+#: lost number -> (payloads discarded, packets_dropped, time_base_intact)
+#: Measured on this head, 2026-09-15.  Every row receives 73 datagrams.
+_BOUNDARY_SWEEP = {
+    # Nothing precedes the first number the tracker observes, so 0 is never
+    # a tracked missing number: the restart resyncs and keeps everything.
+    0: (0, 0, True),
+    # 1..max_held: the held run reaches a number the old stream is still
+    # owed, so the held packets are discarded -- silently, with the time
+    # base still reported intact.  This is the residual.
+    1: (1, 0, True),
+    2: (2, 0, True),
+    3: (3, 0, True),
+    4: (4, 0, True),
+    # From 5 the rest of the restart is too short to be recognised as one,
+    # so its tail is still held at stop() and discarded there too.
+    5: (13, 0, True),
+    6: (13, 0, True),
+    7: (13, 0, True),
+    8: (13, 0, True),
+    # Past max_held the held run is recognised as a restart before it can
+    # reach the lost number: nothing is discarded, and the old stream's
+    # drop is reported honestly.
+    9: (0, 1, False),
+    10: (0, 1, False),
+    11: (0, 1, False),
+}
+
+
+@pytest.mark.parametrize("lost", sorted(_BOUNDARY_SWEEP))
+def test_the_silent_loss_set_is_exactly_1_to_max_held(
+    lost: int, tmp_path: Path,
+) -> None:
+    """#451: the triggering set is 1..``max_held``, inclusive at the top.
+
+    ``max_held`` (8) still loses packets silently; ``max_held`` + 1 does
+    not, and 0 never does.  A reader who computes "the first 8 numbers =
+    0..7" concludes 8 is safe; this fails if that ever becomes true.
+    """
+    discarded, dropped, intact = _BOUNDARY_SWEEP[lost]
+    seqs = [s for s in range(60) if s != lost] + list(range(14))
+    result, pcm = _audio_raw([(s, _SILENT) for s in seqs], tmp_path)
+    kept = len(pcm) // _AUDIO_PAYLOAD_LEN
+
+    assert result.packets_received == 73
+    assert result.payloads_discarded == discarded
+    assert result.packets_dropped == dropped
+    assert result.time_base_intact is intact
+    # The books close in every row, however the packets were classified.
+    assert result.packets_received == kept + result.payloads_discarded
+
+    # The claim itself: silent loss is exactly 1..max_held, inclusive.
+    # "Silent" = payloads thrown away while the capture still reports a
+    # sound time base.
+    silently_lossy = discarded > 0 and intact
+    assert silently_lossy is (1 <= lost <= _MAX_HELD), (
+        f"lost={lost} changes the #451 boundary: the prose in "
+        f"_stream_seq.py and CaptureResult.packets_reordered says the set "
+        f"is exactly 1..{_MAX_HELD}"
+    )
+
+
+def test_a_loss_past_max_held_is_reported_not_swallowed(tmp_path: Path) -> None:
+    """The control that makes the boundary meaningful.
+
+    At ``max_held`` + 1 the restart is recognised before the held run can
+    reach the lost number, so the old stream's drop survives as a drop:
+    ``time_base_intact`` False.  That is the honest outcome, and it is what
+    the rows 1..8 above do *not* do.
+    """
+    seqs = [s for s in range(60) if s != _MAX_HELD + 1] + list(range(14))
+    result, _ = _audio_raw([(s, _SILENT) for s in seqs], tmp_path)
+    assert (result.packets_dropped, result.payloads_discarded) == (1, 0)
+    assert result.time_base_intact is False
