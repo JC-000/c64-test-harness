@@ -1030,8 +1030,9 @@ result = cap.stop(wav_path="output.wav")  # -> CaptureResult
 
 ### `CaptureResult` (dataclass)
 - `.wav_path: Path`, `.duration_seconds: float`, `.sample_rate: int`
-- `.total_samples: int`, `.packets_received: int`, `.packets_dropped: int`, `.packets_reordered: int` (backward sequence steps — reordered or duplicated packets; counted separately from drops, #205)
-- `.time_base_intact: bool` — `packets_dropped == 0`, forward gaps only; a timing measurement must also require `packets_reordered == 0`, since a gap is never padded and either event breaks the sample index as a clock
+- `.total_samples: int`, `.packets_received: int`, `.packets_dropped: int`, `.packets_reordered: int` (packets that arrived behind the highest sequence seen, #205; **one per packet since #430** — it counted backward steps before, so `[0,5,1,2,3,4,6]` read 1 and now reads 4; a late packet un-counts its drop and fills its own slot, a duplicate — same number already received, identical PCM — is discarded, so neither is a drop or shifts the index), `.sequence_resyncs: int` (restarted counter — including one over byte-identical PCM, recognised when the re-sent run continues past its own numbers while still behind the highest number, or when more than `MAX_HELD_DUPLICATES` (8) of them arrive, with the held packets kept — a forward loss ≥ 32,768, or a packet ≥ 1024 late; appended where it arrived; the over-late case overcounts `packets_dropped` by about its lateness; residuals in `backends/_stream_seq.py`)
+- `.payloads_discarded: int` — packets that arrived and were counted in `packets_received` but whose PCM never reached the WAV: held re-sent runs decided to be duplicates, both mid-capture and at `stop()`. `packets_received` == packets in the WAV + `payloads_discarded`. A true duplicate's PCM is a *correct* discard, so non-zero is not by itself a fault — but a silent counter restart discards real audio here while `packets_dropped`, `sequence_resyncs` and `time_base_intact` all read clean, so assert on it when a capture's completeness matters (#443 round 3; residuals in `backends/_stream_seq.py`)
+- `.time_base_intact: bool` — `packets_dropped == 0`; a gap is never padded, so any true drop breaks the sample index as a clock. Deliberately **not** affected by `payloads_discarded`
 
 ### `write_wav(path, pcm_data, sample_rate=48000, channels=2, sample_width=2) -> Path`
 Write raw PCM data to a WAV file.
@@ -1084,7 +1085,7 @@ Accumulates raw bytes in the recv loop; parses into `BusCycle` objects on `stop(
 
 ### `DebugCaptureResult` (dataclass)
 - `.trace: list[BusCycle]`, `.duration_seconds: float`
-- `.packets_received: int`, `.packets_dropped: int`, `.total_cycles: int`
+- `.packets_received: int`, `.packets_dropped: int`, `.total_cycles: int`, `.packets_reordered: int` (datagrams that arrived behind the highest sequence seen, one per datagram, #430: a late one un-counts its drop and its cycles are appended in arrival order; a duplicate — same number already received, identical payload — has its cycles discarded), `.sequence_resyncs: int` (same meaning as on `CaptureResult`), `.payloads_discarded: int` (datagrams received whose cycles never reached the trace — held re-sent runs decided to be duplicates, both mid-capture and at `stop()`; `packets_received` == datagrams in the trace + this. An upper bound on datagrams of lost time rather than lost content, and not a gate: a genuine retransmission is a correct discard. Same meaning and same caveats as on `CaptureResult`)
 
 ### Constants
 - `DEFAULT_DEBUG_PORT = 11002`

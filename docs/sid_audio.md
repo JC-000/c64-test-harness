@@ -209,8 +209,10 @@ amount. The WAV is well-formed either way, so nothing downstream notices.
 
 ```python
 result = cap.stop(wav_path="run.wav")
-assert result.time_base_intact          # packets_dropped == 0 (forward gaps only)
-assert result.packets_reordered == 0    # a backward sequence step is not a drop but still breaks the sample clock (#205)
+assert result.time_base_intact          # packets_dropped == 0
+# packets_reordered counts late and duplicated packets (#205).  Since #430
+# neither is a drop and neither shifts the sample index: a late packet goes
+# into its own slot, a duplicate is discarded.
 ```
 
 ---

@@ -75,8 +75,11 @@ import socket
 import struct
 import threading
 import time
+import zlib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
+
+from . import _stream_seq
 
 if TYPE_CHECKING:
     from .ultimate64_client import Ultimate64Client
@@ -237,6 +240,36 @@ class DebugCaptureResult:
     packets_received: int
     packets_dropped: int
     total_cycles: int
+    #: Datagrams that arrived behind the highest sequence number seen, one per
+    #: datagram (#430).
+    #:
+    #: - Late arrivals: their drop is un-counted and their cycles appended
+    #:   in arrival order.
+    #: - Duplicates (number already received, identical payload): their
+    #:   cycles are discarded.
+    #: - Resyncs, also in :attr:`sequence_resyncs`: kept and appended.
+    #:
+    #: See ``u64_audio_capture.CaptureResult.packets_reordered`` for what
+    #: counts as a resync, including the over-late overcount.
+    packets_reordered: int = 0
+    #: Backward steps taken as a new stream position: a restarted counter,
+    #: a forward loss of 32,768 or more, or a datagram 1024 or more late.
+    sequence_resyncs: int = 0
+    #: Datagrams received whose cycles were discarded instead of appended:
+    #: a held run of re-sent datagrams decided to be duplicates, either
+    #: mid-capture or at :meth:`DebugCapture.stop`.  ``packets_received``
+    #: equals the datagrams in the trace plus this.
+    #:
+    #: An **upper bound on datagrams of lost time, not lost content**, and
+    #: deliberately not a gate: a genuine retransmission's cycles are
+    #: already in the trace, so discarding them is correct.  What it also
+    #: catches is a silent counter restart, whose datagrams are real stream
+    #: time the trace never receives while every other field reads clean.
+    #: Both discard paths are counted, including datagrams still held at
+    #: ``stop()`` -- which needs no restart and no loss at all.  See
+    #: ``u64_audio_capture.CaptureResult.payloads_discarded`` and the
+    #: residuals in ``backends/_stream_seq.py``.
+    payloads_discarded: int = 0
 
 
 class DebugCapture:
@@ -313,7 +346,11 @@ class DebugCapture:
         self._raw_bytes_total = 0
         self._packets_received = 0
         self._packets_dropped = 0
+        self._packets_reordered = 0
+        self._sequence_resyncs = 0
+        self._payloads_discarded = 0
         self._last_seq: int | None = None
+        self._seq = _stream_seq.SequenceTracker()
         self._started = False
         self._start_time = 0.0
 
@@ -383,7 +420,11 @@ class DebugCapture:
         self._raw_bytes_total = 0
         self._packets_received = 0
         self._packets_dropped = 0
+        self._packets_reordered = 0
+        self._sequence_resyncs = 0
+        self._payloads_discarded = 0
         self._last_seq = None
+        self._seq = _stream_seq.SequenceTracker()
 
         # Create and bind UDP socket
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -434,6 +475,9 @@ class DebugCapture:
 
             seq = struct.unpack_from("<H", data, 0)[0]
             entry_payload = data[HEADER_SIZE:]
+            # Digest of the unfiltered payload: a duplicate is the same
+            # datagram, whatever the filter keeps of it.
+            digest = zlib.crc32(entry_payload)
 
             # Optional per-entry filtering: done outside the lock since it
             # only reads local bytes. Keeps the protected section short.
@@ -448,23 +492,33 @@ class DebugCapture:
 
             with self._lock:
                 # Gap detection (always on raw packet sequence)
-                if self._last_seq is not None:
-                    expected = (self._last_seq + 1) & 0xFFFF
-                    if seq != expected:
-                        gap = (seq - expected) & 0xFFFF
-                        if gap < 0x8000:  # forward gap (not reorder)
-                            self._packets_dropped += gap
-                            _log.warning(
-                                "Debug stream gap: expected seq %d, got %d (%d packets dropped)",
-                                expected, seq, gap,
-                            )
-
-                self._last_seq = seq
                 self._packets_received += 1
+                ev = self._seq.observe(seq, digest, entry_payload)
+                self._packets_dropped = self._seq.dropped
+                self._packets_reordered = self._seq.reordered
+                self._sequence_resyncs = self._seq.resyncs
+                self._payloads_discarded = self._seq.discarded
+                self._last_seq = self._seq.highest
+                if ev.kind == _stream_seq.GAP:
+                    _log.warning(
+                        "Debug stream gap: expected seq %d, got %d (%d packets dropped)",
+                        ev.expected, seq, len(ev.tracked_missing) + ev.untracked,
+                    )
+                elif ev.kind == _stream_seq.HELD:
+                    # Duplicate (its cycles would count twice) or a restart
+                    # over identical bytes: the next datagram decides.
+                    continue
+                elif ev.kind in (_stream_seq.LATE, _stream_seq.RESYNC):
+                    _log.warning(
+                        "Debug stream backward step (%s): expected seq %d, got %d",
+                        ev.kind, ev.expected, seq,
+                    )
 
-                if entry_payload:
-                    self._raw_chunks.append(entry_payload)
-                    self._raw_bytes_total += len(entry_payload)
+                for chunk in (*ev.readmit, entry_payload):
+                    if not chunk:
+                        continue
+                    self._raw_chunks.append(chunk)
+                    self._raw_bytes_total += len(chunk)
 
                     # Rolling-window trim: evict oldest chunks FIFO until
                     # the retained total fits in max_bytes. The tail chunk
@@ -500,9 +554,19 @@ class DebugCapture:
             self._sock = None
 
         with self._lock:
+            held = self._seq.flush_held()  # undecided re-sent datagrams
+            if held:
+                _log.warning(
+                    "Debug capture stopped with %d re-sent datagram(s) "
+                    "undecided; discarded as duplicates", held,
+                )
             raw_data = b"".join(self._raw_chunks)
             packets_received = self._packets_received
             packets_dropped = self._packets_dropped
+            packets_reordered = self._packets_reordered
+            sequence_resyncs = self._sequence_resyncs
+            # After the flush above, so the still-held datagrams are in it.
+            payloads_discarded = self._seq.discarded
 
         # Parse raw bytes into BusCycle objects
         total_words = len(raw_data) // ENTRY_SIZE
@@ -524,6 +588,9 @@ class DebugCapture:
             packets_received=packets_received,
             packets_dropped=packets_dropped,
             total_cycles=len(trace),
+            packets_reordered=packets_reordered,
+            sequence_resyncs=sequence_resyncs,
+            payloads_discarded=payloads_discarded,
         )
 
     @property

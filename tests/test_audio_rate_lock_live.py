@@ -45,8 +45,9 @@ returning the identical count support the lock but add almost nothing
 over n=1; the independent evidence is the different window lengths.
 
 A capture whose sequence numbers ever step backwards or repeat is
-discarded as well (``packets_reordered``): ``time_base_intact`` counts
-forward gaps only, and a duplicated packet would add samples.
+discarded as well (``packets_reordered``).  Since #430 a late packet is
+placed in its own slot and a duplicate discarded, so this is stricter than
+the time base needs; it also rejects a restarted sequence counter.
 
 Measured 2026-09-05 on the U64E (fw 3.15, NTSC, 1 MHz): see the
 docstring on ``U64_NTSC_AUDIO_RATE_HZ`` for the numbers.
