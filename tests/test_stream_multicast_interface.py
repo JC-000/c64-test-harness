@@ -9,10 +9,15 @@ the device, so the join landed on the wrong interface.  These tests pin the
 
 **They do not claim multicast capture works.**  #399's measured table is
 zero packets received in every arm, *including* a raw socket joined on the
-en0 address that routes to the device (n=3 paired, interleaved, U64E
-10.43.23.81, fw bce4535e, 2026-09-15).  The cause of that zero is
-unestablished and stays open.  What is under test here is the socket option
-the capture sends, against a fake socket.  No device, no packets.
+en0 address that routes to the device, against a unicast control of
+278/281/339 (n=3 paired, interleaved, on the U64E at fw bce4535e,
+2026-09-15).  The cause of that zero is unestablished and stays open as
+#461.  The full table, with the device address, is in #399 -- a module
+under ``tests/`` does not carry bench addresses, because an address in a
+usage line is one someone later types (``test_u64_runner_script_gates.py``).
+
+What is under test here is the socket option the capture sends, against a
+fake socket.  No device, no packets.
 """
 from __future__ import annotations
 
@@ -32,6 +37,11 @@ from c64_test_harness.backends.u64_debug_capture import DebugCapture
 from c64_test_harness.backends.u64_video_capture import VideoCapture
 
 _GROUP = "239.0.1.65"
+
+#: Stand-ins from RFC 5737 TEST-NET-1, which routes nowhere.  Nothing here
+#: needs a real device: the socket is a fake and the resolver is patched.
+_DEVICE = "192.0.2.1"
+_IFACE = "192.0.2.200"
 
 #: name -> (factory, module whose ``socket`` is patched)
 CLASSES = {
@@ -79,9 +89,9 @@ def _run(name: str, **kwargs) -> MagicMock:
 
 @pytest.mark.parametrize("name", list(CLASSES))
 def test_explicit_interface_is_the_one_joined(name: str) -> None:
-    sock = _run(name, multicast_group=_GROUP, multicast_interface="10.43.23.127")
+    sock = _run(name, multicast_group=_GROUP, multicast_interface=_IFACE)
     assert _joins(sock) == [
-        socket.inet_aton(_GROUP) + socket.inet_aton("10.43.23.127")
+        socket.inet_aton(_GROUP) + socket.inet_aton(_IFACE)
     ]
 
 
@@ -89,12 +99,12 @@ def test_explicit_interface_is_the_one_joined(name: str) -> None:
 def test_device_host_resolves_to_the_local_address_towards_it(name: str) -> None:
     """Naming the device, not an interface, is the documented default path."""
     with patch.object(
-        _stream_iface, "local_address_towards", return_value="10.43.23.127"
+        _stream_iface, "local_address_towards", return_value=_IFACE
     ) as resolve:
-        sock = _run(name, multicast_group=_GROUP, device_host="10.43.23.81")
-    assert resolve.call_args.args[0] == "10.43.23.81"
+        sock = _run(name, multicast_group=_GROUP, device_host=_DEVICE)
+    assert resolve.call_args.args[0] == _DEVICE
     assert _joins(sock) == [
-        socket.inet_aton(_GROUP) + socket.inet_aton("10.43.23.127")
+        socket.inet_aton(_GROUP) + socket.inet_aton(_IFACE)
     ]
 
 
@@ -108,13 +118,13 @@ def test_default_is_still_inaddr_any(name: str) -> None:
 @pytest.mark.parametrize("name", list(CLASSES))
 def test_an_explicit_interface_wins_over_device_host(name: str) -> None:
     with patch.object(
-        _stream_iface, "local_address_towards", return_value="10.43.23.127"
+        _stream_iface, "local_address_towards", return_value=_IFACE
     ):
         sock = _run(
             name,
             multicast_group=_GROUP,
             multicast_interface="192.168.9.9",
-            device_host="10.43.23.81",
+            device_host=_DEVICE,
         )
     assert _joins(sock) == [
         socket.inet_aton(_GROUP) + socket.inet_aton("192.168.9.9")
@@ -125,8 +135,8 @@ def test_an_explicit_interface_wins_over_device_host(name: str) -> None:
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"multicast_interface": "10.43.23.127"},
-        {"device_host": "10.43.23.81"},
+        {"multicast_interface": _IFACE},
+        {"device_host": _DEVICE},
     ],
     ids=["interface", "device_host"],
 )
@@ -150,10 +160,10 @@ def test_a_failed_resolution_falls_back_to_inaddr_any_and_warns(
         _stream_iface, "local_address_towards", side_effect=OSError("no route")
     ):
         with caplog.at_level(logging.WARNING):
-            sock = _run(name, multicast_group=_GROUP, device_host="10.43.23.81")
+            sock = _run(name, multicast_group=_GROUP, device_host=_DEVICE)
     assert _joins(sock) == [socket.inet_aton(_GROUP) + socket.inet_aton("0.0.0.0")]
     assert any(
-        "10.43.23.81" in r.getMessage() and "#399" in r.getMessage()
+        _DEVICE in r.getMessage() and "#399" in r.getMessage()
         for r in caplog.records
     )
 

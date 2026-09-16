@@ -1122,7 +1122,7 @@ cap = VideoCapture(port=11000)
 # Multicast (not known to deliver on this bench — #399/#461): name the
 # interface, or the kernel picks it (the VPN here).
 #   VideoCapture(port=11000, multicast_group="239.0.1.65",
-#                device_host=client.host)     # or multicast_interface="10.43.23.127"
+#                device_host=client.host)     # or multicast_interface=<this host's address on the device's segment>
 cap.start()
 # ... wait for frames ...
 result = cap.stop()  # -> VideoCaptureResult
