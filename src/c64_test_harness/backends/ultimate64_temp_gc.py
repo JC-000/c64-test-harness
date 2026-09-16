@@ -219,10 +219,17 @@ DEFAULT_FTP_TIMEOUT = 10.0
 DEFAULT_FTP_USER = "anonymous"
 DEFAULT_FTP_PASSWORD = "anonymous@"
 
-#: Socket timeout for the bodyless ``GET /v1/drives`` the sweep uses to
-#: learn which managed names are currently mounted (#418). Deliberately
-#: short: the listing is a safety refinement, and a device too slow to
-#: answer it must not delay the hygiene pass that keeps it off the wedge.
+#: Socket timeout for :func:`_default_mounted_probe`'s bodyless
+#: ``GET /v1/drives`` (#418).
+#:
+#: **This governs the built-in probe only.** The production path is
+#: :meth:`~c64_test_harness.backends.ultimate64_client.Ultimate64Client.gc_temp_folder`,
+#: which passes its own ``list_drives`` and so uses the *client's* timeout
+#: (10 s by default). An earlier revision of this comment claimed the
+#: constant kept a slow device from delaying the hygiene pass; it does not
+#: hold on that path, and the probe is issued inside the open FTP session
+#: between ``nlst()`` and the first ``delete()``, so the control connection
+#: idles for whichever timeout is in force (#418 review, finding 3).
 DEFAULT_DRIVES_PROBE_TIMEOUT = 5.0
 
 __all__ = [
@@ -440,6 +447,11 @@ class TempLedger:
         #: The host string of the most recently attached client, for that
         #: orphaned sweep.
         self.host: str | None = None
+        #: REST port and ``X-Password`` of the most recently attached
+        #: client, so the orphaned sweep can still read the drives listing
+        #: when no client object survives to do it (#418 review, finding 2).
+        self.probe_port: int | None = None
+        self.probe_password: str | None = None
         #: Attachments reserved (counted) whose request has not returned yet.
         #: A sweep cannot collect what is still being sent, so :meth:`collected`
         #: carries these into the new generation instead of zeroing them.
@@ -454,10 +466,33 @@ class TempLedger:
         with self.lock:
             self._clients.add(client)
             self.host = getattr(client, "host", None) or self.host
+            self.probe_port = getattr(client, "port", None) or self.probe_port
+            self.probe_password = getattr(client, "password", None) or self.probe_password
 
     def clients(self) -> list:
         with self.lock:
             return list(self._clients)
+
+    def mounted_probe(self) -> "Callable[[], Any] | None":
+        """A drives-listing probe for the clientless sweep (#418, finding 2).
+
+        Prefers a live client's ``list_drives``, which carries that
+        client's port, password and timeout. Falls back to
+        :func:`_default_mounted_probe` rebuilt from the port and password
+        the last attached client registered -- the orphaned-sweep case,
+        where every client has been garbage-collected. ``None`` when no
+        host is known, which leaves :func:`gc_temp_folder` on its own
+        default.
+        """
+        with self.lock:
+            for client in self.clients():
+                probe = getattr(client, "list_drives", None)
+                if callable(probe):
+                    return probe
+            host, port, password = self.host, self.probe_port, self.probe_password
+        if not host:
+            return None
+        return lambda: _default_mounted_probe(host, port=port, password=password)
 
     def collected(self) -> None:
         """A sweep succeeded: only still-in-flight reservations stay pending.
@@ -544,7 +579,7 @@ class TempLedger:
             if not (self.pending > 0 and self.armed_pending and self.host):
                 return False
             try:
-                result = gc_temp_folder(self.host)
+                result = gc_temp_folder(self.host, mounted_probe=self.mounted_probe())
             except Exception as exc:  # noqa: BLE001 - a release must never fail
                 result = TempGCResult(host=self.host, error=f"{type(exc).__name__}: {exc}")
             if result.ok:
@@ -646,16 +681,35 @@ def _managed_names_in(payload: Any) -> set[str]:
     return found
 
 
-def _default_mounted_probe(host: str, timeout: float = DEFAULT_DRIVES_PROBE_TIMEOUT) -> Any:
+def _default_mounted_probe(
+    host: str,
+    timeout: float = DEFAULT_DRIVES_PROBE_TIMEOUT,
+    port: int | None = None,
+    password: str | None = None,
+) -> Any:
     """Read ``GET /v1/drives`` without a client. Bodyless: no ``/Temp`` cost.
 
     :func:`gc_temp_folder` takes a host, not a client, so it needs a way
     to ask what is mounted on its own. Callers that *have* a client
-    should pass its :meth:`~c64_test_harness.backends.ultimate64_client.Ultimate64Client.list_drives`
-    as ``mounted_probe`` instead -- this default sends no ``X-Password``
-    and so reads nothing on a password-protected device.
+    should pass its
+    :meth:`~c64_test_harness.backends.ultimate64_client.Ultimate64Client.list_drives`
+    as ``mounted_probe`` instead.
+
+    *port* and *password* exist because the one caller that cannot supply
+    a client -- :meth:`TempLedger.drain_on_lock_release`'s orphaned sweep
+    -- is also the one that deletes files this process did not create, so
+    it is exactly where the exclusion matters most (#418 review, finding
+    2). Firmware 1.1.0 answers an unauthenticated call with
+    ``HTTP_FORBIDDEN`` when a Network Password is set (``routes.h``
+    collects ``X-Password``; ``routes.cc`` maps the mismatch), and a
+    device on a non-default REST port is not at ``http://host/`` at all --
+    either way the probe would raise and the sweep would proceed
+    unprotected.
     """
-    req = urllib.request.Request(f"http://{host}/v1/drives", method="GET")
+    base = f"http://{host}:{port}" if port and port != 80 else f"http://{host}"
+    req = urllib.request.Request(f"{base}/v1/drives", method="GET")
+    if password:
+        req.add_header("X-Password", password)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         raw = resp.read()
     return json.loads(raw.decode("utf-8")) if raw else {}
