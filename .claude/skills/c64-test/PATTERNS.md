@@ -1481,6 +1481,8 @@ config = ViceConfig(prg_path="build/prog.prg", warp=True, sound=False)
 config = ViceConfig(prg_path="build/prog.prg", console=False, minimize=False)
 ```
 
+That `-console` actually suppresses the window — rather than merely appearing in argv — is measured by `tests/test_vice_headless.py`, which launches and asks LaunchServices. If you touch that probe, judge **only** the name field, the first line of `lsappinfo info -only name <pid>`: an unbundled binary like `x64sc` reports `bundleID`, `bundle path` and `executable path` as `[ NULL ]` even while its window is up, so testing the whole output for `[ NULL ]` returns 0 for every process — Finder and Dock included — and quietly turns the two `-console` assertions into vacuous passes (measured 2026-09-16, macOS Darwin 27).
+
 ### 9. Multi-Agent VICE Process Safety
 When multiple agents run VICE in parallel, never `pkill x64sc` — it kills other agents' instances. Use the PID from `ViceInstance` to manage only your own processes:
 ```python
