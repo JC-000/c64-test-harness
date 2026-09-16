@@ -326,9 +326,11 @@ def test_cartridge_write_does_not_move_reu_size(
     nothing about REU coupling by itself. It is a same-value no-op ONLY on
     a bench with no ``.crt`` selected (``current == ""``, the state this
     was characterised in). On a bench with a ``.crt`` selected the PUT
-    **detaches that cartridge** — a real mutation, restored in the
-    ``finally``. Other chooser values are deliberately never written: they
-    attach a cartridge image.
+    **detaches that cartridge** — a real mutation, and the ``finally``
+    deliberately leaves it detached: it writes the item's own ``default``
+    (``""``), which is the baseline under #334, rather than re-attaching
+    whatever was selected at entry (#447). Other chooser values are
+    deliberately never written: they attach a cartridge image.
     """
     cart = _item(client, _ITEM_CARTRIDGE)
     presets = cart.get("presets", cart.get("values"))
@@ -371,10 +373,23 @@ def test_cartridge_write_does_not_move_reu_size(
             f"{before[_ITEM_REU_ENABLED]!r} -> {after[_ITEM_REU_ENABLED]!r}"
         )
     finally:
-        if current is not None and current != "":
-            client.set_config_item(CAT_CART, _ITEM_CARTRIDGE, current)
+        # #447: the device's own default, never the value read at entry.
+        # The #334 baseline is ``current == default`` per item, so a .crt
+        # selected at entry is drift; re-selecting it here would put that
+        # drift straight back. The PUT above already writes the default
+        # (asserted ``""`` above), so on a clean bench this is a no-op.
+        client.set_config_item(CAT_CART, _ITEM_CARTRIDGE, cart.get("default"))
     final = _category(client)
-    assert _diff(stock, final) == {}, f"category not back to stock: {_diff(stock, final)!r}"
+    assert final.get(_ITEM_CARTRIDGE) == cart.get("default"), (
+        f"Cartridge not restored to its default: "
+        f"{final.get(_ITEM_CARTRIDGE)!r} != {cart.get('default')!r}"
+    )
+    rest = _diff(stock, final)
+    # Cartridge is checked against its default just above rather than
+    # against ``stock``: where the two differ the bench was drifted at
+    # entry and the default is the baseline (#447).
+    rest.pop(_ITEM_CARTRIDGE, None)
+    assert rest == {}, f"category not back to stock: {rest!r}"
 
 
 # --------------------------------------------------------------------------- #

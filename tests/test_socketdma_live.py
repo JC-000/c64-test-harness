@@ -68,7 +68,13 @@ from c64_test_harness.backends.ultimate64_helpers import (
     set_reu,
     snapshot_state,
 )
-from live_fixture_teardown import raise_teardown_failures, teardown_then_release
+from live_fixture_teardown import (
+    attempt_steps,
+    raise_teardown_failures,
+    read_restore_defaults,
+    restore_default_steps,
+    teardown_then_release,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -122,13 +128,6 @@ def client() -> Ultimate64Client:
         steps = [] if client is None else [("client.close()", client.close)]
         failures = teardown_then_release(steps, lock.release)
     raise_teardown_failures("client teardown", failures)
-
-
-def _category_items(client: Ultimate64Client, category: str) -> dict:
-    """Return the unwrapped item dict for a config *category*."""
-    resp = client.get_config_category(category)
-    inner = resp.get(category)
-    return inner if isinstance(inner, dict) else {}
 
 
 # --------------------------------------------------------------------------- #
@@ -231,12 +230,20 @@ def test_set_reu_c64u_contract(
     info = client.get_info()
     record_property("product", str(info.get("product", "")))
 
-    items = _category_items(client, _CAT_CART)
-    orig_enabled = items.get("RAM Expansion Unit")
-    orig_size = items.get("REU Size")
-    record_property("orig_reu_enabled", str(orig_enabled))
-    record_property("orig_reu_size", str(orig_size))
+    # #447: restore to the ``default`` the device reports, not the value
+    # read at entry -- the #334 baseline is ``current == default`` per
+    # item, and an entry value can be a SIGKILLed predecessor's residue.
+    # Read before any write; refuses to start if an item reports no
+    # default, and one bodyless PUT per item on the way out (never
+    # ``set_config_items``, which stops at the first rejection and leaves
+    # the rest holding this test's values).
+    plan = read_restore_defaults(
+        client, {_CAT_CART: ["RAM Expansion Unit", "REU Size"]}
+    )
+    for _cat, item, default in plan:
+        record_property(f"default {item}", str(default))
 
+    failures: list = []
     try:
         set_reu(client, True, size="512 KB")
         enabled, size = get_reu_config(client)
@@ -245,13 +252,8 @@ def test_set_reu_c64u_contract(
             f"{(enabled, size)!r}"
         )
     finally:
-        restore: dict = {}
-        if isinstance(orig_enabled, str):
-            restore["RAM Expansion Unit"] = orig_enabled
-        if isinstance(orig_size, str):
-            restore["REU Size"] = orig_size
-        if restore:
-            client.set_config_items(_CAT_CART, restore)
+        failures = attempt_steps(restore_default_steps(client, plan))
+    raise_teardown_failures("REU contract teardown", failures)
 
 
 # --------------------------------------------------------------------------- #
@@ -281,11 +283,14 @@ def test_reuwrite_byte_fidelity(client: Ultimate64Client) -> None:
     size = 96 * 1024
     pattern = bytes(((i * 7) ^ (i >> 8) ^ (i >> 16)) & 0xFF for i in range(size))
 
-    items = _category_items(client, _CAT_CART)
-    orig_enabled = items.get("RAM Expansion Unit")
-    orig_size = items.get("REU Size")
+    # #447: the ``default`` the device reports, not the values read at
+    # entry -- see ``test_set_reu_c64u_contract`` for the reasoning.
+    plan = read_restore_defaults(
+        client, {_CAT_CART: ["RAM Expansion Unit", "REU Size"]}
+    )
 
     transport = Ultimate64Transport(host=_HOST or "", password=_PW, timeout=30.0)
+    failures: list = []
     try:
         set_reu(client, True, size="128 KB")
         try:
@@ -314,14 +319,14 @@ def test_reuwrite_byte_fidelity(client: Ultimate64Client) -> None:
                 f"(wrote {pattern[first]:#04x}, read {readback[first]:#04x})"
             )
     finally:
-        transport.close()
-        restore: dict = {}
-        if isinstance(orig_enabled, str):
-            restore["RAM Expansion Unit"] = orig_enabled
-        if isinstance(orig_size, str):
-            restore["REU Size"] = orig_size
-        if restore:
-            client.set_config_items(_CAT_CART, restore)
+        # Every step attempted, each on its own: a raising ``close()``
+        # used to skip the config restore entirely and leave a 128 KB REU
+        # enabled on a shared device.
+        failures = attempt_steps([
+            ("transport.close()", transport.close),
+            *restore_default_steps(client, plan),
+        ])
+    raise_teardown_failures("REUWRITE teardown", failures)
 
 
 @requires_mutate

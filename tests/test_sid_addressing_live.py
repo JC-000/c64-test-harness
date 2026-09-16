@@ -53,6 +53,12 @@ from c64_test_harness.backends.ultimate64_schema import (
     sid_address_conflicts,
     sid_address_occupancy,
 )
+from live_fixture_teardown import (
+    attempt_steps,
+    raise_teardown_failures,
+    read_restore_defaults,
+    restore_default_steps,
+)
 
 _HOST = os.environ.get("U64_HOST")
 _ALLOW_MUTATE = os.environ.get("U64_ALLOW_MUTATE")
@@ -93,15 +99,30 @@ def locked(client: Ultimate64Client) -> Ultimate64Client:
 
 @pytest.fixture()
 def restore_addressing(locked: Ultimate64Client) -> Ultimate64Client:
-    """Snapshot the four slot addresses and put them back afterwards."""
-    before = get_sid_address_map(locked)
+    """Put the four slot addresses back to the ``default`` the device reports.
+
+    Not the map read at entry (#447).  The bench baseline is ``current ==
+    default`` per item (#334), and an entry value can be a SIGKILLed
+    predecessor's residue -- restoring that would re-install the drift
+    rather than clear it, which is exactly how a drifted ``SID Socket 2
+    Address`` once survived four independent read paths.
+
+    ``read_restore_defaults`` reads every default *before* any write and
+    refuses to start when an item reports none (exit could not put it
+    back); an item already off its default at entry is logged at WARNING
+    naming what exit will write.  Each item goes back with its own
+    bodyless ``set_config_item`` PUT, so one rejected item cannot leave
+    the rest holding this test's values.
+    """
+    plan = read_restore_defaults(
+        locked, {CAT_SID_ADDRESSING: list(SID_SLOT_ADDRESS_ITEMS.values())}
+    )
+    failures: list = []
     try:
         yield locked
     finally:
-        if before:
-            set_sid_address_map(
-                locked, before, allow_conflicts="restoring pre-test map"
-            )
+        failures = attempt_steps(restore_default_steps(locked, plan))
+    raise_teardown_failures("restore_addressing teardown", failures)
 
 
 # --------------------------------------------------------------------------- #
@@ -407,8 +428,18 @@ def test_detected_type_item_is_writable_over_rest(
     this test starts failing, the firmware gained an enabled-flag check
     and the warning on that helper can be relaxed.
 
-    Restores the original value; note a reboot would restore it anyway,
-    since the boot-time probe rewrites it.
+    **Named exemption from the #447 restore-to-default rule.**  Everywhere
+    else a live restore writes the ``default`` the device reports, because
+    the bench baseline is ``current == default`` (#334).  ``SID Detected
+    Socket 1`` is the exception: it is not a selector but a *measurement*,
+    filled in by the boot-time probe from the chip physically in the
+    socket (``get_detected_sid_types`` documents this, which is why that
+    helper is advisory).  Its ``default`` is the config schema's default,
+    not what the probe found, so writing the default here would replace a
+    correct reading of this bench's hardware with a wrong one -- the
+    opposite of restoring the baseline.  The value read at entry *is* the
+    baseline for this item, so it is what goes back.  A reboot would
+    restore it anyway, since the probe reruns.
     """
     before = get_detected_sid_types(locked)[1]
     other = "6581" if before != "6581" else "8580"
