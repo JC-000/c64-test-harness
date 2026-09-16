@@ -226,17 +226,20 @@ bytes at its own position, so sample index stays a clock across loss.
     becomes routine and this note stops being enough.
   - **a tail of duplicate-looking datagrams still held at `stop()`**, which
     `flush_held` discards (106 in, 100 packets in the WAV, 6 discarded). No
-    loss and no restart is needed, so this path does **not** depend on #452;
-    it is bounded by `MAX_HELD_DUPLICATES` (8 packets, 32 ms).
+    lost packet and no restart is needed, so this path does not depend on
+    #452 — it is the one that justifies counting discards at all — and it is
+    bounded by `MAX_HELD_DUPLICATES` (8 packets, 32 ms).
 
   The harm is **duration, not content**: the discarded bytes are identical to
   PCM already in the file, but the stream time they carried is gone, so the
-  count is an *upper bound on packets of lost time*. `packets_reordered` is
-  the **only trace** on the result (it counts every datagram behind the
-  highest number, held ones included), so reorders without drops do not mean
-  the capture is complete. A discard is not in itself a fault — a genuine
-  retransmission is discarded correctly (101 in, 100 in the WAV, 1 discarded)
-  — so `tests/audio_link_loss.py` bounds lost time rather than requiring zero.
+  count is an *upper bound on packets of lost time*. `payloads_discarded`
+  (#443) counts these datagrams directly; on a result built before that field
+  existed, `packets_reordered` is the **only trace** (it counts every datagram
+  behind the highest number, held ones included), so reorders without drops do
+  not mean the capture is complete. A discard is not in itself a fault — a
+  genuine retransmission is discarded correctly (101 in, 100 in the WAV, 1
+  discarded) — so `tests/audio_link_loss.py` bounds lost time rather than
+  requiring zero.
 - **Older captures:** before #410 gaps were not padded (the capture was the
   concatenation of what arrived) and `time_base_intact` was
   `packets_dropped == 0`. #430 on its own left zero-length placeholders,

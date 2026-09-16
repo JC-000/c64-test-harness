@@ -63,36 +63,38 @@ contract, for anyone reading samples:
   counter hides an unknown number of packets), and no datagram whose PCM
   was not 768 bytes if anything was filled.  It no longer means "nothing
   was lost"; ``packets_dropped == 0`` still does.
-* **Discarded payloads are lost stream time, and no field above shows it
+* **Discarded payloads are lost stream time, and no fill field shows it
   (#443).**  Two paths reach it, and both leave ``packets_dropped``,
   ``packets_filled`` and ``fill_fraction`` at 0, ``filled_frame_ranges``
   at ``()``, ``sequence_resyncs`` at 0 and ``time_base_intact`` True:
 
   - **a counter that restarts over a number that was itself lost** reads
     as a run of duplicates, so their PCM is discarded.  Measured on a
-    loopback stream: 52 datagrams received, 41 packets in the WAV, 11
-    datagrams' PCM never delivered.  This path depends on **#452**: it is
-    constructed today only because nobody has established whether
-    starting a stream resets the FPGA's sequence counter.  If it does, a
-    restart over a lost number is routine rather than contrived, and this
-    clause stops being enough on its own.
-  - **a tail of duplicate-looking datagrams still held when the capture
-    stops**, which :meth:`_stream_seq.SequenceTracker.flush_held`
-    discards.  Measured: 106 received, 100 packets in the WAV, 6
-    discarded.  No loss and no restart is needed, so this path does not
-    depend on #452 at all; it is bounded by
-    ``_stream_seq.MAX_HELD_DUPLICATES`` (8 packets, 32 ms of audio).
+    loopback stream: 52 datagrams in, 41 packets in the WAV, 11 never
+    delivered.  This path depends on **#452**: it is constructed today
+    only because nobody has established whether starting a stream resets
+    the FPGA's sequence counter.  If it does, a restart over a lost
+    number is routine rather than contrived, and this clause stops being
+    enough on its own.
+  - **a tail of duplicate-looking datagrams still held at** ``stop()``,
+    which :meth:`_stream_seq.SequenceTracker.flush_held` discards.
+    Measured: 106 in, 100 packets in the WAV, 6 discarded.  No lost
+    packet and no restart is needed, so this path does not depend on #452
+    -- it is the one that justifies counting discards at all -- and it is
+    bounded by ``_stream_seq.MAX_HELD_DUPLICATES`` (8 packets, 32 ms of
+    audio).
 
   **The harm is duration, not content.**  The discarded bytes are
   byte-identical to PCM already in the file; what is gone is the stream
   time they carried, so the count is an *upper bound on packets of lost
-  time*.  **``packets_reordered`` is the only trace in this dataclass** --
-  it counts every datagram that arrived behind the highest number, held
-  ones included -- so a capture with reorders but no drops is not
-  self-evidently complete.  A discard is not in itself a fault: a genuine
-  retransmission is discarded correctly (101 received, 100 in the WAV, 1
-  discarded), which is why ``tests/audio_link_loss.py`` bounds lost time
-  rather than requiring zero.
+  time*.  ``payloads_discarded`` (#443) counts these datagrams directly;
+  on a result built before that field existed, ``packets_reordered`` is
+  the only trace -- it counts every datagram that arrived behind the
+  highest number, held ones included -- so reorders without drops do not
+  mean the capture is complete.  A discard is not in itself a fault: a
+  genuine retransmission is discarded correctly (101 in, 100 in the WAV,
+  1 discarded), which is why ``tests/audio_link_loss.py`` bounds lost
+  time rather than requiring zero.
 
 **Older behaviour, for readers of older captures.**  Before #410 gaps were
 not padded: the capture was the concatenation of the payloads that arrived,

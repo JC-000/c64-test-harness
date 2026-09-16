@@ -263,15 +263,96 @@ def test_capture_usable_applies_both_conditions() -> None:
     assert capture_usable(_r(0, 0, 100 * 192, resyncs=1)) is False
 
 
-def test_the_contract_says_a_held_discard_is_invisible_in_every_fill_field() -> None:
-    """The reorder count is the only trace, and it depends on #452 (#449 review)."""
-    doc = uac.__doc__ or ""
+#: Every claim the discard clause has to carry, by phrase *and* by figure,
+#: in both texts that state it.  Token presence is not a pin: #443, #452,
+#: ``packets_reordered`` and "only trace" all live in the restart bullet and
+#: the harm paragraph, so asserting those four let the entire held-at-stop
+#: bullet be deleted, either figure set be falsified, and the central claim
+#: be inverted -- six mutants, none caught (#449 review round 2, E1-E6).
+#: The two texts are worded to share these substrings exactly so one table
+#: pins both.
+_DISCARD_CLAUSE_REQUIRED = (
+    # The claim itself.  "fill field" and not "field": once #443 lands
+    # payloads_discarded the clause must still be true, and that field is
+    # not a fill field.
+    "no fill field shows it",
+    "#443",
+    # Path 1: restart over a number that was itself lost, and its figures.
+    "a counter that restarts over a number that was itself lost",
+    "52 datagrams in, 41 packets in the WAV, 11 never delivered",
+    "#452",
+    # Path 2: the tail held at stop().  No #452 dependency -- this is the
+    # path that justifies the counter, and the one that can vanish quietly.
+    "tail of duplicate-looking datagrams still held",
+    "106 in, 100 packets in the WAV, 6 discarded",
+    "flush_held",
+    "does not depend on #452",
+    "MAX_HELD_DUPLICATES",
+    # What the harm is, and what is left to see it by.
+    "duration, not content",
+    "upper bound on packets of lost time",
+    "payloads_discarded",
+    "packets_reordered",
+    "only trace",
+    # Why the live gate bounds lost time instead of requiring zero.
+    "101 in, 100 in the WAV, 1 discarded",
+)
+
+#: Phrasings that would invert the claim while leaving every token above in
+#: place (E6).
+_DISCARD_CLAUSE_REFUSED = (
+    "fill fields show it",
+    "the fill fields show",
+)
+
+
+def _clause_texts() -> dict:
+    """Both texts with runs of whitespace collapsed to one space.
+
+    Re-wrapping a paragraph is not a change to what it claims, and these
+    phrases are longer than a line in the markdown.  Matching the collapsed
+    text keeps the pin sensitive to what matters -- a bullet deleted, a
+    figure falsified, the claim inverted -- without failing on a reflow.
+    """
     md = (Path(__file__).resolve().parent.parent / "docs" / "sid_audio.md").read_text()
-    for where, text in (("module docstring", doc), ("docs/sid_audio.md", md)):
-        assert "#443" in text, where
-        assert "#452" in text, where
-        assert "packets_reordered" in text, where
-        assert "only trace" in text, where
+    return {
+        where: " ".join(text.split())
+        for where, text in (
+            ("module docstring", uac.__doc__ or ""),
+            ("docs/sid_audio.md", md),
+        )
+    }
+
+
+@pytest.mark.parametrize("phrase", _DISCARD_CLAUSE_REQUIRED)
+def test_both_discard_clause_texts_carry_every_claim(phrase: str) -> None:
+    """Each path pinned by phrase and by figure, in both texts (#449 round 2)."""
+    for where, text in _clause_texts().items():
+        assert phrase in text, f"{where} no longer says {phrase!r}"
+
+
+@pytest.mark.parametrize("phrase", _DISCARD_CLAUSE_REFUSED)
+def test_neither_discard_clause_text_inverts_the_claim(phrase: str) -> None:
+    """The fill fields do *not* show a discard; saying they do is the E6 mutant."""
+    for where, text in _clause_texts().items():
+        assert phrase not in text, f"{where} inverts the claim with {phrase!r}"
+
+
+def test_the_only_trace_sentence_survives_the_443_merge() -> None:
+    """#443's head adds ``payloads_discarded``, so it becomes *the* trace.
+
+    The clause names the counter and scopes the reorder-count claim to a
+    result built before it, which is true on both sides of that merge.
+    """
+    for where, text in _clause_texts().items():
+        i = text.index("only trace")
+        before = text[:i]
+        assert "payloads_discarded" in before, (
+            f"{where} claims an only trace without naming payloads_discarded first"
+        )
+        assert "before that field existed" in before, (
+            f"{where} does not scope the only-trace claim to a pre-#443 result"
+        )
 
 
 def _discarding(discarded: int, *, packets_in_wav: int, **kw) -> CaptureResult:
