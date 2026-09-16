@@ -26,25 +26,30 @@ from c64_test_harness.backends.u64_audio_capture import (
 )
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
 from c64_test_harness.backends.ultimate64_helpers import (
+    CAT_SID_ADDRESSING,
     CAT_SID_SOCKETS,
     configure_multi_sid,
     get_audio_mixer_config,
     get_physical_sid_sockets,
-    get_sid_address_map,
     get_sid_addresses,
-    get_sid_socket_enabled,
     get_sid_socket_types,
-    set_sid_address_map,
     set_sid_socket,
 )
 from c64_test_harness.backends.ultimate64_schema import (
     SID_DETECTED_TYPE_VALUES,
+    SID_SLOT_ADDRESS_ITEMS,
     SID_SOCKET_ENABLE_VALUES,
     SIDSocketConfig,
     SidSlot,
 )
 from c64_test_harness.sid import SidFile, build_test_psid
-from live_fixture_teardown import raise_teardown_failures, teardown_then_release
+from live_fixture_teardown import (
+    attempt_steps,
+    raise_teardown_failures,
+    read_restore_defaults,
+    restore_default_steps,
+    teardown_then_release,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -92,83 +97,100 @@ def u64_client():
     raise_teardown_failures('audio u64_client teardown', failures)
 
 
+#: The socket-enable items of ``SID Sockets Configuration``.  Restored to
+#: their ENTRY value, never their default -- see ``restore_sid_config``.
+SOCKET_ENABLE_ITEMS = ("SID Socket 1", "SID Socket 2")
+
+
+def _entry_value_plan(client, category: str, items) -> list:
+    """``(category, item, entry value)`` for a store whose default is unsafe.
+
+    The mirror of ``read_restore_defaults`` for a measurement store: it
+    reads ``current`` instead of ``default`` and refuses to start when an
+    item reports none, so exit can still put the item back.  Used only for
+    :data:`BASELINE_NEVER_TOUCH` categories, where the reported default is
+    a reset product rather than this bench's baseline.
+    """
+    plan: list = []
+    for item in items:
+        entry = client.get_config_item(category, item)
+        current = entry.get("current") if isinstance(entry, dict) else None
+        if current is None or current == "":
+            raise RuntimeError(
+                f"{category} / {item} reports no current value ({entry!r}); "
+                "refusing to start, because exit could not restore it"
+            )
+        plan.append((category, item, current))
+    return plan
+
+
 @pytest.fixture(autouse=True)
 def restore_sid_config(u64_client: Ultimate64Client):
-    """Put back any SID socket or addressing state a test moved.
-
-    Modelled on ``test_sid_addressing_live.py::restore_addressing``, with
-    two differences.
+    """Put SID addressing and socket enables back to the device defaults.
 
     It is **autouse**. Two tests here mutate SID configuration and
     neither restored it; requiring each author to remember an opt-in
-    fixture is exactly what failed. The cost of covering the read-only
-    tests too is two GETs each, because the restore is a diff -- nothing
-    is written when nothing moved.
+    fixture is exactly what failed.
 
-    And it restores with ``allow_conflicts``, which is not laziness: the
-    device's stock allocation is all four slots on ``$D400``, so putting
-    a slot *back* onto that pile grows an occupant set and the delta
-    guard would correctly refuse it. Restoring a known-good snapshot is
-    precisely the case the override exists for.
+    **What it writes is the ``default`` the device reports for each item,
+    not the value read at entry (#447).** The bench baseline is ``current
+    == default`` per item (#334), so an entry snapshot is the baseline
+    only while nothing has drifted -- and a drifted value is precisely
+    what a SIGKILLed predecessor leaves behind. This module learned that
+    the hard way: a drifted ``SID Socket 2 Address`` was once captured as
+    a baseline by a later run and "restored" to the drifted value,
+    reporting success, and four independent read paths had to agree
+    before anyone noticed. Writing the device's own default clears such
+    drift instead of re-installing it.
 
-    Why this matters beyond tidiness: leaked state poisons every later
-    measurement on the bench, including the ones checking whether
-    anything leaked. A drifted ``SID Socket 2 Address`` was once
-    captured as a baseline by a later run and "restored" to the drifted
-    value, reporting success. Four independent read paths had to agree
-    before it was noticed.
+    ``read_restore_defaults`` reads every default before the test runs
+    and refuses to start when an item reports none -- a fixture error,
+    deliberately, in place of the old "test will run unprotected" path:
+    a device that cannot be restored should stop the run, not quietly
+    poison every later measurement on the bench.  An item already off
+    its default at entry is logged at WARNING naming what exit will
+    write.
+
+    Each item goes back through its own bodyless ``set_config_item`` PUT
+    (never ``set_config_items``, which stops at the first rejection and
+    leaves the rest holding this test's values), and every step is
+    attempted even when an earlier one raises.  The addressing writes are
+    unconditional rather than diffed against a snapshot -- correcting
+    drift this test did not cause is the point, and a config PUT is
+    bodyless, so it costs no ``/Temp`` attachment.
+
+    **The socket enables are a named exemption: they go back to the value
+    read at entry, never to their default.**  ``SID Sockets
+    Configuration`` is in :data:`BASELINE_NEVER_TOUCH`
+    (``ultimate64_baseline.py``) and the reason is measured, not
+    inferred: ``ConfigStore::reset`` sets ``SID Socket 1/2 = Disabled``
+    and ``U64SidSockets::effectuate_settings`` (``u64_config.cc:744-800``)
+    then writes regulator bits 0 to the PLD SIDCTRL / I2C, so **writing
+    that default cuts power to the socketed SIDs** while the config read
+    still looks clean (U64E, two 8580s, 2026-09-05, n=3).  Detection
+    never re-runs over REST -- only at boot or from the on-device menu.
+    So the whole store holds *detection results*, not reset products:
+    this bench reads ``Enabled``/``8580``/``22 nF`` against defaults
+    ``Disabled``/``None``/``470 pF`` (recorded in
+    ``tests/test_entry_baseline.py``).  That is the same argument that
+    exempts ``SID Detected Socket 1`` in
+    ``test_sid_addressing_live.py``, and it applies to every item of
+    this store, siblings included -- the #334 "restore the default" rule
+    is for *selector* items, and these are measurements.  The entry
+    value is the baseline here, so it is what goes back.
     """
-    try:
-        before_addresses = get_sid_address_map(u64_client)
-        before_sockets = get_sid_socket_enabled(u64_client)
-    except Exception:  # noqa: BLE001 -- a probe failure must not eat the test
-        logger.exception("SID snapshot failed; test will run unprotected")
-        yield
-        return
-
+    plan = read_restore_defaults(
+        u64_client, {CAT_SID_ADDRESSING: list(SID_SLOT_ADDRESS_ITEMS.values())}
+    )
+    socket_plan = _entry_value_plan(u64_client, CAT_SID_SOCKETS, SOCKET_ENABLE_ITEMS)
+    failures: list = []
     try:
         yield
     finally:
-        # Restore even if the test raised part-way through its own
-        # writes -- that is the case most likely to leave drift.
-        try:
-            after_addresses = get_sid_address_map(u64_client)
-            moved = {
-                slot: addr
-                for slot, addr in before_addresses.items()
-                if after_addresses.get(slot) != addr
-            }
-            if moved:
-                logger.warning(
-                    "restoring SID addresses moved by this test: %s",
-                    {s.value: a for s, a in moved.items()},
-                )
-                set_sid_address_map(
-                    u64_client,
-                    moved,
-                    allow_conflicts="restoring the pre-test snapshot",
-                )
-
-            after_sockets = get_sid_socket_enabled(u64_client)
-            for socket, enabled in before_sockets.items():
-                if after_sockets.get(socket) != enabled:
-                    logger.warning(
-                        "restoring SID socket %d enable state to %s",
-                        socket,
-                        enabled,
-                    )
-                    u64_client.set_config_items(
-                        CAT_SID_SOCKETS,
-                        {
-                            f"SID Socket {socket}":
-                                "Enabled" if enabled else "Disabled"
-                        },
-                    )
-        except Exception:
-            # Loud on purpose: a failed restore leaves the bench dirty
-            # for every later run, which is worse than a failed test.
-            logger.exception("SID CONFIG RESTORE FAILED -- device left drifted")
-            raise
+        failures = attempt_steps(
+            restore_default_steps(u64_client, [*plan, *socket_plan])
+        )
+    raise_teardown_failures("SID config restore", failures)
 
 
 # ======================================================================
