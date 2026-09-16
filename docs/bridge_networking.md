@@ -1062,9 +1062,26 @@ Result bytes the TX builders can now store:
   frame (so not a busy-after-large-frame effect), and nothing
   length-specific is shown at n=8. Cartridge
   Preference was set `External` inside the lock and read back `Auto`
-  afterwards. Odd lengths stay refused; pad the frame by one byte
-  (the IP total-length field governs the datagram). Odd-length support is
-  [#438](https://github.com/JC-000/c64-test-harness/issues/438).
+  afterwards. Odd lengths stay refused by default; pad the frame by one byte
+  (the IP total-length field governs the datagram) — that is the measured
+  route.
+- **An odd length can be copied ip65's way, behind an opt-in**
+  ([#438](https://github.com/JC-000/c64-test-harness/issues/438)).
+  `build_tx_code(..., allow_odd_frame_len=True)` writes TxLength = the true
+  odd length and rounds the copy count up to a whole word, so one pad byte
+  read from `frame_buf + frame_len` fills the last word — what ip65's `send`
+  does via `adjustcnt` (`drivers/cs8900a.s:449`, `:523-531`; source-read).
+  The emitted loop then always compares `Y` against an even count, which is
+  the #238 hang removed at its mechanism, and that much is checkable without
+  a chip: `tests/test_cs8900a_tx_bound.py` runs nine odd lengths on the
+  simulated chip and pins TxLength, every copied byte, the single pad byte,
+  and `ceil(n/2)` words exactly. **What is not established is the chip's
+  side**: no CS8900a has transmitted an odd TxLength with a padded final
+  word, so the paired silicon check #438 asks for (en4 `Ipkts`/`Ibytes`
+  deltas, as in #404's window) is still owed, and the caller-facing default
+  stays the refusal until it is run. Evidence grade: source-read (ip65) plus
+  simulated-chip pins; unmeasured on silicon. For an even length the flag
+  changes nothing — the emitted bytes are identical, pinned per length.
 - **The chip can be reset: `build_cs8900a_reset_code`**
   ([#234](https://github.com/JC-000/c64-test-harness/issues/234)).
   Measured: `Rdy4TxNOW` dead across 65,536 polls while every register the
