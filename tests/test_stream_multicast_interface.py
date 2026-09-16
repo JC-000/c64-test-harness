@@ -158,14 +158,14 @@ def test_a_failed_resolution_falls_back_to_inaddr_any_and_warns(
     )
 
 
-def test_a_malformed_interface_address_is_refused_at_construction() -> None:
+@pytest.mark.parametrize("name", list(CLASSES))
+def test_a_malformed_interface_address_is_refused_at_construction(
+    name: str,
+) -> None:
     """``inet_aton`` at start() would raise inside the capture instead."""
+    factory, _ = CLASSES[name]
     with pytest.raises(ValueError, match="multicast_interface"):
-        AudioCapture(
-            port=EPHEMERAL_AUDIO_PORT,
-            multicast_group=_GROUP,
-            multicast_interface="not-an-address",
-        )
+        factory(multicast_group=_GROUP, multicast_interface="not-an-address")
 
 
 def test_local_address_towards_loopback() -> None:

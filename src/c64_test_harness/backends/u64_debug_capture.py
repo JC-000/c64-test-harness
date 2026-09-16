@@ -351,8 +351,10 @@ class DebugCapture:
                 bench. Ignored without ``multicast_group``: naming one
                 without the other raises ``ValueError``.
             device_host: Resolve ``multicast_interface`` as the local
-                address that reaches this host (a UDP connect, no traffic).
-                An explicit ``multicast_interface`` wins over it.
+                address that reaches this host (a UDP connect: nothing on
+                the wire for a dotted address; a hostname is resolved first,
+                which is DNS, and a failure falls back to INADDR_ANY with a
+                WARNING). An explicit ``multicast_interface`` wins over it.
         """
         _stream_iface.validate_request(
             multicast_group, multicast_interface, device_host

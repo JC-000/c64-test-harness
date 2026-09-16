@@ -121,6 +121,21 @@ class VideoCaptureResult:
     #: Their lines are dropped: the frame they belong to is gone, and
     #: applying them would finalise the frame in progress early and re-open
     #: the old frame number (#442).
+    #:
+    #: **Those lines are lost, and this is the only counter that shows it.**
+    #: :attr:`packets_dropped` stays 0 because the datagram did arrive, and
+    #: :attr:`frames_dropped` stays 0 because the frame was finalised from
+    #: the lines it had -- a frame whose last lines are still in flight is
+    #: emitted as a *complete* frame that is simply shorter, since
+    #: ``_finalize_frame`` takes its height from the highest line present.
+    #: So ``packets_dropped == 0 and frames_dropped == 0`` reads clean on a
+    #: capture that lost lines.  A caller bounding video loss must assert on
+    #: this field too, the way audio callers must assert on
+    #: ``CaptureResult.payloads_discarded`` (#443).  Every received datagram
+    #: ends in exactly one of three places -- its lines applied, discarded
+    #: as a duplicate (:attr:`payloads_discarded`), or dropped as stale --
+    #: but there is no ``applied`` field to check that against, so bounding
+    #: loss means asserting on the latter two.
     stale_packets: int = 0
 
 
@@ -152,9 +167,11 @@ class VideoCapture:
     cannot repair it -- the frame has been emitted or counted dropped -- and
     applying it would finalise the frame in progress early and re-open the
     old frame number, turning one reordered datagram into two corrupted
-    frames.  Those are counted in ``stale_packets`` instead.  A datagram the
-    tracker holds as a possible duplicate is applied only if a restart later
-    re-admits it.
+    frames.  Those are counted in ``stale_packets`` instead -- **the only
+    counter that shows those lines were lost**, since ``packets_dropped``
+    and ``frames_dropped`` both stay 0 for them (see
+    :class:`VideoCaptureResult`).  A datagram the tracker holds as a
+    possible duplicate is applied only if a restart later re-admits it.
     """
 
     def __init__(
@@ -179,8 +196,10 @@ class VideoCapture:
                 bench.  Ignored without ``multicast_group``: naming one
                 without the other raises ``ValueError``.
             device_host: Resolve ``multicast_interface`` as the local
-                address that reaches this host (a UDP connect, no traffic).
-                An explicit ``multicast_interface`` wins over it.
+                address that reaches this host (a UDP connect: nothing on
+                the wire for a dotted address; a hostname is resolved first,
+                which is DNS, and a failure falls back to INADDR_ANY with a
+                WARNING).  An explicit ``multicast_interface`` wins over it.
         """
         _stream_iface.validate_request(
             multicast_group, multicast_interface, device_host
@@ -417,7 +436,13 @@ class VideoCapture:
             self._cur_frame_num = None
 
     def _sync_counters(self) -> None:
-        """Mirror the tracker's counts into this capture's attributes."""
+        """Mirror the tracker's counts into this capture's attributes.
+
+        ``_last_seq`` is written and not read, deliberately: the audio and
+        debug receivers keep the same attribute after #430, and a third
+        receiver that quietly dropped it would make the trio harder to read
+        for no gain.
+        """
         self._packets_dropped = self._seq.dropped
         self._packets_reordered = self._seq.reordered
         self._sequence_resyncs = self._seq.resyncs

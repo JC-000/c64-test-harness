@@ -1119,6 +1119,10 @@ Background-thread UDP receiver. Assembles packets into complete frames.
 from c64_test_harness import VideoCapture, VIC_PALETTE
 
 cap = VideoCapture(port=11000)
+# Multicast (not known to deliver on this bench — #399/#461): name the
+# interface, or the kernel picks it (the VPN here).
+#   VideoCapture(port=11000, multicast_group="239.0.1.65",
+#                device_host=client.host)     # or multicast_interface="10.43.23.127"
 cap.start()
 # ... wait for frames ...
 result = cap.stop()  # -> VideoCaptureResult
@@ -1135,6 +1139,10 @@ PAL: 384×272 @ 50fps (68 packets/frame). NTSC: 384×240 @ 60fps. 4-bit packed p
 - `.frames: list[VideoFrame]`, `.duration_seconds: float`
 - `.packets_received: int`, `.packets_dropped: int`
 - `.frames_completed: int`, `.frames_dropped: int`
+- `.packets_reordered: int` — datagrams that arrived behind the highest sequence number seen (late, held or resync), one per datagram (#442)
+- `.sequence_resyncs: int` — backward steps the tracker could not repair (restarted counter, forward loss ≥ 32768, a datagram past the 1024-packet reorder window)
+- `.payloads_discarded: int` — datagrams held as possible duplicates and then decided to be duplicates; a true duplicate is a correct discard, so non-zero is not by itself a fault
+- `.stale_packets: int` — late datagrams whose frame was already finalised; **their lines are lost and no other counter shows it** (`packets_dropped` stays 0 — the datagram did arrive; `frames_dropped` stays 0 — the frame was finalised from the lines it had, emitted complete but short), so a test bounding video loss must assert on this field too
 
 ### `VIC_PALETTE`
 Tuple of 16 `(R, G, B)` tuples — standard VIC-II colors (index 0=black, 1=white, ..., 15=light grey).

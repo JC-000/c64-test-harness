@@ -34,10 +34,13 @@ INADDR_ANY = "0.0.0.0"
 def local_address_towards(host: str, port: int = 80) -> str:
     """The local address the OS would use to reach *host*.
 
-    A UDP ``connect`` only selects a route: it puts nothing on the wire, so
-    this is safe against a device that must not be touched.  Same trick
-    ``render_wav_u64._detect_local_ip`` and ``ultimate64.capture_frame``
-    already use.
+    A UDP ``connect`` only selects a route, so for a dotted address this
+    puts nothing on the wire and is safe against a device that must not be
+    touched.  A *hostname* is resolved first, which is DNS traffic and can
+    block; a resolution failure raises :class:`socket.gaierror`, a subclass
+    of ``OSError``, so :func:`resolve_interface` falls back to INADDR_ANY
+    with a WARNING.  Same trick ``render_wav_u64._detect_local_ip`` and
+    ``ultimate64.capture_frame`` already use.
     """
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.connect((host, port))
