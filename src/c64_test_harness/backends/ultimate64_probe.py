@@ -31,7 +31,18 @@ from dataclasses import dataclass
 # ``Ultimate64Client``, so without this import it would be a second
 # formatter and a second chance to send the ``0x`` prefix that firmware
 # carrying GideonZ/1541ultimate#884 rejects.
-from .ultimate64_client import _wire_hex16
+from .ultimate64_client import Ultimate64Client, _wire_hex16
+
+# The free functions here mutate a device nobody may be holding: the liveness
+# probe writes $0334-$03B3, and its /Temp reservation wants the same
+# lock-release drain a client gets (#450 review, #460).
+try:
+    from .device_lock import register_release_callback as _register_release_callback
+    from .device_lock import warn_unlocked_client as _warn_unlocked_client
+
+    _HAS_DEVICE_LOCK = True
+except ImportError:  # pragma: no cover - device_lock ships with the package
+    _HAS_DEVICE_LOCK = False
 
 __all__ = [
     "ProbeResult",
@@ -638,6 +649,202 @@ def _wire_format_result(
     )
 
 
+# --------------------------------------------------------------------------- #
+# /Temp accounting for the free function (#450)                               #
+# --------------------------------------------------------------------------- #
+#
+# The client method is accounted (#250, #295); the free spelling was not, so
+# two POSTs per call went out uncounted, swept nothing and could not be
+# refused -- on the one device whose /Temp nothing collects, reached by the
+# obvious spelling at the moment someone already suspects a wedge.  These
+# helpers give the free function the same reserve/gate/refund the client does,
+# against the same per-device ledger (#295), so the count is the device's
+# whichever spelling spent it.
+
+
+def _probe_hygiene_armed(firmware_version: str | None) -> bool:
+    """Whether this device's ``/Temp`` needs collecting, from *firmware_version*.
+
+    The free function holds no client and so no cached capability grade --
+    but by the time this is asked it has already fetched ``GET /v1/info``
+    (step 2, bodyless and free), so it grades from that at no extra cost and
+    with no extra request.
+
+    Mirrors :attr:`Ultimate64Client.temp_hygiene_armed`: ``U64_AUTO_TEMP_GC``
+    wins when set; otherwise ``runner_wedge_possible is not False`` arms, so a
+    version string that cannot settle the question resolves conservatively.
+
+    **An unknown version arms here, unlike on the client** (#450 review). The
+    client may disarm on ``firmware_version is None`` because that means its
+    construct-time probe found nothing answering at all; this function has
+    already established ``reachable=True`` in step 1 before it asks. ``None``
+    here means the device answered and then failed to give a usable version --
+    a timeout, a reset, unparseable JSON, a non-string field -- which is the
+    half-wedged device someone reaches for this probe to diagnose. Disarming
+    there would skip the ``ledger.blocked`` refusal as well as the sweep, and
+    land two POSTs on a device whose hygiene pass is known to be impossible.
+    ``DeviceCapabilities.from_info(None).runner_wedge_possible`` is ``True``,
+    so arming is also what the capability grade itself says.
+    """
+    from .ultimate64_temp_gc import auto_gc_override
+
+    override = auto_gc_override()
+    if override is not None:
+        return override
+    from .u64_capabilities import DeviceCapabilities
+
+    caps = DeviceCapabilities.from_info({"firmware_version": firmware_version})
+    return caps.runner_wedge_possible is not False
+
+
+def _reserve_probe_attachments(
+    host: str, count: int, *, armed: bool, operation: str
+):
+    """Gate, then count, *count* attachments on *host*'s device ledger.
+
+    The same order :meth:`Ultimate64Client._reserve_temp_attachments` uses,
+    under the same ledger lock, so a probe and a client's upload against one
+    device cannot both pass the budget check and then both count:
+
+    * a device whose hygiene pass has been proven impossible refuses here,
+      before the probe reads or writes anything -- so the restore POST is
+      never the request that gets refused, and a blocked client cannot
+      health-check by reaching for the free spelling instead;
+    * a reservation that would overrun the budget sweeps first;
+    * the count goes on whether or not this caller is armed, because the
+      attachment lands either way; arming decides only the gate.
+
+    Three deliberate differences from the client's version. There is no
+    re-probe (the grade came from this call's own ``/v1/info``); a failed
+    sweep writes **no config**, because the FTP-enable write is reserved for a
+    client that leaked attachments of its own (#263) and this function holds
+    no client to own that write; and the sweep runs as ``gc_temp_folder(host)``
+    bare, so the FTP port, credentials and keep-count a client of the same
+    device may have been constructed with are not applied -- there is no
+    client to read them from, and the module defaults are what a bench device
+    uses. The refusal it raises is the client's
+    :class:`Ultimate64TempHygieneError`, so one ``except`` catches both
+    spellings.
+
+    :raises Ultimate64TempHygieneError: when armed, hygiene has been proven
+        impossible for this device, and ``U64_TEMP_GC_REQUIRED`` has not
+        opted out.
+    """
+    from .ultimate64_client import Ultimate64TempHygieneError
+    from .ultimate64_temp_gc import (
+        TempGCResult,
+        TempReservation,
+        gc_temp_folder,
+        hygiene_required,
+        leak_budget,
+        temp_ledger_for,
+    )
+
+    ledger = temp_ledger_for(host)
+    with ledger.lock:
+        if armed:
+            budget = leak_budget()
+            if (
+                ledger.blocked is None
+                and ledger.pending > 0
+                and ledger.pending + count > budget
+            ):
+                try:
+                    result = gc_temp_folder(host)
+                except Exception as exc:  # noqa: BLE001 - gc reports, never raises
+                    result = TempGCResult(
+                        host=host, error=f"{type(exc).__name__}: {exc}"
+                    )
+                if result.ok:
+                    ledger.collected()
+                else:
+                    ledger.blocked = str(result.error or "unknown FTP failure")
+            if ledger.blocked is not None:
+                message = (
+                    f"refusing {operation}: this firmware leaks a /Temp "
+                    "attachment for every request that carries a body and never "
+                    "collects them, and the harness's hygiene pass cannot run: "
+                    f"{ledger.blocked}. Continuing would walk the device towards "
+                    "the /Temp-accumulation wedge, which only a physical "
+                    "power-cycle clears. Diagnose with the bodyless calls "
+                    "instead (get_info, get_version, read_mem); they cost "
+                    "nothing. Remedy: enable Network Settings > FTP File Service "
+                    "on the device, or power-cycle it to empty /Temp. To proceed "
+                    "anyway set U64_TEMP_GC_REQUIRED=0. See docs/u64_recovery.md."
+                )
+                if hygiene_required():
+                    raise Ultimate64TempHygieneError(message)
+                _log.warning(
+                    "U64_TEMP_GC_REQUIRED=0: proceeding anyway. %s", message
+                )
+        pending_before = ledger.pending
+        ledger.pending += count
+        if armed:
+            ledger.armed_pending = True
+            # Flagging them armed is not enough to get them drained. A ledger
+            # learns its host from ``TempLedger.attach(client)`` and its
+            # release callback from ``Ultimate64Client.__init__`` -- neither of
+            # which has happened when a diagnostic script calls the free
+            # function and builds no client at all, so
+            # ``drain_on_lock_release`` would bail on ``self.host`` being None
+            # and would never be invoked anyway (#450 review). Do both here,
+            # so this probe's attachments are swept for the next lane rather
+            # than merely counted. Registration is weak and idempotent.
+            ledger.host = ledger.host or host
+            if _HAS_DEVICE_LOCK:
+                _register_release_callback(
+                    host, ledger, "drain_on_lock_release"
+                )
+        ledger.begin_reservation(count, armed=armed)
+        return TempReservation(ledger.generation, pending_before, armed, count)
+
+
+def _end_probe_reservation(host: str, reservation, *, sent: int) -> None:
+    """End *reservation*: refund what the probe never sent (and count a surplus).
+
+    A probe that stopped before its write -- unreachable device, a readmem
+    that failed, a refused restore -- must not leave the device reading as
+    though it spent attachments it did not, or the next caller sweeps or is
+    blocked on a phantom count.
+    """
+    from .ultimate64_temp_gc import temp_ledger_for
+
+    ledger = temp_ledger_for(host)
+    with ledger.lock:
+        if sent > reservation.count:
+            # Defensive: the probe sends at most two, but a count that is
+            # short is the failure that matters here, so a surplus is added
+            # rather than dropped.
+            ledger.pending += sent - reservation.count
+            if reservation.armed:
+                ledger.armed_pending = True
+        ledger.end_reservation(reservation, sent=min(sent, reservation.count))
+
+
+def _counting_sender(
+    send: "Callable[..., tuple[int, bytes]]", sent: list[int]
+) -> "Callable[..., tuple[int, bytes]]":
+    """Wrap *send*, counting body-carrying POSTs into ``sent[0]``.
+
+    Counted in a ``finally``: the firmware writes the attachment as the body
+    streams in, so a request that then fails has still left one. What counts
+    as an attachment is :meth:`Ultimate64Client._creates_temp_attachment` --
+    the firmware route table's rule, in one place rather than two.
+    """
+
+    def _counted(method, host, port, path, password, timeout, **kwargs):
+        leaks = Ultimate64Client._creates_temp_attachment(
+            method, kwargs.get("body")
+        )
+        try:
+            return send(method, host, port, path, password, timeout, **kwargs)
+        finally:
+            if leaks:
+                sent[0] += 1
+
+    return _counted
+
+
 def liveness_probe(
     host: str,
     port: int = 80,
@@ -646,6 +853,7 @@ def liveness_probe(
     http_timeout: float = _LIVENESS_PROBE_HTTP_TIMEOUT,
     skip_ping: bool = True,
     request: "Callable[..., tuple[int, bytes]] | None" = None,
+    accounted: bool = False,
 ) -> LivenessResult:
     """Full writemem-degradation liveness probe.
 
@@ -667,9 +875,18 @@ def liveness_probe(
     documented TCP-wedge trigger (see issue #107).  On firmware without
     GideonZ/1541ultimate#686 (the C64U on 1.1.0) each POST leaves a
     ``/Temp`` attachment, so one call costs two (measured, issue #250).
-    This free function has no hygiene accounting of its own; call it
-    through :meth:`Ultimate64Client.liveness_probe`, which counts both and
-    refuses when the hygiene pass cannot run.
+
+    **Both are accounted** (issue #450).  Unless the caller says it does its
+    own accounting (*accounted*), this function reserves the whole
+    two-attachment cost against the device's shared ledger
+    (:func:`~c64_test_harness.backends.ultimate64_temp_gc.temp_ledger_for`,
+    #295) once ``/v1/info`` has settled whether the firmware is leak-prone,
+    and before it reads or writes any RAM: the hygiene pass runs first if the
+    budget cannot hold both, a device whose pass has been proven impossible
+    raises :class:`Ultimate64TempHygieneError` instead of probing, and
+    whatever the probe did not send is refunded.  So this spelling and
+    :meth:`Ultimate64Client.liveness_probe` spend one budget and are refused
+    on the same terms.
 
     :param host: device hostname or IP.
     :param port: HTTP port (default 80).
@@ -685,20 +902,65 @@ def liveness_probe(
         (non-2xx returned, connection failures raised raw).  Defaults to
         :func:`_liveness_request`.  :class:`Ultimate64Client` passes a
         wrapper that counts body-carrying POSTs against its ``/Temp``
-        budget.
+        budget.  A sender given here is still accounted by this function
+        unless *accounted* says otherwise.
+    :param accounted: the caller already counts and gates this probe's two
+        POSTs against the device's ``/Temp`` budget, so this function must
+        not count them a second time.  :meth:`Ultimate64Client.liveness_probe`
+        passes ``True``; nothing else should.
     :returns: :class:`LivenessResult` summarising the probe.  Its
         ``scratch_restored`` says whether ``$0334-$03B3`` holds its
         original bytes again; ``False`` is also logged at WARNING.  A
         refused or raised restore leaves ``healthy`` ``True`` (issue #328):
         ``scratch_restored`` and the WARNING are the only report of it.
+    :raises Ultimate64TempHygieneError: when the device's hygiene pass has
+        been proven impossible and ``U64_TEMP_GC_REQUIRED`` has not opted
+        out; nothing is written to the device in that case.
+
+    Like :func:`~c64_test_harness.backends.ultimate64_baseline.apply_factory_baseline`
+    -- the other free function that mutates a device -- this says once per
+    process and host when nothing in this process holds the device's
+    ``DeviceLock`` (#194, #460).  It is a notice, not a refusal: the probe
+    writes ``$0334-$03B3`` and writes it back, so a neighbouring lane's
+    cassette-buffer scratch changes under it either way.
     """
+    if _HAS_DEVICE_LOCK and not accounted:
+        # Not on the client's path: Ultimate64Client warns at construction and
+        # its accounted sender checks the lock per request, so warning again
+        # here would double up on the one caller that already reports it.
+        _warn_unlocked_client(host, what="liveness_probe", logger=_log)
     state: dict[str, bool | None] = {"wrote": False, "restored": None}
-    result = _liveness_probe_steps(
-        host, port, password,
-        http_timeout=http_timeout, skip_ping=skip_ping,
-        send=request if request is not None else _liveness_request,
-        state=state,
-    )
+    send = request if request is not None else _liveness_request
+    cost = Ultimate64Client.LIVENESS_PROBE_TEMP_ATTACHMENTS
+    sent = [0]
+    reservation = None
+    on_firmware = None
+    if not accounted:
+        send = _counting_sender(send, sent)
+
+        def on_firmware(firmware_version: str | None) -> None:  # noqa: F811
+            nonlocal reservation
+            reservation = _reserve_probe_attachments(
+                host,
+                cost,
+                armed=_probe_hygiene_armed(firmware_version),
+                operation=(
+                    f"liveness_probe on {host} "
+                    f"({cost} x POST /v1/machine:writemem)"
+                ),
+            )
+
+    try:
+        result = _liveness_probe_steps(
+            host, port, password,
+            http_timeout=http_timeout, skip_ping=skip_ping,
+            send=send,
+            state=state,
+            on_firmware=on_firmware,
+        )
+    finally:
+        if reservation is not None:
+            _end_probe_reservation(host, reservation, sent=sent[0])
     if not state["wrote"]:
         return result
     restored = state["restored"] is True
@@ -725,12 +987,19 @@ def _liveness_probe_steps(
     skip_ping: bool,
     send: "Callable[..., tuple[int, bytes]]",
     state: "dict[str, bool | None]",
+    on_firmware: "Callable[[str | None], None] | None" = None,
 ) -> LivenessResult:
     """The probe itself; records in *state* whether it wrote and restored.
 
     ``state["wrote"]`` is set just before the probe POST is sent (a timed-out
     POST may still have landed); ``state["restored"]`` holds the restore
     helper's return value when a restore was attempted.
+
+    *on_firmware* is called once with the discovered firmware version (or
+    ``None``), after the bodyless steps and before anything that carries a
+    body or touches RAM.  It may raise, which aborts the probe having sent
+    only GETs; :func:`liveness_probe` uses it to reserve the two attachments
+    the write and its restore will cost (#450).
     """
     # ----------------------------------------------------------------- #
     # Step 1: reachability                                              #
@@ -780,6 +1049,12 @@ def _liveness_probe_steps(
         # Non-fatal: proceed with firmware_version=None.  Probe payload
         # is sized for the worst-known case (fw 3.14*) regardless.
         firmware_version = None
+
+    if on_firmware is not None:
+        # The grade is settled and nothing with a body has gone out yet, so
+        # this is the last point at which a refusal costs the device nothing
+        # and the write and its restore can still be reserved together (#450).
+        on_firmware(firmware_version)
 
     # ----------------------------------------------------------------- #
     # Step 3: writemem POST round-trip                                  #
