@@ -25,6 +25,8 @@ launch could not be elevated, which is what the pcap driver requires
 from __future__ import annotations
 
 import os
+import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -32,6 +34,9 @@ import sys
 import tempfile
 import time
 
+import pytest
+
+from c64_test_harness.ethernet import parse_mac
 from c64_test_harness.backends.vice_elevation import (
     rawnet_capability,
     sudo_can_run,
@@ -60,6 +65,85 @@ from c64_test_harness.backends.vice_lifecycle import (
 # Consumers wanting their own services on the harness bridge should stay
 # clear of ``.1``-``.3`` and use ``.100`` upward.
 BRIDGE_SUBNET = os.environ.get("C64_BRIDGE_SUBNET", "10.0.65").strip().rstrip(".")
+
+
+#: What macOS hands back in place of a real hardware address when the
+#: caller is not entitled to see one.  Measured 2026-09-16 on macOS 27.0
+#: (build 26A428): under the Homebrew venv interpreter EVERY interface's
+#: ``ifconfig`` ``ether`` line reads this, while Apple's
+#: ``/usr/bin/python3`` and a plain shell see the real address.  The cause
+#: is not established -- ``/sbin/ifconfig`` is the same binary in every
+#: arm, so the redaction is inherited from the responsible parent rather
+#: than produced by Python, and the rule may be broader than "Homebrew".
+REDACTED_MAC = "02:00:00:00:00:00"
+
+_MAC = r"([0-9A-Fa-f:]{17})"
+
+
+def _looks_redacted(mac: str) -> bool:
+    """True for the redaction placeholder and for the all-zero address."""
+    return mac.lower().replace("-", ":") in (REDACTED_MAC, "00:00:00:00:00:00")
+
+
+def _stdout(cmd: list[str]) -> str:
+    """``cmd``'s stdout, or ``""`` if it cannot be run at all.
+
+    A missing binary must degrade to the next source, not raise out of a
+    module-scope fixture as a collection error.
+    """
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True).stdout
+    except OSError:
+        return ""
+
+
+def host_mac(iface: str) -> bytes:
+    """The host's hardware address for *iface*, or ``pytest.skip``.
+
+    **Never trust ``ifconfig``'s ``ether`` line from inside the harness.**
+    See :data:`REDACTED_MAC`.  Frames addressed to the placeholder reach
+    nobody, so the host never replies and the miss looks exactly like a
+    dead link or an absent cartridge (issue #444).
+
+    ``networksetup`` is not redacted, but answers only for interfaces it
+    knows as hardware ports -- ``feth``/``bridge10``/``lo0``/``awdl0``
+    return ``** Error: The parameters were not valid.`` -- so the
+    ``ifconfig`` parse stays as a genuine fallback, and the placeholder is
+    refused whichever source produced it rather than being handed back.
+    """
+    mac = None
+    if platform.system() == "Darwin":
+        m = re.search(_MAC, _stdout(["/usr/sbin/networksetup", "-getmacaddress", iface]))
+        if m is None:
+            m = re.search("ether " + _MAC, _stdout(["ifconfig", iface]))
+        mac = m.group(1) if m else None
+    else:
+        try:
+            with open(f"/sys/class/net/{iface}/address") as fh:
+                mac = fh.read().strip()
+        except OSError:
+            m = re.search("link/ether " + _MAC, _stdout(["ip", "addr", "show", iface]))
+            mac = m.group(1) if m else None
+    if not mac:
+        pytest.skip(f"cannot read the MAC of {iface}")
+    if _looks_redacted(mac):
+        pytest.skip(f"{iface}: host MAC reads as the redacted placeholder {mac}")
+    return parse_mac(mac)
+
+
+def host_addr(iface: str) -> tuple[bytes, bytes]:
+    """``(mac, ipv4)`` for *iface*, or ``pytest.skip``.
+
+    The MAC comes from :func:`host_mac`; the IPv4 is parsed from the
+    platform's own listing, which is not redacted.
+    """
+    mac = host_mac(iface)
+    out = _stdout(["ifconfig", iface] if platform.system() == "Darwin"
+                  else ["ip", "addr", "show", iface])
+    ip = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
+    if not ip:
+        pytest.skip(f"cannot read the IPv4 of {iface}")
+    return mac, bytes(int(x) for x in ip.group(1).split("."))
 
 
 def bridge_ip(host_octet: int) -> bytes:

@@ -119,24 +119,10 @@ ROUNDS = 3
 _seq = [0x2200]
 
 
-def _host_addr(iface: str) -> tuple[bytes, bytes]:
-    if platform.system() == "Darwin":
-        out = subprocess.run(["ifconfig", iface], capture_output=True, text=True).stdout
-        # ``ifconfig``'s ether line is REDACTED to 02:00:00:00:00:00 for a
-        # Homebrew-python parent (and everything it spawns); ``networksetup``
-        # is not.  Addressing frames to the placeholder means the host never
-        # sees a frame for itself and never replies.
-        ns = subprocess.run(["/usr/sbin/networksetup", "-getmacaddress", iface],
-                            capture_output=True, text=True).stdout
-        mac = re.search(r"([0-9a-f:]{17})", ns) or re.search(r"ether ([0-9a-f:]{17})", out)
-        ip = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
-    else:
-        out = subprocess.run(["ip", "addr", "show", iface], capture_output=True, text=True).stdout
-        mac = re.search(r"link/ether ([0-9a-f:]{17})", out)
-        ip = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
-    if not mac or not ip:
-        pytest.skip(f"cannot read the MAC/IPv4 of {iface}")
-    return parse_mac(mac.group(1)), bytes(int(x) for x in ip.group(1).split("."))
+# Bound as a module attribute on purpose: tests/test_live_fixture_teardowns.py
+# monkeypatches ``_host_addr`` here.  See bridge_platform.host_addr for why
+# ``ifconfig``'s ether line must not be trusted (#444).
+from bridge_platform import host_addr as _host_addr  # noqa: E402
 
 
 def _pp_read(off: int, dst: int) -> bytes:

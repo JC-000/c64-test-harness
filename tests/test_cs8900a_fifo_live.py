@@ -145,28 +145,10 @@ PARTIAL_N = 20
 _tag = [0]
 
 
-def _host_mac(iface: str) -> bytes:
-    if platform.system() == "Darwin":
-        # ``ifconfig``'s ether line is REDACTED to 02:00:00:00:00:00 under a
-        # Homebrew-python parent (and every process it spawns), which silently
-        # misaddresses every frame this module builds; ``networksetup`` is not
-        # redacted.  Measured on macOS 27.0 (26A428), 2026-09-16.
-        ns = subprocess.run(["/usr/sbin/networksetup", "-getmacaddress", iface],
-                            capture_output=True, text=True).stdout
-        m = re.search(r"([0-9a-f:]{17})", ns)
-        if m:
-            return parse_mac(m.group(1))
-        out = subprocess.run(["ifconfig", iface], capture_output=True, text=True).stdout
-        for ln in out.splitlines():
-            if "ether " in ln:
-                return parse_mac(ln.split()[1])
-    else:
-        try:
-            with open(f"/sys/class/net/{iface}/address") as fh:
-                return parse_mac(fh.read().strip())
-        except OSError:
-            pass
-    pytest.skip(f"cannot read the MAC of {iface}")
+# Bound as a module attribute on purpose: tests/test_live_fixture_teardowns.py
+# monkeypatches ``_host_mac`` here.  See bridge_platform.host_mac for why
+# ``ifconfig``'s ether line must not be trusted (#444).
+from bridge_platform import host_mac as _host_mac  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #

@@ -341,10 +341,11 @@ always ours.
 
 ### macOS test-author traps (live tests only)
 
-These three gotchas are not present on the Linux side. They were
+These three gotchas are not present on the Linux side. Traps 1 and 2 were
 surfaced empirically while landing
 `tests/test_cleanup_vice_ports_macos_live.py`; that file is the canonical
 working reference for any new live test that drives the macOS bridge.
+Trap 3 was surfaced on 2026-09-16 while debugging RR-Net.
 
 **1. NOPASSWD is scoped to the exact program path, not `bash <script>`.**
 The project's sudoers grant NOPASSWD for the cleanup/setup/teardown
@@ -415,6 +416,11 @@ VICE checks: with `/dev/bpf0` at `crw----rw-` (world read/write) and uid
 > multi-instance run.
 
 **3. `ifconfig` reports a REDACTED MAC under a Homebrew-python parent.**
+The cause is **not** established: `/sbin/ifconfig` is the same binary in
+every arm, so the redaction is inherited from the responsible parent
+rather than produced by Python, and the real rule may be broader than
+"Homebrew".  What is *measured* is the set of arms below.
+
 On macOS 27.0 (build 26A428) a process launched from Homebrew's Python --
 and every process it spawns, so `subprocess.run(["ifconfig", iface])` too --
 reads the interface's `ether` line as `02:00:00:00:00:00`, and
@@ -432,9 +438,12 @@ never saw a frame addressed to itself and so never replied -- every
 exchange missed with `RxMISS` **0**, which reads exactly like a dead link
 or an absent cartridge.  A wire capture showed the ARP handshake
 completing correctly and the echo request then leaving for the placeholder
-address.  Rule: **`RxMISS` 0 means the frame never reached the chip --
-check the addressing before suspecting the cartridge or the link**, and
-`RxMISS` +1 is the separate queue-overflow case of issue #222.
+address.  Rule: **`RxMISS` 0 rules out the #222 queue-overflow mechanism; it does
+not establish that the frame never arrived** -- `bridge_ping.py` records
+frames injected 200 ms early that were already buffered with `RxMISS`
+still 0.  On a miss with `RxMISS` 0, check addressing, link and chip
+init, in that order.  `RxMISS` +1 is the separate queue-overflow case of
+issue #222.
 
 ### Issue #144 is refuted: the Homebrew bottle captures fine
 
