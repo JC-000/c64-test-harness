@@ -264,11 +264,17 @@ def test_capture_usable_applies_both_conditions() -> None:
 
 
 #: Every claim the discard clause has to carry, by phrase *and* by figure,
-#: in both texts that state it.  Token presence is not a pin: #443, #452,
-#: ``packets_reordered`` and "only trace" all live in the restart bullet and
-#: the harm paragraph, so asserting those four let the entire held-at-stop
-#: bullet be deleted, either figure set be falsified, and the central claim
-#: be inverted -- six mutants, none caught (#449 review round 2, E1-E6).
+#: asserted **inside the extracted clause** (see :func:`_clause_slice`).
+#:
+#: Presence over the whole text is not a pin, in two separate ways.  Round
+#: 2: #443, #452, ``packets_reordered`` and "only trace" all live in the
+#: restart bullet and the harm paragraph, so asserting those four let the
+#: held-at-stop bullet be deleted, either figure set be falsified and the
+#: claim be inverted (E1-E6).  Round 3: even with every phrase required,
+#: they can be satisfied from somewhere else in the file while the clause
+#: itself is gutted (C3), or left intact under a banner that retires them
+#: (C1/C5).  Extracting the clause first is what kills those by
+#: construction; the refused-word list below is only a second line.
 #: The two texts are worded to share these substrings exactly so one table
 #: pins both.
 _DISCARD_CLAUSE_REQUIRED = (
@@ -298,61 +304,160 @@ _DISCARD_CLAUSE_REQUIRED = (
     "101 in, 100 in the WAV, 1 discarded",
 )
 
-#: Phrasings that would invert the claim while leaving every token above in
-#: place (E6).
+#: Wording that retires or inverts the clause while leaving every required
+#: phrase in place (E6, C1/C5).  Backup only: a word list catches the
+#: phrasings someone thought of, so the slice above has to do the work.
 _DISCARD_CLAUSE_REFUSED = (
     "fill fields show it",
     "the fill fields show",
+    "fully visible",
+    "visible in every fill field",
+    "retired",
+    "retracted",
+    "no longer appl",
+    "was wrong",
+    "ignore the figures",
+    "superseded",
+    "outdated",
+    "disregard",
 )
 
+#: How to cut each text down to the discard clause: (start marker, end
+#: marker, opening, closing).  The markers are the **neighbouring bullets**,
+#: never the clause's own words, so text inserted anywhere between them --
+#: above the sub-bullets, below them, between them -- lands inside the slice
+#: instead of escaping the pin.
+_CLAUSE_BOUNDS = {
+    "module docstring": (
+        'It no longer means "nothing was lost"; ``packets_dropped == 0`` still does.',
+        "**Older behaviour, for readers of older captures.**",
+        "* **Discarded payloads are lost stream time, and no fill field "
+        "shows it (#443).**",
+        "bounds lost time rather than requiring zero.",
+    ),
+    "docs/sid_audio.md": (
+        "- A late packet overwrites its own fill and a duplicate is discarded (#430).",
+        "- **Older captures:**",
+        "- **Discarded payloads are lost stream time, and no fill field "
+        "shows it (#443).**",
+        "bounds lost time rather than requiring zero.",
+    ),
+}
 
-def _clause_texts() -> dict:
-    """Both texts with runs of whitespace collapsed to one space.
+#: Substrings that **span a seam** between the clause's parts: opening ->
+#: first bullet, first bullet -> second bullet, second bullet -> harm
+#: paragraph.  Anything inserted at a seam breaks the span whatever it says,
+#: which is how a retirement banner dies without being on a word list.
+_CLAUSE_SEAMS = {
+    "module docstring": (
+        "``time_base_intact`` True: - **a counter that restarts over a number "
+        "that was itself lost**",
+        "stops being enough on its own. - **a tail of duplicate-looking "
+        "datagrams still held at** ``stop()``",
+        "(8 packets, 32 ms of audio). **The harm is duration, not content.**",
+    ),
+    "docs/sid_audio.md": (
+        "`time_base_intact` True: - **a counter that restarts over a number "
+        "that was itself lost**",
+        "this note stops being enough. - **a tail of duplicate-looking "
+        "datagrams still held at `stop()`**",
+        "`MAX_HELD_DUPLICATES` (8 packets, 32 ms). The harm is "
+        "**duration, not content**",
+    ),
+}
 
-    Re-wrapping a paragraph is not a change to what it claims, and these
-    phrases are longer than a line in the markdown.  Matching the collapsed
-    text keeps the pin sensitive to what matters -- a bullet deleted, a
-    figure falsified, the claim inverted -- without failing on a reflow.
+
+def _flat(text: str) -> str:
+    """Runs of whitespace collapsed to one space.
+
+    Re-wrapping a paragraph is not a change to what it claims, and several
+    pinned phrases outrun a line.  Collapsing keeps the pin sensitive to
+    deletion, falsification, relocation and inversion, and blind to reflow.
     """
-    md = (Path(__file__).resolve().parent.parent / "docs" / "sid_audio.md").read_text()
-    return {
-        where: " ".join(text.split())
-        for where, text in (
-            ("module docstring", uac.__doc__ or ""),
-            ("docs/sid_audio.md", md),
+    return " ".join(text.split())
+
+
+def _clause_slice(where: str) -> str:
+    """Just the discard clause, cut out of *where* between its neighbours."""
+    if where == "module docstring":
+        text = _flat(uac.__doc__ or "")
+    else:
+        text = _flat(
+            (Path(__file__).resolve().parent.parent / "docs" / "sid_audio.md").read_text()
         )
-    }
+    start, end, _opens, _closes = _CLAUSE_BOUNDS[where]
+    assert text.count(start) == 1, f"{where}: start marker not unique/found"
+    i = text.index(start) + len(start)
+    assert text.count(end) == 1, f"{where}: end marker not unique/found"
+    return text[i:text.index(end, i)].strip()
 
 
+@pytest.mark.parametrize("where", sorted(_CLAUSE_BOUNDS))
 @pytest.mark.parametrize("phrase", _DISCARD_CLAUSE_REQUIRED)
-def test_both_discard_clause_texts_carry_every_claim(phrase: str) -> None:
-    """Each path pinned by phrase and by figure, in both texts (#449 round 2)."""
-    for where, text in _clause_texts().items():
-        assert phrase in text, f"{where} no longer says {phrase!r}"
+def test_the_discard_clause_carries_every_claim(phrase: str, where: str) -> None:
+    """Each path pinned by phrase and figure, *inside the clause* (#449 round 3).
+
+    Inside, not anywhere in the file: pasting the phrases into an unrelated
+    section while gutting the clause is C3, and it passed a whole-text pin.
+    """
+    assert phrase in _clause_slice(where), f"{where} clause no longer says {phrase!r}"
 
 
+@pytest.mark.parametrize("where", sorted(_CLAUSE_BOUNDS))
+def test_the_discard_clause_is_one_unbroken_piece(where: str) -> None:
+    """No text inserted at any seam between the clause's parts (C1/C5).
+
+    The seams span opening -> bullet -> bullet -> harm paragraph, so a
+    banner wedged at one breaks its span no matter how it is worded.  This
+    is the check that does not depend on guessing the phrasing.
+    """
+    slice_ = _clause_slice(where)
+    for seam in _CLAUSE_SEAMS[where]:
+        assert seam in slice_, (
+            f"{where}: something was inserted or removed at a clause seam -- "
+            f"expected the clause to run straight through {seam!r}"
+        )
+
+
+@pytest.mark.parametrize("where", sorted(_CLAUSE_BOUNDS))
+def test_the_discard_clause_starts_and_ends_where_it_should(where: str) -> None:
+    """Nothing prepended or appended between the neighbouring bullets."""
+    _start, _end, opens, closes = _CLAUSE_BOUNDS[where]
+    slice_ = _clause_slice(where)
+    assert slice_.startswith(opens), (
+        f"{where}: text sits between the previous bullet and the clause's "
+        f"own opening claim"
+    )
+    assert slice_.endswith(closes), (
+        f"{where}: text sits between the clause's closing sentence and the "
+        f"next bullet"
+    )
+
+
+@pytest.mark.parametrize("where", sorted(_CLAUSE_BOUNDS))
 @pytest.mark.parametrize("phrase", _DISCARD_CLAUSE_REFUSED)
-def test_neither_discard_clause_text_inverts_the_claim(phrase: str) -> None:
-    """The fill fields do *not* show a discard; saying they do is the E6 mutant."""
-    for where, text in _clause_texts().items():
-        assert phrase not in text, f"{where} inverts the claim with {phrase!r}"
+def test_the_discard_clause_is_not_retired_or_inverted(phrase: str, where: str) -> None:
+    """Backup for the seam check: wording that would retract the clause."""
+    assert phrase not in _clause_slice(where).lower(), (
+        f"{where} clause retires or inverts itself with {phrase!r}"
+    )
 
 
-def test_the_only_trace_sentence_survives_the_443_merge() -> None:
+@pytest.mark.parametrize("where", sorted(_CLAUSE_BOUNDS))
+def test_the_only_trace_sentence_survives_the_443_merge(where: str) -> None:
     """#443's head adds ``payloads_discarded``, so it becomes *the* trace.
 
     The clause names the counter and scopes the reorder-count claim to a
     result built before it, which is true on both sides of that merge.
     """
-    for where, text in _clause_texts().items():
-        i = text.index("only trace")
-        before = text[:i]
-        assert "payloads_discarded" in before, (
-            f"{where} claims an only trace without naming payloads_discarded first"
-        )
-        assert "before that field existed" in before, (
-            f"{where} does not scope the only-trace claim to a pre-#443 result"
-        )
+    slice_ = _clause_slice(where)
+    before = slice_[:slice_.index("only trace")]
+    assert "payloads_discarded" in before, (
+        f"{where} claims an only trace without naming payloads_discarded first"
+    )
+    assert "before that field existed" in before, (
+        f"{where} does not scope the only-trace claim to a pre-#443 result"
+    )
 
 
 def _discarding(discarded: int, *, packets_in_wav: int, **kw) -> CaptureResult:
