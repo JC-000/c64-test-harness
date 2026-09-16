@@ -295,7 +295,7 @@ HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
     ),
     ScratchRegion(
         0x00F0, 0x00F3,
-        owner="bridge_ping._emit_poll_rxevent",
+        owner="bridge_ping._emit_poll_rx",
         purpose="6510-side (not a host write): RxEvent poll counters — "
                 "$F0/$F1 inner 16-bit counter, $F2 outer — written by the "
                 "emitted routine while it polls the CS8900a",
@@ -304,7 +304,7 @@ HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
     ScratchRegion(
         0x00F0, 0x00F6,
         owner="tod_timer.build_* (ZP_CUR_LO..ZP_RAW), "
-              "bridge_ping._tod builders",
+              "bridge_ping._emit_tod_* helpers",
         purpose="6510-side (not a host write): CIA1 TOD poll scratch — "
                 "$F0/$F1 elapsed tenths, $F2/$F3 deadline, $F4 BCD "
                 "ones-digit, $F5 raw BCD seconds; released when the poll "

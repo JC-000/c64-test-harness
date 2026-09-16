@@ -69,7 +69,8 @@ The contract, as decided by the owner in #227:
   route table has since been read at tag ``1.1.0`` (``7b628eb1``), and
   **every PUT route binds NULL** there -- so no PUT can attach on 1.1.0
   whatever the body gate does, while the upload POSTs bind
-  ``&attachment_writer``.  The direction of that former residual is kept
+  ``&attachment_writer`` (``POST runners:modplay`` binds
+  ``&attachment_reu``, a ``REUWriter``, not a ``TempfileWriter``).  The direction of that former residual is kept
   on the record because the counting rule itself has not changed:
   counting POST-with-body only is the **permissive** side,
   not the conservative one: an uncounted attachment never advances
@@ -1017,7 +1018,8 @@ def apply_factory_baseline(
     route table has since been read at tag ``1.1.0`` (``7b628eb1``), and
     **every PUT route binds NULL** there -- so no PUT can attach on 1.1.0
     whatever the body gate does, while the upload POSTs bind
-    ``&attachment_writer``.  The direction of that former residual is kept
+    ``&attachment_writer`` (``POST runners:modplay`` binds
+    ``&attachment_reu``, a ``REUWriter``, not a ``TempfileWriter``).  The direction of that former residual is kept
     on the record because the counting rule itself has not changed:
     counting POST-with-body only is the **permissive** side,
     not the conservative one: an uncounted attachment never advances
