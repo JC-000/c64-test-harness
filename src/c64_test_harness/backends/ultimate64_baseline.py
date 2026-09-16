@@ -63,16 +63,23 @@ The contract, as decided by the owner in #227:
   ``route_configs.cc:473``).  So the hypothetical "a PUT that attaches"
   cannot reach a request with no body, and the reset is free even on the
   leak-prone C64 Ultimate.
-  **The residual, and its direction**: ``routes.cc`` was read on the 3.15
-  line (``v3.15-84-g871ad034``) and whether 1.1.0 carries the same
-  five-line gate is an **inference, not a read**.  Note which way that
-  error runs -- counting POST-with-body only is the **permissive** side,
+  **The residual is closed by source (#436)**: the body gate was first
+  read on the 3.15 line, and whether 1.1.0 carried the same five-line
+  gate was for a while an inference rather than a read.  The C64U's own
+  route table has since been read at tag ``1.1.0`` (``7b628eb1``), and
+  **every PUT route binds NULL** there -- so no PUT can attach on 1.1.0
+  whatever the body gate does, while the upload POSTs bind
+  ``&attachment_writer``.  The direction of that former residual is kept
+  on the record because the counting rule itself has not changed:
+  counting POST-with-body only is the **permissive** side,
   not the conservative one: an uncounted attachment never advances
   ``_pending_temp_attachments``, so the budget is never reached, the
   hygiene pass never fires, and the counter reads zero while the device
-  accumulates.  That is the gap to close, not the margin to rely on.  One
-  cheap live check closes it: ``/Temp`` count, one ``reset_to_default``
-  PUT, count again, next time somebody is at that bench.  But ``/Temp`` was not the
+  accumulates.  That direction is why the table was read rather than
+  assumed.  The read establishes only that such a request *creates* an
+  attachment; that accumulated attachments crash the firmware is the
+  owner's account (CLAUDE.md), not something this citation shows.
+  But ``/Temp`` was not the
   only hazard on that device -- it reaches the bench over WiFi whose
   reconnection after a power cycle is known unreliable, with nobody
   present -- so the default consults
@@ -1004,14 +1011,23 @@ def apply_factory_baseline(
     (``software/api/routes.cc:40-46``); this route's writer slot is
     ``NULL`` regardless (``route_configs.cc:473``).  So the call creates no
     ``/Temp`` attachment, on any route binding.
-    **The residual, and its direction**: ``routes.cc`` was read on the 3.15
-    line (``v3.15-84-g871ad034``) and whether 1.1.0 carries the same
-    five-line gate is an **inference, not a read**.  Note which way that
-    error runs -- counting POST-with-body only is the **permissive** side,
+    **The residual is closed by source (#436)**: the body gate was first
+    read on the 3.15 line, and whether 1.1.0 carried the same five-line
+    gate was for a while an inference rather than a read.  The C64U's own
+    route table has since been read at tag ``1.1.0`` (``7b628eb1``), and
+    **every PUT route binds NULL** there -- so no PUT can attach on 1.1.0
+    whatever the body gate does, while the upload POSTs bind
+    ``&attachment_writer``.  The direction of that former residual is kept
+    on the record because the counting rule itself has not changed:
+    counting POST-with-body only is the **permissive** side,
     not the conservative one: an uncounted attachment never advances
     ``_pending_temp_attachments``, so the budget is never reached, the
     hygiene pass never fires, and the counter reads zero while the device
-    accumulates.  That is the gap to close, not the margin to rely on.  Pre-reset drift
+    accumulates.  That direction is why the table was read rather than
+    assumed.  The read establishes only that such a request *creates* an
+    attachment; that accumulated attachments crash the firmware is the
+    owner's account (CLAUDE.md), not something this citation shows.
+    Pre-reset drift
     is logged at INFO per item; a post-reset mismatch raises
     :class:`U64BaselineError` after every category has been processed.
 

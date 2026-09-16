@@ -659,13 +659,11 @@ class TestBodylessThroughout:
         "attachment_writer returns NULL for a body-less request",
         "routes.cc:40-46",
         "route_configs.cc:473",
-        # (b) and the residual's direction is named, the right way round
+        # (b) and the residual's direction is named, the right way round.
+        # The counting rule has not changed, so the direction is still
+        # stated -- it is why the table was read rather than assumed.
         "counting POST-with-body only is the permissive side, "
         "not the conservative one",
-        "the gap to close, not the margin to rely on",
-        # the residual stays honest about being an inference
-        "inference, not a read",
-        "v3.15-84-g871ad034",
     )
 
     @pytest.mark.parametrize("phrase", _CAVEAT_PHRASES)
@@ -709,12 +707,6 @@ class TestBodylessThroughout:
             assert "conservative side of it" not in flat, (
                 f"{where}: the reversed label is back"
             )
-
-    def test_the_module_still_names_the_live_check_that_closes_it(self) -> None:
-        from c64_test_harness.backends import ultimate64_baseline as mod
-
-        flat = self._flat(mod.__doc__ or "")
-        assert "count, one reset_to_default PUT, count again" in flat
 
     def test_a_hypothetical_post_would_be_counted(self) -> None:
         """Positive control for the instrument: the counter is live on this
