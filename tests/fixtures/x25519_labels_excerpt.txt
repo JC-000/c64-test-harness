@@ -1,0 +1,3 @@
+al C:00082D .main_loop
+al C:00148E .x25519_clamp
+al C:0019A0 .x25_scalar

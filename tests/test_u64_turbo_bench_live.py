@@ -5,6 +5,11 @@ must point at an ``x25519.prg`` build (issue #245: it used to be a hard-coded
 path into a Linux home directory, so on any other machine the module skipped
 silently and nobody noticed).
 
+The build must also have kept its ``labels.txt`` beside the PRG: this module
+reads ``x25519_clamp``, ``x25_scalar`` and ``main_loop`` out of it at import
+rather than carrying literals, which went stale once and cost a full session
+of uploads to notice (issue #439).
+
     U64_HOST=<host> U64_ALLOW_MUTATE=1 X25519_PRG=/path/to/x25519.prg \
         python3 -m pytest tests/test_u64_turbo_bench_live.py -v
 
@@ -21,6 +26,7 @@ from __future__ import annotations
 
 import functools
 import os
+import re
 import time
 from pathlib import Path
 
@@ -82,22 +88,124 @@ def _resolve_prg_path() -> tuple[Path | None, str]:
 
 _PRG_PATH, _PRG_SKIP_REASON = _resolve_prg_path()
 
+# ---------------------------------------------------------------------------
+# Addresses: derived from the build, never hard-coded (#439)
+# ---------------------------------------------------------------------------
+#
+# These used to be literals copied out of a ``labels.txt`` by hand. The
+# x25519 link layout then moved (that project's v0.14-v0.16, 2026-09-06/07)
+# and the literals did not: ``main_loop`` became ``$082D`` while the module
+# still polled ``$082A``, which holds ``20 44 08`` (``JSR $0844``). Every
+# speed failed ``PRG boot timeout`` *after* its uploads — 12 ``run_prg``
+# calls and 12 ``reboot()``s spent to discover a stale constant. So the
+# build under test decides (the #245 principle), and it decides at import
+# time: the ``pytestmark`` skip below is evaluated at collection, before any
+# fixture runs and therefore before the first upload.
+
+#: The label lines ``ld65 -Ln`` emits, after the build's ``sed`` rewrites
+#: them to carry a segment prefix: ``al C:00082D .main_loop``.
+_LABEL_RE = re.compile(r"^al\s+C:([0-9A-Fa-f]{1,6})\s+\.(\S+)$")
+
+#: The x25519 Makefile writes ``$(BUILD_DIR)/labels.txt`` beside
+#: ``$(BUILD_DIR)/x25519.prg``, so the listing is the PRG's sibling.
+_LABELS_FILENAME = "labels.txt"
+
+#: Build symbols this module cannot run without, by their ca65 names.
+_REQUIRED_LABELS = ("x25519_clamp", "x25_scalar", "main_loop")
+
+
+def _parse_ca65_labels(text: str) -> tuple[dict[str, int], list[str]]:
+    """Parse an ``ld65 -Ln`` label listing into ``{symbol: address}``.
+
+    Returns ``(labels, unparseable)``. Blank lines are not unparseable;
+    anything else that is not a label line is returned verbatim so the
+    caller can quote it in a skip reason rather than silently dropping it.
+    """
+    labels: dict[str, int] = {}
+    unparseable: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        match = _LABEL_RE.match(line)
+        if match is None:
+            unparseable.append(raw)
+            continue
+        labels[match.group(2)] = int(match.group(1), 16)
+    return labels, unparseable
+
+
+def _resolve_labels(prg_path: Path | None) -> tuple[dict[str, int] | None, str]:
+    """Resolve build addresses from the ``labels.txt`` beside the PRG.
+
+    Returns ``(labels, "")`` when every required symbol resolved, and
+    ``(None, reason)`` otherwise. The three failure modes are reported
+    distinguishably — an absent listing, a listing that is not one, and a
+    listing missing a symbol are three different things to go fix.
+    """
+    if prg_path is None:
+        return None, f"no {_PRG_ENV} resolved, so there is no {_LABELS_FILENAME} to read"
+
+    path = prg_path.parent / _LABELS_FILENAME
+    if not path.is_file():
+        return None, (
+            f"{path} not found — the x25519 build writes {_LABELS_FILENAME} "
+            f"next to the PRG; this module reads its addresses from the build "
+            f"rather than hard-coding them (#439)"
+        )
+
+    try:
+        text = path.read_text()
+    except OSError as exc:  # unreadable is an environment defect, not a decision
+        return None, f"{path} could not be read: {exc}"
+
+    labels, unparseable = _parse_ca65_labels(text)
+    if not labels:
+        sample = unparseable[0] if unparseable else "<empty file>"
+        return None, (
+            f"{path} contains no ca65 label lines "
+            f"({len(unparseable)} unparseable; first: {sample!r}) — expected "
+            f"lines of the form 'al C:00082D .main_loop'"
+        )
+
+    missing = [name for name in _REQUIRED_LABELS if name not in labels]
+    if missing:
+        return None, (
+            f"{path} is missing the symbol(s) {', '.join(missing)} — the PRG "
+            f"at {prg_path} is not the x25519 build this module drives"
+        )
+
+    return labels, ""
+
+
+_LABELS, _LABELS_SKIP_REASON = _resolve_labels(_PRG_PATH)
+
+# Addresses that belong to the build. ``None`` when the labels did not
+# resolve, in which case the module-level skip below has already fired.
+X25519_CLAMP = None if _LABELS is None else _LABELS["x25519_clamp"]
+X25_SCALAR = None if _LABELS is None else _LABELS["x25_scalar"]
+MAIN_LOOP = None if _LABELS is None else _LABELS["main_loop"]
+
+# Addresses the harness chooses. These are free RAM the test picks itself,
+# not build labels, so they are literals on purpose and are not looked up.
+SENTINEL = 0x0350
+TRAMPOLINE = 0x0360
+
+
+# ---------------------------------------------------------------------------
+# Gates
+# ---------------------------------------------------------------------------
+# Declared after the addresses so the label resolution can gate the module.
+# Every one of these is evaluated at collection, which is the point: a stale
+# or unreadable build stops the session before the ``client`` fixture, and so
+# before the first of its 12 uploads (#439).
+
 pytestmark = [
     pytest.mark.skipif(not _HOST, reason="U64_HOST not set"),
     pytest.mark.skipif(not _ALLOW_MUTATE, reason="U64_ALLOW_MUTATE not set"),
     pytest.mark.skipif(_PRG_PATH is None, reason=_PRG_SKIP_REASON),
+    pytest.mark.skipif(_LABELS is None, reason=_LABELS_SKIP_REASON),
 ]
-
-
-# ---------------------------------------------------------------------------
-# Addresses (from labels.txt)
-# ---------------------------------------------------------------------------
-
-X25519_CLAMP = 0x1509
-X25_SCALAR = 0x19A0
-MAIN_LOOP = 0x082A
-SENTINEL = 0x0350
-TRAMPOLINE = 0x0360
 
 
 # ---------------------------------------------------------------------------
@@ -111,13 +219,45 @@ def _clamp_ref(scalar: bytes) -> bytes:
     return bytes(s)
 
 
-# Trampoline: JSR clamp; LDA #$42; STA sentinel; JMP * (park)
-_TRAMPOLINE_CODE = bytes([
-    0x20, X25519_CLAMP & 0xFF, (X25519_CLAMP >> 8) & 0xFF,  # JSR $1509
-    0xA9, 0x42,                                               # LDA #$42
-    0x8D, SENTINEL & 0xFF, (SENTINEL >> 8) & 0xFF,           # STA $0350
-    0x4C, (TRAMPOLINE + 8) & 0xFF, ((TRAMPOLINE + 8) >> 8) & 0xFF,  # JMP $0368
-])
+def _jmp_bytes(target: int) -> bytes:
+    """``JMP target``, assembled little-endian.
+
+    This module needs the same three bytes in three places: the parked
+    ``main_loop`` the boot check waits for (a self-``JMP``), the
+    trampoline's own park, and the hijack written over ``main_loop``.
+    Spelling any of them as a literal is what #439 was: the literal kept
+    saying ``4C 2A 08`` after the label moved to ``$082D``, so the poll
+    could never match and the failure surfaced only after the uploads.
+    """
+    return bytes([0x4C, target & 0xFF, (target >> 8) & 0xFF])
+
+
+def _hijack_code() -> bytes:
+    """``JMP TRAMPOLINE`` — written over ``main_loop`` to divert the 6510.
+
+    Reads ``TRAMPOLINE`` at call time, so relocating the trampoline moves
+    the hijack with it. This one stayed a literal in the first pass at
+    #439: with the trampoline moved, the hijack would have jumped into
+    whatever happened to sit at ``$0360`` — on hardware, after all 12
+    uploads, which is the failure shape #439 exists to remove.
+    """
+    return _jmp_bytes(TRAMPOLINE)
+
+
+def _trampoline_code(clamp_address: int) -> bytes:
+    """JSR clamp; LDA #$42; STA sentinel; JMP * (park).
+
+    Takes the clamp entry point as an argument so it comes from the build's
+    ``labels.txt`` rather than from a literal that the next link-layout
+    change silently invalidates.
+    """
+    park = TRAMPOLINE + 8
+    return bytes([
+        0x20, clamp_address & 0xFF, (clamp_address >> 8) & 0xFF,  # JSR clamp
+        0xA9, 0x42,                                               # LDA #$42
+        0x8D, SENTINEL & 0xFF, (SENTINEL >> 8) & 0xFF,           # STA sentinel
+        *_jmp_bytes(park),                                        # JMP park
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -195,28 +335,35 @@ def _run_clamp_fresh(
     client.run_prg(prg_data)
     time.sleep(2.0)
 
-    # Verify program started via main_loop bytes (not stale screen text)
+    # Verify program started via main_loop bytes (not stale screen text).
+    # The expected bytes are assembled from the build's own main_loop
+    # address, so a relinked PRG moves the poll with it (#439).
+    parked = _jmp_bytes(MAIN_LOOP)
+    ml = b""
     boot_deadline = time.monotonic() + 120.0
     while time.monotonic() < boot_deadline:
         ml = transport.read_memory(MAIN_LOOP, 3)
-        if ml == bytes([0x4C, 0x2A, 0x08]):
+        if ml == parked:
             break
         time.sleep(0.5)
     else:
-        raise TimeoutError(f"PRG boot timeout (main_loop={ml.hex()})")
+        raise TimeoutError(
+            f"PRG boot timeout (main_loop=${MAIN_LOOP:04X} read {ml.hex()}, "
+            f"expected {parked.hex()})"
+        )
 
     time.sleep(0.5)  # settle after init
 
     # Write scalar, trampoline, zero sentinel
     write_bytes(transport, X25_SCALAR, scalar)
-    write_bytes(transport, TRAMPOLINE, _TRAMPOLINE_CODE)
+    write_bytes(transport, TRAMPOLINE, _trampoline_code(X25519_CLAMP))
     write_bytes(transport, SENTINEL, bytes([0x00]))
 
     # DMA flush
     _ = transport.read_memory(SENTINEL, 1)
 
-    # Hijack main_loop → JMP $0360
-    write_bytes(transport, MAIN_LOOP, bytes([0x4C, 0x60, 0x03]))
+    # Hijack main_loop → JMP TRAMPOLINE (assembled, never spelled out)
+    write_bytes(transport, MAIN_LOOP, _hijack_code())
 
     # Poll sentinel
     deadline = time.monotonic() + 30.0
