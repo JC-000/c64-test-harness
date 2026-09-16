@@ -84,6 +84,40 @@ Ultimate-line ≥ 3.15. It is best-effort: any FTP/network failure is captured
 in the returned `TempGCResult.error` rather than raised, so a hygiene
 pass can never fail a test run.
 
+**Mounted images are excluded from the sweep (#418).** The `temp####`
+pattern does not only match leaked attachments. An image uploaded as a
+**raw** body, or as a multipart part with no `filename=`, keeps the
+firmware's managed name and is then mounted *from that file* — on 1.1.0
+`route_drives.cc` passes the full `/Temp/tempXXXX` path into `api_mount`
+and `c1541.cc` stores it as the drive's `mount_file_name` — so an
+oldest-first sweep could delete a mounted image's backing store. Harness
+uploads are not exposed (`mount_disk` sends a named `image.<type>` part
+since #311); other clients' raw uploads are. Before deleting anything,
+the sweep therefore reads `GET /v1/drives` (bodyless, zero `/Temp` cost)
+and skips every managed name a drive has mounted, matching on
+*basenames* so both `/Temp/tempXXXX` and a bare `tempXXXX` are caught.
+Those names come back in `TempGCResult.mounted_excluded`. The exclusion
+can only ever **shrink** the delete set, and the listing is requested
+only when the sweep would otherwise delete something.
+
+**Evidence grade for the exclusion: unit-tested only — it has never run
+against a device.** The mount path is source-read at tag `1.1.0`, and the
+mounted name was observed once (n=1) on the U64E, fw 3.15 `bce4535e`,
+2026-09-15, where a raw mount reported `image_file` =
+`/Temp/cache/upload/temp0082`. The deletion this prevents has **not** been
+reproduced. Note that the live verification recorded in the next paragraph
+is dated 2026-08-21 and predates #418: it covers the keep-count sweep, not
+the exclusion.
+
+**A failed drives listing is not a failed hygiene pass.** If the listing
+cannot be read the sweep proceeds on the keep-count alone, records why in
+`TempGCResult.mounted_probe_error`, and leaves `.error`/`.ok` untouched —
+so it does *not* trip the refusal described below. That asymmetry is
+deliberate: skipping the sweep would trade a recoverable data hazard (a
+deleted image can be re-uploaded) for the unrecoverable one this whole
+mechanism exists to prevent. What the 1541 emulation does when a mounted
+read-write image's backing file disappears is not established.
+
 Verified live on both device generations: originally on the U64E, and
 on the C64U (10.53.21.158, firmware 1.1.0) on 2026-08-21 —
 `tests/test_temp_gc_live.py` passed end-to-end (repeated `run_prg`

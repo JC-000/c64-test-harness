@@ -524,9 +524,18 @@ def test_client_gc_temp_folder_delegates_with_host():
         mock_module_gc.return_value = "sentinel"
         result = c.gc_temp_folder(keep=5, ftp_username="bench", ftp_password="hunter2")
     assert result == "sentinel"
-    mock_module_gc.assert_called_once_with(
-        "10.0.0.64", port=None, username="bench", password="hunter2", keep=5, timeout=10.0
-    )
+    mock_module_gc.assert_called_once()
+    args, kwargs = mock_module_gc.call_args
+    assert args == ("10.0.0.64",)
+    probe = kwargs.pop("mounted_probe")
+    assert kwargs == {
+        "port": None, "username": "bench", "password": "hunter2", "keep": 5, "timeout": 10.0
+    }
+    # #418: the sweep must be able to see what the drives have mounted, and
+    # must see it through *this* client -- the free function's own default
+    # probe sends no X-Password and would read nothing on a locked device.
+    assert probe.__func__ is Ultimate64Client.list_drives
+    assert probe.__self__ is c
 
 
 def test_sid_play_includes_songnr():
