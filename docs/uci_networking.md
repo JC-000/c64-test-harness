@@ -98,8 +98,7 @@ v3.15-85), not measured:
   identifier and `uci_probe` answered 4/4. The REU half, the External and
   `.crt` cases, and the C64U are unmeasured.
   `Ultimate64Client.reboot`'s docstring stated the unconditional version
-  until #299 corrected it to this account
-  (`tests/test_reboot_docstring.py` pins the two together).
+  until #299 corrected it to this account.
 
 #270 has since run the U64E without the reset, with the result given at
 the top of this section. The write is memory-only — it is a config PUT, so

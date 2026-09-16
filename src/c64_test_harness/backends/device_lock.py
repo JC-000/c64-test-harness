@@ -233,8 +233,7 @@ _MAX_HOLDER_HANDOFFS = 3
 #: is called a pattern that works now names this value, the WARNING and
 #: the cap -- the :meth:`DeviceLock.acquire` docstring and
 #: ``docs/device_locking.md`` § "Rescuing a self-held wait from another
-#: thread" -- and ``tests/test_device_lock_rescue_grace_docs.py`` fails
-#: if one stops doing so.  Reconsider only if a real consumer needs a
+#: thread".  Reconsider only if a real consumer needs a
 #: rescue slower than the grace.
 _SELF_HELD_WAIT_GRACE = 2.0
 

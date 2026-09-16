@@ -151,8 +151,8 @@ non-transient entry below by default.
 
 The table is **generated** from `c64_test_harness.HARNESS_SCRATCH`
 (`src/c64_test_harness/memory_policy.py`) by
-`scripts/gen_memory_table.py`, and `tests/test_memory_table_doc.py`
-fails the suite if the two disagree.  Edit the Python list, then run
+`scripts/gen_memory_table.py`; `scripts/gen_memory_table.py --check`
+exits 1 if the two disagree.  Edit the Python list, then run
 `scripts/gen_memory_table.py --write` — never the markdown.  Each
 entry was verified against the code that performs the write (the
 *Owner* column); where an older version of this table disagreed with
@@ -163,9 +163,6 @@ the code, the code won (issue #169).
 |---|---:|---|---|---|
 | `$0000-$0001` | 2 | `snapshot.restore_snapshot` | 6510 CPU port direction/data re-asserted after the RAM restore (override="snapshot-restore") | restore-time only; carries override= |
 | `$00C6` | 1 | `uci_network._execute_uci_routine`, `backends.ultimate64.Ultimate64Transport.inject_keys`, `backends.ultimate64_client.Ultimate64Client.send_text` | KERNAL NDX — keyboard-buffer fill count set after a SYS/text injection | KERNAL-mandated (keybuf_count_addr= on U64 transport) |
-| `$00F0-$00F2` | 3 | `bridge_ping._emit_poll_rx` | 6510-side (not a host write): RxEvent poll counters — $F0/$F1 inner 16-bit counter, $F2 outer — written by the emitted routine while it polls the CS8900a | hardcoded |
-| `$00F0-$00F5` | 6 | `tod_timer.build_* (ZP_CUR_LO..ZP_RAW)`, `bridge_ping._emit_tod_* helpers` | 6510-side (not a host write): CIA1 TOD poll scratch — $F0/$F1 elapsed tenths, $F2/$F3 deadline, $F4 BCD ones-digit, $F5 raw BCD seconds; released when the poll loop completes, before any frame read in the same JSR | hardcoded |
-| `$00FB-$00FC` | 2 | `bridge_ping._emit_tx_frame`, `bridge_ping._emit_read_frame` | 6510-side (not a host write): pointer for the CS8900a frame copy loops, used as ($FB),Y; past 256 bytes the TX loop also does INC $FC, leaving $FC past the last whole page | hardcoded |
 | `$0277-$0280` | 10 | `uci_network._execute_uci_routine`, `backends.ultimate64.Ultimate64Transport.inject_keys`, `backends.ultimate64_client.Ultimate64Client.send_text` | KERNAL KEYD — 10-byte keyboard buffer receiving "SYS<addr>\r" or injected text | KERNAL-mandated (keybuf_addr= on U64 transport) |
 | `$0314-$0315` | 2 | `sid_player.stop_sid_vice` | RAM IRQ vector (CINV) restored to $EA31; the installer stub also patches it from 6502 code | hardcoded |
 | `$0334-$0338` | 5 | `execute.jsr` | JSR addr / NOP / NOP trampoline; checkpoint at +3 | scratch_addr= |
@@ -347,5 +344,4 @@ exactly as before.  Opt in at your own pace:
   wiring fires before any byte crosses the wire.
 * `scripts/gen_memory_table.py` — renders the scratch table above from
   `HARNESS_SCRATCH` (`--check` / `--write`); `tests/test_harness_scratch.py`
-  pins each entry's bounds to the emitting code and
-  `tests/test_memory_table_doc.py` fails on drift.
+  pins each entry's bounds to the emitting code.
