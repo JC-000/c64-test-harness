@@ -12,7 +12,9 @@ unmeasured).
 
 The absence check is the doc pin's own ``_relapses`` (imported, so the two
 cannot drift apart), and it is shown to fire on the exact paragraph master
-carried.  What gets through it is listed in that module's docstring.
+carried.  #270 has since measured the Command Interface half on the U64E
+(bce4535e); the REU half, the External/``.crt`` cases and the C64U are
+still read from source.  What gets through it is listed in that module's docstring.
 """
 from __future__ import annotations
 
@@ -169,6 +171,27 @@ def test_marks_it_unmeasured_and_links_the_doc(doc):
     assert "unmeasured" in doc.lower()
     assert "docs/uci_networking.md" in doc
     assert "#299" in doc
+
+
+def test_the_enable_uci_requirement_is_not_restated_as_standing(doc):
+    """#270 measured the enable live without a reset on the U64E (bce4535e)."""
+    assert "still stands" not in doc
+    assert "bce4535e" in doc and "#270" in doc
+
+
+@pytest.mark.parametrize("phrase", (
+    # PR #409 review round 1 (R5): the result, not just its citation.
+    "was not reproduced on the U64E",
+    "4/4 per arm",
+    "run at +3 s",
+    # Finding 5: what is measured, and what still is not.
+    "The Command Interface half is measured on the U64E",
+    "the REU half, the External and ``.crt`` cases and the C64U are **unmeasured**",
+    # Finding 6.
+    "is open (#422)",
+))
+def test_the_measurement_is_stated_with_its_scope(doc, phrase):
+    assert phrase in doc, phrase
 
 
 def test_the_enable_uci_observation_is_not_dropped(doc):

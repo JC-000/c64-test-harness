@@ -273,8 +273,15 @@ def test_capture_usable_applies_both_conditions() -> None:
 #: claim be inverted (E1-E6).  Round 3: even with every phrase required,
 #: they can be satisfied from somewhere else in the file while the clause
 #: itself is gutted (C3), or left intact under a banner that retires them
-#: (C1/C5).  Extracting the clause first is what kills those by
-#: construction; the refused-word list below is only a second line.
+#: (C1/C5, C7-C10).
+#:
+#: **Two mechanisms, and neither covers the other** -- measured by ablation
+#: with unmatched controls (#449 review round 3): the **slice** kills
+#: relocation (C3), and the **seam spans** kill insertion (C1/C5/C7-C10).
+#: With the seam table and the refused-word list both disabled, an
+#: insertion inside the clause **survives** the slice on its own.  So do
+#: not delete :data:`_CLAUSE_SEAMS` believing the extraction subsumes it;
+#: the refused-word list really is only a third line.
 #: The two texts are worded to share these substrings exactly so one table
 #: pins both.
 _DISCARD_CLAUSE_REQUIRED = (

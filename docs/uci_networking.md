@@ -23,9 +23,23 @@ measured on the U64E unless it says otherwise.
 *C64 and Cartridge Settings → Command Interface → Enabled*.
 `enable_uci(client)` flips that item over REST. The live suites follow it
 with `client.reset()` and a 3 s settle before the first routine
-(`tests/test_uci_udp_send_live.py:274-280`); without that, every routine
-times out at the sentinel. Keep that sequence. On an Ultimate transport every routine except `uci_probe` first reads the UCI identifier at `$DF1D` (one bodyless GET, zero `/Temp` cost) and raises `UCIInterfaceAbsentError` if it is not `$C9`, because with `Cartridge Preference` = External the slot stays off the bus after the reset while `Command Interface` still reads Enabled (#359: U64E, paired ABBAAB, identifier present and routine completing 3/3 with Auto, 0/3 with External). It is a recorded
-observation, and **its cause is not explained by firmware source**. From
+(`tests/test_uci_udp_send_live.py:274-279`), recorded as: without that, every routine
+times out at the sentinel. **That requirement was not reproduced when it
+was measured on the U64E** (#270: fw 3.15, `git_commit_hash` bce4535e,
+2026-09-15, `DeviceLock` held, `Cartridge Preference` `Auto`, each trial
+starting at `READY.` from `disable_uci` + `client.reset()` + 3 s; arms
+interleaved ABCCBA twice, n=4 per arm): with the enable applied and no
+reset, `$DF1D` read `$C9` at +0 (the first read after the PUT), and
+`uci_probe`, run at +3 s with no reset, completed 4/4; with
+`client.reset()` + 3 s, 4/4; with `reboot()` + 5 s, 4/4. So on that build
+the identifier is live without `reset()`, as the source trace below
+predicts. A routine at +0 was not run, so the 3 s settle is not retired. The reset in the live suites is harmless and
+stays. The C64U was not measured, and on it this is still source-read.
+Why the earlier runs timed out is not established (#422); the untested
+candidates are `Cartridge Preference` External (#359, next sentence), the
+C64 not sitting at `READY.` when the `SYS` is typed, and a different
+firmware build. On an Ultimate transport every routine except `uci_probe` first reads the UCI identifier at `$DF1D` (one bodyless GET, zero `/Temp` cost) and raises `UCIInterfaceAbsentError` if it is not `$C9`, because with `Cartridge Preference` = External the slot stays off the bus after the reset while `Command Interface` still reads Enabled (#359: U64E, paired ABBAAB, identifier present and routine completing 3/3 with Auto, 0/3 with External). The original observation is recorded,
+and **its cause is not explained by firmware source**. From
 source, read at tag `1.1.0` (the C64U) and `7f6fcb51` (the U64E's
 v3.15-85), not measured:
 
@@ -79,17 +93,21 @@ v3.15-85), not measured:
 
   The REU enable follows the same two cases; its prohibit check is
   `c64.cc:1056-1061` (`:1335-1339` at `7f6fcb51`).
+  The Command Interface half of that account is measured on the U64E
+  (bce4535e, Cartridge Preference Auto, #270): after `reboot()` + 5 s the
+  identifier and `uci_probe` answered 4/4. The REU half, the External and
+  `.crt` cases, and the C64U are unmeasured.
   `Ultimate64Client.reboot`'s docstring stated the unconditional version
   until #299 corrected it to this account
   (`tests/test_reboot_docstring.py` pins the two together).
 
-To find the real cause, drop the reset on a device and see which step
-fails. Nobody has done that. The write is memory-only — it is a config PUT, so
+#270 has since run the U64E without the reset, with the result given at
+the top of this section. The write is memory-only — it is a config PUT, so
 it survives `machine:reboot` but not a firmware power-on, and it is never
-saved to flash (`uci_network.py:2316-2329`). (`enable_uci`'s own
-docstring still says "a device reboot reverts to the default state";
-that is wrong on the corrected model — `machine:reboot` is a C64-level
-reset and leaves firmware RAM config alone. See
+saved to flash (`uci_network.py:2316-2329`). (`enable_uci`'s docstring
+used to say "a device reboot reverts to the default state"; that was
+wrong on the corrected model — `machine:reboot` is a C64-level reset and
+leaves firmware RAM config alone — and #270 corrected it. See
 [`docs/u64_recovery.md`](u64_recovery.md) § "Harness-side mitigation: FTP
 `/Temp` GC", which carries the correction.)
 
@@ -147,7 +165,10 @@ reset:**
 
   So a timeout closes an open menu, and on `7f6fcb51` also releases held
   keys and joystick.
-- This has not been measured on a device.
+- The timeout path itself has not been measured on a device: its side
+  effects, a reset while a routine is executing, and the C64U. The enable
+  surviving the same `machine:reset` from `READY.` is measured on the U64E;
+  see the prerequisite section above.
 
 The reset does not clear a UCI STATE-bit wedge (#112); that still needs a
 physical power-cycle. Whatever program was running on the C64 is gone

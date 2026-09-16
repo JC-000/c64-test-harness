@@ -71,11 +71,15 @@ that lock -- this module does not acquire one itself.
 """
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import re
+import threading
+import weakref
 from dataclasses import dataclass, field
 from ftplib import FTP, all_errors as _FTP_ALL_ERRORS
+from typing import NamedTuple
 
 _log = logging.getLogger(__name__)
 
@@ -89,8 +93,9 @@ AUTO_GC_ENV = "U64_AUTO_TEMP_GC"
 #: Override the default keep-count (see DEFAULT_KEEP).
 KEEP_ENV = "U64_TEMP_GC_KEEP"
 
-#: Override the per-client leak budget -- how many attachment-creating
-#: requests may go out between hygiene passes (see DEFAULT_LEAK_BUDGET).
+#: Override the leak budget -- how many attachment-creating requests may go
+#: out to one device between hygiene passes, counted across every client of
+#: that host in the process (see DEFAULT_LEAK_BUDGET and TempLedger, #295).
 BUDGET_ENV = "U64_TEMP_GC_BUDGET"
 
 #: Set to a falsy value to opt out of the *refusal*: by default, once a
@@ -197,6 +202,15 @@ DEFAULT_KEEP = 2
 #: Override with :data:`BUDGET_ENV` or the client's ``temp_gc_budget=``.
 DEFAULT_LEAK_BUDGET = 6
 
+#: The device's REST port (``Ultimate64Client``'s ``port`` default). A
+#: ``host:80`` spelling names the same device as a bare ``host``, so
+#: :func:`temp_ledger_key` folds that one port and keeps every other.
+#: ``DeviceLock._sanitize_device_id`` keeps ``gw:8080`` and ``gw:8081``
+#: apart, so a ledger that folded all ports would let a failed pass
+#: against one device refuse requests to a different one behind the same
+#: name (#434 follow-up).
+DEFAULT_REST_PORT = 80
+
 DEFAULT_FTP_PORT = 21
 DEFAULT_FTP_TIMEOUT = 10.0
 DEFAULT_FTP_USER = "anonymous"
@@ -209,6 +223,11 @@ __all__ = [
     "auto_gc_override",
     "hygiene_required",
     "leak_budget",
+    "TempLedger",
+    "TempReservation",
+    "temp_ledger_for",
+    "temp_ledger_key",
+    "DEFAULT_REST_PORT",
     "AUTO_GC_ENV",
     "KEEP_ENV",
     "BUDGET_ENV",
@@ -288,9 +307,279 @@ def hygiene_required() -> bool:
 
 
 def leak_budget(default: int = DEFAULT_LEAK_BUDGET) -> int:
-    """The per-client leak budget, honouring :data:`BUDGET_ENV`."""
+    """The leak budget a client checks the device's count against,
+    honouring :data:`BUDGET_ENV`.
+
+    The *count* is per device (:class:`TempLedger`, issue #295); each client
+    compares it with its own budget, so clients built with different budgets
+    against one device each apply their own threshold to the shared count.
+    """
     value = _int_env(BUDGET_ENV, default)
     return value if value > 0 else default
+
+
+# --------------------------------------------------------------------------- #
+# Per-device accounting (#295)                                                #
+# --------------------------------------------------------------------------- #
+
+def temp_ledger_key(host: str) -> str:
+    """Normalise a client's host string to the key its device's ledger uses.
+
+    Folds together spellings of one address: surrounding whitespace, case,
+    an ``http://``/``https://`` scheme, a trailing path, IPv6 brackets, a
+    trailing dot, and the textual forms of one IP address
+    (``0:0:0:0:0:0:0:1`` and ``::1``).
+
+    **A non-default port is kept.** Only ``:80`` folds
+    (:data:`DEFAULT_REST_PORT`, the client's own default), because
+    ``host:80`` and ``host`` name one device. ``gw:8080`` and ``gw:8081``
+    are two devices as far as ``DeviceLock`` is concerned -- its
+    ``_sanitize_device_id`` keys them apart -- so merging them would let a
+    failed pass against one refuse attachment-creating requests to the
+    other (#434 follow-up).
+
+    **A name and the address it resolves to are not folded.** That would need
+    a DNS lookup in the accounting path, which can block for seconds and can
+    answer differently over time. ``/Temp`` is a property of the device, so
+    two spellings that reach one device through different names keep two
+    ledgers; use one spelling per device within a process.
+    """
+    s = str(host).strip().lower()
+    for scheme in ("http://", "https://"):
+        if s.startswith(scheme):
+            s = s[len(scheme):]
+            break
+    s = s.split("/", 1)[0]
+    port = ""
+    if s.startswith("["):
+        end = s.find("]")
+        if end != -1:
+            rest = s[end + 1:]
+            s = s[1:end]
+            if rest.startswith(":") and rest[1:].isdigit():
+                port = rest[1:]
+    elif s.count(":") == 1:
+        name, _, maybe_port = s.partition(":")
+        if maybe_port.isdigit():
+            s, port = name, maybe_port
+    s = s.rstrip(".")
+    try:
+        s = str(ipaddress.ip_address(s))
+    except ValueError:
+        pass
+    if not s:
+        return str(host)
+    if port and int(port) != DEFAULT_REST_PORT:
+        # Re-bracket an IPv6 literal so "address" and "port" stay readable
+        # (and so ``::1`` with a port cannot collide with a bare address).
+        return f"[{s}]:{port}" if ":" in s else f"{s}:{port}"
+    return s
+
+
+class TempLedger:
+    """``/Temp`` accounting for one device, shared by every client in the process.
+
+    The wedge accumulates per device, so the count, the refusal state and the
+    one FTP-enable attempt live here rather than on ``Ultimate64Client``
+    (issue #295). Before this, a fresh client per upload started a fresh
+    budget and two clients against one device spent a budget each.
+
+    Everything is guarded by :attr:`lock`, an ``RLock``: a client holds it
+    across a budget check and the count that follows, and across a hygiene
+    pass, so concurrent clients of one device take turns rather than both
+    sweeping, and the count never rises above the budget between them.
+
+    **In-process only.** Two processes against one device still keep two
+    ledgers. What covers the hand-off between processes is the lock-release
+    drain (:meth:`drain_on_lock_release`), which runs while the releasing
+    process still holds the device's ``DeviceLock``.
+    """
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+        self.lock = threading.RLock()
+        #: Attachments counted on this device since the last successful sweep.
+        self.pending = 0
+        #: Bumped by every successful sweep; a client's own share is valid
+        #: only for the generation it was counted in.
+        self.generation = 0
+        #: The reason string once a leaking client's hygiene pass has failed;
+        #: ``None`` again after any successful sweep.
+        self.blocked: str | None = None
+        #: One attempt per device per process at enabling FTP File Service.
+        self.ftp_enable_attempted = False
+        #: Whether an **armed** client counted any of :attr:`pending`. Lets a
+        #: lock release sweep the device after every client that leaked has
+        #: been garbage-collected, without sweeping for a disarmed or
+        #: post-safe client's attachments.
+        self.armed_pending = False
+        #: The host string of the most recently attached client, for that
+        #: orphaned sweep.
+        self.host: str | None = None
+        #: Attachments reserved (counted) whose request has not returned yet.
+        #: A sweep cannot collect what is still being sent, so :meth:`collected`
+        #: carries these into the new generation instead of zeroing them.
+        self.in_flight = 0
+        #: How many of :attr:`in_flight` an **armed** client reserved, so the
+        #: carry-over can restore :attr:`armed_pending` truthfully.
+        self.in_flight_armed = 0
+        self._clients: weakref.WeakSet = weakref.WeakSet()
+
+    def attach(self, client: object) -> None:
+        """Remember *client* weakly, so a lock release can pick a drainer."""
+        with self.lock:
+            self._clients.add(client)
+            self.host = getattr(client, "host", None) or self.host
+
+    def clients(self) -> list:
+        with self.lock:
+            return list(self._clients)
+
+    def collected(self) -> None:
+        """A sweep succeeded: only still-in-flight reservations stay pending.
+
+        **Not a reset to zero.** A sweep that lands between another client's
+        reservation and its send cannot have collected that attachment --
+        the request has not finished sending -- so zeroing here would leave
+        the count reading 0 while the device holds one. In-flight
+        reservations are therefore carried into the new generation, and
+        :meth:`end_reservation` refunds whatever of them was never sent.
+        """
+        with self.lock:
+            self.pending = self.in_flight
+            self.blocked = None
+            self.armed_pending = self.in_flight_armed > 0
+            self.generation += 1
+
+    def begin_reservation(self, count: int, *, armed: bool) -> None:
+        """Note *count* counted attachments whose request has not returned."""
+        with self.lock:
+            self.in_flight += count
+            if armed:
+                self.in_flight_armed += count
+
+    def end_reservation(self, reservation: "TempReservation", *, sent: int) -> int:
+        """End *reservation*: it is no longer in flight; refund what was not sent.
+
+        Safe across a sweep: :meth:`collected` carried the whole reservation
+        into the new generation, so the unsent part is still counted there
+        and is still owed back.
+
+        :returns: the refunded (unsent) count, for the caller to take off its
+            own share too.
+        """
+        with self.lock:
+            count = reservation.count
+            unsent = max(0, min(count, count - sent))
+            self.in_flight = max(0, self.in_flight - count)
+            if reservation.armed:
+                self.in_flight_armed = max(0, self.in_flight_armed - count)
+            if unsent:
+                self.pending = max(0, self.pending - unsent)
+            return unsent
+
+    def drain_on_lock_release(self, reason: str = "device lock release") -> bool:
+        """Release callback: **one** drain for this device, however many clients.
+
+        Registered once per host with
+        :func:`~c64_test_harness.backends.device_lock.register_release_callback`
+        in place of one registration per client, which made N clients open N
+        FTP sessions on one release. Clients are tried in order of how much
+        they have to say about the device: armed with a leak of their own,
+        armed, then leaked but not yet armed (whose drain re-probes first),
+        then the rest. The first client whose drain attempts a pass or sweep
+        ends the loop. Never raises.
+
+        **When no live client attempts one** but armed clients counted
+        attachments that are still pending (they were garbage-collected
+        before the release), the ledger sweeps the device itself with the
+        default FTP settings. A failure writes no config: no client is left
+        to write it for. It logs a WARNING and blocks later
+        attachment-creating requests to the device until a sweep succeeds,
+        as a leaking client's failed pass would.
+        """
+        with self.lock:
+            candidates = []
+            for client in self.clients():
+                try:
+                    armed = bool(client.temp_hygiene_armed)
+                    own = client._own_pending_temp_attachments() > 0
+                except Exception:  # noqa: BLE001 - a release must never fail
+                    continue
+                rank = 0 if armed and own else 1 if armed else 2 if own else 3
+                candidates.append((rank, len(candidates), client))
+            for _, _, client in sorted(candidates, key=lambda item: item[:2]):
+                try:
+                    if client._drain_on_lock_release(reason=reason):
+                        return True
+                except Exception as exc:  # noqa: BLE001 - a release must never fail
+                    _log.debug(
+                        "U64 /Temp release drain on %s raised (%s: %s); ignored",
+                        self.key, type(exc).__name__, exc,
+                    )
+            if not (self.pending > 0 and self.armed_pending and self.host):
+                return False
+            try:
+                result = gc_temp_folder(self.host)
+            except Exception as exc:  # noqa: BLE001 - a release must never fail
+                result = TempGCResult(host=self.host, error=f"{type(exc).__name__}: {exc}")
+            if result.ok:
+                self.collected()
+                return True
+            self.blocked = str(result.error or "unknown FTP failure")
+            _log.warning(
+                "U64 /Temp release drain on %s: no live client was left to drain, "
+                "and sweeping the %d uncollected attachment(s) it counted failed "
+                "(%s). No config was written. Later attachment-creating requests "
+                "to this device are refused until a sweep succeeds; enable FTP "
+                "File Service on the device or power-cycle it. See "
+                "docs/u64_recovery.md.",
+                self.host, self.pending, self.blocked,
+            )
+            return True
+
+
+class TempReservation(NamedTuple):
+    """One client's counted-but-not-yet-sent attachment reservation (#295).
+
+    Returned by ``Ultimate64Client._reserve_temp_attachments`` and handed
+    back to :meth:`TempLedger.end_reservation` when the request returns.
+    Carrying ``armed`` and ``count`` on the token (rather than re-reading
+    them at the end) keeps the in-flight accounting symmetric even if the
+    client's grade is re-probed mid-request.
+
+    ``pending_before`` is the device's count as it stood **inside the
+    ledger lock** at reservation time -- the only non-racy value to log.
+    """
+
+    generation: int
+    pending_before: int
+    armed: bool
+    count: int
+
+
+_TEMP_LEDGERS: dict[str, TempLedger] = {}
+_TEMP_LEDGERS_GUARD = threading.Lock()
+
+
+def temp_ledger_for(host: str) -> TempLedger:
+    """The process-wide ledger for *host*'s device (created on first use)."""
+    key = temp_ledger_key(host)
+    with _TEMP_LEDGERS_GUARD:
+        ledger = _TEMP_LEDGERS.get(key)
+        if ledger is None:
+            ledger = _TEMP_LEDGERS[key] = TempLedger(key)
+        return ledger
+
+
+def _reset_temp_ledgers() -> None:
+    """Forget every device's accounting (tests only).
+
+    Clients that already hold a ledger keep it; clients built afterwards
+    start from a fresh one.
+    """
+    with _TEMP_LEDGERS_GUARD:
+        _TEMP_LEDGERS.clear()
 
 
 def gc_temp_folder(

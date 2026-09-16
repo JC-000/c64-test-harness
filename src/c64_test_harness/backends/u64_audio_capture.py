@@ -344,6 +344,30 @@ class CaptureResult:
     #: about its lateness, because the next in-order packet is charged a gap
     #: back up to the stream's real position.  Residuals: see
     #: ``backends/_stream_seq.py``.
+    #:
+    #: **A silent restart can lose packets and still report the time base
+    #: intact** -- when its PCM is byte-identical to the old stream's
+    #: (digital silence), *and* a number the old stream lost falls inside
+    #: the restart's held run, *and* that number is
+    #: still inside the 1024-packet window.  That middle condition triggers
+    #: on exactly the numbers **1..8** (``MAX_HELD_DUPLICATES``), inclusive
+    #: at the top: 8 still triggers it, 9 does not, and 0 never does (#451).
+    #: The packets held for it are
+    #: then discarded as duplicates and that datagram fills the old missing
+    #: slot, un-counting its drop.  Offline loopback, n=1, no device (#443
+    #: review round 2): an old stream 0..500 that never received 5, then a
+    #: restart 0..599, keeps 1,095 of the 1,100 packets sent while
+    #: ``packets_dropped`` is 0 and :attr:`sequence_resyncs` is 1 -- and
+    #: since #410 that resync makes :attr:`time_base_intact` ``False``, so
+    #: this row loses packets and reports the damage.  The loss stays
+    #: silent only where nothing resyncs (a lost number of 5..8, measured
+    #: on the #410 merge).  A silent restart with no such
+    #: lost number keeps every packet.  Declared and accepted, not fixed;
+    #: the full residual list is in ``backends/_stream_seq.py``.  The
+    #: packets it loses are counted in :attr:`payloads_discarded`, which is
+    #: the only field that shows them.  How reachable this is on hardware
+    #: is unestablished: whether starting a stream resets the FPGA's
+    #: sequence counter is an open question (#452).
     packets_reordered: int = 0
     #: Backward steps taken as a new stream position (see
     #: :attr:`packets_reordered`).  The number of packets lost across one is
@@ -359,6 +383,36 @@ class CaptureResult:
     #: ``(start_frame, frame_count)`` of every run of fill in the capture,
     #: ascending and merged.
     filled_frame_ranges: tuple[tuple[int, int], ...] = ()
+    #: Packets whose PCM was discarded instead of written: a held run of
+    #: re-sent packets decided to be duplicates, either mid-capture or at
+    #: :meth:`AudioCapture.stop`.  ``packets_received`` equals the packets
+    #: in the WAV, less any ``packets_filled``, plus this, so the
+    #: accounting closes.  (The ``packets_filled`` term is #410's: a
+    #: filled gap puts a packet in the WAV that was never received.  It is
+    #: 0 on a capture with no loss, which is why the plain form held
+    #: before #410.)
+    #:
+    #: **Read it as an upper bound on packets of lost time, not lost
+    #: content.**  Two things land here and the tracker cannot tell them
+    #: apart while the payloads match:
+    #:
+    #: - a genuine retransmission, whose PCM is already in the WAV.  That
+    #:   discard is *correct* and costs nothing, so a non-zero count is not
+    #:   by itself a fault and this is deliberately not a gate;
+    #: - a silent counter restart's own packets (the fourth residual in
+    #:   ``backends/_stream_seq.py``), which are stream time the WAV never
+    #:   receives.  Their bytes are byte-identical to what is already
+    #:   there, so what the capture loses is **duration, not audio**.
+    #:
+    #: Both discard paths are counted.  One is a held run flushed
+    #: mid-capture when it turns out not to continue; the other is whatever
+    #: is still held at ``stop()``, which needs **no restart and no loss at
+    #: all** -- a tail of re-sent packets when the capture ends is enough,
+    #: and nothing else reports it.  Without this counter such a capture
+    #: reads clean everywhere else: #443 round 3's stream is 52 datagrams
+    #: sent, 52 received, 41 in the WAV, with ``packets_dropped`` 0,
+    #: :attr:`sequence_resyncs` 0 and :attr:`time_base_intact` ``True``.
+    payloads_discarded: int = 0
 
     @property
     def time_base_intact(self) -> bool:
@@ -579,6 +633,7 @@ class AudioCapture:
         self._packets_dropped = 0
         self._packets_reordered = 0
         self._sequence_resyncs = 0
+        self._payloads_discarded = 0
         self._last_seq: int | None = None
         self._seq = _stream_seq.SequenceTracker()
         self._fill_chunks: dict[int, int] = {}  # chunk index -> packets
@@ -597,6 +652,7 @@ class AudioCapture:
         self._packets_dropped = 0
         self._packets_reordered = 0
         self._sequence_resyncs = 0
+        self._payloads_discarded = 0
         self._last_seq = None
         self._seq = _stream_seq.SequenceTracker()
         self._fill_chunks = {}
@@ -768,6 +824,7 @@ class AudioCapture:
         self._packets_dropped = self._seq.dropped
         self._packets_reordered = self._seq.reordered
         self._sequence_resyncs = self._seq.resyncs
+        self._payloads_discarded = self._seq.discarded
         self._last_seq = self._seq.highest
 
     def stop(self, wav_path: str | Path | None = None) -> CaptureResult:
@@ -808,6 +865,8 @@ class AudioCapture:
             sequence_resyncs = self._sequence_resyncs
             nonstandard_payloads = self._nonstandard_payloads
             filled_frame_ranges = _filled_ranges(self._pcm_chunks, self._fill_chunks)
+            # After the flush above, so the still-held packets are in it.
+            payloads_discarded = self._seq.discarded
 
         # Calculate actual duration from captured data.  Timed against the
         # exact rate when the caller gave one -- with 48000 assumed, this
@@ -864,6 +923,7 @@ class AudioCapture:
             sequence_resyncs=sequence_resyncs,
             nonstandard_payloads=nonstandard_payloads,
             filled_frame_ranges=filled_frame_ranges,
+            payloads_discarded=payloads_discarded,
         )
 
     @property

@@ -456,12 +456,18 @@ class Ultimate64Client:
             self._temp_gc_budget = int(temp_gc_budget)
         else:
             self._temp_gc_budget = _leak_budget()
-        #: Attachment-creating requests issued since the last successful pass.
-        self._pending_temp_attachments = 0
-        #: Set to the reason string once hygiene is known to be impossible.
-        self._temp_hygiene_blocked: str | None = None
-        #: One attempt per client at turning FTP File Service on.
-        self._ftp_enable_attempted = False
+        from .ultimate64_temp_gc import temp_ledger_for as _temp_ledger_for
+
+        #: The device's accounting, shared by every client of this host in
+        #: the process (#295): the pending count, the refusal state and the
+        #: one FTP-enable attempt. See ``TempLedger``.
+        self._temp_ledger = _temp_ledger_for(host)
+        #: This client's own share of the device's pending count, valid only
+        #: for the ledger generation it was counted in (a successful sweep by
+        #: any client collects it).
+        self._own_temp_attachments = 0
+        self._own_temp_generation = self._temp_ledger.generation
+        self._temp_ledger.attach(self)
         #: Re-entrancy guard: the hygiene pass's own REST calls must not
         #: recurse back into the budget check.
         self._in_temp_hygiene = False
@@ -515,9 +521,14 @@ class Ultimate64Client:
         self.log_device_grading()
 
         # Drain /Temp when this device's lock is handed to the next lane.
-        # Registered weakly, so a forgotten client is collected normally.
+        # The device's ledger registers, not the client, so one release
+        # drains once however many clients this process built (#295).
+        # Registration is weak and idempotent; the ledger holds its clients
+        # weakly, so a forgotten client is collected normally.
         if _HAS_DEVICE_LOCK:
-            _register_release_callback(self.host, self, "_drain_on_lock_release")
+            _register_release_callback(
+                self.host, self._temp_ledger, "drain_on_lock_release"
+            )
 
     def close(self) -> None:
         """Release client resources.
@@ -704,19 +715,27 @@ class Ultimate64Client:
     ) -> tuple[int, bytes]:
         if method != "GET":
             self._check_device_lock(f"{method} {path}")
-        leaks = self._creates_temp_attachment(method, body)
-        if leaks:
-            self._before_temp_attachment(f"{method} {path}")
+        reservation = None
+        if self._creates_temp_attachment(method, body):
+            # Gate and count in one step under the device ledger's lock
+            # (#295), before sending. Counted whether or not the call then
+            # fails: the firmware writes the attachment as the body streams
+            # in, so a request that errors afterwards has still left one.
+            reservation = self._reserve_temp_attachments(f"{method} {path}")
         try:
             status, data = self._request_uncounted(
                 method, path, body=body, content_type=content_type, query=query
             )
         finally:
-            if leaks:
-                # Counted even when the call failed: the firmware writes
-                # the attachment as the body streams in, so a request
-                # that errors afterwards has still left one behind.
-                self._pending_temp_attachments += 1
+            if reservation is not None:
+                # The send has returned, so the attachment has landed and a
+                # sweep from here on can collect it. While it was *in
+                # flight* one could not -- which is why the ledger carries
+                # in-flight reservations across a sweep instead of zeroing
+                # them, so a sweep between this reservation and its send
+                # cannot leave the count reading 0 against a device that
+                # holds one.
+                self._end_temp_reservation(reservation, sent=reservation.count)
         # Reaching here means the device answered, which is the evidence a
         # construct-time probe failure could not supply. Only the fact is
         # recorded here, not the re-probe: firing a GET from inside every
@@ -733,36 +752,31 @@ class Ultimate64Client:
         The firmware's route table is the authority, and it is unambiguous:
         a route either binds ``&attachment_writer`` (which streams the
         request body into a managed ``/Temp`` temp file) or binds ``NULL``
-        (the body is ditched). Every ``POST`` route in
-        ``software/api/route_*.cc`` binds a writer —
-        ``configs``, ``drives:mount``, ``drives:load_rom``,
-        ``machine:writemem``, ``runners:{run_prg,load_prg,run_crt,sidplay}``
-        — and **every** ``PUT`` route binds ``NULL``, which is why
+        (the body is ditched). Read at tag ``1.1.0`` (``7b628eb1``, the
+        C64U's firmware) in ``software/api/route_*.cc``: the upload
+        ``POST`` routes bind ``&attachment_writer`` --
+        ``route_configs.cc:251`` (``configs``), ``route_drives.cc:78``
+        (``drives:mount``), ``route_drives.cc:149`` (``drives:load_rom``),
+        ``route_machine.cc:125`` (``machine:writemem``) and
+        ``route_runners.cc:24`` / ``:60`` / ``:68`` / ``:91`` (``sidplay``,
+        ``load_prg``, ``run_prg``, ``run_crt``) -- while
+        ``route_runners.cc:125`` (``modplay``) binds ``&attachment_reu``,
+        and **every** ``PUT`` route binds ``NULL``, which is why
         ``PUT machine:writemem?data=<hex>`` and the config PUTs are free.
+        The 3.15 line pairs verbs and handlers the same way.
 
         So the rule is: a body plus ``POST``. That covers every current
-        caller and anything added later, by construction.
+        caller and anything added later, by construction.  The route table
+        establishes only that such a request *creates* an attachment; that
+        accumulated attachments crash the firmware is the owner's account
+        (CLAUDE.md), not something this citation shows.
 
-        Two deliberate conservatisms:
-
-        * ``POST runners:modplay`` binds ``&attachment_reu`` (the body
-          goes to the REU, not to ``/Temp``) and ``POST machine:input``
-          binds ``&input_json_writer``. Both are counted anyway — the
-          cost is an occasional extra hygiene pass, and neither handler
-          has been read closely enough here to certify it never touches
-          ``/Temp``.
-        * The route table read is a 3.15-line checkout. The C64U's 1.1.0
-          table is not available, so this assumes the verb/handler
-          pairing is the same there. Counting POST-with-body only is the
-          **permissive** side of that assumption, not the conservative
-          one: a PUT that *did* attach on 1.1.0 is never counted, so it
-          never advances ``_pending_temp_attachments``, the budget
-          comparison in :meth:`_before_temp_attachment` is never reached,
-          the hygiene pass never fires
-          and ``pending_temp_attachments`` reads zero while the device
-          accumulates. That is the gap to close, not the margin to rely
-          on, and one live run on a 1.1.0 device closes it. The genuinely
-          conservative half is the over-counting in the bullet above.
+        One deliberate conservatism: ``POST runners:modplay``
+        (``&attachment_reu`` -- the body goes to the REU, not to ``/Temp``)
+        and, on the 3.15 line, ``POST machine:input``
+        (``&input_json_writer``) are counted anyway.  The cost is an
+        occasional extra hygiene pass, and neither handler has been read
+        closely enough here to certify it never touches ``/Temp``.
         """
         return body is not None and method == "POST"
 
@@ -941,8 +955,106 @@ class Ultimate64Client:
 
     @property
     def pending_temp_attachments(self) -> int:
-        """Attachments this client has created since the last successful pass."""
-        return self._pending_temp_attachments
+        """Attachments counted on this client's **device** since the last
+        successful sweep, by any client of that host in this process (#295).
+
+        Not this client's own share, and not other processes' uploads.
+        """
+        return self._temp_ledger.pending
+
+    # The device ledger (#295) backs what used to be instance state; these
+    # keep the old attribute names working for callers and tests.
+    @property
+    def _pending_temp_attachments(self) -> int:
+        return self._temp_ledger.pending
+
+    @property
+    def _temp_hygiene_blocked(self) -> str | None:
+        return self._temp_ledger.blocked
+
+    @_temp_hygiene_blocked.setter
+    def _temp_hygiene_blocked(self, value: str | None) -> None:
+        self._temp_ledger.blocked = value
+
+    @property
+    def _ftp_enable_attempted(self) -> bool:
+        return self._temp_ledger.ftp_enable_attempted
+
+    @_ftp_enable_attempted.setter
+    def _ftp_enable_attempted(self, value: bool) -> None:
+        self._temp_ledger.ftp_enable_attempted = value
+
+    def _own_pending_temp_attachments(self) -> int:
+        """This client's attachments not yet collected by any sweep."""
+        ledger = self._temp_ledger
+        with ledger.lock:
+            if self._own_temp_generation != ledger.generation:
+                return 0
+            return self._own_temp_attachments
+
+    def _count_temp_attachments(self, count: int, armed: bool | None = None) -> None:
+        """Add *count* to this client's share and the device's count.
+
+        *armed* lets a caller reuse the arming decision it already made under
+        the ledger lock, so a re-probe mid-request cannot make the in-flight
+        accounting asymmetric.
+        """
+        ledger = self._temp_ledger
+        with ledger.lock:
+            if self._own_temp_generation != ledger.generation:
+                self._own_temp_generation = ledger.generation
+                self._own_temp_attachments = 0
+            self._own_temp_attachments += count
+            ledger.pending += count
+            if self.temp_hygiene_armed if armed is None else armed:
+                # So the ledger can still sweep these if every client that
+                # counted them is collected before the lock release.
+                ledger.armed_pending = True
+
+    def _end_temp_reservation(self, reservation, sent: int) -> None:
+        """The request has returned: end *reservation* and refund the unsent part.
+
+        The device's ledger refunds whatever of the reservation never went
+        out (correct even if a sweep intervened -- ``collected()`` carried
+        the reservation into the new generation), and this client takes the
+        same refund off its own share, so a probe that sent nothing does not
+        leave the client looking as though it leaked. That matters beyond the
+        count: the own share is what decides whether a client may make the
+        FTP-enable config write (#263).
+        """
+        ledger = self._temp_ledger
+        with ledger.lock:
+            unsent = ledger.end_reservation(reservation, sent=sent)
+            if unsent and self._own_temp_generation == reservation.generation:
+                self._own_temp_attachments = max(
+                    0, self._own_temp_attachments - unsent
+                )
+
+    def _reserve_temp_attachments(self, operation: str, count: int = 1):
+        """Gate, then count, *count* attachments as one step on the device.
+
+        Holding the ledger lock across both is what keeps two clients (or two
+        threads) from each passing the budget check and then both counting.
+        The reservation is also marked **in flight** until the caller ends it
+        with :meth:`_end_temp_reservation`, so a sweep that runs while the
+        request is still being sent cannot zero a count the attachment is
+        about to land into.
+
+        :returns: a
+            :class:`~c64_test_harness.backends.ultimate64_temp_gc.TempReservation`
+            to hand back to :meth:`_end_temp_reservation`.
+        :raises Ultimate64TempHygieneError: see :meth:`_before_temp_attachment`.
+        """
+        from .ultimate64_temp_gc import TempReservation as _TempReservation
+
+        ledger = self._temp_ledger
+        with ledger.lock:
+            self._before_temp_attachment(operation, count)
+            pending_before = ledger.pending
+            armed = self.temp_hygiene_armed
+            self._count_temp_attachments(count, armed=armed)
+            ledger.begin_reservation(count, armed=armed)
+            return _TempReservation(ledger.generation, pending_before, armed, count)
 
     def _before_temp_attachment(self, operation: str, count: int = 1) -> None:
         """Refuse or make room before *count* attachment-creating requests.
@@ -973,7 +1085,9 @@ class Ultimate64Client:
         if self._temp_hygiene_blocked is not None:
             self._refuse_or_warn(operation)
             return
-        pending = self._pending_temp_attachments
+        # The device's count, not this client's (#295). Callers hold the
+        # ledger lock: go through _reserve_temp_attachments.
+        pending = self._temp_ledger.pending
         if pending > 0 and pending + count > self._temp_gc_budget:
             self._run_temp_hygiene(
                 f"budget of {self._temp_gc_budget} attachment(s) spent before {operation}"
@@ -1009,8 +1123,9 @@ class Ultimate64Client:
     def _run_temp_hygiene(self, reason: str) -> bool:
         """Run one hygiene pass; ``True`` if ``/Temp`` was collected.
 
-        Never raises. On failure it makes exactly one attempt, per client,
-        at enabling the device's FTP File Service (off by default on C64U
+        Never raises. On failure it makes exactly one attempt per device per
+        process (the ledger's ``ftp_enable_attempted``, #295) at enabling
+        the device's FTP File Service (off by default on C64U
         1.1.0, which is the one device that needs this pass) and retries.
         The enable is a bodyless config PUT — it creates no attachment of
         its own — and is runtime-only: it lives in firmware RAM until
@@ -1022,22 +1137,36 @@ class Ultimate64Client:
         ``BASELINE_NEVER_TOUCH`` is ``apply_factory_baseline``'s contract --
         the entry-baseline reset never resets or asserts those stores -- and
         says nothing about this pass, which may write exactly one item,
-        ``Network Settings > FTP File Service``, once per client, only for a
-        client that leaked (both callers require pending attachments) and
-        only after its sweep failed.  A client that leaked nothing never
-        reaches it: :meth:`_sweep_inherited_temp` writes no config.
+        ``Network Settings > FTP File Service``, once per device per process,
+        only for a client holding an uncollected leak **of its own**
+        (``_own_pending_temp_attachments() > 0``) and only after its sweep
+        failed.  A client that leaked nothing never writes config by either
+        route: :meth:`_sweep_inherited_temp` writes none on the drain path,
+        and the gate above withholds it on the budget path, which a client
+        whose own share is zero can reach because the budget counts the
+        *device* (#295).
         """
         self._in_temp_hygiene = True
         try:
             _log.debug("U64 /Temp hygiene on %s: %s", self.host, reason)
             result = self.gc_temp_folder()
             if getattr(result, "ok", False):
-                self._pending_temp_attachments = 0
-                self._temp_hygiene_blocked = None
+                # Only a successful sweep zeroes the device's count (#295).
+                self._temp_ledger.collected()
                 return True
 
             first_error = getattr(result, "error", None)
-            if not self._ftp_enable_attempted:
+            # Only a client holding an uncollected leak of its own may make
+            # this config write (#263). The budget gate fires on the
+            # *device's* count (#295), so a client whose own share is zero
+            # can reach this pass having leaked nothing -- for example when
+            # another client, or a temp_hygiene=False one, spent the budget.
+            # Such a client still sweeps, and still blocks the device on
+            # failure; it just writes no config.
+            if (
+                not self._ftp_enable_attempted
+                and self._own_pending_temp_attachments() > 0
+            ):
                 self._ftp_enable_attempted = True
                 # WARNING, not INFO: this mutates the device's config and
                 # the change persists until a firmware power-on (it lives
@@ -1064,8 +1193,7 @@ class Ultimate64Client:
                 else:
                     result = self.gc_temp_folder()
                     if getattr(result, "ok", False):
-                        self._pending_temp_attachments = 0
-                        self._temp_hygiene_blocked = None
+                        self._temp_ledger.collected()
                         return True
 
             self._temp_hygiene_blocked = str(
@@ -1075,14 +1203,16 @@ class Ultimate64Client:
         finally:
             self._in_temp_hygiene = False
 
-    def _drain_on_lock_release(self, reason: str = "device lock release") -> None:
-        """Release-callback entry point (``device_lock.register_release_callback``).
+    def _drain_on_lock_release(self, reason: str = "device lock release") -> bool:
+        """Lock-release drain for this client; ``True`` if it attempted a sweep.
 
-        ``DeviceLock.release`` fires callbacks only on the outermost release
-        and while the flock is still held, so this drain runs under the lock
-        by construction.
+        Called by the device's ``TempLedger.drain_on_lock_release``, which is
+        what is registered with ``device_lock.register_release_callback``
+        (one registration per host, #295). ``DeviceLock.release`` fires
+        callbacks only on the outermost release and while the flock is still
+        held, so this drain runs under the lock by construction.
         """
-        self._drain_temp_attachments(reason=reason, under_lock=True)
+        return self._drain_temp_attachments(reason=reason, under_lock=True)
 
     def _holds_device_lock(self) -> bool:
         """Whether this process holds this device's ``DeviceLock`` (no I/O).
@@ -1106,8 +1236,13 @@ class Ultimate64Client:
 
     def _drain_temp_attachments(
         self, reason: str = "drain", *, under_lock: bool = False
-    ) -> None:
+    ) -> bool:
         """Sweep the device's ``/Temp`` on the way out. Never raises.
+
+        Returns ``True`` if a hygiene pass or inherited sweep was attempted,
+        so the device ledger's release drain can stop after one (#295).
+        "Leaked" below is this client's own share of the device's count, not
+        yet collected by any client's sweep.
 
         Two cases, and they are deliberately not treated alike:
 
@@ -1133,33 +1268,39 @@ class Ultimate64Client:
         stays disarmed), not the counter.
         """
         try:
-            leaked = self._pending_temp_attachments > 0
-            if leaked:
-                # Something leaked, so a device is demonstrably there:
-                # settle the grade before deciding not to clean up after
-                # it. Deliberately not done on a zero count -- that would
-                # put a /v1/info GET into close() for every client that
-                # ever completed a request, fake hosts included.
-                self._maybe_reprobe_capabilities()
-            if not self.temp_hygiene_armed:
-                return
-            if leaked:
-                self._run_temp_hygiene(reason)
-                return
-            if not (under_lock or self._holds_device_lock()):
-                _log.debug(
-                    "U64 /Temp drain on %s (%s): this client leaked nothing and "
-                    "does not hold the device lock; not sweeping other lanes' "
-                    "attachments",
-                    self.host, reason,
-                )
-                return
-            self._sweep_inherited_temp(reason)
+            with self._temp_ledger.lock:
+                # This client's own uncollected share: whether it may take
+                # the leaking-lane path (the FTP-enable attempt, the block on
+                # failure) is still decided by what *it* did (#263, #264).
+                leaked = self._own_pending_temp_attachments() > 0
+                if leaked:
+                    # Something leaked, so a device is demonstrably there:
+                    # settle the grade before deciding not to clean up after
+                    # it. Deliberately not done on a zero count -- that would
+                    # put a /v1/info GET into close() for every client that
+                    # ever completed a request, fake hosts included.
+                    self._maybe_reprobe_capabilities()
+                if not self.temp_hygiene_armed:
+                    return False
+                if leaked:
+                    self._run_temp_hygiene(reason)
+                    return True
+                if not (under_lock or self._holds_device_lock()):
+                    _log.debug(
+                        "U64 /Temp drain on %s (%s): this client leaked nothing and "
+                        "does not hold the device lock; not sweeping other lanes' "
+                        "attachments",
+                        self.host, reason,
+                    )
+                    return False
+                self._sweep_inherited_temp(reason)
+                return True
         except Exception as exc:  # noqa: BLE001 - a drain must never fail a run
             _log.debug(
                 "U64 /Temp drain on %s raised (%s: %s); ignored",
                 self.host, type(exc).__name__, exc,
             )
+            return False
 
     def _sweep_inherited_temp(self, reason: str) -> None:
         """Best-effort sweep for attachments this client did not create.
@@ -1174,6 +1315,10 @@ class Ultimate64Client:
         finally:
             self._in_temp_hygiene = False
         if getattr(result, "ok", False):
+            # The sweep is device-wide, so it collected every client's
+            # attachments, and FTP answered: clear the device's count and
+            # any block another client's failed pass left (#295).
+            self._temp_ledger.collected()
             return
         _log.warning(
             "U64 /Temp inherited sweep on %s failed (%s). This client leaked "
@@ -1295,16 +1440,19 @@ class Ultimate64Client:
         from . import ultimate64_probe as _probe
 
         cost = self.LIVENESS_PROBE_TEMP_ATTACHMENTS
-        self._before_temp_attachment(
+        # The whole cost is gated and counted up front against the device's
+        # count (#295); whatever the probe does not send is refunded below.
+        reservation = self._reserve_temp_attachments(
             f"liveness_probe ({cost} x POST /v1/machine:writemem)", count=cost
         )
-        if self.temp_hygiene_armed:
+        if reservation.armed:
             _log.info(
                 "liveness_probe on %s spends %d /Temp attachments on this "
                 "firmware (%d of %d already pending)",
-                self.host, cost, self._pending_temp_attachments,
+                self.host, cost, reservation.pending_before,
                 self._temp_gc_budget,
             )
+        sent = [0]
 
         def _accounted(method, host, port, path, password, timeout, **kwargs):
             # The probe keeps its own raw sender and failure classification;
@@ -1319,17 +1467,24 @@ class Ultimate64Client:
                 )
             finally:
                 if leaks:
-                    self._pending_temp_attachments += 1
+                    sent[0] += 1
             self._saw_successful_request = True
             return result
 
-        return _probe.liveness_probe(
-            self.host,
-            port=self.port,
-            password=self.password,
-            http_timeout=http_timeout,
-            request=_accounted,
-        )
+        try:
+            return _probe.liveness_probe(
+                self.host,
+                port=self.port,
+                password=self.password,
+                http_timeout=http_timeout,
+                request=_accounted,
+            )
+        finally:
+            if sent[0] > cost:
+                self._count_temp_attachments(
+                    sent[0] - cost, armed=reservation.armed
+                )
+            self._end_temp_reservation(reservation, sent=min(sent[0], cost))
 
     def assert_healthy(self, http_timeout: float = 2.0) -> "LivenessResult":
         """Run :meth:`liveness_probe` and raise on failure.
@@ -1649,7 +1804,10 @@ class Ultimate64Client:
 
         What it does to the REU and the Command Interface slot, read from
         firmware source at tag ``1.1.0`` (the C64U; the same shape at
-        ``7f6fcb51``, the U64E's v3.15-85) and **unmeasured** on a device:
+        ``7f6fcb51``, the U64E's v3.15-85). The Command Interface half is
+        measured on the U64E (bce4535e, Cartridge Preference Auto, #270);
+        the REU half, the External and ``.crt`` cases and the C64U are
+        **unmeasured**:
         ``start_cartridge`` first zeroes ``C64_CARTRIDGE_TYPE``,
         ``C64_REU_ENABLE``, ``C64_SAMPLER_ENABLE`` and
         ``CMD_IF_SLOT_ENABLE`` (``c64.cc:913``), then, when no external
@@ -1671,8 +1829,12 @@ class Ultimate64Client:
         Line numbers are for ``1.1.0``; ``docs/uci_networking.md`` carries
         the ``7f6fcb51`` equivalents and the full trace. The recorded
         observation that ``enable_uci`` needs a ``reset()`` and a ~3 s
-        settle before routines answer still stands, but this path does not
-        explain it and its cause is open. An earlier revision of this
+        settle before routines answer was not reproduced on the U64E (fw
+        3.15, bce4535e, 2026-09-15, #270): with Cartridge Preference Auto,
+        ``$DF1D`` read ``$C9`` at +0 and ``uci_probe``, run at +3 s, completed
+        with no reset, and after ``reboot()`` + 5 s, 4/4 per arm (arms
+        interleaved). Why the earlier runs timed out is open (#422). An
+        earlier revision of this
         docstring gave the unconditional version as that cause (issue
         #299).
 
@@ -2434,23 +2596,74 @@ class Ultimate64Client:
         """Load a custom ROM into a drive slot (DESTRUCTIVE).
 
         If *rom_path_or_data* is a ``bytes``-like object, the ROM is uploaded
-        as a multipart body via PUT /v1/drives/<drive>:load_rom (mirrors the
-        ``mount_disk`` shape).  If it is a ``str``, it is treated as a
+        as a single-part multipart body via **POST**
+        /v1/drives/<drive>:load_rom.  If it is a ``str``, it is treated as a
         filename on the device's filesystem and passed via PUT
-        /v1/drives/<drive>:load_rom?file=<path>.
+        /v1/drives/<drive>:load_rom?file=<path>, with no body.
+
+        **POST for the upload, not PUT** (#253).  The firmware registers two
+        routes on this path: ``PUT`` binds ``NULL`` as its body handler and
+        requires a ``file`` query naming a ROM already on the device, while
+        ``POST`` binds ``&attachment_writer`` and loads
+        ``get_filename(0)`` -- the first multipart part, which is why the
+        body carries the file part and nothing else
+        (``software/api/route_drives.cc:290`` vs ``:312`` at bce4535e).
+        This used to PUT the body, which the route rejects.  Measured on
+        the U64E (fw 3.15, bce4535e, 2026-09-15, n=3 per arm, an empty ROM
+        part so nothing was loaded): the body-carrying PUT answered HTTP
+        400, the POST answered 412 "Drive ROM is invalid" -- the body
+        reached the ROM loader.  A successful load of a real ROM was not
+        measured, and the C64U is source-read only.
+
+        **The upload costs one managed ``/Temp`` attachment** on leak-prone
+        firmware, counted by the request choke point like every
+        body-carrying POST; the ``str`` form costs nothing.  **The part
+        carries no ``filename=``** (#417 review).  Source-read at tag 1.1.0
+        (the C64U), not measured: ``attachment_writer.h`` ``collect()``
+        creates every part as ``/Temp/temp%04x`` and renames it to
+        ``/Temp/<filename>`` only when ``filename=`` is present, and
+        ``gc_temp_folder``'s ``^temp[0-9a-fA-F]+$`` never collects the
+        renamed file -- the upload would be counted, the sweep would
+        "succeed", and the file would stay.  Unnamed, it keeps the managed
+        ``temp%04x`` name; deleting it later is harmless because
+        ``load_file`` copies the ROM into drive memory and closes the file.
+        (The U64E's bce4535e names uploads differently, via
+        ``create_temp_file("upload", ...)``, so this naming concern is a
+        1.1.0-line one.)  Measured on the U64E (fw 3.15, bce4535e,
+        2026-09-15, named vs unnamed empty part interleaved, n=3 per arm):
+        both answered 412 "Drive ROM is invalid" with drive ``a`` still on
+        ``1541.rom``, so the route accepts the unnamed part; the resulting
+        file name was not observed.
+
+        **Only 16384- or 32768-byte ROMs are sent** (#417 review).
+        ``C1541::load_dos_from_file`` (``software/drive/c1541.cc``, read at
+        bce4535e) resets the drive whenever it transferred any bytes and
+        only *then* checks the size, so a wrong-size upload leaves the
+        drive running a partial ROM and answers 412 -- and on leak-prone
+        firmware still costs the attachment.  Any other length raises
+        :class:`ValueError` before a request is made.
         """
         path = self._drive_slot_path(drive, "load_rom")
         if isinstance(rom_path_or_data, (bytes, bytearray)):
+            if len(rom_path_or_data) not in _DRIVE_ROM_SIZES:
+                raise ValueError(
+                    f"drive ROM must be {' or '.join(map(str, _DRIVE_ROM_SIZES))} bytes, "
+                    f"got {len(rom_path_or_data)}: the firmware resets the drive "
+                    f"before checking the size, so a wrong-size ROM half-loads"
+                )
             boundary = "----U64ClientBoundary" + uuid.uuid4().hex
             body = _build_multipart(
                 boundary,
                 fields={},
                 file_field="file",
-                file_name="drive.rom",
+                # No filename=: the upload keeps the GC-collectable temp%04x
+                # name (#417 review).  load_file copies the ROM into drive
+                # memory and closes the file, so a later sweep is harmless.
+                file_name=None,
                 file_bytes=bytes(rom_path_or_data),
             )
             self._request(
-                "PUT",
+                "POST",
                 path,
                 body=body,
                 content_type=f"multipart/form-data; boundary={boundary}",
@@ -2690,17 +2903,29 @@ class Ultimate64Client:
         return [str(n) for n in names]
 
 
+#: The two drive ROM lengths ``C1541::load_dos_from_file`` accepts (a 16 KiB
+#: ROM is mirrored to 32 KiB).  Anything else half-loads after a drive reset
+#: (#417 review).
+_DRIVE_ROM_SIZES = (16384, 32768)
+
+
 def _build_multipart(
     boundary: str,
     *,
     fields: dict[str, str],
     file_field: str,
-    file_name: str,
+    file_name: str | None,
     file_bytes: bytes,
 ) -> bytes:
     """Build an RFC 2388 multipart/form-data body.
 
     Order: simple fields first, file last. Line endings are CRLF.
+
+    ``file_name=None`` omits the ``filename=`` attribute from the file
+    part's ``Content-Disposition``.  The firmware's attachment writer then
+    keeps the managed ``temp%04x`` name instead of renaming the upload to
+    ``/Temp/<filename>`` (``attachment_writer.h`` ``collect()``), which is
+    the only name ``gc_temp_folder`` collects (#417 review).
     """
     crlf = b"\r\n"
     out = bytearray()
@@ -2711,11 +2936,10 @@ def _build_multipart(
         out += crlf
         out += value.encode("utf-8") + crlf
     out += b"--" + b + crlf
-    out += (
-        f'Content-Disposition: form-data; name="{file_field}"; filename="{file_name}"'
-        .encode("utf-8")
-        + crlf
-    )
+    disposition = f'Content-Disposition: form-data; name="{file_field}"'
+    if file_name is not None:
+        disposition += f'; filename="{file_name}"'
+    out += disposition.encode("utf-8") + crlf
     out += b"Content-Type: application/octet-stream" + crlf
     out += crlf
     out += file_bytes + crlf

@@ -55,12 +55,12 @@ Gates (all unset -> the module skips cleanly):
   its IP is read from ``ifconfig`` (macOS) or ``ip`` (Linux).
 
 Needs a capture node the process can open.  Sets ``Cartridge
-Preference = External`` and restores it.  Never: ``save_config_to_flash``,
+Preference = External`` and restores it to the ``default`` the device
+reports, never the value read at entry (#412).  Never: ``save_config_to_flash``,
 ``poweroff``, ``reboot``.
 """
 from __future__ import annotations
 
-import functools
 import os
 import platform
 import re
@@ -89,7 +89,12 @@ from c64_test_harness.ethernet import parse_mac
 from c64_test_harness.execute import load_code, run_subroutine
 from c64_test_harness.memory import read_bytes, write_bytes
 from c64_test_harness.screen import wait_for_text
-from live_fixture_teardown import attempt_steps, raise_teardown_failures
+from live_fixture_teardown import (
+    attempt_steps,
+    raise_teardown_failures,
+    read_restore_defaults,
+    restore_default_steps,
+)
 
 _LIVE = os.environ.get("RRNET_LIVE")
 _HOST = os.environ.get("U64_HOST")
@@ -166,9 +171,12 @@ def session():
         with mgr.instance() as target:
             t = target.transport
             client = t.client
-            orig = client.get_config_value(CAT, ITEM)
+            plan: list = []
             failures: list = []
             try:
+                # The device's default, read before the External PUT: an entry
+                # value can be a killed RR-Net lane's External (#412, #334).
+                plan = read_restore_defaults(client, {CAT: [ITEM]})
                 client.set_config_item(CAT, ITEM, "External")
                 time.sleep(0.5)
                 t.reset()
@@ -188,8 +196,7 @@ def session():
                 # preference unrestored (#391).
                 failures = attempt_steps([
                     ("cap.close()", cap.close),
-                    (f"restore {CAT} / {ITEM} = {orig!r}",
-                     functools.partial(client.set_config_item, CAT, ITEM, orig)),
+                    *restore_default_steps(client, plan),
                 ])
             raise_teardown_failures("session teardown", failures)
 

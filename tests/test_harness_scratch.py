@@ -245,10 +245,13 @@ class TestBoundsMatchCode:
 
 
 # ---------------------------------------------------------------------------
-# Transient flag — only the two save-and-write-back spans may carry it
+# Transient flag — only the known save-and-write-back spans may carry it
 # ---------------------------------------------------------------------------
 
 _TRANSIENT_OWNERS = (
+    # #241: probe_u64(check_write=True) round-trips 8 bytes at $0334 and
+    # writes them back.
+    "backends.ultimate64_probe.probe_u64",
     "backends.ultimate64_probe.liveness_probe",
     "snapshot.extract_reu_contents",
 )
@@ -273,16 +276,17 @@ class TestTransientFlag:
         for r in entries:
             assert r.transient is False, r
 
-    def test_only_the_two_known_owners_are_transient(self) -> None:
+    def test_only_the_known_owners_are_transient(self) -> None:
         transient_owners = sorted({r.owner for r in HARNESS_SCRATCH if r.transient})
         assert transient_owners == sorted(_TRANSIENT_OWNERS)
 
     def test_transient_entries_pinned_by_span(self) -> None:
         # Owner-set pinning alone misses a second transient entry under a
         # known owner at a new start.  Pin the exact (start, end-exclusive)
-        # spans: liveness probe $0334-$03B3 and REU staging $0800-$87FF.
+        # spans: probe_u64 write check $0334-$033B (#241), liveness probe
+        # $0334-$03B3 and REU staging $0800-$87FF.
         spans = sorted((r.start, r.end) for r in HARNESS_SCRATCH if r.transient)
-        assert spans == [(0x0334, 0x03B4), (0x0800, 0x8800)]
+        assert spans == [(0x0334, 0x033C), (0x0334, 0x03B4), (0x0800, 0x8800)]
 
     def test_every_start_in_the_list_is_covered_by_this_test(self) -> None:
         starts = sorted({r.start for r in HARNESS_SCRATCH if not r.transient})

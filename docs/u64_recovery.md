@@ -259,9 +259,10 @@ That touches paths with live timing constraints (the ip65 "≥ 0.2 s after
 a C64U. A direct `client.write_mem` call is not covered and still POSTs
 above the threshold.
 
-**Cadence.** A per-client budget of
+**Cadence.** A per-device budget of
 `ultimate64_temp_gc.DEFAULT_LEAK_BUDGET` = **6** attachment-creating
-calls, then the pass runs before the call that would overrun it, and a
+calls, counted across every client of that host in the process (issue
+#295). The pass runs before the call that would overrun it, and only a
 successful pass resets the count.
 
 Why 6. Upstream is the only firm bound: the firmware's
@@ -351,10 +352,70 @@ device to the next one clean. The two drain cases differ:
   still hold an earlier lane's attachments and that FTP File Service must
   be enabled by hand, or the device power-cycled, before uploading.
 
-The budget itself is still per client instance — two clients against one
-device spend six each (issue #295). `machine:reboot` does **not** reset the
-count: it is a C64-level reset, and `/Temp` is a firmware RAM disk
-(`software/filesystem/ramdisk.cc`) that only a firmware power-on clears.
+**The budget is per device, within one process** (issue #295). The count,
+the refusal state and the one FTP-enable attempt live in a process-wide
+`TempLedger` (`ultimate64_temp_gc.py`), keyed by the normalised host.
+Normalising folds together case, scheme, a trailing dot and the
+spellings of one IP address. It does **not** fold a name with its
+address, because that needs DNS; use one spelling per device. A
+**non-default port is kept**: only `:80` folds (`DEFAULT_REST_PORT`, the
+client's own default), because `host:80` and `host` name one device while
+`gw:8080` and `gw:8081` do not — `DeviceLock` keys those apart, so a
+ledger that merged them would let a failed pass against one refuse
+requests to the other. So:
+
+- a fresh client per upload no longer resets the budget;
+- two clients of one device spend one budget between them;
+- a lock release drains **once per host**, however many clients were built.
+  The ledger is what registers the release callback, and it picks one
+  client to drain: armed with a leak of its own first, then armed.
+- A leaking client whose pass fails blocks attachment-creating calls on
+  **every** armed client of that device, until any client's sweep succeeds.
+  Bodyless calls, `temp_hygiene=False` clients and `U64_TEMP_GC_REQUIRED=0`
+  are not blocked.
+- Whether a client may take the leaking-lane path (the FTP-enable attempt)
+  is decided by that client's own uncollected share, on **both** routes
+  into the pass. **A client that leaked nothing never writes config** —
+  not on the drain, where the inherited sweep writes none, and not on the
+  budget path either, which a client whose own share is zero can reach
+  precisely because the budget counts the *device*: another client's
+  attachments, or a `temp_hygiene=False` client's, can be what crosses it.
+  Such a client still sweeps, and still blocks the device if its sweep
+  fails; it just makes no `Network Settings` write.
+- **A counted attachment is in flight until its request returns.** The
+  count happens before the send, so that the budget check and the count
+  are one atomic step, which leaves a window where a sweep could otherwise
+  zero a count the attachment is about to land into. A successful sweep
+  therefore resets the count to the still-in-flight reservations rather
+  than to zero, and whatever a reservation never sent is refunded when it
+  ends. **The carry is approximate in one direction, and deliberately so:**
+  if a sweep lands after the attachment has been written but before the
+  reservation ends, `collected()` carries a reservation whose attachment
+  that sweep already collected, and the count reads one higher than the
+  device holds. That is the conservative direction — the cost is an extra
+  hygiene pass nobody needed, never an uncounted attachment — but it means
+  `pending_temp_attachments` is an **upper bound** on what the device
+  holds, not a reading of the device. Do not treat it as device truth; the
+  FTP listing is the only thing that is.
+- **A leak outlives its client.** Release callbacks hold nothing strongly,
+  so before the ledger a client that leaked and was garbage-collected
+  before the lock release never drained. The ledger outlives its clients:
+  if no live client attempts a drain, but armed clients counted
+  attachments that are still pending, the ledger sweeps the device itself
+  with the default FTP settings.
+  - On failure it writes no config, logs a WARNING and blocks later
+    attachment-creating requests until a sweep succeeds.
+  - Attachments counted only by disarmed or post-safe clients are never
+    swept this way.
+
+**Cross-process accounting is still open.** Two processes against one
+device keep two ledgers, and each spends a budget. The hand-off between
+processes is covered only by the lock-release drain, which sweeps while the
+releasing process still holds the device's lock.
+
+`machine:reboot` does **not** reset the count: it is a C64-level reset, and
+`/Temp` is a firmware RAM disk (`software/filesystem/ramdisk.cc`) that only
+a firmware power-on clears.
 
 **A `run_prg` that takes the 404 fallback costs two attachments**, not
 one — on the reading that the firmware writes an attachment for the
@@ -546,16 +607,20 @@ primitive that clears this state.
 The recommended order is cheapest-to-most-targeted: REST first (Tier 1
 will mask any other layer), runner second, UCI last.
 
-Start from the right instrument. **`probe_u64()` cannot see a dead write
-path**: it is an ICMP ping, a TCP connect and `GET /v1/version`, all
+Start from the right instrument. **`probe_u64()` on its defaults cannot see
+a dead write path**: it is an ICMP ping, a TCP connect and `GET /v1/version`, all
 read-only, so a device that answers every GET while rejecting memory
 writes reports `reachable=True`, `api_ok=True`, `error=None` — exactly
 the Tier-1 shape above
 ([#241](https://github.com/JC-000/c64-test-harness/issues/241)).
-`liveness_probe()` is the one that exercises a write, which is also why
+`probe_u64(..., check_write=True)` adds a write round trip: 8 bytes at
+`$0334` are read, overwritten with their inverse by a query-string
+`PUT writemem`, read back and restored, and the verdict is `write_ok`. It
+carries no body, so it costs no `/Temp` attachment on any firmware. But it
+exercises the PUT path only. A device whose POST `writemem` alone is
+degraded can still pass it; the #241 report had `PUT ?data=` answering
+200. `liveness_probe()` is the one that exercises POST, which is also why
 it costs two `/Temp` attachments on leak-prone firmware (see Tier 1).
-Those are the two halves of the same trade: the free check is blind to
-this failure, and the check that sees it is the expensive one.
 
 ```python
 from c64_test_harness import Ultimate64Client, liveness_probe, uci_wedge_probe
