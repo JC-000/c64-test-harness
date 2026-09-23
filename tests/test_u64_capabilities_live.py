@@ -174,14 +174,15 @@ class TestSocketReadCeiling:
             )
         return Ultimate64Transport(host=_HOST or "", client=client)
 
-    @pytest.mark.parametrize("size", [100, 253, 894, NET_MAX_SOCKET_READ])
+    @pytest.mark.parametrize("size", [100, 253, 895, NET_MAX_SOCKET_READ])
     def test_read_socket_accepts_a_length_above_one_block(
         self, uci: Ultimate64Transport, size: int
     ) -> None:
         """A datagram of *size* comes back whole through ``uci_socket_read``.
 
         100 and 253 take the single-block routine (the regression control);
-        894 is one byte into a continuation block and 1472 two blocks
+        895 is two bytes into a continuation block (894 is refused locally
+        on a 3.15 grade, which cannot show #802) and 1472 two blocks
         (893 + 579).  Assumes a 1500-byte MTU on every hop between host and
         device (1472 is the largest unfragmented IPv4 UDP payload), and a C64
         at 1 MHz with Turbo Control Off -- the bench baseline -- since the

@@ -370,6 +370,7 @@ def test_a_short_reply_raises_with_the_bytes_that_arrived(turbo: bool) -> None:
     import c64_test_harness as root
 
     assert root.UCISocketReadTruncatedError is UCISocketReadTruncatedError
+    assert root.UCISocketNotOwnedError is u.UCISocketNotOwnedError
 
 
 @pytest.mark.parametrize("turbo", PATHS, ids=["plain", "turbo"])
@@ -396,6 +397,32 @@ def test_above_893_is_refused_unless_the_device_grades_3_15(caps) -> None:
     with pytest.raises(ValueError, match="893"):
         uci_socket_read(t, 5, max_len=894)
     assert t.writes == [], "refused after touching the device"
+
+
+#: A 3.15 build a probe showed carries #802 (the U64E's bce4535e does).
+U64E_802 = DeviceCapabilities.from_info(
+    {"firmware_version": "3.15", "product": "Ultimate 64"},
+    overrides={"uci_socket_read_multiblock": True},
+)
+
+
+def test_894_is_refused_on_a_3_15_grade_that_may_lack_802() -> None:
+    """Safety (#479 round 3): #802 (c0fd6d70) is post-tag, so stock v3.15
+    still takes 894 in one 896-byte block that never drains.  ``from_info``
+    grades every 3.15 as ``None``, so 894 is refused there before any write;
+    895 and up draw ``82`` from a pre-#802 build and stay allowed."""
+    assert U64E.uci_socket_read_multiblock is None
+    t = _SimTransport(_datagram(894), caps=U64E, split=False)
+    with pytest.raises(ValueError, match="894"):
+        uci_socket_read(t, 5, max_len=894)
+    assert t.writes == [], "refused after touching the device"
+    t = _SimTransport(_datagram(895), caps=U64E)
+    assert uci_socket_read(t, 5, max_len=895) == _datagram(895)
+
+
+def test_894_reads_whole_where_802_is_established() -> None:
+    t = _SimTransport(_datagram(894), caps=U64E_802)
+    assert uci_socket_read(t, 5, max_len=894) == _datagram(894)
 
 
 @pytest.mark.parametrize("caps", [C64U, None], ids=["c64u-1.1.0", "ungraded"])

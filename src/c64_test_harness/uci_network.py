@@ -2746,18 +2746,24 @@ def uci_socket_read(
     than arrived, :class:`UCISocketReadTruncatedError` is raised carrying
     the bytes that did arrive (owner decision, 2026-09-23).
 
-    **Above 893 the device must grade 3.15 or later** (#479).  Older
-    firmware answers in one block into an 896-byte reply buffer: it accepts
-    894, and an 894-byte reply fills that buffer exactly, which the
-    interface never reports as drained (``command_protocol.vhd``, the
-    response pointer stops at ``buffer_end``; source-read), so the routine
-    would spin until the timeout reset.  So on a transport whose client's
-    cached grade is not Ultimate-line 3.15+ -- the C64U on 1.1.0, or an
-    unprobed client -- *max_len* above 893 raises ``ValueError`` before
-    anything is written.  A 3.15 build without upstream #802 grades the
-    same as one with it and refuses a length above 894 with
-    ``82,PARAMETER(S) OUT OF RANGE``: that returns ``b""`` and logs a
-    WARNING naming the status.
+    **Above 893 the firmware must carry upstream #802** (post-tag,
+    c0fd6d70; #479).  Without it the firmware answers in one block into an
+    896-byte reply buffer: it accepts 894, and an 894-byte reply fills that
+    buffer exactly, which the interface never reports as drained
+    (``network_target.cc`` ``> CMD_MAX_REPLY_LEN-2``; ``command_protocol.vhd``,
+    the response pointer stops at ``buffer_end``; source-read), so the
+    routine would spin until the timeout reset.  So, before anything is
+    written, ``ValueError`` is raised for:
+
+    * *max_len* above 893 when the client's cached grade rules #802 out or
+      is missing -- the C64U on 1.1.0, pre-3.15, an unprobed client;
+    * *max_len* == 894 when the grade cannot tell -- every 3.15 build grades
+      ``uci_socket_read_multiblock = None``, because #802 is post-tag.  Only
+      an override of ``True`` allows 894.
+
+    895 and up stay allowed on a ``None`` grade: a 3.15 build without #802
+    refuses them with ``82,PARAMETER(S) OUT OF RANGE``, which returns
+    ``b""`` and logs a WARNING naming the status.
 
     An empty socket (``02,NO DATA``, header ``$FFFF``) returns ``b""``.
     With *turbo_safe* the timeout grows by
@@ -2768,12 +2774,18 @@ def uci_socket_read(
             f"max_len must be <= {NET_MAX_SOCKET_READ} (the firmware's "
             f"READ_SOCKET ceiling), got {max_len}"
         )
-    if max_len > _PRE_315_SAFE_READ and not _grades_multiblock_read(transport):
+    multiblock = _multiblock_read_grade(transport)
+    if max_len > _PRE_315_SAFE_READ and (
+        multiblock is False
+        or (multiblock is None and max_len == _PRE_315_SAFE_READ + 1)
+    ):
         raise ValueError(
-            f"max_len {max_len} needs firmware 3.15 or later; this device is "
-            f"not graded so, and older firmware can leave a READ_SOCKET above "
-            f"{_PRE_315_SAFE_READ} bytes undrainable -- ask for at most "
+            f"max_len {max_len} needs firmware carrying upstream #802 "
+            f"(post-tag, c0fd6d70), which this device's grade does not "
+            f"establish: without it a READ_SOCKET of "
+            f"{_PRE_315_SAFE_READ + 1} bytes never drains -- ask for at most "
             f"{_PRE_315_SAFE_READ}"
+            + (", or at least 895" if multiblock is None else "")
         )
     if turbo_safe:
         timeout += max_len * _TURBO_READ_SECONDS_PER_BYTE
@@ -2872,18 +2884,18 @@ def _uci_socket_read_multiblock(
     )
 
 
-def _grades_multiblock_read(transport: C64Transport) -> bool:
-    """Whether *transport*'s device is graded Ultimate-line 3.15 or later.
+def _multiblock_read_grade(transport: C64Transport) -> bool | None:
+    """Whether *transport*'s device carries upstream #802, as far as its
+    cached grade says: ``True``, ``False``, or ``None`` (cannot tell).
 
-    Reads the client's cached grade only (no device traffic).  Anything else
-    -- no client, an unprobed one, the ``cbm`` line, pre-3.15 -- is ``False``.
-    ``DeviceCapabilities.from_info`` sets ``uci_socket_read_multiblock`` to
-    ``False`` everywhere except Ultimate-line 3.15+, where the version cannot
-    tell and it is ``None``; so "not ``False``" is exactly "3.15 or later,
-    unless an override says otherwise".
+    Reads the client's cached grade only (no device traffic).  No client or
+    an unprobed one is ``False``.  ``DeviceCapabilities.from_info`` sets
+    ``uci_socket_read_multiblock`` to ``False`` everywhere except
+    Ultimate-line 3.15+, where #802 is post-tag and the version cannot tell,
+    so it is ``None``; ``True`` comes only from an override.
     """
     caps = getattr(getattr(transport, "client", None), "cached_capabilities", None)
-    return caps is not None and caps.uci_socket_read_multiblock is not False
+    return False if caps is None else caps.uci_socket_read_multiblock
 
 
 def uci_socket_close(
