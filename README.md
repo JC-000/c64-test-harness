@@ -655,15 +655,24 @@ The U64 firmware has three independent wedge tiers (REST/writemem, runner subsys
 Since the U64 has no CPU register control, use DMA writes to inject and trigger code:
 
 ```python
-SENTINEL, TRAMPOLINE, MAIN_LOOP = 0x0350, 0x0360, 0x082A
+# SENTINEL/TRAMPOLINE are free RAM you pick. main_loop belongs to the
+# program under test: read it from that build's ld65 label listing rather
+# than hard-coding it — a copied literal went stale and cost a full session
+# of uploads to notice (issue #439; see `_resolve_labels` in
+# tests/test_u64_turbo_bench_live.py).
+SENTINEL, TRAMPOLINE = 0x0350, 0x0360
+MAIN_LOOP = labels["main_loop"]
+park = TRAMPOLINE + 8
 
 # Write trampoline: JSR target; LDA #$42; STA sentinel; JMP * (park)
 trampoline = bytes([0x20, target & 0xFF, target >> 8, 0xA9, 0x42,
-                    0x8D, 0x50, 0x03, 0x4C, 0x68, 0x03])
+                    0x8D, SENTINEL & 0xFF, SENTINEL >> 8,
+                    0x4C, park & 0xFF, park >> 8])
 write_bytes(transport, TRAMPOLINE, trampoline)
 write_bytes(transport, SENTINEL, bytes([0x00]))
-# Hijack the program's parking loop
-write_bytes(transport, MAIN_LOOP, bytes([0x4C, 0x60, 0x03]))
+# Hijack the program's parking loop — assembled from TRAMPOLINE, so
+# relocating the trampoline moves the jump with it
+write_bytes(transport, MAIN_LOOP, bytes([0x4C, TRAMPOLINE & 0xFF, TRAMPOLINE >> 8]))
 # Poll sentinel for completion
 while transport.read_memory(SENTINEL, 1)[0] != 0x42:
     time.sleep(0.1)

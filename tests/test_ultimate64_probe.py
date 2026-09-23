@@ -1135,10 +1135,12 @@ def test_client_liveness_probe_delegates(mock_lp):
     r = client.liveness_probe()
     assert r is sentinel
     # #250: the client also hands over a request sender, so the probe's two
-    # writemem POSTs are counted against the /Temp budget.
+    # writemem POSTs are counted against the /Temp budget.  #450: and it says
+    # it did the accounting itself, so the free function does not count the
+    # same two attachments a second time against the device's ledger.
     mock_lp.assert_called_once_with(
         "10.0.0.1", port=80, password="secret", http_timeout=2.0,
-        request=ANY,
+        request=ANY, accounted=True,
     )
     assert callable(mock_lp.call_args.kwargs["request"])
 

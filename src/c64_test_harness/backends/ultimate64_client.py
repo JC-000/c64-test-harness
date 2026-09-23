@@ -1478,6 +1478,10 @@ class Ultimate64Client:
                 password=self.password,
                 http_timeout=http_timeout,
                 request=_accounted,
+                # This method reserved, counted and gated the whole cost
+                # above; the free function must not do it a second time
+                # against the same device ledger (#450).
+                accounted=True,
             )
         finally:
             if sent[0] > cost:
@@ -2220,6 +2224,13 @@ class Ultimate64Client:
 
         Caller responsibility: this does not acquire a DeviceLock. Call
         it only while already holding the lock for this device.
+
+        This client's :meth:`list_drives` is handed to the sweep as its
+        mounted-image probe (#418), so a managed ``temp%04x`` name that a
+        drive has mounted is excluded from deletion. Going through the
+        client rather than the free function's own default probe means
+        the device's ``X-Password`` and timeout apply to that lookup too.
+        It is a bodyless ``GET`` and costs no ``/Temp`` attachment.
         """
         from .ultimate64_temp_gc import DEFAULT_FTP_TIMEOUT, gc_temp_folder as _gc_temp_folder
         return _gc_temp_folder(
@@ -2229,6 +2240,7 @@ class Ultimate64Client:
             password=ftp_password,
             keep=keep,
             timeout=timeout if timeout is not None else DEFAULT_FTP_TIMEOUT,
+            mounted_probe=self.list_drives,
         )
 
     def run_prg(self, data: bytes, *, fallback_on_404: bool = True) -> None:
