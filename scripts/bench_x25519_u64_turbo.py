@@ -5,11 +5,14 @@ Loads x25519.prg onto real Ultimate 64 hardware, runs a full scalar*basepoint
 multiplication at each CPU speed, measures jiffy clock timing, and verifies
 correctness against RFC 7748.
 
-Requires U64_HOST environment variable (and optionally U64_PASSWORD).
+Requires U64_HOST environment variable (and optionally U64_PASSWORD), and
+an x25519 build named by ``--prg`` or ``X25519_PRG``. Its ``labels.txt`` is
+read from beside the PRG unless ``--labels`` says otherwise, and every build
+address comes from it (#462).
 
 Usage:
-    U64_HOST=<device> python3 scripts/bench_x25519_u64_turbo.py
-    U64_HOST=<device> python3 scripts/bench_x25519_u64_turbo.py --all
+    U64_HOST=<device> X25519_PRG=/path/to/x25519.prg python3 scripts/bench_x25519_u64_turbo.py
+    U64_HOST=<device> python3 scripts/bench_x25519_u64_turbo.py --prg /path/to/x25519.prg --all
     U64_HOST=<device> python3 scripts/bench_x25519_u64_turbo.py --speeds 48,16,4,1
     U64_HOST=<device> python3 scripts/bench_x25519_u64_turbo.py --timeout 1800
 """
@@ -45,8 +48,12 @@ from c64_test_harness.screen import wait_for_text
 # Constants
 # ---------------------------------------------------------------------------
 
-PRG_PATH = "/home/someone/c64-x25519/build/x25519.prg"
-LABELS_PATH = "/home/someone/c64-x25519/build/labels.txt"
+#: Env var naming the x25519 PRG. No default path: one that resolves on a
+#: single machine is not a default (#245).
+PRG_ENV = "X25519_PRG"
+
+#: The x25519 build writes its listing beside the PRG.
+LABELS_FILENAME = "labels.txt"
 
 # All 16 supported U64 turbo speeds, fastest first.
 ALL_SPEEDS = [48, 40, 32, 24, 20, 16, 14, 12, 10, 8, 6, 5, 4, 3, 2, 1]
@@ -151,6 +158,37 @@ def _build_bench_subroutine(
     return bytes(code)
 
 
+def _self_jmp_bytes(addr: int) -> bytes:
+    """``JMP addr`` -- what ``main_loop`` holds once the program has parked."""
+    return bytes([0x4C, addr & 0xFF, (addr >> 8) & 0xFF])
+
+
+def _check_main_loop(prg_data: bytes, main_loop: int) -> str | None:
+    """Return why *prg_data* does not park at *main_loop*, or ``None``.
+
+    The boot poll waits for ``JMP main_loop`` at ``main_loop``; if the PRG
+    image does not hold it, the listing belongs to a different build and the
+    poll could never match. Checked before the first upload, not after (#462).
+    """
+    load = prg_data[0] | (prg_data[1] << 8)
+    offset = main_loop - load
+    want = _self_jmp_bytes(main_loop)
+    got = prg_data[2 + offset:2 + offset + 3] if offset >= 0 else b""
+    if len(got) < 3:
+        return (
+            f"main_loop=${main_loop:04X} is outside the PRG image "
+            f"(${load:04X}-${load + len(prg_data) - 3:04X}): the labels are "
+            f"not from this build"
+        )
+    if got != want:
+        return (
+            f"the PRG holds {got.hex(' ')} at main_loop=${main_loop:04X}, not "
+            f"{want.hex(' ')} (JMP ${main_loop:04X}): the labels are not from "
+            f"this build"
+        )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Polling helper
 # ---------------------------------------------------------------------------
@@ -220,13 +258,16 @@ def run_one_speed(
     client.run_prg(prg_data)
     time.sleep(2.0)
 
-    # 3. Verify program actually started by polling main_loop for JMP $082A
-    #    (not just screen text, which can be stale from a previous run)
+    # 3. Verify program actually started by polling main_loop for its own
+    #    JMP main_loop (not just screen text, which can be stale from a
+    #    previous run)
     print("  Waiting for program init ...", flush=True)
+    parked = _self_jmp_bytes(main_loop)
+    ml = b""
     boot_deadline = time.monotonic() + 120.0
     while time.monotonic() < boot_deadline:
         ml = transport.read_memory(main_loop, 3)
-        if ml == bytes([0x4C, 0x2A, 0x08]):
+        if ml == parked:
             break
         time.sleep(0.5)
     else:
@@ -374,14 +415,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--prg",
         type=str,
-        default=PRG_PATH,
-        help=f"Path to x25519.prg (default: {PRG_PATH}).",
+        default=os.environ.get(PRG_ENV),
+        help=f"Path to x25519.prg (default: ${PRG_ENV}).",
     )
     p.add_argument(
         "--labels",
         type=str,
-        default=LABELS_PATH,
-        help=f"Path to labels.txt (default: {LABELS_PATH}).",
+        default=None,
+        help=f"Path to labels.txt (default: {LABELS_FILENAME} beside the PRG).",
     )
     return p.parse_args()
 
@@ -415,6 +456,11 @@ def main() -> None:
     password = os.environ.get("U64_PASSWORD")
 
     # Load PRG and labels
+    if not args.prg:
+        print(f"ERROR: no PRG named -- pass --prg or set {PRG_ENV}")
+        sys.exit(1)
+    if args.labels is None:
+        args.labels = os.path.join(os.path.dirname(args.prg), LABELS_FILENAME)
     print(f"Loading PRG: {args.prg}")
     with open(args.prg, "rb") as f:
         prg_data = f.read()
@@ -434,6 +480,12 @@ def main() -> None:
             print(f"ERROR: Required label '{name}' not found in {args.labels}")
             sys.exit(1)
         print(f"  {name} = ${labels[name]:04X}")
+
+    # The boot poll is only meaningful if this PRG parks where its labels say.
+    park_error = _check_main_loop(prg_data, labels["main_loop"])
+    if park_error:
+        print(f"ERROR: {park_error}")
+        sys.exit(1)
 
     # Build bench subroutine (show it once for debug)
     bench_code = _build_bench_subroutine(
