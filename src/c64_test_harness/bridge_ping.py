@@ -720,6 +720,7 @@ CS8900A_TX_MAX_FRAME_LEN = 1514
 
 def _check_tx_frame_len(
     frame_len: int, what: str = "frame_len", *, allow_odd: bool = False,
+    offer_odd_opt_in: bool = False,
 ) -> None:
     """Refuse a length the TX copy loop cannot honour (issues #238, #404, #438).
 
@@ -736,7 +737,8 @@ def _check_tx_frame_len(
     ip65's ``send`` does via ``adjustcnt``).  It stays **off** by default:
     the padded loop is pinned on the simulated chip only, and no silicon
     has transmitted an odd TxLength under it.  The range is checked either
-    way.
+    way.  ``offer_odd_opt_in`` names ``allow_odd_frame_len`` in the error;
+    only a caller that takes that argument (:func:`build_tx_code`) sets it.
     """
     if isinstance(frame_len, bool) or not isinstance(frame_len, int) \
             or not 2 <= frame_len <= CS8900A_TX_MAX_FRAME_LEN \
@@ -745,9 +747,10 @@ def _check_tx_frame_len(
         odd_advice = "" if allow_odd else (
             ": the TX copy loop copies two bytes at a time, so an odd length "
             "hangs the 6510 after one frame (issue #238) -- pad an odd frame "
-            "by one byte, the IP total-length field governs the datagram, or "
-            "pass allow_odd_frame_len=True for the unmeasured padded copy "
-            "(issue #438) --"
+            "by one byte, the IP total-length field governs the datagram"
+            + (", or pass allow_odd_frame_len=True for the unmeasured padded "
+               "copy (issue #438)" if offer_odd_opt_in else "")
+            + " --"
         )
         raise ValueError(
             f"{what} must be {parity}2..{CS8900A_TX_MAX_FRAME_LEN}, got "
@@ -980,6 +983,7 @@ def _emit_tx_frame(
     max_polls: int = CS8900A_TX_READY_MAX_POLLS,
     what: str = "frame_len",
     allow_odd_frame_len: bool = False,
+    offer_odd_opt_in: bool = False,
 ) -> None:
     """Emit the CS8900a TX handshake for ``frame_len`` bytes at ``frame_buf``.
 
@@ -1018,7 +1022,8 @@ def _emit_tx_frame(
     transmitted an odd TxLength under it.  For an even length the flag
     changes nothing, in the emitted bytes or anywhere else.
     """
-    _check_tx_frame_len(frame_len, what, allow_odd=allow_odd_frame_len)
+    _check_tx_frame_len(frame_len, what, allow_odd=allow_odd_frame_len,
+                        offer_odd_opt_in=offer_odd_opt_in)
     # issue #438, ip65 ``adjustcnt``: TxLength gets the true length, the copy
     # count is rounded up to a whole word.  For an even length this is
     # ``frame_len`` and every emitted byte is unchanged.
@@ -1140,7 +1145,8 @@ def build_tx_code(
     a.emit(0x78)  # SEI
     _emit_clockport_enable(a)
     _emit_tx_frame(a, frame_buf, frame_len, "tx", "tx_fail",
-                   allow_odd_frame_len=allow_odd_frame_len)
+                   allow_odd_frame_len=allow_odd_frame_len,
+                   offer_odd_opt_in=True)
     a.emit(0xA9, 0x01, 0x8D, result_addr & 0xFF, (result_addr >> 8) & 0xFF)
     a.emit(0x58)
     a.emit(0x60)
