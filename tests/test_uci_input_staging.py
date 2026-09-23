@@ -3,7 +3,7 @@
 ``uci_tcp_connect``/``uci_udp_connect`` stage the hostname, and
 ``uci_socket_read``/``uci_socket_close`` the socket id, at ``$C100``, then
 ``_execute_uci_routine`` writes the routine at ``$C000``.  Plain routines
-(116-174 B) end below ``$C100``; turbo routines (348-491 B) do not, so the
+(118-176 B) end below ``$C100``; turbo routines (366-509 B) do not, so the
 upload overwrote the input and the routine sent bytes of its own code as
 the hostname or socket id.
 
