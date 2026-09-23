@@ -106,6 +106,7 @@ UCI_IDENTIFIER = 0xC9
 BIT_DATA_AV  = 0x80    # bit 7 — response data available
 BIT_STAT_AV  = 0x40    # bit 6 — status data available
 BIT_ERROR    = 0x08    # bit 3 — error flag
+BIT_ABORT_PENDING = 0x04  # bit 2 — ABORT written, not yet serviced by the firmware
 BIT_CMD_BUSY = 0x01    # bit 0 — command busy
 
 # State field (bits 5:4 of status register)
@@ -268,7 +269,7 @@ _WRITE_SOCKET_ID_ADDR = 0xC403
 _WRITE_DATA_BUF_ADDR  = 0xC500
 
 # Where turbo-safe connect/read/close routines read their staged input.
-# Turbo routines are 348-491 bytes at $C000 and cover the legacy $C100 slot,
+# Turbo routines are 366-509 bytes at $C000 and cover the legacy $C100 slot,
 # so the upload overwrote the hostname / socket id (issue #322). These reuse
 # the uci_socket_write slots above, which already clear every routine. Plain
 # routines keep $C100, so their bytes are unchanged.
@@ -291,7 +292,7 @@ _TURBO_SOCKET_ID_ADDR = _WRITE_SOCKET_ID_ADDR  # $C403 — 1 byte
 SOCKET_WRITE_MAX_BYTES = 892
 
 # Default input slots for build_socket_write(turbo_safe=True) (issue #346).
-# The turbo routine is 428 B at $C000 and covers the legacy $C100/$C101/$C1FF
+# The turbo routine is 446 B at $C000 and covers the legacy $C100/$C101/$C1FF
 # defaults. Data goes in the uci_socket_write buffer; the length sits right
 # after a maximum payload -- the slot uci_socket_write itself uses for 892
 # bytes -- so it clears every payload the builder accepts and every routine.
@@ -311,8 +312,8 @@ def _input_addr(addr: int | None, turbo_safe: bool, plain: int,
     """Resolve a staged-input address a builder reads (issue #322).
 
     ``None`` picks the default for the routine's size class: plain routines
-    (116-174 B at ``$C000``) end below ``$C100`` and keep that legacy slot,
-    so their bytes are unchanged; turbo routines (348-491 B) cover ``$C100``,
+    (118-176 B at ``$C000``) end below ``$C100`` and keep that legacy slot,
+    so their bytes are unchanged; turbo routines (366-509 B) cover ``$C100``,
     so their input is staged past every routine's footprint, in the
     ``uci_socket_write`` slots (``$C403`` socket id, ``$C500`` buffer).
     """
@@ -411,20 +412,25 @@ _FENCE_BYTES = 16
 # ---------------------------------------------------------------------------
 
 def _build_abort_preamble() -> list[int]:
-    """6502 fragment: send ABORT to clear any pending UCI state.
+    """6502 fragment: send ABORT to clear any pending UCI state, and wait for it.
 
     Best practice: issue ABORT ($04) before starting a new command
-    sequence to ensure a clean slate.  A brief delay loop (LDX #$FF;
-    DEX; BNE) gives the firmware time to process the abort before
-    we proceed.
+    sequence to ensure a clean slate.  The FPGA only latches it as
+    :data:`BIT_ABORT_PENDING`; the firmware services it later, from its
+    command task, with ``HANDSHAKE_RESET`` -- which also resets the command
+    pointer and forces the state to idle (``command_intf.cc`` ``run_task``,
+    ``command_protocol.vhd``).  A command byte written before that lands is
+    lost, so the fragment polls until the bit clears (issue #419; a fixed
+    ``LDX #$FF`` delay stood here and lost the race at 48 MHz).
+
+    Layout: ``LDA #$04 / STA $DF1C / wait: LDA $DF1C / AND #$04 / BNE wait``.
     """
     return [
         _LDA_IMM, CMD_ABORT,
         _STA_ABS, _lo(UCI_CONTROL_STATUS_REG), _hi(UCI_CONTROL_STATUS_REG),
-        # Brief delay loop for abort to take effect
-        _LDX_IMM, 0xFF,
-        _DEX,             # DEX
-        _BNE, 0xFD,       # BNE -3 (back to DEX)
+        _LDA_ABS, _lo(UCI_CONTROL_STATUS_REG), _hi(UCI_CONTROL_STATUS_REG),
+        _AND_IMM, BIT_ABORT_PENDING,
+        _BNE, 0xF9,       # BNE -7 (back to LDA $DF1C)
     ]
 
 
@@ -901,9 +907,11 @@ def _emit_write_cmd_from_mem_tsx(src_addr: int, fence: bool = True) -> list[int]
 
 
 def _build_abort_preamble_tsx(fence: bool = True) -> list[int]:
-    """Turbo-safe abort preamble — same as the plain version but with a fence
-    after the control-register write so the abort is fully latched before
-    the ``LDX #$FF / DEX`` settle loop runs.
+    """Turbo-safe :func:`_build_abort_preamble`: fence the ABORT write and
+    every poll of the acknowledgement.
+
+    The poll loop is 23 bytes with the fence, so it branches back with a
+    plain ``BNE`` rather than a JMP trampoline.
     """
     out = [
         _LDA_IMM, CMD_ABORT,
@@ -912,11 +920,12 @@ def _build_abort_preamble_tsx(fence: bool = True) -> list[int]:
     ]
     if fence:
         out.extend(_build_fence())
-    out.extend([
-        _LDX_IMM, 0xFF,
-        _DEX,
-        _BNE, 0xFD,
-    ])
+    loop = [_LDA_ABS, _lo(UCI_CONTROL_STATUS_REG), _hi(UCI_CONTROL_STATUS_REG)]
+    if fence:
+        loop.extend(_build_fence())
+    loop.extend([_AND_IMM, BIT_ABORT_PENDING])
+    out.extend(loop)
+    out.extend([_BNE, (-(len(loop) + 2)) & 0xFF])
     return out
 
 
@@ -993,6 +1002,9 @@ def build_uci_command(
         the FPGA behind ``$DF1C``-``$DF1F`` needs ~38 µs to latch writes and
         settle reads. At stock 1 MHz the plain (unfenced) path is faster and
         just as correct. Defaults to ``False`` for backward compatibility.
+        At the default ``$C000`` a turbo-safe routine takes at most 4 *params*
+        bytes (494 B); a fifth reaches the reply area at ``$C200`` and
+        :func:`_execute_uci_routine` refuses it.
     """
     if isinstance(params, list):
         params = bytes(params)
@@ -1135,7 +1147,7 @@ def build_tcp_connect(
     The socket ID is stored in the first byte of *result_addr*.
 
     *host_addr* defaults to ``$C100`` for a plain routine and ``$C500``
-    (:data:`_TURBO_HOST_ADDR`) for a turbo-safe one, whose 491 bytes cover
+    (:data:`_TURBO_HOST_ADDR`) for a turbo-safe one, whose 509 bytes cover
     ``$C100``; an explicit address inside the routine raises ``ValueError``
     (issue #322).
 
@@ -2108,6 +2120,17 @@ def _execute_uci_routine(
             settle is taken.
     """
     from .transport import TimeoutError
+
+    # The routine's working area is $C200-$C3FF: the reply at _RESP_ADDR, the
+    # status at _STATUS_ADDR, the length words, the sentinel and the error
+    # flag.  Code anywhere in it would be overwritten mid-run by the reply it
+    # is reading or by the flags the host clears and waits on.  The largest
+    # turbo routine's last byte is $C1FC since #419, a margin of three bytes.
+    if code_addr < _ERROR_ADDR + 1 and _RESP_ADDR < code_addr + len(code):
+        raise ValueError(
+            f"{len(code)}-byte routine at ${code_addr:04X} overlaps the reply "
+            f"area ${_RESP_ADDR:04X}-${_ERROR_ADDR:04X}"
+        )
 
     # The slot must be on the bus before anything is written or typed (#359).
     if check_identifier:
