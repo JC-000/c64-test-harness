@@ -301,9 +301,26 @@ _TURBO_WRITE_LEN_ADDR  = _WRITE_DATA_BUF_ADDR + SOCKET_WRITE_MAX_BYTES  # $C87C
 #: Bytes of ``[len_lo][len_hi]`` the firmware prefixes to a socket-read reply.
 _SOCKET_READ_HEADER_LEN = 2
 
-#: Maximum payload a single :func:`uci_socket_read` can return. The drain
-#: loop indexes with Y, so header + payload must stay under 256.
+#: Largest *max_len* the single-block drain serves. Its loop indexes with Y,
+#: so header + payload must stay under 256; a longer read takes the
+#: multi-block routine (issue #420).
 SOCKET_READ_MAX_BYTES = 255 - _SOCKET_READ_HEADER_LEN
+
+#: Most a ``READ_SOCKET`` can return: firmware 3.15 refuses a longer request
+#: with ``82,PARAMETER(S) OUT OF RANGE`` (``network_target.h``
+#: ``NET_MAX_SOCKET_READ``, upstream #802; bce4535e).  Pre-3.15 firmware
+#: refuses anything above 894 the same way (``CMD_MAX_REPLY_LEN - 2``).
+NET_MAX_SOCKET_READ = 1472
+
+#: Where the multi-block read routine stores ``[len_lo][len_hi][payload]``:
+#: the ``uci_socket_write`` buffer, extended to hold a 1472-byte reply
+#: (``$C500-$CAC1``).  ``$C200`` has only 240 bytes before the length fields.
+_LONG_READ_BUF_ADDR = _WRITE_DATA_BUF_ADDR
+
+#: 16-bit store countdown for the multi-block drain -- the socket-write
+#: inner-loop slots, which no read routine shares a run with.
+_READ_REMAIN_LO = _INNER_LOOP_CNT_LO   # $C400
+_READ_REMAIN_HI = _INNER_LOOP_CNT_HI   # $C401
 
 
 def _input_addr(addr: int | None, turbo_safe: bool, plain: int,
@@ -800,6 +817,126 @@ def _build_read_response_tsx(
     # STX resp_len
     out.extend([_STX_ABS, _lo(resp_len_addr), _hi(resp_len_addr)])
 
+    return out
+
+
+def _build_read_response_multiblock(
+    pc: int,
+    resp_addr: int,
+    resp_len_addr: int,
+    limit: int,
+    fence: bool,
+) -> list[int]:
+    """Drain a reply that may span Data More blocks (issue #420).
+
+    Firmware 3.15 answers a long ``READ_SOCKET`` in blocks: the interface
+    reads STATE ``11`` after a block that is not the last, a DATA_ACC write
+    moves it to ``01`` while the firmware fills the next block, and the last
+    block leaves it at ``10`` (``command_protocol.vhd``;
+    ``command_intf.cc``; ``network_target.cc`` ``get_more_data``).  So::
+
+            SMC store pointer := resp_addr ; remain := limit ; len := 0
+        loop:
+            LDA $DF1C ; AND #DATA_AV ; BNE byte ; JMP block_end
+        byte:
+            LDA remain_lo ; ORA remain_hi ; BEQ discard
+            LDA remain_lo ; BNE +3 ; DEC remain_hi ; DEC remain_lo
+            LDA $DF1E
+        store:
+            STA resp_addr          ; operand advanced in place
+            INC store+1 ; BNE +3 ; INC store+2
+            INC len_lo ; BNE +3 ; INC len_hi
+            JMP loop
+        discard:
+            LDA $DF1E ; JMP loop
+        block_end:
+            LDA $DF1C ; AND #$10 ; BNE more ; JMP done   ; STATE 10: last
+        more:
+            LDA #NEXT_DATA ; STA $DF1C                   ; ask for the next
+        wait:
+            LDA $DF1C ; AND #$20 ; BNE loop_t ; JMP wait ; STATE 01: filling
+        loop_t:
+            JMP loop
+        done:
+
+    Every ``$DF1C``-``$DF1F`` access is fenced when *fence*.  No index
+    register is used, so the fence's ``Y = 0`` exit (#298) does not matter.
+    At most *limit* bytes are stored (the rest are drained and dropped), so
+    the buffer's declared span holds whatever the firmware sends; *len* is
+    the 16-bit count stored.  The final accept is not here: it belongs to
+    :func:`_build_acknowledge`, after the status drain, as for a single
+    block -- the status goes out on the last block only.
+    """
+    f = _build_fence() if fence else []
+    ctl = [_lo(UCI_CONTROL_STATUS_REG), _hi(UCI_CONTROL_STATUS_REG)]
+    out: list[int] = []
+
+    def here() -> int:
+        return pc + len(out)
+
+    def jmp(target: int) -> None:
+        out.extend([_JMP_ABS, _lo(target), _hi(target)])
+
+    store_pos_placeholder = len(out)
+    out.extend([_LDA_IMM, _lo(resp_addr), _STA_ABS, 0, 0,
+                _LDA_IMM, _hi(resp_addr), _STA_ABS, 0, 0])
+    out.extend([_LDA_IMM, limit & 0xFF,
+                _STA_ABS, _lo(_READ_REMAIN_LO), _hi(_READ_REMAIN_LO),
+                _LDA_IMM, (limit >> 8) & 0xFF,
+                _STA_ABS, _lo(_READ_REMAIN_HI), _hi(_READ_REMAIN_HI),
+                _LDA_IMM, 0x00,
+                _STA_ABS, _lo(resp_len_addr), _hi(resp_len_addr),
+                _STA_ABS, _lo(resp_len_addr + 1), _hi(resp_len_addr + 1)])
+
+    loop = here()
+    out.extend([_LDA_ABS, *ctl, *f, _AND_IMM, BIT_DATA_AV, _BNE, 0x03])
+    jmp_block_end = len(out)
+    jmp(0)
+    # byte:
+    out.extend([_LDA_ABS, _lo(_READ_REMAIN_LO), _hi(_READ_REMAIN_LO),
+                _ORA_ABS, _lo(_READ_REMAIN_HI), _hi(_READ_REMAIN_HI),
+                _BEQ, 0x00])
+    discard_branch = len(out) - 1
+    out.extend([_LDA_ABS, _lo(_READ_REMAIN_LO), _hi(_READ_REMAIN_LO),
+                _BNE, 0x03,
+                _DEC_ABS, _lo(_READ_REMAIN_HI), _hi(_READ_REMAIN_HI),
+                _DEC_ABS, _lo(_READ_REMAIN_LO), _hi(_READ_REMAIN_LO)])
+    out.extend([_LDA_ABS, _lo(UCI_RESP_DATA_REG), _hi(UCI_RESP_DATA_REG), *f])
+    store = here()
+    out.extend([_STA_ABS, _lo(resp_addr), _hi(resp_addr),
+                _INC_ABS, _lo(store + 1), _hi(store + 1), _BNE, 0x03,
+                _INC_ABS, _lo(store + 2), _hi(store + 2),
+                _INC_ABS, _lo(resp_len_addr), _hi(resp_len_addr), _BNE, 0x03,
+                _INC_ABS, _lo(resp_len_addr + 1), _hi(resp_len_addr + 1)])
+    jmp(loop)
+    # discard:
+    offset = len(out) - (discard_branch + 1)
+    if offset > 0x7F:
+        raise AssertionError("multi-block discard branch out of range")
+    out[discard_branch] = offset
+    out.extend([_LDA_ABS, _lo(UCI_RESP_DATA_REG), _hi(UCI_RESP_DATA_REG), *f])
+    jmp(loop)
+    # block_end:
+    block_end = here()
+    out[jmp_block_end + 1:jmp_block_end + 3] = [_lo(block_end), _hi(block_end)]
+    # STATE bit 4 is the "more" bit of 10/11 (``state(0)`` in the VHDL).
+    out.extend([_LDA_ABS, *ctl, *f, _AND_IMM, 0x10, _BNE, 0x03])
+    jmp_done = len(out)
+    jmp(0)
+    # more:
+    out.extend([_LDA_IMM, CMD_NEXT_DATA, _STA_ABS, *ctl, *f])
+    wait = here()
+    # STATE bit 5 (``state(1)``) is clear while the firmware fills (01).
+    out.extend([_LDA_ABS, *ctl, *f, _AND_IMM, 0x20, _BNE, 0x03])
+    jmp(wait)
+    jmp(loop)
+    done = here()
+    out[jmp_done + 1:jmp_done + 3] = [_lo(done), _hi(done)]
+    # Point the preamble's SMC resets at the store operand.
+    out[store_pos_placeholder + 3:store_pos_placeholder + 5] = [
+        _lo(store + 1), _hi(store + 1)]
+    out[store_pos_placeholder + 8:store_pos_placeholder + 10] = [
+        _lo(store + 2), _hi(store + 2)]
     return out
 
 
@@ -1668,7 +1805,7 @@ def build_socket_write(
 @refuses_bool_address_args
 def build_socket_read(
     socket_id_addr: int | None = None,
-    result_addr: int = _RESP_ADDR,
+    result_addr: int | None = None,
     max_len: int = 255,
     actual_len_addr: int = _RESP_LEN_ADDR,
     status_addr: int = _STATUS_ADDR,
@@ -1677,11 +1814,26 @@ def build_socket_read(
     sentinel_addr: int = _SENTINEL_ADDR,
     code_addr: int = _CODE_ADDR,
     turbo_safe: bool = False,
+    multi_block: bool | None = None,
 ) -> bytes:
     """Build routine: SOCKET_READ.
 
     Params: socket_id, length (2 bytes LE).
     Response data goes to *result_addr*, actual length to *actual_len_addr*.
+
+    *multi_block* picks the drain.  ``False`` is the single-block, 8-bit
+    drain (at most 256 bytes stored, *result_addr* default ``$C200``); its
+    bytes are unchanged for every *max_len* by issue #420.  ``True`` is the
+    multi-block drain of :func:`_build_read_response_multiblock`: it follows
+    firmware 3.15's Data More blocks, stores at most ``max_len + 2`` bytes
+    (header included) at *result_addr* (default ``$C500``,
+    :data:`_LONG_READ_BUF_ADDR`) and writes a 16-bit count at
+    *actual_len_addr*.  ``None`` (the default) means ``True`` exactly when
+    *max_len* is above 255, which the single-block drain cannot hold.
+    The multi-block routine is 242 bytes plain and 602 turbo-safe
+    (``$C000-$C0F1`` / ``$C000-$C259``, clear of the ``$C300`` status buffer),
+    so a transport upload at the 128-byte PUT threshold is 2 / 5 PUTs and
+    no ``/Temp`` attachment.
 
     *socket_id_addr* defaults to ``$C100`` for a plain routine and ``$C403``
     (:data:`_TURBO_SOCKET_ID_ADDR`) for a turbo-safe one, which covers
@@ -1692,6 +1844,10 @@ def build_socket_read(
     """
     socket_id_addr = _input_addr(socket_id_addr, turbo_safe, _SOCKET_ID_ADDR,
                                  _TURBO_SOCKET_ID_ADDR)
+    if multi_block is None:
+        multi_block = max_len > 0xFF
+    if result_addr is None:
+        result_addr = _LONG_READ_BUF_ADDR if multi_block else _RESP_ADDR
     len_lo = max_len & 0xFF
     len_hi = (max_len >> 8) & 0xFF
 
@@ -1764,7 +1920,12 @@ def build_socket_read(
         code.extend(_build_check_error(error_addr))
 
     # Read response
-    if turbo_safe:
+    if multi_block:
+        code.extend(_build_read_response_multiblock(
+            pc(), result_addr, actual_len_addr,
+            max_len + _SOCKET_READ_HEADER_LEN, fence=turbo_safe,
+        ))
+    elif turbo_safe:
         code.extend(_build_read_response_tsx(pc(), result_addr, actual_len_addr))
     else:
         code.extend(_build_read_response(result_addr, actual_len_addr))
@@ -2388,21 +2549,32 @@ def uci_socket_read(
         block at the result address; this helper skips the two header bytes
         and returns only the payload.
 
-    .. warning::
-        *max_len* is capped at :data:`SOCKET_READ_MAX_BYTES` (253) rather
-        than 255 because the drain loop indexes with an 8-bit register:
-        the two header bytes plus 254 payload bytes would wrap it. Lifting
-        the cap needs a 16-bit drain, which is the same work as draining the
-        multi-block replies firmware 3.15 can return — tracked separately.
+    *max_len* up to :data:`SOCKET_READ_MAX_BYTES` (253) uses the
+    single-block routine, unchanged.  Above it, up to
+    :data:`NET_MAX_SOCKET_READ` (1472), the multi-block routine drains
+    every Data More block firmware 3.15 sends, into ``$C500``
+    (issue #420); the payload length is the first block's header, and
+    never more than *max_len* is returned.  Pre-3.15 firmware refuses a length above 894 with
+    ``82,PARAMETER(S) OUT OF RANGE``: that returns ``b""`` and logs a
+    WARNING naming the status.
+
+    When the header announces more than arrived, what arrived is returned
+    and a WARNING says how much was announced.
     """
-    if max_len > SOCKET_READ_MAX_BYTES:
+    if max_len > NET_MAX_SOCKET_READ:
         raise ValueError(
-            f"max_len must be <= {SOCKET_READ_MAX_BYTES}, got {max_len}"
+            f"max_len must be <= {NET_MAX_SOCKET_READ} (the firmware's "
+            f"READ_SOCKET ceiling), got {max_len}"
         )
 
     socket_id_addr = _input_addr(None, turbo_safe, _DATA_ADDR,
                                  _TURBO_SOCKET_ID_ADDR)
     transport.write_memory(socket_id_addr, bytes([socket_id]))
+
+    if max_len > SOCKET_READ_MAX_BYTES:
+        return _uci_socket_read_multiblock(
+            transport, socket_id_addr, max_len, timeout, turbo_safe,
+        )
 
     code = build_socket_read(
         socket_id_addr, max_len=max_len, turbo_safe=turbo_safe,
@@ -2432,6 +2604,50 @@ def uci_socket_read(
         return b""
     return transport.read_memory(
         _RESP_ADDR + _SOCKET_READ_HEADER_LEN, payload_len
+    )
+
+
+def _uci_socket_read_multiblock(
+    transport: C64Transport,
+    socket_id_addr: int,
+    max_len: int,
+    timeout: float,
+    turbo_safe: bool,
+) -> bytes:
+    """:func:`uci_socket_read` above the single-block cap (issue #420)."""
+    code = build_socket_read(
+        socket_id_addr, max_len=max_len, turbo_safe=turbo_safe,
+        multi_block=True,
+    )
+    _execute_uci_routine(transport, code, timeout=timeout)
+
+    raw = transport.read_memory(_RESP_LEN_ADDR, 2)
+    drained = raw[0] | (raw[1] << 8)
+    if drained < _SOCKET_READ_HEADER_LEN:
+        status = _read_status_string(transport)
+        if status.startswith("82"):
+            _log.warning(
+                "uci_socket_read: READ_SOCKET of %d bytes returned no reply "
+                "(status %r); firmware before 3.15 accepts at most 894",
+                max_len, status,
+            )
+        return b""
+    header = transport.read_memory(_LONG_READ_BUF_ADDR, _SOCKET_READ_HEADER_LEN)
+    # No cap at max_len needed here: the routine stores at most max_len + 2
+    # bytes, so ``available`` already bounds the result.
+    payload_len = header[0] | (header[1] << 8)
+    available = drained - _SOCKET_READ_HEADER_LEN
+    if payload_len > available:
+        _log.warning(
+            "uci_socket_read: header reports %d bytes but only %d arrived "
+            "across the reply blocks; returning what arrived",
+            payload_len, available,
+        )
+        payload_len = available
+    if payload_len == 0:
+        return b""
+    return transport.read_memory(
+        _LONG_READ_BUF_ADDR + _SOCKET_READ_HEADER_LEN, payload_len
     )
 
 

@@ -436,9 +436,11 @@ HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
     ),
     ScratchRegion(
         0xC400, 0xC403,
-        owner="uci_network.build_socket_write",
+        owner="uci_network.build_socket_write (also build_socket_read's "
+              "multi-block routine, $C400-$C401)",
         purpose="16-bit inner-loop countdown (lo, hi) + Y save slot "
-                "across the turbo fence",
+                "across the turbo fence; the multi-block read's 16-bit "
+                "store countdown",
         configurable="hardcoded",
     ),
     ScratchRegion(
@@ -460,6 +462,16 @@ HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
                 "hostname here; build_socket_write's turbo defaults are "
                 "data $C500 and length $C87C-$C87D",
         configurable="hardcoded",
+    ),
+    ScratchRegion(
+        0xC500, 0xCAC2,
+        owner="uci_network.uci_socket_read (max_len > 253) / "
+              "build_socket_read(multi_block=True)",
+        purpose="multi-block READ_SOCKET reply: 2-byte header plus up to "
+                "1472 payload bytes, stored across Data More blocks "
+                "(issue #420)",
+        configurable="result_addr= on build_socket_read; hardcoded in "
+                     "uci_socket_read",
     ),
     ScratchRegion(
         0xCF00, 0xCF04,

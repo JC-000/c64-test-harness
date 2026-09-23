@@ -1246,7 +1246,7 @@ print(f"U64 IP: {ip}")
 
 sock = uci_tcp_connect(transport, host="192.168.1.10", port=80)
 uci_socket_write(transport, sock, b"GET / HTTP/1.0\r\n\r\n")
-data = uci_socket_read(transport, sock, max_len=253)   # SOCKET_READ_MAX_BYTES; one call drains one reply block
+data = uci_socket_read(transport, sock, max_len=1472)  # NET_MAX_SOCKET_READ; above 253 it drains every Data More block (#420)
 uci_socket_close(transport, sock)
 ```
 

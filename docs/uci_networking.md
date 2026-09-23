@@ -194,18 +194,23 @@ Custom builders MUST end with `RTS` (0x60), not `JMP` or `BRK`.
 
 For UDP, one `uci_socket_write` call produces exactly one `lwip_send` on the firmware side, which is one UDP datagram on the wire (empirically confirmed by `tests/test_uci_udp_send_live.py`'s per-call-per-datagram probe). No firmware-side coalescing. For payloads larger than 892 bytes, call `uci_socket_write` in a loop; each call emits its own UDP datagram. Receivers must reassemble in application code.
 
-`uci_socket_read` is capped far lower, at **253 bytes** per call
-(`SOCKET_READ_MAX_BYTES = 255 - _SOCKET_READ_HEADER_LEN`,
-`uci_network.py:261-265`), and a larger `max_len` raises `ValueError` rather
-than being truncated. The limit is the harness's, not the firmware's: the
-6502 drain loop indexes with Y, so the two-byte `[len_lo][len_hi]` reply
-header plus 254 payload bytes would wrap it. (An earlier revision of this
-page quoted a "theoretical 894 bytes (`CMD_MAX_REPLY_LEN - 2`)"; whatever the
-firmware would allow, no caller can ask for it through this helper.) Lifting
-the cap needs a 16-bit drain, which is the same work as draining the
-multi-block replies firmware 3.15 can return — tracked separately. Until
-then, a reply whose header reports more bytes than arrived in the block logs
-a WARNING and returns the first block only (`:1993-2004`).
+`uci_socket_read` accepts up to **1472 bytes** per call
+(`NET_MAX_SOCKET_READ`, firmware 3.15's own `READ_SOCKET` ceiling), and a
+larger `max_len` raises `ValueError` before any device contact. Up to
+`SOCKET_READ_MAX_BYTES` (253) it uses the single-block routine, whose 8-bit
+drain holds header plus 253 payload bytes; above that it uses the multi-block
+routine (#420), which follows firmware 3.15's Data More blocks (first block:
+header with the *total* length plus up to 893 bytes; continuations: up to 895
+bytes each) into `$C500-$CAC1` with a 16-bit count. The payload length is the
+first block's header; the routine stores at most `max_len` payload bytes. If fewer bytes arrive than the
+header announced, the helper returns what arrived and logs a WARNING.
+Firmware before 3.15 (the C64U on 1.1.0) refuses a length above 894 with
+`82,PARAMETER(S) OUT OF RANGE`; the helper then returns `b""` with a WARNING
+naming that status. The multi-block routine is 242 bytes plain and 602
+turbo-safe: 2 or 5 PUTs at the 128-byte threshold, no `/Temp` attachment.
+Evidence grade: firmware source (bce4535e) and the interpreter model in
+`tests/test_uci_socket_read_multiblock.py`; the device check is
+`tests/test_u64_capabilities_live.py::TestSocketReadCeiling` (U64E only).
 
 ## Cost on leak-prone firmware: zero, one or two attachments per routine
 
