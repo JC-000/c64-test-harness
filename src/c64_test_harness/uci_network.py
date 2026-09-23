@@ -333,6 +333,18 @@ _TURBO_READ_SECONDS_PER_BYTE = 0.006
 #: that fills the buffer exactly is never reported drained (#479).
 _PRE_315_SAFE_READ = 893
 
+#: RAM the multi-block read routine writes, besides the sentinel/error flags
+#: and its own self-modified store operand: status buffer and length fields
+#: (``$C300-$C3FF``), the store countdown (``$C400-$C401``) and the reply
+#: buffer (``$C500-$CAC1``).  End-exclusive ``(start, end)`` pairs, for the
+#: executor's reply-area guard (#484).
+_MULTIBLOCK_READ_OUTPUT_SPANS = (
+    (_STATUS_ADDR, _ERROR_ADDR + 1),
+    (_READ_REMAIN_LO, _READ_REMAIN_HI + 1),
+    (_LONG_READ_BUF_ADDR, _LONG_READ_BUF_ADDR + NET_MAX_SOCKET_READ
+     + _SOCKET_READ_HEADER_LEN),
+)
+
 #: The header ``read_socket`` sends when the receive failed (``ret = -1``),
 #: alongside ``02,NO DATA``.
 _NO_DATA_HEADER = 0xFFFF

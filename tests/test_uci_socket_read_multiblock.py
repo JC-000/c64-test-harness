@@ -487,3 +487,79 @@ def test_every_uci_register_access_in_the_turbo_routine_is_fenced() -> None:
     assert len(sites) >= 12
     for i in sites:
         assert code[i + 3:i + 3 + len(fence)] == fence, f"unfenced access at +{i}"
+
+
+# ------------------------------------------ declared output spans (#484)
+class _StoreRecordingUci(_DataMoreUci):
+    """Records every RAM store the routine makes (I/O and the ``PHA`` stack
+    pushes, which bypass ``write``, are not RAM stores of interest)."""
+
+    def __init__(self, *a, **kw) -> None:
+        super().__init__(*a, **kw)
+        self.stores: set[int] = set()
+
+    def write(self, addr: int, val: int) -> None:
+        if not 0xD000 <= addr <= 0xDFFF:
+            self.stores.add(addr)
+        super().write(addr, val)
+
+
+def _uncovered(stores: set[int], spans, *, code_addr: int, code_len: int) -> set[int]:
+    """Stores outside every declared span, the sentinel/error flags, and the
+    routine's own bytes.  The routine's bytes are allowed by name: the store
+    operand is self-modified in place (``INC store+1`` / ``INC store+2``)."""
+    self_modified_operand = range(code_addr, code_addr + code_len)
+    flags = {_SENTINEL_ADDR, u._ERROR_ADDR}
+    return {
+        a for a in stores
+        if a not in flags and a not in self_modified_operand
+        and not any(start <= a < end for start, end in spans)
+    }
+
+
+def _stores_of_a_full_read(turbo: bool) -> tuple[set[int], int]:
+    code = build_socket_read(SOCKET_ID_ADDR, max_len=NET_MAX_SOCKET_READ,
+                             turbo_safe=turbo, multi_block=True)
+    cpu = _StoreRecordingUci(code, _datagram(NET_MAX_SOCKET_READ))
+    cpu.mem[SOCKET_ID_ADDR] = 0x05
+    cpu.run(max_steps=20_000_000)
+    return cpu.stores, len(code)
+
+
+@pytest.mark.parametrize("turbo", PATHS, ids=["plain", "turbo"])
+def test_the_declared_output_spans_cover_every_store(turbo: bool) -> None:
+    """Safety: the executor's reply-area guard trusts these spans, so a store
+    the declaration misses is RAM the guard lets a caller's program occupy."""
+    stores, code_len = _stores_of_a_full_read(turbo)
+    assert _uncovered(stores, u._MULTIBLOCK_READ_OUTPUT_SPANS,
+                      code_addr=_CODE_ADDR, code_len=code_len) == set()
+    in_code = {a for a in stores if _CODE_ADDR <= a < _CODE_ADDR + code_len}
+    assert len(in_code) == 2, "only the store operand's two bytes self-modify"
+    # The store pointer is bounded by the storage limit: the last reply byte
+    # lands exactly at the span's end.
+    assert max(a for a in stores if a >= LONG_BUF) == u._MULTIBLOCK_READ_OUTPUT_SPANS[2][1] - 1
+
+
+@pytest.mark.parametrize("turbo", PATHS, ids=["plain", "turbo"])
+def test_the_coverage_check_fails_on_an_undersized_span(turbo: bool) -> None:
+    """Negative control: one byte short at the end of the reply buffer, or a
+    missing countdown span, must be reported."""
+    stores, code_len = _stores_of_a_full_read(turbo)
+    status, remain, reply = u._MULTIBLOCK_READ_OUTPUT_SPANS
+    short = (status, remain, (reply[0], reply[1] - 1))
+    assert _uncovered(stores, short, code_addr=_CODE_ADDR,
+                      code_len=code_len) == {reply[1] - 1}
+    assert _uncovered(stores, (status, reply), code_addr=_CODE_ADDR,
+                      code_len=code_len) == set(range(*remain))
+
+
+def test_the_coverage_check_fails_on_a_store_outside_every_span() -> None:
+    """Negative control: a routine storing its reply elsewhere is caught."""
+    code = build_socket_read(SOCKET_ID_ADDR, max_len=100, multi_block=True,
+                             result_addr=0x6000)
+    cpu = _StoreRecordingUci(code, _datagram(100))
+    cpu.mem[SOCKET_ID_ADDR] = 0x05
+    cpu.run(max_steps=20_000_000)
+    missed = _uncovered(cpu.stores, u._MULTIBLOCK_READ_OUTPUT_SPANS,
+                        code_addr=_CODE_ADDR, code_len=len(code))
+    assert missed == set(range(0x6000, 0x6000 + 102))
