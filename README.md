@@ -660,19 +660,27 @@ Since the U64 has no CPU register control, use DMA writes to inject and trigger 
 # than hard-coding it — a copied literal went stale and cost a full session
 # of uploads to notice (issue #439; see `_resolve_labels` in
 # tests/test_u64_turbo_bench_live.py).
-SENTINEL, TRAMPOLINE = 0x0350, 0x0360
-MAIN_LOOP = labels["main_loop"]
+SENTINEL = 0x0350
+MAIN_LOOP = labels["main_loop"]           # the program's parking JMP main_loop
+# Same low byte as MAIN_LOOP, so the hijack below rewrites one byte (#426).
+# $CE00-$CEFF is outside HARNESS_SCRATCH ($0360-$036D, the old trampoline
+# address here, is inside it).
+TRAMPOLINE = 0xCE00 | (MAIN_LOOP & 0xFF)
 park = TRAMPOLINE + 8
 
 # Write trampoline: JSR target; LDA #$42; STA sentinel; JMP * (park)
 trampoline = bytes([0x20, target & 0xFF, target >> 8, 0xA9, 0x42,
                     0x8D, SENTINEL & 0xFF, SENTINEL >> 8,
                     0x4C, park & 0xFF, park >> 8])
+assert TRAMPOLINE + len(trampoline) <= 0xCF00, "low byte >= $F5 runs into $CF00"
 write_bytes(transport, TRAMPOLINE, trampoline)
 write_bytes(transport, SENTINEL, bytes([0x00]))
-# Hijack the program's parking loop — assembled from TRAMPOLINE, so
-# relocating the trampoline moves the jump with it
-write_bytes(transport, MAIN_LOOP, bytes([0x4C, TRAMPOLINE & 0xFF, TRAMPOLINE >> 8]))
+# Only once MAIN_LOOP reads back as JMP MAIN_LOOP (the program is parked):
+# rewrite the high operand byte alone. The 6510 is executing that JMP while
+# the write lands, and a two-byte rewrite can be fetched torn (old low byte,
+# new high byte) -- #426: 8 of 14 paired runs failed that way, 0 of 14 with
+# the one-byte write (U64E fw bce4535e, 2026-09-22/23, paired).
+write_bytes(transport, MAIN_LOOP + 2, bytes([TRAMPOLINE >> 8]))
 # Poll sentinel for completion
 while transport.read_memory(SENTINEL, 1)[0] != 0x42:
     time.sleep(0.1)

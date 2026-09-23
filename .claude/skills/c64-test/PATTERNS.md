@@ -1082,16 +1082,21 @@ trampoline = bytes([
     0x8D, SENTINEL & 0xFF, (SENTINEL >> 8) & 0xFF,       # STA sentinel
     0x4C, (TRAMPOLINE + 8) & 0xFF, ((TRAMPOLINE + 8) >> 8) & 0xFF,  # JMP *
 ])
+# $CE00 | lo plus 11 bytes runs into $CF00 (HARNESS_SCRATCH) when lo >= $F5.
+assert TRAMPOLINE + len(trampoline) <= 0xCF00
 
 # Write trampoline + zero sentinel via DMA
 write_bytes(transport, TRAMPOLINE, trampoline)
 write_bytes(transport, SENTINEL, bytes([0x00]))
 
 # Hijack the program's main_loop: JMP main_loop -> JMP TRAMPOLINE, high byte only.
+# Only after the startup check (§ "Verify Program Startup via Code Bytes" below)
+# has read MAIN_LOOP back as JMP MAIN_LOOP: the one-byte write assumes that JMP.
 # The 6510 is executing that JMP while the write lands, and a DMA write can halt
 # it between the two operand fetches. Rewriting both operand bytes can then run a
 # torn JMP (old low byte, new high byte) into the middle of whatever is there --
-# #426: 8 of 14 paired runs failed this way, 0 of 14 with the one-byte write.
+# #426: 8 of 14 paired runs failed this way, 0 of 14 with the one-byte write
+# (U64E fw bce4535e, 2026-09-22/23, paired).
 write_bytes(transport, MAIN_LOOP + 2, bytes([TRAMPOLINE >> 8]))
 
 # Poll sentinel for completion
