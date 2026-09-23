@@ -390,7 +390,8 @@ class TempLedger:
     pass, so concurrent clients of one device take turns rather than both
     sweeping, and the count never rises above the budget between them.
 
-    **In-process only (#433, open).** Two processes
+    **In-process only; across processes the bound is the lock** (owner
+    decision 2026-09-22 on #433: accept and document).  Two processes
     against one device keep two ledgers and each spends its own budget, so
     the worst peak before a sweep is ``budget x processes``. What covers the
     hand-off between processes is the lock-release drain
@@ -402,7 +403,10 @@ class TempLedger:
     is how lanes take turns, but the lock is advisory
     (``docs/device_locking.md``) and ``run_u64_parallel_locked.py``
     interleaves tests from several processes on one device, releasing
-    between tests.  Whether and how to close that is #433.
+    between tests.  So the cross-process bound is the ``DeviceLock``
+    serialising uploads plus the lock-release sweep, and the residual is a
+    process that uploads without holding the lock.  Counting in the lockfile
+    or on the device was declined in the same decision.
     """
 
     def __init__(self, key: str) -> None:
