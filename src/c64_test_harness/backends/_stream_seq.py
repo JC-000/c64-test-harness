@@ -102,10 +102,14 @@ measured on this bench, so none of these has been seen):
   payload is a correct discard, so a non-zero count is not by itself a
   fault.  It is the caller's to assert on.
 
-  **How reachable any of this is on hardware is unestablished** (#452):
-  the sequence number is generated FPGA-side and nobody has established
-  whether starting a stream resets it, so a mid-capture restart may be
-  routine or may be unreachable.  That question grades this residual.
+  **Reachability on hardware** (#452, measured on the U64E, bce4535e,
+  2026-09-22): every ``stream_*_start`` resets the counter to 0 -- audio,
+  debug and video, 12/12 restarts, while a control that kept the stream
+  running and only reopened the socket continued the numbering 12/12.
+  Stopping does not renumber audio or debug: the datagrams in flight keep
+  their numbers.  So a restart reaches a capture exactly when its caller
+  stops and restarts the stream while one capture is open; the harness's
+  own helpers start one stream per capture and never do.
 
   More generally, **a restart whose first number is an unarrived missing
   number inside the window places that datagram in the old stream's slot

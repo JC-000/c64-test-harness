@@ -391,3 +391,72 @@ class TestReorderAndFrameAssembly:
         assert [(f.frame_number, f.height) for f in result.frames] == [
             (0, 8), (1, 8)
         ]
+
+
+# ------------------------------------------------ stream stop and restart
+
+
+def _zero_header(fill: int) -> bytes:
+    """What the U64E sends after ``stream_video_stop`` (#452).
+
+    Measured on bce4535e, 2026-09-22: once the stop lands, the rest of the
+    frame in flight still goes out, but with sequence, frame and line all 0
+    (11/11 stops; 2 to 53 datagrams where counted, n=4).
+    """
+    return _build_video_packet(seq=0, frame_num=0, line_num=0, fill=fill)
+
+
+class TestStreamStopAndRestart:
+    """A stop tail is not a frame, and a restart still is (#452)."""
+
+    def test_a_stop_tail_adds_no_frame_and_no_resync(self) -> None:
+        result = _capture([
+            _build_video_packet(seq=0, frame_num=0, line_num=0, fill=0x11),
+            _build_video_packet(
+                seq=1, frame_num=0, line_num=4, frame_end=True, fill=0x22
+            ),
+            _build_video_packet(seq=2, frame_num=1, line_num=0, fill=0x33),
+            _zero_header(0x44),
+            _zero_header(0x55),
+            _zero_header(0x55),
+        ])
+        assert [(f.frame_number, f.height) for f in result.frames] == [(0, 8)]
+        assert result.stop_tail_packets == 3
+        assert (result.sequence_resyncs, result.packets_reordered,
+                result.payloads_discarded) == (0, 0, 0)
+        # Frame 1 lost its remaining lines to the tail: dropped, not short.
+        assert result.frames_dropped == 1
+
+    def test_a_restart_after_a_stop_tail_keeps_its_first_line(self) -> None:
+        result = _capture([
+            _build_video_packet(seq=0, frame_num=0, line_num=0, fill=0x11),
+            _build_video_packet(
+                seq=1, frame_num=0, line_num=4, frame_end=True, fill=0x22
+            ),
+            _zero_header(0x33),
+            _zero_header(0x44),
+            # stream_video_start again: the counter restarts at 0.
+            _zero_header(0x55),
+            _build_video_packet(
+                seq=1, frame_num=0, line_num=4, frame_end=True, fill=0x66
+            ),
+        ])
+        assert [(f.frame_number, f.height) for f in result.frames] == [
+            (0, 8), (0, 8)
+        ]
+        assert result.frames[1].row(0) == bytes([5]) * 384
+        assert result.stop_tail_packets == 2
+        assert result.sequence_resyncs == 1
+
+    def test_a_frame_without_its_end_marker_is_dropped_not_short(self) -> None:
+        """Every interior frame carried exactly one end marker, on its last
+        datagram (174/174 frames, bce4535e, 2026-09-22), so a frame that
+        never got one lost its tail -- the capture stopped mid-frame."""
+        result = _capture([
+            _build_video_packet(
+                seq=0, frame_num=0, line_num=0, frame_end=True, fill=0x11
+            ),
+            _build_video_packet(seq=1, frame_num=1, line_num=0, fill=0x22),
+        ])
+        assert [(f.frame_number, f.height) for f in result.frames] == [(0, 4)]
+        assert result.frames_dropped == 1
