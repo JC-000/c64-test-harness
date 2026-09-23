@@ -274,7 +274,9 @@ class TestTodPrimitiveU64Live:
     # ZP-safe code region, past BASIC ($0801) and below KERNAL
     TOD_START_CODE_ADDR = 0xC000
     TOD_READ_CODE_ADDR = 0xC100
-    WRAPPER_ADDR = 0xC200
+    #: The wrapper shares its low byte with ``MAIN_LOOP`` so the hijack is a
+    #: one-byte write; see :meth:`_hijack_main_loop` (#426).
+    WRAPPER_ADDR = 0xC210
     GO_FLAG = 0xC1E0          # host writes 0x01 here to trigger read
     DONE_FLAG = 0xC1E1        # 6502 writes 0x42 when done
     RESULT_ADDR = 0xC1E2      # LE16 elapsed tenths
@@ -323,8 +325,8 @@ class TestTodPrimitiveU64Live:
             $0810  main_loop: JMP $0810
 
         When run via ``client.run_prg``, the CPU will spin at $0810
-        forever, which we can then hijack by writing ``JMP $C200`` at
-        $0810 to redirect execution.
+        forever, which we can then hijack by turning ``JMP $0810`` into
+        ``JMP $C210`` (:meth:`_hijack_main_loop`).
         """
         # PRG files start with a 2-byte load address (little-endian).
         header = bytes([0x01, 0x08])
@@ -411,6 +413,31 @@ class TestTodPrimitiveU64Live:
         w.jmp("park")
         load_code(transport, self.WRAPPER_ADDR, w.build())
 
+    def _hijack_main_loop(self, transport) -> None:
+        """Redirect the running ``JMP $0810`` to the wrapper with one byte.
+
+        The 6510 is executing that ``JMP`` when the write lands, and the
+        U64's DMA write can halt it between two operand fetches: a ``JMP abs``
+        loop never writes, so unless an interrupt writes first ``C64::stop``
+        falls back to a forced stop at whatever cycle it is on (``c64.cc``,
+        ``STOP_COND_FORCE``; source-read at bce4535e).  Halted there, the CPU
+        resumes with the old low byte and the new high byte.  Writing all
+        three bytes of ``JMP $C200`` made that ``JMP $C210`` -- mid-wrapper,
+        where ``FB A9 33`` executes as ``ISC $33A9,Y`` and ``STA $C1E4``
+        stores the result, so ``DIAG_ADDR`` read one lower on every failure
+        while ``$33A9`` counted up (#426, measured on the U64E).
+
+        Only the high byte changes here, so every fetch of the ``JMP`` sees
+        either the old instruction or the new one, never a mix.
+        """
+        if self.WRAPPER_ADDR & 0xFF != self.MAIN_LOOP & 0xFF:
+            raise ValueError(
+                f"WRAPPER_ADDR ${self.WRAPPER_ADDR:04X} must share its low byte "
+                f"with MAIN_LOOP ${self.MAIN_LOOP:04X}: a hijack that rewrites "
+                f"both operand bytes of a running JMP can be fetched torn"
+            )
+        write_bytes(transport, self.MAIN_LOOP + 2, [self.WRAPPER_ADDR >> 8])
+
     def _measure_tod_ratio(self, client, transport, sleep_s: float) -> float:
         """Run one TOD-primitive measurement; return reported/wall ratio.
 
@@ -430,13 +457,7 @@ class TestTodPrimitiveU64Live:
         # DMA flush
         _ = transport.read_memory(self.DONE_FLAG, 1)
 
-        # Hijack main loop -> JMP wrapper
-        write_bytes(
-            transport,
-            self.MAIN_LOOP,
-            bytes([0x4C, self.WRAPPER_ADDR & 0xFF,
-                   (self.WRAPPER_ADDR >> 8) & 0xFF]),
-        )
+        self._hijack_main_loop(transport)
 
         # Wait for wrapper to reach the polling state ($22 diag means
         # tod_start has returned).  We can't assume a fixed sleep time
