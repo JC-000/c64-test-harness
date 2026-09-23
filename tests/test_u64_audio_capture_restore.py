@@ -95,6 +95,14 @@ def _client(
     return client
 
 
+@pytest.fixture(autouse=True)
+def _mutate_gate(monkeypatch):
+    """Set ``U64_ALLOW_MUTATE``: without it exit writes nothing at all, so
+    every test of *what* exit writes needs the gate.  The gate-less tests
+    remove it themselves."""
+    monkeypatch.setenv("U64_ALLOW_MUTATE", "1")
+
+
 def _run(client: MagicMock, body) -> None:
     """Drive the fixture around *body*, which mutates the fake device."""
     gen = restore_sid_config(client)
@@ -173,16 +181,28 @@ def test_drift_present_at_entry_is_only_warned_without_the_mutate_gate(
     assert any("without U64_ALLOW_MUTATE" in r.getMessage() for r in caplog.records)
 
 
-def test_drift_a_test_caused_is_restored_without_the_mutate_gate(monkeypatch) -> None:
-    """The gate only spares drift that was there before the test."""
+def test_an_out_of_band_change_is_not_written_without_the_mutate_gate(
+    monkeypatch, caplog,
+) -> None:
+    """Without the gate the module's config-writing tests are skipped, so a
+    change during a read-only test is not the test's own -- another lane,
+    a reboot, the on-device menu -- and putting the entry value back into
+    the never-touch socket store would be a write nobody allowed."""
     monkeypatch.delenv("U64_ALLOW_MUTATE", raising=False)
     client = _client()
 
-    def body() -> None:
-        client.set_config_item(CAT_SID_ADDRESSING, "UltiSID 1 Address", "$D520")
+    def body() -> None:  # out of band: not through the client under test
+        client._state[CAT_SID_SOCKETS]["SID Socket 2"] = SOCKET_DEFAULT
+        client._state[CAT_SID_ADDRESSING]["UltiSID 1 Address"] = "$D520"
 
-    _run(client, body)
-    assert client._state[CAT_SID_ADDRESSING]["UltiSID 1 Address"] == STOCK_ADDRESS
+    with caplog.at_level("WARNING"):
+        _run(client, body)
+
+    client.set_config_item.assert_not_called()
+    assert client._state[CAT_SID_SOCKETS]["SID Socket 2"] == SOCKET_DEFAULT
+    assert sum(
+        "without U64_ALLOW_MUTATE" in r.getMessage() for r in caplog.records
+    ) == 2
 
 
 def test_restore_runs_after_a_test_raises_partway() -> None:
@@ -331,6 +351,14 @@ def test_restores_item_by_item_and_never_in_one_batch() -> None:
     ]
 
 
+#: The envelopes ``get_config_item`` answers with an absent item or category
+#: on stock firmware -- HTTP 200 with no category key, or an empty map.
+_ABSENT_ENVELOPES = {
+    "UltiSID 1 Address": {"errors": []},
+    "UltiSID 2 Address": {CAT_SID_ADDRESSING: {}, "errors": []},
+}
+
+
 def test_an_item_the_device_does_not_expose_is_left_out(caplog) -> None:
     """The C64U may not have every item: skip it, do not error every test."""
     from c64_test_harness.backends.ultimate64_client import (
@@ -342,13 +370,16 @@ def test_an_item_the_device_does_not_expose_is_left_out(caplog) -> None:
     read = client.get_config_item.side_effect
 
     def get_item(cat: str, item: str) -> dict:
-        if item == "UltiSID 2 Address":
-            raise Ultimate64ProtocolError("no item 'UltiSID 2 Address'")
+        if item in _ABSENT_ENVELOPES:
+            raise Ultimate64ProtocolError(f"no {item!r}")
         if item == "SID Socket 2":
             raise Ultimate64Error("not found", status=404)
         return read(cat, item)
 
     client.get_config_item.side_effect = get_item
+    client.get_config_item_raw.side_effect = (
+        lambda cat, item: _ABSENT_ENVELOPES[item]
+    )
 
     def body() -> None:
         client._state[CAT_SID_ADDRESSING]["SID Socket 1 Address"] = "$D520"
@@ -359,7 +390,42 @@ def test_an_item_the_device_does_not_expose_is_left_out(caplog) -> None:
     assert client.set_config_item.call_args_list == [
         ((CAT_SID_ADDRESSING, "SID Socket 1 Address", STOCK_ADDRESS),)
     ]
-    assert sum("not exposed" in r.getMessage() for r in caplog.records) == 2
+    assert sum("not exposed" in r.getMessage() for r in caplog.records) == 3
+
+
+def _raise_invalid_json(cat: str, item: str):
+    from c64_test_harness.backends.ultimate64_client import Ultimate64ProtocolError
+
+    raise Ultimate64ProtocolError("invalid JSON from device")
+
+
+@pytest.mark.parametrize("raw", [
+    _raise_invalid_json,
+    lambda cat, item: {"errors": ["Could not read item"]},
+    lambda cat, item: {cat: {item: "not a map"}, "errors": []},
+    lambda cat, item: {cat: "not a map", "errors": []},
+    lambda cat, item: ["not", "an", "envelope"],
+    # present under the firmware's case-insensitive name match
+    lambda cat, item: {cat.upper(): {item.lower(): {"current": 1}}, "errors": []},
+], ids=["invalid-json", "errors-array", "item-not-a-map", "category-not-a-map",
+        "not-a-dict", "present-in-another-case"])
+def test_a_protocol_error_that_is_not_absence_stops_the_start(raw) -> None:
+    """Only the absent shapes are skipped.  Counting every
+    ``Ultimate64ProtocolError`` as absence let a device answering garbage
+    empty the plan and start the test unprotected."""
+    from c64_test_harness.backends.ultimate64_client import Ultimate64ProtocolError
+
+    client = _client()
+
+    def get_item(cat: str, item: str):
+        raise Ultimate64ProtocolError("unreadable")
+
+    client.get_config_item.side_effect = get_item
+    client.get_config_item_raw.side_effect = raw
+    gen = restore_sid_config(client)
+    with pytest.raises(Ultimate64ProtocolError):
+        next(gen)
+    client.set_config_item.assert_not_called()
 
 
 def test_an_unreadable_item_that_is_not_absent_stops_the_start() -> None:

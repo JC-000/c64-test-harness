@@ -110,17 +110,43 @@ def _mutate_allowed() -> bool:
     return bool(os.environ.get("U64_ALLOW_MUTATE"))
 
 
+def _names_absent(envelope, category: str, item: str) -> bool:
+    """Whether a raw envelope is the firmware saying "no such item".
+
+    Stock firmware answers an unknown category with HTTP 200 and no category
+    key, and an unknown item with an empty category map, both with an empty
+    ``errors`` (``get_config_item``).  Names match case-insensitively, as
+    the firmware matches them.  Anything else -- an ``errors`` entry, a
+    non-dict envelope or category, the item present -- is not absence.
+    """
+    if not isinstance(envelope, dict) or envelope.get("errors"):
+        return False
+    categories = [
+        v for k, v in envelope.items()
+        if k != "errors" and k.lower() == category.lower()
+    ]
+    if not categories:
+        return True
+    if len(categories) != 1 or not isinstance(categories[0], dict):
+        return False
+    return not any(k.lower() == item.lower() for k in categories[0])
+
+
 def _read_present_item(client, category: str, item: str):
     """The item map, or ``None`` when this device does not expose the item.
 
-    An unknown category or item is ``Ultimate64ProtocolError`` on stock
-    firmware and HTTP 404 on the 3.15 fork (``get_config_item``).  Any other
+    Absence is HTTP 404 (the 3.15 fork) or, on stock firmware, an
+    ``Ultimate64ProtocolError`` whose raw envelope :func:`_names_absent`
+    reads as "no such item".  ``get_config_item`` raises the same error for
+    invalid JSON, an ``errors`` array and malformed shapes, so every other
     failure propagates: a device that cannot be read must not be restored
-    blind.
+    blind, nor have its items quietly dropped from the plan.
     """
     try:
         return client.get_config_item(category, item)
     except Ultimate64ProtocolError as exc:
+        if not _names_absent(client.get_config_item_raw(category, item), category, item):
+            raise
         reason = exc
     except Ultimate64Error as exc:
         if exc.status != 404:
@@ -134,7 +160,7 @@ def _read_present_item(client, category: str, item: str):
 
 
 def _restore_plan(client) -> list:
-    """``(category, item, target, entry current)`` for every item the device has.
+    """``(category, item, target)`` for every item the device has.
 
     The target is the reported ``default`` for ``SID Addressing`` and the
     entry ``current`` for the socket enables (the ``BASELINE_NEVER_TOUCH``
@@ -164,22 +190,22 @@ def _restore_plan(client) -> list:
                 "corrects it only under U64_ALLOW_MUTATE",
                 category, item, current, target,
             )
-        plan.append((category, item, target, current))
+        plan.append((category, item, target))
     return plan
 
 
 def _restore_steps(client, plan) -> list:
     """One teardown step per item: re-read, then PUT only if it differs."""
 
-    def restore(category: str, item: str, target, at_entry) -> None:
+    def restore(category: str, item: str, target) -> None:
         entry = client.get_config_item(category, item)
         current = entry.get("current") if isinstance(entry, dict) else None
         if current == target:
             return
-        if current == at_entry and not _mutate_allowed():
+        if not _mutate_allowed():
             logger.warning(
-                "%s / %s still holds %r, as it did at entry; not writing %r "
-                "without U64_ALLOW_MUTATE", category, item, current, target,
+                "%s / %s holds %r, not %r; not writing it without "
+                "U64_ALLOW_MUTATE", category, item, current, target,
             )
             return
         logger.warning(
@@ -190,9 +216,9 @@ def _restore_steps(client, plan) -> list:
     return [
         (
             f"restore {category} / {item} = {target!r}",
-            functools.partial(restore, category, item, target, at_entry),
+            functools.partial(restore, category, item, target),
         )
-        for category, item, target, at_entry in plan
+        for category, item, target in plan
     ]
 
 
@@ -220,18 +246,22 @@ def restore_sid_config(u64_client: Ultimate64Client):
     hard way: a drifted ``SID Socket 2 Address`` was once captured as a
     baseline by a later run and "restored" to the drifted value,
     reporting success, and four independent read paths had to agree
-    before anyone noticed.  Drift a test *caused* is always put back.
-    Drift already present at entry is corrected only under
-    ``U64_ALLOW_MUTATE``; without it the fixture logs a WARNING at entry
-    and at exit and writes nothing, since correcting it is a config
-    write the operator did not allow.
+    before anyone noticed.
+
+    **Nothing is written without ``U64_ALLOW_MUTATE``.**  Without it the
+    module's config-writing tests are skipped, so any difference at exit
+    -- drift inherited at entry, or a change during the test from another
+    lane, a reboot or the on-device menu -- is not the test's own, and
+    correcting it is a config write the operator did not allow.  The
+    fixture logs a WARNING naming the item and writes nothing.
 
     An item that reports no target refuses the start -- a fixture error,
     deliberately, in place of the old "test will run unprotected" path.
-    An item the device **does not expose** (an unknown category or item:
-    ``Ultimate64ProtocolError``, or HTTP 404 on the 3.15 fork) is left
-    out of the plan with a WARNING: there is nothing to restore on a
-    device without it, and the tests that need it fail on their own.
+    An item the device **does not expose** (HTTP 404 on the 3.15 fork,
+    or on stock firmware an envelope with no such category or item --
+    ``_names_absent``) is left out of the plan with a WARNING: there is
+    nothing to restore on a device without it, and the tests that need it
+    fail on their own.  Any other read failure stops the start.
 
     Each item goes back through its own bodyless ``set_config_item`` PUT
     (never ``set_config_items``, which stops at the first rejection and
