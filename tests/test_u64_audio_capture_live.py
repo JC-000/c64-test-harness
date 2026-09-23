@@ -11,6 +11,7 @@ Example::
 """
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import socket
@@ -24,7 +25,11 @@ from c64_test_harness.backends.u64_audio_capture import (
     EPHEMERAL_AUDIO_PORT,
     AudioCapture,
 )
-from c64_test_harness.backends.ultimate64_client import Ultimate64Client
+from c64_test_harness.backends.ultimate64_client import (
+    Ultimate64Client,
+    Ultimate64Error,
+    Ultimate64ProtocolError,
+)
 from c64_test_harness.backends.ultimate64_helpers import (
     CAT_SID_ADDRESSING,
     CAT_SID_SOCKETS,
@@ -46,8 +51,6 @@ from c64_test_harness.sid import SidFile, build_test_psid
 from live_fixture_teardown import (
     attempt_steps,
     raise_teardown_failures,
-    read_restore_defaults,
-    restore_default_steps,
     teardown_then_release,
 )
 
@@ -102,69 +105,145 @@ def u64_client():
 SOCKET_ENABLE_ITEMS = ("SID Socket 1", "SID Socket 2")
 
 
-def _entry_value_plan(client, category: str, items) -> list:
-    """``(category, item, entry value)`` for a store whose default is unsafe.
+def _mutate_allowed() -> bool:
+    """Read at exit, like ``_requires_mutate`` reads it at collection."""
+    return bool(os.environ.get("U64_ALLOW_MUTATE"))
 
-    The mirror of ``read_restore_defaults`` for a measurement store: it
-    reads ``current`` instead of ``default`` and refuses to start when an
-    item reports none, so exit can still put the item back.  Used only for
-    :data:`BASELINE_NEVER_TOUCH` categories, where the reported default is
-    a reset product rather than this bench's baseline.
+
+def _read_present_item(client, category: str, item: str):
+    """The item map, or ``None`` when this device does not expose the item.
+
+    An unknown category or item is ``Ultimate64ProtocolError`` on stock
+    firmware and HTTP 404 on the 3.15 fork (``get_config_item``).  Any other
+    failure propagates: a device that cannot be read must not be restored
+    blind.
+    """
+    try:
+        return client.get_config_item(category, item)
+    except Ultimate64ProtocolError as exc:
+        reason = exc
+    except Ultimate64Error as exc:
+        if exc.status != 404:
+            raise
+        reason = exc
+    logger.warning(
+        "%s / %s is not exposed by this device (%s); the SID restore "
+        "leaves it alone", category, item, reason,
+    )
+    return None
+
+
+def _restore_plan(client) -> list:
+    """``(category, item, target, entry current)`` for every item the device has.
+
+    The target is the reported ``default`` for ``SID Addressing`` and the
+    entry ``current`` for the socket enables (the ``BASELINE_NEVER_TOUCH``
+    exemption, see ``restore_sid_config``).  An item that exists but
+    reports no target refuses the start: exit could not put it back.
     """
     plan: list = []
-    for item in items:
-        entry = client.get_config_item(category, item)
-        current = entry.get("current") if isinstance(entry, dict) else None
-        if current is None or current == "":
+    wanted = [
+        *((CAT_SID_ADDRESSING, item, "default") for item in SID_SLOT_ADDRESS_ITEMS.values()),
+        *((CAT_SID_SOCKETS, item, "current") for item in SOCKET_ENABLE_ITEMS),
+    ]
+    for category, item, key in wanted:
+        entry = _read_present_item(client, category, item)
+        if entry is None:
+            continue
+        target = entry.get(key) if isinstance(entry, dict) else None
+        if target is None or target == "":
+            what = "current value" if key == "current" else "default"
             raise RuntimeError(
-                f"{category} / {item} reports no current value ({entry!r}); "
+                f"{category} / {item} reports no {what} ({entry!r}); "
                 "refusing to start, because exit could not restore it"
             )
-        plan.append((category, item, current))
+        current = entry.get("current")
+        if current != target:
+            logger.warning(
+                "%s / %s drifted at entry: current %r, default %r; exit "
+                "corrects it only under U64_ALLOW_MUTATE",
+                category, item, current, target,
+            )
+        plan.append((category, item, target, current))
     return plan
+
+
+def _restore_steps(client, plan) -> list:
+    """One teardown step per item: re-read, then PUT only if it differs."""
+
+    def restore(category: str, item: str, target, at_entry) -> None:
+        entry = client.get_config_item(category, item)
+        current = entry.get("current") if isinstance(entry, dict) else None
+        if current == target:
+            return
+        if current == at_entry and not _mutate_allowed():
+            logger.warning(
+                "%s / %s still holds %r, as it did at entry; not writing %r "
+                "without U64_ALLOW_MUTATE", category, item, current, target,
+            )
+            return
+        logger.warning(
+            "restoring %s / %s from %r to %r", category, item, current, target,
+        )
+        client.set_config_item(category, item, target)
+
+    return [
+        (
+            f"restore {category} / {item} = {target!r}",
+            functools.partial(restore, category, item, target, at_entry),
+        )
+        for category, item, target, at_entry in plan
+    ]
 
 
 @pytest.fixture(autouse=True)
 def restore_sid_config(u64_client: Ultimate64Client):
-    """Put SID addressing and socket enables back to the device defaults.
+    """Put SID addressing and socket enables back where they belong.
 
     It is **autouse**. Two tests here mutate SID configuration and
     neither restored it; requiring each author to remember an opt-in
     fixture is exactly what failed.
 
-    **What it writes is the ``default`` the device reports for each item,
-    not the value read at entry (#447).** The bench baseline is ``current
-    == default`` per item (#334), so an entry snapshot is the baseline
-    only while nothing has drifted -- and a drifted value is precisely
-    what a SIGKILLed predecessor leaves behind. This module learned that
-    the hard way: a drifted ``SID Socket 2 Address`` was once captured as
-    a baseline by a later run and "restored" to the drifted value,
-    reporting success, and four independent read paths had to agree
-    before anyone noticed. Writing the device's own default clears such
-    drift instead of re-installing it.
+    **It writes only what differs.** At exit each item is re-read and
+    PUT only where ``current`` differs from its target, so an untouched
+    bench costs reads and no writes.  That matters twice over: most tests
+    here are read-only and run on ``U64_HOST`` alone, without
+    ``U64_ALLOW_MUTATE``, and the firmware has no same-value short-circuit
+    -- every config PUT re-runs the store's ``effectuate_settings``,
+    which for ``SID Sockets Configuration`` is the socket power path.
 
-    ``read_restore_defaults`` reads every default before the test runs
-    and refuses to start when an item reports none -- a fixture error,
-    deliberately, in place of the old "test will run unprotected" path:
-    a device that cannot be restored should stop the run, not quietly
-    poison every later measurement on the bench.  An item already off
-    its default at entry is logged at WARNING naming what exit will
-    write.
+    **The addressing target is the ``default`` the device reports, not
+    the value read at entry (#447).** The bench baseline is ``current ==
+    default`` per item (#334), so an entry snapshot is the baseline only
+    while nothing has drifted -- and a drifted value is precisely what a
+    SIGKILLed predecessor leaves behind. This module learned that the
+    hard way: a drifted ``SID Socket 2 Address`` was once captured as a
+    baseline by a later run and "restored" to the drifted value,
+    reporting success, and four independent read paths had to agree
+    before anyone noticed.  Drift a test *caused* is always put back.
+    Drift already present at entry is corrected only under
+    ``U64_ALLOW_MUTATE``; without it the fixture logs a WARNING at entry
+    and at exit and writes nothing, since correcting it is a config
+    write the operator did not allow.
+
+    An item that reports no target refuses the start -- a fixture error,
+    deliberately, in place of the old "test will run unprotected" path.
+    An item the device **does not expose** (an unknown category or item:
+    ``Ultimate64ProtocolError``, or HTTP 404 on the 3.15 fork) is left
+    out of the plan with a WARNING: there is nothing to restore on a
+    device without it, and the tests that need it fail on their own.
 
     Each item goes back through its own bodyless ``set_config_item`` PUT
     (never ``set_config_items``, which stops at the first rejection and
     leaves the rest holding this test's values), and every step is
-    attempted even when an earlier one raises.  The addressing writes are
-    unconditional rather than diffed against a snapshot -- correcting
-    drift this test did not cause is the point, and a config PUT is
-    bodyless, so it costs no ``/Temp`` attachment.
+    attempted even when an earlier one raises.
 
-    **The socket enables are a named exemption: they go back to the value
-    read at entry, never to their default.**  ``SID Sockets
-    Configuration`` is in :data:`BASELINE_NEVER_TOUCH`
-    (``ultimate64_baseline.py``) and the reason is measured, not
-    inferred: ``ConfigStore::reset`` sets ``SID Socket 1/2 = Disabled``
-    and ``U64SidSockets::effectuate_settings`` (``u64_config.cc:744-800``)
+    **The socket enables are a named exemption: their target is the value
+    read at entry, never their default.**  ``SID Sockets Configuration``
+    is in :data:`BASELINE_NEVER_TOUCH` (``ultimate64_baseline.py``) and
+    the reason is measured, not inferred: ``ConfigStore::reset`` sets
+    ``SID Socket 1/2 = Disabled`` and
+    ``U64SidSockets::effectuate_settings`` (``u64_config.cc:744-800``)
     then writes regulator bits 0 to the PLD SIDCTRL / I2C, so **writing
     that default cuts power to the socketed SIDs** while the config read
     still looks clean (U64E, two 8580s, 2026-09-05, n=3).  Detection
@@ -179,17 +258,12 @@ def restore_sid_config(u64_client: Ultimate64Client):
     is for *selector* items, and these are measurements.  The entry
     value is the baseline here, so it is what goes back.
     """
-    plan = read_restore_defaults(
-        u64_client, {CAT_SID_ADDRESSING: list(SID_SLOT_ADDRESS_ITEMS.values())}
-    )
-    socket_plan = _entry_value_plan(u64_client, CAT_SID_SOCKETS, SOCKET_ENABLE_ITEMS)
+    plan = _restore_plan(u64_client)
     failures: list = []
     try:
         yield
     finally:
-        failures = attempt_steps(
-            restore_default_steps(u64_client, [*plan, *socket_plan])
-        )
+        failures = attempt_steps(_restore_steps(u64_client, plan))
     raise_teardown_failures("SID config restore", failures)
 
 

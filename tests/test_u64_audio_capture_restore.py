@@ -133,21 +133,56 @@ def test_addresses_go_back_to_their_device_default() -> None:
     }
 
 
-def test_an_address_drifted_at_entry_is_corrected_not_reinstalled() -> None:
+def _drifted_client() -> MagicMock:
+    drifted = {item: STOCK_ADDRESS for item in ADDRESS_ITEMS}
+    drifted["SID Socket 2 Address"] = "$D520"
+    return _client(addresses=drifted)
+
+
+def test_an_address_drifted_at_entry_is_corrected_under_the_mutate_gate(
+    monkeypatch,
+) -> None:
     """#447: the entry value can be a dead lane's residue.
 
     A snapshot-and-restore fixture would put ``$D520`` back and report
     success -- which is how a drifted ``SID Socket 2 Address`` once
     survived four independent read paths.
     """
-    drifted = {item: STOCK_ADDRESS for item in ADDRESS_ITEMS}
-    drifted["SID Socket 2 Address"] = "$D520"
-    client = _client(addresses=drifted)
+    monkeypatch.setenv("U64_ALLOW_MUTATE", "1")
+    client = _drifted_client()
 
     _run(client, lambda: None)
 
     assert client._state[CAT_SID_ADDRESSING]["SID Socket 2 Address"] == STOCK_ADDRESS
-    assert ("SID Socket 2 Address", "$D520") not in _writes(client, CAT_SID_ADDRESSING)
+    assert _writes(client, CAT_SID_ADDRESSING) == [("SID Socket 2 Address", STOCK_ADDRESS)]
+
+
+def test_drift_present_at_entry_is_only_warned_without_the_mutate_gate(
+    monkeypatch, caplog,
+) -> None:
+    """Correcting inherited drift is a config write, and a read-only test
+    running on ``U64_HOST`` alone was never allowed one."""
+    monkeypatch.delenv("U64_ALLOW_MUTATE", raising=False)
+    client = _drifted_client()
+
+    with caplog.at_level("WARNING"):
+        _run(client, lambda: None)
+
+    client.set_config_item.assert_not_called()
+    assert client._state[CAT_SID_ADDRESSING]["SID Socket 2 Address"] == "$D520"
+    assert any("without U64_ALLOW_MUTATE" in r.getMessage() for r in caplog.records)
+
+
+def test_drift_a_test_caused_is_restored_without_the_mutate_gate(monkeypatch) -> None:
+    """The gate only spares drift that was there before the test."""
+    monkeypatch.delenv("U64_ALLOW_MUTATE", raising=False)
+    client = _client()
+
+    def body() -> None:
+        client.set_config_item(CAT_SID_ADDRESSING, "UltiSID 1 Address", "$D520")
+
+    _run(client, body)
+    assert client._state[CAT_SID_ADDRESSING]["UltiSID 1 Address"] == STOCK_ADDRESS
 
 
 def test_restore_runs_after_a_test_raises_partway() -> None:
@@ -214,31 +249,48 @@ def test_socket_enables_go_back_to_the_entry_value_not_the_default() -> None:
         item: SOCKET_ENTRY for item in SOCKET_ITEMS
     }
     restores = _writes(client, CAT_SID_SOCKETS)[1:]  # [0] is the body's own write
-    assert restores == [(item, SOCKET_ENTRY) for item in SOCKET_ITEMS], restores
+    assert restores == [("SID Socket 2", SOCKET_ENTRY)], restores
 
 
-def test_the_socket_default_is_never_written_on_an_untouched_bench() -> None:
+@pytest.mark.parametrize("mutate", [False, True], ids=["read-only", "mutate-gate"])
+def test_nothing_is_written_on_an_untouched_bench(monkeypatch, mutate) -> None:
     """The autouse fixture runs after every test, read-only ones included.
 
-    So a teardown that wrote the socket default unconditionally would
-    power the SIDs off on a bench where no test went near them.
+    Those run on ``U64_HOST`` alone, without ``U64_ALLOW_MUTATE``, so a
+    teardown that wrote anything there would be a config write the
+    operator never allowed -- and the firmware has no same-value
+    short-circuit, so even a PUT of the value already held re-runs the
+    store's ``effectuate_settings``, which for ``SID Sockets
+    Configuration`` is the socket power path.  With the gate set it is
+    still a diff: nothing moved, nothing is written.
     """
+    if mutate:
+        monkeypatch.setenv("U64_ALLOW_MUTATE", "1")
+    else:
+        monkeypatch.delenv("U64_ALLOW_MUTATE", raising=False)
     client = _client()
     _run(client, lambda: None)
 
+    client.set_config_item.assert_not_called()
     assert client._state[CAT_SID_SOCKETS] == {
         item: SOCKET_ENTRY for item in SOCKET_ITEMS
     }
-    assert SOCKET_DEFAULT not in [
-        value for _item, value in _writes(client, CAT_SID_SOCKETS)
-    ]
 
 
-def test_a_socket_reporting_no_current_value_refuses_to_start() -> None:
-    """Exit could not put it back, so the run stops before the test body."""
+@pytest.mark.parametrize("entry", [
+    {"default": SOCKET_DEFAULT},
+    {"current": "", "default": SOCKET_DEFAULT},
+], ids=["missing", "empty"])
+def test_a_socket_reporting_no_current_value_refuses_to_start(entry) -> None:
+    """Exit could not put it back, so the run stops before the test body.
+
+    An empty ``current`` is refused like a missing one: the enables are
+    ``Enabled``/``Disabled`` enums, so ``""`` is not a value exit could
+    write back.
+    """
     client = _client()
     client.get_config_item.side_effect = lambda cat, item: (
-        {"default": SOCKET_DEFAULT}
+        dict(entry)
         if cat == CAT_SID_SOCKETS
         else {"current": STOCK_ADDRESS, "default": STOCK_ADDRESS}
     )
@@ -260,7 +312,14 @@ def test_restores_item_by_item_and_never_in_one_batch() -> None:
     that leaves a ``/Temp`` attachment on leak-prone firmware.
     """
     client = _client()
-    _run(client, lambda: None)
+
+    def body() -> None:
+        for item in ADDRESS_ITEMS:
+            client._state[CAT_SID_ADDRESSING][item] = "$D520"
+        for item in SOCKET_ITEMS:
+            client._state[CAT_SID_SOCKETS][item] = SOCKET_DEFAULT
+
+    _run(client, body)
 
     client.set_config_items.assert_not_called()
     client.set_config_items_batch.assert_not_called()
@@ -270,6 +329,49 @@ def test_restores_item_by_item_and_never_in_one_batch() -> None:
     assert _writes(client, CAT_SID_SOCKETS) == [
         (item, SOCKET_ENTRY) for item in SOCKET_ITEMS
     ]
+
+
+def test_an_item_the_device_does_not_expose_is_left_out(caplog) -> None:
+    """The C64U may not have every item: skip it, do not error every test."""
+    from c64_test_harness.backends.ultimate64_client import (
+        Ultimate64Error,
+        Ultimate64ProtocolError,
+    )
+
+    client = _client()
+    read = client.get_config_item.side_effect
+
+    def get_item(cat: str, item: str) -> dict:
+        if item == "UltiSID 2 Address":
+            raise Ultimate64ProtocolError("no item 'UltiSID 2 Address'")
+        if item == "SID Socket 2":
+            raise Ultimate64Error("not found", status=404)
+        return read(cat, item)
+
+    client.get_config_item.side_effect = get_item
+
+    def body() -> None:
+        client._state[CAT_SID_ADDRESSING]["SID Socket 1 Address"] = "$D520"
+
+    with caplog.at_level("WARNING"):
+        _run(client, body)
+
+    assert client.set_config_item.call_args_list == [
+        ((CAT_SID_ADDRESSING, "SID Socket 1 Address", STOCK_ADDRESS),)
+    ]
+    assert sum("not exposed" in r.getMessage() for r in caplog.records) == 2
+
+
+def test_an_unreadable_item_that_is_not_absent_stops_the_start() -> None:
+    """Only "not exposed" is skipped; any other failure is not guessed at."""
+    from c64_test_harness.backends.ultimate64_client import Ultimate64Error
+
+    client = _client()
+    client.get_config_item.side_effect = Ultimate64Error("HTTP 500", status=500)
+    gen = restore_sid_config(client)
+    with pytest.raises(Ultimate64Error, match="500"):
+        next(gen)
+    client.set_config_item.assert_not_called()
 
 
 def test_an_address_reporting_no_default_refuses_to_start() -> None:

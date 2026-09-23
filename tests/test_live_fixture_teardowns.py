@@ -1632,10 +1632,18 @@ class TestAudioCaptureFixtureRestoresDefaults:
     ``default``; the ``SID Sockets Configuration`` enables go back to the
     **entry value**, because that store is in ``BASELINE_NEVER_TOUCH`` and
     its default is a reset product that cuts power to the socketed SIDs.
+    ``_prime`` leaves every address off its default at entry, which the
+    fixture corrects only under ``U64_ALLOW_MUTATE`` -- so ``_gen`` sets it
+    unless told otherwise.
     """
 
     NAME = "test_u64_audio_capture_live.py"
     SOCKETS = ["SID Socket 1", "SID Socket 2"]
+
+    @pytest.fixture(autouse=True)
+    def _mutate(self, monkeypatch):
+        monkeypatch.setenv("U64_ALLOW_MUTATE", "1")
+        return monkeypatch
 
     def _gen(self, probe):
         items, _mirror = _sid_items()
@@ -1653,14 +1661,27 @@ class TestAudioCaptureFixtureRestoresDefaults:
         ]
 
     def test_exit_writes_address_defaults_and_socket_entry_values(self, probe) -> None:
-        items, _client_, gen = self._gen(probe)
+        items, client, gen = self._gen(probe)
         next(gen)
+        for item in self.SOCKETS:  # what a socket-writing test leaves behind
+            client.config[(_CAT_SOCKETS, item)]["current"] = _default(item)
         mark = len(probe.journal)
         with pytest.raises(StopIteration):
             next(gen)
         assert _after(probe.journal, mark) == [
             *_writes(_CAT_ADDRESSING, items), *self._socket_entry_writes(),
         ]
+
+    def test_without_the_mutate_gate_inherited_drift_is_not_written(
+        self, probe, _mutate
+    ) -> None:
+        _mutate.delenv("U64_ALLOW_MUTATE")
+        _items, _client_, gen = self._gen(probe)
+        next(gen)
+        mark = len(probe.journal)
+        with pytest.raises(StopIteration):
+            next(gen)
+        assert _after(probe.journal, mark) == []
 
     def test_the_socket_enable_default_is_never_written(self, probe) -> None:
         """Writing it drops the PLD regulator bits and powers the socketed
