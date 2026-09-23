@@ -294,12 +294,12 @@ _DISCARD_CLAUSE_REQUIRED = (
     "a counter that restarts over a number that was itself lost",
     "52 datagrams in, 41 packets in the WAV, 11 never delivered",
     "#452",
-    # Path 2: the tail held at stop().  No #452 dependency -- this is the
+    # Path 2: the tail held at stop().  No restart needed -- this is the
     # path that justifies the counter, and the one that can vanish quietly.
     "tail of duplicate-looking datagrams still held",
     "106 in, 100 packets in the WAV, 6 discarded",
     "flush_held",
-    "does not depend on #452",
+    "does not depend on a stream restart",
     "MAX_HELD_DUPLICATES",
     # What the harm is, and what is left to see it by.
     "duration, not content",
@@ -359,14 +359,14 @@ _CLAUSE_SEAMS = {
     "module docstring": (
         "``time_base_intact`` True: - **a counter that restarts over a number "
         "that was itself lost**",
-        "stops being enough on its own. - **a tail of duplicate-looking "
+        "the harness's own helpers never do. - **a tail of duplicate-looking "
         "datagrams still held at** ``stop()``",
         "(8 packets, 32 ms of audio). **The harm is duration, not content.**",
     ),
     "docs/sid_audio.md": (
         "`time_base_intact` True: - **a counter that restarts over a number "
         "that was itself lost**",
-        "this note stops being enough. - **a tail of duplicate-looking "
+        "the harness's own helpers never do. - **a tail of duplicate-looking "
         "datagrams still held at `stop()`**",
         "`MAX_HELD_DUPLICATES` (8 packets, 32 ms). The harm is "
         "**duration, not content**",

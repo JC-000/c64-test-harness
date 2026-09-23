@@ -122,21 +122,34 @@ class VideoCaptureResult:
     #: applying them would finalise the frame in progress early and re-open
     #: the old frame number (#442).
     #:
-    #: **Those lines are lost, and this is the only counter that shows it.**
-    #: :attr:`packets_dropped` stays 0 because the datagram did arrive, and
-    #: :attr:`frames_dropped` stays 0 because the frame was finalised from
-    #: the lines it had -- a frame whose last lines are still in flight is
-    #: emitted as a *complete* frame that is simply shorter, since
-    #: ``_finalize_frame`` takes its height from the highest line present.
-    #: So ``packets_dropped == 0 and frames_dropped == 0`` reads clean on a
-    #: capture that lost lines.  A caller bounding video loss must assert on
-    #: this field too, the way audio callers must assert on
-    #: ``CaptureResult.payloads_discarded`` (#443).  Every received datagram
-    #: ends in exactly one of three places -- its lines applied, discarded
-    #: as a duplicate (:attr:`payloads_discarded`), or dropped as stale --
-    #: but there is no ``applied`` field to check that against, so bounding
-    #: loss means asserting on the latter two.
+    #: **Those lines are lost.**  :attr:`packets_dropped` stays 0 because
+    #: the datagram did arrive.  When its lines fall inside the frame or
+    #: it carried the end marker, the frame was finalised with a hole or
+    #: without its end marker and is counted in :attr:`frames_dropped`
+    #: (#452).  Every
+    #: received datagram ends in exactly one of four places -- its lines
+    #: applied, discarded as a duplicate (:attr:`payloads_discarded`),
+    #: dropped as stale, or set aside as a stop tail
+    #: (:attr:`stop_tail_packets`) -- but there is no ``applied`` field to
+    #: check that against, so bounding loss means asserting on the others.
     stale_packets: int = 0
+    #: Datagrams sent after ``stream_video_stop`` took effect, set aside
+    #: unapplied (#452).  Measured on the U64E (bce4535e, 2026-09-22): after
+    #: 11/11 stops the rest of the frame in flight still went out, but with
+    #: sequence, frame and line number all 0 -- 2 to 53 datagrams per stop
+    #: where counted (n=4).
+    #: Applied, they finalised the real frame early and appended a bogus
+    #: 4-line frame 0, and counted up to 9 resyncs and 47 reorders per
+    #: capture.  A datagram with that all-zero header is held until the next
+    #: one: sequence 1 makes it the first datagram of a restarted stream
+    #: (which starts at 0 on every ``stream_video_start``), and it is
+    #: applied; anything else, or the end of the capture, makes it tail.
+    #: The frame the stop cut short never gets its end marker and is
+    #: counted in :attr:`frames_dropped`.  Only sequence 1 readmits, by
+    #: choice: a restart whose sequence 1 is lost has its first datagram
+    #: taken as tail, and that loss shows only in :attr:`frames_dropped`,
+    #: with :attr:`packets_dropped` 0.
+    stop_tail_packets: int = 0
 
 
 class VideoCapture:
@@ -224,6 +237,10 @@ class VideoCapture:
         self._sequence_resyncs = 0
         self._payloads_discarded = 0
         self._stale_packets = 0
+        self._stop_tail_packets = 0
+        self._seen_end_marker = False
+        # An all-zero-header datagram waiting on the next one (#452).
+        self._pending_zero: tuple[int, int, tuple] | None = None
         self._frames_dropped = 0
         self._last_seq: int | None = None
         self._seq = _stream_seq.SequenceTracker()
@@ -247,6 +264,9 @@ class VideoCapture:
         self._sequence_resyncs = 0
         self._payloads_discarded = 0
         self._stale_packets = 0
+        self._stop_tail_packets = 0
+        self._seen_end_marker = False
+        self._pending_zero = None
         self._frames_dropped = 0
         self._last_seq = None
         self._seq = _stream_seq.SequenceTracker()
@@ -282,8 +302,17 @@ class VideoCapture:
         self._thread.start()
         _log.info("VideoCapture started on port %d", self._port)
 
-    def _finalize_frame(self) -> None:
-        """Assemble the current line buffer into a VideoFrame."""
+    def _finalize_frame(self, ended: bool = False) -> None:
+        """Assemble the current line buffer into a VideoFrame.
+
+        *ended*: the frame's end-marker datagram arrived.  Every interior
+        frame carried exactly one, on its last datagram (174/174 frames,
+        U64E bce4535e, 2026-09-22), so once this capture has seen a marker,
+        a frame finalised without one lost its tail -- to a frame-number
+        change or the end of the capture -- and is counted dropped rather
+        than emitted short (#452).  That rests on one firmware build, so a
+        capture that has seen no marker at all emits such frames as before.
+        """
         if self._cur_frame_num is None or not self._cur_frame_lines:
             return
 
@@ -303,7 +332,7 @@ class VideoCapture:
                 missing += 1
                 rows.append(b"\x00" * expected_row_len)
 
-        if missing > 0:
+        if missing > 0 or (not ended and self._seen_end_marker):
             self._frames_dropped += 1
             _log.debug(
                 "Frame %d incomplete: %d/%d lines missing",
@@ -356,52 +385,79 @@ class VideoCapture:
 
             with self._lock:
                 self._packets_received += 1
-                ev = self._seq.observe(seq, zlib.crc32(payload), lines)
-                self._sync_counters()
-
-                if ev.discarded_held:
-                    _log.warning(
-                        "Video stream: %d re-sent datagram(s) were "
-                        "duplicates; lines discarded", ev.discarded_held,
-                    )
-                if ev.kind == _stream_seq.GAP:
-                    _log.warning(
-                        "Video stream gap: expected seq %d, got %d (%d packets dropped)",
-                        ev.expected, seq,
-                        len(ev.tracked_missing) + ev.untracked,
-                    )
-                elif ev.kind == _stream_seq.HELD:
-                    # Duplicate, or a restart over identical pixels: the
-                    # next datagram decides (see _stream_seq).  Applying it
-                    # now would write a line the restart may not own.
+                datagram = (seq, zlib.crc32(payload), lines)
+                if (seq, frame_num, raw_line) == (0, 0, 0) and (
+                    self._seq.highest is not None
+                ):
+                    # A stop tail or a restart's first datagram: the next
+                    # one decides (see VideoCaptureResult.stop_tail_packets).
+                    self._discard_pending_zero()
+                    self._pending_zero = datagram
                     continue
-                elif ev.kind == _stream_seq.LATE:
-                    if frame_num != self._cur_frame_num:
-                        # Its frame is already finalised; see the class
-                        # docstring for why it is not applied anyway.
-                        self._stale_packets += 1
-                        _log.warning(
-                            "Video stream late packet: seq %d belongs to "
-                            "frame %d, which is already finalised; %d "
-                            "line(s) dropped",
-                            seq, frame_num, lines_per_packet,
-                        )
-                        continue
-                    _log.warning(
-                        "Video stream late packet: seq %d arrived after %d; "
-                        "applied to the frame still being assembled",
-                        seq, self._seq.highest,
-                    )
-                elif ev.kind == _stream_seq.RESYNC:
-                    _log.warning(
-                        "Video stream backward step: expected seq %d, got "
-                        "%d; resynchronising on the new sequence",
-                        ev.expected, seq,
-                    )
-                    for held_lines in ev.readmit:
-                        self._apply_packet(*held_lines)
+                if self._pending_zero is not None:
+                    if seq == 1:
+                        self._process(*self._pending_zero)
+                        self._pending_zero = None
+                    else:
+                        self._discard_pending_zero()
+                self._process(*datagram)
 
-                self._apply_packet(*lines)
+    def _discard_pending_zero(self) -> None:
+        """Count the held all-zero-header datagram as stop tail, if any."""
+        if self._pending_zero is not None:
+            self._stop_tail_packets += 1
+            self._pending_zero = None
+
+    def _process(self, seq: int, digest: int, lines: tuple) -> None:
+        """Account for one datagram and apply its lines.  Caller holds the lock."""
+        frame_num = lines[0]
+        lines_per_packet = lines[4]
+        ev = self._seq.observe(seq, digest, lines)
+        self._sync_counters()
+
+        if ev.discarded_held:
+            _log.warning(
+                "Video stream: %d re-sent datagram(s) were "
+                "duplicates; lines discarded", ev.discarded_held,
+            )
+        if ev.kind == _stream_seq.GAP:
+            _log.warning(
+                "Video stream gap: expected seq %d, got %d (%d packets dropped)",
+                ev.expected, seq,
+                len(ev.tracked_missing) + ev.untracked,
+            )
+        elif ev.kind == _stream_seq.HELD:
+            # Duplicate, or a restart over identical pixels: the
+            # next datagram decides (see _stream_seq).  Applying it
+            # now would write a line the restart may not own.
+            return
+        elif ev.kind == _stream_seq.LATE:
+            if frame_num != self._cur_frame_num:
+                # Its frame is already finalised; see the class
+                # docstring for why it is not applied anyway.
+                self._stale_packets += 1
+                _log.warning(
+                    "Video stream late packet: seq %d belongs to "
+                    "frame %d, which is already finalised; %d "
+                    "line(s) dropped",
+                    seq, frame_num, lines_per_packet,
+                )
+                return
+            _log.warning(
+                "Video stream late packet: seq %d arrived after %d; "
+                "applied to the frame still being assembled",
+                seq, self._seq.highest,
+            )
+        elif ev.kind == _stream_seq.RESYNC:
+            _log.warning(
+                "Video stream backward step: expected seq %d, got "
+                "%d; resynchronising on the new sequence",
+                ev.expected, seq,
+            )
+            for held_lines in ev.readmit:
+                self._apply_packet(*held_lines)
+
+        self._apply_packet(*lines)
 
     def _apply_packet(
         self,
@@ -432,7 +488,8 @@ class VideoCapture:
 
         # Frame-end marker: finalize immediately
         if frame_end:
-            self._finalize_frame()
+            self._seen_end_marker = True
+            self._finalize_frame(ended=True)
             self._cur_frame_num = None
 
     def _sync_counters(self) -> None:
@@ -472,6 +529,8 @@ class VideoCapture:
         duration = time.monotonic() - self._capture_start
 
         with self._lock:
+            # An all-zero-header datagram nothing followed is stop tail.
+            self._discard_pending_zero()
             # Whatever is still held was never decided: take it as
             # duplicates, as the audio and debug receivers do.
             held = self._seq.flush_held()
@@ -492,14 +551,16 @@ class VideoCapture:
             sequence_resyncs = self._sequence_resyncs
             payloads_discarded = self._payloads_discarded
             stale_packets = self._stale_packets
+            stop_tail_packets = self._stop_tail_packets
             frames_dropped = self._frames_dropped
 
         _log.info(
             "VideoCapture stopped: %.2fs, %d frames, %d packets (%d dropped, "
-            "%d reordered, %d resyncs, %d discarded, %d stale), %d frames dropped",
+            "%d reordered, %d resyncs, %d discarded, %d stale, %d stop tail), "
+            "%d frames dropped",
             duration, len(frames), packets_received, packets_dropped,
             packets_reordered, sequence_resyncs, payloads_discarded,
-            stale_packets, frames_dropped,
+            stale_packets, stop_tail_packets, frames_dropped,
         )
 
         self._started = False
@@ -515,6 +576,7 @@ class VideoCapture:
             sequence_resyncs=sequence_resyncs,
             payloads_discarded=payloads_discarded,
             stale_packets=stale_packets,
+            stop_tail_packets=stop_tail_packets,
         )
 
     @property

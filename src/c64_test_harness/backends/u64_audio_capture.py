@@ -71,16 +71,15 @@ contract, for anyone reading samples:
   - **a counter that restarts over a number that was itself lost** reads
     as a run of duplicates, so their PCM is discarded.  Measured on a
     loopback stream: 52 datagrams in, 41 packets in the WAV, 11 never
-    delivered.  This path depends on **#452**: it is constructed today
-    only because nobody has established whether starting a stream resets
-    the FPGA's sequence counter.  If it does, a restart over a lost
-    number is routine rather than contrived, and this clause stops being
-    enough on its own.
+    delivered.  Starting a stream does reset the FPGA's sequence counter
+    to 0 (#452, measured 12/12 restarts on the U64E), so this path is
+    reached whenever a caller stops and restarts the stream while one
+    capture is open -- the harness's own helpers never do.
   - **a tail of duplicate-looking datagrams still held at** ``stop()``,
     which :meth:`_stream_seq.SequenceTracker.flush_held` discards.
     Measured: 106 in, 100 packets in the WAV, 6 discarded.  No lost
-    packet and no restart is needed, so this path does not depend on #452
-    -- it is the one that justifies counting discards at all -- and it is
+    packet and no restart is needed, so this path does not depend on a
+    stream restart -- it is the one that justifies counting discards at all -- and it is
     bounded by ``_stream_seq.MAX_HELD_DUPLICATES`` (8 packets, 32 ms of
     audio).
 
@@ -365,9 +364,9 @@ class CaptureResult:
     #: lost number keeps every packet.  Declared and accepted, not fixed;
     #: the full residual list is in ``backends/_stream_seq.py``.  The
     #: packets it loses are counted in :attr:`payloads_discarded`, which is
-    #: the only field that shows them.  How reachable this is on hardware
-    #: is unestablished: whether starting a stream resets the FPGA's
-    #: sequence counter is an open question (#452).
+    #: the only field that shows them.  It is reachable on hardware: every
+    #: stream start resets the FPGA's sequence counter to 0 (#452), so a
+    #: stream restarted inside one capture takes this path.
     packets_reordered: int = 0
     #: Backward steps taken as a new stream position (see
     #: :attr:`packets_reordered`).  The number of packets lost across one is
