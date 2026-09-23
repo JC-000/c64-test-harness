@@ -42,7 +42,9 @@ from __future__ import annotations
 from ._address import refuses_bool_address_args
 
 import logging
+import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -106,6 +108,7 @@ UCI_IDENTIFIER = 0xC9
 BIT_DATA_AV  = 0x80    # bit 7 — response data available
 BIT_STAT_AV  = 0x40    # bit 6 — status data available
 BIT_ERROR    = 0x08    # bit 3 — error flag
+BIT_ABORT_PENDING = 0x04  # bit 2 — ABORT written, not yet serviced by the firmware
 BIT_CMD_BUSY = 0x01    # bit 0 — command busy
 
 # State field (bits 5:4 of status register)
@@ -268,7 +271,7 @@ _WRITE_SOCKET_ID_ADDR = 0xC403
 _WRITE_DATA_BUF_ADDR  = 0xC500
 
 # Where turbo-safe connect/read/close routines read their staged input.
-# Turbo routines are 348-491 bytes at $C000 and cover the legacy $C100 slot,
+# Turbo routines are 366-509 bytes at $C000 and cover the legacy $C100 slot,
 # so the upload overwrote the hostname / socket id (issue #322). These reuse
 # the uci_socket_write slots above, which already clear every routine. Plain
 # routines keep $C100, so their bytes are unchanged.
@@ -291,7 +294,7 @@ _TURBO_SOCKET_ID_ADDR = _WRITE_SOCKET_ID_ADDR  # $C403 — 1 byte
 SOCKET_WRITE_MAX_BYTES = 892
 
 # Default input slots for build_socket_write(turbo_safe=True) (issue #346).
-# The turbo routine is 428 B at $C000 and covers the legacy $C100/$C101/$C1FF
+# The turbo routine is 446 B at $C000 and covers the legacy $C100/$C101/$C1FF
 # defaults. Data goes in the uci_socket_write buffer; the length sits right
 # after a maximum payload -- the slot uci_socket_write itself uses for 892
 # bytes -- so it clears every payload the builder accepts and every routine.
@@ -336,13 +339,13 @@ _PRE_315_SAFE_READ = 893
 #: RAM the multi-block read routine writes, besides the sentinel/error flags
 #: and its own self-modified store operand: status buffer and length fields
 #: (``$C300-$C3FF``), the store countdown (``$C400-$C401``) and the reply
-#: buffer (``$C500-$CAC1``).  End-exclusive ``(start, end)`` pairs, for the
-#: executor's reply-area guard (#484).
+#: buffer (``$C500-$CAC1``).  Inclusive ``(first, last)`` pairs, the form
+#: :func:`_execute_uci_routine`'s *output_spans* takes (#484).
 _MULTIBLOCK_READ_OUTPUT_SPANS = (
-    (_STATUS_ADDR, _ERROR_ADDR + 1),
-    (_READ_REMAIN_LO, _READ_REMAIN_HI + 1),
+    (_STATUS_ADDR, _ERROR_ADDR),
+    (_READ_REMAIN_LO, _READ_REMAIN_HI),
     (_LONG_READ_BUF_ADDR, _LONG_READ_BUF_ADDR + NET_MAX_SOCKET_READ
-     + _SOCKET_READ_HEADER_LEN),
+     + _SOCKET_READ_HEADER_LEN - 1),
 )
 
 #: The header ``read_socket`` sends when the receive failed (``ret = -1``),
@@ -355,8 +358,8 @@ def _input_addr(addr: int | None, turbo_safe: bool, plain: int,
     """Resolve a staged-input address a builder reads (issue #322).
 
     ``None`` picks the default for the routine's size class: plain routines
-    (116-174 B at ``$C000``) end below ``$C100`` and keep that legacy slot,
-    so their bytes are unchanged; turbo routines (348-491 B) cover ``$C100``,
+    (118-176 B at ``$C000``) end below ``$C100`` and keep that legacy slot,
+    so their bytes are unchanged; turbo routines (366-509 B) cover ``$C100``,
     so their input is staged past every routine's footprint, in the
     ``uci_socket_write`` slots (``$C403`` socket id, ``$C500`` buffer).
     """
@@ -455,20 +458,25 @@ _FENCE_BYTES = 16
 # ---------------------------------------------------------------------------
 
 def _build_abort_preamble() -> list[int]:
-    """6502 fragment: send ABORT to clear any pending UCI state.
+    """6502 fragment: send ABORT to clear any pending UCI state, and wait for it.
 
     Best practice: issue ABORT ($04) before starting a new command
-    sequence to ensure a clean slate.  A brief delay loop (LDX #$FF;
-    DEX; BNE) gives the firmware time to process the abort before
-    we proceed.
+    sequence to ensure a clean slate.  The FPGA only latches it as
+    :data:`BIT_ABORT_PENDING`; the firmware services it later, from its
+    command task, with ``HANDSHAKE_RESET`` -- which also resets the command
+    pointer and forces the state to idle (``command_intf.cc`` ``run_task``,
+    ``command_protocol.vhd``).  A command byte written before that lands is
+    lost, so the fragment polls until the bit clears (issue #419; a fixed
+    ``LDX #$FF`` delay stood here and lost the race at 48 MHz).
+
+    Layout: ``LDA #$04 / STA $DF1C / wait: LDA $DF1C / AND #$04 / BNE wait``.
     """
     return [
         _LDA_IMM, CMD_ABORT,
         _STA_ABS, _lo(UCI_CONTROL_STATUS_REG), _hi(UCI_CONTROL_STATUS_REG),
-        # Brief delay loop for abort to take effect
-        _LDX_IMM, 0xFF,
-        _DEX,             # DEX
-        _BNE, 0xFD,       # BNE -3 (back to DEX)
+        _LDA_ABS, _lo(UCI_CONTROL_STATUS_REG), _hi(UCI_CONTROL_STATUS_REG),
+        _AND_IMM, BIT_ABORT_PENDING,
+        _BNE, 0xF9,       # BNE -7 (back to LDA $DF1C)
     ]
 
 
@@ -1058,9 +1066,11 @@ def _emit_write_cmd_from_mem_tsx(src_addr: int, fence: bool = True) -> list[int]
 
 
 def _build_abort_preamble_tsx(fence: bool = True) -> list[int]:
-    """Turbo-safe abort preamble — same as the plain version but with a fence
-    after the control-register write so the abort is fully latched before
-    the ``LDX #$FF / DEX`` settle loop runs.
+    """Turbo-safe :func:`_build_abort_preamble`: fence the ABORT write and
+    every poll of the acknowledgement.
+
+    The poll loop is 23 bytes with the fence, so it branches back with a
+    plain ``BNE`` rather than a JMP trampoline.
     """
     out = [
         _LDA_IMM, CMD_ABORT,
@@ -1069,11 +1079,12 @@ def _build_abort_preamble_tsx(fence: bool = True) -> list[int]:
     ]
     if fence:
         out.extend(_build_fence())
-    out.extend([
-        _LDX_IMM, 0xFF,
-        _DEX,
-        _BNE, 0xFD,
-    ])
+    loop = [_LDA_ABS, _lo(UCI_CONTROL_STATUS_REG), _hi(UCI_CONTROL_STATUS_REG)]
+    if fence:
+        loop.extend(_build_fence())
+    loop.extend([_AND_IMM, BIT_ABORT_PENDING])
+    out.extend(loop)
+    out.extend([_BNE, (-(len(loop) + 2)) & 0xFF])
     return out
 
 
@@ -1150,6 +1161,9 @@ def build_uci_command(
         the FPGA behind ``$DF1C``-``$DF1F`` needs ~38 µs to latch writes and
         settle reads. At stock 1 MHz the plain (unfenced) path is faster and
         just as correct. Defaults to ``False`` for backward compatibility.
+        At the default ``$C000`` a turbo-safe routine takes at most 4 *params*
+        bytes (494 B); a fifth reaches the reply area at ``$C200`` and
+        :func:`_execute_uci_routine` refuses it.
     """
     if isinstance(params, list):
         params = bytes(params)
@@ -1292,7 +1306,7 @@ def build_tcp_connect(
     The socket ID is stored in the first byte of *result_addr*.
 
     *host_addr* defaults to ``$C100`` for a plain routine and ``$C500``
-    (:data:`_TURBO_HOST_ADDR`) for a turbo-safe one, whose 491 bytes cover
+    (:data:`_TURBO_HOST_ADDR`) for a turbo-safe one, whose 509 bytes cover
     ``$C100``; an explicit address inside the routine raises ``ValueError``
     (issue #322).
 
@@ -2090,6 +2104,41 @@ class UCISocketReadTruncatedError(UCIError):
         )
 
 
+class UCISocketNotOwnedError(UCIError):
+    """A socket call named a handle the network target does not own (#428).
+
+    Since #808 the firmware keeps a table of the sockets it opened for the
+    C64 and drops a handle from it when the handle is closed, when a read
+    returns 0 -- a TCP peer closed the connection, or a zero-length UDP
+    datagram arrived (``network_target.cc`` ``read_socket``) -- and, for every
+    handle, on a C64 reset, including the reset ``_execute_uci_routine``
+    issues after a routine timeout (#313).  A read, write or close on a
+    handle outside the table answers ``EBADF`` (errno 9): open a new one.
+    """
+
+
+#: ``errno`` the network target reports for a handle it does not own
+#: (``network_target.cc`` ``owns_socket``; newlib ``EBADF``).
+_EBADF = 9
+
+#: The status codes that carry an errno: ``02,NO DATA: <errno>`` (read) and
+#: ``12,SEND ERROR`` / ``12,ERROR ON CLOSE: <errno>`` (write, close).
+_ERRNO_STATUS = re.compile(r"^(02|12),.*: (\d+)$")
+
+
+def _raise_if_not_owned(transport: C64Transport, command: str, socket_id: int) -> None:
+    """Raise :class:`UCISocketNotOwnedError` on an ``02``/``12`` status with errno 9."""
+    status = _read_status_string(transport)
+    m = _ERRNO_STATUS.match(status.strip())
+    if m and int(m.group(2)) == _EBADF:
+        raise UCISocketNotOwnedError(
+            f"UCI {command} on socket {socket_id}: {status} -- the network "
+            f"target does not own this handle (never opened, closed, closed by "
+            f"a C64 reset, or dropped when a read returned 0 because the peer "
+            f"closed it; #808)"
+        )
+
+
 class UCIInterfaceAbsentError(UCIError):
     """The UCI identifier is not on the bus, so no UCI routine can run (#359).
 
@@ -2230,6 +2279,39 @@ def _check_uci_identifier(transport: C64Transport) -> None:
     raise UCIInterfaceAbsentError(identifier, preference)
 
 
+#: What a routine at ``$C000`` writes by default: the reply at
+#: :data:`_RESP_ADDR`, the status at :data:`_STATUS_ADDR`, the length words,
+#: the sentinel and the error flag -- ``$C200-$C3FF``, inclusive.
+_DEFAULT_OUTPUT_SPANS: tuple[tuple[int, int], ...] = ((_RESP_ADDR, _ERROR_ADDR),)
+
+
+def _check_routine_clear_of(
+    code_addr: int,
+    length: int,
+    spans: Sequence[tuple[int, int]],
+    flags: Sequence[tuple[str, int]] = (),
+) -> None:
+    """Raise ``ValueError`` if ``[code_addr, code_addr + length)`` overlaps any
+    inclusive ``(first, last)`` span in *spans*, or any ``(name, address)``
+    single byte in *flags*."""
+    end = code_addr + length
+    labelled: list[tuple[int, int, str]] = []
+    for first, last in spans:
+        if first > last:
+            raise ValueError(f"output span ${first:04X}-${last:04X} is reversed")
+        if (first, last) == _DEFAULT_OUTPUT_SPANS[0]:
+            label = f"the reply area ${first:04X}-${last:04X}"
+        else:
+            label = f"the output span ${first:04X}-${last:04X}"
+        labelled.append((first, last, label))
+    labelled.extend((addr, addr, f"{name} at ${addr:04X}") for name, addr in flags)
+    for first, last, label in labelled:
+        if code_addr <= last and first < end:
+            raise ValueError(
+                f"{length}-byte routine at ${code_addr:04X} overlaps {label}"
+            )
+
+
 def _execute_uci_routine(
     transport: C64Transport,
     code: bytes,
@@ -2239,6 +2321,7 @@ def _execute_uci_routine(
     timeout: float = _DEFAULT_TIMEOUT,
     *,
     check_identifier: bool = True,
+    output_spans: Sequence[tuple[int, int]] = _DEFAULT_OUTPUT_SPANS,
 ) -> None:
     """Inject and execute a UCI routine on the U64.
 
@@ -2295,7 +2378,17 @@ def _execute_uci_routine(
     enable-and-reset site to hang it on. ``check_identifier=False`` skips it
     -- :func:`uci_probe` does, because reporting the identifier is its job.
 
+    **The routine must not overlap what it writes.**  *output_spans* are
+    inclusive ``(first, last)`` address pairs; the default is the whole
+    ``$C200-$C3FF`` reply area (reply, status, length words, sentinel, error
+    flag).  A routine that writes elsewhere -- #420's multi-block read, which
+    runs to ``$C26B`` and uses the status page and its own buffer -- passes
+    its real spans.  *sentinel_addr* and *error_addr* are checked whatever
+    the spans, because the host clears and polls them.
+
     Raises:
+        ValueError: The routine overlaps an output span, the sentinel or the
+            error flag, before any write.
         UCIInterfaceAbsentError: On an Ultimate transport whose ``$DF1D``
             does not read ``$C9``, before any write (see above).
         UCIError: If the error flag is set after execution (no reset: the
@@ -2306,6 +2399,15 @@ def _execute_uci_routine(
             settle is taken.
     """
     from .transport import TimeoutError
+
+    # Code that overlaps what the routine writes -- or the sentinel and error
+    # flag the host clears and polls -- is overwritten mid-run.  The default
+    # span is the whole $C200-$C3FF reply area; the largest turbo routine's
+    # last byte is $C1FC since #419, a margin of three bytes.
+    _check_routine_clear_of(
+        code_addr, len(code), output_spans,
+        flags=(("the sentinel", sentinel_addr), ("the error flag", error_addr)),
+    )
 
     # The slot must be on the bus before anything is written or typed (#359).
     if check_identifier:
@@ -2536,6 +2638,10 @@ def uci_socket_write(
     :func:`build_socket_write` for the inner-loop scratch addresses.
 
     :param turbo_safe: see :func:`build_uci_command`.
+    :raises UCISocketNotOwnedError: the network target does not own
+        *socket_id* (``"12,SEND ERROR: 9"``) -- e.g. a C64 reset closed it,
+        or an earlier read returned 0 (peer closed, or a zero-length UDP
+        datagram) and the firmware dropped the handle.
     """
     if len(data) > SOCKET_WRITE_MAX_BYTES:
         raise ValueError(
@@ -2562,6 +2668,8 @@ def uci_socket_write(
         turbo_safe=turbo_safe,
     )
     _execute_uci_routine(transport, code, timeout=timeout)
+    # The routine drains only the status; $C200 holds an earlier reply.
+    _raise_if_not_owned(transport, "WRITE_SOCKET", socket_id)
 
 
 def uci_socket_read(
@@ -2574,9 +2682,14 @@ def uci_socket_read(
 ) -> bytes:
     """Read up to *max_len* bytes from a UCI socket.
 
-    Returns the received data (may be shorter than *max_len*).
+    Returns the received data (may be shorter than *max_len*), or ``b""``
+    when nothing is queued.
 
     :param turbo_safe: see :func:`build_uci_command`.
+    :raises UCISocketNotOwnedError: the network target does not own
+        *socket_id* (``"02,NO DATA: 9"``) -- e.g. a C64 reset closed it, or
+        an earlier read returned 0 (peer closed, or a zero-length UDP
+        datagram) and the firmware dropped the handle.
 
     .. note::
         The UCI firmware response is ``[actual_len_lo] [actual_len_hi]
@@ -2633,7 +2746,7 @@ def uci_socket_read(
 
     if max_len > SOCKET_READ_MAX_BYTES:
         return _uci_socket_read_multiblock(
-            transport, socket_id_addr, max_len, timeout, turbo_safe,
+            transport, socket_id, socket_id_addr, max_len, timeout, turbo_safe,
         )
 
     code = build_socket_read(
@@ -2648,6 +2761,9 @@ def uci_socket_read(
     header = transport.read_memory(_RESP_ADDR, _SOCKET_READ_HEADER_LEN)
     payload_len = header[0] | (header[1] << 8)
     if payload_len == _NO_DATA_HEADER:
+        # lwip_recvmsg returned -1: nothing queued ("02,NO DATA: 11", the
+        # 40 ms receive timeout) or a handle the target does not own (#428).
+        _raise_if_not_owned(transport, "READ_SOCKET", socket_id)
         return b""
     available = drained - _SOCKET_READ_HEADER_LEN
     if payload_len > available:
@@ -2671,6 +2787,7 @@ def uci_socket_read(
 
 def _uci_socket_read_multiblock(
     transport: C64Transport,
+    socket_id: int,
     socket_id_addr: int,
     max_len: int,
     timeout: float,
@@ -2681,7 +2798,8 @@ def _uci_socket_read_multiblock(
         socket_id_addr, max_len=max_len, turbo_safe=turbo_safe,
         multi_block=True,
     )
-    _execute_uci_routine(transport, code, timeout=timeout)
+    _execute_uci_routine(transport, code, timeout=timeout,
+                         output_spans=_MULTIBLOCK_READ_OUTPUT_SPANS)
 
     raw = transport.read_memory(_RESP_LEN_ADDR, 2)
     drained = raw[0] | (raw[1] << 8)
@@ -2697,6 +2815,9 @@ def _uci_socket_read_multiblock(
     header = transport.read_memory(_LONG_READ_BUF_ADDR, _SOCKET_READ_HEADER_LEN)
     payload_len = header[0] | (header[1] << 8)
     if payload_len == _NO_DATA_HEADER:
+        # As on the single-block path: nothing queued, or a handle the
+        # target does not own (#428).
+        _raise_if_not_owned(transport, "READ_SOCKET", socket_id)
         return b""
     available = drained - _SOCKET_READ_HEADER_LEN
     if payload_len > available:
@@ -2737,6 +2858,8 @@ def uci_socket_close(
     """Close a UCI socket.
 
     :param turbo_safe: see :func:`build_uci_command`.
+    :raises UCISocketNotOwnedError: the network target does not own
+        *socket_id* (``"12,ERROR ON CLOSE: 9"``).
     """
     socket_id_addr = _input_addr(None, turbo_safe, _DATA_ADDR,
                                  _TURBO_SOCKET_ID_ADDR)
@@ -2744,6 +2867,7 @@ def uci_socket_close(
 
     code = build_socket_close(socket_id_addr, turbo_safe=turbo_safe)
     _execute_uci_routine(transport, code, timeout=timeout)
+    _raise_if_not_owned(transport, "CLOSE_SOCKET", socket_id)
 
 
 def uci_tcp_listen_start(

@@ -1079,6 +1079,26 @@ class TestUnlockedNotice:
         assert not [r for r in caplog.records if UNLOCKED_NOTICE_PHRASE in r.getMessage()]
 
 
+    def test_silent_for_a_port_8080_client_under_its_host_and_port_lock(
+        self, default_lock_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """#434: ``_LockedU64Manager`` locks ``host:port``, so asking about the
+        bare host gave every device on another port a spurious notice."""
+        real = Ultimate64Client(HOST, port=8080, warn_unlocked=False)
+
+        class _OnPort8080(FakeBaselineU64):
+            _device_key = real._device_key  # the key the real client carries
+
+        lock = lock_mod.DeviceLock(f"{HOST}:8080", lock_dir=default_lock_dir)
+        assert lock.acquire(timeout=1.0)
+        try:
+            with caplog.at_level(logging.WARNING, logger=_BASELINE_LOGGER):
+                apply_factory_baseline(_OnPort8080())
+        finally:
+            lock.release()
+        assert not [r for r in caplog.records if UNLOCKED_NOTICE_PHRASE in r.getMessage()]
+
+
 # --------------------------------------------------------------------------- #
 # Opt-in                                                                      #
 # --------------------------------------------------------------------------- #

@@ -1142,7 +1142,8 @@ PAL: 384×272 @ 50fps (68 packets/frame). NTSC: 384×240 @ 60fps. 4-bit packed p
 - `.packets_reordered: int` — datagrams that arrived behind the highest sequence number seen (late, held or resync), one per datagram (#442)
 - `.sequence_resyncs: int` — backward steps the tracker could not repair (restarted counter, forward loss ≥ 32768, a datagram past the 1024-packet reorder window)
 - `.payloads_discarded: int` — datagrams held as possible duplicates and then decided to be duplicates; a true duplicate is a correct discard, so non-zero is not by itself a fault
-- `.stale_packets: int` — late datagrams whose frame was already finalised; **their lines are lost and no other counter shows it** (`packets_dropped` stays 0 — the datagram did arrive; `frames_dropped` stays 0 **for tail loss** — the frame is finalised from the lines it had and emitted complete but short, since its height comes from the highest line present, whereas an **interior** hole counts `frames_dropped` 1 and that frame never reaches `.frames` at all), so a test bounding video loss must assert on this field too
+- `.stale_packets: int` — late datagrams whose frame was already finalised; their lines are lost (`packets_dropped` stays 0 — the datagram did arrive; the frame counts in `frames_dropped`, finalised with a hole or without its end marker, #452)
+- `.stop_tail_packets: int` — datagrams sent after `stream_video_stop` took effect, set aside unapplied: the U64E sends the rest of the frame in flight with sequence, frame and line all 0 (#452). A frame without its end marker counts in `frames_dropped` and never reaches `.frames`
 
 ### `VIC_PALETTE`
 Tuple of 16 `(R, G, B)` tuples — standard VIC-II colors (index 0=black, 1=white, ..., 15=light grey).
@@ -1179,7 +1180,7 @@ Ultimate Command Interface (UCI) socket-level TCP/UDP networking for U64 Elite. 
 - `uci_tcp_connect(transport, host, port, *, timeout=10.0, turbo_safe=False) -> int` — returns socket handle
 - `uci_udp_connect(transport, host, port, *, timeout=10.0, turbo_safe=False) -> int`
 - `uci_socket_write(transport, socket_id, data, *, timeout=10.0, turbo_safe=False) -> None` -- `data` must be at most 892 bytes (`SOCKET_WRITE_MAX_BYTES`; empirical firmware ceiling, theoretical 893 truncates by one byte on the wire). For UDP, one call == one datagram (no firmware coalescing). Larger payloads must be split into multiple calls; each emits its own datagram. See `docs/uci_networking.md § Datagram size limits`. The cost depends on the grade (since #294). All four writes go through `transport.write_memory`, which splits anything over the threshold into PUT-sized pieces unless the cached grade says `writemem_post_safe is True`. So on a leak-prone or unknown grade (the C64U) a call costs **no** `/Temp` attachment. On a post-safe grade the 170-byte routine is one POST, plus a second when the payload exceeds the threshold, and that firmware collects them. Calling `client.write_mem` directly bypasses the chunking and POSTs on any grade. Driving the same protocol C64-side from an uploaded PRG costs only the upload; see PATTERNS § "`/Temp` attachment hygiene".
-- `uci_socket_read(transport, socket_id, max_len=255, *, timeout=10.0, turbo_safe=False) -> bytes` — `max_len` above `NET_MAX_SOCKET_READ` (1472) raises `ValueError`; up to 253 it drains one reply block, above that every Data More block (#420); returns only the payload
+- `uci_socket_read(transport, socket_id, max_len=255, *, timeout=10.0, turbo_safe=False) -> bytes` — `max_len` above `NET_MAX_SOCKET_READ` (1472) raises `ValueError`; up to 253 it drains one reply block, above that every Data More block (#420); returns only the payload; `b""` when nothing is queued; a handle the target does not own raises `UCISocketNotOwnedError`
 - `uci_socket_close(transport, socket_id, *, timeout=10.0, turbo_safe=False) -> None`
 - `uci_tcp_listen_start(transport, port, *, timeout=10.0, turbo_safe=False) -> None`
 - `uci_tcp_listen_state(transport, *, timeout=10.0, turbo_safe=False) -> int` — NOT_LISTENING / LISTENING / CONNECTED / BIND_ERROR / PORT_IN_USE (one listener per device; no handle argument)
@@ -1217,6 +1218,7 @@ All address arguments default to the `$C000` UCI block (`code_addr=0xC000`, data
 
 ### Exceptions
 - `UCIError` — raised on protocol/timeout/error-bit conditions
+- `UCISocketNotOwnedError` (in `uci_network`) — a `UCIError`: `uci_socket_read` / `uci_socket_write` / `uci_socket_close` named a handle the network target does not own (`EBADF`; #428). Since #808 a **C64 reset closes every UCI socket** — `client.reset()` (measured on the U64E at bce4535e, `TestSocketLifetime`) and so the same `machine:reset` that `_execute_uci_routine` issues after a routine timeout — so open a new handle after one. The firmware also drops a handle when a read returns 0 (a TCP peer closed it, or a zero-length UDP datagram arrived; that read returns `b""`), so the next call on it raises
 
 ---
 

@@ -100,7 +100,8 @@ class _DataMoreUci(_UciMachine):
     """
 
     def __init__(self, code: bytes, datagram: bytes | None, *, split: bool = True,
-                 short_by: int = 0, busy_polls: int = 3) -> None:
+                 short_by: int = 0, busy_polls: int = 3,
+                 no_data_status: bytes = b"") -> None:
         super().__init__(code)
         self.mem[LONG_BUF:LONG_BUF + 0x600] = bytes([UNWRITTEN]) * 0x600
         self.datagram = datagram
@@ -112,6 +113,7 @@ class _DataMoreUci(_UciMachine):
         self.status_text = b""
         self._busy_left = 0
         self._stuck = False
+        self.no_data_status = no_data_status or NO_DATA
 
     def _next_block(self) -> None:
         block = self.blocks.pop(0)
@@ -155,7 +157,7 @@ class _DataMoreUci(_UciMachine):
                 self.status_text = OUT_OF_RANGE
             elif self.datagram is None:
                 self.blocks = [b"\xff\xff"]
-                self.status_text = NO_DATA
+                self.status_text = self.no_data_status
             else:
                 payload = self.datagram[:length]
                 header = bytes([len(payload) & 0xFF, len(payload) >> 8])
@@ -272,13 +274,14 @@ def test_pre_315_single_block_reply_drains_the_same_way(turbo: bool) -> None:
 
 # ------------------------------------------------------ the single-block path
 #: sha256 over ``build_socket_read(sid, max_len=n, turbo_safe=t)`` for n in
-#: 0..255, captured on master a7a022e before #420.  Every length a caller
-#: could already build must emit the bytes it emitted before.
+#: 0..255.  Every length a caller could already build must emit the bytes
+#: master emits: re-captured on master cbb79f8 (after #476/#484/#480, whose
+#: preamble change altered them), and equal to this branch's output there.
 _SINGLE_BLOCK_PINS = {
-    (False, None): "0e573c73f5388268eebac3a72c071177b9d07ec5afda004c1c3639a76ab85ac3",
-    (False, SOCKET_ID_ADDR): "71e24091e33f99c6b0a28594d0acbbee62fa53422e016c5f836d6efa3740f0d3",
-    (True, None): "0cabf20aa56312c0bdec12743c49ffbb6b808e9ea412de223c1a4cc018950a15",
-    (True, SOCKET_ID_ADDR): "0cabf20aa56312c0bdec12743c49ffbb6b808e9ea412de223c1a4cc018950a15",
+    (False, None): "a026373c88e4355512b3478b1aa0604f3c26bc0b679d0c70494ce8ac7890d1ee",
+    (False, SOCKET_ID_ADDR): "6f7946377bc77c1d121a2a312641b1a45709a5e6def3c6cceba0d05853cc1303",
+    (True, None): "f1781fad0325a7451e96564a3ba4761c95c408071fc88d2e362ff4e3f4162322",
+    (True, SOCKET_ID_ADDR): "f1781fad0325a7451e96564a3ba4761c95c408071fc88d2e362ff4e3f4162322",
 }
 
 
@@ -412,6 +415,18 @@ def test_the_hazard_is_real_in_the_model() -> None:
 
 @pytest.mark.parametrize("max_len", [100, NET_MAX_SOCKET_READ],
                          ids=["single-block", "multi-block"])
+def test_a_handle_the_target_does_not_own_raises_on_both_paths(
+    max_len: int,
+) -> None:
+    """``$FFFF`` with ``02,NO DATA: 9`` (EBADF) is a dead handle, not an
+    empty socket, above 253 bytes as below (#428, #480)."""
+    t = _SimTransport(None, no_data_status=b"02,NO DATA: 9")
+    with pytest.raises(u.UCISocketNotOwnedError):
+        uci_socket_read(t, 5, max_len=max_len)
+
+
+@pytest.mark.parametrize("max_len", [100, NET_MAX_SOCKET_READ],
+                         ids=["single-block", "multi-block"])
 def test_an_empty_socket_is_an_empty_read_without_a_warning(
     max_len: int, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -513,7 +528,7 @@ def _uncovered(stores: set[int], spans, *, code_addr: int, code_len: int) -> set
     return {
         a for a in stores
         if a not in flags and a not in self_modified_operand
-        and not any(start <= a < end for start, end in spans)
+        and not any(first <= a <= last for first, last in spans)
     }
 
 
@@ -537,7 +552,7 @@ def test_the_declared_output_spans_cover_every_store(turbo: bool) -> None:
     assert len(in_code) == 2, "only the store operand's two bytes self-modify"
     # The store pointer is bounded by the storage limit: the last reply byte
     # lands exactly at the span's end.
-    assert max(a for a in stores if a >= LONG_BUF) == u._MULTIBLOCK_READ_OUTPUT_SPANS[2][1] - 1
+    assert max(a for a in stores if a >= LONG_BUF) == u._MULTIBLOCK_READ_OUTPUT_SPANS[2][1]
 
 
 @pytest.mark.parametrize("turbo", PATHS, ids=["plain", "turbo"])
@@ -548,9 +563,9 @@ def test_the_coverage_check_fails_on_an_undersized_span(turbo: bool) -> None:
     status, remain, reply = u._MULTIBLOCK_READ_OUTPUT_SPANS
     short = (status, remain, (reply[0], reply[1] - 1))
     assert _uncovered(stores, short, code_addr=_CODE_ADDR,
-                      code_len=code_len) == {reply[1] - 1}
+                      code_len=code_len) == {reply[1]}
     assert _uncovered(stores, (status, reply), code_addr=_CODE_ADDR,
-                      code_len=code_len) == set(range(*remain))
+                      code_len=code_len) == set(range(remain[0], remain[1] + 1))
 
 
 def test_the_coverage_check_fails_on_a_store_outside_every_span() -> None:

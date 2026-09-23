@@ -81,13 +81,19 @@ from c64_test_harness.backends.ultimate64_helpers import (
     get_detected_sid_types,
     get_sid_socket_enabled,
     isolated_sid_addressing,
-    restore_config_items,
     set_sid_auto_mirroring,
     sid_address_conflicts,
 )
 from c64_test_harness.backends.ultimate64_schema import (
     SID_AUTO_MIRRORING_ITEM,
+    SID_SLOT_ADDRESS_ITEMS,
     SidSlot,
+)
+from live_fixture_teardown import (
+    attempt_steps,
+    raise_teardown_failures,
+    read_restore_defaults,
+    restore_default_steps,
 )
 
 #: No default (#243): a live module that invents a device drives real
@@ -195,6 +201,22 @@ def _is_open_bus(window: tuple[int, int]) -> bool:
     )
 
 
+def _verify_defaults(client, plan):
+    """A teardown step asserting every planned item reads back at its default."""
+    def check() -> None:
+        final = _sid_addressing_category(client)
+        wrong = {
+            item: (final.get(item), default)
+            for _cat, item, default in plan
+            if final.get(item) != default
+        }
+        if wrong:
+            raise AssertionError(
+                f"SID Addressing not restored to defaults (item: got, want): {wrong}"
+            )
+    return check
+
+
 @pytest.fixture(scope="module")
 def target():
     with create_manager(
@@ -205,6 +227,18 @@ def target():
             check_measurement_environment(client)
             stock = _sid_addressing_category(client)
             assert stock, "SID Addressing category came back empty"
+            # #447: exit restores the ``default`` the device reports for
+            # each item this module writes, not this entry snapshot -- an
+            # entry value can be a SIGKILLed predecessor's residue, and
+            # putting it back re-installs the drift (#334 baseline:
+            # ``current == default`` per item).  ``stock`` stays, because
+            # the ON-stock positive control asserts on the map that is
+            # actually installed while the tests run; it is no longer what
+            # teardown writes.  Read before any write, and it refuses to
+            # start when an item reports no usable default.
+            plan = read_restore_defaults(client, {CAT_SID_ADDRESSING: [
+                *SID_SLOT_ADDRESS_ITEMS.values(), SID_AUTO_MIRRORING_ITEM,
+            ]})
             # BASIC READY is what run_subroutine's SYS trampoline needs.
             client.reset()
             time.sleep(3.0)
@@ -213,14 +247,18 @@ def target():
                 verbose=False,
             ) is not None, "C64 never reached READY after reset"
             tgt.stock_sid_addressing = stock  # type: ignore[attr-defined]
+            tgt.sid_addressing_defaults = {  # type: ignore[attr-defined]
+                item: default for _cat, item, default in plan
+            }
+            failures: list = []
             try:
                 yield tgt
             finally:
-                restore_config_items(client, CAT_SID_ADDRESSING, stock)
-                final = _sid_addressing_category(client)
-                assert final == stock, (
-                    f"SID Addressing not restored: {final} != {stock}"
-                )
+                failures = attempt_steps([
+                    *restore_default_steps(client, plan),
+                    ("verify SID Addressing defaults", _verify_defaults(client, plan)),
+                ])
+            raise_teardown_failures("SID Addressing teardown", failures)
 
 
 def test_auto_mirroring_readback_reflects_the_write(target) -> None:
@@ -231,7 +269,10 @@ def test_auto_mirroring_readback_reflects_the_write(target) -> None:
     with itself would still fail here.
     """
     client = target.client
-    stock_value = target.stock_sid_addressing[SID_AUTO_MIRRORING_ITEM]
+    # #447: the device's own default for the item, not the value read at
+    # entry -- the fixture read it before any write and exit writes the
+    # same thing, so this test and the teardown agree on the baseline.
+    default_value = target.sid_addressing_defaults[SID_AUTO_MIRRORING_ITEM]
     try:
         set_sid_auto_mirroring(client, False)
         assert _sid_addressing_category(client)[SID_AUTO_MIRRORING_ITEM] == "Disabled"
@@ -239,9 +280,9 @@ def test_auto_mirroring_readback_reflects_the_write(target) -> None:
         assert _sid_addressing_category(client)[SID_AUTO_MIRRORING_ITEM] == "Enabled"
     finally:
         client.set_config_item(
-            CAT_SID_ADDRESSING, SID_AUTO_MIRRORING_ITEM, stock_value
+            CAT_SID_ADDRESSING, SID_AUTO_MIRRORING_ITEM, default_value
         )
-    assert _sid_addressing_category(client)[SID_AUTO_MIRRORING_ITEM] == stock_value
+    assert _sid_addressing_category(client)[SID_AUTO_MIRRORING_ITEM] == default_value
 
 
 def _skip_if_socket_empty(client, slot: SidSlot) -> None:
@@ -322,7 +363,15 @@ def test_isolated_map_decodes_distinctly_and_stock_map_aliases(
                 f"(stride {STRIDE_A}); got {on}.  The mirror mechanism did "
                 f"not engage, so the positive control is not a control."
             )
-        # The context manager put the whole category back.
+        # The context manager put the whole category back.  This compares
+        # against the entry snapshot on purpose: it asserts
+        # ``isolated_sid_addressing``'s own round trip, which restores the
+        # snapshot IT took, and is not a live-test teardown (#447 leaves it).
+        # Residue, on a bench already drifted at entry:
+        # ``test_auto_mirroring_readback_reflects_the_write`` now leaves
+        # ``Auto Address Mirroring`` at its *default* while ``stock`` holds
+        # the drifted value, so a future parametrisation of this test could
+        # trip on an item it never moved.  The drifted bench is the fault.
         assert _sid_addressing_category(client) == stock
 
         # -- ON-stock: the trap ------------------------------------------

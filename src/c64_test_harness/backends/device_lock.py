@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import ipaddress
 import json
 import logging
 import math
@@ -126,6 +127,118 @@ def _sanitize_device_id(host: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9.\-]", "_", host)
     s = re.sub(r"_+", "_", s)
     return s.strip("_") or "unknown"
+
+
+#: The device's REST port.  A ``host:80`` spelling names the same device
+#: as a bare ``host`` (it is ``Ultimate64Client``'s own ``port`` default),
+#: so :func:`normalize_device_host` folds that one port and keeps every
+#: other.  ``ultimate64_temp_gc.DEFAULT_REST_PORT`` is this constant.
+DEFAULT_DEVICE_PORT = 80
+
+
+def normalize_device_host(host: str) -> str:
+    """Canonical form of a host string: **one device, one key** (#434).
+
+    This is the single normaliser shared by the two places that key state
+    per device -- the ``DeviceLock`` lockfile (via :func:`_device_lock_key`)
+    and the ``/Temp`` ledger (``ultimate64_temp_gc.temp_ledger_key``, which
+    is this function).  They must agree: if they disagreed, one spelling of
+    a device could take the lock while another spelling spent its own
+    ``/Temp`` budget on the same hardware.
+
+    Folds together spellings of one address: surrounding whitespace, case,
+    an ``http://``/``https://`` scheme, a trailing path, IPv6 brackets, a
+    trailing dot, and the textual forms of one IP address
+    (``0:0:0:0:0:0:0:1`` and ``::1``).
+
+    **A non-default port is kept.**  Only :data:`DEFAULT_DEVICE_PORT`
+    folds, because ``host:80`` and ``host`` name one device.  ``gw:8080``
+    and ``gw:8081`` are two devices, and both the lock and the ledger key
+    them apart -- merging them would let two devices behind one name share
+    a lock and a budget.  ``DeviceLock`` sees a port only through the host
+    string, so every caller holding a separate ``port`` folds it in with
+    :func:`device_key`.
+
+    **A name and the address it resolves to are not folded.**  That would
+    need a DNS lookup in the keying path, which can block for seconds and
+    can answer differently over time, and the lock is taken on paths that
+    must not do network I/O.  So ``c64u.lan`` and ``10.53.21.158`` remain
+    two keys for one device: use one spelling per device.  Documented
+    limit, pinned by ``tests/test_temp_budget_per_device.py::
+    test_a_name_and_an_ip_are_not_merged_documented_limit``.  Keying on a
+    device identity read from ``GET /v1/info`` (the U64E reports
+    ``unique_id``) would close it, but it puts a network probe -- and a
+    device that may be wedged -- in the path of taking a lock.
+    """
+    s = str(host).strip().lower()
+    for scheme in ("http://", "https://"):
+        if s.startswith(scheme):
+            s = s[len(scheme):]
+            break
+    s = s.split("/", 1)[0]
+    port = ""
+    if s.startswith("["):
+        end = s.find("]")
+        if end != -1:
+            rest = s[end + 1:]
+            s = s[1:end]
+            if rest.startswith(":") and rest[1:].isdigit():
+                port = rest[1:]
+    elif s.count(":") == 1:
+        name, _, maybe_port = s.partition(":")
+        if maybe_port.isdigit():
+            s, port = name, maybe_port
+    s = s.rstrip(".")
+    try:
+        s = str(ipaddress.ip_address(s))
+    except ValueError:
+        pass
+    if not s:
+        return str(host)
+    if port and int(port) != DEFAULT_DEVICE_PORT:
+        # Re-bracket an IPv6 literal so "address" and "port" stay readable
+        # (and so ``::1`` with a port cannot collide with a bare address).
+        return f"[{s}]:{port}" if ":" in s else f"{s}:{port}"
+    return s
+
+
+def device_key(host: str, port: int = DEFAULT_DEVICE_PORT) -> str:
+    """The key for the device at *host* on REST *port*: lock, ledger, callbacks.
+
+    ``DeviceLock`` sees a port only in the host string, so every caller that
+    holds a host and a separate ``port`` -- ``Ultimate64Client``, the
+    manager's lock, ``liveness_probe`` -- must fold the port in the same way,
+    or a lock taken by one never covers the state keyed by another and the
+    lock-release ``/Temp`` drain silently misses (#434).  This is that rule.
+
+    The result is :func:`normalize_device_host` of ``host:port``, with an
+    IPv6 literal re-bracketed first: ``::1`` on 8080 is ``[::1]:8080``,
+    never ``::1:8080``, which is a different (valid) IPv6 address.  The
+    default port folds away, so ``device_key(h) == normalize_device_host(h)``.
+    *host* is expected to carry no port of its own when *port* is given.
+    """
+    base = normalize_device_host(host)
+    if int(port) == DEFAULT_DEVICE_PORT:
+        return base
+    try:
+        is_v6 = ipaddress.ip_address(base).version == 6
+    except ValueError:
+        is_v6 = False
+    return normalize_device_host(f"[{base}]:{port}" if is_v6 else f"{base}:{port}")
+
+
+def _device_lock_key(host: str) -> str:
+    """Filename component identifying *host*'s device lock.
+
+    :func:`normalize_device_host` first, so every spelling of one device
+    reaches one lockfile, then :func:`_sanitize_device_id` to make the
+    result safe to put in a filename.  Keying on the raw string is what
+    let ``U64.lan``, ``u64.lan``, ``http://u64.lan/`` and ``u64.lan:80``
+    take four lockfiles for one device on a case-sensitive filesystem
+    (three on case-insensitive APFS, which this bench uses), so two lanes
+    could both hold "the lock" and drive the same hardware (#434).
+    """
+    return _sanitize_device_id(normalize_device_host(host))
 
 
 # Waiter intent files live in ``<lockfile>.queue/`` and are named
@@ -559,7 +672,7 @@ class DeviceLock:
             use it — they are concurrent users, not one nested user.
         """
         self._device_host = device_host
-        self._device_id = _sanitize_device_id(device_host)
+        self._device_id = _device_lock_key(device_host)
         self._lock_dir = lock_dir or _default_lock_dir()
         self._lock_path = self._lock_dir / f"device-{self._device_id}.lock"
         self._queue_dir_path = Path(str(self._lock_path) + ".queue")
@@ -1327,7 +1440,7 @@ class DeviceLock:
         decide whether they are a good citizen or a squatter.
         """
         d = lock_dir or _default_lock_dir(create=False)
-        key = str(d / f"device-{_sanitize_device_id(device_host)}.lock")
+        key = str(d / f"device-{_device_lock_key(device_host)}.lock")
         with _PROCESS_HELD_GUARD:
             return _PROCESS_HELD.get(key, 0) > 0
 
@@ -1355,7 +1468,7 @@ class DeviceLock:
         (a waiter that collides just retries on its next 100 ms poll).
         """
         d = lock_dir or _default_lock_dir(create=False)
-        path = d / f"device-{_sanitize_device_id(device_host)}.lock"
+        path = d / f"device-{_device_lock_key(device_host)}.lock"
         try:
             fd = os.open(str(path), os.O_RDONLY)
         except OSError:
@@ -1460,7 +1573,7 @@ class DeviceLock:
         unobservable.
         """
         d = lock_dir or _default_lock_dir()
-        device_id = _sanitize_device_id(device_host)
+        device_id = _device_lock_key(device_host)
         queue_dir = Path(str(d / f"device-{device_id}.lock") + ".queue")
         return cls._count_live_waiters(queue_dir)
 
@@ -1902,7 +2015,7 @@ def device_lock_path(device_host: str, lock_dir: Path | None = None) -> Path:
     the exact file rather than reverse-engineering the sanitizing rule.
     """
     d = lock_dir or _default_lock_dir(create=False)
-    return d / f"device-{_sanitize_device_id(device_host)}.lock"
+    return d / f"device-{_device_lock_key(device_host)}.lock"
 
 
 def device_lock_holder(
@@ -2014,10 +2127,11 @@ def warn_unlocked_client(
             return False
         if DeviceLock.held_by_this_process(device_host, lock_dir=lock_dir):
             return False
+        warn_key = _device_lock_key(device_host)
         with _PROCESS_HELD_GUARD:
-            if device_host in _UNLOCKED_WARNED:
+            if warn_key in _UNLOCKED_WARNED:
                 return False
-            _UNLOCKED_WARNED.add(device_host)
+            _UNLOCKED_WARNED.add(warn_key)
         path = device_lock_path(device_host, lock_dir=lock_dir)
         holder = DeviceLock.foreign_holder(device_host, lock_dir=lock_dir)
     except Exception:  # pragma: no cover - defensive
@@ -2067,7 +2181,7 @@ def register_release_callback(device_host: str, obj: object, method: str) -> Non
     the release proceeds regardless. Registering the same object and
     method twice is a no-op.
     """
-    key = _sanitize_device_id(device_host)
+    key = _device_lock_key(device_host)
     with _RELEASE_CALLBACK_GUARD:
         entries = _RELEASE_CALLBACKS.setdefault(key, [])
         for ref, name in entries:
@@ -2078,7 +2192,7 @@ def register_release_callback(device_host: str, obj: object, method: str) -> Non
 
 def unregister_release_callback(device_host: str, obj: object, method: str) -> None:
     """Undo one :func:`register_release_callback`. Silent if not registered."""
-    key = _sanitize_device_id(device_host)
+    key = _device_lock_key(device_host)
     with _RELEASE_CALLBACK_GUARD:
         entries = _RELEASE_CALLBACKS.get(key)
         if not entries:
@@ -2092,7 +2206,7 @@ def unregister_release_callback(device_host: str, obj: object, method: str) -> N
 
 def _run_release_callbacks(device_host: str) -> None:
     """Invoke (and prune) the release callbacks for one device. Never raises."""
-    key = _sanitize_device_id(device_host)
+    key = _device_lock_key(device_host)
     with _RELEASE_CALLBACK_GUARD:
         entries = list(_RELEASE_CALLBACKS.get(key, ()))
     live: list[tuple[weakref.ref, str]] = []

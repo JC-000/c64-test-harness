@@ -1321,3 +1321,616 @@ def test_the_structure_scan_sees_a_bare_restore() -> None:
     assert bare_teardown_calls(source) == [
         "original_state:4 restore_state()", "put_back:7 client.set_config_item()",
     ]
+
+
+# --------------------------------------------------------------------------- #
+# #447: a live restore writes the device default, never the entry value       #
+# --------------------------------------------------------------------------- #
+#
+# #412 fixed the three RR-Net ``Cartridge Preference`` fixtures; the sweep it
+# asked for found the sites below still restoring a value read at entry.  The
+# rule is the #334 baseline -- known state is ``current == default`` per item,
+# so an entry value can be a SIGKILLed predecessor's residue and putting it
+# back re-installs the drift.  One class per converted site, each driven
+# offline against the module's own source through ``_fixture_body``.
+#
+# ``SID Detected Socket 1`` in ``test_sid_addressing_live.py`` is a named
+# exemption and is deliberately NOT converted: it is a boot-probe measurement
+# of the chip in the socket, so its schema ``default`` is not this bench's
+# baseline.  The reason is recorded at that test.
+
+_CAT_ADDRESSING = "SID Addressing"
+_CAT_SOCKETS = "SID Sockets Configuration"
+_CAT_CART = "C64 and Cartridge Settings"
+
+
+# --------------------------------------------------------------------------- #
+# The never-touch guard: no fixture restores a BASELINE_NEVER_TOUCH category  #
+# to its "default"                                                            #
+# --------------------------------------------------------------------------- #
+#
+# #447 review, blocker 1.  Converting a restore to the device default is right
+# for a *selector* item, whose default is the #334 baseline.  It is wrong, and
+# on one store dangerous, for a *measurement* store: writing ``SID Sockets
+# Configuration`` back to its defaults sets ``SID Socket 1/2 = Disabled``, and
+# ``U64SidSockets::effectuate_settings`` (u64_config.cc:744-800) then drops the
+# PLD regulator bits -- the socketed SIDs are powered off while the config read
+# stays clean, and detection only re-runs at boot or from the on-device menu.
+# ``BASELINE_NEVER_TOUCH`` already names every such store, with its reason.
+#
+# This is a property over the whole live corpus rather than another per-site
+# pin: a future fixture that adds one of those categories to a
+# ``read_restore_defaults`` plan fails here, whether or not anyone writes a
+# test for that fixture.
+
+def _category_constants() -> dict[str, str]:
+    """``CAT_*`` / ``CARTRIDGE_*`` name -> value, for resolving a Name key."""
+    from c64_test_harness.backends import ultimate64_helpers as helpers
+
+    return {
+        name: value
+        for name, value in vars(helpers).items()
+        if isinstance(value, str) and name.startswith(("CAT_", "CARTRIDGE_"))
+    }
+
+
+def _constant_table(source: str) -> dict[str, str]:
+    """Every name that resolves to a category string, for one module.
+
+    The helpers' ``CAT_*`` constants overlaid with the module's **own**
+    module-level string constants and aliases.  The live modules rarely hand
+    a helpers name straight to ``read_restore_defaults``: they bind
+    ``CAT = CARTRIDGE_SETTINGS_CATEGORY`` (alias),
+    ``CAT = "C64 and Cartridge Settings"`` or ``_CAT_CART = "..."`` (local
+    literal) first.  Resolving only the helpers names made this scan fail
+    closed on four safe modules, which is a scanner defect, not a finding.
+    Assignments are read in source order, so an alias sees what precedes it.
+    """
+    table = _category_constants()
+    for node in ast.parse(source).body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        value = node.value
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            table[target.id] = value.value
+        elif isinstance(value, ast.Name) and value.id in table:
+            table[target.id] = table[value.id]
+    return table
+
+
+def restore_default_categories(source: str) -> list[tuple[str, str]]:
+    """``(function, category)`` for every category handed to a default restore.
+
+    Keys are read from the mapping literal passed to
+    ``read_restore_defaults``; a literal string resolves to itself, and a name
+    through :func:`_constant_table`.  Anything else resolves to an
+    ``<unresolved ...>`` marker so the scan fails closed rather than passing a
+    category it could not read.
+    """
+    consts = _constant_table(source)
+    found: list[tuple[str, str]] = []
+    for fn in ast.walk(ast.parse(source)):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(fn):
+            if not (
+                isinstance(node, ast.Call)
+                and _callee(node) == "read_restore_defaults"
+            ):
+                continue
+            for arg in [*node.args, *(kw.value for kw in node.keywords)]:
+                if not isinstance(arg, ast.Dict):
+                    continue
+                for key in arg.keys:
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                        found.append((fn.name, key.value))
+                    elif isinstance(key, ast.Name) and key.id in consts:
+                        found.append((fn.name, consts[key.id]))
+                    else:
+                        found.append(
+                            (fn.name, f"<unresolved {ast.unparse(key)}>")
+                        )
+    return found
+
+
+@pytest.mark.parametrize("path", _scanned_modules(), ids=lambda p: p.name)
+def test_no_default_restore_into_a_never_touch_category(path: Path) -> None:
+    from c64_test_harness.backends.ultimate64_baseline import BASELINE_NEVER_TOUCH
+
+    never = {name.casefold(): reason for name, reason in BASELINE_NEVER_TOUCH.items()}
+    seen = restore_default_categories(path.read_text())
+
+    unresolved = [f"{fn}: {cat}" for fn, cat in seen if cat.startswith("<unresolved")]
+    assert not unresolved, (
+        f"{path.name}: the never-touch scan could not resolve a category handed "
+        "to read_restore_defaults, so it cannot prove the category is safe: "
+        + ", ".join(unresolved)
+    )
+
+    offenders = [(fn, cat) for fn, cat in seen if cat.casefold() in never]
+    assert not offenders, (
+        f"{path.name}: a fixture restores a BASELINE_NEVER_TOUCH category to its "
+        "'default', but that default is a reset product, not this bench's "
+        "baseline -- for SID Sockets Configuration it powers the socketed SIDs "
+        "off (#447). Restore the entry value and record the reason at the site: "
+        + ", ".join(
+            f"{fn} -> {cat} ({never[cat.casefold()][:80]}...)" for fn, cat in offenders
+        )
+    )
+
+
+def test_the_never_touch_scan_resolves_every_key_form_and_can_fail() -> None:
+    """Literal, helpers name, local alias and local literal all resolve.
+
+    The last two are load-bearing: every RR-Net fixture binds
+    ``CAT = CARTRIDGE_SETTINGS_CATEGORY`` and ``test_socketdma_live.py``
+    binds ``_CAT_CART = "C64 and Cartridge Settings"``, so a scan that read
+    only the helpers names reported four safe modules as unresolvable.
+    """
+    source = (
+        "CAT = CARTRIDGE_SETTINGS_CATEGORY\n"
+        "_CAT_CART = 'C64 and Cartridge Settings'\n"
+        "def powers_the_sids_off(c):\n"
+        "    plan = read_restore_defaults(c, {'SID Sockets Configuration': ['SID Socket 1']})\n"
+        "def helpers_name(c):\n"
+        "    plan = read_restore_defaults(c, {CAT_SID_ADDRESSING: ['UltiSID 1 Address']})\n"
+        "def local_alias(c):\n"
+        "    plan = read_restore_defaults(c, {CAT: ['Cartridge Preference']})\n"
+        "def local_literal(c):\n"
+        "    plan = read_restore_defaults(c, {_CAT_CART: ['REU Size']})\n"
+        "def opaque(c):\n"
+        "    plan = read_restore_defaults(c, {pick(): ['x']})\n"
+    )
+    assert restore_default_categories(source) == [
+        ("powers_the_sids_off", "SID Sockets Configuration"),
+        ("helpers_name", "SID Addressing"),
+        ("local_alias", "C64 and Cartridge Settings"),
+        ("local_literal", "C64 and Cartridge Settings"),
+        ("opaque", "<unresolved pick()>"),
+    ]
+
+    from c64_test_harness.backends.ultimate64_baseline import BASELINE_NEVER_TOUCH
+
+    # The category the scan exists to catch, and the two it must not.
+    assert "SID Sockets Configuration" in BASELINE_NEVER_TOUCH
+    assert "SID Addressing" not in BASELINE_NEVER_TOUCH
+    assert "C64 and Cartridge Settings" not in BASELINE_NEVER_TOUCH
+
+
+def _sid_items() -> tuple[list[str], str]:
+    """The four slot-address items and the mirroring item, from the schema."""
+    from c64_test_harness.backends.ultimate64_schema import (
+        SID_AUTO_MIRRORING_ITEM,
+        SID_SLOT_ADDRESS_ITEMS,
+    )
+    return list(SID_SLOT_ADDRESS_ITEMS.values()), SID_AUTO_MIRRORING_ITEM
+
+
+def _prime(probe, category: str, items) -> None:
+    """Give each item a distinct entry value and a distinct default."""
+    for item in items:
+        probe.config[(category, item)] = {
+            "current": _entry(item), "default": _default(item)
+        }
+
+
+#: Real ``SID Addressing`` enum values.  The pre-#447 fixture restored through
+#: ``set_sid_address_map``, which validates against the address enum, so
+#: synthetic values made its red run fail on a schema refusal rather than on
+#: the value it wrote.  With these the old code writes ``$D520`` successfully
+#: and the red is a clean "wrote the entry value, wanted the default" diff.
+#: ``$D400`` as the default is also the device's real stock allocation.
+_SID_ENTRY_ADDRESS = "$D520"
+_SID_DEFAULT_ADDRESS = "$D400"
+
+
+def _prime_values(probe, category: str, items, current: str, default: str) -> None:
+    for item in items:
+        probe.config[(category, item)] = {"current": current, "default": default}
+
+
+def _client(probe):
+    client = _FakeClient(probe.journal, probe.fail, probe.config)
+    probe.client = client
+    return client
+
+
+def _writes(category: str, items) -> list:
+    return [("config", category, item, _default(item)) for item in items]
+
+
+class TestSidAddressingFixtureRestoresDefaults:
+    """``test_sid_addressing_live.py::restore_addressing`` (#447)."""
+
+    NAME = "test_sid_addressing_live.py"
+
+    def _gen(self, probe):
+        items, _mirror = _sid_items()
+        _prime_values(
+            probe, _CAT_ADDRESSING, items, _SID_ENTRY_ADDRESS, _SID_DEFAULT_ADDRESS
+        )
+        module = _load_module(self.NAME)
+        client = _client(probe)
+        gen = _fixture_body(module, self.NAME, "restore_addressing")(client)
+        probe.generators.append(gen)
+        return items, client, gen
+
+    def _current(self, client, item):
+        return client.config[(_CAT_ADDRESSING, item)]["current"]
+
+    def test_exit_writes_the_default_not_the_entry_map(self, probe) -> None:
+        items, client, gen = self._gen(probe)
+        assert next(gen) is client
+        mark = len(probe.journal)
+        with pytest.raises(StopIteration):
+            next(gen)
+        assert _after(probe.journal, mark) == [
+            ("config", _CAT_ADDRESSING, item, _SID_DEFAULT_ADDRESS) for item in items
+        ]
+        for item in items:
+            assert self._current(client, item) == _SID_DEFAULT_ADDRESS
+
+    def test_an_exception_at_the_yield_still_writes_the_defaults(self, probe) -> None:
+        items, client, gen = self._gen(probe)
+        next(gen)
+        with pytest.raises(KeyError, match="test body"):
+            gen.throw(KeyError("test body"))
+        for item in items:
+            assert self._current(client, item) == _SID_DEFAULT_ADDRESS
+
+    def test_a_failed_restore_is_reported_and_the_rest_still_run(self, probe) -> None:
+        items, client, gen = self._gen(probe)
+        next(gen)
+        probe.fail.add(
+            ("config", _CAT_ADDRESSING, items[0], _SID_DEFAULT_ADDRESS)
+        )
+        with pytest.raises(RuntimeError, match="restore_addressing teardown") as info:
+            next(gen)
+        assert "FAKE" in str(info.value.__cause__)
+        for item in items[1:]:
+            assert self._current(client, item) == _SID_DEFAULT_ADDRESS
+
+    @pytest.mark.parametrize("breakage", ["missing", "empty"])
+    def test_no_default_refuses_before_the_test_runs(self, probe, breakage) -> None:
+        items, _mirror = _sid_items()
+        _prime_values(
+            probe, _CAT_ADDRESSING, items, _SID_ENTRY_ADDRESS, _SID_DEFAULT_ADDRESS
+        )
+        probe.config[(_CAT_ADDRESSING, items[0])] = (
+            {"current": _SID_ENTRY_ADDRESS} if breakage == "missing"
+            else {"current": _SID_ENTRY_ADDRESS, "default": ""}
+        )
+        module = _load_module(self.NAME)
+        client = _client(probe)
+        gen = _fixture_body(module, self.NAME, "restore_addressing")(client)
+        probe.generators.append(gen)
+        with pytest.raises(RuntimeError, match="no default"):
+            next(gen)
+        assert not [e for e in probe.journal if isinstance(e, tuple)], probe.journal
+
+    def test_a_drifted_entry_warns_naming_what_exit_will_write(
+        self, probe, caplog
+    ) -> None:
+        items, _client_, gen = self._gen(probe)
+        with caplog.at_level(logging.WARNING):
+            next(gen)
+        drift = [
+            r.getMessage() for r in caplog.records if "drifted at entry" in r.getMessage()
+        ]
+        assert len(drift) == len(items), drift
+        assert repr(_SID_ENTRY_ADDRESS) in drift[0]
+        assert repr(_SID_DEFAULT_ADDRESS) in drift[0]
+
+
+class TestAudioCaptureFixtureRestoresDefaults:
+    """``test_u64_audio_capture_live.py::restore_sid_config`` (#447).
+
+    Two stores, two rules: ``SID Addressing`` goes back to the reported
+    ``default``; the ``SID Sockets Configuration`` enables go back to the
+    **entry value**, because that store is in ``BASELINE_NEVER_TOUCH`` and
+    its default is a reset product that cuts power to the socketed SIDs.
+    ``_prime`` leaves every address off its default at entry, which the
+    fixture corrects only under ``U64_ALLOW_MUTATE`` -- so ``_gen`` sets it
+    unless told otherwise.
+    """
+
+    NAME = "test_u64_audio_capture_live.py"
+    SOCKETS = ["SID Socket 1", "SID Socket 2"]
+
+    @pytest.fixture(autouse=True)
+    def _mutate(self, monkeypatch):
+        monkeypatch.setenv("U64_ALLOW_MUTATE", "1")
+        return monkeypatch
+
+    def _gen(self, probe):
+        items, _mirror = _sid_items()
+        _prime(probe, _CAT_ADDRESSING, items)
+        _prime(probe, _CAT_SOCKETS, self.SOCKETS)
+        module = _load_module(self.NAME)
+        client = _client(probe)
+        gen = _fixture_body(module, self.NAME, "restore_sid_config")(client)
+        probe.generators.append(gen)
+        return items, client, gen
+
+    def _socket_entry_writes(self) -> list:
+        return [
+            ("config", _CAT_SOCKETS, item, _entry(item)) for item in self.SOCKETS
+        ]
+
+    def test_exit_writes_address_defaults_and_socket_entry_values(self, probe) -> None:
+        items, client, gen = self._gen(probe)
+        next(gen)
+        for item in self.SOCKETS:  # what a socket-writing test leaves behind
+            client.config[(_CAT_SOCKETS, item)]["current"] = _default(item)
+        mark = len(probe.journal)
+        with pytest.raises(StopIteration):
+            next(gen)
+        assert _after(probe.journal, mark) == [
+            *_writes(_CAT_ADDRESSING, items), *self._socket_entry_writes(),
+        ]
+
+    def test_without_the_mutate_gate_inherited_drift_is_not_written(
+        self, probe, _mutate
+    ) -> None:
+        _mutate.delenv("U64_ALLOW_MUTATE")
+        _items, _client_, gen = self._gen(probe)
+        next(gen)
+        mark = len(probe.journal)
+        with pytest.raises(StopIteration):
+            next(gen)
+        assert _after(probe.journal, mark) == []
+
+    def test_the_socket_enable_default_is_never_written(self, probe) -> None:
+        """Writing it drops the PLD regulator bits and powers the socketed
+        SIDs off, with nothing in the config read to say so."""
+        _items, client, gen = self._gen(probe)
+        next(gen)
+        with pytest.raises(StopIteration):
+            next(gen)
+        for item in self.SOCKETS:
+            assert ("config", _CAT_SOCKETS, item, _default(item)) not in probe.journal
+            assert client.config[(_CAT_SOCKETS, item)]["current"] == _entry(item)
+
+    def test_an_exception_at_the_yield_still_restores(self, probe) -> None:
+        items, client, gen = self._gen(probe)
+        next(gen)
+        with pytest.raises(KeyError, match="test body"):
+            gen.throw(KeyError("test body"))
+        for item in items:
+            assert client.config[(_CAT_ADDRESSING, item)]["current"] == _default(item)
+        for item in self.SOCKETS:
+            assert client.config[(_CAT_SOCKETS, item)]["current"] == _entry(item)
+
+    def test_an_address_without_a_default_refuses_to_start(self, probe) -> None:
+        """The old fixture logged and yielded anyway; a device that cannot be
+        put back must stop the run, not poison every later measurement."""
+        items, _mirror = _sid_items()
+        _prime(probe, _CAT_ADDRESSING, items)
+        _prime(probe, _CAT_SOCKETS, self.SOCKETS)
+        probe.config[(_CAT_ADDRESSING, items[0])] = {"current": _entry(items[0])}
+        module = _load_module(self.NAME)
+        client = _client(probe)
+        gen = _fixture_body(module, self.NAME, "restore_sid_config")(client)
+        probe.generators.append(gen)
+        with pytest.raises(RuntimeError, match="no default"):
+            next(gen)
+        assert not [e for e in probe.journal if isinstance(e, tuple)], probe.journal
+
+    def test_a_socket_without_a_current_value_refuses_to_start(self, probe) -> None:
+        """The exemption reads ``current``, so that is what it refuses over."""
+        items, _mirror = _sid_items()
+        _prime(probe, _CAT_ADDRESSING, items)
+        _prime(probe, _CAT_SOCKETS, self.SOCKETS)
+        probe.config[(_CAT_SOCKETS, self.SOCKETS[0])] = {
+            "default": _default(self.SOCKETS[0])
+        }
+        module = _load_module(self.NAME)
+        client = _client(probe)
+        gen = _fixture_body(module, self.NAME, "restore_sid_config")(client)
+        probe.generators.append(gen)
+        with pytest.raises(RuntimeError, match="no current value"):
+            next(gen)
+        assert not [e for e in probe.journal if isinstance(e, tuple)], probe.journal
+
+
+class TestSidIsolationTargetRestoresDefaults:
+    """``test_sid_addressing_isolation_live.py::target`` (#447)."""
+
+    NAME = "test_sid_addressing_isolation_live.py"
+
+    def _gen(self, probe):
+        items, mirror = _sid_items()
+        owned = [*items, mirror]
+        _prime(probe, _CAT_ADDRESSING, owned)
+        module = _load_module(self.NAME)
+        client = _client(probe)
+        tgt = SimpleNamespace(client=client, transport=object())
+
+        class _Instance:
+            def __enter__(self_inner):
+                return tgt
+
+            def __exit__(self_inner, *exc):
+                probe.journal.append("instance exit")
+                return False
+
+        class _Manager:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *exc):
+                probe.journal.append("manager exit")
+                return False
+
+            def instance(self_inner):
+                return _Instance()
+
+        module.create_manager = lambda **_kw: _Manager()
+        module.check_measurement_environment = lambda _c: None
+        module.wait_for_text = lambda *_a, **_kw: "READY."
+        module.time = SimpleNamespace(sleep=lambda _s: None)
+        gen = _fixture_body(module, self.NAME, "target")()
+        probe.generators.append(gen)
+        return owned, client, tgt, gen
+
+    def test_exit_writes_the_defaults_not_the_stock_snapshot(self, probe) -> None:
+        owned, _client_, tgt, gen = self._gen(probe)
+        assert next(gen) is tgt
+        mark = len(probe.journal)
+        with pytest.raises(StopIteration):
+            next(gen)
+        assert _after(probe.journal, mark) == [
+            *_writes(_CAT_ADDRESSING, owned), "instance exit", "manager exit",
+        ]
+
+    def test_the_fixture_publishes_the_defaults_for_the_tests(self, probe) -> None:
+        owned, _client_, tgt, gen = self._gen(probe)
+        next(gen)
+        assert tgt.sid_addressing_defaults == {i: _default(i) for i in owned}
+        assert tgt.stock_sid_addressing != tgt.sid_addressing_defaults
+
+    def test_a_restore_that_does_not_take_is_reported(self, probe) -> None:
+        """The read-back verification is against the defaults now, so a PUT
+        the device accepts and never applies is still caught."""
+        owned, client, _tgt, gen = self._gen(probe)
+        next(gen)
+        item = owned[0]
+        real = client.set_config_item
+
+        def swallow(category, name, value):
+            if name == item:
+                client.journal.append(("config", category, name, value))
+                return  # accepted, never applied
+            real(category, name, value)
+
+        client.set_config_item = swallow
+        with pytest.raises(RuntimeError, match="SID Addressing teardown"):
+            next(gen)
+
+    def test_an_exception_at_the_yield_still_writes_the_defaults(self, probe) -> None:
+        owned, client, _tgt, gen = self._gen(probe)
+        next(gen)
+        with pytest.raises(KeyError, match="test body"):
+            gen.throw(KeyError("test body"))
+        for item in owned:
+            assert client.config[(_CAT_ADDRESSING, item)]["current"] == _default(item)
+
+
+class TestAutoMirroringTestRestoresTheDefault:
+    """``test_sid_addressing_isolation_live.py`` in-test ``finally`` (#447)."""
+
+    NAME = "test_sid_addressing_isolation_live.py"
+
+    def test_the_finally_writes_the_default_not_the_stock_value(self, probe) -> None:
+        _items, mirror = _sid_items()
+        _prime(probe, _CAT_ADDRESSING, [mirror])
+        module = _load_module(self.NAME)
+        client = _client(probe)
+        module.set_sid_auto_mirroring = lambda c, on: c.set_config_item(
+            _CAT_ADDRESSING, mirror, "Enabled" if on else "Disabled"
+        )
+        target = SimpleNamespace(
+            client=client,
+            stock_sid_addressing={mirror: _entry(mirror)},
+            sid_addressing_defaults={mirror: _default(mirror)},
+        )
+        body = _fixture_body(
+            module, self.NAME, "test_auto_mirroring_readback_reflects_the_write"
+        )
+        body(target)
+        assert probe.journal[-1] == (
+            "config", _CAT_ADDRESSING, mirror, _default(mirror)
+        )
+        assert client.config[(_CAT_ADDRESSING, mirror)]["current"] == _default(mirror)
+
+
+class TestSocketDmaReuRestoresDefaults:
+    """``test_socketdma_live.py`` REU ``finally`` blocks (#447)."""
+
+    NAME = "test_socketdma_live.py"
+    ITEMS = ["RAM Expansion Unit", "REU Size"]
+
+    def _module(self, probe):
+        _prime(probe, _CAT_CART, self.ITEMS)
+        module = _load_module(self.NAME)
+        client = _client(probe)
+        client.get_info = lambda: {"product": "fake"}
+        module.set_reu = lambda c, on, size=None: c.set_config_item(
+            _CAT_CART, "REU Size", size
+        )
+        module.get_reu_config = lambda _c: (True, "512 KB")
+        return module, client
+
+    def test_the_contract_test_restores_the_defaults(self, probe) -> None:
+        module, client = self._module(probe)
+        body = _fixture_body(module, self.NAME, "test_set_reu_c64u_contract")
+        body(client, lambda *_a: None)
+        assert probe.journal[-2:] == _writes(_CAT_CART, self.ITEMS)
+        for item in self.ITEMS:
+            assert client.config[(_CAT_CART, item)]["current"] == _default(item)
+
+    def _fidelity(self, module, client):
+        def refuse(*_a, **_kw):
+            from c64_test_harness import Ultimate64Error
+
+            raise Ultimate64Error("connect refused")
+
+        module.Ultimate64Transport = lambda **_kw: SimpleNamespace(
+            close=lambda: client._do("transport.close"),
+            socket_dma_reu_write=refuse,
+        )
+        return _fixture_body(module, self.NAME, "test_reuwrite_byte_fidelity")
+
+    def test_the_fidelity_test_restores_the_defaults(self, probe) -> None:
+        module, client = self._module(probe)
+        body = self._fidelity(module, client)
+        with pytest.raises(pytest.skip.Exception):
+            body(client)
+        assert probe.journal[-3:] == [
+            "transport.close", *_writes(_CAT_CART, self.ITEMS),
+        ]
+
+    def test_a_raising_close_no_longer_skips_the_config_restore(self, probe) -> None:
+        """The old ``finally`` ran ``transport.close()`` first and bare, so a
+        close that raised left the REU enabled on a shared device."""
+        module, client = self._module(probe)
+        body = self._fidelity(module, client)
+        probe.fail.add("transport.close")
+        with pytest.raises(pytest.skip.Exception):
+            body(client)
+        for item in self.ITEMS:
+            assert client.config[(_CAT_CART, item)]["current"] == _default(item)
+
+
+class TestReuReadbackCartridgeRestoresTheDefault:
+    """``test_reu_size_readback_live.py`` ``Cartridge`` ``finally`` (#447)."""
+
+    NAME = "test_reu_size_readback_live.py"
+
+    def test_a_crt_selected_at_entry_is_not_re_selected(self, probe) -> None:
+        """Entry drift -- a ``.crt`` chosen by whatever ran last -- must not go
+        back on: the item's own default (``""``) is the baseline."""
+        probe.config[(_CAT_CART, "Cartridge")] = {
+            "current": "game.crt", "default": "", "presets": [""]
+        }
+        probe.config[(_CAT_CART, "REU Size")] = {"current": "2 MB", "default": "2 MB"}
+        probe.config[(_CAT_CART, "RAM Expansion Unit")] = {
+            "current": "Enabled", "default": "Enabled"
+        }
+        module = _load_module(self.NAME)
+        client = _client(probe)
+        module.get_reu_config = lambda _c: (True, "2 MB")
+        stock = {
+            "Cartridge": "game.crt",
+            "REU Size": "2 MB",
+            "RAM Expansion Unit": "Enabled",
+        }
+        body = _fixture_body(
+            module, self.NAME, "test_cartridge_write_does_not_move_reu_size"
+        )
+        body(client, stock, lambda *_a: None)
+        assert client.config[(_CAT_CART, "Cartridge")]["current"] == ""
+        assert ("config", _CAT_CART, "Cartridge", "game.crt") not in probe.journal

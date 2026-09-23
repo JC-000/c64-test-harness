@@ -220,14 +220,14 @@ bytes at its own position, so sample index stays a clock across loss.
   `sequence_resyncs` at 0 and `time_base_intact` True:
   - **a counter that restarts over a number that was itself lost** reads as a
     run of duplicates, so their PCM is discarded (loopback: 52 datagrams in,
-    41 packets in the WAV, 11 never delivered). This path depends on **#452**
-    — it is constructed today only because nobody has established whether
-    starting a stream resets the FPGA's sequence counter; if it does, it
-    becomes routine and this note stops being enough.
+    41 packets in the WAV, 11 never delivered). Every stream start resets
+    the FPGA's sequence counter to 0 (#452, measured 12/12 restarts on the
+    U64E), so this is reached whenever a caller restarts the stream while
+    one capture is open; the harness's own helpers never do.
   - **a tail of duplicate-looking datagrams still held at `stop()`**, which
     `flush_held` discards (106 in, 100 packets in the WAV, 6 discarded). No
-    lost packet and no restart is needed, so this path does not depend on
-    #452 — it is the one that justifies counting discards at all — and it is
+    lost packet and no restart is needed, so this path does not depend on a
+    stream restart — it is the one that justifies counting discards at all — and it is
     bounded by `MAX_HELD_DUPLICATES` (8 packets, 32 ms).
 
   The harm is **duration, not content**: the discarded bytes are identical to
