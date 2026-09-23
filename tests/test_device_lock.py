@@ -76,7 +76,7 @@ class TestOneDeviceOneLockfile:
     """Aliasing in the lock key defeats device exclusion (#434).
 
     Keying on the raw string gave these five spellings four different
-    lockfiles, so two lanes could each hold "the lock" and drive one
+    lockfiles on a case-sensitive filesystem (three on APFS), so two lanes could each hold "the lock" and drive one
     device at the same time.
     """
 

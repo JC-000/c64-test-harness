@@ -50,7 +50,9 @@ the whole of the exclusion. Until
 [#434](https://github.com/JC-000/c64-test-harness/issues/434) that was the
 raw string with unsafe characters replaced, which meant `U64.lan`,
 `u64.lan`, `http://u64.lan/` and `u64.lan:80` took **four lockfiles for
-one device**. Two lanes could each hold "the lock" and drive the same
+one device** on a case-sensitive filesystem, and three on a
+case-insensitive one such as this bench's APFS (where `U64.lan` and
+`u64.lan` name one file). Two lanes could each hold "the lock" and drive the same
 hardware, and every warning in this document would stay silent while they
 did — the failure the lock exists to prevent, produced by the lock.
 
@@ -83,7 +85,8 @@ hardware.
 > **Upgrading across this change:** a lock held by an older process is
 > held on the **old** filename. A new-code lane normalising the same host
 > to a different name will not see it, and both will run. The window is
-> one lock hand-off, and it only exists for hosts whose spelling was not
+> any overlap with an old-code process that is still running and uses a
+> non-canonical spelling, and it only exists for hosts whose spelling was not
 > already canonical — a bare lowercase IP or hostname, which is every
 > spelling this bench uses, keys to exactly the same file as before. If
 > you drive a device by a spelling that *does* change (mixed case, a

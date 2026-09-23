@@ -390,7 +390,7 @@ class TempLedger:
     pass, so concurrent clients of one device take turns rather than both
     sweeping, and the count never rises above the budget between them.
 
-    **In-process only, and that is an accepted limit (#433).** Two processes
+    **In-process only (#433, open).** Two processes
     against one device keep two ledgers and each spends its own budget, so
     the worst peak before a sweep is ``budget x processes``. What covers the
     hand-off between processes is the lock-release drain
@@ -402,14 +402,7 @@ class TempLedger:
     is how lanes take turns, but the lock is advisory
     (``docs/device_locking.md``) and ``run_u64_parallel_locked.py``
     interleaves tests from several processes on one device, releasing
-    between tests.
-
-    Closing it properly means counting on the device rather than in the
-    process -- an FTP ``/Temp`` listing before each attachment-creating
-    request (no attachment, but a round trip, and FTP File Service is off by
-    default on 1.1.0), or a count in the lockfile (shared, but
-    last-writer-wins and lossy across a crash). Neither was judged worth its
-    cost against a bound the lock already provides.
+    between tests.  Whether and how to close that is #433.
     """
 
     def __init__(self, key: str) -> None:

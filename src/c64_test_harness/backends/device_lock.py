@@ -155,7 +155,8 @@ def normalize_device_host(host: str) -> str:
     folds, because ``host:80`` and ``host`` name one device.  ``gw:8080``
     and ``gw:8081`` are two devices, and both the lock and the ledger key
     them apart -- merging them would let two devices behind one name share
-    a lock and a budget.
+    a lock and a budget.  ``DeviceLock`` sees a port only through the host
+    string, so ``Ultimate64Client`` folds a non-default ``port=`` into it.
 
     **A name and the address it resolves to are not folded.**  That would
     need a DNS lookup in the keying path, which can block for seconds and
@@ -207,8 +208,9 @@ def _device_lock_key(host: str) -> str:
     reaches one lockfile, then :func:`_sanitize_device_id` to make the
     result safe to put in a filename.  Keying on the raw string is what
     let ``U64.lan``, ``u64.lan``, ``http://u64.lan/`` and ``u64.lan:80``
-    take four lockfiles for one device, so two lanes could both hold
-    "the lock" and drive the same hardware (#434).
+    take four lockfiles for one device on a case-sensitive filesystem
+    (three on case-insensitive APFS, which this bench uses), so two lanes
+    could both hold "the lock" and drive the same hardware (#434).
     """
     return _sanitize_device_id(normalize_device_host(host))
 

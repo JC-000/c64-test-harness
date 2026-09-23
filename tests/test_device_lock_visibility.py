@@ -354,6 +354,59 @@ class TestSuppressUnlockedWarning:
         assert other_result == [True]
 
 
+# -- Every per-device registry keys on the device, not the spelling (#434) --
+
+
+class _Drain:
+    """Stands in for a ``TempLedger``: records each release-callback call."""
+
+    def __init__(self) -> None:
+        self.reasons: list[str] = []
+
+    def drain_on_lock_release(self, reason: str) -> None:
+        self.reasons.append(reason)
+
+
+class TestRegistriesFoldSpellings:
+    """The lockfile folds spellings of one device; the in-process registries
+    beside it must fold them the same way, or a lane holding the lock under
+    one spelling is invisible to a query under another."""
+
+    def test_a_release_under_another_spelling_runs_the_drain(
+        self, lock_dir: Path
+    ) -> None:
+        """Safety: the lock-release ``/Temp`` drain.  A raw key here skips
+        the drain silently, and the next lane inherits the attachments."""
+        drain = _Drain()
+        lock_mod.register_release_callback("U64.Lan", drain, "drain_on_lock_release")
+        lock = DeviceLock("http://u64.lan/", lock_dir=lock_dir)
+        assert lock.acquire(timeout=5.0)
+        lock.release()
+        assert len(drain.reasons) == 1
+
+    def test_held_by_this_process_answers_for_every_spelling(
+        self, lock_dir: Path
+    ) -> None:
+        """Safety: a client's ``close()`` sweeps inherited ``/Temp`` only
+        when this answers True, so a raw key would skip that sweep."""
+        lock = DeviceLock("u64.lan", lock_dir=lock_dir)
+        assert lock.acquire(timeout=5.0)
+        try:
+            assert DeviceLock.held_by_this_process("http://u64.lan/", lock_dir=lock_dir)
+            assert DeviceLock.held_by_this_process("U64.LAN:80", lock_dir=lock_dir)
+        finally:
+            lock.release()
+        assert not DeviceLock.held_by_this_process("http://u64.lan/", lock_dir=lock_dir)
+
+    def test_the_unlocked_notice_is_once_per_device_not_per_spelling(
+        self, lock_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            assert warn_unlocked_client("u64.lan", lock_dir=lock_dir) is True
+            assert warn_unlocked_client("http://U64.lan/", lock_dir=lock_dir) is False
+        assert len(caplog.records) == 1
+
+
 # -- Client wiring ------------------------------------------------------
 
 

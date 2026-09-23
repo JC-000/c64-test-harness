@@ -659,6 +659,30 @@ def test_a_different_port_is_a_different_device(one, other):
     assert _device_lock_key(one) != _device_lock_key(other)
 
 
+def test_the_port_kwarg_is_part_of_the_device_key():
+    """``port=8080`` and a ``:8080`` host string are one device, so they
+    share one ledger; ``port=8081`` is another device.  Keying the client on
+    ``host`` alone merged two devices behind one name into one budget."""
+    a = _client("gw.example", port=8080)
+    assert a._temp_ledger is _client("gw.example:8080")._temp_ledger
+    assert a._temp_ledger is not _client("gw.example", port=8081)._temp_ledger
+    assert a._temp_ledger is not _client("gw.example")._temp_ledger
+
+
+def test_a_lock_on_the_host_and_port_drains_a_port_kwarg_client(tmp_path):
+    """Safety: the lock-release drain reaches a client built with ``port=``
+    when the lock is taken as ``host:port`` -- the only spelling
+    ``DeviceLock`` can see a port in."""
+    c = _client("gw.example", port=8080)
+    with _FTP() as ftp:
+        c.run_prg(PRG)
+        _release_lock("gw.example", tmp_path)
+        assert ftp.hosts == [], "a lock on another device must not drain this one"
+        _release_lock("gw.example:8080", tmp_path)
+    assert ftp.hosts == ["gw.example"]
+    assert c.pending_temp_attachments == 0
+
+
 @pytest.mark.parametrize("spelling,bare", [
     ("gw.example:80", "gw.example"),
     ("10.0.0.7:80", "10.0.0.7"),
