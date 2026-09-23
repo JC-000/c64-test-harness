@@ -173,9 +173,15 @@ X25_SCALAR = None if _LABELS is None else _LABELS["x25_scalar"]
 MAIN_LOOP = None if _LABELS is None else _LABELS["main_loop"]
 
 # Addresses the harness chooses. These are free RAM the test picks itself,
-# not build labels, so they are literals on purpose and are not looked up.
+# not build labels, so they are not looked up in the listing.
 SENTINEL = 0x0350
-TRAMPOLINE = 0x0360
+
+#: The trampoline's page. The trampoline sits here at main_loop's low byte,
+#: so the hijack rewrites one byte of the running ``JMP main_loop`` (#477;
+#: see :func:`_hijack_code`). $CD00-$CEFF is outside HARNESS_SCRATCH and the
+#: x25519 image, and an 11-byte trampoline never leaves it.
+TRAMPOLINE_PAGE = 0xCD00
+TRAMPOLINE = None if MAIN_LOOP is None else TRAMPOLINE_PAGE | (MAIN_LOOP & 0xFF)
 
 
 # ---------------------------------------------------------------------------
@@ -208,26 +214,36 @@ def _clamp_ref(scalar: bytes) -> bytes:
 def _jmp_bytes(target: int) -> bytes:
     """``JMP target``, assembled little-endian.
 
-    This module needs the same three bytes in three places: the parked
-    ``main_loop`` the boot check waits for (a self-``JMP``), the
-    trampoline's own park, and the hijack written over ``main_loop``.
-    Spelling any of them as a literal is what #439 was: the literal kept
+    This module needs these bytes in two places: the parked ``main_loop``
+    the boot check waits for (a self-``JMP``) and the trampoline's own park.
+    Spelling either of them as a literal is what #439 was: the literal kept
     saying ``4C 2A 08`` after the label moved to ``$082D``, so the poll
     could never match and the failure surfaced only after the uploads.
     """
     return bytes([0x4C, target & 0xFF, (target >> 8) & 0xFF])
 
 
-def _hijack_code() -> bytes:
-    """``JMP TRAMPOLINE`` — written over ``main_loop`` to divert the 6510.
+def _hijack_code() -> tuple[int, bytes]:
+    """``(address, data)`` that turns ``JMP main_loop`` into ``JMP TRAMPOLINE``.
 
-    Reads ``TRAMPOLINE`` at call time, so relocating the trampoline moves
-    the hijack with it. This one stayed a literal in the first pass at
-    #439: with the trampoline moved, the hijack would have jumped into
-    whatever happened to sit at ``$0360`` — on hardware, after all 12
-    uploads, which is the failure shape #439 exists to remove.
+    One byte: the high operand byte, at ``main_loop + 2``. The 6510 is
+    executing that ``JMP`` while the DMA write lands, and the write can halt
+    it between the operand fetches; a write of both operand bytes can then
+    run a torn ``JMP`` -- old low byte, new high byte, ``JMP $032D`` for the
+    old ``$0360`` trampoline, into harness scratch. #426 measured the
+    mechanism on the TOD test; ``tests/torn_fetch.py`` models it (#477).
+
+    Reads ``TRAMPOLINE`` and ``MAIN_LOOP`` at call time, so moving either
+    moves the hijack with it (#439), and refuses a pair whose low bytes
+    differ rather than write a hijack that can tear.
     """
-    return _jmp_bytes(TRAMPOLINE)
+    if TRAMPOLINE & 0xFF != MAIN_LOOP & 0xFF:
+        raise ValueError(
+            f"TRAMPOLINE ${TRAMPOLINE:04X} must share main_loop's low byte "
+            f"(${MAIN_LOOP:04X}): a hijack that rewrites both operand bytes of "
+            f"a running JMP can be fetched torn (#477)"
+        )
+    return MAIN_LOOP + 2, bytes([TRAMPOLINE >> 8])
 
 
 def _trampoline_code(clamp_address: int) -> bytes:
@@ -348,8 +364,8 @@ def _run_clamp_fresh(
     # DMA flush
     _ = transport.read_memory(SENTINEL, 1)
 
-    # Hijack main_loop → JMP TRAMPOLINE (assembled, never spelled out)
-    write_bytes(transport, MAIN_LOOP, _hijack_code())
+    # Hijack main_loop -> JMP TRAMPOLINE, high byte only (#477)
+    write_bytes(transport, *_hijack_code())
 
     # Poll sentinel
     deadline = time.monotonic() + 30.0

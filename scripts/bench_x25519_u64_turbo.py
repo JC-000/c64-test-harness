@@ -2,8 +2,8 @@
 """Benchmark X25519 scalar multiplication across Ultimate 64 turbo speeds.
 
 Loads x25519.prg onto real Ultimate 64 hardware, runs a full scalar*basepoint
-multiplication at each CPU speed, measures jiffy clock timing, and verifies
-correctness against RFC 7748.
+multiplication at each CPU speed, times it with the build's CIA1 cycle counter
+(``bench_cycles``), and verifies correctness against RFC 7748.
 
 Requires U64_HOST environment variable (and optionally U64_PASSWORD), and
 an x25519 build named by ``--prg`` or ``X25519_PRG``. Its ``labels.txt`` is
@@ -41,6 +41,7 @@ from c64_test_harness.backends.ultimate64_helpers import (
     snapshot_state,
     restore_state,
 )
+from c64_test_harness import NTSC_PHI2_HZ
 from c64_test_harness.labels import Labels
 from c64_test_harness.screen import wait_for_text
 
@@ -72,89 +73,61 @@ RFC7748_EXPECTED = bytes.fromhex(
 # Memory addresses for the benchmark harness.
 SENTINEL_ADDR = 0x0350
 SENTINEL_VALUE = 0x42
-BENCH_SUB = 0x0360
 
-# Jiffy clock tick rate (CIA-driven, nominally 60 Hz on NTSC).
-JIFFY_HZ = 60.0
+#: Page the benchmark routine goes in. The routine sits at this page with
+#: main_loop's low byte (:func:`_bench_sub_addr`), so the hijack rewrites one
+#: byte (#477). $CD00-$CEFF is outside HARNESS_SCRATCH and the x25519 image.
+BENCH_PAGE = 0xCD00
+
+#: Labels the benchmark routine calls, in call order.
+BENCH_CALLS = ("vic_blank", "bench_cycles_start", "x25519_base",
+               "bench_cycles_stop", "vic_unblank")
 
 # ---------------------------------------------------------------------------
 # 6502 machine code builder
 # ---------------------------------------------------------------------------
 
 
-def _build_bench_subroutine(
-    x25519_base: int,
-    bench_ticks: int,
-    vic_blank: int,
-    vic_unblank: int,
-) -> bytes:
-    """Build 6502 machine code for the benchmark subroutine at BENCH_SUB.
+def _bench_sub_addr(main_loop: int) -> int:
+    """Where the benchmark routine goes: :data:`BENCH_PAGE`, main_loop's low byte.
 
-    Layout:
-        SEI
-        LDA #$00 ; STA $A0 ; STA $A1 ; STA $A2   -- zero jiffy clock
-        CLI
-        JSR vic_blank                               -- blank screen for speed
-        JSR x25519_base                             -- run the multiplication
-        SEI
-        LDA $A0 ; STA bench_ticks+0                -- copy jiffy clock
-        LDA $A1 ; STA bench_ticks+1
-        LDA $A2 ; STA bench_ticks+2
-        CLI
-        JSR vic_unblank                             -- restore screen
-        LDA #$42 ; STA $0350                       -- sentinel
-        JMP *                                       -- park CPU
+    The hijack turns the running ``JMP main_loop`` into ``JMP`` here by
+    writing only the high byte. A DMA write can halt the 6510 between the
+    two operand fetches, and a write of both operand bytes can then run a
+    torn ``JMP`` (old low byte, new high byte) -- #426 measured it, #477.
+    """
+    return BENCH_PAGE | (main_loop & 0xFF)
+
+
+def _build_bench_subroutine(base: int, labels) -> bytes:
+    """Build the benchmark routine that runs at *base*.
+
+    Layout::
+
+        JSR vic_blank             -- blank the screen: badlines steal cycles
+        JSR bench_cycles_start    -- CIA1 TA+TB as a 32-bit cycle counter
+        JSR x25519_base           -- the multiplication
+        JSR bench_cycles_stop     -- stop; count -> bench_cycles (LE u32)
+        JSR vic_unblank
+        LDA #$42 ; STA sentinel
+        JMP *                     -- park
+
+    The build's CIA1 counter, not the KERNAL jiffy clock:
+    ``x25519_scalarmult`` runs its whole body under ``sei`` (c64-x25519
+    #35), so the jiffy clock at ``$A0-$A2`` never ticked and the old
+    readout was 1 at every speed. The counter keeps counting under ``sei``
+    (c64-x25519 ``src/util.s``). ``bench_cycles_start`` reprograms CIA1's
+    timers, so the KERNAL IRQ rate is wrong until the next reset -- every
+    speed starts with a reboot.
     """
     code = bytearray()
-
-    def emit(*bs: int) -> None:
-        code.extend(bs)
-
-    def emit_jsr(addr: int) -> None:
-        emit(0x20, addr & 0xFF, (addr >> 8) & 0xFF)
-
-    def emit_lda_imm(val: int) -> None:
-        emit(0xA9, val & 0xFF)
-
-    def emit_sta_abs(addr: int) -> None:
-        emit(0x8D, addr & 0xFF, (addr >> 8) & 0xFF)
-
-    def emit_lda_abs(addr: int) -> None:
-        emit(0xAD, addr & 0xFF, (addr >> 8) & 0xFF)
-
-    # SEI
-    emit(0x78)
-    # Zero jiffy clock ($A0 = hours, $A1 = minutes, $A2 = jiffies — big-endian)
-    emit_lda_imm(0x00)
-    emit_sta_abs(0x00A0)
-    emit_sta_abs(0x00A1)
-    emit_sta_abs(0x00A2)
-    # CLI
-    emit(0x58)
-    # JSR vic_blank — blank VIC screen for faster computation
-    emit_jsr(vic_blank)
-    # JSR x25519_base — the actual scalar multiplication
-    emit_jsr(x25519_base)
-    # SEI
-    emit(0x78)
-    # Copy jiffy clock to bench_ticks (3 bytes, big-endian)
-    emit_lda_abs(0x00A0)
-    emit_sta_abs(bench_ticks)
-    emit_lda_abs(0x00A1)
-    emit_sta_abs(bench_ticks + 1)
-    emit_lda_abs(0x00A2)
-    emit_sta_abs(bench_ticks + 2)
-    # CLI
-    emit(0x58)
-    # JSR vic_unblank — restore screen
-    emit_jsr(vic_unblank)
-    # LDA #$42; STA $0350 — sentinel to signal completion
-    emit_lda_imm(SENTINEL_VALUE)
-    emit_sta_abs(SENTINEL_ADDR)
-    # JMP * — park CPU in infinite loop (address = current PC)
-    park_addr = BENCH_SUB + len(code)
-    emit(0x4C, park_addr & 0xFF, (park_addr >> 8) & 0xFF)
-
+    for name in BENCH_CALLS:
+        addr = labels[name]
+        code += bytes([0x20, addr & 0xFF, (addr >> 8) & 0xFF])
+    code += bytes([0xA9, SENTINEL_VALUE,
+                   0x8D, SENTINEL_ADDR & 0xFF, (SENTINEL_ADDR >> 8) & 0xFF])
+    park = base + len(code)
+    code += bytes([0x4C, park & 0xFF, (park >> 8) & 0xFF])
     return bytes(code)
 
 
@@ -227,13 +200,11 @@ def run_one_speed(
 ) -> dict | None:
     """Run X25519 benchmark at the given speed.  Returns a result dict or None on failure."""
 
-    x25519_base = labels["x25519_base"]
     x25_scalar = labels["x25_scalar"]
     x25_result = labels["x25_result"]
-    bench_ticks = labels["bench_ticks"]
-    vic_blank = labels["vic_blank"]
-    vic_unblank = labels["vic_unblank"]
+    bench_cycles = labels["bench_cycles"]
     main_loop = labels["main_loop"]
+    bench_sub = _bench_sub_addr(main_loop)
 
     print(f"\n{'='*60}")
     print(f"  {mhz} MHz")
@@ -283,16 +254,16 @@ def run_one_speed(
     transport.write_memory(x25_scalar, RFC7748_SCALAR)
 
     # 5. Build and write benchmark subroutine
-    bench_code = _build_bench_subroutine(x25519_base, bench_ticks, vic_blank, vic_unblank)
-    transport.write_memory(BENCH_SUB, bench_code)
+    bench_code = _build_bench_subroutine(bench_sub, labels)
+    transport.write_memory(bench_sub, bench_code)
 
     # 6. Zero sentinel
     transport.write_memory(SENTINEL_ADDR, bytes([0x00]))
 
-    # 7. Overwrite main_loop entry with JMP BENCH_SUB to redirect CPU
-    #    JMP $0360 = 4C 60 03
-    jmp_code = bytes([0x4C, BENCH_SUB & 0xFF, (BENCH_SUB >> 8) & 0xFF])
-    transport.write_memory(main_loop, jmp_code)
+    # 7. Redirect the parked JMP main_loop to the routine: the routine shares
+    #    main_loop's low byte, so only the high byte changes and no fetch of
+    #    the running JMP can see half the write (#477, see _bench_sub_addr).
+    transport.write_memory(main_loop + 2, bytes([bench_sub >> 8]))
 
     # 8. Measure wall-clock time while polling for sentinel
     wall_start = time.monotonic()
@@ -316,18 +287,17 @@ def run_one_speed(
 
     print(f" done ({wall_secs:.1f}s wall)")
 
-    # 9. Read bench_ticks (3 bytes, big-endian) and result (32 bytes)
-    ticks_raw = transport.read_memory(bench_ticks, 3)
-    jiffies = (ticks_raw[0] << 16) | (ticks_raw[1] << 8) | ticks_raw[2]
+    # 9. Read bench_cycles (little-endian u32) and result (32 bytes)
+    cycles = int.from_bytes(bytes(transport.read_memory(bench_cycles, 4)), "little")
 
     result_bytes = transport.read_memory(x25_result, 32)
 
     # 10. Verify correctness
     correct = result_bytes == RFC7748_EXPECTED
-    c64_secs = jiffies / JIFFY_HZ
+    c64_secs = cycles / float(NTSC_PHI2_HZ)
 
     status = "PASS" if correct else "FAIL"
-    print(f"  Jiffies: {jiffies}  ({c64_secs:.2f}s @ {JIFFY_HZ} Hz)")
+    print(f"  CIA1 cycles: {cycles}  ({c64_secs:.2f}s at the NTSC phi2 rate)")
     print(f"  Wall time: {wall_secs:.2f}s")
     print(f"  Result: {status}")
     if not correct:
@@ -336,7 +306,7 @@ def run_one_speed(
 
     return {
         "mhz": mhz,
-        "jiffies": jiffies,
+        "cycles": cycles,
         "c64_secs": c64_secs,
         "wall_secs": wall_secs,
         "correct": correct,
@@ -356,22 +326,22 @@ def print_summary(results: list[dict]) -> None:
         return
 
     # Find 1 MHz result for speedup calculation
-    base_jiffies = None
+    base_cycles = None
     for r in results:
         if r["mhz"] == 1:
-            base_jiffies = r["jiffies"]
+            base_cycles = r["cycles"]
             break
 
     print(f"\n{'='*76}")
     print("  X25519 Benchmark Summary — Ultimate 64")
     print(f"{'='*76}")
 
-    hdr = f"  {'MHz':>4s}  {'Jiffies':>8s}  {'C64 time':>9s}  {'Wall':>8s}  {'Status':>6s}"
-    if base_jiffies is not None:
+    hdr = f"  {'MHz':>4s}  {'Cycles':>10s}  {'C64 time':>9s}  {'Wall':>8s}  {'Status':>6s}"
+    if base_cycles is not None:
         hdr += f"  {'Speedup':>8s}"
     print(hdr)
-    print(f"  {'-'*4}  {'-'*8}  {'-'*9}  {'-'*8}  {'-'*6}", end="")
-    if base_jiffies is not None:
+    print(f"  {'-'*4}  {'-'*10}  {'-'*9}  {'-'*8}  {'-'*6}", end="")
+    if base_cycles is not None:
         print(f"  {'-'*8}", end="")
     print()
 
@@ -379,9 +349,9 @@ def print_summary(results: list[dict]) -> None:
         c64_time = f"{r['c64_secs']:.2f}s"
         wall_time = f"{r['wall_secs']:.1f}s"
         status = "PASS" if r["correct"] else "FAIL"
-        line = f"  {r['mhz']:>4d}  {r['jiffies']:>8d}  {c64_time:>9s}  {wall_time:>8s}  {status:>6s}"
-        if base_jiffies is not None and r["jiffies"] > 0:
-            speedup = base_jiffies / r["jiffies"]
+        line = f"  {r['mhz']:>4d}  {r['cycles']:>10d}  {c64_time:>9s}  {wall_time:>8s}  {status:>6s}"
+        if base_cycles is not None and r["cycles"] > 0:
+            speedup = base_cycles / r["cycles"]
             line += f"  {speedup:>7.1f}x"
         print(line)
 
@@ -474,8 +444,7 @@ def main() -> None:
 
     # Verify required labels exist
     required_labels = [
-        "x25519_base", "x25_scalar", "x25_result",
-        "bench_ticks", "vic_blank", "vic_unblank", "main_loop",
+        *BENCH_CALLS, "x25_scalar", "x25_result", "bench_cycles", "main_loop",
     ]
     for name in required_labels:
         if name not in labels:
@@ -490,13 +459,9 @@ def main() -> None:
         sys.exit(1)
 
     # Build bench subroutine (show it once for debug)
-    bench_code = _build_bench_subroutine(
-        labels["x25519_base"],
-        labels["bench_ticks"],
-        labels["vic_blank"],
-        labels["vic_unblank"],
-    )
-    print(f"\nBenchmark subroutine: {len(bench_code)} bytes at ${BENCH_SUB:04X}")
+    bench_sub = _bench_sub_addr(labels["main_loop"])
+    bench_code = _build_bench_subroutine(bench_sub, labels)
+    print(f"\nBenchmark subroutine: {len(bench_code)} bytes at ${bench_sub:04X}")
 
     # Connect to device -- under the DeviceLock from the first request to
     # the last restore: run_prg replaces whatever a neighbouring lane has

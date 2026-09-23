@@ -246,7 +246,8 @@ def test_harness_chosen_addresses_are_not_taken_from_the_listing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """``SENTINEL``/``TRAMPOLINE`` are free RAM this test picks, not build
-    labels. A listing that happens to define them must not move them."""
+    labels. A listing that happens to define them must not move them; the
+    trampoline follows only main_loop's low byte (#477)."""
     module = _arm(
         monkeypatch,
         tmp_path,
@@ -254,7 +255,7 @@ def test_harness_chosen_addresses_are_not_taken_from_the_listing(
     )
 
     assert module.SENTINEL == 0x0350
-    assert module.TRAMPOLINE == 0x0360
+    assert module.TRAMPOLINE == 0xCD00 | (_REAL_MAIN_LOOP & 0xFF)
 
 
 # ---------------------------------------------------------------------------
@@ -299,20 +300,23 @@ def test_trampoline_jsrs_the_build_clamp_address(
 def test_hijack_jumps_to_the_trampoline_wherever_it_is(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The hijack written over ``main_loop`` must follow ``TRAMPOLINE``.
+    """The one-byte hijack must follow ``TRAMPOLINE`` and ``MAIN_LOOP`` (#439, #477).
 
-    This was the last literal left in the module: ``4C 60 03`` spelled out.
-    Move the trampoline and the jump stayed behind, landing the 6510 in
-    whatever sits at ``$0360`` — on hardware, after all 12 uploads.
+    It writes the trampoline's high byte at ``main_loop + 2``; a trampoline
+    whose low byte differs from main_loop's cannot be reached that way and
+    is refused rather than written as a hijack that can tear.
     """
     module = _arm(monkeypatch, tmp_path)
-    assert module._hijack_code() == bytes([0x4C, 0x60, 0x03])
+    assert module._hijack_code() == (_REAL_MAIN_LOOP + 2, bytes([0xCD]))
 
-    monkeypatch.setattr(module, "TRAMPOLINE", 0x0370)
-
-    assert module._hijack_code() == bytes([0x4C, 0x70, 0x03]), (
+    monkeypatch.setattr(module, "TRAMPOLINE", 0xCE00 | (_REAL_MAIN_LOOP & 0xFF))
+    assert module._hijack_code() == (_REAL_MAIN_LOOP + 2, bytes([0xCE])), (
         "the hijack is a literal again: it does not track TRAMPOLINE"
     )
+
+    monkeypatch.setattr(module, "TRAMPOLINE", 0x0370)
+    with pytest.raises(ValueError, match="low byte"):
+        module._hijack_code()
 
 
 def test_run_clamp_fresh_hijacks_main_loop_to_the_trampoline(
@@ -326,7 +330,8 @@ def test_run_clamp_fresh_hijacks_main_loop_to_the_trampoline(
     the transport, the memory helpers and ``sleep`` are all doubles.
     """
     module = _arm(monkeypatch, tmp_path)
-    monkeypatch.setattr(module, "TRAMPOLINE", 0x0370)
+    moved = 0xCE00 | (_REAL_MAIN_LOOP & 0xFF)
+    monkeypatch.setattr(module, "TRAMPOLINE", moved)
 
     writes: list[tuple[int, bytes]] = []
 
@@ -352,14 +357,64 @@ def test_run_clamp_fresh_hijacks_main_loop_to_the_trampoline(
 
     module._run_clamp_fresh(_FakeClient(), _FakeTransport(), b"", bytes(32), 1)
 
-    hijacks = [data for addr, data in writes if addr == module.MAIN_LOOP]
-    assert hijacks == [bytes([0x4C, 0x70, 0x03])], (
-        f"the write over main_loop must be JMP $0370, got {hijacks!r}"
+    hijacks = [(addr, data) for addr, data in writes
+                if module.MAIN_LOOP <= addr <= module.MAIN_LOOP + 2]
+    assert hijacks == [(module.MAIN_LOOP + 2, bytes([0xCE]))], (
+        f"the write over main_loop must be its high byte, $CE; got {hijacks!r}"
     )
     # And the trampoline itself went to the relocated address.
-    assert any(addr == 0x0370 for addr, _ in writes), (
+    assert any(addr == moved for addr, _ in writes), (
         f"trampoline not written at the relocated address: {writes!r}"
     )
+
+
+@pytest.mark.parametrize("main_loop", [_REAL_MAIN_LOOP, 0x0900, 0x08FF])
+def test_every_fetch_of_the_hijacked_loop_is_main_loop_or_the_trampoline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, main_loop: int
+) -> None:
+    """The write over the running ``JMP main_loop`` must not be fetchable torn (#477).
+
+    Drives the real ``_run_clamp_fresh`` against fakes, then asks
+    ``torn_fetch`` for every ``JMP`` the 6510 could execute while the
+    hijack lands.  A three-byte ``JMP $0360`` over ``JMP $082D`` can be
+    fetched as ``JMP $032D`` (old low byte, new high byte), harness scratch.
+    """
+    from torn_fetch import fetched_targets, span_writes
+
+    module = _arm(monkeypatch, tmp_path, main_loop=main_loop)
+    writes: list[tuple[int, bytes]] = []
+
+    class _FakeTransport:
+        def read_memory(self, address: int, count: int) -> bytes:
+            if address == module.MAIN_LOOP:
+                return module._jmp_bytes(module.MAIN_LOOP)  # booted, parked
+            return bytes([0x42])  # sentinel: clamp already finished
+
+    class _FakeClient:
+        def reboot(self) -> None:
+            pass
+
+        def run_prg(self, data: bytes) -> None:
+            pass
+
+    monkeypatch.setattr(module, "write_bytes",
+                        lambda t, addr, data: writes.append((addr, bytes(data))))
+    monkeypatch.setattr(module, "read_bytes", lambda t, addr, n: bytes(n))
+    monkeypatch.setattr(module, "set_reu", lambda *a, **k: None)
+    monkeypatch.setattr(module, "set_turbo_mhz", lambda *a, **k: None)
+    monkeypatch.setattr(module.time, "sleep", lambda *a, **k: None)
+
+    module._run_clamp_fresh(_FakeClient(), _FakeTransport(), b"", bytes(32), 1)
+
+    hijack = span_writes(main_loop, writes)
+    targets = fetched_targets(main_loop, module._jmp_bytes(main_loop), hijack)
+    assert module.TRAMPOLINE in targets, f"the loop is never redirected: {hijack!r}"
+    assert targets <= {main_loop, module.TRAMPOLINE}, (
+        f"a torn fetch of the hijack {hijack!r} can jump to "
+        f"{sorted(f'${t:04X}' for t in targets - {main_loop, module.TRAMPOLINE})}"
+    )
+    trampoline = [a for a, _ in writes if a == module.TRAMPOLINE]
+    assert trampoline, f"the trampoline was not written where the hijack points: {writes!r}"
 
 
 # ---------------------------------------------------------------------------
