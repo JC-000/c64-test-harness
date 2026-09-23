@@ -19,8 +19,9 @@ attachments bought for no measurement. Deriving the addresses at import means
 the gate is a collection-time skip, before any fixture and so before the
 first upload.
 
-No device traffic: only the module's label parser, resolver and code
-builders are exercised, against listings written into ``tmp_path``.
+No device traffic: only the module's label resolver (parsing by
+``c64_test_harness.Labels``, #463) and code builders are exercised,
+against listings written into ``tmp_path``.
 """
 
 from __future__ import annotations
@@ -96,8 +97,18 @@ def _load() -> ModuleType:
 
 
 # ---------------------------------------------------------------------------
-# The parser
+# Parsing, through the resolver (#463: the module no longer has its own)
 # ---------------------------------------------------------------------------
+
+def _resolve_text(module: ModuleType, tmp_path: Path, text: str):
+    """Run the module's resolver on a listing whose text we choose."""
+    build = tmp_path / "resolve"
+    build.mkdir(exist_ok=True)
+    prg = build / "x25519.prg"
+    prg.write_bytes(b"\x01\x08")
+    (build / "labels.txt").write_text(text)
+    return module._resolve_labels(prg)
+
 
 def test_parser_reads_the_segment_prefixed_ca65_form(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -105,31 +116,90 @@ def test_parser_reads_the_segment_prefixed_ca65_form(
     """``al C:00082D .main_loop`` -> ``{"main_loop": 0x082D}``."""
     module = _arm(monkeypatch, tmp_path)
 
-    labels, unparseable = module._parse_ca65_labels(
+    labels, reason = _resolve_text(
+        module, tmp_path,
         "al C:00082D .main_loop\n"
         "al C:0019A0 .x25_scalar\n"
+        "al C:00148E .x25519_clamp\n",
     )
 
-    assert labels == {"main_loop": 0x082D, "x25_scalar": 0x19A0}
-    assert unparseable == []
+    assert reason == ""
+    assert labels == {
+        "main_loop": 0x082D, "x25_scalar": 0x19A0, "x25519_clamp": 0x148E,
+    }
 
 
-def test_parser_reports_non_label_lines_instead_of_dropping_them(
+def test_parser_accepts_the_prefix_less_form_the_repo_parser_reads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``al 00082D .main_loop`` (no ``C:``) is a listing too (#463).
+
+    The module's own parser required the ``C:`` prefix and so called this
+    "not a listing"; ``Labels`` reads both forms, and so does the module.
+    """
+    module = _arm(monkeypatch, tmp_path)
+
+    labels, reason = _resolve_text(
+        module, tmp_path,
+        "al 00082D .main_loop\n"
+        "al 0019A0 .x25_scalar\n"
+        "al 00148E .x25519_clamp\n",
+    )
+
+    assert reason == "", reason
+    assert labels["main_loop"] == 0x082D
+
+
+def test_resolver_quotes_a_non_label_line_when_nothing_parses(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     module = _arm(monkeypatch, tmp_path)
 
-    labels, unparseable = module._parse_ca65_labels(
-        "al C:00082D .main_loop\n"
+    labels, reason = _resolve_text(
+        module, tmp_path,
         "\n"                      # blank lines are not a defect
-        "this is not a label\n"
+        "this is not a label\n",
     )
 
-    assert labels == {"main_loop": 0x082D}
-    assert unparseable == ["this is not a label"], (
-        "an unrecognised line must be handed back so the skip reason can "
-        "quote it, not silently discarded"
+    assert labels is None
+    assert "1 unparseable" in reason and "'this is not a label'" in reason, (
+        "when nothing parses, the skip reason must quote the first "
+        f"non-blank line and not count the blank one: {reason!r}"
     )
+
+
+def test_listing_with_none_of_the_symbols_quotes_what_it_found(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An HTML 404 page can carry one line ``Labels`` accepts.
+
+    It then parses to one unrelated symbol, so the "not a listing" branch
+    does not fire and the reason is "missing symbols". With none of the
+    required symbols present, the reason must still show what the file is.
+    """
+    module = _arm(monkeypatch, tmp_path)
+
+    labels, reason = _resolve_text(
+        module, tmp_path,
+        "<html><title>404 Not Found</title>\n"
+        "al 404 .notfound\n"
+        "</html>\n",
+    )
+
+    assert labels is None
+    assert "main_loop" in reason, reason
+    assert "404 Not Found" in reason, (
+        f"the reason should quote the file's first line: {reason!r}"
+    )
+
+
+def test_listing_missing_one_symbol_is_not_given_a_sample(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A real listing short one symbol is a wrong build, not a strange file."""
+    module = _arm(monkeypatch, tmp_path, main_loop=None)
+
+    assert "first line" not in module._LABELS_SKIP_REASON
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +372,11 @@ def test_absent_listing_names_the_file_and_does_not_fall_back(
     module = _arm(monkeypatch, tmp_path, labels=False)
 
     assert module._LABELS is None
-    assert "labels.txt" in module._LABELS_SKIP_REASON
+    reason = module._LABELS_SKIP_REASON
+    assert "labels.txt" in reason
+    # Told apart from an unreadable file: the parse's own FileNotFoundError
+    # also names the path, so without the existence check this would pass.
+    assert "not found" in reason and "could not be read" not in reason, reason
     # A fallback to the old literals would re-create #439 exactly.
     assert module.MAIN_LOOP is None
     assert module.X25519_CLAMP is None
@@ -416,10 +490,20 @@ def test_parses_the_checked_in_real_ld65_listing(
     """
     module = _arm(monkeypatch, tmp_path)
 
-    labels, unparseable = module._parse_ca65_labels(labels_path.read_text())
+    # That project has no x25519 symbols; add two so the resolver accepts it
+    # and every other line is still that project's real output.
+    labels, reason = _resolve_text(
+        module, tmp_path,
+        labels_path.read_text()
+        + "al C:00148E .x25519_clamp\nal C:0019A0 .x25_scalar\n",
+    )
 
-    assert unparseable == [], f"real ld65 output did not parse: {unparseable[:3]}"
-    assert len(labels) > 700
+    assert reason == "", f"real ld65 output did not resolve: {reason}"
+    # Every non-blank line of the fixture (names are unique) plus the two
+    # appended: a parser that silently drops some real lines fails here.
+    real = [line for line in labels_path.read_text().splitlines() if line.strip()]
+    assert len(real) == 761
+    assert len(labels) == len(real) + 2
     assert labels["main_loop"] == 0x0883      # that project's, not x25519's
     assert labels["reu_addr_ctrl"] == 0xDF0A  # four lowercase digits
 
