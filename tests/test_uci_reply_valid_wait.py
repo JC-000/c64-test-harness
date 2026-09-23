@@ -211,3 +211,14 @@ def test_uci_socket_read_returns_the_datagram_through_the_window(turbo: bool) ->
     dg = _datagram(253)
     t = _SimTransport(bytes([253, 0]) + dg, window_reads=3)
     assert uci_socket_read(t, 5, 253, turbo_safe=turbo) == dg
+
+
+@pytest.mark.parametrize("target", [0x83, 0x80, 0xFF])
+def test_a_no_reply_target_is_refused(target: int) -> None:
+    """Safety: ``CMD_IF_NO_REPLY`` ($80 in the target byte) makes the firmware
+    answer with ``HANDSHAKE_RESET`` instead of a reply, so neither STATE bit 5
+    nor the error bit ever sets and the post-push wait would spin until the
+    host timeout reset (#490 review)."""
+    with pytest.raises(ValueError, match="no-reply"):
+        u.build_uci_command(target, 1)
+    u.build_uci_command(target & 0x7F, 1)  # the same target with a reply is fine

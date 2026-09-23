@@ -64,7 +64,6 @@ MASK_STATE_BUSY = 0x31  # state bits (5,4) + cmd_busy (0) -- zero when idle
 BIT_DATA_AV     = 0x80
 BIT_STAT_AV     = 0x40
 BIT_ERROR       = 0x08  # bit3
-BIT_CMD_BUSY    = 0x01
 
 # UCI control bits (write to $DF1C)
 CTL_PUSH_CMD  = 0x01  # bit0
@@ -168,12 +167,16 @@ def _build_probe_prg() -> bytes:
         emit_write_cmd_data(cmd)
         emit_sta_control(CTL_PUSH_CMD)
 
-    def emit_wait_not_busy():
-        """Poll $DF1C until CMD_BUSY (bit0) clears."""
+    def emit_wait_reply():
+        """Poll $DF1C until the reply is valid (STATE bit 5) or ERROR (bit 3).
+
+        Not until CMD_BUSY (bit 0) clears: the firmware clears bit 0 before
+        it fills the queues, so a drain started then can find them empty
+        (issue #486)."""
         pos = len(code)
         emit_lda_status()
-        emit(0x29, BIT_CMD_BUSY)  # AND #$01
-        emit(0xD0, 0)  # BNE back -- placeholder
+        emit(0x29, 0x28)  # AND #$28
+        emit(0xF0, 0)  # BEQ back -- placeholder
         code[-1] = (pos - len(code)) & 0xFF
 
     def emit_check_error(error_bit):
@@ -268,7 +271,7 @@ def _build_probe_prg() -> bytes:
     emit_wait_idle()
     emit_progress(0x03)
     emit_send_cmd(TARGET_NETWORK, CMD_IDENTIFY)
-    emit_wait_not_busy()
+    emit_wait_reply()
     emit_progress(0x04)
     jmp_ident_err = emit_check_error(0x01)
 
@@ -301,7 +304,7 @@ def _build_probe_prg() -> bytes:
     emit_progress(0x08)
     # (acknowledge above already waits for idle)
     emit_send_cmd(TARGET_NETWORK, CMD_GET_IFACE_COUNT)
-    emit_wait_not_busy()
+    emit_wait_reply()
     jmp_iface_err = emit_check_error(0x02)
 
     # Read one response byte
@@ -326,7 +329,7 @@ def _build_probe_prg() -> bytes:
     emit_write_cmd_data(CMD_GET_IP_ADDRESS)
     emit_write_cmd_data(0x00)  # interface index 0
     emit_sta_control(CTL_PUSH_CMD)
-    emit_wait_not_busy()
+    emit_wait_reply()
     jmp_ip_err = emit_check_error(0x04)
 
     # Read response bytes using Y as index

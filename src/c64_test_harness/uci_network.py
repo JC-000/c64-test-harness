@@ -131,6 +131,11 @@ _IDLE_MASK = STATE_BITS | BIT_CMD_BUSY
 #: find both queues empty -- measured on the U64E, 2026-09-23 (#486).
 _REPLY_WAIT_MASK = STATE_LAST_DATA | BIT_ERROR
 
+#: Target-byte flag that tells the firmware to send no reply
+#: (``CMD_IF_NO_REPLY``, ``command_intf.cc``): it forces the state to ``00``
+#: with ``HANDSHAKE_RESET``, so the wait above would never end.
+_CMD_IF_NO_REPLY = 0x80
+
 # ---------------------------------------------------------------------------
 # Control register bits (write side of $DF1C)
 # ---------------------------------------------------------------------------
@@ -467,7 +472,10 @@ def _build_push_and_wait() -> list[int]:
     not for bit 0 (CMD_BUSY) to clear, which comes before the reply is in
     the queues (issue #486).  Same 12 bytes as the old bit-0 wait.  Like the
     other waits it is unbounded on the 6510; the host's sentinel timeout and
-    CPU reset (:func:`_execute_uci_routine`) bound it.
+    CPU reset (:func:`_execute_uci_routine`) bound it.  Two cases never end
+    it and so run to that timeout: a target with the no-reply bit
+    (:func:`build_uci_command` refuses one), and an ABORT serviced while it
+    waits (the firmware resets the state to ``00``).
     """
     # LDA #$01(2); STA $DF1C(3); LDA $DF1C(3); AND #mask(2); BEQ wait(2)
     # wait loop at byte 5; BEQ at byte 10; next=12; target=5; offset=-7=0xF9
@@ -1026,7 +1034,17 @@ def build_uci_command(
         At the default ``$C000`` a turbo-safe routine takes at most 4 *params*
         bytes (494 B); a fifth reaches the reply area at ``$C200`` and
         :func:`_execute_uci_routine` refuses it.
+
+    A *target* with bit 7 set (``CMD_IF_NO_REPLY``) raises ``ValueError``:
+    the firmware answers that with ``HANDSHAKE_RESET`` rather than a reply,
+    so the post-push wait for a valid reply would never end (#486).
     """
+    if target & _CMD_IF_NO_REPLY:
+        raise ValueError(
+            f"target ${target:02X} has the no-reply bit ($80) set: the firmware "
+            "sends no reply for it, and every routine waits for one after the "
+            "push (issue #486) -- clear bit 7"
+        )
     if isinstance(params, list):
         params = bytes(params)
 
