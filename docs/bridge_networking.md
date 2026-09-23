@@ -1106,10 +1106,10 @@ Result bytes the TX builders can now store:
   RxCTL accepts broadcast, so frames the host puts on the link sit unread
   in the chip's shared buffer, and while they do `Rdy4TxNOW` does not
   assert. That state has every property #234 reports, but that #234 *was*
-  it is inferred, not measured — #234's session was not reproduced. Paired n=6 at 1 MHz, TX 1514
-  B bid: three injected host frames gave `0x04` 5/6, none 0/6; the
-  unprovoked `0x04`s in the #438 run (16 of 174) are attributed to this
-  cause, not shown to be it. Once starved it
+  it is inferred, not measured — #234's session was not reproduced.
+  Paired n=6 at 1 MHz, TX 1514 B bid: three injected host frames gave
+  `0x04` 5/6, none 0/6; the unprovoked `0x04`s in the #438 run (16 of
+  174) are attributed to this cause, not shown to be it. Once starved it
   persists: every retry stayed `0x04` (16/16) until the queue was drained
   or the chip reset. `build_cs8900a_reset_code` cleared 10/10 starved chips
   (5 at 1 MHz, 5 at 48 MHz) and the next two transmits reached en4 20/20;

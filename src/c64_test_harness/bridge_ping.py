@@ -1171,9 +1171,11 @@ def build_tx_code(
     reset.  What ran on silicon was a standalone :func:`_emit_drain_rx`
     routine, not this option: it freed the next transmit 4/4, and one of
     those failed again on the transmit after.  ``drain_first`` itself is
-    pinned on the simulated chip only.  RxCTL accepts broadcast, so an
-    idle link fills the queue on its own.  The drain discards those
-    frames, so leave it off when the routine that follows must read them.
+    pinned on the simulated chip only.  RxCTL accepts broadcast, and
+    unprovoked ``0x04`` results (16 of 174 transmits in #303) are
+    attributed to host frames the link delivered on its own.  The drain
+    discards queued frames, so leave it off when the routine that follows
+    must read them.
     Default ``False`` keeps the routine byte-identical; ``True`` adds 40
     bytes (43 with ``drain_status_addr``), 139-163 bytes in all, which
     takes the routine past 128 bytes -- through ``transport.write_memory``
