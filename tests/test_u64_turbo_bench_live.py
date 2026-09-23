@@ -150,10 +150,16 @@ def _resolve_labels(prg_path: Path | None) -> tuple[Labels | None, str]:
 
     missing = [name for name in _REQUIRED_LABELS if name not in labels]
     if missing:
-        return None, (
+        reason = (
             f"{path} is missing the symbol(s) {', '.join(missing)} — the PRG "
             f"at {prg_path} is not the x25519 build this module drives"
         )
+        if len(missing) == len(_REQUIRED_LABELS):
+            # None of them: the file may not be a listing at all, with one
+            # stray line ``Labels`` accepted. Show what it is.
+            first = next(line for line in text.splitlines() if line.strip())
+            reason += f" (first line: {first!r})"
+        return None, reason
 
     return labels, ""
 

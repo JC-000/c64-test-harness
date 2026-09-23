@@ -20,7 +20,8 @@ the gate is a collection-time skip, before any fixture and so before the
 first upload.
 
 No device traffic: only the module's label resolver (parsing by
-``c64_test_harness.Labels``, #463) and code builders are exercised, against listings written into ``tmp_path``.
+``c64_test_harness.Labels``, #463) and code builders are exercised,
+against listings written into ``tmp_path``.
 """
 
 from __future__ import annotations
@@ -149,7 +150,7 @@ def test_parser_accepts_the_prefix_less_form_the_repo_parser_reads(
     assert labels["main_loop"] == 0x082D
 
 
-def test_parser_reports_non_label_lines_instead_of_dropping_them(
+def test_resolver_quotes_a_non_label_line_when_nothing_parses(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     module = _arm(monkeypatch, tmp_path)
@@ -162,9 +163,43 @@ def test_parser_reports_non_label_lines_instead_of_dropping_them(
 
     assert labels is None
     assert "1 unparseable" in reason and "'this is not a label'" in reason, (
-        "an unrecognised line must reach the skip reason so it can be "
-        f"quoted, not be silently discarded: {reason!r}"
+        "when nothing parses, the skip reason must quote the first "
+        f"non-blank line and not count the blank one: {reason!r}"
     )
+
+
+def test_listing_with_none_of_the_symbols_quotes_what_it_found(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An HTML 404 page can carry one line ``Labels`` accepts.
+
+    It then parses to one unrelated symbol, so the "not a listing" branch
+    does not fire and the reason is "missing symbols". With none of the
+    required symbols present, the reason must still show what the file is.
+    """
+    module = _arm(monkeypatch, tmp_path)
+
+    labels, reason = _resolve_text(
+        module, tmp_path,
+        "<html><title>404 Not Found</title>\n"
+        "al 404 .notfound\n"
+        "</html>\n",
+    )
+
+    assert labels is None
+    assert "main_loop" in reason, reason
+    assert "404 Not Found" in reason, (
+        f"the reason should quote the file's first line: {reason!r}"
+    )
+
+
+def test_listing_missing_one_symbol_is_not_given_a_sample(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A real listing short one symbol is a wrong build, not a strange file."""
+    module = _arm(monkeypatch, tmp_path, main_loop=None)
+
+    assert "first line" not in module._LABELS_SKIP_REASON
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +499,11 @@ def test_parses_the_checked_in_real_ld65_listing(
     )
 
     assert reason == "", f"real ld65 output did not resolve: {reason}"
-    assert len(labels) > 700
+    # Every non-blank line of the fixture (names are unique) plus the two
+    # appended: a parser that silently drops some real lines fails here.
+    real = [line for line in labels_path.read_text().splitlines() if line.strip()]
+    assert len(real) == 761
+    assert len(labels) == len(real) + 2
     assert labels["main_loop"] == 0x0883      # that project's, not x25519's
     assert labels["reu_addr_ctrl"] == 0xDF0A  # four lowercase digits
 
