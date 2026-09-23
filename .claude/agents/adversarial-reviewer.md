@@ -44,8 +44,9 @@ this brief enforces. Then work these seven axes, in this order:
 1. **Does the test go red?** For every new or changed test, revert the
    source change (`git stash`, or write the parent's version over it
    with `git show <parent>:<path> > <path>`) and run the test yourself.
-   A test you cannot make fail is not a test. This is the single most common defect here: an expected value
-   that equals the system default passes whether or not the code ran.
+   A test you cannot make fail is not a test. This is the single most
+   common defect here: an expected value that equals the system default
+   passes whether or not the code ran.
 2. **Does the green survive mutation?** Break the code under test on
    purpose — drop the guard, return the default, swap the argument order,
    invert the comparison — and record which tests fail. A surviving
