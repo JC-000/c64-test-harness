@@ -206,12 +206,26 @@ def _diff(before: dict, after: dict) -> dict:
     }
 
 
+def _drift_from_stock(client, stock: dict, now: dict) -> dict:
+    """``_diff(stock, now)``, except that ``Cartridge`` at its reported
+    default is not drift: ``test_cartridge_write_does_not_move_reu_size``
+    puts it there by design (#470), so a ``.crt`` selected at entry is
+    expected to be gone afterwards."""
+    drift = _diff(stock, now)
+    if _ITEM_CARTRIDGE in drift and now.get(_ITEM_CARTRIDGE) == client.get_config_item(
+        CAT_CART, _ITEM_CARTRIDGE
+    ).get("default"):
+        del drift[_ITEM_CARTRIDGE]
+    return drift
+
+
 def _require_fresh_stock(client, stock: dict) -> None:
     """Fail loud if the module snapshot no longer describes the device --
     e.g. a flash-reload test ran first and left every item at its default
     (#469) -- rather than diffing against it and blaming the firmware."""
-    if _category(client) != stock:
-        pytest.fail(f"stock snapshot stale before this test: {_diff(stock, _category(client))!r}")
+    drift = _drift_from_stock(client, stock, _category(client))
+    if drift:
+        pytest.fail(f"stock snapshot stale before this test: {drift!r}")
 
 
 def _category_defaults(client, items) -> tuple[dict, list[str]]:
@@ -520,9 +534,9 @@ def test_set_reu_readback_is_immediate_and_restore_is_exact(
         stock[_ITEM_REU_ENABLED] == "Enabled",
         stock[_ITEM_REU_SIZE],
     ), f"REU state not restored: {cfg_restored!r}"
-    assert _diff(stock, restored) == {}, (
-        f"category differs from the pre-write snapshot after restore_state: "
-        f"{_diff(stock, restored)!r}"
+    drift = _drift_from_stock(client, stock, restored)
+    assert drift == {}, (
+        f"category differs from the pre-write snapshot after restore_state: {drift!r}"
     )
 
 

@@ -167,6 +167,36 @@ def test_the_residue_refuses_to_judge_an_item_whose_default_is_unreadable():
         live._restore_residue(client, {"Command Interface": "Enabled"})
 
 
+class _CategoryClient(_FakeClient):
+    """A device whose whole category currently reads *now*."""
+
+    def __init__(self, now: dict) -> None:
+        super().__init__()
+        self.now = now
+
+    def get_config_category(self, category: str) -> dict:
+        return {category: dict(self.now), "errors": []}
+
+
+_STOCK = {"Cartridge": "game.crt", "REU Size": "512 KB"}
+
+
+def test_the_stock_guard_accepts_a_cartridge_put_back_to_its_default():
+    """The Cartridge test leaves ``Cartridge`` at its default ``""`` by
+    design (#470), so the next test must not read that as a stale
+    snapshot and blame test ordering."""
+    live._require_fresh_stock(_CategoryClient({**_STOCK, "Cartridge": ""}), _STOCK)
+
+
+@pytest.mark.parametrize("now", [
+    {**_STOCK, "Cartridge": "other.crt"},     # neither stock nor default
+    {**_STOCK, "Cartridge": "", "REU Size": "2 MB"},  # any other drift
+], ids=["cartridge-elsewhere", "other-item-drifted"])
+def test_the_stock_guard_still_fails_on_any_other_drift(now):
+    with pytest.raises(pytest.fail.Exception, match="stale"):
+        live._require_fresh_stock(_CategoryClient(now), _STOCK)
+
+
 @pytest.mark.parametrize(
     "stock_size, default_size",
     [
