@@ -43,6 +43,7 @@ def _make_mock_u64_instance(host: str = "192.168.1.81") -> MagicMock:
     inst.pid = None
     inst.transport = MagicMock()
     inst.device.host = host
+    inst.device.port = 80  # U64DeviceConfig's default; the lock keys on it
     return inst
 
 

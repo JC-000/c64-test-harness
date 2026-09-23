@@ -463,6 +463,42 @@ class TestClientConstructionNotice:
         finally:
             lock.release()
 
+    def test_silent_when_the_host_and_port_lock_is_held(
+        self, default_lock_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A ``port=8080`` client is covered by a lock taken as ``host:8080``."""
+        lock = DeviceLock(f"{HOST}:8080", lock_dir=default_lock_dir)
+        assert lock.acquire(timeout=1.0)
+        try:
+            with caplog.at_level(logging.WARNING, logger=_CLIENT_LOGGER):
+                _client(port=8080)
+            assert caplog.records == []
+        finally:
+            lock.release()
+
+    def test_the_advisory_check_asks_about_host_and_port(
+        self, default_lock_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Another process holding ``host:8080`` is contention for a
+        ``port=8080`` client; the bare host's lockfile is another device."""
+        from c64_test_harness.backends.device_lock import (
+            REQUIRE_DEVICE_LOCK_ENV,
+            DeviceLockContentionError,
+            normalize_device_host,
+        )
+
+        monkeypatch.setenv(REQUIRE_DEVICE_LOCK_ENV, "1")
+        held = normalize_device_host(f"{HOST}:8080")
+        monkeypatch.setattr(
+            lock_mod.DeviceLock, "foreign_holder",
+            staticmethod(lambda h, lock_dir=None: (
+                {"pid": 4242} if normalize_device_host(h) == held else None
+            )),
+        )
+        c = _client(port=8080, warn_unlocked=False)
+        with pytest.raises(DeviceLockContentionError):
+            c._check_device_lock("PUT /v1/machine:reset")
+
     def test_no_notice_when_device_lock_unavailable(
         self,
         default_lock_dir: Path,

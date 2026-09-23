@@ -156,7 +156,8 @@ def normalize_device_host(host: str) -> str:
     and ``gw:8081`` are two devices, and both the lock and the ledger key
     them apart -- merging them would let two devices behind one name share
     a lock and a budget.  ``DeviceLock`` sees a port only through the host
-    string, so ``Ultimate64Client`` folds a non-default ``port=`` into it.
+    string, so every caller holding a separate ``port`` folds it in with
+    :func:`device_key`.
 
     **A name and the address it resolves to are not folded.**  That would
     need a DNS lookup in the keying path, which can block for seconds and
@@ -199,6 +200,31 @@ def normalize_device_host(host: str) -> str:
         # (and so ``::1`` with a port cannot collide with a bare address).
         return f"[{s}]:{port}" if ":" in s else f"{s}:{port}"
     return s
+
+
+def device_key(host: str, port: int = DEFAULT_DEVICE_PORT) -> str:
+    """The key for the device at *host* on REST *port*: lock, ledger, callbacks.
+
+    ``DeviceLock`` sees a port only in the host string, so every caller that
+    holds a host and a separate ``port`` -- ``Ultimate64Client``, the
+    manager's lock, ``liveness_probe`` -- must fold the port in the same way,
+    or a lock taken by one never covers the state keyed by another and the
+    lock-release ``/Temp`` drain silently misses (#434).  This is that rule.
+
+    The result is :func:`normalize_device_host` of ``host:port``, with an
+    IPv6 literal re-bracketed first: ``::1`` on 8080 is ``[::1]:8080``,
+    never ``::1:8080``, which is a different (valid) IPv6 address.  The
+    default port folds away, so ``device_key(h) == normalize_device_host(h)``.
+    *host* is expected to carry no port of its own when *port* is given.
+    """
+    base = normalize_device_host(host)
+    if int(port) == DEFAULT_DEVICE_PORT:
+        return base
+    try:
+        is_v6 = ipaddress.ip_address(base).version == 6
+    except ValueError:
+        is_v6 = False
+    return normalize_device_host(f"[{base}]:{port}" if is_v6 else f"{base}:{port}")
 
 
 def _device_lock_key(host: str) -> str:

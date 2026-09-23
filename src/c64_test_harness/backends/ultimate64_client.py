@@ -42,12 +42,14 @@ if TYPE_CHECKING:
 
 try:  # device_lock needs fcntl — absent on Windows, optional everywhere
     from .device_lock import advisory_lock_check as _advisory_lock_check
+    from .device_lock import device_key as _device_key
     from .device_lock import register_release_callback as _register_release_callback
     from .device_lock import warn_unlocked_client as _warn_unlocked_client
 
     _HAS_DEVICE_LOCK = True
 except Exception:  # pragma: no cover - exercised only without fcntl
     _HAS_DEVICE_LOCK = False
+    _device_key = None
 
 __all__ = [
     "Ultimate64Client",
@@ -437,13 +439,14 @@ class Ultimate64Client:
         #: The spelling this client keys per-device state on: the lock, the
         #: ``/Temp`` ledger and the release callback.  ``DeviceLock`` sees a
         #: port only in the host string, so a non-default ``port`` goes into
-        #: it; ``gw`` on 8080 and 8081 are two devices (#434).
-        if port == 80:
-            self._device_key = host
-        elif ":" in host and not host.startswith("["):
-            self._device_key = f"[{host}]:{port}"
+        #: it; ``gw`` on 8080 and 8081 are two devices (#434).  The rule is
+        #: ``device_lock.device_key``, shared with the manager's lock and
+        #: ``liveness_probe``; without ``device_lock`` there is no lock to
+        #: agree with, and the ledger normalises the host itself.
+        if _device_key is None:  # pragma: no cover - only without fcntl
+            self._device_key = host if port == 80 else f"{host}:{port}"
         else:
-            self._device_key = f"{host}:{port}"
+            self._device_key = _device_key(host, port)
 
         # Before any network traffic: one line per process per host if
         # this lane is driving the device without holding its lock.

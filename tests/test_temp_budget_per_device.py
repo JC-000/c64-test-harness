@@ -683,6 +683,140 @@ def test_a_lock_on_the_host_and_port_drains_a_port_kwarg_client(tmp_path):
     assert c.pending_temp_attachments == 0
 
 
+@pytest.mark.parametrize("host,same,other", [
+    ("gw.example", "gw.example:8080", "gw.example:8081"),
+    # IPv6: re-bracketed, or "::1" on 8080 would key as the address ::1:8080
+    ("::1", "[::1]:8080", "::1:8080"),
+])
+def test_host_and_port_key_as_the_host_and_port_spelling(host, same, other):
+    from c64_test_harness.backends.device_lock import device_key
+
+    assert device_key(host, 8080) == gc_mod.temp_ledger_key(same)
+    assert device_key(host, 8080) != gc_mod.temp_ledger_key(other)
+    assert device_key(host) == gc_mod.temp_ledger_key(host)
+    assert _client(host, port=8080)._temp_ledger is _client(same)._temp_ledger
+    assert _client(host, port=8080)._temp_ledger is not _client(other)._temp_ledger
+
+
+@pytest.fixture
+def default_lock_dir(monkeypatch, tmp_path):
+    """Point every ``lock_dir=None`` default -- the manager's lock, the
+    client's lock query -- at a private directory."""
+    from c64_test_harness.backends import device_lock as lock_mod
+
+    monkeypatch.setattr(lock_mod, "_default_lock_dir", lambda create=True: tmp_path)
+    return tmp_path
+
+
+def test_a_manager_lock_on_a_port_8080_device_drains_its_client(default_lock_dir, host):
+    """Safety (#434 round 3): ``_LockedU64Manager`` took ``DeviceLock`` on the
+    bare host while the client keyed on ``host:port``, so on any port but 80
+    the lock-release drain never reached the client that leaked."""
+    from types import SimpleNamespace
+
+    from c64_test_harness.backends.unified_manager import _LockedU64Manager
+
+    device = SimpleNamespace(host=host, port=8080)
+
+    class _Inner:
+        def acquire(self):
+            return SimpleNamespace(device=device)
+
+        def release(self, instance):
+            pass
+
+    mgr = _LockedU64Manager(_Inner(), lock_timeout=5.0, baseline_on_entry=False)
+    instance = mgr.acquire()
+    c = _client(host, port=8080)
+    with _FTP() as ftp:
+        c.run_prg(PRG)
+        mgr.release(instance)
+    assert ftp.hosts == [host], "the manager's release never drained it"
+    assert c.pending_temp_attachments == 0
+
+
+def test_a_port_kwarg_client_sees_its_host_and_port_lock_as_held(default_lock_dir, host):
+    """Safety: ``close()`` sweeps inherited ``/Temp`` only while this process
+    holds the device's lock, so the client must find a lock taken as
+    ``host:port`` -- and must not take the bare host's lock for its own."""
+    from c64_test_harness.backends.device_lock import DeviceLock
+
+    idle = _client(host, port=8080)
+    for spelling, sweeps in ((host, False), (f"{host}:8080", True)):
+        lock = DeviceLock(spelling)
+        assert lock.acquire(timeout=5.0)
+        with _FTP() as ftp:
+            try:
+                assert idle._holds_device_lock() is sweeps, spelling
+                idle.close()
+                swept = list(ftp.hosts)
+            finally:
+                lock.release()
+        assert swept == ([host] if sweeps else []), spelling
+
+
+def test_the_free_liveness_probe_keys_on_host_and_port(tmp_path, host):
+    """#434 round 3: the probe reserved and registered under the bare host,
+    so a probe of ``gw.example`` on 8080 spent device 80's budget and a lock
+    on ``gw.example:8080`` never drained it."""
+    with _FTP() as ftp:
+        result = _free_probe(host, port=8080)
+        assert result.healthy, result
+        assert gc_mod.temp_ledger_for(host).pending == 0
+        assert gc_mod.temp_ledger_for(f"{host}:8080").pending == 2
+        _release_lock(host, tmp_path)
+        assert ftp.hosts == []
+        _release_lock(f"{host}:8080", tmp_path)
+    assert ftp.hosts == [host], "FTP goes to the bare host"
+
+
+def test_a_port_probe_that_sends_nothing_refunds_its_own_ledger(host):
+    """The refund must land on the ledger the reservation was taken on, or
+    ``host:8080`` keeps a phantom count that sweeps or blocks later callers."""
+    import socket
+
+    def _sender(method, h, port, path, password, timeout, **kwargs):
+        if path == "/v1/info":
+            return 200, json.dumps({"firmware_version": "1.1.0"}).encode()
+        raise socket.timeout("readmem")
+
+    with _FTP():
+        result = _free_probe(host, port=8080, request=_sender)
+    assert result.failure == "tcp_stack_wedged", result
+    assert gc_mod.temp_ledger_for(f"{host}:8080").pending == 0
+
+
+def test_a_port_probe_is_covered_by_the_host_and_port_lock(
+    default_lock_dir, host, monkeypatch, caplog
+):
+    """The probe's unlocked notice asks about the lock that covers it:
+    ``host:8080`` held -> silent; only the bare host held -> the notice."""
+    import logging
+
+    from c64_test_harness.backends.device_lock import (
+        UNLOCKED_WARNING_ENV,
+        DeviceLock,
+    )
+
+    monkeypatch.delenv(UNLOCKED_WARNING_ENV, raising=False)
+    notices = []
+    for spelling in (f"{host}:8080", host):
+        lock = DeviceLock(spelling)
+        assert lock.acquire(timeout=5.0)
+        caplog.clear()
+        with _FTP():
+            try:
+                with caplog.at_level(logging.WARNING):
+                    _free_probe(host, port=8080)
+            finally:
+                lock.release()
+        notices.append(any(
+            "liveness_probe" in r.getMessage() and "lock" in r.getMessage()
+            for r in caplog.records
+        ))
+    assert notices == [False, True], notices
+
+
 @pytest.mark.parametrize("spelling,bare", [
     ("gw.example:80", "gw.example"),
     ("10.0.0.7:80", "10.0.0.7"),

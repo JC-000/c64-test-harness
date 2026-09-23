@@ -29,8 +29,10 @@ from .vice_manager import ViceInstanceManager
 
 try:
     from .device_lock import (
+        DEFAULT_DEVICE_PORT,
         DeviceLock,
         DeviceLockTimeout,
+        device_key,
         resolve_lock_timeout,
         suppress_unlocked_warning,
     )
@@ -409,7 +411,7 @@ class _LockedU64Manager:
 
         acquire():
             1. inner.acquire()  → picks a device from the in-process pool
-            2. DeviceLock(device.host).acquire(timeout)
+            2. DeviceLock(device_key(device.host, device.port)).acquire(timeout)
                → blocks if another process holds this device
             3. baseline_on_entry: apply_factory_baseline(client)
                → reset the covered config stores to factory default and
@@ -470,7 +472,18 @@ class _LockedU64Manager:
         # otherwise queue behind itself for the full lock_timeout and
         # then fail.  The inner manager still guarantees one in-process
         # user per device, so joining the existing hold is safe.
-        lock = DeviceLock(device_host, allow_nested=True)
+        #
+        # Keyed on host *and* port, by the rule the client keys its ledger and
+        # release callback on: a lock on the bare host would never fire the
+        # ``/Temp`` drain of a client on any other port (#434).  A device
+        # record without a ``port`` is on the default one.
+        lock = DeviceLock(
+            device_key(
+                device_host,
+                getattr(instance.device, "port", DEFAULT_DEVICE_PORT),
+            ),
+            allow_nested=True,
+        )
         try:
             lock.acquire_or_raise(timeout=lock_timeout)
         except BaseException:

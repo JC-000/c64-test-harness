@@ -66,7 +66,12 @@ Two things it deliberately does **not** fold:
 
 - **A non-default port.** `gw:8080` and `gw:8081` are two devices behind
   one name, and merging them would let one device's failed `/Temp`
-  hygiene pass block requests to the other.
+  hygiene pass block requests to the other. A caller that holds the port
+  separately (`Ultimate64Client(host, port=...)`, the manager's lock,
+  `liveness_probe(host, port=...)`) keys on `device_key(host, port)` from
+  `device_lock`, which also re-brackets IPv6 (`[::1]:8080`). Lock a device
+  on another port as `DeviceLock(device_key(host, port))`, or the lock does
+  not cover that client and its lock-release `/Temp` drain never runs.
 - **A name and the address it resolves to.** `c64u.lan` and
   `10.53.21.158` stay two keys for one device. Folding them needs a DNS
   lookup in the path that takes the lock, which can block for seconds and
