@@ -26,12 +26,12 @@ from __future__ import annotations
 
 import functools
 import os
-import re
 import time
 from pathlib import Path
 
 import pytest
 
+from c64_test_harness import Labels
 from c64_test_harness.backends.device_lock import DeviceLock, DeviceLockTimeout
 from c64_test_harness.backends.ultimate64 import Ultimate64Transport
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
@@ -102,10 +102,6 @@ _PRG_PATH, _PRG_SKIP_REASON = _resolve_prg_path()
 # time: the ``pytestmark`` skip below is evaluated at collection, before any
 # fixture runs and therefore before the first upload.
 
-#: The label lines ``ld65 -Ln`` emits, after the build's ``sed`` rewrites
-#: them to carry a segment prefix: ``al C:00082D .main_loop``.
-_LABEL_RE = re.compile(r"^al\s+C:([0-9A-Fa-f]{1,6})\s+\.(\S+)$")
-
 #: The x25519 Makefile writes ``$(BUILD_DIR)/labels.txt`` beside
 #: ``$(BUILD_DIR)/x25519.prg``, so the listing is the PRG's sibling.
 _LABELS_FILENAME = "labels.txt"
@@ -114,34 +110,15 @@ _LABELS_FILENAME = "labels.txt"
 _REQUIRED_LABELS = ("x25519_clamp", "x25_scalar", "main_loop")
 
 
-def _parse_ca65_labels(text: str) -> tuple[dict[str, int], list[str]]:
-    """Parse an ``ld65 -Ln`` label listing into ``{symbol: address}``.
-
-    Returns ``(labels, unparseable)``. Blank lines are not unparseable;
-    anything else that is not a label line is returned verbatim so the
-    caller can quote it in a skip reason rather than silently dropping it.
-    """
-    labels: dict[str, int] = {}
-    unparseable: list[str] = []
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        match = _LABEL_RE.match(line)
-        if match is None:
-            unparseable.append(raw)
-            continue
-        labels[match.group(2)] = int(match.group(1), 16)
-    return labels, unparseable
-
-
-def _resolve_labels(prg_path: Path | None) -> tuple[dict[str, int] | None, str]:
+def _resolve_labels(prg_path: Path | None) -> tuple[Labels | None, str]:
     """Resolve build addresses from the ``labels.txt`` beside the PRG.
 
-    Returns ``(labels, "")`` when every required symbol resolved, and
-    ``(None, reason)`` otherwise. The three failure modes are reported
-    distinguishably — an absent listing, a listing that is not one, and a
-    listing missing a symbol are three different things to go fix.
+    Parsing is :meth:`c64_test_harness.Labels.from_file`'s (#463); this
+    function only adds the policy. Returns ``(labels, "")`` when every
+    required symbol resolved, and ``(None, reason)`` otherwise. The three
+    failure modes are reported distinguishably — an absent listing, a
+    listing that is not one, and a listing missing a symbol are three
+    different things to go fix — and none of them falls back to a literal.
     """
     if prg_path is None:
         return None, f"no {_PRG_ENV} resolved, so there is no {_LABELS_FILENAME} to read"
@@ -155,12 +132,15 @@ def _resolve_labels(prg_path: Path | None) -> tuple[dict[str, int] | None, str]:
         )
 
     try:
+        labels = Labels.from_file(path)
         text = path.read_text()
     except OSError as exc:  # unreadable is an environment defect, not a decision
         return None, f"{path} could not be read: {exc}"
 
-    labels, unparseable = _parse_ca65_labels(text)
+    # ``Labels`` drops lines it cannot parse without a word, so an HTML 404
+    # saved as labels.txt parses to nothing. Say so, and quote what is there.
     if not labels:
+        unparseable = [line for line in text.splitlines() if line.strip()]
         sample = unparseable[0] if unparseable else "<empty file>"
         return None, (
             f"{path} contains no ca65 label lines "
