@@ -119,6 +119,18 @@ def test_a_reversed_output_span_is_refused() -> None:
     assert t.writes == []
 
 
+def test_the_error_flag_is_protected_whatever_the_spans() -> None:
+    """The error flag alone, clear of the sentinel: the host clears it before
+    the upload and reads it after, so no span list can give it away."""
+    t = _Recorder()
+    with pytest.raises(ValueError, match="the error flag at"):
+        un._execute_uci_routine(
+            t, bytes(1), code_addr=un._ERROR_ADDR,
+            check_identifier=False, output_spans=((0xC500, 0xC5FF),),
+        )
+    assert t.writes == []
+
+
 def test_a_single_byte_caller_span_is_named_as_an_output_span() -> None:
     t = _Recorder()
     with pytest.raises(ValueError, match=r"output span \$C500-\$C500"):
