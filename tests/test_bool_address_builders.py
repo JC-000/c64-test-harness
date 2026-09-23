@@ -80,7 +80,9 @@ UCI = dict(status_addr=A.STAT, stat_len_addr=A.SLEN, error_addr=A.ERR, sentinel_
 
 #: name -> (builder, IntEnum-addressed kwargs, sha256[:16] of the base's output).
 #: Digests taken on 3aaa53d with scratch script i373_golden.py (int and IntEnum
-#: agreed on the base for every row).
+#: agreed on the base for every row).  The seven UCI builders that push a command were
+#: re-taken for #486, whose wait-for-reply change alters exactly two bytes of
+#: each (the wait mask ``$01``->``$28`` and its branch opcode), sizes unchanged.
 BUILDERS = {
     "build_cs8900a_reset_code": (bridge_ping.build_cs8900a_reset_code, dict(load_addr=A.LOAD, result_addr=A.RESULT), "4f96c03b59e1b071"),
     "build_icmp_responder_code": (bridge_ping.build_icmp_responder_code, dict(load_addr=A.LOAD, rx_buf=A.RX, my_ip=IP, result_addr=A.RESULT, my_mac=MAC), "7499c032a253503c"),
@@ -99,13 +101,13 @@ BUILDERS = {
     "build_poll_with_tod_deadline_code": (tod_timer.build_poll_with_tod_deadline_code, dict(load_addr=A.LOAD, peek_check_snippet=SNIP, result_addr=A.RESULT, deadline_tenths=50), "3a200cd12f7444b6"),
     "build_uci_probe": (uci_network.build_uci_probe, dict(result_addr=A.RESP, sentinel_addr=A.SENT, code_addr=A.CODE), "e5fe30ee49a863ca"),
     "build_uci_status_peek": (uci_network.build_uci_status_peek, dict(result_addr=A.RESP, sentinel_addr=A.SENT, code_addr=A.CODE), "4a77cf1d5a4952c2"),
-    "build_uci_command": (uci_network.build_uci_command, dict(target=4, cmd=1, params=b"", resp_addr=A.RESP, resp_len_addr=A.RLEN, **UCI), "e13fd0850f31e343"),
-    "build_get_ip": (uci_network.build_get_ip, dict(result_addr=A.RESP, resp_len_addr=A.RLEN, **UCI), "02e00ec4794c821d"),
-    "build_tcp_connect": (uci_network.build_tcp_connect, dict(host_addr=A.HOST, port=80, result_addr=A.RESP, resp_len_addr=A.RLEN, **UCI), "ce438f8fcb3b25a4"),
-    "build_udp_connect": (uci_network.build_udp_connect, dict(host_addr=A.HOST, port=80, result_addr=A.RESP, resp_len_addr=A.RLEN, **UCI), "ff0a0295c8a0d495"),
-    "build_socket_write": (uci_network.build_socket_write, dict(socket_id_addr=A.SOCK, data_addr=A.DATA, data_len_addr=A.DLEN, **UCI), "a2ac4661d5c18c57"),
-    "build_socket_read": (uci_network.build_socket_read, dict(socket_id_addr=A.SOCK, result_addr=A.RESP, max_len=100, actual_len_addr=A.ALEN, **UCI), "d57f06fa64a31b18"),
-    "build_socket_close": (uci_network.build_socket_close, dict(socket_id_addr=A.SOCK, **UCI), "db19e7fecd3cbe64"),
+    "build_uci_command": (uci_network.build_uci_command, dict(target=4, cmd=1, params=b"", resp_addr=A.RESP, resp_len_addr=A.RLEN, **UCI), "11601440abbda122"),
+    "build_get_ip": (uci_network.build_get_ip, dict(result_addr=A.RESP, resp_len_addr=A.RLEN, **UCI), "603977ee61239910"),
+    "build_tcp_connect": (uci_network.build_tcp_connect, dict(host_addr=A.HOST, port=80, result_addr=A.RESP, resp_len_addr=A.RLEN, **UCI), "ee0d84b3a835fcf0"),
+    "build_udp_connect": (uci_network.build_udp_connect, dict(host_addr=A.HOST, port=80, result_addr=A.RESP, resp_len_addr=A.RLEN, **UCI), "89eaad3d224ea07f"),
+    "build_socket_write": (uci_network.build_socket_write, dict(socket_id_addr=A.SOCK, data_addr=A.DATA, data_len_addr=A.DLEN, **UCI), "9e61438639226ae7"),
+    "build_socket_read": (uci_network.build_socket_read, dict(socket_id_addr=A.SOCK, result_addr=A.RESP, max_len=100, actual_len_addr=A.ALEN, **UCI), "9b2efa649580f730"),
+    "build_socket_close": (uci_network.build_socket_close, dict(socket_id_addr=A.SOCK, **UCI), "66f8bdd91748b3e4"),
     "build_vice_stub": (sid_player.build_vice_stub, dict(play_addr=A.PLAY, stub_addr=A.STUB), "ded740690d725b5c"),
     "build_test_psid": (sid.build_test_psid, dict(load_addr=A.PSID, init_code=b"\xea", play_code=b"\xea"), "e6504f4db256b843"),
 }

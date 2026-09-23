@@ -188,6 +188,21 @@ does not cycle through IMAIN — only the command-line processor does.
 
 Custom builders MUST end with `RTS` (0x60), not `JMP` or `BRK`.
 
+**After the push, every routine waits for the reply to be valid, not for
+`CMD_BUSY` to clear** (#486). `$DF1C` bit 0 is the new-command flag, and the
+firmware clears it (`HANDSHAKE_ACCEPT_COMMAND`, `command_intf.cc:169` at
+bce4535e) *before* `copy_result` fills the queues and validates the reply
+(`:173`). In between, STATE reads `01` with DATA_AV and STAT_AV both low, so
+a drain started on bit 0 alone could store nothing and still record the
+`00,OK` that arrived a few instructions later. On the U64E (2026-09-23,
+1 MHz, 253-byte reads, interleaved n=8 per arm) the bit-0 wait returned the
+whole datagram 5/16 times and a wait for STATE bit 5 16/16. The wait
+(`_REPLY_WAIT_MASK`) ends on STATE bit 5 **or** the error bit, because a
+PUSH while not idle sets only the error bit. It uses the old loop's bytes
+(mask and branch sense), so no routine changed size; like the other waits it
+is unbounded on the 6510 and bounded by the host timeout and reset above.
+A custom routine that polls bit 0 has the same race.
+
 ## Datagram size limits
 
 `uci_socket_write` accepts up to **892 bytes per call** (the constant `SOCKET_WRITE_MAX_BYTES`). This is the *empirical* firmware ceiling on the U64E: the theoretical `CMD_MAX_COMMAND_LEN - 3` from Gideon's source is 893, but the firmware truncates by exactly one byte at that boundary (a fencepost in how `command->length` counts — verified with a size sweep in `tests/test_uci_udp_send_large_live.py` and the standalone probe captured at session time). The 6502 inner loop in `build_socket_write` uses self-modifying code on the `LDA abs,Y` operand to push payloads across 6502 page boundaries in one call.
@@ -279,9 +294,10 @@ keyword. When set, the generated 6502 routine:
    (`$DF1C-$DF1F`). The fence burns ~2525 cycles — ~52 µs at 48 MHz, ~2.5 ms
    at 1 MHz. Loop parameters: `UCI_FENCE_OUTER = 5`, `UCI_FENCE_INNER = 100`.
 2. Adds a 255-iteration settle delay after every `PUSH_CMD` write, before
-   the first `CMD_BUSY` poll. At turbo speeds the FPGA may not have asserted
-   `CMD_BUSY` yet when the CPU reaches the poll loop; the settle loop closes
-   that gap.
+   the first poll of the post-push wait. It was added because at turbo
+   speeds the FPGA might not have asserted `CMD_BUSY` by the first poll;
+   since #486 that wait is for the reply to be valid, not for `CMD_BUSY`,
+   and the settle is kept as it was.
 3. Converts loop-back short branches (`BNE`/`BEQ`) to `JMP` trampolines
    wherever the fence expansion blows the 8-bit branch range.
 

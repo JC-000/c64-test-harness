@@ -23,7 +23,8 @@ Command protocol:
 1. Wait idle (STATE==0 and CMD_BUSY==0)
 2. Write target byte, command byte, params to $DF1D
 3. Push command: write $01 to $DF1C
-4. Wait not busy: poll $DF1C bit0
+4. Wait for the reply: poll $DF1C until STATE bit 5 or ERROR (not bit0,
+   which clears before the reply is valid -- issue #486)
 5. Check error: bit3 set => write $08 to $DF1C, flag error
 6. Read response: while bit7 set, read $DF1E
 7. Read status: while bit6 set, read $DF1F
@@ -119,6 +120,16 @@ STATE_MORE_DATA = 0x30    # more data available
 
 # Combined mask for idle check: STATE bits + CMD_BUSY
 _IDLE_MASK = STATE_BITS | BIT_CMD_BUSY
+
+#: What the post-PUSH wait waits *for* (issue #486): STATE bit 5
+#: (``state(1)``: the firmware has validated a reply, ``10`` or ``11``) or the
+#: error bit (a PUSH while not idle sets ``error_busy`` and changes nothing
+#: else, so bit 5 alone would never come).  Bit 0 is not enough: it is the
+#: new-command flag, and the firmware clears it (``HANDSHAKE_ACCEPT_COMMAND``,
+#: ``command_intf.cc:169`` at bce4535e) *before* ``copy_result`` fills the
+#: queues and validates (``:173``), so a drain started on bit 0 alone can
+#: find both queues empty -- measured on the U64E, 2026-09-23 (#486).
+_REPLY_WAIT_MASK = STATE_LAST_DATA | BIT_ERROR
 
 # ---------------------------------------------------------------------------
 # Control register bits (write side of $DF1C)
@@ -450,15 +461,22 @@ def _build_wait_idle() -> list[int]:
 
 
 def _build_push_and_wait() -> list[int]:
-    """6502 fragment: push command then wait for not-busy."""
-    # LDA #$01(2); STA $DF1C(3); LDA $DF1C(3); AND #$01(2); BNE wait(2)
-    # wait loop at byte 5; BNE at byte 10; next=12; target=5; offset=-7=0xF9
+    """6502 fragment: push command, then wait until the reply is valid.
+
+    Waits for :data:`_REPLY_WAIT_MASK` -- STATE bit 5 or the error bit --
+    not for bit 0 (CMD_BUSY) to clear, which comes before the reply is in
+    the queues (issue #486).  Same 12 bytes as the old bit-0 wait.  Like the
+    other waits it is unbounded on the 6510; the host's sentinel timeout and
+    CPU reset (:func:`_execute_uci_routine`) bound it.
+    """
+    # LDA #$01(2); STA $DF1C(3); LDA $DF1C(3); AND #mask(2); BEQ wait(2)
+    # wait loop at byte 5; BEQ at byte 10; next=12; target=5; offset=-7=0xF9
     return [
         _LDA_IMM, CMD_PUSH,
         _STA_ABS, _lo(UCI_CONTROL_STATUS_REG), _hi(UCI_CONTROL_STATUS_REG),
         _LDA_ABS, _lo(UCI_CONTROL_STATUS_REG), _hi(UCI_CONTROL_STATUS_REG),
-        _AND_IMM, BIT_CMD_BUSY,
-        _BNE, 0xF9,
+        _AND_IMM, _REPLY_WAIT_MASK,
+        _BEQ, 0xF9,
     ]
 
 
@@ -649,8 +667,10 @@ def _build_wait_idle_tsx(pc: int, fence: bool = True) -> list[int]:
 def _build_push_and_wait_tsx(pc: int, fence: bool = True) -> list[int]:
     """Turbo-safe variant of ``_build_push_and_wait``.
 
-    Emits PUSH_CMD + a fixed settle delay + a wait_not_busy loop that uses
-    JMP trampolines (since the fence is too wide for short BNE back)::
+    Emits PUSH_CMD + a fixed settle delay + a wait-for-reply loop that uses
+    JMP trampolines (since the fence is too wide for short BNE back).  It
+    waits for :data:`_REPLY_WAIT_MASK`, not for bit 0 to clear (issue #486);
+    same size as the old bit-0 loop::
 
         LDA #PUSH_CMD
         STA $DF1C
@@ -662,8 +682,8 @@ def _build_push_and_wait_tsx(pc: int, fence: bool = True) -> list[int]:
     busy_loop:
         LDA $DF1C
         <fence>
-        AND #BIT_CMD_BUSY
-        BEQ done
+        AND #_REPLY_WAIT_MASK      ; STATE bit 5 or ERROR
+        BNE done
         JMP busy_loop
     done:
     """
@@ -686,9 +706,9 @@ def _build_push_and_wait_tsx(pc: int, fence: bool = True) -> list[int]:
                 _hi(UCI_CONTROL_STATUS_REG)])
     if fence:
         out.extend(_build_fence())
-    out.extend([_AND_IMM, BIT_CMD_BUSY])
-    # BEQ done (skip 3-byte JMP)
-    out.extend([_BEQ, 0x03])
+    out.extend([_AND_IMM, _REPLY_WAIT_MASK])
+    # BNE done (skip 3-byte JMP)
+    out.extend([_BNE, 0x03])
     out.extend([_JMP_ABS, _lo(busy_loop_abs), _hi(busy_loop_abs)])
     return out
 
