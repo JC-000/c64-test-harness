@@ -74,6 +74,51 @@ def test_routine_placed_past_the_reply_area_is_uploaded() -> None:
     assert (_AREA_END, len(code)) in t.writes
 
 
+# --- callers whose routine writes elsewhere pass their own output spans ----
+
+def test_a_routine_over_an_unused_reply_buffer_is_uploaded_with_its_spans() -> None:
+    """#420's multi-block read is 620 B at $C000 (to $C26B) and never writes
+    $C200-$C2FF: its output is the status page and its own buffer."""
+    t = _Recorder()
+    code = bytes(620)
+    un._execute_uci_routine(
+        t, code, check_identifier=False, timeout=1.0,
+        output_spans=((0xC300, 0xC3FF), (0xC500, 0xC8FF)),
+    )
+    assert (un._CODE_ADDR, len(code)) in t.writes
+
+
+def test_a_routine_over_a_declared_output_span_is_refused() -> None:
+    t = _Recorder()
+    with pytest.raises(ValueError, match=r"\$C500-\$C8FF"):
+        un._execute_uci_routine(
+            t, bytes(32), code_addr=0xC4F0, check_identifier=False,
+            output_spans=((0xC300, 0xC3FF), (0xC500, 0xC8FF)),
+        )
+    assert t.writes == []
+
+
+def test_the_sentinel_and_error_flag_are_protected_whatever_the_spans() -> None:
+    """The host clears and polls them, so no span list can give them away."""
+    t = _Recorder()
+    with pytest.raises(ValueError, match="sentinel|error"):
+        un._execute_uci_routine(
+            t, bytes(4), code_addr=un._SENTINEL_ADDR - 1,
+            check_identifier=False, output_spans=((0xC500, 0xC5FF),),
+        )
+    assert t.writes == []
+
+
+def test_a_reversed_output_span_is_refused() -> None:
+    """A reversed pair would overlap nothing and quietly disarm the guard."""
+    t = _Recorder()
+    with pytest.raises(ValueError, match="reversed"):
+        un._execute_uci_routine(
+            t, bytes(4), check_identifier=False, output_spans=((0xC3FF, 0xC300),),
+        )
+    assert t.writes == []
+
+
 @pytest.mark.parametrize("name", [
     "build_uci_command", "build_get_ip", "build_tcp_connect",
     "build_udp_connect", "build_socket_write", "build_socket_read",
