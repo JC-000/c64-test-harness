@@ -780,3 +780,213 @@ def test_N2_armed_carry_decides_whether_an_orphaned_attachment_is_swept(tmp_path
         ftp.hosts.clear()
         _release_lock(h, tmp_path)     # no live client: orphan drain must sweep
     assert ftp.hosts == [h], "orphaned armed attachment was not swept"
+
+
+# --------------------------------------------------------------------------- #
+# #450: the free spelling spends the same device budget                       #
+# --------------------------------------------------------------------------- #
+#
+# ``c64_test_harness.liveness_probe`` (the module-level function, re-exported
+# at the package root) issues the same two body-carrying POSTs the client
+# method does -- the probe write and its restore.  Before #450 those two were
+# invisible to the device ledger: never counted, never swept for, never
+# refused.  It is also the spelling a diagnostic script reaches for at the
+# moment someone already suspects a wedge, which is the worst moment to spend
+# two attachments off the books.
+
+def _reachable_probe():
+    return patch(
+        "c64_test_harness.backends.ultimate64_probe.probe_u64",
+        return_value=MagicMock(reachable=True, error=None),
+    )
+
+
+def _free_probe(host: str, **kwargs):
+    from c64_test_harness.backends.ultimate64_probe import liveness_probe
+
+    with _reachable_probe():
+        return liveness_probe(host, **kwargs)
+
+
+def _probe_script(firmware: str = "1.1.0"):
+    """A ``request`` sender for a healthy device reporting *firmware*."""
+    pattern = bytes((i ^ 0x5A) & 0xFF for i in range(128))
+    posts: list[object] = []
+
+    def _send(method, host, port, path, password, timeout, **kwargs):
+        if path == "/v1/info":
+            return 200, json.dumps({"firmware_version": firmware}).encode()
+        if path == "/v1/machine:readmem":
+            return 200, (pattern if posts else bytes(128))
+        posts.append(kwargs.get("body"))
+        return 200, b""
+
+    return _send
+
+
+def _writemem_posts(wire) -> list:
+    return [entry for entry in wire if entry[2] == "/v1/machine:writemem"]
+
+
+def test_the_free_liveness_probe_counts_its_two_posts_against_the_device(host):
+    with _FTP() as ftp:
+        result = _free_probe(host)
+    assert result.healthy, result
+    assert ftp.hosts == [], "nothing pending beforehand: no pass was due"
+    assert _client(host).pending_temp_attachments == 2
+
+
+def test_the_free_liveness_probe_is_refused_once_hygiene_is_known_impossible(
+    host, _clean
+):
+    """A blocked device must not be health-checkable by the other spelling."""
+    wire = _clean
+    a = _client(host, temp_gc_budget=1)
+    with _FTP(default=REFUSED), _no_config_writes():
+        a.run_prg(PRG)
+        with pytest.raises(Ultimate64TempHygieneError):
+            a.run_prg(PRG)             # a's pass failed: the device is blocked
+        wire.clear()
+        with pytest.raises(Ultimate64TempHygieneError):
+            _free_probe(host)
+    assert _writemem_posts(wire) == [], "refused before it wrote anything"
+
+
+def test_the_free_liveness_probe_sweeps_before_it_overruns_the_budget(
+    host, monkeypatch
+):
+    """2 pending + **2** reserved > 3: the pass runs before the probe's first POST.
+
+    Both attachments are reserved together, as on the client (#250): a
+    single-attachment reservation (2 + 1 > 3 is false) would let the probe
+    take this device to four uncollected instead of sweeping first. The free
+    function has no client to carry a ``temp_gc_budget``, so its threshold is
+    the process-wide one (``U64_TEMP_GC_BUDGET`` / the default).
+    """
+    monkeypatch.setenv(gc_mod.BUDGET_ENV, "3")
+    a = _client(host, temp_gc_budget=3)
+    with _FTP() as ftp:
+        a.run_prg(PRG)
+        a.run_prg(PRG)
+        assert a.pending_temp_attachments == 2
+        result = _free_probe(host)
+    assert result.healthy, result
+    assert ftp.hosts == [host]
+    assert _client(host).pending_temp_attachments == 2
+
+
+def test_the_free_liveness_probe_on_post_safe_firmware_counts_but_never_sweeps(
+    host, monkeypatch
+):
+    """Arming follows the firmware the probe's own bodyless /v1/info reports.
+
+    3.15 collects its own ``/Temp``, so there is nothing to sweep and nothing
+    to refuse -- but the attachments are still counted, as the client counts
+    them on a post-safe device.  The budget is set to 1 so that an armed probe
+    *would* sweep here: without that, arming decides nothing and this passes
+    whatever the grade says.
+    """
+    monkeypatch.setenv(gc_mod.BUDGET_ENV, "1")
+    a = _client(host, temp_gc_budget=1)
+    with _FTP() as ftp:
+        a.run_prg(PRG)                                  # 1 pending, budget 1
+        result = _free_probe(host, request=_probe_script("3.15"))
+    assert result.healthy, result
+    assert ftp.hosts == []
+    assert _client(host).pending_temp_attachments == 3
+
+
+def test_a_free_probe_that_sends_nothing_refunds_its_reservation(host):
+    """Mutation guard for the refund: a phantom count sweeps or blocks later
+    callers for attachments the device never received."""
+    import socket
+
+    def _sender(method, h, port, path, password, timeout, **kwargs):
+        if path == "/v1/info":
+            return 200, json.dumps({"firmware_version": "1.1.0"}).encode()
+        raise socket.timeout("readmem")
+
+    with _FTP() as ftp:
+        result = _free_probe(host, request=_sender)
+    assert result.failure == "tcp_stack_wedged", result
+    assert ftp.hosts == []
+    assert _client(host).pending_temp_attachments == 0
+
+
+
+
+def test_a_blocked_device_refuses_the_free_probe_when_info_is_unreadable(host):
+    """Unknown firmware must arm: that is the half-wedged device (#450 review).
+
+    Step 1 has already reported the device reachable, so a ``/v1/info`` that
+    times out means it answered and then failed to say what it is -- not that
+    nothing is there. Disarming on that would skip the refusal as well as the
+    sweep and land two POSTs on a device whose hygiene pass is known to be
+    impossible.
+    """
+    import socket
+
+    calls: list[tuple[str, str]] = []
+
+    def _info_unreadable(method, h, port, path, password, timeout, **kwargs):
+        calls.append((method, path))
+        if path == "/v1/info":
+            raise socket.timeout("info")
+        return 200, bytes(128)
+
+    a = _client(host, temp_gc_budget=1)
+    with _FTP(default=REFUSED), _no_config_writes():
+        a.run_prg(PRG)
+        with pytest.raises(Ultimate64TempHygieneError):
+            a.run_prg(PRG)             # a's pass failed: the device is blocked
+        with pytest.raises(Ultimate64TempHygieneError):
+            _free_probe(host, request=_info_unreadable)
+    assert [c for c in calls if c[0] == "POST"] == [], "refused before writing"
+
+
+def test_a_free_probe_with_no_client_is_still_drained_on_lock_release(
+    host, tmp_path
+):
+    """Counting the attachments is only half of it: they have to be sweepable.
+
+    A diagnostic script that calls the free spelling builds no client, so
+    nothing attaches a host to the ledger and nothing registers the release
+    callback -- ``armed_pending`` alone would leave the two attachments
+    flagged and unreachable by the drain (#450 review).
+    """
+    with _FTP() as ftp:
+        result = _free_probe(host)
+        assert result.healthy, result
+        ledger = gc_mod.temp_ledger_for(host)
+        assert ledger.pending == 2 and ledger.clients() == []
+        _release_lock(host, tmp_path)
+    assert ftp.hosts == [host], "the release drain must reach a client-less host"
+    assert gc_mod.temp_ledger_for(host).pending == 0
+
+
+def test_the_free_probe_says_so_when_this_process_holds_no_lock(host):
+    """#460: it writes \\$0334-\\$03B3 with nobody holding the device.
+
+    A notice, not a refusal (#194) -- the same call
+    ``apply_factory_baseline`` makes, the other free function that mutates a
+    device.
+    """
+    import c64_test_harness.backends.ultimate64_probe as probe_mod
+
+    with _FTP(), patch.object(probe_mod, "_warn_unlocked_client") as warn:
+        _free_probe(host)
+    assert warn.call_count == 1
+    assert warn.call_args.args[0] == host
+    assert warn.call_args.kwargs["what"] == "liveness_probe"
+
+
+def test_the_client_spelling_does_not_warn_twice(host):
+    """The client already warns at construction and checks the lock per
+    request, so the free function must not add a second notice on that path."""
+    import c64_test_harness.backends.ultimate64_probe as probe_mod
+
+    c = _client(host)
+    with _reachable_probe(), _FTP(), \
+            patch.object(probe_mod, "_warn_unlocked_client") as warn:
+        c.liveness_probe()
+    warn.assert_not_called()

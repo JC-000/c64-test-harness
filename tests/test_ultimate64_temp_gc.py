@@ -61,6 +61,14 @@ class _FakeFTP:
         _FakeFTP.deleted.append(name)
 
 
+#: Captured before any fixture patches it, so the one test that is a
+#: positive control on the real probe can put it back (#418 review, finding 1).
+_REAL_DEFAULT_PROBE = gc_mod._default_mounted_probe
+
+#: (host, timeout, port, password) per call to the stubbed default probe.
+_default_probe_calls: list = []
+
+
 @pytest.fixture(autouse=True)
 def _reset_fake_ftp(monkeypatch: pytest.MonkeyPatch):
     _FakeFTP.files = []
@@ -72,6 +80,20 @@ def _reset_fake_ftp(monkeypatch: pytest.MonkeyPatch):
     _FakeFTP.login_error = None
     _FakeFTP.delete_error_names = set()
     monkeypatch.setattr(gc_mod, "FTP", _FakeFTP)
+    # This module is offline ("no network -- FTP is faked", above), and the
+    # sweep's built-in mounted-image probe would break that: every legacy
+    # test calls gc_temp_folder("10.0.0.1"), which would open a real TCP
+    # connection and block for DEFAULT_DRIVES_PROBE_TIMEOUT (#418 review,
+    # finding 1 -- measured 0.02s -> 40.13s, six calls at 5.00s, and
+    # 10.0.0.1 is a common gateway that might actually answer). Stub it,
+    # and record the calls so a test can assert it was or was not reached.
+    _default_probe_calls.clear()
+
+    def _recording_default_probe(host, timeout=None, port=None, password=None):
+        _default_probe_calls.append((host, timeout, port, password))
+        return {}
+
+    monkeypatch.setattr(gc_mod, "_default_mounted_probe", _recording_default_probe)
     # Belt-and-suspenders: clear any GC env vars a prior test left set.
     for var in (gc_mod.AUTO_GC_ENV, gc_mod.KEEP_ENV, gc_mod.FTP_USER_ENV, gc_mod.FTP_PASSWORD_ENV):
         monkeypatch.delenv(var, raising=False)
@@ -323,3 +345,262 @@ def test_budget_comment_prices_uci_writes_by_grade():
     # The same qualifier applies to the "raw write_memory" parenthetical
     # above the note: the transport now chunks those on a leak-prone grade.
     assert "those are lane bugs to fix by chunking" not in src
+
+
+# ------------------------------------------------- mounted images (#418)
+def _drives(*image_files: str) -> dict:
+    """A GET /v1/drives document mounting *image_files* on a, b, ..."""
+    return {
+        "drives": [
+            {chr(ord("a") + i): {"enabled": True, "image_file": f}}
+            for i, f in enumerate(image_files)
+        ],
+        "errors": [],
+    }
+
+
+def test_mounted_managed_image_is_not_deleted():
+    """A temp%04x name a drive has mounted survives the sweep (#418).
+
+    Raw-body uploads (and multipart parts with no filename=) keep the
+    firmware's managed name and are mounted from that file, so the
+    oldest-first sweep would otherwise delete a mounted image's backing
+    store.
+    """
+    _FakeFTP.files = ["temp0001", "temp0002", "temp0003", "temp0004"]
+    result = gc_temp_folder(
+        "dev", mounted_probe=lambda: _drives("/Temp/temp0001", "/Temp/image.d64")
+    )
+    assert "temp0001" not in _FakeFTP.deleted
+    assert result.deleted == ["temp0002"]
+    assert result.mounted_excluded == ["temp0001"]
+    assert result.ok
+
+
+def test_mounted_image_in_a_subdirectory_is_excluded_by_basename():
+    """The U64E reports /Temp/cache/upload/temp0082; the name still matches.
+
+    Measured on the U64E (fw 3.15 bce4535e, 2026-09-15, n=1). Comparing
+    basenames rather than full paths is what makes the exclusion hold
+    across the two generations' differing layouts.
+    """
+    _FakeFTP.files = ["temp0082", "temp0083", "temp0084"]
+    result = gc_temp_folder(
+        "dev", keep=1, mounted_probe=lambda: _drives("/Temp/cache/upload/temp0082")
+    )
+    assert _FakeFTP.deleted == ["temp0083"]
+    assert result.mounted_excluded == ["temp0082"]
+
+
+def test_excluding_a_mounted_image_never_widens_the_delete_set():
+    """Excluding the *youngest* name must not promote an older one into deletion.
+
+    Mounted names are dropped before the keep-count is applied, so the
+    survivors are re-chosen from what is left: the delete set can only
+    shrink. Applying the keep-count first and subtracting afterwards
+    would still delete temp0001 AND temp0002 here.
+    """
+    _FakeFTP.files = ["temp0001", "temp0002", "temp0003", "temp0004"]
+    result = gc_temp_folder("dev", mounted_probe=lambda: _drives("/Temp/temp0004"))
+    assert result.deleted == ["temp0001"]
+    assert result.kept == ["temp0002", "temp0003"]
+    assert result.mounted_excluded == ["temp0004"]
+
+
+def test_unmanaged_mounted_names_leave_the_sweep_untouched():
+    """A normally-named mounted image excludes nothing (harness uploads, #311)."""
+    _FakeFTP.files = ["temp0001", "temp0002", "temp0003"]
+    result = gc_temp_folder("dev", mounted_probe=lambda: _drives("/Temp/image.d64"))
+    assert result.deleted == ["temp0001"]
+    assert result.mounted_excluded == []
+
+
+def test_probe_failure_still_sweeps_and_is_not_a_failed_pass():
+    """An unreadable drives listing must not stop hygiene, and must say so.
+
+    Skipping the sweep would trade a recoverable data hazard for the
+    unrecoverable one this module prevents, and setting .error would
+    block later attachment-creating requests to a healthy device.
+    """
+    _FakeFTP.files = ["temp0001", "temp0002", "temp0003"]
+
+    def boom():
+        raise OSError("connection reset")
+
+    result = gc_temp_folder("dev", mounted_probe=boom)
+    assert result.deleted == ["temp0001"]
+    assert result.ok and result.error is None
+    assert "connection reset" in (result.mounted_probe_error or "")
+
+
+def test_probe_is_not_consulted_when_nothing_would_be_deleted():
+    """No drives request on a device the keep-count already spares."""
+    _FakeFTP.files = ["temp0001", "temp0002"]
+    calls = []
+
+    def probe():
+        calls.append(1)
+        return _drives()
+
+    result = gc_temp_folder("dev", mounted_probe=probe)
+    assert calls == []
+    assert result.deleted == []
+
+
+def test_full_path_ftp_listing_still_protects_the_mounted_image():
+    """NLST may answer with paths, not basenames -- the exclusion must still hold.
+
+    #418 review, finding 4: comparing the raw listing entry against the
+    mounted name (rather than normalising both to a basename) passed every
+    other test in this module while deleting the mounted image. Whether a
+    given ftpd returns ``/Temp/temp0001`` or ``temp0001`` is not
+    established, so the normalisation is load-bearing-if-it-happens and
+    gets its own test.
+    """
+    _FakeFTP.files = ["/Temp/temp0001", "/Temp/temp0002", "/Temp/temp0003"]
+    result = gc_temp_folder(
+        "dev", keep=1, mounted_probe=lambda: _drives("/Temp/temp0001")
+    )
+    assert "/Temp/temp0001" not in _FakeFTP.deleted
+    assert result.deleted == ["/Temp/temp0002"]
+    assert result.mounted_excluded == ["/Temp/temp0001"]
+
+
+def test_default_probe_is_a_bodyless_drives_get(monkeypatch: pytest.MonkeyPatch):
+    """Positive control on the real probe: it is reached, and it is a bodyless GET.
+
+    The autouse fixture stubs ``_default_mounted_probe`` so the rest of
+    this module stays offline; this test puts the **real** one back and
+    fakes the socket layer underneath it instead. That keeps the wiring
+    honestly exercised -- if ``gc_temp_folder`` stopped reaching its
+    default probe, no request would be captured and this fails (which is
+    exactly how it went red against master: ``assert 0 == 1``).
+
+    A body-carrying request here would make every hygiene pass leak the
+    very thing it is sweeping for.
+    """
+    from unittest.mock import patch
+
+    monkeypatch.setattr(gc_mod, "_default_mounted_probe", _REAL_DEFAULT_PROBE)
+    captured = []
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+        def read(self):
+            return b'{"drives":[{"a":{"image_file":"/Temp/temp0001"}}]}'
+
+    def fake_urlopen(req, timeout=None):
+        captured.append(req)
+        return _Resp()
+
+    _FakeFTP.files = ["temp0001", "temp0002", "temp0003"]
+    with patch("urllib.request.urlopen", fake_urlopen):
+        result = gc_temp_folder("10.0.0.5")
+
+    assert len(captured) == 1
+    assert captured[0].get_full_url() == "http://10.0.0.5/v1/drives"
+    assert captured[0].get_method() == "GET"
+    assert captured[0].data is None
+    assert result.mounted_excluded == ["temp0001"]
+
+
+def test_default_probe_carries_port_and_password(monkeypatch: pytest.MonkeyPatch):
+    """The clientless probe must reach a non-80 port and authenticate (finding 2).
+
+    Firmware 1.1.0 answers an unauthenticated call with HTTP_FORBIDDEN
+    when a Network Password is set, and a device on another REST port is
+    not at http://host/ at all. Either miss makes the probe raise and the
+    sweep proceed with no #418 protection.
+    """
+    from unittest.mock import patch
+
+    monkeypatch.setattr(gc_mod, "_default_mounted_probe", _REAL_DEFAULT_PROBE)
+    captured = []
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+        def read(self):
+            return b"{}"
+
+    def fake_urlopen(req, timeout=None):
+        captured.append(req)
+        return _Resp()
+
+    with patch("urllib.request.urlopen", fake_urlopen):
+        gc_mod._default_mounted_probe("10.0.0.5", port=8080, password="hunter2")
+
+    assert captured[0].get_full_url() == "http://10.0.0.5:8080/v1/drives"
+    assert captured[0].get_header("X-password") == "hunter2"
+
+
+def test_ledger_probe_prefers_a_live_clients_list_drives():
+    """A surviving client's list_drives carries its port, password and timeout."""
+
+    class _FakeClient:
+        host, port, password = "10.0.0.5", 80, None
+
+        def list_drives(self):
+            return _drives("/Temp/temp0001")
+
+    ledger = gc_mod.TempLedger("10.0.0.5")
+    client = _FakeClient()
+    ledger.attach(client)
+    probe = ledger.mounted_probe()
+    assert probe.__self__ is client
+    assert probe() == _drives("/Temp/temp0001")
+
+
+def test_ledger_probe_falls_back_to_the_registered_port_and_password():
+    """The orphaned sweep (no client left) still probes with real credentials.
+
+    This is the path that deletes files the process did not create -- the
+    cross-lane case #418 is actually about -- so it is the one that most
+    needs the listing.
+
+    The state is built the way production builds it -- ``attach()``
+    records the client's credentials, then every client is
+    garbage-collected -- rather than by assigning the three attributes by
+    hand. Assigning them pinned only the *read* side, which left
+    ``attach`` free to stop recording them with no test noticing: mutant
+    r2m12 replaced both recording lines with ``pass`` and survived all
+    308 tests, silently reverting the orphaned sweep to port 80 with no
+    ``X-Password`` (#418 re-verify, finding A).
+    """
+
+    class _FakeClient:
+        host, port, password = "10.0.0.5", 8080, "hunter2"
+
+    ledger = gc_mod.TempLedger("10.0.0.5")
+    ledger.attach(_FakeClient())
+    # The recording half of the wiring, on the tested route.
+    assert (ledger.host, ledger.probe_port, ledger.probe_password) == (
+        "10.0.0.5", 8080, "hunter2",
+    )
+    # The orphaned case: no client object survives to drain.
+    ledger._clients.clear()
+    probe = ledger.mounted_probe()
+    assert probe() == {}
+    assert _default_probe_calls == [("10.0.0.5", None, 8080, "hunter2")]
+
+
+def test_unit_tests_never_dial_a_real_device():
+    """The stubbed default probe is what legacy offline tests reach (finding 1).
+
+    Guards the fixture itself: a sweep against a fake host must reach the
+    stub rather than opening a socket. Pairs with the positive control
+    above, which proves the stub is not hiding broken wiring.
+    """
+    _FakeFTP.files = ["temp0001", "temp0002", "temp0003"]
+    result = gc_temp_folder("10.0.0.1")
+    assert _default_probe_calls == [("10.0.0.1", None, None, None)]
+    assert result.deleted == ["temp0001"]

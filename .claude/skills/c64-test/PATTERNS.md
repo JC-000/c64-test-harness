@@ -906,9 +906,20 @@ So on a leak-prone device **`run_prg_via_sys(target, prg)` is the low-risk way t
    probing again on a bad result converges on the wedge you are diagnosing
    (issue #250). `get_info()`, `get_version()` and `read_mem()` cost nothing; use
    those, and reach for `liveness_probe` once, deliberately, knowing the price.
-   The client now counts both POSTs, reserves them before probing, and raises
+   The client counts both POSTs, reserves them before probing, and raises
    `Ultimate64TempHygieneError` instead of probing once hygiene is known to be
-   impossible; the module-level `ultimate64_probe.liveness_probe` does none of that.
+   impossible — and since #450 the module-level `ultimate64_probe.liveness_probe`
+   (the `c64_test_harness.liveness_probe` re-export) does the same against the
+   same per-device ledger, grading the firmware from its own bodyless
+   `/v1/info`. Neither spelling is a free health check. Three consequences for
+   the free one: it now **raises** where it used to return, it now **sweeps**
+   on a budget crossing (and a sweep can delete a raw or filename-less `/Temp`
+   image another lane mounted — #418), and it says once per process and host
+   when nothing here holds the device's `DeviceLock` (#194/#460) — a notice,
+   not a refusal, because it writes `$0334-$03B3` and writes it back. An
+   unreadable `/v1/info` **arms** rather than disarms: step 1 has already
+   reported the device reachable, so a version that will not parse is the
+   half-wedged device, not an empty address.
 9. **A malformed `address` is not rejected by the firmware — it writes to `$0000`.**
    `PUT /v1/machine:writemem?address=0xZZZZ&data=...` returns HTTP 200 and lands at
    zero page (measured 2026-09-10, issue #251). `Ultimate64Client.write_mem`
@@ -1049,8 +1060,13 @@ from c64_test_harness.memory import write_bytes, read_bytes
 
 SENTINEL = 0x0350      # Scratch byte for completion signaling
 TRAMPOLINE = 0x0360    # Scratch area for injected code
-MAIN_LOOP = 0x082A     # Program's parking JMP (from labels)
-TARGET_SUB = 0x1509    # Subroutine to call (from labels)
+# These two belong to the program under test, not to you. Read them from that
+# build's ld65 label listing instead of pasting an address: the literals that
+# used to sit here went stale when the layout moved, and the mismatch only
+# surfaced from the polling loop — after a full session of uploads (#439; see
+# _resolve_labels in tests/test_u64_turbo_bench_live.py).
+MAIN_LOOP = labels["main_loop"]      # Program's parking JMP
+TARGET_SUB = labels["x25519_clamp"]  # Subroutine to call
 
 # Build trampoline: JSR target; LDA #$42; STA sentinel; JMP * (park)
 trampoline = bytes([
@@ -1122,7 +1138,7 @@ grid = wait_for_text(transport, "Q=QUIT", timeout=60.0)
 boot_deadline = time.monotonic() + 60.0
 while time.monotonic() < boot_deadline:
     ml = transport.read_memory(MAIN_LOOP, 3)
-    if ml == bytes([0x4C, 0x2A, 0x08]):  # expected JMP $082A
+    if ml == bytes([0x4C, MAIN_LOOP & 0xFF, (MAIN_LOOP >> 8) & 0xFF]):  # parked
         break
     time.sleep(0.5)
 ```
@@ -1155,7 +1171,7 @@ client.stream_debug_start("239.0.1.66:11002")
 
 What to use turbo-speed capture for: aggregate statistics that tolerate uniform subsampling (which addresses are hit, hot-path frequency, read/write ratios). What *not* to use it for: call-graph reconstruction, exact cycle counting, transition chains (any read-modify-write, IRQ-entry sequence, or timing-sensitive inspection).
 
-The `multicast_group=` argument on `DebugCapture` is the portable receive path — the U64's default `Stream Debug to` destination is the multicast group `239.0.1.66:11002`. Unicast (`<local-ip>:11002`) only works when the Mac/Linux host and the U64 share an L2 segment; multicast works as long as your switch forwards admin-scoped multicast to the host NIC.
+The `multicast_group=` argument on `DebugCapture` is the portable receive path — the U64's default `Stream Debug to` destination is the multicast group `239.0.1.66:11002`. Unicast (`<local-ip>:11002`) only works when the Mac/Linux host and the U64 share an L2 segment. **Multicast has not been observed to deliver on this bench**: #399 measured zero packets in every arm — including a raw socket joined on the en0 address that routes to the device — against a unicast control of 278/281/339 (n=3 paired, interleaved, U64E fw bce4535e, 2026-09-15). The cause is unestablished and open as #461. Use unicast. If you try the group anyway, name the interface: `multicast_interface=` (or `device_host=`, which resolves it) on `AudioCapture`/`DebugCapture`/`VideoCapture` — the join was INADDR_ANY before #399, and on this bench the kernel routes `239.0.1.x` via the VPN.
 
 ### Recovering from FPGA UDP-rate degradation
 

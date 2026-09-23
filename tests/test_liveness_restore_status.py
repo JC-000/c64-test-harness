@@ -92,9 +92,20 @@ def _run(script: _Script, probe=_REACHABLE) -> LivenessResult:
         return liveness_probe("10.0.0.1", request=script)
 
 
+#: The probe's own logger also carries the unlocked-lane notice (#194/#460):
+#: ``liveness_probe`` says once per process and host when nothing here holds
+#: the device's ``DeviceLock``.  It is a true statement about a different
+#: subject, and which test it lands in is decided by which one happens to
+#: probe that host first -- so it is dropped here rather than allowed to
+#: decide whether a restore was reported.  Everything else still counts, so
+#: the ``== []`` assertions keep their full strength.
+_UNLOCKED_NOTICE = "without holding this device's lock"
+
+
 def _warnings(caplog) -> list[str]:
     return [r.getMessage() for r in caplog.records
-            if r.name == _LOGGER and r.levelno >= logging.WARNING]
+            if r.name == _LOGGER and r.levelno >= logging.WARNING
+            and _UNLOCKED_NOTICE not in r.getMessage()]
 
 
 # --------------------------------------------------------------------------- #
