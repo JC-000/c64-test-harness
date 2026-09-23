@@ -103,3 +103,19 @@ def test_the_default_emits_the_pre_drain_bytes(n: int) -> None:
     for code in (bp.build_tx_code(LOAD, TX_BUF, n, RESULT),
                  bp.build_tx_code(LOAD, TX_BUF, n, RESULT, drain_first=False)):
         assert (hashlib.sha256(code).hexdigest(), len(code)) == _DEFAULT_DIGESTS[n]
+
+
+def test_a_part_read_frame_still_starves_the_bid() -> None:
+    """A frame the 6510 has started reading but not finished still holds the
+    buffer: the queue is empty, the stream is not, and the bid is refused."""
+    chip = Cs8900aSim(rx_queue=[_frame(64)], tx_starved_by_rx=True)
+    chip.clockport = 1
+    for _ in range(6):                      # header (4) + 2 body bytes
+        chip.read(0xDE09)
+    assert chip.rx_queue == []
+    cpu = Cpu6502(chip)
+    cpu.load(TX_BUF, _frame(60) + b"\x00")
+    cpu.load(LOAD, bp.build_tx_code(LOAD, TX_BUF, 60, RESULT))
+    cpu.jsr(LOAD, max_steps=5_000_000)
+    assert cpu.read(RESULT) == bp.RESULT_TX_NOT_READY
+    assert chip.tx_frames == []

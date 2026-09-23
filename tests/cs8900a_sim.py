@@ -104,8 +104,8 @@ class Cs8900aSim:
     #: Withhold ``Rdy4TxNOW`` while any received frame is still queued or
     #: part-read -- the TX-buffer starvation measured on silicon in #303
     #: (unread RX frames in the shared buffer; SkipNow or a chip reset frees
-    #: it).  Simplified: on silicon it depends on frame sizes, here any
-    #: queued frame starves every bid.  ``False`` keeps the old model.
+    #: it).  Whether it depends on bid or queued-frame size is unmeasured;
+    #: the model starves every bid.  ``False`` keeps the old model.
     tx_starved_by_rx: bool = False
     #: Number of TxLength high-byte writes seen so far.
     tx_bids: int = 0

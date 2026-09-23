@@ -679,9 +679,11 @@ CS8900A_TX_READY_MAX_POLLS = 65536
 
 #: Result byte every TX builder stores when ``Rdy4TxNOW`` did not assert
 #: within :data:`CS8900A_TX_READY_MAX_POLLS` polls (issue #236): nothing was
-#: copied into the chip.  On silicon the cause measured is the TX buffer
-#: starved by unread RX frames (#303): drain the RX queue (``drain_first``)
-#: or reset the chip with :func:`build_cs8900a_reset_code`.
+#: copied into the chip.  On silicon, injecting host frames that sit unread
+#: provokes it (measured, #303): the TX buffer is starved by the RX queue,
+#: and a chip reset (:func:`build_cs8900a_reset_code`) or a SkipNow drain
+#: frees it.  The unprovoked ``0x04`` results in #303 (16 of 174 transmits)
+#: are attributed to the same cause, not shown to be it.
 RESULT_TX_NOT_READY = 0x04
 
 #: Upper bound on SelfCTL reads :func:`build_cs8900a_reset_code` spends
@@ -902,14 +904,16 @@ def build_cs8900a_reset_code(
 
     Issue #234: ``Rdy4TxNOW`` can stay dead while every status register
     reads healthy, surviving a C64 reset, ``reset(scope="machine")`` and
-    re-running :func:`cs8900a_enable_inline_code`.  The cause measured in
-    #303 is the TX buffer starved by unread RX frames, which none of those
-    touch.  An explicit SelfCTL RESET plus re-init clears it: 10/10 starved
-    chips on the U64E (5 at 1 MHz, 5 at 48 MHz, 2026-09-23), and the next
-    two transmits reached the host 20/20; a SkipNow drain
-    (``build_tx_code(..., drain_first=True)``) clears it too, without a
-    reset.  This is that
-    sequence, in ip65's ``drivers/cs8900a.s`` ``reset`` order:
+    re-running :func:`cs8900a_enable_inline_code`.  #303 measured a state
+    with exactly those properties -- the TX buffer starved by unread RX
+    frames, which none of those touch -- and that #234 was that state is
+    inferred, not measured (#234's session was not reproduced).  An
+    explicit SelfCTL RESET plus re-init clears the starved state: 10/10
+    starved chips on the U64E (5 at 1 MHz, 5 at 48 MHz, 2026-09-23), and
+    the next two transmits reached the host 20/20.  A standalone SkipNow
+    drain (:func:`_emit_drain_rx`) freed it on the next transmit 4/4, with
+    one failure on the transmit after that.  This is the reset sequence,
+    in ip65's ``drivers/cs8900a.s`` ``reset`` order:
 
     1. clockport enable, ``SelfCTL (PP 0x0114)`` low byte ``= $40`` (RESET;
        the high byte is not written, as in ip65);
@@ -1148,26 +1152,33 @@ def build_tx_code(
       #235: 3072 of these with zero packets on the wire).
     * :data:`RESULT_TX_NOT_READY` (``0x04``) -- ``Rdy4TxNOW`` did not assert
       within :data:`CS8900A_TX_READY_MAX_POLLS` polls and nothing was
-      copied.  On silicon this is the TX buffer **starved by unread RX
-      frames** (#303): drain the RX queue (``drain_first=True``) or reset
-      the chip (:func:`build_cs8900a_reset_code`); retrying without either
-      keeps returning ``0x04``.
+      copied.  Provoked on silicon by host frames left unread, it is the TX
+      buffer **starved by the RX queue** (measured, #303); unprovoked
+      ``0x04`` results are attributed to the same cause.  Drain the RX
+      queue (``drain_first=True``) or reset the chip
+      (:func:`build_cs8900a_reset_code`); a starved chip kept returning
+      ``0x04`` on every retry without either.
 
     ``drain_first`` (issue #303): SkipNow every frame already queued in the
     chip before the bid (:func:`_emit_drain_rx`, at most
-    :data:`DRAIN_RX_MAX_FRAMES`).  Measured on the U64E with an external
-    RR-Net (fw 3.15 ``bce4535e``, 2026-09-23, https://github.com/JC-000/c64-test-harness/issues/303#issuecomment-5798261175):
+    :data:`DRAIN_RX_MAX_FRAMES`).  Why, measured on the U64E with an
+    external RR-Net (fw 3.15 ``bce4535e``, 2026-09-23;
+    https://github.com/JC-000/c64-test-harness/issues/303#issuecomment-5798261175):
     host frames that sit unread in the chip's shared buffer keep
-    ``Rdy4TxNOW`` from asserting -- three injected 1514-byte frames gave
-    ``0x04`` 5/6 against 0/6 with none, and once starved every retry stayed
-    ``0x04`` (16/16) until a drain or a chip reset.  RxCTL accepts
-    broadcast, so an idle link fills the queue on its own.  The drain
-    discards those frames, so leave it off when the routine that follows
-    must read them.  Default ``False`` keeps the routine byte-identical;
-    ``True`` adds 40 bytes (43 with ``drain_status_addr``), 139-163 bytes in
-    all, which takes the routine past 128 bytes -- through ``transport.write_memory`` that still
-    costs no ``/Temp`` attachment on a leak-prone device, but a direct
-    ``client.write_mem`` of it does.  ``drain_status_addr`` (needs
+    ``Rdy4TxNOW`` from asserting -- three injected host frames before a
+    1514-byte TX bid gave ``0x04`` 5/6 against 0/6 with none, and once
+    starved every retry stayed ``0x04`` (16/16) until a drain or a chip
+    reset.  What ran on silicon was a standalone :func:`_emit_drain_rx`
+    routine, not this option: it freed the next transmit 4/4, and one of
+    those failed again on the transmit after.  ``drain_first`` itself is
+    pinned on the simulated chip only.  RxCTL accepts broadcast, so an
+    idle link fills the queue on its own.  The drain discards those
+    frames, so leave it off when the routine that follows must read them.
+    Default ``False`` keeps the routine byte-identical; ``True`` adds 40
+    bytes (43 with ``drain_status_addr``), 139-163 bytes in all, which
+    takes the routine past 128 bytes -- through ``transport.write_memory``
+    that still costs no ``/Temp`` attachment on a leak-prone device, but a
+    direct ``client.write_mem`` of it does.  ``drain_status_addr`` (needs
     ``drain_first``) receives the drain's remaining budget: ``0`` = bound
     hit, frames may still be queued; ``n > 0`` = the queue emptied after
     ``8 - n`` skips.
