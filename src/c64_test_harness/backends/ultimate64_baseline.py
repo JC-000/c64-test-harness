@@ -1065,7 +1065,12 @@ def apply_factory_baseline(
     wanted = _validate_categories(categories)
     exempt_pairs = _validate_exempt(exempt)
 
-    host = getattr(client, "host", None)
+    # The client's device key (``device_lock.device_key(host, port)``), not
+    # its bare host: the manager locks ``host:port``, so asking about the bare
+    # host warns a device on any other port that is in fact locked (#434).
+    host = getattr(client, "_device_key", None)
+    if not (isinstance(host, str) and host):
+        host = getattr(client, "host", None)
     if _HAS_DEVICE_LOCK and isinstance(host, str) and host:
         _warn_unlocked_client(host, what="apply_factory_baseline", logger=_log)
 
