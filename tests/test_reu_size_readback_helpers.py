@@ -23,9 +23,14 @@ from c64_test_harness.backends.ultimate64_client import Ultimate64Error
 class _FakeClient:
     """Records ``set_config_item`` calls; raises on the items in *reject*."""
 
-    def __init__(self, reject: set[str]) -> None:
+    def __init__(self, reject: set[str], cartridge_default: object = "") -> None:
         self.reject = reject
+        self.cartridge_default = cartridge_default
         self.calls: list[tuple[str, str, object]] = []
+
+    def get_config_item(self, category: str, item: str) -> dict:
+        assert (category, item) == (live.CAT_CART, "Cartridge"), (category, item)
+        return {"current": "unused", "default": self.cartridge_default}
 
     def set_config_item(self, category: str, item: str, value: object) -> None:
         self.calls.append((category, item, value))
@@ -48,6 +53,43 @@ def test_restore_continues_past_a_rejected_put_and_raises_after():
     assert ("C64 and Cartridge Settings", "Command Interface", "Enabled") in client.calls
     assert ("C64 and Cartridge Settings", "REU Size", "512 KB") in client.calls
     assert "A" in str(excinfo.value)
+
+
+def test_a_cartridge_selected_at_entry_goes_back_to_its_default():
+    """#447/#469: a .crt selected at entry is drift, not baseline.
+
+    Restoring ``Cartridge`` to the snapshot would put it straight back, as
+    the Cartridge test in the same module already refuses to do.
+    """
+    stock = {"Cartridge": "stale.crt", "REU Size": "512 KB"}
+    now = {"Cartridge": "stale.crt", "REU Size": "2 MB"}
+    client = _FakeClient(reject=set())
+
+    live._restore_category_items(client, stock, now)
+
+    assert sorted(client.calls) == [
+        (live.CAT_CART, "Cartridge", ""),
+        (live.CAT_CART, "REU Size", "512 KB"),
+    ]
+
+
+def test_a_cartridge_already_at_its_default_is_not_rewritten():
+    client = _FakeClient(reject=set())
+    live._restore_category_items(
+        client, {"Cartridge": "stale.crt"}, {"Cartridge": ""}
+    )
+    assert client.calls == []
+
+
+def test_a_cartridge_without_a_default_is_reported_and_the_rest_restored():
+    client = _FakeClient(reject=set(), cartridge_default=None)
+    with pytest.raises(Ultimate64Error, match="Cartridge"):
+        live._restore_category_items(
+            client,
+            {"Cartridge": "", "REU Size": "512 KB"},
+            {"Cartridge": "x.crt", "REU Size": "2 MB"},
+        )
+    assert client.calls == [(live.CAT_CART, "REU Size", "512 KB")]
 
 
 def test_restore_is_a_no_op_when_nothing_differs():

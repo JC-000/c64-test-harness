@@ -205,9 +205,30 @@ def _restore_category_items(client, stock: dict, now: dict) -> None:
     — the firmware answers 400 for ``value=""`` on some items — and the
     failures are raised together at the end, so one bad item cannot leave
     the rest un-restored.
+
+    ``Cartridge`` is the exception: it goes back to the item's reported
+    ``default``, never the snapshot, as in
+    ``test_cartridge_write_does_not_move_reu_size`` (#447) -- a ``.crt``
+    selected at entry is drift, not baseline.  The rest of the category
+    still restores to the snapshot (#469).
     """
     failures: list[str] = []
-    for item, (want, _got) in _diff(stock, now).items():
+    targets = {
+        item: want
+        for item, (want, _got) in _diff(stock, now).items()
+        if item != _ITEM_CARTRIDGE
+    }
+    if _ITEM_CARTRIDGE in now:
+        try:
+            cart_default = client.get_config_item(CAT_CART, _ITEM_CARTRIDGE).get("default")
+        except Ultimate64Error as exc:
+            failures.append(f"{_ITEM_CARTRIDGE}: default not readable: {exc}")
+        else:
+            if cart_default is None:
+                failures.append(f"{_ITEM_CARTRIDGE}: reports no default")
+            elif now[_ITEM_CARTRIDGE] != cart_default:
+                targets[_ITEM_CARTRIDGE] = cart_default
+    for item, want in targets.items():
         try:
             client.set_config_item(CAT_CART, item, want)
         except Ultimate64Error as exc:
@@ -217,6 +238,20 @@ def _restore_category_items(client, stock: dict, now: dict) -> None:
             f"{len(failures)} item(s) could not be restored in {CAT_CART!r}: "
             + "; ".join(failures)
         )
+
+
+def _restore_residue(client, stock: dict, now: dict) -> dict:
+    """What :func:`_restore_category_items` failed to put back.
+
+    The snapshot for every item but ``Cartridge``, which is checked against
+    its reported ``default`` -- the target that function writes.
+    """
+    expected = dict(stock)
+    if _ITEM_CARTRIDGE in now:
+        expected[_ITEM_CARTRIDGE] = client.get_config_item(
+            CAT_CART, _ITEM_CARTRIDGE
+        ).get("default")
+    return _diff(expected, now)
 
 
 def _pick_ram_target(stock_size: str, default_size: str | None) -> str:
@@ -528,9 +563,8 @@ def test_flash_reload_moves_reu_size_without_a_config_write(
 
     restored, cfg_restored = _observe(client, "after full-category restore")
     assert cfg_restored[1] == stock[_ITEM_REU_SIZE]
-    assert _diff(stock, restored) == {}, (
-        f"category differs from the pre-write snapshot: {_diff(stock, restored)!r}"
-    )
+    residue = _restore_residue(client, stock, restored)
+    assert residue == {}, f"category differs from its restore targets: {residue!r}"
 
 
 @requires_mutate
@@ -566,10 +600,8 @@ def test_flash_holds_the_item_default_reu_size(
     finally:
         _restore_category_items(client, stock, _category(client))
 
-    restored = _category(client)
-    assert _diff(stock, restored) == {}, (
-        f"category differs from the pre-write snapshot: {_diff(stock, restored)!r}"
-    )
+    residue = _restore_residue(client, stock, _category(client))
+    assert residue == {}, f"category differs from its restore targets: {residue!r}"
     if flash_size != default_size:
         pytest.xfail(
             f"bench-state changed: flash holds REU Size {flash_size!r}, not the "
