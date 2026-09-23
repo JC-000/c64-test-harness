@@ -537,7 +537,7 @@ def _make_mock_transport(
                 return bytes([len(block)])
             return bytes([1])  # default: 1 byte response
         if addr == _STAT_LEN_ADDR:
-            return b"\x00"
+            return bytes(length)  # the 2-byte field (#281), zero
         if _RESP_ADDR <= addr < _RESP_ADDR + max(len(block), 1) or addr == _RESP_ADDR:
             if block:
                 offset = addr - _RESP_ADDR

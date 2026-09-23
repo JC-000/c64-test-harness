@@ -1892,6 +1892,35 @@ class UCIError(Exception):
     """UCI command returned an error."""
 
 
+class UCISocketNotOwnedError(UCIError):
+    """A socket call named a handle the network target does not own (#428).
+
+    Since #808 the firmware keeps a table of the sockets it opened for the
+    C64 and closes them all on a C64 reset -- including the reset
+    ``_execute_uci_routine`` issues after a routine timeout (#313).  A read,
+    write or close on a handle outside that table answers ``EBADF`` (errno 9),
+    so the handle was never opened, was already closed, or did not survive a
+    reset: open a new one.
+    """
+
+
+#: ``errno`` the network target reports for a handle it does not own
+#: (``network_target.cc`` ``owns_socket``; newlib ``EBADF``).
+_EBADF = 9
+
+
+def _raise_if_not_owned(transport: C64Transport, command: str, socket_id: int) -> None:
+    """Raise :class:`UCISocketNotOwnedError` when the status ends in ``: 9``."""
+    status = _read_status_string(transport)
+    _, sep, errno = status.rpartition(": ")
+    if sep and errno.strip() == str(_EBADF):
+        raise UCISocketNotOwnedError(
+            f"UCI {command} on socket {socket_id}: {status} -- the network "
+            f"target does not own this handle (never opened, closed, or closed "
+            f"by a C64 reset, #808)"
+        )
+
+
 class UCIInterfaceAbsentError(UCIError):
     """The UCI identifier is not on the bus, so no UCI routine can run (#359).
 
@@ -2338,6 +2367,8 @@ def uci_socket_write(
     :func:`build_socket_write` for the inner-loop scratch addresses.
 
     :param turbo_safe: see :func:`build_uci_command`.
+    :raises UCISocketNotOwnedError: the network target does not own
+        *socket_id* (``"12,SEND ERROR: 9"``) -- e.g. a C64 reset closed it.
     """
     if len(data) > SOCKET_WRITE_MAX_BYTES:
         raise ValueError(
@@ -2364,6 +2395,9 @@ def uci_socket_write(
         turbo_safe=turbo_safe,
     )
     _execute_uci_routine(transport, code, timeout=timeout)
+    # The reply is lwip_send's return value; FF FF is -1 (#428).
+    if bytes(transport.read_memory(_RESP_ADDR, 2)) == b"\xff\xff":
+        _raise_if_not_owned(transport, "WRITE_SOCKET", socket_id)
 
 
 def uci_socket_read(
@@ -2376,9 +2410,12 @@ def uci_socket_read(
 ) -> bytes:
     """Read up to *max_len* bytes from a UCI socket.
 
-    Returns the received data (may be shorter than *max_len*).
+    Returns the received data (may be shorter than *max_len*), or ``b""``
+    when nothing is queued.
 
     :param turbo_safe: see :func:`build_uci_command`.
+    :raises UCISocketNotOwnedError: the network target does not own
+        *socket_id* (``"02,NO DATA: 9"``) -- e.g. a C64 reset closed it.
 
     .. note::
         The UCI firmware response is ``[actual_len_lo] [actual_len_hi]
@@ -2415,6 +2452,11 @@ def uci_socket_read(
         return b""
     header = transport.read_memory(_RESP_ADDR, _SOCKET_READ_HEADER_LEN)
     payload_len = header[0] | (header[1] << 8)
+    if payload_len == 0xFFFF:
+        # lwip_recvmsg returned -1: nothing queued ("02,NO DATA: 11", the
+        # 40 ms receive timeout) or a handle the target does not own (#428).
+        _raise_if_not_owned(transport, "READ_SOCKET", socket_id)
+        return b""
     available = drained - _SOCKET_READ_HEADER_LEN
     if payload_len > available:
         # The firmware reports the *total* reply length in the header, so a
@@ -2445,6 +2487,8 @@ def uci_socket_close(
     """Close a UCI socket.
 
     :param turbo_safe: see :func:`build_uci_command`.
+    :raises UCISocketNotOwnedError: the network target does not own
+        *socket_id* (``"12,ERROR ON CLOSE: 9"``).
     """
     socket_id_addr = _input_addr(None, turbo_safe, _DATA_ADDR,
                                  _TURBO_SOCKET_ID_ADDR)
@@ -2452,6 +2496,7 @@ def uci_socket_close(
 
     code = build_socket_close(socket_id_addr, turbo_safe=turbo_safe)
     _execute_uci_routine(transport, code, timeout=timeout)
+    _raise_if_not_owned(transport, "CLOSE_SOCKET", socket_id)
 
 
 def uci_tcp_listen_start(
