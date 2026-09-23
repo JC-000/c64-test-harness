@@ -995,9 +995,10 @@ def _emit_tx_frame(
     conventionally storing :data:`RESULT_TX_NOT_READY`.  The poll counts in
     ``X:Y``, so X is clobbered (Y always was, by the copy loop).
 
-    ``frame_len`` must be even and 2..1514; anything else raises
-    :class:`ValueError` here rather than hanging or no-opping on the 6510
-    (issues #238, #404); ``what`` names it in the error.  The copy count is
+    ``frame_len`` must be 2..1514, and even unless ``allow_odd_frame_len``
+    is set; anything else raises :class:`ValueError` here rather than
+    hanging or no-opping on the 6510 (issues #238, #404); ``what`` names it
+    in the error.  The copy count is
     ``copy_len = frame_len`` rounded up to a whole word.  Up to 256 bytes
     the copy loop counts in ``Y`` alone, byte-identical to the loop #238
     measured on silicon.  Above 256 it copies ``copy_len >> 8`` whole
@@ -1010,7 +1011,9 @@ def _emit_tx_frame(
     TxLength still gets the true odd length; ``copy_len`` is ``frame_len +
     1``, so the last word carries one pad byte read from ``frame_buf +
     frame_len`` -- the caller's buffer must have that byte, exactly as
-    ip65's ``send`` requires after ``adjustcnt``.  It is **off by default**:
+    ip65's ``send`` requires after ``adjustcnt``.  Whatever RAM follows the
+    frame is written into the chip's TX buffer as that pad byte; whether the
+    chip keeps it off the wire is unmeasured.  It is **off by default**:
     the padded loop is pinned on the simulated chip only, and no silicon has
     transmitted an odd TxLength under it.  For an even length the flag
     changes nothing, in the emitted bytes or anywhere else.
@@ -1103,15 +1106,17 @@ def build_tx_code(
     """Build a 6502 routine that hands ``frame_len`` bytes from ``frame_buf``
     to the CS8900a for transmission.  Loads at ``load_addr``.
 
-    ``frame_len`` must be even and 2..1514
-    (:data:`CS8900A_TX_MAX_FRAME_LEN`); anything else raises
-    :class:`ValueError` (issue #238 -- on hardware an odd length hangs the
-    6510 after one frame).  Frames above 256 bytes use a page-counted copy
+    ``frame_len`` must be 2..1514 (:data:`CS8900A_TX_MAX_FRAME_LEN`), and
+    even unless ``allow_odd_frame_len=True``; anything else raises
+    :class:`ValueError` (issue #238 -- on hardware an odd length through the
+    unpadded copy hangs the 6510 after one frame).  Frames above 256 bytes use a page-counted copy
     (issue #404); ones up to 256 emit the same bytes as before.
 
     ``allow_odd_frame_len=True`` accepts an odd length and copies it ip65's
     way: TxLength is the true length and one pad byte, read from
-    ``frame_buf + frame_len``, fills the last word (issue #438).  **Use it
+    ``frame_buf + frame_len``, fills the last word (issue #438); that byte
+    is whatever RAM follows the frame, written into the chip's TX buffer,
+    and whether the chip keeps it off the wire is unmeasured.  **Use it
     knowing what is not established**: that path is pinned on the simulated
     chip, and no CS8900a has transmitted an odd TxLength under it -- the
     paired silicon check #438 asks for has not been run.  The default is the
