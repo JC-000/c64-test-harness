@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from types import SimpleNamespace
 
 import pytest
 
@@ -48,9 +49,11 @@ from c64_test_harness.uci_network import (
     _SENTINEL_DONE,
     _STAT_LEN_ADDR,
     _STATUS_ADDR,
+    UCISocketReadTruncatedError,
     build_socket_read,
     uci_socket_read,
 )
+from c64_test_harness.backends.u64_capabilities import DeviceCapabilities
 from test_uci_turbo_fence_register import UNWRITTEN, _UciMachine
 
 #: Firmware constants at bce4535e (``network_target.h``).
@@ -62,6 +65,19 @@ SOCKET_ID_ADDR = 0xC403
 LONG_BUF = u._LONG_READ_BUF_ADDR
 STATUS_OK = b"00,OK"
 OUT_OF_RANGE = b"82,PARAMETER(S) OUT OF RANGE"
+NO_DATA = b"02,NO DATA: 11"
+#: Reply buffer size (``CMD_MAX_REPLY_LEN``); a block that fills it exactly
+#: never clears DATA_AV on pre-3.15 firmware (``command_protocol.vhd``).
+REPLY_BUFFER = 896
+
+U64E = DeviceCapabilities.from_info({"firmware_version": "3.15", "product": "Ultimate 64"})
+C64U = DeviceCapabilities.from_info({"firmware_version": "1.1.0", "product": "C64 Ultimate"})
+U64_314 = DeviceCapabilities.from_info({"firmware_version": "3.14", "product": "Ultimate 64"})
+#: A 3.15 build a probe showed lacks #802: the override beats the version.
+U64E_PRE_802 = DeviceCapabilities.from_info(
+    {"firmware_version": "3.15", "product": "Ultimate 64"},
+    overrides={"uci_socket_read_multiblock": False},
+)
 
 
 def _datagram(n: int) -> bytes:
@@ -77,9 +93,13 @@ class _DataMoreUci(_UciMachine):
     the full length -- the "fewer arrived than announced" case.
     ``busy_polls`` holds STATE at ``01`` for that many status reads after
     each continuation accept, so a drain that does not wait is caught.
+    ``datagram=None`` is an empty socket: header ``$FFFF`` (``ret = -1``)
+    and ``02,NO DATA``.  With ``split=False`` a block that fills the
+    896-byte reply buffer keeps DATA_AV set after its last byte, as the
+    VHDL response pointer stops at ``buffer_end`` (source-read, #479).
     """
 
-    def __init__(self, code: bytes, datagram: bytes, *, split: bool = True,
+    def __init__(self, code: bytes, datagram: bytes | None, *, split: bool = True,
                  short_by: int = 0, busy_polls: int = 3) -> None:
         super().__init__(code)
         self.mem[LONG_BUF:LONG_BUF + 0x600] = bytes([UNWRITTEN]) * 0x600
@@ -91,6 +111,7 @@ class _DataMoreUci(_UciMachine):
         self.blocks: list[bytes] = []
         self.status_text = b""
         self._busy_left = 0
+        self._stuck = False
 
     def _next_block(self) -> None:
         block = self.blocks.pop(0)
@@ -98,6 +119,7 @@ class _DataMoreUci(_UciMachine):
         if last and self.short_by:
             block = block[:len(block) - self.short_by]
         self.data_q = list(block)
+        self._stuck = not self.split and len(block) >= REPLY_BUFFER
         self.status_q = list(self.status_text) if last else []
         self.state = 0x20 if last else 0x30
 
@@ -115,6 +137,8 @@ class _DataMoreUci(_UciMachine):
                 v |= BIT_STAT_AV
             return v
         if addr == UCI_RESP_DATA_REG:
+            if len(self.data_q) == 1 and self._stuck:
+                return self.data_q[0]
             return self.data_q.pop(0) if self.data_q else 0
         if addr == UCI_STATUS_DATA_REG:
             return self.status_q.pop(0) if self.status_q else 0
@@ -129,6 +153,9 @@ class _DataMoreUci(_UciMachine):
             if length > limit:
                 self.blocks = [b""]
                 self.status_text = OUT_OF_RANGE
+            elif self.datagram is None:
+                self.blocks = [b"\xff\xff"]
+                self.status_text = NO_DATA
             else:
                 payload = self.datagram[:length]
                 header = bytes([len(payload) & 0xFF, len(payload) >> 8])
@@ -280,9 +307,12 @@ class _SimTransport:
     """``write_memory``/``read_memory`` on the machine's RAM; typing the
     ``SYS`` (the keyboard-count write) runs the routine to its RTS."""
 
-    def __init__(self, datagram: bytes, **kw) -> None:
+    def __init__(self, datagram: bytes | None, *,
+                 caps: DeviceCapabilities | None = U64E, **kw) -> None:
         self._datagram = datagram
         self._kw = kw
+        if caps is not None:
+            self.client = SimpleNamespace(cached_capabilities=caps)
         self.mem = bytearray(0x10000)
         self.cpu: _DataMoreUci | None = None
         self.writes: list[tuple[int, int]] = []
@@ -325,27 +355,91 @@ def test_a_request_just_past_the_single_block_cap_is_served_whole(
 
 
 @pytest.mark.parametrize("turbo", PATHS, ids=["plain", "turbo"])
-def test_a_short_reply_returns_what_arrived_with_a_warning(
-    turbo: bool, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Item 3 of #420: today's contract is kept -- return what arrived and
-    say so -- not a raise."""
+def test_a_short_reply_raises_with_the_bytes_that_arrived(turbo: bool) -> None:
+    """Owner decision on #420 item 3 (2026-09-23): a truncated multi-block
+    read raises, carrying what did arrive."""
     t = _SimTransport(_datagram(1472), short_by=100)
-    with caplog.at_level(logging.WARNING, logger=u.__name__):
-        got = uci_socket_read(t, 5, max_len=NET_MAX_SOCKET_READ, turbo_safe=turbo)
-    assert got == _datagram(1372)
-    assert "1472" in caplog.text and "1372" in caplog.text
+    with pytest.raises(UCISocketReadTruncatedError) as err:
+        uci_socket_read(t, 5, max_len=NET_MAX_SOCKET_READ, turbo_safe=turbo)
+    assert err.value.data == _datagram(1372)
+    assert (err.value.announced, len(err.value.data)) == (1472, 1372)
+    assert isinstance(err.value, u.UCIError)
+    import c64_test_harness as root
+
+    assert root.UCISocketReadTruncatedError is UCISocketReadTruncatedError
 
 
 @pytest.mark.parametrize("turbo", PATHS, ids=["plain", "turbo"])
-def test_a_pre_315_refusal_is_reported_not_silent(
+def test_a_pre_802_refusal_is_reported_not_silent(
     turbo: bool, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """A 3.15 build without #802 grades like one with it but refuses a
+    length above 894; the refusal is logged, not a silent empty read."""
     t = _SimTransport(_datagram(1000), split=False)
     with caplog.at_level(logging.WARNING, logger=u.__name__):
         got = uci_socket_read(t, 5, max_len=1000, turbo_safe=turbo)
     assert got == b""
     assert "82,PARAMETER(S) OUT OF RANGE" in caplog.text
+
+
+@pytest.mark.parametrize("caps", [C64U, None, U64_314, U64E_PRE_802],
+                         ids=["c64u-1.1.0", "ungraded", "u64-3.14", "3.15-override-false"])
+def test_above_893_is_refused_unless_the_device_grades_3_15(caps) -> None:
+    """Safety (#479 finding 2): pre-3.15 firmware accepts 894, and an
+    894-byte datagram then fills the 896-byte reply buffer, which never
+    clears DATA_AV -- the routine spins until the timeout reset.  So a
+    device not graded 3.15 or later is refused above 893 before any write."""
+    t = _SimTransport(_datagram(894), caps=caps, split=False)
+    with pytest.raises(ValueError, match="893"):
+        uci_socket_read(t, 5, max_len=894)
+    assert t.writes == [], "refused after touching the device"
+
+
+@pytest.mark.parametrize("caps", [C64U, None], ids=["c64u-1.1.0", "ungraded"])
+def test_893_still_reads_whole_on_pre_315_firmware(caps) -> None:
+    t = _SimTransport(_datagram(893), caps=caps, split=False)
+    assert uci_socket_read(t, 5, max_len=893) == _datagram(893)
+
+
+def test_the_hazard_is_real_in_the_model() -> None:
+    """Premise of the refusal above: the old-firmware fake does spin on an
+    894-byte reply.  If the model stops doing that, revisit the refusal."""
+    code = build_socket_read(SOCKET_ID_ADDR, max_len=894, multi_block=True)
+    cpu = _DataMoreUci(code, _datagram(894), split=False)
+    with pytest.raises(AssertionError, match="did not reach its RTS"):
+        cpu.run(max_steps=300_000)
+
+
+@pytest.mark.parametrize("max_len", [100, NET_MAX_SOCKET_READ],
+                         ids=["single-block", "multi-block"])
+def test_an_empty_socket_is_an_empty_read_without_a_warning(
+    max_len: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``02,NO DATA`` comes with header ``$FFFF``; that is no data, not a
+    65535-byte reply that fell short (#479 finding 4)."""
+    t = _SimTransport(None)
+    with caplog.at_level(logging.WARNING, logger=u.__name__):
+        assert uci_socket_read(t, 5, max_len=max_len) == b""
+    assert caplog.records == []
+
+
+@pytest.mark.parametrize("turbo,max_len", [(True, NET_MAX_SOCKET_READ),
+                                           (True, 100), (False, NET_MAX_SOCKET_READ)])
+def test_the_turbo_timeout_scales_with_the_length(
+    turbo: bool, max_len: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """At 1 MHz each fenced byte costs two ~2.5 ms fences, so a 1472-byte
+    turbo read spends ~7.5 s in fences alone (#479 finding 3)."""
+    seen: list[float] = []
+    monkeypatch.setattr(u, "_execute_uci_routine",
+                        lambda *a, timeout, **k: seen.append(timeout))
+    t = _SimTransport(b"")
+    uci_socket_read(t, 5, max_len=max_len, timeout=10.0, turbo_safe=turbo)
+    if turbo:
+        assert seen == [10.0 + max_len * u._TURBO_READ_SECONDS_PER_BYTE]
+        assert seen[0] >= 10.0 + max_len * 0.005
+    else:
+        assert seen == [10.0]
 
 
 def test_uci_socket_read_refuses_past_the_firmware_ceiling() -> None:

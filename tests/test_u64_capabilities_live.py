@@ -172,7 +172,13 @@ class TestSocketReadCeiling:
     def test_read_socket_accepts_a_length_above_one_block(
         self, uci: Ultimate64Transport
     ) -> None:
-        """A 1472-byte datagram (two blocks: 893 + 579) comes back whole."""
+        """A 1472-byte datagram (two blocks: 893 + 579) comes back whole.
+
+        Assumes a 1500-byte MTU on every hop between host and device (1472
+        is the largest unfragmented IPv4 UDP payload), and a C64 at 1 MHz
+        with Turbo Control Off -- the bench baseline -- since the routine is
+        the plain one, not ``turbo_safe``.
+        """
         datagram = bytes((i * 7 + 3) & 0xFF for i in range(NET_MAX_SOCKET_READ))
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
             probe.connect((_HOST, 80))
@@ -196,7 +202,7 @@ class TestSocketReadCeiling:
         assert len(got) == len(datagram)
         assert got == datagram
 
-    def test_oversized_read_is_rejected_not_truncated(
+    def test_the_firmware_refuses_a_read_above_its_ceiling(
         self, uci: Ultimate64Transport
     ) -> None:
         """1473 draws ``82,PARAMETER(S) OUT OF RANGE`` and an empty reply.

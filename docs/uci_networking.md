@@ -202,12 +202,21 @@ drain holds header plus 253 payload bytes; above that it uses the multi-block
 routine (#420), which follows firmware 3.15's Data More blocks (first block:
 header with the *total* length plus up to 893 bytes; continuations: up to 895
 bytes each) into `$C500-$CAC1` with a 16-bit count. The payload length is the
-first block's header; the routine stores at most `max_len` payload bytes. If fewer bytes arrive than the
-header announced, the helper returns what arrived and logs a WARNING.
-Firmware before 3.15 (the C64U on 1.1.0) refuses a length above 894 with
-`82,PARAMETER(S) OUT OF RANGE`; the helper then returns `b""` with a WARNING
-naming that status. The multi-block routine is 242 bytes plain and 602
-turbo-safe: 2 or 5 PUTs at the 128-byte threshold, no `/Temp` attachment.
+first block's header; the routine stores at most `max_len` payload bytes. If
+fewer bytes arrive than the header announced, the helper raises
+`UCISocketReadTruncatedError` carrying what did arrive (owner decision,
+2026-09-23). An empty socket (`02,NO DATA`, header `$FFFF`) returns `b""`.
+Firmware before 3.15 (the C64U on 1.1.0) accepts up to 894 in one block, but
+an 894-byte reply fills its 896-byte reply buffer exactly and the interface
+never reports it drained (`command_protocol.vhd`; source-read), so the helper
+refuses `max_len` above 893 with `ValueError`, before any write, unless the
+transport's client is graded Ultimate-line 3.15 or later. A 3.15 build
+without upstream #802 refuses above 894 with `82,PARAMETER(S) OUT OF RANGE`;
+the helper returns `b""` with a WARNING naming that status. With
+`turbo_safe=True` the timeout grows by 6 ms per requested byte (two ~2.5 ms
+fences per byte at 1 MHz). The multi-block routine is 232 bytes plain and
+592 turbo-safe: 2 or 5 PUTs at the 128-byte threshold, no `/Temp`
+attachment.
 Evidence grade: firmware source (bce4535e) and the interpreter model in
 `tests/test_uci_socket_read_multiblock.py`; the device check is
 `tests/test_u64_capabilities_live.py::TestSocketReadCeiling` (U64E only).

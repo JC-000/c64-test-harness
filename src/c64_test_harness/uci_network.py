@@ -309,7 +309,8 @@ SOCKET_READ_MAX_BYTES = 255 - _SOCKET_READ_HEADER_LEN
 #: Most a ``READ_SOCKET`` can return: firmware 3.15 refuses a longer request
 #: with ``82,PARAMETER(S) OUT OF RANGE`` (``network_target.h``
 #: ``NET_MAX_SOCKET_READ``, upstream #802; bce4535e).  Pre-3.15 firmware
-#: refuses anything above 894 the same way (``CMD_MAX_REPLY_LEN - 2``).
+#: refuses anything above 894 the same way (``CMD_MAX_REPLY_LEN - 2``), and
+#: 894 itself is not safe there -- see :data:`_PRE_315_SAFE_READ`.
 NET_MAX_SOCKET_READ = 1472
 
 #: Where the multi-block read routine stores ``[len_lo][len_hi][payload]``:
@@ -321,6 +322,20 @@ _LONG_READ_BUF_ADDR = _WRITE_DATA_BUF_ADDR
 #: inner-loop slots, which no read routine shares a run with.
 _READ_REMAIN_LO = _INNER_LOOP_CNT_LO   # $C400
 _READ_REMAIN_HI = _INNER_LOOP_CNT_HI   # $C401
+
+#: Extra timeout per requested byte for a ``turbo_safe`` read: each stored
+#: byte crosses two fences, ~2.5 ms each at 1 MHz (see ``_build_fence``),
+#: so 5 ms, plus margin (#479).
+_TURBO_READ_SECONDS_PER_BYTE = 0.006
+
+#: Largest READ_SOCKET that drains safely on firmware before 3.15: its
+#: single reply block is header + payload in an 896-byte buffer, and a block
+#: that fills the buffer exactly is never reported drained (#479).
+_PRE_315_SAFE_READ = 893
+
+#: The header ``read_socket`` sends when the receive failed (``ret = -1``),
+#: alongside ``02,NO DATA``.
+_NO_DATA_HEADER = 0xFFFF
 
 
 def _input_addr(addr: int | None, turbo_safe: bool, plain: int,
@@ -835,7 +850,7 @@ def _build_read_response_multiblock(
     block leaves it at ``10`` (``command_protocol.vhd``;
     ``command_intf.cc``; ``network_target.cc`` ``get_more_data``).  So::
 
-            SMC store pointer := resp_addr ; remain := limit ; len := 0
+            remain := limit ; len := 0
         loop:
             LDA $DF1C ; AND #DATA_AV ; BNE byte ; JMP block_end
         byte:
@@ -861,7 +876,8 @@ def _build_read_response_multiblock(
 
     Every ``$DF1C``-``$DF1F`` access is fenced when *fence*.  No index
     register is used, so the fence's ``Y = 0`` exit (#298) does not matter.
-    At most *limit* bytes are stored (the rest are drained and dropped), so
+    The store operand advances in place and is not reset: the routine is
+    uploaded fresh for every call, so run it once per upload.  At most *limit* bytes are stored (the rest are drained and dropped), so
     the buffer's declared span holds whatever the firmware sends; *len* is
     the 16-bit count stored.  The final accept is not here: it belongs to
     :func:`_build_acknowledge`, after the status drain, as for a single
@@ -877,9 +893,6 @@ def _build_read_response_multiblock(
     def jmp(target: int) -> None:
         out.extend([_JMP_ABS, _lo(target), _hi(target)])
 
-    store_pos_placeholder = len(out)
-    out.extend([_LDA_IMM, _lo(resp_addr), _STA_ABS, 0, 0,
-                _LDA_IMM, _hi(resp_addr), _STA_ABS, 0, 0])
     out.extend([_LDA_IMM, limit & 0xFF,
                 _STA_ABS, _lo(_READ_REMAIN_LO), _hi(_READ_REMAIN_LO),
                 _LDA_IMM, (limit >> 8) & 0xFF,
@@ -932,11 +945,6 @@ def _build_read_response_multiblock(
     jmp(loop)
     done = here()
     out[jmp_done + 1:jmp_done + 3] = [_lo(done), _hi(done)]
-    # Point the preamble's SMC resets at the store operand.
-    out[store_pos_placeholder + 3:store_pos_placeholder + 5] = [
-        _lo(store + 1), _hi(store + 1)]
-    out[store_pos_placeholder + 8:store_pos_placeholder + 10] = [
-        _lo(store + 2), _hi(store + 2)]
     return out
 
 
@@ -1830,8 +1838,8 @@ def build_socket_read(
     :data:`_LONG_READ_BUF_ADDR`) and writes a 16-bit count at
     *actual_len_addr*.  ``None`` (the default) means ``True`` exactly when
     *max_len* is above 255, which the single-block drain cannot hold.
-    The multi-block routine is 242 bytes plain and 602 turbo-safe
-    (``$C000-$C0F1`` / ``$C000-$C259``, clear of the ``$C300`` status buffer),
+    The multi-block routine is 232 bytes plain and 592 turbo-safe
+    (``$C000-$C0E7`` / ``$C000-$C24F``, clear of the ``$C300`` status buffer),
     so a transport upload at the 128-byte PUT threshold is 2 / 5 PUTs and
     no ``/Temp`` attachment.
 
@@ -2051,6 +2059,23 @@ def build_socket_close(
 
 class UCIError(Exception):
     """UCI command returned an error."""
+
+
+class UCISocketReadTruncatedError(UCIError):
+    """A multi-block ``READ_SOCKET`` delivered fewer bytes than its header
+    announced (issue #420; owner decision 2026-09-23: raise, not warn).
+
+    :attr:`data` holds the bytes that did arrive and :attr:`announced` the
+    length the first block's header reported.
+    """
+
+    def __init__(self, announced: int, data: bytes) -> None:
+        self.announced = announced
+        self.data = data
+        super().__init__(
+            f"READ_SOCKET header announced {announced} bytes but only "
+            f"{len(data)} arrived across the reply blocks"
+        )
 
 
 class UCIInterfaceAbsentError(UCIError):
@@ -2554,18 +2579,41 @@ def uci_socket_read(
     :data:`NET_MAX_SOCKET_READ` (1472), the multi-block routine drains
     every Data More block firmware 3.15 sends, into ``$C500``
     (issue #420); the payload length is the first block's header, and
-    never more than *max_len* is returned.  Pre-3.15 firmware refuses a length above 894 with
+    never more than *max_len* is returned.  When the header announces more
+    than arrived, :class:`UCISocketReadTruncatedError` is raised carrying
+    the bytes that did arrive (owner decision, 2026-09-23).
+
+    **Above 893 the device must grade 3.15 or later** (#479).  Older
+    firmware answers in one block into an 896-byte reply buffer: it accepts
+    894, and an 894-byte reply fills that buffer exactly, which the
+    interface never reports as drained (``command_protocol.vhd``, the
+    response pointer stops at ``buffer_end``; source-read), so the routine
+    would spin until the timeout reset.  So on a transport whose client's
+    cached grade is not Ultimate-line 3.15+ -- the C64U on 1.1.0, or an
+    unprobed client -- *max_len* above 893 raises ``ValueError`` before
+    anything is written.  A 3.15 build without upstream #802 grades the
+    same as one with it and refuses a length above 894 with
     ``82,PARAMETER(S) OUT OF RANGE``: that returns ``b""`` and logs a
     WARNING naming the status.
 
-    When the header announces more than arrived, what arrived is returned
-    and a WARNING says how much was announced.
+    An empty socket (``02,NO DATA``, header ``$FFFF``) returns ``b""``.
+    With *turbo_safe* the timeout grows by
+    :data:`_TURBO_READ_SECONDS_PER_BYTE` per requested byte, for the fences.
     """
     if max_len > NET_MAX_SOCKET_READ:
         raise ValueError(
             f"max_len must be <= {NET_MAX_SOCKET_READ} (the firmware's "
             f"READ_SOCKET ceiling), got {max_len}"
         )
+    if max_len > _PRE_315_SAFE_READ and not _grades_multiblock_read(transport):
+        raise ValueError(
+            f"max_len {max_len} needs firmware 3.15 or later; this device is "
+            f"not graded so, and older firmware can leave a READ_SOCKET above "
+            f"{_PRE_315_SAFE_READ} bytes undrainable -- ask for at most "
+            f"{_PRE_315_SAFE_READ}"
+        )
+    if turbo_safe:
+        timeout += max_len * _TURBO_READ_SECONDS_PER_BYTE
 
     socket_id_addr = _input_addr(None, turbo_safe, _DATA_ADDR,
                                  _TURBO_SOCKET_ID_ADDR)
@@ -2587,6 +2635,8 @@ def uci_socket_read(
         return b""
     header = transport.read_memory(_RESP_ADDR, _SOCKET_READ_HEADER_LEN)
     payload_len = header[0] | (header[1] << 8)
+    if payload_len == _NO_DATA_HEADER:
+        return b""
     available = drained - _SOCKET_READ_HEADER_LEN
     if payload_len > available:
         # The firmware reports the *total* reply length in the header, so a
@@ -2628,27 +2678,41 @@ def _uci_socket_read_multiblock(
         if status.startswith("82"):
             _log.warning(
                 "uci_socket_read: READ_SOCKET of %d bytes returned no reply "
-                "(status %r); firmware before 3.15 accepts at most 894",
+                "(status %r); this firmware refuses READ_SOCKET above 894 bytes",
                 max_len, status,
             )
         return b""
     header = transport.read_memory(_LONG_READ_BUF_ADDR, _SOCKET_READ_HEADER_LEN)
-    # No cap at max_len needed here: the routine stores at most max_len + 2
-    # bytes, so ``available`` already bounds the result.
     payload_len = header[0] | (header[1] << 8)
+    if payload_len == _NO_DATA_HEADER:
+        return b""
     available = drained - _SOCKET_READ_HEADER_LEN
     if payload_len > available:
-        _log.warning(
-            "uci_socket_read: header reports %d bytes but only %d arrived "
-            "across the reply blocks; returning what arrived",
-            payload_len, available,
-        )
-        payload_len = available
+        # The routine stores at most max_len + 2 bytes, so this is also the
+        # only place a header above max_len could surface.
+        arrived = transport.read_memory(
+            _LONG_READ_BUF_ADDR + _SOCKET_READ_HEADER_LEN, available
+        ) if available else b""
+        raise UCISocketReadTruncatedError(payload_len, arrived)
     if payload_len == 0:
         return b""
     return transport.read_memory(
         _LONG_READ_BUF_ADDR + _SOCKET_READ_HEADER_LEN, payload_len
     )
+
+
+def _grades_multiblock_read(transport: C64Transport) -> bool:
+    """Whether *transport*'s device is graded Ultimate-line 3.15 or later.
+
+    Reads the client's cached grade only (no device traffic).  Anything else
+    -- no client, an unprobed one, the ``cbm`` line, pre-3.15 -- is ``False``.
+    ``DeviceCapabilities.from_info`` sets ``uci_socket_read_multiblock`` to
+    ``False`` everywhere except Ultimate-line 3.15+, where the version cannot
+    tell and it is ``None``; so "not ``False``" is exactly "3.15 or later,
+    unless an override says otherwise".
+    """
+    caps = getattr(getattr(transport, "client", None), "cached_capabilities", None)
+    return caps is not None and caps.uci_socket_read_multiblock is not False
 
 
 def uci_socket_close(
