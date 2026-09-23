@@ -3367,8 +3367,10 @@ def verified_lock_probe(
 
 
 def _bench_args(work: Path) -> tuple[str, ...]:
+    # Loaded at $C000 and parked at main_loop ($C006, the seventh label
+    # below), so the script's pre-upload build check (#462) lets it through.
     prg = work / "x25519.prg"
-    prg.write_bytes(b"\x01\x08" + bytes(16))
+    prg.write_bytes(b"\x00\xc0" + bytes(6) + b"\x4c\x06\xc0" + bytes(7))
     labels = work / "labels.txt"
     labels.write_text("".join(
         f"al C:{0xC000 + i:04x} .{name}\n"
