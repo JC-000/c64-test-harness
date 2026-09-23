@@ -37,7 +37,8 @@ Scope is deliberately narrow:
   frame is skipped); the TxCMD / TxLength-before-data ordering is not
   enforced (data written before TxLength is discarded when TxLength is
   written, no error); ``Rdy4TxNOW`` is set for every bid unless
-  ``tx_ready_budget`` withholds it (issues #234/#236), and it gates
+  ``tx_ready_budget`` withholds it (issues #234/#236) or
+  ``tx_starved_by_rx`` does while RX frames are queued (#303), and it gates
   nothing -- a routine that never polls BusST still transmits; SelfCTL
   (PP ``0x0114``) models only the self-clearing RESET bit and resets no
   other state; there is no acceptance filter --
@@ -100,6 +101,12 @@ class Cs8900aSim:
     #: ``k`` bids (a bid is a TxLength high-byte write) and never another,
     #: which is the wedged chip of issues #234/#236.
     tx_ready_budget: int | None = None
+    #: Withhold ``Rdy4TxNOW`` while any received frame is still queued or
+    #: part-read -- the TX-buffer starvation measured on silicon in #303
+    #: (unread RX frames in the shared buffer; SkipNow or a chip reset frees
+    #: it).  Whether it depends on bid or queued-frame size is unmeasured;
+    #: the model starves every bid.  ``False`` keeps the old model.
+    tx_starved_by_rx: bool = False
     #: Number of TxLength high-byte writes seen so far.
     tx_bids: int = 0
     #: Every read of BusST's high byte -- one per ``Rdy4TxNOW`` poll pass.
@@ -219,6 +226,8 @@ class Cs8900aSim:
             return self._rx_event()
         if pp == PP_BUSST:
             ready = self.tx_ready_budget is None or self.tx_bids <= self.tx_ready_budget
+            if self.tx_starved_by_rx and (self.rx_queue or self._rx_stream):
+                ready = False
             return (BUSST_RDY4TXNOW if ready else 0) | 0x0018
         if pp == PP_SELFCTL:
             self.selfctl_reads += 1

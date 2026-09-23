@@ -669,17 +669,21 @@ CS8900A_LINECTL_ENABLE = 0x00C0
 #: VICE test could notice because the emulated chip is always ready.
 #:
 #: 65,536 polls is 13 CPU cycles each (``LDA abs / AND / BNE / DEY /
-#: BNE``), about 0.85 s at 1 MHz -- two orders of magnitude beyond a
-#: maximum-length 10BASE-T frame.  Under turbo it is shorter, but the U64
-#: throttles expansion-port cycles (a cartridge-I/O loop measured only 1.7x
-#: faster at 48 MHz), so roughly half a second -- inferred, not measured.
-#: The constant is the chosen bound, not a characterised chip limit.
+#: BNE``), about 0.85 s at 1 MHz by cycle count -- two orders of magnitude
+#: beyond a maximum-length 10BASE-T frame.  Measured on the U64E (#303,
+#: 2026-09-23): a ``0x04`` run of :func:`build_tx_code` took about 1.02 s of
+#: ``run_subroutine`` wall time at 1 MHz (a bare ``RTS`` takes 0.11 s) and
+#: about 0.15 s at 48 MHz.  The constant is the chosen bound, not a
+#: characterised chip limit.
 CS8900A_TX_READY_MAX_POLLS = 65536
 
 #: Result byte every TX builder stores when ``Rdy4TxNOW`` did not assert
 #: within :data:`CS8900A_TX_READY_MAX_POLLS` polls (issue #236): nothing was
-#: copied into the chip.  A chip that returns this is the #234 wedge until
-#: shown otherwise -- :func:`build_cs8900a_reset_code` is the remedy.
+#: copied into the chip.  On silicon, injecting host frames that sit unread
+#: provokes it (measured, #303): the TX buffer is starved by the RX queue,
+#: and a chip reset (:func:`build_cs8900a_reset_code`) or a SkipNow drain
+#: frees it.  The unprovoked ``0x04`` results in #303 (16 of 174 transmits)
+#: are attributed to the same cause, not shown to be it.
 RESULT_TX_NOT_READY = 0x04
 
 #: Upper bound on SelfCTL reads :func:`build_cs8900a_reset_code` spends
@@ -898,12 +902,18 @@ def build_cs8900a_reset_code(
 ) -> bytes:
     """Reset the CS8900a through SelfCTL, wait (bounded) for it, re-initialise.
 
-    Issue #234: a chip can wedge so that ``Rdy4TxNOW`` never asserts while
-    every status register reads healthy, and the wedge survives a C64
-    reset, ``reset(scope="machine")`` and re-running
-    :func:`cs8900a_enable_inline_code`.  An explicit SelfCTL RESET plus
-    re-init cleared it (measured by the 1541ultimate lane).  This is that
-    sequence, in ip65's ``drivers/cs8900a.s`` ``reset`` order:
+    Issue #234: ``Rdy4TxNOW`` can stay dead while every status register
+    reads healthy, surviving a C64 reset, ``reset(scope="machine")`` and
+    re-running :func:`cs8900a_enable_inline_code`.  #303 measured a state
+    with exactly those properties -- the TX buffer starved by unread RX
+    frames, which none of those touch -- and that #234 was that state is
+    inferred, not measured (#234's session was not reproduced).  An
+    explicit SelfCTL RESET plus re-init clears the starved state: 10/10
+    starved chips on the U64E (5 at 1 MHz, 5 at 48 MHz, 2026-09-23), and
+    the next two transmits reached the host 20/20.  A standalone SkipNow
+    drain (:func:`_emit_drain_rx`) freed it on the next transmit 4/4, with
+    one failure on the transmit after that.  This is the reset sequence,
+    in ip65's ``drivers/cs8900a.s`` ``reset`` order:
 
     1. clockport enable, ``SelfCTL (PP 0x0114)`` low byte ``= $40`` (RESET;
        the high byte is not written, as in ip65);
@@ -918,20 +928,22 @@ def build_cs8900a_reset_code(
     Loads at ``load_addr``; ``SEI`` on entry, ``CLI`` before ``RTS``;
     clobbers A, X and Y.
 
-    ``0x01`` does not prove the wedge is gone.  The readiness probe #234
-    asks for is a transmit through the bounded poll afterwards:
-    :func:`build_tx_code` answers :data:`RESULT_TX_NOT_READY` instead of
-    hanging when ``Rdy4TxNOW`` stays dead.  A register-read probe cannot
-    substitute, since the wedged chip's registers all read healthy.
+    ``0x01`` does not prove the chip can transmit.  The readiness probe is a
+    transmit through the bounded poll afterwards: :func:`build_tx_code`
+    answers :data:`RESULT_TX_NOT_READY` instead of hanging when
+    ``Rdy4TxNOW`` stays dead.  A register-read probe cannot substitute,
+    since a starved chip's registers all read healthy.
 
     **Divergence from ip65, read from source, not measured.**  ip65's loop
     (``:321-328``) is ``jsr packetpp_a1 / ldy ppdata / and #$40 / bne``:
     it loads SelfCTL into Y but tests A, which ``packetpp_a1`` leaves at
     ``$14``, so ``$14 & $40 = 0`` exits on the first pass and ip65 never
     actually waits for RESET to clear.  This routine tests the byte it
-    read.  Whether real silicon reads bit 6 as set during reset, and so
-    whether this wait is ever non-zero, has not been measured; the bound
-    guarantees it cannot hang either way.  The re-init also re-enables the
+    read.  On silicon bit 6 reads clear on the very first poll after the
+    RESET write (0 polls, 5/5, U64E, 1 MHz, #303), though the reset does
+    happen (RxCTL and LineCTL read their reset values afterwards), so the
+    wait is zero there and the re-init is what matters; the bound guarantees
+    it cannot hang either way.  The re-init also re-enables the
     clockport, per the INITCODE -> RESET -> INITCODE order #234 reports;
     whether a chip reset disturbs the RR-Net clockport bit is not known.
 
@@ -1106,6 +1118,8 @@ def build_tx_code(
     result_addr: int,
     *,
     allow_odd_frame_len: bool = False,
+    drain_first: bool = False,
+    drain_status_addr: int | None = None,
 ) -> bytes:
     """Build a 6502 routine that hands ``frame_len`` bytes from ``frame_buf``
     to the CS8900a for transmission.  Loads at ``load_addr``.
@@ -1143,12 +1157,46 @@ def build_tx_code(
       #235: 3072 of these with zero packets on the wire).
     * :data:`RESULT_TX_NOT_READY` (``0x04``) -- ``Rdy4TxNOW`` did not assert
       within :data:`CS8900A_TX_READY_MAX_POLLS` polls and nothing was
-      copied; the chip is probably wedged (issues #234/#236), see
-      :func:`build_cs8900a_reset_code`.
+      copied.  Provoked on silicon by host frames left unread, it is the TX
+      buffer **starved by the RX queue** (measured, #303); unprovoked
+      ``0x04`` results are attributed to the same cause.  Drain the RX
+      queue (``drain_first=True``) or reset the chip
+      (:func:`build_cs8900a_reset_code`); a starved chip kept returning
+      ``0x04`` on every retry without either.
+
+    ``drain_first`` (issue #303): SkipNow every frame already queued in the
+    chip before the bid (:func:`_emit_drain_rx`, at most
+    :data:`DRAIN_RX_MAX_FRAMES`).  Why, measured on the U64E with an
+    external RR-Net (fw 3.15 ``bce4535e``, 2026-09-23;
+    https://github.com/JC-000/c64-test-harness/issues/303#issuecomment-5798261175):
+    host frames that sit unread in the chip's shared buffer keep
+    ``Rdy4TxNOW`` from asserting -- three injected host frames before a
+    1514-byte TX bid gave ``0x04`` 5/6 against 0/6 with none, and once
+    starved every retry stayed ``0x04`` (16/16) until a drain or a chip
+    reset.  ``drain_first=True`` on a chip confirmed starved (two plain
+    transmits both ``0x04``) transmitted byte-exact to the host 6/6
+    against 0/6 without it, paired and interleaved (1 MHz, 1514 B, #488
+    head 4f4781d, 2026-09-23, fw ``bce4535e``;
+    https://github.com/JC-000/c64-test-harness/issues/303#issuecomment-5799700978).  RxCTL accepts broadcast, and
+    unprovoked ``0x04`` results (16 of 174 transmits in #303) are
+    attributed to host frames the link delivered on its own.  The drain
+    discards queued frames, so leave it off when the routine that follows
+    must read them.
+    Default ``False`` keeps the routine byte-identical; ``True`` adds 40
+    bytes (43 with ``drain_status_addr``), 139-163 bytes in all, which
+    takes the routine past 128 bytes -- through ``transport.write_memory``
+    that still costs no ``/Temp`` attachment on a leak-prone device, but a
+    direct ``client.write_mem`` of it does.  ``drain_status_addr`` (needs
+    ``drain_first``) receives the drain's remaining budget: ``0`` = bound
+    hit, frames may still be queued; ``n > 0`` = the queue emptied after
+    ``8 - n`` skips.
     """
+    _check_drain_status(drain_first, drain_status_addr)
     a = Asm(org=load_addr)
     a.emit(0x78)  # SEI
     _emit_clockport_enable(a)
+    if drain_first:
+        _emit_drain_rx(a, "tx", status_addr=drain_status_addr)
     _emit_tx_frame(a, frame_buf, frame_len, "tx", "tx_fail",
                    allow_odd_frame_len=allow_odd_frame_len,
                    offer_odd_opt_in=True)
