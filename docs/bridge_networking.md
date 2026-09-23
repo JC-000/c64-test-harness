@@ -1080,21 +1080,23 @@ Result bytes the TX builders can now store:
   simulated chip and pins TxLength, every copied byte, the single pad byte,
   and `ceil(n/2)` words exactly. **Measured on silicon** (U64E fw 3.15
   `bce4535e`, external RR-Net point-to-point to en4, 1 MHz, 2026-09-23;
-  ip65 `pingstatic` control passed first; [#438's evidence
+  ip65 `pingstatic` control passed 3/3 earlier the same day, recorded on
+  #438; [#438's evidence
   comment](https://github.com/JC-000/c64-test-harness/issues/438#issuecomment-5798081221)): odd lengths 61, 101, 255, 257, 511 and 1513,
   paired and interleaved with even controls (62, 100, 254, 258, 512, 1514)
   and a control that sends the odd frame as `frame_len + 1`, with a marker
   byte at `frame_buf + frame_len`. Each frame was checked by host BPF
-  capture on en4 and `netstat -I en4 -b` deltas. All 54 odd frames that
-  were sent arrived with capture length and `Ibytes` delta equal to the
-  true length, a byte-exact body and no marker; the 55 even controls
-  likewise; the `frame_len + 1` control put the marker on the wire 48/48,
+  capture on en4 and `netstat -I en4 -b` deltas. 54 of 60 odd transmits
+  arrived with capture length and `Ibytes` delta equal to the true
+  length, a byte-exact body and no marker (the other 6 stored `0x04`,
+  below); 55 of 60 even controls likewise; the `frame_len + 1` control put the marker on the wire 48/48,
   so the instrument sees a leaked pad byte. No FIFO desync on the frame
-  after an odd one. The `0x04` results in that run (6 odd, 5 even, 5
-  padded) hit every arm alike and are RX-buffer starvation, not the odd
-  path (#303). The default stays the refusal by owner decision on #438.
-  For an even length the flag
-  changes nothing — the emitted bytes are identical, pinned per length.
+  after an odd one. The `0x04` results over the 4 sessions (6 odd, 5
+  even, 5 padded) hit every arm alike and are attributed to RX-buffer
+  starvation (#303), not the odd path; one padded transmit stored `0x01`
+  and arrived as nothing (cause not established). The default stays the
+  refusal by owner decision on #438. For an even length the flag changes
+  nothing — the emitted bytes are identical, pinned per length.
 - **The chip can be reset: `build_cs8900a_reset_code`**
   ([#234](https://github.com/JC-000/c64-test-harness/issues/234)).
   Measured: `Rdy4TxNOW` dead across 65,536 polls while every register the

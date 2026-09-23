@@ -736,8 +736,9 @@ def _check_tx_frame_len(
     (TxLength the true length, ``ceil(frame_len / 2)`` words copied, as
     ip65's ``send`` does via ``adjustcnt``).  It stays **off** by default
     (owner decision on #438); the padded copy is measured on silicon, see
-    :func:`build_tx_code`.  The range is checked either way.  ``offer_odd_opt_in`` names ``allow_odd_frame_len`` in the error;
-    only a caller that takes that argument (:func:`build_tx_code`) sets it.
+    :func:`build_tx_code`.  The range is checked either way.
+    ``offer_odd_opt_in`` names ``allow_odd_frame_len`` in the error; only a
+    caller that takes that argument (:func:`build_tx_code`) sets it.
     """
     if isinstance(frame_len, bool) or not isinstance(frame_len, int) \
             or not 2 <= frame_len <= CS8900A_TX_MAX_FRAME_LEN \
@@ -1120,12 +1121,15 @@ def build_tx_code(
     ``frame_buf + frame_len``, fills the last word (issue #438); that byte
     is whatever RAM follows the frame, written into the chip's TX buffer.
     Measured on silicon (U64E fw 3.15 ``bce4535e``, external RR-Net to the
-    host's en4, 1 MHz, 2026-09-23): 54 odd frames of 61..1513 bytes, paired
-    and interleaved with 55 even controls, all arrived with the true length
-    (en4 capture and ``Ibytes`` delta both equal ``frame_len``), a
-    byte-exact body and the pad byte absent; a control that sent the same
-    odd frames as ``frame_len + 1`` put the pad byte on the wire every time
-    (48/48), so the capture could see it.  Evidence: https://github.com/JC-000/c64-test-harness/issues/438#issuecomment-5798081221.
+    host's en4, 1 MHz, 2026-09-23), paired and interleaved with even
+    controls: 54 of 60 odd transmits of 61..1513 bytes arrived with the
+    true length (en4 capture and ``Ibytes`` delta both equal
+    ``frame_len``), a byte-exact body and the pad byte absent; the other 6
+    stored ``0x04``, at the same rate as the even controls (#303).  A
+    control that sent the same odd frames as ``frame_len + 1`` put the pad
+    byte on the wire every time it transmitted (48/48), so the capture
+    could see it.  Evidence:
+    https://github.com/JC-000/c64-test-harness/issues/438#issuecomment-5798081221.
     The default stays the refusal (owner decision on #438); padding the frame
     by one byte (the IP total-length field governs the datagram) works too.
     The flag is on this builder only; the ping builders do not take it.
