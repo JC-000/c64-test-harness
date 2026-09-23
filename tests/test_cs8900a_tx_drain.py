@@ -8,7 +8,8 @@ three injected host frames against 0/6 with none, persistent until the RX
 queue is drained or the chip is reset.  ``drain_first`` SkipNows the queue
 on the 6510 before the bid, as the ping builders' ``drain_first`` does
 (#222).  These run on the simulated chip with its starvation model
-(``Cs8900aSim.tx_starved_by_rx``); the live check waits for a device slot.
+(``Cs8900aSim.tx_starved_by_rx``); on silicon ``drain_first`` went 6/6
+against 0/6 on a starved chip (#303, 2026-09-23).
 """
 from __future__ import annotations
 

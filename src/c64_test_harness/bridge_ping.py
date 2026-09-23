@@ -1168,10 +1168,11 @@ def build_tx_code(
     ``Rdy4TxNOW`` from asserting -- three injected host frames before a
     1514-byte TX bid gave ``0x04`` 5/6 against 0/6 with none, and once
     starved every retry stayed ``0x04`` (16/16) until a drain or a chip
-    reset.  What ran on silicon was a standalone :func:`_emit_drain_rx`
-    routine, not this option: it freed the next transmit 4/4, and one of
-    those failed again on the transmit after.  ``drain_first`` itself is
-    pinned on the simulated chip only.  RxCTL accepts broadcast, and
+    reset.  ``drain_first=True`` on a chip confirmed starved (two plain
+    transmits both ``0x04``) transmitted byte-exact to the host 6/6
+    against 0/6 without it, paired and interleaved (1 MHz, 1514 B, #488
+    head 4f4781d, 2026-09-23, fw ``bce4535e``;
+    https://github.com/JC-000/c64-test-harness/issues/303#issuecomment-5799700978).  RxCTL accepts broadcast, and
     unprovoked ``0x04`` results (16 of 174 transmits in #303) are
     attributed to host frames the link delivered on its own.  The drain
     discards queued frames, so leave it off when the routine that follows

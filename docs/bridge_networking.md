@@ -1118,9 +1118,12 @@ Result bytes the TX builders can now store:
   transmit after that. `build_tx_code(..., drain_first=True)` packages
   that drain before the bid (as on the ping builders since #222; 40 bytes
   more, so past the 128-byte PUT threshold — still zero attachments
-  through `transport.write_memory`); it is pinned on the simulated chip
-  and has not run on silicon. A `0x04` run
-  costs about 1.02 s of `run_subroutine` wall time at 1 MHz (a bare `RTS`
+  through `transport.write_memory`). On a chip confirmed starved (two
+  plain transmits both `0x04`) it transmitted byte-exact to en4 6/6
+  against 0/6 without it, paired and interleaved (1 MHz, 1514 B, head
+  4f4781d, 2026-09-23, fw `bce4535e`;
+  [evidence](https://github.com/JC-000/c64-test-harness/issues/303#issuecomment-5799700978)).
+  A `0x04` run costs about 1.02 s of `run_subroutine` wall time at 1 MHz (a bare `RTS`
   0.11 s) and about 0.15 s at 48 MHz. ip65's `send` handles the same
   condition differently: on a clear `Rdy4TxNOW` it SkipNows one received
   frame and retries, up to 8 times (`drivers/cs8900a.s` `send`); the
