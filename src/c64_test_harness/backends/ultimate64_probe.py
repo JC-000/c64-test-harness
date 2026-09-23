@@ -37,12 +37,16 @@ from .ultimate64_client import Ultimate64Client, _wire_hex16
 # probe writes $0334-$03B3, and its /Temp reservation wants the same
 # lock-release drain a client gets (#450 review, #460).
 try:
+    from .device_lock import device_key as _device_key
     from .device_lock import register_release_callback as _register_release_callback
     from .device_lock import warn_unlocked_client as _warn_unlocked_client
 
     _HAS_DEVICE_LOCK = True
 except ImportError:  # pragma: no cover - device_lock ships with the package
     _HAS_DEVICE_LOCK = False
+
+    def _device_key(host: str, port: int = 80) -> str:
+        return host if port == 80 else f"{host}:{port}"
 
 __all__ = [
     "ProbeResult",
@@ -698,9 +702,14 @@ def _probe_hygiene_armed(firmware_version: str | None) -> bool:
 
 
 def _reserve_probe_attachments(
-    host: str, count: int, *, armed: bool, operation: str
+    host: str, count: int, *, armed: bool, operation: str, key: str | None = None
 ):
     """Gate, then count, *count* attachments on *host*'s device ledger.
+
+    *key* is the device key (``device_lock.device_key(host, port)``) the
+    ledger and the release callback are found under; it defaults to *host*.
+    The sweep and ``ledger.host`` stay on the bare *host*, which is what FTP
+    connects to (#434).
 
     The same order :meth:`Ultimate64Client._reserve_temp_attachments` uses,
     under the same ledger lock, so a probe and a client's upload against one
@@ -740,7 +749,7 @@ def _reserve_probe_attachments(
         temp_ledger_for,
     )
 
-    ledger = temp_ledger_for(host)
+    ledger = temp_ledger_for(key or host)
     with ledger.lock:
         if armed:
             budget = leak_budget()
@@ -793,13 +802,15 @@ def _reserve_probe_attachments(
             ledger.host = ledger.host or host
             if _HAS_DEVICE_LOCK:
                 _register_release_callback(
-                    host, ledger, "drain_on_lock_release"
+                    key or host, ledger, "drain_on_lock_release"
                 )
         ledger.begin_reservation(count, armed=armed)
         return TempReservation(ledger.generation, pending_before, armed, count)
 
 
-def _end_probe_reservation(host: str, reservation, *, sent: int) -> None:
+def _end_probe_reservation(
+    host: str, reservation, *, sent: int, key: str | None = None
+) -> None:
     """End *reservation*: refund what the probe never sent (and count a surplus).
 
     A probe that stopped before its write -- unreachable device, a readmem
@@ -809,7 +820,7 @@ def _end_probe_reservation(host: str, reservation, *, sent: int) -> None:
     """
     from .ultimate64_temp_gc import temp_ledger_for
 
-    ledger = temp_ledger_for(host)
+    ledger = temp_ledger_for(key or host)
     with ledger.lock:
         if sent > reservation.count:
             # Defensive: the probe sends at most two, but a count that is
@@ -924,11 +935,14 @@ def liveness_probe(
     writes ``$0334-$03B3`` and writes it back, so a neighbouring lane's
     cassette-buffer scratch changes under it either way.
     """
+    # The lock, the ledger and the release callback key on host *and* port,
+    # as the client's do (#434); FTP and HTTP still go to the bare host.
+    key = _device_key(host, port)
     if _HAS_DEVICE_LOCK and not accounted:
         # Not on the client's path: Ultimate64Client warns at construction and
         # its accounted sender checks the lock per request, so warning again
         # here would double up on the one caller that already reports it.
-        _warn_unlocked_client(host, what="liveness_probe", logger=_log)
+        _warn_unlocked_client(key, what="liveness_probe", logger=_log)
     state: dict[str, bool | None] = {"wrote": False, "restored": None}
     send = request if request is not None else _liveness_request
     cost = Ultimate64Client.LIVENESS_PROBE_TEMP_ATTACHMENTS
@@ -943,6 +957,7 @@ def liveness_probe(
             reservation = _reserve_probe_attachments(
                 host,
                 cost,
+                key=key,
                 armed=_probe_hygiene_armed(firmware_version),
                 operation=(
                     f"liveness_probe on {host} "
@@ -960,7 +975,7 @@ def liveness_probe(
         )
     finally:
         if reservation is not None:
-            _end_probe_reservation(host, reservation, sent=sent[0])
+            _end_probe_reservation(host, reservation, sent=sent[0], key=key)
     if not state["wrote"]:
         return result
     restored = state["restored"] is True

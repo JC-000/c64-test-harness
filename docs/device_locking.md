@@ -43,6 +43,60 @@ the cause, but the same class of mistake. **Two lanes each
 half-participating is how a mechanism like this quietly stops being
 one.**
 
+## One device, one lockfile: how the host string is keyed
+
+The lock is a file per device, so **which file** a host string names is
+the whole of the exclusion. Until
+[#434](https://github.com/JC-000/c64-test-harness/issues/434) that was the
+raw string with unsafe characters replaced, which meant `U64.lan`,
+`u64.lan`, `http://u64.lan/` and `u64.lan:80` took **four lockfiles for
+one device** on a case-sensitive filesystem, and three on a
+case-insensitive one such as this bench's APFS (where `U64.lan` and
+`u64.lan` name one file). Two lanes could each hold "the lock" and drive the same
+hardware, and every warning in this document would stay silent while they
+did — the failure the lock exists to prevent, produced by the lock.
+
+The key is now `normalize_device_host()` (in `backends/device_lock.py`)
+followed by the filename sanitiser. It folds case, surrounding
+whitespace, an `http(s)://` scheme, a trailing path, IPv6 brackets, a
+trailing dot, the `:80` default port, and the textual forms of one IP
+address.
+
+Two things it deliberately does **not** fold:
+
+- **A non-default port.** `gw:8080` and `gw:8081` are two devices behind
+  one name, and merging them would let one device's failed `/Temp`
+  hygiene pass block requests to the other. A caller that holds the port
+  separately (`Ultimate64Client(host, port=...)`, the manager's lock,
+  `liveness_probe(host, port=...)`) keys on `device_key(host, port)` from
+  `device_lock`, which also re-brackets IPv6 (`[::1]:8080`). Lock a device
+  on another port as `DeviceLock(device_key(host, port))`, or the lock does
+  not cover that client and its lock-release `/Temp` drain never runs.
+- **A name and the address it resolves to.** `c64u.lan` and
+  `10.53.21.158` stay two keys for one device. Folding them needs a DNS
+  lookup in the path that takes the lock, which can block for seconds and
+  can answer differently over time. Keying on a device identity read from
+  `GET /v1/info` (the U64E does report `unique_id`) would avoid DNS, but
+  it puts a network probe — against a device that may be wedged — in
+  front of taking a lock. **So use one spelling per device**; the
+  canonical spelling on this bench is the bare lowercase IP.
+
+`ultimate64_temp_gc.temp_ledger_key`, which keys the `/Temp` budget, *is*
+this same function. The two must agree: a spelling that reaches one
+lockfile has to reach one ledger, or a lane could hold the lock under one
+spelling while another spelling spent a second `/Temp` budget on the same
+hardware.
+
+> **Upgrading across this change:** a lock held by an older process is
+> held on the **old** filename. A new-code lane normalising the same host
+> to a different name will not see it, and both will run. The window is
+> any overlap with an old-code process that is still running and uses a
+> non-canonical spelling, and it only exists for hosts whose spelling was not
+> already canonical — a bare lowercase IP or hostname, which is every
+> spelling this bench uses, keys to exactly the same file as before. If
+> you drive a device by a spelling that *does* change (mixed case, a
+> scheme, an explicit `:80`), drain the lane before upgrading it.
+
 ## The rules
 
 1. **Hold the lock for the whole run, not per call.** The unit of

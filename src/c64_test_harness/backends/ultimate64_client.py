@@ -42,12 +42,14 @@ if TYPE_CHECKING:
 
 try:  # device_lock needs fcntl — absent on Windows, optional everywhere
     from .device_lock import advisory_lock_check as _advisory_lock_check
+    from .device_lock import device_key as _device_key
     from .device_lock import register_release_callback as _register_release_callback
     from .device_lock import warn_unlocked_client as _warn_unlocked_client
 
     _HAS_DEVICE_LOCK = True
 except Exception:  # pragma: no cover - exercised only without fcntl
     _HAS_DEVICE_LOCK = False
+    _device_key = None
 
 __all__ = [
     "Ultimate64Client",
@@ -434,12 +436,23 @@ class Ultimate64Client:
         self.password = password
         self.timeout = timeout
         self._base = f"http://{host}:{port}" if port != 80 else f"http://{host}"
+        #: The spelling this client keys per-device state on: the lock, the
+        #: ``/Temp`` ledger and the release callback.  ``DeviceLock`` sees a
+        #: port only in the host string, so a non-default ``port`` goes into
+        #: it; ``gw`` on 8080 and 8081 are two devices (#434).  The rule is
+        #: ``device_lock.device_key``, shared with the manager's lock and
+        #: ``liveness_probe``; without ``device_lock`` there is no lock to
+        #: agree with, and the ledger normalises the host itself.
+        if _device_key is None:  # pragma: no cover - only without fcntl
+            self._device_key = host if port == 80 else f"{host}:{port}"
+        else:
+            self._device_key = _device_key(host, port)
 
         # Before any network traffic: one line per process per host if
         # this lane is driving the device without holding its lock.
         if warn_unlocked and _HAS_DEVICE_LOCK:
             _warn_unlocked_client(
-                self.host, what="Ultimate64Client", logger=_log
+                self._device_key, what="Ultimate64Client", logger=_log
             )
 
         # ---- /Temp hygiene state (see temp_hygiene_armed) ----
@@ -461,7 +474,7 @@ class Ultimate64Client:
         #: The device's accounting, shared by every client of this host in
         #: the process (#295): the pending count, the refusal state and the
         #: one FTP-enable attempt. See ``TempLedger``.
-        self._temp_ledger = _temp_ledger_for(host)
+        self._temp_ledger = _temp_ledger_for(self._device_key)
         #: This client's own share of the device's pending count, valid only
         #: for the ledger generation it was counted in (a successful sweep by
         #: any client collects it).
@@ -527,7 +540,7 @@ class Ultimate64Client:
         # weakly, so a forgotten client is collected normally.
         if _HAS_DEVICE_LOCK:
             _register_release_callback(
-                self.host, self._temp_ledger, "drain_on_lock_release"
+                self._device_key, self._temp_ledger, "drain_on_lock_release"
             )
 
     def close(self) -> None:
@@ -1230,7 +1243,7 @@ class Ultimate64Client:
         try:
             from .device_lock import DeviceLock
 
-            return bool(DeviceLock.held_by_this_process(self.host))
+            return bool(DeviceLock.held_by_this_process(self._device_key))
         except Exception:  # noqa: BLE001 - a lock query must never fail a drain
             return False
 
@@ -1347,7 +1360,7 @@ class Ultimate64Client:
         """
         if not _HAS_DEVICE_LOCK:
             return
-        _advisory_lock_check(self.host, operation, logger=_log)
+        _advisory_lock_check(self._device_key, operation, logger=_log)
 
     @staticmethod
     def _raise_for_status(status: int, data: bytes, method: str, url: str) -> None:
