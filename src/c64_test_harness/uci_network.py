@@ -42,6 +42,7 @@ from __future__ import annotations
 from ._address import refuses_bool_address_args
 
 import logging
+import re
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -1905,6 +1906,41 @@ class UCIError(Exception):
     """UCI command returned an error."""
 
 
+class UCISocketNotOwnedError(UCIError):
+    """A socket call named a handle the network target does not own (#428).
+
+    Since #808 the firmware keeps a table of the sockets it opened for the
+    C64 and drops a handle from it when the handle is closed, when a read
+    returns 0 -- a TCP peer closed the connection, or a zero-length UDP
+    datagram arrived (``network_target.cc`` ``read_socket``) -- and, for every
+    handle, on a C64 reset, including the reset ``_execute_uci_routine``
+    issues after a routine timeout (#313).  A read, write or close on a
+    handle outside the table answers ``EBADF`` (errno 9): open a new one.
+    """
+
+
+#: ``errno`` the network target reports for a handle it does not own
+#: (``network_target.cc`` ``owns_socket``; newlib ``EBADF``).
+_EBADF = 9
+
+#: The status codes that carry an errno: ``02,NO DATA: <errno>`` (read) and
+#: ``12,SEND ERROR`` / ``12,ERROR ON CLOSE: <errno>`` (write, close).
+_ERRNO_STATUS = re.compile(r"^(02|12),.*: (\d+)$")
+
+
+def _raise_if_not_owned(transport: C64Transport, command: str, socket_id: int) -> None:
+    """Raise :class:`UCISocketNotOwnedError` on an ``02``/``12`` status with errno 9."""
+    status = _read_status_string(transport)
+    m = _ERRNO_STATUS.match(status.strip())
+    if m and int(m.group(2)) == _EBADF:
+        raise UCISocketNotOwnedError(
+            f"UCI {command} on socket {socket_id}: {status} -- the network "
+            f"target does not own this handle (never opened, closed, closed by "
+            f"a C64 reset, or dropped when a read returned 0 because the peer "
+            f"closed it; #808)"
+        )
+
+
 class UCIInterfaceAbsentError(UCIError):
     """The UCI identifier is not on the bus, so no UCI routine can run (#359).
 
@@ -2404,6 +2440,10 @@ def uci_socket_write(
     :func:`build_socket_write` for the inner-loop scratch addresses.
 
     :param turbo_safe: see :func:`build_uci_command`.
+    :raises UCISocketNotOwnedError: the network target does not own
+        *socket_id* (``"12,SEND ERROR: 9"``) -- e.g. a C64 reset closed it,
+        or an earlier read returned 0 (peer closed, or a zero-length UDP
+        datagram) and the firmware dropped the handle.
     """
     if len(data) > SOCKET_WRITE_MAX_BYTES:
         raise ValueError(
@@ -2430,6 +2470,8 @@ def uci_socket_write(
         turbo_safe=turbo_safe,
     )
     _execute_uci_routine(transport, code, timeout=timeout)
+    # The routine drains only the status; $C200 holds an earlier reply.
+    _raise_if_not_owned(transport, "WRITE_SOCKET", socket_id)
 
 
 def uci_socket_read(
@@ -2442,9 +2484,14 @@ def uci_socket_read(
 ) -> bytes:
     """Read up to *max_len* bytes from a UCI socket.
 
-    Returns the received data (may be shorter than *max_len*).
+    Returns the received data (may be shorter than *max_len*), or ``b""``
+    when nothing is queued.
 
     :param turbo_safe: see :func:`build_uci_command`.
+    :raises UCISocketNotOwnedError: the network target does not own
+        *socket_id* (``"02,NO DATA: 9"``) -- e.g. a C64 reset closed it, or
+        an earlier read returned 0 (peer closed, or a zero-length UDP
+        datagram) and the firmware dropped the handle.
 
     .. note::
         The UCI firmware response is ``[actual_len_lo] [actual_len_hi]
@@ -2481,6 +2528,11 @@ def uci_socket_read(
         return b""
     header = transport.read_memory(_RESP_ADDR, _SOCKET_READ_HEADER_LEN)
     payload_len = header[0] | (header[1] << 8)
+    if payload_len == 0xFFFF:
+        # lwip_recvmsg returned -1: nothing queued ("02,NO DATA: 11", the
+        # 40 ms receive timeout) or a handle the target does not own (#428).
+        _raise_if_not_owned(transport, "READ_SOCKET", socket_id)
+        return b""
     available = drained - _SOCKET_READ_HEADER_LEN
     if payload_len > available:
         # The firmware reports the *total* reply length in the header, so a
@@ -2511,6 +2563,8 @@ def uci_socket_close(
     """Close a UCI socket.
 
     :param turbo_safe: see :func:`build_uci_command`.
+    :raises UCISocketNotOwnedError: the network target does not own
+        *socket_id* (``"12,ERROR ON CLOSE: 9"``).
     """
     socket_id_addr = _input_addr(None, turbo_safe, _DATA_ADDR,
                                  _TURBO_SOCKET_ID_ADDR)
@@ -2518,6 +2572,7 @@ def uci_socket_close(
 
     code = build_socket_close(socket_id_addr, turbo_safe=turbo_safe)
     _execute_uci_routine(transport, code, timeout=timeout)
+    _raise_if_not_owned(transport, "CLOSE_SOCKET", socket_id)
 
 
 def uci_tcp_listen_start(

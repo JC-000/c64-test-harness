@@ -1,6 +1,6 @@
 """Behavioural capability probes against a real Ultimate device.
 
-**Staged, not yet run.** These are the probes that settle the capabilities
+These are the probes that settle the capabilities
 :class:`DeviceCapabilities` reports as ``None`` — the ones that landed after
 the "Bump to 3.15" commit, so every build on that line reports the same
 version string whether or not it carries them.
@@ -8,8 +8,9 @@ version string whether or not it carries them.
 Gated by ``U64_HOST`` like the other live suites, so they skip cleanly until
 a device is deliberately pointed at.
 
-Everything here is **read-only** except the tests in ``TestSocketLifetime``,
-which reset the C64.  They also skip without ``U64_ALLOW_MUTATE``: stricter
+Everything here is **read-only** except the tests in ``TestSocketLifetime``
+(run on the U64E at bce4535e, 2026-09-23), which enable the Command
+Interface and reset the C64.  They also skip without ``U64_ALLOW_MUTATE``: stricter
 than the contract, which covers config changes only (#333).
 
 What each probe distinguishes
@@ -159,36 +160,153 @@ class TestSocketReadCeiling:
 
 
 # ----------------------------------------- UCI socket lifetime (#808)
+#: A handle the network target never handed out.  lwip numbers its sockets
+#: from 0 up to MEMP_NUM_NETCONN (16 in the firmware's lwipopts.h), so no
+#: OPEN can return this; a READ_SOCKET on it takes the ``owns_socket``
+#: refusal -- the control the reset case is compared against.
+_NEVER_OPENED = 0xC8
+
+_UCI_CATEGORY = "C64 and Cartridge Settings"
+_UCI_ITEM = "Command Interface"
+
+
 @pytest.mark.skipif(
     not _ALLOW_MUTATE,
     reason="U64_ALLOW_MUTATE not set — socket-lifetime probes reset the C64",
 )
 class TestSocketLifetime:
-    """#808 bounded the socket table and closes it on C64 reset.
+    """#808 made the UCI network target own its sockets.
 
-    Two behaviours changed at once:
+    At bce4535e (``software/io/network/network_target.cc``, PR #814) the
+    target keeps a table of the sockets it opened, sized to every socket lwip
+    can create (``NET_MAX_SOCKETS`` 16 = ``MEMP_NUM_NETCONN``); a C64 reset
+    closes them all (``c64_reset`` -> ``close_all_sockets``), and a READ,
+    WRITE or CLOSE on a handle not in the table answers ``EBADF`` without
+    touching lwip.  There is no eviction: an OPEN past lwip's limit fails
+    with ``85,ERROR OPENING SOCKET``.  Exhausting lwip is not probed here --
+    the device's own HTTP server needs a socket per REST request.
 
-    * ``NET_MAX_SOCKETS`` is 4, and opening past it closes the oldest first,
-      so an ``OPEN_*`` always succeeds rather than failing once lwip's eight
-      UDP control blocks are exhausted;
-    * a C64 reset closes every socket the target opened for its client,
-      because the program that owned them is gone.
-
-    Any harness flow that resets and then reuses a handle is now broken by
-    design — four live UCI suites call ``client.reset()``.
+    So a handle does not outlive a C64 reset, and the reset that
+    ``_execute_uci_routine`` issues after a routine timeout (#313) ends every
+    socket the caller held.  U64E only: the C64U is not probed.
     """
 
-    @pytest.mark.skip(reason="staged — awaiting device all-clear")
-    def test_sockets_do_not_survive_a_c64_reset(self) -> None:
-        raise NotImplementedError(
-            "Open a UDP socket, reset the C64, settle >=3s for the boot "
-            "RAM-walk, then assert a READ_SOCKET on the old handle answers "
-            "EBADF rather than reading."
+    @pytest.fixture(scope="class")
+    def uci(self, client: Ultimate64Client):
+        """``(transport, host_ip)`` with the Command Interface on and no sockets."""
+        import socket as pysocket
+        import time
+
+        from c64_test_harness import uci_network as un
+        from c64_test_harness.backends.ultimate64 import Ultimate64Transport
+        from live_fixture_teardown import (
+            attempt_steps,
+            read_restore_defaults,
+            restore_default_steps,
         )
 
-    @pytest.mark.skip(reason="staged — awaiting device all-clear")
-    def test_opening_past_the_table_evicts_the_oldest(self) -> None:
-        raise NotImplementedError(
-            "Open NET_MAX_SOCKETS + 1 sockets; assert every OPEN succeeds and "
-            "the first handle is the one that stopped working."
-        )
+        info = client.get_info()
+        if info.get("product") != "Ultimate 64 Elite":
+            pytest.skip(f"U64E only; device reports {info.get('product')!r}")
+        plan = read_restore_defaults(client, {_UCI_CATEGORY: [_UCI_ITEM]})
+        transport = Ultimate64Transport(host=_HOST or "", client=client)
+        probe = pysocket.socket(pysocket.AF_INET, pysocket.SOCK_DGRAM)
+        try:
+            probe.connect((_HOST, 80))
+            host_ip = probe.getsockname()[0]
+        finally:
+            probe.close()
+        failures: list = []
+        try:
+            un.enable_uci(client)
+            client.reset()          # also closes any socket a previous lane left
+            time.sleep(3.0)
+            yield transport, host_ip
+        finally:
+            failures = attempt_steps([
+                ("client.reset()", client.reset),
+                *restore_default_steps(client, plan),
+            ])
+        raise_teardown_failures("TestSocketLifetime uci teardown", failures)
+
+    @staticmethod
+    def _listener():
+        import socket as pysocket
+
+        s = pysocket.socket(pysocket.AF_INET, pysocket.SOCK_DGRAM)
+        s.bind(("0.0.0.0", 0))
+        s.settimeout(1.5)
+        return s
+
+    @staticmethod
+    def _received(listener) -> bytes | None:
+        import socket as pysocket
+
+        try:
+            return listener.recv(64)
+        except pysocket.timeout:
+            return None
+
+    def test_sockets_do_not_survive_a_c64_reset(self, client, uci) -> None:
+        import time
+
+        from c64_test_harness import uci_network as un
+
+        transport, host_ip = uci
+        listener = self._listener()
+        try:
+            port = listener.getsockname()[1]
+            sock = un.uci_udp_connect(transport, host_ip, port)
+            un.uci_socket_write(transport, sock, b"before")
+            assert self._received(listener) == b"before", (
+                "the freshly opened socket did not deliver: the probe has no "
+                "positive control"
+            )
+            # The instrument must tell the two apart before it is trusted.
+            assert un.uci_socket_read(transport, sock, 16) == b""
+            with pytest.raises(un.UCISocketNotOwnedError):
+                un.uci_socket_read(transport, _NEVER_OPENED, 16)
+
+            client.reset()
+            time.sleep(3.0)
+
+            # Write first: no failing read may leave a reply behind for it.
+            with pytest.raises(un.UCISocketNotOwnedError):
+                un.uci_socket_write(transport, sock, b"after")
+            assert self._received(listener) is None, (
+                f"handle {sock} still delivered a datagram after a C64 reset"
+            )
+            with pytest.raises(un.UCISocketNotOwnedError):
+                un.uci_socket_read(transport, sock, 16)
+        finally:
+            listener.close()
+
+    def test_closing_one_socket_leaves_the_others_open(self, client, uci) -> None:
+        from c64_test_harness import uci_network as un
+
+        transport, host_ip = uci
+        listener = self._listener()
+        socks: list[int] = []
+        try:
+            port = listener.getsockname()[1]
+            socks = [un.uci_udp_connect(transport, host_ip, port) for _ in range(3)]
+            assert len(set(socks)) == 3, f"three OPENs returned {socks}"
+
+            un.uci_socket_close(transport, socks[1])
+
+            with pytest.raises(un.UCISocketNotOwnedError):
+                un.uci_socket_read(transport, socks[1], 16)
+            for n, sock in ((0, socks[0]), (2, socks[2])):
+                payload = f"open{n}".encode()
+                un.uci_socket_write(transport, sock, payload)
+                assert self._received(listener) == payload, (
+                    f"socket {n} (handle {sock}) stopped delivering when "
+                    f"handle {socks[1]} was closed"
+                )
+        finally:
+            for sock in (socks[0], socks[2]) if len(socks) == 3 else ():
+                try:
+                    un.uci_socket_close(transport, sock)
+                except Exception:  # noqa: BLE001 -- the fixture's reset closes it anyway
+                    pass
+            listener.close()
