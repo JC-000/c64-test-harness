@@ -546,8 +546,10 @@ that skipped a step says so in its body.
    - **Stale bytecode.** CPython trusts a cached `.pyc` while the
      source's size and whole-second mtime are unchanged. A size-preserving
      mutation (`!=` to `==`) applied and reverted within one second, the
-     normal pace of a scripted loop, runs the old code. Measured once per
-     arm: 2 failed / 3 passed with `__pycache__` purged, 5 passed without.
+     normal pace of a scripted loop, runs the old code. Measured
+     2026-09-16 (#464) on `u64_video_capture.py`, mutating
+     `if frame_num != self._cur_frame_num:` to `==`, n=1 per arm:
+     2 failed / 3 passed with `__pycache__` purged, 5 passed without.
      The error goes both ways: a false SURVIVED, or a reverted mutant
      that keeps failing on a clean tree.
    - **Index pollution.** `git checkout <sha> -- <file>` also stages that
@@ -556,12 +558,17 @@ that skipped a step says so in its body.
 
    The recipe: before every mutation run, purge the bytecode
    (`find src tests scripts -name __pycache__ -type d -prune -exec rm -rf {} +`)
-   and run with `PYTHONDONTWRITEBYTECODE=1`.
-   Back up with `cp` into a directory namespaced to your lane, and
-   restore from that. Read an old version with
-   `git show <sha>:<path> > <path>`, which leaves the index alone. Never
+   and run with `PYTHONDONTWRITEBYTECODE=1`. The purge is the half that
+   matters: `PYTHONDONTWRITEBYTECODE` only stops new `.pyc` files being
+   written, and an existing stale one is still read. Back up with `cp`
+   into a directory namespaced to your lane, and restore from that. Read
+   an old version with `git show "${sha}:${path}" > "${path}"`, which
+   leaves the index alone. Quote and brace it: under zsh an unbraced
+   `$P:scripts/…` or `$P:tests/…` is read as a `:s` or `:t` modifier, and
+   a `git show` that fails still truncates the redirect target. Never
    revert with `git checkout <sha> --`. Mutating a scratch copy made with
-   `git archive` avoids both traps.
+   `git archive` avoids the index trap; the bytecode trap still needs the
+   purge there.
 3. **Adversarial review before merge.** A reviewer with a standing brief
    to assume the implementer is wrong reads the diff, the issue and the
    authority (firmware source, ip65, the datasheet), runs its own red tests

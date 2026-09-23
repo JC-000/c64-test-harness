@@ -43,7 +43,9 @@ this brief enforces. Then work these seven axes, in this order:
 
 1. **Does the test go red?** For every new or changed test, revert the
    source change (`git stash`, or write the parent's version over it
-   with `git show <parent>:<path> > <path>`) and run the test yourself.
+   with `git show "${parent}:${path}" > "${path}"` — braced and quoted,
+   since zsh reads `$P:s…`/`$P:t…` as modifiers and a failed `git show`
+   still truncates the file) and run the test yourself.
    A test you cannot make fail is not a test. This is the single most
    common defect here: an expected value that equals the system default
    passes whether or not the code ran.
