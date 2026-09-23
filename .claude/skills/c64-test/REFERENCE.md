@@ -1218,7 +1218,7 @@ All address arguments default to the `$C000` UCI block (`code_addr=0xC000`, data
 
 ### Exceptions
 - `UCIError` — raised on protocol/timeout/error-bit conditions
-- `UCISocketNotOwnedError` (in `uci_network`) — a `UCIError`: `uci_socket_read` / `uci_socket_write` / `uci_socket_close` named a handle the network target does not own (`EBADF`; #428). Since #808 a **C64 reset closes every UCI socket** — `client.reset()` (measured on the U64E at bce4535e, `TestSocketLifetime`) and so the same `machine:reset` that `_execute_uci_routine` issues after a routine timeout — so open a new handle after one
+- `UCISocketNotOwnedError` (in `uci_network`) — a `UCIError`: `uci_socket_read` / `uci_socket_write` / `uci_socket_close` named a handle the network target does not own (`EBADF`; #428). Since #808 a **C64 reset closes every UCI socket** — `client.reset()` (measured on the U64E at bce4535e, `TestSocketLifetime`) and so the same `machine:reset` that `_execute_uci_routine` issues after a routine timeout — so open a new handle after one. The firmware also drops a handle when a read returns 0 (a TCP peer closed it, or a zero-length UDP datagram arrived; that read returns `b""`), so the next call on it raises
 
 ---
 

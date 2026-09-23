@@ -270,13 +270,14 @@ class TestSocketLifetime:
             client.reset()
             time.sleep(3.0)
 
-            with pytest.raises(un.UCISocketNotOwnedError):
-                un.uci_socket_read(transport, sock, 16)
+            # Write first: no failing read may leave a reply behind for it.
             with pytest.raises(un.UCISocketNotOwnedError):
                 un.uci_socket_write(transport, sock, b"after")
             assert self._received(listener) is None, (
                 f"handle {sock} still delivered a datagram after a C64 reset"
             )
+            with pytest.raises(un.UCISocketNotOwnedError):
+                un.uci_socket_read(transport, sock, 16)
         finally:
             listener.close()
 

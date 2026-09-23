@@ -73,13 +73,28 @@ def test_read_that_arrived_is_returned() -> None:
     assert un.uci_socket_read(t, 6, 16, timeout=1.0) == b"abc"
 
 
-def test_write_on_a_handle_not_owned_raises() -> None:
+@pytest.mark.parametrize("stale", [b"\xff\xff", b"\x03\x00", b""],
+                         ids=["ff-ff", "03-00", "empty"])
+def test_write_on_a_handle_not_owned_raises(stale: bytes) -> None:
+    """``build_socket_write`` drains only the status, never ``$C200``.
+
+    Whatever is at ``$C200`` was left by an earlier routine, so it must not
+    decide the outcome: the status alone does.
+    """
     with pytest.raises(un.UCISocketNotOwnedError, match="12,SEND ERROR: 9"):
-        un.uci_socket_write(_transport(SEND_EBADF), 6, b"x", timeout=1.0)
+        un.uci_socket_write(_transport(SEND_EBADF, reply=stale), 6, b"x", timeout=1.0)
 
 
-def test_write_that_was_sent_does_not_raise() -> None:
-    un.uci_socket_write(_transport(b"00,OK", reply=b"\x01\x00"), 6, b"x", timeout=1.0)
+@pytest.mark.parametrize("stale", [b"\xff\xff", b"\x03\x00"], ids=["ff-ff", "03-00"])
+def test_write_that_was_sent_does_not_raise(stale: bytes) -> None:
+    un.uci_socket_write(_transport(b"00,OK", reply=stale), 6, b"x", timeout=1.0)
+
+
+@pytest.mark.parametrize("status", [b"04,DATAGRAM TRUNCATED: 9", b"00,OK: 9"],
+                         ids=["truncated", "ok"])
+def test_a_status_ending_in_9_that_is_not_an_error_does_not_raise(status: bytes) -> None:
+    """Only the ``02``/``12`` error codes carry an errno; ``: 9`` alone is not EBADF."""
+    un.uci_socket_close(_transport(status, reply=b""), 6, timeout=1.0)
 
 
 def test_close_on_a_handle_not_owned_raises() -> None:
