@@ -1002,6 +1002,9 @@ def build_uci_command(
         the FPGA behind ``$DF1C``-``$DF1F`` needs ~38 µs to latch writes and
         settle reads. At stock 1 MHz the plain (unfenced) path is faster and
         just as correct. Defaults to ``False`` for backward compatibility.
+        At the default ``$C000`` a turbo-safe routine takes at most 4 *params*
+        bytes (494 B); a fifth reaches the reply area at ``$C200`` and
+        :func:`_execute_uci_routine` refuses it.
     """
     if isinstance(params, list):
         params = bytes(params)
@@ -1144,7 +1147,7 @@ def build_tcp_connect(
     The socket ID is stored in the first byte of *result_addr*.
 
     *host_addr* defaults to ``$C100`` for a plain routine and ``$C500``
-    (:data:`_TURBO_HOST_ADDR`) for a turbo-safe one, whose 491 bytes cover
+    (:data:`_TURBO_HOST_ADDR`) for a turbo-safe one, whose 509 bytes cover
     ``$C100``; an explicit address inside the routine raises ``ValueError``
     (issue #322).
 
@@ -2118,13 +2121,15 @@ def _execute_uci_routine(
     """
     from .transport import TimeoutError
 
-    # The routine's reply lands at _RESP_ADDR: code that runs into it would
-    # be overwritten by its own response mid-read.  The largest turbo routine
-    # ends at $C1FD since #419, so this is a margin of three bytes.
-    if code_addr <= _RESP_ADDR < code_addr + len(code):
+    # The routine's working area is $C200-$C3FF: the reply at _RESP_ADDR, the
+    # status at _STATUS_ADDR, the length words, the sentinel and the error
+    # flag.  Code anywhere in it would be overwritten mid-run by the reply it
+    # is reading or by the flags the host clears and waits on.  The largest
+    # turbo routine's last byte is $C1FC since #419, a margin of three bytes.
+    if code_addr < _ERROR_ADDR + 1 and _RESP_ADDR < code_addr + len(code):
         raise ValueError(
-            f"{len(code)}-byte routine at ${code_addr:04X} runs into the "
-            f"reply buffer at ${_RESP_ADDR:04X}"
+            f"{len(code)}-byte routine at ${code_addr:04X} overlaps the reply "
+            f"area ${_RESP_ADDR:04X}-${_ERROR_ADDR:04X}"
         )
 
     # The slot must be on the bus before anything is written or typed (#359).

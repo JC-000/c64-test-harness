@@ -1,7 +1,7 @@
 """``build_socket_write``'s default inputs must not sit inside its routine (#346).
 
 Same shape as #322.  With ``turbo_safe=True`` the routine is 446 B at
-``$C000-$C1AB``, and the old defaults put the socket id at ``$C100``, the data
+``$C000-$C1BD``, and the old defaults put the socket id at ``$C100``, the data
 at ``$C101`` and the length at ``$C1FF`` -- all inside the routine.  A direct
 caller that stages its input at the defaults and then uploads the routine
 gets its input overwritten by code.
@@ -104,7 +104,7 @@ class TestTheGuard:
 
     def test_length_inside_the_routine_is_refused(self) -> None:
         # $C1FF (the plain default) is NOT inside the 446 B turbo routine
-        # ($C000-$C1AB); $C100 is.
+        # ($C000-$C1BD); $C100 is.
         with pytest.raises(ValueError, match="data_len_addr"):
             build_socket_write(TURBO["socket_id"], TURBO["data"], 0xC100,
                                turbo_safe=True)
