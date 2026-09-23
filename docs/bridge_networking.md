@@ -1048,7 +1048,7 @@ Result bytes the TX builders can now store:
   does) and then the even remainder; up to 256 the emitted bytes are
   unchanged. `build_tx_code` is 99 bytes up to 256, 104 at a whole number
   of pages and 120 otherwise — still at or under the 128-byte PUT
-  threshold. **Measured on silicon** (U64E fw 3.15 `bce4535e`, external
+  threshold (`drain_first=True`, #303, adds 40, which crosses it). **Measured on silicon** (U64E fw 3.15 `bce4535e`, external
   RR-Net, 2026-09-15, at 1 MHz (Turbo Control Off); not tried at 48 MHz;
   ip65 `pingstatic` control passed first, `$630E` identity; conditions,
   all 40 trial rows and the driver script in
@@ -1090,24 +1090,42 @@ Result bytes the TX builders can now store:
   ([#234](https://github.com/JC-000/c64-test-harness/issues/234)).
   Measured: `Rdy4TxNOW` dead across 65,536 polls while every register the
   harness exposes read healthy (`$630E` identity, `RxCTL $0D85`,
-  `LineST $1294` LinkOK, `SelfST $00D6` INITD, `BusST $0018`). The wedge
-  survives a C64 reset, `reset(scope="machine")`, and re-running
-  bring-up; an explicit SelfCTL (`$0114`) bit-6 RESET plus re-init
-  cleared it. The builder writes SelfCTL low byte `$40`, reads SelfCTL
-  until bit 6 clears (at most `CS8900A_RESET_MAX_POLLS`, else `0x05` with
-  nothing programmed), then programs RxCTL, the Individual Address (with
-  `mac=`) and LineCTL in ip65's order. **The readiness probe is a transmit
-  afterwards**: a register read cannot tell the wedged chip from a healthy
-  one, but `build_tx_code` now answers `0x04` instead of hanging.
-  **Unmeasured on silicon**: neither the builder nor the bounded poll has
-  run on hardware yet.
-- **ip65 does not actually wait for RESET to clear** (read from source,
-  not measured). Its loop (`drivers/cs8900a.s:321-328`) is
+  `LineST $1294` LinkOK, `SelfST $00D6` INITD, `BusST $0018`), surviving a
+  C64 reset, `reset(scope="machine")`, and re-running bring-up; an explicit
+  SelfCTL (`$0114`) bit-6 RESET plus re-init cleared it. The builder writes
+  SelfCTL low byte `$40`, reads SelfCTL until bit 6 clears (at most
+  `CS8900A_RESET_MAX_POLLS`, else `0x05` with nothing programmed), then
+  programs RxCTL, the Individual Address (with `mac=`) and LineCTL in ip65's
+  order. **The readiness probe is a transmit afterwards**: a register read
+  cannot tell a starved chip from a healthy one, but `build_tx_code` answers
+  `0x04` instead of hanging.
+- **The "wedge" is the TX buffer starved by unread RX frames** (#303,
+  measured on the U64E fw 3.15 `bce4535e`, external RR-Net to en4,
+  2026-09-23; [evidence](https://github.com/JC-000/c64-test-harness/issues/303#issuecomment-5798261175)). RxCTL accepts broadcast, so frames
+  the host puts on the link sit unread in the chip's shared buffer, and
+  while they do `Rdy4TxNOW` does not assert. Paired n=6 at 1 MHz, TX 1514
+  B: three injected host frames gave `0x04` 5/6, none 0/6. Once starved it
+  persists: every retry stayed `0x04` (16/16) until the queue was drained
+  or the chip reset. `build_cs8900a_reset_code` cleared 10/10 starved chips
+  (5 at 1 MHz, 5 at 48 MHz) and the next two transmits reached en4 20/20;
+  the no-reset control stayed `0x04` 10/10. A SkipNow drain clears it
+  without a reset: `build_tx_code(..., drain_first=True)` (as on the ping
+  builders since #222; 40 bytes more, so past the 128-byte PUT threshold —
+  still zero attachments through `transport.write_memory`). A `0x04` run
+  costs about 1.02 s of `run_subroutine` wall time at 1 MHz (a bare `RTS`
+  0.11 s) and about 0.15 s at 48 MHz. ip65's `send` handles the same
+  condition differently: on a clear `Rdy4TxNOW` it SkipNows one received
+  frame and retries, up to 8 times (`drivers/cs8900a.s` `send`); the
+  harness's other TX builders do not, which is
+  [#487](https://github.com/JC-000/c64-test-harness/issues/487).
+- **ip65 does not actually wait for RESET to clear** (read from source).
+  Its loop (`drivers/cs8900a.s:321-328`) is
   `jsr packetpp_a1 / ldy ppdata / and #$40 / bne`: it loads SelfCTL into
   Y but tests A, which `packetpp_a1` leaves at `$14`, so it exits on the
-  first pass. What ip65 does that the harness did not is *reset at all*.
-  Whether real silicon reads bit 6 as set during reset — so whether the
-  harness's wait is ever non-zero — is not known.
+  first pass. On silicon that costs nothing: bit 6 reads clear on the
+  first poll after the RESET write (0 polls, 5/5, U64E, 1 MHz, #303) while
+  the reset does take effect (RxCTL `$0005` and LineCTL `$0013`, their
+  reset values, read afterwards), so the harness's wait is zero too.
 
 ### Warp mode and ip65 DHCP
 
