@@ -63,14 +63,18 @@ What the mutating tests touch:
   (a no-op only with no ``.crt`` selected; otherwise it detaches the
   cartridge and the ``finally`` re-selects it), and one per-category
   ``configs/<C64 and Cartridge Settings>:load_from_flash`` (the
-  flash-vs-RAM measurement; every item it changes is PUT back).
+  flash-vs-RAM measurement; afterwards every item of the category goes
+  back to its reported default, #469).
 * ``U64 Specific Settings`` — ``restore_state`` rewrites ``Turbo Control``,
   ``CPU Speed`` and ``Badline Timing`` there with their snapshotted values
   (``ultimate64_helpers.restore_state``), so that category sees same-value
   PUTs even though nothing in this module changes it.
 
-The stock cartridge category is snapshotted before any write and every
-mutating test ends by diffing the full category against that snapshot.
+The stock cartridge category is snapshotted before any write.  The
+``Cartridge`` smoke test and the ``set_reu`` round trip end by diffing the
+full category against that snapshot, because what they measure is that
+their own write moved nothing else; the two flash-reload tests end with
+every item at its reported default, the #334 baseline (#469).
 Never: ``save_config_to_flash``, ``reset``, ``reboot``, ``poweroff``.
 """
 from __future__ import annotations
@@ -163,6 +167,11 @@ def stock(client: Ultimate64Client) -> dict:
 
     Every mutating test diffs against this — a restore compared against a
     mid-session snapshot proves nothing.
+
+    Module-scoped, so order matters: the two flash-reload tests leave every
+    item at its **default** (#469), which is not this snapshot on a drifted
+    bench, so they are defined last and must run after the tests that diff
+    against it (pytest's file order; nothing here reorders tests).
     """
     return _category(client)
 
@@ -195,40 +204,58 @@ def _diff(before: dict, after: dict) -> dict:
     }
 
 
-def _restore_category_items(client, stock: dict, now: dict) -> None:
-    """PUT back every item in *now* that differs from *stock*; raise afterwards.
+def _category_defaults(client, items) -> tuple[dict, list[str]]:
+    """``{item: reported default}`` for *items*, plus one failure per item
+    whose default could not be read (bodyless GETs)."""
+    defaults: dict = {}
+    failures: list[str] = []
+    for item in items:
+        try:
+            default = client.get_config_item(CAT_CART, item).get("default")
+        except Ultimate64Error as exc:
+            failures.append(f"{item}: default not readable: {exc}")
+            continue
+        if default is None:
+            failures.append(f"{item}: reports no default")
+            continue
+        defaults[item] = default
+    return defaults, failures
+
+
+def _restore_category_items(client, now: dict) -> None:
+    """PUT every item in *now* that is off its reported default back to it.
 
     Used by the flash-reload tests, where ``restore_state`` alone is not
     enough (the reload also flips items the snapshot does not carry, e.g.
     ``Command Interface``, which ``set_emulation_flags`` really applies on
-    the device). Every PUT is attempted even if an earlier one is rejected
-    — the firmware answers 400 for ``value=""`` on some items — and the
-    failures are raised together at the end, so one bad item cannot leave
-    the rest un-restored.
+    the device).
 
-    ``Cartridge`` is the exception: it goes back to the item's reported
-    ``default``, never the snapshot, as in
-    ``test_cartridge_write_does_not_move_reu_size`` (#447) -- a ``.crt``
-    selected at entry is drift, not baseline.  The rest of the category
-    still restores to the snapshot (#469).
+    **The target is each item's reported ``default``, never the entry
+    snapshot (#469, the rule #447 applied to ``Cartridge``).**  ``C64 and
+    Cartridge Settings`` is a ``BASELINE_CATEGORIES`` member and every one of
+    its 19 items is a selector -- ``c64_config[]`` (1541ultimate
+    ``software/io/c64/c64.cc:72``: cartridge and ROM choices, bus modes and
+    sharing, REU enable/size/preload, fast reset, audio mapping, DMA ID,
+    command interface), the same item set at ``bce4535e`` (U64E) and
+    ``1.1.0`` (C64U); nothing in it is a detection result.  So the #334
+    baseline is ``current == default`` per item, and an entry value off its
+    default -- this bench's lanes leave ``REU Size`` at ``512 KB`` and
+    ``Command Interface`` Enabled against defaults ``2 MB`` / Disabled -- is
+    drift that a snapshot restore would put straight back.  The flash-vs-RAM
+    measurement does not depend on it: its assertions and recorded
+    properties are all taken before this runs, and ``_pick_ram_target``
+    still reads the entry value.
+
+    Only items off their default are written.  Every PUT is attempted even
+    if an earlier one is rejected -- the firmware answers 400 for
+    ``value=""`` on some items -- and an item whose default cannot be read
+    is reported rather than guessed at; the failures are raised together at
+    the end, so one bad item cannot leave the rest un-restored.
     """
-    failures: list[str] = []
-    targets = {
-        item: want
-        for item, (want, _got) in _diff(stock, now).items()
-        if item != _ITEM_CARTRIDGE
-    }
-    if _ITEM_CARTRIDGE in now:
-        try:
-            cart_default = client.get_config_item(CAT_CART, _ITEM_CARTRIDGE).get("default")
-        except Ultimate64Error as exc:
-            failures.append(f"{_ITEM_CARTRIDGE}: default not readable: {exc}")
-        else:
-            if cart_default is None:
-                failures.append(f"{_ITEM_CARTRIDGE}: reports no default")
-            elif now[_ITEM_CARTRIDGE] != cart_default:
-                targets[_ITEM_CARTRIDGE] = cart_default
-    for item, want in targets.items():
+    defaults, failures = _category_defaults(client, now)
+    for item, want in defaults.items():
+        if now[item] == want:
+            continue
         try:
             client.set_config_item(CAT_CART, item, want)
         except Ultimate64Error as exc:
@@ -240,18 +267,16 @@ def _restore_category_items(client, stock: dict, now: dict) -> None:
         )
 
 
-def _restore_residue(client, stock: dict, now: dict) -> dict:
-    """What :func:`_restore_category_items` failed to put back.
-
-    The snapshot for every item but ``Cartridge``, which is checked against
-    its reported ``default`` -- the target that function writes.
-    """
-    expected = dict(stock)
-    if _ITEM_CARTRIDGE in now:
-        expected[_ITEM_CARTRIDGE] = client.get_config_item(
-            CAT_CART, _ITEM_CARTRIDGE
-        ).get("default")
-    return _diff(expected, now)
+def _restore_residue(client, now: dict) -> dict:
+    """``{item: (default, current)}`` for every item still off its default --
+    what :func:`_restore_category_items` failed to put back."""
+    defaults, failures = _category_defaults(client, now)
+    assert not failures, failures
+    return {
+        item: (default, now[item])
+        for item, default in defaults.items()
+        if now[item] != default
+    }
 
 
 def _pick_ram_target(stock_size: str, default_size: str | None) -> str:
@@ -519,10 +544,11 @@ def test_flash_reload_moves_reu_size_without_a_config_write(
 
     Blast radius: the per-category form reloads only ``C64 and Cartridge
     Settings`` (``/v1/configs/<category>:load_from_flash``; live-verified
-    that ``U64 Specific Settings`` is untouched). Every item the reload
-    changed is PUT back from ``stock`` in the ``finally`` — ``restore_state``
-    alone is not enough here (live: flash also differed in ``Command
-    Interface``, which the snapshot does not carry).
+    that ``U64 Specific Settings`` is untouched). Every item of the category
+    goes back to its reported default in the ``finally``
+    (``_restore_category_items``, #469) — ``restore_state`` alone is not
+    enough here (live: flash also differed in ``Command Interface``, which
+    the snapshot does not carry).
     """
     reu_item = _item(client, _ITEM_REU_SIZE)
     default_size = reu_item.get("default")
@@ -557,14 +583,14 @@ def test_flash_reload_moves_reu_size_without_a_config_write(
         )
         assert flash_size in reu_item["values"]
     finally:
-        # Put back every item the reload (or our PUT) changed, from the
-        # pre-write snapshot — not just the REU pair.
-        _restore_category_items(client, stock, _category(client))
+        # Put every item of the category -- not just the REU pair, and not
+        # only the ones the reload or our PUT moved -- back to its default.
+        _restore_category_items(client, _category(client))
 
     restored, cfg_restored = _observe(client, "after full-category restore")
-    assert cfg_restored[1] == stock[_ITEM_REU_SIZE]
-    residue = _restore_residue(client, stock, restored)
-    assert residue == {}, f"category differs from its restore targets: {residue!r}"
+    assert cfg_restored[1] == default_size
+    residue = _restore_residue(client, restored)
+    assert residue == {}, f"category items off their default: {residue!r}"
 
 
 @requires_mutate
@@ -598,10 +624,10 @@ def test_flash_holds_the_item_default_reu_size(
         flash_size = cfg_after[1]
         record_property("reu_size_flash", flash_size)
     finally:
-        _restore_category_items(client, stock, _category(client))
+        _restore_category_items(client, _category(client))
 
-    residue = _restore_residue(client, stock, _category(client))
-    assert residue == {}, f"category differs from its restore targets: {residue!r}"
+    residue = _restore_residue(client, _category(client))
+    assert residue == {}, f"category items off their default: {residue!r}"
     if flash_size != default_size:
         pytest.xfail(
             f"bench-state changed: flash holds REU Size {flash_size!r}, not the "
