@@ -258,10 +258,12 @@ def run_one_speed(
     client.run_prg(prg_data)
     time.sleep(2.0)
 
-    # 3. Verify program actually started by polling main_loop for its own
-    #    JMP main_loop (not just screen text, which can be stale from a
-    #    previous run)
-    print("  Waiting for program init ...", flush=True)
+    # 3. Wait until main_loop reads JMP main_loop. That instruction is in
+    #    the static image, so a match proves this build's image landed, not
+    #    that init has finished. Ordering after init comes from step 7: the
+    #    redirect is written over main_loop, which the 6510 only reaches
+    #    once init falls through to it.
+    print("  Waiting for the PRG image ...", flush=True)
     parked = _self_jmp_bytes(main_loop)
     ml = b""
     boot_deadline = time.monotonic() + 120.0
@@ -271,9 +273,9 @@ def run_one_speed(
             break
         time.sleep(0.5)
     else:
-        print(f"  ERROR: Program did not start (main_loop={ml.hex()}). Skipping.")
+        print(f"  ERROR: PRG image not at main_loop (read {ml.hex()}). Skipping.")
         return None
-    time.sleep(1.0)  # settle after init
+    time.sleep(1.0)  # settle; the step-7 redirect, not this, orders us after init
 
     print("  Setting up benchmark ...", flush=True)
 

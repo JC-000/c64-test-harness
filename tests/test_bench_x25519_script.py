@@ -142,11 +142,13 @@ def test_run_one_speed_rejects_the_stale_literal(
 # The pre-upload derivation check
 # ---------------------------------------------------------------------------
 
-def test_check_main_loop_accepts_the_build(tmp_path: Path) -> None:
+@pytest.mark.parametrize("main_loop", [0x082D, _LOAD])
+def test_check_main_loop_accepts_the_build(tmp_path: Path, main_loop: int) -> None:
+    """``_LOAD`` is the image's first byte: offset 0 is inside, not outside."""
     module = _load()
-    prg = _write_build(tmp_path)
+    prg = _write_build(tmp_path, main_loop=main_loop)
 
-    assert module._check_main_loop(prg.read_bytes(), 0x082D) is None
+    assert module._check_main_loop(prg.read_bytes(), main_loop) is None
 
 
 def test_check_main_loop_rejects_a_non_park_instruction(tmp_path: Path) -> None:
