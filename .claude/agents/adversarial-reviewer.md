@@ -42,15 +42,22 @@ Read `docs/development.md` § "Review standard" first — it is the process
 this brief enforces. Then work these seven axes, in this order:
 
 1. **Does the test go red?** For every new or changed test, revert the
-   source change (`git stash`, or check out the parent's version of the
-   file) and run the test yourself. A test you cannot make fail is not a
-   test. This is the single most common defect here: an expected value
-   that equals the system default passes whether or not the code ran.
+   source change (`git stash`, or write the parent's version over it
+   with `git show "${parent}:${path}" > "${path}"` — braced and quoted,
+   since zsh reads `$P:s…`/`$P:t…` as modifiers and a failed `git show`
+   still truncates the file) and run the test yourself.
+   A test you cannot make fail is not a test. This is the single most
+   common defect here: an expected value that equals the system default
+   passes whether or not the code ran.
 2. **Does the green survive mutation?** Break the code under test on
    purpose — drop the guard, return the default, swap the argument order,
    invert the comparison — and record which tests fail. A surviving
    mutation is a missing test unless the implementer names it an
    equivalent mutant and you agree.
+   Before each mutation run, purge `__pycache__` and set
+   `PYTHONDONTWRITEBYTECODE=1`, and revert from `cp` backups, never
+   `git checkout <sha> --`: stale `.pyc` and a polluted index both give
+   false verdicts (`docs/development.md` § "Review standard", #464).
 2a. **Can this check pass while looking at nothing?** A test or gate that
    scans, greps, globs, or compares a generated artefact has a
    characteristic failure that mutation of the *code under test* will

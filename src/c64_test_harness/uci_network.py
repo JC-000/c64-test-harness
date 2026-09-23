@@ -44,6 +44,7 @@ from ._address import refuses_bool_address_args
 import logging
 import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -2080,6 +2081,39 @@ def _check_uci_identifier(transport: C64Transport) -> None:
     raise UCIInterfaceAbsentError(identifier, preference)
 
 
+#: What a routine at ``$C000`` writes by default: the reply at
+#: :data:`_RESP_ADDR`, the status at :data:`_STATUS_ADDR`, the length words,
+#: the sentinel and the error flag -- ``$C200-$C3FF``, inclusive.
+_DEFAULT_OUTPUT_SPANS: tuple[tuple[int, int], ...] = ((_RESP_ADDR, _ERROR_ADDR),)
+
+
+def _check_routine_clear_of(
+    code_addr: int,
+    length: int,
+    spans: Sequence[tuple[int, int]],
+    flags: Sequence[tuple[str, int]] = (),
+) -> None:
+    """Raise ``ValueError`` if ``[code_addr, code_addr + length)`` overlaps any
+    inclusive ``(first, last)`` span in *spans*, or any ``(name, address)``
+    single byte in *flags*."""
+    end = code_addr + length
+    labelled: list[tuple[int, int, str]] = []
+    for first, last in spans:
+        if first > last:
+            raise ValueError(f"output span ${first:04X}-${last:04X} is reversed")
+        if (first, last) == _DEFAULT_OUTPUT_SPANS[0]:
+            label = f"the reply area ${first:04X}-${last:04X}"
+        else:
+            label = f"the output span ${first:04X}-${last:04X}"
+        labelled.append((first, last, label))
+    labelled.extend((addr, addr, f"{name} at ${addr:04X}") for name, addr in flags)
+    for first, last, label in labelled:
+        if code_addr <= last and first < end:
+            raise ValueError(
+                f"{length}-byte routine at ${code_addr:04X} overlaps {label}"
+            )
+
+
 def _execute_uci_routine(
     transport: C64Transport,
     code: bytes,
@@ -2089,6 +2123,7 @@ def _execute_uci_routine(
     timeout: float = _DEFAULT_TIMEOUT,
     *,
     check_identifier: bool = True,
+    output_spans: Sequence[tuple[int, int]] = _DEFAULT_OUTPUT_SPANS,
 ) -> None:
     """Inject and execute a UCI routine on the U64.
 
@@ -2145,7 +2180,17 @@ def _execute_uci_routine(
     enable-and-reset site to hang it on. ``check_identifier=False`` skips it
     -- :func:`uci_probe` does, because reporting the identifier is its job.
 
+    **The routine must not overlap what it writes.**  *output_spans* are
+    inclusive ``(first, last)`` address pairs; the default is the whole
+    ``$C200-$C3FF`` reply area (reply, status, length words, sentinel, error
+    flag).  A routine that writes elsewhere -- #420's multi-block read, which
+    runs to ``$C26B`` and uses the status page and its own buffer -- passes
+    its real spans.  *sentinel_addr* and *error_addr* are checked whatever
+    the spans, because the host clears and polls them.
+
     Raises:
+        ValueError: The routine overlaps an output span, the sentinel or the
+            error flag, before any write.
         UCIInterfaceAbsentError: On an Ultimate transport whose ``$DF1D``
             does not read ``$C9``, before any write (see above).
         UCIError: If the error flag is set after execution (no reset: the
@@ -2157,16 +2202,14 @@ def _execute_uci_routine(
     """
     from .transport import TimeoutError
 
-    # The routine's working area is $C200-$C3FF: the reply at _RESP_ADDR, the
-    # status at _STATUS_ADDR, the length words, the sentinel and the error
-    # flag.  Code anywhere in it would be overwritten mid-run by the reply it
-    # is reading or by the flags the host clears and waits on.  The largest
-    # turbo routine's last byte is $C1FC since #419, a margin of three bytes.
-    if code_addr < _ERROR_ADDR + 1 and _RESP_ADDR < code_addr + len(code):
-        raise ValueError(
-            f"{len(code)}-byte routine at ${code_addr:04X} overlaps the reply "
-            f"area ${_RESP_ADDR:04X}-${_ERROR_ADDR:04X}"
-        )
+    # Code that overlaps what the routine writes -- or the sentinel and error
+    # flag the host clears and polls -- is overwritten mid-run.  The default
+    # span is the whole $C200-$C3FF reply area; the largest turbo routine's
+    # last byte is $C1FC since #419, a margin of three bytes.
+    _check_routine_clear_of(
+        code_addr, len(code), output_spans,
+        flags=(("the sentinel", sentinel_addr), ("the error flag", error_addr)),
+    )
 
     # The slot must be on the bus before anything is written or typed (#359).
     if check_identifier:
