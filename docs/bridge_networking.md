@@ -1041,7 +1041,7 @@ Result bytes the TX builders can now store:
   (`tx_frame_len`, `arp_frame_len`) raise `ValueError` for anything above
   `CS8900A_TX_MAX_FRAME_LEN` = 1514 (an Ethernet frame without CRC) and for
   odd lengths — always for the ping builders, and for `build_tx_code`
-  unless it is passed `allow_odd_frame_len=True` (next item). The measured
+  unless it is passed `allow_odd_frame_len=True` (next item). The other
   route for an odd frame is to pad it by one byte (the IP total-length
   field governs the datagram). Since #404 a frame above 256 bytes is copied in whole pages
   (`X` counts pages, `INC $FC` advances the pointer, as ip65's `send`
@@ -1073,19 +1073,30 @@ Result bytes the TX builders can now store:
   read from `frame_buf + frame_len` fills the last word — what ip65's `send`
   does via `adjustcnt` (`drivers/cs8900a.s:449`, `:523-531`; source-read).
   That byte is whatever RAM follows the frame buffer, and it is written into
-  the chip's TX buffer; whether the chip then keeps it off the wire is part
-  of the unmeasured chip side below.
+  the chip's TX buffer; the chip keeps it off the wire (measured, below).
   The emitted loop then always compares `Y` against an even count, which is
   the #238 hang removed at its mechanism, and that much is checkable without
   a chip: `tests/test_cs8900a_tx_bound.py` runs nine odd lengths on the
   simulated chip and pins TxLength, every copied byte, the single pad byte,
-  and `ceil(n/2)` words exactly. **What is not established is the chip's
-  side**: no CS8900a has transmitted an odd TxLength with a padded final
-  word, so the paired silicon check #438 asks for (en4 `Ipkts`/`Ibytes`
-  deltas, as in #404's window) is still owed, and the caller-facing default
-  stays the refusal until it is run. Evidence grade: source-read (ip65) plus
-  simulated-chip pins; unmeasured on silicon. For an even length the flag
-  changes nothing — the emitted bytes are identical, pinned per length.
+  and `ceil(n/2)` words exactly. **Measured on silicon** (U64E fw 3.15
+  `bce4535e`, external RR-Net point-to-point to en4, 1 MHz, 2026-09-23;
+  ip65 `pingstatic` control passed 3/3 earlier the same day, recorded on
+  #438; [#438's evidence
+  comment](https://github.com/JC-000/c64-test-harness/issues/438#issuecomment-5798081221)): odd lengths 61, 101, 255, 257, 511 and 1513,
+  paired and interleaved with even controls (62, 100, 254, 258, 512, 1514)
+  and a control that sends the odd frame as `frame_len + 1`, with a marker
+  byte at `frame_buf + frame_len`. Each frame was checked by host BPF
+  capture on en4 and `netstat -I en4 -b` deltas. 54 of 60 odd transmits
+  arrived with capture length and `Ibytes` delta equal to the true
+  length, a byte-exact body and no marker (the other 6 stored `0x04`,
+  below); 55 of 60 even controls likewise; the `frame_len + 1` control put the marker on the wire 48/48,
+  so the instrument sees a leaked pad byte. No FIFO desync on the frame
+  after an odd one. The `0x04` results over the 4 sessions (6 odd, 5
+  even, 5 padded) hit every arm alike and are attributed to RX-buffer
+  starvation (#303), not the odd path; one padded transmit stored `0x01`
+  and arrived as nothing (cause not established). The default stays the
+  refusal by owner decision on #438. For an even length the flag changes
+  nothing — the emitted bytes are identical, pinned per length.
 - **The chip can be reset: `build_cs8900a_reset_code`**
   ([#234](https://github.com/JC-000/c64-test-harness/issues/234)).
   Measured: `Rdy4TxNOW` dead across 65,536 polls while every register the

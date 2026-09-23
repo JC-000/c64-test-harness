@@ -469,8 +469,8 @@ def test_the_odd_opt_in_changes_nothing_for_an_even_length(n: int) -> None:
 
 @pytest.mark.parametrize("n", [3, 61, 257, 1513])
 def test_an_odd_length_is_still_refused_without_the_opt_in(n: int) -> None:
-    """The padded copy is pinned on the simulated chip only -- no silicon has
-    transmitted an odd TxLength under it -- so the default stays a refusal."""
+    """The default stays a refusal (owner decision on #438), though the padded
+    copy is measured on silicon."""
     with pytest.raises(ValueError, match=r"pad an odd frame by one byte"):
         bp.build_tx_code(LOAD, TX_BUF, n, RESULT)
 
