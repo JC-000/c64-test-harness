@@ -77,6 +77,7 @@ from c64_test_harness.uci_network import (
     uci_tcp_connect,
     uci_socket_read,
     SOCKET_READ_MAX_BYTES,
+    NET_MAX_SOCKET_READ,
     uci_socket_write,
     uci_socket_close,
     # UCI config helpers
@@ -680,11 +681,12 @@ class TestUciSocketRead:
         t = _make_mock_transport(resp_data=b"", framed=True)
         assert uci_socket_read(t, 1, 16, timeout=1.0) == b""
 
-    def test_max_len_above_the_cap_is_rejected(self) -> None:
-        """Header + payload must stay inside the 8-bit drain index."""
+    def test_max_len_above_the_firmware_ceiling_is_rejected(self) -> None:
+        """Above 253 the multi-block routine takes over (#420); the refusal
+        is now the firmware's own READ_SOCKET ceiling."""
         t = _make_mock_transport(framed=True)
         with pytest.raises(ValueError):
-            uci_socket_read(t, 1, SOCKET_READ_MAX_BYTES + 1, timeout=1.0)
+            uci_socket_read(t, 1, NET_MAX_SOCKET_READ + 1, timeout=1.0)
 
     def test_max_len_at_the_cap_is_accepted(self) -> None:
         t = _make_mock_transport(resp_data=b"x" * 8, framed=True)

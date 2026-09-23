@@ -8,10 +8,14 @@ version string whether or not it carries them.
 Gated by ``U64_HOST`` like the other live suites, so they skip cleanly until
 a device is deliberately pointed at.
 
-Everything here is **read-only** except the tests in ``TestSocketLifetime``
-(run on the U64E at bce4535e, 2026-09-23), which enable the Command
-Interface and reset the C64.  They also skip without ``U64_ALLOW_MUTATE``: stricter
-than the contract, which covers config changes only (#333).
+Everything here is **read-only** except two classes.  ``TestSocketLifetime``
+(run on the U64E at bce4535e, 2026-09-23) enables the Command Interface and
+resets the C64; it also skips without ``U64_ALLOW_MUTATE``: stricter than the
+contract, which covers config changes only (#333).  ``TestSocketReadCeiling``
+runs UCI routines -- RAM writes through ``transport.write_memory`` and a typed
+``SYS`` -- which #333 allows on ``U64_HOST`` alone.  It writes no config: it
+skips unless ``Command Interface`` is already Enabled, and it runs only on a
+post-safe Ultimate-line device (the U64E), never the C64U.
 
 What each probe distinguishes
 -----------------------------
@@ -35,6 +39,8 @@ Feed a confirmed probe back into the capability set rather than re-probing::
 from __future__ import annotations
 
 import os
+import socket
+import time
 
 import pytest
 
@@ -43,6 +49,24 @@ from c64_test_harness.backends.u64_capabilities import DeviceCapabilities
 from c64_test_harness.backends.ultimate64_client import (
     Ultimate64Client,
     Ultimate64Error,
+)
+from c64_test_harness.backends.ultimate64 import Ultimate64Transport
+from c64_test_harness.backends.ultimate64_helpers import (
+    restore_speed_defaults,
+    set_turbo_mhz,
+)
+from c64_test_harness.uci_network import (
+    NET_MAX_SOCKET_READ,
+    _DATA_ADDR,
+    _RESP_LEN_ADDR,
+    _execute_uci_routine,
+    _read_status_string,
+    build_socket_read,
+    get_uci_enabled,
+    uci_socket_close,
+    uci_socket_read,
+    uci_socket_write,
+    uci_udp_connect,
 )
 from live_fixture_teardown import raise_teardown_failures, teardown_then_release
 
@@ -129,34 +153,119 @@ class TestSocketReadCeiling:
     """3.15 raised the accepted read length to 1472 and split the reply.
 
     Before #802 a ``READ_SOCKET`` for more than one reply block's worth was
-    not answerable; after it, the payload comes back over Data More blocks
-    with the *total* length in the first block's header.
-
-    The harness drain is still single-block and 8-bit indexed
-    (``SOCKET_READ_MAX_BYTES`` = 253), so this suite only establishes what
-    the firmware accepts. Draining the continuation blocks is the follow-up
-    work; until it lands, ``uci_socket_read`` logs a warning and returns the
-    first block when the header reports more than arrived.
+    refused; after it, the payload comes back over Data More blocks with the
+    *total* length in the first block's header.  ``uci_socket_read`` drains
+    those blocks above 253 bytes (#420); these two tests are its device
+    check.  U64E only: see the module docstring.
     """
 
-    @pytest.mark.skip(
-        reason="needs the 16-bit multi-block drain; see audit finding #4"
-    )
-    def test_read_socket_accepts_a_length_above_one_block(self) -> None:
-        raise NotImplementedError(
-            "Open a UDP socket, send a datagram larger than "
-            "NET_FIRST_BLOCK_PAYLOAD (893), request it in one READ_SOCKET, "
-            "and assert the concatenated blocks equal the datagram."
-        )
+    @pytest.fixture
+    def uci(self, client: Ultimate64Client) -> Ultimate64Transport:
+        caps = client.capabilities
+        if caps.generation != "ultimate" or not caps.writemem_post_safe:
+            pytest.skip(
+                f"U64E only: {caps.generation} fw {caps.firmware_version} is "
+                "not a post-safe Ultimate-line device"
+            )
+        if not get_uci_enabled(client):
+            pytest.skip(
+                "Command Interface is Disabled; this suite writes no config "
+                "-- enable it deliberately first"
+            )
+        return Ultimate64Transport(host=_HOST or "", client=client)
 
-    @pytest.mark.skip(
-        reason="needs the 16-bit multi-block drain; see audit finding #4"
+    @pytest.mark.parametrize("size", [100, 253, 894, NET_MAX_SOCKET_READ])
+    def test_read_socket_accepts_a_length_above_one_block(
+        self, uci: Ultimate64Transport, size: int
+    ) -> None:
+        """A datagram of *size* comes back whole through ``uci_socket_read``.
+
+        100 and 253 take the single-block routine (the regression control);
+        894 is one byte into a continuation block and 1472 two blocks
+        (893 + 579).  Assumes a 1500-byte MTU on every hop between host and
+        device (1472 is the largest unfragmented IPv4 UDP payload), and a C64
+        at 1 MHz with Turbo Control Off -- the bench baseline -- since the
+        routine is the plain one, not ``turbo_safe``.
+        """
+        datagram = _pattern(size)
+        assert _round_trip(uci, datagram, size, turbo_safe=False) == datagram
+
+    @pytest.mark.skipif(
+        not _ALLOW_MUTATE,
+        reason="U64_ALLOW_MUTATE not set -- this test changes CPU speed",
     )
-    def test_oversized_read_is_rejected_not_truncated(self) -> None:
-        raise NotImplementedError(
-            "A READ_SOCKET length above NET_MAX_SOCKET_READ (1472) must draw "
-            "the param-out-of-range status, not a silently clamped read."
-        )
+    def test_a_1472_byte_read_at_48_mhz_with_turbo_safe(
+        self, uci: Ultimate64Transport, client: Ultimate64Client
+    ) -> None:
+        """The fenced multi-block routine at 48 MHz (#479 finding 3 is the
+        1 MHz timeout; this is the speed the fence exists for).  Writes
+        ``Turbo Control`` / ``CPU Speed`` and puts both back to the device's
+        defaults afterwards.  Same MTU assumption as above."""
+        datagram = _pattern(NET_MAX_SOCKET_READ)
+        set_turbo_mhz(client, 48)
+        try:
+            time.sleep(0.3)
+            got = _round_trip(uci, datagram, NET_MAX_SOCKET_READ, turbo_safe=True)
+        finally:
+            restore_speed_defaults(client)
+        assert got == datagram
+
+    def test_the_firmware_refuses_a_read_above_its_ceiling(
+        self, uci: Ultimate64Transport
+    ) -> None:
+        """1473 draws ``82,PARAMETER(S) OUT OF RANGE`` and an empty reply.
+
+        ``uci_socket_read`` refuses 1473 before touching the device, so this
+        drives the routine directly.
+        """
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect((_HOST, 80))
+            host_ip = probe.getsockname()[0]
+        sid = uci_udp_connect(uci, host_ip, 9)
+        try:
+            uci.write_memory(_DATA_ADDR, bytes([sid]))
+            code = build_socket_read(
+                _DATA_ADDR, max_len=NET_MAX_SOCKET_READ + 1, multi_block=True,
+            )
+            _execute_uci_routine(uci, code)
+            drained = uci.read_memory(_RESP_LEN_ADDR, 2)
+            status = _read_status_string(uci)
+        finally:
+            uci_socket_close(uci, sid)
+        assert status.startswith("82"), status
+        assert drained[0] | (drained[1] << 8) == 0
+
+
+def _pattern(n: int) -> bytes:
+    return bytes((i * 7 + 3) & 0xFF for i in range(n))
+
+
+def _round_trip(uci: Ultimate64Transport, datagram: bytes, max_len: int, *,
+                turbo_safe: bool) -> bytes:
+    """Send *datagram* from the host to a UCI UDP socket and read it back.
+
+    The C64 writes one small datagram first, so the host learns which port
+    to answer; the reply is then read with one ``uci_socket_read``.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        probe.connect((_HOST, 80))
+        host_ip = probe.getsockname()[0]
+    listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    listener.bind(("", 0))
+    listener.settimeout(5.0)
+    sid = None
+    try:
+        sid = uci_udp_connect(uci, host_ip, listener.getsockname()[1],
+                              turbo_safe=turbo_safe)
+        uci_socket_write(uci, sid, b"hello", turbo_safe=turbo_safe)
+        _, c64_addr = listener.recvfrom(64)
+        listener.sendto(datagram, c64_addr)
+        time.sleep(0.5)
+        return uci_socket_read(uci, sid, max_len, turbo_safe=turbo_safe)
+    finally:
+        if sid is not None:
+            uci_socket_close(uci, sid, turbo_safe=turbo_safe)
+        listener.close()
 
 
 # ----------------------------------------- UCI socket lifetime (#808)
