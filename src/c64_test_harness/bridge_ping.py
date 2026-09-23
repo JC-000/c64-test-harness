@@ -734,10 +734,9 @@ def _check_tx_frame_len(
 
     ``allow_odd`` accepts an odd length for the padded copy of issue #438
     (TxLength the true length, ``ceil(frame_len / 2)`` words copied, as
-    ip65's ``send`` does via ``adjustcnt``).  It stays **off** by default:
-    the padded loop is pinned on the simulated chip only, and no silicon
-    has transmitted an odd TxLength under it.  The range is checked either
-    way.  ``offer_odd_opt_in`` names ``allow_odd_frame_len`` in the error;
+    ip65's ``send`` does via ``adjustcnt``).  It stays **off** by default
+    (owner decision on #438); the padded copy is measured on silicon, see
+    :func:`build_tx_code`.  The range is checked either way.  ``offer_odd_opt_in`` names ``allow_odd_frame_len`` in the error;
     only a caller that takes that argument (:func:`build_tx_code`) sets it.
     """
     if isinstance(frame_len, bool) or not isinstance(frame_len, int) \
@@ -748,8 +747,8 @@ def _check_tx_frame_len(
             ": the TX copy loop copies two bytes at a time, so an odd length "
             "hangs the 6510 after one frame (issue #238) -- pad an odd frame "
             "by one byte, the IP total-length field governs the datagram"
-            + (", or pass allow_odd_frame_len=True for the unmeasured padded "
-               "copy (issue #438)" if offer_odd_opt_in else "")
+            + (", or pass allow_odd_frame_len=True for the padded copy "
+               "(issue #438)" if offer_odd_opt_in else "")
             + " --"
         )
         raise ValueError(
@@ -1016,11 +1015,10 @@ def _emit_tx_frame(
     1``, so the last word carries one pad byte read from ``frame_buf +
     frame_len`` -- the caller's buffer must have that byte, exactly as
     ip65's ``send`` requires after ``adjustcnt``.  Whatever RAM follows the
-    frame is written into the chip's TX buffer as that pad byte; whether the
-    chip keeps it off the wire is unmeasured.  It is **off by default**:
-    the padded loop is pinned on the simulated chip only, and no silicon has
-    transmitted an odd TxLength under it.  For an even length the flag
-    changes nothing, in the emitted bytes or anywhere else.
+    frame is written into the chip's TX buffer as that pad byte, and the
+    chip keeps it off the wire (measured, see :func:`build_tx_code`).  It
+    is **off by default** (owner decision on #438).  For an even length the
+    flag changes nothing, in the emitted bytes or anywhere else.
     """
     _check_tx_frame_len(frame_len, what, allow_odd=allow_odd_frame_len,
                         offer_odd_opt_in=offer_odd_opt_in)
@@ -1120,14 +1118,17 @@ def build_tx_code(
     ``allow_odd_frame_len=True`` accepts an odd length and copies it ip65's
     way: TxLength is the true length and one pad byte, read from
     ``frame_buf + frame_len``, fills the last word (issue #438); that byte
-    is whatever RAM follows the frame, written into the chip's TX buffer,
-    and whether the chip keeps it off the wire is unmeasured.  **Use it
-    knowing what is not established**: that path is pinned on the simulated
-    chip, and no CS8900a has transmitted an odd TxLength under it -- the
-    paired silicon check #438 asks for has not been run.  The default is the
-    refusal, and padding the frame by one byte (the IP total-length field
-    governs the datagram) remains the measured route.  The flag is on this
-    builder only; the ping builders do not take it.
+    is whatever RAM follows the frame, written into the chip's TX buffer.
+    Measured on silicon (U64E fw 3.15 ``bce4535e``, external RR-Net to the
+    host's en4, 1 MHz, 2026-09-23): 54 odd frames of 61..1513 bytes, paired
+    and interleaved with 55 even controls, all arrived with the true length
+    (en4 capture and ``Ibytes`` delta both equal ``frame_len``), a
+    byte-exact body and the pad byte absent; a control that sent the same
+    odd frames as ``frame_len + 1`` put the pad byte on the wire every time
+    (48/48), so the capture could see it.  Evidence: https://github.com/JC-000/c64-test-harness/issues/438#issuecomment-5798081221.
+    The default stays the refusal (owner decision on #438); padding the frame
+    by one byte (the IP total-length field governs the datagram) works too.
+    The flag is on this builder only; the ping builders do not take it.
 
     Stores one byte at ``result_addr``:
 
