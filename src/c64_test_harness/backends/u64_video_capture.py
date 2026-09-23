@@ -145,7 +145,10 @@ class VideoCaptureResult:
     #: (which starts at 0 on every ``stream_video_start``), and it is
     #: applied; anything else, or the end of the capture, makes it tail.
     #: The frame the stop cut short never gets its end marker and is
-    #: counted in :attr:`frames_dropped`.
+    #: counted in :attr:`frames_dropped`.  Only sequence 1 readmits, by
+    #: choice: a restart whose sequence 1 is lost has its first datagram
+    #: taken as tail, and that loss shows only in :attr:`frames_dropped`,
+    #: with :attr:`packets_dropped` 0.
     stop_tail_packets: int = 0
 
 
@@ -235,6 +238,7 @@ class VideoCapture:
         self._payloads_discarded = 0
         self._stale_packets = 0
         self._stop_tail_packets = 0
+        self._seen_end_marker = False
         # An all-zero-header datagram waiting on the next one (#452).
         self._pending_zero: tuple[int, int, tuple] | None = None
         self._frames_dropped = 0
@@ -261,6 +265,7 @@ class VideoCapture:
         self._payloads_discarded = 0
         self._stale_packets = 0
         self._stop_tail_packets = 0
+        self._seen_end_marker = False
         self._pending_zero = None
         self._frames_dropped = 0
         self._last_seq = None
@@ -302,9 +307,11 @@ class VideoCapture:
 
         *ended*: the frame's end-marker datagram arrived.  Every interior
         frame carried exactly one, on its last datagram (174/174 frames,
-        U64E bce4535e, 2026-09-22), so a frame finalised without it lost its
-        tail -- to a frame-number change or the end of the capture -- and is
-        counted dropped rather than emitted short (#452).
+        U64E bce4535e, 2026-09-22), so once this capture has seen a marker,
+        a frame finalised without one lost its tail -- to a frame-number
+        change or the end of the capture -- and is counted dropped rather
+        than emitted short (#452).  That rests on one firmware build, so a
+        capture that has seen no marker at all emits such frames as before.
         """
         if self._cur_frame_num is None or not self._cur_frame_lines:
             return
@@ -325,7 +332,7 @@ class VideoCapture:
                 missing += 1
                 rows.append(b"\x00" * expected_row_len)
 
-        if missing > 0 or not ended:
+        if missing > 0 or (not ended and self._seen_end_marker):
             self._frames_dropped += 1
             _log.debug(
                 "Frame %d incomplete: %d/%d lines missing",
@@ -481,6 +488,7 @@ class VideoCapture:
 
         # Frame-end marker: finalize immediately
         if frame_end:
+            self._seen_end_marker = True
             self._finalize_frame(ended=True)
             self._cur_frame_num = None
 

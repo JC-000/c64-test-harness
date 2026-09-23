@@ -460,3 +460,75 @@ class TestStreamStopAndRestart:
         ])
         assert [(f.frame_number, f.height) for f in result.frames] == [(0, 4)]
         assert result.frames_dropped == 1
+
+    def test_a_stream_without_end_markers_still_yields_frames(self) -> None:
+        """Only the U64E's 174/174 says every frame carries a marker; a
+        device that sends none must still produce frames (as before #452)."""
+        result = _capture([
+            _build_video_packet(seq=0, frame_num=0, line_num=0, fill=0x11),
+            _build_video_packet(seq=1, frame_num=0, line_num=4, fill=0x22),
+            _build_video_packet(seq=2, frame_num=1, line_num=0, fill=0x33),
+            _build_video_packet(seq=3, frame_num=1, line_num=4, fill=0x44),
+        ])
+        assert [(f.frame_number, f.height) for f in result.frames] == [
+            (0, 8), (1, 8)
+        ]
+        assert result.frames_dropped == 0
+
+    def test_a_wrapped_seq_0_on_a_nonzero_frame_is_applied(self) -> None:
+        """Sequence 0 after a wrap, frame 8, line 0: not a stop tail."""
+        result = _capture([
+            _build_video_packet(
+                seq=65534, frame_num=7, line_num=0, frame_end=True, fill=0x11
+            ),
+            _build_video_packet(seq=0, frame_num=8, line_num=0, fill=0x22),
+            # seq 1 lost, so seq 2 cannot readmit anything held.
+            _build_video_packet(
+                seq=2, frame_num=8, line_num=4, frame_end=True, fill=0x33
+            ),
+        ])
+        assert result.stop_tail_packets == 0
+        assert [(f.frame_number, f.height) for f in result.frames] == [
+            (7, 4), (8, 8)
+        ]
+        assert result.frames[1].row(0) == bytes([2]) * 384
+
+    def test_a_wrapped_seq_0_on_a_nonzero_line_is_applied(self) -> None:
+        """Sequence 0 after a wrap, frame 0, line 4: not a stop tail."""
+        result = _capture([
+            _build_video_packet(
+                seq=65534, frame_num=65535, line_num=0, frame_end=True,
+                fill=0x11,
+            ),
+            _build_video_packet(seq=65535, frame_num=0, line_num=0, fill=0x22),
+            _build_video_packet(seq=0, frame_num=0, line_num=4, fill=0x33),
+            _build_video_packet(
+                seq=2, frame_num=0, line_num=8, frame_end=True, fill=0x44
+            ),
+        ])
+        assert result.stop_tail_packets == 0
+        assert [(f.frame_number, f.height) for f in result.frames] == [
+            (65535, 4), (0, 12)
+        ]
+        assert result.frames[1].row(4) == bytes([3]) * 384
+
+    def test_a_restart_that_loses_its_seq_1_shows_only_as_a_dropped_frame(
+        self,
+    ) -> None:
+        """Deliberate: only sequence 1 readmits a held all-zero datagram, so
+        a restart whose seq 1 is lost has its first datagram taken as stop
+        tail, and the loss shows in ``frames_dropped`` alone."""
+        result = _capture([
+            _build_video_packet(seq=0, frame_num=0, line_num=0, fill=0x11),
+            _build_video_packet(
+                seq=1, frame_num=0, line_num=4, frame_end=True, fill=0x22
+            ),
+            _zero_header(0x33),  # restart; its seq 1 never arrives
+            _build_video_packet(
+                seq=2, frame_num=0, line_num=8, frame_end=True, fill=0x44
+            ),
+        ])
+        assert result.stop_tail_packets == 1
+        assert result.packets_dropped == 0
+        assert result.frames_dropped == 1
+        assert [(f.frame_number, f.height) for f in result.frames] == [(0, 8)]
