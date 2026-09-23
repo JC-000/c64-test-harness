@@ -33,6 +33,8 @@ DEFAULTS = {
     "RAM Expansion Unit": "Disabled",
     "Command Interface": "Disabled",
     "Fast Reset": "Disabled",
+    "Kernal ROM": "kernal.bin",       # string default (STRFUNC)
+    "DMA Load Mimics ID:": 8,         # integer default (CFG_TYPE_VALUE)
 }
 
 
@@ -132,10 +134,37 @@ def test_restore_is_a_no_op_when_everything_is_at_its_default():
     assert client.calls == []
 
 
+def test_string_and_integer_defaults_are_restored():
+    """A ROM file name and the integer ``DMA Load Mimics ID:`` go back too."""
+    client = _FakeClient()
+    live._restore_category_items(
+        client, {"Kernal ROM": "custom.bin", "DMA Load Mimics ID:": 12}
+    )
+    assert client.calls == [
+        (live.CAT_CART, "Kernal ROM", "kernal.bin"),
+        (live.CAT_CART, "DMA Load Mimics ID:", 8),
+    ]
+
+
 def test_the_residue_is_what_is_still_off_its_default():
     client = _FakeClient()
-    now = {"REU Size": "2 MB", "Fast Reset": "Enabled", "Cartridge": ""}
-    assert live._restore_residue(client, now) == {"Fast Reset": ("Disabled", "Enabled")}
+    now = {
+        "REU Size": "2 MB", "Fast Reset": "Enabled", "Cartridge": "",
+        "Kernal ROM": "custom.bin", "DMA Load Mimics ID:": 12,
+    }
+    assert live._restore_residue(client, now) == {
+        "Fast Reset": ("Disabled", "Enabled"),
+        "Kernal ROM": ("kernal.bin", "custom.bin"),
+        "DMA Load Mimics ID:": (8, 12),
+    }
+
+
+def test_the_residue_refuses_to_judge_an_item_whose_default_is_unreadable():
+    """An empty residue must mean "everything is at its default", not "the
+    items that could not be read were left out"."""
+    client = _FakeClient(unreadable={"Command Interface"})
+    with pytest.raises(AssertionError, match="Command Interface"):
+        live._restore_residue(client, {"Command Interface": "Enabled"})
 
 
 @pytest.mark.parametrize(

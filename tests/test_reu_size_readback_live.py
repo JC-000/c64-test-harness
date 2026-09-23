@@ -171,7 +171,9 @@ def stock(client: Ultimate64Client) -> dict:
     Module-scoped, so order matters: the two flash-reload tests leave every
     item at its **default** (#469), which is not this snapshot on a drifted
     bench, so they are defined last and must run after the tests that diff
-    against it (pytest's file order; nothing here reorders tests).
+    against it (pytest's file order; nothing here reorders tests).  Each of
+    those tests starts with ``_require_fresh_stock``, so a reordered run
+    fails loud instead of diffing against a stale snapshot.
     """
     return _category(client)
 
@@ -202,6 +204,14 @@ def _diff(before: dict, after: dict) -> dict:
         for k in set(before) | set(after)
         if before.get(k) != after.get(k)
     }
+
+
+def _require_fresh_stock(client, stock: dict) -> None:
+    """Fail loud if the module snapshot no longer describes the device --
+    e.g. a flash-reload test ran first and left every item at its default
+    (#469) -- rather than diffing against it and blaming the firmware."""
+    if _category(client) != stock:
+        pytest.fail(f"stock snapshot stale before this test: {_diff(stock, _category(client))!r}")
 
 
 def _category_defaults(client, items) -> tuple[dict, list[str]]:
@@ -336,6 +346,7 @@ def test_reu_size_stable_across_quiet_reads(
     ``io/c64/c64.cc:270-280, 315-318``). The test corroborates; the source
     excludes a cache.
     """
+    _require_fresh_stock(client, stock)
     info = client.get_info()
     record_property("product", str(info.get("product")))
     record_property("firmware_version", str(info.get("firmware_version")))
@@ -392,6 +403,7 @@ def test_cartridge_write_does_not_move_reu_size(
     whatever was selected at entry (#447). Other chooser values are
     deliberately never written: they attach a cartridge image.
     """
+    _require_fresh_stock(client, stock)
     cart = _item(client, _ITEM_CARTRIDGE)
     presets = cart.get("presets", cart.get("values"))
     current = cart.get("current")
@@ -468,6 +480,7 @@ def test_set_reu_readback_is_immediate_and_restore_is_exact(
     between. The post-restore full-category diff against the pre-write
     ``stock`` snapshot must be empty.
     """
+    _require_fresh_stock(client, stock)
     snap = snapshot_state(client)
     assert snap.reu_size == stock[_ITEM_REU_SIZE]
     assert snap.reu_enabled == stock[_ITEM_REU_ENABLED]
