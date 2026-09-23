@@ -63,7 +63,6 @@ MASK_STATE_BUSY = 0x31
 BIT_DATA_AV     = 0x80
 BIT_STAT_AV     = 0x40
 BIT_ERROR       = 0x08
-BIT_CMD_BUSY    = 0x01
 
 CTL_PUSH_CMD  = 0x01
 CTL_NEXT_DATA = 0x02
@@ -143,11 +142,13 @@ def _build_echo_routine(host: str, port: int, data: bytes) -> tuple[bytes, bytes
         emit(0xD0, 0)  # BNE
         code[-1] = (pos - len(code)) & 0xFF
 
-    def emit_wait_not_busy():
+    def emit_wait_reply():
+        # Wait for the reply to be valid (STATE bit 5) or the error bit, not
+        # for bit 0 to clear: bit 0 clears before the queues fill (#486).
         pos = len(code)
         emit_lda_abs(UCI_STATUS)
-        emit(0x29, BIT_CMD_BUSY)
-        emit(0xD0, 0)
+        emit(0x29, 0x28)
+        emit(0xF0, 0)  # BEQ
         code[-1] = (pos - len(code)) & 0xFF
 
     def emit_progress(step):
@@ -251,7 +252,7 @@ def _build_echo_routine(host: str, port: int, data: bytes) -> tuple[bytes, bytes
 
     # Push command
     emit_sta_ctl(CTL_PUSH_CMD)
-    emit_wait_not_busy()
+    emit_wait_reply()
 
     emit_progress(0x02)
     emit_check_error(RESULT_BASE + OFF_CONNECT_ERR)
@@ -309,7 +310,7 @@ def _build_echo_routine(host: str, port: int, data: bytes) -> tuple[bytes, bytes
     code[beq_done_write] = (len(code) - (beq_done_write + 1)) & 0xFF
 
     emit_sta_ctl(CTL_PUSH_CMD)
-    emit_wait_not_busy()
+    emit_wait_reply()
 
     emit_progress(0x11)
     emit_check_error(RESULT_BASE + OFF_WRITE_ERR)
@@ -359,7 +360,7 @@ def _build_echo_routine(host: str, port: int, data: bytes) -> tuple[bytes, bytes
     emit_write_cmd(0x00)
 
     emit_sta_ctl(CTL_PUSH_CMD)
-    emit_wait_not_busy()
+    emit_wait_reply()
 
     emit_progress(0x21)
 
@@ -439,7 +440,7 @@ def _build_echo_routine(host: str, port: int, data: bytes) -> tuple[bytes, bytes
     emit_sta(UCI_CMD_DATA)
 
     emit_sta_ctl(CTL_PUSH_CMD)
-    emit_wait_not_busy()
+    emit_wait_reply()
 
     emit_progress(0x31)
     emit_check_error(RESULT_BASE + OFF_CLOSE_ERR)

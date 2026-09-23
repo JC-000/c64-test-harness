@@ -23,7 +23,8 @@ Command protocol:
 1. Wait idle (STATE==0 and CMD_BUSY==0)
 2. Write target byte, command byte, params to $DF1D
 3. Push command: write $01 to $DF1C
-4. Wait not busy: poll $DF1C bit0
+4. Wait for the reply: poll $DF1C until STATE bit 5 or ERROR (not bit0,
+   which clears before the reply is valid -- issue #486)
 5. Check error: bit3 set => write $08 to $DF1C, flag error
 6. Read response: while bit7 set, read $DF1E
 7. Read status: while bit6 set, read $DF1F
@@ -120,6 +121,21 @@ STATE_MORE_DATA = 0x30    # more data available
 
 # Combined mask for idle check: STATE bits + CMD_BUSY
 _IDLE_MASK = STATE_BITS | BIT_CMD_BUSY
+
+#: What the post-PUSH wait waits *for* (issue #486): STATE bit 5
+#: (``state(1)``: the firmware has validated a reply, ``10`` or ``11``) or the
+#: error bit (a PUSH while not idle sets ``error_busy`` and changes nothing
+#: else, so bit 5 alone would never come).  Bit 0 is not enough: it is the
+#: new-command flag, and the firmware clears it (``HANDSHAKE_ACCEPT_COMMAND``,
+#: ``command_intf.cc:169`` at bce4535e) *before* ``copy_result`` fills the
+#: queues and validates (``:173``), so a drain started on bit 0 alone can
+#: find both queues empty -- measured on the U64E, 2026-09-23 (#486).
+_REPLY_WAIT_MASK = STATE_LAST_DATA | BIT_ERROR
+
+#: Target-byte flag that tells the firmware to send no reply
+#: (``CMD_IF_NO_REPLY``, ``command_intf.cc``): it forces the state to ``00``
+#: with ``HANDSHAKE_RESET``, so the wait above would never end.
+_CMD_IF_NO_REPLY = 0x80
 
 # ---------------------------------------------------------------------------
 # Control register bits (write side of $DF1C)
@@ -495,15 +511,25 @@ def _build_wait_idle() -> list[int]:
 
 
 def _build_push_and_wait() -> list[int]:
-    """6502 fragment: push command then wait for not-busy."""
-    # LDA #$01(2); STA $DF1C(3); LDA $DF1C(3); AND #$01(2); BNE wait(2)
-    # wait loop at byte 5; BNE at byte 10; next=12; target=5; offset=-7=0xF9
+    """6502 fragment: push command, then wait until the reply is valid.
+
+    Waits for :data:`_REPLY_WAIT_MASK` -- STATE bit 5 or the error bit --
+    not for bit 0 (CMD_BUSY) to clear, which comes before the reply is in
+    the queues (issue #486).  Same 12 bytes as the old bit-0 wait.  Like the
+    other waits it is unbounded on the 6510; the host's sentinel timeout and
+    CPU reset (:func:`_execute_uci_routine`) bound it.  Two cases never end
+    it and so run to that timeout: a target with the no-reply bit
+    (:func:`build_uci_command` refuses one), and an ABORT serviced while it
+    waits (the firmware resets the state to ``00``).
+    """
+    # LDA #$01(2); STA $DF1C(3); LDA $DF1C(3); AND #mask(2); BEQ wait(2)
+    # wait loop at byte 5; BEQ at byte 10; next=12; target=5; offset=-7=0xF9
     return [
         _LDA_IMM, CMD_PUSH,
         _STA_ABS, _lo(UCI_CONTROL_STATUS_REG), _hi(UCI_CONTROL_STATUS_REG),
         _LDA_ABS, _lo(UCI_CONTROL_STATUS_REG), _hi(UCI_CONTROL_STATUS_REG),
-        _AND_IMM, BIT_CMD_BUSY,
-        _BNE, 0xF9,
+        _AND_IMM, _REPLY_WAIT_MASK,
+        _BEQ, 0xF9,
     ]
 
 
@@ -694,8 +720,10 @@ def _build_wait_idle_tsx(pc: int, fence: bool = True) -> list[int]:
 def _build_push_and_wait_tsx(pc: int, fence: bool = True) -> list[int]:
     """Turbo-safe variant of ``_build_push_and_wait``.
 
-    Emits PUSH_CMD + a fixed settle delay + a wait_not_busy loop that uses
-    JMP trampolines (since the fence is too wide for short BNE back)::
+    Emits PUSH_CMD + a fixed settle delay + a wait-for-reply loop that uses
+    JMP trampolines (since the fence is too wide for short BNE back).  It
+    waits for :data:`_REPLY_WAIT_MASK`, not for bit 0 to clear (issue #486);
+    same size as the old bit-0 loop::
 
         LDA #PUSH_CMD
         STA $DF1C
@@ -707,8 +735,8 @@ def _build_push_and_wait_tsx(pc: int, fence: bool = True) -> list[int]:
     busy_loop:
         LDA $DF1C
         <fence>
-        AND #BIT_CMD_BUSY
-        BEQ done
+        AND #_REPLY_WAIT_MASK      ; STATE bit 5 or ERROR
+        BNE done
         JMP busy_loop
     done:
     """
@@ -731,9 +759,9 @@ def _build_push_and_wait_tsx(pc: int, fence: bool = True) -> list[int]:
                 _hi(UCI_CONTROL_STATUS_REG)])
     if fence:
         out.extend(_build_fence())
-    out.extend([_AND_IMM, BIT_CMD_BUSY])
-    # BEQ done (skip 3-byte JMP)
-    out.extend([_BEQ, 0x03])
+    out.extend([_AND_IMM, _REPLY_WAIT_MASK])
+    # BNE done (skip 3-byte JMP)
+    out.extend([_BNE, 0x03])
     out.extend([_JMP_ABS, _lo(busy_loop_abs), _hi(busy_loop_abs)])
     return out
 
@@ -1164,7 +1192,17 @@ def build_uci_command(
         At the default ``$C000`` a turbo-safe routine takes at most 4 *params*
         bytes (494 B); a fifth reaches the reply area at ``$C200`` and
         :func:`_execute_uci_routine` refuses it.
+
+    A *target* with bit 7 set (``CMD_IF_NO_REPLY``) raises ``ValueError``:
+    the firmware answers that with ``HANDSHAKE_RESET`` rather than a reply,
+    so the post-push wait for a valid reply would never end (#486).
     """
+    if target & _CMD_IF_NO_REPLY:
+        raise ValueError(
+            f"target ${target:02X} has the no-reply bit ($80) set: the firmware "
+            "sends no reply for it, and every routine waits for one after the "
+            "push (issue #486) -- clear bit 7"
+        )
     if isinstance(params, list):
         params = bytes(params)
 
