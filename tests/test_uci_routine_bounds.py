@@ -101,7 +101,7 @@ def test_a_routine_over_a_declared_output_span_is_refused() -> None:
 def test_the_sentinel_and_error_flag_are_protected_whatever_the_spans() -> None:
     """The host clears and polls them, so no span list can give them away."""
     t = _Recorder()
-    with pytest.raises(ValueError, match="sentinel|error"):
+    with pytest.raises(ValueError, match="the sentinel at"):
         un._execute_uci_routine(
             t, bytes(4), code_addr=un._SENTINEL_ADDR - 1,
             check_identifier=False, output_spans=((0xC500, 0xC5FF),),
@@ -117,6 +117,15 @@ def test_a_reversed_output_span_is_refused() -> None:
             t, bytes(4), check_identifier=False, output_spans=((0xC3FF, 0xC300),),
         )
     assert t.writes == []
+
+
+def test_a_single_byte_caller_span_is_named_as_an_output_span() -> None:
+    t = _Recorder()
+    with pytest.raises(ValueError, match=r"output span \$C500-\$C500"):
+        un._execute_uci_routine(
+            t, bytes(4), code_addr=0xC4FE, check_identifier=False,
+            output_spans=((0xC500, 0xC500),),
+        )
 
 
 @pytest.mark.parametrize("name", [

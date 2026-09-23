@@ -2052,23 +2052,29 @@ _DEFAULT_OUTPUT_SPANS: tuple[tuple[int, int], ...] = ((_RESP_ADDR, _ERROR_ADDR),
 
 
 def _check_routine_clear_of(
-    code_addr: int, length: int, spans: Sequence[tuple[int, int]]
+    code_addr: int,
+    length: int,
+    spans: Sequence[tuple[int, int]],
+    flags: Sequence[tuple[str, int]] = (),
 ) -> None:
     """Raise ``ValueError`` if ``[code_addr, code_addr + length)`` overlaps any
-    inclusive ``(first, last)`` span in *spans*."""
+    inclusive ``(first, last)`` span in *spans*, or any ``(name, address)``
+    single byte in *flags*."""
     end = code_addr + length
+    labelled: list[tuple[int, int, str]] = []
     for first, last in spans:
         if first > last:
             raise ValueError(f"output span ${first:04X}-${last:04X} is reversed")
+        if (first, last) == _DEFAULT_OUTPUT_SPANS[0]:
+            label = f"the reply area ${first:04X}-${last:04X}"
+        else:
+            label = f"the output span ${first:04X}-${last:04X}"
+        labelled.append((first, last, label))
+    labelled.extend((addr, addr, f"{name} at ${addr:04X}") for name, addr in flags)
+    for first, last, label in labelled:
         if code_addr <= last and first < end:
-            if first == last:
-                what = "the sentinel/error flag"
-            elif (first, last) == _DEFAULT_OUTPUT_SPANS[0]:
-                what = f"the reply area ${first:04X}-${last:04X}"
-            else:
-                what = f"the output span ${first:04X}-${last:04X}"
             raise ValueError(
-                f"{length}-byte routine at ${code_addr:04X} overlaps {what}"
+                f"{length}-byte routine at ${code_addr:04X} overlaps {label}"
             )
 
 
@@ -2165,8 +2171,8 @@ def _execute_uci_routine(
     # span is the whole $C200-$C3FF reply area; the largest turbo routine's
     # last byte is $C1FC since #419, a margin of three bytes.
     _check_routine_clear_of(
-        code_addr, len(code),
-        [*output_spans, (sentinel_addr, sentinel_addr), (error_addr, error_addr)],
+        code_addr, len(code), output_spans,
+        flags=(("the sentinel", sentinel_addr), ("the error flag", error_addr)),
     )
 
     # The slot must be on the bus before anything is written or typed (#359).
