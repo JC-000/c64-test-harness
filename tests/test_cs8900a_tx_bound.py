@@ -12,6 +12,10 @@ is here and in the structural pins of ``test_cs8900a_register_pins.py``:
   bids before it.
 * **#238** -- ``frame_len`` odd, zero, or above the maximum is refused at
   emit time on every public route to the copy loop.
+* **#438** -- ``build_tx_code(allow_odd_frame_len=True)`` copies an odd
+  length ip65's way instead: TxLength the true length, the copy count
+  rounded up a byte, one pad byte in the last word.  The refusal stays the
+  default because that path has never run on silicon.
 * **#404** -- the maximum is 1514 (a standard Ethernet frame without CRC):
   above 256 the copy loop counts pages in ``X`` and bytes in ``Y``, and the
   whole frame reaches TX; at or below 256 the emitted bytes are unchanged.
@@ -404,6 +408,95 @@ def test_frames_up_to_256_emit_masters_exact_bytes(key: tuple[str, int]) -> None
     """The 8-bit loop is what #238 measured on silicon; #404 leaves it alone."""
     code = _SHORT_CALLS[key[0]](key[1])
     assert (hashlib.sha256(code).hexdigest(), len(code)) == _SHORT_DIGESTS[key]
+
+
+# ===========================================================================
+# #438: an odd length, behind the opt-in, is copied with one pad byte
+# ===========================================================================
+
+#: Odd lengths that exercise every arm of the copy loop once rounded up:
+#: 3/61 the 8-bit loop, 255 rounding to a full page, 257/259 page+tail,
+#: 511 rounding to an exact two-page copy (no tail at all), 1513 the max.
+ODD_LENS = [3, 61, 255, 257, 259, 511, 513, 1023, 1513]
+
+#: The byte sitting immediately after the frame in RAM.  ip65's ``adjustcnt``
+#: rounds the copy count up, so exactly this byte fills the last word.
+PAD_SENTINEL = 0xA5
+
+
+class _TxWordLog(Cs8900aSim):
+    """Records every half-word written into RTDATA, before the sim truncates
+    the frame to TxLength -- so a test can see the pad byte and count the
+    words the loop actually copied."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tx_halves: list[int] = []
+
+    def _tx_write(self, reg: int, value: int) -> None:
+        self.tx_halves.append(value)
+        super()._tx_write(reg, value)
+
+
+@pytest.mark.parametrize("n", ODD_LENS)
+def test_an_odd_frame_goes_out_whole_with_the_true_txlength(n: int) -> None:
+    """ip65's ``send``: TxLength is the **true** odd length, and ``adjustcnt``
+    rounds the copy to ``ceil(n/2)`` words so one pad byte fills the last
+    word.  Before this the emitted loop compared ``Y`` against an odd
+    ``CPY`` value it steps over two at a time, so it never terminated: on
+    silicon (#238) one frame went out and the 6510 hung forever with SEI in
+    force, and here the run exhausts the step budget."""
+    frame = _pattern(n)
+    chip = _TxWordLog()
+    code = bp.build_tx_code(LOAD, LONG_TX, n, RESULT, allow_odd_frame_len=True)
+    cpu = _run(code, chip, {LONG_TX: frame + bytes([PAD_SENTINEL])})
+    assert cpu.mem[RESULT] == 0x01
+    assert chip.txlen == n, "TxLength must be the true length, not the padded count"
+    assert chip.tx_frames == [frame]
+    assert chip._tx_buf == bytearray(), f"{len(chip._tx_buf)} byte(s) copied past the frame"
+    # Exactly ceil(n/2) words: the frame, then one pad byte read from RAM.
+    assert bytes(chip.tx_halves) == frame + bytes([PAD_SENTINEL])
+    assert chip.busst_hi_reads == 1
+
+
+@pytest.mark.parametrize("n", [2, 60, 254, 256, 258, 512, 1512, 1514])
+def test_the_odd_opt_in_changes_nothing_for_an_even_length(n: int) -> None:
+    """The opt-in only relaxes the parity refusal: for an even length the
+    emitted bytes are the ones #404 measured on silicon, to the byte."""
+    assert bp.build_tx_code(LOAD, TX_BUF, n, RESULT, allow_odd_frame_len=True) == \
+        bp.build_tx_code(LOAD, TX_BUF, n, RESULT)
+
+
+@pytest.mark.parametrize("n", [3, 61, 257, 1513])
+def test_an_odd_length_is_still_refused_without_the_opt_in(n: int) -> None:
+    """The padded copy is pinned on the simulated chip only -- no silicon has
+    transmitted an odd TxLength under it -- so the default stays a refusal."""
+    with pytest.raises(ValueError, match=r"pad an odd frame by one byte"):
+        bp.build_tx_code(LOAD, TX_BUF, n, RESULT)
+
+
+def test_the_ping_builders_have_no_odd_length_opt_in() -> None:
+    """The opt-in's blast radius is ``build_tx_code`` alone: the ping
+    builders transmit into a reply-matching loop and are not the instrument
+    a silicon check would use."""
+    for build in (bp.build_ping_and_wait_code, bp.build_ping_and_wait_tod_code):
+        with pytest.raises(TypeError):
+            build(LOAD, TX_BUF, 60, RX_BUF, RESULT, 1, 1,
+                  allow_odd_frame_len=True)          # type: ignore[call-arg]
+
+
+@pytest.mark.parametrize("n", [0, 1, -1, 1515, 1601, 65537])
+def test_the_length_range_is_enforced_even_with_the_odd_opt_in(n: int) -> None:
+    """``allow_odd_frame_len`` relaxes parity, never the 2..1514 bound."""
+    with pytest.raises(ValueError, match="1514"):
+        bp.build_tx_code(LOAD, TX_BUF, n, RESULT, allow_odd_frame_len=True)
+
+
+@pytest.mark.parametrize("n", ODD_LENS)
+def test_an_odd_frame_build_tx_code_still_fits_one_rest_put(n: int) -> None:
+    """CLAUDE.md hardware-safety rule 2: the upload stays a zero-attachment
+    PUT on a leak-prone device."""
+    assert len(bp.build_tx_code(LOAD, TX_BUF, n, RESULT, allow_odd_frame_len=True)) <= 128
 
 
 @pytest.mark.parametrize("n", [258, 512, 1514])

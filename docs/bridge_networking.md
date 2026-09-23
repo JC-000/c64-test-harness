@@ -1028,8 +1028,8 @@ Result bytes the TX builders can now store:
   (#238), so it does not by itself show the chip dropping valid frames.
   Confirm delivery out of band — a host-side counter or capture — never
   from this byte. `build_tx_code`'s docstring now says so.
-- **`frame_len` must be even and 2..1514, and violations raise at emit
-  time** ([#238](https://github.com/JC-000/c64-test-harness/issues/238),
+- **`frame_len` must be 2..1514 and, by default, even; violations raise
+  at emit time** ([#238](https://github.com/JC-000/c64-test-harness/issues/238),
   [#404](https://github.com/JC-000/c64-test-harness/issues/404)).
   The copy loop copies two bytes a pass. Measured on hardware against the
   old 8-bit-Y loop, 8 frames per length, delivery classified by host NIC
@@ -1038,9 +1038,12 @@ Result bytes the TX builders can now store:
   silent no-op that still stored `0x01` (longer ones fail by the same
   mechanism, not by measurement). `build_tx_code`,
   `build_ping_and_wait_code` and `build_ping_and_wait_tod_code`
-  (`tx_frame_len`, `arp_frame_len`) raise `ValueError` for odd lengths and
-  for anything above `CS8900A_TX_MAX_FRAME_LEN` = 1514 (an Ethernet frame
-  without CRC). Since #404 a frame above 256 bytes is copied in whole pages
+  (`tx_frame_len`, `arp_frame_len`) raise `ValueError` for anything above
+  `CS8900A_TX_MAX_FRAME_LEN` = 1514 (an Ethernet frame without CRC) and for
+  odd lengths — always for the ping builders, and for `build_tx_code`
+  unless it is passed `allow_odd_frame_len=True` (next item). The measured
+  route for an odd frame is to pad it by one byte (the IP total-length
+  field governs the datagram). Since #404 a frame above 256 bytes is copied in whole pages
   (`X` counts pages, `INC $FC` advances the pointer, as ip65's `send`
   does) and then the even remainder; up to 256 the emitted bytes are
   unchanged. `build_tx_code` is 99 bytes up to 256, 104 at a whole number
@@ -1062,9 +1065,27 @@ Result bytes the TX builders can now store:
   frame (so not a busy-after-large-frame effect), and nothing
   length-specific is shown at n=8. Cartridge
   Preference was set `External` inside the lock and read back `Auto`
-  afterwards. Odd lengths stay refused; pad the frame by one byte
-  (the IP total-length field governs the datagram). Odd-length support is
-  [#438](https://github.com/JC-000/c64-test-harness/issues/438).
+  afterwards.
+- **An odd length can be copied ip65's way, behind an opt-in**
+  ([#438](https://github.com/JC-000/c64-test-harness/issues/438)).
+  `build_tx_code(..., allow_odd_frame_len=True)` writes TxLength = the true
+  odd length and rounds the copy count up to a whole word, so one pad byte
+  read from `frame_buf + frame_len` fills the last word — what ip65's `send`
+  does via `adjustcnt` (`drivers/cs8900a.s:449`, `:523-531`; source-read).
+  That byte is whatever RAM follows the frame buffer, and it is written into
+  the chip's TX buffer; whether the chip then keeps it off the wire is part
+  of the unmeasured chip side below.
+  The emitted loop then always compares `Y` against an even count, which is
+  the #238 hang removed at its mechanism, and that much is checkable without
+  a chip: `tests/test_cs8900a_tx_bound.py` runs nine odd lengths on the
+  simulated chip and pins TxLength, every copied byte, the single pad byte,
+  and `ceil(n/2)` words exactly. **What is not established is the chip's
+  side**: no CS8900a has transmitted an odd TxLength with a padded final
+  word, so the paired silicon check #438 asks for (en4 `Ipkts`/`Ibytes`
+  deltas, as in #404's window) is still owed, and the caller-facing default
+  stays the refusal until it is run. Evidence grade: source-read (ip65) plus
+  simulated-chip pins; unmeasured on silicon. For an even length the flag
+  changes nothing — the emitted bytes are identical, pinned per length.
 - **The chip can be reset: `build_cs8900a_reset_code`**
   ([#234](https://github.com/JC-000/c64-test-harness/issues/234)).
   Measured: `Rdy4TxNOW` dead across 65,536 polls while every register the
