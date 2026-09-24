@@ -691,7 +691,7 @@ while transport.read_memory(SENTINEL, 1)[0] != 0x42:
 
 `scripts/bench_x25519_u64_turbo.py` benchmarks X25519 scalar multiplication across all turbo speeds. The figures below are a **dated measurement**, taken on an Ultimate 64 Elite running fw 3.14d with the script's old jiffy readout and a pre-c64-x25519-#35 build (2026-04-22), inferred from the jiffy readout having ticked. They have not been re-taken on a 3.15-line build; the script now reports CIA1 cycles (#477):
 
-| MHz | C64 Time (jiffy readout, pre-#477 build, 3.14d) | Speedup |
+| MHz | C64 Time (jiffy readout, pre-c64-x25519-#35 build, 3.14d) | Speedup |
 |-----|----------|---------|
 | 48 | 12.0s | 13.6x |
 | 32 | 13.4s | 12.2x |
