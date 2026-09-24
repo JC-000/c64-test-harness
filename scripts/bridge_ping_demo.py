@@ -58,7 +58,7 @@ PING_PAYLOAD = b"PING_FROM_VICE_A"
 
 CODE = 0xC000           # init helpers (rxctl/linectl) + peek routine load addr
 PEEK_ADDR = 0xC000      # peek routine (~64 bytes)
-CONSUME_ADDR = 0xC200   # consume routine (~360 bytes, fits before $C400)
+CONSUME_ADDR = 0xC200   # consume routine (429 bytes since #487, fits before $C400)
 SCRATCH = 0xC1E0        # used only during one-time CS8900a init
 RESULT = 0xC1F0         # 1-byte result (between peek and consume regions)
 TX_FRAME_BUF = 0xC500

@@ -39,12 +39,14 @@ def _run(code: bytes, frame: bytes, queued: int):
 
 
 @pytest.mark.parametrize("n", [60, 258, 1514])
-def test_a_starved_chip_refuses_the_bid_without_the_drain(n: int) -> None:
-    """The failure the drain exists for: frames queued, no drain -> 0x04, nothing sent."""
-    cpu, chip = _run(bp.build_tx_code(LOAD, TX_BUF, n, RESULT), _frame(n), queued=3)
+def test_a_queue_deeper_than_the_skip_phase_refuses_the_bid_without_the_drain(n: int) -> None:
+    """What the drain still adds since #487: the TX skip phase frees at most
+    ``CS8900A_TX_SKIP_TRIES`` frames, so one more starves the bid -> 0x04."""
+    queued = bp.CS8900A_TX_SKIP_TRIES + 1
+    cpu, chip = _run(bp.build_tx_code(LOAD, TX_BUF, n, RESULT), _frame(n), queued=queued)
     assert cpu.read(RESULT) == bp.RESULT_TX_NOT_READY
     assert chip.tx_frames == []
-    assert len(chip.rx_queue) == 3
+    assert len(chip.rx_queue) == 1
 
 
 @pytest.mark.parametrize("n", [60, 258, 1514])
@@ -67,14 +69,15 @@ def test_drain_status_addr_reports_the_budget_left(queued: int) -> None:
 
 
 def test_a_bound_hit_drain_still_bids_and_reports_zero() -> None:
-    """More frames than the drain's bound: the status says so (0) and the bid
-    is refused rather than hanging."""
+    """More frames than the drain's bound and the TX skip phase's together:
+    the status says so (0) and the bid is refused rather than hanging."""
     code = bp.build_tx_code(LOAD, TX_BUF, 60, RESULT, drain_first=True,
                             drain_status_addr=STATUS)
-    cpu, chip = _run(code, _frame(60), queued=bp.DRAIN_RX_MAX_FRAMES + 2)
+    extra = bp.CS8900A_TX_SKIP_TRIES + 1
+    cpu, chip = _run(code, _frame(60), queued=bp.DRAIN_RX_MAX_FRAMES + extra)
     assert cpu.read(STATUS) == 0
     assert cpu.read(RESULT) == bp.RESULT_TX_NOT_READY
-    assert len(chip.rx_queue) == 2
+    assert len(chip.rx_queue) == 1
 
 
 def test_drain_status_addr_without_drain_first_is_refused() -> None:
@@ -89,18 +92,20 @@ def test_drain_first_composes_with_the_odd_length_opt_in() -> None:
     assert chip.tx_frames == [_frame(61)]
 
 
-#: Digests of the routine as emitted before ``drain_first`` existed
-#: (origin/master af0effd); the default must not move a byte.
+#: Digests of the default routine (``drain_first`` off).  Taken before
+#: ``drain_first`` existed (af0effd) and re-pinned deliberately for #487,
+#: whose skip phase adds 60 bytes; with it removed the bytes are 9ec1273's
+#: except one relocated JMP operand (scratch provenance487.py).
 _DEFAULT_DIGESTS = {
-    60: ("98bc94956e032bb67ef34a05bed24fc7a6976d4c18de4aa3cc73fb47f4dbb5f4", 99),
-    258: ("2ec99e7668b36673ad7ed4aaa14de77ce6602520d82ad11a11ee74f425edb025", 120),
-    512: ("6212d01faa3feda9c7cca8744cb99b2c1e73c8684ed7001a6566897bb82a4c66", 104),
-    1514: ("750eb8a79b863970498e505960fad0ce9ad2cac95b5fa7183f523c722e21b6c0", 120),
+    60: ("51053ba39fcb9e4a6962fba9976e24381a8e797763c3d151757d7d8a942c52cf", 159),
+    258: ("cb3ee473c0b98c9fb525a6af33d1485cd24a0ff52826f8cc6922fbe54cef3c96", 180),
+    512: ("60b6b901993f0c7335ddd66cdd38fc5fde592497d912462783600f2dcb54bb6e", 164),
+    1514: ("2386815a041a6b0160a12ee59b1a6dfb0e3dfe91a48f35f59bcb70b6399459ca", 180),
 }
 
 
 @pytest.mark.parametrize("n", sorted(_DEFAULT_DIGESTS))
-def test_the_default_emits_the_pre_drain_bytes(n: int) -> None:
+def test_the_default_emits_the_pinned_bytes(n: int) -> None:
     for code in (bp.build_tx_code(LOAD, TX_BUF, n, RESULT),
                  bp.build_tx_code(LOAD, TX_BUF, n, RESULT, drain_first=False)):
         assert (hashlib.sha256(code).hexdigest(), len(code)) == _DEFAULT_DIGESTS[n]
@@ -108,15 +113,14 @@ def test_the_default_emits_the_pre_drain_bytes(n: int) -> None:
 
 def test_a_part_read_frame_still_starves_the_bid() -> None:
     """A frame the 6510 has started reading but not finished still holds the
-    buffer: the queue is empty, the stream is not, and the bid is refused."""
+    buffer: the queue is empty, the stream is not, and BusST reports no
+    Rdy4TxNOW.  Read at the register (since #487 a TX routine would SkipNow
+    the part-read frame and transmit, which is not what this pins)."""
     chip = Cs8900aSim(rx_queue=[_frame(64)], tx_starved_by_rx=True)
     chip.clockport = 1
     for _ in range(6):                      # header (4) + 2 body bytes
         chip.read(0xDE09)
     assert chip.rx_queue == []
-    cpu = Cpu6502(chip)
-    cpu.load(TX_BUF, _frame(60) + b"\x00")
-    cpu.load(LOAD, bp.build_tx_code(LOAD, TX_BUF, 60, RESULT))
-    cpu.jsr(LOAD, max_steps=5_000_000)
-    assert cpu.read(RESULT) == bp.RESULT_TX_NOT_READY
-    assert chip.tx_frames == []
+    chip.write(0xDE02, 0x38)
+    chip.write(0xDE03, 0x01)                # PPPtr = BusST
+    assert chip.read(0xDE05) & 0x01 == 0

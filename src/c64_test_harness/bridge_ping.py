@@ -51,6 +51,7 @@ from __future__ import annotations
 from ._address import refuses_bool_address_args
 
 import struct
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 
@@ -677,6 +678,17 @@ CS8900A_LINECTL_ENABLE = 0x00C0
 #: characterised chip limit.
 CS8900A_TX_READY_MAX_POLLS = 65536
 
+#: How many times every TX site checks ``Rdy4TxNOW`` and, when it is clear
+#: and RxEvent shows a frame queued, SkipNows one received frame before
+#: falling into the bounded poll (issue #487).  Modelled on ip65's ``send``
+#: (``drivers/cs8900a.s:452-467``, source-read), which also tries 8 times
+#: but skips unconditionally on a clear read and fails after the 8; the
+#: harness gates each skip on RxEvent, like its #222 drain, and keeps the
+#: #236 bounded poll after the tries.  Unread RX frames starve the chip's
+#: shared buffer and ``Rdy4TxNOW`` stays clear until they go (measured,
+#: #303).
+CS8900A_TX_SKIP_TRIES = 8
+
 #: Result byte every TX builder stores when ``Rdy4TxNOW`` did not assert
 #: within :data:`CS8900A_TX_READY_MAX_POLLS` polls (issue #236): nothing was
 #: copied into the chip.  On silicon, injecting host frames that sit unread
@@ -999,9 +1011,19 @@ def _emit_tx_frame(
 ) -> None:
     """Emit the CS8900a TX handshake for ``frame_len`` bytes at ``frame_buf``.
 
-    TxCMD = :data:`CS8900A_TXCMD_VALUE`, TxLength = ``frame_len``, PPPtr =
-    BusST (0x0138), poll ``Rdy4TxNOW`` at most ``max_polls`` times, then
-    copy the frame into RTDATA low half first through ``($FB),Y``.  This is
+    TxCMD = :data:`CS8900A_TXCMD_VALUE`, TxLength = ``frame_len``, then the
+    #487 skip phase: read ``Rdy4TxNOW`` up to :data:`CS8900A_TX_SKIP_TRIES`
+    times and after each clear read SkipNow one received frame when RxEvent
+    says one is queued (unread RX frames starve the TX buffer, #303),
+    counting the tries in ``$FB``.  Modelled on ip65's ``send``, which
+    skips unconditionally on a clear read and fails after 8; the harness
+    gates the skip on RxEvent, like its #222 drain, and keeps the bounded
+    poll after.  Then PPPtr = BusST
+    (0x0138), poll ``Rdy4TxNOW`` at most ``max_polls`` times, then copy the
+    frame into RTDATA low half first through ``($FB),Y``.  The skip phase
+    adds 60 bytes per TX site and discards the frames it skips, so a
+    routine that must read a frame queued behind its own transmit loses it
+    when the chip is starved -- ip65 accepts the same loss.  This is
     the one TX sequence every builder emits; ``prefix`` keeps the labels
     unique in a routine that transmits more than once (ARP request then
     echo request, or ARP reply then echo reply -- issue #218).
@@ -1044,6 +1066,28 @@ def _emit_tx_frame(
     a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
     a.emit(0xA9, frame_len & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
     a.emit(0xA9, (frame_len >> 8) & 0xFF, 0x8D, TXLEN_HI & 0xFF, TXLEN_HI >> 8)
+    # issue #487, after ip65 ``send`` (drivers/cs8900a.s:452-467): check
+    # Rdy4TxNOW up to CS8900A_TX_SKIP_TRIES times, and after each clear read
+    # SkipNow one received frame if RxEvent shows one (ip65 skips
+    # unconditionally) -- unread RX frames starve the shared buffer (#303).
+    # Then the #236 bounded poll, unchanged (ip65 fails after the tries).  $FB counts the
+    # tries; the copy below reloads it.
+    a.emit(0xA9, CS8900A_TX_SKIP_TRIES, 0x85, 0xFB)  # LDA #tries / STA $FB
+    a.label(f"{prefix}_txsk")
+    a.emit(0xA9, 0x38, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)   # PPPtr = BusST
+    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
+    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)  # LDA BusST hi
+    a.emit(0x29, 0x01)                               # AND #Rdy4TxNOW
+    a.branch(0xD0, f"{prefix}_txgo")                 # BNE -> ready, copy
+    a.emit(0xA9, 0x24, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)   # PPPtr = RxEvent
+    a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
+    a.emit(0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8)  # LDA RxEvent hi (presents it, #219)
+    a.emit(0x29, CS8900A_RXEVENT_MASK)
+    a.branch(0xF0, f"{prefix}_txnf")                 # BEQ -> nothing queued to skip
+    _emit_skip_packet(a)
+    a.label(f"{prefix}_txnf")
+    a.emit(0xC6, 0xFB)                               # DEC $FB
+    a.branch(0xD0, f"{prefix}_txsk")
     a.emit(0xA0, poll_y, 0xA2, poll_x)             # LDY #lo / LDX #hi: poll budget
     a.emit(0xA9, 0x38, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8)
     a.emit(0xA9, 0x01, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8)
@@ -1092,6 +1136,36 @@ def _check_drain_status(drain_first: bool, drain_status_addr: int | None) -> Non
     """``drain_status_addr`` without ``drain_first`` is a caller mistake."""
     if drain_status_addr is not None and not drain_first:
         raise ValueError("drain_status_addr given without drain_first")
+
+
+def _check_drain_status_clear(
+    builder: str,
+    drain_status_addr: int | None,
+    *,
+    load_addr: int,
+    code_len: int,
+    result_addr: int,
+    frames: Iterable[tuple[int, int]],
+) -> None:
+    """Refuse a ``drain_status_addr`` that lands on the routine's own bytes,
+    on ``result_addr``, or inside a frame it transmits (issue #487).
+
+    The drain's ``STX`` would patch the running code, be overwritten by
+    the result, or corrupt a frame before it is copied to the chip.  Spans
+    are half-open; *frames* are ``(buf, bytes read)`` pairs.
+    """
+    if drain_status_addr is None:
+        return
+    spans = [("result_addr", result_addr, result_addr + 1),
+             ("the routine", load_addr, load_addr + code_len)]
+    spans += [("a transmitted frame", buf, buf + n) for buf, n in frames]
+    for what, lo, hi in spans:
+        if lo <= drain_status_addr < hi:
+            raise ValueError(
+                f"{builder} drain_status_addr ${drain_status_addr:04X} overlaps "
+                f"{what} (${lo:04X}-${hi - 1:04X}); the drain's STX would "
+                + ("overwrite it" if what != "the routine" else "patch the running code")
+            )
 
 
 def _resolve_arp_frame(
@@ -1159,10 +1233,21 @@ def build_tx_code(
       within :data:`CS8900A_TX_READY_MAX_POLLS` polls and nothing was
       copied.  Provoked on silicon by host frames left unread, it is the TX
       buffer **starved by the RX queue** (measured, #303); unprovoked
-      ``0x04`` results are attributed to the same cause.  Drain the RX
-      queue (``drain_first=True``) or reset the chip
-      (:func:`build_cs8900a_reset_code`); a starved chip kept returning
-      ``0x04`` on every retry without either.
+      ``0x04`` results are attributed to the same cause.  Since #487 the
+      routine itself SkipNows up to :data:`CS8900A_TX_SKIP_TRIES` queued
+      frames before the bounded poll (after ip65's ``send``, which skips
+      unconditionally and fails after 8; the harness gates the skip on
+      RxEvent and keeps the bounded poll), so ``0x04`` now
+      means more than that were queued or the chip is not starved but
+      dead: drain the queue first (``drain_first=True``) or reset the chip
+      (:func:`build_cs8900a_reset_code`).  Measured on the U64E (fw
+      ``bce4535e``, #495 head 8263182, 1 MHz, 1514 B, 2026-09-23): on a
+      chip confirmed starved (two pre-#487 transmits both ``0x04``) this
+      routine transmitted byte-exact 7/7 against 1/6 for the pre-#487 code,
+      and the ungated ip65 form 7/7 -- the RxEvent gate made no difference
+      at this n.  5 of 27 trials self-cleared between the confirming probes
+      and were not counted, and one confirmed-starved control still sent
+      (https://github.com/JC-000/c64-test-harness/issues/487#issuecomment-5806809683).
 
     ``drain_first`` (issue #303): SkipNow every frame already queued in the
     chip before the bid (:func:`_emit_drain_rx`, at most
@@ -1172,8 +1257,8 @@ def build_tx_code(
     host frames that sit unread in the chip's shared buffer keep
     ``Rdy4TxNOW`` from asserting -- three injected host frames before a
     1514-byte TX bid gave ``0x04`` 5/6 against 0/6 with none, and once
-    starved every retry stayed ``0x04`` (16/16) until a drain or a chip
-    reset.  ``drain_first=True`` on a chip confirmed starved (two plain
+    starved every retry through the pre-#487 TX path stayed ``0x04``
+    (16/16) until a drain or a chip reset.  ``drain_first=True`` on a chip confirmed starved (two plain
     transmits both ``0x04``) transmitted byte-exact to the host 6/6
     against 0/6 without it, paired and interleaved (1 MHz, 1514 B, #488
     head 4f4781d, 2026-09-23, fw ``bce4535e``;
@@ -1182,11 +1267,15 @@ def build_tx_code(
     attributed to host frames the link delivered on its own.  The drain
     discards queued frames, so leave it off when the routine that follows
     must read them.
-    Default ``False`` keeps the routine byte-identical; ``True`` adds 40
-    bytes (43 with ``drain_status_addr``), 139-163 bytes in all, which
-    takes the routine past 128 bytes -- through ``transport.write_memory``
-    that still costs no ``/Temp`` attachment on a leak-prone device, but a
-    direct ``client.write_mem`` of it does.  ``drain_status_addr`` (needs
+    Since #487 the TX skip phase frees up to 8 frames without it; the
+    drain still clears deeper queues and does it before the bid.  Default
+    ``False`` keeps the routine byte-identical; ``True`` adds 40 bytes (43
+    with ``drain_status_addr``).  The routine is over 128 bytes either way
+    since #487 (159-180 bytes, 199-223 with the drain): through
+    ``transport.write_memory`` that costs no ``/Temp`` attachment on a
+    leak-prone device, but a direct ``client.write_mem`` of it does.
+    ``drain_status_addr`` must not land on ``result_addr``, the frame or
+    the routine's own bytes (:class:`ValueError`, #487).  ``drain_status_addr`` (needs
     ``drain_first``) receives the drain's remaining budget: ``0`` = bound
     hit, frames may still be queued; ``n > 0`` = the queue emptied after
     ``8 - n`` skips.
@@ -1205,7 +1294,11 @@ def build_tx_code(
     a.emit(0x60)
     a.label("tx_fail")
     _emit_result_exit(a, RESULT_TX_NOT_READY, result_addr)
-    return a.build()
+    code = a.build()
+    _check_drain_status_clear(
+        "build_tx_code", drain_status_addr, load_addr=load_addr, code_len=len(code),
+        result_addr=result_addr, frames=[(frame_buf, frame_len + (frame_len & 1))])
+    return code
 
 
 _FIXED_RX_BYTES = 60  # bytes to drain after status+length (drives loop count)
@@ -1616,7 +1709,9 @@ def build_ping_and_wait_code(
     reset + init + idle is the usual victim.  Default ``False`` keeps the
     routine byte-identical.  ``drain_status_addr`` (needs ``drain_first``)
     receives the drain's remaining budget: ``0`` = bound hit, frames may
-    still be queued; ``n > 0`` = queue emptied after ``8 - n`` skips.
+    still be queued; ``n > 0`` = queue emptied after ``8 - n`` skips.  It
+    must not land on ``result_addr``, either frame or the routine's own
+    bytes (:class:`ValueError`, #487).
 
     .. note::
 
@@ -1690,7 +1785,12 @@ def build_ping_and_wait_code(
     a.label("tx_fail")
     _emit_result_exit(a, RESULT_TX_NOT_READY, result_addr)
 
-    return a.build()
+    code = a.build()
+    _check_drain_status_clear(
+        "build_ping_and_wait_code", drain_status_addr, load_addr=load_addr,
+        code_len=len(code), result_addr=result_addr,
+        frames=[(tx_frame_buf, tx_frame_len)] + ([arp] if arp is not None else []))
+    return code
 
 
 @refuses_bool_address_args
@@ -2645,6 +2745,8 @@ def build_ping_and_wait_tod_code(
         drain_status_addr: With ``drain_first``, where to store the
             drain's remaining budget (``0`` = bound hit, frames may still
             be queued; ``n > 0`` = queue emptied after ``8 - n`` skips).
+            Must not land on ``result_addr``, either frame or the
+            routine's own bytes (#487).
 
     Raises:
         ValueError: if ``deadline_tenths`` is out of range,
@@ -2732,6 +2834,10 @@ def build_ping_and_wait_tod_code(
     ones_tab_addr = load_addr + a.labels["ones_tab"]
     buf = bytearray(raw)
     _patch_tod_tables(buf, sec_tab_addr, ones_tab_addr, patch_positions)
+    _check_drain_status_clear(
+        "build_ping_and_wait_tod_code", drain_status_addr, load_addr=load_addr,
+        code_len=len(buf), result_addr=result_addr,
+        frames=[(tx_frame_buf, tx_frame_len)] + ([arp] if arp is not None else []))
     return bytes(buf)
 
 

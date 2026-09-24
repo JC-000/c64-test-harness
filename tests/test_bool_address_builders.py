@@ -54,7 +54,7 @@ class A(enum.IntEnum):
     RX = 0x4000
     TX = 0x5000
     ARP = 0x5100
-    DRAIN = 0xC1F0
+    DRAIN = 0x5200     # clear of every routine span since #487's growth (was $C1F0)
     DEST = 0xC200
     PLAY = 0x1003
     STUB = 0xC300
@@ -83,18 +83,26 @@ UCI = dict(status_addr=A.STAT, stat_len_addr=A.SLEN, error_addr=A.ERR, sentinel_
 #: agreed on the base for every row).  The seven UCI builders that push a command were
 #: re-taken for #486, whose wait-for-reply change alters exactly two bytes of
 #: each (the wait mask ``$01``->``$28`` and its branch opcode), sizes unchanged.
+#: Re-pinned deliberately for issue #487 (the RxEvent-gated skip phase at every
+#: TX site): each TX site grew by exactly 60 bytes, and with each 60-byte
+#: skip phase removed the new output equals 9ec1273's byte for byte except
+#: absolute operands relocated by 60 or 120 (scratch provenance487.py, all
+#: 23 builder configurations, 0 unexplained bytes).  The skip phase itself
+#: is pinned structurally in test_cs8900a_register_pins.py.
+#: The two ping rows were re-taken once more after moving ``A.DRAIN`` off
+#: $C1F0, which the grown routines now cover (#487's overlap guard refuses it).
 BUILDERS = {
     "build_cs8900a_reset_code": (bridge_ping.build_cs8900a_reset_code, dict(load_addr=A.LOAD, result_addr=A.RESULT), "4f96c03b59e1b071"),
-    "build_icmp_responder_code": (bridge_ping.build_icmp_responder_code, dict(load_addr=A.LOAD, rx_buf=A.RX, my_ip=IP, result_addr=A.RESULT, my_mac=MAC), "7499c032a253503c"),
-    "build_icmp_responder_tod_code": (bridge_ping.build_icmp_responder_tod_code, dict(load_addr=A.LOAD, rx_buf=A.RX, my_ip=IP, result_addr=A.RESULT, deadline_tenths=50, my_mac=MAC), "3a097608c848259b"),
-    "build_ping_and_wait_code": (bridge_ping.build_ping_and_wait_code, dict(load_addr=A.LOAD, tx_frame_buf=A.TX, tx_frame_len=74, rx_buf=A.RX, result_addr=A.RESULT, identifier=0x1234, sequence=1, arp_frame_buf=A.ARP, arp_frame_len=42, drain_first=True, drain_status_addr=A.DRAIN), "22e5d725b816bc47"),
-    "build_ping_and_wait_tod_code": (bridge_ping.build_ping_and_wait_tod_code, dict(load_addr=A.LOAD, tx_frame_buf=A.TX, tx_frame_len=74, rx_buf=A.RX, result_addr=A.RESULT, identifier=0x1234, sequence=1, deadline_tenths=50, arp_frame_buf=A.ARP, arp_frame_len=42, drain_first=True, drain_status_addr=A.DRAIN), "7e60dda9a8a34493"),
+    "build_icmp_responder_code": (bridge_ping.build_icmp_responder_code, dict(load_addr=A.LOAD, rx_buf=A.RX, my_ip=IP, result_addr=A.RESULT, my_mac=MAC), "e3ed475989f38852"),
+    "build_icmp_responder_tod_code": (bridge_ping.build_icmp_responder_tod_code, dict(load_addr=A.LOAD, rx_buf=A.RX, my_ip=IP, result_addr=A.RESULT, deadline_tenths=50, my_mac=MAC), "fd8de491c709172b"),
+    "build_ping_and_wait_code": (bridge_ping.build_ping_and_wait_code, dict(load_addr=A.LOAD, tx_frame_buf=A.TX, tx_frame_len=74, rx_buf=A.RX, result_addr=A.RESULT, identifier=0x1234, sequence=1, arp_frame_buf=A.ARP, arp_frame_len=42, drain_first=True, drain_status_addr=A.DRAIN), "8806f0a7a7be52dd"),
+    "build_ping_and_wait_tod_code": (bridge_ping.build_ping_and_wait_tod_code, dict(load_addr=A.LOAD, tx_frame_buf=A.TX, tx_frame_len=74, rx_buf=A.RX, result_addr=A.RESULT, identifier=0x1234, sequence=1, deadline_tenths=50, arp_frame_buf=A.ARP, arp_frame_len=42, drain_first=True, drain_status_addr=A.DRAIN), "392417acfbb59214"),
     "build_read_and_match_echo_reply_code": (bridge_ping.build_read_and_match_echo_reply_code, dict(load_addr=A.LOAD, rx_buf=A.RX, result_addr=A.RESULT, identifier=0x1234, sequence=1), "385c56ea9992e1dc"),
-    "build_read_and_respond_echo_request_code": (bridge_ping.build_read_and_respond_echo_request_code, dict(load_addr=A.LOAD, rx_buf=A.RX, my_ip=IP, result_addr=A.RESULT, my_mac=MAC), "05e105273a4492e9"),
+    "build_read_and_respond_echo_request_code": (bridge_ping.build_read_and_respond_echo_request_code, dict(load_addr=A.LOAD, rx_buf=A.RX, my_ip=IP, result_addr=A.RESULT, my_mac=MAC), "ed88054213e996b1"),
     "build_rx_echo_reply_code": (bridge_ping.build_rx_echo_reply_code, dict(load_addr=A.LOAD, rx_buf=A.RX, result_addr=A.RESULT, identifier=0x1234, sequence=1), "12fa259717a77888"),
     "build_rx_echo_reply_tod_code": (bridge_ping.build_rx_echo_reply_tod_code, dict(load_addr=A.LOAD, rx_buf=A.RX, result_addr=A.RESULT, expect_id=0x1234, expect_seq=1, deadline_tenths=50), "5f15a07d5eb3371d"),
     "build_rx_peek_code": (bridge_ping.build_rx_peek_code, dict(load_addr=A.LOAD, result_addr=A.RESULT), "97a73f08588a3d5d"),
-    "build_tx_code": (bridge_ping.build_tx_code, dict(load_addr=A.LOAD, frame_buf=A.TX, frame_len=60, result_addr=A.RESULT), "e32ede6eadea2a2d"),
+    "build_tx_code": (bridge_ping.build_tx_code, dict(load_addr=A.LOAD, frame_buf=A.TX, frame_len=60, result_addr=A.RESULT), "303f841c86728362"),
     "cs8900a_read_linectl_code": (bridge_ping.cs8900a_read_linectl_code, dict(dest_addr=A.DEST), "1de72344c8aa13ff"),
     "build_tod_start_code": (tod_timer.build_tod_start_code, dict(load_addr=A.LOAD), "87ee9b1052df2342"),
     "build_tod_read_tenths_code": (tod_timer.build_tod_read_tenths_code, dict(load_addr=A.LOAD, result_addr=A.RESULT), "69250fbf77344a83"),

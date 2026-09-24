@@ -125,6 +125,9 @@ _POLL_HI = re.compile(
 IP = bytes([10, 0, 0, 2])
 LOAD, TX_BUF, ARP_BUF, RX_BUF, RESULT = 0xC000, 0xC300, 0xC380, 0xC400, 0xC0FF
 MY_MAC = bytes.fromhex("02C640000002")
+#: Clear of the [drain] routines' own span (#487's guard refuses RESULT + 1 = $C100,
+#: which the routine covers) and of the TX/ARP frames.
+DRAIN_STATUS = 0xC3F0
 
 # Every builder that emits a TxCMD write.  The ``[arp]`` entries are the
 # same builders with issue #218's ARP support switched on (an ARP request
@@ -138,7 +141,7 @@ TX_BUILDERS: dict[str, Callable[[], bytes]] = {
         LOAD, TX_BUF, 60, RX_BUF, RESULT, 0x1234, 1, arp_frame_buf=ARP_BUF),
     "build_ping_and_wait_code[drain]": lambda: bp.build_ping_and_wait_code(
         LOAD, TX_BUF, 60, RX_BUF, RESULT, 0x1234, 1, arp_frame_buf=ARP_BUF,
-        drain_first=True, drain_status_addr=RESULT + 1),
+        drain_first=True, drain_status_addr=DRAIN_STATUS),
     "build_icmp_responder_code": lambda: bp.build_icmp_responder_code(
         LOAD, RX_BUF, IP, RESULT),
     "build_icmp_responder_code[arp]": lambda: bp.build_icmp_responder_code(
@@ -152,7 +155,7 @@ TX_BUILDERS: dict[str, Callable[[], bytes]] = {
         LOAD, TX_BUF, 60, RX_BUF, RESULT, 0x1234, 1),
     "build_ping_and_wait_tod_code[drain]": lambda: bp.build_ping_and_wait_tod_code(
         LOAD, TX_BUF, 60, RX_BUF, RESULT, 0x1234, 1, arp_frame_buf=ARP_BUF,
-        drain_first=True, drain_status_addr=RESULT + 1),
+        drain_first=True, drain_status_addr=DRAIN_STATUS),
     "build_ping_and_wait_tod_code[arp]": lambda: bp.build_ping_and_wait_tod_code(
         LOAD, TX_BUF, 60, RX_BUF, RESULT, 0x1234, 1, arp_frame_buf=ARP_BUF),
     "build_icmp_responder_tod_code": lambda: bp.build_icmp_responder_tod_code(
@@ -231,6 +234,56 @@ def _disp(code: bytes, at: int) -> int:
     return at + 2 + (d - 256 if d >= 128 else d)
 
 
+#: ip65's try count (``drivers/cs8900a.s`` ``send``, ``ldy #$08``), as a
+#: literal (issue #487).
+TX_SKIP_TRIES = 8
+DEC_ZP, ZP_COUNT = 0xC6, 0xFB
+#: SkipNow as every emitter writes it: PPPtr = RxCFG, then its low byte |= $40.
+SKIPNOW = pptr_set(PP_RXCFG) + _lda(PPDATA_LO) + bytes([ORA_IMM, 0x40]) + _sta(PPDATA_LO)
+
+
+def _skip_phase_anchors(code: bytes) -> set[int]:
+    """Offsets of every ``PPPtr=BusST`` that opens a #487 skip phase: the one
+    immediately after ``LDA #tries / STA $FB``."""
+    return {m.start() for m in re.finditer(re.escape(pptr_set(PP_BUSST)), code)
+            if code[m.start() - 2:m.start()] == bytes([0x85, ZP_COUNT])}
+
+
+def _skip_phases(code: bytes) -> list[dict[str, int]]:
+    """Decode the #487 skip phase in front of every bounded poll.
+
+    Emitted shape (:func:`bridge_ping._emit_tx_frame`)::
+
+              LDA #8 / STA $FB
+        sk:   PPPtr = BusST
+              LDA PPData_hi / AND #$01 / BNE go
+              PPPtr = RxEvent
+              LDA PPData_hi / AND #$0D / BEQ nf
+              SkipNow                  ; RxCFG low |= $40
+        nf:   DEC $FB / BNE sk
+              LDY #lo / LDX #hi / PPPtr = BusST / ...the #236 bounded poll
+
+    Decoded by position from the anchor, like :func:`_rdy4txnow_polls`, so
+    a mutated byte is reported rather than silently unmatched.
+    """
+    out = []
+    for at in sorted(_skip_phase_anchors(code)):
+        lda = at + len(pptr_set(PP_BUSST))
+        rxe = lda + 7
+        rxlda = rxe + len(pptr_set(PP_RXEVENT))
+        skip = rxlda + 7
+        nf = skip + len(SKIPNOW)
+        out.append({
+            "anchor": at, "tries": code[at - 3], "tries_op": code[at - 4],
+            "busst_poll": code[lda:lda + 6], "exit_target": _disp(code, lda + 5),
+            "rxevent_ptr": code[rxe:rxlda], "rxevent_poll": code[rxlda:rxlda + 6],
+            "nf_target": _disp(code, rxlda + 5), "skip": code[skip:nf], "nf": nf,
+            "dec": code[nf:nf + 2], "loop_op": code[nf + 2], "loop_target": _disp(code, nf + 2),
+            "then": nf + 4,
+        })
+    return out
+
+
 def _rdy4txnow_polls(code: bytes) -> list[dict[str, int]]:
     """Decode the bounded poll around every ``PPPtr=BusST`` write in *code*.
 
@@ -255,6 +308,8 @@ def _rdy4txnow_polls(code: bytes) -> list[dict[str, int]]:
     """
     out = []
     for m in re.finditer(re.escape(pptr_set(PP_BUSST)), code):
+        if m.start() in _skip_phase_anchors(code):
+            continue                      # the #487 skip phase; see _skip_phases
         lda = m.end()
         assert code[lda:lda + 3] == _lda(PPDATA_HI), (
             f"PPPtr=BusST at offset {m.start()} is not followed by LDA PPData_hi "
@@ -421,10 +476,11 @@ def test_tx_sequence_is_txcmd_txlen_busst_poll_then_data(name: str) -> None:
         txcmd_hi = step(_sta(TXCMD_HI), txcmd_lo)
         txlen_lo = step(_sta(TXLEN_LO), txcmd_hi)
         txlen_hi = step(_sta(TXLEN_HI), txlen_lo)
-        busst = step(pptr_set(PP_BUSST), txlen_hi)
+        skip_phase = step(pptr_set(PP_BUSST), txlen_hi)
+        busst = step(pptr_set(PP_BUSST), skip_phase + 1) if skip_phase >= 0 else -1
         poll = step(poll_bytes, busst)
         data = step(_sta(RTDATA_LO), poll)
-        order = [txcmd_lo, txcmd_hi, txlen_lo, txlen_hi, busst, poll, data]
+        order = [txcmd_lo, txcmd_hi, txlen_lo, txlen_hi, skip_phase, busst, poll, data]
         assert all(o >= 0 for o in order), (
             f"{name}: TX site {i} (TxCMD at {txcmd_lo}) has a handshake step "
             f"missing (offsets {order}; -1 = not found after the previous step "
@@ -437,6 +493,56 @@ def test_tx_sequence_is_txcmd_txlen_busst_poll_then_data(name: str) -> None:
         )
         assert polls[busst]["go"] <= data, (
             f"{name}: TX site {i}: RTDATA is written inside the poll loop"
+        )
+        assert skip_phase in _skip_phase_anchors(code), (
+            f"{name}: TX site {i}: the first PPPtr=BusST after TxLength at "
+            f"{skip_phase} is not a #487 skip phase"
+        )
+
+
+@pytest.mark.parametrize("name", sorted(TX_BUILDERS))
+def test_every_tx_site_skips_a_queued_frame_per_clear_read(name: str) -> None:
+    """Issue #487: before the bounded poll, each TX site checks Rdy4TxNOW
+    :data:`TX_SKIP_TRIES` times, going straight to the copy when it is set
+    and otherwise issuing SkipNow (only when RxEvent says a frame is
+    queued).  Modelled on ip65's ``send`` (``drivers/cs8900a.s:452-467``),
+    which skips unconditionally and fails after 8; the harness gates the
+    skip on RxEvent and keeps the bounded poll after.  Rejected
+    by name: another try count, a ready branch that does not reach the
+    bounded poll's copy, a SkipNow without the RESET-free ``$40`` bit on
+    RxCFG's low byte, a loop that does not return to re-aim at BusST, and a
+    phase that falls anywhere but the bounded poll."""
+    code = TX_BUILDERS[name]()
+    phases = _skip_phases(code)
+    polls = _rdy4txnow_polls(code)
+    assert len(phases) == _expected_tx_sites(name) == len(polls), (
+        f"{name}: {len(phases)} skip phase(s), {len(polls)} bounded poll(s), "
+        f"expected {_expected_tx_sites(name)}"
+    )
+    for ph, poll in zip(phases, polls):
+        where = f"{name}: skip phase at offset {ph['anchor']}"
+        assert (ph["tries_op"], ph["tries"]) == (LDA_IMM, TX_SKIP_TRIES), (
+            f"{where}: try count LDA #${ph['tries']:02X}, expected #{TX_SKIP_TRIES} (ip65)"
+        )
+        assert ph["busst_poll"] == _lda(PPDATA_HI) + bytes([AND_IMM, BUSST_RDY4TXNOW_MASK, BNE]), (
+            f"{where}: does not test Rdy4TxNOW with BNE (got {ph['busst_poll'].hex()})"
+        )
+        assert ph["exit_target"] == poll["go"], (
+            f"{where}: ready branch lands at {ph['exit_target']}, not the copy at {poll['go']}"
+        )
+        assert ph["rxevent_ptr"] == pptr_set(PP_RXEVENT)
+        assert ph["rxevent_poll"][:5] == _lda(PPDATA_HI) + bytes([AND_IMM, RXEVENT_IP65_MASK]) \
+            and ph["rxevent_poll"][5] == BEQ and ph["nf_target"] == ph["nf"], (
+            f"{where}: RxEvent check is not LDA hi / AND #$0D / BEQ past the SkipNow"
+        )
+        assert ph["skip"] == SKIPNOW, f"{where}: SkipNow is {ph['skip'].hex()}"
+        assert ph["dec"] == bytes([DEC_ZP, ZP_COUNT]) and ph["loop_op"] == BNE \
+            and ph["loop_target"] == ph["anchor"], (
+            f"{where}: the try loop is not DEC $FB / BNE back to the BusST aim"
+        )
+        assert ph["then"] == poll["pptr"] - 4, (
+            f"{where}: falls through to {ph['then']}, not the bounded poll's "
+            f"LDY/LDX at {poll['pptr'] - 4}"
         )
 
 
@@ -482,8 +588,10 @@ def test_each_poll_masks_the_register_its_pptr_points_at(name: str) -> None:
     assert (PP_BUSST in registers) == (name in TX_BUILDERS), (
         f"{name}: BusST poll presence does not match whether it transmits"
     )
-    assert (PP_RXEVENT in registers) == (name in RX_POLLERS), (
-        f"{name}: RxEvent poll presence does not match whether it polls"
+    # Since #487 every TX site reads RxEvent in its skip phase, so a
+    # transmitter reads it whether or not it also polls for frames.
+    assert (PP_RXEVENT in registers) == (name in RX_POLLERS or name in TX_BUILDERS), (
+        f"{name}: RxEvent poll presence does not match whether it polls or transmits"
     )
 
 

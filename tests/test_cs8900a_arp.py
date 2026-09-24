@@ -206,13 +206,19 @@ def test_arp_builders_reject_an_ip_that_is_not_four_bytes(bad_ip: bytes) -> None
 # responder 7ec06447.. 401, responder_tod 15392373.. 525, respond 47afe09e.. 349.
 # What "opt-in means opt-in" still guards: ARP support adds nothing to
 # these bytes; the #236 structure is pinned in test_cs8900a_register_pins.py.
+# Re-pinned deliberately for issue #487 (the RxEvent-gated skip phase at every
+# TX site): each TX site grew by exactly 60 bytes, and with each 60-byte
+# skip phase removed the new output equals 9ec1273's byte for byte except
+# absolute operands relocated by 60 or 120 (scratch provenance487.py, all
+# 23 builder configurations, 0 unexplained bytes).  The skip phase itself
+# is pinned structurally in test_cs8900a_register_pins.py.
 _MASTER_DIGESTS: dict[str, tuple[str, int]] = {
-    "build_tx_code": ("98bc94956e032bb67ef34a05bed24fc7a6976d4c18de4aa3cc73fb47f4dbb5f4", 99),
-    "build_ping_and_wait_code": ("23374cb0d0056ff32018bd5324f0a7f8136ab836250ed3b5272065a25d3ed224", 276),
-    "build_ping_and_wait_tod_code": ("1955f33e3c5d4a3c1a5625fdb743082804497877b43d6c23caa660f4c2316d53", 400),
-    "build_icmp_responder_code": ("1c8e89b402a60e00c37aed6db4c3b9bc45accaaef1e6c7b33590f5240bc59ca1", 421),
-    "build_icmp_responder_tod_code": ("ee754e1d26c06ce3f3b68c918e12129ff470ba1c86eb5333ed3f1b091f60dfe3", 545),
-    "build_read_and_respond_echo_request_code": ("e98e97f7df9544f6c28b15b001889f6d37eb7aa991dea13cc9a0d70f435a419f", 369),
+    "build_tx_code": ("51053ba39fcb9e4a6962fba9976e24381a8e797763c3d151757d7d8a942c52cf", 159),
+    "build_ping_and_wait_code": ("58f7b7331a165a6f6a24e2c01de7c0f64dead4e8eb7481d6a8f7ec71c7ccadb2", 336),
+    "build_ping_and_wait_tod_code": ("0966d2b7466f88de81a23e6f834892006c0412a16d1c9f8dfbbd43c397f09abb", 460),
+    "build_icmp_responder_code": ("ee902cbd566d054008b492df4bc1a051ef820c70d27749cb0d111996e9bb0762", 481),
+    "build_icmp_responder_tod_code": ("c92c6634e08e04d10b871191e0e88c64841cda0f8f116454418e547189b2cb4d", 605),
+    "build_read_and_respond_echo_request_code": ("4c212231a0c63b35b467d22c8391e0b799f4719c4d416733bcbb858727259292", 429),
 }
 
 _LEGACY_CALLS = {
@@ -279,10 +285,14 @@ def _tx_sites(code: bytes) -> list[tuple[int, int, int]]:
 
 
 def _first_rxevent_pptr(code: bytes) -> int:
+    """First PPPtr=RxEvent write that opens an RX poll.  The #487 skip phase
+    of every TX site also aims at RxEvent, right after its ``AND #$01 /
+    BNE`` Rdy4TxNOW test; those are part of the transmit, not the poll."""
     seq = _store_imm(0x24, PPTR_LO) + _store_imm(0x01, PPTR_HI)
-    off = code.find(seq)
-    assert off >= 0, "no PPPtr=RxEvent write"
-    return off
+    for m in re.finditer(re.escape(seq), code):
+        if code[m.start() - 4:m.start() - 1] != bytes([0x29, 0x01, 0xD0]):
+            return m.start()
+    raise AssertionError("no PPPtr=RxEvent write outside a TX skip phase")
 
 
 @pytest.mark.parametrize("name", sorted(PING_ARP_BUILDERS))

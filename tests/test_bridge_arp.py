@@ -101,9 +101,9 @@ pytestmark = [
 # Memory layout (see the module docstring for the sizes that drove it)
 # ---------------------------------------------------------------------------
 PEEK_ADDR = 0xC000          # build_rx_peek_code, ~64 bytes
-PING_CODE = 0xC000          # build_ping_and_wait_code + ARP, 319 bytes -> < $C140
+PING_CODE = 0xC000          # build_ping_and_wait_code + ARP, 472 bytes (#487) -> < $C1D8
 RESULT = 0xC1F0
-CONSUME_ADDR = 0xC200       # ARP-capable consume routine, 585 bytes -> < $C44A
+CONSUME_ADDR = 0xC200       # ARP-capable consume routine, 738 bytes (#487) -> < $C4E2
 TX_FRAME_BUF = 0xC500
 ARP_FRAME_BUF = 0xC580
 RX_FRAME_BUF = 0xC700
