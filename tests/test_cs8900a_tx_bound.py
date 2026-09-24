@@ -385,7 +385,7 @@ def test_a_long_frame_goes_out_whole_through_the_ping_builders(n: int) -> None:
 
 # Emitted bytes at or below 256 are pinned to master f927012 (pre-#404),
 # including the two lengths at the top of the 8-bit loop.
-#: Re-pinned deliberately for issue #487 (ip65-parity skip phase at every
+#: Re-pinned deliberately for issue #487 (the RxEvent-gated skip phase at every
 #: TX site): each TX site grew by exactly 60 bytes, and with each 60-byte
 #: skip phase removed the new output equals 9ec1273's byte for byte except
 #: absolute operands relocated by 60 or 120 (scratch provenance487.py, all

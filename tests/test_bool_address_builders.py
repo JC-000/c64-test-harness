@@ -83,7 +83,7 @@ UCI = dict(status_addr=A.STAT, stat_len_addr=A.SLEN, error_addr=A.ERR, sentinel_
 #: agreed on the base for every row).  The seven UCI builders that push a command were
 #: re-taken for #486, whose wait-for-reply change alters exactly two bytes of
 #: each (the wait mask ``$01``->``$28`` and its branch opcode), sizes unchanged.
-#: Re-pinned deliberately for issue #487 (ip65-parity skip phase at every
+#: Re-pinned deliberately for issue #487 (the RxEvent-gated skip phase at every
 #: TX site): each TX site grew by exactly 60 bytes, and with each 60-byte
 #: skip phase removed the new output equals 9ec1273's byte for byte except
 #: absolute operands relocated by 60 or 120 (scratch provenance487.py, all

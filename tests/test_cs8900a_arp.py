@@ -206,7 +206,7 @@ def test_arp_builders_reject_an_ip_that_is_not_four_bytes(bad_ip: bytes) -> None
 # responder 7ec06447.. 401, responder_tod 15392373.. 525, respond 47afe09e.. 349.
 # What "opt-in means opt-in" still guards: ARP support adds nothing to
 # these bytes; the #236 structure is pinned in test_cs8900a_register_pins.py.
-# Re-pinned deliberately for issue #487 (ip65-parity skip phase at every
+# Re-pinned deliberately for issue #487 (the RxEvent-gated skip phase at every
 # TX site): each TX site grew by exactly 60 bytes, and with each 60-byte
 # skip phase removed the new output equals 9ec1273's byte for byte except
 # absolute operands relocated by 60 or 120 (scratch provenance487.py, all

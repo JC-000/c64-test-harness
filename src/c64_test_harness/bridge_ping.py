@@ -678,12 +678,15 @@ CS8900A_LINECTL_ENABLE = 0x00C0
 #: characterised chip limit.
 CS8900A_TX_READY_MAX_POLLS = 65536
 
-#: How many times every TX site checks ``Rdy4TxNOW`` and, when it is clear,
-#: SkipNows one received frame before falling into the bounded poll (issue
-#: #487) -- ip65's ``send`` does exactly this, 8 tries
-#: (``drivers/cs8900a.s:452-467``, source-read).  Unread RX frames starve
-#: the chip's shared buffer and ``Rdy4TxNOW`` stays clear until they go
-#: (measured, #303).
+#: How many times every TX site checks ``Rdy4TxNOW`` and, when it is clear
+#: and RxEvent shows a frame queued, SkipNows one received frame before
+#: falling into the bounded poll (issue #487).  Modelled on ip65's ``send``
+#: (``drivers/cs8900a.s:452-467``, source-read), which also tries 8 times
+#: but skips unconditionally on a clear read and fails after the 8; the
+#: harness gates each skip on RxEvent, like its #222 drain, and keeps the
+#: #236 bounded poll after the tries.  Unread RX frames starve the chip's
+#: shared buffer and ``Rdy4TxNOW`` stays clear until they go (measured,
+#: #303).
 CS8900A_TX_SKIP_TRIES = 8
 
 #: Result byte every TX builder stores when ``Rdy4TxNOW`` did not assert
@@ -1011,13 +1014,16 @@ def _emit_tx_frame(
     TxCMD = :data:`CS8900A_TXCMD_VALUE`, TxLength = ``frame_len``, then the
     #487 skip phase: read ``Rdy4TxNOW`` up to :data:`CS8900A_TX_SKIP_TRIES`
     times and after each clear read SkipNow one received frame when RxEvent
-    says one is queued (ip65's ``send``; unread RX frames starve the TX
-    buffer, #303), counting the tries in ``$FB``.  Then PPPtr = BusST
+    says one is queued (unread RX frames starve the TX buffer, #303),
+    counting the tries in ``$FB``.  Modelled on ip65's ``send``, which
+    skips unconditionally on a clear read and fails after 8; the harness
+    gates the skip on RxEvent, like its #222 drain, and keeps the bounded
+    poll after.  Then PPPtr = BusST
     (0x0138), poll ``Rdy4TxNOW`` at most ``max_polls`` times, then copy the
     frame into RTDATA low half first through ``($FB),Y``.  The skip phase
     adds 60 bytes per TX site and discards the frames it skips, so a
     routine that must read a frame queued behind its own transmit loses it
-    when the chip is starved -- ip65 accepts the same.  This is
+    when the chip is starved -- ip65 accepts the same loss.  This is
     the one TX sequence every builder emits; ``prefix`` keeps the labels
     unique in a routine that transmits more than once (ARP request then
     echo request, or ARP reply then echo reply -- issue #218).
@@ -1060,10 +1066,11 @@ def _emit_tx_frame(
     a.emit(0xA9, 0x00, 0x8D, TXCMD_HI & 0xFF, TXCMD_HI >> 8)
     a.emit(0xA9, frame_len & 0xFF, 0x8D, TXLEN_LO & 0xFF, TXLEN_LO >> 8)
     a.emit(0xA9, (frame_len >> 8) & 0xFF, 0x8D, TXLEN_HI & 0xFF, TXLEN_HI >> 8)
-    # issue #487, ip65 ``send`` (drivers/cs8900a.s:452-467): check
+    # issue #487, after ip65 ``send`` (drivers/cs8900a.s:452-467): check
     # Rdy4TxNOW up to CS8900A_TX_SKIP_TRIES times, and after each clear read
-    # SkipNow one received frame -- unread RX frames starve the shared
-    # buffer (#303).  Then the #236 bounded poll, unchanged.  $FB counts the
+    # SkipNow one received frame if RxEvent shows one (ip65 skips
+    # unconditionally) -- unread RX frames starve the shared buffer (#303).
+    # Then the #236 bounded poll, unchanged (ip65 fails after the tries).  $FB counts the
     # tries; the copy below reloads it.
     a.emit(0xA9, CS8900A_TX_SKIP_TRIES, 0x85, 0xFB)  # LDA #tries / STA $FB
     a.label(f"{prefix}_txsk")
@@ -1228,7 +1235,9 @@ def build_tx_code(
       buffer **starved by the RX queue** (measured, #303); unprovoked
       ``0x04`` results are attributed to the same cause.  Since #487 the
       routine itself SkipNows up to :data:`CS8900A_TX_SKIP_TRIES` queued
-      frames before the bounded poll (ip65's ``send``), so ``0x04`` now
+      frames before the bounded poll (after ip65's ``send``, which skips
+      unconditionally and fails after 8; the harness gates the skip on
+      RxEvent and keeps the bounded poll), so ``0x04`` now
       means more than that were queued or the chip is not starved but
       dead: drain the queue first (``drain_first=True``) or reset the chip
       (:func:`build_cs8900a_reset_code`).  The skip phase is pinned on the

@@ -250,7 +250,7 @@ def _skip_phase_anchors(code: bytes) -> set[int]:
 
 
 def _skip_phases(code: bytes) -> list[dict[str, int]]:
-    """Decode the ip65-parity skip phase in front of every bounded poll (#487).
+    """Decode the #487 skip phase in front of every bounded poll.
 
     Emitted shape (:func:`bridge_ping._emit_tx_frame`)::
 
@@ -501,11 +501,13 @@ def test_tx_sequence_is_txcmd_txlen_busst_poll_then_data(name: str) -> None:
 
 
 @pytest.mark.parametrize("name", sorted(TX_BUILDERS))
-def test_every_tx_site_skips_a_received_frame_per_clear_read_like_ip65(name: str) -> None:
+def test_every_tx_site_skips_a_queued_frame_per_clear_read(name: str) -> None:
     """Issue #487: before the bounded poll, each TX site checks Rdy4TxNOW
     :data:`TX_SKIP_TRIES` times, going straight to the copy when it is set
     and otherwise issuing SkipNow (only when RxEvent says a frame is
-    queued) -- ip65's ``send`` (``drivers/cs8900a.s:452-467``).  Rejected
+    queued).  Modelled on ip65's ``send`` (``drivers/cs8900a.s:452-467``),
+    which skips unconditionally and fails after 8; the harness gates the
+    skip on RxEvent and keeps the bounded poll after.  Rejected
     by name: another try count, a ready branch that does not reach the
     bounded poll's copy, a SkipNow without the RESET-free ``$40`` bit on
     RxCFG's low byte, a loop that does not return to re-aim at BusST, and a

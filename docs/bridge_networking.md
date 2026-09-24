@@ -1019,8 +1019,8 @@ Result bytes the TX builders can now store:
   at 1 MHz; shorter under turbo, inferred) and stores `0x04`. The
   orchestrators `run_ping_and_wait` / `run_icmp_responder` return it. The
   cost is +20 bytes per single-transmit routine and +33 per two-transmit
-  routine (`build_tx_code` 79 → 99, still at or under the 128-byte PUT
-  threshold). X is now clobbered by every transmit.
+  routine (at #236: `build_tx_code` 79 → 99, then still at or under the
+  128-byte PUT threshold; #487 took it past it). X is now clobbered by every transmit.
 - **`0x01` is a completion flag, not a delivery flag**
   ([#235](https://github.com/JC-000/c64-test-harness/issues/235)).
   Nothing reads `TxEvent` or `TxBidErr` after the copy. Measured: a
@@ -1141,11 +1141,14 @@ Result bytes the TX builders can now store:
   (a bare `RTS` 0.11 s) and about 0.15 s at 48 MHz (measured before #487's
   skip phase, which adds eight BusST reads in front).
 - **Every TX site SkipNows received frames when `Rdy4TxNOW` is clear**
-  ([#487](https://github.com/JC-000/c64-test-harness/issues/487)), as
-  ip65's `send` does (`drivers/cs8900a.s:452-467`, source-read): up to
+  ([#487](https://github.com/JC-000/c64-test-harness/issues/487)): up to
   `CS8900A_TX_SKIP_TRIES` = 8 reads of `Rdy4TxNOW`, each clear one
   followed by SkipNow when RxEvent shows a queued frame, then the #236
-  bounded poll unchanged. So a builder without `drain_first` transmits
+  bounded poll unchanged. Modelled on ip65's `send`
+  (`drivers/cs8900a.s:452-467`, source-read), which is not the same: it
+  skips unconditionally on a clear read and fails after the 8; the
+  harness gates the skip on RxEvent, like its #222 drain, and keeps the
+  bounded poll after. So a builder without `drain_first` transmits
   through a chip starved by up to 8 unread frames; deeper queues still
   need the drain. It costs 60 bytes per TX site (`build_tx_code` 159-180,
   the ping and responder builders 336-907), and the skipped frames are

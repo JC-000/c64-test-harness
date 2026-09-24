@@ -4,13 +4,17 @@ ip65's ``send`` (``drivers/cs8900a.s:452-467``, source-read at
 ``~/Documents/c64-https/ip65``) bids, then checks BusST bit 8
 (``Rdy4TxNOW``) up to 8 times, and on each clear read issues SkipNow
 (RxCFG ``|= $40``) to free a received frame from the shared buffer.
-The harness only polled, and on silicon a chip starved by unread RX frames
+It gives up after the 8.  The harness only polled, and on silicon a chip starved by unread RX frames
 never asserts ``Rdy4TxNOW`` until they are drained or the chip is reset
 (measured, U64E fw 3.15 ``bce4535e``, 2026-09-23, #303: 3 injected host
 frames -> ``0x04`` 5/6 vs 0/6; persistent 16/16).  Since #487
-``_emit_tx_frame`` does ip65's 8 checks with a SkipNow after each clear
-one, then falls into the old bounded poll -- so every builder transmits
-through a starved chip without ``drain_first``.
+``_emit_tx_frame`` does 8 checks with a SkipNow after each clear one --
+gated on RxEvent showing a queued frame, unlike ip65, which skips
+unconditionally -- then falls into the old bounded poll instead of failing
+-- so every builder transmits through a starved chip without
+``drain_first``.  The ungated form is equivalent on this simulator (its
+SkipNow is a no-op on an empty queue); only the byte pins and the
+register-pins decoder tell them apart.
 
 These run on the simulated chip's starvation model
 (``Cs8900aSim.tx_starved_by_rx``: any queued frame starves every bid).  The
