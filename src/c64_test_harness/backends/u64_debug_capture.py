@@ -6,9 +6,13 @@ entries, each representing one bus cycle.
 
 **Rate cap (measured, not a bug in this receiver)**
 
-The U64E FPGA emits the debug stream at a fixed rate of roughly
-**~850,000 entries per second** (≈ 2,400 UDP packets/sec) regardless
-of the CPU's actual turbo speed. This matches the 6510's native rate
+The U64E FPGA emits the debug stream at a fixed rate of
+**~1,023,000 entries per second** (2,842-2,843 UDP packets/sec on the NTSC
+U64E, 1 MHz, wired host, 0 lost, n=3, bce4535e 2026-09-23; #432 --
+consistent with one entry per NTSC phi2 cycle, 1022727/360 = 2840.9: a
+rate match, 360 entries per packet, n=3, Debug Stream Mode presumed at its
+default 6510 Only, not recorded) regardless of the CPU's
+actual turbo speed. This matches the 6510's native rate
 at 1 MHz, so at 1 MHz you get an essentially complete cycle-accurate
 trace. At higher turbo speeds you get a **uniformly sampled 1/N view**
 of the real bus: at 4 MHz you see ~1/4 of cycles, at 48 MHz ~1/48.
@@ -44,7 +48,7 @@ capture is fine because the sampling is uniform.
 
 What was *observed*: over a long run with sustained adjacent
 workload, delivery fell to **30-90% of the configured rate**, with
-``packets_received`` well below the expected ~2,400/sec even at
+``packets_received`` well below the expected ~2,840/sec even at
 1 MHz, and :meth:`Ultimate64Client.reboot` restored it where a soft
 :meth:`Ultimate64Client.reset` did not.
 
@@ -310,7 +314,7 @@ class DebugCapture:
 
     .. note::
 
-       The U64E debug stream is rate-capped at ~850k entries/sec at the
+       The U64E debug stream is rate-capped at ~1.02M entries/sec (#432) at the
        FPGA source (see the module docstring). At CPU turbo speeds you
        receive a uniformly sampled ``1/N`` view of the bus, not a
        dropped-during-send slice. Turbo speed adds no sequence gaps,

@@ -131,7 +131,7 @@ from dataclasses import dataclass, field
 #: duplicate has been observed on this bench (#410, #430: zero backward steps
 #: in 28 captures), so there is no lateness distribution to size it from.  It
 #: bounds memory, and lateness at ~4 s of audio (250 packets/s) or ~0.4 s of
-#: debug stream (~2,400 packets/s).
+#: debug stream (~2,840 packets/s).
 SEQ_REORDER_WINDOW = 1024
 
 #: Digest-identical datagrams held at once before a continuing run is taken

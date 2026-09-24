@@ -53,6 +53,12 @@ from live_fixture_teardown import (
     raise_teardown_failures,
     teardown_then_release,
 )
+from stream_rate_floor import (
+    AUDIO_EMIT_PPS_MIN,
+    emission_ok,
+    emitted_pps,
+    stream_window,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -340,20 +346,15 @@ def test_capture_silence(u64_client: Ultimate64Client, tmp_path) -> None:
     """
     wav_path = tmp_path / "silence.wav"
     capture = AudioCapture(port=EPHEMERAL_AUDIO_PORT)
-    stream_started = False
     try:
         capture.start()
-        u64_client.stream_audio_start(
-            f"{_local_ip_towards(u64_client.host)}:{capture.port}"
+        window = stream_window(
+            lambda: u64_client.stream_audio_start(
+                f"{_local_ip_towards(u64_client.host)}:{capture.port}"
+            ),
+            u64_client.stream_audio_stop, 1.0,
         )
-        stream_started = True
-        time.sleep(1.0)
     finally:
-        if stream_started:
-            try:
-                u64_client.stream_audio_stop()
-            except Exception:
-                pass
         result = capture.stop(wav_path=wav_path)
 
     assert wav_path.exists(), "WAV file was not created"
@@ -362,6 +363,16 @@ def test_capture_silence(u64_client: Ultimate64Client, tmp_path) -> None:
         "is the assertion that proves the stream reached the capture"
     )
     assert result.total_samples > 0, "Capture holds no PCM frames"
+    emitted = emitted_pps(result.packets_received, result.packets_dropped, window)
+    assert emission_ok(
+        result.packets_received, result.packets_dropped, window,
+        AUDIO_EMIT_PPS_MIN,
+    ), (
+        f"the device emitted {emitted:.0f} audio packets/s by its own "
+        f"sequence numbers, below the {AUDIO_EMIT_PPS_MIN:.0f} floor "
+        "(249.69 derived) -- host-side loss cannot cause this; see "
+        "tests/stream_rate_floor.py (#432)"
+    )
     logger.info(
         "Silence capture: %.2fs, %d packets, %d dropped",
         result.duration_seconds,
