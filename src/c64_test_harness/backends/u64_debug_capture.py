@@ -8,8 +8,10 @@ entries, each representing one bus cycle.
 
 The U64E FPGA emits the debug stream at a fixed rate of
 **~1,023,000 entries per second** (2,842-2,843 UDP packets/sec on the NTSC
-U64E, 1 MHz, wired host, 0 lost, n=3, bce4535e 2026-09-23 -- one entry
-per phi2 cycle: 1022727/360 = 2840.9; #432) regardless of the CPU's
+U64E, 1 MHz, wired host, 0 lost, n=3, bce4535e 2026-09-23; #432 --
+consistent with one entry per NTSC phi2 cycle, 1022727/360 = 2840.9: a
+rate match, 360 entries per packet, n=3, Debug Stream Mode presumed at its
+default 6510 Only, not recorded) regardless of the CPU's
 actual turbo speed. This matches the 6510's native rate
 at 1 MHz, so at 1 MHz you get an essentially complete cycle-accurate
 trace. At higher turbo speeds you get a **uniformly sampled 1/N view**

@@ -53,7 +53,12 @@ from live_fixture_teardown import (
     raise_teardown_failures,
     teardown_then_release,
 )
-from stream_rate_floor import AUDIO_EMIT_PPS_MIN, emission_ok, emitted_pps
+from stream_rate_floor import (
+    AUDIO_EMIT_PPS_MIN,
+    emission_ok,
+    emitted_pps,
+    stream_window,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -341,23 +346,15 @@ def test_capture_silence(u64_client: Ultimate64Client, tmp_path) -> None:
     """
     wav_path = tmp_path / "silence.wav"
     capture = AudioCapture(port=EPHEMERAL_AUDIO_PORT)
-    stream_started = False
-    window_start = window_end = None
     try:
         capture.start()
-        u64_client.stream_audio_start(
-            f"{_local_ip_towards(u64_client.host)}:{capture.port}"
+        window = stream_window(
+            lambda: u64_client.stream_audio_start(
+                f"{_local_ip_towards(u64_client.host)}:{capture.port}"
+            ),
+            u64_client.stream_audio_stop, 1.0,
         )
-        stream_started = True
-        window_start = time.monotonic()
-        time.sleep(1.0)
     finally:
-        if stream_started:
-            try:
-                u64_client.stream_audio_stop()
-                window_end = time.monotonic()
-            except Exception:
-                pass
         result = capture.stop(wav_path=wav_path)
 
     assert wav_path.exists(), "WAV file was not created"
@@ -366,8 +363,6 @@ def test_capture_silence(u64_client: Ultimate64Client, tmp_path) -> None:
         "is the assertion that proves the stream reached the capture"
     )
     assert result.total_samples > 0, "Capture holds no PCM frames"
-    assert window_start is not None and window_end is not None
-    window = window_end - window_start
     emitted = emitted_pps(result.packets_received, result.packets_dropped, window)
     assert emission_ok(
         result.packets_received, result.packets_dropped, window,

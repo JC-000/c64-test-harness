@@ -32,7 +32,12 @@ from c64_test_harness.backends.ultimate64_helpers import (
     DEBUG_MODE_6510_VIC,
 )
 from live_fixture_teardown import raise_teardown_failures, teardown_then_release
-from stream_rate_floor import DEBUG_EMIT_PPS_MIN, emission_ok, emitted_pps
+from stream_rate_floor import (
+    DEBUG_EMIT_PPS_MIN,
+    emission_ok,
+    emitted_pps,
+    stream_window,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -184,17 +189,12 @@ def test_debug_stream_captures_cycles(client: Ultimate64Client) -> None:
     local = _local_ip()
     cap = DebugCapture(port=11002)
     cap.start()
-    window_start = window_end = None
     try:
-        client.stream_debug_start(f"{local}:11002")
-        window_start = time.monotonic()
-        time.sleep(1.0)
+        window = stream_window(
+            lambda: client.stream_debug_start(f"{local}:11002"),
+            client.stream_debug_stop, 1.0,
+        )
     finally:
-        try:
-            client.stream_debug_stop()
-            window_end = time.monotonic()
-        except Exception:
-            pass
         time.sleep(0.3)
         result = cap.stop()
 
@@ -234,8 +234,6 @@ def test_debug_stream_captures_cycles(client: Ultimate64Client) -> None:
         "above that points at the receiver's sequence accounting (byte "
         "order) -- see DEBUG_STREAM_LOSS_MAX (#356)"
     )
-    assert window_start is not None and window_end is not None
-    window = window_end - window_start
     emitted = emitted_pps(result.packets_received, result.packets_dropped, window)
     assert emission_ok(
         result.packets_received, result.packets_dropped, window,
