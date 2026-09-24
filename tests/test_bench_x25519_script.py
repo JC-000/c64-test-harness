@@ -31,6 +31,9 @@ _LABELS = {
     "x25_scalar": 0x19A0,
     "x25_result": 0x19E0,
     "bench_ticks": 0x177A,
+    "bench_cycles_start": 0x177D,
+    "bench_cycles_stop": 0x17AC,
+    "bench_cycles": 0x17DC,
     "vic_blank": 0x17E1,
     "vic_unblank": 0x17EA,
 }
@@ -102,7 +105,8 @@ def _drive_run_one_speed(monkeypatch, module, tmp_path, main_loop, parked_reads)
         sleep=lambda *a: None, monotonic=lambda: next(clock)))
 
     result = module.run_one_speed(
-        _FakeClient(), _FakeTransport(), prg.read_bytes(), labels, 48, 60.0)
+        _FakeClient(), _FakeTransport(), prg.read_bytes(), labels, 48, 60.0,
+        system_mode="NTSC")
     return result, writes
 
 
@@ -122,7 +126,9 @@ def test_run_one_speed_accepts_the_build_park_bytes(
 
     assert result is not None, "the boot poll never matched the parked JMP"
     assert result["correct"] is True
-    assert [d for a, d in writes if a == main_loop] == [_jmp(module.BENCH_SUB)]
+    assert [a for a, _ in writes if a == main_loop] == []
+    assert [d for a, d in writes if a == main_loop + 2] == [
+        bytes([module._bench_sub_addr(main_loop) >> 8])]
 
 
 def test_run_one_speed_rejects_the_stale_literal(
@@ -135,7 +141,131 @@ def test_run_one_speed_rejects_the_stale_literal(
         monkeypatch, module, tmp_path, 0x082D, bytes([0x4C, 0x2A, 0x08]))
 
     assert result is None
-    assert [a for a, _ in writes if a == 0x082D] == []
+    assert [a for a, _ in writes if 0x082D <= a <= 0x082F] == []
+
+
+@pytest.mark.parametrize("main_loop", [0x082D, 0x0900, 0x08FF])
+def test_run_one_speed_hijack_cannot_be_fetched_torn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, main_loop: int
+) -> None:
+    """Every ``JMP`` the 6510 can fetch while the hijack lands is safe (#477).
+
+    ``JMP $0360`` written whole over ``JMP $082D`` can run as ``JMP $032D``:
+    the #426 torn fetch, harness scratch.  See ``tests/torn_fetch.py``.
+    """
+    from torn_fetch import fetched_targets, span_writes
+
+    module = _load()
+    result, writes = _drive_run_one_speed(
+        monkeypatch, module, tmp_path, main_loop, _jmp(main_loop))
+
+    assert result is not None
+    # The routine is the one upload that is neither the scalar, the
+    # sentinel nor the hijack; wherever it went, the hijack must go there.
+    others = {main_loop, main_loop + 2, _LABELS["x25_scalar"], module.SENTINEL_ADDR}
+    (bench_sub,) = {a for a, _ in writes if a not in others}
+    targets = fetched_targets(main_loop, _jmp(main_loop), span_writes(main_loop, writes))
+    assert bench_sub in targets, f"the hijack never reaches the routine at ${bench_sub:04X}"
+    assert targets <= {main_loop, bench_sub}, (
+        f"torn fetch can jump to {sorted(f'${t:04X}' for t in targets - {main_loop, bench_sub})}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The timing readout (#477: the jiffy clock never ticked)
+# ---------------------------------------------------------------------------
+
+def test_bench_subroutine_times_the_call_with_the_cia_cycle_counter() -> None:
+    """Run the emitted routine on the sim CPU against recording stubs.
+
+    ``x25519_scalarmult`` runs its whole body under ``sei`` (c64-x25519 #35),
+    so the KERNAL jiffy clock the routine used to read never advanced: the
+    column read 1 at every speed.  The build's ``bench_cycles_start`` /
+    ``bench_cycles_stop`` (CIA1 TA+TB) keep counting under ``sei``; the
+    multiplication must run between them, and blanking outside them.
+    """
+    from cs8900a_sim import Cpu6502, Cs8900aSim
+
+    module = _load()
+    stubs = {name: 0x4000 + 0x10 * i for i, name in enumerate(
+        ["vic_blank", "bench_cycles_start", "x25519_base", "bench_cycles_stop",
+         "vic_unblank"])}
+    log_count, log = 0x02F0, 0x02F1
+    cpu = Cpu6502(Cs8900aSim(rx_queue=[]))
+    for i, addr in enumerate(stubs.values()):
+        # LDX log_count ; LDA #i ; STA log,X ; INC log_count ; RTS
+        cpu.load(addr, bytes([0xAE, log_count & 0xFF, log_count >> 8,
+                              0xA9, i, 0x9D, log & 0xFF, log >> 8,
+                              0xEE, log_count & 0xFF, log_count >> 8, 0x60]))
+    base = module._bench_sub_addr(0x082D)
+    code = module._build_bench_subroutine(base, stubs)
+    cpu.load(base, code)
+    park = base + len(code) - 3
+    cpu.pc = base
+    for _ in range(10_000):
+        if cpu.pc == park:
+            break
+        cpu.step()
+    assert cpu.pc == park, "the routine never reached its park"
+    order = [list(stubs)[b] for b in cpu.mem[log:log + cpu.mem[log_count]]]
+    assert order == ["vic_blank", "bench_cycles_start", "x25519_base",
+                     "bench_cycles_stop", "vic_unblank"]
+    assert cpu.mem[module.SENTINEL_ADDR] == module.SENTINEL_VALUE
+
+
+@pytest.mark.parametrize("mode", ["NTSC", "PAL"])
+def test_run_one_speed_reports_the_cycle_count_the_build_stored(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
+) -> None:
+    """``bench_cycles`` is a little-endian u32; seconds only at the NTSC phi2 rate.
+
+    No PAL constant is published here, so off NTSC the count is reported and
+    the seconds are withheld rather than computed at the wrong rate.
+    """
+    module = _load()
+    count = 17_000_000
+    stored = count.to_bytes(4, "little")
+
+    prg = _write_build(tmp_path)
+    labels = module.Labels.from_file(prg.parent / "labels.txt")
+
+    class _Transport:
+        def read_memory(self, addr: int, n: int) -> bytes:
+            if addr == 0x082D:
+                return _jmp(0x082D)
+            if addr == module.SENTINEL_ADDR:
+                return bytes([module.SENTINEL_VALUE])
+            if addr == labels["x25_result"]:
+                return module.RFC7748_EXPECTED
+            if addr == labels["bench_cycles"]:
+                return stored[:n]
+            return bytes(n)
+
+        def write_memory(self, addr: int, data: bytes) -> None:
+            pass
+
+    class _Client:
+        def reboot(self) -> None:
+            pass
+
+        def run_prg(self, data: bytes) -> None:
+            pass
+
+    clock = iter(float(i) for i in range(10_000))
+    monkeypatch.setattr(module, "set_reu", lambda *a, **k: None)
+    monkeypatch.setattr(module, "set_turbo_mhz", lambda *a, **k: None)
+    monkeypatch.setattr(module, "time", types.SimpleNamespace(
+        sleep=lambda *a: None, monotonic=lambda: next(clock)))
+
+    result = module.run_one_speed(_Client(), _Transport(), prg.read_bytes(), labels,
+                                  48, 60.0, system_mode=mode)
+
+    assert result["cycles"] == count
+    if mode == "NTSC":
+        assert result["c64_secs"] == pytest.approx(count / float(module.NTSC_PHI2_HZ))
+    else:
+        assert result["c64_secs"] is None
+    module.print_summary([result])        # a None must not break the table
 
 
 # ---------------------------------------------------------------------------

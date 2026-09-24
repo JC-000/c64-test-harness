@@ -1074,7 +1074,9 @@ SENTINEL = 0x0350      # Scratch byte for completion signaling
 MAIN_LOOP = labels["main_loop"]      # Program's parking JMP (JMP main_loop)
 TARGET_SUB = labels["x25519_clamp"]  # Subroutine to call
 # Same low byte as MAIN_LOOP, so the hijack below rewrites one byte (#426).
-TRAMPOLINE = 0xCE00 | (MAIN_LOOP & 0xFF)
+# Page $CD: $CD00 | lo plus the trampoline ends by $CE0A for any lo, clear of
+# HARNESS_SCRATCH ($CF00) -- the scripts and turbo bench use it too (#477).
+TRAMPOLINE = 0xCD00 | (MAIN_LOOP & 0xFF)
 
 # Build trampoline: JSR target; LDA #$42; STA sentinel; JMP * (park)
 trampoline = bytes([
@@ -1083,9 +1085,6 @@ trampoline = bytes([
     0x8D, SENTINEL & 0xFF, (SENTINEL >> 8) & 0xFF,       # STA sentinel
     0x4C, (TRAMPOLINE + 8) & 0xFF, ((TRAMPOLINE + 8) >> 8) & 0xFF,  # JMP *
 ])
-# $CE00 | lo plus 11 bytes runs into $CF00 (HARNESS_SCRATCH) when lo >= $F5.
-assert TRAMPOLINE + len(trampoline) <= 0xCF00
-
 # Write trampoline + zero sentinel via DMA
 write_bytes(transport, TRAMPOLINE, trampoline)
 write_bytes(transport, SENTINEL, bytes([0x00]))
