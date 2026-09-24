@@ -1240,8 +1240,14 @@ def build_tx_code(
       RxEvent and keeps the bounded poll), so ``0x04`` now
       means more than that were queued or the chip is not starved but
       dead: drain the queue first (``drain_first=True``) or reset the chip
-      (:func:`build_cs8900a_reset_code`).  The skip phase is pinned on the
-      simulated chip only; its live check is owed (#487).
+      (:func:`build_cs8900a_reset_code`).  Measured on the U64E (fw
+      ``bce4535e``, #495 head 8263182, 1 MHz, 1514 B, 2026-09-23): on a
+      chip confirmed starved (two pre-#487 transmits both ``0x04``) this
+      routine transmitted byte-exact 7/7 against 1/6 for the pre-#487 code,
+      and the ungated ip65 form 7/7 -- the RxEvent gate made no difference
+      at this n.  5 of 27 trials self-cleared between the confirming probes
+      and were not counted, and one confirmed-starved control still sent
+      (https://github.com/JC-000/c64-test-harness/issues/487#issuecomment-5806809683).
 
     ``drain_first`` (issue #303): SkipNow every frame already queued in the
     chip before the bid (:func:`_emit_drain_rx`, at most

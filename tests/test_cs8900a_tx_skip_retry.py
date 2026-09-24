@@ -17,9 +17,9 @@ SkipNow is a no-op on an empty queue); only the byte pins and the
 register-pins decoder tell them apart.
 
 These run on the simulated chip's starvation model
-(``Cs8900aSim.tx_starved_by_rx``: any queued frame starves every bid).  The
-live check (starved chip, no ``drain_first``) waits for the RR-Net to be
-re-cabled.
+(``Cs8900aSim.tx_starved_by_rx``: any queued frame starves every bid).  On
+silicon (U64E, 2026-09-23, #487) a confirmed-starved chip transmitted 7/7
+through this path without ``drain_first``, against 1/6 on the pre-#487 code.
 """
 from __future__ import annotations
 

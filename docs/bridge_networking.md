@@ -1153,9 +1153,17 @@ Result bytes the TX builders can now store:
   need the drain. It costs 60 bytes per TX site (`build_tx_code` 159-180,
   the ping and responder builders 336-907), and the skipped frames are
   discarded, so a routine that must read a frame queued behind its own
-  transmit loses it on a starved chip, as ip65 does. Pinned on the
-  simulated chip; **unmeasured on silicon** — the paired live check
-  (starved chip, no `drain_first`) is owed. `drain_status_addr` on any
+  transmit loses it on a starved chip, as ip65 does. **Measured on
+  silicon** (U64E fw `bce4535e`, external RR-Net to en4, #495 head
+  8263182, 1 MHz, 1514 B, 2026-09-23;
+  [evidence](https://github.com/JC-000/c64-test-harness/issues/487#issuecomment-5806809683)): on a chip confirmed
+  starved (3 injected host frames, then two pre-#487 transmits both
+  `0x04`), plain `build_tx_code` without `drain_first` transmitted
+  byte-exact 7/7 and the ungated ip65 form 7/7, against 1/6 for the
+  pre-#487 code, interleaved over 2 sessions; the RxEvent gate made no
+  difference at this n. Caveat: 5 of 27 trials self-cleared between the
+  two confirming probes and were not counted, and one confirmed-starved
+  control still sent, so starvation held less reliably than in #303. `drain_status_addr` on any
   builder is now refused when it lands on `result_addr`, a transmitted
   frame or the routine's own bytes.
 - **ip65 does not actually wait for RESET to clear** (read from source).
