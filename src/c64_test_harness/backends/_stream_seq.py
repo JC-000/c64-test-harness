@@ -83,7 +83,8 @@ measured on this bench, so none of these has been seen):
   datagram, so this is not "silent restarts lose packets".  Declared and
   accepted rather than fixed: it is the same ambiguity as the residual
   above (a re-sent 48, 49 then a late 50 is indistinguishable from a
-  restart), and no duplication or restart has been measured on the device.
+  restart).  No duplication has been measured on the device; a restart
+  has (#452, below).
 
   **The loss is countable**: those discarded payloads are in
   :attr:`SequenceTracker.discarded`, surfaced as ``payloads_discarded`` on

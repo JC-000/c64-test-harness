@@ -430,7 +430,8 @@ def build_udp_frame(
     frame = dst_mac + src_mac + b"\x08\x00" + ip_header + udp_header + payload
 
     # CS8900a TX padding: 60-byte minimum (chip appends 4-byte FCS), and
-    # the TX FIFO is word-oriented so length must be even.
+    # even, because the TX builders refuse an odd length unless the caller
+    # opts in (``allow_odd_frame_len``, #438).
     if len(frame) < 60:
         frame = frame + b"\x00" * (60 - len(frame))
     if len(frame) % 2:

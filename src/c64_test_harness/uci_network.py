@@ -325,11 +325,13 @@ _SOCKET_READ_HEADER_LEN = 2
 #: multi-block routine (issue #420).
 SOCKET_READ_MAX_BYTES = 255 - _SOCKET_READ_HEADER_LEN
 
-#: Most a ``READ_SOCKET`` can return: firmware 3.15 refuses a longer request
-#: with ``82,PARAMETER(S) OUT OF RANGE`` (``network_target.h``
-#: ``NET_MAX_SOCKET_READ``, upstream #802; bce4535e).  Pre-3.15 firmware
-#: refuses anything above 894 the same way (``CMD_MAX_REPLY_LEN - 2``), and
-#: 894 itself is not safe there -- see :data:`_PRE_315_SAFE_READ`.
+#: Most a ``READ_SOCKET`` can return: firmware carrying upstream #802
+#: (post-tag, c0fd6d70; bce4535e has it) refuses a longer request with
+#: ``82,PARAMETER(S) OUT OF RANGE`` (``network_target.h``
+#: ``NET_MAX_SOCKET_READ``).  Firmware without it -- stock v3.15 and
+#: everything older -- refuses anything above 894 the same way
+#: (``CMD_MAX_REPLY_LEN - 2``), and 894 itself is not safe there -- see
+#: :data:`_PRE_315_SAFE_READ`.
 NET_MAX_SOCKET_READ = 1472
 
 #: Where the multi-block read routine stores ``[len_lo][len_hi][payload]``:
@@ -347,8 +349,8 @@ _READ_REMAIN_HI = _INNER_LOOP_CNT_HI   # $C401
 #: so 5 ms, plus margin (#479).
 _TURBO_READ_SECONDS_PER_BYTE = 0.006
 
-#: Largest READ_SOCKET that drains safely on firmware before 3.15: its
-#: single reply block is header + payload in an 896-byte buffer, and a block
+#: Largest READ_SOCKET that drains safely on firmware without upstream #802:
+#: its single reply block is header + payload in an 896-byte buffer, and a block
 #: that fills the buffer exactly is never reported drained (#479).
 _PRE_315_SAFE_READ = 893
 
@@ -892,10 +894,10 @@ def _build_read_response_multiblock(
 ) -> list[int]:
     """Drain a reply that may span Data More blocks (issue #420).
 
-    Firmware 3.15 answers a long ``READ_SOCKET`` in blocks: the interface
-    reads STATE ``11`` after a block that is not the last, a DATA_ACC write
-    moves it to ``01`` while the firmware fills the next block, and the last
-    block leaves it at ``10`` (``command_protocol.vhd``;
+    Firmware carrying upstream #802 answers a long ``READ_SOCKET`` in
+    blocks: the interface reads STATE ``11`` after a block that is not the
+    last, a DATA_ACC write moves it to ``01`` while the firmware fills the
+    next block, and the last block leaves it at ``10`` (``command_protocol.vhd``;
     ``command_intf.cc``; ``network_target.cc`` ``get_more_data``).  So::
 
             remain := limit ; len := 0
@@ -1897,7 +1899,7 @@ def build_socket_read(
     drain (at most 256 bytes stored, *result_addr* default ``$C200``); its
     bytes are unchanged for every *max_len* by issue #420.  ``True`` is the
     multi-block drain of :func:`_build_read_response_multiblock`: it follows
-    firmware 3.15's Data More blocks, stores at most ``max_len + 2`` bytes
+    the Data More blocks of firmware carrying upstream #802, stores at most ``max_len + 2`` bytes
     (header included) at *result_addr* (default ``$C500``,
     :data:`_LONG_READ_BUF_ADDR`) and writes a 16-bit count at
     *actual_len_addr*.  ``None`` (the default) means ``True`` exactly when
@@ -2740,7 +2742,7 @@ def uci_socket_read(
     *max_len* up to :data:`SOCKET_READ_MAX_BYTES` (253) uses the
     single-block routine, unchanged.  Above it, up to
     :data:`NET_MAX_SOCKET_READ` (1472), the multi-block routine drains
-    every Data More block firmware 3.15 sends, into ``$C500``
+    every Data More block the firmware sends, into ``$C500``
     (issue #420); the payload length is the first block's header, and
     never more than *max_len* is returned.  When the header announces more
     than arrived, :class:`UCISocketReadTruncatedError` is raised carrying
@@ -2819,7 +2821,7 @@ def uci_socket_read(
     if payload_len > available:
         # The firmware reports the *total* reply length in the header, so a
         # count larger than this block delivered means the reply spanned
-        # blocks (firmware 3.15's Data More path). This drain reads one
+        # blocks (the #802 firmware's Data More path). This drain reads one
         # block, so return what actually arrived rather than over-reading
         # stale memory.
         _log.warning(
