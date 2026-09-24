@@ -221,13 +221,17 @@ first block's header; the routine stores at most `max_len` payload bytes. If
 fewer bytes arrive than the header announced, the helper raises
 `UCISocketReadTruncatedError` carrying what did arrive (owner decision,
 2026-09-23). An empty socket (`02,NO DATA`, header `$FFFF`) returns `b""`.
-Firmware before 3.15 (the C64U on 1.1.0) accepts up to 894 in one block, but
-an 894-byte reply fills its 896-byte reply buffer exactly and the interface
-never reports it drained (`command_protocol.vhd`; source-read), so the helper
-refuses `max_len` above 893 with `ValueError`, before any write, unless the
-transport's client is graded Ultimate-line 3.15 or later. A 3.15 build
-without upstream #802 refuses above 894 with `82,PARAMETER(S) OUT OF RANGE`;
-the helper returns `b""` with a WARNING naming that status. With
+Firmware without upstream #802 (post-tag, c0fd6d70) -- the C64U on 1.1.0,
+and stock v3.15 -- accepts up to 894 in one block, but an 894-byte reply
+fills its 896-byte reply buffer exactly and the interface never reports it
+drained (`network_target.cc` `> CMD_MAX_REPLY_LEN-2`, `command_protocol.vhd`;
+source-read). So the helper raises `ValueError` before any write for
+`max_len` above 893 when the grade rules #802 out or is missing, and for
+`max_len` = 894 when it cannot tell, which is every 3.15 build (#802 is
+post-tag, so `uci_socket_read_multiblock` grades `None`; only an override of
+`True` allows 894). 895 and up stay allowed there: a 3.15 build without #802
+refuses them with `82,PARAMETER(S) OUT OF RANGE`, and the helper returns
+`b""` with a WARNING naming that status. With
 `turbo_safe=True` the timeout grows by 6 ms per requested byte (two ~2.5 ms
 fences per byte at 1 MHz). The multi-block routine is 232 bytes plain and
 592 turbo-safe: 2 or 5 PUTs at the 128-byte threshold, no `/Temp`
