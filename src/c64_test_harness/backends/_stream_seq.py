@@ -116,8 +116,9 @@ measured on this bench, so none of these has been seen):
   number inside the window places that datagram in the old stream's slot
   and un-counts the old drop.**
 
-Evidence grade for every residual above: **offline loopback through the
-real receivers, n=1 per case, no device** (#443 review round 2).
+Evidence grade for every residual above except the #452 reachability
+paragraph: **offline loopback through the real receivers, n=1 per case, no
+device** (#443 review round 2).  The #452 paragraph is a device measurement.
 
 Memory: the missing and received books each hold at most ``window`` entries,
 pruned by age as the highest number advances; at most

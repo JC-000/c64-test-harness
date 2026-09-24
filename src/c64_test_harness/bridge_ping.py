@@ -675,8 +675,8 @@ CS8900A_LINECTL_ENABLE = 0x00C0
 #: beyond a maximum-length 10BASE-T frame.  Measured on the U64E (#303,
 #: 2026-09-23): a ``0x04`` run of :func:`build_tx_code` took about 1.02 s of
 #: ``run_subroutine`` wall time at 1 MHz (a bare ``RTS`` takes 0.11 s) and
-#: about 0.15 s at 48 MHz.  The constant is the chosen bound, not a
-#: characterised chip limit.
+#: about 0.15 s at 48 MHz, both measured before #487's skip phase.  The
+#: constant is the chosen bound, not a characterised chip limit.
 CS8900A_TX_READY_MAX_POLLS = 65536
 
 #: How many times every TX site checks ``Rdy4TxNOW`` and, when it is clear
