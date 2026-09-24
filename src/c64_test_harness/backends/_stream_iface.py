@@ -10,25 +10,75 @@ group address.  On this bench ``route -n get 239.0.1.65`` resolves via
 **utun0** (the VPN), not the interface that reaches the device, so the join
 landed on an interface the device's traffic never arrives on (#399).
 
-**Fixing the interface is not known to make multicast capture work.**  #399's
-measured table is zero packets in every arm, including a raw socket joined on
-the en0 address that routes to the device (n=3 paired, interleaved, U64E
-10.43.23.81, fw bce4535e, 2026-09-15).  The remaining candidates -- the
-device's multicast TTL or egress, switch IGMP snooping -- are unmeasured, and
-there is no capture-level evidence because tcpdump needs root.  This module
-removes a latent defect in what the harness asks for; it establishes nothing
-about delivery.
+**A join towards the device receives the group; the default does not**
+(U64E, fw bce4535e, 2026-09-23, host wired on the device's LAN, n=3 per arm).
+All three capture classes received the stream when joined via
+``device_host=``.  The INADDR_ANY default received 0 in 6/6 arms while the
+same frames were on the wire, because the kernel routed 224/4 via the VPN.
+Over Wi-Fi, no join received anything, because the frames never reached the
+host's interface (#461).  The default stays INADDR_ANY because a capture
+does not know the device.  When the kernel's route for the group is a
+tunnel, the join logs a WARNING naming it (owner decision, #399).
 """
 from __future__ import annotations
 
 import logging
+import platform
+import re
 import socket
 import struct
+import subprocess
 
 _log = logging.getLogger(__name__)
 
 #: The kernel-picks-it default, which is what every capture sent before #399.
 INADDR_ANY = "0.0.0.0"
+
+#: Interface-name prefixes a default join warns about: a tunnel is not where
+#: a device on the LAN sends its group traffic.  ``utun`` is macOS's VPN
+#: interface, the one this bench's 224/4 route used (#399).
+TUNNEL_INTERFACE_PREFIXES = ("utun",)
+
+#: Seconds a route lookup may take before it is given up (it is advisory).
+_ROUTE_LOOKUP_TIMEOUT = 2.0
+
+
+def multicast_route_interface(group: str) -> str | None:
+    """Name of the interface the kernel routes *group* through, or ``None``.
+
+    ``route -n get`` on macOS, ``ip -o route get`` elsewhere.  Reads the
+    routing table only; nothing goes on the wire.  Any failure -- no such
+    binary, a timeout, a non-zero exit, output that names no interface --
+    returns ``None``: the lookup only decides whether to warn.
+    """
+    if platform.system() == "Darwin":
+        argv, pattern = ["route", "-n", "get", group], r"^\s*interface:\s*(\S+)"
+    else:
+        argv, pattern = ["ip", "-o", "route", "get", group], r"\bdev\s+(\S+)"
+    try:
+        out = subprocess.run(
+            argv, capture_output=True, text=True, timeout=_ROUTE_LOOKUP_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        _log.debug("Route lookup for %s failed: %s", group, exc)
+        return None
+    if out.returncode != 0:
+        return None
+    match = re.search(pattern, out.stdout or "", re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def _warn_if_default_join_uses_a_tunnel(group: str) -> None:
+    """The INADDR_ANY join lands on the kernel's route; say so if it is a tunnel."""
+    iface = multicast_route_interface(group)
+    if iface is not None and iface.startswith(TUNNEL_INTERFACE_PREFIXES):
+        _log.warning(
+            "Joining multicast group %s on INADDR_ANY: the kernel routes it "
+            "via %s, a tunnel, so a device on the LAN is unlikely to reach "
+            "this join.  Pass device_host= (or multicast_interface=) to join "
+            "on the interface towards the device (#399)",
+            group, iface,
+        )
 
 
 def local_address_towards(host: str, port: int = 80) -> str:
@@ -112,6 +162,8 @@ def join_group(
 ) -> str:
     """``IP_ADD_MEMBERSHIP`` for *group*; returns the interface joined on."""
     interface = resolve_interface(multicast_interface, device_host)
+    if interface == INADDR_ANY:
+        _warn_if_default_join_uses_a_tunnel(group)
     mreq = struct.pack(
         "4s4s", socket.inet_aton(group), socket.inet_aton(interface)
     )

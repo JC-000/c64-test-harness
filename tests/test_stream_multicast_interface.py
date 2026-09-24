@@ -7,12 +7,10 @@ kernel's route for the group address.  On this bench ``route -n get
 the device, so the join landed on the wrong interface.  These tests pin the
 ``ip_mreq`` the capture actually sends.
 
-**They do not claim multicast capture works.**  #399's measured table is
-zero packets received in every arm, *including* a raw socket joined on the
-en0 address that routes to the device, against a unicast control of
-278/281/339 (n=3 paired, interleaved, on the U64E at fw bce4535e,
-2026-09-15).  The cause of that zero is unestablished and stays open as
-#461.  The full table, with the device address, is in #399 -- a module
+Delivery itself was measured on the device, not here.  A join towards the
+device received the group on a wired host, and the INADDR_ANY default
+received nothing while the kernel routed 224/4 via a tunnel (#399,
+2026-09-23).  The full table, with the device address, is in #399 -- a module
 under ``tests/`` does not carry bench addresses, because an address in a
 usage line is one someone later types (``test_u64_runner_script_gates.py``).
 
@@ -181,3 +179,107 @@ def test_a_malformed_interface_address_is_refused_at_construction(
 def test_local_address_towards_loopback() -> None:
     """The resolver sends no traffic: a UDP connect only picks a route."""
     assert _stream_iface.local_address_towards("127.0.0.1") == "127.0.0.1"
+
+
+# ------------------------------------ the INADDR_ANY default warns via a tunnel
+
+#: What ``route -n get <group>`` prints on macOS, cut to the lines parsed.
+_DARWIN_ROUTE = """\
+   route to: 239.0.1.65
+destination: 224.0.0.0
+       mask: 240.0.0.0
+  interface: {iface}
+      flags: <UP,DONE,CLONING,STATIC,MULTICAST,IFSCOPE>
+"""
+#: What ``ip -o route get <group>`` prints on Linux.
+_LINUX_ROUTE = "multicast 239.0.1.65 dev {iface} src 192.0.2.200 uid 1000 \\    cache \n"
+
+
+def _route_says(iface: str):
+    """A fake ``subprocess.run`` whose route table sends 224/4 via *iface*."""
+    def run(argv, **kwargs):
+        text = (_LINUX_ROUTE if argv[0] == "ip" else _DARWIN_ROUTE).format(iface=iface)
+        return MagicMock(returncode=0, stdout=text)
+    return run
+
+
+def _tunnel_warnings(caplog) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING and "INADDR_ANY" in r.getMessage()
+        and "#399" in r.getMessage()
+    ]
+
+
+@pytest.mark.parametrize("name", list(CLASSES))
+def test_a_default_join_routed_via_a_tunnel_warns_and_names_it(
+    name: str, caplog
+) -> None:
+    with patch.object(_stream_iface.subprocess, "run", side_effect=_route_says("utun4")):
+        with caplog.at_level(logging.WARNING):
+            sock = _run(name, multicast_group=_GROUP)
+    assert _joins(sock) == [socket.inet_aton(_GROUP) + socket.inet_aton("0.0.0.0")]
+    warnings = _tunnel_warnings(caplog)
+    assert len(warnings) == 1 and "utun4" in warnings[0]
+    assert "device_host" in warnings[0]
+
+
+@pytest.mark.parametrize("name", list(CLASSES))
+def test_a_default_join_routed_via_a_lan_interface_does_not_warn(
+    name: str, caplog
+) -> None:
+    """Control: the same join, a route that is not a tunnel."""
+    with patch.object(_stream_iface.subprocess, "run", side_effect=_route_says("en0")):
+        with caplog.at_level(logging.WARNING):
+            _run(name, multicast_group=_GROUP)
+    assert _tunnel_warnings(caplog) == []
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        FileNotFoundError("route"),
+        _stream_iface.subprocess.TimeoutExpired("route", 2.0),
+        # A failed command's output is not trusted, even if it names one.
+        MagicMock(returncode=1, stdout="  interface: utun4\n"),
+        MagicMock(returncode=0, stdout="nothing that names an interface\n"),
+    ],
+    ids=["no-binary", "timeout", "nonzero-exit", "unparseable"],
+)
+def test_a_failed_route_lookup_still_joins_and_does_not_warn(failure, caplog) -> None:
+    """The lookup is advisory: it must never stop a capture from starting."""
+    kw = {"side_effect": failure} if isinstance(failure, BaseException) else {"return_value": failure}
+    with patch.object(_stream_iface.subprocess, "run", **kw):
+        with caplog.at_level(logging.WARNING):
+            sock = _run("audio", multicast_group=_GROUP)
+    assert _joins(sock) == [socket.inet_aton(_GROUP) + socket.inet_aton("0.0.0.0")]
+    assert _tunnel_warnings(caplog) == []
+
+
+@pytest.mark.parametrize("name", list(CLASSES))
+def test_a_join_towards_the_device_neither_looks_up_nor_warns(
+    name: str, caplog
+) -> None:
+    with patch.object(
+        _stream_iface, "local_address_towards", return_value=_IFACE
+    ), patch.object(
+        _stream_iface.subprocess, "run", side_effect=_route_says("utun4")
+    ) as run:
+        with caplog.at_level(logging.WARNING):
+            _run(name, multicast_group=_GROUP, device_host=_DEVICE)
+    assert run.call_count == 0
+    assert _tunnel_warnings(caplog) == []
+
+
+@pytest.mark.parametrize(
+    "system, tool, template",
+    [("Darwin", "route", _DARWIN_ROUTE), ("Linux", "ip", _LINUX_ROUTE)],
+)
+def test_the_route_interface_is_read_on_both_platforms(system, tool, template) -> None:
+    with patch.object(_stream_iface.platform, "system", return_value=system), \
+            patch.object(
+                _stream_iface.subprocess, "run",
+                return_value=MagicMock(returncode=0, stdout=template.format(iface="utun7")),
+            ) as run:
+        assert _stream_iface.multicast_route_interface(_GROUP) == "utun7"
+    assert run.call_args.args[0][0] == tool
