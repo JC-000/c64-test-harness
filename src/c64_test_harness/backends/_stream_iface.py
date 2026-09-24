@@ -36,8 +36,9 @@ INADDR_ANY = "0.0.0.0"
 
 #: Interface-name prefixes a default join warns about: a tunnel is not where
 #: a device on the LAN sends its group traffic.  ``utun`` is macOS's VPN
-#: interface, the one this bench's 224/4 route used (#399).
-TUNNEL_INTERFACE_PREFIXES = ("utun",)
+#: interface, the one this bench's 224/4 route used (#399); the rest are the
+#: Linux tun, WireGuard, Tailscale, ZeroTier, PPP and IPsec families.
+TUNNEL_INTERFACE_PREFIXES = ("utun", "tun", "wg", "tailscale", "zt", "ppp", "ipsec")
 
 #: Seconds a route lookup may take before it is given up (it is advisory).
 _ROUTE_LOOKUP_TIMEOUT = 2.0
@@ -162,11 +163,11 @@ def join_group(
 ) -> str:
     """``IP_ADD_MEMBERSHIP`` for *group*; returns the interface joined on."""
     interface = resolve_interface(multicast_interface, device_host)
-    if interface == INADDR_ANY:
-        _warn_if_default_join_uses_a_tunnel(group)
     mreq = struct.pack(
         "4s4s", socket.inet_aton(group), socket.inet_aton(interface)
     )
+    if interface == INADDR_ANY:
+        _warn_if_default_join_uses_a_tunnel(group)
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
     _log.info("Joined multicast group %s on interface %s", group, interface)
     return interface

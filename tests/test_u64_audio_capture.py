@@ -26,6 +26,17 @@ from c64_test_harness.backends.u64_audio_capture import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_real_route_lookup(monkeypatch):
+    """A multicast join here must not fork the real ``route`` (#399).
+
+    On this bench it would log the tunnel warning for every such test.
+    """
+    from c64_test_harness.backends import _stream_iface
+
+    monkeypatch.setattr(_stream_iface, "multicast_route_interface", lambda group: None)
+
+
 # ---------------------------------------------------------------- helpers
 
 

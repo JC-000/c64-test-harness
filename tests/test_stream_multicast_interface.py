@@ -58,6 +58,16 @@ CLASSES = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _lan_route_by_default():
+    """No test here forks the real ``route``: the default route is a LAN one.
+
+    Tests that need another route patch ``subprocess.run`` inside this one.
+    """
+    with patch.object(_stream_iface.subprocess, "run", side_effect=_route_says("en0")):
+        yield
+
+
 def _fake_socket() -> MagicMock:
     sock = MagicMock()
     sock.recvfrom = MagicMock(side_effect=itertools.repeat(socket.timeout()))
@@ -211,28 +221,52 @@ def _tunnel_warnings(caplog) -> list[str]:
     ]
 
 
+#: Tunnel names a default join must warn about: macOS VPN, and the Linux
+#: tun/WireGuard/Tailscale/ZeroTier/PPP/IPsec families.
+_TUNNELS = ["utun4", "tun0", "wg0", "tailscale0", "ztabcdef12", "ppp0", "ipsec0"]
+#: LAN interfaces that must not warn.
+_LANS = ["en0", "eth0", "enp3s0"]
+
+
+@pytest.mark.parametrize("tunnel", _TUNNELS)
 @pytest.mark.parametrize("name", list(CLASSES))
 def test_a_default_join_routed_via_a_tunnel_warns_and_names_it(
-    name: str, caplog
+    name: str, tunnel: str, caplog
 ) -> None:
-    with patch.object(_stream_iface.subprocess, "run", side_effect=_route_says("utun4")):
+    with patch.object(_stream_iface.subprocess, "run", side_effect=_route_says(tunnel)):
         with caplog.at_level(logging.WARNING):
             sock = _run(name, multicast_group=_GROUP)
     assert _joins(sock) == [socket.inet_aton(_GROUP) + socket.inet_aton("0.0.0.0")]
     warnings = _tunnel_warnings(caplog)
-    assert len(warnings) == 1 and "utun4" in warnings[0]
+    assert len(warnings) == 1 and tunnel in warnings[0]
     assert "device_host" in warnings[0]
 
 
+@pytest.mark.parametrize("lan", _LANS)
 @pytest.mark.parametrize("name", list(CLASSES))
 def test_a_default_join_routed_via_a_lan_interface_does_not_warn(
-    name: str, caplog
+    name: str, lan: str, caplog
 ) -> None:
     """Control: the same join, a route that is not a tunnel."""
-    with patch.object(_stream_iface.subprocess, "run", side_effect=_route_says("en0")):
+    with patch.object(_stream_iface.subprocess, "run", side_effect=_route_says(lan)):
         with caplog.at_level(logging.WARNING):
             _run(name, multicast_group=_GROUP)
     assert _tunnel_warnings(caplog) == []
+
+
+def test_the_route_lookup_is_bounded_by_its_timeout() -> None:
+    """An unbounded lookup could hang a capture's start() on a wedged tool."""
+    with patch.object(_stream_iface.subprocess, "run", side_effect=_route_says("en0")) as run:
+        _stream_iface.multicast_route_interface(_GROUP)
+    assert run.call_args.kwargs["timeout"] == _stream_iface._ROUTE_LOOKUP_TIMEOUT
+
+
+def test_a_malformed_group_is_refused_before_any_route_lookup() -> None:
+    sock = _fake_socket()
+    with patch.object(_stream_iface.subprocess, "run", side_effect=_route_says("utun4")) as run:
+        with pytest.raises(OSError):
+            _stream_iface.join_group(sock, "not-a-group")
+    assert run.call_count == 0
 
 
 @pytest.mark.parametrize(
