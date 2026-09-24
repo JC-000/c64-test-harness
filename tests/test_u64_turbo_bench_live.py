@@ -181,7 +181,14 @@ SENTINEL = 0x0350
 #: see :func:`_hijack_code`). $CD00-$CEFF is outside HARNESS_SCRATCH and the
 #: x25519 image, and an 11-byte trampoline never leaves it.
 TRAMPOLINE_PAGE = 0xCD00
-TRAMPOLINE = None if MAIN_LOOP is None else TRAMPOLINE_PAGE | (MAIN_LOOP & 0xFF)
+
+
+def _trampoline_addr(main_loop: int) -> int:
+    """:data:`TRAMPOLINE_PAGE` at *main_loop*'s low byte (#477)."""
+    return TRAMPOLINE_PAGE | (main_loop & 0xFF)
+
+
+TRAMPOLINE = None if MAIN_LOOP is None else _trampoline_addr(MAIN_LOOP)
 
 
 # ---------------------------------------------------------------------------

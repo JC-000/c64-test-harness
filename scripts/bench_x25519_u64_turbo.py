@@ -35,6 +35,7 @@ from _u64_host import hold_device_lock, require_u64_host  # noqa: E402
 from c64_test_harness.backends.ultimate64 import Ultimate64Transport
 from c64_test_harness.backends.ultimate64_client import Ultimate64Client
 from c64_test_harness.backends.ultimate64_helpers import (
+    CAT_U64_SPECIFIC,
     get_turbo_mhz,
     set_turbo_mhz,
     set_reu,
@@ -197,6 +198,8 @@ def run_one_speed(
     labels: Labels,
     mhz: int,
     timeout: float,
+    *,
+    system_mode: str,
 ) -> dict | None:
     """Run X25519 benchmark at the given speed.  Returns a result dict or None on failure."""
 
@@ -294,10 +297,15 @@ def run_one_speed(
 
     # 10. Verify correctness
     correct = result_bytes == RFC7748_EXPECTED
-    c64_secs = cycles / float(NTSC_PHI2_HZ)
+    # Seconds only on NTSC: that is the one phi2 rate published here, and a
+    # PAL cycle count divided by it would read as a plausible wrong time.
+    c64_secs = cycles / float(NTSC_PHI2_HZ) if system_mode == "NTSC" else None
 
     status = "PASS" if correct else "FAIL"
-    print(f"  CIA1 cycles: {cycles}  ({c64_secs:.2f}s at the NTSC phi2 rate)")
+    if c64_secs is None:
+        print(f"  CIA1 cycles: {cycles}  (System Mode {system_mode!r}: no seconds)")
+    else:
+        print(f"  CIA1 cycles: {cycles}  ({c64_secs:.2f}s at the NTSC phi2 rate)")
     print(f"  Wall time: {wall_secs:.2f}s")
     print(f"  Result: {status}")
     if not correct:
@@ -335,8 +343,10 @@ def print_summary(results: list[dict]) -> None:
     print(f"\n{'='*76}")
     print("  X25519 Benchmark Summary — Ultimate 64")
     print(f"{'='*76}")
+    print("  Cycles: CIA1 TA+TB count (phi2). NTSC s: cycles / NTSC phi2,")
+    print("  '-' when System Mode is not NTSC. Speedup: the 1 MHz count / this one.")
 
-    hdr = f"  {'MHz':>4s}  {'Cycles':>10s}  {'C64 time':>9s}  {'Wall':>8s}  {'Status':>6s}"
+    hdr = f"  {'MHz':>4s}  {'Cycles':>10s}  {'NTSC s':>9s}  {'Wall':>8s}  {'Status':>6s}"
     if base_cycles is not None:
         hdr += f"  {'Speedup':>8s}"
     print(hdr)
@@ -346,7 +356,7 @@ def print_summary(results: list[dict]) -> None:
     print()
 
     for r in results:
-        c64_time = f"{r['c64_secs']:.2f}s"
+        c64_time = "-" if r["c64_secs"] is None else f"{r['c64_secs']:.2f}s"
         wall_time = f"{r['wall_secs']:.1f}s"
         status = "PASS" if r["correct"] else "FAIL"
         line = f"  {r['mhz']:>4d}  {r['cycles']:>10d}  {c64_time:>9s}  {wall_time:>8s}  {status:>6s}"
@@ -481,6 +491,12 @@ def main() -> None:
             print(f"ERROR: Cannot reach U64 at {host}: {e}")
             sys.exit(1)
 
+        # The cycle count converts to seconds only at a known phi2 rate
+        # (bodyless GET; the pattern of test_audio_rate_lock_live).
+        system_mode = client.get_config_category(CAT_U64_SPECIFIC)[
+            CAT_U64_SPECIFIC]["System Mode"]
+        print(f"  System Mode: {system_mode}")
+
         # Snapshot original state for restore
         print("  Snapshotting turbo state ...")
         original_state = snapshot_state(client)
@@ -501,6 +517,7 @@ def main() -> None:
             for mhz in speeds:
                 result = run_one_speed(
                     client, transport, prg_data, labels, mhz, args.timeout,
+                    system_mode=system_mode,
                 )
                 if result is not None:
                     results.append(result)

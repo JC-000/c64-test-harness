@@ -663,16 +663,17 @@ Since the U64 has no CPU register control, use DMA writes to inject and trigger 
 SENTINEL = 0x0350
 MAIN_LOOP = labels["main_loop"]           # the program's parking JMP main_loop
 # Same low byte as MAIN_LOOP, so the hijack below rewrites one byte (#426).
-# $CE00-$CEFF is outside HARNESS_SCRATCH ($0360-$036D, the old trampoline
-# address here, is inside it).
-TRAMPOLINE = 0xCE00 | (MAIN_LOOP & 0xFF)
+# Page $CD: $CD00 | lo plus the trampoline ends by $CE0A for any lo, outside
+# HARNESS_SCRATCH ($0360-$036D, the old trampoline address here, is inside it,
+# and so is $CF00, which $CE00 | lo reached for lo >= $F5; #477).
+TRAMPOLINE = 0xCD00 | (MAIN_LOOP & 0xFF)
 park = TRAMPOLINE + 8
 
 # Write trampoline: JSR target; LDA #$42; STA sentinel; JMP * (park)
 trampoline = bytes([0x20, target & 0xFF, target >> 8, 0xA9, 0x42,
                     0x8D, SENTINEL & 0xFF, SENTINEL >> 8,
                     0x4C, park & 0xFF, park >> 8])
-assert TRAMPOLINE + len(trampoline) <= 0xCF00, "low byte >= $F5 runs into $CF00"
+assert TRAMPOLINE + len(trampoline) <= 0xCF00, "the trampoline runs into $CF00 scratch"
 write_bytes(transport, TRAMPOLINE, trampoline)
 write_bytes(transport, SENTINEL, bytes([0x00]))
 # Only once MAIN_LOOP reads back as JMP MAIN_LOOP (the program is parked):
@@ -688,9 +689,9 @@ while transport.read_memory(SENTINEL, 1)[0] != 0x42:
 
 ### Turbo Benchmark
 
-`scripts/bench_x25519_u64_turbo.py` benchmarks X25519 scalar multiplication across all turbo speeds. The figures below are a **dated measurement**, taken on an Ultimate 64 Elite running fw 3.14d. They have not been re-taken on a 3.15-line build:
+`scripts/bench_x25519_u64_turbo.py` benchmarks X25519 scalar multiplication across all turbo speeds. The figures below are a **dated measurement**, taken on an Ultimate 64 Elite running fw 3.14d with the script's old jiffy readout and a pre-#477 x25519 build (one that did not yet run under `sei`). They have not been re-taken on a 3.15-line build; the script now reports CIA1 cycles (#477):
 
-| MHz | C64 Time | Speedup |
+| MHz | C64 Time (jiffy readout, pre-#477 build, 3.14d) | Speedup |
 |-----|----------|---------|
 | 48 | 12.0s | 13.6x |
 | 32 | 13.4s | 12.2x |

@@ -105,7 +105,8 @@ def _drive_run_one_speed(monkeypatch, module, tmp_path, main_loop, parked_reads)
         sleep=lambda *a: None, monotonic=lambda: next(clock)))
 
     result = module.run_one_speed(
-        _FakeClient(), _FakeTransport(), prg.read_bytes(), labels, 48, 60.0)
+        _FakeClient(), _FakeTransport(), prg.read_bytes(), labels, 48, 60.0,
+        system_mode="NTSC")
     return result, writes
 
 
@@ -212,14 +213,18 @@ def test_bench_subroutine_times_the_call_with_the_cia_cycle_counter() -> None:
     assert cpu.mem[module.SENTINEL_ADDR] == module.SENTINEL_VALUE
 
 
+@pytest.mark.parametrize("mode", ["NTSC", "PAL"])
 def test_run_one_speed_reports_the_cycle_count_the_build_stored(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
 ) -> None:
-    """``bench_cycles`` is a little-endian u32; seconds use the NTSC phi2."""
+    """``bench_cycles`` is a little-endian u32; seconds only at the NTSC phi2 rate.
+
+    No PAL constant is published here, so off NTSC the count is reported and
+    the seconds are withheld rather than computed at the wrong rate.
+    """
     module = _load()
     count = 17_000_000
     stored = count.to_bytes(4, "little")
-    real_drive = _drive_run_one_speed
 
     prg = _write_build(tmp_path)
     labels = module.Labels.from_file(prg.parent / "labels.txt")
@@ -251,12 +256,16 @@ def test_run_one_speed_reports_the_cycle_count_the_build_stored(
     monkeypatch.setattr(module, "set_turbo_mhz", lambda *a, **k: None)
     monkeypatch.setattr(module, "time", types.SimpleNamespace(
         sleep=lambda *a: None, monotonic=lambda: next(clock)))
-    del real_drive
 
-    result = module.run_one_speed(_Client(), _Transport(), prg.read_bytes(), labels, 48, 60.0)
+    result = module.run_one_speed(_Client(), _Transport(), prg.read_bytes(), labels,
+                                  48, 60.0, system_mode=mode)
 
     assert result["cycles"] == count
-    assert result["c64_secs"] == pytest.approx(count / float(module.NTSC_PHI2_HZ))
+    if mode == "NTSC":
+        assert result["c64_secs"] == pytest.approx(count / float(module.NTSC_PHI2_HZ))
+    else:
+        assert result["c64_secs"] is None
+    module.print_summary([result])        # a None must not break the table
 
 
 # ---------------------------------------------------------------------------
