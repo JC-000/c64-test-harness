@@ -228,8 +228,9 @@ class TestBoundsMatchCode:
                 my_ip=bytes(4), my_mac=bytes(6), result_addr=0xC0FF,
             )),
         )
-        # tx 99, match 135, respond 369, respond+ARP 618 (#218, then +20/+33
-        # for the bounded Rdy4TxNOW poll of #236)
+        # tx 159, match 135, respond 429, respond+ARP 738 (#218, then +20/+33
+        # for the bounded Rdy4TxNOW poll of #236, then +60 per TX site for
+        # the #487 skip phase)
         assert consume.length == largest
 
     def test_reu_staging_window_matches_snapshot_constants(self) -> None:

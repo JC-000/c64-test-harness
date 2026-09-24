@@ -379,7 +379,7 @@ from c64_test_harness import (
 )
 
 # Layout (same as tests/test_bridge_ping.py): peek routine at $C000 (the
-# default peek_addr, 64 B), consume routines at $C200 (up to 349 B), the
+# default peek_addr, 64 B), consume routines at $C200 (up to 738 B since #487), the
 # result byte at $C1F0, TX frame at $C500, RX frame at $C700 (small ping
 # frames; widen the gap for bigger ones).  Never put result_addr on the
 # default consume_addr ($C100): run_ping_and_wait loads the routine there,
@@ -434,7 +434,7 @@ An RR-Net-compatible cartridge in the U64's expansion port is a real CS8900a at 
 - **The firmware's runner load path deselects the cartridge** (#217, n=3/arm): `client.run_prg()` and `client.load_prg()` both leave the program seeing `$DE00` dead while the config still says `External` (stock ip65 prints `INIT DRIVER: FAILED`); the deselection survives every `reset()` and only a re-PUT of `Cartridge Preference` reselects it. Deselected PP `$0000` is not reliably zeros — only `!= $630E` means anything. Start PRGs with `run_prg_via_sys(target, prg)` — write to RAM + typed `SYS` + resume, with the re-PUT done for you on a U64 (`reselect_cartridge=False` opts out).
 - **Host-side `write_memory` never reaches the cartridge on hardware** (and host reads of the window are not meaningful), so `set_cs8900a_mac()` — which works under VICE — is a silent no-op here; program the MAC from the 6510 with `cs8900a_set_mac_inline_code(mac)`.
 - **No `jsr()` on hardware**: `run_ping_and_wait` / `run_icmp_responder` / `poll_until_ready` are VICE-only. Use the `*_tod_code` builders (each ends `CLI; RTS`) through `run_subroutine`, which needs BASIC `READY.`.
-- **Resolve before the first ping to a host: pass the ARP frame (`arp_frame_buf=`), and give responders `my_mac=` so they answer ARP.** A macOS host with no *complete* neighbour entry for the C64 holds every echo reply (entry absent 0/8, present 8/8 — #218; the stale-entry case is inferred) — a run that never ARPs gets 0/N with the requests visibly leaving the wire (issue #212, closed invalid: not a chip fault); stock ip65 is immune because `icmp_ping` ARPs first and `arp_process` answers. Since #218 the harness does both, opt-in: `build_arp_request_frame(mac, ip_c64, ip_host)` into RAM and `build_ping_and_wait_tod_code(..., arp_frame_buf=ARP_BUF)` transmits it before the echo in one run (the ARP reply is drained as a non-match); `build_icmp_responder_tod_code(..., my_mac=mac)` answers ARP requests for `my_ip` while waiting. Defaults (`None`) keep every builder byte-identical to before; with ARP on the routines are larger (consume 585 B, responder 630 B, TOD responder 754 B, ping 319 B — size the code window for them). **Measured under VICE and on a simulated chip only**: the 0/8 → 6/6 hardware figure came from a hand-built frame and `build_tx_code`; a U64E pass of these parameters is still owed.
+- **Resolve before the first ping to a host: pass the ARP frame (`arp_frame_buf=`), and give responders `my_mac=` so they answer ARP.** A macOS host with no *complete* neighbour entry for the C64 holds every echo reply (entry absent 0/8, present 8/8 — #218; the stale-entry case is inferred) — a run that never ARPs gets 0/N with the requests visibly leaving the wire (issue #212, closed invalid: not a chip fault); stock ip65 is immune because `icmp_ping` ARPs first and `arp_process` answers. Since #218 the harness does both, opt-in: `build_arp_request_frame(mac, ip_c64, ip_host)` into RAM and `build_ping_and_wait_tod_code(..., arp_frame_buf=ARP_BUF)` transmits it before the echo in one run (the ARP reply is drained as a non-match); `build_icmp_responder_tod_code(..., my_mac=mac)` answers ARP requests for `my_ip` while waiting. Defaults (`None`) keep every builder byte-identical to before; with ARP on the routines are larger (measured after #487: consume 738 B, responder 783 B, TOD responder 907 B, ping 472 B, TOD ping 596 B, 636 B with `drain_first` — size the code window for them). **Measured under VICE and on a simulated chip only**: the 0/8 → 6/6 hardware figure came from a hand-built frame and `build_tx_code`; a U64E pass of these parameters is still owed.
 - **Drain the chip's RX queue before the first exchange (`drain_first=True` on the ping builders, issue #222).** Frames that arrive while nobody reads sit in the CS8900a's queue, and an exchange started on top of them loses its reply — the chip counts it in RxMISS and never presents it; on this bench the stale frames are the host's own DHCP DISCOVER broadcasts from `en4` (342 B, ~every 10 s). U64E 2026-09-05, interleaved n=6: first ping after reset + init + 5 s idle 3/6 without the drain, 6/6 with it; every miss had LinkOK, request and reply on the wire, RxMISS +1 and a non-empty queue; the live test injects three such frames and gets MISS 3/3 without / MATCH 3/3 with the drain. The REST `reset()` does not reset the chip, so a "fresh" session inherits the old queue. Not the link, not the capture's promiscuous toggle (no `en4` transition in 30 trials), not ARP. A second ping 1 s after a miss matched 7/7 — so a single retry also covers it, at the cost of a deadline. Read RxMISS (PP `$0130`, count in bits 6-15, read-to-clear) when an exchange misses: +1 says the chip dropped it. Live: `tests/test_first_exchange_live.py` (`RRNET_LIVE=1`).
 
 ```python
@@ -449,7 +449,8 @@ from live_fixture_teardown import (   # tests/live_fixture_teardown.py (#447)
     attempt_steps, read_restore_defaults, restore_default_steps,
 )
 
-CODE, RESULT, TX_BUF, ARP_BUF, RX_BUF = 0xC000, 0xC1F0, 0xC500, 0xC580, 0xC700
+# The ARP + drain ping routine is 636 bytes ($C000-$C27B, #487), so RESULT sits past it.
+CODE, RESULT, TX_BUF, ARP_BUF, RX_BUF = 0xC000, 0xC3F0, 0xC500, 0xC580, 0xC700
 mac = generate_mac(1)
 host_mac = parse_mac("c0:56:27:b1:16:38")            # the host NIC on the cartridge's link
 ip_c64, ip_host = bytes([10, 0, 66, 200]), bytes([10, 0, 66, 1])
@@ -472,8 +473,8 @@ with create_manager(backend="u64", u64_hosts="10.43.23.81") as mgr:
         # Presence test — the only valid one (ip65 init does exactly this).
         ident = bytes([0xA9, 0x00, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8,      # PPPtr = $0000
                        0xA9, 0x00, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8,
-                       0xAD, PPDATA_LO & 0xFF, PPDATA_LO >> 8, 0x8D, 0xF0, 0xC1,   # -> $C1F0
-                       0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8, 0x8D, 0xF1, 0xC1,   # -> $C1F1
+                       0xAD, PPDATA_LO & 0xFF, PPDATA_LO >> 8, 0x8D, 0xF0, 0xC3,   # -> $C3F0
+                       0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8, 0x8D, 0xF1, 0xC3,   # -> $C3F1
                        0x60])
         write_bytes(t, CODE, ident)
         run_subroutine(target, CODE, timeout=5.0)
@@ -814,8 +815,9 @@ Four consequences to know before writing the loop:
 | `build_socket_read` | **149** (**449**) | defaults | **yes** |
 | `build_tcp_connect`, `build_udp_connect` | **159** (**484**) | defaults | **yes** |
 | `build_socket_write` | **170** (**421**) | payload-independent — 170 at payloads 0, 10, 128, 800, 892 | **yes** |
-| `build_tx_code` / `build_rx_peek_code` | 99-120 / 64 | 99 at `frame_len` 42, 60, 256; 104 at 512, 1024 (whole pages); 120 at 258, 1514 (#404 page loop); 64 at `batch_size` 1, 8, 32 | no |
-| `build_tx_code(..., drain_first=True)` | **139-163** | 139 at `frame_len` 42, 60, 256; 144 at 512, 1024; 160 at 258, 1514; +3 with `drain_status_addr` (#303) | **yes** |
+| `build_tx_code` | **159-180** | 159 at `frame_len` 42, 60, 256; 164 at 512, 1024 (whole pages); 180 at 258, 1514 (#404 page loop); +60 for #487's skip phase | **yes** |
+| `build_rx_peek_code` | 64 | 64 at `batch_size` 1, 8, 32 | no |
+| `build_tx_code(..., drain_first=True)` | **199-223** | 199 at `frame_len` 42, 60, 256; 204 at 512, 1024; 220 at 258, 1514; +3 with `drain_status_addr` (#303, #487) | **yes** |
 | the eight `cs8900a_*` snippets | **18-69** | `linectl_or_inline` 18, `rxctl_inline` 28, `rxctl` 29, `write_linectl(0,0)` 29, `read_linectl` 31, `enable_inline` 46, `set_mac_inline` 60, `set_mac` 69 (`bridge_ping.py:663,677,688,707,717,749,758,773`) | no |
 | `build_rx_echo_reply_code` | **193** | invariant in `identifier` / `sequence` | **yes** |
 | `build_ping_and_wait_code` | **256** | plain — no ARP, no drain | **yes** |
