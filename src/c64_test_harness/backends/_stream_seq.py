@@ -83,7 +83,8 @@ measured on this bench, so none of these has been seen):
   datagram, so this is not "silent restarts lose packets".  Declared and
   accepted rather than fixed: it is the same ambiguity as the residual
   above (a re-sent 48, 49 then a late 50 is indistinguishable from a
-  restart), and no duplication or restart has been measured on the device.
+  restart).  No duplication has been measured on the device; a restart
+  has (#452, below).
 
   **The loss is countable**: those discarded payloads are in
   :attr:`SequenceTracker.discarded`, surfaced as ``payloads_discarded`` on
@@ -115,8 +116,9 @@ measured on this bench, so none of these has been seen):
   number inside the window places that datagram in the old stream's slot
   and un-counts the old drop.**
 
-Evidence grade for every residual above: **offline loopback through the
-real receivers, n=1 per case, no device** (#443 review round 2).
+Evidence grade for every residual above except the #452 reachability
+paragraph: **offline loopback through the real receivers, n=1 per case, no
+device** (#443 review round 2).  The #452 paragraph is a device measurement.
 
 Memory: the missing and received books each hold at most ``window`` entries,
 pruned by age as the highest number advances; at most

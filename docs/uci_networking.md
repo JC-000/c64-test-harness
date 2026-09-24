@@ -210,11 +210,12 @@ A custom routine that polls bit 0 has the same race.
 For UDP, one `uci_socket_write` call produces exactly one `lwip_send` on the firmware side, which is one UDP datagram on the wire (empirically confirmed by `tests/test_uci_udp_send_live.py`'s per-call-per-datagram probe). No firmware-side coalescing. For payloads larger than 892 bytes, call `uci_socket_write` in a loop; each call emits its own UDP datagram. Receivers must reassemble in application code.
 
 `uci_socket_read` accepts up to **1472 bytes** per call
-(`NET_MAX_SOCKET_READ`, firmware 3.15's own `READ_SOCKET` ceiling), and a
+(`NET_MAX_SOCKET_READ`, the `READ_SOCKET` ceiling of firmware carrying
+upstream #802, which bce4535e does), and a
 larger `max_len` raises `ValueError` before any device contact. Up to
 `SOCKET_READ_MAX_BYTES` (253) it uses the single-block routine, whose 8-bit
 drain holds header plus 253 payload bytes; above that it uses the multi-block
-routine (#420), which follows firmware 3.15's Data More blocks (first block:
+routine (#420), which follows that firmware's Data More blocks (first block:
 header with the *total* length plus up to 893 bytes; continuations: up to 895
 bytes each) into `$C500-$CAC1` with a 16-bit count. The payload length is the
 first block's header; the routine stores at most `max_len` payload bytes. If

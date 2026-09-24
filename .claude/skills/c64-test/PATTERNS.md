@@ -384,9 +384,10 @@ from c64_test_harness import (
 # frames; widen the gap for bigger ones).  Never put result_addr on the
 # default consume_addr ($C100): run_ping_and_wait loads the routine there,
 # then zeroes the result byte before the jsr — a $00 (BRK) over the
-# routine's first opcode.  $C400-$C87D is also uci_network's socket-write
-# scratch (see docs/memory_safety.md); RR-Net and UCI never run in the
-# same test, but don't reuse this layout alongside uci_socket_write.
+# routine's first opcode.  $C400-$CAC1 is also uci_network's socket-write
+# and multi-block read scratch (see docs/memory_safety.md); RR-Net and UCI
+# never run in the same test, but don't reuse this layout alongside
+# uci_socket_write or uci_socket_read.
 PEEK_ADDR, CONSUME_ADDR, RESULT_ADDR = 0xC000, 0xC200, 0xC1F0
 TX_FRAME_BUF, RX_FRAME_BUF = 0xC500, 0xC700
 
@@ -434,7 +435,7 @@ An RR-Net-compatible cartridge in the U64's expansion port is a real CS8900a at 
 - **The firmware's runner load path deselects the cartridge** (#217, n=3/arm): `client.run_prg()` and `client.load_prg()` both leave the program seeing `$DE00` dead while the config still says `External` (stock ip65 prints `INIT DRIVER: FAILED`); the deselection survives every `reset()` and only a re-PUT of `Cartridge Preference` reselects it. Deselected PP `$0000` is not reliably zeros — only `!= $630E` means anything. Start PRGs with `run_prg_via_sys(target, prg)` — write to RAM + typed `SYS` + resume, with the re-PUT done for you on a U64 (`reselect_cartridge=False` opts out).
 - **Host-side `write_memory` never reaches the cartridge on hardware** (and host reads of the window are not meaningful), so `set_cs8900a_mac()` — which works under VICE — is a silent no-op here; program the MAC from the 6510 with `cs8900a_set_mac_inline_code(mac)`.
 - **No `jsr()` on hardware**: `run_ping_and_wait` / `run_icmp_responder` / `poll_until_ready` are VICE-only. Use the `*_tod_code` builders (each ends `CLI; RTS`) through `run_subroutine`, which needs BASIC `READY.`.
-- **Resolve before the first ping to a host: pass the ARP frame (`arp_frame_buf=`), and give responders `my_mac=` so they answer ARP.** A macOS host with no *complete* neighbour entry for the C64 holds every echo reply (entry absent 0/8, present 8/8 — #218; the stale-entry case is inferred) — a run that never ARPs gets 0/N with the requests visibly leaving the wire (issue #212, closed invalid: not a chip fault); stock ip65 is immune because `icmp_ping` ARPs first and `arp_process` answers. Since #218 the harness does both, opt-in: `build_arp_request_frame(mac, ip_c64, ip_host)` into RAM and `build_ping_and_wait_tod_code(..., arp_frame_buf=ARP_BUF)` transmits it before the echo in one run (the ARP reply is drained as a non-match); `build_icmp_responder_tod_code(..., my_mac=mac)` answers ARP requests for `my_ip` while waiting. Defaults (`None`) keep every builder byte-identical to before; with ARP on the routines are larger (measured after #487: consume 738 B, responder 783 B, TOD responder 907 B, ping 472 B, TOD ping 596 B, 636 B with `drain_first` — size the code window for them). **Measured under VICE and on a simulated chip only**: the 0/8 → 6/6 hardware figure came from a hand-built frame and `build_tx_code`; a U64E pass of these parameters is still owed.
+- **Resolve before the first ping to a host: pass the ARP frame (`arp_frame_buf=`), and give responders `my_mac=` so they answer ARP.** A macOS host with no *complete* neighbour entry for the C64 holds every echo reply (entry absent 0/8, present 8/8 — #218; the stale-entry case is inferred) — a run that never ARPs gets 0/N with the requests visibly leaving the wire (issue #212, closed invalid: not a chip fault); stock ip65 is immune because `icmp_ping` ARPs first and `arp_process` answers. Since #218 the harness does both, opt-in: `build_arp_request_frame(mac, ip_c64, ip_host)` into RAM and `build_ping_and_wait_tod_code(..., arp_frame_buf=ARP_BUF)` transmits it before the echo in one run (the ARP reply is drained as a non-match); `build_icmp_responder_tod_code(..., my_mac=mac)` answers ARP requests for `my_ip` while waiting. Defaults (`None`) emit no ARP code; with ARP on the routines are larger (measured after #487: consume 738 B, responder 783 B, TOD responder 907 B, ping 472 B, TOD ping 596 B, 636 B with `drain_first` — size the code window for them). The ARP ping path has run on the U64E, on the pre-#487 routine (`tests/test_first_exchange_live.py`; #222 on 2026-09-05, #444/PR #458 on 2026-09-16); the responders' `my_mac` ARP answer is still unmeasured on hardware.
 - **Drain the chip's RX queue before the first exchange (`drain_first=True` on the ping builders, issue #222).** Frames that arrive while nobody reads sit in the CS8900a's queue, and an exchange started on top of them loses its reply — the chip counts it in RxMISS and never presents it; on this bench the stale frames are the host's own DHCP DISCOVER broadcasts from `en4` (342 B, ~every 10 s). U64E 2026-09-05, interleaved n=6: first ping after reset + init + 5 s idle 3/6 without the drain, 6/6 with it; every miss had LinkOK, request and reply on the wire, RxMISS +1 and a non-empty queue; the live test injects three such frames and gets MISS 3/3 without / MATCH 3/3 with the drain. The REST `reset()` does not reset the chip, so a "fresh" session inherits the old queue. Not the link, not the capture's promiscuous toggle (no `en4` transition in 30 trials), not ARP. A second ping 1 s after a miss matched 7/7 — so a single retry also covers it, at the cost of a deadline. Read RxMISS (PP `$0130`, count in bits 6-15, read-to-clear) when an exchange misses: +1 says the chip dropped it. Live: `tests/test_first_exchange_live.py` (`RRNET_LIVE=1`).
 
 ```python
@@ -804,44 +805,44 @@ Four consequences to know before writing the loop:
 - **`execute.load_code(transport, addr, code)` is a bare alias for `transport.write_memory`**, so it behaves exactly as above — chunked on a leak-prone grade, one request on a post-safe one. A direct `client.write_mem(addr, blob)` call does **not** chunk on any grade and still POSTs above the threshold.
 - `client.run_prg(prg)` is one attachment per call, whatever the PRG's size — **or two when the 404 sideload fires, which is precisely when you can least afford it.** With `fallback_on_404=True` (the default), a 404 from `runners:run_prg` makes the client re-send the whole PRG body through `write_mem(load_addr, body)`, **unchunked** (`run_prg`'s 404 sideload path in `ultimate64_client.py`) and so far above either threshold that it is always a POST — a second body-carrying request on top of the runner POST that already carried the body and 404'd. **And a 404 from that endpoint is itself a wedge symptom**, so the fallback doubles the attachment cost exactly at the moment the device is closest to the edge: a positive-feedback loop you meet for the first time at the worst possible moment. Pass `fallback_on_404=False` on a leak-prone device if you would rather see the 404. (Whether a POST that *returns* 404 still leaves its attachment behind is **unmeasured** — assume it does, which is the conservative reading; the sideload's own POST is not in doubt, only the doubling. Note for anyone who goes to settle it: the cheap version of that experiment — POST past the threshold to a bogus `/v1/runners:*` path, count `/Temp` either side — **is informative in only one direction**. A bogus path 404s at *routing*, possibly before the firmware ever materialises the attachment, whereas the real case is a 404 from a *known* route on a distressed device. A positive result (attachment appears) would be strong evidence that creation precedes routing, so the real case leaks too; a negative result proves nothing, because a known route may behave differently. Design for the positive case or find a way to 404 a real route.)
 
-**Assembled routines are usually *over* the ceiling, so a code write is normally a POST.** Measured host-side at this head (`len()` of the builder output — no device involved), against the 128-byte C64U ceiling. **Blob size depends on the arguments**, so each figure carries the ones it was taken under; a figure quoted without them is not reproducible, which is how the first version of this table was wrong.
+**Assembled routines are usually *over* the ceiling, so a code write is normally a POST.** Measured host-side at b412686, 2026-09-24 (`len()` of the builder output — no device involved), against the 128-byte C64U ceiling. **Blob size depends on the arguments**, so each figure carries the ones it was taken under; a figure quoted without them is not reproducible, which is how the first version of this table was wrong.
 
 | Builder | Blob bytes | Conditions the figure was taken under | Over 128? |
 |---|---|---|---|
 | `build_uci_probe`, `build_uci_status_peek` | 12 (**28** `turbo_safe`) | defaults | no |
-| `build_socket_close` | 112 (**341**) | defaults | only with the fence |
-| `build_uci_command` | **133** (**385**) | `params=b""`; **+5 bytes per param byte** (+21 `turbo_safe`) | **yes** |
-| `build_get_ip` | **138** (**406**) | defaults | **yes** |
-| `build_socket_read` | **149** (**449**) | defaults | **yes** |
-| `build_tcp_connect`, `build_udp_connect` | **159** (**484**) | defaults | **yes** |
-| `build_socket_write` | **170** (**421**) | payload-independent — 170 at payloads 0, 10, 128, 800, 892 | **yes** |
+| `build_socket_close` | 118 (**366**) | defaults | only with the fence |
+| `build_uci_command` | **139** (**410**) | `params=b""`; **+5 bytes per param byte** (+21 `turbo_safe`) | **yes** |
+| `build_get_ip` | **144** (**431**) | defaults | **yes** |
+| `build_socket_read` | **155** (**474**) | defaults | **yes** |
+| `build_tcp_connect`, `build_udp_connect` | **165** (**509**) | defaults | **yes** |
+| `build_socket_write` | **176** (**446**) | payload-independent — 176 at payloads 0, 10, 128, 800, 892 | **yes** |
 | `build_tx_code` | **159-180** | 159 at `frame_len` 42, 60, 256; 164 at 512, 1024 (whole pages); 180 at 258, 1514 (#404 page loop); +60 for #487's skip phase | **yes** |
 | `build_rx_peek_code` | 64 | 64 at `batch_size` 1, 8, 32 | no |
 | `build_tx_code(..., drain_first=True)` | **199-223** | 199 at `frame_len` 42, 60, 256; 204 at 512, 1024; 220 at 258, 1514; +3 with `drain_status_addr` (#303, #487) | **yes** |
-| the eight `cs8900a_*` snippets | **18-69** | `linectl_or_inline` 18, `rxctl_inline` 28, `rxctl` 29, `write_linectl(0,0)` 29, `read_linectl` 31, `enable_inline` 46, `set_mac_inline` 60, `set_mac` 69 (`bridge_ping.py:663,677,688,707,717,749,758,773`) | no |
+| the eight `cs8900a_*` snippets | **18-69** | `linectl_or_inline` 18, `rxctl_inline` 28, `rxctl` 29, `write_linectl(0,0)` 29, `read_linectl` 31, `enable_inline` 46, `set_mac_inline` 60, `set_mac` 69 | no |
 | `build_rx_echo_reply_code` | **193** | invariant in `identifier` / `sequence` | **yes** |
-| `build_ping_and_wait_code` | **256** | plain — no ARP, no drain | **yes** |
-| " | **319** | `arp_frame_buf` + `arp_frame_len` only | **yes** |
-| " | **296** | `drain_first=True` only | **yes** |
-| " | **359** | ARP + drain, **no** `drain_status_addr` | **yes** |
-| " | **362** | ARP + drain + `drain_status_addr` | **yes** |
+| `build_ping_and_wait_code` | **336** | plain — no ARP, no drain; all rows here at `tx_frame_len` ≤ 256, +21 for a page-loop length | **yes** |
+| " | **472** | `arp_frame_buf` + `arp_frame_len` only | **yes** |
+| " | **376** | `drain_first=True` only | **yes** |
+| " | **512** | ARP + drain, **no** `drain_status_addr` | **yes** |
+| " | **515** | ARP + drain + `drain_status_addr` | **yes** |
 | `build_rx_echo_reply_tod_code` | **317** | defaults | **yes** |
-| `build_ping_and_wait_tod_code` | **380** | plain | **yes** |
-| " | **483** | ARP + drain, **no** `drain_status_addr` | **yes** |
-| " | **486** | ARP + drain + `drain_status_addr` | **yes** |
-| `build_icmp_responder_code` | **630** | **`my_mac` set** — the form the RR-Net pattern tells you to use | **yes** |
-| " | 401 | `my_mac=None` — does not answer ARP; see below | **yes** |
-| `build_icmp_responder_tod_code` | **754** | `my_mac` set | **yes** |
-| " | 525 | `my_mac=None` | **yes** |
+| `build_ping_and_wait_tod_code` | **460** | plain; `tx_frame_len` ≤ 256, +21 for a page-loop length | **yes** |
+| " | **636** | ARP + drain, **no** `drain_status_addr` | **yes** |
+| " | **639** | ARP + drain + `drain_status_addr` | **yes** |
+| `build_icmp_responder_code` | **783** | **`my_mac` set** — the form the RR-Net pattern tells you to use | **yes** |
+| " | 481 | `my_mac=None` — does not answer ARP; see below | **yes** |
+| `build_icmp_responder_tod_code` | **907** | `my_mac` set | **yes** |
+| " | 605 | `my_mac=None` | **yes** |
 
-**Why 630 and not 401 is the number to plan against.** `my_mac` is what makes the responder answer ARP for its own IP, and on this bench that is not optional: macOS holds every reply while it has no complete neighbour entry for the C64 (#218), so the RR-Net recipe in Pattern 8 tells authors to pass it. The `my_mac=None` form is 229 bytes smaller and is the one you will not be using. Same shape for `build_ping_and_wait_code`: the plain 256-byte form is not the one the pattern recommends — with ARP and the #222 drain it is 359, or 362 once `drain_status_addr` is passed.
+**Why 783 and not 481 is the number to plan against.** `my_mac` is what makes the responder answer ARP for its own IP, and on this bench that is not optional: macOS holds every reply while it has no complete neighbour entry for the C64 (#218), so the RR-Net recipe in Pattern 8 tells authors to pass it. The `my_mac=None` form is 302 bytes smaller and is the one you will not be using. Same shape for `build_ping_and_wait_code`: the plain 336-byte form is not the one the pattern recommends — with ARP and the #222 drain it is 512, or 515 once `drain_status_addr` is passed.
 
 **This was a conditions defect, not a wrong conclusion.** Every RR-Net figure is over 128 under *every* variant, so the "over 128?" column and everything drawn from it stand exactly as before — one attachment per blob load, whichever arguments you pass. Nothing in the guidance changed.
 
 The `turbo_safe=True` fence roughly triples every UCI blob, so a turbo-safe routine that was under the ceiling is not. Practical readings:
 
-- **Since #252 a UCI socket write through `Ultimate64Transport` on a leak-prone or unknown grade costs no attachment.** `transport.write_memory` chunks each of its writes into PUTs. On a post-safe device the over-threshold writes are single, collected POSTs. **Before #252 it cost one attachment for its routine code, plus a second only when the payload itself exceeded 128**, which is the shape described below. `uci_socket_write` issues four separate writes (`uci_network.py:1936-1943`) — `socket_id` (1 byte), the payload (**conditional on `if data:`**, and unchunked), the length (2 bytes), then the 170-byte routine via `_execute_uci_routine` (`uci_network.py:1686`; the routine write is at `:1735`) — and only the payload can cross the ceiling. So the 800/892-byte large-send tests pay two; a small socket write pays one.
-- **`enable_uci` / `disable_uci` cost nothing.** They are `set_config_items` (`uci_network.py:2316`/`:2331`) — bodyless config PUTs, not the code-write path. Enabling UCI does not leak.
+- **Since #252 a UCI socket write through `Ultimate64Transport` on a leak-prone or unknown grade costs no attachment.** `transport.write_memory` chunks each of its writes into PUTs. On a post-safe device the over-threshold writes are single, collected POSTs. **Before #252 it cost one attachment for its routine code, plus a second only when the payload itself exceeded 128**, which is the shape described below. `uci_socket_write` issues four separate writes — `socket_id` (1 byte), the payload (**conditional on `if data:`**, and unchunked), the length (2 bytes), then the 176-byte routine via `_execute_uci_routine` — and only the payload can cross the ceiling. So the 800/892-byte large-send tests pay two; a small socket write pays one.
+- **`enable_uci` / `disable_uci` cost nothing.** They are `set_config_items` — bodyless config PUTs, not the code-write path. Enabling UCI does not leak.
 - **An RR-Net ping or responder blob loaded with `load_code` is one attachment each.**
 
 If you need a code write not to leak on any grade, put it through `write_bytes`: same bytes, threshold-sized chunks (`rest_put_chunk_size`), PUT path on every grade (#252). Since #252 `load_code` / `write_memory` also chunk on any grade that is not post-safe.
@@ -1189,7 +1190,7 @@ client.stream_debug_start("239.0.1.66:11002")
 
 What to use turbo-speed capture for: aggregate statistics that tolerate uniform subsampling (which addresses are hit, hot-path frequency, read/write ratios). What *not* to use it for: call-graph reconstruction, exact cycle counting, transition chains (any read-modify-write, IRQ-entry sequence, or timing-sensitive inspection).
 
-The `multicast_group=` argument on `DebugCapture` is the portable receive path — the U64's default `Stream Debug to` destination is the multicast group `239.0.1.66:11002`. Unicast (`<local-ip>:11002`) only works when the Mac/Linux host and the U64 share an L2 segment. **Multicast has not been observed to deliver on this bench**: #399 measured zero packets in every arm — including a raw socket joined on the en0 address that routes to the device — against a unicast control of 278/281/339 (n=3 paired, interleaved, U64E fw bce4535e, 2026-09-15). The cause is unestablished and open as #461. Use unicast. If you try the group anyway, name the interface: `multicast_interface=` (or `device_host=`, which resolves it) on `AudioCapture`/`DebugCapture`/`VideoCapture` — the join was INADDR_ANY before #399, and on this bench the kernel routes `239.0.1.x` via the VPN.
+The `multicast_group=` argument on `DebugCapture` receives the U64's default `Stream Debug to` destination, the multicast group `239.0.1.66:11002`. **A multicast join receives only when it is made towards the device** (#399, U64E fw bce4535e, 2026-09-23, host wired on the device's LAN, n=3 per arm): `device_host=` (or an explicit `multicast_interface=`) on `AudioCapture`/`DebugCapture`/`VideoCapture` received the group in every arm, while the default INADDR_ANY join received 0 in 6/6 because the kernel routes `239.0.1.x` via the VPN on this bench; a default join whose route is a tunnel now logs a WARNING naming it (#494). Over Wi-Fi no join received anything (#461), so unicast is the fallback there.
 
 ### Recovering from FPGA UDP-rate degradation
 

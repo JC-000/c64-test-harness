@@ -1016,7 +1016,8 @@ Result bytes the TX builders can now store:
   a `BEQ` to itself: a chip that never asserted hung the 6510 with no
   diagnosis. Every TX site now gives up after
   `CS8900A_TX_READY_MAX_POLLS` = 65,536 polls (13 cycles each, ~0.85 s
-  at 1 MHz; shorter under turbo, inferred) and stores `0x04`. The
+  at 1 MHz; a whole `0x04` run measured about 1.02 s at 1 MHz and 0.15 s
+  at 48 MHz before #487's skip phase, #303 below) and stores `0x04`. The
   orchestrators `run_ping_and_wait` / `run_icmp_responder` return it. The
   cost is +20 bytes per single-transmit routine and +33 per two-transmit
   routine (at #236: `build_tx_code` 79 → 99, then still at or under the

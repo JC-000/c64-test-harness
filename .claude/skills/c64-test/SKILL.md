@@ -79,9 +79,11 @@ When you write a test that can point at the C64U:
 - **Do not assume an API chunks because its name suggests it.**
   `execute.load_code()` is a bare alias for `transport.write_memory`, and
   `_execute_uci_routine` writes its routine through `transport.write_memory`
-  as well (`uci_network.py:1780`). Most assembled blobs are over 128 bytes
-  (UCI builders 133-170, tripled by `turbo_safe=True`; RR-Net builders
-  193-754). Since #252, `transport.write_memory` chunks at the client
+  as well. Most assembled blobs are over 128 bytes
+  (UCI builders 139-176 B, with `build_socket_close` 118 and
+  `build_uci_probe`/`build_uci_status_peek` 12 under it; 366-509 with
+  `turbo_safe=True`; RR-Net routines
+  up to 907, with `build_tx_code` at 159-180 since #487). Since #252, `transport.write_memory` chunks at the client
   threshold on any grade that is not post-safe. On a C64U a UCI socket
   write through the transport is therefore all PUTs and costs **no**
   attachment for its routine code or its payload; on a post-safe device
