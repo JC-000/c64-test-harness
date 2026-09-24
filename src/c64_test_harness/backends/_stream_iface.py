@@ -58,9 +58,10 @@ def multicast_route_interface(group: str) -> str | None:
         argv, pattern = ["ip", "-o", "route", "get", group], r"\bdev\s+(\S+)"
     try:
         out = subprocess.run(
-            argv, capture_output=True, text=True, timeout=_ROUTE_LOOKUP_TIMEOUT,
+            argv, capture_output=True, text=True, errors="replace",
+            timeout=_ROUTE_LOOKUP_TIMEOUT,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as exc:
         _log.debug("Route lookup for %s failed: %s", group, exc)
         return None
     if out.returncode != 0:

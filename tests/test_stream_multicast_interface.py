@@ -254,11 +254,13 @@ def test_a_default_join_routed_via_a_lan_interface_does_not_warn(
     assert _tunnel_warnings(caplog) == []
 
 
-def test_the_route_lookup_is_bounded_by_its_timeout() -> None:
+def test_the_route_lookup_is_bounded_and_decodes_leniently() -> None:
     """An unbounded lookup could hang a capture's start() on a wedged tool."""
     with patch.object(_stream_iface.subprocess, "run", side_effect=_route_says("en0")) as run:
         _stream_iface.multicast_route_interface(_GROUP)
     assert run.call_args.kwargs["timeout"] == _stream_iface._ROUTE_LOOKUP_TIMEOUT
+    # Undecodable output is replaced, not raised (#494 review).
+    assert run.call_args.kwargs["errors"] == "replace"
 
 
 def test_a_malformed_group_is_refused_before_any_route_lookup() -> None:
@@ -277,8 +279,10 @@ def test_a_malformed_group_is_refused_before_any_route_lookup() -> None:
         # A failed command's output is not trusted, even if it names one.
         MagicMock(returncode=1, stdout="  interface: utun4\n"),
         MagicMock(returncode=0, stdout="nothing that names an interface\n"),
+        # text=True decodes; a ValueError, not an OSError (#494 review).
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
     ],
-    ids=["no-binary", "timeout", "nonzero-exit", "unparseable"],
+    ids=["no-binary", "timeout", "nonzero-exit", "unparseable", "undecodable"],
 )
 def test_a_failed_route_lookup_still_joins_and_does_not_warn(failure, caplog) -> None:
     """The lookup is advisory: it must never stop a capture from starting."""
