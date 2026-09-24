@@ -32,9 +32,14 @@ PAL is unmeasured for both streams.  For debug only: if the stream is also
 one entry per phi2 cycle on PAL, it gives 985248/360 = 2736.8.
 
 Both floors are chosen at 0.8x the lower figure for their stream, not
-derived: audio 0.8x 249.69, debug 0.8x the PAL 2736.8.  A halved emitter
-fails, and the window-measure error does not.  That error is chiefly the
-in-flight tail after a stop, about 1-2% here.
+derived: audio 0.8x 249.69, debug 0.8x the PAL 2736.8.  The window's
+error is **fail-open**, and it grows with PUT latency.  Packets sent while
+the start reply is in flight, while the stop request is on its way out,
+and in the tail after the stop are all counted but not timed, so they only
+raise the reading.  At the 1 s window, a halved emitter still fails unless
+that combined latency exceeds ~0.6 s (audio: 125 x (1 + L) >= 200 needs
+L >= 0.6; debug, from the NTSC rate: L >= ~0.54).  The 1-2% error seen on
+the 5 s wired run is that effect at low latency.
 """
 from __future__ import annotations
 
