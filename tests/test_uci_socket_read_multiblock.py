@@ -275,13 +275,14 @@ def test_pre_315_single_block_reply_drains_the_same_way(turbo: bool) -> None:
 # ------------------------------------------------------ the single-block path
 #: sha256 over ``build_socket_read(sid, max_len=n, turbo_safe=t)`` for n in
 #: 0..255.  Every length a caller could already build must emit the bytes
-#: master emits: re-captured on master cbb79f8 (after #476/#484/#480, whose
-#: preamble change altered them), and equal to this branch's output there.
+#: master emits: re-captured on master 9ec1273, after #490's reply-valid
+#: wait, which changed exactly two bytes of every one of these routines
+#: (the wait mask and its branch opcode) and nothing else.
 _SINGLE_BLOCK_PINS = {
-    (False, None): "a026373c88e4355512b3478b1aa0604f3c26bc0b679d0c70494ce8ac7890d1ee",
-    (False, SOCKET_ID_ADDR): "6f7946377bc77c1d121a2a312641b1a45709a5e6def3c6cceba0d05853cc1303",
-    (True, None): "f1781fad0325a7451e96564a3ba4761c95c408071fc88d2e362ff4e3f4162322",
-    (True, SOCKET_ID_ADDR): "f1781fad0325a7451e96564a3ba4761c95c408071fc88d2e362ff4e3f4162322",
+    (False, None): "88667962c194c1e64c76a336305a8a3b94dbcae2416c933fd518ce8c2e1a1018",
+    (False, SOCKET_ID_ADDR): "edfa6b560e2982b4a356efe9da638cb4f7690b56240162debe35779fc7efd425",
+    (True, None): "5624b70a3e0153235c6b89f62a647b60d6d855c349da1fd8aa5b53eabdd52beb",
+    (True, SOCKET_ID_ADDR): "5624b70a3e0153235c6b89f62a647b60d6d855c349da1fd8aa5b53eabdd52beb",
 }
 
 
