@@ -387,16 +387,19 @@ def test_a_pre_802_refusal_is_reported_not_silent(
     assert "82,PARAMETER(S) OUT OF RANGE" in caplog.text
 
 
+@pytest.mark.parametrize("max_len", [894, NET_MAX_SOCKET_READ])
 @pytest.mark.parametrize("caps", [C64U, None, U64_314, U64E_PRE_802],
                          ids=["c64u-1.1.0", "ungraded", "u64-3.14", "3.15-override-false"])
-def test_above_893_is_refused_unless_the_device_grades_3_15(caps) -> None:
-    """Safety (#479 finding 2): pre-3.15 firmware accepts 894, and an
+def test_above_893_is_refused_unless_the_device_grades_3_15(caps, max_len: int) -> None:
+    """Safety (#479 finding 2): firmware without #802 accepts 894, and an
     894-byte datagram then fills the 896-byte reply buffer, which never
     clears DATA_AV -- the routine spins until the timeout reset.  So a
-    device not graded 3.15 or later is refused above 893 before any write."""
-    t = _SimTransport(_datagram(894), caps=caps, split=False)
+    device whose grade rules #802 out, or that has no grade, is refused
+    above 893 before any write -- at 1472 as at 894, since 894 alone would
+    also be refused by the separate rule for an undetermined grade."""
+    t = _SimTransport(_datagram(max_len), caps=caps, split=False)
     with pytest.raises(ValueError, match="893"):
-        uci_socket_read(t, 5, max_len=894)
+        uci_socket_read(t, 5, max_len=max_len)
     assert t.writes == [], "refused after touching the device"
 
 
