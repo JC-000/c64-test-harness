@@ -183,7 +183,10 @@ def _machine_progress(
     this way -- the report's EMULATOR_STOPPED label says to check it.
     EMULATOR_STOPPED itself is the fake's behaviour plus the measured
     fact that Timer A moves whenever VICE emulates; the live bug-6 stall
-    has not been sampled with Timer A.
+    has not been sampled with Timer A.  Residue: a jam whose KIL byte is
+    later overwritten by a host write, with no resume in between, reads
+    MASKED_SPIN -- VICE sent its single ``0x61`` earlier, and that event
+    carries no PC (upstream bug 7).
     """
     seen: list[str] = []
     start_gen = getattr(transport, "_resume_generation", 0)
