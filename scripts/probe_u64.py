@@ -188,7 +188,8 @@ def main() -> int:
         print(f"default : {cs.get('default')!r}")
         print(f"values  : {cs.get('values')}")
         print("Interpretation: CPU speed multiplier in MHz (approx). Values are")
-        print("strings, right-aligned to width 2. Max on this device is 48 MHz.")
+        print("strings, right-aligned to width 2. The highest value listed is")
+        print("this device's max (48 on the U64E, 64 on the C64 Ultimate).")
 
         # C64 and Cartridge Settings
         print_header("C64 and Cartridge Settings  ->  Cartridge / REU Size")

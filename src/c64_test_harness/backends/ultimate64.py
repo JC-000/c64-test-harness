@@ -791,8 +791,10 @@ class Ultimate64Transport(HardwareTransportBase):
         """Reset the machine.  See :meth:`C64Transport.reset` for semantics.
 
         * ``scope="cpu"`` — :meth:`Ultimate64Client.reset` (soft 6510).
-        * ``scope="machine"`` — :meth:`Ultimate64Client.reboot` (FPGA
-          full reinit; ~8 s before the device is reachable again).
+        * ``scope="machine"`` — :meth:`Ultimate64Client.reboot` (a
+          C64-level reset with cartridge and REU re-initialised, not a
+          firmware reboot or FPGA reinit; ~8 s before the device is
+          reachable again).
         * ``scope="drive"`` — :meth:`Ultimate64Client.drive_reset`;
           ``drive`` must be ``"a"``, ``"b"`` (or ``0`` / ``1``).
         """

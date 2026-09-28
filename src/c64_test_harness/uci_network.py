@@ -1904,8 +1904,8 @@ def build_socket_read(
     :data:`_LONG_READ_BUF_ADDR`) and writes a 16-bit count at
     *actual_len_addr*.  ``None`` (the default) means ``True`` exactly when
     *max_len* is above 255, which the single-block drain cannot hold.
-    The multi-block routine is 232 bytes plain and 592 turbo-safe
-    (``$C000-$C0E7`` / ``$C000-$C24F``, clear of the ``$C300`` status buffer),
+    The multi-block routine is 234 bytes plain and 610 turbo-safe
+    (``$C000-$C0E9`` / ``$C000-$C261``, clear of the ``$C300`` status buffer),
     so a transport upload at the 128-byte PUT threshold is 2 / 5 PUTs and
     no ``/Temp`` attachment.
 

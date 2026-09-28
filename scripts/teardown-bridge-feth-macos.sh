@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Bridge networking teardown (macOS) — reverses setup-bridge-feth-macos.sh.
 #
-# Symmetric with setup: touches only bridge0, feth0, feth1. Idempotent.
+# Symmetric with setup: touches only bridge10, feth0, feth1. Idempotent.
 # Does NOT kill VICE processes — happy-path VICE lifecycle is owned by the
 # Python harness (ViceProcess context manager).
 #

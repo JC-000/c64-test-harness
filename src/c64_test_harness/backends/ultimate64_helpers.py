@@ -948,10 +948,13 @@ def reset(client: Ultimate64Client) -> None:
 
 
 def reboot(client: Ultimate64Client) -> None:
-    """Full reboot of the Ultimate device (``PUT /v1/machine:reboot``).
+    """C64-level reset of the Ultimate device (``PUT /v1/machine:reboot``).
 
-    Reinitializes the entire FPGA including DMA controllers and REU.
-    Required when switching turbo speeds between REU-heavy workloads
+    Despite the endpoint's name this is not a firmware reboot and does
+    not reinitialise the FPGA: the C64 side restarts with cartridge and
+    REU re-initialised while the firmware keeps running (see
+    :meth:`Ultimate64Client.reboot` for what survives).  Required when
+    switching turbo speeds between REU-heavy workloads
     (a soft :func:`reset` leaves stale DMA state).  Allow ~8 seconds
     for the device to become responsive after reboot.
     """

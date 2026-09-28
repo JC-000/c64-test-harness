@@ -364,7 +364,7 @@ class ViceConfig:
     #:
     #: It is **destructive for audio-domain measurement**: at volume 0
     #: ``amp`` is 0 and VICE ``memset``s the sample buffer to zero
-    #: (S ``sound.c:1446``) before it reaches the play *or* record device.
+    #: (S ``sound.c:1447``) before it reaches the play *or* record device.
     #: A ``sounddev="wav"`` capture taken at volume 0 is a well-formed
     #: file full of silence.  :func:`render_wav` rejects it for that
     #: reason.

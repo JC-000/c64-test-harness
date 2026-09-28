@@ -162,8 +162,8 @@ BASELINE_ON_ENTRY_ENV = U64_BASELINE_ON_ENTRY_ENV
 #:   GETs), so it costs no ``/Temp`` attachment, and the device is on
 #:   wired ethernet.
 #: * ``"cbm"`` (the C64 Ultimate, 1.x) -- **off**.  Not because of
-#:   ``/Temp`` (free there too, on the 3.15-route-table assumption above --
-#:   unverified against 1.1.0), but because that device reaches the
+#:   ``/Temp`` (free there too: every PUT route in the 1.1.0 route
+#:   table binds NULL -- #436, above), but because that device reaches the
 #:   bench **over WiFi** and its reconnection after a power cycle is known
 #:   to be unreliable; nothing on the never-touch list protects a store
 #:   that a future edit adds to the covered set by mistake, and there is no
@@ -265,12 +265,15 @@ BASELINE_NEVER_TOUCH: dict[str, str] = {
         "2026-09-10, all five items already at default.  (2) 'the 3.15 "
         "source only re-starts DHCP when it is not already running, so the "
         "reset is a live no-op' -- that guard is REAL but it is NOT a "
-        "property of 3.15: it arrived post-tag in 6b5ffc21 (upstream #805) "
-        "and exists only in the v3.15-8x fork line this bench flashed onto "
-        "the U64E.  Upstream (v3.14e checkout, network_interface.cc:406) "
-        "and the C64U's 1.1.0 line call dhcp_stop() UNCONDITIONALLY on a "
-        "link-up interface.  So the no-op holds for exactly one device on "
-        "this bench and must never be generalised to the line"
+        "property of 3.15: it arrived post-tag in 6b5ffc21 (upstream #805, "
+        "merged to test-merge, in no release), v3.15-74.  Every fork build "
+        "recorded on the U64E carries it -- v3.15-78 (71480a9d), v3.15-85 "
+        "(7f6fcb51), v3.15-119 (4011c97c) and bce4535e (v3.15-132, reported "
+        "since 2026-09-15) -- and the C64U's 1.1.0 tag does not.  Upstream "
+        "(v3.14e checkout, network_interface.cc:406) and the C64U's 1.1.0 "
+        "line call dhcp_stop() UNCONDITIONALLY on a link-up interface.  So "
+        "the no-op holds for exactly one device on this bench and must "
+        "never be generalised to the line"
     ),
     "Network Settings": (
         "reset blanks Network Password (default \"\") and the syslog server, "
