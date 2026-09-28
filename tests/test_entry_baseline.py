@@ -520,7 +520,7 @@ class TestRecordedCategorySets:
 #: Item counts per category, literally -- duplicated from the module on
 #: purpose, like the category sets above.
 #: U64E fw 3.15: device-read 2026-09-15 (#342), identical per category to
-#: firmware source at 7f6fcb51 (v3.15-85).
+#: firmware source at 7f6fcb51.
 _U64E_COUNTS = {
     "Audio Mixer": 21, "SID Sockets Configuration": 8,
     "UltiSID Configuration": 8, "SID Addressing": 8,
@@ -1524,7 +1524,7 @@ class TestTableLiveModule:
     def test_firmware_version_string_matches(self, gen: str, reported: str) -> None:
         mod = _table_live_module()
         record = mod.BASELINE_RECORDED_CATEGORY_SETS[gen]
-        # The record's firmware carries a build suffix ("3.15 (v3.15-85, ...)");
+        # The record's firmware carries a build suffix ("3.15 (fork build ...)");
         # only the version string is compared.
         assert " " in record.firmware
         assert mod.firmware_mismatch(record, reported) == ""
@@ -1532,7 +1532,7 @@ class TestTableLiveModule:
     @pytest.mark.parametrize("gen,reported", [
         ("ultimate", "3.16"),
         ("ultimate", "3.15-85"),            # a build suffix the device does not report
-        ("ultimate", "3.15 (v3.15-85, 7f6fcb51)"),
+        ("ultimate", "3.15 (fork build 7f6fcb51)"),
         ("cbm", "1.1.1"),
         ("cbm", None),
         ("cbm", ""),

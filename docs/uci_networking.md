@@ -40,8 +40,8 @@ candidates are `Cartridge Preference` External (#359, next sentence), the
 C64 not sitting at `READY.` when the `SYS` is typed, and a different
 firmware build. On an Ultimate transport every routine except `uci_probe` first reads the UCI identifier at `$DF1D` (one bodyless GET, zero `/Temp` cost) and raises `UCIInterfaceAbsentError` if it is not `$C9`, because with `Cartridge Preference` = External the slot stays off the bus after the reset while `Command Interface` still reads Enabled (#359: U64E, paired ABBAAB, identifier present and routine completing 3/3 with Auto, 0/3 with External). The original observation is recorded,
 and **its cause is not explained by firmware source**. From
-source, read at tag `1.1.0` (the C64U) and `7f6fcb51` (v3.15-85, the
-U64E's build before 2026-09-15; it now reports bce4535e), not measured:
+source, read at tag `1.1.0` (the C64U) and `7f6fcb51` (the
+U64E's fork build before 2026-09-15; it now reports bce4535e), not measured:
 
 - The item drives the FPGA register `CMD_IF_SLOT_ENABLE`, which
   `C64::set_emulation_flags()` sets to `!!cfg->get_value(CFG_CMD_ENABLE)`
@@ -216,14 +216,15 @@ first block's header; the routine stores at most `max_len` payload bytes. If
 fewer bytes arrive than the header announced, the helper raises
 `UCISocketReadTruncatedError` carrying what did arrive (owner decision,
 2026-09-23). An empty socket (`02,NO DATA`, header `$FFFF`) returns `b""`.
-Firmware without upstream #802 (post-tag, c0fd6d70) -- the C64U on 1.1.0,
-and stock v3.15 -- accepts up to 894 in one block, but an 894-byte reply
+Firmware without upstream #802 (c0fd6d70) -- the C64U on 1.1.0, and 3.15
+builds cut before it -- accepts up to 894 in one block, but an 894-byte reply
 fills its 896-byte reply buffer exactly and the interface never reports it
 drained (`network_target.cc` `> CMD_MAX_REPLY_LEN-2`, `command_protocol.vhd`;
 source-read). So the helper raises `ValueError` before any write for
 `max_len` above 893 when the grade rules #802 out or is missing, and for
-`max_len` = 894 when it cannot tell, which is every 3.15 build (#802 is
-post-tag, so `uci_socket_read_multiblock` grades `None`; only an override of
+`max_len` = 894 when it cannot tell, which is every 3.15 build (#802 is in the
+public v3.15 but not in the release-candidate commit that began the line,
+and both report `"3.15"`, so `uci_socket_read_multiblock` grades `None`; only an override of
 `True` allows 894). 895 and up stay allowed there: a 3.15 build without #802
 refuses them with `82,PARAMETER(S) OUT OF RANGE`, and the helper returns
 `b""` with a WARNING naming that status. With

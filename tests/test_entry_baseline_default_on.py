@@ -872,12 +872,12 @@ class TestEthernetReason:
 
     def test_the_reason_does_not_claim_the_reset_is_harmless(self) -> None:
         """The 'live no-op' reading was refuted by the lines it cited: the
-        guard is a post-tag fork commit, not a property of 3.15, and both
-        upstream and the C64U's 1.1.0 call dhcp_stop unconditionally.  A
+        guard arrived in 6b5ffc21 and is not a property of the whole line:
+        the v3.14e checkout and the C64U's 1.1.0 call dhcp_stop unconditionally.  A
         reason must not present a one-device property as a line-wide one."""
         reason = BASELINE_NEVER_TOUCH["Ethernet Settings"]
         assert "UNCONDITIONALLY" in reason
-        for token in ("6b5ffc21", "1.1.0", "fork", "v3.15-8"):
+        for token in ("6b5ffc21", "1.1.0", "fork"):
             assert token in reason, (
                 f"the provenance of the narrowing must be cited: {token!r}"
             )
@@ -892,7 +892,7 @@ class TestEthernetReason:
         # without contradicting anything else asserted here.
         assert reason.count("is a live no-op") == 1, (
             "the 'live no-op' reading belongs only in the quoted retraction; "
-            "it is refuted for every build except the U64E's fork"
+            "it is refuted for the line as a whole (1.1.0 lacks the guard)"
         )
 
     def test_both_retracted_readings_are_named(self) -> None:

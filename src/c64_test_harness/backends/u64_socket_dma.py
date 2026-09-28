@@ -90,8 +90,8 @@ _OPCODE_NAMES = {
 #: wait — the barrier returns as soon as the reply arrives.
 _REU_DRAIN_FLOOR_BPS = 4096.0
 
-#: Firmware from the 2026-05-10 commit fdb521a5 on (the v3.15 line and the
-#: U64E's post-tag fork) closes a SocketDMA connection that has been idle
+#: Firmware from the 2026-05-10 commit fdb521a5 on (the v3.15 line, the
+#: U64E's fork builds included) closes a SocketDMA connection that has been idle
 #: for more than one second: ``socket_dma.cc`` sets ``SO_RCVTIMEO = 1 s``
 #: on every accepted socket and the command loop ``break``s (and closes)
 #: as soon as a ``recv`` returns ``<= 0`` (measured on the U64E

@@ -16,10 +16,10 @@ match stopped firing and the behaviour flipped with nothing asserting it.
 
 :class:`DeviceCapabilities` replaces that with named capabilities, each
 carrying its own version rule. Anything the version string genuinely cannot
-settle reports ``None`` rather than guessing — see *Post-tag capabilities*.
+settle reports ``None`` rather than guessing — see *Capabilities within the 3.15 line*.
 
-Post-tag capabilities
----------------------
+Capabilities within the 3.15 line
+---------------------------------
 ``ee005041 "Bump to 3.15"`` is the *start* of the 3.15 line, not its release.
 Work merged after it — multi-block socket reads (upstream #802/#806), socket
 lifetime bounds (#808), readmem argument bounds (#760) — ships in builds that
@@ -216,7 +216,7 @@ class DeviceCapabilities:
     ``1`` used to grade post-safe.
 
     Only ``writemem_post_safe`` is validated.  ``runner_wedge_possible`` and
-    the post-tag fields (``uci_socket_read_multiblock``,
+    the within-3.15 fields (``uci_socket_read_multiblock``,
     ``uci_sockets_close_on_reset``, ``readmem_rejects_zero_length``) are
     not: they accept whatever a caller passes.  Validation also cannot reach
     duck-typed stand-ins that never construct this class, which is why
@@ -270,7 +270,7 @@ class DeviceCapabilities:
         generation = cls._generation_for(version)
 
         writemem_post_safe = cls._writemem_post_safe(generation, version)
-        # Post-tag work sits on the 3.15 line only. Below it the answer is
+        # Work merged after ee005041 sits on the 3.15 line only. Below it the answer is
         # knowable and negative; on it the version string cannot tell.
         post_tag = None if (
             generation == "ultimate"

@@ -236,7 +236,7 @@ _ERROR_ADDR    = 0xC3FF   # error flag
 #: Room in the status buffer: ``$C300`` up to the next field (``$C3F0``).
 #: The firmware may send up to ``CMD_MAX_STATUS_LEN`` = 256 status bytes
 #: (``software/io/command_interface/command_intf.h:58`` at tag ``1.1.0``,
-#: 7b628eb1; ``:59`` at ``7f6fcb51``/v3.15-85, also defined in
+#: 7b628eb1; ``:59`` at ``7f6fcb51`` (U64E fork build), also defined in
 #: ``command_target.h:57`` there), more than fits,
 #: so both the 6502 drain and :func:`_read_status_string` clamp here
 #: (issue #281).
@@ -326,10 +326,10 @@ _SOCKET_READ_HEADER_LEN = 2
 SOCKET_READ_MAX_BYTES = 255 - _SOCKET_READ_HEADER_LEN
 
 #: Most a ``READ_SOCKET`` can return: firmware carrying upstream #802
-#: (post-tag, c0fd6d70; bce4535e has it) refuses a longer request with
+#: (c0fd6d70, in the public v3.15; bce4535e has it) refuses a longer request with
 #: ``82,PARAMETER(S) OUT OF RANGE`` (``network_target.h``
-#: ``NET_MAX_SOCKET_READ``).  Firmware without it -- stock v3.15 and
-#: everything older -- refuses anything above 894 the same way
+#: ``NET_MAX_SOCKET_READ``).  Firmware without it -- 3.15 builds cut before
+#: it and everything older -- refuses anything above 894 the same way
 #: (``CMD_MAX_REPLY_LEN - 2``), and 894 itself is not safe there -- see
 #: :data:`_PRE_315_SAFE_READ`.
 NET_MAX_SOCKET_READ = 1472
@@ -2399,7 +2399,7 @@ def _execute_uci_routine(
     only and leaves the ``Command Interface`` config and FPGA enable alone
     (firmware ``MENU_C64_RESET`` -> ``C64::reset``, not measured; read at
     tag ``1.1.0``, ``c64.cc:593-601``, and at ``7f6fcb51`` (the U64E's
-    v3.15-85), ``c64.cc:612-620``, ``c64_subsys.cc:217-224``,
+    earlier fork build), ``c64.cc:612-620``, ``c64_subsys.cc:217-224``,
     ``route_machine.cc:73-85``; unchanged at ``871ad034``) -- then
     sleeps :data:`_TIMEOUT_RESET_SETTLE` so the KERNAL is back at
     ``READY.`` before the next ``SYS`` is typed. It never uses
@@ -2748,8 +2748,8 @@ def uci_socket_read(
     than arrived, :class:`UCISocketReadTruncatedError` is raised carrying
     the bytes that did arrive (owner decision, 2026-09-23).
 
-    **Above 893 the firmware must carry upstream #802** (post-tag,
-    c0fd6d70; #479).  Without it the firmware answers in one block into an
+    **Above 893 the firmware must carry upstream #802** (c0fd6d70;
+    #479).  Without it the firmware answers in one block into an
     896-byte reply buffer: it accepts 894, and an 894-byte reply fills that
     buffer exactly, which the interface never reports as drained
     (``network_target.cc`` ``> CMD_MAX_REPLY_LEN-2``; ``command_protocol.vhd``,
@@ -2760,7 +2760,9 @@ def uci_socket_read(
     * *max_len* above 893 when the client's cached grade rules #802 out or
       is missing -- the C64U on 1.1.0, pre-3.15, an unprobed client;
     * *max_len* == 894 when the grade cannot tell -- every 3.15 build grades
-      ``uci_socket_read_multiblock = None``, because #802 is post-tag.  Only
+      ``uci_socket_read_multiblock = None``, because #802 is in the public v3.15
+      but not in the release-candidate commit that began the line, and both
+      report ``"3.15"``.  Only
       an override of ``True`` allows 894.
 
     895 and up stay allowed on a ``None`` grade: a 3.15 build without #802
@@ -2783,7 +2785,7 @@ def uci_socket_read(
     ):
         raise ValueError(
             f"max_len {max_len} needs firmware carrying upstream #802 "
-            f"(post-tag, c0fd6d70), which this device's grade does not "
+            f"(c0fd6d70), which this device's grade does not "
             f"establish: without it a READ_SOCKET of "
             f"{_PRE_315_SAFE_READ + 1} bytes never drains -- ask for at most "
             f"{_PRE_315_SAFE_READ}"
@@ -2893,7 +2895,8 @@ def _multiblock_read_grade(transport: C64Transport) -> bool | None:
     Reads the client's cached grade only (no device traffic).  No client or
     an unprobed one is ``False``.  ``DeviceCapabilities.from_info`` sets
     ``uci_socket_read_multiblock`` to ``False`` everywhere except
-    Ultimate-line 3.15+, where #802 is post-tag and the version cannot tell,
+    Ultimate-line 3.15+, where builds with and without #802 all report
+    ``"3.15"`` and the version cannot tell,
     so it is ``None``; ``True`` comes only from an override.
     """
     caps = getattr(getattr(transport, "client", None), "cached_capabilities", None)

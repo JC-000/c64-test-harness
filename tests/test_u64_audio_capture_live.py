@@ -141,7 +141,9 @@ def _names_absent(envelope, category: str, item: str) -> bool:
 def _read_present_item(client, category: str, item: str):
     """The item map, or ``None`` when this device does not expose the item.
 
-    Absence is HTTP 404 (the 3.15 fork) or, on stock firmware, an
+    Absence is HTTP 404 (an unknown category on firmware carrying upstream
+    #805, 6b5ffc21: the public v3.15 and every U64E build on this bench) or,
+    on firmware without it (1.1.0, 3.14d), an
     ``Ultimate64ProtocolError`` whose raw envelope :func:`_names_absent`
     reads as "no such item".  ``get_config_item`` raises the same error for
     invalid JSON, an ``errors`` array and malformed shapes, so every other
@@ -263,8 +265,10 @@ def restore_sid_config(u64_client: Ultimate64Client):
 
     An item that reports no target refuses the start -- a fixture error,
     deliberately, in place of the old "test will run unprotected" path.
-    An item the device **does not expose** (HTTP 404 on the 3.15 fork,
-    or on stock firmware an envelope with no such category or item --
+    An item the device **does not expose** (HTTP 404 for an unknown
+    category on firmware carrying upstream #805, 6b5ffc21 -- the public
+    v3.15 and every U64E build on this bench -- or, on 1.1.0 and 3.14d, an
+    envelope with no such category or item --
     ``_names_absent``) is left out of the plan with a WARNING: there is
     nothing to restore on a device without it, and the tests that need it
     fail on their own.  Any other read failure stops the start.

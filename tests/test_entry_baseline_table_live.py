@@ -103,7 +103,7 @@ def firmware_mismatch(record: RecordedCategorySet, reported: Any) -> str:
     Compares the **version string only** -- the first word of
     ``record.firmware`` against ``GET /v1/info``'s ``firmware_version``,
     whitespace-stripped -- **not the build**.  The record's build suffix
-    (``"3.15 (v3.15-85, 7f6fcb51)"``) is not something the device reports,
+    (``"3.15 (fork build 7f6fcb51)"``) is not something the device reports,
     so a reflashed self-built U64E that still reads ``"3.15"`` is not
     flagged here; the per-category count comparison is what catches a new
     build.  Pure (no I/O) so it is unit-tested without a device.

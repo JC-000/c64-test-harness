@@ -6,7 +6,7 @@ barrier that finishes each bulk write failed "intermittently" with
 applied" from "applied, ack lost".
 
 What it is (firmware ``software/network/socket_dma.cc``, same at v3.15
-and on the U64E's post-tag fork): the accepted TCP/64 socket gets
+and on the U64E's fork builds): the accepted TCP/64 socket gets
 ``SO_RCVTIMEO = 1 s`` and the command loop ``break``s -- closing the
 socket -- on the first ``recv`` that returns ``<= 0``.  A client that
 reuses one connection across writes therefore loses the first command

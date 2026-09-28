@@ -6,7 +6,7 @@ the 2-byte LE header (the *total* payload length) plus up to
 ``NET_FIRST_BLOCK_PAYLOAD`` = 893 bytes, each continuation block is payload
 only, up to ``NET_MAX_REPLY_BLOCK`` = 895 bytes, and the result status goes
 out once, on the last block (``software/io/network/network_target.cc``
-``start_read_reply`` / ``get_more_data`` at bce4535e, v3.15-132).  The
+``start_read_reply`` / ``get_more_data`` at bce4535e).  The
 interface sits in STATE ``11`` (Data More) after a block that is not the
 last; a DATA_ACC write moves it to ``01`` and the firmware answers with the
 next block, ``10`` or ``11`` (``command_protocol.vhd`` and
@@ -411,7 +411,7 @@ U64E_802 = DeviceCapabilities.from_info(
 
 
 def test_894_is_refused_on_a_3_15_grade_that_may_lack_802() -> None:
-    """Safety (#479 round 3): #802 (c0fd6d70) is post-tag, so stock v3.15
+    """Safety (#479 round 3): a 3.15 build cut before #802 (c0fd6d70)
     still takes 894 in one 896-byte block that never drains.  ``from_info``
     grades every 3.15 as ``None``, so 894 is refused there before any write;
     895 and up draw ``82`` from a pre-#802 build and stay allowed."""

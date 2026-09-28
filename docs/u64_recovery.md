@@ -45,10 +45,10 @@ established.
 The fix is upstream in
 [GideonZ/1541ultimate#686 "Add automatic cleanup of Temp folder"](https://github.com/GideonZ/1541ultimate/pull/686)
 (merged 2026-04-26). **That merge is an ancestor of the `v3.15` tag**, so
-every Ultimate-line 3.15 build carries it. The bench U64E is on a
-post-tag 3.15 build (it reports `git_commit_hash` bce4535e, v3.15-132,
-since 2026-09-15) and is fixed: measured 2026-09-02, on its then build
-v3.15-85, with the harness GC off
+every Ultimate-line 3.15 build carries it. The bench U64E runs a
+build from upstream `test-merge` (it reports `git_commit_hash` bce4535e,
+public v3.15 + #884, since 2026-09-15) and is fixed: measured 2026-09-02, on its then fork build
+7f6fcb51, with the harness GC off
 (`U64_AUTO_TEMP_GC` unset), `/Temp` held zero managed attachments before
 and after fifteen `run_prg` uploads. `u64_capabilities` encodes the same
 fact (`writemem_post_safe=True` for Ultimate-line ≥ 3.15, POST cutoff 48
@@ -234,8 +234,8 @@ transport it is also the only route that avoids a leak — leak
 
 The large POST form itself carries an unresolved question
 ([#231](https://github.com/JC-000/c64-test-harness/issues/231)). A 47,103-byte
-single-call write at `$0801` on the U64E (reported as fw
-`v3.15-78-g71480a9d`), with the machine running from `READY.`, read back
+single-call write at `$0801` on the U64E (fork build
+`71480a9d`), with the machine running from `READY.`, read back
 with exactly one wrong byte in both of n=2 trials, at offsets 2715 and
 3181. The same bytes written in 84-byte chunks were byte-exact 2/2. A
 controlled re-run on the U64E at `4011c97c` (range `$0801-$9FFF`, single
