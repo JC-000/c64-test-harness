@@ -67,6 +67,9 @@ def run_smoke(
         vice_config_cls = vice_config_cls or ViceConfig
         transport_cls = transport_cls or BinaryViceTransport
 
+    import c64_test_harness
+
+    harness = c64_test_harness.__file__
     port = port if port is not None else _free_port()
     config = vice_config_cls(port=port, sound=False, minimize=True, warp=True)
     vice = vice_process_cls(config)
@@ -84,7 +87,7 @@ def run_smoke(
             )
         return True, (
             f"launched VICE (pid {pid}, port {port}), wrote and read back "
-            f"{len(SMOKE_PATTERN)} bytes at ${SMOKE_ADDR:04X}"
+            f"{len(SMOKE_PATTERN)} bytes at ${SMOKE_ADDR:04X}; harness {harness}"
         )
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"

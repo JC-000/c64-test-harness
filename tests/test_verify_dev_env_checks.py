@@ -274,7 +274,9 @@ def test_setup_ubuntu_runs_apt_get(tmp_path, body):
 # ---------------------------------------------------------------------------
 
 
-def _check_smoke(smoke: int, fake_py: Path, repo_root: Path) -> subprocess.CompletedProcess:
+def _check_smoke(
+    smoke: int, fake_py: Path, repo_root: Path, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
     program = (
         _VERIFY_STUBS
         + f"SMOKE={smoke}\nREPO_ROOT={shlex.quote(str(repo_root))}\n"
@@ -282,7 +284,7 @@ def _check_smoke(smoke: int, fake_py: Path, repo_root: Path) -> subprocess.Compl
         + _section(VERIFY, "# ---------- Section 2b", "# ---------- Section 3")
         + "\ncheck_smoke\n"
     )
-    proc = _run(program)
+    proc = _run(program, env)
     assert proc.returncode == 0, proc.stderr
     return proc
 
@@ -503,3 +505,92 @@ def test_setup_harness_stage_installs_dev_extras(tmp_path):
     assert proc.returncode == 0, proc.stderr
     calls = log.read_text().splitlines()
     assert f"pip install -e {repo}[dev]" in calls, calls
+
+
+# ---------------------------------------------------------------------------
+# #510 review: --smoke must exercise this checkout's harness, not whatever
+# the venv's editable .pth points at; and -console is only a fallback
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("inherited", ["", "/elsewhere/src"], ids=["unset", "preset"])
+def test_smoke_runs_against_this_checkouts_src(tmp_path, inherited):
+    """The venv's editable install may point at another checkout (the
+    canonical one, from a worktree); the smoke run must put
+    ``$REPO_ROOT/src`` first on PYTHONPATH."""
+    repo = tmp_path / "checkout"
+    (repo / "src").mkdir(parents=True)
+    py = tmp_path / "fake-python"
+    py.write_text('#!/bin/sh\necho "ok: PYTHONPATH=$PYTHONPATH"\nexit 0\n')
+    py.chmod(0o755)
+    proc = _check_smoke(1, py, repo, {"PYTHONPATH": inherited} if inherited else None)
+    ((_label, status, detail, _crit),) = _rows(proc.stdout)
+    assert status == "ok", detail
+    entries = detail.split("PYTHONPATH=", 1)[1].split(":")
+    assert entries[0] == f"{repo}/src", detail
+    if inherited:
+        assert inherited in entries, detail
+
+
+def test_smoke_ok_line_names_the_harness_that_ran():
+    import c64_test_harness
+
+    mod = _load_smoke()
+    passed, detail = _smoke(mod, transport_cls=_transport_cls())
+    assert passed, detail
+    assert f"harness {c64_test_harness.__file__}" in detail, detail
+
+
+# Stand-in x64sc whose plain --help lists the flags and whose -console form
+# fails: a machine with a display, where the fallback must not decide.
+_FAKE_DISPLAY_X64SC = r"""#!/bin/sh
+case "$*" in
+  --version) echo "x64sc (VICE 3.10)"; exit 0 ;;
+  --help)
+     echo "        -ethernetcart <Type>"
+     echo "        -binarymonitor"
+     echo "        -remotemonitor"
+     exit 0 ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac
+"""
+
+
+def _display_bin(tmp_path: Path) -> Path:
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    x = bindir / "x64sc"
+    x.write_text(_FAKE_DISPLAY_X64SC)
+    x.chmod(0o755)
+    c = bindir / "c1541"
+    c.write_text("#!/bin/sh\necho 'c1541 (VICE 3.10)'\n")
+    c.chmod(0o755)
+    return bindir
+
+
+def test_verify_keeps_plain_help_when_it_lists_the_flags(tmp_path):
+    bindir = _display_bin(tmp_path)
+    program = (
+        "set -u\n"
+        + "record() { printf 'ROW|%s|%s|%s|%s\\n' \"$2\" \"$3\" \"$4\" \"$5\"; }\n"
+        + "add_hint() { printf 'HINT|%s\\n' \"$1\"; }\n"
+        + 'have_cmd() { command -v "$1" >/dev/null 2>&1; }\n'
+        + _section(VERIFY, "# ---------- Section 1: VICE", "# ---------- Section 2")
+        + "\ncheck_vice\n"
+    )
+    proc = _run(program, {"PATH": f"{bindir}:/usr/bin:/bin"})
+    rows = {r[0]: r[1] for r in _rows(proc.stdout)}
+    assert rows["ethernet cart support"] == "ok", proc.stdout
+    assert rows["binary monitor support"] == "ok", proc.stdout
+    assert rows["text monitor support"] == "ok", proc.stdout
+
+
+def test_setup_keeps_plain_help_when_it_lists_the_flags(tmp_path):
+    bindir = _display_bin(tmp_path)
+    program = (
+        "set -u\nset -o pipefail\n"
+        + _section(SETUP, "# ---------- Stage 2", "stage_vice_build() {")
+        + '\nvice_already_installed; echo "RC=$?"\n'
+    )
+    proc = _run(program, {"PATH": f"{bindir}:/usr/bin:/bin"})
+    assert "RC=0" in proc.stdout, proc.stdout + proc.stderr

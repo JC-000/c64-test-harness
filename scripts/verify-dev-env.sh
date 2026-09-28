@@ -415,7 +415,10 @@ check_smoke() {
         record "$sec" "VICE launch + memory round-trip" missing "needs python3 and the repo root" 1
         return
     fi
-    out="$("$py_bin" "$REPO_ROOT/scripts/vice_smoke.py" 2>&1 </dev/null)"
+    # $REPO_ROOT/src first: the harness venv's editable .pth points at
+    # whichever checkout ran `pip install -e`, so without this a worktree or
+    # a second checkout would smoke-test that other tree's harness (#510).
+    out="$(PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" "$py_bin" "$REPO_ROOT/scripts/vice_smoke.py" 2>&1 </dev/null)"
     rc=$?
     out="$(printf '%s\n' "$out" | tail -1)"
     if [ "$rc" -eq 0 ]; then
