@@ -20,19 +20,17 @@ order. Each layer has its own probe + recovery primitive.
 This whole wedge family (issues #112, #129, #137) was traced to firmware
 Temp-folder accumulation after the tiers below were first characterised,
 and the mitigations here are **temporary**. `POST /v1/machine:writemem`
-uploads arrive as multipart attachments that land in Temp — visible in the
-firmware route table itself, `software/api/route_machine.cc` at tag `1.1.0`:
-`API_CALL(POST, machine, writemem, &attachment_writer, ...)`, where all
-eleven other `machine:*` registrations pass `NULL`. So POST `writemem` is
-the only attachment-carrying route in that family, from firmware source
-rather than from observed behaviour. (Two limits on what this citation
-buys: it covers the `machine:*` family only — the `runners:*` routes and
-the multipart `mount_disk`/`drives:load_rom` bodies are registered
-elsewhere and are not evidenced by it — and it establishes that
-attachments are *created*, not that accumulation crashes the firmware;
-that is the owner's settled account (2026-09-15), not this citation's.) and without
-garbage collection the accumulation produces the latency drift and
-eventual wedge described in every tier below.
+uploads arrive as attachments that land in Temp — visible in the firmware
+route table itself: at tag `1.1.0`, `software/api/route_machine.cc`
+registers `API_CALL(POST, machine, writemem, &attachment_writer, ...)`, and
+the same `&attachment_writer` binding appears on the `configs`,
+`drives:mount`, `drives:load_rom` and `runners:*` POST routes (the full
+list is in `Ultimate64Client._creates_temp_attachment`'s docstring). The
+route table establishes that attachments are *created*; that their
+accumulation crashes the firmware is the owner's settled account
+(2026-09-15), not the citation's. Without garbage collection the
+accumulation produces the latency drift and eventual wedge described in
+every tier below.
 
 Two cautions about how far that goes, both expanded under "The hygiene
 pass is prevention, not recovery" below. The accumulation fills `/Temp`,
@@ -46,8 +44,10 @@ established.
 The fix is upstream in
 [GideonZ/1541ultimate#686 "Add automatic cleanup of Temp folder"](https://github.com/GideonZ/1541ultimate/pull/686)
 (merged 2026-04-26). **That merge is an ancestor of the `v3.15` tag**, so
-every Ultimate-line 3.15 build carries it. The bench U64E runs
-`v3.15-85` and is fixed: measured 2026-09-02 with the harness GC off
+every Ultimate-line 3.15 build carries it. The bench U64E is on a
+post-tag 3.15 build (it reports `git_commit_hash` bce4535e, v3.15-132,
+since 2026-09-15) and is fixed: measured 2026-09-02, on its then build
+v3.15-85, with the harness GC off
 (`U64_AUTO_TEMP_GC` unset), `/Temp` held zero managed attachments before
 and after fifteen `run_prg` uploads. `u64_capabilities` encodes the same
 fact (`writemem_post_safe=True` for Ultimate-line ≥ 3.15, POST cutoff 48
@@ -60,7 +60,7 @@ Two practical consequences on unfixed firmware:
 - Prefer `PUT /v1/machine:writemem?data=<hex>` over `POST` for heavy
   write loads. POST is the leaking path; PUT does not accumulate Temp
   files.
-- Once both devices run fixed firmware, the tier-1 mitigations and the
+- Once the C64U runs fixed firmware, the tier-1 mitigations and the
   tier-3 `uci_wedge_probe` become diagnostic history rather than
   operating procedure. Re-validate against the new firmware before
   deleting anything — the deterministic repro in issue #112 is the
@@ -72,10 +72,9 @@ On unfixed firmware, `run_prg` (and any other endpoint that carries a
 body — `writemem` above the device's threshold, `load_prg`, `run_crt`,
 `sidplay`, `modplay`, the multipart `mount_disk`/`load_rom` bodies) leaks a managed attachment
 (`temp0000`, `temp0001`, ...) per call. Keyboard injection is **not** on
-that list, despite an earlier revision of this line saying so:
-`send_text` writes at most `KEYBUF_MAX = 10` bytes
-(`ultimate64_client.py:862-866`), which is under either threshold and so
-always takes the bodyless `PUT ?data=` form. Ultimate-line 3.15 collects them
+that list: `Ultimate64Client.send_text` writes at most `KEYBUF_MAX = 10`
+bytes per request, which is under either threshold and so always takes
+the bodyless `PUT ?data=` form. Ultimate-line 3.15 collects them
 on-device (#686); the C64U on 1.1.0 does not. This is shared 1541ultimate firmware behaviour, not
 specific to either device generation. `ultimate64_temp_gc.gc_temp_folder(host, ...)`
 deletes those files over FTP, oldest-first, keeping the youngest N
@@ -143,11 +142,8 @@ upload is not a cautious default — it is the only lever still attached.
 
 #### The hygiene pass is integral, not an env flag
 
-`U64_AUTO_TEMP_GC` used to be the only thing that armed the pass, and it
-armed exactly one call site (`run_prg`). Both halves of that were wrong
-for the device that needs it: the flag was almost never set, and
-`load_prg` / `run_crt` / `sidplay` / POST `writemem` / `drives:mount`
-leaked just the same. `Ultimate64Client` now decides for itself.
+`Ultimate64Client` decides for itself whether to run the pass, and it
+guards every attachment-creating request, not only `run_prg`.
 
 **Arming** — in order: the `temp_hygiene=` constructor argument; then
 `U64_AUTO_TEMP_GC` (truthy forces the pass on for *any* device, falsy
@@ -177,11 +173,11 @@ binds `NULL`. So the harness counts a leak for exactly *body + POST*,
 checked in `Ultimate64Client._request` — one choke point, so anything
 added later is covered by construction. `PUT machine:writemem?data=<hex>`
 and the config PUTs are free, which is also why the pass can enable FTP
-File Service without leaking an attachment to do it. Two deliberate
-conservatisms: `runners:modplay` (`&attachment_reu` — the body goes to
-the REU) and `machine:input` (`&input_json_writer`) are counted anyway;
-and the route table read is a 3.15-line checkout, so the C64U's 1.1.0
-verb/handler pairing is assumed identical.
+File Service without leaking an attachment to do it. The route table was
+read at tag `1.1.0` (the C64U's firmware), and the 3.15 line pairs verbs
+and handlers the same way. One deliberate conservatism: `runners:modplay`
+(`&attachment_reu` — the body goes to the REU) and, on the 3.15 line,
+`machine:input` (`&input_json_writer`) are counted anyway.
 
 Measured live, and the boundary is exact (C64U 10.53.21.158, fw 1.1.0,
 `writemem_post_safe=False`, threshold 128, 2026-09-10, under the
@@ -195,103 +191,61 @@ the C64U. (FTP File Service read `current=Enabled` / `default=Disabled`
 on that device, so the enable-then-refuse path was not exercised there —
 it remains required for the general case.)
 
-The path that makes this urgent has no `run_prg` in it at all:
-before #252, `Ultimate64Transport.write_memory` did not chunk, so a payload
-above the threshold went straight to the body-POST path. It now chunks at the
-client's threshold (every piece a PUT) on any device not graded
-`writemem_post_safe` — leak-prone, unprobed, or unknown — and keeps the single
-POST only on a post-safe device; a direct `client.write_mem` call above the
-threshold still POSTs. The body-POST path is also the one
-with an open correctness question: `write_mem`'s docstring says the POST
-form "has no upper bound verified at 2048 bytes"
-(`Ultimate64Client.write_mem`'s docstring, `ultimate64_client.py:1371`),
-and a 47,103-byte
-single-call write on the U64E (fw `v3.15-78-g71480a9d`, n=2, under the
-`DeviceLock`) came back with **exactly one wrong byte, at a different
-offset each time** (2715, then 3181 — both past 2048), while the same
-bytes through `write_bytes`'s chunks (84 bytes at the time) were byte-exact 2/2. Not
-truncation and not a fixed boundary; unexplained. So chunking is the
-better path for two independent reasons, not one —
-[#231](https://github.com/JC-000/c64-test-harness/issues/231). Callers that route through
-`write_bytes` stay on the PUT path and never leak, on every grade. On an
-Ultimate transport it chunks at the transport's `rest_put_chunk_size` (the
-client's `write_mem_query_threshold`, capped at 128), while VICE and other
-transports keep 84. On a post-safe device the cost is more, smaller
-requests, accepted by owner decision 2026-09-15
-([#252](https://github.com/JC-000/c64-test-harness/issues/252)). So
-does the SocketDMA fast path — but **SocketDMA writes are disabled
-pending a stability review**, so it is not a route off the POST path that
-anyone may take today. `socket_dma` defaults to `False`
-(`backends/ultimate64.py:79`); leave it there. Note also that a SocketDMA
-write which falls back to REST *does* leak, and the fallback latches:
-`_socket_dma_unusable` is never cleared, not even by `close()`
-(`backends/ultimate64.py:106`, `:299`), so one connect failure routes every
-later write on that transport to REST for its lifetime after a single
-WARNING.
-
-**On a C64U, a code write is normally a POST.** The 128-byte ceiling is
-below most of the harness's own generated blobs — measured host-side by
-`len()` (no device traffic, 2026-09-10): `build_uci_command` 133,
-`build_get_ip` 138, `build_socket_read` 149, `build_tcp_connect` /
-`build_udp_connect` 159, `build_socket_write` 170 (payload-independent —
-the data lives separately at `data_addr`), `build_rx_echo_reply_code` 193,
-`build_ping_and_wait_code` 256 (362 with ARP + drain),
-`build_rx_echo_reply_tod_code` 317, `build_ping_and_wait_tod_code` 486,
-`build_icmp_responder_code` 630, `build_icmp_responder_tod_code` 754.
-`build_uci_probe` / `build_uci_status_peek` (12) and `build_socket_close`
-(112) fit under the ceiling — but `turbo_safe=True` roughly triples every
-one of these, which pushes even `build_socket_close` to 341.
-
-Before [#252](https://github.com/JC-000/c64-test-harness/issues/252), a UCI
-socket write (`uci_network.py:1936-1943`) cost **one** attachment for its
-always-POST 170-byte routine code, plus a **second only when the payload
-itself exceeded the ceiling**. The 800/892-byte large-send tests did; a
-small write stayed on PUT. Since #252 every one of those writes goes
-through `Ultimate64Transport.write_memory`, which on a leak-prone or unknown
-grade chunks each of them into PUTs, so a UCI socket write through the
-transport costs **nothing**. On a post-safe device the over-threshold
-writes are single POSTs, and that firmware collects them. The table above
-still gives the blob sizes. Its `socket_id` (1 byte) and `data_len` (2
-bytes) writes are PUTs on every grade and cost nothing, and
+**Writes through the transport do not leak.** Most of the harness's own
+generated 6502 blobs (the UCI builders, the `bridge_ping` routines) are
+longer than the 128-byte PUT ceiling; `len()` of a builder's output gives
+its size. They reach the device through `Ultimate64Transport.write_memory`
+— directly, via `execute.load_code()` (a bare alias for it), or via
+`uci_network._execute_uci_routine` — and since
+[#252](https://github.com/JC-000/c64-test-harness/issues/252) that method
+splits every write into chunks of at most the transport's
+`rest_put_chunk_size` (the client's `write_mem_query_threshold`, capped at
+128) on any device not graded `writemem_post_safe` — leak-prone,
+unprobed, or unknown. Every chunk is a bodyless PUT, so a routine upload,
+a UCI socket write's payload and its socket-id and length bytes all cost
+**nothing** on the C64U. A post-safe device keeps the single POST, which
+that firmware collects. The price on the leak-prone grade is one round
+trip per chunk, and the 6510 runs between chunks, so no chunked write is
+atomic; the timing-sensitive paths (the ip65 "≥ 0.2 s after `ip65_init`"
+rule) are **not live-verified** chunked on a C64U. `write_bytes` also
+chunks at `rest_put_chunk_size` on an Ultimate transport, on every grade
+(owner decision 2026-09-15, #252); VICE and other transports keep 84.
 `enable_uci` / `disable_uci` are `set_config_items` — bodyless, zero
-attachments. Each RR-Net ping/responder load costs one. The budget counts
-*attachments* rather than logical operations, which is the right unit
-precisely because nobody has to maintain that table: every one of those
-distinctions falls out of the same choke point.
+attachments.
 
-**Where the protocol is driven decided the exposure before #252.** UCI
-driven from host Python cost an attachment per `_execute_uci_routine` code
-write *when the emitted routine exceeded the threshold*. The builders mostly
-do (133-170 B), though probe, peek and `socket_close` do not, so an
-operation made of many `socket_read`s was many attachments. Since #252,
-through `Ultimate64Transport` on a leak-prone or unknown grade, those code
-writes are chunked PUTs and cost nothing. What remains is a round trip per
-chunk, and no chunked write is atomic. The same protocol driven C64-side
-from inside an uploaded PRG still costs only the one upload and none of
-the round trips, and it is the only route that avoids a leak for a caller
-that bypasses the transport. That is leak *elimination*, not hygiene, and it is the first
-thing to reach for — the GC is what covers the traffic you cannot move.
+What still leaks on the C64U: a direct `client.write_mem` above the
+threshold, `run_prg` / `load_prg` / `run_crt` / `sid_play` (and
+`mod_play`, whose body the firmware routes to the REU, counted anyway),
+the multipart `mount_disk` / `drive_load_rom` bodies, and
+`liveness_probe` (two per call, see Tier 1). The budget counts
+*attachments* at the one request choke point, so none of these needs a
+table of its own.
 
-These arrive via `execute.load_code()`, a bare alias for
-`transport.write_memory` (`execute.py:104-110`), and via
-`_execute_uci_routine`, which writes its routine with
-`transport.write_memory` too (`uci_network.py:1780`). Before #252 neither
-chunked. That was the third independent confirmation that hooking the
-*request* is the only workable choke point: a budget keyed on runner verb
-names sees none of this traffic.
+**Where the protocol is driven still decides the round-trip count.** UCI
+driven from host Python costs a routine upload (several chunked PUTs on a
+leak-prone device) per operation, so a fetch made of many `socket_read`s
+is many requests. The same protocol driven C64-side, from inside an
+uploaded PRG, costs only the one upload. For a caller that bypasses the
+transport it is also the only route that avoids a leak — leak
+*elimination*, not hygiene, and the first thing to reach for.
 
-Since [#252](https://github.com/JC-000/c64-test-harness/issues/252),
-`Ultimate64Transport.write_memory` chunks at the client's threshold on
-any device not graded `writemem_post_safe`. On a leak-prone or unknown
-grade, both routes above therefore send ≤128-byte PUTs and leave nothing
-in `/Temp`, which eliminates this class of leak rather than cleaning up
-after it. On a post-safe device they remain one POST, which that firmware
-collects. The cost is paid on the leak-prone grade: a 754-byte blob
-becomes six round trips instead of one, and the 6510 runs between them.
-That touches paths with live timing constraints (the ip65 "≥ 0.2 s after
-`ip65_init`" rule, the SocketDMA barrier) and is **not live-verified** on
-a C64U. A direct `client.write_mem` call is not covered and still POSTs
-above the threshold.
+The large POST form itself carries an unresolved question: a 47,103-byte
+single-call `write_mem` on the U64E (fw `v3.15-78-g71480a9d`) once read
+back with one wrong byte at a varying offset
+([#231](https://github.com/JC-000/c64-test-harness/issues/231)). A later
+controlled re-run was clean 0/50 on another build and identified two
+confounders sufficient to explain it (a readback past `$A000` reading
+BASIC ROM, and a running CPU writing its own RAM), so the issue is closed
+as non-reproducing, not refuted.
+
+**SocketDMA writes are disabled pending a stability review**, so the
+SocketDMA fast path is not a route off the POST path that anyone may take
+today. `Ultimate64Transport`'s `socket_dma` defaults to `False`; leave it
+there. A SocketDMA write which falls back to REST is chunked like any
+other write on a non-post-safe grade, and the fallback latches:
+`_socket_dma_unusable` is never cleared, not even by `close()`, so one
+connect failure routes every later write on that transport to REST for its
+lifetime after a single WARNING.
 
 **Cadence.** A per-device budget of
 `ultimate64_temp_gc.DEFAULT_LEAK_BUDGET` = **6** attachment-creating
@@ -468,11 +422,6 @@ requests to the other. So:
   - Attachments counted only by disarmed or post-safe clients are never
     swept this way.
 
-**Cross-process accounting is still open.** Two processes against one
-device keep two ledgers, and each spends a budget. The hand-off between
-processes is covered only by the lock-release drain, which sweeps while the
-releasing process still holds the device's lock.
-
 `machine:reboot` does **not** reset the count: it is a C64-level reset, and
 `/Temp` is a firmware RAM disk (`software/filesystem/ramdisk.cc`) that only
 a firmware power-on clears.
@@ -520,27 +469,23 @@ arming. On firmware carrying #686 (Ultimate-line ≥ 3.15) the pass is a
 no-op that finds nothing to delete — verified on the U64E 2026-09-02 —
 so all of this matters only for the C64U until its firmware catches up.
 
-**Correction (issue #153 comment, 2026-08-21):** the firmware's
-attachment counter is hex, not decimal — `temp0009` is followed by
-`temp000A`. `gc_temp_folder` matches `^temp[0-9a-fA-F]+$` and sorts by
-the suffix parsed as base-16 (a decimal-only pattern silently leaves
-every lettered name uncollected — this exact bug was already found and
-fixed in the sibling `c64-https` repo, `tools/uci/_temp_gc.py` at
-`a4f4c46`). Separately, the C64U ships `FTP File Service: Disabled` by
-default (the U64E has it enabled); `gc_temp_folder` detects a refused
-FTP connection and reports that the setting may need enabling via
-`Network Settings > FTP File Service` — a runtime-only REST config
-write, so it lives in firmware RAM until `save_config_to_flash` and a
-firmware **power-on** reverts it. That revert is benign, because `/Temp`
-is a RAM disk (`software/filesystem/ramdisk.cc`) and the same power-on
-empties it.
+**Attachment names are hex.** The firmware's counter is hex, not decimal —
+`temp0009` is followed by `temp000A` (#153) — so `gc_temp_folder` matches
+`^temp[0-9a-fA-F]+$` and sorts by the suffix parsed as base-16; a
+decimal-only pattern would leave every lettered name uncollected. The C64U
+ships `FTP File Service: Disabled` by default (the U64E has it enabled);
+`gc_temp_folder` detects a refused FTP connection and reports that the
+setting may need enabling via `Network Settings > FTP File Service` — a
+runtime-only REST config write that lives in firmware RAM until
+`save_config_to_flash`, reverted only by a firmware **power-on**. That
+revert is benign, because `/Temp` is a RAM disk
+(`software/filesystem/ramdisk.cc`) and the same power-on empties it.
 
-**`machine:reboot` does neither.** This sentence used to say a reboot
-"both reverts it and empties `/Temp`"; it is false on both halves.
-`machine:reboot` is a C64-level reset — config in firmware RAM survives
-it, and so do the attachments. Measured on the C64U: one POST leaves
-`temp0008`, then `reboot()` plus a 6 s settle leaves `temp0008` still
-there. Do not treat a reboot as cross-run `/Temp` protection.
+**`machine:reboot` does neither.** It is a C64-level reset: config in
+firmware RAM survives it, and so do the attachments. Measured on the C64U:
+one POST leaves `temp0008`, then `reboot()` plus a 6 s settle leaves
+`temp0008` still there. Do not treat a reboot as cross-run `/Temp`
+protection.
 
 ## Wedge tiers
 
@@ -574,24 +519,22 @@ trigger.
 
 **On leak-prone firmware the probe costs two `/Temp` attachments per
 call** (measured on the C64U, fw 1.1.0, 2026-09-10: `/Temp` 0 → 2 for one
-call, with a bodyless `read_mem` control at 0). Its docstring says the
-probe issues "exactly one" writemem POST; that counts the probe write and
-not the restore. It writes a 128-byte pattern at `$0334` by POST
-(`ultimate64_probe.py:536-547`), then writes the original bytes back
-through `_restore_quiet` — a second POST (`:712`, `:729`). Two bodies, two
-attachments. `assert_healthy()` wraps it, and the 128-byte payload sits
+call, with a bodyless `read_mem` control at 0). It writes a 128-byte
+pattern at `$0334` by POST, then writes the original bytes back through
+`_restore_quiet` — a second POST (`backends/ultimate64_probe.py`). Two
+bodies, two attachments. `assert_healthy()` wraps it, and the 128-byte payload sits
 exactly at the C64U's PUT ceiling but is sent by the probe's own raw REST
 client, which does not consult the client's threshold.
 
 The consequence inverts the obvious procedure: **the health check you
 reach for when you already suspect a wedge spends two of a small budget,
 and probing again on a bad result converges on the wedge you are
-diagnosing.** Under the conservative count reading, seven or eight health
-checks are the whole budget. Diagnose with bodyless calls first —
+diagnosing.** Three health checks spend the whole per-device budget of 6
+(`DEFAULT_LEAK_BUDGET`). Diagnose with bodyless calls first —
 `get_info()`, `get_version()` and `read_mem()` all cost nothing — and
 reach for `liveness_probe` deliberately, once, knowing the price.
 
-**Since #250 the client accounts for it.** `Ultimate64Client.liveness_probe`
+**The client accounts for it** (#250). `Ultimate64Client.liveness_probe`
 (and so `assert_healthy`) routes both POSTs through the client's
 `/Temp` accounting — `LIVENESS_PROBE_TEMP_ATTACHMENTS = 2` — and reserves
 both before sending anything: if the budget cannot hold two, the hygiene
@@ -599,7 +542,7 @@ pass runs first, and if hygiene has been proven impossible it raises
 `Ultimate64TempHygieneError` without touching the device, so the restore
 is never the refused request.
 
-**Since #450 the free spelling is accounted too.** The module-level
+**The free spelling is accounted too** (#450). The module-level
 `ultimate64_probe.liveness_probe(host, ...)` — and so the
 `c64_test_harness.liveness_probe` re-export — holds no client, but it
 reserves the same two attachments against the same per-device ledger
@@ -612,9 +555,9 @@ to a client that leaked attachments of its own (#263), and this function
 has no client. Whichever spelling you use, the count is the device's.
 
 Three consequences worth knowing before you reach for the free spelling.
-It **can now raise** `Ultimate64TempHygieneError`, which it never did
-before #450 — that is the refusal, and it is the point, but it is a new
-exception from a previously non-raising root export. It **can now sweep**,
+It **can raise** `Ultimate64TempHygieneError` — that is the refusal, and
+it is the point, but it is an exception from a root export that did not
+raise before #450. It **can sweep**,
 and a sweep deletes `temp%04x` files, which per #418 can include a raw or
 filename-less image another lane mounted; that trade was already accepted
 for every client path and here it fires only on a budget crossing. And it
@@ -757,7 +700,7 @@ wedges.
 firmware reboot**, despite the endpoint's name: it is
 `C64::start_cartridge(NULL)`, so the C64 side restarts with cartridge and
 REU re-initialised while **the firmware itself keeps running** (see
-`Ultimate64Client.reboot`'s docstring, `ultimate64_client.py:1200-1206`).
+`Ultimate64Client.reboot`'s docstring).
 ~8 s; over the wire. That re-initialisation is why it recovers REU/DMA
 stuck state and clears most runner-tier wedges — and the firmware's
 survival is why it clears neither `/Temp` (a firmware RAM disk; only a
@@ -802,72 +745,42 @@ device" — wasting troubleshooting cycles each time.
 
 **Cost, stated plainly:** a `/Temp` firmware crash on the C64 Ultimate put
 the device out of service for about two weeks in August–September 2026,
-because nobody was physically present to power-cycle it. (Recorded here as
-a UCI STATE-bit wedge until 2026-09-11, when the owner confirmed REST was
-down throughout — see below.) No REST endpoint
+because nobody was physically present to power-cycle it. No REST endpoint
 restarts the firmware — `machine:reboot` is `C64::start_cartridge(NULL)`,
-a C64-level reset, and no `machine:*` route restarts the firmware itself —
-so nothing re-initialises lwIP or clears stack-level state remotely.
-(The route list was last enumerated at firmware 8fb73523 as menu_button,
-reset, pause, resume, poweroff, writemem and debugreg. That enumeration was
-**never complete**: at tag `1.1.0` `software/api/route_machine.cc` has twelve
-registrations across ten route names (`writemem` and `debugreg` each
-register two verbs), including the `GET machine:readmem` the harness uses constantly and
-a `GET machine:measure` nothing in this repo mentions. The conclusion is
-unaffected — none of them restarts the firmware — but the seven-route list
-was wrong when written, not outdated: `GET machine:readmem` is the route
-the harness has called since 3.14d and existed at 8fb73523 too. Do not
-re-enumerate at each firmware bump; the method was the problem.) Before running a sustained UCI `SOCKET_WRITE` load on a device
-that only a remote agent is using, ask whether anyone can reach its power
-switch this week; if not, do not run it.
+a C64-level reset, and none of the `machine:*` routes at tag `1.1.0`
+(`software/api/route_machine.cc`) restarts the firmware itself — so
+nothing re-initialises lwIP or clears stack-level state remotely. Before
+running a sustained UCI `SOCKET_WRITE` load on a device that only a remote
+agent is using, ask whether anyone can reach its power switch this week;
+if not, do not run it.
 
-**Was that outage a `/Temp` consequence? Yes — settled by the owner,
-2026-09-11.** This section previously recorded the two-week outage as a UCI
-STATE-bit wedge, and the Status section above attributes the whole wedge
-family to Temp-folder accumulation. The two labels were never reconciled.
-The owner has now settled it from direct observation: **REST was down**
-during those two weeks.
+**That outage was the `/Temp` crash, not a UCI STATE-bit wedge** (owner,
+2026-09-11). It was first recorded here as a UCI wedge; the owner settled
+it from direct observation that **REST was down** throughout. That is
+decisive: a UCI STATE-bit wedge leaves REST *healthy* (Tier 3's "What
+we've ruled out"), while a `/Temp` crash takes REST and the UCI bridge
+down together with the firmware. The presentation matches the crash
+model: the FPGA keeps running and the C64 keyboard stays responsive, so
+the machine looks alive, but the firmware is dead — the button on the side
+of the case will neither soft-power-off nor bring up the firmware menu.
+Tier 3's UCI STATE-bit wedge is a real and separate failure (#112); it is
+not what cost two weeks.
 
-That is decisive, because this document already records the discriminator.
-A UCI STATE-bit wedge leaves REST *healthy* — Tier 3's "What we've ruled
-out" states that `liveness_probe` and `runner_health_check` both return
-healthy throughout. A `/Temp` crash takes REST and the UCI bridge down
-together with the firmware. REST being down rules the UCI wedge out and
-matches the `/Temp` crash exactly.
-
-The owner's account of the presentation, which matches the crash model
-recorded above: the FPGA keeps running and the C64 keyboard stays
-responsive, so the machine looks alive, but the firmware is dead — the
-button on the side of the case will neither soft-power-off nor bring up
-the firmware menu.
-
-**Consequences.**
-
-* The two-week cost **does** belong to the `/Temp` regime and may be cited
-  as such. An earlier revision of this scrub removed that citation from
-  CLAUDE.md and the skill files on the grounds that it belonged to a
-  different mechanism; that removal was based on this document's own
-  mislabelling and has been reversed.
-* This section's "UCI STATE-bit wedge" label on the 2026-08/09 outage is
-  **wrong** and is corrected above. Tier 3's UCI STATE-bit wedge is a real
-  and separate failure (#112) — it simply is not what cost two weeks.
-* The **driver is settled**: `writemem` attachment accumulation. The owner
-  states it directly (2026-09-11), this document's Status section says the
-  same, and upstream removed it — GideonZ/1541ultimate#686, "Add automatic
-  cleanup of Temp folder" (chrisgleissner, merged 2026-04-26, building on
-  Gee-64's #474), which keeps the youngest 10 *managed* files and deletes
-  older ones. The harness's own defence attacks the same driver one step
-  earlier: staying at or below `write_mem_query_threshold` uses the
-  bodyless `PUT ...?data=` path, which creates no attachment at all.
-* **Why a full `/Temp` crashes the firmware** is not established, and #686 does not
-  settle it. Read it and it documents no crash, hang or exhaustion — it is
-  framed as housekeeping, and it explicitly **removed the disk-use trigger
-  in favour of a file count**, because keeping the youngest 10 conflicted
-  with a usage threshold. So upstream's remedy is count-shaped, but that is
-  a design choice in the cleaner, not evidence about what fails.
+* **The driver is settled**: `writemem` attachment accumulation (owner,
+  2026-09-11). Upstream removed it — GideonZ/1541ultimate#686, "Add
+  automatic cleanup of Temp folder" (chrisgleissner, merged 2026-04-26,
+  building on Gee-64's #474), which keeps the youngest 10 *managed* files
+  and deletes older ones. The harness's own defence attacks the same
+  driver one step earlier: staying at or below `write_mem_query_threshold`
+  uses the bodyless `PUT ...?data=` path, which creates no attachment at
+  all.
 * **The mechanism is settled** (owner, 2026-09-15): "When /Temp is filled then the device firmware crashes. the c64 appears to continue to run but the rest api becomes unresponsive and the local firmware menu switch no longer has an effect. This is the outcome of the writemem garbage collection issue on unpatched firmware."
-  How many uploads it takes is not known, and no count is kept here: the
-  earlier guessed wedge count is retired.
+  How many uploads it takes is not known, and no count is kept here.
+* **Why a full `/Temp` crashes the firmware**, rather than failing writes,
+  is not established, and #686 does not settle it: it documents no crash,
+  hang or exhaustion, and it **removed a disk-use trigger in favour of a
+  file count**. Upstream's remedy is count-shaped, but that is a design
+  choice in the cleaner, not evidence about what fails.
 
 The currently confirmed cases where physical power-cycle is the **only**
 documented recovery:
@@ -902,9 +815,12 @@ not parse; it uses zero.
 `Ultimate64Client.write_mem` validates `0..0xFFFF` before it builds the
 query, so ordinary callers are safe. Anyone assembling the query string
 themselves, or calling `_request` directly, gets a silent zero-page
-clobber — `$0000`/`$0001` are the 6510 CPU port — reported to them as
-success. Tracked as
-[#251](https://github.com/JC-000/c64-test-harness/issues/251).
+clobber on the C64U — `$0000`/`$0001` are the 6510 CPU port — reported
+to them as success
+([#251](https://github.com/JC-000/c64-test-harness/issues/251)). The
+upstream fix (1541ultimate PRs #884/#888: strict hex parsing in
+`readmem`/`writemem`/`debugreg`, HTTP 400 "Invalid address") is in the
+U64E's bce4535e build and, by source, not in the C64U's 1.1.0.
 
 ## Cross-references
 
