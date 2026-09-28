@@ -380,8 +380,12 @@ it reads `LIN=12` every time with `CYC` 0-2. Measured on VICE 3.10
 (2026-09-28, n=8 per arm, warp on and off): Timer A moved in every trial
 of BASIC idle, `SEI; JMP *`, a 9-cycle `SEI` loop and a KIL jam alike,
 and the classifier returned running / masked spin / masked spin / jammed
-8/8 each. The stopped-emulator verdict rests on the fake plus that
-measurement; this bug has not yet been caught live with Timer A sampled.
+8/8 each. With I/O banked out of the CPU's view (`$01=$34`) the `$DC04`
+peek reads RAM, so a frozen value there is reported inconclusive (8/8
+live); a program that stopped Timer A (`$DC0E` bit 0 clear) still reads
+as a stopped emulator, and the label says to check `$DC0E`. The
+stopped-emulator verdict rests on the fake plus that measurement; this
+bug has not yet been caught live with Timer A sampled.
 Deliberately **not** auto-restarted: a harness
 that silently rebuilds a stalled emulator converts a reproducible
 upstream bug into an invisible one.

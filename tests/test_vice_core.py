@@ -174,16 +174,22 @@ def _machine_progress(
     MASKED_SPIN for both SEI loops and JAMMED for the KIL, 8/8 per arm,
     warp on and off.
 
-    Limits: a program that stops Timer A, or banks I/O out of the CPU's
-    view (the peek goes through the CPU bank), reads as EMULATOR_STOPPED
-    while running.  EMULATOR_STOPPED itself is the fake's behaviour plus
-    the measured fact that Timer A moves whenever VICE emulates; the live
-    bug-6 stall has not been sampled with Timer A.
+    Each sample also reads the processor port (``$00``/``$01``).  The
+    Timer A peek goes through the CPU's memory map, so with I/O banked
+    out (``$01=$34``, ``$30``, or char ROM at ``$33``) it reads RAM that
+    holds still on a running machine; a frozen timer seen through such a
+    map proves nothing and the verdict is ``None``.  A program that
+    stopped Timer A (CRA ``$DC0E`` bit 0 clear) cannot be told from bug 6
+    this way -- the report's EMULATOR_STOPPED label says to check it.
+    EMULATOR_STOPPED itself is the fake's behaviour plus the measured
+    fact that Timer A moves whenever VICE emulates; the live bug-6 stall
+    has not been sampled with Timer A.
     """
     seen: list[str] = []
     start_gen = getattr(transport, "_resume_generation", 0)
     prev: tuple[int, bytes] | None = None
     timers: set[bytes] = set()
+    io_hidden = False
     last_pc = -1
     compared = 0
     for _ in range(samples):
@@ -191,13 +197,18 @@ def _machine_progress(
             r = transport.read_registers()
             jiffy = bytes(transport.read_memory(0x00A0, 3))
             timer_a = bytes(transport.read_memory(0xDC04, 2))
+            ddr, port = transport.read_memory(0x0000, 2)
         except Exception:
             break
+        # Input bits read 1 (pulled up); I/O is visible when LORAM|HIRAM
+        # is set and CHAREN is 1.
+        lines = (port | ~ddr) & 0x07
+        io_hidden = io_hidden or not (lines & 0x03 and lines & 0x04)
         last_pc = r.get("PC", -1)
         cur = (last_pc, jiffy)
         seen.append(
             f"PC={last_pc:#06x} jiffy={int.from_bytes(jiffy, 'big')} "
-            f"TA={int.from_bytes(timer_a, 'little')} "
+            f"TA={int.from_bytes(timer_a, 'little')} $01={port:#04x} "
             f"LIN={r.get('LIN', -1)} CYC={r.get('CYC', -1)}"
         )
         timers.add(timer_a)
@@ -214,6 +225,9 @@ def _machine_progress(
     if compared == 0:
         return None, seen
     if len(timers) == 1:
+        if io_hidden:
+            seen.append("I/O banked out of the CPU view: $DC04 read RAM")
+            return None, seen
         return MachineState.EMULATOR_STOPPED, seen
     jam_events = [
         gen for gen, resp in getattr(transport, "_event_queue", ())
@@ -241,7 +255,7 @@ _PROGRESS_VERDICTS: dict[MachineState | None, str] = {
     MachineState.EMULATOR_STOPPED: (
         "<- EMULATOR STOPPED: PC, jiffy clock and CIA1 Timer A all frozen "
         "across acknowledged resumes -- VICE is not emulating (upstream "
-        "bug 6)."
+        "bug 6), unless the program stopped CIA1 Timer A -- check $DC0E."
     ),
     MachineState.JAMMED: (
         "<- JAMMED: the machine is clocked (Timer A moves) but the 6510 "
