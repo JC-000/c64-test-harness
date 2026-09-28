@@ -268,19 +268,16 @@ class TempGCResult:
     #: Disjoint from ``kept``, which is the keep-count's own survivors.
     mounted_excluded: list[str] = field(default_factory=list)
     #: Why the mounted-image listing could not be read, if it could not.
-    #: **Not** a failed hygiene pass: the sweep still ran (see
-    #: :func:`gc_temp_folder`), so this never clears :attr:`ok`.
+    #: When it is set, the sweep deleted nothing and :attr:`error` is set
+    #: too, so the pass has failed (#513 review, finding 4).
     mounted_probe_error: str | None = None
 
     @property
     def ok(self) -> bool:
-        """True when the pass ran without an FTP/network failure (skips still count as ok).
+        """True when the pass ran without a failure (skips still count as ok).
 
-        A :attr:`mounted_probe_error` does not clear this. The drives
-        listing only narrows what the sweep may delete; failing to read
-        it leaves the sweep exactly as protective of the *device* as it
-        was before #418, and treating that as a failed pass would block
-        the hygiene the wedge clause depends on.
+        An unreadable drives listing is a failure: the sweep then deletes
+        nothing and sets :attr:`error` (#513 review, finding 4).
         """
         return self.error is None
 
@@ -587,7 +584,11 @@ class TempLedger:
             if not (self.pending > 0 and self.armed_pending and self.host):
                 return False
             try:
-                result = gc_temp_folder(self.host, mounted_probe=self.mounted_probe())
+                result = gc_temp_folder(
+                    self.host,
+                    keep=sweep_keep(self),
+                    mounted_probe=self.mounted_probe(),
+                )
             except Exception as exc:  # noqa: BLE001 - a release must never fail
                 result = TempGCResult(host=self.host, error=f"{type(exc).__name__}: {exc}")
             if result.ok:
@@ -647,6 +648,39 @@ def _reset_temp_ledgers() -> None:
     """
     with _TEMP_LEDGERS_GUARD:
         _TEMP_LEDGERS.clear()
+
+
+def lock_held_for(host: str) -> bool:
+    """Whether this process holds *host*'s ``DeviceLock`` (any lock dir).
+
+    The ``/Temp`` handover gate (#511) sweeps, and may write config, only
+    for a process that is in the device's queue. That means one holding the
+    lock: supervisor ruling on the #513 review, following the owner's "when
+    the device queue advances to the next user" and CLAUDE.md rule 4.
+    ``False`` without ``device_lock`` (no fcntl), so the gate refuses.
+    """
+    try:
+        from .device_lock import held_by_this_process_in_any_dir
+    except ImportError:  # pragma: no cover - only without fcntl
+        return False
+    return held_by_this_process_in_any_dir(host)
+
+
+def sweep_keep(ledger: "TempLedger") -> int:
+    """The keep-count for a sweep of *ledger*'s device (#513 review, finding 1).
+
+    At least ``DEFAULT_KEEP`` (or ``$U64_TEMP_GC_KEEP``) plus one per
+    attachment this process still has **in flight**. Those are the youngest
+    names on the device (the firmware's counter only goes up), and one still
+    streaming is an open file. At 1.1.0, FatFS is built with
+    ``FF_FS_LOCK 0`` (``software/chan_fat/full/ffconf.h:265``), and
+    ``FileManager::delete_file_impl`` (``filemanager.cc:508``) does not check
+    for open files, so an FTP ``DELE`` of an open file is not refused (read
+    from source). Call with ``ledger.lock`` held so the in-flight count cannot
+    move under the sweep.
+    """
+    base = _int_env(KEEP_ENV, DEFAULT_KEEP)
+    return max(base, DEFAULT_KEEP + max(0, ledger.in_flight))
 
 
 def _split_by_keep(names: list[str], keep: int) -> tuple[list[str], list[str]]:
@@ -778,13 +812,14 @@ def gc_temp_folder(
         login, or delete failure is captured in ``.error`` and logged at
         INFO/WARNING; the caller's run must never fail on hygiene.
 
-    **A probe failure is not a failed hygiene pass.** If the listing
-    cannot be read, the sweep proceeds on the keep-count alone and
-    records why in ``.mounted_probe_error``, leaving ``.ok`` true. The
-    alternative -- skipping the sweep -- would trade a recoverable data
-    hazard (a deleted image that can be re-uploaded) for the
-    unrecoverable one this module exists to prevent: a ``/Temp`` that
-    fills and crashes the firmware, which no remote instrument can undo.
+    **A probe failure is a failed pass, and deletes nothing** (#513 review,
+    finding 4). Without the listing, the keep-count alone could delete a
+    mounted image that is not the youngest. Its drive holds it open, and at
+    1.1.0 FatFS does not refuse deleting an open file (``FF_FS_LOCK 0``).
+    So the result carries ``.mounted_probe_error`` and ``.error``, and the
+    caller's refusal applies. The pass was previously treated as ok; that
+    traded a delete of an open file for the chance to keep sweeping, and
+    the harness now prefers to stop uploading instead.
     """
     resolved_port = port if port is not None else DEFAULT_FTP_PORT
     resolved_user = username if username is not None else os.environ.get(FTP_USER_ENV, DEFAULT_FTP_USER)
@@ -826,9 +861,19 @@ def gc_temp_folder(
                     probe_error = f"{type(exc).__name__}: {exc}"
                     _log.warning(
                         "gc_temp_folder: could not read the mounted-image listing on %s "
-                        "(%s); sweeping on the keep-count alone. A managed name another "
-                        "client mounted from a raw upload could be deleted (#418).",
+                        "(%s); deleting nothing. A mounted image that is not the "
+                        "youngest is held open by its drive and could otherwise be "
+                        "deleted (#418, #513 review).",
                         host, probe_error,
+                    )
+                    return TempGCResult(
+                        host=host,
+                        kept=list(managed_names),
+                        mounted_probe_error=probe_error,
+                        error=(
+                            f"mounted-image listing unreadable ({probe_error}); "
+                            "deleted nothing"
+                        ),
                     )
                 else:
                     survivors = []

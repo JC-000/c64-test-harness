@@ -332,7 +332,10 @@ lookup). `acquire()` itself makes no network call. The `/Temp` ledger
 compares that epoch with the epoch of its last successful sweep. So an
 armed client on a leak-prone device sweeps `/Temp` before this hold's
 first attachment-creating request, and if that sweep fails the request is
-refused before anything is sent. The sweep waits for the first upload,
+refused before anything is sent. A process that does **not** hold the
+lock (in any lock directory) gets no sweep and no FTP-enable, and its
+attachment-creating requests to a leak-prone device are refused. Only lock
+holders are in the queue (#513 review). The sweep waits for the first upload,
 not for `acquire()`, because at acquire time there is often no client and
 so no grade to decide with. A post-safe device (the U64E) therefore sees
 no new traffic at all. Every locked path takes the flock through

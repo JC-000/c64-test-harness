@@ -56,7 +56,8 @@ When you write a test that can point at the C64U:
   holding the device's lock (#264). A handover sweep that finds FTP off
   makes one attempt per process at enabling FTP File Service, then
   retries (owner decision 2026-09-28). **It can also refuse.** Once a sweep
-  it needed has failed (FTP down), every later attachment-creating
+  it needed has failed (FTP down), or when this process does not hold the
+  device's `DeviceLock` at all (#513), every later attachment-creating
   request raises `Ultimate64TempHygieneError`, before sending anything, until a
   sweep succeeds (import it from
   `backends.ultimate64_client`; it is not a package-root export) rather

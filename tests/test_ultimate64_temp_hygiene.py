@@ -1357,6 +1357,8 @@ def _handover_sweep_already_done(monkeypatch):
     acquire) is pinned in ``tests/test_temp_handover_sweep.py``, and here it
     would add one sweep before every test's first upload."""
     monkeypatch.setattr(gc_mod.TempLedger, "handover_sweep_due", lambda self: False)
+    # Likewise the lock requirement (#513 review): pinned in that module.
+    monkeypatch.setattr(gc_mod, "lock_held_for", lambda host: True)
 
 
 @pytest.fixture(autouse=True)

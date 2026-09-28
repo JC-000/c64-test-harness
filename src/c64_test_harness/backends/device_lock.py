@@ -2202,6 +2202,23 @@ def acquire_epoch(device_host: str) -> int:
         return _ACQUIRE_EPOCHS.get(key, 0)
 
 
+def held_by_this_process_in_any_dir(device_host: str) -> bool:
+    """Whether this process holds *device_host*'s lock in **any** lock dir.
+
+    :meth:`DeviceLock.held_by_this_process` asks about one directory (the
+    default unless told otherwise). The ``/Temp`` handover gate (#511) asks
+    this instead: a process that took the device's flock anywhere is in
+    that directory's queue, which is what the gate needs to know. A dict
+    scan of the in-process registry: no filesystem, no network.
+    """
+    name = f"device-{_device_lock_key(device_host)}.lock"
+    with _PROCESS_HELD_GUARD:
+        return any(
+            count > 0 and Path(path).name == name
+            for path, count in _PROCESS_HELD.items()
+        )
+
+
 def register_release_callback(device_host: str, obj: object, method: str) -> None:
     """Call ``obj.<method>(reason=...)`` when this device's lock is released.
 

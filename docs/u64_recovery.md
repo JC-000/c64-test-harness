@@ -110,14 +110,16 @@ reproduced. Note that the live verification recorded in the next paragraph
 is dated 2026-08-21 and predates #418: it covers the keep-count sweep, not
 the exclusion.
 
-**A failed drives listing is not a failed hygiene pass.** If the listing
-cannot be read the sweep proceeds on the keep-count alone, records why in
-`TempGCResult.mounted_probe_error`, and leaves `.error`/`.ok` untouched —
-so it does *not* trip the refusal described below. That asymmetry is
-deliberate: skipping the sweep would trade a recoverable data hazard (a
-deleted image can be re-uploaded) for the unrecoverable one this whole
-mechanism exists to prevent. What the 1541 emulation does when a mounted
-read-write image's backing file disappears is not established.
+**A failed drives listing is a failed hygiene pass, and deletes nothing**
+(#513 review). If the listing cannot be read, the sweep deletes nothing. It
+records why in `TempGCResult.mounted_probe_error` and sets `.error`, so the
+refusal described below applies. A mounted image that is not the youngest
+is held open by its drive (`C1541::mount_file`). At 1.1.0, FatFS is built
+with `FF_FS_LOCK 0` (`software/chan_fat/full/ffconf.h:265`) and `FileManager::delete_file_impl` (`filemanager.cc:508`) does not check
+for open files, so the firmware would not refuse the delete. Before #513 the
+sweep carried on by keep-count here. The harness now stops uploading
+instead. What the 1541 emulation does when a mounted read-write image's
+backing file disappears is not established.
 
 Verified live on both device generations: originally on the U64E, and
 on the C64U (10.53.21.158, firmware 1.1.0) on 2026-08-21 —
@@ -262,8 +264,19 @@ lifetime after a single WARNING.
 2026-09-28: *"Can we have the harness check the directory and clear it when
 the device queue advances to the next user? I'm not sure we really need to
 allow 6 deep either, I think only the most recent file gets a lock."* Two
-rules, both on an armed (leak-prone) client, both before anything is sent:
+rules, both on an armed client whose grade is leak-prone, both before
+anything is sent. Neither applies to a post-safe grade, even when
+`U64_AUTO_TEMP_GC=1` forces the pass on.
 
+- **Lock first.** Only lock holders are in the device queue. A process that
+  does not hold the device's `DeviceLock` (in any lock directory) gets no
+  sweep and no FTP-enable. Its attachment-creating requests are refused
+  with `Ultimate64TempHygieneError`, and the message says to hold the lock.
+  The free `liveness_probe` is refused the same way. This was a supervisor
+  ruling on the #513 review, following CLAUDE.md rule 4 and #264. Every
+  in-repo uploader already holds the lock: scripts via
+  `hold_device_lock`, pytest via the conftest guard, and
+  `run_u64_parallel_locked.py`'s children through that guard.
 - **Handover.** `DeviceLock` counts each time this process takes a device's
   flock (`device_lock.acquire_epoch`; a nested join does not count). A
   device's `TempLedger` records the epoch of its last successful sweep. A
@@ -286,8 +299,12 @@ rules, both on an armed (leak-prone) client, both before anything is sent:
   attachment-creating request sweeps first. Only a successful pass resets
   the count.
 
-The sweep keeps the youngest managed file (`DEFAULT_KEEP` = **1**) and any
-image a drive has mounted (#418), and deletes the rest. Resident managed
+The sweep keeps the youngest managed file (`DEFAULT_KEEP` = **1**), plus
+one more for each upload this process still has in flight
+(`ultimate64_temp_gc.sweep_keep`, read under the ledger lock), plus any
+image a drive has mounted (#418). It deletes the rest. The in-flight part
+closes a hole the #513 review reproduced: with two uploads still streaming,
+keep 1 deleted the older one mid-write. Resident managed
 files peak at **2**: the kept youngest plus the one just sent. During a
 `liveness_probe` the peak is 3, because its two POSTs are reserved whole
 after a sweep.

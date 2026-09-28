@@ -873,7 +873,11 @@ So on a leak-prone device **`run_prg_via_sys(target, prg)` is the low-risk way t
    once one attachment is pending. `client.temp_gc_budget` is
    `DEFAULT_LEAK_BUDGET = 1` in `backends/ultimate64_temp_gc.py`; override it with
    `temp_gc_budget=` or `$U64_TEMP_GC_BUDGET`. The sweep keeps the youngest file
-   (`DEFAULT_KEEP = 1`) and any mounted image. The client drains again on
+   (`DEFAULT_KEEP = 1`), one more per upload still in flight in this process, and
+   any mounted image. It deletes nothing, and fails, if `GET /v1/drives` cannot be
+   read. **Only a process holding the device's `DeviceLock` sweeps.** An unlocked
+   process's attachment-creating requests to a leak-prone device are refused
+   (#513). The client drains again on
    `close()` and on `DeviceLock` release. **The guard also refuses.** Once hygiene
    is armed and a sweep it needed has failed (FTP down, say), this and every later
    attachment-creating request

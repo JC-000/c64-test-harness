@@ -17,16 +17,25 @@ records every request:
   open once its request has returned;
 * once one attachment is pending, the next attachment-creating request
   sweeps first (budget 1), so resident managed files stay at two;
-* a failed handover sweep writes no config (the FTP-enable policy of #263 is
-  unchanged: only a client with its own uncollected leak may make it);
+* a handover sweep that FTP refuses makes the process's one FTP-enable
+  attempt and retries (owner decision 2026-09-28), and is refused if FTP
+  still will not come up;
+* the sweep and the enable happen only for a process that holds the
+  device's ``DeviceLock``: an unlocked process is refused without touching
+  FTP or config (supervisor ruling on the #513 review);
+* a sweep never deletes a file whose upload is still in flight in this
+  process, and deletes nothing when it cannot read the mounted-image list;
 * ``U64_TEMP_GC_REQUIRED=0`` and ``temp_hygiene=False`` still disarm;
-* a post-safe device (the U64E) sees no new request at all.
+* a post-safe device (the U64E) sees no new request at all, even under
+  ``U64_AUTO_TEMP_GC=1``.
 
 No device: HTTP and FTP are faked.
 """
 from __future__ import annotations
 
 import json
+import threading
+import time
 import urllib.parse
 import uuid
 from unittest.mock import MagicMock, patch
@@ -78,6 +87,14 @@ class FakeDevice:
         #: ``?value=Enabled`` brings FTP up. ``False`` models a device whose
         #: FTP will not come up however it is configured.
         self.ftp_enable_works = False
+        #: ``GET /v1/drives`` answers HTTP 500 when set.
+        self.drives_fail = False
+        #: POSTs to these paths hold their attachment "in flight" until
+        #: :attr:`release_in_flight` is set, like a body still streaming.
+        self.hold_paths: set[str] = set()
+        self.release_in_flight = threading.Event()
+        self.in_flight: list[str] = []
+        self.deleted_in_flight: list[str] = []
         self.temp: list[str] = []
         self.counter = 0
         self.mounted: dict[str, str] = {}
@@ -116,6 +133,8 @@ class FakeDevice:
         if path == "/v1/info":
             return _Resp(json.dumps(self.info).encode())
         if path == "/v1/drives":
+            if self.drives_fail:
+                return _Resp(b"", status=500)
             drives = [
                 {letter: {"image_file": name, "image_path": "/Temp/"}}
                 for letter, name in sorted(self.mounted.items())
@@ -130,6 +149,10 @@ class FakeDevice:
             name = self.attach()
             if path.startswith("/v1/drives/") and path.endswith(":mount"):
                 self.mounted[path.split("/")[3].split(":")[0]] = name
+            if path in self.hold_paths:
+                self.in_flight.append(name)
+                assert self.release_in_flight.wait(5.0), "never released"
+                self.in_flight.remove(name)
         return _Resp(b"{}")
 
     # -- FTP -------------------------------------------------------------
@@ -160,6 +183,8 @@ class FakeDevice:
 
             def delete(self, name):
                 device.log.append(("FTP", "delete", name))
+                if name in device.in_flight:
+                    device.deleted_in_flight.append(name)
                 device.temp.remove(name)
 
         return _FTP()
@@ -315,12 +340,123 @@ def test_a_fresh_process_is_refused_before_spending_anything(device, host, tmp_p
     assert len(device.ftp_enables()) == 3
 
 
-def test_an_unlocked_fresh_process_is_refused_too(device, host):
-    """No lock at all: a ledger that has never swept counts as a handover."""
+def test_an_unlocked_process_is_refused_without_touching_ftp_or_config(device, host):
+    """Only lock holders are in the queue: an unlocked process gets neither
+    the sweep nor the FTP-enable, and its upload is refused."""
     device.ftp_up = False
+    device.ftp_enable_works = True
+    device.temp[:] = ["temp0000", "temp0001"]
     c = _client(host)
-    with pytest.raises(Ultimate64TempHygieneError):
+    with pytest.raises(Ultimate64TempHygieneError, match="DeviceLock"):
         c.run_prg(PRG)
+    assert device.posts() == []
+    assert device.ftp_sessions() == 0
+    assert device.config_writes() == []
+    assert device.temp == ["temp0000", "temp0001"]
+
+
+def test_an_unlocked_process_is_refused_even_with_ftp_up(device, host):
+    device.temp[:] = ["temp0000", "temp0001"]
+    with pytest.raises(Ultimate64TempHygieneError, match="DeviceLock"):
+        _client(host).run_prg(PRG)
+    assert device.posts() == []
+    assert device.ftp_sessions() == 0
+
+
+def test_holding_another_devices_lock_does_not_count(device, host, tmp_path):
+    """The lock that counts is this device's, in any lock directory."""
+    other = _lock(host + "-other", tmp_path)
+    try:
+        with pytest.raises(Ultimate64TempHygieneError, match="DeviceLock"):
+            _client(host).run_prg(PRG)
+        assert device.ftp_sessions() == 0
+        mine = _lock(host, tmp_path)
+        try:
+            _client(host).run_prg(PRG)
+        finally:
+            mine.release()
+    finally:
+        other.release()
+    assert device.posts() == ["/v1/runners:run_prg"]
+
+
+def test_the_free_probe_is_refused_unlocked(device, host):
+    from c64_test_harness.backends import ultimate64_probe as probe_mod
+
+    with pytest.raises(Ultimate64TempHygieneError, match="DeviceLock"):
+        probe_mod._reserve_probe_attachments(
+            host, 2, armed=True, operation="liveness_probe"
+        )
+    assert device.ftp_sessions() == 0
+    assert gc_mod.temp_ledger_for(host).pending == 0
+
+
+# ----------------------------------------------------- in-flight uploads
+def test_a_sweep_never_deletes_an_upload_still_in_flight(device, host, tmp_path):
+    """#513 review, finding 1: two of this process's uploads are still
+    streaming when a third sweeps. keep=1 deleted the older one mid-write;
+    1.1.0 FatFS has no open-file lock (FF_FS_LOCK 0), so that is a delete of
+    an open file on the RAM disk."""
+    lock = _lock(host, tmp_path)
+    try:
+        c = _client(host)
+        c.run_prg(PRG)                       # handover sweep, then temp0000
+        device.hold_paths.add("/v1/machine:writemem")
+        workers = [
+            threading.Thread(target=c.write_mem, args=(0xC000, b"x" * 200))
+            for _ in range(2)
+        ]
+        for w in workers:
+            w.start()
+        deadline = time.monotonic() + 5.0
+        while len(device.in_flight) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(device.in_flight) == 2
+        c.run_prg(PRG)                       # sweeps: pending > 0
+        device.release_in_flight.set()
+        for w in workers:
+            w.join(5.0)
+    finally:
+        device.release_in_flight.set()
+        lock.release()
+    assert device.deleted_in_flight == []
+
+
+def test_the_free_probe_sweep_keeps_in_flight_uploads(device, host, tmp_path):
+    from c64_test_harness.backends import ultimate64_probe as probe_mod
+
+    device.temp[:] = ["temp0000", "temp0001", "temp0002"]
+    device.counter = 3
+    ledger = gc_mod.temp_ledger_for(host)
+    ledger.begin_reservation(2, armed=True)  # two uploads still streaming
+    lock = _lock(host, tmp_path)
+    try:
+        probe_mod._reserve_probe_attachments(
+            host, 2, armed=True, operation="liveness_probe"
+        )
+    finally:
+        lock.release()
+    deleted = [arg for kind, cmd, arg in device.log if cmd == "delete"]
+    assert "temp0001" not in deleted and "temp0002" not in deleted
+
+
+# ------------------------------------------------- unreadable drives list
+def test_an_unreadable_drives_list_deletes_nothing_and_refuses(device, host, tmp_path):
+    """#513 review, finding 4: without the mounted list a non-youngest image
+    could be deleted while open. Fail closed instead."""
+    device.temp[:] = ["temp0000", "temp0001", "temp0002"]
+    device.counter = 3
+    device.mounted["a"] = "temp0000"
+    device.drives_fail = True
+    lock = _lock(host, tmp_path)
+    try:
+        c = _client(host)
+        with pytest.raises(Ultimate64TempHygieneError):
+            c.run_prg(PRG)
+        log = list(device.log)
+    finally:
+        lock.release()
+    assert [arg for kind, cmd, arg in log if cmd == "delete"] == []
     assert device.posts() == []
 
 
@@ -462,15 +598,19 @@ def test_liveness_probe_fits_a_budget_of_one(device, host, tmp_path):
         lock.release()
 
 
-def test_the_free_liveness_probe_is_gated_at_handover(device, host):
+def test_the_free_liveness_probe_is_gated_at_handover(device, host, tmp_path):
     """The root-exported spelling reaches the same ledger and the same gate."""
     from c64_test_harness.backends import ultimate64_probe as probe_mod
 
     device.ftp_up = False
-    with pytest.raises(Ultimate64TempHygieneError):
-        probe_mod._reserve_probe_attachments(
-            host, 2, armed=True, operation="liveness_probe"
-        )
+    lock = _lock(host, tmp_path)
+    try:
+        with pytest.raises(Ultimate64TempHygieneError):
+            probe_mod._reserve_probe_attachments(
+                host, 2, armed=True, operation="liveness_probe"
+            )
+    finally:
+        lock.release()
     assert gc_mod.temp_ledger_for(host).pending == 0
     assert device.ftp_sessions() == 1
 
@@ -500,6 +640,26 @@ def test_temp_hygiene_false_touches_no_ftp(device, host, tmp_path):
     assert device.posts() == ["/v1/runners:run_prg"] * 2
     assert device.ftp_sessions() == 0
     assert device.config_writes() == []
+
+
+def test_a_forced_arm_on_a_post_safe_device_gets_no_handover_enable(
+    device, host, tmp_path, monkeypatch
+):
+    """#513 review, finding 2: ``U64_AUTO_TEMP_GC=1`` arms any device, but the
+    handover sweep and its FTP-enable are for leak-prone grades only."""
+    monkeypatch.setenv(gc_mod.AUTO_GC_ENV, "1")
+    device.info = dict(POST_SAFE)
+    device.ftp_up = False
+    device.ftp_enable_works = True
+    lock = _lock(host, tmp_path)
+    try:
+        c = _client(host)
+        assert c.temp_hygiene_armed
+        c.run_prg(PRG)
+    finally:
+        lock.release()
+    assert device.config_writes() == []
+    assert device.posts() == ["/v1/runners:run_prg"]
 
 
 def test_a_post_safe_device_with_ftp_off_gets_no_enable(device, host, tmp_path):

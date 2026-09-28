@@ -410,7 +410,10 @@ def test_a_second_leaking_client_does_not_repeat_the_ftp_enable(host):
     assert set_item.call_count == 1
 
 
-def test_a_client_that_leaked_nothing_writes_no_config_even_with_device_pending(host, tmp_path, caplog):
+def test_a_release_drain_by_a_client_that_leaked_nothing_writes_no_config_even_with_device_pending(host, tmp_path, caplog):
+    """Drain path only. The handover sweep before an upload may make the one
+    FTP-enable attempt (owner decision 2026-09-28, #511); that is pinned in
+    ``test_temp_handover_sweep.py`` and switched off in this module."""
     leaker = _client(host)
     with _FTP(default=REFUSED), _no_config_writes() as set_item:
         leaker.run_prg(PRG)
@@ -1198,6 +1201,8 @@ def _handover_sweep_already_done(monkeypatch):
     acquire) is pinned in ``tests/test_temp_handover_sweep.py``, and here it
     would add one sweep before every test's first upload."""
     monkeypatch.setattr(gc_mod.TempLedger, "handover_sweep_due", lambda self: False)
+    # Likewise the lock requirement (#513 review): pinned in that module.
+    monkeypatch.setattr(gc_mod, "lock_held_for", lambda host: True)
 
 
 @pytest.fixture(autouse=True)

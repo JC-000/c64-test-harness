@@ -494,6 +494,9 @@ def test_run_prg_gcs_temp_folder_when_auto_enabled(monkeypatch: pytest.MonkeyPat
     is spent. With a budget of 1, both uploads here follow a pass.
     """
     monkeypatch.setenv("U64_AUTO_TEMP_GC", "1")
+    from c64_test_harness.backends import ultimate64_temp_gc as gc_mod
+
+    monkeypatch.setattr(gc_mod, "lock_held_for", lambda host: True)  # #513
     c = Ultimate64Client("h", temp_gc_budget=1)
     mock, captured = _capture(b"")
     posts_before_gc: list[int] = []

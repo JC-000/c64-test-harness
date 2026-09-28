@@ -1109,16 +1109,26 @@ class Ultimate64Client:
         if self._temp_hygiene_blocked is not None:
             self._refuse_or_warn(operation)
             return
-        if self._temp_ledger.handover_sweep_due():
-            # The device queue has advanced to this process (or this process
-            # has never swept it): what other lanes left in /Temp is unknown,
-            # so sweep before spending anything, and fail closed (#511).
-            self._run_temp_hygiene(
-                f"device handover, before {operation}", handover=True
-            )
-            if self._temp_hygiene_blocked is not None:
-                self._refuse_or_warn(operation)
+        if self._leak_prone_grade():
+            from . import ultimate64_temp_gc as _gc
+
+            if not _gc.lock_held_for(self._device_key):
+                # Only lock holders are in the device queue, so an unlocked
+                # process neither sweeps other lanes' /Temp nor writes config:
+                # it is refused (#513 review; CLAUDE.md rule 4).
+                self._refuse_unlocked(operation)
                 return
+            if self._temp_ledger.handover_sweep_due():
+                # The device queue has advanced to this process (or this
+                # process has never swept it): what other lanes left in /Temp
+                # is unknown, so sweep before spending anything, and fail
+                # closed (#511).
+                self._run_temp_hygiene(
+                    f"device handover, before {operation}", handover=True
+                )
+                if self._temp_hygiene_blocked is not None:
+                    self._refuse_or_warn(operation)
+                    return
         # The device's count, not this client's (#295). Callers hold the
         # ledger lock: go through _reserve_temp_attachments.
         pending = self._temp_ledger.pending
@@ -1128,6 +1138,42 @@ class Ultimate64Client:
             )
             if self._temp_hygiene_blocked is not None:
                 self._refuse_or_warn(operation)
+
+    def _leak_prone_grade(self) -> bool:
+        """The cached grade does not say post-safe (no I/O).
+
+        ``None`` (never probed, e.g. forced armed with ``temp_hygiene=True``)
+        counts as leak-prone, which is the conservative reading. Gates the
+        handover sweep, its FTP-enable and the lock requirement, so that
+        ``U64_AUTO_TEMP_GC=1`` on a post-safe device changes none of them
+        (#513 review, finding 2).
+        """
+        caps = self.cached_capabilities
+        return caps is None or caps.runner_wedge_possible is not False
+
+    def _refuse_unlocked(self, operation: str) -> None:
+        from .ultimate64_temp_gc import hygiene_required as _hygiene_required
+
+        message = (
+            f"refusing {operation} on {self.host}: this device's firmware leaks "
+            "a /Temp attachment for every request that carries a body, and "
+            "this process does not hold its DeviceLock. The harness sweeps "
+            "/Temp (and may enable FTP File Service) only for the process "
+            "whose turn it is in the device queue. Hold the DeviceLock -- "
+            "create_manager(backend=\"u64\"), DeviceLock(host), or "
+            "scripts/_u64_host.py hold_device_lock(host) -- for the whole run. "
+            "To proceed anyway set U64_TEMP_GC_REQUIRED=0, or pass "
+            "temp_hygiene=False. See docs/device_locking.md."
+        )
+        if _hygiene_required():
+            raise Ultimate64TempHygieneError(message)
+        _log.warning("U64_TEMP_GC_REQUIRED=0: proceeding anyway. %s", message)
+
+    def _sweep_keep(self) -> int:
+        from .ultimate64_temp_gc import sweep_keep as _sweep_keep
+
+        with self._temp_ledger.lock:
+            return _sweep_keep(self._temp_ledger)
 
     def _refuse_or_warn(self, operation: str) -> None:
         from .ultimate64_temp_gc import hygiene_required as _hygiene_required
@@ -1186,7 +1232,7 @@ class Ultimate64Client:
         self._in_temp_hygiene = True
         try:
             _log.debug("U64 /Temp hygiene on %s: %s", self.host, reason)
-            result = self.gc_temp_folder()
+            result = self.gc_temp_folder(keep=self._sweep_keep())
             if getattr(result, "ok", False):
                 # Only a successful sweep zeroes the device's count (#295).
                 self._temp_ledger.collected()
@@ -1204,14 +1250,19 @@ class Ultimate64Client:
             # Owner decision 2026-09-28 (#511): the handover sweep may make
             # the same one attempt, so a C64U with FTP File Service off
             # (the 1.1.0 default) is enabled and swept rather than refused.
-            # Still once per device per process, never on a disarmed or
-            # post-safe client (neither reaches here), and not under
+            # Still once per device per process, never on a grade that is
+            # post-safe (not even when U64_AUTO_TEMP_GC=1 forces the pass
+            # on: #513 review, finding 2), and at handover not under
             # U64_TEMP_GC_REQUIRED=0, which opts out of enforcement.
             from .ultimate64_temp_gc import hygiene_required as _hygiene_required
 
-            if not self._ftp_enable_attempted and (
-                self._own_pending_temp_attachments() > 0
-                or (handover and _hygiene_required())
+            if (
+                not self._ftp_enable_attempted
+                and self._leak_prone_grade()
+                and (
+                    self._own_pending_temp_attachments() > 0
+                    or (handover and _hygiene_required())
+                )
             ):
                 self._ftp_enable_attempted = True
                 # WARNING, not INFO: this mutates the device's config and
@@ -1237,7 +1288,7 @@ class Ultimate64Client:
                         self.host, type(exc).__name__, exc,
                     )
                 else:
-                    result = self.gc_temp_folder()
+                    result = self.gc_temp_folder(keep=self._sweep_keep())
                     if getattr(result, "ok", False):
                         self._temp_ledger.collected()
                         return True
@@ -1359,7 +1410,7 @@ class Ultimate64Client:
         self._in_temp_hygiene = True
         try:
             _log.debug("U64 /Temp inherited sweep on %s: %s", self.host, reason)
-            result = self.gc_temp_folder()
+            result = self.gc_temp_folder(keep=self._sweep_keep())
         finally:
             self._in_temp_hygiene = False
         if getattr(result, "ok", False):

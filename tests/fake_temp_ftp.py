@@ -41,10 +41,14 @@ class EmptyTempFTP:
 
 
 def install(monkeypatch) -> type[EmptyTempFTP]:
-    """Route every sweep in this test to an empty ``/Temp`` and forget ledgers."""
+    """Route every sweep in this test to an empty ``/Temp``, forget ledgers,
+    and treat this process as holding the device's lock (the #513 gate
+    refuses unlocked uploads to a leak-prone grade; these modules pin other
+    behaviour, and the gate is pinned in ``test_temp_handover_sweep.py``)."""
     from c64_test_harness.backends import ultimate64_temp_gc as gc_mod
 
     EmptyTempFTP.sessions = []
     monkeypatch.setattr(gc_mod, "FTP", EmptyTempFTP)
+    monkeypatch.setattr(gc_mod, "lock_held_for", lambda host: True)
     gc_mod._reset_temp_ledgers()
     return EmptyTempFTP

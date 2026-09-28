@@ -371,22 +371,22 @@ def test_unmanaged_mounted_names_leave_the_sweep_untouched():
     assert result.mounted_excluded == []
 
 
-def test_probe_failure_still_sweeps_and_is_not_a_failed_pass():
-    """An unreadable drives listing must not stop hygiene, and must say so.
-
-    Skipping the sweep would trade a recoverable data hazard for the
-    unrecoverable one this module prevents, and setting .error would
-    block later attachment-creating requests to a healthy device.
-    """
+def test_probe_failure_deletes_nothing_and_fails_the_pass():
+    """An unreadable drives listing deletes nothing and is a failed pass
+    (#513 review, finding 4). Without the listing, a mounted image that is
+    not the youngest could be deleted while the drive holds it open, so the
+    sweep fails closed and the caller's refusal applies."""
     _FakeFTP.files = ["temp0001", "temp0002", "temp0003"]
 
     def boom():
         raise OSError("connection reset")
 
-    result = gc_temp_folder("dev", keep=2, mounted_probe=boom)
-    assert result.deleted == ["temp0001"]
-    assert result.ok and result.error is None
+    result = gc_temp_folder("dev", mounted_probe=boom)
+    assert result.deleted == []
+    assert _FakeFTP.deleted == []
+    assert not result.ok
     assert "connection reset" in (result.mounted_probe_error or "")
+    assert "connection reset" in (result.error or "")
 
 
 def test_probe_is_not_consulted_when_nothing_would_be_deleted():
