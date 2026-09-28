@@ -10,10 +10,12 @@ The primary bench is **macOS** (27.0, Apple Silicon) with Homebrew's VICE
 `HAVE_TUNTAP no` to `x64sc -features`: the bridge is a `feth` peer pair,
 VICE attaches with its `pcap` driver over BPF, and an ethernet VICE runs as
 root. Linux (TAP devices + a Linux bridge, VICE's `tuntap` driver) is also
-supported, but that path is **last verified 2026-04-11** — the last
-substantive change to `scripts/setup-bridge-tap.sh`,
-`scripts/teardown-bridge-tap.sh` and `scripts/cleanup-bridge-networking.sh`
-— and has not been exercised on the current bench; see § "Linux (TAP +
+supported, but that path was **last run on Linux 2026-04-10** (the
+two-VICE demo, 10/10 in normal and warp mode). The Linux scripts changed
+after that run (`teardown-bridge-tap.sh` and `cleanup-bridge-networking.sh`
+on 2026-04-11, `scripts/bridge_ping_demo.py` on 2026-08-15 and 2026-09-23)
+and no Linux run is recorded since, so treat it as unverified at the current
+head; see § "Linux (TAP +
 Linux bridge)".
 
 The cross-platform dispatch module is `tests/bridge_platform.py`
@@ -22,7 +24,7 @@ The cross-platform dispatch module is `tests/bridge_platform.py`
 
 ## Overview
 
-| | macOS | Linux (last verified 2026-04-11) |
+| | macOS | Linux (last run 2026-04-10; not run since) |
 |---|---|---|
 | L2 link between the two VICEs | `feth0` ⇄ `feth1` peer pair | `tap-c64-0` / `tap-c64-1` on bridge `br-c64` |
 | Host address `10.0.65.1/24` on | `bridge10` (no members) | `br-c64` |
@@ -47,7 +49,7 @@ can exchange ethernet frames, use this canonical lifecycle:
 
    ```bash
    sudo scripts/setup-bridge-feth-macos.sh     # macOS
-   sudo scripts/setup-bridge-tap.sh            # Linux (last verified 2026-04-11)
+   sudo scripts/setup-bridge-tap.sh            # Linux (last run 2026-04-10)
    ```
 
 2. **Acquire VICE instances** via the `bridge_vice_pair` pytest fixture
@@ -472,8 +474,9 @@ root-owned processes; `lsof` is the wrong tool for this at any privilege
 level. Regression test: `tests/test_bpf_attach_detection.py`, which
 launches a real elevated VICE and asserts the attach is seen.
 
-The same run showed that the vicerc alone configures ethernet
-completely. `ViceProcess` writes the real resource names
+The same run (macOS, elevated, `pcap` on `feth0`, 2026-08-30) showed that
+the vicerc alone configures ethernet completely; the equivalent Linux
+`tuntap` launch has no recorded measurement. `ViceProcess` writes the real resource names
 (`ETHERNET_INTERFACE`, `ETHERNET_DRIVER`) and still passes the
 `-ethernetioif` / `-ethernetiodriver` flags alongside; the earlier
 `EthernetIOIF` / `EthernetIODriver` keys are not VICE resources in any
@@ -482,9 +485,10 @@ Pinned by `tests/test_vice_ethernet_rc.py`.
 
 ## Linux (TAP + Linux bridge)
 
-**Last verified 2026-04-11** (the last substantive change to the three
-Linux scripts); the current bench is macOS and this path has not been
-re-run since.
+**Last run on Linux 2026-04-10** (the two-VICE demo, 10/10 normal and
+warp). `teardown-bridge-tap.sh` and `cleanup-bridge-networking.sh` changed on
+2026-04-11, after that run, and no Linux run is recorded since; the current
+bench is macOS, so treat this section as unverified at the current head.
 
 Prerequisites:
 
@@ -861,7 +865,7 @@ can observe their traffic on the host:
 
 ```bash
 sudo tcpdump -nne -i feth0     # macOS: capture on a feth peer, not bridge10 (it has no members)
-sudo tcpdump -nne -i br-c64    # Linux (last verified 2026-04-11)
+sudo tcpdump -nne -i br-c64    # Linux (last run 2026-04-10)
 ```
 
 This is useful for debugging your test cases and for verifying that
@@ -1269,7 +1273,7 @@ Ultimate 64 TOD primitive test at 1 / 8 / 24 / 48 MHz turbo speeds
   `scripts/teardown-bridge-feth-macos.sh` /
   `scripts/cleanup-bridge-feth-macos.sh` (macOS)
 * `scripts/setup-bridge-tap.sh` / `scripts/teardown-bridge-tap.sh` /
-  `scripts/cleanup-bridge-networking.sh` (Linux, last verified 2026-04-11)
+  `scripts/cleanup-bridge-networking.sh` (Linux; last run 2026-04-10, changed since)
 * `tests/bridge_platform.py` — cross-platform constants
   (`ETHERNET_DRIVER`, `IFACE_A`, `IFACE_B`, `BRIDGE_NAME`, `SETUP_HINT`,
   `BRIDGE_HOST_IP`, `BRIDGE_IP_A`, `BRIDGE_IP_B`) and the macOS helpers
@@ -1278,7 +1282,7 @@ Ultimate 64 TOD primitive test at 1 / 8 / 24 / 48 MHz turbo speeds
   round-trip test where B's 6502 responder swaps IPs/MACs and TXes
   an ICMP echo reply in the same JSR that consumed the request
 * `scripts/bridge_ping_demo.py` (Linux only: it hardcodes `tap-c64-*` /
-  `tuntap`; last verified 2026-04-10) -- visible two-VICE demo: launches
+  `tuntap`; last run 2026-04-10, changed since) -- visible two-VICE demo: launches
   both instances side by side (not minimized) and runs the ICMP
   round-trip in a loop with live per-screen status (ping counter +
   latest result, green/red). Run with

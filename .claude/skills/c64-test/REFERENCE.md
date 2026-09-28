@@ -92,7 +92,7 @@ Structural protocol satisfied by both `ViceInstanceManager` and `Ultimate64Insta
 ### `create_manager(backend="auto", *, lock_timeout=None, **kwargs) -> UnifiedManager`
 Factory function. `backend="auto"` reads `C64_BACKEND` env var (defaults to `"vice"`).
 
-- `lock_timeout: float | None` — cross-process device-lock timeout in seconds (U64 only); threaded through `UnifiedManager` to `_LockedU64Manager`, which calls `lock.acquire_or_raise(...)` and raises `DeviceLockTimeout` on failure (see below). `None` (the default) resolves at acquire time to `$U64_DEVICE_LOCK_TIMEOUT`, else 60 s (`unified_manager.DEFAULT_LOCK_TIMEOUT`); a malformed, non-positive or non-finite env value raises `DeviceLockTimeoutConfigError` (a `ValueError`) before any device contact. It bounds the wait against **wedged or dead** holders only — healthy holders heartbeat the lockfile every ~15 s and extend the deadline implicitly, so widening this past ~120 s is rarely useful (see PATTERNS § "Pattern 9a: Queueing for the U64").
+- `lock_timeout: float | None` — cross-process device-lock timeout in seconds (U64 only); threaded through `UnifiedManager` to `_LockedU64Manager`, which calls `lock.acquire_or_raise(...)` and raises `DeviceLockTimeout` on failure (see below). `None` (the default) resolves at acquire time to `$U64_DEVICE_LOCK_TIMEOUT`, else 60 s (`unified_manager.DEFAULT_LOCK_TIMEOUT`); a malformed, non-positive or non-finite env value raises `DeviceLockTimeoutConfigError` (a `ValueError`) before any device contact. It bounds the wait against **wedged or dead** holders only — healthy holders heartbeat the lockfile every ~15 s. Raising `lock_timeout` does not help you queue behind a healthy holder (its heartbeat already extends your deadline); it only lengthens how long you wait on a wedged or dead one. See PATTERNS § "Pattern 9a: Queueing for the U64".
 
 **U64 cross-process safety:** When the U64 backend is selected, `UnifiedManager` automatically wraps device access with `DeviceLock` via `_LockedU64Manager`. Multiple agents (separate OS processes) queue for the same physical device automatically.
 
@@ -508,7 +508,7 @@ set_cs8900a_mac(transport, mac, base=0xDE00)
 
 ## Module: capture
 
-Host-side raw ethernet capture/injection for TX/RX ethernet tests, platform-selected: macOS `/dev/bpf*` via `BIOCSETIF` (issue #158; needs a world-rw BPF node, and every dnsmasq rig on the bench holds one, so the chmod must cover `bpf4+` — see `docs/bridge_networking.md` § "macOS test-author traps" item 4 for the chmod/reboot caveats), Linux `AF_PACKET`/`SOCK_RAW` (needs `CAP_NET_RAW`/root; last verified 2026-04). `open_capture(iface) -> PacketCapture` (import from `c64_test_harness.capture`, as `CaptureUnavailable`; neither is a package-root export) returns the platform implementation or raises `CaptureUnavailable` naming the remedy verbatim — skip tests with that message, not a paraphrase. `parse_bpf_records()` is the pure BPF-buffer parser, pinned without a device by `tests/test_capture.py`. Full design in `docs/bridge_networking.md`.
+Host-side raw ethernet capture/injection for TX/RX ethernet tests, platform-selected: macOS `/dev/bpf*` via `BIOCSETIF` (issue #158; needs a world-rw BPF node, and every dnsmasq rig on the bench holds one, so the chmod must cover `bpf4+` — see `docs/bridge_networking.md` § "Host-side capture on macOS (issue #158)" for the chmod/reboot caveats), Linux `AF_PACKET`/`SOCK_RAW` (needs `CAP_NET_RAW`/root; added 2026-09-01 and exercised only against faked syscalls — no Linux run is recorded). `open_capture(iface) -> PacketCapture` (import from `c64_test_harness.capture`, as `CaptureUnavailable`; neither is a package-root export) returns the platform implementation or raises `CaptureUnavailable` naming the remedy verbatim — skip tests with that message, not a paraphrase. `parse_bpf_records()` is the pure BPF-buffer parser, pinned without a device by `tests/test_capture.py`. Full design in `docs/bridge_networking.md`.
 
 ---
 
@@ -518,7 +518,7 @@ Platform-dispatch module for bridge/ethernet tests. **Tests MUST import from her
 
 ### Constants (platform-dispatched at import time)
 
-| Name | macOS (primary) | Linux (last verified 2026-04) |
+| Name | macOS (primary) | Linux (last run 2026-04-10; not run since) |
 |------|-------|-------|
 | `IFACE_A` | `feth0` | `tap-c64-0` |
 | `IFACE_B` | `feth1` | `tap-c64-1` |

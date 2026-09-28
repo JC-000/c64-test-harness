@@ -20,10 +20,10 @@ stops the sound core being clocked, and reSID with it. Reads of
 
 | Register | Value with sound off | Source |
 |---|---|---|
-| `$D41B` (OSC3) | `maincpu_clk % 256` | S `sid.c:136`, `sid.c:279` |
+| `$D41B` (OSC3) | `maincpu_clk % 256` | S `sid.c:137`, `sid.c:279` |
 | `$D41C` (ENV3) | `maincpu_clk % 256` | same |
-| `$D419` / `$D41A` (paddles) | `0xff` | S `sid.c:133`, `sid.c:276` |
-| everything else | `0` | S `sid.c:138`, `sid.c:281` |
+| `$D419` / `$D41A` (paddles) | `0xff` | S `sid.c:134`, `sid.c:276` |
+| everything else | `0` | S `sid.c:139`, `sid.c:281` |
 
 A sampling loop reading OSC3 therefore gets a clean ramp at its own
 stride. It does not look broken; it looks like a working oscillator.
@@ -227,14 +227,18 @@ bytes at its own position, so sample index stays a clock across loss.
   The harm is **duration, not content**: the discarded bytes are identical to
   PCM already in the file, but the stream time they carried is gone, so the
   count is an *upper bound on packets of lost time*. `payloads_discarded`
-  (#443) counts these datagrams directly (`packets_reordered` counts every
-  datagram behind the highest number, held ones included, so reorders
-  without drops do not mean the capture is complete). A discard is not in itself a fault — a
+  (#443) counts these datagrams directly; on a result built before that field
+  existed, `packets_reordered` is the **only trace** (it counts every datagram
+  behind the highest number, held ones included), so reorders without drops do
+  not mean the capture is complete. A discard is not in itself a fault — a
   genuine retransmission is discarded correctly (101 in, 100 in the WAV, 1
   discarded) — so `tests/audio_link_loss.py` bounds lost time rather than
   requiring zero.
-- A WAV written before #410 was the concatenation of what arrived, with no
-  padding.
+- **Older captures:** before #410 gaps were not padded (the capture was the
+  concatenation of what arrived) and `time_base_intact` was
+  `packets_dropped == 0`. #430 on its own left zero-length placeholders,
+  which is the same concatenation. A result without `packets_filled` never
+  padded.
 - On this bench's Wi-Fi link, loss is 0-1.4% of a capture when idle and
   9-26% under other host traffic (#410). `tests/audio_link_loss.py` holds
   the live tests' bound and retry count.

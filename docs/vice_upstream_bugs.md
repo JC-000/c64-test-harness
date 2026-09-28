@@ -256,6 +256,13 @@ recorded because it was characterised precisely and because the next
 person to hit it will otherwise spend a day on it, as two investigations
 here already did.
 
+> **Evidence record.** This section is a summary. The full investigation
+> as it stood at 0e56950 — the #170 capture (pause at `$EA86`, `SP=$F0`,
+> the stack bytes and the `$00E6-$00F5` disassembly), the bisect table,
+> the redirect counts, the JAMAction-0 source trace, the mode-2 example and
+> the RED CHRGET signature — is kept verbatim in
+> [issue #170, comment 5873925412](https://github.com/JC-000/c64-test-harness/issues/170#issuecomment-5873925412).
+
 Under host load, a running VICE stops emulating. Its binary monitor
 thread stays completely healthy: it answers `read_registers`,
 `read_memory`, `CHECKPOINT_LIST` and `resource_get`, and it acknowledges
@@ -280,7 +287,7 @@ JAMAction resource: 1 (continue)
 
 The dump was captured under `JAMAction=1`. The harness now pins
 `-jamaction 0` (DIALOG) whenever `ViceConfig.monitor` is on
-(`vice_lifecycle.py:791`), because VICE emits the `0x61` JAM event only
+(`ViceProcess.start()` in `backends/vice_lifecycle.py`), because VICE emits the `0x61` JAM event only
 under JAMAction 0 with the binary monitor connected (S
 `machine.c:131-139`).
 
@@ -304,7 +311,7 @@ the discriminator; the raster alone is not:
   unverified** (the `should_pause_on_exit_mon` path at `monitor.c:3325`
   was ruled out). A jam is told apart from this bug by the queued `0x61`
   and a PC sitting on a KIL opcode, which `_machine_failure_report`
-  (`tests/test_vice_core.py:169`) checks for.
+  in `tests/test_vice_core.py` checks for.
 
 **What it is not** — each ruled out by measurement, not by argument:
 
@@ -339,7 +346,7 @@ the outside ("the text never appeared"):
 | **lost keystrokes** | advancing (frozen if it ended in a jam) | cycling the BASIC idle loop `$E5CD-$E5D4`, or on a KIL opcode with `0x61` queued | `READY.` only, nothing typed | a harness defect, fixed (#170) |
 
 The second mode was the harness's own `_restore_basic` fixture
-(`tests/test_vice_core.py:362`), which returned to BASIC with `CLI; JMP
+in `tests/test_vice_core.py`, which returned to BASIC with `CLI; JMP
 $E5CD` and SP untouched. `$E5CD` sits inside CHRIN's call frame, and the
 monitor pauses the CPU wherever the per-frame poll catches it (S
 `monitor.c:407`) — in 2 of 317 redirects measured under load, inside the
@@ -350,7 +357,7 @@ a jam on a KIL opcode, or a self-healing warm start (captured with CPU
 history via `scripts/vice_keyecho_probe.py`, disassembled with
 `scripts/dis6502.py`). The fixture now re-enters BASIC through the warm
 start, `CLI; JMP ($A002)`, which rebuilds SP. Deterministic regression:
-`TestRestoreBasicFromInterrupt` (`tests/test_vice_core.py:767`) parks the
+`tests/test_vice_core.py::TestRestoreBasicFromInterrupt` parks the
 CPU on the handler's RTI at `$EA86` and calls `_restore_basic`. Under the
 issue's load recipe: 1 of 45 cycles failed before, 0 of 45 after. When
 diagnosing, sample `$C6`/`$0277` immediately after the feed, not at
@@ -359,7 +366,7 @@ VICE is one trial.
 
 **Harness mitigation: detection, not recovery.** We cannot fix VICE.
 `_machine_failure_report` in `tests/test_vice_core.py` samples the raster
-across acknowledged resumes (`_emulator_is_stalled`, `:112`) and checks for
+across acknowledged resumes (`_emulator_is_stalled`) and checks for
 a queued `0x61`, so a stall says so instead of timing out on a screen
 assertion. Deliberately **not** auto-restarted: a harness
 that silently rebuilds a stalled emulator converts a reproducible
