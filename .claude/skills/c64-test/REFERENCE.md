@@ -1014,7 +1014,7 @@ End-to-end: configure U64 audio stream destination, play SID, capture UDP packet
 
 ### `U64CaptureResult` (dataclass)
 - `.wav_path: Path`, `.duration_seconds: float`, `.sample_rate: int`
-- `.total_samples: int`, `.packets_received: int`, `.packets_dropped: int`, plus the sequence-tracking and fill fields listed under `CaptureResult` below (not `payloads_discarded`)
+- `.total_samples: int`, `.packets_received: int`, `.packets_dropped: int`, plus the sequence-tracking, fill and `payloads_discarded` fields listed under `CaptureResult` below, same meanings
 
 ---
 
@@ -1042,7 +1042,7 @@ result = cap.stop(wav_path="output.wav")  # -> CaptureResult
 - `.time_base_intact: bool` — every drop filled at a trusted length (no unfilled drop, no `sequence_resyncs`, no nonstandard payload when anything was filled); not "nothing lost" — that is `packets_dropped == 0`. Before #410 (and on #430 alone) gaps were concatenated and this was `packets_dropped == 0`; a result without `packets_filled` never padded. Deliberately **not** affected by `payloads_discarded`
 - `.sample_rate_exact: Fraction | None` — the rate the capture was actually timed at (e.g. the NTSC `2109375/44` Hz, see `docs/sid_audio.md`)
 
-`U64CaptureResult` carries the same fields **except `payloads_discarded`**, which `capture_sid_u64` does not propagate — read it from an `AudioCapture` result when completeness matters
+`U64CaptureResult` carries every `CaptureResult` field, `payloads_discarded` included (#505), so `capture_sid_u64` and `capture_u64_audio` results can be bounded the same way
 
 ### `write_wav(path, pcm_data, sample_rate=48000, channels=2, sample_width=2) -> Path`
 Write raw PCM data to a WAV file.
