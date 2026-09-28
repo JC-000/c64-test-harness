@@ -43,8 +43,9 @@ REU layer (Phase B)
   ``$DF00-$DF0A`` per 32 KB bank, the window is read back, and the
   original RAM is restored.  Works through the plain ``C64Transport``
   read/write surface (no REST readback for REU memory exists on either
-  U64 generation — an upstream ``GET /v1/machine:reumem`` feature
-  request is pending).
+  U64 generation — the upstream request, GideonZ/1541ultimate#697, is
+  still open; its thread moved from the originally proposed
+  ``GET /v1/machine:reumem`` verb to ``readmem`` with ``space=reu``).
 * **Restore** — ``restore_snapshot`` routes REU contents through the
   Ultimate 64 transport's managed SocketDMA client
   (:meth:`Ultimate64Transport.socket_dma_reu_write`, REUWRITE opcode
@@ -608,8 +609,10 @@ def extract_reu_contents(
     """Read *size_bytes* of REU expansion memory via the staging window.
 
     Neither U64 generation exposes a REST endpoint for REU readback (the
-    upstream ``GET /v1/machine:reumem`` feature request is pending), so
-    the extract stages each bank through C64 RAM:
+    upstream request, GideonZ/1541ultimate#697, is still open; its thread
+    moved from the originally proposed ``machine:reumem`` verb to
+    ``readmem`` with ``space=reu``), so the extract stages each bank
+    through C64 RAM:
 
     1. Stash the 32 KB staging window ``$0800-$87FF``.
     2. Per 32 KB bank: program an REU→C64 transfer through the REC

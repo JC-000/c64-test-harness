@@ -2098,8 +2098,16 @@ class Ultimate64Client:
           ``"Maximum length of 128 bytes exceeded. Consider using POST
           method with attachment."``).
 
-        Both forms are functionally equivalent for supported sizes; the
-        POST form has no upper bound verified at 2048 bytes.
+        Both forms are functionally equivalent for supported sizes.  No
+        upper bound on the POST form is known.  A controlled re-run of 25
+        single 38,911-byte POSTs at ``$0801`` plus 25 sentinel-bed writes
+        read back 0/50 corrupted (U64E fw 3.15 ``4011c97c``, CPU paused,
+        payload below ``$A000``).  Issue #231's
+        earlier one-byte-corruption report on a 47,103-byte POST was
+        closed as non-reproducing (not refuted): a running CPU and the
+        ROM shadow above ``$A000`` explain it, and its build was not
+        re-tested.  A bulk readback check must pause the CPU and stay
+        below ``$A000``.
         """
         # bool subclasses int; True would address $0001, the 6510
         # processor port (#340).

@@ -1270,7 +1270,7 @@ def build_tx_code(
     must read them.
     Since #487 the TX skip phase frees up to 8 frames without it; the
     drain still clears deeper queues and does it before the bid.  Default
-    ``False`` keeps the routine byte-identical; ``True`` adds 40 bytes (43
+    ``False`` emits no drain code; ``True`` adds 40 bytes (43
     with ``drain_status_addr``).  The routine is over 128 bytes either way
     since #487 (159-180 bytes, 199-223 with the drain): through
     ``transport.write_memory`` that costs no ``/Temp`` attachment on a
@@ -1700,15 +1700,16 @@ def build_ping_and_wait_code(
     the echo request, in the same run, so a host whose neighbour cache is
     stale answers the ping instead of queuing the reply (issue #212).  The
     ARP reply that comes back is drained like any other non-matching frame.
-    Without it the output is byte-identical to the pre-#218 routine.
+    Without it the routine emits no ARP code.  (It is not byte-identical
+    to the pre-#218 routine: #487 changed every TX site since.)
 
     ``drain_first`` (issue #222): SkipNow every frame already queued in
     the chip before transmitting anything (:func:`_emit_drain_rx`, at
     most :data:`DRAIN_RX_MAX_FRAMES`).  On real silicon an exchange
     started with stale frames in the queue loses its reply (the chip
     counts RxMISS +1 and never presents it); the first exchange after a
-    reset + init + idle is the usual victim.  Default ``False`` keeps the
-    routine byte-identical.  ``drain_status_addr`` (needs ``drain_first``)
+    reset + init + idle is the usual victim.  Default ``False`` emits no
+    drain code.  ``drain_status_addr`` (needs ``drain_first``)
     receives the drain's remaining budget: ``0`` = bound hit, frames may
     still be queued; ``n > 0`` = queue emptied after ``8 - n`` skips.  It
     must not land on ``result_addr``, either frame or the routine's own
@@ -1815,9 +1816,10 @@ def build_icmp_responder_code(
     ``my_ip`` while it waits -- reply transmitted, then back to polling
     for the echo request -- the way ip65's ``arp_process`` does, so a
     peer that must resolve us first gets an answer.  ARP frames that are
-    not requests for ``my_ip`` are dropped.  Without ``my_mac`` the
-    output is byte-identical to the pre-#218 routine and ARP is dropped
-    like any other non-ICMP frame.
+    not requests for ``my_ip`` are dropped.  Without ``my_mac`` no ARP
+    code is emitted and ARP is dropped like any other non-ICMP frame (the
+    output is not byte-identical to the pre-#218 routine: #487 changed
+    its TX site since).
 
     Uses RR-Net register layout with the clockport enable injected at
     entry.  See ``tests/test_bridge_ping.py`` for a working round-trip
@@ -2109,7 +2111,8 @@ def build_read_and_respond_echo_request_code(
     * ``0x03`` (:data:`RESULT_ARP_REPLY_SENT`) -- the frame was an ARP
       request for ``my_ip`` and a reply was transmitted; host should
       re-poll.  Only with ``my_mac`` (issue #218); without it ARP is a
-      non-match and the output is byte-identical to the pre-#218 routine.
+      non-match and no ARP code is emitted (the output is not
+      byte-identical to the pre-#218 routine: #487 changed its TX site).
     * :data:`RESULT_TX_NOT_READY` (``0x04``) -- a reply was due but
       ``Rdy4TxNOW`` never asserted, so nothing was transmitted (issue #236).
     """
@@ -2741,8 +2744,7 @@ def build_ping_and_wait_tod_code(
         arp_frame_buf: Optional ARP request to transmit first.
         arp_frame_len: Its length; defaults to :data:`ARP_FRAME_LEN`.
         drain_first: Drain the chip's RX queue before transmitting
-            (issue #222).  Default ``False`` keeps the routine
-            byte-identical.
+            (issue #222).  Default ``False`` emits no drain code.
         drain_status_addr: With ``drain_first``, where to store the
             drain's remaining budget (``0`` = bound hit, frames may still
             be queued; ``n > 0`` = queue emptied after ``8 - n`` skips).

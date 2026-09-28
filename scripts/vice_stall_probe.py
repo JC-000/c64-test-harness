@@ -74,8 +74,11 @@ def interrogate(t):
     print(f"checkpoints: {t.checkpoint_list()}", flush=True)
 
     # LIN/CYC are the raster position: they advance whenever the *machine*
-    # is emulating, whether or not the CPU is executing.  Frozen LIN means
-    # the whole emulator is halted, not just the 6510.
+    # is emulating, whether or not the CPU is executing.  Frozen LIN alone
+    # does not prove the emulator halted: monitor commands are serviced
+    # once per frame, so a running machine can read the same LIN every
+    # time, and a -jamaction 0 jam pins it too.  Acknowledged resumes
+    # without progress (the next section) are what separate a stall.
     print("\n-- is the machine emulating at all? (raster position) --",
           flush=True)
     for i in range(5):

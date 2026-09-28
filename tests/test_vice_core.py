@@ -114,9 +114,15 @@ def _emulator_is_stalled(transport, samples: int = 4) -> tuple[bool, list[str]]:
 
     ``LIN``/``CYC`` are the raster position.  They advance whenever the
     *machine* is emulating, whether or not the 6510 is executing any
-    instruction, so they discriminate a stalled emulator from every other
-    failure — and unlike a PC sample they cannot coincide by accident,
-    because the raster never sits still on a running machine.
+    instruction.  A constant reading is **not** proof of a stall, though:
+    the binary monitor services commands once per frame from its vsync
+    hook, so a command sent to a running machine halts it at the same
+    frame phase every time (``$D012`` read back 12 across n=8
+    resume-and-reread cycles, VICE 3.10, 2026-09-05), and a jam under the
+    harness's ``-jamaction 0`` pin also pins ``LIN``/``CYC``.  Only
+    acknowledged resumes without progress discriminate a stalled
+    emulator; read this result alongside the JAM-event and PC lines of
+    :func:`_machine_failure_report`.
 
     This is upstream bug 6 (docs/vice_upstream_bugs.md): under host load
     VICE stops emulating while its monitor thread stays healthy, answers
@@ -175,10 +181,12 @@ def _machine_failure_report(transport, needle: str) -> str:
     observed in both, which is itself evidence that the fault is the
     emulator rather than anything about keyboard injection.
 
-    These three tests fail together, intermittently, and only in
-    full-suite runs -- never in 60 isolated runs, nor in 30 under heavy
-    concurrent VICE load.  "'5' not found on screen" is all the evidence
-    a failure has ever produced, which is why the cause is still open.
+    Issue #170 was three of these tests failing together, intermittently,
+    with "'5' not found on screen" as the only evidence.  Its cause was
+    found and fixed (PR #177): ``_restore_basic`` re-entered BASIC at the
+    KERNAL idle loop ``$E5CD`` with the stack the monitor pause left
+    behind, and now re-enters through the warm start ``JMP ($A002)``.
+    This report stays so that a recurrence says why it failed.
 
     The distinguishing question is whether the 6510 is *executing*.  The
     fourth test in this class asserts no screen content and has never
@@ -195,9 +203,10 @@ def _machine_failure_report(transport, needle: str) -> str:
         stalled, raster = _emulator_is_stalled(transport)
         lines.append(
             f"raster across resumes: {raster}"
-            + ("  <- FROZEN: VICE has stopped emulating entirely "
-               "(upstream bug 6). Everything below is the state it was "
-               "left in, not a clue about this test." if stalled else
+            + ("  <- FROZEN: VICE may have stopped emulating (upstream "
+               "bug 6), or the 6510 jammed (see the JAM line below); a "
+               "constant raster alone does not separate them from a "
+               "running machine sampled at the monitor's frame phase." if stalled else
                "  (advancing: the emulator is running)")
         )
     except Exception as e:

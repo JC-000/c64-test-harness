@@ -51,7 +51,8 @@ from c64_test_harness.backends.vice_lifecycle import (
 # ---------------------------------------------------------------------------
 #
 # The harness owns this /24: the setup scripts put the host at ``.1``
-# (``BRIDGE_ADDR`` in setup-bridge-feth-macos.sh / setup-tap-networking.sh)
+# (``BRIDGE_ADDR`` in setup-bridge-feth-macos.sh / setup-bridge-tap.sh;
+# the single-tap setup-tap-networking.sh uses the same ``.1`` as ``TAP_ADDR``)
 # and the two emulated C64s answer on ``.2`` and ``.3``.
 #
 # These were previously duplicated as literals across five test modules,
@@ -436,12 +437,13 @@ def probe_vice_pcap_ok(
         )
         return _PROBE_CACHE
 
-    # Build the same ``-addconfig`` vicerc + CLI flag combination that
-    # ``ViceProcess`` uses in production (see
-    # ``src/c64_test_harness/backends/vice_lifecycle.py``).  This is the only
-    # invocation VICE 3.10 accepts for ethernet activation, so anything else
-    # would probe a flag pattern VICE rejects unconditionally and would
-    # tell us nothing about the pcap driver's actual health.
+    # An ``-addconfig`` vicerc plus the ``-ethernetioif`` /
+    # ``-ethernetiodriver`` CLI flags, as ``ViceProcess`` launches.  The rc
+    # below is NOT production's: ``EthernetIOIF`` / ``EthernetIODriver`` are
+    # not VICE resources in any casing (the real names are
+    # ``ETHERNET_INTERFACE`` / ``ETHERNET_DRIVER``; see
+    # ``vice_lifecycle.build_ethernet_rc``), so VICE ignores those two lines
+    # and the interface and driver reach it only through the CLI flags.
     #
     # Why NOT ``-ethernetiodriver pcap`` on a bare cmdline: the option is
     # advertised in ``-help`` but its value set is populated by
@@ -571,12 +573,15 @@ def probe_vice_pcap_ok(
                     (
                         f"VICE (x64sc) exited during pcap+{iface} cart "
                         f"activation (code={proc.returncode}); pcap driver "
-                        "is broken on this host.  Root cause: the "
-                        "EthernetIODriver resource setter does not populate "
-                        "rawnet_arch_driver before cs8900_activate runs, so "
-                        "cs8900_activate segfaults on a NULL driver vtable. "
-                        "See docs/development.md macOS caveats and "
-                        "scripts/probe-vice-feth.sh for a standalone probe."
+                        "is broken on this host.  The known cause is an "
+                        "unelevated launch: VICE selects a rawnet driver "
+                        "only when archdep_rawnet_capability() holds "
+                        "(geteuid() == 0 on macOS), otherwise "
+                        "rawnet_arch_driver stays NULL and the cart's reset "
+                        "dereferences it (rawnetarch.c:251). See "
+                        "docs/vice_upstream_bugs.md, docs/development.md "
+                        "macOS caveats and scripts/probe-vice-feth.sh for a "
+                        "standalone probe."
                     ),
                 )
             else:

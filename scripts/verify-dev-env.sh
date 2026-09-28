@@ -186,8 +186,9 @@ check_vice() {
         path="$(command -v x64sc)"
         record "$sec" "x64sc on PATH" ok "$path" 1
 
-        # Version check. Primary: `x64sc --version`. On macOS 26 Tahoe the
-        # Homebrew vice 3.10 bottle has an upstream init-order bug where
+        # Version check. Primary: `x64sc --version`. On macOS (first seen on
+        # 26 Tahoe) the Homebrew vice 3.10 bottle has an upstream init-order
+        # bug (docs/vice_upstream_bugs.md bug 5) where
         # archdep_program_path_set_argv0() is called *after* `--version` is
         # handled, so `proc_pidpath()` failure there hits a NULL argv0_ref
         # and exits 1 without printing the version. Fall back to other
@@ -229,7 +230,7 @@ check_vice() {
         fi
         if [ -n "$ver" ]; then
             local detail="$ver"
-            [ -n "$ver_source" ] && [ "$ver_source" != "--version" ] && detail="$ver [via $ver_source; --version broken on macOS 26]"
+            [ -n "$ver_source" ] && [ "$ver_source" != "--version" ] && detail="$ver [via $ver_source; x64sc --version printed no version]"
             if printf '%s' "$ver" | grep -q '3\.10'; then
                 record "$sec" "VICE version" ok "$detail" 1
             elif [ "$ver_source" = "-features probe" ]; then
@@ -398,8 +399,8 @@ check_system() {
             if [ -r /dev/bpf0 ]; then
                 record "$sec" "/dev/bpf0 readable" ok "BPF devices user-readable (pcap ready)" 0
             else
-                record "$sec" "/dev/bpf0 readable" warn "BPF devices are root-only (VICE pcap driver needs sudo chmod 666 /dev/bpf* or Wireshark's ChmodBPF helper)" 0
-                add_hint "Make /dev/bpf* user-readable: sudo chmod 666 /dev/bpf* (session) or install Wireshark's ChmodBPF (permanent)"
+                record "$sec" "/dev/bpf0 readable" warn "BPF devices are root-only (host-side packet capture and the ethernet TX/RX tests need sudo chmod o+rw /dev/bpf* or Wireshark's ChmodBPF helper; VICE's pcap driver needs root regardless)" 0
+                add_hint "Make /dev/bpf* user-readable: sudo chmod o+rw /dev/bpf* (session; re-run once a root process has created bpf4+) or install Wireshark's ChmodBPF (permanent)"
             fi
         else
             record "$sec" "/dev/bpf0 readable" missing "no /dev/bpf* device" 0
@@ -454,12 +455,13 @@ check_system() {
                 missing_nopasswd=1
             fi
         done
-        # macOS 26 also needs root to attach VICE's pcap driver to a feth
-        # interface (the kernel's per-process BPF attach check is root-only,
-        # independent of /dev/bpf* permissions). `ViceProcess.start()` wraps
-        # the x64sc argv with `sudo -n` when ethernet is enabled, so the
-        # ethernet tests need a NOPASSWD entry for /opt/homebrew/bin/x64sc
-        # in the same sudoers drop-in.
+        # On macOS VICE's pcap ethernet driver needs root, whatever the
+        # /dev/bpf* permissions: VICE's own gate, archdep_rawnet_capability(),
+        # returns geteuid() == 0 there (the CAP_NET_RAW branch is Linux-only),
+        # and unelevated the driver is never selected. plan_vice_launch()
+        # (backends/vice_elevation.py) wraps the x64sc argv with `sudo -n`
+        # for an ethernet launch, so the ethernet tests need a NOPASSWD
+        # entry for /opt/homebrew/bin/x64sc in the same sudoers drop-in.
         local x64sc_path="/opt/homebrew/bin/x64sc"
         if [ -x "$x64sc_path" ]; then
             if nopasswd_for "$x64sc_path"; then
