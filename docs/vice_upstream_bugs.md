@@ -138,9 +138,12 @@ All three flags are genuinely registered: S `ethernetcart.c:434-451`.
 exactly as the rc does and arrive at the same dereference.
 
 Do not confuse this with `-ethernetiodriver pcap` on a bare command line,
-which **is** rejected at parse time (exit 255, `Argument 'pcap' not
-valid`), because the driver's value set is only populated once the cart
-is active. The *cart* options are accepted and crash.
+which **is** rejected at parse time when unelevated (exit 255,
+`Argument 'pcap' not valid`): the option sets `ETHERNET_DRIVER`, whose
+setter selects pcap only when `archdep_rawnet_capability()` holds (S
+`rawnetarch.c:108`) and otherwise returns -1, which S `cmdline.c:262-264`
+reports as that error — with or without an `-addconfig` rc. The *cart*
+options are accepted and crash.
 
 **Harness mitigation: yes.** `plan_vice_launch()`
 (`src/c64_test_harness/backends/vice_elevation.py`) refuses to spawn an
@@ -342,8 +345,8 @@ the outside ("the text never appeared"):
 
 | | raster across resumes | PC | screen | diagnosis |
 |---|---|---|---|---|
-| **stall (this bug)** | frozen | pinned, e.g. at `$CF00` | stale | VICE stopped emulating |
-| **lost keystrokes** | advancing (frozen if it ended in a jam) | cycling the BASIC idle loop `$E5CD-$E5D4`, or on a KIL opcode with `0x61` queued | `READY.` only, nothing typed | a harness defect, fixed (#170) |
+| **stall (this bug)** | constant | pinned, e.g. at `$CF00` | stale | VICE stopped emulating |
+| **lost keystrokes** | constant too: `LIN=12`, `CYC` 0-2 (the monitor's frame phase, #504) — the raster separates nothing here | cycling the BASIC idle loop `$E5CD-$E5D4`, or on a KIL opcode with `0x61` queued | `READY.` only, nothing typed | a harness defect, fixed (#170) |
 
 The second mode was the harness's own `_restore_basic` fixture
 in `tests/test_vice_core.py`, which returned to BASIC with `CLI; JMP
@@ -372,7 +375,7 @@ so instead of timing out on a screen assertion. The raster is reported
 but does not decide: sampled through the monitor on a healthy running
 machine it reads `LIN=12` every time with `CYC` 0-2, identical across
 all four samples in 2 of 60 trials, while the jiffy clock advanced across
-every resume in 70 of 70 (#504, VICE 3.10, 2026-09-28). Deliberately **not** auto-restarted: a harness
+every resume in 70 of 70 (#504, VICE 3.10, 2026-09-28). "No progress" also covers a running loop with IRQs masked (the jiffy clock stops and the frame-phase halt can read one PC every time), so it is evidence for this bug only alongside a PC that is not such a loop and no `0x61`. Deliberately **not** auto-restarted: a harness
 that silently rebuilds a stalled emulator converts a reproducible
 upstream bug into an invisible one.
 
@@ -488,9 +491,9 @@ The script writes its vicerc into a throwaway `HOME`, so it never touches
 The cart must be activated through an `-addconfig` rc. Passing
 `-ethernetiodriver pcap` on a bare command line does **not** reach the
 bug — it is rejected at parse time with `Argument 'pcap' not valid for
-option '-ethernetiodriver'` and exit 255, because the driver's value set
-is populated by `rawnet_arch_init()`, which only runs once the cart is
-active. Verified: that shorter form exits 255, not 139.
+option '-ethernetiodriver'` and exit 255, because unelevated the
+`ETHERNET_DRIVER` setter refuses pcap (S `rawnetarch.c:108`; reported by
+S `cmdline.c:262-264`). Verified: that shorter form exits 255, not 139.
 
 ```sh
 #!/bin/sh

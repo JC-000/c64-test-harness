@@ -109,7 +109,9 @@ def _wait_for_text_binary(transport, needle, timeout=15.0, poll_interval=1.0):
             pass
 
 
-def _emulator_is_stalled(transport, samples: int = 4) -> tuple[bool, list[str]]:
+def _emulator_is_stalled(
+    transport, samples: int = 4
+) -> tuple[bool | None, list[str]]:
     """Whether the machine made no progress across acknowledged resumes.
 
     Progress is the KERNAL jiffy clock (``$A0-$A2``) or the PC changing
@@ -128,15 +130,26 @@ def _emulator_is_stalled(transport, samples: int = 4) -> tuple[bool, list[str]]:
     while ``CYC`` still changed in 2 of them (each the first trial after
     the jam).
 
-    So ``True`` means "no progress": either upstream bug 6
-    (docs/vice_upstream_bugs.md -- VICE stops emulating under host load
-    while its monitor answers and acknowledges every resume) or a jammed
-    6510.  The JAM-event and PC lines of :func:`_machine_failure_report`
-    separate the two.  Code running with IRQs masked freezes the jiffy
-    clock but not the PC, so it still counts as progress.
+    So ``True`` means "no progress seen", which has three causes:
+    upstream bug 6 (docs/vice_upstream_bugs.md -- VICE stops emulating
+    under host load while its monitor answers and acknowledges every
+    resume), a jammed 6510, or code spinning with IRQs masked.  The last
+    is a running machine this sampler cannot see move: masked IRQs freeze
+    the jiffy clock, and the monitor halts at a fixed frame phase, so a
+    loop whose period divides the frame reads the same PC every time
+    (``SEI; JMP *`` and a 9-cycle ``SEI; INC; JMP`` loop both returned
+    ``True`` 8/8, warp on and off).  The JAM-event line of
+    :func:`_machine_failure_report` identifies a jam.  CIA1 Timer A
+    (``$DC04``) was measured as a clock independent of the I flag and
+    rejected: it advanced in every trial of every arm, the KIL jam
+    included (8/8 each, warp on and off), because a jammed 6510 still
+    clocks the machine; it therefore cannot separate a jam from a spin.
 
-    A comparison counts only when the resume before it returned; fewer
-    than two readable samples prove nothing and report ``False``.
+    ``False`` means a change was seen.  ``None`` means inconclusive: no
+    comparison completed, because fewer than two samples were readable or
+    a resume failed before the second read.  A comparison counts only
+    when the resume before it returned; a run cut short after one or more
+    comparisons is judged on those.
     """
     seen: list[str] = []
     prev: tuple[int, bytes] | None = None
@@ -162,7 +175,7 @@ def _emulator_is_stalled(transport, samples: int = 4) -> tuple[bool, list[str]]:
             break
         prev = cur
         time.sleep(0.1)
-    return compared > 0, seen
+    return (True if compared > 0 else None), seen
 
 
 def _stub_was_executed(transport, samples: int = 4) -> tuple[bool, list[int]]:
@@ -221,9 +234,12 @@ def _machine_failure_report(transport, needle: str) -> str:
         stalled, seen = _emulator_is_stalled(transport)
         lines.append(
             f"PC and jiffy clock across acknowledged resumes: {seen}"
-            + ("  <- NO PROGRESS: VICE stopped emulating (upstream bug 6) "
-               "or the 6510 jammed -- the JAM line below separates them."
-               if stalled else
+            + ("  (inconclusive: no two samples across an acknowledged "
+               "resume)" if stalled is None else
+               "  <- NO PROGRESS SEEN: VICE stopped emulating (upstream "
+               "bug 6), the 6510 jammed (see the JAM line below), or code "
+               "is spinning with IRQs masked, which this sampler cannot "
+               "see move." if stalled else
                "  (progressing: the machine runs when resumed)")
         )
     except Exception as e:
