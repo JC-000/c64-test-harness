@@ -23,7 +23,7 @@ measured on the U64E unless it says otherwise.
 *C64 and Cartridge Settings → Command Interface → Enabled*.
 `enable_uci(client)` flips that item over REST. The live suites follow it
 with `client.reset()` and a 3 s settle before the first routine
-(`tests/test_uci_udp_send_live.py:274-279`), recorded as: without that, every routine
+(`tests/test_uci_udp_send_live.py`'s fixture), recorded as: without that, every routine
 times out at the sentinel. **That requirement was not reproduced when it
 was measured on the U64E** (#270: fw 3.15, `git_commit_hash` bce4535e,
 2026-09-15, `DeviceLock` held, `Cartridge Preference` `Auto`, each trial
@@ -40,8 +40,8 @@ candidates are `Cartridge Preference` External (#359, next sentence), the
 C64 not sitting at `READY.` when the `SYS` is typed, and a different
 firmware build. On an Ultimate transport every routine except `uci_probe` first reads the UCI identifier at `$DF1D` (one bodyless GET, zero `/Temp` cost) and raises `UCIInterfaceAbsentError` if it is not `$C9`, because with `Cartridge Preference` = External the slot stays off the bus after the reset while `Command Interface` still reads Enabled (#359: U64E, paired ABBAAB, identifier present and routine completing 3/3 with Auto, 0/3 with External). The original observation is recorded,
 and **its cause is not explained by firmware source**. From
-source, read at tag `1.1.0` (the C64U) and `7f6fcb51` (the U64E's
-v3.15-85), not measured:
+source, read at tag `1.1.0` (the C64U) and `7f6fcb51` (v3.15-85, the
+U64E's build before 2026-09-15; it now reports bce4535e), not measured:
 
 - The item drives the FPGA register `CMD_IF_SLOT_ENABLE`, which
   `C64::set_emulation_flags()` sets to `!!cfg->get_value(CFG_CMD_ENABLE)`
@@ -97,29 +97,24 @@ v3.15-85), not measured:
   (bce4535e, Cartridge Preference Auto, #270): after `reboot()` + 5 s the
   identifier and `uci_probe` answered 4/4. The REU half, the External and
   `.crt` cases, and the C64U are unmeasured.
-  `Ultimate64Client.reboot`'s docstring stated the unconditional version
-  until #299 corrected it to this account.
 
-#270 has since run the U64E without the reset, with the result given at
-the top of this section. The write is memory-only — it is a config PUT, so
-it survives `machine:reboot` but not a firmware power-on, and it is never
-saved to flash (`uci_network.py:2316-2329`). (`enable_uci`'s docstring
-used to say "a device reboot reverts to the default state"; that was
-wrong on the corrected model — `machine:reboot` is a C64-level reset and
-leaves firmware RAM config alone — and #270 corrected it. See
-[`docs/u64_recovery.md`](u64_recovery.md) § "Harness-side mitigation: FTP
-`/Temp` GC", which carries the correction.)
+The `enable_uci` write is memory-only — it is a config PUT, so it survives
+`machine:reboot` (a C64-level reset that leaves firmware RAM config alone)
+but not a firmware power-on, and `enable_uci` never saves it to flash.
 
 ## How the 6502 routine is dispatched
 
-The host (`_execute_uci_routine` in `uci_network.py`, `:1686`) clears the
-sentinel and error bytes, writes `CTL_ABORT` to `$DF1C` and sleeps 0.1 s to
-drain stale UCI state, writes the generated 6502 routine at `code_addr`
-(default `$C000`), then injects the string `SYS <code_addr>\r` into the
-keyboard buffer at `$0277` and sets the keyboard fill count at `$00C6` to the
-command length. That injection is why `code_addr` is constrained: the
-`SYS<addr>\r` string must fit the 10-byte KERNAL buffer, and a longer one
-raises `ValueError` before anything is written (`:1741-1745`). BASIC's
+The host (`_execute_uci_routine` in `uci_network.py`) first refuses, with
+`ValueError` and before any write, a routine that overlaps its own output
+spans, the sentinel or the error flag; on an Ultimate transport it then
+checks the `$DF1D` identifier (above). It clears the sentinel and error
+bytes, writes `CTL_ABORT` to `$DF1C` and sleeps 0.1 s to drain stale UCI
+state, writes the generated 6502 routine at `code_addr` (default `$C000`),
+then injects the string `SYS<code_addr>\r` into the keyboard buffer at
+`$0277` and sets the keyboard fill count at `$00C6` to the command length.
+That injection is why `code_addr` is constrained: the `SYS<addr>\r` string
+must fit the 10-byte KERNAL buffer, and a longer one raises `ValueError`
+before the `SYS` is typed — but after the routine has been written. BASIC's
 command-line processor reads the buffer on its next cycle as if the user
 typed the `SYS` command and RETURN, which JSRs into the routine. The
 routine does its work, writes the sentinel byte, and executes `RTS` to
@@ -175,16 +170,15 @@ after a timeout.
 
 ```asm
 ; Tail of every UCI routine:
-    LDA #$01            ; sentinel done value
+    LDA #$42            ; sentinel done value (_SENTINEL_DONE)
     STA sentinel_addr   ; host polls this byte
     RTS                 ; return to BASIC (SYS dispatch)
 ```
 
-An earlier version patched the IMAIN vector at `$0302/$0303` to point at
-`code_addr` and waited for BASIC's idle loop to jump through it. That
-worked on warm devices (where prior BASIC activity had already traversed
-`$0302`) but silently failed on cold boots because BASIC's READY loop
-does not cycle through IMAIN — only the command-line processor does.
+Dispatch is by typed `SYS`, not by patching the IMAIN vector at
+`$0302/$0303`: BASIC's READY loop does not cycle through IMAIN on a cold
+boot — only the command-line processor does — so a vector patch fires only
+on a warm machine.
 
 Custom builders MUST end with `RTS` (0x60), not `JMP` or `BRK`.
 
@@ -234,62 +228,47 @@ post-tag, so `uci_socket_read_multiblock` grades `None`; only an override of
 refuses them with `82,PARAMETER(S) OUT OF RANGE`, and the helper returns
 `b""` with a WARNING naming that status. With
 `turbo_safe=True` the timeout grows by 6 ms per requested byte (two ~2.5 ms
-fences per byte at 1 MHz). The multi-block routine is 232 bytes plain and
-592 turbo-safe: 2 or 5 PUTs at the 128-byte threshold, no `/Temp`
+fences per byte at 1 MHz). The multi-block routine is 234 bytes plain and
+610 turbo-safe: 2 or 5 PUTs at the 128-byte threshold, no `/Temp`
 attachment.
 Evidence grade: firmware source (bce4535e) and the interpreter model in
 `tests/test_uci_socket_read_multiblock.py`; the device check is
 `tests/test_u64_capabilities_live.py::TestSocketReadCeiling` (U64E only).
 
-## Cost on leak-prone firmware: zero, one or two attachments per routine
+## Cost on leak-prone firmware: zero attachments through the transport
 
 On a device without the upstream `/Temp` collector — the C64 Ultimate on
-1.1.0 today — **most UCI calls from host Python cost one managed `/Temp`
-attachment; a large `socket_write` costs two and a probe or peek costs
-none — the size of the emitted routine decides**, and enough attachments
-crash the device firmware. The mechanism, the budget and the hygiene pass
-are in [`docs/u64_recovery.md`](u64_recovery.md); what matters here is the
-shape:
+1.1.0 today — every body-carrying REST POST leaves a managed `/Temp`
+attachment, and enough of them crash the device firmware. The mechanism,
+the budget and the hygiene pass are in
+[`docs/u64_recovery.md`](u64_recovery.md). For UCI the shape is:
 
-- **Since [#252](https://github.com/JC-000/c64-test-harness/issues/252)
-  the costs in this list apply only where `transport.write_memory` does not
-  chunk.** That means a post-safe device, where every POST is collected, or
-  a transport other than `Ultimate64Transport`. On a leak-prone or unknown
-  grade `Ultimate64Transport.write_memory` chunks every write below at the
-  client threshold, so none of them costs an attachment. The costs are
-  kept as the record of the pre-#252 behaviour and of the blob sizes.
-- `_execute_uci_routine` writes its routine with a single
-  `transport.write_memory(code_addr, code)` (`uci_network.py:1780`). Before
-  #252 that did **not** chunk. Measured host-side by `len()` (no device
-  traffic, 2026-09-10), every command builder emits more than the C64U's
-  128-byte PUT threshold — `build_uci_command` 133, `build_get_ip` 138,
-  `build_socket_read` 149, `build_tcp_connect` / `build_udp_connect` 159,
-  `build_socket_write` 170 — so the routine write took the POST path and
-  leaked one attachment. Only `build_uci_probe` / `build_uci_status_peek`
-  (12 bytes) and `build_socket_close` (112) fit under it — those three
-  calls cost nothing. `turbo_safe=True` changes that unevenly: it pushes
-  `build_socket_close` to 341, over the threshold and onto POST, while
-  probe and peek reach only 28 and stay comfortably under it. Turbo makes
-  a free call cost one; it does not make every call cost three times as
-  much.
-- `uci_socket_write` costs a **second** attachment only when the payload
-  itself exceeds the threshold (`uci_network.py:1936-1943` writes the
-  socket-id byte, the payload and the two length bytes separately; only the
-  payload can cross). The 800/892-byte large-send tests pay two; a small
-  write pays one.
-- The three other writes `_execute_uci_routine` makes are all far under the
-  threshold and add nothing: the `CTL_ABORT` byte to `$DF1C`, the
-  `SYS<addr>\r` string (at most 10 bytes) to `$0277`, and the fill count to
-  `$00C6` (`uci_network.py:1735-1747`).
+- Every write a UCI helper makes goes through `transport.write_memory`:
+  the routine (`_execute_uci_routine`), `uci_socket_write`'s socket-id
+  byte, payload and two length bytes, the `CTL_ABORT` byte, the
+  `SYS<addr>\r` string and the `$00C6` fill count. On a leak-prone or
+  unknown grade `Ultimate64Transport.write_memory` splits each write into
+  bodyless PUTs of at most 128 bytes
+  ([#252](https://github.com/JC-000/c64-test-harness/issues/252)), so a UCI
+  call from host Python costs **zero** attachments on the C64U. On a
+  post-safe device a write above the threshold is one POST, which that
+  firmware collects.
+- The routines are mostly longer than 128 bytes (`len()` of a builder's
+  output gives the size; `turbo_safe=True` roughly triples it), so on the
+  leak-prone grade a routine upload is several PUTs with the 6510 running
+  between them. Only `build_uci_probe` / `build_uci_status_peek` (either
+  form) and `build_socket_close` without `turbo_safe` fit one PUT. The multi-block
+  read routine is 234 bytes plain and 610 turbo-safe: 2 or 5 PUTs.
+- A direct `client.write_mem` of a routine above the threshold bypasses the
+  chunking and costs one attachment per call.
 - `enable_uci` / `disable_uci` are `set_config_items` — bodyless config PUTs
   that cost nothing.
 
 **The same protocol driven C64-side costs only the upload that put it
-there.** A fetch made of many `socket_read`s is many attachments when the
-loop runs in host Python, and one attachment when the loop runs inside an
-uploaded PRG. On a leak-prone device, moving the loop onto the 6510 removes
-the leak rather than cleaning up after it, and it is the first thing to
-reach for.
+there.** A fetch made of many `socket_read`s is many round trips when the
+loop runs in host Python, and one upload when the loop runs inside an
+uploaded PRG — the only leak-free route for a caller that bypasses the
+transport, and the first thing to reach for when round trips matter.
 
 ## Turbo speed support (`turbo_safe=True`)
 
@@ -339,6 +318,7 @@ from c64_test_harness import (
     uci_probe, uci_tcp_connect, uci_socket_write,
     uci_socket_read, uci_socket_close,
 )
+from c64_test_harness import restore_speed_defaults
 from c64_test_harness.backends.ultimate64_helpers import set_turbo_mhz
 
 # Switch the U64 into 48 MHz turbo
@@ -352,8 +332,10 @@ uci_socket_write(transport, sock, b"GET / HTTP/1.0\r\n\r\n",
 data  = uci_socket_read(transport, sock, turbo_safe=True)
 uci_socket_close(transport, sock, turbo_safe=True)
 
-# Back to stock speed
-set_turbo_mhz(client, None)
+# Back to stock speed: set_turbo_mhz(client, None) writes only
+# Turbo Control = Off and leaves CPU Speed behind; restore both items
+# to the device's defaults instead.
+restore_speed_defaults(client)
 ```
 
 ### Fence tuning (advanced)

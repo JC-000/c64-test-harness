@@ -46,17 +46,13 @@ one.**
 ## One device, one lockfile: how the host string is keyed
 
 The lock is a file per device, so **which file** a host string names is
-the whole of the exclusion. Until
-[#434](https://github.com/JC-000/c64-test-harness/issues/434) that was the
-raw string with unsafe characters replaced, which meant `U64.lan`,
-`u64.lan`, `http://u64.lan/` and `u64.lan:80` took **four lockfiles for
-one device** on a case-sensitive filesystem, and three on a
-case-insensitive one such as this bench's APFS (where `U64.lan` and
-`u64.lan` name one file). Two lanes could each hold "the lock" and drive the same
-hardware, and every warning in this document would stay silent while they
-did — the failure the lock exists to prevent, produced by the lock.
+the whole of the exclusion: two spellings that reached two lockfiles would
+let two lanes each hold "the lock" on the same hardware. Keying on the raw
+string did exactly that (`U64.lan`, `http://u64.lan/` and `u64.lan:80` were
+separate lockfiles for one device) until
+[#434](https://github.com/JC-000/c64-test-harness/issues/434).
 
-The key is now `normalize_device_host()` (in `backends/device_lock.py`)
+The key is `normalize_device_host()` (in `backends/device_lock.py`)
 followed by the filename sanitiser. It folds case, surrounding
 whitespace, an `http(s)://` scheme, a trailing path, IPv6 brackets, a
 trailing dot, the `:80` default port, and the textual forms of one IP
@@ -81,21 +77,16 @@ Two things it deliberately does **not** fold:
   front of taking a lock. **So use one spelling per device**; the
   canonical spelling on this bench is the bare lowercase IP.
 
-`ultimate64_temp_gc.temp_ledger_key`, which keys the `/Temp` budget, *is*
-this same function. The two must agree: a spelling that reaches one
+`ultimate64_temp_gc.temp_ledger_key`, which keys the `/Temp` budget,
+delegates to this same function and adds nothing. The two must agree: a spelling that reaches one
 lockfile has to reach one ledger, or a lane could hold the lock under one
 spelling while another spelling spent a second `/Temp` budget on the same
 hardware.
 
-> **Upgrading across this change:** a lock held by an older process is
-> held on the **old** filename. A new-code lane normalising the same host
-> to a different name will not see it, and both will run. The window is
-> any overlap with an old-code process that is still running and uses a
-> non-canonical spelling, and it only exists for hosts whose spelling was not
-> already canonical — a bare lowercase IP or hostname, which is every
-> spelling this bench uses, keys to exactly the same file as before. If
-> you drive a device by a spelling that *does* change (mixed case, a
-> scheme, an explicit `:80`), drain the lane before upgrading it.
+A process still running pre-#434 code holds its lock on the old,
+un-normalised filename. For a bare lowercase IP or hostname (every
+spelling this bench uses) the two filenames are identical; for any other
+spelling, drain the old lane before running new code against the device.
 
 ## The rules
 
@@ -142,7 +133,7 @@ Through the manager, which locks for you:
 from c64_test_harness import create_manager
 
 with create_manager(backend="u64", lock_timeout=1800.0) as mgr:
-    with mgr.target() as target:
+    with mgr.instance() as target:
         ...
 ```
 
@@ -201,7 +192,7 @@ environment (issue #233):
 | Call | Explicit argument | `U64_DEVICE_LOCK_TIMEOUT` unset |
 |---|---|---|
 | `DeviceLock.acquire()` / `acquire_or_raise()` | `timeout=` | 30 s (`DEFAULT_ACQUIRE_TIMEOUT`) |
-| `create_manager()` / `UnifiedManager` | `lock_timeout=` | 60 s (`unified_manager.DEFAULT_LOCK_TIMEOUT`) |
+| `create_manager()` / `UnifiedManager` | `lock_timeout=` | 60 s (`backends/unified_manager.py` `DEFAULT_LOCK_TIMEOUT`) |
 
 - **An explicit argument always wins**, and when one is given the
   variable is not read at all. An explicit value is not checked against
@@ -210,8 +201,6 @@ environment (issue #233):
   less makes a single attempt.
 - **The variable is read at call time**, on every acquire. A long-lived
   manager sees a change.
-- **Neither default moved.** A caller that set nothing gets exactly what
-  it got before.
 - **Malformed, zero or negative, or non-finite is fatal**:
   `DeviceLockTimeoutConfigError`, a `ValueError`, so an `except
   TimeoutError` retry arm will not swallow a typo. It is raised before the
@@ -235,8 +224,7 @@ bound, not against one long healthy run.
 ## Seeing the wait: progress lines and `on_wait`
 
 A blocked acquire reports every 30 s, whether or not its deadline is
-being extended. Before #233 a wait behind a non-extending holder said
-nothing until it timed out. Two forms carry the same four fields:
+being extended (#233). Two forms carry the same four fields:
 
 - **A log line** from `c64_test_harness.backends.device_lock`:
   `DeviceLock <host>: still waiting after Ns; holder pid=P, lockfile
@@ -334,10 +322,9 @@ last-writer-wins slot, and unheld files are swept by unrelated acquires.
 Nothing in this package can tell you which lane held a device an hour
 ago.
 
-## Releasing the lock can now make network calls
+## Releasing the lock can make network calls
 
-Since the `/Temp` hygiene work, releasing a `DeviceLock` is no longer
-purely local. Each `Ultimate64Client` registers its device's `/Temp`
+Releasing a `DeviceLock` is not purely local. Each `Ultimate64Client` registers its device's `/Temp`
 ledger (`ultimate64_temp_gc.TempLedger.drain_on_lock_release`) through
 `device_lock.register_release_callback`. The release path fires it **while
 the flock is still held**, so the device is still exclusively ours when
@@ -398,4 +385,7 @@ run, and the run is the caller's to scope.
 
 - `docs/u64_recovery.md` — wedge tiers and what to do instead of a
   power-cycle. Read it before concluding a shared device is broken.
-- `CLAUDE.md` § "Destructive U64E endpoints and the poweroff guard".
+- [`docs/u64_recovery.md`](u64_recovery.md) § "Recovery primitives" and
+  § "The poweroff guard" — what `reset()`, `reboot()` and `recover()` do
+  and do not clear, and why `poweroff()` is irrecoverable over the
+  network.
