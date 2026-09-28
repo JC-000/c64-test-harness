@@ -5,7 +5,7 @@ This page is the detailed source of truth for setting up a `c64-test-harness` de
 Two platforms are covered:
 
 - **macOS (Homebrew)** is the primary, current path: the project's dev machine runs it.
-- **Ubuntu Desktop 25** is secondary. Its one-shot `scripts/setup-dev-env.sh` installer was **last run in April 2026, and that run failed; the fixes have not been run since**.
+- **Ubuntu 25** is secondary. Its one-shot `scripts/setup-dev-env.sh` installer **passed end to end on 2026-09-28** in a fresh Ubuntu 25.10 aarch64 VM (lima, cloud image `ubuntu-25.10-server-cloudimg-arm64` 20260703, no host mounts, port forwarding off): `verify-dev-env.sh` READY (18 ok, 0 missing), and `--smoke` passed.
 
 `scripts/verify-dev-env.sh` is the read-only diagnostic for both.
 
@@ -79,7 +79,7 @@ Steps 6-8 are needed only for the ethernet/bridge tests.
    - **One-shot:** `sudo chmod o+rw /dev/bpf*`. This resets on the next boot. It must cover more than `bpf0-3`: a root VICE takes the two lowest free nodes, and each dnsmasq DHCP rig on a shared bench holds one node permanently. Nodes above `bpf3` exist only once some root process has opened them, so re-run the `chmod` after that.
    - **Persistent:** on a fresh machine, install Wireshark and run its **ChmodBPF** helper. The project's dev machine has no ChmodBPF daemon and uses the `chmod`.
 
-   `verify-dev-env.sh` checks only that `/dev/bpf0` is readable, so a green row there does not prove the higher nodes are usable.
+   `verify-dev-env.sh` checks every existing `/dev/bpf*` node for other-rw and names each one that fails (#502). A node a root process creates later starts root-only, so a green row holds only until then.
 
 8. **Passwordless sudo for bridge lifecycle AND the VICE ethernet tests.** Two things on macOS need root and are driven non-interactively by the harness, so both need NOPASSWD sudoers entries:
 
@@ -170,7 +170,7 @@ The dev machine was not set up with it, and no macOS run of it is recorded. Its 
 ./scripts/verify-dev-env.sh --no-u64
 ```
 
-This is a **read-only diagnostic**. It never starts an emulator session. The only VICE binaries it runs are `x64sc --version` and `--help` (and `-features` as a macOS fallback), plus `c1541 --version`; each prints and exits. Besides those it runs read-only queries: `brew list --versions`, `sudo -n -l`, `ifconfig`, `git`, `python3` (the import and version checks) and, for the optional probe, `curl`. It never runs pytest, never changes network state, and never writes outside the repo, so it is safe to run while other agents hold VICE instances open. The one network access is the optional Ultimate probe, a `GET /v1/version`. It runs only when `U64_HOST` or `--u64-host` is set, and `--no-u64` skips it.
+This is a **read-only diagnostic** unless you pass `--smoke`. By default it never starts an emulator session. The only VICE binaries it runs are `x64sc --version` and `--help` (retried as `x64sc -console --help` when a display-less GTK3 build prints no options, and `-features` as a macOS fallback), plus `c1541 --version`; each prints and exits. Besides those it runs read-only queries: `brew list --versions`, `sudo -n -l`, `ifconfig`, `git`, `python3` (the import and version checks) and, for the optional probe, `curl`. It never runs pytest, never changes network state, and never writes outside the repo, so without `--smoke` it is safe to run while other agents hold VICE instances open. The one network access is the optional Ultimate probe, a `GET /v1/version`. It runs only when `U64_HOST` or `--u64-host` is set, and `--no-u64` skips it.
 
 The Python checks use the first interpreter found in this order: `$VIRTUAL_ENV`, then the canonical venv, then `<repo>/.venv`, then the system `python3`. Each row names the interpreter it used.
 
@@ -181,23 +181,25 @@ The Python checks use the first interpreter found in this order: `$VIRTUAL_ENV`,
 | Repo | Running inside a `c64-test-harness` checkout (critical); current git branch + short SHA |
 | VICE | `x64sc` on `PATH`; VICE 3.10 version (on macOS `x64sc --version` exits early, so the version comes from `brew list --versions vice`, then the Cellar path, then a `-features` probe); `-ethernetcart` / `-ethernetioif` / `-ethernetiodriver` in `--help` (the key deployability gate: distro-packaged VICE usually lacks `--enable-ethernet`); `-binarymonitor` and `-remotemonitor` in `--help`; `c1541` on `PATH` |
 | Python | `python3` ≥ 3.10, `c64_test_harness` importable, `pytest` available |
-| System tools (macOS) | `ifconfig`; `/dev/bpf0` readable; a NOPASSWD rule for each of the three `*-bridge-feth-macos.sh` scripts and for `/opt/homebrew/bin/x64sc` |
-| System tools (Linux) | `ip`, `iptables`, `/dev/net/tun`, passwordless sudo (informational) |
+| Smoke (`--smoke` only) | Launches one headless VICE through the harness launcher (`scripts/vice_smoke.py`: `ViceProcess`/`ViceConfig`, `sound=False`, `minimize=True`), writes 8 bytes at `$033C` over the binary monitor, reads them back, and stops the process it started (critical when requested). It runs with this checkout's `src/` first on `PYTHONPATH`, and the ok row names the `c64_test_harness` file that ran |
+| System tools (macOS) | `ifconfig`; every existing `/dev/bpf*` node other-rw, naming the ones that are not; a NOPASSWD rule for each of the three `*-bridge-feth-macos.sh` scripts and for `/opt/homebrew/bin/x64sc` |
+| System tools (Linux) | `ip`, `iptables`, `/dev/net/tun`, passwordless sudo (informational). The install hints for `ip`/`iptables` name the package manager found from `/etc/os-release` `ID`/`ID_LIKE`: `apt-get`, `dnf`, `pacman`, or a generic line when it is not recognised |
 | Bridge networking | macOS: `bridge10`, `feth0`, `feth1`. Linux: `br-c64`, `tap-c64-0`, `tap-c64-1` |
 | Ultimate 64 (optional) | HTTP GET `/v1/version`, only as described above |
 
-On the macOS dev machine (2026-09-28, bridge not set up, `--no-u64`) it reports `Summary: 14 ok, 3 missing, 1 skipped, 3 warn` / `Overall: READY (with optional gaps)`. The 3 missing rows are `bridge10`/`feth0`/`feth1`, and the 3 warns are the bridge-script NOPASSWD rows. The README shows the full output.
+On the macOS dev machine (2026-09-28, bridge not set up, `--no-u64`) it reports `Summary: 13 ok, 3 missing, 1 skipped, 4 warn` / `Overall: READY (with optional gaps)`. The 3 missing rows are `bridge10`/`feth0`/`feth1`. The 4 warns are the three bridge-script NOPASSWD rows and `/dev/bpf*`, which names `bpf4` as root-only while `bpf0-3` are `0606`: the case the old `/dev/bpf0`-only check reported ok (#502). The README shows the full output.
 
 ### CLI
 
 ```
-verify-dev-env.sh [--quiet] [--json] [--no-u64] [--u64-host HOST]
+verify-dev-env.sh [--quiet] [--json] [--no-u64] [--u64-host HOST] [--smoke]
 ```
 
 - `--quiet`: suppress section headers; print only failures plus the final summary
 - `--json`: emit a single JSON object (uses `python3` for clean serialization)
 - `--no-u64`: skip the Ultimate 64 probe even if `U64_HOST` is set
 - `--u64-host HOST`: override `$U64_HOST`
+- `--smoke`: also launch one headless VICE and round-trip a RAM write/read (see the Smoke row above). This is the one option that starts an emulator, so do not pass it on a host where another lane holds VICE. It picks a free port and stops only its own process.
 
 ### Exit codes
 
@@ -213,13 +215,14 @@ The critical checks are:
 - VICE presence, version, ethernet and binary monitor;
 - `c1541`;
 - Python ≥ 3.10;
-- the `c64_test_harness` import.
+- the `c64_test_harness` import;
+- the smoke round-trip, when `--smoke` is passed.
 
 Everything else is reported but does not fail the overall check: bridge, U64, system tools, NOPASSWD, the text monitor and `pytest`.
 
 ## Ubuntu 25: `scripts/setup-dev-env.sh`
 
-> **Last run April 2026, and that run failed; the fixes have not been run since.** A fresh Ubuntu 25 VM hit three failures: PEP 668, a drifted `libgtkglext1-dev` package, and the GTK3/SDL2 choice. `5242a8f` (2026-04-11) fixed them. No run of the fixed installer is recorded. The only later change was the macOS dispatch on 2026-04-19 (`b6b77e9`). Expect Ubuntu package-name drift. No destructive smoke run (launch VICE, run a test) is part of the installer. A fresh-VM run, a smoke pass, distro-aware fix hints and a `--repair` mode are tracked in [#500](https://github.com/JC-000/c64-test-harness/issues/500).
+> **Last run 2026-09-28: passed** (#500), in a fresh Ubuntu 25.10 aarch64 VM (lima, cloud image `ubuntu-25.10-server-cloudimg-arm64` 20260703, no host mounts, port forwarding off). The first run at `2654952` failed: VICE's `configure` stopped on missing flex, bison, dos2unix, xa65, libevdev and libcurl headers, and after those were added the headless GTK3 `x64sc --help` printed no options, so the probe reported "built without --enable-ethernet". With both fixed, a second fresh VM ran `--dry-run`, then the real install (`SETUP_EXIT=0`, verify READY, 18 ok, 0 missing, 1 skipped), then an idempotent re-run (every stage skipped, READY), then `verify-dev-env.sh --smoke` (READY, VICE launched, 8 bytes round-tripped, no `x64sc` left running). A server image is not Ubuntu Desktop: the desktop-only parts (a display for the GTK3 window) are not covered. The macOS branch has still not been run.
 
 On a clean Ubuntu Desktop 25 machine, one command is meant to take you from zero to "verify-dev-env.sh says READY":
 
@@ -251,14 +254,12 @@ The installer runs six stages. Every stage is **idempotent** (safe to re-run) an
 
 | # | Stage | What it does | Opt-out flag |
 |---|-------|--------------|--------------|
-| 1 | `system packages` | `sudo apt-get install` the build toolchain, the VICE build deps (SDL2, GTK3, libpcap, pulse/alsa, flac/vorbis/mpg123/lame) and the harness tooling (python3, pip, iproute2, iptables). If a bulk install fails, retries per package to report which names drifted. | `--no-system-packages` |
-| 2 | `VICE 3.10 build` | Downloads the VICE 3.10 tarball from SourceForge into `~/.cache/c64-test-harness/build/`, extracts it, and runs `./configure --enable-ethernet --enable-shared --disable-html-docs --enable-native-gtk3ui`, `make -j$(nproc)`, `sudo make install`. Skips entirely if `x64sc --version` already reports VICE 3.10 with ethernet support. Optional `--sha256 HEX` pin. | `--no-vice` |
-| 3 | `Python harness` | Creates the venv at `~/.local/share/c64-test-harness/venv` (with `--system-site-packages`) and runs `pip install -e .` into it. Skipped if the venv already exists and its `c64_test_harness` import resolves to this checkout. After success, prints the `source .../activate` command to run. | `--no-harness` |
+| 1 | `system packages` | `sudo apt-get install` the build toolchain, the tools VICE's `configure` demands (flex, bison, dos2unix, xa65), the VICE build deps (SDL2, GTK3, GLEW, libpcap, libevdev, libcurl, pulse/alsa, flac/vorbis/mpg123/lame) and the harness tooling (python3, pip, venv, iproute2, iptables). If a bulk install fails, retries per package to report which names drifted. Skipped, with a message, on a `--force`d distro whose package manager is not `apt-get`. | `--no-system-packages` |
+| 2 | `VICE 3.10 build` | Downloads the VICE 3.10 tarball from SourceForge into `~/.cache/c64-test-harness/build/`, extracts it, and runs `./configure --enable-ethernet --disable-html-docs --enable-gtk3ui`, `make -j$(nproc)`, `sudo make install`. Skips entirely if `x64sc --version` already reports VICE 3.10 and its help lists `-ethernetcart` (falling back to `x64sc -console --help` when a GTK3 build has no display). Optional `--sha256 HEX` pin. | `--no-vice` |
+| 3 | `Python harness` | Creates the venv at `~/.local/share/c64-test-harness/venv` (with `--system-site-packages`) and runs `pip install -e '.[dev]'` into it, so `pytest` is there. Skipped if the venv already exists, its `c64_test_harness` import resolves to this checkout and `pytest` imports. After success, prints the `source .../activate` command to run. | `--no-harness` |
 | 4 | `bridge networking` | Runs `sudo ./scripts/setup-bridge-tap.sh` to create `br-c64` + `tap-c64-0` + `tap-c64-1`. Skipped if all three interfaces already exist. | `--no-bridge` |
 | 5 | `Ultimate 64 probe` | Runs only if `U64_HOST` is set in env or `--u64-host HOST` is passed. `curl`s `/v1/version` and reports reachability; never a failure. | `--no-u64` |
 | 6 | `verify-dev-env.sh` | Final sanity check. The installer's exit code mirrors this: `0` READY, `1` NOT READY, `3` verify-script broken. | (always runs) |
-
-Stage 3 installs without the `dev` extra. It relies on `--system-site-packages` for `pytest`, so if the system has none, run `pip install -e '.[dev]'` in the venv.
 
 ### CLI
 
@@ -282,13 +283,13 @@ Exit code `2` means an installer error: a bad argument, an OS mismatch without `
 
 ### Recovery
 
-If a stage fails, re-run the installer. Each stage is idempotent, so it skips anything already done and picks up where it left off. If one stage is blocking progress on an unrelated concern, skip it with the matching `--no-*` flag. For example, if the VICE build is slow and you want to iterate on the harness, pass `--no-vice`.
+If a stage fails, re-run the installer. Each stage is idempotent, so it skips anything already done and picks up where it left off. That re-run is the repair mode: there is no separate `--repair`. If one stage is blocking progress on an unrelated concern, skip it with the matching `--no-*` flag. For example, if the VICE build is slow and you want to iterate on the harness, pass `--no-vice`.
 
 If `verify-dev-env.sh` reports NOT READY at the end, its own output lists exactly which checks failed plus fix hints.
 
 ## Manual setup (other Linux distros)
 
-`scripts/setup-dev-env.sh` targets Ubuntu Desktop 25 specifically. On other distros, pass `--force` to bypass the OS check (system-package names may drift), or do it by hand:
+`scripts/setup-dev-env.sh` targets Ubuntu 25 specifically. On another Debian-family distro, `--force` bypasses the OS check and stage 1 still runs `apt-get` (package names may drift). On a distro whose package manager is `dnf` or `pacman`, `--force` runs every stage except stage 1, which it skips with a message: install the equivalents of the stage 1 list first. Or do it all by hand:
 
 1. **Build VICE 3.10 from source with `--enable-ethernet`.** Distro packages generally omit the flag, so `verify-dev-env.sh` flags a packaged VICE as a critical failure. Install to `/usr/local/bin`.
 2. **Install the Python harness in editable mode into the canonical venv.** From the repo root:

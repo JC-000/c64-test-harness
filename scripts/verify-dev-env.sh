@@ -2,10 +2,15 @@
 #
 # verify-dev-env.sh — non-destructive dev environment check for c64-test-harness
 #
-# SAFETY: This script is read-only. It never launches VICE (beyond --version /
-# --help, which exit immediately), never runs pytest, never mutates network
-# state, never touches anything outside the repo and a read-only probe of the
-# Ultimate 64 REST API (only if U64_HOST is set and --no-u64 is not passed).
+# SAFETY: By default this script is read-only. It never launches VICE
+# (beyond --version / --help, which exit immediately), never runs pytest,
+# never mutates network state, never touches anything outside the repo and a
+# read-only probe of the Ultimate 64 REST API (only if U64_HOST is set and
+# --no-u64 is not passed).
+#
+# --smoke is the one opt-in exception: it launches one headless VICE through
+# the harness launcher (scripts/vice_smoke.py), writes and reads back a few
+# bytes of RAM over the binary monitor, and stops the process it started.
 #
 # Exit codes:
 #   0 — READY (all critical checks passed; optional gaps allowed)
@@ -13,13 +18,14 @@
 #   2 — script error (bad args, not in a repo, etc.)
 #
 # Usage:
-#   verify-dev-env.sh [--quiet] [--json] [--no-u64] [--u64-host HOST]
+#   verify-dev-env.sh [--quiet] [--json] [--no-u64] [--u64-host HOST] [--smoke]
 
 set -u
 
 QUIET=0
 JSON=0
 NO_U64=0
+SMOKE=0
 U64_HOST="${U64_HOST:-}"
 
 while [ $# -gt 0 ]; do
@@ -27,6 +33,7 @@ while [ $# -gt 0 ]; do
         --quiet) QUIET=1; shift ;;
         --json) JSON=1; shift ;;
         --no-u64) NO_U64=1; shift ;;
+        --smoke) SMOKE=1; shift ;;
         --u64-host)
             if [ $# -lt 2 ]; then
                 echo "error: --u64-host needs a value" >&2
@@ -43,6 +50,9 @@ Options:
   --json             Emit results as a single JSON object
   --no-u64           Skip the Ultimate 64 reachability probe
   --u64-host HOST    U64 hostname/IP to probe (overrides $U64_HOST)
+  --smoke            Also launch one headless VICE through the harness and
+                     round-trip a RAM write/read (starts an emulator; off by
+                     default)
   -h, --help         Show this help
 
 Exit codes: 0=READY, 1=NOT READY, 2=script error
@@ -244,8 +254,19 @@ check_vice() {
         fi
 
         # Help-text probes for ethernet + monitor flags
+        # A GTK3 build with no display (a server, an SSH session, a VM)
+        # exits 1 from `--help` after "cannot open display", printing no
+        # options, so a headless Linux box read as "built without
+        # --enable-ethernet" (Ubuntu 25.10 VM, 2026-09-28, #500).  `-console`
+        # -- the same pre-UI flag the harness launches with -- skips the
+        # window and prints the full list; it is tried only when the plain
+        # form advertised no -binarymonitor, so a machine whose --help
+        # already works takes the same path as before.
         local help_out
         help_out="$(x64sc --help 2>&1 || true)"
+        if ! printf '%s' "$help_out" | grep -qi -- '-binarymonitor'; then
+            help_out="$(x64sc -console --help 2>&1 || true)"
+        fi
         if printf '%s' "$help_out" | grep -qiE -- '-ethernetcart|-ethernetioif|-ethernetiodriver'; then
             record "$sec" "ethernet cart support" ok "ethernet flags found in --help" 1
         else
@@ -381,7 +402,111 @@ check_python() {
     fi
 }
 
+# ---------- Section 2b: VICE smoke (opt-in) -------------------------------
+
+check_smoke() {
+    local sec="Smoke"
+    if [ "$SMOKE" = "0" ]; then
+        return
+    fi
+    local py_bin out rc
+    py_bin="$(select_py_bin)"
+    if [ -z "$py_bin" ] || [ -z "$REPO_ROOT" ]; then
+        record "$sec" "VICE launch + memory round-trip" missing "needs python3 and the repo root" 1
+        return
+    fi
+    # $REPO_ROOT/src first: the harness venv's editable .pth points at
+    # whichever checkout ran `pip install -e`, so without this a worktree or
+    # a second checkout would smoke-test that other tree's harness (#510).
+    out="$(PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" "$py_bin" "$REPO_ROOT/scripts/vice_smoke.py" 2>&1 </dev/null)"
+    rc=$?
+    out="$(printf '%s\n' "$out" | tail -1)"
+    if [ "$rc" -eq 0 ]; then
+        record "$sec" "VICE launch + memory round-trip" ok "${out#ok: }" 1
+    else
+        record "$sec" "VICE launch + memory round-trip" missing "${out#fail: }" 1
+        add_hint "The --smoke launch failed: run $py_bin $REPO_ROOT/scripts/vice_smoke.py for the error"
+    fi
+}
+
 # ---------- Section 3: System tools ---------------------------------------
+
+# Package manager for fix hints (#500): brew on macOS, else the family
+# named by ID / ID_LIKE in os-release (C64H_OS_RELEASE overrides the path,
+# for tests/test_verify_dev_env_checks.py).  Prints apt-get, dnf, pacman,
+# brew, or nothing when the distro is not recognised.
+detect_pkg_manager() {
+    if [ "$(uname)" = "Darwin" ]; then
+        printf 'brew'
+        return
+    fi
+    local f="${C64H_OS_RELEASE:-/etc/os-release}" ids
+    [ -r "$f" ] || return 0
+    ids="$(. "$f" 2>/dev/null; printf '%s %s' "${ID:-}" "${ID_LIKE:-}")"
+    case " $ids " in
+        *" debian "*|*" ubuntu "*) printf 'apt-get' ;;
+        *" fedora "*|*" rhel "*|*" centos "*) printf 'dnf' ;;
+        *" arch "*) printf 'pacman' ;;
+    esac
+}
+
+# pkg_install_cmd <debian-package-name>: the install command for this
+# distro, with the package renamed where the families disagree.
+pkg_install_cmd() {
+    local pkg="$1" mgr
+    mgr="$(detect_pkg_manager)"
+    case "$mgr:$pkg" in
+        dnf:iproute2) pkg=iproute ;;
+    esac
+    case "$mgr" in
+        apt-get) printf 'sudo apt-get install -y %s' "$pkg" ;;
+        dnf)     printf 'sudo dnf install -y %s' "$pkg" ;;
+        pacman)  printf 'sudo pacman -S --needed %s' "$pkg" ;;
+        brew)    printf 'brew install %s' "$pkg" ;;
+        *)       printf "install the package that provides '%s' with your distro's package manager" "$pkg" ;;
+    esac
+}
+
+# ---------- BPF node check (begin) ----------------------------------------
+#
+# macOS host-side capture opens /dev/bpfN directly, and so do the ethernet
+# TX/RX tests, so every node they might be handed must be other-rw.  A
+# root VICE takes the two lowest free nodes and each dnsmasq DHCP rig on
+# the bench holds one permanently, so the node the harness actually gets
+# is often bpf4 or higher -- and a node a root process creates later
+# starts out root-only (`chmod o+rw /dev/bpf*` covers only the nodes that
+# exist when it runs).  Checking /dev/bpf0 alone reported ok while bpf4
+# was root-only (#502), so every existing node is checked and the failing
+# ones are named.  C64H_DEV_DIR (default /dev) exists for
+# tests/test_verify_dev_env_checks.py; the modes come from `ls -ld`, whose
+# first ten columns are the same on BSD and GNU ls.
+check_bpf_nodes() {
+    local sec="$1"
+    local dev_dir="${C64H_DEV_DIR:-/dev}"
+    local node mode name
+    local total=0 bad="" good=""
+    for node in "$dev_dir"/bpf[0-9]*; do
+        [ -e "$node" ] || continue
+        total=$((total + 1))
+        name="${node##*/}"
+        mode="$(ls -ld "$node" 2>/dev/null | awk '{print $1}')"
+        # Characters 8 and 9 of the mode string are other-read, other-write.
+        if [ "${mode:7:2}" = "rw" ]; then
+            good="${good:+$good }$name"
+        else
+            bad="${bad:+$bad }$name"
+        fi
+    done
+    if [ "$total" -eq 0 ]; then
+        record "$sec" "/dev/bpf* other-rw" missing "no /dev/bpf* device" 0
+    elif [ -z "$bad" ]; then
+        record "$sec" "/dev/bpf* other-rw" ok "all $total nodes other-rw ($good); a node a root process creates later starts root-only" 0
+    else
+        record "$sec" "/dev/bpf* other-rw" warn "not other-rw: $bad (host-side packet capture and the ethernet TX/RX tests fail on any node they are handed that is root-only; VICE's pcap driver needs root regardless)" 0
+        add_hint "Make every /dev/bpf* node other-rw: sudo chmod o+rw /dev/bpf* (lasts until reboot, and covers only nodes that exist -- re-run it after a root process creates bpf4+) or install Wireshark's ChmodBPF (permanent)"
+    fi
+}
+# ---------- BPF node check (end) ------------------------------------------
 
 check_system() {
     local sec="System tools"
@@ -395,28 +520,19 @@ check_system() {
         else
             record "$sec" "ifconfig command" missing "ifconfig not found (macOS base tool)" 0
         fi
-        if [ -c /dev/bpf0 ]; then
-            if [ -r /dev/bpf0 ]; then
-                record "$sec" "/dev/bpf0 readable" ok "BPF devices user-readable (pcap ready)" 0
-            else
-                record "$sec" "/dev/bpf0 readable" warn "BPF devices are root-only (host-side packet capture and the ethernet TX/RX tests need sudo chmod o+rw /dev/bpf* or Wireshark's ChmodBPF helper; VICE's pcap driver needs root regardless)" 0
-                add_hint "Make /dev/bpf* user-readable: sudo chmod o+rw /dev/bpf* (session; re-run once a root process has created bpf4+) or install Wireshark's ChmodBPF (permanent)"
-            fi
-        else
-            record "$sec" "/dev/bpf0 readable" missing "no /dev/bpf* device" 0
-        fi
+        check_bpf_nodes "$sec"
     else
         if have_cmd ip; then
             record "$sec" "ip command" ok "$(command -v ip)" 0
         else
             record "$sec" "ip command" missing "iproute2 not installed" 0
-            add_hint "Install iproute2 (Ubuntu: sudo apt-get install iproute2)"
+            add_hint "Install iproute2: $(pkg_install_cmd iproute2)"
         fi
         if have_cmd iptables; then
             record "$sec" "iptables command" ok "$(command -v iptables)" 0
         else
             record "$sec" "iptables command" missing "iptables not installed" 0
-            add_hint "Install iptables (Ubuntu: sudo apt-get install iptables)"
+            add_hint "Install iptables: $(pkg_install_cmd iptables)"
         fi
         if [ -c /dev/net/tun ]; then
             record "$sec" "/dev/net/tun" ok "present" 0
@@ -616,6 +732,7 @@ check_repo() {
 check_repo
 check_vice
 check_python
+check_smoke
 check_system
 check_bridge
 check_u64
@@ -683,6 +800,7 @@ def to_bool(rows_):
 out = {
     "vice": to_bool(by_section("VICE")),
     "python": to_bool(by_section("Python")),
+    "smoke": to_bool(by_section("Smoke")),
     "system": to_bool(by_section("System tools")),
     "bridge": to_bool(by_section("Bridge networking")),
     "u64": {
