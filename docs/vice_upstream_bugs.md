@@ -368,14 +368,21 @@ failure time, and use a fresh VICE per trial — a probe that reuses one
 VICE is one trial.
 
 **Harness mitigation: detection, not recovery.** We cannot fix VICE.
-`_machine_failure_report` in `tests/test_vice_core.py` samples the jiffy
-clock (`$A0-$A2`) and the PC across acknowledged resumes
-(`_emulator_is_stalled`) and checks for a queued `0x61`, so a stall says
-so instead of timing out on a screen assertion. The raster is reported
-but does not decide: sampled through the monitor on a healthy running
-machine it reads `LIN=12` every time with `CYC` 0-2, identical across
-all four samples in 2 of 60 trials, while the jiffy clock advanced across
-every resume in 70 of 70 (#504, VICE 3.10, 2026-09-28). "No progress" also covers a running loop with IRQs masked (the jiffy clock stops and the frame-phase halt can read one PC every time), so it is evidence for this bug only alongside a PC that is not such a loop and no `0x61`. Deliberately **not** auto-restarted: a harness
+`_machine_failure_report` in `tests/test_vice_core.py` classifies the
+machine across acknowledged resumes (`_machine_progress`, #504) and names
+exactly one cause. The jiffy clock (`$A0-$A2`) or the PC moving means
+running. If neither moves, CIA1 Timer A (`$DC04`) decides whether the
+machine is clocked at all: frozen means VICE stopped emulating (this
+bug); moving means a jammed 6510 (a KIL byte at the PC, or a `0x61`
+queued while sampling) or, with no jam, code spinning with IRQs masked.
+The raster is reported but decides nothing: sampled through the monitor
+it reads `LIN=12` every time with `CYC` 0-2. Measured on VICE 3.10
+(2026-09-28, n=8 per arm, warp on and off): Timer A moved in every trial
+of BASIC idle, `SEI; JMP *`, a 9-cycle `SEI` loop and a KIL jam alike,
+and the classifier returned running / masked spin / masked spin / jammed
+8/8 each. The stopped-emulator verdict rests on the fake plus that
+measurement; this bug has not yet been caught live with Timer A sampled.
+Deliberately **not** auto-restarted: a harness
 that silently rebuilds a stalled emulator converts a reproducible
 upstream bug into an invisible one.
 

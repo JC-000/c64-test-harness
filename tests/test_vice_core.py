@@ -16,6 +16,7 @@ operations so BASIC can process keystrokes and update the screen.
 
 from __future__ import annotations
 
+import enum
 import time
 
 import pytest
@@ -109,73 +110,149 @@ def _wait_for_text_binary(transport, needle, timeout=15.0, poll_interval=1.0):
             pass
 
 
-def _emulator_is_stalled(
+class MachineState(enum.Enum):
+    """What :func:`_machine_progress` concluded; exactly one cause each."""
+
+    #: The jiffy clock or the PC moved across an acknowledged resume.
+    RUNNING = "running"
+    #: Nothing moved, CIA1 Timer A included: VICE stopped emulating while
+    #: its monitor kept acknowledging resumes (upstream bug 6).
+    EMULATOR_STOPPED = "emulator stopped"
+    #: Timer A moved, so the machine is emulating, and the 6510 is on a
+    #: KIL opcode or VICE queued a ``0x61`` JAM event during the sampling.
+    JAMMED = "jammed"
+    #: Timer A moved and there is no jam: code spinning with IRQs masked,
+    #: which freezes the jiffy clock and can read one PC every time.
+    MASKED_SPIN = "masked spin"
+
+
+#: The 6510's KIL/JAM opcodes (one per ``x2`` column that is not LDX #).
+_KIL_OPCODES = frozenset(
+    {0x02, 0x12, 0x22, 0x32, 0x42, 0x52, 0x62, 0x72, 0x92, 0xB2, 0xD2, 0xF2}
+)
+_RESPONSE_JAM = 0x61
+
+
+def _machine_progress(
     transport, samples: int = 4
-) -> tuple[bool | None, list[str]]:
-    """Whether the machine made no progress across acknowledged resumes.
+) -> tuple[MachineState | None, list[str]]:
+    """Classify the machine from samples taken across acknowledged resumes.
 
-    Progress is the KERNAL jiffy clock (``$A0-$A2``) or the PC changing
-    between two reads that an acknowledged ``resume()`` separates.  The
-    raster is reported but never decides: the binary monitor services
-    commands once per frame from its vsync hook, so a running machine is
-    always halted at the same frame phase.  Measured here (VICE 3.10,
-    2026-09-28, this function's exact read/resume/sleep(0.1) cycle, BASIC
-    idle, 4 samples per trial): ``LIN`` read 12 in every sample and
-    ``CYC`` only 0-2 (instruction-boundary jitter, not motion), so all
-    four raster reads matched in 2 of 60 healthy trials under warp; the
-    PC matched in all four in 3 of 60 (the idle loop is eight bytes).
-    The jiffy clock advanced across every resume in 60/60 (warp) and
-    10/10 (no warp) trials.  With the 6510 jammed on a KIL under the
-    harness's ``-jamaction 0`` pin, jiffy and PC never moved (0/80 trials),
-    while ``CYC`` still changed in 2 of them (each the first trial after
-    the jam).
+    Each sample reads the PC, the KERNAL jiffy clock (``$A0-$A2``), CIA1
+    Timer A (``$DC04-$DC05``, a side-effect-free host peek) and, for the
+    record only, the raster.  Verdicts, in order:
 
-    So ``True`` means "no progress seen", which has three causes:
-    upstream bug 6 (docs/vice_upstream_bugs.md -- VICE stops emulating
-    under host load while its monitor answers and acknowledges every
-    resume), a jammed 6510, or code spinning with IRQs masked.  The last
-    is a running machine this sampler cannot see move: masked IRQs freeze
-    the jiffy clock, and the monitor halts at a fixed frame phase, so a
-    loop whose period divides the frame reads the same PC every time
-    (``SEI; JMP *`` and a 9-cycle ``SEI; INC; JMP`` loop both returned
-    ``True`` 8/8, warp on and off).  The JAM-event line of
-    :func:`_machine_failure_report` identifies a jam.  CIA1 Timer A
-    (``$DC04``) was measured as a clock independent of the I flag and
-    rejected: it advanced in every trial of every arm, the KIL jam
-    included (8/8 each, warp on and off), because a jammed 6510 still
-    clocks the machine; it therefore cannot separate a jam from a spin.
+    * :attr:`MachineState.RUNNING` -- the jiffy clock or the PC changed
+      between two reads an acknowledged ``resume()`` separates.
+    * ``None`` -- inconclusive: no comparison completed (fewer than two
+      readable samples, or a resume failed before the second read).  A run
+      cut short after one or more comparisons is judged on those.
+    * :attr:`MachineState.EMULATOR_STOPPED` -- Timer A did not change
+      either: nothing in the machine is being clocked.  Upstream bug 6.
+    * :attr:`MachineState.JAMMED` -- Timer A changed, and the byte at the
+      PC is a KIL opcode or a ``0x61`` JAM event was queued at or after
+      the resume generation this call started at.
+    * :attr:`MachineState.MASKED_SPIN` -- Timer A changed, no jam.
 
-    ``False`` means a change was seen.  ``None`` means inconclusive: no
-    comparison completed, because fewer than two samples were readable or
-    a resume failed before the second read.  A comparison counts only
-    when the resume before it returned; a run cut short after one or more
-    comparisons is judged on those.
+    Why these signals (VICE 3.10, 2026-09-28, 4 samples per trial, n=8
+    per arm unless stated, warp on and off).  The binary monitor services
+    commands once per frame from its vsync hook, so every read halts the
+    machine at the same frame phase: ``LIN`` read 12 in every sample and
+    ``CYC`` only 0-2, so the raster matched in all four reads in 2 of 60
+    healthy trials and cannot decide anything.  On BASIC idle the jiffy
+    clock advanced across every resume (80/80).  ``SEI; JMP *`` and a
+    9-cycle ``SEI; INC $C100; JMP`` loop froze both the jiffy clock and
+    the PC, exactly like a KIL jam -- but Timer A changed across every
+    resume in all three, the jam included, because a jammed 6510 still
+    clocks the machine.  So Timer A separates "VICE stopped" from
+    "something is spinning", and the jam evidence separates a jam from a
+    spin.  TOD never ran (the KERNAL does not start it).  VICE queued one
+    ``0x61`` when the 6510 hit the KIL and none on the resumes after it,
+    so a jam older than this call is recognised by the KIL byte at the PC;
+    the event only counts for a jam that happens while sampling.  Live,
+    this function returned RUNNING for BASIC idle and ``CLI; JMP *``,
+    MASKED_SPIN for both SEI loops and JAMMED for the KIL, 8/8 per arm,
+    warp on and off.
+
+    Limits: a program that stops Timer A, or banks I/O out of the CPU's
+    view (the peek goes through the CPU bank), reads as EMULATOR_STOPPED
+    while running.  EMULATOR_STOPPED itself is the fake's behaviour plus
+    the measured fact that Timer A moves whenever VICE emulates; the live
+    bug-6 stall has not been sampled with Timer A.
     """
     seen: list[str] = []
+    start_gen = getattr(transport, "_resume_generation", 0)
     prev: tuple[int, bytes] | None = None
+    timers: set[bytes] = set()
+    last_pc = -1
     compared = 0
     for _ in range(samples):
         try:
             r = transport.read_registers()
             jiffy = bytes(transport.read_memory(0x00A0, 3))
+            timer_a = bytes(transport.read_memory(0xDC04, 2))
         except Exception:
             break
-        cur = (r.get("PC", -1), jiffy)
+        last_pc = r.get("PC", -1)
+        cur = (last_pc, jiffy)
         seen.append(
-            f"PC={cur[0]:#06x} jiffy={int.from_bytes(jiffy, 'big')} "
+            f"PC={last_pc:#06x} jiffy={int.from_bytes(jiffy, 'big')} "
+            f"TA={int.from_bytes(timer_a, 'little')} "
             f"LIN={r.get('LIN', -1)} CYC={r.get('CYC', -1)}"
         )
+        timers.add(timer_a)
         if prev is not None:
             compared += 1
             if cur != prev:
-                return False, seen
+                return MachineState.RUNNING, seen
         try:
             transport.resume()
         except Exception:
             break
         prev = cur
         time.sleep(0.1)
-    return (True if compared > 0 else None), seen
+    if compared == 0:
+        return None, seen
+    if len(timers) == 1:
+        return MachineState.EMULATOR_STOPPED, seen
+    jam_events = [
+        gen for gen, resp in getattr(transport, "_event_queue", ())
+        if resp.response_type == _RESPONSE_JAM and gen >= start_gen
+    ]
+    on_kil = False
+    if 0 <= last_pc <= 0xFFFF:
+        try:
+            on_kil = transport.read_memory(last_pc, 1)[0] in _KIL_OPCODES
+        except Exception:
+            pass
+    if jam_events or on_kil:
+        seen.append(
+            f"jam evidence: {len(jam_events)} 0x61 event(s) since generation "
+            f"{start_gen}; opcode at PC is KIL: {on_kil}"
+        )
+        return MachineState.JAMMED, seen
+    return MachineState.MASKED_SPIN, seen
+
+
+#: The report's one-line reading of each :func:`_machine_progress` verdict.
+_PROGRESS_VERDICTS: dict[MachineState | None, str] = {
+    None: "(inconclusive: no two samples across an acknowledged resume)",
+    MachineState.RUNNING: "(running: the jiffy clock or the PC moved)",
+    MachineState.EMULATOR_STOPPED: (
+        "<- EMULATOR STOPPED: PC, jiffy clock and CIA1 Timer A all frozen "
+        "across acknowledged resumes -- VICE is not emulating (upstream "
+        "bug 6)."
+    ),
+    MachineState.JAMMED: (
+        "<- JAMMED: the machine is clocked (Timer A moves) but the 6510 "
+        "sits on a KIL opcode or VICE queued a 0x61 JAM event."
+    ),
+    MachineState.MASKED_SPIN: (
+        "<- SPINNING WITH IRQs MASKED: the machine is clocked (Timer A "
+        "moves) and not jammed, but the jiffy clock and PC are frozen -- "
+        "code looping under SEI, not a VICE fault."
+    ),
+}
 
 
 def _stub_was_executed(transport, samples: int = 4) -> tuple[bool, list[int]]:
@@ -231,16 +308,10 @@ def _machine_failure_report(transport, needle: str) -> str:
     # stopped emulating, the PC, the screen and the checkpoints are all
     # just the last state the machine was left in.
     try:
-        stalled, seen = _emulator_is_stalled(transport)
+        state, seen = _machine_progress(transport)
         lines.append(
-            f"PC and jiffy clock across acknowledged resumes: {seen}"
-            + ("  (inconclusive: no two samples across an acknowledged "
-               "resume)" if stalled is None else
-               "  <- NO PROGRESS SEEN: VICE stopped emulating (upstream "
-               "bug 6), the 6510 jammed (see the JAM line below), or code "
-               "is spinning with IRQs masked, which this sampler cannot "
-               "see move." if stalled else
-               "  (progressing: the machine runs when resumed)")
+            f"machine across acknowledged resumes: {seen}  "
+            + _PROGRESS_VERDICTS[state]
         )
     except Exception as e:
         lines.append(f"could not sample the raster: {type(e).__name__}: {e}")
