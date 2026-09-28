@@ -42,11 +42,11 @@ The Homebrew bottle already carries ethernet support, so you do not need a sourc
 - `sudo chmod o+rw /dev/bpf*` gives host-side capture access to the BPF nodes. The change is lost on reboot, and it must also cover `bpf4` and up on a machine where other rigs hold BPF nodes.
 - A NOPASSWD sudoers drop-in for the three bridge scripts and for `/opt/homebrew/bin/x64sc`. On macOS, VICE's pcap driver needs **root**, and the harness launches it with `sudo -n`. Without the entry, an ethernet launch is refused up front with `ViceElevationRequiredError`, which prints the exact sudoers line to add.
 
-`scripts/setup-dev-env.sh` also has a macOS branch (`brew install vice`, the venv, the feth bridge), added 2026-04-19. The setup above is the one in use, not that script. The script builds the venv from whichever `python3` is first on `PATH`, so check that it is ≥ 3.10 before relying on it.
+`scripts/setup-dev-env.sh` also has a macOS branch (`brew install vice`, the venv, the feth bridge), added 2026-04-19. No run of that branch is recorded. The setup above is the one in use, not that script. The script builds the venv from whichever `python3` is first on `PATH`, so check that it is ≥ 3.10 before relying on it.
 
-### Ubuntu 25: secondary, last verified April 2026
+### Ubuntu 25: secondary, last run April 2026 (failed; fixes not run since)
 
-> **Not re-verified since April 2026.** The installer's Linux path was last changed on 2026-04-11 (`5242a8f`, fixes for three failures seen on a fresh Ubuntu 25 VM). The only change since was the macOS dispatch on 2026-04-19. No Linux run of it is recorded after that, so expect package-name drift.
+> **Last run April 2026, and that run failed.** A fresh Ubuntu 25 VM hit three failures, which `5242a8f` (2026-04-11) fixed. No run of the fixed installer is recorded. The only later change was the macOS dispatch on 2026-04-19. Treat this path as unverified and expect package-name drift ([#500](https://github.com/JC-000/c64-test-harness/issues/500)).
 
 ```bash
 ./scripts/setup-dev-env.sh --dry-run   # preview every action; changes nothing
@@ -89,7 +89,7 @@ Summary: 14 ok, 3 missing, 1 skipped, 3 warn
 Overall: READY (with optional gaps)
 ```
 
-The `--version broken` note is expected: the Homebrew build's `x64sc --version` exits early, so the script falls back to Homebrew's metadata. The reported harness version comes from the installed package metadata, so it lags `pyproject.toml` until you re-run `pip install -e .`.
+The `--version broken` note is expected: the Homebrew build's `x64sc --version` exits early, so the script falls back to Homebrew's metadata. The harness version is read from the installed package metadata. This sample's `0.11.3` came from a venv installed before the current `0.12.4` in `pyproject.toml`, and it needs `pip install -e .` again to report the right number.
 
 The VICE checks are **critical**, so a hardware-only machine without VICE reports NOT READY even though the Ultimate backend works. Options: `--quiet`, `--json`, `--no-u64`, `--u64-host HOST`. Exit codes: `0` READY, `1` NOT READY, `2` script error. Details are in [docs/development.md](docs/development.md#quick-check-scriptsverify-dev-envsh).
 
@@ -165,7 +165,7 @@ Hardware reading, in order:
 - **Queue-aware device locking:** `DeviceLock` serializes access to a shared device across processes. It heartbeats while held, so a waiter queued behind a live, progressing holder keeps waiting instead of timing out. A chain of holders handing the lock on is capped (`_MAX_HOLDER_HANDOFFS`). `acquire_or_raise()` raises `DeviceLockTimeout`, whose message says whether you are queued, the holder looks wedged, or the lock is stale. `U64_DEVICE_LOCK_TIMEOUT` is a wait budget, not a gate. The optional `c64-test-harness[notify]` extra adds `watchdog`-based wakeups. Full contract in [docs/device_locking.md](docs/device_locking.md).
 - **Known state on entry:** `apply_factory_baseline()` resets the covered config categories to the firmware's defaults and asserts `current == default`. The manager runs it at `acquire()` on a U64E ([below](#unified-backend-manager)).
 - **Automatic `/Temp` hygiene on leak-prone firmware** (C64 Ultimate 1.1.0; any Ultimate-line < 3.15):
-  - The client counts attachment-creating requests against a per-device budget and runs an FTP-based GC when the budget is reached, on `close()`, and on `DeviceLock` release.
+  - The client counts attachment-creating requests against a budget (per device, within a process; #433) and runs an FTP-based GC when the budget is reached, on `close()`, and on `DeviceLock` release.
   - It refuses further body-carrying calls if the GC cannot run.
   - The pass is prevention only. Once the firmware has crashed, FTP is gone too, and only a physical power-cycle recovers the device.
   - It stays disarmed on firmware that collects its own attachments (Ultimate-line ≥ 3.15).
@@ -182,7 +182,11 @@ Hardware reading, in order:
 - **UCI networking:** TCP/UDP sockets from C64 code through the firmware's lwIP stack ([below](#uci-networking-ultimate-command-interface)).
 - **SocketDMA client:** `SocketDMAClient` on TCP 64 wraps capabilities REST does not expose: `inject_keys`, `reu_write`, `dma_load` / `dma_jump` / `dma_write`, `reset`, plus a UDP identify broadcast for LAN device discovery. The transport's SocketDMA *write fast path* is disabled pending a stability review ([below](#socketdma-write-fast-path)).
 - **Syslog listener:** `U64SyslogListener` (`backends.u64_syslog`) consumes the firmware's UDP 514 raw-line syslog and offers `wait_for(predicate)` for assertion-driven tests.
-- **Recovery:** `recover()` (`backends.ultimate64_helpers`) escalates reset → probe → `reboot()` → probe to clear CPU/FPGA/REU stuck states, and never calls `poweroff()`. `runner_health_check()` raises `Ultimate64RunnerStuckError` on the firmware's "Cannot open file" wedged-runner signature. See [docs/u64_recovery.md](docs/u64_recovery.md).
+- **Recovery:** `recover()` (`backends.ultimate64_helpers`) escalates reset → probe → `reboot()` → probe to clear CPU and REU/DMA stuck states, and never calls `poweroff()`. `runner_health_check()` raises `Ultimate64RunnerStuckError` on the firmware's "Cannot open file" wedged-runner signature. See [docs/u64_recovery.md](docs/u64_recovery.md).
+- **`poweroff()` is guarded:**
+  - `Ultimate64Client.poweroff()` raises `Ultimate64UnsafeOperationError` (from `backends.ultimate64_client`) unless it is called with `confirm_irrecoverable=True`.
+  - After a power-off the device drops off the network, and only a physical power-cycle brings it back.
+  - Use `reboot()` to recover a stuck device.
 
 ## Quick Start
 
@@ -1116,7 +1120,7 @@ Additional scripts in `scripts/`:
 | `scripts/bridge_ping_demo.py` | Visible two-VICE bridge ping demo (RR-Net, live on-screen counters; supports `--warp` via host-side wall-clock orchestrators) |
 | `scripts/verify_tod_warp.py` | Empirical CIA TOD behavior probe in normal vs warp mode (regression check for the wall-clock timeout design) |
 | `scripts/verify-dev-env.sh` | Non-destructive dev environment check (VICE build flags, Python harness, bridge interfaces, optional U64 probe) |
-| `scripts/setup-dev-env.sh` | Fresh-machine installer. On Ubuntu 25: apt packages, VICE 3.10 source build, harness venv, bridge setup, final verify run. It also has a macOS/Homebrew branch. Idempotent, `--dry-run` safe, and not re-verified since April 2026 (see [Getting started](#getting-started)) |
+| `scripts/setup-dev-env.sh` | Fresh-machine installer. On Ubuntu 25: apt packages, VICE 3.10 source build, harness venv, bridge setup, final verify run. It also has a macOS/Homebrew branch, with no recorded run. Idempotent and `--dry-run` safe. The Ubuntu path was last run April 2026 (failed; fixes not run since; see [Getting started](#getting-started), #500) |
 | `scripts/install-skill.sh` | Symlink the `c64-test` Claude Code skill into `~/.claude/skills/` (`--dry-run`, `--uninstall`) |
 | `scripts/gen_memory_table.py` | Regenerate / check (`--write` / `--check`) the scratch-address table in `docs/memory_safety.md` from `HARNESS_SCRATCH` |
 

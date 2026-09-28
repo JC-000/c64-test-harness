@@ -5,7 +5,7 @@ This page is the detailed source of truth for setting up a `c64-test-harness` de
 Two platforms are covered:
 
 - **macOS (Homebrew)** is the primary, current path: the project's dev machine runs it.
-- **Ubuntu Desktop 25** is secondary. Its one-shot `scripts/setup-dev-env.sh` installer has **not been re-verified since April 2026**.
+- **Ubuntu Desktop 25** is secondary. Its one-shot `scripts/setup-dev-env.sh` installer was **last run in April 2026, and that run failed; the fixes have not been run since**.
 
 `scripts/verify-dev-env.sh` is the read-only diagnostic for both.
 
@@ -170,7 +170,7 @@ The dev machine was not set up with it, and no macOS run of it is recorded. Its 
 ./scripts/verify-dev-env.sh --no-u64
 ```
 
-This is a **read-only diagnostic**. It never starts an emulator session. The only binaries it runs are `x64sc --version` and `--help` (and `-features` as a macOS fallback), plus `c1541 --version`; each prints and exits. It never runs pytest, never changes network state, and never writes outside the repo, so it is safe to run while other agents hold VICE instances open. The one network access is the optional Ultimate probe, a `GET /v1/version`. It runs only when `U64_HOST` or `--u64-host` is set, and `--no-u64` skips it.
+This is a **read-only diagnostic**. It never starts an emulator session. The only VICE binaries it runs are `x64sc --version` and `--help` (and `-features` as a macOS fallback), plus `c1541 --version`; each prints and exits. Besides those it runs read-only queries: `brew list --versions`, `sudo -n -l`, `ifconfig`, `git`, `python3` (the import and version checks) and, for the optional probe, `curl`. It never runs pytest, never changes network state, and never writes outside the repo, so it is safe to run while other agents hold VICE instances open. The one network access is the optional Ultimate probe, a `GET /v1/version`. It runs only when `U64_HOST` or `--u64-host` is set, and `--no-u64` skips it.
 
 The Python checks use the first interpreter found in this order: `$VIRTUAL_ENV`, then the canonical venv, then `<repo>/.venv`, then the system `python3`. Each row names the interpreter it used.
 
@@ -219,7 +219,7 @@ Everything else is reported but does not fail the overall check: bridge, U64, sy
 
 ## Ubuntu 25: `scripts/setup-dev-env.sh`
 
-> **Last verified April 2026; not re-verified since.** The Linux path of the installer was last changed on 2026-04-11 in `5242a8f`. That commit fixed three failures seen on a fresh Ubuntu 25 VM: PEP 668, a drifted `libgtkglext1-dev` package, and the GTK3/SDL2 choice. The only later change was the macOS dispatch on 2026-04-19 (`b6b77e9`). No Linux run is recorded after these, and no run of the fixed version is recorded either. Expect Ubuntu package-name drift. No destructive smoke run (launch VICE, run a test) is part of the installer.
+> **Last run April 2026, and that run failed; the fixes have not been run since.** A fresh Ubuntu 25 VM hit three failures: PEP 668, a drifted `libgtkglext1-dev` package, and the GTK3/SDL2 choice. `5242a8f` (2026-04-11) fixed them. No run of the fixed installer is recorded. The only later change was the macOS dispatch on 2026-04-19 (`b6b77e9`). Expect Ubuntu package-name drift. No destructive smoke run (launch VICE, run a test) is part of the installer. A fresh-VM run, a smoke pass, distro-aware fix hints and a `--repair` mode are tracked in [#500](https://github.com/JC-000/c64-test-harness/issues/500).
 
 On a clean Ubuntu Desktop 25 machine, one command is meant to take you from zero to "verify-dev-env.sh says READY":
 
@@ -365,13 +365,13 @@ per refused store:
   calls `dhcp_stop()` → `dhcp_release_and_stop`
   (`lwip/src/core/ipv4/dhcp.c:1325-1390`): DHCP_RELEASE goes out and
   `netif_set_addr(netif, IP4_ADDR_ANY4, ...)` zeroes the address the REST
-  request arrived on. The 3.15-line guard that makes this a live no-op arrived
-  **post-tag** in `6b5ffc21` and exists only in the `v3.15-8x` fork line this
-  bench flashed onto the U64E. Since 2026-09-15 the device reports `bce4535e`
-  (v3.15-132), which does not descend from v3.15-85, and whether that build
-  carries `6b5ffc21` is not recorded — upstream and the C64U's 1.1.0 line call `dhcp_stop()`
-  unconditionally, so the no-op holds for exactly one device here and must never
-  be generalised. On a statically addressed device the same path takes the
+  request arrived on. The guard that makes this a live no-op is `6b5ffc21`
+  (upstream #805). It was merged post-tag to the test-merge line and is in no
+  release. Both U64E builds this bench has run carry it: it is an ancestor of
+  `7f6fcb51` (v3.15-85) and of `bce4535e` (v3.15-132, reported since 2026-09-15).
+  The C64U's 1.1.0 is not a descendant, and there `dhcp_stop()` runs
+  unconditionally. So the no-op holds for the U64E only, and it must never be
+  generalised to a firmware line. On a statically addressed device the same path takes the
   `else` branch, which is why **tests must never configure a static address**.
 - **`Network Settings`** — the reset blanks the Network Password and the syslog
   server, restores the hostname to the product default, and **re-enables** every
@@ -397,7 +397,8 @@ pattern match. `apply_factory_baseline()` resets per category over
 `ValueError` before a single request goes out, asserts per item that the reset
 took (`U64BaselineError` if it did not), logs pre-existing drift at INFO rather
 than failing on it, and accepts `exempt=[(category, item)]` for
-detection-derived values inside a covered store. Which stores a device
+detection-derived values inside a covered store. Exempt items are listed under
+`report.detection_derived` and are never compared or PUT. Which stores a device
 generation lists, and how many items each has (device-read on the U64E,
 source-derived only on the C64U), is recorded in
 `BASELINE_RECORDED_CATEGORY_SETS` in the same module — cite that table by name
@@ -418,7 +419,8 @@ refusal in `_build_u64_manager`; pinned by
 resolves the reset from the device's generation at `acquire()` — on for the
 U64E, off for the C64U, off for an unreadable generation — so a U64E lane gets a
 reconciled device without passing anything, and `U64_BASELINE_ON_ENTRY` is the
-override in both directions. The gate table's entry below spells out the
+override in both directions. Opting a C64U in makes the manager log a WARNING
+naming the WiFi device-loss risk at every acquire. The gate table's entry below spells out the
 precedence.
 
 The worked fixture, and the rest of the contract, are in the `c64-test` skill:
