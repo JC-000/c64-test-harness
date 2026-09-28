@@ -554,8 +554,10 @@ class Ultimate64Client:
         * if it leaked nothing, the device's ``/Temp`` is still swept for
           attachments an earlier lane left behind (issue #264) -- but only
           when this process holds the device's ``DeviceLock``, since that
-          sweep deletes other lanes' files, and a failed one never enables
-          FTP File Service and never blocks this client.
+          sweep deletes other lanes' files. A failed one enables no FTP File
+          Service and sets no block. This client's next attachment-creating
+          request still sweeps first, though, and is refused if that sweep
+          fails too (#511).
 
         See :attr:`temp_hygiene_armed` and :meth:`_drain_temp_attachments`.
         """
@@ -674,8 +676,9 @@ class Ultimate64Client:
         exactly which requests a call makes). Deferring costs one thing,
         bounded and harmless: on a slow-probed device the *first*
         attachment-creating call is decided on the stale unknown grade.
-        It is still counted, and the second call arms — well inside a
-        budget of 6.
+        It is still counted, without the handover sweep an armed client
+        would have run first (#511). The second call arms and sweeps at
+        handover before it sends.
 
         ``write_mem_query_threshold`` is deliberately *not* recomputed. It
         was fixed at construction and callers may have reasoned about it;
@@ -1072,6 +1075,14 @@ class Ultimate64Client:
     def _before_temp_attachment(self, operation: str, count: int = 1) -> None:
         """Refuse or make room before *count* attachment-creating requests.
 
+        **Handover first** (#511): if the device's ledger has not swept
+        ``/Temp`` since this process last took the device's ``DeviceLock``
+        (or ever), a hygiene pass runs before anything is counted. If FTP
+        refuses, it makes the process's one attempt at enabling FTP File
+        Service and retries (owner decision 2026-09-28). If it still fails,
+        this request is refused and so is every later one until a sweep
+        succeeds.
+
         *count* > 1 reserves an operation's whole cost up front, so a
         multi-POST operation is never refused half-way through (see
         :meth:`liveness_probe`, whose second POST restores RAM).
@@ -1098,6 +1109,24 @@ class Ultimate64Client:
         if self._temp_hygiene_blocked is not None:
             self._refuse_or_warn(operation)
             return
+        if self._leak_prone_grade():
+            if not self._temp_lock_held():
+                # Only lock holders are in the device queue, so an unlocked
+                # process neither sweeps other lanes' /Temp nor writes config:
+                # it is refused (#513 review; CLAUDE.md rule 4).
+                self._refuse_unlocked(operation)
+                return
+            if self._temp_ledger.handover_sweep_due():
+                # The device queue has advanced to this process (or this
+                # process has never swept it): what other lanes left in /Temp
+                # is unknown, so sweep before spending anything, and fail
+                # closed (#511).
+                self._run_temp_hygiene(
+                    f"device handover, before {operation}", handover=True
+                )
+                if self._temp_hygiene_blocked is not None:
+                    self._refuse_or_warn(operation)
+                    return
         # The device's count, not this client's (#295). Callers hold the
         # ledger lock: go through _reserve_temp_attachments.
         pending = self._temp_ledger.pending
@@ -1107,6 +1136,51 @@ class Ultimate64Client:
             )
             if self._temp_hygiene_blocked is not None:
                 self._refuse_or_warn(operation)
+
+    def _leak_prone_grade(self) -> bool:
+        """The cached grade does not say post-safe (no I/O).
+
+        ``None`` (never probed, e.g. forced armed with ``temp_hygiene=True``)
+        counts as leak-prone, which is the conservative reading. Gates the
+        handover sweep, its FTP-enable and the lock requirement, so that
+        ``U64_AUTO_TEMP_GC=1`` on a post-safe device changes none of them
+        (#513 review, finding 2).
+        """
+        caps = self.cached_capabilities
+        return caps is None or caps.runner_wedge_possible is not False
+
+    def _refuse_unlocked(self, operation: str) -> None:
+        """Always raises: ``U64_TEMP_GC_REQUIRED=0`` does **not** lift this.
+
+        That variable downgrades the "hygiene impossible" refusal only
+        (#513 re-verify, finding 1): letting it lift this one let an unlocked
+        process upload without any sweep at all. ``temp_hygiene=False`` is
+        the one explicit disarm.
+        """
+        message = (
+            f"refusing {operation} on {self.host}: this device's firmware leaks "
+            "a /Temp attachment for every request that carries a body, and "
+            "this process does not hold its DeviceLock. The harness sweeps "
+            "/Temp (and may enable FTP File Service) only for the process "
+            "whose turn it is in the device queue. Hold the DeviceLock -- "
+            "create_manager(backend=\"u64\"), DeviceLock(host), or "
+            "scripts/_u64_host.py hold_device_lock(host) -- for the whole run. "
+            "U64_TEMP_GC_REQUIRED=0 does not lift this refusal; pass "
+            "temp_hygiene=False to disarm the pass deliberately. See "
+            "docs/device_locking.md."
+        )
+        raise Ultimate64TempHygieneError(message)
+
+    def _temp_lock_held(self) -> bool:
+        from . import ultimate64_temp_gc as _gc
+
+        return _gc.lock_held_for(self._device_key)
+
+    def _sweep_keep(self) -> int:
+        from .ultimate64_temp_gc import sweep_keep as _sweep_keep
+
+        with self._temp_ledger.lock:
+            return _sweep_keep(self._temp_ledger)
 
     def _refuse_or_warn(self, operation: str) -> None:
         from .ultimate64_temp_gc import hygiene_required as _hygiene_required
@@ -1133,7 +1207,7 @@ class Ultimate64Client:
             raise Ultimate64TempHygieneError(message)
         _log.warning("U64_TEMP_GC_REQUIRED=0: proceeding anyway. %s", message)
 
-    def _run_temp_hygiene(self, reason: str) -> bool:
+    def _run_temp_hygiene(self, reason: str, *, handover: bool = False) -> bool:
         """Run one hygiene pass; ``True`` if ``/Temp`` was collected.
 
         Never raises. On failure it makes exactly one attempt per device per
@@ -1151,34 +1225,51 @@ class Ultimate64Client:
         the entry-baseline reset never resets or asserts those stores -- and
         says nothing about this pass, which may write exactly one item,
         ``Network Settings > FTP File Service``, once per device per process,
-        only for a client holding an uncollected leak **of its own**
-        (``_own_pending_temp_attachments() > 0``) and only after its sweep
-        failed.  A client that leaked nothing never writes config by either
-        route: :meth:`_sweep_inherited_temp` writes none on the drain path,
-        and the gate above withholds it on the budget path, which a client
-        whose own share is zero can reach because the budget counts the
-        *device* (#295).
+        and only after its sweep failed, for one of two callers: a client
+        holding an uncollected leak **of its own**
+        (``_own_pending_temp_attachments() > 0``), or the **handover sweep**
+        before a process's first upload (*handover*; owner decision
+        2026-09-28, #511), unless ``U64_TEMP_GC_REQUIRED=0``.  Otherwise a
+        client that leaked nothing writes no config:
+        :meth:`_sweep_inherited_temp` writes none on the drain path, and
+        the gate withholds it on the budget path, which a client whose own
+        share is zero can reach because the budget counts the *device*
+        (#295).
         """
         self._in_temp_hygiene = True
         try:
             _log.debug("U64 /Temp hygiene on %s: %s", self.host, reason)
-            result = self.gc_temp_folder()
+            result = self.gc_temp_folder(keep=self._sweep_keep())
             if getattr(result, "ok", False):
                 # Only a successful sweep zeroes the device's count (#295).
                 self._temp_ledger.collected()
                 return True
 
             first_error = getattr(result, "error", None)
-            # Only a client holding an uncollected leak of its own may make
-            # this config write (#263). The budget gate fires on the
+            # Two callers may make this config write: a client holding an
+            # uncollected leak of its own (#263), and the handover sweep
+            # (below). Otherwise the answer is no. The budget gate fires on the
             # *device's* count (#295), so a client whose own share is zero
             # can reach this pass having leaked nothing -- for example when
             # another client, or a temp_hygiene=False one, spent the budget.
             # Such a client still sweeps, and still blocks the device on
             # failure; it just writes no config.
+            # Owner decision 2026-09-28 (#511): the handover sweep may make
+            # the same one attempt, so a C64U with FTP File Service off
+            # (the 1.1.0 default) is enabled and swept rather than refused.
+            # Still once per device per process, never on a grade that is
+            # post-safe (not even when U64_AUTO_TEMP_GC=1 forces the pass
+            # on: #513 review, finding 2), and at handover not under
+            # U64_TEMP_GC_REQUIRED=0, which opts out of enforcement.
+            from .ultimate64_temp_gc import hygiene_required as _hygiene_required
+
             if (
                 not self._ftp_enable_attempted
-                and self._own_pending_temp_attachments() > 0
+                and self._leak_prone_grade()
+                and (
+                    self._own_pending_temp_attachments() > 0
+                    or (handover and _hygiene_required())
+                )
             ):
                 self._ftp_enable_attempted = True
                 # WARNING, not INFO: this mutates the device's config and
@@ -1204,7 +1295,7 @@ class Ultimate64Client:
                         self.host, type(exc).__name__, exc,
                     )
                 else:
-                    result = self.gc_temp_folder()
+                    result = self.gc_temp_folder(keep=self._sweep_keep())
                     if getattr(result, "ok", False):
                         self._temp_ledger.collected()
                         return True
@@ -1273,9 +1364,11 @@ class Ultimate64Client:
           process holds the lock); and a lane that made only bodyless calls
           must not write ``Network Settings > FTP File Service`` (a
           BASELINE_NEVER_TOUCH store that persists until a firmware
-          power-on) or be refused for a failure it did not cause. So a
-          failed inherited sweep logs a WARNING naming the manual remedy,
-          enables nothing and blocks nothing.
+          power-on). So a failed inherited sweep logs a WARNING naming the
+          manual remedy, enables nothing and sets no block. It does not
+          count as a sweep, though: the next attachment-creating request
+          from this process sweeps first and is refused if that fails
+          (#511), so bodyless work carries on and uploads do not.
 
         What keeps a fake host off FTP is arming (a never-answered probe
         stays disarmed), not the counter.
@@ -1294,6 +1387,20 @@ class Ultimate64Client:
                     # ever completed a request, fake hosts included.
                     self._maybe_reprobe_capabilities()
                 if not self.temp_hygiene_armed:
+                    return False
+                if (
+                    not under_lock
+                    and self._leak_prone_grade()
+                    and not self._temp_lock_held()
+                ):
+                    # Only a lock holder sweeps or writes config on a
+                    # leak-prone grade (#513): a close() after the lock is
+                    # gone leaves /Temp to the next holder's handover sweep.
+                    _log.debug(
+                        "U64 /Temp drain on %s (%s): this process does not hold "
+                        "the device lock; not sweeping",
+                        self.host, reason,
+                    )
                     return False
                 if leaked:
                     self._run_temp_hygiene(reason)
@@ -1324,7 +1431,7 @@ class Ultimate64Client:
         self._in_temp_hygiene = True
         try:
             _log.debug("U64 /Temp inherited sweep on %s: %s", self.host, reason)
-            result = self.gc_temp_folder()
+            result = self.gc_temp_folder(keep=self._sweep_keep())
         finally:
             self._in_temp_hygiene = False
         if getattr(result, "ok", False):
@@ -1335,12 +1442,13 @@ class Ultimate64Client:
             return
         _log.warning(
             "U64 /Temp inherited sweep on %s failed (%s). This client leaked "
-            "nothing, so the harness neither enables Network Settings > FTP "
-            "File Service on its behalf (issue #263) nor refuses its requests; "
-            "but /Temp may still hold attachments an earlier lane left behind. "
-            "Before uploading to this device, enable FTP File Service manually "
-            "(it persists until a firmware power-on) or have it power-cycled. "
-            "See docs/u64_recovery.md.",
+            "nothing, so the harness does not enable Network Settings > FTP "
+            "File Service on its behalf (issue #263). /Temp may still hold "
+            "attachments an earlier lane left behind, so this process's next "
+            "upload sweeps first and is refused if that fails too (#511). "
+            "To clear it, enable FTP File Service manually (it persists until "
+            "a firmware power-on) or have the device power-cycled. See "
+            "docs/u64_recovery.md.",
             self.host, getattr(result, "error", None) or "unknown FTP failure",
         )
 

@@ -330,3 +330,13 @@ def test_summary_mentions_a_dirty_span():
         scratch_restored=True,
     )
     assert "$0334" not in clean.summary
+
+
+@pytest.fixture(autouse=True)
+def _empty_temp_over_ftp(monkeypatch):
+    """#511: the free probe sweeps ``/Temp`` before its first POST on a
+    leak-prone or unknown grade; answer with an empty ``/Temp`` rather than
+    dial the fake host's FTP port."""
+    import fake_temp_ftp
+
+    fake_temp_ftp.install(monkeypatch)

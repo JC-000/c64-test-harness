@@ -46,17 +46,24 @@ When you write a test that can point at the C64U:
 
 - **Do not hand-roll cleanup.** `/Temp` hygiene belongs in the harness,
   below your test, and it is there (PR #259): on leak-prone
-  firmware `Ultimate64Client` arms a hygiene pass by itself, spends a
-  budget of 6 attachment-creating requests **per device** (shared by every
-  client in the process, #295) before sweeping, and drains on `close()`
-  and on `DeviceLock` release — a client that leaked drains its own; one
-  that leaked nothing sweeps inherited `/Temp` only while holding the
-  device's lock (#264). **It can also refuse** — once a leaking client's
-  pass has proven impossible (FTP down), every later attachment-creating
-  request raises `Ultimate64TempHygieneError` (import it from
+  firmware `Ultimate64Client` arms a hygiene pass by itself. It sweeps
+  `/Temp` before the first attachment-creating request after this process
+  takes the device's `DeviceLock` (or ever), and again before each one once
+  an attachment is pending (budget 1 **per device**, shared by every client
+  in the process; keep 1; mounted images kept; #295, #511). It also drains
+  on `close()` and on `DeviceLock` release: a client that leaked drains its
+  own, and one that leaked nothing sweeps inherited `/Temp` only while
+  holding the device's lock (#264). A handover sweep that finds FTP off
+  makes one attempt per process at enabling FTP File Service, then
+  retries (owner decision 2026-09-28). **It can also refuse.** Once a sweep
+  it needed has failed (FTP down), or when this process does not hold the
+  device's `DeviceLock` at all (#513), every later attachment-creating
+  request raises `Ultimate64TempHygieneError`, before sending anything, until a
+  sweep succeeds (import it from
   `backends.ultimate64_client`; it is not a package-root export) rather
   than walking the device toward the wedge; `U64_TEMP_GC_REQUIRED=0`
-  downgrades that to a WARNING and `temp_hygiene=False` disarms the pass.
+  downgrades a failed-sweep refusal to a WARNING (never the unlocked
+  refusal) and `temp_hygiene=False` disarms the pass.
   A client constructed with an explicit `write_mem_query_threshold=` never
   probes and so is **silently unarmed**.
   So if your test needs a manual GC call to be safe, the guard is missing

@@ -123,88 +123,82 @@ FTP_PASSWORD_ENV = "U64_TEMP_GC_FTP_PASSWORD"
 #: mounted disk images that also live in /Temp must never match.
 _MANAGED_ATTACHMENT_RE = re.compile(r"^temp([0-9a-fA-F]+)$")
 
-DEFAULT_KEEP = 2
+#: How many of the youngest managed attachments a sweep leaves in place.
+#:
+#: **1**, from the firmware source (issue #511; 1541ultimate tag ``1.1.0``,
+#: the C64U's firmware). No uploaded file is held open once its request has
+#: returned. ``TempfileWriter::collect`` closes the file on ``eDataEnd`` /
+#: ``eTerminate`` *before* it calls the route handler
+#: (``software/api/attachment_writer.h``). Every handler then reads the file
+#: synchronously and closes it before it answers:
+#:
+#: * the runners: ``route_runners.cc`` -> ``FileTypePRG::start_prg``
+#:   (``filetype_prg.cc:198-202``) -> ``C64_DMA_LOAD``, which does
+#:   ``fopen`` / ``dma_load`` / ``fclose`` (``c64_subsys.cc:367-375``);
+#:   ``load_crt`` and ``FileTypeSID::play_file`` also load and return;
+#: * ``machine:writemem`` (``route_machine.cc:125-160``, ``load_file``);
+#: * ``configs`` (``route_configs.cc``, ``buffer_file``);
+#: * ``drives:load_rom``: ``C1541::load_dos_from_file`` (``load_file``).
+#:
+#: The youngest file is in use only **while its own request is still
+#: streaming**: ``collect`` creates it with ``FA_CREATE_ALWAYS`` on
+#: ``eDataStart``, from a counter that only goes up, so an in-flight upload
+#: is always the youngest managed name. Keeping one covers a single
+#: concurrent upload the ``DeviceLock`` cannot see (another thread of this
+#: process, or an unlocked neighbour). The one file held open *after* its
+#: request is a **mounted disk image**. ``C1541::executeCommand`` opens it
+#: ``FA_READ | FA_WRITE`` and keeps it as ``mount_file`` until the next
+#: mount, ``remove`` or ``unlink`` on that drive (``c1541.cc`` around
+#: 1020-1030 and ``remove_disk`` around 420-430). That is at most one per
+#: drive, and it need not be the youngest. The ``GET /v1/drives`` exclusion
+#: in :func:`gc_temp_folder` (#418) covers it, not this count. So the
+#: owner's "only the most recent file gets a lock" (2026-09-28) holds for an
+#: in-flight upload. It does not hold for a mounted image.
+DEFAULT_KEEP = 1
 
-#: How many attachment-creating requests one client may issue before the
-#: next one triggers a hygiene pass.
+#: How many attachment-creating requests may go out to one device before
+#: the next one triggers a hygiene pass: **1** (issue #511). Once one
+#: attachment is pending, every further attachment-creating request sweeps
+#: first. With :data:`DEFAULT_KEEP` = 1 that holds a device's resident
+#: managed files at **2**: the kept youngest plus the one just sent, not
+#: counting mounted images.
 #:
-#: Upstream is the only firm bound: the firmware's own post-#686 collector
-#: keeps at most **10** managed files
-#: (``software/filemanager/filemanager.cc``: ``kManagedTempMaxFiles``),
-#: which is upstream's own statement of a safe resident count. The
-#: firmware that needs this pass does not enforce it -- that is the whole
-#: point -- but it is upstream's judgement about the same folder on the
-#: same device family, and it needs no conditions attached.
-#:
-#: Nothing bounds it from the other side. The owner's account
+#: The source (see :data:`DEFAULT_KEEP`) gives no reason to let more pile
+#: up. A file nobody holds is garbage the moment its request returns. And
+#: nobody knows how many a device survives. The owner's account
 #: (2026-09-15) is that attachments fill ``/Temp`` and a full ``/Temp``
-#: crashes the firmware; nobody knows how many uploads that takes, the
-#: earlier guessed wedge count is retired, and none is kept here. The RAM
-#: disk is 16 MiB (``ramdisk.cc`` computes
-#: ``__ram_disk_limit - __ram_disk_start``; cite that computation, not the
-#: stale "3 * 1024 * 1024" comment beside it -- issue #261; per-tree values
-#: in the module docstring: the nios2 BSP at v3.14d for the U64E, u64ii at
-#: 1.1.0 for the C64U), but that size is not a count of uploads either.
+#: crashes the firmware. The earlier guessed wedge count is retired and none
+#: is kept here. The RAM disk is 16 MiB: ``ramdisk.cc`` computes
+#: ``__ram_disk_limit - __ram_disk_start``, and the "3 * 1024 * 1024"
+#: comment beside it is stale (issue #261). But that size is not a count of
+#: uploads either. Do not try to establish one experimentally: the
+#: experiment is "upload until the firmware crashes", on hardware nobody can
+#: power-cycle remotely.
 #:
-#: On a crashed machine the C64 FPGA keeps running while the device
-#: firmware is dead: it stops answering the network *and* stops responding
-#: to the physical menu button. Why a full ``/Temp`` does that is
-#: **not established** (the pre-fix ``attachment_writer``
-#: created ``/Temp/temp%04x`` from a static counter and never deleted
-#: them, but ``TempfileWriter``'s destructor does free the ``strdup``'d
-#: names and the buffers, so a naive per-request heap-leak story does not
-#: hold on its face; heap fragmentation, per-entry allocation in
-#: directory traversal and FileManager bookkeeping growth are all
-#: candidates, none run down). Do not claim a cause.
+#: **Cost:** each upload after the first in a hold is preceded by one FTP
+#: session (connect, login, ``CWD /Temp``, ``NLST``, ``QUIT``). From the
+#: third upload on, that session also sends one ``DELE`` and one bodyless
+#: ``GET /v1/drives`` (the mounted-image probe, sent only when something
+#: would be deleted). None of it costs a ``/Temp`` attachment. The first
+#: upload after the process takes the device is preceded by the handover
+#: sweep instead (:meth:`TempLedger.handover_sweep_due`), so every upload
+#: to a leak-prone device follows a sweep.
 #:
-#: Since the trigger threshold is not established, the budget is a choice
-#: about **which error to make**: 6, with :data:`DEFAULT_KEEP` = 2, holds
-#: the steady state at 8 resident attachments -- inside upstream's own
-#: notion of safe -- at the cost of an occasional FTP pass nobody needed.
+#: **A reservation larger than the budget still goes through whole** when
+#: nothing is pending (``Ultimate64Client._before_temp_attachment``), so
+#: ``liveness_probe``'s two POSTs (rule 3a) are not made impossible. They
+#: follow a sweep, and the next attachment-creating request sweeps them.
+#: Resident managed files peak at 3 during a probe.
 #:
-#: Consumer call counts bound it from below, and show a low budget costs
-#: normal consumers nothing (recounted across all six consumer lanes,
-#: 2026-09-10; reported, not verified here). Ordinary runner-verb
-#: consumers issue **1-2** leaking POSTs per run across ~14 call sites and
-#: one host-Python UCI driver reaches 4-8, so at 6 the pass never fires
-#: for any of them. The case this exists for is a **17**-call
-#: ``ALL_SPEEDS`` sweep (``bench_p256_u64.py`` / ``bench_p384_u64.py``,
-#: one ``run_prg`` per speed), which is pure runner verbs -- it cannot be
-#: moved off POST by chunking or by driving the protocol C64-side, so
-#: hygiene is its only available fix, and it would otherwise accumulate
-#: 17 attachments in a single invocation. At 6 the pass fires on that
-#: run's 7th and 13th calls, holding resident attachments at budget +
-#: keep = 8. A budget of 10 or more would let that sweep run to
-#: completion with nothing having happened, which is why this is low
-#: rather than generous. (Lanes doing hundreds of raw ``write_memory``
-#: calls exist. Since #294 the transport splits those into PUT-sized pieces
-#: on any grade that is not post-safe, so they cost nothing there; a loop of
-#: large direct ``client.write_mem`` calls is still a lane bug to fix, not a
-#: count to size against.)
-#:
-#: Note the unit: this counts *attachments*, not logical operations, and
-#: most generated code blobs exceed the 128-byte PUT ceiling
-#: (``build_socket_write`` is 170 bytes, payload-independent;
-#: ``turbo_safe=True`` roughly triples every builder). What that costs
-#: depends on the grade since #294: ``transport.write_memory`` -- which
-#: carries every UCI routine and payload -- splits a large write into
-#: PUT-sized pieces unless the cached grade says ``writemem_post_safe is
-#: True``. So on a leak-prone or unknown grade (the C64U) a UCI socket write
-#: costs no attachment at all. On a post-safe grade the routine, and a
-#: payload over the ceiling, are one POST each, which that firmware
-#: collects. A direct ``client.write_mem`` call above the threshold still
-#: POSTs on any grade, as do the runner and mount uploads. ``enable_uci`` /
-#: ``disable_uci`` are bodyless config writes and cost nothing. Counting
-#: at the request layer gets all of that right for free without anyone
-#: maintaining a table; see ``docs/u64_recovery.md``.
-#:
-#: Do not try to establish the trigger threshold experimentally: the
-#: experiment is "upload until the firmware crashes", on hardware nobody
-#: can power-cycle remotely. It becomes safely measurable only with
-#: someone physically present.
+#: The unit is *attachments*, counted at the request layer: a body-carrying
+#: ``POST``. ``transport.write_memory`` splits large writes into PUTs on any
+#: grade that is not post-safe (#294), so UCI routines and payloads cost
+#: nothing on the C64U. A direct ``client.write_mem`` above the threshold,
+#: the runner verbs and the multipart mount/ROM uploads still POST; see
+#: ``docs/u64_recovery.md``.
 #:
 #: Override with :data:`BUDGET_ENV` or the client's ``temp_gc_budget=``.
-DEFAULT_LEAK_BUDGET = 6
+DEFAULT_LEAK_BUDGET = 1
 
 #: The device's REST port (``Ultimate64Client``'s ``port`` default). A
 #: ``host:80`` spelling names the same device as a bare ``host``, so
@@ -274,19 +268,16 @@ class TempGCResult:
     #: Disjoint from ``kept``, which is the keep-count's own survivors.
     mounted_excluded: list[str] = field(default_factory=list)
     #: Why the mounted-image listing could not be read, if it could not.
-    #: **Not** a failed hygiene pass: the sweep still ran (see
-    #: :func:`gc_temp_folder`), so this never clears :attr:`ok`.
+    #: When it is set, the sweep deleted nothing and :attr:`error` is set
+    #: too, so the pass has failed (#513 review, finding 4).
     mounted_probe_error: str | None = None
 
     @property
     def ok(self) -> bool:
-        """True when the pass ran without an FTP/network failure (skips still count as ok).
+        """True when the pass ran without a failure (skips still count as ok).
 
-        A :attr:`mounted_probe_error` does not clear this. The drives
-        listing only narrows what the sweep may delete; failing to read
-        it leaves the sweep exactly as protective of the *device* as it
-        was before #418, and treating that as a failed pass would block
-        the hygiene the wedge clause depends on.
+        An unreadable drives listing is a failure: the sweep then deletes
+        nothing and sets :attr:`error` (#513 review, finding 4).
         """
         return self.error is None
 
@@ -390,30 +381,26 @@ class TempLedger:
     pass, so concurrent clients of one device take turns rather than both
     sweeping, and the count never rises above the budget between them.
 
-    **In-process only; across processes the bound is the lock** (owner
-    decision 2026-09-22 on #433: accept and document).  Two processes
-    against one device keep two ledgers and each spends its own budget, so
-    the worst peak before a sweep is ``budget x processes``. What covers the
-    hand-off between processes is the lock-release drain
-    (:meth:`drain_on_lock_release`), which runs while the releasing process
-    still holds the device's ``DeviceLock``, plus the inherited sweep (#264)
-    by which the next lane collects what it found. **Neither bounds two
-    processes uploading concurrently** -- with the lock held as intended
-    that does not happen, because the uploads are destructive and the lock
-    is how lanes take turns, but the lock is advisory
-    (``docs/device_locking.md``) and ``run_u64_parallel_locked.py``
-    interleaves tests from several processes on one device, releasing
-    between tests.  So the cross-process bound is the ``DeviceLock``
-    serialising uploads plus the lock-release sweep, and while sweeps
-    succeed the residual is a process that uploads without holding the lock.
-    **That bound needs working sweeps.**  The refusal state (:attr:`blocked`)
-    also lives in this per-process ledger, so it does not outlive the
-    process: when the FTP GC keeps failing (as on a C64U with FTP File
-    Service off), every new process starts unblocked with a fresh budget,
-    spends up to ``budget`` attachments, and is only then blocked by its own
-    failed pass -- the device accumulates ``budget`` more per process, lock
-    held or not (source-read, not measured).  Counting in the lockfile
-    or on the device was declined in the same decision.
+    **Across processes: a sweep at every handover, failing closed** (#511,
+    replacing the accept-and-document outcome of #433). Each process keeps
+    its own ledger, so the refusal a failed pass sets (:attr:`blocked`)
+    lives in process memory. Before #511 a new process against a device
+    whose FTP sweep was failing therefore spent a fresh budget before it
+    found that out. Now a ledger records the ``DeviceLock`` acquire epoch of
+    its last successful sweep (:attr:`swept_epoch`). A ledger that has never
+    swept, or whose process has taken the device's lock since, is
+    :meth:`handover_sweep_due`. An armed client then sweeps before its first
+    attachment-creating request. If FTP refuses, it makes this ledger's one
+    FTP-enable attempt (:attr:`ftp_enable_attempted`; owner decision
+    2026-09-28) and retries. If the sweep still fails, the request is
+    refused before anything is sent. So no process spends anything on a device it
+    could not clean first. That includes each test of a
+    ``run_u64_parallel_locked.py`` run, which takes and releases the lock
+    per test. The lock-release drain
+    (:meth:`drain_on_lock_release`) still hands the device on clean. The
+    residual is two processes uploading concurrently without the lock (it is
+    advisory; ``docs/device_locking.md``). There the bound is
+    :data:`DEFAULT_LEAK_BUDGET` per process after each one's own sweep.
     """
 
     def __init__(self, key: str) -> None:
@@ -449,6 +436,11 @@ class TempLedger:
         #: How many of :attr:`in_flight` an **armed** client reserved, so the
         #: carry-over can restore :attr:`armed_pending` truthfully.
         self.in_flight_armed = 0
+        #: The ``DeviceLock`` acquire epoch at the last successful sweep
+        #: (:func:`~c64_test_harness.backends.device_lock.acquire_epoch`),
+        #: or ``None`` if this process has never swept the device. See
+        #: :meth:`handover_sweep_due` (#511).
+        self.swept_epoch: int | None = None
         self._clients: weakref.WeakSet = weakref.WeakSet()
 
     def attach(self, client: object) -> None:
@@ -484,6 +476,28 @@ class TempLedger:
             return None
         return lambda: _default_mounted_probe(host, port=port, password=password)
 
+    def current_epoch(self) -> int:
+        """This process's acquire epoch for the device (``0`` without a lock
+        module, or before the first acquire)."""
+        try:
+            from .device_lock import acquire_epoch
+        except ImportError:  # pragma: no cover - only without fcntl
+            return 0
+        return acquire_epoch(self.key)
+
+    def handover_sweep_due(self) -> bool:
+        """Whether ``/Temp`` must be swept before the next attachment (#511).
+
+        True for a ledger that has never swept the device (a new process,
+        with or without the lock) and after every outermost ``DeviceLock``
+        acquire since the last successful sweep: the device queue has
+        advanced, so what other lanes left in ``/Temp`` is unknown. A
+        successful sweep of any kind (handover, budget, drain) clears it
+        for the current epoch.
+        """
+        with self.lock:
+            return self.swept_epoch != self.current_epoch()
+
     def collected(self) -> None:
         """A sweep succeeded: only still-in-flight reservations stay pending.
 
@@ -497,6 +511,7 @@ class TempLedger:
         with self.lock:
             self.pending = self.in_flight
             self.blocked = None
+            self.swept_epoch = self.current_epoch()
             self.armed_pending = self.in_flight_armed > 0
             self.generation += 1
 
@@ -569,7 +584,11 @@ class TempLedger:
             if not (self.pending > 0 and self.armed_pending and self.host):
                 return False
             try:
-                result = gc_temp_folder(self.host, mounted_probe=self.mounted_probe())
+                result = gc_temp_folder(
+                    self.host,
+                    keep=sweep_keep(self),
+                    mounted_probe=self.mounted_probe(),
+                )
             except Exception as exc:  # noqa: BLE001 - a release must never fail
                 result = TempGCResult(host=self.host, error=f"{type(exc).__name__}: {exc}")
             if result.ok:
@@ -629,6 +648,39 @@ def _reset_temp_ledgers() -> None:
     """
     with _TEMP_LEDGERS_GUARD:
         _TEMP_LEDGERS.clear()
+
+
+def lock_held_for(host: str) -> bool:
+    """Whether this process holds *host*'s ``DeviceLock`` (any lock dir).
+
+    The ``/Temp`` handover gate (#511) sweeps, and may write config, only
+    for a process that is in the device's queue. That means one holding the
+    lock: supervisor ruling on the #513 review, following the owner's "when
+    the device queue advances to the next user" and CLAUDE.md rule 4.
+    ``False`` without ``device_lock`` (no fcntl), so the gate refuses.
+    """
+    try:
+        from .device_lock import held_by_this_process_in_any_dir
+    except ImportError:  # pragma: no cover - only without fcntl
+        return False
+    return held_by_this_process_in_any_dir(host)
+
+
+def sweep_keep(ledger: "TempLedger") -> int:
+    """The keep-count for a sweep of *ledger*'s device (#513 review, finding 1).
+
+    At least ``DEFAULT_KEEP`` (or ``$U64_TEMP_GC_KEEP``) plus one per
+    attachment this process still has **in flight**. Those are the youngest
+    names on the device (the firmware's counter only goes up), and one still
+    streaming is an open file. At 1.1.0, FatFS is built with
+    ``FF_FS_LOCK 0`` (``software/chan_fat/full/ffconf.h:265``), and
+    ``FileManager::delete_file_impl`` (``filemanager.cc:508``) does not check
+    for open files, so an FTP ``DELE`` of an open file is not refused (read
+    from source). Call with ``ledger.lock`` held so the in-flight count cannot
+    move under the sweep.
+    """
+    base = _int_env(KEEP_ENV, DEFAULT_KEEP)
+    return max(base, DEFAULT_KEEP + max(0, ledger.in_flight))
 
 
 def _split_by_keep(names: list[str], keep: int) -> tuple[list[str], list[str]]:
@@ -760,13 +812,14 @@ def gc_temp_folder(
         login, or delete failure is captured in ``.error`` and logged at
         INFO/WARNING; the caller's run must never fail on hygiene.
 
-    **A probe failure is not a failed hygiene pass.** If the listing
-    cannot be read, the sweep proceeds on the keep-count alone and
-    records why in ``.mounted_probe_error``, leaving ``.ok`` true. The
-    alternative -- skipping the sweep -- would trade a recoverable data
-    hazard (a deleted image that can be re-uploaded) for the
-    unrecoverable one this module exists to prevent: a ``/Temp`` that
-    fills and crashes the firmware, which no remote instrument can undo.
+    **A probe failure is a failed pass, and deletes nothing** (#513 review,
+    finding 4). Without the listing, the keep-count alone could delete a
+    mounted image that is not the youngest. Its drive holds it open, and at
+    1.1.0 FatFS does not refuse deleting an open file (``FF_FS_LOCK 0``).
+    So the result carries ``.mounted_probe_error`` and ``.error``, and the
+    caller's refusal applies. The pass was previously treated as ok; that
+    traded a delete of an open file for the chance to keep sweeping, and
+    the harness now prefers to stop uploading instead.
     """
     resolved_port = port if port is not None else DEFAULT_FTP_PORT
     resolved_user = username if username is not None else os.environ.get(FTP_USER_ENV, DEFAULT_FTP_USER)
@@ -808,9 +861,19 @@ def gc_temp_folder(
                     probe_error = f"{type(exc).__name__}: {exc}"
                     _log.warning(
                         "gc_temp_folder: could not read the mounted-image listing on %s "
-                        "(%s); sweeping on the keep-count alone. A managed name another "
-                        "client mounted from a raw upload could be deleted (#418).",
+                        "(%s); deleting nothing. A mounted image that is not the "
+                        "youngest is held open by its drive and could otherwise be "
+                        "deleted (#418, #513 review).",
                         host, probe_error,
+                    )
+                    return TempGCResult(
+                        host=host,
+                        kept=list(managed_names),
+                        mounted_probe_error=probe_error,
+                        error=(
+                            f"mounted-image listing unreadable ({probe_error}); "
+                            "deleted nothing"
+                        ),
                     )
                 else:
                     survivors = []

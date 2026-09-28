@@ -77,11 +77,12 @@ Two things it deliberately does **not** fold:
   front of taking a lock. **So use one spelling per device**; the
   canonical spelling on this bench is the bare lowercase IP.
 
-`ultimate64_temp_gc.temp_ledger_key`, which keys the `/Temp` budget,
+`ultimate64_temp_gc.temp_ledger_key`, which keys the `/Temp` ledger,
 delegates to this same function and adds nothing. The two must agree: a spelling that reaches one
 lockfile has to reach one ledger, or a lane could hold the lock under one
 spelling while another spelling spent a second `/Temp` budget on the same
-hardware.
+hardware, or swept at a handover that the other spelling's lock never
+signalled.
 
 A process still running pre-#434 code holds its lock on the old,
 un-normalised filename. For a bare lowercase IP or hostname (every
@@ -322,7 +323,27 @@ last-writer-wins slot, and unheld files are swept by unrelated acquires.
 Nothing in this package can tell you which lane held a device an hour
 ago.
 
-## Releasing the lock can make network calls
+## Taking and releasing the lock both matter to `/Temp`
+
+**Acquiring is local**, and it is also the handover signal (#511). Each
+time a process takes a device's flock (a nested join does not count), the
+device's *acquire epoch* goes up (`device_lock.acquire_epoch(host)`, a dict
+lookup). `acquire()` itself makes no network call. The `/Temp` ledger
+compares that epoch with the epoch of its last successful sweep. So an
+armed client on a leak-prone device sweeps `/Temp` before this hold's
+first attachment-creating request, and if that sweep fails the request is
+refused before anything is sent. A process that does **not** hold the
+lock (in any lock directory) gets no sweep and no FTP-enable, and its
+attachment-creating requests to a leak-prone device are refused. Only lock
+holders are in the queue (#513 review). The sweep waits for the first upload,
+not for `acquire()`, because at acquire time there is often no client and
+so no grade to decide with. A post-safe device (the U64E) therefore sees
+no new traffic at all. Every locked path takes the flock through
+`DeviceLock._try_acquire_once`: the manager, the conftest guard,
+`hold_device_lock` and a bare `DeviceLock`. That is why the epoch lives
+there.
+
+**Releasing can make network calls.**
 
 Releasing a `DeviceLock` is not purely local. Each `Ultimate64Client` registers its device's `/Temp`
 ledger (`ultimate64_temp_gc.TempLedger.drain_on_lock_release`) through
@@ -339,7 +360,7 @@ on a leak-prone device (it is best-effort and swallows its own errors —
 it never fails the run, so **a clean release does not prove a clean
 device**), and it is *why* handing the device to the next
 lane clean is automatic rather than something each lane remembers to do.
-The mechanism, the budget and the failure modes are in
+The mechanism, the handover sweep, the budget and the failure modes are in
 [`docs/u64_recovery.md`](u64_recovery.md) § "Harness-side mitigation:
 FTP `/Temp` GC".
 

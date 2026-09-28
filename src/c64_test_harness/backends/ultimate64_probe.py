@@ -701,8 +701,26 @@ def _probe_hygiene_armed(firmware_version: str | None) -> bool:
     return caps.runner_wedge_possible is not False
 
 
+def _probe_hygiene_armed_by_grade(firmware_version: str | None) -> bool:
+    """Whether the grade alone (no ``U64_AUTO_TEMP_GC`` override) is leak-prone.
+
+    Gates the handover sweep and the lock requirement, so that a forced arm
+    on a post-safe device changes neither (#513 review, finding 2).
+    """
+    from .u64_capabilities import DeviceCapabilities
+
+    caps = DeviceCapabilities.from_info({"firmware_version": firmware_version})
+    return caps.runner_wedge_possible is not False
+
+
 def _reserve_probe_attachments(
-    host: str, count: int, *, armed: bool, operation: str, key: str | None = None
+    host: str,
+    count: int,
+    *,
+    armed: bool,
+    operation: str,
+    key: str | None = None,
+    leak_prone: bool = True,
 ):
     """Gate, then count, *count* attachments on *host*'s device ledger.
 
@@ -715,6 +733,9 @@ def _reserve_probe_attachments(
     under the same ledger lock, so a probe and a client's upload against one
     device cannot both pass the budget check and then both count:
 
+    * a device this process has not swept since it last took the device's
+      ``DeviceLock`` (or ever) is swept first, and a failed sweep refuses
+      (#511);
     * a device whose hygiene pass has been proven impossible refuses here,
       before the probe reads or writes anything -- so the restore POST is
       never the request that gets refused, and a blocked client cannot
@@ -746,20 +767,35 @@ def _reserve_probe_attachments(
         gc_temp_folder,
         hygiene_required,
         leak_budget,
+        lock_held_for,
+        sweep_keep,
         temp_ledger_for,
     )
 
     ledger = temp_ledger_for(key or host)
     with ledger.lock:
+        if armed and leak_prone and not lock_held_for(key or host):
+            # Only lock holders are in the device queue (#513 review): no
+            # sweep, no count, no request from an unlocked process.
+            message = (
+                f"refusing {operation}: this device's firmware leaks a /Temp "
+                "attachment for every request that carries a body, and this "
+                "process does not hold its DeviceLock, so the harness will not "
+                "sweep /Temp for it. Hold the DeviceLock for the whole run, or "
+                "diagnose with the bodyless calls (get_info, get_version, "
+                "read_mem). U64_TEMP_GC_REQUIRED=0 does not lift this refusal "
+                "(#513 re-verify). See docs/device_locking.md."
+            )
+            raise Ultimate64TempHygieneError(message)
         if armed:
             budget = leak_budget()
-            if (
-                ledger.blocked is None
-                and ledger.pending > 0
-                and ledger.pending + count > budget
+            if ledger.blocked is None and (
+                # #511: sweep at handover too, as the client does.
+                (leak_prone and ledger.handover_sweep_due())
+                or (ledger.pending > 0 and ledger.pending + count > budget)
             ):
                 try:
-                    result = gc_temp_folder(host)
+                    result = gc_temp_folder(host, keep=sweep_keep(ledger))
                 except Exception as exc:  # noqa: BLE001 - gc reports, never raises
                     result = TempGCResult(
                         host=host, error=f"{type(exc).__name__}: {exc}"
@@ -959,6 +995,7 @@ def liveness_probe(
                 cost,
                 key=key,
                 armed=_probe_hygiene_armed(firmware_version),
+                leak_prone=_probe_hygiene_armed_by_grade(firmware_version),
                 operation=(
                     f"liveness_probe on {host} "
                     f"({cost} x POST /v1/machine:writemem)"

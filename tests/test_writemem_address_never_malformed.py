@@ -343,3 +343,13 @@ def test_the_widened_scan_passes_guarded_and_non_query_shapes(line):
 ])
 def test_the_scan_passes_guarded_builders_and_prose(line):
     assert _unguarded_address_builders(line) == []
+
+
+@pytest.fixture(autouse=True)
+def _empty_temp_over_ftp(monkeypatch):
+    """#511: a leak-prone client sweeps ``/Temp`` before its first POST;
+    answer with an empty ``/Temp`` rather than dial the fake host's FTP
+    port."""
+    import fake_temp_ftp
+
+    fake_temp_ftp.install(monkeypatch)

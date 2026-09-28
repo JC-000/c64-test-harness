@@ -1264,3 +1264,13 @@ class TestStaticAddressIsOutOfScopeForTests:
         offenders, parsed = self._offenders(tmp_path)
         assert offenders, "the matcher must catch a real write"
         assert parsed == ["bad.py"]
+
+
+@pytest.fixture(autouse=True)
+def _empty_temp_over_ftp(monkeypatch):
+    """#511: a leak-prone client sweeps ``/Temp`` before its first POST;
+    answer with an empty ``/Temp`` rather than dial the fake host's FTP
+    port."""
+    import fake_temp_ftp
+
+    fake_temp_ftp.install(monkeypatch)

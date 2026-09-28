@@ -412,3 +412,13 @@ def test_docstring_no_longer_offers_a_path_that_does_nothing():
     assert stale in re.sub(r"\s*#:\s*|\s+", " ", wrapped)
     # And the supported path is what the attribute's comment now names.
     assert "Precedence" in flat and "write_mem_query_threshold=" in flat
+
+
+@pytest.fixture(autouse=True)
+def _empty_temp_over_ftp(monkeypatch):
+    """#511: a leak-prone client sweeps ``/Temp`` before its first POST;
+    answer with an empty ``/Temp`` rather than dial the fake host's FTP
+    port."""
+    import fake_temp_ftp
+
+    fake_temp_ftp.install(monkeypatch)

@@ -664,8 +664,8 @@ calls. The attachments fill `/Temp`, and a full `/Temp` crashes the device
 firmware, taking REST and the UCI bridge down together; only a physical
 power-cycle recovers it — with nobody physically present. No count of
 uploads before that crash is known, and none is kept (owner ruling,
-2026-09-15; #256), so budgets are sized conservatively as a choice about
-which error to make. So a change that adds, moves, or widens such a call
+2026-09-15; #256), so the harness sweeps before every upload to a
+leak-prone device and refuses the upload if that sweep fails (#511). So a change that adds, moves, or widens such a call
 must show where its hygiene comes from and must not be reachable in an
 unbounded loop, and a hygiene pass whose failure is swallowed is a
 blocker rather than a nit. Reviewers do not run live hardware

@@ -358,6 +358,16 @@ _PROCESS_HELD: dict[str, int] = {}
 _PROCESS_HELD_THREADS: dict[str, list[int]] = {}
 _PROCESS_HELD_GUARD = threading.Lock()
 
+#: Device lock key -> how many times this process has *taken* that device's
+#: flock: one per outermost acquire, none for a nested join (issue #511).
+#: Each one is the device queue advancing to this process, so whatever
+#: another lane did to the device in between is unknown here.  The ``/Temp``
+#: ledger compares it with the epoch of its last successful sweep and sweeps
+#: again before the next attachment-creating request.  Monotonic, never
+#: reset (not even by ``_reset_advisory_state``): a reset could make a stale
+#: sweep look current.  Guarded by :data:`_PROCESS_HELD_GUARD`.
+_ACQUIRE_EPOCHS: dict[str, int] = {}
+
 #: Sanitized device id -> weak references to (object, method name) pairs
 #: to invoke when this process's outermost hold on that device is
 #: released.  The hook exists so a device client can hand the device to
@@ -1383,10 +1393,18 @@ class DeviceLock:
     # -- Process-hold registry (issue #136) --
 
     def _register_process_hold(self) -> None:
-        """Record that this process owns the flock for this lockfile."""
+        """Record that this process owns the flock for this lockfile.
+
+        Also advances the device's acquire epoch (:func:`acquire_epoch`):
+        this is reached only when the flock itself was taken, never by a
+        nested join, so every call is the queue handing the device over.
+        """
         key = str(self._lock_path)
         self._owner_thread = threading.get_ident()
         with _PROCESS_HELD_GUARD:
+            _ACQUIRE_EPOCHS[self._device_id] = (
+                _ACQUIRE_EPOCHS.get(self._device_id, 0) + 1
+            )
             _PROCESS_HELD[key] = _PROCESS_HELD.get(key, 0) + 1
             _PROCESS_HELD_THREADS.setdefault(key, []).append(
                 self._owner_thread
@@ -2165,6 +2183,40 @@ def warn_unlocked_client(
         UNLOCKED_WARNING_ENV,
     )
     return True
+
+
+def acquire_epoch(device_host: str) -> int:
+    """How many times this process has taken *device_host*'s lock (#511).
+
+    Counts outermost acquires in any lock directory -- each one is the
+    device queue advancing to this process -- and ignores nested joins.
+    ``0`` until the first.  A dict lookup: no filesystem, no network.
+
+    The ``/Temp`` ledger (``ultimate64_temp_gc.TempLedger``) records the
+    epoch of its last successful sweep; a ledger whose sweep predates the
+    current epoch sweeps before its next attachment-creating request,
+    because another lane may have used the device since.
+    """
+    key = _device_lock_key(device_host)
+    with _PROCESS_HELD_GUARD:
+        return _ACQUIRE_EPOCHS.get(key, 0)
+
+
+def held_by_this_process_in_any_dir(device_host: str) -> bool:
+    """Whether this process holds *device_host*'s lock in **any** lock dir.
+
+    :meth:`DeviceLock.held_by_this_process` asks about one directory (the
+    default unless told otherwise). The ``/Temp`` handover gate (#511) asks
+    this instead: a process that took the device's flock anywhere is in
+    that directory's queue, which is what the gate needs to know. A dict
+    scan of the in-process registry: no filesystem, no network.
+    """
+    name = f"device-{_device_lock_key(device_host)}.lock"
+    with _PROCESS_HELD_GUARD:
+        return any(
+            count > 0 and Path(path).name == name
+            for path, count in _PROCESS_HELD.items()
+        )
 
 
 def register_release_callback(device_host: str, obj: object, method: str) -> None:
