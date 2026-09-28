@@ -74,6 +74,10 @@ class FakeDevice:
     def __init__(self, info: dict, *, ftp_up: bool = True) -> None:
         self.info = info
         self.ftp_up = ftp_up
+        #: Whether ``PUT /v1/configs/Network Settings/FTP File Service``
+        #: ``?value=Enabled`` brings FTP up. ``False`` models a device whose
+        #: FTP will not come up however it is configured.
+        self.ftp_enable_works = False
         self.temp: list[str] = []
         self.counter = 0
         self.mounted: dict[str, str] = {}
@@ -93,6 +97,9 @@ class FakeDevice:
 
     def ftp_sessions(self) -> int:
         return sum(1 for kind, cmd, _ in self.log if kind == "FTP" and cmd == "connect")
+
+    def ftp_enables(self) -> list[str]:
+        return [p for p in self.config_writes() if p.endswith("/FTP File Service")]
 
     def config_writes(self) -> list[str]:
         return [
@@ -114,6 +121,11 @@ class FakeDevice:
                 for letter, name in sorted(self.mounted.items())
             ]
             return _Resp(json.dumps({"drives": drives}).encode())
+        if method == "PUT" and path == "/v1/configs/Network Settings/FTP File Service":
+            query = dict(urllib.parse.parse_qsl(parsed.query))
+            if query.get("value") == "Enabled" and self.ftp_enable_works:
+                self.ftp_up = True
+            return _Resp(b"{}")
         if method == "POST" and req.data is not None:
             name = self.attach()
             if path.startswith("/v1/drives/") and path.endswith(":mount"):
@@ -202,14 +214,83 @@ def test_failed_acquire_sweep_refuses_the_first_upload(device, host, tmp_path):
         assert device.posts() == []
         assert device.ftp_sessions() >= 1, "the sweep must have been tried"
         assert device.temp == ["temp0000", "temp0001", "temp0002"]
-        # #263 unchanged: this client leaked nothing, so no config write.
-        assert device.config_writes() == []
-        # And it stays refused: a second attempt sends nothing either.
+        # Owner, 2026-09-28: the handover sweep makes the one FTP-enable
+        # attempt; FTP stayed down, so the upload is still refused.
+        assert device.ftp_enables() == ["/v1/configs/Network Settings/FTP File Service"]
+        # And it stays refused: a second attempt sends nothing either, and
+        # the enable is not tried again in this process.
         with pytest.raises(Ultimate64TempHygieneError):
             c.write_mem(0xC000, b"x" * 200)
         assert device.posts() == []
+        c2 = _client(host)
+        with pytest.raises(Ultimate64TempHygieneError):
+            c2.run_prg(PRG)
     finally:
         lock.release()
+    assert len(device.ftp_enables()) == 1
+
+
+def test_ftp_off_at_handover_is_enabled_once_then_swept_then_uploaded(
+    device, host, tmp_path
+):
+    """FTP File Service off (the 1.1.0 default): one enable, the sweep, the upload."""
+    device.ftp_up = False
+    device.ftp_enable_works = True
+    device.temp[:] = ["temp0000", "temp0001"]
+    device.counter = 2
+    lock = _lock(host, tmp_path)
+    try:
+        c = _client(host)
+        c.run_prg(PRG)
+        c.run_prg(PRG)
+        log = list(device.log)
+    finally:
+        lock.release()
+    assert device.ftp_enables() == ["/v1/configs/Network Settings/FTP File Service"]
+    enable = log.index(("REST", "PUT", "/v1/configs/Network Settings/FTP File Service"))
+    first_post = log.index(("REST", "POST", "/v1/runners:run_prg"))
+    # The failed sweep, then the enable, then a sweep that deletes, then the upload.
+    assert ("FTP", "connect", host) in log[:enable]
+    deletes = [i for i, entry in enumerate(log) if entry[1] == "delete"]
+    assert deletes and enable < deletes[0] < first_post
+    assert len(device.posts()) == 2
+
+
+def test_the_handover_enable_is_attempted_once_per_process(device, host, tmp_path):
+    """FTP will not come up: one enable, then refused. A later sweep lifts
+    the block, the next handover fails again, and no second enable goes out."""
+    device.ftp_up = False
+    lock = _lock(host, tmp_path)
+    c = _client(host)
+    with pytest.raises(Ultimate64TempHygieneError):
+        c.run_prg(PRG)
+    device.ftp_up = True
+    lock.release()  # the release drain sweeps, and succeeds: block lifted
+    device.ftp_up = False
+    lock = _lock(host, tmp_path)
+    try:
+        with pytest.raises(Ultimate64TempHygieneError):
+            _client(host).run_prg(PRG)
+    finally:
+        lock.release()
+    assert len(device.ftp_enables()) == 1
+    assert device.posts() == []
+
+
+def test_required_zero_makes_no_enable_attempt_at_handover(
+    device, host, tmp_path, monkeypatch
+):
+    """``U64_TEMP_GC_REQUIRED=0`` opts out of enforcement: no config write."""
+    monkeypatch.setenv(gc_mod.REQUIRED_ENV, "0")
+    device.ftp_up = False
+    device.ftp_enable_works = True
+    lock = _lock(host, tmp_path)
+    try:
+        _client(host).run_prg(PRG)
+        log = list(device.log)
+    finally:
+        lock.release()
+    assert ("REST", "PUT", "/v1/configs/Network Settings/FTP File Service") not in log
 
 
 def test_a_fresh_process_is_refused_before_spending_anything(device, host, tmp_path):
@@ -230,6 +311,8 @@ def test_a_fresh_process_is_refused_before_spending_anything(device, host, tmp_p
             lock.release()
     assert device.posts() == []
     assert device.temp == []
+    # One enable attempt per process, each of which failed.
+    assert len(device.ftp_enables()) == 3
 
 
 def test_an_unlocked_fresh_process_is_refused_too(device, host):
@@ -416,6 +499,24 @@ def test_temp_hygiene_false_touches_no_ftp(device, host, tmp_path):
         lock.release()
     assert device.posts() == ["/v1/runners:run_prg"] * 2
     assert device.ftp_sessions() == 0
+    assert device.config_writes() == []
+
+
+def test_a_post_safe_device_with_ftp_off_gets_no_enable(device, host, tmp_path):
+    """The owner's allowance is for leak-prone devices only: FTP off on a
+    post-safe device is left alone, and uploads go straight out."""
+    device.info = dict(POST_SAFE)
+    device.ftp_up = False
+    device.ftp_enable_works = True
+    for _ in range(2):
+        lock = _lock(host, tmp_path)
+        try:
+            _client(host).run_prg(PRG)
+        finally:
+            lock.release()
+    assert device.config_writes() == []
+    assert device.ftp_sessions() == 0
+    assert device.posts() == ["/v1/runners:run_prg"] * 2
 
 
 # -------------------------------------------------------------- post-safe

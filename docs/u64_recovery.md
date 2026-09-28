@@ -268,10 +268,16 @@ rules, both on an armed (leak-prone) client, both before anything is sent:
   flock (`device_lock.acquire_epoch`; a nested join does not count). A
   device's `TempLedger` records the epoch of its last successful sweep. A
   ledger that has never swept, or whose process has taken the lock since,
-  sweeps `/Temp` before its first attachment-creating request. **If that
-  sweep fails, the request is refused** with `Ultimate64TempHygieneError`,
-  and so is every later one until a sweep succeeds. The free
-  `liveness_probe` passes the same gate. So a new process, or the next
+  sweeps `/Temp` before its first attachment-creating request. If FTP
+  refuses, the client makes the process's **one attempt at enabling
+  `Network Settings > FTP File Service`** and sweeps again. This is the
+  same write as #263, allowed at handover by owner decision (2026-09-28)
+  so that a C64U with FTP off (the 1.1.0 default) is swept rather than
+  refused; `U64_TEMP_GC_REQUIRED=0` skips it. **If the sweep still fails,
+  the request is refused** with `Ultimate64TempHygieneError`, and so is
+  every later one until a sweep succeeds; the enable is not tried again
+  in that process. The free `liveness_probe` passes the same gate but has
+  no client, so it writes no config. So a new process, or the next
   holder of the lock, never spends anything on a device it could not clean
   first. Before #511 each new process spent a fresh budget of 6 before it
   found out.
@@ -405,11 +411,11 @@ requests to the other. So:
   **every** armed client of that device, until any client's sweep succeeds.
   Bodyless calls, `temp_hygiene=False` clients and `U64_TEMP_GC_REQUIRED=0`
   are not blocked.
-- Whether a client may take the leaking-lane path (the FTP-enable attempt)
-  is decided by that client's own uncollected share, on **both** routes
-  into the pass. **A client that leaked nothing never writes config** —
-  not on the drain, where the inherited sweep writes none, and not on the
-  budget path either, which a client whose own share is zero can reach
+- Who may make the FTP-enable attempt (once per device per process): a
+  client with an uncollected leak of its own, and the handover sweep
+  (#511, owner decision 2026-09-28). **Otherwise a client that leaked
+  nothing writes no config** — not on the drain, where the inherited sweep
+  writes none, and not on the budget path either, which a client whose own share is zero can reach
   precisely because the budget counts the *device*: another client's
   attachments, or a `temp_hygiene=False` client's, can be what crosses it.
   Such a client still sweeps, and still blocks the device if its sweep

@@ -393,8 +393,10 @@ class TempLedger:
     its last successful sweep (:attr:`swept_epoch`). A ledger that has never
     swept, or whose process has taken the device's lock since, is
     :meth:`handover_sweep_due`. An armed client then sweeps before its first
-    attachment-creating request, and if that sweep fails it is refused
-    before anything is sent. So no process spends anything on a device it
+    attachment-creating request. If FTP refuses, it makes this ledger's one
+    FTP-enable attempt (:attr:`ftp_enable_attempted`; owner decision
+    2026-09-28) and retries. If the sweep still fails, the request is
+    refused before anything is sent. So no process spends anything on a device it
     could not clean first. That includes each test of a
     ``run_u64_parallel_locked.py`` run, which takes and releases the lock
     per test. The lock-release drain

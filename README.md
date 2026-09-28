@@ -166,7 +166,7 @@ Hardware reading, in order:
 - **Known state on entry:** `apply_factory_baseline()` resets the covered config categories to the firmware's defaults and asserts `current == default`. The manager runs it at `acquire()` on a U64E ([below](#unified-backend-manager)).
 - **Automatic `/Temp` hygiene on leak-prone firmware** (C64 Ultimate 1.1.0; any Ultimate-line < 3.15):
   - The client sweeps `/Temp` over FTP before the first upload after this process takes the device's `DeviceLock` (or its first upload ever), and before every further upload once one attachment is pending (budget 1, keep 1, mounted images kept; #511). It also sweeps on `close()` and on `DeviceLock` release.
-  - It refuses body-carrying calls, before sending anything, if the sweep cannot run.
+  - If FTP is off at that first sweep it enables FTP File Service once per process and retries. It refuses body-carrying calls, before sending anything, if the sweep still cannot run.
   - The pass is prevention only. Once the firmware has crashed, FTP is gone too, and only a physical power-cycle recovers the device.
   - It stays disarmed on firmware that collects its own attachments (Ultimate-line ≥ 3.15).
   - Env knobs `U64_AUTO_TEMP_GC`, `U64_TEMP_GC_BUDGET`, `U64_TEMP_GC_KEEP` and `U64_TEMP_GC_REQUIRED=0` are covered, with the mechanism, in [docs/u64_recovery.md](docs/u64_recovery.md).

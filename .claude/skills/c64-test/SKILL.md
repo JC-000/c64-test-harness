@@ -53,7 +53,9 @@ When you write a test that can point at the C64U:
   in the process; keep 1; mounted images kept; #295, #511). It also drains
   on `close()` and on `DeviceLock` release: a client that leaked drains its
   own, and one that leaked nothing sweeps inherited `/Temp` only while
-  holding the device's lock (#264). **It can also refuse.** Once a sweep
+  holding the device's lock (#264). A handover sweep that finds FTP off
+  makes one attempt per process at enabling FTP File Service, then
+  retries (owner decision 2026-09-28). **It can also refuse.** Once a sweep
   it needed has failed (FTP down), every later attachment-creating
   request raises `Ultimate64TempHygieneError`, before sending anything, until a
   sweep succeeds (import it from
