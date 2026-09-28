@@ -43,6 +43,8 @@ from c64_test_harness.backends.vice_elevation import (
 )
 from c64_test_harness.backends.vice_lifecycle import (
     ETHERNET_VICE_BIN_ENV,
+    ViceConfig,
+    build_ethernet_rc,
     ethernet_vice_binary,
 )
 
@@ -437,29 +439,25 @@ def probe_vice_pcap_ok(
         )
         return _PROBE_CACHE
 
-    # An ``-addconfig`` vicerc plus the ``-ethernetioif`` /
-    # ``-ethernetiodriver`` CLI flags, as ``ViceProcess`` launches.  The rc
-    # below is NOT production's: ``EthernetIOIF`` / ``EthernetIODriver`` are
-    # not VICE resources in any casing (the real names are
-    # ``ETHERNET_INTERFACE`` / ``ETHERNET_DRIVER``; see
-    # ``vice_lifecycle.build_ethernet_rc``), so VICE ignores those two lines
-    # and the interface and driver reach it only through the CLI flags.
+    # Launch exactly as ``ViceProcess`` does for ``ethernet=True``: the
+    # ``-addconfig`` rc from ``build_ethernet_rc`` (which alone activates
+    # the cart and names the driver and interface), followed by the
+    # ``-ethernetioif`` / ``-ethernetiodriver`` flags it also passes.  The
+    # probe used to hand-write ``EthernetIOIF`` / ``EthernetIODriver``,
+    # which VICE 3.10 does not register (#503), so it never exercised the
+    # rc production relies on.
     #
-    # Why NOT ``-ethernetiodriver pcap`` on a bare cmdline: the option is
-    # advertised in ``-help`` but its value set is populated by
-    # ``rawnet_arch_init()``, which the Homebrew build only runs when the
-    # cart is activated.  At parse time with no ``-addconfig`` loaded, the
-    # driver list is empty and VICE rejects ``pcap`` with
-    # ``Argument 'pcap' not valid``.  So the probe MUST go through
-    # ``-addconfig``.
-    rc_body = (
-        "[Version]\nConfigVersion=3.10\n\n"
-        "[C64SC]\n"
-        "ETHERNETCART_ACTIVE=1\n"
-        "EthernetCartMode=1\n"
-        f'EthernetIOIF="{iface}"\n'
-        'EthernetIODriver="pcap"\n'
-        "SaveResourcesOnExit=0\n"
+    # ``-ethernetiodriver pcap`` is refused (``Argument 'pcap' not valid``)
+    # only when the launch is unelevated, with or without ``-addconfig``:
+    # the option is a plain SET_RESOURCE of ``ETHERNET_DRIVER``
+    # (S ``rawnetarch.c:193``), whose setter selects pcap only when
+    # ``archdep_rawnet_capability()`` holds (S ``rawnetarch.c:108``) and
+    # returns -1 otherwise, which ``cmdline.c:262-264`` reports as that
+    # error.  The resource is registered at startup
+    # (``cs8900io_resources_init``), not on cart activation.  Source-read,
+    # VICE 3.10; the unelevated launch is never made here -- see below.
+    rc_body = build_ethernet_rc(
+        ViceConfig(ethernet=True, ethernet_interface=iface, ethernet_driver="pcap")
     )
     fd, rc_path = tempfile.mkstemp(prefix="probe_pcap_", suffix=".rc")
     try:

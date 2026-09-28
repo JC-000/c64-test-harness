@@ -110,41 +110,59 @@ def _wait_for_text_binary(transport, needle, timeout=15.0, poll_interval=1.0):
 
 
 def _emulator_is_stalled(transport, samples: int = 4) -> tuple[bool, list[str]]:
-    """Whether VICE has stopped emulating, and the raster positions seen.
+    """Whether the machine made no progress across acknowledged resumes.
 
-    ``LIN``/``CYC`` are the raster position.  They advance whenever the
-    *machine* is emulating, whether or not the 6510 is executing any
-    instruction.  A constant reading is **not** proof of a stall, though:
-    the binary monitor services commands once per frame from its vsync
-    hook, so a command sent to a running machine halts it at the same
-    frame phase every time (``$D012`` read back 12 across n=8
-    resume-and-reread cycles, VICE 3.10, 2026-09-05), and a jam under the
-    harness's ``-jamaction 0`` pin also pins ``LIN``/``CYC``.  Only
-    acknowledged resumes without progress discriminate a stalled
-    emulator; read this result alongside the JAM-event and PC lines of
-    :func:`_machine_failure_report`.
+    Progress is the KERNAL jiffy clock (``$A0-$A2``) or the PC changing
+    between two reads that an acknowledged ``resume()`` separates.  The
+    raster is reported but never decides: the binary monitor services
+    commands once per frame from its vsync hook, so a running machine is
+    always halted at the same frame phase.  Measured here (VICE 3.10,
+    2026-09-28, this function's exact read/resume/sleep(0.1) cycle, BASIC
+    idle, 4 samples per trial): ``LIN`` read 12 in every sample and
+    ``CYC`` only 0-2 (instruction-boundary jitter, not motion), so all
+    four raster reads matched in 2 of 60 healthy trials under warp; the
+    PC matched in all four in 3 of 60 (the idle loop is eight bytes).
+    The jiffy clock advanced across every resume in 60/60 (warp) and
+    10/10 (no warp) trials.  With the 6510 jammed on a KIL under the
+    harness's ``-jamaction 0`` pin, jiffy and PC never moved (0/80 trials),
+    while ``CYC`` still changed in 2 of them (each the first trial after
+    the jam).
 
-    This is upstream bug 6 (docs/vice_upstream_bugs.md): under host load
-    VICE stops emulating while its monitor thread stays healthy, answers
-    every command, and acknowledges every resume.  A test that waits on
-    the machine running will otherwise spend its whole timeout and then
-    report something misleading about screen text.
+    So ``True`` means "no progress": either upstream bug 6
+    (docs/vice_upstream_bugs.md -- VICE stops emulating under host load
+    while its monitor answers and acknowledges every resume) or a jammed
+    6510.  The JAM-event and PC lines of :func:`_machine_failure_report`
+    separate the two.  Code running with IRQs masked freezes the jiffy
+    clock but not the PC, so it still counts as progress.
+
+    A comparison counts only when the resume before it returned; fewer
+    than two readable samples prove nothing and report ``False``.
     """
     seen: list[str] = []
-    positions: set[tuple[int, int]] = set()
+    prev: tuple[int, bytes] | None = None
+    compared = 0
     for _ in range(samples):
         try:
             r = transport.read_registers()
+            jiffy = bytes(transport.read_memory(0x00A0, 3))
         except Exception:
             break
-        pos = (r.get("LIN", -1), r.get("CYC", -1))
-        positions.add(pos)
-        seen.append(f"LIN={pos[0]} CYC={pos[1]}")
-        if len(positions) > 1:
-            return False, seen
-        transport.resume()
+        cur = (r.get("PC", -1), jiffy)
+        seen.append(
+            f"PC={cur[0]:#06x} jiffy={int.from_bytes(jiffy, 'big')} "
+            f"LIN={r.get('LIN', -1)} CYC={r.get('CYC', -1)}"
+        )
+        if prev is not None:
+            compared += 1
+            if cur != prev:
+                return False, seen
+        try:
+            transport.resume()
+        except Exception:
+            break
+        prev = cur
         time.sleep(0.1)
-    return len(positions) == 1, seen
+    return compared > 0, seen
 
 
 def _stub_was_executed(transport, samples: int = 4) -> tuple[bool, list[int]]:
@@ -200,14 +218,13 @@ def _machine_failure_report(transport, needle: str) -> str:
     # stopped emulating, the PC, the screen and the checkpoints are all
     # just the last state the machine was left in.
     try:
-        stalled, raster = _emulator_is_stalled(transport)
+        stalled, seen = _emulator_is_stalled(transport)
         lines.append(
-            f"raster across resumes: {raster}"
-            + ("  <- FROZEN: VICE may have stopped emulating (upstream "
-               "bug 6), or the 6510 jammed (see the JAM line below); a "
-               "constant raster alone does not separate them from a "
-               "running machine sampled at the monitor's frame phase." if stalled else
-               "  (advancing: the emulator is running)")
+            f"PC and jiffy clock across acknowledged resumes: {seen}"
+            + ("  <- NO PROGRESS: VICE stopped emulating (upstream bug 6) "
+               "or the 6510 jammed -- the JAM line below separates them."
+               if stalled else
+               "  (progressing: the machine runs when resumed)")
         )
     except Exception as e:
         lines.append(f"could not sample the raster: {type(e).__name__}: {e}")

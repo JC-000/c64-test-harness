@@ -63,3 +63,96 @@ def test_wait_records_its_starting_generation():
     t = _Never([], generation=7)
     tc._wait_for_text_binary(t, "X", timeout=0.0)
     assert tc._LAST_POLL_START_GEN == [7]
+
+
+# ---------------------------------------------------------------------------
+# _emulator_is_stalled: progress across acknowledged resumes (#504)
+# ---------------------------------------------------------------------------
+
+
+class _Machine:
+    """A fake VICE as the binary monitor presents it (measured, #504).
+
+    Every read halts the machine at the monitor's frame phase, so ``LIN``
+    reads 12 whatever happens.  ``resume()`` is always acknowledged; what
+    it *does* depends on the machine's state:
+
+    * ``irq=True``  -- the KERNAL IRQ runs, so the jiffy clock at
+      ``$A0-$A2`` advances by a frame's worth per resume.
+    * ``pcs``       -- the PC read after each resume, cycled.
+    * ``emulating=False`` -- upstream bug 6 or a jam: the resume is
+      acknowledged and nothing moves.
+    * ``cycs``      -- ``CYC`` per read, cycled (jitter, not motion).
+    * ``fail_reads_after`` -- register reads raise after that many.
+    """
+
+    def __init__(self, *, emulating=True, irq=True, pcs=(0xE5CF,),
+                 cycs=(2,), fail_reads_after=None):
+        self.emulating, self.irq = emulating, irq
+        self.pcs, self.cycs = pcs, cycs
+        self.fail_reads_after = fail_reads_after
+        self.jiffy = 0x001234
+        self.steps = 0
+        self.reads = 0
+        self.resumes = 0
+
+    def read_registers(self):
+        if self.fail_reads_after is not None and self.reads >= self.fail_reads_after:
+            raise ConnectionError("monitor went away")
+        cyc = self.cycs[self.reads % len(self.cycs)]
+        self.reads += 1
+        return {"PC": self.pcs[self.steps % len(self.pcs)], "LIN": 12, "CYC": cyc}
+
+    def read_memory(self, addr, n):
+        assert (addr, n) == (0x00A0, 3)
+        return self.jiffy.to_bytes(3, "big")
+
+    def resume(self):
+        self.resumes += 1
+        if self.emulating:
+            self.steps += 1
+            if self.irq:
+                self.jiffy = (self.jiffy + 6) & 0xFFFFFF
+
+
+def _no_sleep(monkeypatch):
+    monkeypatch.setattr(tc.time, "sleep", lambda s: None)
+
+
+def test_healthy_machine_sampled_at_one_frame_phase_is_not_stalled(monkeypatch):
+    """Same raster and same idle-loop PC on every read, jiffy ticking."""
+    _no_sleep(monkeypatch)
+    stalled, seen = tc._emulator_is_stalled(_Machine())
+    assert stalled is False, seen
+
+
+def test_emulator_that_acknowledges_resumes_but_never_runs_is_stalled(monkeypatch):
+    _no_sleep(monkeypatch)
+    m = _Machine(emulating=False, pcs=(0xCF00,))
+    stalled, seen = tc._emulator_is_stalled(m)
+    assert stalled is True, seen
+    assert m.resumes >= 3  # the verdict rests on acknowledged resumes
+
+
+def test_jam_with_cyc_jitter_is_still_no_progress(monkeypatch):
+    """Measured: CYC can change once right after a jam; that is not motion."""
+    _no_sleep(monkeypatch)
+    m = _Machine(emulating=False, pcs=(0xC000,), cycs=(3, 2, 2, 2))
+    stalled, seen = tc._emulator_is_stalled(m)
+    assert stalled is True, seen
+
+
+def test_code_running_with_irqs_masked_is_progress(monkeypatch):
+    """Jiffy frozen (SEI) but the PC moves: the machine is running."""
+    _no_sleep(monkeypatch)
+    m = _Machine(irq=False, pcs=(0xC010, 0xC013, 0xC016))
+    stalled, seen = tc._emulator_is_stalled(m)
+    assert stalled is False, seen
+
+
+def test_one_readable_sample_proves_nothing(monkeypatch):
+    _no_sleep(monkeypatch)
+    m = _Machine(emulating=False, fail_reads_after=1)
+    stalled, seen = tc._emulator_is_stalled(m)
+    assert stalled is False, seen
+    assert len(seen) == 1

@@ -56,14 +56,14 @@ def interrogate(t):
     print("\n=== INTERROGATION ===", flush=True)
 
     # Exercise the PRODUCTION detector against this genuine stall.  Stubs
-    # can show that `_emulator_is_stalled` distinguishes a constant raster
-    # from an advancing one; only a real stall shows it firing on the
+    # can show that `_emulator_is_stalled` separates a frozen jiffy clock
+    # and PC from a moving one; only a real stall shows it firing on the
     # thing it was built for, and the stall is far easier to induce here
     # than through the test suite.
     import test_vice_core as tc
-    stalled, raster = tc._emulator_is_stalled(t)
+    stalled, seen = tc._emulator_is_stalled(t)
     print(f"\n*** tests/test_vice_core.py::_emulator_is_stalled -> "
-          f"stalled={stalled} raster={raster}", flush=True)
+          f"stalled={stalled} samples={seen}", flush=True)
     print("*** production failure report follows:", flush=True)
     print(tc._machine_failure_report(t, "<verification>"), flush=True)
 

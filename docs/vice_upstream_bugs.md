@@ -365,10 +365,14 @@ failure time, and use a fresh VICE per trial — a probe that reuses one
 VICE is one trial.
 
 **Harness mitigation: detection, not recovery.** We cannot fix VICE.
-`_machine_failure_report` in `tests/test_vice_core.py` samples the raster
-across acknowledged resumes (`_emulator_is_stalled`) and checks for
-a queued `0x61`, so a stall says so instead of timing out on a screen
-assertion. Deliberately **not** auto-restarted: a harness
+`_machine_failure_report` in `tests/test_vice_core.py` samples the jiffy
+clock (`$A0-$A2`) and the PC across acknowledged resumes
+(`_emulator_is_stalled`) and checks for a queued `0x61`, so a stall says
+so instead of timing out on a screen assertion. The raster is reported
+but does not decide: sampled through the monitor on a healthy running
+machine it reads `LIN=12` every time with `CYC` 0-2, identical across
+all four samples in 2 of 60 trials, while the jiffy clock advanced across
+every resume in 70 of 70 (#504, VICE 3.10, 2026-09-28). Deliberately **not** auto-restarted: a harness
 that silently rebuilds a stalled emulator converts a reproducible
 upstream bug into an invisible one.
 
