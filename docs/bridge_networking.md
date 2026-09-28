@@ -12,8 +12,8 @@ VICE attaches with its `pcap` driver over BPF, and an ethernet VICE runs as
 root. Linux (TAP devices + a Linux bridge, VICE's `tuntap` driver) is also
 supported, but that path was **last run on Linux 2026-04-10** (the
 two-VICE demo, 10/10 in normal and warp mode). The Linux scripts changed
-after that run (`teardown-bridge-tap.sh` and `cleanup-bridge-networking.sh`
-on 2026-04-11, `scripts/bridge_ping_demo.py` on 2026-08-15 and 2026-09-23)
+after that run (`setup-bridge-tap.sh`, `teardown-bridge-tap.sh` and
+`cleanup-bridge-networking.sh` on 2026-04-11, `scripts/bridge_ping_demo.py` on 2026-08-15 and 2026-09-23)
 and no Linux run is recorded since, so treat it as unverified at the current
 head; see § "Linux (TAP +
 Linux bridge)".
@@ -486,8 +486,8 @@ Pinned by `tests/test_vice_ethernet_rc.py`.
 ## Linux (TAP + Linux bridge)
 
 **Last run on Linux 2026-04-10** (the two-VICE demo, 10/10 normal and
-warp). `teardown-bridge-tap.sh` and `cleanup-bridge-networking.sh` changed on
-2026-04-11, after that run, and no Linux run is recorded since; the current
+warp). `setup-bridge-tap.sh`, `teardown-bridge-tap.sh` and
+`cleanup-bridge-networking.sh` changed on 2026-04-11, after that run, and no Linux run is recorded since; the current
 bench is macOS, so treat this section as unverified at the current head.
 
 Prerequisites:
