@@ -149,7 +149,7 @@ The snapshot work introduces two new harness scratch usages:
 
 ## Upstream firmware feature request
 
-The U64 REU extract path is slow (DMA-via-staging) because **no firmware on this bench exposes a REST endpoint for REU memory readback** — not the U64E's 3.15-line fork build and not the C64U's 1.1.0. The feature request is [GideonZ/1541ultimate#697](https://github.com/GideonZ/1541ultimate/issues/697), "REST endpoint for REU memory read back" (opened 2026-05-19; open). The `GET /v1/machine:reumem` verb it originally proposed was withdrawn in that thread in favour of a `space=` parameter on the existing `readmem`/`writemem` (so REU readback would be `readmem` with `space=reu`). When it lands, the staging-window dance in `extract_reu_contents` can be swapped for a direct chunked `readmem`. The restore path is already on the fast SocketDMA `REUWRITE` (opcode `0xFF07`) and doesn't change.
+The U64 REU extract path is slow (DMA-via-staging) because **no firmware on this bench exposes a REST endpoint for REU memory readback** — not the U64E's build from upstream test-merge bce4535e (public v3.15 + #884) and not the C64U's 1.1.0. The feature request is [GideonZ/1541ultimate#697](https://github.com/GideonZ/1541ultimate/issues/697), "REST endpoint for REU memory read back" (opened 2026-05-19; open). The `GET /v1/machine:reumem` verb it originally proposed was withdrawn in that thread in favour of a `space=` parameter on the existing `readmem`/`writemem` (so REU readback would be `readmem` with `space=reu`). When it lands, the staging-window dance in `extract_reu_contents` can be swapped for a direct chunked `readmem`. The restore path is already on the fast SocketDMA `REUWRITE` (opcode `0xFF07`) and doesn't change.
 
 ## Files
 

@@ -5,8 +5,8 @@ HTTP REST API (plain HTTP on port 80, no TLS). Captured on 2026-04-05 on
 firmware **3.14** and not re-captured since.
 
 > **This is a historical 3.14 snapshot, not the current schema.** The U64E
-> now runs a 3.15-line fork build (it reports `git_commit_hash`
-> `bce4535e` since 2026-09-15), and the bench's second device is
+> now runs a build from upstream `test-merge` (it reports `git_commit_hash`
+> `bce4535e`, public v3.15 + #884, since 2026-09-15), and the bench's second device is
 > a C64 Ultimate on firmware 1.1.0, whose CPU Speed list has `"64"` and
 > lacks `" 5"` and which adds `Speaker Mixer` and `Keyboard Lighting`
 > categories. Per-category item counts differ on 3.15 as well (for example

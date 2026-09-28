@@ -45,9 +45,9 @@ established.
 The fix is upstream in
 [GideonZ/1541ultimate#686 "Add automatic cleanup of Temp folder"](https://github.com/GideonZ/1541ultimate/pull/686)
 (merged 2026-04-26). **That merge is an ancestor of the `v3.15` tag**, so
-every Ultimate-line 3.15 build carries it. The bench U64E is on a
-3.15-line fork build (it reports `git_commit_hash` bce4535e
-since 2026-09-15) and is fixed: measured 2026-09-02, on its then build
+every Ultimate-line 3.15 build carries it. The bench U64E runs a
+build from upstream `test-merge` (it reports `git_commit_hash` bce4535e,
+public v3.15 + #884, since 2026-09-15) and is fixed: measured 2026-09-02, on its then fork build
 7f6fcb51, with the harness GC off
 (`U64_AUTO_TEMP_GC` unset), `/Temp` held zero managed attachments before
 and after fifteen `run_prg` uploads. `u64_capabilities` encodes the same

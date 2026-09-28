@@ -892,7 +892,7 @@ class TestEthernetReason:
         # without contradicting anything else asserted here.
         assert reason.count("is a live no-op") == 1, (
             "the 'live no-op' reading belongs only in the quoted retraction; "
-            "it is refuted for every build except the U64E's fork"
+            "it is refuted for the line as a whole (1.1.0 lacks the guard)"
         )
 
     def test_both_retracted_readings_are_named(self) -> None:

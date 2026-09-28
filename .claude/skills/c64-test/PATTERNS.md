@@ -1617,7 +1617,7 @@ In backend-agnostic code, prefer `target.transport.reset(scope="cpu")` (soft) an
 `run_prg()` does a soft reset internally, but screen memory at $0400 persists. Never use `wait_for_text()` alone to detect program startup — poll for known code bytes (e.g. main_loop JMP) instead. See Pattern 10.
 
 ### 17. U64: Runner Endpoints Use POST
-All U64 runner endpoints (`run_prg`, `load_prg`, `run_crt`, `sidplay`, `modplay`) require HTTP POST. PUT returned HTTP 400 on firmware 3.14 and the harness still POSTs on both bench devices (U64E on a 3.15-line fork build, C64U 1.1.0); PUT has not been re-tried on either.
+All U64 runner endpoints (`run_prg`, `load_prg`, `run_crt`, `sidplay`, `modplay`) require HTTP POST. PUT returned HTTP 400 on firmware 3.14 and the harness still POSTs on both bench devices (U64E on a build from upstream test-merge bce4535e (public v3.15 + #884), C64U 1.1.0); PUT has not been re-tried on either.
 
 That POST carries the program as its body, so on firmware predating GideonZ/1541ultimate#686 (the C64U on 1.1.0) **each of these calls leaks one `/Temp` attachment**, and enough of them fill `/Temp` and crash the firmware (no safe count is known) — see Pattern 10 § "`/Temp` attachment hygiene". `run_prg_via_sys(target, prg)` writes the program through `write_bytes` (chunked at the client threshold, which on that firmware is its 128-byte PUT ceiling; #252) and leaks nothing there.
 
