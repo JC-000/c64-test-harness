@@ -74,6 +74,7 @@ class U64CaptureResult:
     sequence_resyncs: int = 0
     nonstandard_payloads: int = 0
     filled_frame_ranges: tuple[tuple[int, int], ...] = ()
+    payloads_discarded: int = 0
 
     @property
     def time_base_intact(self) -> bool:
@@ -280,6 +281,7 @@ def _to_u64_result(result: CaptureResult) -> U64CaptureResult:
         sequence_resyncs=result.sequence_resyncs,
         nonstandard_payloads=result.nonstandard_payloads,
         filled_frame_ranges=result.filled_frame_ranges,
+        payloads_discarded=result.payloads_discarded,
     )
 
 

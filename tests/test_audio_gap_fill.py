@@ -6,6 +6,7 @@ fill, and the WAV's packet order reads straight back.
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import socket
 import struct
@@ -241,6 +242,43 @@ def test_u64_result_carries_fill_through() -> None:
         CaptureResult(Path("/dev/null"), 1.0, 47940, 19200, 90, 10, sequence_resyncs=1,
                       packets_filled=10)
     ).time_base_intact is False
+
+
+def test_u64_result_carries_every_capture_result_field() -> None:
+    """_to_u64_result must not drop any CaptureResult field (#505).
+
+    Every field gets a value distinct from its default and from every other
+    field, so a dropped copy (reads the default) and a crossed copy (reads
+    a neighbour's value) both fail.
+    """
+    low = CaptureResult(
+        wav_path=Path("/tmp/x.wav"), duration_seconds=2.5, sample_rate=47940,
+        total_samples=19200, packets_received=113, packets_dropped=7,
+        sample_rate_exact=U64_NTSC_AUDIO_RATE_HZ, packets_reordered=3,
+        sequence_resyncs=2, packets_filled=5, nonstandard_payloads=4,
+        filled_frame_ranges=((192, 384),), payloads_discarded=11,
+    )
+    r = _to_u64_result(low)
+    names = [f.name for f in dataclasses.fields(CaptureResult)]
+    assert {n: getattr(r, n, "<missing>") for n in names} == {
+        n: getattr(low, n) for n in names
+    }
+
+
+def test_capture_usable_sees_discards_on_a_u64_result() -> None:
+    """capture_sid_u64 callers bound lost time through the adapted result.
+
+    11 discarded packets of 2112 frames is 11*192/(19200+2112) = 9.9% lost
+    time, past MAX_LOST_TIME_FRACTION; everything else about the capture is
+    clean, so only payloads_discarded can reject it.
+    """
+    low = CaptureResult(Path("/dev/null"), 1.0, 47940, 19200, 111, 0,
+                        payloads_discarded=11)
+    assert capture_usable(low) is False          # control: the raw result
+    r = _to_u64_result(low)
+    assert payloads_discarded(r) == 11
+    assert lost_time_fraction(r) > MAX_LOST_TIME_FRACTION
+    assert capture_usable(r) is False
 
 
 # --------------------------------------------------------------- live tolerance
