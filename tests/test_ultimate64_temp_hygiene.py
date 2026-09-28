@@ -711,18 +711,21 @@ def test_close_does_not_sweep_inherited_temp_without_the_device_lock():
     gc.assert_not_called()
 
 
-def test_close_still_drains_what_this_client_leaked_without_the_lock():
-    """The pre-#264 behaviour for a client that DID leak is unchanged:
-    its own attachments are collected on close whether or not it holds
-    the lock (restricting that is not this change's call)."""
+def test_close_does_not_drain_a_leak_once_the_lock_is_gone(monkeypatch):
+    """#513 re-verify: on a leak-prone grade only a lock holder sweeps. A
+    client that leaked under the lock and closes after it is released
+    leaves the collection to the next holder's handover sweep (#511); before
+    #513 its close() swept unlocked."""
     c = _client(LEAKY)
     mock, _ = _urlopen_mock()
     with _lock_held(False), patch.object(
         c, "gc_temp_folder", return_value=TempGCResult(host="fake-host")
     ) as gc, patch("urllib.request.urlopen", mock):
         c.run_prg(b"\x01\x08x")
+        monkeypatch.setattr(gc_mod, "lock_held_for", lambda host: False)
         c.close()
-    gc.assert_called_once()
+    gc.assert_not_called()
+    assert c.pending_temp_attachments == 1
 
 
 def test_device_lock_release_drains_the_client(tmp_path):

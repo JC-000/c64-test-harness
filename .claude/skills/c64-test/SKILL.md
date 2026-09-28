@@ -62,7 +62,8 @@ When you write a test that can point at the C64U:
   sweep succeeds (import it from
   `backends.ultimate64_client`; it is not a package-root export) rather
   than walking the device toward the wedge; `U64_TEMP_GC_REQUIRED=0`
-  downgrades that to a WARNING and `temp_hygiene=False` disarms the pass.
+  downgrades a failed-sweep refusal to a WARNING (never the unlocked
+  refusal) and `temp_hygiene=False` disarms the pass.
   A client constructed with an explicit `write_mem_query_threshold=` never
   probes and so is **silently unarmed**.
   So if your test needs a manual GC call to be safe, the guard is missing

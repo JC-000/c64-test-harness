@@ -783,13 +783,11 @@ def _reserve_probe_attachments(
                 "process does not hold its DeviceLock, so the harness will not "
                 "sweep /Temp for it. Hold the DeviceLock for the whole run, or "
                 "diagnose with the bodyless calls (get_info, get_version, "
-                "read_mem). To proceed anyway set U64_TEMP_GC_REQUIRED=0. See "
-                "docs/device_locking.md."
+                "read_mem). U64_TEMP_GC_REQUIRED=0 does not lift this refusal "
+                "(#513 re-verify). See docs/device_locking.md."
             )
-            if hygiene_required():
-                raise Ultimate64TempHygieneError(message)
-            _log.warning("U64_TEMP_GC_REQUIRED=0: proceeding anyway. %s", message)
-        elif armed:
+            raise Ultimate64TempHygieneError(message)
+        if armed:
             budget = leak_budget()
             if ledger.blocked is None and (
                 # #511: sweep at handover too, as the client does.

@@ -95,6 +95,7 @@ class FakeDevice:
         self.release_in_flight = threading.Event()
         self.in_flight: list[str] = []
         self.deleted_in_flight: list[str] = []
+        self.ram = bytearray(0x10000)
         self.temp: list[str] = []
         self.counter = 0
         self.mounted: dict[str, str] = {}
@@ -132,6 +133,15 @@ class FakeDevice:
         self.log.append(("REST", method, path))
         if path == "/v1/info":
             return _Resp(json.dumps(self.info).encode())
+        if path == "/v1/machine:readmem":
+            q = dict(urllib.parse.parse_qsl(parsed.query))
+            addr, length = int(q["address"], 16), int(q["length"])
+            return _Resp(bytes(self.ram[addr:addr + length]))
+        if path == "/v1/machine:writemem" and method == "POST":
+            q = dict(urllib.parse.parse_qsl(parsed.query))
+            if "address" in q:
+                addr = int(q["address"], 16)
+                self.ram[addr:addr + len(req.data)] = req.data
         if path == "/v1/drives":
             if self.drives_fail:
                 return _Resp(b"", status=500)
@@ -380,6 +390,53 @@ def test_holding_another_devices_lock_does_not_count(device, host, tmp_path):
     assert device.posts() == ["/v1/runners:run_prg"]
 
 
+def test_required_zero_does_not_lift_the_unlocked_refusal(device, host, monkeypatch):
+    """#513 re-verify, finding 1: ``U64_TEMP_GC_REQUIRED=0`` downgrades only
+    the "hygiene impossible" refusal. Before, an unlocked process under it
+    uploaded 20 times with no sweep (resident 20). ``temp_hygiene=False``
+    stays the one explicit disarm."""
+    monkeypatch.setenv(gc_mod.REQUIRED_ENV, "0")
+    c = _client(host)
+    for _ in range(20):
+        with pytest.raises(Ultimate64TempHygieneError, match="DeviceLock"):
+            c.run_prg(PRG)
+    c.close()
+    assert device.posts() == []
+    assert device.temp == []
+    assert device.ftp_sessions() == 0
+    assert device.config_writes() == []
+
+
+def test_the_free_probe_refuses_unlocked_even_under_required_zero(device, host, monkeypatch):
+    from c64_test_harness.backends import ultimate64_probe as probe_mod
+
+    monkeypatch.setenv(gc_mod.REQUIRED_ENV, "0")
+    with pytest.raises(Ultimate64TempHygieneError, match="DeviceLock"):
+        probe_mod._reserve_probe_attachments(
+            host, 2, armed=True, operation="liveness_probe"
+        )
+    assert gc_mod.temp_ledger_for(host).pending == 0
+    assert device.ftp_sessions() == 0
+
+
+def test_close_does_not_sweep_or_enable_while_unlocked(device, host, tmp_path, monkeypatch):
+    """A client that leaked under the lock (REQUIRED=0, FTP down) and then
+    closes after the lock is gone must not sweep or write config unlocked."""
+    monkeypatch.setenv(gc_mod.REQUIRED_ENV, "0")
+    device.ftp_up = False
+    lock = _lock(host, tmp_path)
+    c = _client(host)
+    try:
+        c.run_prg(PRG)                       # handover fails, warned, sent
+    finally:
+        lock.release()                       # release drain runs under the lock
+    sessions, writes = device.ftp_sessions(), list(device.config_writes())
+    device.ftp_up = True
+    c.close()
+    assert device.ftp_sessions() == sessions
+    assert device.config_writes() == writes
+
+
 def test_the_free_probe_is_refused_unlocked(device, host):
     from c64_test_harness.backends import ultimate64_probe as probe_mod
 
@@ -547,6 +604,23 @@ def test_one_handover_sweep_per_hold_not_one_per_upload(device, host, tmp_path):
     assert len(device.posts()) == 6
 
 
+def test_the_keep_env_raises_the_sweep_keep(device, host, tmp_path, monkeypatch):
+    """#513 re-verify, finding 3 (mutant N14): ``U64_TEMP_GC_KEEP`` still
+    sets the floor of a client sweep's keep-count."""
+    monkeypatch.setenv(gc_mod.KEEP_ENV, "3")
+    device.temp[:] = [f"temp{i:04x}" for i in range(5)]
+    device.counter = 5
+    lock = _lock(host, tmp_path)
+    try:
+        _client(host).run_prg(PRG)
+        log = list(device.log)
+    finally:
+        lock.release()
+    first_post = log.index(("REST", "POST", "/v1/runners:run_prg"))
+    deleted = [arg for kind, cmd, arg in log[:first_post] if cmd == "delete"]
+    assert deleted == ["temp0000", "temp0001"]
+
+
 def test_the_sweep_keeps_the_youngest_and_the_mounted_image(device, host, tmp_path):
     device.temp[:] = ["temp0000", "temp0001", "temp0002", "temp0003", "temp0004"]
     device.counter = 5
@@ -660,6 +734,25 @@ def test_a_forced_arm_on_a_post_safe_device_gets_no_handover_enable(
         lock.release()
     assert device.config_writes() == []
     assert device.posts() == ["/v1/runners:run_prg"]
+
+
+def test_the_free_liveness_probe_on_a_forced_post_safe_device_is_not_gated(
+    device, host, monkeypatch
+):
+    """#513 re-verify, finding 2 (mutant N8): the free probe grades the
+    device itself; ``U64_AUTO_TEMP_GC=1`` on a post-safe device arms it but
+    adds no lock refusal and no handover sweep."""
+    from c64_test_harness.backends import ultimate64_probe as probe_mod
+
+    monkeypatch.setenv(gc_mod.AUTO_GC_ENV, "1")
+    device.info = dict(POST_SAFE)
+    with patch.object(
+        probe_mod, "probe_u64", return_value=MagicMock(reachable=True, error=None)
+    ):
+        probe_mod.liveness_probe(host)
+    assert device.ftp_sessions() == 0
+    assert device.config_writes() == []
+    assert device.posts() == ["/v1/machine:writemem", "/v1/machine:writemem"]
 
 
 def test_a_post_safe_device_with_ftp_off_gets_no_enable(device, host, tmp_path):

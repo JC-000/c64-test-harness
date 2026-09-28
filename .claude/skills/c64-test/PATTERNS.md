@@ -888,8 +888,9 @@ So on a leak-prone device **`run_prg_via_sys(target, prg)` is the low-risk way t
    `Ultimate64Error`, which is its base class.
    That is a hard exception from a layer below your test, and its message names the
    remedy. Both opt-outs are deliberate: set `U64_TEMP_GC_REQUIRED=0` to downgrade
-   the refusal to a WARNING and proceed, or pass `temp_hygiene=False` to disarm the
-   pass entirely.
+   a failed-sweep refusal to a WARNING and proceed (it does not lift the refusal of
+   a process that does not hold the `DeviceLock`, #513), or pass
+   `temp_hygiene=False` to disarm the pass entirely.
    One residue to know: a client that never probed capabilities — one constructed
    with an explicit `write_mem_query_threshold=`, which by contract issues no HTTP
    at construction — stays **disarmed**. A device whose construct-time probe merely

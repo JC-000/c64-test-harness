@@ -1110,9 +1110,7 @@ class Ultimate64Client:
             self._refuse_or_warn(operation)
             return
         if self._leak_prone_grade():
-            from . import ultimate64_temp_gc as _gc
-
-            if not _gc.lock_held_for(self._device_key):
+            if not self._temp_lock_held():
                 # Only lock holders are in the device queue, so an unlocked
                 # process neither sweeps other lanes' /Temp nor writes config:
                 # it is refused (#513 review; CLAUDE.md rule 4).
@@ -1152,8 +1150,13 @@ class Ultimate64Client:
         return caps is None or caps.runner_wedge_possible is not False
 
     def _refuse_unlocked(self, operation: str) -> None:
-        from .ultimate64_temp_gc import hygiene_required as _hygiene_required
+        """Always raises: ``U64_TEMP_GC_REQUIRED=0`` does **not** lift this.
 
+        That variable downgrades the "hygiene impossible" refusal only
+        (#513 re-verify, finding 1): letting it lift this one let an unlocked
+        process upload without any sweep at all. ``temp_hygiene=False`` is
+        the one explicit disarm.
+        """
         message = (
             f"refusing {operation} on {self.host}: this device's firmware leaks "
             "a /Temp attachment for every request that carries a body, and "
@@ -1162,12 +1165,16 @@ class Ultimate64Client:
             "whose turn it is in the device queue. Hold the DeviceLock -- "
             "create_manager(backend=\"u64\"), DeviceLock(host), or "
             "scripts/_u64_host.py hold_device_lock(host) -- for the whole run. "
-            "To proceed anyway set U64_TEMP_GC_REQUIRED=0, or pass "
-            "temp_hygiene=False. See docs/device_locking.md."
+            "U64_TEMP_GC_REQUIRED=0 does not lift this refusal; pass "
+            "temp_hygiene=False to disarm the pass deliberately. See "
+            "docs/device_locking.md."
         )
-        if _hygiene_required():
-            raise Ultimate64TempHygieneError(message)
-        _log.warning("U64_TEMP_GC_REQUIRED=0: proceeding anyway. %s", message)
+        raise Ultimate64TempHygieneError(message)
+
+    def _temp_lock_held(self) -> bool:
+        from . import ultimate64_temp_gc as _gc
+
+        return _gc.lock_held_for(self._device_key)
 
     def _sweep_keep(self) -> int:
         from .ultimate64_temp_gc import sweep_keep as _sweep_keep
@@ -1380,6 +1387,20 @@ class Ultimate64Client:
                     # ever completed a request, fake hosts included.
                     self._maybe_reprobe_capabilities()
                 if not self.temp_hygiene_armed:
+                    return False
+                if (
+                    not under_lock
+                    and self._leak_prone_grade()
+                    and not self._temp_lock_held()
+                ):
+                    # Only a lock holder sweeps or writes config on a
+                    # leak-prone grade (#513): a close() after the lock is
+                    # gone leaves /Temp to the next holder's handover sweep.
+                    _log.debug(
+                        "U64 /Temp drain on %s (%s): this process does not hold "
+                        "the device lock; not sweeping",
+                        self.host, reason,
+                    )
                     return False
                 if leaked:
                     self._run_temp_hygiene(reason)

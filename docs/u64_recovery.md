@@ -272,7 +272,11 @@ anything is sent. Neither applies to a post-safe grade, even when
   does not hold the device's `DeviceLock` (in any lock directory) gets no
   sweep and no FTP-enable. Its attachment-creating requests are refused
   with `Ultimate64TempHygieneError`, and the message says to hold the lock.
-  The free `liveness_probe` is refused the same way. This was a supervisor
+  **`U64_TEMP_GC_REQUIRED=0` does not lift this refusal**; only
+  `temp_hygiene=False` disarms it (#513 re-verify: under REQUIRED=0 an
+  unlocked process had uploaded 20 times with no sweep). A `close()`
+  after the lock is gone does not sweep or write config either. The free
+  `liveness_probe` is refused the same way. This was a supervisor
   ruling on the #513 review, following CLAUDE.md rule 4 and #264. Every
   in-repo uploader already holds the lock: scripts via
   `hold_device_lock`, pytest via the conftest guard, and
@@ -498,7 +502,8 @@ retried; if it still fails, further body-carrying POSTs raise
 `Ultimate64TempHygieneError` naming the remedy. Bodyless calls (`reset`,
 `reboot`, config PUTs, `readmem`) keep working, so a blocked client can
 still drive recovery. Opt out with `U64_TEMP_GC_REQUIRED=0` (downgrades
-to a warning) or `temp_hygiene=False` (disarms the pass entirely). None
+this refusal to a warning, but not the refusal of an unlocked process on
+a leak-prone grade) or `temp_hygiene=False` (disarms the pass entirely). None
 of this arms on a `writemem_post_safe=True` device: no FTP, no config
 mutation, no refusal.
 
