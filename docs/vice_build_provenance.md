@@ -15,6 +15,12 @@ Every factual claim carries one of three marks:
 - **U** — explicitly unverified.
 
 Recorded on macOS 26.6.2 (build 25G83), Apple Silicon (arm64), Homebrew 6.0.20.
+Re-read on 2026-09-28 after the bench moved to macOS 27.0 (26A428), Homebrew
+7.0.6 (T, read-only): the bottle is still `vice/3.10`, `/opt/homebrew/bin/x64sc`
+still links to `../Cellar/vice/3.10/bin/x64sc`, `x64sc -features` still reports
+`HAVE_RAWNET yes` / `HAVE_PCAP yes` / `HAVE_TUNTAP no` on both the bottle and the
+local build, and `sudo -n -l` lists the same NOPASSWD rules. Nothing that needs
+a launch was re-run.
 
 ---
 
@@ -115,7 +121,7 @@ itself:
 - It behaves identically to a from-source `--enable-ethernet` build across every
   ethernet invocation tested (finding 2 below).
 
-**Ethernet capability is now probed, not configured.**
+**Ethernet capability is probed, not configured.**
 `resolve_vice_executable()` probes `-features` on whatever binary it resolves, so
 the `PATH` x64sc is verified rather than assumed. `VICE_ETHERNET_BIN`
 (equivalently `ViceConfig(ethernet_executable=...)`, whose default reads that
@@ -135,17 +141,15 @@ User someone may run the following commands on Offensive-Bias:
     (root) NOPASSWD: /opt/homebrew/bin/brew reinstall --HEAD vice, … install --HEAD vice, … uninstall vice
 ```
 
-Corroborated by a successful elevated launch (T, `vice-remediation`):
+Corroborated by a successful elevated launch (T):
 `sudo -n /opt/homebrew/bin/x64sc -console -default …` ran as root. A `sudo -n`
-that succeeds is itself proof of a NOPASSWD rule for that exact command —
-stronger evidence than reading the sudoers file.
+that succeeds is itself proof of a NOPASSWD rule for that exact command.
 
 **This sudoers shape misleads in both directions. Two probes that do not
 answer the question:**
 
 - `sudo -n true` prompts, because `true` has no NOPASSWD rule. It says nothing
-  about whether some *other* command does. Phase 0 of this audit drew the wrong
-  conclusion from exactly this — that no elevated run was possible at all.
+  about whether some *other* command does.
 - `sudo -n -l -- <cmd>` exits 0 for **anything** the user may run, `/bin/ls`
   included, because of the `(ALL) ALL` line. A per-command probe of this form is
   vacuous.
@@ -168,10 +172,8 @@ and invoke that same form. Two ways to get this wrong, both handled by
   *as an absolute path*, so a bare `x64sc` can never be the thing a rule
   authorises. Separately, Linux sudoers commonly set a `secure_path` that omits
   Homebrew-style prefixes, so there the bare name also fails "command not found"
-  under sudo. Stock macOS sets no `secure_path` — `sudo -n -l` lists no such
-  Default and `sudo -n x64sc -features` exits 0 (T, measured) — so an earlier
-  version of this bullet, which blamed `secure_path` on macOS, stated a false
-  premise; the conclusion stands for the sudoers-matching reason.
+  under sudo. Stock macOS sets no `secure_path` (`sudo -n -l` lists no such
+  Default, T), so on macOS the sudoers-matching reason alone applies.
   `ViceConfig.executable` defaults to the bare name, so every elevated launch
   from a default config depends on this. Resolving PATH is mandatory.
 
@@ -247,17 +249,12 @@ $ echo $?
 This refutes any launcher heuristic that treats a user-openable `/dev/bpf*` as
 grounds to skip elevation.
 
-**Root side (T, `vice-remediation`).** Phase 0 recorded this as unverifiable,
-having concluded from `sudo -n true` prompting that no elevated run was possible.
-That conclusion was wrong — see "Reference binary" above for why that probe does
-not answer the question. An elevated launch was subsequently made:
-`sudo -n /opt/homebrew/bin/x64sc -console -default …` ran as root (sudo wrapper
-pid 4636, x64sc 4637), the binary monitor came up, and the process held **two BPF
-descriptors, one bound to `feth0`**.
-
-So as root the pcap driver is selected and a BPF device *is* attached, matching
-the source reading in this finding. Issue #144's claim that capture silently
-fails even when elevated is not supported by that run.
+**Root side (T).** An elevated launch,
+`sudo -n /opt/homebrew/bin/x64sc -console -default …`, ran as root, the binary
+monitor came up, and the process held **two BPF descriptors, one bound to
+`feth0`**. So as root the pcap driver is selected and a BPF device *is* attached,
+matching the source reading in this finding (issue #144's contrary claim is
+refuted; see `docs/bridge_networking.md` § "Issue #144 is refuted").
 
 ### 2. Enabling the ethernet cart unelevated segfaults — upstream, not a packaging defect
 

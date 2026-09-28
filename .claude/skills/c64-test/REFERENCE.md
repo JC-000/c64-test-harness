@@ -6,13 +6,15 @@
 pip install -e /path/to/c64-test-harness
 ```
 
-The package is `c64_test_harness`. All public symbols are re-exported from the top-level `__init__.py`. The package version is exposed as `c64_test_harness.__version__` (via `importlib.metadata`).
+Working on this repo itself, use the existing venv at `~/.local/share/c64-test-harness/venv/` (created by `scripts/setup-dev-env.sh`; never a new one inside the repo or a worktree).
+
+The package is `c64_test_harness`. Most public symbols are re-exported from the top-level `__init__.py`; entries below that are not (e.g. `ShortReadError`, `max_cpu_speed_mhz`, `Ultimate64TempHygieneError`, the `CS8900A_*` constants) say which module to import from. The package version is exposed as `c64_test_harness.__version__` (via `importlib.metadata`).
 
 ---
 
 ## Memory Safety (`MemoryPolicy`)
 
-The harness has fixed scratch addresses (authoritative list: `HARNESS_SCRATCH` in `memory_policy.py`, rendered into `docs/memory_safety.md` by `scripts/gen_memory_table.py`; highlights: `$0334` jsr trampoline, `$0360`+`$03F0`-`$03F1` `run_subroutine`, `$0277`/`$00C6` keyboard buffer, `$C000-$C3FF` UCI block, `$C400-$C87D` UCI socket-write scratch, `$C000`+`$0339`+`$033C` SID player, `$CF00` test-suite BASIC-restore stub). Any host-side `write_memory()` into a region the consumer also uses silently collides — the 6502 has no MMU. `MemoryPolicy` enforces an allow-list / deny-list at the transport boundary; violations raise `MemoryPolicyError` before any byte crosses the wire.
+The harness has fixed scratch addresses (authoritative list: `HARNESS_SCRATCH` in `memory_policy.py`, rendered into `docs/memory_safety.md` by `scripts/gen_memory_table.py`; highlights: `$0334` jsr trampoline, `$0360`+`$03F0`-`$03F1` `run_subroutine`, `$0277`/`$00C6` keyboard buffer, `$C000-$C3FF` UCI block, `$C400-$CAC1` UCI socket-write and multi-block read scratch, `$C000`+`$0339`+`$033C` SID player, `$CF00` test-suite BASIC-restore stub). Any host-side `write_memory()` into a region the consumer also uses silently collides — the 6502 has no MMU. `MemoryPolicy` enforces an allow-list / deny-list at the transport boundary; violations raise `MemoryPolicyError` before any byte crosses the wire.
 
 ```python
 from c64_test_harness import MemoryPolicy, MemoryRegion, UnknownPolicy
@@ -87,10 +89,10 @@ Structural protocol satisfied by both `ViceInstanceManager` and `Ultimate64Insta
 - `release(instance) -> None`
 - `shutdown() -> None`
 
-### `create_manager(backend="auto", *, lock_timeout=60.0, **kwargs) -> UnifiedManager`
+### `create_manager(backend="auto", *, lock_timeout=None, **kwargs) -> UnifiedManager`
 Factory function. `backend="auto"` reads `C64_BACKEND` env var (defaults to `"vice"`).
 
-- `lock_timeout: float` — cross-process device-lock timeout in seconds (U64 only); threaded through `UnifiedManager` to `_LockedU64Manager` (which now calls `lock.acquire_or_raise(timeout=lock_timeout)` and raises `DeviceLockTimeout` on failure — see below). Default 60.0; bounds the wait against **wedged or dead** holders only — healthy holders heartbeat the lockfile every ~15 s and extend the deadline implicitly, so widening this past ~120 s is rarely useful (see PATTERNS § "Pattern 9a: Queueing for the U64").
+- `lock_timeout: float | None` — cross-process device-lock timeout in seconds (U64 only); threaded through `UnifiedManager` to `_LockedU64Manager`, which calls `lock.acquire_or_raise(...)` and raises `DeviceLockTimeout` on failure (see below). `None` (the default) resolves at acquire time to `$U64_DEVICE_LOCK_TIMEOUT`, else 60 s (`unified_manager.DEFAULT_LOCK_TIMEOUT`); a malformed, non-positive or non-finite env value raises `DeviceLockTimeoutConfigError` (a `ValueError`) before any device contact. It bounds the wait against **wedged or dead** holders only — healthy holders heartbeat the lockfile every ~15 s and extend the deadline implicitly, so widening this past ~120 s is rarely useful (see PATTERNS § "Pattern 9a: Queueing for the U64").
 
 **U64 cross-process safety:** When the U64 backend is selected, `UnifiedManager` automatically wraps device access with `DeviceLock` via `_LockedU64Manager`. Multiple agents (separate OS processes) queue for the same physical device automatically.
 
@@ -180,7 +182,7 @@ Uses OS-level `bind()` + file-based `flock()` locks to hold ports so concurrent 
 ### `PortLock`
 File-based cross-process lock using `fcntl.flock()`. **Used internally by `PortAllocator`** -- do not use directly.
 
-Lockfiles are stored in `$XDG_RUNTIME_DIR/c64-test-harness/` (fallback: `/tmp/c64-test-harness-{uid}/`). The kernel auto-releases locks when the process exits (crash-safe).
+Lockfiles are stored in `/tmp/c64-test-harness-{uid}/` on macOS (where `$XDG_RUNTIME_DIR` is normally unset), else `$XDG_RUNTIME_DIR/c64-test-harness/`. The kernel auto-releases locks when the process exits (crash-safe).
 - `acquire() -> bool` -- Non-blocking exclusive lock; writes metadata (PID, timestamp)
 - `release()` -- Unlock fd (best-effort). Does NOT delete lockfile (inode race safety)
 - `update_vice_pid(pid)` -- Update metadata with VICE process PID
@@ -229,7 +231,7 @@ All functions take `transport` as first arg (stateless).
 
 - `read_bytes(transport, addr, length) -> bytes` -- Read bytes from addr. Contains legacy auto-chunking at 256 bytes (unnecessary with binary transport but harmless).
 - `read_bytes_chunked(transport, addr, length, chunk_size=128) -> bytes` -- Explicitly chunked read for large regions. A chunk that comes back short is retried once, then raises `ShortReadError` instead of silently returning a truncated, misaligned result.
-- `ShortReadError` -- Raised by `read_bytes_chunked` on a persistent short chunk. Attributes: `.addr`, `.requested`, `.got`. (Module-level export, not re-exported from the package root.)
+- `ShortReadError` -- Raised by `read_bytes_chunked` on a persistent short chunk. Attributes: `.addr`, `.requested`, `.got`. (Import from `c64_test_harness.memory`; not re-exported from the package root.)
 - `read_bytes_verified(transport, addr, length, *, max_attempts=2) -> bytes` -- Re-reads on disagreement until two consecutive reads match; raises `FlakeyReadError` if `max_attempts` reads all disagree pairwise. Diagnostic added in PR #88 for downstream tests suspecting issue-#88-style flakey reads (VICE binary monitor response-type misrouting). Doubles wire traffic per read — only use when a flake is actively suspected; the PR also tightened the read path to raise `TransportError` on `response_type` mismatch, which is usually the faster diagnostic.
 - `FlakeyReadError` -- Raised by `read_bytes_verified` on persistent disagreement. Attributes: `.addr`, `.length`, `.attempts: list[bytes]` (the disagreeing reads in order). Inspect to distinguish structured corruption (every-other-byte ±1) from random truncation.
 - `write_bytes(transport, addr, data) -> None` -- Write data to addr (accepts bytes or list[int]). Auto-chunks. On an Ultimate transport it chunks at `transport.rest_put_chunk_size` (the client's `write_mem_query_threshold`, capped at 128), so every chunk is a PUT on every grade (#252). On a post-safe device that is more, smaller requests, a cost accepted by owner decision 2026-09-15. On VICE and other transports it chunks at 84 bytes, the legacy text-monitor limit (unnecessary with the binary transport but harmless). Subject to `MemoryPolicy` enforcement at the transport (see "Memory Safety" section above).
@@ -243,7 +245,7 @@ All functions take `transport` as first arg (stateless).
 
 All functions take `transport: BinaryViceTransport` as first arg (stateless). These functions use the binary monitor's native checkpoint and register commands.
 
-- `load_code(transport, addr, code) -> None` -- Write executable bytes (semantic alias for `write_memory`). It chunks exactly as `write_memory` does (#252): on a U64 not graded `writemem_post_safe` (leak-prone, unprobed or unknown) a blob above `write_mem_query_threshold` is split into PUT-sized pieces that leave no `/Temp` attachment — at the price of no longer being one DMA transaction, so the 6510 runs between pieces — while on a post-safe device it stays one POST, which that firmware collects. That matters because most real builder output is over the ceiling, and the size depends on the arguments — measured at this head: `build_socket_write` 170 (payload-independent), `build_ping_and_wait_code` 256 plain but 362 with ARP + drain + `drain_status_addr`, `build_icmp_responder_code` 630 with `my_mac` set (401 without, but `my_mac` is the form the RR-Net pattern requires). Every variant is over 128, so on a leak-prone grade every one of them is chunked. `memory.write_bytes` gives the same PUT-only result on **every** grade, post-safe included: it chunks at the transport's `rest_put_chunk_size` (the client threshold, capped at 128), a choice made by owner decision 2026-09-15 (#252). See PATTERNS § "`/Temp` attachment hygiene".
+- `load_code(transport, addr, code) -> None` -- Write executable bytes (semantic alias for `write_memory`). It chunks exactly as `write_memory` does (#252): on a U64 not graded `writemem_post_safe` (leak-prone, unprobed or unknown) a blob above `write_mem_query_threshold` is split into PUT-sized pieces that leave no `/Temp` attachment — at the price of no longer being one DMA transaction, so the 6510 runs between pieces — while on a post-safe device it stays one POST, which that firmware collects. That matters because most real builder output is over the ceiling, and the size depends on the arguments — at 0e56950: `build_socket_write` 176 (446 with `turbo_safe=True`; payload-independent), `build_ping_and_wait_code` 336 plain but 515 with ARP + drain + `drain_status_addr`, `build_icmp_responder_code` 783 with `my_mac` set (481 without, but `my_mac` is the form the RR-Net pattern requires). Every variant is over 128, so on a leak-prone grade every one of them is chunked. `memory.write_bytes` gives the same PUT-only result on **every** grade, post-safe included: it chunks at the transport's `rest_put_chunk_size` (the client threshold, capped at 128), a choice made by owner decision 2026-09-15 (#252). See PATTERNS § "`/Temp` attachment hygiene".
 - `set_register(transport, name, value) -> None` -- Set CPU register via `transport.set_registers({name: value})`
 - `goto(transport, addr, *, cold=False) -> None` -- Set PC via `transport.set_registers({"PC": addr})` then `transport.resume()`. A **one-way** jump: control never returns, so nothing is restored. This is **not** the `jsr()` defect of #183 despite that issue's wording (corrected in a comment there; see #192) -- a restore needs a moment when control comes back, and `goto()` has none. By default the target inherits the stack frame and `I` flag of whatever the monitor halted, interrupt handler included. `cold=True` writes `SP=$FF` and `FL=$20` (`I` and `D` clear) alongside `PC` in the same register command: "start this as if nothing was running". It does **not** reset the machine (vectors, I/O and zero page are as the previous program left them) and does **not** acknowledge a pending interrupt, so a target entered with `I` newly cleared may take that interrupt at once. It needs `SP` and `FL` in the transport's register map; a map without them refuses the whole write, leaving the CPU halted where it was. The alternative is caller-side: rebuild `SP` in the target, e.g. the warm-start `JMP ($A002)` idiom in `sid_player.py` (which wants BASIC running afterwards and so cannot use `cold`). Not the same knob as `jsr()`'s `preserve_state`, which asks for the opposite.
 - `set_breakpoint(transport, addr) -> int` -- Calls `transport.set_checkpoint(addr)`, returns checkpoint ID
@@ -326,8 +328,8 @@ Key fields:
 - `screen_poll_interval` (default 2.0) -- poll interval for `wait_for_text()`/`wait_for_stable()`. Decrease for graphics-heavy tests.
 - `vice_ethernet` (default False) -- enable CS8900a ethernet cartridge emulation
 - `vice_ethernet_mode` (default "rrnet") -- "rrnet" or "tfe"
-- `vice_ethernet_interface` (default "") -- host network interface. Values typically come from `tests/bridge_platform.py` (`tap-c64-0`/`tap-c64-1` on Linux, `feth0`/`feth1` on macOS).
-- `vice_ethernet_driver` (default "") -- `"tuntap"` on Linux, `"pcap"` on macOS (see `bridge_platform.ETHERNET_DRIVER`).
+- `vice_ethernet_interface` (default "") -- host network interface. Values typically come from `tests/bridge_platform.py` (`feth0`/`feth1` on macOS, `tap-c64-0`/`tap-c64-1` on Linux).
+- `vice_ethernet_driver` (default "") -- `"pcap"` on macOS, `"tuntap"` on Linux (see `bridge_platform.ETHERNET_DRIVER`).
 - `vice_ethernet_base` (default 0xDE00) -- I/O base address
 - `u64_baseline_on_entry` (default `None`, tri-state) -- U64 reset-on-entry to factory default (issue #227). TOML `[u64] baseline_on_entry = true` (a TOML `false` is an explicit off); env `U64_BASELINE_ON_ENTRY=1` — the one name, resolved by `from_env()` through the same precedence the manager uses (`C64TEST_U64_BASELINE_ON_ENTRY` wins when both are set). `None` means "nobody asked": pass it straight through as `UnifiedManager(..., baseline_on_entry=cfg.u64_baseline_on_entry)` and the manager resolves it at `acquire()` — env var first, then the device's generation (on for the U64E, off for the C64U, off for an unreadable generation; #285). Keeping it `None` is what stops the wiring from turning an inherited default into an explicit request, and what keeps the shell switch working for consumers that wire the config.
 
@@ -359,7 +361,7 @@ ViceConfig(
     ethernet=False,         # Enable CS8900a ethernet cartridge
     ethernet_mode="rrnet",  # "rrnet" (matches ip65 + physical cart) or "tfe"
     ethernet_interface="",  # Host interface; use bridge_platform.IFACE_A / IFACE_B
-    ethernet_driver="",     # "tuntap" (Linux) or "pcap" (macOS); see bridge_platform.ETHERNET_DRIVER
+    ethernet_driver="",     # "pcap" (macOS) or "tuntap" (Linux); see bridge_platform.ETHERNET_DRIVER
     ethernet_base=0xDE00,   # I/O base address
     ethernet_mac=b"",       # 6-byte MAC (empty = auto-generated by manager)
     # Platform: launch VICE as root via `sudo -n` (macOS BPF attach needs it)
@@ -390,8 +392,8 @@ with ViceProcess(config) as vice:
 `ViceInstanceManager._start_or_adopt()` uses a retry-connect pattern to establish a `BinaryViceTransport` connection after starting VICE, rather than a dedicated wait method.
 
 Static methods:
-- `ViceProcess.kill_on_port(port) -> bool` -- Kill process listening on port (Linux `/proc/net/tcp`, macOS `lsof`)
-- `ViceProcess.get_listener_pid(port) -> int | None` -- Return PID of process listening on port (Linux `/proc/net/tcp`, macOS `lsof`)
+- `ViceProcess.kill_on_port(port) -> bool` -- Kill process listening on port (macOS `lsof`, Linux `/proc/net/tcp`)
+- `ViceProcess.get_listener_pid(port) -> int | None` -- Return PID of process listening on port (macOS `lsof`, Linux `/proc/net/tcp`)
 
 ---
 
@@ -506,28 +508,29 @@ set_cs8900a_mac(transport, mac, base=0xDE00)
 
 ## Module: capture
 
-Host-side raw ethernet capture/injection for TX/RX ethernet tests, platform-selected: Linux `AF_PACKET`/`SOCK_RAW` (needs `CAP_NET_RAW`/root), macOS `/dev/bpf*` via `BIOCSETIF` (issue #158 — before this module the TX/RX tests skipped on macOS entirely; needs a world-rw BPF node, see `docs/bridge_networking.md` § "macOS test-author traps" item 4 for the chmod/reboot caveats). `open_capture(iface) -> PacketCapture` returns the platform implementation or raises `CaptureUnavailable` naming the remedy verbatim — skip tests with that message, not a paraphrase. `parse_bpf_records()` is the pure BPF-buffer parser, pinned without a device by `tests/test_capture.py`. Full design in `docs/bridge_networking.md`.
+Host-side raw ethernet capture/injection for TX/RX ethernet tests, platform-selected: macOS `/dev/bpf*` via `BIOCSETIF` (issue #158; needs a world-rw BPF node, and every dnsmasq rig on the bench holds one, so the chmod must cover `bpf4+` — see `docs/bridge_networking.md` § "macOS test-author traps" item 4 for the chmod/reboot caveats), Linux `AF_PACKET`/`SOCK_RAW` (needs `CAP_NET_RAW`/root; last verified 2026-04). `open_capture(iface) -> PacketCapture` (import from `c64_test_harness.capture`, as `CaptureUnavailable`; neither is a package-root export) returns the platform implementation or raises `CaptureUnavailable` naming the remedy verbatim — skip tests with that message, not a paraphrase. `parse_bpf_records()` is the pure BPF-buffer parser, pinned without a device by `tests/test_capture.py`. Full design in `docs/bridge_networking.md`.
 
 ---
 
 ## Module: tests.bridge_platform
 
-Platform-dispatch module for bridge/ethernet tests. **Tests MUST import from here instead of hardcoding `tap-c64-*`, `br-c64`, `/sys/class/net/...`, or `tuntap`.** Lives in `tests/` so it's importable from pytest fixtures and conftest without touching the library package.
+Platform-dispatch module for bridge/ethernet tests. **Tests MUST import from here instead of hardcoding `feth*`, `bridge10`, `pcap`, or the Linux `tap-c64-*` / `br-c64` / `tuntap` names.** Lives in `tests/` so it's importable from pytest fixtures and conftest without touching the library package.
 
 ### Constants (platform-dispatched at import time)
 
-| Name | Linux | macOS |
+| Name | macOS (primary) | Linux (last verified 2026-04) |
 |------|-------|-------|
-| `IFACE_A` | `tap-c64-0` | `feth0` |
-| `IFACE_B` | `tap-c64-1` | `feth1` |
-| `BRIDGE_NAME` | `br-c64` | `bridge10` |
-| `ETHERNET_DRIVER` | `tuntap` | `pcap` |
-| `SETUP_HINT` | `"run sudo scripts/setup-bridge-tap.sh"` | `"run sudo scripts/setup-bridge-feth-macos.sh"` |
+| `IFACE_A` | `feth0` | `tap-c64-0` |
+| `IFACE_B` | `feth1` | `tap-c64-1` |
+| `BRIDGE_NAME` | `bridge10` | `br-c64` |
+| `ETHERNET_DRIVER` | `pcap` | `tuntap` |
+| `SETUP_HINT` | `"run sudo scripts/setup-bridge-feth-macos.sh"` | `"run sudo scripts/setup-bridge-tap.sh"` |
 
 ### Helpers
 
-- `iface_present(name: str) -> bool` — dispatches `/sys/class/net/<name>` (Linux) vs `ifconfig <name>` (macOS). Use in skip gates.
-- `first_available_ethernet_iface() -> str | None` — returns the first interface whose name prefix matches the platform (`tap` / `feth`), or `None`.
+- `iface_present(name: str) -> bool` — dispatches `ifconfig <name>` (macOS) vs `/sys/class/net/<name>` (Linux). Use in skip gates.
+- `first_available_ethernet_iface() -> str | None` — returns the first interface whose name prefix matches the platform (`feth` / `tap`), or `None`.
+- `bpf_attached_interfaces(pid) -> list[str]` — macOS: the interfaces a process holds a BPF attach on, read from `netstat -B` (never `lsof`, which returns nothing for a root-owned process). `probe_vice_pcap_ok` uses it to require a real attach.
 - `probe_vice_pcap_ok(iface: str | None = None, timeout: float = 3.0) -> tuple[bool, str]` — **macOS-only** active probe. Launches a throwaway x64sc via `sudo -n` using the production `-addconfig` invocation to see whether the pcap driver survives cart activation; returns `(ok, reason)` where `reason` is a human-readable skip message on failure. Cached per-process — cheap to call many times.
 
 ### Env overrides for `probe_vice_pcap_ok`
@@ -555,7 +558,7 @@ pytestmark = [
 
 Keep a module-specific gate (e.g. `probe_vice_pcap_ok`'s active launch-and-crash probe, or `BRIDGE_CLEANUP_LIVE` opt-in) as its own `skipif` alongside the marker — only the four *static* prerequisites above belong to `elevation(...)`.
 
-A fixture that launches `ViceProcess(ethernet=True)` (rather than a test carrying the marker) should route through `start_vice_or_skip(config, request.node.nodeid)` (in `tests/conftest.py`) instead of `with ViceProcess(config) as vice:` — it converts a mid-launch `ViceElevationRequiredError` (e.g. a bypassed preflight probe) into the same skip/fail + record, so the session-end notice covers it too.
+A fixture that launches `ViceProcess(ethernet=True)` (rather than a test carrying the marker) should route through `start_vice_or_skip(config)` (in `tests/conftest.py`) instead of `with ViceProcess(config) as vice:` — it converts a mid-launch `ViceElevationRequiredError` (e.g. a bypassed preflight probe) into the same skip/fail + record, so the session-end notice covers it too.
 
 `C64_REQUIRE_ELEVATION=1` mirrors `C64_REQUIRE_VICE=1` (the env var that fails a run instead of silently certifying the VICE backend from mocks when no `vice_live` test executes): a missing elevation prerequisite fails at setup instead of skipping, and `pytest_sessionfinish` always prints an `ELEVATION REQUIRED: N test(s) skipped` section — kind, count, remedy — whenever anything was skipped for elevation, without needing `-rs`. See `docs/development.md` "Live test gates" for the full writeup of both knobs.
 
@@ -575,7 +578,7 @@ prg = PrgFile.from_file("build/program.prg")
 
 ## Module: debug
 
-- `dump_screen(transport, label="") -> str` -- Save screen contents to file for debugging; returns the dump text
+- `dump_screen(transport, label="") -> str` -- Capture the screen, print the formatted dump to stdout and return it. A snapshot, not a waiter: like `ScreenGrid.from_transport`, it **leaves the CPU paused on VICE**, so calling it in a loop never advances the machine.
 
 ---
 
@@ -585,9 +588,9 @@ prg = PrgFile.from_file("build/program.prg")
 Optional base class for hardware backends. Provides default screen dimensions. Subclasses must implement all methods of the `C64Transport` protocol.
 
 ```python
-class Ultimate64Transport(HardwareTransportBase):
+class MyHardwareTransport(HardwareTransportBase):   # Ultimate64Transport is one
     def read_memory(self, addr, length):
-        return self._serial.read_mem(addr, length)
+        return self._device.read_mem(addr, length)
     # ... etc
 ```
 
@@ -654,21 +657,21 @@ Exception mapping: timeouts, unreachable device, and connection drops mid-reques
 - `client.pause()` -- Halt the emulated CPU
 - `client.resume()` -- Resume the emulated CPU
 
-**PRG/runner endpoints** (all use POST, not PUT — verified on 3.14; unchanged on the bench U64E 3.15 fork and the C64U 1.1.0, which the harness still drives with POST). **Every one of these carries the payload as an HTTP body, so on firmware predating GideonZ/1541ultimate#686 each call leaks one managed `/Temp` attachment — and `run_prg` leaks a second attachment for the sideload's own POST when its 404 fallback fires, since that re-sends the whole PRG body through an unchunked `write_mem` (`run_prg`'s 404 sideload path); whether the 404'd runner POST also leaves one is **unmeasured** (see PATTERNS for why the obvious experiment settles it in only one direction). A 404 from that endpoint is a wedge symptom, so the fallback doubles the cost exactly when the device is closest to the edge; pass `fallback_on_404=False` on a leak-prone device to see the 404 instead**, and enough accumulation **crashes the device firmware** — REST and the UCI bridge go down together and only a physical power-cycle recovers it. **A full `/Temp` crashes the firmware** (owner, 2026-09-15): the C64 FPGA keeps running while the firmware stops answering both the network and the physical menu button. The RAM disk is **16 MiB** (`ramdisk.cc` sizes it from `__ram_disk_start`=`0x02000000` / `__ram_disk_limit`=`0x03000000` in `target/u64{,ii}/riscv/ultimate/linker.x` at tag `1.1.0`; its "3 MB" comment is stale — issue #261), but how many uploads fill it before the crash is not known, and no count is kept. Size the budget conservatively as though attachments were counted; that is a choice about which error to make, not a measured limit. Note the GC cannot rescue you afterwards: **FTP is part of the firmware that crashes**, so prevention is the only option. `DeviceCapabilities.writemem_post_safe` is the per-device switch; see PATTERNS § "`/Temp` attachment hygiene" for the full leak/no-leak table and the budget.
+**PRG/runner endpoints** (all POST — verified on 3.14; unchanged on the bench U64E 3.15 fork and the C64U 1.1.0). **Every one carries the payload as an HTTP body, so on firmware predating GideonZ/1541ultimate#686 each call leaks one managed `/Temp` attachment**, and `run_prg`'s 404 sideload fallback leaks a second: it re-sends the whole PRG through an unchunked `write_mem` POST (whether the 404'd runner POST also leaves one is unmeasured). A 404 from that endpoint is a wedge symptom, so pass `fallback_on_404=False` on a leak-prone device to see the 404 instead. A full `/Temp` **crashes the device firmware** (owner, 2026-09-15): REST and the UCI bridge go down together, the FPGA keeps running, the physical menu button stops responding, and only a physical power-cycle recovers it. The RAM disk is **16 MiB** (`ramdisk.cc` sizes it from `__ram_disk_start`=`0x02000000` / `__ram_disk_limit`=`0x03000000` in `target/u64{,ii}/riscv/ultimate/linker.x` at tag `1.1.0`; its "3 MB" comment is stale — issue #261); how many uploads fill it is not known and no count is kept. The GC cannot rescue you afterwards — **FTP is part of the firmware that crashes** — so prevention is the only option. `DeviceCapabilities.writemem_post_safe` is the per-device switch; see PATTERNS § "`/Temp` attachment hygiene" for the leak/no-leak table and the budget.
 - `client.run_prg(data, *, fallback_on_404=True)` -- Load and RUN a PRG (resets C64 internally). When `fallback_on_404=True` (default) and the runner endpoint returns HTTP 404 (fw 3.14d wedged-runner symptom), the call transparently sideloads via `write_mem(load_addr, body)` using the PRG's first two header bytes as the load address (little-endian) and triggers via `send_text("RUN")` for load address `$0801` (BASIC-stub PRG — `SYS 2049` would execute the BASIC line-link bytes as opcodes) or `send_text("SYS <addr>")` for any other load address (pure ML). A `logging.warning` naming the trigger is emitted when the fallback fires. Pass `fallback_on_404=False` to surface the 404 as a plain `Ultimate64Error`.
 - `client.load_prg(data)` -- Load a PRG into memory without running
 - `client.run_crt(data)` -- Start a cartridge image
 - `client.sid_play(data, songnr=0)` -- Play a .sid tune
 - `client.mod_play(data)` -- Play a .mod file
-- `client.gc_temp_folder(*, keep=None, ftp_port=None, ftp_username=None, ftp_password=None, timeout=None) -> TempGCResult` -- best-effort FTP sweep of the device's leaked `/Temp` attachments, oldest-first, keeping the youngest `keep` (default 2). **Never raises** — an FTP or network failure comes back as `result.error`, and `result.ok` is False. A result with `.error` set is a *failed* hygiene pass, not a benign skip — and once a pass has failed on an armed client, **every later attachment-creating request raises `Ultimate64TempHygieneError`** (`_before_temp_attachment` / `_refuse_or_warn` in `backends/ultimate64_client.py`) instead of proceeding. It is **not** a package-root export — import it from `c64_test_harness.backends.ultimate64_client`, or catch the root-level `Ultimate64Error` it derives from. Opt out with `U64_TEMP_GC_REQUIRED=0` (refusal downgrades to a WARNING) or `temp_hygiene=False` (disarms the pass). It needs the device's FTP File Service, which is `Disabled` **by default** on 1.1.0 — verify it is on rather than assuming it; where it is off the sweep silently no-ops and the failure mode is "cleanup appeared to run, device wedged anyway". Verified end-to-end against a C64U over anonymous FTP on 2026-09-10 (`keep=0` deleted the one attachment a 129-byte POST had just created). Acquires no lock of its own — call it while already holding the device's `DeviceLock`. **You rarely call it yourself**: since commit f2b46ce the client arms hygiene on its own against leak-prone firmware (`client.temp_hygiene_armed`, `ultimate64_client.py:674` — `temp_hygiene=` kwarg first, then `$U64_AUTO_TEMP_GC` as a both-ways override, then `DeviceCapabilities.runner_wedge_possible is not False`), spends `client.temp_gc_budget` attachment-creating requests (`DEFAULT_LEAK_BUDGET = 6`; `temp_gc_budget=` or `$U64_TEMP_GC_BUDGET`) before sweeping, and drains again on `close()` and on `DeviceLock` release. A client that never probed capabilities — including one given an explicit `write_mem_query_threshold=`, which issues no HTTP at construction — stays **disarmed**; force it with `temp_hygiene=True` or `U64_AUTO_TEMP_GC=1`. Env overrides: `U64_TEMP_GC_KEEP`, `U64_TEMP_GC_BUDGET`, `U64_TEMP_GC_REQUIRED`, `U64_TEMP_GC_FTP_USER`, `U64_TEMP_GC_FTP_PASSWORD`. A no-op on firmware carrying #686.
+- `client.gc_temp_folder(*, keep=None, ftp_port=None, ftp_username=None, ftp_password=None, timeout=None) -> TempGCResult` -- best-effort FTP sweep of the device's leaked `/Temp` attachments, oldest-first, keeping the youngest `keep` (default 2). **Never raises** — an FTP or network failure comes back as `result.error`, and `result.ok` is False. A result with `.error` set is a *failed* hygiene pass, not a benign skip — and once a pass by a client that leaked has failed, **every later attachment-creating request on that client raises `Ultimate64TempHygieneError`** (`_before_temp_attachment` / `_refuse_or_warn` in `backends/ultimate64_client.py`) instead of proceeding. `Ultimate64TempHygieneError` is **not** a package-root export — import it from `c64_test_harness.backends.ultimate64_client`, or catch the root-level `Ultimate64Error` it derives from. Opt out with `U64_TEMP_GC_REQUIRED=0` (refusal downgrades to a WARNING) or `temp_hygiene=False` (disarms the pass). It needs the device's FTP File Service, which is `Disabled` **by default** on 1.1.0 — verify it is on rather than assuming it; where it is off the sweep silently no-ops and the failure mode is "cleanup appeared to run, device wedged anyway". Verified end-to-end against a C64U over anonymous FTP on 2026-09-10 (`keep=0` deleted the one attachment a 129-byte POST had just created). Acquires no lock of its own — call it while already holding the device's `DeviceLock`. **You rarely call it yourself**: since PR #259 the client arms hygiene on its own against leak-prone firmware (`client.temp_hygiene_armed` — `temp_hygiene=` kwarg first, then `$U64_AUTO_TEMP_GC` as a both-ways override, then `DeviceCapabilities.runner_wedge_possible is not False`). The budget (`DEFAULT_LEAK_BUDGET = 6`; `temp_gc_budget=` or `$U64_TEMP_GC_BUDGET`) is counted **per device**, in a `TempLedger` shared by every client of that host in the process (#295); `client.pending_temp_attachments` is that device count — an upper bound, not a reading of the device. The drain has two cases (#264): a client that **leaked** drains on `close()` and on `DeviceLock` release, and a failed pass may make one attempt per device to enable FTP File Service (a `Network Settings` write, #263) and then blocks that client; a client that **leaked nothing** sweeps inherited `/Temp` only while holding the device's lock, writes no config, and on failure only logs a WARNING. A client that never probed capabilities — including one given an explicit `write_mem_query_threshold=`, which issues no HTTP at construction — stays **disarmed**; force it with `temp_hygiene=True` or `U64_AUTO_TEMP_GC=1`. Documented limits: each process has its own ledger, bounded across processes only by the `DeviceLock` serialising uploads plus the lock-release sweep (#433), and a hostname and the address it resolves to are two keys — for both the ledger and the lock — so use one spelling per device (#434; other spellings of one address are folded by `normalize_device_host`). The root-exported `liveness_probe(host, ...)` reserves its two POSTs against the same device ledger (#450). Env overrides: `U64_TEMP_GC_KEEP`, `U64_TEMP_GC_BUDGET`, `U64_TEMP_GC_REQUIRED`, `U64_TEMP_GC_FTP_USER`, `U64_TEMP_GC_FTP_PASSWORD`. A no-op on firmware carrying #686.
 
 **Keyboard injection:**
 - `client.send_text(text, *, finish_with_return=True) -> None` -- PETSCII-encode `text` and write into the KERNAL keyboard buffer at `$0277` (count byte at `$00C6`); appends a CR (`0x0D`) when `finish_with_return=True`. Canonical for triggering `SYS <addr>` after `run_prg` lands at READY. Respects the buffer's 10-byte hardware limit by polling `$00C6` and waiting for the buffer to drain **to empty** (`$C6 == 0`) before writing each chunk at offset 0 — topping up a partially-full buffer races the KERNAL's dequeue (three HTTP round-trips apart) and can corrupt offset and count. Raises `Ultimate64Error` if the buffer never drains. (`Ultimate64Transport.inject_keys` uses the same drain-to-empty convention.)
 
 **Memory (DMA-backed):**
-- `client.liveness_probe(http_timeout=2.0) -> LivenessResult` / `client.assert_healthy(...)` -- actively exercises the `POST /v1/machine:writemem` path that `probe_u64` does not (issue #107), so on leak-prone firmware **one call costs two `/Temp` attachments** (measured C64U 2026-09-10: 0 -> 2; issue #250) — a third of the default budget of 6, spent exactly when you suspect a wedge. `get_info()` / `get_version()` / `read_mem()` are bodyless and cost nothing; diagnose with those. Both POSTs count against the client's budget (`Ultimate64Client.LIVENESS_PROBE_TEMP_ATTACHMENTS`), reserved before the probe sends anything; once hygiene is known to be impossible it raises `Ultimate64TempHygieneError` without probing. `assert_healthy` raises `U64UnreachableError` or `U64WritememDegradedError`.
+- `client.liveness_probe(http_timeout=2.0) -> LivenessResult` / `client.assert_healthy(...)` -- actively exercises the `POST /v1/machine:writemem` path that `probe_u64` does not (issue #107), so on leak-prone firmware **one call costs two `/Temp` attachments** (measured C64U 2026-09-10: 0 -> 2; issue #250) — a third of the default budget of 6, spent exactly when you suspect a wedge. `get_info()` / `get_version()` / `read_mem()` are bodyless and cost nothing; diagnose with those. Both POSTs (`Ultimate64Client.LIVENESS_PROBE_TEMP_ATTACHMENTS` = 2) are reserved against the device's shared budget before the probe sends anything — the root-exported `liveness_probe(host, ...)` too (#450); once hygiene is known to be impossible it raises `Ultimate64TempHygieneError` without probing. `assert_healthy` raises `U64UnreachableError` or `U64WritememDegradedError`.
 - `client.read_mem(address, length) -> bytes` -- Raises `Ultimate64ProtocolError` when the device returns a payload shorter or longer than requested (prevents silently short/misaligned chunked reads).
-- `client.write_mem(address, data)` -- DMA-backed write. Uses the legacy `PUT ?data=<hex>` form for payloads `<= self.write_mem_query_threshold` bytes, the `POST` raw-byte form above. Threshold is per-instance and auto-detected at construction from `DeviceCapabilities.writemem_post_safe` (128 on firmware without the Temp-folder fix — C64U 1.1.0, or Ultimate-line < 3.15; 48 on Ultimate-line ≥ 3.15); override via the `write_mem_query_threshold=` constructor kwarg. The class attribute `Ultimate64Client.WRITE_MEM_QUERY_THRESHOLD` (shipped value 48) is an override, not a default: an untouched client takes the grade. Precedence is the kwarg, then a poke of that name (class, subclass, or instance after construction; applied with a WARNING, and unlike the kwarg it still probes, so hygiene still arms; clamped to 128, and a poke below 128 is refused on any grade that is not post-safe, since it would only add `/Temp` attachments), then the grade. Before issue #249 every poke was a silent no-op. Use the constructor kwarg. The wire form is also what decides whether the call leaks, and the boundary is **measured** on a C64U at fw 1.1.0 (2026-09-10, n=1 per arm, every write read back and byte-compared first): 64 bytes and **128** bytes both take the `PUT ?data=` form and leave `/Temp` at zero; **129** bytes takes the `POST` form and leaves exactly one attachment. The ceiling is inclusive, and the POST path costs exactly one attachment per call. Note the direction — the leak-prone device has the *higher* ceiling (128), so on a C64U anything chunked at or below it never reaches the leaking path. `memory.write_bytes` (and `run_prg_via_sys`, which writes through it) chunks at the transport's `rest_put_chunk_size`, and since #252 `transport.write_memory` itself chunks on any grade that is not post-safe. A direct `client.write_mem(addr, blob)` of 16 KiB is still a single POST and a single attachment. Addresses are validated `0..0xFFFF` here before anything is sent — which matters because the firmware does **not** validate: `PUT /v1/machine:writemem?address=0xZZZZ&data=...` returns HTTP 200 and writes to `$0000` (measured 2026-09-10, issue #251). Anyone hand-building the query or calling `_request` directly gets a silent zero-page clobber reported as success.
+- `client.write_mem(address, data)` -- DMA-backed write. Uses the legacy `PUT ?data=<hex>` form for payloads `<= self.write_mem_query_threshold` bytes, the `POST` raw-byte form above. Threshold is per-instance and auto-detected at construction from `DeviceCapabilities.writemem_post_safe` (128 on firmware without the Temp-folder fix — C64U 1.1.0, or Ultimate-line < 3.15; 48 on Ultimate-line ≥ 3.15); override via the `write_mem_query_threshold=` constructor kwarg. The class attribute `Ultimate64Client.WRITE_MEM_QUERY_THRESHOLD` (shipped value 48) is an override, not a default: an untouched client takes the grade. Precedence is the kwarg, then a poke of that name (class, subclass, or instance after construction; applied with a WARNING, and unlike the kwarg it still probes, so hygiene still arms; clamped to 128, and a poke below 128 is refused on any grade that is not post-safe, since it would only add `/Temp` attachments), then the grade. Use the constructor kwarg. The wire form is also what decides whether the call leaks, and the boundary is **measured** on a C64U at fw 1.1.0 (2026-09-10, n=1 per arm, every write read back and byte-compared first): 64 bytes and **128** bytes both take the `PUT ?data=` form and leave `/Temp` at zero; **129** bytes takes the `POST` form and leaves exactly one attachment. The ceiling is inclusive, and the POST path costs exactly one attachment per call. Note the direction — the leak-prone device has the *higher* ceiling (128), so on a C64U anything chunked at or below it never reaches the leaking path. `memory.write_bytes` (and `run_prg_via_sys`, which writes through it) chunks at the transport's `rest_put_chunk_size`, and since #252 `transport.write_memory` itself chunks on any grade that is not post-safe. A direct `client.write_mem(addr, blob)` of 16 KiB is still a single POST and a single attachment. Addresses are validated `0..0xFFFF` here before anything is sent — which matters because the firmware does **not** validate: `PUT /v1/machine:writemem?address=0xZZZZ&data=...` returns HTTP 200 and writes to `$0000` (measured 2026-09-10, issue #251). Anyone hand-building the query or calling `_request` directly gets a silent zero-page clobber reported as success.
 
 **Config:**
 - `client.get_version() -> dict`
@@ -743,14 +746,14 @@ Cross-backend VICE/U64 snapshot interop using VICE's native `.vsf` format as the
 - `Snapshot.from_vsf(data: bytes) -> Snapshot` -- Parse a VICE-emitted `.vsf` back into RAM + CPU port.
 - `SnapshotFormatError` -- Raised on malformed `.vsf` input.
 
-### Naming history
-The top-level helpers were originally named `extract_state` / `restore_state`. They were renamed in PR #126 (commit 373da4e) to `extract_snapshot` / `restore_snapshot` to avoid colliding with the U64 helper `snapshot_state` / `restore_state` in `ultimate64_helpers` — a different object that captures turbo + REU + cartridge config (not RAM). Both APIs coexist.
+### Not to be confused with
+`snapshot_state` / `restore_state` in `ultimate64_helpers` capture U64 *config* (turbo, REU, cartridge, …), not RAM. The RAM helpers here are `extract_snapshot` / `restore_snapshot` (renamed from `extract_state` / `restore_state` in PR #126 to avoid that collision).
 
 ---
 
 ## Module: progress
 
-Backend-agnostic live memory watcher ("pexpect for DMA"). Polls memory addresses and yields `ProgressEvent` instances (kinds: `Advanced`, `Stalled`, `Finished`) until a sentinel matches or a timeout fires. Originally bound to `Ultimate64Client.read_mem`; lifted to the `C64Transport.read_memory` protocol in PR #123 (commit 9e6dd29).
+Backend-agnostic live memory watcher ("pexpect for DMA"). Polls memory addresses through `C64Transport.read_memory` (PR #123) and yields `ProgressEvent` instances until a sentinel matches or a timeout fires.
 
 - `watch_progress(transport, addresses, *, poll_interval=10.0, idle_timeout=120.0, overall_timeout=5400.0, stop_when=<never>) -> Iterator[ProgressEvent]` -- canonical entry point (defaults are tuned for hour-long DMA benches — pass `poll_interval` explicitly for anything interactive). Re-exported from the package root.
 - `ProgressEvent` -- frozen dataclass with `.kind` ("Advanced" / "Stalled" / "Finished" / "Timeout" / "PollError"), `.elapsed`, `.changed` (dict of label → `(old, new)` byte deltas), `.values` (dict of label → current bytes), `.error`.
@@ -804,10 +807,10 @@ if lock.acquire(timeout=30.0):
 ```
 
 - `__init__(device_host, lock_dir=None, *, heartbeat_interval=15.0, allow_nested=False)` -- `heartbeat_interval` is the cadence (seconds) at which a daemon thread bumps the lockfile mtime while held, so queue-aware waiters see this holder as "progressing". `None`/`0`/negative disables the heartbeat (rarely useful outside unit tests that need deterministic mtime control).
-- `acquire(timeout=30.0, *, progress_window=60.0) -> bool` -- Blocking acquire (polls with LOCK_NB every 0.1s). Writes JSON metadata (PID, timestamp, device_host). Verifies inode after flock. Starts the heartbeat thread on success.
+- `acquire(timeout=None, *, progress_window=60.0, on_wait=None) -> bool` -- `timeout=None` resolves to `$U64_DEVICE_LOCK_TIMEOUT`, else 30 s (`DEFAULT_ACQUIRE_TIMEOUT`); an explicit value wins. `on_wait(elapsed, holder_pid, lockfile_age, queue_depth)` is called from the waiting thread alongside the periodic progress log line (an exception from it abandons the wait). Blocking acquire (polls with LOCK_NB every 0.1s). Writes JSON metadata (PID, timestamp, device_host). Verifies inode after flock. Starts the heartbeat thread on success.
   - **Queue-aware semantics (default).** `timeout` bounds time spent waiting on **wedged or dead** holders only. A live holder whose lockfile mtime is within `progress_window` seconds is "progressing"; the waiter's deadline is reset on every poll iteration. With the heartbeat, healthy holders stay "progressing" indefinitely. Pass `progress_window=None` for legacy hard-timeout behavior.
   - **Optional `watchdog` wakeup.** When the optional `c64-test-harness[notify]` extra is installed (`watchdog>=3.0`), queued acquirers wake on lockfile fs-events instead of waiting the full poll interval. The release path emits a cooperative `os.utime(lockfile)` so other waiters wake immediately. The 100 ms polling backstop is preserved for kernel-released flocks (`kill -9` holders where `release()` never ran and no fs-event fires).
-- `acquire_or_raise(timeout=30.0, *, progress_window=60.0) -> None` -- Wraps `acquire()` and raises `DeviceLockTimeout` on timeout with structured diagnostics (holder PID, liveness, lockfile age, REST reachability). Prefer this over `acquire()` for live tests.
+- `acquire_or_raise(timeout=None, *, progress_window=60.0, on_wait=None) -> None` -- Wraps `acquire()` and raises `DeviceLockTimeout` on timeout with structured diagnostics (holder PID, liveness, lockfile age, REST reachability). Prefer this over `acquire()` for live tests.
 - `release()` -- Release flock and stop the heartbeat thread. Does NOT delete lockfile (inode race safety, same as PortLock). Touches lockfile mtime via `os.utime` to wake `watchdog`-based waiters cooperatively (best-effort).
 - `read_info() -> dict | None` -- Read metadata without locking (diagnostics).
 - `queue_depth -> int | None` -- Property, lazily computed. Number of **live** waiters currently blocked in `acquire()` for this device (holder not counted). `0` = empty queue; `None` = unobservable (sidecar path unreadable). Read-only: never touches the flock.
@@ -819,7 +822,7 @@ if lock.acquire(timeout=30.0):
 - `.device_host` / `.held` properties
 - Context manager support
 
-Lockfiles at `$XDG_RUNTIME_DIR/c64-test-harness/device-{sanitized_host}.lock`. Same directory as PortLock. Kernel auto-releases locks on process exit (crash-safe).
+Lockfiles at `device-{sanitized_host}.lock` in the same directory as PortLock (`/tmp/c64-test-harness-{uid}/` unless `$XDG_RUNTIME_DIR` is set); `device_lock_path(host)` gives the path. Kernel auto-releases locks on process exit (crash-safe).
 
 ### `DeviceLockTimeout(TimeoutError)`
 Raised by `DeviceLock.acquire_or_raise()` and by `_LockedU64Manager.acquire()` (i.e. `create_manager(backend="u64", ...)`) on lock-acquire timeout. Exported from the top-level package.
@@ -865,6 +868,8 @@ Autouse fixture in `tests/conftest.py`. Holds the device lock around every `*_li
 - `.api_ok: bool | None` -- None if skipped
 - `.latency_ms: float | None` -- Fastest successful check
 - `.error: str | None` -- Human-readable failure message, None on success
+- `.write_ok: bool | None` -- `check_write=True` only: the PUT write path round-tripped (`None` when not asked)
+- `.scratch_restored: bool | None` -- `check_write=True` only: whether `$0334-$033B` was put back (`False` is logged at WARNING)
 - `.summary: str` -- One-line status string (property)
 
 ### Functions
@@ -1009,7 +1014,7 @@ End-to-end: configure U64 audio stream destination, play SID, capture UDP packet
 
 ### `U64CaptureResult` (dataclass)
 - `.wav_path: Path`, `.duration_seconds: float`, `.sample_rate: int`
-- `.total_samples: int`, `.packets_received: int`, `.packets_dropped: int`
+- `.total_samples: int`, `.packets_received: int`, `.packets_dropped: int`, plus the sequence-tracking and fill fields listed under `CaptureResult` below (not `payloads_discarded`)
 
 ---
 
@@ -1034,7 +1039,10 @@ result = cap.stop(wav_path="output.wav")  # -> CaptureResult
 - `.packets_filled: int`, `.fill_fraction: float`, `.filled_frame_ranges: tuple[(start_frame, frame_count), ...]` — each lost packet is 768 zero bytes (192 frames) at its own position (#410); zeros are not signal, so bound the fraction or skip the ranges
 - `.nonstandard_payloads: int` — datagrams whose PCM is not 768 B; while any fill exists this voids the fill's timing
 - `.payloads_discarded: int` — packets that arrived and were counted in `packets_received` but whose PCM never reached the WAV: held re-sent runs decided to be duplicates, both mid-capture and at `stop()`. `packets_received` == packets in the WAV + `payloads_discarded` − `packets_filled` (the filled packets are in the WAV but were never received; before #410 nothing was filled and the term was zero). A true duplicate's PCM is a *correct* discard, so non-zero is not by itself a fault — but a silent counter restart discards real audio here while `packets_dropped`, `sequence_resyncs` and `time_base_intact` all read clean, so assert on it when a capture's completeness matters (#443 round 3; residuals in `backends/_stream_seq.py`)
-- `.time_base_intact: bool` — every drop filled at a trusted length (no unfilled drop, no `sequence_resyncs`, no nonstandard payload when anything was filled); not "nothing lost" — that is `packets_dropped == 0`. Before #410 (and on #430 alone) gaps were concatenated and this was `packets_dropped == 0`; a result without `packets_filled` never padded. Deliberately **not** affected by `payloads_discarded`. Same fields on `U64CaptureResult`
+- `.time_base_intact: bool` — every drop filled at a trusted length (no unfilled drop, no `sequence_resyncs`, no nonstandard payload when anything was filled); not "nothing lost" — that is `packets_dropped == 0`. Before #410 (and on #430 alone) gaps were concatenated and this was `packets_dropped == 0`; a result without `packets_filled` never padded. Deliberately **not** affected by `payloads_discarded`
+- `.sample_rate_exact: Fraction | None` — the rate the capture was actually timed at (e.g. the NTSC `2109375/44` Hz, see `docs/sid_audio.md`)
+
+`U64CaptureResult` carries the same fields **except `payloads_discarded`**, which `capture_sid_u64` does not propagate — read it from an `AudioCapture` result when completeness matters
 
 ### `write_wav(path, pcm_data, sample_rate=48000, channels=2, sample_width=2) -> Path`
 Write raw PCM data to a WAV file.
@@ -1083,7 +1091,7 @@ for cycle in result.trace:
 Accumulates raw bytes in the recv loop; parses into `BusCycle` objects on `stop()` for performance at ~32 Mbps.
 
 **Classmethod constructor for per-routine stream refresh:**
-- `DebugCapture.with_fresh_fpga(client, *, capture_kwargs=None, reboot_settle_seconds=12.0) -> DebugCapture` -- Calls `client.reboot()` — a C64-level reset with cartridge/REU re-init, not a firmware or FPGA reboot, despite this helper's name (issue #269) — sleeps `reboot_settle_seconds` (default 12.0s, matches `recover()`'s reboot-settle), then constructs and returns a fresh `DebugCapture` instance with `**(capture_kwargs or {})` forwarded to `__init__` (e.g. `port`, `multicast_group`, `max_bytes`, `filter`). Caller still has to call `.start()`. Use this before each routine in a multi-routine bench to recover from the FPGA UDP-stream rate degradation that builds up under sustained workload (issue #81). Never calls `poweroff()` — `reboot()` is the right primitive for clearing FPGA state.
+- `DebugCapture.with_fresh_fpga(client, *, capture_kwargs=None, reboot_settle_seconds=12.0) -> DebugCapture` -- Calls `client.reboot()` — a C64-level reset with cartridge/REU re-init, not a firmware or FPGA reboot, despite this helper's name (issue #269) — sleeps `reboot_settle_seconds` (default 12.0s, matches `recover()`'s reboot-settle), then constructs and returns a fresh `DebugCapture` instance with `**(capture_kwargs or {})` forwarded to `__init__` (e.g. `port`, `multicast_group`, `max_bytes`, `filter`). Caller still has to call `.start()`. It exists for the UDP-rate degradation seen under sustained workload (issue #81), where `reboot()` restored delivery and a soft `reset()` did not — a remedy that helped, not a diagnosis: **that the FPGA emitter is the cause is unverified (#431)**, since the host's Wi-Fi downlink reproduces the same signature with no FPGA involved. Never calls `poweroff()`.
 
 ### `DebugCaptureResult` (dataclass)
 - `.trace: list[BusCycle]`, `.duration_seconds: float`
@@ -1093,7 +1101,7 @@ Accumulates raw bytes in the recv loop; parses into `BusCycle` objects on `stop(
 - `DEFAULT_DEBUG_PORT = 11002`
 - `ENTRIES_PER_PACKET = 360`
 
-### Debug stream modes (set via config helpers)
+### Debug stream modes (constants in `backends.ultimate64_helpers`, also package-root exports; set via the config helpers below)
 - `DEBUG_MODE_6510 = "6510 Only"` — 6510 CPU cycles only
 - `DEBUG_MODE_VIC = "VIC Only"` — VIC access cycles only
 - `DEBUG_MODE_6510_VIC = "6510 & VIC"` — interleaved, distinguished by `cycle.is_cpu`
@@ -1180,7 +1188,7 @@ Ultimate Command Interface (UCI) socket-level TCP/UDP networking for U64 Elite. 
 - `uci_tcp_connect(transport, host, port, *, timeout=10.0, turbo_safe=False) -> int` — returns socket handle
 - `uci_udp_connect(transport, host, port, *, timeout=10.0, turbo_safe=False) -> int`
 - `uci_socket_write(transport, socket_id, data, *, timeout=10.0, turbo_safe=False) -> None` -- `data` must be at most 892 bytes (`SOCKET_WRITE_MAX_BYTES`; empirical firmware ceiling, theoretical 893 truncates by one byte on the wire). For UDP, one call == one datagram (no firmware coalescing). Larger payloads must be split into multiple calls; each emits its own datagram. See `docs/uci_networking.md § Datagram size limits`. The cost depends on the grade (since #294). All four writes go through `transport.write_memory`, which splits anything over the threshold into PUT-sized pieces unless the cached grade says `writemem_post_safe is True`. So on a leak-prone or unknown grade (the C64U) a call costs **no** `/Temp` attachment. On a post-safe grade the 176-byte routine is one POST, plus a second when the payload exceeds the threshold, and that firmware collects them. Calling `client.write_mem` directly bypasses the chunking and POSTs on any grade. Driving the same protocol C64-side from an uploaded PRG costs only the upload; see PATTERNS § "`/Temp` attachment hygiene".
-- `uci_socket_read(transport, socket_id, max_len=255, *, timeout=10.0, turbo_safe=False) -> bytes` — `max_len` above `NET_MAX_SOCKET_READ` (1472) raises `ValueError`; up to 253 it drains one reply block, above that every Data More block (#420); returns only the payload; `b""` when nothing is queued; a handle the target does not own raises `UCISocketNotOwnedError`. Refused locally, before any write: above 893 unless the cached grade allows #802 (the C64U, unprobed clients), and 894 unless `uci_socket_read_multiblock` is `True` (every 3.15 grades `None`; stock v3.15 hangs at 894). A multi-block reply shorter than its header raises `UCISocketReadTruncatedError` (`.data` holds what arrived)
+- `uci_socket_read(transport, socket_id, max_len=255, *, timeout=10.0, turbo_safe=False) -> bytes` — `max_len` above `NET_MAX_SOCKET_READ` (1472) raises `ValueError`; up to 253 it drains one reply block, above that every Data More block (#420); returns only the payload; `b""` when nothing is queued; a handle the target does not own raises `UCISocketNotOwnedError`. Refused locally with `ValueError`, before any write: anything above 893 when the cached `uci_socket_read_multiblock` grade is `False` or missing (the C64U on 1.1.0, pre-3.15, an unprobed client), and exactly 894 when it is `None` (every 3.15 build, since upstream #802 is post-tag; without it an 894-byte reply never drains). 895 and up stay allowed on a `None` grade: firmware without #802 answers `82,PARAMETER(S) OUT OF RANGE`, which returns `b""` with a WARNING. A multi-block reply shorter than its header raises `UCISocketReadTruncatedError` (`.data` holds what arrived)
 - `uci_socket_close(transport, socket_id, *, timeout=10.0, turbo_safe=False) -> None`
 - `uci_tcp_listen_start(transport, port, *, timeout=10.0, turbo_safe=False) -> None`
 - `uci_tcp_listen_state(transport, *, timeout=10.0, turbo_safe=False) -> int` — NOT_LISTENING / LISTENING / CONNECTED / BIND_ERROR / PORT_IN_USE (one listener per device; no handle argument)
@@ -1197,7 +1205,7 @@ All address arguments default to the `$C000` UCI block (`code_addr=0xC000`, data
 - `build_tcp_connect(host_addr=None, port=80, result_addr=0xC200, ..., turbo_safe=False) -> bytes` — `host_addr` holds the NUL-terminated hostname; `None` resolves to `$C100` for a plain routine and `$C500` for a turbo one (a turbo routine covers `$C100`); an explicit address inside the emitted routine raises `ValueError` (#322)
 - `build_udp_connect(host_addr=None, port=53, ..., turbo_safe=False) -> bytes` — `host_addr` as for `build_tcp_connect`
 - `build_socket_write(socket_id_addr=None, data_addr=None, data_len_addr=None, status_addr=0xC300, ..., turbo_safe=False) -> bytes` — `None` resolves to `$C100` / `$C101` / `$C1FF` for a plain routine and `$C403` / `$C500` / `$C87C` for a turbo one; an explicit socket id, data start or either length byte inside the emitted routine raises `ValueError` (#346)
-- `build_socket_read(socket_id_addr=None, result_addr=0xC200, max_len=255, actual_len_addr=0xC3F0, ..., turbo_safe=False) -> bytes` — `None` resolves to `$C100` for a plain routine and `$C403` for a turbo one; an explicit address inside the emitted routine raises `ValueError` (#322)
+- `build_socket_read(socket_id_addr=None, result_addr=None, max_len=255, actual_len_addr=0xC3F0, ..., turbo_safe=False, multi_block=None) -> bytes` — `socket_id_addr=None` resolves to `$C100` for a plain routine and `$C403` for a turbo one; an explicit address inside the emitted routine raises `ValueError` (#322). `multi_block=None` picks the multi-block drain when `max_len > 255` (#420); `result_addr=None` is `$C200` single-block, `$C500` multi-block
 - `build_socket_close(socket_id_addr=None, ..., turbo_safe=False) -> bytes` — `socket_id_addr` as for `build_socket_read`
 
 ### Fence tuning (public constants)
@@ -1224,7 +1232,7 @@ All address arguments default to the `$C000` UCI block (`code_addr=0xC000`, data
 
 ## Module: bridge_ping
 
-Bridge networking helpers — two VICE instances on a host bridge (Linux TAP + `br-c64`, or macOS `feth` + `bridge10`) talking L2 + IP + ICMP via CS8900a. See Pattern 8 in `PATTERNS.md`.
+Bridge networking helpers — two VICE instances on a host bridge (macOS `feth` + `bridge10`, or Linux TAP + `br-c64`) talking L2 + IP + ICMP via CS8900a. See Pattern 8 in `PATTERNS.md`.
 
 ### High-level orchestrators (own the wall-clock deadline in Python; **VICE-only** — they drive the 6510 with `jsr()`)
 - `run_ping_and_wait(transport, *, tx_frame, rx_buf, result_addr, identifier, sequence, tx_frame_buf, timeout_s=5.0, peek_addr=..., consume_addr=..., arp=True) -> int` — returns `0x01` on matched reply, `0xFF` on timeout. `arp=True` (default, #218) first transmits an ARP request derived from `tx_frame`'s source MAC / source IP / destination IP through the same buffer; `ValueError` if `tx_frame` is not IPv4 — pass `arp=False` to send it raw.
@@ -1235,7 +1243,7 @@ Bridge networking helpers — two VICE instances on a host bridge (Linux TAP + `
 - `build_arp_request_frame(src_mac, src_ip, target_ip) -> bytes` — broadcast "who has *target_ip*" (#218); `ARP_FRAME_LEN` = 60 bytes, RFC 826 at ip65's `ap_*` offsets. Feed to `build_bridge_tx_code` or `arp_frame_buf=` below
 - `build_arp_reply_frame(src_mac, src_ip, target_mac, target_ip) -> bytes` — unicast reply; the host-side twin of what the responders emit
 - `parse_arp(frame) -> ArpPacket | None` — `None` unless ethernet/IPv4 ARP (accepts the unpadded 42-byte packet). Both builders raise `ValueError` on a MAC/IP of the wrong length
-- `build_bridge_tx_code(...)` — transmit a pre-built frame via CS8900a (`build_tx_code` in `bridge_ping`; 159-180 B since #487's skip phase, so over 128 — upload through `load_code`, which chunks on a leak-prone grade); `drain_first=True` SkipNows the queued RX frames first (#303), `allow_odd_frame_len=True` accepts an odd length (#438, measured on silicon). Result `0x04` means `Rdy4TxNOW` never asserted; its measured cause on silicon is a TX buffer starved by unread RX frames (#303, provoked), unprovoked `0x04`s are attributed to it, and #234 is inferred to be the same state
+- `build_bridge_tx_code(load_addr, frame_buf, frame_len, result_addr, *, allow_odd_frame_len=False, drain_first=False, drain_status_addr=None)` — package-root alias of `bridge_ping.build_tx_code`; transmit a pre-built frame via CS8900a (159-180 B since #487's skip phase, 199-223 with `drain_first=True`, so over 128 — upload through `load_code`, which chunks on a leak-prone grade). `frame_len` must be even and 2..1514 unless `allow_odd_frame_len=True`; `drain_first=True` SkipNows the queued RX frames first (#303), `allow_odd_frame_len=True` accepts an odd length (#438, measured on silicon). Result `0x04` means `Rdy4TxNOW` never asserted; its measured cause on silicon is a TX buffer starved by unread RX frames (#303, provoked), unprovoked `0x04`s are attributed to it, and #234 is inferred to be the same state
 - `build_rx_peek_code(...)` — bounded peek into RX FIFO (drives orchestrator polling)
 - `build_rx_echo_reply_code(...)` — full-routine echo-reply match (legacy, virtual-cycle timing)
 - `build_read_and_match_echo_reply_code(...)` — read a pending frame, match against expected reply
@@ -1259,7 +1267,7 @@ Bridge networking helpers — two VICE instances on a host bridge (Linux TAP + `
 - `EchoRequest` — `.frame`, `.identifier`, `.sequence`, `.payload`; what `build_echo_request_frame` returns
 - `ArpPacket` — `.dst_mac`, `.src_mac`, `.opcode`, `.sender_mac`, `.sender_ip`, `.target_mac`, `.target_ip`, `.is_request`, `.is_reply`; what `parse_arp` returns. Package-root exports: `ArpPacket`, `build_arp_request_frame`, `build_arp_reply_frame`, `parse_arp`; `ARP_FRAME_LEN`, `RESULT_ARP_REPLY_SENT`, `ETHERTYPE_ARP` live in `c64_test_harness.bridge_ping`
 
-**Test fixture:** `bridge_vice_pair` in `tests/conftest.py` brings up two VICE instances on `BRIDGE_NAME` (`br-c64` / `bridge10`), RR-Net mode, warp off, unique MACs, CS8900a initialised.
+**Test fixture:** `bridge_vice_pair` in `tests/conftest.py` brings up two VICE instances on `BRIDGE_NAME` (`bridge10` on macOS, `br-c64` on Linux), RR-Net mode, warp off, unique MACs, CS8900a initialised.
 
 ---
 
@@ -1267,7 +1275,7 @@ Bridge networking helpers — two VICE instances on a host bridge (Linux TAP + `
 
 CIA1 TOD-based 6502 timeout helpers for **shippable C64 applications**. Works correctly on real C64, real U64 Elite (any turbo speed), and VICE normal. **NOT usable under VICE warp** — VICE TOD is virtual-CPU-clocked, not wall-clock (see gotcha #23 in `PATTERNS.md`).
 
-Zero-page footprint: `$F0`-`$F5` (see gotcha #22 — don't interleave TOD reads with `bridge_ping` frame reads in one routine).
+Zero-page footprint: `$F0`-`$F5` (PATTERNS gotcha #22). `bridge_ping`'s frame reader no longer touches `$F1-$F4` (#208), so frame reads inside a TOD loop are safe; the counter-timed `bridge_ping` routines (`build_rx_peek_code`, the non-TOD ping/responder builders) use `$F0-$F2` as poll counters and must not be nested inside one.
 
 ### Builders
 - `build_tod_start_code(load_addr) -> bytes` — reset CIA1 TOD to 00:00:00.0 and start it

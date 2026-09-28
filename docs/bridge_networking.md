@@ -2,27 +2,41 @@
 
 This document describes how to set up and use the **two-VICE bridge**
 pattern for tests that need to exchange ethernet frames between two C64
-emulator instances. Both Linux (TAP + Linux bridge) and macOS (feth +
-BSD bridge) are supported; the cross-platform dispatch module lives in
-`tests/bridge_platform.py` (constants `ETHERNET_DRIVER`, `IFACE_A`,
-`IFACE_B`, `BRIDGE_NAME`, `SETUP_HINT`).
+emulator instances, and — from § "CS8900a register layout" on — what the
+harness's CS8900a (RR-Net) routines do on real silicon.
+
+The primary bench is **macOS** (27.0, Apple Silicon) with Homebrew's VICE
+3.10 bottle, which reports `HAVE_RAWNET yes` / `HAVE_PCAP yes` /
+`HAVE_TUNTAP no` to `x64sc -features`: the bridge is a `feth` peer pair,
+VICE attaches with its `pcap` driver over BPF, and an ethernet VICE runs as
+root. Linux (TAP devices + a Linux bridge, VICE's `tuntap` driver) is also
+supported, but that path is **last verified 2026-04-11** — the last
+substantive change to `scripts/setup-bridge-tap.sh`,
+`scripts/teardown-bridge-tap.sh` and `scripts/cleanup-bridge-networking.sh`
+— and has not been exercised on the current bench; see § "Linux (TAP +
+Linux bridge)".
+
+The cross-platform dispatch module is `tests/bridge_platform.py`
+(constants `ETHERNET_DRIVER`, `IFACE_A`, `IFACE_B`, `BRIDGE_NAME`,
+`SETUP_HINT`, `BRIDGE_HOST_IP`, `BRIDGE_IP_A`, `BRIDGE_IP_B`).
 
 ## Overview
 
-The pattern uses (Linux naming shown; macOS equivalents in parentheses):
+| | macOS | Linux (last verified 2026-04-11) |
+|---|---|---|
+| L2 link between the two VICEs | `feth0` ⇄ `feth1` peer pair | `tap-c64-0` / `tap-c64-1` on bridge `br-c64` |
+| Host address `10.0.65.1/24` on | `bridge10` (no members) | `br-c64` |
+| VICE driver | `pcap` (VICE must run as root) | `tuntap` (unprivileged) |
+| Host capture of C64 traffic | `feth0` or `feth1` | `br-c64` |
 
-* `br-c64` (macOS: `bridge10`) -- a host network bridge
-* `tap-c64-0` / `tap-c64-1` (macOS: `feth0` / `feth1`) -- two
-  bridge-member interfaces, one per VICE instance
-* Two `x64sc` processes, each launched with RR-Net-mode CS8900a
-  ethernet bound to its interface (VICE's `tuntap` driver on Linux,
-  `pcap` driver on macOS)
-
-This setup gives two VICE instances a shared layer-2 segment.  The
-host can also participate (the bridge's IP is `10.0.65.1` on both
-platforms), so captures via `tcpdump -i br-c64` (Linux) or
-`tcpdump -i bridge10` (macOS) will show all traffic between the
-instances.
+On macOS the **feth peer mechanism is the L2 link**: a frame transmitted on
+`feth0` is received on `feth1` and vice versa. `bridge10` is created only so
+the host has somewhere to hold `10.0.65.1` and so the fixtures'
+`iface_present(BRIDGE_NAME)` precondition passes; `feth0`/`feth1` are
+deliberately **not** its members (adding them creates a second forwarding
+path and duplicated replies, and the setup script removes them if a prior
+run added them). So a capture on `bridge10` sees none of the C64 traffic —
+capture on `feth0`/`feth1`.
 
 ## Reference pattern for VICE agents
 
@@ -32,15 +46,14 @@ can exchange ethernet frames, use this canonical lifecycle:
 1. **Setup** (once per session, as root):
 
    ```bash
-   sudo scripts/setup-bridge-tap.sh            # Linux
    sudo scripts/setup-bridge-feth-macos.sh     # macOS
+   sudo scripts/setup-bridge-tap.sh            # Linux (last verified 2026-04-11)
    ```
 
 2. **Acquire VICE instances** via the `bridge_vice_pair` pytest fixture
    in `tests/conftest.py`, or the equivalent `ViceProcess`-based pattern
-   for non-pytest code. See `tests/test_bridge_ping.py` for full fixture
-   usage, and `scripts/bridge_ping_demo.py` for a standalone script
-   reference.
+   for non-pytest code (§ "Launching two VICE instances on the bridge").
+   See `tests/test_bridge_ping.py` for fixture usage.
 
 3. **Run your code**. The fixture handles CS8900a init, MAC programming,
    and clean VICE shutdown on context exit.
@@ -48,142 +61,103 @@ can exchange ethernet frames, use this canonical lifecycle:
 4. **Teardown** (after the last session completes, as root):
 
    ```bash
-   sudo scripts/teardown-bridge-tap.sh           # Linux
    sudo scripts/teardown-bridge-feth-macos.sh    # macOS
+   sudo scripts/teardown-bridge-tap.sh           # Linux
    ```
+
+   The `feth` pair may be shared with other rigs on this bench (c64-https's
+   rig runs dnsmasq on `feth1`), so tearing it down pulls it from under
+   them — check before you do.
 
 5. **Recovery** (only if a session died uncleanly, leaving residue):
 
    ```bash
-   sudo scripts/cleanup-bridge-networking.sh     # Linux
    sudo scripts/cleanup-bridge-feth-macos.sh     # macOS
+   sudo scripts/cleanup-bridge-networking.sh     # Linux
    ```
 
 ### Rules for VICE lifecycle
 
 - **Never `pkill x64sc`.** It kills every VICE on the host including
-  unrelated instances.  Use `scripts/cleanup_vice_ports.py` instead,
-  which is scoped to the harness's known port ranges and verifies each
-  target's `/proc/<pid>/comm` before sending any signal.  See
-  `feedback_no_pkill.md`.
+  unrelated instances. Use `scripts/cleanup_vice_ports.py` instead,
+  which is scoped to port ranges and verifies each target's process name
+  before sending any signal.
 - **The Python harness owns VICE lifecycle in the happy path.** Let
   `ViceProcess.__exit__` / `ViceInstanceManager.release()` stop VICE
-  cleanly.  The cleanup script is only for the "my session crashed"
+  cleanly. The cleanup script is only for the "my session crashed"
   case.
-- **Setup and teardown are symmetric.** On Linux they touch exactly
-  these resources: the `br-c64` bridge, `tap-c64-0` / `tap-c64-1` TAP
-  devices, six FORWARD iptables rules, and `/tmp/vice_eth_*.rc` stale
-  files.  They never touch `/proc/sys/net/ipv4/ip_forward` — the host
-  default is preserved.  On macOS the scope is `bridge10` + `feth0` /
-  `feth1` + `/tmp/vice_eth_*.rc`; no pf/iptables state is involved.
-- **Interface names are canonical per platform.** The fixture, setup
-  script, teardown script, and cleanup script all agree on
-  `br-c64` / `tap-c64-{0,1}` (Linux) or `bridge10` / `feth{0,1}`
-  (macOS).  The single source of truth is `tests/bridge_platform.py`;
-  don't drift — update that module and all four scripts in lockstep if
-  you ever need to rename.
-- **Port ranges for harness VICE instances**: `6511-6531` and
-  `6560-6580` (per `HarnessConfig.vice_port_range_start/end` and the
-  bridge fixture respectively).  The cleanup helper scopes to these
-  ranges by default.
+- **Setup and teardown are symmetric.** On macOS the scope is `bridge10`
+  + `feth0` / `feth1` + `/tmp/vice_eth_*.rc` (the temporary vicerc files
+  `ViceProcess` writes); no pf state is involved. On Linux it is the
+  `br-c64` bridge, the `tap-c64-0` / `tap-c64-1` TAP devices, their
+  iptables FORWARD rules, and `/tmp/vice_eth_*.rc`; `/proc/sys/net/ipv4/ip_forward`
+  is never touched.
+- **Interface names are canonical per platform** — `bridge10` /
+  `feth{0,1}` (macOS) or `br-c64` / `tap-c64-{0,1}` (Linux). The fixtures
+  read them from `tests/bridge_platform.py`; the setup, teardown and
+  cleanup scripts hardcode the same names, so a rename means changing that
+  module and all six scripts in lockstep.
+- **Port ranges for harness VICE instances**: `6511-6531`
+  (`HarnessConfig.vice_port_range_start/end`) and `6560-6580` (the
+  `bridge_vice_pair` fixture's `PortAllocator`).
 
 ### Recovery helper
 
 Both platforms ship a standalone sudo cleanup script
-(`scripts/cleanup-bridge-networking.sh` on Linux,
-`scripts/cleanup-bridge-feth-macos.sh` on macOS) and share
-`scripts/cleanup_vice_ports.py` for the scoped VICE-kill step. The
-Python helper is cross-platform: it discovers harness-port listeners via
-`/proc/net/tcp` on Linux and `lsof`/`ps` on macOS, and `ViceProcess`'s
-port-based introspection (`get_listener_pid`, `kill_on_port`) likewise
-supports both platforms natively.
+(`scripts/cleanup-bridge-feth-macos.sh`, `scripts/cleanup-bridge-networking.sh`)
+that calls `scripts/cleanup_vice_ports.py --range 6511:6531,6560:6580`
+for the scoped VICE-kill step, then removes interfaces and stale
+`/tmp/vice_eth_*.rc` files.
 
 `scripts/cleanup_vice_ports.py` is the port-range-scoped VICE killer:
 
 ```bash
 python3 scripts/cleanup_vice_ports.py --range 6511:6531,6560:6580
 python3 scripts/cleanup_vice_ports.py --range 6511:6531 --dry-run
-python3 scripts/cleanup_vice_ports.py --help
+python3 scripts/cleanup_vice_ports.py --help   # also --comm, --grace-seconds, --quiet
 ```
 
-It resolves listeners in the requested ranges to PIDs, verifies the
-process is `x64sc` (comm check via `/proc/<pid>/comm` on Linux or `ps`
-on macOS), then SIGTERMs, waits a grace period (default 2 s), and
-SIGKILLs survivors.  Safe to run while unrelated VICE instances
-(outside the harness port ranges) are alive — they won't be touched.
-Exit code is `0` on a clean result, `1` if any process is still alive
-after SIGKILL, `2` on argument error, and `3` if listener(s) were found
-but comm could not be read for any of them (insufficient privileges —
-re-run with `sudo`).
+Run bare, it scans only `HarnessConfig`'s range (`6511:6531`); pass
+`6560:6580` explicitly to cover bridge-fixture VICEs. It resolves
+listeners to PIDs (`lsof -nP -iTCP:<port> -sTCP:LISTEN -t` on macOS,
+`/proc/net/tcp` on Linux), verifies the process name is `x64sc`
+(`ps -p <pid> -o ucomm=` on macOS, `/proc/<pid>/comm` on Linux), then
+SIGTERMs, waits `--grace-seconds` (default 2), and SIGKILLs survivors.
+Unrelated VICE instances outside the ranges are not touched. Exit codes:
+`0` clean, `1` a process still alive after SIGKILL, `2` argument error,
+`3` listener(s) found but no process name could be read for any of them
+(insufficient privileges — re-run with `sudo`). An elevated macOS
+ethernet VICE is root-owned, so an unprivileged `lsof` may not see its
+socket at all; the sudo wrapper scripts avoid that. On Linux, exit 3 is
+typically `x64sc` file capabilities (`cap_net_admin,cap_net_raw=ep`)
+making `/proc/<pid>/comm` unreadable.
 
-On Linux specifically, exit 3 is typically caused by `x64sc` file
-capabilities (`cap_net_admin,cap_net_raw=ep`) making unprivileged
-`/proc/<pid>/comm` reads fail; the helper detects this and flags it
-instead of silently reporting zero.
-
-The scoping is empirically verified by `tests/test_cleanup_vice_ports_live.py::TestBridgeCleanupScoping::test_scoped_cleanup_preserves_out_of_range_vice` (opt in with `BRIDGE_CLEANUP_LIVE=1`).
-
-## Prerequisites (Linux)
-
-* `x64sc` (VICE 3.10) compiled with `tuntap` driver support
-* Root privileges to create TAP devices and configure the bridge
-  (only required for setup/teardown -- VICE itself runs unprivileged)
-* `ip` (iproute2) and `iptables`
-* The c64-test-harness package (`c64_test_harness.bridge_ping`)
-
-## Setting up the bridge (Linux)
-
-```bash
-sudo ./scripts/setup-bridge-tap.sh
-```
-
-This creates:
-- `br-c64` bridge with IP `10.0.65.1/24`
-- `tap-c64-0` and `tap-c64-1` TAP interfaces, both attached to the bridge
-- iptables FORWARD rules permitting traffic on the bridge
-
-To tear down:
-
-```bash
-sudo ./scripts/teardown-bridge-tap.sh
-```
-
-If something goes wrong, an emergency cleanup is available:
-
-```bash
-sudo ./scripts/cleanup-bridge-networking.sh
-```
+The scoping is verified live by
+`tests/test_cleanup_vice_ports_macos_live.py` and, on Linux,
+`tests/test_cleanup_vice_ports_live.py::TestBridgeCleanupScoping::test_scoped_cleanup_preserves_out_of_range_vice`
+(both opt in with `BRIDGE_CLEANUP_LIVE=1`).
 
 ## macOS (feth + BSD bridge)
 
-The macOS path is a drop-in replacement for the Linux TAP layout. It
-uses `feth0`/`feth1` (a kernel "fake ethernet" peer pair) bridged via
-the BSD `bridge10` pseudo-device, all driven through `ifconfig`. VICE
-attaches with its `pcap` driver instead of `tuntap`, because macOS has
-no `/dev/net/tun` and `libpcap`-over-BPF is the portable path.
-
 ```
-   host (10.0.65.1 on bridge10)
-              |
-         +----+----+
-         | bridge10|
-         +----+----+
-          /        \
-      feth0      feth1        (peered; frames pass through bridge10)
-        |          |
-      VICE A     VICE B       (-ethernetiodriver pcap -ethernetioif fethN)
+   host (10.0.65.1 on bridge10 -- not a member link, holds the address only)
+
+      feth0 <----- peer -----> feth1        (the L2 link)
+        |                        |
+      VICE A                   VICE B       (root; pcap driver on fethN)
 ```
 
-Lifecycle (see the reference patterns below — do not inline the ifconfig
-steps in agent code; call the scripts):
+Lifecycle — call the scripts; do not inline the `ifconfig` steps in agent
+code:
 
 ```bash
-sudo ./scripts/setup-bridge-feth-macos.sh       # create bridge10 + feth0/feth1
+sudo ./scripts/setup-bridge-feth-macos.sh       # create feth0/feth1 (peered, up) + bridge10 with 10.0.65.1/24
 sudo ./scripts/teardown-bridge-feth-macos.sh    # symmetric teardown
 sudo ./scripts/cleanup-bridge-feth-macos.sh     # emergency recovery (scoped VICE kill)
 ```
 
-The setup script is idempotent. Internally it runs, roughly:
+The setup script is idempotent and refuses to run on anything but Darwin.
+Internally it runs, roughly:
 
 ```bash
 ifconfig feth0 create
@@ -191,12 +165,7 @@ ifconfig feth1 create
 ifconfig feth0 peer feth1
 ifconfig feth0 up && ifconfig feth1 up
 ifconfig bridge10 create
-# NOTE: feth0/feth1 are intentionally NOT added as members of bridge10.
-# The feth peer mechanism already provides L2 between them; adding the
-# peers as bridge members creates a duplicate forwarding path and causes
-# duplicate / looped frames. bridge10 exists only to hold the host-side
-# IP. (The setup script actively removes feth members if a prior botched
-# run added them.)
+ifconfig bridge10 deletem feth0; ifconfig bridge10 deletem feth1   # only if a prior run added them
 ifconfig bridge10 inet 10.0.65.1 netmask 255.255.255.0 up
 ```
 
@@ -204,10 +173,13 @@ Prerequisites:
 
 * `x64sc` — **the Homebrew bottle is the right binary**; no separately
   built VICE is needed. It reports `HAVE_RAWNET yes` / `HAVE_PCAP yes`
-  (`HAVE_TUNTAP no`) to `x64sc -features` and links libpcap. Leave
-  `$VICE_ETHERNET_BIN` unset; it is an override, not a requirement.
-* Root privileges for `ifconfig create`/`addm` (setup/teardown) **and for
-  VICE itself**. VICE registers its pcap driver only when
+  (`HAVE_TUNTAP no`) to `x64sc -features` and links libpcap.
+  `resolve_vice_executable()` probes that (cached per binary) and raises
+  `ViceEthernetBinaryError` for a binary without rawnet or without the
+  requested driver. Leave `$VICE_ETHERNET_BIN` unset; it is an override,
+  not a requirement.
+* Root privileges for the setup/teardown `ifconfig` calls **and for VICE
+  itself**. VICE registers its pcap driver only when
   `archdep_rawnet_capability()` holds — `geteuid() == 0` on macOS — so an
   unelevated ethernet launch has no driver at all and SIGSEGVs on reset.
   The harness refuses such a launch rather than crashing; see trap 2
@@ -216,68 +188,68 @@ Prerequisites:
   runs (`/opt/homebrew/bin/x64sc` — the literal path, not its Cellar
   symlink target). Being *permitted* to sudo is not enough: a launch that
   stops at a password prompt is a failed launch.
-* `/dev/bpf*` permissions are **not** a prerequisite for VICE. It never
-  reads those nodes, and `chmod o+rw /dev/bpf*` changes nothing it
-  consults — running as root is what makes *its* capture work. They
-  **are** the prerequisite for the harness's own unelevated host-side
-  capture (`c64_test_harness.capture`, the TX/RX tests) — see
-  "Host-side capture" below.
-* The c64-test-harness package (`c64_test_harness.bridge_ping`)
+* `/dev/bpf*` permissions are **not** a prerequisite for VICE — running
+  as root is what makes its capture work. They **are** the prerequisite
+  for the harness's own unelevated host-side capture
+  (`c64_test_harness.capture`, the TX/RX tests) — see "Host-side capture"
+  below.
 
 Notes:
 
-* The macOS setup does **not** configure a host firewall. There is no
-  pf ruleset or NAT layer analogous to the Linux `iptables FORWARD`
-  rules — the BSD bridge driver forwards freely between its members,
-  and no outside-host routing is involved. Teardown therefore has no
-  pf state to reverse.
+* The macOS setup configures no host firewall and no pf/NAT state, so
+  teardown has none to reverse. The C64s' segment is the feth pair
+  alone; nothing is routed off it.
 * We deliberately use `bridge10` rather than `bridge0`. `bridge0` is a
   pre-existing system bridge on macOS (Thunderbolt / Internet Sharing)
   that may already have system interfaces as members; attaching `feth`
   peers or assigning our IP to it would pollute it.
-* VICE attachment: each instance is launched with
-  `-ethernetiodriver pcap -ethernetioif feth0` (or `feth1`). The
-  `ViceConfig` mapping handles this automatically when
-  `ethernet_driver="pcap"` is set — see `tests/bridge_platform.py` for
-  the `ETHERNET_DRIVER` constant that the fixtures read.
+* VICE attachment: `ViceConfig(ethernet=True, ethernet_driver="pcap",
+  ethernet_interface="feth0")` (or `feth1`) — `ViceProcess` writes the
+  `ETHERNET_DRIVER` / `ETHERNET_INTERFACE` resources into an `-addconfig`
+  vicerc and also passes `-ethernetiodriver` / `-ethernetioif`. The
+  fixtures read the values from `tests/bridge_platform.py`.
+* `probe_vice_pcap_ok()` in `tests/bridge_platform.py` launches one
+  throwaway VICE per pytest process to decide whether the pcap tests can
+  run; `MACOS_PCAP_ENABLED=1` / `MACOS_PCAP_DISABLED=1` skip the probe.
 
 ### Host-side capture on macOS (issue #158)
 
 `tests/test_ethernet.py`'s TX and RX tests check that a frame the C64
 transmits actually reaches the wire, and inject a frame for it to
-receive. On Linux that is an `AF_PACKET` socket; macOS has none, so until
-`c64_test_harness.capture` existed those two tests skipped on the primary
-bench and nothing verified emitted frames host-side at all.
+receive. `c64_test_harness.capture` provides that on both platforms.
 
 `open_capture(iface)` returns the platform's `PacketCapture`
-(`recv(timeout, match=...)`, `send(frame)`): `AfPacketCapture` on Linux,
-`BpfCapture` on macOS. `BpfCapture` opens the lowest `/dev/bpfN` this
-process may, then `BIOCIMMEDIATE`, `BIOCSHDRCMPLT` (injected source MACs
-are left alone), `BIOCSSEESENT`, `BIOCSETIF`, `BIOCPROMISC`; reads are
-runs of `bpf_hdr` records split by `parse_bpf_records()` (pinned by hand-
-built headers in `tests/test_capture.py`). It needs **no elevation** —
-only a node the process can open.
+(`recv(timeout, match=...)`, `send(frame)`): `BpfCapture` on macOS,
+`AfPacketCapture` on Linux. `BpfCapture` opens the lowest `/dev/bpfN` this
+process may, then sets `BIOCIMMEDIATE`, `BIOCSHDRCMPLT` (injected source
+MACs are left alone), `BIOCSSEESENT`, `BIOCSETIF`, checks `BIOCGDLT`, and
+sets `BIOCPROMISC`; reads are runs of `bpf_hdr` records split by
+`parse_bpf_records()` (pinned by hand-built headers in
+`tests/test_capture.py`). It needs **no elevation** — only a node the
+process can open.
 
-What the bench looks like (measured 2026-09-01, uid 501):
+What the bench looked like (measured 2026-09-01, uid 501):
 
 * `/dev/bpf0-3` are `crw----rw-` — a manual `chmod o+rw`; there is no
   ChmodBPF LaunchDaemon and no `access_bpf` group, so **the mode does not
-  survive a reboot**. `/dev/bpf4-7` are root-only, and macOS creates
+  survive a reboot**. Higher nodes are root-only, and macOS creates
   further nodes on demand *only for root*.
-* A root VICE takes the lowest two free nodes per instance — i.e. exactly
-  the ones the chmod opened. With one VICE up and one stray holder
-  (`netstat -B` lists them), one node is left for the harness.
+* A root VICE takes the lowest two free nodes per instance (one bound to
+  the requested `feth`, one to another host interface — `netstat -B`,
+  re-verified 2026-08-30), and every dnsmasq DHCP rig on the bench holds
+  one node permanently. `netstat -B` lists every holder; its Command
+  column reads `.<pid>` for some holders — a naming quirk, not a stale
+  pid.
 * Full unelevated sequence verified: open `/dev/bpf1`, `BIOCGBLEN`=4096,
   `BIOCSETIF feth0`, `BIOCGDLT`=1 (EN10MB), `BIOCPROMISC`.
 
 When nothing can be opened, `open_capture` raises `CaptureUnavailable`
-whose message carries the operator remedy verbatim, and the two tests
-skip **with that message as the reason** — only then. When a capture is
+whose message carries the operator remedy verbatim. When a capture is
 open, a silent wire is a **failure**: `run_tx_scenario` raises when no
-frame with the test ethertype arrives, and `run_rx_scenario` raises on a
-failed host send or a C64 poll timeout (the old code swallowed the send
-error and skipped on the timeout). `tests/test_ethernet_capture_wiring.py`
-proves both with fakes.
+frame with the test ethertype (`0x88B5`; other frames on the interface
+are discarded, so stray traffic can neither fail nor pass the test)
+arrives, and `run_rx_scenario` raises on a failed host send or a C64 poll
+timeout. `tests/test_ethernet_capture_wiring.py` proves both with fakes.
 
 Remedy after a reboot or when the pool is short (no sudoers change):
 
@@ -286,31 +258,29 @@ sudo chmod o+rw /dev/bpf*
 ```
 
 Order matters after a reboot: devfs exposes only `bpf0-3` until a root
-process opens more — macOS creates `bpf4+` on demand *for root only*
-(e.g. the next elevated VICE launch takes `bpf0`+`bpf1`, then `bpf2`…). A
-`chmod` run before that widens nothing beyond the four that exist, so
-either launch VICE first and `chmod` afterwards, or accept that with one
-VICE up only the nodes it did not take (`bpf2-3`) are open to the
-harness.
+process opens more, and macOS creates `bpf4+` on demand *for root only*.
+A `chmod` run before that widens nothing beyond the nodes that exist, so
+either launch VICE (and the rigs) first and `chmod` afterwards, or accept
+that only the nodes they did not take are open to the harness. With two
+dnsmasq rigs up, `bpf0-3` alone cannot serve a root VICE plus the harness
+capture.
 
 The tests open the capture *after* the module's VICE fixture has taken
 its nodes, so the one `open_capture()` call reflects the pool this
-process really has. Its exception is classified: **skip** only on genuine
-absence (no nodes, no `CAP_NET_RAW`, no backend); **fail**, remedy in the
-message, when the path exists but is broken — all writable nodes `EBUSY`
-while VICE is live (pool eaten), `BIOCSETIF` failing on the interface the
+process really has. The exception is classified by
+`capture_failure_disposition(exc, iface=..., vice_live=...)` in
+`tests/ethernet_scenarios.py`: **skip** only on genuine absence (no
+nodes, no `CAP_NET_RAW`, no backend); **fail**, remedy in the message,
+when the path exists but is broken — all writable nodes `EBUSY` while
+VICE is live (pool eaten), `BIOCSETIF` failing on the interface the
 platform helper just found, a non-ethernet DLT, a Linux bind failure, an
-unclassified errno — **and** every node root-only while a root VICE is up:
-that is this bench's state after every reboot (the chmod is not
-persisted), and with an elevated ethernet VICE already running it is a
-misconfigured bench, not a missing capability
-(`capture_failure_disposition(..., vice_live=True)`). No
-`tcpdump` NOPASSWD rule exists or is needed; if an operator prefers
-sudoers over chmod, `someone ALL=(root) NOPASSWD: /usr/sbin/tcpdump`
-would enable a subprocess path the harness does not currently implement.
+unclassified errno — **and** every node root-only while a root VICE is up
+(`vice_live=True`): that is this bench's state after every reboot, and
+with an elevated ethernet VICE already running it is a misconfigured
+bench, not a missing capability. No `tcpdump` NOPASSWD rule exists or is
+needed.
 
-**Direction assumption and the peer knob.** `feth0`/`feth1` are a peer
-pair (`ifconfig feth0` reports `peer: feth1`). A frame VICE injects on
+**Direction assumption and the peer knob.** A frame VICE injects on
 `feth0` is *outgoing* there and *incoming* on `feth1`; a frame the host
 writes to `feth0`'s BPF emerges from `feth1`. By default the harness
 binds capture and send to VICE's interface and relies on `BIOCSSEESENT`
@@ -329,23 +299,35 @@ C64_ETH_SEND_IFACE=feth1    pytest tests/test_ethernet.py   # send on the peer o
 ```
 
 (`C64_ETH_SEND_IFACE` follows `C64_ETH_CAPTURE_IFACE` unless set
-separately; a second interface costs a second BPF node.) The knob is
-`ethernet_scenarios.resolve_capture_ifaces()`.
+separately; a named interface that is not present is refused; a second
+interface costs a second BPF node.) The knob is
+`resolve_capture_ifaces()` in `tests/ethernet_scenarios.py`.
 
-**Linux behaviour change.** The TX test used to accept the *first* frame
-`AF_PACKET` returned within 5 s and compare it; it now discards frames
-whose ethertype is not `0x88B5` until the deadline, so stray traffic on
-the TAP (IPv6 multicast, ARP) can no longer fail the test by arriving
-first — and can no longer *pass* it either, since the compared frame is
-always ours.
+### The harness's bridge address range
+
+The setup scripts put the host at `10.0.65.1` (`BRIDGE_ADDR`) and the
+ethernet tests answer on `.2` and `.3`. The tests read those three
+addresses from `tests/bridge_platform.py` (`BRIDGE_HOST_IP`,
+`BRIDGE_IP_A`, `BRIDGE_IP_B`), and `C64_BRIDGE_SUBNET=10.77.1` (three
+octets) moves them when the harness has to coexist with a rig that
+already owns `10.0.65/24`. The setup scripts hardcode `10.0.65.1`, so
+that override moves the tests, not the host address.
+
+**Consumer rigs built on this bridge must stay clear of `.1`-`.3`** and
+take `.100` upward. This is not hypothetical: c64-https's
+`rig-up-macos.sh` calls the harness setup script, then moves the host
+address to `feth1` while keeping `.1`, and runs a dnsmasq DHCP pool of
+`.2-.10` — exactly the addresses the two-VICE tests use. Nothing detects
+that clash; the bridge tests simply fail or behave oddly while the
+consumer rig is up.
 
 ### macOS test-author traps (live tests only)
 
-These three gotchas are not present on the Linux side. Traps 1 and 2 were
-surfaced empirically while landing
-`tests/test_cleanup_vice_ports_macos_live.py`; that file is the canonical
-working reference for any new live test that drives the macOS bridge.
-Trap 3 was surfaced on 2026-09-16 while debugging RR-Net.
+`tests/test_cleanup_vice_ports_macos_live.py` is the canonical working
+reference for any new live test that drives the macOS bridge; traps 1-3
+were surfaced landing it, trap 4 while debugging RR-Net (2026-09-16).
+The host-side BPF pool (previous section) is the other macOS-only
+failure a test author meets.
 
 **1. NOPASSWD is scoped to the exact program path, not `bash <script>`.**
 The project's sudoers grant NOPASSWD for the cleanup/setup/teardown
@@ -362,189 +344,45 @@ def _run_sudo_script(script_path: Path) -> subprocess.CompletedProcess:
     )
 ```
 
-The Linux equivalent (`tests/test_cleanup_vice_ports_live.py`) uses the
-`bash` wrapper because Linux sudoers there are configured permissively;
-do not copy that helper verbatim onto macOS.
+The Linux reference (`tests/test_cleanup_vice_ports_live.py`) uses the
+`bash` wrapper, which only works under a permissive sudoers; do not copy
+that helper onto macOS.
 
 **2. `ViceConfig.ethernet=True` needs root on macOS, and `/dev/bpf*` has
 nothing to do with it.**
 VICE admits an ethernet driver only when `archdep_rawnet_capability()`
 holds. That function is, in full: `geteuid() == 0`, plus a Linux-only
-`CAP_NET_RAW` branch (`src/arch/shared/archdep_rawnet_capability.c`). It
-never inspects `/dev/bpf*`. The result gates *driver selection* in
+`CAP_NET_RAW` branch (VICE `src/arch/shared/archdep_rawnet_capability.c`).
+It never inspects `/dev/bpf*`. The result gates *driver selection* in
 `rawnetarch.c` (`set_ethernet_driver()` and `rawnet_arch_resources_init()`),
 so an unelevated macOS VICE leaves `rawnet_arch_driver` NULL and
 dereferences it in `rawnet_arch_pre_reset()` — **SIGSEGV with no log
-output at all**. It does not degrade to "no traffic"; it dies.
+output at all**. It does not degrade to "no traffic"; it dies. Verified
+live: with `/dev/bpf0` at `crw----rw-` and uid 501, `-ethernetiodriver
+pcap` is still rejected. (Upstream bug record:
+[vice_upstream_bugs.md](vice_upstream_bugs.md).)
 
-**The `10.0.65.0/24` range belongs to the harness.** The setup scripts put
-the host at `.1` (`BRIDGE_ADDR`) and the ethernet tests answer on `.2` and
-`.3`. Those three addresses are reserved; they are defined once in
-`tests/bridge_platform.py` (`BRIDGE_HOST_IP`, `BRIDGE_IP_A`,
-`BRIDGE_IP_B`) rather than repeated as literals, and the whole range can
-be moved with `C64_BRIDGE_SUBNET=10.77.1` when the harness has to coexist
-with a rig that already owns `10.0.65/24`.
-
-**Consumer rigs built on this bridge must stay clear of `.1`-`.3`.** A rig
-that reuses the harness's bridge and runs its own services should take
-`.100` upward. This is not hypothetical: c64-https's `rig-up-macos.sh`
-calls the harness setup script, then moves the host address to `feth1`
-while keeping `.1`, and runs a dnsmasq DHCP pool of `.2-.10` — handing out
-exactly the addresses the harness's two-VICE tests hardcode. Nothing
-detects that clash; the bridge tests simply fail or behave oddly while the
-consumer rig is up.
-
-Verified live that the euid gate, not `/dev/bpf*` permissions, is what
-VICE checks: with `/dev/bpf0` at `crw----rw-` (world read/write) and uid
-501, `-ethernetiodriver pcap` is still rejected.
-
-> An earlier version of this section claimed a rig that ran
-> `sudo chmod o+rw /dev/bpf*` needed no elevation. That rule was wrong —
-> it modelled libpcap's requirements rather than VICE's gate, and
-> `bpf_capture_available()` has been removed.
->
-> The **pool observation is not retracted**: one VICE holding two
-> `/dev/bpf*` nodes and a second instance dying `rc=255` was recorded
-> correctly, under `sudo`, and only its context was lost. Re-verified
-> 2026-08-30 with `netstat -B`: a single elevated x64sc holds exactly two
-> BPF peers — one bound to the requested `feth`, one to another host
-> interface — and the count of nodes an unprivileged process can still
-> open drops by exactly two. That is the old `BPF_NODES_PER_VICE = 2`,
-> measured again. As root macOS creates further nodes on demand, so the
-> pool does not block a second instance the way it blocks an unprivileged
-> one, but a pool exhausted by another capturing process can still bite a
-> multi-instance run.
-
-**3. `ifconfig` reports a REDACTED MAC under a Homebrew-python parent.**
-The cause is **not** established: `/sbin/ifconfig` is the same binary in
-every arm, so the redaction is inherited from the responsible parent
-rather than produced by Python, and the real rule may be broader than
-"Homebrew".  What is *measured* is the set of arms below.
-
-On macOS 27.0 (build 26A428) a process launched from Homebrew's Python --
-and every process it spawns, so `subprocess.run(["ifconfig", iface])` too --
-reads the interface's `ether` line as `02:00:00:00:00:00`, and
-`uuid.getnode()` returns `020000000000` likewise.  Apple's
-`/usr/bin/python3` and a plain shell see the real address.  It is the
-*interpreter*, not the venv and not this package: `-S` and `-E -S` still
-redact, no `.pth` or `sitecustomize` is involved, and the value is
-identical before and after importing the harness with no environment
-variable changing.  **`networksetup -getmacaddress <iface>` is not
-redacted**, and is what the live RR-Net fixtures read.
-
-The failure it caused (2026-09-16): `_host_addr` / `_host_mac` returned the
-placeholder, the ping builders set `dst_mac` to a MAC nobody owns, the Mac
-never saw a frame addressed to itself and so never replied -- every
-exchange missed with `RxMISS` **0**, which reads exactly like a dead link
-or an absent cartridge.  A wire capture showed the ARP handshake
-completing correctly and the echo request then leaving for the placeholder
-address.  Rule: **`RxMISS` 0 rules out the #222 queue-overflow mechanism; it does
-not establish that the frame never arrived** -- `bridge_ping.py` records
-frames injected 200 ms early that were already buffered with `RxMISS`
-still 0.  On a miss with `RxMISS` 0, check addressing, link and chip
-init, in that order.  `RxMISS` +1 is the separate queue-overflow case of
-issue #222.
-
-### Issue #144 is refuted: the Homebrew bottle captures fine
-
-#144 recorded that *as root*, VICE answers the binary monitor while
-attaching no BPF device — i.e. that the Homebrew build's ethernet was
-silently non-functional and a separate build was required. **That is
-false.** Measured 2026-08-30, elevated, cart active, with the interface
-and driver supplied only through the `-addconfig` rc:
-
-```
-wrapper=4636  x64sc=4637  owner=root  monitor=up
-  ETHERNET_DRIVER      = 'pcap'
-  ETHERNET_INTERFACE   = 'feth0'
-  ETHERNETCART_ACTIVE  = 1
-netstat -B:
-  bpf1  ap1    p---IO------  x64sc.4637
-  bpf2  feth0  p---IO------  x64sc.4637
-```
-
-Two BPF descriptors, one bound to the requested interface, in
-promiscuous mode.
-
-The claim came from the harness's own measurement. `probe_vice_pcap_ok()`
-demanded a `/dev/bpf*` attach as proof of real capture — correctly — but
-read it with `lsof -nP -p <pid>` run **unelevated**. An unprivileged
-`lsof` cannot read a root-owned process's descriptor table at all: it
-returns *zero lines*, not zero `bpf` lines. Since every macOS pcap launch
-elevates, the helper returned `[]` every time, and the probe published
-that as a defect in the emulator build. Its own diagnostic string is what
-#144 was written from.
-
-### The rc alone is sufficient; the ethernet CLI flags are redundant
-
-The same elevated run settles a second question. `ViceProcess` writes an
-`-addconfig` rc *and* passes `-ethernetioif` / `-ethernetiodriver`, and
-two rc keys were misspelled (`EthernetIOIF` / `EthernetIODriver` — not
-VICE resources in any casing; the real names are `ETHERNET_INTERFACE`
-and `ETHERNET_DRIVER`). That was first recorded as harmless, because the
-CLI flags carried the same settings.
-
-It was worse than that. With the corrected names and **no ethernet CLI
-flags at all**, the rc on its own produces `ETHERNET_DRIVER='pcap'`,
-`ETHERNET_INTERFACE='feth0'`, `ETHERNETCART_ACTIVE=1` and two attached
-BPF peers. The rc is sufficient by itself, so the CLI flags are
-redundant rather than load-bearing — and the misspelling was harmless
-only on paths that happened to pass both. Any path relying on the rc
-alone was silently unconfigured. Hence the fix writes the real names
-rather than dropping the lines.
-
-The instrument is now `netstat -B` (`bpf_attached_interfaces()` in
-`tests/bridge_platform.py`), which reports device, bound interface and
-owning command, needs no privilege, and reads root-owned processes.
-`lsof` is the wrong tool for this measurement at any privilege level.
-Regression test: `tests/test_bpf_attach_detection.py`, which launches a
-real elevated VICE and asserts the attach is seen — it fails against the
-`lsof` implementation.
-
-So on macOS every pcap ethernet launch elevates. The harness refuses to
+So every macOS pcap ethernet launch elevates, and the harness refuses to
 launch one it cannot elevate: `plan_vice_launch()` (in
 `c64_test_harness.backends.vice_elevation`) parses the `NOPASSWD:` rules
 out of plain `sudo -n -l` (`sudo_can_run` → `parse_sudo_listing`; a
 per-command `sudo -n -l -- <x64sc>` probe exits 0 for anything a
 `(ALL) ALL` user may run and proves nothing) and, when no rule names the
-exact binary, raises `ViceElevationRequiredError` carrying
-the exact command to run and a NOPASSWD line naming that exact binary
-path — never `bash`-wrapped, since sudoers matches sudo's first non-flag
-argument. `VICE_ETHERNET_ALLOW_UNELEVATED=1` downgrades the refusal to a
-warning for a host that grants the capability some way we cannot see
-(Linux file capabilities, say).
+exact binary, raises `ViceElevationRequiredError` carrying the exact
+command to run and a NOPASSWD line naming that exact binary path — never
+`bash`-wrapped, since sudoers matches sudo's first non-flag argument.
+`VICE_ETHERNET_ALLOW_UNELEVATED=1` downgrades the refusal to a warning for
+a host that grants the capability some way the harness cannot see (Linux
+file capabilities, say). Linux's `tuntap` driver is selected without
+consulting the capability, so the Linux bridge suite needs no elevation.
 
-Linux is unaffected: the `tuntap` driver is selected without consulting
-the capability, so the Linux bridge suite needs no elevation.
-
-When elevation *does* fire, `ViceProcess` wraps the launch in
-`sudo -n x64sc …`, so the recorded `ViceProcess.pid` is the **sudo
-wrapper's** PID, not the actual `x64sc` process. `ps -p <sudo_pid> -o
-ucomm=` returns `"sudo"`, which breaks any `_is_x64sc(pid)` sanity check.
-Check `ViceProcess.is_sudo_child` rather than assuming either shape.
-
-Resolve the real x64sc descendant before asserting:
-
-```python
-def _resolve_x64sc_child(parent_pid: int) -> int | None:
-    out = subprocess.run(
-        ["pgrep", "-P", str(parent_pid), "x64sc"],
-        capture_output=True, text=True, check=False,
-    )
-    for line in out.stdout.splitlines():
-        if line.strip().isdigit():
-            return int(line.strip())
-    return None
-```
-
-Sentinel VICEs spawned without `ethernet=True` are NOT sudo-wrapped, so
-`ViceProcess.pid` is correct for them — the resolver only applies to
-ethernet-enabled bridge VICEs.
-
-`ViceProcess` now ships this resolver: check `proc.is_sudo_child` and
-call `proc.resolve_vice_pid()` to get the actual x64sc PID (equal to
-`proc.pid` for plain launches) instead of hand-rolling the `pgrep`
-snippet above.
+When elevation fires, `ViceProcess` wraps the launch in `sudo -n x64sc …`,
+so `ViceProcess.pid` is the **sudo wrapper's** PID (`ps -o ucomm=` says
+`sudo`, which breaks an `_is_x64sc(pid)` check). Check
+`ViceProcess.is_sudo_child` and call `ViceProcess.resolve_vice_pid()` for
+the real x64sc PID (it equals `pid` for a plain launch and returns `None`
+when the child cannot be found). Non-ethernet VICEs are never
+sudo-wrapped.
 
 **3. macOS `ps -o ucomm=` preserves the comm name on zombies. Use `stat=`.**
 A SIGKILL'd-not-yet-reaped process retains its `ucomm` value, so a
@@ -572,8 +410,101 @@ Pair this with `Popen.poll()` calls in the test body to actually reap
 zombies whose parent is pytest. Without poll, the kernel keeps the PID
 alive until pytest exits; with poll, the next `os.kill(pid, 0)` raises
 `ProcessLookupError` cleanly. The Linux `_pid_alive` reads
-`/proc/<pid>/status State:` for the same purpose; macOS just gets the
-state via `ps` instead.
+`/proc/<pid>/status State:` for the same purpose.
+
+**4. `ifconfig` reports a REDACTED MAC under a Homebrew-python parent.**
+On macOS 27.0 (build 26A428) a process launched from Homebrew's Python —
+and every process it spawns, so `subprocess.run(["ifconfig", iface])` too —
+reads the interface's `ether` line as `02:00:00:00:00:00`, and
+`uuid.getnode()` returns `020000000000` likewise. Apple's
+`/usr/bin/python3` and a plain shell see the real address. It is the
+*interpreter*, not the venv and not this package: `-S` and `-E -S` still
+redact, no `.pth` or `sitecustomize` is involved, and the value is
+identical before and after importing the harness. The cause is **not**
+established: `/sbin/ifconfig` is the same binary in every arm, so the
+redaction is inherited from the responsible parent, and the real rule may
+be broader than "Homebrew". **`networksetup -getmacaddress <iface>` is not
+redacted**; `host_mac()` / `host_addr()` in `tests/bridge_platform.py`
+read it first, fall back to `ifconfig` only for interfaces `networksetup`
+does not know (`feth*`, `bridge10`), and skip rather than return the
+placeholder (`REDACTED_MAC`) or all zeros (issue #444).
+
+The failure it caused (2026-09-16): the ping builders were given the
+placeholder as `dst_mac`, the Mac never saw a frame addressed to itself
+and so never replied — every exchange missed with `RxMISS` **0**, which
+reads exactly like a dead link or an absent cartridge. A wire capture
+showed the ARP handshake completing and the echo request leaving for the
+placeholder. Rule: **`RxMISS` 0 rules out the #222 queue-overflow
+mechanism; it does not establish that the frame never arrived** —
+`bridge_ping.py` records frames injected 200 ms early that were already
+buffered with `RxMISS` still 0. On a miss with `RxMISS` 0, check
+addressing, link and chip init, in that order. `RxMISS` +1 is the
+queue-overflow case of issue #222.
+
+### Issue #144 is refuted: the Homebrew bottle captures fine
+
+#144 recorded that *as root*, VICE answers the binary monitor while
+attaching no BPF device — i.e. that the Homebrew build's ethernet was
+silently non-functional. **That is false.** Measured 2026-08-30, elevated,
+cart active, with the interface and driver supplied only through the
+`-addconfig` rc:
+
+```
+wrapper=4636  x64sc=4637  owner=root  monitor=up
+  ETHERNET_DRIVER      = 'pcap'
+  ETHERNET_INTERFACE   = 'feth0'
+  ETHERNETCART_ACTIVE  = 1
+netstat -B:
+  bpf1  ap1    p---IO------  x64sc.4637
+  bpf2  feth0  p---IO------  x64sc.4637
+```
+
+Two BPF descriptors, one bound to the requested interface, in
+promiscuous mode.
+
+The claim came from the harness's own instrument: `probe_vice_pcap_ok()`
+read the attach with `lsof -nP -p <pid>` run **unelevated**, and an
+unprivileged `lsof` returns *zero lines* for a root-owned process, so every
+elevated launch looked unattached. The instrument is now `netstat -B`
+(`bpf_attached_interfaces()` in `tests/bridge_platform.py`), which reports
+device, bound interface and owning command, needs no privilege, and reads
+root-owned processes; `lsof` is the wrong tool for this at any privilege
+level. Regression test: `tests/test_bpf_attach_detection.py`, which
+launches a real elevated VICE and asserts the attach is seen.
+
+The same run showed that the vicerc alone configures ethernet
+completely. `ViceProcess` writes the real resource names
+(`ETHERNET_INTERFACE`, `ETHERNET_DRIVER`) and still passes the
+`-ethernetioif` / `-ethernetiodriver` flags alongside; the earlier
+`EthernetIOIF` / `EthernetIODriver` keys are not VICE resources in any
+casing and only ever worked because the flags carried the same settings.
+Pinned by `tests/test_vice_ethernet_rc.py`.
+
+## Linux (TAP + Linux bridge)
+
+**Last verified 2026-04-11** (the last substantive change to the three
+Linux scripts); the current bench is macOS and this path has not been
+re-run since.
+
+Prerequisites:
+
+* `x64sc` (VICE 3.10) built with `tuntap` support (`x64sc -features`
+  shows `HAVE_TUNTAP yes`)
+* Root privileges to create TAP devices and configure the bridge
+  (only required for setup/teardown — VICE itself runs unprivileged)
+* `ip` (iproute2) and `iptables`
+
+```bash
+sudo ./scripts/setup-bridge-tap.sh          # br-c64 (10.0.65.1/24, STP off) + tap-c64-0/1 + FORWARD ACCEPT rules
+sudo ./scripts/teardown-bridge-tap.sh       # symmetric teardown
+sudo ./scripts/cleanup-bridge-networking.sh # emergency recovery
+```
+
+Host capture of the C64 traffic: `sudo tcpdump -nne -i br-c64`. The
+harness's own capture is an `AF_PACKET` socket (`AfPacketCapture`, needs
+`CAP_NET_RAW`). `scripts/bridge_ping_demo.py` and
+`scripts/verify_vice_ethernet.py` hardcode the Linux `tap-c64-*` /
+`tuntap` names and do not run on macOS.
 
 ## Launching two VICE instances on the bridge
 
@@ -586,67 +517,63 @@ def test_my_bridge_thing(bridge_vice_pair):
     # both VICE instances are at READY, CS8900a initialised, MACs set
 ```
 
-The fixture handles port allocation, VICE process lifecycle, BASIC
-READY synchronization, CS8900a initialization (RxCTL + LineCTL), and
-unique MAC programming.
+The fixture handles port allocation, VICE process lifecycle (via
+`start_vice_or_skip`, which turns a mid-launch `ViceElevationRequiredError`
+into the elevation skip/fail), BASIC READY synchronization, CS8900a
+initialization (RxCTL + LineCTL), unique MAC programming (`BRIDGE_MAC_A`
+`02:C6:40:00:00:01`, `BRIDGE_MAC_B` `…:02`), and a teardown that attempts
+every step independently.
 
-To launch manually (Linux values shown; on macOS substitute
-`ethernet_interface="feth0"`/`"feth1"` and `ethernet_driver="pcap"` —
-or pull both from `tests/bridge_platform.py`):
+To launch manually (the platform values come from
+`tests/bridge_platform.py`; importing it and `tests/conftest.py` needs
+`tests/` on `sys.path`, as under pytest):
 
 ```python
+from bridge_platform import ETHERNET_DRIVER, IFACE_A, IFACE_B
 from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
 from c64_test_harness.backends.vice_manager import PortAllocator
-from c64_test_harness.bridge_ping import (
-    cs8900a_rxctl_code, cs8900a_read_linectl_code, cs8900a_write_linectl_code,
-)
 from c64_test_harness.ethernet import set_cs8900a_mac
-from c64_test_harness.execute import jsr, load_code
-from c64_test_harness.memory import read_bytes
-from tests.conftest import connect_binary_transport
+from conftest import _bridge_init_cs8900a, _bridge_wait_ready, connect_binary_transport
 
-# Allocate two binary monitor ports
 allocator = PortAllocator(port_range_start=6560, port_range_end=6580)
 port_a = allocator.allocate()
 port_b = allocator.allocate()
 
-# Configure both VICE instances with RR-Net ethernet on different TAPs.
 # Keep warp=False: ip65's DHCP flow has been observed to misbehave in
 # warp mode, and normal speed is fast enough for ethernet tests.
 config_a = ViceConfig(
     port=port_a, warp=False, sound=False,
     ethernet=True, ethernet_mode="rrnet",
-    ethernet_interface="tap-c64-0",
-    ethernet_driver="tuntap",
+    ethernet_interface=IFACE_A,        # "feth0" on macOS, "tap-c64-0" on Linux
+    ethernet_driver=ETHERNET_DRIVER,   # "pcap" on macOS, "tuntap" on Linux
 )
 config_b = ViceConfig(
     port=port_b, warp=False, sound=False,
     ethernet=True, ethernet_mode="rrnet",
-    ethernet_interface="tap-c64-1",
-    ethernet_driver="tuntap",
+    ethernet_interface=IFACE_B,
+    ethernet_driver=ETHERNET_DRIVER,
 )
 
-vice_a = ViceProcess(config_a)
-vice_b = ViceProcess(config_b)
+vice_a = ViceProcess(config_a)   # on macOS start() elevates via sudo -n,
+vice_b = ViceProcess(config_b)   # or raises ViceElevationRequiredError
 vice_a.start()
 vice_b.start()
 transport_a = connect_binary_transport(port_a, proc=vice_a)
 transport_b = connect_binary_transport(port_b, proc=vice_b)
 
-# Wait for BASIC READY (omitted: see _bridge_wait_ready in tests/conftest.py)
+_bridge_wait_ready(transport_a)
+_bridge_wait_ready(transport_b)
+# RxCTL = CS8900A_RXCTL_VALUE, LineCTL |= 0x00C0 (code at $C000, scratch $C1E0)
+_bridge_init_cs8900a(transport_a, 0xC1E0, 0xC000)
+_bridge_init_cs8900a(transport_b, 0xC1E0, 0xC000)
 
-# Initialise CS8900a on each instance: RxCTL = CS8900A_RXCTL_VALUE,
-# LineCTL |= 0x00C0
-# (see _bridge_init_cs8900a in tests/conftest.py for the exact sequence)
-
-# Program unique MAC addresses
 set_cs8900a_mac(transport_a, bytes.fromhex("02C640000001"))
 set_cs8900a_mac(transport_b, bytes.fromhex("02C640000002"))
 
 # ... use the transports ...
 
-vice_a.stop()
-vice_b.stop()
+transport_a.close(); transport_b.close()
+vice_a.stop(); vice_b.stop()
 allocator.release(port_a)
 allocator.release(port_b)
 ```
@@ -688,9 +615,11 @@ read-modify-write on `$DE01` before the first PP access.
 Programming model:
 
 * **TX**: write `TxCMD = CS8900A_TXCMD_VALUE` (`0x00C9`: transmit-after-full-frame
-  `0x00C0` plus the register number `0x09` in the read-only low 6 bits -- a bare
-  `0x00C0` is the same omission as the old RxCTL `0x00D8`), `TxLength = N`, then poll BusST
-  (PP `0x0138` bit 8) for `Rdy4TxNOW`, then write N bytes to RTDATA.
+  `0x00C0` plus the register number `0x09` in the read-only low 6 bits, as
+  ip65 writes it), `TxLength = N`, then read BusST (PP `0x0138` bit 8) for
+  `Rdy4TxNOW` -- up to `CS8900A_TX_SKIP_TRIES` reads with a SkipNow of a
+  queued RX frame after each clear one (#487), then a bounded poll (#236)
+  -- then write N bytes to RTDATA.  See § "TX builder hazards".
 * **RX**: poll the high byte of RxEvent (PP `0x0124`) masked with
   `CS8900A_RXEVENT_MASK` (`0x0D` = RxOK | IndividualAdr | Broadcast, ip65's mask;
   the old `AND #$01` missed frames the chip signalled without RxOK), then read 2
@@ -711,13 +640,12 @@ All three were found bringing an external RR-Net cartridge up on a U64E
 expansion port; all three are invisible to the two-VICE bridge suite,
 because VICE is more forgiving than the chip.
 
-"Three" counts the silicon-vs-VICE *divergences* only, and it is the
-right count for this list. The two ip65 alignments at the end of this
-section are not divergences (neither caused a measured fault), and the
-operational steps for a cartridge on real hardware — `Cartridge
-Preference`, `run_prg_via_sys`, ARP-first, RX drain — are in
-§ "Driving a cartridge on the U64" below. A summary elsewhere that
-counts five is spanning both sections, not contradicting this one.
+"Three" counts the silicon-vs-VICE *divergences* only. The two ip65
+alignments at the end of this section are not divergences (neither caused
+a measured fault), the operational steps for a cartridge on real hardware
+— `Cartridge Preference`, `run_prg_via_sys`, RX release, ARP-first, RX
+drain — are in § "Driving a cartridge on the U64" below, and the TX-side
+hazards are in § "TX builder hazards and what now guards them".
 
 **1. RxCTL's low 6 bits are read-only** (issue #207).  On a real CS8900a
 every control/status register reports its own register number in the low
@@ -784,7 +712,12 @@ not a bare `0x00C0`), and the RxEvent poll masks `CS8900A_RXEVENT_MASK` =
 
 ### Driving a cartridge on the U64
 
-Two more hardware-only facts, from issues #209, #211 and #217:
+Hardware-only facts for driving an external RR-Net cartridge on the U64
+(issues #209, #211, #217, #218, #219, #222). The live modules cited below
+all need `RRNET_LIVE=1`, `U64_HOST` and `U64_ALLOW_MUTATE=1` (they write
+`Cartridge Preference` and restore it to the device's default); the
+cartridge sits on a point-to-point 10BASE-T link to the host NIC `en4`
+(`RRNET_IFACE`, default `en4`).
 
 * The cartridge is invisible unless `C64 and Cartridge Settings` ->
   **`Cartridge Preference` = `External`**.  On the default `Auto` the
@@ -825,7 +758,7 @@ Two more hardware-only facts, from issues #209, #211 and #217:
   it first (`reselect_cartridge=False` opts out).  Stock ip65 `ping.prg`
   reports `INIT DRIVER: FAILED` under `run_prg` and pings normally under
   `run_prg_via_sys`.  Live matrix:
-  `tests/test_run_prg_cartridge_visibility_live.py` (`RRNET_LIVE=1`, `U64_ALLOW_MUTATE=1`).
+  `tests/test_run_prg_cartridge_visibility_live.py`.
 * **A complete RX read releases the frame without SkipNow, but the next
   header appears only after RxEvent's high byte is read** (#219, U64E,
   n=3 per variant, two host-queued frames): after reading all RxLength
@@ -848,21 +781,19 @@ Two more hardware-only facts, from issues #209, #211 and #217:
   dropped" reading was a leftover half-read frame behind a blind
   SkipNow drain, retracted on #219.  `_emit_read_frame` keeps its skip
   because its fixed 60-byte body read is a partial read.  Live:
-  `tests/test_cs8900a_fifo_live.py` (`RRNET_LIVE=1`, `U64_ALLOW_MUTATE=1`, `RRNET_IFACE`).
+  `tests/test_cs8900a_fifo_live.py`.
 * **Resolve before the first exchange with a host: pass the ARP frame,
-  or use the responder, which now answers ARP (issue #218).**  Until #218
-  the harness's ping routines neither sent nor answered ARP, and macOS
-  holds every reply while it has no *complete* neighbour entry for the
-  C64 (its own ARP request goes unanswered and the entry sits
+  or use a responder with `my_mac=`, which answers ARP (issue #218).**
+  macOS holds every reply while it has no *complete* neighbour entry for
+  the C64 (its own ARP request goes unanswered and the entry sits
   `incomplete`; entry absent 0/8, entry present 8/8 -- #218 paired
   rounds; the "stale entry behind revalidation" case is inferred, not
   measured, because the `arp -S` control needs root) -- so a routine
-  that only pinged got 0/8 with
-  the requests visibly leaving the wire and the replies still sitting on
-  the host, and 6/6 once an ARP request preceded the ping (issue #212,
-  closed invalid: it was never a chip fault).  ip65 is immune because
-  `icmp_ping` ARPs first and `arp_process` answers requests.  The harness
-  now does the same, opt-in:
+  that only pinged got 0/8 with the requests visibly leaving the wire and
+  the replies still sitting on the host, and 6/6 once an ARP request
+  preceded the ping (issue #212, closed invalid: it was never a chip
+  fault).  ip65 is immune because `icmp_ping` ARPs first and
+  `arp_process` answers requests.  The harness does the same, opt-in:
   - **Pinging:** `build_arp_request_frame(src_mac, src_ip, target_ip)`
     (60 bytes, RFC 826 at ip65's `ap_*` offsets) into RAM, then
     `build_ping_and_wait_code(..., arp_frame_buf=ADDR)` /
@@ -877,27 +808,29 @@ Two more hardware-only facts, from issues #209, #211 and #217:
     ARP request for `my_ip` from the received frame in place and go back
     to waiting for the echo (`run_icmp_responder(my_mac=...)`; the
     consume routine reports `RESULT_ARP_REPLY_SENT = 0x03`).  Without
-    `my_mac` -- and without `arp_frame_buf` -- every builder's output is
-    byte-identical to before, so nothing sized to the old routines moves;
-    with ARP on they are larger (measured after #487: consume 738 B,
-    responder 783 B, TOD responder 907 B, ping-and-wait 472 B, TOD
-    ping-and-wait 596 B; the 480-byte `$C000-$C1DF` window does not fit an
-    ARP-enabled responder).
+    `my_mac` -- and without `arp_frame_buf` -- a builder emits no ARP
+    code.  Sizes at 0e56950 (after #487), plain / with ARP: consume
+    429 / 738 B, responder 481 / 783 B, TOD responder 605 / 907 B,
+    ping-and-wait 336 / 472 B, TOD ping-and-wait 460 / 596 B.  Neither
+    responder fits the 480-byte `$C000-$C1DF` span below the bridge
+    fixture's `$C1E0` scratch any more.
   - `parse_arp(frame) -> ArpPacket | None` reads either direction back
     from a buffer or a capture.
 
-  **Measured under VICE and on a simulated CS8900a only** so far: the
-  ARP behaviour is proven by `tests/test_cs8900a_arp.py` (default suite;
-  runs the emitted 6502 on `tests/cs8900a_sim.py`) and by the two-VICE
-  `tests/test_bridge_arp.py`; the 0/8 -> 6/6 figure above is the only
-  hardware measurement, and it was taken with a hand-built ARP frame and
-  `build_tx_code`, not with these builders.  A U64E + RR-Net pass of the
-  new parameters is still owed.  Pinning a static neighbour entry on the
-  host remains a valid workaround for code that cannot change.
+  The ARP behaviour is proven by `tests/test_cs8900a_arp.py` (default
+  suite; runs the emitted 6502 on `tests/cs8900a_sim.py`) and by the
+  two-VICE `tests/test_bridge_arp.py`.  The 0/8 -> 6/6 figure above was
+  taken with a hand-built ARP frame and `build_tx_code`, not with these
+  builders; on silicon `arp_frame_buf` is driven by
+  `tests/test_first_exchange_live.py` (with `build_ping_and_wait_tod_code`),
+  and no dated result of that pass is recorded here.  Pinning a static
+  neighbour entry on the host remains a valid workaround for code that
+  cannot change.
 * **Drain the chip's RX queue before the first exchange (issue #222):**
-  ``build_ping_and_wait_code`` / ``build_ping_and_wait_tod_code`` take
-  ``drain_first=True``, which SkipNows every frame already queued (at
-  most ``DRAIN_RX_MAX_FRAMES`` = 8) before the first transmit.  Frames
+  ``build_ping_and_wait_code`` / ``build_ping_and_wait_tod_code`` (and,
+  since #303, ``build_tx_code``) take ``drain_first=True``, which SkipNows
+  every frame already queued (at most ``DRAIN_RX_MAX_FRAMES`` = 8) before
+  the first transmit; ``drain_status_addr=`` records the remaining budget.  Frames
   that arrive while nobody reads sit in the CS8900a's queue, and an
   exchange started on top of them loses its reply: the chip counts it in
   RxMISS ("no receive buffer") and never presents it.  Measured on the
@@ -917,17 +850,18 @@ Two more hardware-only facts, from issues #209, #211 and #217:
   it.  A second ping 1 s after a miss matched 7/7, so one retry also
   covers it.  The promiscuous-mode / link-bounce candidate from the #218
   review is out (no link transition in 30 trials, LinkOK at every TX).
-  Live: ``tests/test_first_exchange_live.py`` (``RRNET_LIVE=1``, ``U64_ALLOW_MUTATE=1``); the
+  Live: ``tests/test_first_exchange_live.py``; the
   simulator models blind SkipNow releasing a queued frame
   (``tests/test_cs8900a_drain.py``).
 
 ## Capture-only sample (host tcpdump)
 
 Once the bridge is up and two VICE instances are running on it, you
-can observe all traffic on the host:
+can observe their traffic on the host:
 
 ```bash
-sudo tcpdump -nne -i br-c64
+sudo tcpdump -nne -i feth0     # macOS: capture on a feth peer, not bridge10 (it has no members)
+sudo tcpdump -nne -i br-c64    # Linux (last verified 2026-04-11)
 ```
 
 This is useful for debugging your test cases and for verifying that
@@ -953,10 +887,10 @@ below); warp-mode test runs must use the host-driven pattern
 described here.
 
 The host-side pattern works in **both** normal and warp modes (verified
-10/10 each via `scripts/bridge_ping_demo.py [--warp]`) and is the same
-orchestration shape.  (UCI networking has since landed separately -- see
-`docs/uci_networking.md` and `tests/test_uci_*.py`; it does not go through
-`poll_until_ready`.)
+10/10 each via `scripts/bridge_ping_demo.py [--warp]` on Linux, 2026-04-10;
+the demo hardcodes the Linux interfaces).  UCI networking is separate --
+see [uci_networking.md](uci_networking.md); it does not go through
+`poll_until_ready`.
 
 ### High-level entry points
 
@@ -981,24 +915,30 @@ orchestration shape.  (UCI networking has since landed separately -- see
 * `bridge_ping.build_read_and_respond_echo_request_code(...)` --
   one-shot drain + transform + TX reply (returns 0x01 done / 0x02 mismatch).
 
-The older `build_icmp_responder_code` / `build_ping_and_wait_code` /
-`build_rx_echo_reply_code` builders remain the right choice for tests
-that run under VICE warp mode, because their polling budget is owned
-by the host-side `poll_until_ready` wrapper rather than by an in-6502
-counter.  For **shippable applications** (real C64, Ultimate 64 Elite,
-VICE normal mode) use the `*_tod_code` variants in the "Test harness
-vs shippable application" section below instead.
+The older single-JSR builders `build_icmp_responder_code` /
+`build_ping_and_wait_code` / `build_rx_echo_reply_code` still poll with
+an in-6502 3-level iteration counter (`_emit_poll_rx`, `$F0-$F2`, ~4-5 s
+at 1 MHz), so their timeout evaporates under warp exactly as described
+above; under warp use `run_ping_and_wait` / `run_icmp_responder`, which
+are built from the peek and one-shot routines.  For **shippable
+applications** (real C64, Ultimate 64, VICE normal mode) use the
+`*_tod_code` variants in the "Test harness vs shippable application"
+section below.
 
 ## Known limitations
 
 ### TX builder hazards and what now guards them (issues #234, #235, #236, #238)
 
-All four are hardware-only — an emulated CS8900a asserts `Rdy4TxNOW` at
+These hazards — the four in the heading plus the #303 starvation, the
+#487 skip-and-retry, the #404 page copy and the #438 odd-length opt-in
+below — are hardware-only: an emulated CS8900a asserts `Rdy4TxNOW` at
 once and resets instantly, so **no VICE test can fail on any of them**.
 The guards are structural byte pins (`tests/test_cs8900a_register_pins.py`)
-and runs on the simulated chip (`tests/test_cs8900a_tx_bound.py`). All
-four are reached through `_emit_tx_frame` in `bridge_ping.py`, the single
-TX sequence every builder emits (nine call sites).
+and runs on the simulated chip (`tests/test_cs8900a_tx_bound.py`,
+`tests/test_cs8900a_tx_drain.py`, `tests/test_cs8900a_tx_skip_retry.py`,
+`tests/test_cs8900a_drain_status_guard.py`). All are reached through
+`_emit_tx_frame` in `bridge_ping.py`, the single TX sequence every builder
+emits (nine call sites).
 
 Result bytes the TX builders can now store:
 
@@ -1019,9 +959,7 @@ Result bytes the TX builders can now store:
   at 1 MHz; a whole `0x04` run measured about 1.02 s at 1 MHz and 0.15 s
   at 48 MHz before #487's skip phase, #303 below) and stores `0x04`. The
   orchestrators `run_ping_and_wait` / `run_icmp_responder` return it. The
-  cost is +20 bytes per single-transmit routine and +33 per two-transmit
-  routine (at #236: `build_tx_code` 79 → 99, then still at or under the
-  128-byte PUT threshold; #487 took it past it). X is now clobbered by every transmit.
+  poll counts in `X:Y`, so X is clobbered by every transmit.
 - **`0x01` is a completion flag, not a delivery flag**
   ([#235](https://github.com/JC-000/c64-test-harness/issues/235)).
   Nothing reads `TxEvent` or `TxBidErr` after the copy. Measured: a
@@ -1047,12 +985,12 @@ Result bytes the TX builders can now store:
   route for an odd frame is to pad it by one byte (the IP total-length
   field governs the datagram). Since #404 a frame above 256 bytes is copied in whole pages
   (`X` counts pages, `INC $FC` advances the pointer, as ip65's `send`
-  does) and then the even remainder; up to 256 the emitted bytes are
-  unchanged. `build_tx_code` was 99 bytes up to 256, 104 at a whole number
-  of pages and 120 otherwise; #487's skip phase adds 60 (159/164/180),
-  which takes it past the 128-byte PUT threshold — zero attachments still,
-  through `transport.write_memory` (#294), but not through a direct
-  `client.write_mem` (`drain_first=True`, #303, adds 40 more).
+  does) and then the even remainder; up to 256 the copy loop is the one
+  #238 measured. `build_tx_code` is 159 bytes up to 256, 164 at a whole
+  number of pages and 180 otherwise (`drain_first=True` adds 40) — past
+  the 128-byte PUT threshold, so zero `/Temp` attachments through
+  `transport.write_memory` (#294) but not through a direct
+  `client.write_mem`.
   **Measured on silicon** (U64E fw 3.15 `bce4535e`, external RR-Net,
   2026-09-15, at 1 MHz (Turbo Control Off); not tried at 48 MHz;
   ip65 `pingstatic` control passed first, `$630E` identity; conditions,
@@ -1131,9 +1069,7 @@ Result bytes the TX builders can now store:
   the no-reset control stayed `0x04` 10/10. A standalone SkipNow drain
   (`_emit_drain_rx`) freed the next transmit 4/4, with one failure on the
   transmit after that. `build_tx_code(..., drain_first=True)` packages
-  that drain before the bid (as on the ping builders since #222; 40 bytes
-  more, so past the 128-byte PUT threshold — still zero attachments
-  through `transport.write_memory`). On a chip confirmed starved (two
+  that drain before the bid (as on the ping builders since #222). On a chip confirmed starved (two
   plain transmits both `0x04`) it transmitted byte-exact to en4 6/6
   against 0/6 without it, paired and interleaved (1 MHz, 1514 B, head
   4f4781d, 2026-09-23, fw `bce4535e`;
@@ -1164,9 +1100,10 @@ Result bytes the TX builders can now store:
   pre-#487 code, interleaved over 2 sessions; the RxEvent gate made no
   difference at this n. Caveat: 5 of 27 trials self-cleared between the
   two confirming probes and were not counted, and one confirmed-starved
-  control still sent, so starvation held less reliably than in #303. `drain_status_addr` on any
-  builder is now refused when it lands on `result_addr`, a transmitted
-  frame or the routine's own bytes.
+  control still sent, so starvation held less reliably than in #303. `drain_status_addr` (on
+  the three builders that take `drain_first`) is refused with
+  `ValueError` when it lands on `result_addr`, a transmitted frame or the
+  routine's own bytes.
 - **ip65 does not actually wait for RESET to clear** (read from source).
   Its loop (`drivers/cs8900a.s:321-328`) is
   `jsr packetpp_a1 / ldy ppdata / and #$40 / bne`: it loads SelfCTL into
@@ -1181,7 +1118,7 @@ Result bytes the TX builders can now store:
 This caveat applies only to **ip65-driven** ethernet tests (DHCP, full
 TCP/IP).  ip65's DHCP state machine has been observed to misbehave in
 warp mode independently of the poll-budget issue described above.  The
-plain bridge ping tests in this directory work fine in warp mode --
+host-driven bridge ping orchestrators work fine in warp mode --
 the demo opts in via `--warp`.
 
 ### ip65's shipped config is not zero
@@ -1227,9 +1164,14 @@ test runs).  It is **VICE-only**: every orchestrator on it
 commands; `Ultimate64Transport` has no `jsr` (issue #209).  On the U64 use
 the `*_tod_code` builders below, started with `run_subroutine`.
 
-Relevant helpers: `build_tx_code`, `build_rx_echo_reply_code`,
-`build_ping_and_wait_code`, `build_icmp_responder_code` in
-`c64_test_harness.bridge_ping`.
+Relevant helpers: `run_ping_and_wait`, `run_icmp_responder` and the
+routines they assemble (`build_rx_peek_code`,
+`build_read_and_match_echo_reply_code`,
+`build_read_and_respond_echo_request_code`, `build_tx_code`) in
+`c64_test_harness.bridge_ping`. The single-JSR `build_ping_and_wait_code`
+/ `build_icmp_responder_code` / `build_rx_echo_reply_code` are also
+host-started but carry an in-6502 iteration-counter timeout, so they are
+normal-mode only (§ "Lower-level building blocks").
 
 **This path is not shippable.**  A real C64 networking application
 running on bare iron or a standalone Ultimate 64 Elite has no Python
@@ -1261,14 +1203,13 @@ exposes three code builders:
 * `build_tod_start_code(load_addr)` -- start CIA1 TOD at 00:00:00.0.
 * `build_tod_read_tenths_code(load_addr, result_addr)` -- read TOD
   and store elapsed tenths since start as an LE16 value.
-* `build_poll_with_tod_deadline_code(load_addr, peek_snippet,
-  result_addr, deadline_tenths)` -- generic poll loop that calls a
+* `build_poll_with_tod_deadline_code(load_addr, peek_check_snippet,
+  result_addr, deadline_tenths)` -- generic poll loop that inlines a
   user-supplied 6502 "ready?" snippet and bails out when the TOD
-  deadline elapses.  `peek_snippet` is raw 6502 bytes that must
+  deadline elapses.  `peek_check_snippet` is raw 6502 bytes that must
   leave `Z=0` when the device is ready -- for CS8900a RxEvent this
-  is `LDA $DE05 / AND #$0D` (`CS8900A_RXEVENT_MASK`), for a UCI response-ready bit it would
-  read the UCI status register, etc.  This is the generalization
-  boundary for eventual UCI support.
+  is `LDA $DE05 / AND #$0D` (`CS8900A_RXEVENT_MASK`); any other device's
+  status test fits the same slot.
 
 Zero-page footprint: `$F0`-`$F5`.  Deadline cap: **599 tenths
 (59.9 s)** -- for longer waits, loop in the caller.
@@ -1299,13 +1240,15 @@ TOD poll core for common ICMP scenarios:
   that polls RX with a TOD deadline and drains frames into a
   buffer until one matches the expected identifier/sequence.
 
-All three are drop-in counterparts of the host-driven
-`build_ping_and_wait_code` / `build_icmp_responder_code` /
-`build_rx_echo_reply_code` and take the same arguments plus
-`deadline_tenths` (1..599).  See `tests/test_bridge_ping_tod.py` for a
-full two-VICE bridge round trip using these variants on VICE normal
-mode, plus a live Ultimate 64 TOD primitive test at 1 / 8 / 24 / 48
-MHz turbo speeds (gated by `U64_HOST`).
+All three are counterparts of `build_ping_and_wait_code` /
+`build_icmp_responder_code` / `build_rx_echo_reply_code` and take the
+same arguments plus `deadline_tenths` (1..599, default 50), except that
+`build_rx_echo_reply_tod_code` names its match fields `expect_id` /
+`expect_seq` where `build_rx_echo_reply_code` has `identifier` /
+`sequence`.  See `tests/test_bridge_ping_tod.py` for a full two-VICE
+bridge round trip using these variants on VICE normal mode, plus a live
+Ultimate 64 TOD primitive test at 1 / 8 / 24 / 48 MHz turbo speeds
+(gated by `U64_HOST` and `U64_ALLOW_MUTATE`, since it changes CPU speed).
 
 ## See also
 
@@ -1322,17 +1265,20 @@ MHz turbo speeds (gated by `U64_HOST`).
 * `tests/test_bridge_ping_tod.py` -- live TOD-based bridge ping round
   trip on VICE normal mode (shippable-application path) plus live
   U64 TOD primitive test across turbo speeds
-* `scripts/setup-bridge-tap.sh` / `scripts/teardown-bridge-tap.sh` /
-  `scripts/cleanup-bridge-networking.sh` (Linux)
 * `scripts/setup-bridge-feth-macos.sh` /
   `scripts/teardown-bridge-feth-macos.sh` /
   `scripts/cleanup-bridge-feth-macos.sh` (macOS)
+* `scripts/setup-bridge-tap.sh` / `scripts/teardown-bridge-tap.sh` /
+  `scripts/cleanup-bridge-networking.sh` (Linux, last verified 2026-04-11)
 * `tests/bridge_platform.py` — cross-platform constants
-  (`ETHERNET_DRIVER`, `IFACE_A`, `IFACE_B`, `BRIDGE_NAME`, `SETUP_HINT`)
+  (`ETHERNET_DRIVER`, `IFACE_A`, `IFACE_B`, `BRIDGE_NAME`, `SETUP_HINT`,
+  `BRIDGE_HOST_IP`, `BRIDGE_IP_A`, `BRIDGE_IP_B`) and the macOS helpers
+  `probe_vice_pcap_ok()`, `bpf_attached_interfaces()`, `host_mac()`
 * `tests/test_bridge_ping.py::TestBridgeIcmpRoundTrip` -- full
   round-trip test where B's 6502 responder swaps IPs/MACs and TXes
   an ICMP echo reply in the same JSR that consumed the request
-* `scripts/bridge_ping_demo.py` -- visible two-VICE demo: launches
+* `scripts/bridge_ping_demo.py` (Linux only: it hardcodes `tap-c64-*` /
+  `tuntap`; last verified 2026-04-10) -- visible two-VICE demo: launches
   both instances side by side (not minimized) and runs the ICMP
   round-trip in a loop with live per-screen status (ping counter +
   latest result, green/red). Run with
