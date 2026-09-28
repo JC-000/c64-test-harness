@@ -1821,7 +1821,7 @@ class Ultimate64Client:
 
         What it does to the REU and the Command Interface slot, read from
         firmware source at tag ``1.1.0`` (the C64U; the same shape at
-        ``7f6fcb51``, the U64E's v3.15-85). The Command Interface half is
+        ``7f6fcb51``, the U64E's earlier fork build). The Command Interface half is
         measured on the U64E (bce4535e, Cartridge Preference Auto, #270);
         the REU half, the External and ``.crt`` cases and the C64U are
         **unmeasured**:

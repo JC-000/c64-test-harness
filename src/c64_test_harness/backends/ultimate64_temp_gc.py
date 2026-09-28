@@ -48,7 +48,7 @@ FTP against ``/Temp`` worked with the same defaults as the U64E.
 Upstream root cause and fix: GideonZ/1541ultimate#686 (auto-cleanup of
 managed ``/Temp`` files, oldest-first, keep youngest 10). The merge is an
 ancestor of the ``v3.15`` tag, so every Ultimate-line 3.15 build has it;
-on the bench U64E (v3.15-85) this module finds nothing to delete
+on the bench U64E (fork build 7f6fcb51) this module finds nothing to delete
 (measured 2026-09-02: 0 managed files before and after 15 ``run_prg``
 uploads with the GC off). It still matters on the C64 Ultimate, whose
 1.1.0 firmware predates the fix; ``u64_capabilities.writemem_post_safe``
@@ -404,8 +404,15 @@ class TempLedger:
     (``docs/device_locking.md``) and ``run_u64_parallel_locked.py``
     interleaves tests from several processes on one device, releasing
     between tests.  So the cross-process bound is the ``DeviceLock``
-    serialising uploads plus the lock-release sweep, and the residual is a
-    process that uploads without holding the lock.  Counting in the lockfile
+    serialising uploads plus the lock-release sweep, and while sweeps
+    succeed the residual is a process that uploads without holding the lock.
+    **That bound needs working sweeps.**  The refusal state (:attr:`blocked`)
+    also lives in this per-process ledger, so it does not outlive the
+    process: when the FTP GC keeps failing (as on a C64U with FTP File
+    Service off), every new process starts unblocked with a fresh budget,
+    spends up to ``budget`` attachments, and is only then blocked by its own
+    failed pass -- the device accumulates ``budget`` more per process, lock
+    held or not (source-read, not measured).  Counting in the lockfile
     or on the device was declined in the same decision.
     """
 

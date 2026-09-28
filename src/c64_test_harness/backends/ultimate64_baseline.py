@@ -269,8 +269,8 @@ BASELINE_NEVER_TOUCH: dict[str, str] = {
         "merged to test-merge 2026-08-27, now on GideonZ master and in the "
         "public v3.15/v3.15a release tags; every recorded U64E build "
         "carries it, 1.1.0 does not).  The U64E's recorded builds are fork "
-        "builds: v3.15-78 (71480a9d), v3.15-85 (7f6fcb51), v3.15-119 "
-        "(4011c97c) and bce4535e (v3.15-132, reported since 2026-09-15).  "
+        "builds: 71480a9d, 7f6fcb51, 4011c97c and bce4535e (reported since "
+        "2026-09-15).  "
         "Upstream (v3.14e checkout, network_interface.cc:406) and the "
         "C64U's 1.1.0 "
         "line call dhcp_stop() UNCONDITIONALLY on a link-up interface.  So "
@@ -333,7 +333,7 @@ BASELINE_NEVER_TOUCH: dict[str, str] = {
         "u64_config.cc:704/708)"
     ),
     "Clock Settings": (
-        "ULTIMATE LINE ONLY (read at 7f6fcb51 = v3.15-85, the U64E's flashed "
+        "ULTIMATE LINE ONLY (read at 7f6fcb51, the U64E's then flashed fork "
         "build: rtc_i2c.cc:79-80 registers the store, "
         "target/u64/nios2/ultimate/Makefile:67 builds it).  "
         "the RTC (Year..Seconds, defaults 2015-10-13 16:52:55, rtc.cc:26-34). "
@@ -449,7 +449,7 @@ BASELINE_RECORDED_CATEGORY_SETS: dict[str, RecordedCategorySet] = {
     "ultimate": RecordedCategorySet(
         generation="ultimate",
         device="U64E (Ultimate 64 Elite, 10.43.23.81)",
-        firmware="3.15 (v3.15-85, 7f6fcb51)",
+        firmware="3.15 (fork build 7f6fcb51)",
         date="2026-09-15",
         source=(
             "category names reconstructed from the 2026-09-12 read-only "
@@ -459,7 +459,7 @@ BASELINE_RECORDED_CATEGORY_SETS: dict[str, RecordedCategorySet] = {
             "Configuration + Data Streams; no saved listing of the names.  "
             "Cross-checked against scripts/U64_DEVICE_PROBE.md section 5 "
             "(fw 3.14, 2026-04-05, 'all 19') and against firmware source at "
-            "7f6fcb51 (v3.15-85): target/u64/nios2/ultimate/Makefile builds "
+            "7f6fcb51: target/u64/nios2/ultimate/Makefile builds "
             "rtc_i2c.cc (:67, Clock Settings), network_esp32.cc (:143, WiFi "
             "settings) and data_streamer.cc (:170, Data Streams) and not "
             "bling_board.cc; Speaker Mixer is #if U64 == 2 only.  "
@@ -467,9 +467,9 @@ BASELINE_RECORDED_CATEGORY_SETS: dict[str, RecordedCategorySet] = {
             "(U64E fw 3.15, one bodyless GET /v1/configs, DeviceLock held; "
             "#287): 19 categories, identical to this record (#316); the "
             "record's date is that read's, and it reported only firmware 3.15, "
-            "fpga 125, core 1.4F.  The flash record gave v3.15-85 (7f6fcb51).  "
+            "fpga 125, core 1.4F.  The flash record gave 7f6fcb51.  "
             "After the owner's power-cycle, GET /v1/info reported "
-            "bce4535e (v3.15-132) on 2026-09-15 (#292).  The counts were "
+            "bce4535e on 2026-09-15 (#292).  The counts were "
             "derived at 7f6fcb51 and carry to bce4535e by the tree diff and "
             "the device read recorded in residuals"
         ),
@@ -495,7 +495,7 @@ BASELINE_RECORDED_CATEGORY_SETS: dict[str, RecordedCategorySet] = {
                 "User Interface Settings": 10,
             },
             basis=("device-read", "source-derived"),
-            firmware="3.15 (v3.15-85, 7f6fcb51)",
+            firmware="3.15 (fork build 7f6fcb51)",
             date="2026-09-15",
         ),
         totals={"covered": 151, "never_touch": 40, "neither": 12, "all": 203},
@@ -503,7 +503,7 @@ BASELINE_RECORDED_CATEGORY_SETS: dict[str, RecordedCategorySet] = {
             "device-read 2026-09-15: one bodyless per-category GET on the U64E "
             "(fw 3.15, fpga 125, core 1.4F; DeviceLock held; #342).  "
             "The same per-category counts were reproduced from firmware source "
-            "at 7f6fcb51 (v3.15-85) -- first in #288's adversarial review, "
+            "at 7f6fcb51 -- first in #288's adversarial review, "
             "against the 2026-09-12 read-only count, and again for #342: each "
             "store's t_cfg_definition[] run through cc -E -P with the U64E "
             "build flags (-DU64=1 -DDEVELOPER=0 -DCLOCK_FREQ=66666667, "
@@ -529,8 +529,8 @@ BASELINE_RECORDED_CATEGORY_SETS: dict[str, RecordedCategorySet] = {
             "every category, and a per-item GET showed that every one of the "
             "203 items carries both current and default, so an item-level "
             "'no default key' basis cannot produce #276's figure.  GET /v1/info "
-            "reported git_commit_hash bce4535e (v3.15-132-gbce4535e in "
-            "~/Documents/1541ultimate), not this record's 7f6fcb51, which is "
+            "reported git_commit_hash bce4535e, "
+            "not this record's 7f6fcb51, which is "
             "not its ancestor.  In the tree diff 7f6fcb51 -> bce4535e (not a "
             "linear range) no added or removed line under software/ or "
             "target/ carries CFG_TYPE_, t_cfg_definition or register_store, "
