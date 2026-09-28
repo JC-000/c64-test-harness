@@ -365,13 +365,13 @@ per refused store:
   calls `dhcp_stop()` → `dhcp_release_and_stop`
   (`lwip/src/core/ipv4/dhcp.c:1325-1390`): DHCP_RELEASE goes out and
   `netif_set_addr(netif, IP4_ADDR_ANY4, ...)` zeroes the address the REST
-  request arrived on. The guard that makes this a live no-op is `6b5ffc21`
-  (upstream #805). It was merged post-tag to the test-merge line and is in no
-  release. Both U64E builds this bench has run carry it: it is an ancestor of
-  `7f6fcb51` (v3.15-85) and of `bce4535e` (v3.15-132, reported since 2026-09-15).
-  The C64U's 1.1.0 is not a descendant, and there `dhcp_stop()` runs
-  unconditionally. So the no-op holds for the U64E only, and it must never be
-  generalised to a firmware line. On a statically addressed device the same path takes the
+  request arrived on. The guard that makes this a live no-op is
+  6b5ffc21 (upstream #805, merged to test-merge 2026-08-27, now on GideonZ
+  master and in the public v3.15 and v3.15a release tags). Every recorded U64E
+  build carries it; the C64U's 1.1.0 does not. The two U64E builds are
+  `7f6fcb51` (v3.15-85) and `bce4535e` (v3.15-132, reported since 2026-09-15).
+  On 1.1.0, `dhcp_stop()` runs unconditionally. So the no-op holds for the U64E
+  only, and it must never be generalised to the C64U / 1.x line. On a statically addressed device the same path takes the
   `else` branch, which is why **tests must never configure a static address**.
 - **`Network Settings`** — the reset blanks the Network Password and the syslog
   server, restores the hostname to the product default, and **re-enables** every
