@@ -118,7 +118,7 @@ OPTIONS:
   --force               Skip the Ubuntu 25 version check (ignored on macOS)
   --no-system-packages  Skip the apt-get / brew install step
   --no-vice             Skip VICE source build (no-op on macOS: brew-installed)
-  --no-harness          Skip pip install -e .
+  --no-harness          Skip pip install -e '.[dev]'
   --no-bridge           Skip bridge network setup
   --no-u64              Skip U64 probe even if U64_HOST is set
   --u64-host HOST       Probe this U64 host (overrides $U64_HOST)
@@ -176,6 +176,20 @@ parse_args() {
 
 # ---------- environment checks --------------------------------------------
 
+# Package manager of this Linux distro, from ID / ID_LIKE in os-release:
+# apt-get, dnf, pacman, or empty when not recognised.  Mirrors
+# detect_pkg_manager in verify-dev-env.sh (#500).
+DISTRO_PKG_MGR=""
+detect_linux_pkg_manager() {
+    local ids
+    ids="$(. "$1" 2>/dev/null; printf '%s %s' "${ID:-}" "${ID_LIKE:-}")"
+    case " $ids " in
+        *" debian "*|*" ubuntu "*) printf 'apt-get' ;;
+        *" fedora "*|*" rhel "*|*" centos "*) printf 'dnf' ;;
+        *" arch "*) printf 'pacman' ;;
+    esac
+}
+
 check_os() {
     banner "Preflight -- OS detection"
     if [ "$OS" = "Darwin" ]; then
@@ -189,21 +203,26 @@ check_os() {
         log_ok "detected: macOS $mac_ver (build $mac_build)"
         return
     fi
-    if [ ! -r /etc/os-release ]; then
-        log_warn "/etc/os-release missing; cannot detect distro"
+    # C64H_OS_RELEASE overrides the path for tests/test_verify_dev_env_checks.py.
+    local os_release="${C64H_OS_RELEASE:-/etc/os-release}"
+    if [ ! -r "$os_release" ]; then
+        log_warn "$os_release missing; cannot detect distro"
         if [ "$FORCE" = "0" ]; then
             log_fail "refusing to run on unknown OS; pass --force to override"
             exit 2
         fi
         return
     fi
-    # shellcheck disable=SC1091
-    . /etc/os-release
-    local id="${ID:-unknown}"
-    local ver="${VERSION_ID:-unknown}"
-    log_ok "detected: ID=$id VERSION_ID=$ver"
+    local id ver
+    id="$(. "$os_release" 2>/dev/null; printf '%s' "${ID:-unknown}")"
+    ver="$(. "$os_release" 2>/dev/null; printf '%s' "${VERSION_ID:-unknown}")"
+    DISTRO_PKG_MGR="$(detect_linux_pkg_manager "$os_release")"
+    log_ok "detected: ID=$id VERSION_ID=$ver package manager=${DISTRO_PKG_MGR:-unknown}"
     if [ "$id" != "ubuntu" ]; then
         log_warn "target is Ubuntu Desktop 25; found $id $ver"
+        if [ "$DISTRO_PKG_MGR" != "apt-get" ]; then
+            log_warn "stage 1 installs Ubuntu package names with apt-get; with --force it is skipped here -- install the equivalents with ${DISTRO_PKG_MGR:-your package manager} (docs/development.md, Other distros)"
+        fi
         if [ "$FORCE" = "0" ]; then
             log_fail "non-Ubuntu system; pass --force to override"
             exit 2
@@ -313,9 +332,13 @@ stage_system_packages() {
     fi
 
     # -------- Linux (Ubuntu) path --------
+    if [ "$DISTRO_PKG_MGR" != "apt-get" ]; then
+        log_skip "stage 1 uses apt-get and Ubuntu package names; detected ${DISTRO_PKG_MGR:-an unrecognised package manager} -- install the equivalents by hand"
+        return
+    fi
     # Package list derived from:
     #   - VICE 3.10 configure.ac requirements for --enable-ethernet +
-    #     --enable-native-gtk3ui + audio codecs
+    #     --enable-gtk3ui + audio codecs
     #   - Ubuntu 25 package names (best-effort mapping -- some names may have
     #     drifted from earlier Ubuntu releases). If apt-get install fails on a
     #     specific package, grep for its base name with `apt-cache search` and
@@ -332,11 +355,15 @@ stage_system_packages() {
         automake              # VICE Makefile.am handling
         libtool               # VICE libltdl
         pkg-config            # pkg-config / .pc lookups during configure
+        flex                  # VICE configure: "Could not find either flex or lex"
+        bison                 # VICE configure: needs byacc, yacc or bison
+        dos2unix              # VICE configure: "dos2unix tool is missing"
+        xa65                  # VICE configure: "xa assembler is missing"
 
         # -- VICE GTK3 UI deps --
         libsdl2-dev           # SDL2 headers for audio/video
         libsdl2-image-dev     # SDL2_image headers
-        libgtk-3-dev          # GTK3 headers (native-gtk3ui)
+        libgtk-3-dev          # GTK3 headers (--enable-gtk3ui)
         libglew-dev           # GLEW for VICE GL backend
         # NOTE: libgtkglext1-dev was in the original list as conservative
         # coverage for legacy GtkGLExt GL bindings. It was deprecated on
@@ -356,6 +383,8 @@ stage_system_packages() {
         libvorbis-dev         # Ogg Vorbis support
         libmpg123-dev         # mp3 decoding
         libmp3lame-dev        # mp3 encoding
+        libevdev-dev          # VICE configure: "Please install libevdev headers"
+        libcurl4-openssl-dev  # VICE configure: "libcurl ... was not found"
 
         # -- harness + bridge tooling --
         git                   # clone + version info
@@ -408,9 +437,20 @@ stage_system_packages() {
 
 vice_already_installed() {
     # Returns 0 if a working VICE 3.10 with ethernet is already on PATH.
+    # Output is captured and grepped from a here-string: under
+    # `set -o pipefail` a `x64sc ... | grep -q` pipeline fails with SIGPIPE
+    # whenever grep exits before the writer has finished the ~1900-line help
+    # (exit 141, 3/3 in the Ubuntu 25.10 VM run, 2026-09-28, #500).
     command -v x64sc >/dev/null 2>&1 || return 1
-    x64sc --version 2>&1 | grep -q "VICE 3.10" || return 1
-    x64sc --help 2>&1 | grep -qiE -- '-ethernetcart' || return 1
+    local out
+    out="$(x64sc --version 2>&1)"
+    grep -q "VICE 3.10" <<< "$out" || return 1
+    # Headless GTK3 builds print no options for a plain --help (no
+    # display); -console prints them.  Same fallback as verify-dev-env.sh.
+    out="$(x64sc --help 2>&1)"
+    grep -qiE -- '-ethernetcart' <<< "$out" && return 0
+    out="$(x64sc -console --help 2>&1)"
+    grep -qiE -- '-ethernetcart' <<< "$out" || return 1
     return 0
 }
 
@@ -475,24 +515,26 @@ stage_vice_build() {
 
     # Configure + build + install. Flags rationale:
     #   --enable-ethernet       load-bearing: CS8900a / TFE / RR-Net support
-    #   --enable-shared         shared libs (default, kept explicit)
     #   --disable-html-docs     skip doc generation; shaves minutes off build
-    #   --enable-native-gtk3ui  native GTK3 UI
+    #   --enable-gtk3ui         GTK3 UI (VICE 3.10's configure name; the older
+    #                           --enable-native-gtk3ui and --enable-shared are
+    #                           not 3.10 options -- configure only warns
+    #                           "invalid option" about them, measured in the
+    #                           2026-09-28 Ubuntu 25.10 VM run, #500)
     #
     # UI choice: GTK3 was picked to match the binary on the current dev
     # machine (inferred from the installed `x64sc`; the actual build log
     # is not on disk). SDL2 is a reasonable alternative with fewer deps --
-    # to switch, replace `--enable-native-gtk3ui` below with
-    # `--enable-sdlui2` (and you can drop libgtk-3-dev / libglew-dev /
-    # libxaw7-dev from the stage 1 package list). Both UIs work with this
-    # test harness, which only talks to VICE via the binary monitor and
-    # doesn't care about the UI toolkit.
+    # to switch, replace `--enable-gtk3ui` below with `--enable-sdl2ui`
+    # (and you can drop libgtk-3-dev / libglew-dev / libxaw7-dev from the
+    # stage 1 package list). Both UIs work with this test harness, which
+    # only talks to VICE via the binary monitor and doesn't care about the
+    # UI toolkit.
     local configure_cmd=(
         ./configure
         --enable-ethernet
-        --enable-shared
         --disable-html-docs
-        --enable-native-gtk3ui
+        --enable-gtk3ui
     )
     if [ "$DRY_RUN" = "1" ]; then
         log_dry "cd $srcdir && ${configure_cmd[*]}"
@@ -558,8 +600,9 @@ stage_harness_install() {
     if [ "$DRY_RUN" != "1" ] && [ -x "$VENV_DIR/bin/python" ]; then
         local installed_path=""
         installed_path="$("$VENV_DIR/bin/python" -c 'import c64_test_harness, os; print(os.path.dirname(c64_test_harness.__file__))' 2>/dev/null || true)"
-        if [ -n "$installed_path" ] && [ "$installed_path" = "$expected_pkg" ]; then
-            log_skip "c64_test_harness already installed editable in $VENV_DIR (resolves to $installed_path)"
+        if [ -n "$installed_path" ] && [ "$installed_path" = "$expected_pkg" ] \
+           && "$VENV_DIR/bin/python" -c 'import pytest' >/dev/null 2>&1; then
+            log_skip "c64_test_harness[dev] already installed editable in $VENV_DIR (resolves to $installed_path)"
             return
         fi
         if [ -n "$installed_path" ]; then
@@ -571,7 +614,7 @@ stage_harness_install() {
         log_dry "mkdir -p $(dirname "$VENV_DIR")"
         log_dry "python3 -m venv --system-site-packages $VENV_DIR"
         log_dry "$VENV_DIR/bin/pip install --upgrade pip"
-        log_dry "$VENV_DIR/bin/pip install -e $REPO_ROOT"
+        log_dry "$VENV_DIR/bin/pip install -e $REPO_ROOT[dev]"
         log_dry "$VENV_DIR/bin/python -c 'import c64_test_harness; print(c64_test_harness.__version__)'"
         log_ok "stage 3 (dry-run): would create venv at $VENV_DIR and install harness editable"
         log_ok "stage 3 (dry-run): activate with: source $VENV_DIR/bin/activate"
@@ -594,8 +637,11 @@ stage_harness_install() {
         log_warn "pip upgrade failed; continuing with bundled pip"
     fi
 
-    log_install "pip install -e $REPO_ROOT (inside venv)"
-    if ! "$VENV_DIR/bin/pip" install -e "$REPO_ROOT"; then
+    # [dev] brings pytest: the venv is where the suite runs, and without it
+    # verify-dev-env.sh ended the 2026-09-28 VM run with "pytest not
+    # installed" (#500).
+    log_install "pip install -e $REPO_ROOT[dev] (inside venv)"
+    if ! "$VENV_DIR/bin/pip" install -e "$REPO_ROOT[dev]"; then
         log_fail "editable install failed"
         return
     fi
