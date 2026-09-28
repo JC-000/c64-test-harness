@@ -1,156 +1,60 @@
 # Development environment
 
-This page describes the dev-environment expectations for `c64-test-harness`. Two platforms are supported: **Ubuntu Desktop 25** (primary target; one-shot `scripts/setup-dev-env.sh` installer) and **macOS** (Apple Silicon, Tahoe 26.x verified; Homebrew-based manual setup described below). The companion `scripts/verify-dev-env.sh` is the non-destructive diagnostic that works on both platforms and is called at the end of the Ubuntu installer.
+This page is the detailed source of truth for setting up a `c64-test-harness` dev environment. The README's "Getting started" summarises it.
 
-## Fresh-machine install: `scripts/setup-dev-env.sh`
+Two platforms are covered:
 
-On a clean Ubuntu Desktop 25 machine, one command gets you from zero to "verify-dev-env.sh says READY":
+- **macOS (Homebrew)** is the primary, current path: the project's dev machine runs it.
+- **Ubuntu Desktop 25** is secondary. Its one-shot `scripts/setup-dev-env.sh` installer was **last run in April 2026, and that run failed; the fixes have not been run since**.
 
-```bash
-./scripts/setup-dev-env.sh
-```
+`scripts/verify-dev-env.sh` is the read-only diagnostic for both.
 
-Always preview first with `--dry-run` — it prints every action it would take without touching the system, then runs `verify-dev-env.sh` so you can see the current state:
+Both platforms use the same canonical venv, **outside the repo**, at `~/.local/share/c64-test-harness/venv`. Do not create a venv inside the repo or a worktree.
 
-```bash
-./scripts/setup-dev-env.sh --dry-run
-```
-
-After a successful run, the harness lives in a dedicated venv at `~/.local/share/c64-test-harness/venv` (this avoids the PEP 668 `externally-managed-environment` error that Ubuntu 23+ raises against system Python). Activate it with:
-
-```bash
-source ~/.local/share/c64-test-harness/venv/bin/activate
-```
-
-or invoke the venv python directly:
-
-```bash
-~/.local/share/c64-test-harness/venv/bin/python -m pytest tests/
-```
-
-### Stages
-
-The installer runs six stages. Every stage is **idempotent** (safe to re-run) and **opt-out** via `--no-*` flags.
-
-| # | Stage | What it does | Opt-out flag |
-|---|-------|--------------|--------------|
-| 1 | `system packages` | `sudo apt-get install` build toolchain, VICE build deps (SDL2, GTK3, libpcap, pulse/alsa, flac/vorbis/mpg123/lame), harness tooling (python3, pip, iproute2, iptables). If a bulk install fails, retries per-package to report which names drifted. | `--no-system-packages` |
-| 2 | `VICE 3.10 build` | Downloads the VICE 3.10 tarball from SourceForge into `~/.cache/c64-test-harness/build/`, extracts, `./configure --enable-ethernet --disable-html-docs --enable-native-gtk3ui`, `make -j$(nproc)`, `sudo make install`. Skips entirely if `x64sc --version` already reports VICE 3.10 with ethernet support. Optional `--sha256 HEX` pin. | `--no-vice` |
-| 3 | `Python harness` | Creates a dedicated venv at `~/.local/share/c64-test-harness/venv` (with `--system-site-packages`) and runs `pip install -e .` into it. This avoids the PEP 668 / externally-managed-environment error that Ubuntu 23+ raises for `pip install --user` against system Python. Skipped if the venv already exists and its `c64_test_harness` import resolves to this checkout. After success, prints the `source .../activate` command to run. | `--no-harness` |
-| 4 | `bridge networking` | Runs `sudo ./scripts/setup-bridge-tap.sh` to create `br-c64` + `tap-c64-0` + `tap-c64-1`. Skipped if all three interfaces already exist. | `--no-bridge` |
-| 5 | `Ultimate 64 probe` | Only runs if `U64_HOST` is set in env or `--u64-host HOST` is passed. `curl`s `/v1/version` and reports reachability; never a failure. | `--no-u64` |
-| 6 | `verify-dev-env.sh` | Final sanity check. The installer's exit code mirrors this: `0` READY, `1` NOT READY, `3` verify-script broken. | (always runs) |
-
-### CLI
-
-```
-setup-dev-env.sh [OPTIONS]
-
-  --dry-run             Print actions without executing; still runs verify
-  --force               Skip the Ubuntu 25 version check
-  --no-system-packages  Skip stage 1
-  --no-vice             Skip stage 2
-  --no-harness          Skip stage 3
-  --no-bridge           Skip stage 4
-  --no-u64              Skip stage 5
-  --u64-host HOST       Probe this U64 host (overrides $U64_HOST)
-  --build-dir DIR       VICE source cache dir (default ~/.cache/c64-test-harness/build)
-  --sha256 HEX          Pin the VICE tarball checksum
-  -h, --help            Print usage
-```
-
-### Recovery
-
-If a stage fails, re-run the installer — each stage is idempotent, so it will skip anything that's already done and pick up where it left off. If a specific stage is blocking progress on an unrelated concern (e.g. the VICE build is slow and you want to iterate on the harness), skip it with the matching `--no-*` flag.
-
-If `verify-dev-env.sh` reports NOT READY at the end, its own output lists exactly which checks failed plus fix hints.
-
-## Quick check: `scripts/verify-dev-env.sh`
-
-```bash
-./scripts/verify-dev-env.sh
-```
-
-This is a **pure read-only diagnostic**. It never launches VICE (beyond `--version` / `--help`, which exit immediately), never runs pytest, never mutates network state, and never writes outside the repo. It is safe to run while other test agents hold VICE instances open.
-
-### What it checks
-
-| Section | Checks |
-|---------|--------|
-| VICE | `x64sc` / `c1541` on `PATH`, VICE 3.10 version, `-ethernetcart` / `-ethernetioif` / `-ethernetiodriver` advertised in `--help` (this is the key deployability gate — distro-packaged VICE usually lacks `--enable-ethernet`), `-binarymonitor` and `-remotemonitor` advertised |
-| Python | `python3` >= 3.10, `c64_test_harness` importable, `pytest` available |
-| System tools | `ip`, `iptables`, `/dev/net/tun`, passwordless sudo (informational) |
-| Bridge networking | `br-c64`, `tap-c64-0`, `tap-c64-1` interfaces present |
-| Ultimate 64 (optional) | HTTP GET `/v1/version` if `U64_HOST` is set (or `--u64-host HOST` passed) and `--no-u64` is not |
-| Repo | Running inside a `c64-test-harness` checkout; current git branch + short SHA |
-
-### CLI
-
-```
-verify-dev-env.sh [--quiet] [--json] [--no-u64] [--u64-host HOST]
-```
-
-- `--quiet` — suppress section headers; print only failures plus the final summary
-- `--json` — emit a single JSON object (uses `python3` for clean serialization)
-- `--no-u64` — skip the Ultimate 64 probe even if `U64_HOST` is set
-- `--u64-host HOST` — override `$U64_HOST`
-
-### Exit codes
-
-| Code | Meaning |
-|------|---------|
-| `0` | READY — all critical checks passed (optional gaps like missing bridge or U64 are allowed) |
-| `1` | NOT READY — at least one critical check failed (missing/wrong VICE build, Python harness broken, etc.) |
-| `2` | Script error — bad argument, running outside a repo |
-
-Critical checks are: VICE presence/version/ethernet/binary-monitor, `c1541`, Python >= 3.10, `c64_test_harness` import. Everything else (bridge, U64, bridge tools, text monitor) is reported but does not fail the overall check.
-
-## Manual setup (if you're not on Ubuntu 25)
-
-`scripts/setup-dev-env.sh` targets Ubuntu Desktop 25 specifically. On other distros, pass `--force` to bypass the OS check (system-package names may drift), or do it by hand:
-
-1. **Build VICE 3.10 from source with `--enable-ethernet`** — distro packages generally omit the flag, so `verify-dev-env.sh` will flag this as a critical failure if you install from `apt`. Install to `/usr/local/bin`.
-2. **Install the Python harness in editable mode into a venv**: `python3 -m venv --system-site-packages ~/.local/share/c64-test-harness/venv && ~/.local/share/c64-test-harness/venv/bin/pip install -e .` from the repo root. On Ubuntu 23+ / PEP-668 distros this is mandatory — `pip install --user` against system Python is blocked. Activate with `source ~/.local/share/c64-test-harness/venv/bin/activate` before running tests, or invoke `~/.local/share/c64-test-harness/venv/bin/python -m pytest tests/` directly.
-3. **Set up bridge networking** (only required for multi-VICE ethernet tests): `sudo ./scripts/setup-bridge-tap.sh`. Teardown: `sudo ./scripts/teardown-bridge-tap.sh`. Emergency cleanup: `sudo ./scripts/cleanup-bridge-networking.sh`.
-4. **Optional Ultimate 64**: set `U64_HOST=<ip>` in the environment to enable hardware-backed live tests. Suites that change device config additionally require `U64_ALLOW_MUTATE=1`, which covers device config changes only — resets, RAM writes and stream start/stop run on `U64_HOST` alone (#333); with either variable unset a config-writing suite skips cleanly.
-
-Re-run `./scripts/verify-dev-env.sh` after each step to confirm progress.
+The package has no runtime dependencies. The extras are `dev` (`pytest`) and `notify` (`watchdog`, for filesystem-event wakeups in `DeviceLock`). VICE 3.10 is needed only for the emulator backend. The package imports and drives Ultimate hardware without `x64sc`/`c1541` installed. `verify-dev-env.sh` still treats VICE as critical, so a hardware-only machine reports NOT READY.
 
 ## macOS (Homebrew)
 
-The harness runs natively on macOS (Apple Silicon, Tahoe 26.x verified). Bridge networking is supported via the BSD bridge driver plus `feth` peer interfaces (see `docs/bridge_networking.md` and `tests/bridge_platform.py` for the cross-platform dispatch module). VICE attaches to `feth` via its `pcap` driver rather than `tuntap` because macOS has no `/dev/net/tun`.
+The dev machine is Apple Silicon (arm64) on macOS 27.0 (build 26A428). Checked on 2026-09-28:
 
-Unlike the Ubuntu flow there is no one-shot installer — `scripts/setup-dev-env.sh` targets Ubuntu 25 specifically. The macOS flow is manual but short:
+- Homebrew `vice` 3.10 at `/opt/homebrew/bin/x64sc` and `/opt/homebrew/bin/c1541`, where `x64sc -features` reports `HAVE_RAWNET yes` / `HAVE_PCAP yes`;
+- the venv built on Homebrew `python@3.13` (3.13.13).
 
-1. **Install Homebrew** if you don't have it yet: <https://brew.sh>.
+Bridge networking uses the BSD bridge driver plus `feth` peer interfaces; see `docs/bridge_networking.md` and `tests/bridge_platform.py` for the cross-platform dispatch module. VICE attaches to `feth` through its `pcap` driver rather than `tuntap`, because macOS has no `/dev/net/tun`.
 
-2. **Install VICE 3.10** (ships `x64sc` and `c1541`, pre-built with `--enable-ethernet`):
+The setup is manual and short:
+
+1. **Install Homebrew** if you don't have it yet: <https://brew.sh>. Never run `brew` as root.
+
+2. **Install VICE 3.10 and a Python ≥ 3.10.** The `vice` bottle ships `x64sc` and `c1541` with ethernet support already compiled in, so no source build is needed:
 
    ```bash
-   brew install vice
+   brew install vice python@3.13
    ```
 
-3. **Create the harness venv** at the same path Linux uses so scripts and docs stay uniform, and `pip install -e .` into it:
+3. **Create the harness venv** at the canonical path, and install the package editable with the `dev` extra. Name the interpreter explicitly: `/usr/bin/python3` from the Xcode command-line tools is 3.9, below the package's `requires-python >= 3.10`.
 
    ```bash
-   python3 -m venv --system-site-packages ~/.local/share/c64-test-harness/venv
+   /opt/homebrew/opt/python@3.13/bin/python3.13 -m venv --system-site-packages \
+       ~/.local/share/c64-test-harness/venv
    ~/.local/share/c64-test-harness/venv/bin/pip install -e '.[dev]'
-   source ~/.local/share/c64-test-harness/venv/bin/activate
    ```
 
-4. **Verify** with the cross-platform checker:
+   Run tests with `~/.local/share/c64-test-harness/venv/bin/pytest`, or `source` the venv's `bin/activate` first. The editable install points at the checkout it was made from. A worktree needs `PYTHONPATH=<worktree>/src` to test its own code. The version `c64_test_harness.__version__` reports comes from the installed metadata, and is refreshed only by re-running `pip install -e .`.
+
+4. **Verify** with the read-only checker ([below](#quick-check-scriptsverify-dev-envsh)):
 
    ```bash
-   ./scripts/verify-dev-env.sh
+   ./scripts/verify-dev-env.sh --no-u64
    ```
 
-   Bridge checks report as optional gaps until step 5 runs. Non-bridge tests should pass:
+   The bridge rows report as optional gaps until step 5 runs.
 
-   ```bash
-   ~/.local/share/c64-test-harness/venv/bin/python -m pytest tests/test_vice_core.py tests/test_vice_binary.py
-   ```
+5. **Optional: the `c64-test` Claude Code skill** in every project. Run `./scripts/install-skill.sh` (see [below](#making-the-c64-test-claude-code-skill-available-globally)).
 
-5. **Bridge networking for ethernet tests** — creates `bridge10` + `feth0`/`feth1`, the macOS-native counterpart to `br-c64` + `tap-c64-{0,1}`:
+Steps 6-8 are needed only for the ethernet/bridge tests.
+
+6. **Bridge networking.** `setup-bridge-feth-macos.sh` creates `bridge10` + `feth0`/`feth1`, the macOS-native counterpart to `br-c64` + `tap-c64-{0,1}`:
 
    ```bash
    sudo ./scripts/setup-bridge-feth-macos.sh
@@ -168,19 +72,19 @@ Unlike the Ubuntu flow there is no one-shot installer — `scripts/setup-dev-env
    sudo ./scripts/cleanup-bridge-feth-macos.sh
    ```
 
-   See [docs/bridge_networking.md](bridge_networking.md) for the full lifecycle.
+   On a machine shared with other networking rigs, the `feth` pair and the `10.0.65.0/24` host address can collide with theirs. See [docs/bridge_networking.md](bridge_networking.md) for the full lifecycle.
 
-6. **BPF permission for the VICE pcap driver.** VICE's `pcap` ethernet driver opens `/dev/bpf*`, which is root-only on a fresh macOS install. Grant user access via one of:
+7. **BPF node permissions, for host-side packet capture.** The harness's own capture (`c64_test_harness.capture`, and the tests marked `elevation("bpf_nodes")`) opens `/dev/bpf*` directly. It needs no sudo, but only while the nodes are world-rw. **VICE is not affected by these permissions**: it runs as root (step 8), and its pcap gate is `geteuid()`, not the node mode (see Caveats). Grant access with one of:
 
-   - **On this bench, use the `chmod` below** — there is no ChmodBPF daemon installed here. On a fresh machine, installing Wireshark and running its **ChmodBPF** helper is the better answer: it persists across reboots and is the standard Wireshark path.
-   - One-shot `sudo chmod o+rw /dev/bpf*` (resets on the next boot). Cover more than `bpf0-3`: a root VICE takes the two lowest free nodes and each dnsmasq DHCP rig on the bench holds one node permanently, so the low four alone cannot serve a root VICE plus the harness capture. Nodes above `bpf3` exist only once some root process has opened them, so re-run the `chmod` after that.
+   - **One-shot:** `sudo chmod o+rw /dev/bpf*`. This resets on the next boot. It must cover more than `bpf0-3`: a root VICE takes the two lowest free nodes, and each dnsmasq DHCP rig on a shared bench holds one node permanently. Nodes above `bpf3` exist only once some root process has opened them, so re-run the `chmod` after that.
+   - **Persistent:** on a fresh machine, install Wireshark and run its **ChmodBPF** helper. The project's dev machine has no ChmodBPF daemon and uses the `chmod`.
 
-   Without this, VICE errors out with a `pcap_open_live` / BPF permission message when you try to attach `feth0`/`feth1`.
+   `verify-dev-env.sh` checks only that `/dev/bpf0` is readable, so a green row there does not prove the higher nodes are usable.
 
-7. **Passwordless sudo for bridge lifecycle AND the VICE ethernet tests.** Two things on macOS need root and are driven non-interactively by the harness, so both need NOPASSWD sudoers entries:
+8. **Passwordless sudo for bridge lifecycle AND the VICE ethernet tests.** Two things on macOS need root and are driven non-interactively by the harness, so both need NOPASSWD sudoers entries:
 
-   - **Bridge lifecycle** — setup, teardown, and cleanup of `bridge10` + `feth0`/`feth1` all require root (`ifconfig create`, `addm`, `up`, `inet` assignment). The harness invokes these three scripts from tests and CI.
-   - **`x64sc` itself** — on macOS 26, VICE's `pcap` driver cannot attach to a `feth` interface without root (see the "Caveats" section below for why `chmod 666 /dev/bpf*` is not sufficient on macOS 26). `ViceProcess.start()` wraps its argv with `sudo -n` when ethernet is enabled, so any ethernet test needs `/opt/homebrew/bin/x64sc` to be runnable without a password prompt. **This is required for the ethernet suite to pass on macOS 26**; the three bridge scripts alone are not enough.
+   - **Bridge lifecycle.** Setup, teardown, and cleanup of `bridge10` + `feth0`/`feth1` all require root (`ifconfig create`, `addm`, `up`, `inet` assignment). The harness invokes these three scripts from tests.
+   - **`x64sc` itself.** On macOS, VICE's `pcap` driver works only as root (see "Caveats" below for why `/dev/bpf*` permissions do not help). `ViceProcess.start()` wraps its argv with `sudo -n` when ethernet is enabled, so any ethernet test needs `/opt/homebrew/bin/x64sc` to run without a password prompt. **The ethernet suite requires this on macOS; the three bridge scripts alone are not enough.** Without it, the launch is refused up front with `ViceElevationRequiredError`, and its message carries the exact sudoers line to add.
 
    Install a sudoers drop-in so it doesn't conflict with the main `/etc/sudoers`:
 
@@ -188,11 +92,11 @@ Unlike the Ubuntu flow there is no one-shot installer — `scripts/setup-dev-env
    sudo visudo -f /etc/sudoers.d/c64-test-harness
    ```
 
-   Paste (substituting your username for `YOURUSER` and the repo path for `/path/to/c64-test-harness` if it lives elsewhere):
+   Paste the following, substituting your username for `YOURUSER` and your repo path for `/path/to/c64-test-harness`. The scripts must be named at the canonical checkout's path, because sudoers matches the literal path, so a worktree's copy is not covered.
 
    ```
    # c64-test-harness -- passwordless sudo for bridge networking lifecycle
-   # and for the VICE ethernet tests (macOS 26 requires root for pcap on feth).
+   # and for the VICE ethernet tests (VICE's pcap driver needs root on macOS).
    # Scoped to four binaries by absolute path; does NOT grant general sudo.
    #
    # SECURITY NOTE: the three bridge scripts live under a user-writable repo
@@ -209,19 +113,22 @@ Unlike the Ubuntu flow there is no one-shot installer — `scripts/setup-dev-env
                                  /opt/homebrew/bin/x64sc
    ```
 
-   `visudo -f` syntax-checks the file before writing — a typo won't lock you out. Verify with:
+   `visudo -f` syntax-checks the file before writing, so a typo won't lock you out. Invoke the scripts directly (`sudo -n ./scripts/…`), never as `sudo bash <script>`: NOPASSWD matches the program sudo runs, and `bash` is not in the list. `scripts/verify-dev-env.sh` parses the `NOPASSWD:` rules out of `sudo -n -l` and reports a `warn` row for each of the three bridge scripts and `/opt/homebrew/bin/x64sc` that no rule names. A blanket `(ALL) ALL` does not count, because it still prompts.
 
-   ```bash
-   sudo -n -l /path/to/c64-test-harness/scripts/setup-bridge-feth-macos.sh
-   sudo -n -l /opt/homebrew/bin/x64sc
-   ```
+**The one-shot installer on macOS.** `scripts/setup-dev-env.sh` has had a Darwin branch since 2026-04-19:
 
-   each of which should print the NOPASSWD match instead of prompting for a password. `scripts/verify-dev-env.sh` checks each of the three bridge scripts and `/opt/homebrew/bin/x64sc` for a NOPASSWD entry and reports `warn` for any that are missing.
+- stage 1 runs `brew update` and `brew install vice`;
+- stage 2 (the source build) is skipped;
+- stage 3 builds the venv;
+- stage 4 runs `setup-bridge-feth-macos.sh`;
+- `--force` and `--sha256` are ignored.
+
+The dev machine was not set up with it, and no macOS run of it is recorded. Its stage 3 builds the venv from whichever `python3` is first on `PATH`, which must be ≥ 3.10. It does not do steps 7-8.
 
 ### Caveats
 
 - The Homebrew `vice` formula already passes `--enable-ethernet`, so `-ethernetcart` / `-ethernetioif` / `-ethernetiodriver` are available and `verify-dev-env.sh` reports the VICE section green.
-- On macOS 26 (Tahoe), the VICE 3.10 bottle prints a cosmetic `Error - failed to retrieve executable path, falling back to getcwd() + argv[0]` on every launch. `-help`, `-features`, and normal emulator launches proceed past it and work correctly, including `-binarymonitor`. The one case that does *not* recover is `x64sc --version`, which exits 1 after the error because VICE's init-order bug hits a NULL `argv[0]` reference before the path is stashed. `verify-dev-env.sh` works around this by falling back to `brew list --versions vice`, the Cellar path, and finally a `-features` probe. File upstream if we want a real fix.
+- On macOS 26 (Tahoe), the VICE 3.10 bottle prints a cosmetic `Error - failed to retrieve executable path, falling back to getcwd() + argv[0]` on every launch. `-help`, `-features`, and normal emulator launches proceed past it and work correctly, including `-binarymonitor`. The one case that does *not* recover is `x64sc --version`, which exits 1 after the error because VICE's init-order bug hits a NULL `argv[0]` reference before the path is stashed. `verify-dev-env.sh` works around this by falling back to `brew list --versions vice`, the Cellar path, and finally a `-features` probe. On macOS 27, 2026-09-28, the checker again took the Homebrew fallback, so `--version` still does not report there. It is recorded, unreported upstream, in [docs/vice_upstream_bugs.md](vice_upstream_bugs.md).
 - On macOS, VICE's `pcap` ethernet driver requires **root**, and `/dev/bpf*` permissions are irrelevant to that. The gate is VICE's own: `archdep_rawnet_capability()` (`src/arch/shared/archdep_rawnet_capability.c`) returns `geteuid() == 0` on macOS — the `CAP_NET_RAW` branch is Linux-only — and `rawnetarch.c` admits the pcap driver only when it holds. Unelevated, `rawnet_arch_driver` is never assigned and stays NULL, and `cs8900_activate` derefs it. (An earlier version of this note blamed a root-only macOS 26 kernel attach check inside `pcap_open_live()`; VICE never gets that far. Verified live: `/dev/bpf0` at `crw----rw-`, uid 501, driver still refused.) The observed symptom is a SIGSEGV at `rawnet_arch_pre_reset+8` inside `cs8900_activate`:
 
   ```
@@ -252,10 +159,150 @@ Unlike the Ubuntu flow there is no one-shot installer — `scripts/setup-dev-env
 
   Escape hatches still work the same way: `MACOS_PCAP_DISABLED=1` force-skips the ethernet suite without running the probe, and `MACOS_PCAP_ENABLED=1` trusts the user and skips the probe. Reproduce the working launch interactively with `scripts/probe-vice-feth.sh` (which runs VICE under `sudo -n` by default; `--no-sudo` opts out for future hosts where ChmodBPF/TCC changes make non-root pcap work).
 
-  Quality-of-life upstream item (not blocking): the "silent NULL driver on pcap init failure" is worth reporting to VICE — a clean error-and-exit instead of a deferred NULL deref would have shortened this debugging loop considerably. File when convenient.
+  The silent NULL driver on pcap init failure is recorded, with its reproducer, in [docs/vice_upstream_bugs.md](vice_upstream_bugs.md). It has not been reported upstream.
 - **feth peers MUST NOT also be bridge members.** `scripts/setup-bridge-feth-macos.sh` creates `feth0` + `feth1`, pairs them via `ifconfig feth0 peer feth1`, AND creates `bridge10` — but it deliberately leaves `feth0`/`feth1` OUT of the bridge (zero members on `bridge10`). Rationale: the `peer` relation is already a point-to-point L2 link (TX on `feth0` = RX on `feth1` and vice versa); adding them as bridge members creates a SECOND forwarding path between the same two nodes, which empirically broke B→A reply delivery (A→B first-hops stayed fine). `bridge10` still exists so the tests' `iface_present(BRIDGE_NAME)` precondition keeps passing and the host-side `10.0.65.1` address has a stable home; if any future test needs the host to participate at L2 it can `addm` a THIRD interface (e.g. a fresh feth pair or a vlan) but not the existing peered pair. The cleanup script `cleanup-bridge-feth-macos.sh` is a peers-only reconverge too — if a previous setup run happened to add the peers as members, the setup script now calls `deletem` idempotently to restore the intended topology.
 - **libpcap over BPF self-delivers broadcasts on macOS.** `libpcap` sets `BIOCSSEESENT=1` whenever `pcap_set_promisc(1)` is on, which means the sender's own pcap handle receives its own outbound broadcast frames back as inbound. VICE's `pcap` driver feeds those back into the CS8900a RX FIFO, so after a TX phase the sender's CS8900a has its own just-sent frame queued for read. Any test that TX's then later RX's on the same transport (e.g. `test_bidirectional_exchange` in `tests/test_ethernet_bridge.py`) must drain the FIFO first or it will read the stale self-frame. `_drain_cs8900a_rx` in `tests/test_ethernet_bridge.py` is the 6502 helper that handles this; the `_build_rx_code(..., expected_src_mac=...)` src-MAC filter is the defence-in-depth layer. Unicast tests (e.g. the ICMP suite which addresses frames to the peer's MAC) are not affected because `run_ping_and_wait` drains and re-polls on a mismatched frame (`build_read_and_match_echo_reply_code` returns `0x02` for anything that is not the expected echo reply) -- not because of IA filtering: `CS8900A_RXCTL_VALUE` sets PromiscuousA, so the chip accepts every unicast frame, and the old `0x00D8` had PromiscuousA set too.
 - **`multiprocessing` start method differs by platform.** macOS defaults to `spawn`, Linux defaults to `fork`. `spawn` re-imports the target module in the child and pickles the `Process(target=...)` callable, so any nested closure passed as `target` blows up with `AttributeError: Can't get local object`. Worker functions must live at module scope and receive everything they need via `args=`. Both `tests/test_port_lock.py` (three module-level `_child_*` helpers) and `scripts/stress_cross_process.py` (five `_*_worker` helpers) follow this pattern.
+
+## Quick check: `scripts/verify-dev-env.sh`
+
+```bash
+./scripts/verify-dev-env.sh --no-u64
+```
+
+This is a **read-only diagnostic**. It never starts an emulator session. The only VICE binaries it runs are `x64sc --version` and `--help` (and `-features` as a macOS fallback), plus `c1541 --version`; each prints and exits. Besides those it runs read-only queries: `brew list --versions`, `sudo -n -l`, `ifconfig`, `git`, `python3` (the import and version checks) and, for the optional probe, `curl`. It never runs pytest, never changes network state, and never writes outside the repo, so it is safe to run while other agents hold VICE instances open. The one network access is the optional Ultimate probe, a `GET /v1/version`. It runs only when `U64_HOST` or `--u64-host` is set, and `--no-u64` skips it.
+
+The Python checks use the first interpreter found in this order: `$VIRTUAL_ENV`, then the canonical venv, then `<repo>/.venv`, then the system `python3`. Each row names the interpreter it used.
+
+### What it checks
+
+| Section | Checks |
+|---------|--------|
+| Repo | Running inside a `c64-test-harness` checkout (critical); current git branch + short SHA |
+| VICE | `x64sc` on `PATH`; VICE 3.10 version (on macOS `x64sc --version` exits early, so the version comes from `brew list --versions vice`, then the Cellar path, then a `-features` probe); `-ethernetcart` / `-ethernetioif` / `-ethernetiodriver` in `--help` (the key deployability gate: distro-packaged VICE usually lacks `--enable-ethernet`); `-binarymonitor` and `-remotemonitor` in `--help`; `c1541` on `PATH` |
+| Python | `python3` ≥ 3.10, `c64_test_harness` importable, `pytest` available |
+| System tools (macOS) | `ifconfig`; `/dev/bpf0` readable; a NOPASSWD rule for each of the three `*-bridge-feth-macos.sh` scripts and for `/opt/homebrew/bin/x64sc` |
+| System tools (Linux) | `ip`, `iptables`, `/dev/net/tun`, passwordless sudo (informational) |
+| Bridge networking | macOS: `bridge10`, `feth0`, `feth1`. Linux: `br-c64`, `tap-c64-0`, `tap-c64-1` |
+| Ultimate 64 (optional) | HTTP GET `/v1/version`, only as described above |
+
+On the macOS dev machine (2026-09-28, bridge not set up, `--no-u64`) it reports `Summary: 14 ok, 3 missing, 1 skipped, 3 warn` / `Overall: READY (with optional gaps)`. The 3 missing rows are `bridge10`/`feth0`/`feth1`, and the 3 warns are the bridge-script NOPASSWD rows. The README shows the full output.
+
+### CLI
+
+```
+verify-dev-env.sh [--quiet] [--json] [--no-u64] [--u64-host HOST]
+```
+
+- `--quiet`: suppress section headers; print only failures plus the final summary
+- `--json`: emit a single JSON object (uses `python3` for clean serialization)
+- `--no-u64`: skip the Ultimate 64 probe even if `U64_HOST` is set
+- `--u64-host HOST`: override `$U64_HOST`
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | READY: all critical checks passed (optional gaps like a missing bridge or U64 are allowed) |
+| `1` | NOT READY: at least one critical check failed (missing/wrong VICE build, broken Python harness, etc.) |
+| `2` | Script error: bad argument, or running outside a repo |
+
+The critical checks are:
+
+- the repo check;
+- VICE presence, version, ethernet and binary monitor;
+- `c1541`;
+- Python ≥ 3.10;
+- the `c64_test_harness` import.
+
+Everything else is reported but does not fail the overall check: bridge, U64, system tools, NOPASSWD, the text monitor and `pytest`.
+
+## Ubuntu 25: `scripts/setup-dev-env.sh`
+
+> **Last run April 2026, and that run failed; the fixes have not been run since.** A fresh Ubuntu 25 VM hit three failures: PEP 668, a drifted `libgtkglext1-dev` package, and the GTK3/SDL2 choice. `5242a8f` (2026-04-11) fixed them. No run of the fixed installer is recorded. The only later change was the macOS dispatch on 2026-04-19 (`b6b77e9`). Expect Ubuntu package-name drift. No destructive smoke run (launch VICE, run a test) is part of the installer. A fresh-VM run, a smoke pass, distro-aware fix hints and a `--repair` mode are tracked in [#500](https://github.com/JC-000/c64-test-harness/issues/500).
+
+On a clean Ubuntu Desktop 25 machine, one command is meant to take you from zero to "verify-dev-env.sh says READY":
+
+```bash
+./scripts/setup-dev-env.sh
+```
+
+Always preview first with `--dry-run`. It prints every action it would take without touching the system, then runs `verify-dev-env.sh` so you can see the current state:
+
+```bash
+./scripts/setup-dev-env.sh --dry-run
+```
+
+After a successful run, the harness lives in the canonical venv at `~/.local/share/c64-test-harness/venv`. The venv avoids the PEP 668 `externally-managed-environment` error that Ubuntu 23+ raises against system Python. Activate it with:
+
+```bash
+source ~/.local/share/c64-test-harness/venv/bin/activate
+```
+
+or invoke the venv python directly:
+
+```bash
+~/.local/share/c64-test-harness/venv/bin/python -m pytest tests/
+```
+
+### Stages
+
+The installer runs six stages. Every stage is **idempotent** (safe to re-run) and **opt-out** via `--no-*` flags.
+
+| # | Stage | What it does | Opt-out flag |
+|---|-------|--------------|--------------|
+| 1 | `system packages` | `sudo apt-get install` the build toolchain, the VICE build deps (SDL2, GTK3, libpcap, pulse/alsa, flac/vorbis/mpg123/lame) and the harness tooling (python3, pip, iproute2, iptables). If a bulk install fails, retries per package to report which names drifted. | `--no-system-packages` |
+| 2 | `VICE 3.10 build` | Downloads the VICE 3.10 tarball from SourceForge into `~/.cache/c64-test-harness/build/`, extracts it, and runs `./configure --enable-ethernet --enable-shared --disable-html-docs --enable-native-gtk3ui`, `make -j$(nproc)`, `sudo make install`. Skips entirely if `x64sc --version` already reports VICE 3.10 with ethernet support. Optional `--sha256 HEX` pin. | `--no-vice` |
+| 3 | `Python harness` | Creates the venv at `~/.local/share/c64-test-harness/venv` (with `--system-site-packages`) and runs `pip install -e .` into it. Skipped if the venv already exists and its `c64_test_harness` import resolves to this checkout. After success, prints the `source .../activate` command to run. | `--no-harness` |
+| 4 | `bridge networking` | Runs `sudo ./scripts/setup-bridge-tap.sh` to create `br-c64` + `tap-c64-0` + `tap-c64-1`. Skipped if all three interfaces already exist. | `--no-bridge` |
+| 5 | `Ultimate 64 probe` | Runs only if `U64_HOST` is set in env or `--u64-host HOST` is passed. `curl`s `/v1/version` and reports reachability; never a failure. | `--no-u64` |
+| 6 | `verify-dev-env.sh` | Final sanity check. The installer's exit code mirrors this: `0` READY, `1` NOT READY, `3` verify-script broken. | (always runs) |
+
+Stage 3 installs without the `dev` extra. It relies on `--system-site-packages` for `pytest`, so if the system has none, run `pip install -e '.[dev]'` in the venv.
+
+### CLI
+
+```
+setup-dev-env.sh [OPTIONS]
+
+  --dry-run             Print actions without executing; still runs verify
+  --force               Skip the Ubuntu 25 version check (ignored on macOS)
+  --no-system-packages  Skip stage 1
+  --no-vice             Skip stage 2 (no-op on macOS)
+  --no-harness          Skip stage 3
+  --no-bridge           Skip stage 4
+  --no-u64              Skip stage 5
+  --u64-host HOST       Probe this U64 host (overrides $U64_HOST)
+  --build-dir DIR       VICE source cache dir (default ~/.cache/c64-test-harness/build)
+  --sha256 HEX          Pin the VICE tarball checksum (Linux only)
+  -h, --help            Print usage
+```
+
+Exit code `2` means an installer error: a bad argument, an OS mismatch without `--force`, or running outside the repo.
+
+### Recovery
+
+If a stage fails, re-run the installer. Each stage is idempotent, so it skips anything already done and picks up where it left off. If one stage is blocking progress on an unrelated concern, skip it with the matching `--no-*` flag. For example, if the VICE build is slow and you want to iterate on the harness, pass `--no-vice`.
+
+If `verify-dev-env.sh` reports NOT READY at the end, its own output lists exactly which checks failed plus fix hints.
+
+## Manual setup (other Linux distros)
+
+`scripts/setup-dev-env.sh` targets Ubuntu Desktop 25 specifically. On other distros, pass `--force` to bypass the OS check (system-package names may drift), or do it by hand:
+
+1. **Build VICE 3.10 from source with `--enable-ethernet`.** Distro packages generally omit the flag, so `verify-dev-env.sh` flags a packaged VICE as a critical failure. Install to `/usr/local/bin`.
+2. **Install the Python harness in editable mode into the canonical venv.** From the repo root:
+
+   ```bash
+   python3 -m venv --system-site-packages ~/.local/share/c64-test-harness/venv
+   ~/.local/share/c64-test-harness/venv/bin/pip install -e '.[dev]'
+   ```
+
+   On Ubuntu 23+ and other PEP 668 distros the venv is mandatory, because `pip install --user` against system Python is blocked.
+3. **Set up bridge networking** (only needed for the multi-VICE ethernet tests): `sudo ./scripts/setup-bridge-tap.sh`. Teardown is `sudo ./scripts/teardown-bridge-tap.sh`, and emergency cleanup is `sudo ./scripts/cleanup-bridge-networking.sh`. Linux's `tuntap` driver needs no elevated VICE.
+4. **Optional Ultimate 64:** set `U64_HOST=<device>` in the environment to enable hardware-backed live tests. Suites that change device config also require `U64_ALLOW_MUTATE=1`. That variable covers device config changes only; resets, RAM writes and stream start/stop run on `U64_HOST` alone (#333). With either variable unset, a config-writing suite skips cleanly.
+
+Re-run `./scripts/verify-dev-env.sh` after each step to confirm progress.
 
 ## Live test gates: `C64_REQUIRE_VICE` / `C64_REQUIRE_ELEVATION`
 
@@ -318,11 +365,15 @@ per refused store:
   calls `dhcp_stop()` → `dhcp_release_and_stop`
   (`lwip/src/core/ipv4/dhcp.c:1325-1390`): DHCP_RELEASE goes out and
   `netif_set_addr(netif, IP4_ADDR_ANY4, ...)` zeroes the address the REST
-  request arrived on. The 3.15-line guard that makes this a live no-op arrived
-  **post-tag** in `6b5ffc21` and exists only in the `v3.15-8x` fork this bench
-  flashed onto the U64E — upstream and the C64U's 1.1.0 line call `dhcp_stop()`
-  unconditionally, so the no-op holds for exactly one device here and must never
-  be generalised. On a statically addressed device the same path takes the
+  request arrived on. The guard that makes this a live no-op is
+  6b5ffc21 (upstream #805, merged to test-merge 2026-08-27, now on GideonZ
+  master and in the public v3.15 and v3.15a release tags). Every recorded U64E
+  build carries it (`71480a9d`, `7f6fcb51`, `4011c97c`, `bce4535e`); the C64U's
+  1.1.0 does not. The bench baseline builds are `7f6fcb51` (v3.15-85) and
+  `bce4535e` (v3.15-132, reported since 2026-09-15). `71480a9d` and `4011c97c`
+  are the builds behind #231's report and its re-run.
+  On 1.1.0, `dhcp_stop()` runs unconditionally. So the no-op holds for the U64E
+  only, and it must never be generalised to the C64U / 1.x line. On a statically addressed device the same path takes the
   `else` branch, which is why **tests must never configure a static address**.
 - **`Network Settings`** — the reset blanks the Network Password and the syslog
   server, restores the hostname to the product default, and **re-enables** every
@@ -348,7 +399,8 @@ pattern match. `apply_factory_baseline()` resets per category over
 `ValueError` before a single request goes out, asserts per item that the reset
 took (`U64BaselineError` if it did not), logs pre-existing drift at INFO rather
 than failing on it, and accepts `exempt=[(category, item)]` for
-detection-derived values inside a covered store. Which stores a device
+detection-derived values inside a covered store. Exempt items are listed under
+`report.detection_derived` and are never compared or PUT. Which stores a device
 generation lists, and how many items each has (device-read on the U64E,
 source-derived only on the C64U), is recorded in
 `BASELINE_RECORDED_CATEGORY_SETS` in the same module — cite that table by name
@@ -362,13 +414,15 @@ deliberate: `create_manager(backend="u64", baseline_on_entry=True)` — or
 (`RuntimeError`, "baseline_on_entry requires DeviceLock"), while a reset merely
 *inherited* from the generation default **degrades to off with a WARNING** naming
 the switch rather than turning a working configuration into a crash
-(`unified_manager.py:196-212`, `:368-376`; pinned by
+(`backends/unified_manager.py`: the degrade in `UnifiedManager.__init__`, the
+refusal in `_build_u64_manager`; pinned by
 `tests/test_entry_baseline_default_on.py`
 `TestDefaultDoesNotSilentlyArmWithoutTheLock`). **You do not have to ask for it.** Since #285 the manager
 resolves the reset from the device's generation at `acquire()` — on for the
 U64E, off for the C64U, off for an unreadable generation — so a U64E lane gets a
 reconciled device without passing anything, and `U64_BASELINE_ON_ENTRY` is the
-override in both directions. The gate table's entry below spells out the
+override in both directions. Opting a C64U in makes the manager log a WARNING
+naming the WiFi device-loss risk at every acquire. The gate table's entry below spells out the
 precedence.
 
 The worked fixture, and the rest of the contract, are in the `c64-test` skill:
@@ -449,8 +503,8 @@ resets, RAM writes and stream start/stop are outside it and not scanned.
 | `SOCKETDMA_LIVE=1` (*mutate* for the REU-config-writing tests; the RAM-only barrier tests skip without the gate too, stricter than the contract) | `tests/test_socketdma_barrier_live.py`, `tests/test_socketdma_live.py` | "Ultimate DMA Service" enabled | idle-reconnect and the one-retry barrier (#223); `REUWRITE` byte fidelity. **SocketDMA writes are disabled pending a stability review** — do not run these to "check it still works" |
 | `U64_BASELINE_LIVE=1` (*mutate*) | `tests/test_entry_baseline_live.py` | — | reset-on-entry: drift → per-category reset → every covered item at `default`; never-touch stores untouched (#227) |
 | `FLASH_BASELINE_LIVE=1` (*mutate*) | `tests/test_flash_baseline_live.py` | — | flash equals the firmware default per category (never-touch and `Network Settings` not reloaded) (#227) |
-| `TEMP_GC_LIVE=1` (*mutate*) | `tests/test_temp_gc_live.py` | FTP File Service enabled | `gc_temp_folder` against a real FTP server: leak `temp####` attachments via `run_prg`, trim to the keep-count, idempotent re-run (#153). **This one leaks on purpose** — read the `/Temp` clause before running it on a leak-prone device. Its three mutating tests need `U64_ALLOW_MUTATE=1` (`test_temp_gc_live.py:40-43`); set only the gate and they skip |
-| `REU_READBACK_LIVE=1` (*mutate*) | `tests/test_reu_size_readback_live.py` | — | `REU Size` read-back is not stale: a differing value means a write, a flash reload or a boot in between (#168). Four tests need `U64_ALLOW_MUTATE=1` (`:112-115`) |
+| `TEMP_GC_LIVE=1` (*mutate*) | `tests/test_temp_gc_live.py` | FTP File Service enabled | `gc_temp_folder` against a real FTP server: leak `temp####` attachments via `run_prg`, trim to the keep-count, idempotent re-run (#153). **This one leaks on purpose** — read the `/Temp` clause before running it on a leak-prone device. The whole module (two tests) also needs `U64_ALLOW_MUTATE=1` (module `pytestmark`); set only the gate and it skips |
+| `REU_READBACK_LIVE=1` (*mutate*) | `tests/test_reu_size_readback_live.py` | — | `REU Size` read-back is not stale: a differing value means a write, a flash reload or a boot in between (#168). Four of its five tests need `U64_ALLOW_MUTATE=1` (the `requires_mutate` mark); the quiet-read test runs without it |
 | `TURBO_CONTRACT_LIVE=1` (*mutate*) | `tests/test_turbo_contract_live.py` | — | the CPU-Speed enum is a cross-generation superset; a generation-foreign speed raises locally off the probed presets |
 | `UCI_UDP_LIVE=1` (*mutate*) | `tests/test_uci_udp_send_live.py`, `tests/test_uci_udp_send_large_live.py` | UCI enabled, `reset()` + 3 s settle | one `uci_socket_write` = one datagram, no firmware coalescing; the 892-byte write ceiling. Enables `Command Interface` and puts back the value it read first (#268) |
 | `RRNET_UDP_LIVE=1` | `tests/test_rrnet_udp_send_live.py` | VICE + bridge (no U64) | VICE-side RR-Net UDP TX of a 256-byte frame (the largest `build_tx_code` accepts; larger frames never delivered, #304), received by a host socket |
@@ -478,8 +532,8 @@ whose reconnection after a power cycle is known unreliable, with nobody present,
 and nothing in `BASELINE_NEVER_TOUCH` protects against a future edit adding a
 network store to the covered set by mistake — see the `Ethernet Settings` and
 `WiFi settings` reasons above. `U64_BASELINE_ON_ENTRY=1` opts a C64U in for
-somebody standing at the bench, and the manager logs a WARNING naming the risk
-when it does. An `unknown` generation — an unreadable or timed-out capability
+somebody standing at the bench (the WARNING this logs is described under
+"Live tests reconcile at entry" above). An `unknown` generation — an unreadable or timed-out capability
 probe ([#262](https://github.com/JC-000/c64-test-harness/issues/262)) — resolves
 **off**: a reset must never arm on a device the harness failed to identify, and
 the C64U is exactly the device a slow probe mis-grades.
@@ -635,10 +689,3 @@ and a WARNING log line, once per version per process. The grade stays
 Tracked as #248.
 Full statement in CLAUDE.md § "Standing hardware-safety clause" and
 `docs/u64_recovery.md`.
-
-## Follow-ups not in this PR
-
-- Real fresh-VM validation of `setup-dev-env.sh` (the authoring was done via `--dry-run` only, on an already-set-up machine)
-- Destructive validation pass that actually launches VICE and runs a tiny smoke test
-- Distro detection so the fix hints can target more than just Ubuntu
-- `--repair` mode that invokes only the stages verify-dev-env reports as missing
