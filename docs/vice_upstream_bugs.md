@@ -138,9 +138,12 @@ All three flags are genuinely registered: S `ethernetcart.c:434-451`.
 exactly as the rc does and arrive at the same dereference.
 
 Do not confuse this with `-ethernetiodriver pcap` on a bare command line,
-which **is** rejected at parse time (exit 255, `Argument 'pcap' not
-valid`), because the driver's value set is only populated once the cart
-is active. The *cart* options are accepted and crash.
+which **is** rejected at parse time when unelevated (exit 255,
+`Argument 'pcap' not valid`): the option sets `ETHERNET_DRIVER`, whose
+setter selects pcap only when `archdep_rawnet_capability()` holds (S
+`rawnetarch.c:108`) and otherwise returns -1, which S `cmdline.c:262-264`
+reports as that error — with or without an `-addconfig` rc. The *cart*
+options are accepted and crash.
 
 **Harness mitigation: yes.** `plan_vice_launch()`
 (`src/c64_test_harness/backends/vice_elevation.py`) refuses to spawn an
@@ -342,8 +345,8 @@ the outside ("the text never appeared"):
 
 | | raster across resumes | PC | screen | diagnosis |
 |---|---|---|---|---|
-| **stall (this bug)** | frozen | pinned, e.g. at `$CF00` | stale | VICE stopped emulating |
-| **lost keystrokes** | advancing (frozen if it ended in a jam) | cycling the BASIC idle loop `$E5CD-$E5D4`, or on a KIL opcode with `0x61` queued | `READY.` only, nothing typed | a harness defect, fixed (#170) |
+| **stall (this bug)** | constant | pinned, e.g. at `$CF00` | stale | VICE stopped emulating |
+| **lost keystrokes** | constant too: `LIN=12`, `CYC` 0-2 (the monitor's frame phase, #504) — the raster separates nothing here | cycling the BASIC idle loop `$E5CD-$E5D4`, or on a KIL opcode with `0x61` queued | `READY.` only, nothing typed | a harness defect, fixed (#170) |
 
 The second mode was the harness's own `_restore_basic` fixture
 in `tests/test_vice_core.py`, which returned to BASIC with `CLI; JMP
@@ -365,10 +368,25 @@ failure time, and use a fresh VICE per trial — a probe that reuses one
 VICE is one trial.
 
 **Harness mitigation: detection, not recovery.** We cannot fix VICE.
-`_machine_failure_report` in `tests/test_vice_core.py` samples the raster
-across acknowledged resumes (`_emulator_is_stalled`) and checks for
-a queued `0x61`, so a stall says so instead of timing out on a screen
-assertion. Deliberately **not** auto-restarted: a harness
+`_machine_failure_report` in `tests/test_vice_core.py` classifies the
+machine across acknowledged resumes (`_machine_progress`, #504) and names
+exactly one cause. The jiffy clock (`$A0-$A2`) or the PC moving means
+running. If neither moves, CIA1 Timer A (`$DC04`) decides whether the
+machine is clocked at all: frozen means VICE stopped emulating (this
+bug); moving means a jammed 6510 (a KIL byte at the PC, or a `0x61`
+queued while sampling) or, with no jam, code spinning with IRQs masked.
+The raster is reported but decides nothing: sampled through the monitor
+it reads `LIN=12` every time with `CYC` 0-2. Measured on VICE 3.10
+(2026-09-28, n=8 per arm, warp on and off): Timer A moved in every trial
+of BASIC idle, `SEI; JMP *`, a 9-cycle `SEI` loop and a KIL jam alike,
+and the classifier returned running / masked spin / masked spin / jammed
+8/8 each. With I/O banked out of the CPU's view (`$01=$34`) the `$DC04`
+peek reads RAM, so a frozen value there is reported inconclusive (8/8
+live); a program that stopped Timer A (`$DC0E` bit 0 clear) still reads
+as a stopped emulator, and the label says to check `$DC0E`. The
+stopped-emulator verdict rests on the fake plus that measurement; this
+bug has not yet been caught live with Timer A sampled.
+Deliberately **not** auto-restarted: a harness
 that silently rebuilds a stalled emulator converts a reproducible
 upstream bug into an invisible one.
 
@@ -484,9 +502,9 @@ The script writes its vicerc into a throwaway `HOME`, so it never touches
 The cart must be activated through an `-addconfig` rc. Passing
 `-ethernetiodriver pcap` on a bare command line does **not** reach the
 bug — it is rejected at parse time with `Argument 'pcap' not valid for
-option '-ethernetiodriver'` and exit 255, because the driver's value set
-is populated by `rawnet_arch_init()`, which only runs once the cart is
-active. Verified: that shorter form exits 255, not 139.
+option '-ethernetiodriver'` and exit 255, because unelevated the
+`ETHERNET_DRIVER` setter refuses pcap (S `rawnetarch.c:108`; reported by
+S `cmdline.c:262-264`). Verified: that shorter form exits 255, not 139.
 
 ```sh
 #!/bin/sh

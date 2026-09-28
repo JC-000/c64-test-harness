@@ -477,7 +477,7 @@ HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
         0xCF00, 0xCF04,
         owner="tests/test_vice_core.py::_restore_basic (also "
               "scripts/vice_keyecho_probe.py + scripts/vice_stall_probe.py)",
-        purpose="CLI; JMP $E5CD stub returning the CPU to BASIC MAINLOOP "
+        purpose="CLI; JMP ($A002) stub warm-starting BASIC (rebuilds SP) "
                 "before every screen/keyboard test — test-suite scratch, "
                 "not library",
         configurable="hardcoded",

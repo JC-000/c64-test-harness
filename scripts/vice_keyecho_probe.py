@@ -8,8 +8,9 @@ recording proxy, so what runs here is what pytest runs.
 What the proxy records that the test suite cannot see:
 
 * at every PC redirect (``set_registers``): where the 6510 was paused
-  (PC, SP, the stack above SP) -- the state ``_restore_basic`` inherits
-  when it jumps into the KERNAL idle loop at $E5CD without touching SP;
+  (PC, SP, the stack above SP) -- the state ``--restore e5cd-stub``
+  inherits when it jumps into the KERNAL idle loop at $E5CD without
+  touching SP (the suite's restore warm-starts via ``JMP ($A002)``);
 * at every ``$C6`` write: the paused PC and the old ``$C6`` value, to
   catch a write landing while LP2 ($E5B4-$E5C9) is mid-copy;
 * around the blank+feed pair: LIN/CYC before and after, to prove the
