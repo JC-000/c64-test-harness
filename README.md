@@ -44,9 +44,9 @@ The Homebrew bottle already carries ethernet support, so you do not need a sourc
 
 `scripts/setup-dev-env.sh` also has a macOS branch (`brew install vice`, the venv, the feth bridge), added 2026-04-19. No run of that branch is recorded. The setup above is the one in use, not that script. The script builds the venv from whichever `python3` is first on `PATH`, so check that it is ≥ 3.10 before relying on it.
 
-### Ubuntu 25: secondary, last run April 2026 (failed; fixes not run since)
+### Ubuntu 25: secondary, passed in a fresh VM 2026-09-28
 
-> **Last run April 2026, and that run failed.** A fresh Ubuntu 25 VM hit three failures, which `5242a8f` (2026-04-11) fixed. No run of the fixed installer is recorded. The only later change was the macOS dispatch on 2026-04-19. Treat this path as unverified and expect package-name drift ([#500](https://github.com/JC-000/c64-test-harness/issues/500)).
+> **Last run 2026-09-28: passed** in a fresh Ubuntu 25.10 aarch64 VM (lima, cloud image `ubuntu-25.10-server-cloudimg-arm64` 20260703, no host mounts, port forwarding off): install, idempotent re-run and `verify-dev-env.sh --smoke` all READY. That run first found six missing VICE build dependencies and a headless `--help` probe failure, now fixed ([#500](https://github.com/JC-000/c64-test-harness/issues/500)). A display-backed Ubuntu Desktop run is not recorded.
 
 ```bash
 ./scripts/setup-dev-env.sh --dry-run   # preview every action; changes nothing
@@ -58,7 +58,7 @@ Every stage is idempotent and can be skipped with a `--no-*` flag. The venv is m
 
 ### Verifying your dev environment
 
-`./scripts/verify-dev-env.sh` is read-only and works on both platforms. It never starts an emulator session: it runs only `x64sc --version`, `--help`, and `-features` as a macOS fallback, plus `c1541 --version`. It never runs pytest and never changes network state. It probes an Ultimate device (`GET /v1/version`) only when `U64_HOST` or `--u64-host` is set, and `--no-u64` turns that probe off. On macOS it checks `ifconfig`, `/dev/bpf0` readability, NOPASSWD rules for the three bridge scripts and `/opt/homebrew/bin/x64sc`, and `bridge10`/`feth0`/`feth1`. On Linux it checks `ip`, `iptables`, `/dev/net/tun` and `br-c64`/`tap-c64-*`. Output from the dev machine above (2026-09-28, bridge not set up):
+`./scripts/verify-dev-env.sh` is read-only by default and works on both platforms. Without `--smoke` it never starts an emulator session: it runs only `x64sc --version`, `--help` (retried as `x64sc -console --help` when a display-less GTK3 build prints no options), and `-features` as a macOS fallback, plus `c1541 --version`. `--smoke` is the one opt-in that does: it launches one headless VICE through the harness launcher, writes and reads back 8 bytes of RAM, and stops the process it started. It never runs pytest and never changes network state. It probes an Ultimate device (`GET /v1/version`) only when `U64_HOST` or `--u64-host` is set, and `--no-u64` turns that probe off. On macOS it checks `ifconfig`, that every existing `/dev/bpf*` node is other-rw (naming the ones that are not), NOPASSWD rules for the three bridge scripts and `/opt/homebrew/bin/x64sc`, and `bridge10`/`feth0`/`feth1`. On Linux it checks `ip`, `iptables`, `/dev/net/tun` and `br-c64`/`tap-c64-*`, and its install hints name `apt-get`, `dnf` or `pacman` from `/etc/os-release`. Output from the dev machine above (2026-09-28, bridge not set up). The `/dev/bpf*` row, and the ok/warn counts with it, come from the per-node check added for #502, run the same day on the same machine; the old `/dev/bpf0`-only check had reported that row ok:
 
 ```
 [VICE]
@@ -76,7 +76,7 @@ Every stage is idempotent and can be skipped with a `--no-*` flag. The venv is m
 
 [System tools]
   ✓ ifconfig command (/sbin/ifconfig)
-  ✓ /dev/bpf0 readable (BPF devices user-readable (pcap ready))
+  ⚠ /dev/bpf* other-rw (not other-rw: bpf4 (host-side packet capture and the ethernet TX/RX tests fail on any node they are handed that is root-only; VICE's pcap driver needs root regardless))
   ⚠ NOPASSWD sudo for setup-bridge-feth-macos.sh (no NOPASSWD entry (bridge setup will prompt for a password))
   ...
   ✓ NOPASSWD sudo for x64sc (NOPASSWD rule names /opt/homebrew/bin/x64sc)
@@ -85,13 +85,13 @@ Every stage is idempotent and can be skipped with a `--no-*` flag. The venv is m
   ✗ bridge10 (not found)
   ...
 
-Summary: 14 ok, 3 missing, 1 skipped, 3 warn
+Summary: 13 ok, 3 missing, 1 skipped, 4 warn
 Overall: READY (with optional gaps)
 ```
 
 The `x64sc --version printed no version` note is expected: the Homebrew build's `x64sc --version` exits early, so the script falls back to Homebrew's metadata. The harness version is read from the installed package metadata. This sample's `0.11.3` came from a venv installed before the current `0.12.4` in `pyproject.toml`, and it needs `pip install -e .` again to report the right number.
 
-The VICE checks are **critical**, so a hardware-only machine without VICE reports NOT READY even though the Ultimate backend works. Options: `--quiet`, `--json`, `--no-u64`, `--u64-host HOST`. Exit codes: `0` READY, `1` NOT READY, `2` script error. Details are in [docs/development.md](docs/development.md#quick-check-scriptsverify-dev-envsh).
+The VICE checks are **critical**, so a hardware-only machine without VICE reports NOT READY even though the Ultimate backend works. Options: `--quiet`, `--json`, `--no-u64`, `--u64-host HOST`, `--smoke`. Exit codes: `0` READY, `1` NOT READY, `2` script error. Details are in [docs/development.md](docs/development.md#quick-check-scriptsverify-dev-envsh).
 
 ## Choosing a backend
 
@@ -1124,7 +1124,7 @@ Additional scripts in `scripts/`:
 | `scripts/bridge_ping_demo.py` | Visible two-VICE bridge ping demo (RR-Net, live on-screen counters; supports `--warp` via host-side wall-clock orchestrators) |
 | `scripts/verify_tod_warp.py` | Empirical CIA TOD behavior probe in normal vs warp mode (regression check for the wall-clock timeout design) |
 | `scripts/verify-dev-env.sh` | Non-destructive dev environment check (VICE build flags, Python harness, bridge interfaces, optional U64 probe) |
-| `scripts/setup-dev-env.sh` | Fresh-machine installer. On Ubuntu 25: apt packages, VICE 3.10 source build, harness venv, bridge setup, final verify run. It also has a macOS/Homebrew branch, with no recorded run. Idempotent and `--dry-run` safe. The Ubuntu path was last run April 2026 (failed; fixes not run since; see [Getting started](#getting-started), #500) |
+| `scripts/setup-dev-env.sh` | Fresh-machine installer. On Ubuntu 25: apt packages, VICE 3.10 source build, harness venv, bridge setup, final verify run. It also has a macOS/Homebrew branch, with no recorded run. Idempotent and `--dry-run` safe. The Ubuntu path passed end to end in a fresh Ubuntu 25.10 aarch64 VM on 2026-09-28 (see [Getting started](#getting-started), #500) |
 | `scripts/install-skill.sh` | Symlink the `c64-test` Claude Code skill into `~/.claude/skills/` (`--dry-run`, `--uninstall`) |
 | `scripts/gen_memory_table.py` | Regenerate / check (`--write` / `--check`) the scratch-address table in `docs/memory_safety.md` from `HARNESS_SCRATCH` |
 
