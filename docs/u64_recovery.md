@@ -24,7 +24,8 @@ uploads arrive as attachments that land in Temp — visible in the firmware
 route table itself: at tag `1.1.0`, `software/api/route_machine.cc`
 registers `API_CALL(POST, machine, writemem, &attachment_writer, ...)`, and
 the same `&attachment_writer` binding appears on the `configs`,
-`drives:mount`, `drives:load_rom` and `runners:*` POST routes (the full
+`drives:mount`, `drives:load_rom` and `runners:{sidplay,load_prg,run_prg,run_crt}`
+POST routes (`runners:modplay` binds `&attachment_reu` instead; the full
 list is in `Ultimate64Client._creates_temp_attachment`'s docstring). The
 route table establishes that attachments are *created*; that their
 accumulation crashes the firmware is the owner's settled account
@@ -70,7 +71,8 @@ Two practical consequences on unfixed firmware:
 
 On unfixed firmware, `run_prg` (and any other endpoint that carries a
 body — `writemem` above the device's threshold, `load_prg`, `run_crt`,
-`sidplay`, `modplay`, the multipart `mount_disk`/`load_rom` bodies) leaks a managed attachment
+`sidplay`, `set_config_items_batch` (`POST /v1/configs`), the multipart
+`mount_disk`/`load_rom` bodies) leaks a managed attachment
 (`temp0000`, `temp0001`, ...) per call. Keyboard injection is **not** on
 that list: `Ultimate64Client.send_text` writes at most `KEYBUF_MAX = 10`
 bytes per request, which is under either threshold and so always takes
@@ -175,9 +177,9 @@ added later is covered by construction. `PUT machine:writemem?data=<hex>`
 and the config PUTs are free, which is also why the pass can enable FTP
 File Service without leaking an attachment to do it. The route table was
 read at tag `1.1.0` (the C64U's firmware), and the 3.15 line pairs verbs
-and handlers the same way. One deliberate conservatism: `runners:modplay`
+and handlers the same way. Two deliberate conservatisms: `runners:modplay`
 (`&attachment_reu` — the body goes to the REU) and, on the 3.15 line,
-`machine:input` (`&input_json_writer`) are counted anyway.
+`machine:input` (`&input_json_writer`) are both counted anyway.
 
 Measured live, and the boundary is exact (C64U 10.53.21.158, fw 1.1.0,
 `writemem_post_safe=False`, threshold 128, 2026-09-10, under the
@@ -214,10 +216,11 @@ chunks at `rest_put_chunk_size` on an Ultimate transport, on every grade
 attachments.
 
 What still leaks on the C64U: a direct `client.write_mem` above the
-threshold, `run_prg` / `load_prg` / `run_crt` / `sid_play` (and
-`mod_play`, whose body the firmware routes to the REU, counted anyway),
-the multipart `mount_disk` / `drive_load_rom` bodies, and
-`liveness_probe` (two per call, see Tier 1). The budget counts
+threshold, `run_prg` / `load_prg` / `run_crt` / `sid_play`,
+`set_config_items_batch` (`POST /v1/configs`; `route_configs.cc:251`
+binds `&attachment_writer` at `1.1.0`), the multipart `mount_disk` /
+`drive_load_rom` bodies, and `liveness_probe` (two per call, see Tier 1).
+`mod_play` is counted too, although its body goes to the REU. The budget counts
 *attachments* at the one request choke point, so none of these needs a
 table of its own.
 
@@ -229,14 +232,21 @@ uploaded PRG, costs only the one upload. For a caller that bypasses the
 transport it is also the only route that avoids a leak — leak
 *elimination*, not hygiene, and the first thing to reach for.
 
-The large POST form itself carries an unresolved question: a 47,103-byte
-single-call `write_mem` on the U64E (fw `v3.15-78-g71480a9d`) once read
-back with one wrong byte at a varying offset
-([#231](https://github.com/JC-000/c64-test-harness/issues/231)). A later
-controlled re-run was clean 0/50 on another build and identified two
-confounders sufficient to explain it (a readback past `$A000` reading
-BASIC ROM, and a running CPU writing its own RAM), so the issue is closed
-as non-reproducing, not refuted.
+The large POST form itself carries an unresolved question
+([#231](https://github.com/JC-000/c64-test-harness/issues/231)). A 47,103-byte
+single-call write at `$0801` on the U64E (reported as fw
+`v3.15-78-g71480a9d`), with the machine running from `READY.`, read back
+with exactly one wrong byte in both of n=2 trials, at offsets 2715 and
+3181. The same bytes written in 84-byte chunks were byte-exact 2/2. A
+controlled re-run on the U64E at `4011c97c` (range `$0801-$9FFF`, single
+POST, 25 trials into a sentinel bed) found 0/50 corrupted writes, 25
+payload and 25 bed, with the CPU paused. With the CPU running, the
+payloads were 0/25 corrupted, but one bed write showed 2 bad bytes just
+after reset, which fits the machine writing its own RAM. So a running CPU
+is a sufficient confounder for the original signature, and a readback
+past `$A000` reads BASIC ROM. The builds differ, and the issue is closed
+as non-reproducing, not refuted. It reopens only on a mismatch with the
+CPU paused and the payload entirely below `$A000`.
 
 **SocketDMA writes are disabled pending a stability review**, so the
 SocketDMA fast path is not a route off the POST path that anyone may take
@@ -530,7 +540,7 @@ The consequence inverts the obvious procedure: **the health check you
 reach for when you already suspect a wedge spends two of a small budget,
 and probing again on a bad result converges on the wedge you are
 diagnosing.** Three health checks spend the whole per-device budget of 6
-(`DEFAULT_LEAK_BUDGET`). Diagnose with bodyless calls first —
+(`DEFAULT_LEAK_BUDGET`, per process). Diagnose with bodyless calls first —
 `get_info()`, `get_version()` and `read_mem()` all cost nothing — and
 reach for `liveness_probe` deliberately, once, knowing the price.
 
@@ -818,9 +828,12 @@ themselves, or calling `_request` directly, gets a silent zero-page
 clobber on the C64U — `$0000`/`$0001` are the 6510 CPU port — reported
 to them as success
 ([#251](https://github.com/JC-000/c64-test-harness/issues/251)). The
-upstream fix (1541ultimate PRs #884/#888: strict hex parsing in
-`readmem`/`writemem`/`debugreg`, HTTP 400 "Invalid address") is in the
-U64E's bce4535e build and, by source, not in the C64U's 1.1.0.
+upstream fix is strict hex parsing in `readmem`/`writemem`/`debugreg`,
+which answers HTTP 400 "Invalid address". The U64E's bce4535e build is
+the merge commit of 1541ultimate PR #884 on the `test-merge` branch, so
+it carries the fix. PR #888 replays the same change onto `master` and is
+not an ancestor of bce4535e; a future C64U (`u64ii`) release would get
+the fix from #888. The C64U's 1.1.0 predates both.
 
 ## Cross-references
 

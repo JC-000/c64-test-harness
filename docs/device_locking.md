@@ -385,5 +385,7 @@ run, and the run is the caller's to scope.
 
 - `docs/u64_recovery.md` — wedge tiers and what to do instead of a
   power-cycle. Read it before concluding a shared device is broken.
-- [`docs/u64_recovery.md`](u64_recovery.md) § "The poweroff guard" — which
-  destructive endpoints recover over the network and which do not.
+- [`docs/u64_recovery.md`](u64_recovery.md) § "Recovery primitives" and
+  § "The poweroff guard" — what `reset()`, `reboot()` and `recover()` do
+  and do not clear, and why `poweroff()` is irrecoverable over the
+  network.
