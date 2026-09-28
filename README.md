@@ -1,118 +1,188 @@
 # c64-test-harness
 
-Reusable test harness for Commodore 64 programs. Automates C64 programs via the VICE emulator's binary monitor protocol, with an architecture that supports real hardware backends.
+Reusable test harness for Commodore 64 programs. One Python API drives two backends:
 
-## Features
+- the **VICE emulator** (`x64sc`, over its binary monitor on TCP), and
+- **Ultimate hardware** over the firmware's `/v1/*` REST API: the Ultimate 64 / U64 Elite on the **3.x** firmware line, and the **C64 Ultimate** on the **1.x** (`u64ii`) line.
 
-- **Transport abstraction** (`C64Transport` Protocol) — write tests once, run on VICE or hardware
-- **Binary monitor transport** — persistent TCP connection via VICE's binary monitor protocol (~0.08ms per command, no write size limits, async breakpoint events)
-- **Wrap-aware screen matching** — search for text that spans 40-column row boundaries
-- **Fast keyboard injection** — batched writes to the keyboard buffer (10x faster than per-character)
-- **Little-endian helpers** — `read_word_le()` / `read_dword_le()` for 6502's native byte order
-- **PRG binary verification** — compare runtime memory against a PRG file to detect corruption
-- **Complete PETSCII/screen code tables** — full 256-entry mappings with extensibility
-- **Disk image management** — create/read/write D64/D71/D81 images via c1541, auto-attach to VICE
-- **Test runner framework** — scenario-based testing with error recovery
-- **Execution control** — load code into RAM, call subroutines via `jsr()`, set breakpoints, patch code at runtime
-- **Multi-instance VICE management** — run multiple emulators concurrently with thread-safe port allocation
-- **Parallel test execution** — distribute tests across a pool of VICE instances via `run_parallel()`
-- **VICE label file parser** — load cc65/ACME/Kick Assembler label files
-- **Debug utilities** — `dump_screen()` and `hex_dump()` for quick inspection during test runs
-- **Ethernet / CS8900a** — RR-Net-mode ethernet cartridge emulation with TAP interfaces, bridge networking for multi-VICE communication, auto-generated unique MAC addresses per instance
-- **SID playback** — cross-backend `play_sid()` dispatches to VICE (IRQ stub) or Ultimate 64 (native firmware endpoint); PSID/RSID parser
-- **Audio capture** — headless WAV recording via VICE (`render_wav()`) and U64 UDP audio stream (`capture_sid_u64()`, `AudioCapture`)
-- **U64 data streams** — cycle-accurate 6510/VIC bus trace (`DebugCapture`), VIC-II video frame capture (`VideoCapture`), audio capture — all over UDP with gap detection
-- **Runtime warp toggle** — enable/disable VICE warp mode at runtime on any VICE target (real warp via the text monitor when connected, `Speed`-resource pseudo-warp over the binary monitor otherwise); `resource_get`/`resource_set` for general VICE resource control
-- **VICE single-step / snapshots / trace** — `single_step` / `step_out`, conditional breakpoints (`set_condition`), instruction history (`cpu_history`, VICE 3.10+), `dump_snapshot`/`undump_snapshot`, `banks_available` / `registers_available` introspection
-- **Input simulation & display capture** — cross-backend `inject_joystick` (active-high: bit set = pressed; the U64 backend inverts for its active-low CIA ports internally), `inject_userport` (VICE); `read_framebuffer` + `read_palette` for raw VIC capture
-- **Cross-backend snapshots** — `extract_snapshot` / `restore_snapshot` move RAM (+ optional REU contents) between VICE and U64 via VICE's native `.vsf` format; restore skips the live I/O window `$D000-$DFFF` except color RAM (see [docs/snapshot_interop.md](docs/snapshot_interop.md)). **Not a verified round-trip in both directions.** VICE-side extract was broken for the life of the feature — `read_memory(0x0000, 65536)` always raised, because VICE returns the MEM_GET payload length through a `uint16` and 65536 truncates to 0, so VICE had in fact never produced a snapshot. That is fixed and covered by `tests/test_vice_binary.py::TestFullAddressSpaceRead`. The U64 extract side has no such live coverage yet, so treat U64→VICE as the direction this suite actually demonstrates
-- **VICE deterministic test setup** — event replay (`event_snapshot_mode` → `EventStartMode` 0-3, `event_snapshot_dir`, `event_image_include`), `seed` for RNG (emitted before VICE's pre-UI argv scan, which is the only place it is honoured), `sound_record_driver`/`_file` → `SoundRecordDeviceName`/`Arg`, `exit_screenshot`. There is no `load_snapshot` field: VICE has no `-loadsnapshot` flag, so load a `.vsf` through the monitor's `undump_snapshot()`. Event *recording* likewise has no CLI entry point in VICE 3.10
-- **VICE text-monitor extras** — `detach_drive`, `attach_drive`, `screenshot_to_file`, 6502 profiler (`profile_start`/`profile_stop`/`profile_dump`)
-- **U64 drive & disk fixtures** — `drive_on/off/reset/set_mode/load_rom`, `create_d64/d71/d81/dnp` blank-image creation, `file_info`, `get_debug_register`/`set_debug_register` ($D7FF), `measure_bus_timing` (VCD), batch `set_config_items_batch`
-- **U64 SocketDMA client** — `SocketDMAClient` on TCP 64 wraps capabilities REST does not expose: `inject_keys`, `reu_write`, `dma_load`/`dma_jump`/`dma_write`, `reset`, plus UDP identify-broadcast for LAN device discovery
-- **U64 syslog listener** — `U64SyslogListener` consumes UDP 514 raw-line syslog from the firmware; `wait_for(predicate)` for assertion-driven tests
-- **U64 robust recovery** — `recover()` escalates `reset()` -> probe -> `reboot()` -> probe to clear CPU/FPGA/REU stuck states, and `runner_health_check()` raises `Ultimate64RunnerStuckError` on the firmware's "Cannot open file" wedged-runner signature (never calls `poweroff()`)
-- **Cross-backend `run_subroutine()`** — single primitive for short routines that dispatches to VICE `jsr()` (binary-monitor checkpoint) or U64 sentinel-trampoline + host poll (`poll_cadence` knob for sub-ms targets); `target.client` accessor returns the underlying `Ultimate64Client` on U64-backed targets
-- **`run_prg_via_sys(target, prg)`** — loads a PRG by `write_memory` and starts it with a typed `SYS` (entry parsed from the BASIC stub by `parse_basic_sys_address`, or `sys_addr=`), then resumes; the load path that keeps an external cartridge on the U64's bus: the firmware's runner load (`run_prg`/`load_prg`) deselects it stickily across resets until `Cartridge Preference` is re-PUT, which this helper does (#211, #217). Works on both backends.
-- **Ultimate64Client robustness** — public `send_text(text, *, finish_with_return=True)` for KERNAL keyboard-buffer injection (waits for the buffer to fully drain — `$C6 == 0` — before each chunk, so keystrokes can't land at stale offsets); `run_prg(..., fallback_on_404=True)` transparently sideloads via `write_mem` when a wedged runner answers HTTP 404 (observed on fw 3.14d; not looked for on other firmware), triggering with `RUN` for `$0801` BASIC-stub PRGs and `SYS <addr>` for pure-ML; connection drops mid-request (reset / broken pipe / truncated response) map to `Ultimate64TimeoutError` and short `readmem` payloads raise `Ultimate64ProtocolError`; `write_mem_query_threshold` is per-instance with auto-detect (128 on firmware without the Temp-folder fix — C64U 1.1.0, or Ultimate-line < 3.15; 48 on Ultimate-line ≥ 3.15) and a kwarg override
-- **Automatic `/Temp` hygiene (firmware predating 1541ultimate#686)** — on a device whose firmware never collects the managed `/Temp` attachments that every body-carrying REST call leaves behind (the C64 Ultimate on 1.1.0; any Ultimate-line < 3.15), enough accumulation wedges the device, recoverable only by a physical power-cycle. `Ultimate64Client` arms a capability-gated hygiene pass automatically on such firmware: it counts attachment-creating requests, runs an FTP-based GC when a per-device budget is reached (counted across every client of that host in the process, #295), on `close()` and on `DeviceLock` release, and refuses further body-carrying calls if the GC cannot run rather than walking the device toward the wedge. What that wedge *is* matters for what the pass can do: the uncollected attachments fill `/Temp`, and when `/Temp` is full the firmware **crashes**. The C64 FPGA keeps running while the firmware stops answering the network *and* stops responding to the physical menu button. No count of uploads before that crash is known, and none is kept (owner ruling, 2026-09-15; #256). The RAM disk is **16 MiB** (because `ramdisk.cc:25` sizes the disk from the linker symbols `__ram_disk_start` / `__ram_disk_limit`, `0x02000000`-`0x03000000` at tag `1.1.0`; the `3 * 1024 * 1024` written beside them is a stale comment — issue #261). The FTP server is part of the firmware that crashes, so the GC is unavailable exactly when a device is wedged: the pass is **prevention only**, `gc_temp_folder` is never a recovery step, and `machine:reboot` does not clear `/Temp` either (it is a C64-level reset; the RAM disk survives it and only a power-on clears it). It stays disarmed on firmware that self-collects (Ultimate-line ≥ 3.15), so there is no behaviour change there. Env: `U64_AUTO_TEMP_GC` (force on/off), `U64_TEMP_GC_BUDGET`, `U64_TEMP_GC_KEEP`, `U64_TEMP_GC_REQUIRED=0` (downgrade the refusal to a warning). See [docs/u64_recovery.md](docs/u64_recovery.md).
-- **Queue-aware device locking** — `DeviceLock` heartbeats the lockfile mtime every ~15 s while held (configurable via `heartbeat_interval`), and `acquire(timeout, *, progress_window=60.0)` extends a waiter's deadline indefinitely against any live, heartbeating holder — so multi-hour holders no longer cause waiter timeouts. `acquire_or_raise()` raises `DeviceLockTimeout` (a `TimeoutError` subclass; exported from the top-level package) with structured diagnostics — holder PID, liveness, lockfile age, REST reachability — and a diagnosed-state message that distinguishes "queued behind live, progressing" / "holder may be wedged" / "stale lock from dead PID" / "no holder metadata" so callers stop conflating "queued" with "device broken". `create_manager(lock_timeout=...)` threads through to `_LockedU64Manager`, which now raises `DeviceLockTimeout` on failure; 60 s default, widen via `lock_timeout=` or `U64_DEVICE_LOCK_TIMEOUT` — though widening is rarely useful with the heartbeat in place. Where no timeout is passed, `U64_DEVICE_LOCK_TIMEOUT` supplies it, read at call time: a budget, not a gate (it changes how long a wait may last, never whether anything runs; unset, `DeviceLock.acquire()` waits 30 s via `DEFAULT_ACQUIRE_TIMEOUT` and `create_manager()` 60 s via `unified_manager.DEFAULT_LOCK_TIMEOUT`; a malformed, non-positive or non-finite value raises `DeviceLockTimeoutConfigError`). A blocked acquire logs a periodic progress line (holder PID, lockfile age, queue depth) and calls `on_wait(elapsed, holder_pid, lockfile_age, queue_depth)` when given one. Another thread can rescue a wait on a lock this thread already holds only within the 2.0 s grace (`_SELF_HELD_WAIT_GRACE`): a longer timeout is capped with a WARNING. Details in `docs/device_locking.md`. Optional `c64-test-harness[notify]` extra adds `watchdog`-based fs-event wakeups
-- **Per-routine capture refresh** — `DebugCapture.with_fresh_fpga(client, *, capture_kwargs=None, reboot_settle_seconds=12.0)` classmethod reboots the U64 before each capture to recover from the UDP debug-stream rate degradation that builds up during sustained workloads (issue #81)
-- **VICE Darwin autostart fix** — `ViceProcess` auto-injects `-autostartprgmode 1` on macOS when `prg_path` is set, unless the caller has already passed `-autostartprgmode` via `extra_args`
-- **Flexible configuration** — `HarnessConfig` with TOML file and environment variable support
+Tests written against the `C64Transport` protocol run unchanged on either one, and `UnifiedManager` / `create_manager()` hand you a ready transport for whichever backend you select. If you are driving an Ultimate device, start with [Choosing a backend](#choosing-a-backend).
 
-## Getting started (fresh Ubuntu 25 machine)
+## Getting started
 
-Supported platforms: **Ubuntu Desktop 25** (primary) and **macOS** (Homebrew-based; Apple Silicon, Tahoe 26.x verified).
+Requirements: Python ≥ 3.10. The package has no runtime dependencies (`pytest` comes with the `dev` extra, `watchdog` with `notify`). The VICE backend needs **VICE 3.10** (`x64sc` and `c1541`), built with ethernet support if you want the CS8900a tests. The Ultimate backend needs only network reach to the device's REST API. VICE is not required for hardware-only use.
 
-On a clean Ubuntu Desktop 25 box, one command gets you from zero to a working dev environment:
+The canonical venv lives **outside the repo**, at `~/.local/share/c64-test-harness/venv`, on both platforms. The docs and helper scripts assume that path.
+
+### macOS (Homebrew): the primary, current path
+
+This is how the project's dev machine is set up. It was last checked on 2026-09-28:
+
+- macOS 27.0 (build 26A428), Apple Silicon (arm64);
+- Homebrew `vice` 3.10 at `/opt/homebrew/bin/x64sc` and `c1541`, where `x64sc -features` reports `HAVE_RAWNET yes` / `HAVE_PCAP yes`;
+- the venv on Homebrew `python@3.13` (3.13.13).
 
 ```bash
-./scripts/setup-dev-env.sh
+brew install vice python@3.13
+
+# Create the venv from a Python >= 3.10. The Xcode /usr/bin/python3 is 3.9 and too old.
+/opt/homebrew/opt/python@3.13/bin/python3.13 -m venv --system-site-packages \
+    ~/.local/share/c64-test-harness/venv
+~/.local/share/c64-test-harness/venv/bin/pip install -e '.[dev]'
+
+# Read-only check. --no-u64 keeps it off the network.
+./scripts/verify-dev-env.sh --no-u64
+
+# Optional: make the c64-test Claude Code skill available in every project.
+./scripts/install-skill.sh
 ```
 
-The installer runs six stages — system packages, VICE 3.10 source build with `--enable-ethernet`, editable harness install, bridge networking, optional Ultimate 64 probe, and a final `verify-dev-env.sh` run — and every stage is idempotent and opt-out via `--no-*` flags. Pass `--dry-run` first to preview exactly what it will do without touching anything:
+The Homebrew bottle already carries ethernet support, so you do not need a source build of VICE. The ethernet/bridge tests need three more steps. All are optional, and [docs/development.md § macOS (Homebrew)](docs/development.md#macos-homebrew) has them in full:
+
+- `sudo ./scripts/setup-bridge-feth-macos.sh` creates `bridge10` + `feth0`/`feth1`, the macOS counterpart of Linux's `br-c64` + `tap-c64-{0,1}`. See [docs/bridge_networking.md](docs/bridge_networking.md).
+- `sudo chmod o+rw /dev/bpf*` gives host-side capture access to the BPF nodes. The change is lost on reboot, and it must also cover `bpf4` and up on a machine where other rigs hold BPF nodes.
+- A NOPASSWD sudoers drop-in for the three bridge scripts and for `/opt/homebrew/bin/x64sc`. On macOS, VICE's pcap driver needs **root**, and the harness launches it with `sudo -n`. Without the entry, an ethernet launch is refused up front with `ViceElevationRequiredError`, which prints the exact sudoers line to add.
+
+`scripts/setup-dev-env.sh` also has a macOS branch (`brew install vice`, the venv, the feth bridge), added 2026-04-19. The setup above is the one in use, not that script. The script builds the venv from whichever `python3` is first on `PATH`, so check that it is ≥ 3.10 before relying on it.
+
+### Ubuntu 25: secondary, last verified April 2026
+
+> **Not re-verified since April 2026.** The installer's Linux path was last changed on 2026-04-11 (`5242a8f`, fixes for three failures seen on a fresh Ubuntu 25 VM). The only change since was the macOS dispatch on 2026-04-19. No Linux run of it is recorded after that, so expect package-name drift.
 
 ```bash
-./scripts/setup-dev-env.sh --dry-run
+./scripts/setup-dev-env.sh --dry-run   # preview every action; changes nothing
+./scripts/setup-dev-env.sh             # apt packages, VICE 3.10 source build with --enable-ethernet,
+                                       # venv + editable install, bridge/TAP setup, final verify
 ```
 
-See [docs/development.md](docs/development.md) for the full stage breakdown, opt-out flags, and how to recover if a stage fails.
+Every stage is idempotent and can be skipped with a `--no-*` flag. The venv is mandatory on Ubuntu 23+, where PEP 668 blocks `pip install` against the system Python. Distro VICE packages usually lack `--enable-ethernet`, which is why the installer builds from source. Stage table, flags, recovery and the manual route are in [docs/development.md](docs/development.md#ubuntu-25-scriptssetup-dev-envsh).
 
-**macOS:** there is no one-shot installer — the flow is a short manual sequence (`brew install vice`, create the venv at `~/.local/share/c64-test-harness/venv`, `pip install -e .`, then `sudo scripts/setup-bridge-feth-macos.sh` if you want the bridge tests). See [docs/development.md#macos-homebrew](docs/development.md#macos-homebrew) for the step-by-step, and [docs/bridge_networking.md](docs/bridge_networking.md) for the `feth0`/`feth1` + `bridge10` layout that is the macOS counterpart to `tap-c64-{0,1}` + `br-c64`.
+### Verifying your dev environment
 
-## Installation
-
-On Ubuntu 23+ (including Ubuntu 25), PEP 668 / `externally-managed-environment` blocks `pip install` against system Python, so install into a venv:
-
-```bash
-python3 -m venv --system-site-packages ~/.local/share/c64-test-harness/venv
-~/.local/share/c64-test-harness/venv/bin/pip install -e .
-source ~/.local/share/c64-test-harness/venv/bin/activate
-```
-
-Requires Python 3.10+. Zero runtime dependencies. (If you used `scripts/setup-dev-env.sh`, the venv is already created for you at the same path; just `source` its `activate`.)
-
-## Verifying your dev environment
-
-Before running the full test suite (which needs VICE 3.10 built with ethernet support, bridge networking, and optionally an Ultimate 64 device), run the non-destructive environment check:
-
-```bash
-./scripts/verify-dev-env.sh
-```
-
-The script is **read-only**: it never launches VICE (only `--version` / `--help`), never runs pytest, never mutates networking, and never touches anything outside the repo. It reports presence of `x64sc`/`c1541`, whether VICE was built with `--enable-ethernet` (the main deployability blocker — distro packages usually omit it), Python harness import, bridge interfaces (`br-c64`, `tap-c64-*`), and optionally probes an Ultimate 64 over `/v1/version` when `U64_HOST` is set.
+`./scripts/verify-dev-env.sh` is read-only and works on both platforms. It never starts an emulator session: it runs only `x64sc --version`, `--help`, and `-features` as a macOS fallback, plus `c1541 --version`. It never runs pytest and never changes network state. It probes an Ultimate device (`GET /v1/version`) only when `U64_HOST` or `--u64-host` is set, and `--no-u64` turns that probe off. On macOS it checks `ifconfig`, `/dev/bpf0` readability, NOPASSWD rules for the three bridge scripts and `/opt/homebrew/bin/x64sc`, and `bridge10`/`feth0`/`feth1`. On Linux it checks `ip`, `iptables`, `/dev/net/tun` and `br-c64`/`tap-c64-*`. Output from the dev machine above (2026-09-28, bridge not set up):
 
 ```
-c64-test-harness dev environment check
-=======================================
-
 [VICE]
-  ✓ x64sc on PATH (/usr/local/bin/x64sc)
-  ✓ VICE version (VICE 3.10)
+  ✓ x64sc on PATH (/opt/homebrew/bin/x64sc)
+  ✓ VICE version (VICE 3.10 [via brew; --version broken on macOS 26])
   ✓ ethernet cart support (ethernet flags found in --help)
   ✓ binary monitor support (-binarymonitor flag present)
   ✓ text monitor support (-remotemonitor flag present)
   ✓ c1541 on PATH (present)
 
 [Python]
-  ✓ python3 >= 3.10 (3.13.7)
-  ✓ c64_test_harness importable (version unknown)
-  ✓ pytest available (8.3.5)
+  ✓ python3 >= 3.10 (3.13.13 [harness venv: ~/.local/share/c64-test-harness/venv/bin/python3])
+  ✓ c64_test_harness importable (version 0.11.3 [harness venv])
+  ✓ pytest available (9.0.3)
+
+[System tools]
+  ✓ ifconfig command (/sbin/ifconfig)
+  ✓ /dev/bpf0 readable (BPF devices user-readable (pcap ready))
+  ⚠ NOPASSWD sudo for setup-bridge-feth-macos.sh (no NOPASSWD entry (bridge setup will prompt for a password))
+  ...
+  ✓ NOPASSWD sudo for x64sc (NOPASSWD rule names /opt/homebrew/bin/x64sc)
 
 [Bridge networking]
-  ✗ br-c64 bridge (not found)
-  ✗ tap-c64-0 (not found)
-  ✗ tap-c64-1 (not found)
+  ✗ bridge10 (not found)
+  ...
 
-[Fix hints]
-  -> Run: sudo ./scripts/setup-bridge-tap.sh
-
-Summary: 15 ok, 3 missing, 1 skipped
+Summary: 14 ok, 3 missing, 1 skipped, 3 warn
 Overall: READY (with optional gaps)
 ```
 
-Options: `--quiet` (failures + summary only), `--json` (machine-readable), `--no-u64` (skip the U64 probe), `--u64-host HOST` (override `$U64_HOST`). Exit codes: `0` READY (optional gaps OK), `1` NOT READY (a critical check failed), `2` script error. See [docs/development.md](docs/development.md) for details.
+The `--version broken` note is expected: the Homebrew build's `x64sc --version` exits early, so the script falls back to Homebrew's metadata. The reported harness version comes from the installed package metadata, so it lags `pyproject.toml` until you re-run `pip install -e .`.
+
+The VICE checks are **critical**, so a hardware-only machine without VICE reports NOT READY even though the Ultimate backend works. Options: `--quiet`, `--json`, `--no-u64`, `--u64-host HOST`. Exit codes: `0` READY, `1` NOT READY, `2` script error. Details are in [docs/development.md](docs/development.md#quick-check-scriptsverify-dev-envsh).
+
+## Choosing a backend
+
+`create_manager()` reads `C64_BACKEND` (`vice`, the default, or `u64`). For hardware it also reads `U64_HOST` (comma-separated for a pool of devices) and `U64_PASSWORD`. You can pass the same things as arguments: `create_manager(backend="u64", u64_hosts="<device>")`.
+
+```python
+from c64_test_harness import create_manager, wait_for_text, send_text
+
+# C64_BACKEND=u64 U64_HOST=<device> python3 my_test.py   (or unset for VICE)
+with create_manager() as mgr:
+    with mgr.instance() as target:            # target.backend is "vice" or "u64"
+        wait_for_text(target.transport, "READY.", timeout=30)
+        send_text(target.transport, "PRINT 2+2\r")
+        wait_for_text(target.transport, " 4", timeout=10)
+```
+
+When the U64 backend is selected, the manager holds the device's cross-process `DeviceLock` for as long as you hold the target. On a U64E it also resets the covered config categories to the factory defaults on entry ([Unified Backend Manager](#unified-backend-manager)). A U64-only setup does not need VICE: the package imports and drives hardware without `x64sc` or `c1541` installed.
+
+Hardware reading, in order:
+
+- [Ultimate 64 Hardware Backend](#ultimate-64-hardware-backend): the transport, pooling, locking, config helpers and what is VICE-only.
+- [docs/device_locking.md](docs/device_locking.md): the shared-device contract. Any tool that touches a shared device takes its lock first.
+- [docs/u64_recovery.md](docs/u64_recovery.md): wedge tiers, recovery primitives, and the `/Temp` hygiene.
+- **C64 Ultimate (firmware 1.1.0):** this firmware predates upstream 1541ultimate#686. It never collects the `/Temp` attachments that body-carrying REST calls leave behind, and a full `/Temp` crashes the firmware until someone power-cycles it. The harness arms its own hygiene pass on such firmware automatically; read [docs/u64_recovery.md](docs/u64_recovery.md) before looping uploads against one.
+
+## Features
+
+### Both backends
+
+- **Transport abstraction** (`C64Transport` Protocol): write tests once, run them on VICE or hardware.
+- **Backend-agnostic acquisition:** `UnifiedManager` / `create_manager()` return a `TestTarget` (`.transport`, `.backend`, `.pid`; `.client` returns the `Ultimate64Client` on U64 targets).
+- **Wrap-aware screen matching:** search for text that spans 40-column row boundaries (`ScreenGrid`, `wait_for_text`, `wait_for_stable`).
+- **Fast keyboard injection:** batched writes to the keyboard buffer, about 10x faster than one key at a time.
+- **Memory helpers:** `read_bytes` / `write_bytes`, plus `read_word_le()` / `read_dword_le()` for the 6502's little-endian byte order.
+- **`MemoryPolicy`:** a transport-level guard that refuses host writes into your program's memory ([below](#memory-safety-memorypolicy)).
+- **PRG binary verification:** compare runtime memory against a PRG file to detect corruption.
+- **Complete PETSCII/screen code tables:** full 256-entry mappings, extensible.
+- **Test runner framework:** scenario-based testing with error recovery.
+- **Parallel test execution:** `run_parallel()` distributes tests across a pool of VICE instances or Ultimate devices.
+- **Cross-backend `run_subroutine()`:** one primitive for short routines. On VICE it uses `jsr()` (a binary-monitor checkpoint). On a U64 it uses a sentinel trampoline and a host poll (`poll_cadence` knob for sub-ms targets).
+- **`run_prg_via_sys(target, prg)`:** loads a PRG with `write_memory` and starts it with a typed `SYS`, then resumes. The entry address comes from the BASIC stub (`parse_basic_sys_address`) or from `sys_addr=`. On the U64 this is the load path that keeps an external cartridge on the bus. The firmware's runner load (`run_prg` / `load_prg`) deselects it, stickily across resets, until `Cartridge Preference` is re-PUT, and this helper does that re-PUT (#211, #217).
+- **SID playback:** `play_sid()` dispatches to VICE (IRQ stub) or the Ultimate's native `sidplay` runner. Includes a PSID/RSID parser.
+- **Input simulation & display capture:** `inject_joystick` works on both backends (active-high: bit set = pressed; the U64 backend inverts internally for its active-low CIA ports). `inject_userport` is VICE-only. `read_framebuffer` + `read_palette` give raw VIC capture.
+- **Cross-backend snapshots:** `extract_snapshot` / `restore_snapshot` move RAM (plus optional REU contents) between VICE and U64 through VICE's native `.vsf` format. Restore skips the live I/O window `$D000-$DFFF`, except color RAM. **The round trip has not been verified in both directions.** VICE-side extract was broken for the life of the feature: `read_memory(0x0000, 65536)` always raised, because VICE returns the MEM_GET payload length through a `uint16` and 65536 truncates to 0, so VICE had never actually produced a snapshot. That is fixed and covered by `tests/test_vice_binary.py::TestFullAddressSpaceRead`. The U64 extract side has no such live coverage yet, so treat U64→VICE as the direction this suite actually demonstrates. See [docs/snapshot_interop.md](docs/snapshot_interop.md).
+- **Flexible configuration:** `HarnessConfig` with TOML file and environment variable support.
+
+### VICE emulator
+
+- **Binary monitor transport:** a persistent TCP connection over VICE's binary monitor protocol (~0.08 ms per command, no write size limits, async breakpoint events).
+- **Execution control:** load code into RAM, call subroutines with `jsr()`, set breakpoints, and patch code at runtime.
+- **Multi-instance VICE management:** run several emulators at once with thread-safe, cross-process port allocation.
+- **VICE label file parser:** load cc65/ACME/Kick Assembler label files.
+- **Debug utilities:** `dump_screen()` and `hex_dump()` for quick inspection during test runs.
+- **Disk image management:** create, read and write D64/D71/D81 images via `c1541`, with auto-attach to VICE.
+- **Ethernet / CS8900a:** RR-Net-mode ethernet cartridge emulation on TAP (Linux) or `feth` (macOS) interfaces, bridge networking for multi-VICE communication, and an auto-generated unique MAC per instance. A real RR-Net on the U64 is covered in [Ethernet / CS8900a Testing](#ethernet--cs8900a-testing).
+- **Headless audio render:** `render_wav()` records WAV without a visible window.
+- **Runtime warp toggle:** turn warp on or off at runtime. With the text monitor connected this is real warp; over the binary monitor alone it falls back to a `Speed`-resource pseudo-warp. `resource_get` / `resource_set` give general control of VICE resources.
+- **Single-step / snapshots / trace:** `single_step` / `step_out`, conditional breakpoints (`set_condition`), instruction history (`cpu_history`, VICE 3.10+), `dump_snapshot` / `undump_snapshot`, and `banks_available` / `registers_available` introspection.
+- **Deterministic test setup:**
+  - Event replay: `event_snapshot_mode` → `EventStartMode` 0-3, plus `event_snapshot_dir` and `event_image_include`. Event *recording* has no CLI entry point in VICE 3.10.
+  - `seed` for the RNG. It is emitted before VICE's pre-UI argv scan, the only place VICE honours it.
+  - `sound_record_driver` / `_file` → `SoundRecordDeviceName` / `Arg`.
+  - `exit_screenshot`.
+  - There is no `load_snapshot` field, because VICE has no `-loadsnapshot` flag. Load a `.vsf` through the monitor's `undump_snapshot()`.
+- **Text-monitor extras:** `detach_drive`, `attach_drive`, `screenshot_to_file`, and a 6502 profiler (`profile_start` / `profile_stop` / `profile_dump`).
+- **PRG autostart mode pinned:** `ViceProcess` passes `-autostartprgmode 1` (inject into RAM) on every launch unless `extra_args` already carries `-autostartprgmode`. VICE's factory default is disk-image autostart.
+
+### Ultimate hardware (U64 / U64E fw 3.x, C64 Ultimate fw 1.x)
+
+- **REST transport:** `Ultimate64Transport` provides memory, screen, keyboard and reset over HTTP. `Ultimate64InstanceManager` pools several devices and works with `run_parallel()`.
+- **Queue-aware device locking:** `DeviceLock` serializes access to a shared device across processes. It heartbeats while held, so a waiter queued behind a live, progressing holder keeps waiting instead of timing out. A chain of holders handing the lock on is capped (`_MAX_HOLDER_HANDOFFS`). `acquire_or_raise()` raises `DeviceLockTimeout`, whose message says whether you are queued, the holder looks wedged, or the lock is stale. `U64_DEVICE_LOCK_TIMEOUT` is a wait budget, not a gate. The optional `c64-test-harness[notify]` extra adds `watchdog`-based wakeups. Full contract in [docs/device_locking.md](docs/device_locking.md).
+- **Known state on entry:** `apply_factory_baseline()` resets the covered config categories to the firmware's defaults and asserts `current == default`. The manager runs it at `acquire()` on a U64E ([below](#unified-backend-manager)).
+- **Automatic `/Temp` hygiene on leak-prone firmware** (C64 Ultimate 1.1.0; any Ultimate-line < 3.15):
+  - The client counts attachment-creating requests against a per-device budget and runs an FTP-based GC when the budget is reached, on `close()`, and on `DeviceLock` release.
+  - It refuses further body-carrying calls if the GC cannot run.
+  - The pass is prevention only. Once the firmware has crashed, FTP is gone too, and only a physical power-cycle recovers the device.
+  - It stays disarmed on firmware that collects its own attachments (Ultimate-line ≥ 3.15).
+  - Env knobs `U64_AUTO_TEMP_GC`, `U64_TEMP_GC_BUDGET`, `U64_TEMP_GC_KEEP` and `U64_TEMP_GC_REQUIRED=0` are covered, with the mechanism, in [docs/u64_recovery.md](docs/u64_recovery.md).
+- **`Ultimate64Client` robustness:**
+  - `send_text(text, *, finish_with_return=True)` waits for the KERNAL keyboard buffer to drain (`$C6 == 0`) before each chunk.
+  - `run_prg(..., fallback_on_404=True)` sideloads via `write_mem` when a wedged runner answers HTTP 404 (observed on fw 3.14d).
+  - Connection drops map to `Ultimate64TimeoutError`, and short `readmem` payloads raise `Ultimate64ProtocolError`.
+  - `write_mem_query_threshold` is auto-detected per device: 128 on firmware without the Temp-folder fix, 48 on Ultimate-line ≥ 3.15.
+- **Liveness probe:** `probe_u64()` / `is_u64_reachable()` check reachability (ping → TCP → REST). This is not a health check ([below](#liveness-probe)).
+- **Configuration helpers:** turbo speed (cross-generation CPU-speed probing), REU size, SID sockets and addressing, disk mounting, PRG run/load, and snapshot/restore of device state.
+- **Drive & disk fixtures:** `drive_on/off/reset/set_mode/load_rom`, blank-image creation with `create_d64/d71/d81/dnp`, `file_info`, `get_debug_register` / `set_debug_register` (`$D7FF`), `measure_bus_timing` (VCD), and batch `set_config_items_batch`.
+- **U64 data streams over UDP, with gap detection:** audio (`capture_sid_u64()`, `capture_u64_audio()`, `AudioCapture`), VIC-II video frames (`VideoCapture`), and a cycle-accurate 6510/VIC bus trace (`DebugCapture`). `DebugCapture.with_fresh_fpga(client, *, capture_kwargs=None, reboot_settle_seconds=12.0)` reboots before each capture to recover from the debug-stream rate degradation that builds up under sustained workloads (issue #81).
+- **UCI networking:** TCP/UDP sockets from C64 code through the firmware's lwIP stack ([below](#uci-networking-ultimate-command-interface)).
+- **SocketDMA client:** `SocketDMAClient` on TCP 64 wraps capabilities REST does not expose: `inject_keys`, `reu_write`, `dma_load` / `dma_jump` / `dma_write`, `reset`, plus a UDP identify broadcast for LAN device discovery. The transport's SocketDMA *write fast path* is disabled pending a stability review ([below](#socketdma-write-fast-path)).
+- **Syslog listener:** `U64SyslogListener` (`backends.u64_syslog`) consumes the firmware's UDP 514 raw-line syslog and offers `wait_for(predicate)` for assertion-driven tests.
+- **Recovery:** `recover()` (`backends.ultimate64_helpers`) escalates reset → probe → `reboot()` → probe to clear CPU/FPGA/REU stuck states, and never calls `poweroff()`. `runner_health_check()` raises `Ultimate64RunnerStuckError` on the firmware's "Cannot open file" wedged-runner signature. See [docs/u64_recovery.md](docs/u64_recovery.md).
 
 ## Quick Start
 
@@ -437,6 +507,7 @@ print(hex_dump(transport, 0x0400, 64))
 The `TestRunner` executes named scenarios sequentially with optional recovery between tests:
 
 ```python
+import sys
 from c64_test_harness import TestRunner
 
 runner = TestRunner()
@@ -447,7 +518,7 @@ runner.print_summary()
 sys.exit(runner.exit_code)
 ```
 
-Each scenario is a `(name, run_fn, recovery_fn)` tuple. If a test raises an exception, the runner calls the recovery function before continuing with the next scenario.
+`run_fn` returns `(ok, message)`, and `recovery_fn` is optional. If `run_fn` returns `ok=False` or raises (recorded as `FAIL` / `ERROR`), the runner calls the recovery function before it moves on to the next scenario.
 
 ## Configuration
 
@@ -459,7 +530,8 @@ from c64_test_harness import HarnessConfig
 # From a TOML file
 config = HarnessConfig.from_toml("c64_harness.toml")
 
-# From environment variables (C64_VICE_PORT, C64_VICE_HOST, etc.)
+# From environment variables: C64TEST_ + the upper-cased field name
+# (C64TEST_VICE_PORT, C64TEST_VICE_HOST, ...)
 config = HarnessConfig.from_env()
 
 # Or construct directly with defaults
@@ -495,7 +567,7 @@ finally:
     transport.close()
 ```
 
-**Large single-call `write_memory()` on hardware is not byte-verified.** `Ultimate64Client.write_mem`'s POST form declares no upper bound and is verified only to 2048 bytes (`backends/ultimate64_client.py:1371`); a 47 kB body written in one call came back with exactly one wrong byte at a different offset each time, while the same bytes through `write_bytes()` (84-byte chunks at the time; it now chunks at the transport's threshold, #252) were byte-exact (issue #231, U64E fw `v3.15-78-g71480a9d`, n=2 — sporadic, so absence in a given run proves nothing). Verify large writes, or chunk them.
+**Large single-call `write_memory()` on hardware is not byte-verified.** `Ultimate64Client.write_mem`'s POST form declares no upper bound and is verified only to 2048 bytes (the `Ultimate64Client.write_mem` docstring); a 47 kB body written in one call came back with exactly one wrong byte at a different offset each time, while the same bytes through `write_bytes()` (84-byte chunks at the time; it now chunks at the transport's threshold, #252) were byte-exact (issue #231, U64E fw `v3.15-78-g71480a9d`, n=2 — sporadic, so absence in a given run proves nothing). Verify large writes, or chunk them.
 
 Multiple devices can be pooled with `Ultimate64InstanceManager` — the same pattern as `ViceInstanceManager`, compatible with `run_parallel()`:
 
@@ -526,11 +598,20 @@ with create_manager() as mgr:
         print(f"Backend: {target.backend}, PID: {target.pid}")
 ```
 
-Environment variables: `C64_BACKEND` (`vice` or `u64`), `U64_HOST` (comma-separated for multiple devices), `U64_PASSWORD`.
+Environment variables: `C64_BACKEND` (`vice` or `u64`; `"auto"` with the variable unset means `vice`, so a hardware-only lane must set it or pass `backend="u64"`), `U64_HOST` (comma-separated for multiple devices), `U64_PASSWORD`.
 
 When the U64 backend is selected, `UnifiedManager` automatically wraps device access with `DeviceLock` — an `fcntl.flock`-based cross-process lock that serializes access to each physical device. Multiple independent agents (separate OS processes) can safely target the same U64 without coordination; the lock file queues them automatically. This is the same kernel-enforced locking pattern used by `PortLock` for VICE port allocation.
 
-**Known state on entry (issues #227, #285).** Setup is verifiable, teardown is not: a killed run restores nothing, and on a shared device the previous lane's turbo, REU size, SID map or `Cartridge Preference` is what the next lane inherits. So every `acquire()` on the U64 backend runs `apply_factory_baseline(client)` right after the `DeviceLock` is taken and before the target is handed out: a per-category `PUT /v1/configs/<category>:reset_to_default` over the covered stores in `BASELINE_CATEGORIES` (machine/SID-addressing/audio/drive/tape/printer/LED/modem/UI, plus the C64U-only speaker mixer and keyboard lighting), then an assertion that every item reads `current == default` — the firmware's own `default` from the item map, so there is no harness-owned table and a firmware release that moves a default is a deliberate bench change, not drift. **Reset, then assert:** drift found *before* the reset is the ordinary shared-device state and is logged per item at INFO ("inherited drift"); a mismatch *after* the reset means the reset did not take and raises `U64BaselineError` naming category, item, current and default. The reset is memory-only (flash untouched; a reboot reloads flash), and it never uses the global `configs:reset_to_default` route and never touches a store in `BASELINE_NEVER_TOUCH` (each with its reason, refused as an argument before any request): `Ethernet Settings` (the reset drops the DHCP lease mid-request: `effectuate_settings` → `dhcp_stop()` → `dhcp_release_and_stop` zeroes the address the request arrived on; the guard that makes it a live no-op arrived post-tag in `6b5ffc21` and exists only on this bench's U64E fork build, so it must never be generalised — and tests must never configure a static address, which takes the same path's `else` branch), `Network Settings` (blanks the password and syslog server, restores the hostname, and *re-enables* every service — Ident/DMA, Telnet, FTP, Web, SNTP), the WiFi store (device-loss risk: the C64U is reached over WiFi whose reconnection after a power cycle is known unreliable — owner testimony, 2026-09-11 — with no remote remedy if it does not come back), **`SID Sockets Configuration`** (its `effectuate` after a reset writes regulator bits 0 to the PLD SIDCTRL/I2C — measured on the U64E, n=3: all six detection items flip and the socketed SIDs lose power while the report reads clean; detection never re-runs over REST, and the recovery PUT of the detected values would on a 6581 bench apply socket voltage without the human 12 V approval, `u64_config.cc:698-705`, `744-800`) and **`Clock Settings`** (the RTC: `effectuate` is empty so a reset shows neither drift nor mismatch — RAM already reads the 2015 defaults — while arming the next PUT to write them to the chip, `rtc.cc:350-409`). Categories the device does not list (the C64 Ultimate's set differs) are skipped with a log line. A post-reset mismatch on an item whose value is detection-derived rather than a reset product can be exempted for a run with `exempt=[(category, item)]` (listed under `report.detection_derived`, never compared or PUT); the error message says so. **Whether it runs is resolved at `acquire()` from the device's generation, not from a flag** (#285, closing #266): `BASELINE_ON_ENTRY_DEFAULT_BY_GENERATION` is on for the U64E, off for the C64U, off for an unreadable generation (`unknown`, #262 — never arm a reset on a device the harness failed to identify). The C64U is off for the WiFi reason above, not for `/Temp`: every request the reset makes is bodyless and costs no attachment. `U64_BASELINE_ON_ENTRY=1`/`=0` overrides either way (that is how a C64U is opted in, for somebody at the bench — the manager logs a WARNING when it happens) and an explicit `baseline_on_entry=` beats both; off means no requests at all, and the resolved value plus what decided it is logged at INFO on every acquire. `apply_factory_baseline(client, dry_run=True)` returns the `BaselineReport` (what drifted, what was reset, what still mismatches, what was exempt, what was skipped) without writing. `U64_BASELINE_ON_ENTRY` is the one switch for both the manager and `HarnessConfig.from_env()`, resolved through one precedence (`C64TEST_U64_BASELINE_ON_ENTRY`, which every field has by convention, wins if both are set); `HarnessConfig.u64_baseline_on_entry` is tri-state — `None` means "nobody asked" and is resolved at acquire time, so `UnifiedManager(..., baseline_on_entry=cfg.u64_baseline_on_entry)` keeps the shell switch working instead of turning an inherited default into an explicit request, and a TOML `false` is an explicit off. `snapshot_state`/`restore_state` stay as the courtesy on exit. Live coverage: `tests/test_entry_baseline_live.py` (`U64_BASELINE_LIVE=1`) and the flash-vs-default instrument `tests/test_flash_baseline_live.py` (`FLASH_BASELINE_LIVE=1`), both with `U64_HOST` and `U64_ALLOW_MUTATE=1`.
+**Known state on entry (issues #227, #285).** Setup can be verified; teardown cannot, because a killed run restores nothing. On a shared device, the previous lane's turbo, REU size, SID map or `Cartridge Preference` is what the next lane inherits.
+
+- **What runs.** `acquire()` on the U64 backend runs `apply_factory_baseline(client)` after the `DeviceLock` is taken and before the target is handed out. That is a per-category `PUT /v1/configs/<category>:reset_to_default` over the stores in `BASELINE_CATEGORIES`: machine, SID addressing, audio, drive, tape, printer, LED, modem and UI, plus the C64U-only speaker mixer and keyboard lighting. It then asserts that every item reads `current == default`, using the firmware's own `default`.
+- **Drift versus failure.** Drift found before the reset is logged at INFO. A mismatch after the reset raises `U64BaselineError`.
+- **Memory only.** The reset leaves flash untouched.
+- **What it never touches.** It never sends the global `configs:reset_to_default` route, and never touches a `BASELINE_NEVER_TOUCH` store: `Ethernet Settings`, `Network Settings`, the WiFi store, `SID Sockets Configuration`, `Clock Settings`. Each is refused with its reason before any request goes out. A PUT restoring detected SID-socket values would also apply socket voltage on a 6581 bench without the human 12 V approval (`u64_config.cc:698-705`).
+- **When it runs.** This is resolved at `acquire()` from the device's generation (`BASELINE_ON_ENTRY_DEFAULT_BY_GENERATION`): on for the U64E, off for the C64U (WiFi device-loss risk, not `/Temp`), and off for an unreadable generation. `U64_BASELINE_ON_ENTRY=1`/`=0` overrides it either way, and an explicit `baseline_on_entry=` beats both. `HarnessConfig.u64_baseline_on_entry` is tri-state, with `None` meaning "nobody asked".
+- **Previewing and exempting.** `apply_factory_baseline(client, dry_run=True)` returns the `BaselineReport` without writing. `exempt=[(category, item)]` skips a detection-derived item.
+
+The reasons for each never-touch store, the precedence rules and the live coverage (`U64_BASELINE_LIVE`, `FLASH_BASELINE_LIVE`) are in [docs/development.md § Live tests reconcile at entry](docs/development.md#live-tests-reconcile-at-entry-they-do-not-rely-on-the-last-runs-teardown). `snapshot_state`/`restore_state` remain the courtesy on exit.
 
 ### Shared-device contract (`DeviceLock`)
 
@@ -590,13 +671,13 @@ if is_u64_reachable("<device>"):
 
 # Detailed probe: ICMP ping -> TCP connect -> REST API check
 result = probe_u64("<device>")
-print(result.summary)  # "U64 at <device>: reachable (ping=1.2ms, port=0.8ms, api=5.3ms)"
+print(result.summary)  # "U64 at <device>:80 reachable (1.2ms)" or "... UNREACHABLE: <error>"
 # result.reachable, result.ping_ok, result.port_ok, result.api_ok, result.latency_ms, result.error
 ```
 
 The probe runs with short timeouts (2s ping, 2s TCP, 3s API) and fails fast — if ping fails, TCP and API checks are skipped. `Ultimate64InstanceManager.acquire()` uses the probe internally to skip unreachable devices and try the next one in the pool.
 
-**It is a reachability probe, not a health check.** All three stages are read-only — ICMP ping, TCP connect, `GET /v1/version` (`backends/ultimate64_probe.py:60, :88, :108`) — so a device that answers `/v1/version` while its memory-write path is dead reports `reachable=True` with every sub-check green (issue #241). Do not read a green `reachable` as "writes will work". Pass `check_write=True` to add a write-path check: it reads 8 bytes at `$0334`, writes their inverse with a query-string `PUT /v1/machine:writemem?data=` (no body, so no `/Temp` attachment on any firmware), reads them back and restores the original. It mutates RAM through the raw REST client, so hold the device's `DeviceLock` while it runs; `result.scratch_restored` says whether the bytes were put back. The verdict is `result.write_ok` (`None` when not asked), and `reachable` keeps its reads-only meaning. It checks the PUT path only. A device whose POST `writemem` alone is degraded can pass it, and `Ultimate64Client.liveness_probe()` remains the POST check — on leak-prone firmware that one is not free, since each call leaves `/Temp` attachments behind (issue #250), so reach for it deliberately rather than in a retry loop.
+**It is a reachability probe, not a health check.** All three stages are read-only — ICMP ping, TCP connect, `GET /v1/version` (`ping_host`, `check_port`, `check_api` in `backends/ultimate64_probe.py`) — so a device that answers `/v1/version` while its memory-write path is dead reports `reachable=True` with every sub-check green (issue #241). Do not read a green `reachable` as "writes will work". Pass `check_write=True` to add a write-path check: it reads 8 bytes at `$0334`, writes their inverse with a query-string `PUT /v1/machine:writemem?data=` (no body, so no `/Temp` attachment on any firmware), reads them back and restores the original. It mutates RAM through the raw REST client, so hold the device's `DeviceLock` while it runs; `result.scratch_restored` says whether the bytes were put back. The verdict is `result.write_ok` (`None` when not asked), and `reachable` keeps its reads-only meaning. It checks the PUT path only. A device whose POST `writemem` alone is degraded can pass it, and `Ultimate64Client.liveness_probe()` remains the POST check — on leak-prone firmware that one is not free, since each call leaves `/Temp` attachments behind (issue #250), so reach for it deliberately rather than in a retry loop.
 
 ### Configuration helpers
 
@@ -609,15 +690,20 @@ from c64_test_harness import (
     snapshot_state, restore_state,
 )
 
-set_turbo_mhz(transport, 4)            # superset: 1-6, 8, 10, 12, 14, 16, 20, 24, 32, 40, 48, 64
-set_reu(transport, enabled=True, size_mb=16)
-mount_disk_file(transport, "build/disk.d64", drive="a")
-run_prg_file(transport, "build/app.prg")
+client = transport.client                # the helpers take the Ultimate64Client, not the transport
 
-snap = snapshot_state(transport)        # capture turbo/REU/SID config
+snap = snapshot_state(client)            # capture turbo/REU/SID config
+
+set_turbo_mhz(client, 4)                 # superset: 1-6, 8, 10, 12, 14, 16, 20, 24, 32, 40, 48, 64
+set_reu(client, True, size=16)           # MB int, or the enum string "16 MB"
+mount_disk_file(client, "a", "build/disk.d64")   # drive, then path
+run_prg_file(client, "build/app.prg")
+
 # ... run tests ...
-restore_state(transport, snap)          # put device back as you found it
+restore_state(client, snap)              # put device back as you found it
 ```
+
+`mount_disk_file` and `run_prg_file` upload a body. On leak-prone firmware (the C64 Ultimate on 1.1.0) each such call leaves a `/Temp` attachment that the harness's hygiene pass has to collect. `run_prg_via_sys` loads a PRG with query-string PUTs instead, which leave no attachment.
 
 CPU speeds are validated against the **superset** of enum values across device generations: the Ultimate 64 Elite supports 1–48 MHz including 5; the C64 Ultimate (fw 1.1.0) drops 5 and adds 64. `set_turbo_mhz` probes the connected device's actual `CPU Speed` presets (once, cached per client) and rejects a generation-foreign speed with a local `ValueError` before anything goes on the wire; only when the probe is inconclusive does the request reach the firmware, which rejects it with HTTP 400 (`Ultimate64Error`) — and because CPU Speed is written before Turbo Control is enabled, a rejected speed never leaves turbo half-enabled. The same probe backs `max_cpu_speed_mhz(client)`, so `transport.set_speed(None)` ("max speed") resolves to the device's true maximum — 64 MHz on a C64 Ultimate, 48 MHz on a U64 Elite, with a 48 fallback when the probe is inconclusive. See `tests/test_turbo_contract_live.py` (gated by `TURBO_CONTRACT_LIVE=1` + `U64_HOST` + `U64_ALLOW_MUTATE=1`).
 
@@ -641,7 +727,7 @@ Motivation: on C64 Ultimate fw 1.1.0 the REST `POST writemem` path degrades shar
 
 ### Reset vs Reboot
 
-The Ultimate 64 has two reset modes:
+The Ultimate 64 has two reset modes, available as `Ultimate64Client.reset()` / `.reboot()` and as the helpers `reset(client)` / `reboot(client)` in `c64_test_harness.backends.ultimate64_helpers` (not exported at the package root):
 
 - **`reset(client)`** — Soft C64 reset (6510 CPU only). Fast, but does not re-initialise the cartridge and REU state that `reboot()` does.
 - **`reboot(client)`** — C64-level reset with cartridge and REU re-initialisation (`C64::start_cartridge(NULL)`). **Not a firmware reboot**: the firmware itself keeps running, so config held in firmware RAM, accumulated `/Temp` attachments and the lwIP/UCI stack state all survive it — which is why a reboot clears neither `/Temp` nor a UCI STATE-bit wedge. Takes ~8 seconds. **Required when switching turbo speeds between REU-heavy workloads** — stale DMA state from a prior turbo speed causes hangs after a soft reset.
@@ -652,7 +738,7 @@ The U64 firmware has three independent wedge tiers (REST/writemem, runner subsys
 
 ### DMA Trampoline Pattern (executing code without jsr)
 
-Since the U64 has no CPU register control, use DMA writes to inject and trigger code:
+The U64 has no CPU register control, so code is injected and triggered with DMA writes. For a routine that returns with `RTS`, `run_subroutine(target, addr)` packages this: a sentinel trampoline plus a host poll on the U64, and `jsr()` on VICE. Hand-roll the pattern below only when you need to hijack a program's own main loop:
 
 ```python
 # SENTINEL/TRAMPOLINE are free RAM you pick. main_loop belongs to the
@@ -701,7 +787,7 @@ while transport.read_memory(SENTINEL, 1)[0] != 0x42:
 | 2 | 81.3s | 2.0x |
 | 1 | 163.7s | 1.0x |
 
-**Limitations on hardware:** The REST API does not expose CPU registers or breakpoints. `jsr()`, `wait_for_pc()`, `set_breakpoint()`, and `set_register()` are VICE-only — they are not available on `Ultimate64Transport`. Tests that need register-precise execution control must use the VICE backend. Memory read/write, screen capture, keyboard injection, and screen-text waiting all work identically to VICE.
+**Limitations on hardware:** The REST API does not expose CPU registers or breakpoints. `jsr()`, `wait_for_pc()`, `set_breakpoint()`, and `set_register()` are VICE-only — they are not available on `Ultimate64Transport`. Tests that need register-precise execution control must use the VICE backend. To call a subroutine on both backends, use `run_subroutine(target, addr)`. Memory read/write, screen capture, keyboard injection, and screen-text waiting all work identically to VICE.
 
 ## SID Playback
 
@@ -713,9 +799,9 @@ sid = SidFile.load("song.sid")
 play_sid(transport, sid, song=0)  # works with BinaryViceTransport or Ultimate64Transport
 ```
 
-`SidFile` parses PSID v1-v4 and RSID headers; `build_test_psid()` synthesizes minimal valid PSIDs for tests. `play_sid()` dispatches on transport type — VICE installs an 18-byte 6502 IRQ wrapper stub at `$C000` (configurable via `DEFAULT_STUB_ADDR`) that repoints the KERNAL IRQ vector at `$0314/$0315` through a `JSR play; JMP $EA31` trampoline, driving the tune at 50Hz. Ultimate 64 hands the `.sid` bytes to the native `POST /v1/runners:sidplay` firmware endpoint.
+`SidFile` parses PSID v1-v4 and RSID headers; `build_test_psid()` synthesizes minimal valid PSIDs for tests. `play_sid()` dispatches on transport type — VICE installs an 18-byte 6502 IRQ wrapper stub at `$C000` (configurable via `DEFAULT_STUB_ADDR`) that repoints the KERNAL IRQ vector at `$0314/$0315` through a `JSR play; JMP $EA31` trampoline, driving the tune from the KERNAL jiffy IRQ (~60 Hz). Ultimate 64 hands the `.sid` bytes to the native `POST /v1/runners:sidplay` firmware endpoint.
 
-**VICE limitations:** PSID only — no IRQ-driven RSID support in the stub; `load_addr` must be explicit (the 0x0000 "load-address-in-data" form is not supported here); `play_addr` must be non-zero (the VICE wrapper cannot host sample-driven tunes that have no play routine). Call `stop_sid_vice(transport)` to cleanly silence the SID and restore the original KERNAL IRQ vector.
+**VICE limitations:** PSID only — no IRQ-driven RSID support in the stub (a PSID whose `load_addr` is `0x0000` is fine: the embedded load address is used); `play_addr` must be non-zero (the VICE wrapper cannot host sample-driven tunes that have no play routine). Call `stop_sid_vice(transport)` to cleanly silence the SID and restore the original KERNAL IRQ vector.
 
 **Ultimate 64:** the native `sidplay` runner accepts anything the firmware supports (PSID and RSID, including sample-driven tunes), so on hardware the `play_sid()` call just forwards the file bytes.
 
@@ -811,7 +897,7 @@ Capture SID audio from a U64 via its UDP audio stream:
 from c64_test_harness import capture_sid_u64, SidFile, Ultimate64Client
 
 client = Ultimate64Client(host="<device>")
-sid = SidFile.from_file("tune.sid")
+sid = SidFile.load("tune.sid")
 result = capture_sid_u64(client, sid, out_wav="/tmp/u64_audio.wav", duration_seconds=10.0)
 print(f"{result.packets_received} packets, {result.packets_dropped} dropped")
 ```
@@ -819,12 +905,14 @@ print(f"{result.packets_received} packets, {result.packets_dropped} dropped")
 For low-level control, use `AudioCapture` directly — or `capture_u64_audio()`, which brings the stream up and down around an arbitrary run without resetting the machine (`capture_sid_u64()` resets in its `finally`, which destroys a host-driven run):
 
 ```python
-from c64_test_harness import AudioCapture, capture_u64_audio, U64_NTSC_AUDIO_RATE_HZ
+from c64_test_harness import (
+    capture_u64_audio, run_subroutine, wait_for_text, U64_NTSC_AUDIO_RATE_HZ,
+)
 
-with capture_u64_audio(client, "/tmp/run.wav",
+with capture_u64_audio(target.client, "/tmp/run.wav",
                        sample_rate=U64_NTSC_AUDIO_RATE_HZ) as captured:
-    target.jsr(0xC000)
-    target.wait_for_text("DONE")
+    run_subroutine(target, 0xC000)
+    wait_for_text(target.transport, "DONE")
 assert captured[0].time_base_intact      # every lost packet was zero-filled in place (#410)
 assert captured[0].fill_fraction < 0.05  # zeros are not signal: bound them, or skip filled_frame_ranges
 # A late packet overwrites its own fill and a duplicate is discarded, so
@@ -958,7 +1046,7 @@ UnifiedManager (backend-agnostic)
         +-- DeviceLock      (fcntl.flock cross-process lock per device)
         +-- probe_u64()     (ping + TCP + API liveness check)
 
-TestTarget: backend-agnostic handle (.transport, .backend, .pid)
+TestTarget: backend-agnostic handle (.transport, .backend, .pid; .client on U64)
 create_manager(): factory from env vars (C64_BACKEND, U64_HOST)
 
 Screen/Keyboard/Memory modules sit above the transport:
@@ -970,7 +1058,7 @@ Ethernet:
   ViceConfig: ethernet=True, ethernet_mac auto-assigned by manager
 
 U64 Data Streams (UDP capture):
-  AudioCapture  -> CaptureResult          (port 11001, 48kHz stereo PCM)
+  AudioCapture  -> CaptureResult          (port 11001, stereo PCM, 47940.34 Hz on NTSC)
   VideoCapture  -> VideoCaptureResult      (port 11000, 4-bit VIC-II frames)
   DebugCapture  -> DebugCaptureResult      (port 11002, cycle-accurate bus trace)
 
@@ -1006,7 +1094,7 @@ Additional scripts in `scripts/`:
 |--------|-------------|
 | `scripts/run_parallel_sha256.py` | 3 concurrent VICE instances running SHA-256 validation |
 | `scripts/three_windows.py` | Interactive demo writing user input across 3 VICE windows |
-| `scripts/run_all_tests.py` | Parallel test runner for the full test suite |
+| `scripts/run_all_tests.py` | Legacy phased runner over a hard-coded list of 22 test files, not the full suite (see [Running Tests](#running-tests)) |
 | `scripts/stress_port_allocation.py` | Cross-process port allocation stress test |
 | `scripts/stress_cross_process.py` | Multi-agent VICE instance management stress test (5 phases) |
 | `scripts/probe_u64.py` | Probe an Ultimate 64 device (firmware, endpoints, config surface) |
@@ -1014,75 +1102,66 @@ Additional scripts in `scripts/`:
 | `scripts/bench_x25519_u64_turbo.py` | X25519 benchmark across U64 turbo speeds (1–48 MHz) |
 | `scripts/stress_u64_queue.py` | Cross-process DeviceLock stress test (N workers × M rounds) |
 | `scripts/run_u64_parallel_locked.py` | Run all U64 live tests in parallel files, per-test DeviceLock via conftest |
-| `scripts/play_chromatic_u64.py` | Chromatic scale capture through 4 SID configs on U64 |
+| `scripts/play_chromatic_u64.py` | Build + play a C3-C5 chromatic scale PSID on an Ultimate 64 (`--sid 6581\|8580` instrument parameters, `--save` writes the PSID) |
+| `scripts/run_all_u64_live.py` / `scripts/run_sid_u64_live.py` | Run the live U64 test modules (or the SID module) against a device you name |
 | `scripts/setup-bridge-tap.sh` | Create bridge + 2 TAP interfaces for multi-VICE ethernet |
 | `scripts/teardown-bridge-tap.sh` | Tear down bridge + TAP interfaces |
 | `scripts/cleanup-bridge-networking.sh` | Emergency bridge recovery (scoped VICE kill + iptables/TAP teardown) |
-| `scripts/cleanup_vice_ports.py` | Port-range-scoped VICE killer (resolves PIDs via `/proc/net/tcp`, verifies `comm`, SIGTERM then SIGKILL — never `pkill`) |
+| `scripts/setup-bridge-feth-macos.sh` / `teardown-bridge-feth-macos.sh` / `cleanup-bridge-feth-macos.sh` | macOS counterparts: `bridge10` + `feth0`/`feth1` setup, teardown, and emergency recovery |
+| `scripts/probe-vice-feth.sh` | macOS smoke test that VICE's pcap driver launches against a `feth` interface and serves the binary monitor |
+| `scripts/cleanup_vice_ports.py` | Port-range-scoped VICE killer (resolves PIDs via `/proc/net/tcp` on Linux, `lsof` on macOS; verifies the process name, then SIGTERM, then SIGKILL — never `pkill`) |
 | `scripts/setup-tap-networking.sh` | Create single TAP interface with NAT for VICE ethernet |
 | `scripts/teardown-tap-networking.sh` | Tear down single TAP interface |
 | `scripts/validate_ping.py` | End-to-end ARP + ICMP ping through VICE CS8900a + TAP |
 | `scripts/bridge_ping_demo.py` | Visible two-VICE bridge ping demo (RR-Net, live on-screen counters; supports `--warp` via host-side wall-clock orchestrators) |
 | `scripts/verify_tod_warp.py` | Empirical CIA TOD behavior probe in normal vs warp mode (regression check for the wall-clock timeout design) |
 | `scripts/verify-dev-env.sh` | Non-destructive dev environment check (VICE build flags, Python harness, bridge interfaces, optional U64 probe) |
-| `scripts/setup-dev-env.sh` | Fresh-Ubuntu-25 installer: apt packages, VICE 3.10 source build, harness install, bridge setup, final verify run (idempotent, `--dry-run` safe) |
+| `scripts/setup-dev-env.sh` | Fresh-machine installer. On Ubuntu 25: apt packages, VICE 3.10 source build, harness venv, bridge setup, final verify run. It also has a macOS/Homebrew branch. Idempotent, `--dry-run` safe, and not re-verified since April 2026 (see [Getting started](#getting-started)) |
+| `scripts/install-skill.sh` | Symlink the `c64-test` Claude Code skill into `~/.claude/skills/` (`--dry-run`, `--uninstall`) |
+| `scripts/gen_memory_table.py` | Regenerate / check (`--write` / `--check`) the scratch-address table in `docs/memory_safety.md` from `HARNESS_SCRATCH` |
+
+The remaining scripts in `scripts/` are one-off probes and diagnostics behind specific issues. Each one's docstring says what it measures.
 
 ## Running Tests
 
+The gate is plain pytest from the canonical venv. The repo has no CI, so the local run is the only check.
+
 ```bash
-# Install into a venv (PEP 668 compliant — see Installation above)
-python3 -m venv --system-site-packages ~/.local/share/c64-test-harness/venv
-~/.local/share/c64-test-harness/venv/bin/pip install -e ".[dev]"
-source ~/.local/share/c64-test-harness/venv/bin/activate
+PYTEST=~/.local/share/c64-test-harness/venv/bin/pytest
 
-# Run the full test suite (parallel by default)
-python3 scripts/run_all_tests.py
-
-# Unit tests only (no external tools needed)
-python3 scripts/run_all_tests.py --unit-only
-
-# Sequential with full pytest output
-python3 scripts/run_all_tests.py --serial --verbose
-
-# Control parallelism or filter tests
-python3 scripts/run_all_tests.py --workers 4
-python3 scripts/run_all_tests.py -k "test_config"
+$PYTEST                                   # the whole suite (testpaths = tests)
+$PYTEST tests/test_ultimate64_client.py   # one file
+$PYTEST --collect-only -q                 # collection sanity check, runs nothing
 ```
 
-The test runner organises test files into three phases:
-1. **Unit tests** — run in parallel, no external dependencies
-2. **Integration tests** — needs `c1541` on PATH
-3. **VICE integration tests** — needs `x64sc` + `c1541`, runs serially
+A bare `pytest` is **not** "unit tests only". It collects every module, and the VICE tests skip only when `x64sc` is not on `PATH`, so on a machine with VICE installed it spawns emulators. Do not run two VICE-spawning suites at once on one machine. Ultimate live tests skip unless `U64_HOST` is set, and the ethernet/bridge tests skip unless their elevated prerequisites are present. Pytest prints an `ELEVATION REQUIRED` section with the exact remedy at session end. To turn silent skips into failures, set `C64_REQUIRE_VICE=1` / `C64_REQUIRE_ELEVATION=1` ([docs/development.md](docs/development.md#live-test-gates-c64_require_vice--c64_require_elevation)).
 
-Suites with missing tools are skipped automatically. You can also run tests directly with pytest:
+`scripts/run_all_tests.py` predates most of the suite. It runs a hard-coded list of 22 test files in three phases (unit / `c1541` / VICE) and is not a full-suite runner.
 
 ```bash
-pytest                                   # unit tests only (no VICE needed)
-pytest tests/test_disk_vice.py -v        # VICE disk I/O integration tests
-pytest tests/test_vice_core.py -v        # VICE core module integration tests
-pytest tests/test_vice_binary.py -v      # VICE binary monitor protocol tests
+# Ultimate 64 live tests. Each needs U64_HOST; suites that change device config
+# also need U64_ALLOW_MUTATE=1 (resets, RAM writes and stream start/stop run on
+# U64_HOST alone, #333). No script or live module has a default host: name the
+# device or it refuses with exit 2 / skips (#243, #275).
+U64_HOST=<device> U64_ALLOW_MUTATE=1 $PYTEST tests/test_u64_feature_parity_live.py -v
+TURBO_CONTRACT_LIVE=1 U64_HOST=<device> U64_ALLOW_MUTATE=1 $PYTEST tests/test_turbo_contract_live.py -v
 
-# Ultimate 64 live tests (requires U64_HOST; suites that change device
-# config additionally require U64_ALLOW_MUTATE=1 — resets, RAM writes and
-# stream start/stop run on U64_HOST alone, #333)
-U64_HOST=<device> U64_ALLOW_MUTATE=1 pytest tests/test_u64_feature_parity_live.py -v
-U64_HOST=<device> U64_ALLOW_MUTATE=1 X25519_PRG=/path/to/x25519.prg pytest tests/test_u64_turbo_bench_live.py -v  # 12 run_prg uploads
-TURBO_CONTRACT_LIVE=1 U64_HOST=<device> U64_ALLOW_MUTATE=1 pytest tests/test_turbo_contract_live.py -v  # cross-generation CPU-speed contract
-SOCKETDMA_LIVE=1 U64_HOST=<device> U64_ALLOW_MUTATE=1 pytest tests/test_socketdma_live.py -v  # SocketDMA fast path + cross-generation REU contract
+# 12 run_prg uploads per session: each body-carrying upload leaves a /Temp
+# attachment on leak-prone firmware, so point this at a post-safe device.
+U64_HOST=<device> U64_ALLOW_MUTATE=1 X25519_PRG=/path/to/x25519.prg $PYTEST tests/test_u64_turbo_bench_live.py -v
 
-# Run all U64 live tests in parallel files (per-test DeviceLock via conftest)
+# All U64 live modules, per-test DeviceLock via conftest
 python3 scripts/run_u64_parallel_locked.py <device>
 
-# Stress test the cross-process queueing (6 workers, 5 rounds each)
+# Stress the cross-process queueing (6 workers, 5 rounds each)
 python3 scripts/stress_u64_queue.py <device> --workers 6 --rounds 5
-
-# No script or live module has a default host: name the device (argument
-# or U64_HOST) or it refuses with exit 2 / skips (#243, #275).
 ```
 
-Every live test runs inside the autouse `device_lock_guard` fixture, so `DeviceLock` serializes access to the physical device whether or not the test asks for it. Multiple agents (separate OS processes) can safely run tests in parallel — the lock file queues them automatically. See [Shared-device contract](#shared-device-contract-devicelock) for what that obliges non-test tools to do, and set `U64_REQUIRE_DEVICE_LOCK=1` to make an unlocked destructive call an error instead of a warning.
+Every opt-in gate (`*_LIVE=1`, `U64_DESTRUCTIVE`, `BRIDGE_CLEANUP_LIVE`, ...) is listed with what it needs and what it pins in [docs/development.md § Hardware and network live gates](docs/development.md#hardware-and-network-live-gates-all-opt-in-skip-cleanly-when-unset).
 
-`U64_ALLOW_MUTATE=1` covers device config changes only; resets, RAM writes and stream start/stop run on `U64_HOST` alone (owner decision 2026-09-15, #333). Live suites that change device config (`test_multi_sid_parallel_live.py`, the turbo/SocketDMA suites above) are double-gated behind `U64_HOST` **and** `U64_ALLOW_MUTATE=1`; with either unset they skip cleanly. A few suites also skip their resets or RAM writes without the gate (`test_u64_feature_parity_live.py`, `test_ultimate64_client_writemem_live.py`, `test_socketdma_barrier_live.py`), which is stricter than the contract. The UCI UDP live probes (`test_uci_udp_send_live.py`, `test_uci_udp_send_large_live.py`) read the device address from `U64_HOST` (plus their `UCI_UDP_LIVE=1` gate, and `U64_ALLOW_MUTATE=1` because they enable the Command Interface, a config write, #268) — no hardcoded IPs.
+Every live test runs inside the autouse `device_lock_guard` fixture, so `DeviceLock` serializes access to the physical device whether or not the test asks for it. Separate OS processes can run tests in parallel safely, because the lock file queues them. See [Shared-device contract](#shared-device-contract-devicelock) for what that obliges non-test tools to do. Set `U64_REQUIRE_DEVICE_LOCK=1` to make an unlocked destructive call an error instead of a warning.
+
+`U64_ALLOW_MUTATE=1` covers device config changes only; resets, RAM writes and stream start/stop run on `U64_HOST` alone (owner decision 2026-09-15, #333). Live suites that change device config (`test_multi_sid_parallel_live.py`, the turbo and SocketDMA suites) are double-gated behind `U64_HOST` **and** `U64_ALLOW_MUTATE=1`, and with either unset they skip cleanly. A few suites also skip their resets or RAM writes without the gate (`test_u64_feature_parity_live.py`, `test_ultimate64_client_writemem_live.py`, `test_socketdma_barrier_live.py`), which is stricter than the contract requires. The UCI UDP live probes (`test_uci_udp_send_live.py`, `test_uci_udp_send_large_live.py`) take the device address from `U64_HOST`. They also need their `UCI_UDP_LIVE=1` gate, and `U64_ALLOW_MUTATE=1` because they enable the Command Interface, a config write (#268). None of them hardcodes an IP.
 
 ## Contributing
 
