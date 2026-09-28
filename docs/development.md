@@ -530,8 +530,8 @@ whose reconnection after a power cycle is known unreliable, with nobody present,
 and nothing in `BASELINE_NEVER_TOUCH` protects against a future edit adding a
 network store to the covered set by mistake — see the `Ethernet Settings` and
 `WiFi settings` reasons above. `U64_BASELINE_ON_ENTRY=1` opts a C64U in for
-somebody standing at the bench, and the manager logs a WARNING naming the risk
-when it does. An `unknown` generation — an unreadable or timed-out capability
+somebody standing at the bench (the WARNING this logs is described under
+"Live tests reconcile at entry" above). An `unknown` generation — an unreadable or timed-out capability
 probe ([#262](https://github.com/JC-000/c64-test-harness/issues/262)) — resolves
 **off**: a reset must never arm on a device the harness failed to identify, and
 the C64U is exactly the device a slow probe mis-grades.
