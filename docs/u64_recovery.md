@@ -832,8 +832,8 @@ upstream fix is strict hex parsing in `readmem`/`writemem`/`debugreg`,
 which answers HTTP 400 "Invalid address". The U64E's bce4535e build is
 the merge commit of 1541ultimate PR #884 on the `test-merge` branch, so
 it carries the fix. PR #888 replays the same change onto `master` and is
-not an ancestor of bce4535e; a future C64U (`u64ii`) release would get
-the fix from #888. The C64U's 1.1.0 predates both.
+not an ancestor of bce4535e; a `u64ii` release cut from `master` after
+#888 would carry it. The C64U's 1.1.0 predates both.
 
 ## Cross-references
 
