@@ -1670,9 +1670,11 @@ class Ultimate64Client:
         plain name that matches nothing raises with the keys present
         rather than being mapped onto whatever single item is there.
 
-        **Unknown names**: stock firmware (1.1.0 / 3.14d) answers an unknown
-        *category* with HTTP 200 and no category key at all → this raises
-        :class:`Ultimate64ProtocolError`; the 3.15 fork answers 404 → a
+        **Unknown names**: firmware without upstream #805 (1.1.0 / 3.14d)
+        answers an unknown *category* with HTTP 200 and no category key at
+        all → this raises :class:`Ultimate64ProtocolError`; firmware
+        carrying #805 (6b5ffc21; the public v3.15 and every U64E build on
+        this bench) answers 404 → a
         plain :class:`Ultimate64Error` with ``status == 404`` from the
         request layer.  An unknown *item* in a known category is HTTP 200
         with an empty category map on every firmware →
@@ -1682,7 +1684,8 @@ class Ultimate64Client:
             (or several) matching category/item, or the item not being a
             map (issue #214: an accessor named for the item must not hand
             back a value from a failed read).
-        :raises Ultimate64Error: HTTP-level failures (404 on the 3.15 fork).
+        :raises Ultimate64Error: HTTP-level failures (404 for an unknown
+            category on firmware carrying upstream #805).
         """
         envelope = self.get_config_item_raw(category, item)
         if not isinstance(envelope, dict):

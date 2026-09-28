@@ -1814,9 +1814,10 @@ def test_get_config_item_absent_message_lists_keys_present():
 
 
 def test_get_config_item_unknown_category_on_stock_firmware_raises_protocol_error():
-    """Stock firmware (1.1.0 / 3.14d) answers an unknown category with HTTP
-    200 and no category key at all; the 3.15 fork answers 404 (a plain
-    Ultimate64Error from the request layer)."""
+    """Firmware without upstream #805 (1.1.0 / 3.14d) answers an unknown
+    category with HTTP 200 and no category key at all; firmware carrying
+    #805 (6b5ffc21; the public v3.15 and every U64E build on this bench)
+    answers 404 (a plain Ultimate64Error from the request layer)."""
     mock, _ = _capture(b'{"errors":[]}')
     c = Ultimate64Client("h")
     with patch("urllib.request.urlopen", mock):
