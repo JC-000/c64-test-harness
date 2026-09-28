@@ -1,9 +1,29 @@
 # Ultimate 64 Elite - Live Device Probe
 
 Read-only reconnaissance of the real Ultimate 64 Elite on the LAN via its
-HTTP REST API (plain HTTP on port 80, no TLS). Captured on 2026-04-05.
+HTTP REST API (plain HTTP on port 80, no TLS). Captured on 2026-04-05 on
+firmware **3.14** and not re-captured since.
 
-Companion script: `scripts/probe_u64.py` (`python3 -m urllib.request`, zero deps).
+> **This is a historical 3.14 snapshot, not the current schema.** The U64E
+> now runs a post-tag 3.15 fork build (it reports `git_commit_hash`
+> `bce4535e`, v3.15-132, since 2026-09-15), and the bench's second device is
+> a C64 Ultimate on firmware 1.1.0, whose CPU Speed list has `"64"` and
+> lacks `" 5"` and which adds `Speaker Mixer` and `Keyboard Lighting`
+> categories. Per-category item counts differ on 3.15 as well (for example
+> `U64 Specific Settings` 27, `Audio Mixer` 21). The authoritative current
+> category sets and counts for both generations are
+> `BASELINE_RECORDED_CATEGORY_SETS` in
+> `src/c64_test_harness/backends/ultimate64_baseline.py`; the harness
+> probes enums such as CPU Speed at runtime rather than hardcoding them.
+
+Companion script: `scripts/probe_u64.py` — GET-only, standard library
+`urllib` (no third-party deps). It needs `--host <device>` or `$U64_HOST`
+and refuses with exit 2 otherwise (#243); it holds the cross-process
+`DeviceLock` for its whole run and exits 3 if the lock cannot be taken or the
+harness will not import (#244). Other flags: `--password`, `--raw-dir <dir>`
+to save the raw JSON. It iterates a hardcoded list of the 19 categories
+below, so a category that exists only on newer firmware (the C64U's two
+extra ones) is not dumped.
 
 ---
 
@@ -139,7 +159,7 @@ Enabled, `Ext DualSID Range Split` and `UltiSID Range Split` are Off.
 
 ---
 
-## 5. Config Categories (all 19)
+## 5. Config Categories (all 19, fw 3.14 item counts)
 
 | Category | Items | Purpose |
 |---|---|---|
@@ -207,6 +227,12 @@ slots.
 
 `$U64_HOST` is the device you are pointing at — set it, do not paste an
 address in (#243).
+
+Every recipe here is a bodyless GET, so it costs no `/Temp` attachment even
+on the leak-prone C64 Ultimate. Raw curl does not take the `DeviceLock`,
+though: on a shared device prefer `scripts/probe_u64.py`, which does, or ask
+who holds it first with `device_lock_holder(host)`
+(`docs/device_locking.md`).
 
 ```bash
 # Identity and API version

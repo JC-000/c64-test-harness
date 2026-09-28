@@ -7,7 +7,7 @@
 ### Why ViceInstanceManager is mandatory
 
 - **Port safety**: `ViceInstanceManager` uses `PortAllocator` internally with OS-level `bind()` + file-based `flock()` locks. The file lock eliminates the TOCTOU gap between closing the reservation socket and VICE binding to the port. Without it, another agent can steal the port during that window.
-- **PID verification**: After VICE starts, the manager verifies via `/proc/net/tcp` (Linux) or `lsof` (macOS) that the correct process is listening. PID mismatches trigger a retry.
+- **PID verification**: After VICE starts, the manager verifies via `lsof -iTCP:<port> -sTCP:LISTEN` (macOS) or `/proc/net/tcp` (Linux) that the correct process is listening. PID mismatches trigger a retry. A sudo-wrapped launch (macOS ethernet) often cannot be inspected by an unelevated `lsof`; the manager then logs a WARNING and skips the check rather than passing it silently.
 - **Retry with backoff**: Failed acquisitions retry automatically (configurable `max_retries`, default 3) with exponential backoff.
 - **PID tracking**: `inst.pid` reliably identifies your VICE process. Without it, agents resort to `pkill x64sc` which kills other agents' instances.
 - **Binary transport creation**: `inst.transport` is a `BinaryViceTransport` pre-configured with the correct port. No manual construction needed. The manager uses a retry-connect pattern internally (TCP connect retries until VICE's binary monitor is ready).
@@ -16,6 +16,7 @@
 ### Single-instance pattern
 
 ```python
+import sys
 from c64_test_harness import ViceConfig, ViceInstanceManager, Labels, wait_for_text, write_bytes
 
 config = ViceConfig(prg_path="build/program.prg", warp=True, ntsc=True, sound=False)
@@ -189,7 +190,7 @@ Wait on a **transition** instead:
 For running many tests across a pool of VICE instances. `ViceInstanceManager` handles all port allocation and PID tracking.
 
 ```python
-from c64_test_harness import ViceInstanceManager, ViceConfig, Labels, write_bytes
+from c64_test_harness import ViceInstanceManager, ViceConfig, Labels, wait_for_text, write_bytes
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 config = ViceConfig(prg_path="build/program.prg", warp=True, ntsc=True, sound=False)
@@ -291,53 +292,59 @@ To add a new test suite to the parallel runner:
 
 ## Pattern 8: Ethernet / CS8900a Bridge Networking
 
-For testing C64 networking code with the CS8900a ethernet cartridge. Two VICE instances share a host bridge and talk to each other via L2 + IP + ICMP — no TAP-to-host NAT is involved. The harness supports both Linux (TAP devices + Linux bridge) and macOS (`feth(4)` peers + BSD bridge). Tests MUST dispatch through `tests/bridge_platform.py` constants — never hardcode `tap-c64-*` / `br-c64` / `tuntap`.
+For testing C64 networking code with the CS8900a ethernet cartridge. Two VICE instances share a host L2 link and talk to each other via L2 + IP + ICMP — no host NAT is involved. The primary platform is macOS (`feth(4)` peers + the `pcap` driver under a root VICE); Linux (TAP devices + Linux bridge + `tuntap`) is supported but was last run on Linux 2026-04-10 (the two-VICE demo, 10/10); the Linux scripts changed after that run and no Linux run is recorded since. Tests MUST dispatch through `tests/bridge_platform.py` constants — never hardcode `feth*` / `bridge10` / `pcap` or `tap-c64-*` / `br-c64` / `tuntap`.
 
 ```python
-from tests.bridge_platform import IFACE_A, ETHERNET_DRIVER
+from bridge_platform import IFACE_A, ETHERNET_DRIVER   # tests/bridge_platform.py (tests/ on sys.path)
 
 config = ViceConfig(
     prg_path="build/network_app.prg",
-    warp=True,                       # OK — new orchestrators are wall-clock-driven
+    warp=True,                       # OK — the orchestrators are wall-clock-driven
     ethernet=True,                   # Enable CS8900a
-    ethernet_mode="rrnet",           # RR-Net — matches ip65 and the physical cart
-    ethernet_interface=IFACE_A,      # tap-c64-0 on Linux, feth0 on macOS
-    ethernet_driver=ETHERNET_DRIVER, # tuntap on Linux, pcap on macOS
+    ethernet_mode="rrnet",           # RR-Net (the default) — matches ip65 and the physical cart
+    ethernet_interface=IFACE_A,      # feth0 on macOS, tap-c64-0 on Linux
+    ethernet_driver=ETHERNET_DRIVER, # pcap on macOS, tuntap on Linux
 )
 ```
 
-On macOS `ViceProcess` wraps the x64sc launch with `sudo -n` whenever the pcap driver is in play: VICE admits that driver only when `archdep_rawnet_capability()` (`geteuid()==0`) holds, and `chmod o+rw /dev/bpf*` changes nothing it looks at. Unelevated the launch is refused with `ViceElevationRequiredError` rather than allowed to SIGSEGV. This is a no-op on Linux, whose `tuntap` driver is ungated. When elevation does fire you need a NOPASSWD sudoers entry naming the **exact** x64sc path you launch, symlink form and all (`/opt/homebrew/bin/x64sc`, not its Cellar target — sudoers matches the literal path); the error tells you the entry to add. See `docs/development.md` -> macOS -> "Passwordless sudo for bridge lifecycle".
+On macOS `ViceProcess` wraps the x64sc launch with `sudo -n` whenever the pcap driver is in play: VICE admits that driver only when `archdep_rawnet_capability()` (`geteuid()==0`) holds, and `chmod o+rw /dev/bpf*` changes nothing it looks at. Unelevated the launch is refused with `ViceElevationRequiredError` rather than allowed to SIGSEGV. You need a NOPASSWD sudoers entry naming the **exact** x64sc path you launch, symlink form and all (`/opt/homebrew/bin/x64sc`, not its Cellar target — sudoers matches the literal path); the error tells you the entry to add. See `docs/development.md` § "macOS (Homebrew)", step 7 "Passwordless sudo for bridge lifecycle". Linux's `tuntap` driver is ungated and needs no elevation.
 
-A build without raw-network support starts and answers the binary monitor while attaching **no** BPF device, so CS8900 register assertions pass against pure emulation with zero host traffic — `probe_vice_pcap_ok()` demands a real `/dev/bpf*` attach for exactly this reason, and `resolve_vice_executable()` refuses such a binary up front via `x64sc -features` (`ViceEthernetBinaryError`). Homebrew's x64sc is **not** such a build, despite issue #144: `-features` reports `HAVE_RAWNET yes` / `HAVE_PCAP yes` and it links libpcap. What breaks it is being run unelevated — so use the PATH binary and leave `$VICE_ETHERNET_BIN` unset; it is an override, not a requirement.
+A build without raw-network support starts and answers the binary monitor while attaching **no** BPF device, so CS8900 register assertions pass against pure emulation with zero host traffic. `resolve_vice_executable()` refuses such a binary up front via `x64sc -features` (`ViceEthernetBinaryError`), and `probe_vice_pcap_ok()` demands a real BPF attach, read with `bpf_attached_interfaces()` (`netstat -B`) — never `lsof`, which returns nothing for a root-owned VICE. Homebrew's x64sc is **not** such a build: `-features` reports `HAVE_RAWNET yes` / `HAVE_PCAP yes`. Use the PATH binary and leave `$VICE_ETHERNET_BIN` unset; it is an override, not a requirement.
 
 `ViceInstanceManager` auto-generates unique MACs (`02:c6:40:xx:xx:xx`) per instance and programs the CS8900a Individual Address registers after connect — no manual MAC handling needed.
 
 ### Use the `bridge_vice_pair` fixture for two-VICE tests
 
 ```python
-# tests/conftest.py already provides this:
-def bridge_vice_pair(...) -> tuple[ViceInstance, ViceInstance]:
-    # Brings up two VICE instances on the host bridge (br-c64 / bridge10),
-    # RR-Net mode, warp=False (opt-in warp), unique MACs,
-    # CS8900a initialised (RxCTL + LineCTL + clockport).
+# tests/conftest.py already provides this (a module-scoped generator fixture):
+def bridge_vice_pair():
+    # Yields (transport_a, transport_b): two VICE instances on IFACE_A/IFACE_B,
+    # RR-Net mode, warp=False, at BASIC READY, CS8900a initialised
+    # (clockport + RxCTL + LineCTL), MACs BRIDGE_MAC_A / BRIDGE_MAC_B programmed.
+    # Skips when x64sc is not on PATH or an interface is missing.
+    ...
 ```
 
 Skip-gate pattern for bridge tests — check all three interfaces through the dispatch module before running:
 
 ```python
-from tests.bridge_platform import IFACE_A, IFACE_B, BRIDGE_NAME, SETUP_HINT, iface_present
+from bridge_platform import IFACE_A, IFACE_B, BRIDGE_NAME, SETUP_HINT, iface_present
 
 missing = [n for n in (IFACE_A, IFACE_B, BRIDGE_NAME) if not iface_present(n)]
 if missing:
     pytest.skip(f"bridge down ({', '.join(missing)} missing); {SETUP_HINT}")
 ```
 
+The emulated C64s answer on `.2` and `.3` of `10.0.65.0/24` (host `.1`); `C64_BRIDGE_SUBNET` (first three octets) moves the range when another rig on the machine already owns it (`tests/bridge_platform.py` `BRIDGE_SUBNET`). The setup scripts still assign the host `10.0.65.1` themselves.
+
 Host setup lives in three scripts per platform:
 
-- Linux: `scripts/setup-bridge-tap.sh`, `teardown-bridge-tap.sh`, `cleanup-bridge-networking.sh`
 - macOS: `scripts/setup-bridge-feth-macos.sh`, `teardown-bridge-feth-macos.sh`, `cleanup-bridge-feth-macos.sh`
+- Linux (last run 2026-04-10; changed since, not re-run): `scripts/setup-bridge-tap.sh`, `teardown-bridge-tap.sh`, `cleanup-bridge-networking.sh`
 
-On macOS the setup script pairs `feth0` <-> `feth1` via `ifconfig feth0 peer feth1` and creates `bridge10` for the precondition + the host `10.0.65.1` address, but deliberately leaves the feth peers OUT of `bridge10`. The feth peer relation IS the L2 link; adding them as bridge members creates a second forwarding path that empirically caused asymmetric B->A reply drops. The setup script `deletem`s any stale peer-membership idempotently.
+Invoke them directly (`sudo -n scripts/setup-bridge-feth-macos.sh`), never as `sudo bash <script>`: the NOPASSWD rule matches the script path, not `bash`.
+
+On macOS the setup script pairs `feth0` <-> `feth1` via `ifconfig feth0 peer feth1` and creates `bridge10` for the precondition + the host `10.0.65.1` address, but deliberately leaves the feth peers OUT of `bridge10`. The feth peer relation IS the L2 link; adding them as bridge members creates a second forwarding path that empirically caused asymmetric B->A reply drops. The setup script `deletem`s any stale peer-membership idempotently. The feth pair and `bridge10` may be shared with other rigs on the machine: tearing them down removes them for everyone.
 
 Cleanup of orphaned VICE processes uses the port-range-scoped `scripts/cleanup_vice_ports.py` — NEVER `pkill x64sc`.
 
@@ -347,14 +354,14 @@ libpcap over BPF sets `BIOCSSEESENT=1` when `pcap_set_promisc(1)` is on, so on m
 
 Reference implementation in `tests/test_ethernet_bridge.py`:
 
-- `_build_drain_rx_code` / `_drain_cs8900a_rx` — 6502 routine that drains any queued CS8900a RX frames before each receive phase (primary defence; no-op on Linux because TAP doesn't loop TX back).
+- `_build_drain_rx_code` / `_drain_cs8900a_rx` — 6502 routine that drains any queued CS8900a RX frames before each receive phase (primary defence; a no-op on Linux, where TAP does not loop TX back). The shipped builders have their own equivalent: `drain_first=True` on `build_tx_code` and the ping builders (`_emit_drain_rx`).
 - `_build_rx_code(..., expected_src_mac=...)` — optional src-MAC filter (defence in depth): any frame that slips past the drain with a non-matching src MAC is treated as non-matching and drained on the fly.
 
 ICMP tests (`test_bridge_ping.py`, `test_bridge_ping_tod.py`) are not affected because they address frames unicast to the peer's MAC and rely on the CS8900a's built-in Individual Address filter to discard self-echoes. Only broadcast TX-then-RX-on-same-transport tests need the drain.
 
 ### RR-Net mode is required (not TFE)
 
-The harness previously used TFE. RR-Net (`ethernet_mode="rrnet"`, emits `-ethernetcartmode 1`) is now mandatory because the register layout matches ip65's `cs8900a.s` and the physical RR-Net cartridge. TFE looked simpler but made TX-after-RX and full ICMP round-trip fail in ways that were misattributed to "VICE 3.10 limitations" — PR #44 discovered the real fix is RR-Net + clockport enable.
+RR-Net (`ethernet_mode="rrnet"`, the default; written as `EthernetCartMode=1` into the `-addconfig` rc) is required: its register layout matches ip65's `cs8900a.s` and the physical RR-Net cartridge. Under TFE, TX-after-RX and full ICMP round trips fail (PR #44).
 
 ### RR-Net register map (base $DE00)
 
@@ -401,14 +408,16 @@ result = run_ping_and_wait(
     result_addr=RESULT_ADDR, identifier=echo.identifier, sequence=echo.sequence,
     tx_frame_buf=TX_FRAME_BUF, timeout_s=5.0,
     peek_addr=PEEK_ADDR, consume_addr=CONSUME_ADDR,
-)
-# result: 0x01 on reply match, 0xFF on wall-clock timeout
+)   # arp=True (default): ARPs for dst_ip first, through the same TX buffer
+# result: 0x01 on reply match, 0xFF on wall-clock timeout,
+# 0x04 (RESULT_TX_NOT_READY) if the chip never became ready to transmit
 
 # Other side: reply to any echo request addressed to us
 result = run_icmp_responder(
     transport_b, rx_buf=RX_FRAME_BUF, my_ip=ip_b,
     result_addr=RESULT_ADDR, timeout_s=5.0,
     peek_addr=PEEK_ADDR, consume_addr=CONSUME_ADDR,
+    my_mac=mac_b,   # optional: also answer ARP for my_ip (738 B consume routine)
 )
 ```
 
@@ -427,15 +436,15 @@ VICE warp accelerates TOD (it's virtual-CPU-clocked, not wall-clock-driven — s
 
 ### Hardware RR-Net on the U64 (external cartridge)
 
-An RR-Net-compatible cartridge in the U64's expansion port is a real CS8900a at `$DE00` with the register map above (measured on U64E fw 3.15; the C64U is unverified). Several things differ from the two-VICE bridge, none of which a VICE test can fail on (issues #207–#212; `docs/bridge_networking.md` § "Real silicon diverges from VICE"):
+An RR-Net-compatible cartridge in the U64's expansion port is a real CS8900a at `$DE00` with the register map above (measured on U64E fw 3.15; the C64U is unverified). On this bench it is cabled point-to-point to the Mac's USB NIC `en4` at 10BASE-T (no switch, no DHCP; read `LineST`, PP `$0134`, bit 7 first — `$1214` means no link). Several things differ from the two-VICE bridge, none of which a VICE test can fail on (issues #207–#212; `docs/bridge_networking.md` § "Real silicon diverges from VICE"):
 
-- **The port is invisible until `Cartridge Preference = External`** (`CARTRIDGE_SETTINGS_CATEGORY` / `CARTRIDGE_PREFERENCE_ITEM`, package-root constants since #221). On the default `Auto` every byte of `$DE00-$DE0F` reads zero, exactly like an empty slot; `Bus Operation Mode` is irrelevant. Config PUTs are memory-only until `save_config_to_flash()`; set it per run and put it back in a `finally` — it does not revert by itself (the "reverts to Auto" folk claim was neighbouring lanes' own restores, retracted 2026-09-05). **Restore to the `default` the device reports for the item, not the value you read at entry** (#447, #412): the bench baseline is `current == default` per item (#334), and an entry value can be a SIGKILLed predecessor's `External`, so putting it back re-installs the drift. Use `tests/live_fixture_teardown.py`'s `read_restore_defaults` (before the `External` PUT; it refuses to start when an item reports no default, and warns on entry drift) with `restore_default_steps` in the `finally` — one bodyless `set_config_item` PUT per item. `snapshot_state`/`restore_state` are entry-value restores and are **not** the right tool for this: they would carry a drifted `Cartridge Preference` straight back onto the device.
+- **The cartridge does not answer until `Cartridge Preference = External`** (`CARTRIDGE_SETTINGS_CATEGORY` / `CARTRIDGE_PREFERENCE_ITEM`, package-root constants since #221). On the default `Auto` the `$630E` identity read fails and the raw `$DE00` bytes are not reproducible (zeros, `fb fb`, `06 fb`, `7c 00` and `ff ff` have all been seen); `Bus Operation Mode` is irrelevant. Config PUTs are memory-only until `save_config_to_flash()`; set it per run and put it back in a `finally` — it does not revert by itself (the "reverts to Auto" folk claim was neighbouring lanes' own restores, retracted 2026-09-05). **Restore to the `default` the device reports for the item, not the value you read at entry** (#447, #412): the bench baseline is `current == default` per item (#334), and an entry value can be a SIGKILLed predecessor's `External`, so putting it back re-installs the drift. Use `tests/live_fixture_teardown.py`'s `read_restore_defaults` (before the `External` PUT; it refuses to start when an item reports no default, and warns on entry drift) with `restore_default_steps` in the `finally` — one bodyless `set_config_item` PUT per item. `snapshot_state`/`restore_state` are entry-value restores and are **not** the right tool for this: they would carry a drifted `Cartridge Preference` straight back onto the device.
 - **Put `Cartridge Preference` back to `Auto`, then `reset()` and settle (the measured sequence; see SKILL 15), before any UCI use on the same device.** With External, the Command Interface slot is off the bus (measured after a reset, #359) while `Command Interface` still reads Enabled, so UCI routines raise `UCIInterfaceAbsentError` (they used to time out; #359, U64E, measured 0/3 on External against 3/3 on Auto). The recipe below puts the preference back with `read_restore_defaults`/`restore_default_steps` — its own device default, not a snapshot (#447); the reset and settle are still yours. SKILL pitfall 15 has the rest.
 - **The only presence test is the CS8900a identity read, on the 6510: PPPtr = `$0000`, PPData == `$630E`** — what ip65's `init` does before it will initialise (`drivers/cs8900a.s`; `INIT DRIVER: FAILED` is that read failing). A host-side `read_memory` of the I/O window returns bytes unrelated to the cartridge and not reproducible (`0A` ×16 and `3C 00 00 00 …` have both been observed under the same stated conditions). A 6510 raw read of `$DE00` is not a test either: zeros on `Auto`, zeros after `client.run_prg()`, zeros with no cartridge, and the chip's registers (`FF FF …`) when it is working — non-zero but not self-describing (issues #209, #211).
 - **The firmware's runner load path deselects the cartridge** (#217, n=3/arm): `client.run_prg()` and `client.load_prg()` both leave the program seeing `$DE00` dead while the config still says `External` (stock ip65 prints `INIT DRIVER: FAILED`); the deselection survives every `reset()` and only a re-PUT of `Cartridge Preference` reselects it. Deselected PP `$0000` is not reliably zeros — only `!= $630E` means anything. Start PRGs with `run_prg_via_sys(target, prg)` — write to RAM + typed `SYS` + resume, with the re-PUT done for you on a U64 (`reselect_cartridge=False` opts out).
 - **Host-side `write_memory` never reaches the cartridge on hardware** (and host reads of the window are not meaningful), so `set_cs8900a_mac()` — which works under VICE — is a silent no-op here; program the MAC from the 6510 with `cs8900a_set_mac_inline_code(mac)`.
 - **No `jsr()` on hardware**: `run_ping_and_wait` / `run_icmp_responder` / `poll_until_ready` are VICE-only. Use the `*_tod_code` builders (each ends `CLI; RTS`) through `run_subroutine`, which needs BASIC `READY.`.
-- **Resolve before the first ping to a host: pass the ARP frame (`arp_frame_buf=`), and give responders `my_mac=` so they answer ARP.** A macOS host with no *complete* neighbour entry for the C64 holds every echo reply (entry absent 0/8, present 8/8 — #218; the stale-entry case is inferred) — a run that never ARPs gets 0/N with the requests visibly leaving the wire (issue #212, closed invalid: not a chip fault); stock ip65 is immune because `icmp_ping` ARPs first and `arp_process` answers. Since #218 the harness does both, opt-in: `build_arp_request_frame(mac, ip_c64, ip_host)` into RAM and `build_ping_and_wait_tod_code(..., arp_frame_buf=ARP_BUF)` transmits it before the echo in one run (the ARP reply is drained as a non-match); `build_icmp_responder_tod_code(..., my_mac=mac)` answers ARP requests for `my_ip` while waiting. Defaults (`None`) emit no ARP code; with ARP on the routines are larger (measured after #487: consume 738 B, responder 783 B, TOD responder 907 B, ping 472 B, TOD ping 596 B, 636 B with `drain_first` — size the code window for them). The ARP ping path has run on the U64E, on the pre-#487 routine (`tests/test_first_exchange_live.py`; #222 on 2026-09-05, #444/PR #458 on 2026-09-16); the responders' `my_mac` ARP answer is still unmeasured on hardware.
+- **Resolve before the first ping to a host: pass the ARP frame (`arp_frame_buf=`), and give responders `my_mac=` so they answer ARP.** A macOS host with no *complete* neighbour entry for the C64 holds every echo reply (entry absent 0/8, present 8/8 — #218; the stale-entry case is inferred) — a run that never ARPs gets 0/N with the requests visibly leaving the wire (issue #212, closed invalid: not a chip fault); stock ip65 is immune because `icmp_ping` ARPs first and `arp_process` answers. Since #218 the harness does both, opt-in: `build_arp_request_frame(mac, ip_c64, ip_host)` into RAM and `build_ping_and_wait_tod_code(..., arp_frame_buf=ARP_BUF)` transmits it before the echo in one run (the ARP reply is drained as a non-match); `build_icmp_responder_tod_code(..., my_mac=mac)` answers ARP requests for `my_ip` while waiting. Defaults (`None`) emit no ARP code; with ARP on the routines are larger (`len()` after #487, re-checked at 0e56950: `run_icmp_responder`'s consume routine 738 B, `build_icmp_responder_code` 783 B, `build_icmp_responder_tod_code` 907 B, `build_ping_and_wait_code` 472 B, `build_ping_and_wait_tod_code` 596 B, 636 B with `drain_first` — size the code window for them; full table in Pattern 10). The ARP ping path has run on the U64E, on the pre-#487 routine (`tests/test_first_exchange_live.py`; #222 on 2026-09-05, #444/PR #458 on 2026-09-16); the responders' `my_mac` ARP answer is still unmeasured on hardware.
 - **Drain the chip's RX queue before the first exchange (`drain_first=True` on the ping builders, issue #222).** Frames that arrive while nobody reads sit in the CS8900a's queue, and an exchange started on top of them loses its reply — the chip counts it in RxMISS and never presents it; on this bench the stale frames are the host's own DHCP DISCOVER broadcasts from `en4` (342 B, ~every 10 s). U64E 2026-09-05, interleaved n=6: first ping after reset + init + 5 s idle 3/6 without the drain, 6/6 with it; every miss had LinkOK, request and reply on the wire, RxMISS +1 and a non-empty queue; the live test injects three such frames and gets MISS 3/3 without / MATCH 3/3 with the drain. The REST `reset()` does not reset the chip, so a "fresh" session inherits the old queue. Not the link, not the capture's promiscuous toggle (no `en4` transition in 30 trials), not ARP. A second ping 1 s after a miss matched 7/7 — so a single retry also covers it, at the cost of a deadline. Read RxMISS (PP `$0130`, count in bits 6-15, read-to-clear) when an exchange misses: +1 says the chip dropped it. Live: `tests/test_first_exchange_live.py` (`RRNET_LIVE=1`).
 
 ```python
@@ -443,66 +452,77 @@ from c64_test_harness import (
     CARTRIDGE_PREFERENCE_ITEM, CARTRIDGE_SETTINGS_CATEGORY,
     create_manager, run_subroutine, write_bytes, read_bytes, wait_for_text,
     build_arp_request_frame, build_echo_request_frame, build_ping_and_wait_tod_code,
-    cs8900a_enable_inline_code, cs8900a_set_mac_inline_code, generate_mac, parse_mac,
+    cs8900a_enable_inline_code, cs8900a_set_mac_inline_code, generate_mac,
 )
 from c64_test_harness.bridge_ping import PPTR_LO, PPTR_HI, PPDATA_LO, PPDATA_HI
-from live_fixture_teardown import (   # tests/live_fixture_teardown.py (#447)
-    attempt_steps, read_restore_defaults, restore_default_steps,
+from bridge_platform import host_addr        # tests/bridge_platform.py
+from live_fixture_teardown import (          # tests/live_fixture_teardown.py (#447)
+    attempt_steps, raise_teardown_failures, read_restore_defaults, restore_default_steps,
 )
 
 # The ARP + drain ping routine is 636 bytes ($C000-$C27B, #487), so RESULT sits past it.
 CODE, RESULT, TX_BUF, ARP_BUF, RX_BUF = 0xC000, 0xC3F0, 0xC500, 0xC580, 0xC700
 mac = generate_mac(1)
-host_mac = parse_mac("c0:56:27:b1:16:38")            # the host NIC on the cartridge's link
-ip_c64, ip_host = bytes([10, 0, 66, 200]), bytes([10, 0, 66, 1])
+# The host NIC on the cartridge's link (en4 on this bench). host_addr() reads the
+# MAC with networksetup: under the Homebrew venv interpreter `ifconfig` reports
+# every MAC as 02:00:00:00:00:00, and frames sent there reach nobody (#444).
+host_mac, ip_host = host_addr("en4")         # pytest.skip()s if either is unreadable
+ip_c64 = ip_host[:3] + bytes([201])          # same subnet as en4's current address
 
-with create_manager(backend="u64", u64_hosts="10.43.23.81") as mgr:
+def bring_up_and_ping(target):
+    t = target.transport
+    # Bring the chip up FROM THE 6510: clockport + RxCTL + LineCTL, then the MAC.
+    write_bytes(t, CODE, cs8900a_enable_inline_code() + cs8900a_set_mac_inline_code(mac) + b"\x60")
+    run_subroutine(target, CODE, timeout=5.0)
+
+    # Presence test — the only valid one (ip65 init does exactly this).
+    ident = bytes([0xA9, 0x00, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8,      # PPPtr = $0000
+                   0xA9, 0x00, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8,
+                   0xAD, PPDATA_LO & 0xFF, PPDATA_LO >> 8, 0x8D, 0xF0, 0xC3,   # -> $C3F0
+                   0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8, 0x8D, 0xF1, 0xC3,   # -> $C3F1
+                   0x60])
+    write_bytes(t, CODE, ident)
+    run_subroutine(target, CODE, timeout=5.0)
+    assert read_bytes(t, RESULT, 2) == b"\x0e\x63", "no CS8900a on the bus (PP $0000 != $630E)"
+
+    # Ping with the TOD-timed builder; result 0x01 match / 0xFF deadline /
+    # 0x04 transmitter never ready.  arp_frame_buf= makes it ARP for the host
+    # first, in the same run (#212/#218); drain_first= empties the chip's RX
+    # queue before the exchange (#222).
+    echo = build_echo_request_frame(src_mac=mac, dst_mac=host_mac, src_ip=ip_c64, dst_ip=ip_host)
+    write_bytes(t, TX_BUF, echo.frame)
+    write_bytes(t, ARP_BUF, build_arp_request_frame(mac, ip_c64, ip_host))
+    write_bytes(t, CODE, build_ping_and_wait_tod_code(
+        CODE, TX_BUF, len(echo.frame), RX_BUF, RESULT,
+        echo.identifier, echo.sequence, deadline_tenths=40,
+        arp_frame_buf=ARP_BUF, drain_first=True))
+    write_bytes(t, RESULT, b"\x00")
+    run_subroutine(target, CODE, timeout=10.0)
+    assert read_bytes(t, RESULT, 1) == b"\x01"
+
+
+with create_manager(backend="u64", u64_hosts="10.43.23.81") as mgr:   # the U64E
     with mgr.instance() as target:
         t, client = target.transport, target.client
         # Read the item's default BEFORE the External PUT (#447): exit writes
         # that, not the entry value, which can be a dead lane's `External`.
         plan = read_restore_defaults(
             client, {CARTRIDGE_SETTINGS_CATEGORY: [CARTRIDGE_PREFERENCE_ITEM]})
-        client.set_config_item(CARTRIDGE_SETTINGS_CATEGORY, CARTRIDGE_PREFERENCE_ITEM, "External")
-        t.reset()                                            # run_subroutine needs READY.
-        assert wait_for_text(t, "READY.", timeout=25.0, poll_interval=0.3, verbose=False)
-
-        # Bring the chip up FROM THE 6510: clockport + RxCTL + LineCTL, then the MAC.
-        write_bytes(t, CODE, cs8900a_enable_inline_code() + cs8900a_set_mac_inline_code(mac) + b"\x60")
-        run_subroutine(target, CODE, timeout=5.0)
-
-        # Presence test — the only valid one (ip65 init does exactly this).
-        ident = bytes([0xA9, 0x00, 0x8D, PPTR_LO & 0xFF, PPTR_LO >> 8,      # PPPtr = $0000
-                       0xA9, 0x00, 0x8D, PPTR_HI & 0xFF, PPTR_HI >> 8,
-                       0xAD, PPDATA_LO & 0xFF, PPDATA_LO >> 8, 0x8D, 0xF0, 0xC3,   # -> $C3F0
-                       0xAD, PPDATA_HI & 0xFF, PPDATA_HI >> 8, 0x8D, 0xF1, 0xC3,   # -> $C3F1
-                       0x60])
-        write_bytes(t, CODE, ident)
-        run_subroutine(target, CODE, timeout=5.0)
-        assert read_bytes(t, RESULT, 2) == b"\x0e\x63", "no CS8900a on the bus (PP $0000 != $630E)"
-
-        # Ping with the TOD-timed builder; result 0x01 match / 0xFF deadline.
-        # arp_frame_buf= makes it ARP for the host first, in the same run,
-        # so the host's neighbour cache is fresh before the echo goes out
-        # (issues #212/#218).  Without it the routine is byte-identical to
-        # the pre-#218 one and the host may queue the reply.
-        echo = build_echo_request_frame(src_mac=mac, dst_mac=host_mac, src_ip=ip_c64, dst_ip=ip_host)
-        write_bytes(t, TX_BUF, echo.frame)
-        write_bytes(t, ARP_BUF, build_arp_request_frame(mac, ip_c64, ip_host))
-        write_bytes(t, CODE, build_ping_and_wait_tod_code(
-            CODE, TX_BUF, len(echo.frame), RX_BUF, RESULT,
-            echo.identifier, echo.sequence, deadline_tenths=40,
-            arp_frame_buf=ARP_BUF, drain_first=True))   # #218 ARP-first, #222 drain-first
-        write_bytes(t, RESULT, b"\x00")
-        run_subroutine(target, CODE, timeout=10.0)
-        assert read_bytes(t, RESULT, 1) == b"\x01"
-
-        attempt_steps(restore_default_steps(client, plan))    # preference -> its device default
+        failures = []
+        try:
+            client.set_config_item(CARTRIDGE_SETTINGS_CATEGORY, CARTRIDGE_PREFERENCE_ITEM, "External")
+            t.reset()                                        # run_subroutine needs READY.
+            assert wait_for_text(t, "READY.", timeout=25.0, poll_interval=0.3, verbose=False)
+            bring_up_and_ping(target)
+        finally:
+            # The preference back to its device default, one bodyless PUT.
+            failures = attempt_steps(restore_default_steps(client, plan))
+        raise_teardown_failures("RR-Net teardown", failures)
 ```
 
-Layout is the bridge layout (peek/consume unused here). **Leave ≥ 0.2 s between `ip65_init` and the first transmit, or run at 1 MHz.** The U64 throttles expansion-port cycles (a cartridge-I/O loop runs only 1.7× faster at 48 MHz than at 1 MHz) and the register interface holds up at 48 MHz — `$630E` identity and ip65's `INIT DRIVER: OK` both read fine there. The clock is *not* the variable behind flaky transmits: **stock ip65's cs8900a driver transmits too soon after its own reset.** A 2×2 (init clock × ping clock, 8 pings per arm, a gated build that pauses between init and ping — c64-wireguard, 2026-09-05) came back 40/40 at 48 MHz, init at 48 MHz included; the un-gated `pingstatic`, which goes init→transmit in microseconds, fails `$82 TRANSMIT_FAILED` about 4 in 5 at 48 MHz and never at 1 MHz. The shortest gap measured was a screen read plus a DMA write (~0.2–0.4 s); anything shorter is untested. The earlier "transmit is intermittent at 48 MHz" was true of `pingstatic` and false in general. Nothing has been filed upstream about ip65.
+Layout is the bridge layout (peek/consume unused here). **Leave ≥ 0.2 s between `ip65_init` and the first transmit, or run at 1 MHz.** The U64 throttles expansion-port cycles (a cartridge-I/O loop runs only 1.7× faster at 48 MHz than at 1 MHz) and the register interface holds up at 48 MHz — `$630E` identity and ip65's `INIT DRIVER: OK` both read fine there. The clock is *not* the variable behind flaky transmits: **stock ip65's cs8900a driver transmits too soon after its own reset.** A 2×2 (init clock × ping clock, 8 pings per arm, a gated build that pauses between init and ping — c64-wireguard, 2026-09-05) came back 40/40 at 48 MHz, init at 48 MHz included; the un-gated `pingstatic`, which goes init→transmit in microseconds, fails `$82 TRANSMIT_FAILED` about 4 in 5 at 48 MHz and never at 1 MHz. The shortest gap measured was a screen read plus a DMA write (~0.2–0.4 s); anything shorter is untested. Nothing has been filed upstream about ip65.
 
-**Gate-on-a-byte experiments.** The pattern that separated those variables is reusable for any "does X differ across phase boundary Y" question: the C64 program clears a byte, prints a marker, then spins on that byte; the host waits for the marker, changes whatever it wants to vary (clock, a register, a delay), and writes the byte to release. Two arms (init-at-1-then-raise vs init-at-48) would *both* have passed and "proved" the init clock irrelevant while leaving the wrong belief about 48 MHz transmit intact — the 2×2 with a controlled gap is what found the real variable. Source and driver in `.claude/scratch/rrnet-ip65/peer/` (`pingclock.s`, `diag_initclock.py`). Pair trials A/B on this bench: the host's ARP state drifts batch to batch and produced three convincing false "fixes" in #212. The bench-health control is the ip65 static-ping PRG in `.claude/scratch/rrnet-ip65/` (`build-pingstatic.sh`) — run it first; if it fails, the fault is not in your code.
+**Gate-on-a-byte experiments.** The pattern that separated those variables is reusable for any "does X differ across phase boundary Y" question: the C64 program clears a byte, prints a marker, then spins on that byte; the host waits for the marker, changes whatever it wants to vary (clock, a register, a delay), and writes the byte to release. Two arms (init-at-1-then-raise vs init-at-48) would *both* have passed and "proved" the init clock irrelevant while leaving the wrong belief about 48 MHz transmit intact — the 2×2 with a controlled gap is what found the real variable. Source and driver in `.claude/scratch/rrnet-ip65/peer/` (`pingclock.s`, `diag_initclock.py`). Pair trials A/B on this bench: the host's ARP state drifts batch to batch and produced three convincing false "fixes" in #212. The bench-health control is the ip65 static-ping PRG in `.claude/scratch/rrnet-ip65/` (untracked, main checkout only) — run it first; if it fails, the fault is not in your code. **Rebuild it before use**: the checked-in `pingstatic.s` hardcodes the 2026-09-05 subnet and macOS reassigns `en4`'s link-local address, so run `build-pingstatic.sh <c64-ip> <peer-ip> <netmask> [outname]` with `en4`'s current address as `<peer-ip>`.
 
 ### Critical networking gotchas
 
@@ -516,15 +536,15 @@ Layout is the bridge layout (peek/consume unused here). **Leave ≥ 0.2 s betwee
 
 2c. **TxCMD is `$00C9` and the RxEvent poll mask is `$0D`, not `$C0`/`$01`.** Same read-only-register-number rule as RxCTL: `CS8900A_TXCMD_VALUE = 0x00C9` (TxStart-after-full-frame plus regnum 9) and `CS8900A_RXEVENT_MASK = 0x0D` (RxOK | IndividualAdr | Broadcast) are what ip65 writes and what every harness builder now emits (#213). Hand-rolled TX or poll code that still writes `$C0` / masks `$01` matches VICE and misses frames on silicon.
 
-3. **VICE flag ordering.** `-ethernetioif` / `-ethernetiodriver` MUST come before `-ethernetcart` (VICE probes the interface on the cart flag; rejects if inaccessible). `ViceConfig` handles this.
+3. **Let `ViceConfig(ethernet=True)` build the launch.** It activates the cart through a temporary rc passed with `-addconfig` (`ETHERNETCART_ACTIVE`, `ETHERNET_INTERFACE`, `ETHERNET_DRIVER`, `EthernetCartMode`), which is sufficient on its own (measured on macOS only: elevated, `pcap` on `feth0`, 2026-08-30 (#144); the Linux `tuntap` launch is unrecorded); `-ethernetioif` / `-ethernetiodriver` follow as belt-and-braces. There is no VICE flag-ordering quirk (the old one was an artefact of misspelled rc resources — `build_ethernet_rc` in `backends/vice_lifecycle.py`). Hand-passing `-ethernetcart` / `-rrnet` unelevated on macOS SIGSEGVs (`docs/vice_upstream_bugs.md`).
 
-4. **Combined TX+RX in one 6502 routine.** The binary monitor pauses the CPU between commands. VICE's CS8900a only processes incoming TAP frames while the CPU is running, so splitting TX and RX across two `jsr()` calls misses the reply during the pause. The `run_ping_and_wait` orchestrator works around this by driving the wall-clock from Python and running bounded `build_rx_peek_code` bursts.
+4. **Combined TX+RX in one 6502 routine.** The binary monitor pauses the CPU between commands. VICE's CS8900a only processes incoming frames (from the feth/BPF or TAP side) while the CPU is running, so splitting TX and RX across two `jsr()` calls misses the reply during the pause. The `run_ping_and_wait` orchestrator works around this by driving the wall-clock from Python and running bounded `build_rx_peek_code` bursts.
 
 5. **SEI/CLI around polling loops.** KERNAL IRQ fires ~60×/sec and corrupts zero-page timeout counters ($FD/$FE).
 
-6. **Result addresses must not overlap code.** Combined routines can reach ~185 bytes; place result/meta buffers well above.
+6. **Result addresses must not overlap code.** Combined routines now run to 900+ bytes (the TOD responder with `my_mac` is 907 B; table in Pattern 10); place result/meta buffers past the routine's end. The TX and ping builders refuse a `drain_status_addr` that lands on the routine, `result_addr` or a transmitted frame (`ValueError`, #487); nothing checks `result_addr` itself.
 
-7. **Filter RX frames by EtherType.** Host kernel sends IPv6 MLDv2 multicast on TAP — drain non-matching frames before resuming.
+7. **Filter RX frames by EtherType.** The host injects its own traffic (IPv6 MLDv2 multicast on a Linux TAP; DHCP DISCOVER broadcasts on the RR-Net bench's `en4`) — drain non-matching frames before resuming.
 
 8. **Use the `Asm` helper for 6502 branch offsets.** Hand-coded displacements are a major bug source.
 
@@ -536,7 +556,7 @@ Layout is the bridge layout (peek/consume unused here). **Leave ≥ 0.2 s betwee
     - Either way, reject the shipped default **by name**, with a message distinct from the zeroed case: `192.168.1.64` means "the DHCP code never ran", `0.0.0.0` means "it ran and cleared it" — opposite next steps, so one "invalid address" verdict conflates them.
     The same applies to `cfg_mac`: "did `eth_init` run?" via `cfg_mac != 0` is vacuous, and `drivers/cs8900a.s` rewrites the Individual Address from its *own* table on every init (Cirrus OUI `00:0E:3A:…`, or the RR-Net MK3 EEPROM MAC `28:CD:4C:FF:hi:lo`), so a MAC check must compare against what the driver programmed — read PP `$0158-$015D` back on the 6510 — not against non-zero. See memory `feedback_unfalsifiable_default_assertions`.
 
-**End-to-end validation:** `scripts/bridge_ping_demo.py [--warp]` runs a visible two-VICE ping with on-screen counters. Validated 10/10 in both normal and warp modes.
+**End-to-end validation (Linux only):** `scripts/bridge_ping_demo.py [--warp] [--count N] [--interval S]` runs a visible two-VICE ping with on-screen counters. It hardcodes `tap-c64-0`/`tap-c64-1` and the `tuntap` driver, so it does not run on macOS; its "10/10 in normal and warp modes" predates the skill's check-in (2026-05-18) and is not recorded as re-run since.
 
 ---
 
@@ -573,7 +593,7 @@ with create_manager() as mgr:
 
 ### Cross-backend `run_subroutine` for short routines
 
-`run_subroutine(target, addr, *, timeout=30.0, poll_cadence=0.005, trampoline_addr=0x0360)` is the cross-backend "call this 6502 sub and wait for RTS" primitive. On VICE it wraps `jsr()` (binary-monitor checkpoint, sub-frame round-trip). On U64 it installs a 14-byte sentinel trampoline at `trampoline_addr` (default `$0360` in the cassette buffer; flags at `$03F0`/`$03F1`), triggers it via a `SYS` keystroke, and host-polls the done flag every `poll_cadence` seconds.
+`run_subroutine(target, addr, *, timeout=30.0, poll_cadence=0.005, trampoline_addr=0x0360, override=None)` is the cross-backend "call this 6502 sub and wait for RTS" primitive. On VICE it wraps `jsr()` (binary-monitor checkpoint, sub-frame round-trip). On U64 it installs a 14-byte sentinel trampoline at `trampoline_addr` (default `$0360` in the cassette buffer; flags at `$03F0`/`$03F1`), triggers it via a `SYS` keystroke, and host-polls the done flag every `poll_cadence` seconds.
 
 ```python
 from c64_test_harness import create_manager, run_subroutine
@@ -674,6 +694,7 @@ The message is suffixed with `; device REST API responsive` or `; device REST AP
 import pytest
 from c64_test_harness import DeviceLock, DeviceLockTimeout
 from c64_test_harness.backends.ultimate64 import Ultimate64Transport
+from live_fixture_teardown import raise_teardown_failures, teardown_then_release  # tests/
 
 @pytest.fixture(scope="module")
 def transport():
@@ -682,15 +703,20 @@ def transport():
         lock.acquire_or_raise(timeout=120.0)
     except DeviceLockTimeout as e:
         pytest.skip(str(e))  # diagnosed-state message ends up in pytest output
-    t = Ultimate64Transport(host=_HOST, password=_PW, timeout=8.0)
+    t = None
+    failures = []
     try:
+        # Constructed inside the try: a constructor that raises must not leak the lock.
+        t = Ultimate64Transport(host=_HOST, password=_PW, timeout=8.0)
         yield t
     finally:
-        t.close()
-        lock.release()
+        # Every step attempted, lock.release() last and always (#334, #368).
+        failures = teardown_then_release(
+            [("t.close()", t.close if t is not None else None)], lock.release)
+    raise_teardown_failures("transport teardown", failures)
 ```
 
-**`UnifiedManager` path:** `_LockedU64Manager.acquire()` now raises `DeviceLockTimeout` (previously a bare `RuntimeError`). `lock_timeout` bounds against **wedged or dead** holders only — the heartbeat makes live holders extend the deadline implicitly. The historic "long benches need 1800 s" guidance no longer applies (see anti-patterns).
+**`UnifiedManager` path:** `_LockedU64Manager.acquire()` raises `DeviceLockTimeout`. `lock_timeout` bounds against **wedged or dead** holders only — the heartbeat makes live holders extend the deadline implicitly, so a long `lock_timeout` is not needed to queue behind a long bench (see anti-patterns).
 
 ```python
 from c64_test_harness import create_manager, DeviceLockTimeout
@@ -713,38 +739,18 @@ except DeviceLockTimeout as e:
 
 ### Diagnostic recipe
 
-Inspect the current lock state of a host without acquiring:
+Ask who holds a device **right now** without acquiring — no network traffic, one non-blocking shared `flock` probe:
 
 ```python
-from c64_test_harness import DeviceLock
+from c64_test_harness import device_lock_holder
 
-lock = DeviceLock("10.43.23.81")
-info = lock.read_info()
-# → {"pid": 12345, "ts": 1700000000.0, "device_host": "10.43.23.81"}
-# or None if the lockfile is missing or unreadable.
-print(info)
+holder = device_lock_holder("10.43.23.81")
+# -> {"pid": 12345, "ts": 1700000000.0, "device_host": "10.43.23.81"}
+# or None: nobody else holds it (or only this process does, or it can't be read).
+print(holder)
 ```
 
-Tell whether the flock is **actually** held vs the file just being metadata-stale:
-
-```python
-import fcntl, os
-
-path = device_lock_path("10.43.23.81")   # public; identical to lock._lock_path
-fd = os.open(str(path), os.O_RDWR)
-try:
-    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    held = False  # got it ourselves — no one holds the flock
-    fcntl.flock(fd, fcntl.LOCK_UN)
-except BlockingIOError:
-    held = True   # someone else holds the flock (or kernel-released stale state)
-finally:
-    os.close(fd)
-print("held by another process:", held)
-```
-
-`held=False` + a populated `read_info()` = stale metadata; next `acquire()` will clean it up.
-`held=True` = a real holder; combine with `read_info()["pid"]` + `os.kill(pid, 0)` to classify alive vs wedged vs dead per the table above.
+Do **not** use `DeviceLock(host).read_info()` for this: it reads the lockfile without consulting the flock, so it names whoever held the lock *last*. `release()` deliberately does not unlink the lockfile, so a file naming a dead PID is the normal state after every completed run, not a stale or wedged holder. `DeviceLock.held_by_this_process` answers the "is it us?" half. Full contract in `docs/device_locking.md`.
 
 ---
 
@@ -774,12 +780,14 @@ So size the budget conservatively, as though attachments were counted: that is a
 
 | Call | Wire form | Leaves a `/Temp` attachment? |
 |---|---|---|
-| `client.run_prg` / `load_prg` / `run_crt` / `sid_play` / `mod_play` | POST + body | **Yes — one per call** |
+| `client.run_prg` / `load_prg` / `run_crt` / `sid_play` | POST + body | **Yes — one per call** |
+| `client.mod_play` | POST + body | Counted by the harness (reserves budget); by source no `/Temp` file — at 1.1.0 `runners:modplay` binds `&attachment_reu` (`route_runners.cc:125`) and the body goes to REU memory |
+| `client.set_config_items_batch(...)` | **POST** `/v1/configs` + JSON body (`&attachment_writer`, `route_configs.cc:251` at 1.1.0) | **Yes — one per call** |
 | `client.mount_disk(...)` | **POST** + single-part multipart body, `type`/`mode` as query arguments (`mount_disk` in `ultimate64_client.py`; before #311 it sent them as form fields ahead of the image, which the U64E rejected with HTTP 400 `Invalid Type ''`) | **Yes — one per call** |
 | `client.drive_load_rom(..., bytes)` | **POST** + single-part multipart body with no `filename=`, so the attachment keeps its GC-collectable `temp%04x` name; only 16384/32768-byte ROMs are sent (`drive_load_rom`, same module; it PUT the body until #253, which the firmware rejects with HTTP 400) | **Yes — one per call** |
 | `client.write_mem(addr, data)` where `len(data) > write_mem_query_threshold` | POST + body | **Yes — one per call** |
 | `client.write_mem(addr, data)` where `len(data) <= write_mem_query_threshold` | `PUT ?data=<hex>` | No |
-| `reset` / `reboot` / `pause` / `resume` / `menu_button`, every `configs:*`, the drive-slot verbs, `mount_disk_path`, stream start/stop | PUT, no body | No |
+| `reset` / `reboot` / `pause` / `resume` / `menu_button`, every config **PUT** (`set_config_item(s)`, `configs:*` — not the batch POST above), the drive-slot verbs, `mount_disk_path`, stream start/stop | PUT, no body | No |
 | SocketDMA fast path on TCP 64 (`transport.socket_dma = True`, `socket_dma_reu_write`, `SocketDMAClient`) | raw TCP, never HTTP | No — but **do not enable the write fast path** `transport.socket_dma` (disabled pending a stability review), and read the caveat below. The prohibition covers the **bulk-write** path only: `socket_dma_reu_write` / `restore_snapshot(restore_reu=True)` is a separate REUWRITE route that never consults the `socket_dma` switch and is **not** covered by it |
 
 **The threshold is 128 on a C64U, not 48** — and that asymmetry decides most of what follows. `write_mem` picks its wire form at `write_mem_query_threshold`, auto-detected from `DeviceCapabilities.writemem_post_safe`: **48** on Ultimate-line >= 3.15 (which self-collects, so those POSTs are harmless) and **128** on leak-prone firmware.
@@ -803,9 +811,9 @@ Four consequences to know before writing the loop:
 - `memory.write_bytes()` on an Ultimate transport chunks at the transport's **`rest_put_chunk_size`**: the client's `write_mem_query_threshold`, capped at 128 (128 on a C64U, 48 on a post-safe U64E). Every chunk is therefore a PUT **on every grade** (#252). VICE and other transports keep the fixed 84 bytes, the text-monitor limit. On a post-safe device that is more, smaller requests (48-byte PUTs where it used to send 84-byte POSTs, roughly 1.75x as many), a cost accepted by owner decision 2026-09-15. Everything routed through it — including `run_prg_via_sys(target, prg)`, whose body write goes through `write_bytes` — **stays on the PUT path and leaks nothing on a C64U**, however large the PRG.
 - `transport.write_memory(addr, blob)` **chunks only when the device is not graded post-safe** (#252): on a leak-prone, unprobed or unknown grade it splits at the client's `write_mem_query_threshold` (capped at 128), so every piece is a PUT and nothing leaks; on a post-safe device it stays one request (a POST above the threshold, which that firmware collects). The cost on a leak-prone device: a 16 KiB write is ~128 requests and **no longer one DMA transaction** — the 6510 runs between chunks, so pause the machine yourself if a running program must not see a half-written region. A span past `$FFFF` is refused before any byte is sent.
 - **`execute.load_code(transport, addr, code)` is a bare alias for `transport.write_memory`**, so it behaves exactly as above — chunked on a leak-prone grade, one request on a post-safe one. A direct `client.write_mem(addr, blob)` call does **not** chunk on any grade and still POSTs above the threshold.
-- `client.run_prg(prg)` is one attachment per call, whatever the PRG's size — **or two when the 404 sideload fires, which is precisely when you can least afford it.** With `fallback_on_404=True` (the default), a 404 from `runners:run_prg` makes the client re-send the whole PRG body through `write_mem(load_addr, body)`, **unchunked** (`run_prg`'s 404 sideload path in `ultimate64_client.py`) and so far above either threshold that it is always a POST — a second body-carrying request on top of the runner POST that already carried the body and 404'd. **And a 404 from that endpoint is itself a wedge symptom**, so the fallback doubles the attachment cost exactly at the moment the device is closest to the edge: a positive-feedback loop you meet for the first time at the worst possible moment. Pass `fallback_on_404=False` on a leak-prone device if you would rather see the 404. (Whether a POST that *returns* 404 still leaves its attachment behind is **unmeasured** — assume it does, which is the conservative reading; the sideload's own POST is not in doubt, only the doubling. Note for anyone who goes to settle it: the cheap version of that experiment — POST past the threshold to a bogus `/v1/runners:*` path, count `/Temp` either side — **is informative in only one direction**. A bogus path 404s at *routing*, possibly before the firmware ever materialises the attachment, whereas the real case is a 404 from a *known* route on a distressed device. A positive result (attachment appears) would be strong evidence that creation precedes routing, so the real case leaks too; a negative result proves nothing, because a known route may behave differently. Design for the positive case or find a way to 404 a real route.)
+- `client.run_prg(prg)` is one attachment per call, whatever the PRG's size — **or two when the 404 sideload fires, which is precisely when you can least afford it.** With `fallback_on_404=True` (the default), a 404 from `runners:run_prg` makes the client re-send the whole PRG body through `write_mem(load_addr, body)`, **unchunked** (`run_prg`'s 404 sideload path in `ultimate64_client.py`) and so far above either threshold that it is always a POST — a second body-carrying request on top of the runner POST that already carried the body and 404'd. **And a 404 from that endpoint is itself a wedge symptom**, so the fallback doubles the attachment cost exactly at the moment the device is closest to the edge: a positive-feedback loop you meet for the first time at the worst possible moment. Pass `fallback_on_404=False` on a leak-prone device if you would rather see the 404. (Whether a POST that *returns* 404 still leaves its attachment behind is **unmeasured** — assume it does. A cheap experiment against a bogus `/v1/runners:*` path is informative only if it shows an attachment: a bogus path 404s at routing, possibly before any attachment exists, which a known route on a distressed device need not do.)
 
-**Assembled routines are usually *over* the ceiling, so a code write is normally a POST.** Measured host-side at b412686, 2026-09-24 (`len()` of the builder output — no device involved), against the 128-byte C64U ceiling. **Blob size depends on the arguments**, so each figure carries the ones it was taken under; a figure quoted without them is not reproducible, which is how the first version of this table was wrong.
+**Assembled routines are usually *over* the ceiling — which matters only when you bypass the transport.** Through `transport.write_memory` / `load_code` / `write_bytes` they are chunked into PUTs on every grade that is not post-safe (#252, #294) and cost **zero** attachments on a C64U; a direct `client.write_mem(addr, blob)` sends one POST per blob above 128 bytes and leaks one attachment each. Sizes measured host-side at b412686, 2026-09-24 (`len()` of the builder output — no device involved), unchanged at 0e56950. **Blob size depends on the arguments**, so each figure carries the ones it was taken under.
 
 | Builder | Blob bytes | Conditions the figure was taken under | Over 128? |
 |---|---|---|---|
@@ -813,7 +821,7 @@ Four consequences to know before writing the loop:
 | `build_socket_close` | 118 (**366**) | defaults | only with the fence |
 | `build_uci_command` | **139** (**410**) | `params=b""`; **+5 bytes per param byte** (+21 `turbo_safe`) | **yes** |
 | `build_get_ip` | **144** (**431**) | defaults | **yes** |
-| `build_socket_read` | **155** (**474**) | defaults | **yes** |
+| `build_socket_read` | **155** (**474**); **234** (**610**) multi-block | defaults; multi-block at `max_len` > 255 or `multi_block=True` (`uci_socket_read` takes that path above 253; #420, #479) | **yes** |
 | `build_tcp_connect`, `build_udp_connect` | **165** (**509**) | defaults | **yes** |
 | `build_socket_write` | **176** (**446**) | payload-independent — 176 at payloads 0, 10, 128, 800, 892 | **yes** |
 | `build_tx_code` | **159-180** | 159 at `frame_len` 42, 60, 256; 164 at 512, 1024 (whole pages); 180 at 258, 1514 (#404 page loop); +60 for #487's skip phase | **yes** |
@@ -835,21 +843,17 @@ Four consequences to know before writing the loop:
 | `build_icmp_responder_tod_code` | **907** | `my_mac` set | **yes** |
 | " | 605 | `my_mac=None` | **yes** |
 
-**Why 783 and not 481 is the number to plan against.** `my_mac` is what makes the responder answer ARP for its own IP, and on this bench that is not optional: macOS holds every reply while it has no complete neighbour entry for the C64 (#218), so the RR-Net recipe in Pattern 8 tells authors to pass it. The `my_mac=None` form is 302 bytes smaller and is the one you will not be using. Same shape for `build_ping_and_wait_code`: the plain 336-byte form is not the one the pattern recommends — with ARP and the #222 drain it is 512, or 515 once `drain_status_addr` is passed.
+**Plan against 783, not 481.** `my_mac` is what makes the responder answer ARP for its own IP, and on this bench that is not optional: macOS holds every reply while it has no complete neighbour entry for the C64 (#218), so the RR-Net recipe in Pattern 8 passes it. Same shape for `build_ping_and_wait_code`: with ARP and the #222 drain it is 512, or 515 once `drain_status_addr` is passed, not the plain 336.
 
-**This was a conditions defect, not a wrong conclusion.** Every RR-Net figure is over 128 under *every* variant, so the "over 128?" column and everything drawn from it stand exactly as before — one attachment per blob load, whichever arguments you pass. Nothing in the guidance changed.
+The `turbo_safe=True` fence roughly triples every UCI blob. Practical readings:
 
-The `turbo_safe=True` fence roughly triples every UCI blob, so a turbo-safe routine that was under the ceiling is not. Practical readings:
+- **A UCI socket operation through `Ultimate64Transport` on a leak-prone or unknown grade costs no attachment.** `uci_socket_write` issues four writes — `socket_id` (1 byte), the payload (only `if data:`), the length (2 bytes), then the 176-byte routine via `_execute_uci_routine` — and every one goes through `transport.write_memory`, which chunks into PUTs there. Each chunk is still a round trip. On a post-safe device the over-threshold writes are single POSTs that the firmware collects.
+- **`enable_uci` / `disable_uci` cost nothing.** They are `set_config_items` — bodyless config PUTs, not the code-write path.
+- **An RR-Net ping or responder blob loaded with `load_code` costs nothing on a C64U** (chunked PUTs); only a direct `client.write_mem` of it leaks.
 
-- **Since #252 a UCI socket write through `Ultimate64Transport` on a leak-prone or unknown grade costs no attachment.** `transport.write_memory` chunks each of its writes into PUTs. On a post-safe device the over-threshold writes are single, collected POSTs. **Before #252 it cost one attachment for its routine code, plus a second only when the payload itself exceeded 128**, which is the shape described below. `uci_socket_write` issues four separate writes — `socket_id` (1 byte), the payload (**conditional on `if data:`**, and unchunked), the length (2 bytes), then the 176-byte routine via `_execute_uci_routine` — and only the payload can cross the ceiling. So the 800/892-byte large-send tests pay two; a small socket write pays one.
-- **`enable_uci` / `disable_uci` cost nothing.** They are `set_config_items` — bodyless config PUTs, not the code-write path. Enabling UCI does not leak.
-- **An RR-Net ping or responder blob loaded with `load_code` is one attachment each.**
+**The U64 trampoline stays under the ceiling, and a test holds it there.** Only one trampoline reaches REST at all: `run_subroutine`'s 14-byte U64 sentinel (`$0360`). `jsr()`'s 5-byte trampoline is the **VICE branch** — `run_subroutine` dispatches to `_run_subroutine_u64` on a U64 target and calls `jsr()` only otherwise, and `jsr()` needs checkpoints and register writes `Ultimate64Transport` does not have — so its bytes never cross a REST wire. `tests/test_run_subroutine_trampoline_size.py` (#254) pins the U64 trampoline to the PUT path from the request log of a full `run_subroutine` call.
 
-If you need a code write not to leak on any grade, put it through `write_bytes`: same bytes, threshold-sized chunks (`rest_put_chunk_size`), PUT path on every grade (#252). Since #252 `load_code` / `write_memory` also chunk on any grade that is not post-safe.
-
-**The U64 trampoline is under the ceiling, but nothing holds it there.** Only one trampoline reaches REST at all: `run_subroutine`'s 14-byte U64 sentinel (`$0360`). `jsr()`'s 5-byte trampoline is the **VICE branch** — `run_subroutine` dispatches to `_run_subroutine_u64` on a U64 target and calls `jsr()` only otherwise (`execute.py:698-709`), and `jsr()` needs checkpoints and register writes `Ultimate64Transport` does not have — so its bytes never cross a REST wire and it has no `/Temp` cost on any firmware. The 14 bytes take the PUT path on either threshold, but that is arithmetic on today's constants, not a pinned property: no test asserts the size stays below `write_mem_query_threshold`, so a few bytes of growth would silently move a per-call harness primitive onto the leaking POST path (issue #254 — whose body carries the same VICE/U64 error this paragraph did; **delete this paragraph's "nothing holds it there" claim when #254 lands a test**). If you grow it, check the size yourself.
-
-**Two routes that can exceed any chunk ceiling** — a SocketDMA write that falls back to REST, and a `uci_socket_write` payload — are tracked as issue #242.
+**A SocketDMA write that falls back to REST, and a `uci_socket_write` payload,** used to be able to exceed any chunk ceiling (#242, closed): both now reach `transport.write_memory`'s chunked path on a non-post-safe grade.
 
 So on a leak-prone device **`run_prg_via_sys(target, prg)` is the low-risk way to start a program and `client.run_prg(prg)` is the costly one** — the opposite of the intuition that the purpose-built endpoint must be the cheaper path. (`run_prg_via_sys` is also what an external cartridge needs; see Pattern 8 § "Hardware RR-Net on the U64".)
 
@@ -858,7 +862,7 @@ So on a leak-prone device **`run_prg_via_sys(target, prg)` is the low-risk way t
 **Rules for tests and scripts:**
 
 1. **Hygiene is the harness's job, not the test author's.** If you find yourself adding a manual cleanup call to a test, the guard belongs one layer down instead.
-   That guard has landed (merged 2026-09-10, commit f2b46ce): `Ultimate64Client`
+   That guard is in place: `Ultimate64Client`
    arms a `/Temp` hygiene pass on its own when the device's capabilities say the
    firmware is leak-prone — `client.temp_hygiene_armed`
    (`backends/ultimate64_client.py`) decides from `temp_hygiene=` first, then
@@ -887,9 +891,7 @@ So on a leak-prone device **`run_prg_via_sys(target, prg)` is the low-risk way t
    request, so a slow-probed device arms from its **second** attachment-creating
    request, the first having been decided on the stale unknown grade — well inside
    a budget of 6. Only if that second probe also fails does it stay disarmed, with
-   a WARNING saying so. (An earlier revision of this paragraph said the timed-out
-   case stays disarmed for the client's lifetime; that came from a stale docstring
-   and is wrong — issue #262.) Force arming with `temp_hygiene=True` or
+   a WARNING saying so (#262). Force arming with `temp_hygiene=True` or
    `U64_AUTO_TEMP_GC=1`. The drain on `close()` / `DeviceLock` release also sweeps for a client that **leaked nothing**, so a lane inheriting a dirty `/Temp` collects it on the way out (issue #264). That inherited-only sweep runs only under the device lock (lock release, or `close()` while holding it). If it fails it writes no config and blocks nothing: it logs a WARNING that FTP File Service must be enabled by hand. Only a client that leaked gets the automatic FTP-enable attempt — a `Network Settings` write that persists until a firmware power-on (issue #263). **The budget is per device within one process** (#295):
    every client of one host shares one count, so a fresh client per upload does not
    reset it, and a lock release sweeps once per host however many clients exist. A
@@ -903,10 +905,10 @@ So on a leak-prone device **`run_prg_via_sys(target, prg)` is the low-risk way t
    client's *own* uncollected share. A client that leaked nothing sweeps and may
    block, but never writes config.
 2. **Never loop an upload against a leak-prone device without a hygiene pass.** Nobody knows how many uploads an unpatched device survives before `/Temp` fills and the firmware crashes, so there is no count to stay under: the harness's per-device budget (`DEFAULT_LEAK_BUDGET`, #295) is a conservative choice, not a measured limit. **Budget across runs, not within one:** a `reboot()` does not delete attachments (measured), so what you are spending is whatever the device has accumulated since its last GC or power-cycle — including everything the previous lane left behind. Parametrization multiplies quietly: four `mhz` params x three vectors is twelve uploads in one session.
-3. **A hygiene result with `.error` set is a failed pass, not a benign skip.** `gc_temp_folder` never raises — it reports. The GC needs the device's **FTP File Service**, which is **`Disabled` by default on 1.1.0**: verify it is on before relying on a hygiene pass, never assume it. Where it is off the sweep silently no-ops and the failure mode is "cleanup appeared to run, device wedged anyway". Stop uploading after an `.error`; do not keep going. And know what the harness does about it: on a failed pass `_run_temp_hygiene` (`ultimate64_client.py:812-834`) **enables FTP File Service itself** — a `Network Settings` write it logs at WARNING and never restores, persisting until a firmware power-on, since `machine:reboot` does not clear firmware RAM. So the setting you find on a device may be a previous lane's hygiene pass rather than anyone's decision, and that write targets a store the entry-baseline code lists in `BASELINE_NEVER_TOUCH`. Those are two contracts, not a contradiction (owner decision on #263): `BASELINE_NEVER_TOUCH` means `apply_factory_baseline` never resets or asserts those stores, while the hygiene pass may write exactly this one item, once per device per process (#295), and only for a client that leaked — a client that leaked nothing writes no config.
+3. **A hygiene result with `.error` set is a failed pass, not a benign skip.** `gc_temp_folder` never raises — it reports. The GC needs the device's **FTP File Service**, which is **`Disabled` by default on 1.1.0**: verify it is on before relying on a hygiene pass, never assume it. Where it is off the sweep silently no-ops and the failure mode is "cleanup appeared to run, device wedged anyway". Stop uploading after an `.error`; do not keep going. And know what the harness does about it: on a failed pass `Ultimate64Client._run_temp_hygiene` **enables FTP File Service itself** — a `Network Settings` write it logs at WARNING and never restores, persisting until a firmware power-on, since `machine:reboot` does not clear firmware RAM. So the setting you find on a device may be a previous lane's hygiene pass rather than anyone's decision, and that write targets a store the entry-baseline code lists in `BASELINE_NEVER_TOUCH`. Those are two contracts, not a contradiction (owner decision on #263): `BASELINE_NEVER_TOUCH` means `apply_factory_baseline` never resets or asserts those stores, while the hygiene pass may write exactly this one item, once per device per process (#295), and only for a client holding an uncollected leak of its own — a client that leaked nothing writes no config.
 4. **Run hygiene while holding the `DeviceLock`.** `gc_temp_folder` acquires no lock of its own.
 5. **Prefer the routes that do not leak** for bulk data — **but do not enable SocketDMA writes; the write fast path is disabled pending a stability review** (see § "SocketDMA write fast path" below). The non-leaking route for bulk data is `write_bytes` / `run_prg_via_sys`, whose threshold-sized chunks (128 on a C64U) stay on the PUT path on every grade (#252) — and there is no fast replacement. Measured on the U64E (fw 3.15, bce4535e, 2026-09-15, host on Wi-Fi (en0), link not instrumented, every write verified, n=2-4 per arm, interleaved, #267): `write_bytes` runs about 1.3 KiB/s at 48-byte chunks and about 3.2 KiB/s at 128-byte chunks, median ~36-52 ms per PUT, observed 34-79 ms, so 16 KiB takes ~12.5 s or ~5.0 s, where a single 16 KiB POST took ~0.1 s on that device. The per-PUT time barely moves with chunk size, so it is dominated by the host link and per-request overhead, not the payload. The 128-byte arm is the chunk a C64U uses, but its per-request latency over its own link is not measured on the C64U, so do not read 3.2 KiB/s as that device's rate.
-6. **Where you drive the protocol decides your exposure.** Before #252, UCI driven from host Python cost a POST per `_execute_uci_routine` call (one per `uci_socket_*` operation), so a fetch made of many `socket_read`s was many attachments. Since #252, through `Ultimate64Transport` on a leak-prone or unknown grade, those routine writes are chunked PUTs that cost no attachment, but each chunk is still a round trip. The same protocol driven C64-side, inside an uploaded PRG, costs only the upload that put it there. When a run needs many operations against a leak-prone device, **moving the loop onto the 6510 removes the leak rather than cleaning up after it** — which beats managing it with a GC.
+6. **Where you drive the protocol decides your exposure.** UCI driven from host Python through `Ultimate64Transport` on a leak-prone or unknown grade costs no attachment (the routine writes are chunked PUTs, #252), but every `uci_socket_*` operation is several round trips; through a direct `client.write_mem` it is a POST per routine. The same protocol driven C64-side, inside an uploaded PRG, costs only the upload that put it there. When a run needs many operations against a leak-prone device, **moving the loop onto the 6510 removes the leak rather than cleaning up after it** — which beats managing it with a GC.
 7. **Do not export a live gate as a side effect of unrelated work.** Every live test here skips unless its gate is set; keep it that way unless the device run is the point of the task.
 8. **Diagnose a suspected wedge with bodyless calls.** `liveness_probe()` costs
    **two attachments per call** on leak-prone firmware (measured on the C64U
@@ -941,14 +943,14 @@ So on a leak-prone device **`run_prg_via_sys(target, prg)` is the low-risk way t
 
 **The practice: a live test reconciles the device to a known baseline when it starts, and then sets only the items it needs. It does not depend on the previous run having cleaned up after itself.** Entry-time reconciliation, not exit-time restore.
 
-Setup is verifiable, teardown is not — and teardown is missing exactly when it matters most. On 2026-09-10 a live run against the bench U64E was SIGKILLed about 30 s in. `tests/test_ultimate64_transport_live.py` leaves the device at 1 MHz in the teardown of its module-scoped `transport` fixture — the statements after its `yield t` — and a SIGKILL runs none of them. The device had been flashed to defaults minutes earlier, so the residue was unambiguous: `U64 Specific Settings / CPU Speed` read `' 8'` against a default of `' 1'`, and nothing in the harness noticed or said so (issue #276; the per-item `current`-vs-`default` comparison is the measurement, 201 items on the U64E, 2026-09-10, and the attribution to that window is strong but circumstantial). An 8× device does not fail anybody's test — it produces plausible, wrong timing numbers for every later run, on a bench shared by several projects. That fixture is in fact weaker than the `finally` #276 describes it as: its teardown is a bare post-`yield` sequence with no `try`/`finally`, so an exception arriving at the `yield` skips the `set_speed(1)`, the `t.close()` and the `lock.release()` alike.
+Setup is verifiable, teardown is not — and teardown is missing exactly when it matters most. On 2026-09-10 a live run against the bench U64E was SIGKILLed about 30 s in, and `tests/test_ultimate64_transport_live.py`'s teardown — which put the device back at 1 MHz — never ran. The device had been flashed to defaults minutes earlier, so the residue was unambiguous: `U64 Specific Settings / CPU Speed` read `' 8'` against a default of `' 1'`, and nothing in the harness noticed (issue #276; the attribution to that window is strong but circumstantial). An 8× device does not fail anybody's test — it produces plausible, wrong timing numbers for every later run, on a bench shared by several projects. That module now reconciles at entry through its `speed_baseline` fixture.
 
 `finally` covers exceptions and normal exit. It does not cover SIGKILL, a host crash, or a worker reaped by a parallel launcher — which is the shape that occurred. So **restore-on-exit is a courtesy; the correctness mechanism is reconciliation at entry**, the only point at which a process is present to notice the leftovers and fix them.
 
 > **Do not hand-roll this, and never with the raw endpoint.** The naive form of the advice — "just call `configs:reset_to_default`" — is dangerous on this bench, and the repo already knows why: see `BASELINE_NEVER_TOUCH` in `src/c64_test_harness/backends/ultimate64_baseline.py`, where each of the five refused stores carries its reason.
 >
 > - **`SID Sockets Configuration`** — the reset **cuts socket power**. `ConfigStore::reset` sets `SID Socket 1/2=Disabled` and the store's `effectuate_settings` writes regulator bits 0 to the PLD SIDCTRL/I2C (`u64_config.cc:744-800`). Measured on the U64E with two 8580s, n=3, 2026-09-05: all six items flip (`Enabled→Disabled`, `8580→None`, `22 nF→470 pF`) — and because every item now equals its default, "the report reads clean, so the socketed SIDs are POWERED OFF with nothing to say so". Detection never re-runs over REST (only at boot or from the on-device menu).
-> - **`Ethernet Settings`** — the reset **drops the DHCP lease mid-request**. `ConfigStore::reset` is followed by `effectuate()`, and `NetworkInterface::effectuate_settings` on an initialised, link-up interface calls `dhcp_stop()` → `dhcp_release_and_stop` (`lwip/src/core/ipv4/dhcp.c:1325-1390`): DHCP_RELEASE goes out and `netif_set_addr(netif, IP4_ADDR_ANY4, ...)` zeroes the address the REST request arrived on. The guard that makes this a live no-op arrived **post-tag** in `6b5ffc21` and exists only in the `v3.15-8x` fork this bench flashed onto the U64E; upstream and the C64U's 1.1.0 line call `dhcp_stop()` unconditionally. On a statically addressed device the same path takes the `else` branch — which is why **tests must never configure a static address**.
+> - **`Ethernet Settings`** — the reset **drops the DHCP lease mid-request**. `ConfigStore::reset` is followed by `effectuate()`, and `NetworkInterface::effectuate_settings` on an initialised, link-up interface calls `dhcp_stop()` → `dhcp_release_and_stop` (`lwip/src/core/ipv4/dhcp.c:1325-1390`): DHCP_RELEASE goes out and `netif_set_addr(netif, IP4_ADDR_ANY4, ...)` zeroes the address the REST request arrived on. The guard that makes this a live no-op arrived in `6b5ffc21` (upstream #805, merged to test-merge 2026-08-27, now on GideonZ master and in the public v3.15 and v3.15a release tags). Every recorded U64E build carries it (`71480a9d`, `7f6fcb51`, `4011c97c`, `bce4535e`); the C64U's 1.1.0 does not, and calls `dhcp_stop()` unconditionally. On a statically addressed device the same path takes the `else` branch — which is why **tests must never configure a static address**.
 > - **`Network Settings`** — the reset blanks the Network Password and the syslog server, restores the hostname to the product default, and **re-enables** every service (Ultimate Ident/DMA, Telnet, FTP, Web, SNTP all default to `1 = Enabled`, `network_config.cc:15-36`). It turns them on, not off: a security-shaped change on a shared bench that silently undoes a deliberate service-off state.
 > - **`WiFi settings`** — device-loss risk. The C64 Ultimate reaches the bench over WiFi and its **reconnection after a power cycle is known unreliable**: the owner has seen it fail to rejoin, saved a working configuration to flash deliberately, and confirmed the rejoin only by standing at the device (owner testimony, 2026-09-11). A reset would discard that configuration in RAM and re-effectuate the stack the device is reached over, and if it does not come back there is no remote remedy at all.
 > - **`Clock Settings`** — the RTC: the reset shows neither drift nor mismatch while arming the next PUT to the category to write the 2015 defaults to the clock chip (`rtc.cc:350-409`).
@@ -971,7 +973,8 @@ with create_manager(backend="u64", u64_hosts="10.43.23.81") as mgr:
 
 # Scripts: the same step by hand, with the report.
 report = apply_factory_baseline(target.client)          # or dry_run=True to look without writing
-print(report.summary())                                 # "14 categories reset; 3 item(s) drifted before; 0 still off after"
+print(report.summary())   # U64E, e.g. "12 categories reset; 3 item(s) drifted before; 0 still off after;
+                          #   2 skipped (absent): Speaker Mixer, Keyboard Lighting"
 for cat, item in report.drifted_items():                # what the previous lane left behind (logged at INFO too)
     print(cat, item, report.drifted[cat][item])         # (value_before, default)
 ```
@@ -996,6 +999,7 @@ from c64_test_harness.backends.ultimate64 import Ultimate64Transport
 from c64_test_harness.backends.ultimate64_helpers import (
     check_measurement_environment, restore_speed_defaults, set_turbo_mhz,
 )
+from live_fixture_teardown import raise_teardown_failures, teardown_then_release  # tests/
 
 _HOST = os.environ.get("U64_HOST")
 _MUTATE = os.environ.get("U64_ALLOW_MUTATE") == "1"   # this module writes config — gate it (#268)
@@ -1008,6 +1012,7 @@ def transport():
     if not lock.acquire(timeout=120.0):
         pytest.skip(f"could not acquire device lock for {_HOST}")
     t = None
+    failures = []
     try:
         # Inside the try, not before it: a constructor raise (unreachable host,
         # bad password) would otherwise leak the lock we just took.
@@ -1028,19 +1033,17 @@ def transport():
     finally:
         # Courtesy, not the guarantee. What actually guarantees the next lane a
         # known device is *its own* step 1 — this block does not run on SIGKILL.
-        if t is not None:
-            try:
-                # Both speed items back to the firmware default (#365). Not
-                # set_turbo_mhz(t.client, 1): that runs at 1 MHz but writes
-                # Turbo Control = Manual, which is != default.
-                restore_speed_defaults(t.client)
-            except Exception:
-                pass
-            t.close()
-        lock.release()
+        # Every step is attempted; lock.release() runs last, always (#334, #368).
+        # Both speed items go back to the firmware default (#365) — not
+        # set_turbo_mhz(t.client, 1), which writes Turbo Control = Manual.
+        failures = teardown_then_release([
+            ("restore_speed_defaults", (lambda: restore_speed_defaults(t.client)) if t is not None else None),
+            ("t.close()", t.close if t is not None else None),
+        ], lock.release)
+    raise_teardown_failures("transport teardown", failures)   # after the release, never masking the body
 ```
 
-Three things the example is making a point of. The `try`/`finally` opens **immediately after `lock.acquire()` succeeds** and the transport is built inside it, so the `DeviceLock` is released on every path a live process survives — including a constructor that raises. Put the construction above the `try`, as the obvious version does, and an unreachable host leaks the lock for the heartbeat's lifetime; the module in #276 does not wrap the `yield` at all. The `t is not None` guard is what makes that ordering safe. And a measurement module that needs 1 MHz should still call `check_measurement_environment(t.client)` after step 1 (gotcha 28): the entry reset makes turbo-at-default *likely*, the guard makes it *checked*, and the two are not the same claim.
+Three things the example is making a point of. The `try`/`finally` opens **immediately after `lock.acquire()` succeeds** and the transport is built inside it, so the `DeviceLock` is released on every path a live process survives — including a constructor that raises. Put the construction above the `try` and an unreachable host leaks the lock for the heartbeat's lifetime. The `t is not None` guards are what make that ordering safe, and `teardown_then_release` attempts every step independently, releases last, and hands failures back to be raised after the release (a bare post-`yield` teardown is refused structurally for `test_*_live.py`). And a measurement module that needs 1 MHz should still call `check_measurement_environment(t.client)` after step 1 (gotcha 28): the entry reset makes turbo-at-default *likely*, the guard makes it *checked*, and the two are not the same claim.
 
 `create_manager(backend="u64")` does step 1 for you — no argument needed on a U64E — and is the better choice whenever the module can take its target from the manager; roll the fixture by hand only when it cannot.
 
@@ -1049,7 +1052,7 @@ Three things the example is making a point of. The `try`/`finally` opens **immed
 There are two hardware generations with real behavioral differences. Detect with `client.get_info()["product"]`: `"Ultimate 64 Elite"` (fw 3.14/3.15) vs `"C64 Ultimate"` (fw 1.1.0). Never hardcode one generation's behavior; on an unrecognized product, skip with the observed payload rather than guessing. Known asymmetries (each live-verified):
 
 - **CPU-speed enum**: Elite has `" 5"` but not `"64"`; C64U has `"64"` but not `" 5"`. The harness schema is the cross-generation superset — `set_turbo_mhz` probes the device's actual CPU-Speed presets (once, cached per client) and raises `ValueError` locally for a foreign speed; only when the probe is inconclusive does the write reach the firmware, which rejects it with HTTP 400 *before* Turbo Control is enabled (`set_turbo_mhz` writes CPU Speed first, on purpose). `max_cpu_speed_mhz(client)` / `set_speed(None)` resolve "max" from the same probe (64 on C64U, 48 on U64E; 48 fallback). Contract test: `tests/test_turbo_contract_live.py` (`TURBO_CONTRACT_LIVE=1` gate).
-- **REU / Cartridge preset**: only U64E firmware 3.14 exposed `Cartridge` as an enum with a `"REU"` preset that had to be written to enable the REU. U64E 3.15 replaced it with a `.crt` file chooser (`presets: [""]`; firmware `c64.cc:73`, `CFG_TYPE_STRFUNC`/`list_crts`) and the REU is controlled by `RAM Expansion Unit` + `REU Size` alone; the C64U (1.1.0) likewise has no `"REU"` preset — its `Cartridge` value merely mirrors REU state, and writing it back is rejected with HTTP 400. `set_reu` / `restore_state` handle all three by probing the item's presets (preset write ordered first, so a rejection never half-enables the REU). Don't hand-write `Cartridge: "REU"` config updates; use the helpers. `REU Size` read-back is trustworthy — a value that changes between reads means a config write, a flash reload, or a reboot/power-cycle in between (PUTs are volatile until `save_to_flash`); see `tests/test_reu_size_readback_live.py`.
+- **REU / Cartridge preset**: only U64E firmware 3.14 exposed `Cartridge` as an enum with a `"REU"` preset that had to be written to enable the REU. U64E 3.15 replaced it with a `.crt` file chooser (`presets: [""]`; firmware `c64.cc:73`, `CFG_TYPE_STRFUNC`/`list_crts`) and the REU is controlled by `RAM Expansion Unit` + `REU Size` alone; the C64U (1.1.0) likewise has no `"REU"` preset — its `Cartridge` value merely mirrors REU state, and writing it back is rejected with HTTP 400. `set_reu` / `restore_state` handle all three by probing the item's presets (preset write ordered first, so a rejection never half-enables the REU). Don't hand-write `Cartridge: "REU"` config updates; use the helpers. `REU Size` read-back is trustworthy — a value that changes between reads means a config write, a flash reload, or a reboot/power-cycle in between (PUTs are volatile until `save_config_to_flash()`); see `tests/test_reu_size_readback_live.py`.
 - **REST `POST writemem` cliff (C64U)**: ~100–160 ms up to 12 KiB, then ~6 s per request at ≥16 KiB (sometimes exceeding a 10 s client timeout). Per-request pathology, not a wedge — the device stays healthy. **There is no fast bulk-write path on a C64U today.** The SocketDMA fast path is disabled (see below), which leaves `write_bytes` / `run_prg_via_sys` — and those are ~128 128-byte PUT round trips for 16 KiB **on a C64U** (`write_bytes` chunks at the client threshold, so every chunk is a PUT on every grade, #252; on a post-safe device that means 48-byte PUTs, a cost accepted by owner decision 2026-09-15), and the only timing is from the U64E. Measured there (fw 3.15, bce4535e, 2026-09-15, host on Wi-Fi (en0), link not instrumented, n=2-4 per arm, interleaved, #267): `write_bytes` runs about 1.3 KiB/s at 48-byte chunks (16 KiB in ~12.5 s) and about 3.2 KiB/s at 128-byte chunks (~5.0 s), median ~36-52 ms per PUT, observed 34-79 ms, dominated by the host link rather than the payload, while a single 16 KiB POST took ~0.1 s on that device, with no cliff at that size. It is not measured on the C64U: the 128-byte chunk is the same arm, but the latency over that device's link is unknown, so budget for it being slow and do not assume it beats the ~6 s cliff.
 
 ### SocketDMA write fast path (TCP 64)
@@ -1058,16 +1061,17 @@ There are two hardware generations with real behavioral differences. Detect with
 
 The firmware serves a binary "SocketDMA" channel on TCP port 64 (client: `SocketDMAClient`, package-root export; capabilities: DMA load/run, raw memory write, REU write, keyboard inject, reset, identify). On the C64U it ships disabled — enable **Network Settings → "Ultimate DMA Service"**. `Ultimate64Transport` wires it in as an opt-in bulk-write route gated on two attributes: **`socket_dma`** (the master switch, default `False`) and **`socket_dma_min_bytes`** (default 8192 — the payload size at or above which `write_memory` takes DMAWRITE instead of REST). They are named here so you can recognise the path in someone else's code or in a traceback; **do not set either**. No runnable recipe is given, deliberately — a copy-pasteable one outlives the prohibition that sits above it.
 
-Semantics to rely on: same `MemoryPolicy` checks as the REST path; chunked at 32 KiB (full 64 KiB writes work); `DMAWRITE` is fire-and-forget (no per-command ack), so the transport finishes each write with an in-band **`IDENTIFY` completion barrier** — commands on one connection are serviced strictly in order, so the reply proves every chunk was consumed and applied (same pattern as `reu_write`; recv timeout scales with payload size) — followed by a REST tail read-back as a post-barrier sanity check (`socket_dma_verify_timeout`, default 2 s). A tail read-back alone is NOT a completion barrier: a tail that matches pre-existing RAM reports success while the bulk DMA is still in flight. Connect/send/barrier/verify failure logs a WARNING and falls back to REST, and a connect failure latches the fast path off for the transport's lifetime. **Firmware from fdb521a5 (2026-05-10) on — v3.15 and the U64E fork — closes a SocketDMA connection idle for >1 s** (`SO_RCVTIMEO = 1 s` in `socket_dma.cc`; U64E 3.15: 0.90 s gap ok 3/3, 1.00 s closed 3/3; v3.14d / 1.1.0 have no socket timeout, where the reconnect is a spare handshake), and a command sent into that socket is never read — that was issue #223's "intermittent" barrier failure (50/50 at a 1.5 s inter-write gap, 0/50 at 0.2 s, load irrelevant, failed DMA applied 0/50). `SocketDMAClient` now reopens a connection idle for `IDLE_RECONNECT_SECONDS` (0.8 s) before the next command, and the transport retries a failed send/barrier once on a fresh connection before falling back (re-send is idempotent for RAM: same bytes, same address; a span touching `$D000-$DFFF` is never re-sent — straight to REST). Live: `tests/test_socketdma_barrier_live.py`. Live tests: `tests/test_socketdma_live.py` (`SOCKETDMA_LIVE=1` gate). The service is present on the bench U64E's post-tag 3.15 fork (the #223 measurements above ran there); availability on 3.14 builds is untested. The fallback used to be described here as making it "safe everywhere" — **that is now false**: the fallback only covers *reachability*, and says nothing about the concern behind the standing do-not-enable rule at the top of this section.
+Semantics, for reading such code: same `MemoryPolicy` checks as the REST path; chunked at 32 KiB; `DMAWRITE` is fire-and-forget, so the transport finishes each write with an in-band **`IDENTIFY` completion barrier** (commands on one connection are serviced in order, so the reply proves every chunk was applied), then a REST tail read-back as a sanity check (`socket_dma_verify_timeout`, default 2 s) — a tail read-back alone is not a barrier. A connect/send/barrier/verify failure logs a WARNING and falls back to REST, and a connect failure latches the fast path off for the transport's lifetime (`_socket_dma_unusable`, never cleared). Firmware from fdb521a5 on (v3.15 and the U64E fork) closes a SocketDMA connection idle > 1 s (`SO_RCVTIMEO` in `socket_dma.cc`; #223), so `SocketDMAClient` reopens one idle for `IDLE_RECONNECT_SECONDS` (0.8 s) and the transport retries a failed send/barrier once on a fresh connection before falling back (a span touching `$D000-$DFFF` is never re-sent). Live tests: `tests/test_socketdma_barrier_live.py`, `tests/test_socketdma_live.py` (`SOCKETDMA_LIVE=1`). The REST fallback covers reachability only; it says nothing about the review behind the rule above.
 
 ### DMA Trampoline Pattern
 ```python
-from c64_test_harness.backends.device_lock import DeviceLock
-from c64_test_harness.backends.ultimate64 import Ultimate64Transport
-from c64_test_harness.backends.ultimate64_client import Ultimate64Client
-from c64_test_harness.backends.ultimate64_helpers import set_turbo_mhz, set_reu, reboot
+import time
+from c64_test_harness import Labels
 from c64_test_harness.memory import write_bytes, read_bytes
 
+# `transport` is target.transport from create_manager(backend="u64") (locked);
+# `labels` is the program's ld65 label file; RESULT_ADDR is the program's output.
+labels = Labels.from_file("build/program.labels")
 SENTINEL = 0x0350      # Scratch byte for completion signaling
 # These two belong to the program under test, not to you. Read them from that
 # build's ld65 label listing instead of pasting an address: the literals that
@@ -1103,7 +1107,6 @@ write_bytes(transport, SENTINEL, bytes([0x00]))
 write_bytes(transport, MAIN_LOOP + 2, bytes([TRAMPOLINE >> 8]))
 
 # Poll sentinel for completion
-import time
 deadline = time.monotonic() + 30.0
 while time.monotonic() < deadline:
     if transport.read_memory(SENTINEL, 1)[0] == 0x42:
@@ -1127,7 +1130,7 @@ client.run_prg(prg_data)  # may hang!
 # RIGHT: reboot() restarts the C64 side with cartridge + REU re-initialised
 client.reboot()
 time.sleep(8.0)  # ~8s before the device answers again
-set_reu(client, enabled=True, size="512 KB")  # re-enable after reboot
+set_reu(client, enabled=True, size="512 KB")  # config write; see Gotcha 18
 set_turbo_mhz(client, 32)
 client.run_prg(prg_data)  # works reliably
 ```
@@ -1145,7 +1148,7 @@ target.transport.set_speed(1)              # 1 MHz on both backends (warp off / 
 target.transport.set_speed(None)           # "max speed" — VICE warp / U64 probed max (64 on C64U, 48 on U64E)
 ```
 
-VICE raises `NotImplementedError` for `set_speed` multipliers other than `1` and `None` because the 6510 has no discrete CPU-speed steps natively; both work on default VICE targets (no text monitor needed — see Gotcha 20). On U64, `set_speed(None)` resolves to the device's true maximum via a cached CPU-Speed preset probe (48 fallback when inconclusive), and a generation-foreign multiplier raises `ValueError` locally when the probe succeeded. The REU re-enable step above remains U64-only — there's no protocol-level cartridge-state shim yet, so REU-heavy benches must still drop to `client.*` for `set_reu(...)`.
+VICE raises `NotImplementedError` for `set_speed` multipliers other than `1` and `None` because the 6510 has no discrete CPU-speed steps natively; both work on default VICE targets (no text monitor needed — see Gotcha 20). On U64, `set_speed(None)` resolves to the device's true maximum via a cached CPU-Speed preset probe (48 fallback when inconclusive), and a generation-foreign multiplier raises `ValueError` locally when the probe succeeded. REU configuration is U64-only — there's no protocol-level cartridge-state shim, so REU-heavy benches drop to `client.*` for `set_reu(...)`.
 
 ### Verify Program Startup via Code Bytes (not screen text)
 After `run_prg()`, screen RAM ($0400) may contain stale text from a prior run. Always verify startup by polling for known code bytes:
@@ -1164,12 +1167,12 @@ while time.monotonic() < boot_deadline:
 
 ### Debug stream is rate-capped at 1 MHz-equivalent (turbo gives a 1/N sampled view)
 
-The U64E FPGA emits the UDP debug stream at a fixed rate of **~1.02M bus-cycle entries/sec** (2,842-2,843 packets/sec on the NTSC U64E at 1 MHz, wired host, #432) regardless of the CPU's actual turbo speed. That matches the 6510's native rate at 1 MHz, so `DebugCapture` at 1 MHz is essentially cycle-accurate. At higher turbo speeds you receive a **uniformly sampled 1/N view** of the real bus — at 48 MHz only ~2% of cycles reach the host, but the sampling is uniform and `packets_dropped` stays at zero (the rate limit is at the FPGA source, not the UDP path). Measured in `tests/test_u64_debug_stream_speed_live.py`.
+The U64E FPGA emits the UDP debug stream at a fixed rate of **~1.02M bus-cycle entries/sec** (2,842-2,843 packets/sec on the NTSC U64E at 1 MHz, wired host, #432) regardless of the CPU's actual turbo speed. That matches the 6510's native rate at 1 MHz, so `DebugCapture` at 1 MHz is essentially cycle-accurate. At higher turbo speeds you receive a **uniformly sampled 1/N view** of the real bus — at 48 MHz only ~2% of cycles reach the host; turbo speed itself adds no sequence gaps, because the rate limit is at the FPGA source. Measured in `tests/test_u64_debug_stream_speed_live.py`. **`packets_dropped` is not zero in general** (#424): the bench's own loss ran 0.4-45% of packets per 1 s capture, placed at the host's Wi-Fi downlink and load-dependent (#356).
 
 ```python
 # WRONG: try to capture a complete trace while running at turbo speed
 set_turbo_mhz(client, 48)
-cap = DebugCapture(port=11002, multicast_group="239.0.1.66")
+cap = DebugCapture(port=11002, multicast_group="239.0.1.66", device_host=client.host)
 cap.start()
 client.stream_debug_start("239.0.1.66:11002")
 # ... run the target routine ...
@@ -1192,9 +1195,9 @@ What to use turbo-speed capture for: aggregate statistics that tolerate uniform 
 
 The `multicast_group=` argument on `DebugCapture` receives the U64's default `Stream Debug to` destination, the multicast group `239.0.1.66:11002`. **A multicast join receives only when it is made towards the device** (#399, U64E fw bce4535e, 2026-09-23, host wired on the device's LAN, n=3 per arm): `device_host=` (or an explicit `multicast_interface=`) on `AudioCapture`/`DebugCapture`/`VideoCapture` received the group in every arm, while the default INADDR_ANY join received 0 in 6/6 because the kernel routes `239.0.1.x` via the VPN on this bench; a default join whose route is a tunnel now logs a WARNING naming it (#494). Over Wi-Fi no join received anything (#461), so unicast is the fallback there.
 
-### Recovering from FPGA UDP-rate degradation
+### Suspected debug-stream rate degradation (unverified)
 
-The U64E FPGA's debug-stream emitter degrades over time under sustained workload — observed delivery drops to 30–90% of the configured rate after a long run, and only `reboot()` restores it (`reset()` is not enough; see issue #81) — an empirical result, not a claim that the FPGA is re-loaded: `reboot()` is a C64-level reset and the firmware keeps running. For multi-routine benches, use `DebugCapture.with_fresh_fpga(client)` to reboot + settle (12s default) and return a freshly-constructed `DebugCapture` ready to `.start()`.
+**Unverified (#431).** Delivery was observed to drop to 30–90% of the configured rate after long runs and to recover after `reboot()` but not `reset()` (#81) — but the host's Wi-Fi downlink reproduces that signature with no FPGA involvement, and there has been no wired-host reproduction. Treat `reboot()` as a remedy that helped, not a diagnosis; it is a C64-level reset and neither the FPGA nor the firmware is reloaded. For multi-routine benches, `DebugCapture.with_fresh_fpga(client)` reboots, settles (`reboot_settle_seconds=12.0`) and returns a freshly constructed `DebugCapture` ready to `.start()`.
 
 ```python
 from c64_test_harness.backends.u64_debug_capture import DebugCapture
@@ -1202,7 +1205,8 @@ from c64_test_harness.backends.u64_debug_capture import DebugCapture
 for routine in routines:
     cap = DebugCapture.with_fresh_fpga(
         client,
-        capture_kwargs={"port": 11002, "multicast_group": "239.0.1.66"},
+        capture_kwargs={"port": 11002, "multicast_group": "239.0.1.66",
+                        "device_host": client.host},
     )
     cap.start()
     client.stream_debug_start("239.0.1.66:11002")
@@ -1217,7 +1221,7 @@ This helper never calls `poweroff()` — `reboot()` is the right primitive for c
 Three failure modes show up when driving a U64 hard from a test run:
 
 - **CPU stuck (alive-but-hung 6510):** HTTP still works, but the running program has wedged the CPU. A soft `reset()` clears it instantly.
-- **FPGA / REU / DMA stuck:** typically after turbo-speed switches with REU-heavy workloads. A soft reset is not enough; only `reboot()` (~8s, a C64-level restart with cartridge and REU re-initialised) clears it.
+- **REU / DMA stuck:** typically after turbo-speed switches with REU-heavy workloads. A soft reset is not enough; only `reboot()` (~8s, a C64-level restart with cartridge and REU re-initialised) clears it.
 - **Runner subsystem wedged:** the device is otherwise reachable (HTTP + `/v1/version` respond) but `run_prg` returns the firmware's `"Cannot open file"` signature and refuses new programs. `recover()` clears it **when the cause is runner state**.
 - **`/Temp` attachment accumulation (leak-prone firmware only):** the *same* `"Cannot open file"` signature, and the one failure mode on this list that `recover()` cannot touch — because past a point it is not a runner fault at all but a **firmware crash** (issue #153; the C64 keeps running while the firmware stops answering both the network and the physical menu button). The attachments are the trigger and **neither `reset()` nor `reboot()` deletes them**, so both "succeed" and the next upload wedges identically, and the UCI bridge goes with it. That is measured, not inferred: on the C64U (2026-09-10, under the lock, FTP either side) one POST left `temp0008`, and a `reboot()` plus 6 s settle left `temp0008` exactly where it was. The mechanism agrees — `/Temp` is a FAT filesystem on a firmware **RAM disk** (`ramdisk.cc:25-42`) and `machine:reboot` is a C64-level reset that never restarts the firmware. **So accumulation is across runs, not within one**: a fresh test session inherits every attachment the previous one left, and "I rebooted between runs" is not cross-run protection. Distinguish it by history, not by the error: if the session has been uploading (`run_prg`, `load_prg`, POST `writemem` above the threshold) against a device whose `DeviceCapabilities.writemem_post_safe` is `False`, assume this one first. The fix is a `/Temp` GC, not a reboot; once the device is in this state it is out until someone is physically present to power-cycle it. See § "`/Temp` attachment hygiene" above.
 
@@ -1265,7 +1269,10 @@ print(f"U64 IP: {ip}")
 
 sock = uci_tcp_connect(transport, host="192.168.1.10", port=80)
 uci_socket_write(transport, sock, b"GET / HTTP/1.0\r\n\r\n")
-data = uci_socket_read(transport, sock, max_len=1472)  # NET_MAX_SOCKET_READ; above 253 it drains every Data More block (#420)
+data = uci_socket_read(transport, sock, max_len=893)   # above 253 drains every Data More block (#420)
+# Up to 1472 (NET_MAX_SOCKET_READ) needs firmware carrying upstream #802: above 893
+# raises ValueError before any write on a grade that rules it out or is missing
+# (the C64U on 1.1.0, an unprobed client), and 894 exactly on any 3.15 grade (#479).
 uci_socket_close(transport, sock)
 ```
 
@@ -1286,9 +1293,9 @@ This emits a nested delay-loop fence (~52 µs at 48 MHz, ~2.5 ms at 1 MHz, 16 by
 
 ### UCI gotchas
 
-1. **UCI must be enabled in U64 config.** "C64 and Cartridge Settings" → "Command Interface" → "Enabled" (save to flash). Use `get_uci_enabled()` / `enable_uci()` / `disable_uci()` for transient activation in tests.
-2. **UCI state survives soft reset.** Always send `CMD_ABORT` (`$04` to `$DF1C`) before code injection if you're unsure of the device state.
-3. **`$DF1F` status reads require per-byte `CMD_NEXT_DATA` acknowledgment.** The harness helpers handle this.
+1. **UCI must be enabled in U64 config.** "C64 and Cartridge Settings" → "Command Interface" → "Enabled". Use `get_uci_enabled()` / `enable_uci()` / `disable_uci()` for transient activation in tests — do not save it to flash (the bench baseline is flash == factory default, where it is Disabled). No reset is needed after `enable_uci` on the U64E (#270, PR #409). `Cartridge Preference = External` takes the slot off the bus while `Command Interface` still reads Enabled; routines then raise `UCIInterfaceAbsentError` (#359, PR #394).
+2. **Every routine opens with an ABORT and waits for the firmware to take it.** The builders write `CMD_ABORT` (`$04` to `$DF1C`) and poll until `BIT_ABORT_PENDING` (`$04`) clears before writing the command (#476); a fixed delay lost the command bytes intermittently at 48 MHz. Hand-written routines must do the same.
+3. **Wait for the reply to be valid, not for bit 0.** After `PUSH_CMD`, poll `$DF1C` until STATE bit 5 or ERROR (`$28`) is set (#490): bit 0 clears before the firmware copies the reply, and a drain in that window stores nothing while the status still reads `00,OK`. Then read `$DF1E` / `$DF1F` consecutively with **no** control write between bytes (the read strobe advances the queue), and write `CMD_NEXT_DATA` (`$02`) **once**, after both queues are drained — a per-byte `$02` truncates the reply to one byte (#155). The builders do all of this.
 4. **`GET_IP_ADDRESS` needs an interface index byte (0x00) as parameter.** Helper does this.
 5. **Routine dispatch uses SYS + keyboard buffer.** `_execute_uci_routine` writes the routine, types `SYS <addr>`, and presses RETURN — it does NOT patch `IMAIN`. Don't assume IMAIN is touched.
 6. **UCI builders emit `turbo_safe` delays that widen short branches.** If you copy builder output into your own routine, preserve the `JMP` trampolines over fence expansions.
@@ -1303,7 +1310,7 @@ This emits a nested delay-loop fence (~52 µs at 48 MHz, ~2.5 ms at 1 MHz, 16 by
 
 ## Pattern 12: Memory Safety with `MemoryPolicy`
 
-The harness writes to fixed scratch addresses (authoritative list: `HARNESS_SCRATCH` in `memory_policy.py`, rendered into `docs/memory_safety.md` by `scripts/gen_memory_table.py`; highlights: `$0334` jsr trampoline, `$0360`+`$03F0`-`$03F1` `run_subroutine`, `$0277`/`$00C6` keyboard buffer, `$C000-$C3FF` UCI block, `$C400-$C87D` UCI socket-write scratch, `$C000`+`$0339`+`$033C` SID player, `$CF00` test-suite BASIC-restore stub). If the consumer's program also occupies those addresses, host-side `write_memory()` calls silently corrupt RAM — the 6502 has no MMU and no exception fires. `MemoryPolicy` is the transport-layer guard that catches collisions before any byte hits the wire.
+The harness writes to fixed scratch addresses (authoritative list: `HARNESS_SCRATCH` in `memory_policy.py`, rendered into `docs/memory_safety.md` by `scripts/gen_memory_table.py`; highlights: `$0334` jsr trampoline, `$0360`+`$03F0`-`$03F1` `run_subroutine`, `$0277`/`$00C6` keyboard buffer, `$C000-$C3FF` UCI block, `$C400-$CAC1` UCI socket-write and multi-block read scratch, `$C000-$C03F` + `$C100-$C3E1` RR-Net peek and consume routines, `$C000`+`$0339`+`$033C` SID player, `$CF00` test-suite BASIC-restore stub). If the consumer's program also occupies those addresses, host-side `write_memory()` calls silently corrupt RAM — the 6502 has no MMU and no exception fires. `MemoryPolicy` is the transport-layer guard that catches collisions before any byte hits the wire.
 
 ### Default is permissive — no behaviour change for existing tests
 
@@ -1534,7 +1541,7 @@ After `run_parallel()`, each `SingleTestResult` has a `.pid` field identifying w
 
 **Port allocation is cross-process safe.** `ViceInstanceManager` uses `PortAllocator` internally with dual-layer protection: OS-level `bind()` reservations and file-based `flock()` locks. The file lock bridges the TOCTOU gap between closing the reservation socket and VICE binding to the port, so overlapping startup from independent processes is completely safe — no stagger delay needed. After VICE starts, PID ownership is verified via `/proc/net/tcp` (Linux) or `lsof` (macOS) to ensure the correct VICE process is listening. Failed acquisitions retry with exponential backoff (configurable via `max_retries`, default 3).
 
-**VICE startup crashes:** When 5+ VICE instances launch simultaneously, ~2 of 5 may crash with rc=1 due to X11/GTK resource contention. The manager detects this within ~1s and retries automatically. No special handling needed by callers.
+**VICE startup crashes:** When 5+ VICE instances launch simultaneously, ~2 of 5 have crashed with rc=1 from X11/GTK resource contention (observed on Linux with windowed VICE; not re-measured under the default headless `console=True`). The manager detects this within ~1s and retries automatically. No special handling needed by callers.
 
 **Validated:** 3 concurrent agents x 6 workers x 5 phases (lock-only, vice, mixed, crash, exhaustion), zero failures. See `scripts/stress_cross_process.py`.
 
@@ -1576,23 +1583,7 @@ transport = Ultimate64Transport(host="<device>")
 transport.write_memory(0xC000, b"\xDE\xAD")
 ```
 **Right (pytest fixture):**
-```python
-from c64_test_harness import DeviceLockTimeout
-
-@pytest.fixture(scope="module")
-def transport():
-    lock = DeviceLock(_HOST)
-    try:
-        lock.acquire_or_raise(timeout=120.0)
-    except DeviceLockTimeout as e:
-        pytest.skip(str(e))  # diagnosed-state message in test output
-    t = Ultimate64Transport(host=_HOST, password=_PW, timeout=8.0)
-    try:
-        yield t
-    finally:
-        t.close()
-        lock.release()
-```
+The module-scoped `transport` fixture in Pattern 9a § "Usage patterns" is the shape to copy: lock first, transport constructed inside the `try`, teardown through `tests/live_fixture_teardown.py` (`teardown_then_release`, release last).
 See Pattern 9a for how to read `DeviceLockTimeout` (queued vs wedged vs dead vs unreachable) and which branches warrant a reboot vs a retry.
 **Right (standalone script):**
 ```python
@@ -1631,7 +1622,7 @@ All U64 runner endpoints (`run_prg`, `load_prg`, `run_crt`, `sidplay`, `modplay`
 That POST carries the program as its body, so on firmware predating GideonZ/1541ultimate#686 (the C64U on 1.1.0) **each of these calls leaks one `/Temp` attachment**, and enough of them fill `/Temp` and crash the firmware (no safe count is known) — see Pattern 10 § "`/Temp` attachment hygiene". `run_prg_via_sys(target, prg)` writes the program through `write_bytes` (chunked at the client threshold, which on that firmware is its 128-byte PUT ceiling; #252) and leaks nothing there.
 
 ### 18. U64: REU Must Be Enabled for REU Programs
-Programs that use the REU (e.g. x25519) need `set_reu(client, True, size="512 KB")` before loading. REU config may reset after `reboot()` — re-enable it after each reboot.
+Programs that use the REU (e.g. x25519) need `set_reu(client, True, size="512 KB")` before loading. The setting is firmware-RAM config, so it survives `reboot()`, and by firmware source (1.1.0 `c64.cc`) the reboot re-applies the REU enable from config — except when an external cartridge holds the bus (e.g. `Cartridge Preference = External`) or the configured `.crt` prohibits the REU. A power-on reloads flash, where this bench keeps the default `2 MB`. Read `REU Size` back rather than assuming.
 
 ### 19. VICE Binary Monitor Must Not Use Port 6510
 Port 6510 is VICE's default TEXT monitor port. VICE misbehaves when the BINARY monitor is bound there. `PortAllocator` starts at 6511 (range 6511-6531) and `ViceConfig.port` defaults to 6502 for this reason. Don't override to 6510.
@@ -1639,8 +1630,8 @@ Port 6510 is VICE's default TEXT monitor port. VICE misbehaves when the BINARY m
 ### 20. VICE 3.10 WarpMode is Not a Resource — set_warp/get_warp Are Hybrid
 `resource_get("WarpMode")` returns error 0x1 — WarpMode is a static C variable in vsync.c, not in the resource system — and the `Speed` resource rejects the documented "unlimited" value 0. `set_warp`/`get_warp` handle this: with a text monitor connected they use the real `warp on` / `warp off` toggle (and `get_warp` sees warp enabled via the `-warp` CLI flag); on default targets (no text monitor) they fall back to pseudo-warp via the binary monitor's `Speed` resource (`Speed=1000000`; warp off restores `Speed=100`), so protocol-level `set_speed`/`get_speed` work on every VICE target. Caveat on the fallback path: `get_warp` only reflects pseudo-warp set through the transport — CLI `-warp` is not observable without a text monitor. The `ViceInstanceManager(enable_text_monitor=True)` flag allocates both ports automatically.
 
-### 21. VICE 3.10 Ethernet Needs BOTH -addconfig AND -ethernetioif
-CS8900a activation needs both `-addconfig <rc>` (with `ETHERNETCART_ACTIVE=1`) AND `-ethernetioif` / `-ethernetiodriver` on the CLI, with `-addconfig` FIRST. `ViceConfig` handles this when `ethernet=True`.
+### 21. VICE 3.10 Ethernet: Let `ViceConfig(ethernet=True)` Build the Launch
+The `-addconfig <rc>` that `ViceConfig` writes (`ETHERNETCART_ACTIVE=1`, `ETHERNET_INTERFACE`, `ETHERNET_DRIVER`, `EthernetCartMode`) activates the CS8900a and attaches the interface on its own (measured on macOS only: elevated, `pcap` on `feth0`, 2026-08-30 (#144); the Linux `tuntap` launch is unrecorded); the `-ethernetioif` / `-ethernetiodriver` flags it also emits are belt-and-braces, and their order is not load-bearing. The earlier "needs both, `-addconfig` first" rule came from an rc that misspelled the interface/driver resources (`build_ethernet_rc`, `backends/vice_lifecycle.py`).
 
 ### 22. TOD Zero-Page Footprint is $F0-$F5 (Don't Collide)
 The `tod_timer.py` helpers and every `bridge_ping.build_*_tod_code` routine claim:
@@ -1739,7 +1730,7 @@ Common C64 addresses used in testing:
 
 | Address | Purpose |
 |---------|---------|
-| `$0334` | Cassette buffer — safe for jsr() trampoline after BASIC boot |
+| `$0334` | Unused KERNAL RAM (`$0334-$033B`) — default `jsr()` trampoline; the cassette buffer proper is `$033C-$03FB` |
 | `$0339` | JMP-self safety loop target (write `4C 39 03` here) |
 | `$0400` | Screen RAM (40x25 = 1000 bytes) |
 | `$0277` | Keyboard buffer (10 bytes) |

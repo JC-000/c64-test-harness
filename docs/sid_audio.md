@@ -13,7 +13,8 @@ or the Ultimate 3.15 pre-release firmware tree
 
 ## 1. `sound=False` disables SID *emulation*, not just audio output
 
-`ViceConfig.sound` defaults to `False`, which emits VICE's `+sound`. That
+`ViceConfig.sound` defaults to `False`, which (with no `sounddev` set)
+emits VICE's `+sound`; a configured `sounddev` forces `-sound`. `+sound`
 stops the sound core being clocked, and reSID with it. Reads of
 `$D400-$D41F` then come from the sound-off fallback:
 
@@ -21,7 +22,7 @@ stops the sound core being clocked, and reSID with it. Reads of
 |---|---|---|
 | `$D41B` (OSC3) | `maincpu_clk % 256` | S `sid.c:137`, `sid.c:279` |
 | `$D41C` (ENV3) | `maincpu_clk % 256` | same |
-| `$D419` / `$D41A` (paddles) | `0xff` | S `sid.c:134`, `sid.c:277` |
+| `$D419` / `$D41A` (paddles) | `0xff` | S `sid.c:134`, `sid.c:276` |
 | everything else | `0` | S `sid.c:139`, `sid.c:281` |
 
 A sampling loop reading OSC3 therefore gets a clean ramp at its own
@@ -67,14 +68,15 @@ measurement**: the volume is applied *after* reSID has been clocked
 (S `sound.c:1432` generates, `sound.c:1441-1449` attenuates).
 
 It is **not** safe for audio-domain measurement: at volume 0 `amp` is 0
-and VICE `memset`s the sample buffer to zero (S `sound.c:1446`) before it
+and VICE `memset`s the sample buffer to zero (S `sound.c:1447`) before it
 reaches the play *or* record device, so the WAV is silence.
 `render_wav()` refuses `soundvolume=0` for that reason.
 
 The default stays `False`. Turning it on globally would open a host audio
 device on every launch, which is not what a headless harness should do —
-so the defence is the warning, the predicate
-(`sid_emulation_enabled(cfg)`), and this page.
+so the defence is the launch-time warning, the predicates
+`sid_emulation_enabled(cfg)` and `sid_sound_device_drains(cfg)` (both
+exported at the package root), and this page.
 
 ### Sample the SID from the 6510, never from the host
 
@@ -89,25 +91,17 @@ command to a running machine always halts it at the same frame phase --
 `read_memory($D012)` returns the same raster line across resume-and-reread
 cycles -- and `$D41B`/`$D41C` read host-side are one sample of a stopped
 oscillator, not a waveform. Configuring the SID host-side does land in the
-chip; *measuring* it host-side measures nothing. (The `ViceConfig.sound=False`
-fallback described in this document is a separate, still-true reason a
-host-side `$D41B` can look like a working oscillator.)
+chip; *measuring* it host-side measures nothing.
 
 So a register-domain measurement has to run on the machine: a routine
 that writes the voice registers and samples `$D41B` into a RAM buffer,
 called with `jsr()`, with the host reading only the buffer.
 `tests/test_sid_emulation_live.py` is the worked example.
 
-This is worth stating because it makes the obvious probe fail in the most
-misleading possible way. A host-side freeze-and-read test reports "not a
-SID" for **every** configuration, including the healthy one — a confident,
-uniform, entirely wrong answer, and one that looks like a harness defect
-rather than a measurement error.
-
-It also means the "raise when a caller reads `$D400-$D41F` on a
-sound-disabled instance" idea from #193 would guard a path that never
-reaches the SID under either setting. The launch-time warning is the
-defence that actually covers the reported failure.
+A host-side freeze-and-read probe therefore reports "not a SID" for
+**every** configuration, including the healthy one, which is why the
+harness guards `sound=False` with a launch-time warning rather than a
+read-time check on `$D400-$D41F` (#193).
 
 ---
 
@@ -126,9 +120,8 @@ experiments work warped. It does not get the audio to a device:
   (with `Sound buffer overflow (cycle based)` in the log, S
   `sound.c:1407`).
 
-So the fix is **warp off**, full stop. Issue #196's suggestion that a
-configured `-soundrecdev` is an alternative is wrong; that is the one
-correction this harness makes to the reported findings.
+So the fix is **warp off**, full stop; a configured `-soundrecdev` is
+not an alternative (contrary to the suggestion in #196).
 
 `render_wav()` sets `warp=False` and refuses a `-warp` smuggled in
 through `extra_args`, since VICE takes the last setting of a resource and
@@ -211,8 +204,9 @@ bytes at its own position, so sample index stays a clock across loss.
   `filled_frame_ranges` (`(start_frame, frame_count)`) say how much and
   where. Bound the fraction, or skip the ranges, before analysing.
 - `time_base_intact` means every drop was filled at a trusted length: no
-  unfilled drop, no sequence resync, and no datagram of another size. It no
-  longer means nothing was lost; `packets_dropped == 0` does.
+  unfilled drop, no sequence resync, and no datagram of another size
+  (`nonstandard_payloads`). It does not mean nothing was lost;
+  `packets_dropped == 0` does.
 - A late packet overwrites its own fill and a duplicate is discarded (#430).
 - **Discarded payloads are lost stream time, and no fill field shows it
   (#443).** Two paths reach it, and both leave `packets_dropped`,
@@ -278,6 +272,13 @@ no player, no reset. `capture_sid_u64(..., reset_after=False)` is the
 narrower escape when the firmware player *is* wanted but the reset is
 not (the tune then keeps playing).
 
+If the capture joins a **multicast** group, pass `device_host=` (or an
+explicit `multicast_interface=`) to `AudioCapture`: the default join is
+INADDR_ANY, which follows the kernel's route for the group, and on this
+bench that route is the VPN (`utun0`), where a join received nothing in 6/6
+arms while a join towards the device received the stream (#399, U64E,
+2026-09-23). A default join whose route is a tunnel logs a WARNING (#494).
+
 ---
 
 ## 5. Remapping SIDs safely
@@ -320,7 +321,7 @@ address map back after writing it and raises `Ultimate64Error` on any
 slot that did not take (hardware-verified in #204: with mirroring off a
 two-slot map decodes distinctly, 27/27; with it on the stock map
 aliases). A mocked client whose category read does not reflect writes
-will now raise rather than report a clean run.
+raises rather than reporting a clean run.
 
 ```python
 from c64_test_harness import isolated_sid_addressing, SidSlot
@@ -331,14 +332,17 @@ with isolated_sid_addressing(
     ...   # addresses is the full four-slot map now in effect
 ```
 
-`others="unmapped"` is the strongest isolation (everything not named goes
+`others` picks what happens to the slots not named. The default,
+`"distinct"`, moves any that collide to a free address and leaves unmapped
+ones unmapped. `others="unmapped"` is the strongest isolation (everything not named goes
 to `Unmapped`, whose firmware offset `0x01` is odd where every real
 decode is even, so it can never alias). `others="leave"` touches nothing
 else and only checks the result.
 
-`snapshot_state()` / `restore_state()` now cover the `SID Addressing`
-category too, so a run that used the helpers above and crashed still gets
-the category put back by the surrounding state restore.
+`snapshot_state()` / `restore_state()` cover the `SID Addressing`
+category too (restoring `Auto Address Mirroring` last), so a run that used
+the helpers above and crashed still gets the category put back by the
+surrounding state restore.
 
 ---
 
