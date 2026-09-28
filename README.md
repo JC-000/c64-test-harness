@@ -63,7 +63,7 @@ Every stage is idempotent and can be skipped with a `--no-*` flag. The venv is m
 ```
 [VICE]
   ✓ x64sc on PATH (/opt/homebrew/bin/x64sc)
-  ✓ VICE version (VICE 3.10 [via brew; --version broken on macOS 26])
+  ✓ VICE version (VICE 3.10 [via brew; x64sc --version printed no version])
   ✓ ethernet cart support (ethernet flags found in --help)
   ✓ binary monitor support (-binarymonitor flag present)
   ✓ text monitor support (-remotemonitor flag present)
@@ -89,7 +89,7 @@ Summary: 14 ok, 3 missing, 1 skipped, 3 warn
 Overall: READY (with optional gaps)
 ```
 
-The `--version broken` note is expected: the Homebrew build's `x64sc --version` exits early, so the script falls back to Homebrew's metadata. The harness version is read from the installed package metadata. This sample's `0.11.3` came from a venv installed before the current `0.12.4` in `pyproject.toml`, and it needs `pip install -e .` again to report the right number.
+The `x64sc --version printed no version` note is expected: the Homebrew build's `x64sc --version` exits early, so the script falls back to Homebrew's metadata. The harness version is read from the installed package metadata. This sample's `0.11.3` came from a venv installed before the current `0.12.4` in `pyproject.toml`, and it needs `pip install -e .` again to report the right number.
 
 The VICE checks are **critical**, so a hardware-only machine without VICE reports NOT READY even though the Ultimate backend works. Options: `--quiet`, `--json`, `--no-u64`, `--u64-host HOST`. Exit codes: `0` READY, `1` NOT READY, `2` script error. Details are in [docs/development.md](docs/development.md#quick-check-scriptsverify-dev-envsh).
 
@@ -571,7 +571,11 @@ finally:
     transport.close()
 ```
 
-**Large single-call `write_memory()` on hardware is not byte-verified.** `Ultimate64Client.write_mem`'s POST form declares no upper bound and is verified only to 2048 bytes (the `Ultimate64Client.write_mem` docstring); a 47 kB body written in one call came back with exactly one wrong byte at a different offset each time, while the same bytes through `write_bytes()` (84-byte chunks at the time; it now chunks at the transport's threshold, #252) were byte-exact (issue #231, U64E fw `v3.15-78-g71480a9d`, n=2 — sporadic, so absence in a given run proves nothing). Verify large writes, or chunk them.
+**Large single-call `write_memory()` on hardware.**
+- `Ultimate64Client.write_mem`'s POST form has no known upper bound.
+- A controlled re-run read back 0/50 corrupted: 25 single 38,911-byte POSTs at `$0801` plus 25 sentinel-bed writes, on U64E fw 3.15 `4011c97c`, with the CPU paused and the payload below `$A000`.
+- Issue #231 had reported one wrong byte in a 47,103-byte POST. It is closed as non-reproducing, not refuted: a running CPU and the ROM shadow above `$A000` explain it, and its build was not re-tested.
+- Any bulk read-back check must pause the CPU and stay below `$A000` (see the `write_mem` docstring).
 
 Multiple devices can be pooled with `Ultimate64InstanceManager` — the same pattern as `ViceInstanceManager`, compatible with `run_parallel()`:
 
