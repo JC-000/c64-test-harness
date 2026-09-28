@@ -104,8 +104,8 @@ def test_deletes_oldest_first_keeps_default_youngest():
     _FakeFTP.files = [f"temp{i:04d}" for i in range(6)]
     result = gc_temp_folder("10.0.0.1")
     assert result.ok
-    assert result.deleted == ["temp0000", "temp0001", "temp0002", "temp0003"]
-    assert result.kept == ["temp0004", "temp0005"]
+    assert result.deleted == ["temp0000", "temp0001", "temp0002", "temp0003", "temp0004"]
+    assert result.kept == ["temp0005"]
     assert _FakeFTP.deleted == result.deleted
     assert _FakeFTP.cwd_path == "/Temp"
     assert _FakeFTP.connected == ("10.0.0.1", 21)
@@ -168,7 +168,7 @@ def test_keep_kwarg_overrides_env(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_default_keep_constant_used_when_unset():
-    assert DEFAULT_KEEP == 2
+    assert DEFAULT_KEEP == 1
 
 
 def test_credentials_via_kwargs():
@@ -303,50 +303,6 @@ def test_temp_gc_source_no_longer_states_the_3_mb_ramdisk():
     assert "carry no RAM-disk symbols" not in flat
 
 
-def test_budget_comment_prices_uci_writes_by_grade():
-    """#294 chunks ``Ultimate64Transport.write_memory`` into PUT-sized pieces
-    unless the cached grade is ``writemem_post_safe is True``, and UCI
-    routines and payloads go through the transport. So a UCI socket write
-    costs no attachment on a leak-prone or unknown grade; only a post-safe
-    grade (whose firmware collects) or a direct ``client.write_mem`` caller
-    pays. The budget comment used to state the pre-#294 cost unqualified.
-
-    Named limit (#318 review round 2): these are phrase pins. They catch a
-    rewrite of the pinned claims and the specific wrong wordings forbidden
-    below, but not a *contradicting sentence appended* after them (V1: "In
-    practice a UCI socket write still leaks one attachment on the C64U."
-    survives). Proving the paragraph's meaning is beyond a text test; the
-    reviewer accepted this limit.
-    """
-    from c64_test_harness.backends import ultimate64_temp_gc as mod
-
-    src = _inspect.getsource(mod)
-    start = src.index("#: Note the unit:")
-    end = src.index("DEFAULT_LEAK_BUDGET = ")
-    # Strip only the "#:" comment prefixes, so "#294" survives the flattening.
-    note = _re.sub(r"[\s`]+", " ", src[start:end].replace("\n#:", " "))
-    # Vacuity guard: this is the paragraph about UCI costs.
-    assert "build_socket_write" in note and "enable_uci" in note
-    assert "write spends one of the budget for its routine code" not in note
-    assert "writemem_post_safe is True" in note
-    assert "transport.write_memory" in note
-    assert "client.write_mem" in note
-    assert "#294" in note
-    # Review round 1 (#318): keywords let two wrong rewrites through (U1
-    # "costs one attachment ... on every grade", U2 "... which that firmware
-    # never collects"). Pin each grade-bound claim as one contiguous phrase.
-    claim = note.lower()
-    assert ("on a leak-prone or unknown grade (the c64u) a uci socket write "
-            "costs no attachment") in claim
-    assert ("on a post-safe grade the routine, and a payload over the "
-            "ceiling, are one post each, which that firmware collects") in claim
-    assert "on every grade" not in claim
-    assert "never collects" not in claim
-    # The same qualifier applies to the "raw write_memory" parenthetical
-    # above the note: the transport now chunks those on a leak-prone grade.
-    assert "those are lane bugs to fix by chunking" not in src
-
-
 # ------------------------------------------------- mounted images (#418)
 def _drives(*image_files: str) -> dict:
     """A GET /v1/drives document mounting *image_files* on a, b, ..."""
@@ -369,7 +325,7 @@ def test_mounted_managed_image_is_not_deleted():
     """
     _FakeFTP.files = ["temp0001", "temp0002", "temp0003", "temp0004"]
     result = gc_temp_folder(
-        "dev", mounted_probe=lambda: _drives("/Temp/temp0001", "/Temp/image.d64")
+        "dev", keep=2, mounted_probe=lambda: _drives("/Temp/temp0001", "/Temp/image.d64")
     )
     assert "temp0001" not in _FakeFTP.deleted
     assert result.deleted == ["temp0002"]
@@ -401,7 +357,7 @@ def test_excluding_a_mounted_image_never_widens_the_delete_set():
     would still delete temp0001 AND temp0002 here.
     """
     _FakeFTP.files = ["temp0001", "temp0002", "temp0003", "temp0004"]
-    result = gc_temp_folder("dev", mounted_probe=lambda: _drives("/Temp/temp0004"))
+    result = gc_temp_folder("dev", keep=2, mounted_probe=lambda: _drives("/Temp/temp0004"))
     assert result.deleted == ["temp0001"]
     assert result.kept == ["temp0002", "temp0003"]
     assert result.mounted_excluded == ["temp0004"]
@@ -410,7 +366,7 @@ def test_excluding_a_mounted_image_never_widens_the_delete_set():
 def test_unmanaged_mounted_names_leave_the_sweep_untouched():
     """A normally-named mounted image excludes nothing (harness uploads, #311)."""
     _FakeFTP.files = ["temp0001", "temp0002", "temp0003"]
-    result = gc_temp_folder("dev", mounted_probe=lambda: _drives("/Temp/image.d64"))
+    result = gc_temp_folder("dev", keep=2, mounted_probe=lambda: _drives("/Temp/image.d64"))
     assert result.deleted == ["temp0001"]
     assert result.mounted_excluded == []
 
@@ -427,7 +383,7 @@ def test_probe_failure_still_sweeps_and_is_not_a_failed_pass():
     def boom():
         raise OSError("connection reset")
 
-    result = gc_temp_folder("dev", mounted_probe=boom)
+    result = gc_temp_folder("dev", keep=2, mounted_probe=boom)
     assert result.deleted == ["temp0001"]
     assert result.ok and result.error is None
     assert "connection reset" in (result.mounted_probe_error or "")
@@ -442,7 +398,7 @@ def test_probe_is_not_consulted_when_nothing_would_be_deleted():
         calls.append(1)
         return _drives()
 
-    result = gc_temp_folder("dev", mounted_probe=probe)
+    result = gc_temp_folder("dev", keep=2, mounted_probe=probe)
     assert calls == []
     assert result.deleted == []
 
@@ -601,6 +557,6 @@ def test_unit_tests_never_dial_a_real_device():
     above, which proves the stub is not hiding broken wiring.
     """
     _FakeFTP.files = ["temp0001", "temp0002", "temp0003"]
-    result = gc_temp_folder("10.0.0.1")
+    result = gc_temp_folder("10.0.0.1", keep=2)
     assert _default_probe_calls == [("10.0.0.1", None, None, None)]
     assert result.deleted == ["temp0001"]

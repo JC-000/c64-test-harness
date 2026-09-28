@@ -114,6 +114,10 @@ def host() -> str:
 def _client(host: str, caps: DeviceCapabilities = LEAKY, **kwargs) -> Ultimate64Client:
     kwargs.setdefault("write_mem_query_threshold", 128)
     kwargs.setdefault("warn_unlocked", False)
+    # Room for several uploads between sweeps: these tests pin sharing,
+    # refusal and drain mechanics, not the default cadence (budget 1, #511,
+    # pinned in test_temp_handover_sweep.py).
+    kwargs.setdefault("temp_gc_budget", 6)
     c = Ultimate64Client(host, **kwargs)
     c._capabilities = caps
     return c
@@ -416,7 +420,9 @@ def test_a_client_that_leaked_nothing_writes_no_config_even_with_device_pending(
         with caplog.at_level("WARNING"):
             _release_lock(host, tmp_path)
         set_item.assert_not_called()
-        idle.run_prg(PRG)                  # a failed inherited sweep blocks nothing
+        # The drain sets no block. (The #511 handover sweep, off in this
+        # module, would still refuse this upload: see test_temp_handover_sweep.)
+        idle.run_prg(PRG)
     assert any("inherited sweep" in r.getMessage() for r in caplog.records)
     assert idle.pending_temp_attachments == 2
 
@@ -1183,3 +1189,25 @@ def test_the_client_spelling_does_not_warn_twice(host):
             patch.object(probe_mod, "_warn_unlocked_client") as warn:
         c.liveness_probe()
     warn.assert_not_called()
+
+
+@pytest.fixture(autouse=True)
+def _handover_sweep_already_done(monkeypatch):
+    """Pin the budget, drain and refusal mechanics on their own: the #511
+    handover sweep (the first attachment of a process, or after each lock
+    acquire) is pinned in ``tests/test_temp_handover_sweep.py``, and here it
+    would add one sweep before every test's first upload."""
+    monkeypatch.setattr(gc_mod.TempLedger, "handover_sweep_due", lambda self: False)
+
+
+@pytest.fixture(autouse=True)
+def _empty_temp_over_ftp(monkeypatch):
+    """A budget of 1 (#511) sweeps on the second upload; a test that does not
+    patch the sweep gets an empty ``/Temp`` rather than dialling a fake
+    host's FTP port. Tests that fake FTP themselves patch over this."""
+    from c64_test_harness.backends import ultimate64_temp_gc as _gc
+
+    import fake_temp_ftp
+
+    fake_temp_ftp.EmptyTempFTP.sessions = []
+    monkeypatch.setattr(_gc, "FTP", fake_temp_ftp.EmptyTempFTP)

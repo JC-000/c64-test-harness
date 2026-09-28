@@ -715,6 +715,9 @@ def _reserve_probe_attachments(
     under the same ledger lock, so a probe and a client's upload against one
     device cannot both pass the budget check and then both count:
 
+    * a device this process has not swept since it last took the device's
+      ``DeviceLock`` (or ever) is swept first, and a failed sweep refuses
+      (#511);
     * a device whose hygiene pass has been proven impossible refuses here,
       before the probe reads or writes anything -- so the restore POST is
       never the request that gets refused, and a blocked client cannot
@@ -753,10 +756,10 @@ def _reserve_probe_attachments(
     with ledger.lock:
         if armed:
             budget = leak_budget()
-            if (
-                ledger.blocked is None
-                and ledger.pending > 0
-                and ledger.pending + count > budget
+            if ledger.blocked is None and (
+                # #511: sweep at handover too, as the client does.
+                ledger.handover_sweep_due()
+                or (ledger.pending > 0 and ledger.pending + count > budget)
             ):
                 try:
                     result = gc_temp_folder(host)

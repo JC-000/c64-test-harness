@@ -489,29 +489,29 @@ def test_run_prg_does_not_gc_temp_by_default(monkeypatch: pytest.MonkeyPatch):
 def test_run_prg_gcs_temp_folder_when_auto_enabled(monkeypatch: pytest.MonkeyPatch):
     """U64_AUTO_TEMP_GC=1 arms the hygiene pass for run_prg (issue #153).
 
-    The cadence is a budget, not once-per-upload: the pass runs when the
-    budget is spent, *before* the upload that would overrun it. Set the
-    budget to 1 here so the second run_prg triggers it.
+    The pass runs *before* the upload it makes room for: once at handover,
+    before this process's first upload (#511), and again whenever the budget
+    is spent. With a budget of 1, both uploads here follow a pass.
     """
     monkeypatch.setenv("U64_AUTO_TEMP_GC", "1")
     c = Ultimate64Client("h", temp_gc_budget=1)
-    calls: list[str] = []
+    mock, captured = _capture(b"")
+    posts_before_gc: list[int] = []
 
     def fake_gc(**kwargs):
         from c64_test_harness.backends.ultimate64_temp_gc import TempGCResult
 
-        calls.append("gc")
+        posts_before_gc.append(
+            sum(1 for req, _ in captured if req.get_method() == "POST")
+        )
         return TempGCResult(host="h")
 
-    mock, captured = _capture(b"")
-    with patch.object(c, "gc_temp_folder", side_effect=fake_gc) as mock_gc, \
+    with patch.object(c, "gc_temp_folder", side_effect=fake_gc), \
          patch("urllib.request.urlopen", mock):
         c.run_prg(b"\x01\x08\x0b\x08")
-        assert mock_gc.call_count == 0
+        assert posts_before_gc == [0]
         c.run_prg(b"\x01\x08\x0b\x08")
-    mock_gc.assert_called_once()
-    # GC must run before the upload it makes room for, not after.
-    assert calls == ["gc"]
+    assert posts_before_gc == [0, 1]
     assert captured[0][0].get_full_url() == "http://h/v1/runners:run_prg"
 
 

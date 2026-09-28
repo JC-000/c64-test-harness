@@ -503,3 +503,13 @@ def test_readback_400_is_unknown_and_still_restores(mock_urlopen, mock_probe):
     assert restore_req.get_method() == "POST"
     assert "machine:writemem" in restore_req.full_url
     assert restore_req.data == original
+
+
+@pytest.fixture(autouse=True)
+def _empty_temp_over_ftp(monkeypatch):
+    """#511: the free probe sweeps ``/Temp`` before its first POST on a
+    leak-prone or unknown grade; answer with an empty ``/Temp`` rather than
+    dial the fake host's FTP port."""
+    import fake_temp_ftp
+
+    fake_temp_ftp.install(monkeypatch)

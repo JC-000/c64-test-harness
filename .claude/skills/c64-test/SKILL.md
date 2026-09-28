@@ -46,14 +46,17 @@ When you write a test that can point at the C64U:
 
 - **Do not hand-roll cleanup.** `/Temp` hygiene belongs in the harness,
   below your test, and it is there (PR #259): on leak-prone
-  firmware `Ultimate64Client` arms a hygiene pass by itself, spends a
-  budget of 6 attachment-creating requests **per device** (shared by every
-  client in the process, #295) before sweeping, and drains on `close()`
-  and on `DeviceLock` release — a client that leaked drains its own; one
-  that leaked nothing sweeps inherited `/Temp` only while holding the
-  device's lock (#264). **It can also refuse** — once a leaking client's
-  pass has proven impossible (FTP down), every later attachment-creating
-  request raises `Ultimate64TempHygieneError` (import it from
+  firmware `Ultimate64Client` arms a hygiene pass by itself. It sweeps
+  `/Temp` before the first attachment-creating request after this process
+  takes the device's `DeviceLock` (or ever), and again before each one once
+  an attachment is pending (budget 1 **per device**, shared by every client
+  in the process; keep 1; mounted images kept; #295, #511). It also drains
+  on `close()` and on `DeviceLock` release: a client that leaked drains its
+  own, and one that leaked nothing sweeps inherited `/Temp` only while
+  holding the device's lock (#264). **It can also refuse.** Once a sweep
+  it needed has failed (FTP down), every later attachment-creating
+  request raises `Ultimate64TempHygieneError`, before sending anything, until a
+  sweep succeeds (import it from
   `backends.ultimate64_client`; it is not a package-root export) rather
   than walking the device toward the wedge; `U64_TEMP_GC_REQUIRED=0`
   downgrades that to a WARNING and `temp_hygiene=False` disarms the pass.

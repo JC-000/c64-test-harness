@@ -1199,3 +1199,13 @@ def test_client_assert_healthy_raises_writemem_degraded(mock_lp):
     with pytest.raises(U64WritememDegradedError) as excinfo:
         client.assert_healthy()
     assert excinfo.value.result is degraded
+
+
+@pytest.fixture(autouse=True)
+def _empty_temp_over_ftp(monkeypatch):
+    """#511: the free probe sweeps ``/Temp`` before its first POST on a
+    leak-prone or unknown grade; answer with an empty ``/Temp`` rather than
+    dial the fake host's FTP port."""
+    import fake_temp_ftp
+
+    fake_temp_ftp.install(monkeypatch)

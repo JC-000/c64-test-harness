@@ -554,8 +554,10 @@ class Ultimate64Client:
         * if it leaked nothing, the device's ``/Temp`` is still swept for
           attachments an earlier lane left behind (issue #264) -- but only
           when this process holds the device's ``DeviceLock``, since that
-          sweep deletes other lanes' files, and a failed one never enables
-          FTP File Service and never blocks this client.
+          sweep deletes other lanes' files. A failed one enables no FTP File
+          Service and sets no block. This client's next attachment-creating
+          request still sweeps first, though, and is refused if that sweep
+          fails too (#511).
 
         See :attr:`temp_hygiene_armed` and :meth:`_drain_temp_attachments`.
         """
@@ -674,8 +676,9 @@ class Ultimate64Client:
         exactly which requests a call makes). Deferring costs one thing,
         bounded and harmless: on a slow-probed device the *first*
         attachment-creating call is decided on the stale unknown grade.
-        It is still counted, and the second call arms — well inside a
-        budget of 6.
+        It is still counted, without the handover sweep an armed client
+        would have run first (#511). The second call arms and sweeps at
+        handover before it sends.
 
         ``write_mem_query_threshold`` is deliberately *not* recomputed. It
         was fixed at construction and callers may have reasoned about it;
@@ -1072,6 +1075,14 @@ class Ultimate64Client:
     def _before_temp_attachment(self, operation: str, count: int = 1) -> None:
         """Refuse or make room before *count* attachment-creating requests.
 
+        **Handover first** (#511): if the device's ledger has not swept
+        ``/Temp`` since this process last took the device's ``DeviceLock``
+        (or ever), a hygiene pass runs before anything is counted. If it
+        fails, this request is refused and so is every later one until a
+        sweep succeeds. The pass follows :meth:`_run_temp_hygiene`'s rules,
+        so a client with no uncollected leak of its own writes no config
+        (#263).
+
         *count* > 1 reserves an operation's whole cost up front, so a
         multi-POST operation is never refused half-way through (see
         :meth:`liveness_probe`, whose second POST restores RAM).
@@ -1098,6 +1109,14 @@ class Ultimate64Client:
         if self._temp_hygiene_blocked is not None:
             self._refuse_or_warn(operation)
             return
+        if self._temp_ledger.handover_sweep_due():
+            # The device queue has advanced to this process (or this process
+            # has never swept it): what other lanes left in /Temp is unknown,
+            # so sweep before spending anything, and fail closed (#511).
+            self._run_temp_hygiene(f"device handover, before {operation}")
+            if self._temp_hygiene_blocked is not None:
+                self._refuse_or_warn(operation)
+                return
         # The device's count, not this client's (#295). Callers hold the
         # ledger lock: go through _reserve_temp_attachments.
         pending = self._temp_ledger.pending
@@ -1273,9 +1292,11 @@ class Ultimate64Client:
           process holds the lock); and a lane that made only bodyless calls
           must not write ``Network Settings > FTP File Service`` (a
           BASELINE_NEVER_TOUCH store that persists until a firmware
-          power-on) or be refused for a failure it did not cause. So a
-          failed inherited sweep logs a WARNING naming the manual remedy,
-          enables nothing and blocks nothing.
+          power-on). So a failed inherited sweep logs a WARNING naming the
+          manual remedy, enables nothing and sets no block. It does not
+          count as a sweep, though: the next attachment-creating request
+          from this process sweeps first and is refused if that fails
+          (#511), so bodyless work carries on and uploads do not.
 
         What keeps a fake host off FTP is arming (a never-answered probe
         stays disarmed), not the counter.
@@ -1335,12 +1356,13 @@ class Ultimate64Client:
             return
         _log.warning(
             "U64 /Temp inherited sweep on %s failed (%s). This client leaked "
-            "nothing, so the harness neither enables Network Settings > FTP "
-            "File Service on its behalf (issue #263) nor refuses its requests; "
-            "but /Temp may still hold attachments an earlier lane left behind. "
-            "Before uploading to this device, enable FTP File Service manually "
-            "(it persists until a firmware power-on) or have it power-cycled. "
-            "See docs/u64_recovery.md.",
+            "nothing, so the harness does not enable Network Settings > FTP "
+            "File Service on its behalf (issue #263). /Temp may still hold "
+            "attachments an earlier lane left behind, so this process's next "
+            "upload sweeps first and is refused if that fails too (#511). "
+            "To clear it, enable FTP File Service manually (it persists until "
+            "a firmware power-on) or have the device power-cycled. See "
+            "docs/u64_recovery.md.",
             self.host, getattr(result, "error", None) or "unknown FTP failure",
         )
 

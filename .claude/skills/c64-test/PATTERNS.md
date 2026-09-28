@@ -868,12 +868,15 @@ So on a leak-prone device **`run_prg_via_sys(target, prg)` is the low-risk way t
    (`backends/ultimate64_client.py`) decides from `temp_hygiene=` first, then
    `$U64_AUTO_TEMP_GC` (truthy forces on for *any* device, falsy forces off), then
    `DeviceCapabilities.runner_wedge_possible is not False`. Armed, the client
-   spends a leak budget of `client.temp_gc_budget`
-   (`DEFAULT_LEAK_BUDGET = 6` in `backends/ultimate64_temp_gc.py`; override with
-   `temp_gc_budget=` or `$U64_TEMP_GC_BUDGET`) of attachment-creating requests and
-   sweeps when it runs out, and drains again on `close()` and on `DeviceLock`
-   release. **The guard also refuses.** Once hygiene is armed and a pass has been
-   proven impossible (FTP down, say), every later attachment-creating request
+   sweeps `/Temp` before its process's first attachment-creating request after
+   each `DeviceLock` acquire (the *handover*, #511), and before every further one
+   once one attachment is pending. `client.temp_gc_budget` is
+   `DEFAULT_LEAK_BUDGET = 1` in `backends/ultimate64_temp_gc.py`; override it with
+   `temp_gc_budget=` or `$U64_TEMP_GC_BUDGET`. The sweep keeps the youngest file
+   (`DEFAULT_KEEP = 1`) and any mounted image. The client drains again on
+   `close()` and on `DeviceLock` release. **The guard also refuses.** Once hygiene
+   is armed and a sweep it needed has failed (FTP down, say), this and every later
+   attachment-creating request
    raises `Ultimate64TempHygieneError` (`_before_temp_attachment` /
    `_refuse_or_warn` in `backends/ultimate64_client.py`) rather than walking the
    device toward the wedge. **It is not a package-root export**: import it from
@@ -889,22 +892,23 @@ So on a leak-prone device **`run_prg_via_sys(target, prg)` is the low-risk way t
    timed out is *not* in that class: `_maybe_reprobe_capabilities` re-probes once
    at the full timeout after the client completes any
    request, so a slow-probed device arms from its **second** attachment-creating
-   request, the first having been decided on the stale unknown grade — well inside
-   a budget of 6. Only if that second probe also fails does it stay disarmed, with
+   request, the first having been decided on the stale unknown grade (counted, and
+   swept by the second's handover sweep). Only if that second probe also fails does it stay disarmed, with
    a WARNING saying so (#262). Force arming with `temp_hygiene=True` or
-   `U64_AUTO_TEMP_GC=1`. The drain on `close()` / `DeviceLock` release also sweeps for a client that **leaked nothing**, so a lane inheriting a dirty `/Temp` collects it on the way out (issue #264). That inherited-only sweep runs only under the device lock (lock release, or `close()` while holding it). If it fails it writes no config and blocks nothing: it logs a WARNING that FTP File Service must be enabled by hand. Only a client that leaked gets the automatic FTP-enable attempt — a `Network Settings` write that persists until a firmware power-on (issue #263). **The budget is per device within one process** (#295):
+   `U64_AUTO_TEMP_GC=1`. The drain on `close()` / `DeviceLock` release also sweeps for a client that **leaked nothing**, so a lane inheriting a dirty `/Temp` collects it on the way out (issue #264). That inherited-only sweep runs only under the device lock (lock release, or `close()` while holding it). If it fails it writes no config and sets no block: it logs a WARNING that FTP File Service must be enabled by hand. It does not count as a sweep, though, so the next upload sweeps first and is refused if that fails too (#511). Only a client that leaked gets the automatic FTP-enable attempt — a `Network Settings` write that persists until a firmware power-on (issue #263). **The budget is per device within one process** (#295):
    every client of one host shares one count, so a fresh client per upload does not
    reset it, and a lock release sweeps once per host however many clients exist. A
    name and its IP address are separate ledgers (no DNS), so use one spelling per
    device; a non-default `:port` in the host string is likewise a separate ledger,
    matching how `DeviceLock` keys devices (only `:80` folds). It is **not** shared
-   across processes: two processes against one device
-   each spend a budget, and only the lock-release drain covers the hand-off.
+   across processes, and it does not have to be: a new process's ledger has never
+   swept, so its first upload sweeps first and is refused if that fails (#511,
+   replacing #433's "each process spends a budget").
    Because the budget counts the **device**, the client that crosses it need not be
    the one that leaked — so the FTP-enable write is gated separately, on the
    client's *own* uncollected share. A client that leaked nothing sweeps and may
    block, but never writes config.
-2. **Never loop an upload against a leak-prone device without a hygiene pass.** Nobody knows how many uploads an unpatched device survives before `/Temp` fills and the firmware crashes, so there is no count to stay under: the harness's per-device budget (`DEFAULT_LEAK_BUDGET`, #295) is a conservative choice, not a measured limit. **Budget across runs, not within one:** a `reboot()` does not delete attachments (measured), so what you are spending is whatever the device has accumulated since its last GC or power-cycle — including everything the previous lane left behind. Parametrization multiplies quietly: four `mhz` params x three vectors is twelve uploads in one session.
+2. **Never loop an upload against a leak-prone device without a hygiene pass.** Nobody knows how many uploads an unpatched device survives before `/Temp` fills and the firmware crashes, so there is no count to stay under: the harness sweeps before every upload (`DEFAULT_LEAK_BUDGET = 1`, #511) because the 1.1.0 source holds no attachment open after its request returns, except a mounted image, which the sweep keeps. **Budget across runs, not within one:** a `reboot()` does not delete attachments (measured), so what you are spending is whatever the device has accumulated since its last GC or power-cycle — including everything the previous lane left behind. Parametrization multiplies quietly: four `mhz` params x three vectors is twelve uploads in one session.
 3. **A hygiene result with `.error` set is a failed pass, not a benign skip.** `gc_temp_folder` never raises — it reports. The GC needs the device's **FTP File Service**, which is **`Disabled` by default on 1.1.0**: verify it is on before relying on a hygiene pass, never assume it. Where it is off the sweep silently no-ops and the failure mode is "cleanup appeared to run, device wedged anyway". Stop uploading after an `.error`; do not keep going. And know what the harness does about it: on a failed pass `Ultimate64Client._run_temp_hygiene` **enables FTP File Service itself** — a `Network Settings` write it logs at WARNING and never restores, persisting until a firmware power-on, since `machine:reboot` does not clear firmware RAM. So the setting you find on a device may be a previous lane's hygiene pass rather than anyone's decision, and that write targets a store the entry-baseline code lists in `BASELINE_NEVER_TOUCH`. Those are two contracts, not a contradiction (owner decision on #263): `BASELINE_NEVER_TOUCH` means `apply_factory_baseline` never resets or asserts those stores, while the hygiene pass may write exactly this one item, once per device per process (#295), and only for a client holding an uncollected leak of its own — a client that leaked nothing writes no config.
 4. **Run hygiene while holding the `DeviceLock`.** `gc_temp_folder` acquires no lock of its own.
 5. **Prefer the routes that do not leak** for bulk data — **but do not enable SocketDMA writes; the write fast path is disabled pending a stability review** (see § "SocketDMA write fast path" below). The non-leaking route for bulk data is `write_bytes` / `run_prg_via_sys`, whose threshold-sized chunks (128 on a C64U) stay on the PUT path on every grade (#252) — and there is no fast replacement. Measured on the U64E (fw 3.15, bce4535e, 2026-09-15, host on Wi-Fi (en0), link not instrumented, every write verified, n=2-4 per arm, interleaved, #267): `write_bytes` runs about 1.3 KiB/s at 48-byte chunks and about 3.2 KiB/s at 128-byte chunks, median ~36-52 ms per PUT, observed 34-79 ms, so 16 KiB takes ~12.5 s or ~5.0 s, where a single 16 KiB POST took ~0.1 s on that device. The per-PUT time barely moves with chunk size, so it is dominated by the host link and per-request overhead, not the payload. The 128-byte arm is the chunk a C64U uses, but its per-request latency over its own link is not measured on the C64U, so do not read 3.2 KiB/s as that device's rate.
@@ -914,7 +918,7 @@ So on a leak-prone device **`run_prg_via_sys(target, prg)` is the low-risk way t
    **two attachments per call** on leak-prone firmware (measured on the C64U
    2026-09-10: `/Temp` 0 -> 2 for one call) because it deliberately exercises the
    POST `writemem` path, and `assert_healthy()` wraps it — so the call you reach
-   for when you already suspect a wedge spends a third of the default budget, and
+   for when you already suspect a wedge spends twice the default budget, and
    probing again on a bad result converges on the wedge you are diagnosing
    (issue #250). `get_info()`, `get_version()` and `read_mem()` cost nothing; use
    those, and reach for `liveness_probe` once, deliberately, knowing the price.
@@ -925,8 +929,8 @@ So on a leak-prone device **`run_prg_via_sys(target, prg)` is the low-risk way t
    same per-device ledger, grading the firmware from its own bodyless
    `/v1/info`. Neither spelling is a free health check. Three consequences for
    the free one: it now **raises** where it used to return, it now **sweeps**
-   on a budget crossing (and a sweep can delete a raw or filename-less `/Temp`
-   image another lane mounted — #418), and it says once per process and host
+   at handover and on a budget crossing (never a `/Temp` image a drive reports
+   mounted, #418), and it says once per process and host
    when nothing here holds the device's `DeviceLock` (#194/#460) — a notice,
    not a refusal, because it writes `$0334-$03B3` and writes it back. An
    unreadable `/v1/info` **arms** rather than disarms: step 1 has already

@@ -80,8 +80,8 @@ the bodyless `PUT ?data=` form. Ultimate-line 3.15 collects them
 on-device (#686); the C64U on 1.1.0 does not. This is shared 1541ultimate firmware behaviour, not
 specific to either device generation. `ultimate64_temp_gc.gc_temp_folder(host, ...)`
 deletes those files over FTP, oldest-first, keeping the youngest N
-(default 2) — mirroring the policy 1541ultimate#686 applies on-device on
-Ultimate-line ≥ 3.15. It is best-effort: any FTP/network failure is captured
+(default 1, #511). 1541ultimate#686 applies the same oldest-first policy
+on-device on Ultimate-line ≥ 3.15, where it keeps 10. It is best-effort: any FTP/network failure is captured
 in the returned `TempGCResult.error` rather than raised, so a hygiene
 pass can never fail a test run.
 
@@ -257,78 +257,83 @@ other write on a non-post-safe grade, and the fallback latches:
 connect failure routes every later write on that transport to REST for its
 lifetime after a single WARNING.
 
-**Cadence.** A per-device budget of
-`ultimate64_temp_gc.DEFAULT_LEAK_BUDGET` = **6** attachment-creating
-calls, counted across every client of that host in the process (issue
-#295). The pass runs before the call that would overrun it, and only a
-successful pass resets the count.
+**Cadence: a sweep before every upload** (issue
+[#511](https://github.com/JC-000/c64-test-harness/issues/511)). The owner,
+2026-09-28: *"Can we have the harness check the directory and clear it when
+the device queue advances to the next user? I'm not sure we really need to
+allow 6 deep either, I think only the most recent file gets a lock."* Two
+rules, both on an armed (leak-prone) client, both before anything is sent:
 
-**The budget is per device only *within a process*; across processes the
-bound is the lock** (owner decision 2026-09-22, recorded on
-[#433](https://github.com/JC-000/c64-test-harness/issues/433): accept and
-document; counting in the lockfile or on the device was declined).
-`TempLedger` is a module-level registry, so two processes driving one
-leak-prone device keep two ledgers and each spends its own budget: the
-worst peak before a sweep is `budget x processes`, not `budget`. Two
-things bound the cross-process case today, and it is worth being precise
-about which case each one covers:
+- **Handover.** `DeviceLock` counts each time this process takes a device's
+  flock (`device_lock.acquire_epoch`; a nested join does not count). A
+  device's `TempLedger` records the epoch of its last successful sweep. A
+  ledger that has never swept, or whose process has taken the lock since,
+  sweeps `/Temp` before its first attachment-creating request. **If that
+  sweep fails, the request is refused** with `Ultimate64TempHygieneError`,
+  and so is every later one until a sweep succeeds. The free
+  `liveness_probe` passes the same gate. So a new process, or the next
+  holder of the lock, never spends anything on a device it could not clean
+  first. Before #511 each new process spent a fresh budget of 6 before it
+  found out.
+- **Budget.** `DEFAULT_LEAK_BUDGET` = **1**, counted across every client of
+  that host in the process (#295). Once one attachment is pending, the next
+  attachment-creating request sweeps first. Only a successful pass resets
+  the count.
 
-- the **lock-release drain**, which sweeps the device while the releasing
-  process still holds its `DeviceLock`, so the next lane inherits a clean
-  `/Temp`;
-- the **inherited sweep** ([#264](https://github.com/JC-000/c64-test-harness/issues/264)),
-  by which an armed client that leaked nothing still collects what it
-  found while holding the lock.
+The sweep keeps the youngest managed file (`DEFAULT_KEEP` = **1**) and any
+image a drive has mounted (#418), and deletes the rest. Resident managed
+files peak at **2**: the kept youngest plus the one just sent. During a
+`liveness_probe` the peak is 3, because its two POSTs are reserved whole
+after a sweep.
 
-Both act at a hand-off. **Neither bounds two processes uploading
-concurrently.** Held as intended the lock prevents that — the uploads are
-destructive, and taking turns is what the lock is for — but the lock is
-advisory ([`device_locking.md`](device_locking.md)), and
-`run_u64_parallel_locked.py` interleaves tests from several processes on
-one device, releasing between them. So the cross-process bound is the
-`DeviceLock` serialising uploads plus the lock-release sweep, and **the
-residual is a process that uploads without holding the lock**.
+**Why 1 and 1: the firmware holds nothing else open.** Read at 1541ultimate
+tag `1.1.0` (the C64U's firmware); not measured.
 
-Why 6. Upstream is the only firm bound: the firmware's
-own post-#686 collector keeps at most **10** managed files
-(`kManagedTempMaxFiles`), upstream's own statement of a safe resident
-count for this folder on this device family, needing no conditions.
-Nothing bounds it from the other side. How many uploads an unpatched
-device survives before `/Temp` fills and the firmware crashes has never
-been measured, and the earlier guessed wedge count (one U64E on 3.14d,
-n unrecorded) is retired (owner, 2026-09-15): do not size against it.
-The RAM disk is **16 MiB**: `ramdisk.cc:25` computes its size as
-`__ram_disk_limit - __ram_disk_start`, and at tag `1.1.0` both
-`target/u64/riscv/ultimate/linker.x` and
-`target/u64ii/riscv/ultimate/linker.x` set those symbols to `0x02000000`
-and `0x03000000` — a 16 MiB span. (The `// 3 * 1024 * 1024` on that same
-line is a stale trailing comment, not the value; a "~3 MB RAM disk"
-propagated through five documents on the strength of it. Corrected in
-[#261](https://github.com/JC-000/c64-test-harness/issues/261).) That size
-is not a count of uploads. Consumer call counts (recounted
-across all six consumer lanes, 2026-09-10; reported, not verified here)
-bound it from below and show a low budget costs normal consumers nothing:
+- `TempfileWriter::collect` (`software/api/attachment_writer.h`) creates
+  `/Temp/temp%04x` with `FA_CREATE_ALWAYS` on `eDataStart`, from a static
+  counter that only goes up. It closes the file on `eDataEnd`/`eTerminate`,
+  **before** it calls the route handler.
+- Every handler reads the file synchronously and closes it before it
+  answers:
+  - `run_prg`/`load_prg`: `FileTypePRG::start_prg` (`filetype_prg.cc:198-202`)
+    into `C64_DMA_LOAD` (`c64_subsys.cc:367-375`: `fopen`, `dma_load`,
+    `fclose`);
+  - `run_crt`: `load_crt`;
+  - `sidplay`: `FileTypeSID::play_file`;
+  - `machine:writemem`: `route_machine.cc:125-160`, `load_file`;
+  - `configs`: `buffer_file`;
+  - `drives:load_rom`: `C1541::load_dos_from_file`, `load_file`.
+- **The exception is a mounted disk image.** `C1541::executeCommand` opens
+  it `FA_READ|FA_WRITE` and keeps it as `mount_file` until the next mount,
+  `remove` or `unlink` on that drive (`c1541.cc` around 1020-1030;
+  `remove_disk` around 420-430). That is at most one per drive, and it need
+  not be the youngest. The `GET /v1/drives` exclusion covers it.
 
-| Consumer shape | Leaking POSTs per default run |
-|---|---|
-| Ordinary runner-verb consumers (~14 sites) | 1–2 |
-| One host-Python UCI driver | 4–8 |
-| `bench_p256_u64.py` / `bench_p384_u64.py` `ALL_SPEEDS` sweep | **17** |
-| A wireguard soak loop, one PRG per iteration | N (a long soak fills `/Temp`) |
-| Two multi-hundred-write lanes | lane bugs, to be chunked onto PUT |
+So "only the most recent file gets a lock" is right for an **in-flight**
+upload: the youngest name may still be streaming. Keeping one covers a
+single concurrent upload that the lock cannot see, from another thread or
+an unlocked neighbour. It is not right for a mounted image, which is held
+for as long as it stays mounted, whatever its age. A file nobody holds is
+garbage as soon as its request returns, so there is no reason to let more
+pile up. And since nobody knows how many a device survives, the harness
+keeps the count at the least the source allows.
 
-**The 17-per-run sweep is the case this budget exists for.** It would
-otherwise accumulate 17 attachments *in a single invocation*, and it is
-pure `run_prg` — it cannot be moved off the POST path by chunking or by
-driving the protocol C64-side, so hygiene is the only fix available to
-that consumer. At a budget of 6 the pass fires on that run's 7th and 13th
-calls, holding resident attachments at budget + keep = 8, inside
-upstream's own figure. A budget of 10 or more would let that sweep run to
-completion with nothing having happened; that is the reason for a low
-number rather than a generous one. Three
-c64-https rigs already run a lane-local GC keeping 2 — this design should
-make those redundant, and does not conflict with them (both delete
-oldest-first by the same pattern).
+**Cost per upload.** Every attachment-creating request to a leak-prone
+device follows one FTP session: connect, login, `CWD /Temp`, `NLST`, quit.
+From the third upload of a hold on, that session also sends one `DELE`
+and one bodyless `GET /v1/drives` (the mounted-image probe, asked only
+when something would be deleted). None of it costs a `/Temp` attachment.
+A post-safe device (the U64E) is disarmed and sees **no** new request:
+no epoch probe, no FTP.
+
+**The residual across processes** (it narrows
+[#433](https://github.com/JC-000/c64-test-harness/issues/433), which
+accepted `budget x processes`). A process that uploads **without** taking
+the lock still sweeps before its first upload, but two such processes
+running at once can each have one attachment pending between sweeps. The
+lock is advisory ([`device_locking.md`](device_locking.md)). Held as
+intended it prevents that, because the uploads are destructive and taking
+turns is what the lock is for.
 
 **Why the budget counts attachments.** On a wedged machine the C64 FPGA
 keeps running while the device firmware is dead: it stops answering the
@@ -345,14 +350,13 @@ failing writes, is not established and should not be asserted: pre-fix, `attachm
 and the buffers, so a naive per-request heap-leak story does not hold on
 its face. Heap fragmentation, per-entry allocation in directory
 traversal, and FileManager bookkeeping growth are all candidates, none
-run down. Since the trigger threshold is unknown, the budget is a choice
-about which error to make. Do **not** resolve it experimentally — the
+run down. Since the trigger threshold is unknown, the harness keeps
+nothing the source says is garbage. Do **not** resolve it experimentally — the
 experiment is "upload until the firmware crashes", on a device nobody can
 power-cycle remotely; it becomes safely measurable only with someone
 physically present.
 
-With the default keep-count of 2 the steady
-state is at most 8 resident. Override with `U64_TEMP_GC_BUDGET` or
+Override with `U64_TEMP_GC_BUDGET` or
 `temp_gc_budget=`. The pass also runs as a **drain** on `client.close()`
 and when the device's `DeviceLock` is released (registered via
 `device_lock.register_release_callback`, fired while the flock is still
@@ -372,11 +376,15 @@ device to the next one clean. The two drain cases differ:
   inherited attachments — but only **under the device lock** (the
   lock-release callback, or `close()` while this process holds the lock),
   because it deletes files other lanes created. A failed inherited sweep
-  writes no config and blocks nothing: it logs a WARNING that `/Temp` may
+  writes no config and sets no block: it logs a WARNING that `/Temp` may
   still hold an earlier lane's attachments and that FTP File Service must
-  be enabled by hand, or the device power-cycled, before uploading.
+  be enabled by hand, or the device power-cycled. It does not count as a
+  sweep either, so the process's next upload sweeps first and is refused
+  if that fails too (#511).
 
-**The budget is per device, within one process** (issue #295). The count,
+**The count is per device, within one process** (issue #295); the
+handover sweep above is what covers the step from one process to the
+next (#511). The count,
 the refusal state and the one FTP-enable attempt live in a process-wide
 `TempLedger` (`ultimate64_temp_gc.py`), keyed by the normalised host.
 Normalising folds together case, scheme, a trailing dot and the
@@ -539,16 +547,18 @@ client, which does not consult the client's threshold.
 The consequence inverts the obvious procedure: **the health check you
 reach for when you already suspect a wedge spends two of a small budget,
 and probing again on a bad result converges on the wedge you are
-diagnosing.** Three health checks spend the whole per-device budget of 6
-(`DEFAULT_LEAK_BUDGET`, per process). Diagnose with bodyless calls first —
+diagnosing.** One health check is already twice the per-device budget
+of 1 (`DEFAULT_LEAK_BUDGET`). It still goes through whole when nothing is
+pending, right after a sweep, and the next upload sweeps its two
+attachments (#511). Diagnose with bodyless calls first —
 `get_info()`, `get_version()` and `read_mem()` all cost nothing — and
 reach for `liveness_probe` deliberately, once, knowing the price.
 
 **The client accounts for it** (#250). `Ultimate64Client.liveness_probe`
 (and so `assert_healthy`) routes both POSTs through the client's
 `/Temp` accounting — `LIVENESS_PROBE_TEMP_ATTACHMENTS = 2` — and reserves
-both before sending anything: if the budget cannot hold two, the hygiene
-pass runs first, and if hygiene has been proven impossible it raises
+both before sending anything: at handover, or if anything is already
+pending, the hygiene pass runs first, and if hygiene has been proven impossible it raises
 `Ultimate64TempHygieneError` without touching the device, so the restore
 is never the refused request.
 
@@ -567,10 +577,9 @@ has no client. Whichever spelling you use, the count is the device's.
 Three consequences worth knowing before you reach for the free spelling.
 It **can raise** `Ultimate64TempHygieneError` — that is the refusal, and
 it is the point, but it is an exception from a root export that did not
-raise before #450. It **can sweep**,
-and a sweep deletes `temp%04x` files, which per #418 can include a raw or
-filename-less image another lane mounted; that trade was already accepted
-for every client path and here it fires only on a budget crossing. And it
+raise before #450. It **can sweep**, at handover and on a budget crossing, like every
+client path. A sweep deletes `temp%04x` files, but not one that a drive
+reports mounted (#418). And it
 **says once per process and host when nothing in this process holds the
 device's `DeviceLock`** (#194, #460) — a notice, not a refusal, because the
 probe writes `$0334-$03B3` and writes it back under whoever else is using

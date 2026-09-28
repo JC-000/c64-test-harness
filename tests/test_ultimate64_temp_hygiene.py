@@ -173,7 +173,7 @@ def test_uci_socket_write_shape_is_accounted_per_attachment():
 
     # A large send adds the payload as a second attachment.  Same host, so
     # the count is the device's (#295): measure what this send adds.
-    c2 = _client(LEAKY)
+    c2 = _client(LEAKY, temp_gc_budget=6)  # count, don't sweep, between them
     before = c2.pending_temp_attachments
     mock2, captured2 = _urlopen_mock()
     with patch("urllib.request.urlopen", mock2):
@@ -263,7 +263,8 @@ def test_a_device_that_answered_late_is_regraded_after_a_successful_request():
         return _FakeResponse()
 
     with patch("urllib.request.urlopen", side_effect=urlopen):
-        c = Ultimate64Client("fake-host")
+        # A budget with room, so the count is not swept between the uploads.
+        c = Ultimate64Client("fake-host", temp_gc_budget=6)
         assert c.temp_hygiene_armed is False, "unknown grade at construction"
         c.run_prg(b"\x01\x08x")
         assert c.pending_temp_attachments == 1, "counted even while unarmed"
@@ -577,7 +578,7 @@ def test_run_prg_404_fallback_costs_two_attachments():
     a wedge symptom, so the path that costs double fires exactly when the
     device is closest to the edge.
     """
-    c = _client(LEAKY)
+    c = _client(LEAKY, temp_gc_budget=6)  # no sweep between the two POSTs
     prg = bytes([0x60, 0x03]) + b"\xAA" * 400
 
     def urlopen(req, timeout=None):
@@ -1295,6 +1296,7 @@ def test_socket_dma_connect_fallback_is_accounted_and_the_latch_keeps_leaking(mo
     """A refused connect latches the fast path off for the transport's
     lifetime (``_socket_dma_unusable`` is never cleared), so every later
     bulk write takes REST -- each POST counted."""
+    monkeypatch.setenv(gc_mod.BUDGET_ENV, "6")  # count, don't sweep, between them
     c = _armed_fixed_client()
     fake = _FakeDMA(connect_error=True)
     t = _dma_transport(monkeypatch, c, fake)
@@ -1346,3 +1348,25 @@ def test_socket_dma_fallback_is_refused_once_hygiene_is_known_impossible(monkeyp
         with pytest.raises(Ultimate64TempHygieneError):
             t.write_memory(0x6000, _bulk())
     assert len(_writemem_posts(wire)) == 1
+
+
+@pytest.fixture(autouse=True)
+def _handover_sweep_already_done(monkeypatch):
+    """Pin the budget, drain and refusal mechanics on their own: the #511
+    handover sweep (the first attachment of a process, or after each lock
+    acquire) is pinned in ``tests/test_temp_handover_sweep.py``, and here it
+    would add one sweep before every test's first upload."""
+    monkeypatch.setattr(gc_mod.TempLedger, "handover_sweep_due", lambda self: False)
+
+
+@pytest.fixture(autouse=True)
+def _empty_temp_over_ftp(monkeypatch):
+    """A budget of 1 (#511) sweeps on the second upload; a test that does not
+    patch the sweep gets an empty ``/Temp`` rather than dialling a fake
+    host's FTP port. Tests that fake FTP themselves patch over this."""
+    from c64_test_harness.backends import ultimate64_temp_gc as _gc
+
+    import fake_temp_ftp
+
+    fake_temp_ftp.EmptyTempFTP.sessions = []
+    monkeypatch.setattr(_gc, "FTP", fake_temp_ftp.EmptyTempFTP)
