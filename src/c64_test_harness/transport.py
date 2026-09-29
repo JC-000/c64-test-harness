@@ -53,6 +53,11 @@ class C64Transport(Protocol):
 
         Returns a ``bytes`` object of exactly ``length`` bytes.
 
+        On VICE this halts the 6510 and leaves it halted until
+        :meth:`resume` (issue #514); a caller polling memory while a
+        program runs should use
+        :func:`~c64_test_harness.memory.wait_for_memory` instead.
+
         A ``bool`` ``addr`` (``bool`` subclasses ``int``; ``True`` is
         ``$0001``, the 6510 processor port) MUST raise ``ValueError``
         **first** -- before any range check, before any early return
@@ -80,6 +85,9 @@ class C64Transport(Protocol):
         A ``bool`` ``addr`` MUST raise ``ValueError`` **first** -- before
         the empty-data early return, the span check, the memory policy
         and any wire use (#340, #352, #357).
+
+        On VICE this halts the 6510 and leaves it halted until
+        :meth:`resume`, like every binary-monitor command.
         """
         ...
 
@@ -135,9 +143,19 @@ class C64Transport(Protocol):
         needed; it is still a real request to the device, which costs a
         round trip and will clear a pause the caller set deliberately.
 
-        The cross-backend screen waiters resume on every exit path for
-        this reason; :meth:`ScreenGrid.from_transport` deliberately does
-        not, because it is a snapshot primitive rather than a waiter.
+        The cross-backend screen waiters and
+        :func:`~c64_test_harness.memory.wait_for_memory` resume on every
+        exit path for this reason; :meth:`ScreenGrid.from_transport` and
+        :func:`~c64_test_harness.memory.read_bytes` deliberately do not,
+        because they are snapshot primitives rather than waiters.
+
+        A transport MAY declare ``halts_cpu_on_access: bool``.
+        ``wait_for_memory``, ``watch_progress`` and the REU extract skip
+        every resume only when it is exactly ``False``
+        (``HardwareTransportBase`` and so ``Ultimate64Transport``); an
+        absent attribute means "treat like VICE".  It is deliberately
+        not a Protocol member, so a transport written before it existed
+        still satisfies ``isinstance(t, C64Transport)``.
         """
         ...
 

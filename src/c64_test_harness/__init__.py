@@ -22,6 +22,7 @@ from .memory import (
     read_word_le,
     read_dword_le,
     hex_dump,
+    wait_for_memory,
     FlakeyReadError,
 )
 from .labels import Labels
@@ -420,6 +421,7 @@ __all__ = [
     # Screen
     "ScreenGrid",
     "wait_for_text",
+    "wait_for_memory",
     "wait_for_stable",
     # Input
     "send_text",

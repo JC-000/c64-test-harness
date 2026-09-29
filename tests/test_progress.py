@@ -69,8 +69,10 @@ def _record_sleep() -> tuple[list[float], "Callable[[float], None]"]:
 def _make_transport(spec=BinaryViceTransport) -> MagicMock:
     """Mock that quacks like the slice of :class:`C64Transport` we need.
 
-    ``watch_progress`` only ever touches ``transport.read_memory``; the
-    rest of the protocol is irrelevant. We use a bare :class:`MagicMock`
+    ``watch_progress`` reads through ``transport.read_memory`` and, on a
+    transport that does not declare ``halts_cpu_on_access = False``,
+    calls ``resume()`` after each poll (#514) -- a spec'd mock answers
+    both. We use a bare :class:`MagicMock`
     so individual tests script the ``read_memory`` side effects
     declaratively. ``spec`` is parametrised over both concrete transport
     types in the suites below so a regression that ties ``watch_progress``
@@ -291,3 +293,138 @@ class TestCanonicalValidation:
             list(watch_progress(
                 transport, addresses={"x": (0x0400, 1)}, poll_interval=0,
             ))
+
+
+# --------------------------------------------------------------------------- #
+# Issue #514: the watched program must keep running between polls            #
+# --------------------------------------------------------------------------- #
+
+
+class _HaltingCounter:
+    """VICE-shaped: every read halts the guest; it counts only while running.
+
+    Each ``resume`` advances the counter by one, so a watcher that never
+    resumes sees one value for ever -- the ``Stalled`` report #514 found.
+    """
+
+    def __init__(self, *, fail_read: int | None = None) -> None:
+        self.counter = 0
+        self.halted = False
+        self.reads = 0
+        self.resumes = 0
+        self.fail_read = fail_read
+
+    def read_memory(self, addr: int, length: int) -> bytes:
+        self.reads += 1
+        self.halted = True
+        if self.reads == self.fail_read:
+            raise OSError("wire dropped")
+        return bytes([self.counter & 0xFF]) * length
+
+    def resume(self) -> None:
+        self.halted = False
+        self.resumes += 1
+        self.counter += 1
+
+
+class _DmaCounter(_HaltingCounter):
+    """U64-shaped: reads do not halt; a resume would clear a real pause."""
+
+    halts_cpu_on_access = False
+
+    def read_memory(self, addr: int, length: int) -> bytes:
+        self.counter += 1  # the machine runs on its own
+        data = super().read_memory(addr, length)
+        self.halted = False
+        return data
+
+
+def _watch(transport, *, ticks: int = 6, **kw):
+    clock = _FakeClock([0.0], step=1.0)
+    _, sleep = _record_sleep()
+    return watch_progress(
+        transport,
+        addresses={"a": (0x0400, 1), "b": (0x0401, 1)},
+        poll_interval=1.0,
+        idle_timeout=2.5,
+        overall_timeout=float(ticks),
+        _clock=clock,
+        _sleep=sleep,
+        **kw,
+    )
+
+
+class TestResumeBetweenPolls:
+    def test_halting_backend_advances_and_is_running_at_every_event(self) -> None:
+        t = _HaltingCounter()
+        kinds = []
+        for event in _watch(t):
+            assert not t.halted, f"yielded {event.kind} with the CPU halted"
+            kinds.append(event.kind)
+        assert "Stalled" not in kinds, kinds
+        assert kinds.count("Advanced") >= 2, kinds
+        # One resume per poll (two reads each), none for the Timeout.
+        assert t.resumes == t.reads // 2
+
+    def test_halting_backend_resumed_after_a_failed_read(self) -> None:
+        t = _HaltingCounter(fail_read=1)
+        gen = _watch(t)
+        assert next(gen).kind == "PollError"
+        assert not t.halted
+        gen.close()
+
+    def test_halting_backend_resumed_before_finished(self) -> None:
+        t = _HaltingCounter()
+        events = list(_watch(t, stop_when=lambda v: True))
+        assert [e.kind for e in events] == ["Advanced", "Finished"]
+        assert not t.halted and t.resumes == 1
+
+    def test_non_halting_backend_is_never_resumed(self) -> None:
+        t = _DmaCounter()
+        kinds = [e.kind for e in _watch(t)]
+        assert kinds.count("Advanced") >= 2, kinds
+        assert t.reads > 0 and t.resumes == 0
+
+    def test_legacy_client_shim_never_resumes(self, caplog) -> None:
+        # The adapter has no resume() at all: a watcher that tried would
+        # log a WARNING per poll from the swallowed AttributeError.
+        from c64_test_harness.backends.ultimate64_helpers import (
+            watch_progress as shim_watch_progress,
+        )
+
+        client = MagicMock()
+        client.read_mem.side_effect = lambda a, n: b"\x00" * n
+        clock = _FakeClock([0.0], step=1.0)
+        _, sleep = _record_sleep()
+        with caplog.at_level("WARNING"):
+            list(shim_watch_progress(
+                client, {"a": (0x0400, 1)}, poll_interval=1.0,
+                idle_timeout=10.0, overall_timeout=3.0, _clock=clock,
+                _sleep=sleep,
+            ))
+        assert client.read_mem.called
+        client.resume.assert_not_called()
+        assert not caplog.records, [r.getMessage() for r in caplog.records]
+
+    def test_hardware_extension_point_is_never_resumed(self, caplog) -> None:
+        # HardwareTransportBase.resume() raises NotImplementedError; a
+        # watcher treating it as halting logged one WARNING per poll, and a
+        # subclass with a real resume() lost a deliberate pause each poll.
+        from c64_test_harness.backends.hardware import HardwareTransportBase
+
+        class Bare(HardwareTransportBase):
+            def read_memory(self, addr: int, length: int) -> bytes:
+                return b"\x00" * length
+
+        class Pausable(Bare):
+            resumes = 0
+
+            def resume(self) -> None:
+                type(self).resumes += 1
+
+        for t in (Bare(), Pausable()):
+            with caplog.at_level("WARNING"):
+                kinds = [e.kind for e in _watch(t)]
+            assert kinds[-1] == "Timeout", kinds
+        assert Pausable.resumes == 0
+        assert not caplog.records, [r.getMessage() for r in caplog.records]

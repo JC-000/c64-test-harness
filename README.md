@@ -89,7 +89,7 @@ Summary: 13 ok, 3 missing, 1 skipped, 4 warn
 Overall: READY (with optional gaps)
 ```
 
-The `x64sc --version printed no version` note is expected: the Homebrew build's `x64sc --version` exits early, so the script falls back to Homebrew's metadata. The harness version is read from the installed package metadata. This sample's `0.11.3` came from a venv installed before the current `0.12.4` in `pyproject.toml`, and it needs `pip install -e .` again to report the right number.
+The `x64sc --version printed no version` note is expected: the Homebrew build's `x64sc --version` exits early, so the script falls back to Homebrew's metadata. The harness version is read from the installed package metadata. This sample's `0.11.3` came from a venv installed before the current `0.13.0` in `pyproject.toml`, and it needs `pip install -e .` again to report the right number.
 
 The VICE checks are **critical**, so a hardware-only machine without VICE reports NOT READY even though the Ultimate backend works. Options: `--quiet`, `--json`, `--no-u64`, `--u64-host HOST`, `--smoke`. Exit codes: `0` READY, `1` NOT READY, `2` script error. Details are in [docs/development.md](docs/development.md#quick-check-scriptsverify-dev-envsh).
 
@@ -244,7 +244,7 @@ with ViceProcess(config) as vice:
     transport.close()
 ```
 
-**Binary monitor note:** The binary monitor auto-pauses the CPU when any command is sent. Screen and keyboard operations need explicit `transport.resume()` calls between reads so the C64 can process keystrokes and update the screen. Use `wait_for_text()` or `wait_for_stable()`, which resume between polls *and* in a `finally`, so every exit path leaves the machine running. If you hand-roll a poll loop, resume in a `finally` — not just between polls, or a successful match hands back a stopped C64 that is indistinguishable from a hung one.
+**Binary monitor note:** The binary monitor auto-pauses the CPU when any command is sent. Screen and keyboard operations need explicit `transport.resume()` calls between reads so the C64 can process keystrokes and update the screen. Use `wait_for_text()` or `wait_for_stable()` -- or `wait_for_memory()` for a flag byte -- which resume between polls *and* in a `finally`, so every exit path leaves the machine running. If you hand-roll a poll loop, resume in a `finally` — not just between polls, or a successful match hands back a stopped C64 that is indistinguishable from a hung one.
 
 ## Memory Helpers
 
@@ -375,7 +375,7 @@ with ViceProcess(config) as vice:
 |----------|-------------|
 | `load_code(transport, addr, code)` | Write machine code into memory (semantic alias for `write_memory`) |
 | `set_register(transport, name, value)` | Set a CPU register (A/X/Y/SP/PC) via `set_registers()` |
-| `goto(transport, addr, *, cold=False)` | Set PC and resume execution; `cold=True` also gives the target `SP=$FF` with `I`/`D` clear |
+| `goto(transport, addr, *, cold=False)` | Set PC and resume execution; `cold=True` also gives the target `SP=$FF` with `I`/`D` clear. The target runs only until the next monitor command -- wait on it with `wait_for_memory` (#514) |
 | `set_breakpoint(transport, addr) -> int` | Set execution checkpoint, returns checkpoint ID |
 | `delete_breakpoint(transport, bp_id)` | Remove a checkpoint |
 | `wait_for_pc(transport, addr)` | Wait for CPU to stop at addr (uses async stopped events) |
@@ -385,7 +385,7 @@ with ViceProcess(config) as vice:
 
 `preserve_state=True`, the default, reads PC, SP and the status register before the hijack and writes them back after the routine returns. Without it, a call issued while the monitor happened to halt the CPU inside an interrupt abandons that handler's stack frame and leaves interrupts masked for the rest of the boot, stopping the jiffy clock and the keyboard scan with no error anywhere (issue #183). Consequences: the machine is left on its pre-call register file while the returned dict holds the routine's, so read the return value rather than the machine; `A`/`X`/`Y` are not restored; nothing is restored on timeout; and a routine whose point is its own `SEI`/`CLI` or `LDX #$FF / TXS` needs `preserve_state=False` or its work is undone. See `examples/direct_memory_test.py` for a complete demo.
 
-`goto()` is the one-way counterpart and does **not** share that defect: there is no point at which control comes back, so there is nothing to restore and nowhere to put it — the abandoned frame is what `goto()` is for. What it does inherit is the halted machine's stack pointer and `I` flag. `cold=True` is the opt-in fix for that, writing `SP=$FF` and a status register with `I` and `D` clear in the same command as `PC`, so the target starts as if nothing had been running. It is not a reset: vectors, I/O and zero page are untouched, and a still-asserting interrupt source will fire as soon as `I` comes clear. The caller-side alternative, when the target should land back in BASIC rather than in your own code, is the warm-start `JMP ($A002)` idiom in `sid_player.py`.
+`goto()` is the one-way counterpart and does **not** share that defect: there is no point at which control comes back, so there is nothing to restore and nowhere to put it — the abandoned frame is what `goto()` is for. And it cannot keep the machine running past the next monitor command: a `read_bytes()` after `goto()` halts the target again until `resume()`, so a bare read loop polls a frozen machine and a settle sleep only hides that for a target that finishes inside the sleep (#514). Wait with `wait_for_memory(transport, addr, expected, timeout=...)` (package root), which resumes between reads on VICE and never resumes the U64. What `goto()` does inherit is the halted machine's stack pointer and `I` flag. `cold=True` is the opt-in fix for that, writing `SP=$FF` and a status register with `I` and `D` clear in the same command as `PC`, so the target starts as if nothing had been running. It is not a reset: vectors, I/O and zero page are untouched, and a still-asserting interrupt source will fire as soon as `I` comes clear. The caller-side alternative, when the target should land back in BASIC rather than in your own code, is the warm-start `JMP ($A002)` idiom in `sid_player.py`.
 
 **Host-side memory access reaches the chips under VICE but samples a machine the monitor has halted -- and never reaches a cartridge on the U64.** Under VICE, `read_memory()` / `write_memory()` go through the binary monitor's `default` bank, which is the 6510's current memory map: writes go through `mem_store` and are indistinguishable from CPU stores (a host write to `$D020`/`$D021` reads back on the 6510 as the new values), and reads go through the chips' side-effect-free *peek* path (`read_memory(0xD020)` returns the VIC's value with its unused-bit pattern; a CIA ICR peek does not clear it) -- measured on VICE 3.10. What the host cannot observe is *motion*: the monitor services commands once per frame from its vsync hook, so a command sent to a running machine always halts it at the same frame phase, and `read_memory(0xD012, 1)` returns the same raster line across resume-and-reread cycles (n=8: always 12), while a checkpoint halt reads whatever line the machine stopped on (60/140/220 after busy-waiting for those lines). So host-side *configuration* of static registers is fine; anything time-varying -- a raster position, a SID oscillator or envelope, a CIA timer or TOD -- must be sampled on the 6510 with the machine running: write the registers, sample into a RAM buffer, call it with `jsr()`, read only the buffer; `tests/test_sid_emulation_live.py` is the worked example. On the Ultimate 64 the reason is different and stronger: host `read_memory`/`write_memory` go through the REST/DMA path, which does not present the access on the expansion port -- the bytes a read of `$DE00` returns are neither meaningful nor reproducible, and a write does not read back (see [docs/bridge_networking.md](docs/bridge_networking.md#real-silicon-diverges-from-vice-in-three-ways)). Same advice, opposite mechanisms; a reader who learns only one will misjudge the other platform. It is still worth knowing before writing a probe, because the host-side version does not error -- it reports the same frozen answer for every configuration, including a healthy one.
 
@@ -776,9 +776,10 @@ write_bytes(transport, SENTINEL, bytes([0x00]))
 # new high byte) -- #426: 8 of 14 paired runs failed that way, 0 of 14 with
 # the one-byte write (U64E fw bce4535e, 2026-09-22/23, paired).
 write_bytes(transport, MAIN_LOOP + 2, bytes([TRAMPOLINE >> 8]))
-# Poll sentinel for completion
-while transport.read_memory(SENTINEL, 1)[0] != 0x42:
-    time.sleep(0.1)
+# Poll sentinel for completion -- with a deadline, and through wait_for_memory
+# so the same code is safe on VICE, where a bare read loop freezes the CPU (#514)
+if wait_for_memory(transport, SENTINEL, 0x42, timeout=30.0, poll_interval=0.1) is None:
+    raise TimeoutError("trampoline never set the sentinel")
 ```
 
 ### Turbo Benchmark

@@ -145,12 +145,20 @@ class ScreenGrid:
         return "\n".join(lines)
 
 
-def _resume_quietly(transport: C64Transport) -> bool:
+def _resume_quietly(transport: C64Transport, *, confirm: bool = False) -> bool:
     """Resume the CPU; return whether the resume was actually delivered.
 
-    Both waiters poll through the binary monitor, which halts the machine
-    for every read; without a resume the C64 does not advance between
-    polls and a running program is indistinguishable from a hung one.
+    With *confirm*, a transport that offers ``_resume_confirmed``
+    (``BinaryViceTransport``) resumes until no stale monitor trap swallows
+    the resume (#516 re-verify); ``False`` from it -- a real stop, or
+    every attempt swallowed -- is logged like a failed resume.  Used for
+    the exit resumes that promise a running machine, not between polls.
+
+    The screen waiters, :func:`~.memory.wait_for_memory` and
+    :func:`~.progress.watch_progress` poll through the binary monitor,
+    which halts the machine for every read; without a resume the C64 does
+    not advance between polls and a running program is indistinguishable
+    from a hung one.
 
     Failures are logged at WARNING and never re-raised.  Two reasons, and
     the second is why ``NotImplementedError`` is not allowed out either
@@ -174,14 +182,26 @@ def _resume_quietly(transport: C64Transport) -> bool:
     logger.
     """
     try:
+        confirmed = getattr(transport, "_resume_confirmed", None)
+        if confirm and callable(confirmed):
+            if not confirmed():
+                logger.warning(
+                    "%s: the CPU stopped again right after resume() (a "
+                    "checkpoint, a jam, or repeated stale monitor traps); "
+                    "it may still be halted.",
+                    type(transport).__name__,
+                )
+                return False
+            return True
         transport.resume()
         return True
     except NotImplementedError:
         # Not a transient: this transport structurally cannot resume, so
         # every waiter run against it silently breaks the contract.
         logger.warning(
-            "%s.resume() is not implemented; the screen waiters cannot "
-            "guarantee the CPU is running on return for this transport.",
+            "%s.resume() is not implemented; the waiters (screen, memory) "
+            "cannot guarantee the CPU is running on return for this "
+            "transport.",
             type(transport).__name__,
         )
         return False
@@ -244,6 +264,12 @@ def wait_for_text(
     clears a deliberate pause.  The waiters cannot tell whether a read
     halted this particular backend without asking it what backend it is,
     which is the coupling ``C64Transport`` exists to prevent.
+
+    *Confirmed on VICE.*  The exit resume goes through
+    ``BinaryViceTransport._resume_confirmed``: a read that arrived while
+    the guest was stalled in an REU DMA leaves a spare monitor trap that
+    swallows a plain resume, so it resumes again until one runs (~5 ms
+    per exit; #516 re-verify).
 
     *Best-effort, not enforced.*  A ``resume`` that raises is logged at
     WARNING and swallowed (see :func:`_resume_quietly` for why raising
@@ -317,7 +343,7 @@ def wait_for_text(
         # depended on which branch it left by.  Gated so the timeout path
         # -- resume, sleep, return -- does not resume a second time.
         if pending_resume:
-            _resume_quietly(transport)
+            _resume_quietly(transport, confirm=True)
 
 
 def wait_for_stable(
@@ -364,4 +390,4 @@ def wait_for_stable(
             time.sleep(poll_interval)
     finally:
         if pending_resume:
-            _resume_quietly(transport)
+            _resume_quietly(transport, confirm=True)

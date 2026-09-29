@@ -131,6 +131,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .memory import _access_halts_cpu
+
 if TYPE_CHECKING:
     from .transport import C64Transport
 
@@ -193,6 +195,25 @@ _REC_CMD_C64_TO_REU = 0x90  # reserved: restore goes via SocketDMA REUWRITE
 
 #: Override reason used for every staging-window / REC write.
 _REU_STAGING_OVERRIDE = "reu-snapshot-staging"
+
+#: Where the VICE extract parks the 6510 while the REC fills the staging
+#: window: a ``JMP *`` in the cassette buffer, clear of $0800-$87FF.  The
+#: prior three bytes are written back afterwards (HARNESS_SCRATCH entry
+#: owned by ``snapshot.extract_reu_contents``, transient).
+_REU_PARK_ADDR = 0x03C0
+#: 6510 status-register interrupt-disable bit.
+_FLAG_I = 0x04
+#: REC command-register execute bit: set by the command write, cleared by
+#: x64sc once the transfer has run (``reu_dma_start``).
+_REC_CMD_EXECUTE = 0x80
+#: Stale-trap listening window for the extract's one drain.  Longer than
+#: the waiters' (``BinaryViceTransport.STALE_TRAP_WINDOW``): it is paid
+#: once per extract, and a miss here costs the caller's next resume.
+_DRAIN_WINDOW = 0.05
+#: Wall-clock bound on one VICE bank transfer (32768 stolen cycles, ~1.67
+#: PAL frames of emulated time; the bound only catches a machine that
+#: never runs).
+_REC_DONE_TIMEOUT = 5.0
 
 # ---------------------------------------------------------------------------
 # I/O window constants — see the module docstring's "I/O window" section
@@ -477,7 +498,9 @@ def extract_snapshot(
     """Read RAM + CPU port out of any ``C64Transport``-conforming backend.
 
     Reads ``$0000-$FFFF`` and the two CPU port registers and packages
-    them into a :class:`Snapshot`.  The backend's chunking handles any
+    them into a :class:`Snapshot`.  On VICE the read halts the 6510 and
+    leaves it halted, so the image is one consistent instant; the U64
+    reads by DMA while the machine runs.  The backend's chunking handles any
     transport-level size limits.  The read goes through the CPU view,
     so the ``$D000-$DFFF`` slice of :attr:`Snapshot.ram` holds I/O-view
     bytes (register reads + color RAM), not RAM under I/O — see the
@@ -523,7 +546,9 @@ def restore_snapshot(
     override_memory_policy: bool = True,
     restore_reu: bool = True,
 ) -> None:
-    """Write RAM and CPU port back through the transport.
+    """Write RAM and CPU port back through the transport.  On VICE the
+    machine is left halted (binary monitor); resume to run the restored
+    image.
 
     The RAM image is restored in three slices — ``$0000-$CFFF``, color
     RAM ``$D800-$DBFF``, and ``$E000-$FFFF``.  The rest of the I/O
@@ -616,8 +641,9 @@ def extract_reu_contents(
 
     1. Stash the 32 KB staging window ``$0800-$87FF``.
     2. Per 32 KB bank: program an REU→C64 transfer through the REC
-       registers (``$DF02-$DF0A`` then the command at ``$DF01``), wait
-       *settle* seconds for the DMA to land, and read the window back.
+       registers (``$DF02-$DF0A`` then the command at ``$DF01``), resume
+       the CPU on VICE (below), wait *settle* seconds for the DMA to
+       land, and read the window back.
     3. Restore the original 32 KB.
 
     ``pause=True`` requests a CPU pause around the extract
@@ -627,9 +653,37 @@ def extract_reu_contents(
     including the REC's DMA engine, so the staged transfers never
     execute and the extract returns stale RAM. The default therefore
     runs unpaused — the capture is not atomic, so ensure the running
-    program isn't actively mutating REU during the extract. On VICE
-    the knob is irrelevant: the binary monitor already holds the
-    machine during memory commands.
+    program isn't actively mutating REU during the extract.
+
+    VICE has the same property for a different reason (issue #514):
+    x64sc's REC only pulls BA on the command write and performs the
+    transfer from the CPU loop (``c64/cart/reu.c`` ``reu_dma``), which
+    does not run while the binary monitor holds the machine.  So on a
+    transport whose accesses halt the CPU the extract **resumes after
+    each command write** and polls the REC command register until its
+    execute bit clears -- the transfer runs synchronously once the CPU
+    runs, but a single resume does not guarantee a cycle has run before
+    the next command is serviced -- so *settle* is not slept there.
+    Before this the VICE extract returned the staging window's own RAM
+    -- and the transfer it had armed ran on the caller's next resume,
+    *after* the write-back, overwriting the window with REU data.
+
+    Resuming means the CPU runs between command and read, so on VICE
+    the extract first **parks the 6510 outside the window**: it saves
+    ``PC``/``FL``, writes ``JMP *`` at ``$03C0`` (the cassette buffer),
+    sets ``PC`` there with ``I`` set so no IRQ handler runs either, and
+    afterwards writes back those three bytes and the saved ``PC``/``FL``.
+    A program executing inside ``$0800-$87FF`` therefore never runs REU
+    data (a KIL-filled bank used to jam it) and carries on where it was
+    halted.  An NMI is not masked by ``I``; a program whose NMI handler
+    lives in the window is not protected.  A halting transport without
+    ``read_registers``/``set_registers`` cannot be parked and is
+    extracted unparked.  *pause* has no effect on VICE.  The machine is
+    left halted on return, and the caller's next ``resume()`` runs it:
+    each transfer stalls the CPU for ~1.67 PAL frames with a command
+    waiting, which makes VICE queue a spare monitor trap, and the extract
+    spends a confirmed resume on those while still parked (#516
+    re-verify; before, the caller's first resume ran nothing, 8/8).
 
     All staging/REC writes carry ``override="reu-snapshot-staging"`` so
     a strict :class:`~c64_test_harness.MemoryPolicy` doesn't block them.
@@ -637,7 +691,8 @@ def extract_reu_contents(
     the snapshot).
 
     Cost: ~30 s / 16 MB at native speed on U64 hardware (turbo helps);
-    effectively instant on VICE.
+    on VICE ~1.67 PAL frames of emulated time per 32 KB bank (32768
+    stolen cycles), spent parked.
     """
     if not isinstance(size_bytes, int) or isinstance(size_bytes, bool):
         raise ValueError(f"size_bytes must be an int, got {size_bytes!r}")
@@ -646,10 +701,13 @@ def extract_reu_contents(
             f"size_bytes must be 1..{_REU_MAX_BYTES}, got {size_bytes}"
         )
 
-    _warn_if_layout_overlaps_staging_window(transport)
+    halts = _access_halts_cpu(transport)
+    if not (halts and _can_park(transport)):
+        _warn_if_layout_overlaps_staging_window(transport)
     paused = _try_pause(transport) if pause else False
     try:
         saved = transport.read_memory(_REU_STAGING_BASE, _REU_STAGING_SIZE)
+        unpark = _park_outside_staging_window(transport) if halts else None
         try:
             out = bytearray()
             for reu_offset in range(0, size_bytes, _REU_STAGING_SIZE):
@@ -660,7 +718,9 @@ def extract_reu_contents(
                     length=n,
                     command=_REC_CMD_REU_TO_C64,
                 )
-                if settle > 0:
+                if halts:
+                    _run_rec_transfer(transport, reu_offset)
+                elif settle > 0:
                     time.sleep(settle)
                 bank = transport.read_memory(_REU_STAGING_BASE, n)
                 if len(bank) != n:
@@ -669,14 +729,111 @@ def extract_reu_contents(
                         f"expected {n} (REU offset {reu_offset:#x})"
                     )
                 out += bank
+            if unpark is not None:
+                _drain_stale_monitor_traps(transport)
             return bytes(out)
         finally:
-            transport.write_memory(
-                _REU_STAGING_BASE, saved, override=_REU_STAGING_OVERRIDE
-            )
+            try:
+                transport.write_memory(
+                    _REU_STAGING_BASE, saved, override=_REU_STAGING_OVERRIDE
+                )
+            finally:
+                if unpark is not None:
+                    unpark()
     finally:
         if paused:
             transport.resume()
+
+
+def _run_rec_transfer(transport: "C64Transport", reu_offset: int) -> None:
+    """Resume a halted x64sc until the armed REC transfer has run.
+
+    x64sc performs the transfer from the CPU loop, and the command write
+    left the CPU halted.  One resume is not enough: measured, a read sent
+    straight after it saw the previous bank in 2 of 4 banks -- the monitor
+    can service the next command before the CPU has run a cycle.  So this
+    polls the command register's execute bit (cleared by
+    ``reu_dma_start``), resuming after every poll, until it clears.  Not
+    the quiet resume: a resume that fails here must not yield stale data.
+    """
+    deadline = time.monotonic() + _REC_DONE_TIMEOUT
+    while True:
+        transport.resume()
+        if not transport.read_memory(_REC_COMMAND, 1)[0] & _REC_CMD_EXECUTE:
+            return
+        if time.monotonic() > deadline:
+            raise RuntimeError(
+                f"REC transfer at REU offset {reu_offset:#x} never ran: the "
+                f"execute bit at ${_REC_COMMAND:04X} stayed set for "
+                f"{_REC_DONE_TIMEOUT} s of resumes"
+            )
+
+
+def _drain_stale_monitor_traps(transport: "C64Transport") -> None:
+    """Consume the spare monitor traps the transfers left, while parked.
+
+    Each transfer stalls the CPU for ~1.67 PAL frames with the next
+    command already on the socket, and VICE queues a monitor trap at every
+    vsync that sees it; the spare one re-enters the monitor on the next
+    EXIT.  Left alone, that EXIT is the caller's first ``resume()`` after
+    the extract, and it ran nothing (#516 re-verify, 3/3 and 8/8).  So the
+    extract resumes the parked CPU until an EXIT is not swallowed; the
+    write-back that follows halts it again with one ordinary trap.
+    """
+    confirmed = getattr(transport, "_resume_confirmed", None)
+    if callable(confirmed) and not confirmed(window=_DRAIN_WINDOW):
+        _log.warning(
+            "extract_reu_contents: the parked CPU kept stopping after "
+            "resume(); the caller's next resume may not run the program"
+        )
+
+
+def _can_park(transport: "C64Transport") -> bool:
+    return callable(getattr(transport, "read_registers", None)) and callable(
+        getattr(transport, "set_registers", None)
+    )
+
+
+def _park_outside_staging_window(transport: "C64Transport"):
+    """Park a halted 6510 on ``JMP *`` at :data:`_REU_PARK_ADDR`, IRQs off.
+
+    Returns the callable that undoes it (park bytes, then ``PC``/``FL``),
+    or ``None`` when the transport cannot report and set registers.  Only
+    ``PC`` and ``FL`` are changed, so only they are put back: ``JMP *``
+    touches no other register, and with ``I`` set no IRQ pushes a frame.
+    """
+    if not _can_park(transport):
+        return None
+    set_regs = transport.set_registers
+    regs = transport.read_registers()
+    if "PC" not in regs or "FL" not in regs:
+        return None
+    restore = {"PC": regs["PC"], "FL": regs["FL"]}
+    prior = transport.read_memory(_REU_PARK_ADDR, 3)
+    transport.write_memory(
+        _REU_PARK_ADDR,
+        bytes([0x4C, _REU_PARK_ADDR & 0xFF, _REU_PARK_ADDR >> 8]),
+        override=_REU_STAGING_OVERRIDE,
+    )
+    try:
+        set_regs({"PC": _REU_PARK_ADDR, "FL": regs["FL"] | _FLAG_I})
+    except BaseException:
+        # Not parked, so nothing will unpark: put the three bytes back now
+        # rather than leave a JMP * in the cassette buffer.
+        transport.write_memory(
+            _REU_PARK_ADDR, prior, override=_REU_STAGING_OVERRIDE
+        )
+        raise
+
+    def unpark() -> None:
+        try:
+            transport.write_memory(
+                _REU_PARK_ADDR, prior, override=_REU_STAGING_OVERRIDE
+            )
+        finally:
+            set_regs(restore)
+
+    return unpark
 
 
 def _warn_if_layout_overlaps_staging_window(transport: "C64Transport") -> None:
@@ -690,15 +847,16 @@ def _warn_if_layout_overlaps_staging_window(transport: "C64Transport") -> None:
     flight; writing the original bytes back afterwards does not undo
     PC/stack/side effects.  Say so up front.
 
-    Hardware only.  On VICE the binary monitor holds the machine during
-    memory commands, nothing executes from the window mid-extract, and
-    the write-back is genuinely transient — so the warning would be
-    noise.  The backend test is the same duck-typing :func:`_try_pause`
-    uses: an Ultimate transport carries a ``client`` (the REST object),
-    a VICE transport does not.
+    Called for every transport the extract cannot park: hardware, and a
+    halting transport without ``read_registers``/``set_registers``.  It
+    used to skip every VICE-shaped transport on the belief that the
+    binary monitor holds the machine for the whole extract; it cannot,
+    because x64sc performs the REC transfer only while the CPU runs, so
+    the extract resumes after each command write (issue #514).  A
+    parkable VICE transport is safe because the CPU is parked outside the
+    window meanwhile (an NMI handler in the window is the residue, noted
+    on :func:`extract_reu_contents`).
     """
-    if getattr(transport, "client", None) is None:
-        return  # VICE-shaped: monitor holds the machine; no hazard
     policy = getattr(transport, "memory_policy", None)
     overlaps = getattr(policy, "harness_scratch_overlaps", None)
     if overlaps is None:

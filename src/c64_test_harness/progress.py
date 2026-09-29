@@ -3,9 +3,11 @@
 This module provides :func:`watch_progress`, a generator that polls a
 caller-supplied set of memory ranges and yields :class:`ProgressEvent`\\ s
 when their bytes change, stall, or the wall-clock budget expires. It is a
-host-side polling loop with no backend-specific dependencies: the only
-primitive it uses is :meth:`C64Transport.read_memory`, so it works
-identically against the VICE emulator and Ultimate 64 hardware.
+host-side polling loop with no backend-specific dependencies: it reads
+through :meth:`C64Transport.read_memory` and, on a backend whose reads
+halt the CPU (VICE), resumes after every poll, so the watched program
+keeps running between polls on the VICE emulator and Ultimate 64
+hardware alike (issue #514).
 
 See GitHub issue #108 for the motivating use case (multi-hour crypto
 handshakes on the U64E).
@@ -28,6 +30,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Iterator, Literal, Mapping
 
+from .memory import _access_halts_cpu
+from .screen import _resume_quietly
 from .transport import C64Transport
 
 _log = logging.getLogger(__name__)
@@ -108,6 +112,19 @@ def watch_progress(
 
     Operationally:
 
+    * **The watched program keeps running between polls.**  On VICE each
+      ``read_memory`` halts the 6510 until ``resume()``, so after every
+      poll's reads (successful or not) the watcher resumes -- before it
+      yields, so the machine is running while the caller handles an
+      event.  It resumes only after a poll that read something, and
+      never on a transport that declares ``halts_cpu_on_access = False``
+      (``HardwareTransportBase`` and so the Ultimate 64, where
+      ``resume()`` is a real request that clears a deliberate pause).
+      Before issue #514 it never resumed, and on VICE the program froze
+      at the first poll and was reported ``"Stalled"``.  On VICE the
+      resume is confirmed (~5 ms per poll): a guest REU DMA in
+      flight during the reads leaves a spare monitor trap that would
+      swallow a plain resume.
     * Each poll issues one ``read_memory`` per watched name. On
       hardware (U64) reads contend with the C64 bus via DMA, so
       ``poll_interval`` defaults to a conservative 10 s. Shorten it
@@ -143,7 +160,9 @@ def watch_progress(
     special handling.
 
     :param transport: Any :class:`C64Transport` (VICE, U64, future
-        backends). Only ``read_memory(addr, length)`` is used.
+        backends). ``read_memory(addr, length)`` is used, plus
+        ``resume()`` after each poll unless the transport declares
+        ``halts_cpu_on_access = False``.
     :param addresses: Mapping of caller-chosen name to ``(addr, length)``
         tuple. Each entry is read independently every poll. Empty
         mappings raise :class:`ValueError`.
@@ -204,6 +223,8 @@ def watch_progress(
     # deterministic when callers iterate ``event.changed`` / ``values``.
     plan = list(addresses.items())
 
+    halts = _access_halts_cpu(transport)
+
     def _gen() -> Iterator[ProgressEvent]:
         start = _clock()
         last_change = start
@@ -224,17 +245,32 @@ def watch_progress(
 
             current: dict[str, bytes] = {}
             poll_error: Exception | None = None
-            for name, (addr, length) in plan:
-                try:
-                    data = transport.read_memory(addr, length)
-                except Exception as exc:  # noqa: BLE001
-                    poll_error = exc
-                    _log.warning(
-                        "watch_progress: read_memory(%s @ 0x%04X, %d) raised %r",
-                        name, addr, length, exc,
-                    )
-                    break
-                current[name] = bytes(data)
+            try:
+                for name, (addr, length) in plan:
+                    try:
+                        data = transport.read_memory(addr, length)
+                    except Exception as exc:  # noqa: BLE001
+                        poll_error = exc
+                        _log.warning(
+                            "watch_progress: read_memory(%s @ 0x%04X, %d) raised %r",
+                            name, addr, length, exc,
+                        )
+                        break
+                    current[name] = bytes(data)
+            finally:
+                # Issue #514: on VICE the reads above halted the 6510 and
+                # nothing else will restart it -- without this the watched
+                # program freezes at the first poll and every later poll
+                # reports "Stalled".  Owed only after a read (the Timeout
+                # path above reads nothing), and never on a transport that
+                # declares its reads do not halt (the U64, where resume()
+                # would clear a deliberate pause; #189/#190).
+                if halts:
+                    # Confirmed: the caller is told the program runs while
+                    # it handles the event, and a guest REU DMA in flight
+                    # during the reads can leave a stale monitor trap that
+                    # swallows a plain resume (#516 re-verify).
+                    _resume_quietly(transport, confirm=True)
 
             now = _clock()
             elapsed = now - start

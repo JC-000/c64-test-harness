@@ -122,7 +122,8 @@ def poll_until_ready(
 
     Returns:
         The final result byte: ``0x01`` on event, ``0xFF`` on
-        wall-clock timeout, or any device-specific sentinel.
+        wall-clock timeout, or any device-specific sentinel.  On VICE
+        the CPU is left halted, as the last :func:`jsr` left it.
 
     Note:
         This function imports :mod:`c64_test_harness.execute` and

@@ -154,9 +154,23 @@ class _FakeRecTransport:
     64 KB RAM image.  ``read_memory``/``write_memory`` otherwise behave
     as plain RAM, so the staging stash/restore path is exercised for
     real.
+
+    ``halts=False`` (default) is the Ultimate shape: the copy happens on
+    the command write.  ``halts=True`` is x64sc under the binary monitor
+    (issue #514): the command only arms the transfer (execute bit set in
+    ``$DF01``), which runs -- clearing the bit -- on the ``lag + 1``-th
+    resume after it.  ``lag=1`` models the measured case where the monitor
+    serviced the next command before the CPU ran a cycle.
     """
 
-    def __init__(self, reu_image: bytes, ram_fill: int = 0xEE) -> None:
+    def __init__(
+        self, reu_image: bytes, ram_fill: int = 0xEE, *, halts: bool = False,
+        lag: int = 0, never_runs: bool = False,
+    ) -> None:
+        self.lag = lag
+        self.never_runs = never_runs
+        self._pending_lag = 0
+        self._cmd = 0x00  # REC command register, kept out of the RAM image
         self.ram = bytearray(_ram_64k(ram_fill))
         self.reu = bytes(reu_image)
         self.writes: list[tuple[int, bytes, str | None]] = []
@@ -164,8 +178,12 @@ class _FakeRecTransport:
         self._rec_regs = bytearray(9)
         self.client = MagicMock()
         self.resume_calls = 0
+        self.halts_cpu_on_access = halts
+        self._armed: tuple[int, int, int] | None = None
 
     def read_memory(self, addr: int, length: int) -> bytes:
+        if addr == _REC_COMMAND and length == 1:
+            return bytes([self._cmd])
         return bytes(self.ram[addr : addr + length])
 
     def write_memory(
@@ -182,16 +200,56 @@ class _FakeRecTransport:
             reu_base = r[2] | (r[3] << 8) | (r[4] << 16)
             length = r[5] | (r[6] << 8)
             self.transfers.append((c64_base, reu_base, length))
-            self.ram[c64_base : c64_base + length] = self.reu[
-                reu_base : reu_base + length
-            ]
+            self._armed = (c64_base, reu_base, length)
+            self._pending_lag = self.lag
+            self._cmd = data[0]
+            if not self.halts_cpu_on_access:
+                self._run_dma()
             return
         # Plain RAM write (staging stash restore etc.).
         if addr + len(data) <= 65536:
             self.ram[addr : addr + len(data)] = data
 
+    def _run_dma(self) -> None:
+        if self._armed is None or self.never_runs:
+            return
+        c64_base, reu_base, length = self._armed
+        self._armed = None
+        self._cmd &= 0x7F
+        self.ram[c64_base : c64_base + length] = self.reu[
+            reu_base : reu_base + length
+        ]
+
     def resume(self) -> None:
         self.resume_calls += 1
+        if self._pending_lag:
+            self._pending_lag -= 1
+            return
+        self._run_dma()
+
+
+class _ParkableRecTransport(_FakeRecTransport):
+    """x64sc-shaped REC fake that also reports and sets registers.
+
+    Records ``(PC, FL, bytes at PC)`` at every resume, so a test can see
+    where the CPU would have run while the window held REU data.
+    """
+
+    def __init__(self, reu_image: bytes, **kw) -> None:
+        super().__init__(reu_image, halts=True, **kw)
+        self.regs = {"PC": 0x1000, "FL": 0x20, "SP": 0xF3, "A": 1, "X": 2, "Y": 3}
+        self.at_resume: list[tuple[int, int, bytes]] = []
+
+    def read_registers(self) -> dict[str, int]:
+        return dict(self.regs)
+
+    def set_registers(self, regs: dict[str, int]) -> None:
+        self.regs.update(regs)
+
+    def resume(self) -> None:
+        pc = self.regs["PC"]
+        self.at_resume.append((pc, self.regs["FL"], bytes(self.ram[pc:pc + 3])))
+        super().resume()
 
 
 class _MockTransport:
@@ -428,6 +486,147 @@ class TestExtractReuContents:
         assert [reu for _, reu, _ in t.transfers] == [
             0x00000, 0x08000, 0x10000, 0x18000,
         ]
+
+    def test_halting_backend_is_resumed_so_the_transfer_runs(self) -> None:
+        # x64sc performs the REC transfer only while the CPU runs; without
+        # a resume after each command the bank read returns the window's
+        # own RAM (measured live, tests/test_resume_after_monitor_vice_live.py).
+        size = 40 * 1024
+        reu = _pattern(size, seed=5)
+        t = _FakeRecTransport(reu, halts=True)
+        assert extract_reu_contents(t, size, settle=0) == reu
+        assert t.resume_calls == 2  # one per bank, none elsewhere
+
+    def test_halting_backend_resumed_until_the_execute_bit_clears(self) -> None:
+        # Measured on x64sc: a read straight after one resume saw the
+        # previous bank in 2 of 4 banks.  The extract must poll $DF01.
+        size = 64 * 1024
+        reu = _pattern(size, seed=6)
+        t = _FakeRecTransport(reu, halts=True, lag=2)
+        assert extract_reu_contents(t, size, settle=0) == reu
+        assert t.resume_calls == 6
+
+    def test_halting_backend_does_not_sleep_the_settle(self) -> None:
+        # On x64sc the execute-bit poll is the barrier; the U64-shaped
+        # settle sleep only cost wall time (and, under warp, ~55 frames of
+        # a running program per bank before the park existed).
+        import time as _time
+
+        t = _FakeRecTransport(_pattern(64 * 1024), halts=True)
+        start = _time.monotonic()
+        extract_reu_contents(t, 64 * 1024, settle=5.0)
+        assert _time.monotonic() - start < 1.0
+
+    def test_a_transfer_that_never_runs_raises_and_restores(self, monkeypatch) -> None:
+        import c64_test_harness.snapshot as snap
+
+        monkeypatch.setattr(snap, "_REC_DONE_TIMEOUT", 0.05)
+        t = _FakeRecTransport(_pattern(1024), halts=True, never_runs=True)
+        original = bytes(t.ram[_REU_STAGING_BASE:_REU_STAGING_BASE + _REU_STAGING_SIZE])
+        with pytest.raises(RuntimeError, match="never ran"):
+            extract_reu_contents(t, 1024, settle=0)
+        assert bytes(t.ram[_REU_STAGING_BASE:_REU_STAGING_BASE + _REU_STAGING_SIZE]) == original
+
+    def test_halting_backend_parks_the_cpu_outside_the_window(self) -> None:
+        # Review of #516: a program running inside $0800-$87FF executed the
+        # REU bytes (a KIL-filled bank jammed it).  Every resume must find
+        # the CPU on a JMP * outside the window with IRQs masked.
+        from c64_test_harness.snapshot import _REU_PARK_ADDR
+
+        size = 64 * 1024
+        reu = _pattern(size, seed=8)
+        t = _ParkableRecTransport(reu, lag=1)
+        park_before = bytes(t.ram[_REU_PARK_ADDR:_REU_PARK_ADDR + 3])
+        before = dict(t.regs)
+        assert extract_reu_contents(t, size, settle=0) == reu
+        jmp_self = bytes([0x4C, _REU_PARK_ADDR & 0xFF, _REU_PARK_ADDR >> 8])
+        assert t.at_resume, "never resumed"
+        for pc, fl, code in t.at_resume:
+            assert pc == _REU_PARK_ADDR and fl & 0x04 and code == jmp_self
+        assert not (_REU_STAGING_BASE <= _REU_PARK_ADDR
+                    < _REU_STAGING_BASE + _REU_STAGING_SIZE)
+        # Everything put back: park bytes, PC and FL; nothing else touched.
+        assert bytes(t.ram[_REU_PARK_ADDR:_REU_PARK_ADDR + 3]) == park_before
+        assert t.regs == before
+
+    def test_park_is_undone_when_a_bank_read_fails(self) -> None:
+        from c64_test_harness.snapshot import _REU_PARK_ADDR
+
+        t = _ParkableRecTransport(_pattern(1024))
+        park_before = bytes(t.ram[_REU_PARK_ADDR:_REU_PARK_ADDR + 3])
+        before = dict(t.regs)
+        real_read = t.read_memory
+
+        def short_bank(addr: int, length: int) -> bytes:
+            if addr == _REU_STAGING_BASE and length == 1024:
+                return b""
+            return real_read(addr, length)
+
+        t.read_memory = short_bank  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="staging window read"):
+            extract_reu_contents(t, 1024, settle=0)
+        assert bytes(t.ram[_REU_PARK_ADDR:_REU_PARK_ADDR + 3]) == park_before
+        assert t.regs == before
+
+    def test_stale_traps_are_drained_while_still_parked(self) -> None:
+        # #516 re-verify: each transfer leaves a spare monitor trap that
+        # swallowed the caller's first resume after the extract.  The
+        # extract must spend a confirmed resume on it while the CPU is
+        # still on the park loop -- once, after the last bank.
+        from c64_test_harness.snapshot import _REU_PARK_ADDR
+
+        t = _ParkableRecTransport(_pattern(64 * 1024))
+        drained_at: list[tuple[int, int]] = []
+
+        windows: list[float] = []
+
+        def confirmed(**kw) -> bool:
+            drained_at.append((t.regs["PC"], len(t.transfers)))
+            windows.append(kw.get("window"))
+            return True
+
+        t._resume_confirmed = confirmed  # type: ignore[attr-defined]
+        before = dict(t.regs)
+        extract_reu_contents(t, 64 * 1024, settle=0)
+        assert drained_at == [(_REU_PARK_ADDR, 2)]
+        # Paid once per extract, so it listens longer than a waiter exit.
+        from c64_test_harness.backends.vice_binary import BinaryViceTransport
+
+        assert windows[0] > BinaryViceTransport.STALE_TRAP_WINDOW
+        assert t.regs == before
+
+    def test_a_failed_park_puts_the_park_bytes_back(self) -> None:
+        # The JMP * is written before PC is moved onto it; if that register
+        # write fails nothing will ever unpark, so the bytes go back at once.
+        from c64_test_harness.snapshot import _REU_PARK_ADDR
+
+        t = _ParkableRecTransport(_pattern(1024))
+        park_before = bytes(t.ram[_REU_PARK_ADDR:_REU_PARK_ADDR + 3])
+
+        def refuse(regs):
+            raise OSError("monitor socket closed")
+
+        t.set_registers = refuse  # type: ignore[method-assign]
+        with pytest.raises(OSError, match="socket closed"):
+            extract_reu_contents(t, 1024, settle=0)
+        assert bytes(t.ram[_REU_PARK_ADDR:_REU_PARK_ADDR + 3]) == park_before
+
+    def test_cpu_is_unparked_even_when_the_write_back_fails(self) -> None:
+        # Leaving PC on the park loop (with I set) after a failed write-back
+        # would turn a transport error into a machine that never runs again.
+        t = _ParkableRecTransport(_pattern(1024))
+        before = dict(t.regs)
+        real_write = t.write_memory
+
+        def failing_write_back(addr, data, *, override=None):
+            if addr == _REU_STAGING_BASE and len(data) == _REU_STAGING_SIZE:
+                raise OSError("monitor socket closed")
+            return real_write(addr, data, override=override)
+
+        t.write_memory = failing_write_back  # type: ignore[method-assign]
+        with pytest.raises(OSError, match="socket closed"):
+            extract_reu_contents(t, 1024, settle=0)
+        assert t.regs == before
 
     def test_staging_window_ram_restored(self) -> None:
         t = _FakeRecTransport(_pattern(_REU_STAGING_SIZE), ram_fill=0xEE)

@@ -2259,6 +2259,7 @@ def run_ping_and_wait(
     :func:`~c64_test_harness.execute.jsr`, which
     ``Ultimate64Transport`` does not provide (issue #209).  On hardware
     use :func:`build_ping_and_wait_tod_code` with ``run_subroutine``.
+    Returns with the CPU halted, as the last :func:`jsr` left it.
     """
     import time as _time
     from .execute import jsr, load_code
@@ -2353,7 +2354,8 @@ def run_icmp_responder(
     while waiting (the consume routine reports
     :data:`RESULT_ARP_REPLY_SENT` and the loop re-polls), so a peer that
     resolves before pinging -- :func:`run_ping_and_wait`'s default, ip65,
-    any real IP stack -- gets its reply.
+    any real IP stack -- gets its reply.  VICE-only (built on
+    :func:`~c64_test_harness.execute.jsr`); returns with the CPU halted.
     """
     import time as _time
     from .execute import jsr, load_code

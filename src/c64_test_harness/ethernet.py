@@ -97,7 +97,8 @@ def set_cs8900a_mac(
     the first register access.
 
     The transport must be connected and the CPU should be stopped
-    (normal state after binary monitor connect).
+    (normal state after binary monitor connect).  It is left stopped on
+    VICE: resume before running code that expects the chip programmed.
 
     A ``bool`` *base* raises :class:`ValueError` before any access: ``base
     + offset`` would turn ``True`` into zero-page addresses no transport

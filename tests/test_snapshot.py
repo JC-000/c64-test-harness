@@ -122,6 +122,7 @@ class _MockTransport:
     def __init__(self, memory_policy: MemoryPolicy | None = None) -> None:
         self.memory_policy = memory_policy or MemoryPolicy.permissive()
         self.writes: list[tuple[int, bytes, str | None]] = []
+        self.resumes = 0
 
     def write_memory(self, addr: int, data, *, override: str | None = None) -> None:
         # Honour the policy so MemoryPolicyError can be raised when the
@@ -133,6 +134,9 @@ class _MockTransport:
     # extract_snapshot is not exercised by these tests; satisfy the protocol.
     def read_memory(self, addr: int, length: int) -> bytes:
         return bytes(length)
+
+    def resume(self) -> None:
+        self.resumes += 1
 
 
 def _replay_writes(
@@ -507,6 +511,7 @@ class _HardwareMockTransport(_MockTransport):
     The stub has no ``pause`` so the extract runs unpaused as on hardware."""
 
     client = object()
+    halts_cpu_on_access = False
 
 
 _OVERLAPPING = MemoryPolicy(
@@ -514,11 +519,27 @@ _OVERLAPPING = MemoryPolicy(
 )
 
 
+class _ParkableViceMockTransport(_MockTransport):
+    """VICE-shaped and parkable: reports and sets registers."""
+
+    def read_registers(self) -> dict[str, int]:
+        return {"PC": 0x0900, "FL": 0x20}
+
+    def set_registers(self, regs: dict[str, int]) -> None:
+        pass
+
+
 class TestReuStagingWindowWarning:
-    def test_extract_warns_on_hardware_when_policy_overlaps_staging_window(self) -> None:
+    # Both unparkable shapes: VICE runs the CPU between the REC command and
+    # the bank read too, since x64sc only performs the transfer while the
+    # CPU runs (issue #514) -- it used to be exempted as "the monitor holds
+    # the machine", which was the wrong model.  A VICE transport that can be
+    # parked outside the window is silent: its program never runs there.
+    @pytest.mark.parametrize("shape", [_HardwareMockTransport, _MockTransport])
+    def test_extract_warns_when_policy_overlaps_staging_window(self, shape) -> None:
         from c64_test_harness.snapshot import extract_reu_contents
 
-        mock = _HardwareMockTransport(memory_policy=_OVERLAPPING)
+        mock = shape(memory_policy=_OVERLAPPING)
         with pytest.warns(UserWarning, match="staging window") as rec:
             extract_reu_contents(mock, 0x8000, settle=0)
         msg = str(rec[0].message)
@@ -526,16 +547,12 @@ class TestReuStagingWindowWarning:
         assert "consumer PRG" in msg
         assert "execut" in msg  # says the span is not safe to execute from
 
-    def test_extract_is_silent_on_vice_shaped_transport_even_when_overlapping(self) -> None:
-        # No ``client`` attribute => VICE-shaped.  The binary monitor holds
-        # the machine during memory commands, so nothing executes from the
-        # window mid-extract and the write-back is genuinely transient.
+    def test_extract_is_silent_when_the_cpu_is_parked(self) -> None:
         import warnings as _w
 
         from c64_test_harness.snapshot import extract_reu_contents
 
-        mock = _MockTransport(memory_policy=_OVERLAPPING)  # no .client
-        assert not hasattr(mock, "client")
+        mock = _ParkableViceMockTransport(memory_policy=_OVERLAPPING)
         with _w.catch_warnings():
             _w.simplefilter("error")
             extract_reu_contents(mock, 0x8000, settle=0)

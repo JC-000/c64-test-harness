@@ -30,7 +30,9 @@ from __future__ import annotations
 
 from .._address import refuse_bool_address
 
+import itertools
 import logging
+import re
 import socket
 import struct
 import threading
@@ -162,7 +164,16 @@ class BinaryViceTransport:
     format for all communication.  Provides ~0.08ms latency per command,
     no write size limits, async breakpoint events, and non-destructive
     resume().
+
+    **Every command halts the 6510** -- a memory read included -- at the
+    next vsync, and it stays halted until :meth:`resume`.  A caller that
+    polls memory while a program runs must resume between reads; use
+    :func:`~c64_test_harness.memory.wait_for_memory` (issue #514).
     """
+
+    #: Capability read by :func:`~c64_test_harness.memory.wait_for_memory`:
+    #: a memory access leaves the CPU halted until :meth:`resume`.
+    halts_cpu_on_access: bool = True
 
     def __init__(
         self,
@@ -310,31 +321,110 @@ class BinaryViceTransport:
             f"{self.host}:{self._text_monitor_port}: {last_err}"
         )
 
-    def _text_recv_until_prompt(self) -> str:
-        """Read from text monitor until we see the (C:$xxxx) prompt."""
+    #: A text-monitor prompt, ``(C:$e5cf) `` -- ``make_prompt`` in
+    #: ``monitor/monitor.c``: memspace C/8/9/10/11 (``mon_memspace_string``)
+    #: and the address.  The assembler's ``.xxxx  `` prompt is not matched;
+    #: nothing here enters assembler mode.
+    _TEXT_PROMPT_RE = re.compile(r"\((?:C|8|9|10|11):\$[0-9a-fA-F]{4}\) ?")
+    #: Marker ids for :meth:`_text_command`; ``print`` of a 16-bit value.
+    _TEXT_MARKERS = itertools.count(1)
+    #: How long :meth:`_text_command` waits for a marker's answer before
+    #: sending the marker again.
+    _TEXT_NUDGE_INTERVAL = 0.05
+
+    def _text_marker_exchange(self, marker_id: int, deadline: float) -> str:
+        """Send ``p $marker``; return everything received before its answer.
+
+        VICE (3.10) processes only the first line of a read that carries
+        several; the rest wait until more data arrives, and that arrival
+        then drains them (``monitor_network_get_command_line``).  So a
+        marker that shared a read with an earlier line -- the command just
+        before it, or an exchange that timed out -- goes unanswered until
+        something else is sent.  The marker is therefore re-sent every
+        :attr:`_TEXT_NUDGE_INTERVAL` until its answer arrives; surplus
+        answers are discarded by the next exchange.  Always whole lines:
+        a partial line leaves VICE blocked in ``recv`` on this socket,
+        serving neither monitor, until a newline comes.  Never an empty
+        line either: ``monitor_process`` repeats the last command for one.
+        """
         assert self._text_sock is not None
+        answer = f"\t{marker_id}\n"
+        line = f"p ${marker_id:04x}\n".encode("ascii")
         buf = b""
+        self._text_sock.sendall(line)
+        nudge_at = time.monotonic() + self._TEXT_NUDGE_INTERVAL
         while True:
+            text = buf.decode("ascii", errors="replace")
+            at = text.find(answer)
+            if at >= 0:
+                return text[:at]
+            now = time.monotonic()
+            if now > deadline:
+                raise TimeoutError(
+                    f"VICE text monitor never answered marker {marker_id}; "
+                    f"got {text[-120:]!r}"
+                )
+            if now >= nudge_at:
+                self._text_sock.sendall(line)
+                nudge_at = now + self._TEXT_NUDGE_INTERVAL
+            self._text_sock.settimeout(
+                max(0.001, min(nudge_at, deadline) - now)
+            )
             try:
                 chunk = self._text_sock.recv(4096)
-            except socket.timeout as e:
-                raise TimeoutError(
-                    f"Timed out reading from VICE text monitor"
-                ) from e
+            except socket.timeout:
+                continue
+            finally:
+                self._text_sock.settimeout(self.timeout)
             if not chunk:
                 raise ConnectionError("VICE text monitor closed connection")
             buf += chunk
-            # Prompt is "(C:$xxxx) " at end of output
-            text = buf.decode("ascii", errors="replace")
-            if "(C:" in text and text.rstrip().endswith(")"):
-                return text
 
     def _text_command(self, cmd: str) -> str:
-        """Send a command to the text monitor and return the response."""
+        """Send a command to the text monitor and return its reply.
+
+        The reply is the command's output with prompts removed.  Holds the
+        binary lock as well (always taken first; nothing takes
+        ``_text_lock`` before ``_lock``, so the order cannot invert).  A
+        text command enters VICE's monitor, and the binary socket reports
+        that entry as a bare Stopped event; issued from another thread
+        during :meth:`_resume_confirmed`'s window it was read as a stale
+        trap and resumed over (#516 round 3, 5/5).  The cost is that a text
+        command waits for any binary exchange in flight, including a
+        :meth:`wait_for_stopped` that holds the lock for its whole timeout;
+        ``self.timeout`` starts once both locks are held, so that wait does
+        not count against it.
+
+        Like every monitor command it leaves the 6510 halted: VICE stays
+        in its monitor loop after a text command until something resumes.
+        """
         assert self._text_sock is not None
-        with self._text_lock:
+        # VICE transmits a prompt every time its monitor loop asks for
+        # input (``uimon_in``, ``monitor/mon_util.c``) -- on entry, after
+        # every text command, and after every *binary* command too, since
+        # the same loop serves both sockets.  So stray ``(C:$xxxx) `` pile
+        # up here, and "read up to the first prompt" took one for the
+        # reply (get_warp() False ~18 in 65k calls under binary traffic,
+        # #516).  So the command is framed by two markers, each
+        # ``print $NNNN`` answering ``\tNNNN-in-decimal\n``, sent and
+        # awaited one at a time (:meth:`_text_marker_exchange`):
+        #
+        # 1. marker A: everything before its answer -- strays, the entry
+        #    prompt, leftovers of an exchange that timed out -- is
+        #    discarded;
+        # 2. the command;
+        # 3. marker B: the reply is everything between A's answer and B's,
+        #    with prompts and surplus answers to A removed.  VICE answers
+        #    lines in order, so nothing else lands in between.
+        with self._lock, self._text_lock:
+            deadline = time.monotonic() + self.timeout
+            first = next(self._TEXT_MARKERS) & 0xFFFF
+            second = next(self._TEXT_MARKERS) & 0xFFFF
+            self._text_marker_exchange(first, deadline)
             self._text_sock.sendall((cmd + "\n").encode("ascii"))
-            return self._text_recv_until_prompt()
+            reply = self._text_marker_exchange(second, deadline)
+        reply = reply.replace(f"\t{first}\n", "")
+        return self._TEXT_PROMPT_RE.sub("", reply)
 
     def _next_req_id(self) -> int:
         """Return an incrementing request ID (wraps at 32 bits)."""
@@ -533,6 +623,11 @@ class BinaryViceTransport:
         would run past ``$FFFF`` raises :class:`ValueError` rather than
         silently wrapping back to ``$0000``.  A ``bool`` address raises
         :class:`ValueError` before anything else (#352).
+
+        Leaves the 6510 halted until :meth:`resume` -- deliberately, so a
+        sequence of reads sees one consistent machine.  To wait on a value
+        a running program will write, use
+        :func:`~c64_test_harness.memory.wait_for_memory` (issue #514).
         """
         # bool subclasses int: True would read $0001, the 6510 processor
         # port.  Refused first, like the Ultimate 64 entry points (#340,
@@ -820,6 +915,132 @@ class BinaryViceTransport:
         """
         self._resume_generation += 1
         self._send_and_recv(CMD_EXIT)
+
+    #: How long :meth:`_resume_confirmed` listens after an EXIT for a
+    #: stale-trap re-entry.  The re-entry's events are written by the same
+    #: VICE thread straight after the Resumed event, before any 6510
+    #: instruction runs: measured 0.08-0.24 ms after the EXIT reply (n=20,
+    #: #516 round 3).  The clean path waits out the whole window, and every
+    #: waiter exit on VICE pays it, so it is kept small; a re-entry delayed
+    #: past it (a descheduled VICE thread) is missed and the waiter returns
+    #: with the machine halted, as before #516.
+    STALE_TRAP_WINDOW = 0.005
+    #: EXITs :meth:`_resume_confirmed` sends before giving up: one per spare
+    #: trap, and a trap queues at every vsync the CPU is stalled across.
+    #: The longest REU stall is a 64 KB swap: ``reu_dma_swap`` costs 2
+    #: cycles per byte (``c64/cart/reu.c``), 131072 cycles, ~6.7 PAL frames
+    #: of 19656 cycles -- up to 6 spare traps behind one command (a 32 KB
+    #: transfer, 1 cycle per byte, is ~1.67 frames).  8 covers that.
+    STALE_TRAP_ATTEMPTS = 8
+
+    def _resume_confirmed(
+        self,
+        window: float | None = None,
+        attempts: int | None = None,
+    ) -> bool:
+        """Resume, and resume again while a stale monitor trap swallows it.
+
+        VICE queues a monitor trap at every vsync that finds a command
+        waiting (``monitor_vsync_hook`` -> ``monitor_startup_trap``), and
+        ``interrupt_do_trap`` runs all queued traps back to back.  A
+        command sent while the CPU is stalled across a vsync -- by an REU
+        DMA, the guest's or the snapshot extract's -- therefore leaves a
+        spare trap, which re-enters the monitor the instant the next EXIT
+        leaves it: that resume runs nothing, and the machine is halted
+        although the caller resumed it (#516 re-verify).
+
+        The re-entry is visible on the wire: after the EXIT reply and the
+        Resumed event, a clean exit sends nothing more, while a stale trap
+        immediately sends a Registers event and a Stopped event.  A
+        stopping checkpoint sends Checkpoint-info (``stop_when_hit`` set)
+        first and a jam sends ``RESPONSE_JAM``; those are real stops, so
+        they are queued for :meth:`wait_for_stopped` and not resumed over.
+        A tracepoint's Checkpoint-info (``stop_when_hit`` clear) is queued
+        and listening goes on.  A stop made through the text monitor also
+        arrives as a bare Stopped; :meth:`_text_command` holds the binary
+        lock so none can land inside the window.  Returns ``True``
+        once an EXIT was not followed by a stale re-entry within
+        :attr:`STALE_TRAP_WINDOW`, ``False`` after a real stop or after
+        :attr:`STALE_TRAP_ATTEMPTS` swallowed EXITs.
+
+        Costs one listening window per call, so the harness uses it only
+        where "running on return" is promised: the waiters' exit resume
+        and the REU extract's drain -- not between polls, where a
+        swallowed resume only delays the next one.
+        """
+        window = self.STALE_TRAP_WINDOW if window is None else window
+        attempts = self.STALE_TRAP_ATTEMPTS if attempts is None else attempts
+        expected = CMD_TO_RESPONSE_TYPE[CMD_EXIT]
+        for _ in range(attempts):
+            # EXIT and the listening window under one hold of the binary
+            # lock (which ``_text_command`` also takes), so no text-monitor
+            # command -- whose monitor entry arrives as a bare Stopped --
+            # can land between them.  Same generation bump as resume().
+            with self._lock:
+                self._resume_generation += 1
+                req_id = self._send_command(CMD_EXIT)
+                self._wait_for_response(req_id, expected_response_type=expected)
+                verdict = self._after_exit(window)
+            if verdict != "stale":
+                return verdict == "running"
+        return False
+
+    @staticmethod
+    def _checkpoint_stops(body: bytes) -> bool:
+        """Whether a Checkpoint-info frame reports a stopping checkpoint.
+
+        Byte 9 is ``stop_when_hit`` (after number u32, currently-hit u8,
+        start u16, end u16); a tracepoint has it clear.  A frame too short
+        to say is treated as a stop -- the safe side, it is not resumed
+        over.
+        """
+        return len(body) < 10 or bool(body[9])
+
+    def _after_exit(self, window: float) -> str:
+        """Classify the events that follow an EXIT: running/stale/stopped.
+
+        Called with ``self._lock`` held (by :meth:`_resume_confirmed`).
+        """
+        assert self._sock is not None
+        held: list[_Response] = []
+        verdict = "running"
+        deadline = time.monotonic() + window
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._sock.settimeout(remaining)
+                try:
+                    resp = self._recv_response()
+                except TimeoutError:
+                    break
+                if resp.response_type == EVENT_RESUMED:
+                    continue
+                if (resp.response_type == RESPONSE_CHECKPOINT_INFO
+                        and not self._checkpoint_stops(resp.body)):
+                    # A tracepoint: reported, and the CPU runs on.
+                    held.append(resp)
+                    continue
+                if resp.response_type in (
+                    RESPONSE_CHECKPOINT_INFO, RESPONSE_JAM,
+                ):
+                    held.append(resp)
+                    verdict = "stopped"
+                    break
+                if resp.response_type == EVENT_STOPPED:
+                    # No checkpoint or jam before it: our own spare trap.
+                    # Its Registers/Stopped events describe a halt the
+                    # next EXIT undoes; drop them.
+                    verdict = "stale"
+                    held = []
+                    break
+                held.append(resp)
+        finally:
+            self._sock.settimeout(self.timeout)
+        for resp in held:
+            self._event_queue.append((self._resume_generation, resp))
+        return verdict
 
     def close(self) -> None:
         """Close TCP connections to VICE."""

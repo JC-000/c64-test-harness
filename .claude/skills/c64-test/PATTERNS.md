@@ -125,9 +125,7 @@ def test_via_menu(transport, labels):
     if grid is None:
         return False, "Menu prompt did not appear"
 
-    time.sleep(0.1)  # Small delay for keyboard buffer
     send_text(transport, "HELLO WORLD")
-    time.sleep(0.1)
     send_key(transport, "\r")
 
     # Wait for result. Wait on a string that appears ONLY on completion --
@@ -240,7 +238,6 @@ def cross_validate(transport, labels, message):
     # Resume CPU, inject RUN command, wait for program to boot
     transport.resume()
     send_text(transport, "RUN")
-    time.sleep(0.1)
     send_key(transport, "\r")
     wait_for_text(transport, "Q=QUIT", timeout=60.0, verbose=False)
 
@@ -1075,8 +1072,7 @@ Semantics, for reading such code: same `MemoryPolicy` checks as the REST path; c
 
 ### DMA Trampoline Pattern
 ```python
-import time
-from c64_test_harness import Labels
+from c64_test_harness import Labels, wait_for_memory
 from c64_test_harness.memory import write_bytes, read_bytes
 
 # `transport` is target.transport from create_manager(backend="u64") (locked);
@@ -1116,13 +1112,10 @@ write_bytes(transport, SENTINEL, bytes([0x00]))
 # (U64E fw bce4535e, 2026-09-22/23, paired).
 write_bytes(transport, MAIN_LOOP + 2, bytes([TRAMPOLINE >> 8]))
 
-# Poll sentinel for completion
-deadline = time.monotonic() + 30.0
-while time.monotonic() < deadline:
-    if transport.read_memory(SENTINEL, 1)[0] == 0x42:
-        break
-    time.sleep(0.1)
-else:
+# Poll sentinel for completion.  wait_for_memory, not a read_memory loop: the
+# same code then works on VICE, where every read halts the CPU until resume()
+# and a bare loop would freeze the program at its first read (#514).
+if wait_for_memory(transport, SENTINEL, 0x42, timeout=30.0, poll_interval=0.1) is None:
     raise TimeoutError("subroutine did not complete")
 
 # Read results from memory
@@ -1166,13 +1159,11 @@ After `run_prg()`, screen RAM ($0400) may contain stale text from a prior run. A
 # WRONG: stale screen text gives false positive
 grid = wait_for_text(transport, "Q=QUIT", timeout=60.0)
 
-# RIGHT: poll for known code at a program address
-boot_deadline = time.monotonic() + 60.0
-while time.monotonic() < boot_deadline:
-    ml = transport.read_memory(MAIN_LOOP, 3)
-    if ml == bytes([0x4C, MAIN_LOOP & 0xFF, (MAIN_LOOP >> 8) & 0xFF]):  # parked
-        break
-    time.sleep(0.5)
+# RIGHT: poll for known code at a program address (wait_for_memory keeps a VICE
+# program running between reads; a bare read_memory loop would freeze it, #514)
+parked = bytes([0x4C, MAIN_LOOP & 0xFF, (MAIN_LOOP >> 8) & 0xFF])  # JMP MAIN_LOOP
+if wait_for_memory(transport, MAIN_LOOP, parked, timeout=60.0, poll_interval=0.5) is None:
+    raise TimeoutError("program never parked at MAIN_LOOP")
 ```
 
 ### Debug stream is rate-capped at 1 MHz-equivalent (turbo gives a 1/N sampled view)
@@ -1486,7 +1477,6 @@ Either way the returned dict holds the *routine's* registers. Read the return va
 ```python
 transport.resume()  # Resumes the pre-call program (or the trampoline, if preserve_state=False)
 send_text(transport, "RUN")
-time.sleep(0.1)
 send_key(transport, "\r")
 wait_for_text(transport, "Q=QUIT", timeout=60.0, verbose=False)
 ```
@@ -1516,11 +1506,11 @@ grid = wait_for_text(transport, "READY", timeout=30.0, verbose=False)
 ```
 
 ### 7. Timing Between Keyboard Operations
-The C64 keyboard buffer is only 10 characters. For longer text, `send_text()` auto-chunks, but add small delays between operations:
+No sleep is needed between `send_text()` and `send_key()`, and on VICE one does nothing. VICE's Keyboard Feed queues the keys in the emulator and, like every monitor command, leaves the 6510 halted: the KERNAL sees them only once something resumes the machine -- normally the `wait_for_text()` that follows (measured: `PRINT` typed then `time.sleep(0.5)` without a resume, 0/5 echoed; with `resume()`, 5/5). On the U64 `inject_keys` itself waits for the 10-byte KERNAL buffer to drain between batches.
 ```python
 send_text(transport, "HELLO")
-time.sleep(0.1)  # Let buffer drain
 send_key(transport, "\r")
+wait_for_text(transport, "RESULT:", timeout=10.0, verbose=False)  # resumes: keys delivered
 ```
 
 ### 8. Window Focus Stealing
