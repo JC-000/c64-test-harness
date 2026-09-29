@@ -64,10 +64,8 @@ _warned_sid_unemulated = False
 
 # Every ViceProcess that has launched a child and not yet stopped it,
 # held strongly so a consumer that drops the object without stop() still
-# has its x64sc stopped when the interpreter exits (#514: an orphaned
-# x64sc re-parented to init after its launcher exited).  Keyed to the
-# launching PID: a forked child inherits the set but must not stop its
-# parent's emulators when it exits.
+# has its x64sc stopped when the interpreter exits (#514 candidate 3).
+# ViceProcess.detach() opts a process out.
 _LIVE_PROCESSES: set["ViceProcess"] = set()
 _LIVE_LOCK = threading.Lock()
 
@@ -75,7 +73,7 @@ _LIVE_LOCK = threading.Lock()
 def _stop_live_processes() -> None:
     """atexit: stop every x64sc this interpreter launched and abandoned."""
     with _LIVE_LOCK:
-        live = [p for p in _LIVE_PROCESSES if p._owner_pid == os.getpid()]
+        live = list(_LIVE_PROCESSES)
     for proc in live:
         if not isinstance(proc.pid, int):
             continue  # a test double, not a launched child
@@ -90,6 +88,23 @@ def _stop_live_processes() -> None:
 
 
 atexit.register(_stop_live_processes)
+
+
+def _forget_parent_processes() -> None:
+    """after-fork (child): the parent's emulators are not ours to stop.
+
+    The child inherits the registry, so without this its exit would warn
+    "never stopped" and run stop() on the parent's processes (deleting the
+    parent's temp vicerc).  The lock is re-created because a fork taken
+    while another thread held it leaves the child a lock nobody releases.
+    """
+    global _LIVE_LOCK
+    _LIVE_LOCK = threading.Lock()
+    _LIVE_PROCESSES.clear()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forget_parent_processes)
 
 
 def ethernet_vice_binary() -> str:
@@ -691,6 +706,32 @@ def _pid_exists(pid: int) -> bool:
     return bool(stat) and not stat.startswith("Z")
 
 
+def _proc_identity(pid: int) -> tuple[str, str] | None:
+    """``(start time, comm)`` of *pid* from ``ps``, or None if it is gone.
+
+    ``ps`` reports both for processes of any user, root included.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "lstart=,comm=", "-p", str(pid)],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+    except OSError:
+        return None
+    parts = out.split(None, 5)  # lstart is five fields: Tue Sep 29 09:44:55 2026
+    if len(parts) < 6:
+        return None
+    return " ".join(parts[:5]), parts[5]
+
+
+def _is_same_x64sc(pid: int | None, ident: tuple[str, str] | None) -> bool:
+    """True if *pid* still has the start time and comm captured as *ident*
+    (captured when it was resolved as x64sc, so comm is x64sc's)."""
+    if pid is None or ident is None:
+        return False
+    return _proc_identity(pid) == ident
+
+
 class ViceProcess:
     """Context manager for a VICE emulator process.
 
@@ -702,9 +743,11 @@ class ViceProcess:
             ...
 
     A process that is started and never stopped is stopped at interpreter
-    exit by an ``atexit`` hook (#514), in the launching process only.
-    That does not cover a launcher killed by a signal (SIGKILL, or an
-    unhandled SIGTERM): x64sc then outlives it, re-parented to init.
+    exit by an ``atexit`` hook, in the launching process only (a forked
+    child forgets its parent's processes).  Call :meth:`detach` for an
+    emulator that must outlive this interpreter.  The hook does not run
+    when the launcher is killed by a signal (SIGKILL, or an unhandled
+    SIGTERM): x64sc then outlives it, re-parented to init.
     """
 
     def __init__(self, config: ViceConfig) -> None:
@@ -720,7 +763,6 @@ class ViceProcess:
         # which on macOS cannot signal a root-owned child from an
         # unprivileged parent.
         self._is_sudo_child: bool = False
-        self._owner_pid: int = os.getpid()
 
     def __enter__(self) -> ViceProcess:
         self.start()
@@ -753,6 +795,15 @@ class ViceProcess:
         if not self._is_sudo_child:
             return self.pid
         return self._find_x64sc_child_pid()
+
+    def detach(self) -> None:
+        """Leave this emulator running when the interpreter exits.
+
+        Removes the process from the at-exit stop registry.  The handle is
+        kept, so :meth:`stop` still works; only the automatic stop at
+        interpreter exit is given up.
+        """
+        self._unregister()
 
     def start(self) -> None:
         """Stop any existing process on this instance, then launch VICE."""
@@ -991,7 +1042,6 @@ class ViceProcess:
         self._is_sudo_child = plan.sudo_wrapped
 
         self._proc = subprocess.Popen(args, **popen_kwargs)  # type: ignore[arg-type]
-        self._owner_pid = os.getpid()
         with _LIVE_LOCK:
             _LIVE_PROCESSES.add(self)
 
@@ -1035,13 +1085,15 @@ class ViceProcess:
         naming its PID instead of returning as if it had succeeded.
         """
         if self._proc is None:
-            self._unregister()
             self._cleanup_tmp_vicerc()
             return
 
         # Resolve the root x64sc before signalling anything: once the
-        # wrapper exits, x64sc is re-parented and no longer findable.
+        # wrapper exits, x64sc is re-parented and no longer findable.  Its
+        # start time is recorded with it, so a PID that has since been
+        # reused is never root-killed or reported as a survivor.
         vice_pid = self._find_x64sc_child_pid() if self._is_sudo_child else None
+        vice_ident = _proc_identity(vice_pid) if vice_pid is not None else None
         try:
             if self._is_sudo_child:
                 # sudo forwards SIGTERM to its child when it runs in the
@@ -1052,9 +1104,11 @@ class ViceProcess:
                 except subprocess.TimeoutExpired:
                     # sudo / x64sc didn't exit; find the root child and kill
                     # it with sudo, then give Popen a moment to reap.
-                    child_pid = self._find_x64sc_child_pid() or vice_pid
-                    if child_pid is not None:
+                    child_pid = self._find_x64sc_child_pid()
+                    if child_pid is not None and child_pid != vice_pid:
                         vice_pid = child_pid
+                        vice_ident = _proc_identity(child_pid)
+                    if _is_same_x64sc(child_pid, vice_ident):
                         subprocess.run(
                             ["sudo", "-n", "kill", "-9", str(child_pid)],
                             check=False,
@@ -1088,7 +1142,7 @@ class ViceProcess:
         self._proc = None
         self._unregister()
         self._cleanup_tmp_vicerc()
-        if vice_pid is not None and _pid_exists(vice_pid):
+        if _is_same_x64sc(vice_pid, vice_ident) and _pid_exists(vice_pid):
             _log.warning(
                 "x64sc PID %d (launched via sudo, running as root) survived "
                 "stop(): this process cannot signal it and `sudo -n kill` "

@@ -1,10 +1,12 @@
-"""No x64sc survives a failed or abandoned launch (issue #514's orphan).
+"""No x64sc survives a failed or abandoned launch (#514, candidates 1-3).
 
 Every test here launches a *real* short-lived process in place of x64sc
 (``/bin/sleep`` copied to a file named ``x64sc``, so ``ps`` sees the same
 comm name the harness matches on) and injects the failure that used to
 leak it.  The assertion is always about the process table, never about a
 mock having been called.  No VICE is spawned and no port is listened on.
+Cleanup only ever kills a PID whose argv[0] is the full path of the
+stand-in this test created -- never anything merely named ``x64sc``.
 """
 
 from __future__ import annotations
@@ -58,11 +60,16 @@ def _wait_dead(pid: int, timeout: float = 5.0) -> bool:
 
 
 def _is_stub(pid: int, stub: Path) -> bool:
-    comm = subprocess.run(
-        ["ps", "-o", "comm=", "-p", str(pid)],
+    """True if *pid* is running this test's stand-in, by full path.
+
+    ``args`` rather than ``comm``: Linux truncates ``comm`` to the bare
+    name, which is exactly what a real x64sc on this host also has.
+    """
+    args = subprocess.run(
+        ["ps", "-o", "args=", "-p", str(pid)],
         capture_output=True, text=True, check=False,
     ).stdout.strip()
-    return bool(comm) and os.path.basename(comm) == stub.name
+    return bool(args) and args.split()[0] == str(stub)
 
 
 def _kill_if_ours(pid: int, stub: Path) -> None:
@@ -93,7 +100,7 @@ def stub_x64sc(tmp_path):
         subprocess.run(["codesign", "-f", "-s", "-", str(sleeper)],
                        check=True, capture_output=True)
     launcher = bindir / "x64sc-launch"
-    launcher.write_text(f'#!/bin/sh\nexec "{sleeper}" 120\n')
+    launcher.write_text(f'#!/bin/sh\nexec "{sleeper}" "${{STUB_SECS:-120}}"\n')
     launcher.chmod(0o755)
     return launcher, sleeper
 
@@ -127,9 +134,33 @@ def spawned(stub_x64sc):
             p.wait(timeout=5)
 
 
-def _cfg(launcher: Path) -> ViceConfig:
+def _cfg(launcher: Path, **kw) -> ViceConfig:
     return ViceConfig(executable=str(launcher), port=6599, warp=True,
-                      sound=False, minimize=True)
+                      sound=False, minimize=True, **kw)
+
+
+def _record_ports(mgr: ViceInstanceManager) -> list[int]:
+    """Every port the manager's allocator hands out, in order."""
+    ports: list[int] = []
+    real = mgr._allocator.allocate
+
+    def allocate(*a, **kw):
+        port = real(*a, **kw)
+        ports.append(port)
+        return port
+
+    mgr._allocator.allocate = allocate
+    return ports
+
+
+def _assert_port_locks_free(ports) -> None:
+    from c64_test_harness.backends.port_lock import PortLock
+
+    assert ports, "no port was allocated; the check proves nothing"
+    for port in ports:
+        lock = PortLock(port)
+        assert lock.acquire(), f"port lock {port} still held"
+        lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -150,16 +181,20 @@ class TestStartInstanceNeverOrphans:
     ):
         launcher, _ = stub_x64sc
         mgr = ViceInstanceManager(_cfg(launcher), port_range_start=6590,
-                                  port_range_end=6599, max_retries=1)
+                                  port_range_end=6599, max_retries=3)
+        ports = _record_ports(mgr)
         with patch(
             "c64_test_harness.backends.vice_manager.BinaryViceTransport",
             side_effect=KeyboardInterrupt,
         ):
             with pytest.raises(KeyboardInterrupt):
                 mgr.acquire()
+        # An interrupt is never retried, whatever max_retries says.
+        assert len(spawned) == 1
         self._assert_all_dead(spawned)
         # The port the failed attempt held is free again.
         assert mgr._allocator.allocated_ports == frozenset()
+        _assert_port_locks_free(ports)
 
     def test_error_after_connect_stops_process_and_closes_transport(
         self, spawned, stub_x64sc,
@@ -167,7 +202,9 @@ class TestStartInstanceNeverOrphans:
         launcher, _ = stub_x64sc
         transport = MagicMock()
         mgr = ViceInstanceManager(_cfg(launcher), port_range_start=6590,
-                                  port_range_end=6599, max_retries=1)
+                                  port_range_end=6599, max_retries=1,
+                                  enable_text_monitor=True)
+        ports = _record_ports(mgr)
         with (
             patch(
                 "c64_test_harness.backends.vice_manager.BinaryViceTransport",
@@ -181,6 +218,8 @@ class TestStartInstanceNeverOrphans:
         self._assert_all_dead(spawned)
         transport.close.assert_called()
         assert mgr.active_count == 0
+        assert len(ports) == 2  # binary monitor + text monitor
+        _assert_port_locks_free(ports)
 
     def test_retried_failures_leave_no_process_behind(
         self, spawned, stub_x64sc,
@@ -188,6 +227,7 @@ class TestStartInstanceNeverOrphans:
         launcher, _ = stub_x64sc
         mgr = ViceInstanceManager(_cfg(launcher), port_range_start=6590,
                                   port_range_end=6599, max_retries=3)
+        ports = _record_ports(mgr)
         with (
             patch(
                 "c64_test_harness.backends.vice_manager.BinaryViceTransport",
@@ -201,6 +241,7 @@ class TestStartInstanceNeverOrphans:
                 mgr.acquire()
         assert len(spawned) == 3
         self._assert_all_dead(spawned)
+        _assert_port_locks_free(ports)
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +305,30 @@ def test_interrupted_wait_for_exit_stops_the_process(spawned, stub_x64sc):
     with pytest.raises(KeyboardInterrupt):
         proc.wait_for_exit(timeout=30)
     assert _wait_dead(popen.pid), "wait_for_exit dropped a live x64sc"
+    assert proc not in vice_lifecycle._LIVE_PROCESSES
+
+
+# ---------------------------------------------------------------------------
+# The at-exit registry: stopped or exited processes leave it
+# ---------------------------------------------------------------------------
+
+
+def test_stop_removes_the_process_from_the_exit_registry(spawned, stub_x64sc):
+    launcher, _ = stub_x64sc
+    proc = ViceProcess(_cfg(launcher))
+    proc.start()
+    assert proc in vice_lifecycle._LIVE_PROCESSES
+    proc.stop()
+    assert _wait_dead(spawned[0].pid)
+    assert proc not in vice_lifecycle._LIVE_PROCESSES
+
+
+def test_self_exited_process_leaves_the_exit_registry(spawned, stub_x64sc):
+    launcher, _ = stub_x64sc
+    proc = ViceProcess(_cfg(launcher, env=dict(os.environ, STUB_SECS="1")))
+    proc.start()
+    assert proc.wait_for_exit(timeout=10) == 0
+    assert proc not in vice_lifecycle._LIVE_PROCESSES
 
 
 # ---------------------------------------------------------------------------
@@ -354,8 +419,77 @@ def test_forked_child_exit_does_not_stop_the_parents_process(stub_x64sc):
         assert alive == "True", (
             "a forked child's interpreter exit stopped the parent's x64sc"
         )
+        # The child must not act on the parent's registry at all: no
+        # "never stopped" claim, no stop() (which would also delete the
+        # parent's temp vicerc).
+        assert "never stopped" not in res.stderr, res.stderr
     finally:
         _kill_if_ours(int(pid_s), sleeper)
+
+
+def test_fork_while_registry_lock_held_does_not_hang_the_child(stub_x64sc):
+    """A fork taken while another thread holds the registry lock hands
+    the child a lock nobody will release; the child's exit must not
+    block on it."""
+    launcher, _ = stub_x64sc
+    res = _run_child(
+        """
+        import os, signal, sys, threading, time
+        from c64_test_harness.backends import vice_lifecycle as vl
+        held, done = threading.Event(), threading.Event()
+        def hold():
+            with vl._LIVE_LOCK:
+                held.set()
+                done.wait()
+        t = threading.Thread(target=hold)
+        t.start()
+        held.wait()
+        child = os.fork()
+        if child == 0:
+            sys.exit(0)        # runs the atexit hook in the child
+        deadline = time.monotonic() + 10
+        status = "hung"
+        while time.monotonic() < deadline:
+            pid, _ = os.waitpid(child, os.WNOHANG)
+            if pid:
+                status = "exited"
+                break
+            time.sleep(0.05)
+        if status == "hung":
+            os.kill(child, signal.SIGKILL)
+            os.waitpid(child, 0)
+        done.set()
+        t.join()
+        print(status, flush=True)
+        """,
+        launcher,
+    )
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.split()[-1] == "exited", "forked child deadlocked at exit"
+
+
+def test_detached_process_is_left_running_at_exit(stub_x64sc):
+    launcher, sleeper = stub_x64sc
+    res = _run_child(
+        """
+        import os
+        from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
+        p = ViceProcess(ViceConfig(executable=os.environ["STUB"], sound=False))
+        p.start()
+        p.detach()
+        print(p.pid, flush=True)
+        """,
+        launcher,
+    )
+    assert res.returncode == 0, res.stderr
+    pid = int(res.stdout.split()[0])
+    try:
+        time.sleep(0.5)
+        assert _alive(pid) and _is_stub(pid, sleeper), (
+            "a detached x64sc was stopped at interpreter exit"
+        )
+    finally:
+        _kill_if_ours(pid, sleeper)
 
 
 # ---------------------------------------------------------------------------
@@ -366,14 +500,21 @@ def test_forked_child_exit_does_not_stop_the_parents_process(stub_x64sc):
 def _wrapper_tree(sleeper: Path, *, ignore_term: str = "none") -> subprocess.Popen:
     """wrapper(sh) -> monitor(sh) -> x64sc: the use_pty shape of sudo.
 
-    *ignore_term*: ``"none"``; ``"all"`` (the wrapper, the monitor and the
+    *ignore_term*: ``"none"``; ``"forward"`` (every layer relays SIGTERM
+    and waits, as sudo does); ``"all"`` (the wrapper, the monitor and the
     stand-in all ignore SIGTERM); or ``"below"`` (the wrapper dies on
     SIGTERM, the monitor and stand-in ignore it -- x64sc is re-parented
     the moment the wrapper exits).  An ignored signal stays ignored across
     fork and exec.
     """
     inner = f'"{sleeper}" 120 & wait'
-    if ignore_term == "all":
+    if ignore_term == "forward":
+        # sudo's real shape: each layer relays SIGTERM to its child and
+        # waits for it, so the stand-in is dead before the wrapper exits.
+        relay = "c=$!; trap 'kill -TERM $c; wait $c; exit 143' TERM; wait $c"
+        inner = f'"{sleeper}" 120 & {relay}'
+        outer = f'/bin/sh -c "$0" & {relay}'
+    elif ignore_term == "all":
         outer = 'trap "" TERM; /bin/sh -c "$0" & wait'
     elif ignore_term == "below":
         outer = '(trap "" TERM; exec /bin/sh -c "$0") & wait'
@@ -388,12 +529,12 @@ def _wrapper_tree(sleeper: Path, *, ignore_term: str = "none") -> subprocess.Pop
 def _find_stub_under(root: int, sleeper: Path, timeout: float = 5.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        out = subprocess.run(["ps", "-axo", "pid=,ppid=,comm="],
+        out = subprocess.run(["ps", "-axo", "pid=,ppid=,args="],
                              capture_output=True, text=True).stdout
         rows = [line.split(None, 2) for line in out.splitlines()]
         kids = {int(r[0]): (int(r[1]), r[2]) for r in rows if len(r) == 3}
-        for pid, (ppid, comm) in kids.items():
-            if os.path.basename(comm) != sleeper.name:
+        for pid, (ppid, args) in kids.items():
+            if args.split()[0] != str(sleeper):
                 continue
             anc = ppid
             while anc > 1 and anc in kids:
@@ -523,3 +664,86 @@ def test_render_wav_interrupted_before_wait_stops_the_process(
                           config=ViceConfig(executable=str(launcher)))
     assert len(spawned) == 1
     assert _wait_dead(spawned[0].pid), "render_wav left x64sc running"
+
+
+def _refuse_root_kill(calls):
+    """subprocess.run stand-in: the privileged kill is refused, as on this
+    bench (no NOPASSWD rule for kill); every call is recorded."""
+    real_run = subprocess.run
+
+    def run(args, *a, **kw):
+        if args[:3] == ["sudo", "-n", "kill"]:
+            calls.append(list(args))
+            return subprocess.CompletedProcess(args, 1)
+        return real_run(args, *a, **kw)
+
+    return run
+
+
+def test_sudo_stop_is_silent_when_x64sc_dies_on_the_relayed_term(
+    stub_x64sc, caplog,
+):
+    _, sleeper = stub_x64sc
+    wrapper = _wrapper_tree(sleeper, ignore_term="forward")
+    stub_pid = _find_stub_under(wrapper.pid, sleeper)
+    assert stub_pid is not None, "test setup: stub never appeared"
+    proc = ViceProcess(ViceConfig(sound=False))
+    proc._proc = wrapper
+    proc._is_sudo_child = True
+    calls: list = []
+    try:
+        with (
+            patch.object(vice_lifecycle.subprocess, "run",
+                         _refuse_root_kill(calls)),
+            caplog.at_level(logging.WARNING, logger=vice_lifecycle.__name__),
+        ):
+            proc.stop()
+        assert not _alive(stub_pid), "relayed SIGTERM did not stop the stand-in"
+        assert not [r for r in caplog.records
+                    if r.levelno >= logging.WARNING], caplog.text
+        assert calls == []
+    finally:
+        _kill_if_ours(stub_pid, sleeper)
+        if wrapper.poll() is None:
+            wrapper.kill()
+            wrapper.wait(timeout=5)
+
+
+def test_sudo_stop_never_kills_or_blames_a_reused_pid(stub_x64sc, caplog):
+    """If the PID resolved as x64sc now names a different process (same
+    PID, other start time), stop() must neither root-kill nor report it."""
+    _, sleeper = stub_x64sc
+    wrapper = _wrapper_tree(sleeper, ignore_term="all")
+    stub_pid = _find_stub_under(wrapper.pid, sleeper)
+    assert stub_pid is not None, "test setup: stub never appeared"
+    proc = ViceProcess(ViceConfig(sound=False))
+    proc._proc = wrapper
+    proc._is_sudo_child = True
+    seen = {"n": 0}
+    calls: list = []
+    try:
+        real_identity = vice_lifecycle._proc_identity
+
+        def identity(pid):
+            seen["n"] += 1
+            real = real_identity(pid)
+            if seen["n"] == 1 or real is None:
+                return real
+            return ("Thu Jan  1 00:00:00 1970", real[1])  # a reused PID
+
+        with (
+            patch.object(vice_lifecycle.subprocess, "run",
+                         _refuse_root_kill(calls)),
+            patch.object(vice_lifecycle, "_proc_identity", identity),
+            caplog.at_level(logging.WARNING, logger=vice_lifecycle.__name__),
+        ):
+            proc.stop()
+        assert seen["n"] >= 2, "identity was never re-checked"
+        assert calls == [], f"root kill sent to a reused PID: {calls}"
+        assert not [r for r in caplog.records
+                    if r.levelno >= logging.WARNING], caplog.text
+    finally:
+        _kill_if_ours(stub_pid, sleeper)
+        if wrapper.poll() is None:
+            wrapper.kill()
+            wrapper.wait(timeout=5)
