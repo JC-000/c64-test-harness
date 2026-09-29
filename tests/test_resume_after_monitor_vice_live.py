@@ -411,10 +411,18 @@ def test_a_text_monitor_stop_is_not_taken_for_a_stale_trap(text_monitor_transpor
     stop = threading.Event()
     errors: list[BaseException] = []
 
+    wrong: list[int] = []
+    calls = [0]
+
     def hammer() -> None:
+        # VICE was started with warp on, so every reply must say so.  Before
+        # the marker-matched reply, a stray prompt from the binary traffic
+        # was taken as the reply ~18 times in 65k calls (#516).
         try:
             while not stop.is_set():
-                t.get_warp()
+                calls[0] += 1
+                if t.get_warp() is not True:
+                    wrong.append(calls[0])
         except BaseException as exc:  # surfaced below
             errors.append(exc)
 
@@ -430,3 +438,4 @@ def test_a_text_monitor_stop_is_not_taken_for_a_stale_trap(text_monitor_transpor
     assert not errors, errors
     assert verdicts, "no confirmed resume happened"
     assert "stale" not in verdicts, verdicts
+    assert not wrong, f"get_warp() misread {len(wrong)} of {calls[0]} replies"

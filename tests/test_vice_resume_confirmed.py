@@ -157,12 +157,21 @@ def test_a_text_monitor_command_waits_for_the_binary_lock():
     sent = threading.Event()
     text_sock = MagicMock()
     text_sock.sendall.side_effect = lambda data: sent.set()
-    text_sock.recv.return_value = b"(C:$e5d1) "
+    # No reply at all: the worker's read times out and it ends, so the
+    # thread never outlives the test.
+    text_sock.recv.side_effect = socket.timeout("no reply")
     t._text_sock = text_sock
     t._text_lock = threading.Lock()
+
+    def run() -> None:
+        try:
+            t._text_command("warp")
+        except Exception:
+            pass
+
     t._lock.acquire()
     try:
-        worker = threading.Thread(target=t._text_command, args=("warp",))
+        worker = threading.Thread(target=run, daemon=True)
         worker.start()
         _time.sleep(0.1)
         assert not sent.is_set(), "text command ran while the binary lock was held"

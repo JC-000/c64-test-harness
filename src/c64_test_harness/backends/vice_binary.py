@@ -30,7 +30,9 @@ from __future__ import annotations
 
 from .._address import refuse_bool_address
 
+import itertools
 import logging
+import re
 import socket
 import struct
 import threading
@@ -319,41 +321,100 @@ class BinaryViceTransport:
             f"{self.host}:{self._text_monitor_port}: {last_err}"
         )
 
-    def _text_recv_until_prompt(self) -> str:
-        """Read from text monitor until we see the (C:$xxxx) prompt."""
+    #: A text-monitor prompt, ``(C:$e5cf) `` -- memspace C/8/9/10/11
+    #: (``mon_memspace_string``, ``monitor/monitor.c``).
+    _TEXT_PROMPT_RE = re.compile(r"\((?:C|8|9|10|11):\$[0-9a-fA-F]{4}\) ?")
+    #: Marker ids for :meth:`_text_command`; ``print`` of a 16-bit value.
+    _TEXT_MARKERS = itertools.count(1)
+
+    def _text_recv(self, done, deadline: float, what: str) -> str:
+        """Read the text socket until ``done(text)`` returns an index.
+
+        Returns the text before that index.  Bounded by *deadline* overall,
+        not only per ``recv``: stray prompts from binary traffic would
+        otherwise keep a missing reply waiting for ever.
+        """
         assert self._text_sock is not None
         buf = b""
         while True:
+            text = buf.decode("ascii", errors="replace")
+            end = done(text)
+            if end is not None:
+                return text[:end]
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"VICE text monitor never answered {what}; "
+                    f"got {text[-120:]!r}"
+                )
             try:
                 chunk = self._text_sock.recv(4096)
             except socket.timeout as e:
                 raise TimeoutError(
-                    f"Timed out reading from VICE text monitor"
+                    "Timed out reading from VICE text monitor"
                 ) from e
             if not chunk:
                 raise ConnectionError("VICE text monitor closed connection")
             buf += chunk
-            # Prompt is "(C:$xxxx) " at end of output
-            text = buf.decode("ascii", errors="replace")
-            if "(C:" in text and text.rstrip().endswith(")"):
-                return text
 
     def _text_command(self, cmd: str) -> str:
-        """Send a command to the text monitor and return the response.
+        """Send a command to the text monitor and return its reply.
 
-        Holds the binary lock as well (always taken first; nothing takes
-        ``_text_lock`` before ``_lock``, so the order cannot invert).  A
-        text command enters VICE's monitor, and the binary socket reports
-        that entry as a bare Stopped event; issued from another thread
-        during :meth:`_resume_confirmed`'s window it was read as a stale
-        trap and resumed over (#516 round 3, 5/5).  The cost is that a text
-        command now waits for any binary exchange in flight, including a
-        :meth:`wait_for_stopped` that holds the lock for its whole timeout.
+        The reply is the command's output, without the prompt that ends
+        it.  Holds the binary lock as well
+        (always taken first; nothing takes ``_text_lock`` before ``_lock``,
+        so the order cannot invert).  A text command enters VICE's monitor,
+        and the binary socket reports that entry as a bare Stopped event;
+        issued from another thread during :meth:`_resume_confirmed`'s
+        window it was read as a stale trap and resumed over (#516 round 3,
+        5/5).  The cost is that a text command now waits for any binary
+        exchange in flight, including a :meth:`wait_for_stopped` that holds
+        the lock for its whole timeout.
+
+        Like every monitor command it leaves the 6510 halted: VICE stays
+        in its monitor loop after a text command until something resumes.
         """
         assert self._text_sock is not None
+        # VICE transmits a prompt every time its monitor loop asks for
+        # input (``uimon_in``, ``monitor/mon_util.c``) -- on entry, after
+        # every text command, and after every *binary* command too, since
+        # the same loop serves both sockets.  So stray ``(C:$xxxx) `` pile
+        # up here, and "read up to the first prompt" took one for the
+        # reply (get_warp() False ~18 in 65k calls under binary traffic,
+        # #516), leaving the real reply for the next command.  Two steps:
+        #
+        # 1. Synchronise: ``print $NNNN`` answers ``\tNNNN-in-decimal\n``.
+        #    Everything up to that marker and the prompt after it is
+        #    discarded -- strays and the entry prompt included -- and VICE
+        #    is now inside its monitor loop, waiting for input.
+        # 2. Send the command; its reply is everything up to the next
+        #    prompt.  With the binary lock held no binary command can be
+        #    processed in between to emit another prompt.
+        #
+        # The two are separate sends because VICE (3.10) handles only the
+        # first line of a read that carries two: the second waits for the
+        # next data to arrive (``monitor_network_get_command_line``).
+        marker_id = next(self._TEXT_MARKERS) & 0xFFFF
+        marker = f"\t{marker_id}\n"
+        prompt = self._TEXT_PROMPT_RE
+
+        def after_marker(text: str):
+            at = text.find(marker)
+            if at >= 0:
+                m = prompt.search(text, at + len(marker))
+                if m:
+                    return m.end()
+            return None
+
+        def first_prompt(text: str):
+            m = prompt.search(text)
+            return m.start() if m else None
+
+        deadline = time.monotonic() + self.timeout
         with self._lock, self._text_lock:
+            self._text_sock.sendall(f"p ${marker_id:04x}\n".encode("ascii"))
+            self._text_recv(after_marker, deadline, "the sync marker")
             self._text_sock.sendall((cmd + "\n").encode("ascii"))
-            return self._text_recv_until_prompt()
+            return self._text_recv(first_prompt, deadline, repr(cmd))
 
     def _next_req_id(self) -> int:
         """Return an incrementing request ID (wraps at 32 bits)."""
