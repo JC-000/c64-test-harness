@@ -177,14 +177,16 @@ class ViceInstance:
             self.transport.close()
         except Exception:
             pass
-        if self.managed and self.process is not None:
-            self.process.stop()
-        if self._text_port_lock is not None:
-            self._text_port_lock.release()
-            self._text_port_lock = None
-        if self._port_lock is not None:
-            self._port_lock.release()
-            self._port_lock = None
+        try:
+            if self.managed and self.process is not None:
+                self.process.stop()
+        finally:
+            if self._text_port_lock is not None:
+                self._text_port_lock.release()
+                self._text_port_lock = None
+            if self._port_lock is not None:
+                self._port_lock.release()
+                self._port_lock = None
 
 
 class ViceInstanceManager:
@@ -253,9 +255,11 @@ class ViceInstanceManager:
                 raise
             try:
                 instance = self._start_or_adopt(port)
-            except Exception as exc:
-                last_error = exc
+            except BaseException as exc:
                 self._allocator.release(port)
+                if not isinstance(exc, Exception):
+                    raise  # KeyboardInterrupt/SystemExit: never retry
+                last_error = exc
                 if attempt < self._max_retries:
                     logger.warning(
                         "VICE acquire attempt %d/%d on port %d failed: %s",
@@ -286,15 +290,27 @@ class ViceInstanceManager:
             self._allocator.release(instance.text_monitor_port)
 
     def shutdown(self) -> None:
-        """Stop all active instances."""
+        """Stop all active instances.
+
+        Every instance is stopped and its ports released even if an
+        earlier one raises; the first error is re-raised afterwards.
+        """
         with self._lock:
             instances = list(self._instances)
             self._instances.clear()
+        first_error: BaseException | None = None
         for inst in instances:
-            inst.stop()
-            self._allocator.release(inst.port)
-            if inst.text_monitor_port:
-                self._allocator.release(inst.text_monitor_port)
+            try:
+                inst.stop()
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                if first_error is None:
+                    first_error = exc
+            finally:
+                self._allocator.release(inst.port)
+                if inst.text_monitor_port:
+                    self._allocator.release(inst.text_monitor_port)
+        if first_error is not None:
+            raise first_error
 
     @contextmanager
     def instance(self) -> Iterator[ViceInstance]:
@@ -324,7 +340,7 @@ class ViceInstanceManager:
             return self._start_instance(
                 port, text_monitor_port,
             )
-        except Exception:
+        except BaseException:
             # The caller (acquire()) releases the main port; the text
             # monitor port was allocated here, so it must be returned
             # to the allocator here or it leaks on every failed start.
@@ -385,12 +401,12 @@ class ViceInstanceManager:
             if text_reservation is not None:
                 text_reservation.close()
 
+        transport = None
         try:
             proc.start()
 
             # Connect binary transport with retries
             deadline_time = time.monotonic() + 30.0
-            transport = None
             last_err = None
             while time.monotonic() < deadline_time:
                 if proc._proc is not None and proc._proc.poll() is not None:
@@ -466,11 +482,24 @@ class ViceInstanceManager:
                         "Failed to set CS8900a MAC on port %d: %s", port, exc,
                     )
 
-        except Exception:
-            if text_port_lock is not None:
-                text_port_lock.release()
-            if port_lock is not None:
-                port_lock.release()
+        except BaseException:
+            # Any exit short of a returned instance -- an exception from
+            # PID verification or the lockfile update, or a
+            # KeyboardInterrupt/SystemExit during the 30 s connect loop --
+            # must not leave x64sc running: the instance never reaches
+            # _instances, so shutdown() could not find it (#514).
+            if transport is not None:
+                try:
+                    transport.close()
+                except Exception:
+                    pass
+            try:
+                proc.stop()
+            finally:
+                if text_port_lock is not None:
+                    text_port_lock.release()
+                if port_lock is not None:
+                    port_lock.release()
             raise
 
         return ViceInstance(

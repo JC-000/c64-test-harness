@@ -216,7 +216,7 @@ def render_wav(
                 f"VICE created an empty WAV file: {out_wav}"
             )
 
-    except Exception:
+    except BaseException:
         proc.stop()
         raise
 

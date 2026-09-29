@@ -6,6 +6,7 @@ manager that handles the lifecycle).
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import platform
@@ -14,6 +15,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,6 +61,35 @@ SID_CLOCK_LEAK_REGISTERS = (0xD41B, 0xD41C)
 # One warning per process is enough: whether the sound core runs is a
 # static property of the launch configuration, not of the run.
 _warned_sid_unemulated = False
+
+# Every ViceProcess that has launched a child and not yet stopped it,
+# held strongly so a consumer that drops the object without stop() still
+# has its x64sc stopped when the interpreter exits (#514: an orphaned
+# x64sc re-parented to init after its launcher exited).  Keyed to the
+# launching PID: a forked child inherits the set but must not stop its
+# parent's emulators when it exits.
+_LIVE_PROCESSES: set["ViceProcess"] = set()
+_LIVE_LOCK = threading.Lock()
+
+
+def _stop_live_processes() -> None:
+    """atexit: stop every x64sc this interpreter launched and abandoned."""
+    with _LIVE_LOCK:
+        live = [p for p in _LIVE_PROCESSES if p._owner_pid == os.getpid()]
+    for proc in live:
+        if not isinstance(proc.pid, int):
+            continue  # a test double, not a launched child
+        try:
+            _log.warning(
+                "x64sc PID %s was never stopped; stopping it at "
+                "interpreter exit", proc.pid,
+            )
+            proc.stop()
+        except BaseException:  # noqa: BLE001 - keep stopping the rest
+            pass
+
+
+atexit.register(_stop_live_processes)
 
 
 def ethernet_vice_binary() -> str:
@@ -640,6 +671,26 @@ def headless_sid_config(
     )
 
 
+def _pid_exists(pid: int) -> bool:
+    """True if *pid* exists (as any user) and is not a zombie."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    try:
+        stat = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+    except OSError:
+        return True
+    return bool(stat) and not stat.startswith("Z")
+
+
 class ViceProcess:
     """Context manager for a VICE emulator process.
 
@@ -649,6 +700,11 @@ class ViceProcess:
         with ViceProcess(config) as vice:
             transport = BinaryViceTransport(port=config.port)
             ...
+
+    A process that is started and never stopped is stopped at interpreter
+    exit by an ``atexit`` hook (#514), in the launching process only.
+    That does not cover a launcher killed by a signal (SIGKILL, or an
+    unhandled SIGTERM): x64sc then outlives it, re-parented to init.
     """
 
     def __init__(self, config: ViceConfig) -> None:
@@ -664,6 +720,7 @@ class ViceProcess:
         # which on macOS cannot signal a root-owned child from an
         # unprivileged parent.
         self._is_sudo_child: bool = False
+        self._owner_pid: int = os.getpid()
 
     def __enter__(self) -> ViceProcess:
         self.start()
@@ -934,6 +991,9 @@ class ViceProcess:
         self._is_sudo_child = plan.sudo_wrapped
 
         self._proc = subprocess.Popen(args, **popen_kwargs)  # type: ignore[arg-type]
+        self._owner_pid = os.getpid()
+        with _LIVE_LOCK:
+            _LIVE_PROCESSES.add(self)
 
     def wait_for_exit(self, timeout: float = 60.0) -> int:
         """Wait for the VICE process to exit on its own.
@@ -949,13 +1009,16 @@ class ViceProcess:
             raise RuntimeError("VICE process has not been started")
         try:
             self._proc.wait(timeout=timeout)
-            return self._proc.returncode
-        except subprocess.TimeoutExpired:
+        except BaseException:
+            # Timeout, KeyboardInterrupt or anything else: the process may
+            # still be running, so stop it rather than drop its handle.
             self.stop()
             raise
-        finally:
-            # Clear internal handle so stop() becomes a no-op
-            self._proc = None
+        code = self._proc.returncode
+        # Clear internal handle so stop() becomes a no-op
+        self._proc = None
+        self._unregister()
+        return code
 
     def stop(self) -> None:
         """Terminate VICE: SIGTERM → wait 5s → SIGKILL fallback.
@@ -966,12 +1029,19 @@ class ViceProcess:
         itself is the Popen target, signalling sudo forwards to x64sc
         (sudo's default signal-forwarding behaviour on POSIX), so we try
         that first and only escalate to ``sudo -n kill -9 <x64sc-pid>``
-        if sudo itself refuses to exit.
+        if sudo itself refuses to exit.  That escalation needs a NOPASSWD
+        rule for ``kill``, which the documented bench sudoers does not
+        grant; when x64sc survives every step, stop() logs a WARNING
+        naming its PID instead of returning as if it had succeeded.
         """
         if self._proc is None:
+            self._unregister()
             self._cleanup_tmp_vicerc()
             return
 
+        # Resolve the root x64sc before signalling anything: once the
+        # wrapper exits, x64sc is re-parented and no longer findable.
+        vice_pid = self._find_x64sc_child_pid() if self._is_sudo_child else None
         try:
             if self._is_sudo_child:
                 # sudo forwards SIGTERM to its child when it runs in the
@@ -982,8 +1052,9 @@ class ViceProcess:
                 except subprocess.TimeoutExpired:
                     # sudo / x64sc didn't exit; find the root child and kill
                     # it with sudo, then give Popen a moment to reap.
-                    child_pid = self._find_x64sc_child_pid()
+                    child_pid = self._find_x64sc_child_pid() or vice_pid
                     if child_pid is not None:
+                        vice_pid = child_pid
                         subprocess.run(
                             ["sudo", "-n", "kill", "-9", str(child_pid)],
                             check=False,
@@ -993,9 +1064,7 @@ class ViceProcess:
                     try:
                         self._proc.wait(timeout=3)
                     except subprocess.TimeoutExpired:
-                        # Last resort: kill the sudo wrapper too.  Works
-                        # because sudo itself runs as our UID (it elevates
-                        # only its exec'd child).
+                        # Last resort: kill the sudo wrapper too.
                         try:
                             self._proc.kill()
                             # Reap the wrapper: without wait() the killed
@@ -1017,14 +1086,28 @@ class ViceProcess:
             except Exception:
                 pass
         self._proc = None
+        self._unregister()
         self._cleanup_tmp_vicerc()
+        if vice_pid is not None and _pid_exists(vice_pid):
+            _log.warning(
+                "x64sc PID %d (launched via sudo, running as root) survived "
+                "stop(): this process cannot signal it and `sudo -n kill` "
+                "was refused or ineffective.  Stop it with `sudo kill %d`.",
+                vice_pid, vice_pid,
+            )
+
+    def _unregister(self) -> None:
+        with _LIVE_LOCK:
+            _LIVE_PROCESSES.discard(self)
 
     def _find_x64sc_child_pid(self) -> int | None:
         """Find the x64sc process spawned under our sudo wrapper.
 
         Only meaningful when ``self._is_sudo_child`` is True.  Returns the
-        PID of an x64sc process whose parent is our Popen child (the sudo
-        wrapper), or None if no such process is found.  Uses ``ps -axo
+        PID of an x64sc process descended from our Popen child (the sudo
+        wrapper), or None if no such process is found.  A descendant, not
+        just a child: with ``use_pty`` (sudo's default since 1.9.14) sudo
+        forks a monitor process and x64sc is its child.  Uses ``ps -axo
         pid,ppid,comm`` which is available on both Linux and macOS.
         """
         if self._proc is None:
@@ -1039,20 +1122,27 @@ class ViceProcess:
             ).stdout
         except OSError:
             return None
+        table: dict[int, tuple[int, str]] = {}
         for line in out.splitlines():
             parts = line.strip().split(None, 2)
             if len(parts) < 3:
                 continue
             try:
-                pid = int(parts[0])
-                ppid = int(parts[1])
+                table[int(parts[0])] = (int(parts[1]), parts[2])
             except ValueError:
                 continue
-            comm = parts[2]
+        for pid, (ppid, comm) in table.items():
             # On macOS `comm` may be the full path; match on basename.
-            name = os.path.basename(comm)
-            if ppid == sudo_pid and name == "x64sc":
-                return pid
+            if os.path.basename(comm) != "x64sc":
+                continue
+            seen: set[int] = set()
+            while ppid not in seen:
+                if ppid == sudo_pid:
+                    return pid
+                seen.add(ppid)
+                if ppid not in table:
+                    break
+                ppid = table[ppid][0]
         return None
 
     def _cleanup_tmp_vicerc(self) -> None:

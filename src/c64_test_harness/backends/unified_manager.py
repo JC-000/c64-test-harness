@@ -260,13 +260,18 @@ class UnifiedManager:
     def acquire(self) -> TestTarget:
         """Acquire a test target from the underlying manager."""
         instance = self._manager.acquire()
-        if self._memory_policy is not None:
-            instance.transport.memory_policy = self._memory_policy
-        target = TestTarget(
-            transport=instance.transport,
-            backend=self._backend,
-            pid=instance.pid,
-        )
+        try:
+            if self._memory_policy is not None:
+                instance.transport.memory_policy = self._memory_policy
+            target = TestTarget(
+                transport=instance.transport,
+                backend=self._backend,
+                pid=instance.pid,
+            )
+        except BaseException:
+            # The caller never gets a target to release; do it here.
+            self._manager.release(instance)
+            raise
         # Stash so release() can delegate to the underlying manager.
         target._instance = instance  # type: ignore[attr-defined]
         return target
@@ -291,16 +296,16 @@ class UnifiedManager:
     def instance(self) -> Iterator[TestTarget]:
         """Context manager: acquire a target, auto-release on exit."""
         instance = self._manager.acquire()
-        if self._memory_policy is not None:
-            instance.transport.memory_policy = self._memory_policy
-        target = TestTarget(
-            transport=instance.transport,
-            backend=self._backend,
-            pid=instance.pid,
-        )
-        # Stash the raw instance so release() can delegate properly.
-        target._instance = instance  # type: ignore[attr-defined]
         try:
+            if self._memory_policy is not None:
+                instance.transport.memory_policy = self._memory_policy
+            target = TestTarget(
+                transport=instance.transport,
+                backend=self._backend,
+                pid=instance.pid,
+            )
+            # Stash the raw instance so release() can delegate properly.
+            target._instance = instance  # type: ignore[attr-defined]
             yield target
         finally:
             self._manager.release(instance)
