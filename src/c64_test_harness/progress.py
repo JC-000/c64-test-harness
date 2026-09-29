@@ -121,7 +121,10 @@ def watch_progress(
       (``HardwareTransportBase`` and so the Ultimate 64, where
       ``resume()`` is a real request that clears a deliberate pause).
       Before issue #514 it never resumed, and on VICE the program froze
-      at the first poll and was reported ``"Stalled"``.
+      at the first poll and was reported ``"Stalled"``.  On VICE the
+      resume is confirmed (up to 50 ms per poll): a guest REU DMA in
+      flight during the reads leaves a spare monitor trap that would
+      swallow a plain resume.
     * Each poll issues one ``read_memory`` per watched name. On
       hardware (U64) reads contend with the C64 bus via DMA, so
       ``poll_interval`` defaults to a conservative 10 s. Shorten it
@@ -263,7 +266,11 @@ def watch_progress(
                 # declares its reads do not halt (the U64, where resume()
                 # would clear a deliberate pause; #189/#190).
                 if halts:
-                    _resume_quietly(transport)
+                    # Confirmed: the caller is told the program runs while
+                    # it handles the event, and a guest REU DMA in flight
+                    # during the reads can leave a stale monitor trap that
+                    # swallows a plain resume (#516 re-verify).
+                    _resume_quietly(transport, confirm=True)
 
             now = _clock()
             elapsed = now - start

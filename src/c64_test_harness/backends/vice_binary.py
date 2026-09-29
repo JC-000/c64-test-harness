@@ -835,6 +835,93 @@ class BinaryViceTransport:
         self._resume_generation += 1
         self._send_and_recv(CMD_EXIT)
 
+    #: How long :meth:`_resume_confirmed` listens after an EXIT for a
+    #: stale-trap re-entry.  The re-entry's events are written by the same
+    #: VICE thread straight after the Resumed event, before any 6510
+    #: instruction runs, so this only has to cover loopback delivery.
+    STALE_TRAP_WINDOW = 0.05
+    #: EXITs :meth:`_resume_confirmed` sends before giving up.  One spare
+    #: trap per vsync the CPU was stalled across; a 32 KB REU DMA spans
+    #: ~1.67 PAL frames, so two is the usual worst case.
+    STALE_TRAP_ATTEMPTS = 4
+
+    def _resume_confirmed(
+        self,
+        window: float | None = None,
+        attempts: int | None = None,
+    ) -> bool:
+        """Resume, and resume again while a stale monitor trap swallows it.
+
+        VICE queues a monitor trap at every vsync that finds a command
+        waiting (``monitor_vsync_hook`` -> ``monitor_startup_trap``), and
+        ``interrupt_do_trap`` runs all queued traps back to back.  A
+        command sent while the CPU is stalled across a vsync -- by an REU
+        DMA, the guest's or the snapshot extract's -- therefore leaves a
+        spare trap, which re-enters the monitor the instant the next EXIT
+        leaves it: that resume runs nothing, and the machine is halted
+        although the caller resumed it (#516 re-verify).
+
+        The re-entry is visible on the wire: after the EXIT reply and the
+        Resumed event, a clean exit sends nothing more, while a stale trap
+        immediately sends a Registers event and a Stopped event.  A
+        checkpoint hit sends Checkpoint-info first and a jam sends
+        ``RESPONSE_JAM``; those are real stops, so they are queued for
+        :meth:`wait_for_stopped` and not resumed over.  Returns ``True``
+        once an EXIT was not followed by a stale re-entry within
+        :attr:`STALE_TRAP_WINDOW`, ``False`` after a real stop or after
+        :attr:`STALE_TRAP_ATTEMPTS` swallowed EXITs.
+
+        Costs one listening window per call, so the harness uses it only
+        where "running on return" is promised: the waiters' exit resume
+        and the REU extract's drain -- not between polls, where a
+        swallowed resume only delays the next one.
+        """
+        window = self.STALE_TRAP_WINDOW if window is None else window
+        attempts = self.STALE_TRAP_ATTEMPTS if attempts is None else attempts
+        for _ in range(attempts):
+            self.resume()
+            verdict = self._after_exit(window)
+            if verdict != "stale":
+                return verdict == "running"
+        return False
+
+    def _after_exit(self, window: float) -> str:
+        """Classify the events that follow an EXIT: running/stale/stopped."""
+        assert self._sock is not None
+        held: list[_Response] = []
+        verdict = "running"
+        with self._lock:
+            deadline = time.monotonic() + window
+            try:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._sock.settimeout(remaining)
+                    try:
+                        resp = self._recv_response()
+                    except TimeoutError:
+                        break
+                    if resp.response_type == EVENT_RESUMED:
+                        continue
+                    if resp.response_type in (
+                        RESPONSE_CHECKPOINT_INFO, RESPONSE_JAM,
+                    ):
+                        held.append(resp)
+                        verdict = "stopped"
+                        break
+                    if resp.response_type == EVENT_STOPPED:
+                        # No checkpoint or jam before it: our own spare
+                        # trap.  Its Registers/Stopped events describe a
+                        # halt the next EXIT undoes; drop them.
+                        return "stale"
+                    held.append(resp)
+            finally:
+                self._sock.settimeout(self.timeout)
+        for resp in held:
+            self._event_queue.append((self._resume_generation, resp))
+        return verdict
+
     def close(self) -> None:
         """Close TCP connections to VICE."""
         if self._text_sock is not None:

@@ -568,6 +568,42 @@ class TestExtractReuContents:
         assert bytes(t.ram[_REU_PARK_ADDR:_REU_PARK_ADDR + 3]) == park_before
         assert t.regs == before
 
+    def test_stale_traps_are_drained_while_still_parked(self) -> None:
+        # #516 re-verify: each transfer leaves a spare monitor trap that
+        # swallowed the caller's first resume after the extract.  The
+        # extract must spend a confirmed resume on it while the CPU is
+        # still on the park loop -- once, after the last bank.
+        from c64_test_harness.snapshot import _REU_PARK_ADDR
+
+        t = _ParkableRecTransport(_pattern(64 * 1024))
+        drained_at: list[tuple[int, int]] = []
+
+        def confirmed() -> bool:
+            drained_at.append((t.regs["PC"], len(t.transfers)))
+            return True
+
+        t._resume_confirmed = confirmed  # type: ignore[attr-defined]
+        before = dict(t.regs)
+        extract_reu_contents(t, 64 * 1024, settle=0)
+        assert drained_at == [(_REU_PARK_ADDR, 2)]
+        assert t.regs == before
+
+    def test_a_failed_park_puts_the_park_bytes_back(self) -> None:
+        # The JMP * is written before PC is moved onto it; if that register
+        # write fails nothing will ever unpark, so the bytes go back at once.
+        from c64_test_harness.snapshot import _REU_PARK_ADDR
+
+        t = _ParkableRecTransport(_pattern(1024))
+        park_before = bytes(t.ram[_REU_PARK_ADDR:_REU_PARK_ADDR + 3])
+
+        def refuse(regs):
+            raise OSError("monitor socket closed")
+
+        t.set_registers = refuse  # type: ignore[method-assign]
+        with pytest.raises(OSError, match="socket closed"):
+            extract_reu_contents(t, 1024, settle=0)
+        assert bytes(t.ram[_REU_PARK_ADDR:_REU_PARK_ADDR + 3]) == park_before
+
     def test_cpu_is_unparked_even_when_the_write_back_fails(self) -> None:
         # Leaving PC on the park loop (with I set) after a failed write-back
         # would turn a transport error into a machine that never runs again.

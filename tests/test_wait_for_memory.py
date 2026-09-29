@@ -259,10 +259,18 @@ class _ResumeRaises(HaltingFake):
 
 
 def test_a_resume_that_raises_is_best_effort(caplog):
-    # The exit resume sits in a finally: raising there would replace the
-    # caller's result (or exception) with the resume's.  Logged, not raised.
-    t = _ResumeRaises(resumes_to_finish=0)
+    # Between polls and in the finally alike: raising there would replace
+    # the caller's result (or exception) with the resume's.  Logged, not
+    # raised.  Two failing resumes between polls, then the exit one.
+    t = _ResumeRaises(resumes_to_finish=2)
     with caplog.at_level("WARNING", logger="c64_test_harness.screen"):
-        assert wait_for_memory(t, FLAG, DONE, timeout=1.0) == bytes([DONE])
-    assert t.resumes == 1
-    assert any("resume() failed" in r.getMessage() for r in caplog.records)
+        assert wait_for_memory(t, FLAG, DONE, timeout=5.0,
+                               poll_interval=0) == bytes([DONE])
+    assert t.resumes == 3
+    assert sum("resume() failed" in r.getMessage() for r in caplog.records) == 3
+
+
+def test_a_resume_that_raises_still_times_out_cleanly():
+    t = _ResumeRaises(resumes_to_finish=10**9)
+    assert wait_for_memory(t, FLAG, DONE, timeout=0.1, poll_interval=0.01) is None
+    assert t.resumes > 1

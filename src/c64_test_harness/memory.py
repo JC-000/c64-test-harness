@@ -314,6 +314,10 @@ def wait_for_memory(
     are what memory held at the match, not necessarily what it holds now.
     The resume is best-effort in the same way as the screen waiters'
     (logged at WARNING and swallowed if the transport cannot resume).
+    The exit resume is *confirmed* on VICE: if the guest was in an REU
+    DMA when the last read arrived, VICE queued a spare monitor trap that
+    would swallow a plain resume, so the helper resumes again until one
+    runs (``BinaryViceTransport._resume_confirmed``; up to 50 ms).
 
     **On the Ultimate 64 it never resumes.**  Memory access there is
     DMA-backed and does not halt the CPU, while ``resume()`` is a real
@@ -405,4 +409,6 @@ def wait_for_memory(
             time.sleep(min(poll_interval, remaining))
     finally:
         if pending_resume:
-            _resume_quietly(transport)
+            # Confirmed: a guest REU DMA in flight during the last read can
+            # leave a stale monitor trap that swallows a plain resume.
+            _resume_quietly(transport, confirm=True)

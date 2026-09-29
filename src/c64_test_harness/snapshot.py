@@ -206,8 +206,9 @@ _FLAG_I = 0x04
 #: REC command-register execute bit: set by the command write, cleared by
 #: x64sc once the transfer has run (``reu_dma_start``).
 _REC_CMD_EXECUTE = 0x80
-#: Wall-clock bound on one VICE bank transfer (it takes one frame of
-#: emulated time; the bound only catches a machine that never runs).
+#: Wall-clock bound on one VICE bank transfer (32768 stolen cycles, ~1.67
+#: PAL frames of emulated time; the bound only catches a machine that
+#: never runs).
 _REC_DONE_TIMEOUT = 5.0
 
 # ---------------------------------------------------------------------------
@@ -674,7 +675,11 @@ def extract_reu_contents(
     lives in the window is not protected.  A halting transport without
     ``read_registers``/``set_registers`` cannot be parked and is
     extracted unparked.  *pause* has no effect on VICE.  The machine is
-    left halted on return.
+    left halted on return, and the caller's next ``resume()`` runs it:
+    each transfer stalls the CPU for ~1.67 PAL frames with a command
+    waiting, which makes VICE queue a spare monitor trap, and the extract
+    spends a confirmed resume on those while still parked (#516
+    re-verify; before, the caller's first resume ran nothing, 8/8).
 
     All staging/REC writes carry ``override="reu-snapshot-staging"`` so
     a strict :class:`~c64_test_harness.MemoryPolicy` doesn't block them.
@@ -682,8 +687,8 @@ def extract_reu_contents(
     the snapshot).
 
     Cost: ~30 s / 16 MB at native speed on U64 hardware (turbo helps);
-    on VICE about one video frame of emulated time per 32 KB bank, spent
-    parked.
+    on VICE ~1.67 PAL frames of emulated time per 32 KB bank (32768
+    stolen cycles), spent parked.
     """
     if not isinstance(size_bytes, int) or isinstance(size_bytes, bool):
         raise ValueError(f"size_bytes must be an int, got {size_bytes!r}")
@@ -720,6 +725,8 @@ def extract_reu_contents(
                         f"expected {n} (REU offset {reu_offset:#x})"
                     )
                 out += bank
+            if unpark is not None:
+                _drain_stale_monitor_traps(transport)
             return bytes(out)
         finally:
             try:
@@ -758,6 +765,25 @@ def _run_rec_transfer(transport: "C64Transport", reu_offset: int) -> None:
             )
 
 
+def _drain_stale_monitor_traps(transport: "C64Transport") -> None:
+    """Consume the spare monitor traps the transfers left, while parked.
+
+    Each transfer stalls the CPU for ~1.67 PAL frames with the next
+    command already on the socket, and VICE queues a monitor trap at every
+    vsync that sees it; the spare one re-enters the monitor on the next
+    EXIT.  Left alone, that EXIT is the caller's first ``resume()`` after
+    the extract, and it ran nothing (#516 re-verify, 3/3 and 8/8).  So the
+    extract resumes the parked CPU until an EXIT is not swallowed; the
+    write-back that follows halts it again with one ordinary trap.
+    """
+    confirmed = getattr(transport, "_resume_confirmed", None)
+    if callable(confirmed) and not confirmed():
+        _log.warning(
+            "extract_reu_contents: the parked CPU kept stopping after "
+            "resume(); the caller's next resume may not run the program"
+        )
+
+
 def _can_park(transport: "C64Transport") -> bool:
     return callable(getattr(transport, "read_registers", None)) and callable(
         getattr(transport, "set_registers", None)
@@ -785,7 +811,15 @@ def _park_outside_staging_window(transport: "C64Transport"):
         bytes([0x4C, _REU_PARK_ADDR & 0xFF, _REU_PARK_ADDR >> 8]),
         override=_REU_STAGING_OVERRIDE,
     )
-    set_regs({"PC": _REU_PARK_ADDR, "FL": regs["FL"] | _FLAG_I})
+    try:
+        set_regs({"PC": _REU_PARK_ADDR, "FL": regs["FL"] | _FLAG_I})
+    except BaseException:
+        # Not parked, so nothing will unpark: put the three bytes back now
+        # rather than leave a JMP * in the cassette buffer.
+        transport.write_memory(
+            _REU_PARK_ADDR, prior, override=_REU_STAGING_OVERRIDE
+        )
+        raise
 
     def unpark() -> None:
         try:
