@@ -771,7 +771,9 @@ def test_identity_check_distinguishes_start_time_on_a_real_process(
         stub_pid = _find_stub_under(wrapper.pid, sleeper)
         assert stub_pid is not None, "test setup: stub never appeared"
         ident = vice_lifecycle._proc_identity(stub_pid)
-        assert ident is not None and ident[1] == str(sleeper), ident
+        # Linux procps prints the bare exec name (<=15 chars), macOS the
+        # full path; the basename is what both agree on.
+        assert ident is not None and os.path.basename(ident[1]) == sleeper.name, ident
         started = subprocess.run(
             ["ps", "-o", "lstart=", "-p", str(stub_pid)],
             capture_output=True, text=True, check=True,
