@@ -122,7 +122,7 @@ def watch_progress(
       ``resume()`` is a real request that clears a deliberate pause).
       Before issue #514 it never resumed, and on VICE the program froze
       at the first poll and was reported ``"Stalled"``.  On VICE the
-      resume is confirmed (up to 50 ms per poll): a guest REU DMA in
+      resume is confirmed (~5 ms per poll): a guest REU DMA in
       flight during the reads leaves a spare monitor trap that would
       swallow a plain resume.
     * Each poll issues one ``read_memory`` per watched name. On

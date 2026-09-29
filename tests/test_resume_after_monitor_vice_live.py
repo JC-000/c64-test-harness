@@ -329,3 +329,104 @@ def test_screen_waiters_leave_a_dma_heavy_guest_running(reu_transport):
         f"running on exit: wait_for_text {text_running}/{TRIALS}, "
         f"wait_for_stable {stable_running}/{TRIALS}"
     )
+
+
+# -- cost of the confirmation, and a text monitor on the side (#516 round 3) --
+
+EXIT_COST_TRIALS = 20
+#: The clean path listens for the whole stale-trap window; a stale Stopped
+#: was measured 0.08-0.24 ms after the EXIT.  A first-poll match without
+#: confirmation takes ~1-6 ms, so 20 ms leaves room and still fails a 50 ms
+#: window.
+EXIT_COST_MEDIAN_LIMIT = 0.020
+
+
+def test_a_confirmed_waiter_exit_stays_cheap(binary_transport):
+    t = binary_transport
+    t.resume()
+    assert wait_for_text(t, "READY.", timeout=15.0, poll_interval=0.2,
+                         verbose=False) is not None
+    costs = []
+    for _ in range(EXIT_COST_TRIALS):
+        start = time.monotonic()
+        assert wait_for_text(t, "READY.", timeout=5.0, poll_interval=0.01,
+                             verbose=False) is not None
+        costs.append(time.monotonic() - start)
+    median = sorted(costs)[len(costs) // 2]
+    assert median < EXIT_COST_MEDIAN_LIMIT, (
+        f"median first-poll wait_for_text {median * 1000:.1f} ms"
+    )
+
+
+@pytest.fixture
+def text_monitor_transport():
+    """VICE with the binary monitor and a remote text monitor, booted."""
+    require_vice_or_skip()
+    allocator = PortAllocator(port_range_start=6511, port_range_end=6531)
+    port = allocator.allocate()
+    text_port = allocator.allocate()
+    for p in (port, text_port):
+        reservation = allocator.take_socket(p)
+        if reservation is not None:
+            reservation.close()
+    config = ViceConfig(port=port, text_monitor_port=text_port, warp=True,
+                        sound=False, minimize=True)
+    failures: list = []
+    with ViceProcess(config) as vice:
+        transport = None
+        try:
+            transport = connect_binary_transport(port, proc=vice,
+                                                 text_monitor_port=text_port)
+            transport.resume()
+            assert wait_for_text(transport, "READY.", timeout=15.0,
+                                 poll_interval=0.2, verbose=False) is not None
+            yield transport
+        finally:
+            failures = attempt_steps([
+                ("transport.close()", transport.close if transport is not None else None),
+                (f"allocator.release({port})", lambda: allocator.release(port)),
+                (f"allocator.release({text_port})", lambda: allocator.release(text_port)),
+            ])
+    raise_teardown_failures("text_monitor_transport teardown", failures)
+
+
+def test_a_text_monitor_stop_is_not_taken_for_a_stale_trap(text_monitor_transport):
+    # A text-monitor command enters the monitor too, and the binary monitor
+    # reports that entry as a bare Stopped.  Issued from another thread in
+    # the middle of a confirmation window it was classified "stale" and
+    # resumed over (5/5, #516 round 3).  Nothing here stalls the CPU, so
+    # every "stale" verdict is a misreading.
+    import threading
+
+    t = text_monitor_transport
+    verdicts: list[str] = []
+    real_after_exit = t._after_exit
+
+    def spy(window):
+        v = real_after_exit(window)
+        verdicts.append(v)
+        return v
+
+    t._after_exit = spy
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def hammer() -> None:
+        try:
+            while not stop.is_set():
+                t.get_warp()
+        except BaseException as exc:  # surfaced below
+            errors.append(exc)
+
+    worker = threading.Thread(target=hammer, daemon=True)
+    worker.start()
+    try:
+        for _ in range(40):
+            assert wait_for_text(t, "READY.", timeout=5.0, poll_interval=0.01,
+                                 verbose=False) is not None
+    finally:
+        stop.set()
+        worker.join(timeout=10.0)
+    assert not errors, errors
+    assert verdicts, "no confirmed resume happened"
+    assert "stale" not in verdicts, verdicts

@@ -206,6 +206,10 @@ _FLAG_I = 0x04
 #: REC command-register execute bit: set by the command write, cleared by
 #: x64sc once the transfer has run (``reu_dma_start``).
 _REC_CMD_EXECUTE = 0x80
+#: Stale-trap listening window for the extract's one drain.  Longer than
+#: the waiters' (``BinaryViceTransport.STALE_TRAP_WINDOW``): it is paid
+#: once per extract, and a miss here costs the caller's next resume.
+_DRAIN_WINDOW = 0.05
 #: Wall-clock bound on one VICE bank transfer (32768 stolen cycles, ~1.67
 #: PAL frames of emulated time; the bound only catches a machine that
 #: never runs).
@@ -777,7 +781,7 @@ def _drain_stale_monitor_traps(transport: "C64Transport") -> None:
     write-back that follows halts it again with one ordinary trap.
     """
     confirmed = getattr(transport, "_resume_confirmed", None)
-    if callable(confirmed) and not confirmed():
+    if callable(confirmed) and not confirmed(window=_DRAIN_WINDOW):
         _log.warning(
             "extract_reu_contents: the parked CPU kept stopping after "
             "resume(); the caller's next resume may not run the program"

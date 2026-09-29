@@ -578,14 +578,21 @@ class TestExtractReuContents:
         t = _ParkableRecTransport(_pattern(64 * 1024))
         drained_at: list[tuple[int, int]] = []
 
-        def confirmed() -> bool:
+        windows: list[float] = []
+
+        def confirmed(**kw) -> bool:
             drained_at.append((t.regs["PC"], len(t.transfers)))
+            windows.append(kw.get("window"))
             return True
 
         t._resume_confirmed = confirmed  # type: ignore[attr-defined]
         before = dict(t.regs)
         extract_reu_contents(t, 64 * 1024, settle=0)
         assert drained_at == [(_REU_PARK_ADDR, 2)]
+        # Paid once per extract, so it listens longer than a waiter exit.
+        from c64_test_harness.backends.vice_binary import BinaryViceTransport
+
+        assert windows[0] > BinaryViceTransport.STALE_TRAP_WINDOW
         assert t.regs == before
 
     def test_a_failed_park_puts_the_park_bytes_back(self) -> None:

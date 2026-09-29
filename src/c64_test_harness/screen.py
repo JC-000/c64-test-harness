@@ -268,8 +268,8 @@ def wait_for_text(
     *Confirmed on VICE.*  The exit resume goes through
     ``BinaryViceTransport._resume_confirmed``: a read that arrived while
     the guest was stalled in an REU DMA leaves a spare monitor trap that
-    swallows a plain resume, so it resumes again until one runs (up to
-    50 ms per exit; #516 re-verify).
+    swallows a plain resume, so it resumes again until one runs (~5 ms
+    per exit; #516 re-verify).
 
     *Best-effort, not enforced.*  A ``resume`` that raises is logged at
     WARNING and swallowed (see :func:`_resume_quietly` for why raising

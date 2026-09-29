@@ -317,7 +317,7 @@ def wait_for_memory(
     The exit resume is *confirmed* on VICE: if the guest was in an REU
     DMA when the last read arrived, VICE queued a spare monitor trap that
     would swallow a plain resume, so the helper resumes again until one
-    runs (``BinaryViceTransport._resume_confirmed``; up to 50 ms).
+    runs (``BinaryViceTransport._resume_confirmed``; ~5 ms per exit).
 
     **On the Ultimate 64 it never resumes.**  Memory access there is
     DMA-backed and does not halt the CPU, while ``resume()`` is a real

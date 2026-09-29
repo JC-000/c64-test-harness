@@ -56,8 +56,9 @@ class _ScriptedSocket:
         events = self.scripts[self.exits] if self.exits < len(self.scripts) else [EVENT_RESUMED]
         self.exits += 1
         self.buf += _frame(CMD_TO_RESPONSE_TYPE[CMD_EXIT], req_id)
-        for rtype in events:
-            self.buf += _frame(rtype)
+        for ev in events:
+            rtype, body = ev if isinstance(ev, tuple) else (ev, b"")
+            self.buf += _frame(rtype, body=body)
 
     def recv(self, n: int) -> bytes:
         if not self.buf:
@@ -87,6 +88,14 @@ def _transport(sock: _ScriptedSocket) -> BinaryViceTransport:
 STALE = [EVENT_RESUMED, REGISTERS_EVENT, EVENT_STOPPED]
 
 
+def _checkpoint_info(stop_when_hit: bool) -> tuple[int, bytes]:
+    # number, currently-hit, start, end, stop_when_hit, enabled, op,
+    # temporary, hit count, ignore count, has condition, memspace
+    body = struct.pack("<IBHHBBBBIIBB", 1, 1, 0xC000, 0xC000,
+                       int(stop_when_hit), 1, 4, 0, 1, 0, 0, 0)
+    return (RESPONSE_CHECKPOINT_INFO, body)
+
+
 def test_a_clean_exit_is_confirmed_with_one_exit():
     sock = _ScriptedSocket([[EVENT_RESUMED]])
     assert _transport(sock)._resume_confirmed(window=0.01) is True
@@ -103,12 +112,107 @@ def test_a_swallowed_exit_is_resent_until_one_runs():
 
 
 def test_a_checkpoint_stop_is_not_resumed_over():
-    sock = _ScriptedSocket([[EVENT_RESUMED, RESPONSE_CHECKPOINT_INFO,
+    sock = _ScriptedSocket([[EVENT_RESUMED, _checkpoint_info(True),
                              REGISTERS_EVENT, EVENT_STOPPED]])
     t = _transport(sock)
     assert t._resume_confirmed(window=0.01) is False
     assert sock.exits == 1
     assert any(e.response_type == RESPONSE_CHECKPOINT_INFO for _, e in t._event_queue)
+
+
+def test_a_tracepoint_hit_is_not_a_stop():
+    # A checkpoint with stop_when_hit=False reports the hit and keeps
+    # running: no Stopped follows, so the CPU is running.
+    sock = _ScriptedSocket([[EVENT_RESUMED, _checkpoint_info(False)]])
+    t = _transport(sock)
+    assert t._resume_confirmed(window=0.01) is True
+    assert sock.exits == 1
+    assert any(e.response_type == RESPONSE_CHECKPOINT_INFO for _, e in t._event_queue)
+
+
+def test_a_tracepoint_hit_does_not_hide_a_stale_trap():
+    sock = _ScriptedSocket([[EVENT_RESUMED, _checkpoint_info(False),
+                             REGISTERS_EVENT, EVENT_STOPPED], [EVENT_RESUMED]])
+    assert _transport(sock)._resume_confirmed(window=0.01) is True
+    assert sock.exits == 2
+
+
+def test_the_default_budget_covers_a_guest_64k_swap():
+    # reu_dma_swap costs 2 cycles per byte (reu.c): a 64 KB swap stalls the
+    # CPU 131072 cycles, ~6.7 PAL frames of 19656 cycles, so up to 6 spare
+    # traps can queue behind one command.
+    sock = _ScriptedSocket([STALE] * 6 + [[EVENT_RESUMED]])
+    assert _transport(sock)._resume_confirmed(window=0.01) is True
+    assert sock.exits == 7
+
+
+def test_a_text_monitor_command_waits_for_the_binary_lock():
+    # A text-monitor command enters VICE's monitor, which the binary socket
+    # reports as a bare Stopped; inside a confirmation window that reads as
+    # a stale trap.  So text commands are serialised with the binary lock.
+    import threading
+    import time as _time
+
+    t = _transport(_ScriptedSocket([]))
+    sent = threading.Event()
+    text_sock = MagicMock()
+    text_sock.sendall.side_effect = lambda data: sent.set()
+    text_sock.recv.return_value = b"(C:$e5d1) "
+    t._text_sock = text_sock
+    t._text_lock = threading.Lock()
+    t._lock.acquire()
+    try:
+        worker = threading.Thread(target=t._text_command, args=("warp",))
+        worker.start()
+        _time.sleep(0.1)
+        assert not sent.is_set(), "text command ran while the binary lock was held"
+    finally:
+        t._lock.release()
+    worker.join(timeout=5.0)
+    assert sent.is_set()
+
+
+def test_exit_and_window_happen_under_one_lock_hold():
+    # Otherwise a text-monitor command (which takes the same lock) can slip
+    # in between the EXIT and the listening window.
+    log: list[str] = []
+
+    class TrackingLock:
+        def __init__(self) -> None:
+            self._l = threading.Lock()
+
+        def __enter__(self):
+            self._l.acquire()
+            log.append("acquire")
+            return self
+
+        def __exit__(self, *exc) -> None:
+            log.append("release")
+            self._l.release()
+
+        def locked(self) -> bool:
+            return self._l.locked()
+
+    sock = _ScriptedSocket([STALE, [EVENT_RESUMED]])
+    real_sendall = sock.sendall
+
+    def sendall(data: bytes) -> None:
+        log.append("exit")
+        real_sendall(data)
+
+    sock.sendall = sendall
+    t = _transport(sock)
+    t._lock = TrackingLock()
+    real = t._after_exit
+
+    def spy(window):
+        log.append("window")
+        return real(window)
+
+    t._after_exit = spy
+    assert t._resume_confirmed(window=0.01) is True
+    joined = " ".join(log)
+    assert joined.count("acquire exit window release") == 2, joined
 
 
 def test_a_jam_is_not_resumed_over_and_stays_queued():

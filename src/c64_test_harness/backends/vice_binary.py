@@ -339,9 +339,19 @@ class BinaryViceTransport:
                 return text
 
     def _text_command(self, cmd: str) -> str:
-        """Send a command to the text monitor and return the response."""
+        """Send a command to the text monitor and return the response.
+
+        Holds the binary lock as well (always taken first; nothing takes
+        ``_text_lock`` before ``_lock``, so the order cannot invert).  A
+        text command enters VICE's monitor, and the binary socket reports
+        that entry as a bare Stopped event; issued from another thread
+        during :meth:`_resume_confirmed`'s window it was read as a stale
+        trap and resumed over (#516 round 3, 5/5).  The cost is that a text
+        command now waits for any binary exchange in flight, including a
+        :meth:`wait_for_stopped` that holds the lock for its whole timeout.
+        """
         assert self._text_sock is not None
-        with self._text_lock:
+        with self._lock, self._text_lock:
             self._text_sock.sendall((cmd + "\n").encode("ascii"))
             return self._text_recv_until_prompt()
 
@@ -838,12 +848,19 @@ class BinaryViceTransport:
     #: How long :meth:`_resume_confirmed` listens after an EXIT for a
     #: stale-trap re-entry.  The re-entry's events are written by the same
     #: VICE thread straight after the Resumed event, before any 6510
-    #: instruction runs, so this only has to cover loopback delivery.
-    STALE_TRAP_WINDOW = 0.05
-    #: EXITs :meth:`_resume_confirmed` sends before giving up.  One spare
-    #: trap per vsync the CPU was stalled across; a 32 KB REU DMA spans
-    #: ~1.67 PAL frames, so two is the usual worst case.
-    STALE_TRAP_ATTEMPTS = 4
+    #: instruction runs: measured 0.08-0.24 ms after the EXIT reply (n=20,
+    #: #516 round 3).  The clean path waits out the whole window, and every
+    #: waiter exit on VICE pays it, so it is kept small; a re-entry delayed
+    #: past it (a descheduled VICE thread) is missed and the waiter returns
+    #: with the machine halted, as before #516.
+    STALE_TRAP_WINDOW = 0.005
+    #: EXITs :meth:`_resume_confirmed` sends before giving up: one per spare
+    #: trap, and a trap queues at every vsync the CPU is stalled across.
+    #: The longest REU stall is a 64 KB swap: ``reu_dma_swap`` costs 2
+    #: cycles per byte (``c64/cart/reu.c``), 131072 cycles, ~6.7 PAL frames
+    #: of 19656 cycles -- up to 6 spare traps behind one command (a 32 KB
+    #: transfer, 1 cycle per byte, is ~1.67 frames).  8 covers that.
+    STALE_TRAP_ATTEMPTS = 8
 
     def _resume_confirmed(
         self,
@@ -864,9 +881,13 @@ class BinaryViceTransport:
         The re-entry is visible on the wire: after the EXIT reply and the
         Resumed event, a clean exit sends nothing more, while a stale trap
         immediately sends a Registers event and a Stopped event.  A
-        checkpoint hit sends Checkpoint-info first and a jam sends
-        ``RESPONSE_JAM``; those are real stops, so they are queued for
-        :meth:`wait_for_stopped` and not resumed over.  Returns ``True``
+        stopping checkpoint sends Checkpoint-info (``stop_when_hit`` set)
+        first and a jam sends ``RESPONSE_JAM``; those are real stops, so
+        they are queued for :meth:`wait_for_stopped` and not resumed over.
+        A tracepoint's Checkpoint-info (``stop_when_hit`` clear) is queued
+        and listening goes on.  A stop made through the text monitor also
+        arrives as a bare Stopped; :meth:`_text_command` holds the binary
+        lock so none can land inside the window.  Returns ``True``
         once an EXIT was not followed by a stale re-entry within
         :attr:`STALE_TRAP_WINDOW`, ``False`` after a real stop or after
         :attr:`STALE_TRAP_ATTEMPTS` swallowed EXITs.
@@ -878,46 +899,74 @@ class BinaryViceTransport:
         """
         window = self.STALE_TRAP_WINDOW if window is None else window
         attempts = self.STALE_TRAP_ATTEMPTS if attempts is None else attempts
+        expected = CMD_TO_RESPONSE_TYPE[CMD_EXIT]
         for _ in range(attempts):
-            self.resume()
-            verdict = self._after_exit(window)
+            # EXIT and the listening window under one hold of the binary
+            # lock (which ``_text_command`` also takes), so no text-monitor
+            # command -- whose monitor entry arrives as a bare Stopped --
+            # can land between them.  Same generation bump as resume().
+            with self._lock:
+                self._resume_generation += 1
+                req_id = self._send_command(CMD_EXIT)
+                self._wait_for_response(req_id, expected_response_type=expected)
+                verdict = self._after_exit(window)
             if verdict != "stale":
                 return verdict == "running"
         return False
 
+    @staticmethod
+    def _checkpoint_stops(body: bytes) -> bool:
+        """Whether a Checkpoint-info frame reports a stopping checkpoint.
+
+        Byte 9 is ``stop_when_hit`` (after number u32, currently-hit u8,
+        start u16, end u16); a tracepoint has it clear.  A frame too short
+        to say is treated as a stop -- the safe side, it is not resumed
+        over.
+        """
+        return len(body) < 10 or bool(body[9])
+
     def _after_exit(self, window: float) -> str:
-        """Classify the events that follow an EXIT: running/stale/stopped."""
+        """Classify the events that follow an EXIT: running/stale/stopped.
+
+        Called with ``self._lock`` held (by :meth:`_resume_confirmed`).
+        """
         assert self._sock is not None
         held: list[_Response] = []
         verdict = "running"
-        with self._lock:
-            deadline = time.monotonic() + window
-            try:
-                while True:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    self._sock.settimeout(remaining)
-                    try:
-                        resp = self._recv_response()
-                    except TimeoutError:
-                        break
-                    if resp.response_type == EVENT_RESUMED:
-                        continue
-                    if resp.response_type in (
-                        RESPONSE_CHECKPOINT_INFO, RESPONSE_JAM,
-                    ):
-                        held.append(resp)
-                        verdict = "stopped"
-                        break
-                    if resp.response_type == EVENT_STOPPED:
-                        # No checkpoint or jam before it: our own spare
-                        # trap.  Its Registers/Stopped events describe a
-                        # halt the next EXIT undoes; drop them.
-                        return "stale"
+        deadline = time.monotonic() + window
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._sock.settimeout(remaining)
+                try:
+                    resp = self._recv_response()
+                except TimeoutError:
+                    break
+                if resp.response_type == EVENT_RESUMED:
+                    continue
+                if (resp.response_type == RESPONSE_CHECKPOINT_INFO
+                        and not self._checkpoint_stops(resp.body)):
+                    # A tracepoint: reported, and the CPU runs on.
                     held.append(resp)
-            finally:
-                self._sock.settimeout(self.timeout)
+                    continue
+                if resp.response_type in (
+                    RESPONSE_CHECKPOINT_INFO, RESPONSE_JAM,
+                ):
+                    held.append(resp)
+                    verdict = "stopped"
+                    break
+                if resp.response_type == EVENT_STOPPED:
+                    # No checkpoint or jam before it: our own spare trap.
+                    # Its Registers/Stopped events describe a halt the
+                    # next EXIT undoes; drop them.
+                    verdict = "stale"
+                    held = []
+                    break
+                held.append(resp)
+        finally:
+            self._sock.settimeout(self.timeout)
         for resp in held:
             self._event_queue.append((self._resume_generation, resp))
         return verdict
