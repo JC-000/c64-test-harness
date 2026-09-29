@@ -129,3 +129,70 @@ def test_extract_reu_contents_returns_the_reu_not_the_staging_window(reu_transpo
     assert got == in_reu
     # And the staging window was put back.
     assert t.read_memory(STAGING, STAGING_LEN) == in_ram
+
+
+#: A program living inside the staging window: INC $CB00 / BNE / INC $CB01 /
+#: JMP $1000.  Its counter sits outside the window, so it survives the
+#: extract's write-back only if the program itself kept running correctly.
+PROG_ADDR, PROG_COUNTER = 0x1000, 0xCB00
+PROG_CODE = bytes([
+    0xEE, 0x00, 0xCB,   # INC $CB00
+    0xD0, 0xFB,         # BNE $1000
+    0xEE, 0x01, 0xCB,   # INC $CB01
+    0x4C, 0x00, 0x10,   # JMP $1000
+])
+KIL = 0x02
+REU_BANKS = 4
+
+
+def _seed_reu(t, banks: list[bytes]) -> None:
+    for i, data in enumerate(banks):
+        off = i * STAGING_LEN
+        t.write_memory(STAGING, data)
+        t.write_memory(0xDF02, bytes([STAGING & 0xFF, STAGING >> 8,
+                                      off & 0xFF, (off >> 8) & 0xFF, off >> 16,
+                                      STAGING_LEN & 0xFF, STAGING_LEN >> 8, 0, 0]))
+        t.write_memory(0xDF01, bytes([0x90]))   # execute, FF00 off, C64->REU
+        t.resume()
+        time.sleep(0.1)
+
+
+def _pc(t) -> int:
+    return t.read_registers()["PC"]
+
+
+@pytest.mark.parametrize("settle", [0.0, 0.05])
+def test_extract_does_not_run_reu_data_in_a_program_inside_the_window(
+    reu_transport, settle
+):
+    # Review of PR #516: with the resume that makes x64sc perform the DMA,
+    # a program executing inside $0800-$87FF ran the REU bytes -- a KIL-filled
+    # bank jammed it 3/3.  The extract must park the CPU outside the window.
+    t = reu_transport
+    banks = [bytes([KIL]) * STAGING_LEN] + [_pattern(17 * i) for i in range(1, REU_BANKS)]
+    _seed_reu(t, banks)
+    in_ram = bytearray(_pattern(101))
+    in_ram[PROG_ADDR - STAGING:PROG_ADDR - STAGING + len(PROG_CODE)] = PROG_CODE
+    in_ram = bytes(in_ram)
+    t.write_memory(STAGING, in_ram)
+    t.write_memory(PROG_COUNTER, bytes([0, 0]))
+    goto(t, PROG_ADDR)
+    time.sleep(0.1)
+
+    for _ in range(2):  # 8 bank transfers per parametrisation
+        got = extract_reu_contents(t, REU_BANKS * STAGING_LEN, settle=settle)
+        assert got == b"".join(banks), "extract returned the wrong bytes"
+        assert PROG_ADDR <= _pc(t) < PROG_ADDR + len(PROG_CODE), (
+            f"CPU left at ${_pc(t):04X}, not in the program"
+        )
+        t.resume()
+        time.sleep(0.1)
+
+    assert t.read_memory(STAGING, STAGING_LEN) == in_ram, "window not restored"
+    assert PROG_ADDR <= _pc(t) < PROG_ADDR + len(PROG_CODE), (
+        f"program not running: PC ${_pc(t):04X} (a KIL jam parks it on $02)"
+    )
+    seen = t.read_memory(PROG_COUNTER, 2)
+    t.resume()
+    time.sleep(0.2)
+    assert t.read_memory(PROG_COUNTER, 2) != seen, "program stopped counting"

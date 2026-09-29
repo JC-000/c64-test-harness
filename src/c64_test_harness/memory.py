@@ -120,7 +120,8 @@ def read_bytes_verified(
     Intended for downstream tests that suspect issue #88-style flakey
     reads.  The standard :func:`read_bytes` should be used everywhere
     else — this helper doubles the wire traffic per read and is only
-    worth the cost when a flake is suspected.  Like :func:`read_bytes`, never resumes: on VICE the CPU is left halted.
+    worth the cost when a flake is suspected.  Like :func:`read_bytes`,
+    never resumes: on VICE the CPU is left halted.
     """
     refuse_bool_address(addr, "read_bytes_verified address")
     if max_attempts < 2:
@@ -158,7 +159,8 @@ def read_bytes_chunked(
     offset`` would turn ``True`` into the int ``1``, hiding the flag from
     the transport's own guard (#357).
 
-    Like :func:`read_bytes`, never resumes: on VICE the CPU is left halted.
+    Like :func:`read_bytes`, never resumes: on VICE the CPU is left
+    halted.
     """
     refuse_bool_address(addr, "read_bytes_chunked address")
     result = bytearray()
@@ -216,7 +218,8 @@ def write_bytes(transport: C64Transport, addr: int, data: bytes | list[int]) -> 
 def read_word_le(transport: C64Transport, addr: int) -> int:
     """Read a 16-bit little-endian value from *addr*.
 
-    Like :func:`read_bytes`, never resumes: on VICE the CPU is left halted.
+    Like :func:`read_bytes`, never resumes: on VICE the CPU is left
+    halted.
     """
     refuse_bool_address(addr, "read_word_le address")
     data = transport.read_memory(addr, 2)
@@ -226,7 +229,8 @@ def read_word_le(transport: C64Transport, addr: int) -> int:
 def read_dword_le(transport: C64Transport, addr: int) -> int:
     """Read a 32-bit little-endian value from *addr*.
 
-    Like :func:`read_bytes`, never resumes: on VICE the CPU is left halted.
+    Like :func:`read_bytes`, never resumes: on VICE the CPU is left
+    halted.
     """
     refuse_bool_address(addr, "read_dword_le address")
     data = transport.read_memory(addr, 4)
@@ -241,7 +245,8 @@ def hex_dump(transport: C64Transport, addr: int, length: int) -> str:
         $0400: 05 18 10 20 0b 05 19 3a 20 37 03 20 06 04 20 03
         $0410: ...
 
-    Like :func:`read_bytes`, never resumes: on VICE the CPU is left halted.
+    Like :func:`read_bytes`, never resumes: on VICE the CPU is left
+    halted.
     """
     refuse_bool_address(addr, "hex_dump address")
     data = read_bytes(transport, addr, length)
@@ -314,9 +319,11 @@ def wait_for_memory(
     DMA-backed and does not halt the CPU, while ``resume()`` is a real
     ``PUT /v1/machine:resume`` that would clear a pause the caller set
     deliberately (issue #189).  The helper reads the transport's
-    ``halts_cpu_on_access`` attribute: only an explicit ``False`` (which
-    ``Ultimate64Transport`` declares) skips the resumes; any other
-    transport is treated as halting.  So, unlike
+    ``halts_cpu_on_access`` attribute: only an explicit ``False`` skips
+    the resumes.  ``HardwareTransportBase`` declares ``False`` (so
+    ``Ultimate64Transport`` and any backend built on the extension point
+    inherit it) and ``BinaryViceTransport`` declares ``True``; a transport
+    that declares nothing is treated as halting.  So, unlike
     :func:`~.screen.wait_for_text`, a first-poll match on hardware does
     **not** clear a deliberate pause -- and a machine the caller paused
     stays paused, so a program that must advance to set the flag will
@@ -336,7 +343,9 @@ def wait_for_memory(
         matches = expected
     elif isinstance(expected, (bytes, bytearray)):
         if not expected:
-            raise ValueError("wait_for_memory: expected bytes must be non-empty")
+            raise ValueError(
+                "wait_for_memory: expected bytes must be non-empty"
+            )
         want = bytes(expected)
         n = len(want) if length is None else length
         if n != len(want):
@@ -364,7 +373,9 @@ def wait_for_memory(
             f"callable, not {type(expected).__name__}"
         )
     if not isinstance(n, int) or isinstance(n, bool) or n < 1:
-        raise ValueError(f"wait_for_memory: length must be >= 1; got {length!r}")
+        raise ValueError(
+            f"wait_for_memory: length must be >= 1; got {length!r}"
+        )
     if timeout < 0 or poll_interval < 0:
         raise ValueError(
             f"wait_for_memory: timeout ({timeout}) and poll_interval "

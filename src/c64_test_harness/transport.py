@@ -150,11 +150,12 @@ class C64Transport(Protocol):
         because they are snapshot primitives rather than waiters.
 
         A transport MAY declare ``halts_cpu_on_access: bool``.
-        ``wait_for_memory`` skips every resume only when it is exactly
-        ``False`` (``Ultimate64Transport``); an absent attribute means
-        "treat like VICE".  It is deliberately not a Protocol member, so a
-        transport written before it existed still satisfies
-        ``isinstance(t, C64Transport)``.
+        ``wait_for_memory``, ``watch_progress`` and the REU extract skip
+        every resume only when it is exactly ``False``
+        (``HardwareTransportBase`` and so ``Ultimate64Transport``); an
+        absent attribute means "treat like VICE".  It is deliberately
+        not a Protocol member, so a transport written before it existed
+        still satisfies ``isinstance(t, C64Transport)``.
         """
         ...
 

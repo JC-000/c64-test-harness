@@ -69,8 +69,10 @@ def _record_sleep() -> tuple[list[float], "Callable[[float], None]"]:
 def _make_transport(spec=BinaryViceTransport) -> MagicMock:
     """Mock that quacks like the slice of :class:`C64Transport` we need.
 
-    ``watch_progress`` only ever touches ``transport.read_memory``; the
-    rest of the protocol is irrelevant. We use a bare :class:`MagicMock`
+    ``watch_progress`` reads through ``transport.read_memory`` and, on a
+    transport that does not declare ``halts_cpu_on_access = False``,
+    calls ``resume()`` after each poll (#514) -- a spec'd mock answers
+    both. We use a bare :class:`MagicMock`
     so individual tests script the ``read_memory`` side effects
     declaratively. ``spec`` is parametrised over both concrete transport
     types in the suites below so a regression that ties ``watch_progress``
@@ -383,7 +385,9 @@ class TestResumeBetweenPolls:
         assert kinds.count("Advanced") >= 2, kinds
         assert t.reads > 0 and t.resumes == 0
 
-    def test_legacy_client_shim_never_resumes(self) -> None:
+    def test_legacy_client_shim_never_resumes(self, caplog) -> None:
+        # The adapter has no resume() at all: a watcher that tried would
+        # log a WARNING per poll from the swallowed AttributeError.
         from c64_test_harness.backends.ultimate64_helpers import (
             watch_progress as shim_watch_progress,
         )
@@ -392,9 +396,35 @@ class TestResumeBetweenPolls:
         client.read_mem.side_effect = lambda a, n: b"\x00" * n
         clock = _FakeClock([0.0], step=1.0)
         _, sleep = _record_sleep()
-        list(shim_watch_progress(
-            client, {"a": (0x0400, 1)}, poll_interval=1.0, idle_timeout=10.0,
-            overall_timeout=3.0, _clock=clock, _sleep=sleep,
-        ))
+        with caplog.at_level("WARNING"):
+            list(shim_watch_progress(
+                client, {"a": (0x0400, 1)}, poll_interval=1.0,
+                idle_timeout=10.0, overall_timeout=3.0, _clock=clock,
+                _sleep=sleep,
+            ))
         assert client.read_mem.called
         client.resume.assert_not_called()
+        assert not caplog.records, [r.getMessage() for r in caplog.records]
+
+    def test_hardware_extension_point_is_never_resumed(self, caplog) -> None:
+        # HardwareTransportBase.resume() raises NotImplementedError; a
+        # watcher treating it as halting logged one WARNING per poll, and a
+        # subclass with a real resume() lost a deliberate pause each poll.
+        from c64_test_harness.backends.hardware import HardwareTransportBase
+
+        class Bare(HardwareTransportBase):
+            def read_memory(self, addr: int, length: int) -> bytes:
+                return b"\x00" * length
+
+        class Pausable(Bare):
+            resumes = 0
+
+            def resume(self) -> None:
+                type(self).resumes += 1
+
+        for t in (Bare(), Pausable()):
+            with caplog.at_level("WARNING"):
+                kinds = [e.kind for e in _watch(t)]
+            assert kinds[-1] == "Timeout", kinds
+        assert Pausable.resumes == 0
+        assert not caplog.records, [r.getMessage() for r in caplog.records]

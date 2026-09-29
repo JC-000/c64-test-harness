@@ -172,6 +172,7 @@ entry was verified against the code that performs the write (the
 | `$0339-$033B` | 3 | `sid_player.play_sid_vice` | park JMP ($A002) executed after the installer so resume() lands in BASIC warm start | _PARK_ADDR constant |
 | `$033C-$0341` | 6 | `sid_player.play_sid_vice` | song trampoline: LDA #song / JSR init / RTS | _SONG_TRAMPOLINE_ADDR constant |
 | `$0360-$036D` | 14 | `execute.run_subroutine (U64 path)` | 14-byte sentinel trampoline; on VICE the 5-byte jsr() trampoline is written here instead | trampoline_addr= |
+| `$03C0-$03C2` † | 3 | `snapshot.extract_reu_contents` | VICE only: JMP * park for the 6510 while the REC fills the staging window, so a program in $0800-$87FF never runs REU data (#514); prior bytes and PC/FL written back afterwards | hardcoded |
 | `$03F0-$03F1` | 2 | `execute.run_subroutine (U64 path)` | running / done flag bytes polled by the host | hardcoded |
 | `$0800-$87FF` † | 32768 | `snapshot.extract_reu_contents` | 32 KiB REU→C64 DMA staging window (opt-in include_reu=True, override="reu-snapshot-staging"). Filled by REC DMA with the CPU running (unpaused is mandatory on hardware) — MemoryPolicy cannot see the fill; prior contents written back afterwards, but code executing there meanwhile runs REU data | hardcoded |
 | `$C000-$C011` | 18 | `sid_player.play_sid_vice` | 18-byte IRQ installer + wrapper stub | stub_addr= (DEFAULT_STUB_ADDR) |
@@ -184,7 +185,7 @@ entry was verified against the code that performs the write (the
 | `$C500-$CAC1` | 1474 | `uci_network.uci_socket_read (max_len > 253) / build_socket_read(multi_block=True)` | multi-block READ_SOCKET reply: 2-byte header plus up to 1472 payload bytes, stored across Data More blocks (issue #420) | result_addr= on build_socket_read; hardcoded in uci_socket_read |
 | `$CF00-$CF03` | 4 | `tests/test_vice_core.py::_restore_basic (also scripts/vice_keyecho_probe.py + scripts/vice_stall_probe.py)` | CLI; JMP ($A002) stub warm-starting BASIC (rebuilds SP) before every screen/keyboard test — test-suite scratch, not library | hardcoded |
 
-† *transient* — the prior contents are written back afterwards (best-effort for the liveness probe: only on success; for probe_u64's write check, ProbeResult.scratch_restored reports whether it was). It does NOT mean the span is safe to execute from while the operation runs: the REU window is filled by REC DMA with the CPU live and `MemoryPolicy` cannot see that fill; `extract_reu_contents` warns when the policy declares RAM inside it, on VICE too (x64sc runs the REC transfer only while the CPU runs, so the extract resumes it; #514). Declared like every other write, but not withheld by `MemoryArbiter` by default.
+† *transient* — the prior contents are written back afterwards (best-effort for the liveness probe: only on success; for probe_u64's write check, ProbeResult.scratch_restored reports whether it was). It does NOT mean the span is safe to execute from while the operation runs: the REU window is filled by REC DMA with the CPU live and `MemoryPolicy` cannot see that fill; on hardware `extract_reu_contents` warns when the policy declares RAM inside it (on VICE it parks the CPU outside the window instead; #514). Declared like every other write, but not withheld by `MemoryArbiter` by default.
 <!-- END HARNESS_SCRATCH TABLE -->
 
 Reading the table:
@@ -222,14 +223,17 @@ Reading the table:
   `extract_reu_contents` fills `$0800-$87FF` by REC DMA — the host only
   programs `$DF01-$DF0A`, so `MemoryPolicy` never sees the clobber —
   with the CPU running (unpaused is mandatory on Ultimate hardware,
-  see `docs/snapshot_interop.md`; on VICE, x64sc performs the REC
-  transfer only while the CPU runs, so the extract resumes the machine
-  after each command write -- #514).  A program executing from
-  `$0801-$87FF` runs REU data during the extract, and the write-back
-  does not undo PC/stack/side effects.  On either backend
+  see `docs/snapshot_interop.md`).  On hardware a program executing
+  from `$0801-$87FF` runs REU data during the extract, and the
+  write-back does not undo PC/stack/side effects, so
   `extract_reu_contents` emits a `UserWarning` when the policy declares
   a region inside the window; stop the program or keep it out of the
-  window first.
+  window first.  On VICE, x64sc performs the REC transfer only while
+  the CPU runs, so the extract resumes the machine after each command
+  write -- and first parks the 6510 on a `JMP *` at `$03C0` with `I`
+  set, restoring the park bytes and `PC`/`FL` afterwards, so a program
+  in the window never runs REU data (#514).  An NMI handler in the
+  window is not covered.
 
 `MemoryPolicy.from_prg()` warns at construction when the load image
 overlaps a non-transient entry — the collision would otherwise surface

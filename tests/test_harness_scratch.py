@@ -240,6 +240,16 @@ class TestBoundsMatchCode:
         assert r.length == s._REU_STAGING_SIZE
         assert r.transient
 
+    def test_reu_park_matches_snapshot_constant(self) -> None:
+        # The VICE extract parks the CPU on a 3-byte JMP * outside the
+        # staging window (#514); the entry must cover exactly that write.
+        from c64_test_harness import snapshot as s
+
+        r = _region_of("extract_reu_contents", s._REU_PARK_ADDR)
+        assert r.length == 3 and r.transient
+        assert not (s._REU_STAGING_BASE <= r.start
+                    < s._REU_STAGING_BASE + s._REU_STAGING_SIZE)
+
     def test_cpu_port_is_two_single_byte_writes(self) -> None:
         r = _region_of("restore_snapshot", 0x0000)
         assert r.length == 2
@@ -291,7 +301,8 @@ class TestTransientFlag:
         # spans: probe_u64 write check $0334-$033B (#241), liveness probe
         # $0334-$03B3 and REU staging $0800-$87FF.
         spans = sorted((r.start, r.end) for r in HARNESS_SCRATCH if r.transient)
-        assert spans == [(0x0334, 0x033C), (0x0334, 0x03B4), (0x0800, 0x8800)]
+        assert spans == [(0x0334, 0x033C), (0x0334, 0x03B4), (0x03C0, 0x03C3),
+                         (0x0800, 0x8800)]
 
     def test_every_start_in_the_list_is_covered_by_this_test(self) -> None:
         starts = sorted({r.start for r in HARNESS_SCRATCH if not r.transient})

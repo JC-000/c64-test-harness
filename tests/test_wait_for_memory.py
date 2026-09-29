@@ -19,6 +19,7 @@ import time
 import pytest
 
 from c64_test_harness import wait_for_memory
+from c64_test_harness.backends.hardware import HardwareTransportBase
 from c64_test_harness.backends.ultimate64 import Ultimate64Transport
 from c64_test_harness.backends.vice_binary import BinaryViceTransport
 
@@ -192,3 +193,76 @@ def test_malformed_arguments_refused_before_the_transport_is_touched(kwargs):
     with pytest.raises((ValueError, TypeError)):
         wait_for_memory(t, kwargs.pop("addr"), kwargs.pop("expected"), **kwargs)
     assert (t.reads, t.resumes) == (0, 0)
+
+
+# -- the documented hardware extension point --------------------------------
+
+class _BareHardware(HardwareTransportBase):
+    """A hardware backend built on the extension point, resume() not overridden
+    (the base raises NotImplementedError)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reads = 0
+
+    def read_memory(self, addr: int, length: int) -> bytes:
+        self.reads += 1
+        return bytes([DONE if self.reads >= 3 else 0]) * length
+
+
+class _PausableHardware(_BareHardware):
+    """One with a real resume(), which would clear a deliberate pause (#189)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.resumes = 0
+
+    def resume(self) -> None:
+        self.resumes += 1
+
+
+def test_hardware_base_is_not_resumed(caplog):
+    t = _PausableHardware()
+    with caplog.at_level("WARNING"):
+        assert wait_for_memory(t, FLAG, DONE, timeout=5.0, poll_interval=0) == bytes([DONE])
+    assert t.resumes == 0
+    assert not caplog.records
+
+
+def test_hardware_base_without_resume_logs_nothing(caplog):
+    t = _BareHardware()
+    with caplog.at_level("WARNING"):
+        assert wait_for_memory(t, FLAG, DONE, timeout=5.0, poll_interval=0) == bytes([DONE])
+    assert not caplog.records, [r.getMessage() for r in caplog.records]
+
+
+# -- arguments and best-effort resume ---------------------------------------
+
+def test_negative_poll_interval_refused_before_the_transport_is_touched():
+    t = HaltingFake()
+    with pytest.raises(ValueError, match="poll_interval"):
+        wait_for_memory(t, FLAG, DONE, poll_interval=-0.1)
+    assert t.reads == 0
+
+
+def test_zero_length_refused_for_a_predicate():
+    t = HaltingFake()
+    with pytest.raises(ValueError, match="length"):
+        wait_for_memory(t, FLAG, lambda d: True, length=0)
+    assert t.reads == 0
+
+
+class _ResumeRaises(HaltingFake):
+    def resume(self) -> None:
+        self.resumes += 1
+        raise OSError("monitor socket closed")
+
+
+def test_a_resume_that_raises_is_best_effort(caplog):
+    # The exit resume sits in a finally: raising there would replace the
+    # caller's result (or exception) with the resume's.  Logged, not raised.
+    t = _ResumeRaises(resumes_to_finish=0)
+    with caplog.at_level("WARNING", logger="c64_test_harness.screen"):
+        assert wait_for_memory(t, FLAG, DONE, timeout=1.0) == bytes([DONE])
+    assert t.resumes == 1
+    assert any("resume() failed" in r.getMessage() for r in caplog.records)

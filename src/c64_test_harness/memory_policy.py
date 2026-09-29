@@ -387,6 +387,16 @@ HARNESS_SCRATCH: tuple[ScratchRegion, ...] = (
         configurable="trampoline_addr=",
     ),
     ScratchRegion(
+        0x03C0, 0x03C3,
+        owner="snapshot.extract_reu_contents",
+        purpose="VICE only: JMP * park for the 6510 while the REC fills "
+                "the staging window, so a program in $0800-$87FF never "
+                "runs REU data "
+                "(#514); prior bytes and PC/FL written back afterwards",
+        configurable="hardcoded",
+        transient=True,
+    ),
+    ScratchRegion(
         0x03F0, 0x03F2,
         owner="execute.run_subroutine (U64 path)",
         purpose="running / done flag bytes polled by the host",

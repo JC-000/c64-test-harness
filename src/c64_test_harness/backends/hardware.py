@@ -28,6 +28,16 @@ class HardwareTransportBase:
             # ... etc
     """
 
+    #: Capability read by :func:`~c64_test_harness.memory.wait_for_memory`,
+    #: :func:`~c64_test_harness.progress.watch_progress` and the REU extract:
+    #: whether a memory access leaves the CPU halted until ``resume()``.
+    #: Hardware reads (DMA, a probe, video capture) normally do not, and
+    #: ``resume()`` here raises -- while a subclass's real ``resume()`` would
+    #: clear a pause the caller set deliberately (#189) -- so the default is
+    #: ``False``.  A backend whose accesses really do halt the CPU overrides
+    #: it with ``True`` (issue #514).
+    halts_cpu_on_access: bool = False
+
     def __init__(self, screen_cols: int = 40, screen_rows: int = 25) -> None:
         self._screen_cols = screen_cols
         self._screen_rows = screen_rows

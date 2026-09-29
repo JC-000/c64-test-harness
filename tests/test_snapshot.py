@@ -519,11 +519,22 @@ _OVERLAPPING = MemoryPolicy(
 )
 
 
+class _ParkableViceMockTransport(_MockTransport):
+    """VICE-shaped and parkable: reports and sets registers."""
+
+    def read_registers(self) -> dict[str, int]:
+        return {"PC": 0x0900, "FL": 0x20}
+
+    def set_registers(self, regs: dict[str, int]) -> None:
+        pass
+
+
 class TestReuStagingWindowWarning:
-    # Both shapes: VICE runs the program between the REC command and the
-    # bank read too, since x64sc only performs the transfer while the CPU
-    # runs (issue #514) -- it used to be exempted as "the monitor holds
-    # the machine", which was the wrong model.
+    # Both unparkable shapes: VICE runs the CPU between the REC command and
+    # the bank read too, since x64sc only performs the transfer while the
+    # CPU runs (issue #514) -- it used to be exempted as "the monitor holds
+    # the machine", which was the wrong model.  A VICE transport that can be
+    # parked outside the window is silent: its program never runs there.
     @pytest.mark.parametrize("shape", [_HardwareMockTransport, _MockTransport])
     def test_extract_warns_when_policy_overlaps_staging_window(self, shape) -> None:
         from c64_test_harness.snapshot import extract_reu_contents
@@ -535,6 +546,16 @@ class TestReuStagingWindowWarning:
         assert "$0801-$0FFF" in msg
         assert "consumer PRG" in msg
         assert "execut" in msg  # says the span is not safe to execute from
+
+    def test_extract_is_silent_when_the_cpu_is_parked(self) -> None:
+        import warnings as _w
+
+        from c64_test_harness.snapshot import extract_reu_contents
+
+        mock = _ParkableViceMockTransport(memory_policy=_OVERLAPPING)
+        with _w.catch_warnings():
+            _w.simplefilter("error")
+            extract_reu_contents(mock, 0x8000, settle=0)
 
     def test_extract_is_silent_when_nothing_overlaps(self) -> None:
         import warnings as _w

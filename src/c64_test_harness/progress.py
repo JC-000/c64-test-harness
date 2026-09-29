@@ -118,10 +118,10 @@ def watch_progress(
       yields, so the machine is running while the caller handles an
       event.  It resumes only after a poll that read something, and
       never on a transport that declares ``halts_cpu_on_access = False``
-      (the Ultimate 64, where ``resume()`` is a real request that clears
-      a deliberate pause).  Before issue #514 it never resumed, and on
-      VICE the program froze at the first poll and was reported
-      ``"Stalled"``.
+      (``HardwareTransportBase`` and so the Ultimate 64, where
+      ``resume()`` is a real request that clears a deliberate pause).
+      Before issue #514 it never resumed, and on VICE the program froze
+      at the first poll and was reported ``"Stalled"``.
     * Each poll issues one ``read_memory`` per watched name. On
       hardware (U64) reads contend with the C64 bus via DMA, so
       ``poll_interval`` defaults to a conservative 10 s. Shorten it
