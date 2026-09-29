@@ -209,6 +209,8 @@ def _vice_worker(
     allocated = False
     monitor_ready = False
     error = None
+    alloc = None
+    proc = None
 
     if startup_delay > 0:
         time.sleep(startup_delay * worker_id)
@@ -247,12 +249,16 @@ def _vice_worker(
         if transport is not None:
             transport.close()
 
-        proc.stop()
-        alloc.release(port)
-
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
         alloc_ms = (time.monotonic() - t0) * 1000
+    finally:
+        # Every exit, including a failed connect or an interrupt, stops
+        # the x64sc this worker launched and frees its port.
+        if proc is not None:
+            proc.stop()
+        if alloc is not None and port is not None:
+            alloc.release(port)
 
     return {
         "worker_id": worker_id,
