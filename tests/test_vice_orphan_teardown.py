@@ -72,8 +72,15 @@ def _is_stub(pid: int, stub: Path) -> bool:
     return bool(args) and args.split()[0] == str(stub)
 
 
-def _kill_if_ours(pid: int, stub: Path) -> None:
-    """Kill *pid* only if it is still running the stub we created."""
+def _kill_if_ours(pid: int, stub: Path, settle: float = 3.0) -> None:
+    """Kill *pid* only if it is running the stub we created.
+
+    A PID printed straight after start() may still be the launcher shell
+    that is about to exec the stub, so wait briefly for it to become one.
+    """
+    deadline = time.monotonic() + settle
+    while not _is_stub(pid, stub) and _alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
     if _is_stub(pid, stub):
         try:
             os.kill(pid, signal.SIGKILL)
@@ -476,20 +483,23 @@ def test_detached_process_is_left_running_at_exit(stub_x64sc):
         from c64_test_harness.backends.vice_lifecycle import ViceConfig, ViceProcess
         p = ViceProcess(ViceConfig(executable=os.environ["STUB"], sound=False))
         p.start()
+        print(p.pid, flush=True)   # before detach(): cleanup needs it
         p.detach()
-        print(p.pid, flush=True)
         """,
         launcher,
     )
-    assert res.returncode == 0, res.stderr
-    pid = int(res.stdout.split()[0])
+    tokens = res.stdout.split()
+    pid = int(tokens[0]) if tokens and tokens[0].isdigit() else None
     try:
+        assert res.returncode == 0, res.stderr
+        assert pid is not None, res.stdout
         time.sleep(0.5)
         assert _alive(pid) and _is_stub(pid, sleeper), (
             "a detached x64sc was stopped at interpreter exit"
         )
     finally:
-        _kill_if_ours(pid, sleeper)
+        if pid is not None:
+            _kill_if_ours(pid, sleeper)
 
 
 # ---------------------------------------------------------------------------
@@ -742,6 +752,75 @@ def test_sudo_stop_never_kills_or_blames_a_reused_pid(stub_x64sc, caplog):
         assert calls == [], f"root kill sent to a reused PID: {calls}"
         assert not [r for r in caplog.records
                     if r.levelno >= logging.WARNING], caplog.text
+    finally:
+        _kill_if_ours(stub_pid, sleeper)
+        if wrapper.poll() is None:
+            wrapper.kill()
+            wrapper.wait(timeout=5)
+
+
+def test_identity_check_distinguishes_start_time_on_a_real_process(
+    stub_x64sc,
+):
+    """Unpatched: the identity of a live stand-in names it, matches
+    itself, and a different start time with the same comm does not."""
+    _, sleeper = stub_x64sc
+    wrapper = _wrapper_tree(sleeper)
+    stub_pid = None
+    try:
+        stub_pid = _find_stub_under(wrapper.pid, sleeper)
+        assert stub_pid is not None, "test setup: stub never appeared"
+        ident = vice_lifecycle._proc_identity(stub_pid)
+        assert ident is not None and ident[1] == str(sleeper), ident
+        started = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(stub_pid)],
+            capture_output=True, text=True, check=True,
+        ).stdout.split()
+        assert ident[0] == " ".join(started), (ident, started)
+        assert vice_lifecycle._is_same_x64sc(stub_pid, ident)
+        assert not vice_lifecycle._is_same_x64sc(
+            stub_pid, ("Thu Jan  1 00:00:00 1970", ident[1]),
+        )
+    finally:
+        if stub_pid is not None:
+            _kill_if_ours(stub_pid, sleeper)
+        wrapper.kill()
+        wrapper.wait(timeout=5)
+
+
+def test_sudo_stop_resolves_x64sc_late_when_it_was_not_found_up_front(
+    stub_x64sc, caplog,
+):
+    """The up-front lookup can miss (sudo has not exec'd x64sc yet); the
+    lookup after the TERM timeout must then capture the identity itself,
+    so the root kill is attempted and the survivor is reported by PID."""
+    _, sleeper = stub_x64sc
+    wrapper = _wrapper_tree(sleeper, ignore_term="all")
+    stub_pid = _find_stub_under(wrapper.pid, sleeper)
+    assert stub_pid is not None, "test setup: stub never appeared"
+    proc = ViceProcess(ViceConfig(sound=False))
+    proc._proc = wrapper
+    proc._is_sudo_child = True
+    real_find = proc._find_x64sc_child_pid
+    lookups = {"n": 0}
+
+    def find():
+        lookups["n"] += 1
+        return None if lookups["n"] == 1 else real_find()
+
+    proc._find_x64sc_child_pid = find
+    calls: list = []
+    try:
+        with (
+            patch.object(vice_lifecycle.subprocess, "run",
+                         _refuse_root_kill(calls)),
+            caplog.at_level(logging.WARNING, logger=vice_lifecycle.__name__),
+        ):
+            proc.stop()
+        assert lookups["n"] >= 2
+        assert calls == [["sudo", "-n", "kill", "-9", str(stub_pid)]], calls
+        assert any(str(stub_pid) in r.getMessage() for r in caplog.records
+                   if r.levelno >= logging.WARNING), caplog.text
     finally:
         _kill_if_ours(stub_pid, sleeper)
         if wrapper.poll() is None:
