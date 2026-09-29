@@ -68,6 +68,12 @@ class Ultimate64Transport(HardwareTransportBase):
     writes happen concurrently with normal execution.
     """
 
+    #: Capability read by :func:`~c64_test_harness.memory.wait_for_memory`:
+    #: DMA access does not halt the CPU, so the helper never sends a
+    #: ``resume()`` here -- which would be a real ``machine:resume`` that
+    #: clears a deliberate pause (issue #189).
+    halts_cpu_on_access: bool = False
+
     def __init__(
         self,
         host: str,

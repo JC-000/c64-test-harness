@@ -155,6 +155,17 @@ _COLD_FL = 0x20
 def goto(transport: BinaryViceTransport, addr: int, *, cold: bool = False) -> None:
     """Set PC to *addr* and resume CPU execution.
 
+    **The target runs only until the next monitor command.**  On VICE any
+    later command -- a :func:`~.memory.read_bytes` included -- halts the
+    6510 at the next vsync, and it stays halted until something calls
+    ``transport.resume()``.  ``goto()`` cannot keep the machine running
+    past a command it never sees, so to wait for the target to reach a
+    state, poll with :func:`~.memory.wait_for_memory` or
+    :func:`~.screen.wait_for_text`, both of which resume between reads.
+    A bare ``read_bytes`` loop after ``goto()`` freezes the target at the
+    first read, and a settle sleep only hides that for a target that
+    finishes inside the sleep (issue #514).
+
     Unlike :func:`jsr` this is a one-way jump: control never comes back,
     so there is no point at which anything could be restored.  ``goto()``
     does **not** have the :func:`jsr` defect of issue #183 -- that fix is
@@ -672,6 +683,10 @@ def run_subroutine(
         ``SYS <addr>\\n`` into the keyboard buffer (assumes BASIC READY
         state) and polls the done flag with ``read_memory(done, 1)`` at
         *poll_cadence* seconds.
+
+    CPU state on return differs: halted at the trampoline's post-RTS
+    checkpoint on VICE (as :func:`jsr` leaves it -- resume before
+    expecting the program to run on), running on the Ultimate 64.
 
     Parameters
     ----------

@@ -184,7 +184,7 @@ entry was verified against the code that performs the write (the
 | `$C500-$CAC1` | 1474 | `uci_network.uci_socket_read (max_len > 253) / build_socket_read(multi_block=True)` | multi-block READ_SOCKET reply: 2-byte header plus up to 1472 payload bytes, stored across Data More blocks (issue #420) | result_addr= on build_socket_read; hardcoded in uci_socket_read |
 | `$CF00-$CF03` | 4 | `tests/test_vice_core.py::_restore_basic (also scripts/vice_keyecho_probe.py + scripts/vice_stall_probe.py)` | CLI; JMP ($A002) stub warm-starting BASIC (rebuilds SP) before every screen/keyboard test — test-suite scratch, not library | hardcoded |
 
-† *transient* — the prior contents are written back afterwards (best-effort for the liveness probe: only on success; for probe_u64's write check, ProbeResult.scratch_restored reports whether it was). It does NOT mean the span is safe to execute from while the operation runs: the REU window is filled by REC DMA with the CPU live and `MemoryPolicy` cannot see that fill; on Ultimate transports `extract_reu_contents` warns when the policy declares RAM inside it (VICE's monitor holds the machine, so no warning there). Declared like every other write, but not withheld by `MemoryArbiter` by default.
+† *transient* — the prior contents are written back afterwards (best-effort for the liveness probe: only on success; for probe_u64's write check, ProbeResult.scratch_restored reports whether it was). It does NOT mean the span is safe to execute from while the operation runs: the REU window is filled by REC DMA with the CPU live and `MemoryPolicy` cannot see that fill; `extract_reu_contents` warns when the policy declares RAM inside it, on VICE too (x64sc runs the REC transfer only while the CPU runs, so the extract resumes it; #514). Declared like every other write, but not withheld by `MemoryArbiter` by default.
 <!-- END HARNESS_SCRATCH TABLE -->
 
 Reading the table:
@@ -222,14 +222,14 @@ Reading the table:
   `extract_reu_contents` fills `$0800-$87FF` by REC DMA — the host only
   programs `$DF01-$DF0A`, so `MemoryPolicy` never sees the clobber —
   with the CPU running (unpaused is mandatory on Ultimate hardware,
-  see `docs/snapshot_interop.md`).  A program executing from
+  see `docs/snapshot_interop.md`; on VICE, x64sc performs the REC
+  transfer only while the CPU runs, so the extract resumes the machine
+  after each command write -- #514).  A program executing from
   `$0801-$87FF` runs REU data during the extract, and the write-back
-  does not undo PC/stack/side effects.  On Ultimate transports
+  does not undo PC/stack/side effects.  On either backend
   `extract_reu_contents` emits a `UserWarning` when the policy declares
   a region inside the window; stop the program or keep it out of the
-  window first.  On VICE the binary monitor holds the machine during
-  memory commands, so the write-back really is transient and no
-  warning is raised.
+  window first.
 
 `MemoryPolicy.from_prg()` warns at construction when the load image
 overlaps a non-transient entry — the collision would otherwise surface

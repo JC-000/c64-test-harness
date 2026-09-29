@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from ._address import refuse_bool_address
+import time
+from typing import TYPE_CHECKING, Callable
 
-from typing import TYPE_CHECKING
+from ._address import refuse_bool_address
+from .screen import _resume_quietly
 
 if TYPE_CHECKING:
     from .transport import C64Transport
@@ -87,6 +89,14 @@ def read_bytes(transport: C64Transport, addr: int, length: int) -> bytes:
 
     Reads larger than 256 bytes are automatically chunked for reliability
     (VICE's text monitor can return incomplete data on very large reads).
+
+    **A snapshot primitive: it never resumes.**  On VICE the read halts
+    the 6510 and it stays halted until ``transport.resume()``, so a loop of
+    bare ``read_bytes`` calls after :func:`~.execute.goto` polls a frozen
+    machine and never sees the program move on (issue #514).  Use
+    :func:`wait_for_memory` to wait on a value; keep ``read_bytes`` for
+    reading a machine that is stopped or finished, where the halt is
+    exactly what makes consecutive reads agree.
     """
     refuse_bool_address(addr, "read_bytes address")
     if length > _AUTO_CHUNK_THRESHOLD:
@@ -110,7 +120,7 @@ def read_bytes_verified(
     Intended for downstream tests that suspect issue #88-style flakey
     reads.  The standard :func:`read_bytes` should be used everywhere
     else — this helper doubles the wire traffic per read and is only
-    worth the cost when a flake is suspected.
+    worth the cost when a flake is suspected.  Like :func:`read_bytes`, never resumes: on VICE the CPU is left halted.
     """
     refuse_bool_address(addr, "read_bytes_verified address")
     if max_attempts < 2:
@@ -147,6 +157,8 @@ def read_bytes_chunked(
     A ``bool`` *addr* raises :class:`ValueError` before any read: ``addr +
     offset`` would turn ``True`` into the int ``1``, hiding the flag from
     the transport's own guard (#357).
+
+    Like :func:`read_bytes`, never resumes: on VICE the CPU is left halted.
     """
     refuse_bool_address(addr, "read_bytes_chunked address")
     result = bytearray()
@@ -183,6 +195,9 @@ def write_bytes(transport: C64Transport, addr: int, data: bytes | list[int]) -> 
     A ``bool`` *addr* raises :class:`ValueError` before any write: the
     chunked path's ``addr + offset`` would launder ``True`` into ``1`` past
     the transport's own guard (#357).
+
+    On VICE each write halts the CPU and leaves it halted until
+    ``transport.resume()``.
     """
     refuse_bool_address(addr, "write_bytes address")
     if isinstance(data, list):
@@ -199,14 +214,20 @@ def write_bytes(transport: C64Transport, addr: int, data: bytes | list[int]) -> 
 
 
 def read_word_le(transport: C64Transport, addr: int) -> int:
-    """Read a 16-bit little-endian value from *addr*."""
+    """Read a 16-bit little-endian value from *addr*.
+
+    Like :func:`read_bytes`, never resumes: on VICE the CPU is left halted.
+    """
     refuse_bool_address(addr, "read_word_le address")
     data = transport.read_memory(addr, 2)
     return data[0] | (data[1] << 8)
 
 
 def read_dword_le(transport: C64Transport, addr: int) -> int:
-    """Read a 32-bit little-endian value from *addr*."""
+    """Read a 32-bit little-endian value from *addr*.
+
+    Like :func:`read_bytes`, never resumes: on VICE the CPU is left halted.
+    """
     refuse_bool_address(addr, "read_dword_le address")
     data = transport.read_memory(addr, 4)
     return data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24)
@@ -219,6 +240,8 @@ def hex_dump(transport: C64Transport, addr: int, length: int) -> str:
 
         $0400: 05 18 10 20 0b 05 19 3a 20 37 03 20 06 04 20 03
         $0410: ...
+
+    Like :func:`read_bytes`, never resumes: on VICE the CPU is left halted.
     """
     refuse_bool_address(addr, "hex_dump address")
     data = read_bytes(transport, addr, length)
@@ -228,3 +251,147 @@ def hex_dump(transport: C64Transport, addr: int, length: int) -> str:
         hex_part = " ".join(f"{b:02x}" for b in chunk)
         lines.append(f"${addr + i:04X}: {hex_part}")
     return "\n".join(lines)
+
+
+def _access_halts_cpu(transport: object) -> bool:
+    """Whether a memory access through *transport* leaves the 6510 halted.
+
+    Asks the transport's declared ``halts_cpu_on_access`` capability, not
+    its type.  Only an explicit ``False`` means "does not halt": an
+    unknown transport (or a test double whose attributes answer anything)
+    is treated like VICE, which is the side a mistake costs least on --
+    a needless resume, never a machine frozen for good.
+    """
+    return getattr(transport, "halts_cpu_on_access", True) is not False
+
+
+def wait_for_memory(
+    transport: C64Transport,
+    addr: int,
+    expected: int | bytes | bytearray | Callable[[bytes], bool],
+    *,
+    length: int | None = None,
+    timeout: float = 10.0,
+    poll_interval: float = 0.05,
+) -> bytes | None:
+    """Poll memory at *addr* until it matches, keeping the C64 running.
+
+    The safe way to wait on a flag byte after :func:`~.execute.goto` (or
+    after anything else that leaves a program running).  Issue #514: on
+    VICE every binary-monitor command -- a plain :func:`read_bytes`
+    included -- halts the 6510 at the next vsync, and it **stays halted
+    until something calls** ``transport.resume()``.  So ``goto()``
+    followed by a bare ``read_bytes`` loop stops the target at the first
+    read and then reads the same frozen byte for ever (0/50 on the
+    issue's repro; 50/50 with a resume between polls).  A settle sleep
+    before the first read is not a fix: it only outruns the halt for a
+    workload short enough to finish inside the sleep.
+
+    *expected* is one of:
+
+    * an ``int`` 0-255 -- matches when the byte at *addr* equals it
+      (*length* defaults to 1 and must be 1);
+    * ``bytes``/``bytearray`` -- matches when the *length* bytes at *addr*
+      equal it (*length* defaults to ``len(expected)``);
+    * a callable taking the ``bytes`` read and returning truthy on a match
+      (*length* defaults to 1).  An exception it raises propagates, after
+      the exit resume below.
+
+    Returns the matching bytes, or ``None`` on timeout -- the same contract
+    as :func:`~.screen.wait_for_text`.  Memory is always read at least
+    once, so ``timeout=0`` is a single check.  Transport errors propagate;
+    they are not swallowed as poll misses.
+
+    **CPU state on return, on a halting backend (VICE): running, on every
+    exit path** -- match, timeout or exception.  The helper resumes after
+    every read that did not match and, in a ``finally``, after the last
+    read.  The returned bytes were read before that final resume, so they
+    are what memory held at the match, not necessarily what it holds now.
+    The resume is best-effort in the same way as the screen waiters'
+    (logged at WARNING and swallowed if the transport cannot resume).
+
+    **On the Ultimate 64 it never resumes.**  Memory access there is
+    DMA-backed and does not halt the CPU, while ``resume()`` is a real
+    ``PUT /v1/machine:resume`` that would clear a pause the caller set
+    deliberately (issue #189).  The helper reads the transport's
+    ``halts_cpu_on_access`` attribute: only an explicit ``False`` (which
+    ``Ultimate64Transport`` declares) skips the resumes; any other
+    transport is treated as halting.  So, unlike
+    :func:`~.screen.wait_for_text`, a first-poll match on hardware does
+    **not** clear a deliberate pause -- and a machine the caller paused
+    stays paused, so a program that must advance to set the flag will
+    not.  On VICE the residue the screen waiters accept remains: the
+    exit resume bumps ``BinaryViceTransport._resume_generation`` and so
+    drops a queued JAM event (issue #190).
+
+    A ``bool`` *addr* raises :class:`ValueError` before the transport is
+    touched (#357); so do a malformed *expected*, a mismatched *length*,
+    or a negative *timeout*/*poll_interval*.
+
+    .. versionadded:: 0.13.0
+    """
+    refuse_bool_address(addr, "wait_for_memory address")
+    if callable(expected):
+        n = 1 if length is None else length
+        matches = expected
+    elif isinstance(expected, (bytes, bytearray)):
+        if not expected:
+            raise ValueError("wait_for_memory: expected bytes must be non-empty")
+        want = bytes(expected)
+        n = len(want) if length is None else length
+        if n != len(want):
+            raise ValueError(
+                f"wait_for_memory: length={length} does not match "
+                f"len(expected)={len(want)}"
+            )
+        matches = want.__eq__
+    elif isinstance(expected, int) and not isinstance(expected, bool):
+        if not 0 <= expected <= 0xFF:
+            raise ValueError(
+                f"wait_for_memory: expected byte {expected!r} is not 0-255"
+            )
+        n = 1 if length is None else length
+        if n != 1:
+            raise ValueError(
+                f"wait_for_memory: an int expected compares one byte; "
+                f"got length={length}"
+            )
+        want = bytes([expected])
+        matches = want.__eq__
+    else:
+        raise TypeError(
+            f"wait_for_memory: expected must be an int, bytes or a "
+            f"callable, not {type(expected).__name__}"
+        )
+    if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+        raise ValueError(f"wait_for_memory: length must be >= 1; got {length!r}")
+    if timeout < 0 or poll_interval < 0:
+        raise ValueError(
+            f"wait_for_memory: timeout ({timeout}) and poll_interval "
+            f"({poll_interval}) must be >= 0"
+        )
+
+    halts = _access_halts_cpu(transport)
+    deadline = time.monotonic() + timeout
+    # True once a read has (possibly) halted the machine and no resume
+    # has followed it -- the screen waiters' #189 bookkeeping.  Never set
+    # on a transport that does not halt, so nothing resumes there.
+    pending_resume = False
+    try:
+        while True:
+            # Set before the read: a read that raised part-way may still
+            # have halted the 6510.
+            pending_resume = halts
+            data = read_bytes(transport, addr, n)
+            if matches(data):
+                return data
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            if halts:
+                _resume_quietly(transport)
+                pending_resume = False
+            time.sleep(min(poll_interval, remaining))
+    finally:
+        if pending_resume:
+            _resume_quietly(transport)

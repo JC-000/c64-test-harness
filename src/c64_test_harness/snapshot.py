@@ -131,6 +131,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .memory import _access_halts_cpu
+
 if TYPE_CHECKING:
     from .transport import C64Transport
 
@@ -477,7 +479,9 @@ def extract_snapshot(
     """Read RAM + CPU port out of any ``C64Transport``-conforming backend.
 
     Reads ``$0000-$FFFF`` and the two CPU port registers and packages
-    them into a :class:`Snapshot`.  The backend's chunking handles any
+    them into a :class:`Snapshot`.  On VICE the read halts the 6510 and
+    leaves it halted, so the image is one consistent instant; the U64
+    reads by DMA while the machine runs.  The backend's chunking handles any
     transport-level size limits.  The read goes through the CPU view,
     so the ``$D000-$DFFF`` slice of :attr:`Snapshot.ram` holds I/O-view
     bytes (register reads + color RAM), not RAM under I/O — see the
@@ -523,7 +527,9 @@ def restore_snapshot(
     override_memory_policy: bool = True,
     restore_reu: bool = True,
 ) -> None:
-    """Write RAM and CPU port back through the transport.
+    """Write RAM and CPU port back through the transport.  On VICE the
+    machine is left halted (binary monitor); resume to run the restored
+    image.
 
     The RAM image is restored in three slices — ``$0000-$CFFF``, color
     RAM ``$D800-$DBFF``, and ``$E000-$FFFF``.  The rest of the I/O
@@ -616,8 +622,9 @@ def extract_reu_contents(
 
     1. Stash the 32 KB staging window ``$0800-$87FF``.
     2. Per 32 KB bank: program an REU→C64 transfer through the REC
-       registers (``$DF02-$DF0A`` then the command at ``$DF01``), wait
-       *settle* seconds for the DMA to land, and read the window back.
+       registers (``$DF02-$DF0A`` then the command at ``$DF01``), resume
+       the CPU on VICE (below), wait *settle* seconds for the DMA to
+       land, and read the window back.
     3. Restore the original 32 KB.
 
     ``pause=True`` requests a CPU pause around the extract
@@ -627,9 +634,21 @@ def extract_reu_contents(
     including the REC's DMA engine, so the staged transfers never
     execute and the extract returns stale RAM. The default therefore
     runs unpaused — the capture is not atomic, so ensure the running
-    program isn't actively mutating REU during the extract. On VICE
-    the knob is irrelevant: the binary monitor already holds the
-    machine during memory commands.
+    program isn't actively mutating REU during the extract.
+
+    VICE has the same property for a different reason (issue #514):
+    x64sc's REC only pulls BA on the command write and performs the
+    transfer from the CPU loop (``c64/cart/reu.c`` ``reu_dma``), which
+    does not run while the binary monitor holds the machine.  So on a
+    transport whose accesses halt the CPU the extract **resumes after
+    each command write**; the next read halts it again at a vsync, by
+    which point the transfer has completed.  Before this, the VICE
+    extract returned the staging window's own RAM, not the REU.  The
+    consequence is that on VICE too the program runs for up to a frame
+    per bank while the window holds REU data -- so the overlap warning
+    below applies on both backends.  *pause* has no effect on VICE.
+    The machine is left halted on return (the last command is the
+    write-back).
 
     All staging/REC writes carry ``override="reu-snapshot-staging"`` so
     a strict :class:`~c64_test_harness.MemoryPolicy` doesn't block them.
@@ -637,7 +656,7 @@ def extract_reu_contents(
     the snapshot).
 
     Cost: ~30 s / 16 MB at native speed on U64 hardware (turbo helps);
-    effectively instant on VICE.
+    about one video frame of emulated time per 32 KB bank on VICE.
     """
     if not isinstance(size_bytes, int) or isinstance(size_bytes, bool):
         raise ValueError(f"size_bytes must be an int, got {size_bytes!r}")
@@ -647,6 +666,7 @@ def extract_reu_contents(
         )
 
     _warn_if_layout_overlaps_staging_window(transport)
+    halts = _access_halts_cpu(transport)
     paused = _try_pause(transport) if pause else False
     try:
         saved = transport.read_memory(_REU_STAGING_BASE, _REU_STAGING_SIZE)
@@ -660,6 +680,12 @@ def extract_reu_contents(
                     length=n,
                     command=_REC_CMD_REU_TO_C64,
                 )
+                if halts:
+                    # x64sc runs the REC transfer from the CPU loop, and
+                    # the command write above left the CPU halted.  Not
+                    # the quiet variant: a resume that fails here means
+                    # the read below returns the window's own RAM.
+                    transport.resume()
                 if settle > 0:
                     time.sleep(settle)
                 bank = transport.read_memory(_REU_STAGING_BASE, n)
@@ -690,15 +716,12 @@ def _warn_if_layout_overlaps_staging_window(transport: "C64Transport") -> None:
     flight; writing the original bytes back afterwards does not undo
     PC/stack/side effects.  Say so up front.
 
-    Hardware only.  On VICE the binary monitor holds the machine during
-    memory commands, nothing executes from the window mid-extract, and
-    the write-back is genuinely transient — so the warning would be
-    noise.  The backend test is the same duck-typing :func:`_try_pause`
-    uses: an Ultimate transport carries a ``client`` (the REST object),
-    a VICE transport does not.
+    Both backends.  It used to skip VICE on the belief that the binary
+    monitor holds the machine for the whole extract; it cannot, because
+    x64sc performs the REC transfer only while the CPU runs, so the
+    extract resumes after each command write and the program runs for
+    up to a frame with REU data in the window (issue #514).
     """
-    if getattr(transport, "client", None) is None:
-        return  # VICE-shaped: monitor holds the machine; no hazard
     policy = getattr(transport, "memory_policy", None)
     overlaps = getattr(policy, "harness_scratch_overlaps", None)
     if overlaps is None:

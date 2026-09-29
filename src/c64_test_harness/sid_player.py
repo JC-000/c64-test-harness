@@ -245,6 +245,8 @@ def stop_sid_vice(transport: BinaryViceTransport) -> None:
 
     Writes ``$31 $EA`` (lo, hi of ``$EA31``) so the jiffy IRQ no longer
     calls the SID player wrapper.  Safe to call even if no SID is playing.
+    The write leaves the 6510 halted (binary monitor); the player stops
+    being called once something resumes the machine.
     """
     transport.write_memory(
         _IRQ_VEC_LO,

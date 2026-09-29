@@ -154,9 +154,16 @@ class _FakeRecTransport:
     64 KB RAM image.  ``read_memory``/``write_memory`` otherwise behave
     as plain RAM, so the staging stash/restore path is exercised for
     real.
+
+    ``halts=False`` (default) is the Ultimate shape: the copy happens on
+    the command write.  ``halts=True`` is x64sc under the binary monitor
+    (issue #514): the command only arms the transfer, which runs when the
+    CPU is next resumed.
     """
 
-    def __init__(self, reu_image: bytes, ram_fill: int = 0xEE) -> None:
+    def __init__(
+        self, reu_image: bytes, ram_fill: int = 0xEE, *, halts: bool = False
+    ) -> None:
         self.ram = bytearray(_ram_64k(ram_fill))
         self.reu = bytes(reu_image)
         self.writes: list[tuple[int, bytes, str | None]] = []
@@ -164,6 +171,8 @@ class _FakeRecTransport:
         self._rec_regs = bytearray(9)
         self.client = MagicMock()
         self.resume_calls = 0
+        self.halts_cpu_on_access = halts
+        self._armed: tuple[int, int, int] | None = None
 
     def read_memory(self, addr: int, length: int) -> bytes:
         return bytes(self.ram[addr : addr + length])
@@ -182,16 +191,26 @@ class _FakeRecTransport:
             reu_base = r[2] | (r[3] << 8) | (r[4] << 16)
             length = r[5] | (r[6] << 8)
             self.transfers.append((c64_base, reu_base, length))
-            self.ram[c64_base : c64_base + length] = self.reu[
-                reu_base : reu_base + length
-            ]
+            self._armed = (c64_base, reu_base, length)
+            if not self.halts_cpu_on_access:
+                self._run_dma()
             return
         # Plain RAM write (staging stash restore etc.).
         if addr + len(data) <= 65536:
             self.ram[addr : addr + len(data)] = data
 
+    def _run_dma(self) -> None:
+        if self._armed is None:
+            return
+        c64_base, reu_base, length = self._armed
+        self._armed = None
+        self.ram[c64_base : c64_base + length] = self.reu[
+            reu_base : reu_base + length
+        ]
+
     def resume(self) -> None:
         self.resume_calls += 1
+        self._run_dma()
 
 
 class _MockTransport:
@@ -428,6 +447,16 @@ class TestExtractReuContents:
         assert [reu for _, reu, _ in t.transfers] == [
             0x00000, 0x08000, 0x10000, 0x18000,
         ]
+
+    def test_halting_backend_is_resumed_so_the_transfer_runs(self) -> None:
+        # x64sc performs the REC transfer only while the CPU runs; without
+        # a resume after each command the bank read returns the window's
+        # own RAM (measured live, tests/test_resume_after_monitor_vice_live.py).
+        size = 40 * 1024
+        reu = _pattern(size, seed=5)
+        t = _FakeRecTransport(reu, halts=True)
+        assert extract_reu_contents(t, size, settle=0) == reu
+        assert t.resume_calls == 2  # one per bank, none elsewhere
 
     def test_staging_window_ram_restored(self) -> None:
         t = _FakeRecTransport(_pattern(_REU_STAGING_SIZE), ram_fill=0xEE)

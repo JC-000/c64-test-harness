@@ -162,7 +162,16 @@ class BinaryViceTransport:
     format for all communication.  Provides ~0.08ms latency per command,
     no write size limits, async breakpoint events, and non-destructive
     resume().
+
+    **Every command halts the 6510** -- a memory read included -- at the
+    next vsync, and it stays halted until :meth:`resume`.  A caller that
+    polls memory while a program runs must resume between reads; use
+    :func:`~c64_test_harness.memory.wait_for_memory` (issue #514).
     """
+
+    #: Capability read by :func:`~c64_test_harness.memory.wait_for_memory`:
+    #: a memory access leaves the CPU halted until :meth:`resume`.
+    halts_cpu_on_access: bool = True
 
     def __init__(
         self,
@@ -533,6 +542,11 @@ class BinaryViceTransport:
         would run past ``$FFFF`` raises :class:`ValueError` rather than
         silently wrapping back to ``$0000``.  A ``bool`` address raises
         :class:`ValueError` before anything else (#352).
+
+        Leaves the 6510 halted until :meth:`resume` -- deliberately, so a
+        sequence of reads sees one consistent machine.  To wait on a value
+        a running program will write, use
+        :func:`~c64_test_harness.memory.wait_for_memory` (issue #514).
         """
         # bool subclasses int: True would read $0001, the 6510 processor
         # port.  Refused first, like the Ultimate 64 entry points (#340,

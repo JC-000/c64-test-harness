@@ -1584,6 +1584,10 @@ class _ClientReadMemoryAdapter:
 
     __slots__ = ("_client",)
 
+    #: DMA reads do not halt the CPU, so the watcher must not send
+    #: ``resume()`` -- which this adapter does not even have (#514).
+    halts_cpu_on_access = False
+
     def __init__(self, client: Ultimate64Client) -> None:
         self._client = client
 

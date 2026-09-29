@@ -148,8 +148,8 @@ class ScreenGrid:
 def _resume_quietly(transport: C64Transport) -> bool:
     """Resume the CPU; return whether the resume was actually delivered.
 
-    Both waiters poll through the binary monitor, which halts the machine
-    for every read; without a resume the C64 does not advance between
+    Both screen waiters and :func:`~.memory.wait_for_memory` poll through
+    the binary monitor, which halts the machine for every read; without a resume the C64 does not advance between
     polls and a running program is indistinguishable from a hung one.
 
     Failures are logged at WARNING and never re-raised.  Two reasons, and
@@ -180,7 +180,7 @@ def _resume_quietly(transport: C64Transport) -> bool:
         # Not a transient: this transport structurally cannot resume, so
         # every waiter run against it silently breaks the contract.
         logger.warning(
-            "%s.resume() is not implemented; the screen waiters cannot "
+            "%s.resume() is not implemented; the waiters (screen, memory) cannot "
             "guarantee the CPU is running on return for this transport.",
             type(transport).__name__,
         )
