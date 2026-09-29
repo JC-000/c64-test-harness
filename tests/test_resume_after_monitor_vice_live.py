@@ -439,3 +439,25 @@ def test_a_text_monitor_stop_is_not_taken_for_a_stale_trap(text_monitor_transpor
     assert verdicts, "no confirmed resume happened"
     assert "stale" not in verdicts, verdicts
     assert not wrong, f"get_warp() misread {len(wrong)} of {calls[0]} replies"
+
+
+def test_a_text_command_outwaits_a_long_binary_wait(text_monitor_transport):
+    # #516 combined re-verify: the text-command deadline started before the
+    # binary lock was taken, so a get_warp() queued behind a binary
+    # exchange longer than ``timeout`` (the reviewer used a
+    # wait_for_stopped(timeout=7)) failed having read nothing, and its
+    # orphaned marker left the next one failing too.  The lock is held
+    # here directly, for longer than ``timeout``, with the machine running.
+    import threading
+
+    t = text_monitor_transport
+    t.timeout = 2.0
+    t.resume()
+    t._lock.acquire()
+    releaser = threading.Timer(3.0, t._lock.release)
+    releaser.start()
+    try:
+        assert t.get_warp() is True
+    finally:
+        releaser.join()
+    assert t.get_warp() is True

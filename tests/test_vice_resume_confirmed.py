@@ -22,6 +22,8 @@ import struct
 import threading
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from c64_test_harness.backends.vice_binary import (
     API_VERSION,
     CMD_EXIT,
@@ -154,6 +156,7 @@ def test_a_text_monitor_command_waits_for_the_binary_lock():
     import time as _time
 
     t = _transport(_ScriptedSocket([]))
+    t.timeout = 0.3
     sent = threading.Event()
     text_sock = MagicMock()
     text_sock.sendall.side_effect = lambda data: sent.set()
@@ -222,6 +225,32 @@ def test_exit_and_window_happen_under_one_lock_hold():
     assert t._resume_confirmed(window=0.01) is True
     joined = " ".join(log)
     assert joined.count("acquire exit window release") == 2, joined
+
+
+def test_a_checkpoint_frame_too_short_to_read_counts_as_a_stop():
+    # The stop flag is byte 9; a frame that does not reach it cannot say it
+    # is a tracepoint, and resuming over a real stop is the worse mistake.
+    sock = _ScriptedSocket([[EVENT_RESUMED, (RESPONSE_CHECKPOINT_INFO, b"\x01" * 9)]])
+    t = _transport(sock)
+    assert t._resume_confirmed(window=0.01) is False
+    assert sock.exits == 1
+
+
+def test_events_queued_before_the_exit_are_aged_out():
+    # Like resume(), the confirmed resume bumps the generation, so a Stopped
+    # left over from before it is not taken by wait_for_stopped as the
+    # machine stopping now.
+    from c64_test_harness.backends.vice_binary import _Response
+    from c64_test_harness.transport import TimeoutError as HarnessTimeout
+
+    sock = _ScriptedSocket([[EVENT_RESUMED]])
+    t = _transport(sock)
+    t._event_queue.append(
+        (t._resume_generation, _Response(EVENT_STOPPED, 0, EVENT_REQUEST_ID, b""))
+    )
+    assert t._resume_confirmed(window=0.01) is True
+    with pytest.raises(HarnessTimeout):
+        t.wait_for_stopped(timeout=0.05)
 
 
 def test_a_jam_is_not_resumed_over_and_stays_queued():
