@@ -526,29 +526,52 @@ def test_the_fork_guard_is_still_reentrant_in_a_forked_child():
     assert out == "returned", f"forked child: {out}"
 
 
+@pytest.mark.parametrize("in_forked_child", [False, True])
 def test_a_signal_handler_that_stops_vice_inside_the_registry_lock_does_not_hang(
-    stub_x64sc,
+    stub_x64sc, in_forked_child,
 ):
     """A SIGTERM-style handler calling stop() while the interrupted code
-    holds the at-exit registry lock (#515's lock)."""
+    holds the at-exit registry lock (#515's lock) -- in the launching
+    process, and in a forked child, which re-creates that lock."""
     launcher, sleeper = stub_x64sc
     out = _run_script(
         f"""
-        import os, signal
+        import os, signal, time
         from c64_test_harness.backends import vice_lifecycle as vl
-        p = vl.ViceProcess(vl.ViceConfig(executable={str(launcher)!r},
-                                          sound=False))
-        p.start()
-        pid = p.pid
-        signal.signal(signal.SIGUSR1, lambda s, f: p.stop())
-        with vl._LIVE_LOCK:
-            signal.raise_signal(signal.SIGUSR1)
-        print(pid, flush=True)
-        print("returned", flush=True)
+
+        def scenario():
+            p = vl.ViceProcess(vl.ViceConfig(executable={str(launcher)!r},
+                                              sound=False))
+            p.start()
+            signal.signal(signal.SIGUSR1, lambda s, f: p.stop())
+            with vl._LIVE_LOCK:
+                signal.raise_signal(signal.SIGUSR1)
+
+        if not {in_forked_child!r}:
+            scenario()
+            print("returned", flush=True)
+        else:
+            child = os.fork()
+            if child == 0:
+                scenario()
+                os._exit(0)
+            deadline = time.monotonic() + 15
+            status = "hung"
+            while time.monotonic() < deadline:
+                pid, code = os.waitpid(child, os.WNOHANG)
+                if pid:
+                    status = "returned" if code == 0 else f"exit-{{code}}"
+                    break
+                time.sleep(0.05)
+            if status == "hung":
+                # Its watchdog then stops the child's stand-in x64sc.
+                os.kill(child, signal.SIGKILL)
+                os.waitpid(child, 0)
+            print(status, flush=True)
         """,
         timeout=30,
     )
-    assert out == "returned", "stop() from a signal handler deadlocked"
+    assert out == "returned", f"stop() from a signal handler: {out}"
 
 
 def _ack_thread(pid: int):
@@ -653,10 +676,18 @@ def test_a_confirmation_thread_that_cannot_start_does_not_fail_the_launch(
     assert any("confirmation" in r.getMessage() for r in caplog.records)
 
 
-def test_a_python_without_ctypes_still_gets_a_watchdog(
-    stub_x64sc, monkeypatch,
+def test_a_launcher_without_ctypes_does_not_fail_the_launch(
+    stub_x64sc, monkeypatch, caplog,
 ):
-    """start_time() falls back to ps; nothing about ctypes may fail start()."""
+    """Nothing about ctypes may fail start(): the launcher's start_time()
+    falls back to ``ps``.
+
+    Only the launcher is ctypes-less here.  The watchdog (a separate
+    ``python -I``) still reads microseconds, so the ``lstart:`` token the
+    launcher sends does not match and the arm is refused -- fail safe,
+    and reported.  On a Python that truly lacks ctypes both sides use
+    ``ps`` and the tokens match.
+    """
     from c64_test_harness.backends import vice_watchdog as vw
 
     launcher, sleeper = stub_x64sc
@@ -664,12 +695,19 @@ def test_a_python_without_ctypes_still_gets_a_watchdog(
     monkeypatch.setitem(sys.modules, "ctypes", None)   # import -> ImportError
     monkeypatch.setitem(sys.modules, "ctypes.util", None)
     p = ViceProcess(ViceConfig(executable=str(launcher), sound=False))
-    try:
-        p.start()
-        assert p._watchdog is not None
-        assert start_time(p.pid) is not None
-    finally:
-        p.stop()
+    with caplog.at_level(logging.WARNING, logger=vice_lifecycle.__name__):
+        try:
+            p.start()
+            assert p._watchdog is not None
+            assert start_time(p.pid).startswith("lstart:")
+            t = _ack_thread(p.pid)
+            assert t is not None
+            t.join(timeout=DEATH_BOUND)
+        finally:
+            p.stop()
+    assert any("refused the arm" in m for m in _unguarded(caplog)), (
+        [r.getMessage() for r in caplog.records]
+    )
 
 
 # ---------------------------------------------------------------------------
