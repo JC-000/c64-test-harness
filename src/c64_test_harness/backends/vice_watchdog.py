@@ -75,13 +75,13 @@ def _libc():
     """libc via ctypes, loaded once (the cold load is ~12 ms on macOS)."""
     global _LIBC
     if _LIBC is None:
-        import ctypes
-        import ctypes.util
-
         try:
+            import ctypes
+            import ctypes.util
+
             _LIBC = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-        except OSError:
-            _LIBC = False
+        except (ImportError, OSError):
+            _LIBC = False  # start_time() falls back to ps
     return _LIBC or None
 
 
@@ -101,11 +101,11 @@ def _darwin_start_time(pid: int) -> str | None:
     two pointers and ``p_flag``, so ``p_stat`` is the char at offset 36
     (``SZOMB`` = 5; checked against ``ps -o stat`` on macOS 27).
     """
-    import ctypes
-
     libc = _libc()
     if libc is None:
         return None
+    import ctypes
+
     try:
         mib = (ctypes.c_int * 4)(1, 14, 1, pid)  # CTL_KERN, KERN_PROC, KERN_PROC_PID
         buf = ctypes.create_string_buffer(1024)

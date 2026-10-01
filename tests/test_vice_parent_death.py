@@ -23,6 +23,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 
@@ -433,6 +434,242 @@ def test_a_fork_during_pipe_creation_does_not_keep_the_write_end(stub_x64sc):
     assert res.stdout.split()[-1] == "closed", (
         "a child forked mid-spawn kept the watchdog pipe's write end"
     )
+
+
+def _run_script(body: str, timeout: float = 30.0) -> str:
+    """Run *body* in a child interpreter; a hang is reported, not waited on."""
+    try:
+        res = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(body)],
+            capture_output=True, text=True, timeout=timeout,
+            env=dict(os.environ, PYTHONPATH=SRC, PYTHONDONTWRITEBYTECODE="1"),
+        )
+    except subprocess.TimeoutExpired:
+        return "hung"
+    assert res.returncode == 0, res.stderr
+    return res.stdout.split()[-1]
+
+
+def test_a_signal_handler_that_forks_inside_the_fork_guard_does_not_hang():
+    """A handler runs on the thread that holds the guard; its fork must not
+    wait for that thread (a non-reentrant lock deadlocks here)."""
+    out = _run_script(
+        """
+        import os, signal
+        from c64_test_harness.backends import vice_lifecycle as vl
+        children = []
+        def handler(signum, frame):
+            pid = os.fork()
+            if pid == 0:
+                os._exit(0)
+            children.append(pid)
+        signal.signal(signal.SIGUSR1, handler)
+        real_pipe = os.pipe
+        def pipe():
+            ends = real_pipe()
+            vl.os.pipe = real_pipe          # only the first pipe
+            signal.raise_signal(signal.SIGUSR1)   # inside the guard
+            return ends
+        vl.os.pipe = pipe
+        wd = vl._ParentDeathWatchdog.spawn()
+        wd.retire()
+        os.waitpid(children[0], 0)
+        print("returned", flush=True)
+        """,
+        timeout=20,
+    )
+    assert out == "returned", "a fork from a signal handler deadlocked"
+
+
+def test_the_fork_guard_is_still_reentrant_in_a_forked_child():
+    """The child re-creates the guard after fork; a signal-handler fork
+    inside the guard must not deadlock there either."""
+    out = _run_script(
+        """
+        import os, signal, time
+        from c64_test_harness.backends import vice_lifecycle as vl
+        child = os.fork()
+        if child == 0:
+            grandchildren = []
+            def handler(signum, frame):
+                pid = os.fork()
+                if pid == 0:
+                    os._exit(0)
+                grandchildren.append(pid)
+            signal.signal(signal.SIGUSR1, handler)
+            real_pipe = os.pipe
+            def pipe():
+                ends = real_pipe()
+                vl.os.pipe = real_pipe
+                signal.raise_signal(signal.SIGUSR1)
+                return ends
+            vl.os.pipe = pipe
+            wd = vl._ParentDeathWatchdog.spawn()
+            wd.retire()
+            os.waitpid(grandchildren[0], 0)
+            os._exit(0)
+        deadline = time.monotonic() + 15
+        status = "hung"
+        while time.monotonic() < deadline:
+            pid, code = os.waitpid(child, os.WNOHANG)
+            if pid:
+                status = "returned" if code == 0 else f"exit-{code}"
+                break
+            time.sleep(0.05)
+        if status == "hung":
+            os.kill(child, signal.SIGKILL)
+            os.waitpid(child, 0)
+        print(status, flush=True)
+        """,
+        timeout=30,
+    )
+    assert out == "returned", f"forked child: {out}"
+
+
+def test_a_signal_handler_that_stops_vice_inside_the_registry_lock_does_not_hang(
+    stub_x64sc,
+):
+    """A SIGTERM-style handler calling stop() while the interrupted code
+    holds the at-exit registry lock (#515's lock)."""
+    launcher, sleeper = stub_x64sc
+    out = _run_script(
+        f"""
+        import os, signal
+        from c64_test_harness.backends import vice_lifecycle as vl
+        p = vl.ViceProcess(vl.ViceConfig(executable={str(launcher)!r},
+                                          sound=False))
+        p.start()
+        pid = p.pid
+        signal.signal(signal.SIGUSR1, lambda s, f: p.stop())
+        with vl._LIVE_LOCK:
+            signal.raise_signal(signal.SIGUSR1)
+        print(pid, flush=True)
+        print("returned", flush=True)
+        """,
+        timeout=30,
+    )
+    assert out == "returned", "stop() from a signal handler deadlocked"
+
+
+def _ack_thread(pid: int):
+    for t in threading.enumerate():
+        if t.name == f"x64sc-watchdog-ack-{pid}":
+            return t
+    return None
+
+
+def _unguarded(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records
+            if "not guarded" in r.getMessage()]
+
+
+def test_a_healthy_launch_is_confirmed_without_a_warning(
+    stub_x64sc, monkeypatch, caplog,
+):
+    """Negative control for the arm confirmation: the real watchdog acks."""
+    launcher, sleeper = stub_x64sc
+    monkeypatch.setattr(vice_lifecycle, "_WATCHDOG_ACK_SECONDS", 2.0)
+    p = ViceProcess(ViceConfig(executable=str(launcher), sound=False))
+    with caplog.at_level(logging.WARNING, logger=vice_lifecycle.__name__):
+        try:
+            p.start()
+            t = _ack_thread(p.pid)
+            assert t is not None, "no confirmation thread was started"
+            t.join(timeout=DEATH_BOUND)
+            assert not t.is_alive()
+        finally:
+            p.stop()
+    assert _unguarded(caplog) == []
+
+
+def _silent_interpreter(tmp_path: Path) -> Path:
+    """Starts, holds its pipes open, never runs the watchdog: no ack."""
+    silent = tmp_path / "silent-python"
+    silent.write_text("#!/bin/sh\nexec /bin/sleep 30\n")
+    silent.chmod(0o755)
+    return silent
+
+
+def test_no_warning_when_x64sc_exited_before_the_confirmation_window(
+    stub_x64sc, tmp_path, monkeypatch, caplog,
+):
+    launcher, sleeper = stub_x64sc
+    monkeypatch.setattr(sys, "executable", str(_silent_interpreter(tmp_path)))
+    monkeypatch.setattr(vice_lifecycle, "_WATCHDOG_ACK_SECONDS", 1.5)
+    p = ViceProcess(ViceConfig(executable=str(launcher), sound=False,
+                               env=dict(os.environ, STUB_SECS="0.2")))
+    with caplog.at_level(logging.WARNING, logger=vice_lifecycle.__name__):
+        try:
+            p.start()
+            t = _ack_thread(p.pid)
+            assert t is not None
+            t.join(timeout=DEATH_BOUND)   # x64sc exits during the window
+            assert p._proc.poll() is not None, "test setup: x64sc still runs"
+        finally:
+            p.stop()
+    assert _unguarded(caplog) == []
+
+
+def test_detach_before_the_watchdog_answers_does_not_warn(
+    stub_x64sc, tmp_path, monkeypatch, caplog,
+):
+    """detach() retires a watchdog that never answered; the confirmation
+    thread then sees EOF, which is not a reason to warn."""
+    launcher, sleeper = stub_x64sc
+    monkeypatch.setattr(sys, "executable", str(_silent_interpreter(tmp_path)))
+    monkeypatch.setattr(vice_lifecycle, "_WATCHDOG_ACK_SECONDS", 5.0)
+    p = ViceProcess(ViceConfig(executable=str(launcher), sound=False))
+    with caplog.at_level(logging.WARNING, logger=vice_lifecycle.__name__):
+        try:
+            p.start()
+            t = _ack_thread(p.pid)
+            assert t is not None
+            p.detach()                    # reaps the silent watchdog: EOF
+            t.join(timeout=DEATH_BOUND)
+            assert not t.is_alive()
+        finally:
+            p.stop()
+    assert _unguarded(caplog) == []
+
+
+def test_a_confirmation_thread_that_cannot_start_does_not_fail_the_launch(
+    stub_x64sc, monkeypatch, caplog,
+):
+    launcher, sleeper = stub_x64sc
+
+    class NoThreads(threading.Thread):
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(vice_lifecycle.threading, "Thread", NoThreads)
+    p = ViceProcess(ViceConfig(executable=str(launcher), sound=False))
+    with caplog.at_level(logging.WARNING, logger=vice_lifecycle.__name__):
+        try:
+            p.start()
+            assert p in vice_lifecycle._LIVE_PROCESSES
+            assert p._watchdog is not None
+        finally:
+            p.stop()
+    assert any("confirmation" in r.getMessage() for r in caplog.records)
+
+
+def test_a_python_without_ctypes_still_gets_a_watchdog(
+    stub_x64sc, monkeypatch,
+):
+    """start_time() falls back to ps; nothing about ctypes may fail start()."""
+    from c64_test_harness.backends import vice_watchdog as vw
+
+    launcher, sleeper = stub_x64sc
+    monkeypatch.setattr(vw, "_LIBC", None)
+    monkeypatch.setitem(sys.modules, "ctypes", None)   # import -> ImportError
+    monkeypatch.setitem(sys.modules, "ctypes.util", None)
+    p = ViceProcess(ViceConfig(executable=str(launcher), sound=False))
+    try:
+        p.start()
+        assert p._watchdog is not None
+        assert start_time(p.pid) is not None
+    finally:
+        p.stop()
 
 
 # ---------------------------------------------------------------------------

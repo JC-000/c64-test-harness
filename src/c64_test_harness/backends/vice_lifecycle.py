@@ -70,7 +70,9 @@ _warned_sid_unemulated = False
 # has its x64sc stopped when the interpreter exits (#514 candidate 3).
 # ViceProcess.detach() opts a process out.
 _LIVE_PROCESSES: set["ViceProcess"] = set()
-_LIVE_LOCK = threading.Lock()
+# Reentrant: a signal handler that calls stop() runs on whichever thread
+# it interrupted, possibly one inside this lock (#518 review).
+_LIVE_LOCK = threading.RLock()
 
 
 def _stop_live_processes() -> None:
@@ -107,7 +109,7 @@ def _forget_parent_processes() -> None:
     the parent's x64sc alive past a SIGKILL of the parent.  Close them.
     """
     global _LIVE_LOCK
-    _LIVE_LOCK = threading.Lock()
+    _LIVE_LOCK = threading.RLock()
     _LIVE_PROCESSES.clear()
     for watchdog in list(_WATCHDOGS):
         watchdog._abandon_in_child()
@@ -132,7 +134,12 @@ _WATCHDOG_ACK_SECONDS = 10.0
 # is in it; a fork from another thread waits for it (_hold_forks), so no
 # child copies an unregistered write end.  Kept separate from _LIVE_LOCK
 # so a fork taken while some thread holds that lock cannot deadlock here.
-_FORK_GUARD = threading.Lock()
+# Reentrant, because a signal handler that forks runs on the thread it
+# interrupted, which may be the one holding the guard; that fork goes
+# ahead, and the child keeps the not-yet-registered write end (the one
+# case this guard cannot cover -- the parent's x64sc then outlives a
+# SIGKILL of the parent for as long as that child lives).
+_FORK_GUARD = threading.RLock()
 
 
 def _warn_unguarded(pid: int, token: str, why: str) -> None:
@@ -145,8 +152,12 @@ def _warn_unguarded(pid: int, token: str, why: str) -> None:
     )
 
 
-def _await_arm_ack(fd: int, pid: int, token: str) -> None:
-    """Thread: wait for the watchdog's ``A``; warn on anything else."""
+def _await_arm_ack(
+    fd: int, pid: int, token: str, watchdog: "_ParentDeathWatchdog",
+) -> None:
+    """Thread: wait for the watchdog's ``A``; warn on anything else,
+    unless the watchdog was retired meanwhile (stop/detach: no guard is
+    wanted any more, and a retire that had to SIGKILL it reads as EOF)."""
     import select
 
     try:
@@ -169,7 +180,7 @@ def _await_arm_ack(fd: int, pid: int, token: str) -> None:
             os.close(fd)
         except OSError:
             pass
-    if not data.startswith(b"A"):
+    if not data.startswith(b"A") and not watchdog._retired:
         why = {b"R": "the watchdog refused the arm"}.get(
             data[:1], "the parent-death watchdog never confirmed the arm "
             f"(interpreter {sys.executable!r})",
@@ -192,6 +203,7 @@ class _ParentDeathWatchdog:
     """
 
     def __init__(self, wfd: int) -> None:
+        self._retired = False
         self.pid: int | None = None
         self._wfd: int | None = wfd
         self._ack_fd: int | None = None
@@ -221,17 +233,14 @@ class _ParentDeathWatchdog:
             try:
                 ack_r, ack_w = os.pipe()
                 try:
-                    if r <= 2:
-                        # dup2(r, 0) with r == 0 would keep O_CLOEXEC.
-                        import fcntl
-                        moved = fcntl.fcntl(r, fcntl.F_DUPFD_CLOEXEC, 3)
-                        os.close(r)
-                        r = moved
-                    if ack_w <= 2:
-                        import fcntl
-                        moved = fcntl.fcntl(ack_w, fcntl.F_DUPFD_CLOEXEC, 3)
-                        os.close(ack_w)
-                        ack_w = moved
+                    # dup2(fd, n) with fd == n would keep O_CLOEXEC, and
+                    # a source in 0..2 could be overwritten by an earlier
+                    # file action.  r is the first fd allocated here and
+                    # can be 0 (stdin closed); ack_w is the fourth, and
+                    # os.pipe() returns the lowest free fds, so it is >= 3
+                    # unless another thread closes a low fd in between.
+                    r = _above_stdio(r)
+                    ack_w = _above_stdio(ack_w)
                     watchdog.pid = os.posix_spawn(
                         sys.executable,
                         [sys.executable, "-I", str(_WATCHDOG_SCRIPT),
@@ -265,7 +274,8 @@ class _ParentDeathWatchdog:
                 watchdog.retire()
                 raise
             watchdog._ack_fd = ack_r
-        except (OSError, AttributeError, NotImplementedError) as exc:
+        except (OSError, AttributeError, NotImplementedError,
+                ImportError) as exc:
             if not _warned_watchdog_unavailable:
                 _warned_watchdog_unavailable = True
                 _log.warning(
@@ -305,13 +315,22 @@ class _ParentDeathWatchdog:
         if ack_fd is not None:
             # Confirmed off the launch path: start() does not wait for the
             # watchdog's interpreter to come up.
-            threading.Thread(
-                target=_await_arm_ack, args=(ack_fd, target_pid, token),
-                name=f"x64sc-watchdog-ack-{target_pid}", daemon=True,
-            ).start()
+            try:
+                threading.Thread(
+                    target=_await_arm_ack,
+                    args=(ack_fd, target_pid, token, self),
+                    name=f"x64sc-watchdog-ack-{target_pid}", daemon=True,
+                ).start()
+            except RuntimeError as exc:  # thread limit, or finalising
+                os.close(ack_fd)
+                _log.warning(
+                    "x64sc PID %d: the parent-death watchdog was armed, but "
+                    "its confirmation cannot be awaited (%s)", target_pid, exc,
+                )
 
     def retire(self) -> None:
         """Disarm, close the pipe and reap.  The target is left untouched."""
+        self._retired = True
         ack_fd, self._ack_fd = self._ack_fd, None
         if ack_fd is not None:
             os.close(ack_fd)  # never armed: nothing to confirm
@@ -355,6 +374,17 @@ class _ParentDeathWatchdog:
                 pass
 
 
+def _above_stdio(fd: int) -> int:
+    """*fd*, or a close-on-exec duplicate of it at 3 or above."""
+    if fd > 2:
+        return fd
+    import fcntl
+
+    moved = fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 3)
+    os.close(fd)
+    return moved
+
+
 def _hold_forks() -> None:
     _FORK_GUARD.acquire()
 
@@ -365,7 +395,7 @@ def _release_forks() -> None:
 
 def _after_fork_in_child() -> None:
     global _FORK_GUARD
-    _FORK_GUARD = threading.Lock()
+    _FORK_GUARD = threading.RLock()
     _forget_parent_processes()
 
 
@@ -1038,7 +1068,9 @@ class ViceProcess:
     logged at WARNING naming the x64sc PID.  Unguarded windows that remain:
     from ``Popen`` returning to the arm being written (well under 1 ms
     measured on macOS, the start time being read via ``sysctl``), and the
-    lifetime of the watchdog process itself, if something kills it.
+    lifetime of the watchdog process itself, if something kills it; and a
+    signal handler that forks while the same thread is inside the
+    watchdog's pipe set-up, whose child keeps the pipe open while it lives.
     """
 
     def __init__(self, config: ViceConfig) -> None:
