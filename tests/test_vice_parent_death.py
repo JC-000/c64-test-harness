@@ -16,7 +16,9 @@ signals, and above all what it refuses to signal.
 from __future__ import annotations
 
 import io
+import logging
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -244,6 +246,193 @@ def test_failed_launch_retires_the_watchdog(tmp_path):
     with pytest.raises(OSError):
         p.start()
     assert not vice_lifecycle._WATCHDOGS
+
+
+def test_consumer_pipes_are_not_held_open_by_the_watchdog(stub_x64sc):
+    """posix_spawn hands the watchdog every *inheritable* fd above stderr.
+    A consumer's inheritable pipe must still reach EOF when the consumer
+    closes its write end, not only when the emulator is stopped."""
+    launcher, sleeper = stub_x64sc
+    rp, wp = os.pipe()
+    os.set_inheritable(wp, True)
+    p = ViceProcess(ViceConfig(executable=str(launcher), sound=False))
+    try:
+        p.start()
+        assert p._watchdog is not None, "no watchdog was started"
+        # Let the watchdog get past its start-up fd sweep.
+        time.sleep(0.5)
+        os.close(wp)
+        wp = None
+        readable, _, _ = select.select([rp], [], [], 2.0)
+        assert readable and os.read(rp, 1) == b"", (
+            "the consumer's pipe saw no EOF: the watchdog holds its write end"
+        )
+    finally:
+        if wp is not None:
+            os.close(wp)
+        os.close(rp)
+        p.stop()
+
+
+def test_launcher_with_stdin_closed_still_takes_its_x64sc_with_it(stub_x64sc):
+    """With fd 0 closed, os.pipe() returns the read end as fd 0; dup2'ing
+    it onto the watchdog's stdin would then leave it close-on-exec."""
+    launcher, sleeper = stub_x64sc
+    run = Launcher("os.close(0)\n" + STUB_LAUNCH
+                   + "print(p.pid, flush=True)\nos.kill(os.getpid(), 9)\n",
+                   {"STUB": str(launcher)})
+    pid = int(run.tokens[0])
+    try:
+        run.proc.wait(timeout=10)
+        assert run.proc.returncode == -signal.SIGKILL
+        assert _wait_dead(pid, DEATH_BOUND), (
+            f"x64sc stand-in {pid} outlived a SIGKILLed launcher that had "
+            "closed its stdin"
+        )
+    finally:
+        run.close()
+        _kill_if_ours(pid, sleeper)
+
+
+def test_an_interpreter_that_cannot_run_the_watchdog_is_reported(
+    stub_x64sc, monkeypatch, caplog,
+):
+    """sys.executable starts but does not run the script (an embedded host,
+    a frozen app): the launch is unguarded, and it must say so."""
+    launcher, sleeper = stub_x64sc
+    monkeypatch.setattr(sys, "executable", "/usr/bin/true")
+    p = ViceProcess(ViceConfig(executable=str(launcher), sound=False))
+    vpid = None
+    with caplog.at_level(logging.WARNING, logger=vice_lifecycle.__name__):
+        try:
+            p.start()
+            vpid = p.pid
+            deadline = time.monotonic() + DEATH_BOUND
+            while time.monotonic() < deadline and not any(
+                "not guarded" in r.getMessage() for r in caplog.records
+            ):
+                time.sleep(0.05)
+        finally:
+            p.stop()
+    assert any(
+        "not guarded" in r.getMessage() and str(vpid) in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+
+
+def test_a_watchdog_that_never_confirms_the_arm_is_reported(
+    stub_x64sc, tmp_path, monkeypatch, caplog,
+):
+    """The interpreter starts and keeps reading -- the arm is delivered --
+    but never runs the watchdog, so no confirmation comes back."""
+    launcher, sleeper = stub_x64sc
+    mute = tmp_path / "mute-python"
+    mute.write_text("#!/bin/sh\nexec cat > /dev/null\n")
+    mute.chmod(0o755)
+    monkeypatch.setattr(sys, "executable", str(mute))
+    monkeypatch.setattr(vice_lifecycle, "_WATCHDOG_ACK_SECONDS", 1.0)
+    p = ViceProcess(ViceConfig(executable=str(launcher), sound=False))
+    vpid = None
+    with caplog.at_level(logging.WARNING, logger=vice_lifecycle.__name__):
+        try:
+            p.start()
+            vpid = p.pid
+            assert p._watchdog is not None
+            deadline = time.monotonic() + DEATH_BOUND
+            while time.monotonic() < deadline and not any(
+                "never confirmed" in r.getMessage() for r in caplog.records
+            ):
+                time.sleep(0.05)
+        finally:
+            p.stop()
+    assert any(
+        "never confirmed" in r.getMessage() and str(vpid) in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+
+
+def test_an_arm_that_cannot_be_sent_is_reported(
+    stub_x64sc, monkeypatch, caplog,
+):
+    """The watchdog's pipe refuses the write (it died first)."""
+    launcher, sleeper = stub_x64sc
+    monkeypatch.setattr(vice_lifecycle._ParentDeathWatchdog, "_send",
+                        lambda self, message: False)
+    p = ViceProcess(ViceConfig(executable=str(launcher), sound=False))
+    with caplog.at_level(logging.WARNING, logger=vice_lifecycle.__name__):
+        try:
+            p.start()
+            vpid = p.pid
+        finally:
+            p.stop()
+    assert any(
+        "could not be sent" in r.getMessage() and str(vpid) in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+
+
+def test_a_frozen_application_skips_the_watchdog_with_a_warning(
+    stub_x64sc, monkeypatch, caplog,
+):
+    launcher, sleeper = stub_x64sc
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(vice_lifecycle, "_warned_watchdog_unavailable", False)
+    p = ViceProcess(ViceConfig(executable=str(launcher), sound=False))
+    with caplog.at_level(logging.WARNING, logger=vice_lifecycle.__name__):
+        try:
+            p.start()
+            assert p._watchdog is None, "a frozen app ran sys.executable"
+        finally:
+            p.stop()
+    assert any("watchdog unavailable" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_a_fork_during_pipe_creation_does_not_keep_the_write_end(stub_x64sc):
+    """Another thread forks between os.pipe() and the watchdog's
+    registration: the child must still not hold the write end."""
+    launcher, _ = stub_x64sc
+    res = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(
+            """
+            import os, sys, threading, time
+            from c64_test_harness.backends import vice_lifecycle as vl
+            made, ends = threading.Event(), []
+            real_pipe = os.pipe
+            def slow_pipe():
+                r, w = real_pipe()
+                ends.append(w)
+                made.set()
+                time.sleep(0.3)      # preempted right after the pipe
+                return r, w
+            vl.os.pipe = slow_pipe
+            results = []
+            def forker():
+                made.wait()
+                vl.os.pipe = real_pipe
+                child = os.fork()
+                if child == 0:
+                    try:
+                        os.fstat(ends[0])
+                        os._exit(1)      # write end still open
+                    except OSError:
+                        os._exit(0)
+                results.append(os.waitpid(child, 0)[1])
+            t = threading.Thread(target=forker)
+            t.start()
+            wd = vl._ParentDeathWatchdog.spawn()
+            t.join()
+            wd.retire()
+            print("held" if results[0] else "closed", flush=True)
+            """)],
+        capture_output=True, text=True, timeout=60,
+        env=dict(os.environ, PYTHONPATH=SRC, PYTHONDONTWRITEBYTECODE="1",
+                 STUB=str(launcher)),
+    )
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.split()[-1] == "closed", (
+        "a child forked mid-spawn kept the watchdog pipe's write end"
+    )
 
 
 # ---------------------------------------------------------------------------

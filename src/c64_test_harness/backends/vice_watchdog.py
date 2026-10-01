@@ -14,7 +14,9 @@ only the launcher holds)::
     T <pid> <start>\\n
                 arm: watch this process, whose start-time token (see
                 ``start_time``) the launcher read while the PID was its
-                own unreaped child and so could not have been reused
+                own unreaped child and so could not have been reused.
+                The watchdog answers on stdout: ``A`` armed, ``R`` refused.
+                The launcher warns when no ``A`` arrives.
     D\\n         disarm: exit without touching anything (stop/detach)
     EOF         the launcher is gone -- by exit, crash or any signal,
                 because the kernel closes its descriptors -- so terminate
@@ -66,6 +68,30 @@ def _ps(pid: int, fields: str) -> str:
         return ""
 
 
+_LIBC: object = None
+
+
+def _libc():
+    """libc via ctypes, loaded once (the cold load is ~12 ms on macOS)."""
+    global _LIBC
+    if _LIBC is None:
+        import ctypes
+        import ctypes.util
+
+        try:
+            _LIBC = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        except OSError:
+            _LIBC = False
+    return _LIBC or None
+
+
+def warm() -> None:
+    """Pay :func:`start_time`'s one-off cost now, without running anything
+    (on macOS: the ctypes import and libc lookup)."""
+    if sys.platform == "darwin":
+        _libc()
+
+
 def _darwin_start_time(pid: int) -> str | None:
     """``p_starttime`` of *pid* in microseconds, via ``sysctl``; "" for a
     zombie or a missing process; None if sysctl itself is unavailable.
@@ -76,10 +102,11 @@ def _darwin_start_time(pid: int) -> str | None:
     (``SZOMB`` = 5; checked against ``ps -o stat`` on macOS 27).
     """
     import ctypes
-    import ctypes.util
 
+    libc = _libc()
+    if libc is None:
+        return None
     try:
-        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
         mib = (ctypes.c_int * 4)(1, 14, 1, pid)  # CTL_KERN, KERN_PROC, KERN_PROC_PID
         buf = ctypes.create_string_buffer(1024)
         size = ctypes.c_size_t(len(buf))
@@ -137,12 +164,14 @@ class Watchdog:
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
         grace: float = GRACE_SECONDS,
+        ack: Callable[[bytes], None] | None = None,
     ) -> None:
         self._start_of = start_of
         self._kill = kill
         self._sleep = sleep
         self._clock = clock
         self._grace = grace
+        self._ack = ack or (lambda _msg: None)
 
     def run(self, stream: BinaryIO) -> str:
         """Serve the protocol until disarm or EOF; return the outcome."""
@@ -162,8 +191,10 @@ class Watchdog:
                 if self._start_of(pid) != claimed:
                     # Already gone, or the PID is not the process the
                     # launcher named: never ours to signal.
+                    self._ack(b"R\n")
                     return "refused"
                 target, start = pid, claimed
+                self._ack(b"A\n")
         if target is None:
             return "unarmed"
         return self.terminate(target, start)
@@ -213,6 +244,16 @@ def _close_inherited_fds() -> None:
     os.closerange(3, 4096)
 
 
+def _ack_on_stdout(message: bytes) -> None:
+    """Tell the launcher whether the arm was accepted (``A``) or refused
+    (``R``).  stdout is the write end of the launcher's ack pipe."""
+    try:
+        os.write(1, message)
+        os.close(1)
+    except OSError:
+        pass  # the launcher stopped listening: nothing to tell it
+
+
 def main(argv: list[str]) -> int:
     # Keep only stdin (the pipe), stdout and stderr: anything else this
     # process inherited belongs to someone else, and holding a pipe's
@@ -221,7 +262,7 @@ def main(argv: list[str]) -> int:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     # argv[1] is the launcher's PID: informational only, for ``ps``.
-    Watchdog().run(sys.stdin.buffer)
+    Watchdog(ack=_ack_on_stdout).run(sys.stdin.buffer)
     return 0
 
 

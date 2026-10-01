@@ -124,6 +124,59 @@ _watchdog_start_time = vice_watchdog.start_time
 #: Seconds retire() waits for a disarmed watchdog to exit before SIGKILL.
 _WATCHDOG_REAP_SECONDS = 2.0
 
+#: Seconds the arm confirmation may take before the launch is reported
+#: unguarded.  Measured cold start of the watchdog is tens of ms.
+_WATCHDOG_ACK_SECONDS = 10.0
+
+# Guards _WATCHDOGS, and is held from os.pipe() until the new write end
+# is in it; a fork from another thread waits for it (_hold_forks), so no
+# child copies an unregistered write end.  Kept separate from _LIVE_LOCK
+# so a fork taken while some thread holds that lock cannot deadlock here.
+_FORK_GUARD = threading.Lock()
+
+
+def _warn_unguarded(pid: int, token: str, why: str) -> None:
+    if _watchdog_start_time(pid) != token:
+        return  # x64sc already exited: nothing was left unguarded
+    _log.warning(
+        "x64sc PID %d is not guarded against this process being killed by "
+        "a signal: %s.  It will outlive this process unless stop() runs.",
+        pid, why,
+    )
+
+
+def _await_arm_ack(fd: int, pid: int, token: str) -> None:
+    """Thread: wait for the watchdog's ``A``; warn on anything else."""
+    import select
+
+    try:
+        data = b""
+        deadline = time.monotonic() + _WATCHDOG_ACK_SECONDS
+        while b"\n" not in data:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            if not select.select([fd], [], [], left)[0]:
+                break
+            chunk = os.read(fd, 16)
+            if not chunk:
+                break
+            data += chunk
+    except OSError:
+        data = b""
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    if not data.startswith(b"A"):
+        why = {b"R": "the watchdog refused the arm"}.get(
+            data[:1], "the parent-death watchdog never confirmed the arm "
+            f"(interpreter {sys.executable!r})",
+        )
+        _warn_unguarded(pid, token, why)
+
+
 # Every watchdog whose pipe write end this process holds.
 _WATCHDOGS: set["_ParentDeathWatchdog"] = set()
 _warned_watchdog_unavailable = False
@@ -138,51 +191,80 @@ class _ParentDeathWatchdog:
     the armed target; :meth:`retire` disarms it first.
     """
 
-    def __init__(self, pid: int, wfd: int) -> None:
-        self.pid: int | None = pid
+    def __init__(self, wfd: int) -> None:
+        self.pid: int | None = None
         self._wfd: int | None = wfd
+        self._ack_fd: int | None = None
 
     @classmethod
     def spawn(cls) -> "_ParentDeathWatchdog | None":
         """Start a watchdog, or return None (WARNING once) if it cannot be."""
         global _warned_watchdog_unavailable
         try:
+            if getattr(sys, "frozen", False):
+                raise OSError(
+                    "frozen application: sys.executable is not a Python "
+                    "interpreter"
+                )
             if not sys.executable or not _WATCHDOG_SCRIPT.is_file():
                 raise OSError("no interpreter or watchdog script to run")
-            r, w = os.pipe()  # both O_CLOEXEC (PEP 446)
+            # Warm the start-time reader (macOS: ctypes import and
+            # find_library, ~12 ms cold) so arm() is quick when it counts.
+            vice_watchdog.warm()
+            # Create and register the write end with forks held off, so
+            # no child can copy it before the at-fork hook knows to close
+            # it (see _hold_forks).
+            with _FORK_GUARD:
+                r, w = os.pipe()  # both O_CLOEXEC (PEP 446)
+                watchdog = cls(w)
+                _WATCHDOGS.add(watchdog)
             try:
-                if r <= 2:
-                    # dup2(r, 0) with r == 0 would keep O_CLOEXEC on stdin.
-                    import fcntl
-                    moved = fcntl.fcntl(r, fcntl.F_DUPFD_CLOEXEC, 3)
+                ack_r, ack_w = os.pipe()
+                try:
+                    if r <= 2:
+                        # dup2(r, 0) with r == 0 would keep O_CLOEXEC.
+                        import fcntl
+                        moved = fcntl.fcntl(r, fcntl.F_DUPFD_CLOEXEC, 3)
+                        os.close(r)
+                        r = moved
+                    if ack_w <= 2:
+                        import fcntl
+                        moved = fcntl.fcntl(ack_w, fcntl.F_DUPFD_CLOEXEC, 3)
+                        os.close(ack_w)
+                        ack_w = moved
+                    watchdog.pid = os.posix_spawn(
+                        sys.executable,
+                        [sys.executable, "-I", str(_WATCHDOG_SCRIPT),
+                         str(os.getpid())],
+                        os.environ,
+                        file_actions=[
+                            (os.POSIX_SPAWN_DUP2, r, 0),
+                            (os.POSIX_SPAWN_DUP2, ack_w, 1),
+                            (os.POSIX_SPAWN_OPEN, 2, os.devnull,
+                             os.O_WRONLY, 0),
+                        ],
+                        # Own session, so a signal sent to the launcher's
+                        # process group (terminal SIGINT/SIGHUP, kill --
+                        # -PGID) does not take the watchdog down with the
+                        # launcher.  Defence in depth: a plain x64sc
+                        # shares that group and gets the same signal, and
+                        # sudo was measured to relay the watchdog's
+                        # SIGTERM with or without this (sudo 1.9.17p2,
+                        # macOS, 2026-09-30).
+                        setsid=True,
+                        setsigmask=(),
+                        setsigdef=(signal.SIGTERM, signal.SIGINT),
+                    )
+                except BaseException:
+                    os.close(ack_r)
+                    raise
+                finally:
                     os.close(r)
-                    r = moved
-                pid = os.posix_spawn(
-                    sys.executable,
-                    [sys.executable, "-I", str(_WATCHDOG_SCRIPT),
-                     str(os.getpid())],
-                    os.environ,
-                    file_actions=[
-                        (os.POSIX_SPAWN_DUP2, r, 0),
-                        (os.POSIX_SPAWN_OPEN, 1, os.devnull, os.O_WRONLY, 0),
-                        (os.POSIX_SPAWN_OPEN, 2, os.devnull, os.O_WRONLY, 0),
-                    ],
-                    # Own session, so a signal sent to the launcher's
-                    # process group (terminal SIGINT/SIGHUP, kill -- -PGID)
-                    # does not take the watchdog down with the launcher.
-                    # Defence in depth: a plain x64sc shares that group
-                    # and gets the same signal, and sudo was measured to
-                    # relay the watchdog's SIGTERM with or without this
-                    # (sudo 1.9.17p2, macOS, 2026-09-30).
-                    setsid=True,
-                    setsigmask=(),
-                    setsigdef=(signal.SIGTERM, signal.SIGINT),
-                )
+                    os.close(ack_w)
             except BaseException:
-                os.close(w)
+                watchdog.retire()
                 raise
-            finally:
-                os.close(r)
+            watchdog._ack_fd = ack_r
         except (OSError, AttributeError, NotImplementedError) as exc:
             if not _warned_watchdog_unavailable:
                 _warned_watchdog_unavailable = True
@@ -192,9 +274,6 @@ class _ParentDeathWatchdog:
                     exc,
                 )
             return None
-        watchdog = cls(pid, w)
-        with _LIVE_LOCK:
-            _WATCHDOGS.add(watchdog)
         return watchdog
 
     def _send(self, message: bytes) -> bool:
@@ -217,10 +296,25 @@ class _ParentDeathWatchdog:
         if token is None:
             self.retire()  # already exited: nothing to guard
             return
-        self._send(b"T %d %s\n" % (target_pid, token.encode("ascii")))
+        ack_fd, self._ack_fd = self._ack_fd, None
+        if not self._send(b"T %d %s\n" % (target_pid, token.encode("ascii"))):
+            if ack_fd is not None:
+                os.close(ack_fd)
+            _warn_unguarded(target_pid, token, "the arm could not be sent")
+            return
+        if ack_fd is not None:
+            # Confirmed off the launch path: start() does not wait for the
+            # watchdog's interpreter to come up.
+            threading.Thread(
+                target=_await_arm_ack, args=(ack_fd, target_pid, token),
+                name=f"x64sc-watchdog-ack-{target_pid}", daemon=True,
+            ).start()
 
     def retire(self) -> None:
         """Disarm, close the pipe and reap.  The target is left untouched."""
+        ack_fd, self._ack_fd = self._ack_fd, None
+        if ack_fd is not None:
+            os.close(ack_fd)  # never armed: nothing to confirm
         wfd, self._wfd = self._wfd, None
         if wfd is None:
             return
@@ -229,7 +323,7 @@ class _ParentDeathWatchdog:
         except OSError:
             pass
         os.close(wfd)
-        with _LIVE_LOCK:
+        with _FORK_GUARD:
             _WATCHDOGS.discard(self)
         pid, self.pid = self.pid, None
         if pid is None:
@@ -253,6 +347,7 @@ class _ParentDeathWatchdog:
         """after-fork (child): drop our copy of the pipe; never reap."""
         wfd, self._wfd = self._wfd, None
         self.pid = None
+        self._ack_fd = None  # the parent's to close
         if wfd is not None:
             try:
                 os.close(wfd)
@@ -260,8 +355,26 @@ class _ParentDeathWatchdog:
                 pass
 
 
+def _hold_forks() -> None:
+    _FORK_GUARD.acquire()
+
+
+def _release_forks() -> None:
+    _FORK_GUARD.release()
+
+
+def _after_fork_in_child() -> None:
+    global _FORK_GUARD
+    _FORK_GUARD = threading.Lock()
+    _forget_parent_processes()
+
+
 if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_forget_parent_processes)
+    os.register_at_fork(
+        before=_hold_forks,
+        after_in_parent=_release_forks,
+        after_in_child=_after_fork_in_child,
+    )
 
 
 def ethernet_vice_binary() -> str:
@@ -916,6 +1029,16 @@ class ViceProcess:
     (:attr:`pid`), which relays SIGTERM to the root x64sc; its SIGKILL
     escalation reaches the wrapper alone, so a root x64sc that survives
     the relayed SIGTERM outlives the launcher.
+
+    The watchdog confirms each arm on a back channel, read off the launch
+    path by a short-lived thread.  A launch it does not guard -- the
+    watchdog could not be started (a frozen application: one WARNING per
+    process), the arm could not be sent, or no confirmation came back
+    (``sys.executable`` is not a Python that can run the script) -- is
+    logged at WARNING naming the x64sc PID.  Unguarded windows that remain:
+    from ``Popen`` returning to the arm being written (well under 1 ms
+    measured on macOS, the start time being read via ``sysctl``), and the
+    lifetime of the watchdog process itself, if something kills it.
     """
 
     def __init__(self, config: ViceConfig) -> None:
