@@ -11,6 +11,7 @@ import logging
 import os
 import platform
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -31,6 +32,8 @@ from c64_test_harness.backends.vice_elevation import (
     plan_vice_launch,
     vice_binary_supports_ethernet,
 )
+
+from c64_test_harness.backends import vice_watchdog
 
 if TYPE_CHECKING:
     from c64_test_harness.disk import DiskImage
@@ -97,10 +100,164 @@ def _forget_parent_processes() -> None:
     "never stopped" and run stop() on the parent's processes (deleting the
     parent's temp vicerc).  The lock is re-created because a fork taken
     while another thread held it leaves the child a lock nobody releases.
+
+    The child also inherits the write end of every parent-death watchdog
+    pipe (``O_CLOEXEC`` only acts at exec), and a watchdog sees EOF only
+    once *every* copy is closed -- so a long-lived forked child would keep
+    the parent's x64sc alive past a SIGKILL of the parent.  Close them.
     """
     global _LIVE_LOCK
     _LIVE_LOCK = threading.Lock()
     _LIVE_PROCESSES.clear()
+    for watchdog in list(_WATCHDOGS):
+        watchdog._abandon_in_child()
+    _WATCHDOGS.clear()
+
+
+# ---------------------------------------------------------------------------
+# Parent-death watchdog (#517)
+# ---------------------------------------------------------------------------
+
+_WATCHDOG_SCRIPT = Path(__file__).with_name("vice_watchdog.py")
+_watchdog_start_time = vice_watchdog.start_time
+
+#: Seconds retire() waits for a disarmed watchdog to exit before SIGKILL.
+_WATCHDOG_REAP_SECONDS = 2.0
+
+# Every watchdog whose pipe write end this process holds.
+_WATCHDOGS: set["_ParentDeathWatchdog"] = set()
+_warned_watchdog_unavailable = False
+
+
+class _ParentDeathWatchdog:
+    """Launcher side of :mod:`vice_watchdog`: kills x64sc on launcher death.
+
+    The watchdog is a sidecar process in its own session that reads the
+    pipe this object holds the only write end of.  Any death of this
+    process, SIGKILL included, closes that end and the watchdog terminates
+    the armed target; :meth:`retire` disarms it first.
+    """
+
+    def __init__(self, pid: int, wfd: int) -> None:
+        self.pid: int | None = pid
+        self._wfd: int | None = wfd
+
+    @classmethod
+    def spawn(cls) -> "_ParentDeathWatchdog | None":
+        """Start a watchdog, or return None (WARNING once) if it cannot be."""
+        global _warned_watchdog_unavailable
+        try:
+            if not sys.executable or not _WATCHDOG_SCRIPT.is_file():
+                raise OSError("no interpreter or watchdog script to run")
+            r, w = os.pipe()  # both O_CLOEXEC (PEP 446)
+            try:
+                if r <= 2:
+                    # dup2(r, 0) with r == 0 would keep O_CLOEXEC on stdin.
+                    import fcntl
+                    moved = fcntl.fcntl(r, fcntl.F_DUPFD_CLOEXEC, 3)
+                    os.close(r)
+                    r = moved
+                pid = os.posix_spawn(
+                    sys.executable,
+                    [sys.executable, "-I", str(_WATCHDOG_SCRIPT),
+                     str(os.getpid())],
+                    os.environ,
+                    file_actions=[
+                        (os.POSIX_SPAWN_DUP2, r, 0),
+                        (os.POSIX_SPAWN_OPEN, 1, os.devnull, os.O_WRONLY, 0),
+                        (os.POSIX_SPAWN_OPEN, 2, os.devnull, os.O_WRONLY, 0),
+                    ],
+                    # Own session, so a signal sent to the launcher's
+                    # process group (terminal SIGINT/SIGHUP, kill -- -PGID)
+                    # does not take the watchdog down with the launcher.
+                    # Defence in depth: a plain x64sc shares that group
+                    # and gets the same signal, and sudo was measured to
+                    # relay the watchdog's SIGTERM with or without this
+                    # (sudo 1.9.17p2, macOS, 2026-09-30).
+                    setsid=True,
+                    setsigmask=(),
+                    setsigdef=(signal.SIGTERM, signal.SIGINT),
+                )
+            except BaseException:
+                os.close(w)
+                raise
+            finally:
+                os.close(r)
+        except (OSError, AttributeError, NotImplementedError) as exc:
+            if not _warned_watchdog_unavailable:
+                _warned_watchdog_unavailable = True
+                _log.warning(
+                    "x64sc parent-death watchdog unavailable (%s): an x64sc "
+                    "will outlive this process if it is killed by a signal",
+                    exc,
+                )
+            return None
+        watchdog = cls(pid, w)
+        with _LIVE_LOCK:
+            _WATCHDOGS.add(watchdog)
+        return watchdog
+
+    def _send(self, message: bytes) -> bool:
+        wfd = self._wfd
+        if wfd is None:
+            return False
+        try:
+            os.write(wfd, message)
+            return True
+        except OSError:  # the watchdog died or refused: nothing to tell it
+            return False
+
+    def arm(self, target_pid: int) -> None:
+        """Watch *target_pid*, which must be this process's unreaped child.
+
+        Its start time is read here, while it cannot have been reused, and
+        sent with it: the watchdog signals nothing that does not match.
+        """
+        token = _watchdog_start_time(target_pid)
+        if token is None:
+            self.retire()  # already exited: nothing to guard
+            return
+        self._send(b"T %d %s\n" % (target_pid, token.encode("ascii")))
+
+    def retire(self) -> None:
+        """Disarm, close the pipe and reap.  The target is left untouched."""
+        wfd, self._wfd = self._wfd, None
+        if wfd is None:
+            return
+        try:
+            os.write(wfd, b"D\n")
+        except OSError:
+            pass
+        os.close(wfd)
+        with _LIVE_LOCK:
+            _WATCHDOGS.discard(self)
+        pid, self.pid = self.pid, None
+        if pid is None:
+            return
+        deadline = time.monotonic() + _WATCHDOG_REAP_SECONDS
+        try:
+            while True:
+                if os.waitpid(pid, os.WNOHANG)[0]:
+                    return
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.01)
+            # A disarmed watchdog never signals anything, so killing a
+            # stuck one is safe.
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        except (ChildProcessError, ProcessLookupError):
+            pass  # already reaped (SIGCHLD ignored) or gone
+
+    def _abandon_in_child(self) -> None:
+        """after-fork (child): drop our copy of the pipe; never reap."""
+        wfd, self._wfd = self._wfd, None
+        self.pid = None
+        if wfd is not None:
+            try:
+                os.close(wfd)
+            except OSError:
+                pass
 
 
 if hasattr(os, "register_at_fork"):
@@ -745,9 +902,20 @@ class ViceProcess:
     A process that is started and never stopped is stopped at interpreter
     exit by an ``atexit`` hook, in the launching process only (a forked
     child forgets its parent's processes).  Call :meth:`detach` for an
-    emulator that must outlive this interpreter.  The hook does not run
-    when the launcher is killed by a signal (SIGKILL, or an unhandled
-    SIGTERM): x64sc then outlives it, re-parented to init.
+    emulator that must outlive this interpreter.
+
+    The hook does not run when the launcher is killed by a signal (SIGKILL,
+    or an unhandled SIGTERM/SIGHUP).  For that case every launch also
+    starts a parent-death watchdog (:mod:`vice_watchdog`, #517): a small
+    sidecar process, not a parent of x64sc, that terminates the x64sc this
+    process launched when this process dies, however it dies.  It signals
+    only the PID it was given, after checking the PID's start time.
+    :meth:`stop`, :meth:`wait_for_exit` and :meth:`detach` retire it.
+
+    On a sudo-wrapped launch the watchdog can signal only the sudo wrapper
+    (:attr:`pid`), which relays SIGTERM to the root x64sc; its SIGKILL
+    escalation reaches the wrapper alone, so a root x64sc that survives
+    the relayed SIGTERM outlives the launcher.
     """
 
     def __init__(self, config: ViceConfig) -> None:
@@ -763,6 +931,9 @@ class ViceProcess:
         # which on macOS cannot signal a root-owned child from an
         # unprivileged parent.
         self._is_sudo_child: bool = False
+        # Parent-death watchdog for the current child (#517); None when
+        # nothing is launched, after retire, or when it could not start.
+        self._watchdog: _ParentDeathWatchdog | None = None
 
     def __enter__(self) -> ViceProcess:
         self.start()
@@ -799,11 +970,13 @@ class ViceProcess:
     def detach(self) -> None:
         """Leave this emulator running when the interpreter exits.
 
-        Removes the process from the at-exit stop registry.  The handle is
-        kept, so :meth:`stop` still works; only the automatic stop at
-        interpreter exit is given up.
+        Removes the process from the at-exit stop registry and retires its
+        parent-death watchdog, so x64sc also survives this process being
+        killed by a signal.  The handle is kept, so :meth:`stop` still
+        works; only the automatic stops are given up.
         """
         self._unregister()
+        self._retire_watchdog()
 
     def start(self) -> None:
         """Stop any existing process on this instance, then launch VICE."""
@@ -1041,7 +1214,21 @@ class ViceProcess:
         # unprivileged parent cannot signal a root-owned child.
         self._is_sudo_child = plan.sudo_wrapped
 
-        self._proc = subprocess.Popen(args, **popen_kwargs)  # type: ignore[arg-type]
+        # The watchdog is started before x64sc so that the only unguarded
+        # window is Popen returning to arm(), not a whole process spawn.
+        watchdog = _ParentDeathWatchdog.spawn()
+        try:
+            self._proc = subprocess.Popen(args, **popen_kwargs)  # type: ignore[arg-type]
+        except BaseException:
+            if watchdog is not None:
+                watchdog.retire()
+            raise
+        if watchdog is not None:
+            if isinstance(self._proc.pid, int):
+                watchdog.arm(self._proc.pid)
+                self._watchdog = watchdog
+            else:
+                watchdog.retire()  # a test double, not a launched child
         with _LIVE_LOCK:
             _LIVE_PROCESSES.add(self)
 
@@ -1068,6 +1255,7 @@ class ViceProcess:
         # Clear internal handle so stop() becomes a no-op
         self._proc = None
         self._unregister()
+        self._retire_watchdog()
         return code
 
     def stop(self) -> None:
@@ -1085,6 +1273,7 @@ class ViceProcess:
         naming its PID instead of returning as if it had succeeded.
         """
         if self._proc is None:
+            self._retire_watchdog()
             self._cleanup_tmp_vicerc()
             return
 
@@ -1141,6 +1330,7 @@ class ViceProcess:
                 pass
         self._proc = None
         self._unregister()
+        self._retire_watchdog()
         self._cleanup_tmp_vicerc()
         if _is_same_x64sc(vice_pid, vice_ident) and _pid_exists(vice_pid):
             _log.warning(
@@ -1153,6 +1343,11 @@ class ViceProcess:
     def _unregister(self) -> None:
         with _LIVE_LOCK:
             _LIVE_PROCESSES.discard(self)
+
+    def _retire_watchdog(self) -> None:
+        watchdog, self._watchdog = self._watchdog, None
+        if watchdog is not None:
+            watchdog.retire()
 
     def _find_x64sc_child_pid(self) -> int | None:
         """Find the x64sc process spawned under our sudo wrapper.

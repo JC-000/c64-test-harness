@@ -343,7 +343,7 @@ Invoke them directly (`sudo -n scripts/setup-bridge-feth-macos.sh`), never as `s
 
 On macOS the setup script pairs `feth0` <-> `feth1` via `ifconfig feth0 peer feth1` and creates `bridge10` for the precondition + the host `10.0.65.1` address, but deliberately leaves the feth peers OUT of `bridge10`. The feth peer relation IS the L2 link; adding them as bridge members creates a second forwarding path that empirically caused asymmetric B->A reply drops. The setup script `deletem`s any stale peer-membership idempotently. The feth pair and `bridge10` may be shared with other rigs on the machine: tearing them down removes them for everyone.
 
-Cleanup of orphaned VICE processes uses the port-range-scoped `scripts/cleanup_vice_ports.py` — NEVER `pkill x64sc`.
+Cleanup of orphaned VICE processes uses the port-range-scoped `scripts/cleanup_vice_ports.py` — NEVER `pkill x64sc`. Since #517 a launcher killed by a signal no longer orphans its x64sc (a watchdog sidecar terminates it, matching PID and start time, never the name); `ViceProcess.detach()` opts out.
 
 ### macOS gotcha — drain the CS8900a RX FIFO before each expect-RX phase
 
