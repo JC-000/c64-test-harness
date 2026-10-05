@@ -362,8 +362,10 @@ def temp_ledger_key(host: str) -> str:
     a trailing path, IPv6 brackets, a trailing dot, and the textual forms of
     one IP address. Keeps a non-default port -- ``gw:8080`` and ``gw:8081``
     are two devices, in the lock and in the ledger alike. Does **not** fold
-    a name with the address it resolves to (no DNS in the keying path); see
-    that function for both rules and why.
+    a name with the address it resolves to (no DNS in the keying path)
+    unless both are listed for one device in the offline alias map, which
+    folds every listed spelling, ethernet and WiFi addresses included, into
+    ``uid-<unique_id>`` (#519); see that function for the rules and why.
     """
     return normalize_device_host(host)
 

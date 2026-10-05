@@ -78,6 +78,7 @@ __all__ = [
     "aliases_file_path",
     "canonical_key_for_id",
     "check_device_identity",
+    "configured_spellings",
     "configured_unique_id",
     "fold_alias",
 ]
@@ -217,33 +218,38 @@ def _parse_env(value: str, normalize: Callable[[str], str]) -> dict[str, str]:
 
 
 _cache_lock = threading.Lock()
-_cache: tuple[object, dict[str, str]] | None = None
-
-
-def _source_signature(path: Path) -> object:
-    try:
-        st = path.stat()
-        file_sig: object = (st.st_ino, st.st_mtime_ns, st.st_size)
-    except FileNotFoundError:
-        file_sig = None
-    except OSError as exc:
-        raise DeviceAliasConfigError(f"{path}: cannot stat ({exc})") from exc
-    return (os.environ.get(ALIASES_ENV, ""), str(path), file_sig)
+_cache: dict[str, str] | None = None
 
 
 def _alias_map(normalize: Callable[[str], str]) -> dict[str, str]:
-    """``{normalised spelling: unique_id}``, re-read when a source changes."""
+    """``{normalised spelling: unique_id}``, read **once per process**.
+
+    Frozen on first successful read, deliberately: a lock is keyed when it
+    is constructed, and its release callbacks, the in-process held registry
+    and the client's ledger are looked up again later by host.  A map that
+    changed in between would key those lookups differently from the lock
+    they belong to -- the release ``/Temp`` drain would silently miss, and
+    a broken edit would make ``release()`` raise with the flock still held
+    (#519 review, finding 1).  So an edit to the file or the environment
+    takes effect in **new** processes only.  A read that fails is not
+    cached: every call raises until the configuration is fixed.
+    """
     global _cache
-    path = aliases_file_path()
-    sig = _source_signature(path)
     with _cache_lock:
-        if _cache is not None and _cache[0] == sig:
-            return _cache[1]
-        merged = _parse_file(path, normalize)
+        if _cache is not None:
+            return _cache
+        merged = _parse_file(aliases_file_path(), normalize)
         # The environment wins: a lane can re-point one spelling for a run.
         merged.update(_parse_env(os.environ.get(ALIASES_ENV, ""), normalize))
-        _cache = (sig, merged)
+        _cache = merged
         return merged
+
+
+def _reset_alias_cache() -> None:
+    """Test-only: forget the frozen map so the next call re-reads it."""
+    global _cache
+    with _cache_lock:
+        _cache = None
 
 
 def fold_alias(key: str, normalize: Callable[[str], str]) -> str:
@@ -263,6 +269,12 @@ def configured_unique_id(key: str, normalize: Callable[[str], str]) -> str | Non
     if key.startswith(CANONICAL_PREFIX):
         return key[len(CANONICAL_PREFIX):]
     return _alias_map(normalize).get(key)
+
+
+def configured_spellings(unique_id: str, normalize: Callable[[str], str]) -> list[str]:
+    """Every normalised spelling the map lists for *unique_id*, sorted."""
+    uid = str(unique_id).strip().lower()
+    return sorted(k for k, v in _alias_map(normalize).items() if v == uid)
 
 
 # --------------------------------------------------------------------------- #
@@ -351,20 +363,58 @@ def check_device_identity(
 
     *key* is the caller's device key (already folded), *host* the spelling
     it connects to, and *unique_id* the id from the client's cached
-    ``GET /v1/info``. Never does network I/O. Call it only while holding
-    *key*'s lock: the record says "this key is a way to reach this device",
-    and only a holder knows that the answer came from the device it locked.
+    ``GET /v1/info`` (``None`` if it never probed, or the device's Unique ID
+    config is empty, which omits it).  Never does network I/O.  Call it only
+    while holding *key*'s lock: the record says "this key is a way to reach
+    this device", and only a holder knows that the answer came from the
+    device it locked.
 
-    Returns ``None`` when there is nothing to report, including when
-    *unique_id* is ``None`` (the client never probed, or the device's
-    Unique ID config is empty, which omits it from ``/v1/info``).
+    In order:
+
+    1. **A lane on an older harness** (no alias map) locks the raw address.
+       When *key* is a configured ``uid-`` key, the legacy lockfile of every
+       configured spelling is probed; a live foreign holder there is a
+       ``"collision"``.  Needs no ``unique_id``.
+    2. **The wrong device**: the map says *key* is one id and the device
+       reports another -- ``"mismatch"``.
+    3. **An alias nobody configured**: another key is recorded for this id.
+       It is a ``"collision"`` only when that key's lock is held right now
+       by the **same process that recorded it**, after it recorded it -- a
+       lane that has itself been answered by this device.  A holder that has
+       not (an address since handed to another device, a wrapper that only
+       locks, a lane that has not uploaded yet) is a ``"seen"`` finding, so
+       a stale record can never block a device (#519 review, finding 2).
     """
-    if not unique_id:
-        return None
     from . import device_lock as _dl
 
-    uid = str(unique_id).strip().lower()
+    d = lock_dir or _dl._default_lock_dir()
     configured = configured_unique_id(key, _dl._normalize_spelling)
+    if configured is not None and key.startswith(CANONICAL_PREFIX):
+        legacy = []
+        for spelling in configured_spellings(configured, _dl._normalize_spelling):
+            path = d / f"device-{_dl._sanitize_device_id(spelling)}.lock"
+            try:
+                holder = _dl._foreign_holder_at(path, spelling)
+            except Exception:  # noqa: BLE001 - a lock query must never fail the caller
+                holder = None
+            if holder is not None:
+                legacy.append((spelling, holder.get("pid")))
+        if legacy:
+            names = ", ".join(f"{s} (pid {pid})" for s, pid in legacy)
+            return IdentityFinding(
+                "collision",
+                f"device {configured} is locked by this process as {key}, and "
+                f"by another process under its raw address: {names}. That "
+                "lane runs a harness without the #519 alias map, so the two "
+                "locks do not exclude each other. Upgrade that lane, or wait "
+                "for it to finish.",
+            )
+    if not unique_id:
+        return None
+    uid = str(unique_id).strip().lower()
+    if not _ID_RE.match(uid):
+        _log.debug("device at %s reports an unusable unique_id %r", host, unique_id)
+        return None
     if configured is not None and configured != uid:
         return IdentityFinding(
             "mismatch",
@@ -376,13 +426,15 @@ def check_device_identity(
             "Network Settings > Unique ID was set by hand. Fix the alias "
             f"file ({aliases_file_path()}) before continuing.",
         )
-    d = lock_dir or _dl._default_lock_dir()
     path = _identity_path(d, uid)
     keys = _read_record(path)
-    entry = keys.get(key)
-    if entry is None or entry.get("pid") != os.getpid():
-        keys[key] = {"host": host, "pid": os.getpid(), "last_seen": time.time()}
-        _write_record(path, keys)
+    # Rewritten on every call, not only when the pid changes: a collision
+    # needs last_seen to postdate the recorder's *current* acquire, and a
+    # process re-acquires (per-test locking) without changing pid.
+    first_time = keys.get(key, {}).get("pid") != os.getpid()
+    keys[key] = {"host": host, "pid": os.getpid(), "last_seen": time.time()}
+    _write_record(path, keys)
+    if first_time:
         _forget_key_elsewhere(d, key, path)
     # A key that now folds to this one was a spelling the alias map has
     # since joined to it: no longer a separate queue, so not a finding.
@@ -393,12 +445,20 @@ def check_device_identity(
     if not others:
         return None
     held = []
-    for other in sorted(others):
+    for other, rec in sorted(others.items()):
         try:
             holder = _dl.DeviceLock.foreign_holder(other, lock_dir=lock_dir)
         except Exception:  # noqa: BLE001 - a lock query must never fail the caller
             holder = None
-        if holder is not None:
+        if holder is None:
+            continue
+        ts, seen = holder.get("ts"), rec.get("last_seen")
+        if (
+            holder.get("pid") == rec.get("pid")
+            and isinstance(ts, (int, float))
+            and isinstance(seen, (int, float))
+            and ts <= seen
+        ):
             held.append((other, holder.get("pid")))
     spellings = [host] + [str(v.get("host", k)) for k, v in others.items()]
     if held:

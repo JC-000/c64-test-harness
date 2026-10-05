@@ -213,8 +213,10 @@ def _isolate_device_aliases(request, monkeypatch, tmp_path_factory):
     if is_live_test_file(node_path):
         yield
         return
+    from c64_test_harness.backends import device_aliases as _aliases
     from c64_test_harness.backends import ultimate64_client as _client
 
+    _aliases._reset_alias_cache()
     monkeypatch.setenv(
         "C64_DEVICE_ALIASES_FILE",
         str(tmp_path_factory.getbasetemp() / "no-device-aliases.toml"),
@@ -223,6 +225,7 @@ def _isolate_device_aliases(request, monkeypatch, tmp_path_factory):
     _client._IDENTITY_SEEN_WARNED.clear()
     yield
     _client._IDENTITY_SEEN_WARNED.clear()
+    _aliases._reset_alias_cache()
 
 
 class MockTransport:

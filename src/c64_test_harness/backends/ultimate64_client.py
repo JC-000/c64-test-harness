@@ -61,6 +61,7 @@ __all__ = [
     "Ultimate64WireFormatError",
     "Ultimate64UnsafeOperationError",
     "Ultimate64TempHygieneError",
+    "Ultimate64DeviceAliasError",
     "Ultimate64UnreachableError",
     "Ultimate64RunnerStuckError",
     "U64UnreachableError",
@@ -1098,6 +1099,12 @@ class Ultimate64Client:
         """
         from .ultimate64_temp_gc import TempReservation as _TempReservation
 
+        # Before the ledger lock, not under it: the #519 identity check does
+        # file I/O and flock probes, and every upload on the device queues on
+        # that lock.  It reads only lock and record files, so nothing it
+        # decides depends on the ledger's state.
+        if not self._in_temp_hygiene:
+            self._check_device_identity(operation)
         ledger = self._temp_ledger
         with ledger.lock:
             self._before_temp_attachment(operation, count)
@@ -1139,7 +1146,6 @@ class Ultimate64Client:
         if self._in_temp_hygiene:
             return
         self._maybe_reprobe_capabilities()
-        self._check_device_identity(operation)
         if not self.temp_hygiene_armed:
             return
         if self._temp_hygiene_blocked is not None:
@@ -1181,7 +1187,8 @@ class Ultimate64Client:
         holds the device's lock, because only a holder knows the answer
         came from the device it locked.  A client that never probed (an
         explicit ``write_mem_query_threshold``), or a device whose Unique ID
-        config is empty, is not checked.
+        config is empty, gets only the legacy-lockfile check (an older
+        harness holding a configured raw address), which needs no id.
 
         A collision or a mismatch (see
         :func:`~c64_test_harness.backends.device_aliases.check_device_identity`)
@@ -1191,7 +1198,7 @@ class Ultimate64Client:
         a WARNING once per process.
         """
         uid = self._device_unique_id
-        if not uid or not _HAS_DEVICE_LOCK or not self._temp_lock_held():
+        if not _HAS_DEVICE_LOCK or not self._temp_lock_held():
             return
         from .device_aliases import DeviceAliasConfigError, check_device_identity
 
@@ -1206,9 +1213,9 @@ class Ultimate64Client:
             return
         if finding.kind == "seen":
             with _IDENTITY_SEEN_GUARD:
-                if uid.lower() in _IDENTITY_SEEN_WARNED:
+                if str(uid).lower() in _IDENTITY_SEEN_WARNED:
                     return
-                _IDENTITY_SEEN_WARNED.add(uid.lower())
+                _IDENTITY_SEEN_WARNED.add(str(uid).lower())
             _log.warning("Ultimate device %s: %s", self.host, finding.message)
             return
         from .device_lock import require_device_lock
@@ -1218,9 +1225,11 @@ class Ultimate64Client:
             raise Ultimate64DeviceAliasError(
                 message + " U64_TEMP_GC_REQUIRED=0 does not lift this refusal."
             )
-        if finding.message not in self._identity_warned:
+        with _IDENTITY_SEEN_GUARD:
+            if finding.message in self._identity_warned:
+                return
             self._identity_warned.add(finding.message)
-            _log.warning("Ultimate device %s: %s", self.host, finding.message)
+        _log.warning("Ultimate device %s: %s", self.host, finding.message)
 
     def _leak_prone_grade(self) -> bool:
         """The cached grade does not say post-safe (no I/O).

@@ -134,8 +134,12 @@ spelling the holder used (`device_host`) and the folded key
   key, an id that is not a filename-safe `unique_id`, invalid TOML, or a
   file present when no TOML parser is available. A missing file is an
   empty map.
-- The file is re-read whenever it changes (its mtime, size or inode), with
-  no restart needed.
+- **The map is read once per process.** An edit takes effect in new
+  processes only. That is deliberate: a held lock, its release `/Temp`
+  drain and the client's ledger are each looked up by host at different
+  times, and a map that changed in between would key them differently. A
+  broken edit mid-hold would then make `release()` fail with the lock
+  still held. Install or change the file between runs.
 
 ### Catching an alias nobody configured
 
@@ -148,23 +152,33 @@ request it then checks:
 
 | Finding | Leak-prone grade, hygiene armed | Otherwise |
 |---|---|---|
-| Another key for this device is **locked right now** by another process | `Ultimate64DeviceAliasError` before sending (a `Ultimate64TempHygieneError`; `U64_TEMP_GC_REQUIRED=0` does **not** lift it) | WARNING; raises under `U64_REQUIRE_DEVICE_LOCK=1` |
+| A configured address's **raw lockfile** is held by another process (a lane on a harness without the alias map) | `Ultimate64DeviceAliasError` before sending (a `Ultimate64TempHygieneError`; `U64_TEMP_GC_REQUIRED=0` does **not** lift it) | WARNING; raises under `U64_REQUIRE_DEVICE_LOCK=1` |
+| Another key for this device is **locked right now** by the process that recorded it, after recording it (a lane the device has answered) | same refusal | WARNING; raises under `U64_REQUIRE_DEVICE_LOCK=1` |
 | The alias map says this address is a **different device** from the one that answered | same refusal | WARNING; raises under `U64_REQUIRE_DEVICE_LOCK=1` |
-| The device was reached under another key before, and nobody holds that key now | WARNING once per process | WARNING once per process |
+| The device was reached under another key before, and that key is free, or held by a process the device has not answered under it (an address since handed to another device, a lock-only wrapper, a lane that has not uploaded yet) | WARNING once per process | WARNING once per process |
 
-Each message names both keys and gives the exact TOML to add. The check
-does not run for a client that never probed (one constructed with an
-explicit `write_mem_query_threshold`), for a device whose Unique ID config
-is empty, or for a process that does not hold the lock.
+Each message names both keys and gives the exact TOML to add. A stale
+record can only ever produce the warning, never a refusal. When an address
+is recorded under one device it is removed from every other device's
+record. The check does not run for a process that does not hold the lock.
+A client that never probed (one constructed with an explicit
+`write_mem_query_threshold`), or a device whose Unique ID config is empty,
+gets only the raw-lockfile check.
 
 ### Migrating lanes
 
-A lane still on a harness without this change locks the raw address, so
-it never excludes an upgraded lane, which locks `uid-…`. Until every lane
-has upgraded, **keep the #519 stopgap wrapper** (take `DeviceLock("10.43.23.81")`,
-then run the rig). Keeping it is safe for an upgraded rig: its child locks
-`uid-601a96`, a different file from the wrapper's `.81`, so it cannot queue
-behind its own parent.
+**Retire the #519 stopgap wrapper in the same step that installs the alias
+file.** An upgraded wrapper's `DeviceLock("10.43.23.81")` folds to
+`uid-601a96`, the same key its upgraded child takes, so the child would
+queue behind its own parent until it timed out.
+
+Lanes still on a harness without this change lock the raw address and
+cannot see upgraded lanes. The reverse is covered: an upgraded lane probes
+the raw lockfile of every configured address before each
+attachment-creating request. It is refused on a leak-prone grade, and
+warned on a post-safe one, or refused under `U64_REQUIRE_DEVICE_LOCK=1`.
+Upgrade every lane that drives a device before relying on the map. On the
+U64E, set `U64_REQUIRE_DEVICE_LOCK=1` in upgraded lanes until then.
 
 ## The rules
 

@@ -525,7 +525,14 @@ def test_concurrent_clients_count_every_attachment(host):
 
 def test_concurrent_budget_crossings_sweep_without_losing_the_bound(host):
     """Every attachment is either collected by a sweep or still pending, and
-    no reservation leaves more than the budget pending."""
+    the count stays bounded.  The bound is ``max(budget, threads)``, not
+    ``budget``: a sweep must keep every upload still in flight
+    (``collected()`` resets ``pending`` to ``in_flight``, at most one per
+    thread), and those settle before the next reservation sweeps again.
+    The old ``<= budget`` assertion held only while uploads rarely
+    overlapped -- a 1 ms delay in the fake device fails it on master 3/3
+    (#519 PR).  Without sweeps the count would climb to
+    ``threads * per_thread``."""
     threads, per_thread, budget = 6, 20, 4
     seen: list[int] = []
     guard = threading.Lock()
@@ -545,8 +552,8 @@ def test_concurrent_budget_crossings_sweep_without_losing_the_bound(host):
             w.start()
         for w in workers:
             w.join()
-    assert max(seen) <= budget, max(seen)
-    assert len(ftp.hosts) >= (threads * per_thread) // budget - 1
+    assert max(seen) <= max(budget, threads), max(seen)
+    assert len(ftp.hosts) >= (threads * per_thread) // max(budget, threads) - 1
 
 
 def test_the_reset_hook_clears_the_registry(host):

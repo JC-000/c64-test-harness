@@ -1514,41 +1514,7 @@ class DeviceLock:
         """
         d = lock_dir or _default_lock_dir(create=False)
         path = d / f"device-{_device_lock_key(device_host)}.lock"
-        try:
-            fd = os.open(str(path), os.O_RDONLY)
-        except OSError:
-            return None  # No lockfile at all — nobody has ever locked it.
-        try:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-            except OSError:
-                pass  # Held right now — fall through and describe the holder.
-            else:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-                return None  # Nobody holds it; stale lockfile.
-            try:
-                raw = os.read(fd, 4096)
-            except OSError:
-                raw = b""
-        finally:
-            os.close(fd)
-
-        info: dict = {}
-        try:
-            parsed = json.loads(raw) if raw else {}
-            if isinstance(parsed, dict):
-                info = parsed
-        except (json.JSONDecodeError, ValueError):
-            info = {}
-        pid = info.get("pid")
-        if isinstance(pid, int) and pid == os.getpid():
-            # Held by us through some other fd (e.g. a DeviceLock that
-            # never registered).  Not a foreign holder.
-            return None
-        holder = dict(info)
-        holder["pid"] = pid if isinstance(pid, int) else None
-        holder["device_host"] = info.get("device_host", device_host)
-        return holder
+        return _foreign_holder_at(path, device_host)
 
     def read_info(self) -> dict | None:
         """Read metadata from the lockfile without acquiring the lock.
@@ -2249,6 +2215,48 @@ def held_by_this_process_in_any_dir(device_host: str) -> bool:
         )
 
 
+def _foreign_holder_at(path: Path, device_host: str) -> dict | None:
+    """:meth:`DeviceLock.foreign_holder` for an explicit lockfile *path*.
+
+    Also probes the legacy, un-aliased lockfile that a lane on an older
+    harness holds (#519), whose path the alias fold no longer produces.
+    """
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return None  # No lockfile at all — nobody has ever locked it.
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            pass  # Held right now — fall through and describe the holder.
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return None  # Nobody holds it; stale lockfile.
+        try:
+            raw = os.read(fd, 4096)
+        except OSError:
+            raw = b""
+    finally:
+        os.close(fd)
+
+    info: dict = {}
+    try:
+        parsed = json.loads(raw) if raw else {}
+        if isinstance(parsed, dict):
+            info = parsed
+    except (json.JSONDecodeError, ValueError):
+        info = {}
+    pid = info.get("pid")
+    if isinstance(pid, int) and pid == os.getpid():
+        # Held by us through some other fd (e.g. a DeviceLock that
+        # never registered).  Not a foreign holder.
+        return None
+    holder = dict(info)
+    holder["pid"] = pid if isinstance(pid, int) else None
+    holder["device_host"] = info.get("device_host", device_host)
+    return holder
+
 def register_release_callback(device_host: str, obj: object, method: str) -> None:
     """Call ``obj.<method>(reason=...)`` when this device's lock is released.
 
@@ -2288,7 +2296,15 @@ def unregister_release_callback(device_host: str, obj: object, method: str) -> N
 
 def _run_release_callbacks(device_host: str) -> None:
     """Invoke (and prune) the release callbacks for one device. Never raises."""
-    key = _device_lock_key(device_host)
+    try:
+        key = _device_lock_key(device_host)
+    except Exception as exc:  # noqa: BLE001 - a release must never fail
+        _log.warning(
+            "DeviceLock release for %r: cannot key its release callbacks "
+            "(%s: %s); the lock-release /Temp drain did not run",
+            device_host, type(exc).__name__, exc,
+        )
+        return
     with _RELEASE_CALLBACK_GUARD:
         entries = list(_RELEASE_CALLBACKS.get(key, ()))
     live: list[tuple[weakref.ref, str]] = []
