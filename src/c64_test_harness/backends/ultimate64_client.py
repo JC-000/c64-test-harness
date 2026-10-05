@@ -24,6 +24,7 @@ import json
 import logging
 import re
 import socket
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -67,6 +68,11 @@ __all__ = [
 ]
 
 _log = logging.getLogger(__name__)
+
+#: ``unique_id``\ s already warned as "seen under another key" in this
+#: process (#519): once per device per process, however many clients.
+_IDENTITY_SEEN_WARNED: set[str] = set()
+_IDENTITY_SEEN_GUARD = threading.Lock()
 
 
 class Ultimate64Error(Exception):
@@ -203,6 +209,26 @@ class Ultimate64TempHygieneError(Ultimate64Error):
     Opt out with ``U64_TEMP_GC_REQUIRED=0`` (or ``temp_hygiene=False`` to
     disarm the whole pass) if you know the device's ``/Temp`` is being
     kept clean some other way.
+    """
+
+
+class Ultimate64DeviceAliasError(Ultimate64TempHygieneError):
+    """One device is being driven under two lock keys (#519).
+
+    Raised before an attachment-creating request when the device that
+    answered this client is either locked right now by another process
+    under a different key (an alias nobody configured: ethernet and WiFi
+    addresses of one U64E or C64U), or is a different device from the one
+    the alias file says this address is.  Two keys mean two queues and two
+    ``/Temp`` budgets for one device, and on leak-prone firmware a split
+    budget walks the device towards the wedge that only a power-cycle
+    clears.
+
+    A subclass of :class:`Ultimate64TempHygieneError`, so existing handlers
+    still catch it.  ``U64_TEMP_GC_REQUIRED=0`` does **not** lift it; the
+    remedy is the alias file the message names (``docs/device_locking.md``,
+    "Multi-interface devices").  On a post-safe grade the same finding is a
+    WARNING unless ``U64_REQUIRE_DEVICE_LOCK=1``.
     """
 
 
@@ -486,6 +512,11 @@ class Ultimate64Client:
         self._in_temp_hygiene = False
 
         self._capabilities: DeviceCapabilities | None = None
+        #: ``unique_id`` from the last ``GET /v1/info`` probe, or ``None``.
+        #: Kept for the #519 identity check, which must not issue a request
+        #: of its own.
+        self._device_unique_id: str | None = None
+        self._identity_warned: set[str] = set()
         #: Has a firmware probe ever actually been issued? ``False`` means
         #: nothing was asked and this client is inert by contract (the
         #: caller pinned the threshold); ``True`` with an unreadable grade
@@ -642,7 +673,11 @@ class Ultimate64Client:
         finally:
             self._probing = False
             self.timeout = original
-        return info if isinstance(info, dict) else None
+        if not isinstance(info, dict):
+            return None
+        uid = info.get("unique_id")
+        self._device_unique_id = uid.strip() if isinstance(uid, str) and uid.strip() else None
+        return info
 
     def _maybe_reprobe_capabilities(self) -> None:
         """Re-probe once, on evidence that a device is actually there.
@@ -1104,6 +1139,7 @@ class Ultimate64Client:
         if self._in_temp_hygiene:
             return
         self._maybe_reprobe_capabilities()
+        self._check_device_identity(operation)
         if not self.temp_hygiene_armed:
             return
         if self._temp_hygiene_blocked is not None:
@@ -1136,6 +1172,55 @@ class Ultimate64Client:
             )
             if self._temp_hygiene_blocked is not None:
                 self._refuse_or_warn(operation)
+
+    def _check_device_identity(self, operation: str) -> None:
+        """Refuse or warn when one device is reached under two keys (#519).
+
+        Uses the ``unique_id`` cached by the capability probe, and lock and
+        record files: no request of its own.  Runs only while this process
+        holds the device's lock, because only a holder knows the answer
+        came from the device it locked.  A client that never probed (an
+        explicit ``write_mem_query_threshold``), or a device whose Unique ID
+        config is empty, is not checked.
+
+        A collision or a mismatch (see
+        :func:`~c64_test_harness.backends.device_aliases.check_device_identity`)
+        raises :class:`Ultimate64DeviceAliasError` on a leak-prone grade with
+        hygiene armed, and under ``U64_REQUIRE_DEVICE_LOCK=1``; otherwise it
+        is a WARNING.  A device seen under another key that nobody holds is
+        a WARNING once per process.
+        """
+        uid = self._device_unique_id
+        if not uid or not _HAS_DEVICE_LOCK or not self._temp_lock_held():
+            return
+        from .device_aliases import DeviceAliasConfigError, check_device_identity
+
+        try:
+            finding = check_device_identity(self._device_key, self.host, uid)
+        except DeviceAliasConfigError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a diagnostic never fails a request
+            _log.debug("device identity check on %s failed: %s", self.host, exc)
+            return
+        if finding is None:
+            return
+        if finding.kind == "seen":
+            with _IDENTITY_SEEN_GUARD:
+                if uid.lower() in _IDENTITY_SEEN_WARNED:
+                    return
+                _IDENTITY_SEEN_WARNED.add(uid.lower())
+            _log.warning("Ultimate device %s: %s", self.host, finding.message)
+            return
+        from .device_lock import require_device_lock
+
+        message = f"refusing {operation} on {self.host}: {finding.message}"
+        if (self._leak_prone_grade() and self.temp_hygiene_armed) or require_device_lock():
+            raise Ultimate64DeviceAliasError(
+                message + " U64_TEMP_GC_REQUIRED=0 does not lift this refusal."
+            )
+        if finding.message not in self._identity_warned:
+            self._identity_warned.add(finding.message)
+            _log.warning("Ultimate device %s: %s", self.host, finding.message)
 
     def _leak_prone_grade(self) -> bool:
         """The cached grade does not say post-safe (no I/O).

@@ -137,7 +137,7 @@ DEFAULT_DEVICE_PORT = 80
 
 
 def normalize_device_host(host: str) -> str:
-    """Canonical form of a host string: **one device, one key** (#434).
+    """Canonical form of a host string: **one device, one key** (#434, #519).
 
     This is the single normaliser shared by the two places that key state
     per device -- the ``DeviceLock`` lockfile (via :func:`_device_lock_key`)
@@ -169,7 +169,30 @@ def normalize_device_host(host: str) -> str:
     device identity read from ``GET /v1/info`` (the U64E reports
     ``unique_id``) would close it, but it puts a network probe -- and a
     device that may be wedged -- in the path of taking a lock.
+
+    **Multi-interface devices** (#519).  A U64E or C64U answers on ethernet
+    and WiFi at different addresses, and either address can move (DHCP, a
+    reflash, a change of interface) while the device stays the same.  The
+    last step of this function folds every spelling listed in the offline
+    alias map (:mod:`~c64_test_harness.backends.device_aliases`:
+    ``~/.config/c64-test-harness/devices.toml`` or ``C64_DEVICE_ALIASES``)
+    into ``uid-<unique_id>``, the device's flash-serial-derived identity.
+    That is local configuration, read without network I/O; listing a name
+    there is also how a name and its address are joined.  An unlisted
+    spelling keeps its own key.  A broken alias configuration raises
+    :class:`~c64_test_harness.backends.device_aliases.DeviceAliasConfigError`.
     """
+    return _fold_alias(_normalize_spelling(host))
+
+
+def _fold_alias(key: str) -> str:
+    from .device_aliases import fold_alias
+
+    return fold_alias(key, _normalize_spelling)
+
+
+def _normalize_spelling(host: str) -> str:
+    """:func:`normalize_device_host` without the alias fold: spelling rules only."""
     s = str(host).strip().lower()
     for scheme in ("http://", "https://"):
         if s.startswith(scheme):
@@ -217,9 +240,12 @@ def device_key(host: str, port: int = DEFAULT_DEVICE_PORT) -> str:
     default port folds away, so ``device_key(h) == normalize_device_host(h)``.
     *host* is expected to carry no port of its own when *port* is given.
     """
-    base = normalize_device_host(host)
+    # Spell the full host:port first and fold once, at the end: folding the
+    # base first would merge ``a:8080`` and ``b:8080`` whenever ``a`` and
+    # ``b`` are aliases, which no one declared (#519).
+    base = _normalize_spelling(host)
     if int(port) == DEFAULT_DEVICE_PORT:
-        return base
+        return _fold_alias(base)
     try:
         is_v6 = ipaddress.ip_address(base).version == 6
     except ValueError:
@@ -682,7 +708,8 @@ class DeviceLock:
             use it — they are concurrent users, not one nested user.
         """
         self._device_host = device_host
-        self._device_id = _device_lock_key(device_host)
+        self._device_key = normalize_device_host(device_host)
+        self._device_id = _sanitize_device_id(self._device_key)
         self._lock_dir = lock_dir or _default_lock_dir()
         self._lock_path = self._lock_dir / f"device-{self._device_id}.lock"
         self._queue_dir_path = Path(str(self._lock_path) + ".queue")
@@ -1797,6 +1824,9 @@ class DeviceLock:
             "pid": os.getpid(),
             "ts": time.time(),
             "device_host": self._device_host,
+            # The folded key (#519): with an alias map, the spelling a
+            # holder used and the device it locked are different facts.
+            "device_key": self._device_key,
         }
         data = json.dumps(meta).encode()
         try:
