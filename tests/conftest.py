@@ -45,20 +45,44 @@ def is_live_test_file(path: str) -> bool:
 
 
 def drives_a_device_file(path: str) -> bool:
-    """Whether *path* is a module that drives a real device when gated in.
+    """Whether *path* is a module that drives the operator's device when gated in.
 
-    That is every ``*_live.py`` module plus the ``test_blind_agent_*``
-    modules, which drive the device under ``U64_HOST`` through
-    ``UnifiedManager(backend="u64")`` without the ``_live`` suffix.  The
-    per-device isolation fixtures below (the alias map and the ``/Temp``
-    ledger reset) spare these modules: there the real map is what folds
-    their lock into the same ``uid-`` key every other lane on that device
+    That is every ``*_live.py`` module plus any other ``test_*.py`` module
+    that reads ``U64_HOST`` without supplying its own: the same criterion
+    the ``U64_ALLOW_MUTATE`` scan uses (``test_live_mutation_gate.
+    drives_a_named_device``, #375), so the two cannot drift apart.  Today
+    that adds the ``test_blind_agent_*`` modules, ``test_bridge_ping_tod.py``
+    and ``test_stress_smoke.py``.
+
+    The per-device isolation fixtures below (the alias map and the ``/Temp``
+    ledger reset) spare these modules.  There the real map is what folds
+    their lock into the same ``uid-`` key every other lane on the device
     uses, and the ledger's count describes the device across tests (#522).
-    The live *lock* guard still keys on :func:`is_live_test_file` alone,
-    because a blind-agent module's ``UnifiedManager`` takes its own lock.
+    The live *lock* guard still keys on :func:`is_live_test_file` alone:
+    the other device modules take their own lock (``UnifiedManager``,
+    ``DeviceLock``, or the script they run).  Cached per path; the source
+    is parsed, never imported.
     """
-    name = os.path.basename(str(path))
-    return is_live_test_file(path) or name.startswith("test_blind_agent_")
+    return _drives_a_device_file(str(path))
+
+
+@lru_cache(maxsize=None)
+def _drives_a_device_file(path: str) -> bool:
+    if is_live_test_file(path):
+        return True
+    name = os.path.basename(path)
+    if not (name.startswith("test_") and name.endswith(".py")):
+        return False
+    import ast
+
+    from test_live_mutation_gate import drives_a_named_device
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename=path)
+    except (OSError, SyntaxError):
+        return False
+    return drives_a_named_device(tree)
 
 
 def live_device_host(module: object = None) -> str | None:
