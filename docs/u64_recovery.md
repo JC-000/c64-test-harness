@@ -416,7 +416,10 @@ the refusal state and the one FTP-enable attempt live in a process-wide
 `TempLedger` (`ultimate64_temp_gc.py`), keyed by the normalised host.
 Normalising folds together case, scheme, a trailing dot and the
 spellings of one IP address. It does **not** fold a name with its
-address, because that needs DNS; use one spelling per device. A
+address, because that needs DNS, nor the ethernet and WiFi addresses of one
+device, unless they are listed together in the offline alias map
+(`docs/device_locking.md` § "Multi-interface devices", #519), which folds
+them to `uid-<unique_id>`; otherwise use one spelling per device. A
 **non-default port is kept**: only `:80` folds (`DEFAULT_REST_PORT`, the
 client's own default), because `host:80` and `host` name one device while
 `gw:8080` and `gw:8081` do not — `DeviceLock` keys those apart, so a

@@ -24,6 +24,7 @@ import json
 import logging
 import re
 import socket
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -60,6 +61,7 @@ __all__ = [
     "Ultimate64WireFormatError",
     "Ultimate64UnsafeOperationError",
     "Ultimate64TempHygieneError",
+    "Ultimate64DeviceAliasError",
     "Ultimate64UnreachableError",
     "Ultimate64RunnerStuckError",
     "U64UnreachableError",
@@ -67,6 +69,11 @@ __all__ = [
 ]
 
 _log = logging.getLogger(__name__)
+
+#: ``unique_id``\ s already warned as "seen under another key" in this
+#: process (#519): once per device per process, however many clients.
+_IDENTITY_SEEN_WARNED: set[str] = set()
+_IDENTITY_SEEN_GUARD = threading.Lock()
 
 
 class Ultimate64Error(Exception):
@@ -204,6 +211,78 @@ class Ultimate64TempHygieneError(Ultimate64Error):
     disarm the whole pass) if you know the device's ``/Temp`` is being
     kept clean some other way.
     """
+
+
+class Ultimate64DeviceAliasError(Ultimate64TempHygieneError):
+    """One device is being driven under two lock keys (#519).
+
+    Raised before an attachment-creating request when the device that
+    answered this client is either locked right now by another process
+    under a different key (an alias nobody configured: ethernet and WiFi
+    addresses of one U64E or C64U), or is a different device from the one
+    the alias file says this address is.  Two keys mean two queues and two
+    ``/Temp`` budgets for one device, and on leak-prone firmware a split
+    budget walks the device towards the wedge that only a power-cycle
+    clears.
+
+    A subclass of :class:`Ultimate64TempHygieneError`, so existing handlers
+    still catch it.  ``U64_TEMP_GC_REQUIRED=0`` does **not** lift it; the
+    remedy is the alias file the message names (``docs/device_locking.md``,
+    "Multi-interface devices").  On a post-safe grade the same finding is a
+    WARNING unless ``U64_REQUIRE_DEVICE_LOCK=1``.
+    """
+
+
+def _enforce_device_identity(
+    key: str,
+    host: str,
+    unique_id: str | None,
+    operation: str,
+    *,
+    refuse: bool,
+    warned: set[str],
+) -> None:
+    """Act on :func:`~c64_test_harness.backends.device_aliases.check_device_identity`.
+
+    Shared by the client and the free ``liveness_probe`` (#519).  The caller
+    has already established that this process holds *key*'s lock.  A
+    collision or mismatch raises :class:`Ultimate64DeviceAliasError` when
+    *refuse* (a leak-prone grade with hygiene armed) or under
+    ``U64_REQUIRE_DEVICE_LOCK=1``, and is otherwise a WARNING once per
+    message in *warned*.  A ``"seen"`` finding is a WARNING once per device
+    per process.  A broken alias map raises; any other failure of the check
+    is logged at DEBUG and never fails the request.
+    """
+    from .device_aliases import DeviceAliasConfigError, check_device_identity
+
+    try:
+        finding = check_device_identity(key, host, unique_id)
+    except DeviceAliasConfigError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a diagnostic never fails a request
+        _log.debug("device identity check on %s failed: %s", host, exc)
+        return
+    if finding is None:
+        return
+    if finding.kind == "seen":
+        with _IDENTITY_SEEN_GUARD:
+            if str(unique_id).lower() in _IDENTITY_SEEN_WARNED:
+                return
+            _IDENTITY_SEEN_WARNED.add(str(unique_id).lower())
+        _log.warning("Ultimate device %s: %s", host, finding.message)
+        return
+    from .device_lock import require_device_lock
+
+    if refuse or require_device_lock():
+        raise Ultimate64DeviceAliasError(
+            f"refusing {operation} on {host}: {finding.message} "
+            "U64_TEMP_GC_REQUIRED=0 does not lift this refusal."
+        )
+    with _IDENTITY_SEEN_GUARD:
+        if finding.message in warned:
+            return
+        warned.add(finding.message)
+    _log.warning("Ultimate device %s: %s", host, finding.message)
 
 
 class U64UnreachableError(Ultimate64Error):
@@ -486,6 +565,11 @@ class Ultimate64Client:
         self._in_temp_hygiene = False
 
         self._capabilities: DeviceCapabilities | None = None
+        #: ``unique_id`` from the last ``GET /v1/info`` probe, or ``None``.
+        #: Kept for the #519 identity check, which must not issue a request
+        #: of its own.
+        self._device_unique_id: str | None = None
+        self._identity_warned: set[str] = set()
         #: Has a firmware probe ever actually been issued? ``False`` means
         #: nothing was asked and this client is inert by contract (the
         #: caller pinned the threshold); ``True`` with an unreadable grade
@@ -642,7 +726,11 @@ class Ultimate64Client:
         finally:
             self._probing = False
             self.timeout = original
-        return info if isinstance(info, dict) else None
+        if not isinstance(info, dict):
+            return None
+        uid = info.get("unique_id")
+        self._device_unique_id = uid.strip() if isinstance(uid, str) and uid.strip() else None
+        return info
 
     def _maybe_reprobe_capabilities(self) -> None:
         """Re-probe once, on evidence that a device is actually there.
@@ -1063,6 +1151,19 @@ class Ultimate64Client:
         """
         from .ultimate64_temp_gc import TempReservation as _TempReservation
 
+        # Before the ledger lock, not under it: the #519 identity check does
+        # file I/O and flock probes, and every upload on the device queues on
+        # that lock.  It reads only lock and record files, so nothing it
+        # decides depends on the ledger's state.
+        if not self._in_temp_hygiene:
+            # Re-probe first (once per client, bodyless): it is what fills
+            # the unique_id a slow construct-time probe left empty.  Outside
+            # the ledger lock, so a second thread can pass while the first
+            # thread's re-probe is in flight and check with no unique_id yet:
+            # the same one-upload residue the re-probe already accepts for
+            # the grade.
+            self._maybe_reprobe_capabilities()
+            self._check_device_identity(operation)
         ledger = self._temp_ledger
         with ledger.lock:
             self._before_temp_attachment(operation, count)
@@ -1136,6 +1237,32 @@ class Ultimate64Client:
             )
             if self._temp_hygiene_blocked is not None:
                 self._refuse_or_warn(operation)
+
+    def _check_device_identity(self, operation: str) -> None:
+        """Refuse or warn when one device is reached under two keys (#519).
+
+        Uses the ``unique_id`` cached by the capability probe, and lock and
+        record files: no request of its own.  Runs only while this process
+        holds the device's lock, because only a holder knows the answer
+        came from the device it locked.  A client that never probed (an
+        explicit ``write_mem_query_threshold``), or a device whose Unique ID
+        config is empty, gets only the legacy-lockfile check (an older
+        harness holding a configured raw address), which needs no id.
+
+        A collision or a mismatch (see
+        :func:`~c64_test_harness.backends.device_aliases.check_device_identity`)
+        raises :class:`Ultimate64DeviceAliasError` on a leak-prone grade with
+        hygiene armed, and under ``U64_REQUIRE_DEVICE_LOCK=1``; otherwise it
+        is a WARNING.  A device seen under another key that nobody holds is
+        a WARNING once per process.
+        """
+        if not _HAS_DEVICE_LOCK or not self._temp_lock_held():
+            return
+        _enforce_device_identity(
+            self._device_key, self.host, self._device_unique_id, operation,
+            refuse=self._leak_prone_grade() and self.temp_hygiene_armed,
+            warned=self._identity_warned,
+        )
 
     def _leak_prone_grade(self) -> bool:
         """The cached grade does not say post-safe (no I/O).

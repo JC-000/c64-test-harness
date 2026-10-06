@@ -74,8 +74,8 @@ Two things it deliberately does **not** fold:
   can answer differently over time. Keying on a device identity read from
   `GET /v1/info` (the U64E does report `unique_id`) would avoid DNS, but
   it puts a network probe — against a device that may be wedged — in
-  front of taking a lock. **So use one spelling per device**; the
-  canonical spelling on this bench is the bare lowercase IP.
+  front of taking a lock. Join them with the alias map below, which reads
+  no network at all; otherwise use one spelling per device.
 
 `ultimate64_temp_gc.temp_ledger_key`, which keys the `/Temp` ledger,
 delegates to this same function and adds nothing. The two must agree: a spelling that reaches one
@@ -88,6 +88,97 @@ A process still running pre-#434 code holds its lock on the old,
 un-normalised filename. For a bare lowercase IP or hostname (every
 spelling this bench uses) the two filenames are identical; for any other
 spelling, drain the old lane before running new code against the device.
+
+## Multi-interface devices: the alias map
+
+A U64E or C64U has an ethernet interface and a WiFi interface, and each
+answers on its own address. A reflash that resets the config, a DHCP
+lease change, or a switch between wired and WiFi moves the address while
+the device stays the same. If both interfaces are up, both addresses work
+at once. Every address is a separate key, so a lane keyed on `.81` and a
+lane keyed on `.83` take two lockfiles and two `/Temp` ledgers for one
+device, and neither excludes the other
+([#519](https://github.com/JC-000/c64-test-harness/issues/519)).
+
+The fix is to declare once which spellings are one device:
+
+```toml
+# ~/.config/c64-test-harness/devices.toml  (or $C64_DEVICE_ALIASES_FILE)
+[devices.601a96]                       # the device's unique_id
+hosts = ["10.43.23.81", "10.43.23.83", "u64e.lan"]
+```
+
+`normalize_device_host()` folds every listed spelling into
+`uid-601a96`. The lockfile, the `/Temp` ledger and `device_lock_holder()`
+all use that key, so it reaches every harness path in every project on
+the machine that uses the harness. The lockfile record carries both the
+spelling the holder used (`device_host`) and the folded key
+(`device_key`).
+
+- **The table name is the device's `unique_id`** from `GET /v1/info`, not
+  an address. By default the firmware derives it from the flash chip's
+  serial (`getProductUniqueId()` in `software/system/product.cc`). It
+  survives reflashes and DHCP changes, and both interfaces report the
+  same value, which is not true of the MAC. It is still a config item:
+  Network Settings > Unique ID is `Default` (the serial-derived id), a
+  value set by hand, or empty (omitted from `/v1/info`). Read it with a
+  bodyless `GET /v1/info`, which costs no `/Temp` attachment.
+- **For one-off runs**, `C64_DEVICE_ALIASES="601a96=10.43.23.81,10.43.23.83;..."`
+  adds groups. On conflict the environment wins over the file.
+- **Ports.** A port other than the default folds only if it is listed
+  literally (`"10.43.23.81:8080"`). `device_key(host, port)` builds
+  `host:port` before folding.
+- **A broken map is fatal.** These all raise `DeviceAliasConfigError`
+  (`backends/device_aliases.py`) before any lock is tried or any device
+  contacted: a spelling listed under two ids, an empty `hosts`, an unknown
+  key, an id that is not a filename-safe `unique_id`, invalid TOML, or a
+  file present when no TOML parser is available. A missing file is an
+  empty map.
+- **The map is read once per process.** An edit takes effect in new
+  processes only. That is deliberate: a held lock, its release `/Temp`
+  drain and the client's ledger are each looked up by host at different
+  times, and a map that changed in between would key them differently. A
+  broken edit mid-hold would then make `release()` fail with the lock
+  still held. Install or change the file between runs.
+
+### Catching an alias nobody configured
+
+If an address isn't in the map, it keeps its own key. The client catches
+that case **after** it has the lock, without making any request of its
+own. It reuses the `unique_id` from the capability probe it already made,
+and records "device X was reached under key K" in
+`<lock dir>/identity-uid-<id>.json`. Before every attachment-creating
+request it then checks:
+
+| Finding | Leak-prone grade, hygiene armed | Otherwise |
+|---|---|---|
+| A configured address's **raw lockfile** is held by another process (a lane on a harness without the alias map) | `Ultimate64DeviceAliasError` before sending (a `Ultimate64TempHygieneError`; `U64_TEMP_GC_REQUIRED=0` does **not** lift it) | WARNING; raises under `U64_REQUIRE_DEVICE_LOCK=1` |
+| Another key for this device is **locked right now** by the process that recorded it, after recording it (a lane the device has answered) | same refusal | WARNING; raises under `U64_REQUIRE_DEVICE_LOCK=1` |
+| The alias map says this address is a **different device** from the one that answered | same refusal | WARNING; raises under `U64_REQUIRE_DEVICE_LOCK=1` |
+| The device was reached under another key before, and that key is free, or held by a process the device has not answered under it (an address since handed to another device, a lock-only wrapper, a lane that has not uploaded yet) | WARNING once per process | WARNING once per process |
+
+Each message names both keys and gives the exact TOML to add. A stale
+record can only ever produce the warning, never a refusal. When an address
+is recorded under one device it is removed from every other device's
+record. The check does not run for a process that does not hold the lock.
+A client that never probed (one constructed with an explicit
+`write_mem_query_threshold`), or a device whose Unique ID config is empty,
+gets only the raw-lockfile check.
+
+### Migrating lanes
+
+**Retire the #519 stopgap wrapper in the same step that installs the alias
+file.** An upgraded wrapper's `DeviceLock("10.43.23.81")` folds to
+`uid-601a96`, the same key its upgraded child takes, so the child would
+queue behind its own parent until it timed out.
+
+Lanes still on a harness without this change lock the raw address and
+cannot see upgraded lanes. The reverse is covered: an upgraded lane probes
+the raw lockfile of every configured address before each
+attachment-creating request. It is refused on a leak-prone grade, and
+warned on a post-safe one, or refused under `U64_REQUIRE_DEVICE_LOCK=1`.
+Upgrade every lane that drives a device before relying on the map. On the
+U64E, set `U64_REQUIRE_DEVICE_LOCK=1` in upgraded lanes until then.
 
 ## The rules
 

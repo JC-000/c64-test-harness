@@ -198,6 +198,36 @@ def _reset_temp_ledgers(request):
     reset()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_device_aliases(request, monkeypatch, tmp_path_factory):
+    """Keep this machine's device alias map out of unit tests (#519).
+
+    ``normalize_device_host`` folds every spelling listed in
+    ``~/.config/c64-test-harness/devices.toml`` (or ``C64_DEVICE_ALIASES``)
+    into a ``uid-`` key, so a unit test that names a bench address would
+    otherwise lock and account under whatever the owner configured.  Live
+    tests keep the real map: there it is what makes their lock exclude a
+    lane that reaches the same device through its other interface.
+    """
+    node_path = getattr(request.node, "path", None) or request.node.fspath
+    if is_live_test_file(node_path):
+        yield
+        return
+    from c64_test_harness.backends import device_aliases as _aliases
+    from c64_test_harness.backends import ultimate64_client as _client
+
+    _aliases._reset_alias_cache()
+    monkeypatch.setenv(
+        "C64_DEVICE_ALIASES_FILE",
+        str(tmp_path_factory.getbasetemp() / "no-device-aliases.toml"),
+    )
+    monkeypatch.delenv("C64_DEVICE_ALIASES", raising=False)
+    _client._IDENTITY_SEEN_WARNED.clear()
+    yield
+    _client._IDENTITY_SEEN_WARNED.clear()
+    _aliases._reset_alias_cache()
+
+
 class MockTransport:
     """In-memory C64Transport for testing screen/keyboard/memory modules.
 
