@@ -478,7 +478,8 @@ is spared both: it sees the real map, so its lock folds into the same
 the device's count across tests (#522).
 
 The test is `conftest.drives_a_device_file`: every `*_live.py` module, plus
-any `test_*.py` that reads `U64_HOST` without supplying its own. That is the
+any `test_*.py` that reads `U64_HOST` without supplying its own (an
+import-time read always counts). That is the
 same criterion the `U64_ALLOW_MUTATE` config-write scan uses
 (`test_live_mutation_gate.drives_a_named_device`). Today that means the three
 `test_blind_agent_*` modules, `test_bridge_ping_tod.py` and
@@ -486,8 +487,12 @@ same criterion the `U64_ALLOW_MUTATE` config-write scan uses
 
 - **A new module that drives the device** needs no special name. Reading
   `U64_HOST` is enough.
-- **A mocked test that must stay isolated** sets `U64_HOST` itself
-  (`monkeypatch.setenv`). That also keeps it out of the mutation scan.
+- **A mocked test that must stay isolated** sets `U64_HOST` to a host
+  itself (`monkeypatch.setenv("U64_HOST", "fake-host")`) and reads it only
+  inside functions. An empty value or a `delenv` supplies nothing, and a
+  module-level read always counts. That also keeps it out of the mutation
+  scan. A `*_live.py` module is always treated as driving a device, whatever
+  it sets.
 
 `tests/test_conftest_device_module_isolation.py` runs the real conftest over
 generated modules to pin both sides, and fails if the mutation scan ever
