@@ -624,3 +624,66 @@ def test_an_unusable_reported_unique_id_writes_no_record(lock_root, clean_env, u
     lock_root.mkdir(parents=True, exist_ok=True)
     assert da.check_device_identity(ETH, ETH, uid) is None
     assert not list(lock_root.parent.rglob("identity-*"))
+
+
+def test_a_deliberately_disarmed_leak_prone_client_only_warns(lock_root, clean_env, caplog):
+    """temp_hygiene=False is the explicit disarm: a collision is a WARNING
+    there, not a refusal (the docs table's "otherwise" column)."""
+    device = _Device(LEAKY_INFO)
+    with _Holder(ETH, record=UID), patch("urllib.request.urlopen", side_effect=device):
+        lock = DeviceLock(WIFI)
+        assert lock.acquire(timeout=5.0)
+        c = Ultimate64Client(WIFI, warn_unlocked=False, temp_hygiene=False)
+        try:
+            with caplog.at_level(logging.WARNING):
+                c.run_prg(PRG)
+        finally:
+            lock.release()
+    assert any("locked right now under another key" in r.getMessage() for r in caplog.records)
+    assert device.posts()
+
+
+def _probe_sender(info: dict, posts: list):
+    def _send(method, host, port, path, password, timeout, **kwargs):
+        if path == "/v1/info":
+            return 200, json.dumps(info).encode()
+        if method == "POST":
+            posts.append(path)
+        return 200, bytes(128)
+
+    return _send
+
+
+def _reachable():
+    return patch(
+        "c64_test_harness.backends.ultimate64_probe.probe_u64",
+        return_value=MagicMock(reachable=True, error=None),
+    )
+
+
+def test_the_free_liveness_probe_only_warns_on_a_post_safe_grade(
+    lock_root, clean_env, caplog
+):
+    from c64_test_harness.backends.ultimate64_probe import liveness_probe
+
+    posts: list[str] = []
+    with _Holder(ETH, record=UID), _reachable():
+        lock = DeviceLock(WIFI)
+        assert lock.acquire(timeout=5.0)
+        try:
+            with caplog.at_level(logging.WARNING):
+                liveness_probe(WIFI, request=_probe_sender(FIXED_INFO, posts))
+        finally:
+            lock.release()
+    assert any("locked right now under another key" in r.getMessage() for r in caplog.records)
+    assert posts, "a post-safe device must not be refused"
+
+
+def test_an_unlocked_free_liveness_probe_writes_no_identity_record(lock_root, clean_env):
+    from c64_test_harness.backends.ultimate64_probe import liveness_probe
+
+    posts: list[str] = []
+    with _reachable():
+        liveness_probe(ETH, request=_probe_sender(FIXED_INFO, posts))
+    assert posts
+    assert not list(lock_root.parent.rglob("identity-*"))

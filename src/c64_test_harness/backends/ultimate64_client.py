@@ -1157,7 +1157,11 @@ class Ultimate64Client:
         # decides depends on the ledger's state.
         if not self._in_temp_hygiene:
             # Re-probe first (once per client, bodyless): it is what fills
-            # the unique_id a slow construct-time probe left empty.
+            # the unique_id a slow construct-time probe left empty.  Outside
+            # the ledger lock, so a second thread can pass while the first
+            # thread's re-probe is in flight and check with no unique_id yet:
+            # the same one-upload residue the re-probe already accepts for
+            # the grade.
             self._maybe_reprobe_capabilities()
             self._check_device_identity(operation)
         ledger = self._temp_ledger
