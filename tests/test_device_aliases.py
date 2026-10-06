@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import socket
 import multiprocessing
 import os
 import time
@@ -77,7 +78,7 @@ def lock_root(tmp_path, monkeypatch):
 BENCH = f'[devices.{UID}]\nhosts = ["{ETH}", "{WIFI}"]\n'
 
 
-def _hold(host, started, stop, lock_dir, record=None, reacquire=False):
+def _hold(host, started, stop, lock_dir, record=None, reacquire=False, record_again=False):
     lock = DeviceLock(host, lock_dir=Path(lock_dir) if lock_dir else None)
     if not lock.acquire(timeout=5.0):
         return
@@ -90,6 +91,9 @@ def _hold(host, started, stop, lock_dir, record=None, reacquire=False):
                 lock.release()
                 time.sleep(0.05)
                 assert lock.acquire(timeout=5.0)
+                if record_again:
+                    # ...and has been answered again (its next upload).
+                    da.check_device_identity(normalize_device_host(host), host, record)
         started.set()
         stop.wait(timeout=20.0)
     finally:
@@ -102,13 +106,15 @@ class _Holder:
     def __init__(
         self, host: str, lock_dir: Path | None = None, *,
         record: str | None = None, reacquire: bool = False,
+        record_again: bool = False,
     ) -> None:
         ctx = multiprocessing.get_context("spawn")
         self._started, self._stop = ctx.Event(), ctx.Event()
         self._proc = ctx.Process(
             target=_hold,
             args=(host, self._started, self._stop,
-                  str(lock_dir) if lock_dir else None, record, reacquire),
+                  str(lock_dir) if lock_dir else None, record, reacquire,
+                  record_again),
         )
 
     def __enter__(self):
@@ -531,3 +537,90 @@ def test_a_recorder_that_re_took_the_lock_since_is_not_a_collision(lock_root, cl
     a = _Device(LEAKY_INFO)
     with _Holder(WIFI, record=UID, reacquire=True):
         _a_lane_on_eth_is_not_refused(a)
+
+
+def test_a_lane_that_re_took_the_lock_and_was_answered_again_is_a_collision(
+    lock_root, clean_env
+):
+    """Per-test locking: every pytest lane re-acquires between tests.  Its
+    record must follow its current hold, or detection decays to "seen" from
+    its second test on (round-2 review, finding 1)."""
+    device = _Device(LEAKY_INFO)
+    with _Holder(ETH, record=UID, reacquire=True, record_again=True), \
+            patch("urllib.request.urlopen", side_effect=device), _sweeps_ok():
+        c, lock = _locked_client(WIFI, device)
+        device.wire.clear()
+        try:
+            with pytest.raises(Ultimate64DeviceAliasError):
+                c.run_prg(PRG)
+        finally:
+            lock.release()
+    assert device.posts() == []
+
+
+class _SlowFirstInfo(_Device):
+    """The construct-time ``/v1/info`` times out; later requests answer."""
+
+    def __init__(self, info: dict) -> None:
+        super().__init__(info)
+        self._slow = True
+
+    def __call__(self, req, timeout=None):
+        if self._slow and urllib.parse.urlsplit(req.full_url).path == "/v1/info":
+            self._slow = False
+            raise socket.timeout("slow first probe")
+        return super().__call__(req, timeout)
+
+
+def test_the_first_upload_after_a_slow_construct_probe_is_still_checked(
+    lock_root, clean_env
+):
+    """The re-probe fills the unique_id; the check must run after it
+    (round-2 review, finding 2)."""
+    device = _SlowFirstInfo(LEAKY_INFO)
+    with _Holder(ETH, record=UID), patch("urllib.request.urlopen", side_effect=device), \
+            _sweeps_ok():
+        c, lock = _locked_client(WIFI, device)
+        try:
+            assert c._device_unique_id is None, "the construct-time probe should have failed"
+            c.get_version()                 # the device has now answered a request
+            device.wire.clear()
+            with pytest.raises(Ultimate64DeviceAliasError):
+                c.run_prg(PRG)
+        finally:
+            lock.release()
+    assert device.posts() == []
+
+
+def test_the_free_liveness_probe_is_checked_before_it_reserves(lock_root, clean_env):
+    """Round-2 review, finding 3: the root-exported probe reserves two POSTs."""
+    from c64_test_harness.backends.ultimate64_probe import liveness_probe
+
+    posts: list[str] = []
+
+    def _send(method, host, port, path, password, timeout, **kwargs):
+        if path == "/v1/info":
+            return 200, json.dumps(LEAKY_INFO).encode()
+        if method == "POST":
+            posts.append(path)
+        return 200, bytes(128)
+
+    with _Holder(ETH, record=UID), _sweeps_ok(), patch(
+        "c64_test_harness.backends.ultimate64_probe.probe_u64",
+        return_value=MagicMock(reachable=True, error=None),
+    ):
+        lock = DeviceLock(WIFI)
+        assert lock.acquire(timeout=5.0)
+        try:
+            with pytest.raises(Ultimate64DeviceAliasError):
+                liveness_probe(WIFI, request=_send)
+        finally:
+            lock.release()
+    assert posts == []
+
+
+@pytest.mark.parametrize("uid", ["ab cd", "../x", "x" * 17])
+def test_an_unusable_reported_unique_id_writes_no_record(lock_root, clean_env, uid):
+    lock_root.mkdir(parents=True, exist_ok=True)
+    assert da.check_device_identity(ETH, ETH, uid) is None
+    assert not list(lock_root.parent.rglob("identity-*"))

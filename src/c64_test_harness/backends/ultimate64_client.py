@@ -233,6 +233,58 @@ class Ultimate64DeviceAliasError(Ultimate64TempHygieneError):
     """
 
 
+def _enforce_device_identity(
+    key: str,
+    host: str,
+    unique_id: str | None,
+    operation: str,
+    *,
+    refuse: bool,
+    warned: set[str],
+) -> None:
+    """Act on :func:`~c64_test_harness.backends.device_aliases.check_device_identity`.
+
+    Shared by the client and the free ``liveness_probe`` (#519).  The caller
+    has already established that this process holds *key*'s lock.  A
+    collision or mismatch raises :class:`Ultimate64DeviceAliasError` when
+    *refuse* (a leak-prone grade with hygiene armed) or under
+    ``U64_REQUIRE_DEVICE_LOCK=1``, and is otherwise a WARNING once per
+    message in *warned*.  A ``"seen"`` finding is a WARNING once per device
+    per process.  A broken alias map raises; any other failure of the check
+    is logged at DEBUG and never fails the request.
+    """
+    from .device_aliases import DeviceAliasConfigError, check_device_identity
+
+    try:
+        finding = check_device_identity(key, host, unique_id)
+    except DeviceAliasConfigError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a diagnostic never fails a request
+        _log.debug("device identity check on %s failed: %s", host, exc)
+        return
+    if finding is None:
+        return
+    if finding.kind == "seen":
+        with _IDENTITY_SEEN_GUARD:
+            if str(unique_id).lower() in _IDENTITY_SEEN_WARNED:
+                return
+            _IDENTITY_SEEN_WARNED.add(str(unique_id).lower())
+        _log.warning("Ultimate device %s: %s", host, finding.message)
+        return
+    from .device_lock import require_device_lock
+
+    if refuse or require_device_lock():
+        raise Ultimate64DeviceAliasError(
+            f"refusing {operation} on {host}: {finding.message} "
+            "U64_TEMP_GC_REQUIRED=0 does not lift this refusal."
+        )
+    with _IDENTITY_SEEN_GUARD:
+        if finding.message in warned:
+            return
+        warned.add(finding.message)
+    _log.warning("Ultimate device %s: %s", host, finding.message)
+
+
 class U64UnreachableError(Ultimate64Error):
     """Raised by :meth:`Ultimate64Client.assert_healthy` when the device
     fails the reachability portion of the writemem-degradation liveness
@@ -1104,6 +1156,9 @@ class Ultimate64Client:
         # that lock.  It reads only lock and record files, so nothing it
         # decides depends on the ledger's state.
         if not self._in_temp_hygiene:
+            # Re-probe first (once per client, bodyless): it is what fills
+            # the unique_id a slow construct-time probe left empty.
+            self._maybe_reprobe_capabilities()
             self._check_device_identity(operation)
         ledger = self._temp_ledger
         with ledger.lock:
@@ -1197,39 +1252,13 @@ class Ultimate64Client:
         is a WARNING.  A device seen under another key that nobody holds is
         a WARNING once per process.
         """
-        uid = self._device_unique_id
         if not _HAS_DEVICE_LOCK or not self._temp_lock_held():
             return
-        from .device_aliases import DeviceAliasConfigError, check_device_identity
-
-        try:
-            finding = check_device_identity(self._device_key, self.host, uid)
-        except DeviceAliasConfigError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - a diagnostic never fails a request
-            _log.debug("device identity check on %s failed: %s", self.host, exc)
-            return
-        if finding is None:
-            return
-        if finding.kind == "seen":
-            with _IDENTITY_SEEN_GUARD:
-                if str(uid).lower() in _IDENTITY_SEEN_WARNED:
-                    return
-                _IDENTITY_SEEN_WARNED.add(str(uid).lower())
-            _log.warning("Ultimate device %s: %s", self.host, finding.message)
-            return
-        from .device_lock import require_device_lock
-
-        message = f"refusing {operation} on {self.host}: {finding.message}"
-        if (self._leak_prone_grade() and self.temp_hygiene_armed) or require_device_lock():
-            raise Ultimate64DeviceAliasError(
-                message + " U64_TEMP_GC_REQUIRED=0 does not lift this refusal."
-            )
-        with _IDENTITY_SEEN_GUARD:
-            if finding.message in self._identity_warned:
-                return
-            self._identity_warned.add(finding.message)
-        _log.warning("Ultimate device %s: %s", self.host, finding.message)
+        _enforce_device_identity(
+            self._device_key, self.host, self._device_unique_id, operation,
+            refuse=self._leak_prone_grade() and self.temp_hygiene_armed,
+            warned=self._identity_warned,
+        )
 
     def _leak_prone_grade(self) -> bool:
         """The cached grade does not say post-safe (no I/O).

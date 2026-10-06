@@ -713,6 +713,32 @@ def _probe_hygiene_armed_by_grade(firmware_version: str | None) -> bool:
     return caps.runner_wedge_possible is not False
 
 
+#: Identity-check WARNINGs already given by the free probe (#519).
+_PROBE_IDENTITY_WARNED: set[str] = set()
+
+
+def _probe_identity_check(
+    key: str, host: str, unique_id: str | None, *, operation: str, refuse: bool
+) -> None:
+    """The client's #519 identity check, for the free ``liveness_probe``.
+
+    Runs before the probe reserves its two POSTs, from the ``/v1/info`` the
+    probe has just read, and only while this process holds the device's
+    lock (as the client's does).  See
+    ``ultimate64_client._enforce_device_identity``.
+    """
+    if not _HAS_DEVICE_LOCK:
+        return
+    from .ultimate64_client import _enforce_device_identity
+    from .ultimate64_temp_gc import lock_held_for
+
+    if not lock_held_for(key):
+        return
+    _enforce_device_identity(
+        key, host, unique_id, operation, refuse=refuse, warned=_PROBE_IDENTITY_WARNED
+    )
+
+
 def _reserve_probe_attachments(
     host: str,
     count: int,
@@ -979,7 +1005,7 @@ def liveness_probe(
         # its accounted sender checks the lock per request, so warning again
         # here would double up on the one caller that already reports it.
         _warn_unlocked_client(key, what="liveness_probe", logger=_log)
-    state: dict[str, bool | None] = {"wrote": False, "restored": None}
+    state: dict[str, object] = {"wrote": False, "restored": None}
     send = request if request is not None else _liveness_request
     cost = Ultimate64Client.LIVENESS_PROBE_TEMP_ATTACHMENTS
     sent = [0]
@@ -990,12 +1016,19 @@ def liveness_probe(
 
         def on_firmware(firmware_version: str | None) -> None:  # noqa: F811
             nonlocal reservation
+            armed = _probe_hygiene_armed(firmware_version)
+            leak_prone = _probe_hygiene_armed_by_grade(firmware_version)
+            _probe_identity_check(
+                key, host, state.get("unique_id"),  # type: ignore[arg-type]
+                operation=f"liveness_probe on {host}",
+                refuse=armed and leak_prone,
+            )
             reservation = _reserve_probe_attachments(
                 host,
                 cost,
                 key=key,
-                armed=_probe_hygiene_armed(firmware_version),
-                leak_prone=_probe_hygiene_armed_by_grade(firmware_version),
+                armed=armed,
+                leak_prone=leak_prone,
                 operation=(
                     f"liveness_probe on {host} "
                     f"({cost} x POST /v1/machine:writemem)"
@@ -1038,7 +1071,7 @@ def _liveness_probe_steps(
     http_timeout: float,
     skip_ping: bool,
     send: "Callable[..., tuple[int, bytes]]",
-    state: "dict[str, bool | None]",
+    state: "dict[str, object]",
     on_firmware: "Callable[[str | None], None] | None" = None,
 ) -> LivenessResult:
     """The probe itself; records in *state* whether it wrote and restored.
@@ -1090,6 +1123,10 @@ def _liveness_probe_steps(
                 fw = info.get("firmware_version")
                 if isinstance(fw, str):
                     firmware_version = fw
+                uid = info.get("unique_id")
+                if isinstance(uid, str) and uid.strip():
+                    # For the #519 identity check before the reservation.
+                    state["unique_id"] = uid.strip()
     except (
         socket.timeout,
         urllib.error.URLError,

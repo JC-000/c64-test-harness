@@ -523,7 +523,8 @@ def test_concurrent_clients_count_every_attachment(host):
     assert _client(host, FIXED).pending_temp_attachments == threads * per_thread
 
 
-def test_concurrent_budget_crossings_sweep_without_losing_the_bound(host):
+@pytest.mark.parametrize("threads,budget", [(6, 4), (3, 4)], ids=["over", "within"])
+def test_concurrent_budget_crossings_sweep_without_losing_the_bound(host, threads, budget):
     """Every attachment is either collected by a sweep or still pending, and
     the count stays bounded.  The bound is ``max(budget, threads)``, not
     ``budget``: a sweep must keep every upload still in flight
@@ -532,8 +533,10 @@ def test_concurrent_budget_crossings_sweep_without_losing_the_bound(host):
     The old ``<= budget`` assertion held only while uploads rarely
     overlapped -- a 1 ms delay in the fake device fails it on master 3/3
     (#519 PR).  Without sweeps the count would climb to
-    ``threads * per_thread``."""
-    threads, per_thread, budget = 6, 20, 4
+    ``threads * per_thread``.  The ``within`` case (threads below the
+    budget) keeps the exact ``<= budget`` bound, so an off-by-one in the
+    sweep condition still fails here."""
+    per_thread = 20
     seen: list[int] = []
     guard = threading.Lock()
     start = threading.Barrier(threads)
