@@ -900,8 +900,10 @@ So on a leak-prone device **`run_prg_via_sys(target, prg)` is the low-risk way t
    `U64_AUTO_TEMP_GC=1`. The drain on `close()` / `DeviceLock` release also sweeps for a client that **leaked nothing**, so a lane inheriting a dirty `/Temp` collects it on the way out (issue #264). That inherited-only sweep runs only under the device lock (lock release, or `close()` while holding it). If it fails it writes no config and sets no block: it logs a WARNING that FTP File Service must be enabled by hand. It does not count as a sweep, though, so the next upload sweeps first and is refused if that fails too (#511). Only a client that leaked gets the automatic FTP-enable attempt — a `Network Settings` write that persists until a firmware power-on (issue #263). **The budget is per device within one process** (#295):
    every client of one host shares one count, so a fresh client per upload does not
    reset it, and a lock release sweeps once per host however many clients exist. A
-   name and its IP address are separate ledgers (no DNS), so use one spelling per
-   device; a non-default `:port` in the host string is likewise a separate ledger,
+   name and its IP address, or a device's ethernet and WiFi addresses, are separate
+   ledgers (no DNS, no probe) unless they are listed together in the offline alias
+   map (`~/.config/c64-test-harness/devices.toml`, folded to `uid-<unique_id>`, #519);
+   otherwise use one spelling per device. A non-default `:port` in the host string is likewise a separate ledger,
    matching how `DeviceLock` keys devices (only `:80` folds). It is **not** shared
    across processes, and it does not have to be: a new process's ledger has never
    swept, so its first upload sweeps first (enabling FTP File Service once if FTP

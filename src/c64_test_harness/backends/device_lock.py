@@ -159,16 +159,18 @@ def normalize_device_host(host: str) -> str:
     string, so every caller holding a separate ``port`` folds it in with
     :func:`device_key`.
 
-    **A name and the address it resolves to are not folded.**  That would
-    need a DNS lookup in the keying path, which can block for seconds and
-    can answer differently over time, and the lock is taken on paths that
-    must not do network I/O.  So ``c64u.lan`` and ``10.53.21.158`` remain
-    two keys for one device: use one spelling per device.  Documented
-    limit, pinned by ``tests/test_temp_budget_per_device.py::
+    **A name and the address it resolves to are not folded automatically.**
+    That would need a DNS lookup in the keying path, which can block for
+    seconds and can answer differently over time, and the lock is taken on
+    paths that must not do network I/O.  So, unless both are listed in the
+    alias map below, ``c64u.lan`` and ``10.53.21.158`` remain two keys for
+    one device.  Pinned for the unlisted case by
+    ``tests/test_temp_budget_per_device.py::
     test_a_name_and_an_ip_are_not_merged_documented_limit``.  Keying on a
-    device identity read from ``GET /v1/info`` (the U64E reports
-    ``unique_id``) would close it, but it puts a network probe -- and a
-    device that may be wedged -- in the path of taking a lock.
+    ``unique_id`` *probed* from ``GET /v1/info`` is rejected for the same
+    reason: it would put a network probe, aimed at a device that may be
+    wedged, in the path of taking a lock.  The alias map uses the same id
+    from local configuration instead.
 
     **Multi-interface devices** (#519).  A U64E or C64U answers on ethernet
     and WiFi at different addresses, and either address can move (DHCP, a
@@ -256,8 +258,9 @@ def device_key(host: str, port: int = DEFAULT_DEVICE_PORT) -> str:
 def _device_lock_key(host: str) -> str:
     """Filename component identifying *host*'s device lock.
 
-    :func:`normalize_device_host` first, so every spelling of one device
-    reaches one lockfile, then :func:`_sanitize_device_id` to make the
+    :func:`normalize_device_host` first, so every spelling it folds (and
+    every address the alias map lists for one device) reaches one lockfile,
+    then :func:`_sanitize_device_id` to make the
     result safe to put in a filename.  Keying on the raw string is what
     let ``U64.lan``, ``u64.lan``, ``http://u64.lan/`` and ``u64.lan:80``
     take four lockfiles for one device on a case-sensitive filesystem
@@ -657,8 +660,10 @@ class DeviceLockTimeout(TimeoutError):
 class DeviceLock:
     """Cross-process exclusive lock for a hardware device.
 
-    Uses ``fcntl.flock(LOCK_EX)`` on a per-device lockfile keyed by a
-    sanitized device identifier (hostname or IP).  The kernel releases
+    Uses ``fcntl.flock(LOCK_EX)`` on a per-device lockfile keyed by
+    :func:`normalize_device_host` (sanitised for a filename): the host
+    string's normal form, or ``uid-<unique_id>`` for an address listed in
+    the alias map (#519).  The kernel releases
     the lock automatically when the process exits or the file descriptor
     is closed, so this is crash-safe.
 
