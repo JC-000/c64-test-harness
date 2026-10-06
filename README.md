@@ -162,7 +162,7 @@ Hardware reading, in order:
 ### Ultimate hardware (U64 / U64E fw 3.x, C64 Ultimate fw 1.x)
 
 - **REST transport:** `Ultimate64Transport` provides memory, screen, keyboard and reset over HTTP. `Ultimate64InstanceManager` pools several devices and works with `run_parallel()`.
-- **Queue-aware device locking:** `DeviceLock` serializes access to a shared device across processes. It heartbeats while held, so a waiter queued behind a live, progressing holder keeps waiting instead of timing out. A chain of holders handing the lock on is capped (`_MAX_HOLDER_HANDOFFS`). `acquire_or_raise()` raises `DeviceLockTimeout`, whose message says whether you are queued, the holder looks wedged, or the lock is stale. `U64_DEVICE_LOCK_TIMEOUT` is a wait budget, not a gate. The optional `c64-test-harness[notify]` extra adds `watchdog`-based wakeups. Full contract in [docs/device_locking.md](docs/device_locking.md).
+- **Queue-aware device locking:** `DeviceLock` serializes access to a shared device across processes. It heartbeats while held, so a waiter queued behind a live, progressing holder keeps waiting instead of timing out. A chain of holders handing the lock on is capped (`_MAX_HOLDER_HANDOFFS`). `acquire_or_raise()` raises `DeviceLockTimeout`, whose message says whether you are queued, the holder looks wedged, or the lock is stale. `U64_DEVICE_LOCK_TIMEOUT` is a wait budget, not a gate. A device's ethernet and WiFi addresses, or a name and its IP, share one lock once they are listed in the offline alias map (`devices.toml`, #519). The optional `c64-test-harness[notify]` extra adds `watchdog`-based wakeups. Full contract in [docs/device_locking.md](docs/device_locking.md).
 - **Known state on entry:** `apply_factory_baseline()` resets the covered config categories to the firmware's defaults and asserts `current == default`. The manager runs it at `acquire()` on a U64E ([below](#unified-backend-manager)).
 - **Automatic `/Temp` hygiene on leak-prone firmware** (C64 Ultimate 1.1.0; any Ultimate-line < 3.15):
   - The client sweeps `/Temp` over FTP before the first upload after this process takes the device's `DeviceLock` (or its first upload ever), and before every further upload once one attachment is pending (budget 1, keep 1, mounted images kept; #511). It also sweeps on `close()` and on `DeviceLock` release.
@@ -623,7 +623,22 @@ The reasons for each never-touch store, the precedence rules and the live covera
 
 ### Shared-device contract (`DeviceLock`)
 
-**Any tool that touches a shared device must acquire that device's `DeviceLock` first, and hold it for the whole job.** This includes read-mostly tools: a reboot issued by somebody else invalidates a reader mid-measurement just as thoroughly as it invalidates a writer. The lockfile is machine-global (`$XDG_RUNTIME_DIR`, else `/tmp/c64-test-harness-<uid>`, keyed by the normalised host — case, scheme, path, trailing dot and `:80` fold to one lockfile since #434; a device on another port is `DeviceLock(device_key(host, port))`, from `backends.device_lock`; a hostname and its IP address are still two keys, so use one spelling per device — see [docs/device_locking.md](docs/device_locking.md)), so every checkout, venv, and downstream repo on the machine converges on the same lock without configuration.
+**Any tool that touches a shared device must acquire that device's `DeviceLock` first, and hold it for the whole job.** This includes read-mostly tools: a reboot issued by somebody else invalidates a reader mid-measurement just as thoroughly as it invalidates a writer. The lockfile is machine-global (`$XDG_RUNTIME_DIR`, else `/tmp/c64-test-harness-<uid>`, keyed by the normalised host — case, scheme, path, trailing dot and `:80` fold to one lockfile since #434; a device on another port is `DeviceLock(device_key(host, port))`, from `backends.device_lock`; a hostname and its IP, or a device's ethernet and WiFi addresses, are two keys unless they are listed together in the offline alias map — see below), so every checkout, venv, and downstream repo on the machine converges on the same lock without configuration.
+
+**Multi-interface devices (#519).** A U64E or C64U answers on ethernet and WiFi at different addresses, and either address can move with DHCP, a reflash or a change of interface. Declare every address a device answers on in `~/.config/c64-test-harness/devices.toml` (or `$C64_DEVICE_ALIASES_FILE`; `C64_DEVICE_ALIASES="601a96=10.43.23.81,10.43.23.83"` for one-off runs):
+
+```toml
+[devices.601a96]            # the device's unique_id, from GET /v1/info
+hosts = ["10.43.23.81", "10.43.23.83"]
+```
+
+Every listed spelling then shares one lockfile and one `/Temp` ledger, `uid-601a96`. The map is local configuration, read once per process, with no network I/O on the lock path; a broken map raises `DeviceAliasConfigError` before anything is locked or sent. Once a lane holds the lock, the client and the free `liveness_probe` catch three cases the map alone cannot prevent:
+
+- the device is reached under an unlisted second key, held by another lane the device has answered under that key;
+- a lane on an older harness is holding a listed raw address;
+- a listed address answers as a different device from the one configured.
+
+On a leak-prone grade with `/Temp` hygiene armed, each of these raises `Ultimate64DeviceAliasError` before the upload. Otherwise it is a WARNING, or a refusal under `U64_REQUIRE_DEVICE_LOCK=1`. Details and the migration notes are in [docs/device_locking.md § Multi-interface devices](docs/device_locking.md#multi-interface-devices-the-alias-map).
 
 The contract exists because unlocked access is not a theoretical problem. On 2026-07-19 a locked `c64-nist-curves` ECDSA bench was rebooted mid-sweep by two jobs that drove the same device without locking; the bench spent its per-primitive timeouts against a machine sitting at `READY` and the whole sweep was discarded.
 

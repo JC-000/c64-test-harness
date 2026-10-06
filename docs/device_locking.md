@@ -56,9 +56,11 @@ The key is `normalize_device_host()` (in `backends/device_lock.py`)
 followed by the filename sanitiser. It folds case, surrounding
 whitespace, an `http(s)://` scheme, a trailing path, IPv6 brackets, a
 trailing dot, the `:80` default port, and the textual forms of one IP
-address.
+address. As its last step it folds every spelling listed in the offline
+alias map into `uid-<unique_id>`
+([below](#multi-interface-devices-the-alias-map), #519).
 
-Two things it deliberately does **not** fold:
+Two things it does **not** fold on its own:
 
 - **A non-default port.** `gw:8080` and `gw:8081` are two devices behind
   one name, and merging them would let one device's failed `/Temp`
@@ -68,14 +70,15 @@ Two things it deliberately does **not** fold:
   `device_lock`, which also re-brackets IPv6 (`[::1]:8080`). Lock a device
   on another port as `DeviceLock(device_key(host, port))`, or the lock does
   not cover that client and its lock-release `/Temp` drain never runs.
-- **A name and the address it resolves to.** `c64u.lan` and
-  `10.53.21.158` stay two keys for one device. Folding them needs a DNS
-  lookup in the path that takes the lock, which can block for seconds and
-  can answer differently over time. Keying on a device identity read from
-  `GET /v1/info` (the U64E does report `unique_id`) would avoid DNS, but
-  it puts a network probe — against a device that may be wedged — in
-  front of taking a lock. Join them with the alias map below, which reads
-  no network at all; otherwise use one spelling per device.
+- **Two spellings that only the network can relate**: a name and the
+  address it resolves to (`c64u.lan` and `10.53.21.158`), or a device's
+  ethernet and WiFi addresses. Folding them automatically needs either a
+  DNS lookup or a `GET /v1/info` probe in the path that takes the lock.
+  Either can block for seconds, and the probe is aimed at a device that
+  may already be wedged. Instead, list them together in the alias map
+  below, which uses the device's `unique_id` without contacting it. A
+  spelling that isn't listed keeps its own key, so use one spelling per
+  device.
 
 `ultimate64_temp_gc.temp_ledger_key`, which keys the `/Temp` ledger,
 delegates to this same function and adds nothing. The two must agree: a spelling that reaches one
