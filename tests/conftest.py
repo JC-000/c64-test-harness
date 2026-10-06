@@ -44,6 +44,23 @@ def is_live_test_file(path: str) -> bool:
     return os.path.basename(str(path)).endswith("_live.py")
 
 
+def drives_a_device_file(path: str) -> bool:
+    """Whether *path* is a module that drives a real device when gated in.
+
+    That is every ``*_live.py`` module plus the ``test_blind_agent_*``
+    modules, which drive the device under ``U64_HOST`` through
+    ``UnifiedManager(backend="u64")`` without the ``_live`` suffix.  The
+    per-device isolation fixtures below (the alias map and the ``/Temp``
+    ledger reset) spare these modules: there the real map is what folds
+    their lock into the same ``uid-`` key every other lane on that device
+    uses, and the ledger's count describes the device across tests (#522).
+    The live *lock* guard still keys on :func:`is_live_test_file` alone,
+    because a blind-agent module's ``UnifiedManager`` takes its own lock.
+    """
+    name = os.path.basename(str(path))
+    return is_live_test_file(path) or name.startswith("test_blind_agent_")
+
+
 def live_device_host(module: object = None) -> str | None:
     """Resolve the device a live test module drives, or ``None``.
 
@@ -173,8 +190,9 @@ def _reset_temp_ledgers(request):
 
     The ledger is process-wide by design, so a unit test that leaks against
     ``fake-host`` would otherwise leave a count, or a hygiene block, for the
-    next test that builds a client on that name.  Live tests keep it: there
-    the count describes a real device across tests.
+    next test that builds a client on that name.  Modules that
+    drive a device (:func:`drives_a_device_file`, #522) keep it: there the
+    count describes a real device across tests.
 
     **Test-only, and deliberately not a full reset.**  It clears the
     registry, so clients built afterwards get fresh ledgers, while a client
@@ -188,7 +206,7 @@ def _reset_temp_ledgers(request):
     the test.
     """
     node_path = getattr(request.node, "path", None) or request.node.fspath
-    if is_live_test_file(node_path):
+    if drives_a_device_file(node_path):
         yield
         return
     from c64_test_harness.backends.ultimate64_temp_gc import _reset_temp_ledgers as reset
@@ -205,12 +223,13 @@ def _isolate_device_aliases(request, monkeypatch, tmp_path_factory):
     ``normalize_device_host`` folds every spelling listed in
     ``~/.config/c64-test-harness/devices.toml`` (or ``C64_DEVICE_ALIASES``)
     into a ``uid-`` key, so a unit test that names a bench address would
-    otherwise lock and account under whatever the owner configured.  Live
-    tests keep the real map: there it is what makes their lock exclude a
-    lane that reaches the same device through its other interface.
+    otherwise lock and account under whatever the owner configured.
+    Modules that drive a device (:func:`drives_a_device_file`) keep the real
+    map: there it is what makes their lock exclude a lane that reaches the
+    same device through its other interface (#522).
     """
     node_path = getattr(request.node, "path", None) or request.node.fspath
-    if is_live_test_file(node_path):
+    if drives_a_device_file(node_path):
         yield
         return
     from c64_test_harness.backends import device_aliases as _aliases
