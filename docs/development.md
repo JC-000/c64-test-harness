@@ -466,6 +466,41 @@ value itself: a malformed value silently became 300 s, and `0`, `inf` or
 `nan` reached the lock as an unchecked explicit timeout. Now a bad value
 fails the live test up front.
 
+### Which test modules count as driving a device
+
+`tests/conftest.py` isolates ordinary unit tests from the machine's device
+state. It hides the device alias map (`~/.config/c64-test-harness/devices.toml`
+and `C64_DEVICE_ALIASES`, #519), so a unit test that names a bench address
+locks and accounts under the raw address. It also resets the process-wide
+`/Temp` ledgers around every test. A module that drives the operator's device
+is spared both: it sees the real map, so its lock folds into the same
+`uid-<unique_id>` key as every other lane on that device, and its ledger keeps
+the device's count across tests (#522).
+
+The test is `conftest.drives_a_device_file`: every `*_live.py` module, plus
+any `test_*.py` that reads `U64_HOST` without supplying its own (an
+import-time read always counts). That is the
+same criterion the `U64_ALLOW_MUTATE` config-write scan uses
+(`test_live_mutation_gate.drives_a_named_device`). Today that means the three
+`test_blind_agent_*` modules, `test_bridge_ping_tod.py` and
+`test_stress_smoke.py`. So the module's content decides, not its name:
+
+- **A new module that drives the device** needs no special name. Reading
+  `U64_HOST` is enough.
+- **A mocked test that must stay isolated** sets `U64_HOST` to a host
+  itself (`monkeypatch.setenv("U64_HOST", "fake-host")`) and reads it only
+  inside functions. An empty value or a `delenv` supplies nothing, and a
+  module-level read always counts. That also keeps it out of the mutation
+  scan. A `*_live.py` module is always treated as driving a device, whatever
+  it sets.
+
+`tests/test_conftest_device_module_isolation.py` runs the real conftest over
+generated modules to pin both sides, and fails if the mutation scan ever
+selects a module the predicate does not spare. The live **lock** guard is
+narrower: it still holds the `DeviceLock` only around `*_live.py` modules.
+The other device modules lock themselves (`UnifiedManager(backend="u64")`, an
+in-module `DeviceLock`, or the script they run).
+
 ### Hardware and network live gates (all opt-in, skip cleanly when unset)
 
 Most gates below also need `U64_HOST` (or the test's own host knob), and
