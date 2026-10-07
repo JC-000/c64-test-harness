@@ -855,8 +855,7 @@ def test_unmount_disk_url():
 def test_build_multipart_file_name_none_omits_the_filename_attribute():
     """``file_name=None`` emits ``name="file"`` with no ``filename=`` (#417 review).
 
-    A string ``file_name`` still emits the attribute, so ``mount_disk``'s
-    named part (#421) is unchanged.
+    A string ``file_name`` still emits the attribute.
     """
     unnamed = _build_multipart(
         "B", fields={}, file_field="file", file_name=None, file_bytes=b"\x01",

@@ -119,8 +119,10 @@ FTP_PASSWORD_ENV = "U64_TEMP_GC_FTP_PASSWORD"
 #: counter is HEX, not decimal -- ``temp0009`` is followed by
 #: ``temp000A`` -- so the suffix must accept a-f/A-F, not just digits
 #: (issue #153 correction; a decimal-only pattern silently leaves every
-#: lettered name uncollected). Deliberately narrow -- user files and
-#: mounted disk images that also live in /Temp must never match.
+#: lettered name uncollected). Deliberately narrow -- user files and named
+#: uploads that also live in /Temp must never match. Images uploaded
+#: unnamed (harness ``mount_disk`` since #427) do match; a mounted one is
+#: protected by the ``GET /v1/drives`` exclusion, not by this pattern.
 _MANAGED_ATTACHMENT_RE = re.compile(r"^temp([0-9a-fA-F]+)$")
 
 #: How many of the youngest managed attachments a sweep leaves in place.
@@ -707,8 +709,9 @@ def _managed_names_in(payload: Any) -> set[str]:
     (#418). A mounted name also appears at different depths across
     generations: measured on the U64E (fw 3.15 bce4535e, 2026-09-15,
     n=1) as ``/Temp/cache/upload/temp0082``, while the C64U's 1.1.0
-    writes it at ``/Temp/temp%04x`` (source-read, #311), which is the one
-    the top-level sweep actually lists.
+    reports it at ``/Temp/temp%04x`` (measured 2026-10-07, n=1, #427:
+    ``/Temp/temp0003``), which is the one the top-level sweep actually
+    lists.
     """
     found: set[str] = set()
     stack: list[Any] = [payload]
