@@ -2705,27 +2705,28 @@ class Ultimate64Client:
         ``Invalid Type ''`` 3/3 and mounted nothing; this shape answered 200
         3/3 and ``GET /v1/drives`` reported the uploaded image mounted.
         ``mode`` is not visible in ``GET /v1/drives``, so that half is
-        source-read.  On the C64U (1.1.0) the same route shape is
-        source-read, not measured.
+        source-read.  On the C64U (fw 1.1.0, 2026-10-07, n=2) the route
+        answered 200 and ``GET /v1/drives`` reported the image mounted.
 
         **Cost: one managed ``/Temp`` attachment per call**, which is what
-        the request choke point counts.  The part is named
-        ``image.<type>``, so on 1.1.0 (by source) it lands at
-        ``/Temp/image.<type>``, is overwritten per type rather than
-        accumulating, and never matches the GC's ``temp%04x`` pattern --
-        a sweep cannot delete the mounted image, and cannot collect it
-        either (#418).
+        the request choke point counts.
 
-        **Same-type re-mount on 1.1.0 overwrites the mounted file**
-        (source-read, #427): ``attachment_writer.h`` ``collect()`` opens
-        ``/Temp/<filename>`` with ``FA_CREATE_ALWAYS``, so a second
-        ``mount_disk`` of the same image type overwrites that file even
-        while it is mounted.  Whether the drive holds it open is not read.
-        This exposure is new with #311 -- the old body never mounted at
-        all.  Remove the image (``drives/<d>:remove``, i.e.
-        :meth:`unmount_disk`) before mounting another of the same type.
-        On the U64E (bce4535e) a repeated name is uniquified instead
-        (``image_1.d64``; measured 2026-09-15, n=1).
+        **The part carries no ``filename=``** (#427).  ``type`` comes from
+        the query, so the route never needs the name's extension.  At tag
+        1.1.0 (the C64U) ``attachment_writer.h`` ``collect()`` writes an
+        unnamed part to ``/Temp/temp%04x`` from a static counter, so every
+        upload gets its own file and ``gc_temp_folder`` can collect it once
+        no drive has it mounted (the harness sweep reads ``GET /v1/drives``
+        and skips mounted names).  The part used to be named
+        ``image.<type>``, which 1.1.0 writes to ``/Temp/image.<type>`` with
+        ``FA_CREATE_ALWAYS``.  Measured on the C64U (fw 1.1.0, 2026-10-07,
+        n=1): a second same-type mount on another drive answered 200 and
+        rewrote the one file both drives then reported, each drive kept
+        serving its own image from memory, and a ``SAVE`` to drive 8 wrote
+        drive 8's dirty tracks into drive 9's image -- no error anywhere.
+        On the U64E (bce4535e) every upload goes through
+        ``create_temp_file("upload", ...)``, which by source makes the
+        name unique either way.
         """
         if not isinstance(image, (bytes, bytearray)):
             raise TypeError("image must be bytes")
@@ -2740,7 +2741,9 @@ class Ultimate64Client:
             boundary,
             fields={},
             file_field="file",
-            file_name=f"image.{image_type}",
+            # No filename=: each upload keeps its own GC-collectable
+            # temp%04x instead of sharing /Temp/image.<type> (#427).
+            file_name=None,
             file_bytes=bytes(image),
         )
         self._request(

@@ -783,10 +783,10 @@ def gc_temp_folder(
     with no ``filename=``, keeps the firmware's managed ``temp%04x``
     name and is then mounted *from that file*, so a sweep -- including
     one a later lane runs under the device lock -- could delete a
-    mounted image's backing store. Harness uploads are not exposed
-    (:meth:`~c64_test_harness.backends.ultimate64_client.Ultimate64Client.mount_disk`
-    has sent a named ``image.<type>`` part since #311/PR #421, which the
-    pattern never matches); other clients' raw uploads are. What the
+    mounted image's backing store. Harness uploads have that shape too:
+    :meth:`~c64_test_harness.backends.ultimate64_client.Ultimate64Client.mount_disk`
+    sends an unnamed part since #427, so that each upload gets its own
+    file instead of a shared ``image.<type>``. What the
     1541 emulation does when a mounted read-write image's backing file
     disappears is not established, which is the reason not to find out.
 

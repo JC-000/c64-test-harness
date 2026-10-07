@@ -92,8 +92,9 @@ firmware's managed name and is then mounted *from that file* — on 1.1.0
 `route_drives.cc` passes the full `/Temp/tempXXXX` path into `api_mount`
 and `c1541.cc` stores it as the drive's `mount_file_name` — so an
 oldest-first sweep could delete a mounted image's backing store. Harness
-uploads are not exposed (`mount_disk` sends a named `image.<type>` part
-since #311); other clients' raw uploads are. Before deleting anything,
+uploads have that shape too: since #427 `mount_disk` sends an unnamed part,
+because a shared `image.<type>` let a second same-type mount rewrite the
+image another drive had mounted (measured on the C64U, 2026-10-07). Before deleting anything,
 the sweep therefore reads `GET /v1/drives` (bodyless, zero `/Temp` cost)
 and skips every managed name a drive has mounted, matching on
 *basenames* so both `/Temp/tempXXXX` and a bare `tempXXXX` are caught.
