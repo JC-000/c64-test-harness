@@ -2724,9 +2724,12 @@ class Ultimate64Client:
         rewrote the one file both drives then reported, each drive kept
         serving its own image from memory, and a ``SAVE`` to drive 8 wrote
         drive 8's dirty tracks into drive 9's image -- no error anywhere.
-        On the U64E (bce4535e) every upload goes through
-        ``create_temp_file("upload", ...)``, which by source makes the
-        name unique either way.
+        Unnamed, the same run gave ``/Temp/temp0003`` and ``temp0004``, and
+        the ``SAVE`` changed only drive 8's file (C64U, 2026-10-07, n=1).
+        On the U64E every upload goes through ``create_temp_file("upload",
+        ...)`` (bce4535e, source), which makes the name unique either way;
+        unnamed it gave ``/Temp/cache/upload/temp0027`` and ``temp0028``
+        with the same result (fw 3.15, 3a1ff9ff, 2026-10-07, n=1).
         """
         if not isinstance(image, (bytes, bytearray)):
             raise TypeError("image must be bytes")
