@@ -700,9 +700,12 @@ def test_mount_disk_multipart_body():
     assert body.count(f"--{boundary}\r\n".encode()) == 1
     assert b'name="mode"' not in body
     assert b'name="type"' not in body
-    # The mounted file is the part's filename; the field name is not read
-    # by the route (get_filename(0)), so only the filename is pinned.
-    assert b'filename="image.d64"' in body
+    # No filename= (#427): at 1.1.0 a named part lands at /Temp/<filename>
+    # with FA_CREATE_ALWAYS, so a second same-type mount truncated the file
+    # another drive had mounted (measured on the C64U 2026-10-07: drive a's
+    # dirty tracks were written into drive b's image). Unnamed, each upload
+    # gets its own temp%04x from a static counter, which the GC can collect.
+    assert b"filename=" not in body
     assert b"\x01\x02\x03" in body
     # terminated with closing boundary
     assert body.rstrip(b"\r\n").endswith(f"--{boundary}--".encode())
@@ -743,20 +746,6 @@ def test_mount_disk_with_a_body_uses_post():
     with patch("urllib.request.urlopen", mock):
         c.mount_disk("a", b"x", "d64")
     assert captured[0][0].get_method() == "POST"
-
-
-def test_mount_disk_docstring_warns_about_same_type_overwrite():
-    """#421 review / #427: on 1.1.0 a same-type re-mount overwrites the mounted file.
-
-    By source (attachment_writer.h collect(), FA_CREATE_ALWAYS on
-    /Temp/<filename>); new exposure since #311 made mount_disk work at all.
-    """
-    import inspect
-    import re as _re
-
-    doc = _re.sub(r"\s+", " ", inspect.getdoc(Ultimate64Client.mount_disk) or "")
-    for token in ("FA_CREATE_ALWAYS", "overwrites", "Remove the image", "#427", "source-read"):
-        assert token in doc, token
 
 
 def test_mount_disk_image_accepts_a_device_path():
@@ -866,8 +855,7 @@ def test_unmount_disk_url():
 def test_build_multipart_file_name_none_omits_the_filename_attribute():
     """``file_name=None`` emits ``name="file"`` with no ``filename=`` (#417 review).
 
-    A string ``file_name`` still emits the attribute, so ``mount_disk``'s
-    named part (#421) is unchanged.
+    A string ``file_name`` still emits the attribute.
     """
     unnamed = _build_multipart(
         "B", fields={}, file_field="file", file_name=None, file_bytes=b"\x01",

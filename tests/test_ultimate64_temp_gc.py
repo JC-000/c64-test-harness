@@ -364,7 +364,7 @@ def test_excluding_a_mounted_image_never_widens_the_delete_set():
 
 
 def test_unmanaged_mounted_names_leave_the_sweep_untouched():
-    """A normally-named mounted image excludes nothing (harness uploads, #311)."""
+    """A non-managed mounted name (user files, other clients' named uploads) excludes nothing."""
     _FakeFTP.files = ["temp0001", "temp0002", "temp0003"]
     result = gc_temp_folder("dev", keep=2, mounted_probe=lambda: _drives("/Temp/image.d64"))
     assert result.deleted == ["temp0001"]

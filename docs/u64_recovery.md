@@ -92,8 +92,9 @@ firmware's managed name and is then mounted *from that file* — on 1.1.0
 `route_drives.cc` passes the full `/Temp/tempXXXX` path into `api_mount`
 and `c1541.cc` stores it as the drive's `mount_file_name` — so an
 oldest-first sweep could delete a mounted image's backing store. Harness
-uploads are not exposed (`mount_disk` sends a named `image.<type>` part
-since #311); other clients' raw uploads are. Before deleting anything,
+uploads have that shape too: since #427 `mount_disk` sends an unnamed part,
+because a shared `image.<type>` let a second same-type mount rewrite the
+image another drive had mounted (measured on the C64U, 2026-10-07). Before deleting anything,
 the sweep therefore reads `GET /v1/drives` (bodyless, zero `/Temp` cost)
 and skips every managed name a drive has mounted, matching on
 *basenames* so both `/Temp/tempXXXX` and a bare `tempXXXX` are caught.
@@ -101,10 +102,12 @@ Those names come back in `TempGCResult.mounted_excluded`. The exclusion
 can only ever **shrink** the delete set, and the listing is requested
 only when the sweep would otherwise delete something.
 
-**Evidence grade for the exclusion: unit-tested only — it has never run
-against a device.** The mount path is source-read at tag `1.1.0`, and the
-mounted name was observed once (n=1) on the U64E, fw 3.15 `bce4535e`,
-2026-09-15, where a raw mount reported `image_file` =
+**Evidence grade for the exclusion: one device run.** On the C64U (fw
+1.1.0, 2026-10-07, n=1, #427), with `/Temp/temp0003` mounted on drive a,
+the budget sweep before the next `mount_disk` logged `gc_temp_folder: 1
+managed /Temp name(s) on 10.53.21.158 are mounted on a drive and were left
+alone: temp0003`, and the file survived to the unmount. On the U64E (fw
+3.15 `bce4535e`, 2026-09-15, n=1) a raw mount reported `image_file` =
 `/Temp/cache/upload/temp0082`. The deletion this prevents has **not** been
 reproduced. Note that the live verification recorded in the next paragraph
 is dated 2026-08-21 and predates #418: it covers the keep-count sweep, not
