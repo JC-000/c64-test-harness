@@ -732,10 +732,13 @@ from c64_test_harness.backends.ultimate64_helpers import (
 Files on a device's persistent storage over the firmware's FTP server. Everything below is exported at the package root.
 
 - `storage_volumes(host) -> list[str]`: the usable volumes at the FTP root. An empty media slot is left out: the root lists it, but `CWD` into it fails. On 2026-10-08 the C64U had only `Flash` and `Temp` (its `/SD` slot was empty), and the U64E had `Flash`, `Temp` and `USB1`.
+- `storage_writable_volumes(host) -> list[str]`: `storage_volumes` without `/Temp` and `/Flash`. Use it rather than filtering with `WRITE_REFUSED_VOLUMES`, which is casefolded while the device spells them `Temp`/`Flash`.
+- `storage_list_dir(host, path) -> list[StorageEntry(name, kind, size)]`: sorted by name, from `MLSD`. Any volume, including a volume root such as `/USB1`, may be listed. A disk image is a `"file"`. Names starting with `.` and hidden-attribute files are omitted by the firmware, so an empty listing does not prove a directory is empty; writes refuse `.`-names for that reason.
 - `storage_get_file(host, path) -> bytes`: any volume may be read.
 - `storage_put_file(host, path, data: bytes | Path, *, overwrite=False, verify=True) -> StoragePutResult(path, size, sha256, verified, replaced)`. Creates missing parents. Checks `SIZE` after the write and, with `verify`, reads the file back and compares SHA-256. A `str` for `data` is refused.
 - `storage_mkdir(host, path, *, exist_ok=True) -> bool`
 - `storage_delete_file(host, path, *, missing_ok=False) -> bool`: directories are refused.
+- `storage_rmdir(host, path, *, missing_ok=False) -> bool`: removes an empty directory. A non-empty one raises `Ultimate64StorageNotEmptyError`: visible entries are caught before `RMD` (named in `.entries`), and hidden ones turn `RMD`'s 550 into the same error with empty `.entries`. Volume roots, `/Temp` and `/Flash` are refused.
 
 Rules:
 - Every call needs this process to hold the device's `DeviceLock`, on every grade. Otherwise it raises `Ultimate64StorageError` before connecting.

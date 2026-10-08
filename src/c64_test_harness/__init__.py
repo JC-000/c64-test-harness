@@ -154,14 +154,19 @@ from .backends.ultimate64_temp_gc import (
 )
 from .backends.ultimate64_storage import (
     WRITE_REFUSED_VOLUMES,
+    StorageEntry,
     StoragePutResult,
     Ultimate64StorageError,
+    Ultimate64StorageNotEmptyError,
     Ultimate64StorageVolumeError,
     storage_delete_file,
     storage_get_file,
+    storage_list_dir,
     storage_mkdir,
     storage_put_file,
+    storage_rmdir,
     storage_volumes,
+    storage_writable_volumes,
 )
 from .backends.u64_capabilities import CbmFixConstantStaleWarning
 from .backends.ultimate64_probe import (
@@ -628,6 +633,11 @@ __all__ = [
     "storage_put_file",
     "storage_mkdir",
     "storage_delete_file",
+    "StorageEntry",
+    "Ultimate64StorageNotEmptyError",
+    "storage_writable_volumes",
+    "storage_list_dir",
+    "storage_rmdir",
     # CBM /Temp-fix constant never set for a newer C64U release (issue #248)
     "CbmFixConstantStaleWarning",
     # Ultimate 64 liveness probe

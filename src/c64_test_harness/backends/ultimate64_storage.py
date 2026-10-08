@@ -14,8 +14,9 @@ Rules, all enforced before the path is touched:
   every firmware grade, for every call, reads included. Storage is device
   state, and the lock is the unit of exclusion (docs/device_locking.md).
   This is checked before any connection.
-* **Writes never go to** ``/Temp`` **or** ``/Flash``: ``put``, ``mkdir``
-  and ``delete`` refuse them. ``/Temp`` is the firmware's RAM disk,
+* **Writes never go to** ``/Temp`` **or** ``/Flash``: ``put``, ``mkdir``,
+  ``delete`` and ``rmdir`` refuse them, along with names starting with ``.``,
+  which no listing would show. ``/Temp`` is the firmware's RAM disk,
   emptied at power-on and swept by the harness's ``/Temp`` hygiene.
   ``/Flash`` holds the firmware's own configuration and ROMs. Reads may
   target any volume. Checked before any connection.
@@ -80,19 +81,24 @@ from .ultimate64_temp_gc import (
 
 __all__ = [
     "WRITE_REFUSED_VOLUMES",
+    "StorageEntry",
     "StoragePutResult",
     "Ultimate64StorageError",
+    "Ultimate64StorageNotEmptyError",
     "Ultimate64StorageVolumeError",
     "storage_delete_file",
     "storage_get_file",
+    "storage_list_dir",
     "storage_mkdir",
     "storage_put_file",
+    "storage_rmdir",
     "storage_volumes",
+    "storage_writable_volumes",
 ]
 
 _log = logging.getLogger(__name__)
 
-#: Volumes that put/mkdir/delete never touch (compared casefolded).
+#: Volumes that put/mkdir/delete/rmdir never touch (compared casefolded).
 WRITE_REFUSED_VOLUMES = frozenset({"temp", "flash"})
 
 #: Socket timeout for the FTP session. An 880 KB image over the VPN to
@@ -125,6 +131,27 @@ class Ultimate64StorageVolumeError(Ultimate64StorageError):
         self.available = list(available)
 
 
+class Ultimate64StorageNotEmptyError(Ultimate64StorageError):
+    """:func:`storage_rmdir` refused a directory that still has entries.
+
+    ``entries`` lists their names.
+    """
+
+    def __init__(self, message: str, entries: list[str]) -> None:
+        super().__init__(message)
+        self.entries = list(entries)
+
+
+@dataclass(frozen=True)
+class StorageEntry:
+    """One entry of :func:`storage_list_dir`."""
+
+    name: str
+    #: ``"dir"`` or ``"file"``. A disk image is a ``"file"``.
+    kind: str
+    size: int
+
+
 @dataclass(frozen=True)
 class StoragePutResult:
     """What :func:`storage_put_file` wrote."""
@@ -138,7 +165,7 @@ class StoragePutResult:
     replaced: bool
 
 
-def _check_path(path: str, *, write: bool) -> list[str]:
+def _check_path(path: str, *, write: bool, allow_volume: bool = False) -> list[str]:
     """Validate *path* and return its components. Raises ``ValueError``."""
     if not isinstance(path, str) or not path:
         raise ValueError("storage path must be a non-empty string")
@@ -163,12 +190,17 @@ def _check_path(path: str, *, write: bool) -> list[str]:
     parts = path[1:].split("/")
     if any(p in ("", ".", "..") for p in parts):
         raise ValueError(f"storage path must be normalised (no '', '.', '..'): {path!r}")
-    if len(parts) < 2:
+    if len(parts) < (1 if allow_volume else 2):
         raise ValueError(f"storage path must name a volume and an entry: {path!r}")
     if any(len(p) > MAX_COMPONENT_LEN for p in parts):
         raise ValueError(
             f"storage path component longer than {MAX_COMPONENT_LEN} characters: {path!r}"
         )
+    if write and any(p.startswith(".") for p in parts):
+        # FileManager::get_directory (1.1.0 and 3a1ff9ff) leaves '.'-names
+        # out of every listing, so the harness must not create entries that
+        # storage_list_dir cannot show and storage_rmdir cannot see.
+        raise ValueError(f"refusing to write a name starting with '.': {path!r}")
     if write and parts[0].casefold() in WRITE_REFUSED_VOLUMES:
         raise ValueError(
             f"refusing to write {path!r}: /{parts[0]} is not test storage "
@@ -207,6 +239,10 @@ def _session(host: str, operation: str, port: int, timeout: float) -> Iterator[F
             "create_manager(backend='u64')."
         )
     ftp = FTP()
+    # FatFS is built with FF_CODE_PAGE 437 and FF_LFN_UNICODE 0 (ffconf.h at
+    # 1.1.0 and 3a1ff9ff), so names go on the wire as CP437 bytes. ftplib's
+    # default strict UTF-8 would raise on a name such as b"\x9abung".
+    ftp.encoding = "cp437"
     try:
         ftp.connect(host, port, timeout=timeout)
         ftp.login(
@@ -230,7 +266,7 @@ def _session(host: str, operation: str, port: int, timeout: float) -> Iterator[F
         yield ftp
     except _PASS_THROUGH:
         raise
-    except _FTP_ALL_ERRORS as exc:
+    except (UnicodeError, *_FTP_ALL_ERRORS) as exc:
         raise Ultimate64StorageError(
             f"{operation} on {host} failed: {type(exc).__name__}: {exc}"
         ) from exc
@@ -345,11 +381,68 @@ def storage_volumes(
     """The usable volume names at the device's FTP root, e.g. ``['Flash', 'Temp', 'USB1']``.
 
     An empty media slot (listed at the root, but ``CWD`` into it fails) is
-    left out. Filter out ``/Temp`` and ``/Flash`` yourself
-    (``WRITE_REFUSED_VOLUMES``) to find somewhere writable.
+    left out. For somewhere writable, use :func:`storage_writable_volumes`.
     """
     with _session(host, "storage_volumes", port, timeout) as ftp:
         return _list_root(ftp)[0]
+
+
+def storage_writable_volumes(
+    host: str, *, port: int = DEFAULT_FTP_PORT, timeout: float = DEFAULT_STORAGE_FTP_TIMEOUT
+) -> list[str]:
+    """:func:`storage_volumes` without ``/Temp`` and ``/Flash``, whatever their case.
+
+    The device spells them ``Temp`` and ``Flash``, while
+    :data:`WRITE_REFUSED_VOLUMES` is casefolded, so filtering with a plain
+    ``in`` keeps both. Use this instead.
+    """
+    return [
+        v for v in storage_volumes(host, port=port, timeout=timeout)
+        if v.casefold() not in WRITE_REFUSED_VOLUMES
+    ]
+
+
+def storage_list_dir(
+    host: str, path: str, *, port: int = DEFAULT_FTP_PORT,
+    timeout: float = DEFAULT_STORAGE_FTP_TIMEOUT,
+) -> list[StorageEntry]:
+    """The entries of directory *path*, sorted by name. Any volume may be listed.
+
+    *path* may be a volume root such as ``/USB1``. The listing comes from
+    ``MLSD``, whose 1.1.0 code passes each name as a ``%s`` argument, so
+    names containing ``%`` are safe here (unlike in ``MLST``). An entry
+    whose own name contains ``%`` is listed, but the other helpers refuse
+    to address it.
+
+    **Hidden entries are omitted.** ``FileManager::get_directory`` skips
+    names starting with ``.`` and files with the hidden attribute (1.1.0
+    and 3a1ff9ff), so an empty result does not prove the directory is
+    empty. A login user of ``dirs``/``into`` (container mode, set by
+    ``$U64_TEMP_GC_FTP_USER``) would list disk images as directories; the
+    default anonymous login lists them as files.
+
+    :raises FileNotFoundError: no such directory.
+    :raises NotADirectoryError: *path*, or an ancestor, is a file. A disk
+        image counts as a file and is never opened as a directory.
+    """
+    parts = _check_path(path, write=False, allow_volume=True)
+    with _session(host, f"storage_list_dir({path!r})", port, timeout) as ftp:
+        path = _resolve_volume(ftp, host, parts)
+        kind = _walk(ftp, path)
+        if kind is None:
+            raise FileNotFoundError(f"{path} does not exist on {host}")
+        if kind == "file":
+            raise NotADirectoryError(f"{path} on {host} is a file")
+        entries = []
+        for name, facts in ftp.mlsd(path):
+            if name in (".", "..") or facts.get("type") in ("cdir", "pdir"):
+                continue
+            entries.append(StorageEntry(
+                name=name,
+                kind="dir" if facts.get("type") == "dir" else "file",
+                size=int(facts.get("size", 0) or 0),
+            ))
+        return sorted(entries, key=lambda e: e.name)
 
 
 def storage_get_file(
@@ -519,4 +612,55 @@ def storage_delete_file(
             raise FileNotFoundError(f"{path} does not exist on {host}")
         ftp.delete(path)
     _log.info("storage_delete_file: deleted %s on %s", path, host)
+    return True
+
+
+def storage_rmdir(
+    host: str, path: str, *, missing_ok: bool = False, port: int = DEFAULT_FTP_PORT,
+    timeout: float = DEFAULT_STORAGE_FTP_TIMEOUT,
+) -> bool:
+    """Remove the empty directory *path*. Volume roots are refused.
+
+    Returns ``True`` if it was removed, or ``False`` if it was absent and
+    *missing_ok* is true. A directory that still has entries is refused
+    with :class:`Ultimate64StorageNotEmptyError`. Visible entries are
+    caught before ``RMD`` is sent (``.entries`` names them). Hidden ones
+    (see :func:`storage_list_dir`) make ``RMD`` answer 550, which raises
+    the same error with empty ``.entries``.
+
+    :raises FileNotFoundError: absent and *missing_ok* is false.
+    :raises NotADirectoryError: *path*, or an ancestor, is a file.
+    """
+    parts = _check_path(path, write=True)
+    with _session(host, f"storage_rmdir({path!r})", port, timeout) as ftp:
+        path = _resolve_volume(ftp, host, parts)
+        kind = _walk(ftp, path)
+        if kind is None:
+            if missing_ok:
+                return False
+            raise FileNotFoundError(f"{path} does not exist on {host}")
+        if kind == "file":
+            raise NotADirectoryError(f"{path} on {host} is a file")
+        left = [n for n, f in ftp.mlsd(path) if n not in (".", "..")]
+        if left:
+            raise Ultimate64StorageNotEmptyError(
+                f"{path} on {host} is not empty ({len(left)} entries)", sorted(left)
+            )
+        try:
+            ftp.rmd(path)
+        except error_perm as exc:
+            if not str(exc).startswith("550"):
+                raise
+            # f_unlink refuses a non-empty directory. Entries the listing
+            # omits ('.'-names and hidden-attribute files, such as a Mac's
+            # .DS_Store or ._*) still count, so the pre-check above passed.
+            raise Ultimate64StorageNotEmptyError(
+                f"{path} on {host}: RMD answered {exc}. The directory most likely "
+                "still holds hidden entries that MLSD does not list (names "
+                "starting with '.', or files with the hidden attribute, such as "
+                ".DS_Store), or the directory is read-only or the volume "
+                "write-protected; remove them by another route",
+                [],
+            ) from exc
+    _log.info("storage_rmdir: removed %s on %s", path, host)
     return True

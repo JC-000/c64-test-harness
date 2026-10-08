@@ -139,6 +139,32 @@ class _FakeFTP:
         callback(data)
         return "226 Transfer complete"
 
+    def mlsd(self, path="", facts=()):
+        self.server.log.append(f"MLSD {path}")
+        if path not in self.server.dirs:
+            raise ftplib.error_temp("451 Requested action aborted")
+        prefix = path.rstrip("/") + "/"
+        # FileManager::get_directory skips names starting with '.' (and
+        # AM_HID entries) at 1.1.0 and 3a1ff9ff, so MLSD never shows them.
+        for d in sorted(self.server.dirs):
+            name = d[len(prefix):]
+            if d.startswith(prefix) and "/" not in name and d != path and not name.startswith("."):
+                yield name, {"type": "dir", "size": "0"}
+        for f, data in sorted(self.server.files.items()):
+            name = f[len(prefix):]
+            if f.startswith(prefix) and "/" not in name and not name.startswith("."):
+                yield name, {"type": "file", "size": str(len(data))}
+
+    def rmd(self, path):
+        self.server.log.append(f"RMD {path}")
+        prefix = path + "/"
+        if path not in self.server.dirs or any(
+            x.startswith(prefix) for x in list(self.server.dirs) + list(self.server.files)
+        ):
+            raise ftplib.error_perm("550 Requested action not taken.")
+        self.server.dirs.discard(path)
+        return "250 OK"
+
     def delete(self, path):
         self.server.log.append(f"DELE {path}")
         if path not in self.server.files:
@@ -600,7 +626,153 @@ def test_an_image_directly_under_the_volume_is_never_stated_through(server):
         lambda: st.storage_mkdir("dev", "/SD/game.d64/sub"),
         lambda: st.storage_get_file("dev", "/SD/game.d64/inner.prg"),
         lambda: st.storage_delete_file("dev", "/SD/game.d64/inner.prg", missing_ok=True),
+        lambda: st.storage_list_dir("dev", "/SD/game.d64/sub"),
+        lambda: st.storage_rmdir("dev", "/SD/game.d64/sub", missing_ok=True),
     ):
         with pytest.raises(NotADirectoryError):
             call()
     assert not any(e.startswith("MOUNTED") for e in server.log), server.log
+
+
+# ---------------------------------------------------------------- list_dir / rmdir / writable volumes
+def test_writable_volumes_drop_temp_and_flash_whatever_their_case(server):
+    """storage_volumes spells them 'Flash'/'Temp'; WRITE_REFUSED_VOLUMES is casefolded."""
+    assert st.storage_writable_volumes("dev") == ["SD", "USB1"]
+    server.dirs.discard("/SD")
+    server.empty_slots.add("SD")
+    assert st.storage_writable_volumes("dev") == ["USB1"]
+
+
+def test_list_dir_returns_entries_with_kind_and_size(server):
+    server.dirs.update({"/SD/t", "/SD/t/sub"})
+    server.files["/SD/t/a.bin"] = b"abc"
+    server.files["/SD/t/game.d64"] = b"\x00" * 10
+    server.files["/SD/t/sub/deep.bin"] = b"x"
+    entries = st.storage_list_dir("dev", "/SD/t")
+    assert entries == [
+        st.StorageEntry("a.bin", "file", 3),
+        st.StorageEntry("game.d64", "file", 10),
+        st.StorageEntry("sub", "dir", 0),
+    ]
+    assert not any(e.startswith("MOUNTED") for e in server.log)
+
+
+def test_list_dir_of_a_volume_root(server):
+    server.files["/USB1/x.bin"] = b"x"
+    assert [e.name for e in st.storage_list_dir("dev", "/usb1")] == ["x.bin"]
+
+
+def test_list_dir_refuses_files_missing_paths_and_bad_paths(server):
+    server.files["/SD/x.d64"] = b"\x00"
+    with pytest.raises(NotADirectoryError):
+        st.storage_list_dir("dev", "/SD/x.d64")
+    assert not any(e.startswith("MLSD") for e in server.log)
+    with pytest.raises(FileNotFoundError):
+        st.storage_list_dir("dev", "/SD/nope")
+    for bad in ("/SD/..\\Temp", "/SD/a%s", "SD", "/", ""):
+        with pytest.raises(ValueError):
+            st.storage_list_dir("dev", bad)
+
+
+def test_list_dir_may_read_any_volume_but_needs_the_lock(server):
+    server.dirs.add("/Flash/roms")
+    assert st.storage_list_dir("dev", "/Flash") == [st.StorageEntry("roms", "dir", 0)]
+    with patch.object(st, "lock_held_for", lambda host: False):
+        with pytest.raises(st.Ultimate64StorageError, match="DeviceLock"):
+            st.storage_list_dir("dev", "/SD")
+
+
+def test_rmdir_removes_an_empty_directory(server):
+    server.dirs.update({"/SD/c64https-test"})
+    assert st.storage_rmdir("dev", "/SD/c64https-test") is True
+    assert "/SD/c64https-test" not in server.dirs
+    with pytest.raises(FileNotFoundError):
+        st.storage_rmdir("dev", "/SD/c64https-test")
+    assert st.storage_rmdir("dev", "/SD/c64https-test", missing_ok=True) is False
+
+
+def test_rmdir_refuses_a_non_empty_directory_before_sending_rmd(server):
+    server.dirs.add("/SD/d")
+    server.files["/SD/d/zz.bin"] = b"x"
+    server.files["/SD/d/keep.bin"] = b"x"
+    with pytest.raises(st.Ultimate64StorageNotEmptyError) as ei:
+        st.storage_rmdir("dev", "/sd/d")
+    assert ei.value.entries == ["keep.bin", "zz.bin"]
+    assert "/SD/d" in server.dirs
+    assert not any(e.startswith("RMD") for e in server.log)
+
+
+def test_rmdir_refuses_files_volume_roots_and_refused_volumes(server):
+    server.files["/SD/x.bin"] = b"x"
+    with pytest.raises(NotADirectoryError):
+        st.storage_rmdir("dev", "/SD/x.bin")
+    for bad in ("/SD", "/Temp/cache", "/Flash/roms", "/SD/a\\..\\..\\Temp", "/SD/a%n"):
+        with pytest.raises(ValueError):
+            st.storage_rmdir("dev", bad)
+    assert not any(e.startswith("RMD") for e in server.log)
+
+
+def test_not_empty_error_is_a_storage_error():
+    assert issubclass(st.Ultimate64StorageNotEmptyError, st.Ultimate64StorageError)
+
+
+# ---------------------------------------------------------------- #527 review round 1
+def test_rmdir_of_a_dir_holding_only_hidden_entries_is_a_typed_not_empty(server):
+    """MLSD omits '.'-names, so the pre-check passes; RMD's 550 must still be typed."""
+    server.dirs.add("/SD/d")
+    server.files["/SD/d/.DS_Store"] = b"x"
+    assert st.storage_list_dir("dev", "/SD/d") == []
+    with pytest.raises(st.Ultimate64StorageNotEmptyError, match="hidden") as ei:
+        st.storage_rmdir("dev", "/SD/d")
+    assert ei.value.entries == []
+    assert "/SD/d" in server.dirs
+
+
+def test_rmdir_lowercase_volume_uses_device_spelling(server):
+    server.dirs.add("/SD/e")
+    assert st.storage_rmdir("dev", "/sd/e") is True
+    assert "RMD /SD/e" in server.log
+
+
+@pytest.mark.parametrize("path", ["/SD/.keep", "/SD/.hidden/x.bin", "/SD/a/._x"])
+def test_writes_refuse_dot_names_the_listing_cannot_show(server, path):
+    with pytest.raises(ValueError, match="'.'"):
+        st.storage_put_file("dev", path, b"x")
+    with pytest.raises(ValueError):
+        st.storage_mkdir("dev", path)
+    assert server.connects == 0
+
+
+def test_session_speaks_the_firmware_code_page(server):
+    """FF_CODE_PAGE 437, FF_LFN_UNICODE 0: names are CP437 bytes on the wire."""
+    seen = {}
+    real = _FakeFTP.mlsd
+
+    def mlsd(self, path="", facts=()):
+        seen["encoding"] = getattr(self, "encoding", None)
+        return real(self, path, facts)
+
+    with patch.object(_FakeFTP, "mlsd", mlsd):
+        st.storage_list_dir("dev", "/SD")
+    assert seen["encoding"] == "cp437"
+
+
+def test_a_decode_error_inside_a_session_is_a_storage_error(server):
+    def mlsd(self, path="", facts=()):
+        raise UnicodeDecodeError("utf-8", b"\x9a", 0, 1, "invalid start byte")
+
+    with patch.object(_FakeFTP, "mlsd", mlsd):
+        with pytest.raises(st.Ultimate64StorageError, match="UnicodeDecodeError"):
+            st.storage_list_dir("dev", "/SD")
+
+
+def test_a_non_550_rmd_refusal_stays_an_untyped_storage_error(server):
+    server.dirs.add("/SD/d")
+
+    def rmd(self, path):
+        raise ftplib.error_perm("530 Not logged in.")
+
+    with patch.object(_FakeFTP, "rmd", rmd):
+        with pytest.raises(st.Ultimate64StorageError, match="530") as ei:
+            st.storage_rmdir("dev", "/SD/d")
+    assert not isinstance(ei.value, st.Ultimate64StorageNotEmptyError)
