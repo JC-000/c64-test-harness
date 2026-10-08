@@ -24,13 +24,16 @@ import pytest
 
 from c64_test_harness.backends.device_lock import DeviceLock, DeviceLockTimeout
 from c64_test_harness.backends.ultimate64_storage import (
-    WRITE_REFUSED_VOLUMES,
+    Ultimate64StorageNotEmptyError,
     Ultimate64StorageVolumeError,
     storage_delete_file,
     storage_get_file,
+    storage_list_dir,
     storage_mkdir,
     storage_put_file,
+    storage_rmdir,
     storage_volumes,
+    storage_writable_volumes,
 )
 from live_fixture_teardown import raise_teardown_failures, teardown_then_release
 
@@ -67,7 +70,7 @@ def locked():
 @pytest.fixture(scope="module")
 def volume_dir(locked):
     """``/<first usable removable volume>/<_DIR>``; the test file is deleted after."""
-    vols = [v for v in storage_volumes(_HOST) if v.casefold() not in WRITE_REFUSED_VOLUMES]
+    vols = storage_writable_volumes(_HOST)
     if not vols:
         pytest.skip(f"{_HOST} has no usable removable storage volume")
     target = f"/{vols[0]}/{_DIR}"
@@ -138,3 +141,30 @@ def test_a_missing_volume_is_a_typed_error(locked) -> None:
     with pytest.raises(Ultimate64StorageVolumeError) as ei:
         storage_put_file(_HOST, "/NoSuchVolume/x.bin", b"x")
     assert ei.value.available == usable
+
+
+def test_list_dir_and_rmdir(volume_dir: str) -> None:
+    sub = f"{volume_dir}/rmdir-probe"
+    inner = f"{sub}/keep.bin"
+    storage_delete_file(_HOST, inner, missing_ok=True)
+    storage_rmdir(_HOST, sub, missing_ok=True)
+    try:
+        storage_put_file(_HOST, inner, b"keep")
+        names = {e.name: e for e in storage_list_dir(_HOST, volume_dir)}
+        assert names["rmdir-probe"].kind == "dir"
+        listing = storage_list_dir(_HOST, sub)
+        assert [(e.name, e.kind, e.size) for e in listing] == [("keep.bin", "file", 4)]
+        with pytest.raises(Ultimate64StorageNotEmptyError) as ei:
+            storage_rmdir(_HOST, sub)
+        assert ei.value.entries == ["keep.bin"]
+        assert storage_delete_file(_HOST, inner) is True
+        assert storage_list_dir(_HOST, sub) == []
+        assert storage_rmdir(_HOST, sub) is True
+        assert "rmdir-probe" not in {e.name for e in storage_list_dir(_HOST, volume_dir)}
+        with pytest.raises(FileNotFoundError):
+            storage_list_dir(_HOST, sub)
+        root = storage_list_dir(_HOST, "/" + volume_dir.split("/")[1])
+        assert any(e.name == volume_dir.split("/")[2] and e.kind == "dir" for e in root)
+    finally:
+        storage_delete_file(_HOST, inner, missing_ok=True)
+        storage_rmdir(_HOST, sub, missing_ok=True)

@@ -80,14 +80,19 @@ from .ultimate64_temp_gc import (
 
 __all__ = [
     "WRITE_REFUSED_VOLUMES",
+    "StorageEntry",
     "StoragePutResult",
     "Ultimate64StorageError",
+    "Ultimate64StorageNotEmptyError",
     "Ultimate64StorageVolumeError",
     "storage_delete_file",
     "storage_get_file",
+    "storage_list_dir",
     "storage_mkdir",
     "storage_put_file",
+    "storage_rmdir",
     "storage_volumes",
+    "storage_writable_volumes",
 ]
 
 _log = logging.getLogger(__name__)
@@ -125,6 +130,27 @@ class Ultimate64StorageVolumeError(Ultimate64StorageError):
         self.available = list(available)
 
 
+class Ultimate64StorageNotEmptyError(Ultimate64StorageError):
+    """:func:`storage_rmdir` refused a directory that still has entries.
+
+    ``entries`` lists their names.
+    """
+
+    def __init__(self, message: str, entries: list[str]) -> None:
+        super().__init__(message)
+        self.entries = list(entries)
+
+
+@dataclass(frozen=True)
+class StorageEntry:
+    """One entry of :func:`storage_list_dir`."""
+
+    name: str
+    #: ``"dir"`` or ``"file"``. A disk image is a ``"file"``.
+    kind: str
+    size: int
+
+
 @dataclass(frozen=True)
 class StoragePutResult:
     """What :func:`storage_put_file` wrote."""
@@ -138,7 +164,7 @@ class StoragePutResult:
     replaced: bool
 
 
-def _check_path(path: str, *, write: bool) -> list[str]:
+def _check_path(path: str, *, write: bool, allow_volume: bool = False) -> list[str]:
     """Validate *path* and return its components. Raises ``ValueError``."""
     if not isinstance(path, str) or not path:
         raise ValueError("storage path must be a non-empty string")
@@ -163,7 +189,7 @@ def _check_path(path: str, *, write: bool) -> list[str]:
     parts = path[1:].split("/")
     if any(p in ("", ".", "..") for p in parts):
         raise ValueError(f"storage path must be normalised (no '', '.', '..'): {path!r}")
-    if len(parts) < 2:
+    if len(parts) < (1 if allow_volume else 2):
         raise ValueError(f"storage path must name a volume and an entry: {path!r}")
     if any(len(p) > MAX_COMPONENT_LEN for p in parts):
         raise ValueError(
@@ -352,6 +378,57 @@ def storage_volumes(
         return _list_root(ftp)[0]
 
 
+def storage_writable_volumes(
+    host: str, *, port: int = DEFAULT_FTP_PORT, timeout: float = DEFAULT_STORAGE_FTP_TIMEOUT
+) -> list[str]:
+    """:func:`storage_volumes` without ``/Temp`` and ``/Flash``, whatever their case.
+
+    The device spells them ``Temp`` and ``Flash``, while
+    :data:`WRITE_REFUSED_VOLUMES` is casefolded, so filtering with a plain
+    ``in`` keeps both. Use this instead.
+    """
+    return [
+        v for v in storage_volumes(host, port=port, timeout=timeout)
+        if v.casefold() not in WRITE_REFUSED_VOLUMES
+    ]
+
+
+def storage_list_dir(
+    host: str, path: str, *, port: int = DEFAULT_FTP_PORT,
+    timeout: float = DEFAULT_STORAGE_FTP_TIMEOUT,
+) -> list[StorageEntry]:
+    """The entries of directory *path*, sorted by name. Any volume may be listed.
+
+    *path* may be a volume root such as ``/USB1``. The listing comes from
+    ``MLSD``, whose 1.1.0 code passes each name as a ``%s`` argument, so
+    names containing ``%`` are safe here (unlike in ``MLST``). An entry
+    whose own name contains ``%`` is listed, but the other helpers refuse
+    to address it.
+
+    :raises FileNotFoundError: no such directory.
+    :raises NotADirectoryError: *path*, or an ancestor, is a file. A disk
+        image counts as a file and is never opened as a directory.
+    """
+    parts = _check_path(path, write=False, allow_volume=True)
+    with _session(host, f"storage_list_dir({path!r})", port, timeout) as ftp:
+        path = _resolve_volume(ftp, host, parts)
+        kind = _walk(ftp, path)
+        if kind is None:
+            raise FileNotFoundError(f"{path} does not exist on {host}")
+        if kind == "file":
+            raise NotADirectoryError(f"{path} on {host} is a file")
+        entries = []
+        for name, facts in ftp.mlsd(path):
+            if name in (".", "..") or facts.get("type") in ("cdir", "pdir"):
+                continue
+            entries.append(StorageEntry(
+                name=name,
+                kind="dir" if facts.get("type") == "dir" else "file",
+                size=int(facts.get("size", 0) or 0),
+            ))
+        return sorted(entries, key=lambda e: e.name)
+
+
 def storage_get_file(
     host: str, path: str, *, port: int = DEFAULT_FTP_PORT,
     timeout: float = DEFAULT_STORAGE_FTP_TIMEOUT,
@@ -519,4 +596,37 @@ def storage_delete_file(
             raise FileNotFoundError(f"{path} does not exist on {host}")
         ftp.delete(path)
     _log.info("storage_delete_file: deleted %s on %s", path, host)
+    return True
+
+
+def storage_rmdir(
+    host: str, path: str, *, missing_ok: bool = False, port: int = DEFAULT_FTP_PORT,
+    timeout: float = DEFAULT_STORAGE_FTP_TIMEOUT,
+) -> bool:
+    """Remove the empty directory *path*. Volume roots are refused.
+
+    Returns ``True`` if it was removed, or ``False`` if it was absent and
+    *missing_ok* is true. A directory that still has entries is refused,
+    before ``RMD`` is sent, with :class:`Ultimate64StorageNotEmptyError`.
+
+    :raises FileNotFoundError: absent and *missing_ok* is false.
+    :raises NotADirectoryError: *path*, or an ancestor, is a file.
+    """
+    parts = _check_path(path, write=True)
+    with _session(host, f"storage_rmdir({path!r})", port, timeout) as ftp:
+        path = _resolve_volume(ftp, host, parts)
+        kind = _walk(ftp, path)
+        if kind is None:
+            if missing_ok:
+                return False
+            raise FileNotFoundError(f"{path} does not exist on {host}")
+        if kind == "file":
+            raise NotADirectoryError(f"{path} on {host} is a file")
+        left = [n for n, f in ftp.mlsd(path) if n not in (".", "..")]
+        if left:
+            raise Ultimate64StorageNotEmptyError(
+                f"{path} on {host} is not empty ({len(left)} entries)", sorted(left)
+            )
+        ftp.rmd(path)
+    _log.info("storage_rmdir: removed %s on %s", path, host)
     return True
