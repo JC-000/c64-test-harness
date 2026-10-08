@@ -33,6 +33,9 @@ class _FakeFTPServer:
         self.empty_slots: set[str] = set()
 
 
+_MOUNTABLE = (".d64", ".d71", ".d81", ".dnp", ".t64", ".iso", ".fat")
+
+
 class _FakeFTP:
     server: _FakeFTPServer
 
@@ -53,9 +56,28 @@ class _FakeFTP:
 
     def cwd(self, path):
         self.server.log.append(f"CWD {path}")
-        if path not in self.server.dirs:
-            raise ftplib.error_perm("550 Requested action not taken.")
-        return "250 OK"
+        # ftpd.cc vfs_chdir opens a mountable image (find_mount_point), so
+        # CWD into a .d64 succeeds on the firmware (U64E 3a1ff9ff, 2026-10-08).
+        if path in self.server.dirs or (
+            path in self.server.files and path.lower().endswith(_MOUNTABLE)
+        ):
+            return "250 OK"
+        raise ftplib.error_perm("550 Requested action not taken.")
+
+    def sendcmd(self, cmd):
+        self.server.log.append(cmd)
+        verb, _, arg = cmd.partition(" ")
+        if verb == "MLST":
+            # ftpd.cc cmd_mlst: vfs_stat without mounting; 501 when missing.
+            if arg in self.server.dirs:
+                kind = "dir"
+            elif arg in self.server.files:
+                kind = "file"
+            else:
+                raise ftplib.error_perm("501 Syntax error in parameters or arguments.")
+            name = arg.rsplit("/", 1)[-1]
+            return f"250- Listing {name}\r\ntype={kind};modify=19800101000000; {name}\r\n250 End"
+        raise AssertionError(f"unexpected sendcmd {cmd!r}")
 
     def quit(self):
         return "221 Bye"
@@ -85,7 +107,8 @@ class _FakeFTP:
         self.server.log.append(f"MKD {path}")
         parent = path.rsplit("/", 1)[0] or "/"
         if path in self.server.dirs or parent not in self.server.dirs:
-            raise ftplib.error_perm("550 Requested action not taken.")
+            # ftpd.cc cmd_mkd answers 553 (1.1.0 and 3a1ff9ff)
+            raise ftplib.error_perm("553 Requested action not taken.")
         self.server.dirs.add(path)
         return path
 
@@ -237,6 +260,11 @@ def test_delete_refuses_a_directory(server):
         "",
         "/SD/a\nb",
         "/SD",
+        # the firmware's Path::cd treats '\\' as a separator and resolves '..'
+        "/USB1/..\\Temp\\x",
+        "/USB1/a\\..\\..\\Flash\\x",
+        "/USB1\\..\\Temp/x",
+        "/SD/a\\b",
     ],
 )
 def test_write_refused_paths_never_connect(server, path):
@@ -386,3 +414,126 @@ def test_an_empty_media_slot_is_not_a_usable_volume(server):
         st.storage_put_file("dev", "/SD/amiga64/wb.adf", b"x")
     assert ei.value.available == ["Flash", "Temp", "USB1"]
     assert not any(e.startswith(("MKD", "STOR")) for e in server.log)
+
+
+# ---------------------------------------------------------------- review round 1 (#526)
+def test_backslash_is_refused_for_reads_too(server):
+    with pytest.raises(ValueError, match="backslash"):
+        st.storage_get_file("dev", "/USB1/..\\Flash\\config.cfg")
+    assert server.connects == 0
+
+
+def test_a_mountable_image_is_a_file_not_a_directory(server):
+    """CWD into a .d64 succeeds on the firmware; MLST says type=file."""
+    image = b"\x00" * 174848
+    st.storage_put_file("dev", "/SD/disks/game.d64", image)
+    assert st.storage_get_file("dev", "/SD/disks/game.d64") == image
+    again = st.storage_put_file("dev", "/SD/disks/game.d64", b"\x01" * 174848, overwrite=True)
+    assert again.replaced
+    assert st.storage_delete_file("dev", "/SD/disks/game.d64") is True
+    assert "/SD/disks/game.d64" not in server.files
+
+
+def test_a_mountable_image_is_never_used_as_a_parent(server):
+    server.dirs.add("/SD/disks")
+    server.files["/SD/disks/game.d64"] = b"\x00" * 174848
+    with pytest.raises(FileExistsError):
+        st.storage_put_file("dev", "/SD/disks/game.d64/inner.prg", b"x")
+    with pytest.raises(FileExistsError):
+        st.storage_mkdir("dev", "/SD/disks/game.d64/sub")
+    assert not any(e.startswith(("STOR", "MKD")) for e in server.log)
+
+
+def test_a_failed_new_upload_is_removed_so_a_retry_succeeds(server):
+    real = _FakeFTP.storbinary
+
+    def partial(self, cmd, fp, blocksize=8192):
+        path = cmd.split(" ", 1)[1]
+        self.server.log.append(f"STOR {path}")
+        self.server.files[path] = fp.read()[:1024]
+        raise TimeoutError("timed out")
+
+    with patch.object(_FakeFTP, "storbinary", partial):
+        with pytest.raises(st.Ultimate64StorageError, match="removed"):
+            st.storage_put_file("dev", "/SD/wb.adf", DATA)
+    assert "/SD/wb.adf" not in server.files
+    with patch.object(_FakeFTP, "storbinary", real):
+        assert st.storage_put_file("dev", "/SD/wb.adf", DATA).verified
+
+
+def test_a_failed_new_upload_with_a_bad_read_back_is_removed(server):
+    server.corrupt_reads = True
+    with pytest.raises(st.Ultimate64StorageError, match="removed"):
+        st.storage_put_file("dev", "/SD/x.bin", DATA)
+    assert "/SD/x.bin" not in server.files
+
+
+def test_a_failed_overwrite_says_the_old_file_is_gone(server):
+    server.files["/SD/x.bin"] = b"old"
+
+    def partial(self, cmd, fp, blocksize=8192):
+        path = cmd.split(" ", 1)[1]
+        self.server.files[path] = fp.read()[:10]
+        raise TimeoutError("timed out")
+
+    with patch.object(_FakeFTP, "storbinary", partial):
+        with pytest.raises(st.Ultimate64StorageError, match="overwrite=True"):
+            st.storage_put_file("dev", "/SD/x.bin", DATA, overwrite=True)
+
+
+def test_an_empty_payload_is_refused_before_connecting(server):
+    """3a1ff9ff creates nothing for a zero-byte STOR (measured on the U64E)."""
+    with pytest.raises(ValueError, match="empty"):
+        st.storage_put_file("dev", "/SD/x.bin", b"")
+    assert server.connects == 0
+
+
+def test_a_non_550_size_error_is_not_read_as_missing(server):
+    def size(self, path):
+        raise ftplib.error_perm("530 Not logged in.")
+
+    with patch.object(_FakeFTP, "size", size):
+        with pytest.raises(st.Ultimate64StorageError, match="530"):
+            st.storage_put_file("dev", "/SD/x.bin", b"x")
+
+
+def test_a_non_501_mlst_error_is_not_read_as_missing(server):
+    real = _FakeFTP.sendcmd
+
+    def sendcmd(self, cmd):
+        if cmd.startswith("MLST"):
+            raise ftplib.error_perm("530 Not logged in.")
+        return real(self, cmd)
+
+    server.files["/SD/x.bin"] = b"x"
+    with patch.object(_FakeFTP, "sendcmd", sendcmd):
+        for call in (
+            lambda: st.storage_put_file("dev", "/SD/y.bin", b"x"),
+            lambda: st.storage_delete_file("dev", "/SD/x.bin", missing_ok=True),
+            lambda: st.storage_get_file("dev", "/SD/x.bin"),
+            lambda: st.storage_mkdir("dev", "/SD/d"),
+        ):
+            with pytest.raises(st.Ultimate64StorageError, match="530"):
+                call()
+    assert not any(e.startswith(("STOR", "DELE", "MKD", "RETR")) for e in server.log)
+
+
+def test_session_is_closed_and_uses_timeout_and_credentials(server, monkeypatch):
+    seen = {}
+    monkeypatch.setenv("U64_TEMP_GC_FTP_USER", "alice")
+    monkeypatch.setenv("U64_TEMP_GC_FTP_PASSWORD", "secret")
+
+    def connect(self, host, port, timeout=None):
+        seen["connect"] = (host, port, timeout)
+
+    def login(self, user, password):
+        seen["login"] = (user, password)
+
+    def quit(self):
+        seen["quit"] = True
+
+    with patch.object(_FakeFTP, "connect", connect), patch.object(
+        _FakeFTP, "login", login
+    ), patch.object(_FakeFTP, "quit", quit):
+        st.storage_volumes("dev", port=2121, timeout=7.5)
+    assert seen == {"connect": ("dev", 2121, 7.5), "login": ("alice", "secret"), "quit": True}

@@ -109,6 +109,21 @@ def test_put_get_overwrite_delete_round_trip(volume_dir: str) -> None:
         storage_delete_file(_HOST, path)
 
 
+def test_a_disk_image_is_a_file(volume_dir: str) -> None:
+    """CWD into a .d64 mounts it on the firmware; MLST must still say file (#526 review)."""
+    path = f"{volume_dir}/probe.d64"
+    storage_delete_file(_HOST, path, missing_ok=True)
+    image = bytes(174848)
+    try:
+        storage_put_file(_HOST, path, image)
+        assert storage_get_file(_HOST, path) == image
+        assert storage_put_file(_HOST, path, b"\x01" * 174848, overwrite=True).replaced
+        with pytest.raises(FileExistsError):
+            storage_mkdir(_HOST, f"{path}/sub")
+    finally:
+        assert storage_delete_file(_HOST, path, missing_ok=True)
+
+
 def test_mkdir_is_idempotent_and_a_directory_is_not_a_file(volume_dir: str) -> None:
     storage_mkdir(_HOST, volume_dir)
     assert storage_mkdir(_HOST, volume_dir) is False

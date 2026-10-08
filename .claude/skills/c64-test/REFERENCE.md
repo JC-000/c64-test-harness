@@ -739,7 +739,8 @@ Files on a device's persistent storage over the firmware's FTP server. Everythin
 
 Rules:
 - Every call needs this process to hold the device's `DeviceLock`, on every grade. Otherwise it raises `Ultimate64StorageError` before connecting.
-- Writes refuse `/Temp` and `/Flash` (`WRITE_REFUSED_VOLUMES`), and paths must be absolute and normalised. Both raise `ValueError` before connecting.
+- Writes refuse `/Temp` and `/Flash` (`WRITE_REFUSED_VOLUMES`). Paths must be absolute and normalised and must not contain a backslash: the firmware treats `\` as a separator and resolves `..`. Each of these raises `ValueError` before connecting, and so does an empty payload, because the U64E creates no file for one.
+- Files and directories are told apart with `MLST`, because `CWD` into a `.d64`/`.d81`/`.t64` succeeds on the firmware (it mounts the image). A failed upload of a new file is deleted, best effort, so a retry is not refused.
 - A path whose volume is absent or empty raises `Ultimate64StorageVolumeError`, which carries `.available`. Rigs should skip on it.
 - `FileExistsError`, `FileNotFoundError` and `IsADirectoryError` propagate as is. Any other FTP failure becomes `Ultimate64StorageError`, a subclass of `Ultimate64Error`.
 - The helpers never write config, so FTP File Service must already be on.

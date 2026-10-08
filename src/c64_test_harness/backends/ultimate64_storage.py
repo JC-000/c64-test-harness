@@ -20,8 +20,10 @@ Rules, all enforced before the path is touched:
   ``/Flash`` holds the firmware's own configuration and ROMs. Reads may
   target any volume. Checked before any connection.
 * **Paths are absolute and normalised:** no ``.``/``..``, no empty
-  components, no trailing ``/``, no control characters, and at least a
-  volume plus a name. Checked before any connection.
+  components, no trailing ``/``, no control characters, no backslash, and
+  at least a volume plus a name. The firmware treats ``\\`` as a path
+  separator and resolves ``..``, so ``/USB1/..\\Temp`` reaches ``/Temp``.
+  Checked before any connection.
 * **The volume must exist.** Its name is matched case-insensitively
   against the root listing, and the device's own spelling is used. A
   missing volume raises :class:`Ultimate64StorageVolumeError` with the
@@ -30,10 +32,24 @@ Rules, all enforced before the path is touched:
   card in it: the root lists that slot, but it cannot be entered.
 * **No config writes.** If FTP File Service is off, the call raises
   :class:`Ultimate64StorageError` naming the setting, and leaves it off.
+* **Files and directories are told apart with** ``MLST``, which stats
+  without mounting. ``CWD`` into a mountable image (``.d64``, ``.d81``,
+  ``.t64``...) succeeds on the firmware and opens the image, so it is used
+  only to check that a volume root can be entered.
+* **A failed upload of a new file is deleted** (best effort) so that a
+  retry is not refused. A failed overwrite cannot restore the old file,
+  and its error says so.
+
+The lock is keyed the way ``DeviceLock`` keys it: addresses listed together
+in ``devices.toml`` fold to one key. Unlike the REST client, these helpers
+make no identity probe, so an *unlisted* second address of a device whose
+lock another lane holds is not detected (#519). The FTP login reuses
+``$U64_TEMP_GC_FTP_USER`` and ``$U64_TEMP_GC_FTP_PASSWORD`` (default
+anonymous), the same credentials the ``/Temp`` GC uses.
 
 FTP ``STOR`` writes straight to the target volume (``ftpd.cc``
 ``cmd_stor``). It is not a REST body, so it creates no ``/Temp``
-attachment on any firmware. ``/Temp`` hygiene for REST uploads is
+attachment (source-read at 1.1.0 and 3a1ff9ff). ``/Temp`` hygiene for REST uploads is
 separate and automatic; see ``ultimate64_temp_gc``.
 """
 
@@ -43,6 +59,7 @@ import hashlib
 import io
 import logging
 import os
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from ftplib import FTP, all_errors as _FTP_ALL_ERRORS, error_perm
@@ -60,6 +77,7 @@ from .ultimate64_temp_gc import (
 )
 
 __all__ = [
+    "WRITE_REFUSED_VOLUMES",
     "StoragePutResult",
     "Ultimate64StorageError",
     "Ultimate64StorageVolumeError",
@@ -119,6 +137,11 @@ def _check_path(path: str, *, write: bool) -> list[str]:
         raise ValueError("storage path must be a non-empty string")
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in path):
         raise ValueError(f"storage path contains a control character: {path!r}")
+    if "\\" in path:
+        # The firmware's Path::cd treats '\\' as a separator and resolves
+        # '..' (path.cc at 1.1.0 and 3a1ff9ff), so '/USB1/..\\Temp' reaches
+        # /Temp: measured on the U64E, 2026-10-08 (SIZE and MLST of it).
+        raise ValueError(f"storage path must not contain a backslash: {path!r}")
     if not path.startswith("/"):
         raise ValueError(f"storage path must be absolute: {path!r}")
     if path.endswith("/"):
@@ -146,7 +169,7 @@ def _list_root(ftp: FTP) -> tuple[list[str], list[str]]:
     whose ``CWD`` fails is reported as empty, not usable.
     """
     names = sorted({n.strip("/").rsplit("/", 1)[-1] for n in ftp.nlst("/") if n.strip("/")})
-    usable = [n for n in names if _is_dir(ftp, "/" + n)]
+    usable = [n for n in names if _enterable(ftp, "/" + n)]
     return usable, [n for n in names if n not in usable]
 
 
@@ -189,8 +212,6 @@ def _session(host: str, operation: str, port: int, timeout: float) -> Iterator[F
         yield ftp
     except _PASS_THROUGH:
         raise
-    except Ultimate64Error:
-        raise
     except _FTP_ALL_ERRORS as exc:
         raise Ultimate64StorageError(
             f"{operation} on {host} failed: {type(exc).__name__}: {exc}"
@@ -209,7 +230,7 @@ def _resolve_volume(ftp: FTP, host: str, parts: list[str]) -> str:
         if name.casefold() == parts[0].casefold():
             return "/" + "/".join([name] + parts[1:])
     state = (
-        "is listed but has no medium mounted"
+        "is listed but cannot be entered (no medium, or a filesystem the firmware cannot read)"
         if any(n.casefold() == parts[0].casefold() for n in empty)
         else "is not a volume"
     )
@@ -231,8 +252,14 @@ def _size(ftp: FTP, path: str) -> int | None:
     return int(size) if size is not None else None
 
 
-def _is_dir(ftp: FTP, path: str) -> bool:
-    """Whether *path* is a directory, tested by whether ``CWD`` into it succeeds."""
+def _enterable(ftp: FTP, path: str) -> bool:
+    """Whether ``CWD`` into *path* succeeds. Use this only for volume roots.
+
+    On the firmware, ``CWD`` into a mountable image file (.d64, .d81, .t64,
+    and so on) succeeds and opens the image: ``vfs_chdir`` ->
+    ``find_mount_point``. So it cannot tell a file from a directory; that is
+    :func:`_kind`'s job. A volume root is never such a file.
+    """
     try:
         ftp.cwd(path)
     except error_perm:
@@ -241,14 +268,34 @@ def _is_dir(ftp: FTP, path: str) -> bool:
     return True
 
 
+def _kind(ftp: FTP, path: str) -> str | None:
+    """``"dir"``, ``"file"`` or ``None`` (missing), from ``MLST``.
+
+    ``cmd_mlst`` stats without mounting and answers 501 for a missing path
+    (ftpd.cc at 1.1.0 and 3a1ff9ff). On the U64E (2026-10-08) a ``.d64``
+    read ``type=file``.
+    """
+    try:
+        reply = ftp.sendcmd(f"MLST {path}")
+    except error_perm as exc:
+        if str(exc).startswith(("501", "550")):
+            return None
+        raise
+    m = re.search(r"type=(\w+)", reply)
+    if m is None:
+        raise Ultimate64StorageError(f"MLST {path}: no type fact in {reply!r}")
+    return "dir" if m.group(1) in ("dir", "cdir", "pdir") else "file"
+
+
 def _make_parents(ftp: FTP, path: str, *, include_self: bool) -> None:
     parts = path[1:].split("/")
     stop = len(parts) + 1 if include_self else len(parts)
     for depth in range(2, stop):
         sub = "/" + "/".join(parts[:depth])
-        if _is_dir(ftp, sub):
+        kind = _kind(ftp, sub)
+        if kind == "dir":
             continue
-        if _size(ftp, sub) is not None:
+        if kind == "file":
             raise FileExistsError(f"{sub} exists and is not a directory")
         ftp.mkd(sub)
 
@@ -278,9 +325,10 @@ def storage_get_file(
     parts = _check_path(path, write=False)
     with _session(host, f"storage_get_file({path!r})", port, timeout) as ftp:
         path = _resolve_volume(ftp, host, parts)
-        if _is_dir(ftp, path):
+        kind = _kind(ftp, path)
+        if kind == "dir":
             raise IsADirectoryError(f"{path} on {host} is a directory")
-        if _size(ftp, path) is None:
+        if kind is None:
             raise FileNotFoundError(f"{path} does not exist on {host}")
         buf = io.BytesIO()
         ftp.retrbinary(f"RETR {path}", buf.write)
@@ -317,34 +365,56 @@ def storage_put_file(
         payload = bytes(data)
     else:
         raise TypeError("data must be bytes or a pathlib.Path to a local file")
+    if not payload:
+        # 3a1ff9ff's receivefile opens the file only on the first data block,
+        # so a zero-byte STOR creates nothing (measured on the U64E, 2026-10-08).
+        raise ValueError("refusing an empty payload: the U64E firmware creates no file for it")
     digest = hashlib.sha256(payload).hexdigest()
     with _session(host, f"storage_put_file({path!r})", port, timeout) as ftp:
         path = _resolve_volume(ftp, host, parts)
-        if _is_dir(ftp, path):
+        kind = _kind(ftp, path)
+        if kind == "dir":
             raise IsADirectoryError(f"{path} on {host} is a directory")
-        existing = _size(ftp, path)
-        if existing is not None and not overwrite:
+        existing = _size(ftp, path) if kind == "file" else None
+        if kind == "file" and not overwrite:
             raise FileExistsError(
                 f"{path} already exists on {host} ({existing} B); pass overwrite=True"
             )
         _make_parents(ftp, path, include_self=False)
-        ftp.storbinary(f"STOR {path}", io.BytesIO(payload))
-        written = _size(ftp, path)
-        if written != len(payload):
-            raise Ultimate64StorageError(
-                f"{path} on {host}: server reports size {written}, sent {len(payload)}"
-            )
-        verified = False
-        if verify:
-            buf = io.BytesIO()
-            ftp.retrbinary(f"RETR {path}", buf.write)
-            back = hashlib.sha256(buf.getvalue()).hexdigest()
-            if back != digest:
+        try:
+            ftp.storbinary(f"STOR {path}", io.BytesIO(payload))
+            written = _size(ftp, path)
+            if written != len(payload):
                 raise Ultimate64StorageError(
-                    f"{path} on {host}: read back sha256 {back[:16]}..., "
-                    f"sent {digest[:16]}..."
+                    f"{path} on {host}: server reports size {written}, sent {len(payload)}"
                 )
-            verified = True
+            verified = False
+            if verify:
+                buf = io.BytesIO()
+                ftp.retrbinary(f"RETR {path}", buf.write)
+                back = hashlib.sha256(buf.getvalue()).hexdigest()
+                if back != digest:
+                    raise Ultimate64StorageError(
+                        f"{path} on {host}: read back sha256 {back[:16]}..., "
+                        f"sent {digest[:16]}..."
+                    )
+                verified = True
+        except (Ultimate64StorageError, *_FTP_ALL_ERRORS) as exc:
+            # The firmware opens the target before (1.1.0) or on (3a1ff9ff)
+            # the first data block and answers 226 even after a dropped
+            # transfer, so a failure can leave a truncated file behind.
+            if kind is None:
+                try:
+                    ftp.delete(path)
+                    fate = "the partial file was removed"
+                except _FTP_ALL_ERRORS as del_exc:
+                    fate = f"removing the partial file also failed ({del_exc}); retry with overwrite=True"
+            else:
+                fate = "the previous file is gone or truncated; retry with overwrite=True"
+            raise Ultimate64StorageError(
+                f"storage_put_file({path!r}) on {host} failed: "
+                f"{type(exc).__name__}: {exc}; {fate}"
+            ) from exc
     _log.info(
         "storage_put_file: wrote %s on %s (%d B, sha256 %s, verified=%s, replaced=%s)",
         path, host, len(payload), digest[:16], verified, existing is not None,
@@ -370,10 +440,13 @@ def storage_mkdir(
     parts = _check_path(path, write=True)
     with _session(host, f"storage_mkdir({path!r})", port, timeout) as ftp:
         path = _resolve_volume(ftp, host, parts)
-        if _is_dir(ftp, path):
+        kind = _kind(ftp, path)
+        if kind == "dir":
             if exist_ok:
                 return False
             raise FileExistsError(f"{path} already exists on {host}")
+        if kind == "file":
+            raise FileExistsError(f"{path} exists on {host} and is a file")
         _make_parents(ftp, path, include_self=True)
     _log.info("storage_mkdir: created %s on %s", path, host)
     return True
@@ -394,9 +467,10 @@ def storage_delete_file(
     parts = _check_path(path, write=True)
     with _session(host, f"storage_delete_file({path!r})", port, timeout) as ftp:
         path = _resolve_volume(ftp, host, parts)
-        if _is_dir(ftp, path):
+        kind = _kind(ftp, path)
+        if kind == "dir":
             raise IsADirectoryError(f"{path} on {host} is a directory")
-        if _size(ftp, path) is None:
+        if kind is None:
             if missing_ok:
                 return False
             raise FileNotFoundError(f"{path} does not exist on {host}")

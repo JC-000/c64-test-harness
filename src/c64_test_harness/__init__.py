@@ -153,6 +153,7 @@ from .backends.ultimate64_temp_gc import (
     auto_gc_enabled,
 )
 from .backends.ultimate64_storage import (
+    WRITE_REFUSED_VOLUMES,
     StoragePutResult,
     Ultimate64StorageError,
     Ultimate64StorageVolumeError,
@@ -618,6 +619,7 @@ __all__ = [
     "gc_temp_folder",
     "auto_gc_enabled",
     # Ultimate persistent storage (FTP put/delete under the DeviceLock)
+    "WRITE_REFUSED_VOLUMES",
     "StoragePutResult",
     "Ultimate64StorageError",
     "Ultimate64StorageVolumeError",
