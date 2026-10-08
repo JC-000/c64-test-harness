@@ -152,6 +152,16 @@ from .backends.ultimate64_temp_gc import (
     gc_temp_folder,
     auto_gc_enabled,
 )
+from .backends.ultimate64_storage import (
+    StoragePutResult,
+    Ultimate64StorageError,
+    Ultimate64StorageVolumeError,
+    storage_delete_file,
+    storage_get_file,
+    storage_mkdir,
+    storage_put_file,
+    storage_volumes,
+)
 from .backends.u64_capabilities import CbmFixConstantStaleWarning
 from .backends.ultimate64_probe import (
     LivenessResult,
@@ -607,6 +617,15 @@ __all__ = [
     "TempGCResult",
     "gc_temp_folder",
     "auto_gc_enabled",
+    # Ultimate persistent storage (FTP put/delete under the DeviceLock)
+    "StoragePutResult",
+    "Ultimate64StorageError",
+    "Ultimate64StorageVolumeError",
+    "storage_volumes",
+    "storage_get_file",
+    "storage_put_file",
+    "storage_mkdir",
+    "storage_delete_file",
     # CBM /Temp-fix constant never set for a newer C64U release (issue #248)
     "CbmFixConstantStaleWarning",
     # Ultimate 64 liveness probe
