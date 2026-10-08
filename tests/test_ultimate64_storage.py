@@ -582,3 +582,25 @@ def test_type_fact_is_read_from_the_fact_line_not_the_name(server):
     server.files["/SD/atype=dir.bin"] = b"payload"
     assert st.storage_get_file("dev", "/SD/atype=dir.bin") == b"payload"
     assert st.storage_delete_file("dev", "/SD/atype=dir.bin") is True
+
+
+# ---------------------------------------------------------------- review round 3 (#526)
+@pytest.mark.parametrize("path", ["/SD/100%s.d64", "/SD/a%n", "/SD/" + "x" * 61])
+def test_reads_refuse_percent_and_long_names_before_connecting(server, path):
+    """get MLSTs its path, so it reaches 1.1.0's format-string sink too."""
+    with pytest.raises(ValueError):
+        st.storage_get_file("dev", path)
+    assert server.connects == 0
+
+
+def test_an_image_directly_under_the_volume_is_never_stated_through(server):
+    server.files["/SD/game.d64"] = b"\x00" * 174848
+    for call in (
+        lambda: st.storage_put_file("dev", "/SD/game.d64/inner.prg", b"x"),
+        lambda: st.storage_mkdir("dev", "/SD/game.d64/sub"),
+        lambda: st.storage_get_file("dev", "/SD/game.d64/inner.prg"),
+        lambda: st.storage_delete_file("dev", "/SD/game.d64/inner.prg", missing_ok=True),
+    ):
+        with pytest.raises(NotADirectoryError):
+            call()
+    assert not any(e.startswith("MOUNTED") for e in server.log), server.log
