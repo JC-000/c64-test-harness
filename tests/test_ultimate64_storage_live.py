@@ -17,6 +17,7 @@ not, the test fails with the storage error that names the setting.
 """
 from __future__ import annotations
 
+import ftplib
 import hashlib
 import os
 
@@ -167,4 +168,30 @@ def test_list_dir_and_rmdir(volume_dir: str) -> None:
         assert any(e.name == volume_dir.split("/")[2] and e.kind == "dir" for e in root)
     finally:
         storage_delete_file(_HOST, inner, missing_ok=True)
+        storage_rmdir(_HOST, sub, missing_ok=True)
+
+
+def test_a_hidden_entry_makes_rmdir_a_typed_not_empty(volume_dir: str) -> None:
+    """MLSD omits '.'-names (get_directory); RMD's refusal must still be typed (#527 review).
+
+    The API refuses to create a '.'-name, so the probe is planted with raw FTP.
+    """
+    sub = f"{volume_dir}/hidden-probe"
+    dot = f"{sub}/.probe"
+    storage_mkdir(_HOST, sub)
+    ftp = ftplib.FTP(_HOST, timeout=30)
+    ftp.login()
+    try:
+        ftp.storbinary(f"STOR {dot}", __import__("io").BytesIO(b"hidden"))
+        assert ftp.size(dot) == 6
+        assert storage_list_dir(_HOST, sub) == []
+        with pytest.raises(Ultimate64StorageNotEmptyError) as ei:
+            storage_rmdir(_HOST, sub)
+        assert ei.value.entries == []
+    finally:
+        try:
+            ftp.delete(dot)
+        except ftplib.all_errors:
+            pass
+        ftp.quit()
         storage_rmdir(_HOST, sub, missing_ok=True)
