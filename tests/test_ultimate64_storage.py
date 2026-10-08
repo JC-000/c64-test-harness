@@ -764,3 +764,15 @@ def test_a_decode_error_inside_a_session_is_a_storage_error(server):
     with patch.object(_FakeFTP, "mlsd", mlsd):
         with pytest.raises(st.Ultimate64StorageError, match="UnicodeDecodeError"):
             st.storage_list_dir("dev", "/SD")
+
+
+def test_a_non_550_rmd_refusal_stays_an_untyped_storage_error(server):
+    server.dirs.add("/SD/d")
+
+    def rmd(self, path):
+        raise ftplib.error_perm("530 Not logged in.")
+
+    with patch.object(_FakeFTP, "rmd", rmd):
+        with pytest.raises(st.Ultimate64StorageError, match="530") as ei:
+            st.storage_rmdir("dev", "/SD/d")
+    assert not isinstance(ei.value, st.Ultimate64StorageNotEmptyError)

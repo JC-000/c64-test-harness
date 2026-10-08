@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ftplib
 import hashlib
+import io
 import os
 
 import pytest
@@ -180,9 +181,12 @@ def test_a_hidden_entry_makes_rmdir_a_typed_not_empty(volume_dir: str) -> None:
     dot = f"{sub}/.probe"
     storage_mkdir(_HOST, sub)
     ftp = ftplib.FTP(_HOST, timeout=30)
-    ftp.login()
+    ftp.login(
+        os.environ.get("U64_TEMP_GC_FTP_USER", "anonymous"),
+        os.environ.get("U64_TEMP_GC_FTP_PASSWORD", "anonymous@"),
+    )
     try:
-        ftp.storbinary(f"STOR {dot}", __import__("io").BytesIO(b"hidden"))
+        ftp.storbinary(f"STOR {dot}", io.BytesIO(b"hidden"))
         assert ftp.size(dot) == 6
         assert storage_list_dir(_HOST, sub) == []
         with pytest.raises(Ultimate64StorageNotEmptyError) as ei:

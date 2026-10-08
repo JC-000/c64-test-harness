@@ -658,7 +658,8 @@ def storage_rmdir(
                 f"{path} on {host}: RMD answered {exc}. The directory most likely "
                 "still holds hidden entries that MLSD does not list (names "
                 "starting with '.', or files with the hidden attribute, such as "
-                ".DS_Store); remove them by another route",
+                ".DS_Store), or the directory is read-only or the volume "
+                "write-protected; remove them by another route",
                 [],
             ) from exc
     _log.info("storage_rmdir: removed %s on %s", path, host)
