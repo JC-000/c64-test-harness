@@ -727,6 +727,26 @@ from c64_test_harness.backends.ultimate64_helpers import (
 
 ---
 
+## Module: backends.ultimate64_storage
+
+Files on a device's persistent storage over the firmware's FTP server. Everything below is exported at the package root.
+
+- `storage_volumes(host) -> list[str]`: the usable volumes at the FTP root. An empty media slot is left out: the root lists it, but `CWD` into it fails. On 2026-10-08 the C64U had only `Flash` and `Temp` (its `/SD` slot was empty), and the U64E had `Flash`, `Temp` and `USB1`.
+- `storage_get_file(host, path) -> bytes`: any volume may be read.
+- `storage_put_file(host, path, data: bytes | Path, *, overwrite=False, verify=True) -> StoragePutResult(path, size, sha256, verified, replaced)`. Creates missing parents. Checks `SIZE` after the write and, with `verify`, reads the file back and compares SHA-256. A `str` for `data` is refused.
+- `storage_mkdir(host, path, *, exist_ok=True) -> bool`
+- `storage_delete_file(host, path, *, missing_ok=False) -> bool`: directories are refused.
+
+Rules:
+- Every call needs this process to hold the device's `DeviceLock`, on every grade. Otherwise it raises `Ultimate64StorageError` before connecting.
+- Writes refuse `/Temp` and `/Flash` (`WRITE_REFUSED_VOLUMES`). Paths must be absolute and normalised. They must not contain a backslash (the firmware treats `\` as a separator and resolves `..`) or a `%` (1.1.0's `MLST` formats the name as a format string, fixed upstream in #713), and no component may exceed 60 characters. Each of these raises `ValueError` before connecting, and so does an empty payload, because the U64E creates no file for one.
+- Files and directories are told apart with `MLST`, because `CWD` into a `.d64`/`.d81`/`.t64` succeeds on the firmware (it mounts the image). A failed upload of a new file is deleted, best effort, so a retry is not refused.
+- A path whose volume is absent or empty raises `Ultimate64StorageVolumeError`, which carries `.available`. Rigs should skip on it.
+- `FileExistsError`, `FileNotFoundError`, `IsADirectoryError` and `NotADirectoryError` (an ancestor is a file, such as a disk image; classification is top-down, so nothing is stat'ed through an image) propagate as is. Any other FTP failure becomes `Ultimate64StorageError`, a subclass of `Ultimate64Error`.
+- The helpers never write config, so FTP File Service must already be on.
+- FTP `STOR` costs no `/Temp` attachment.
+- Live test: `tests/test_ultimate64_storage_live.py`, gated by `STORAGE_LIVE=1` and `U64_HOST`.
+
 ## Module: snapshot
 
 Cross-backend VICE/U64 snapshot interop using VICE's native `.vsf` format as the on-disk wire. **Phase A** (PR #115 / commit 45a5844): RAM + CPU port round-trip — explicitly RAM + color RAM, I/O window excluded on restore: extract captures I/O-view bytes for `$D000-$DFFF`, but restore skips that window except color RAM `$D800-$DBFF` (blind register writes could fire spurious REU DMA via `$DF01`), so the round-trip guarantee is `$0000-$CFFF` + `$D800-$DBFF` + `$E000-$FFFF`. **REU layer** (issue #134): `reu_size_bytes` + `reu_contents` capture/restore, live-validated byte-exact on C64U fw 1.1.0 (2026-07-21). Later phases will add CIA/VIC/SID register state, drive images, and cartridge bytes — see `docs/snapshot_interop.md` for the per-layer asymmetry matrix and the U64-side limitations (REST cannot read cart bytes / disk images / REU memory back; 6510 registers aren't directly observable; 28 of 32 SID registers are write-only on hardware).
