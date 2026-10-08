@@ -31,6 +31,8 @@ class _FakeFTPServer:
         self.log: list[str] = []
         #: listed at the root but CWD fails (an empty media slot)
         self.empty_slots: set[str] = set()
+        #: MLST of a missing path: 501 at 1.1.0, 550 at 3a1ff9ff (ftpd.cc)
+        self.mlst_missing = "501 Syntax error in parameters or arguments."
 
 
 _MOUNTABLE = (".d64", ".d71", ".d81", ".dnp", ".t64", ".iso", ".fat")
@@ -69,12 +71,17 @@ class _FakeFTP:
         verb, _, arg = cmd.partition(" ")
         if verb == "MLST":
             # ftpd.cc cmd_mlst: vfs_stat without mounting; 501 when missing.
+            # vfs_stat enters a mountable image on the way to a deeper path
+            # (find_pathentry -> find_mount_point): record that it happened.
+            for f in self.server.files:
+                if arg.startswith(f + "/"):
+                    self.server.log.append(f"MOUNTED {f}")
             if arg in self.server.dirs:
                 kind = "dir"
             elif arg in self.server.files:
                 kind = "file"
             else:
-                raise ftplib.error_perm("501 Syntax error in parameters or arguments.")
+                raise ftplib.error_perm(self.server.mlst_missing)
             name = arg.rsplit("/", 1)[-1]
             return f"250- Listing {name}\r\ntype={kind};modify=19800101000000; {name}\r\n250 End"
         raise AssertionError(f"unexpected sendcmd {cmd!r}")
@@ -265,6 +272,13 @@ def test_delete_refuses_a_directory(server):
         "/USB1/a\\..\\..\\Flash\\x",
         "/USB1\\..\\Temp/x",
         "/SD/a\\b",
+        # 1.1.0's cmd_mlst sprintfs the name into the format argument of
+        # send_msg (fixed upstream in #713, in 3a1ff9ff, not in 1.1.0)
+        "/SD/100%s.d64",
+        "/SD/a%n",
+        "/SD/%",
+        # stay clear of 1.1.0's 200-byte MLST buffer (63-char LFN + size)
+        "/SD/" + "x" * 61,
     ],
 )
 def test_write_refused_paths_never_connect(server, path):
@@ -389,10 +403,12 @@ def test_mkdir_creates_parents_and_honours_exist_ok(server):
 
 def test_mkdir_refuses_when_a_file_is_in_the_way(server):
     server.files["/SD/a"] = b"file"
-    with pytest.raises(FileExistsError):
+    with pytest.raises(NotADirectoryError):
         st.storage_mkdir("dev", "/SD/a/b")
-    with pytest.raises(FileExistsError):
+    with pytest.raises(NotADirectoryError):
         st.storage_put_file("dev", "/SD/a/b.bin", b"x")
+    with pytest.raises(FileExistsError):
+        st.storage_mkdir("dev", "/SD/a")
     assert "/SD/a/b" not in server.dirs
 
 
@@ -437,11 +453,18 @@ def test_a_mountable_image_is_a_file_not_a_directory(server):
 def test_a_mountable_image_is_never_used_as_a_parent(server):
     server.dirs.add("/SD/disks")
     server.files["/SD/disks/game.d64"] = b"\x00" * 174848
-    with pytest.raises(FileExistsError):
-        st.storage_put_file("dev", "/SD/disks/game.d64/inner.prg", b"x")
-    with pytest.raises(FileExistsError):
-        st.storage_mkdir("dev", "/SD/disks/game.d64/sub")
-    assert not any(e.startswith(("STOR", "MKD")) for e in server.log)
+    for call in (
+        lambda: st.storage_put_file("dev", "/SD/disks/game.d64/inner.prg", b"x"),
+        lambda: st.storage_mkdir("dev", "/SD/disks/game.d64/sub"),
+        lambda: st.storage_get_file("dev", "/SD/disks/game.d64/inner.prg"),
+        lambda: st.storage_delete_file("dev", "/SD/disks/game.d64/inner.prg", missing_ok=True),
+    ):
+        with pytest.raises(NotADirectoryError):
+            call()
+    assert not any(e.startswith(("STOR", "MKD", "RETR", "DELE")) for e in server.log)
+    # classification is top-down: nothing is ever stat'ed through the image,
+    # which would mount it (and on 1.1.0 leave a stale mount after a DELE)
+    assert not any(e.startswith("MOUNTED") for e in server.log), server.log
 
 
 def test_a_failed_new_upload_is_removed_so_a_retry_succeeds(server):
@@ -537,3 +560,25 @@ def test_session_is_closed_and_uses_timeout_and_credentials(server, monkeypatch)
     ), patch.object(_FakeFTP, "quit", quit):
         st.storage_volumes("dev", port=2121, timeout=7.5)
     assert seen == {"connect": ("dev", 2121, 7.5), "login": ("alice", "secret"), "quit": True}
+
+
+# ---------------------------------------------------------------- review round 2 (#526)
+@pytest.mark.parametrize(
+    "missing",
+    ["501 Syntax error in parameters or arguments.", "550 File not found."],
+    ids=["1.1.0-501", "3a1ff9ff-550"],
+)
+def test_mlst_missing_codes_of_both_firmwares(server, missing):
+    server.mlst_missing = missing
+    with pytest.raises(FileNotFoundError):
+        st.storage_get_file("dev", "/SD/nope.bin")
+    assert st.storage_delete_file("dev", "/SD/nope.bin", missing_ok=True) is False
+    assert st.storage_put_file("dev", "/SD/new/x.bin", b"x").verified
+    assert st.storage_mkdir("dev", "/SD/other/d") is True
+
+
+def test_type_fact_is_read_from_the_fact_line_not_the_name(server):
+    """A file named like a fact must not be read as a directory."""
+    server.files["/SD/atype=dir.bin"] = b"payload"
+    assert st.storage_get_file("dev", "/SD/atype=dir.bin") == b"payload"
+    assert st.storage_delete_file("dev", "/SD/atype=dir.bin") is True

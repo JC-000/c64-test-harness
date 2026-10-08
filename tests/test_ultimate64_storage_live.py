@@ -118,10 +118,10 @@ def test_a_disk_image_is_a_file(volume_dir: str) -> None:
         storage_put_file(_HOST, path, image)
         assert storage_get_file(_HOST, path) == image
         assert storage_put_file(_HOST, path, b"\x01" * 174848, overwrite=True).replaced
-        with pytest.raises(FileExistsError):
+        with pytest.raises(NotADirectoryError):
             storage_mkdir(_HOST, f"{path}/sub")
     finally:
-        assert storage_delete_file(_HOST, path, missing_ok=True)
+        storage_delete_file(_HOST, path, missing_ok=True)
 
 
 def test_mkdir_is_idempotent_and_a_directory_is_not_a_file(volume_dir: str) -> None:

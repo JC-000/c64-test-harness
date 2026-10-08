@@ -20,8 +20,10 @@ Rules, all enforced before the path is touched:
   ``/Flash`` holds the firmware's own configuration and ROMs. Reads may
   target any volume. Checked before any connection.
 * **Paths are absolute and normalised:** no ``.``/``..``, no empty
-  components, no trailing ``/``, no control characters, no backslash, and
-  at least a volume plus a name. The firmware treats ``\\`` as a path
+  components, no trailing ``/``, no control characters, no backslash, no
+  ``%``, no component over :data:`MAX_COMPONENT_LEN` characters, and at
+  least a volume plus a name. ``%`` reaches a format string in 1.1.0's
+  ``MLST`` (fixed upstream in #713). The firmware treats ``\\`` as a path
   separator and resolves ``..``, so ``/USB1/..\\Temp`` reaches ``/Temp``.
   Checked before any connection.
 * **The volume must exist.** Its name is matched case-insensitively
@@ -99,7 +101,12 @@ DEFAULT_STORAGE_FTP_TIMEOUT = 60.0
 
 #: OSError subclasses raised on purpose here. ftplib's ``all_errors``
 #: includes OSError, so they are re-raised before that clause can wrap them.
-_PASS_THROUGH = (FileExistsError, FileNotFoundError, IsADirectoryError)
+_PASS_THROUGH = (FileExistsError, FileNotFoundError, IsADirectoryError, NotADirectoryError)
+
+#: Longest path component accepted. 1.1.0's ``cmd_mlst`` formats the name
+#: and size into a 200-byte buffer; a 63-character LFN plus a 10-digit size
+#: fills it exactly (#526 review), so components stay well under that.
+MAX_COMPONENT_LEN = 60
 
 
 class Ultimate64StorageError(Ultimate64Error):
@@ -142,6 +149,13 @@ def _check_path(path: str, *, write: bool) -> list[str]:
         # '..' (path.cc at 1.1.0 and 3a1ff9ff), so '/USB1/..\\Temp' reaches
         # /Temp: measured on the U64E, 2026-10-08 (SIZE and MLST of it).
         raise ValueError(f"storage path must not contain a backslash: {path!r}")
+    if "%" in path:
+        # 1.1.0's cmd_mlst sprintfs the entry's name and then passes the
+        # result to send_msg as its *format*, so a '%' in a name reaches
+        # vsprintf with no arguments (ftpd.cc; fixed upstream in #713,
+        # which 3a1ff9ff carries and 1.1.0 does not). Source-read; never
+        # probed on a device.
+        raise ValueError(f"storage path must not contain '%': {path!r}")
     if not path.startswith("/"):
         raise ValueError(f"storage path must be absolute: {path!r}")
     if path.endswith("/"):
@@ -151,6 +165,10 @@ def _check_path(path: str, *, write: bool) -> list[str]:
         raise ValueError(f"storage path must be normalised (no '', '.', '..'): {path!r}")
     if len(parts) < 2:
         raise ValueError(f"storage path must name a volume and an entry: {path!r}")
+    if any(len(p) > MAX_COMPONENT_LEN for p in parts):
+        raise ValueError(
+            f"storage path component longer than {MAX_COMPONENT_LEN} characters: {path!r}"
+        )
     if write and parts[0].casefold() in WRITE_REFUSED_VOLUMES:
         raise ValueError(
             f"refusing to write {path!r}: /{parts[0]} is not test storage "
@@ -281,10 +299,31 @@ def _kind(ftp: FTP, path: str) -> str | None:
         if str(exc).startswith(("501", "550")):
             return None
         raise
-    m = re.search(r"type=(\w+)", reply)
+    m = re.search(r"^\s*type=(\w+)", reply, re.MULTILINE)
     if m is None:
         raise Ultimate64StorageError(f"MLST {path}: no type fact in {reply!r}")
     return "dir" if m.group(1) in ("dir", "cdir", "pdir") else "file"
+
+
+def _walk(ftp: FTP, path: str) -> str | None:
+    """Kind of *path*'s leaf, classified top-down (``"dir"``/``"file"``/``None``).
+
+    Each ancestor below the volume is checked with ``MLST`` before
+    anything deeper. A missing ancestor means the leaf is missing, and an
+    ancestor that is a file raises ``NotADirectoryError``. So nothing is
+    ever stat'ed *through* a disk image: ``vfs_stat`` would mount it
+    (``find_pathentry`` -> ``find_mount_point``), and on 1.1.0 a later
+    ``DELE`` of that image leaves a stale mount (#526 review).
+    """
+    parts = path[1:].split("/")
+    for depth in range(2, len(parts)):
+        sub = "/" + "/".join(parts[:depth])
+        kind = _kind(ftp, sub)
+        if kind is None:
+            return None
+        if kind == "file":
+            raise NotADirectoryError(f"{sub} is a file, not a directory")
+    return _kind(ftp, path)
 
 
 def _make_parents(ftp: FTP, path: str, *, include_self: bool) -> None:
@@ -296,7 +335,7 @@ def _make_parents(ftp: FTP, path: str, *, include_self: bool) -> None:
         if kind == "dir":
             continue
         if kind == "file":
-            raise FileExistsError(f"{sub} exists and is not a directory")
+            raise NotADirectoryError(f"{sub} is a file, not a directory")
         ftp.mkd(sub)
 
 
@@ -321,11 +360,12 @@ def storage_get_file(
 
     :raises FileNotFoundError: no such file.
     :raises IsADirectoryError: *path* is a directory.
+    :raises NotADirectoryError: an ancestor is a file (such as a disk image).
     """
     parts = _check_path(path, write=False)
     with _session(host, f"storage_get_file({path!r})", port, timeout) as ftp:
         path = _resolve_volume(ftp, host, parts)
-        kind = _kind(ftp, path)
+        kind = _walk(ftp, path)
         if kind == "dir":
             raise IsADirectoryError(f"{path} on {host} is a directory")
         if kind is None:
@@ -350,7 +390,8 @@ def storage_put_file(
     *data* is ``bytes``, or a ``Path`` to a local file. A ``str`` is
     refused, because it could be either. An existing file is refused with
     ``FileExistsError`` unless *overwrite* is true, and a directory at
-    *path* is always refused (``IsADirectoryError``).
+    *path* is always refused (``IsADirectoryError``), and so is an
+    ancestor that is a file (``NotADirectoryError``).
 
     After the ``STOR`` the server's ``SIZE`` must equal ``len(data)``.
     With *verify* (the default) the file is also read back and its
@@ -372,7 +413,7 @@ def storage_put_file(
     digest = hashlib.sha256(payload).hexdigest()
     with _session(host, f"storage_put_file({path!r})", port, timeout) as ftp:
         path = _resolve_volume(ftp, host, parts)
-        kind = _kind(ftp, path)
+        kind = _walk(ftp, path)
         if kind == "dir":
             raise IsADirectoryError(f"{path} on {host} is a directory")
         existing = _size(ftp, path) if kind == "file" else None
@@ -434,13 +475,14 @@ def storage_mkdir(
     Returns ``True`` if it was created, or ``False`` if it already
     existed and *exist_ok* is true.
 
-    :raises FileExistsError: it exists and *exist_ok* is false, or a
-        file sits where a directory is needed.
+    :raises FileExistsError: it exists and *exist_ok* is false, or it
+        is a file.
+    :raises NotADirectoryError: an ancestor is a file (such as a disk image).
     """
     parts = _check_path(path, write=True)
     with _session(host, f"storage_mkdir({path!r})", port, timeout) as ftp:
         path = _resolve_volume(ftp, host, parts)
-        kind = _kind(ftp, path)
+        kind = _walk(ftp, path)
         if kind == "dir":
             if exist_ok:
                 return False
@@ -463,11 +505,12 @@ def storage_delete_file(
 
     :raises FileNotFoundError: absent and *missing_ok* is false.
     :raises IsADirectoryError: *path* is a directory.
+    :raises NotADirectoryError: an ancestor is a file (such as a disk image).
     """
     parts = _check_path(path, write=True)
     with _session(host, f"storage_delete_file({path!r})", port, timeout) as ftp:
         path = _resolve_volume(ftp, host, parts)
-        kind = _kind(ftp, path)
+        kind = _walk(ftp, path)
         if kind == "dir":
             raise IsADirectoryError(f"{path} on {host} is a directory")
         if kind is None:
