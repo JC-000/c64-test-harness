@@ -232,8 +232,23 @@ class SocketDMAClient:
             )
         sock = self._ensure_connected()
         header = struct.pack("<HH", opcode, len(payload))
+        # ``sendall`` blocks until the device has read the command, and the
+        # socket timeout bounds the whole call, so a 64 KiB command needs
+        # the drain-rate budget the barrier gets: a flat 5 s timed out on
+        # the C64U (fw 1.1.0, 2026-10-09, first 1 MB REUWRITE).  Never
+        # shorten a timeout a caller stretched (the barrier's IDENTIFY), and
+        # put it back afterwards.  (Guarded: socket fakes without
+        # ``gettimeout`` keep their own timeout.)
+        gettimeout = getattr(sock, "gettimeout", None)
+        prior = gettimeout() if gettimeout is not None else None
+        budget = self._timeout + len(payload) / _REU_DRAIN_FLOOR_BPS
+        stretch = prior is not None and budget > prior
         try:
+            if stretch:
+                sock.settimeout(budget)
             sock.sendall(header + payload)
+            if stretch:
+                sock.settimeout(prior)
         except OSError as exc:
             self.close()
             raise Ultimate64Error(f"SocketDMA send failed: {exc}") from exc

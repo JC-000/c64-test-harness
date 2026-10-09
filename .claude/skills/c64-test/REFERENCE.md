@@ -958,7 +958,7 @@ Context manager — `with` opens one connection reused across commands; outside 
 - `dma_write(addr, data)` — raw memory write (opcode 0xFF06), no autostart; payload ≤ 65535 bytes/command
 - `dma_load(addr, data, run=False)` — PRG-style load (0xFF01), `run=True` → DMARUN (0xFF02) autostart
 - `dma_jump(addr)` — 0xFF09
-- `reu_write(offset, data, *, sync=True)` — 0xFF07; 24-bit LE offset, ≤16 MB REU space; chunks transparently at `REU_WRITE_MAX_CHUNK` (65 532) data bytes/command. `sync=True` ends with an in-band IDENTIFY completion barrier — REUWRITE has no per-command ack and the C64U fw 1.1.0 drains large bursts erratically (0.4–19 s live-measured for 96 KiB), so without the barrier an immediate read-back sees stale contents; the barrier's recv timeout scales with payload size. No REST readback exists on any firmware — extraction goes through the snapshot staging window (issue #134, wired).
+- `reu_write(offset, data, *, sync=True)` — 0xFF07; 24-bit LE offset, ≤16 MB REU space; chunks transparently at `REU_WRITE_MAX_CHUNK` (65 532) data bytes/command. `sync=True` ends with an in-band IDENTIFY completion barrier — REUWRITE has no per-command ack and the C64U fw 1.1.0 drains large bursts erratically (0.4–19 s live-measured for 96 KiB), so without the barrier an immediate read-back sees stale contents; each command's send and the barrier's recv scale their timeouts with payload size. No REST readback exists on any firmware — extraction goes through the snapshot staging window (issue #134, wired).
 - `inject_keys(text)` — 0xFF03; firmware DMAs into the 10-byte keyboard buffer
 - `reset()` — 0xFF04; recoverable, menu-equivalent
 - `authenticate()` — 0xFF1F; required first on password-protected devices (fw 3.12+)

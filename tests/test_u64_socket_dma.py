@@ -560,3 +560,121 @@ def test_fire_and_forget_after_idle_gap_is_not_lost(firmware_like) -> None:
 def test_idle_reconnect_rejects_non_positive() -> None:
     with pytest.raises(ValueError):
         SocketDMAClient(host="fake", idle_reconnect=0)
+
+
+# ---------------------------------------------------------------------------
+# A slow-draining device: the send timeout must scale with the payload
+# ---------------------------------------------------------------------------
+#
+# The firmware reads a command's payload off the socket as fast as it can
+# service it, so a large command's ``sendall`` blocks until the device has
+# drained it, and Python applies the socket timeout to the whole ``sendall``.
+# The REUWRITE barrier already budgets the worst C64U drain rate
+# (``_REU_DRAIN_FLOOR_BPS``); the sends before it must too, or a 64 KiB
+# command times out at the flat 5 s client timeout before the barrier is
+# reached (amiga64 on the C64U, fw 1.1.0, 2026-10-09: "SocketDMA send
+# failed: timed out" on the first 1 MB REUWRITE).
+
+
+class _SlowDrainSock:
+    """A connection whose peer reads at ``rate`` bytes/s, with no buffering.
+
+    ``sendall`` fails the way a real socket does when the drain outlasts the
+    timeout in force; ``recv`` records the timeout in force for the reply.
+    """
+
+    def __init__(self, rate: float) -> None:
+        self.rate = rate
+        self.timeout = None
+        self.send_timeouts: list[tuple[int, float]] = []
+        self.recv_timeouts: list[float] = []
+        self._replies: list[bytes] = []
+
+    def settimeout(self, value) -> None:
+        self.timeout = value
+
+    def gettimeout(self):
+        return self.timeout
+
+    def sendall(self, data: bytes) -> None:
+        self.send_timeouts.append((len(data), self.timeout))
+        if self.timeout is not None and len(data) / self.rate > self.timeout:
+            raise socket.timeout("timed out")
+        if data[:2] == b"\x0e\xff":
+            self._replies.append(b"\x04FAKE")
+
+    def recv(self, n: int) -> bytes:
+        self.recv_timeouts.append(self.timeout)
+        if not self._replies:
+            return b""
+        out = self._replies[0][:n]
+        self._replies[0] = self._replies[0][n:]
+        if not self._replies[0]:
+            self._replies.pop(0)
+        return out
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.fixture
+def slow_drain(monkeypatch):
+    from c64_test_harness.backends import u64_socket_dma as mod
+
+    socks: list[_SlowDrainSock] = []
+
+    def create_connection(addr, timeout=None):
+        s = _SlowDrainSock(rate=5 * 1024)   # the slowest C64U drain observed
+        socks.append(s)
+        return s
+
+    monkeypatch.setattr(mod.socket, "create_connection", create_connection)
+    return socks
+
+
+def test_large_reu_write_survives_a_slow_drain(slow_drain) -> None:
+    """1 MB at 5 KiB/s: each 64 KiB command takes ~12.8 s to drain, more
+    than the flat 5 s client timeout."""
+    from c64_test_harness.backends.u64_socket_dma import (
+        REU_WRITE_MAX_CHUNK, _REU_DRAIN_FLOOR_BPS,
+    )
+
+    with SocketDMAClient(host="fake", timeout=5.0) as c:
+        c.reu_write(0xF00000, bytes(1 << 20))
+    sock = slow_drain[0]
+    writes = [(n, t) for n, t in sock.send_timeouts if n > 4]
+    assert len(writes) == -(-(1 << 20) // REU_WRITE_MAX_CHUNK)
+    for n, t in writes:
+        assert t >= 5.0 + (n - 4) / _REU_DRAIN_FLOOR_BPS
+
+
+def test_send_scaling_keeps_the_barrier_budget(slow_drain) -> None:
+    """The barrier's IDENTIFY send must not shrink the barrier's own scaled
+    recv timeout back to the flat client timeout."""
+    from c64_test_harness.backends.u64_socket_dma import _REU_DRAIN_FLOOR_BPS
+
+    size = 200_000
+    with SocketDMAClient(host="fake", timeout=5.0) as c:
+        c.reu_write(0, bytes(size))
+        assert slow_drain[0].timeout == 5.0      # restored afterwards
+    barrier = 5.0 + size / _REU_DRAIN_FLOOR_BPS
+    assert slow_drain[0].recv_timeouts
+    assert min(slow_drain[0].recv_timeouts) >= barrier
+    # The IDENTIFY itself queues behind the drain, so its send needs it too.
+    (n, t), = [(n, t) for n, t in slow_drain[0].send_timeouts if n == 4]
+    assert t >= barrier
+
+
+def test_small_command_keeps_the_flat_timeout(slow_drain) -> None:
+    with SocketDMAClient(host="fake", timeout=5.0) as c:
+        c.identify()
+    (n, t), = slow_drain[0].send_timeouts
+    assert n == 4 and t == pytest.approx(5.0, abs=0.01)
+
+
+def test_stretched_send_timeout_is_put_back(slow_drain) -> None:
+    """Without a barrier to reset it, a later reply read must not inherit a
+    write's drain budget (a dead device would then hang for that long)."""
+    with SocketDMAClient(host="fake", timeout=5.0) as c:
+        c.reu_write(0, bytes(100_000), sync=False)
+        assert slow_drain[0].timeout == 5.0
