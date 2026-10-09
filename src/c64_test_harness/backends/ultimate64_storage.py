@@ -381,7 +381,8 @@ def storage_volumes(
     """The usable volume names at the device's FTP root, e.g. ``['Flash', 'Temp', 'USB1']``.
 
     An empty media slot (listed at the root, but ``CWD`` into it fails) is
-    left out. For somewhere writable, use :func:`storage_writable_volumes`.
+    left out. To leave out the volumes the helpers refuse to write, use
+    :func:`storage_writable_volumes`.
     """
     with _session(host, "storage_volumes", port, timeout) as ftp:
         return _list_root(ftp)[0]
@@ -395,6 +396,14 @@ def storage_writable_volumes(
     The device spells them ``Temp`` and ``Flash``, while
     :data:`WRITE_REFUSED_VOLUMES` is casefolded, so filtering with a plain
     ``in`` keeps both. Use this instead.
+
+    **A listed volume is one the helpers will try to write, not one that
+    accepts writes.** Nothing is written to find out: a volume here was
+    entered with ``CWD`` and is not refused by name. The C64U (1.1.0,
+    2026-10-09) listed ``SD`` here with a microSD card inserted, and
+    ``storage_mkdir('/SD/amiga64')`` still failed with ``553``. 1.1.0's
+    ``MKD`` answers ``553`` for every ``FRESULT`` from ``f_mkdir``, so the
+    reply does not say why.
     """
     return [
         v for v in storage_volumes(host, port=port, timeout=timeout)
