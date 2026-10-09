@@ -700,6 +700,28 @@ def test_failed_reu_send_names_the_range_it_may_have_left_stale(slow_drain) -> N
         c._sock.rate = 1                  # every command times out
         with pytest.raises(Ultimate64Error, match=r"REU 0x100000-0x10fffb may hold stale"):
             c.reu_write(0x100000, bytes(2 * REU_WRITE_MAX_CHUNK))
+        assert c._sock is None            # a cut-off stream is not reused
+
+
+def test_reu_error_that_sent_nothing_is_not_labelled_stale(slow_drain, monkeypatch) -> None:
+    """A reconnect that fails before a chunk is sent wrote nothing to the REU."""
+    from c64_test_harness.backends import u64_socket_dma as mod
+    from c64_test_harness.backends.u64_socket_dma import REU_WRITE_MAX_CHUNK
+
+    with SocketDMAClient(host="fake", timeout=5.0, idle_reconnect=None) as c:
+        real_send = mod.SocketDMAClient._send
+        calls = []
+
+        def send(self, opcode, payload=b""):
+            calls.append(opcode)
+            if len(calls) == 2:
+                raise Ultimate64Error("SocketDMA connect to fake:64 failed: refused")
+            return real_send(self, opcode, payload)
+
+        monkeypatch.setattr(mod.SocketDMAClient, "_send", send)
+        with pytest.raises(Ultimate64Error) as info:
+            c.reu_write(0, bytes(2 * REU_WRITE_MAX_CHUNK), sync=False)
+    assert "may hold stale" not in str(info.value)
 
 
 def test_interrupted_send_drops_the_connection(slow_drain) -> None:
