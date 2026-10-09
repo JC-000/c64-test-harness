@@ -453,7 +453,10 @@ class _FirmwareLikeSock:
         self.closed = False
 
     def settimeout(self, value) -> None:
-        pass
+        self.timeout = value
+
+    def gettimeout(self):
+        return getattr(self, "timeout", None)
 
     def sendall(self, data: bytes) -> None:
         if self._clock() - self._last_cmd >= self.IDLE_CLOSE:
@@ -566,9 +569,10 @@ def test_idle_reconnect_rejects_non_positive() -> None:
 # A slow-draining device: the send timeout must scale with the payload
 # ---------------------------------------------------------------------------
 #
-# The firmware reads a command's payload off the socket as fast as it can
-# service it, so a large command's ``sendall`` blocks until the device has
-# drained it, and Python applies the socket timeout to the whole ``sendall``.
+# A large command's ``sendall`` cannot finish until the device has taken most
+# of it, and Python applies the socket timeout to the whole ``sendall``
+# (whether the C64U's REU drain or its WiFi/VPN path was the slow part on
+# 2026-10-09 was not measured).
 # The REUWRITE barrier already budgets the worst C64U drain rate
 # (``_REU_DRAIN_FLOOR_BPS``); the sends before it must too, or a 64 KiB
 # command times out at the flat 5 s client timeout before the barrier is
@@ -678,3 +682,33 @@ def test_stretched_send_timeout_is_put_back(slow_drain) -> None:
     with SocketDMAClient(host="fake", timeout=5.0) as c:
         c.reu_write(0, bytes(100_000), sync=False)
         assert slow_drain[0].timeout == 5.0
+
+
+def test_blocking_client_needs_no_budget(slow_drain) -> None:
+    """``timeout=None`` (the stdlib's "blocking") stays usable for every
+    command, the barrier included."""
+    with SocketDMAClient(host="fake", timeout=None) as c:
+        assert c.identify() == {"title": "FAKE"}
+        c.reu_write(0, bytes(100_000))
+    assert all(t is None for _, t in slow_drain[0].send_timeouts)
+
+
+def test_failed_reu_send_names_the_range_it_may_have_left_stale(slow_drain) -> None:
+    from c64_test_harness.backends.u64_socket_dma import REU_WRITE_MAX_CHUNK
+
+    with SocketDMAClient(host="fake", timeout=0.1) as c:
+        c._sock.rate = 1                  # every command times out
+        with pytest.raises(Ultimate64Error, match=r"REU 0x100000-0x10fffb may hold stale"):
+            c.reu_write(0x100000, bytes(2 * REU_WRITE_MAX_CHUNK))
+
+
+def test_interrupted_send_drops_the_connection(slow_drain) -> None:
+    """A command cut off by a non-OSError (Ctrl-C) leaves the stream mid-
+    command; the next command must start on a fresh connection."""
+    with SocketDMAClient(host="fake", timeout=5.0) as c:
+        def interrupted(data):
+            raise KeyboardInterrupt
+        c._sock.sendall = interrupted
+        with pytest.raises(KeyboardInterrupt):
+            c.reu_write(0, bytes(1000), sync=False)
+        assert c._sock is None

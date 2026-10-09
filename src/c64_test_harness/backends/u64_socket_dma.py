@@ -112,6 +112,11 @@ IDLE_RECONNECT_SECONDS = 0.8
 _FIRMWARE_IDLE_CLOSE_SECONDS = 1.0
 
 
+
+class _SendFailed(Ultimate64Error):
+    """A command's bytes may have been partly sent (the socket is closed)."""
+
+
 class SocketDMAClient:
     """Client for the U64 SocketDMA binary protocol on TCP 64.
 
@@ -232,17 +237,23 @@ class SocketDMAClient:
             )
         sock = self._ensure_connected()
         header = struct.pack("<HH", opcode, len(payload))
-        # ``sendall`` blocks until the device has read the command, and the
-        # socket timeout bounds the whole call, so a 64 KiB command needs
-        # the drain-rate budget the barrier gets: a flat 5 s timed out on
-        # the C64U (fw 1.1.0, 2026-10-09, first 1 MB REUWRITE).  Never
-        # shorten a timeout a caller stretched (the barrier's IDENTIFY), and
-        # put it back afterwards.  (Guarded: socket fakes without
-        # ``gettimeout`` keep their own timeout.)
-        gettimeout = getattr(sock, "gettimeout", None)
-        prior = gettimeout() if gettimeout is not None else None
-        budget = self._timeout + len(payload) / _REU_DRAIN_FLOOR_BPS
-        stretch = prior is not None and budget > prior
+        # A large command's ``sendall`` cannot finish until the device has
+        # taken most of it (the host buffers about its send buffer, and
+        # 1.1.0's lwIP window is 7300 B), and the socket timeout bounds the
+        # whole call.  So the timeout scales with the payload at the
+        # barrier's drain floor.  On the C64U (fw 1.1.0, 2026-10-09) the
+        # first 1 MB REUWRITE timed out at the flat 5 s; whether the REU
+        # drain or the WiFi/VPN path was slow was not measured, and the
+        # budget covers either down to ~3 KiB/s.  A blocking client
+        # (``timeout=None``) needs no budget; a timeout a caller already
+        # stretched (the barrier's IDENTIFY) is never shortened, and the
+        # prior value is put back afterwards.
+        prior = sock.gettimeout()
+        budget = (
+            None if self._timeout is None
+            else self._timeout + len(payload) / _REU_DRAIN_FLOOR_BPS
+        )
+        stretch = budget is not None and prior is not None and budget > prior
         try:
             if stretch:
                 sock.settimeout(budget)
@@ -251,7 +262,11 @@ class SocketDMAClient:
                 sock.settimeout(prior)
         except OSError as exc:
             self.close()
-            raise Ultimate64Error(f"SocketDMA send failed: {exc}") from exc
+            raise _SendFailed(f"SocketDMA send failed: {exc}") from exc
+        except BaseException:
+            # A command cut off part-way leaves the stream desynchronised.
+            self.close()
+            raise
         self._touch()
 
     def _recv_exact(self, n: int) -> bytes:
@@ -402,13 +417,24 @@ class SocketDMAClient:
             for i in range(0, len(data), REU_WRITE_MAX_CHUNK):
                 chunk = data[i : i + REU_WRITE_MAX_CHUNK]
                 payload = struct.pack("<I", offset + i)[:3] + chunk
-                self._send(_CMD_REUWRITE, payload)
+                try:
+                    self._send(_CMD_REUWRITE, payload)
+                except _SendFailed as exc:
+                    # 1.1.0 writes the header's length into the REU even
+                    # after a short read (socket_dma.cc readSocket /
+                    # REUWRITE), so the tail of this range may hold stale
+                    # load-buffer bytes.  Source-read, not measured.
+                    raise _SendFailed(
+                        f"{exc}; REU {offset + i:#08x}-"
+                        f"{offset + i + len(chunk) - 1:#08x} may hold stale "
+                        "bytes from a partly received command"
+                    ) from exc
             if sync:
                 # Drain time is erratic on C64U fw 1.1.0 — 0.4 s to 19 s
                 # live-observed for the same 96 KiB burst — so the flat
                 # client timeout is not enough for the barrier's recv.
                 # Budget the worst observed rate (~5 KiB/s) with margin.
-                if self._sock is not None:
+                if self._sock is not None and self._timeout is not None:
                     self._sock.settimeout(
                         self._timeout + len(data) / _REU_DRAIN_FLOOR_BPS
                     )
