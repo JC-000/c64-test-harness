@@ -402,8 +402,9 @@ def storage_writable_volumes(
     entered with ``CWD`` and is not refused by name. The C64U (1.1.0,
     2026-10-09) listed ``SD`` here with a microSD card inserted, and
     ``storage_mkdir('/SD/amiga64')`` still failed with ``553``. 1.1.0's
-    ``MKD`` answers ``553`` for every ``FRESULT`` from ``f_mkdir``, so the
-    reply does not say why.
+    ``MKD`` answers ``553`` whenever ``vfs_mkdir`` fails: ``FR_EXIST`` or
+    any other failure from the lookup in ``FileManager::create_dir``, or
+    any ``FRESULT`` from ``f_mkdir``. The reply does not say which.
     """
     return [
         v for v in storage_volumes(host, port=port, timeout=timeout)
