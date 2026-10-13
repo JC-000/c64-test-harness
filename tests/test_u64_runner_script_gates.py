@@ -54,8 +54,9 @@ _PHANTOM_HOST = "192.168.1.81"
 
 #: Real bench addresses. A script must not carry these as runtime literals
 #: either — a live IP pinned into source is how the phantom got started.
-#: The C64U has had three: 10.53.21.158, WiFi 10.43.23.158 (2026-10-12) and
-#: ethernet 10.43.23.26 (2026-10-13); every one stays listed.
+#: C64U addresses on record: 10.53.21.158 (interface unrecorded),
+#: 10.43.23.158 (WiFi per the owner, 2026-10-12) and ethernet 10.43.23.26
+#: (2026-10-13). A device holds both interfaces at once, so all stay listed.
 _BENCH_HOSTS = ("10.43.23.81", "10.53.21.158", "10.43.23.158", "10.43.23.26")
 
 _DEVICE_ADDRESSES = (_PHANTOM_HOST, *_BENCH_HOSTS)

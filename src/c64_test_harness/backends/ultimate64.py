@@ -644,13 +644,16 @@ class Ultimate64Transport(HardwareTransportBase):
     ) -> dict:
         """Capture one VIC-II frame from the U64 video stream.
 
-        Generation caveat: a C64 Ultimate (firmware 1.1.0) on WiFi, with
-        the capture host on a routed subnet, answered the video-stream
-        start with HTTP 500 "No Operational Network Interface" (observed
-        live 2026-07-28) — this raises :class:`Ultimate64Error` there.
-        The same C64U on ethernet, on the capture host's subnet, streams:
-        ``test_u64_streams_live.py -k video`` passed 3/3 on 2026-10-13.
-        Both changed at once, so which one mattered is not established.
+        Generation caveat: a C64 Ultimate (firmware 1.1.0) streams only
+        over its wired ethernet. On WiFi it answers the video-stream start
+        with HTTP 500 "No Operational Network Interface" (observed live
+        2026-07-28), which raises :class:`Ultimate64Error` here. By source
+        (1.1.0 ``data_streamer.cc`` ``startStream``): the streamer uses
+        network interface 0, the wired RMII interface (registered first,
+        init priority 51; WiFi is 52), and refuses when it has no link or no
+        IP, before the destination is read, so the capture host's
+        topology plays no part. On ethernet the three ``VideoCapture`` tests
+        in ``test_u64_streams_live.py`` passed in one run (2026-10-13).
         On the U64 Elite the stream works.
 
         Returns a dict matching the :class:`BinaryViceTransport`
