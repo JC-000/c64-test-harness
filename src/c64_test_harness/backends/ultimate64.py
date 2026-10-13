@@ -645,8 +645,9 @@ class Ultimate64Transport(HardwareTransportBase):
         """Capture one VIC-II frame from the U64 video stream.
 
         Generation caveat: a C64 Ultimate (firmware 1.1.0) streams only
-        over its wired ethernet. On WiFi it answers the video-stream start
-        with HTTP 500 "No Operational Network Interface" (observed live
+        over its wired ethernet. Whenever that has no link or no IP (as
+        on a WiFi-attached C64U) it answers the video-stream start with
+        HTTP 500 "No Operational Network Interface" (observed live
         2026-07-28), which raises :class:`Ultimate64Error` here. By source
         (1.1.0 ``data_streamer.cc`` ``startStream``): the streamer uses
         network interface 0, the wired RMII interface (registered first,
