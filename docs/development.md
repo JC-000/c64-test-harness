@@ -693,7 +693,7 @@ project's local brief.
 ### Standing hardware-safety clause: the C64U's `/Temp`
 
 Every review also enforces the C64U wedge clause. The C64 Ultimate
-(10.53.21.158, fw 1.1.0) predates GideonZ/1541ultimate#686 and never
+(`uid-5d2518`, ethernet 10.43.23.26 since 2026-10-13, fw 1.1.0) predates GideonZ/1541ultimate#686 and never
 collects the managed `/Temp` attachments left by body-carrying REST
 calls. The attachments fill `/Temp`, and a full `/Temp` crashes the device
 firmware, taking REST and the UCI bridge down together; only a physical

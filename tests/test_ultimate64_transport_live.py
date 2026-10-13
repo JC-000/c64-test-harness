@@ -319,10 +319,12 @@ def test_read_framebuffer_returns_one_frame(transport: Ultimate64Transport) -> N
         fb = transport.read_framebuffer(timeout=3.0)
     except Ultimate64Error as exc:
         if exc.status == 500:
-            # Observed live 2026-07-28: C64U fw 1.1.0 answered HTTP 500
-            # "No Operational Network Interface" to video:start with a
-            # routed capture host. May be topology-dependent — the skip
-            # reason carries the device's actual error body.
+            # C64U fw 1.1.0 streams only over wired ethernet: with no
+            # ethernet link or IP (as on WiFi) it answers video:start with
+            # HTTP 500 "No Operational Network Interface" (observed
+            # 2026-07-28; by source, data_streamer.cc checks interface 0's
+            # link before reading the destination). The skip reason
+            # carries the device's actual error body.
             pytest.skip(
                 f"video stream start rejected by this firmware: {exc}"
             )
