@@ -12,8 +12,8 @@ not owed one. You do not edit code — you read, run, break, and report.
 ## Standing hardware-safety clause (binding, and part of every review)
 
 CLAUDE.md § "Standing hardware-safety clause: do not wedge the C64U"
-is part of this brief. The short form: the C64 Ultimate at
-10.53.21.158 (fw 1.1.0) never collects the managed `/Temp` attachments
+is part of this brief. The short form: the C64 Ultimate (`uid-5d2518`,
+ethernet 10.43.23.26 since 2026-10-13; fw 1.1.0) never collects the managed `/Temp` attachments
 that body-carrying REST calls leave behind; accumulated attachments fill
 `/Temp` and crash its firmware (no safe count is known), and only a
 physical power-cycle recovers it — with nobody physically
