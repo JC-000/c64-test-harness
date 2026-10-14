@@ -401,9 +401,11 @@ def check_device_identity(
                 legacy.append((spelling, holder.get("pid")))
         if legacy:
             names = ", ".join(
-                f"{s} (pid {pid})" if pid is not None
-                else f"{s} (pid unknown: the lockfile is empty, as a bare "
-                     "flock leaves it)"
+                f"{s} (pid {pid} per the lockfile record, which a bare flock "
+                "never rewrites, so it may be a former holder)"
+                if pid is not None
+                else f"{s} (pid unknown: the lockfile names no pid, as a "
+                     "bare flock leaves a new one)"
                 for s, pid in legacy
             )
             return IdentityFinding(
