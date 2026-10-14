@@ -16,8 +16,7 @@ is part of this brief. The short form: the C64 Ultimate (`uid-5d2518`,
 ethernet 10.43.23.26 since 2026-10-13; fw 1.1.0) never collects the managed `/Temp` attachments
 that body-carrying REST calls leave behind; accumulated attachments fill
 `/Temp` and crash its firmware (no safe count is known), and only a
-physical power-cycle recovers it — with nobody physically
-present. You review under it and you enforce it. In force until
+physical power-cycle recovers it, by the owner at the bench. You review under it and you enforce it. In force until
 `DeviceCapabilities.writemem_post_safe` is `True` for that device.
 
 For you, concretely: **you do not touch an Ultimate device.** Reviewing
