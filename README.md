@@ -89,7 +89,7 @@ Summary: 13 ok, 3 missing, 1 skipped, 4 warn
 Overall: READY (with optional gaps)
 ```
 
-The `x64sc --version printed no version` note is expected: the Homebrew build's `x64sc --version` exits early, so the script falls back to Homebrew's metadata. The harness version is read from the installed package metadata. This sample's `0.11.3` came from a venv installed before the current `0.13.0` in `pyproject.toml`, and it needs `pip install -e .` again to report the right number.
+The `x64sc --version printed no version` note is expected: the Homebrew build's `x64sc --version` exits early, so the script falls back to Homebrew's metadata. The harness version is read from the installed package metadata. This sample's `0.11.3` came from a venv installed before the current `0.13.1` in `pyproject.toml`, and it needs `pip install -e .` again to report the right number.
 
 The VICE checks are **critical**, so a hardware-only machine without VICE reports NOT READY even though the Ultimate backend works. Options: `--quiet`, `--json`, `--no-u64`, `--u64-host HOST`, `--smoke`. Exit codes: `0` READY, `1` NOT READY, `2` script error. Details are in [docs/development.md](docs/development.md#quick-check-scriptsverify-dev-envsh).
 
