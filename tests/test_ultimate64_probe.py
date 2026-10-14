@@ -1293,18 +1293,23 @@ def test_ping_executable_skips_non_executable_fallback(monkeypatch, tmp_path):
     assert probe._ping_executable() is None
 
 
-@pytest.mark.parametrize("platform, expected", [
-    ("darwin", "2000"),
-    ("linux", "2"),
+@pytest.mark.parametrize("platform, timeout, option, value", [
+    ("darwin", 2.0, "-t", "2"),
+    ("linux", 2.0, "-W", "2"),
+    ("linux", 0.5, "-W", "1"),
 ])
-def test_ping_wait_is_in_the_platforms_unit(monkeypatch, platform, expected):
-    """macOS ping reads -W in milliseconds, Linux iputils in seconds."""
+def test_ping_wait_bounds_the_run_in_the_platforms_option(
+        monkeypatch, platform, timeout, option, value):
+    """macOS bounds the whole run with -t (its -W is milliseconds, after a
+    1 s interval); Linux iputils waits -W seconds; never below one second."""
     from types import SimpleNamespace
     from c64_test_harness.backends import ultimate64_probe as probe
 
     monkeypatch.setattr(probe, "sys", SimpleNamespace(platform=platform))
     with patch.object(probe.subprocess, "run",
                       return_value=MagicMock(returncode=0)) as run:
-        ping_host("10.0.0.1", timeout=2.0)
+        ping_host("10.0.0.1", timeout=timeout)
     argv = run.call_args[0][0]
-    assert argv[argv.index("-W") + 1] == expected
+    other = "-W" if option == "-t" else "-t"
+    assert other not in argv
+    assert argv[argv.index(option) + 1] == value

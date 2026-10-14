@@ -129,23 +129,28 @@ def _ping_executable() -> str | None:
     return None
 
 
-def _ping_wait_arg(timeout: float) -> str:
-    """``ping -W``'s value for *timeout* seconds (at least one second).
+def _ping_wait_args(timeout: float) -> list[str]:
+    """The ping options that bound one ``ping -c 1`` to *timeout* seconds
+    (whole seconds, at least one).
 
-    Linux iputils reads ``-W`` in seconds; macOS reads it in
-    **milliseconds** (``man ping``), so a bare ``2`` there waited 2 ms.
+    Linux iputils: ``-W <seconds>``, the wait for the reply.  macOS has no
+    equivalent: its ``-W`` is in milliseconds and starts only after the 1 s
+    send interval, so ``-W 2`` waited about 1 s and ``-W 2000`` about 3 s,
+    past the subprocess timeout.  macOS ``-t <seconds>`` bounds the whole
+    run instead (measured 2026-10-13: 2.03 s and 1.02 s to TEST-NET for
+    ``-t 2`` / ``-t 1``; a 49 ms host still answers).
     """
     wait_sec = max(1, int(timeout))
     if sys.platform == "darwin":
-        return str(wait_sec * 1000)
-    return str(wait_sec)
+        return ["-t", str(wait_sec)]
+    return ["-W", str(wait_sec)]
 
 
 def ping_host(host: str, timeout: float = 2.0) -> tuple[bool, float | None]:
     """ICMP ping via subprocess.  Returns ``(ok, latency_ms)``.
 
-    Uses ``ping -c 1 -W <wait>``, with the wait in the unit the platform's
-    ping expects (:func:`_ping_wait_arg`).  The binary is found on ``PATH``
+    Uses ``ping -c 1`` bounded to *timeout* by the platform's own option
+    (:func:`_ping_wait_args`).  The binary is found on ``PATH``
     or, failing that, in the standard system directories
     (:func:`_ping_executable`).  Catches all exceptions (permission
     denied, no ping binary, etc).  Returns ``(False, None)`` on any
@@ -154,7 +159,7 @@ def ping_host(host: str, timeout: float = 2.0) -> tuple[bool, float | None]:
     t0 = time.monotonic()
     try:
         result = subprocess.run(
-            [_ping_executable() or "ping", "-c", "1", "-W", _ping_wait_arg(timeout), host],
+            [_ping_executable() or "ping", "-c", "1", *_ping_wait_args(timeout), host],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout + 1.0,
