@@ -382,9 +382,9 @@ its face. Heap fragmentation, per-entry allocation in directory
 traversal, and FileManager bookkeeping growth are all candidates, none
 run down. Since the trigger threshold is unknown, the harness keeps
 nothing the source says is garbage. Do **not** resolve it experimentally — the
-experiment is "upload until the firmware crashes", on a device nobody can
-power-cycle remotely; it becomes safely measurable only with someone
-physically present.
+experiment is "upload until the firmware crashes", on a shared device
+whose only recovery is a power-cycle by the owner at the bench (where the
+C64U has sat since 2026-10-12).
 
 Override with `U64_TEMP_GC_BUDGET` or
 `temp_gc_budget=`. The pass also runs as a **drain** on `client.close()`
@@ -798,14 +798,15 @@ device" — wasting troubleshooting cycles each time.
 
 **Cost, stated plainly:** a `/Temp` firmware crash on the C64 Ultimate put
 the device out of service for about two weeks in August–September 2026,
-because nobody was physically present to power-cycle it. No REST endpoint
+because nobody was physically present to power-cycle it. Since 2026-10-12
+it sits on the owner's desk, so a wedge now costs a power-cycle by the
+owner, and every lane's runs until then. No REST endpoint
 restarts the firmware — `machine:reboot` is `C64::start_cartridge(NULL)`,
 a C64-level reset, and none of the `machine:*` routes at tag `1.1.0`
 (`software/api/route_machine.cc`) restarts the firmware itself — so
 nothing re-initialises lwIP or clears stack-level state remotely. Before
-running a sustained UCI `SOCKET_WRITE` load on a device that only a remote
-agent is using, ask whether anyone can reach its power switch this week;
-if not, do not run it.
+running a sustained UCI `SOCKET_WRITE` load on the C64U, ask whether
+the owner can reach its power switch; if not, do not run it.
 
 **That outage was the `/Temp` crash, not a UCI STATE-bit wedge** (owner,
 2026-09-11). It was first recorded here as a UCI wedge; the owner settled

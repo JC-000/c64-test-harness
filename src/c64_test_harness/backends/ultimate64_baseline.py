@@ -81,9 +81,10 @@ The contract, as decided by the owner in #227:
   attachment; that accumulated attachments crash the firmware is the
   owner's account (CLAUDE.md), not something this citation shows.
   But ``/Temp`` was not the
-  only hazard on that device -- it reaches the bench over WiFi whose
-  reconnection after a power cycle is known unreliable, with nobody
-  present -- so the default consults
+  only hazard on that device -- when this was decided it reached the
+  bench over WiFi whose reconnection after a power cycle is known
+  unreliable, with nobody present (wired and on the owner's desk since
+  2026-10-12; #533 holds the decision) -- so the default consults
   :data:`BASELINE_ON_ENTRY_DEFAULT_BY_GENERATION` rather than being one
   global boolean.  An ``unknown`` generation (an unreadable or timed-out
   probe, #262) resolves **off**: a reset must never arm on a device the
@@ -163,12 +164,13 @@ BASELINE_ON_ENTRY_ENV = U64_BASELINE_ON_ENTRY_ENV
 #:   wired ethernet.
 #: * ``"cbm"`` (the C64 Ultimate, 1.x) -- **off**.  Not because of
 #:   ``/Temp`` (free there too: every PUT route in the 1.1.0 route
-#:   table binds NULL -- #436, above), but because that device reaches the
-#:   bench **over WiFi** and its reconnection after a power cycle is known
-#:   to be unreliable; nothing on the never-touch list protects a store
-#:   that a future edit adds to the covered set by mistake, and there is no
-#:   remote remedy if it does not come back.  Opt in explicitly when
-#:   someone is at the bench.
+#:   table binds NULL -- #436, above), but because that device reached the
+#:   bench **over WiFi** when this was decided, and its reconnection after a
+#:   power cycle is known to be unreliable; nothing on the never-touch list
+#:   protects a store that a future edit adds to the covered set by
+#:   mistake, and there is no remote remedy if it does not come back.  The
+#:   device is wired and on the owner's desk since 2026-10-12; whether this
+#:   should change is #533.  Opt in explicitly when someone is at the bench.
 #: * ``"unknown"`` -- **off**.  An unreadable or timed-out probe (#262)
 #:   must never arm a reset on a device the harness failed to identify;
 #:   the C64U is exactly the device a slow probe mis-grades.
@@ -253,10 +255,10 @@ BASELINE_NEVER_TOUCH: dict[str, str] = {
         "dhcp_stop() + netif_set_addr(my_ip, ...) -- which is why TESTS MUST "
         "NEVER CONFIGURE A STATIC ADDRESS: it is this code path, reached "
         "through a store that looks inert (pinned by "
-        "tests/test_entry_baseline_default_on.py).  On the C64 Ultimate, "
-        "reached over a WiFi link whose reconnection is known unreliable "
-        "with nobody present, that is the device-loss path -- see the WiFi "
-        "settings entry.  "
+        "tests/test_entry_baseline_default_on.py).  On a device reached over "
+        "WiFi, whose reconnection is known unreliable (the C64 Ultimate "
+        "until 2026-10-12, #533), that is the device-loss path -- see the "
+        "WiFi settings entry.  "
         "TWO RETRACTED READINGS, both of which looked cited and were not: "
         "(1) 'reset_to_default flips a static-addressed device to DHCP "
         "(192.168.2.64/24) and strands it' -- wrong, the device is already "
@@ -295,12 +297,13 @@ BASELINE_NEVER_TOUCH: dict[str, str] = {
     ),
     "WiFi settings": (
         "DEVICE-LOSS RISK, not a connectivity inconvenience.  The C64 "
-        "Ultimate reaches the bench over WiFi, and its reconnection after a "
+        "Ultimate reached the bench over WiFi until 2026-10-12 (it is wired "
+        "now, and can go back to WiFi), and its reconnection after a "
         "power cycle is KNOWN UNRELIABLE: the owner has seen it fail to "
         "rejoin the wireless network after a hard power cycle, saved a "
         "working WiFi configuration to flash deliberately, and confirmed the "
         "rejoin only by standing at the device (owner testimony, measured "
-        "2026-09-11).  Nobody is at the bench now.  reset_to_default here "
+        "2026-09-11).  reset_to_default here "
         "would discard that saved-and-verified configuration in RAM and "
         "re-effectuate the stack the device is reached over "
         "(NetworkLWIP_WiFi::effectuate_settings, network_esp32.cc:126-147 -> "
@@ -308,7 +311,7 @@ BASELINE_NEVER_TOUCH: dict[str, str] = {
         "the store carries the same Use DHCP / 192.168.2.64 addressing block, "
         "wifi_config[] :34-58).  If it does not come back there is no remote "
         "remedy AT ALL -- not reboot(), not FTP, not any REST route -- only "
-        "someone physically present.  This is also why the entry baseline "
+        "someone at the device.  This is also why the entry baseline "
         "defaults OFF for the cbm generation "
         "(BASELINE_ON_ENTRY_DEFAULT_BY_GENERATION).  Read from the 3.15 "
         "source; the C64U runs the 1.1.0 line, and on U64 == 2 the radio "

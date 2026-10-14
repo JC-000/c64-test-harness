@@ -32,8 +32,8 @@ Env gates (all unset -> everything skips cleanly):
 * ``U64_PASSWORD``               -- optional; sent as ``X-Password`` when set.
 * ``BASELINE_TABLE_LIVE_C64U=1`` -- required **in addition** when the host
   answers as the C64 Ultimate (generation ``cbm``).  Without it the module
-  skips on that device.  The read is free there, but the device is shared,
-  unattended and leak-prone, and the hardware-safety rule is that nobody
+  skips on that device.  The read is free there, but the device is shared
+  and leak-prone, and the hardware-safety rule is that nobody
   sends it traffic as a side effect: somebody has to have meant it.
 
 A device whose generation grades ``unknown`` skips: there is no record to

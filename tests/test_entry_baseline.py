@@ -249,7 +249,7 @@ class TestCoveredSet:
                 "SNTP service flags (and sets Ultimate DMA Service=Enabled)"
             ),
             "WiFi settings": (
-                "the C64 Ultimate reaches the bench over WiFi; its store has "
+                "the C64 Ultimate can be reached over WiFi; its store has "
                 "never been read, so a reset there is unassessed"
             ),
             "SID Sockets Configuration": (

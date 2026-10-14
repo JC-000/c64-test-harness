@@ -28,7 +28,7 @@ are listed, not compared.
 Excluded from the reload: every store in ``BASELINE_NEVER_TOUCH`` —
 ``Ethernet Settings`` (loading it from flash could change the address if
 a static config had ever been saved), the WiFi store (the C64 Ultimate
-reaches the bench over WiFi; its store has not been read), ``SID Sockets
+reached the bench over WiFi until 2026-10-12; its store has not been read), ``SID Sockets
 Configuration`` (``load_from_flash`` runs ``at_close_config`` →
 ``effectuate``, which with flash's ``Socket=Disabled`` powers the
 socketed SIDs off, and the PUT-back would apply socket voltage) and

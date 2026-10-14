@@ -18,8 +18,8 @@ The primary machine is **macOS (27.0, Apple Silicon)** with Homebrew VICE 3.10 (
 
 ## Do not wedge the C64U (standing clause, in force until its firmware increments)
 
-The C64 Ultimate (`uid-5d2518`, ethernet 10.43.23.26 since 2026-10-13, fw 1.1.0) is a **shared remote** device
-with nobody physically present. Its firmware predates
+The C64 Ultimate (`uid-5d2518`, ethernet 10.43.23.26 since 2026-10-13, fw 1.1.0) is a **shared** device
+on the owner's desk beside the U64E since 2026-10-12 (before that, remote with nobody present), so a wedge costs a power-cycle by the owner. Its firmware predates
 GideonZ/1541ultimate#686, so it never collects the managed `/Temp`
 attachments that every body-carrying REST call leaves behind — `POST
 /v1/machine:writemem`, `runners:run_prg` / `load_prg` / `run_crt` /

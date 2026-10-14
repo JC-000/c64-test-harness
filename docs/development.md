@@ -384,12 +384,13 @@ per refused store:
   security-shaped change on a shared bench that silently undoes a deliberate
   service-off state.
 - **`WiFi settings`** — device-loss risk, not a connectivity inconvenience. The
-  C64 Ultimate reaches the bench over WiFi and its **reconnection after a power
-  cycle is known unreliable**: the owner has seen it fail to rejoin, saved a
+  C64 Ultimate reached the bench over WiFi until 2026-10-12 (it is wired now and
+  can go back), and its **reconnection after a power cycle is known unreliable**: the owner has seen it fail to rejoin, saved a
   working configuration to flash deliberately, and confirmed the rejoin only by
   standing at the device (owner testimony, 2026-09-11). A reset would discard
   that configuration in RAM and re-effectuate the stack the device is reached
-  over; if it does not come back there is no remote remedy at all.
+  over; if it does not come back there is no remote remedy at all, only someone at
+  the device.
 - **`Clock Settings`** — the RTC: the reset shows neither drift nor mismatch
   while arming the next PUT to the category to write the 2015 defaults to the
   clock chip (`rtc.cc:350-409`).
@@ -564,9 +565,10 @@ at INFO on every acquire.
 
 **Why the C64 Ultimate is the exception, deliberately and not by oversight.**
 Not `/Temp`: every request the reset makes is bodyless, so it costs no
-attachment even there. It is the link. That device reaches the bench over WiFi
-whose reconnection after a power cycle is known unreliable, with nobody present,
-and nothing in `BASELINE_NEVER_TOUCH` protects against a future edit adding a
+attachment even there. It is the link. When this was decided the device reached the bench over WiFi
+whose reconnection after a power cycle is known unreliable, with nobody present;
+since 2026-10-12 it is wired and on the owner's desk, and whether the default
+should change is [#533](https://github.com/JC-000/c64-test-harness/issues/533). Nothing in `BASELINE_NEVER_TOUCH` protects against a future edit adding a
 network store to the covered set by mistake — see the `Ethernet Settings` and
 `WiFi settings` reasons above. `U64_BASELINE_ON_ENTRY=1` opts a C64U in for
 somebody standing at the bench (the WARNING this logs is described under
@@ -697,7 +699,7 @@ Every review also enforces the C64U wedge clause. The C64 Ultimate
 collects the managed `/Temp` attachments left by body-carrying REST
 calls. The attachments fill `/Temp`, and a full `/Temp` crashes the device
 firmware, taking REST and the UCI bridge down together; only a physical
-power-cycle recovers it — with nobody physically present. No count of
+power-cycle recovers it, by the owner at the bench. No count of
 uploads before that crash is known, and none is kept (owner ruling,
 2026-09-15; #256), so the harness sweeps before every upload to a
 leak-prone device and refuses the upload if that sweep fails (#511). So a change that adds, moves, or widens such a call

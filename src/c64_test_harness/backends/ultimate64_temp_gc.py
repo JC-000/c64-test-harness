@@ -174,8 +174,8 @@ DEFAULT_KEEP = 1
 #: ``__ram_disk_limit - __ram_disk_start``, and the "3 * 1024 * 1024"
 #: comment beside it is stale (issue #261). But that size is not a count of
 #: uploads either. Do not try to establish one experimentally: the
-#: experiment is "upload until the firmware crashes", on hardware nobody can
-#: power-cycle remotely.
+#: experiment is "upload until the firmware crashes", on shared hardware
+#: whose only recovery is a power-cycle at the bench.
 #:
 #: **Cost:** each upload after the first in a hold is preceded by one FTP
 #: session (connect, login, ``CWD /Temp``, ``NLST``, ``QUIT``). From the

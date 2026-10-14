@@ -112,9 +112,9 @@ class Ultimate64WireFormatError(Ultimate64Error):
     This exists because of what the *undiagnosed* form of that failure
     leads to: a lane that has always been able to read this device sees
     a bare HTTP 400 and concludes the hardware is faulty, then reaches
-    for ``reboot()`` and ``recover()``. On the C64 Ultimate nobody is
-    physically present to power-cycle if that reasoning goes astray, so
-    the 400 has to name the contract change itself.
+    for ``reboot()`` and ``recover()``. On the C64 Ultimate a
+    power-cycle by the owner is the only way back if that reasoning goes
+    astray, so the 400 has to name the contract change itself.
 
     A 400 from these routes is not *necessarily* the wire format — an
     out-of-range ``address + length`` is the other candidate the
@@ -185,8 +185,8 @@ class Ultimate64TempHygieneError(Ultimate64Error):
     whole CBM ``1.x`` line) turns every attachment-creating REST call
     into a permanent file in the device's ``/Temp`` RAM disk. Enough of
     them wedge the REST API and the UCI bridge together, and only a
-    physical power-cycle recovers — which on a shared remote device has
-    cost weeks of downtime.
+    physical power-cycle recovers — which on the shared C64U, while it
+    was remote, cost weeks of downtime.
 
     The harness's mitigation is an FTP-based hygiene pass, and it is
     *prevention, not recovery* — as a consequence of the failure mode,

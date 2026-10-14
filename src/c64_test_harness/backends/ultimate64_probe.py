@@ -637,8 +637,8 @@ def _wire_format_result(
     """Build the ``failure="wire_format"`` result for an HTTP 400.
 
     Separate from the degraded/wedged tags on purpose: those recommend a
-    physical power-cycle, which on the C64 Ultimate nobody is present to
-    perform and which would be the wrong response to a request the
+    physical power-cycle, which on the C64 Ultimate costs the owner a trip
+    to the bench and which would be the wrong response to a request the
     firmware was right to reject.
     """
     return LivenessResult(
