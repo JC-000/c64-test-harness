@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import os
 import socket
 import subprocess
 import urllib.error
@@ -60,6 +61,26 @@ class _FakeDevice:
                 self.mem[addr:addr + len(data)] = data
             return self.put_status, b"{}"
         return 404, b""
+
+
+#: Tests that exercise the ping binary lookup itself.  Every other test in
+#: this module runs as on a host that has ``ping``: they mock ``ping_host``,
+#: and ``probe_u64`` checks for the binary before calling it.
+_REAL_PING_LOOKUP = frozenset({
+    "test_ping_host_finds_ping_outside_path",
+    "test_probe_without_ping_binary_falls_through_to_tcp",
+    "test_ping_executable_prefers_path",
+    "test_ping_executable_skips_non_executable_fallback",
+})
+
+
+@pytest.fixture(autouse=True)
+def _ping_binary_present(request, monkeypatch):
+    if request.node.originalname in _REAL_PING_LOOKUP:
+        return
+    from c64_test_harness.backends import ultimate64_probe as probe
+
+    monkeypatch.setattr(probe, "_ping_executable", lambda: "/sbin/ping")
 
 
 _PROBE_OK = dict(
@@ -345,7 +366,7 @@ def test_ping_success(mock_run):
     assert lat is not None and lat >= 0
     mock_run.assert_called_once()
     args = mock_run.call_args[0][0]
-    assert args[0] == "ping"
+    assert os.path.basename(args[0]) == "ping"
     assert "-c" in args and "1" in args
 
 
@@ -1209,3 +1230,86 @@ def _empty_temp_over_ftp(monkeypatch):
     import fake_temp_ftp
 
     fake_temp_ftp.install(monkeypatch)
+
+
+# ---- ping binary outside PATH ------------------------------------------
+# ``ping`` lives in /sbin on macOS, and env -i, cron and launchd hand out a
+# PATH without it.  A bare ``ping`` then raised FileNotFoundError, which
+# ping_host reports as a failed ping and probe_u64 as an unreachable device.
+
+
+def test_ping_host_finds_ping_outside_path(monkeypatch, tmp_path):
+    """A real ping of loopback succeeds with an empty PATH."""
+    import shutil
+
+    if shutil.which("ping", path="/sbin:/bin:/usr/sbin:/usr/bin") is None:
+        pytest.skip("no ping binary on this host")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    ok, lat = ping_host("127.0.0.1", timeout=2.0)
+    assert ok is True
+    assert lat is not None
+
+
+def test_probe_without_ping_binary_falls_through_to_tcp(monkeypatch, tmp_path):
+    """No ping binary anywhere is not an unreachable device: TCP decides."""
+    from c64_test_harness.backends import ultimate64_probe as probe
+
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(probe, "_PING_FALLBACK_PATHS", ())
+    with patch.object(probe, "check_port", return_value=(True, 1.0)), \
+         patch.object(probe, "check_api", return_value=(True, {"version": "0.1"})):
+        r = probe.probe_u64("10.0.0.1")
+    assert r.reachable is True
+    assert r.ping_ok is None
+    assert r.port_ok is True
+
+
+def test_ping_executable_prefers_path(monkeypatch):
+    """A ping on PATH wins over the fallback list (NixOS keeps its setuid
+    wrapper in /run/wrappers/bin and has no /bin/ping)."""
+    from types import SimpleNamespace
+    from c64_test_harness.backends import ultimate64_probe as probe
+
+    monkeypatch.setattr(
+        probe, "shutil",
+        SimpleNamespace(which=lambda name: "/run/wrappers/bin/ping"),
+    )
+    with patch.object(probe.subprocess, "run",
+                      return_value=MagicMock(returncode=0)) as run:
+        assert ping_host("10.0.0.1")[0] is True
+    assert run.call_args[0][0][0] == "/run/wrappers/bin/ping"
+
+
+def test_ping_executable_skips_non_executable_fallback(monkeypatch, tmp_path):
+    """A file at a fallback path that cannot be executed is not a ping."""
+    from types import SimpleNamespace
+    from c64_test_harness.backends import ultimate64_probe as probe
+
+    plain = tmp_path / "ping"
+    plain.write_bytes(b"")
+    plain.chmod(0o644)
+    monkeypatch.setattr(probe, "shutil", SimpleNamespace(which=lambda name: None))
+    monkeypatch.setattr(probe, "_PING_FALLBACK_PATHS", (str(plain),))
+    assert probe._ping_executable() is None
+
+
+@pytest.mark.parametrize("platform, timeout, option, value", [
+    ("darwin", 2.0, "-t", "2"),
+    ("linux", 2.0, "-W", "2"),
+    ("linux", 0.5, "-W", "1"),
+])
+def test_ping_wait_bounds_the_run_in_the_platforms_option(
+        monkeypatch, platform, timeout, option, value):
+    """macOS bounds the whole run with -t (its -W is milliseconds, after a
+    1 s interval); Linux iputils waits -W seconds; never below one second."""
+    from types import SimpleNamespace
+    from c64_test_harness.backends import ultimate64_probe as probe
+
+    monkeypatch.setattr(probe, "sys", SimpleNamespace(platform=platform))
+    with patch.object(probe.subprocess, "run",
+                      return_value=MagicMock(returncode=0)) as run:
+        ping_host("10.0.0.1", timeout=timeout)
+    argv = run.call_args[0][0]
+    other = "-W" if option == "-t" else "-t"
+    assert other not in argv
+    assert argv[argv.index(option) + 1] == value

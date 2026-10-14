@@ -17,8 +17,11 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import os
+import shutil
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -108,19 +111,55 @@ class ProbeResult:
         return f"U64 at {self.host}:{self.port} UNREACHABLE: {self.error}"
 
 
+#: Where ``ping`` lives when ``PATH`` does not say: ``/sbin`` on macOS,
+#: which ``env -i``, cron and launchd leave off their ``PATH``.
+_PING_FALLBACK_PATHS: tuple[str, ...] = (
+    "/sbin/ping", "/bin/ping", "/usr/sbin/ping", "/usr/bin/ping",
+)
+
+
+def _ping_executable() -> str | None:
+    """The ``ping`` binary: on ``PATH``, else a standard location, else ``None``."""
+    found = shutil.which("ping")
+    if found:
+        return found
+    for candidate in _PING_FALLBACK_PATHS:
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _ping_wait_args(timeout: float) -> list[str]:
+    """The ping options that bound one ``ping -c 1`` to *timeout* seconds
+    (whole seconds, at least one).
+
+    Linux iputils: ``-W <seconds>``, the wait for the reply.  macOS has no
+    equivalent: its ``-W`` is in milliseconds and starts only after the 1 s
+    send interval, so ``-W 2`` waited about 1 s and ``-W 2000`` about 3 s,
+    past the subprocess timeout.  macOS ``-t <seconds>`` bounds the whole
+    run instead (measured 2026-10-13: 2.03 s and 1.02 s to TEST-NET for
+    ``-t 2`` / ``-t 1``; a 49 ms host still answers).
+    """
+    wait_sec = max(1, int(timeout))
+    if sys.platform == "darwin":
+        return ["-t", str(wait_sec)]
+    return ["-W", str(wait_sec)]
+
+
 def ping_host(host: str, timeout: float = 2.0) -> tuple[bool, float | None]:
     """ICMP ping via subprocess.  Returns ``(ok, latency_ms)``.
 
-    Uses ``ping -c 1 -W <timeout>`` on Linux.  Catches all exceptions
-    (permission denied, no ping binary, etc).  Returns ``(False, None)``
-    on any failure.
+    Uses ``ping -c 1`` bounded to *timeout* by the platform's own option
+    (:func:`_ping_wait_args`).  The binary is found on ``PATH``
+    or, failing that, in the standard system directories
+    (:func:`_ping_executable`).  Catches all exceptions (permission
+    denied, no ping binary, etc).  Returns ``(False, None)`` on any
+    failure.
     """
     t0 = time.monotonic()
     try:
-        # -W accepts integer seconds on most Linux ping implementations.
-        wait_sec = max(1, int(timeout))
         result = subprocess.run(
-            ["ping", "-c", "1", "-W", str(wait_sec), host],
+            [_ping_executable() or "ping", "-c", "1", *_ping_wait_args(timeout), host],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout + 1.0,
@@ -198,7 +237,9 @@ def probe_u64(
     """Full liveness probe: ping -> TCP connect -> API version check.
 
     Fail-fast: if ping fails, remaining checks are skipped.  If TCP
-    fails, the API check is skipped.
+    fails, the API check is skipped.  A host with no ``ping`` binary at
+    all skips the ping stage as ``skip_ping`` would (``ping_ok`` is
+    ``None``) and lets the TCP connect decide.
 
     ``reachable`` is a **reads-only** verdict: every default stage is
     read-only, so a device whose memory-write path is dead still reports
@@ -230,6 +271,11 @@ def probe_u64(
     error: str | None = None
 
     # --- ping ---
+    # No ping binary at all is not an unreachable device: skip the stage
+    # and let the TCP connect decide.
+    if not skip_ping and _ping_executable() is None:
+        _log.info("no ping binary found; probing %s by TCP only", host)
+        skip_ping = True
     if not skip_ping:
         ok, lat = ping_host(host, timeout=ping_timeout)
         ping_result = ok
