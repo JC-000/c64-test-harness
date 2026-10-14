@@ -400,14 +400,22 @@ def check_device_identity(
             if holder is not None:
                 legacy.append((spelling, holder.get("pid")))
         if legacy:
-            names = ", ".join(f"{s} (pid {pid})" for s, pid in legacy)
+            names = ", ".join(
+                f"{s} (pid {pid})" if pid is not None
+                else f"{s} (pid unknown: the lockfile is empty, as a bare "
+                     "flock leaves it)"
+                for s, pid in legacy
+            )
             return IdentityFinding(
                 "collision",
                 f"device {configured} is locked by this process as {key}, and "
-                f"by another process under its raw address: {names}. That "
-                "lane runs a harness without the #519 alias map, so the two "
-                "locks do not exclude each other. Upgrade that lane, or wait "
-                "for it to finish.",
+                f"by another process under its raw address: {names}. Either "
+                "that lane runs a harness without the #519 alias map, or a "
+                "wrapper -- possibly this process's own parent -- flocks the "
+                "raw-address lockfile itself; the two locks do not exclude "
+                "each other. Upgrade that lane or wait for it to finish; drop "
+                f"a wrapper's raw flock, since {key} already covers every "
+                "listed address.",
             )
     if not unique_id:
         return None
