@@ -21,6 +21,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -128,21 +129,32 @@ def _ping_executable() -> str | None:
     return None
 
 
+def _ping_wait_arg(timeout: float) -> str:
+    """``ping -W``'s value for *timeout* seconds (at least one second).
+
+    Linux iputils reads ``-W`` in seconds; macOS reads it in
+    **milliseconds** (``man ping``), so a bare ``2`` there waited 2 ms.
+    """
+    wait_sec = max(1, int(timeout))
+    if sys.platform == "darwin":
+        return str(wait_sec * 1000)
+    return str(wait_sec)
+
+
 def ping_host(host: str, timeout: float = 2.0) -> tuple[bool, float | None]:
     """ICMP ping via subprocess.  Returns ``(ok, latency_ms)``.
 
-    Uses ``ping -c 1 -W <timeout>`` on Linux.  The binary is found on
-    ``PATH`` or, failing that, in the standard system directories
+    Uses ``ping -c 1 -W <wait>``, with the wait in the unit the platform's
+    ping expects (:func:`_ping_wait_arg`).  The binary is found on ``PATH``
+    or, failing that, in the standard system directories
     (:func:`_ping_executable`).  Catches all exceptions (permission
     denied, no ping binary, etc).  Returns ``(False, None)`` on any
     failure.
     """
     t0 = time.monotonic()
     try:
-        # -W accepts integer seconds on most Linux ping implementations.
-        wait_sec = max(1, int(timeout))
         result = subprocess.run(
-            [_ping_executable() or "ping", "-c", "1", "-W", str(wait_sec), host],
+            [_ping_executable() or "ping", "-c", "1", "-W", _ping_wait_arg(timeout), host],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout + 1.0,
@@ -220,7 +232,9 @@ def probe_u64(
     """Full liveness probe: ping -> TCP connect -> API version check.
 
     Fail-fast: if ping fails, remaining checks are skipped.  If TCP
-    fails, the API check is skipped.
+    fails, the API check is skipped.  A host with no ``ping`` binary at
+    all skips the ping stage as ``skip_ping`` would (``ping_ok`` is
+    ``None``) and lets the TCP connect decide.
 
     ``reachable`` is a **reads-only** verdict: every default stage is
     read-only, so a device whose memory-write path is dead still reports
