@@ -555,8 +555,8 @@ class TestBodylessThroughout:
 
     The C64 Ultimate (fw 1.1.0) has no ``/Temp`` garbage collection: a
     body-carrying POST leaves a managed file behind and enough of them
-    crash the firmware, recoverable only by a physical power-cycle that
-    nobody is there to perform.  Arming anything by default on that
+    crash the firmware, recoverable only by a physical power-cycle at
+    the bench.  Arming anything by default on that
     device is only safe if it costs zero attachments, so the claim is
     measured on the client's own counter.
     """
