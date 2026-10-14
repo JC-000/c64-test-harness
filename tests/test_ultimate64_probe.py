@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import os
 import socket
 import subprocess
 import urllib.error
@@ -345,7 +346,7 @@ def test_ping_success(mock_run):
     assert lat is not None and lat >= 0
     mock_run.assert_called_once()
     args = mock_run.call_args[0][0]
-    assert args[0] == "ping"
+    assert os.path.basename(args[0]) == "ping"
     assert "-c" in args and "1" in args
 
 
@@ -1209,3 +1210,35 @@ def _empty_temp_over_ftp(monkeypatch):
     import fake_temp_ftp
 
     fake_temp_ftp.install(monkeypatch)
+
+
+# ---- ping binary outside PATH ------------------------------------------
+# ``ping`` lives in /sbin on macOS, and env -i, cron and launchd hand out a
+# PATH without it.  A bare ``ping`` then raised FileNotFoundError, which
+# ping_host reports as a failed ping and probe_u64 as an unreachable device.
+
+
+def test_ping_host_finds_ping_outside_path(monkeypatch, tmp_path):
+    """A real ping of loopback succeeds with an empty PATH."""
+    import shutil
+
+    if shutil.which("ping", path="/sbin:/bin:/usr/sbin:/usr/bin") is None:
+        pytest.skip("no ping binary on this host")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    ok, lat = ping_host("127.0.0.1", timeout=2.0)
+    assert ok is True
+    assert lat is not None
+
+
+def test_probe_without_ping_binary_falls_through_to_tcp(monkeypatch, tmp_path):
+    """No ping binary anywhere is not an unreachable device: TCP decides."""
+    from c64_test_harness.backends import ultimate64_probe as probe
+
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(probe, "_PING_FALLBACK_PATHS", (), raising=False)
+    with patch.object(probe, "check_port", return_value=(True, 1.0)), \
+         patch.object(probe, "check_api", return_value=(True, {"version": "0.1"})):
+        r = probe.probe_u64("10.0.0.1")
+    assert r.reachable is True
+    assert r.ping_ok is None
+    assert r.port_ok is True
