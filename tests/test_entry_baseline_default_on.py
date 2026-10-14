@@ -6,9 +6,10 @@ asking for it, so each is pinned rather than described:
 * **Default on for the Ultimate line, off for the CBM line, off for
   unknown.**  The default consults the device
   (``DeviceCapabilities.generation``) rather than being one global
-  boolean, because the two lines are not equally recoverable: the C64U
-  reaches the bench over WiFi whose reconnection after a power cycle is
-  known unreliable, and nobody is there.  An unreadable or timed-out
+  boolean, because the two lines were not equally recoverable when this
+  was decided: the C64U reached the bench over WiFi whose reconnection
+  after a power cycle is known unreliable, and nobody was there (wired
+  and on the owner's desk since 2026-10-12; #533).  An unreadable or timed-out
   probe (#262) grades ``unknown`` and must fall to **off** — a reset must
   never arm on a device the harness failed to identify.  The switch stays
   tri-state above that: an explicit ``baseline_on_entry=`` wins, then the
@@ -16,7 +17,7 @@ asking for it, so each is pinned rather than described:
   generation default.  ``HarnessConfig.u64_baseline_on_entry=None`` still
   means "nobody asked".
 * **It is bodyless throughout**, so arming it on the leak-prone,
-  unattended, WiFi-reached C64 Ultimate costs zero ``/Temp``
+  shared C64 Ultimate costs zero ``/Temp``
   attachments.  That is the safety property the default rests on, and it
   is asserted on the real :class:`Ultimate64Client` through its own
   attachment counter, not by reading the source.

@@ -384,12 +384,13 @@ per refused store:
   security-shaped change on a shared bench that silently undoes a deliberate
   service-off state.
 - **`WiFi settings`** — device-loss risk, not a connectivity inconvenience. The
-  C64 Ultimate reaches the bench over WiFi and its **reconnection after a power
-  cycle is known unreliable**: the owner has seen it fail to rejoin, saved a
+  C64 Ultimate reached the bench over WiFi until 2026-10-12 (it is wired now and
+  can go back), and its **reconnection after a power cycle is known unreliable**: the owner has seen it fail to rejoin, saved a
   working configuration to flash deliberately, and confirmed the rejoin only by
   standing at the device (owner testimony, 2026-09-11). A reset would discard
   that configuration in RAM and re-effectuate the stack the device is reached
-  over; if it does not come back there is no remote remedy at all.
+  over; if it does not come back there is no remote remedy at all, only someone at
+  the device.
 - **`Clock Settings`** — the RTC: the reset shows neither drift nor mismatch
   while arming the next PUT to the category to write the 2015 defaults to the
   clock chip (`rtc.cc:350-409`).

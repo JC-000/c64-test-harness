@@ -101,8 +101,9 @@ _log = logging.getLogger(__name__)
 #: Volumes that put/mkdir/delete/rmdir never touch (compared casefolded).
 WRITE_REFUSED_VOLUMES = frozenset({"temp", "flash"})
 
-#: Socket timeout for the FTP session. An 880 KB image over the VPN to
-#: the C64U takes a few seconds, so this is generous.
+#: Socket timeout for the FTP session. An 880 KB image to the C64U took a
+#: few seconds over the VPN (written 2026-10-08, before it moved to the bench), so
+#: this is generous.
 DEFAULT_STORAGE_FTP_TIMEOUT = 60.0
 
 #: OSError subclasses raised on purpose here. ftplib's ``all_errors``

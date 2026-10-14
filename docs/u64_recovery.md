@@ -800,7 +800,7 @@ device" — wasting troubleshooting cycles each time.
 the device out of service for about two weeks in August–September 2026,
 because nobody was physically present to power-cycle it. Since 2026-10-12
 it sits on the owner's desk, so a wedge now costs a power-cycle by the
-owner and every lane's runs until then, not weeks. No REST endpoint
+owner, and every lane's runs until then. No REST endpoint
 restarts the firmware — `machine:reboot` is `C64::start_cartridge(NULL)`,
 a C64-level reset, and none of the `machine:*` routes at tag `1.1.0`
 (`software/api/route_machine.cc`) restarts the firmware itself — so

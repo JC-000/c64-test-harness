@@ -516,10 +516,12 @@ class _LockedU64Manager:
             logger.warning(
                 "U64 %s is a C64 Ultimate (generation=cbm) and the entry "
                 "baseline was armed explicitly (%s) — it does NOT default on "
-                "for this generation. That device is reached over WiFi whose "
-                "reconnection after a power cycle is known unreliable, and "
-                "nobody is at the bench: if a reset takes the link down there "
-                "is no remote remedy. Proceeding. Set %s=0 to opt out.",
+                "for this generation. That default was set while the device was "
+                "reached over WiFi, whose reconnection after a power cycle is "
+                "known unreliable, with nobody at the bench; whether it should "
+                "change is #533. If a reset takes the link down, only a "
+                "power-cycle at the bench recovers it. Proceeding. Set %s=0 "
+                "to opt out.",
                 device_host, why, BASELINE_ON_ENTRY_ENV,
             )
         if enabled:
