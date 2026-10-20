@@ -49,12 +49,21 @@ _PATCHED_FEATURES = _STOCK_FEATURES + (
     "RAWNET_BPF_PERMISSIONS    yes  Raw ethernet without root when a /dev/bpf* device is read-write.\n"
 )
 
+# install/reinstall stand in for Homebrew: they copy the tap's formula into
+# the keg's .brew/ (as Homebrew does) and write a patched x64sc.
 _FAKE_BREW = r"""#!/bin/bash
 case "$1" in
   cat) cat "$FAKE/formula.rb" ;;
   list) [ -e "$FAKE/installed" ] || exit 1; echo "${2##*/} 3.10" ;;
   --prefix) case "$2" in vice) echo "$FAKE/vice" ;; *) echo "$FAKE/vice-eth" ;; esac ;;
   --repository) echo "$FAKE/tap" ;;
+  tap-new) mkdir -p "$FAKE/tap" ;;
+  install|reinstall)
+    echo "$*" >> "$FAKE/installs"
+    mkdir -p "$FAKE/vice-eth/.brew" "$FAKE/vice-eth/bin"
+    cp "$FAKE/tap/Formula/vice-eth.rb" "$FAKE/vice-eth/.brew/vice-eth.rb"
+    cp "$FAKE/patched-x64sc" "$FAKE/vice-eth/bin/x64sc"
+    touch "$FAKE/installed" ;;
   *) echo "unexpected brew $*" >&2; exit 99 ;;
 esac
 """
@@ -78,6 +87,7 @@ def _world(tmp_path: Path, *, formula: str = _FORMULA) -> Path:
     brew.chmod(0o755)
     (fake / "formula.rb").write_text(formula)
     _x64sc(fake / "vice" / "bin" / "x64sc", _STOCK_FEATURES)
+    _x64sc(fake / "patched-x64sc", _PATCHED_FEATURES)
     return fake
 
 
@@ -100,6 +110,8 @@ def _install(fake: Path, *, formula_text: str | None = None, features: str = _PA
     (keg / ".brew").mkdir(parents=True)
     (keg / ".brew" / "vice-eth.rb").write_text(formula_text or generated.stdout)
     _x64sc(keg / "bin" / "x64sc", features)
+    (fake / "tap" / "patches").mkdir(parents=True, exist_ok=True)
+    (fake / "tap" / "patches" / PATCH.name).write_bytes(PATCH.read_bytes())
     (fake / "installed").touch()
 
 
@@ -114,7 +126,10 @@ def test_formula_is_homebrews_plus_the_patch(tmp_path):
     assert f"c64h-patch-sha256: {_sha(PATCH.read_bytes())}" in out
     patch_at = out.index("  patch do\n")
     assert patch_at < out.index("  def install\n")
-    assert f'url "file://{PATCH}"' in out
+    # The tap's copy of the patch, not this checkout's: the installed
+    # formula must not depend on where the repo (or a worktree) lives.
+    assert f'url "file://{fake}/tap/patches/{PATCH.name}"' in out
+    assert str(REPO) not in out
     assert 'system "./configure", "--disable-usbsid", "--disable-arch",' in out
     # Everything else is Homebrew's, unchanged.
     for line in _FORMULA.splitlines()[1:]:
@@ -169,12 +184,51 @@ def test_check_flags_a_build_from_an_older_patch(tmp_path):
     assert "patch changed" in proc.stdout
 
 
-def test_check_flags_a_build_without_the_marker(tmp_path):
+def test_check_counts_a_build_without_the_marker_as_not_patched(tmp_path):
+    """The harness reads such a binary as stock and wants root: exit 2, so
+    verify does not call the x64sc sudo rule unnecessary."""
     fake = _world(tmp_path)
     _install(fake, features=_STOCK_FEATURES)
     proc = _run(fake, "--check")
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "not patched" in proc.stdout
+
+
+def test_check_flags_a_tap_without_the_patch_copy(tmp_path):
+    fake = _world(tmp_path)
+    _install(fake)
+    (fake / "tap" / "patches" / PATCH.name).unlink()
+    proc = _run(fake, "--check")
     assert proc.returncode == 1, proc.stdout + proc.stderr
-    assert "RAWNET_BPF_PERMISSIONS" in proc.stdout
+    assert "reinstall would fail" in proc.stdout
+
+
+def test_check_says_when_it_could_not_compare_with_vice(tmp_path):
+    fake = _world(tmp_path)
+    _install(fake)
+    (fake / "vice" / "bin" / "x64sc").unlink()
+    proc = _run(fake, "--check")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "not compared" in proc.stdout
+
+
+def test_build_installs_from_the_tap_and_then_passes_check(tmp_path):
+    fake = _world(tmp_path)
+    proc = _run(fake)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (fake / "tap" / "patches" / PATCH.name).read_bytes() == PATCH.read_bytes()
+    assert (fake / "installs").read_text().split() == [
+        "install", "--build-from-source", "c64-test-harness/local/vice-eth"
+    ]
+    assert "current" in proc.stdout
+
+
+def test_force_reinstalls_a_current_build(tmp_path):
+    fake = _world(tmp_path)
+    _install(fake)
+    proc = _run(fake, "--force")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (fake / "installs").read_text().split()[0] == "reinstall"
 
 
 def test_check_flags_features_that_differ_from_homebrews_vice(tmp_path):
@@ -190,7 +244,6 @@ def test_build_does_nothing_when_current(tmp_path):
     fake = _world(tmp_path)
     _install(fake)
     proc = _run(fake)
-    # The fake brew fails on install/reinstall/tap-new, so rc 0 means none ran.
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "current" in proc.stdout
-    assert "unexpected brew" not in proc.stderr
+    assert not (fake / "installs").exists()

@@ -1175,6 +1175,7 @@ def test_plan_runs_the_patched_build_as_the_user(monkeypatch, tmp_path):
 def test_refusal_for_a_stock_build_names_the_patched_build(monkeypatch, tmp_path):
     _as_uid(monkeypatch, 501)
     monkeypatch.setattr(ve.sys, "platform", "darwin")
+    monkeypatch.setattr(ve, "patched_vice_binary", lambda: None)  # none built here
     _no_sudo(monkeypatch)
     _patched_features(monkeypatch, bpf_permissions=False)
     _bpf_dir(monkeypatch, tmp_path, {"bpf0": 0o600})
@@ -1198,11 +1199,17 @@ def test_refusal_for_the_patched_build_names_the_bpf_remedy(monkeypatch, tmp_pat
     assert "build-vice-eth.sh" not in msg
 
 
-def _patched_at(monkeypatch, tmp_path):
+def _patched_at(monkeypatch, tmp_path, *, usable: bool = True):
+    """A patched build at a fake path; *usable* is what rawnet_capability
+    answers for it (marker plus an openable /dev/bpf* node)."""
     monkeypatch.setattr(ve.sys, "platform", "darwin")
     monkeypatch.delenv("HOMEBREW_PREFIX", raising=False)
     exe = _fake_x64sc(tmp_path, "vice-eth-x64sc", ethernet=True)
     monkeypatch.setattr(ve, "PATCHED_VICE_CANDIDATES", ("/nonexistent/x64sc", exe))
+    monkeypatch.setattr(
+        ve, "rawnet_capability", lambda as_root=None, binary=None: usable and binary == exe
+    )
+    monkeypatch.setattr(vice_lifecycle, "_PATCHED_NOTES", set())
     return exe
 
 
@@ -1252,3 +1259,96 @@ def test_resolver_ignores_the_patched_build_without_ethernet(monkeypatch, tmp_pa
     _patched_at(monkeypatch, tmp_path)
     cfg = ViceConfig(ethernet=False, ethernet_executable="")
     assert vice_lifecycle.resolve_vice_executable(cfg) == "x64sc"
+
+
+def test_patched_binary_must_be_executable(monkeypatch, tmp_path):
+    exe = _patched_at(monkeypatch, tmp_path)
+    os.chmod(exe, 0o644)
+    assert ve.patched_vice_binary() is None
+
+
+def test_resolver_falls_back_when_the_patched_build_cannot_run_as_this_user(monkeypatch, tmp_path, caplog):
+    """A second account on the Mac, not in access_bpf, with a sudo rule for
+    the stock path: steering it onto vice-eth would get its launch refused."""
+    _patched_at(monkeypatch, tmp_path, usable=False)
+    bindir = tmp_path / "path"
+    bindir.mkdir()
+    _fake_x64sc(bindir, "x64sc", ethernet=True)
+    monkeypatch.setenv("PATH", str(bindir))
+    cfg = ViceConfig(ethernet=True, ethernet_executable="")
+    with caplog.at_level("INFO", logger=vice_lifecycle.__name__):
+        assert vice_lifecycle.resolve_vice_executable(cfg) == "x64sc"
+    assert any("cannot run ethernet" in r.getMessage() for r in caplog.records)
+
+
+def test_resolver_names_the_patched_build_it_chose_once(monkeypatch, tmp_path, caplog):
+    exe = _patched_at(monkeypatch, tmp_path)
+    cfg = ViceConfig(ethernet=True, ethernet_executable="")
+    with caplog.at_level("INFO", logger=vice_lifecycle.__name__):
+        vice_lifecycle.resolve_vice_executable(cfg)
+        vice_lifecycle.resolve_vice_executable(cfg)
+    chose = [r for r in caplog.records if exe in r.getMessage()]
+    assert len(chose) == 1, [r.getMessage() for r in caplog.records]
+
+
+def _kegs(tmp_path, eth_version: str, stock_version: str) -> str:
+    """opt/{vice-eth,vice} symlinked into Cellar/<name>/<version>, as Homebrew lays them out."""
+    root = tmp_path / "brew"
+    for name, version in (("vice-eth", eth_version), ("vice", stock_version)):
+        keg = root / "Cellar" / name / version / "bin"
+        keg.mkdir(parents=True)
+        (keg / "x64sc").write_text("#!/bin/sh\n")
+        (keg / "x64sc").chmod(0o755)
+        (root / "opt").mkdir(exist_ok=True)
+        (root / "opt" / name).symlink_to(root / "Cellar" / name / version)
+    return str(root / "opt" / "vice-eth" / "bin" / "x64sc")
+
+
+def test_patched_lag_sees_a_brew_upgrade_of_vice(tmp_path):
+    assert ve.patched_vice_lag(_kegs(tmp_path, "3.10", "3.11")) == ("3.10", "3.11")
+
+
+def test_patched_lag_is_none_when_the_kegs_match(tmp_path):
+    assert ve.patched_vice_lag(_kegs(tmp_path, "3.10", "3.10")) is None
+
+
+def test_resolver_warns_when_the_patched_build_lags_vice(monkeypatch, tmp_path, caplog):
+    exe = _kegs(tmp_path, "3.10", "3.11")
+    monkeypatch.setattr(ve.sys, "platform", "darwin")
+    monkeypatch.delenv("HOMEBREW_PREFIX", raising=False)
+    monkeypatch.setattr(ve, "PATCHED_VICE_CANDIDATES", (exe,))
+    monkeypatch.setattr(ve, "rawnet_capability", lambda as_root=None, binary=None: True)
+    monkeypatch.setattr(vice_lifecycle, "_PATCHED_NOTES", set())
+    _stub_features(monkeypatch)
+    with caplog.at_level("INFO", logger=vice_lifecycle.__name__):
+        vice_lifecycle.resolve_vice_executable(ViceConfig(ethernet=True, ethernet_executable=""))
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any("3.10" in r.getMessage() and "3.11" in r.getMessage() for r in warnings), caplog.text
+
+
+def test_refusal_on_linux_never_names_the_macos_build(monkeypatch, tmp_path):
+    _as_uid(monkeypatch, 501)
+    monkeypatch.setattr(ve.sys, "platform", "linux")
+    monkeypatch.setattr(ve, "_has_cap_net_raw", lambda: False)
+    _no_sudo(monkeypatch)
+    _patched_features(monkeypatch, bpf_permissions=False)
+    with pytest.raises(ve.ViceElevationRequiredError) as excinfo:
+        ve.plan_vice_launch(ViceConfig(ethernet=True, ethernet_driver="pcap"), _eth_argv())
+    assert "build-vice-eth" not in str(excinfo.value)
+
+
+def test_refusal_for_stock_when_the_patched_build_is_unusable_names_bpf(monkeypatch, tmp_path):
+    """The patched build exists but cannot run as this user: rebuilding it
+    is not the remedy, BPF access is."""
+    _as_uid(monkeypatch, 501)
+    monkeypatch.setattr(ve.sys, "platform", "darwin")
+    _no_sudo(monkeypatch)
+    _patched_features(monkeypatch, bpf_permissions=False)
+    _bpf_dir(monkeypatch, tmp_path, {"bpf0": 0o000})
+    monkeypatch.setattr(ve, "patched_vice_binary", lambda: "/opt/homebrew/opt/vice-eth/bin/x64sc")
+    with pytest.raises(ve.ViceElevationRequiredError) as excinfo:
+        ve.plan_vice_launch(ViceConfig(ethernet=True, ethernet_driver="pcap"), _eth_argv())
+    msg = str(excinfo.value)
+    assert "/opt/homebrew/opt/vice-eth/bin/x64sc is installed" in msg
+    assert "access_bpf" in msg
+    assert "build the patched VICE" not in msg

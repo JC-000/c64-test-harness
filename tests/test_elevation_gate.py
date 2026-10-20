@@ -929,8 +929,17 @@ def test_probe_vice_root_resolves_the_patched_build_by_default(monkeypatch, tmp_
     exe = tmp_path / "vice-eth-x64sc"
     exe.write_bytes(b"x")
     monkeypatch.setattr(vl, "ethernet_vice_binary", lambda: "")
-    monkeypatch.setattr(ve, "patched_vice_binary", lambda: str(exe))
+    monkeypatch.setattr(ve, "usable_patched_vice_binary", lambda: str(exe))
     assert conftest._resolve_ethernet_binary() == str(exe)
+
+
+def test_probe_vice_root_lets_vice_ethernet_bin_win_over_the_patched_build(monkeypatch, tmp_path):
+    from c64_test_harness.backends import vice_elevation as ve
+    from c64_test_harness.backends import vice_lifecycle as vl
+
+    monkeypatch.setattr(vl, "ethernet_vice_binary", lambda: "/configured/x64sc")
+    monkeypatch.setattr(ve, "usable_patched_vice_binary", lambda: str(tmp_path / "vice-eth"))
+    assert conftest._resolve_ethernet_binary() == "/configured/x64sc"
 
 
 def test_probe_vice_root_can_demand_the_sudo_rule_itself(monkeypatch, tmp_path):

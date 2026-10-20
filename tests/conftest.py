@@ -792,10 +792,10 @@ def elevation_is_required() -> bool:
 
 def _resolve_ethernet_binary() -> str:
     """The x64sc an ethernet launch with a default ``ViceConfig`` would use."""
-    from c64_test_harness.backends.vice_elevation import patched_vice_binary
+    from c64_test_harness.backends.vice_elevation import usable_patched_vice_binary
     from c64_test_harness.backends.vice_lifecycle import ethernet_vice_binary
     return (
-        ethernet_vice_binary() or patched_vice_binary() or shutil.which("x64sc") or "x64sc"
+        ethernet_vice_binary() or usable_patched_vice_binary() or shutil.which("x64sc") or "x64sc"
     )
 
 

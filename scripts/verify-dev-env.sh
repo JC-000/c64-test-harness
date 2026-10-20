@@ -599,7 +599,7 @@ check_system() {
             0) record "$sec" "patched VICE (ethernet without root)" ok "$eth_state" 0 ;;
             1) record "$sec" "patched VICE (ethernet without root)" warn "$eth_state" 0
                add_hint "Rebuild the patched VICE so it matches Homebrew's vice again: scripts/build-vice-eth.sh (a stale build still runs, but lags the release)" ;;
-            2) record "$sec" "patched VICE (ethernet without root)" missing "not built: a stock x64sc needs root for ethernet (the x64sc NOPASSWD row)" 0 ;;
+            2) record "$sec" "patched VICE (ethernet without root)" missing "$eth_state (a stock x64sc needs root for ethernet: the x64sc NOPASSWD row)" 0 ;;
             *) record "$sec" "patched VICE (ethernet without root)" unknown "$eth_state" 0 ;;
         esac
         local x64sc_path="${C64H_X64SC_PATH:-/opt/homebrew/bin/x64sc}"

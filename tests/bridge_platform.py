@@ -38,9 +38,9 @@ import pytest
 
 from c64_test_harness.ethernet import parse_mac
 from c64_test_harness.backends.vice_elevation import (
-    patched_vice_binary,
     rawnet_capability,
     sudo_can_run,
+    usable_patched_vice_binary,
 )
 from c64_test_harness.backends.vice_lifecycle import (
     ETHERNET_VICE_BIN_ENV,
@@ -393,10 +393,11 @@ def probe_vice_pcap_ok(
 
     # Probe the binary the ethernet tests will actually launch: an
     # ethernet-capable build when one is configured ($VICE_ETHERNET_BIN),
-    # else the patched vice-eth (macOS, scripts/build-vice-eth.sh), else the
-    # PATH x64sc -- resolve_vice_executable()'s order.  Probing PATH while
-    # the tests run a different binary would report on the wrong emulator.
-    x64sc = ethernet_vice_binary() or patched_vice_binary() or shutil.which("x64sc")
+    # else the patched vice-eth when it can run as this user (macOS,
+    # scripts/build-vice-eth.sh), else the PATH x64sc --
+    # resolve_vice_executable()'s order.  Probing PATH while the tests run
+    # a different binary would report on the wrong emulator entirely.
+    x64sc = ethernet_vice_binary() or usable_patched_vice_binary() or shutil.which("x64sc")
     if x64sc is None:
         _PROBE_CACHE = (False, "x64sc not on PATH")
         return _PROBE_CACHE

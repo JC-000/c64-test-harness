@@ -364,6 +364,44 @@ def patched_vice_binary() -> str | None:
     return None
 
 
+def usable_patched_vice_binary() -> str | None:
+    """:func:`patched_vice_binary`, but only when it would run ethernet as
+    this user now: it reports ``RAWNET_BPF_PERMISSIONS`` and a ``/dev/bpf*``
+    node opens read-write.  Otherwise ``None``, so a launch falls back to
+    the configured binary (and whatever sudo rule names it) rather than
+    being steered onto a build this user cannot use.
+    """
+    path = patched_vice_binary()
+    if path is None or not rawnet_capability(as_root=False, binary=path):
+        return None
+    return path
+
+
+def patched_vice_lag(path: str) -> tuple[str, str] | None:
+    """``(vice-eth version, vice version)`` when the patched build's keg is
+    not the version of Homebrew's ``vice`` beside it, else ``None``.
+
+    Read from the opt symlinks (``opt/<name>`` -> ``Cellar/<name>/<version>``),
+    so it costs no subprocess; ``None`` too when either is not such a keg.
+    This is the run-time half of ``build-vice-eth.sh --check``: it sees a
+    ``brew upgrade vice`` that left the patched build behind, not a formula
+    revision or a patch change, which only ``--check`` reads.
+    """
+    def keg_version(x64sc: str, name: str) -> str | None:
+        real = os.path.realpath(x64sc)
+        parts = real.split(os.sep)
+        if len(parts) >= 5 and parts[-5] == "Cellar" and parts[-4] == name:
+            return parts[-3]
+        return None
+
+    opt_dir = os.path.dirname(os.path.dirname(os.path.dirname(path)))
+    eth = keg_version(path, "vice-eth")
+    stock = keg_version(os.path.join(opt_dir, "vice", "bin", "x64sc"), "vice")
+    if eth is None or stock is None or eth == stock:
+        return None
+    return eth, stock
+
+
 def rawnet_capability(*, as_root: bool | None = None, binary: str | None = None) -> bool:
     """What ``archdep_rawnet_capability()`` would return for a child.
 
@@ -573,14 +611,24 @@ def _unprivileged_route(binary: str) -> str:
     """The non-root remedy for *binary* on macOS, or ``""`` elsewhere."""
     if sys.platform != "darwin":
         return ""
+    bpf_remedy = (
+        "Install Wireshark's ChmodBPF (brew install --cask "
+        "wireshark-chmodbpf), make sure `id -Gn` lists access_bpf (log in "
+        "again after joining), or sudo chmod o+rw /dev/bpf* until the next "
+        "reboot.\n"
+    )
     if vice_features(binary).bpf_permissions:
         return (
             f"This x64sc reports {BPF_PERMISSIONS_FEATURE} yes, so it would run "
             f"as you, but no /dev/bpf* node opens read-write for this user. "
-            f"Install Wireshark's ChmodBPF (brew install --cask "
-            f"wireshark-chmodbpf), make sure `id -Gn` lists access_bpf (log "
-            f"in again after joining), or sudo chmod o+rw /dev/bpf* until the "
-            f"next reboot.\n"
+            + bpf_remedy
+        )
+    patched = patched_vice_binary()
+    if patched is not None:
+        return (
+            f"The patched build at {patched} is installed, but it cannot run "
+            f"ethernet as you (no /dev/bpf* node opens read-write for this "
+            f"user), so this stock x64sc was chosen instead. " + bpf_remedy
         )
     return (
         "This x64sc is a stock build, which enables ethernet only for root. "

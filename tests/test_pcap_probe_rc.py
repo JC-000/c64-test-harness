@@ -112,7 +112,7 @@ def test_probe_runs_the_patched_build_unelevated(monkeypatch, tmp_path):
     monkeypatch.delenv("MACOS_PCAP_DISABLED", raising=False)
     monkeypatch.delenv("MACOS_PCAP_ENABLED", raising=False)
     monkeypatch.setattr(bp, "ethernet_vice_binary", lambda: "")
-    monkeypatch.setattr(bp, "patched_vice_binary", lambda: str(patched))
+    monkeypatch.setattr(bp, "usable_patched_vice_binary", lambda: str(patched))
     monkeypatch.setattr(
         bp, "rawnet_capability", lambda as_root=False, binary=None: binary == str(patched)
     )

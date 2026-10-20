@@ -96,7 +96,8 @@ Steps 6-8 are needed only for the ethernet/bridge tests.
 
    ```
    # c64-test-harness -- passwordless sudo for bridge networking lifecycle
-   # and for the VICE ethernet tests (VICE's pcap driver needs root on macOS).
+   # and, with stock VICE only, for the VICE ethernet tests (stock VICE's pcap
+   # driver needs root on macOS; the patched build from build-vice-eth.sh does not).
    # Scoped to four binaries by absolute path; does NOT grant general sudo.
    #
    # SECURITY NOTE: the three bridge scripts live under a user-writable repo
@@ -174,7 +175,7 @@ The patch is not upstream. A submission is being prepared; until VICE carries it
 
   The `sudo -n` wrap (stock VICE only) is **non-interactive**: it requires a passwordless sudoers entry for `/opt/homebrew/bin/x64sc` on macOS dev hosts that do not build the patched VICE. See the "Passwordless sudo for bridge lifecycle" subsection above — the same sudoers drop-in that covers the three bridge scripts now also needs an `x64sc` entry. `scripts/verify-dev-env.sh` parses the `NOPASSWD:` rules out of `sudo -n -l` (the same way `vice_elevation.parse_sudo_listing` does) and reports a `warn` row if no rule names `/opt/homebrew/bin/x64sc` exactly and no patched build exists — a blanket `(ALL) ALL` does not count, because it still prompts. (It used to probe with `sudo -n -l <cmd>`, which exits 0 for anything a `(ALL) ALL` user may run at all, so it reported `ok` on hosts where every elevated launch prompted.)
 
-  Escape hatches still work the same way: `MACOS_PCAP_DISABLED=1` force-skips the ethernet suite without running the probe, and `MACOS_PCAP_ENABLED=1` trusts the user and skips the probe. Reproduce the working launch interactively with `scripts/probe-vice-feth.sh` (which runs VICE under `sudo -n` by default; `--no-sudo` opts out for future hosts where ChmodBPF/TCC changes make non-root pcap work).
+  Escape hatches still work the same way: `MACOS_PCAP_DISABLED=1` force-skips the ethernet suite without running the probe, and `MACOS_PCAP_ENABLED=1` trusts the user and skips the probe. Reproduce the working launch interactively with `scripts/probe-vice-feth.sh`. It runs the PATH x64sc under `sudo -n` by default; for the patched build pass `--no-sudo --vice-bin /opt/homebrew/opt/vice-eth/bin/x64sc` (the script, unlike the harness, does not pick the patched build by itself).
 
   The silent NULL driver on pcap init failure is recorded, with its reproducer, in [docs/vice_upstream_bugs.md](vice_upstream_bugs.md). It has not been reported upstream.
 - **feth peers MUST NOT also be bridge members.** `scripts/setup-bridge-feth-macos.sh` creates `feth0` + `feth1`, pairs them via `ifconfig feth0 peer feth1`, AND creates `bridge10` — but it deliberately leaves `feth0`/`feth1` OUT of the bridge (zero members on `bridge10`). Rationale: the `peer` relation is already a point-to-point L2 link (TX on `feth0` = RX on `feth1` and vice versa); adding them as bridge members creates a SECOND forwarding path between the same two nodes, which empirically broke B→A reply delivery (A→B first-hops stayed fine). `bridge10` still exists so the tests' `iface_present(BRIDGE_NAME)` precondition keeps passing and the host-side `10.0.65.1` address has a stable home; if any future test needs the host to participate at L2 it can `addm` a THIRD interface (e.g. a fresh feth pair or a vlan) but not the existing peered pair. The cleanup script `cleanup-bridge-feth-macos.sh` is a peers-only reconverge too — if a previous setup run happened to add the peers as members, the setup script now calls `deletem` idempotently to restore the intended topology.
