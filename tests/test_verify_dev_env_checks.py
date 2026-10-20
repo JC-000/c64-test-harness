@@ -61,6 +61,9 @@ def _run(program: str, env: dict[str, str] | None = None) -> subprocess.Complete
 
 
 def _check_system(uname: str, env: dict[str, str]) -> subprocess.CompletedProcess:
+    # Never this host's build-vice-eth.sh or x64sc unless a test supplies them.
+    env = {"C64H_BUILD_VICE_ETH": "/nonexistent/build-vice-eth.sh",
+           "C64H_X64SC_PATH": "/nonexistent/x64sc", **env}
     program = (
         _VERIFY_STUBS
         + f"uname() {{ printf '%s\\n' {shlex.quote(uname)}; }}\n"
@@ -855,3 +858,59 @@ def test_setup_keeps_plain_help_when_it_lists_the_flags(tmp_path):
     )
     proc = _run(program, {"PATH": f"{bindir}:/usr/bin:/bin"})
     assert "RC=0" in proc.stdout, proc.stdout + proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# The patched VICE (scripts/build-vice-eth.sh) and the x64sc sudoers row
+# ---------------------------------------------------------------------------
+
+
+def _vice_eth_rows(tmp_path: Path, check_rc: int, *, x64sc: bool = True) -> tuple[dict[str, list[str]], list[str]]:
+    fake = tmp_path / "build-vice-eth.sh"
+    fake.write_text(f"#!/bin/sh\necho 'build-vice-eth: state {check_rc}'\nexit {check_rc}\n")
+    fake.chmod(0o755)
+    stock = tmp_path / "x64sc"
+    if x64sc:
+        stock.write_text("#!/bin/sh\n")
+        stock.chmod(0o755)
+    proc = _check_system(
+        "Darwin",
+        {
+            "C64H_DEV_DIR": str(_fake_dev(tmp_path, {"bpf0": 0o606})),
+            "C64H_BUILD_VICE_ETH": str(fake),
+            "C64H_X64SC_PATH": str(stock),
+        },
+    )
+    rows = {r[0]: r[1:] for r in _rows(proc.stdout)}
+    return rows, _hints(proc.stdout)
+
+
+@pytest.mark.parametrize(("check_rc", "status"), [(0, "ok"), (1, "warn"), (2, "missing"), (5, "unknown")])
+def test_patched_vice_row_follows_build_check(tmp_path, check_rc, status):
+    rows, _hints_ = _vice_eth_rows(tmp_path, check_rc)
+    assert rows["patched VICE (ethernet without root)"][0] == status
+
+
+def test_stale_patched_vice_hints_a_rebuild(tmp_path):
+    _rows_, hints = _vice_eth_rows(tmp_path, 1)
+    assert any("scripts/build-vice-eth.sh" in h and "Rebuild" in h for h in hints), hints
+
+
+@pytest.mark.parametrize("check_rc", [0, 1])
+def test_a_patched_build_makes_the_x64sc_rule_unnecessary(tmp_path, check_rc):
+    rows, hints = _vice_eth_rows(tmp_path, check_rc)
+    status, detail, _crit = rows["NOPASSWD sudo for x64sc"]
+    assert status == "ok"
+    assert "not needed" in detail
+    assert not any("NOPASSWD rule for" in h for h in hints), hints
+
+
+def test_without_a_patched_build_the_x64sc_rule_is_required(tmp_path):
+    rows, hints = _vice_eth_rows(tmp_path, 2)
+    assert rows["NOPASSWD sudo for x64sc"][0] == "warn"
+    assert any("build-vice-eth.sh" in h and "NOPASSWD rule for" in h for h in hints), hints
+
+
+def test_no_x64sc_and_no_patched_build_has_no_sudo_row(tmp_path):
+    rows, _hints_ = _vice_eth_rows(tmp_path, 2, x64sc=False)
+    assert "NOPASSWD sudo for x64sc" not in rows

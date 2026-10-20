@@ -180,21 +180,25 @@ Prerequisites:
   `ViceEthernetBinaryError` for a binary without rawnet or without the
   requested driver. Leave `$VICE_ETHERNET_BIN` unset; it is an override,
   not a requirement.
-* Root privileges for the setup/teardown `ifconfig` calls **and for VICE
-  itself**. VICE registers its pcap driver only when
+* Root privileges for the setup/teardown `ifconfig` calls.
+* For VICE itself, one of two routes. **The patched build** from
+  `scripts/build-vice-eth.sh` (Homebrew's vice plus
+  `vice/rawnet-bpf-permissions.patch`; see docs/development.md § "VICE
+  ethernet without root") enables pcap when this user can open a
+  `/dev/bpf*` node read-write, so it runs as you, and the harness prefers
+  it. **Stock VICE** registers its pcap driver only when
   `archdep_rawnet_capability()` holds — `geteuid() == 0` on macOS — so an
-  unelevated ethernet launch has no driver at all and SIGSEGVs on reset.
-  The harness refuses such a launch rather than crashing; see trap 2
-  below.
-* A NOPASSWD sudoers rule naming the exact x64sc path, for unattended
-  runs (`/opt/homebrew/bin/x64sc` — the literal path, not its Cellar
-  symlink target). Being *permitted* to sudo is not enough: a launch that
-  stops at a password prompt is a failed launch.
-* `/dev/bpf*` permissions are **not** a prerequisite for VICE — running
-  as root is what makes its capture work. They **are** the prerequisite
-  for the harness's own unelevated host-side capture
-  (`c64_test_harness.capture`, the TX/RX tests) — see "Host-side capture"
-  below.
+  unelevated ethernet launch has no driver at all and SIGSEGVs on reset;
+  it needs a NOPASSWD sudoers rule naming the exact x64sc path
+  (`/opt/homebrew/bin/x64sc` — the literal path, not its Cellar symlink
+  target). Being *permitted* to sudo is not enough: a launch that stops at
+  a password prompt is a failed launch. The harness refuses a launch that
+  has neither rather than crashing; see trap 2 below.
+* `/dev/bpf*` permissions are **not** a prerequisite for stock VICE —
+  running as root is what makes its capture work. They **are** the
+  prerequisite for the patched build, and for the harness's own
+  unelevated host-side capture (`c64_test_harness.capture`, the TX/RX
+  tests) — see "Host-side capture" below.
 
 Notes:
 
@@ -350,9 +354,11 @@ The Linux reference (`tests/test_cleanup_vice_ports_live.py`) uses the
 `bash` wrapper, which only works under a permissive sudoers; do not copy
 that helper onto macOS.
 
-**2. `ViceConfig.ethernet=True` needs root on macOS, and `/dev/bpf*` has
-nothing to do with it.**
-VICE admits an ethernet driver only when `archdep_rawnet_capability()`
+**2. `ViceConfig.ethernet=True` needs root on macOS with stock VICE, and
+`/dev/bpf*` has nothing to do with it.** (The patched build from
+`scripts/build-vice-eth.sh` is the exception: it adds a `/dev/bpf*` check
+and runs as you. What follows is stock VICE.)
+Stock VICE admits an ethernet driver only when `archdep_rawnet_capability()`
 holds. That function is, in full: `geteuid() == 0`, plus a Linux-only
 `CAP_NET_RAW` branch (VICE `src/arch/shared/archdep_rawnet_capability.c`).
 It never inspects `/dev/bpf*`. The result gates *driver selection* in
@@ -364,8 +370,8 @@ live: with `/dev/bpf0` at `crw----rw-` and uid 501, `-ethernetiodriver
 pcap` is still rejected. (Upstream bug record:
 [vice_upstream_bugs.md](vice_upstream_bugs.md).)
 
-So every macOS pcap ethernet launch elevates, and the harness refuses to
-launch one it cannot elevate: `plan_vice_launch()` (in
+So every macOS pcap ethernet launch of a stock binary elevates, and the
+harness refuses to launch one it cannot elevate: `plan_vice_launch()` (in
 `c64_test_harness.backends.vice_elevation`) parses the `NOPASSWD:` rules
 out of plain `sudo -n -l` (`sudo_can_run` → `parse_sudo_listing`; a
 per-command `sudo -n -l -- <x64sc>` probe exits 0 for anything a

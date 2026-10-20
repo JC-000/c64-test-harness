@@ -1,0 +1,63 @@
+--- a/src/arch/shared/archdep_rawnet_capability.c
++++ b/src/arch/shared/archdep_rawnet_capability.c
+@@ -36,6 +36,10 @@
+ #ifdef UNIX_COMPILE
+ # include <unistd.h>
+ # include <sys/types.h>
++# ifdef __APPLE__
++#  include <errno.h>
++#  include <fcntl.h>
++# endif
+ # ifdef HAVE_CAPABILITIES
+ #  include <sys/capability.h>
+ # endif
+@@ -91,6 +95,31 @@
+     if (geteuid() == 0) {
+         return true;
+     }
++#  ifdef __APPLE__
++    /* macOS has no POSIX capabilities: libpcap access is granted by the
++       permissions on the /dev/bpf* character devices (for example by
++       Wireshark's ChmodBPF, which makes them group access_bpf 0660), so
++       probe those instead of insisting on root.  A node that exists but is
++       busy or denied does not end the search; a missing node does. */
++    {
++        char devname[32];
++        int i;
++
++        for (i = 0; i < 256; i++) {
++            int fd;
++
++            snprintf(devname, sizeof devname, "/dev/bpf%d", i);
++            fd = open(devname, O_RDWR);
++            if (fd >= 0) {
++                close(fd);
++                return true;
++            }
++            if (errno == ENOENT) {
++                break;
++            }
++        }
++    }
++#  endif
+ #  ifdef HAVE_CAPABILITIES
+     /* check if the CAP_NET_RAW capability is supported */
+     if (CAP_IS_SUPPORTED(CAP_NET_RAW)) {
+--- a/src/vicefeatures.c
++++ b/src/vicefeatures.c
+@@ -322,6 +322,15 @@
+         1 },
+ #endif
+ 
++#if defined(__APPLE__) /* (macOS) */
++    { "RAWNET_BPF_PERMISSIONS", "Raw ethernet without root when a /dev/bpf* device is read-write.",
++# if defined(HAVE_PCAP) && defined(UNIX_COMPILE)
++        1 },
++# else
++        0 },
++# endif
++#endif
++
+ #if defined(UNIX_COMPILE) /* (unix) */
+     { "HAVE_LIBNET", "Use the libnet library.",
+ #ifndef HAVE_LIBNET

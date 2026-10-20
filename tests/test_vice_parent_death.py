@@ -18,6 +18,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import shutil
 import select
 import signal
 import subprocess
@@ -762,7 +763,9 @@ print(p.pid, p.config.executable or "", flush=True)
 
 
 @pytest.mark.vice_live
-@pytest.mark.elevation("vice_root")
+# run_as_root without the ethernet cart launches the PATH x64sc, so that is
+# the path the NOPASSWD rule must name (not the patched ethernet build).
+@pytest.mark.elevation("vice_root", binary=shutil.which("x64sc") or "x64sc", require_sudo=True)
 def test_root_x64sc_under_sudo_dies_with_a_sigkilled_launcher():
     """The sudo-wrapped launch: the watchdog can signal only the sudo
     wrapper (this process's child), and relies on sudo relaying SIGTERM

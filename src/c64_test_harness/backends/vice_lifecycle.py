@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 from c64_test_harness.backends.vice_elevation import (
     ViceElevationRequiredError,
     effective_driver_name,
+    patched_vice_binary,
     vice_features,
     ViceEthernetBinaryError,
     ViceEthernetError,
@@ -416,7 +417,9 @@ def ethernet_vice_binary() -> str:
     links libpcap, so ethernet work needs no separately-built companion.
     (It was long cited as an ethernet-less build, issue #144; that was a
     misreading of the crash an *unelevated* launch produces -- see
-    ``vice_elevation``.)
+    ``vice_elevation``.)  On macOS that binary needs root for ethernet;
+    when ``scripts/build-vice-eth.sh`` has built the patched ``vice-eth``,
+    :func:`resolve_vice_executable` prefers it without this being set.
 
     Set it only for a bench that must launch a different binary.
     :func:`resolve_vice_executable` probes whichever binary it resolves
@@ -441,6 +444,9 @@ def resolve_vice_executable(cfg: ViceConfig) -> str:
     Prefers :attr:`ViceConfig.ethernet_executable` when the ethernet cart
     is in play, so a bench can keep a stock ``x64sc`` on ``PATH`` for
     ordinary tests and an ethernet-enabled build for the bridge suite.
+    With neither that nor a non-default :attr:`ViceConfig.executable`
+    set, a macOS host with ``scripts/build-vice-eth.sh``'s patched build
+    uses it, since that build runs ethernet without root.
 
     With ``cfg.ethernet`` set, the chosen binary is *checked* for
     raw-network support and a build without it raises
@@ -452,12 +458,16 @@ def resolve_vice_executable(cfg: ViceConfig) -> str:
     if not cfg.ethernet:
         return cfg.executable
 
-    candidate = cfg.ethernet_executable or cfg.executable
-    source = (
-        f"ViceConfig.ethernet_executable / ${ETHERNET_VICE_BIN_ENV}"
-        if cfg.ethernet_executable
-        else "ViceConfig.executable"
-    )
+    patched = None
+    if not cfg.ethernet_executable and cfg.executable == ViceConfig.executable:
+        patched = patched_vice_binary()
+    candidate = cfg.ethernet_executable or patched or cfg.executable
+    if cfg.ethernet_executable:
+        source = f"ViceConfig.ethernet_executable / ${ETHERNET_VICE_BIN_ENV}"
+    elif patched:
+        source = "the patched vice-eth build (scripts/build-vice-eth.sh)"
+    else:
+        source = "ViceConfig.executable"
     resolved = shutil.which(candidate)
     if resolved is None and os.path.isfile(candidate):
         resolved = candidate

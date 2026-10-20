@@ -577,24 +577,44 @@ check_system() {
                 missing_nopasswd=1
             fi
         done
-        # On macOS VICE's pcap ethernet driver needs root, whatever the
-        # /dev/bpf* permissions: VICE's own gate, archdep_rawnet_capability(),
-        # returns geteuid() == 0 there (the CAP_NET_RAW branch is Linux-only),
-        # and unelevated the driver is never selected. plan_vice_launch()
-        # (backends/vice_elevation.py) wraps the x64sc argv with `sudo -n`
-        # for an ethernet launch, so the ethernet tests need a NOPASSWD
-        # entry for /opt/homebrew/bin/x64sc in the same sudoers drop-in.
-        local x64sc_path="/opt/homebrew/bin/x64sc"
-        if [ -x "$x64sc_path" ]; then
+        # VICE's pcap ethernet driver.  Stock VICE enables it only for root
+        # (archdep_rawnet_capability() is geteuid() == 0 on macOS; the
+        # CAP_NET_RAW branch is Linux-only), so plan_vice_launch()
+        # (backends/vice_elevation.py) sudo-wraps the launch and needs a
+        # NOPASSWD rule for the exact x64sc path.  The patched build from
+        # scripts/build-vice-eth.sh accepts a read-write /dev/bpf* node
+        # instead and the harness prefers it, so with it built that rule is
+        # not needed.  --check is read-only (brew cat/list/--prefix and two
+        # `x64sc -features`).
+        local build_vice_eth="${C64H_BUILD_VICE_ETH:-$repo_root/scripts/build-vice-eth.sh}"
+        local eth_state="" eth_rc=0
+        if [ -x "$build_vice_eth" ]; then
+            eth_state="$("$build_vice_eth" --check 2>&1)" || eth_rc=$?
+            eth_state="$(printf '%s' "$eth_state" | sed 's/^build-vice-eth: //' | tr '\n' ' ' | sed 's/  */ /g; s/ $//')"
+        else
+            eth_rc=127
+            eth_state="$build_vice_eth missing"
+        fi
+        case "$eth_rc" in
+            0) record "$sec" "patched VICE (ethernet without root)" ok "$eth_state" 0 ;;
+            1) record "$sec" "patched VICE (ethernet without root)" warn "$eth_state" 0
+               add_hint "Rebuild the patched VICE so it matches Homebrew's vice again: scripts/build-vice-eth.sh (a stale build still runs, but lags the release)" ;;
+            2) record "$sec" "patched VICE (ethernet without root)" missing "not built: a stock x64sc needs root for ethernet (the x64sc NOPASSWD row)" 0 ;;
+            *) record "$sec" "patched VICE (ethernet without root)" unknown "$eth_state" 0 ;;
+        esac
+        local x64sc_path="${C64H_X64SC_PATH:-/opt/homebrew/bin/x64sc}"
+        if [ "$eth_rc" = "0" ] || [ "$eth_rc" = "1" ]; then
+            record "$sec" "NOPASSWD sudo for x64sc" ok "not needed: the patched vice-eth runs ethernet as you" 0
+        elif [ -x "$x64sc_path" ]; then
             if nopasswd_for "$x64sc_path"; then
                 record "$sec" "NOPASSWD sudo for x64sc" ok "NOPASSWD rule names $x64sc_path" 0
             else
-                record "$sec" "NOPASSWD sudo for x64sc" warn "no NOPASSWD rule names $x64sc_path (plan_vice_launch will refuse the ethernet launch; a (ALL) ALL rule does not count)" 0
-                missing_nopasswd=1
+                record "$sec" "NOPASSWD sudo for x64sc" warn "no NOPASSWD rule names $x64sc_path, and no patched VICE (plan_vice_launch will refuse the ethernet launch; a (ALL) ALL rule does not count)" 0
+                add_hint "VICE ethernet on macOS: build the patched VICE with scripts/build-vice-eth.sh (no sudo; it runs as you once /dev/bpf* is rw for you), or add a NOPASSWD rule for $x64sc_path (it is user-writable, so that rule is a route to root)"
             fi
         fi
         if [ "$missing_nopasswd" = "1" ]; then
-            add_hint "Add a sudoers drop-in so the bridge lifecycle scripts AND /opt/homebrew/bin/x64sc run non-interactively. See docs/development.md -> macOS -> Passwordless sudo for bridge lifecycle. Example: sudo visudo -f /etc/sudoers.d/c64-test-harness"
+            add_hint "Add a sudoers drop-in so the bridge lifecycle scripts run non-interactively. See docs/development.md -> macOS -> Passwordless sudo for bridge lifecycle. Example: sudo visudo -f /etc/sudoers.d/c64-test-harness"
         fi
     else
         if sudo -n true 2>/dev/null; then

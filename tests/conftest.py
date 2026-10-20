@@ -791,8 +791,12 @@ def elevation_is_required() -> bool:
 
 
 def _resolve_ethernet_binary() -> str:
+    """The x64sc an ethernet launch with a default ``ViceConfig`` would use."""
+    from c64_test_harness.backends.vice_elevation import patched_vice_binary
     from c64_test_harness.backends.vice_lifecycle import ethernet_vice_binary
-    return ethernet_vice_binary() or shutil.which("x64sc") or "x64sc"
+    return (
+        ethernet_vice_binary() or patched_vice_binary() or shutil.which("x64sc") or "x64sc"
+    )
 
 
 @lru_cache(maxsize=1)
@@ -829,8 +833,13 @@ def _canonical_repo_root() -> str | None:
     return None
 
 
-def _probe_vice_root(binary: str | None = None) -> tuple[bool, str]:
-    """(a): a NOPASSWD sudoers rule for the exact x64sc path.
+def _probe_vice_root(binary: str | None = None, require_sudo: bool = False) -> tuple[bool, str]:
+    """(a): an ethernet VICE launch can get raw-network capability.
+
+    Either the binary is the patched build and a ``/dev/bpf*`` node opens
+    read-write (no root at all), or a NOPASSWD sudoers rule names the exact
+    x64sc path.  *require_sudo* asks for the rule alone, for a test of the
+    sudo-wrapped launch itself.
 
     *binary* overrides the default resolved ethernet binary -- for a
     test that needs a specific bench binary (e.g. the Homebrew path on
@@ -839,14 +848,17 @@ def _probe_vice_root(binary: str | None = None) -> tuple[bool, str]:
     """
     from c64_test_harness.backends.vice_elevation import (
         _sudoers_entry,
+        _unprivileged_route,
         launch_path,
         rawnet_capability,
         sudo_authorisation,
         sudo_can_run,
     )
-    if rawnet_capability():
-        return True, ""
     resolved = launch_path(binary or _resolve_ethernet_binary())
+    if not require_sudo and rawnet_capability(
+        binary=resolved if os.path.exists(resolved) else None
+    ):
+        return True, ""
     # Existence-check BOTH paths (adversarial review N3): a missing
     # binary is not a sudo problem, and letting a missing default
     # resolution fall through to sudo_can_run() reported "'sudo -n' is
@@ -866,7 +878,8 @@ def _probe_vice_root(binary: str | None = None) -> tuple[bool, str]:
         return True, ""
     entry = _sudoers_entry(resolved)
     return False, (
-        f"'sudo -n' is not authorised for {resolved}. Add to sudoers "
+        ("" if require_sudo else _unprivileged_route(resolved))
+        + f"'sudo -n' is not authorised for {resolved}. Add to sudoers "
         f"(visudo; the rule must name this exact path and must not be "
         f"bash-wrapped):\n    {entry}"
     )

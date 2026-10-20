@@ -55,6 +55,7 @@ from conftest import connect_binary_transport
 
 from c64_test_harness.backends.vice_elevation import (
     ALLOW_UNELEVATED_ENV,
+    patched_vice_binary,
     sudo_authorisation,
     vice_features,
 )
@@ -115,9 +116,10 @@ def _prewarm_elevation_caches() -> None:
     (it unpacks ``communicate()``'s return).  Both are cached, so calling
     them here keeps the patch confined to the spawn under test.
     """
-    binary = shutil.which("x64sc")
-    if binary is not None:
-        vice_features(binary)
+    # The ethernet entry resolves to the patched build when one is installed.
+    for binary in (shutil.which("x64sc"), patched_vice_binary()):
+        if binary is not None:
+            vice_features(binary)
     sudo_authorisation()
 
 

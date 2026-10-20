@@ -821,24 +821,43 @@ def test_the_features_fixtures_match_the_real_output_shape():
     binary, the way ``test_vice_wire_format_live`` anchors the response
     frame.
     """
-    proc = subprocess.run(
-        ["/opt/homebrew/bin/x64sc", "-features"],
-        capture_output=True, text=True, timeout=60,
-    )
-    rows = {
-        parts[0]: parts[1]
-        for line in proc.stdout.splitlines()
-        if (parts := line.split()) and len(parts) >= 2
-    }
-    missing = sorted(set(ve._FEATURE_ROWS) - set(rows))
+    rows = _real_feature_rows("/opt/homebrew/bin/x64sc")
+    # Stock VICE has no RAWNET_BPF_PERMISSIONS row; only the patched build does.
+    expected = set(ve._FEATURE_ROWS) - {ve.BPF_PERMISSIONS_FEATURE}
+    missing = sorted(expected - set(rows))
     assert not missing, (
         f"the parser looks for {missing}, which real -features output does "
         f"not contain -- every fixture in this module is the wrong shape"
     )
-    assert set(rows[name] for name in ve._FEATURE_ROWS) <= {"yes", "no"}, (
+    assert set(rows[name] for name in expected) <= {"yes", "no"}, (
         "a feature value was neither 'yes' nor 'no'; the parser's "
         "`== \"yes\"` test would silently read it as False"
     )
+    assert ve.vice_features("/opt/homebrew/bin/x64sc").bpf_permissions is False
+
+
+def _real_feature_rows(binary: str) -> dict[str, str]:
+    proc = subprocess.run(
+        [binary, "-default", "-features"],
+        capture_output=True, text=True, timeout=60,
+    )
+    return {
+        parts[0]: parts[1]
+        for line in proc.stdout.splitlines()
+        if (parts := line.split()) and len(parts) >= 2
+    }
+
+
+def test_the_patched_build_reports_every_row_the_parser_reads():
+    """The marker row is only ever typed into fixtures; anchor it to the build."""
+    binary = ve.patched_vice_binary()
+    if binary is None:
+        pytest.skip("no patched vice-eth build here (scripts/build-vice-eth.sh)")
+    rows = _real_feature_rows(binary)
+    missing = sorted(set(ve._FEATURE_ROWS) - set(rows))
+    assert not missing, missing
+    assert rows[ve.BPF_PERMISSIONS_FEATURE] == "yes"
+    assert ve.vice_features(binary).bpf_permissions is True
 
 
 @requires_homebrew_x64sc
@@ -1046,3 +1065,190 @@ def test_b_a_later_test_must_not_see_test_as_stale_cache(monkeypatch):
     )
     result = ve.sudo_authorisation()
     assert result.allows("/opt/homebrew/bin/x64sc") is True
+
+
+# =====================================================================
+# The patched build (scripts/build-vice-eth.sh): RAWNET_BPF_PERMISSIONS
+# =====================================================================
+
+
+def _patched_features(monkeypatch, *, bpf_permissions: bool):
+    stub = lambda path: ve.ViceFeatures(
+        True, True, False, "-features", True, bpf_permissions=bpf_permissions
+    )
+    monkeypatch.setattr(ve, "vice_features", stub)
+    monkeypatch.setattr(vice_lifecycle, "vice_features", stub)
+
+
+def _bpf_dir(monkeypatch, tmp_path, modes: dict[str, int]):
+    """A fake /dev holding ``bpf<N>`` files with *modes* (this user owns them)."""
+    dev = tmp_path / "dev"
+    dev.mkdir()
+    for name, mode in modes.items():
+        node = dev / name
+        node.touch()
+        node.chmod(mode)
+    monkeypatch.setattr(ve, "_BPF_DEV_DIR", str(dev))
+    return dev
+
+
+def test_features_probe_reads_the_bpf_permissions_row(tmp_path, monkeypatch):
+    exe = _fake_x64sc(tmp_path, "x64sc", ethernet=True)
+    _fake_features(monkeypatch, _FEATURES_OUT + "RAWNET_BPF_PERMISSIONS    yes  Raw ethernet without root.\n")
+    assert ve.vice_features(exe).bpf_permissions is True
+
+
+def test_features_probe_reads_a_stock_build_as_needing_root(tmp_path, monkeypatch):
+    exe = _fake_x64sc(tmp_path, "x64sc", ethernet=True)
+    _fake_features(monkeypatch, _FEATURES_OUT)
+    assert ve.vice_features(exe).bpf_permissions is False
+
+
+def test_features_probe_reads_a_no_bpf_permissions_row(tmp_path, monkeypatch):
+    exe = _fake_x64sc(tmp_path, "x64sc", ethernet=True)
+    _fake_features(monkeypatch, _FEATURES_OUT + "RAWNET_BPF_PERMISSIONS    no   Raw ethernet without root.\n")
+    assert ve.vice_features(exe).bpf_permissions is False
+
+
+def test_bpf_walk_takes_a_node_after_a_denied_one(monkeypatch, tmp_path):
+    _bpf_dir(monkeypatch, tmp_path, {"bpf0": 0o000, "bpf1": 0o600})
+    assert ve.bpf_node_openable() is True
+
+
+def test_bpf_walk_stops_at_the_first_missing_node(monkeypatch, tmp_path):
+    """The patch's own rule: a gap ends the search, as on a real /dev."""
+    _bpf_dir(monkeypatch, tmp_path, {"bpf0": 0o000, "bpf2": 0o600})
+    assert ve.bpf_node_openable() is False
+
+
+def test_bpf_walk_needs_write_access(monkeypatch, tmp_path):
+    _bpf_dir(monkeypatch, tmp_path, {"bpf0": 0o400})
+    assert ve.bpf_node_openable() is False
+
+
+def test_patched_build_with_an_openable_node_has_capability(monkeypatch, tmp_path):
+    _as_uid(monkeypatch, 501)
+    monkeypatch.setattr(ve.sys, "platform", "darwin")
+    _patched_features(monkeypatch, bpf_permissions=True)
+    _bpf_dir(monkeypatch, tmp_path, {"bpf0": 0o600})
+    assert ve.rawnet_capability(binary="/opt/eth/x64sc") is True
+
+
+def test_patched_build_without_an_openable_node_has_none(monkeypatch, tmp_path):
+    _as_uid(monkeypatch, 501)
+    monkeypatch.setattr(ve.sys, "platform", "darwin")
+    _patched_features(monkeypatch, bpf_permissions=True)
+    _bpf_dir(monkeypatch, tmp_path, {"bpf0": 0o000})
+    assert ve.rawnet_capability(binary="/opt/eth/x64sc") is False
+
+
+def test_stock_build_with_an_openable_node_has_none(monkeypatch, tmp_path):
+    _as_uid(monkeypatch, 501)
+    monkeypatch.setattr(ve.sys, "platform", "darwin")
+    _patched_features(monkeypatch, bpf_permissions=False)
+    _bpf_dir(monkeypatch, tmp_path, {"bpf0": 0o600})
+    assert ve.rawnet_capability(binary="/opt/eth/x64sc") is False
+
+
+def test_bpf_permissions_count_only_on_macos(monkeypatch, tmp_path):
+    _as_uid(monkeypatch, 501)
+    monkeypatch.setattr(ve.sys, "platform", "linux")
+    monkeypatch.setattr(ve, "_has_cap_net_raw", lambda: False)
+    _patched_features(monkeypatch, bpf_permissions=True)
+    _bpf_dir(monkeypatch, tmp_path, {"bpf0": 0o600})
+    assert ve.rawnet_capability(binary="/opt/eth/x64sc") is False
+
+
+def test_plan_runs_the_patched_build_as_the_user(monkeypatch, tmp_path):
+    _as_uid(monkeypatch, 501)
+    monkeypatch.setattr(ve.sys, "platform", "darwin")
+    monkeypatch.setattr(ve, "sudo_can_run", lambda b: pytest.fail("needs no sudo"))
+    _patched_features(monkeypatch, bpf_permissions=True)
+    _bpf_dir(monkeypatch, tmp_path, {"bpf0": 0o600})
+    cfg = ViceConfig(ethernet=True, ethernet_driver="pcap")
+    plan = ve.plan_vice_launch(cfg, _eth_argv())
+    assert plan.argv == _eth_argv()
+    assert plan.sudo_wrapped is False
+    assert plan.elevated is False
+
+
+def test_refusal_for_a_stock_build_names_the_patched_build(monkeypatch, tmp_path):
+    _as_uid(monkeypatch, 501)
+    monkeypatch.setattr(ve.sys, "platform", "darwin")
+    _no_sudo(monkeypatch)
+    _patched_features(monkeypatch, bpf_permissions=False)
+    _bpf_dir(monkeypatch, tmp_path, {"bpf0": 0o600})
+    with pytest.raises(ve.ViceElevationRequiredError) as excinfo:
+        ve.plan_vice_launch(ViceConfig(ethernet=True, ethernet_driver="pcap"), _eth_argv())
+    msg = str(excinfo.value)
+    assert "scripts/build-vice-eth.sh" in msg
+    assert "NOPASSWD" in msg  # the root route is still offered
+
+
+def test_refusal_for_the_patched_build_names_the_bpf_remedy(monkeypatch, tmp_path):
+    _as_uid(monkeypatch, 501)
+    monkeypatch.setattr(ve.sys, "platform", "darwin")
+    _no_sudo(monkeypatch)
+    _patched_features(monkeypatch, bpf_permissions=True)
+    _bpf_dir(monkeypatch, tmp_path, {"bpf0": 0o000})
+    with pytest.raises(ve.ViceElevationRequiredError) as excinfo:
+        ve.plan_vice_launch(ViceConfig(ethernet=True, ethernet_driver="pcap"), _eth_argv())
+    msg = str(excinfo.value)
+    assert "access_bpf" in msg
+    assert "build-vice-eth.sh" not in msg
+
+
+def _patched_at(monkeypatch, tmp_path):
+    monkeypatch.setattr(ve.sys, "platform", "darwin")
+    monkeypatch.delenv("HOMEBREW_PREFIX", raising=False)
+    exe = _fake_x64sc(tmp_path, "vice-eth-x64sc", ethernet=True)
+    monkeypatch.setattr(ve, "PATCHED_VICE_CANDIDATES", ("/nonexistent/x64sc", exe))
+    return exe
+
+
+def test_patched_binary_is_found_where_the_build_installs_it(monkeypatch, tmp_path):
+    exe = _patched_at(monkeypatch, tmp_path)
+    assert ve.patched_vice_binary() == exe
+
+
+def test_patched_binary_follows_homebrew_prefix_first(monkeypatch, tmp_path):
+    _patched_at(monkeypatch, tmp_path)
+    prefix = tmp_path / "brew"
+    (prefix / "opt" / "vice-eth" / "bin").mkdir(parents=True)
+    exe = prefix / "opt" / "vice-eth" / "bin" / "x64sc"
+    exe.write_bytes(b"x")
+    exe.chmod(0o755)
+    monkeypatch.setenv("HOMEBREW_PREFIX", str(prefix))
+    assert ve.patched_vice_binary() == str(exe)
+
+
+def test_patched_binary_is_macos_only(monkeypatch, tmp_path):
+    _patched_at(monkeypatch, tmp_path)
+    monkeypatch.setattr(ve.sys, "platform", "linux")
+    assert ve.patched_vice_binary() is None
+
+
+def test_resolver_prefers_the_patched_build_by_default(monkeypatch, tmp_path):
+    exe = _patched_at(monkeypatch, tmp_path)
+    cfg = ViceConfig(ethernet=True, ethernet_executable="")
+    assert vice_lifecycle.resolve_vice_executable(cfg) == exe
+
+
+def test_resolver_keeps_an_explicit_ethernet_build_over_the_patched_one(monkeypatch, tmp_path):
+    _patched_at(monkeypatch, tmp_path)
+    eth_exe = _fake_x64sc(tmp_path, "x64sc-eth", ethernet=True)
+    cfg = ViceConfig(ethernet=True, ethernet_executable=eth_exe)
+    assert vice_lifecycle.resolve_vice_executable(cfg) == eth_exe
+
+
+def test_resolver_keeps_an_explicit_executable_over_the_patched_one(monkeypatch, tmp_path):
+    _patched_at(monkeypatch, tmp_path)
+    exe = _fake_x64sc(tmp_path, "x64sc-custom", ethernet=True)
+    cfg = ViceConfig(executable=exe, ethernet=True, ethernet_executable="")
+    assert vice_lifecycle.resolve_vice_executable(cfg) == exe
+
+
+def test_resolver_ignores_the_patched_build_without_ethernet(monkeypatch, tmp_path):
+    _patched_at(monkeypatch, tmp_path)
+    cfg = ViceConfig(ethernet=False, ethernet_executable="")
+    assert vice_lifecycle.resolve_vice_executable(cfg) == "x64sc"
