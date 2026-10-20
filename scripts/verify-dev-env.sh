@@ -127,7 +127,10 @@ have_cmd() { command -v "$1" >/dev/null 2>&1; }
 # `NOPASSWD:` and the command (`NOPASSWD: SETENV: /x`) and are skipped; a
 # later `PASSWD:` tag reinstates the prompt and voids the entry.  Entries
 # with pinned arguments (`NOPASSWD: /opt/homebrew/bin/brew reinstall --HEAD
-# vice`) authorise that one command line and are deliberately not counted.
+# vice`) authorise that one command line and are deliberately not counted,
+# except the empty one (`/path ""`, no arguments at all), which counts when
+# the caller passes `noargs` (the bridge helpers run bare).  A digest pin
+# (`sha256:<hex> /path`) ahead of the command is skipped.
 # tests/test_verify_dev_env_sudo_probe.py holds this function to the Python
 # parser's verdict on every one of those shapes.
 SUDO_LISTING=""
@@ -138,10 +141,11 @@ load_sudo_listing() {
         SUDO_LISTING_LOADED=1
     fi
 }
-# nopasswd_for <abs-path>: exit 0 if this user may run <abs-path> as root
-# without a password, per the NOPASSWD rules in `sudo -n -l`; 1 otherwise.
+# nopasswd_for <abs-path> [noargs]: exit 0 if this user may run <abs-path>
+# as root without a password, per the NOPASSWD rules in `sudo -n -l`; 1
+# otherwise.  `noargs` asks about a run with no arguments.
 nopasswd_for() {
-    local target="$1" line rest entry cmd
+    local target="$1" mode="${2:-}" line rest entry cmd
     local -a entries words
     local i n nargs reprompt
     load_sudo_listing
@@ -165,6 +169,9 @@ nopasswd_for() {
                 esac
                 i=$((i + 1))
             done
+            case "${words[$i]:-}" in              # Digest_Spec before the command
+                sha224:?*|sha256:?*|sha384:?*|sha512:?*) i=$((i + 1)) ;;
+            esac
             [ "$i" -ge "$n" ] && continue        # tags only, no command
             [ "$reprompt" = "1" ] && continue    # would prompt after all
             cmd="${words[$i]}"
@@ -178,6 +185,9 @@ nopasswd_for() {
                     return 0
                 fi
                 if [ "$nargs" -eq 1 ] && [ "${words[$((i + 1))]}" = "*" ]; then
+                    return 0
+                fi
+                if [ "$mode" = "noargs" ] && [ "$nargs" -eq 1 ] && [ "${words[$((i + 1))]}" = '""' ]; then
                     return 0
                 fi
             fi
@@ -555,15 +565,28 @@ check_system() {
         # CI. We check for a NOPASSWD sudoers entry per script rather than a
         # bare `sudo -n true`: the latter just reports a cached credential
         # window, which does not persist long enough for a test session.
+        # The copy looked for is the one the harness runs
+        # (tests/bridge_platform.py resolve_bridge_helper, #541): root-owned
+        # copies in /usr/local/libexec/c64-harness first, then this
+        # checkout's; $C64_BRIDGE_HELPER_DIR replaces both.  They run with
+        # no arguments, so a rule pinned to "" counts.
         local repo_root
-        repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+        repo_root="${C64H_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+        local libexec="${C64H_BRIDGE_LIBEXEC:-/usr/local/libexec/c64-harness}"
         local missing_nopasswd=0
-        local script
+        local script cand first authorised
+        local -a cands
         for script in setup-bridge-feth-macos.sh \
                       teardown-bridge-feth-macos.sh \
                       cleanup-bridge-feth-macos.sh; do
-            local path="$repo_root/scripts/$script"
-            if [ ! -x "$path" ]; then
+            if [ -n "${C64_BRIDGE_HELPER_DIR:-}" ]; then
+                cands=("$C64_BRIDGE_HELPER_DIR/$script")
+            else
+                cands=()
+                [ -f "$libexec/$script" ] && cands+=("$libexec/$script")
+                [ -x "$repo_root/scripts/$script" ] && cands+=("$repo_root/scripts/$script")
+            fi
+            if [ "${#cands[@]}" -eq 0 ]; then
                 # Missing script file is a separate concern (Bridge section
                 # reports it); skip here so we don't double-fail.
                 continue
@@ -572,10 +595,18 @@ check_system() {
             # above).  The per-command `sudo -n -l <cmd>` form this replaced
             # exits 0 for anything a `(ALL) ALL` user may run at all, so it
             # reported "passwordless" on hosts where every launch prompts.
-            if nopasswd_for "$path"; then
-                record "$sec" "NOPASSWD sudo for $script" ok "passwordless sudo configured" 0
+            first="${cands[0]}"
+            authorised=""
+            for cand in "${cands[@]}"; do
+                if nopasswd_for "$cand" noargs; then
+                    authorised="$cand"
+                    break
+                fi
+            done
+            if [ -n "$authorised" ]; then
+                record "$sec" "NOPASSWD sudo for $script" ok "passwordless sudo configured for $authorised" 0
             else
-                record "$sec" "NOPASSWD sudo for $script" warn "no NOPASSWD entry (bridge setup will prompt for a password)" 0
+                record "$sec" "NOPASSWD sudo for $script" warn "no NOPASSWD entry for $first (bridge setup will prompt for a password)" 0
                 missing_nopasswd=1
             fi
         done
@@ -616,7 +647,7 @@ check_system() {
             fi
         fi
         if [ "$missing_nopasswd" = "1" ]; then
-            add_hint "Add a sudoers drop-in so the bridge lifecycle scripts run non-interactively. See docs/development.md -> macOS -> Passwordless sudo for bridge lifecycle. Example: sudo visudo -f /etc/sudoers.d/c64-test-harness"
+            add_hint "Add a sudoers drop-in so the bridge lifecycle scripts run non-interactively, naming the paths in the rows above (preferably root-owned copies in $libexec, since a rule on this checkout's user-writable scripts is a route to root). See docs/development.md -> macOS -> Passwordless sudo for bridge lifecycle. Example: sudo visudo -f /etc/sudoers.d/c64-test-harness"
         fi
     else
         if sudo -n true 2>/dev/null; then

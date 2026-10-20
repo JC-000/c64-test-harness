@@ -905,23 +905,28 @@ _BRIDGE_SCRIPT_SETS = {
 def _probe_bridge_scripts(scripts: tuple[str, ...] | None = None) -> tuple[bool, str]:
     """(b): NOPASSWD rules for the bridge lifecycle scripts.
 
-    Probed at their canonical repo path -- never a worktree's -- because
-    that is the only path a NOPASSWD rule can be written against (see
-    CLAUDE.md "Permission notes for agents").
+    Each script is looked for where ``bridge_platform.resolve_bridge_helper``
+    looks: root-owned copies in ``/usr/local/libexec/c64-harness`` first,
+    then the canonical repo checkout -- never a worktree's, which no
+    NOPASSWD rule can be written against (CLAUDE.md "Permission notes for
+    agents").  ``$C64_BRIDGE_HELPER_DIR`` replaces both.
     """
-    from c64_test_harness.backends.vice_elevation import _sudoers_entry, sudo_can_run
+    from c64_test_harness.backends.vice_elevation import _sudoers_entry
+    import bridge_platform as bp
     names = scripts or _BRIDGE_SCRIPT_SETS.get(sys.platform, _BRIDGE_SCRIPT_SETS["linux"])
     root = _canonical_repo_root()
-    if root is None:
+    resolved = [bp.resolve_bridge_helper(name, root) for name in names]
+    if any(path is None for path, _ok in resolved):
         return False, (
             "cannot locate the canonical checkout (not a git clone?): "
             "'git worktree list --porcelain' failed or returned no "
             "worktree row, and the sudoers path for these scripts can "
             "only be resolved from a real git checkout -- run the tests "
-            "from a git clone, not an exported copy"
+            "from a git clone, not an exported copy, or install the "
+            f"helpers in {bp.BRIDGE_HELPER_LIBEXEC} (or name their "
+            f"directory in ${bp.BRIDGE_HELPER_DIR_ENV})"
         )
-    paths = [os.path.join(root, "scripts", name) for name in names]
-    missing = [p for p in paths if not sudo_can_run(p)]
+    missing = [path for path, ok in resolved if not ok]
     if not missing:
         return True, ""
     lines = "\n".join(f"    {_sudoers_entry(p)}" for p in missing)

@@ -83,7 +83,15 @@ Steps 6-8 are needed only for the ethernet/bridge tests.
 
 8. **Passwordless sudo for bridge lifecycle, and VICE ethernet without it.** On macOS the bridge lifecycle needs root and is driven non-interactively by the harness, so it needs NOPASSWD sudoers entries. VICE's ethernet does not need root if you build the patched VICE ([below](#vice-ethernet-without-root-the-patched-build)); with stock VICE it does:
 
-   - **Bridge lifecycle.** Setup, teardown, and cleanup of `bridge10` + `feth0`/`feth1` all require root (`ifconfig create`, `addm`, `up`, `inet` assignment). The harness invokes these three scripts from tests.
+   - **Bridge lifecycle.** Setup, teardown, and cleanup of `bridge10` + `feth0`/`feth1` all require root (`ifconfig create`, `addm`, `up`, `inet` assignment). The harness invokes these three scripts from tests. **Prefer root-owned copies** in `/usr/local/libexec/c64-harness/` (`root:wheel 0755`, hardened to take no arguments), named in sudoers with their digest and an empty argument list, as this bench does since 2026-10-20:
+
+     ```
+     YOURUSER ALL=(root) NOPASSWD: sha256:<hex> /usr/local/libexec/c64-harness/setup-bridge-feth-macos.sh "", \
+                                   sha256:<hex> /usr/local/libexec/c64-harness/teardown-bridge-feth-macos.sh "", \
+                                   sha256:<hex> /usr/local/libexec/c64-harness/cleanup-bridge-feth-macos.sh ""
+     ```
+
+     The harness looks there first, then at the canonical checkout's `scripts/`, and runs whichever copy a NOPASSWD rule covers (`bridge_platform.resolve_bridge_helper`; the `bridge_scripts` probe, the live cleanup test and `verify-dev-env.sh` all use it). `C64_BRIDGE_HELPER_DIR=<dir>` names the directory outright instead. The `sha256:` digest makes sudo refuse a copy that has changed, so re-install the rule whenever you update the copies. The hardened cleanup does not delete `/tmp/vice_eth_*.rc`: `ViceProcess.stop()` deletes its own rc file, which it writes under `$TMPDIR`.
    - **`x64sc` itself, with stock VICE only.** Stock VICE enables its `pcap` driver only as root (see "Caveats" below). For a stock binary `ViceProcess.start()` wraps the argv with `sudo -n`, so the ethernet tests need `/opt/homebrew/bin/x64sc` to run without a password prompt, and the launch is refused up front with `ViceElevationRequiredError` (carrying the exact sudoers line) otherwise. That binary is user-writable, so the rule is a route to root. **Prefer the patched build**, which needs no rule: with it, drop the `x64sc` line from the drop-in below.
 
    Install a sudoers drop-in so it doesn't conflict with the main `/etc/sudoers`:
@@ -92,7 +100,7 @@ Steps 6-8 are needed only for the ethernet/bridge tests.
    sudo visudo -f /etc/sudoers.d/c64-test-harness
    ```
 
-   Paste the following, substituting your username for `YOURUSER` and your repo path for `/path/to/c64-test-harness`. The scripts must be named at the canonical checkout's path, because sudoers matches the literal path, so a worktree's copy is not covered.
+   Without root-owned copies, paste the following, substituting your username for `YOURUSER` and your repo path for `/path/to/c64-test-harness`. The scripts must be named at the canonical checkout's path, because sudoers matches the literal path, so a worktree's copy is not covered.
 
    ```
    # c64-test-harness -- passwordless sudo for bridge networking lifecycle
@@ -114,7 +122,7 @@ Steps 6-8 are needed only for the ethernet/bridge tests.
                                  /opt/homebrew/bin/x64sc
    ```
 
-   `visudo -f` syntax-checks the file before writing, so a typo won't lock you out. Invoke the scripts directly (`sudo -n ./scripts/…`), never as `sudo bash <script>`: NOPASSWD matches the program sudo runs, and `bash` is not in the list. `scripts/verify-dev-env.sh` parses the `NOPASSWD:` rules out of `sudo -n -l` and reports a `warn` row for each of the three bridge scripts and `/opt/homebrew/bin/x64sc` that no rule names. A blanket `(ALL) ALL` does not count, because it still prompts.
+   `visudo -f` syntax-checks the file before writing, so a typo won't lock you out. Invoke the scripts directly (`sudo -n ./scripts/…`), never as `sudo bash <script>`: NOPASSWD matches the program sudo runs, and `bash` is not in the list. `scripts/verify-dev-env.sh` parses the `NOPASSWD:` rules out of `sudo -n -l` and reports a `warn` row for each of the three bridge scripts (naming the copy it looked for) and `/opt/homebrew/bin/x64sc` that no rule names. A blanket `(ALL) ALL` does not count, because it still prompts.
 
 **The one-shot installer on macOS.** `scripts/setup-dev-env.sh` has had a Darwin branch since 2026-04-19:
 
@@ -217,7 +225,7 @@ The steps above build a harness. Moving to a new Mac takes more than that: some 
    - ChmodBPF;
    - a BPF-patched VICE that runs unprivileged.
 
-   The patched VICE is supported: run `./scripts/build-vice-eth.sh` ([VICE ethernet without root](#vice-ethernet-without-root-the-patched-build)) and VICE ethernet needs no sudo. The bridge scripts are not yet: the harness still names the repo's copies, so without a drop-in for them the bridge tests skip with an `ELEVATION REQUIRED` notice, and nothing else is affected. That follow-up is tracked in [#541](https://github.com/JC-000/c64-test-harness/issues/541).
+   All three are supported. Run `./scripts/build-vice-eth.sh` ([VICE ethernet without root](#vice-ethernet-without-root-the-patched-build)) and VICE ethernet needs no sudo. Install the root-owned bridge copies with digest-pinned, argument-free rules (step 8, "Bridge lifecycle") and the harness uses them in preference to the repo's. Without any rule the bridge tests skip with an `ELEVATION REQUIRED` notice, and nothing else is affected.
 
 6. **Mind the editable installs of other projects.** Other projects install this checkout editable into their own venvs; on 2026-10-20 the 1541ultimate lane did. Every source change, and every branch switch in the main checkout, then reaches their next run at once. Keep the main checkout on `master` while they work, and do branch work in a worktree with `PYTHONPATH=<worktree>/src`.
 

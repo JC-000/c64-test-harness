@@ -1369,3 +1369,62 @@ def test_refusal_for_a_chosen_stock_binary_names_the_setting_not_bpf(monkeypatch
     assert "would run ethernet as you" in msg
     assert "VICE_ETHERNET_BIN" in msg
     assert "access_bpf" not in msg
+
+
+# ---------------------------------------------------------------------------
+# Digest-pinned, argument-free rules (#541): the new bench's sudoers name
+# root-owned copies of the bridge helpers in /usr/local/libexec/c64-harness,
+# each pinned to a sha256 digest and to an empty argument list ("").
+# ---------------------------------------------------------------------------
+
+_LIBEXEC = "/usr/local/libexec/c64-harness"
+
+#: Real ``sudo -n -l`` output from the 2026-10-20 bench, trimmed to the
+#: rules (digests shortened).  ``sha256:<hex>`` precedes the command and
+#: ``""`` after it means "only with no arguments".
+_DIGEST_LISTING = f"""\
+User someone may run the following commands on Ebullient-Prism-686:
+    (ALL) ALL
+    (root) NOPASSWD: sha256:04eaced3f51cdda9 {_LIBEXEC}/setup-bridge-feth-macos.sh "", \
+sha256:1a25b7e9bbf99fee {_LIBEXEC}/teardown-bridge-feth-macos.sh "", \
+sha256:947412f3a0ab87a5 {_LIBEXEC}/cleanup-bridge-feth-macos.sh ""
+"""
+
+
+def test_a_digest_pinned_no_argument_rule_authorises_an_argument_free_run(monkeypatch):
+    """The digest is not the command, and ``""`` admits exactly the run the
+    bridge helpers get: no arguments.  Both shapes used to drop the entry,
+    so every bridge test skipped with ELEVATION REQUIRED on this bench."""
+    _sudo_listing(monkeypatch, _DIGEST_LISTING)
+    for name in ("setup", "teardown", "cleanup"):
+        path = f"{_LIBEXEC}/{name}-bridge-feth-macos.sh"
+        assert ve.sudo_can_run(path, no_args=True) is True, path
+
+
+def test_a_no_argument_rule_does_not_authorise_a_run_with_arguments(monkeypatch):
+    """An x64sc launch always carries arguments; ``""`` would refuse it."""
+    _sudo_listing(
+        monkeypatch,
+        "User x may run the following commands:\n"
+        '    (root) NOPASSWD: /opt/homebrew/bin/x64sc ""\n',
+    )
+    assert ve.sudo_can_run("/opt/homebrew/bin/x64sc") is False
+    assert ve.sudo_can_run("/opt/homebrew/bin/x64sc", no_args=True) is True
+
+
+def test_a_digest_pinned_open_rule_authorises_the_binary(monkeypatch):
+    _sudo_listing(
+        monkeypatch,
+        "User x may run the following commands:\n"
+        "    (root) NOPASSWD: SETENV: sha512:abcdef0123 /opt/homebrew/bin/x64sc\n",
+    )
+    assert ve.sudo_can_run("/opt/homebrew/bin/x64sc") is True
+
+
+def test_a_pinned_argument_rule_does_not_become_argument_free(monkeypatch):
+    _sudo_listing(
+        monkeypatch,
+        "User x may run the following commands:\n"
+        "    (root) NOPASSWD: /opt/homebrew/bin/brew reinstall --HEAD vice\n",
+    )
+    assert ve.sudo_can_run("/opt/homebrew/bin/brew", no_args=True) is False

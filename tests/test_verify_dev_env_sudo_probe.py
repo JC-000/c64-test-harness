@@ -38,14 +38,14 @@ def _probe_block() -> str:
     return text[start:end]
 
 
-def shell_nopasswd_for(listing: str, path: str) -> bool:
+def shell_nopasswd_for(listing: str, path: str, no_args: bool = False) -> bool:
     """What the script's ``nopasswd_for`` says for *path* given *listing*."""
     program = (
         "set -u\n"
         + _probe_block()
         + f"\nSUDO_LISTING={shlex.quote(listing)}\n"
         + "SUDO_LISTING_LOADED=1\n"
-        + f"nopasswd_for {shlex.quote(path)}\n"
+        + f"nopasswd_for {shlex.quote(path)}{' noargs' if no_args else ''}\n"
     )
     proc = subprocess.run(
         ["bash", "-c", program],
@@ -60,8 +60,8 @@ def shell_nopasswd_for(listing: str, path: str) -> bool:
     return proc.returncode == 0
 
 
-def python_nopasswd_for(listing: str, path: str) -> bool:
-    return ve.parse_sudo_listing(listing).allows(path)
+def python_nopasswd_for(listing: str, path: str, no_args: bool = False) -> bool:
+    return ve.parse_sudo_listing(listing).allows(path, no_args=no_args)
 
 
 _HEADER = "User someone may run the following commands on host:\n    (ALL) ALL\n"
@@ -88,13 +88,38 @@ LISTINGS = [
 ]
 
 
+LIBEXEC_SETUP = "/usr/local/libexec/c64-harness/setup-bridge-feth-macos.sh"
+
+LISTINGS += [
+    pytest.param(
+        f'{_HEADER}    (root) NOPASSWD: sha256:04eaced3 {LIBEXEC_SETUP} "", '
+        f'sha256:1a25b7e9 {SETUP} ""\n',
+        LIBEXEC_SETUP,
+        id="digest-no-args",
+    ),
+    pytest.param(
+        f"{_HEADER}    (root) NOPASSWD: SETENV: sha512:abcdef {X64SC}\n", X64SC, id="digest-open"
+    ),
+    pytest.param(f'{_HEADER}    (root) NOPASSWD: {X64SC} ""\n', X64SC, id="no-args-only"),
+]
+
+
+@pytest.mark.parametrize("no_args", [False, True], ids=["with-args", "no-args"])
 @pytest.mark.parametrize("listing, path", LISTINGS)
-def test_shell_probe_agrees_with_parse_sudo_listing(listing, path):
-    expected = python_nopasswd_for(listing, path)
-    assert shell_nopasswd_for(listing, path) is expected, (
-        f"nopasswd_for {path!r} disagrees with parse_sudo_listing "
-        f"(python says {expected}) for listing:\n{listing}"
+def test_shell_probe_agrees_with_parse_sudo_listing(listing, path, no_args):
+    expected = python_nopasswd_for(listing, path, no_args)
+    assert shell_nopasswd_for(listing, path, no_args) is expected, (
+        f"nopasswd_for {path!r} (no_args={no_args}) disagrees with "
+        f"parse_sudo_listing (python says {expected}) for listing:\n{listing}"
     )
+
+
+def test_the_bench_listing_authorises_the_libexec_helpers_bare():
+    """Oracle check, so agreement cannot be two parsers both saying no."""
+    listing = LISTINGS[-3].values[0]
+    assert python_nopasswd_for(listing, LIBEXEC_SETUP, no_args=True) is True
+    assert shell_nopasswd_for(listing, LIBEXEC_SETUP, no_args=True) is True
+    assert shell_nopasswd_for(listing, LIBEXEC_SETUP) is False
 
 
 def test_the_probe_block_is_extractable():

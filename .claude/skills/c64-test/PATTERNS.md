@@ -339,7 +339,7 @@ Host setup lives in three scripts per platform:
 - macOS: `scripts/setup-bridge-feth-macos.sh`, `teardown-bridge-feth-macos.sh`, `cleanup-bridge-feth-macos.sh`
 - Linux (last run 2026-04-10; changed since, not re-run): `scripts/setup-bridge-tap.sh`, `teardown-bridge-tap.sh`, `cleanup-bridge-networking.sh`
 
-Invoke them directly (`sudo -n scripts/setup-bridge-feth-macos.sh`), never as `sudo bash <script>`: the NOPASSWD rule matches the script path, not `bash`.
+Invoke them directly (`sudo -n scripts/setup-bridge-feth-macos.sh`), never as `sudo bash <script>`: the NOPASSWD rule matches the script path, not `bash`. A bench may instead install root-owned copies in `/usr/local/libexec/c64-harness/` (this one does, with `sha256:<hex> … ""` rules: no arguments), and the harness then runs those: resolve the path with `bridge_platform.resolve_bridge_helper(name, repo_root)` rather than hardcoding `scripts/` (`C64_BRIDGE_HELPER_DIR` overrides).
 
 On macOS the setup script pairs `feth0` <-> `feth1` via `ifconfig feth0 peer feth1` and creates `bridge10` for the precondition + the host `10.0.65.1` address, but deliberately leaves the feth peers OUT of `bridge10`. The feth peer relation IS the L2 link; adding them as bridge members creates a second forwarding path that empirically caused asymmetric B->A reply drops. The setup script `deletem`s any stale peer-membership idempotently. The feth pair and `bridge10` may be shared with other rigs on the machine: tearing them down removes them for everyone.
 

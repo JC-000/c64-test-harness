@@ -525,7 +525,7 @@ Platform-dispatch module for bridge/ethernet tests. **Tests MUST import from her
 | `IFACE_B` | `feth1` | `tap-c64-1` |
 | `BRIDGE_NAME` | `bridge10` | `br-c64` |
 | `ETHERNET_DRIVER` | `pcap` | `tuntap` |
-| `SETUP_HINT` | `"run sudo scripts/setup-bridge-feth-macos.sh"` | `"run sudo scripts/setup-bridge-tap.sh"` |
+| `SETUP_HINT` | `"run sudo -n /usr/local/libexec/c64-harness/setup-bridge-feth-macos.sh"` when that copy is installed, else `"run sudo scripts/setup-bridge-feth-macos.sh"` | `"run sudo scripts/setup-bridge-tap.sh"` (same rule) |
 
 ### Helpers
 

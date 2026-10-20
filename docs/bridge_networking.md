@@ -45,6 +45,13 @@ capture on `feth0`/`feth1`.
 When an agent working on c64-test-harness needs two VICE instances that
 can exchange ethernet frames, use this canonical lifecycle:
 
+Where `/usr/local/libexec/c64-harness/` holds root-owned copies of the
+macOS scripts and sudoers names those (#541), run them from there instead
+(`sudo -n /usr/local/libexec/c64-harness/setup-bridge-feth-macos.sh`, no
+arguments); the harness's own probe and live tests pick that copy
+automatically (`bridge_platform.resolve_bridge_helper`). The hardened
+cleanup there leaves `/tmp` alone; `ViceProcess.stop()` removes its own rc file.
+
 1. **Setup** (once per session, as root):
 
    ```bash
