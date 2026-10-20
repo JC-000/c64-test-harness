@@ -41,6 +41,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -383,8 +384,23 @@ class TestBridgeCleanupScopingMacos:
             # 4. Run the real cleanup script.  This is the core action.
             rc_paths = [p._tmp_vicerc for p in bridge_procs]
             assert all(rc and os.path.exists(rc) for rc in rc_paths), rc_paths
+            # Reap the bridge VICEs the moment the cleanup kills them, as
+            # launchd does for the crashed run the cleanup exists for.  The
+            # patched build is pytest's own child (stock VICE was sudo's), so
+            # unreaped it would linger as a zombie that the helper's survivor
+            # check may count as alive.  Never the sentinel: its survival is
+            # the assertion.
+            reapers = [
+                threading.Thread(target=p._proc.wait, kwargs={"timeout": 60}, daemon=True)
+                for p in bridge_procs
+                if p._proc is not None
+            ]
+            for t in reapers:
+                t.start()
             _run_sudo_script(cleanup_script, timeout=60.0)
             cleanup_ran = True
+            for t in reapers:
+                t.join(timeout=10)
             # Settle + reap.  The cleanup script SIGKILLed the bridge
             # VICEs, but since pytest is their parent, their PIDs stay
             # as zombies until we waitpid() them.  Calling Popen.poll()

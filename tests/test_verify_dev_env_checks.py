@@ -1011,3 +1011,31 @@ def test_the_helper_dir_override_is_the_only_place_looked(tmp_path):
     )
     status, detail, _crit = rows[f"NOPASSWD sudo for {_BRIDGE_SCRIPTS[0]}"]
     assert status == "warn" and str(other / _BRIDGE_SCRIPTS[0]) in detail, detail
+
+
+def test_bridge_rows_prefer_libexec_when_both_are_authorised(tmp_path):
+    lib, repo = tmp_path / "libexec", tmp_path / "repo"
+    rows, _h, lib, _r = _bridge_rows(
+        tmp_path, [lib / _BRIDGE_SCRIPTS[0], repo / "scripts" / _BRIDGE_SCRIPTS[0]])
+    _status, detail, _crit = rows[f"NOPASSWD sudo for {_BRIDGE_SCRIPTS[0]}"]
+    assert detail.endswith(str(lib / _BRIDGE_SCRIPTS[0])), detail
+
+
+def test_a_whitespace_only_helper_dir_means_unset(tmp_path):
+    lib = tmp_path / "libexec"
+    rows, _h, lib, _r = _bridge_rows(
+        tmp_path, [lib / n for n in _BRIDGE_SCRIPTS], env={"C64_BRIDGE_HELPER_DIR": "  "})
+    assert rows[f"NOPASSWD sudo for {_BRIDGE_SCRIPTS[0]}"][0] == "ok"
+
+
+def test_a_missing_repo_script_gets_no_row(tmp_path):
+    """Matches bridge_helper_candidates: an absent script is no candidate."""
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    proc = _check_system(
+        "Darwin",
+        {"C64H_DEV_DIR": str(_fake_dev(tmp_path, {"bpf0": 0o606})),
+         "C64H_BRIDGE_LIBEXEC": str(tmp_path / "nolibexec"), "C64H_REPO_ROOT": str(repo)},
+    )
+    labels = [r[0] for r in _rows(proc.stdout)]
+    assert not any(f"NOPASSWD sudo for {n}" in labels for n in _BRIDGE_SCRIPTS), labels

@@ -579,13 +579,15 @@ check_system() {
         for script in setup-bridge-feth-macos.sh \
                       teardown-bridge-feth-macos.sh \
                       cleanup-bridge-feth-macos.sh; do
-            if [ -n "${C64_BRIDGE_HELPER_DIR:-}" ]; then
-                cands=("$C64_BRIDGE_HELPER_DIR/$script")
-            else
-                cands=()
-                [ -f "$libexec/$script" ] && cands+=("$libexec/$script")
-                [ -x "$repo_root/scripts/$script" ] && cands+=("$repo_root/scripts/$script")
-            fi
+            # A whitespace-only override counts as unset, as in Python.
+            case "${C64_BRIDGE_HELPER_DIR:-}" in
+                *[![:space:]]*) cands=("$C64_BRIDGE_HELPER_DIR/$script") ;;
+                *)
+                    cands=()
+                    [ -x "$libexec/$script" ] && cands+=("$libexec/$script")
+                    [ -x "$repo_root/scripts/$script" ] && cands+=("$repo_root/scripts/$script")
+                    ;;
+            esac
             if [ "${#cands[@]}" -eq 0 ]; then
                 # Missing script file is a separate concern (Bridge section
                 # reports it); skip here so we don't double-fail.

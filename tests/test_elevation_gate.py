@@ -255,7 +255,7 @@ def test_probe_bridge_scripts_does_not_fabricate_a_remedy_without_a_canonical_ro
         conftest._canonical_repo_root.cache_clear()
     assert ok is False
     assert os.getcwd() not in remedy
-    assert "cannot locate the canonical checkout" in remedy
+    assert "canonical checkout cannot be located" in remedy
 
 
 # ---------------------------------------------------------------------------

@@ -185,7 +185,10 @@ BRIDGE_IP_B = bridge_ip(3)
 # root-owned copies here and name only those in sudoers -- pinned to their
 # digest and to no arguments (``sha256:<hex> /path ""``).  The helpers take
 # no arguments either way.  ``$C64_BRIDGE_HELPER_DIR`` names the directory
-# outright and is then the only place looked.
+# outright and is then the only place looked.  The libexec copies are a
+# macOS layout: the Linux live test still runs the repo scripts through
+# ``sudo -n bash``, which no argument-free rule could cover, so Linux keeps
+# looking at the checkout only.  verify-dev-env.sh mirrors this search.
 
 #: Where root-owned copies of the bridge helpers are installed.
 BRIDGE_HELPER_LIBEXEC = "/usr/local/libexec/c64-harness"
@@ -195,16 +198,36 @@ BRIDGE_HELPER_DIR_ENV = "C64_BRIDGE_HELPER_DIR"
 
 def bridge_helper_candidates(name: str, repo_root: str | None) -> list[str]:
     """Where *name* may live, in the order the harness prefers them."""
-    override = os.environ.get(BRIDGE_HELPER_DIR_ENV, "").strip()
-    if override:
+    override = os.environ.get(BRIDGE_HELPER_DIR_ENV, "")
+    if override.strip():
         return [os.path.join(override, name)]
     found = []
-    installed = os.path.join(BRIDGE_HELPER_LIBEXEC, name)
-    if os.path.isfile(installed):
-        found.append(installed)
+    if sys.platform == "darwin":
+        found.append(os.path.join(BRIDGE_HELPER_LIBEXEC, name))
     if repo_root is not None:
         found.append(os.path.join(repo_root, "scripts", name))
-    return found
+    return [path for path in found if os.access(path, os.X_OK)]
+
+
+def bridge_helper_sudoers_entry(path: str) -> str:
+    """The NOPASSWD line a remedy should print for *path*.
+
+    An installed copy gets the digest-pinned, argument-free form the docs
+    recommend; a repo script (user-writable, so a digest would only break on
+    the next edit) the bare form.
+    """
+    from c64_test_harness.backends.vice_elevation import _sudoers_entry
+    entry = _sudoers_entry(path)
+    if os.path.dirname(path) != BRIDGE_HELPER_LIBEXEC.rstrip("/"):
+        return entry
+    import hashlib
+    try:
+        with open(path, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return entry + ' ""'
+    head, _, tail = entry.partition("NOPASSWD: ")
+    return f'{head}NOPASSWD: sha256:{digest} {tail} ""'
 
 
 def resolve_bridge_helper(name: str, repo_root: str | None) -> tuple[str | None, bool]:
