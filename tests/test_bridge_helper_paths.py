@@ -40,6 +40,7 @@ def bench(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     _install(repo / "scripts")
     monkeypatch.setattr(bp, "BRIDGE_HELPER_LIBEXEC", str(libexec))
+    monkeypatch.setattr(bp, "SEARCH_BRIDGE_HELPER_LIBEXEC", True)  # a macOS bench, on any host
     monkeypatch.delenv(bp.BRIDGE_HELPER_DIR_ENV, raising=False)
     return libexec, repo
 
@@ -180,7 +181,7 @@ def test_libexec_is_searched_on_macos_only(bench, monkeypatch):
     """The Linux live test still runs repo scripts via `sudo -n bash`, which
     no argument-free rule on an installed copy could cover."""
     libexec, repo = bench
-    monkeypatch.setattr(bp.sys, "platform", "linux")
+    monkeypatch.setattr(bp, "SEARCH_BRIDGE_HELPER_LIBEXEC", False)
     assert bp.bridge_helper_candidates(NAMES[0], str(repo)) == [str(repo / "scripts" / NAMES[0])]
 
 
@@ -188,6 +189,7 @@ def test_probe_names_the_scripts_it_cannot_find(tmp_path, monkeypatch):
     """A partial install with no checkout: say which are missing."""
     libexec = _install(tmp_path / "libexec", names=NAMES[:1])
     monkeypatch.setattr(bp, "BRIDGE_HELPER_LIBEXEC", str(libexec))
+    monkeypatch.setattr(bp, "SEARCH_BRIDGE_HELPER_LIBEXEC", True)
     monkeypatch.delenv(bp.BRIDGE_HELPER_DIR_ENV, raising=False)
     monkeypatch.setattr(conftest, "_canonical_repo_root", lambda: None)
     _authorise(monkeypatch, {str(libexec / NAMES[0])})
@@ -204,3 +206,17 @@ def test_probe_remedy_for_an_installed_copy_pins_digest_and_no_args(probe_root, 
     _ok, remedy = conftest._probe_bridge_scripts(NAMES[:1])
     digest = hashlib.sha256((libexec / NAMES[0]).read_bytes()).hexdigest()
     assert f'NOPASSWD: sha256:{digest} {libexec / NAMES[0]} ""' in remedy, remedy
+
+
+def test_probe_remedy_for_a_repo_script_is_the_bare_rule(tmp_path, monkeypatch):
+    """A digest on a user-writable script would break on its next edit."""
+    repo = tmp_path / "repo"
+    _install(repo / "scripts")
+    monkeypatch.setattr(bp, "BRIDGE_HELPER_LIBEXEC", str(tmp_path / "absent"))
+    monkeypatch.delenv(bp.BRIDGE_HELPER_DIR_ENV, raising=False)
+    monkeypatch.setattr(conftest, "_canonical_repo_root", lambda: str(repo))
+    _authorise(monkeypatch, set())
+    _ok, remedy = conftest._probe_bridge_scripts(NAMES[:1])
+    line = next(l for l in remedy.splitlines() if "NOPASSWD:" in l)
+    assert line.rstrip().endswith(f"NOPASSWD: {repo / 'scripts' / NAMES[0]}"), line
+    assert "sha256:" not in line

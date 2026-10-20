@@ -927,7 +927,7 @@ def _probe_bridge_scripts(scripts: tuple[str, ...] | None = None) -> tuple[bool,
         )
         return False, (
             f"cannot find {', '.join(unfound)}: not installed "
-            + (f"in {bp.BRIDGE_HELPER_LIBEXEC}, " if sys.platform == "darwin" else "")
+            + (f"in {bp.BRIDGE_HELPER_LIBEXEC}, " if bp.SEARCH_BRIDGE_HELPER_LIBEXEC else "")
             + f"not in ${bp.BRIDGE_HELPER_DIR_ENV}, and not {where}"
         )
     missing = [path for path, ok in resolved if not ok]

@@ -194,6 +194,8 @@ BRIDGE_IP_B = bridge_ip(3)
 BRIDGE_HELPER_LIBEXEC = "/usr/local/libexec/c64-harness"
 #: Names the directory holding the bridge helpers, overriding the search.
 BRIDGE_HELPER_DIR_ENV = "C64_BRIDGE_HELPER_DIR"
+#: Whether the libexec copies are searched at all (macOS only, see above).
+SEARCH_BRIDGE_HELPER_LIBEXEC = sys.platform == "darwin"
 
 
 def bridge_helper_candidates(name: str, repo_root: str | None) -> list[str]:
@@ -202,7 +204,7 @@ def bridge_helper_candidates(name: str, repo_root: str | None) -> list[str]:
     if override.strip():
         return [os.path.join(override, name)]
     found = []
-    if sys.platform == "darwin":
+    if SEARCH_BRIDGE_HELPER_LIBEXEC:
         found.append(os.path.join(BRIDGE_HELPER_LIBEXEC, name))
     if repo_root is not None:
         found.append(os.path.join(repo_root, "scripts", name))
