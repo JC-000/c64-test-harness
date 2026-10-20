@@ -10,9 +10,11 @@ stack.  The Linux variant is the authoritative reference for layout;
 this file is a parallel, intentionally not a refactor.
 
 Opt in with ``BRIDGE_CLEANUP_LIVE=1``.  Requires ``x64sc`` on PATH and
-passwordless ``sudo -n`` access (the test drives the setup/teardown
-bridge scripts AND ``ViceConfig`` flips ``run_as_root=True`` on macOS
-when ``ethernet=True``, so the launch itself is wrapped with sudo).
+passwordless ``sudo -n`` for the setup/teardown bridge scripts, which the
+test drives.  The ethernet VICE launches either as the user (the patched
+build from ``scripts/build-vice-eth.sh``) or, with stock VICE, wrapped in
+``sudo -n`` (``ViceConfig`` flips ``run_as_root=True``); the test resolves
+the x64sc PID in both cases.
 
 Probe shape vs. the Linux test:
   * /sys/class/net/<name>            -> ``ifconfig <name>`` returncode
@@ -87,8 +89,8 @@ pytestmark = [
     #
     # NOPASSWD sudo for setup-bridge-feth-macos.sh /
     # teardown-bridge-feth-macos.sh / cleanup-bridge-feth-macos.sh (this
-    # test drives them directly), and for x64sc itself (ViceConfig flips
-    # run_as_root=True for ethernet=True on macOS -- see module
+    # test drives them directly), and raw-network capability for x64sc
+    # (the patched build, or a NOPASSWD rule for stock VICE -- see module
     # docstring).  Unlike the pcap probe above, both ARE static
     # prerequisites the bench either has or doesn't, so checking them
     # upfront costs nothing on a clean host.
@@ -313,13 +315,15 @@ class TestBridgeCleanupScopingMacos:
 
             # 3. Two bridge VICE instances on harness bridge ports
             #    (6560-6580) attached to the feth pair via VICE's
-            #    pcap driver.  ViceConfig auto-elevates this launch
-            #    on macOS (run_as_root=True when ethernet=True), so
-            #    the spawn itself goes through ``sudo -n`` and
-            #    ``ViceProcess.pid`` is the sudo wrapper.  We resolve
+            #    pcap driver.  With stock VICE, ViceConfig auto-elevates
+            #    this launch on macOS (run_as_root=True when
+            #    ethernet=True), so the spawn goes through ``sudo -n``
+            #    and ``ViceProcess.pid`` is the sudo wrapper: we resolve
             #    and record the actual ``x64sc`` child PID so the
             #    pre/post-cleanup ``_is_x64sc`` and ``_pid_alive``
-            #    checks evaluate against the real VICE process.
+            #    checks evaluate against the real VICE process.  The
+            #    patched build runs as the user, unwrapped, and
+            #    ``ViceProcess.pid`` is x64sc itself.
             allocator = PortAllocator(
                 port_range_start=6560, port_range_end=6580
             )
@@ -343,13 +347,19 @@ class TestBridgeCleanupScopingMacos:
                 p.start()
                 bridge_procs.append(p)
                 time.sleep(2.0)
-                sudo_wrapper_pid = p.pid
-                assert sudo_wrapper_pid is not None
-                x64sc_pid = _resolve_x64sc_child(sudo_wrapper_pid)
-                assert x64sc_pid is not None, (
-                    f"could not resolve x64sc child of sudo wrapper "
-                    f"PID {sudo_wrapper_pid} (port {port})"
-                )
+                launched_pid = p.pid
+                assert launched_pid is not None
+                if p.is_sudo_child:
+                    x64sc_pid = _resolve_x64sc_child(launched_pid)
+                    assert x64sc_pid is not None, (
+                        f"could not resolve x64sc child of sudo wrapper "
+                        f"PID {launched_pid} (port {port})"
+                    )
+                else:
+                    x64sc_pid = launched_pid
+                    assert _is_x64sc(x64sc_pid), (
+                        f"unwrapped launch PID {x64sc_pid} is not x64sc (port {port})"
+                    )
                 bridge_pids.append(x64sc_pid)
 
             # All three should be alive before cleanup.

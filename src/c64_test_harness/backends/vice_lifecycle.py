@@ -25,6 +25,9 @@ from typing import TYPE_CHECKING
 from c64_test_harness.backends.vice_elevation import (
     ViceElevationRequiredError,
     effective_driver_name,
+    patched_vice_binary,
+    patched_vice_lag,
+    usable_patched_vice_binary,
     vice_features,
     ViceEthernetBinaryError,
     ViceEthernetError,
@@ -416,7 +419,10 @@ def ethernet_vice_binary() -> str:
     links libpcap, so ethernet work needs no separately-built companion.
     (It was long cited as an ethernet-less build, issue #144; that was a
     misreading of the crash an *unelevated* launch produces -- see
-    ``vice_elevation``.)
+    ``vice_elevation``.)  On macOS that binary needs root for ethernet;
+    when ``scripts/build-vice-eth.sh`` has built the patched ``vice-eth``,
+    :func:`resolve_vice_executable` prefers it without this being set,
+    when it can run ethernet as this user.
 
     Set it only for a bench that must launch a different binary.
     :func:`resolve_vice_executable` probes whichever binary it resolves
@@ -435,12 +441,49 @@ def ethernet_vice_binary() -> str:
     return os.environ.get(ETHERNET_VICE_BIN_ENV, "").strip()
 
 
+#: Messages :func:`_note_patched_choice` has already logged in this process.
+_PATCHED_NOTES: set[str] = set()
+
+
+def _note_once(level: int, message: str) -> None:
+    if message not in _PATCHED_NOTES:
+        _PATCHED_NOTES.add(message)
+        _log.log(level, message)
+
+
+def _note_patched_choice(usable: str | None) -> None:
+    """Say which ethernet binary the macOS default picked, once per process."""
+    if usable is not None:
+        _note_once(logging.INFO, f"ethernet VICE: using the patched build {usable} (runs as you)")
+        lag = patched_vice_lag(usable)
+        if lag is not None:
+            _note_once(
+                logging.WARNING,
+                f"ethernet VICE: the patched build is vice-eth {lag[0]} but "
+                f"Homebrew's vice is {lag[1]}; rebuild with scripts/build-vice-eth.sh",
+            )
+        return
+    installed = patched_vice_binary()
+    if installed is not None:
+        _note_once(
+            logging.INFO,
+            f"ethernet VICE: the patched build {installed} cannot run ethernet "
+            f"as you (no read-write /dev/bpf* node), so the configured x64sc is used",
+        )
+
+
 def resolve_vice_executable(cfg: ViceConfig) -> str:
     """The ``x64sc`` binary *cfg* should actually launch.
 
     Prefers :attr:`ViceConfig.ethernet_executable` when the ethernet cart
     is in play, so a bench can keep a stock ``x64sc`` on ``PATH`` for
     ordinary tests and an ethernet-enabled build for the bridge suite.
+    With neither that nor a non-default :attr:`ViceConfig.executable`
+    set, a macOS host with ``scripts/build-vice-eth.sh``'s patched build
+    uses it when it can run ethernet as this user (it reports
+    ``RAWNET_BPF_PERMISSIONS`` and a ``/dev/bpf*`` node opens read-write);
+    otherwise the configured binary.  The choice is logged once at INFO,
+    and a patched build behind Homebrew's ``vice`` at WARNING.
 
     With ``cfg.ethernet`` set, the chosen binary is *checked* for
     raw-network support and a build without it raises
@@ -452,12 +495,17 @@ def resolve_vice_executable(cfg: ViceConfig) -> str:
     if not cfg.ethernet:
         return cfg.executable
 
-    candidate = cfg.ethernet_executable or cfg.executable
-    source = (
-        f"ViceConfig.ethernet_executable / ${ETHERNET_VICE_BIN_ENV}"
-        if cfg.ethernet_executable
-        else "ViceConfig.executable"
-    )
+    patched = None
+    if not cfg.ethernet_executable and cfg.executable == ViceConfig.executable:
+        patched = usable_patched_vice_binary()
+        _note_patched_choice(patched)
+    candidate = cfg.ethernet_executable or patched or cfg.executable
+    if cfg.ethernet_executable:
+        source = f"ViceConfig.ethernet_executable / ${ETHERNET_VICE_BIN_ENV}"
+    elif patched:
+        source = "the patched vice-eth build (scripts/build-vice-eth.sh)"
+    else:
+        source = "ViceConfig.executable"
     resolved = shutil.which(candidate)
     if resolved is None and os.path.isfile(candidate):
         resolved = candidate
@@ -780,9 +828,13 @@ class ViceConfig:
     # ``cs8900_activate`` segfault; the cause is the NULL driver, and it
     # is the euid that decides.  Confirmed live: with ``/dev/bpf0`` at
     # ``crw----rw-`` and uid 501, VICE still refuses the pcap driver.
+    # All of that is stock VICE.  The patched build from
+    # ``scripts/build-vice-eth.sh`` (``RAWNET_BPF_PERMISSIONS`` in its
+    # ``-features``) also accepts a read-write ``/dev/bpf*`` node, and for
+    # it the capability below includes that check, so it runs unelevated.
     #
     # ``None`` means auto-detect (ethernet + a root-gated driver + no
-    # capability).  Set explicitly to override -- but note that
+    # capability for the binary being launched).  Set explicitly to override -- but note that
     # ``run_as_root=False`` on a launch that needs root is refused rather
     # than crashed; see ``vice_elevation.plan_vice_launch``.  A
     # passwordless sudoers entry is only needed when elevation actually

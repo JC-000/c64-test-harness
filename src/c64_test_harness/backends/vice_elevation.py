@@ -6,9 +6,9 @@ VICE gates its ethernet drivers on ``archdep_rawnet_capability()``
     geteuid() == 0                      -- every UNIX build
     || cap_check(CAP_NET_RAW)           -- Linux only (HAVE_CAPABILITIES)
 
-That is the *whole* test.  It never looks at ``/dev/bpf*``: a rig that
-ran ``chmod o+rw /dev/bpf*`` has changed nothing VICE consults.  The
-result gates driver *selection* in ``rawnetarch.c:set_ethernet_driver()``
+That is the *whole* test in stock VICE.  It never looks at
+``/dev/bpf*``: a rig that ran ``chmod o+rw /dev/bpf*`` has changed nothing
+stock VICE consults.  The result gates driver *selection* in ``rawnetarch.c:set_ethernet_driver()``
 and ``rawnet_arch_resources_init()``, both of which admit the pcap driver
 only when the capability holds.  Without it ``rawnet_arch_driver`` stays
 ``NULL`` and the first reset dereferences it in
@@ -20,6 +20,13 @@ the answer is no, hands the operator the exact command to run instead.
 
 The tuntap driver (Linux) is selected without consulting the capability,
 so tuntap launches need no elevation at all.
+
+On macOS, ``scripts/build-vice-eth.sh`` builds Homebrew's VICE plus
+``vice/rawnet-bpf-permissions.patch``, which adds the check macOS actually
+grants capture by -- can this user open a ``/dev/bpf*`` node read-write? --
+and reports it in ``-features`` as ``RAWNET_BPF_PERMISSIONS yes``.  For such
+a binary :func:`rawnet_capability` mirrors that check, so the launch runs
+as the user; for any other binary it still needs root.
 
 Public surface: :func:`plan_vice_launch` (used by ``ViceProcess.start``),
 :func:`vice_binary_supports_ethernet`, :func:`rawnet_capability`,
@@ -56,11 +63,26 @@ ALLOW_UNELEVATED_ENV = "VICE_ETHERNET_ALLOW_UNELEVATED"
 #: no emulator starts.
 _FEATURES_TIMEOUT = 10.0
 
+#: The ``-features`` row of a VICE whose rawnet check also accepts a
+#: read-write ``/dev/bpf*`` node (``vice/rawnet-bpf-permissions.patch``).
+BPF_PERMISSIONS_FEATURE = "RAWNET_BPF_PERMISSIONS"
+
+#: Where ``scripts/build-vice-eth.sh``'s keg-only ``vice-eth`` lands, after
+#: ``$HOMEBREW_PREFIX/opt/vice-eth/bin/x64sc`` when that is set.
+PATCHED_VICE_CANDIDATES = (
+    "/opt/homebrew/opt/vice-eth/bin/x64sc",
+    "/usr/local/opt/vice-eth/bin/x64sc",
+)
+
+#: Directory holding the ``bpf<N>`` nodes; a module attribute for tests.
+_BPF_DEV_DIR = "/dev"
+
 #: ``-features`` rows the harness cares about, mapped to field names.
 _FEATURE_ROWS = {
     "HAVE_RAWNET": "rawnet",
     "HAVE_PCAP": "pcap",
     "HAVE_TUNTAP": "tuntap",
+    BPF_PERMISSIONS_FEATURE: "bpf_permissions",
 }
 
 #: Resource-name strings present in every x64sc built with raw-network
@@ -165,6 +187,10 @@ class ViceFeatures:
     The fallback can see *whether* raw-network support is compiled in but
     not *which* drivers, so ``drivers_known`` is False there and callers
     must not refuse a driver on its say-so.
+
+    ``bpf_permissions`` is the ``RAWNET_BPF_PERMISSIONS`` row: the binary
+    accepts a read-write ``/dev/bpf*`` node in place of root.  The scan
+    fallback never sets it, so an unexecutable binary is treated as stock.
     """
 
     rawnet: bool
@@ -172,6 +198,7 @@ class ViceFeatures:
     tuntap: bool
     source: str
     drivers_known: bool
+    bpf_permissions: bool = False
 
     def has_driver(self, name: str) -> bool:
         return {"pcap": self.pcap, "tuntap": self.tuntap}.get(name.lower(), False)
@@ -238,6 +265,7 @@ def _probe_features(
             tuntap=values.get("tuntap", False),
             source="-features",
             drivers_known=True,
+            bpf_permissions=values.get("bpf_permissions", False),
         )
 
     # Could not ask the binary; read it instead.
@@ -301,14 +329,97 @@ def _has_cap_net_raw() -> bool:
     return False
 
 
-def rawnet_capability(*, as_root: bool | None = None) -> bool:
+def bpf_node_openable() -> bool:
+    """Whether this user can open some ``/dev/bpf*`` node read-write.
+
+    The same walk the patched ``archdep_rawnet_capability()`` makes:
+    ``bpf0`` upwards, a busy or denied node does not end it, a missing one
+    does.  Each node opened is closed at once.
+    """
+    for i in range(256):
+        try:
+            fd = os.open(os.path.join(_BPF_DEV_DIR, f"bpf{i}"), os.O_RDWR)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            continue
+        os.close(fd)
+        return True
+    return False
+
+
+def patched_vice_binary() -> str | None:
+    """The ``vice-eth`` x64sc built by ``scripts/build-vice-eth.sh``, if any.
+
+    macOS only.  Existence only: whether it really is the patched build is
+    read from its ``-features`` at launch time (:func:`rawnet_capability`).
+    """
+    if sys.platform != "darwin":
+        return None
+    prefix = os.environ.get("HOMEBREW_PREFIX", "").strip()
+    candidates = ((os.path.join(prefix, "opt", "vice-eth", "bin", "x64sc"),) if prefix else ())
+    for path in candidates + PATCHED_VICE_CANDIDATES:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def usable_patched_vice_binary() -> str | None:
+    """:func:`patched_vice_binary`, but only when it would run ethernet as
+    this user now: it reports ``RAWNET_BPF_PERMISSIONS`` and a ``/dev/bpf*``
+    node opens read-write.  Otherwise ``None``, so a launch falls back to
+    the configured binary (and whatever sudo rule names it) rather than
+    being steered onto a build this user cannot use.
+    """
+    path = patched_vice_binary()
+    if path is None or not rawnet_capability(as_root=False, binary=path):
+        return None
+    return path
+
+
+def patched_vice_lag(path: str) -> tuple[str, str] | None:
+    """``(vice-eth version, vice version)`` when the patched build's keg is
+    not the version of Homebrew's ``vice`` beside it, else ``None``.
+
+    Read from the opt symlinks (``opt/<name>`` -> ``Cellar/<name>/<version>``),
+    so it costs no subprocess; ``None`` too when either is not such a keg.
+    This is the run-time half of ``build-vice-eth.sh --check``: it sees a
+    ``brew upgrade vice`` that left the patched build behind, not a formula
+    revision or a patch change, which only ``--check`` reads.
+    """
+    def keg_version(x64sc: str, name: str) -> str | None:
+        real = os.path.realpath(x64sc)
+        parts = real.split(os.sep)
+        if len(parts) >= 5 and parts[-5] == "Cellar" and parts[-4] == name:
+            return parts[-3]
+        return None
+
+    opt_dir = os.path.dirname(os.path.dirname(os.path.dirname(path)))
+    eth = keg_version(path, "vice-eth")
+    stock = keg_version(os.path.join(opt_dir, "vice", "bin", "x64sc"), "vice")
+    if eth is None or stock is None or eth == stock:
+        return None
+    return eth, stock
+
+
+def rawnet_capability(*, as_root: bool | None = None, binary: str | None = None) -> bool:
     """What ``archdep_rawnet_capability()`` would return for a child.
 
     *as_root* says whether the child will run as root; ``None`` asks
-    about this process as it stands.
+    about this process as it stands.  *binary* is the x64sc to be
+    launched: a build reporting ``RAWNET_BPF_PERMISSIONS`` (macOS) also
+    passes when this user can open a ``/dev/bpf*`` node read-write.
+    Without *binary* the answer is stock VICE's.
     """
     running_as_root = os.geteuid() == 0 if as_root is None else as_root
     if running_as_root:
+        return True
+    if (
+        binary is not None
+        and sys.platform == "darwin"
+        and vice_features(binary).bpf_permissions
+        and bpf_node_openable()
+    ):
         return True
     return _has_cap_net_raw()
 
@@ -496,6 +607,44 @@ def _display_command(interactive: list[str]) -> str:
     return shlex.join(rendered)
 
 
+def _unprivileged_route(binary: str) -> str:
+    """The non-root remedy for *binary* on macOS, or ``""`` elsewhere."""
+    if sys.platform != "darwin":
+        return ""
+    bpf_remedy = (
+        "Install Wireshark's ChmodBPF (brew install --cask "
+        "wireshark-chmodbpf), make sure `id -Gn` lists access_bpf (log in "
+        "again after joining), or sudo chmod o+rw /dev/bpf* until the next "
+        "reboot.\n"
+    )
+    if vice_features(binary).bpf_permissions:
+        return (
+            f"This x64sc reports {BPF_PERMISSIONS_FEATURE} yes, so it would run "
+            f"as you, but no /dev/bpf* node opens read-write for this user. "
+            + bpf_remedy
+        )
+    patched = patched_vice_binary()
+    if patched is not None and usable_patched_vice_binary() is not None:
+        return (
+            f"The patched build at {patched} would run ethernet as you, but "
+            f"this launch chose a stock x64sc ($VICE_ETHERNET_BIN, "
+            f"ethernet_executable or executable). Unset that to use it.\n"
+        )
+    if patched is not None:
+        return (
+            f"The patched build at {patched} is installed, but it cannot run "
+            f"ethernet as you (no /dev/bpf* node opens read-write for this "
+            f"user), so this stock x64sc was chosen instead. " + bpf_remedy
+        )
+    return (
+        "This x64sc is a stock build, which enables ethernet only for root. "
+        "To run it as you instead, build the patched VICE with "
+        "scripts/build-vice-eth.sh (Homebrew's vice plus one patch; it checks "
+        "/dev/bpf* permissions instead of root, and the harness picks it up "
+        "automatically).\n"
+    )
+
+
 def _refuse(argv: list[str], binary: str, reason: str) -> ViceElevationRequiredError:
     # The remedy names the *resolved* binary, like ``binary`` and the
     # sudoers line do: sudoers matches the absolute command path (and
@@ -521,8 +670,8 @@ def _refuse(argv: list[str], binary: str, reason: str) -> ViceElevationRequiredE
         f"VICE selects an ethernet driver only when "
         f"archdep_rawnet_capability() holds (euid 0, or CAP_NET_RAW on "
         f"Linux); without it rawnet_arch_driver stays NULL and x64sc "
-        f"SIGSEGVs on the first reset with no log output. "
-        f"/dev/bpf* permissions are irrelevant — VICE never reads them.\n"
+        f"SIGSEGVs on the first reset with no log output.\n"
+        f"{_unprivileged_route(binary)}"
         f"Run this launch elevated:\n"
         f"    {display_command}\n"
         f"{addconfig_note}"
@@ -555,7 +704,7 @@ def plan_vice_launch(cfg: "ViceConfig", argv: Sequence[str]) -> ViceLaunchPlan:
     needs_root = (
         bool(cfg.ethernet)
         and driver_requires_root(cfg.ethernet_driver)
-        and not rawnet_capability()
+        and not rawnet_capability(binary=binary)
     )
     want_root = needs_root if cfg.run_as_root is None else bool(cfg.run_as_root)
 

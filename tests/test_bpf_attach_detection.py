@@ -87,7 +87,9 @@ requires_bench = pytest.mark.skipif(
 # x64sc path -- the same question elevation("vice_root") asks elsewhere,
 # scoped here to the one binary this bench's sudoers entry actually
 # names rather than whatever ethernet_vice_binary()/PATH would resolve.
-requires_root = pytest.mark.elevation("vice_root", binary=X64SC)
+# require_sudo: these launch a *root* VICE on purpose, so the patched build
+# (which runs as the user) does not satisfy them.
+requires_root = pytest.mark.elevation("vice_root", binary=X64SC, require_sudo=True)
 
 
 def _free_port() -> int:

@@ -40,6 +40,7 @@ from c64_test_harness.ethernet import parse_mac
 from c64_test_harness.backends.vice_elevation import (
     rawnet_capability,
     sudo_can_run,
+    usable_patched_vice_binary,
 )
 from c64_test_harness.backends.vice_lifecycle import (
     ETHERNET_VICE_BIN_ENV,
@@ -392,9 +393,11 @@ def probe_vice_pcap_ok(
 
     # Probe the binary the ethernet tests will actually launch: an
     # ethernet-capable build when one is configured ($VICE_ETHERNET_BIN),
-    # otherwise the PATH x64sc.  Probing PATH while the tests run a
-    # different binary would report on the wrong emulator entirely.
-    x64sc = ethernet_vice_binary() or shutil.which("x64sc")
+    # else the patched vice-eth when it can run as this user (macOS,
+    # scripts/build-vice-eth.sh), else the PATH x64sc --
+    # resolve_vice_executable()'s order.  Probing PATH while the tests run
+    # a different binary would report on the wrong emulator entirely.
+    x64sc = ethernet_vice_binary() or usable_patched_vice_binary() or shutil.which("x64sc")
     if x64sc is None:
         _PROBE_CACHE = (False, "x64sc not on PATH")
         return _PROBE_CACHE
@@ -468,11 +471,11 @@ def probe_vice_pcap_ok(
         # Elevate on exactly the same rule production uses, so the probe
         # measures the configuration the tests will actually run under.
         # VICE admits the pcap driver only when
-        # ``archdep_rawnet_capability()`` holds (euid 0; ``/dev/bpf*``
-        # permissions are not consulted), and without a driver it
-        # SIGSEGVs on reset -- which on macOS raises the crash reporter.
+        # ``archdep_rawnet_capability()`` holds (euid 0; for the patched
+        # build also a read-write ``/dev/bpf*`` node), and without a driver
+        # it SIGSEGVs on reset -- which on macOS raises the crash reporter.
         # So when we cannot elevate, skip rather than launch.
-        elevated = not rawnet_capability(as_root=False)
+        elevated = not rawnet_capability(as_root=False, binary=x64sc)
         if elevated and not sudo_can_run(x64sc):
             _PROBE_CACHE = (
                 False,

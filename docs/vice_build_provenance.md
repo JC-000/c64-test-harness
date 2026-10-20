@@ -224,7 +224,7 @@ are not properties of any one binary.
 euid check). macOS has no `HAVE_CAPABILITIES`, so it reduces to the euid test and
 otherwise falls through to `return false`. **It never inspects `/dev/bpf*`.**
 
-There is no macOS path to a working rawnet driver unelevated. Only two drivers
+There is no macOS path to a working rawnet driver unelevated in stock VICE. (The harness's patched build, `scripts/build-vice-eth.sh` with `vice/rawnet-bpf-permissions.patch`, adds one: a read-write `/dev/bpf*` node; see docs/development.md § "VICE ethernet without root". What follows describes the pinned release as shipped.) Only two drivers
 exist — the sole non-NULL assignments to `rawnet_arch_driver` are **S**
 `src/arch/shared/rawnetarch.c:109` (pcap) and `:114` (tuntap):
 

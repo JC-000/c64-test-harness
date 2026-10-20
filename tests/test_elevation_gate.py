@@ -901,3 +901,56 @@ def test_e2e_probe_runs_once_across_two_items_sharing_a_kind(pytester):
     result = pytester.runpytest()
     result.assert_outcomes(passed=2)
     result.stdout.fnmatch_lines(["PROBE CALLS: 1"])
+
+
+def test_probe_vice_root_passes_a_patched_build_without_sudo(monkeypatch, tmp_path):
+    """The patched build with a usable /dev/bpf* node needs no NOPASSWD rule."""
+    from c64_test_harness.backends import vice_elevation as ve
+
+    exe = tmp_path / "x64sc"
+    exe.write_bytes(b"x")
+    seen = {}
+
+    def capability(**kwargs):
+        seen.update(kwargs)
+        return kwargs.get("binary") == str(exe)
+
+    monkeypatch.setattr(ve, "rawnet_capability", capability)
+    monkeypatch.setattr(ve, "sudo_can_run", lambda b: pytest.fail("needs no sudo"))
+    ok, remedy = conftest._probe_vice_root(binary=str(exe))
+    assert (ok, remedy) == (True, "")
+    assert seen["binary"] == str(exe)
+
+
+def test_probe_vice_root_resolves_the_patched_build_by_default(monkeypatch, tmp_path):
+    from c64_test_harness.backends import vice_elevation as ve
+    from c64_test_harness.backends import vice_lifecycle as vl
+
+    exe = tmp_path / "vice-eth-x64sc"
+    exe.write_bytes(b"x")
+    monkeypatch.setattr(vl, "ethernet_vice_binary", lambda: "")
+    monkeypatch.setattr(ve, "usable_patched_vice_binary", lambda: str(exe))
+    assert conftest._resolve_ethernet_binary() == str(exe)
+
+
+def test_probe_vice_root_lets_vice_ethernet_bin_win_over_the_patched_build(monkeypatch, tmp_path):
+    from c64_test_harness.backends import vice_elevation as ve
+    from c64_test_harness.backends import vice_lifecycle as vl
+
+    monkeypatch.setattr(vl, "ethernet_vice_binary", lambda: "/configured/x64sc")
+    monkeypatch.setattr(ve, "usable_patched_vice_binary", lambda: str(tmp_path / "vice-eth"))
+    assert conftest._resolve_ethernet_binary() == "/configured/x64sc"
+
+
+def test_probe_vice_root_can_demand_the_sudo_rule_itself(monkeypatch, tmp_path):
+    """A test of the sudo-wrapped launch is not satisfied by the patched build."""
+    from c64_test_harness.backends import vice_elevation as ve
+
+    exe = tmp_path / "x64sc"
+    exe.write_bytes(b"x")
+    monkeypatch.setattr(ve, "rawnet_capability", lambda **kwargs: True)
+    monkeypatch.setattr(ve, "sudo_can_run", lambda b: False)
+    ok, remedy = conftest._probe_vice_root(binary=str(exe), require_sudo=True)
+    assert ok is False
+    assert "NOPASSWD" in remedy
+    assert "build-vice-eth" not in remedy

@@ -45,7 +45,7 @@ def test_probe_hands_vice_the_production_rc(monkeypatch, tmp_path):
     monkeypatch.delenv("MACOS_PCAP_ENABLED", raising=False)
     monkeypatch.setattr(bp, "ethernet_vice_binary", lambda: str(fake_bin))
     # Already root: no sudo in front of the launch, nothing to authorise.
-    monkeypatch.setattr(bp, "rawnet_capability", lambda as_root=False: True)
+    monkeypatch.setattr(bp, "rawnet_capability", lambda **kwargs: True)
     monkeypatch.setattr(bp, "_probe_port", lambda: 65001)
 
     def fake_run(args, **kwargs):
@@ -98,3 +98,53 @@ def test_probe_hands_vice_the_production_rc(monkeypatch, tmp_path):
     # The fake VICE exited, so the probe must say so rather than pass.
     assert ok is False
     assert "code=139" in reason
+
+
+def test_probe_runs_the_patched_build_unelevated(monkeypatch, tmp_path):
+    """With no $VICE_ETHERNET_BIN, the probe launches the patched vice-eth,
+    as the tests would, and asks about *that* binary's capability."""
+    patched = tmp_path / "vice-eth-x64sc"
+    patched.write_text("#!/bin/sh\nexit 0\n")
+    patched.chmod(0o755)
+
+    monkeypatch.setattr(bp, "_PROBE_CACHE", None)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.delenv("MACOS_PCAP_DISABLED", raising=False)
+    monkeypatch.delenv("MACOS_PCAP_ENABLED", raising=False)
+    monkeypatch.setattr(bp, "ethernet_vice_binary", lambda: "")
+    monkeypatch.setattr(bp, "usable_patched_vice_binary", lambda: str(patched))
+    monkeypatch.setattr(
+        bp, "rawnet_capability", lambda as_root=False, binary=None: binary == str(patched)
+    )
+    monkeypatch.setattr(bp, "sudo_can_run", lambda b: False)
+    monkeypatch.setattr(bp, "_probe_port", lambda: 65002)
+    monkeypatch.setattr(
+        bp.subprocess, "run",
+        lambda args, **kw: types.SimpleNamespace(
+            stdout=f"{IFACE}: flags=8863<UP,BROADCAST,RUNNING> mtu 1500\n", returncode=0
+        ),
+    )
+    launched: dict = {}
+
+    class _Exited:
+        returncode = 139
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            pass
+
+    def fake_popen(args, **kwargs):
+        launched["args"] = list(args)
+        return _Exited()
+
+    monkeypatch.setattr(bp.subprocess, "Popen", fake_popen)
+    bp.probe_vice_pcap_ok(iface=IFACE)
+    assert launched["args"][0] == str(patched), launched
