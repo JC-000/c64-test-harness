@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import shlex
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -111,7 +112,7 @@ def test_bpf_root_only_higher_node_is_named(tmp_path):
     proc = _check_system("Darwin", {"C64H_DEV_DIR": str(dev)})
     label, status, detail, _crit = _bpf_row(proc)
     assert status == "warn", detail
-    assert "not other-rw: bpf4 " in detail, detail
+    assert "no rw access: bpf4 " in detail, detail
     for good in ("bpf0", "bpf1", "bpf2", "bpf3"):
         assert good not in detail.split("(")[0], detail
     assert any("bpf4+" in h for h in _hints(proc.stdout)), proc.stdout
@@ -122,7 +123,7 @@ def test_bpf_every_failing_node_is_named(tmp_path):
     proc = _check_system("Darwin", {"C64H_DEV_DIR": str(dev)})
     _label, status, detail, _crit = _bpf_row(proc)
     assert status == "warn"
-    failing = detail.split("not other-rw: ", 1)[1].split(" (", 1)[0].split()
+    failing = detail.split("no rw access: ", 1)[1].split(" (", 1)[0].split()
     assert sorted(failing) == ["bpf0", "bpf10", "bpf2"], detail
 
 
@@ -133,6 +134,32 @@ def test_bpf_all_nodes_other_rw_is_ok(tmp_path):
     assert status == "ok", detail
     assert "all 3 nodes" in detail, detail
     assert not any("bpf" in h for h in _hints(proc.stdout))
+
+
+def _node_group(dev: Path) -> str:
+    import grp
+
+    return grp.getgrgid((dev / "bpf0").stat().st_gid).gr_name
+
+
+def test_bpf_group_rw_for_a_member_is_ok(tmp_path):
+    """Wireshark's ChmodBPF leaves the nodes root:access_bpf 0660: usable by a member."""
+    dev = _fake_dev(tmp_path, {"bpf0": 0o660, "bpf1": 0o660})
+    groups = f"everyone {_node_group(dev)}"
+    proc = _check_system("Darwin", {"C64H_DEV_DIR": str(dev), "C64H_USER_GROUPS": groups})
+    _label, status, detail, _crit = _bpf_row(proc)
+    assert status == "ok", detail
+    assert not any("bpf" in h for h in _hints(proc.stdout))
+
+
+def test_bpf_group_rw_for_a_non_member_is_named(tmp_path):
+    dev = _fake_dev(tmp_path, {"bpf0": 0o660, "bpf1": 0o606})
+    proc = _check_system("Darwin", {"C64H_DEV_DIR": str(dev), "C64H_USER_GROUPS": "everyone"})
+    _label, status, detail, _crit = _bpf_row(proc)
+    assert status == "warn", detail
+    failing = detail.split("no rw access: ", 1)[1].split(" (", 1)[0].split()
+    assert failing == ["bpf0"], detail
+    assert any("access_bpf" in h for h in _hints(proc.stdout)), proc.stdout
 
 
 def test_bpf_no_nodes_is_missing(tmp_path):
@@ -505,6 +532,104 @@ def test_setup_harness_stage_installs_dev_extras(tmp_path):
     assert proc.returncode == 0, proc.stderr
     calls = log.read_text().splitlines()
     assert f"pip install -e {repo}[dev]" in calls, calls
+
+
+# A fresh Mac's first python3 on PATH is Apple's 3.9 (/usr/bin/python3, Xcode
+# CLT), below requires-python >= 3.10; stage 3 used it anyway.
+_FAKE_PY = r"""#!/bin/sh
+case "$1" in
+  -c) exec "$REAL_PY" -c 'import sys; sys.version_info = (@VER@); exec(sys.argv[1])' "$2" ;;
+  -m) echo "@NAME@ $*" >> "$CALLS"
+      d="$4"; mkdir -p "$d/bin"
+      printf '#!/bin/sh\nexit 0\n' > "$d/bin/python"
+      printf '#!/bin/sh\necho "pip $*" >> "$CALLS"\n' > "$d/bin/pip"
+      chmod 755 "$d/bin/python" "$d/bin/pip" ;;
+esac
+"""
+
+
+def _stage3_with(tmp_path: Path, interpreters: dict[str, str]) -> tuple[subprocess.CompletedProcess, Path, list[str]]:
+    """Run stage 3 with only *interpreters* (name -> "3, 9, 6") ahead of /usr/bin."""
+    import sys
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for name, ver in interpreters.items():
+        f = bindir / name
+        f.write_text(_FAKE_PY.replace("@VER@", ver).replace("@NAME@", name))
+        f.chmod(0o755)
+    # /usr/bin and /bin hold a real python3 on macOS; shadow them with a
+    # PATH of only the fake bin dir plus the tools the script itself needs.
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    for tool in ("bash", "mkdir", "chmod", "dirname", "cat"):
+        real = shutil.which(tool)
+        if real:
+            (tools / tool).symlink_to(real)
+    venv = tmp_path / "venv"
+    repo = tmp_path / "repo"
+    calls = tmp_path / "calls"
+    calls.touch()
+    program = (
+        "set -u\n"
+        + _section(SETUP, "# ---------- logging helpers", "# ---------- arg parsing")
+        + f"DRY_RUN=0\nNO_HARNESS=0\nVENV_DIR={shlex.quote(str(venv))}\n"
+        + f"REPO_ROOT={shlex.quote(str(repo))}\n"
+        + "run_cmd() { shift; \"$@\"; }\n"
+        + _section(SETUP, "# ---------- Stage 3", "# ---------- Stage 4")
+        + "\nstage_harness_install\n"
+    )
+    proc = _run(program, {"PATH": f"{bindir}:{tools}", "CALLS": str(calls), "REAL_PY": sys.executable})
+    assert proc.returncode == 0, proc.stderr
+    venv_calls = [c for c in calls.read_text().splitlines() if " -m venv " in c]
+    return proc, venv, venv_calls
+
+
+def test_stage3_builds_the_venv_with_a_python_that_meets_requires_python(tmp_path):
+    _proc, venv, venv_calls = _stage3_with(tmp_path, {"python3": "3, 9, 6", "python3.13": "3, 13, 16"})
+    assert venv_calls == [f"python3.13 -m venv --system-site-packages {venv}"], venv_calls
+
+
+def test_stage3_refuses_when_no_python_meets_requires_python(tmp_path):
+    proc, venv, venv_calls = _stage3_with(tmp_path, {"python3": "3, 9, 6"})
+    assert venv_calls == [], venv_calls
+    assert not venv.exists()
+    assert "no python3 >= 3.10" in proc.stdout + proc.stderr, proc.stdout
+
+
+def test_setup_exits_not_ready_when_an_install_stage_failed(tmp_path):
+    """A failed stage 3 used to end READY/0: verify fell back to another venv."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for tool in ("bash", "mkdir", "dirname"):
+        (bindir / tool).symlink_to(shutil.which(tool))
+    program = (
+        "set -u\n"
+        + _section(SETUP, "# ---------- logging helpers", "# ---------- arg parsing")
+        + f"DRY_RUN=0\nNO_HARNESS=0\nVENV_DIR={shlex.quote(str(tmp_path / 'venv'))}\n"
+        + f"REPO_ROOT={shlex.quote(str(tmp_path))}\n"
+        + _section(SETUP, "# ---------- Stage 3", "# ---------- Stage 4")
+        + _section(SETUP, "# ---------- Stage 6", "# ---------- main")
+        + "stage_harness_install\nVERIFY_EXIT=0\nprint_summary\n"
+        + 'setup_exit_code; echo "RC=$?"\n'
+    )
+    proc = _run(program, {"PATH": str(bindir)})
+    assert "RC=1" in proc.stdout, proc.stdout + proc.stderr
+    assert "install step" in proc.stdout, proc.stdout
+
+
+@pytest.mark.parametrize(("verify", "rc"), [(0, 0), (1, 1), (2, 3), (7, 3)])
+def test_setup_exit_mirrors_verify_when_no_stage_failed(verify, rc):
+    program = (
+        "set -u\n"
+        + _section(SETUP, "# ---------- logging helpers", "# ---------- arg parsing")
+        + "DRY_RUN=0\n"
+        + _section(SETUP, "# ---------- Stage 6", "# ---------- main")
+        + f"VERIFY_EXIT={verify}\nprint_summary\n"
+        + 'setup_exit_code; echo "RC=$?"\n'
+    )
+    proc = _run(program)
+    assert f"RC={rc}" in proc.stdout, proc.stdout + proc.stderr
 
 
 # ---------------------------------------------------------------------------

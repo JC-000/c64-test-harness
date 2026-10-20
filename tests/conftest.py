@@ -752,7 +752,7 @@ def require_vice_or_skip() -> None:
 # four elevated prerequisites: (a) ``vice_root`` -- a NOPASSWD sudoers
 # rule for the exact x64sc path VICE's ethernet driver needs root for;
 # (b) ``bridge_scripts`` -- NOPASSWD rules for the bridge lifecycle
-# scripts; (c) ``bpf_nodes`` -- a world-rw ``/dev/bpf*`` node for
+# scripts; (c) ``bpf_nodes`` -- a ``/dev/bpf*`` node this user can open for
 # host-side capture; (d) ``bridge_iface`` -- the bridge interface(s)
 # present and up.  On a bench missing one, the affected tests silently
 # skip and the reason is visible only under ``-rs``.
@@ -920,7 +920,8 @@ def _probe_bridge_scripts(scripts: tuple[str, ...] | None = None) -> tuple[bool,
 
 
 def _probe_bpf_nodes() -> tuple[bool, str]:
-    """(c): a world-rw ``/dev/bpf*`` node for host-side capture.
+    """(c): a ``/dev/bpf*`` node this user can open (other-rw, or group-rw
+    via ChmodBPF's ``access_bpf``) for host-side capture.
 
     Opens -- and immediately closes -- at most one node, matching the
     same node the real capture path would take.  A no-op (satisfied) on

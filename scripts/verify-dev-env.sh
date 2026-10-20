@@ -470,40 +470,46 @@ pkg_install_cmd() {
 # ---------- BPF node check (begin) ----------------------------------------
 #
 # macOS host-side capture opens /dev/bpfN directly, and so do the ethernet
-# TX/RX tests, so every node they might be handed must be other-rw.  A
+# TX/RX tests, so every node they might be handed must be rw for us.  A
 # root VICE takes the two lowest free nodes and each dnsmasq DHCP rig on
 # the bench holds one permanently, so the node the harness actually gets
 # is often bpf4 or higher -- and a node a root process creates later
 # starts out root-only (`chmod o+rw /dev/bpf*` covers only the nodes that
 # exist when it runs).  Checking /dev/bpf0 alone reported ok while bpf4
 # was root-only (#502), so every existing node is checked and the failing
-# ones are named.  C64H_DEV_DIR (default /dev) exists for
-# tests/test_verify_dev_env_checks.py; the modes come from `ls -ld`, whose
-# first ten columns are the same on BSD and GNU ls.
+# ones are named.  A node is usable when it is other-rw, or group-rw for
+# a group this user is in: Wireshark's ChmodBPF leaves every node
+# root:access_bpf 0660, which the old other-rw-only check reported as a
+# gap on a machine where capture worked.  C64H_DEV_DIR (default /dev) and
+# C64H_USER_GROUPS (default `id -Gn`) exist for
+# tests/test_verify_dev_env_checks.py; mode and group come from `ls -ld`,
+# whose first four columns are the same on BSD and GNU ls.
 check_bpf_nodes() {
     local sec="$1"
     local dev_dir="${C64H_DEV_DIR:-/dev}"
-    local node mode name
+    local groups=" ${C64H_USER_GROUPS:-$(id -Gn 2>/dev/null)} "
+    local node mode group name
     local total=0 bad="" good=""
     for node in "$dev_dir"/bpf[0-9]*; do
         [ -e "$node" ] || continue
         total=$((total + 1))
         name="${node##*/}"
-        mode="$(ls -ld "$node" 2>/dev/null | awk '{print $1}')"
-        # Characters 8 and 9 of the mode string are other-read, other-write.
-        if [ "${mode:7:2}" = "rw" ]; then
+        read -r mode _ _ group _ <<<"$(ls -ld "$node" 2>/dev/null)"
+        # Mode characters 5-6 are group-read/write, 8-9 other-read/write.
+        if [ "${mode:7:2}" = "rw" ] \
+            || { [ "${mode:4:2}" = "rw" ] && [[ "$groups" == *" $group "* ]]; }; then
             good="${good:+$good }$name"
         else
             bad="${bad:+$bad }$name"
         fi
     done
     if [ "$total" -eq 0 ]; then
-        record "$sec" "/dev/bpf* other-rw" missing "no /dev/bpf* device" 0
+        record "$sec" "/dev/bpf* access" missing "no /dev/bpf* device" 0
     elif [ -z "$bad" ]; then
-        record "$sec" "/dev/bpf* other-rw" ok "all $total nodes other-rw ($good); a node a root process creates later starts root-only" 0
+        record "$sec" "/dev/bpf* access" ok "all $total nodes rw for this user; a node a root process creates later starts root-only unless ChmodBPF is installed" 0
     else
-        record "$sec" "/dev/bpf* other-rw" warn "not other-rw: $bad (host-side packet capture and the ethernet TX/RX tests fail on any node they are handed that is root-only; VICE's pcap driver needs root regardless)" 0
-        add_hint "Make every /dev/bpf* node other-rw: sudo chmod o+rw /dev/bpf* (lasts until reboot, and covers only nodes that exist -- re-run it after a root process creates bpf4+) or install Wireshark's ChmodBPF (permanent)"
+        record "$sec" "/dev/bpf* access" warn "no rw access: $bad (host-side packet capture and the ethernet TX/RX tests fail on any node they are handed that is root-only; VICE's pcap driver needs root regardless)" 0
+        add_hint "Make every /dev/bpf* node rw for you: sudo chmod o+rw /dev/bpf* (lasts until reboot, and covers only nodes that exist -- re-run it after a root process creates bpf4+) or install Wireshark's ChmodBPF (permanent: nodes root:access_bpf 0660) and add yourself to access_bpf, then log in again"
     fi
 }
 # ---------- BPF node check (end) ------------------------------------------
