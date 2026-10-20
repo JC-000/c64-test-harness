@@ -1352,3 +1352,20 @@ def test_refusal_for_stock_when_the_patched_build_is_unusable_names_bpf(monkeypa
     assert "/opt/homebrew/opt/vice-eth/bin/x64sc is installed" in msg
     assert "access_bpf" in msg
     assert "build the patched VICE" not in msg
+
+
+def test_refusal_for_a_chosen_stock_binary_names_the_setting_not_bpf(monkeypatch, tmp_path):
+    """The patched build works for this user, but $VICE_ETHERNET_BIN (or
+    executable) chose stock: BPF access is fine, so do not blame it."""
+    _as_uid(monkeypatch, 501)
+    monkeypatch.setattr(ve.sys, "platform", "darwin")
+    _no_sudo(monkeypatch)
+    _patched_features(monkeypatch, bpf_permissions=False)
+    monkeypatch.setattr(ve, "patched_vice_binary", lambda: "/opt/homebrew/opt/vice-eth/bin/x64sc")
+    monkeypatch.setattr(ve, "usable_patched_vice_binary", lambda: "/opt/homebrew/opt/vice-eth/bin/x64sc")
+    with pytest.raises(ve.ViceElevationRequiredError) as excinfo:
+        ve.plan_vice_launch(ViceConfig(ethernet=True, ethernet_driver="pcap"), _eth_argv())
+    msg = str(excinfo.value)
+    assert "would run ethernet as you" in msg
+    assert "VICE_ETHERNET_BIN" in msg
+    assert "access_bpf" not in msg

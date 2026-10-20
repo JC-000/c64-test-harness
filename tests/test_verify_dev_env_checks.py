@@ -865,7 +865,9 @@ def test_setup_keeps_plain_help_when_it_lists_the_flags(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _vice_eth_rows(tmp_path: Path, check_rc: int, *, x64sc: bool = True) -> tuple[dict[str, list[str]], list[str]]:
+def _vice_eth_rows(
+    tmp_path: Path, check_rc: int, *, x64sc: bool = True, bpf_mode: int = 0o606
+) -> tuple[dict[str, list[str]], list[str]]:
     fake = tmp_path / "build-vice-eth.sh"
     fake.write_text(f"#!/bin/sh\necho 'build-vice-eth: state {check_rc}'\nexit {check_rc}\n")
     fake.chmod(0o755)
@@ -876,7 +878,7 @@ def _vice_eth_rows(tmp_path: Path, check_rc: int, *, x64sc: bool = True) -> tupl
     proc = _check_system(
         "Darwin",
         {
-            "C64H_DEV_DIR": str(_fake_dev(tmp_path, {"bpf0": 0o606})),
+            "C64H_DEV_DIR": str(_fake_dev(tmp_path, {"bpf0": bpf_mode})),
             "C64H_BUILD_VICE_ETH": str(fake),
             "C64H_X64SC_PATH": str(stock),
         },
@@ -914,3 +916,9 @@ def test_without_a_patched_build_the_x64sc_rule_is_required(tmp_path):
 def test_no_x64sc_and_no_patched_build_has_no_sudo_row(tmp_path):
     rows, _hints_ = _vice_eth_rows(tmp_path, 2, x64sc=False)
     assert "NOPASSWD sudo for x64sc" not in rows
+
+
+def test_a_patched_build_without_bpf_access_still_needs_the_x64sc_rule(tmp_path):
+    """The harness falls back to stock + sudo when no node is usable."""
+    rows, _hints_ = _vice_eth_rows(tmp_path, 0, bpf_mode=0o600)
+    assert rows["NOPASSWD sudo for x64sc"][0] == "warn"

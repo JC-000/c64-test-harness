@@ -421,7 +421,8 @@ def ethernet_vice_binary() -> str:
     misreading of the crash an *unelevated* launch produces -- see
     ``vice_elevation``.)  On macOS that binary needs root for ethernet;
     when ``scripts/build-vice-eth.sh`` has built the patched ``vice-eth``,
-    :func:`resolve_vice_executable` prefers it without this being set.
+    :func:`resolve_vice_executable` prefers it without this being set,
+    when it can run ethernet as this user.
 
     Set it only for a bench that must launch a different binary.
     :func:`resolve_vice_executable` probes whichever binary it resolves

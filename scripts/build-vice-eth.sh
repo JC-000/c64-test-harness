@@ -102,7 +102,7 @@ installed_x64sc() { printf '%s/bin/x64sc\n' "$(brew --prefix "$NAME")"; }
 # The -features table as "NAME value" lines, sorted, without the marker row.
 feature_table() { "$1" -default -features 2>/dev/null | awk -v m="$MARKER" 'NF >= 2 && $1 != m && $2 ~ /^(yes|no)$/ { print $1, $2 }' | sort; }
 
-# check: print why, return 0 current / 1 stale or diverged / 2 not built.
+# check: print why, return 0 current / 1 stale or diverged / 2 not built or not patched.
 # 2 also covers a vice-eth that does not report the marker: the harness
 # reads such a binary as stock and wants root for it, so it is no patched
 # build as far as anyone running the harness is concerned.

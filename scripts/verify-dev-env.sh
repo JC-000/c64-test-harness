@@ -503,6 +503,8 @@ check_bpf_nodes() {
             bad="${bad:+$bad }$name"
         fi
     done
+    # For the x64sc sudo row: the patched VICE needs just one usable node.
+    [ -n "$good" ] && BPF_ANY_RW=1
     if [ "$total" -eq 0 ]; then
         record "$sec" "/dev/bpf* access" missing "no /dev/bpf* device" 0
     elif [ -z "$bad" ]; then
@@ -583,8 +585,8 @@ check_system() {
         # (backends/vice_elevation.py) sudo-wraps the launch and needs a
         # NOPASSWD rule for the exact x64sc path.  The patched build from
         # scripts/build-vice-eth.sh accepts a read-write /dev/bpf* node
-        # instead and the harness prefers it, so with it built that rule is
-        # not needed.  --check is read-only (brew cat/list/--prefix and two
+        # instead, and the harness prefers it when it can run as you (built
+        # and patched, and some node is rw), so then that rule is not needed.  --check is read-only (brew cat/list/--prefix and two
         # `x64sc -features`).
         local build_vice_eth="${C64H_BUILD_VICE_ETH:-$repo_root/scripts/build-vice-eth.sh}"
         local eth_state="" eth_rc=0
@@ -603,7 +605,7 @@ check_system() {
             *) record "$sec" "patched VICE (ethernet without root)" unknown "$eth_state" 0 ;;
         esac
         local x64sc_path="${C64H_X64SC_PATH:-/opt/homebrew/bin/x64sc}"
-        if [ "$eth_rc" = "0" ] || [ "$eth_rc" = "1" ]; then
+        if { [ "$eth_rc" = "0" ] || [ "$eth_rc" = "1" ]; } && [ "${BPF_ANY_RW:-0}" = "1" ]; then
             record "$sec" "NOPASSWD sudo for x64sc" ok "not needed: the patched vice-eth runs ethernet as you" 0
         elif [ -x "$x64sc_path" ]; then
             if nopasswd_for "$x64sc_path"; then

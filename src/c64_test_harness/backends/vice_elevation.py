@@ -624,6 +624,12 @@ def _unprivileged_route(binary: str) -> str:
             + bpf_remedy
         )
     patched = patched_vice_binary()
+    if patched is not None and usable_patched_vice_binary() is not None:
+        return (
+            f"The patched build at {patched} would run ethernet as you, but "
+            f"this launch chose a stock x64sc ($VICE_ETHERNET_BIN, "
+            f"ethernet_executable or executable). Unset that to use it.\n"
+        )
     if patched is not None:
         return (
             f"The patched build at {patched} is installed, but it cannot run "
