@@ -64,7 +64,7 @@ Gates (all unset -> the module skips cleanly):
 * ``U64_HOST``     -- the device (no IPs are committed).
 * ``RRNET_IFACE``  -- host NIC on the cartridge's link (default ``en4``).
 
-Needs a capture node the process can open (macOS: world-rw ``/dev/bpf*``;
+Needs a capture node the process can open (macOS: a ``/dev/bpf*`` node this user can read and write;
 Linux: ``CAP_NET_RAW``).  Sets ``Cartridge Preference = External`` for the
 module and restores it to the ``default`` the device reports, never the value
 read at entry (#412).  No elevation marker: nothing here changes host

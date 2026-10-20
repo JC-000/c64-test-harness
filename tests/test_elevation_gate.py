@@ -2,8 +2,8 @@
 
 Ten live test files each grew their own ad hoc ``skipif`` for one of four
 elevated prerequisites (a NOPASSWD sudoers rule for the exact x64sc path,
-NOPASSWD rules for the bridge lifecycle scripts, world-rw ``/dev/bpf*``
-nodes, or the bridge interface being up).  On a bench missing one, the
+NOPASSWD rules for the bridge lifecycle scripts, ``/dev/bpf*`` nodes this
+user can open, or the bridge interface being up).  On a bench missing one, the
 affected tests silently skip and the reason is visible only under
 ``-rs``.  ``@pytest.mark.elevation(kind)`` replaces the ad hoc copies
 with one probe per kind, evaluated once per session (cached), and a

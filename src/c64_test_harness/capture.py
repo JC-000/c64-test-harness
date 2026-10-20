@@ -15,8 +15,9 @@ host-side proof that emitted frames reach the wire at all (issue #158).
   ``BIOCSHDRCMPLT`` so injected source MACs are left alone.  Needs a
   node the process can open: macOS ships ``/dev/bpf0-3`` root-only and
   creates further nodes on demand *only for root*, so the unelevated
-  path relies on ``sudo chmod o+rw /dev/bpf*`` having been run (the
-  mode does not survive a reboot).  VICE, which the harness runs as
+  path relies on Wireshark's ChmodBPF (nodes ``root:access_bpf 0660``
+  for members of ``access_bpf``, every boot) or on ``sudo chmod o+rw
+  /dev/bpf*`` having been run (lost on reboot).  VICE, which the harness runs as
   root, takes the lowest two free nodes per instance -- the very ones
   the chmod opened -- so a bench with one VICE up typically has one
   node left for this module.

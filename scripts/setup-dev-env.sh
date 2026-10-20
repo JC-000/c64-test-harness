@@ -72,7 +72,13 @@ log_install(){ log "install" "$1"; }
 log_ok()    { log "ok" "$1"; }
 log_skip()  { log "skip" "$1"; }
 log_warn()  { log "warn" "$1"; }
-log_fail()  { log "fail" "$1"; }
+# Every [fail] counts: verify-dev-env.sh can still say READY after a stage
+# failed (it falls back to the canonical venv), so the exit code must not
+# rest on verify alone.
+STAGE_FAILURES=0
+log_fail()  { STAGE_FAILURES=$((STAGE_FAILURES + 1)); log "fail" "$1"; }
+# A further [fail] line about the failure just counted.
+log_fail_more() { log "fail" "$1"; }
 log_dry()   { log "dry-run" "$1"; }
 
 banner() {
@@ -127,8 +133,8 @@ OPTIONS:
   -h, --help            Print this help
 
 EXIT CODES:
-  0  verify-dev-env.sh reports READY
-  1  verify-dev-env.sh reports NOT READY (one or more stages failed or were skipped)
+  0  verify-dev-env.sh reports READY and no install step failed
+  1  verify-dev-env.sh reports NOT READY, or an install step failed
   2  installer error (bad arg, OS mismatch without --force, not in repo)
   3  verify-dev-env.sh itself is broken (exit 2)
 EOF
@@ -266,9 +272,8 @@ check_repo_root() {
 # macOS variant of stage 1. The Linux path installs a large build toolchain
 # because it then builds VICE 3.10 from source; on macOS we consume the
 # Homebrew `vice` bottle instead (which also provides x64sc + c1541 +
-# ethernet support), so the only required package is `vice`. Python is
-# assumed to be already installed (Homebrew Python or system python3 >=
-# 3.10 per verify-dev-env.sh).
+# ethernet support), plus python@3.13 because macOS's own python3 is 3.9,
+# below the harness's requires-python >= 3.10.
 #
 # Homebrew must NOT be run as root -- doing so corrupts the prefix
 # permissions. We never call `sudo brew`. If brew is missing we print a
@@ -276,16 +281,18 @@ check_repo_root() {
 stage_system_packages_macos() {
     if ! command -v brew >/dev/null 2>&1; then
         log_fail "Homebrew (brew) not found on PATH"
-        log_fail "Install Homebrew first: https://brew.sh"
-        log_fail "Then re-run this script. Do not run Homebrew as root."
+        log_fail_more "Install Homebrew first: https://brew.sh"
+        log_fail_more "Then re-run this script. Do not run Homebrew as root."
         exit 2
     fi
     log_ok "Homebrew found at $(command -v brew)"
 
     # Minimum macOS package set for the harness. `vice` is the only hard
-    # requirement; `curl` is in the base system on every supported macOS.
+    # requirement besides a Python >= 3.10; `curl` is in the base system on every
+    # supported macOS.
     local packages=(
         vice                  # x64sc, c1541 -- Homebrew bottle includes ethernet
+        python@3.13           # stage 3's venv: /usr/bin/python3 is 3.9
     )
 
     if [ "$DRY_RUN" = "1" ]; then
@@ -429,7 +436,7 @@ stage_system_packages() {
         log_ok "all packages installed after retry"
     else
         log_fail "could not install: ${failed[*]}"
-        log_fail "suggested debugging: apt-cache search <base-name> for each"
+        log_fail_more "suggested debugging: apt-cache search <base-name> for each"
     fi
 }
 
@@ -575,6 +582,26 @@ stage_vice_build() {
 
 # ---------- Stage 3: Python harness install -------------------------------
 
+# The first python3 on PATH is not necessarily new enough: on a fresh Mac it
+# is Apple's /usr/bin/python3 (3.9, Xcode CLT), below the package's
+# requires-python >= 3.10.  Take the first versioned interpreter that meets
+# it, newest first, then plain python3.  Prints nothing when none does.
+python_meets_floor() {
+    "$1" -c 'import sys; sys.exit(sys.version_info < (3, 10))' >/dev/null 2>&1
+}
+
+pick_venv_python() {
+    local py
+    for py in python3.14 python3.13 python3.12 python3.11 python3.10 python3; do
+        command -v "$py" >/dev/null 2>&1 || continue
+        if python_meets_floor "$py"; then
+            printf '%s\n' "$py"
+            return 0
+        fi
+    done
+    return 1
+}
+
 stage_harness_install() {
     banner "Stage 3 -- Python harness editable install (dedicated venv)"
     if [ "$NO_HARNESS" = "1" ]; then
@@ -612,7 +639,12 @@ stage_harness_install() {
 
     if [ "$DRY_RUN" = "1" ]; then
         log_dry "mkdir -p $(dirname "$VENV_DIR")"
-        log_dry "python3 -m venv --system-site-packages $VENV_DIR"
+        local dry_python
+        if dry_python="$(pick_venv_python)"; then
+            log_dry "$dry_python -m venv --system-site-packages $VENV_DIR"
+        else
+            log_warn "no python3 >= 3.10 on PATH: a real run stops here (macOS: brew install python@3.13)"
+        fi
         log_dry "$VENV_DIR/bin/pip install --upgrade pip"
         log_dry "$VENV_DIR/bin/pip install -e $REPO_ROOT[dev]"
         log_dry "$VENV_DIR/bin/python -c 'import c64_test_harness; print(c64_test_harness.__version__)'"
@@ -624,10 +656,19 @@ stage_harness_install() {
     log_install "creating venv at $VENV_DIR"
     run_cmd "mkdir-venv-parent" mkdir -p "$(dirname "$VENV_DIR")"
     if [ ! -x "$VENV_DIR/bin/python" ]; then
-        if ! python3 -m venv --system-site-packages "$VENV_DIR"; then
-            log_fail "python3 -m venv failed -- is python3-venv installed?"
+        local venv_python
+        if ! venv_python="$(pick_venv_python)"; then
+            log_fail "no python3 >= 3.10 on PATH (macOS: brew install python@3.13)"
             return
         fi
+        if ! "$venv_python" -m venv --system-site-packages "$VENV_DIR"; then
+            log_fail "$venv_python -m venv failed -- is python3-venv installed?"
+            return
+        fi
+    elif ! python_meets_floor "$VENV_DIR/bin/python"; then
+        # e.g. left behind by an older installer that used macOS's 3.9.
+        log_fail "venv at $VENV_DIR is older than Python 3.10: rm -rf $VENV_DIR and re-run"
+        return
     else
         log_skip "venv already present at $VENV_DIR (reusing)"
     fi
@@ -767,15 +808,13 @@ run_verify() {
     # verify-dev-env.sh is non-destructive; run it even in dry-run mode so the
     # user sees the current state of the machine.
     #
-    # verify-dev-env.sh uses plain `python3` to probe for the harness. Since
-    # we install into a dedicated venv (stage 3), that `python3` would
-    # resolve to system Python and fail the import check even though the
-    # install succeeded. Prepend the venv's bin dir to PATH for the verify
-    # invocation only -- this mirrors what an activated venv does, and
-    # avoids modifying verify-dev-env.sh in this PR.
+    # Point verify at the venv stage 3 built, as an activated venv would:
+    # VIRTUAL_ENV is what its interpreter selection checks first; without it
+    # verify falls back to the canonical venv and can report READY for a
+    # different venv from the one just built.
     if [ -x "$VENV_DIR/bin/python3" ] || [ -x "$VENV_DIR/bin/python" ]; then
-        log_install "prepending $VENV_DIR/bin to PATH for verify run"
-        PATH="$VENV_DIR/bin:$PATH" "$verify"
+        log_install "verifying the venv at $VENV_DIR"
+        PATH="$VENV_DIR/bin:$PATH" VIRTUAL_ENV="$VENV_DIR" "$verify"
     else
         "$verify"
     fi
@@ -786,6 +825,11 @@ run_verify() {
 
 print_summary() {
     banner "Summary"
+    # Snapshot before the verify verdict below adds its own [fail].
+    INSTALL_FAILURES=$STAGE_FAILURES
+    if [ "$INSTALL_FAILURES" -gt 0 ]; then
+        log_fail "$INSTALL_FAILURES install step(s) failed above -- NOT READY whatever verify says"
+    fi
     case "$VERIFY_EXIT" in
         0)
             log_ok "verify-dev-env.sh says READY"
@@ -805,6 +849,16 @@ print_summary() {
     fi
 }
 
+# 0 READY, 1 NOT READY (verify said so, or an install step failed),
+# 3 verify-script broken.  Call after print_summary.
+setup_exit_code() {
+    case "$VERIFY_EXIT" in
+        0) [ "$INSTALL_FAILURES" -gt 0 ] && return 1; return 0 ;;
+        1) return 1 ;;
+        *) return 3 ;;
+    esac
+}
+
 # ---------- main ----------------------------------------------------------
 
 main() {
@@ -821,12 +875,8 @@ main() {
     stage_u64_probe
     run_verify
     print_summary
-    case "$VERIFY_EXIT" in
-        0) exit 0 ;;
-        1) exit 1 ;;
-        2) exit 3 ;;
-        *) exit 3 ;;
-    esac
+    setup_exit_code
+    exit $?
 }
 
 main "$@"

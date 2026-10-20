@@ -74,12 +74,12 @@ Steps 6-8 are needed only for the ethernet/bridge tests.
 
    On a machine shared with other networking rigs, the `feth` pair and the `10.0.65.0/24` host address can collide with theirs. See [docs/bridge_networking.md](bridge_networking.md) for the full lifecycle.
 
-7. **BPF node permissions, for host-side packet capture.** The harness's own capture (`c64_test_harness.capture`, and the tests marked `elevation("bpf_nodes")`) opens `/dev/bpf*` directly. It needs no sudo, but only while the nodes are world-rw. **VICE is not affected by these permissions**: it runs as root (step 8), and its pcap gate is `geteuid()`, not the node mode (see Caveats). Grant access with one of:
+7. **BPF node permissions, for host-side packet capture.** The harness's own capture (`c64_test_harness.capture`, and the tests marked `elevation("bpf_nodes")`) opens `/dev/bpf*` directly. It needs no sudo, but only while the nodes are readable and writable by you: other-rw, or group-rw for a group you are in. **VICE is not affected by these permissions**: it runs as root (step 8), and its pcap gate is `geteuid()`, not the node mode (see Caveats). Grant access with one of:
 
    - **One-shot:** `sudo chmod o+rw /dev/bpf*`. This resets on the next boot. It must cover more than `bpf0-3`: a root VICE takes the two lowest free nodes, and each dnsmasq DHCP rig on a shared bench holds one node permanently. Nodes above `bpf3` exist only once some root process has opened them, so re-run the `chmod` after that.
-   - **Persistent:** on a fresh machine, install Wireshark and run its **ChmodBPF** helper. The project's dev machine has no ChmodBPF daemon and uses the `chmod`.
+   - **Persistent:** install Wireshark's **ChmodBPF** (`brew install --cask wireshark-chmodbpf`). At boot its LaunchDaemon runs `chgrp access_bpf` and `chmod g+rw` on every node, which leaves the default `0600` nodes `root:access_bpf 0660`. Its installer already adds the installing user (and the `admin` group) to `access_bpf`; otherwise add yourself and log in again. The dev machine has used it since 2026-10-19, as the previous one did.
 
-   `verify-dev-env.sh` checks every existing `/dev/bpf*` node for other-rw and names each one that fails (#502). A node a root process creates later starts root-only, so a green row holds only until then.
+   `verify-dev-env.sh` checks every existing `/dev/bpf*` node and names each one you cannot read and write (#502). A node a root process creates later starts root-only unless ChmodBPF is installed, so with the `chmod` a green row holds only until then.
 
 8. **Passwordless sudo for bridge lifecycle AND the VICE ethernet tests.** Two things on macOS need root and are driven non-interactively by the harness, so both need NOPASSWD sudoers entries:
 
@@ -123,7 +123,7 @@ Steps 6-8 are needed only for the ethernet/bridge tests.
 - stage 4 runs `setup-bridge-feth-macos.sh`;
 - `--force` and `--sha256` are ignored.
 
-The dev machine was not set up with it, and no macOS run of it is recorded. Its stage 3 builds the venv from whichever `python3` is first on `PATH`, which must be ≥ 3.10. It does not do steps 7-8.
+Its stage 1 also installs `python@3.13`, and stage 3 builds the venv from the newest `python3.1x` ≥ 3.10 on `PATH`. It does not do steps 7-8. The first recorded macOS run was on 2026-10-20 with `--no-system-packages --no-bridge --no-u64`, so stage 1 has still not run on macOS: stage 3 built the venv on 3.13.16 and installed the harness into it. Verify reported READY, but it checked the canonical venv rather than the new one; the installer now points verify at the venv it built. At `c89f9cf` the same run had taken `/usr/bin/python3` 3.9.6, failed the editable install (`requires a different Python: 3.9.6 not in '>=3.10'`), and still exited 0 (see [Bringing up a new machine](#bringing-up-a-new-machine)).
 
 ### Caveats
 
@@ -164,6 +164,57 @@ The dev machine was not set up with it, and no macOS run of it is recorded. Its 
 - **libpcap over BPF self-delivers broadcasts on macOS.** `libpcap` sets `BIOCSSEESENT=1` whenever `pcap_set_promisc(1)` is on, which means the sender's own pcap handle receives its own outbound broadcast frames back as inbound. VICE's `pcap` driver feeds those back into the CS8900a RX FIFO, so after a TX phase the sender's CS8900a has its own just-sent frame queued for read. Any test that TX's then later RX's on the same transport (e.g. `test_bidirectional_exchange` in `tests/test_ethernet_bridge.py`) must drain the FIFO first or it will read the stale self-frame. `_drain_cs8900a_rx` in `tests/test_ethernet_bridge.py` is the 6502 helper that handles this; the `_build_rx_code(..., expected_src_mac=...)` src-MAC filter is the defence-in-depth layer. Unicast tests (e.g. the ICMP suite which addresses frames to the peer's MAC) are not affected because `run_ping_and_wait` drains and re-polls on a mismatched frame (`build_read_and_match_echo_reply_code` returns `0x02` for anything that is not the expected echo reply) -- not because of IA filtering: `CS8900A_RXCTL_VALUE` sets PromiscuousA, so the chip accepts every unicast frame, and the old `0x00D8` had PromiscuousA set too.
 - **`multiprocessing` start method differs by platform.** macOS defaults to `spawn`, Linux defaults to `fork`. `spawn` re-imports the target module in the child and pickles the `Process(target=...)` callable, so any nested closure passed as `target` blows up with `AttributeError: Can't get local object`. Worker functions must live at module scope and receive everything they need via `args=`. Both `tests/test_port_lock.py` (three module-level `_child_*` helpers) and `scripts/stress_cross_process.py` (five `_*_worker` helpers) follow this pattern.
 
+## Bringing up a new machine
+
+The steps above build a harness. Moving to a new Mac takes more than that: some state lives outside git, other projects depend on this checkout, and the devices are shared. This is the order used on 2026-10-19 and 10-20 (Apple Silicon, macOS 27.0.1 build 26A434, Homebrew `vice` 3.10 and `python@3.13` 3.13.16), with what each step found.
+
+1. **Clone, don't copy.** Re-clone from GitHub, run `gh auth status`, and confirm `git log -1` matches `origin/master`.
+
+2. **Packages and venv.** Either follow steps 2-4 above, or run the installer without the root-only and device stages:
+
+   ```bash
+   ./scripts/setup-dev-env.sh --no-bridge --no-u64
+   ```
+
+   That exact command has not been run: both recorded macOS runs added `--no-system-packages`, so the macOS stage 1 (`brew install vice python@3.13`) is unrun. The installer now builds the venv from the newest `python3.1x` ≥ 3.10 on `PATH`, not plain `python3`. Before this, it took `/usr/bin/python3` (3.9) on a fresh Mac, `pip` refused the package, and the run still ended READY with exit 0: verify fell back to an existing canonical venv. Now a failed stage makes the installer exit 1, and a venv left behind on Python < 3.10 is refused with the `rm -rf` to run rather than reused. Add the `notify` extra if you want filesystem-event wakeups in `DeviceLock`: `pip install -e '.[dev,notify]'`.
+
+3. **Carry over the state that is not in git.** Recreate each item, or copy it across; do not assume a migration tool brought it.
+
+   - `~/.config/c64-test-harness/devices.toml`, the device alias map ([device_locking.md § Multi-interface devices](device_locking.md)). The 2026-10 migration archived it but did not restore it. A hand rebuild left out the U64E's WiFi address, so the original was then copied back from the archive. Copy the file across; rebuilding it from memory loses addresses. Without it, a device's ethernet and WiFi addresses become separate `DeviceLock`s and `/Temp` ledgers, and two lanes can drive one device at once. List every address of each device under its `unique_id` from `GET /v1/info`, and read that ID only while holding the device's lock:
+
+     ```toml
+     [devices.5d2518]   # C64U: ethernet, WiFi, old address
+     hosts = ["10.43.23.26", "10.43.23.158", "10.53.21.158"]
+     [devices.601a96]   # U64E: ethernet, WiFi (seen 2026-10-04)
+     hosts = ["10.43.23.81", "10.43.23.83"]
+     ```
+
+   - The `c64-test` skill symlink: `./scripts/install-skill.sh` (idempotent).
+
+4. **BPF access, for host-side capture.** Prefer Wireshark's ChmodBPF (`brew install --cask wireshark-chmodbpf`) to the one-shot `chmod`. It survives reboots and leaves every node `root:access_bpf 0660`. Its installer adds you to `access_bpf`; if `id -Gn` does not list it, add yourself and log in again. `verify-dev-env.sh` accepts that state: a node passes when it is other-rw, or group-rw for a group you are in. The check used to require other-rw, so it reported all 256 nodes as a gap on a machine where capture worked.
+
+5. **Elevation for the ethernet/bridge suite: decide, don't copy.** Step 8's sudoers drop-in gives NOPASSWD root to three scripts under a user-writable path and to `/opt/homebrew/bin/x64sc`, a user-writable prefix. Each of those is a path to root. The 2026-10 migration plan deliberately did not carry it over, and planned these instead:
+
+   - root-owned copies of the bridge scripts in `/usr/local/libexec/c64-harness/`;
+   - ChmodBPF;
+   - a BPF-patched VICE that runs unprivileged.
+
+   The harness does not support that layout yet: it wraps an ethernet VICE in `sudo -n` and names the repo's scripts. So on a machine without the drop-in, the ethernet/bridge tests skip with an `ELEVATION REQUIRED` notice, and nothing else is affected. The follow-up is tracked in [#541](https://github.com/JC-000/c64-test-harness/issues/541).
+
+6. **Mind the editable installs of other projects.** Other projects install this checkout editable into their own venvs; on 2026-10-20 the 1541ultimate lane did. Every source change, and every branch switch in the main checkout, then reaches their next run at once. Keep the main checkout on `master` while they work, and do branch work in a worktree with `PYTHONPATH=<worktree>/src`.
+
+7. **Exercise it offline.** Run `./scripts/verify-dev-env.sh --no-u64`, then `--smoke` (one headless VICE), then the full suite with no live gates set:
+
+   ```bash
+   ~/.local/share/c64-test-harness/venv/bin/pytest -q
+   ```
+
+   On 2026-10-20 at `c89f9cf`, with no live gates, no sudoers drop-in and no bridge, this run took 8 min 40 s: 7876 passed, 242 skipped, 2 xfailed, exit 0. Thirteen of the skips were the `ELEVATION REQUIRED` ones from step 5 (`bridge_iface` 8, `vice_root` 3, `bridge_scripts` 2). `verify-dev-env.sh --smoke` launched VICE, round-tripped 8 bytes and left no `x64sc` running.
+
+8. **Exercise it on hardware, only when the device is handed over.** The C64U and the U64E are shared, and another lane may be flashing either of them. Ask whoever is using them, wait for the handover, and check `device_lock_holder(host)` before you start. Every live run holds the `DeviceLock`: pytest takes it per test and scripts take it through `hold_device_lock`. On the C64U (fw 1.1.0, leak-prone), the CLAUDE.md hardware-safety clause applies in full. Route upload-heavy runs to the U64E.
+
+Two macOS facts that trip scripts written on Linux: stock macOS has no `timeout` command (Homebrew coreutils adds `timeout` and `gtimeout`), and pytest here has no `--timeout` option.
+
 ## Quick check: `scripts/verify-dev-env.sh`
 
 ```bash
@@ -182,7 +233,7 @@ The Python checks use the first interpreter found in this order: `$VIRTUAL_ENV`,
 | VICE | `x64sc` on `PATH`; VICE 3.10 version (on macOS `x64sc --version` exits early, so the version comes from `brew list --versions vice`, then the Cellar path, then a `-features` probe); `-ethernetcart` / `-ethernetioif` / `-ethernetiodriver` in `--help` (the key deployability gate: distro-packaged VICE usually lacks `--enable-ethernet`); `-binarymonitor` and `-remotemonitor` in `--help`; `c1541` on `PATH` |
 | Python | `python3` ≥ 3.10, `c64_test_harness` importable, `pytest` available |
 | Smoke (`--smoke` only) | Launches one headless VICE through the harness launcher (`scripts/vice_smoke.py`: `ViceProcess`/`ViceConfig`, `sound=False`, `minimize=True`), writes 8 bytes at `$033C` over the binary monitor, reads them back, and stops the process it started (critical when requested). It runs with this checkout's `src/` first on `PYTHONPATH`, and the ok row names the `c64_test_harness` file that ran |
-| System tools (macOS) | `ifconfig`; every existing `/dev/bpf*` node other-rw, naming the ones that are not; a NOPASSWD rule for each of the three `*-bridge-feth-macos.sh` scripts and for `/opt/homebrew/bin/x64sc` |
+| System tools (macOS) | `ifconfig`; every existing `/dev/bpf*` node rw for this user (other-rw, or group-rw for a group you are in, as ChmodBPF sets up), naming the ones that are not; a NOPASSWD rule for each of the three `*-bridge-feth-macos.sh` scripts and for `/opt/homebrew/bin/x64sc` |
 | System tools (Linux) | `ip`, `iptables`, `/dev/net/tun`, passwordless sudo (informational). The install hints for `ip`/`iptables` name the package manager found from `/etc/os-release` `ID`/`ID_LIKE`: `apt-get`, `dnf`, `pacman`, or a generic line when it is not recognised |
 | Bridge networking | macOS: `bridge10`, `feth0`, `feth1`. Linux: `br-c64`, `tap-c64-0`, `tap-c64-1` |
 | Ultimate 64 (optional) | HTTP GET `/v1/version`, only as described above |
@@ -222,7 +273,7 @@ Everything else is reported but does not fail the overall check: bridge, U64, sy
 
 ## Ubuntu 25: `scripts/setup-dev-env.sh`
 
-> **Last run 2026-09-28: passed** (#500), in a fresh Ubuntu 25.10 aarch64 VM (lima, cloud image `ubuntu-25.10-server-cloudimg-arm64` 20260703, no host mounts, port forwarding off). The first run at `2654952` failed: VICE's `configure` stopped on missing flex, bison, dos2unix, xa65, libevdev and libcurl headers, and after those were added the headless GTK3 `x64sc --help` printed no options, so the probe reported "built without --enable-ethernet". With both fixed, a second fresh VM ran `--dry-run`, then the real install (`SETUP_EXIT=0`, verify READY, 18 ok, 0 missing, 1 skipped), then an idempotent re-run (every stage skipped, READY), then `verify-dev-env.sh --smoke` (READY, VICE launched, 8 bytes round-tripped, no `x64sc` left running). A server image is not Ubuntu Desktop: the desktop-only parts (a display for the GTK3 window) are not covered. The macOS branch has still not been run.
+> **Last run 2026-09-28: passed** (#500), in a fresh Ubuntu 25.10 aarch64 VM (lima, cloud image `ubuntu-25.10-server-cloudimg-arm64` 20260703, no host mounts, port forwarding off). The first run at `2654952` failed: VICE's `configure` stopped on missing flex, bison, dos2unix, xa65, libevdev and libcurl headers, and after those were added the headless GTK3 `x64sc --help` printed no options, so the probe reported "built without --enable-ethernet". With both fixed, a second fresh VM ran `--dry-run`, then the real install (`SETUP_EXIT=0`, verify READY, 18 ok, 0 missing, 1 skipped), then an idempotent re-run (every stage skipped, READY), then `verify-dev-env.sh --smoke` (READY, VICE launched, 8 bytes round-tripped, no `x64sc` left running). A server image is not Ubuntu Desktop: the desktop-only parts (a display for the GTK3 window) are not covered. The macOS branch's first recorded run is under [macOS (Homebrew)](#macos-homebrew).
 
 On a clean Ubuntu Desktop 25 machine, one command is meant to take you from zero to "verify-dev-env.sh says READY":
 
@@ -256,10 +307,10 @@ The installer runs six stages. Every stage is **idempotent** (safe to re-run) an
 |---|-------|--------------|--------------|
 | 1 | `system packages` | `sudo apt-get install` the build toolchain, the tools VICE's `configure` demands (flex, bison, dos2unix, xa65), the VICE build deps (SDL2, GTK3, GLEW, libpcap, libevdev, libcurl, pulse/alsa, flac/vorbis/mpg123/lame) and the harness tooling (python3, pip, venv, iproute2, iptables). If a bulk install fails, retries per package to report which names drifted. Skipped, with a message, on a `--force`d distro whose package manager is not `apt-get`. | `--no-system-packages` |
 | 2 | `VICE 3.10 build` | Downloads the VICE 3.10 tarball from SourceForge into `~/.cache/c64-test-harness/build/`, extracts it, and runs `./configure --enable-ethernet --disable-html-docs --enable-gtk3ui`, `make -j$(nproc)`, `sudo make install`. Skips entirely if `x64sc --version` already reports VICE 3.10 and its help lists `-ethernetcart` (falling back to `x64sc -console --help` when a GTK3 build has no display). Optional `--sha256 HEX` pin. | `--no-vice` |
-| 3 | `Python harness` | Creates the venv at `~/.local/share/c64-test-harness/venv` (with `--system-site-packages`) and runs `pip install -e '.[dev]'` into it, so `pytest` is there. Skipped if the venv already exists, its `c64_test_harness` import resolves to this checkout and `pytest` imports. After success, prints the `source .../activate` command to run. | `--no-harness` |
+| 3 | `Python harness` | Creates the venv at `~/.local/share/c64-test-harness/venv` (with `--system-site-packages`, from the newest `python3.1x` ≥ 3.10 on `PATH`, falling back to `python3`) and runs `pip install -e '.[dev]'` into it, so `pytest` is there. Skipped if the venv already exists, its `c64_test_harness` import resolves to this checkout and `pytest` imports. After success, prints the `source .../activate` command to run. | `--no-harness` |
 | 4 | `bridge networking` | Runs `sudo ./scripts/setup-bridge-tap.sh` to create `br-c64` + `tap-c64-0` + `tap-c64-1`. Skipped if all three interfaces already exist. | `--no-bridge` |
 | 5 | `Ultimate 64 probe` | Runs only if `U64_HOST` is set in env or `--u64-host HOST` is passed. `curl`s `/v1/version` and reports reachability; never a failure. | `--no-u64` |
-| 6 | `verify-dev-env.sh` | Final sanity check. The installer's exit code mirrors this: `0` READY, `1` NOT READY, `3` verify-script broken. | (always runs) |
+| 6 | `verify-dev-env.sh` | Final sanity check. The installer's exit code mirrors it: `0` READY, `1` NOT READY, `3` verify-script broken. It is also `1` when any earlier stage logged a `[fail]`, the bridge stage included, even if verify says READY: verify can fall back to another venv. | (always runs) |
 
 ### CLI
 
