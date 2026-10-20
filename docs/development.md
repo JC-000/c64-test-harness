@@ -77,7 +77,7 @@ Steps 6-8 are needed only for the ethernet/bridge tests.
 7. **BPF node permissions, for host-side packet capture.** The harness's own capture (`c64_test_harness.capture`, and the tests marked `elevation("bpf_nodes")`) opens `/dev/bpf*` directly. It needs no sudo, but only while the nodes are readable and writable by you: other-rw, or group-rw for a group you are in. **VICE is not affected by these permissions**: it runs as root (step 8), and its pcap gate is `geteuid()`, not the node mode (see Caveats). Grant access with one of:
 
    - **One-shot:** `sudo chmod o+rw /dev/bpf*`. This resets on the next boot. It must cover more than `bpf0-3`: a root VICE takes the two lowest free nodes, and each dnsmasq DHCP rig on a shared bench holds one node permanently. Nodes above `bpf3` exist only once some root process has opened them, so re-run the `chmod` after that.
-   - **Persistent:** install Wireshark's **ChmodBPF** (`brew install --cask wireshark-chmodbpf`). Its LaunchDaemon sets every node to `root:access_bpf 0660` at boot. Add yourself to `access_bpf` and log in again. The dev machine has used this since 2026-10-20.
+   - **Persistent:** install Wireshark's **ChmodBPF** (`brew install --cask wireshark-chmodbpf`). At boot its LaunchDaemon runs `chgrp access_bpf` and `chmod g+rw` on every node, which leaves the default `0600` nodes `root:access_bpf 0660`. Its installer already adds the installing user (and the `admin` group) to `access_bpf`; otherwise add yourself and log in again. The dev machine has used it since 2026-10-19, as the previous one did.
 
    `verify-dev-env.sh` checks every existing `/dev/bpf*` node and names each one you cannot read and write (#502). A node a root process creates later starts root-only unless ChmodBPF is installed, so with the `chmod` a green row holds only until then.
 
@@ -123,7 +123,7 @@ Steps 6-8 are needed only for the ethernet/bridge tests.
 - stage 4 runs `setup-bridge-feth-macos.sh`;
 - `--force` and `--sha256` are ignored.
 
-Its stage 1 also installs `python@3.13`, and stage 3 builds the venv from the newest `python3.1x` ≥ 3.10 on `PATH`. It does not do steps 7-8. The first recorded macOS run was on 2026-10-20 with `--no-system-packages --no-bridge --no-u64`: stage 3 built the venv on 3.13.16, and verify reported READY. At `c89f9cf` the same run had taken `/usr/bin/python3` 3.9.6, failed the editable install (`requires a different Python: 3.9.6 not in '>=3.10'`), and still exited 0 (see [Bringing up a new machine](#bringing-up-a-new-machine)).
+Its stage 1 also installs `python@3.13`, and stage 3 builds the venv from the newest `python3.1x` ≥ 3.10 on `PATH`. It does not do steps 7-8. The first recorded macOS run was on 2026-10-20 with `--no-system-packages --no-bridge --no-u64`, so stage 1 has still not run on macOS: stage 3 built the venv on 3.13.16 and installed the harness into it. Verify reported READY, but it checked the canonical venv rather than the new one; the installer now points verify at the venv it built. At `c89f9cf` the same run had taken `/usr/bin/python3` 3.9.6, failed the editable install (`requires a different Python: 3.9.6 not in '>=3.10'`), and still exited 0 (see [Bringing up a new machine](#bringing-up-a-new-machine)).
 
 ### Caveats
 
@@ -166,7 +166,7 @@ Its stage 1 also installs `python@3.13`, and stage 3 builds the venv from the ne
 
 ## Bringing up a new machine
 
-The steps above build a harness. Moving to a new Mac takes more than that: some state lives outside git, other projects depend on this checkout, and the devices are shared. This is the order used on 2026-10-20 (Apple Silicon, macOS 27.0.1 build 26A434, Homebrew `vice` 3.10 and `python@3.13` 3.13.16), with what each step found.
+The steps above build a harness. Moving to a new Mac takes more than that: some state lives outside git, other projects depend on this checkout, and the devices are shared. This is the order used on 2026-10-19 and 10-20 (Apple Silicon, macOS 27.0.1 build 26A434, Homebrew `vice` 3.10 and `python@3.13` 3.13.16), with what each step found.
 
 1. **Clone, don't copy.** Re-clone from GitHub, run `gh auth status`, and confirm `git log -1` matches `origin/master`.
 
@@ -176,22 +176,22 @@ The steps above build a harness. Moving to a new Mac takes more than that: some 
    ./scripts/setup-dev-env.sh --no-bridge --no-u64
    ```
 
-   The installer now builds the venv from the newest `python3.1x` ≥ 3.10 on `PATH`, not plain `python3`. Before this, it took `/usr/bin/python3` (3.9) on a fresh Mac, `pip` refused the package, and the run still ended READY with exit 0: verify fell back to an existing canonical venv. Now a failed stage makes the installer exit 1. Add the `notify` extra if you want filesystem-event wakeups in `DeviceLock`: `pip install -e '.[dev,notify]'`.
+   That exact command has not been run: both recorded macOS runs added `--no-system-packages`, so the macOS stage 1 (`brew install vice python@3.13`) is unrun. The installer now builds the venv from the newest `python3.1x` ≥ 3.10 on `PATH`, not plain `python3`. Before this, it took `/usr/bin/python3` (3.9) on a fresh Mac, `pip` refused the package, and the run still ended READY with exit 0: verify fell back to an existing canonical venv. Now a failed stage makes the installer exit 1, and a venv left behind on Python < 3.10 is refused with the `rm -rf` to run rather than reused. Add the `notify` extra if you want filesystem-event wakeups in `DeviceLock`: `pip install -e '.[dev,notify]'`.
 
 3. **Carry over the state that is not in git.** Recreate each item, or copy it across; do not assume a migration tool brought it.
 
-   - `~/.config/c64-test-harness/devices.toml`, the device alias map ([device_locking.md § Multi-interface devices](device_locking.md)). It was **lost in the 2026-10 migration** and written again by hand. Without it, a device's ethernet and WiFi addresses become separate `DeviceLock`s and `/Temp` ledgers, and two lanes can drive one device at once. List every address of each device under its `unique_id` from `GET /v1/info`, and read that ID only while holding the device's lock:
+   - `~/.config/c64-test-harness/devices.toml`, the device alias map ([device_locking.md § Multi-interface devices](device_locking.md)). The 2026-10 migration archived it but did not restore it. A hand rebuild left out the U64E's WiFi address, so the original was then copied back from the archive. Copy the file across; rebuilding it from memory loses addresses. Without it, a device's ethernet and WiFi addresses become separate `DeviceLock`s and `/Temp` ledgers, and two lanes can drive one device at once. List every address of each device under its `unique_id` from `GET /v1/info`, and read that ID only while holding the device's lock:
 
      ```toml
      [devices.5d2518]   # C64U: ethernet, WiFi, old address
      hosts = ["10.43.23.26", "10.43.23.158", "10.53.21.158"]
-     [devices.601a96]   # U64E
-     hosts = ["10.43.23.81"]
+     [devices.601a96]   # U64E: ethernet, WiFi (seen 2026-10-04)
+     hosts = ["10.43.23.81", "10.43.23.83"]
      ```
 
    - The `c64-test` skill symlink: `./scripts/install-skill.sh` (idempotent).
 
-4. **BPF access, for host-side capture.** Prefer Wireshark's ChmodBPF (`brew install --cask wireshark-chmodbpf`) to the one-shot `chmod`. It survives reboots and leaves every node `root:access_bpf 0660`. Add yourself to `access_bpf` and log in again. `verify-dev-env.sh` accepts that state: a node passes when it is other-rw, or group-rw for a group you are in. The check used to require other-rw, so it reported all 256 nodes as a gap on a machine where capture worked.
+4. **BPF access, for host-side capture.** Prefer Wireshark's ChmodBPF (`brew install --cask wireshark-chmodbpf`) to the one-shot `chmod`. It survives reboots and leaves every node `root:access_bpf 0660`. Its installer adds you to `access_bpf`; if `id -Gn` does not list it, add yourself and log in again. `verify-dev-env.sh` accepts that state: a node passes when it is other-rw, or group-rw for a group you are in. The check used to require other-rw, so it reported all 256 nodes as a gap on a machine where capture worked.
 
 5. **Elevation for the ethernet/bridge suite: decide, don't copy.** Step 8's sudoers drop-in gives NOPASSWD root to three scripts under a user-writable path and to `/opt/homebrew/bin/x64sc`, a user-writable prefix. Each of those is a path to root. The 2026-10 migration plan deliberately did not carry it over, and planned these instead:
 
@@ -213,7 +213,7 @@ The steps above build a harness. Moving to a new Mac takes more than that: some 
 
 8. **Exercise it on hardware, only when the device is handed over.** The C64U and the U64E are shared, and another lane may be flashing either of them. Ask whoever is using them, wait for the handover, and check `device_lock_holder(host)` before you start. Every live run holds the `DeviceLock`: pytest takes it per test and scripts take it through `hold_device_lock`. On the C64U (fw 1.1.0, leak-prone), the CLAUDE.md hardware-safety clause applies in full. Route upload-heavy runs to the U64E.
 
-Two macOS facts that trip scripts written on Linux: there is no `timeout` command, and pytest here has no `--timeout` option.
+Two macOS facts that trip scripts written on Linux: stock macOS has no `timeout` command (Homebrew coreutils adds `timeout` and `gtimeout`), and pytest here has no `--timeout` option.
 
 ## Quick check: `scripts/verify-dev-env.sh`
 

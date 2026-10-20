@@ -152,9 +152,47 @@ def test_bpf_group_rw_for_a_member_is_ok(tmp_path):
     assert not any("bpf" in h for h in _hints(proc.stdout))
 
 
-def test_bpf_group_rw_for_a_non_member_is_named(tmp_path):
-    dev = _fake_dev(tmp_path, {"bpf0": 0o660, "bpf1": 0o606})
-    proc = _check_system("Darwin", {"C64H_DEV_DIR": str(dev), "C64H_USER_GROUPS": "everyone"})
+def test_bpf_group_rw_found_through_id_for_a_supplementary_group(tmp_path):
+    """No override: membership comes from ``id -Gn``, supplementary groups included.
+
+    ChmodBPF's access_bpf is never the primary group (``staff`` on macOS),
+    so a lookup of the primary group alone warns about every node again.
+    """
+    import grp
+
+    primary = os.getgid()
+    named = []
+    for gid in os.getgroups():
+        if gid == primary:
+            continue
+        try:
+            named.append((gid, grp.getgrgid(gid).gr_name))
+        except KeyError:
+            continue
+    if not named:
+        pytest.skip("this user has no named supplementary group to chgrp a node to")
+    gid, _name = named[0]
+    dev = _fake_dev(tmp_path, {"bpf0": 0o660})
+    os.chown(dev / "bpf0", -1, gid)
+    proc = _check_system("Darwin", {"C64H_DEV_DIR": str(dev)})
+    _label, status, detail, _crit = _bpf_row(proc)
+    assert status == "ok", detail
+
+
+@pytest.mark.parametrize(
+    ("mode", "groups"),
+    [
+        (0o660, "everyone"),
+        (0o640, None),  # group may read but not write
+        (0o660, "x{g}"),  # a group whose name merely contains the node's
+        (0o660, "{g}x"),
+    ],
+)
+def test_bpf_group_rw_for_a_non_member_is_named(tmp_path, mode, groups):
+    dev = _fake_dev(tmp_path, {"bpf0": mode, "bpf1": 0o606})
+    group = _node_group(dev)
+    member_of = f"everyone {group}" if groups is None else groups.format(g=group)
+    proc = _check_system("Darwin", {"C64H_DEV_DIR": str(dev), "C64H_USER_GROUPS": member_of})
     _label, status, detail, _crit = _bpf_row(proc)
     assert status == "warn", detail
     failing = detail.split("no rw access: ", 1)[1].split(" (", 1)[0].split()
@@ -548,8 +586,13 @@ esac
 """
 
 
-def _stage3_with(tmp_path: Path, interpreters: dict[str, str]) -> tuple[subprocess.CompletedProcess, Path, list[str]]:
-    """Run stage 3 with only *interpreters* (name -> "3, 9, 6") ahead of /usr/bin."""
+def _stage3_with(
+    tmp_path: Path, interpreters: dict[str, str], *, existing_venv: str | None = None, dry_run: bool = False
+) -> tuple[subprocess.CompletedProcess, Path, list[str]]:
+    """Run stage 3 with only *interpreters* (name -> "3, 9, 6") ahead of /usr/bin.
+
+    *existing_venv* pre-creates the venv with an interpreter of that version.
+    """
     import sys
 
     bindir = tmp_path / "bin"
@@ -570,10 +613,18 @@ def _stage3_with(tmp_path: Path, interpreters: dict[str, str]) -> tuple[subproce
     repo = tmp_path / "repo"
     calls = tmp_path / "calls"
     calls.touch()
+    if existing_venv is not None:
+        (venv / "bin").mkdir(parents=True)
+        py = venv / "bin" / "python"
+        py.write_text(_FAKE_PY.replace("@VER@", existing_venv).replace("@NAME@", "venv-python"))
+        py.chmod(0o755)
+        pip = venv / "bin" / "pip"
+        pip.write_text('#!/bin/sh\necho "pip $*" >> "$CALLS"\n')
+        pip.chmod(0o755)
     program = (
         "set -u\n"
         + _section(SETUP, "# ---------- logging helpers", "# ---------- arg parsing")
-        + f"DRY_RUN=0\nNO_HARNESS=0\nVENV_DIR={shlex.quote(str(venv))}\n"
+        + f"DRY_RUN={int(dry_run)}\nNO_HARNESS=0\nVENV_DIR={shlex.quote(str(venv))}\n"
         + f"REPO_ROOT={shlex.quote(str(repo))}\n"
         + "run_cmd() { shift; \"$@\"; }\n"
         + _section(SETUP, "# ---------- Stage 3", "# ---------- Stage 4")
@@ -588,6 +639,36 @@ def _stage3_with(tmp_path: Path, interpreters: dict[str, str]) -> tuple[subproce
 def test_stage3_builds_the_venv_with_a_python_that_meets_requires_python(tmp_path):
     _proc, venv, venv_calls = _stage3_with(tmp_path, {"python3": "3, 9, 6", "python3.13": "3, 13, 16"})
     assert venv_calls == [f"python3.13 -m venv --system-site-packages {venv}"], venv_calls
+
+
+def test_stage3_prefers_the_newest_python_over_a_qualifying_python3(tmp_path):
+    _proc, venv, venv_calls = _stage3_with(tmp_path, {"python3": "3, 11, 9", "python3.13": "3, 13, 16"})
+    assert venv_calls == [f"python3.13 -m venv --system-site-packages {venv}"], venv_calls
+
+
+def test_stage3_accepts_python_3_10(tmp_path):
+    _proc, venv, venv_calls = _stage3_with(tmp_path, {"python3.10": "3, 10, 0"})
+    assert venv_calls == [f"python3.10 -m venv --system-site-packages {venv}"], venv_calls
+
+
+def test_stage3_refuses_to_reuse_a_venv_below_requires_python(tmp_path):
+    """A 3.9 venv left by the old installer used to be reused, and pip then failed."""
+    proc, venv, _venv_calls = _stage3_with(tmp_path, {"python3.13": "3, 13, 16"}, existing_venv="3, 9, 6")
+    out = proc.stdout + proc.stderr
+    assert f"rm -rf {venv}" in out, out
+    assert not [c for c in (tmp_path / "calls").read_text().splitlines() if c.startswith("pip ")]
+
+
+def test_stage3_reuses_a_venv_that_meets_requires_python(tmp_path):
+    proc, _venv, venv_calls = _stage3_with(tmp_path, {"python3.13": "3, 13, 16"}, existing_venv="3, 13, 16")
+    assert venv_calls == []
+    assert "reusing" in proc.stdout, proc.stdout
+
+
+def test_stage3_dry_run_does_not_show_a_venv_it_would_refuse(tmp_path):
+    proc, _venv, _calls = _stage3_with(tmp_path, {"python3": "3, 9, 6"}, dry_run=True)
+    assert "-m venv" not in proc.stdout, proc.stdout
+    assert "no python3 >= 3.10" in proc.stdout, proc.stdout
 
 
 def test_stage3_refuses_when_no_python_meets_requires_python(tmp_path):
@@ -608,6 +689,7 @@ def test_setup_exits_not_ready_when_an_install_stage_failed(tmp_path):
         + _section(SETUP, "# ---------- logging helpers", "# ---------- arg parsing")
         + f"DRY_RUN=0\nNO_HARNESS=0\nVENV_DIR={shlex.quote(str(tmp_path / 'venv'))}\n"
         + f"REPO_ROOT={shlex.quote(str(tmp_path))}\n"
+        + "run_cmd() { shift; \"$@\"; }\n"
         + _section(SETUP, "# ---------- Stage 3", "# ---------- Stage 4")
         + _section(SETUP, "# ---------- Stage 6", "# ---------- main")
         + "stage_harness_install\nVERIFY_EXIT=0\nprint_summary\n"
@@ -616,6 +698,60 @@ def test_setup_exits_not_ready_when_an_install_stage_failed(tmp_path):
     proc = _run(program, {"PATH": str(bindir)})
     assert "RC=1" in proc.stdout, proc.stdout + proc.stderr
     assert "install step" in proc.stdout, proc.stdout
+
+
+def test_setup_counts_one_failure_once(tmp_path):
+    """No Homebrew is one failure, though stage 1 prints three [fail] lines for it."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "bash").symlink_to(shutil.which("bash"))
+    program = (
+        "set -u\n"
+        + _section(SETUP, "# ---------- logging helpers", "# ---------- arg parsing")
+        + "DRY_RUN=0\n"
+        + _section(SETUP, "# ---------- Stage 1", "# ---------- Stage 2")
+        + "(trap 'echo \"FAILURES=$STAGE_FAILURES\"' EXIT; stage_system_packages_macos)\n"
+    )
+    proc = _run(program, {"PATH": str(bindir)})
+    assert proc.stdout.count("[fail]") == 3, proc.stdout
+    assert "FAILURES=1" in proc.stdout, proc.stdout
+
+
+def test_setup_macos_stage1_installs_a_python_for_the_venv(tmp_path):
+    calls = tmp_path / "brew-calls"
+    program = (
+        "set -u\n"
+        + _section(SETUP, "# ---------- logging helpers", "# ---------- arg parsing")
+        + "DRY_RUN=0\n"
+        + f'brew() {{ echo "$*" >> {shlex.quote(str(calls))}; }}\n'
+        + _section(SETUP, "# ---------- Stage 1", "# ---------- Stage 2")
+        + "stage_system_packages_macos\n"
+    )
+    proc = _run(program)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    installs = [c for c in calls.read_text().splitlines() if c.startswith("install ")]
+    assert "install python@3.13" in installs, installs
+
+
+def test_setup_verifies_the_venv_it_built(tmp_path):
+    """verify must check VENV_DIR, not fall back to the canonical venv."""
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python3").write_text("#!/bin/sh\n")
+    (venv / "bin" / "python3").chmod(0o755)
+    (tmp_path / "scripts").mkdir()
+    verify = tmp_path / "scripts" / "verify-dev-env.sh"
+    verify.write_text('#!/bin/sh\necho "VERIFIED=${VIRTUAL_ENV:-unset}"\n')
+    verify.chmod(0o755)
+    program = (
+        "set -u\n"
+        + _section(SETUP, "# ---------- logging helpers", "# ---------- arg parsing")
+        + f"DRY_RUN=0\nVENV_DIR={shlex.quote(str(venv))}\nREPO_ROOT={shlex.quote(str(tmp_path))}\n"
+        + _section(SETUP, "# ---------- Stage 6", "# ---------- summary")
+        + "run_verify\n"
+    )
+    proc = _run(program)
+    assert f"VERIFIED={venv}" in proc.stdout, proc.stdout + proc.stderr
 
 
 @pytest.mark.parametrize(("verify", "rc"), [(0, 0), (1, 1), (2, 3), (7, 3)])
