@@ -398,9 +398,13 @@ device to the next one clean. The two drain cases differ:
   `Network Settings > FTP File Service` — a config write that persists
   until a firmware power-on (`machine:reboot` does not clear it) — and if
   the pass still fails, later uploads on that client refuse. A lane that
-  leaked may make that write (owner decision on #263): it is the one
-  sanctioned write into a `BASELINE_NEVER_TOUCH` store, whose contract
-  covers the entry-baseline reset (`apply_factory_baseline`) only.
+  leaked may make that write (owner decision on #263): it is the
+  harness's one automatic write into a `BASELINE_NEVER_TOUCH` store, whose
+  contract covers the entry-baseline reset (`apply_factory_baseline`)
+  only. The other sanctioned write of the same item is the caller-invoked
+  `enable_ftp_service(client)` (#546): lock holder only, written only when
+  the item is not already enabled, verified by read-back, never saved to
+  flash, and logged at WARNING.
 - **The client leaked nothing** (issue #264): the wedge is per device and
   `gc_temp_folder` sweeps `/Temp` device-wide, so the drain still sweeps
   inherited attachments — but only **under the device lock** (the
@@ -408,7 +412,8 @@ device to the next one clean. The two drain cases differ:
   because it deletes files other lanes created. A failed inherited sweep
   writes no config and sets no block: it logs a WARNING that `/Temp` may
   still hold an earlier lane's attachments and that FTP File Service must
-  be enabled by hand, or the device power-cycled. It does not count as a
+  be enabled by hand (`enable_ftp_service(client)` under the device's
+  `DeviceLock`), or the device power-cycled. It does not count as a
   sweep either, so the process's next upload sweeps first and is refused
   if that fails too (#511).
 
@@ -527,7 +532,8 @@ so all of this matters only for the C64U until its firmware catches up.
 decimal-only pattern would leave every lettered name uncollected. The C64U
 ships `FTP File Service: Disabled` by default (the U64E has it enabled);
 `gc_temp_folder` detects a refused FTP connection and reports that the
-setting may need enabling via `Network Settings > FTP File Service` — a
+setting may need enabling via `Network Settings > FTP File Service`
+(`enable_ftp_service(client)`, under the `DeviceLock`) — a
 runtime-only REST config write that lives in firmware RAM until
 `save_config_to_flash`, reverted only by a firmware **power-on**. That
 revert is benign, because `/Temp` is a RAM disk

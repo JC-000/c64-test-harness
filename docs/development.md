@@ -593,7 +593,9 @@ the manager's generation-resolved entry baseline reset
 whenever a lane acquires the device through `create_manager`, whether or not
 `U64_ALLOW_MUTATE` is set — opt out with `U64_BASELINE_ON_ENTRY=0`; and the
 `/Temp` hygiene pass enables FTP File Service on a leak-prone device after a
-failed pass (#263, owner-approved). That
+failed pass (#263, owner-approved). A live test that calls
+`enable_ftp_service` itself (#546) is a config write like any other and
+needs the gate: the scan's vocabulary picks it up through `set_config_item`. That
 includes the `U64_HOST`-only suites outside this table:
 `test_chromatic_capture_live.py` and `test_uci_tcp_echo_live.py` as a whole,
 and the config-writing tests of `test_u64_audio_capture_live.py`,

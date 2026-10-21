@@ -140,6 +140,30 @@ class Ultimate64WireFormatError(Ultimate64Error):
         self.result = result
 
 
+class Ultimate64ConfigVerifyError(Ultimate64Error):
+    """A config write was accepted but the item reads back different (#545).
+
+    Raised by ``set_config_item(..., verify=True)`` when the ``current``
+    value a fresh GET returns does not match the value written, after the
+    normalisation described there.  ``category`` / ``item`` are the names
+    the caller passed; ``requested`` is the value written and ``readback``
+    the ``current`` value the device returned, both unnormalised.
+    """
+
+    def __init__(
+        self, category: str, item: str, requested: Any, readback: Any
+    ) -> None:
+        self.category = category
+        self.item = item
+        self.requested = requested
+        self.readback = readback
+        super().__init__(
+            f"config item {category!r}/{item!r} read back as {readback!r} "
+            f"after writing {requested!r}: the device accepted the PUT but "
+            f"did not apply it"
+        )
+
+
 class Ultimate64UnsafeOperationError(Ultimate64Error):
     """Raised when a destructive call needs an explicit caller-confirmation
     kwarg and didn't get one.
@@ -331,6 +355,46 @@ class U64WritememDegradedError(Ultimate64Error):
 def _encode(value: str) -> str:
     """URL-encode a single path segment (including spaces and colons)."""
     return urllib.parse.quote(value, safe="")
+
+
+_STRTOL0 = re.compile(r"\s*([+-]?)(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)")
+
+
+def _strtol0(value: Any) -> int | None:
+    """The integer C ``strtol(value, NULL, 0)`` would parse, or ``None``.
+
+    ``None`` where ``strtol`` would consume nothing (it answers 0 there);
+    the caller then falls back to a string comparison rather than guess.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    m = _STRTOL0.match(str(value))
+    if m is None:
+        return None
+    sign, digits = m.groups()
+    if digits[:2] in ("0x", "0X"):
+        number = int(digits[2:], 16)
+    elif len(digits) > 1 and digits[0] == "0":
+        number = int(digits, 8)
+    else:
+        number = int(digits)
+    return -number if sign == "-" else number
+
+
+def _config_values_match(item_map: dict, written: Any, readback: Any) -> bool:
+    """Whether *readback* is what the firmware stores for *written* (#545).
+
+    Keyed on the item map's type, the way 1.1.0 ``route_configs.cc``
+    ``set_item`` applies a value: enum (``"values"``) by ``strcasecmp``,
+    range (``"min"``) by ``strtol(..., 0)``, anything else verbatim.
+    """
+    if "values" in item_map:
+        return str(written).strip().casefold() == str(readback).strip().casefold()
+    if "min" in item_map:
+        a, b = _strtol0(written), _strtol0(readback)
+        if a is not None and b is not None:
+            return a == b
+    return str(written).strip() == str(readback).strip()
 
 
 #: Shared tail: true of any 400 from these routes, whatever the cause.
@@ -1325,7 +1389,8 @@ class Ultimate64Client:
             f"{self._temp_hygiene_blocked}. Continuing would walk the device "
             "towards the /Temp-accumulation wedge, which only a physical "
             "power-cycle clears. Remedy: enable Network Settings > FTP File "
-            "Service on the device (and save it to flash), or power-cycle it to "
+            "Service (c64_test_harness.enable_ftp_service(client), under the "
+            "DeviceLock; or on the device, saved to flash), or power-cycle it to "
             "empty /Temp. To proceed anyway set U64_TEMP_GC_REQUIRED=0, or pass "
             "temp_hygiene=False to disarm the pass entirely. See "
             "docs/u64_recovery.md."
@@ -1347,7 +1412,10 @@ class Ultimate64Client:
         empties ``/Temp`` (a RAM disk).
 
         **Two contracts, not one** (owner decision on #263): that enable is
-        the one sanctioned write into a ``BASELINE_NEVER_TOUCH`` store.
+        the harness's one automatic write into a ``BASELINE_NEVER_TOUCH``
+        store (the other sanctioned write, the caller-invoked
+        ``enable_ftp_service`` of #546, is deliberately not reused here: it
+        reads before and after, so it would change this pass's requests).
         ``BASELINE_NEVER_TOUCH`` is ``apply_factory_baseline``'s contract --
         the entry-baseline reset never resets or asserts those stores -- and
         says nothing about this pass, which may write exactly one item,
@@ -1573,8 +1641,10 @@ class Ultimate64Client:
             "File Service on its behalf (issue #263). /Temp may still hold "
             "attachments an earlier lane left behind, so this process's next "
             "upload sweeps first and is refused if that fails too (#511). "
-            "To clear it, enable FTP File Service manually (it persists until "
-            "a firmware power-on) or have the device power-cycled. See "
+            "To clear it, enable FTP File Service manually with "
+            "c64_test_harness.enable_ftp_service(client) under the DeviceLock "
+            "(it persists until a firmware power-on) or have the device "
+            "power-cycled. See "
             "docs/u64_recovery.md.",
             self.host, getattr(result, "error", None) or "unknown FTP failure",
         )
@@ -3052,12 +3122,32 @@ class Ultimate64Client:
         return data
 
     # -------------------------------------------------------------- config write
-    def set_config_item(self, category: str, item: str, value: Any) -> None:
+    def set_config_item(
+        self, category: str, item: str, value: Any, *, verify: bool = False
+    ) -> None:
         """PUT /v1/configs/<category>/<item>?value=<value> — set a single
         config item (DESTRUCTIVE).
 
         The device expects the new value as a ``value=`` query
         parameter, not as a JSON body.
+
+        :param verify: when true, re-read the item after the PUT
+            (:meth:`get_config_item`, one bodyless GET) and raise
+            :class:`Ultimate64ConfigVerifyError` if its ``current`` does not
+            match *value* (#545).  The firmware answers HTTP 200 to a write
+            it did not apply in some states, and only the read-back shows
+            that.  Default ``False``: the PUT alone, as before.  Either way
+            the call carries no body and costs no ``/Temp`` attachment.
+
+            The comparison follows how 1.1.0's ``route_configs.cc``
+            ``set_item`` applies the value, keyed on the item map's type:
+            an enum item (``"values"``) is matched with ``strcasecmp`` and
+            echoed in the firmware's own spelling, so both sides are
+            compared stripped and case-folded (CPU Speed choices carry a
+            leading space, ``" 5"``); a range item (``"min"``) is parsed
+            with ``strtol(..., 0)``, so both sides are compared as integers
+            (``"0xA"`` matches ``10``); any other item is stored as written
+            and compared stripped but case-sensitive.
         """
         if not isinstance(category, str) or not category:
             raise ValueError("category must be a non-empty string")
@@ -3065,6 +3155,17 @@ class Ultimate64Client:
             raise ValueError("item must be a non-empty string")
         path = f"/v1/configs/{_encode(category)}/{_encode(item)}"
         self._put_no_body(path, query={"value": value})
+        if not verify:
+            return
+        item_map = self.get_config_item(category, item)
+        if "current" not in item_map:
+            raise Ultimate64ProtocolError(
+                f"config item {category!r}/{item!r} has no 'current' value "
+                f"to verify against: {item_map!r}"
+            )
+        readback = item_map["current"]
+        if not _config_values_match(item_map, value, readback):
+            raise Ultimate64ConfigVerifyError(category, item, value, readback)
 
     def set_config_items(self, category: str, updates: dict) -> None:
         """Set multiple config items in *category* (DESTRUCTIVE).

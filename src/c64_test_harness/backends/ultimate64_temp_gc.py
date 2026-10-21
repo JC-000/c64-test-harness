@@ -57,9 +57,10 @@ is the per-device switch.
 This module only reports that FTP may need enabling; it writes no config.
 The harness's one automatic enable of ``Network Settings > FTP File
 Service`` lives in ``Ultimate64Client._run_temp_hygiene``, for a client
-that leaked, and is the sanctioned exception to
-``ultimate64_baseline.BASELINE_NEVER_TOUCH``, whose contract covers the
-entry-baseline reset only (owner decision on #263).
+that leaked and for the handover sweep. It is one of two sanctioned
+exceptions to ``ultimate64_baseline.BASELINE_NEVER_TOUCH``, whose contract
+covers the entry-baseline reset only (owner decision on #263); the other is
+the caller-invoked ``ultimate64_helpers.enable_ftp_service`` (#546).
 
 :func:`gc_temp_folder` is deliberately *never raising*: every FTP or
 network failure is caught and reported via :class:`TempGCResult.error`
