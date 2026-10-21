@@ -672,7 +672,12 @@ def _stage3_with(
         + _section(SETUP, "# ---------- Stage 3", "# ---------- Stage 4")
         + "\nstage_harness_install\n"
     )
-    proc = _run(program, {"PATH": f"{bindir}:{tools}", "CALLS": str(calls), "REAL_PY": sys.executable})
+    # No PATH seam intercepts an absolute interpreter path: if a regression
+    # reaches a real python3, keep its pip off the network.
+    no_net_pip = {"PIP_NO_INDEX": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1", "PIP_CONFIG_FILE": "/dev/null"}
+    proc = _run(
+        program, {"PATH": f"{bindir}:{tools}", "CALLS": str(calls), "REAL_PY": sys.executable, **no_net_pip}
+    )
     assert proc.returncode == 0, proc.stderr
     venv_calls = [c for c in calls.read_text().splitlines() if " -m venv " in c]
     return proc, venv, venv_calls
