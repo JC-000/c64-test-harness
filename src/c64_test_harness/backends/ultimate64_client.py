@@ -147,7 +147,9 @@ class Ultimate64ConfigVerifyError(Ultimate64Error):
     value a fresh GET returns does not match the value written, after the
     normalisation described there.  ``category`` / ``item`` are the names
     the caller passed; ``requested`` is the value written and ``readback``
-    the ``current`` value the device returned, both unnormalised.
+    the ``current`` value the device returned, both unnormalised.  When the
+    item name contains ``password`` (case-folded) the message shows neither
+    value; the attributes still carry both.
     """
 
     def __init__(
@@ -157,10 +159,15 @@ class Ultimate64ConfigVerifyError(Ultimate64Error):
         self.item = item
         self.requested = requested
         self.readback = readback
+        if "password" in item.casefold():
+            # The values stay on the attributes; the message reaches logs.
+            shown_readback = shown_requested = "<redacted>"
+        else:
+            shown_readback, shown_requested = repr(readback), repr(requested)
         super().__init__(
-            f"config item {category!r}/{item!r} read back as {readback!r} "
-            f"after writing {requested!r}: the device accepted the PUT but "
-            f"did not apply it"
+            f"config item {category!r}/{item!r} read back as {shown_readback} "
+            f"after writing {shown_requested}: the read-back differs from what "
+            f"was written (not applied, truncated, or rewritten by the firmware)"
         )
 
 
@@ -386,7 +393,9 @@ def _config_values_match(item_map: dict, written: Any, readback: Any) -> bool:
 
     Keyed on the item map's type, the way 1.1.0 ``route_configs.cc``
     ``set_item`` applies a value: enum (``"values"``) by ``strcasecmp``,
-    range (``"min"``) by ``strtol(..., 0)``, anything else verbatim.
+    range (``"min"``) by ``strtol(..., 0)``, anything else verbatim
+    (``setString``), so exactly.  The enum strip is defensive: 1.1.0 echoes
+    the stored choice verbatim.
     """
     if "values" in item_map:
         return str(written).strip().casefold() == str(readback).strip().casefold()
@@ -394,7 +403,7 @@ def _config_values_match(item_map: dict, written: Any, readback: Any) -> bool:
         a, b = _strtol0(written), _strtol0(readback)
         if a is not None and b is not None:
             return a == b
-    return str(written).strip() == str(readback).strip()
+    return str(written) == str(readback)
 
 
 #: Shared tail: true of any 400 from these routes, whatever the cause.
@@ -1390,8 +1399,10 @@ class Ultimate64Client:
             "towards the /Temp-accumulation wedge, which only a physical "
             "power-cycle clears. Remedy: enable Network Settings > FTP File "
             "Service (c64_test_harness.enable_ftp_service(client), under the "
-            "DeviceLock; or on the device, saved to flash), or power-cycle it to "
-            "empty /Temp. To proceed anyway set U64_TEMP_GC_REQUIRED=0, or pass "
+            "DeviceLock), then release and re-take the DeviceLock: the release "
+            "drain sweeps /Temp, and only a successful sweep lifts this "
+            "refusal. Or have the device power-cycled to empty /Temp. To "
+            "proceed anyway set U64_TEMP_GC_REQUIRED=0, or pass "
             "temp_hygiene=False to disarm the pass entirely. See "
             "docs/u64_recovery.md."
         )
@@ -3134,20 +3145,29 @@ class Ultimate64Client:
         :param verify: when true, re-read the item after the PUT
             (:meth:`get_config_item`, one bodyless GET) and raise
             :class:`Ultimate64ConfigVerifyError` if its ``current`` does not
-            match *value* (#545).  The firmware answers HTTP 200 to a write
-            it did not apply in some states, and only the read-back shows
-            that.  Default ``False``: the PUT alone, as before.  Either way
-            the call carries no body and costs no ``/Temp`` attachment.
+            match *value* (#545).  On 1.1.0 ``route_configs.cc`` stores the
+            value before the 200 goes out, so a read-back can differ only
+            through truncation (``setString`` past the item's maximum
+            length, ``config.cc``), a hook that rewrites the item, or other
+            firmware; the check makes that visible instead of assuming it
+            cannot happen.  Default ``False``: the PUT alone, as before.
+            Either way the call carries no body and costs no ``/Temp``
+            attachment.  With a glob in *category* or *item* the PUT applies
+            the first match, but :meth:`get_config_item` raises on several
+            matches, so ``verify=True`` can raise
+            :class:`Ultimate64ProtocolError` after the write has gone out.
 
             The comparison follows how 1.1.0's ``route_configs.cc``
             ``set_item`` applies the value, keyed on the item map's type:
             an enum item (``"values"``) is matched with ``strcasecmp`` and
             echoed in the firmware's own spelling, so both sides are
-            compared stripped and case-folded (CPU Speed choices carry a
-            leading space, ``" 5"``); a range item (``"min"``) is parsed
-            with ``strtol(..., 0)``, so both sides are compared as integers
-            (``"0xA"`` matches ``10``); any other item is stored as written
-            and compared stripped but case-sensitive.
+            compared case-folded, and also stripped (defensive; 1.1.0
+            echoes the stored choice verbatim, CPU Speed's ``" 5"``
+            included); a range item (``"min"``) is parsed with
+            ``strtol(..., 0)``, so both sides are compared as integers
+            (``"0xA"`` matches ``10``); any other item is stored verbatim by
+            ``setString`` and compared exactly, whitespace and case
+            included.
         """
         if not isinstance(category, str) or not category:
             raise ValueError("category must be a non-empty string")

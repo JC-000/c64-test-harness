@@ -887,7 +887,9 @@ def _reserve_probe_attachments(
                     "instead (get_info, get_version, read_mem); they cost "
                     "nothing. Remedy: enable Network Settings > FTP File Service "
                     "(c64_test_harness.enable_ftp_service(client) under the "
-                    "DeviceLock), or power-cycle it to empty /Temp. To proceed "
+                    "DeviceLock), then release and re-take the DeviceLock: the "
+                    "release drain sweeps /Temp, and only a successful sweep "
+                    "lifts this refusal. Or power-cycle it to empty /Temp. To proceed "
                     "anyway set U64_TEMP_GC_REQUIRED=0. See docs/u64_recovery.md."
                 )
                 if hygiene_required():

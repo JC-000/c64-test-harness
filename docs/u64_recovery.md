@@ -510,7 +510,10 @@ wrong.
 stops rather than walking the device to the wedge: one attempt is made
 to enable `Network Settings > FTP File Service` over REST and the pass is
 retried; if it still fails, further body-carrying POSTs raise
-`Ultimate64TempHygieneError` naming the remedy. Bodyless calls (`reset`,
+`Ultimate64TempHygieneError` naming the remedy. Enabling FTP
+(`enable_ftp_service(client)`) does not lift that refusal by itself within
+the same hold: only a successful sweep does, so release and re-take the
+`DeviceLock` and the release drain sweeps. Bodyless calls (`reset`,
 `reboot`, config PUTs, `readmem`) keep working, so a blocked client can
 still drive recovery. Opt out with `U64_TEMP_GC_REQUIRED=0` (downgrades
 this refusal to a warning, but not the refusal of an unlocked process on

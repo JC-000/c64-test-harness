@@ -87,6 +87,9 @@ class FakeDevice:
         #: ``?value=Enabled`` brings FTP up. ``False`` models a device whose
         #: FTP will not come up however it is configured.
         self.ftp_enable_works = False
+        #: What ``GET /v1/configs/Network Settings/FTP File Service`` reports
+        #: as ``current``; the PUT sets it, a power-cycle puts it back.
+        self.ftp_config = "Disabled"
         #: ``GET /v1/drives`` answers HTTP 500 when set.
         self.drives_fail = False
         #: POSTs to these paths hold their attachment "in flight" until
@@ -152,9 +155,19 @@ class FakeDevice:
             return _Resp(json.dumps({"drives": drives}).encode())
         if method == "PUT" and path == "/v1/configs/Network Settings/FTP File Service":
             query = dict(urllib.parse.parse_qsl(parsed.query))
+            self.ftp_config = query.get("value", self.ftp_config)
             if query.get("value") == "Enabled" and self.ftp_enable_works:
                 self.ftp_up = True
             return _Resp(b"{}")
+        if method == "GET" and path == "/v1/configs/Network Settings/FTP File Service":
+            return _Resp(json.dumps({
+                "Network Settings": {"FTP File Service": {
+                    "current": self.ftp_config,
+                    "values": ["Disabled", "Enabled"],
+                    "default": "Disabled",
+                }},
+                "errors": [],
+            }).encode())
         if method == "POST" and req.data is not None:
             name = self.attach()
             if path.startswith("/v1/drives/") and path.endswith(":mount"):
@@ -310,6 +323,52 @@ def test_the_handover_enable_is_attempted_once_per_process(device, host, tmp_pat
         lock.release()
     assert len(device.ftp_enables()) == 1
     assert device.posts() == []
+
+
+def test_enable_ftp_service_then_relock_lifts_a_refusal(device, host, tmp_path):
+    """The remedy the refusal names, end to end (#546 review, finding 1).
+
+    The process's one hygiene enable is spent in the first hold; the device is
+    then power-cycled (FTP off, ``/Temp`` empty), so the next hold's handover
+    sweep fails and the upload is refused. ``enable_ftp_service`` brings FTP
+    up but does not by itself lift the refusal: only a successful sweep does.
+    Releasing the lock runs the release drain, which sweeps; the next hold's
+    upload then goes through after its own handover sweep.
+    """
+    from c64_test_harness.backends.ultimate64_helpers import enable_ftp_service
+
+    device.ftp_up = False
+    device.ftp_enable_works = True
+    lock = _lock(host, tmp_path)
+    c = _client(host)
+    c.run_prg(PRG)  # handover: the process's one enable, sweep, upload
+    lock.release()
+    assert len(device.ftp_enables()) == 1
+    # The owner power-cycles the device: FTP and its config back to off.
+    device.ftp_up, device.ftp_config, device.temp[:] = False, "Disabled", []
+    lock = _lock(host, tmp_path)
+    try:
+        with pytest.raises(Ultimate64TempHygieneError):
+            c.run_prg(PRG)
+        posts = len(device.posts())
+        assert enable_ftp_service(c) is True
+        assert device.ftp_up
+        # Same hold: still refused, and nothing is swept or sent.
+        sessions = device.ftp_sessions()
+        with pytest.raises(Ultimate64TempHygieneError):
+            c.run_prg(PRG)
+        assert device.ftp_sessions() == sessions
+        assert len(device.posts()) == posts
+    finally:
+        lock.release()  # the release drain sweeps, and succeeds
+    assert device.ftp_sessions() > sessions, "the release drain must sweep"
+    lock = _lock(host, tmp_path)
+    try:
+        c.run_prg(PRG)
+    finally:
+        lock.release()
+    assert len(device.posts()) == posts + 1
+    assert len(device.ftp_enables()) == 2  # the hygiene's one, and the helper's
 
 
 def test_required_zero_makes_no_enable_attempt_at_handover(

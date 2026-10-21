@@ -605,7 +605,9 @@ class TempLedger:
                 "and sweeping the %d uncollected attachment(s) it counted failed "
                 "(%s). No config was written. Later attachment-creating requests "
                 "to this device are refused until a sweep succeeds; enable FTP "
-                "File Service on the device or power-cycle it. See "
+                "File Service (enable_ftp_service(client) under the DeviceLock), "
+                "then release and re-take the lock so the release drain sweeps, "
+                "or power-cycle the device. See "
                 "docs/u64_recovery.md.",
                 self.host, self.pending, self.blocked,
             )

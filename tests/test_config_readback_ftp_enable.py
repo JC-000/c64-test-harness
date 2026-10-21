@@ -180,9 +180,11 @@ def test_verify_enum_compare_is_case_insensitive_like_the_firmware():
 
 
 def test_verify_enum_ignores_firmware_padding_cpu_speed():
-    """CPU Speed choices carry a leading space (' 5'). The value written and
-    the value echoed are compared stripped, so padding on either side is not
-    a mismatch."""
+    """CPU Speed choices carry a leading space (' 5').
+
+    1.1.0 echoes the stored choice verbatim, so the plain round trip needs no
+    normalisation. The strip on enum values is defensive: ``dev2`` models a
+    firmware that trims its echo, which 1.1.0 does not do."""
     items = {(U64, CPU): {"current": " 1", "values": [" 1", " 2", " 5"],
                           "default": " 1"}}
     dev = _FakeConfigDevice(items)
@@ -190,8 +192,7 @@ def test_verify_enum_ignores_firmware_padding_cpu_speed():
     with patch("urllib.request.urlopen", dev):
         c.set_config_item(U64, CPU, " 5", verify=True)
     assert dev.items[(U64, CPU)]["current"] == " 5"
-    # The comparison itself: written padded, compared against an echo that
-    # dropped the padding, and the other way round.
+    # Defensive only: a hypothetical echo that drops the padding.
     dev2 = _FakeConfigDevice(items, echo={(U64, CPU): str.strip})
     with patch("urllib.request.urlopen", dev2):
         c.set_config_item(U64, CPU, " 2", verify=True)
@@ -274,6 +275,41 @@ def test_verify_free_string_item_is_case_sensitive():
     with patch("urllib.request.urlopen", ok):
         c.set_config_item(NET, "Host Name", "bench", verify=True)
     assert ok.items[(NET, "Host Name")]["current"] == "bench"
+
+
+def test_verify_free_string_whitespace_difference_raises():
+    """setString stores a free string verbatim, so a read-back that differs
+    only in whitespace is a write that lost it, never a formatting echo."""
+    items = {(NET, "Host Name"): {"current": "bench", "default": "C64U"}}
+    dev = _FakeConfigDevice(items, ignore_writes=True)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", dev), \
+            pytest.raises(Ultimate64ConfigVerifyError):
+        c.set_config_item(NET, "Host Name", "bench ", verify=True)
+    ok = _FakeConfigDevice(items)
+    with patch("urllib.request.urlopen", ok):
+        c.set_config_item(NET, "Host Name", " bench ", verify=True)
+    assert ok.items[(NET, "Host Name")]["current"] == " bench "
+
+
+def test_verify_error_redacts_password_values():
+    """A mismatch on a password item keeps the values on the exception's
+    attributes but leaves them out of its message, which ends up in logs."""
+    items = {(NET, "Network Password"): {"current": "old-secret", "default": ""}}
+    dev = _FakeConfigDevice(items, ignore_writes=True)
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", dev), \
+            pytest.raises(Ultimate64ConfigVerifyError) as info:
+        c.set_config_item(NET, "Network Password", "new-secret", verify=True)
+    err = info.value
+    assert (err.requested, err.readback) == ("new-secret", "old-secret")
+    assert "new-secret" not in str(err) and "old-secret" not in str(err)
+    # An ordinary item still names both values.
+    plain = _FakeConfigDevice(_ftp_item("Disabled"), ignore_writes=True)
+    with patch("urllib.request.urlopen", plain), \
+            pytest.raises(Ultimate64ConfigVerifyError) as info:
+        c.set_config_item(NET, FTP, "Enabled", verify=True)
+    assert "'Enabled'" in str(info.value) and "'Disabled'" in str(info.value)
 
 
 # ------------------------------------------------------ #546 enable_ftp_service
