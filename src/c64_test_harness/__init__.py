@@ -165,6 +165,7 @@ from .backends.ultimate64_storage import (
     Ultimate64StorageNotEmptyError,
     Ultimate64StorageVolumeError,
     storage_delete_file,
+    storage_delete_rom,
     storage_get_file,
     storage_list_dir,
     storage_mkdir,
@@ -651,6 +652,7 @@ __all__ = [
     "ROM_SIZES",
     "STOCK_ROM_NAMES",
     "storage_put_rom",
+    "storage_delete_rom",
     # CBM /Temp-fix constant never set for a newer C64U release (issue #248)
     "CbmFixConstantStaleWarning",
     # Ultimate 64 liveness probe

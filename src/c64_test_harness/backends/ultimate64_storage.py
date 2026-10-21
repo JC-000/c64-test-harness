@@ -22,15 +22,21 @@ Rules, all enforced before the path is touched:
   target any volume. Checked before any connection. The one exception is
   :func:`storage_put_rom`, which writes a single ROM image of a size the
   firmware loads to ``/Flash/roms/<name>`` and nowhere else in ``/Flash``
-  (owner, 2026-10-20). It never deletes, and it replaces a firmware stock
-  ROM file only when the caller passes ``replace_stock=True``.
+  (owner, 2026-10-20). It replaces a firmware stock ROM file only when the
+  caller passes ``replace_stock=True``, and it deletes only a new file of
+  its own whose upload failed. :func:`storage_delete_rom` deletes a single
+  non-stock file in ``/Flash/roms``.
 * **Paths are absolute and normalised:** no ``.``/``..``, no empty
   components, no trailing ``/``, no control characters, no backslash, no
-  ``%``, no component over :data:`MAX_COMPONENT_LEN` characters, and at
+  ``%``, no ``*`` or ``?``, on writes no component ending in ``.`` or a
+  space, no component over :data:`MAX_COMPONENT_LEN` characters, and at
   least a volume plus a name. ``%`` reaches a format string in 1.1.0's
   ``MLST`` (fixed upstream in #713). The firmware treats ``\\`` as a path
   separator and resolves ``..``, so ``/USB1/..\\Temp`` reaches ``/Temp``.
-  Checked before any connection.
+  ``MLST``/``SIZE``/``DELE`` match each component as a case-insensitive
+  pattern (``*``, ``?``), and FatFS strips a trailing ``.`` or space when it
+  creates a file, so either spelling would reach a file that the existence
+  checks never saw. Checked before any connection.
 * **The volume must exist.** Its name is matched case-insensitively
   against the root listing, and the device's own spelling is used. A
   missing volume raises :class:`Ultimate64StorageVolumeError` with the
@@ -46,8 +52,9 @@ Rules, all enforced before the path is touched:
   ``.t64``...) succeeds on the firmware and opens the image, so it is used
   only to check that a volume root can be entered.
 * **A failed upload of a new file is deleted** (best effort) so that a
-  retry is not refused. A failed overwrite cannot restore the old file,
-  and its error says so.
+  retry is not refused. Before an overwrite the old bytes are read, and a
+  failed overwrite puts them back and verifies them. The error says
+  whether that worked.
 
 The lock is keyed the way ``DeviceLock`` keys it: addresses listed together
 in ``devices.toml`` fold to one key. Unlike the REST client, these helpers
@@ -96,6 +103,7 @@ __all__ = [
     "Ultimate64StorageNotEmptyError",
     "Ultimate64StorageVolumeError",
     "storage_delete_file",
+    "storage_delete_rom",
     "storage_get_file",
     "storage_list_dir",
     "storage_mkdir",
@@ -236,6 +244,18 @@ def _is_rom_path(parts: list[str]) -> bool:
     )
 
 
+_ASCII_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def _ascii_fold(name: str) -> str:
+    """*name* with A-Z lowered and nothing else changed.
+
+    The firmware's pattern_match and FatFS (FF_CODE_PAGE 437) fold ASCII
+    only, so ``str.casefold`` is wrong here: it turns ``'ß'`` into ``"ss"``.
+    """
+    return name.translate(_ASCII_FOLD)
+
+
 def _check_path(
     path: str, *, write: bool, allow_volume: bool = False, allow_rom_dir: bool = False
 ) -> list[str]:
@@ -260,6 +280,12 @@ def _check_path(
         # which 3a1ff9ff carries and 1.1.0 does not). Source-read; never
         # probed on a device.
         raise ValueError(f"storage path must not contain '%': {path!r}")
+    if "*" in path or "?" in path:
+        # MLST, SIZE, DELE and CWD resolve every component with
+        # pattern_match, which honours '*' and '?' and ignores case
+        # (file_system.cc:106 -> pattern.cc:78 at 1.1.0 and master), so
+        # "/SD/*" names whichever entry matches first.
+        raise ValueError(f"storage path must not contain '*' or '?': {path!r}")
     if not path.startswith("/"):
         raise ValueError(f"storage path must be absolute: {path!r}")
     if path.endswith("/"):
@@ -278,6 +304,12 @@ def _check_path(
         # out of every listing, so the harness must not create entries that
         # storage_list_dir cannot show and storage_rmdir cannot see.
         raise ValueError(f"refusing to write a name starting with '.': {path!r}")
+    if write and any(p[-1] in ". " for p in parts):
+        # FatFS create_name snips trailing spaces and dots (ff.c:2903 at
+        # 1.1.0), so STOR "x.bin." truncates and rewrites x.bin, while MLST
+        # of "x.bin." (pattern_match, literal dot) reports it missing: every
+        # existence guard would pass.
+        raise ValueError(f"refusing to write a name ending in '.' or ' ': {path!r}")
     if (
         write
         and parts[0].casefold() in WRITE_REFUSED_VOLUMES
@@ -581,9 +613,10 @@ def storage_put_file(
 
     After the ``STOR`` the server's ``SIZE`` must equal ``len(data)``.
     With *verify* (the default) the file is also read back and its
-    SHA-256 compared. Either mismatch raises
-    :class:`Ultimate64StorageError` and leaves the file in place for
-    inspection.
+    SHA-256 compared. Either mismatch, or a failed transfer, raises
+    :class:`Ultimate64StorageError`. A new file is then deleted. An
+    overwritten one gets its previous bytes back, which are read before the
+    ``STOR`` and verified after the restore. The error says which happened.
     """
     parts = _check_path(path, write=True)
     payload = _payload(data)
@@ -641,31 +674,54 @@ def storage_put_rom(
     The one write the helpers make under ``/Flash``. *kind* is
     ``"kernal"``, ``"basic"``, ``"chars"`` or ``"drive"`` (a 1541, 1571 or
     1581 ROM), and sets the sizes allowed (:data:`ROM_SIZES`) and the
-    longest name. Uploading does not select it. The firmware loads the file
-    that the ``C64 and Cartridge Settings`` items ``Kernal ROM``,
-    ``Basic ROM`` and ``Char ROM``, or the ``Drive A Settings`` items
-    ``ROM for 1541 mode`` / ``1571`` / ``1581``, name. The C64 ROMs are
-    loaded again on ``client.reboot()`` (c64.cc:915), not on
+    longest name.
+
+    **Selection.** The firmware loads the file that the ``C64 and Cartridge
+    Settings`` items ``Kernal ROM``, ``Basic ROM`` and ``Char ROM``, or the
+    ``Drive A Settings`` items ``ROM for 1541 mode`` / ``1571`` / ``1581``,
+    name. A new name is not selected until one of those items names it. A
+    stock name can already be selected, because the item's default names
+    it: the drive items default to ``1541.rom``/``1571.rom``/``1581.rom``
+    (c1541.cc:50-52 at 1.1.0), and on the C64U dev line the C64 items
+    default to ``kernal.bin``/``basic.bin``/``chars.bin`` (c64.cc:84-86 at
+    master cc4af99e). So writing a missing stock file can select it. The
+    C64 ROMs are loaded again on ``client.reboot()`` (c64.cc:915), not on
     ``machine:reset``.
+
+    **Fallbacks.** A missing ROM file makes the firmware fall back to its
+    built-in kernal and character ROM, but on the C64U dev line not to a
+    built-in BASIC (c64.cc:1153 at master cc4af99e). A drive ROM has no
+    built-in fallback: a missing or wrong-sized one fails ``set_drive_type``
+    (c1541.cc:920-933) and the drive is powered off (c1541.cc:200-202).
+    Drive images also get no signature check.
 
     Refused before any connection: an unknown *kind*, a size that kind cannot
     have, a C64 ROM that does not start the way the firmware menu expects
     (unless *check_signature* is false), and a name that is not one path
-    component, breaks the storage name rules, or is too long for its config
-    item.
+    component, breaks the storage name rules (``*``, ``?`` and a trailing
+    ``.`` or space included), or is too long for its config item.
 
-    On the device, the name is matched casefolded against the directory
-    (FatFS is case-insensitive), and an existing file keeps its spelling.
-    An existing file needs *overwrite*. One of :data:`STOCK_ROM_NAMES` also
-    needs *replace_stock*, because those are what recovery needs. The file
-    is always read back and its SHA-256 compared. If a new file fails,
-    it is deleted. A missing ROM file makes the firmware fall back to its
-    built-in kernal and character ROM, but on the C64U dev line not to a
-    built-in BASIC (c64.cc:1153 at master cc4af99e).
+    On the device, the name is matched ASCII-casefolded against the
+    ``MLSD`` listing (FatFS and the firmware fold ASCII only), and an
+    existing file keeps its spelling. An existing file needs *overwrite*.
+    One of :data:`STOCK_ROM_NAMES` also needs *replace_stock*, because
+    those are what recovery needs. **Residual:** an 8.3 short-name alias of
+    a long non-stock name (``JIFFYD~1.BIN``) is not in the listing, so the
+    *overwrite* guard does not see the file it reaches. The stock names are
+    already 8.3 and have no other alias. Before an overwrite the old bytes
+    are read. If the write or its read-back fails, they are put back and
+    verified, and the error says whether that worked. The new file is
+    always read back and its SHA-256 compared. A new file that fails is
+    deleted.
 
-    FTP ``STOR`` opens the target on the flash disk itself
-    (``vfs_open(vfs, arg, "wb")``, ftpd.cc:538 at 1.1.0), so this costs no
-    ``/Temp`` attachment.
+    **Accumulation.** ``/Flash`` is the same flash FAT that holds the saved
+    configuration (``CFG_FILEPATH "/flash/config"``, config.cc:34, written at
+    :374-375), so ROMs that pile up there take its space. Remove what you
+    upload with :func:`storage_delete_rom`.
+
+    **No /Temp cost, by source:** ``STOR`` opens the target itself
+    (ftpd.cc:538 -> ``vfs_open`` vfs.cc:32 -> ``f_open``, at 1.1.0). It is not
+    a REST body, so no attachment is created.
 
     :raises FileExistsError: an existing file without *overwrite*, or a stock
         file without *replace_stock*.
@@ -682,13 +738,13 @@ def storage_put_rom(
         # NotADirectoryError for it.
         if _walk(ftp, rom_dir) == "dir":
             for entry, _facts in ftp.mlsd(rom_dir):
-                if entry.casefold() == name.casefold():
+                if _ascii_fold(entry) == _ascii_fold(name):
                     path = f"{rom_dir}/{entry}"
                     break
         kind_now = _walk(ftp, path)
         if (
             kind_now == "file"
-            and path.rsplit("/", 1)[1].casefold() in STOCK_ROM_NAMES
+            and _ascii_fold(path.rsplit("/", 1)[1]) in STOCK_ROM_NAMES
             and not replace_stock
         ):
             raise FileExistsError(
@@ -700,6 +756,57 @@ def storage_put_rom(
             operation=f"storage_put_rom({kind!r}, {path!r})",
         )
     return result
+
+
+def storage_delete_rom(
+    host: str, name: str, *, missing_ok: bool = False, port: int = DEFAULT_FTP_PORT,
+    timeout: float = DEFAULT_STORAGE_FTP_TIMEOUT,
+) -> bool:
+    """Delete the ROM image *name* from :data:`ROM_DIRECTORY`. Stock files are refused.
+
+    The one delete the helpers make under ``/Flash``, so that what
+    :func:`storage_put_rom` uploads can be removed again. *name* follows the
+    same rules as there, and one of :data:`STOCK_ROM_NAMES` raises
+    ``ValueError`` before any connection, whatever its case. On the device
+    *name* must equal, ASCII-casefolded, an entry the ``MLSD`` listing of
+    ``/Flash/roms`` shows. That entry is deleted by its own spelling, so
+    ``DELE`` never matches by pattern, and an entry the listing does not
+    show (an 8.3 alias such as ``JIFFYD~1.BIN``) is never reached.
+
+    Returns ``True`` if a file was deleted, or ``False`` if it was absent and
+    *missing_ok* is true. If a config item still names the file, the
+    firmware falls back as :func:`storage_put_rom` describes.
+
+    :raises FileNotFoundError: absent and *missing_ok* is false.
+    :raises IsADirectoryError: *name* is a directory.
+    """
+    if not isinstance(name, str):
+        raise TypeError(f"ROM name must be a str, not {type(name).__name__}")
+    if _ascii_fold(name) in STOCK_ROM_NAMES:
+        raise ValueError(
+            f"refusing to delete {name!r}: it is a firmware stock ROM file, which recovery needs"
+        )
+    parts = _check_path(f"{ROM_DIRECTORY}/{name}", write=True, allow_rom_dir=True)
+    with _session(host, f"storage_delete_rom({name!r})", port, timeout) as ftp:
+        path = _resolve_volume(ftp, host, parts)
+        rom_dir = path.rsplit("/", 1)[0]
+        found = None
+        if _walk(ftp, rom_dir) == "dir":
+            for entry, facts in ftp.mlsd(rom_dir):
+                if _ascii_fold(entry) == _ascii_fold(name):
+                    found = (entry, facts.get("type"))
+                    break
+        if found is None:
+            if missing_ok:
+                return False
+            raise FileNotFoundError(f"{rom_dir}/{name} does not exist on {host}")
+        entry, entry_type = found
+        path = f"{rom_dir}/{entry}"
+        if entry_type in ("dir", "cdir", "pdir"):
+            raise IsADirectoryError(f"{path} on {host} is a directory")
+        ftp.delete(path)
+    _log.info("storage_delete_rom: deleted %s on %s", path, host)
+    return True
 
 
 def _payload(data: bytes | bytearray | Path) -> bytes:
@@ -730,6 +837,14 @@ def _store(
         raise FileExistsError(
             f"{path} already exists on {host} ({existing} B); pass overwrite=True"
         )
+    original = None
+    if kind == "file":
+        # "wb" opens with FA_CREATE_ALWAYS (vfs.cc:32 at 1.1.0), which
+        # truncates before the first byte arrives, so keep the old bytes to
+        # put back if the write fails.
+        buf = io.BytesIO()
+        ftp.retrbinary(f"RETR {path}", buf.write)
+        original = buf.getvalue()
     _make_parents(ftp, path, include_self=False)
     try:
         ftp.storbinary(f"STOR {path}", io.BytesIO(payload))
@@ -760,7 +875,7 @@ def _store(
             except _FTP_ALL_ERRORS as del_exc:
                 fate = f"removing the partial file also failed ({del_exc}); retry with overwrite=True"
         else:
-            fate = "the previous file is gone or truncated; retry with overwrite=True"
+            fate = _restore(ftp, host, path, original)
         raise Ultimate64StorageError(
             f"{operation} on {host} failed: "
             f"{type(exc).__name__}: {exc}; {fate}"
@@ -773,6 +888,22 @@ def _store(
         path=path, size=len(payload), sha256=digest,
         verified=verified, replaced=existing is not None,
     )
+
+
+def _restore(ftp: FTP, host: str, path: str, original: bytes) -> str:
+    """Put *original* back at *path* after a failed overwrite; say what is there now."""
+    try:
+        ftp.storbinary(f"STOR {path}", io.BytesIO(original))
+        buf = io.BytesIO()
+        ftp.retrbinary(f"RETR {path}", buf.write)
+        if buf.getvalue() != original:
+            raise Ultimate64StorageError("the restored file read back differently")
+    except (Ultimate64StorageError, *_FTP_ALL_ERRORS) as exc:
+        return (
+            f"putting it back also failed ({type(exc).__name__}: {exc}); the previous "
+            "file is gone or truncated; retry with overwrite=True"
+        )
+    return "the previous file was put back and verified; the device holds it unchanged"
 
 
 def storage_mkdir(
