@@ -587,7 +587,8 @@ _FAKE_PY = r"""#!/bin/sh
 case "$1" in
   -c) exec "$REAL_PY" -c 'import sys; sys.version_info = (@VER@); exec(sys.argv[1])' "$2" ;;
   -m) echo "@NAME@ $*" >> "$CALLS"
-      d="$4"; mkdir -p "$d/bin"
+      for d; do :; done  # the venv dir is the last argument, flag or not
+      mkdir -p "$d/bin"
       printf '#!/bin/sh\nexit 0\n' > "$d/bin/python"
       printf '#!/bin/sh\necho "pip $*" >> "$CALLS"\n' > "$d/bin/pip"
       chmod 755 "$d/bin/python" "$d/bin/pip" ;;
@@ -603,13 +604,17 @@ def _stage3_with(
     dry_run: bool = False,
     os_name: str = "Linux",
     brew_python: str | None = None,
+    brew_seam: str = "env",
 ) -> tuple[subprocess.CompletedProcess, Path, list[str]]:
     """Run stage 3 with only *interpreters* (name -> "3, 9, 6") ahead of /usr/bin.
 
     *existing_venv* pre-creates the venv with an interpreter of that version.
     *brew_python* installs a fake Homebrew ``python3`` of that version, off
     ``PATH``, at the path ``BREW_PYTHON3`` names (``os_name="Darwin"`` only
-    looks there); ``None`` leaves that path empty.
+    looks there); ``None`` leaves that path empty.  *brew_seam* says how stage 3
+    finds it: ``"env"`` sets ``BREW_PYTHON3``, ``"brew"`` leaves it unset and
+    puts a fake ``brew`` on ``PATH`` whose ``--prefix`` is that path's prefix,
+    ``"none"`` does neither.
     """
     import sys
 
@@ -644,12 +649,17 @@ def _stage3_with(
         brew_py.parent.mkdir(parents=True)
         brew_py.write_text(_FAKE_PY.replace("@VER@", brew_python).replace("@NAME@", "brew-python3"))
         brew_py.chmod(0o755)
+    if brew_seam == "brew":
+        fake_brew = bindir / "brew"
+        fake_brew.write_text(f'#!/bin/sh\n[ "$1" = --prefix ] && echo {shlex.quote(str(brew_py.parent.parent))}\n')
+        fake_brew.chmod(0o755)
+    seam = f"BREW_PYTHON3={shlex.quote(str(brew_py))}\n" if brew_seam == "env" else "unset BREW_PYTHON3\n"
     program = (
         "set -u\n"
         + _section(SETUP, "# ---------- logging helpers", "# ---------- arg parsing")
         + f"DRY_RUN={int(dry_run)}\nNO_HARNESS=0\nVENV_DIR={shlex.quote(str(venv))}\n"
         + f"REPO_ROOT={shlex.quote(str(repo))}\nOS={os_name}\n"
-        + f"BREW_PYTHON3={shlex.quote(str(brew_py))}\n"
+        + seam
         + "run_cmd() { shift; \"$@\"; }\n"
         + _section(SETUP, "# ---------- Stage 3", "# ---------- Stage 4")
         + "\nstage_harness_install\n"
@@ -706,10 +716,14 @@ def test_stage3_refuses_when_no_python_meets_requires_python(tmp_path):
 # 2026-10-21: Python is unpinned, fix forward). A versioned python3.1x on PATH
 # used to win even when it was older than brew's current one.
 def test_stage3_macos_builds_the_venv_on_brews_python3(tmp_path):
-    _proc, venv, venv_calls = _stage3_with(
+    proc, venv, venv_calls = _stage3_with(
         tmp_path, {"python3.14": "3, 14, 0", "python3": "3, 9, 6"}, os_name="Darwin", brew_python="3, 15, 0"
     )
     assert venv_calls == [f"brew-python3 -m venv {venv}"], venv_calls
+    # Stage 3 went on to install into the venv it built.
+    assert "[fail]" not in proc.stdout + proc.stderr, proc.stdout + proc.stderr
+    calls = (tmp_path / "calls").read_text().splitlines()
+    assert [c for c in calls if c.startswith("pip install -e ")], calls
 
 
 def test_stage3_macos_refuses_a_brew_python3_below_requires_python(tmp_path):
@@ -719,6 +733,20 @@ def test_stage3_macos_refuses_a_brew_python3_below_requires_python(tmp_path):
     assert venv_calls == [], venv_calls
     assert not venv.exists()
     assert "brew install python" in proc.stdout + proc.stderr, proc.stdout
+    assert "BREW_PYTHON3" in proc.stdout + proc.stderr, proc.stdout
+
+
+def test_stage3_macos_finds_python3_under_brews_prefix(tmp_path):
+    """An Intel Mac's Homebrew lives in /usr/local, not /opt/homebrew."""
+    _proc, venv, venv_calls = _stage3_with(
+        tmp_path, {"python3.14": "3, 14, 0"}, os_name="Darwin", brew_python="3, 15, 0", brew_seam="brew"
+    )
+    assert venv_calls == [f"brew-python3 -m venv {venv}"], venv_calls
+
+
+def test_stage3_macos_without_brew_on_path_looks_in_opt_homebrew(tmp_path):
+    proc, _venv, _calls = _stage3_with(tmp_path, {}, os_name="Darwin", brew_seam="none", dry_run=True)
+    assert "/opt/homebrew/bin/python3" in proc.stdout, proc.stdout
 
 
 def test_stage3_macos_without_brew_python3_does_not_fall_back_to_path(tmp_path):

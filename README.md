@@ -21,7 +21,7 @@ This is how the project's dev machine is set up. It was last checked on 2026-09-
 - Homebrew `vice` 3.10 at `/opt/homebrew/bin/x64sc` and `c1541`, where `x64sc -features` reports `HAVE_RAWNET yes` / `HAVE_PCAP yes`;
 - the venv on Homebrew `python@3.13` (3.13.13).
 
-Python is not pinned: use Homebrew's current `python` formula, whatever release it is (3.15.0 on 2026-10-21, where master passed its suite), and fix forward when it moves.
+Python is not pinned: use Homebrew's current `python` formula, whatever release it is (3.15.0 on 2026-10-21, when master passed its suite in the central `~/.local/share/c64-harness/venv` built on it with `[dev,notify]`; this repo's own dev venv was still on 3.13 then), and fix forward when it moves.
 
 ```bash
 brew install vice python
@@ -44,7 +44,7 @@ The Homebrew bottle already carries ethernet support, so you do not need a sourc
 - VICE ethernet without root: `./scripts/build-vice-eth.sh` builds Homebrew's VICE plus one patch (`vice/rawnet-bpf-permissions.patch`) that enables the pcap driver when you can open a `/dev/bpf*` node read-write, keg-only at `/opt/homebrew/opt/vice-eth`, and the harness uses it automatically. Stock VICE's pcap driver needs **root** instead: the harness then launches it with `sudo -n` and needs a NOPASSWD rule for `/opt/homebrew/bin/x64sc`, and without one an ethernet launch is refused up front with `ViceElevationRequiredError`, which names both remedies. `verify-dev-env.sh` reports which you have, and flags a patched build that `brew upgrade vice` has left behind.
 - A NOPASSWD sudoers drop-in for the three bridge scripts, preferably naming root-owned copies in `/usr/local/libexec/c64-harness/` (the harness uses those when a rule covers them, else the checkout's `scripts/`).
 
-`scripts/setup-dev-env.sh` also has a macOS branch (`brew install vice python`, the venv, the feth bridge). Its first recorded run was on 2026-10-20, with `--no-system-packages --no-bridge --no-u64`, so its macOS stage 1 is still unrun: the venv was built and the harness installed into it. On macOS it builds the venv from Homebrew's `/opt/homebrew/bin/python3`, whatever release that is, and stops if it is missing or older than 3.10. Moving to a new machine involves more than installing: state outside git, other projects' editable installs, shared devices. The order is in [docs/development.md § Bringing up a new machine](docs/development.md#bringing-up-a-new-machine).
+`scripts/setup-dev-env.sh` also has a macOS branch (`brew install vice python`, the venv, the feth bridge). Its first recorded run was on 2026-10-20, with `--no-system-packages --no-bridge --no-u64`, so its macOS stage 1 is still unrun: the venv was built and the harness installed into it. On macOS it builds the venv from Homebrew's `python3` (`$(brew --prefix)/bin/python3`, so `/opt/homebrew` on Apple Silicon and `/usr/local` on Intel; `BREW_PYTHON3` overrides it), whatever release that is, and stops if it is missing or older than 3.10. Moving to a new machine involves more than installing: state outside git, other projects' editable installs, shared devices. The order is in [docs/development.md § Bringing up a new machine](docs/development.md#bringing-up-a-new-machine).
 
 ### Ubuntu 25: secondary, passed in a fresh VM 2026-09-28
 

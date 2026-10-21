@@ -589,7 +589,20 @@ stage_vice_build() {
 # whatever release it is (Python is unpinned; owner, 2026-10-21), and nothing
 # else.  Elsewhere take the first versioned interpreter that meets the floor,
 # newest first, then plain python3.  Prints nothing when none does.
-BREW_PYTHON3="${BREW_PYTHON3:-/opt/homebrew/bin/python3}"
+# BREW_PYTHON3 may be set in the environment to override that interpreter;
+# it is also the tests' seam.  Unset, it is $(brew --prefix)/bin/python3
+# (/usr/local on an Intel Mac), or /opt/homebrew/bin/python3 without brew.
+brew_python3() {
+    if [ -n "${BREW_PYTHON3:-}" ]; then
+        printf '%s\n' "$BREW_PYTHON3"
+        return
+    fi
+    local prefix=""
+    if command -v brew >/dev/null 2>&1; then
+        prefix="$(brew --prefix 2>/dev/null)" || prefix=""
+    fi
+    printf '%s/bin/python3\n' "${prefix:-/opt/homebrew}"
+}
 
 python_meets_floor() {
     "$1" -c 'import sys; sys.exit(sys.version_info < (3, 10))' >/dev/null 2>&1
@@ -597,7 +610,7 @@ python_meets_floor() {
 
 no_venv_python_msg() {
     if [ "${OS:-}" = "Darwin" ]; then
-        printf 'no python3 >= 3.10 at %s (brew install python)' "$BREW_PYTHON3"
+        printf 'no python3 >= 3.10 at %s (brew install python, or set BREW_PYTHON3)' "$(brew_python3)"
     else
         printf 'no python3 >= 3.10 on PATH'
     fi
@@ -614,7 +627,7 @@ venv_site_flag() {
 pick_venv_python() {
     local py
     if [ "${OS:-}" = "Darwin" ]; then
-        py="$BREW_PYTHON3"
+        py="$(brew_python3)"
         if [ -x "$py" ] && python_meets_floor "$py"; then
             printf '%s\n' "$py"
             return 0

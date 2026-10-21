@@ -26,7 +26,7 @@ The setup is manual and short:
 
 1. **Install Homebrew** if you don't have it yet: <https://brew.sh>. Never run `brew` as root.
 
-2. **Install VICE 3.10 and Homebrew's Python.** The `vice` bottle ships `x64sc` and `c1541` with ethernet support already compiled in, so no source build is needed. Python is not pinned: take the unversioned `python` formula, whatever release it is (3.15.0 on 2026-10-21, where master passed its suite), and fix forward when it moves:
+2. **Install VICE 3.10 and Homebrew's Python.** The `vice` bottle ships `x64sc` and `c1541` with ethernet support already compiled in, so no source build is needed. Python is not pinned: take the unversioned `python` formula, whatever release it is (3.15.0 on 2026-10-21, when master passed its suite in the central `~/.local/share/c64-harness/venv` built on it with `[dev,notify]`; this repo's own dev venv was still on 3.13 then), and fix forward when it moves:
 
    ```bash
    brew install vice python
@@ -131,7 +131,7 @@ Steps 6-8 are needed only for the ethernet/bridge tests.
 - stage 4 runs `setup-bridge-feth-macos.sh`;
 - `--force` and `--sha256` are ignored.
 
-Its stage 1 also installs Homebrew's unversioned `python`, and stage 3 builds the venv from `/opt/homebrew/bin/python3`, without `--system-site-packages`, stopping if that interpreter is missing or older than 3.10. It does not do steps 7-8. The first recorded macOS run was on 2026-10-20 with `--no-system-packages --no-bridge --no-u64`, so stage 1 has still not run on macOS: stage 3 built the venv on 3.13.16 and installed the harness into it. Verify reported READY, but it checked the canonical venv rather than the new one; the installer now points verify at the venv it built. At `c89f9cf` the same run had taken `/usr/bin/python3` 3.9.6, failed the editable install (`requires a different Python: 3.9.6 not in '>=3.10'`), and still exited 0 (see [Bringing up a new machine](#bringing-up-a-new-machine)).
+Its stage 1 also installs Homebrew's unversioned `python`, and stage 3 builds the venv from Homebrew's `python3` (`$(brew --prefix)/bin/python3`, falling back to `/opt/homebrew/bin/python3` without `brew`; `BREW_PYTHON3` overrides it), without `--system-site-packages`, stopping if that interpreter is missing or older than 3.10. It does not do steps 7-8. The first recorded macOS run was on 2026-10-20 with `--no-system-packages --no-bridge --no-u64`, so stage 1 has still not run on macOS: stage 3 built the venv on 3.13.16 and installed the harness into it. Verify reported READY, but it checked the canonical venv rather than the new one; the installer now points verify at the venv it built. At `c89f9cf` the same run had taken `/usr/bin/python3` 3.9.6, failed the editable install (`requires a different Python: 3.9.6 not in '>=3.10'`), and still exited 0 (see [Bringing up a new machine](#bringing-up-a-new-machine)).
 
 ### VICE ethernet without root: the patched build
 
@@ -201,7 +201,7 @@ The steps above build a harness. Moving to a new Mac takes more than that: some 
    ./scripts/setup-dev-env.sh --no-bridge --no-u64
    ```
 
-   That exact command has not been run: both recorded macOS runs added `--no-system-packages`, so the macOS stage 1 (now `brew install vice python`) is unrun. On macOS the installer now builds the venv from Homebrew's `/opt/homebrew/bin/python3`, not the first `python3` on `PATH`. Before this, it took `/usr/bin/python3` (3.9) on a fresh Mac, `pip` refused the package, and the run still ended READY with exit 0: verify fell back to an existing canonical venv. Now a failed stage makes the installer exit 1, and a venv left behind on Python < 3.10 is refused with the `rm -rf` to run rather than reused. Add the `notify` extra if you want filesystem-event wakeups in `DeviceLock`: `pip install -e '.[dev,notify]'`.
+   That exact command has not been run: both recorded macOS runs added `--no-system-packages`, so the macOS stage 1 (now `brew install vice python`) is unrun. On macOS the installer now builds the venv from Homebrew's `python3`, not the first `python3` on `PATH`. Before this, it took `/usr/bin/python3` (3.9) on a fresh Mac, `pip` refused the package, and the run still ended READY with exit 0: verify fell back to an existing canonical venv. Now a failed stage makes the installer exit 1, and a venv left behind on Python < 3.10 is refused with the `rm -rf` to run rather than reused. Add the `notify` extra if you want filesystem-event wakeups in `DeviceLock`: `pip install -e '.[dev,notify]'`.
 
 3. **Carry over the state that is not in git.** Recreate each item, or copy it across; do not assume a migration tool brought it.
 
