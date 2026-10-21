@@ -35,6 +35,8 @@ Rules, all enforced before the path is touched:
   card in it: the root lists that slot, but it cannot be entered.
 * **No config writes.** If FTP File Service is off, the call raises
   :class:`Ultimate64StorageError` naming the setting, and leaves it off.
+  Turning it on is the caller's decision:
+  :func:`~c64_test_harness.backends.ultimate64_helpers.enable_ftp_service`.
 * **Files and directories are told apart with** ``MLST``, which stats
   without mounting. ``CWD`` into a mountable image (``.d64``, ``.d81``,
   ``.t64``...) succeeds on the firmware and opens the image, so it is used
@@ -259,8 +261,9 @@ def _session(host: str, operation: str, port: int, timeout: float) -> Iterator[F
             f"{operation}: cannot reach the FTP server on {host}:{port} "
             f"({type(exc).__name__}: {exc}). If FTP File Service is disabled "
             "(the 1.1.0 default after power-on), enable it with "
-            "client.set_config_item('Network Settings', 'FTP File Service', "
-            "'Enabled'); the storage helpers never write config."
+            "c64_test_harness.enable_ftp_service(client) while holding this "
+            "DeviceLock (it persists until power-on and is never saved to "
+            "flash); the storage helpers never write config themselves."
         ) from exc
     try:
         ftp.voidcmd("TYPE I")

@@ -86,6 +86,7 @@ from .backends.ultimate64_client import (
     Ultimate64TimeoutError,
     Ultimate64ProtocolError,
     Ultimate64WireFormatError,
+    Ultimate64ConfigVerifyError,
 )
 from .backends.ultimate64_helpers import (
     get_turbo_mhz,
@@ -108,6 +109,7 @@ from .backends.ultimate64_helpers import (
     set_sid_address_map,
     isolated_sid_addressing,
     set_sid_auto_mirroring,
+    enable_ftp_service,
     get_sid_socket_types,
     get_sid_addresses,
     configure_multi_sid,
@@ -523,6 +525,7 @@ __all__ = [
     "Ultimate64TimeoutError",
     "Ultimate64ProtocolError",
     "Ultimate64WireFormatError",
+    "Ultimate64ConfigVerifyError",
     "CPU_SPEED_VALUES",
     "CPU_SPEED_BY_MHZ",
     "TURBO_CONTROL_VALUES",
@@ -579,6 +582,7 @@ __all__ = [
     "set_sid_address_map",
     "isolated_sid_addressing",
     "set_sid_auto_mirroring",
+    "enable_ftp_service",
     "get_sid_socket_types",
     "get_sid_addresses",
     "configure_multi_sid",

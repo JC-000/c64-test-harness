@@ -25,6 +25,7 @@ from typing import Any, Callable, Iterator, Mapping
 from ..progress import ProgressEvent, ProgressEventKind, watch_progress as _watch_progress
 from .ultimate64_client import (
     Ultimate64Client,
+    Ultimate64ConfigVerifyError,
     Ultimate64Error,
     Ultimate64ProtocolError,
     Ultimate64RunnerStuckError,
@@ -89,6 +90,7 @@ __all__ = [
     "set_sid_address_map",
     "isolated_sid_addressing",
     "set_sid_auto_mirroring",
+    "enable_ftp_service",
     "mount_disk_file",
     "unmount",
     "run_prg_file",
@@ -1988,6 +1990,64 @@ def set_sid_auto_mirroring(client: Ultimate64Client, enabled: bool) -> None:
             f"{SID_AUTO_MIRRORING_ITEM} read back as {readback!r} after "
             f"writing {value!r}; the address map cannot be trusted."
         )
+
+
+_FTP_SERVICE_CATEGORY = "Network Settings"
+_FTP_SERVICE_ITEM = "FTP File Service"
+_FTP_SERVICE_ENABLED = "Enabled"
+
+
+def enable_ftp_service(client: Ultimate64Client) -> bool:
+    """Turn on ``Network Settings > FTP File Service``; ``True`` if it wrote.
+
+    FTP File Service is off by default on C64U 1.1.0 and after a config
+    reset, and the storage helpers and the ``/Temp`` sweep both need it
+    (#546). This is the public form of the enable the hygiene pass makes on
+    its own:
+
+    * **The caller must hold the device's** ``DeviceLock`` (any lock dir,
+      the check the hygiene pass uses). Refused with :class:`Ultimate64Error`
+      before any request otherwise.
+    * **Idempotent:** reads the item first and writes nothing when it is
+      already enabled (returns ``False``).
+    * **Verified:** the write is ``set_config_item(..., verify=True)``, so a
+      PUT the device accepted but did not apply raises
+      :class:`Ultimate64ConfigVerifyError`.
+    * **Never saved to flash.** The setting lives in firmware RAM until a
+      power-on (``machine:reboot`` does not clear it). It is the second
+      sanctioned write into a ``BASELINE_NEVER_TOUCH`` store, after the
+      hygiene pass's own; that contract covers ``apply_factory_baseline``
+      only.
+    * Logs a WARNING once it has written: the device's FTP server is then
+      open on the LAN, anonymous login included, until power-off.
+
+    Every request is bodyless (GET, query-string PUT, GET): zero ``/Temp``
+    attachments on any firmware.
+
+    :raises Ultimate64Error: this process does not hold the DeviceLock.
+    :raises Ultimate64ConfigVerifyError: the item did not read back enabled.
+    """
+    if not client._temp_lock_held():
+        raise Ultimate64Error(
+            f"refusing to enable {_FTP_SERVICE_CATEGORY} > {_FTP_SERVICE_ITEM} "
+            f"on {client.host}: this process does not hold the device's "
+            "DeviceLock. Take it first, e.g. DeviceLock(host).acquire_or_raise("
+            "timeout=...), or run inside create_manager(backend='u64')."
+        )
+    current = client.get_config_value(_FTP_SERVICE_CATEGORY, _FTP_SERVICE_ITEM)
+    if str(current).strip().casefold() == _FTP_SERVICE_ENABLED.casefold():
+        return False
+    client.set_config_item(
+        _FTP_SERVICE_CATEGORY, _FTP_SERVICE_ITEM, _FTP_SERVICE_ENABLED,
+        verify=True,
+    )
+    _log.warning(
+        "Enabled %s > %s on %s (was %r): the device's FTP server is now open "
+        "on the LAN, anonymous login included, until a firmware power-off. "
+        "Not saved to flash; machine:reboot does not clear it.",
+        _FTP_SERVICE_CATEGORY, _FTP_SERVICE_ITEM, client.host, current,
+    )
+    return True
 
 
 def _distinct_sid_allocation(
