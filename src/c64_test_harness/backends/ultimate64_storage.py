@@ -120,10 +120,10 @@ ROM_DIRECTORY = "/Flash/roms"
 
 #: The sizes each ROM kind may have, from the firmware's own filters: the
 #: ``Kernal ROM``/``Basic ROM`` presets list only 8192-byte files and ``Char
-#: ROM`` only 4096-byte ones (c64.cc:1420/1449/1478 at 1.1.0), and the drive
-#: ROM presets 16384 or 32768 (c1541.cc:1222). A 16 KiB drive ROM is mirrored
+#: ROM`` only 4096-byte ones (c64.cc:1419/1448/1477 at 1.1.0), and the drive
+#: ROM presets 16384 or 32768 (c1541.cc:1220). A 16 KiB drive ROM is mirrored
 #: to fill 32 KiB; any other size fails with SSRET_INVALID_DRIVE_ROM
-#: (c1541.cc:927-933).
+#: (c1541.cc:928-933).
 ROM_SIZES: dict[str, tuple[int, ...]] = {
     "kernal": (8192,),
     "basic": (8192,),
@@ -140,7 +140,7 @@ _ROM_NAME_MAX = {"kernal": 30, "basic": 30, "chars": 30, "drive": 32}
 
 #: ``(offset, bytes)`` each C64 ROM kind starts with: the checks the firmware
 #: menu's "Set as ... ROM" makes before it asks "Are you sure?"
-#: (filetype_bin.cc:161, :174, :187 at 1.1.0, little-endian words). The drive
+#: (filetype_bin.cc:164, :177, :190 at 1.1.0, little-endian words). The drive
 #: ROMs have none there.
 _ROM_SIGNATURES = {
     "kernal": (0, bytes.fromhex("8556200f")),
@@ -150,10 +150,10 @@ _ROM_SIGNATURES = {
 
 #: Files the firmware itself puts in :data:`ROM_DIRECTORY` (compared
 #: casefolded). The updaters write the drive ROMs and sound banks
-#: (update_u64ii.cc:142-147 for the C64U, update_u64.cc:93-98 for the
+#: (update_u64ii.cc:144-149 for the C64U, update_u64.cc:93-98 for the
 #: U64E), the U64E's updater also copies kernal/basic/chars out of flash
-#: (update_u64.cc:83-91), and on the C64U dev line (master) these three are
-#: the defaults of the ROM config items (c64.cc:84-86 at master). These are
+#: (update_u64.cc:83-91), and on the C64U dev line these three are
+#: the defaults of the ROM config items (c64.cc:84-86 at master cc4af99e). These are
 #: what recovery needs, and the C64U cannot be reflashed remotely, so
 #: :func:`storage_put_rom` replaces one only with ``replace_stock=True``.
 STOCK_ROM_NAMES = frozenset({
@@ -286,7 +286,8 @@ def _check_path(
         raise ValueError(
             f"refusing to write {path!r}: /{parts[0]} is not test storage "
             "(/Temp is the firmware RAM disk the harness sweeps; /Flash holds "
-            "the firmware's own files)"
+            "the firmware's own files; storage_put_rom writes a single file "
+            "directly in /Flash/roms and nothing else)"
         )
     return parts
 
@@ -590,7 +591,7 @@ def storage_put_file(
         path = _resolve_volume(ftp, host, parts)
         result = _store(
             ftp, host, path, payload, _walk(ftp, path),
-            overwrite=overwrite, verify=verify, operation="storage_put_file",
+            overwrite=overwrite, verify=verify, operation=f"storage_put_file({path!r})",
         )
     return result
 
@@ -599,8 +600,8 @@ def _check_rom(kind: str, name: str, payload: bytes, *, check_signature: bool) -
     """Refuse a ROM the firmware would not list or load. Raises ``ValueError``."""
     if kind not in ROM_SIZES:
         raise ValueError(f"unknown ROM kind {kind!r}; expected one of {sorted(ROM_SIZES)}")
-    if not isinstance(name, str) or not name or "/" in name:
-        raise ValueError(f"ROM name must be one non-empty path component: {name!r}")
+    if not isinstance(name, str):
+        raise TypeError(f"ROM name must be a str, not {type(name).__name__}")
     if len(name) > _ROM_NAME_MAX[kind]:
         raise ValueError(
             f"ROM name {name!r} is {len(name)} characters; the {kind} ROM config "
@@ -660,7 +661,7 @@ def storage_put_rom(
     is always read back and its SHA-256 compared. If a new file fails,
     it is deleted. A missing ROM file makes the firmware fall back to its
     built-in kernal and character ROM, but on the C64U dev line not to a
-    built-in BASIC (c64.cc init_system_roms at master).
+    built-in BASIC (c64.cc:1153 at master cc4af99e).
 
     FTP ``STOR`` opens the target on the flash disk itself
     (``vfs_open(vfs, arg, "wb")``, ftpd.cc:538 at 1.1.0), so this costs no
@@ -674,14 +675,12 @@ def storage_put_rom(
     payload = _payload(data)
     _check_rom(kind, name, payload, check_signature=check_signature)
     parts = _check_path(f"{ROM_DIRECTORY}/{name}", write=True, allow_rom_dir=True)
-    operation = f"storage_put_rom({kind!r}, {name!r})"
-    with _session(host, operation, port, timeout) as ftp:
+    with _session(host, f"storage_put_rom({kind!r}, {name!r})", port, timeout) as ftp:
         path = _resolve_volume(ftp, host, parts)
         rom_dir = path.rsplit("/", 1)[0]
-        dir_kind = _walk(ftp, rom_dir)
-        if dir_kind == "file":
-            raise NotADirectoryError(f"{rom_dir} on {host} is a file, not a directory")
-        if dir_kind == "dir":
+        # A file at /Flash/roms leaves this alone; _walk below raises
+        # NotADirectoryError for it.
+        if _walk(ftp, rom_dir) == "dir":
             for entry, _facts in ftp.mlsd(rom_dir):
                 if entry.casefold() == name.casefold():
                     path = f"{rom_dir}/{entry}"
@@ -697,8 +696,8 @@ def storage_put_rom(
                 "needs; pass overwrite=True, replace_stock=True to replace it"
             )
         result = _store(
-            ftp, host, path, payload, kind_now,
-            overwrite=overwrite, verify=True, operation=operation,
+            ftp, host, path, payload, kind_now, overwrite=overwrite, verify=True,
+            operation=f"storage_put_rom({kind!r}, {path!r})",
         )
     return result
 
@@ -763,12 +762,12 @@ def _store(
         else:
             fate = "the previous file is gone or truncated; retry with overwrite=True"
         raise Ultimate64StorageError(
-            f"{operation}({path!r}) on {host} failed: "
+            f"{operation} on {host} failed: "
             f"{type(exc).__name__}: {exc}; {fate}"
         ) from exc
     _log.info(
         "%s: wrote %s on %s (%d B, sha256 %s, verified=%s, replaced=%s)",
-        operation, path, host, len(payload), digest[:16], verified, existing is not None,
+        operation.split("(", 1)[0], path, host, len(payload), digest[:16], verified, existing is not None,
     )
     return StoragePutResult(
         path=path, size=len(payload), sha256=digest,

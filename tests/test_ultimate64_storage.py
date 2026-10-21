@@ -947,6 +947,22 @@ def test_put_rom_never_replaces_a_stock_file_without_replace_stock(server, stock
     assert f"/Flash/roms/{stock.upper()}" not in server.files
 
 
+def test_put_rom_stock_guard_reads_the_device_spelling_casefolded(server):
+    """A stock file the device spells in capitals (a FAT 8.3 entry) is still stock."""
+    server.dirs.add("/Flash/roms")
+    server.files["/Flash/roms/KERNAL.BIN"] = b"stock"
+    with pytest.raises(FileExistsError, match="replace_stock=True"):
+        st.storage_put_rom("dev", "kernal", "kernal.bin", KERNAL, overwrite=True)
+    assert server.files == {"/Flash/roms/KERNAL.BIN": b"stock"}
+
+
+def test_put_rom_refuses_a_name_that_is_not_a_str(server):
+    for name in (b"kernal.bin", None, 7):
+        with pytest.raises(TypeError):
+            st.storage_put_rom("dev", "kernal", name, KERNAL)
+    assert server.connects == 0
+
+
 def test_put_rom_writes_a_missing_stock_file_without_an_opt_in(server):
     """After a reformat kernal/basic/chars are absent: putting them back is the point."""
     server.dirs.add("/Flash/roms")
