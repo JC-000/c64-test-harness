@@ -1174,18 +1174,46 @@ def test_delete_rom_missing_directory_and_dir_entries(server):
 
 # ------------------------------------------- ASCII-only case folding (FatFS)
 def test_rom_names_fold_ascii_only(server):
-    """str.casefold maps 'ß' to 'ss'; the firmware and FatFS fold ASCII only."""
+    """The firmware's MLST matcher folds ASCII only (pattern.cc:78); str.casefold
+    would make 'strasse.bin' match a listed 'STRAßE.BIN'."""
     server.dirs.add("/Flash/roms")
-    server.files["/Flash/roms/STRASSE.BIN"] = b"other"
-    st.storage_put_rom("dev", "kernal", "straße.bin", KERNAL)
-    assert server.files["/Flash/roms/straße.bin"] == KERNAL
-    assert server.files["/Flash/roms/STRASSE.BIN"] == b"other"
-    assert st.storage_delete_rom("dev", "STRAßE.BIN") is True
-    assert server.files == {"/Flash/roms/STRASSE.BIN": b"other"}
-    # with straße.bin gone, a casefold match would now hit STRASSE.BIN
+    server.files["/Flash/roms/STRAßE.BIN"] = b"other"
+    st.storage_put_rom("dev", "kernal", "strasse.bin", KERNAL)
+    assert server.files["/Flash/roms/strasse.bin"] == KERNAL
+    assert server.files["/Flash/roms/STRAßE.BIN"] == b"other"
+    assert st.storage_delete_rom("dev", "STRASSE.BIN") is True
+    assert server.files == {"/Flash/roms/STRAßE.BIN": b"other"}
     with pytest.raises(FileNotFoundError):
-        st.storage_delete_rom("dev", "straße.bin")
-    assert server.files == {"/Flash/roms/STRASSE.BIN": b"other"}
+        st.storage_delete_rom("dev", "strasse.bin")
+    assert server.files == {"/Flash/roms/STRAßE.BIN": b"other"}
+
+
+@pytest.mark.parametrize("name", ["jiffyä.bin", "JIFFYÄ.bin", "straße.bin", "é.rom", "a\u2044b.bin"])
+def test_rom_names_must_be_ascii(server, name):
+    """FatFS compares long names with ff_wtoupper (ff.c:1917) and short names
+    through CP437 ExCvt (ff.c:2797), but MLST matches ASCII-only: a put of
+    'jiffyä.bin' would stat as missing and then rewrite 'JIFFYÄ.bin'."""
+    server.dirs.add("/Flash/roms")
+    server.files["/Flash/roms/JIFFYÄ.bin"] = b"other"
+    with pytest.raises(ValueError, match="ASCII"):
+        st.storage_put_rom("dev", "kernal", name, KERNAL, overwrite=True)
+    with pytest.raises(ValueError, match="ASCII"):
+        st.storage_delete_rom("dev", name)
+    assert server.connects == 0
+    assert server.files == {"/Flash/roms/JIFFYÄ.bin": b"other"}
+
+
+def test_delete_rom_checks_the_file_is_gone(server):
+    server.dirs.add("/Flash/roms")
+    server.files["/Flash/roms/jiffy.bin"] = KERNAL
+
+    def delete(self, path):
+        self.server.log.append(f"DELE {path}")
+        return "250 OK"  # answered, but nothing removed
+
+    with patch.object(_FakeFTP, "delete", delete):
+        with pytest.raises(st.Ultimate64StorageError, match="still"):
+            st.storage_delete_rom("dev", "jiffy.bin")
 
 
 # ------------------------------------ a failed overwrite puts the old file back

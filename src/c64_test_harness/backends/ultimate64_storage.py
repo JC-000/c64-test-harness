@@ -250,8 +250,11 @@ _ASCII_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstu
 def _ascii_fold(name: str) -> str:
     """*name* with A-Z lowered and nothing else changed.
 
-    The firmware's pattern_match and FatFS (FF_CODE_PAGE 437) fold ASCII
-    only, so ``str.casefold`` is wrong here: it turns ``'ß'`` into ``"ss"``.
+    This is how the firmware's pattern_match, which MLST, SIZE and DELE use,
+    compares names: ASCII only (pattern.cc:78 at 1.1.0). ``str.casefold``
+    would turn ``'ß'`` into ``"ss"``. FatFS itself folds more: ff_wtoupper
+    for long names (ff.c:1917) and CP437 ExCvt for short ones (ff.c:2797).
+    That gap is why the ROM helpers refuse non-ASCII names.
     """
     return name.translate(_ASCII_FOLD)
 
@@ -617,6 +620,18 @@ def storage_put_file(
     :class:`Ultimate64StorageError`. A new file is then deleted. An
     overwritten one gets its previous bytes back, which are read before the
     ``STOR`` and verified after the restore. The error says which happened.
+
+    **Residuals of the existence check.** The *overwrite* refusal relies on
+    ``MLST``, which matches names with ASCII-only case folding (pattern.cc:78
+    at 1.1.0), while the ``STOR`` reaches FatFS's ``f_open``. Two spellings
+    get past it and rewrite an existing file. One is an 8.3 short-name alias
+    of a long name (``LONGNA~1.D64``). The other is a non-ASCII name whose
+    case differs from the file on the device: FatFS upcases long names with
+    ff_wtoupper (ff.c:1917) and short names through CP437 (ff.c:2797), so
+    ``übung.d64`` reaches ``Übung.d64``. Non-ASCII is refused only for ROM
+    names. Here it stays allowed, because the session speaks CP437 on
+    purpose and existing callers may use such names. Spell a name exactly as
+    the device lists it.
     """
     parts = _check_path(path, write=True)
     payload = _payload(data)
@@ -629,12 +644,30 @@ def storage_put_file(
     return result
 
 
+def _check_rom_name(name: str) -> None:
+    """Refuse a ROM name that is not a str or not ASCII, before any connection.
+
+    MLST finds an existing entry with pattern_match, which folds ASCII only
+    (pattern.cc:78 at 1.1.0), but f_open compares long names with
+    ff_wtoupper (ff.c:1917) and short names through the CP437 table
+    (ff.c:2797, :2942). So with ``JIFFY\u00c4.bin`` on the device,
+    ``jiffy\u00e4.bin`` stats as missing and STOR then rewrites the
+    existing file. ASCII names fold the same way on both paths.
+    """
+    if not isinstance(name, str):
+        raise TypeError(f"ROM name must be a str, not {type(name).__name__}")
+    if not name.isascii():
+        raise ValueError(
+            f"ROM name must be ASCII: {name!r} (the firmware's MLST and FatFS "
+            "fold non-ASCII case differently, so existence checks would miss)"
+        )
+
+
 def _check_rom(kind: str, name: str, payload: bytes, *, check_signature: bool) -> None:
     """Refuse a ROM the firmware would not list or load. Raises ``ValueError``."""
     if kind not in ROM_SIZES:
         raise ValueError(f"unknown ROM kind {kind!r}; expected one of {sorted(ROM_SIZES)}")
-    if not isinstance(name, str):
-        raise TypeError(f"ROM name must be a str, not {type(name).__name__}")
+    _check_rom_name(name)
     if len(name) > _ROM_NAME_MAX[kind]:
         raise ValueError(
             f"ROM name {name!r} is {len(name)} characters; the {kind} ROM config "
@@ -701,9 +734,11 @@ def storage_put_rom(
     component, breaks the storage name rules (``*``, ``?`` and a trailing
     ``.`` or space included), or is too long for its config item.
 
-    On the device, the name is matched ASCII-casefolded against the
-    ``MLSD`` listing (FatFS and the firmware fold ASCII only), and an
-    existing file keeps its spelling. An existing file needs *overwrite*.
+    *name* must be ASCII. MLST matches names ASCII-casefolded, but FatFS
+    upcases non-ASCII too (ff.c:1917, :2797), so for a non-ASCII name the
+    two disagree about whether a file exists. On the device, the name is
+    matched ASCII-casefolded against the ``MLSD`` listing, which is how
+    MLST matches, and an existing file keeps its spelling. An existing file needs *overwrite*.
     One of :data:`STOCK_ROM_NAMES` also needs *replace_stock*, because
     those are what recovery needs. **Residual:** an 8.3 short-name alias of
     a long non-stock name (``JIFFYD~1.BIN``) is not in the listing, so the
@@ -768,8 +803,8 @@ def storage_delete_rom(
     :func:`storage_put_rom` uploads can be removed again. *name* follows the
     same rules as there, and one of :data:`STOCK_ROM_NAMES` raises
     ``ValueError`` before any connection, whatever its case. On the device
-    *name* must equal, ASCII-casefolded, an entry the ``MLSD`` listing of
-    ``/Flash/roms`` shows. That entry is deleted by its own spelling, so
+    *name* must be ASCII and must equal, ASCII-casefolded, an entry the
+    ``MLSD`` listing of ``/Flash/roms`` shows. That entry is deleted by its own spelling, so
     ``DELE`` never matches by pattern, and an entry the listing does not
     show (an 8.3 alias such as ``JIFFYD~1.BIN``) is never reached.
 
@@ -779,9 +814,10 @@ def storage_delete_rom(
 
     :raises FileNotFoundError: absent and *missing_ok* is false.
     :raises IsADirectoryError: *name* is a directory.
+    :raises Ultimate64StorageError: the listing still shows the file after
+        ``DELE``.
     """
-    if not isinstance(name, str):
-        raise TypeError(f"ROM name must be a str, not {type(name).__name__}")
+    _check_rom_name(name)
     if _ascii_fold(name) in STOCK_ROM_NAMES:
         raise ValueError(
             f"refusing to delete {name!r}: it is a firmware stock ROM file, which recovery needs"
@@ -805,6 +841,12 @@ def storage_delete_rom(
         if entry_type in ("dir", "cdir", "pdir"):
             raise IsADirectoryError(f"{path} on {host} is a directory")
         ftp.delete(path)
+        left = [e for e, _f in ftp.mlsd(rom_dir) if _ascii_fold(e) == _ascii_fold(entry)]
+        if left:
+            raise Ultimate64StorageError(
+                f"storage_delete_rom: DELE {path} on {host} was answered, but "
+                f"{rom_dir} still lists {left[0]!r}"
+            )
     _log.info("storage_delete_rom: deleted %s on %s", path, host)
     return True
 
