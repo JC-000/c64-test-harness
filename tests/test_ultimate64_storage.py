@@ -1211,9 +1211,11 @@ def test_delete_rom_checks_the_file_is_gone(server):
         self.server.log.append(f"DELE {path}")
         return "250 OK"  # answered, but nothing removed
 
+    # The caller's spelling differs from the device's, so a re-listing that
+    # compared the caller's name exactly would miss the file left behind.
     with patch.object(_FakeFTP, "delete", delete):
         with pytest.raises(st.Ultimate64StorageError, match="still"):
-            st.storage_delete_rom("dev", "jiffy.bin")
+            st.storage_delete_rom("dev", "JIFFY.BIN")
 
 
 # ------------------------------------ a failed overwrite puts the old file back
