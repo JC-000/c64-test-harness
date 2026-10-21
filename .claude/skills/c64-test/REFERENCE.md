@@ -6,6 +6,8 @@
 pip install -e /path/to/c64-test-harness
 ```
 
+On this bench, other projects use the central venv at `~/.local/share/c64-harness/venv/` (harness `master` from GitHub, maintained by the new-computer-setup repo's `toolchain-brew/harness-venv.sh`), not this repo's checkout venv.
+
 Working on this repo itself, use the existing venv at `~/.local/share/c64-test-harness/venv/` (created by `scripts/setup-dev-env.sh`; never a new one inside the repo or a worktree).
 
 The package is `c64_test_harness`. Most public symbols are re-exported from the top-level `__init__.py`; entries below that are not (e.g. `ShortReadError`, `max_cpu_speed_mhz`, `Ultimate64TempHygieneError`, the `CS8900A_*` constants) say which module to import from. The package version is exposed as `c64_test_harness.__version__` (via `importlib.metadata`).

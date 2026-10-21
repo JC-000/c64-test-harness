@@ -9,7 +9,7 @@ Two platforms are covered:
 
 `scripts/verify-dev-env.sh` is the read-only diagnostic for both.
 
-Both platforms use the same canonical venv, **outside the repo**, at `~/.local/share/c64-test-harness/venv`. Do not create a venv inside the repo or a worktree.
+Both platforms use the same canonical venv, **outside the repo**, at `~/.local/share/c64-test-harness/venv`. Do not create a venv inside the repo or a worktree. That venv is for developing this repo; other repos and lanes on this bench use the central venv at `~/.local/share/c64-harness/venv`, maintained by the new-computer-setup repo (`toolchain-brew/harness-venv.sh`).
 
 The package has no runtime dependencies. The extras are `dev` (`pytest`) and `notify` (`watchdog`, for filesystem-event wakeups in `DeviceLock`). VICE 3.10 is needed only for the emulator backend. The package imports and drives Ultimate hardware without `x64sc`/`c1541` installed. `verify-dev-env.sh` still treats VICE as critical, so a hardware-only machine reports NOT READY.
 
@@ -26,17 +26,16 @@ The setup is manual and short:
 
 1. **Install Homebrew** if you don't have it yet: <https://brew.sh>. Never run `brew` as root.
 
-2. **Install VICE 3.10 and a Python ≥ 3.10.** The `vice` bottle ships `x64sc` and `c1541` with ethernet support already compiled in, so no source build is needed:
+2. **Install VICE 3.10 and Homebrew's Python.** The `vice` bottle ships `x64sc` and `c1541` with ethernet support already compiled in, so no source build is needed. Python is not pinned: take the unversioned `python` formula, whatever release it is (3.15.0 on 2026-10-21, when master passed its suite in the central `~/.local/share/c64-harness/venv` built on it with `[dev,notify]`; this repo's own dev venv was still on 3.13 then), and fix forward when it moves:
 
    ```bash
-   brew install vice python@3.13
+   brew install vice python
    ```
 
-3. **Create the harness venv** at the canonical path, and install the package editable with the `dev` extra. Name the interpreter explicitly: `/usr/bin/python3` from the Xcode command-line tools is 3.9, below the package's `requires-python >= 3.10`.
+3. **Create the harness venv** at the canonical path, and install the package editable with the `dev` extra. Name the interpreter explicitly: `/usr/bin/python3` from the Xcode command-line tools is 3.9, below the package's `requires-python >= 3.10`. The venv does not need `--system-site-packages`: nothing the harness or its tests import comes from Homebrew's site-packages.
 
    ```bash
-   /opt/homebrew/opt/python@3.13/bin/python3.13 -m venv --system-site-packages \
-       ~/.local/share/c64-test-harness/venv
+   /opt/homebrew/bin/python3 -m venv ~/.local/share/c64-test-harness/venv
    ~/.local/share/c64-test-harness/venv/bin/pip install -e '.[dev]'
    ```
 
@@ -132,7 +131,7 @@ Steps 6-8 are needed only for the ethernet/bridge tests.
 - stage 4 runs `setup-bridge-feth-macos.sh`;
 - `--force` and `--sha256` are ignored.
 
-Its stage 1 also installs `python@3.13`, and stage 3 builds the venv from the newest `python3.1x` ≥ 3.10 on `PATH`. It does not do steps 7-8. The first recorded macOS run was on 2026-10-20 with `--no-system-packages --no-bridge --no-u64`, so stage 1 has still not run on macOS: stage 3 built the venv on 3.13.16 and installed the harness into it. Verify reported READY, but it checked the canonical venv rather than the new one; the installer now points verify at the venv it built. At `c89f9cf` the same run had taken `/usr/bin/python3` 3.9.6, failed the editable install (`requires a different Python: 3.9.6 not in '>=3.10'`), and still exited 0 (see [Bringing up a new machine](#bringing-up-a-new-machine)).
+Its stage 1 also installs Homebrew's unversioned `python`, and stage 3 builds the venv from Homebrew's `python3` (`$(brew --prefix)/bin/python3`, falling back to `/opt/homebrew/bin/python3` without `brew`; `BREW_PYTHON3` overrides it), without `--system-site-packages`, stopping if that interpreter is missing or older than 3.10. It does not do steps 7-8. The first recorded macOS run was on 2026-10-20 with `--no-system-packages --no-bridge --no-u64`, so stage 1 has still not run on macOS: stage 3 built the venv on 3.13.16 and installed the harness into it. Verify reported READY, but it checked the canonical venv rather than the new one; the installer now points verify at the venv it built. At `c89f9cf` the same run had taken `/usr/bin/python3` 3.9.6, failed the editable install (`requires a different Python: 3.9.6 not in '>=3.10'`), and still exited 0 (see [Bringing up a new machine](#bringing-up-a-new-machine)).
 
 ### VICE ethernet without root: the patched build
 
@@ -202,7 +201,7 @@ The steps above build a harness. Moving to a new Mac takes more than that: some 
    ./scripts/setup-dev-env.sh --no-bridge --no-u64
    ```
 
-   That exact command has not been run: both recorded macOS runs added `--no-system-packages`, so the macOS stage 1 (`brew install vice python@3.13`) is unrun. The installer now builds the venv from the newest `python3.1x` ≥ 3.10 on `PATH`, not plain `python3`. Before this, it took `/usr/bin/python3` (3.9) on a fresh Mac, `pip` refused the package, and the run still ended READY with exit 0: verify fell back to an existing canonical venv. Now a failed stage makes the installer exit 1, and a venv left behind on Python < 3.10 is refused with the `rm -rf` to run rather than reused. Add the `notify` extra if you want filesystem-event wakeups in `DeviceLock`: `pip install -e '.[dev,notify]'`.
+   That exact command has not been run: both recorded macOS runs added `--no-system-packages`, so the macOS stage 1 (now `brew install vice python`) is unrun. On macOS the installer now builds the venv from Homebrew's `python3`, not the first `python3` on `PATH`. Before this, it took `/usr/bin/python3` (3.9) on a fresh Mac, `pip` refused the package, and the run still ended READY with exit 0: verify fell back to an existing canonical venv. Now a failed stage makes the installer exit 1, and a venv left behind on Python < 3.10 is refused with the `rm -rf` to run rather than reused. Add the `notify` extra if you want filesystem-event wakeups in `DeviceLock`: `pip install -e '.[dev,notify]'`.
 
 3. **Carry over the state that is not in git.** Recreate each item, or copy it across; do not assume a migration tool brought it.
 
@@ -227,7 +226,7 @@ The steps above build a harness. Moving to a new Mac takes more than that: some 
 
    All three are supported. Run `./scripts/build-vice-eth.sh` ([VICE ethernet without root](#vice-ethernet-without-root-the-patched-build)) and VICE ethernet needs no sudo. Install the root-owned bridge copies with digest-pinned, argument-free rules (step 8, "Bridge lifecycle") and the harness uses them in preference to the repo's. Without any rule the bridge tests skip with an `ELEVATION REQUIRED` notice, and nothing else is affected. Known gap, measured once (2026-10-20): the hardened cleanup copy installed here counted a killed but unreaped x64sc (a zombie) as a survivor and exited 1. That happens only while the launcher is alive and not reaping; the patched VICE is the launcher's direct child, where stock VICE was sudo's. Its owner fixed it in new-computer-setup `67e5a4e`, and the fix applies once that copy is reinstalled with its new digest. The live cleanup test reaps the bridge VICEs itself.
 
-6. **Mind the editable installs of other projects.** Other projects install this checkout editable into their own venvs; on 2026-10-20 the 1541ultimate lane did. Every source change, and every branch switch in the main checkout, then reaches their next run at once. Keep the main checkout on `master` while they work, and do branch work in a worktree with `PYTHONPATH=<worktree>/src`.
+6. **Mind the editable installs of other projects.** Other projects install this checkout editable into their own venvs; on 2026-10-20 the 1541ultimate lane did. Every source change, and every branch switch in the main checkout, then reaches their next run at once. Point them at the central venv (`~/.local/share/c64-harness/venv`, harness `master` from GitHub) instead where you can. Keep the main checkout on `master` while they work, and do branch work in a worktree with `PYTHONPATH=<worktree>/src`.
 
 7. **Exercise it offline.** Run `./scripts/verify-dev-env.sh --no-u64`, then `--smoke` (one headless VICE), then the full suite with no live gates set:
 
