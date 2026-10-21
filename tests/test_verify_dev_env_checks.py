@@ -612,9 +612,10 @@ def _stage3_with(
     *brew_python* installs a fake Homebrew ``python3`` of that version, off
     ``PATH``, at the path ``BREW_PYTHON3`` names (``os_name="Darwin"`` only
     looks there); ``None`` leaves that path empty.  *brew_seam* says how stage 3
-    finds it: ``"env"`` sets ``BREW_PYTHON3``, ``"brew"`` leaves it unset and
-    puts a fake ``brew`` on ``PATH`` whose ``--prefix`` is that path's prefix,
-    ``"none"`` does neither.
+    finds it: ``"env"`` sets ``BREW_PYTHON3`` (and a fake ``brew`` whose
+    ``--prefix`` is an empty decoy), ``"brew"`` leaves it unset and puts a fake
+    ``brew`` on ``PATH`` whose ``--prefix`` is that path's prefix, ``"none"``
+    does neither and is allowed only with *dry_run*.
     """
     import sys
 
@@ -649,9 +650,16 @@ def _stage3_with(
         brew_py.parent.mkdir(parents=True)
         brew_py.write_text(_FAKE_PY.replace("@VER@", brew_python).replace("@NAME@", "brew-python3"))
         brew_py.chmod(0o755)
-    if brew_seam == "brew":
+    # With no brew on PATH the script falls back to the real
+    # /opt/homebrew/bin/python3, and a non-dry run would build a real venv.
+    assert dry_run or brew_seam != "none", "brew_seam='none' reaches the real interpreter: dry runs only"
+    if brew_seam in ("brew", "env"):
+        # "env": a regression that ignores BREW_PYTHON3 lands in an empty
+        # decoy prefix, not on the real interpreter.
+        prefix = brew_py.parent.parent if brew_seam == "brew" else tmp_path / "brew-decoy"
+        prefix.mkdir(exist_ok=True)
         fake_brew = bindir / "brew"
-        fake_brew.write_text(f'#!/bin/sh\n[ "$1" = --prefix ] && echo {shlex.quote(str(brew_py.parent.parent))}\n')
+        fake_brew.write_text(f'#!/bin/sh\n[ "$1" = --prefix ] && echo {shlex.quote(str(prefix))}\n')
         fake_brew.chmod(0o755)
     seam = f"BREW_PYTHON3={shlex.quote(str(brew_py))}\n" if brew_seam == "env" else "unset BREW_PYTHON3\n"
     program = (
