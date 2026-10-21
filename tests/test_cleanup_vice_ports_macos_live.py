@@ -1,4 +1,4 @@
-"""Live scoping test for scripts/cleanup-bridge-feth-macos.sh.
+"""Live scoping test for cleanup-bridge-feth-macos.sh.
 
 macOS counterpart to ``tests/test_cleanup_vice_ports_live.py``.
 Empirically validates that the port-range-scoped cleanup pipeline only
@@ -10,8 +10,10 @@ stack.  The Linux variant is the authoritative reference for layout;
 this file is a parallel, intentionally not a refactor.
 
 Opt in with ``BRIDGE_CLEANUP_LIVE=1``.  Requires ``x64sc`` on PATH and
-passwordless ``sudo -n`` for the setup/teardown bridge scripts, which the
-test drives.  The ethernet VICE launches either as the user (the patched
+passwordless ``sudo -n`` for the setup and cleanup bridge scripts, which
+the test drives: the root-owned copies in ``/usr/local/libexec/c64-harness``
+when they are installed and authorised, else the canonical checkout's
+(``bridge_platform.resolve_bridge_helper``, #541).  The ethernet VICE launches either as the user (the patched
 build from ``scripts/build-vice-eth.sh``) or, with stock VICE, wrapped in
 ``sudo -n`` (``ViceConfig`` flips ``run_as_root=True``); the test resolves
 the x64sc PID in both cases.
@@ -34,12 +36,12 @@ Probe shape vs. the Linux test:
 """
 from __future__ import annotations
 
-import glob
 import os
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -54,9 +56,13 @@ except Exception:  # pragma: no cover
     _imported_comm_of = None
 
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-CLEANUP_SCRIPT = REPO_ROOT / "scripts" / "cleanup-bridge-feth-macos.sh"
-SETUP_SCRIPT = REPO_ROOT / "scripts" / "setup-bridge-feth-macos.sh"
+def _helper(name: str) -> Path:
+    """The copy of bridge script *name* that sudo authorises (#541)."""
+    import bridge_platform
+    import conftest
+    path, _ok = bridge_platform.resolve_bridge_helper(name, conftest._canonical_repo_root())
+    assert path is not None, f"no copy of {name} found"
+    return Path(path)
 
 SENTINEL_PORT = 7031  # outside every harness range (6511-6531, 6560-6580)
 
@@ -105,7 +111,7 @@ pytestmark = [
 
 
 def _run_sudo_script(script_path: Path, *, timeout: float = 30.0) -> subprocess.CompletedProcess:
-    """Run a repo script via ``sudo -n``.  Raises on non-zero exit.
+    """Run a bridge script via ``sudo -n``.  Raises, with its output, on non-zero exit.
 
     Invokes the script directly (relying on its shebang) rather than
     wrapping it in ``bash``.  NOPASSWD sudoers entries are typically
@@ -114,9 +120,14 @@ def _run_sudo_script(script_path: Path, *, timeout: float = 30.0) -> subprocess.
     asks sudo to run ``bash``, which is a different program.
     """
     cmd = ["sudo", "-n", str(script_path)]
-    return subprocess.run(
-        cmd, check=True, capture_output=True, text=True, timeout=timeout
-    )
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0:
+        # The script's own report says which step failed.
+        raise AssertionError(
+            f"{' '.join(cmd)} exited {proc.returncode}\n"
+            f"--- stdout\n{proc.stdout}--- stderr\n{proc.stderr}"
+        )
+    return proc
 
 
 def _macos_comm_of(pid: int) -> str | None:
@@ -284,8 +295,11 @@ class TestBridgeCleanupScopingMacos:
 
         pre_state = _snapshot_net_state()
 
+        setup_script = _helper("setup-bridge-feth-macos.sh")
+        cleanup_script = _helper("cleanup-bridge-feth-macos.sh")
+
         # 1. Bring the bridge up.
-        _run_sudo_script(SETUP_SCRIPT)
+        _run_sudo_script(setup_script)
 
         sentinel_vice: ViceProcess | None = None
         sentinel_pid: int | None = None
@@ -368,8 +382,25 @@ class TestBridgeCleanupScopingMacos:
                 assert _is_x64sc(pid), f"PID {pid} is not x64sc pre-cleanup"
 
             # 4. Run the real cleanup script.  This is the core action.
-            _run_sudo_script(CLEANUP_SCRIPT, timeout=60.0)
+            rc_paths = [p._tmp_vicerc for p in bridge_procs]
+            assert all(rc and os.path.exists(rc) for rc in rc_paths), rc_paths
+            # Reap the bridge VICEs the moment the cleanup kills them, as
+            # launchd does for the crashed run the cleanup exists for.  The
+            # patched build is pytest's own child (stock VICE was sudo's), so
+            # unreaped it would linger as a zombie that the helper's survivor
+            # check may count as alive.  Never the sentinel: its survival is
+            # the assertion.
+            reapers = [
+                threading.Thread(target=p._proc.wait, kwargs={"timeout": 60}, daemon=True)
+                for p in bridge_procs
+                if p._proc is not None
+            ]
+            for t in reapers:
+                t.start()
+            _run_sudo_script(cleanup_script, timeout=60.0)
             cleanup_ran = True
+            for t in reapers:
+                t.join(timeout=10)
             # Settle + reap.  The cleanup script SIGKILLed the bridge
             # VICEs, but since pytest is their parent, their PIDs stay
             # as zombies until we waitpid() them.  Calling Popen.poll()
@@ -424,8 +455,13 @@ class TestBridgeCleanupScopingMacos:
                 f"{FETH1} still exists after cleanup"
             )
 
-            # 5d. /tmp/vice_eth_*.rc must be gone.
-            leftover_rc = glob.glob("/tmp/vice_eth_*.rc")
+            # 5d. The harness removes its own vicerc files.  The root
+            #     helpers no longer touch /tmp (and ViceProcess writes them
+            #     under $TMPDIR, which on macOS is not /tmp): stop() on a
+            #     process the cleanup killed must still delete its file.
+            for p in bridge_procs:
+                p.stop()
+            leftover_rc = [rc for rc in rc_paths if os.path.exists(rc)]
             assert not leftover_rc, f"stale vicerc files: {leftover_rc}"
 
         finally:
@@ -441,19 +477,18 @@ class TestBridgeCleanupScopingMacos:
                         pass
 
             # Release any bridge_procs -- processes should already be
-            # dead from the cleanup, but close handles cleanly.
+            # dead from the cleanup; stop() also deletes their vicerc
+            # files (a no-op for any 5d already stopped).
             for p in bridge_procs:
                 try:
-                    if p._proc is not None and p._proc.poll() is None:
-                        p._proc.kill()
-                        p._proc.wait(timeout=5)
+                    p.stop()
                 except Exception:
                     pass
 
             # Defensive final cleanup so next test starts clean.  Swallow
             # errors -- assertions above have already recorded truth.
             try:
-                _run_sudo_script(CLEANUP_SCRIPT, timeout=60.0)
+                _run_sudo_script(_helper("cleanup-bridge-feth-macos.sh"), timeout=60.0)
                 cleanup_ran = True
             except Exception:
                 pass

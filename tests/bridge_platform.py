@@ -7,12 +7,14 @@ attaches via its ``tuntap`` driver.
 On macOS, no ``/dev/net/tun`` exists and there is no iproute2. The equivalent
 layout is ``feth0``/``feth1`` pseudo-ethernet peers bridged via ``bridge10``
 (set up by ``scripts/setup-bridge-feth-macos.sh``), and VICE attaches via its
-``pcap`` driver. VICE's pcap attach needs VICE to run as **root**
-(``archdep_rawnet_capability()`` is ``geteuid() == 0``); ``/dev/bpf*``
-node modes are irrelevant to it. Those modes matter to the *harness's own*
-unelevated host-side capture (``c64_test_harness.capture``), which needs a
-node this uid can open -- see docs/bridge_networking.md "Host-side capture
-on macOS".
+``pcap`` driver. Stock VICE's pcap attach needs VICE to run as **root**
+(``archdep_rawnet_capability()`` is ``geteuid() == 0``), whatever the
+``/dev/bpf*`` modes; the patched build from ``scripts/build-vice-eth.sh``
+runs it as you once a node is read-write for you. Those modes also matter
+to the *harness's own* unelevated host-side capture
+(``c64_test_harness.capture``) -- see docs/bridge_networking.md
+"Host-side capture on macOS". The bridge scripts may be root-owned copies
+in ``/usr/local/libexec/c64-harness`` (``resolve_bridge_helper``).
 
 This module is imported by the test fixtures so the tests remain platform-
 portable without duplicating OS dispatch everywhere.  It also hosts the
@@ -174,12 +176,89 @@ BRIDGE_IP_A = bridge_ip(2)
 BRIDGE_IP_B = bridge_ip(3)
 
 
+# ---------------------------------------------------------------------------
+# Which copy of a bridge lifecycle script to run (#541)
+# ---------------------------------------------------------------------------
+#
+# A NOPASSWD rule on the repo's own scripts is a route to root (anyone who
+# can write the checkout can rewrite them), so a bench may instead install
+# root-owned copies here and name only those in sudoers -- pinned to their
+# digest and to no arguments (``sha256:<hex> /path ""``).  The helpers take
+# no arguments either way.  ``$C64_BRIDGE_HELPER_DIR`` names the directory
+# outright and is then the only place looked.  The libexec copies are a
+# macOS layout: the Linux live test still runs the repo scripts through
+# ``sudo -n bash``, which no argument-free rule could cover, so Linux keeps
+# looking at the checkout only.  verify-dev-env.sh mirrors this search.
+
+#: Where root-owned copies of the bridge helpers are installed.
+BRIDGE_HELPER_LIBEXEC = "/usr/local/libexec/c64-harness"
+#: Names the directory holding the bridge helpers, overriding the search.
+BRIDGE_HELPER_DIR_ENV = "C64_BRIDGE_HELPER_DIR"
+#: Whether the libexec copies are searched at all (macOS only, see above).
+SEARCH_BRIDGE_HELPER_LIBEXEC = sys.platform == "darwin"
+
+
+def bridge_helper_candidates(name: str, repo_root: str | None) -> list[str]:
+    """Where *name* may live, in the order the harness prefers them."""
+    override = os.environ.get(BRIDGE_HELPER_DIR_ENV, "")
+    if override.strip():
+        return [os.path.join(override, name)]
+    found = []
+    if SEARCH_BRIDGE_HELPER_LIBEXEC:
+        found.append(os.path.join(BRIDGE_HELPER_LIBEXEC, name))
+    if repo_root is not None:
+        found.append(os.path.join(repo_root, "scripts", name))
+    return [path for path in found if os.access(path, os.X_OK)]
+
+
+def bridge_helper_sudoers_entry(path: str) -> str:
+    """The NOPASSWD line a remedy should print for *path*.
+
+    An installed copy gets the digest-pinned, argument-free form the docs
+    recommend; a repo script (user-writable, so a digest would only break on
+    the next edit) the bare form.
+    """
+    from c64_test_harness.backends.vice_elevation import _sudoers_entry
+    entry = _sudoers_entry(path)
+    if os.path.dirname(path) != BRIDGE_HELPER_LIBEXEC.rstrip("/"):
+        return entry
+    import hashlib
+    try:
+        with open(path, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return entry + ' ""'
+    head, _, tail = entry.partition("NOPASSWD: ")
+    return f'{head}NOPASSWD: sha256:{digest} {tail} ""'
+
+
+def resolve_bridge_helper(name: str, repo_root: str | None) -> tuple[str | None, bool]:
+    """``(path, authorised)`` for bridge script *name*.
+
+    The first candidate sudo lets this user run bare without a password;
+    failing that, the first candidate (``authorised`` False), which is the
+    one a remedy should name; ``(None, False)`` when there is none.
+    *repo_root* is the canonical checkout, never a worktree.
+    """
+    candidates = bridge_helper_candidates(name, repo_root)
+    for path in candidates:
+        if sudo_can_run(path, no_args=True):
+            return path, True
+    return (candidates[0] if candidates else None), False
+
+
+def _setup_hint(name: str) -> str:
+    # Import time, so no sudo probe: name the preferred copy that exists.
+    found = bridge_helper_candidates(name, None)
+    return f"run sudo -n {found[0]}" if found else f"run sudo scripts/{name}"
+
+
 if sys.platform == "darwin":
     ETHERNET_DRIVER = "pcap"
     IFACE_A = "feth0"
     IFACE_B = "feth1"
     BRIDGE_NAME = "bridge10"
-    SETUP_HINT = "run sudo scripts/setup-bridge-feth-macos.sh"
+    SETUP_HINT = _setup_hint("setup-bridge-feth-macos.sh")
 
     def iface_present(name: str) -> bool:
         return (
@@ -208,7 +287,7 @@ else:
     IFACE_A = "tap-c64-0"
     IFACE_B = "tap-c64-1"
     BRIDGE_NAME = "br-c64"
-    SETUP_HINT = "run sudo scripts/setup-bridge-tap.sh"
+    SETUP_HINT = _setup_hint("setup-bridge-tap.sh")
 
     def iface_present(name: str) -> bool:
         return os.path.isdir(f"/sys/class/net/{name}")
@@ -561,7 +640,7 @@ def probe_vice_pcap_ok(
                             "working elevated launch shows two BPF peers, "
                             "one bound to the requested interface. Check "
                             f"that {iface} exists and is up "
-                            "(scripts/setup-bridge-feth-macos.sh), that the "
+                            f"({SETUP_HINT}), that the "
                             "launch really was elevated (an unelevated one "
                             "SIGSEGVs rather than reaching this point), and "
                             "that the BPF node pool is not exhausted by "

@@ -39,6 +39,7 @@ from __future__ import annotations
 import getpass
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -102,6 +103,9 @@ _UNGATED_DRIVERS = frozenset({"tuntap"})
 
 #: Seconds to allow the ``sudo -l`` authorisation probe.
 _SUDO_PROBE_TIMEOUT = 5.0
+
+#: A sudoers Digest_Spec as ``sudo -l`` prints it ahead of the command.
+_SUDO_DIGEST = re.compile(r"^sha(?:224|256|384|512):\S+$")
 
 #: sudoers tag specifiers as ``sudo -l`` prints them (sudoers(5) "Tag_Spec").
 #: Any of these may precede the command in a NOPASSWD entry.
@@ -460,14 +464,20 @@ class SudoAuthorisation:
     individually authorised binaries.  Rules that pin arguments (e.g.
     ``NOPASSWD: /opt/homebrew/bin/brew reinstall --HEAD vice``) authorise
     that one command line and are deliberately *not* counted here: they
-    would not cover the argv we intend to launch.
+    would not cover the argv we intend to launch.  The one pinned argv
+    kept is the empty one (``/path ""``, sudoers(5): no arguments at
+    all), in ``no_arg_commands``: it covers a helper run bare, as the
+    bridge scripts are, and never an x64sc launch.
     """
 
     all_commands: bool
     commands: frozenset[str]
+    no_arg_commands: frozenset[str] = frozenset()
 
-    def allows(self, binary: str) -> bool:
-        return self.all_commands or binary in self.commands
+    def allows(self, binary: str, *, no_args: bool = False) -> bool:
+        if self.all_commands or binary in self.commands:
+            return True
+        return no_args and binary in self.no_arg_commands
 
 
 def parse_sudo_listing(text: str) -> SudoAuthorisation:
@@ -480,6 +490,7 @@ def parse_sudo_listing(text: str) -> SudoAuthorisation:
     """
     all_commands = False
     commands: set[str] = set()
+    no_arg_commands: set[str] = set()
     for raw in text.splitlines():
         line = raw.strip()
         marker = "NOPASSWD:"
@@ -493,6 +504,9 @@ def parse_sudo_listing(text: str) -> SudoAuthorisation:
             tags: list[str] = []
             while parts and parts[0] in _SUDO_TAGS:
                 tags.append(parts.pop(0))
+            # A digest pin (``sha256:<hex> /path``) precedes the command.
+            if parts and _SUDO_DIGEST.match(parts[0]):
+                parts.pop(0)
             if not parts or "PASSWD:" in tags:
                 continue
             if parts[0] == "ALL":
@@ -500,7 +514,11 @@ def parse_sudo_listing(text: str) -> SudoAuthorisation:
             elif len(parts) == 1 or parts[1:] == ["*"]:
                 # No pinned arguments, or the bare wildcard that admits any.
                 commands.add(parts[0])
-    return SudoAuthorisation(all_commands, frozenset(commands))
+            elif parts[1:] == ['""']:
+                no_arg_commands.add(parts[0])
+    return SudoAuthorisation(
+        all_commands, frozenset(commands), frozenset(no_arg_commands)
+    )
 
 
 @lru_cache(maxsize=1)
@@ -525,18 +543,20 @@ def sudo_authorisation() -> SudoAuthorisation:
     return parse_sudo_listing(proc.stdout or "")
 
 
-def sudo_can_run(binary: str) -> bool:
+def sudo_can_run(binary: str, *, no_args: bool = False) -> bool:
     """Whether *binary* can be run as root **without a password**.
 
     Asks sudo for its rule list and looks for a NOPASSWD entry naming
     this exact path.  Being *permitted* to run it is not enough: an
     unattended launch that stops at a password prompt is a failed launch.
+    ``no_args=True`` asks about a run with no arguments, which a rule
+    pinned to ``""`` also covers.
 
     Caveat: a cached sudo timestamp would let a launch through that this
     reports False for.  Refusing with an actionable message is the safe
     direction, and ``VICE_ETHERNET_ALLOW_UNELEVATED=1`` overrides it.
     """
-    return sudo_authorisation().allows(binary)
+    return sudo_authorisation().allows(binary, no_args=no_args)
 
 
 # ------------------------------------------------------------ the plan

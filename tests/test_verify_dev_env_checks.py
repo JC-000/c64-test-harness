@@ -60,12 +60,18 @@ def _run(program: str, env: dict[str, str] | None = None) -> subprocess.Complete
     )
 
 
-def _check_system(uname: str, env: dict[str, str]) -> subprocess.CompletedProcess:
-    # Never this host's build-vice-eth.sh or x64sc unless a test supplies them.
+def _check_system(
+    uname: str, env: dict[str, str], stubs: str = ""
+) -> subprocess.CompletedProcess:
+    # Never this host's build-vice-eth.sh, x64sc or bridge helpers unless a
+    # test supplies them.
     env = {"C64H_BUILD_VICE_ETH": "/nonexistent/build-vice-eth.sh",
-           "C64H_X64SC_PATH": "/nonexistent/x64sc", **env}
+           "C64H_X64SC_PATH": "/nonexistent/x64sc",
+           "C64H_BRIDGE_LIBEXEC": "/nonexistent/libexec",
+           "C64H_REPO_ROOT": "/nonexistent/repo", **env}
     program = (
         _VERIFY_STUBS
+        + stubs
         + f"uname() {{ printf '%s\\n' {shlex.quote(uname)}; }}\n"
         + _section(VERIFY, "# ---------- Section 3: System tools", "# ---------- Section 4")
         + '\ncheck_system "System tools"\n'
@@ -922,3 +928,114 @@ def test_a_patched_build_without_bpf_access_still_needs_the_x64sc_rule(tmp_path)
     """The harness falls back to stock + sudo when no node is usable."""
     rows, _hints_ = _vice_eth_rows(tmp_path, 0, bpf_mode=0o600)
     assert rows["NOPASSWD sudo for x64sc"][0] == "warn"
+
+
+# ---------------------------------------------------------------------------
+# The bridge helper rows: installed root-owned copies or the repo's (#541)
+# ---------------------------------------------------------------------------
+
+_BRIDGE_SCRIPTS = ("setup-bridge-feth-macos.sh", "teardown-bridge-feth-macos.sh",
+                   "cleanup-bridge-feth-macos.sh")
+
+
+def _helpers(directory: Path) -> Path:
+    directory.mkdir(parents=True)
+    for name in _BRIDGE_SCRIPTS:
+        (directory / name).write_text("#!/bin/sh\n")
+        (directory / name).chmod(0o755)
+    return directory
+
+
+def _bridge_rows(tmp_path: Path, allowed: list[Path], *, libexec: bool = True,
+                 env: dict[str, str] | None = None):
+    lib = _helpers(tmp_path / "libexec") if libexec else tmp_path / "nolibexec"
+    repo = tmp_path / "repo"
+    _helpers(repo / "scripts")
+    # Authorises only a bare run of the listed paths, as a "" rule does.
+    cases = "|".join(shlex.quote(str(p)) for p in allowed) or "/never"
+    stub = (
+        'nopasswd_for() { [ "${2:-}" = noargs ] || return 1; '
+        f'case "$1" in {cases}) return 0 ;; esac; return 1; }}\n'
+    )
+    proc = _check_system(
+        "Darwin",
+        {"C64H_DEV_DIR": str(_fake_dev(tmp_path, {"bpf0": 0o606})),
+         "C64H_BRIDGE_LIBEXEC": str(lib), "C64H_REPO_ROOT": str(repo), **(env or {})},
+        stubs=stub,
+    )
+    rows = {r[0]: r[1:] for r in _rows(proc.stdout) if r[0].startswith("NOPASSWD sudo for ") and "x64sc" not in r[0]}
+    return rows, _hints(proc.stdout), lib, repo
+
+
+def test_bridge_rows_accept_the_installed_copies(tmp_path):
+    lib = tmp_path / "libexec"
+    rows, hints, lib, _repo = _bridge_rows(tmp_path, [lib / n for n in _BRIDGE_SCRIPTS])
+    assert set(rows) == {f"NOPASSWD sudo for {n}" for n in _BRIDGE_SCRIPTS}, rows
+    for name in _BRIDGE_SCRIPTS:
+        status, detail, _crit = rows[f"NOPASSWD sudo for {name}"]
+        assert status == "ok", detail
+        assert str(lib / name) in detail
+    assert not any("sudoers drop-in" in h for h in hints), hints
+
+
+def test_bridge_rows_accept_repo_rules_beside_installed_copies(tmp_path):
+    repo = tmp_path / "repo"
+    rows, _hints_, _lib, repo = _bridge_rows(tmp_path, [repo / "scripts" / n for n in _BRIDGE_SCRIPTS])
+    for name in _BRIDGE_SCRIPTS:
+        status, detail, _crit = rows[f"NOPASSWD sudo for {name}"]
+        assert status == "ok" and str(repo / "scripts" / name) in detail, detail
+
+
+def test_an_unauthorised_bridge_row_names_the_installed_copy(tmp_path):
+    lib = tmp_path / "libexec"
+    rows, hints, lib, repo = _bridge_rows(tmp_path, [lib / _BRIDGE_SCRIPTS[0]])
+    assert rows[f"NOPASSWD sudo for {_BRIDGE_SCRIPTS[0]}"][0] == "ok"
+    status, detail, _crit = rows[f"NOPASSWD sudo for {_BRIDGE_SCRIPTS[1]}"]
+    assert status == "warn"
+    assert str(lib / _BRIDGE_SCRIPTS[1]) in detail and str(repo) not in detail, detail
+    assert any("sudoers" in h for h in hints), hints
+
+
+def test_without_installed_copies_the_rows_use_the_repo(tmp_path):
+    repo = tmp_path / "repo"
+    rows, _hints_, _lib, repo = _bridge_rows(tmp_path, [], libexec=False)
+    status, detail, _crit = rows[f"NOPASSWD sudo for {_BRIDGE_SCRIPTS[0]}"]
+    assert status == "warn" and str(repo / "scripts" / _BRIDGE_SCRIPTS[0]) in detail, detail
+
+
+def test_the_helper_dir_override_is_the_only_place_looked(tmp_path):
+    lib = tmp_path / "libexec"
+    other = _helpers(tmp_path / "other")
+    rows, _hints_, _lib, _repo = _bridge_rows(
+        tmp_path, [lib / n for n in _BRIDGE_SCRIPTS], env={"C64_BRIDGE_HELPER_DIR": str(other)}
+    )
+    status, detail, _crit = rows[f"NOPASSWD sudo for {_BRIDGE_SCRIPTS[0]}"]
+    assert status == "warn" and str(other / _BRIDGE_SCRIPTS[0]) in detail, detail
+
+
+def test_bridge_rows_prefer_libexec_when_both_are_authorised(tmp_path):
+    lib, repo = tmp_path / "libexec", tmp_path / "repo"
+    rows, _h, lib, _r = _bridge_rows(
+        tmp_path, [lib / _BRIDGE_SCRIPTS[0], repo / "scripts" / _BRIDGE_SCRIPTS[0]])
+    _status, detail, _crit = rows[f"NOPASSWD sudo for {_BRIDGE_SCRIPTS[0]}"]
+    assert detail.endswith(str(lib / _BRIDGE_SCRIPTS[0])), detail
+
+
+def test_a_whitespace_only_helper_dir_means_unset(tmp_path):
+    lib = tmp_path / "libexec"
+    rows, _h, lib, _r = _bridge_rows(
+        tmp_path, [lib / n for n in _BRIDGE_SCRIPTS], env={"C64_BRIDGE_HELPER_DIR": "  "})
+    assert rows[f"NOPASSWD sudo for {_BRIDGE_SCRIPTS[0]}"][0] == "ok"
+
+
+def test_a_missing_repo_script_gets_no_row(tmp_path):
+    """Matches bridge_helper_candidates: an absent script is no candidate."""
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    proc = _check_system(
+        "Darwin",
+        {"C64H_DEV_DIR": str(_fake_dev(tmp_path, {"bpf0": 0o606})),
+         "C64H_BRIDGE_LIBEXEC": str(tmp_path / "nolibexec"), "C64H_REPO_ROOT": str(repo)},
+    )
+    labels = [r[0] for r in _rows(proc.stdout)]
+    assert not any(f"NOPASSWD sudo for {n}" in labels for n in _BRIDGE_SCRIPTS), labels

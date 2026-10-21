@@ -241,10 +241,13 @@ def test_probe_bridge_scripts_does_not_fabricate_a_remedy_without_a_canonical_ro
 ):
     monkeypatch.setattr(conftest.subprocess, "run", _fake_run(128, ""))
     conftest._canonical_repo_root.cache_clear()
-    from c64_test_harness.backends import vice_elevation as ve
+    import bridge_platform as bp
+    # No installed copies either (this bench has them), so nothing to probe.
+    monkeypatch.setattr(bp, "BRIDGE_HELPER_LIBEXEC", "/nonexistent/libexec")
+    monkeypatch.delenv(bp.BRIDGE_HELPER_DIR_ENV, raising=False)
     monkeypatch.setattr(
-        ve, "sudo_can_run",
-        lambda b: pytest.fail("must not probe sudo without a canonical root"),
+        bp, "sudo_can_run",
+        lambda b, **kw: pytest.fail("must not probe sudo without a canonical root"),
     )
     try:
         ok, remedy = conftest._probe_bridge_scripts()
@@ -252,7 +255,7 @@ def test_probe_bridge_scripts_does_not_fabricate_a_remedy_without_a_canonical_ro
         conftest._canonical_repo_root.cache_clear()
     assert ok is False
     assert os.getcwd() not in remedy
-    assert "cannot locate the canonical checkout" in remedy
+    assert "canonical checkout cannot be located" in remedy
 
 
 # ---------------------------------------------------------------------------

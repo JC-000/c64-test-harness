@@ -905,26 +905,35 @@ _BRIDGE_SCRIPT_SETS = {
 def _probe_bridge_scripts(scripts: tuple[str, ...] | None = None) -> tuple[bool, str]:
     """(b): NOPASSWD rules for the bridge lifecycle scripts.
 
-    Probed at their canonical repo path -- never a worktree's -- because
-    that is the only path a NOPASSWD rule can be written against (see
-    CLAUDE.md "Permission notes for agents").
+    Each script is looked for where ``bridge_platform.resolve_bridge_helper``
+    looks: root-owned copies in ``/usr/local/libexec/c64-harness`` first,
+    then the canonical repo checkout -- never a worktree's, which no
+    NOPASSWD rule can be written against (CLAUDE.md "Permission notes for
+    agents").  ``$C64_BRIDGE_HELPER_DIR`` replaces both.
     """
-    from c64_test_harness.backends.vice_elevation import _sudoers_entry, sudo_can_run
+    import bridge_platform as bp
     names = scripts or _BRIDGE_SCRIPT_SETS.get(sys.platform, _BRIDGE_SCRIPT_SETS["linux"])
     root = _canonical_repo_root()
-    if root is None:
-        return False, (
-            "cannot locate the canonical checkout (not a git clone?): "
-            "'git worktree list --porcelain' failed or returned no "
-            "worktree row, and the sudoers path for these scripts can "
-            "only be resolved from a real git checkout -- run the tests "
-            "from a git clone, not an exported copy"
+    resolved = [bp.resolve_bridge_helper(name, root) for name in names]
+    unfound = [name for name, (path, _ok) in zip(names, resolved) if path is None]
+    if unfound:
+        where = (
+            f"in {os.path.join(root, 'scripts')}" if root is not None else
+            "because the canonical checkout cannot be located (not a git "
+            "clone?): 'git worktree list --porcelain' failed or returned no "
+            "worktree row, and a sudoers path can only be resolved from a "
+            "real git checkout -- run the tests from a git clone, not an "
+            "exported copy"
         )
-    paths = [os.path.join(root, "scripts", name) for name in names]
-    missing = [p for p in paths if not sudo_can_run(p)]
+        return False, (
+            f"cannot find {', '.join(unfound)}: not installed "
+            + (f"in {bp.BRIDGE_HELPER_LIBEXEC}, " if bp.SEARCH_BRIDGE_HELPER_LIBEXEC else "")
+            + f"not in ${bp.BRIDGE_HELPER_DIR_ENV}, and not {where}"
+        )
+    missing = [path for path, ok in resolved if not ok]
     if not missing:
         return True, ""
-    lines = "\n".join(f"    {_sudoers_entry(p)}" for p in missing)
+    lines = "\n".join(f"    {bp.bridge_helper_sudoers_entry(p)}" for p in missing)
     return False, (
         f"'sudo -n' is not authorised for: {', '.join(missing)}. Add to "
         f"sudoers (visudo; each rule must name its exact path and must "
