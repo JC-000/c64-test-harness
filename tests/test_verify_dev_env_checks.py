@@ -737,11 +737,21 @@ def test_stage3_macos_refuses_a_brew_python3_below_requires_python(tmp_path):
 
 
 def test_stage3_macos_finds_python3_under_brews_prefix(tmp_path):
-    """An Intel Mac's Homebrew lives in /usr/local, not /opt/homebrew."""
-    _proc, venv, venv_calls = _stage3_with(
-        tmp_path, {"python3.14": "3, 14, 0"}, os_name="Darwin", brew_python="3, 15, 0", brew_seam="brew"
+    """An Intel Mac's Homebrew lives in /usr/local, not /opt/homebrew.
+
+    Dry run: a regression would otherwise fall back to the real
+    /opt/homebrew/bin/python3 and build a real venv.
+    """
+    proc, venv, _calls = _stage3_with(
+        tmp_path,
+        {"python3.14": "3, 14, 0"},
+        os_name="Darwin",
+        brew_python="3, 15, 0",
+        brew_seam="brew",
+        dry_run=True,
     )
-    assert venv_calls == [f"brew-python3 -m venv {venv}"], venv_calls
+    brew_py = tmp_path / "homebrew" / "bin" / "python3"
+    assert f"{brew_py} -m venv {venv}" in proc.stdout, proc.stdout
 
 
 def test_stage3_macos_without_brew_on_path_looks_in_opt_homebrew(tmp_path):
