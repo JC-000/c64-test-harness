@@ -272,8 +272,9 @@ check_repo_root() {
 # macOS variant of stage 1. The Linux path installs a large build toolchain
 # because it then builds VICE 3.10 from source; on macOS we consume the
 # Homebrew `vice` bottle instead (which also provides x64sc + c1541 +
-# ethernet support), plus python@3.13 because macOS's own python3 is 3.9,
-# below the harness's requires-python >= 3.10.
+# ethernet support), plus Homebrew's unversioned `python` formula because
+# macOS's own python3 is 3.9, below the harness's requires-python >= 3.10.
+# Python is unpinned: stage 3 uses whatever release `python` is today.
 #
 # Homebrew must NOT be run as root -- doing so corrupts the prefix
 # permissions. We never call `sudo brew`. If brew is missing we print a
@@ -292,7 +293,7 @@ stage_system_packages_macos() {
     # supported macOS.
     local packages=(
         vice                  # x64sc, c1541 -- Homebrew bottle includes ethernet
-        python@3.13           # stage 3's venv: /usr/bin/python3 is 3.9
+        python                # stage 3's venv: /usr/bin/python3 is 3.9
     )
 
     if [ "$DRY_RUN" = "1" ]; then
@@ -584,14 +585,42 @@ stage_vice_build() {
 
 # The first python3 on PATH is not necessarily new enough: on a fresh Mac it
 # is Apple's /usr/bin/python3 (3.9, Xcode CLT), below the package's
-# requires-python >= 3.10.  Take the first versioned interpreter that meets
-# it, newest first, then plain python3.  Prints nothing when none does.
+# requires-python >= 3.10.  On macOS take Homebrew's unversioned python3,
+# whatever release it is (Python is unpinned; owner, 2026-10-21), and nothing
+# else.  Elsewhere take the first versioned interpreter that meets the floor,
+# newest first, then plain python3.  Prints nothing when none does.
+BREW_PYTHON3="${BREW_PYTHON3:-/opt/homebrew/bin/python3}"
+
 python_meets_floor() {
     "$1" -c 'import sys; sys.exit(sys.version_info < (3, 10))' >/dev/null 2>&1
 }
 
+no_venv_python_msg() {
+    if [ "${OS:-}" = "Darwin" ]; then
+        printf 'no python3 >= 3.10 at %s (brew install python)' "$BREW_PYTHON3"
+    else
+        printf 'no python3 >= 3.10 on PATH'
+    fi
+}
+
+# macOS venvs see nothing from Homebrew's site-packages: nothing the harness
+# or its tests import comes from there (pytest is the [dev] extra, watchdog
+# the [notify] extra, numpy is optional).  Linux keeps the flag it has had
+# since 2026-04 (5242a8f).
+venv_site_flag() {
+    [ "${OS:-}" = "Darwin" ] || printf '%s' '--system-site-packages'
+}
+
 pick_venv_python() {
     local py
+    if [ "${OS:-}" = "Darwin" ]; then
+        py="$BREW_PYTHON3"
+        if [ -x "$py" ] && python_meets_floor "$py"; then
+            printf '%s\n' "$py"
+            return 0
+        fi
+        return 1
+    fi
     for py in python3.14 python3.13 python3.12 python3.11 python3.10 python3; do
         command -v "$py" >/dev/null 2>&1 || continue
         if python_meets_floor "$py"; then
@@ -615,11 +644,10 @@ stage_harness_install() {
     # dedicated venv at $VENV_DIR and install into it with plain
     # `pip install -e` instead.
     #
-    # --system-site-packages is used so system-installed libraries (pytest,
-    # pyyaml, etc.) remain visible inside the venv -- the harness itself
-    # has zero runtime deps so the usual "system pip leaks into venv" risk
-    # is low, and the gain is big (no surprise "ModuleNotFoundError: yaml"
-    # after creating the venv).
+    # On Linux --system-site-packages keeps apt-installed libraries visible
+    # inside the venv (the 2026-04 rationale; the harness has zero runtime
+    # deps and [dev] brings pytest).  macOS does without it: see
+    # venv_site_flag.
     local expected_pkg="$REPO_ROOT/src/c64_test_harness"
 
     # Idempotency: venv exists AND harness is importable from it AND resolves
@@ -641,9 +669,11 @@ stage_harness_install() {
         log_dry "mkdir -p $(dirname "$VENV_DIR")"
         local dry_python
         if dry_python="$(pick_venv_python)"; then
-            log_dry "$dry_python -m venv --system-site-packages $VENV_DIR"
+            local dry_flag
+            dry_flag="$(venv_site_flag)"
+            log_dry "$dry_python -m venv ${dry_flag:+$dry_flag }$VENV_DIR"
         else
-            log_warn "no python3 >= 3.10 on PATH: a real run stops here (macOS: brew install python@3.13)"
+            log_warn "$(no_venv_python_msg): a real run stops here"
         fi
         log_dry "$VENV_DIR/bin/pip install --upgrade pip"
         log_dry "$VENV_DIR/bin/pip install -e $REPO_ROOT[dev]"
@@ -658,10 +688,12 @@ stage_harness_install() {
     if [ ! -x "$VENV_DIR/bin/python" ]; then
         local venv_python
         if ! venv_python="$(pick_venv_python)"; then
-            log_fail "no python3 >= 3.10 on PATH (macOS: brew install python@3.13)"
+            log_fail "$(no_venv_python_msg)"
             return
         fi
-        if ! "$venv_python" -m venv --system-site-packages "$VENV_DIR"; then
+        # Unquoted on purpose: the flag is one word or none.
+        # shellcheck disable=SC2046
+        if ! "$venv_python" -m venv $(venv_site_flag) "$VENV_DIR"; then
             log_fail "$venv_python -m venv failed -- is python3-venv installed?"
             return
         fi

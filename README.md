@@ -11,7 +11,7 @@ Tests written against the `C64Transport` protocol run unchanged on either one, a
 
 Requirements: Python ≥ 3.10. The package has no runtime dependencies (`pytest` comes with the `dev` extra, `watchdog` with `notify`). The VICE backend needs **VICE 3.10** (`x64sc` and `c1541`), built with ethernet support if you want the CS8900a tests. The Ultimate backend needs only network reach to the device's REST API. VICE is not required for hardware-only use.
 
-The canonical venv lives **outside the repo**, at `~/.local/share/c64-test-harness/venv`, on both platforms. The docs and helper scripts assume that path.
+The canonical venv lives **outside the repo**, at `~/.local/share/c64-test-harness/venv`, on both platforms. The docs and helper scripts assume that path. It is for developing this repo. Other repos and lanes that use the harness on this bench use the central venv at `~/.local/share/c64-harness/venv` instead, which the new-computer-setup repo maintains (`toolchain-brew/harness-venv.sh`).
 
 ### macOS (Homebrew): the primary, current path
 
@@ -21,12 +21,13 @@ This is how the project's dev machine is set up. It was last checked on 2026-09-
 - Homebrew `vice` 3.10 at `/opt/homebrew/bin/x64sc` and `c1541`, where `x64sc -features` reports `HAVE_RAWNET yes` / `HAVE_PCAP yes`;
 - the venv on Homebrew `python@3.13` (3.13.13).
 
-```bash
-brew install vice python@3.13
+Python is not pinned: use Homebrew's current `python` formula, whatever release it is (3.15.0 on 2026-10-21, where master passed its suite), and fix forward when it moves.
 
-# Create the venv from a Python >= 3.10. The Xcode /usr/bin/python3 is 3.9 and too old.
-/opt/homebrew/opt/python@3.13/bin/python3.13 -m venv --system-site-packages \
-    ~/.local/share/c64-test-harness/venv
+```bash
+brew install vice python
+
+# Create the venv from Homebrew's python3. The Xcode /usr/bin/python3 is 3.9 and too old.
+/opt/homebrew/bin/python3 -m venv ~/.local/share/c64-test-harness/venv
 ~/.local/share/c64-test-harness/venv/bin/pip install -e '.[dev]'
 
 # Read-only check. --no-u64 keeps it off the network.
@@ -43,7 +44,7 @@ The Homebrew bottle already carries ethernet support, so you do not need a sourc
 - VICE ethernet without root: `./scripts/build-vice-eth.sh` builds Homebrew's VICE plus one patch (`vice/rawnet-bpf-permissions.patch`) that enables the pcap driver when you can open a `/dev/bpf*` node read-write, keg-only at `/opt/homebrew/opt/vice-eth`, and the harness uses it automatically. Stock VICE's pcap driver needs **root** instead: the harness then launches it with `sudo -n` and needs a NOPASSWD rule for `/opt/homebrew/bin/x64sc`, and without one an ethernet launch is refused up front with `ViceElevationRequiredError`, which names both remedies. `verify-dev-env.sh` reports which you have, and flags a patched build that `brew upgrade vice` has left behind.
 - A NOPASSWD sudoers drop-in for the three bridge scripts, preferably naming root-owned copies in `/usr/local/libexec/c64-harness/` (the harness uses those when a rule covers them, else the checkout's `scripts/`).
 
-`scripts/setup-dev-env.sh` also has a macOS branch (`brew install vice python@3.13`, the venv, the feth bridge). Its first recorded run was on 2026-10-20, with `--no-system-packages --no-bridge --no-u64`, so its macOS stage 1 is still unrun: the venv was built and the harness installed into it. It builds the venv from the newest `python3.1x` ≥ 3.10 on `PATH`. Moving to a new machine involves more than installing: state outside git, other projects' editable installs, shared devices. The order is in [docs/development.md § Bringing up a new machine](docs/development.md#bringing-up-a-new-machine).
+`scripts/setup-dev-env.sh` also has a macOS branch (`brew install vice python`, the venv, the feth bridge). Its first recorded run was on 2026-10-20, with `--no-system-packages --no-bridge --no-u64`, so its macOS stage 1 is still unrun: the venv was built and the harness installed into it. On macOS it builds the venv from Homebrew's `/opt/homebrew/bin/python3`, whatever release that is, and stops if it is missing or older than 3.10. Moving to a new machine involves more than installing: state outside git, other projects' editable installs, shared devices. The order is in [docs/development.md § Bringing up a new machine](docs/development.md#bringing-up-a-new-machine).
 
 ### Ubuntu 25: secondary, passed in a fresh VM 2026-09-28
 
