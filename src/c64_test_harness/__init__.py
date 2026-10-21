@@ -155,6 +155,9 @@ from .backends.ultimate64_temp_gc import (
     auto_gc_enabled,
 )
 from .backends.ultimate64_storage import (
+    ROM_DIRECTORY,
+    ROM_SIZES,
+    STOCK_ROM_NAMES,
     WRITE_REFUSED_VOLUMES,
     StorageEntry,
     StoragePutResult,
@@ -166,6 +169,7 @@ from .backends.ultimate64_storage import (
     storage_list_dir,
     storage_mkdir,
     storage_put_file,
+    storage_put_rom,
     storage_rmdir,
     storage_volumes,
     storage_writable_volumes,
@@ -642,6 +646,11 @@ __all__ = [
     "storage_writable_volumes",
     "storage_list_dir",
     "storage_rmdir",
+    # ROM images in /Flash/roms (issue #544, owner 2026-10-20)
+    "ROM_DIRECTORY",
+    "ROM_SIZES",
+    "STOCK_ROM_NAMES",
+    "storage_put_rom",
     # CBM /Temp-fix constant never set for a newer C64U release (issue #248)
     "CbmFixConstantStaleWarning",
     # Ultimate 64 liveness probe
