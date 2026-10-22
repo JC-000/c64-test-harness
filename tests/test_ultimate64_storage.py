@@ -776,3 +776,529 @@ def test_a_non_550_rmd_refusal_stays_an_untyped_storage_error(server):
         with pytest.raises(st.Ultimate64StorageError, match="530") as ei:
             st.storage_rmdir("dev", "/SD/d")
     assert not isinstance(ei.value, st.Ultimate64StorageNotEmptyError)
+
+
+# ------------------------------------------------- ROM images in /Flash/roms
+# Owner decision 2026-10-20: the harness may write ROM images (stock, or
+# alternatives such as JiffyDOS) to the firmware's ROM directory, and nowhere
+# else in /Flash. Sizes and signatures are the firmware's own (c64.cc
+# list_kernals/list_basics/list_chars, c1541.cc list_roms, filetype_bin.cc).
+
+KERNAL = b"\x85\x56\x20\x0f" + bytes(range(256)) * 31 + bytes(252)
+BASIC = b"\x94\xe3\x7b\xe3" + b"CBMBASIC" + bytes(8192 - 12)
+CHARS = b"\x3c\x66\x6e\x6e" + bytes(4092)
+DRIVE16 = bytes(range(256)) * 64
+DRIVE32 = bytes(range(256)) * 128
+ROMS = {"kernal": KERNAL, "basic": BASIC, "chars": CHARS, "drive": DRIVE16}
+
+
+def _rom_writes(server):
+    """Every path the session created, wrote or deleted."""
+    return [
+        line.split(" ", 1)[1] for line in server.log
+        if line.split(" ", 1)[0] in ("STOR", "MKD", "DELE", "RMD")
+    ]
+
+
+@pytest.mark.parametrize("kind", sorted(ROMS))
+def test_put_rom_writes_into_the_rom_directory_and_verifies(server, kind):
+    server.dirs.add("/Flash/roms")
+    result = st.storage_put_rom("dev", kind, "alt.bin", ROMS[kind])
+    assert server.files["/Flash/roms/alt.bin"] == ROMS[kind]
+    assert result.path == "/Flash/roms/alt.bin"
+    assert result.verified is True
+    assert result.replaced is False
+    assert result.sha256 == hashlib.sha256(ROMS[kind]).hexdigest()
+    assert "RETR /Flash/roms/alt.bin" in server.log
+    assert _rom_writes(server) == ["/Flash/roms/alt.bin"]
+
+
+def test_put_rom_creates_the_rom_directory_after_a_reformat(server):
+    st.storage_put_rom("dev", "kernal", "kernal.bin", KERNAL)
+    assert "/Flash/roms" in server.dirs
+    assert server.files["/Flash/roms/kernal.bin"] == KERNAL
+    assert _rom_writes(server) == ["/Flash/roms", "/Flash/roms/kernal.bin"]
+
+
+def test_put_rom_accepts_both_drive_rom_sizes(server):
+    server.dirs.add("/Flash/roms")
+    st.storage_put_rom("dev", "drive", "jiffy1541.rom", DRIVE16)
+    st.storage_put_rom("dev", "drive", "jiffy1571.rom", DRIVE32)
+    assert len(server.files["/Flash/roms/jiffy1541.rom"]) == 16384
+    assert len(server.files["/Flash/roms/jiffy1571.rom"]) == 32768
+
+
+@pytest.mark.parametrize(
+    "kind, size",
+    [
+        ("kernal", 8191), ("kernal", 8193), ("kernal", 4096), ("kernal", 16384),
+        ("basic", 4096), ("basic", 8193),
+        ("chars", 8192), ("chars", 4095), ("chars", 2048),
+        ("drive", 8192), ("drive", 16383), ("drive", 24576), ("drive", 49152), ("drive", 65536),
+    ],
+)
+def test_put_rom_refuses_a_size_the_firmware_would_not_load(server, kind, size):
+    data = (ROMS[kind] * 8)[:size]
+    with pytest.raises(ValueError, match=str(size)):
+        st.storage_put_rom("dev", kind, "x.bin", data)
+    assert server.connects == 0
+
+
+def test_put_rom_refuses_an_unknown_kind_before_connecting(server):
+    for kind in ("KERNAL", "char", "sounds", "", "cart"):
+        with pytest.raises(ValueError, match="kind"):
+            st.storage_put_rom("dev", kind, "x.bin", KERNAL)
+    assert server.connects == 0
+
+
+@pytest.mark.parametrize(
+    "kind, data",
+    [
+        ("kernal", b"\x00" + KERNAL[1:]),
+        ("kernal", KERNAL[:3] + b"\x0e" + KERNAL[4:]),
+        ("basic", BASIC[:4] + b"CBMBASIX" + BASIC[12:]),
+        ("basic", BASIC[:5] + b"x" + BASIC[6:]),
+        ("chars", b"\x3d" + CHARS[1:]),
+        ("chars", CHARS[:3] + b"\x00" + CHARS[4:]),
+        # a BASIC ROM offered as a KERNAL and the reverse: same size, wrong kind
+        ("kernal", BASIC),
+        ("basic", KERNAL),
+    ],
+)
+def test_put_rom_refuses_an_unrecognised_image_unless_told(server, kind, data):
+    server.dirs.add("/Flash/roms")
+    with pytest.raises(ValueError, match="check_signature=False"):
+        st.storage_put_rom("dev", kind, "x.bin", data)
+    assert server.connects == 0
+    st.storage_put_rom("dev", kind, "x.bin", data, check_signature=False)
+    assert server.files["/Flash/roms/x.bin"] == data
+
+
+def test_put_rom_drive_images_carry_no_signature_check(server):
+    server.dirs.add("/Flash/roms")
+    st.storage_put_rom("dev", "drive", "any.rom", b"\xff" * 16384)
+    assert server.files["/Flash/roms/any.rom"] == b"\xff" * 16384
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "", ".", "..", "../config", "sub/x.bin", "/x.bin", "x.bin/", ".hidden.bin",
+        "a\\..\\..\\config", "100%s.bin", "a\nb.bin", "a\x7f.bin",
+        # a config string longer than its item's max is truncated with '*'
+        # (config.cc setString), so it could never be selected
+        "k" * 27 + ".bin",
+    ],
+)
+def test_put_rom_refuses_bad_names_before_connecting(server, name):
+    with pytest.raises(ValueError):
+        st.storage_put_rom("dev", "kernal", name, KERNAL)
+    assert server.connects == 0
+
+
+def test_put_rom_name_length_follows_the_config_item_of_its_kind(server):
+    """C64 ROM items hold 30 characters (c64.cc:84-86), drive ROM items 32."""
+    server.dirs.add("/Flash/roms")
+    st.storage_put_rom("dev", "kernal", "k" * 26 + ".bin", KERNAL)
+    st.storage_put_rom("dev", "drive", "d" * 28 + ".rom", DRIVE16)
+    with pytest.raises(ValueError, match="32"):
+        st.storage_put_rom("dev", "drive", "d" * 29 + ".rom", DRIVE16)
+    for kind in ("basic", "chars"):
+        with pytest.raises(ValueError, match="30"):
+            st.storage_put_rom("dev", kind, "c" * 27 + ".bin", ROMS[kind])
+
+
+def test_put_rom_requires_the_lock_before_connecting():
+    srv = _FakeFTPServer()
+    fake = type("_BoundFakeFTP", (_FakeFTP,), {"server": srv})
+    with patch.object(st, "FTP", fake), patch.object(st, "lock_held_for", lambda host: False):
+        with pytest.raises(st.Ultimate64StorageError, match="DeviceLock"):
+            st.storage_put_rom("dev", "kernal", "kernal.bin", KERNAL)
+    assert srv.connects == 0
+    assert srv.files == {}
+
+
+@pytest.mark.parametrize(
+    "stock, kind",
+    [
+        ("kernal.bin", "kernal"), ("basic.bin", "basic"), ("chars.bin", "chars"),
+        ("1541.rom", "drive"), ("1571.rom", "drive"), ("1581.rom", "drive"),
+        ("snds1541.bin", "drive"), ("snds1571.bin", "drive"), ("snds1581.bin", "drive"),
+    ],
+)
+def test_put_rom_never_replaces_a_stock_file_without_replace_stock(server, stock, kind):
+    server.dirs.add("/Flash/roms")
+    server.files[f"/Flash/roms/{stock}"] = b"stock"
+    for overwrite in (False, True):
+        with pytest.raises(FileExistsError, match="replace_stock=True"):
+            st.storage_put_rom("dev", kind, stock, ROMS[kind], overwrite=overwrite)
+    # compared casefolded: FatFS names are case-insensitive
+    with pytest.raises(FileExistsError, match="replace_stock=True"):
+        st.storage_put_rom("dev", kind, stock.upper(), ROMS[kind], overwrite=True)
+    assert server.files[f"/Flash/roms/{stock}"] == b"stock"
+    assert _rom_writes(server) == []
+    result = st.storage_put_rom(
+        "dev", kind, stock.upper(), ROMS[kind], overwrite=True, replace_stock=True
+    )
+    # written under the device's spelling, not as a second directory entry
+    assert result.path == f"/Flash/roms/{stock}"
+    assert result.replaced is True
+    assert server.files[f"/Flash/roms/{stock}"] == ROMS[kind]
+    assert f"/Flash/roms/{stock.upper()}" not in server.files
+
+
+def test_put_rom_stock_guard_reads_the_device_spelling_casefolded(server):
+    """A stock file the device spells in capitals (a FAT 8.3 entry) is still stock."""
+    server.dirs.add("/Flash/roms")
+    server.files["/Flash/roms/KERNAL.BIN"] = b"stock"
+    with pytest.raises(FileExistsError, match="replace_stock=True"):
+        st.storage_put_rom("dev", "kernal", "kernal.bin", KERNAL, overwrite=True)
+    assert server.files == {"/Flash/roms/KERNAL.BIN": b"stock"}
+
+
+def test_put_rom_refuses_a_name_that_is_not_a_str(server):
+    for name in (b"kernal.bin", None, 7):
+        with pytest.raises(TypeError):
+            st.storage_put_rom("dev", "kernal", name, KERNAL)
+    assert server.connects == 0
+
+
+def test_put_rom_writes_a_missing_stock_file_without_an_opt_in(server):
+    """After a reformat kernal/basic/chars are absent: putting them back is the point."""
+    server.dirs.add("/Flash/roms")
+    for kind, name in (("kernal", "kernal.bin"), ("basic", "basic.bin"), ("chars", "chars.bin")):
+        assert st.storage_put_rom("dev", kind, name, ROMS[kind]).replaced is False
+    assert server.files["/Flash/roms/basic.bin"] == BASIC
+
+
+def test_put_rom_overwrites_a_non_stock_file_only_with_overwrite(server):
+    server.dirs.add("/Flash/roms")
+    server.files["/Flash/roms/Jiffy.bin"] = b"old"
+    with pytest.raises(FileExistsError, match="overwrite=True"):
+        st.storage_put_rom("dev", "kernal", "jiffy.BIN", KERNAL)
+    assert server.files["/Flash/roms/Jiffy.bin"] == b"old"
+    result = st.storage_put_rom("dev", "kernal", "jiffy.BIN", KERNAL, overwrite=True)
+    assert result.replaced is True
+    assert result.path == "/Flash/roms/Jiffy.bin"
+    assert server.files["/Flash/roms/Jiffy.bin"] == KERNAL
+
+
+def test_put_rom_always_reads_back_and_removes_a_bad_new_file(server):
+    server.dirs.add("/Flash/roms")
+    server.corrupt_reads = True
+    with pytest.raises(st.Ultimate64StorageError, match="removed"):
+        st.storage_put_rom("dev", "kernal", "kernal.bin", KERNAL)
+    assert "/Flash/roms/kernal.bin" not in server.files
+
+
+def test_put_rom_refuses_a_directory_in_the_way(server):
+    server.dirs.update({"/Flash/roms", "/Flash/roms/x.bin"})
+    with pytest.raises(IsADirectoryError):
+        st.storage_put_rom("dev", "kernal", "x.bin", KERNAL)
+
+
+def test_put_rom_refuses_a_file_where_the_rom_directory_should_be(server):
+    server.files["/Flash/roms"] = b"not a dir"
+    with pytest.raises(NotADirectoryError):
+        st.storage_put_rom("dev", "kernal", "x.bin", KERNAL)
+    assert _rom_writes(server) == []
+
+
+def test_put_rom_accepts_a_local_path(server, tmp_path):
+    p = tmp_path / "jiffydos.bin"
+    p.write_bytes(KERNAL)
+    server.dirs.add("/Flash/roms")
+    assert st.storage_put_rom("dev", "kernal", "jiffydos.bin", p).size == 8192
+    with pytest.raises(TypeError):
+        st.storage_put_rom("dev", "kernal", "jiffydos.bin", str(p))
+
+
+def test_generic_writes_to_flash_stay_refused(server):
+    """Only storage_put_rom reaches /Flash, and only /Flash/roms/<name>."""
+    server.dirs.add("/Flash/roms")
+    for path in ("/Flash/roms/x.bin", "/flash/ROMS/kernal.bin", "/Flash/config", "/Flash/roms"):
+        with pytest.raises(ValueError):
+            st.storage_put_file("dev", path, KERNAL, overwrite=True)
+        with pytest.raises(ValueError):
+            st.storage_delete_file("dev", path)
+    assert server.connects == 0
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/Flash/config", "/Flash/carts/x.bin", "/Flash/roms/sub/x.bin", "/Flash/roms",
+     "/Temp/roms/x.bin", "/Temp/x.bin", "/Flash/html/roms"],
+)
+def test_the_rom_exemption_admits_only_flash_roms_name(path):
+    with pytest.raises(ValueError):
+        st._check_path(path, write=True, allow_rom_dir=True)
+    assert st._check_path("/Flash/roms/x.bin", write=True, allow_rom_dir=True) == [
+        "Flash", "roms", "x.bin"
+    ]
+
+
+# ------------------------------------- name spellings the firmware rewrites
+# MLST, SIZE and DELE resolve each component with pattern_match, which is
+# case-insensitive and honours '*' and '?' (file_system.cc:106, pattern.cc:78
+# at 1.1.0). STOR reaches f_open(FA_CREATE_ALWAYS), and FatFS's create_name
+# strips trailing spaces and dots (ff.c:2903). So "kernal.bin." stats as
+# missing and then rewrites kernal.bin, and "k*" stats as kernal.bin.
+
+WILDCARD_PATHS = ["/SD/*", "/SD/k*.bin", "/SD/a?.bin", "/SD/*/x.bin", "/SD/d?r/x.bin"]
+TRAILING_PATHS = ["/SD/x.bin.", "/SD/x.bin ", "/SD/x.bin..", "/SD/dir./x.bin", "/SD/dir /x.bin"]
+
+
+@pytest.mark.parametrize("path", WILDCARD_PATHS + TRAILING_PATHS)
+def test_writes_refuse_names_the_firmware_would_rewrite(server, path):
+    server.files["/SD/x.bin"] = b"old"
+    with pytest.raises(ValueError):
+        st.storage_put_file("dev", path, b"new", overwrite=True)
+    with pytest.raises(ValueError):
+        st.storage_delete_file("dev", path)
+    with pytest.raises(ValueError):
+        st.storage_mkdir("dev", path)
+    with pytest.raises(ValueError):
+        st.storage_rmdir("dev", path)
+    assert server.connects == 0
+    assert server.files == {"/SD/x.bin": b"old"}
+
+
+@pytest.mark.parametrize("path", WILDCARD_PATHS)
+def test_reads_refuse_wildcards_too(server, path):
+    with pytest.raises(ValueError):
+        st.storage_get_file("dev", path)
+    with pytest.raises(ValueError):
+        st.storage_list_dir("dev", path)
+    assert server.connects == 0
+
+
+def test_reads_still_accept_a_trailing_dot_or_space(server):
+    """A read cannot rewrite anything; pattern_match compares the dot literally."""
+    with pytest.raises(FileNotFoundError):
+        st.storage_get_file("dev", "/SD/x.bin.")
+    assert server.connects == 1
+
+
+ROM_SPELLINGS = ["kernal.bin.", "kernal.bin ", "KERNAL.BI?", "k*", "*", "kernal.b?n", "1541.rom."]
+
+
+@pytest.mark.parametrize("name", ROM_SPELLINGS)
+def test_put_rom_refuses_spellings_that_reach_a_stock_file(server, name):
+    server.dirs.add("/Flash/roms")
+    server.files["/Flash/roms/kernal.bin"] = b"stock"
+    server.files["/Flash/roms/1541.rom"] = b"stock"
+    kind = "drive" if name.startswith("1541") else "kernal"
+    for overwrite in (False, True):
+        with pytest.raises(ValueError):
+            st.storage_put_rom("dev", kind, name, ROMS[kind], overwrite=overwrite)
+    assert server.connects == 0
+    assert server.files["/Flash/roms/kernal.bin"] == b"stock"
+
+
+# --------------------------------------------------------- storage_delete_rom
+def test_delete_rom_removes_an_uploaded_rom_by_its_device_spelling(server):
+    server.dirs.add("/Flash/roms")
+    server.files["/Flash/roms/Jiffy.bin"] = KERNAL
+    server.files["/Flash/roms/kernal.bin"] = b"stock"
+    assert st.storage_delete_rom("dev", "jiffy.BIN") is True
+    assert "/Flash/roms/Jiffy.bin" not in server.files
+    assert server.files["/Flash/roms/kernal.bin"] == b"stock"
+    assert _rom_writes(server) == ["/Flash/roms/Jiffy.bin"]
+
+
+@pytest.mark.parametrize(
+    "name", sorted(st.STOCK_ROM_NAMES) + ["KERNAL.BIN", "1541.Rom", "Snds1581.bin"]
+)
+def test_delete_rom_never_deletes_a_stock_file(server, name):
+    server.dirs.add("/Flash/roms")
+    server.files[f"/Flash/roms/{name.lower()}"] = b"stock"
+    with pytest.raises(ValueError, match="stock"):
+        st.storage_delete_rom("dev", name)
+    assert server.connects == 0
+    assert server.files[f"/Flash/roms/{name.lower()}"] == b"stock"
+
+
+@pytest.mark.parametrize(
+    "name",
+    ROM_SPELLINGS + ["", ".", "..", "../config", "sub/x.bin", ".hidden", "a\\b", "a%n",
+                     "a\nb", "x" * 61],
+)
+def test_delete_rom_refuses_bad_names_before_connecting(server, name):
+    server.dirs.add("/Flash/roms")
+    server.files["/Flash/roms/kernal.bin"] = b"stock"
+    with pytest.raises(ValueError):
+        st.storage_delete_rom("dev", name)
+    assert server.connects == 0
+
+
+def test_delete_rom_refuses_a_name_that_is_not_a_str(server):
+    for name in (b"x.bin", None):
+        with pytest.raises(TypeError):
+            st.storage_delete_rom("dev", name)
+    assert server.connects == 0
+
+
+def test_delete_rom_requires_the_lock_before_connecting():
+    srv = _FakeFTPServer()
+    srv.dirs.add("/Flash/roms")
+    srv.files["/Flash/roms/jiffy.bin"] = KERNAL
+    fake = type("_BoundFakeFTP", (_FakeFTP,), {"server": srv})
+    with patch.object(st, "FTP", fake), patch.object(st, "lock_held_for", lambda host: False):
+        with pytest.raises(st.Ultimate64StorageError, match="DeviceLock"):
+            st.storage_delete_rom("dev", "jiffy.bin")
+    assert srv.connects == 0
+    assert "/Flash/roms/jiffy.bin" in srv.files
+
+
+def test_delete_rom_matches_only_a_listed_name(server):
+    """An entry the listing does not show (an 8.3 alias, say) is never DELE'd."""
+    server.dirs.add("/Flash/roms")
+    server.files["/Flash/roms/jiffydos_kernal.bin"] = KERNAL
+    with pytest.raises(FileNotFoundError):
+        st.storage_delete_rom("dev", "JIFFYD~1.BIN")
+    assert st.storage_delete_rom("dev", "JIFFYD~1.BIN", missing_ok=True) is False
+    assert "/Flash/roms/jiffydos_kernal.bin" in server.files
+    assert _rom_writes(server) == []
+
+
+def test_delete_rom_missing_directory_and_dir_entries(server):
+    with pytest.raises(FileNotFoundError):
+        st.storage_delete_rom("dev", "x.bin")
+    assert st.storage_delete_rom("dev", "x.bin", missing_ok=True) is False
+    server.dirs.update({"/Flash/roms", "/Flash/roms/sub"})
+    with pytest.raises(IsADirectoryError):
+        st.storage_delete_rom("dev", "SUB")
+    assert "/Flash/roms/sub" in server.dirs
+    assert _rom_writes(server) == []
+
+
+# ------------------------------------------- ASCII-only case folding (FatFS)
+def test_rom_names_fold_ascii_only(server):
+    """The firmware's MLST matcher folds ASCII only (pattern.cc:78); str.casefold
+    would make 'strasse.bin' match a listed 'STRAßE.BIN'."""
+    server.dirs.add("/Flash/roms")
+    server.files["/Flash/roms/STRAßE.BIN"] = b"other"
+    st.storage_put_rom("dev", "kernal", "strasse.bin", KERNAL)
+    assert server.files["/Flash/roms/strasse.bin"] == KERNAL
+    assert server.files["/Flash/roms/STRAßE.BIN"] == b"other"
+    assert st.storage_delete_rom("dev", "STRASSE.BIN") is True
+    assert server.files == {"/Flash/roms/STRAßE.BIN": b"other"}
+    with pytest.raises(FileNotFoundError):
+        st.storage_delete_rom("dev", "strasse.bin")
+    assert server.files == {"/Flash/roms/STRAßE.BIN": b"other"}
+
+
+@pytest.mark.parametrize("name", ["jiffyä.bin", "JIFFYÄ.bin", "straße.bin", "é.rom", "a\u2044b.bin"])
+def test_rom_names_must_be_ascii(server, name):
+    """FatFS compares long names with ff_wtoupper (ff.c:1917) and short names
+    through CP437 ExCvt (ff.c:2797), but MLST matches ASCII-only: a put of
+    'jiffyä.bin' would stat as missing and then rewrite 'JIFFYÄ.bin'."""
+    server.dirs.add("/Flash/roms")
+    server.files["/Flash/roms/JIFFYÄ.bin"] = b"other"
+    with pytest.raises(ValueError, match="ASCII"):
+        st.storage_put_rom("dev", "kernal", name, KERNAL, overwrite=True)
+    with pytest.raises(ValueError, match="ASCII"):
+        st.storage_delete_rom("dev", name)
+    assert server.connects == 0
+    assert server.files == {"/Flash/roms/JIFFYÄ.bin": b"other"}
+
+
+def test_delete_rom_checks_the_file_is_gone(server):
+    server.dirs.add("/Flash/roms")
+    server.files["/Flash/roms/jiffy.bin"] = KERNAL
+
+    def delete(self, path):
+        self.server.log.append(f"DELE {path}")
+        return "250 OK"  # answered, but nothing removed
+
+    # The caller's spelling differs from the device's, so a re-listing that
+    # compared the caller's name exactly would miss the file left behind.
+    with patch.object(_FakeFTP, "delete", delete):
+        with pytest.raises(st.Ultimate64StorageError, match="still"):
+            st.storage_delete_rom("dev", "JIFFY.BIN")
+
+
+# ------------------------------------ a failed overwrite puts the old file back
+OLD = bytes(range(256)) * 40
+
+
+def _fail_first_stor(limit):
+    real = _FakeFTP.storbinary
+    calls = {"n": 0}
+
+    def stor(self, cmd, fp, blocksize=8192):
+        calls["n"] += 1
+        if calls["n"] <= limit:
+            path = cmd.split(" ", 1)[1]
+            self.server.log.append(f"STOR {path}")
+            self.server.files[path] = fp.read()[:10]  # "wb" truncated, then the link dropped
+            raise TimeoutError("timed out")
+        return real(self, cmd, fp, blocksize)
+
+    return stor
+
+
+def test_a_failed_overwrite_restores_the_previous_file(server):
+    server.files["/SD/x.bin"] = OLD
+    with patch.object(_FakeFTP, "storbinary", _fail_first_stor(1)):
+        with pytest.raises(st.Ultimate64StorageError, match="previous file was put back") as ei:
+            st.storage_put_file("dev", "/SD/x.bin", DATA, overwrite=True)
+    assert server.files["/SD/x.bin"] == OLD
+    assert "verified" in str(ei.value)
+    log = [line for line in server.log if line.startswith(("RETR", "STOR"))]
+    assert log[0] == "RETR /SD/x.bin"  # the original was read before the first STOR
+    assert log.count("STOR /SD/x.bin") == 2
+
+
+def test_a_failed_stock_rom_replacement_restores_the_stock_file(server):
+    server.dirs.add("/Flash/roms")
+    server.files["/Flash/roms/kernal.bin"] = OLD[:8192]
+    with patch.object(_FakeFTP, "storbinary", _fail_first_stor(1)):
+        with pytest.raises(st.Ultimate64StorageError, match="put back"):
+            st.storage_put_rom(
+                "dev", "kernal", "kernal.bin", KERNAL, overwrite=True, replace_stock=True
+            )
+    assert server.files["/Flash/roms/kernal.bin"] == OLD[:8192]
+
+
+def test_an_overwrite_with_a_bad_read_back_restores_the_previous_file(server):
+    server.files["/SD/x.bin"] = OLD
+    real = _FakeFTP.retrbinary
+    reads = {"n": 0}
+
+    def retr(self, cmd, callback, blocksize=8192):
+        reads["n"] += 1
+        if reads["n"] == 2:  # 1 = backup of the original, 2 = verify of the new file
+            return real(self, cmd, lambda b: callback(b[:-1] + bytes([b[-1] ^ 0xFF])), blocksize)
+        return real(self, cmd, callback, blocksize)
+
+    with patch.object(_FakeFTP, "retrbinary", retr):
+        with pytest.raises(st.Ultimate64StorageError, match="put back"):
+            st.storage_put_file("dev", "/SD/x.bin", DATA, overwrite=True)
+    assert server.files["/SD/x.bin"] == OLD
+
+
+def test_a_failed_restore_says_the_previous_file_is_lost(server):
+    server.files["/SD/x.bin"] = OLD
+    with patch.object(_FakeFTP, "storbinary", _fail_first_stor(2)):
+        with pytest.raises(st.Ultimate64StorageError, match="previous file is gone") as ei:
+            st.storage_put_file("dev", "/SD/x.bin", DATA, overwrite=True)
+    assert "putting it back also failed" in str(ei.value)
+    assert server.files["/SD/x.bin"] != OLD
+
+
+def test_a_restore_that_reads_back_wrong_says_so(server):
+    server.files["/SD/x.bin"] = OLD
+    real = _FakeFTP.retrbinary
+    reads = {"n": 0}
+
+    def retr(self, cmd, callback, blocksize=8192):
+        reads["n"] += 1
+        if reads["n"] == 2:  # the restore's verify
+            return real(self, cmd, lambda b: callback(b[:-1] + bytes([b[-1] ^ 0xFF])), blocksize)
+        return real(self, cmd, callback, blocksize)
+
+    with patch.object(_FakeFTP, "storbinary", _fail_first_stor(1)):
+        with patch.object(_FakeFTP, "retrbinary", retr):
+            with pytest.raises(st.Ultimate64StorageError, match="previous file is gone"):
+                st.storage_put_file("dev", "/SD/x.bin", DATA, overwrite=True)
