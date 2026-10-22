@@ -1,12 +1,13 @@
 """Files on an Ultimate's persistent storage, over the firmware's FTP server.
 
 The firmware's FTP server (``software/network/ftpd.cc``) lists every
-volume and media slot at its root. On this bench (2026-10-08) the C64U
-listed ``/SD``, ``/Flash`` and ``/Temp``, but its ``/SD`` slot was empty,
-so it had no writable volume. The U64E listed ``/USB1``, ``/Flash`` and
-``/Temp``. These helpers put test inputs on the removable volumes (a
-disk image that a C64-side program loads through UCI DOS, a rig's trust
-store) and read, list and delete them.
+volume and media slot at its root. Which of them are usable depends on
+the media present at the time, so read :func:`storage_volumes` /
+:func:`storage_writable_volumes` at run time rather than relying on a
+recorded reading; a volume either one lists is one the helpers will try,
+not one proven to accept writes. These helpers put test inputs on the
+removable volumes (a disk image that a C64-side program loads through
+UCI DOS, a rig's trust store) and read, list and delete them.
 
 Rules, all enforced before the path is touched:
 
@@ -519,7 +520,8 @@ def storage_writable_volumes(
     accepts writes.** Nothing is written to find out: a volume here was
     entered with ``CWD`` and is not refused by name. The C64U (1.1.0,
     2026-10-09) listed ``SD`` here with a microSD card inserted, and
-    ``storage_mkdir('/SD/amiga64')`` still failed with ``553``. 1.1.0's
+    ``storage_mkdir('/SD/amiga64')`` failed with ``553`` until the card was
+    unlocked and reformatted MBR + FAT32. 1.1.0's
     ``MKD`` answers ``553`` whenever ``vfs_mkdir`` fails: ``FR_EXIST`` or
     any other failure from the lookup in ``FileManager::create_dir``, or
     any ``FRESULT`` from ``f_mkdir``. The reply does not say which.
