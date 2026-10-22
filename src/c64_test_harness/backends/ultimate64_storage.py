@@ -1,10 +1,10 @@
 """Files on an Ultimate's persistent storage, over the firmware's FTP server.
 
 The firmware's FTP server (``software/network/ftpd.cc``) lists every
-volume and media slot at its root. On this bench (2026-10-08) the C64U
-listed ``/SD``, ``/Flash`` and ``/Temp``, but its ``/SD`` slot was empty,
-so it had no writable volume. The U64E listed ``/USB1``, ``/Flash`` and
-``/Temp``. These helpers put test inputs on the removable volumes (a
+volume and media slot at its root. Which of them a device can write to
+depends on the media inserted at the time, so ask
+``storage_writable_volumes()`` rather than relying on a recorded reading.
+These helpers put test inputs on the removable volumes (a
 disk image that a C64-side program loads through UCI DOS, a rig's trust
 store) and read, list and delete them.
 
