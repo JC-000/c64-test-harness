@@ -5,9 +5,9 @@ volume and media slot at its root. Which of them are usable depends on
 the media present at the time, so read :func:`storage_volumes` /
 :func:`storage_writable_volumes` at run time rather than relying on a
 recorded reading; a volume either one lists is one the helpers will try,
-not one proven to accept writes. These helpers put test inputs on the removable volumes (a
-disk image that a C64-side program loads through UCI DOS, a rig's trust
-store) and read, list and delete them.
+not one proven to accept writes. These helpers put test inputs on the
+removable volumes (a disk image that a C64-side program loads through
+UCI DOS, a rig's trust store) and read, list and delete them.
 
 Rules, all enforced before the path is touched:
 
