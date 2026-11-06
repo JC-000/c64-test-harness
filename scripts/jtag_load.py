@@ -40,6 +40,7 @@ import hashlib
 import importlib
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -150,10 +151,25 @@ def check_identity(info: dict, uid: str, products=PRODUCTS) -> None:
         raise JtagLoadError("identity", f"product {info.get('product')!r} is not a C64U-class board")
 
 
+def check_git_hash(expect_git_hash) -> str:
+    h = str(expect_git_hash or "").lower()
+    if not re.fullmatch(r"[0-9a-f]{7,40}", h):
+        raise JtagLoadError("hash", f"expected git hash {expect_git_hash!r}: give at least 7 hex digits")
+    return h
+
+
+def hash_matches(reported, expect: str) -> bool:
+    """/v1/info reports `git rev-parse --short HEAD` (9 digits here); match on the common prefix."""
+    r = str(reported or "").lower()
+    n = min(len(r), len(expect))
+    return n >= 7 and r[:n] == expect[:n]
+
+
 def wait_info(host: str, uid: str, expect_git_hash: str | None, timeout: float, client_factory=_client,
               sleep=None, clock=None, products=PRODUCTS) -> dict:
     """Poll /v1/info until it answers with the bound unique_id (and the expected hash, if given)."""
     sleep, clock = sleep or time.sleep, clock or time.monotonic
+    expect = check_git_hash(expect_git_hash) if expect_git_hash is not None else None
     end = clock() + timeout
     last = None
     while clock() < end:
@@ -161,7 +177,7 @@ def wait_info(host: str, uid: str, expect_git_hash: str | None, timeout: float, 
         if info is not None:
             last = info
             check_identity(info, uid, products)
-            if expect_git_hash is None or str(info.get("git_commit_hash", "")).startswith(expect_git_hash[:9]):
+            if expect is None or hash_matches(info.get("git_commit_hash"), expect):
                 return info
         sleep(2.0)
     raise JtagLoadError("network", f"no /v1/info with the expected identity within {timeout:.0f} s; last {last!r}")
@@ -171,6 +187,9 @@ def _open(esp, adapter: dict, tck: int = 1_000_000, timeout_ms: int = 10_000):
     ns = argparse.Namespace(port=adapter["port"], baud=adapter.get("baud", "auto"), tck=tck, timeout_ms=timeout_ms)
     link = esp.open_link(ns)
     try:
+        ident = str(getattr(link, "info", {}).get("ident", ""))
+        if not ident.startswith("esp-jtag"):
+            raise JtagLoadError("adapter", f"{adapter['port']} answers as {ident!r}, not esp-jtag")
         return link, esp.open_jtag(link, ns)
     except BaseException:
         link.ser.close()
@@ -186,18 +205,52 @@ class _Locked:
         self.host, self.timeout = host, lock_timeout
 
     def __enter__(self):
-        if not self.dev.acquire(timeout=self.timeout):
+        if _held_by_lock_shell(self.host):     # locked.py convention: C64U_LOCK_PID holds the DeviceLock
+            self.dev = None
+        elif not self.dev.acquire(timeout=self.timeout):
             raise JtagLoadError("lock", f"DeviceLock({self.host}) not acquired within {self.timeout:.0f} s")
         if self.ad is not None and not self.ad.acquire(timeout=30):
-            self.dev.release()
+            if self.dev is not None:
+                self.dev.release()
             raise JtagLoadError("lock", "the JTAG adapter is in use by another process")
         return self
 
     def __exit__(self, *exc):
         if self.ad is not None:
             self.ad.release()
-        self.dev.release()
+        if self.dev is not None:
+            self.dev.release()
         return False
+
+
+def _held_by_lock_shell(host: str) -> bool:
+    """True when C64U_LOCK_PID is set and that process holds host's DeviceLock (locked.py); refuse a stale claim."""
+    pid = os.environ.get("C64U_LOCK_PID")
+    if not pid:
+        return False
+    from c64_test_harness.backends.device_lock import device_lock_holder
+    h = device_lock_holder(host)
+    if h and str(h.get("pid")) == pid:
+        return True
+    raise JtagLoadError("lock", f"C64U_LOCK_PID={pid} does not hold the DeviceLock for {host} (holder {h})")
+
+
+TDI_PATTERN = [1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1]
+
+
+def bypass_ok(jtag) -> bool:
+    """TDI -> TDO through the 1-bit BYPASS register: the pattern must come back one clock late.
+
+    IDCODE needs only TCK/TMS/TDO, so it passes with TDI (P5 pin 9) loose; a user-block read then reads garbage and
+    would be misread as "this bitstream has no user block". Nothing but BYPASS is selected; no user logic is touched.
+    """
+    jtag.reset()
+    jtag.write_ir(0x3F, 6)                  # BYPASS on the 7-series (IR all ones)
+    jtag.change_state("shift_dr")
+    out = jtag.shift_register(TDI_PATTERN + [0])
+    jtag.go_idle()
+    jtag.reset()
+    return list(out[1:]) == TDI_PATTERN
 
 
 def read_ids(host: str, *, user_block: bool = False, lock_timeout: float = 600, esp=None,
@@ -218,7 +271,10 @@ def read_ids(host: str, *, user_block: bool = False, lock_timeout: float = 600, 
             idcode = rec.read_id()
             jtag.sync()
             out = {"idcode": f"{idcode:08x}", "xilinx": (idcode & 0xFFF) == 0x093}
-            if user_block and out["xilinx"]:
+            if out["xilinx"]:
+                out["tdi_ok"] = bypass_ok(jtag)
+                jtag.sync()
+            if user_block and out.get("tdi_ok"):
                 out["user_id"] = f"{rec.user_read_id():08x}"
                 jtag.sync()
         finally:
@@ -227,13 +283,14 @@ def read_ids(host: str, *, user_block: bool = False, lock_timeout: float = 600, 
     return out
 
 
-def jtag_load(host: str, bit, app, *, bit_sha256: str, app_sha256: str, expect_git_hash: str | None = None,
+def jtag_load(host: str, bit, app, *, bit_sha256: str, app_sha256: str, expect_git_hash: str,
               lock_timeout: float = 600, net_timeout: float = 180, record_path=None, dry_run: bool = False,
               esp=None, lock_factory=DeviceLock, client_factory=_client, log=_log) -> dict:
     """Load bit + app into the bound C64U over JTAG; return a record of what was loaded and what came back."""
     esp = esp or esp_module()
     uid = bound_uid(host)
     adapter = ADAPTERS[uid]
+    expect_git_hash = check_git_hash(expect_git_hash)
     rec = {"t0": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": host, "uid": uid, "adapter": adapter["port"],
            "bit": str(bit), "bin": str(app), "bit_sha256": bit_sha256.lower(), "bin_sha256": app_sha256.lower(),
            "expect_git_hash": expect_git_hash, "dry_run": dry_run}
@@ -265,6 +322,9 @@ def jtag_load(host: str, bit, app, *, bit_sha256: str, app_sha256: str, expect_g
                         if not esp.idcode_matches(idcode, want_id):
                             raise JtagLoadError("idcode", f"live IDCODE {idcode:08x} is not the .bit's {want_id:08x}"
                                                 " (P5 unwired or the C64U off?); nothing was loaded")
+                        if not bypass_ok(jtag):
+                            raise JtagLoadError("tdi", "TDI->TDO through BYPASS failed (P5 pin 9 loose?); "
+                                                "nothing was loaded")
                     loader.run(str(pbit), str(papp), idcode_ok=idcode_ok)
                     jtag.link.drain()
                     rec["tck_cycles"] = getattr(jtag, "clock_count", None)
@@ -316,14 +376,8 @@ def power_cycle(host: str, *, expect_git_hash: str | None = None, lock_timeout: 
         check_identity(pre, uid)
         rec["pre_info"] = pre
         b = browser_factory(host)
-        try:
-            log(f"telnet menu: C64 Machine > Power Cycle on {uid}")
-            b.invoke_task_action("C64 Machine", "Power Cycle")
-        finally:
-            try:
-                b.close()
-            except Exception:
-                pass
+        log(f"telnet menu: C64 Machine > Power Cycle on {uid}")
+        activate_task_item(b, "C64 Machine", "Power Cycle")
         end = clock() + down_timeout
         while try_info(host, client_factory) is not None:
             if clock() > end:
@@ -332,6 +386,53 @@ def power_cycle(host: str, *, expect_git_hash: str | None = None, lock_timeout: 
         rec["info"] = wait_info(host, uid, expect_git_hash, up_timeout, client_factory, sleep, clock)
         rec["result"] = "ok"
         return rec
+
+
+def _label(x: str) -> str:
+    return x.split("||", 1)[0].strip()
+
+
+def activate_task_item(b, category: str, item: str) -> None:
+    """Task menu > category > item, with the item's highlight READ BACK before ENTER.
+
+    The upstream choose_overlay_item quick-seeks by first letter, and in "C64 Machine" that lands on "Power OFF"
+    first; it does not verify the highlight over telnet. Here the category is chosen with it (a wrong category only
+    opens another submenu, which then lacks the item), and the item is reached with select_framed_entry, which walks
+    one row at a time and reads the highlighted text back. After the final ENTER only the socket is closed: the
+    browser's own close() navigates home with 1 s timeouts per key, which outlasts the REST drop being watched for.
+    On any refusal before ENTER the menus are escaped and the browser closed normally.
+    """
+    done = False
+    try:
+        cats = b.open_task_menu()
+        if category not in [_label(c) for c in cats]:
+            raise JtagLoadError("menu", f"task menu has no {category!r}: {cats}")
+        before = b.rows()
+        b.choose_overlay_item(cats, category)
+        items = b.wait_for_overlay(before)
+        if item not in [_label(i) for i in items]:
+            raise JtagLoadError("menu", f"{category!r} has no {item!r}: {items}")
+        _frame, text = b.select_framed_entry(item)
+        if _label(text.split("  ")[0]) != item:
+            raise JtagLoadError("menu", f"highlight reads {text!r}, not {item!r}")
+        b.press("ENTER")
+        done = True
+    finally:
+        if done:
+            try:
+                b.backend.close()
+            except Exception:
+                pass
+        else:
+            for _ in range(3):
+                try:
+                    b.press("ESC")
+                except Exception:
+                    break
+            try:
+                b.close()
+            except Exception:
+                pass
 
 
 def _telnet_imports():
@@ -357,7 +458,8 @@ def main(argv=None) -> int:
         p.add_argument("host")
         p.add_argument("--lock-timeout", type=float, default=600)
         if name in ("load", "power-cycle"):
-            p.add_argument("--expect-hash", default=None, help="git_commit_hash /v1/info must report afterwards")
+            p.add_argument("--expect-hash", required=(name == "load"), default=None,
+                           help="git_commit_hash /v1/info must report afterwards (7+ hex digits)")
             p.add_argument("--dry-run", action="store_true", help="all checks that need no device I/O")
             p.add_argument("--record", default=None, help="append a JSON line per action here")
         if name == "load":
@@ -385,8 +487,12 @@ def main(argv=None) -> int:
             if a.record:
                 with open(a.record, "a") as f:
                     f.write(json.dumps(out, default=str) + "\n")
-    except JtagLoadError as e:
-        print(f"FAIL {e}", file=sys.stderr)
+    except Exception as e:          # JtagLoadError, LinkError, upstream Failure, OSError...
+        print(f"FAIL {type(e).__name__}: {e}", file=sys.stderr)
+        if getattr(a, "record", None) and a.cmd == "power-cycle":
+            with open(a.record, "a") as f:
+                f.write(json.dumps({"t": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "action": "power_cycle",
+                                    "host": a.host, "result": "error", "error": f"{type(e).__name__}: {e}"}) + "\n")
         return 2
     print(json.dumps(out, indent=1, default=str))
     return 0

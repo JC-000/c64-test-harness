@@ -35,8 +35,10 @@ class FakeLock:
 class FakeEsp:
     """Stands in for esp_recover: records what would have been driven."""
 
-    def __init__(self, ev, live_idcode=XILINX_7A50T, bit_id=XILINX_7A50T, user_id=0xDEAD1541):
+    def __init__(self, ev, live_idcode=XILINX_7A50T, bit_id=XILINX_7A50T, user_id=0xDEAD1541, tdi_ok=True,
+                 ident="esp-jtag 0.1 esp32"):
         self.ev, self.live_idcode, self.bit_id, self.user_id = ev, live_idcode, bit_id, user_id
+        self.tdi_ok, self.ident = tdi_ok, ident
         self.loaded = None
         esp = self
 
@@ -46,6 +48,7 @@ class FakeEsp:
 
         class Link:
             ser = Ser()
+            info = {"ident": ident}
 
             def drain(self_):
                 pass
@@ -62,6 +65,19 @@ class FakeEsp:
 
             def close(self_):
                 esp.ev.append(("pins_released",))
+
+            def write_ir(self_, v, n):
+                self_.ir = v
+
+            def change_state(self_, name):
+                pass
+
+            def go_idle(self_):
+                pass
+
+            def shift_register(self_, bits):
+                assert self_.ir == 0x3F
+                return [0] + bits[:-1] if esp.tdi_ok else [0] * len(bits)
 
         class Recover:
             def __init__(self_, jtag, log=print):
@@ -240,7 +256,8 @@ def test_busy_adapter_releases_device(env):
 def test_unbound_host_refuses(env):
     ev, bit, app, bsha, asha, tmp = env
     with pytest.raises(jl.JtagLoadError) as e:
-        jl.jtag_load("10.0.0.1", bit, app, bit_sha256=bsha, app_sha256=asha, esp=FakeEsp(ev))
+        jl.jtag_load("10.0.0.1", bit, app, bit_sha256=bsha, app_sha256=asha, expect_git_hash="abc123def",
+                     esp=FakeEsp(ev))
     assert e.value.stage == "binding"
 
 
@@ -254,7 +271,8 @@ def test_probe_reads_user_id_without_loading(env):
     ev = env[0]
     esp = FakeEsp(ev)
     out = jl.read_ids("c64u", user_block=True, esp=esp, lock_factory=locks(ev), log=lambda m: None)
-    assert out == {"idcode": "0362c093", "xilinx": True, "user_id": "dead1541"} and esp.loaded is None
+    assert out == {"idcode": "0362c093", "xilinx": True, "tdi_ok": True, "user_id": "dead1541"}
+    assert esp.loaded is None
 
 
 def test_idcode_only_skips_user_block(env):
@@ -264,11 +282,35 @@ def test_idcode_only_skips_user_block(env):
 
 
 class FakeBrowser:
-    def __init__(self, ev):
-        self.ev = ev
+    """Task menu: C64 Machine > [Reset C64, Reboot C64, Reboot (Clr Mem), Power OFF, Power Cycle]."""
 
-    def invoke_task_action(self, cat, item):
-        self.ev.append(("menu", cat, item))
+    def __init__(self, ev, items=("Reset C64", "Reboot C64", "Reboot (Clr Mem)", "Power OFF", "Power Cycle"),
+                 highlight=None):
+        self.ev, self.items, self.highlight = ev, list(items), highlight
+        outer = self
+
+        class Backend:
+            def close(self_):
+                outer.ev.append(("socket_close",))
+        self.backend = Backend()
+
+    def open_task_menu(self):
+        return ["C64 Machine", "Developer", "Configuration"]
+
+    def rows(self):
+        return []
+
+    def choose_overlay_item(self, labels, label):
+        self.ev.append(("category", label))
+
+    def wait_for_overlay(self, before):
+        return self.items
+
+    def select_framed_entry(self, label):
+        return (0, 0, 9, 9), (self.highlight or label) + "      "
+
+    def press(self, key):
+        self.ev.append(("press", key))
 
     def close(self):
         self.ev.append(("telnet_close",))
@@ -276,12 +318,12 @@ class FakeBrowser:
 
 def test_power_cycle_menu_then_down_then_up(env):
     ev = env[0]
-    client = FakeClient(ev, [info("flashed"), info("flashed"), None, None, info("flashed")])
-    rec = jl.power_cycle("c64u", expect_git_hash="flashed", lock_factory=locks(ev), client_factory=client,
+    client = FakeClient(ev, [info("f1a5bed00"), info("f1a5bed00"), None, None, info("f1a5bed00")])
+    rec = jl.power_cycle("c64u", expect_git_hash="f1a5bed00", lock_factory=locks(ev), client_factory=client,
                          browser_factory=lambda h: FakeBrowser(ev), sleep=lambda s: None, log=lambda m: None)
     assert rec["result"] == "ok"
-    seq = [e for e in ev if e[0] in ("acquire", "menu", "telnet_close", "release")]
-    assert seq == [("acquire", "device"), ("menu", "C64 Machine", "Power Cycle"), ("telnet_close",),
+    seq = [e for e in ev if e[0] in ("acquire", "category", "press", "socket_close", "telnet_close", "release")]
+    assert seq == [("acquire", "device"), ("category", "C64 Machine"), ("press", "ENTER"), ("socket_close",),
                    ("release", "device")]
 
 
@@ -291,13 +333,13 @@ def test_power_cycle_refuses_other_product(env):
     with pytest.raises(jl.JtagLoadError):
         jl.power_cycle("c64u", lock_factory=locks(ev), client_factory=client,
                        browser_factory=lambda h: FakeBrowser(ev), log=lambda m: None)
-    assert not any(e[0] == "menu" for e in ev)
+    assert ("press", "ENTER") not in ev
 
 
 def test_power_cycle_that_never_drops_fails(env):
     ev = env[0]
     t = [0.0]
-    client = FakeClient(ev, [info("flashed")])
+    client = FakeClient(ev, [info("f1a5bed00")])
     with pytest.raises(jl.JtagLoadError) as e:
         jl.power_cycle("c64u", lock_factory=locks(ev), client_factory=client, down_timeout=5,
                        browser_factory=lambda h: FakeBrowser(ev), sleep=lambda s: None,
@@ -325,3 +367,52 @@ def test_payload_from_app_round_trip_and_refusals(tmp_path):
         bad.write_bytes(hdr + body)
         with pytest.raises(jl.JtagLoadError):
             jl.payload_from_app(bad, tmp_path / "x.bin")
+
+
+@pytest.mark.parametrize("browser_kw", [{"highlight": "Power OFF"}, {"items": ("Reset C64", "Power OFF")}])
+def test_power_cycle_never_presses_enter_off_target(env, browser_kw):
+    ev = env[0]
+    client = FakeClient(ev, [info("f1a5bed00")])
+    with pytest.raises(jl.JtagLoadError) as e:
+        jl.power_cycle("c64u", lock_factory=locks(ev), client_factory=client,
+                       browser_factory=lambda h: FakeBrowser(ev, **browser_kw), sleep=lambda s: None,
+                       log=lambda m: None)
+    assert e.value.stage == "menu" and ("press", "ENTER") not in ev and ("press", "ESC") in ev
+
+
+def test_loose_tdi_stops_before_fpga(env):
+    ev = env[0]
+    esp = FakeEsp(ev, tdi_ok=False)
+    with pytest.raises(jl.JtagLoadError) as e:
+        load(env, esp, FakeClient(ev, [info()]))
+    assert e.value.stage == "tdi" and esp.loaded is None
+
+
+def test_probe_with_loose_tdi_reads_no_user_id(env):
+    ev = env[0]
+    out = jl.read_ids("c64u", user_block=True, esp=FakeEsp(ev, tdi_ok=False), lock_factory=locks(ev),
+                      log=lambda m: None)
+    assert out["tdi_ok"] is False and "user_id" not in out and ("user_read_id",) not in ev
+
+
+def test_port_answering_as_something_else_refuses(env):
+    ev = env[0]
+    with pytest.raises(jl.JtagLoadError) as e:
+        load(env, FakeEsp(ev, ident="sniffer2"), FakeClient(ev, [info()]))
+    assert e.value.stage == "adapter"
+
+
+def test_missing_adapter_port_refuses(env, monkeypatch):
+    ev, bit, app, bsha, asha, tmp = env
+    monkeypatch.setattr(jl, "ADAPTERS", {UID: {"port": str(tmp / "absent"), "lock": "adapter"}})
+    with pytest.raises(jl.JtagLoadError) as e:
+        load(env, FakeEsp(ev), FakeClient(ev, [info()]))
+    assert e.value.stage == "adapter" and ev == []
+
+
+@pytest.mark.parametrize("h", ["", "abc", "zzzzzzzzz", None])
+def test_expect_hash_is_required_and_hex(env, h):
+    ev = env[0]
+    with pytest.raises(jl.JtagLoadError) as e:
+        load(env, FakeEsp(ev), FakeClient(ev, [info()]), expect_git_hash=h)
+    assert e.value.stage == "hash" and ev == []

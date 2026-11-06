@@ -48,15 +48,21 @@ class Storage:
 
 
 class Browser:
-    def __init__(self, ev, labels=("Run Update", "Rename", "Delete")):
-        self.ev, self.labels = ev, list(labels)
+    def __init__(self, ev, labels=("Run Update", "Rename", "Delete"), picks=None, highlight=None):
+        self.ev, self.labels, self.picks, self.highlight = ev, list(labels), picks, highlight
         self.sel = ""
+        outer = self
+
+        class Backend:
+            def close(self_):
+                outer.ev.append(("socket_close",))
+        self.backend = Backend()
 
     def go_to_directory(self, d):
         self.ev.append(("cd", d))
 
     def select_entry(self, prefix):
-        self.sel = prefix.upper() + ".U64"
+        self.sel = (self.picks or prefix).upper() + ".U64"
 
     def selected_text(self):
         return self.sel
@@ -64,14 +70,14 @@ class Browser:
     def open_context_menu(self):
         return self.labels
 
-    def choose_overlay_item(self, labels, label):
-        self.ev.append(("choose", label))
+    def select_framed_entry(self, label):
+        return (0, 0, 9, 9), (self.highlight or label) + "    "
 
     def press(self, k):
         self.ev.append(("press", k))
 
     def close(self):
-        pass
+        self.ev.append(("telnet_close",))
 
 
 def info(h="17995fd9c", uid="601A96", product="Ultimate 64 Elite"):
@@ -100,8 +106,8 @@ def test_success_sequence(env):
     rec = run(env, [info("218e36a52"), info("218e36a52"), None, info("17995fd9c")])
     assert rec["result"] == "ok"
     kinds = [e[0] for e in ev]
-    assert kinds == ["acquire", "put", "cd", "choose", "delete", "release"]
-    assert ev[1] == ("put", "/USB1/rr17995f.u64", sha) and ev[3] == ("choose", "Run Update")
+    assert kinds == ["acquire", "put", "cd", "press", "socket_close", "delete", "release"]
+    assert ev[1] == ("put", "/USB1/rr17995f.u64", sha) and ev[3] == ("press", "ENTER")
 
 
 def test_pinned_hash_refuses_before_lock(env):
@@ -130,7 +136,7 @@ def test_no_run_update_entry_aborts_and_cleans_up(env):
     with pytest.raises(jl.JtagLoadError) as e:
         run(env, [info()], browser=Browser(ev, labels=("Rename", "Delete")))
     assert e.value.stage == "menu"
-    assert ("delete", "/USB1/rr17995f.u64") in ev and not any(x[0] == "choose" for x in ev)
+    assert ("delete", "/USB1/rr17995f.u64") in ev and ("press", "ENTER") not in ev
 
 
 def test_same_hash_after_restart_is_not_success(env, monkeypatch):
@@ -140,3 +146,27 @@ def test_same_hash_after_restart_is_not_success(env, monkeypatch):
         run(env, [info("218e36a52"), None, info("218e36a52")], up_timeout=10,
             clock=lambda: t.__setitem__(0, t[0] + 1) or t[0])
     assert e.value.stage == "network"
+
+
+@pytest.mark.parametrize("bkw", [{"picks": "rr218e36"}, {"highlight": "Rename"}])
+def test_never_runs_another_file_or_entry(env, bkw):
+    ev = env[0]
+    with pytest.raises(jl.JtagLoadError) as e:
+        run(env, [info("218e36a52")], browser=Browser(ev, **bkw))
+    assert e.value.stage == "menu" and ("press", "ENTER") not in ev and ("delete", "/USB1/rr17995f.u64") in ev
+
+
+def test_hash_change_proves_restart_without_seeing_the_drop(env):
+    ev = env[0]
+    rec = run(env, [info("218e36a52"), info("17995fd9c")])
+    assert rec["result"] == "ok" and rec["rest_drop_seen"] is False
+
+
+def test_same_hash_needs_the_drop(env):
+    ev = env[0]
+    t = [0.0]
+    with pytest.raises(jl.JtagLoadError) as e:
+        run(env, [info("17995fd9c")], down_timeout=5, clock=lambda: t.__setitem__(0, t[0] + 1) or t[0])
+    assert e.value.stage == "run"
+    rec = run(env, [info("17995fd9c"), info("17995fd9c"), None, info("17995fd9c")])
+    assert rec["result"] == "ok" and rec["rest_drop_seen"] is True
