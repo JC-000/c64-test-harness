@@ -32,6 +32,7 @@ CLI::
     jtag_load.py load       HOST --bit F --bin F --bit-sha256 H --bin-sha256 H [--expect-hash G] [--dry-run]
     jtag_load.py power-cycle HOST [--expect-hash G] [--dry-run]
     jtag_load.py extract    APP OUT               DRAM image from a one-record ultimate.app; prints its SHA-256
+    jtag_load.py scan-u64e  HOST                  U64E (Cyclone V) chain: IDCODEs, IR length, SLD hub; read-only
 """
 from __future__ import annotations
 
@@ -56,8 +57,11 @@ ESP_JTAG_HOST = Path(os.environ.get("ESP_JTAG_DIR", "~/Documents/1541u-tools/esp
 UPSTREAM_TESTS = Path(os.environ.get("C64U_TESTS_DIR", "~/Documents/1541ultimate/tests")).expanduser()
 
 # One kit, wired to one device. Key: the device's /v1/info unique_id (the DeviceLock key is uid-<lowercase>).
+# JTAG_PORT overrides the port (the adapter is identified by its esp-jtag handshake, not by the name; CP2102 bridges
+# all report serial 0001, so the name says nothing). The adapter lock is keyed by the port actually used.
+_PORT = os.environ.get("JTAG_PORT", "/dev/cu.usbserial-0001")
 ADAPTERS = {
-    "5D2518": {"port": "/dev/cu.usbserial-0001", "lock": "jtag-adapter-cp2102-0001", "baud": "921600"},
+    "5D2518": {"port": _PORT, "lock": "jtag-adapter-" + os.path.basename(_PORT), "baud": "921600"},
 }
 PRODUCTS = ("C64 Ultimate", "Ultimate 64-II")   # U64 == 2 builds; the dev app reports "Ultimate 64-II"
 XC7A50T = 0x0362C093
@@ -286,6 +290,98 @@ def read_ids(host: str, *, user_block: bool = False, lock_timeout: float = 600, 
     return out
 
 
+# ---- U64E (Altera Cyclone V) chain scan: read-only, no load, no SVF ----------------------------------------------
+SCAN_ONLY = {"601A96"}                      # devices the scan is enabled for (never loaded with this kit)
+ALTERA_USER1, ALTERA_USER0, ALTERA_IR_LEN = 0x00E, 0x00C, 10
+
+
+def ir_length(jtag, flood: int = 64) -> int:
+    """Total IR length of the chain: flood Shift-IR with ones, then a single zero; count until it reaches TDO.
+
+    The zero is followed by ones again, so what Update-IR latches is all ones = BYPASS on every device: no
+    instruction other than BYPASS is ever selected (on Cyclone V a stray 0x001 would be PULSE_NCONFIG).
+    """
+    jtag.reset()
+    jtag.change_state("shift_ir")
+    bits = [1] * flood + [0] + [1] * flood
+    out = jtag.shift_register(bits)
+    jtag.go_idle()
+    jtag.reset()
+    for k in range(flood, len(out)):
+        if out[k] == 0:
+            return k - flood
+    return -1
+
+
+def idcodes(jtag, n: int = 4) -> list:
+    """The DR after Test-Logic-Reset is IDCODE (32 bits, LSB 1) or BYPASS (1 bit, 0) per device."""
+    jtag.reset()
+    v = jtag.read_dr(32 * n)
+    jtag.reset()
+    out, i = [], 0
+    while i < 32 * n:
+        if (v >> i) & 1:
+            code = (v >> i) & 0xFFFFFFFF
+            if code == 0xFFFFFFFF:
+                break
+            out.append(code)
+            i += 32
+        else:
+            i += 1
+    return out
+
+
+def sld_hub_info(jtag) -> dict:
+    """Altera SLD hub enumeration (as Quartus/jtagconfig and OpenOCD's or1k vjtag code do): IR USER1 with a zero
+    virtual IR (hub address 0, HUB_INFO), then IR USER0 and eight 4-bit DR reads per 32-bit word, LSB nibble first:
+    the hub word, then one word per node. Read-only on the user logic. Single-device chain assumed (checked first)."""
+    def word():
+        w = 0
+        for i in range(8):
+            w |= (jtag.read_dr(4) & 0xF) << (4 * i)
+        return w
+    jtag.reset()
+    jtag.write_ir(ALTERA_USER1, ALTERA_IR_LEN)
+    jtag.write_dr(0, 64)
+    jtag.write_ir(ALTERA_USER0, ALTERA_IR_LEN)
+    hub = word()
+    info = {"hub_raw": f"{hub:08x}", "vir_width": hub & 0xFF, "manufacturer": f"{(hub >> 8) & 0x7FF:03x}",
+            "nodes": (hub >> 19) & 0xFF, "hub_version": (hub >> 27) & 0x1F, "node_list": []}
+    if info["manufacturer"] == "06e" and 0 < info["nodes"] <= 16:
+        for _ in range(info["nodes"]):
+            n = word()
+            info["node_list"].append({"raw": f"{n:08x}", "instance": n & 0xFF, "manufacturer": f"{(n >> 8) & 0x7FF:03x}",
+                                      "node_id": (n >> 19) & 0xFF, "version": (n >> 27) & 0x1F})
+    jtag.reset()
+    jtag.write_ir(0x3FF, ALTERA_IR_LEN)    # leave BYPASS selected
+    jtag.reset()
+    return info
+
+
+def scan_u64e(host: str, *, lock_timeout: float = 600, esp=None, lock_factory=DeviceLock, log=_log) -> dict:
+    """Read-only chain scan of the U64E FPGA over the ESP32 adapter: IDCODEs, IR length, SLD hub and nodes."""
+    esp = esp or esp_module()
+    key = normalize_device_host(host)
+    uid = key[4:].upper() if key.startswith("uid-") else None
+    if uid not in SCAN_ONLY:
+        raise JtagLoadError("binding", f"{host}: the chain scan is enabled only for {sorted(SCAN_ONLY)}")
+    adapter = {"port": _PORT, "lock": "jtag-adapter-" + os.path.basename(_PORT), "baud": "921600"}
+    with _Locked(host, adapter, lock_timeout, lock_factory):
+        link, jtag = _open(esp, adapter)
+        try:
+            out = {"idcodes": [f"{c:08x}" for c in idcodes(jtag)], "ir_length": ir_length(jtag)}
+            altera = [c for c in out["idcodes"] if c.endswith("0dd")]
+            out["altera"] = bool(altera)
+            if len(out["idcodes"]) == 1 and altera and out["ir_length"] == ALTERA_IR_LEN:
+                out["sld_hub"] = sld_hub_info(jtag)
+            jtag.sync()
+        finally:
+            jtag.close()
+            link.ser.close()
+    log(f"U64E chain scan: {out}")
+    return out
+
+
 def jtag_load(host: str, bit, app, *, bit_sha256: str, app_sha256: str, expect_git_hash: str,
               lock_timeout: float = 600, net_timeout: float = 180, record_path=None, dry_run: bool = False,
               esp=None, lock_factory=DeviceLock, client_factory=_client, log=_log) -> dict:
@@ -469,7 +565,7 @@ def _telnet_browser(host: str):
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("idcode", "probe", "load", "power-cycle"):
+    for name in ("idcode", "probe", "load", "power-cycle", "scan-u64e"):
         p = sub.add_parser(name)
         p.add_argument("host")
         p.add_argument("--lock-timeout", type=float, default=600)
@@ -492,7 +588,9 @@ def main(argv=None) -> int:
         print(payload_from_app(Path(a.app), Path(a.out)))
         return 0
     try:
-        if a.cmd in ("idcode", "probe"):
+        if a.cmd == "scan-u64e":
+            out = scan_u64e(a.host, lock_timeout=a.lock_timeout)
+        elif a.cmd in ("idcode", "probe"):
             out = read_ids(a.host, user_block=a.cmd == "probe", lock_timeout=a.lock_timeout)
         elif a.cmd == "load":
             out = jtag_load(a.host, a.bit, a.bin, bit_sha256=a.bit_sha256, app_sha256=a.bin_sha256,

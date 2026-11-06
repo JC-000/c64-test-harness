@@ -437,3 +437,78 @@ def test_rehearsal_never_presses_enter_on_the_item(env):
     jl.rehearse_power_cycle("c64u", lock_factory=locks(ev), client_factory=FakeClient(ev, [info()]),
                             browser_factory=lambda h: FakeBrowser(ev))
     assert ("category", "C64 Machine") in ev and ("press", "ENTER") not in ev and ("press", "ESC") in ev
+
+
+class CycloneTap:
+    """One Cyclone V-like device: 10-bit IR, IDCODE after reset, an SLD hub behind USER1/USER0."""
+    IDCODE_IR = 0x006
+
+    def __init__(self, idcode=0x02B050DD, hub=0x0008_6E08, nodes=(0x0010_6E00,)):
+        self.idcode, self.L = idcode, 10
+        self.words = [hub, *nodes]
+        self.latched = []          # every IR value that reached Update-IR
+        self.reset()
+
+    def reset(self):
+        self.ir, self.shifting_ir, self.ptr = self.IDCODE_IR, False, 0
+        self.tdi = 0
+
+    def change_state(self, name):
+        if name == "shift_ir":
+            self.shifting_ir, self.reg = True, 0b01
+
+    def shift_register(self, bits):
+        out = []
+        for b in bits:
+            out.append(self.reg & 1)
+            self.reg = (self.reg >> 1) | (b << (self.L - 1))
+        return out
+
+    def go_idle(self):
+        if self.shifting_ir:
+            self.ir = self.reg
+            self.latched.append(self.reg)
+            self.shifting_ir = False
+
+    def write_ir(self, v, n):
+        assert n == self.L
+        self.ir = v
+        self.latched.append(v)
+
+    def write_dr(self, v, n):
+        if self.ir == 0x00E and v == 0:
+            self.ptr = 0
+
+    def read_dr(self, n):
+        if self.ir == self.IDCODE_IR:
+            return self.idcode
+        if self.ir == 0x00C:
+            w = self.words[self.ptr // 8] if self.ptr // 8 < len(self.words) else 0
+            nib = (w >> (4 * (self.ptr % 8))) & 0xF
+            self.ptr += 1
+            return nib
+        return 0
+
+
+def test_ir_length_latches_only_bypass():
+    t = CycloneTap()
+    assert jl.ir_length(t) == 10
+    assert t.latched == [0x3FF]      # never a zero-ish IR such as PULSE_NCONFIG (0x001)
+
+
+def test_idcodes_single_device():
+    assert jl.idcodes(CycloneTap()) == [0x02B050DD]
+
+
+def test_sld_hub_info_and_nodes():
+    t = CycloneTap()
+    info = jl.sld_hub_info(t)
+    assert info["manufacturer"] == "06e" and info["nodes"] == 1 and info["vir_width"] == 8
+    assert info["node_list"][0]["node_id"] == 2 and info["node_list"][0]["manufacturer"] == "06e"
+    assert set(t.latched) <= {0x00E, 0x00C, 0x3FF} and t.latched[-1] == 0x3FF
+
+
+def test_scan_refuses_the_c64u(env):
+    with pytest.raises(jl.JtagLoadError) as e:
+        jl.scan_u64e("c64u", esp=FakeEsp(env[0]), lock_factory=locks(env[0]))
+    assert e.value.stage == "binding"
