@@ -105,12 +105,17 @@ def ram_run(host: str, image, *, sha256: str, expect_git_hash: str, volume: str 
             # Proof of a restart: the hash changes, or (same hash) REST drops and returns.
             same = jl.hash_matches(pre.get("git_commit_hash"), jl.check_git_hash(expect_git_hash))
             end = clock() + down_timeout
-            dropped = False
+            dropped, misses = False, 0
             while clock() < end:
                 info = jl.try_info(host, client_factory)
                 if info is None:
-                    dropped = True
-                    break
+                    misses += 1
+                    if misses >= 3:         # sustained, not one missed poll while the old app reads the file
+                        dropped = True
+                        break
+                    sleep(1.0)
+                    continue
+                misses = 0
                 if not same and jl.hash_matches(info.get("git_commit_hash"), expect_git_hash.lower()):
                     break
                 sleep(0.25)

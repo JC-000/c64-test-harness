@@ -224,9 +224,12 @@ class _Locked:
 
 
 def _held_by_lock_shell(host: str) -> bool:
-    """True when C64U_LOCK_PID is set and that process holds host's DeviceLock (locked.py); refuse a stale claim."""
+    """True when C64U_LOCK_PID is set for this host and that process holds its DeviceLock (locked.py)."""
     pid = os.environ.get("C64U_LOCK_PID")
     if not pid:
+        return False
+    shell_host = os.environ.get("C64U_LOCK_HOST")
+    if shell_host and normalize_device_host(shell_host) != normalize_device_host(host):
         return False
     from c64_test_harness.backends.device_lock import device_lock_holder
     h = device_lock_holder(host)
@@ -358,6 +361,8 @@ def power_cycle(host: str, *, expect_git_hash: str | None = None, lock_timeout: 
                 sleep=None, clock=None, log=_log) -> dict:
     """C64U regulator power cycle from the telnet menu: C64 Machine > Power Cycle (U64 == 2 only).
 
+    rehearse_power_cycle() walks the same path and leaves without ENTER.
+
     Firmware path: c64_subsys.cc MENU_C64_POWERCYCLE -> wifi_machine_reboot() -> u64ctrl cmd_reboot (regulators
     off, 2 s, on). The FPGA reconfigures from flash, so this is also the way back from a JTAG-loaded image.
     """
@@ -392,7 +397,7 @@ def _label(x: str) -> str:
     return x.split("||", 1)[0].strip()
 
 
-def activate_task_item(b, category: str, item: str) -> None:
+def activate_task_item(b, category: str, item: str, rehearse: bool = False) -> None:
     """Task menu > category > item, with the item's highlight READ BACK before ENTER.
 
     The upstream choose_overlay_item quick-seeks by first letter, and in "C64 Machine" that lands on "Power OFF"
@@ -415,6 +420,8 @@ def activate_task_item(b, category: str, item: str) -> None:
         _frame, text = b.select_framed_entry(item)
         if _label(text.split("  ")[0]) != item:
             raise JtagLoadError("menu", f"highlight reads {text!r}, not {item!r}")
+        if rehearse:                # navigation proven; leave without activating (the finally ESCapes)
+            return
         b.press("ENTER")
         done = True
     finally:
@@ -433,6 +440,15 @@ def activate_task_item(b, category: str, item: str) -> None:
                 b.close()
             except Exception:
                 pass
+
+
+def rehearse_power_cycle(host: str, *, lock_timeout: float = 600, lock_factory=DeviceLock, client_factory=_client,
+                         browser_factory=None) -> None:
+    """Navigate to the highlighted C64 Machine > Power Cycle and ESCape: proves the menu path, presses no ENTER on it."""
+    uid = bound_uid(host)
+    with _Locked(host, {}, lock_timeout, lock_factory):
+        check_identity(client_factory(host).get_info(), uid)
+        activate_task_item((browser_factory or _telnet_browser)(host), "C64 Machine", "Power Cycle", rehearse=True)
 
 
 def _telnet_imports():

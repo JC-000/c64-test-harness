@@ -416,3 +416,24 @@ def test_expect_hash_is_required_and_hex(env, h):
     with pytest.raises(jl.JtagLoadError) as e:
         load(env, FakeEsp(ev), FakeClient(ev, [info()]), expect_git_hash=h)
     assert e.value.stage == "hash" and ev == []
+
+
+def test_lock_shell_holder_is_honoured_and_a_stale_claim_refused(env, monkeypatch):
+    import c64_test_harness.backends.device_lock as dl
+    ev = env[0]
+    monkeypatch.setenv("C64U_LOCK_PID", "4242")
+    monkeypatch.setenv("C64U_LOCK_HOST", "c64u")
+    monkeypatch.setattr(dl, "device_lock_holder", lambda h: {"pid": 4242})
+    load(env, FakeEsp(ev), FakeClient(ev, [info()]))
+    assert ("acquire", "device") not in ev and ("acquire", "adapter") in ev
+    monkeypatch.setattr(dl, "device_lock_holder", lambda h: {"pid": 1})
+    with pytest.raises(jl.JtagLoadError) as e:
+        load(env, FakeEsp(ev), FakeClient(ev, [info()]))
+    assert e.value.stage == "lock"
+
+
+def test_rehearsal_never_presses_enter_on_the_item(env):
+    ev = env[0]
+    jl.rehearse_power_cycle("c64u", lock_factory=locks(ev), client_factory=FakeClient(ev, [info()]),
+                            browser_factory=lambda h: FakeBrowser(ev))
+    assert ("category", "C64 Machine") in ev and ("press", "ENTER") not in ev and ("press", "ESC") in ev

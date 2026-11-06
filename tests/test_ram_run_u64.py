@@ -168,5 +168,10 @@ def test_same_hash_needs_the_drop(env):
     with pytest.raises(jl.JtagLoadError) as e:
         run(env, [info("17995fd9c")], down_timeout=5, clock=lambda: t.__setitem__(0, t[0] + 1) or t[0])
     assert e.value.stage == "run"
-    rec = run(env, [info("17995fd9c"), info("17995fd9c"), None, info("17995fd9c")])
+    ev.clear()
+    t[0] = 0.0
+    with pytest.raises(jl.JtagLoadError):      # one missed poll is not a restart
+        run(env, [info("17995fd9c"), info("17995fd9c"), None, info("17995fd9c")], down_timeout=20,
+            clock=lambda: t.__setitem__(0, t[0] + 1) or t[0])
+    rec = run(env, [info("17995fd9c"), info("17995fd9c"), None, None, None, info("17995fd9c")])
     assert rec["result"] == "ok" and rec["rest_drop_seen"] is True
