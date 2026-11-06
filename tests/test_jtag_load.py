@@ -294,7 +294,23 @@ class FakeBrowser:
                 outer.ev.append(("socket_close",))
         self.backend = Backend()
 
+    screens = None             # list of screen texts returned in turn (last repeats); None = plain browser
+    empty_first = False
+
+    def screen(self):
+        if not self.screens:
+            return "/ SD USB1 Temp"
+        return self.screens.pop(0) if len(self.screens) > 1 else self.screens[0]
+
+    def press_popup_button(self, key):
+        self.ev.append(("popup", key))
+        if self.screens:
+            self.screens = ["/ SD USB1 Temp"]
+
     def open_task_menu(self):
+        if self.empty_first:
+            self.empty_first = False
+            return []
         return ["C64 Machine", "Developer", "Configuration"]
 
     def rows(self):
@@ -512,3 +528,44 @@ def test_scan_refuses_the_c64u(env):
     with pytest.raises(jl.JtagLoadError) as e:
         jl.scan_u64e("c64u", esp=FakeEsp(env[0]), lock_factory=locks(env[0]))
     assert e.value.stage == "binding"
+
+
+SID_POPUP = "+--------------------------------+\n| SID changed. Please review settings |\n|              Ok              |\n+---------+"
+
+
+def test_power_cycle_answers_the_sid_popup_first(env):
+    ev = env[0]
+    b = FakeBrowser(ev)
+    b.screens = [SID_POPUP]
+    client = FakeClient(ev, [info("f1a5bed00"), info("f1a5bed00"), None, None, info("f1a5bed00")])
+    jl.power_cycle("c64u", expect_git_hash="f1a5bed00", lock_factory=locks(ev), client_factory=client,
+                   browser_factory=lambda h: b, sleep=lambda s: None, log=lambda m: None)
+    seq = [e for e in ev if e[0] in ("popup", "category", "press")]
+    assert seq[0] == ("popup", "o") and ("press", "ENTER") in seq
+
+
+def test_empty_task_menu_is_retried_once(env):
+    ev = env[0]
+    b = FakeBrowser(ev)
+    b.empty_first = True
+    jl.rehearse_power_cycle("c64u", lock_factory=locks(ev), client_factory=FakeClient(ev, [info()]),
+                            browser_factory=lambda h: b)
+    assert ("category", "C64 Machine") in ev and ("press", "ENTER") not in ev
+
+
+def test_question_popups_are_never_answered():
+    class B:
+        def screen(self):
+            return "SID changed? Save changes to Flash?  Yes  No"
+
+        def press_popup_button(self, k):
+            raise AssertionError("pressed")
+    assert jl.clear_message_popups(B()) == 0
+
+
+def test_power_cycle_from_a_jtag_image_is_proven_by_the_hash_change(env):
+    ev = env[0]
+    client = FakeClient(ev, [info("42c032f42"), info("6970255d1")])     # no REST drop observed at all
+    rec = jl.power_cycle("c64u", expect_git_hash="6970255d1", lock_factory=locks(ev), client_factory=client,
+                         browser_factory=lambda h: FakeBrowser(ev), sleep=lambda s: None, log=lambda m: None)
+    assert rec["result"] == "ok" and rec["info"]["git_commit_hash"] == "6970255d1"

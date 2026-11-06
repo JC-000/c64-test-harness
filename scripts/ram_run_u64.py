@@ -73,6 +73,7 @@ def ram_run(host: str, image, *, sha256: str, expect_git_hash: str, volume: str 
             b = browser_factory(host)
             done = False
             try:
+                jl.clear_message_popups(b)
                 b.go_to_directory(volume)
                 b.select_entry(stem)
                 if stem.lower() not in b.selected_text().lower():

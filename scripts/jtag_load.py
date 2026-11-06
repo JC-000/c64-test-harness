@@ -484,11 +484,16 @@ def power_cycle(host: str, *, expect_git_hash: str | None = None, lock_timeout: 
         b = browser_factory(host)
         log(f"telnet menu: C64 Machine > Power Cycle on {uid}")
         activate_task_item(b, "C64 Machine", "Power Cycle")
-        end = clock() + down_timeout
-        while try_info(host, client_factory) is not None:
-            if clock() > end:
-                raise JtagLoadError("power", f"REST still answers {down_timeout:.0f} s after Power Cycle")
-            sleep(0.5)
+        # Proof of the cycle: the hash changes to the flashed one (a JTAG image never survives a power cycle). Only
+        # when the hash before already equals the expected one is a REST drop needed, and one missed poll is
+        # enough, since the action itself was confirmed on screen. The REST gap of a C64U cycle is ~12 s.
+        same = expect_git_hash is None or hash_matches(pre.get("git_commit_hash"), check_git_hash(expect_git_hash))
+        if same:
+            end = clock() + down_timeout
+            while try_info(host, client_factory) is not None:
+                if clock() > end:
+                    raise JtagLoadError("power", f"REST still answers {down_timeout:.0f} s after Power Cycle")
+                sleep(0.5)
         rec["info"] = wait_info(host, uid, expect_git_hash, up_timeout, client_factory, sleep, clock)
         rec["result"] = "ok"
         return rec
@@ -496,6 +501,30 @@ def power_cycle(host: str, *, expect_git_hash: str | None = None, lock_timeout: 
 
 def _label(x: str) -> str:
     return x.split("||", 1)[0].strip()
+
+
+# Message popups with only an Ok button that a fresh boot can leave for the first UI session (UserInterface::
+# postMessage). "SID changed. Please review settings" comes from u64_config.cc whenever the SID store is stale, e.g. after a
+# config reset or on the first boot of a JTAG/RAM-loaded app; over telnet it hides the menus until answered. Only
+# these are answered: a question popup (Yes/No, "Save changes to Flash?") is never touched.
+KNOWN_MESSAGE_POPUPS = ("SID changed", "Please review settings")
+
+
+def clear_message_popups(b, attempts: int = 3, log=None) -> int:
+    """Answer known Ok-only message popups with 'o' (UIPopup's Ok hotkey). Returns how many were answered."""
+    n = 0
+    for _ in range(attempts):
+        try:
+            scr = b.screen()
+        except Exception:
+            return n
+        if not any(m in scr for m in KNOWN_MESSAGE_POPUPS) or ("Yes" in scr and "No" in scr):
+            return n
+        if log:
+            log("telnet: answering a message popup with Ok: " + next(m for m in KNOWN_MESSAGE_POPUPS if m in scr))
+        b.press_popup_button("o")
+        n += 1
+    return n
 
 
 def activate_task_item(b, category: str, item: str, rehearse: bool = False) -> None:
@@ -510,7 +539,12 @@ def activate_task_item(b, category: str, item: str, rehearse: bool = False) -> N
     """
     done = False
     try:
+        clear_message_popups(b)
         cats = b.open_task_menu()
+        if not cats:                    # a popup posted while we looked, or a lost key: answer it and retry once
+            b.press("ESC")
+            clear_message_popups(b)
+            cats = b.open_task_menu()
         if category not in [_label(c) for c in cats]:
             raise JtagLoadError("menu", f"task menu has no {category!r}: {cats}")
         before = b.rows()
