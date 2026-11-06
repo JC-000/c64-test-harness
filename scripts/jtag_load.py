@@ -49,7 +49,8 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent / "src"))
+# C64_HARNESS_SRC: run against another harness tree (e.g. a lane's branch with extra client features); default = ours.
+sys.path.insert(0, os.environ.get("C64_HARNESS_SRC") or str(HERE.parent / "src"))
 
 from c64_test_harness.backends.device_lock import (  # noqa: E402
     DeviceLock, normalize_device_host, resolve_lock_timeout)
