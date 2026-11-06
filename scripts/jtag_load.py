@@ -358,7 +358,8 @@ def sld_hub_info(jtag) -> dict:
     return info
 
 
-def scan_u64e(host: str, *, lock_timeout: float = 600, esp=None, lock_factory=DeviceLock, log=_log) -> dict:
+def scan_u64e(host: str, *, lock_timeout: float = 600, esp=None, lock_factory=DeviceLock, client_factory=_client,
+              log=_log) -> dict:
     """Read-only chain scan of the U64E FPGA over the ESP32 adapter: IDCODEs, IR length, SLD hub and nodes."""
     esp = esp or esp_module()
     key = normalize_device_host(host)
@@ -367,6 +368,9 @@ def scan_u64e(host: str, *, lock_timeout: float = 600, esp=None, lock_factory=De
         raise JtagLoadError("binding", f"{host}: the chain scan is enabled only for {sorted(SCAN_ONLY)}")
     adapter = {"port": _PORT, "lock": "jtag-adapter-" + os.path.basename(_PORT), "baud": "921600"}
     with _Locked(host, adapter, lock_timeout, lock_factory):
+        info = try_info(host, client_factory)      # never drive pins into an unpowered FPGA (back-feed)
+        if not info or str(info.get("unique_id", "")).upper() != uid:
+            raise JtagLoadError("power", f"{host} does not answer as {uid}: is the U64E on? Pins not driven.")
         link, jtag = _open(esp, adapter)
         try:
             out = {"idcodes": [f"{c:08x}" for c in idcodes(jtag)], "ir_length": ir_length(jtag)}
