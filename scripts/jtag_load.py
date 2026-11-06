@@ -31,6 +31,7 @@ CLI::
     jtag_load.py probe      HOST                  IDCODE + user-block ID of the RUNNING bitstream, no load
     jtag_load.py load       HOST --bit F --bin F --bit-sha256 H --bin-sha256 H [--expect-hash G] [--dry-run]
     jtag_load.py power-cycle HOST [--expect-hash G] [--dry-run]
+    jtag_load.py extract    APP OUT               DRAM image from a one-record ultimate.app; prints its SHA-256
 """
 from __future__ import annotations
 
@@ -111,6 +112,23 @@ def pin_files(bit: Path, app: Path, bit_sha256: str, app_sha256: str, workdir: P
             raise JtagLoadError("hash", f"{src}: SHA-256 {got} is not the pinned {want.lower()}")
         out.append(dst)
     return out[0], out[1]
+
+
+def payload_from_app(app: Path, out: Path) -> str:
+    """Write the DRAM image of a single-record ``ultimate.app`` (hex2bin records {load, length, start}) to out.
+
+    This is byte for byte what the flash bootloader copies, which ``ultimate.bin`` (objcopy) is not quite: objcopy
+    fills alignment gaps with 0x00 where hex2bin writes 0xFF. Refuses anything but one record loaded at 0x30000.
+    Returns the SHA-256 of out.
+    """
+    import struct
+    data = Path(app).read_bytes()
+    load, length, start = struct.unpack("<3I", data[:12])
+    if load != 0x30000 or start != 0x30000 or len(data) != 12 + length:
+        raise JtagLoadError("app", f"{app}: not one record at 0x30000 (load {load:#x}, start {start:#x}, "
+                            f"length {length:#x}, file {len(data) - 12:#x} after the header)")
+    Path(out).write_bytes(data[12:])
+    return sha256(Path(out))
 
 
 def _client(host: str, timeout: float = 5.0):
@@ -348,7 +366,13 @@ def main(argv=None) -> int:
             p.add_argument("--bit-sha256", required=True)
             p.add_argument("--bin-sha256", required=True)
             p.add_argument("--net-timeout", type=float, default=180)
+    ex = sub.add_parser("extract")
+    ex.add_argument("app")
+    ex.add_argument("out")
     a = ap.parse_args(argv)
+    if a.cmd == "extract":
+        print(payload_from_app(Path(a.app), Path(a.out)))
+        return 0
     try:
         if a.cmd in ("idcode", "probe"):
             out = read_ids(a.host, user_block=a.cmd == "probe", lock_timeout=a.lock_timeout)

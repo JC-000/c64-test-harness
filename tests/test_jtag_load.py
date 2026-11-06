@@ -310,3 +310,18 @@ def test_other_device_answering_after_load_is_an_identity_failure(env):
     with pytest.raises(jl.JtagLoadError) as e:
         load(env, FakeEsp(ev), FakeClient(ev, [None, info("abc123def", uid="601A96")]))
     assert e.value.stage == "identity"
+
+
+def test_payload_from_app_round_trip_and_refusals(tmp_path):
+    import struct
+    body = bytes(range(256)) * 4
+    good = tmp_path / "u.app"
+    good.write_bytes(struct.pack("<3I", 0x30000, len(body), 0x30000) + body)
+    out = tmp_path / "u.bin"
+    assert jl.payload_from_app(good, out) == jl.sha256(out) and out.read_bytes() == body
+    for hdr in (struct.pack("<3I", 0x0, len(body), 0x234),            # a U64E (Nios) app
+                struct.pack("<3I", 0x30000, len(body) - 8, 0x30000)):  # a second record follows
+        bad = tmp_path / "bad.app"
+        bad.write_bytes(hdr + body)
+        with pytest.raises(jl.JtagLoadError):
+            jl.payload_from_app(bad, tmp_path / "x.bin")
