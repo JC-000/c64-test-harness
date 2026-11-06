@@ -143,15 +143,15 @@ def try_info(host: str, client_factory=_client) -> dict | None:
         return None
 
 
-def check_identity(info: dict, uid: str) -> None:
+def check_identity(info: dict, uid: str, products=PRODUCTS) -> None:
     if str(info.get("unique_id", "")).upper() != uid:
         raise JtagLoadError("identity", f"device answers with unique_id {info.get('unique_id')!r}, bound is {uid}")
-    if info.get("product") not in PRODUCTS:
+    if info.get("product") not in products:
         raise JtagLoadError("identity", f"product {info.get('product')!r} is not a C64U-class board")
 
 
 def wait_info(host: str, uid: str, expect_git_hash: str | None, timeout: float, client_factory=_client,
-              sleep=None, clock=None) -> dict:
+              sleep=None, clock=None, products=PRODUCTS) -> dict:
     """Poll /v1/info until it answers with the bound unique_id (and the expected hash, if given)."""
     sleep, clock = sleep or time.sleep, clock or time.monotonic
     end = clock() + timeout
@@ -160,7 +160,7 @@ def wait_info(host: str, uid: str, expect_git_hash: str | None, timeout: float, 
         info = try_info(host, client_factory)
         if info is not None:
             last = info
-            check_identity(info, uid)
+            check_identity(info, uid, products)
             if expect_git_hash is None or str(info.get("git_commit_hash", "")).startswith(expect_git_hash[:9]):
                 return info
         sleep(2.0)
