@@ -152,8 +152,8 @@ def test_dry_run_reads_the_plug_only(env):
 
 def test_binding_from_devices_toml(tmp_path):
     p = tmp_path / "devices.toml"
-    p.write_text('[devices.5d2518]\nhosts = ["10.43.23.26"]\noutlet = "http://10.43.23.200"\noutlet_kind = "tasmota"\n')
-    assert po.outlet_binding("5D2518", p) == {"outlet": "http://10.43.23.200", "outlet_kind": "tasmota"}
+    p.write_text('[devices.5d2518]\nhosts = ["192.0.2.26"]\noutlet = "http://192.0.2.200"\noutlet_kind = "tasmota"\n')
+    assert po.outlet_binding("5D2518", p) == {"outlet": "http://192.0.2.200", "outlet_kind": "tasmota"}
     with pytest.raises(po.OutletError):
         po.outlet_binding("601A96", p)
 

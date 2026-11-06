@@ -8,7 +8,7 @@ Binding, in ~/.config/c64-test-harness/devices.toml under the device's table:
 
     [devices.5d2518]
     hosts = [...]
-    outlet = "http://10.43.23.x"        # the plug's address (static lease)
+    outlet = "http://<plug address>"    # static DHCP lease
     outlet_kind = "shelly-gen2"         # or "tasmota"
 
 Sequence (Chris's, from the #1042 review: graceful poweroff, then 10 s with the outlet off), all under the device's

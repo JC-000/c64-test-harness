@@ -120,7 +120,7 @@ def test_pinned_hash_refuses_before_lock(env):
 def test_c64u_is_not_enabled(env):
     ev, img, sha = env
     with pytest.raises(jl.JtagLoadError) as e:
-        rr.ram_run("10.43.23.26", img, sha256=sha, expect_git_hash="x", storage=Storage(ev))
+        rr.ram_run("192.0.2.26", img, sha256=sha, expect_git_hash="x", storage=Storage(ev))
     assert e.value.stage == "binding"
 
 

@@ -13,10 +13,10 @@ Library use (a test script looping over N images)::
 
     from jtag_load import jtag_load, power_cycle
     for img in images:
-        rec = jtag_load("10.43.23.26", img.bit, img.bin, bit_sha256=img.bit_sha, app_sha256=img.bin_sha,
+        rec = jtag_load(C64U_HOST, img.bit, img.bin, bit_sha256=img.bit_sha, app_sha256=img.bin_sha,
                         expect_git_hash=img.hash, record_path="runs/loads.jsonl")
         run_tests(...)
-    power_cycle("10.43.23.26", expect_git_hash=FLASHED_HASH)   # back to the flashed image
+    power_cycle(C64U_HOST, expect_git_hash=FLASHED_HASH)   # back to the flashed image
 
 Each call takes the device's DeviceLock (``allow_nested=True``, so a caller may hold it across the loop) and then
 the adapter's own lock. Safety gates, in order: device bound to an adapter; file SHA-256 equal to the caller's
@@ -51,7 +51,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "src"))
 
-from c64_test_harness.backends.device_lock import DeviceLock, normalize_device_host  # noqa: E402
+from c64_test_harness.backends.device_lock import (  # noqa: E402
+    DeviceLock, normalize_device_host, resolve_lock_timeout)
 
 ESP_JTAG_HOST = Path(os.environ.get("ESP_JTAG_DIR", "~/Documents/1541u-tools/esp-jtag")).expanduser() / "host"
 UPSTREAM_TESTS = Path(os.environ.get("C64U_TESTS_DIR", "~/Documents/1541ultimate/tests")).expanduser()
@@ -213,7 +214,7 @@ class _Locked:
             self.dev = None
         elif not self.dev.acquire(timeout=self.timeout):
             raise JtagLoadError("lock", f"DeviceLock({self.host}) not acquired within {self.timeout:.0f} s")
-        if self.ad is not None and not self.ad.acquire(timeout=30):
+        if self.ad is not None and not self.ad.acquire(timeout=resolve_lock_timeout(None, default=30.0)):
             if self.dev is not None:
                 self.dev.release()
             raise JtagLoadError("lock", "the JTAG adapter is in use by another process")
