@@ -978,6 +978,43 @@ def storage_mkdir(
     return True
 
 
+def storage_rename_file(
+    host: str, src: str, dst: str, *, port: int = DEFAULT_FTP_PORT,
+    timeout: float = DEFAULT_STORAGE_FTP_TIMEOUT,
+) -> None:
+    """Move/rename the file *src* to *dst* on the same volume (FTP RNFR/RNTO; no data is copied).
+
+    Both paths obey the write rules (no /Temp, no /Flash). *dst*'s parent must exist and *dst* must not.
+    The result is checked: *dst* is a file afterwards and *src* is gone.
+
+    :raises FileNotFoundError: *src* is absent, or *dst*'s parent is missing.
+    :raises IsADirectoryError: *src* is a directory.
+    :raises FileExistsError: *dst* exists.
+    :raises ValueError: the two paths are on different volumes.
+    """
+    sparts = _check_path(src, write=True)
+    dparts = _check_path(dst, write=True)
+    if sparts[0].lower() != dparts[0].lower():
+        raise ValueError(f"rename across volumes ({src} -> {dst}) is not supported")
+    with _session(host, f"storage_rename_file({src!r}, {dst!r})", port, timeout) as ftp:
+        spath = _resolve_volume(ftp, host, sparts)
+        dpath = _resolve_volume(ftp, host, dparts)
+        kind = _walk(ftp, spath)
+        if kind == "dir":
+            raise IsADirectoryError(f"{spath} on {host} is a directory")
+        if kind is None:
+            raise FileNotFoundError(f"{spath} does not exist on {host}")
+        if _walk(ftp, dpath) is not None:
+            raise FileExistsError(f"{dpath} already exists on {host}")
+        parent = dpath.rsplit("/", 1)[0]
+        if _walk(ftp, parent) != "dir":
+            raise FileNotFoundError(f"{parent} is not a directory on {host}")
+        ftp.rename(spath, dpath)
+        if _walk(ftp, dpath) != "file" or _walk(ftp, spath) is not None:
+            raise Ultimate64StorageError(f"rename {spath} -> {dpath} on {host} did not take")
+    _log.info("storage_rename_file: %s -> %s on %s", spath, dpath, host)
+
+
 def storage_delete_file(
     host: str, path: str, *, missing_ok: bool = False, port: int = DEFAULT_FTP_PORT,
     timeout: float = DEFAULT_STORAGE_FTP_TIMEOUT,
