@@ -43,6 +43,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import sys
 import tempfile
 import time
@@ -390,15 +391,22 @@ def scan_u64e(host: str, *, lock_timeout: float = 600, esp=None, lock_factory=De
 
 def jtag_load(host: str, bit, app, *, bit_sha256: str, app_sha256: str, expect_git_hash: str,
               lock_timeout: float = 600, net_timeout: float = 180, record_path=None, dry_run: bool = False,
-              esp=None, lock_factory=DeviceLock, client_factory=_client, log=_log) -> dict:
-    """Load bit + app into the bound C64U over JTAG; return a record of what was loaded and what came back."""
+              esp=None, lock_factory=DeviceLock, client_factory=_client, log=_log, cold: bool | None = None) -> dict:
+    """Load bit + app into the bound C64U over JTAG; return a record of what was loaded and what came back.
+
+    cold (DEFAULT, standing rule 2026-11-08): the CPU is held in reset from right after the FPGA load until the app
+    and the boot magic are written, so the flashed app never runs first. The old "warm" path (Recover.run: the CPU
+    runs the flashed app for 1 s, then reset/upload/unreset) left stale neorv32 I-cache lines that the new image then
+    executed (C64U boot panics that were loader artifacts). Warm only with cold=False or JTAG_LOAD_WARM=1."""
+    if cold is None:
+        cold = os.environ.get("JTAG_LOAD_WARM") != "1"
     esp = esp or esp_module()
     uid = bound_uid(host)
     adapter = ADAPTERS[uid]
     expect_git_hash = check_git_hash(expect_git_hash)
     rec = {"t0": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": host, "uid": uid, "adapter": adapter["port"],
            "bit": str(bit), "bin": str(app), "bit_sha256": bit_sha256.lower(), "bin_sha256": app_sha256.lower(),
-           "expect_git_hash": expect_git_hash, "dry_run": dry_run}
+           "expect_git_hash": expect_git_hash, "dry_run": dry_run, "cold": cold}
     try:
         with tempfile.TemporaryDirectory(prefix="jtag_load-") as td:
             pbit, papp = pin_files(Path(bit), Path(app), bit_sha256, app_sha256, Path(td))
@@ -430,7 +438,18 @@ def jtag_load(host: str, bit, app, *, bit_sha256: str, app_sha256: str, expect_g
                         if not bypass_ok(jtag):
                             raise JtagLoadError("tdi", "TDI->TDO through BYPASS failed (P5 pin 9 loose?); "
                                                 "nothing was loaded")
-                    loader.run(str(pbit), str(papp), idcode_ok=idcode_ok)
+                    if cold:                        # Recover.run without the 1 s warm run of the flashed app
+                        jtag.reset()
+                        idcode_ok(loader.read_id())
+                        loader.load_fpga(str(pbit))
+                        loader.user_set_outputs(0x80)                  # CPU in reset before it fetches anything
+                        loader.user_upload(str(papp), 0x30000)
+                        loader.user_write_memory(0xFFF8, struct.pack("<LL", 0x30000, 0x1571BABE))
+                        loader.user_set_outputs(0x00)                  # unreset to the boot loader
+                        loader.user_read_id()
+                    else:
+                        log("WARM load (JTAG_LOAD_WARM / cold=False): the flashed app runs 1 s first; stale I-cache risk")
+                        loader.run(str(pbit), str(papp), idcode_ok=idcode_ok)
                     jtag.link.drain()
                     rec["tck_cycles"] = getattr(jtag, "clock_count", None)
                 finally:

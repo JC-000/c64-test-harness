@@ -39,6 +39,7 @@ class FakeEsp:
                  ident="esp-jtag 0.1 esp32"):
         self.ev, self.live_idcode, self.bit_id, self.user_id = ev, live_idcode, bit_id, user_id
         self.tdi_ok, self.ident = tdi_ok, ident
+        self.steps = []                                  # the cold/warm load steps, kept out of ev
         self.loaded = None
         esp = self
 
@@ -93,9 +94,26 @@ class FakeEsp:
 
             def run(self_, bit, binary, sleep=None, idcode_ok=lambda i: None):
                 idcode_ok(esp.live_idcode)
+                esp.steps.append(("warm_run",))
                 esp.ev.append(("load_fpga_and_upload",))
                 esp.loaded = (bit, Path(bit).read_bytes(), binary, Path(binary).read_bytes())
                 self_.user_id = esp.user_id
+
+            # the cold path (default): jtag_load drives these steps itself
+            def load_fpga(self_, bit):
+                esp.steps.append(("load_fpga",))
+                self_._bit = bit
+
+            def user_set_outputs(self_, value):
+                esp.steps.append(("outputs", value))
+
+            def user_upload(self_, binary, addr):
+                esp.steps.append(("upload", addr))
+                esp.ev.append(("load_fpga_and_upload",))
+                esp.loaded = (self_._bit, Path(self_._bit).read_bytes(), binary, Path(binary).read_bytes())
+
+            def user_write_memory(self_, addr, buf):
+                esp.steps.append(("write", addr, bytes(buf)))
 
         self.Link, self.Jtag, self.Recover = Link, Jtag, Recover
 
@@ -173,7 +191,7 @@ def test_success_order_and_record(env):
     assert rec["result"] == "ok" and rec["user_id"] == "dead1541"
     names = [e[0] + (":" + e[1] if len(e) > 1 else "") for e in ev if e[0] != "get_info"]
     assert names == ["acquire:device", "acquire:adapter", "open:" + str(tmp / "cu.fake"), "load_fpga_and_upload",
-                     "pins_released", "ser_close", "release:adapter", "release:device"]
+                     "user_read_id", "pins_released", "ser_close", "release:adapter", "release:device"]
     line = json.loads(rec_path.read_text().splitlines()[-1])
     assert line["result"] == "ok" and line["bin_sha256"] == asha
 
@@ -569,3 +587,27 @@ def test_power_cycle_from_a_jtag_image_is_proven_by_the_hash_change(env):
     rec = jl.power_cycle("c64u", expect_git_hash="6970255d1", lock_factory=locks(ev), client_factory=client,
                          browser_factory=lambda h: FakeBrowser(ev), sleep=lambda s: None, log=lambda m: None)
     assert rec["result"] == "ok" and rec["info"]["git_commit_hash"] == "6970255d1"
+
+
+def test_cold_load_holds_reset_from_the_fpga_load_until_upload_and_magic(env, monkeypatch):
+    """Standing rule 2026-11-08: the CPU must never run the flashed app between the FPGA load and the upload
+    (stale neorv32 I-cache). Order: load_fpga, reset (0x80), upload to 0x30000, magic at 0xFFF8, unreset (0x00)."""
+    import struct
+    monkeypatch.delenv("JTAG_LOAD_WARM", raising=False)
+    ev = env[0]
+    esp = FakeEsp(ev)
+    rec = load(env, esp, FakeClient(ev, [info()]))
+    assert rec["cold"] is True
+    kinds = [e[0] for e in esp.steps]
+    assert kinds == ["load_fpga", "outputs", "upload", "write", "outputs"], esp.steps
+    assert esp.steps[1] == ("outputs", 0x80) and esp.steps[2] == ("upload", 0x30000)
+    assert esp.steps[3] == ("write", 0xFFF8, struct.pack("<LL", 0x30000, 0x1571BABE))
+    assert esp.steps[4] == ("outputs", 0x00)
+
+
+def test_warm_load_only_when_asked(env, monkeypatch):
+    monkeypatch.setenv("JTAG_LOAD_WARM", "1")
+    ev = env[0]
+    esp = FakeEsp(ev)
+    rec = load(env, esp, FakeClient(ev, [info()]))
+    assert rec["cold"] is False and esp.steps == [("warm_run",)]
