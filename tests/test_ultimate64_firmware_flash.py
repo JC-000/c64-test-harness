@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,6 +56,7 @@ UID = "5d2518"
 PROMPTS = (b"Reformat Flash Disk?", b"About to update. Continue?",
            b"Reset Configuration? (Recommended)")
 MARKER = b"bench: forcing module flash"
+HASH_FIELD = b"git_commit_hash"
 
 
 # ---------------------------------------------------------------------------
@@ -68,8 +70,9 @@ def record(load: int, payload: bytes, start: int, *, pad: bool = True) -> bytes:
     return out
 
 
-def body(*strings: bytes, size: int = 997) -> bytes:
-    text = b"\x00".join(strings)
+def body(*strings: bytes, size: int = 997, with_hash_field: bool = True) -> bytes:
+    # Every build that reports git_commit_hash carries the JSON key as a string.
+    text = b"\x00".join(strings + ((HASH_FIELD,) if with_hash_field else ()))
     return text + bytes((i * 7) & 0xFF for i in range(size - len(text)))
 
 
@@ -155,8 +158,9 @@ def wifi(state: str, ident: str | None = None) -> WifiStatus:
 
 class FakeMenu:
     def __init__(self, events, *, started=True, wifi_seq=None, ident="ESP32 WiFi Bridge V1.494",
-                 run_update_exc=None, disable_exc=None, status_hook=None):
+                 run_update_exc=None, disable_exc=None, status_hook=None, enable_exc=None):
         self.events = events
+        self.enable_exc = enable_exc
         self.disable_exc = disable_exc
         self.status_hook = status_hook
         self.started = started
@@ -185,6 +189,8 @@ class FakeMenu:
         self.events.append(("set_wifi_enabled", enabled))
         if enabled is False and self.disable_exc is not None:
             raise self.disable_exc
+        if enabled is True and self.enable_exc is not None:
+            raise self.enable_exc
         before = wifi("link-up") if enabled is False else wifi("disabled", self.ident)
         self.enabled = enabled
         after = wifi("disabled", self.ident) if not enabled else wifi("link-down")
@@ -470,37 +476,86 @@ def test_the_u64e_has_no_silent_path(rig, held, tmp_path):
     assert rig.names() == ["get_info"]
 
 
-# Real images from the 1541ultimate lane's build trees, when this machine has them.
-_RAM_APP = Path.home() / ("Documents/1541u-link/lanes/jtag-volatile/images/7b15448a7/"
-                          "u64e-ram-7b15448a7.u64")
-_MARKED_PROMPTING = Path.home() / "Documents/1541u-wt/c64u-base1400/update.ue2"
-_REAL_SILENT = Path.home() / "Documents/1541u-wt/flash-1109-artifacts-7b15448a7/update.ue2"
+# Real update images, when the caller points C64_FLASH_IMAGE_DIR at a directory
+# holding them under these names (each test skips if its file is absent):
+#   ram-app.u64            an application image loaded into RAM (no updater strings)
+#   prompting-marked.ue2   a prompting C64U bench updater that also prints the marker
+#   silent.ue2             a SILENT C64U bench updater
+#   official-1.1.0.ue2     the official C64U 1.1.0 update image
+IMAGE_DIR_ENV = "C64_FLASH_IMAGE_DIR"
 
 
-def _real(path: Path, kind: str) -> FirmwareImage:
+def _real(name: str, kind: str, **kw) -> FirmwareImage:
+    base = os.environ.get(IMAGE_DIR_ENV)
+    if not base:
+        pytest.skip(f"{IMAGE_DIR_ENV} is not set")
+    path = Path(base) / name
     if not path.is_file():
-        pytest.skip(f"{path} is not on this machine")
+        pytest.skip(f"{name} is not in ${IMAGE_DIR_ENV}")
     return FirmwareImage(path, f"/SD/fw/{path.name}",
-                         hashlib.sha256(path.read_bytes()).hexdigest(), HASH_NEW, kind)
+                         hashlib.sha256(path.read_bytes()).hexdigest(),
+                         kw.pop("git_hash", HASH_NEW), kind, **kw)
 
 
 def test_a_real_ram_application_image_is_not_an_updater(rig, held):
     with pytest.raises(FirmwareImageError, match="not an updater image"):
-        rig.run(_real(_RAM_APP, "dev"))
+        rig.run(_real("ram-app.u64", "dev"))
     assert rig.events == []
 
 
 def test_a_real_marked_prompting_bench_image_is_a_dev_image(rig, held):
-    rec = rig.run(_real(_MARKED_PROMPTING, "dev"), dry_run=True,
+    rec = rig.run(_real("prompting-marked.ue2", "dev"), dry_run=True,
                   confirm_device_powers_off=False)
     assert rec.image.has_silent_marker and len(rec.image.prompts_present) == 3
     assert rec.image_silent is False and rec.reset_configuration_answer == "YES"
 
 
 def test_a_real_silent_bench_image_is_silent(rig, held):
-    rec = rig.run(_real(_REAL_SILENT, "silent"), dry_run=True,
+    rec = rig.run(_real("silent.ue2", "silent"), dry_run=True,
                   confirm_device_powers_off=False)
     assert rec.image_silent is True and rec.image.prompts_present == ()
+    assert rec.image.reports_git_commit_hash
+
+
+def test_the_real_official_image_is_refused_as_dev(rig, held):
+    with pytest.raises(FirmwareImageError, match="never report"):
+        rig.run(_real("official-1.1.0.ue2", "dev"))
+    assert rig.events == []
+
+
+def test_the_real_official_image_is_accepted_as_official(rig, held):
+    rig.infos = [info(), {"product": "C64 Ultimate", "firmware_version": "1.1.0",
+                          "unique_id": UID}]
+    rec = rig.run(_real("official-1.1.0.ue2", "official", git_hash=None,
+                        expected_firmware_version="1.1.0"))
+    assert rec.reset_configuration_answer == "NO" and rec.identity_verified
+    assert not rec.image.reports_git_commit_hash
+
+
+# -- an image that cannot report git_commit_hash is not dev or SILENT -------
+
+@pytest.mark.parametrize("kind, strings", [
+    ("dev", PROMPTS),
+    ("silent", (MARKER,)),
+])
+def test_an_image_without_the_hash_field_cannot_be_dev_or_silent(rig, held, tmp_path,
+                                                                 kind, strings):
+    # Official 1.1.0 has the prompts but no git_commit_hash in its /v1/info
+    # (routes.cc:129-145 at 7b628eb1), so the string is absent from the image.
+    # As kind="dev" the operator would be told YES, which turns REST, FTP and
+    # telnet off on 1.1.0, and the hash could never verify anyway.
+    content = record(LOAD, body(*strings, with_hash_field=False), LOAD)
+    with pytest.raises(FirmwareImageError, match="never report") as ei:
+        rig.run(make_image(tmp_path, kind=kind, content=content))
+    assert rig.events == [] and rig.client_made == []
+    assert ei.value.record.failed_step == "validate"
+
+
+def test_an_official_image_without_the_hash_field_is_accepted(rig, held, tmp_path):
+    rig.infos = [info(), dict(OFFICIAL_INFO)]
+    content = record(LOAD, body(*PROMPTS, with_hash_field=False), LOAD)
+    rec = rig.run(make_image(tmp_path, kind="official", content=content))
+    assert rec.identity_verified and rec.reset_configuration_answer == "NO"
 
 
 # -- official images: verified on product + firmware_version ---------------
@@ -951,3 +1006,16 @@ def test_a_product_of_the_other_family_after_the_flash_is_a_verify_error(rig, he
     rig.infos = [info(), info(product="Ultimate 64 Elite", git_hash=HASH_NEW)]
     with pytest.raises(FirmwareFlashVerifyError, match="not a c64u product"):
         rig.run(make_image(tmp_path))
+
+
+def test_an_enable_that_fails_after_a_clean_read_is_a_step_error(rig, held, tmp_path, caplog):
+    # Nothing failed before the Enable, so its own failure is the error; it must
+    # not be swallowed and turned into a Link Up timeout.
+    exc = ConnectionResetError(54, "reset")
+    with caplog.at_level(logging.WARNING, logger=ff.__name__):
+        with pytest.raises(FirmwareFlashStepError) as ei:
+            rig.run(make_image(tmp_path, ident="ESP32 WiFi Bridge V1.494"),
+                    menu_kw={"enable_exc": exc})
+    assert ei.value.record.failed_step == "wifi_ident"
+    assert ei.value.__cause__ is exc
+    assert "left Disabled" in caplog.text

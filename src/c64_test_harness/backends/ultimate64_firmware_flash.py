@@ -47,7 +47,11 @@ button and never cuts power. It never retries Run Update.
   refused on a mismatch. The U64E has no SILENT path: ``update_u64.cc``
   always prompts and always ends in ``turn_off()``.
 * **What "verified" means depends on the kind.** Dev and SILENT images are
-  verified on ``git_commit_hash``. Official C64U 1.1.0 reports no
+  verified on ``git_commit_hash``, so an image that does not contain the
+  string ``git_commit_hash`` (:data:`HASH_FIELD`) is refused as either: a
+  firmware built from it could never report one. That is also what keeps
+  the official 1.1.0 image from being flashed as ``dev``, which would tell
+  the operator YES and leave REST, FTP and telnet off. Official C64U 1.1.0 reports no
   ``git_commit_hash`` at all (``routes.cc:129-145`` at 7b628eb1), so an
   official image is verified on ``product`` plus ``firmware_version``
   (``expected_firmware_version``), and on an official C64U the hash must be
@@ -176,6 +180,13 @@ PROMPT_STRINGS = (
     b"Reset Configuration? (Recommended)",
 )
 
+#: The ``/v1/info`` key a dev or SILENT image is verified on. A firmware that
+#: reports it carries the key as a string; official C64U 1.1.0 does not report
+#: it (``routes.cc:129-145`` at 7b628eb1) and its image does not contain it.
+#: Of 466 prompting images in the 1541ultimate lane's trees (reviewer's scan,
+#: 2026-11-09) only the official 1.1.0 copies and one other lack it.
+HASH_FIELD = b"git_commit_hash"
+
 #: ``/v1/info`` ``product`` -> device family. Product names from
 #: ``product.cc`` ``product_name[]`` (7b628eb1 with and without
 #: ``COMMODORE``; 3a1ff9ff; 7b15448a7). The bench C64U on 7b15448a7 reports
@@ -299,6 +310,9 @@ class UpdateImageInfo:
     padding: int
     has_silent_marker: bool
     prompts_present: tuple[str, ...]
+    #: Whether the image holds the string :data:`HASH_FIELD`, the JSON key a
+    #: firmware that reports ``git_commit_hash`` in ``/v1/info`` must carry.
+    reports_git_commit_hash: bool = False
 
 
 @dataclass
@@ -483,6 +497,7 @@ def inspect_update_image(data: bytes) -> UpdateImageInfo:
         padding=padding,
         has_silent_marker=SILENT_MARKER in data,
         prompts_present=tuple(p.decode() for p in PROMPT_STRINGS if p in data),
+        reports_git_commit_hash=HASH_FIELD in data,
     )
 
 
@@ -879,6 +894,15 @@ def _validate(image: FirmwareImage, roms: Sequence[RomImage], dry_run: bool,
         raise run.fail(FirmwareImageError,
                        f"kind={image.kind!r}, but the image is a {cls} updater (SILENT: the "
                        "marker 'bench: forcing module flash' and no prompt strings)")
+    if image.kind != "official" and not info_img.reports_git_commit_hash:
+        # The official 1.1.0 image, labelled dev, would have the operator
+        # answer YES to Reset Configuration, which turns REST, FTP and telnet
+        # off on 1.1.0 with no remote way back (design note F7).
+        raise run.fail(FirmwareImageError,
+                       f"kind={image.kind!r} is verified on git_commit_hash, but the image "
+                       f"does not contain {HASH_FIELD.decode()!r}: a firmware built from it "
+                       "would never report one. Official C64U 1.1.0 looks like this; pass "
+                       "kind='official' with expected_firmware_version if that is what it is.")
     payloads: list[bytes] = []
     for rom in roms:
         try:
