@@ -18,7 +18,16 @@ dependencies, so the protocol is written here. 1541ultimate's
   the way ``DeviceLock`` keys it, so addresses listed together in
   ``devices.toml`` fold to one key). Every call checks it before every
   connection, reads included: a telnet session is a UI session on a shared
-  device, and the firmware caps them at four (``TELNET_MAX_SESSIONS``).
+  device. From 3a1ff9ff on the firmware also caps them at four
+  (``TELNET_MAX_SESSIONS``); 1.1.0 (7b628eb1) has no cap.
+* **Nothing is sent that the UI would not read as an intended key, not
+  even telnet negotiation.** The server's ``IAC`` options are parsed and
+  discarded, never answered (1541ultimate's reference does the same). On
+  the u64ii target ``char`` is unsigned (riscv32, no ``-fsigned-char`` in
+  ``target/u64ii/riscv/ultimate/Makefile``), so ``SocketStream::get_char``'s
+  ``buffer[0] == -1`` never matches, and a reply such as ``IAC DO ECHO``
+  would reach the menu as three keys, the last ``$01`` = ``KEY_CTRL_A``,
+  select all (``tree_browser.cc``).
 * **A state-changing ENTER is sent exactly once.** It is never resent, not
   when the screen does not change, not when verification fails. The
   verdict comes from a **fresh connection**: every connection gets a fresh
@@ -34,8 +43,8 @@ dependencies, so the protocol is written here. 1541ultimate's
 * **Only allow-listed keys reach the wire**: the cursor keys, VT100
   PageUp/PageDown (``ESC[5~``/``ESC[6~``, which every build maps the same
   way, unlike the F-keys whose meaning differs between the Ultimate line
-  and the ``COMMODORE`` build), ENTER as a bare CR, RUN/STOP (``$11``) and
-  ``o`` for an ``Ok`` popup. Never LF (``$0A`` is ``KEY_CTRL_J``, swap
+  and the ``COMMODORE`` build), ENTER as a bare CR and ``o`` for an ``Ok``
+  popup. A menu is never closed with a key; the session is closed instead. Never LF (``$0A`` is ``KEY_CTRL_J``, swap
   joysticks), never ``ESC[2~`` (``KEY_INSERT``: delete selected), never a
   letter in the browser (on the official C64U, WASD navigation is the
   default and turns letters into cursor keys).
@@ -45,6 +54,13 @@ dependencies, so the protocol is written here. 1541ultimate's
   ``o``, logged at WARNING and recorded in :attr:`dismissed_messages`.
   ``RETURN`` is never used on a popup: it picks the active button, which on
   a Yes/No popup is Yes.
+* **Every new session can take one queued device message**, read-only
+  calls, verification polls and probes included: ``UserInterface::postMessage``
+  queues device-wide, and the browser of whichever session polls next pops
+  one (``TreeBrowser::poll``, ``getMessage``) and shows it as a popup. So a
+  call can consume a message meant for someone at the device. Each result's
+  ``messages`` lists what this call's sessions showed, dismissed or not;
+  :attr:`dismissed_messages` keeps the ones this object answered.
 * **Zero** ``/Temp`` **cost by construction:** this module makes no REST
   or FTP request. Telnet input creates no attachment.
 
@@ -56,8 +72,8 @@ connection's own ``UserInterface``, which the firmware discards when the
 connection closes; they change no setting, file or radio state. That makes
 a dry run proof that the path exists, the action is offered and the
 highlight can be put on it, which a run that sent nothing could not show.
-The one device-wide effect it can have is answering a queued "SID changed"
-message (see above), which a later session would otherwise show instead.
+The one device-wide effect it can have is consuming a queued message (see
+above).
 
 **Run Update.** The updater's prompts ("Reformat Flash Disk?", "About to
 update. Continue?", "Reset Configuration? (Recommended)", the ESP32
@@ -67,11 +83,20 @@ updater that links no network stack and draws on the C64 screen
 as its host; F10 of ``docs/design/firmware_flashing.md``), and the
 1541ultimate lane confirmed on 2026-11-09 that nothing of it reaches
 telnet. So the driver answers no prompt; someone at the keyboard does.
-What it can see is: a popup on the session if the application refuses the
-image ("Invalid Update Image", "Wrong Product Family", "Update for Wrong
-Product", or a file error), or, if the application accepted it, a session
-that goes silent without closing and fresh connections that get no
-answer. :meth:`Ultimate64RemoteMenu.run_update` reports which.
+What it can see is a popup on the committing session, or, once the
+application has jumped to the updater, a session that goes silent without
+closing and fresh connections that get no answer.
+:meth:`Ultimate64RemoteMenu.run_update` reports which.
+
+**Image validity is the caller's job.** The firmware checks almost nothing
+before it jumps (``FileTypeUpdate``, ``filetype_u2p.cc``). A file is offered
+"Run Update" when its extension is the product's update extension (``.u64``,
+``.ue2``) or, from 3a1ff9ff on, ``.cfw``. A product image is loaded as-is
+(``load_format_0``), with no header or product check. Only a ``.cfw``
+(``load_format_1``, absent from 1.1.0) is checked, and refused with "Invalid
+Update Image", "Wrong Product Family" or "Update for Wrong Product". The one
+refusal a ``.u64``/``.ue2`` can get is a file-open error. So check the image
+(product, hash) before uploading it; this driver cannot.
 
 Evidence grades: the wire format and the screens are read from the
 2026-11-09 transcripts of both devices (U64E and C64U, each on a 3.15a
@@ -138,10 +163,12 @@ _MAX_NAME_FIELD = WIDTH - _TYPE_COLUMN
 #: whichever session's browser polls first.
 DISMISSABLE_MESSAGES = ("SID changed. Please review settings",)
 
-#: Popup texts with which ``FileTypeUpdate::execute`` refuses an image.
-_UPDATE_REFUSALS = ("Invalid Update Image", "Wrong Product Family", "Update for Wrong Product")
+#: Popup texts with which ``FileTypeUpdate::load_format_1`` refuses a ``.cfw``
+#: (from 3a1ff9ff on). A ``.u64``/``.ue2`` is never checked; its one refusal
+#: is a file-open error string.
+_CFW_REFUSALS = ("Invalid Update Image", "Wrong Product Family", "Update for Wrong Product")
 
-#: The only bytes this driver ever writes after the negotiation replies.
+#: The only bytes this driver ever writes.
 _KEYS: dict[str, bytes] = {
     "UP": b"\x1b[A",
     "DOWN": b"\x1b[B",
@@ -150,13 +177,11 @@ _KEYS: dict[str, bytes] = {
     "PAGEUP": b"\x1b[5~",
     "PAGEDOWN": b"\x1b[6~",
     "ENTER": b"\r",
-    "RUNSTOP": b"\x11",
     "OK": b"o",
 }
 
-# Telnet (RFC 854/857/858).
+# Telnet (RFC 854): parsed and discarded, never answered.
 _IAC, _DONT, _DO, _WONT, _WILL, _SB, _SE = 255, 254, 253, 252, 251, 250, 240
-_OPT_ECHO, _OPT_SGA = 1, 3
 
 #: The VT100 line-drawing glyphs ``Screen_VT100::output`` emits, as text.
 _GLYPH_TEXT = {"l": "+", "k": "+", "m": "+", "j": "+", "q": "-", "x": "|",
@@ -216,8 +241,15 @@ class RemoteMenuVerifyError(Ultimate64RemoteMenuError):
 
 
 class UpdateImageRejectedError(Ultimate64RemoteMenuError):
-    """Run Update was refused by the application with a popup (``message``).
-    Nothing was flashed; the popup was left on that session."""
+    """A popup appeared on the committing session after Run Update's ENTER
+    (``popup`` is its text), so the application did not jump to the updater
+    and nothing was flashed. The popup was left on that session.
+
+    For a ``.u64``/``.ue2`` the firmware's only refusal is a file-open error:
+    it does not check the image, so an image for the wrong product is *not*
+    refused here (see the module docstring). Any other popup also stops the
+    call and lands here.
+    """
 
     def __init__(self, message: str, *, popup: str, screen: tuple[str, ...] | None = None) -> None:
         super().__init__(message, enter_sent=True, screen=screen)
@@ -239,6 +271,10 @@ class RemoteMenuTiming:
     :param idle_gap: silence that ends a redraw.
     :param max_drain: a redraw that never goes quiet within this is an error.
     :param poll_interval: between fresh-connection reads while verifying.
+    :param first_probe_delay: after Run Update's ENTER, how long before the
+        first fresh connection. While the application loads the image, every
+        accepted connection still starts a UI task on the device; the delay
+        keeps the first ones out of that window.
     """
 
     connect_timeout: float = 5.0
@@ -246,6 +282,7 @@ class RemoteMenuTiming:
     idle_gap: float = 0.2
     max_drain: float = 10.0
     poll_interval: float = 2.0
+    first_probe_delay: float = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -256,12 +293,9 @@ class TelnetScreen:
     """A VT100 screen as the firmware's ``Screen_VT100`` drives it.
 
     Handles the telnet layer as well: ``IAC`` sequences are removed from the
-    stream (also when split across reads) and :meth:`feed` returns the
-    negotiation replies to send. ``WILL ECHO``/``WILL SGA`` are accepted with
-    ``DO``; any other ``WILL`` is refused with ``DONT`` and any ``DO`` with
-    ``WONT``. The firmware's ``SocketStream::get_char`` swallows each ``IAC``
-    and the two bytes after it, so a three-byte reply never reaches the UI as
-    a key (1.1.0 and 7b15448a7).
+    stream (also when split across reads) and discarded. Nothing is ever
+    answered: on the u64ii target a reply would reach the menu as keys (see
+    the module docstring).
 
     Each cell keeps its character, its attribute (the SGR parameter string in
     force and the reverse-video flag), and, for cells drawn in the
@@ -290,8 +324,7 @@ class TelnetScreen:
         self.alt = False
 
     # -- input -----------------------------------------------------------
-    def feed(self, data: bytes) -> list[bytes]:
-        replies: list[bytes] = []
+    def feed(self, data: bytes) -> None:
         for b in data:
             state = self._iac
             if state is None:
@@ -315,14 +348,7 @@ class TelnetScreen:
             elif state == "sb-iac":
                 self._iac = None if b == _SE else "sb"
             else:
-                cmd = state[1]
-                self._iac = None
-                if cmd == _WILL:
-                    answer = _DO if b in (_OPT_ECHO, _OPT_SGA) else _DONT
-                    replies.append(bytes((_IAC, answer, b)))
-                elif cmd == _DO:
-                    replies.append(bytes((_IAC, _WONT, b)))
-        return replies
+                self._iac = None  # the option byte of WILL/WONT/DO/DONT: discarded
 
     def _byte(self, byte: int) -> None:
         ch = chr(byte)
@@ -645,6 +671,8 @@ class WifiChangeResult:
     showed the row move (Disable: ``disabled``; Enable: out of
     ``disabled``). ``after`` is that fresh reading; ``None`` on a dry run or
     a no-op. ``menu`` is the context menu as read (empty if none opened).
+    ``messages`` are the queued device messages this call's sessions showed,
+    verification polls included.
     """
 
     action: str
@@ -654,6 +682,7 @@ class WifiChangeResult:
     enter_sent: bool
     changed: bool
     menu: tuple[str, ...]
+    messages: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -666,7 +695,8 @@ class RunUpdateResult:
     It does **not** mean the flash succeeded. The updater's prompts are on
     the C64 screen, not on telnet (``prompts_visible`` is always ``False``):
     someone at the keyboard answers them, and the new firmware is confirmed
-    later from ``/v1/info``.
+    later from ``/v1/info``. ``messages`` are the queued device messages this
+    call's sessions showed, probes included (a probe never answers one).
     """
 
     path: str
@@ -676,6 +706,7 @@ class RunUpdateResult:
     started: bool
     evidence: tuple[str, ...]
     prompts_visible: bool = False
+    messages: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -731,8 +762,7 @@ class _Session:
                 break
             got += len(chunk)
             last = time.monotonic()
-            for reply in self.screen.feed(chunk):
-                self._write(reply)
+            self.screen.feed(chunk)
         self.received += got
         return got
 
@@ -821,6 +851,9 @@ class Ultimate64RemoteMenu:
         self._connector = connector or socket.create_connection
         #: Ok-only messages this object answered, oldest first.
         self.dismissed_messages: list[str] = []
+        #: Every popup text any session of this object showed, oldest first;
+        #: each result's ``messages`` is the slice its call added.
+        self._seen_messages: list[str] = []
 
     # -- gate and connection --------------------------------------------
     def _require_lock(self, operation: str) -> None:
@@ -852,7 +885,7 @@ class Ultimate64RemoteMenu:
             if "Too many connections" in text:
                 raise RemoteMenuConnectError(
                     f"{operation}: {self.host} answered 'Too many connections' "
-                    "(the firmware allows four telnet sessions)")
+                    "(from 3a1ff9ff on the firmware allows four telnet sessions)")
             if sess.received == 0:
                 raise RemoteMenuConnectError(
                     f"{operation}: {self.host} accepted the connection but drew nothing")
@@ -880,6 +913,7 @@ class Ultimate64RemoteMenu:
             p = view.popup
             if p is None:
                 return view
+            self._seen_messages.append(p.message)
             if p.message in DISMISSABLE_MESSAGES and p.buttons == ("Ok",):
                 _log.warning("Remote Menu on %s: answering %r with Ok", self.host, p.message)
                 self.dismissed_messages.append(p.message)
@@ -1073,16 +1107,28 @@ class Ultimate64RemoteMenu:
         read on fresh connections, polled until it shows or *verify_timeout*
         passes; on timeout :class:`RemoteMenuVerifyError` with
         ``enter_sent=True``.
+
+        **What the action changes differs by product** (source-read):
+
+        * U64E and the rest of the Ultimate line (``U64 != 2``, 7b15448a7
+          ``network_esp32.cc`` ``set_enabled``): Disable/Enable sets the
+          ``WiFi Enabled`` config item and, when the value changes, **writes
+          the WiFi config store to flash** (``cfg->write()``). The choice
+          survives a power cycle.
+        * C64U (``U64 == 2``, 1.1.0 and 7b15448a7): ``wifi.RadioOff()`` /
+          ``RadioOn()`` on the module, with no config write.
         """
         label = "Enable" if enabled else "Disable"
         once = _Once()
+        start = len(self._seen_messages)
         sess = self._open(f"WiFi {label}")
         try:
             view = self._view(sess)
             before = self._wifi_from(view)
             reached = (before.state in _ENABLED_STATES) if enabled else (before.state == "disabled")
             if reached:
-                return WifiChangeResult(label, dry_run, before, None, False, False, ())
+                return WifiChangeResult(label, dry_run, before, None, False, False, (),
+                                        tuple(self._seen_messages[start:]))
             actionable = (before.state == "disabled") if enabled else (before.state in _DISABLE_FROM)
             if not actionable:
                 raise RemoteMenuUnexpectedScreenError(
@@ -1098,7 +1144,8 @@ class Ultimate64RemoteMenu:
             self._open_menu(sess, "the WiFi row")
             menu = self._highlight(sess, label, "the WiFi row")
             if dry_run:
-                return WifiChangeResult(label, True, before, None, False, False, menu.labels)
+                return WifiChangeResult(label, True, before, None, False, False, menu.labels,
+                                        tuple(self._seen_messages[start:]))
             once.enter(sess, f"WiFi {label}", self.host)
             sess.drain(expect=False)
         except Ultimate64RemoteMenuError as exc:
@@ -1109,7 +1156,8 @@ class Ultimate64RemoteMenu:
 
         moved = (lambda s: s.state != "disabled") if enabled else (lambda s: s.state == "disabled")
         after = self._poll_wifi(moved, verify_timeout, label)
-        return WifiChangeResult(label, False, before, after, True, True, menu.labels)
+        return WifiChangeResult(label, False, before, after, True, True, menu.labels,
+                                tuple(self._seen_messages[start:]))
 
     def _poll_wifi(self, moved: Callable[[WifiStatus], bool], timeout: float,
                    label: str) -> WifiStatus:
@@ -1148,12 +1196,18 @@ class Ultimate64RemoteMenu:
         After the one ENTER the driver watches the committing session for a
         refusal popup (:class:`UpdateImageRejectedError`) and polls fresh
         connections. Two in a row that get no answer mean the application
-        has stopped: ``started=True``. A fresh session that still shows the
-        browser is normal for a few seconds (the image is loaded first; 9.6 s
-        for 8.8 MB on the C64U on 2026-11-09), so polling continues until
-        *verify_timeout*; then :class:`RemoteMenuVerifyError`. The ENTER is
-        never resent. The prompts that follow are not visible here (see the
-        module docstring).
+        has stopped: ``started=True``. The first probe waits
+        ``timing.first_probe_delay``. A fresh session that still shows the
+        browser can be normal for a while: the application loads the whole
+        image before it jumps. How long that takes is not established. On
+        the C64U on 2026-11-09 the first redraw after the ENTER came 9.6 s
+        later; that is either a slow load of 8.8 MB, or the first ENTER was
+        lost (the lane's ``select.txt`` says lost, and the redraw came 2.3 s
+        after its second ENTER). So polling continues until *verify_timeout*;
+        then :class:`RemoteMenuVerifyError`. Either way the ENTER is never
+        resent. The prompts that follow are not visible here (see the module
+        docstring), and a ``.u64``/``.ue2`` image is not checked by the
+        firmware: check it before uploading.
         """
         if not dry_run and not confirm_device_powers_off:
             raise Ultimate64UnsafeOperationError(
@@ -1162,6 +1216,7 @@ class Ultimate64RemoteMenu:
                 "pressed). Pass confirm_device_powers_off=True, or dry_run=True.")
         _split_path(path)
         once = _Once()
+        start = len(self._seen_messages)
         sess = self._open("Run Update")
         try:
             self._navigate(sess, path)
@@ -1169,9 +1224,10 @@ class Ultimate64RemoteMenu:
             menu = self._highlight(sess, "Run Update", path)
             if dry_run:
                 sess.close()
-                return RunUpdateResult(path, True, menu.labels, False, False, ())
+                return RunUpdateResult(path, True, menu.labels, False, False, (),
+                                       messages=tuple(self._seen_messages[start:]))
             once.enter(sess, f"Run Update on {path}", self.host)
-            return self._await_update_start(sess, path, menu.labels, verify_timeout)
+            return self._await_update_start(sess, path, menu.labels, verify_timeout, start)
         except Ultimate64RemoteMenuError as exc:
             exc.enter_sent = once.sent
             raise
@@ -1179,11 +1235,11 @@ class Ultimate64RemoteMenu:
             sess.close()
 
     def _await_update_start(self, sess: _Session, path: str, labels: tuple[str, ...],
-                            timeout: float) -> RunUpdateResult:
+                            timeout: float, start: int) -> RunUpdateResult:
         evidence: list[str] = []
         deadline = time.monotonic() + timeout
         no_answer = 0
-        next_probe = time.monotonic() + self.timing.poll_interval
+        next_probe = time.monotonic() + self.timing.first_probe_delay
         while True:
             if not sess.eof:
                 got = sess.drain(expect=False)
@@ -1194,10 +1250,12 @@ class Ultimate64RemoteMenu:
             view = self._view(sess)
             if view.popup is not None:
                 msg = view.popup.message
-                known = " (a refusal FileTypeUpdate shows)" if msg in _UPDATE_REFUSALS else ""
+                self._seen_messages.append(msg)
+                known = " (a .cfw refusal, FileTypeUpdate::load_format_1)" \
+                    if msg in _CFW_REFUSALS else ""
                 raise UpdateImageRejectedError(
-                    f"Run Update on {path}: the application answered {msg!r}{known}; "
-                    "nothing was flashed. The popup was left open.",
+                    f"Run Update on {path}: the application showed {msg!r}{known} instead "
+                    "of jumping to the updater; nothing was flashed. The popup was left open.",
                     popup=msg, screen=view.rows)
             now = time.monotonic()
             if now >= next_probe:
@@ -1207,7 +1265,8 @@ class Ultimate64RemoteMenu:
                 if outcome.startswith("no answer"):
                     no_answer += 1
                     if no_answer >= 2:
-                        return RunUpdateResult(path, False, labels, True, True, tuple(evidence))
+                        return RunUpdateResult(path, False, labels, True, True, tuple(evidence),
+                                               messages=tuple(self._seen_messages[start:]))
                 else:
                     no_answer = 0
             if time.monotonic() >= deadline:
@@ -1218,7 +1277,11 @@ class Ultimate64RemoteMenu:
             time.sleep(min(self.timing.idle_gap, max(0.0, next_probe - time.monotonic())))
 
     def _probe(self) -> str:
-        """One fresh connection, reading only. Sends no key."""
+        """One fresh connection, reading only. Sends no key.
+
+        The new session may pop a queued device message; it is not answered,
+        and its text is recorded for the result's ``messages``.
+        """
         self._require_lock("verify Run Update")
         try:
             sock = self._connect()
@@ -1236,6 +1299,9 @@ class Ultimate64RemoteMenu:
             view = read_view(sess.screen)
             if got == 0:
                 return "connected, nothing drawn"
+            if view.popup is not None:
+                self._seen_messages.append(view.popup.message)
+                return f"answered, showing popup {view.popup.message!r}"
             return f"answered, path {view.path!r}"
         finally:
             sess.close()

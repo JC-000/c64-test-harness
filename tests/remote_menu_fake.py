@@ -22,6 +22,12 @@ What it models, and where each behaviour comes from:
 * **Diffs:** after a key only the rows that changed are re-sent.
 * **Cursors clamp** at the first and last item (``TreeBrowserState::up/down``,
   ``ContextMenu::down``); nothing wraps.
+* **Input is bytes, not telnet.** Every byte the client sends is a key,
+  ``0xFF`` included: on the u64ii target ``char`` is unsigned, so
+  ``SocketStream::get_char``'s ``buffer[0] == -1`` never matches and an
+  ``IAC`` reply reaches the UI as keys (``IAC DO ECHO`` ends in ``$01``,
+  ``KEY_CTRL_A``: select all). Any reply therefore shows up here as a
+  disallowed key.
 * **Queued messages** (``UserInterface::postMessage`` / ``getMessage``) pop up
   once, on whichever session's browser polls first, as an ``Ok`` popup
   (``UIPopup``) answered by the key ``o``.
@@ -117,9 +123,10 @@ class SessionLog:
     index: int
     raw: bytearray = field(default_factory=bytearray)
     keys: list[str] = field(default_factory=list)
-    #: ("label", "mode") of every ENTER that executed a context-menu action.
+    #: ("label", "path") of every ENTER that executed a context-menu action.
     commits: list[tuple[str, str]] = field(default_factory=list)
-    iac_replies: list[bytes] = field(default_factory=list)
+    commit_times: list[float] = field(default_factory=list)
+    connected_at: float = 0.0
     closed_by_client: bool = False
 
 
@@ -141,8 +148,18 @@ class FakeUltimate:
     :param update: what Run Update does: ``"start"`` (the application stops),
         ``"ignore"`` (nothing happens), or ``"reject:<popup text>"``.
     :param update_load_s: seconds between the ENTER and the application
-        stopping (the C64U spent about 9.6 s loading an 8.8 MB image).
-    :param messages: queued ``postMessage`` texts.
+        stopping. How long a real load takes is not established: on the
+        C64U on 2026-11-09 the first redraw came 9.6 s after the first ENTER,
+        either a slow load of 8.8 MB or a lost first ENTER.
+    :param messages: queued ``postMessage`` texts; an entry may also be
+        ``(text, buttons)`` to draw a popup with other buttons.
+    :param start_path: where a fresh session opens ("Enter Home on Startup").
+    :param enter_cursor_at_end: entering a directory puts the cursor on its
+        last entry instead of the first.
+    :param menu_initial: the context menu's first highlighted item.
+    :param menu_keys_swapped: UP and DOWN are swapped inside a context menu.
+    :param flood_after_commit: after the action's ENTER the session keeps
+        sending and never goes quiet.
     :param framed: the official C64U 1.1.0 layout (``COMMODORE``): the browser
         inside a border, ``F7=HELP`` and its own colours. Source-read only.
     :param password: send ``Password: `` first (``socket_ensure_authenticated``).
@@ -167,6 +184,10 @@ class FakeUltimate:
         password: str | None = None,
         refuse_sessions: bool = False,
         start_path: str = "/",
+        enter_cursor_at_end: bool = False,
+        menu_initial: int = 0,
+        menu_keys_swapped: bool = False,
+        flood_after_commit: bool = False,
     ) -> None:
         self.title = title
         self.root = root if root is not None else [
@@ -204,6 +225,10 @@ class FakeUltimate:
         self.password = password
         self.refuse_sessions = refuse_sessions
         self.start_path = start_path
+        self.enter_cursor_at_end = enter_cursor_at_end
+        self.menu_initial = menu_initial
+        self.menu_keys_swapped = menu_keys_swapped
+        self.flood_after_commit = flood_after_commit
         self.sgr_sel = "0;37;1" if framed else SGR_SEL
         self.sgr_fg = "0;31;2" if framed else SGR_FG
         #: True once Run Update stopped the application: no new connection
@@ -266,7 +291,7 @@ class FakeUltimate:
             except (socket.timeout, OSError):
                 continue
             with self._lock:
-                log = SessionLog(index=len(self.sessions))
+                log = SessionLog(index=len(self.sessions), connected_at=time.monotonic())
                 self.sessions.append(log)
             self._conns.append(conn)
             t = threading.Thread(target=_Session(self, conn, log).run, daemon=True)
@@ -305,9 +330,13 @@ class FakeUltimate:
             if self._pending_wifi:
                 self.wifi = dict(self._pending_wifi.pop(0))
 
-    def pop_message(self) -> str | None:
+    def pop_message(self):
         with self._lock:
             return self.messages.pop(0) if self.messages else None
+
+    def post_message(self, msg) -> None:
+        with self._lock:
+            self.messages.append(msg)
 
 
 class _Session:
@@ -360,7 +389,7 @@ class _Session:
         self.redraw(full=True)
         msg = dev.pop_message()
         if msg is not None:
-            self.popup = (msg, ["Ok"])
+            self.popup = (msg, ["Ok"]) if isinstance(msg, str) else (msg[0], list(msg[1]))
             self.redraw()
         self.conn.settimeout(0.05)
         buf = b""
@@ -391,12 +420,6 @@ class _Session:
         keys = {b"\x1b[A": "UP", b"\x1b[B": "DOWN", b"\x1b[C": "RIGHT",
                 b"\x1b[D": "LEFT", b"\x1b[5~": "PAGEUP", b"\x1b[6~": "PAGEDOWN"}
         while buf:
-            if buf[0] == 0xFF:
-                if len(buf) < 3:
-                    return buf
-                self.log.iac_replies.append(buf[:3])
-                buf = buf[3:]
-                continue
             if buf[0] == 0x1B:
                 for seq, name in keys.items():
                     if buf.startswith(seq):
@@ -411,7 +434,8 @@ class _Session:
                 continue
             b = buf[0]
             buf = buf[1:]
-            name = {0x0D: "ENTER", 0x11: "RUNSTOP", 0x0A: "LF"}.get(b, chr(b))
+            name = {0x0D: "ENTER", 0x11: "RUNSTOP", 0x0A: "LF", 0x01: "CTRL_A",
+                    0xFF: "0xFF"}.get(b, chr(b))
             self.key(name)
         return buf
 
@@ -446,12 +470,10 @@ class _Session:
             e = self.entries()[self.cursor]
             if self.path == "/" and e[0] not in ("Net0", "WiFi", "Ftp"):
                 self.path = f"/{e[0]}/"
-                self.cursor = 0
-                self.first = 0
+                self.enter_dir()
             elif self.path != "/" and e.kind == "DIR":
                 self.path = f"{self.path}{e.name}/"
-                self.cursor = 0
-                self.first = 0
+                self.enter_dir()
         elif name == "LEFT" and self.path != "/":
             parts = self.path.strip("/").split("/")
             self.path = "/" + "/".join(parts[:-1]) + ("/" if len(parts) > 1 else "")
@@ -459,10 +481,15 @@ class _Session:
             self.first = 0
         elif name == "ENTER" and n:
             self.menu = self.context_items()
-            self.menu_index = 0
+            self.menu_index = min(self.dev.menu_initial, max(0, len(self.menu) - 1))
             if not self.menu:
                 self.menu = None
         self.redraw()
+
+    def enter_dir(self) -> None:
+        self.first = 0
+        n = len(self.entries())
+        self.cursor = n - 1 if (self.dev.enter_cursor_at_end and n) else 0
 
     def context_items(self) -> list[str]:
         e = self.entries()[self.cursor]
@@ -473,6 +500,8 @@ class _Session:
         return list(FILE_ACTIONS)
 
     def menu_key(self, name: str) -> None:
+        if self.dev.menu_keys_swapped and name in ("UP", "DOWN"):
+            name = "UP" if name == "DOWN" else "DOWN"
         if name == "DOWN":
             self.menu_index = min(len(self.menu) - 1, self.menu_index + 1)
         elif name == "UP":
@@ -489,6 +518,9 @@ class _Session:
     def commit(self, label: str) -> None:
         dev = self.dev
         self.log.commits.append((label, self.path))
+        self.log.commit_times.append(time.monotonic())
+        if dev.flood_after_commit:
+            threading.Thread(target=self._flood, daemon=True).start()
         if label == "Run Update":
             self.run_update()
             return
@@ -499,6 +531,12 @@ class _Session:
                 dev._pending_wifi = [dict(s) for s in seq[1:]]
         if dev.redraw_after_commit:
             self.redraw()
+
+    def _flood(self) -> None:
+        end = time.monotonic() + 3.0
+        while time.monotonic() < end and not self.dev._stop.is_set():
+            self.send(b"\x1b[24;1H\x1b[0;36m\x1b[27m/ ")
+            time.sleep(0.01)
 
     def run_update(self) -> None:
         dev = self.dev
