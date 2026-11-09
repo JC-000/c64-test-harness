@@ -734,3 +734,19 @@ def test_two_visible_rows_with_the_wanted_name_are_refused(make, held):
     with pytest.raises(RemoteMenuNotFoundError, match="more than one"):
         menu.context_actions("/USB1/vf_ue.u64")
     assert all("ENTER" not in s.keys for s in fake.sessions)
+
+
+@pytest.mark.parametrize("call", [
+    lambda m: m.set_wifi_enabled(False, dry_run=True),
+    lambda m: m.run_update("/USB1/vf_ue.u64", dry_run=True),
+], ids=["set_wifi_enabled", "run_update"])
+def test_each_result_lists_only_its_own_calls_messages(make, held, call):
+    """Two calls on one object: the message shown during the first call is
+    not reported again by the second."""
+    sid = "SID changed. Please review settings"
+    fake, menu = make(messages=[sid])
+    first = call(menu)
+    second = call(menu)
+    assert first.messages == (sid,)
+    assert second.messages == ()
+    assert menu.dismissed_messages == [sid]
