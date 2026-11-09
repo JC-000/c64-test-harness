@@ -872,7 +872,10 @@ def _flash(host: str, image: FirmwareImage, roms: Sequence[RomImage], v: _Valida
         result = menu.run_update(record.device_path_used,
                                  confirm_device_powers_off=confirm_device_powers_off)
     except Exception as exc:
-        raise run.fail(FirmwareFlashStepError, f"{type(exc).__name__}: {exc}") from exc
+        sent = getattr(exc, "enter_sent", False)
+        note = (" The ENTER WAS SENT: the updater may be running. Follow the instruction "
+                "above and do not retry." if sent else " No ENTER was sent.")
+        raise run.fail(FirmwareFlashStepError, f"{type(exc).__name__}: {exc}.{note}") from exc
     record.run_update = result
     if not result.started:
         raise run.fail(FirmwareFlashVerifyError,

@@ -39,6 +39,7 @@ from c64_test_harness.backends.ultimate64_firmware_flash import (
 )
 from c64_test_harness.backends.ultimate64_remote_menu import (
     RemoteMenuNotFoundError,
+    RemoteMenuVerifyError,
     RunUpdateResult,
     WifiChangeResult,
     WifiStatus,
@@ -335,6 +336,24 @@ def test_a_lock_on_another_device_does_not_count(rig, tmp_path):
     assert rig.events == []
 
 
+def test_a_lock_lost_before_the_enter_stops_the_flash(rig, held, tmp_path, monkeypatch):
+    put = rig.storage.put_file
+
+    def put_then_lose_the_lock(*a, **kw):
+        result = put(*a, **kw)
+        held.release()
+        return result
+
+    monkeypatch.setattr(ff, "storage_put_file", put_then_lose_the_lock)
+    try:
+        with pytest.raises(FirmwareFlashRefusedError, match="no longer held") as ei:
+            rig.run(make_image(tmp_path))
+    finally:
+        assert held.acquire(timeout=5)       # the fixture releases it again
+    assert ei.value.record.failed_step == "run_update"
+    assert not any(isinstance(e, tuple) and e[0] == "run_update" for e in rig.events)
+
+
 def test_a_hash_mismatch_is_refused_before_any_traffic(rig, held, tmp_path):
     image = make_image(tmp_path, sha="0" * 64)
     with pytest.raises(FirmwareImageError, match="SHA-256") as ei:
@@ -532,6 +551,18 @@ def test_a_building_block_error_carries_the_step_and_the_cause(rig, held, tmp_pa
         rig.run(make_image(tmp_path), menu_kw={"run_update_exc": exc})
     assert ei.value.__cause__ is exc
     assert ei.value.record.steps == ["validate", "preflight", "upload"]
+    assert "No ENTER was sent" in str(ei.value)
+
+
+def test_an_unclear_run_update_after_the_enter_says_the_updater_may_be_running(
+        rig, held, tmp_path):
+    exc = RemoteMenuVerifyError("still answers", enter_sent=True)
+    with pytest.raises(FirmwareFlashStepError, match="ENTER WAS SENT") as ei:
+        rig.run(make_image(tmp_path), menu_kw={"run_update_exc": exc})
+    assert ei.value.record.failed_step == "run_update"
+    assert rig.names().count("get_info") == 1          # no wait, no retry
+    assert [e for e in rig.events if isinstance(e, tuple) and e[0] == "run_update"] == [
+        ("run_update", "/SD/fw/update.ue2", False, True)]
 
 
 # -- Reset Configuration answers ------------------------------------------
