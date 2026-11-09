@@ -80,6 +80,12 @@ def resolve_port(location: str, comports=None) -> str:
         except ImportError as e:
             raise JtagLoadError("adapter", f"pyserial is needed to find the JTAG adapter by USB location ({e})")
         comports = list_ports.comports()
+    comports = list(comports)
+    same_serial = {p.device for p in comports if getattr(p, "vid", None) == 0x10C4
+                   and getattr(p, "serial_number", None) == "0001" and str(p.device).startswith("/dev/cu.")}
+    if len(same_serial) > 1:   # CP2102 clones share serial "0001" (ours reads lock 0x02, not reprogrammable, 11-09)
+        print(f"jtag_load WARNING: {len(same_serial)} CP210x ports report serial 0001 ({sorted(same_serial)}); "
+              f"selecting by USB location {location} only", file=sys.stderr)
     hits = sorted({p.device for p in comports if p.location == location and str(p.device).startswith("/dev/cu.")})
     if len(hits) != 1:
         raise JtagLoadError("adapter", f"{len(hits)} serial ports at USB location {location}: {hits}; refusing "

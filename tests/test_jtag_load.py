@@ -614,8 +614,8 @@ def test_warm_load_only_when_asked(env, monkeypatch):
 
 
 class _Port:
-    def __init__(self, device, location):
-        self.device, self.location = device, location
+    def __init__(self, device, location, serial=None, vid=None):
+        self.device, self.location, self.serial_number, self.vid = device, location, serial, vid
 
 
 def test_port_is_chosen_by_usb_location_not_by_name(monkeypatch):
@@ -640,3 +640,11 @@ def test_port_refused_when_jtag_port_names_another_port(monkeypatch):
     with pytest.raises(jl.JtagLoadError, match="names swap"):
         jl.resolve_port("0-1.2", [_Port("/dev/cu.usbserial-0001", "0-1.2")])
     assert jl.resolve_port("0-1.2", [_Port("/dev/cu.usbserial-4", "0-1.2")]) == "/dev/cu.usbserial-4"
+
+
+def test_two_cp210x_with_serial_0001_warn_and_location_decides(monkeypatch, capsys):
+    monkeypatch.delenv("JTAG_PORT", raising=False)
+    ports = [_Port("/dev/cu.usbserial-0001", "0-1.2", "0001", 0x10C4),
+             _Port("/dev/cu.usbserial-4", "0-1.4", "0001", 0x10C4)]
+    assert jl.resolve_port("0-1.2", ports) == "/dev/cu.usbserial-0001"
+    assert "2 CP210x ports report serial 0001" in capsys.readouterr().err
