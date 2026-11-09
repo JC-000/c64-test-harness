@@ -177,6 +177,7 @@ from .backends.ultimate64_storage import (
 )
 from .backends.ultimate64_flash import (
     FLASH_DIFF_SKIPPED,
+    FLASH_DIFF_SKIPPED_PATTERNS,
     FLASH_SHARED_PAGES,
     FlashSaveRefusedError,
     FlashSaveReport,
@@ -643,6 +644,7 @@ __all__ = [
     "auto_gc_enabled",
     # Guarded single-key save to flash (#559)
     "FLASH_DIFF_SKIPPED",
+    "FLASH_DIFF_SKIPPED_PATTERNS",
     "FLASH_SHARED_PAGES",
     "FlashSaveRefusedError",
     "FlashSaveReport",

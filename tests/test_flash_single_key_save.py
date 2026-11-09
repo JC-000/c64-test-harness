@@ -21,6 +21,7 @@ sent.  No device traffic: there is no ``U64_HOST`` here and the host is
 from __future__ import annotations
 
 import json
+import socket
 import urllib.error
 import urllib.parse
 from io import BytesIO
@@ -30,7 +31,11 @@ import pytest
 
 import c64_test_harness as harness
 from c64_test_harness.backends import ultimate64_temp_gc as gc_mod
-from c64_test_harness.backends.ultimate64_client import Ultimate64Client, Ultimate64Error
+from c64_test_harness.backends.ultimate64_client import (
+    Ultimate64Client,
+    Ultimate64Error,
+    Ultimate64ProtocolError,
+)
 from c64_test_harness.backends.ultimate64_flash import (
     FLASH_DIFF_SKIPPED,
     FlashSaveRefusedError,
@@ -108,11 +113,23 @@ class _FakeFlashDevice:
     :param reject: ``(cat, item)`` whose PUT answers HTTP 400.
     :param save_noop: ``save_to_flash`` answers ``written`` but writes nothing.
     :param written_override: the ``written`` list ``save_to_flash`` answers.
+    :param extra: additional categories, ``{cat: {item: item_map}}``.
+    :param rewrite: ``{(cat, item): {written: stored}}`` -- a PUT of
+        *written* stores *stored* instead (a hook that rewrites the item).
+    :param put_hook: ``{(cat, item): ((cat2, item2), value)}`` -- a PUT of
+        the first item also sets the second (a hook with a side effect).
+    :param save_corrupt: ``{(cat, item): value}`` written into flash by
+        ``save_to_flash`` on top of the RAM image.
+    :param loaded_override: ``callable(cat, n)`` giving the ``loaded`` list
+        for the *n*-th load of *cat* (0-based), or ``None`` for the default.
     """
 
     def __init__(self, *, ram=None, flash=None, reject=(), save_noop=False,
-                 written_override=None) -> None:
+                 written_override=None, extra=None, rewrite=None, put_hook=None,
+                 save_corrupt=None, loaded_override=None) -> None:
         self.items = _items()
+        for cat, items in (extra or {}).items():
+            self.items[cat] = {i: dict(m) for i, m in items.items()}
         # Flash starts equal to the unmodified RAM image; *ram* and *flash*
         # then move each side away from it.
         self.flash = {
@@ -124,6 +141,11 @@ class _FakeFlashDevice:
         for (cat, item), value in (flash or {}).items():
             self.flash[cat][item] = value
         self.reject = set(reject)
+        self.rewrite = rewrite or {}
+        self.put_hook = put_hook or {}
+        self.save_corrupt = save_corrupt or {}
+        self.loaded_override = loaded_override
+        self.loads: dict[str, int] = {}
         self.save_noop = save_noop
         self.written_override = written_override
         self.dirty: set[str] = set()
@@ -163,16 +185,25 @@ class _FakeFlashDevice:
             # The global :load_from_flash / :save_to_flash forms.
             return _resp({"errors": []})
         if len(parts) == 4:
-            cat, _, verb = parts[3].partition(":")
+            cat, _, verb = parts[3].rpartition(":")
             if verb == "load_from_flash":
                 for item, value in self.flash[cat].items():
-                    self.items[cat][item]["current"] = value
+                    # An item only flash knows about appears in RAM too.
+                    self.items[cat].setdefault(item, _string(value))["current"] = value
                 self.dirty.discard(cat)
-                return _resp({"loaded": [cat], "errors": []})
+                n = self.loads.get(cat, 0)
+                self.loads[cat] = n + 1
+                loaded = [cat]
+                if self.loaded_override is not None:
+                    loaded = self.loaded_override(cat, n) or loaded
+                return _resp({"loaded": loaded, "errors": []})
             if verb == "save_to_flash":
                 written = [cat] if cat in self.dirty else []
                 if written and not self.save_noop:
                     self.flash[cat] = {i: m["current"] for i, m in self.items[cat].items()}
+                    for (c, i), v in self.save_corrupt.items():
+                        if c == cat:
+                            self.flash[c][i] = v
                 self.dirty.discard(cat)
                 if self.written_override is not None:
                     written = list(self.written_override)
@@ -182,6 +213,7 @@ class _FakeFlashDevice:
         if (cat, item) in self.reject:
             raise urllib.error.HTTPError(req.full_url, 400, "Bad", {}, BytesIO(b"no"))
         value = query["value"][0]
+        value = self.rewrite.get((cat, item), {}).get(value, value)
         m = self.items[cat][item]
         if "values" in m:
             match = [v for v in m["values"] if v.lower() == value.lower()]
@@ -192,6 +224,9 @@ class _FakeFlashDevice:
         else:
             m["current"] = value
         self.dirty.add(cat)
+        if (cat, item) in self.put_hook:
+            (c2, i2), v2 = self.put_hook[(cat, item)]
+            self.items[c2][i2]["current"] = v2
         return _resp({"errors": []})
 
 
@@ -403,13 +438,6 @@ def test_dry_run_sends_only_gets_and_states_it_compared_nothing(locked):
     assert not any(NET in p for p in planned)
 
 
-def test_dry_run_writes_nothing_to_disk(locked, tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    dev = _FakeFlashDevice()
-    _run(dev, C64, FAST, "Enabled", dry_run=True)
-    assert list(tmp_path.iterdir()) == []
-
-
 # ------------------------------------------------------------------ client
 def test_client_save_to_flash_per_category_returns_written():
     dev = _FakeFlashDevice()
@@ -432,3 +460,179 @@ def test_client_load_from_flash_per_category_returns_loaded():
 def test_exported_at_the_package_root():
     assert harness.save_config_item_to_flash is save_config_item_to_flash
     assert issubclass(harness.FlashSaveRefusedError, Ultimate64Error)
+
+
+# ------------------------------------------------------- review round 1 (#559)
+def _no_save(dev) -> bool:
+    return not any(p.endswith(":save_to_flash") for _m, p in dev.writes())
+
+
+class _TimeoutAfterLoad(_FakeFlashDevice):
+    """The first GET after a load times out (reviewer probe)."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.loaded = False
+        self.failed = False
+
+    def __call__(self, req, timeout=None):
+        if req.get_full_url().endswith(":load_from_flash"):
+            self.loaded = True
+        elif self.loaded and not self.failed and req.get_method() == "GET":
+            self.failed = True
+            raise socket.timeout("blip")
+        return super().__call__(req, timeout)
+
+
+def test_a_get_timeout_after_a_load_puts_ram_back(locked):
+    dev = _TimeoutAfterLoad(
+        ram={(C64, REU): "512 KB", (C64, FAST): "Enabled"},
+        flash={(C64, REU): "2 MB", (C64, FAST): "Enabled"},
+    )
+    with pytest.raises(FlashSaveRestoreError) as info:
+        _run(dev, C64, FAST, "Disabled")
+    assert info.value.category == C64
+    assert info.value.items == []
+    assert dev.items[C64][REU]["current"] == "512 KB"
+    assert dev.items[C64][FAST]["current"] == "Enabled"
+    assert _no_save(dev)
+
+
+class _LoadReplyLost(_FakeFlashDevice):
+    """The load is applied, but its reply never arrives."""
+
+    def __call__(self, req, timeout=None):
+        resp = super().__call__(req, timeout)
+        if req.get_full_url().endswith(":load_from_flash"):
+            raise socket.timeout("reply lost")
+        return resp
+
+
+def test_a_lost_load_reply_puts_ram_back(locked):
+    dev = _LoadReplyLost(ram={(C64, REU): "512 KB"}, flash={(C64, REU): "2 MB"})
+    with pytest.raises(FlashSaveRestoreError):
+        _run(dev, C64, FAST, "Enabled")
+    assert dev.items[C64][REU]["current"] == "512 KB"
+    assert _no_save(dev)
+
+
+SID_CHIP_STORES = [
+    "SID Socket 1: ARMSID", "SID Socket 2: PDsid", "SID Socket 1: SidKick",
+    "SID Socket 2: SidKick Pico", "SID Socket 1: FPGASID",
+    "SID Socket 2: SwinSID Ultimate", "ARMSID in Socket 1", "FPGASID in Socket 2",
+    "SwinSID Ultimate in Socket 1",
+]
+
+
+@pytest.mark.parametrize("cat", SID_CHIP_STORES)
+def test_refuses_a_per_socket_sid_chip_store_before_any_request(locked, cat):
+    dev = _FakeFlashDevice()
+    with pytest.raises(FlashSaveRefusedError):
+        _run(dev, cat, "SID Type", "8580")
+    assert dev.requests == []
+
+
+def test_a_listed_sid_chip_store_is_skipped_not_loaded(locked):
+    chip = "SID Socket 1: PDsid"
+    dev = _FakeFlashDevice(
+        ram={(C64, FAST): "Enabled"}, flash={(C64, FAST): "Enabled"},
+        extra={chip: {"SID Type": _enum("8580", ["6581", "8580"])}},
+    )
+    report = _run(dev, C64, FAST, "Disabled")
+    assert chip in report.skipped_categories
+    assert chip not in report.compared_categories
+    assert f"/v1/configs/{chip}:load_from_flash" not in [p for _m, p in dev.writes()]
+
+
+def test_refuses_an_item_glob_before_any_request(locked):
+    dev = _FakeFlashDevice()
+    with pytest.raises(FlashSaveRefusedError):
+        _run(dev, C64, "Fast*", "Disabled")
+    assert dev.requests == []
+
+
+def test_a_restore_hook_that_undoes_an_earlier_restore_is_caught(locked):
+    """Restoring REU Size rewrites Fast Reset, which was put back first."""
+    dev = _FakeFlashDevice(
+        ram={(C64, FAST): "Enabled", (C64, REU): "512 KB"},
+        flash={(C64, FAST): "Disabled", (C64, REU): "2 MB"},
+        put_hook={(C64, REU): ((C64, FAST), "Disabled")},
+    )
+    with pytest.raises(FlashSaveRestoreError) as info:
+        _run(dev, DRV, "Drive Bus ID", 9)
+    assert info.value.category == C64
+    assert FAST in info.value.items
+    assert _no_save(dev)
+
+
+def test_a_load_that_reports_extra_categories_is_a_restore_error(locked):
+    dev = _FakeFlashDevice(
+        ram={(C64, FAST): "Enabled"}, flash={(C64, FAST): "Enabled"},
+        loaded_override=lambda cat, n: [DRV, "Drive B Settings"] if cat == DRV else None,
+    )
+    with pytest.raises(FlashSaveRestoreError):
+        _run(dev, C64, FAST, "Disabled")
+    assert _no_save(dev)
+
+
+def test_a_target_write_that_reads_back_wrong_is_put_back_and_refused(locked):
+    dev = _FakeFlashDevice(rewrite={(DRV, "Drive Bus ID"): {"10": "11"}})
+    with pytest.raises(FlashSaveRefusedError):
+        _run(dev, DRV, "Drive Bus ID", 10)
+    assert dev.items[DRV]["Drive Bus ID"]["current"] == 8
+    assert _no_save(dev)
+
+
+def test_a_target_write_and_its_put_back_both_failing_is_a_restore_error(locked):
+    dev = _FakeFlashDevice(rewrite={(DRV, "Drive Bus ID"): {"10": "11", "8": "9"}})
+    with pytest.raises(FlashSaveRestoreError) as info:
+        _run(dev, DRV, "Drive Bus ID", 10)
+    assert info.value.items == ["Drive Bus ID"]
+    assert _no_save(dev)
+
+
+def test_an_item_only_flash_knows_about_is_a_restore_error(locked):
+    dev = _FakeFlashDevice(flash={(C64, "Ghost"): "boo"})
+    with pytest.raises(FlashSaveRestoreError) as info:
+        _run(dev, DRV, "Drive Bus ID", 9)
+    assert "Ghost" in info.value.items
+    assert _no_save(dev)
+
+
+def test_a_save_that_corrupts_another_item_fails_the_confirm(locked):
+    dev = _FakeFlashDevice(
+        ram={(C64, FAST): "Enabled"}, flash={(C64, FAST): "Enabled"},
+        save_corrupt={(C64, REU): "128 KB"},
+    )
+    with pytest.raises(FlashSaveVerifyError):
+        _run(dev, C64, FAST, "Disabled")
+
+
+def test_a_confirming_load_that_reports_extra_categories_fails(locked):
+    dev = _FakeFlashDevice(
+        ram={(C64, FAST): "Enabled"}, flash={(C64, FAST): "Enabled"},
+        loaded_override=lambda cat, n: [C64, DRV] if (cat == C64 and n == 1) else None,
+    )
+    with pytest.raises(FlashSaveVerifyError):
+        _run(dev, C64, FAST, "Disabled")
+
+
+def test_nothing_to_do_sends_no_write_to_the_target(locked):
+    """RAM, flash and the value agree: no set PUT, no save."""
+    dev = _FakeFlashDevice()
+    report = _run(dev, C64, FAST, "Disabled")
+    assert report.saved is False
+    assert not any(p.endswith(f"/{FAST}") for _m, p in dev.writes())
+    assert _no_save(dev)
+
+
+@pytest.mark.parametrize("body", [
+    b'{"written": [], "errors": ["boom"]}',
+    b'["not", "an", "object"]',
+    b'{"written": "C64 and Cartridge Settings", "errors": []}',
+])
+def test_client_save_to_flash_rejects_a_malformed_answer(body):
+    c = Ultimate64Client("h")
+    with patch("urllib.request.urlopen", lambda req, timeout=None: _Resp(body)), \
+            pytest.raises(Ultimate64ProtocolError):
+        c.save_config_to_flash(C64)

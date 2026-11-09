@@ -30,7 +30,11 @@ attachments on any firmware. ``set_config_items_batch`` and the global
 
    * the process does not hold the device's ``DeviceLock``;
    * the category or item name is a glob;
-   * the category is in :data:`FLASH_DIFF_SKIPPED`;
+   * the category is in :data:`FLASH_DIFF_SKIPPED`, or is a per-socket
+     SID-chip store (:data:`FLASH_DIFF_SKIPPED_PATTERNS`). The pageless ones
+     (ARMSID, PDsid, SidKick) show nothing on a load, yet ``save_to_flash``
+     lists them as written; PDsid and SidKick then persist nothing, which
+     would read as a false ``saved=True``;
    * the category shares a flash page with a skipped store
      (:data:`FLASH_SHARED_PAGES`). ``ConfigPage::pack`` writes every store
      on the page (``config.cc:274-289``), so saving such a page would also
@@ -47,32 +51,58 @@ attachments on any firmware. ``set_config_items_batch`` and the global
    * re-read the category, and require it to equal the snapshot.
 
    A failed or rejected restore raises :class:`FlashSaveRestoreError`
-   at once.
+   at once. So does any other error once the load has been sent: a lost
+   load reply, or a failed GET. Every item of the category's snapshot is
+   then written back with ``verify=True`` first, and the error names the
+   items that would not go back.
 4. Refuse with :class:`FlashSaveRefusedError` if any difference other than
    the target remains. RAM has already been verified back at this point.
-5. ``set_config_item(target, value, verify=True)``. If flash already held
-   *value*, stop here: ``saved=False``, and no flash write.
+5. If RAM and flash both already hold *value*, stop: ``saved=False``, and
+   no write at all. Otherwise ``set_config_item(target, value,
+   verify=True)``. A read-back that differs puts the target back to its RAM
+   value and refuses. If that put-back also fails, it is a
+   :class:`FlashSaveRestoreError`. If flash already held *value*, stop
+   after the set: ``saved=False``, and no flash write.
 6. ``save_config_to_flash(category)`` must answer ``written == [category]``.
-7. Confirm: load that category from flash again. It must read exactly the
-   RAM it had after step 5. Otherwise :class:`FlashSaveVerifyError`.
+7. Confirm: load that category from flash again. The load must answer
+   ``loaded == [category]``, and the category must read exactly the RAM it
+   had after step 5. Otherwise :class:`FlashSaveVerifyError`.
+
+**Dry run.** It sends bodyless GETs only (steps 1-2) and writes nothing to
+the device or to disk. The one disk write it implies is the caller's own
+``DeviceLock`` lockfile, which is required and is never taken here. It
+reports ``flash_compared=False`` with the reason: without a load there is
+nothing to compare against. It also reports ``planned_requests``. It
+cannot predict whether the real run would refuse.
 
 **Side effects, accepted by the owner (#559).** These happen even when the
-call refuses. Every compared store re-runs ``effectuate()`` when it is
-loaded, whether or not any value differs. On
-``C64 and Cartridge Settings`` that is ``C64::effectuate_settings``
-(``c64.cc:267-277``): the bus is reconfigured, and the REU enable and the
-Command Interface slot are zeroed and then set again from config (a pulse,
-``c64.cc:306-329``). It is not a C64 reset. On ``Drive A/B Settings``,
-``C1541::effectuate_settings`` forces ``current_drive_type = unset`` and
-re-runs ``set_drive_type`` (``c1541.cc:194-196``), which likely resets the
-emulated drive. A restore PUT runs that item's change hook, if it has one.
-Config is put back; these transient effects are not.
+call refuses. The rule: every compared store re-runs ``effectuate()`` when
+it is loaded, whether or not any value differs, and a restore PUT runs that
+item's change hook, if it has one. Config is put back; these transient
+effects are not. Examples (1.1.0 line numbers):
+
+* ``C64 and Cartridge Settings``: ``C64::effectuate_settings``
+  (``c64.cc:267-277``) reconfigures the bus. The REU enable and the Command
+  Interface slot are zeroed and then set again from config, a pulse
+  (``c64.cc:306-329``). It is not a C64 reset.
+* ``U64 Specific Settings`` and its page-mates: ``U64Config::
+  effectuate_settings`` re-applies CPU speed (``u64_config.cc:993``),
+  reloads the palette, and reprograms the video PLLs when System Mode or
+  HDMI resolution differ from the running mode (``u64_config.cc:1019-1048``).
+  These stores are compared but can never be a target
+  (:data:`FLASH_SHARED_PAGES`).
+* ``Drive A/B Settings``: ``C1541::effectuate_settings`` forces
+  ``current_drive_type = unset`` and re-runs ``set_drive_type``
+  (``c1541.cc:194-196``), which likely resets the emulated drive.
 
 **Known blind spot.** ``ConfigStore::unpack`` sets only the item ids that
 are present in the flash page (``config.cc:404-422``). An item that the
 firmware gained after the page was last written keeps its RAM value across
 a load, so it compares as equal even though a power-on would give its
-default. REST cannot detect this.
+default. REST cannot detect this. A save then **persists that uncompared
+RAM value**: ``ConfigPage::pack`` packs every store on the page, and
+``ConfigStore::pack`` packs every item of each (``config.cc:274-324``), not
+only the target.
 
 **Empty strings restore fine** (source read). ``?value=`` parses to the
 empty string, not to a missing argument: ``ArgsURI::ParseReqHeader``
@@ -87,6 +117,7 @@ any other rejected restore.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -107,6 +138,7 @@ _log = logging.getLogger(__name__)
 
 __all__ = [
     "FLASH_DIFF_SKIPPED",
+    "FLASH_DIFF_SKIPPED_PATTERNS",
     "FLASH_SHARED_PAGES",
     "FlashSaveRefusedError",
     "FlashSaveReport",
@@ -166,6 +198,37 @@ FLASH_DIFF_SKIPPED: dict[str, str] = {
     ),
 }
 
+#: Per-socket SID-chip stores, matched by name, never loaded and never a
+#: target. Names re-derived from source: at 3a1ff9ff ``"SID Socket %d: "`` +
+#: ``ARMSID`` (``sid_device_armsid.cc:82``), ``PDsid``
+#: (``sid_device_pdsid.cc:25``), ``SidKick`` / ``SidKick Pico``
+#: (``sid_device_sidkick.cc:47``), ``FPGASID`` (``sid_device_fpgasid.cc:124``)
+#: and ``SwinSID Ultimate`` (``sid_device_swinsid.cc:60``); at 1.1.0
+#: ``"ARMSID in Socket %d"`` (:82), ``"FPGASID in Socket %d"`` (:124) and
+#: ``"SwinSID Ultimate in Socket %d"`` (:60).
+FLASH_DIFF_SKIPPED_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"^(?:SID Socket \d+: .+|(?:ARMSID|FPGASID|SwinSID Ultimate) in Socket \d+)$",
+            re.IGNORECASE,
+        ),
+        "a per-socket SID-chip store. ARMSID, PDsid and SidKick are custom "
+        "stores with no flash page (ConfigStore(NULL, ...) + add_custom_store, "
+        "3a1ff9ff sid_device_armsid.cc:88-91, sid_device_pdsid.cc:28/63, "
+        "sid_device_sidkick.cc:50/88) whose read() is empty "
+        "(sid_device_pdsid.h:23, sid_device_sidkick.h:23, "
+        "sid_device_armsid.h:35): a load changes nothing, so a comparison "
+        "sees nothing, yet save_to_flash lists the store as written. PDsid's "
+        "and SidKick's write() is empty (:24), so a 'save' would report "
+        "saved=True with nothing persisted; ARMSID's write() saves into the "
+        "chip's own flash (sid_device_armsid.cc:192-199). FPGASID and SwinSID "
+        "Ultimate have flash pages (0x46534944/0x5357494E + socket) but their "
+        "effectuate programs the chip itself, so a load would push flash "
+        "values into the SID. Each sits on its own page, so skipping it does "
+        "not weaken the check for a target elsewhere",
+    ),
+)
+
 #: Flash pages that hold more than one store, from source
 #: (``u64_config.cc``: ``STORE_PAGE_ID`` ``0x55363443`` at 1.1.0 :417-825 and
 #: 3a1ff9ff :480-906). Saving any store on a page writes all of them, so
@@ -190,10 +253,13 @@ _DRY_RUN_REASON = (
 
 _SIDE_EFFECTS = (
     "every compared category was loaded from flash and re-ran its "
-    "effectuate() whether or not any value differed (C64 and Cartridge "
-    "Settings: REU enable / Command Interface slot pulsed; Drive A/B "
-    "Settings: set_drive_type re-run, which likely resets the emulated "
-    "drive); config values were put back, these transient effects were not"
+    "effectuate() whether or not any value differed. Examples: C64 and "
+    "Cartridge Settings pulses the REU enable and the Command Interface "
+    "slot; U64 Specific Settings re-applies CPU speed, reloads the palette, "
+    "and reprograms the video PLLs if System Mode or HDMI resolution "
+    "differ; Drive A/B Settings re-runs set_drive_type, which likely resets "
+    "the emulated drive. Config values were put back; these transient "
+    "effects were not"
 )
 
 
@@ -281,6 +347,17 @@ def _skipped_name(category: str) -> str | None:
     return None
 
 
+def _skip_reason_for(category: str) -> str | None:
+    """Why *category* is never loaded from flash, or ``None`` if it may be."""
+    name = _skipped_name(category)
+    if name is not None:
+        return FLASH_DIFF_SKIPPED[name]
+    for pattern, reason in FLASH_DIFF_SKIPPED_PATTERNS:
+        if pattern.match(category):
+            return reason
+    return None
+
+
 def _shared_page_with_skipped(category: str) -> frozenset[str] | None:
     folded = category.casefold()
     for page in FLASH_SHARED_PAGES:
@@ -321,6 +398,58 @@ def _diff(ram: dict, flash: dict) -> dict[str, tuple[Any, Any]]:
     return out
 
 
+def _put_back_all(client: Ultimate64Client, name: str, ram: dict) -> list[str]:
+    """Write every snapshot item of *name* back, verified; the ones that failed."""
+    failed: list[str] = []
+    for it, value in ram.items():
+        try:
+            client.set_config_item(name, it, value, verify=True)
+        except Ultimate64Error as e:
+            _log.warning("put-back of %r/%r failed: %s", name, it, e)
+            failed.append(it)
+    return failed
+
+
+def _compare_one(client: Ultimate64Client, name: str, ram: dict,
+                 report: "FlashSaveReport") -> dict[str, Any]:
+    """Load *name* from flash, read it, restore RAM; the flash values.
+
+    Raises :class:`FlashSaveRestoreError` when RAM is not verified back, and
+    lets a wire error escape for the caller's put-back.
+    """
+    loaded = client.load_config_from_flash(name)
+    flash = _unwrap_category(client.get_config_category(name), name)
+    failed: list[str] = []
+    for it, (ram_value, flash_value) in _diff(ram, flash).items():
+        report.differences[(name, it)] = (ram_value, flash_value)
+        if it not in ram:
+            # Only flash knows this item: there is no RAM value to put back.
+            failed.append(it)
+            continue
+        try:
+            client.set_config_item(name, it, ram_value, verify=True)
+        except Ultimate64Error as e:
+            _log.warning("restore of %r/%r failed: %s", name, it, e)
+            failed.append(it)
+    after = _unwrap_category(client.get_config_category(name), name)
+    failed += [it for it in _diff(ram, after) if it not in failed]
+    if failed:
+        raise FlashSaveRestoreError(
+            f"{name!r} was loaded from flash for comparison and could not be "
+            f"verified back to its RAM values: {failed!r} may now hold flash "
+            "values. Nothing was saved",
+            name, failed, report,
+        )
+    if loaded != [name]:
+        raise FlashSaveRestoreError(
+            f"PUT {name!r}:load_from_flash reported loading {loaded!r}, not "
+            f"[{name!r}]; any other store it reloaded was not put back. "
+            "Nothing was saved",
+            name, [], report,
+        )
+    return flash
+
+
 def save_config_item_to_flash(
     client: Ultimate64Client,
     category: str,
@@ -340,15 +469,18 @@ def save_config_item_to_flash(
     :param category: the exact category name. A glob is refused.
     :param item: the exact item name. A glob is refused.
     :param value: the value to persist, validated against the item map.
-    :param dry_run: plan only. It sends bodyless GETs and nothing else,
-        writes nothing to disk, and returns a report with
+    :param dry_run: plan only. It sends bodyless GETs and nothing else, and
+        writes nothing to disk; the caller's ``DeviceLock`` lockfile is the
+        one disk write a dry run implies. It returns a report with
         ``flash_compared=False``, the reason, and ``planned_requests``.
     :returns: :class:`FlashSaveReport`. ``saved`` is ``False`` when flash
-        already held *value* (RAM is then set to it, and flash is not
-        written).
+        already held *value*. RAM is then set to it, or left alone if it
+        already held it, and flash is not written.
     :raises FlashSaveRefusedError: a static refusal (before any request),
         an invalid value, or another RAM-vs-flash difference.
-    :raises FlashSaveRestoreError: RAM could not be verified back.
+    :raises FlashSaveRestoreError: RAM could not be verified back, or an
+        error after a load had been sent (every item is then put back
+        first, and the error names any that would not go back).
     :raises FlashSaveVerifyError: the save's answer or the flash read-back
         was wrong.
     """
@@ -374,10 +506,9 @@ def save_config_item_to_flash(
         )
     if _is_glob(category) or _is_glob(item):
         raise refuse("category and item must be exact names, not patterns")
-    skipped = _skipped_name(category)
-    if skipped is not None:
-        raise refuse(f"{skipped!r} is never loaded from flash: "
-                     f"{FLASH_DIFF_SKIPPED[skipped]}")
+    skip_reason = _skip_reason_for(category)
+    if skip_reason is not None:
+        raise refuse(f"{category!r} is never loaded from flash: {skip_reason}")
     page = _shared_page_with_skipped(category)
     if page is not None:
         raise refuse(
@@ -409,9 +540,9 @@ def save_config_item_to_flash(
 
     compared: list[str] = []
     for name in listed:
-        skip = _skipped_name(name)
-        if skip is not None:
-            report.skipped_categories[name] = FLASH_DIFF_SKIPPED[skip]
+        skip_reason = _skip_reason_for(name)
+        if skip_reason is not None:
+            report.skipped_categories[name] = skip_reason
             continue
         compared.append(name)
     report.compared_categories = compared
@@ -444,36 +575,21 @@ def save_config_item_to_flash(
     flash: dict[str, dict[str, Any]] = {}
     for name in compared:
         report.side_effects = _SIDE_EFFECTS
-        loaded = client.load_config_from_flash(name)
-        flash[name] = _unwrap_category(client.get_config_category(name), name)
-        diffs = _diff(ram[name], flash[name])
-        failed: list[str] = []
-        for it, (ram_value, flash_value) in diffs.items():
-            report.differences[(name, it)] = (ram_value, flash_value)
-            if it not in ram[name]:
-                failed.append(it)
-                continue
-            try:
-                client.set_config_item(name, it, ram_value, verify=True)
-            except Ultimate64Error as e:
-                _log.warning("restore of %r/%r failed: %s", name, it, e)
-                failed.append(it)
-        after = _unwrap_category(client.get_config_category(name), name)
-        failed += [it for it in _diff(ram[name], after) if it not in failed]
-        if failed:
+        try:
+            flash[name] = _compare_one(client, name, ram[name], report)
+        except (FlashSaveRestoreError, FlashSaveRefusedError, FlashSaveVerifyError):
+            raise
+        except Ultimate64Error as e:
+            # The load may have been applied: from here on RAM can hold flash
+            # values, so put every item of the snapshot back before raising.
+            failed = _put_back_all(client, name, ram[name])
             raise FlashSaveRestoreError(
-                f"{name!r} was loaded from flash for comparison and could not be "
-                f"verified back to its RAM values: {failed!r} may now hold flash "
-                "values. Nothing was saved",
+                f"{name!r} was loaded from flash for comparison and the next step "
+                f"failed ({e}); every item was put back"
+                + (f" except {failed!r}, which may now hold flash values"
+                   if failed else ", verified") + ". Nothing was saved",
                 name, failed, report,
-            )
-        if loaded != [name]:
-            raise FlashSaveRestoreError(
-                f"PUT {name!r}:load_from_flash reported loading {loaded!r}, not "
-                f"[{name!r}]; any other store it reloaded was not put back. "
-                "Nothing was saved",
-                name, [], report,
-            )
+            ) from e
     report.flash_compared = True
     report.flash_before = flash[cat].get(key)
 
@@ -490,7 +606,13 @@ def save_config_item_to_flash(
             "to its values before this call"
         )
 
-    # 5. Set the key; put it back if the write does not take.
+    # 5. Set the key; put it back if the write does not take.  Nothing to do
+    # when RAM and flash already hold the value.
+    already_in_flash = _config_values_match(item_map, stored, report.flash_before)
+    if already_in_flash and _config_values_match(item_map, stored, report.ram_before):
+        _log.info("%s/%s already holds %s in RAM and flash on %s; nothing to do",
+                  cat, key, _shown(key, stored), client.host)
+        return report
     try:
         client.set_config_item(cat, key, stored, verify=True)
     except Ultimate64Error as e:
@@ -503,7 +625,7 @@ def save_config_item_to_flash(
                 cat, [key], report,
             ) from e2
         raise refuse(f"the write did not take ({e}); RAM was put back") from e
-    if _config_values_match(item_map, stored, report.flash_before):
+    if already_in_flash:
         _log.info("%s/%s already holds %s in flash on %s; not saving",
                   cat, key, _shown(key, stored), client.host)
         return report
@@ -520,7 +642,13 @@ def save_config_item_to_flash(
         )
 
     # 7. Confirm from flash.
-    client.load_config_from_flash(cat)
+    loaded = client.load_config_from_flash(cat)
+    if loaded != [cat]:
+        raise FlashSaveVerifyError(
+            f"the confirming PUT {cat!r}:load_from_flash reported loading "
+            f"{loaded!r}, not [{cat!r}]",
+            report,
+        )
     confirmed = _unwrap_category(client.get_config_category(cat), cat)
     wrong = _diff(expected, confirmed)
     if wrong or not _config_values_match(item_map, stored, confirmed.get(key)):
