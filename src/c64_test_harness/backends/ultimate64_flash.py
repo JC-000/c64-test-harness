@@ -155,83 +155,91 @@ __all__ = [
 
 
 def _skip_reason(name: str, why_not_loaded: str) -> str:
-    return f"{why_not_loaded} (BASELINE_NEVER_TOUCH: {BASELINE_NEVER_TOUCH[name]})"
+    if name not in BASELINE_NEVER_TOUCH:  # the pointer must resolve
+        raise KeyError(f"{name!r} is not in BASELINE_NEVER_TOUCH")
+    return f"{why_not_loaded} (see BASELINE_NEVER_TOUCH[{name!r}])"
 
 
-#: Stores that are never loaded from flash, so they are never compared.
-#: Each reason says why loading it is unsafe, then quotes the
-#: :data:`~.ultimate64_baseline.BASELINE_NEVER_TOUCH` entry for the same
-#: store. None of them shares a flash page with a store that can be a target.
-#: The one page shared with a skipped store is refused through
-#: :data:`FLASH_SHARED_PAGES`.
+#: Stores that are never loaded from flash, so they are never compared, each
+#: with a one-line reason; the full account of each store is in
+#: :data:`~.ultimate64_baseline.BASELINE_NEVER_TOUCH`, which the reason
+#: points to.  Source detail behind the one-liners (1.1.0 unless marked):
+#:
+#: * Ethernet Settings (own page 0x4E657477): a load re-runs
+#:   ``NetworkInterface::effectuate_settings``, which calls ``dhcp_stop()``
+#:   unconditionally on a link-up interface (``network_interface.cc:403-407``),
+#:   clearing the address the REST connection uses and aborting every
+#:   connection on it.  U64E 3a1ff9ff :427-437 guards this; the C64U does not.
+#: * WiFi settings (own page 0x57494649): the same path through
+#:   ``NetworkLWIP_WiFi::effectuate_settings`` (``network_esp32.cc:123-125``).
+#: * Network Settings (own page 0x4E455400): REST checks ``X-Password``
+#:   against the live Network Password (``routes.h:305-313``), so a differing
+#:   flash password locks the client out before RAM can be put back; and the
+#:   C64U's ``/Temp`` hygiene FTP enable lives in RAM only, so comparing this
+#:   store would refuse every call there.
+#: * SID Sockets Configuration (page 0x55363443, shared): a load re-runs
+#:   ``U64SidSockets::effectuate_settings``, which writes the socket regulator
+#:   bits; a differing flash value cuts socket power, and the restore PUT
+#:   re-applies voltage without the 12 V approval.
+#: * Clock Settings: RTC-backed with no flash page (``rtc.h:17-27``); on the
+#:   U64E a load arms ``at_close_config``, which writes RAM items to the chip.
+#:
+#: None of them shares a flash page with a store that can be a target; the
+#: one shared page is refused through :data:`FLASH_SHARED_PAGES`.
 FLASH_DIFF_SKIPPED: dict[str, str] = {
     "Ethernet Settings": _skip_reason(
         "Ethernet Settings",
-        "a load re-runs NetworkInterface::effectuate_settings, which on 1.1.0 "
-        "calls dhcp_stop() unconditionally on a link-up interface "
-        "(network_interface.cc:403-407): the address the REST connection uses "
-        "is cleared and every connection on it is aborted (U64E 3a1ff9ff "
-        ":427-437 guards this; the C64U does not). Own flash page 0x4E657477",
+        "a load re-runs dhcp_stop() on the live link (1.1.0) and drops the REST connection",
     ),
     "WiFi settings": _skip_reason(
         "WiFi settings",
-        "a load re-runs NetworkLWIP_WiFi::effectuate_settings -> "
-        "NetworkInterface::effectuate_settings (network_esp32.cc:123-125), "
-        "the same dhcp_stop() path on the wireless interface. Own flash page "
-        "0x57494649",
+        "a load re-runs dhcp_stop() on the wireless link the device may be reached over",
     ),
     "Network Settings": _skip_reason(
         "Network Settings",
-        "REST checks X-Password against the live Network Password "
-        "(routes.h:305-313), so a flash password that differs from RAM would "
-        "lock this client out before RAM could be put back; and on the C64U "
-        "the /Temp hygiene's FTP enable lives in RAM only, so comparing this "
-        "store would refuse every call there. Own flash page 0x4E455400",
+        "a differing flash Network Password would lock this client out before RAM is put back",
     ),
     "SID Sockets Configuration": _skip_reason(
         "SID Sockets Configuration",
-        "a load re-runs U64SidSockets::effectuate_settings, which writes the "
-        "socket regulator bits from the loaded values: a flash value that "
-        "differs would cut socket power, and the restore PUT would re-apply "
-        "voltage without the 12 V approval. Shares flash page 0x55363443, "
-        "which is why FLASH_SHARED_PAGES refuses its neighbours as targets",
+        "a load rewrites the socket regulators and can cut socket power",
     ),
     "Clock Settings": _skip_reason(
         "Clock Settings",
-        "RTC-backed, with no flash page to compare against (rtc.h:17-27); on "
-        "the U64E a load arms at_close_config, which writes the RAM items to "
-        "the clock chip. Not listed on the C64U at all",
+        "RTC-backed with no flash page; a load can write the clock chip",
     ),
 }
 
 #: Per-socket SID-chip stores, matched by name, never loaded and never a
-#: target. Names re-derived from source: at 3a1ff9ff ``"SID Socket %d: "`` +
-#: ``ARMSID`` (``sid_device_armsid.cc:82``), ``PDsid``
-#: (``sid_device_pdsid.cc:25``), ``SidKick`` / ``SidKick Pico``
+#: target, with a one-line reason.  Names re-derived from source: at 3a1ff9ff
+#: ``"SID Socket %d: "`` + ``ARMSID`` (``sid_device_armsid.cc:82``),
+#: ``PDsid`` (``sid_device_pdsid.cc:25``), ``SidKick`` / ``SidKick Pico``
 #: (``sid_device_sidkick.cc:47``), ``FPGASID`` (``sid_device_fpgasid.cc:124``)
 #: and ``SwinSID Ultimate`` (``sid_device_swinsid.cc:60``); at 1.1.0
 #: ``"ARMSID in Socket %d"`` (:82), ``"FPGASID in Socket %d"`` (:124) and
 #: ``"SwinSID Ultimate in Socket %d"`` (:60).
+#:
+#: Why: ARMSID, PDsid and SidKick are custom stores with no flash page
+#: (``ConfigStore(NULL, ...)`` + ``add_custom_store``, 3a1ff9ff
+#: ``sid_device_armsid.cc:88-91``, ``sid_device_pdsid.cc:28/63``,
+#: ``sid_device_sidkick.cc:50/88``) whose ``read()`` is empty
+#: (``sid_device_pdsid.h:23``, ``sid_device_sidkick.h:23``,
+#: ``sid_device_armsid.h:35``): a load changes nothing, so a comparison sees
+#: nothing, yet ``save_to_flash`` lists the store as written.  PDsid's and
+#: SidKick's ``write()`` is empty (:24), so a "save" would report
+#: ``saved=True`` with nothing persisted; ARMSID's ``write()`` saves into the
+#: chip's own flash (``sid_device_armsid.cc:192-199``).  FPGASID and SwinSID
+#: Ultimate have flash pages (0x46534944 / 0x5357494E + socket) but their
+#: effectuate programs the chip itself, so a load would push flash values
+#: into the SID; excluding them is a deliberately conservative extension.
+#: Each sits on its own page, so skipping it costs a target elsewhere nothing.
 FLASH_DIFF_SKIPPED_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(
             r"^(?:SID Socket \d+: .+|(?:ARMSID|FPGASID|SwinSID Ultimate) in Socket \d+)$",
             re.IGNORECASE,
         ),
-        "a per-socket SID-chip store. ARMSID, PDsid and SidKick are custom "
-        "stores with no flash page (ConfigStore(NULL, ...) + add_custom_store, "
-        "3a1ff9ff sid_device_armsid.cc:88-91, sid_device_pdsid.cc:28/63, "
-        "sid_device_sidkick.cc:50/88) whose read() is empty "
-        "(sid_device_pdsid.h:23, sid_device_sidkick.h:23, "
-        "sid_device_armsid.h:35): a load changes nothing, so a comparison "
-        "sees nothing, yet save_to_flash lists the store as written. PDsid's "
-        "and SidKick's write() is empty (:24), so a 'save' would report "
-        "saved=True with nothing persisted; ARMSID's write() saves into the "
-        "chip's own flash (sid_device_armsid.cc:192-199). FPGASID and SwinSID "
-        "Ultimate have flash pages (0x46534944/0x5357494E + socket) but their "
-        "effectuate programs the chip itself, so a load would push flash "
-        "values into the SID. Each sits on its own page, so skipping it does "
-        "not weaken the check for a target elsewhere",
+        "a per-socket SID-chip store: no flash page or chip-programming effectuate "
+        "(see FLASH_DIFF_SKIPPED_PATTERNS)",
     ),
 )
 
@@ -588,8 +596,11 @@ def save_config_item_to_flash(
             f"GET {enc}",
         ]
     item_path = f"/v1/configs/{cat}/{key}"
+    set_entry = f"PUT {item_path}?value={stored} + GET (verify)"
+    if _config_values_match(item_map, stored, report.ram_before):
+        set_entry += " (skipped if flash also holds the value)"
     report.planned_requests += [
-        f"PUT {item_path}?value={stored} + GET (verify)",
+        set_entry,
         "(the save, load and GET below are skipped if flash already holds the value)",
         f"PUT /v1/configs/{cat}:save_to_flash",
         f"PUT /v1/configs/{cat}:load_from_flash",

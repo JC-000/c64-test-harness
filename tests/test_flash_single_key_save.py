@@ -754,3 +754,29 @@ def test_a_rejected_put_back_counts_even_when_the_re_read_matches(locked):
         _run(dev, DRV, "Drive Bus ID", 9)
     assert FAST in info.value.items
     assert "verified" not in str(info.value)
+
+
+class _CategoryReadsFailAfterLoad(_FakeFlashDevice):
+    """After a load, every category GET answers HTTP 500; item GETs still work."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.loaded = False
+
+    def __call__(self, req, timeout=None):
+        if req.get_full_url().endswith(":load_from_flash"):
+            self.loaded = True
+        path = urllib.parse.unquote(urllib.parse.urlsplit(req.get_full_url()).path)
+        if self.loaded and req.get_method() == "GET" and len(path.split("/")) == 4:
+            raise urllib.error.HTTPError(req.full_url, 500, "Err", {}, BytesIO(b"x"))
+        return super().__call__(req, timeout)
+
+
+def test_a_failed_re_read_after_the_put_back_counts_every_item(locked):
+    """The put-back PUTs verify, but the category cannot be read back: nothing is verified."""
+    dev = _CategoryReadsFailAfterLoad(ram={(C64, REU): "512 KB"}, flash={(C64, REU): "2 MB"})
+    with pytest.raises(FlashSaveRestoreError) as info:
+        _run(dev, C64, FAST, "Enabled")
+    assert sorted(info.value.items) == sorted(dev.items[C64])
+    assert "verified" not in str(info.value)
+    assert _no_save(dev)
