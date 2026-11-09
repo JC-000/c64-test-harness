@@ -185,6 +185,21 @@ from .backends.ultimate64_flash import (
     FlashSaveVerifyError,
     save_config_item_to_flash,
 )
+from .backends.ultimate64_remote_menu import (
+    RemoteMenuConnectError,
+    RemoteMenuLockError,
+    RemoteMenuNavigationError,
+    RemoteMenuNotFoundError,
+    RemoteMenuTiming,
+    RemoteMenuUnexpectedScreenError,
+    RemoteMenuVerifyError,
+    RunUpdateResult,
+    Ultimate64RemoteMenu,
+    Ultimate64RemoteMenuError,
+    UpdateImageRejectedError,
+    WifiChangeResult,
+    WifiStatus,
+)
 from .backends.u64_capabilities import CbmFixConstantStaleWarning
 from .backends.ultimate64_probe import (
     LivenessResult,
@@ -672,6 +687,20 @@ __all__ = [
     "STOCK_ROM_NAMES",
     "storage_put_rom",
     "storage_delete_rom",
+    # Telnet Remote Menu driver: WiFi row, Run Update (issue #543)
+    "Ultimate64RemoteMenu",
+    "RemoteMenuTiming",
+    "WifiStatus",
+    "WifiChangeResult",
+    "RunUpdateResult",
+    "Ultimate64RemoteMenuError",
+    "RemoteMenuLockError",
+    "RemoteMenuConnectError",
+    "RemoteMenuUnexpectedScreenError",
+    "RemoteMenuNotFoundError",
+    "RemoteMenuNavigationError",
+    "RemoteMenuVerifyError",
+    "UpdateImageRejectedError",
     # CBM /Temp-fix constant never set for a newer C64U release (issue #248)
     "CbmFixConstantStaleWarning",
     # Ultimate 64 liveness probe
