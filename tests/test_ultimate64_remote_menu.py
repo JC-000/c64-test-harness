@@ -155,7 +155,7 @@ def test_u64e_listing_selection_is_read_from_colour():
     ("WiFi    ESP32 WiFi Bridge V0.903 bench             Disabled", "disabled",
      "ESP32 WiFi Bridge V0.903 bench", None, None),
     ("WiFi                                               Disabled", "disabled", None, None, None),
-    ("WiFi    IP: 10.43.23.158                           Link Up", "link-up", None, "10.43.23.158", None),
+    ("WiFi    IP: 192.0.2.158                            Link Up", "link-up", None, "192.0.2.158", None),
     ("WiFi    MAC 3C:DC:75:4A:38:60                      Link Down", "link-down", None, None,
      "3C:DC:75:4A:38:60"),
     ("WiFi    ESP32 WiFi Bridge V0.903 bench             Scanning", "scanning", None, None, None),
@@ -169,7 +169,7 @@ def test_wifi_row_states(row, state, ident, ip, mac):
 
 
 def test_wifi_row_rejects_other_rows_and_unknown_words():
-    assert parse_wifi_row("Net0    IP: 10.43.23.26                            Link Up") is None
+    assert parse_wifi_row("Net0    IP: 192.0.2.26                             Link Up") is None
     with pytest.raises(RemoteMenuUnexpectedScreenError):
         parse_wifi_row("WiFi                                               Exploded")
 
