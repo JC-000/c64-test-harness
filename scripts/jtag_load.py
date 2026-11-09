@@ -60,12 +60,43 @@ ESP_JTAG_HOST = Path(os.environ.get("ESP_JTAG_DIR", "~/Documents/1541u-tools/esp
 UPSTREAM_TESTS = Path(os.environ.get("C64U_TESTS_DIR", "~/Documents/1541ultimate/tests")).expanduser()
 
 # One kit, wired to one device. Key: the device's /v1/info unique_id (the DeviceLock key is uid-<lowercase>).
-# JTAG_PORT overrides the port (the adapter is identified by its esp-jtag handshake, not by the name; CP2102 bridges
-# all report serial 0001, so the name says nothing). The adapter lock is keyed by the port actually used.
-_PORT = os.environ.get("JTAG_PORT", "/dev/cu.usbserial-0001")
+# The adapter is selected by its USB LOCATION (pyserial list_ports .location), never by the /dev name: CP2102 bridges
+# all report serial "0001", and macOS swaps /dev/cu.usbserial-N names between two CP2102s on replug (2026-11-08: the
+# B&K 880 LCR meter's CP2102 and this adapter swapped names). JTAG_USB_LOCATION overrides the location; JTAG_PORT, if
+# set, must name the same port as the location or the run is refused. The adapter lock is keyed by the location.
+# The esp-jtag handshake (_open) and the IDCODE pre-gate (0362c093) stay as the second and third checks.
+JTAG_USB_LOCATION = os.environ.get("JTAG_USB_LOCATION", "0-1.2")
 ADAPTERS = {
-    "5D2518": {"port": _PORT, "lock": "jtag-adapter-" + os.path.basename(_PORT), "baud": "921600"},
+    "5D2518": {"location": JTAG_USB_LOCATION, "lock": "jtag-adapter-usb-" + JTAG_USB_LOCATION, "baud": "921600"},
 }
+
+
+def resolve_port(location: str, comports=None) -> str:
+    """The one /dev/cu.* serial port at USB `location`; refuse (JtagLoadError) on none, several, or a JTAG_PORT that
+    names a different port."""
+    if comports is None:
+        try:
+            from serial.tools import list_ports
+        except ImportError as e:
+            raise JtagLoadError("adapter", f"pyserial is needed to find the JTAG adapter by USB location ({e})")
+        comports = list_ports.comports()
+    hits = sorted({p.device for p in comports if p.location == location and str(p.device).startswith("/dev/cu.")})
+    if len(hits) != 1:
+        raise JtagLoadError("adapter", f"{len(hits)} serial ports at USB location {location}: {hits}; refusing "
+                            "(set JTAG_USB_LOCATION after checking which port is the esp-jtag adapter)")
+    env = os.environ.get("JTAG_PORT")
+    if env and env != hits[0]:
+        raise JtagLoadError("adapter", f"JTAG_PORT={env}, but the adapter at USB location {location} is {hits[0]}; "
+                            "refusing (the names swap on replug)")
+    return hits[0]
+
+
+def adapter_for(uid: str, comports=None) -> dict:
+    """ADAPTERS[uid] with "port" resolved from its USB location (an entry that already names a port is kept)."""
+    a = dict(ADAPTERS[uid])
+    if "port" not in a:
+        a["port"] = resolve_port(a["location"], comports)
+    return a
 PRODUCTS = ("C64 Ultimate", "Ultimate 64-II")   # U64 == 2 builds; the dev app reports "Ultimate 64-II"
 XC7A50T = 0x0362C093
 EXPECT_USERID = 0xDEAD1541
@@ -272,7 +303,7 @@ def read_ids(host: str, *, user_block: bool = False, lock_timeout: float = 600, 
     JTAG user block (IR 5/6 memory writes) before any load is attempted with it.
     """
     esp = esp or esp_module()
-    adapter = ADAPTERS[bound_uid(host)]
+    adapter = adapter_for(bound_uid(host))
     with _Locked(host, adapter, lock_timeout, lock_factory):
         link, jtag = _open(esp, adapter)
         try:
@@ -369,7 +400,7 @@ def scan_u64e(host: str, *, lock_timeout: float = 600, esp=None, lock_factory=De
     uid = key[4:].upper() if key.startswith("uid-") else None
     if uid not in SCAN_ONLY:
         raise JtagLoadError("binding", f"{host}: the chain scan is enabled only for {sorted(SCAN_ONLY)}")
-    adapter = {"port": _PORT, "lock": "jtag-adapter-" + os.path.basename(_PORT), "baud": "921600"}
+    adapter = {"port": resolve_port(JTAG_USB_LOCATION), "lock": "jtag-adapter-usb-" + JTAG_USB_LOCATION, "baud": "921600"}
     with _Locked(host, adapter, lock_timeout, lock_factory):
         info = try_info(host, client_factory)      # never drive pins into an unpowered FPGA (back-feed)
         if not info or str(info.get("unique_id", "")).upper() != uid:
@@ -402,7 +433,7 @@ def jtag_load(host: str, bit, app, *, bit_sha256: str, app_sha256: str, expect_g
         cold = os.environ.get("JTAG_LOAD_WARM") != "1"
     esp = esp or esp_module()
     uid = bound_uid(host)
-    adapter = ADAPTERS[uid]
+    adapter = adapter_for(uid)
     expect_git_hash = check_git_hash(expect_git_hash)
     rec = {"t0": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": host, "uid": uid, "adapter": adapter["port"],
            "bit": str(bit), "bin": str(app), "bit_sha256": bit_sha256.lower(), "bin_sha256": app_sha256.lower(),

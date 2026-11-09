@@ -611,3 +611,32 @@ def test_warm_load_only_when_asked(env, monkeypatch):
     esp = FakeEsp(ev)
     rec = load(env, esp, FakeClient(ev, [info()]))
     assert rec["cold"] is False and esp.steps == [("warm_run",)]
+
+
+class _Port:
+    def __init__(self, device, location):
+        self.device, self.location = device, location
+
+
+def test_port_is_chosen_by_usb_location_not_by_name(monkeypatch):
+    """2026-11-08: two CP2102s (serial 0001 both) swap /dev names on replug; select by USB location."""
+    monkeypatch.delenv("JTAG_PORT", raising=False)
+    ports = [_Port("/dev/cu.usbserial-0001", "0-1.2"), _Port("/dev/cu.usbserial-4", "0-1.3"),
+             _Port("/dev/tty.usbserial-0001", "0-1.2")]
+    assert jl.resolve_port("0-1.2", ports) == "/dev/cu.usbserial-0001"
+    assert jl.resolve_port("0-1.3", ports) == "/dev/cu.usbserial-4"
+
+
+def test_port_refused_when_none_or_several_match(monkeypatch):
+    monkeypatch.delenv("JTAG_PORT", raising=False)
+    with pytest.raises(jl.JtagLoadError, match="0 serial ports"):
+        jl.resolve_port("0-1.2", [_Port("/dev/cu.usbserial-4", "0-1.3")])
+    with pytest.raises(jl.JtagLoadError, match="2 serial ports"):
+        jl.resolve_port("0-1.2", [_Port("/dev/cu.usbserial-4", "0-1.2"), _Port("/dev/cu.usbserial-0001", "0-1.2")])
+
+
+def test_port_refused_when_jtag_port_names_another_port(monkeypatch):
+    monkeypatch.setenv("JTAG_PORT", "/dev/cu.usbserial-4")
+    with pytest.raises(jl.JtagLoadError, match="names swap"):
+        jl.resolve_port("0-1.2", [_Port("/dev/cu.usbserial-0001", "0-1.2")])
+    assert jl.resolve_port("0-1.2", [_Port("/dev/cu.usbserial-4", "0-1.2")]) == "/dev/cu.usbserial-4"
