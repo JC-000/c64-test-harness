@@ -51,10 +51,15 @@ attachments on any firmware. ``set_config_items_batch`` and the global
    * re-read the category, and require it to equal the snapshot.
 
    A failed or rejected restore raises :class:`FlashSaveRestoreError`
-   at once. So does any other error once the load has been sent: a lost
-   load reply, or a failed GET. Every item of the category's snapshot is
-   then written back with ``verify=True`` first, and the error names the
-   items that would not go back.
+   at once. So does any other exception once the load has been sent: a
+   lost load reply, a failed GET, or a fault outside the client's error
+   mapping. Every item of the category's snapshot is then written back with
+   ``verify=True`` first, and the category is re-read against the snapshot.
+   The first connection-level timeout stops the put-back, and every item not
+   yet written counts as not back, so a vanished device costs one timeout,
+   not one per item. The error names the items that would not go back. A
+   ``KeyboardInterrupt`` (or any other non-``Exception``) gets the same
+   put-back and then propagates unchanged.
 4. Refuse with :class:`FlashSaveRefusedError` if any difference other than
    the target remains. RAM has already been verified back at this point.
 5. If RAM and flash both already hold *value*, stop: ``saved=False``, and
@@ -130,6 +135,7 @@ from .ultimate64_baseline import (
 from .ultimate64_client import (
     Ultimate64Client,
     Ultimate64Error,
+    Ultimate64TimeoutError,
     _config_values_match,
     _strtol0,
 )
@@ -399,14 +405,37 @@ def _diff(ram: dict, flash: dict) -> dict[str, tuple[Any, Any]]:
 
 
 def _put_back_all(client: Ultimate64Client, name: str, ram: dict) -> list[str]:
-    """Write every snapshot item of *name* back, verified; the ones that failed."""
+    """Write every snapshot item of *name* back, verified; the ones not back.
+
+    Any ``Exception`` on one item is logged and that item counted, and the
+    loop goes on, so a fault outside the client's error mapping neither
+    stops the put-back nor replaces the error that started it.  A
+    connection-level :class:`Ultimate64TimeoutError` stops it instead: the
+    device is not answering, so every item not yet written is counted rather
+    than spending one timeout each.  The category is then read once more and
+    any item that does not match the snapshot is counted too (a later item's
+    hook can undo an earlier put-back); that read is skipped after a timeout,
+    and if it fails every item counts as not verified.
+    """
     failed: list[str] = []
-    for it, value in ram.items():
+    items = list(ram.items())
+    for n, (it, value) in enumerate(items):
         try:
             client.set_config_item(name, it, value, verify=True)
-        except Ultimate64Error as e:
+        except Ultimate64TimeoutError as e:
+            _log.warning("put-back of %r/%r timed out (%s); not trying the "
+                         "remaining %d item(s)", name, it, e, len(items) - n - 1)
+            failed += [i for i, _v in items[n:]]
+            return failed
+        except Exception as e:
             _log.warning("put-back of %r/%r failed: %s", name, it, e)
             failed.append(it)
+    try:
+        after = _unwrap_category(client.get_config_category(name), name)
+    except Exception as e:
+        _log.warning("re-read of %r after the put-back failed: %s", name, e)
+        return list(ram)
+    failed += [it for it in _diff(ram, after) if it not in failed]
     return failed
 
 
@@ -579,10 +608,16 @@ def save_config_item_to_flash(
             flash[name] = _compare_one(client, name, ram[name], report)
         except (FlashSaveRestoreError, FlashSaveRefusedError, FlashSaveVerifyError):
             raise
-        except Ultimate64Error as e:
+        except BaseException as e:
             # The load may have been applied: from here on RAM can hold flash
             # values, so put every item of the snapshot back before raising.
+            # KeyboardInterrupt and the like still propagate, after it.
             failed = _put_back_all(client, name, ram[name])
+            if not isinstance(e, Exception):
+                _log.warning("%s after loading %r from flash; put back, %s",
+                             type(e).__name__, name,
+                             f"except {failed!r}" if failed else "verified")
+                raise
             raise FlashSaveRestoreError(
                 f"{name!r} was loaded from flash for comparison and the next step "
                 f"failed ({e}); every item was put back"

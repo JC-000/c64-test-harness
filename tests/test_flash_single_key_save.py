@@ -122,11 +122,14 @@ class _FakeFlashDevice:
         ``save_to_flash`` on top of the RAM image.
     :param loaded_override: ``callable(cat, n)`` giving the ``loaded`` list
         for the *n*-th load of *cat* (0-based), or ``None`` for the default.
+    :param raise_on_put: ``{(cat, item): exception}`` raised, unwrapped, by
+        ``urlopen`` for a PUT to that item (a fault outside the client's
+        error mapping).
     """
 
     def __init__(self, *, ram=None, flash=None, reject=(), save_noop=False,
                  written_override=None, extra=None, rewrite=None, put_hook=None,
-                 save_corrupt=None, loaded_override=None) -> None:
+                 save_corrupt=None, loaded_override=None, raise_on_put=None) -> None:
         self.items = _items()
         for cat, items in (extra or {}).items():
             self.items[cat] = {i: dict(m) for i, m in items.items()}
@@ -145,6 +148,7 @@ class _FakeFlashDevice:
         self.put_hook = put_hook or {}
         self.save_corrupt = save_corrupt or {}
         self.loaded_override = loaded_override
+        self.raise_on_put = raise_on_put or {}
         self.loads: dict[str, int] = {}
         self.save_noop = save_noop
         self.written_override = written_override
@@ -210,6 +214,8 @@ class _FakeFlashDevice:
                 return _resp({"written": written, "errors": []})
             raise AssertionError(f"unexpected PUT {path}")
         cat, item = parts[3], parts[4]
+        if (cat, item) in self.raise_on_put:
+            raise self.raise_on_put[(cat, item)]
         if (cat, item) in self.reject:
             raise urllib.error.HTTPError(req.full_url, 400, "Bad", {}, BytesIO(b"no"))
         value = query["value"][0]
@@ -636,3 +642,115 @@ def test_client_save_to_flash_rejects_a_malformed_answer(body):
     with patch("urllib.request.urlopen", lambda req, timeout=None: _Resp(body)), \
             pytest.raises(Ultimate64ProtocolError):
         c.save_config_to_flash(C64)
+
+
+# ------------------------------------------------------- review round 2 (#559)
+def test_a_failed_put_back_after_a_post_load_error_is_named(locked):
+    dev = _TimeoutAfterLoad(
+        ram={(C64, REU): "512 KB", (C64, FAST): "Enabled"},
+        flash={(C64, REU): "2 MB", (C64, FAST): "Enabled"},
+        reject={(C64, REU)},
+    )
+    with pytest.raises(FlashSaveRestoreError) as info:
+        _run(dev, C64, FAST, "Disabled")
+    assert REU in info.value.items
+    assert "verified" not in str(info.value)
+    assert _no_save(dev)
+
+
+class _InterruptAfterLoad(_FakeFlashDevice):
+    """The first GET after a load is interrupted by the operator."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.loaded = False
+        self.fired = False
+
+    def __call__(self, req, timeout=None):
+        if req.get_full_url().endswith(":load_from_flash"):
+            self.loaded = True
+        elif self.loaded and not self.fired and req.get_method() == "GET":
+            self.fired = True
+            raise KeyboardInterrupt
+        return super().__call__(req, timeout)
+
+
+def test_a_keyboard_interrupt_after_a_load_puts_ram_back_and_propagates(locked):
+    dev = _InterruptAfterLoad(ram={(C64, REU): "512 KB"}, flash={(C64, REU): "2 MB"})
+    with pytest.raises(KeyboardInterrupt):
+        _run(dev, C64, FAST, "Enabled")
+    assert dev.items[C64][REU]["current"] == "512 KB"
+    assert _no_save(dev)
+
+
+def test_a_non_harness_error_in_a_put_back_neither_stops_it_nor_masks_the_cause(locked):
+    """Fast Reset's put-back blows up; REU Size, after it, still goes back."""
+    dev = _TimeoutAfterLoad(
+        ram={(C64, REU): "512 KB", (C64, FAST): "Enabled"},
+        flash={(C64, REU): "2 MB", (C64, FAST): "Disabled"},
+        raise_on_put={(C64, FAST): RuntimeError("driver bug")},
+    )
+    with pytest.raises(FlashSaveRestoreError) as info:
+        _run(dev, DRV, "Drive Bus ID", 9)
+    assert FAST in info.value.items
+    assert dev.items[C64][REU]["current"] == "512 KB"
+    assert isinstance(info.value.__cause__, Ultimate64Error)
+    assert _no_save(dev)
+
+
+def test_a_put_back_undone_by_a_later_hook_is_caught_by_the_re_read(locked):
+    """Putting REU back rewrites Fast Reset, which went back just before it."""
+    dev = _TimeoutAfterLoad(
+        ram={(C64, REU): "512 KB", (C64, FAST): "Enabled"},
+        flash={(C64, REU): "2 MB", (C64, FAST): "Enabled"},
+        put_hook={(C64, REU): ((C64, FAST), "Disabled")},
+    )
+    with pytest.raises(FlashSaveRestoreError) as info:
+        _run(dev, DRV, "Drive Bus ID", 9)
+    assert FAST in info.value.items
+
+
+class _GoneAfterLoad(_FakeFlashDevice):
+    """Once a load has been sent, every request times out: the device is gone."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.gone = False
+        self.after: list[tuple[str, str]] = []
+
+    def __call__(self, req, timeout=None):
+        if self.gone:
+            self.after.append((req.get_method(), urllib.parse.unquote(
+                urllib.parse.urlsplit(req.get_full_url()).path)))
+            raise socket.timeout("gone")
+        resp = super().__call__(req, timeout)
+        if req.get_full_url().endswith(":load_from_flash"):
+            self.gone = True
+        return resp
+
+
+def test_a_device_gone_after_a_load_costs_one_timeout_not_one_per_item(locked):
+    dev = _GoneAfterLoad()
+    with pytest.raises(FlashSaveRestoreError) as info:
+        _run(dev, DRV, "Drive Bus ID", 9)
+    # The GET that found the device gone, then the first put-back PUT only.
+    assert len(dev.after) == 2
+    assert dev.after[1][0] == "PUT"
+    assert set(info.value.items) == set(dev.items[info.value.category])
+
+
+def test_a_rejected_put_back_counts_even_when_the_re_read_matches(locked):
+    """A put-back the device refused is not verified, even if the value is right.
+
+    Fast Reset holds the same value in RAM and flash, so the re-read after
+    the put-back matches; the refused PUT must still be reported.
+    """
+    dev = _TimeoutAfterLoad(
+        ram={(C64, REU): "512 KB", (C64, FAST): "Enabled"},
+        flash={(C64, REU): "2 MB", (C64, FAST): "Enabled"},
+        reject={(C64, FAST)},
+    )
+    with pytest.raises(FlashSaveRestoreError) as info:
+        _run(dev, DRV, "Drive Bus ID", 9)
+    assert FAST in info.value.items
+    assert "verified" not in str(info.value)
