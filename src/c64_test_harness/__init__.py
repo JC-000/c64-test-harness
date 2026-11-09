@@ -175,6 +175,16 @@ from .backends.ultimate64_storage import (
     storage_volumes,
     storage_writable_volumes,
 )
+from .backends.ultimate64_flash import (
+    FLASH_DIFF_SKIPPED,
+    FLASH_DIFF_SKIPPED_PATTERNS,
+    FLASH_SHARED_PAGES,
+    FlashSaveRefusedError,
+    FlashSaveReport,
+    FlashSaveRestoreError,
+    FlashSaveVerifyError,
+    save_config_item_to_flash,
+)
 from .backends.u64_capabilities import CbmFixConstantStaleWarning
 from .backends.ultimate64_probe import (
     LivenessResult,
@@ -632,6 +642,15 @@ __all__ = [
     "TempGCResult",
     "gc_temp_folder",
     "auto_gc_enabled",
+    # Guarded single-key save to flash (#559)
+    "FLASH_DIFF_SKIPPED",
+    "FLASH_DIFF_SKIPPED_PATTERNS",
+    "FLASH_SHARED_PAGES",
+    "FlashSaveRefusedError",
+    "FlashSaveReport",
+    "FlashSaveRestoreError",
+    "FlashSaveVerifyError",
+    "save_config_item_to_flash",
     # Ultimate persistent storage (FTP put/delete under the DeviceLock)
     "WRITE_REFUSED_VOLUMES",
     "StoragePutResult",
