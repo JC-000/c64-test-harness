@@ -3223,27 +3223,68 @@ class Ultimate64Client:
         body = json.dumps(updates).encode("utf-8")
         self._request("POST", "/v1/configs", body=body, content_type="application/json")
 
-    def save_config_to_flash(self) -> None:
-        """PUT /v1/configs:save_to_flash — persist config to flash (DESTRUCTIVE)."""
-        self._put_no_body("/v1/configs:save_to_flash")
+    def _store_listing(self, path: str, data: bytes, key: str) -> list[str]:
+        """The list of store names a bodyless config PUT answered under *key*."""
+        payload = self._parse_json(data)
+        if not isinstance(payload, dict):
+            raise Ultimate64ProtocolError(
+                f"expected an object from PUT {path}, got {type(payload).__name__}"
+            )
+        errors = payload.get("errors")
+        if errors:
+            raise Ultimate64ProtocolError(f"PUT {path} reported errors {errors!r}")
+        names = payload.get(key, [])
+        if not isinstance(names, list):
+            raise Ultimate64ProtocolError(f"{key!r} in PUT {path} answer is not a list")
+        return [str(n) for n in names]
 
-    def load_config_from_flash(self, category: str | None = None) -> None:
+    def save_config_to_flash(self, category: str | None = None) -> list[str]:
+        """PUT /v1/configs:save_to_flash — persist config to flash (DESTRUCTIVE).
+
+        Writes every store whose RAM is marked dirty (``is_flash_stale``,
+        ``route_configs.cc:330``). Any config PUT marks its store dirty,
+        even one that leaves the value unchanged. With *category*, only
+        stores matching that name or pattern are considered
+        (``PUT /v1/configs/<category>:save_to_flash``). Note that
+        ``ConfigPage::pack`` writes **every store on that store's flash
+        page** (``config.cc:274-289``). Returns the firmware's ``written``
+        list; an empty list means nothing was dirty.
+
+        Persisting one key safely needs more than this call; see
+        :func:`~c64_test_harness.backends.ultimate64_flash.save_config_item_to_flash`
+        (#559).
+        """
+        if category is None:
+            path = "/v1/configs:save_to_flash"
+        elif not isinstance(category, str) or not category:
+            raise ValueError("category must be a non-empty string")
+        else:
+            path = f"/v1/configs/{_encode(category)}:save_to_flash"
+        _, data = self._request("PUT", path)
+        return self._store_listing(path, data, "written")
+
+    def load_config_from_flash(self, category: str | None = None) -> list[str] | None:
         """PUT /v1/configs:load_from_flash — reload config from flash (DESTRUCTIVE).
 
         Discards every unsaved in-memory change: config PUTs are volatile
         until ``save_config_to_flash`` (firmware ``route_configs.cc``
         ``load_from_flash``: ``s->read(false); s->at_close_config()`` per
-        store, so the reloaded values are re-effectuated too). With
-        *category* given, only that category is reloaded via
+        store, so the reloaded values are re-effectuated too, **whether or
+        not any changed**: ``ConfigStore::read`` sets ``staleEffect``
+        unconditionally, ``config.cc:460``). With *category* given, only
+        that category is reloaded via
         ``PUT /v1/configs/<category>:load_from_flash`` (firmware accepts
-        a name or pattern; path depth >1 is HTTP 400).
+        a name or pattern; path depth >1 is HTTP 400), and the firmware's
+        ``loaded`` list is returned; the global form returns ``None``.
         """
         if category is None:
             self._put_no_body("/v1/configs:load_from_flash")
-            return
+            return None
         if not isinstance(category, str) or not category:
             raise ValueError("category must be a non-empty string")
-        self._put_no_body(f"/v1/configs/{_encode(category)}:load_from_flash")
+        path = f"/v1/configs/{_encode(category)}:load_from_flash"
+        _, data = self._request("PUT", path)
+        return self._store_listing(path, data, "loaded")
 
     def reset_config_to_default(self) -> None:
         """PUT /v1/configs:reset_to_default — reset all config (DESTRUCTIVE).
