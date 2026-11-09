@@ -86,14 +86,23 @@ def write_image(tmp_path: Path, name: str, content: bytes) -> Path:
 def make_image(tmp_path: Path, *, kind: str = "silent", ext: str = ".ue2",
                content: bytes | None = None, device_ext: str | None = None,
                sha: str | None = None, ident: str | None = None,
-               git_hash: str = HASH_NEW) -> FirmwareImage:
+               git_hash: str | None = HASH_NEW, fw: str | None = None) -> FirmwareImage:
     if content is None:
         content = record(LOAD, SILENT_BODY if kind == "silent" else PROMPT_BODY, LOAD)
+    if kind == "official" and ext == ".ue2" and git_hash == HASH_NEW:
+        git_hash, fw = None, fw or "1.1.0"      # official C64U: verified on product + version
     p = write_image(tmp_path, f"update{ext}", content)
+    extra = {} if fw is None else {"expected_firmware_version": fw}
     return FirmwareImage(
         local_path=p, device_path=f"/SD/fw/update{device_ext or ext}",
         sha256=sha or hashlib.sha256(content).hexdigest(),
-        expected_git_commit_hash=git_hash, kind=kind, expected_wifi_ident=ident)
+        expected_git_commit_hash=git_hash, kind=kind, expected_wifi_ident=ident, **extra)
+
+
+#: What official C64U 1.1.0 answers on /v1/info: no git_commit_hash
+#: (routes.cc:129-145 at 7b628eb1), product from the COMMODORE build.
+OFFICIAL_INFO = {"product": "C64 Ultimate", "firmware_version": "1.1.0", "fpga_version": "122",
+                 "core_version": "1.49", "hostname": "C64-Ultimate", "unique_id": UID}
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +132,8 @@ class FakeClient:
     def get_info(self):
         self.events.append("get_info")
         item = self._infos.pop(0) if len(self._infos) > 1 else self._infos[0]
+        if callable(item):          # a hook: runs, then answers
+            item = item()
         if isinstance(item, Exception):
             raise item
         return dict(item)
@@ -144,8 +155,10 @@ def wifi(state: str, ident: str | None = None) -> WifiStatus:
 
 class FakeMenu:
     def __init__(self, events, *, started=True, wifi_seq=None, ident="ESP32 WiFi Bridge V1.494",
-                 run_update_exc=None):
+                 run_update_exc=None, disable_exc=None, status_hook=None):
         self.events = events
+        self.disable_exc = disable_exc
+        self.status_hook = status_hook
         self.started = started
         self.wifi_seq = list(wifi_seq or [wifi("link-up")])
         self.ident = ident
@@ -162,12 +175,16 @@ class FakeMenu:
 
     def wifi_status(self):
         self.events.append("wifi_status")
+        if self.status_hook is not None:
+            self.status_hook()
         if not self.enabled:
             return wifi("disabled", self.ident)
         return self.wifi_seq.pop(0) if len(self.wifi_seq) > 1 else self.wifi_seq[0]
 
     def set_wifi_enabled(self, enabled, *, dry_run=False, verify_timeout=15.0):
         self.events.append(("set_wifi_enabled", enabled))
+        if enabled is False and self.disable_exc is not None:
+            raise self.disable_exc
         before = wifi("link-up") if enabled is False else wifi("disabled", self.ident)
         self.enabled = enabled
         after = wifi("disabled", self.ident) if not enabled else wifi("link-down")
@@ -402,28 +419,47 @@ def test_an_unknown_product_is_refused(rig, held, tmp_path):
     assert rig.names() == ["get_info"]
 
 
-# -- the SILENT gate -------------------------------------------------------
+# -- image class: prompting, SILENT, or not an updater ---------------------
 
 def test_kind_silent_on_a_prompting_image_is_refused(rig, held, tmp_path):
     content = record(LOAD, PROMPT_BODY, LOAD)
-    with pytest.raises(FirmwareImageError, match="is not a SILENT"):
+    with pytest.raises(FirmwareImageError, match="is a prompting updater"):
         rig.run(make_image(tmp_path, kind="silent", content=content))
-    assert rig.names() == ["get_info"]
+    assert rig.events == []
 
 
 def test_kind_dev_on_a_silent_image_is_refused(rig, held, tmp_path):
     content = record(LOAD, SILENT_BODY, LOAD)
-    with pytest.raises(FirmwareImageError, match="is a SILENT"):
+    with pytest.raises(FirmwareImageError, match="is a silent updater"):
         rig.run(make_image(tmp_path, kind="dev", content=content))
-    assert rig.names() == ["get_info"]
+    assert rig.events == []
 
 
-@pytest.mark.parametrize("prompt", PROMPTS)
-def test_one_prompt_string_makes_a_marked_image_unrecognised(rig, held, tmp_path, prompt):
-    content = record(LOAD, body(MARKER, prompt), LOAD)
-    with pytest.raises(FirmwareImageError, match="SILENT bench marker and prompt"):
-        rig.run(make_image(tmp_path, kind="silent", content=content))
-    assert rig.names() == ["get_info"]
+@pytest.mark.parametrize("kind", ["dev", "official", "silent"])
+def test_an_image_with_no_prompts_and_no_marker_is_not_an_updater(rig, held, tmp_path, kind):
+    # A RAM application image looks like this: valid records, no updater strings.
+    content = record(LOAD, body(b"plain application code"), LOAD)
+    with pytest.raises(FirmwareImageError, match="not an updater image"):
+        rig.run(make_image(tmp_path, kind=kind, content=content))
+    assert rig.events == [] and rig.client_made == []
+
+
+@pytest.mark.parametrize("missing", range(3))
+@pytest.mark.parametrize("marker", [False, True])
+def test_an_image_with_only_some_prompts_is_not_an_updater(rig, held, tmp_path, missing, marker):
+    strings = [p for i, p in enumerate(PROMPTS) if i != missing] + ([MARKER] if marker else [])
+    content = record(LOAD, body(*strings), LOAD)
+    with pytest.raises(FirmwareImageError, match="not an updater image"):
+        rig.run(make_image(tmp_path, kind="dev", content=content))
+    assert rig.events == []
+
+
+def test_the_marker_with_all_three_prompts_is_a_prompting_image(rig, held, tmp_path):
+    # Non-SILENT bench builds print the marker too (update_u64ii.cc:117 at 7b15448a7).
+    content = record(LOAD, body(MARKER, *PROMPTS), LOAD)
+    rec = rig.run(make_image(tmp_path, kind="dev", content=content))
+    assert rec.image_silent is False and rec.reset_configuration_answer == "YES"
+    assert rec.identity_verified
 
 
 def test_the_u64e_has_no_silent_path(rig, held, tmp_path):
@@ -434,18 +470,117 @@ def test_the_u64e_has_no_silent_path(rig, held, tmp_path):
     assert rig.names() == ["get_info"]
 
 
-def test_official_needs_the_reset_prompt_in_the_image(rig, held, tmp_path):
-    content = record(LOAD, body(PROMPTS[0], PROMPTS[1]), LOAD)
-    with pytest.raises(FirmwareImageError, match="Reset Configuration"):
-        rig.run(make_image(tmp_path, kind="official", content=content))
+# Real images from the 1541ultimate lane's build trees, when this machine has them.
+_RAM_APP = Path.home() / ("Documents/1541u-link/lanes/jtag-volatile/images/7b15448a7/"
+                          "u64e-ram-7b15448a7.u64")
+_MARKED_PROMPTING = Path.home() / "Documents/1541u-wt/c64u-base1400/update.ue2"
+_REAL_SILENT = Path.home() / "Documents/1541u-wt/flash-1109-artifacts-7b15448a7/update.ue2"
+
+
+def _real(path: Path, kind: str) -> FirmwareImage:
+    if not path.is_file():
+        pytest.skip(f"{path} is not on this machine")
+    return FirmwareImage(path, f"/SD/fw/{path.name}",
+                         hashlib.sha256(path.read_bytes()).hexdigest(), HASH_NEW, kind)
+
+
+def test_a_real_ram_application_image_is_not_an_updater(rig, held):
+    with pytest.raises(FirmwareImageError, match="not an updater image"):
+        rig.run(_real(_RAM_APP, "dev"))
     assert rig.events == []
 
 
-def test_official_on_a_u64e_waits_for_the_owner(rig, held, tmp_path):
-    rig.infos = [info(product="Ultimate 64 Elite")]
-    with pytest.raises(FirmwareFlashRefusedError, match="not decided"):
-        rig.run(make_image(tmp_path, kind="official", ext=".u64"))
+def test_a_real_marked_prompting_bench_image_is_a_dev_image(rig, held):
+    rec = rig.run(_real(_MARKED_PROMPTING, "dev"), dry_run=True,
+                  confirm_device_powers_off=False)
+    assert rec.image.has_silent_marker and len(rec.image.prompts_present) == 3
+    assert rec.image_silent is False and rec.reset_configuration_answer == "YES"
+
+
+def test_a_real_silent_bench_image_is_silent(rig, held):
+    rec = rig.run(_real(_REAL_SILENT, "silent"), dry_run=True,
+                  confirm_device_powers_off=False)
+    assert rec.image_silent is True and rec.image.prompts_present == ()
+
+
+# -- official images: verified on product + firmware_version ---------------
+
+def test_official_needs_an_expected_firmware_version(rig, held, tmp_path):
+    image = make_image(tmp_path, kind="official", ext=".u64", git_hash=None, fw=None)
+    with pytest.raises(FirmwareImageError, match="expected_firmware_version is required"):
+        rig.run(image)
+    assert rig.events == []
+
+
+def test_dev_needs_an_expected_git_hash(rig, held, tmp_path):
+    with pytest.raises(FirmwareImageError, match="expected_git_commit_hash is required"):
+        rig.run(make_image(tmp_path, kind="dev", git_hash=None))
+    assert rig.events == []
+
+
+def test_official_c64u_refuses_an_expected_git_hash(rig, held, tmp_path):
+    image = make_image(tmp_path, kind="official", git_hash="7b628eb1", fw="1.1.0")
+    with pytest.raises(FirmwareImageError, match="reports no git_commit_hash"):
+        rig.run(image)
     assert rig.names() == ["get_info"]
+
+
+def test_official_c64u_that_reports_a_hash_is_not_verified(rig, held, tmp_path):
+    rig.infos = [info(), dict(OFFICIAL_INFO, git_commit_hash="7b628eb1")]
+    with pytest.raises(FirmwareFlashVerifyError, match="official 1.1.0 reports none"):
+        rig.run(make_image(tmp_path, kind="official"))
+    assert "apply_factory_baseline" not in rig.events
+
+
+def test_official_c64u_needs_the_commodore_product_name(rig, held, tmp_path):
+    rig.infos = [info(), dict(OFFICIAL_INFO, product="Ultimate 64-II")]
+    with pytest.raises(FirmwareFlashVerifyError, match="reports 'C64 Ultimate'"):
+        rig.run(make_image(tmp_path, kind="official"))
+
+
+def test_official_c64u_with_the_wrong_version_is_not_verified(rig, held, tmp_path):
+    rig.infos = [info(), dict(OFFICIAL_INFO, firmware_version="1.0.9")]
+    with pytest.raises(FirmwareFlashVerifyError, match="firmware_version is '1.0.9'"):
+        rig.run(make_image(tmp_path, kind="official"))
+
+
+def test_official_u64e_answers_yes_and_is_verified_on_version_and_hash(
+        rig, held, tmp_path, caplog):
+    rig.infos = [info(product="Ultimate 64 Elite", git_hash="3a1ff9ff"),
+                 info(product="Ultimate 64 Elite", git_hash="ee005041") | {"firmware_version": "3.15"}]
+    image = make_image(tmp_path, kind="official", ext=".u64", git_hash="ee005041", fw="3.15")
+    with caplog.at_level(logging.WARNING, logger=ff.__name__):
+        rec = rig.run(image)
+    assert rec.reset_configuration_answer == "YES"
+    assert "'Reset Configuration? (Recommended)': YES" in caplog.text
+    assert rec.identity_verified and "apply_factory_baseline" not in rig.events
+
+
+def test_official_u64e_with_the_wrong_hash_is_not_verified(rig, held, tmp_path):
+    rig.infos = [info(product="Ultimate 64 Elite", git_hash="3a1ff9ff"),
+                 info(product="Ultimate 64 Elite", git_hash="3a1ff9ff") | {"firmware_version": "3.15"}]
+    image = make_image(tmp_path, kind="official", ext=".u64", git_hash="ee005041", fw="3.15")
+    with pytest.raises(FirmwareFlashVerifyError, match="git_commit_hash"):
+        rig.run(image)
+
+
+def test_official_u64e_without_a_hash_is_verified_on_the_version(rig, held, tmp_path):
+    rig.infos = [info(product="Ultimate 64 Elite"),
+                 info(product="Ultimate 64 Elite", git_hash="whatever") | {"firmware_version": "3.15"}]
+    rec = rig.run(make_image(tmp_path, kind="official", ext=".u64", git_hash=None, fw="3.15"))
+    assert rec.identity_verified
+
+
+# -- same identity before and after -----------------------------------------
+
+def test_a_device_already_on_the_target_is_flashed_but_not_verified(rig, held, tmp_path, caplog):
+    rig.infos = [info(git_hash=HASH_NEW), info(git_hash=HASH_NEW)]
+    with caplog.at_level(logging.WARNING, logger=ff.__name__):
+        rec = rig.run(make_image(tmp_path, kind="dev"))
+    assert rec.flash_distinguishable is False and rec.identity_verified is False
+    assert "cannot tell a flash from none" in caplog.text
+    assert ("run_update", "/SD/fw/update.ue2", False, True) in rig.events   # not refused
+    assert rec.steps[-1] == "verify"
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +620,8 @@ def test_a_silent_c64u_flash_uploads_runs_waits_and_verifies(rig, held, tmp_path
     names = rig.names()
     assert names.index("put_file") < names.index("run_update")
     assert names[names.index("run_update"):].count("get_info") == 3   # down, down, up
-    assert rec.hash_verified and rec.git_commit_hash_after == HASH_NEW
+    assert rec.identity_verified and rec.flash_distinguishable
+    assert rec.git_commit_hash_after == HASH_NEW
     assert rec.steps == ["validate", "preflight", "upload", "run_update", "wait", "verify"]
     assert rec.image_silent is True and rec.unique_id_after == UID
     assert "apply_factory_baseline" not in rig.events
@@ -520,7 +656,7 @@ def test_the_wrong_hash_after_the_flash_is_a_verify_error(rig, held, tmp_path):
     with pytest.raises(FirmwareFlashVerifyError, match="git_commit_hash") as ei:
         rig.run(make_image(tmp_path))
     rec = ei.value.record
-    assert rec.failed_step == "verify" and not rec.hash_verified
+    assert rec.failed_step == "verify" and not rec.identity_verified
     assert rec.run_update is not None and rec.run_update.started
     assert "verify" not in rec.steps and "wait" in rec.steps
 
@@ -568,8 +704,11 @@ def test_an_unclear_run_update_after_the_enter_says_the_updater_may_be_running(
 # -- Reset Configuration answers ------------------------------------------
 
 def test_official_c64u_answers_no_and_resets_the_categories_itself(rig, held, tmp_path, caplog):
+    rig.infos = [info(), Ultimate64TimeoutError("down"), dict(OFFICIAL_INFO)]
     with caplog.at_level(logging.WARNING, logger=ff.__name__):
         rec = rig.run(make_image(tmp_path, kind="official"))
+    assert rec.identity_verified and rec.git_commit_hash_after is None
+    assert rec.product_after == "C64 Ultimate" and rec.firmware_version_after == "1.1.0"
     assert rec.reset_configuration_answer == "NO"
     assert "'Reset Configuration? (Recommended)': NO" in caplog.text
     assert rig.events.count("apply_factory_baseline") == 1
@@ -656,3 +795,159 @@ def test_errors_are_ultimate64_errors():
     for cls in (FirmwareFlashError, FirmwareImageError, FirmwareFlashRefusedError,
                 FirmwareFlashTimeoutError, FirmwareFlashVerifyError, FirmwareFlashStepError):
         assert issubclass(cls, Ultimate64Error)
+
+
+# ---------------------------------------------------------------------------
+# Review round 1 (#561)
+# ---------------------------------------------------------------------------
+
+def test_an_os_error_from_run_update_is_treated_as_sent(rig, held, tmp_path):
+    # A socket error from sendall/select carries no enter_sent: unknown, not "no".
+    exc = ConnectionResetError(54, "Connection reset by peer")
+    with pytest.raises(FirmwareFlashStepError, match="UNKNOWN: treat it as sent") as ei:
+        rig.run(make_image(tmp_path), menu_kw={"run_update_exc": exc})
+    assert "No ENTER was sent" not in str(ei.value)
+    assert rig.names().count("get_info") == 1
+
+
+def test_a_lock_lost_during_the_wait_stops_before_verify(rig, held, tmp_path):
+    def lose():
+        held.release()
+        return info(git_hash=HASH_NEW)
+
+    rig.infos = [info(), Ultimate64TimeoutError("down"), lose]
+    try:
+        with pytest.raises(FirmwareFlashRefusedError, match="no longer held") as ei:
+            rig.run(make_image(tmp_path), roms=[_rom(tmp_path)])
+    finally:
+        assert held.acquire(timeout=5)
+    assert ei.value.record.failed_step == "verify"
+    assert "reboot" not in rig.events
+
+
+def test_a_lock_lost_before_reset_categories_stops_it(rig, held, tmp_path, monkeypatch):
+    real = ff._identity_problems
+
+    def problems_then_lose(info_, exp):
+        out = real(info_, exp)
+        if info_.get("product") == "C64 Ultimate":     # the read after the flash
+            held.release()
+        return out
+
+    monkeypatch.setattr(ff, "_identity_problems", problems_then_lose)
+    rig.infos = [info(), dict(OFFICIAL_INFO)]
+    try:
+        with pytest.raises(FirmwareFlashRefusedError, match="no longer held") as ei:
+            rig.run(make_image(tmp_path, kind="official"))
+    finally:
+        assert held.acquire(timeout=5)
+    assert ei.value.record.failed_step == "reset_categories"
+    assert "apply_factory_baseline" not in rig.events
+
+
+def test_a_lock_lost_before_the_wifi_step_stops_it(rig, held, tmp_path, monkeypatch):
+    def baseline_then_lose(client):
+        rig.events.append("apply_factory_baseline")
+        held.release()
+        return "baseline-report"
+
+    monkeypatch.setattr(ff, "apply_factory_baseline", baseline_then_lose)
+    rig.infos = [info(), dict(OFFICIAL_INFO)]
+    try:
+        with pytest.raises(FirmwareFlashRefusedError, match="no longer held") as ei:
+            rig.run(make_image(tmp_path, kind="official", ident="ESP32 WiFi Bridge V1.494"))
+    finally:
+        assert held.acquire(timeout=5)
+    assert ei.value.record.failed_step == "wifi_ident"
+    assert not any(isinstance(e, tuple) and e[0] == "set_wifi_enabled" for e in rig.events)
+
+
+def test_a_lock_lost_before_the_rom_step_stops_it(rig, held, tmp_path):
+    calls = {"n": 0}
+
+    def lose_at_link_up():
+        calls["n"] += 1
+        if calls["n"] == 4:          # settle, then link-down, link-down, link-up
+            held.release()
+
+    try:
+        with pytest.raises(FirmwareFlashRefusedError, match="no longer held") as ei:
+            rig.run(make_image(tmp_path, ident="ESP32 WiFi Bridge V1.494"),
+                    roms=[_rom(tmp_path)],
+                    menu_kw={"status_hook": lose_at_link_up,
+                             "wifi_seq": [wifi("link-up"), wifi("link-down"),
+                                          wifi("link-down"), wifi("link-up")]})
+    finally:
+        assert held.acquire(timeout=5)
+    assert ei.value.record.failed_step == "roms"
+    assert "put_rom" not in rig.names() and "reboot" not in rig.events
+
+
+def test_a_disable_whose_enter_was_not_sent_is_not_followed_by_enable(rig, held, tmp_path):
+    exc = RemoteMenuVerifyError("refused before the ENTER", enter_sent=False)
+    with pytest.raises(FirmwareFlashStepError):
+        rig.run(make_image(tmp_path, ident="ESP32 WiFi Bridge V1.494"),
+                menu_kw={"disable_exc": exc})
+    toggles = [e for e in rig.events if isinstance(e, tuple) and e[0] == "set_wifi_enabled"]
+    assert toggles == [("set_wifi_enabled", False)]
+
+
+def test_a_disable_that_failed_unclearly_is_followed_by_enable(rig, held, tmp_path):
+    exc = ConnectionResetError(54, "reset")          # no enter_sent: may have been sent
+    with pytest.raises(FirmwareFlashStepError):
+        rig.run(make_image(tmp_path, ident="ESP32 WiFi Bridge V1.494"),
+                menu_kw={"disable_exc": exc})
+    toggles = [e for e in rig.events if isinstance(e, tuple) and e[0] == "set_wifi_enabled"]
+    assert toggles == [("set_wifi_enabled", False), ("set_wifi_enabled", True)]
+
+
+def test_a_full_length_expected_hash_matches_the_short_reported_one(rig, held, tmp_path):
+    full = HASH_NEW + "0" * 32
+    rec = rig.run(make_image(tmp_path, git_hash=full))
+    assert rec.identity_verified and rec.git_commit_hash_after == HASH_NEW
+
+
+def test_a_reported_hash_shorter_than_seven_digits_is_refused(rig, held, tmp_path):
+    rig.infos = [info(), info(git_hash=HASH_NEW[:3])]
+    with pytest.raises(FirmwareFlashVerifyError, match="git_commit_hash"):
+        rig.run(make_image(tmp_path))
+
+
+def test_the_rest_wait_gives_up_at_its_deadline(rig, held, tmp_path):
+    rig.infos = [info(), Ultimate64TimeoutError("down")]
+    with pytest.raises(FirmwareFlashTimeoutError):
+        rig.run(make_image(tmp_path), wait_up_s=120, poll_interval_s=5)
+    elapsed = rig.clock.t - 1000.0      # nothing before the wait sleeps
+    assert 120 <= elapsed <= 125, elapsed
+
+
+def test_c64_ultimate_mk1_is_a_u64e_family_product(rig, held, tmp_path):
+    rig.infos = [info(product="C64 Ultimate (MK1)"),
+                 info(product="C64 Ultimate (MK1)", git_hash=HASH_NEW)]
+    rec = rig.run(make_image(tmp_path, kind="dev", ext=".u64"))
+    assert rec.family == "u64e" and rec.identity_verified
+
+
+def test_an_upload_that_does_not_verify_stops_the_flash(rig, held, tmp_path, monkeypatch):
+    def unverified(host, path, data, **kw):
+        rig.events.append(("put_file", path, kw.get("verify")))
+        return StoragePutResult(path, len(data), hashlib.sha256(data).hexdigest(), False, False)
+
+    monkeypatch.setattr(ff, "storage_put_file", unverified)
+    with pytest.raises(FirmwareFlashVerifyError, match="not verified") as ei:
+        rig.run(make_image(tmp_path))
+    assert ei.value.record.failed_step == "upload"
+    assert "run_update" not in rig.names()
+
+
+def test_another_firmware_after_the_rom_reboot_is_a_verify_error(rig, held, tmp_path):
+    rig.infos = [info(), info(git_hash=HASH_NEW), info(git_hash=HASH_OLD)]
+    with pytest.raises(FirmwareFlashVerifyError, match="git_commit_hash") as ei:
+        rig.run(make_image(tmp_path), roms=[_rom(tmp_path)])
+    assert ei.value.record.failed_step == "roms" and ei.value.record.rebooted
+
+
+def test_a_product_of_the_other_family_after_the_flash_is_a_verify_error(rig, held, tmp_path):
+    rig.infos = [info(), info(product="Ultimate 64 Elite", git_hash=HASH_NEW)]
+    with pytest.raises(FirmwareFlashVerifyError, match="not a c64u product"):
+        rig.run(make_image(tmp_path))

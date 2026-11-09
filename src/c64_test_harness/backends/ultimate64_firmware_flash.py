@@ -17,8 +17,11 @@ button and never cuts power. It never retries Run Update.
 * **One** ``DeviceLock`` **hold for the whole flash.** The caller holds the
   device's lock for the duration; the call refuses before any traffic when
   this process does not hold it, and checks again before the Run Update
-  ENTER. Every building block (FTP storage, the Remote Menu, the REST
-  client's non-GET requests) checks it as well.
+  ENTER and before each step after the wait (``verify``,
+  ``reset_categories``, ``wifi_ident``, ``roms``). The FTP storage helpers
+  and the Remote Menu check it on every call as well; the REST client's
+  ``reboot()`` and the ``reset_to_default`` PUTs do not, which is why this
+  module checks before the steps that send them.
 * **Host-side image validation is mandatory.** The firmware never validates
   a ``.u64`` or ``.ue2``: ``FileTypeUpdate::load_format_0`` reads raw
   ``{load, length, start}`` records into memory and jumps to the start
@@ -30,14 +33,29 @@ button and never cuts power. It never retries Run Update.
   extension (``getProductUpdateFileExtension``: ``U64`` for the U64 target,
   ``UE2`` for the u64ii target, ``product.cc``); and the record structure
   must parse as the loader will read it (:func:`inspect_update_image`).
-* **Image kind is derived from the image.** On the C64U a ``.ue2`` is
-  SILENT only if it contains :data:`SILENT_MARKER` and none of
-  :data:`PROMPT_STRINGS` (owner, 2026-11-09). The caller's ``kind`` is
-  checked against that and refused on a mismatch. A ``kind="official"``
-  image must contain the "Reset Configuration?" prompt, because answering
-  NO to it is what keeps REST, FTP and telnet on (design note F7, F9). The
-  U64E has no SILENT path: ``update_u64.cc`` always prompts and always ends
-  in ``turn_off()``.
+* **Image kind is derived from the image.** An image holding all three
+  :data:`PROMPT_STRINGS` is a *prompting* updater (``kind`` ``"dev"`` or
+  ``"official"``); one holding :data:`SILENT_MARKER` and none of them is a
+  C64U *SILENT* updater (``kind="silent"``; owner, 2026-11-09). The marker
+  alone says nothing: non-SILENT bench builds print it too
+  (``update_u64ii.cc:117`` at 7b15448a7 is outside any ``#if SILENT``), so a
+  marked image with all three prompts is a prompting one. Anything else
+  (no prompts and no marker, as in a RAM application image, or only some of
+  the prompts) is **not an updater image** and is refused: Run Update would
+  jump into it, and the device could come back on its old firmware with
+  nothing flashed. The caller's ``kind`` is checked against the class and
+  refused on a mismatch. The U64E has no SILENT path: ``update_u64.cc``
+  always prompts and always ends in ``turn_off()``.
+* **What "verified" means depends on the kind.** Dev and SILENT images are
+  verified on ``git_commit_hash``. Official C64U 1.1.0 reports no
+  ``git_commit_hash`` at all (``routes.cc:129-145`` at 7b628eb1), so an
+  official image is verified on ``product`` plus ``firmware_version``
+  (``expected_firmware_version``), and on an official C64U the hash must be
+  absent; an official U64E (3.x) is also checked on the hash when
+  ``expected_git_commit_hash`` is given. If the device already reports the
+  target identity before the flash, the check cannot tell a flash from none:
+  ``flash_distinguishable`` and ``identity_verified`` are then ``False``,
+  with a warning, and the flash is not refused.
 * **Zero** ``/Temp`` **by construction.** FTP (``STOR`` writes the target
   itself), telnet, and bodyless REST only: ``GET /v1/info``,
   ``PUT /v1/machine:reboot``, and, on the official 1.1.0 path, the
@@ -60,8 +78,8 @@ button and never cuts power. It never retries Run Update.
    (no ENTER) and stops here.
 5. ``wait``: poll bodyless ``GET /v1/info`` until REST answers, up to
    ``wait_up_s``. The instruction is logged again at WARNING first.
-6. ``verify``: the same ``unique_id``; ``git_commit_hash`` matches the
-   image's record.
+6. ``verify``: the same ``unique_id``, the same product family, and the
+   identity the kind calls for (see above).
 7. ``reset_categories`` (official C64U images only, after NO): the harness
    resets the non-network categories with :func:`apply_factory_baseline`.
 8. ``wifi_ident`` (only with ``expected_wifi_ident``): Disable, read the
@@ -69,7 +87,10 @@ button and never cuts power. It never retries Run Update.
    the Enable each write the WiFi config store to flash** (``network_esp32.cc``
    ``set_enabled``; #543); on the C64U they switch the radio only.
 9. ``roms`` (C64U only, and only when ROMs are supplied): ``storage_put_rom``
-   for each, ``reboot()``, wait for REST, verify again.
+   for each, then ``reboot()`` so the C64 loads its ROMs again
+   (``c64.cc:915``). ``reboot()`` resets the C64 only; the firmware and REST
+   keep running. The ``/v1/info`` read after it is a sanity check that the
+   same device and firmware still answer; it proves nothing about the ROMs.
 
 Evidence grades: everything here is source-read or taken from the
 2026-11-09 #543/#562 bench records. No real flash has been driven by this
@@ -132,28 +153,36 @@ _log = logging.getLogger(__name__)
 #: ``"silent"``: a C64U bench updater built with ``SILENT 1``; it asks
 #: nothing, resets the configuration and reboots by itself.
 #: ``"dev"``: a prompting development image; Reset Configuration is YES.
-#: ``"official"``: a prompting official image (C64U 1.1.0); Reset
-#: Configuration is NO, and the harness resets the non-network categories.
+#: ``"official"``: a prompting official image. On the C64U (1.1.0) Reset
+#: Configuration is NO, and the harness resets the non-network categories;
+#: on the U64E (3.x, whose defaults keep the network services on) it is YES
+#: (owner, 2026-11-09).
 FIRMWARE_IMAGE_KINDS = ("silent", "dev", "official")
 
 #: The C64U bench updater prints this when it forces the module flash
-#: (``update_u64ii.cc``, bench build 7b15448a7).
+#: (``update_u64ii.cc:117``, bench build 7b15448a7). It is not inside
+#: ``#if SILENT``, so prompting bench builds carry it too: only the marker
+#: *with no prompt string* identifies a SILENT updater.
 SILENT_MARKER = b"bench: forcing module flash"
 
 #: The updater prompts a SILENT build compiles out (``update_common.h``
 #: ``check_flash_disk``/``reset_config``, ``update_u64ii.cc``/``update_u64.cc``
-#: ``do_update``; 7b628eb1, 3a1ff9ff, 7b15448a7).
+#: ``do_update``; 7b628eb1, 3a1ff9ff, 7b15448a7). Every prompting updater
+#: holds all three; every ``update.u64``/``update.ue2`` in the 1541ultimate
+#: lane's build trees read on 2026-11-09 did.
 PROMPT_STRINGS = (
     b"Reformat Flash Disk?",
     b"About to update. Continue?",
     b"Reset Configuration? (Recommended)",
 )
-_RESET_PROMPT = PROMPT_STRINGS[2]
 
 #: ``/v1/info`` ``product`` -> device family. Product names from
 #: ``product.cc`` ``product_name[]`` (7b628eb1 with and without
 #: ``COMMODORE``; 3a1ff9ff; 7b15448a7). The bench C64U on 7b15448a7 reports
-#: ``Ultimate 64-II``; on official 1.1.0 it reports ``C64 Ultimate``.
+#: ``Ultimate 64-II``; on official 1.1.0 it reports ``C64 Ultimate``. A
+#: non-COMMODORE ``U64 == 2`` build on an Ultimate 64 Elite II board would
+#: also report ``Ultimate 64-II``; both take ``.ue2`` and are mapped to
+#: ``c64u`` here. There is no Elite II on this bench.
 _PRODUCT_FAMILY = {
     "Ultimate 64": "u64e",
     "Ultimate 64 Elite": "u64e",
@@ -212,22 +241,29 @@ class FirmwareImage:
         ``/SD/updates/update.ue2``. Not ``/Temp`` or ``/Flash``.
     :param sha256: the SHA-256 the caller recorded for this image (hex).
     :param expected_git_commit_hash: what ``/v1/info`` ``git_commit_hash``
-        must report afterwards; at least 7 hex digits. A prefix match either
-        way is accepted (the firmware reports 8).
+        must report afterwards; 7-40 hex digits. A prefix match either way
+        is accepted, because the firmware reports ``git rev-parse --short``,
+        whose length varies (7b15448a7 is 9 digits). Required for ``dev`` and
+        ``silent``; must be ``None`` for an official C64U (1.1.0 reports no
+        hash); optional for an official U64E.
     :param kind: one of :data:`FIRMWARE_IMAGE_KINDS`. Checked against the
         image.
     :param expected_wifi_ident: the module IDENT expected afterwards, e.g.
         ``ESP32 WiFi Bridge V1.494``, as the WiFi row shows it while
         Disabled. ``None`` skips the check, and with it the Disable/Enable
         cycle (which writes flash on the U64E).
+    :param expected_firmware_version: what ``/v1/info`` ``firmware_version``
+        must report afterwards (e.g. ``1.1.0``). Required for ``official``;
+        checked whenever given.
     """
 
     local_path: Path
     device_path: str
     sha256: str
-    expected_git_commit_hash: str
+    expected_git_commit_hash: str | None
     kind: str
     expected_wifi_ident: str | None = None
+    expected_firmware_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -279,7 +315,8 @@ class FlashRecord:
     image_local_path: str
     image_device_path: str
     image_kind: str
-    expected_git_commit_hash: str
+    expected_git_commit_hash: str | None
+    expected_firmware_version: str | None = None
     #: Steps that finished, in order.
     steps: list[str] = field(default_factory=list)
     #: The step that raised, or ``None``.
@@ -307,7 +344,13 @@ class FlashRecord:
     unique_id_after: str | None = None
     firmware_version_after: str | None = None
     git_commit_hash_after: str | None = None
-    hash_verified: bool = False
+    product_after: str | None = None
+    #: ``False`` when the device already reported the target identity before
+    #: the flash, so the check afterwards cannot tell a flash from none.
+    flash_distinguishable: bool | None = None
+    #: The identity after the flash matched (see the module docstring) **and**
+    #: the flash was distinguishable.
+    identity_verified: bool = False
     baseline: BaselineReport | None = None
     wifi_before_check: WifiStatus | None = None
     wifi_ident: str | None = None
@@ -459,6 +502,25 @@ def _hash_matches(expected: str, reported: Any) -> bool:
     return r.startswith(expected) or expected.startswith(r)
 
 
+def _reset_answer(family: str, kind: str) -> str:
+    """The "Reset Configuration?" answer: NO only for an official C64U image.
+
+    Official 1.1.0 defaults every network service to Disabled (design note
+    F7), so a reset there leaves no remote way back; 3.x and dev builds
+    default them on (owner, 2026-11-09).
+    """
+    return "NO" if (family == "c64u" and kind == "official") else "YES"
+
+
+def _image_class(img: UpdateImageInfo) -> str | None:
+    """``"prompting"``, ``"silent"``, or ``None`` (not an updater image)."""
+    if len(img.prompts_present) == len(PROMPT_STRINGS):
+        return "prompting"
+    if img.has_silent_marker and not img.prompts_present:
+        return "silent"
+    return None
+
+
 def operator_instruction(family: str, kind: str) -> str:
     """The exact instruction for the person at the device.
 
@@ -478,7 +540,7 @@ def operator_instruction(family: str, kind: str) -> str:
             "press any key or button. If the machine stays dark, report it before "
             "pressing anything. Any popup on the C64 screen is unexpected: do not answer "
             "it; report it.")
-    reset = "YES" if kind == "dev" else "NO"
+    reset = _reset_answer(family, kind)
     lines = [
         f"{'C64U' if family == 'c64u' else 'U64E'} {kind} image: answer the updater "
         "prompts on the C64 screen exactly as follows:",
@@ -561,19 +623,62 @@ def _wait_for_rest(client: Ultimate64Client, deadline_s: float, poll_s: float,
         _sleep(poll_s)
 
 
-def _verify_identity(info: dict, run: _Run, expected_hash: str) -> str:
+@dataclass(frozen=True)
+class _Expect:
+    """The identity a flash must produce."""
+
+    family: str
+    kind: str
+    git_hash: str | None
+    firmware_version: str | None
+
+
+def _identity_problems(info: dict, exp: _Expect) -> list[str]:
+    """Why *info* is not the target firmware; empty when it is.
+
+    Used before the flash (an empty list there means the flash cannot be
+    told from none) and after it.
+    """
+    problems = []
+    product = info.get("product")
+    if _PRODUCT_FAMILY.get(product) != exp.family:  # type: ignore[arg-type]
+        problems.append(f"product is {product!r}, not a {exp.family} product")
+    official_c64u = exp.kind == "official" and exp.family == "c64u"
+    if official_c64u:
+        if product != "C64 Ultimate":
+            problems.append(f"product is {product!r}; official C64U firmware (COMMODORE "
+                            "build) reports 'C64 Ultimate'")
+        if "git_commit_hash" in info:
+            problems.append(f"git_commit_hash {info['git_commit_hash']!r} is reported; "
+                            "official 1.1.0 reports none (routes.cc:129-145 at 7b628eb1)")
+    if exp.firmware_version is not None and info.get("firmware_version") != exp.firmware_version:
+        problems.append(f"firmware_version is {info.get('firmware_version')!r}, expected "
+                        f"{exp.firmware_version!r}")
+    if exp.git_hash is not None and not _hash_matches(exp.git_hash, info.get("git_commit_hash")):
+        problems.append(f"git_commit_hash is {info.get('git_commit_hash')!r}, expected "
+                        f"{exp.git_hash!r}")
+    return problems
+
+
+def _verify_identity(info: dict, run: _Run, exp: _Expect) -> None:
     rec = run.record
     uid = info.get("unique_id")
     if rec.unique_id_before is not None and uid != rec.unique_id_before:
         raise run.fail(FirmwareFlashVerifyError,
                        f"a different device answers at {rec.host}: unique_id {uid!r}, "
                        f"was {rec.unique_id_before!r}")
-    got = info.get("git_commit_hash")
-    if not _hash_matches(expected_hash, got):
+    problems = _identity_problems(info, exp)
+    if problems:
         raise run.fail(FirmwareFlashVerifyError,
-                       f"git_commit_hash is {got!r}, expected {expected_hash!r}; "
-                       f"before the flash it was {rec.git_commit_hash_before!r}")
-    return got
+                       "; ".join(problems) + f" (before the flash: product "
+                       f"{rec.product!r}, firmware {rec.firmware_version_before!r}, "
+                       f"hash {rec.git_commit_hash_before!r})")
+
+
+def _require_lock(run: _Run) -> None:
+    if not lock_held_for(run.record.host):
+        raise run.fail(FirmwareFlashRefusedError,
+                       f"{run.record.host}'s DeviceLock is no longer held")
 
 
 def _settled_wifi(menu: Ultimate64RemoteMenu, timeout: float, poll: float) -> WifiStatus:
@@ -596,21 +701,29 @@ def _check_wifi_ident(menu: Ultimate64RemoteMenu, expected: str, run: _Run,
         rec.wifi_ident = st.ident
         rec.wifi_after = st
     elif st.state in ("link-up", "link-down"):
-        off = menu.set_wifi_enabled(False)
-        rec.wifi_after = off.after
+        ident = None
+        failure: BaseException | None = None
         try:
+            off = menu.set_wifi_enabled(False)
+            rec.wifi_after = off.after
             ident = off.after.ident if off.after is not None else None
             if ident is None:
                 ident = menu.wifi_status().ident
             rec.wifi_ident = ident
+        except BaseException as exc:
+            failure = exc
+            raise
         finally:
-            # Put back what this step changed, whatever the read did.
-            try:
-                menu.set_wifi_enabled(True)
-            except Exception:
-                run.warn("WiFi was Disabled for the IDENT read and the Enable failed: "
-                         "it is left Disabled")
-                raise
+            # Put back what this step may have changed. Skipped only when the
+            # failure says the Disable's ENTER was never sent.
+            if failure is None or getattr(failure, "enter_sent", None) is not False:
+                try:
+                    menu.set_wifi_enabled(True)
+                except Exception:
+                    run.warn("WiFi may have been Disabled for the IDENT read and the "
+                             "Enable failed: it may be left Disabled")
+                    if failure is None:
+                        raise
         deadline = _monotonic() + link_timeout
         while True:
             now_st = menu.wifi_status()
@@ -670,7 +783,8 @@ def flash_firmware(
     record = FlashRecord(
         host=host, dry_run=dry_run, image_local_path=str(image.local_path),
         image_device_path=image.device_path, image_kind=image.kind,
-        expected_git_commit_hash=str(image.expected_git_commit_hash),
+        expected_git_commit_hash=image.expected_git_commit_hash,
+        expected_firmware_version=image.expected_firmware_version,
     )
     run = _Run(record)
     make_client = client_factory or (lambda h: Ultimate64Client(h, timeout=_INFO_TIMEOUT))
@@ -695,7 +809,7 @@ class _Validated:
     data: bytes
     info: UpdateImageInfo
     sha: str
-    git_hash: str
+    git_hash: str | None
     rom_payloads: tuple[bytes, ...]
 
 
@@ -716,8 +830,18 @@ def _validate(image: FirmwareImage, roms: Sequence[RomImage], dry_run: bool,
                        f"kind {image.kind!r} is not one of {FIRMWARE_IMAGE_KINDS}")
     try:
         want_sha = _norm_hex(image.sha256, "sha256", min_len=64, max_len=64)
-        want_hash = _norm_hex(image.expected_git_commit_hash, "expected_git_commit_hash",
-                              min_len=7, max_len=40)
+        want_hash = None
+        if image.expected_git_commit_hash is not None:
+            want_hash = _norm_hex(image.expected_git_commit_hash, "expected_git_commit_hash",
+                                  min_len=7, max_len=40)
+        elif image.kind != "official":
+            raise ValueError(f"kind={image.kind!r} is verified on git_commit_hash; "
+                             "expected_git_commit_hash is required")
+        if image.kind == "official" and not (
+                isinstance(image.expected_firmware_version, str)
+                and image.expected_firmware_version.strip()):
+            raise ValueError("kind='official' is verified on product and firmware_version; "
+                             "expected_firmware_version is required")
         _check_path(image.device_path, write=True)
     except ValueError as exc:
         raise run.fail(FirmwareImageError, str(exc)) from exc
@@ -742,10 +866,19 @@ def _validate(image: FirmwareImage, roms: Sequence[RomImage], dry_run: bool,
     except ValueError as exc:
         raise run.fail(FirmwareImageError, f"{image.local_path}: {exc}") from exc
     run.record.image = info_img
-    if image.kind == "official" and _RESET_PROMPT.decode() not in info_img.prompts_present:
+    cls = _image_class(info_img)
+    if cls is None:
         raise run.fail(FirmwareImageError,
-                       "kind='official' relies on answering NO to 'Reset Configuration?', "
-                       "but the image does not contain that prompt")
+                       f"{image.local_path} is not an updater image: it holds the prompt "
+                       f"strings {list(info_img.prompts_present)} of the three an updater "
+                       "has, and "
+                       + ("the SILENT marker" if info_img.has_silent_marker else "no SILENT marker")
+                       + ". Run Update would jump into it and nothing would be flashed.")
+    run.record.image_silent = cls == "silent"
+    if (cls == "silent") != (image.kind == "silent"):
+        raise run.fail(FirmwareImageError,
+                       f"kind={image.kind!r}, but the image is a {cls} updater (SILENT: the "
+                       "marker 'bench: forcing module flash' and no prompt strings)")
     payloads: list[bytes] = []
     for rom in roms:
         try:
@@ -767,9 +900,8 @@ def _flash(host: str, image: FirmwareImage, roms: Sequence[RomImage], v: _Valida
            make_menu: Callable[[str], Ultimate64RemoteMenu], run: _Run,
            clients: list[Ultimate64Client]) -> FlashRecord:
     record = run.record
-    data, info_img, want_sha, want_hash = v.data, v.info, v.sha, v.git_hash
-    rom_payloads = v.rom_payloads
-    confirm_device_powers_off = confirm
+    data, info_img, want_sha = v.data, v.info, v.sha
+    silent = bool(record.image_silent)
     # -- 2. preflight ------------------------------------------------------------
     run.begin("preflight")
     try:
@@ -793,34 +925,27 @@ def _flash(host: str, image: FirmwareImage, roms: Sequence[RomImage], v: _Valida
         raise run.fail(FirmwareImageError,
                        f"{record.product} takes {ext} update images, not "
                        f"{_extension(image.device_path)}")
-    # The SILENT gate (owner, 2026-11-09): the marker, and none of the prompts.
-    # An image with both is not one the gate knows, so it is refused outright.
-    if info_img.has_silent_marker and info_img.prompts_present:
+    if family == "u64e" and silent:
         raise run.fail(FirmwareImageError,
-                       "the image has the SILENT bench marker and prompt strings "
-                       f"{list(info_img.prompts_present)}; not a recognised image")
-    if family == "u64e" and info_img.has_silent_marker:
-        raise run.fail(FirmwareImageError, "a SILENT marker in a .u64: the U64E has no SILENT path")
-    silent = info_img.has_silent_marker      # prompts and the U64E are refused above
-    record.image_silent = silent
-    if silent != (image.kind == "silent"):
+                       "a SILENT updater in a .u64: the U64E has no SILENT path")
+    if family == "c64u" and image.kind == "official" and v.git_hash is not None:
         raise run.fail(FirmwareImageError,
-                       f"kind={image.kind!r}, but the image {'is' if silent else 'is not'} a "
-                       "SILENT updater (marker 'bench: forcing module flash' and no prompts)")
-    if family == "u64e" and image.kind == "official":
-        raise run.fail(FirmwareFlashRefusedError,
-                       "kind='official' on a U64E: the Reset Configuration answer for an "
-                       "official Ultimate-line image is not decided (owner)")
+                       "an official C64U (1.1.0) reports no git_commit_hash; leave "
+                       "expected_git_commit_hash None and set expected_firmware_version")
     if roms and family != "c64u":
         raise run.fail(FirmwareFlashRefusedError, "ROM install after a flash is C64U-only")
-    if record.git_commit_hash_before and _hash_matches(want_hash, record.git_commit_hash_before):
-        run.warn(f"the device already reports {record.git_commit_hash_before}; the hash "
-                 "check after the flash cannot tell a flash from none")
+    exp = _Expect(family, image.kind, v.git_hash, image.expected_firmware_version)
+    record.flash_distinguishable = bool(_identity_problems(info, exp))
+    if not record.flash_distinguishable:
+        run.warn(f"the device already reports the target identity (product "
+                 f"{record.product!r}, firmware {record.firmware_version_before!r}, hash "
+                 f"{record.git_commit_hash_before!r}); the check after the flash cannot tell "
+                 "a flash from none, so identity_verified will stay False")
     if family == "c64u":
         record.recovery_check = RECOVERY_CHECK_NOTE
         run.warn(RECOVERY_CHECK_NOTE)
     record.reset_configuration_answer = (
-        "automatic (SILENT: always resets)" if silent else ("YES" if image.kind == "dev" else "NO"))
+        "automatic (SILENT: always resets)" if silent else _reset_answer(family, image.kind))
     record.operator_instruction = operator_instruction(family, image.kind)
     run.done()
 
@@ -864,17 +989,21 @@ def _flash(host: str, image: FirmwareImage, roms: Sequence[RomImage], v: _Valida
             raise run.fail(FirmwareFlashStepError, f"{type(exc).__name__}: {exc}") from exc
         run.done()
         return record
-    if not lock_held_for(host):
-        raise run.fail(FirmwareFlashRefusedError, f"{host}'s DeviceLock is no longer held")
+    _require_lock(run)
     _log.warning("flash %s: OPERATOR, Run Update is about to start on %s.\n%s",
                  host, record.device_path_used, record.operator_instruction)
     try:
-        result = menu.run_update(record.device_path_used,
-                                 confirm_device_powers_off=confirm_device_powers_off)
+        result = menu.run_update(record.device_path_used, confirm_device_powers_off=confirm)
     except Exception as exc:
-        sent = getattr(exc, "enter_sent", False)
-        note = (" The ENTER WAS SENT: the updater may be running. Follow the instruction "
-                "above and do not retry." if sent else " No ENTER was sent.")
+        sent = getattr(exc, "enter_sent", None)
+        if sent is False:
+            note = " No ENTER was sent."
+        elif sent is True:
+            note = (" The ENTER WAS SENT: the updater may be running. Follow the "
+                    "instruction above and do not retry.")
+        else:
+            note = (" Whether the ENTER was sent is UNKNOWN: treat it as sent. The updater "
+                    "may be running; follow the instruction above and do not retry.")
         raise run.fail(FirmwareFlashStepError, f"{type(exc).__name__}: {exc}.{note}") from exc
     record.run_update = result
     if not result.started:
@@ -893,15 +1022,22 @@ def _flash(host: str, image: FirmwareImage, roms: Sequence[RomImage], v: _Valida
 
     # -- 6. verify ---------------------------------------------------------------
     run.begin("verify")
+    _require_lock(run)
     record.unique_id_after = info.get("unique_id")
+    record.product_after = info.get("product")
     record.firmware_version_after = info.get("firmware_version")
-    record.git_commit_hash_after = _verify_identity(info, run, want_hash)
-    record.hash_verified = True
+    record.git_commit_hash_after = info.get("git_commit_hash")
+    _verify_identity(info, run, exp)
+    record.identity_verified = bool(record.flash_distinguishable)
+    if not record.identity_verified:
+        run.warn("the device reports the target identity, as it did before the flash: "
+                 "not verified that anything was flashed")
     run.done()
 
     # -- 7. reset_categories (official C64U, after NO) ------------------------
     if family == "c64u" and image.kind == "official":
         run.begin("reset_categories")
+        _require_lock(run)
         try:
             record.baseline = apply_factory_baseline(client)
         except Exception as exc:
@@ -911,6 +1047,7 @@ def _flash(host: str, image: FirmwareImage, roms: Sequence[RomImage], v: _Valida
     # -- 8. wifi_ident -------------------------------------------------------------
     if image.expected_wifi_ident is not None:
         run.begin("wifi_ident")
+        _require_lock(run)
         try:
             _check_wifi_ident(menu, image.expected_wifi_ident, run,
                               wifi_link_timeout_s, poll_interval_s)
@@ -923,17 +1060,23 @@ def _flash(host: str, image: FirmwareImage, roms: Sequence[RomImage], v: _Valida
     # -- 9. roms -------------------------------------------------------------------
     if roms:
         run.begin("roms")
+        _require_lock(run)
         try:
-            for rom, payload in zip(roms, rom_payloads):
+            for rom, payload in zip(roms, v.rom_payloads):
                 record.roms.append(storage_put_rom(
                     host, rom.kind, rom.name, payload, overwrite=rom.overwrite,
                     replace_stock=rom.replace_stock, check_signature=rom.check_signature))
+            # Resets the C64 only, so it loads its ROMs again (c64.cc:915);
+            # the firmware and REST keep running.
             client.reboot()
             record.rebooted = True
         except Exception as exc:
             raise run.fail(FirmwareFlashStepError, f"{type(exc).__name__}: {exc}") from exc
+        # A sanity check that the same device and firmware still answer. It
+        # proves nothing about the ROMs.
         info, _ = _wait_for_rest(client, wait_up_s, poll_interval_s, run, "after reboot()")
-        record.git_commit_hash_after_reboot = _verify_identity(info, run, want_hash)
+        _verify_identity(info, run, exp)
+        record.git_commit_hash_after_reboot = info.get("git_commit_hash")
         run.done()
     return record
 
