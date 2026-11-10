@@ -648,3 +648,78 @@ def test_two_cp210x_with_serial_0001_warn_and_location_decides(monkeypatch, caps
              _Port("/dev/cu.usbserial-4", "0-1.4", "0001", 0x10C4)]
     assert jl.resolve_port("0-1.2", ports) == "/dev/cu.usbserial-0001"
     assert "2 CP210x ports report serial 0001" in capsys.readouterr().err
+
+
+class _LinkError(Exception):
+    pass
+
+
+def _flaky(ev, fail_times, exc=None):
+    """FakeEsp whose upload raises LinkError the first `fail_times` attempts (after the FPGA is programmed)."""
+    esp = FakeEsp(ev)
+    esp.LinkError = _LinkError
+    base = esp.Recover
+    count = {"n": 0}
+
+    class R(base):
+        def user_upload(self_, binary, addr):
+            count["n"] += 1
+            if count["n"] <= fail_times:
+                raise (exc or _LinkError("response sequence 27, expected 26"))
+            return base.user_upload(self_, binary, addr)
+    esp.Recover = R
+    esp.count = count
+    return esp
+
+
+def test_link_error_after_programming_retries_whole_load_once(env, capsys):
+    ev = env[0]
+    jl.DUP_SERIAL_WARNED = False
+    esp = _flaky(ev, 1)
+    rp = env[5] / "loads.jsonl"
+    rec = load(env, esp, FakeClient(ev, [info()]), record_path=str(rp))
+    assert rec["result"] == "ok" and rec["retries"] == 1
+    assert len(rec["link_errors"]) == 1 and "sequence 27" in rec["link_errors"][0]["error"]
+    assert [k[0] for k in esp.steps].count("load_fpga") == 2          # restarted from JPROGRAM, not resumed
+    assert [e for e in ev if e[0] == "acquire"] == [("acquire", "device"), ("acquire", "adapter")]   # locks kept
+    assert ev.count(("ser_close",)) == 2
+    line = json.loads(rp.read_text().splitlines()[-1])
+    assert line["retries"] == 1 and line["dup_cp210x_serial_warning"] is False
+
+
+def test_link_error_twice_reports_dark_device(env, capsys):
+    ev = env[0]
+    esp = _flaky(ev, 5)
+    rp = env[5] / "loads.jsonl"
+    with pytest.raises(_LinkError):
+        load(env, esp, FakeClient(ev, [info()]), record_path=str(rp))
+    assert esp.count["n"] == 2                                       # capped at one retry
+    assert jl.DARK_MESSAGE in capsys.readouterr().err
+    line = json.loads(rp.read_text().splitlines()[-1])
+    assert line["result"] == "error" and line["dark"] == jl.DARK_MESSAGE and len(line["link_errors"]) == 2
+
+
+def test_gate_failure_and_non_link_errors_are_not_retried(env):
+    ev = env[0]
+    esp = _flaky(ev, 5, exc=RuntimeError("boom"))
+    with pytest.raises(RuntimeError):
+        load(env, esp, FakeClient(ev, [info()]))
+    assert esp.count["n"] == 1
+    ev2 = Events()
+    esp2 = FakeEsp(ev2, live_idcode=0x12345678)
+    esp2.LinkError = _LinkError
+    with pytest.raises(jl.JtagLoadError, match="idcode"):
+        load(env, esp2, FakeClient(ev2, [info()]))
+    assert [k[0] for k in esp2.steps] == []
+
+
+def test_duplicate_serial_warning_is_recorded(env, monkeypatch):
+    ev = env[0]
+    monkeypatch.setattr(jl, "DUP_SERIAL_WARNED", False)
+    orig = jl.adapter_for
+    def afor(uid, comports=None):
+        jl.DUP_SERIAL_WARNED = True
+        return orig(uid, comports)
+    monkeypatch.setattr(jl, "adapter_for", afor)
+    rec = load(env, FakeEsp(ev), FakeClient(ev, [info()]))
+    assert rec["dup_cp210x_serial_warning"] is True

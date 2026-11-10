@@ -71,6 +71,16 @@ ADAPTERS = {
 }
 
 
+DUP_SERIAL_WARNED = False   # set when resolve_port raised the duplicate-CP210x warning (recorded per load)
+DARK_MESSAGE = "FPGA programmed, no application loaded: device dark, re-run jtag_load"
+
+
+def is_link_error(esp, e: BaseException) -> bool:
+    """True for the esp-jtag adapter link/transport error (sequence desync, timeout, bad CRC), never for our gates."""
+    cls = getattr(esp, "LinkError", None)
+    return isinstance(cls, type) and isinstance(e, cls)
+
+
 def resolve_port(location: str, comports=None) -> str:
     """The one /dev/cu.* serial port at USB `location`; refuse (JtagLoadError) on none, several, or a JTAG_PORT that
     names a different port."""
@@ -84,6 +94,8 @@ def resolve_port(location: str, comports=None) -> str:
     same_serial = {p.device for p in comports if getattr(p, "vid", None) == 0x10C4
                    and getattr(p, "serial_number", None) == "0001" and str(p.device).startswith("/dev/cu.")}
     if len(same_serial) > 1:   # CP2102 clones share serial "0001" (ours reads lock 0x02, not reprogrammable, 11-09)
+        global DUP_SERIAL_WARNED
+        DUP_SERIAL_WARNED = True
         print(f"jtag_load WARNING: {len(same_serial)} CP210x ports report serial 0001 ({sorted(same_serial)}); "
               f"selecting by USB location {location} only", file=sys.stderr)
     hits = sorted({p.device for p in comports if p.location == location and str(p.device).startswith("/dev/cu.")})
@@ -439,11 +451,14 @@ def jtag_load(host: str, bit, app, *, bit_sha256: str, app_sha256: str, expect_g
         cold = os.environ.get("JTAG_LOAD_WARM") != "1"
     esp = esp or esp_module()
     uid = bound_uid(host)
+    global DUP_SERIAL_WARNED
+    DUP_SERIAL_WARNED = False
     adapter = adapter_for(uid)
     expect_git_hash = check_git_hash(expect_git_hash)
     rec = {"t0": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": host, "uid": uid, "adapter": adapter["port"],
            "bit": str(bit), "bin": str(app), "bit_sha256": bit_sha256.lower(), "bin_sha256": app_sha256.lower(),
-           "expect_git_hash": expect_git_hash, "dry_run": dry_run, "cold": cold}
+           "expect_git_hash": expect_git_hash, "dry_run": dry_run, "cold": cold,
+           "dup_cp210x_serial_warning": DUP_SERIAL_WARNED, "link_errors": [], "retries": 0}
     try:
         with tempfile.TemporaryDirectory(prefix="jtag_load-") as td:
             pbit, papp = pin_files(Path(bit), Path(app), bit_sha256, app_sha256, Path(td))
@@ -463,35 +478,62 @@ def jtag_load(host: str, bit, app, *, bit_sha256: str, app_sha256: str, expect_g
                     check_identity(pre, uid)
                 log(f"JTAG load {Path(bit).name} + {Path(app).name} into {uid} ({host})")
                 t0 = time.monotonic()
-                link, jtag = _open(esp, adapter)
-                try:
-                    loader = esp.Recover(jtag, log=log)
+                state = {"programmed": False}
 
-                    def idcode_ok(idcode):          # before the FPGA is touched
-                        rec["idcode"] = f"{idcode:08x}"
-                        if not esp.idcode_matches(idcode, want_id):
-                            raise JtagLoadError("idcode", f"live IDCODE {idcode:08x} is not the .bit's {want_id:08x}"
-                                                " (P5 unwired or the C64U off?); nothing was loaded")
-                        if not bypass_ok(jtag):
-                            raise JtagLoadError("tdi", "TDI->TDO through BYPASS failed (P5 pin 9 loose?); "
-                                                "nothing was loaded")
-                    if cold:                        # Recover.run without the 1 s warm run of the flashed app
-                        jtag.reset()
-                        idcode_ok(loader.read_id())
-                        loader.load_fpga(str(pbit))
-                        loader.user_set_outputs(0x80)                  # CPU in reset before it fetches anything
-                        loader.user_upload(str(papp), 0x30000)
-                        loader.user_write_memory(0xFFF8, struct.pack("<LL", 0x30000, 0x1571BABE))
-                        loader.user_set_outputs(0x00)                  # unreset to the boot loader
-                        loader.user_read_id()
-                    else:
-                        log("WARM load (JTAG_LOAD_WARM / cold=False): the flashed app runs 1 s first; stale I-cache risk")
-                        loader.run(str(pbit), str(papp), idcode_ok=idcode_ok)
-                    jtag.link.drain()
-                    rec["tck_cycles"] = getattr(jtag, "clock_count", None)
-                finally:
-                    jtag.close()
-                    link.ser.close()
+                def attempt():
+                    """One whole load from JPROGRAM; reopens the adapter link each time."""
+                    state["programmed"] = False
+                    link, jtag = _open(esp, adapter)
+                    try:
+                        loader = esp.Recover(jtag, log=log)
+
+                        def idcode_ok(idcode):          # before the FPGA is touched
+                            rec["idcode"] = f"{idcode:08x}"
+                            if not esp.idcode_matches(idcode, want_id):
+                                raise JtagLoadError("idcode", f"live IDCODE {idcode:08x} is not the .bit's {want_id:08x}"
+                                                    " (P5 unwired or the C64U off?); nothing was loaded")
+                            if not bypass_ok(jtag):
+                                raise JtagLoadError("tdi", "TDI->TDO through BYPASS failed (P5 pin 9 loose?); "
+                                                    "nothing was loaded")
+                            if not cold:
+                                state["programmed"] = True    # run() programs right after this gate
+                        if cold:                        # Recover.run without the 1 s warm run of the flashed app
+                            jtag.reset()
+                            idcode_ok(loader.read_id())
+                            state["programmed"] = True
+                            loader.load_fpga(str(pbit))
+                            loader.user_set_outputs(0x80)                  # CPU in reset before it fetches anything
+                            loader.user_upload(str(papp), 0x30000)
+                            loader.user_write_memory(0xFFF8, struct.pack("<LL", 0x30000, 0x1571BABE))
+                            loader.user_set_outputs(0x00)                  # unreset to the boot loader
+                            loader.user_read_id()
+                        else:
+                            log("WARM load (JTAG_LOAD_WARM / cold=False): the flashed app runs 1 s first; stale I-cache risk")
+                            loader.run(str(pbit), str(papp), idcode_ok=idcode_ok)
+                        jtag.link.drain()
+                        rec["tck_cycles"] = getattr(jtag, "clock_count", None)
+                        return loader
+                    finally:
+                        jtag.close()
+                        link.ser.close()
+
+                for n in (0, 1):
+                    try:
+                        loader = attempt()
+                        break
+                    except Exception as e:
+                        if not state["programmed"]:
+                            raise              # nothing was touched: gates and early failures stay as they were
+                        link_err = is_link_error(esp, e)
+                        if link_err:
+                            rec["link_errors"].append({"attempt": n + 1, "error": f"{type(e).__name__}: {e}"})
+                        if link_err and n == 0:
+                            rec["retries"] = 1
+                            log(f"LinkError after programming started ({e}); retrying the whole load once from JPROGRAM")
+                            continue
+                        rec["dark"] = DARK_MESSAGE
+                        print(DARK_MESSAGE, file=sys.stderr, flush=True)
+                        raise
                 rec["load_s"] = round(time.monotonic() - t0, 1)
                 rec["user_id"] = f"{loader.user_id:08x}" if loader.user_id is not None else None
                 if loader.user_id != EXPECT_USERID:
