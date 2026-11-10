@@ -185,6 +185,20 @@ from .backends.ultimate64_flash import (
     FlashSaveVerifyError,
     save_config_item_to_flash,
 )
+from .backends.ultimate64_firmware_flash import (
+    FirmwareFlashError,
+    FirmwareFlashRefusedError,
+    FirmwareFlashStepError,
+    FirmwareFlashTimeoutError,
+    FirmwareFlashVerifyError,
+    FirmwareImage,
+    FirmwareImageError,
+    FlashRecord,
+    RomImage,
+    UpdateImageInfo,
+    flash_firmware,
+    inspect_update_image,
+)
 from .backends.ultimate64_remote_menu import (
     RemoteMenuConnectError,
     RemoteMenuLockError,
@@ -687,6 +701,19 @@ __all__ = [
     "STOCK_ROM_NAMES",
     "storage_put_rom",
     "storage_delete_rom",
+    # Firmware flash orchestration (issue #561)
+    "FirmwareImage",
+    "RomImage",
+    "FlashRecord",
+    "UpdateImageInfo",
+    "flash_firmware",
+    "inspect_update_image",
+    "FirmwareFlashError",
+    "FirmwareImageError",
+    "FirmwareFlashRefusedError",
+    "FirmwareFlashTimeoutError",
+    "FirmwareFlashVerifyError",
+    "FirmwareFlashStepError",
     # Telnet Remote Menu driver: WiFi row, Run Update (issue #543)
     "Ultimate64RemoteMenu",
     "RemoteMenuTiming",
