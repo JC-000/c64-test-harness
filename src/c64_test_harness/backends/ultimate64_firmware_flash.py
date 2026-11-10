@@ -9,7 +9,7 @@ to the host's disk.
 
 **What the harness does not do.** It never answers an updater prompt: the
 updater draws on the C64 screen with no network stack running, so nothing
-of it is visible remotely (#543, design note F10). It never presses a
+of it is visible remotely (#543; see ``docs/firmware_flashing.md``). It never presses a
 button and never cuts power. It never retries Run Update.
 
 **Rules, all checked before the step they guard:**
@@ -97,8 +97,14 @@ button and never cuts power. It never retries Run Update.
    same device and firmware still answer; it proves nothing about the ROMs.
 
 Evidence grades: everything here is source-read or taken from the
-2026-11-09 #543/#562 bench records. No real flash has been driven by this
-code; the first one is planned for a flash round with the owner present.
+2026-11-09 #543/#562 bench records, except one live flash (2026-11-09,
+n=1): the C64U over ethernet, a SILENT bench image, 7b15448a7 -> 584250385,
+steps ``validate`` through ``verify``, ``identity_verified=True``, unattended
+with no button press. REST answered about 125 s after the Run Update ENTER
+(``wait_seconds`` 105, counted from when the updater was seen to start;
+polled every 5 s). Not yet run live: the U64E,
+prompting and official images, and the ``wifi_ident`` and ``roms`` steps.
+See ``docs/firmware_flashing.md``.
 """
 
 from __future__ import annotations
@@ -173,7 +179,7 @@ SILENT_MARKER = b"bench: forcing module flash"
 #: ``check_flash_disk``/``reset_config``, ``update_u64ii.cc``/``update_u64.cc``
 #: ``do_update``; 7b628eb1, 3a1ff9ff, 7b15448a7). Every prompting updater
 #: holds all three; every ``update.u64``/``update.ue2`` in the 1541ultimate
-#: lane's build trees read on 2026-11-09 did.
+#: build trees read on 2026-11-09 did.
 PROMPT_STRINGS = (
     b"Reformat Flash Disk?",
     b"About to update. Continue?",
@@ -183,7 +189,7 @@ PROMPT_STRINGS = (
 #: The ``/v1/info`` key a dev or SILENT image is verified on. A firmware that
 #: reports it carries the key as a string; official C64U 1.1.0 does not report
 #: it (``routes.cc:129-145`` at 7b628eb1) and its image does not contain it.
-#: Of 466 prompting images in the 1541ultimate lane's trees (reviewer's scan,
+#: Of 466 prompting images in 1541ultimate build trees (a review scan,
 #: 2026-11-09) only the official 1.1.0 copies and one other build lack it.
 HASH_FIELD = b"git_commit_hash"
 
@@ -520,9 +526,9 @@ def _hash_matches(expected: str, reported: Any) -> bool:
 def _reset_answer(family: str, kind: str) -> str:
     """The "Reset Configuration?" answer: NO only for an official C64U image.
 
-    Official 1.1.0 defaults every network service to Disabled (design note
-    F7), so a reset there leaves no remote way back; 3.x and dev builds
-    default them on (owner, 2026-11-09).
+    Official 1.1.0 defaults every network service to Disabled, so a reset
+    there leaves no remote way back; 3.x and dev builds default them on
+    (owner, 2026-11-09).
     """
     return "NO" if (family == "c64u" and kind == "official") else "YES"
 
@@ -550,9 +556,9 @@ def operator_instruction(family: str, kind: str) -> str:
             "C64U SILENT image: the updater asks nothing and resets the configuration. "
             "By source (bench updater 7b15448a7, update_common.h turn_off with SILENT) "
             "it then has the module switch the machine off and on again (off 2 s), with "
-            "no button press; REST came back about 113 s after the start on 2026-11-09, "
-            "and whether that return involved a button press is not established. Do not "
-            "press any key or button. If the machine stays dark, report it before "
+            "no button press. On the C64U on 2026-11-09 (n=1) REST came back about 125 s "
+            "after the Run Update ENTER, with no button press. Do not press any key or "
+            "button. If the machine stays dark, report it before "
             "pressing anything. Any popup on the C64 screen is unexpected: do not answer "
             "it; report it.")
     reset = _reset_answer(family, kind)
@@ -897,7 +903,7 @@ def _validate(image: FirmwareImage, roms: Sequence[RomImage], dry_run: bool,
     if image.kind != "official" and not info_img.reports_git_commit_hash:
         # The official 1.1.0 image, labelled dev, would have the operator
         # answer YES to Reset Configuration, which turns REST, FTP and telnet
-        # off on 1.1.0 with no remote way back (design note F7).
+        # off on 1.1.0 with no remote way back.
         raise run.fail(FirmwareImageError,
                        f"kind={image.kind!r} is verified on git_commit_hash, but the image "
                        f"does not contain {HASH_FIELD.decode()!r}: a firmware built from it "
