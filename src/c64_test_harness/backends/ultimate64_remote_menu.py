@@ -788,22 +788,25 @@ class _Session:
         self.sel_attr: tuple[str, bool] | None = None
         sock.setblocking(False)
 
-    def drain(self, *, expect: bool) -> int:
+    def drain(self, *, expect: bool, max_drain: float | None = None) -> int:
         """Read until the screen goes quiet; return the byte count.
 
         With *expect*, wait up to ``first_byte_timeout`` for the first byte;
-        without, only one ``idle_gap``.
+        without, only one ``idle_gap``. A redraw that has started and does
+        not go quiet within *max_drain* (default ``timing.max_drain``) of the
+        call raises.
         """
         t = self.timing
+        limit = t.max_drain if max_drain is None else max_drain
         start = time.monotonic()
         first_wait = t.first_byte_timeout if expect else t.idle_gap
         last: float | None = None
         got = 0
         while not self.eof:
             now = time.monotonic()
-            if now - start > t.max_drain:
+            if last is not None and now - start > limit:
                 raise RemoteMenuUnexpectedScreenError(
-                    f"the screen did not go quiet within {t.max_drain:.1f} s",
+                    f"the screen did not go quiet within {limit:.1f} s",
                     screen=tuple(self.screen.rows()))
             if last is None and now - start >= first_wait:
                 break
@@ -832,8 +835,14 @@ class _Session:
         self.sock.setblocking(True)
         try:
             self.sock.sendall(data)
+        except OSError as exc:
+            raise RemoteMenuConnectError(
+                f"sending {self.keys[-1] if self.keys else 'a key'} failed: {exc}") from exc
         finally:
-            self.sock.setblocking(False)
+            try:
+                self.sock.setblocking(False)
+            except OSError:
+                pass
 
     def press(self, key: str) -> int:
         """Send one allow-listed key and read the redraw it causes."""
@@ -1467,6 +1476,14 @@ class Ultimate64RemoteMenu:
         effect telnet can show, so ``verified`` is ``None`` for them and the
         caller checks the outcome itself (the printer's output file, say).
         The ENTER is never resent.
+
+        **Turn On / Turn Off change the device's config.** They set "IEC
+        printer" (``CFG_PRINTER_ENABLE``) with ``set_value``, which marks the
+        store as needing a flash write (``ConfigStore::setChanged``,
+        584250385). Nothing here saves it, but a later save does: leaving the
+        config menu with Auto Save Config, or a ``save_config_to_flash``. Its
+        default is Disabled, so Turn On moves the device off the factory
+        baseline. Put it back (Turn Off) before you release the lock.
         """
         self._check_category(category)
         what = f"task {category} > {item}"
@@ -1498,7 +1515,14 @@ class Ultimate64RemoteMenu:
         deadline = time.monotonic() + timeout
         drew = False
         while True:
-            drew = sess.drain(expect=True) > 0 or drew
+            # A progress bar may redraw for longer than timing.max_drain; that
+            # is the action still running, not an error, so the drain may
+            # last until the settle deadline.
+            remaining = max(deadline - time.monotonic(), self.timing.idle_gap)
+            try:
+                drew = sess.drain(expect=True, max_drain=remaining) > 0 or drew
+            except RemoteMenuUnexpectedScreenError:
+                return False, self._view(sess).rows
             view = self._view(sess)
             if view.popup is not None:
                 self._seen_messages.append(view.popup.message)

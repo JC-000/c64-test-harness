@@ -57,10 +57,9 @@ FAST = RemoteMenuTiming(
 
 #: Every key name the fake may ever see from the driver. Nothing that
 #: deletes (ESC[2~ is KEY_INSERT = delete selected), no LF (0x0A is
-#: KEY_CTRL_J = swap joysticks). F1/F5 only open the task menu; the make
-#: fixture checks that no other call sends one.
+#: KEY_CTRL_J = swap joysticks). F1/F5 only open the task menu
+#: (test_no_other_call_sends_an_f_key).
 ALLOWED_KEYS = {"UP", "DOWN", "RIGHT", "LEFT", "PAGEUP", "PAGEDOWN", "ENTER", "o", "F1", "F5"}
-TASK_CALLS = ("run_task", "task_items", "task_categories")
 
 
 def _load(name: str) -> dict:
@@ -745,7 +744,9 @@ def test_two_visible_rows_with_the_wanted_name_are_refused(make, held):
 @pytest.mark.parametrize("call", [
     lambda m: m.set_wifi_enabled(False, dry_run=True),
     lambda m: m.run_update("/USB1/vf_ue.u64", dry_run=True),
-], ids=["set_wifi_enabled", "run_update"])
+    lambda m: m.run_task("Printer", "Reset", dry_run=True),
+    lambda m: m.run_task("Printer", "Reset"),
+], ids=["set_wifi_enabled", "run_update", "run_task_dry", "run_task"])
 def test_each_result_lists_only_its_own_calls_messages(make, held, call):
     """Two calls on one object: the message shown during the first call is
     not reported again by the second."""
@@ -759,10 +760,6 @@ def test_each_result_lists_only_its_own_calls_messages(make, held, call):
 
 
 # -- the task menu (#566) ------------------------------------------------------
-
-def _task_session_keys(fake):
-    return [s.keys for s in fake.sessions]
-
 
 def test_run_task_turn_off_sends_one_enter_and_verifies_on_a_fresh_connection(make, held):
     fake, menu = make()
@@ -902,11 +899,78 @@ def test_a_category_that_opens_no_submenu_stops_before_any_enter(make, held):
     assert "ENTER" not in fake.sessions[0].keys
 
 
-def test_a_screen_that_never_settles_after_the_enter_carries_enter_sent(make, held):
+@pytest.mark.parametrize("settle, closed", [(1.0, False), (6.0, True)])
+def test_a_redraw_longer_than_max_drain_is_still_settling_not_an_error(make, held, settle, closed):
+    """A progress bar may redraw for longer than timing.max_drain: the fake
+    redraws for 3 s after the ENTER. Within the settle it is waited out;
+    past it, it is reported as not closed. Neither is an error."""
     import dataclasses
     fake, menu = make(flood_after_commit=True)
-    menu.timing = dataclasses.replace(FAST, max_drain=0.5)
-    with pytest.raises(RemoteMenuUnexpectedScreenError, match="did not go quiet") as ei:
-        menu.run_task("Printer", "Reset")
-    assert ei.value.enter_sent is True
+    menu.timing = dataclasses.replace(FAST, max_drain=0.3)
+    res = menu.run_task("Printer", "Reset", settle_timeout=settle)
+    assert res.enter_sent is True and res.closed is closed
     assert fake.all_commits() == [("Printer/Reset", "tasks")]
+
+
+def test_a_progress_box_that_outlasts_the_settle_is_not_closed(make, held):
+    fake, menu = make(task_progress_s=1.5)
+    res = menu.run_task("Printer", "Flush/Eject", settle_timeout=0.4)
+    assert res.closed is False
+    assert fake.all_commits() == [("Printer/Flush/Eject", "tasks")]
+
+
+class _BreakingSock:
+    """A socket whose sendall fails once *armed*; everything else delegates."""
+
+    def __init__(self, sock, armed):
+        self._sock = sock
+        self._armed = armed
+
+    def sendall(self, data):
+        if self._armed(data):
+            raise ConnectionResetError(54, "Connection reset by peer")
+        return self._sock.sendall(data)
+
+    def __getattr__(self, name):
+        return getattr(self._sock, name)
+
+
+def test_a_reset_on_the_enter_raises_a_remote_menu_error_with_enter_sent(make, held):
+    fake, menu = make()
+    real = menu._connector
+    menu._connector = lambda a, t=None: _BreakingSock(real(a, t), lambda d: d == b"\r")
+    with pytest.raises(rm.RemoteMenuConnectError) as ei:
+        menu.run_task("Printer", "Turn Off")
+    assert ei.value.enter_sent is True
+
+
+def test_a_failed_verify_session_is_a_verify_error_with_enter_sent(make, held):
+    fake, menu = make()
+    real = menu._connector
+    calls = []
+
+    def connector(address, timeout=None):
+        calls.append(address)
+        sock = real(address, timeout)
+        return sock if len(calls) == 1 else _BreakingSock(sock, lambda d: True)
+    menu._connector = connector
+    with pytest.raises(RemoteMenuVerifyError) as ei:
+        menu.run_task("Printer", "Turn Off")
+    assert ei.value.enter_sent is True
+    assert fake.all_commits() == [("Printer/Turn Off", "tasks")]
+
+
+def test_a_refused_verify_connection_is_a_verify_error_with_enter_sent(make, held):
+    fake, menu = make(refuse_after_commit=True)
+    with pytest.raises(RemoteMenuVerifyError) as ei:
+        menu.run_task("Printer", "Turn Off")
+    assert ei.value.enter_sent is True
+    assert fake.all_commits() == [("Printer/Turn Off", "tasks")]
+
+
+def test_a_task_key_that_opens_nothing_stops_before_any_enter(make, held):
+    fake, menu = make(task_key_ignored=True)
+    with pytest.raises(RemoteMenuNavigationError, match="opened no task menu") as ei:
+        menu.run_task("Printer", "Reset")
+    assert ei.value.enter_sent is False
+    assert fake.all_commits() == []

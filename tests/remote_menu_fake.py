@@ -179,6 +179,10 @@ class FakeUltimate:
         Printer; a one-item category runs its action when opened.
     :param task_progress_s: Flush/Eject draws a progress box for this long.
     :param task_right_ignored: RIGHT and ENTER on a category open nothing.
+    :param task_key_ignored: the task key opens nothing (a build that maps it
+        to something else).
+    :param refuse_after_commit: once a task action has run, every new
+        connection is refused like a device at its session cap.
     """
 
     def __init__(
@@ -207,6 +211,8 @@ class FakeUltimate:
         task_categories: dict[str, list[str]] | None = None,
         task_progress_s: float = 0.0,
         task_right_ignored: bool = False,
+        task_key_ignored: bool = False,
+        refuse_after_commit: bool = False,
     ) -> None:
         self.title = title
         self.root = root if root is not None else [
@@ -255,6 +261,8 @@ class FakeUltimate:
         })
         self.task_progress_s = task_progress_s
         self.task_right_ignored = task_right_ignored
+        self.task_key_ignored = task_key_ignored
+        self.refuse_after_commit = refuse_after_commit
         self.sgr_sel = "0;37;1" if framed else SGR_SEL
         self.sgr_fg = "0;31;2" if framed else SGR_FG
         #: True once Run Update stopped the application: no new connection
@@ -504,7 +512,7 @@ class _Session:
             self.task_key(name)
             return
         task_key, page_key = ("F1", "F5") if self.dev.framed else ("F5", "F1")
-        if name == task_key:
+        if name == task_key and not self.dev.task_key_ignored:
             self.tasks = self.dev.tasks()
             self.task_index = 0
             self.redraw()
@@ -608,6 +616,8 @@ class _Session:
         self.log.commit_times.append(time.monotonic())
         if dev.flood_after_commit:
             threading.Thread(target=self._flood, daemon=True).start()
+        if dev.refuse_after_commit:
+            dev.refuse_sessions = True
         if dev.commit_takes_effect and cat == "Printer":
             if label == "Turn Off":
                 dev.printer_on = False
@@ -756,8 +766,11 @@ class _Session:
             _put(scr, top + i, left + 1, label.ljust(width - 2), sgr)
 
     def compose_tasks(self, scr) -> None:
-        """TaskMenu::init: 28 + 2 wide, at least 8 rows, centred; the
-        submenu inside it, at its right edge, from the chosen row."""
+        """TaskMenu::init: 28 + 2 wide, at least 8 rows, centred. The
+        submenu (ContextMenu::init) sits inside it at its right edge, its top
+        border one row above the chosen category (``y_offs = y - 1``) and a
+        hook on its left edge at that category's row, as on the U64E
+        (178517dec, 2026-11-10)."""
         names = [c for c, _ in self.tasks]
         rows = max(8, min(len(names) + 2, HEIGHT - 4))
         top = (HEIGHT - rows) // 2
@@ -767,10 +780,13 @@ class _Session:
             labels = [a for a, _ in self.sub]
             w = max(len(a) for a in labels) + 2
             srows = len(labels) + 2
-            stop = min(top + 1 + self.task_index, top + rows - 1 - srows)
+            stop = max(top + 1, min(top + self.task_index, top + rows - 1 - srows))
             sleft = left + 30 - 1 - w
             sgrs = [self.dev.sgr_fg if en else SGR_INACTIVE for _, en in self.sub]
             self.compose_box(scr, stop, sleft, w, srows, labels, sel=self.sub_index, sgrs=sgrs)
+            hook_row = top + 1 + self.task_index
+            hook = "q" if hook_row in (stop, stop + srows - 1) else "k"
+            _put(scr, hook_row, sleft, hook, SGR_FG, glyph=True)
 
     def compose_popup(self, scr) -> None:
         msg, buttons = self.popup
