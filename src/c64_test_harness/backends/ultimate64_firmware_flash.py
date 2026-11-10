@@ -184,7 +184,7 @@ PROMPT_STRINGS = (
 #: reports it carries the key as a string; official C64U 1.1.0 does not report
 #: it (``routes.cc:129-145`` at 7b628eb1) and its image does not contain it.
 #: Of 466 prompting images in the 1541ultimate lane's trees (reviewer's scan,
-#: 2026-11-09) only the official 1.1.0 copies and one other lack it.
+#: 2026-11-09) only the official 1.1.0 copies and one other build lack it.
 HASH_FIELD = b"git_commit_hash"
 
 #: ``/v1/info`` ``product`` -> device family. Product names from
