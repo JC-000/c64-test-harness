@@ -99,8 +99,10 @@ button and never cuts power. It never retries Run Update.
 Evidence grades: everything here is source-read or taken from the
 2026-11-09 #543/#562 bench records, except one live flash (2026-11-09,
 n=1): the C64U over ethernet, a SILENT bench image, 7b15448a7 -> 584250385,
-steps ``validate`` through ``verify``, ``identity_verified=True``, REST back
-105 s after Run Update with no button press. Not yet run live: the U64E,
+steps ``validate`` through ``verify``, ``identity_verified=True``, unattended
+with no button press. REST answered about 125 s after the Run Update ENTER
+(``wait_seconds`` 105, counted from when the updater was seen to start;
+polled every 5 s). Not yet run live: the U64E,
 prompting and official images, and the ``wifi_ident`` and ``roms`` steps.
 See ``docs/firmware_flashing.md``.
 """
@@ -524,8 +526,9 @@ def _hash_matches(expected: str, reported: Any) -> bool:
 def _reset_answer(family: str, kind: str) -> str:
     """The "Reset Configuration?" answer: NO only for an official C64U image.
 
-    Official 1.1.0 defaults every network service to Disabled, so a reset there leaves no remote way back; 3.x and dev builds
-    default them on (owner, 2026-11-09).
+    Official 1.1.0 defaults every network service to Disabled, so a reset
+    there leaves no remote way back; 3.x and dev builds default them on
+    (owner, 2026-11-09).
     """
     return "NO" if (family == "c64u" and kind == "official") else "YES"
 
@@ -553,9 +556,9 @@ def operator_instruction(family: str, kind: str) -> str:
             "C64U SILENT image: the updater asks nothing and resets the configuration. "
             "By source (bench updater 7b15448a7, update_common.h turn_off with SILENT) "
             "it then has the module switch the machine off and on again (off 2 s), with "
-            "no button press. On the C64U on 2026-11-09 (n=1) REST came back 105 s after "
-            "Run Update with no button press. Do not "
-            "press any key or button. If the machine stays dark, report it before "
+            "no button press. On the C64U on 2026-11-09 (n=1) REST came back about 125 s "
+            "after the Run Update ENTER, with no button press. Do not press any key or "
+            "button. If the machine stays dark, report it before "
             "pressing anything. Any popup on the C64 screen is unexpected: do not answer "
             "it; report it.")
     reset = _reset_answer(family, kind)

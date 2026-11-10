@@ -180,8 +180,8 @@ Hardware reading, in order:
   - `write_mem_query_threshold` is auto-detected per device: 128 on firmware without the Temp-folder fix, 48 on Ultimate-line ≥ 3.15.
 - **Device storage, flash and firmware** (each needs the caller to hold the `DeviceLock`, and none costs a `/Temp` attachment):
   - `storage_*` read and write files on the device's own volumes over FTP. `storage_put_rom` / `storage_delete_rom` are the only writes under `/Flash`, one ROM image in `/Flash/roms`, size- and signature-checked.
-  - `save_config_item_to_flash()` saves one config key, and refuses unless it is the only RAM-vs-flash difference. Nothing else in the harness saves config to flash.
-  - `Ultimate64RemoteMenu` drives the firmware's telnet Remote Menu: read the screen and the WiFi row, toggle WiFi, start Run Update. It sends one state-changing key per call and never answers telnet negotiation.
+  - `save_config_item_to_flash()` saves one config key, and refuses unless it is the only RAM-vs-flash difference. It is the only sanctioned config save; the public `Ultimate64Client.save_config_to_flash` saves every dirty store, and nothing in the harness calls it except this function.
+  - `Ultimate64RemoteMenu` drives the firmware's telnet Remote Menu: read the screen and the WiFi row, toggle WiFi, start Run Update. On a U64E, WiFi Disable/Enable writes the WiFi config store to flash. It sends one state-changing key per call and never answers telnet negotiation.
   - `flash_firmware()` flashes an update image: it validates it on the host, uploads it, starts Run Update, tells the person at the device what to answer, and verifies the firmware that comes back. Dry-run it first. See [docs/firmware_flashing.md](docs/firmware_flashing.md).
 - **Liveness probe:** `probe_u64()` / `is_u64_reachable()` check reachability (ping → TCP → REST). This is not a health check ([below](#liveness-probe)).
 - **Configuration helpers:** turbo speed (cross-generation CPU-speed probing), REU size, SID sockets and addressing, disk mounting, PRG run/load, and snapshot/restore of device state.

@@ -77,18 +77,21 @@ Each call opens its own connections and closes them before it returns.
   WARNING and records it in `dismissed_messages`. ENTER is never used on a
   popup, because it picks the active button, which on a Yes/No popup is
   Yes.
-- **A new session can take one queued device message**, even a read-only
-  call: the firmware queues messages device-wide and the next session to
-  poll shows one. So a call can consume a message meant for someone at the
-  device. Each result's `messages` lists what that call's sessions showed.
+- **A new session can take queued device messages**, even a read-only
+  call: the firmware queues messages device-wide (up to four), and the next
+  session to poll shows one per poll. When each is dismissable the session
+  answers it and the next can follow, up to four; a verification probe
+  never answers one, so it shows at most one. So a call can consume
+  messages meant for someone at the device. Each result's `messages` lists
+  what that call's sessions showed.
 - **No REST or FTP request**, so zero `/Temp` cost.
 
 A **dry run** still connects, navigates and opens the context menu, then
 stops with the action highlighted and closes the session without the
 ENTER. That proves the path exists and the action is offered. Those keys
 move only the connection's own UI state, which the firmware discards on
-close; the one device-wide effect a dry run can have is consuming a queued
-message.
+close; the one device-wide effect a dry run can have is consuming queued
+messages.
 
 ### WiFi Disable and Enable
 
@@ -165,8 +168,8 @@ have acted, so do not just repeat the call.
   once took effect, 12 of 12.
 
 Not measured: the official C64U 1.1.0 framed layout (read from source
-only), and a "SID changed" popup during these runs (one was dismissed
-during the flash below).
+only), and a "SID changed" popup during these runs. One was dismissed on
+the first telnet read after the flash below.
 
 ## Flashing firmware (`flash_firmware`)
 
@@ -327,10 +330,16 @@ ethernet, a SILENT bench image, unattended with the owner's authorisation.
 
 - Steps `validate` → `preflight` → `upload` → `run_update` → `wait` →
   `verify`; `identity_verified=True`, `flash_distinguishable=True`.
-- From the Run Update result to REST answering took 105 s
-  (`wait_seconds`), with **no button press**. The whole call took 176 s.
+- REST answered about 125 s after the Run Update ENTER, with **no button
+  press**. `wait_seconds` reads 105: it counts from when `run_update`
+  returned, which was when the updater was seen to start, and REST was
+  polled every 5 s. The whole call took 176 s.
+- `run_update`'s evidence: fresh sessions still answered at the root at
+  about 5 s and 7 s after the ENTER, then the committing session received
+  1460 bytes, then two fresh connections got no answer (`started=True`).
 - Afterwards REST, FTP and telnet answered and WiFi was Link Up. The SILENT
-  configuration reset had run. `/Flash/roms` was still present.
+  configuration reset had run (the syslog target was cleared).
+  `/Flash/roms` was still present.
 - The first telnet read after the flash showed "SID changed. Please review
   settings"; the driver answered `Ok` and logged it.
 
@@ -340,7 +349,10 @@ Not yet run live: the U64E, prompting (`dev`) and `official` images, the
 ## Saving one config key to flash
 
 `save_config_item_to_flash(client, category, item, value, *, dry_run=False)`
-is the only call in the harness that saves config to flash. Its job is to
+is the only sanctioned config save in the harness.
+(`Ultimate64Client.save_config_to_flash` is public, but it saves every
+dirty store, and nothing in the harness calls it except this function.)
+Its job is to
 put back a key that a run persisted. It refuses unless that key is the only
 RAM-vs-flash difference among the stores it can compare. Reading flash means
 loading it into RAM, so the comparison has side effects even when it

@@ -787,7 +787,7 @@ Rules:
 - **One state-changing ENTER per call**, never resent; the verdict comes from a fresh connection.
 - **The highlight is read back after every key**; a key with no visible effect stops the call.
 - **Modal popups stop the call**, except an `Ok`-only popup whose text is in `DISMISSABLE_MESSAGES` (`"SID changed. Please review settings"`): one `o`, logged at WARNING, recorded in `dismissed_messages`.
-- **A new session can consume one queued device message** (the firmware queues them device-wide). Each result's `messages` lists what that call's sessions showed.
+- **A new session can consume queued device messages** (the firmware queues them device-wide and shows one per poll). A session answers each dismissable one and the next can follow, up to four (`_settle_modals`); a verification probe answers none, so it shows at most one. Each result's `messages` lists what that call's sessions showed.
 - **Zero `/Temp`:** no REST or FTP request.
 - **Dry run** (`dry_run=True`): connects, navigates, opens the menu and highlights the action, then closes the session without the ENTER. Only the session's own UI state moves.
 
@@ -833,7 +833,7 @@ Errors (all `FirmwareFlashError`, an `Ultimate64Error`, with `.record` and `.ste
 - `FirmwareFlashVerifyError`: wrong identity, hash or IDENT, or the upload or Run Update did not verify.
 - `FirmwareFlashStepError`: a building block raised; the original is `__cause__`.
 
-Live: one flash, 2026-11-09, n=1: the C64U over ethernet, SILENT bench image, 7b15448a7 → 584250385, `unique_id` unchanged, `identity_verified=True`, REST back 105 s after Run Update (`wait_seconds`) with no button press, 176 s for the whole call; the first telnet session afterwards showed "SID changed", which the driver dismissed and logged. Not run live: the U64E, `dev` and `official` images, the `wifi_ident` and `roms` steps. The offline tests that use real images read `C64_FLASH_IMAGE_DIR` and skip when it is unset.
+Live: one flash, 2026-11-09, n=1: the C64U over ethernet, SILENT bench image, 7b15448a7 → 584250385, `unique_id` unchanged, `identity_verified=True`, unattended, no button press; REST answered about 125 s after the Run Update ENTER (`wait_seconds` 105, counted from when the updater was seen to start; 5 s polling), 176 s for the whole call; the SILENT configuration reset ran (the syslog target was cleared); the first telnet read after the flash showed "SID changed", which the driver dismissed and logged. Not run live: the U64E, `dev` and `official` images, the `wifi_ident` and `roms` steps. The offline tests that use real images read `C64_FLASH_IMAGE_DIR` and skip when it is unset.
 
 ## Module: snapshot
 

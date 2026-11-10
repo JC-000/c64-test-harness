@@ -54,11 +54,14 @@ dependencies, so the protocol is written here. 1541ultimate's
   ``o``, logged at WARNING and recorded in :attr:`dismissed_messages`.
   ``RETURN`` is never used on a popup: it picks the active button, which on
   a Yes/No popup is Yes.
-* **Every new session can take one queued device message**, read-only
+* **Every new session can take queued device messages**, read-only
   calls, verification polls and probes included: ``UserInterface::postMessage``
   queues device-wide, and the browser of whichever session polls next pops
-  one (``TreeBrowser::poll``, ``getMessage``) and shows it as a popup. So a
-  call can consume a message meant for someone at the device. Each result's
+  one per poll (``TreeBrowser::poll``, ``getMessage``) and shows it as a
+  popup. When each is dismissable, a session answers it and the next one
+  can follow, up to four (the queue's size); a probe never answers one, so
+  it shows at most one. So a call can consume messages meant for someone at
+  the device. Each result's
   ``messages`` lists what this call's sessions showed, dismissed or not;
   :attr:`dismissed_messages` keeps the ones this object answered.
 * **Zero** ``/Temp`` **cost by construction:** this module makes no REST
@@ -72,7 +75,7 @@ connection's own ``UserInterface``, which the firmware discards when the
 connection closes; they change no setting, file or radio state. That makes
 a dry run proof that the path exists, the action is offered and the
 highlight can be put on it, which a run that sent nothing could not show.
-The one device-wide effect it can have is consuming a queued message (see
+The one device-wide effect it can have is consuming queued messages (see
 above).
 
 **Run Update.** The updater's prompts ("Reformat Flash Disk?", "About to
@@ -81,10 +84,11 @@ popups) are **not visible to this driver**: the application jumps to an
 updater that links no network stack and draws on the C64 screen
 (``FileTypeUpdate::execute``; ``update_common.h`` ``setup()`` takes the C64
 as its host), and a bench test on 2026-11-09 confirmed that nothing of it
-reaches telnet (see ``docs/firmware_flashing.md``). So the driver answers no prompt; someone at the keyboard does.
-What it can see is a popup on the committing session, or, once the
-application has jumped to the updater, a session that goes silent without
-closing and fresh connections that get no answer.
+reaches telnet (see ``docs/firmware_flashing.md``). So the driver answers
+no prompt; someone at the keyboard does. What it can see is a popup on
+the committing session, or, once the application has jumped to the
+updater, a session that goes silent without closing and fresh connections
+that get no answer.
 :meth:`Ultimate64RemoteMenu.run_update` reports which.
 
 **Image validity is the caller's job.** The firmware checks almost nothing
@@ -1201,14 +1205,22 @@ class Ultimate64RemoteMenu:
         has stopped: ``started=True``. The first probe waits
         ``timing.first_probe_delay``. A fresh session that still shows the
         browser can be normal for a while: the application loads the whole
-        image before it jumps. How long that takes is not measured. In a
-        bench test of Run Update on the C64U on 2026-11-09, the first redraw
-        after the ENTER came 9.6 s later, and a second ENTER was pressed
-        before it. The live tests of #562 the same day sent 12 single
-        ENTERs on WiFi toggles (6 per device) and all 12 took effect, so the
-        delay was most likely the slow load of the 8.8 MB image, not a lost
-        key. So polling continues until *verify_timeout*; then
-        :class:`RemoteMenuVerifyError`. The ENTER is never resent. The prompts that follow are not visible here (see the module
+        image before it jumps. How long that takes is not measured.
+
+        Evidence (C64U, 3.15a bench image, 2026-11-09, n=1): in the live
+        ``flash_firmware`` run, one Run Update ENTER gave ``started=True``.
+        Fresh sessions still answered at the root at about 5 s and 7 s, then
+        the committing session received 1460 bytes after the ENTER, and the
+        next two fresh connections got no answer. Earlier that day, in a
+        bench test by hand, the first redraw after the ENTER came 9.6 s
+        later and 2.3 s after a second ENTER; the live tests of #562 then
+        sent 12 single ENTERs on WiFi toggles (6 per device) and all 12 took
+        effect, so that delay was most likely the slow load of the 8.8 MB
+        image, not a lost key.
+
+        So polling continues until *verify_timeout*; then
+        :class:`RemoteMenuVerifyError`. The ENTER is never resent. The
+        prompts that follow are not visible here (see the module
         docstring), and a ``.u64``/``.ue2`` image is not checked by the
         firmware: check it before uploading.
         """
