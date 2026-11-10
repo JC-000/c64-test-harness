@@ -47,6 +47,8 @@ Each call opens its own connections and closes them before it returns.
 | `context_actions(path)` | Cursor keys, and the ENTER that opens the menu | Opens the entry's context menu and chooses nothing. |
 | `set_wifi_enabled(enabled, *, dry_run=False, verify_timeout=15.0)` | One state-changing ENTER (none on a dry run) | Returns `WifiChangeResult`. |
 | `run_update(path, *, dry_run=False, confirm_device_powers_off=False, verify_timeout=60.0)` | One state-changing ENTER (none on a dry run) | Returns `RunUpdateResult`. |
+| `task_categories()`, `task_items(category)` | F5 (F1 on the framed layout), cursor keys | Read the task menu and a category's submenu; choose nothing. |
+| `run_task(category, item, *, dry_run=False, settle_timeout=10.0, verify_timeout=15.0)` | F5/F1, cursor keys, one state-changing ENTER (none on a dry run) | Returns `TaskRunResult`. Only categories in `TASK_CATEGORIES` (Printer) are opened. |
 
 ### What the driver will and will not send
 
@@ -60,9 +62,12 @@ Each call opens its own connections and closes them before it returns.
   three keys; the last, `$01`, is Ctrl-A, "select all". On 2026-11-09 the
   C64U drew its root screen with zero bytes sent by the client (n=3).
 - **Only allow-listed keys**: the cursor keys, PageUp/PageDown
-  (`ESC[5~`/`ESC[6~`), ENTER as a bare CR, and `o` for an `Ok` popup.
-  Never LF (Ctrl-J swaps the joysticks), never `ESC[2~` (Insert deletes the
-  selection), never an F-key (their meaning differs by build), and never a
+  (`ESC[5~`/`ESC[6~`), ENTER as a bare CR, `o` for an `Ok` popup, and one
+  F-key, only to open the task menu from the browser. F-keys mean different
+  things per build: the task menu is F5 on the Ultimate line and F1 on the
+  framed COMMODORE layout of official 1.1.0, where F5 is PageDown (source
+  read), so the driver picks the key from the layout. Never LF (Ctrl-J swaps
+  the joysticks), never `ESC[2~` (Insert deletes the selection), and never a
   letter in the browser (the official C64U defaults to WASD navigation).
   A menu is closed by closing the session, never with a key.
 - **The highlight is read, not assumed.** The driver learns the selection
@@ -166,6 +171,12 @@ have acted, so do not just repeat the call.
   PageUp/PageDown, and resolved files in subdirectories.
 - Real WiFi Disable then Enable, 3 cycles per device: each ENTER sent
   once took effect, 12 of 12.
+
+2026-11-10, U64E on the 1541ultimate printer bench build 178517dec:
+`task_categories`, `task_items("Printer")`, dry runs, then a real Turn On,
+Flush/Eject, Reset and Turn Off. One ENTER each, every one took effect; Turn
+On/Off read back on fresh connections; 2.4-7.1 s per call. The Printer
+submenu draws inside the task window, as `TaskSubMenu` places it.
 
 Not measured: the official C64U 1.1.0 framed layout (read from source
 only), and a "SID changed" popup during these runs. One was dismissed on

@@ -36,6 +36,15 @@ What it models, and where each behaviour comes from:
   application, so the session goes silent without closing and new
   connections get no answer (modelled by :meth:`FakeUltimate.connector`).
 
+* **Task menu** (``TaskMenu``/``TaskSubMenu``, 584250385): F5 opens it on
+  the Ultimate line and F1 on the framed ``COMMODORE`` layout; the other key
+  pages the listing. A window 30 columns wide, at least 8 rows, centred; a
+  category opened with RIGHT or ENTER draws its submenu inside that window,
+  except a category with exactly one enabled action, whose action runs at
+  once. Disabled items are drawn in their own colour and skipped by the
+  cursor. Printer's items follow :attr:`FakeUltimate.printer_on` the way
+  ``IecPrinter::update_task_items`` does.
+
 Knobs on :class:`FakeUltimate` reproduce the bench facts in #543: the mirror
 that does not redraw after ENTER, the modal "SID changed" dialog on a fresh
 session, the password prompt, the session cap.
@@ -63,6 +72,7 @@ SGR_DIR = "0;31;1"
 SGR_FILE = "0;33"
 SGR_PATH = "0;36"
 SGR_STATUS = "0;32;1"
+SGR_INACTIVE = "0;30;1"
 
 UPDATE_EXTENSIONS = ("U64", "UE2", "CFW")
 FILE_ACTIONS = ["Copy to...", "Move to...", "Rename", "Delete"]
@@ -164,6 +174,11 @@ class FakeUltimate:
         inside a border, ``F7=HELP`` and its own colours. Source-read only.
     :param password: send ``Password: `` first (``socket_ensure_authenticated``).
     :param refuse_sessions: answer like a device at its session cap.
+    :param printer_on: the printer emulation's state (``printer_enable``).
+    :param task_categories: other categories as ``{name: [labels]}``, after
+        Printer; a one-item category runs its action when opened.
+    :param task_progress_s: Flush/Eject draws a progress box for this long.
+    :param task_right_ignored: RIGHT and ENTER on a category open nothing.
     """
 
     def __init__(
@@ -188,6 +203,10 @@ class FakeUltimate:
         menu_initial: int = 0,
         menu_keys_swapped: bool = False,
         flood_after_commit: bool = False,
+        printer_on: bool = True,
+        task_categories: dict[str, list[str]] | None = None,
+        task_progress_s: float = 0.0,
+        task_right_ignored: bool = False,
     ) -> None:
         self.title = title
         self.root = root if root is not None else [
@@ -229,6 +248,13 @@ class FakeUltimate:
         self.menu_initial = menu_initial
         self.menu_keys_swapped = menu_keys_swapped
         self.flood_after_commit = flood_after_commit
+        self.printer_on = printer_on
+        self.task_categories = dict(task_categories if task_categories is not None else {
+            "Software IEC": ["Turn On", "Reset"],
+            "Power": ["Reboot"],
+        })
+        self.task_progress_s = task_progress_s
+        self.task_right_ignored = task_right_ignored
         self.sgr_sel = "0;37;1" if framed else SGR_SEL
         self.sgr_fg = "0;31;2" if framed else SGR_FG
         #: True once Run Update stopped the application: no new connection
@@ -330,6 +356,16 @@ class FakeUltimate:
             if self._pending_wifi:
                 self.wifi = dict(self._pending_wifi.pop(0))
 
+    def tasks(self) -> list[tuple[str, list[tuple[str, bool]]]]:
+        """Categories as ``(name, [(label, enabled)])``, shown items only."""
+        if self.printer_on:
+            printer = [("Flush/Eject", True), ("Reset", True), ("Turn Off", True)]
+        else:
+            printer = [("Flush/Eject", False), ("Reset", False), ("Turn On", True)]
+        cats = [("Printer", printer)]
+        cats += [(n, [(a, True) for a in acts]) for n, acts in self.task_categories.items()]
+        return cats
+
     def pop_message(self):
         with self._lock:
             return self.messages.pop(0) if self.messages else None
@@ -352,6 +388,12 @@ class _Session:
         self.menu: list[str] | None = None
         self.menu_index = 0
         self.popup: tuple[str, list[str]] | None = None
+        self.tasks: list | None = None     # the task menu, when open
+        self.task_index = 0
+        self.sub: list[tuple[str, bool]] | None = None   # the open category
+        self.sub_name = ""
+        self.sub_index = 0
+        self.progress: str | None = None
         self.sent = _blank_screen()
         self.silent = False   # the application has stopped: never send again
         self.inner_width = WIDTH - 2 if dev.framed else WIDTH
@@ -418,7 +460,8 @@ class _Session:
 
     def _consume(self, buf: bytes) -> bytes:
         keys = {b"\x1b[A": "UP", b"\x1b[B": "DOWN", b"\x1b[C": "RIGHT",
-                b"\x1b[D": "LEFT", b"\x1b[5~": "PAGEUP", b"\x1b[6~": "PAGEDOWN"}
+                b"\x1b[D": "LEFT", b"\x1b[5~": "PAGEUP", b"\x1b[6~": "PAGEDOWN",
+                b"\x1b[11~": "F1", b"\x1b[15~": "F5"}
         while buf:
             if buf[0] == 0x1B:
                 for seq, name in keys.items():
@@ -427,9 +470,9 @@ class _Session:
                         buf = buf[len(seq):]
                         break
                 else:
-                    if len(buf) < 4:
+                    if len(buf) < 5:
                         return buf
-                    self.key("ESC?" + buf[:4].hex())
+                    self.key("ESC?" + buf[:5].hex())
                     buf = buf[1:]
                 continue
             b = buf[0]
@@ -457,6 +500,17 @@ class _Session:
         if self.menu is not None:
             self.menu_key(name)
             return
+        if self.tasks is not None:
+            self.task_key(name)
+            return
+        task_key, page_key = ("F1", "F5") if self.dev.framed else ("F5", "F1")
+        if name == task_key:
+            self.tasks = self.dev.tasks()
+            self.task_index = 0
+            self.redraw()
+            return
+        if name == page_key:
+            name = "PAGEDOWN" if name == "F5" else "PAGEUP"
         n = len(self.entries())
         if name == "DOWN" and n:
             self.cursor = min(n - 1, self.cursor + 1)
@@ -514,6 +568,58 @@ class _Session:
             self.commit(label)
             return
         self.redraw()
+
+    def task_key(self, name: str) -> None:
+        if self.sub is not None:
+            enabled = [i for i, (_, en) in enumerate(self.sub) if en]
+            if name == "DOWN":
+                nxt = [i for i in enabled if i > self.sub_index]
+                self.sub_index = nxt[0] if nxt else self.sub_index
+            elif name == "UP":
+                prv = [i for i in enabled if i < self.sub_index]
+                self.sub_index = prv[-1] if prv else self.sub_index
+            elif name == "LEFT":
+                self.sub = None
+            elif name == "ENTER" and self.sub[self.sub_index][1]:
+                self.run_task_action(self.sub_name, self.sub[self.sub_index][0])
+                return
+            self.redraw()
+            return
+        if name == "DOWN":
+            self.task_index = min(len(self.tasks) - 1, self.task_index + 1)
+        elif name == "UP":
+            self.task_index = max(0, self.task_index - 1)
+        elif name == "LEFT":
+            self.tasks = None
+        elif name in ("RIGHT", "ENTER") and not self.dev.task_right_ignored:
+            cat, acts = self.tasks[self.task_index]
+            if len(acts) == 1 and acts[0][1]:   # TaskMenu::select_item
+                self.run_task_action(cat, acts[0][0])
+                return
+            self.sub, self.sub_name = acts, cat
+            self.sub_index = next((i for i, (_, en) in enumerate(acts) if en), 0)
+        self.redraw()
+
+    def run_task_action(self, cat: str, label: str) -> None:
+        dev = self.dev
+        self.tasks = None
+        self.sub = None
+        self.log.commits.append((f"{cat}/{label}", "tasks"))
+        self.log.commit_times.append(time.monotonic())
+        if dev.flood_after_commit:
+            threading.Thread(target=self._flood, daemon=True).start()
+        if dev.commit_takes_effect and cat == "Printer":
+            if label == "Turn Off":
+                dev.printer_on = False
+            elif label == "Turn On":
+                dev.printer_on = True
+            elif label == "Flush/Eject" and dev.task_progress_s:
+                self.progress = "Flushing/Ejecting page..."
+                self.redraw()
+                time.sleep(dev.task_progress_s)
+                self.progress = None
+        if dev.redraw_after_commit:
+            self.redraw()
 
     def commit(self, label: str) -> None:
         dev = self.dev
@@ -611,6 +717,10 @@ class _Session:
             _put(scr, 23, WIDTH - 9, "-F3=HELP-", "0;37;1")
         if self.menu is not None:
             self.compose_menu(scr)
+        if self.tasks is not None:
+            self.compose_tasks(scr)
+        if self.progress is not None:
+            self.compose_box(scr, 8, 15, 30, 5, [self.progress, "", "####"])
         if self.popup is not None:
             self.compose_popup(scr)
         return scr
@@ -632,6 +742,35 @@ class _Session:
             _put(scr, top + i, left + 1, label.ljust(max_len), sgr)
         hook = "q" if sel_line in (top, top + rows - 1) else "k"
         _put(scr, sel_line, left, hook, SGR_FG, glyph=True)
+
+    def compose_box(self, scr, top, left, width, rows, labels, sel=None, sgrs=None):
+        _put(scr, top, left, "l" + "q" * (width - 2) + "k", SGR_FG, glyph=True)
+        _put(scr, top + rows - 1, left, "m" + "q" * (width - 2) + "j", SGR_FG, glyph=True)
+        for i in range(1, rows - 1):
+            _put(scr, top + i, left, "x", SGR_FG, glyph=True)
+            _put(scr, top + i, left + width - 1, "x", SGR_FG, glyph=True)
+            label = labels[i - 1] if i - 1 < len(labels) else ""
+            sgr = (sgrs[i - 1] if sgrs and i - 1 < len(sgrs) else self.dev.sgr_fg)
+            if sel is not None and i - 1 == sel:
+                sgr = self.dev.sgr_sel
+            _put(scr, top + i, left + 1, label.ljust(width - 2), sgr)
+
+    def compose_tasks(self, scr) -> None:
+        """TaskMenu::init: 28 + 2 wide, at least 8 rows, centred; the
+        submenu inside it, at its right edge, from the chosen row."""
+        names = [c for c, _ in self.tasks]
+        rows = max(8, min(len(names) + 2, HEIGHT - 4))
+        top = (HEIGHT - rows) // 2
+        left = (WIDTH - 30) // 2
+        self.compose_box(scr, top, left, 30, rows, names, sel=self.task_index)
+        if self.sub is not None:
+            labels = [a for a, _ in self.sub]
+            w = max(len(a) for a in labels) + 2
+            srows = len(labels) + 2
+            stop = min(top + 1 + self.task_index, top + rows - 1 - srows)
+            sleft = left + 30 - 1 - w
+            sgrs = [self.dev.sgr_fg if en else SGR_INACTIVE for _, en in self.sub]
+            self.compose_box(scr, stop, sleft, w, srows, labels, sel=self.sub_index, sgrs=sgrs)
 
     def compose_popup(self, scr) -> None:
         msg, buttons = self.popup

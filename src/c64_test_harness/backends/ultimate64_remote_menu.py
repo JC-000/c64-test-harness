@@ -5,7 +5,8 @@ The firmware serves its file browser over telnet (``socket_gui.cc``, the
 harness-owned client for it: a minimal telnet session, a VT100 screen
 model, and a driver that browses to a path, opens an entry's context
 menu, and chooses an action by its exact label. It reads and toggles the
-WiFi row on the browser root, and starts "Run Update" on an update image.
+WiFi row on the browser root, starts "Run Update" on an update image, and
+runs a task-menu action (Tasks > Printer > Flush/Eject, #566).
 
 Python 3.13 removed ``telnetlib`` and the harness has no runtime
 dependencies, so the protocol is written here. 1541ultimate's
@@ -42,9 +43,13 @@ dependencies, so the protocol is written here. 1541ultimate's
   (``TreeBrowserState::up/down``, ``ContextMenu::down``).
 * **Only allow-listed keys reach the wire**: the cursor keys, VT100
   PageUp/PageDown (``ESC[5~``/``ESC[6~``, which every build maps the same
-  way, unlike the F-keys whose meaning differs between the Ultimate line
-  and the ``COMMODORE`` build), ENTER as a bare CR and ``o`` for an ``Ok``
-  popup. A menu is never closed with a key; the session is closed instead. Never LF (``$0A`` is ``KEY_CTRL_J``, swap
+  way), ENTER as a bare CR, ``o`` for an ``Ok`` popup, and one F-key, only
+  in the browser, to open the task menu. The F-keys mean different things
+  per build (``UserInterface::keymapper``): the task menu is F5 on the
+  Ultimate line and F1 on the ``COMMODORE`` build (1.1.0), where F5 is
+  PageDown, so the driver picks the key from the layout it reads (framed =
+  ``COMMODORE``). Either key, sent to the other build, only pages the
+  listing. A menu is never closed with a key; the session is closed instead. Never LF (``$0A`` is ``KEY_CTRL_J``, swap
   joysticks), never ``ESC[2~`` (``KEY_INSERT``: delete selected), never a
   letter in the browser (on the official C64U, WASD navigation is the
   default and turns letters into cursor keys).
@@ -132,7 +137,9 @@ __all__ = [
     "RemoteMenuUnexpectedScreenError",
     "RemoteMenuVerifyError",
     "RunUpdateResult",
+    "TASK_CATEGORIES",
     "TELNET_PORT",
+    "TaskRunResult",
     "TelnetScreen",
     "Ultimate64RemoteMenu",
     "Ultimate64RemoteMenuError",
@@ -166,6 +173,25 @@ _MAX_NAME_FIELD = WIDTH - _TYPE_COLUMN
 #: whichever session's browser polls first.
 DISMISSABLE_MESSAGES = ("SID changed. Please review settings",)
 
+#: Task-menu categories whose submenu this driver may open.
+#: ``TaskMenu::select_item`` runs a category's action at once when the
+#: category holds exactly one action and it is enabled, so opening any other
+#: category could itself be a commit. A category goes on this list only once
+#: the source shows it always holds more than one action. Printer: Flush/Eject,
+#: Reset, Turn On, Turn Off (``IecPrinter::create_task_items``, 7b628eb1 and
+#: 584250385).
+TASK_CATEGORIES = ("Printer",)
+
+#: Task actions whose effect a fresh connection can see: after the action,
+#: the category's submenu offers this label (``IecPrinter::update_task_items``
+#: shows Turn On or Turn Off, never both, by ``printer_enable`` on every
+#: task-menu init). Flush/Eject and Reset draw nothing a telnet session can
+#: read back.
+_TASK_EFFECTS = {
+    ("Printer", "Turn Off"): "Turn On",
+    ("Printer", "Turn On"): "Turn Off",
+}
+
 #: Popup texts with which ``FileTypeUpdate::load_format_1`` refuses a ``.cfw``
 #: (from 3a1ff9ff on). A ``.u64``/``.ue2`` is never checked; its one refusal
 #: is a file-open error string.
@@ -181,6 +207,10 @@ _KEYS: dict[str, bytes] = {
     "PAGEDOWN": b"\x1b[6~",
     "ENTER": b"\r",
     "OK": b"o",
+    # Only to open the task menu, and only in the browser: F5 on the
+    # Ultimate line, F1 on the COMMODORE build (see :data:`TASK_CATEGORIES`).
+    "F1": b"\x1b[11~",
+    "F5": b"\x1b[15~",
 }
 
 # Telnet (RFC 854): parsed and discarded, never answered.
@@ -709,6 +739,35 @@ class RunUpdateResult:
     started: bool
     evidence: tuple[str, ...]
     prompts_visible: bool = False
+    messages: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class TaskRunResult:
+    """Outcome of :meth:`Ultimate64RemoteMenu.run_task`.
+
+    ``categories`` and ``items`` are the task menu and the category's submenu
+    as read before the ENTER (blank rows dropped; a disabled item is listed
+    too). ``enter_sent`` is False on a dry run. ``closed`` says whether the
+    committing session then drew a screen with no menu and no popup within
+    ``settle_timeout``: ``None`` when it drew nothing at all (the mirror may
+    send nothing after an ENTER, #543), so it is evidence, not a verdict.
+    ``verified`` is ``True`` when a fresh connection showed the action's
+    effect (Turn On / Turn Off), ``None`` when the action has no effect a
+    telnet session can see (Flush/Eject, Reset) or on a dry run.
+    ``after_items`` is the submenu that fresh connection read.
+    """
+
+    category: str
+    item: str
+    dry_run: bool
+    categories: tuple[str, ...]
+    items: tuple[str, ...]
+    enter_sent: bool
+    closed: bool | None
+    verified: bool | None
+    after_items: tuple[str, ...] | None
+    screen: tuple[str, ...]
     messages: tuple[str, ...] = ()
 
 
@@ -1320,3 +1379,162 @@ class Ultimate64RemoteMenu:
             return f"answered, path {view.path!r}"
         finally:
             sess.close()
+
+    # -- public: task menu --------------------------------------------------------
+    @staticmethod
+    def _check_category(category: str) -> None:
+        if category not in TASK_CATEGORIES:
+            raise RemoteMenuNotFoundError(
+                f"task category {category!r} is not one this driver opens (TASK_CATEGORIES = "
+                f"{TASK_CATEGORIES}): the firmware runs a category's only action as soon as "
+                "the category is opened, so a category is allowed only once the source shows "
+                "that it always holds several")
+
+    def _open_tasks(self, sess: _Session, what: str) -> MenuBox:
+        """Open the task menu from the browser with the build's task key."""
+        key = "F1" if self._view(sess).framed else "F5"
+        sess.press(key)
+        view = self._view(sess)
+        if view.popup is not None:
+            raise RemoteMenuUnexpectedScreenError(
+                f"a popup {view.popup.message!r} opened instead of the task menu ({what})",
+                screen=view.rows)
+        if view.menu is None:
+            raise RemoteMenuNavigationError(
+                f"{key} opened no task menu on {self.host} ({what}); not resending",
+                screen=view.rows)
+        return view.menu
+
+    def _open_category(self, sess: _Session, category: str) -> tuple[MenuBox, MenuBox]:
+        """Open the task menu and *category*'s submenu; return both as read."""
+        top = self._open_tasks(sess, category)
+        self._highlight(sess, category, "the task menu")
+        sess.press("RIGHT")
+        view = self._view(sess)
+        if view.popup is not None:
+            raise RemoteMenuUnexpectedScreenError(
+                f"a popup {view.popup.message!r} opened instead of the {category} submenu",
+                screen=view.rows)
+        sub = view.menu
+        if sub is None or sub.labels == top.labels:
+            raise RemoteMenuNavigationError(
+                f"RIGHT on {category!r} opened no submenu; not resending", screen=view.rows)
+        return top, sub
+
+    def task_categories(self) -> tuple[str, ...]:
+        """The task menu's categories. Opens the menu, opens no category."""
+        sess = self._open("task_categories")
+        try:
+            return _labels(self._open_tasks(sess, "task_categories"))
+        finally:
+            sess.close()
+
+    def task_items(self, category: str) -> tuple[str, ...]:
+        """The items *category*'s submenu shows, disabled ones included.
+
+        Opens the task menu and the category, chooses nothing. Only a
+        category in :data:`TASK_CATEGORIES` is opened; any other is refused
+        before connecting.
+        """
+        self._check_category(category)
+        sess = self._open(f"task_items({category!r})")
+        try:
+            return _labels(self._open_category(sess, category)[1])
+        finally:
+            sess.close()
+
+    def run_task(self, category: str, item: str, *, dry_run: bool = False,
+                 settle_timeout: float = 10.0, verify_timeout: float = 15.0) -> TaskRunResult:
+        """Choose *item* in the task menu's *category* (Tasks > Printer > Turn Off).
+
+        Opens the task menu from the browser root, with F5 on the Ultimate line
+        and F1 on the framed COMMODORE layout (official C64U 1.1.0, source-read
+        only), highlights *category* and opens it with RIGHT, highlights *item*
+        reading the highlight back after every key, and sends ENTER once (not on
+        a dry run). Only a category in :data:`TASK_CATEGORIES` is opened; any
+        other is refused before connecting.
+
+        An item the submenu does not show (Turn Off while the printer is off)
+        is :class:`RemoteMenuNotFoundError`; a disabled one (Flush/Eject while
+        it is off) cannot be highlighted, the cursor skips it, and the call
+        stops with :class:`RemoteMenuNavigationError`. Neither sends the ENTER.
+
+        After the ENTER the committing session is read for up to
+        *settle_timeout* (``closed`` in the result); a popup there stops the
+        call with ``enter_sent=True`` and is left open. Turn On and Turn Off
+        are then verified on fresh connections within *verify_timeout*
+        (:class:`RemoteMenuVerifyError` if not); Flush/Eject and Reset have no
+        effect telnet can show, so ``verified`` is ``None`` for them and the
+        caller checks the outcome itself (the printer's output file, say).
+        The ENTER is never resent.
+        """
+        self._check_category(category)
+        what = f"task {category} > {item}"
+        once = _Once()
+        start = len(self._seen_messages)
+        sess = self._open(what)
+        try:
+            top, _ = self._open_category(sess, category)
+            menu = self._highlight(sess, item, f"the {category} task menu")
+            cats, items = _labels(top), _labels(menu)
+            if dry_run:
+                return TaskRunResult(category, item, True, cats, items, False, None, None, None,
+                                     self._view(sess).rows, tuple(self._seen_messages[start:]))
+            once.enter(sess, what, self.host)
+            closed, screen = self._await_task_settled(sess, what, settle_timeout)
+        except Ultimate64RemoteMenuError as exc:
+            exc.enter_sent = once.sent
+            raise
+        finally:
+            sess.close()
+        effect = _TASK_EFFECTS.get((category, item))
+        after = self._poll_task_effect(category, what, effect, verify_timeout) if effect else None
+        return TaskRunResult(category, item, False, cats, items, True, closed,
+                             True if effect else None, after, screen,
+                             tuple(self._seen_messages[start:]))
+
+    def _await_task_settled(self, sess: _Session, what: str,
+                            timeout: float) -> tuple[bool | None, tuple[str, ...]]:
+        deadline = time.monotonic() + timeout
+        drew = False
+        while True:
+            drew = sess.drain(expect=True) > 0 or drew
+            view = self._view(sess)
+            if view.popup is not None:
+                self._seen_messages.append(view.popup.message)
+                raise RemoteMenuUnexpectedScreenError(
+                    f"{what}: ENTER sent once; the session then showed the popup "
+                    f"{view.popup.message!r}. It was left open.", enter_sent=True,
+                    screen=view.rows)
+            if drew and view.menu is None:
+                return True, view.rows
+            if sess.eof or time.monotonic() >= deadline:
+                return (False if drew else None), view.rows
+
+    def _poll_task_effect(self, category: str, what: str, want: str,
+                          timeout: float) -> tuple[str, ...]:
+        deadline = time.monotonic() + timeout
+        while True:
+            time.sleep(self.timing.poll_interval)
+            try:
+                sess = self._open(f"verify {what}")
+                try:
+                    last = _labels(self._open_category(sess, category)[1])
+                finally:
+                    sess.close()
+            except Ultimate64RemoteMenuError as exc:
+                raise RemoteMenuVerifyError(
+                    f"{what}: ENTER sent once; a fresh connection then failed: {exc}",
+                    enter_sent=True, screen=exc.screen) from exc
+            if want in last:
+                return last
+            if time.monotonic() >= deadline:
+                raise RemoteMenuVerifyError(
+                    f"{what}: ENTER sent once; after {timeout:.0f} s fresh connections still "
+                    f"show {list(last)}, without {want!r}. Not resent.",
+                    enter_sent=True)
+
+
+def _labels(menu: MenuBox) -> tuple[str, ...]:
+    """A menu's labels without the blank rows a tall window pads with."""
+    return tuple(label for label in menu.labels if label)

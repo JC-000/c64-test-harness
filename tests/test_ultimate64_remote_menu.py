@@ -57,8 +57,10 @@ FAST = RemoteMenuTiming(
 
 #: Every key name the fake may ever see from the driver. Nothing that
 #: deletes (ESC[2~ is KEY_INSERT = delete selected), no LF (0x0A is
-#: KEY_CTRL_J = swap joysticks), no F-keys (their meaning differs by build).
-ALLOWED_KEYS = {"UP", "DOWN", "RIGHT", "LEFT", "PAGEUP", "PAGEDOWN", "ENTER", "o"}
+#: KEY_CTRL_J = swap joysticks). F1/F5 only open the task menu; the make
+#: fixture checks that no other call sends one.
+ALLOWED_KEYS = {"UP", "DOWN", "RIGHT", "LEFT", "PAGEUP", "PAGEDOWN", "ENTER", "o", "F1", "F5"}
+TASK_CALLS = ("run_task", "task_items", "task_categories")
 
 
 def _load(name: str) -> dict:
@@ -227,6 +229,10 @@ def make():
     lambda m: m.run_update("/USB1/vf_ue.u64", confirm_device_powers_off=True),
     lambda m: m.run_update("/USB1/vf_ue.u64", dry_run=True),
     lambda m: m.read_screen(),
+    lambda m: m.run_task("Printer", "Turn Off"),
+    lambda m: m.run_task("Printer", "Flush/Eject", dry_run=True),
+    lambda m: m.task_items("Printer"),
+    lambda m: m.task_categories(),
 ])
 def test_every_call_refuses_without_the_lock_before_connecting(make, call):
     fake, menu = make()
@@ -750,3 +756,157 @@ def test_each_result_lists_only_its_own_calls_messages(make, held, call):
     assert first.messages == (sid,)
     assert second.messages == ()
     assert menu.dismissed_messages == [sid]
+
+
+# -- the task menu (#566) ------------------------------------------------------
+
+def _task_session_keys(fake):
+    return [s.keys for s in fake.sessions]
+
+
+def test_run_task_turn_off_sends_one_enter_and_verifies_on_a_fresh_connection(make, held):
+    fake, menu = make()
+    res = menu.run_task("Printer", "Turn Off")
+    assert fake.all_commits() == [("Printer/Turn Off", "tasks")]
+    assert fake.sessions[0].keys == ["F5", "RIGHT", "DOWN", "DOWN", "ENTER"]
+    assert fake.printer_on is False
+    assert res.enter_sent and res.verified is True and res.closed is True
+    assert res.items == ("Flush/Eject", "Reset", "Turn Off")
+    assert res.after_items == ("Flush/Eject", "Reset", "Turn On")
+    assert res.categories[0] == "Printer"
+    # Every session after the committing one only read: no ENTER.
+    assert all("ENTER" not in s.keys for s in fake.sessions[1:])
+
+
+def test_run_task_turn_on_is_verified_the_other_way(make, held):
+    fake, menu = make(printer_on=False)
+    res = menu.run_task("Printer", "Turn On")
+    assert fake.all_commits() == [("Printer/Turn On", "tasks")]
+    assert fake.printer_on is True
+    assert res.after_items == ("Flush/Eject", "Reset", "Turn Off")
+
+
+def test_run_task_dry_run_highlights_and_commits_nothing(make, held):
+    fake, menu = make()
+    res = menu.run_task("Printer", "Reset", dry_run=True)
+    assert fake.all_commits() == []
+    assert "ENTER" not in fake.sessions[0].keys
+    assert res.dry_run and not res.enter_sent and res.verified is None
+    assert fake.printer_on is True
+
+
+def test_the_framed_layout_opens_tasks_with_f1_never_f5(make, held):
+    fake, menu = make(framed=True)
+    menu.run_task("Printer", "Flush/Eject", dry_run=True)
+    assert fake.sessions[0].keys[0] == "F1"
+    assert "F5" not in fake.sessions[0].keys
+
+
+@pytest.mark.parametrize("category", ["Power", "Software IEC", "printer", "Printer "])
+def test_a_category_not_on_the_list_is_refused_before_connecting(make, held, category):
+    """Power holds one action, which the firmware runs as the category opens."""
+    fake, menu = make()
+    with pytest.raises(RemoteMenuNotFoundError, match="TASK_CATEGORIES"):
+        menu.run_task(category, "Reboot")
+    with pytest.raises(RemoteMenuNotFoundError, match="TASK_CATEGORIES"):
+        menu.task_items(category)
+    assert fake.connect_attempts == 0
+
+
+def test_task_items_lists_disabled_items_and_commits_nothing(make, held):
+    fake, menu = make(printer_on=False)
+    assert menu.task_items("Printer") == ("Flush/Eject", "Reset", "Turn On")
+    assert fake.all_commits() == []
+    assert "ENTER" not in fake.sessions[0].keys
+
+
+def test_task_categories_opens_no_category(make, held):
+    fake, menu = make()
+    assert menu.task_categories() == ("Printer", "Software IEC", "Power")
+    assert fake.sessions[0].keys == ["F5"]
+    assert fake.all_commits() == []
+
+
+def test_a_disabled_item_is_not_chosen(make, held):
+    fake, menu = make(printer_on=False)
+    with pytest.raises(RemoteMenuNavigationError) as ei:
+        menu.run_task("Printer", "Reset")
+    assert ei.value.enter_sent is False
+    assert fake.all_commits() == []
+
+
+def test_an_item_the_submenu_does_not_offer_is_not_found(make, held):
+    fake, menu = make(printer_on=False)
+    with pytest.raises(RemoteMenuNotFoundError) as ei:
+        menu.run_task("Printer", "Turn Off")
+    assert ei.value.enter_sent is False
+    assert fake.all_commits() == []
+
+
+def test_a_lost_turn_off_is_reported_not_resent(make, held):
+    fake, menu = make(commit_takes_effect=False)
+    with pytest.raises(RemoteMenuVerifyError) as ei:
+        menu.run_task("Printer", "Turn Off", verify_timeout=0.3)
+    assert ei.value.enter_sent is True
+    assert fake.all_commits() == [("Printer/Turn Off", "tasks")]
+
+
+def test_flush_without_a_redraw_is_unknown_not_an_error(make, held):
+    fake, menu = make(redraw_after_commit=False)
+    res = menu.run_task("Printer", "Flush/Eject", settle_timeout=0.3)
+    assert fake.all_commits() == [("Printer/Flush/Eject", "tasks")]
+    assert res.closed is None and res.verified is None and res.after_items is None
+    assert len(fake.sessions) == 1   # nothing to verify, so no fresh connection
+
+
+def test_flush_waits_out_its_progress_box(make, held):
+    fake, menu = make(task_progress_s=0.6)
+    res = menu.run_task("Printer", "Flush/Eject", settle_timeout=5.0)
+    assert res.closed is True
+    assert fake.all_commits() == [("Printer/Flush/Eject", "tasks")]
+    assert "Flushing" not in "".join(res.screen)
+
+
+def test_a_popup_after_the_task_enter_stops_with_enter_sent(make, held, monkeypatch):
+    import remote_menu_fake as rmf
+    fake, menu = make()
+    real = rmf._Session.run_task_action
+
+    def with_popup(self, cat, label):
+        real(self, cat, label)
+        self.popup = ("Printer error", ["Ok"])
+        self.redraw()
+    monkeypatch.setattr(rmf._Session, "run_task_action", with_popup)
+    with pytest.raises(RemoteMenuUnexpectedScreenError) as ei:
+        menu.run_task("Printer", "Reset")
+    assert ei.value.enter_sent is True
+    assert fake.all_commits() == [("Printer/Reset", "tasks")]
+    assert fake.sessions[0].keys.count("ENTER") == 1
+
+
+def test_no_other_call_sends_an_f_key(make, held):
+    fake, menu = make()
+    menu.wifi_status()
+    menu.context_actions("/USB1/vf_ue.u64")
+    menu.run_update("/USB1/vf_ue.u64", dry_run=True)
+    menu.set_wifi_enabled(False, dry_run=True)
+    assert all(not {"F1", "F5"} & set(s.keys) for s in fake.sessions)
+
+
+def test_a_category_that_opens_no_submenu_stops_before_any_enter(make, held):
+    fake, menu = make(task_right_ignored=True)
+    with pytest.raises(RemoteMenuNavigationError, match="opened no submenu") as ei:
+        menu.run_task("Printer", "Reset")
+    assert ei.value.enter_sent is False
+    assert fake.all_commits() == []
+    assert "ENTER" not in fake.sessions[0].keys
+
+
+def test_a_screen_that_never_settles_after_the_enter_carries_enter_sent(make, held):
+    import dataclasses
+    fake, menu = make(flood_after_commit=True)
+    menu.timing = dataclasses.replace(FAST, max_drain=0.5)
+    with pytest.raises(RemoteMenuUnexpectedScreenError, match="did not go quiet") as ei:
+        menu.run_task("Printer", "Reset")
+    assert ei.value.enter_sent is True
+    assert fake.all_commits() == [("Printer/Reset", "tasks")]
