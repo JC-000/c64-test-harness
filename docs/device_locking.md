@@ -155,7 +155,7 @@ request it then checks:
 
 | Finding | Leak-prone grade, hygiene armed | Otherwise |
 |---|---|---|
-| A configured address's **raw lockfile** is held by another process (a lane on a harness without the alias map) | `Ultimate64DeviceAliasError` before sending (a `Ultimate64TempHygieneError`; `U64_TEMP_GC_REQUIRED=0` does **not** lift it) | WARNING; raises under `U64_REQUIRE_DEVICE_LOCK=1` |
+| A configured address's **raw lockfile** is held by another process: a lane on a harness without the alias map, or a wrapper that flocks the raw-address lockfile itself, possibly this process's own parent. The message gives the pid from the lockfile record, which a bare flock never rewrites, so it may name a former holder; a lockfile with no pid is reported as "pid unknown" (#539). Drop such a wrapper's flock: the `uid-` key already covers every listed address | `Ultimate64DeviceAliasError` before sending (a `Ultimate64TempHygieneError`; `U64_TEMP_GC_REQUIRED=0` does **not** lift it) | WARNING; raises under `U64_REQUIRE_DEVICE_LOCK=1` |
 | Another key for this device is **locked right now** by the process that recorded it, after recording it (a lane the device has answered) | same refusal | WARNING; raises under `U64_REQUIRE_DEVICE_LOCK=1` |
 | The alias map says this address is a **different device** from the one that answered | same refusal | WARNING; raises under `U64_REQUIRE_DEVICE_LOCK=1` |
 | The device was reached under another key before, and that key is free, or held by a process the device has not answered under it (an address since handed to another device, a lock-only wrapper, a lane that has not uploaded yet) | WARNING once per process | WARNING once per process |
