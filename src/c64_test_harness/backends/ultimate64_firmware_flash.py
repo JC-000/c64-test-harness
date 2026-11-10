@@ -221,7 +221,7 @@ LOAD_WINDOW = (0x03000000, 0x04000000)
 #: Why the recovery check before a C64U flash can only warn. Owner,
 #: 2026-11-09: warn-only.
 RECOVERY_CHECK_NOTE = (
-    "JTAG recovery kit not checked: per docs/design/jtag_recovery.md the only "
+    "JTAG recovery kit not checked: the only "
     "evidence that the kit can recover this device is an IDCODE read through "
     "the ESP32 adapter (esp_recover.py --idcode-only / --link-test), which is "
     "hardware traffic, and no adapter-to-device binding exists in devices.toml. "
