@@ -1105,10 +1105,14 @@ image = FirmwareImage(
 lock = DeviceLock(host)
 lock.acquire_or_raise(timeout=300)
 try:
-    plan = flash_firmware(host, image, dry_run=True)  # validate + /v1/info, no upload, no ENTER
+    # reformat_flash_disk is required: NO on this bench, True only when a test
+    # needs a formatted flash disk (owner, 2026-11-14).
+    plan = flash_firmware(host, image, reformat_flash_disk=False,
+                          dry_run=True)             # validate + /v1/info, no upload, no ENTER
     print(plan.family, plan.operator_instruction, plan.warnings)
     # Only once someone at the device has read plan.operator_instruction:
-    record = flash_firmware(host, image, confirm_device_powers_off=True)
+    record = flash_firmware(host, image, reformat_flash_disk=False,
+                            confirm_device_powers_off=True)
     assert record.identity_verified, record.warnings
 except FirmwareFlashError as exc:
     print(exc.step, exc.record.steps)               # never retry blind after run_update
@@ -1117,7 +1121,17 @@ finally:
     lock.release()
 ```
 
-The dry run navigates to the image only when it is already on the device; otherwise it records a warning and stops after the upload check. A prompting image ends with the machine switched off and needs one press of the power button; a C64U SILENT image (`kind="silent"`) asks nothing. On an official C64U image the instruction says **NO** to "Reset Configuration?" and the harness resets the non-network categories itself.
+The dry run navigates to the image only when it is already on the device; otherwise it records a warning and stops after the upload check. A prompting image ends with the machine switched off and needs one press of the power button; a C64U SILENT image (`kind="silent"`) asks nothing. On an official C64U image the instruction says **NO** to "Reset Configuration?" and the harness resets the non-network categories itself. A ROM in `roms` that `/Flash/roms` already holds byte-for-byte is not written (`record.roms_unchanged`).
+
+**Reading the WiFi module IDENT outside a flash** (`read_wifi_ident`, package root): Disables WiFi only if it is on, reads the IDENT, Enables it again and waits for Link Up. On the U64E each toggle writes flash.
+
+```python
+from c64_test_harness import DeviceLock, read_wifi_ident
+
+with DeviceLock(host) as lock:          # or acquire_or_raise / release as above
+    got = read_wifi_ident(host)         # WifiIdentReading(ident, before, after, toggled)
+    print(got.ident, got.before.state, got.after.state)
+```
 
 ### SocketDMA write fast path (TCP 64)
 

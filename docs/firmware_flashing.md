@@ -115,6 +115,30 @@ On 2026-11-09 both devices read `link-down` right after Enable (3 cycles
 each) and reached `link-up` later, so wait for Link Up if you need the
 WiFi address back. `flash_firmware`'s WiFi step does that.
 
+### Reading the WiFi module IDENT (`read_wifi_ident`)
+
+`read_wifi_ident(host, *, link_timeout_s=90.0, poll_interval_s=5.0) ->
+WifiIdentReading(ident, before, after, toggled)` (package root) reads the
+module IDENT (e.g. `ESP32 WiFi Bridge V1.494`) outside a flash, on the U64E
+and the C64U alike. The firmware shows the IDENT only while WiFi is
+Disabled, so the function always leaves WiFi as it found it:
+
+- A row already `disabled` is read and left alone (`toggled=False`).
+- A `link-up` or `link-down` row is Disabled, read, Enabled again, and then
+  polled until it reads Link Up (`toggled=True`). The Enable is also sent
+  when the Disable or the read fails, unless the failure says the Disable's
+  ENTER was never sent.
+- Any other state (`scanning`, `busy`, `firmware?`, `no-module`, `unknown`)
+  raises `WifiIdentUnreadableError` with nothing sent.
+- No Link Up within `link_timeout_s` raises `WifiLinkTimeoutError`; its
+  `reading` holds the IDENT and the last row. A module with no access
+  point to join therefore always ends this way, with WiFi enabled again.
+
+It needs the `DeviceLock` (`RemoteMenuLockError` otherwise, before any
+connection). It costs zero `/Temp`. **On the U64E each Disable and Enable writes
+the WiFi config store to flash**, as above. `flash_firmware`'s `wifi_ident`
+step runs the same code.
+
 ### Run Update
 
 `run_update` refuses a real run unless `confirm_device_powers_off=True`,
@@ -173,11 +197,18 @@ the first telnet read after the flash below.
 
 ## Flashing firmware (`flash_firmware`)
 
-`flash_firmware(host, image, *, confirm_device_powers_off=False, roms=(),
-dry_run=False, wait_up_s=900.0, poll_interval_s=5.0,
-wifi_link_timeout_s=90.0) -> FlashRecord` takes an update image from the
-host to a verified running firmware. It returns a `FlashRecord`, and
-writes nothing to the host's disk.
+`flash_firmware(host, image, *, reformat_flash_disk,
+confirm_device_powers_off=False, roms=(), dry_run=False, wait_up_s=900.0,
+poll_interval_s=5.0, wifi_link_timeout_s=90.0) -> FlashRecord` takes an
+update image from the host to a verified running firmware. It returns a
+`FlashRecord`, and writes nothing to the host's disk.
+
+`reformat_flash_disk` is required and has no default (new after 0.14.0, so
+0.14.0 callers must add it): it is the answer the operator is told to give to
+"Reformat Flash Disk?", and it is stored in
+`FlashRecord.reformat_flash_disk`. Omitting it is a `TypeError`, and a
+value that is not a `bool` is refused at `validate`. Both happen before
+any traffic.
 
 It never answers an updater prompt, never presses a button, never cuts
 power, and never retries Run Update.
@@ -232,7 +263,7 @@ is not refused.
 
 ### The prompts, and the button
 
-`operator_instruction(family, kind)` (import it from
+`operator_instruction(family, kind, *, reformat_flash_disk)` (import it from
 `c64_test_harness.backends.ultimate64_firmware_flash`) builds the text the
 person at the device is given. The harness logs it at WARNING before the
 ENTER and again before the wait, and stores it in
@@ -240,7 +271,7 @@ ENTER and again before the wait, and stores it in
 
 | Prompt (on the C64 screen) | Answer |
 |---|---|
-| "Reformat Flash Disk?" (asked only when the flash disk has files) | YES |
+| "Reformat Flash Disk?" (asked only when the flash disk has files) | The caller's `reformat_flash_disk`: NO on this bench, YES only when a test needs it (owner, 2026-11-14) |
 | "About to update. Continue?" | YES |
 | "Reset Configuration? (Recommended)" | YES, except **NO on an official C64U image** |
 | An ESP32 "Flashing ESP32 ..." popup waiting for OK | OK |
@@ -266,8 +297,9 @@ again, with no button press.
 `FlashRecord.steps` lists the steps that finished; on an error,
 `record.failed_step` names the one that raised.
 
-1. `validate`: lock, confirmation, kind, hashes, extension, image class,
-   and each `RomImage`'s SHA-256, size and signature. No traffic.
+1. `validate`: lock, confirmation, `reformat_flash_disk`, kind, hashes,
+   extension, image class, and each `RomImage`'s SHA-256, size and
+   signature. No traffic.
 2. `preflight`: `GET /v1/info` gives the product (and so the family and
    extension), `unique_id` and the running hash. An unknown product, a
    SILENT image for a U64E, or ROMs for a U64E is refused. On a C64U a
@@ -284,13 +316,19 @@ again, with no button press.
    identity the kind calls for.
 7. `reset_categories`: official C64U only.
 8. `wifi_ident`: only with `expected_wifi_ident`. Disable, read the module
-   IDENT, Enable, wait for Link Up. On the U64E the Disable and the Enable
-   each write the WiFi config store to flash. A row already Disabled is read
-   and left as it was.
-9. `roms`: C64U only, when `roms` are given. `storage_put_rom` for each,
-   then `reboot()` so the C64 loads its ROMs again, then `/v1/info` is read
-   and the identity checked again. That proves the same firmware still
-   answers; it proves nothing about the ROMs.
+   IDENT, Enable, wait for Link Up (`read_wifi_ident`'s cycle). On the U64E
+   the Disable and the Enable each write the WiFi config store to flash. A
+   row already Disabled is read and left as it was.
+9. `roms`: C64U only, when `roms` are given. A ROM that `/Flash/roms`
+   already holds with the same SHA-256 (matched by name as
+   `storage_put_rom` matches it, then size, then the file read back over
+   FTP) is not written; its path goes in `FlashRecord.roms_unchanged`. Every
+   other ROM goes through `storage_put_rom`, so a stock file with other
+   content still needs `overwrite=True, replace_stock=True`. If any ROM was
+   written, `reboot()` follows so the C64 loads its ROMs again, then
+   `/v1/info` is read and the identity checked again. That proves the same
+   firmware still answers; it proves nothing about the ROMs. If none was
+   written, there is no reboot (`rebooted=False`).
 
 ### Dry run
 
@@ -312,7 +350,7 @@ the dry run's `upload` step, as it would fail a real run.
 | Error | Meaning |
 |---|---|
 | `FirmwareImageError` | Host-side validation failed. Raised before the image is uploaded or selected. |
-| `FirmwareFlashRefusedError` | A precondition failed: the lock, the confirmation, the product, ROMs on a U64E. |
+| `FirmwareFlashRefusedError` | A precondition failed: the lock, the confirmation, a `reformat_flash_disk` that is not a `bool`, the product, ROMs on a U64E. |
 | `FirmwareFlashTimeoutError` | REST, or the WiFi link, did not come back in time. |
 | `FirmwareFlashVerifyError` | The device came back with the wrong identity, hash or IDENT, or the upload or Run Update did not verify. |
 | `FirmwareFlashStepError` | A building block raised during a step; the original is `__cause__`. |

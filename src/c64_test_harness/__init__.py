@@ -196,8 +196,13 @@ from .backends.ultimate64_firmware_flash import (
     FlashRecord,
     RomImage,
     UpdateImageInfo,
+    WifiIdentError,
+    WifiIdentReading,
+    WifiIdentUnreadableError,
+    WifiLinkTimeoutError,
     flash_firmware,
     inspect_update_image,
+    read_wifi_ident,
 )
 from .backends.ultimate64_remote_menu import (
     RemoteMenuConnectError,
@@ -714,6 +719,12 @@ __all__ = [
     "FirmwareFlashTimeoutError",
     "FirmwareFlashVerifyError",
     "FirmwareFlashStepError",
+    # WiFi module IDENT read through the Remote Menu, outside a flash
+    "read_wifi_ident",
+    "WifiIdentReading",
+    "WifiIdentError",
+    "WifiIdentUnreadableError",
+    "WifiLinkTimeoutError",
     # Telnet Remote Menu driver: WiFi row, Run Update (issue #543)
     "Ultimate64RemoteMenu",
     "RemoteMenuTiming",
