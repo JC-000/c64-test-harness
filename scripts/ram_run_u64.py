@@ -110,6 +110,7 @@ def run_update_ramrun(menu, path: str, data: bytes, log=jl._log) -> tuple[str, .
     Returns the context menu's labels. Driver refusals before the ENTER are raised as ``JtagLoadError("menu")``.
     """
     check_ramrun_image(data)
+    # Uses the driver's private _open, _navigate, _open_menu, _highlight and _Session.send/drain/close (no public API).
     from c64_test_harness.backends.ultimate64_remote_menu import Ultimate64RemoteMenuError
     try:
         sess = menu._open("Run Update (RAM-run)")
