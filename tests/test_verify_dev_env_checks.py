@@ -973,11 +973,17 @@ def test_setup_keeps_plain_help_when_it_lists_the_flags(tmp_path):
 
 
 def _vice_eth_rows(
-    tmp_path: Path, check_rc: int, *, x64sc: bool = True, bpf_mode: int = 0o606
+    tmp_path: Path,
+    check_rc: int,
+    *,
+    x64sc: bool = True,
+    bpf_mode: int = 0o606,
+    missing_script: bool = False,
 ) -> tuple[dict[str, list[str]], list[str]]:
     fake = tmp_path / "build-vice-eth.sh"
-    fake.write_text(f"#!/bin/sh\necho 'build-vice-eth: state {check_rc}'\nexit {check_rc}\n")
-    fake.chmod(0o755)
+    if not missing_script:
+        fake.write_text(f"#!/bin/sh\necho 'build-vice-eth: state {check_rc}'\nexit {check_rc}\n")
+        fake.chmod(0o755)
     stock = tmp_path / "x64sc"
     if x64sc:
         stock.write_text("#!/bin/sh\n")
@@ -1015,8 +1021,10 @@ def test_a_patched_build_makes_the_x64sc_rule_unnecessary(tmp_path, check_rc):
     assert not any("NOPASSWD rule for" in h for h in hints), hints
 
 
-def test_without_a_patched_build_the_x64sc_rule_is_required(tmp_path):
-    rows, hints = _vice_eth_rows(tmp_path, 2)
+# 2 not built or not patched, 5 an unknown failure, 127 the script missing.
+@pytest.mark.parametrize("check_rc", [2, 5, 127])
+def test_without_a_patched_build_the_x64sc_rule_is_required(tmp_path, check_rc):
+    rows, hints = _vice_eth_rows(tmp_path, check_rc, missing_script=check_rc == 127)
     assert rows["NOPASSWD sudo for x64sc"][0] == "warn"
     assert any("build-vice-eth.sh" in h and "NOPASSWD rule for" in h for h in hints), hints
 
