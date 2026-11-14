@@ -994,7 +994,7 @@ def _vice_eth_rows(
     return rows, _hints(proc.stdout)
 
 
-@pytest.mark.parametrize(("check_rc", "status"), [(0, "ok"), (1, "warn"), (2, "missing"), (5, "unknown")])
+@pytest.mark.parametrize(("check_rc", "status"), [(0, "ok"), (1, "warn"), (2, "missing"), (3, "unknown"), (5, "unknown")])
 def test_patched_vice_row_follows_build_check(tmp_path, check_rc, status):
     rows, _hints_ = _vice_eth_rows(tmp_path, check_rc)
     assert rows["patched VICE (ethernet without root)"][0] == status
@@ -1005,7 +1005,8 @@ def test_stale_patched_vice_hints_a_rebuild(tmp_path):
     assert any("scripts/build-vice-eth.sh" in h and "Rebuild" in h for h in hints), hints
 
 
-@pytest.mark.parametrize("check_rc", [0, 1])
+# 3: built and patched, but Homebrew's vice formula could not be compared.
+@pytest.mark.parametrize("check_rc", [0, 1, 3])
 def test_a_patched_build_makes_the_x64sc_rule_unnecessary(tmp_path, check_rc):
     rows, hints = _vice_eth_rows(tmp_path, check_rc)
     status, detail, _crit = rows["NOPASSWD sudo for x64sc"]
