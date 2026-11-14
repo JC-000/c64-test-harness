@@ -723,3 +723,59 @@ def test_duplicate_serial_warning_is_recorded(env, monkeypatch):
     monkeypatch.setattr(jl, "adapter_for", afor)
     rec = load(env, FakeEsp(ev), FakeClient(ev, [info()]))
     assert rec["dup_cp210x_serial_warning"] is True
+
+
+# -- the lock guard on the real client factory (require_device_lock, _u64_host) -------------------------------
+
+GUARD_HOST = "192.0.2.1"        # TEST-NET-1: nothing answers there, and the guard refuses before any request
+
+
+@pytest.fixture
+def built(monkeypatch):
+    """Replace the harness client so _client can be called without building one; record each construction."""
+    import c64_test_harness.backends.ultimate64_client as uc
+    made = []
+    monkeypatch.setattr(uc, "Ultimate64Client", lambda host, **kw: made.append(host) or object())
+    monkeypatch.delenv("C64U_LOCK_PID", raising=False)
+    monkeypatch.delenv("C64U_LOCK_HOST", raising=False)
+    return made
+
+
+def real_locks(tmp_path):
+    from c64_test_harness.backends.device_lock import DeviceLock as RealLock
+    return lambda name, allow_nested=False: RealLock(name, lock_dir=tmp_path / "locks", allow_nested=allow_nested,
+                                                     heartbeat_interval=None)
+
+
+def test_client_refuses_unlocked_and_try_info_does_not_hide_it(built):
+    with pytest.raises(jl.DeviceLockNotHeldError):
+        jl._client(GUARD_HOST)
+    with pytest.raises(jl.DeviceLockNotHeldError):       # not None, which would read as "the device is off"
+        jl.try_info(GUARD_HOST)
+    assert built == []
+
+
+def test_client_is_built_under_the_scripts_own_lock(built, tmp_path):
+    with jl._Locked(GUARD_HOST, {}, 5, real_locks(tmp_path)):
+        jl._client(GUARD_HOST)
+    assert built == [GUARD_HOST]
+    with pytest.raises(jl.DeviceLockNotHeldError):       # released again
+        jl._client(GUARD_HOST)
+
+
+def test_client_is_built_under_a_lock_shell_and_a_stale_claim_refused(built, tmp_path, monkeypatch):
+    import c64_test_harness.backends.device_lock as dl
+    monkeypatch.setenv("C64U_LOCK_PID", "4242")
+    monkeypatch.setenv("C64U_LOCK_HOST", GUARD_HOST)
+    monkeypatch.setattr(dl, "device_lock_holder", lambda h: {"pid": 4242})
+    with jl._Locked(GUARD_HOST, {}, 5, real_locks(tmp_path)) as held:
+        assert held.dev is None                         # the shell holds it; this process took nothing
+        jl._client(GUARD_HOST)
+    assert built == [GUARD_HOST]
+    monkeypatch.setattr(dl, "device_lock_holder", lambda h: {"pid": 1})
+    with pytest.raises(jl.LockShellClaimError):
+        jl._client(GUARD_HOST)
+    monkeypatch.setenv("C64U_LOCK_HOST", "192.0.2.99")  # the shell holds another device: no cover here
+    with pytest.raises(jl.DeviceLockNotHeldError):
+        jl._client(GUARD_HOST)
+    assert built == [GUARD_HOST]

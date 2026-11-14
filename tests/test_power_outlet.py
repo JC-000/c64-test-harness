@@ -168,3 +168,60 @@ def test_drivers_build_the_documented_urls():
     assert t.is_on() is True
     assert urls == ["http://p/rpc/Switch.Set?id=0&on=false", "http://p/rpc/Switch.GetStatus?id=0",
                     "http://q/cm?cmnd=Power%20On", "http://q/cm?cmnd=Power"]
+
+
+# -- switching needs the device's lock; reading the plug does not ----------------------------------------------
+
+HOST = "192.0.2.1"      # TEST-NET-1; urlopen is replaced, so nothing is sent anywhere
+
+
+@pytest.fixture
+def wire(monkeypatch):
+    """Record every plug URL the real classes would open."""
+    import io
+    urls = []
+
+    class Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def urlopen(url, timeout=None):
+        urls.append(url)
+        return Resp(b'{"output": true, "POWER": "ON"}')
+    monkeypatch.setattr(po.urllib.request, "urlopen", urlopen)
+    monkeypatch.delenv("C64U_LOCK_PID", raising=False)
+    return urls
+
+
+def test_switching_refuses_without_the_lock(wire):
+    for plug in (po.ShellyGen2("http://p", host=HOST), po.Tasmota("http://q", host=HOST), po.ShellyGen2("http://p")):
+        with pytest.raises(jl.DeviceLockNotHeldError):
+            plug.set(False)
+    assert wire == []
+
+
+def test_switching_under_the_lock(wire, tmp_path):
+    from c64_test_harness.backends.device_lock import DeviceLock as RealLock
+    lock = RealLock(HOST, lock_dir=tmp_path / "locks", heartbeat_interval=None)
+    assert lock.acquire(timeout=5)
+    try:
+        po.ShellyGen2("http://p", host=HOST).set(False)
+        po.Tasmota("http://q", host=HOST).set(True)
+    finally:
+        lock.release()
+    assert wire == ["http://p/rpc/Switch.Set?id=0&on=false", "http://q/cm?cmnd=Power%20On"]
+
+
+def test_status_and_dry_run_read_the_plug_and_never_reach_the_switch(wire, monkeypatch, capsys):
+    def no_switch(*a, **k):
+        raise AssertionError("the read path reached _switch")
+    monkeypatch.setattr(po, "_switch", no_switch)
+    monkeypatch.setattr(po, "outlet_binding", lambda uid, path=None: dict(BIND))
+    monkeypatch.setattr(jl, "normalize_device_host", lambda h: "uid-5d2518")
+    assert po.main(["status", "c64u"]) == 0
+    rec = po.outlet_cycle("c64u", binding=dict(BIND), dry_run=True, log=lambda m: None)
+    assert rec["outlet_on"] is True and rec["result"] == "dry-run ok"
+    assert wire == ["http://plug/rpc/Switch.GetStatus?id=0"] * 2

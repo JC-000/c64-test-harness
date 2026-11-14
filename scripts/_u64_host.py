@@ -55,6 +55,10 @@ __all__ = [
     "require_u64_host",
     "no_host_message",
     "hold_device_lock",
+    "require_device_lock",
+    "lock_shell_holds",
+    "DeviceLockNotHeldError",
+    "LockShellClaimError",
     "NO_HOST_EXIT",
     "NO_LOCK_EXIT",
 ]
@@ -217,3 +221,53 @@ def hold_device_lock(
         yield lock
     finally:
         lock.release()
+
+
+class DeviceLockNotHeldError(RuntimeError):
+    """A device-reaching call was reached while nobody in the device's queue held its ``DeviceLock``."""
+
+
+class LockShellClaimError(RuntimeError):
+    """``C64U_LOCK_PID`` names a process that does not hold the device's ``DeviceLock``."""
+
+
+def lock_shell_holds(host: str, *, normalize=None) -> bool:
+    """True when a lock shell (locked.py) holds *host*'s ``DeviceLock`` for this process.
+
+    The convention: ``C64U_LOCK_PID`` is the PID of the process that holds the lock, and ``C64U_LOCK_HOST``
+    (optional) the host it holds it for. False when ``C64U_LOCK_PID`` is unset or names another device. A claim
+    that the lockfile does not back raises :class:`LockShellClaimError`, never False: the caller would otherwise
+    queue behind, or drive past, the very holder it was told about. *normalize* compares hosts (default: the
+    harness's ``normalize_device_host``).
+    """
+    pid = os.environ.get("C64U_LOCK_PID")
+    if not pid:
+        return False
+    from c64_test_harness.backends.device_lock import device_lock_holder, normalize_device_host
+    norm = normalize or normalize_device_host
+    shell_host = os.environ.get("C64U_LOCK_HOST")
+    if shell_host and norm(shell_host) != norm(host):
+        return False
+    holder = device_lock_holder(host)
+    if holder and str(holder.get("pid")) == pid:
+        return True
+    raise LockShellClaimError(f"C64U_LOCK_PID={pid} does not hold the DeviceLock for {host} (holder {holder})")
+
+
+def require_device_lock(host: str, *, normalize=None) -> None:
+    """Refuse unless *host*'s ``DeviceLock`` is held: by this process (any lock dir), or by its lock shell.
+
+    For code that reaches a device through an injected factory, where no ``with hold_device_lock(...)`` can sit
+    around the construct: call it as the **first statement** of the function that builds the client or sends the
+    request. ``tests/test_u64_runner_script_gates.py`` accepts that shape, and only with this function imported
+    from here. It takes no lock and waits for nothing; the caller's own lock (``DeviceLock``, ``hold_device_lock``,
+    a lock shell) must already be held.
+    """
+    from c64_test_harness.backends.ultimate64_temp_gc import lock_held_for
+    if lock_held_for(host):
+        return
+    if lock_shell_holds(host, normalize=normalize):
+        return
+    raise DeviceLockNotHeldError(
+        f"refusing to reach {host}: this process does not hold its DeviceLock and no lock shell "
+        f"(C64U_LOCK_PID) does. Take it first, e.g. with hold_device_lock({host!r}).")

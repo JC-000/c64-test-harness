@@ -38,6 +38,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import jtag_load as jl  # noqa: E402  (harness src on sys.path, DeviceLock, try_info, wait_info, check_git_hash)
+from _u64_host import require_device_lock  # noqa: E402
 
 MIN_OFF_S = 10.0
 C64U_IDS = {"5D2518"}
@@ -47,36 +48,55 @@ class OutletError(RuntimeError):
     pass
 
 
-class ShellyGen2:
+def _read_plug(url: str, timeout: float) -> dict:
+    """GET a plug status URL. Reads the plug only; never switches power (the lock scan excludes it by name)."""
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def _switch(host: str, url: str, timeout: float) -> dict:
+    """GET a plug switch URL: this cuts or restores the power of *host*, so its DeviceLock must be held."""
+    require_device_lock(host, normalize=jl.normalize_device_host)
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+class _Plug:
+    """Builds the URLs; reads go through _read_plug, switching through _switch (which needs *host*'s lock).
+    *fetch* replaces both, for tests."""
+
+    def __init__(self, base: str, timeout: float = 5.0, fetch=None, host: str | None = None):
+        self.base, self.timeout, self.fetch, self.host = base.rstrip("/"), timeout, fetch, host
+
+    def _get(self, url: str) -> dict:
+        return self.fetch(url) if self.fetch else _read_plug(url, self.timeout)
+
+    def set(self, on: bool) -> None:
+        url = self.switch_url(on)
+        if self.fetch:
+            self.fetch(url)
+        else:
+            _switch(self.host, url, self.timeout)
+
+
+class ShellyGen2(_Plug):
     """Shelly Plus/Pro (Gen2+) RPC over HTTP GET: Switch.Set / Switch.GetStatus, id 0."""
 
-    def __init__(self, base: str, timeout: float = 5.0, fetch=None):
-        self.base, self.timeout = base.rstrip("/"), timeout
-        self.fetch = fetch or self._fetch
-
-    def _fetch(self, url: str) -> dict:
-        with urllib.request.urlopen(url, timeout=self.timeout) as r:
-            return json.loads(r.read().decode())
-
-    def set(self, on: bool) -> None:
-        self.fetch(f"{self.base}/rpc/Switch.Set?id=0&on={'true' if on else 'false'}")
+    def switch_url(self, on: bool) -> str:
+        return f"{self.base}/rpc/Switch.Set?id=0&on={'true' if on else 'false'}"
 
     def is_on(self) -> bool:
-        return bool(self.fetch(f"{self.base}/rpc/Switch.GetStatus?id=0")["output"])
+        return bool(self._get(f"{self.base}/rpc/Switch.GetStatus?id=0")["output"])
 
 
-class Tasmota:
+class Tasmota(_Plug):
     """Tasmota HTTP commands: /cm?cmnd=Power%20On|Off and /cm?cmnd=Power -> {"POWER": "ON"|"OFF"}."""
 
-    def __init__(self, base: str, timeout: float = 5.0, fetch=None):
-        self.base, self.timeout = base.rstrip("/"), timeout
-        self.fetch = fetch or ShellyGen2._fetch.__get__(self)
-
-    def set(self, on: bool) -> None:
-        self.fetch(f"{self.base}/cm?cmnd=Power%20{'On' if on else 'Off'}")
+    def switch_url(self, on: bool) -> str:
+        return f"{self.base}/cm?cmnd=Power%20{'On' if on else 'Off'}"
 
     def is_on(self) -> bool:
-        return str(self.fetch(f"{self.base}/cm?cmnd=Power").get("POWER", "")).upper() == "ON"
+        return str(self._get(f"{self.base}/cm?cmnd=Power").get("POWER", "")).upper() == "ON"
 
 
 KINDS = {"shelly-gen2": ShellyGen2, "tasmota": Tasmota}
@@ -124,7 +144,7 @@ def outlet_cycle(host: str, *, off_s: float = MIN_OFF_S, graceful: bool = True, 
     b = binding or outlet_binding(uid)
     if expect_git_hash is not None:
         expect_git_hash = jl.check_git_hash(expect_git_hash)
-    outlet = (outlet_factory or (lambda bb: KINDS[bb["outlet_kind"]](bb["outlet"])))(b)
+    outlet = (outlet_factory or (lambda bb: KINDS[bb["outlet_kind"]](bb["outlet"], host=host)))(b)
     rec = {"t0": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": host, "uid": uid, "action": "outlet_cycle",
            "outlet": b["outlet"], "off_s": off_s}
     if dry_run:

@@ -56,6 +56,10 @@ sys.path.insert(0, os.environ.get("C64_HARNESS_SRC") or str(HERE.parent / "src")
 from c64_test_harness.backends.device_lock import (  # noqa: E402
     DeviceLock, normalize_device_host, resolve_lock_timeout)
 
+sys.path.insert(0, str(HERE))
+from _u64_host import (  # noqa: E402
+    DeviceLockNotHeldError, LockShellClaimError, lock_shell_holds, require_device_lock)
+
 ESP_JTAG_HOST = Path(os.environ.get("ESP_JTAG_DIR", "~/Documents/1541u-tools/esp-jtag")).expanduser() / "host"
 UPSTREAM_TESTS = Path(os.environ.get("C64U_TESTS_DIR", "~/Documents/1541ultimate/tests")).expanduser()
 
@@ -189,6 +193,7 @@ def payload_from_app(app: Path, out: Path) -> str:
 
 
 def _client(host: str, timeout: float = 5.0):
+    require_device_lock(host, normalize=normalize_device_host)   # every caller holds jl._Locked or a lock shell
     from c64_test_harness.backends.ultimate64_client import Ultimate64Client
     return Ultimate64Client(host, password=os.environ.get("U64_PASS"), timeout=timeout)
 
@@ -196,6 +201,8 @@ def _client(host: str, timeout: float = 5.0):
 def try_info(host: str, client_factory=_client) -> dict | None:
     try:
         return client_factory(host).get_info()
+    except (DeviceLockNotHeldError, LockShellClaimError):
+        raise                               # a refusal is not "the device does not answer"
     except Exception:
         return None
 
@@ -280,18 +287,14 @@ class _Locked:
 
 
 def _held_by_lock_shell(host: str) -> bool:
-    """True when C64U_LOCK_PID is set for this host and that process holds its DeviceLock (locked.py)."""
-    pid = os.environ.get("C64U_LOCK_PID")
-    if not pid:
-        return False
-    shell_host = os.environ.get("C64U_LOCK_HOST")
-    if shell_host and normalize_device_host(shell_host) != normalize_device_host(host):
-        return False
-    from c64_test_harness.backends.device_lock import device_lock_holder
-    h = device_lock_holder(host)
-    if h and str(h.get("pid")) == pid:
-        return True
-    raise JtagLoadError("lock", f"C64U_LOCK_PID={pid} does not hold the DeviceLock for {host} (holder {h})")
+    """True when C64U_LOCK_PID is set for this host and that process holds its DeviceLock (locked.py).
+
+    The check is _u64_host.lock_shell_holds, shared with require_device_lock; a stale claim stays a
+    JtagLoadError("lock") here."""
+    try:
+        return lock_shell_holds(host, normalize=normalize_device_host)
+    except LockShellClaimError as e:
+        raise JtagLoadError("lock", str(e)) from None
 
 
 TDI_PATTERN = [1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1]
