@@ -158,13 +158,16 @@ def outlet_cycle(host: str, *, off_s: float = MIN_OFF_S, graceful: bool | None =
     sleep, clock = sleep or time.sleep, clock or time.monotonic
     if off_s < MIN_OFF_S:
         raise OutletError(f"off time {off_s} s is under the {MIN_OFF_S:.0f} s minimum")
+    if c64u_poweroff and graceful is False:
+        raise OutletError("graceful=False (--no-graceful) and c64u_poweroff=True (--c64u-poweroff) contradict "
+                          "each other; give one")
     uid = _uid(host)
     if uid in C64U_IDS:
         if graceful and not c64u_poweroff:
             raise OutletError(f"{uid} is a C64U: poweroff() is unreachable there (hardware-safety rule 7), so a "
                               "graceful cycle is refused; the outlet alone is cut by default. Pass "
                               "c64u_poweroff=True (--c64u-poweroff) only when its power-on mode is ON.")
-        graceful = c64u_poweroff and graceful is not False
+        graceful = c64u_poweroff                  # graceful=False with the flag was refused above
     elif c64u_poweroff:
         raise OutletError(f"{uid} is not a C64U; --c64u-poweroff does not apply")
     else:
@@ -229,8 +232,9 @@ def main(argv=None) -> int:
     c.add_argument("host")
     c.add_argument("--off-s", type=float, default=MIN_OFF_S)
     c.add_argument("--expect-hash", default=None)
-    c.add_argument("--no-graceful", action="store_true")
-    c.add_argument("--c64u-poweroff", action="store_true",
+    poweroff = c.add_mutually_exclusive_group()
+    poweroff.add_argument("--no-graceful", action="store_true")
+    poweroff.add_argument("--c64u-poweroff", action="store_true",
                    help="C64U only: send poweroff before cutting the outlet. Its ESP32 then stores last-state OFF, "
                         "so the C64U powers up again only if its power-on mode is ON; check that first.")
     c.add_argument("--dry-run", action="store_true")

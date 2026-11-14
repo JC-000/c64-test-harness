@@ -375,14 +375,21 @@ def test_anything_else_is_refused(data):
 @pytest.mark.parametrize("shell_host", [None, "u64e"])
 def test_ram_run_takes_its_own_lock_even_under_a_lock_shell(env, menu, monkeypatch, shell_host):
     """The storage helpers and the menu check this process's own lock (lock_held_for), so a lock shell's hold does
-    not carry them: ram_run refuses under one, before taking anything, instead of failing half-way."""
+    not carry them: ram_run refuses under one, before taking anything, instead of failing half-way (or queueing for
+    up to lock_timeout behind its own parent). The shell here is genuine: this process's parent, holding the lock."""
+    import _u64_host
     import c64_test_harness.backends.device_lock as dl
     ev = env[0]
     monkeypatch.setenv("C64U_LOCK_PID", "4242")
     if shell_host:
         monkeypatch.setenv("C64U_LOCK_HOST", shell_host)
+    else:
+        monkeypatch.delenv("C64U_LOCK_HOST", raising=False)
     monkeypatch.setattr(dl, "device_lock_holder", lambda h: {"pid": 4242})
-    with pytest.raises(jl.JtagLoadError) as e:
+    me = os.getpid()
+    monkeypatch.setattr(_u64_host, "_parent_pid", lambda pid: {me: 4242, 4242: 1}.get(pid))
+    assert _u64_host.lock_shell_holds("u64e", normalize=jl.normalize_device_host)   # jl._Locked would accept it
+    with pytest.raises(jl.JtagLoadError, match="ram_run takes its own DeviceLock") as e:
         run(env, [info("218e36a52"), info("17995fd9c")], menu())
     assert e.value.stage == "lock" and ev == []
 

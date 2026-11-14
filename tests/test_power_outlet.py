@@ -270,3 +270,17 @@ def test_the_read_path_refuses_anything_but_a_status_url(wire, url):
 def test_the_read_path_reads_a_status_url(wire, url):
     po._read_plug(url, 1.0)
     assert wire == [url]
+
+
+def test_no_graceful_and_the_c64u_poweroff_flag_contradict_and_are_refused(env, monkeypatch):
+    """--no-graceful says "never power off", --c64u-poweroff says "power off": neither wins, the run is refused."""
+    ev = env
+    plug = Plug(ev)
+    with pytest.raises(po.OutletError):
+        cycle(ev, plug, Client(ev, plug, info("f1a5bed00"), info("f1a5bed00")), graceful=False, c64u_poweroff=True)
+    assert ev == []
+    called = []
+    monkeypatch.setattr(po, "outlet_cycle", lambda host, **kw: called.append(kw) or {"result": "ok"})
+    with pytest.raises(SystemExit) as e:
+        po.main(["cycle", "c64u", "--no-graceful", "--c64u-poweroff"])
+    assert e.value.code == 2 and called == []
