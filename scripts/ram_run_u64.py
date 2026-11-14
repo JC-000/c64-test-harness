@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import struct
 import sys
 import time
@@ -79,6 +80,17 @@ def check_ramrun_image(data: bytes) -> None:
     if source != recs[0][0] or length != recs[0][1] or not entry:
         raise jl.JtagLoadError("image", f"not a RAM-run file: the stub's parameters (source {source:#x}, length "
                                f"{length}, entry {entry:#x}) do not describe the staged record {shape[0]}")
+
+
+def _refuse_lock_shell(host: str) -> None:
+    """ram_run always takes its own DeviceLock: the FTP storage helpers and the Remote Menu driver check that this
+    process holds it (lock_held_for), so a lock shell's hold would let the client through and then stop the run
+    half-way, after the upload. Refused before anything is taken."""
+    pid = os.environ.get("C64U_LOCK_PID")
+    shell_host = os.environ.get("C64U_LOCK_HOST")
+    if pid and (not shell_host or jl.normalize_device_host(shell_host) == jl.normalize_device_host(host)):
+        raise jl.JtagLoadError("lock", f"C64U_LOCK_PID={pid} is set for {host}, but ram_run takes its own DeviceLock "
+                               "(its FTP and telnet steps need it held by this process); run it outside the lock shell")
 
 
 def _menu(host: str):
@@ -144,6 +156,7 @@ def ram_run(host: str, image, *, sha256: str, expect_git_hash: str, volume: str 
     if dry_run:
         rec["result"] = "dry-run ok"
         return rec
+    _refuse_lock_shell(host)
     with jl._Locked(host, {}, lock_timeout, lock_factory):
         pre = client_factory(host).get_info()
         jl.check_identity(pre, uid, PRODUCTS)

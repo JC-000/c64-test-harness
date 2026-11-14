@@ -370,3 +370,25 @@ def test_anything_else_is_refused(data):
     with pytest.raises(jl.JtagLoadError) as e:
         rr.check_ramrun_image(data)
     assert e.value.stage == "image"
+
+
+@pytest.mark.parametrize("shell_host", [None, "u64e"])
+def test_ram_run_takes_its_own_lock_even_under_a_lock_shell(env, menu, monkeypatch, shell_host):
+    """The storage helpers and the menu check this process's own lock (lock_held_for), so a lock shell's hold does
+    not carry them: ram_run refuses under one, before taking anything, instead of failing half-way."""
+    import c64_test_harness.backends.device_lock as dl
+    ev = env[0]
+    monkeypatch.setenv("C64U_LOCK_PID", "4242")
+    if shell_host:
+        monkeypatch.setenv("C64U_LOCK_HOST", shell_host)
+    monkeypatch.setattr(dl, "device_lock_holder", lambda h: {"pid": 4242})
+    with pytest.raises(jl.JtagLoadError) as e:
+        run(env, [info("218e36a52"), info("17995fd9c")], menu())
+    assert e.value.stage == "lock" and ev == []
+
+
+def test_a_lock_shell_for_another_device_does_not_stop_ram_run(env, menu, monkeypatch):
+    monkeypatch.setenv("C64U_LOCK_PID", "4242")
+    monkeypatch.setenv("C64U_LOCK_HOST", "192.0.2.99")
+    rec = run(env, [info("218e36a52"), info("17995fd9c")], menu())
+    assert rec["result"] == "ok" and env[0][0] == ("acquire",)
