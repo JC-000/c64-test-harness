@@ -619,8 +619,10 @@ check_system() {
         # NOPASSWD rule for the exact x64sc path.  The patched build from
         # scripts/build-vice-eth.sh accepts a read-write /dev/bpf* node
         # instead, and the harness prefers it when it can run as you (built
-        # and patched, and some node is rw), so then that rule is not needed.  --check is read-only (brew cat/list/--prefix and two
-        # `x64sc -features`).
+        # and patched, and some node is rw), so then that rule is not needed.
+        # --check is read-only (brew info/list/--prefix, one HTTPS fetch of
+        # Homebrew's vice formula, and two `x64sc -features`).  Its exit 3
+        # means built and patched, but not compared with Homebrew's formula.
         local build_vice_eth="${C64H_BUILD_VICE_ETH:-$repo_root/scripts/build-vice-eth.sh}"
         local eth_state="" eth_rc=0
         if [ -x "$build_vice_eth" ]; then
@@ -638,7 +640,7 @@ check_system() {
             *) record "$sec" "patched VICE (ethernet without root)" unknown "$eth_state" 0 ;;
         esac
         local x64sc_path="${C64H_X64SC_PATH:-/opt/homebrew/bin/x64sc}"
-        if { [ "$eth_rc" = "0" ] || [ "$eth_rc" = "1" ]; } && [ "${BPF_ANY_RW:-0}" = "1" ]; then
+        if { [ "$eth_rc" = "0" ] || [ "$eth_rc" = "1" ] || [ "$eth_rc" = "3" ]; } && [ "${BPF_ANY_RW:-0}" = "1" ]; then
             record "$sec" "NOPASSWD sudo for x64sc" ok "not needed: the patched vice-eth runs ethernet as you" 0
         elif [ -x "$x64sc_path" ]; then
             if nopasswd_for "$x64sc_path"; then

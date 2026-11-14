@@ -213,6 +213,7 @@ from .backends.ultimate64_remote_menu import (
     RemoteMenuUnexpectedScreenError,
     RemoteMenuVerifyError,
     RunUpdateResult,
+    TaskRunResult,
     Ultimate64RemoteMenu,
     Ultimate64RemoteMenuError,
     UpdateImageRejectedError,
@@ -725,12 +726,13 @@ __all__ = [
     "WifiIdentError",
     "WifiIdentUnreadableError",
     "WifiLinkTimeoutError",
-    # Telnet Remote Menu driver: WiFi row, Run Update (issue #543)
+    # Telnet Remote Menu driver: WiFi row, Run Update, task menu (#543, #566)
     "Ultimate64RemoteMenu",
     "RemoteMenuTiming",
     "WifiStatus",
     "WifiChangeResult",
     "RunUpdateResult",
+    "TaskRunResult",
     "Ultimate64RemoteMenuError",
     "RemoteMenuLockError",
     "RemoteMenuConnectError",
