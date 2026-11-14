@@ -125,19 +125,20 @@ Disabled, so the function always leaves WiFi as it found it:
 
 - A row already `disabled` is read and left alone (`toggled=False`).
 - A `link-up` or `link-down` row is Disabled, read, Enabled again, and then
-  polled until it reads Link Up (`toggled=True`). The Enable is also sent
-  when the Disable or the read fails, unless the failure says the Disable's
-  ENTER was never sent.
+  polled until it is back where it was (`toggled=True`): a row found
+  `link-up` must read Link Up again; a row found `link-down` counts as
+  restored at Link Down or Link Up, so a module with no access point to
+  join is not a failure. The Enable is also sent when the Disable or the
+  read fails, unless the failure says the Disable's ENTER was never sent.
 - Any other state (`scanning`, `busy`, `firmware?`, `no-module`, `unknown`)
   raises `WifiIdentUnreadableError` with nothing sent.
-- No Link Up within `link_timeout_s` raises `WifiLinkTimeoutError`; its
-  `reading` holds the IDENT and the last row. A module with no access
-  point to join therefore always ends this way, with WiFi enabled again.
+- Not back within `link_timeout_s`: `WifiLinkTimeoutError`; its `reading`
+  holds the IDENT and the last row. WiFi has been enabled again.
 
 It needs the `DeviceLock` (`RemoteMenuLockError` otherwise, before any
 connection). It costs zero `/Temp`. **On the U64E each Disable and Enable writes
 the WiFi config store to flash**, as above. `flash_firmware`'s `wifi_ident`
-step runs the same code.
+step runs the same code, but always waits for Link Up.
 
 ### Run Update
 

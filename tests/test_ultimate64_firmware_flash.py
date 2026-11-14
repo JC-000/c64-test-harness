@@ -1204,3 +1204,18 @@ def test_operator_instruction_needs_the_reformat_answer():
     yes = ff.operator_instruction("c64u", "dev", reformat_flash_disk=True)
     assert _reformat_line(no).rstrip().endswith("NO")
     assert _reformat_line(yes).rstrip().endswith("YES")
+
+
+def test_read_wifi_ident_found_at_link_down_is_restored_at_link_down(rig, held):
+    # A module with no access point to join: it starts and stays Link Down.
+    got = _read_ident(rig.events, wifi_seq=[wifi("link-down")])
+    assert got.ident == IDENT and got.toggled is True
+    assert got.before.state == "link-down" and got.after.state == "link-down"
+    assert _toggles(rig.events) == [("set_wifi_enabled", False), ("set_wifi_enabled", True)]
+
+
+def test_the_flash_wifi_step_still_needs_link_up_from_link_down(rig, held, tmp_path):
+    image = make_image(tmp_path, ident=IDENT)
+    with pytest.raises(FirmwareFlashTimeoutError, match="Link Up") as ei:
+        rig.run(image, wifi_link_timeout_s=20, menu_kw={"wifi_seq": [wifi("link-down")]})
+    assert ei.value.record.failed_step == "wifi_ident"

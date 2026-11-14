@@ -775,8 +775,9 @@ class WifiIdentUnreadableError(WifiIdentError):
 
 
 class WifiLinkTimeoutError(WifiIdentError):
-    """WiFi was enabled again after the IDENT read but did not reach Link Up
-    within the limit. ``reading`` has the IDENT and the last row."""
+    """WiFi was enabled again after the IDENT read but did not get back to
+    the state it was found in (Link Up; Link Down or Link Up for a row found
+    Link Down) within the limit. ``reading`` has the IDENT and the last row."""
 
 
 class _WifiProgress:
@@ -789,8 +790,14 @@ class _WifiProgress:
 
 
 def _wifi_ident_cycle(menu: Ultimate64RemoteMenu, link_timeout: float, poll: float,
-                      warn: Callable[[str], None], seen: _WifiProgress) -> WifiIdentReading:
-    """The one implementation of the IDENT read; see :func:`read_wifi_ident`."""
+                      warn: Callable[[str], None], seen: _WifiProgress, *,
+                      require_link_up: bool) -> WifiIdentReading:
+    """The one implementation of the IDENT read; see :func:`read_wifi_ident`.
+
+    After the Enable it waits for Link Up when *require_link_up* is true or
+    the row was found Link Up; a row found Link Down counts as restored at
+    Link Down or Link Up.
+    """
     st = _settled_wifi(menu, link_timeout, poll)
     seen.before = st
     if st.state == "disabled":
@@ -825,15 +832,19 @@ def _wifi_ident_cycle(menu: Ultimate64RemoteMenu, link_timeout: float, poll: flo
                      "Enable failed: it may be left Disabled")
                 if failure is None:
                     raise
+    restored = (("link-up",) if require_link_up or st.state == "link-up"
+                else ("link-up", "link-down"))
     deadline = _monotonic() + link_timeout
     while True:
         now_st = menu.wifi_status()
         seen.after = now_st
-        if now_st.state == "link-up":
+        if now_st.state in restored:
             return WifiIdentReading(ident, st, now_st, True)
         if _monotonic() >= deadline:
             raise WifiLinkTimeoutError(
-                f"WiFi enabled again but not Link Up within {link_timeout:.0f} s "
+                f"WiFi enabled again but not "
+                f"{'Link Up' if len(restored) == 1 else 'Link Up or Link Down'} "
+                f"within {link_timeout:.0f} s "
                 f"(row {now_st.row!r}); module IDENT read {ident!r}",
                 reading=WifiIdentReading(ident, st, now_st, True), enter_sent=True)
         _sleep(poll)
@@ -851,12 +862,14 @@ def read_wifi_ident(
     The firmware shows the IDENT only while WiFi is Disabled. So, once the
     row has settled (up to *link_timeout_s*): a row already ``disabled`` is
     read and left as it is; a ``link-up`` or ``link-down`` row is Disabled,
-    read, Enabled again, and then polled every *poll_interval_s* until it
-    reads Link Up (up to *link_timeout_s*; it reads Link Down first, #562).
-    The Enable is sent even when the Disable or the read fails, unless the
-    failure says the Disable's ENTER was never sent (``enter_sent=False``).
-    A row that never links (no access point configured) therefore ends in
-    :class:`WifiLinkTimeoutError`, with WiFi enabled again.
+    read, Enabled again, and then polled every *poll_interval_s* (up to
+    *link_timeout_s*) until it is back where it was: a row found Link Up
+    must read Link Up again (it reads Link Down first, #562); a row found
+    Link Down counts as restored at Link Down or Link Up, so a module with
+    no access point to join is not a failure. The Enable is sent even when
+    the Disable or the read fails, unless the failure says the Disable's
+    ENTER was never sent (``enter_sent=False``). (``flash_firmware``'s
+    ``wifi_ident`` step requires Link Up whatever the row was.)
 
     Works on the U64E and the C64U alike, outside a flash. **On the U64E
     the Disable and the Enable each write the WiFi config store to flash**
@@ -868,7 +881,8 @@ def read_wifi_ident(
 
     :param menu_factory: builds the Remote Menu driver; for tests.
     :raises WifiIdentUnreadableError: the row is in a state with no IDENT.
-    :raises WifiLinkTimeoutError: enabled again, but no Link Up in time.
+    :raises WifiLinkTimeoutError: enabled again, but not back in its found
+        state in time.
     :raises Ultimate64RemoteMenuError: from the menu driver, as it raised.
     """
     if not lock_held_for(host):
@@ -881,7 +895,8 @@ def read_wifi_ident(
     def warn(message: str) -> None:
         _log.warning("read_wifi_ident %s: %s", host, message)
 
-    return _wifi_ident_cycle(menu, link_timeout_s, poll_interval_s, warn, _WifiProgress())
+    return _wifi_ident_cycle(menu, link_timeout_s, poll_interval_s, warn, _WifiProgress(),
+                             require_link_up=False)
 
 
 def _check_wifi_ident(menu: Ultimate64RemoteMenu, expected: str, run: _Run,
@@ -891,7 +906,9 @@ def _check_wifi_ident(menu: Ultimate64RemoteMenu, expected: str, run: _Run,
     rec = run.record
     seen = _WifiProgress()
     try:
-        reading = _wifi_ident_cycle(menu, link_timeout, poll, run.warn, seen)
+        # The flash keeps its Link Up requirement (#562) whatever the row was.
+        reading = _wifi_ident_cycle(menu, link_timeout, poll, run.warn, seen,
+                                    require_link_up=True)
     except WifiIdentUnreadableError as exc:
         raise run.fail(FirmwareFlashVerifyError, str(exc)) from exc
     except WifiLinkTimeoutError as exc:
