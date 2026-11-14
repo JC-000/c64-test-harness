@@ -58,7 +58,9 @@ dependencies, so the protocol is written here. 1541ultimate's
   settings", which a fresh session may open on): that is answered with one
   ``o``, logged at WARNING and recorded in :attr:`dismissed_messages`.
   ``RETURN`` is never used on a popup: it picks the active button, which on
-  a Yes/No popup is Yes.
+  a Yes/No popup is Yes. A popup that a task action draws after its ENTER
+  ends :meth:`Ultimate64RemoteMenu.run_task` without an error: its text
+  and buttons go into the result and it is left unanswered.
 * **Every new session can take queued device messages**, read-only
   calls, verification polls and probes included: ``UserInterface::postMessage``
   queues device-wide, and the browser of whichever session polls next pops
@@ -506,6 +508,9 @@ class MenuBox:
 
 @dataclass(frozen=True)
 class Popup:
+    """A ``UIPopup``: its message (lines joined with ``\\n``, as the firmware
+    passes it) and its buttons, left to right."""
+
     message: str
     buttons: tuple[str, ...]
 
@@ -595,10 +600,12 @@ def read_view(scr: TelnetScreen, sel_attr: tuple[str, bool] | None = None) -> Vi
     menu_box = None
     for b in boxes:
         inner = [rows[r][b.left + 1:b.right] for r in range(b.top + 1, b.bottom)]
-        if b.bottom - b.top == 4:
-            words = tuple(inner[2].split())
+        # UIPopup::init: one row per message line, a blank row, the buttons
+        # (window_height = message_lines + 4, button_y = message_lines + 1).
+        if len(inner) >= 3 and not inner[-2].strip():
+            words = tuple(inner[-1].split())
             if words and all(w in _BUTTONS for w in words):
-                popup = Popup(inner[0].strip(), words)
+                popup = Popup("\n".join(t.strip() for t in inner[:-2]), words)
                 continue
         labels = tuple(t.strip() for t in inner)
         attrs = [_first_cell_attr(scr, r, b.left + 1, b.right) for r in range(b.top + 1, b.bottom)]
@@ -756,6 +763,12 @@ class TaskRunResult:
     effect (Turn On / Turn Off), ``None`` when the action has no effect a
     telnet session can see (Flush/Eject, Reset) or on a dry run.
     ``after_items`` is the submenu that fresh connection read.
+
+    ``popup`` is the text of a popup the committing session drew after the
+    ENTER (its lines joined with ``\\n``), and ``popup_buttons`` its buttons;
+    ``None`` and ``()`` when there was none. A popup makes ``closed``
+    ``False``. It is left open, unanswered: the call closes the session,
+    which ends the firmware's popup loop without a key.
     """
 
     category: str
@@ -769,6 +782,8 @@ class TaskRunResult:
     after_items: tuple[str, ...] | None
     screen: tuple[str, ...]
     messages: tuple[str, ...] = ()
+    popup: str | None = None
+    popup_buttons: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -1469,13 +1484,27 @@ class Ultimate64RemoteMenu:
         stops with :class:`RemoteMenuNavigationError`. Neither sends the ENTER.
 
         After the ENTER the committing session is read for up to
-        *settle_timeout* (``closed`` in the result); a popup there stops the
-        call with ``enter_sent=True`` and is left open. Turn On and Turn Off
+        *settle_timeout* (``closed`` in the result). A popup there ends the
+        wait: its text and buttons are returned in ``popup`` and
+        ``popup_buttons``, ``closed`` is ``False``, and no key is sent to it.
+        Closing the session ends the firmware's popup loop
+        (``UserInterface::popup`` runs while ``host->exists()``, which turns
+        false once the telnet client is gone, ``SocketStream::is_alive``,
+        700c7f2fa). The caller decides what the popup means. Turn On and Turn Off
         are then verified on fresh connections within *verify_timeout*
         (:class:`RemoteMenuVerifyError` if not); Flush/Eject and Reset have no
         effect telnet can show, so ``verified`` is ``None`` for them and the
         caller checks the outcome itself (the printer's output file, say).
         The ENTER is never resent.
+
+        **Flush/Eject waits for the printer for up to 20 s**
+        (``IEC_PRINTER_FLUSH_WAIT_MS``, behind a progress box). If the page is
+        still rendering then, the firmware hides the box and shows an ``Ok``
+        popup, "The page is still printing.\\nIt is saved when it is done."
+        (``IecPrinter::executeCommand``, ``iec_printer.cc:345`` at
+        700c7f2fa; the page is saved all the same). To see that popup in the
+        result, pass a *settle_timeout* above 20 s; with the default the call
+        returns ``closed=False`` while the progress box is still up.
 
         **Turn On / Turn Off change the device's config.** They set "IEC
         printer" (``CFG_PRINTER_ENABLE``) with ``set_value``, which marks the
@@ -1498,7 +1527,7 @@ class Ultimate64RemoteMenu:
                 return TaskRunResult(category, item, True, cats, items, False, None, None, None,
                                      self._view(sess).rows, tuple(self._seen_messages[start:]))
             once.enter(sess, what, self.host)
-            closed, screen = self._await_task_settled(sess, what, settle_timeout)
+            closed, screen, popup = self._await_task_settled(sess, what, settle_timeout)
         except Ultimate64RemoteMenuError as exc:
             exc.enter_sent = once.sent
             raise
@@ -1508,10 +1537,12 @@ class Ultimate64RemoteMenu:
         after = self._poll_task_effect(category, what, effect, verify_timeout) if effect else None
         return TaskRunResult(category, item, False, cats, items, True, closed,
                              True if effect else None, after, screen,
-                             tuple(self._seen_messages[start:]))
+                             tuple(self._seen_messages[start:]),
+                             popup.message if popup else None,
+                             popup.buttons if popup else ())
 
-    def _await_task_settled(self, sess: _Session, what: str,
-                            timeout: float) -> tuple[bool | None, tuple[str, ...]]:
+    def _await_task_settled(self, sess: _Session, what: str, timeout: float
+                            ) -> tuple[bool | None, tuple[str, ...], Popup | None]:
         deadline = time.monotonic() + timeout
         drew = False
         while True:
@@ -1522,18 +1553,18 @@ class Ultimate64RemoteMenu:
             try:
                 drew = sess.drain(expect=True, max_drain=remaining) > 0 or drew
             except RemoteMenuUnexpectedScreenError:
-                return False, self._view(sess).rows
+                return False, self._view(sess).rows, None
             view = self._view(sess)
             if view.popup is not None:
                 self._seen_messages.append(view.popup.message)
-                raise RemoteMenuUnexpectedScreenError(
-                    f"{what}: ENTER sent once; the session then showed the popup "
-                    f"{view.popup.message!r}. It was left open.", enter_sent=True,
-                    screen=view.rows)
+                _log.warning("Remote Menu on %s: %s: ENTER sent once; the session then "
+                             "showed the popup %r %s. Left open, unanswered.", self.host,
+                             what, view.popup.message, list(view.popup.buttons))
+                return False, view.rows, view.popup
             if drew and view.menu is None:
-                return True, view.rows
+                return True, view.rows, None
             if sess.eof or time.monotonic() >= deadline:
-                return (False if drew else None), view.rows
+                return (False if drew else None), view.rows, None
 
     def _poll_task_effect(self, category: str, what: str, want: str,
                           timeout: float) -> tuple[str, ...]:

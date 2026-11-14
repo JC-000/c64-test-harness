@@ -152,6 +152,27 @@ def test_u64e_listing_selection_is_read_from_colour():
     assert view.selected.kind == "U64"
 
 
+def test_a_menu_whose_last_label_is_a_button_word_is_still_a_menu():
+    """A popup has a blank row above its buttons (UIPopup::init); a menu
+    box does not, whatever its last label says."""
+    import remote_menu_fake as rmf
+    cells = rmf._blank_screen()
+    rmf._put(cells, 23, 0, "/", rmf.SGR_PATH)
+    rmf._put(cells, 2, 0, "Temp    RAM Disk", rmf.SGR_SEL)
+    rmf._put(cells, 8, 20, "lqqqqqqk", glyph=True)
+    for r, label in ((9, "Flush "), (10, "Reset "), (11, "Cancel")):
+        rmf._put(cells, r, 20, "x", glyph=True)
+        rmf._put(cells, r, 21, label)
+        rmf._put(cells, r, 27, "x", glyph=True)
+    rmf._put(cells, 12, 20, "mqqqqqqj", glyph=True)
+    scr = TelnetScreen()
+    for r in range(24):
+        scr.feed(rmf.render_row(r, cells[r]))
+    view = read_view(scr)
+    assert view.popup is None
+    assert view.menu is not None and view.menu.labels == ("Flush", "Reset", "Cancel")
+
+
 @pytest.mark.parametrize("row,state,ident,ip,mac", [
     ("WiFi    ESP32 WiFi Bridge V0.903 bench             Disabled", "disabled",
      "ESP32 WiFi Bridge V0.903 bench", None, None),
@@ -864,21 +885,67 @@ def test_flush_waits_out_its_progress_box(make, held):
     assert "Flushing" not in "".join(res.screen)
 
 
-def test_a_popup_after_the_task_enter_stops_with_enter_sent(make, held, monkeypatch):
+#: The popup rows the U64E drew after Flush/Eject's 20 s wait ran out (3.15a,
+#: 1541ultimate lane, ``lanes/async-impl/printer-uaf/hw-uaf-probe.log`` run 1,
+#: 2026-11-13; the log drops blank rows, so these are screen rows 9-14).
+_STILL_PRINTING_ROWS = (
+    "             +--+----------------------------++             ",
+    "             |  |The page is still printing. ||             ",
+    "             |  |It is saved when it is done.||             ",
+    "             |  |                            ||             ",
+    "             +--|             Ok             |+             ",
+    "                +----------------------------+              ",
+)
+
+
+def test_flush_that_outlasts_its_wait_returns_the_popup_unanswered(make, held):
+    """The firmware's "still printing" popup is two lines high; the call
+    returns it in the result at once and sends no key after the ENTER."""
+    import remote_menu_fake as rmf
+    fake, menu = make(task_progress_s=0.3, flush_outlasts_wait=True)
+    t0 = time.monotonic()
+    res = menu.run_task("Printer", "Flush/Eject", settle_timeout=5.0)
+    assert time.monotonic() - t0 < 3.0          # not the settle deadline
+    assert res.screen[9:15] == _STILL_PRINTING_ROWS
+    assert res.popup == rmf.STILL_PRINTING
+    assert res.popup_buttons == ("Ok",)
+    assert res.closed is False and res.enter_sent is True and res.verified is None
+    assert fake.all_commits() == [("Printer/Flush/Eject", "tasks")]
+    assert fake.sessions[0].keys == ["F5", "RIGHT", "ENTER"]
+    assert len(fake.sessions) == 1
+
+
+def test_any_popup_after_the_task_enter_is_returned_with_its_buttons(make, held, monkeypatch):
     import remote_menu_fake as rmf
     fake, menu = make()
     real = rmf._Session.run_task_action
 
     def with_popup(self, cat, label):
         real(self, cat, label)
-        self.popup = ("Printer error", ["Ok"])
+        self.popup = ("Printer error\nCheck the paper", ["Yes", "No"])
         self.redraw()
     monkeypatch.setattr(rmf._Session, "run_task_action", with_popup)
-    with pytest.raises(RemoteMenuUnexpectedScreenError) as ei:
-        menu.run_task("Printer", "Reset")
-    assert ei.value.enter_sent is True
+    res = menu.run_task("Printer", "Reset")
+    assert res.popup == "Printer error\nCheck the paper"
+    assert res.popup_buttons == ("Yes", "No")
+    assert res.closed is False and res.enter_sent is True
     assert fake.all_commits() == [("Printer/Reset", "tasks")]
     assert fake.sessions[0].keys.count("ENTER") == 1
+    assert fake.sessions[0].keys[-1] == "ENTER"
+
+
+def test_a_task_that_closes_cleanly_reports_no_popup(make, held):
+    fake, menu = make(task_progress_s=0.3)
+    res = menu.run_task("Printer", "Flush/Eject", settle_timeout=5.0)
+    assert res.closed is True
+    assert res.popup is None and res.popup_buttons == ()
+
+
+def test_a_two_line_message_on_a_fresh_session_stops_the_call(make, held):
+    fake, menu = make(messages=[("Something\nunexpected", ["Ok"])])
+    with pytest.raises(RemoteMenuUnexpectedScreenError, match="modal popup"):
+        menu.wifi_status()
+    assert fake.sessions[0].keys == []
 
 
 def test_no_other_call_sends_an_f_key(make, held):

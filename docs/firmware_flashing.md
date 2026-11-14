@@ -81,7 +81,16 @@ Each call opens its own connections and closes them before it returns.
   fresh session can open on. The driver answers it with one `o`, logs it at
   WARNING and records it in `dismissed_messages`. ENTER is never used on a
   popup, because it picks the active button, which on a Yes/No popup is
-  Yes.
+  Yes. A popup that a task action draws after its ENTER does not raise:
+  `run_task` returns it in `TaskRunResult.popup` (lines joined with `\n`)
+  and `popup_buttons`, with `closed=False`, and leaves it unanswered.
+  Closing the session ends the firmware's popup loop
+  (`UserInterface::popup` runs while `host->exists()`, 700c7f2fa). An
+  example is Flush/Eject when the page is still rendering after the
+  printer's 20 s wait: "The page is still printing.\nIt is saved when it
+  is done.", with `Ok` (`iec_printer.cc:345`, 700c7f2fa; seen on the U64E,
+  3.15a, 2026-11-13). The page is saved all the same. To get that popup
+  rather than the progress box, pass `settle_timeout` above 20 s.
 - **A new session can take queued device messages**, even a read-only
   call: the firmware queues messages device-wide (up to four), and the next
   session to poll shows one per poll. When each is dismissable the session

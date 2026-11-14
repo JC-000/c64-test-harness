@@ -44,6 +44,13 @@ What it models, and where each behaviour comes from:
   once. Disabled items are drawn in their own colour and skipped by the
   cursor. Printer's items follow :attr:`FakeUltimate.printer_on` the way
   ``IecPrinter::update_task_items`` does.
+* **Flush/Eject that outlasts its wait** (``IecPrinter::executeCommand``,
+  ``iec_printer.cc:334-345`` at 700c7f2fa): the progress box
+  (``UIStatusBox``, 34x5, centred) is hidden and an ``Ok`` popup says
+  "The page is still printing.\nIt is saved when it is done.". On the
+  wire the progress box's border stays under the popup; the rows are the
+  ones the 1541ultimate lane recorded on the U64E (3.15a,
+  ``lanes/async-impl/printer-uaf/hw-uaf-probe.log``, 2026-11-13).
 
 Knobs on :class:`FakeUltimate` reproduce the bench facts in #543: the mirror
 that does not redraw after ENTER, the modal "SID changed" dialog on a fresh
@@ -75,6 +82,9 @@ SGR_STATUS = "0;32;1"
 SGR_INACTIVE = "0;30;1"
 
 UPDATE_EXTENSIONS = ("U64", "UE2", "CFW")
+#: ``IecPrinter::executeCommand``'s popup when Flush/Eject's wait runs out
+#: (``iec_printer.cc:345`` at 700c7f2fa).
+STILL_PRINTING = "The page is still printing.\nIt is saved when it is done."
 FILE_ACTIONS = ["Copy to...", "Move to...", "Rename", "Delete"]
 
 
@@ -178,6 +188,9 @@ class FakeUltimate:
     :param task_categories: other categories as ``{name: [labels]}``, after
         Printer; a one-item category runs its action when opened.
     :param task_progress_s: Flush/Eject draws a progress box for this long.
+    :param flush_outlasts_wait: after that, Flush/Eject's wait has run out
+        with the page still rendering, so the "still printing" popup opens
+        over what is left of the progress box.
     :param task_right_ignored: RIGHT and ENTER on a category open nothing.
     :param task_key_ignored: the task key opens nothing (a build that maps it
         to something else).
@@ -210,6 +223,7 @@ class FakeUltimate:
         printer_on: bool = True,
         task_categories: dict[str, list[str]] | None = None,
         task_progress_s: float = 0.0,
+        flush_outlasts_wait: bool = False,
         task_right_ignored: bool = False,
         task_key_ignored: bool = False,
         refuse_after_commit: bool = False,
@@ -260,6 +274,7 @@ class FakeUltimate:
             "Power": ["Reboot"],
         })
         self.task_progress_s = task_progress_s
+        self.flush_outlasts_wait = flush_outlasts_wait
         self.task_right_ignored = task_right_ignored
         self.task_key_ignored = task_key_ignored
         self.refuse_after_commit = refuse_after_commit
@@ -402,6 +417,8 @@ class _Session:
         self.sub_name = ""
         self.sub_index = 0
         self.progress: str | None = None
+        #: the progress box's border, left on the wire under a popup
+        self.progress_ghost = False
         self.sent = _blank_screen()
         self.silent = False   # the application has stopped: never send again
         self.inner_width = WIDTH - 2 if dev.framed else WIDTH
@@ -628,6 +645,9 @@ class _Session:
                 self.redraw()
                 time.sleep(dev.task_progress_s)
                 self.progress = None
+                if dev.flush_outlasts_wait:
+                    self.progress_ghost = True
+                    self.popup = (STILL_PRINTING, ["Ok"])
         if dev.redraw_after_commit:
             self.redraw()
 
@@ -729,8 +749,10 @@ class _Session:
             self.compose_menu(scr)
         if self.tasks is not None:
             self.compose_tasks(scr)
-        if self.progress is not None:
-            self.compose_box(scr, 8, 15, 30, 5, [self.progress, "", "####"])
+        if self.progress is not None:   # UIStatusBox::init: 34x5, centred
+            self.compose_box(scr, 9, 13, 34, 5, [self.progress.center(32), "", "####"])
+        if self.progress_ghost:
+            self.compose_box(scr, 9, 13, 34, 5, [])
         if self.popup is not None:
             self.compose_popup(scr)
         return scr
@@ -789,22 +811,31 @@ class _Session:
             _put(scr, hook_row, sleft, hook, SGR_FG, glyph=True)
 
     def compose_popup(self, scr) -> None:
+        """UIPopup::init: one row per message line (split at ``\n``), a blank
+        row, the buttons; ``lines + 4`` rows, centred. A one-line message is
+        centred in the window, as in the #543 transcripts; the lines of a
+        longer one start at its left edge, as in the "still printing"
+        recording."""
         msg, buttons = self.popup
+        lines = msg.split("\n")
         names = [f" {b} " for b in buttons]
         bw = sum(len(n) for n in names)
-        ww = max(len(msg), bw)
+        ww = max(max(len(t) for t in lines), bw)
+        rows = len(lines) + 4
         x1 = (WIDTH - ww) // 2
-        y1 = (HEIGHT - 5) // 2
+        y1 = (HEIGHT - rows) // 2
         _put(scr, y1, x1, "l" + "q" * ww + "k", SGR_FG, glyph=True)
-        _put(scr, y1 + 4, x1, "m" + "q" * ww + "j", SGR_FG, glyph=True)
-        for r in range(1, 4):
+        _put(scr, y1 + rows - 1, x1, "m" + "q" * ww + "j", SGR_FG, glyph=True)
+        for r in range(1, rows - 1):
             _put(scr, y1 + r, x1, "x", SGR_FG, glyph=True)
             _put(scr, y1 + r, x1 + 1, " " * ww, SGR_FG)
             _put(scr, y1 + r, x1 + ww + 1, "x", SGR_FG, glyph=True)
-        _put(scr, y1 + 1, x1 + 1 + (ww - len(msg)) // 2, msg, SGR_FG)
+        for i, t in enumerate(lines):
+            x = x1 + 1 + ((ww - len(t)) // 2 if len(lines) == 1 else 0)
+            _put(scr, y1 + 1 + i, x, t, SGR_FG)
         x = x1 + 1 + (ww - bw) // 2
         for i, n in enumerate(names):
-            _put(scr, y1 + 3, x, n, SGR_FG, reverse=(i == 0))
+            _put(scr, y1 + rows - 2, x, n, SGR_FG, reverse=(i == 0))
             x += len(n)
 
     def redraw(self, *, full: bool = False, emit: bool = True) -> bytes:
