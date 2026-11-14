@@ -392,3 +392,36 @@ def test_a_lock_shell_for_another_device_does_not_stop_ram_run(env, menu, monkey
     monkeypatch.setenv("C64U_LOCK_HOST", "192.0.2.99")
     rec = run(env, [info("218e36a52"), info("17995fd9c")], menu())
     assert rec["result"] == "ok" and env[0][0] == ("acquire",)
+
+
+# -- golden images: real files, when the environment names them (nothing binary is committed) ---------------
+
+def _golden(var):
+    path = os.environ.get(var)
+    if not path or not os.path.isfile(path):
+        pytest.skip(f"{var} does not name an image file on this machine")
+    return path
+
+
+def test_a_real_ramrun_image_passes_and_runs(env, menu, monkeypatch):
+    """RAMRUN_GOLDEN_IMAGE: a .u64 written by 1541ultimate tools/make_ramrun.py."""
+    import shutil
+    ev, img, _ = env
+    shutil.copyfile(_golden("RAMRUN_GOLDEN_IMAGE"), img)
+    data = img.read_bytes()
+    rr.check_ramrun_image(data)
+    rec = run((ev, img, hashlib.sha256(data).hexdigest()), [info("218e36a52"), info("17995fd9c")], menu())
+    assert rec["result"] == "ok" and ev[1][0] == "put"
+
+
+def test_a_real_plain_update_image_is_refused_before_anything(env):
+    """UPDATE_GOLDEN_IMAGE: a plain update.u64 from a firmware build, the kind that flashed a U64E when passed here."""
+    ev, img, _ = env
+    data = open(_golden("UPDATE_GOLDEN_IMAGE"), "rb").read()
+    with pytest.raises(jl.JtagLoadError) as e:
+        rr.check_ramrun_image(data)
+    assert e.value.stage == "image"
+    img.write_bytes(data)
+    with pytest.raises(jl.JtagLoadError) as e:
+        run((ev, img, hashlib.sha256(data).hexdigest()), [info("218e36a52")])
+    assert e.value.stage == "image" and ev == []
