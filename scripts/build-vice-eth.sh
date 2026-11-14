@@ -23,9 +23,10 @@
 # verified against the API's ruby_source_checksum -- what Homebrew itself does
 # in API mode, where homebrew/core is not tapped and `brew cat vice` fails.
 # `brew cat vice` is the fallback when homebrew/core is tapped.  A locally
-# edited vice.rb in a tapped homebrew/core is never built from: in API mode
-# brew info does not read it, and with HOMEBREW_NO_INSTALL_FROM_API=1 its
-# checksum will not match the pinned download, so the script exits 2.
+# edited vice.rb in a tapped homebrew/core is not read in API mode.  With
+# HOMEBREW_NO_INSTALL_FROM_API=1 an uncommitted edit fails the checksum
+# (exit 2); a committed one GitHub lacks cannot be fetched at tap_git_head,
+# so it falls back to `brew cat vice` and is built from, as brew itself would.
 #
 # Usage:
 #   scripts/build-vice-eth.sh                 build, or do nothing when current
@@ -250,7 +251,7 @@ main() {
             --check) mode="check" ;;
             --force) force=1 ;;
             --print-formula) mode="print" ;;
-            -h|--help) sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+            -h|--help) sed -n '2,/^# Requires/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
             *) die "unknown argument: $1" 2 ;;
         esac
         shift
