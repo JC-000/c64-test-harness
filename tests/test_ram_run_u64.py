@@ -195,7 +195,7 @@ def test_no_run_update_entry_aborts_and_cleans_up(env, menu):
     ev = env[0]
     fake, factory = menu()
     with pytest.raises(jl.JtagLoadError) as e:
-        run(env, [info()], (fake, factory), storage=Storage(ev, fake, kind="PRG"))
+        run(env, [info("218e36a52")], (fake, factory), storage=Storage(ev, fake, kind="PRG"))
     assert e.value.stage == "menu" and "Run Update" in str(e.value)
     assert ("delete", "/USB1/rr17995f.u64") in ev and fake.all_commits() == []
 
@@ -230,22 +230,19 @@ def test_never_runs_another_menu_entry(env, menu):
 
 def test_hash_change_proves_restart_without_seeing_the_drop(env, menu):
     rec = run(env, [info("218e36a52"), info("17995fd9c")], menu())
-    assert rec["result"] == "ok" and rec["rest_drop_seen"] is False
+    assert rec["result"] == "ok" and rec["info"]["git_commit_hash"] == "17995fd9c"
 
 
-def test_same_hash_needs_the_drop(env, menu):
+def test_a_device_already_on_the_expected_hash_is_refused_before_the_upload(env, menu):
+    """A same-hash RAM-run cannot be proven started: on the U64E the REST outage is shorter than any drop detector
+    (live, 2026-11-13: not seen in two hash-changing runs, three same-hash runs all unproven). Refused right after the
+    identity check: nothing uploaded, no menu session."""
     ev = env[0]
-    t = [0.0]
-    with pytest.raises(jl.JtagLoadError) as e:
-        run(env, [info("17995fd9c")], menu(), down_timeout=5, clock=lambda: t.__setitem__(0, t[0] + 1) or t[0])
+    fake, factory = menu()
+    with pytest.raises(jl.JtagLoadError, match="already running") as e:
+        run(env, [info("17995fd9c")], (fake, factory))
     assert e.value.stage == "run"
-    ev.clear()
-    t[0] = 0.0
-    with pytest.raises(jl.JtagLoadError):      # one missed poll is not a restart
-        run(env, [info("17995fd9c"), info("17995fd9c"), None, info("17995fd9c")], menu(), down_timeout=20,
-            clock=lambda: t.__setitem__(0, t[0] + 1) or t[0])
-    rec = run(env, [info("17995fd9c"), info("17995fd9c"), None, None, None, info("17995fd9c")], menu())
-    assert rec["result"] == "ok" and rec["rest_drop_seen"] is True
+    assert [x[0] for x in ev] == ["acquire", "release"] and fake.sessions == [] and fake.connect_attempts == 0
 
 
 def lane_call(env, fake, factory, volume, client_script, **kw):

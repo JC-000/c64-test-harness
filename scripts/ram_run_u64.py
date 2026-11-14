@@ -12,7 +12,9 @@ plain update.u64 flashes the device; on 2026-11-13 a plain image passed here by 
 Steps, all under the device's DeviceLock: identity check (bound unique_id, product "Ultimate 64 Elite"); pinned
 SHA-256 of the image; FTP put to a USB volume through the harness storage helpers (they refuse /Temp); telnet menu
 through the harness's Remote Menu driver (ultimate64_remote_menu.py): browse to the exact path, context menu, "Run
-Update", one ENTER; REST must drop and come back with the expected git hash; the file is deleted again.
+Update", one ENTER; /v1/info must then report the expected git hash; the file is deleted again. The hash change
+is the proof that the RAM image started, so a device that already runs the expected hash is refused before the
+upload: a same-hash run cannot be proven (on the U64E the REST outage is shorter than a drop detector can see).
 
     ram_run_u64.py run HOST IMAGE --sha256 H --expect-hash G [--volume USB1] [--dry-run]
 """
@@ -162,31 +164,16 @@ def ram_run(host: str, image, *, sha256: str, expect_git_hash: str, volume: str 
         pre = client_factory(host).get_info()
         jl.check_identity(pre, uid, PRODUCTS)
         rec["pre_info"] = pre
+        if jl.hash_matches(pre.get("git_commit_hash"), expect_git_hash):
+            raise jl.JtagLoadError("run", f"already running {expect_git_hash}; a same-hash RAM-run cannot be proven "
+                                   "started; load a different image first")
         storage.storage_put_file(host, remote, data, overwrite=True)
         try:
             rec["menu"] = list(run_update_ramrun(menu_factory(host), remote, data, log))
-            # Proof of a restart: the hash changes, or (same hash) REST drops and returns.
-            same = jl.hash_matches(pre.get("git_commit_hash"), jl.check_git_hash(expect_git_hash))
-            end = clock() + down_timeout
-            dropped, misses = False, 0
-            while clock() < end:
-                info = jl.try_info(host, client_factory)
-                if info is None:
-                    misses += 1
-                    if misses >= 3:         # sustained, not one missed poll while the old app reads the file
-                        dropped = True
-                        break
-                    sleep(1.0)
-                    continue
-                misses = 0
-                if not same and jl.hash_matches(info.get("git_commit_hash"), expect_git_hash.lower()):
-                    break
-                sleep(0.25)
-            rec["rest_drop_seen"] = dropped
-            if same and not dropped:
-                raise jl.JtagLoadError("run", f"same hash before and after and no REST drop within "
-                                       f"{down_timeout:.0f} s: no proof that the RAM image started")
-            rec["info"] = jl.wait_info(host, uid, expect_git_hash, up_timeout, client_factory, sleep, clock, PRODUCTS)
+            # Proof of a restart: the hash changes to the expected one (a same hash was refused above). The wait
+            # covers the old app reading the file (down_timeout) and the new one booting (up_timeout).
+            rec["info"] = jl.wait_info(host, uid, expect_git_hash, down_timeout + up_timeout, client_factory, sleep,
+                                       clock, PRODUCTS)
         finally:
             try:
                 storage.storage_delete_file(host, remote, missing_ok=True)
