@@ -228,19 +228,28 @@ def test_never_runs_another_menu_entry(env, menu):
     assert e.value.stage == "menu" and fake.all_commits() == [] and ("delete", "/USB1/rr17995f.u64") in ev
 
 
+def test_the_proof_waits_down_timeout_plus_up_timeout(env, menu):
+    """The old app reads the file (down_timeout) before the new one boots (up_timeout): the expected hash first
+    shows after more than up_timeout's worth of polls and within the sum, and the run passes."""
+    script = [info("218e36a52")] + [info("218e36a52")] * 8 + [info("17995fd9c")]
+    rec = run(env, script, menu(), down_timeout=10, up_timeout=5)
+    assert rec["result"] == "ok" and rec["info"]["git_commit_hash"] == "17995fd9c"
+
+
 def test_hash_change_proves_restart_without_seeing_the_drop(env, menu):
     rec = run(env, [info("218e36a52"), info("17995fd9c")], menu())
     assert rec["result"] == "ok" and rec["info"]["git_commit_hash"] == "17995fd9c"
 
 
-def test_a_device_already_on_the_expected_hash_is_refused_before_the_upload(env, menu):
+@pytest.mark.parametrize("expect", ["17995fd", "17995fd9c", "17995fd9c" + "0123456789abcdef0123456789abcde"])
+def test_a_device_already_on_the_expected_hash_is_refused_before_the_upload(env, menu, expect):
     """A same-hash RAM-run cannot be proven started: on the U64E the REST outage is shorter than any drop detector
     (live, 2026-11-13: not seen in two hash-changing runs, three same-hash runs all unproven). Refused right after the
     identity check: nothing uploaded, no menu session."""
     ev = env[0]
     fake, factory = menu()
     with pytest.raises(jl.JtagLoadError, match="already running") as e:
-        run(env, [info("17995fd9c")], (fake, factory))
+        run(env, [info("17995fd9c")], (fake, factory), expect_git_hash=expect)   # prefix match, as /v1/info reports
     assert e.value.stage == "run"
     assert [x[0] for x in ev] == ["acquire", "release"] and fake.sessions == [] and fake.connect_attempts == 0
 
