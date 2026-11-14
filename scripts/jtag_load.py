@@ -268,7 +268,7 @@ class _Locked:
         self.host, self.timeout = host, lock_timeout
 
     def __enter__(self):
-        if _held_by_lock_shell(self.host):     # locked.py convention: C64U_LOCK_PID holds the DeviceLock
+        if _held_by_lock_shell(self.host):     # a lock shell (C64U_LOCK_PID, an ancestor) holds the DeviceLock
             self.dev = None
         elif not self.dev.acquire(timeout=self.timeout):
             raise JtagLoadError("lock", f"DeviceLock({self.host}) not acquired within {self.timeout:.0f} s")
@@ -287,7 +287,8 @@ class _Locked:
 
 
 def _held_by_lock_shell(host: str) -> bool:
-    """True when C64U_LOCK_PID is set for this host and that process holds its DeviceLock (locked.py).
+    """True when C64U_LOCK_PID is set for this host and that process, an ancestor of this one, holds its
+    DeviceLock (docs/device_locking.md, "Lock shells").
 
     The check is _u64_host.lock_shell_holds, shared with require_device_lock; a stale claim stays a
     JtagLoadError("lock") here."""

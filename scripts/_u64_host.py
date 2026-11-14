@@ -41,6 +41,7 @@ Imported by sibling scripts as::
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -231,14 +232,37 @@ class LockShellClaimError(RuntimeError):
     """``C64U_LOCK_PID`` names a process that does not hold the device's ``DeviceLock``."""
 
 
-def lock_shell_holds(host: str, *, normalize=None) -> bool:
-    """True when a lock shell (locked.py) holds *host*'s ``DeviceLock`` for this process.
+def _parent_pid(pid: int) -> int | None:
+    """The parent of *pid*, or None when it cannot be read (``ps``, so macOS and Linux alike)."""
+    try:
+        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True,
+                             timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return int(out) if out.isdigit() else None
 
-    The convention: ``C64U_LOCK_PID`` is the PID of the process that holds the lock, and ``C64U_LOCK_HOST``
-    (optional) the host it holds it for. False when ``C64U_LOCK_PID`` is unset or names another device. A claim
-    that the lockfile does not back raises :class:`LockShellClaimError`, never False: the caller would otherwise
-    queue behind, or drive past, the very holder it was told about. *normalize* compares hosts (default: the
-    harness's ``normalize_device_host``).
+
+def _is_ancestor(pid: int, max_depth: int = 64) -> bool:
+    """Whether *pid* is this process's parent, grandparent, ... (stops at PID 1 or an unreadable link)."""
+    cur = os.getpid()
+    for _ in range(max_depth):
+        cur = _parent_pid(cur)
+        if cur is None or cur <= 1:
+            return False
+        if cur == pid:
+            return True
+    return False
+
+
+def lock_shell_holds(host: str, *, normalize=None) -> bool:
+    """True when a lock shell holds *host*'s ``DeviceLock`` on behalf of this process.
+
+    The convention (docs/device_locking.md, "Lock shells"): an external lock shell holds the DeviceLock and runs a
+    child command with ``C64U_LOCK_PID=<its pid>`` and ``C64U_LOCK_HOST=<host>``. False when ``C64U_LOCK_PID`` is
+    unset or ``C64U_LOCK_HOST`` names another device. A claim raises :class:`LockShellClaimError`, never returns
+    False, when the lockfile's holder is not that PID or that PID is not an ancestor of this process: the caller
+    would otherwise queue behind, or drive past, the very holder it was told about. *normalize* compares hosts
+    (default: the harness's ``normalize_device_host``).
     """
     pid = os.environ.get("C64U_LOCK_PID")
     if not pid:
@@ -249,9 +273,12 @@ def lock_shell_holds(host: str, *, normalize=None) -> bool:
     if shell_host and norm(shell_host) != norm(host):
         return False
     holder = device_lock_holder(host)
-    if holder and str(holder.get("pid")) == pid:
-        return True
-    raise LockShellClaimError(f"C64U_LOCK_PID={pid} does not hold the DeviceLock for {host} (holder {holder})")
+    if not (holder and str(holder.get("pid")) == pid):
+        raise LockShellClaimError(f"C64U_LOCK_PID={pid} does not hold the DeviceLock for {host} (holder {holder})")
+    if not (pid.isdigit() and _is_ancestor(int(pid))):
+        raise LockShellClaimError(f"C64U_LOCK_PID={pid} holds the DeviceLock for {host} but is not an ancestor "
+                                  f"of this process ({os.getpid()}): its hold is not for this run")
+    return True
 
 
 def require_device_lock(host: str, *, normalize=None) -> None:

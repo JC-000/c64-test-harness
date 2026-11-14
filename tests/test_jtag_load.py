@@ -458,6 +458,7 @@ def test_lock_shell_holder_is_honoured_and_a_stale_claim_refused(env, monkeypatc
     monkeypatch.setenv("C64U_LOCK_PID", "4242")
     monkeypatch.setenv("C64U_LOCK_HOST", "c64u")
     monkeypatch.setattr(dl, "device_lock_holder", lambda h: {"pid": 4242})
+    _chain(monkeypatch, 4242)                          # the shell is this process's parent
     load(env, FakeEsp(ev), FakeClient(ev, [info()]))
     assert ("acquire", "device") not in ev and ("acquire", "adapter") in ev
     monkeypatch.setattr(dl, "device_lock_holder", lambda h: {"pid": 1})
@@ -768,6 +769,7 @@ def test_client_is_built_under_a_lock_shell_and_a_stale_claim_refused(built, tmp
     monkeypatch.setenv("C64U_LOCK_PID", "4242")
     monkeypatch.setenv("C64U_LOCK_HOST", GUARD_HOST)
     monkeypatch.setattr(dl, "device_lock_holder", lambda h: {"pid": 4242})
+    _chain(monkeypatch, 4242)
     with jl._Locked(GUARD_HOST, {}, 5, real_locks(tmp_path)) as held:
         assert held.dev is None                         # the shell holds it; this process took nothing
         jl._client(GUARD_HOST)
@@ -779,3 +781,42 @@ def test_client_is_built_under_a_lock_shell_and_a_stale_claim_refused(built, tmp
     with pytest.raises(jl.DeviceLockNotHeldError):
         jl._client(GUARD_HOST)
     assert built == [GUARD_HOST]
+
+
+def _chain(monkeypatch, *ancestors):
+    """Make os.getpid()'s parents, nearest first, *ancestors*; then pid 1."""
+    import _u64_host
+    me = os.getpid()
+    links = dict(zip((me,) + ancestors, ancestors + (1,)))
+    monkeypatch.setattr(_u64_host, "_parent_pid", lambda pid: links.get(pid))
+
+
+@pytest.mark.parametrize("ancestors, ok", [
+    ((4242,), True),                 # the shell ran this process
+    ((100, 4242), True),             # through a wrapper
+    ((100, 200), False),             # 4242 holds the lock, but for some other process tree
+    ((), False),
+])
+def test_a_lock_shell_must_be_an_ancestor_of_this_process(built, monkeypatch, ancestors, ok):
+    import c64_test_harness.backends.device_lock as dl
+    monkeypatch.setenv("C64U_LOCK_PID", "4242")
+    monkeypatch.setenv("C64U_LOCK_HOST", GUARD_HOST)
+    monkeypatch.setattr(dl, "device_lock_holder", lambda h: {"pid": 4242})
+    _chain(monkeypatch, *ancestors)
+    if ok:
+        jl._client(GUARD_HOST)
+        assert built == [GUARD_HOST]
+    else:
+        with pytest.raises(jl.LockShellClaimError, match="ancestor"):
+            jl._client(GUARD_HOST)
+        assert built == []
+
+
+def test_the_parent_chain_is_read_from_the_process_table():
+    """The real _parent_pid (ps): this process's parent is an ancestor, a PID outside the chain is not."""
+    import _u64_host
+    assert _u64_host._parent_pid(os.getpid()) == os.getppid()
+    assert _u64_host._is_ancestor(os.getppid())
+    assert not _u64_host._is_ancestor(os.getpid())
+    assert not _u64_host._is_ancestor(2 ** 22 + 7)
+    assert not _u64_host._is_ancestor(1)               # init/launchd is everyone's ancestor: never a lock shell
