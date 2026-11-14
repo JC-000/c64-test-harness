@@ -158,6 +158,9 @@ class FakeUltimate:
         last entry instead of the first.
     :param menu_initial: the context menu's first highlighted item.
     :param menu_keys_swapped: UP and DOWN are swapped inside a context menu.
+    :param dead_keys: key names the browser listing drops without a redraw
+        (a key lost on the way, or a cursor that did not move). Logged, never
+        acted on; context menus are not affected.
     :param flood_after_commit: after the action's ENTER the session keeps
         sending and never goes quiet.
     :param framed: the official C64U 1.1.0 layout (``COMMODORE``): the browser
@@ -188,6 +191,7 @@ class FakeUltimate:
         menu_initial: int = 0,
         menu_keys_swapped: bool = False,
         flood_after_commit: bool = False,
+        dead_keys: tuple[str, ...] = (),
     ) -> None:
         self.title = title
         self.root = root if root is not None else [
@@ -229,6 +233,7 @@ class FakeUltimate:
         self.menu_initial = menu_initial
         self.menu_keys_swapped = menu_keys_swapped
         self.flood_after_commit = flood_after_commit
+        self.dead_keys = set(dead_keys)
         self.sgr_sel = "0;37;1" if framed else SGR_SEL
         self.sgr_fg = "0;31;2" if framed else SGR_FG
         #: True once Run Update stopped the application: no new connection
@@ -456,6 +461,8 @@ class _Session:
             return
         if self.menu is not None:
             self.menu_key(name)
+            return
+        if name in self.dev.dead_keys:
             return
         n = len(self.entries())
         if name == "DOWN" and n:

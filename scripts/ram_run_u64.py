@@ -10,9 +10,9 @@ First, before any lock, client or upload: the file must be a RAM-run image (chec
 plain update.u64 flashes the device; on 2026-11-13 a plain image passed here by mistake flashed a U64E.
 
 Steps, all under the device's DeviceLock: identity check (bound unique_id, product "Ultimate 64 Elite"); pinned
-SHA-256 of the image; FTP put to a USB volume through the harness storage helpers (they refuse /Temp); telnet menu:
-select the file, context menu, "Run Update"; REST must drop and come back with the expected git hash; the file is
-deleted again.
+SHA-256 of the image; FTP put to a USB volume through the harness storage helpers (they refuse /Temp); telnet menu
+through the harness's Remote Menu driver (ultimate64_remote_menu.py): browse to the exact path, context menu, "Run
+Update", one ENTER; REST must drop and come back with the expected git hash; the file is deleted again.
 
     ram_run_u64.py run HOST IMAGE --sha256 H --expect-hash G [--volume USB1] [--dry-run]
 """
@@ -81,9 +81,49 @@ def check_ramrun_image(data: bytes) -> None:
                                f"{length}, entry {entry:#x}) do not describe the staged record {shape[0]}")
 
 
+def _menu(host: str):
+    from c64_test_harness.backends.ultimate64_remote_menu import Ultimate64RemoteMenu
+    return Ultimate64RemoteMenu(host)
+
+
+def run_update_ramrun(menu, path: str, data: bytes, log=jl._log) -> tuple[str, ...]:
+    """Choose "Run Update" on the RAM-run image at *path*: one ENTER, no wait for anything after it.
+
+    The driver's own ``run_update`` is for flashing: it requires ``confirm_device_powers_off`` and then waits for the
+    application to stop answering telnet, which a RAM image that boots straight back need not show. This takes the
+    driver's steps up to the ENTER instead (a session at the root, the exact path paged to with a check that every
+    key moved the cursor, the context menu, the highlight read back onto "Run Update") and leaves the proof of a
+    restart to the caller's REST checks. *data* is what was uploaded to *path*; it is checked here as well as at
+    ram_run's entry, so this skip of the power-off wait can never be reached with a plain update image.
+    Returns the context menu's labels. Driver refusals before the ENTER are raised as ``JtagLoadError("menu")``.
+    """
+    check_ramrun_image(data)
+    from c64_test_harness.backends.ultimate64_remote_menu import Ultimate64RemoteMenuError
+    try:
+        sess = menu._open("Run Update (RAM-run)")
+    except Ultimate64RemoteMenuError as e:
+        raise jl.JtagLoadError("menu", f"{type(e).__name__}: {e}") from e
+    try:
+        try:
+            menu._navigate(sess, path)
+            menu._open_menu(sess, path)
+            box = menu._highlight(sess, "Run Update", path)
+        except Ultimate64RemoteMenuError as e:
+            raise jl.JtagLoadError("menu", f"{type(e).__name__}: {e}") from e
+        log(f"telnet menu: Run Update on {path}")
+        sess.send("ENTER")          # once; never resent, and a menu is never closed with a key
+        try:                        # read what the ENTER drew before closing, as the upstream browser's press did
+            sess.drain(expect=True)
+        except Exception:           # the application may be gone already; the REST checks decide
+            pass
+        return box.labels
+    finally:
+        sess.close()
+
+
 def ram_run(host: str, image, *, sha256: str, expect_git_hash: str, volume: str = "USB1", stem: str | None = None,
             lock_timeout: float = 600, down_timeout: float = 60, up_timeout: float = 180, dry_run: bool = False,
-            lock_factory=jl.DeviceLock, client_factory=jl._client, browser_factory=None, storage=None,
+            lock_factory=jl.DeviceLock, client_factory=jl._client, menu_factory=_menu, storage=None,
             sleep=None, clock=None, log=jl._log) -> dict:
     sleep, clock = sleep or time.sleep, clock or time.monotonic
     uid = bound_u64(host)
@@ -95,17 +135,13 @@ def ram_run(host: str, image, *, sha256: str, expect_git_hash: str, volume: str 
     expect_git_hash = jl.check_git_hash(expect_git_hash)
     stem = stem or ("rr" + expect_git_hash[:6])
     if not stem.isalnum() or len(stem) > 8:
-        raise jl.JtagLoadError("name", f"stem {stem!r}: use up to 8 letters/digits (the browser selects by prefix)")
+        raise jl.JtagLoadError("name", f"stem {stem!r}: use up to 8 letters/digits (an 8.3 name the listing shows whole)")
     remote = f"/{volume}/{stem}.u64"
     rec = {"t0": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": host, "uid": uid, "image": str(image),
            "sha256": got, "remote": remote, "expect_git_hash": expect_git_hash, "action": "ram_run"}
-    if browser_factory is None:
-        browser_factory = jl._telnet_browser
     if storage is None:
         from c64_test_harness.backends import ultimate64_storage as storage
     if dry_run:
-        if browser_factory is jl._telnet_browser:
-            jl._telnet_imports()
         rec["result"] = "dry-run ok"
         return rec
     with jl._Locked(host, {}, lock_timeout, lock_factory):
@@ -114,39 +150,7 @@ def ram_run(host: str, image, *, sha256: str, expect_git_hash: str, volume: str 
         rec["pre_info"] = pre
         storage.storage_put_file(host, remote, data, overwrite=True)
         try:
-            b = browser_factory(host)
-            done = False
-            try:
-                jl.clear_message_popups(b)
-                b.go_to_directory(volume)
-                b.select_entry(stem)
-                if stem.lower() not in b.selected_text().lower():
-                    raise jl.JtagLoadError("menu", f"selected {b.selected_text()!r}, not {stem}")
-                labels = b.open_context_menu()
-                if "Run Update" not in [jl._label(x) for x in labels]:
-                    raise jl.JtagLoadError("menu", f"no 'Run Update' in the context menu: {labels}")
-                _frame, text = b.select_framed_entry("Run Update")
-                if jl._label(text.split("  ")[0]) != "Run Update":
-                    raise jl.JtagLoadError("menu", f"highlight reads {text!r}, not 'Run Update'")
-                log(f"telnet menu: Run Update on {remote}")
-                b.press("ENTER")
-                done = True
-            finally:
-                if done:                    # only the socket: Browser.close() navigates home with 1 s key timeouts
-                    try:
-                        b.backend.close()
-                    except Exception:
-                        pass
-                else:
-                    for _ in range(2):
-                        try:
-                            b.press("ESC")
-                        except Exception:
-                            break
-                    try:
-                        b.close()
-                    except Exception:
-                        pass
+            rec["menu"] = list(run_update_ramrun(menu_factory(host), remote, data, log))
             # Proof of a restart: the hash changes, or (same hash) REST drops and returns.
             same = jl.hash_matches(pre.get("git_commit_hash"), jl.check_git_hash(expect_git_hash))
             end = clock() + down_timeout
