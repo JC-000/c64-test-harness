@@ -6,6 +6,9 @@ The image is a RAM-run ``.u64`` (1541ultimate branch ``jtagv/u64-ramrun``: ``too
 record to its load address and jumps; the stub silences the running app's DMA, copies the app to 0x0 and starts it.
 Nothing is written to flash. The flashed app comes back only with a power cycle (the U64E has no software one).
 
+First, before any lock, client or upload: the file must be a RAM-run image (check_ramrun_image). "Run Update" on a
+plain update.u64 flashes the device; on 2026-11-13 a plain image passed here by mistake flashed a U64E.
+
 Steps, all under the device's DeviceLock: identity check (bound unique_id, product "Ultimate 64 Elite"); pinned
 SHA-256 of the image; FTP put to a USB volume through the harness storage helpers (they refuse /Temp); telnet menu:
 select the file, context menu, "Run Update"; REST must drop and come back with the expected git hash; the file is
@@ -17,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import struct
 import sys
 import time
 from pathlib import Path
@@ -38,6 +42,45 @@ def bound_u64(host: str) -> str:
     return uid
 
 
+# tools/make_ramrun.py (1541ultimate jtagv/u64-ramrun 30cd96ff9): the stub at __updater_start, the app staged 0x1000
+# above it, and "RAMR" as the first word of the stub's ramrun_params block (ramrun_stub.S:68-73), which make_ramrun.py
+# finds with rfind and fills with source, destination, length, entry.
+RAMRUN_STUB_ADDR = 0x03000000
+RAMRUN_STAGE_ADDR = 0x03001000
+RAMRUN_MAGIC = 0x524D4152
+
+
+def check_ramrun_image(data: bytes) -> None:
+    """Refuse anything but a RAM-run file: "Run Update" on a plain update.u64 FLASHES the device.
+
+    The records are parsed by the harness's own format-0 reader (``inspect_update_image``, ultimate64_firmware_flash.py),
+    which also enforces the loader's rules: complete records, word-aligned lengths between records, and after the last
+    one only its hex2bin padding (0-3 bytes). On top of that, exactly what make_ramrun.py writes: two records, the
+    application at the staging address with start 0, then the stub at its own address with start = that address; the
+    stub's ramrun_params block ("RAMR" magic, then source, destination, length, entry) names the staged record.
+    """
+    from c64_test_harness.backends.ultimate64_firmware_flash import inspect_update_image
+    try:
+        recs = inspect_update_image(data).records
+    except ValueError as e:
+        raise jl.JtagLoadError("image", f"not a RAM-run file: {e}") from None
+    shape = [(hex(load), length, hex(start)) for load, length, start in recs]
+    if (len(recs) != 2 or recs[0][0] != RAMRUN_STAGE_ADDR or recs[0][2] != 0
+            or recs[1][0] != RAMRUN_STUB_ADDR or recs[1][2] != RAMRUN_STUB_ADDR):
+        raise jl.JtagLoadError("image", f"not a RAM-run file (expected the app at {RAMRUN_STAGE_ADDR:#x} with start 0, "
+                               f"then the stub at {RAMRUN_STUB_ADDR:#x} starting there; got {shape}): a plain update "
+                               "image would flash")
+    off = 12 + recs[0][1] + 12
+    payload = data[off:off + recs[1][1]]
+    pos = payload.rfind(struct.pack("<I", RAMRUN_MAGIC))
+    if pos < 0 or pos + 20 > len(payload):
+        raise jl.JtagLoadError("image", "not a RAM-run file: the stub record has no RAMR parameter block")
+    source, _dest, length, entry = struct.unpack_from("<IIII", payload, pos + 4)
+    if source != recs[0][0] or length != recs[0][1] or not entry:
+        raise jl.JtagLoadError("image", f"not a RAM-run file: the stub's parameters (source {source:#x}, length "
+                               f"{length}, entry {entry:#x}) do not describe the staged record {shape[0]}")
+
+
 def ram_run(host: str, image, *, sha256: str, expect_git_hash: str, volume: str = "USB1", stem: str | None = None,
             lock_timeout: float = 600, down_timeout: float = 60, up_timeout: float = 180, dry_run: bool = False,
             lock_factory=jl.DeviceLock, client_factory=jl._client, browser_factory=None, storage=None,
@@ -45,6 +88,7 @@ def ram_run(host: str, image, *, sha256: str, expect_git_hash: str, volume: str 
     sleep, clock = sleep or time.sleep, clock or time.monotonic
     uid = bound_u64(host)
     data = Path(image).read_bytes()
+    check_ramrun_image(data)
     got = jl.hashlib.sha256(data).hexdigest()
     if not sha256 or got != sha256.lower():
         raise jl.JtagLoadError("hash", f"{image}: SHA-256 {got} is not the pinned {sha256}")

@@ -1,6 +1,7 @@
 """Device-free tests of scripts/ram_run_u64.py: the gates around a U64E RAM-run ("Run Update" on a RAM image)."""
 import hashlib
 import os
+import struct
 import sys
 
 import pytest
@@ -84,11 +85,28 @@ def info(h="17995fd9c", uid="601A96", product="Ultimate 64 Elite"):
     return {"unique_id": uid, "product": product, "git_commit_hash": h}
 
 
+APP, STUB, MAGIC = 0x3001000, 0x3000000, 0x524D4152
+
+
+def rec(load, payload, start):
+    return struct.pack("<III", load, len(payload), start) + payload
+
+
+def stub(app_len, magic=MAGIC, stage=APP):
+    """A stub as tools/make_ramrun.py leaves it: code, then ramrun_params filled in."""
+    return b"\x13" * 40 + struct.pack("<IIIII", magic, stage, 0x0, app_len, 0x20)
+
+
+def ramrun_image(app=b"\xa5" * 64):
+    """What make_ramrun.py writes: the app at the staging address with start 0, then the stub, start = stub."""
+    return rec(APP, app, 0) + rec(STUB, stub(len(app)), STUB)
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.setattr(jl, "normalize_device_host", lambda h: "uid-601a96" if h == "u64e" else h)
     img = tmp_path / "r.u64"
-    img.write_bytes(b"\x00" * 64)
+    img.write_bytes(ramrun_image())
     return [], img, hashlib.sha256(img.read_bytes()).hexdigest()
 
 
@@ -175,3 +193,64 @@ def test_same_hash_needs_the_drop(env):
             clock=lambda: t.__setitem__(0, t[0] + 1) or t[0])
     rec = run(env, [info("17995fd9c"), info("17995fd9c"), None, None, None, info("17995fd9c")])
     assert rec["result"] == "ok" and rec["rest_drop_seen"] is True
+
+
+def _with_image(env, data):
+    ev, img, _ = env
+    img.write_bytes(data)
+    return ev, img, hashlib.sha256(data).hexdigest()
+
+
+def test_plain_update_image_is_refused_before_lock_and_upload(env):
+    """A plain update.u64 (one record, start = its load address) would FLASH the device on Run Update."""
+    plain = rec(0x3000000, b"\x5a" * 256, 0x3000000)
+    env = _with_image(env, plain)
+    with pytest.raises(jl.JtagLoadError) as e:
+        run(env, [info("218e36a52"), info("17995fd9c")])
+    assert e.value.stage == "image"
+    assert env[0] == []         # no lock, no client, no upload, no key
+
+
+def _odd_stub(app_len):
+    return stub(app_len) + b"\x01\x02\x03"          # a stub whose length is not a multiple of 4
+
+
+@pytest.mark.parametrize("data", [
+    ramrun_image(),
+    rec(APP, b"\xa5" * 64, 0) + rec(STUB, _odd_stub(64), STUB),
+    rec(APP, b"\xa5" * 64, 0) + rec(STUB, _odd_stub(64), STUB) + b"\x00",   # hex2bin's padding to 4
+    rec(APP, b"\xa5" * 64, 0) + rec(STUB, b"RAMR" + stub(64), STUB),        # make_ramrun.py takes the LAST magic
+], ids=["make_ramrun", "odd-stub", "odd-stub-padded", "magic-twice"])
+def test_ramrun_images_pass(data):
+    rr.check_ramrun_image(data)
+
+
+A, S = b"\xa5" * 64, stub(64)
+
+
+@pytest.mark.parametrize("data", [
+    rec(APP, A, 0) + rec(STUB, S, STUB) + rec(STUB + 0x100, b"\x00" * 4, STUB),          # three records
+    rec(STUB, S, STUB) + rec(APP, A, 0),                                                 # wrong order
+    rec(APP, A, APP) + rec(STUB, S, STUB),                                               # app carries a start
+    rec(APP + 0x1000, A, 0) + rec(STUB, stub(64, stage=APP + 0x1000), STUB),             # app not at staging addr
+    rec(APP, A, 0) + rec(STUB + 0x10, S, STUB),                                          # stub not where it starts
+    rec(APP, A, 0) + rec(STUB, S, STUB + 4),                                             # stub start elsewhere
+    rec(APP, A, 0) + rec(STUB, stub(64, magic=0x52414D52), STUB),                        # no RAMR magic
+    rec(APP, A, 0) + rec(STUB, b"\0" * 3 + struct.pack("<IIII", APP, 0, 64, 0x20), STUB),  # params, no magic
+    rec(APP, A, 0) + rec(STUB, b"\x13" * 40 + struct.pack("<III", MAGIC, APP, 0), STUB),  # block cut short
+    rec(APP, A, 0) + rec(STUB, stub(64, stage=STUB), STUB),                              # params: other source
+    rec(APP, A, 0) + rec(STUB, stub(60), STUB),                                          # params: other length
+    rec(APP, A, 0) + rec(STUB, S[:-4] + b"\x00" * 4, STUB),                              # params: entry 0
+    rec(APP, A, 0) + rec(STUB, S, STUB)[:-1],                                            # truncated record
+    rec(APP, A, 0) + rec(STUB, S, STUB) + b"\x00" * 5,                                   # partial header after
+    rec(APP, A, 0) + rec(STUB, _odd_stub(64), STUB) + b"\x00" * 2,                       # more than its padding
+    rec(APP, A + b"\x01", 0) + rec(STUB, stub(65), STUB),                                # unaligned app, loader misreads
+    rec(STUB, A, STUB),                                                                  # plain image, one record
+    b"",
+], ids=["three", "order", "app-start", "app-load", "stub-load", "stub-start", "magic", "no-magic-params", "short-block", "param-source",
+        "param-length", "param-entry", "truncated", "partial-header", "too-much-padding", "unaligned-app",
+        "plain", "empty"])
+def test_anything_else_is_refused(data):
+    with pytest.raises(jl.JtagLoadError) as e:
+        rr.check_ramrun_image(data)
+    assert e.value.stage == "image"
