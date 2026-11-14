@@ -97,8 +97,10 @@ button and never cuts power. It never retries Run Update.
    ``/Flash/roms`` already holds with the same SHA-256 is not written
    (``FlashRecord.roms_unchanged``; it is read over FTP to compare). Every
    other one goes through ``storage_put_rom``, whose refusals (*overwrite*,
-   *replace_stock*) apply unchanged. If any was written, ``reboot()`` follows
-   so the C64 loads its ROMs again (``c64.cc:915``). ``reboot()`` resets the
+   *replace_stock*) apply unchanged. If any was written, or step 7 reset the
+   ROM selection in RAM (a config change does not reload ROMs, 1.1.0
+   ``c64.cc:267-275``), ``reboot()`` follows so the C64 loads its ROMs
+   again (``c64.cc:915``). ``reboot()`` resets the
    C64 only; the firmware and REST keep running. The ``/v1/info`` read after
    it is a sanity check that the same device and firmware still answer; it
    proves nothing about the ROMs.
@@ -401,7 +403,8 @@ class FlashRecord:
     #: ROMs already in ``/Flash/roms`` with the expected SHA-256: nothing was
     #: written for them. Device paths, in the device's spelling.
     roms_unchanged: list[str] = field(default_factory=list)
-    #: ``True`` only when the ``roms`` step wrote a ROM and then rebooted.
+    #: ``True`` when the ``roms`` step rebooted: it wrote a ROM, or
+    #: ``reset_categories`` ran before it.
     rebooted: bool = False
     git_commit_hash_after_reboot: str | None = None
     warnings: list[str] = field(default_factory=list)
@@ -869,7 +872,9 @@ def read_wifi_ident(
     no access point to join is not a failure. The Enable is sent even when
     the Disable or the read fails, unless the failure says the Disable's
     ENTER was never sent (``enter_sent=False``). (``flash_firmware``'s
-    ``wifi_ident`` step requires Link Up whatever the row was.)
+    ``wifi_ident`` step requires Link Up whatever the row was.) A
+    ``KeyboardInterrupt`` during the re-Enable itself can leave WiFi
+    Disabled; that cannot be avoided, so check WiFi after an interrupted call.
 
     Works on the U64E and the C64U alike, outside a flash. **On the U64E
     the Disable and the Enable each write the WiFi config store to flash**
@@ -1278,9 +1283,11 @@ def _flash(host: str, image: FirmwareImage, roms: Sequence[RomImage], v: _Valida
                 record.roms.append(storage_put_rom(
                     host, rom.kind, rom.name, payload, overwrite=rom.overwrite,
                     replace_stock=rom.replace_stock, check_signature=rom.check_signature))
-            if record.roms:
+            if record.roms or record.baseline is not None:
                 # Resets the C64 only, so it loads its ROMs again (c64.cc:915);
-                # the firmware and REST keep running.
+                # the firmware and REST keep running. Also after
+                # reset_categories: it resets the ROM selection in RAM, and a
+                # config change does not reload ROMs (1.1.0 c64.cc:267-275).
                 client.reboot()
                 record.rebooted = True
         except Exception as exc:

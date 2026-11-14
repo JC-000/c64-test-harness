@@ -9,8 +9,10 @@ previous lane's ``restore_state`` to have run.
 The contract, as decided by the owner in #227:
 
 * **The baseline is the firmware's factory default.**  Every flash on the
-  bench formats the flash and resets settings, so power-on and
-  ``reset_to_default`` converge on the same state.  There is no
+  bench answers YES to Reset Configuration, which is what keeps flash ==
+  defaults, so power-on and ``reset_to_default`` converge on the same
+  state; Reformat Flash Disk is NO by default and YES only when a test
+  needs it (owner, 2026-11-14).  There is no
   harness-owned table: each item map carries its own ``default``
   (``get_config_item``, #214) and the check is ``current == default`` per
   item.  Items without a ``default`` key (preset-file and info types) are

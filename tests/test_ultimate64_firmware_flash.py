@@ -1132,6 +1132,19 @@ def test_a_rom_already_present_unchanged_is_not_written(rig, held, tmp_path):
     assert rec.steps[-1] == "roms"
 
 
+def test_unchanged_roms_after_the_category_reset_still_reboot(rig, held, tmp_path):
+    # reset_categories puts the ROM selection back in RAM, and a config change
+    # does not reload ROMs (1.1.0 c64.cc:267-275); only reboot() applies it.
+    rig.infos = [info(), dict(OFFICIAL_INFO)]
+    rig.storage.files["/Flash/roms/kernal.bin"] = KERNAL
+    rec = rig.run(make_image(tmp_path, kind="official"), roms=[_stock_kernal(tmp_path)])
+    assert "put_rom" not in rig.names() and rec.roms_unchanged == ["/Flash/roms/kernal.bin"]
+    names = rig.names()
+    assert names.index("apply_factory_baseline") < names.index("reboot")
+    assert rec.rebooted and names[names.index("reboot") + 1] == "get_info"
+    assert rec.steps[-1] == "roms"
+
+
 def test_a_stock_rom_with_other_content_still_needs_replace_stock(rig, held, tmp_path):
     other = bytearray(KERNAL)
     other[100] ^= 0xFF

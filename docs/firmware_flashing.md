@@ -134,6 +134,8 @@ Disabled, so the function always leaves WiFi as it found it:
   raises `WifiIdentUnreadableError` with nothing sent.
 - Not back within `link_timeout_s`: `WifiLinkTimeoutError`; its `reading`
   holds the IDENT and the last row. WiFi has been enabled again.
+- A `KeyboardInterrupt` during the re-Enable itself can leave WiFi
+  Disabled. That cannot be avoided; check WiFi after an interrupted call.
 
 It needs the `DeviceLock` (`RemoteMenuLockError` otherwise, before any
 connection). It costs zero `/Temp`. **On the U64E each Disable and Enable writes
@@ -326,10 +328,11 @@ again, with no button press.
    FTP) is not written; its path goes in `FlashRecord.roms_unchanged`. Every
    other ROM goes through `storage_put_rom`, so a stock file with other
    content still needs `overwrite=True, replace_stock=True`. If any ROM was
-   written, `reboot()` follows so the C64 loads its ROMs again, then
-   `/v1/info` is read and the identity checked again. That proves the same
-   firmware still answers; it proves nothing about the ROMs. If none was
-   written, there is no reboot (`rebooted=False`).
+   written, or `reset_categories` ran (it resets the ROM selection in RAM,
+   and a config change does not reload ROMs), `reboot()` follows so the C64
+   loads its ROMs again, then `/v1/info` is read and the identity checked
+   again. That proves the same firmware still answers; it proves nothing
+   about the ROMs. Otherwise there is no reboot (`rebooted=False`).
 
 ### Dry run
 
