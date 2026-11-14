@@ -80,14 +80,56 @@ def cycle(ev, plug, client, host="c64u", **kw):
     return rec, sleeps
 
 
-def test_sequence_graceful_off_wait_on_back(env):
+def u64e(h):
+    return info(h, uid="601A96", product="Ultimate 64 Elite")
+
+
+def test_u64e_sequence_graceful_off_wait_on_back(env):
     ev = env
     plug = Plug(ev)
-    rec, sleeps = cycle(ev, plug, Client(ev, plug, info("f1a5bed00"), info("f1a5bed00")), expect_git_hash="f1a5bed00")
+    rec, sleeps = cycle(ev, plug, Client(ev, plug, u64e("f1a5bed00"), u64e("f1a5bed00")), host="u64e",
+                        expect_git_hash="f1a5bed00")
     assert rec["result"] == "ok"
     assert [e for e in ev if e[0] != "get_info"] == [("acquire",), ("poweroff",), ("outlet", "OFF"), ("outlet", "ON"),
                                                      ("release",)]
     assert 10.0 in sleeps and plug.on
+
+
+def test_c64u_is_never_powered_off_by_default(env):
+    """CLAUDE.md rule 7: poweroff() is unreachable on the C64U. The outlet is just cut and restored."""
+    ev = env
+    plug = Plug(ev)
+    rec, _ = cycle(ev, plug, Client(ev, plug, info("f1a5bed00"), info("f1a5bed00")))
+    assert [e for e in ev if e[0] != "get_info"] == [("acquire",), ("outlet", "OFF"), ("outlet", "ON"), ("release",)]
+    assert rec["result"] == "ok" and rec["c64u_poweroff"] is False
+
+
+def test_c64u_poweroff_needs_its_own_flag(env):
+    ev = env
+    plug = Plug(ev)
+    with pytest.raises(po.OutletError):                 # graceful=True alone is refused, before the lock
+        cycle(ev, plug, Client(ev, plug, info("f1a5bed00"), info("f1a5bed00")), graceful=True)
+    assert ev == []
+    rec, _ = cycle(ev, plug, Client(ev, plug, info("f1a5bed00"), info("f1a5bed00")), c64u_poweroff=True)
+    assert ("poweroff",) in ev and rec["c64u_poweroff"] is True
+
+
+def test_the_c64u_flag_is_refused_on_another_device(env):
+    with pytest.raises(po.OutletError):
+        cycle(env, Plug(env), None, host="u64e", c64u_poweroff=True)
+    assert env == []
+
+
+@pytest.mark.parametrize("argv, want", [
+    (["cycle", "c64u"], {"graceful": None, "c64u_poweroff": False}),
+    (["cycle", "c64u", "--no-graceful"], {"graceful": False, "c64u_poweroff": False}),
+    (["cycle", "c64u", "--c64u-poweroff"], {"graceful": None, "c64u_poweroff": True}),
+])
+def test_cli_passes_the_c64u_flag_only_when_given(monkeypatch, argv, want):
+    got = {}
+    monkeypatch.setattr(po, "outlet_cycle", lambda host, **kw: got.update(kw) or {"result": "ok"})
+    assert po.main(argv) == 0
+    assert {k: got[k] for k in want} == want
 
 
 def test_off_time_minimum(env):
@@ -116,24 +158,8 @@ def test_dead_app_still_gets_cut(env):
             if not self.cycled:
                 raise ConnectionError           # wedged before the cycle
             return self.after
-    rec, _ = cycle(ev, plug, Dead(ev, plug, None, info("f1a5bed00")))
+    rec, _ = cycle(ev, plug, Dead(ev, plug, None, u64e("f1a5bed00")), host="u64e")   # a U64E would get a poweroff
     assert ("poweroff",) not in ev and ("outlet", "OFF") in ev and rec["result"] == "ok"
-
-
-def test_c64u_not_back_names_the_power_on_mode(env):
-    ev = env
-    plug = Plug(ev)
-    t = [0.0]
-
-    class StaysOff(Client):
-        def get_info(self):
-            if any(e == ("poweroff",) for e in self.ev):
-                raise ConnectionError
-            return self.before
-    with pytest.raises(po.OutletError) as e:
-        cycle(ev, plug, StaysOff(ev, plug, info("f1a5bed00"), None), up_timeout=5,
-              clock=lambda: t.__setitem__(0, t[0] + 1) or t[0])
-    assert "power-on mode is ON" in str(e.value) and plug.on
 
 
 def test_wrong_device_behind_the_plug_refuses_before_cutting(env):

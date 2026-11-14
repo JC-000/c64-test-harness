@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Cold power cycle of an Ultimate through a switched outlet (a smart plug with a local HTTP API).
 
-    power_outlet.py cycle HOST [--off-s 10] [--expect-hash G] [--no-graceful] [--dry-run]
+    power_outlet.py cycle HOST [--off-s 10] [--expect-hash G] [--no-graceful] [--c64u-poweroff] [--dry-run]
     power_outlet.py status HOST
 
 Binding, in ~/.config/c64-test-harness/devices.toml under the device's table:
@@ -11,19 +11,20 @@ Binding, in ~/.config/c64-test-harness/devices.toml under the device's table:
     outlet = "http://<plug address>"    # static DHCP lease
     outlet_kind = "shelly-gen2"         # or "tasmota"
 
-Sequence (Chris's, from the #1042 review: graceful poweroff, then 10 s with the outlet off), all under the device's
+Sequence (from the #1042 review: graceful poweroff, then 10 s with the outlet off), all under the device's
 DeviceLock (allow_nested, so a driver that holds it can call this):
   1. if REST answers: PUT /v1/machine:poweroff through the harness client (confirm_irrecoverable=True), then wait
-     briefly for REST to go away;
+     briefly for REST to go away. Not on a C64U unless --c64u-poweroff is given (see below);
   2. outlet OFF, read back OFF; wait off_s (at least 10 s);
   3. outlet ON, read back ON;
   4. wait for /v1/info with the bound unique_id (and the expected hash, if given).
 The outlet is never left OFF by this code: any error after step 2 switches it back ON before raising.
 
-C64U caveat: after AC returns, its ESP32 module decides whether the machine powers up, by its power-on mode
-(software/u64ctrl/main/power_state.c:130-158: ON, LAST_STATE, else OFF). Step 1 stores last-state OFF, so the C64U
-comes back only with power-on mode ON. Changing that mode is a module setting and a user-approved step of a visit;
-this code never changes it. If the device does not come back, the error says so.
+C64U: poweroff() is unreachable on the C64U (CLAUDE.md, hardware-safety rule 7), so step 1 is skipped there and
+the outlet is just cut. After AC returns, its ESP32 module decides whether the machine powers up, by its power-on
+mode (software/u64ctrl/main/power_state.c:130-158: ON, LAST_STATE, else OFF). A poweroff stores last-state OFF, so
+after one the C64U comes back only with power-on mode ON. --c64u-poweroff sends it anyway, for a module known to be
+set to power-on mode ON; graceful=True on a C64U without it is refused. This code never changes that mode.
 """
 from __future__ import annotations
 
@@ -133,7 +134,8 @@ def _set_checked(outlet, on: bool, sleep, tries: int = 3) -> None:
     raise OutletError(f"outlet does not read back {'ON' if on else 'OFF'}")
 
 
-def outlet_cycle(host: str, *, off_s: float = MIN_OFF_S, graceful: bool = True, expect_git_hash: str | None = None,
+def outlet_cycle(host: str, *, off_s: float = MIN_OFF_S, graceful: bool | None = None, c64u_poweroff: bool = False,
+                 expect_git_hash: str | None = None,
                  up_timeout: float = 240, down_timeout: float = 30, lock_timeout: float = 600, dry_run: bool = False,
                  binding: dict | None = None, outlet_factory=None, lock_factory=jl.DeviceLock,
                  client_factory=jl._client, sleep=None, clock=None, log=jl._log) -> dict:
@@ -141,12 +143,23 @@ def outlet_cycle(host: str, *, off_s: float = MIN_OFF_S, graceful: bool = True, 
     if off_s < MIN_OFF_S:
         raise OutletError(f"off time {off_s} s is under the {MIN_OFF_S:.0f} s minimum")
     uid = _uid(host)
+    if uid in C64U_IDS:
+        if graceful and not c64u_poweroff:
+            raise OutletError(f"{uid} is a C64U: poweroff() is unreachable there (hardware-safety rule 7), so a "
+                              "graceful cycle is refused; the outlet alone is cut by default. Pass "
+                              "c64u_poweroff=True (--c64u-poweroff) only when its power-on mode is ON.")
+        graceful = c64u_poweroff and graceful is not False
+    elif c64u_poweroff:
+        raise OutletError(f"{uid} is not a C64U; --c64u-poweroff does not apply")
+    else:
+        graceful = graceful is not False
     b = binding or outlet_binding(uid)
     if expect_git_hash is not None:
         expect_git_hash = jl.check_git_hash(expect_git_hash)
     outlet = (outlet_factory or (lambda bb: KINDS[bb["outlet_kind"]](bb["outlet"], host=host)))(b)
     rec = {"t0": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": host, "uid": uid, "action": "outlet_cycle",
-           "outlet": b["outlet"], "off_s": off_s}
+           "outlet": b["outlet"], "off_s": off_s, "graceful": graceful,
+           "c64u_poweroff": graceful and uid in C64U_IDS}
     if dry_run:
         rec["outlet_on"] = outlet.is_on()             # reads the plug only, never the Ultimate
         rec["result"] = "dry-run ok"
@@ -184,8 +197,9 @@ def outlet_cycle(host: str, *, off_s: float = MIN_OFF_S, graceful: bool = True, 
             rec["info"] = jl.wait_info(host, uid, expect_git_hash, up_timeout, client_factory, sleep, clock,
                                        products=jl.PRODUCTS + ("Ultimate 64 Elite", "Ultimate 64"))
         except jl.JtagLoadError as e:
-            hint = (" The C64U powers up after AC restore only if its power-on mode is ON (power_state.c:130-158);"
-                    " the graceful poweroff stored last-state OFF." if uid in C64U_IDS else
+            hint = (" The C64U powers up after AC restore by its power-on mode (power_state.c:130-158)"
+                    + ("; the poweroff stored last-state OFF, so only mode ON brings it back." if graceful else ".")
+                    if uid in C64U_IDS else
                     " Check whether this device powers up by itself when AC returns.")
             raise OutletError(f"{e}.{hint}") from e
         rec["result"] = "ok"
@@ -200,6 +214,9 @@ def main(argv=None) -> int:
     c.add_argument("--off-s", type=float, default=MIN_OFF_S)
     c.add_argument("--expect-hash", default=None)
     c.add_argument("--no-graceful", action="store_true")
+    c.add_argument("--c64u-poweroff", action="store_true",
+                   help="C64U only: send poweroff before cutting the outlet. Its ESP32 then stores last-state OFF, "
+                        "so the C64U powers up again only if its power-on mode is ON; check that first.")
     c.add_argument("--dry-run", action="store_true")
     s = sub.add_parser("status")
     s.add_argument("host")
@@ -210,8 +227,8 @@ def main(argv=None) -> int:
             b = outlet_binding(uid)
             out = {"uid": uid, **b, "on": KINDS[b["outlet_kind"]](b["outlet"]).is_on()}
         else:
-            out = outlet_cycle(a.host, off_s=a.off_s, graceful=not a.no_graceful, expect_git_hash=a.expect_hash,
-                               dry_run=a.dry_run)
+            out = outlet_cycle(a.host, off_s=a.off_s, graceful=False if a.no_graceful else None,
+                               c64u_poweroff=a.c64u_poweroff, expect_git_hash=a.expect_hash, dry_run=a.dry_run)
     except Exception as e:
         print(f"FAIL {type(e).__name__}: {e}", file=sys.stderr)
         return 2
