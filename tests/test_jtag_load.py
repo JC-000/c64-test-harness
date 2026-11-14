@@ -820,3 +820,16 @@ def test_the_parent_chain_is_read_from_the_process_table():
     assert not _u64_host._is_ancestor(os.getpid())
     assert not _u64_host._is_ancestor(2 ** 22 + 7)
     assert not _u64_host._is_ancestor(1)               # init/launchd is everyone's ancestor: never a lock shell
+
+
+def test_the_telnet_browser_refuses_unlocked_and_opens_under_the_lock(built, tmp_path, monkeypatch):
+    """_telnet_browser opens a UI session on the shared device's telnet menu: same guard as _client."""
+    opened = []
+    monkeypatch.setattr(jl, "_telnet_imports",       # the upstream checkout is not even imported unlocked
+                        lambda: opened.append("import") or ("telnet", lambda mode, host, **kw: opened.append(host) or "B"))
+    with pytest.raises(jl.DeviceLockNotHeldError):
+        jl._telnet_browser(GUARD_HOST)
+    assert opened == []
+    with jl._Locked(GUARD_HOST, {}, 5, real_locks(tmp_path)):
+        assert jl._telnet_browser(GUARD_HOST) == "B"
+    assert opened == ["import", GUARD_HOST]

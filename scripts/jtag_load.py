@@ -700,6 +700,7 @@ def _telnet_imports():
 
 def _telnet_browser(host: str):
     """The upstream e2e telnet UI driver (tests/e2e/lib), used only under our DeviceLock."""
+    require_device_lock(host, normalize=normalize_device_host)   # a UI session on the shared device's menu
     mode, make_browser = _telnet_imports()
     return make_browser(mode, host, telnet_width=60)
 
