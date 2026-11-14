@@ -2355,8 +2355,10 @@ def _device_lock_offenders(source: str, unlocked_functions=frozenset()) -> list[
 
     A node is also covered when its nearest enclosing function starts with
     the lock guard (:data:`_LOCK_GUARD`, imported from ``_u64_host``) and the
-    node is not inside that guard statement itself, or when that function is
-    named in *unlocked_functions* (see :data:`_UNLOCKED_FUNCTIONS`).
+    node is in a statement after the guard, or when that function is named
+    in *unlocked_functions* (see :data:`_UNLOCKED_FUNCTIONS`) and the node is
+    in its body. A lambda or generator expression in between is a scope of
+    its own, never covered this way.
 
     Known limits: functions are matched by bare name, so two same-named
     functions share one verdict; a call through an attribute
@@ -2407,12 +2409,19 @@ def _device_lock_offenders(source: str, unlocked_functions=frozenset()) -> list[
             # run before the lock is taken.
             if locking_with(parent) and child in parent.body:
                 return True
+            # A lambda or a generator expression is a scope that can run after
+            # its function returned, so neither the guard nor an exclusion of
+            # an enclosing function reaches into it.
+            if nearest_function and isinstance(parent, (ast.Lambda, ast.GeneratorExp)):
+                nearest_function = False
             if nearest_function and isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 nearest_function = False
-                if parent.name in unlocked_functions:
+                # Only statements of the body: default arguments, decorators
+                # and annotations are evaluated before the function runs.
+                if parent.name in unlocked_functions and child in parent.body:
                     return True
                 guard = _lock_guard_statement(parent) if guard_imported else None
-                if guard is not None and child is not guard:
+                if guard is not None and child in parent.body[parent.body.index(guard) + 1:]:
                     return True
             if (
                 isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -3517,6 +3526,9 @@ def test_the_lock_guard_shape_is_recognised_only_as_specified() -> None:
         "guarded http helper": (
             guard + "import urllib.request\n"
             + "def _switch(h, u):\n    require_device_lock(h)\n    return urllib.request.urlopen(u)\n"),
+        "list comprehension, evaluated under the guard": (
+            guard + client + "def _c(hs):\n    require_device_lock(hs[0])\n"
+            + "    return [Ultimate64Client(h) for h in hs]\n"),
     }
     for label, source in must_pass.items():
         assert not _device_lock_offenders(source), f"the lock scan refused: {label}"
@@ -3543,6 +3555,17 @@ def test_the_lock_guard_shape_is_recognised_only_as_specified() -> None:
             + "def _c(h):\n    require_device_lock(h)\n    return Ultimate64Client(h)\n"),
         "construct inside the guard statement itself": (
             guard + client + "def _c(h):\n    require_device_lock(Ultimate64Client(h))\n"),
+        # Evaluated before the guard runs, or after the function returned (review of eb465b2).
+        "client as a default argument": (
+            guard + client + "def _c(h, c=Ultimate64Client('h')):\n    require_device_lock(h)\n    return c\n"),
+        "client in a decorator": (
+            guard + client + "def deco(c):\n    return lambda f: f\n"
+            + "@deco(Ultimate64Client('h'))\ndef _c(h):\n    require_device_lock(h)\n"),
+        "client in a returned lambda": (
+            guard + client + "def _c(h):\n    require_device_lock(h)\n    return lambda: Ultimate64Client(h)\n"),
+        "client in a returned generator expression": (
+            guard + client + "def _c(hs):\n    require_device_lock(hs[0])\n"
+            + "    return (Ultimate64Client(h) for h in hs)\n"),
         "construct in a nested function of a guarded one": (
             guard + client + "def _c(h):\n    require_device_lock(h)\n"
             + "    def later():\n        return Ultimate64Client(h)\n    return later\n"),
@@ -3558,6 +3581,8 @@ def test_an_unlocked_function_exclusion_covers_only_that_function() -> None:
     offenders = _device_lock_offenders(src, frozenset({"_read_plug"}))
     assert len(offenders) == 1 and "line 5" in offenders[0], offenders
     assert len(_device_lock_offenders(src)) == 2
+    default_arg = "import urllib.request\ndef _read_plug(u, r=urllib.request.urlopen('x')):\n    return r\n"
+    assert _device_lock_offenders(default_arg, frozenset({"_read_plug"})), "a default argument is not the body"
 
 
 def test_every_unlocked_function_exclusion_names_a_real_device_reaching_function() -> None:
