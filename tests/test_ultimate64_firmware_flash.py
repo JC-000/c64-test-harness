@@ -39,13 +39,18 @@ from c64_test_harness.backends.ultimate64_firmware_flash import (
     inspect_update_image,
 )
 from c64_test_harness.backends.ultimate64_remote_menu import (
+    RemoteMenuLockError,
     RemoteMenuNotFoundError,
     RemoteMenuVerifyError,
     RunUpdateResult,
     WifiChangeResult,
     WifiStatus,
 )
-from c64_test_harness.backends.ultimate64_storage import StorageEntry, StoragePutResult
+from c64_test_harness.backends.ultimate64_storage import (
+    STOCK_ROM_NAMES,
+    StorageEntry,
+    StoragePutResult,
+)
 
 HOST = "127.0.0.1"
 LOAD = 0x03000000
@@ -224,9 +229,22 @@ class FakeStorage:
 
     def put_rom(self, host, kind, name, data, *, overwrite=False, replace_stock=False,
                 check_signature=True, **kw):
+        # Models storage_put_rom's refusals: an existing file (matched
+        # ASCII-casefolded, kept in its device spelling) needs overwrite, and
+        # a stock name also needs replace_stock.
         self.events.append(("put_rom", kind, name))
         path = f"/Flash/roms/{name}"
-        return StoragePutResult(path, len(data), hashlib.sha256(data).hexdigest(), True, False)
+        hit = [p for p in self.files if p.lower() == path.lower()]
+        if hit:
+            path = hit[0]
+            if name.lower() in STOCK_ROM_NAMES and not replace_stock:
+                raise FileExistsError(f"{path} is a firmware stock ROM file; pass "
+                                      "overwrite=True, replace_stock=True")
+            if not overwrite:
+                raise FileExistsError(path)
+        self.files[path] = bytes(data)
+        return StoragePutResult(path, len(data), hashlib.sha256(data).hexdigest(), True,
+                                bool(hit))
 
 
 @dataclass
@@ -249,6 +267,7 @@ class Rig:
             return FakeClient(infos, self.events)
 
         kw.setdefault("confirm_device_powers_off", True)
+        kw.setdefault("reformat_flash_disk", False)
         return flash_firmware(HOST, image, client_factory=client_factory,
                               menu_factory=lambda h: self.menu, **kw)
 
@@ -1019,3 +1038,197 @@ def test_an_enable_that_fails_after_a_clean_read_is_a_step_error(rig, held, tmp_
     assert ei.value.record.failed_step == "wifi_ident"
     assert ei.value.__cause__ is exc
     assert "left Disabled" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Peer requests (1541ultimate lane, 2026-11-13)
+# ---------------------------------------------------------------------------
+
+# -- read_wifi_ident: public, outside a flash ------------------------------
+
+IDENT = "ESP32 WiFi Bridge V1.494"
+
+
+def _read_ident(events, **menu_kw):
+    menu = FakeMenu(events, **menu_kw)
+    return ff.read_wifi_ident(HOST, link_timeout_s=20, poll_interval_s=5,
+                              menu_factory=lambda h: menu)
+
+
+def _toggles(events):
+    return [e for e in events if isinstance(e, tuple) and e[0] == "set_wifi_enabled"]
+
+
+def test_read_wifi_ident_refuses_without_the_lock_before_any_traffic(rig):
+    made = []
+
+    def factory(h):
+        made.append(h)
+        return FakeMenu(rig.events)
+
+    with pytest.raises(RemoteMenuLockError):
+        ff.read_wifi_ident(HOST, menu_factory=factory)
+    assert rig.events == [] and made == []
+
+
+def test_read_wifi_ident_cycles_wifi_and_leaves_it_link_up(rig, held):
+    got = _read_ident(rig.events, wifi_seq=[wifi("link-up"), wifi("link-down"), wifi("link-up")])
+    assert got.ident == IDENT
+    assert got.before.state == "link-up" and got.after.state == "link-up"
+    assert got.toggled is True
+    assert _toggles(rig.events) == [("set_wifi_enabled", False), ("set_wifi_enabled", True)]
+
+
+def test_read_wifi_ident_on_a_disabled_row_reads_it_and_toggles_nothing(rig, held):
+    menu = FakeMenu(rig.events)
+    menu.enabled = False
+    got = ff.read_wifi_ident(HOST, menu_factory=lambda h: menu)
+    assert got.ident == IDENT and got.toggled is False
+    assert got.before.state == "disabled" and got.after.state == "disabled"
+    assert _toggles(rig.events) == []
+
+
+def test_read_wifi_ident_puts_wifi_back_when_the_disable_failed_unclearly(rig, held):
+    exc = ConnectionResetError(54, "reset")
+    with pytest.raises(ConnectionResetError):
+        _read_ident(rig.events, disable_exc=exc)
+    assert _toggles(rig.events) == [("set_wifi_enabled", False), ("set_wifi_enabled", True)]
+
+
+def test_read_wifi_ident_does_not_enable_when_the_disable_was_never_sent(rig, held):
+    exc = RemoteMenuVerifyError("refused before the ENTER", enter_sent=False)
+    with pytest.raises(RemoteMenuVerifyError):
+        _read_ident(rig.events, disable_exc=exc)
+    assert _toggles(rig.events) == [("set_wifi_enabled", False)]
+
+
+def test_read_wifi_ident_link_up_timeout_carries_the_reading(rig, held):
+    with pytest.raises(ff.WifiLinkTimeoutError) as ei:
+        _read_ident(rig.events, wifi_seq=[wifi("link-up"), wifi("link-down")])
+    assert ei.value.reading.ident == IDENT
+    assert ei.value.reading.after.state == "link-down"
+    assert ("set_wifi_enabled", True) in rig.events
+
+
+def test_read_wifi_ident_refuses_a_row_with_no_ident_to_read(rig, held):
+    with pytest.raises(ff.WifiIdentUnreadableError):
+        _read_ident(rig.events, wifi_seq=[wifi("busy")])
+    assert _toggles(rig.events) == []
+
+
+# -- ROMs already present with the expected content -------------------------
+
+def _stock_kernal(tmp_path: Path, **kw) -> RomImage:
+    p = write_image(tmp_path, "kernal.bin", KERNAL)
+    return RomImage("kernal", "kernal.bin", p, hashlib.sha256(KERNAL).hexdigest(), **kw)
+
+
+def test_a_rom_already_present_unchanged_is_not_written(rig, held, tmp_path):
+    rig.storage.files["/Flash/roms/KERNAL.BIN"] = KERNAL
+    rec = rig.run(make_image(tmp_path), roms=[_stock_kernal(tmp_path)])
+    assert "put_rom" not in rig.names()
+    assert rec.roms == [] and rec.roms_unchanged == ["/Flash/roms/KERNAL.BIN"]
+    assert "reboot" not in rig.events and rec.rebooted is False
+    assert rec.steps[-1] == "roms"
+
+
+def test_unchanged_roms_after_the_category_reset_still_reboot(rig, held, tmp_path):
+    # reset_categories puts the ROM selection back in RAM, and a config change
+    # does not reload ROMs (1.1.0 c64.cc:267-275); only reboot() applies it.
+    rig.infos = [info(), dict(OFFICIAL_INFO)]
+    rig.storage.files["/Flash/roms/kernal.bin"] = KERNAL
+    rec = rig.run(make_image(tmp_path, kind="official"), roms=[_stock_kernal(tmp_path)])
+    assert "put_rom" not in rig.names() and rec.roms_unchanged == ["/Flash/roms/kernal.bin"]
+    names = rig.names()
+    assert names.index("apply_factory_baseline") < names.index("reboot")
+    assert rec.rebooted and names[names.index("reboot") + 1] == "get_info"
+    assert rec.steps[-1] == "roms"
+
+
+def test_a_stock_rom_with_other_content_still_needs_replace_stock(rig, held, tmp_path):
+    other = bytearray(KERNAL)
+    other[100] ^= 0xFF
+    rig.storage.files["/Flash/roms/kernal.bin"] = bytes(other)
+    with pytest.raises(FirmwareFlashStepError, match="stock") as ei:
+        rig.run(make_image(tmp_path), roms=[_stock_kernal(tmp_path)])
+    assert ei.value.record.failed_step == "roms"
+    assert ("get_file", "/Flash/roms/kernal.bin") in rig.events   # it was compared
+    assert rig.storage.files["/Flash/roms/kernal.bin"] == bytes(other)
+    assert "reboot" not in rig.events
+
+
+def test_a_changed_rom_is_written_and_the_c64_rebooted(rig, held, tmp_path):
+    basic = b"\x00" * 4 + b"CBMBASIC" + bytes(8180)
+    rig.storage.files["/Flash/roms/kernal.bin"] = KERNAL
+    rig.storage.files["/Flash/roms/basic.bin"] = bytes(8192)
+    bp = write_image(tmp_path, "basic.bin", basic)
+    roms = [_stock_kernal(tmp_path),
+            RomImage("basic", "basic.bin", bp, hashlib.sha256(basic).hexdigest(),
+                     overwrite=True, replace_stock=True)]
+    rec = rig.run(make_image(tmp_path), roms=roms)
+    assert [e for e in rig.events if isinstance(e, tuple) and e[0] == "put_rom"] == [
+        ("put_rom", "basic", "basic.bin")]
+    assert rec.roms_unchanged == ["/Flash/roms/kernal.bin"]
+    assert [r.path for r in rec.roms] == ["/Flash/roms/basic.bin"]
+    assert rec.rebooted and rig.storage.files["/Flash/roms/basic.bin"] == basic
+
+
+def test_a_rom_of_another_size_is_not_read_back_before_the_write(rig, held, tmp_path):
+    rig.storage.files["/Flash/roms/kernal.bin"] = bytes(4096)
+    with pytest.raises(FirmwareFlashStepError, match="stock"):
+        rig.run(make_image(tmp_path), roms=[_stock_kernal(tmp_path)])
+    assert not any(isinstance(e, tuple) and e[0] == "get_file" for e in rig.events)
+
+
+# -- "Reformat Flash Disk?": the caller chooses ----------------------------
+
+def test_omitting_the_reformat_answer_fails_before_any_traffic(rig, held, tmp_path):
+    with pytest.raises(TypeError, match="reformat_flash_disk"):
+        flash_firmware(HOST, make_image(tmp_path), confirm_device_powers_off=True,
+                       client_factory=lambda h: rig.client_made.append(h),
+                       menu_factory=lambda h: rig.events.append("menu"))
+    assert rig.events == [] and rig.client_made == []
+
+
+@pytest.mark.parametrize("bad", [None, "YES", 1, 0])
+def test_a_reformat_answer_that_is_not_a_bool_is_refused(rig, held, tmp_path, bad):
+    with pytest.raises(FirmwareFlashRefusedError, match="reformat_flash_disk") as ei:
+        rig.run(make_image(tmp_path, kind="dev"), reformat_flash_disk=bad)
+    assert rig.events == [] and rig.client_made == []
+    assert ei.value.record.failed_step == "validate"
+
+
+def _reformat_line(text: str) -> str:
+    return next(line for line in text.splitlines() if "Reformat Flash Disk?" in line)
+
+
+@pytest.mark.parametrize("answer, word", [(False, "NO"), (True, "YES")])
+def test_the_reformat_answer_reaches_the_operator_and_the_record(rig, held, tmp_path,
+                                                                answer, word):
+    rec = rig.run(make_image(tmp_path, kind="dev"), reformat_flash_disk=answer)
+    assert rec.reformat_flash_disk is answer
+    assert _reformat_line(rec.operator_instruction).rstrip().endswith(word)
+
+
+def test_operator_instruction_needs_the_reformat_answer():
+    with pytest.raises(TypeError):
+        ff.operator_instruction("c64u", "dev")
+    no = ff.operator_instruction("c64u", "dev", reformat_flash_disk=False)
+    yes = ff.operator_instruction("c64u", "dev", reformat_flash_disk=True)
+    assert _reformat_line(no).rstrip().endswith("NO")
+    assert _reformat_line(yes).rstrip().endswith("YES")
+
+
+def test_read_wifi_ident_found_at_link_down_is_restored_at_link_down(rig, held):
+    # A module with no access point to join: it starts and stays Link Down.
+    got = _read_ident(rig.events, wifi_seq=[wifi("link-down")])
+    assert got.ident == IDENT and got.toggled is True
+    assert got.before.state == "link-down" and got.after.state == "link-down"
+    assert _toggles(rig.events) == [("set_wifi_enabled", False), ("set_wifi_enabled", True)]
+
+
+def test_the_flash_wifi_step_still_needs_link_up_from_link_down(rig, held, tmp_path):
+    image = make_image(tmp_path, ident=IDENT)
+    with pytest.raises(FirmwareFlashTimeoutError, match="Link Up") as ei:
+        rig.run(image, wifi_link_timeout_s=20, menu_kw={"wifi_seq": [wifi("link-down")]})
+    assert ei.value.record.failed_step == "wifi_ident"
