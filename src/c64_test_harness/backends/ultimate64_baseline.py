@@ -10,7 +10,8 @@ The contract, as decided by the owner in #227:
 
 * **The baseline is the firmware's factory default.**  Every flash on the
   bench answers YES to Reset Configuration, which is what keeps flash ==
-  defaults, so power-on and ``reset_to_default`` converge on the same
+  defaults (except an official C64U image, answered NO, after which
+  ``flash_firmware`` resets the non-network categories in RAM only), so power-on and ``reset_to_default`` converge on the same
   state; Reformat Flash Disk is NO by default and YES only when a test
   needs it (owner, 2026-11-14).  There is no
   harness-owned table: each item map carries its own ``default``
