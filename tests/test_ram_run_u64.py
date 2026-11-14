@@ -284,6 +284,21 @@ def test_the_menu_path_itself_refuses_a_plain_image(menu):
     assert e.value.stage == "image" and fake.connect_attempts == 0
 
 
+def test_a_missing_file_in_a_long_listing_stops_at_the_end_of_it(env, menu):
+    """The upload did not land in the /USB1 of the failing runs: the search pages down once past the last screen,
+    sees nothing move, and stops. Bounded in keys sent to a menu that other lanes share, not in wall time."""
+    ev = env[0]
+    fake, factory = menu({"/USB1/": list(USB1_LONG)})
+    with pytest.raises(jl.JtagLoadError) as e:
+        run(env, [info("218e36a52")], (fake, factory), storage=Storage(ev, fake, listed=False))
+    assert e.value.stage == "menu" and "RemoteMenuNotFoundError" in str(e.value) and "not in /USB1/" in str(e.value)
+    (s,) = fake.sessions
+    pages = -(-len(USB1_LONG) // (21 // 2))           # PAGEDOWN moves half the 21-row window (tree_browser.cc)
+    # 2 DOWN + RIGHT to reach /USB1, one PAGEUP that finds the top, the pages, and one PAGEDOWN that moves nothing.
+    assert s.keys.count("PAGEDOWN") <= pages + 1 and len(s.keys) <= 2 + 1 + 1 + pages + 1, s.keys
+    assert fake.all_commits() == [] and ("delete", "/USB1/rr17995f.u64") in ev
+
+
 def test_a_key_that_moves_nothing_stops_the_search(env, menu):
     """The cursor is read back after every key: a DOWN that drew nothing is not resent, and nothing is run."""
     ev = env[0]
