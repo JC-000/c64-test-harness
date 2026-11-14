@@ -33,6 +33,8 @@ class _FakeFTPServer:
         self.empty_slots: set[str] = set()
         #: MLST of a missing path: 501 at 1.1.0, 550 at 3a1ff9ff (ftpd.cc)
         self.mlst_missing = "501 Syntax error in parameters or arguments."
+        #: RNFR/RNTO answers success but leaves the file where it was
+        self.rename_noop = False
 
 
 _MOUNTABLE = (".d64", ".d71", ".d81", ".dnp", ".t64", ".iso", ".fat")
@@ -163,6 +165,15 @@ class _FakeFTP:
         ):
             raise ftplib.error_perm("550 Requested action not taken.")
         self.server.dirs.discard(path)
+        return "250 OK"
+
+    def rename(self, src, dst):
+        self.server.log.append(f"RNFR {src}")
+        self.server.log.append(f"RNTO {dst}")
+        if src not in self.server.files:
+            raise ftplib.error_perm("550 Requested action not taken.")
+        if not self.server.rename_noop:
+            self.server.files[dst] = self.server.files.pop(src)
         return "250 OK"
 
     def delete(self, path):
@@ -1302,3 +1313,92 @@ def test_a_restore_that_reads_back_wrong_says_so(server):
         with patch.object(_FakeFTP, "retrbinary", retr):
             with pytest.raises(st.Ultimate64StorageError, match="previous file is gone"):
                 st.storage_put_file("dev", "/SD/x.bin", DATA, overwrite=True)
+
+
+# -- storage_rename_file (RNFR/RNTO on one volume, verified) ----------------------------------------------------
+
+def _renames(server):
+    return [e for e in server.log if e.startswith(("RNFR", "RNTO"))]
+
+
+def test_rename_moves_the_file_and_verifies(server):
+    server.dirs.add("/SD/old")
+    server.files["/SD/cu_1.ue2"] = b"img"
+    st.storage_rename_file("dev", "/SD/cu_1.ue2", "/SD/old/cu_1.ue2")
+    assert server.files == {"/SD/old/cu_1.ue2": b"img"}
+    assert _renames(server) == ["RNFR /SD/cu_1.ue2", "RNTO /SD/old/cu_1.ue2"]
+
+
+def test_rename_across_volumes_is_refused_before_connecting(server):
+    server.files["/SD/a.bin"] = b"a"
+    with pytest.raises(ValueError, match="across volumes"):
+        st.storage_rename_file("dev", "/SD/a.bin", "/USB1/a.bin")
+    assert server.connects == 0 and server.files == {"/SD/a.bin": b"a"}
+
+
+def test_rename_onto_an_existing_file_is_refused(server):
+    server.files["/SD/a.bin"] = b"a"
+    server.files["/SD/b.bin"] = b"b"
+    with pytest.raises(FileExistsError):
+        st.storage_rename_file("dev", "/SD/a.bin", "/SD/b.bin")
+    assert server.files == {"/SD/a.bin": b"a", "/SD/b.bin": b"b"} and _renames(server) == []
+
+
+def test_rename_of_a_directory_is_refused(server):
+    server.dirs.add("/SD/games")
+    with pytest.raises(IsADirectoryError):
+        st.storage_rename_file("dev", "/SD/games", "/SD/old-games")
+    assert "/SD/games" in server.dirs and _renames(server) == []
+
+
+def test_rename_of_a_missing_file_or_into_a_missing_folder_is_refused(server):
+    with pytest.raises(FileNotFoundError):
+        st.storage_rename_file("dev", "/SD/none.bin", "/SD/x.bin")
+    server.files["/SD/a.bin"] = b"a"
+    with pytest.raises(FileNotFoundError):
+        st.storage_rename_file("dev", "/SD/a.bin", "/SD/nofolder/a.bin")
+    assert _renames(server) == []
+
+
+@pytest.mark.parametrize("src, dst", [
+    ("/Temp/a.bin", "/Temp/b.bin"), ("/SD/a.bin", "/Temp/a.bin"), ("/Temp/a.bin", "/SD/a.bin"),
+    ("/Flash/a.bin", "/Flash/b.bin"), ("/SD/a.bin", "/Flash/a.bin"), ("/Flash/roms/a.bin", "/SD/a.bin"),
+    # the other write rules hold for each side on its own: a '.'-name, a trailing dot
+    ("/SD/.a.bin", "/SD/b.bin"), ("/SD/a.bin", "/SD/.b.bin"), ("/SD/a.bin.", "/SD/b.bin"), ("/SD/a.bin", "/SD/b."),
+])
+def test_rename_against_the_write_rules_never_connects(server, src, dst):
+    with pytest.raises(ValueError):
+        st.storage_rename_file("dev", src, dst)
+    assert server.connects == 0
+
+
+def test_rename_that_did_not_take_is_an_error(server):
+    server.files["/SD/a.bin"] = b"a"
+    server.rename_noop = True
+    with pytest.raises(st.Ultimate64StorageError, match="did not take"):
+        st.storage_rename_file("dev", "/SD/a.bin", "/SD/b.bin")
+
+
+def test_rename_that_copied_instead_of_moving_is_an_error(server):
+    server.files["/SD/a.bin"] = b"a"
+    real = _FakeFTP.rename
+
+    def copy_only(self, src, dst):
+        real(self, src, dst)
+        self.server.files[src] = self.server.files[dst]
+    with patch.object(_FakeFTP, "rename", copy_only):
+        with pytest.raises(st.Ultimate64StorageError, match="did not take"):
+            st.storage_rename_file("dev", "/SD/a.bin", "/SD/b.bin")
+
+
+def test_rename_requires_the_lock():
+    with patch.object(st, "lock_held_for", lambda host: False), patch.object(st, "FTP") as ftp:
+        with pytest.raises(st.Ultimate64StorageError):
+            st.storage_rename_file("dev", "/SD/a.bin", "/SD/b.bin")
+    ftp.assert_not_called()
+
+
+def test_rename_is_exported_at_the_package_root():
+    import c64_test_harness
+    assert c64_test_harness.storage_rename_file is st.storage_rename_file
+    assert "storage_rename_file" in c64_test_harness.__all__ and "storage_rename_file" in st.__all__

@@ -2247,6 +2247,23 @@ _DEVICE_CALLEES = frozenset({
 #: ``with`` context expressions that hold the device for their body.
 _LOCKING_WITH_CALLEES = frozenset({"hold_device_lock", "create_manager"})
 
+#: A fourth shape, for code that reaches a device through an injected factory
+#: (``client_factory=_client``), where no ``with`` can sit around the
+#: construct: the function's first statement (after a docstring) is a call to
+#: ``_u64_host.require_device_lock``, which refuses unless the DeviceLock is
+#: already held by this process or its lock shell. Recognised only when that
+#: name is imported from ``_u64_host`` unaliased and nothing else in the module
+#: binds it; the guard's body is not analysed here (its own tests pin it).
+_LOCK_GUARD = "require_device_lock"
+
+#: Functions, per script, that reach something other than an Ultimate and so
+#: need no DeviceLock, with the reason. The lock scan skips constructs whose
+#: nearest enclosing function is named here; everything else in the script is
+#: scanned as usual.
+_UNLOCKED_FUNCTIONS = {
+    "power_outlet.py": {"_read_plug": "reads the plug only; never switches power"},
+}
+
 _ACQUIRE_METHODS = frozenset({"acquire", "acquire_or_raise"})
 
 
@@ -2278,7 +2295,46 @@ def _parents(tree: ast.AST) -> dict[ast.AST, ast.AST]:
     return parents
 
 
-def _device_lock_offenders(source: str) -> list[str]:
+def _lock_guard_imported(tree: ast.AST) -> bool:
+    """``from _u64_host import require_device_lock`` and no other binding of that name."""
+    from_host = False
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom):
+            for a in n.names:
+                if (a.asname or a.name) == _LOCK_GUARD:
+                    if n.module == "_u64_host" and a.name == _LOCK_GUARD and a.asname is None:
+                        from_host = True
+                    else:
+                        return False
+        elif isinstance(n, ast.Import):
+            if any((a.asname or a.name.split(".")[0]) == _LOCK_GUARD for a in n.names):
+                return False
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if n.name == _LOCK_GUARD:
+                return False
+        elif isinstance(n, ast.Name) and n.id == _LOCK_GUARD and not isinstance(n.ctx, ast.Load):
+            return False
+        elif isinstance(n, ast.arg) and n.arg == _LOCK_GUARD:
+            return False
+    return from_host
+
+
+def _lock_guard_statement(fn: ast.AST) -> ast.stmt | None:
+    """*fn*'s first statement after a docstring, when it is a bare ``require_device_lock(...)`` call."""
+    body = list(fn.body)
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+            and isinstance(body[0].value.value, str):
+        body = body[1:]
+    if not body:
+        return None
+    first = body[0]
+    if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Call)
+            and isinstance(first.value.func, ast.Name) and first.value.func.id == _LOCK_GUARD):
+        return first
+    return None
+
+
+def _device_lock_offenders(source: str, unlocked_functions=frozenset()) -> list[str]:
     """Every device-reaching construct in *source* not held under the lock.
 
     A node is **covered** when it is lexically inside the body of a ``with``
@@ -2296,6 +2352,13 @@ def _device_lock_offenders(source: str) -> list[str]:
     or ``with Ultimate64Transport(...) as t``) and then referenced after the
     block, in the same scope, is flagged too: the construction was locked but
     the ``c.reset()`` in a trailing ``finally`` is not.
+
+    A node is also covered when its nearest enclosing function starts with
+    the lock guard (:data:`_LOCK_GUARD`, imported from ``_u64_host``) and the
+    node is in a statement after the guard, or when that function is named
+    in *unlocked_functions* (see :data:`_UNLOCKED_FUNCTIONS`) and the node is
+    in its body. A lambda or generator expression in between is a scope of
+    its own, never covered this way.
 
     Known limits: functions are matched by bare name, so two same-named
     functions share one verdict; a call through an attribute
@@ -2336,14 +2399,30 @@ def _device_lock_offenders(source: str) -> list[str]:
             call_sites[node.func.id].append(node)
 
     covered_functions: set[str] = set()
+    guard_imported = _lock_guard_imported(tree)
 
     def covered(node: ast.AST) -> bool:
         child, parent = node, parents.get(node)
+        nearest_function = True
         while parent is not None:
             # Only the *body* of a with is held; its context expressions
             # run before the lock is taken.
             if locking_with(parent) and child in parent.body:
                 return True
+            # A lambda or a generator expression is a scope that can run after
+            # its function returned, so neither the guard nor an exclusion of
+            # an enclosing function reaches into it.
+            if nearest_function and isinstance(parent, (ast.Lambda, ast.GeneratorExp)):
+                nearest_function = False
+            if nearest_function and isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                nearest_function = False
+                # Only statements of the body: default arguments, decorators
+                # and annotations are evaluated before the function runs.
+                if parent.name in unlocked_functions and child in parent.body:
+                    return True
+                guard = _lock_guard_statement(parent) if guard_imported else None
+                if guard is not None and child in parent.body[parent.body.index(guard) + 1:]:
+                    return True
             if (
                 isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef))
                 and parent.name in covered_functions
@@ -2562,7 +2641,8 @@ def _scripts_only() -> list[Path]:
 @pytest.mark.parametrize("script_path", _scripts_only(), ids=lambda p: p.name)
 def test_every_script_holds_the_device_lock(script_path: Path) -> None:
     """No script reaches a device without holding its ``DeviceLock`` (#244)."""
-    offenders = _device_lock_offenders(script_path.read_text())
+    offenders = _device_lock_offenders(
+        script_path.read_text(), frozenset(_UNLOCKED_FUNCTIONS.get(script_path.name, {})))
     assert not offenders, (
         f"{script_path.name} drives a device without the DeviceLock. Wrap "
         f"the device work in `with hold_device_lock(host):` from "
@@ -2575,6 +2655,8 @@ def test_every_script_holds_the_device_lock(script_path: Path) -> None:
 #: them it is scanning nothing it could fail on.
 _KNOWN_DEVICE_SCRIPTS = frozenset({
     "bench_x25519_u64_turbo.py",
+    "jtag_load.py",
+    "power_outlet.py",
     "play_chromatic_u64.py",
     "play_scale_u64.py",
     "probe_u64.py",
@@ -3401,6 +3483,12 @@ _LOCK_PROBED_SCRIPTS = (
 _LOCK_PROBE_EXCLUDED = {
     "verify_tod_warp.py": "launches VICE before its U64 case; the first "
     "breach is that spawn, which is local, not device traffic",
+    "jtag_load.py": "needs an ESP32 JTAG adapter bound to the device (and the "
+    "pinned images) before its first device contact; the AST scan and the "
+    "require_device_lock tests cover it",
+    "power_outlet.py": "needs a switched outlet bound to the device in "
+    "devices.toml before its first contact; the AST scan and the "
+    "require_device_lock tests cover it",
 }
 
 
@@ -3424,3 +3512,87 @@ def test_the_lock_probe_covers_every_device_script() -> None:
     assert set(_LOCK_PROBED_SCRIPTS) | set(_LOCK_PROBE_EXCLUDED) == _KNOWN_DEVICE_SCRIPTS
     assert not set(_LOCK_PROBED_SCRIPTS) & set(_LOCK_PROBE_EXCLUDED)
     assert len(_LOCK_PROBED_SCRIPTS) >= 5
+
+
+def test_the_lock_guard_shape_is_recognised_only_as_specified() -> None:
+    """``require_device_lock`` as the first statement covers the function (injected-factory scripts). Planted
+    regressions: guard not first, a local look-alike, no guard, the guard imported from elsewhere or aliased."""
+    guard = "from _u64_host import require_device_lock\n"
+    client = "from c64_test_harness.backends.ultimate64_client import Ultimate64Client\n"
+    must_pass = {
+        "guard first": guard + client + "def _c(h):\n    require_device_lock(h)\n    return Ultimate64Client(h)\n",
+        "guard after a docstring": (
+            guard + client + "def _c(h):\n    '''Doc.'''\n    require_device_lock(h)\n    return Ultimate64Client(h)\n"),
+        "guarded http helper": (
+            guard + "import urllib.request\n"
+            + "def _switch(h, u):\n    require_device_lock(h)\n    return urllib.request.urlopen(u)\n"),
+        "list comprehension, evaluated under the guard": (
+            guard + client + "def _c(hs):\n    require_device_lock(hs[0])\n"
+            + "    return [Ultimate64Client(h) for h in hs]\n"),
+    }
+    for label, source in must_pass.items():
+        assert not _device_lock_offenders(source), f"the lock scan refused: {label}"
+    must_flag = {
+        "guard not first": (
+            guard + client + "def _c(h):\n    c = Ultimate64Client(h)\n    require_device_lock(h)\n    return c\n"),
+        "guard after another statement": (
+            guard + client + "def _c(h):\n    x = 1\n    require_device_lock(h)\n    return Ultimate64Client(h)\n"),
+        "a same-named local function that does not check": (
+            client + "def require_device_lock(h):\n    pass\n"
+            + "def _c(h):\n    require_device_lock(h)\n    return Ultimate64Client(h)\n"),
+        "imported, then shadowed by a local function": (
+            guard + client + "def require_device_lock(h):\n    pass\n"
+            + "def _c(h):\n    require_device_lock(h)\n    return Ultimate64Client(h)\n"),
+        "guard missing": client + "def _c(h):\n    return Ultimate64Client(h)\n",
+        "guard imported from somewhere else": (
+            "from elsewhere import require_device_lock\n" + client
+            + "def _c(h):\n    require_device_lock(h)\n    return Ultimate64Client(h)\n"),
+        "guard aliased": (
+            "from _u64_host import require_device_lock as rdl\n" + client
+            + "def _c(h):\n    rdl(h)\n    return Ultimate64Client(h)\n"),
+        "another function imported under the guard's name": (
+            "from _u64_host import hold_device_lock as require_device_lock\n" + client
+            + "def _c(h):\n    require_device_lock(h)\n    return Ultimate64Client(h)\n"),
+        "construct inside the guard statement itself": (
+            guard + client + "def _c(h):\n    require_device_lock(Ultimate64Client(h))\n"),
+        # Evaluated before the guard runs, or after the function returned (review of eb465b2).
+        "client as a default argument": (
+            guard + client + "def _c(h, c=Ultimate64Client('h')):\n    require_device_lock(h)\n    return c\n"),
+        "client in a decorator": (
+            guard + client + "def deco(c):\n    return lambda f: f\n"
+            + "@deco(Ultimate64Client('h'))\ndef _c(h):\n    require_device_lock(h)\n"),
+        "client in a returned lambda": (
+            guard + client + "def _c(h):\n    require_device_lock(h)\n    return lambda: Ultimate64Client(h)\n"),
+        "client in a returned generator expression": (
+            guard + client + "def _c(hs):\n    require_device_lock(hs[0])\n"
+            + "    return (Ultimate64Client(h) for h in hs)\n"),
+        "construct in a nested function of a guarded one": (
+            guard + client + "def _c(h):\n    require_device_lock(h)\n"
+            + "    def later():\n        return Ultimate64Client(h)\n    return later\n"),
+    }
+    for label, source in must_flag.items():
+        assert _device_lock_offenders(source), f"the lock scan missed: {label}"
+
+
+def test_an_unlocked_function_exclusion_covers_only_that_function() -> None:
+    src = ("import urllib.request\n"
+           "def _read_plug(u):\n    return urllib.request.urlopen(u)\n"
+           "def _write_plug(u):\n    return urllib.request.urlopen(u)\n")
+    offenders = _device_lock_offenders(src, frozenset({"_read_plug"}))
+    assert len(offenders) == 1 and "line 5" in offenders[0], offenders
+    assert len(_device_lock_offenders(src)) == 2
+    default_arg = "import urllib.request\ndef _read_plug(u, r=urllib.request.urlopen('x')):\n    return r\n"
+    assert _device_lock_offenders(default_arg, frozenset({"_read_plug"})), "a default argument is not the body"
+
+
+def test_every_unlocked_function_exclusion_names_a_real_device_reaching_function() -> None:
+    for script, functions in _UNLOCKED_FUNCTIONS.items():
+        tree = ast.parse((_SCRIPTS / script).read_text())
+        aliases = _import_aliases(tree)
+        for name, reason in functions.items():
+            assert reason, (script, name)
+            defs = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and n.name == name]
+            assert len(defs) == 1, f"{script}: exclusion {name!r} matches {len(defs)} functions"
+            assert any(isinstance(n, ast.Call) and _callee_name(n, aliases) in _DEVICE_CALLEES
+                       for n in ast.walk(defs[0])), f"{script}: {name!r} reaches nothing; drop the exclusion"
