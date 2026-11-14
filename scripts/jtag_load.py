@@ -6,8 +6,9 @@ image (``ultimate.bin``, linked at 0x30000) in DRAM; the bootloader in the new b
 and jumps to it. The flashed firmware comes back on the next power cycle. Between two loads no power cycle is
 needed: every load starts with JPROGRAM.
 
-Design: docs/design/jtag_recovery.md (branch design/flashing-and-jtag). Adapter: an ESP32 running esp-jtag
-(``~/Documents/1541u-tools/esp-jtag``, ``host/esp_recover.py`` is imported, not copied).
+Design: docs/design/jtag_recovery.md (branch design/flashing-and-jtag). Adapter: an ESP32 running esp-jtag; its
+kit's ``host/esp_recover.py`` is imported, not copied, from ``$ESP_JTAG_DIR``. The telnet power cycle uses the
+1541ultimate e2e telnet driver from ``$C64U_TESTS_DIR`` (a checkout's ``tests/`` folder). Neither has a default.
 
 Library use (a test script looping over N images)::
 
@@ -60,8 +61,17 @@ sys.path.insert(0, str(HERE))
 from _u64_host import (  # noqa: E402
     DeviceLockNotHeldError, LockShellClaimError, lock_shell_holds, require_device_lock)
 
-ESP_JTAG_HOST = Path(os.environ.get("ESP_JTAG_DIR", "~/Documents/1541u-tools/esp-jtag")).expanduser() / "host"
-UPSTREAM_TESTS = Path(os.environ.get("C64U_TESTS_DIR", "~/Documents/1541ultimate/tests")).expanduser()
+
+
+def _env_dir(var: str, what: str) -> Path:
+    """The directory named by the environment variable *var*; refused when unset or not a directory."""
+    value = os.environ.get(var)
+    if not value:
+        raise JtagLoadError("setup", f"{var} is not set: point it at {what}")
+    path = Path(value).expanduser()
+    if not path.is_dir():
+        raise JtagLoadError("setup", f"{var}={value} is not a directory: point it at {what}")
+    return path
 
 # One kit, wired to one device. Key: the device's /v1/info unique_id (the DeviceLock key is uid-<lowercase>).
 # The adapter is selected by its USB LOCATION (pyserial list_ports .location), never by the /dev name: CP2102 bridges
@@ -135,9 +145,10 @@ def _log(msg: str) -> None:
 
 
 def esp_module():
-    """Import esp_recover from the esp-jtag kit."""
-    if str(ESP_JTAG_HOST) not in sys.path:
-        sys.path.insert(0, str(ESP_JTAG_HOST))
+    """Import esp_recover from the esp-jtag kit ($ESP_JTAG_DIR)."""
+    host_dir = _env_dir("ESP_JTAG_DIR", "the esp-jtag kit (the folder that holds host/esp_recover.py)") / "host"
+    if str(host_dir) not in sys.path:
+        sys.path.insert(0, str(host_dir))
     return importlib.import_module("esp_recover")
 
 
@@ -690,7 +701,8 @@ def rehearse_power_cycle(host: str, *, lock_timeout: float = 600, lock_factory=D
 
 
 def _telnet_imports():
-    for p in (UPSTREAM_TESTS, UPSTREAM_TESTS / "e2e" / "lib"):
+    tests = _env_dir("C64U_TESTS_DIR", "the tests/ folder of a 1541ultimate checkout (it holds e2e/lib)")
+    for p in (tests, tests / "e2e" / "lib"):
         if str(p) not in sys.path:
             sys.path.insert(0, str(p))
     from backend import MODE_TELNET

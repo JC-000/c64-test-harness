@@ -90,10 +90,10 @@ def ramrun_image(app=b"\xa5" * 64):
     return rec(APP, app, 0) + rec(STUB, stub(len(app)), STUB)
 
 
-# /USB1 as the failing runs drew it (printer-uaf loop-fix2.log and loop-master.log, 2026-11-13; review-fixes-1110
-# wifi-tx/flash/select.txt, 2026-11-10): directories first, then the files. Upstream select_entry's default bound
+# /USB1 as the failing runs' logged screens drew it (2026-11-13, twice, and 2026-11-10): directories first, then
+# the files. Upstream select_entry's default bound
 # (max_steps=30, 21 visible rows) scans three screens and stops with the cursor at index 60, so the logged screen
-# shows indexes 40-60; 40 directories therefore come before "mp33r10". About 100 entries, as NOTES-failures says.
+# shows indexes 40-60; 40 directories therefore come before "mp33r10". About 100 entries, as the failure notes say.
 LOGGED_DIRS = ["mp33r10", "mp33r8", "MP33r9", "N", "O", "P", "p1052", "printer", "printer-eb02e9", "Q", "R",
                "S", "SIDs etc", "T", "tlsbench", "U", "uaf", "ultimate_3.10", "ultimate_3.10a", "ultimate_3.14a",
                "V", "W", "Wheels_64_1999_CHS", "Wheels_64_1999_CHS working", "Wheels_64_1999_Click_Here_Software",
@@ -249,7 +249,7 @@ def test_same_hash_needs_the_drop(env, menu):
 
 
 def lane_call(env, fake, factory, volume, client_script, **kw):
-    """ram_run exactly as the lanes call it (uaf_loop.py, stall_bisect.py): image path, sha256=,
+    """ram_run exactly as its callers call it: image path, sha256=,
     expect_git_hash=, volume= (and stem=); only the device stand-ins are injected."""
     ev, img, sha = env
     return rr.ram_run("u64e", img, sha256=sha, expect_git_hash="17995fd9c", volume=volume, **kw,

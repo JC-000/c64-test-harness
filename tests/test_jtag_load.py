@@ -833,3 +833,26 @@ def test_the_telnet_browser_refuses_unlocked_and_opens_under_the_lock(built, tmp
     with jl._Locked(GUARD_HOST, {}, 5, real_locks(tmp_path)):
         assert jl._telnet_browser(GUARD_HOST) == "B"
     assert opened == ["import", GUARD_HOST]
+
+
+# -- external checkouts come from the environment only -----------------------------------------------------
+
+@pytest.mark.parametrize("call, var", [(lambda: jl.esp_module(), "ESP_JTAG_DIR"),
+                                       (lambda: jl._telnet_imports(), "C64U_TESTS_DIR")])
+def test_external_checkouts_have_no_default_path(monkeypatch, tmp_path, call, var):
+    monkeypatch.delenv(var, raising=False)
+    with pytest.raises(jl.JtagLoadError, match=var) as e:
+        call()
+    assert e.value.stage == "setup"
+    monkeypatch.setenv(var, str(tmp_path / "absent"))
+    with pytest.raises(jl.JtagLoadError, match="not a directory"):
+        call()
+
+
+def test_the_esp_jtag_kit_is_imported_from_its_env_dir(monkeypatch, tmp_path):
+    (tmp_path / "host").mkdir()
+    (tmp_path / "host" / "esp_recover.py").write_text("KIT = 'from env'\n")
+    monkeypatch.setenv("ESP_JTAG_DIR", str(tmp_path))
+    monkeypatch.delitem(sys.modules, "esp_recover", raising=False)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    assert jl.esp_module().KIT == "from env"
