@@ -251,3 +251,22 @@ def test_status_and_dry_run_read_the_plug_and_never_reach_the_switch(wire, monke
     rec = po.outlet_cycle("c64u", binding=dict(BIND), dry_run=True, log=lambda m: None)
     assert rec["outlet_on"] is True and rec["result"] == "dry-run ok"
     assert wire == ["http://plug/rpc/Switch.GetStatus?id=0"] * 2
+
+
+@pytest.mark.parametrize("url", [
+    po.ShellyGen2("http://p").switch_url(True), po.ShellyGen2("http://p").switch_url(False),
+    po.Tasmota("http://q").switch_url(True), po.Tasmota("http://q").switch_url(False),
+    "http://q/cm?cmnd=Power%20Toggle", "http://q/cm?cmnd=Power&cmnd=Power%20Off", "http://q/cm?cmnd=Backlog%20Power%20Off",
+    "http://p/rpc/Switch.Toggle?id=0", "http://p/rpc/Switch.GetStatus?id=0&on=false", "http://p/",
+])
+def test_the_read_path_refuses_anything_but_a_status_url(wire, url):
+    """_read_plug runs without the lock, and a Shelly Gen2 Switch.Set is a plain GET: it must not send one."""
+    with pytest.raises(po.OutletError):
+        po._read_plug(url, 1.0)
+    assert wire == []
+
+
+@pytest.mark.parametrize("url", ["http://p/rpc/Switch.GetStatus?id=0", "http://q/cm?cmnd=Power"])
+def test_the_read_path_reads_a_status_url(wire, url):
+    po._read_plug(url, 1.0)
+    assert wire == [url]

@@ -33,6 +33,7 @@ import json
 import os
 import sys
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -49,8 +50,23 @@ class OutletError(RuntimeError):
     pass
 
 
+def _is_status_url(url: str) -> bool:
+    """Shelly Gen2 ``/rpc/Switch.GetStatus`` (``id`` only) or Tasmota ``/cm?cmnd=Power`` with no argument."""
+    u = urllib.parse.urlsplit(url)
+    q = urllib.parse.parse_qs(u.query, keep_blank_values=True)
+    if u.path.endswith("/rpc/Switch.GetStatus"):
+        return set(q) <= {"id"}
+    if u.path.endswith("/cm"):
+        return q == {"cmnd": ["Power"]}
+    return False
+
+
 def _read_plug(url: str, timeout: float) -> dict:
-    """GET a plug status URL. Reads the plug only; never switches power (the lock scan excludes it by name)."""
+    """GET a plug status URL. Reads the plug only; never switches power (the lock scan excludes it by name).
+
+    Anything but a status endpoint is refused: a Shelly Gen2 Switch.Set is a GET as well."""
+    if not _is_status_url(url):
+        raise OutletError(f"{url} is not a plug status URL; switching goes through _switch, under the DeviceLock")
     with urllib.request.urlopen(url, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
