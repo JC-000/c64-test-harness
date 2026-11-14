@@ -91,7 +91,7 @@ Summary: 13 ok, 3 missing, 1 skipped, 4 warn
 Overall: READY (with optional gaps)
 ```
 
-The `x64sc --version printed no version` note is expected: the Homebrew build's `x64sc --version` exits early, so the script falls back to Homebrew's metadata. The harness version is read from the installed package metadata. This sample's `0.11.3` came from a venv installed before the current `0.13.1` in `pyproject.toml`, and it needs `pip install -e .` again to report the right number.
+The `x64sc --version printed no version` note is expected: the Homebrew build's `x64sc --version` exits early, so the script falls back to Homebrew's metadata. The harness version is read from the installed package metadata. This sample's `0.11.3` came from a venv installed before the current `0.14.0` in `pyproject.toml`, and it needs `pip install -e .` again to report the right number.
 
 The VICE checks are **critical**, so a hardware-only machine without VICE reports NOT READY even though the Ultimate backend works. Options: `--quiet`, `--json`, `--no-u64`, `--u64-host HOST`, `--smoke`. Exit codes: `0` READY, `1` NOT READY, `2` script error. Details are in [docs/development.md](docs/development.md#quick-check-scriptsverify-dev-envsh).
 
@@ -178,6 +178,11 @@ Hardware reading, in order:
   - `run_prg(..., fallback_on_404=True)` sideloads via `write_mem` when a wedged runner answers HTTP 404 (observed on fw 3.14d).
   - Connection drops map to `Ultimate64TimeoutError`, and short `readmem` payloads raise `Ultimate64ProtocolError`.
   - `write_mem_query_threshold` is auto-detected per device: 128 on firmware without the Temp-folder fix, 48 on Ultimate-line ≥ 3.15.
+- **Device storage, flash and firmware** (each needs the caller to hold the `DeviceLock`, and none costs a `/Temp` attachment):
+  - `storage_*` read and write files on the device's own volumes over FTP. `storage_put_rom` / `storage_delete_rom` are the only writes under `/Flash`, one ROM image in `/Flash/roms`, size- and signature-checked.
+  - `save_config_item_to_flash()` saves one config key, and refuses unless it is the only RAM-vs-flash difference. It is the only sanctioned config save; the public `Ultimate64Client.save_config_to_flash` saves every dirty store, and nothing in the harness calls it except this function.
+  - `Ultimate64RemoteMenu` drives the firmware's telnet Remote Menu: read the screen and the WiFi row, toggle WiFi, start Run Update. On a U64E, WiFi Disable/Enable writes the WiFi config store to flash. It sends one state-changing key per call and never answers telnet negotiation.
+  - `flash_firmware()` flashes an update image: it validates it on the host, uploads it, starts Run Update, tells the person at the device what to answer, and verifies the firmware that comes back. Dry-run it first. See [docs/firmware_flashing.md](docs/firmware_flashing.md).
 - **Liveness probe:** `probe_u64()` / `is_u64_reachable()` check reachability (ping → TCP → REST). This is not a health check ([below](#liveness-probe)).
 - **Configuration helpers:** turbo speed (cross-generation CPU-speed probing), REU size, SID sockets and addressing, disk mounting, PRG run/load, and snapshot/restore of device state.
 - **Drive & disk fixtures:** `drive_on/off/reset/set_mode/load_rom`, blank-image creation with `create_d64/d71/d81/dnp`, `file_info`, `get_debug_register` / `set_debug_register` (`$D7FF`), `measure_bus_timing` (VCD), and batch `set_config_items_batch`.
@@ -638,7 +643,7 @@ hosts = ["10.43.23.81", "10.43.23.83"]
 Every listed spelling then shares one lockfile and one `/Temp` ledger, `uid-601a96`. The map is local configuration, read once per process, with no network I/O on the lock path; a broken map raises `DeviceAliasConfigError` before anything is locked or sent. Once a lane holds the lock, the client and the free `liveness_probe` catch three cases the map alone cannot prevent:
 
 - the device is reached under an unlisted second key, held by another lane the device has answered under that key;
-- a lane on an older harness is holding a listed raw address;
+- a listed raw address is held by a process on an older harness, or flocked directly by a wrapper (possibly this process's own parent);
 - a listed address answers as a different device from the one configured.
 
 On a leak-prone grade with `/Temp` hygiene armed, each of these raises `Ultimate64DeviceAliasError` before the upload. Otherwise it is a WARNING, or a refusal under `U64_REQUIRE_DEVICE_LOCK=1`. Details and the migration notes are in [docs/device_locking.md § Multi-interface devices](docs/device_locking.md#multi-interface-devices-the-alias-map).

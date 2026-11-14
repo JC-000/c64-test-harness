@@ -1064,6 +1064,61 @@ There are two hardware generations with real behavioral differences. Detect with
 - **REU / Cartridge preset**: only U64E firmware 3.14 exposed `Cartridge` as an enum with a `"REU"` preset that had to be written to enable the REU. U64E 3.15 replaced it with a `.crt` file chooser (`presets: [""]`; firmware `c64.cc:73`, `CFG_TYPE_STRFUNC`/`list_crts`) and the REU is controlled by `RAM Expansion Unit` + `REU Size` alone; the C64U (1.1.0) likewise has no `"REU"` preset — its `Cartridge` value merely mirrors REU state, and writing it back is rejected with HTTP 400. `set_reu` / `restore_state` handle all three by probing the item's presets (preset write ordered first, so a rejection never half-enables the REU). Don't hand-write `Cartridge: "REU"` config updates; use the helpers. `REU Size` read-back is trustworthy — a value that changes between reads means a config write, a flash reload, or a reboot/power-cycle in between (PUTs are volatile until `save_config_to_flash()`); see `tests/test_reu_size_readback_live.py`.
 - **REST `POST writemem` cliff (C64U)**: ~100–160 ms up to 12 KiB, then ~6 s per request at ≥16 KiB (sometimes exceeding a 10 s client timeout). Per-request pathology, not a wedge — the device stays healthy. **There is no fast bulk-write path on a C64U today.** The SocketDMA fast path is disabled (see below), which leaves `write_bytes` / `run_prg_via_sys` — and those are ~128 128-byte PUT round trips for 16 KiB **on a C64U** (`write_bytes` chunks at the client threshold, so every chunk is a PUT on every grade, #252; on a post-safe device that means 48-byte PUTs, a cost accepted by owner decision 2026-09-15), and the only timing is from the U64E. Measured there (fw 3.15, bce4535e, 2026-09-15, host on Wi-Fi (en0), link not instrumented, n=2-4 per arm, interleaved, #267): `write_bytes` runs about 1.3 KiB/s at 48-byte chunks (16 KiB in ~12.5 s) and about 3.2 KiB/s at 128-byte chunks (~5.0 s), median ~36-52 ms per PUT, observed 34-79 ms, dominated by the host link rather than the payload, while a single 16 KiB POST took ~0.1 s on that device, with no cliff at that size. It is not measured on the C64U: the 128-byte chunk is the same arm, but the latency over that device's link is unknown, so budget for it being slow and do not assume it beats the ~6 s cliff.
 
+### Firmware flash and the Remote Menu
+
+Both change persistent device state, so neither belongs in a test: they are operator tools, run deliberately, under one `DeviceLock` hold. Contract in REFERENCE.md (`backends.ultimate64_remote_menu`, `backends.ultimate64_firmware_flash`); narrative and measurements in `docs/firmware_flashing.md`.
+
+**Remote Menu: read first, dry-run the action, then act once.**
+
+```python
+from c64_test_harness import DeviceLock, Ultimate64RemoteMenu
+
+lock = DeviceLock(host)
+lock.acquire_or_raise(timeout=300)
+try:
+    menu = Ultimate64RemoteMenu(host)
+    print(menu.wifi_status())                       # telnet only, zero /Temp
+    plan = menu.set_wifi_enabled(False, dry_run=True)
+    print(plan.before.state, plan.menu)              # menu == () when already disabled
+    # On a U64E the real call writes the WiFi config store to flash.
+    done = menu.set_wifi_enabled(False)              # one ENTER, verified on a fresh session
+    print(done.after, done.messages, menu.dismissed_messages)
+finally:
+    lock.release()
+```
+
+If a call raises with `exc.enter_sent` set, the device may have acted: read the state again with a fresh call, never repeat the action blind.
+
+**Guarded flash: dry run first, then the real run with a person at the device.**
+
+```python
+from pathlib import Path
+from c64_test_harness import DeviceLock, FirmwareFlashError, FirmwareImage, flash_firmware
+
+image = FirmwareImage(
+    local_path=Path("build/update.ue2"),            # .ue2 for a C64U, .u64 for a U64E
+    device_path="/SD/updates/update.ue2",           # never /Temp or /Flash
+    sha256="<the SHA-256 recorded when the image was built>",
+    expected_git_commit_hash="<the commit the image was built from>",
+    kind="dev",                                     # checked against the image itself
+)
+lock = DeviceLock(host)
+lock.acquire_or_raise(timeout=300)
+try:
+    plan = flash_firmware(host, image, dry_run=True)  # validate + /v1/info, no upload, no ENTER
+    print(plan.family, plan.operator_instruction, plan.warnings)
+    # Only once someone at the device has read plan.operator_instruction:
+    record = flash_firmware(host, image, confirm_device_powers_off=True)
+    assert record.identity_verified, record.warnings
+except FirmwareFlashError as exc:
+    print(exc.step, exc.record.steps)               # never retry blind after run_update
+    raise
+finally:
+    lock.release()
+```
+
+The dry run navigates to the image only when it is already on the device; otherwise it records a warning and stops after the upload check. A prompting image ends with the machine switched off and needs one press of the power button; a C64U SILENT image (`kind="silent"`) asks nothing. On an official C64U image the instruction says **NO** to "Reset Configuration?" and the harness resets the non-network categories itself.
+
 ### SocketDMA write fast path (TCP 64)
 
 > **Do not enable SocketDMA writes.** The write fast path is disabled pending a stability review. For bulk data use `write_bytes` / `run_prg_via_sys`, whose threshold-sized chunks stay on the PUT path on every grade (#252). Details are tracked privately.
