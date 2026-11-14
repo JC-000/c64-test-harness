@@ -110,6 +110,7 @@ __all__ = [
     "storage_mkdir",
     "storage_put_file",
     "storage_put_rom",
+    "storage_rename_file",
     "storage_rmdir",
     "storage_volumes",
     "storage_writable_volumes",

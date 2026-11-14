@@ -171,6 +171,7 @@ from .backends.ultimate64_storage import (
     storage_mkdir,
     storage_put_file,
     storage_put_rom,
+    storage_rename_file,
     storage_rmdir,
     storage_volumes,
     storage_writable_volumes,
@@ -695,6 +696,7 @@ __all__ = [
     "storage_writable_volumes",
     "storage_list_dir",
     "storage_rmdir",
+    "storage_rename_file",
     # ROM images in /Flash/roms (issue #544, owner 2026-10-20)
     "ROM_DIRECTORY",
     "ROM_SIZES",
