@@ -909,6 +909,7 @@ def test_flush_that_outlasts_its_wait_returns_the_popup_unanswered(make, held):
     assert res.screen[9:15] == _STILL_PRINTING_ROWS
     assert res.popup == rmf.STILL_PRINTING
     assert res.popup_buttons == ("Ok",)
+    assert rmf.STILL_PRINTING in res.messages
     assert res.closed is False and res.enter_sent is True and res.verified is None
     assert fake.all_commits() == [("Printer/Flush/Eject", "tasks")]
     assert fake.sessions[0].keys == ["F5", "RIGHT", "ENTER"]

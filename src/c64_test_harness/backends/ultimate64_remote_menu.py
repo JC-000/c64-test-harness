@@ -1490,7 +1490,11 @@ class Ultimate64RemoteMenu:
         Closing the session ends the firmware's popup loop
         (``UserInterface::popup`` runs while ``host->exists()``, which turns
         false once the telnet client is gone, ``SocketStream::is_alive``,
-        700c7f2fa). The caller decides what the popup means. Turn On and Turn Off
+        700c7f2fa). Builds before 1f3212c8b, the C64U's 1.1.0 (7b628eb16)
+        among them, end it another way: their loop is ``do { ret = poll(0) }
+        while (!ret)``, and on ``recv() == 0`` ``SocketStream::get_char``
+        returns -2, which ``Keyboard_VT100::getch`` passes through and
+        ``poll`` turns into -1. The caller decides what the popup means. Turn On and Turn Off
         are then verified on fresh connections within *verify_timeout*
         (:class:`RemoteMenuVerifyError` if not); Flush/Eject and Reset have no
         effect telnet can show, so ``verified`` is ``None`` for them and the

@@ -85,7 +85,11 @@ Each call opens its own connections and closes them before it returns.
   `run_task` returns it in `TaskRunResult.popup` (lines joined with `\n`)
   and `popup_buttons`, with `closed=False`, and leaves it unanswered.
   Closing the session ends the firmware's popup loop
-  (`UserInterface::popup` runs while `host->exists()`, 700c7f2fa). An
+  (`UserInterface::popup` runs while `host->exists()`, 700c7f2fa). On
+  builds before 1f3212c8b, the C64U's 1.1.0 (7b628eb16) among them, it ends
+  through the closed socket instead: `SocketStream::get_char` returns -2,
+  `Keyboard_VT100::getch` passes it through and the popup's `poll` returns
+  -1, which ends its `do ... while (!ret)` loop. An
   example is Flush/Eject when the page is still rendering after the
   printer's 20 s wait: "The page is still printing.\nIt is saved when it
   is done.", with `Ok` (`iec_printer.cc:345`, 700c7f2fa; seen on the U64E,
