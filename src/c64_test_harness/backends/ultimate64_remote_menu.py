@@ -140,6 +140,7 @@ __all__ = [
     "RemoteMenuVerifyError",
     "RunUpdateResult",
     "EspFlashResult",
+    "ESP_IDENT_MAX",
     "EspFlashError",
     "EspFlashFailedError",
     "EspFlashNoPopupError",
@@ -202,6 +203,9 @@ _TASK_EFFECTS = {
 #: Popup texts with which ``FileTypeUpdate::load_format_1`` refuses a ``.cfw``
 #: (from 3a1ff9ff on). A ``.u64``/``.ue2`` is never checked; its one refusal
 #: is a file-open error string.
+#: The module's ident is cut at 31 characters (wifi.cc:302, wifi_cmd.cc:155-156):
+#: "ESP32 WiFi Bridge V1.507" leaves 7, so a tag goes at the front.
+ESP_IDENT_MAX = 31
 _ESP_ACTION = "Flash into ESP32"
 _ESP_SUCCESS = "Flashing ESP32 Success!"
 #: Failure popups of ``FileTypeESP::execute`` after ``StopApp``: all but the
@@ -872,8 +876,18 @@ class EspFlashResult:
         return (self.flash_ok and self.wifi_back and self.ping_ok
                 and (self.expect_ident is None or self.ident_ok is True))
 
+    @property
+    def proven(self) -> bool:
+        """The ident was read before and after and it changed. A flash of the
+        image already running looks exactly like nothing written (the firmware
+        shows "Success!" for ``remain == 0``), so without a change the result is
+        unproven even when ``ok``."""
+        return (self.ident_before is not None and self.ident_after is not None
+                and self.ident_before != self.ident_after)
+
     def summary(self) -> str:
-        return (f"{'OK' if self.ok else 'FAILED'} flash_esp {self.path} "
+        verdict = "FAILED" if not self.ok else ("OK" if self.proven else "UNPROVEN")
+        return (f"{verdict} flash_esp {self.path} "
                 f"duration={self.duration_s:.1f}s popup={self.popup!r} "
                 f"wifi_back={self.wifi_back} ping={self.ping_ok} wifi_ip={self.wifi_ip} "
                 f"ident_before={self.ident_before!r} ident_after={self.ident_after!r} "
@@ -1739,6 +1753,11 @@ class Ultimate64RemoteMenu:
                 f"flash_esp({path!r}) rewrites the ESP32 module on {self.host} and kills "
                 "Wi-Fi while it runs. Pass confirm_module_flash=True.")
         _split_path(path)
+        if expect_ident is not None and len(expect_ident) > ESP_IDENT_MAX:
+            raise Ultimate64UnsafeOperationError(
+                f"flash_esp: expect_ident {expect_ident!r} is {len(expect_ident)} characters; "
+                f"the module reports at most {ESP_IDENT_MAX} (wifi.cc:302, wifi_cmd.cc:155), so "
+                "it can never match. Put a short tag at the front of the ident.")
         if not path.upper().endswith(".ESP"):
             raise RemoteMenuNotFoundError(
                 f"{path!r} is not a .esp file (the action is matched on the extension)")

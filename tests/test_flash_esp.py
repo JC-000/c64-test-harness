@@ -237,7 +237,8 @@ def _run_cli(tmp_path, make, extra=(), checker=None, readback=None, ident_probe=
 
 
 def test_cli_success_prints_one_result_line(tmp_path, make, held, capsys):
-    rc, calls, lock, fake = _run_cli(tmp_path, make)
+    seq = iter(["OLD", "NEW"])
+    rc, calls, lock, fake = _run_cli(tmp_path, make, ident_probe=lambda: next(seq))
     out = capsys.readouterr().out.strip().splitlines()
     assert rc == 0 and out[-1].startswith("OK flash_esp /Temp/raw_u64.esp")
     assert calls == [("put", "/Temp/raw_u64.esp"), ("delete", "/Temp/raw_u64.esp")]
@@ -269,13 +270,6 @@ def test_cli_a_truncated_upload_is_refused_before_the_enter(tmp_path, make, held
     assert ("delete", "/Temp/raw_u64.esp") in calls
 
 
-def test_cli_expect_ident_without_a_reader_is_refused(tmp_path, make, held, capsys, monkeypatch):
-    import c64_test_harness as pkg
-    monkeypatch.delattr(pkg, "read_wifi_ident", raising=False)
-    rc, calls, lock, fake = _run_cli(tmp_path, make, extra=["--expect-ident", "T1 bridge"])
-    assert rc == 2 and calls == [] and fake.sessions == []
-
-
 def test_cli_with_an_ident_probe_verifies_the_ident(tmp_path, make, held, capsys):
     seq = iter(["OLD bridge V1", "NEW bridge V2"])
     rc, calls, lock, fake = _run_cli(tmp_path, make, extra=["--expect-ident", "NEW bridge V2"],
@@ -303,3 +297,36 @@ def test_only_an_exact_popup_text_is_answered(make, held, text):
         _flash(menu)
     assert exc.value.enter_sent is True
     assert _oks(fake) == 0 and fake.esp_restarts == 0
+
+
+def test_read_ident_toggles_wifi_reads_and_restores_link_up(make, held):
+    fake, menu = make()
+    assert cli.read_ident(menu, poll=0.05) == "ESP32 WiFi Bridge V0.903 bench"
+    assert [c[0] for c in fake.all_commits()] == ["Disable", "Enable"]
+    assert fake.wifi["state"] == "link-up" or menu.wifi_status().state in ("link-down", "link-up")
+
+
+def test_read_ident_on_a_disabled_row_only_reads(make, held):
+    fake, menu = make(wifi={"state": "disabled", "ident": "T1 bridge"})
+    assert cli.read_ident(menu, poll=0.05) == "T1 bridge"
+    assert fake.all_commits() == []
+
+
+def test_cli_reads_the_ident_only_outside_the_flash_window(tmp_path, make, held, capsys):
+    rc, calls, lock, fake = _run_cli(tmp_path, make, extra=["--allow-same-ident"], ident_probe=None)
+    labels = [c[0] for c in fake.all_commits()]
+    assert labels == ["Disable", "Enable", "Flash into ESP32", "Disable", "Enable"], labels
+    assert rc == 0
+
+
+def test_cli_unchanged_ident_is_unproven_exit_3(tmp_path, make, held, capsys):
+    rc, calls, lock, fake = _run_cli(tmp_path, make, ident_probe=lambda: "same")
+    out = capsys.readouterr().out
+    assert rc == 3 and "UNPROVEN flash_esp" in out
+
+
+def test_ident_longer_than_31_chars_is_refused(make, held):
+    fake, menu = make()
+    with pytest.raises(Ultimate64UnsafeOperationError):
+        _flash(menu, expect_ident="x" * 32, ident_probe=lambda: "y")
+    assert fake.sessions == []

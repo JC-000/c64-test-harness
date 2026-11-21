@@ -9,7 +9,8 @@ by ``--esp-image-tool`` or the ``ESP_IMAGE_TOOL`` environment variable; the
 harness does not carry a copy), take the device's ``DeviceLock``, upload to
 ``/Temp``, run ``Ultimate64RemoteMenu.flash_esp`` (which verifies Wi-Fi,
 ping and ident afterwards), delete the upload, print one result line.
-Exit 0 only when the whole verdict is OK; 1 on a failed or unverified flash
+Exit 0 only when the whole verdict is OK and proven (the ident changed); 3 when the
+flash verified but is unproven (no ident change, e.g. a same-image flash); 1 on a failed or unverified flash
 (the menu's ENTER was sent); 2 on a refusal before it was.
 
 ``--host`` must be the Ethernet address: the flash stops Wi-Fi.
@@ -37,6 +38,46 @@ def system_ping(ip: str, timeout: float = 2.0) -> bool:
     return r.returncode == 0
 
 
+def read_ident(menu, *, link_timeout: float = 90.0, poll: float = 2.0) -> str | None:
+    """Read the module ident: the WiFi row shows it only while Wi-Fi is Disabled.
+
+    Over the Ethernet session: if Wi-Fi is on, Disable it, read the row, Enable
+    it and wait for Link Up again (only when it was Link Up before). Call it
+    BEFORE and AFTER the flash window, never inside it. On the U64E each toggle
+    writes the Wi-Fi config to flash. A minimal copy of the shape of harness
+    PR #569's ``read_wifi_ident``; collapse onto that once it merges.
+    """
+    import time
+
+    from ..backends.ultimate64_remote_menu import Ultimate64RemoteMenuError
+
+    st = menu.wifi_status()
+    if st.state == "disabled":
+        return st.ident
+    if st.state not in ("link-up", "link-down"):
+        raise Ultimate64RemoteMenuError(f"WiFi row is {st.row!r}: no ident to read, nothing sent")
+    ident = None
+    err: BaseException | None = None
+    try:
+        menu.set_wifi_enabled(False)
+        ident = menu.wifi_status().ident
+    except Ultimate64RemoteMenuError as exc:
+        err = exc
+        if exc.enter_sent is False:
+            raise
+    menu.set_wifi_enabled(True)
+    want = ("link-up",) if st.state == "link-up" else ("link-up", "link-down")
+    end = time.monotonic() + link_timeout
+    while menu.wifi_status().state not in want:
+        if time.monotonic() >= end:
+            raise Ultimate64RemoteMenuError(
+                f"Wi-Fi did not return to {want[0]} within {link_timeout:.0f} s after reading the ident")
+        time.sleep(poll)
+    if err is not None:
+        raise err
+    return ident
+
+
 def check_image(tool: Path, platform_name: str, image: Path) -> tuple[bool, str]:
     """Run ``esp_image.py check``; return (ok, its output)."""
     r = subprocess.run([sys.executable, str(tool), "check", "--platform", platform_name,
@@ -60,6 +101,10 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
     ap.add_argument("--lock-timeout", type=float, default=600.0)
     ap.add_argument("--timeout", type=float, default=300.0, help="wait for the result popup")
     ap.add_argument("--verify-timeout", type=float, default=90.0)
+    ap.add_argument("--no-ident-probe", action="store_true",
+                    help="do not toggle Wi-Fi to read the ident before/after (result is then unproven)")
+    ap.add_argument("--allow-same-ident", action="store_true",
+                    help="a flash that leaves the ident unchanged exits 0 instead of 3 (unproven)")
     ap.add_argument("--confirm-module-flash", action="store_true")
     a = ap.parse_args(argv)
 
@@ -95,14 +140,12 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
     delete = delete or storage_delete_file
     get = get or storage_get_file
     probe = ident_probe
-    if probe is None and a.expect_ident is not None:
-        try:
-            from .. import read_wifi_ident  # PR #569
-        except ImportError:
-            print("REFUSED: --expect-ident needs read_wifi_ident (harness PR #569); the WiFi "
-                  "row shows the ident only while Wi-Fi is Disabled", file=sys.stderr)
+    if probe is None and not a.no_ident_probe:
+        if a.expect_ident is not None and len(a.expect_ident) > 31:
+            print("REFUSED: --expect-ident is longer than the 31 characters the module reports",
+                  file=sys.stderr)
             return 2
-        probe = lambda: read_wifi_ident(a.host).ident  # noqa: E731
+        probe = lambda: read_ident(menu)  # noqa: E731  (menu is bound below)
     local = a.esp.read_bytes()
     lock = (lock_factory or DeviceLock)(a.host)
     lock.acquire_or_raise(timeout=a.lock_timeout)
@@ -117,7 +160,7 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
                       f"image ({len(local)} B, sha256 {hashlib.sha256(local).hexdigest()}); "
                       "nothing was flashed", file=sys.stderr)
                 return 2
-            res = menu.flash_esp(dest, ident_probe=probe, expect_ident=a.expect_ident,
+            res = menu.flash_esp(dest, ident_probe=probe, allow_same_ident=a.allow_same_ident, expect_ident=a.expect_ident,
                                  confirm_module_flash=True, timeout=a.timeout,
                                  verify_timeout=a.verify_timeout, wifi_ip=a.wifi_ip, ping=ping)
         except EspFlashError as exc:
@@ -137,7 +180,7 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
             except Exception as exc:  # the flash verdict matters more
                 print(f"note: could not delete {dest}: {exc}", file=sys.stderr)
         print(res.summary())
-        return 0 if res.ok else 1
+        return 1 if not res.ok else (0 if res.proven or a.allow_same_ident else 3)
     finally:
         lock.release()
 
