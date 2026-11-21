@@ -577,6 +577,18 @@ prg = PrgFile.from_file("build/program.prg")
 # prg.data -> bytes
 ```
 
+- `prg.verify_load(transport, *, start=None) -> LoadCheck` -- after a KERNAL LOAD
+  has finished, reads the end pointer EAL (`$AE/$AF`), ST (`$90`) and the payload at
+  *start* (default: the file's load address; `start=0x0801` for `LOAD"NAME",8`).
+  `LoadCheck` (frozen; exported at the package root) has `start`, `expected_end`,
+  `end_pointer`, `status`, `content_diffs`, and the properties `complete` (end
+  pointer and bytes both match) and `short` (the pointer stopped early). Gate on
+  `complete`: ST=$40 and matching bytes also follow a short LOAD over an earlier
+  copy. Refuses a bool, out-of-range or past-`$FFFF` *start* with `ValueError`
+  before any read; a short EAL/ST read or payload chunk raises `ShortReadError`.
+  On an Ultimate, call it only once IEC I/O has stopped (#573; see PATTERNS
+  § "Don't read C64 memory during IEC I/O on an Ultimate").
+
 ---
 
 ## Module: debug

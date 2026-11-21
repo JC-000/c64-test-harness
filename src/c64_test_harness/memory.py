@@ -281,6 +281,12 @@ def wait_for_memory(
 ) -> bytes | None:
     """Poll memory at *addr* until it matches, keeping the C64 running.
 
+    **On an Ultimate, do not call this while the C64 is doing IEC I/O**
+    (LOAD, SAVE, printing, SoftIEC): each poll is a REST memory read that
+    halts the 6510 for about 1 ms per 1000 bytes and can break the transfer
+    (#573, GideonZ/1541ultimate#1120). See the c64-test skill, PATTERNS
+    § "Don't read C64 memory during IEC I/O on an Ultimate".
+
     The safe way to wait on a flag byte after :func:`~.execute.goto` (or
     after anything else that leaves a program running).  Issue #514: on
     VICE every binary-monitor command -- a plain :func:`read_bytes`

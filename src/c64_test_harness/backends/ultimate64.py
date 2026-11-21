@@ -553,7 +553,10 @@ class Ultimate64Transport(HardwareTransportBase):
         writing at offset 0 makes the write placement race-free (the same
         convention :meth:`Ultimate64Client.send_text` uses).
 
-        Because U64 memory I/O is DMA-backed, no CPU pause is needed.
+        The harness adds no pause of its own, but each REST read and write
+        halts the 6510 briefly in the firmware (about 1 ms per 1000 bytes;
+        #573, GideonZ/1541ultimate#1120). The poll runs only before a chunk
+        is written, so a command's final RETURN is sent with no read after it.
         """
         if not petscii_codes:
             return

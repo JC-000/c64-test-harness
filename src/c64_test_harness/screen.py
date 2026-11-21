@@ -228,6 +228,12 @@ def wait_for_text(
     Returns the matching ``ScreenGrid`` so the caller can immediately
     extract data, or ``None`` on timeout.
 
+    **On an Ultimate, do not call this while the C64 is doing IEC I/O**
+    (LOAD, SAVE, printing, SoftIEC): each poll is a REST memory read that
+    halts the 6510 for about 1 ms per 1000 bytes and can break the transfer
+    (#573, GideonZ/1541ultimate#1120). See the c64-test skill, PATTERNS
+    § "Don't read C64 memory during IEC I/O on an Ultimate".
+
     *on_progress* replaces hardcoded ``print()`` — receives elapsed seconds
     and a snippet of the last non-blank screen row.
 
@@ -360,6 +366,12 @@ def wait_for_stable(
     path), including its two qualifications: the exit resume is owed
     rather than unconditional, and it is best-effort.  See
     :func:`wait_for_text` for both in full.
+
+    **On an Ultimate, do not call this while the C64 is doing IEC I/O**
+    (LOAD, SAVE, printing, SoftIEC): each poll is a REST memory read that
+    halts the 6510 for about 1 ms per 1000 bytes and can break the transfer
+    (#573, GideonZ/1541ultimate#1120). See the c64-test skill, PATTERNS
+    § "Don't read C64 memory during IEC I/O on an Ultimate".
     """
     prev_text: str | None = None
     count = 0
