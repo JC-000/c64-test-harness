@@ -39,46 +39,6 @@ def system_ping(ip: str, timeout: float = 2.0) -> bool:
     return r.returncode == 0
 
 
-def read_ident(menu, *, link_timeout: float = 90.0, poll: float = 2.0) -> str | None:
-    """Read the module ident: the WiFi row shows it only while Wi-Fi is Disabled.
-
-    Over the Ethernet session: if Wi-Fi is on, Disable it, read the row, Enable
-    it and wait for Link Up again (only when it was Link Up before). Call it
-    BEFORE and AFTER the flash window, never inside it. On the U64E each toggle
-    writes the Wi-Fi config to flash. A minimal copy of the shape of harness
-    PR #569's ``read_wifi_ident``; collapse onto that once it merges.
-    """
-    import time
-
-    from ..backends.ultimate64_remote_menu import Ultimate64RemoteMenuError
-
-    st = menu.wifi_status()
-    if st.state == "disabled":
-        return st.ident
-    if st.state not in ("link-up", "link-down"):
-        raise Ultimate64RemoteMenuError(f"WiFi row is {st.row!r}: no ident to read, nothing sent")
-    ident = None
-    err: BaseException | None = None
-    try:
-        menu.set_wifi_enabled(False)
-        ident = menu.wifi_status().ident
-    except Ultimate64RemoteMenuError as exc:
-        err = exc
-        if exc.enter_sent is False:
-            raise
-    menu.set_wifi_enabled(True)
-    want = ("link-up",) if st.state == "link-up" else ("link-up", "link-down")
-    end = time.monotonic() + link_timeout
-    while menu.wifi_status().state not in want:
-        if time.monotonic() >= end:
-            raise Ultimate64RemoteMenuError(
-                f"Wi-Fi did not return to {want[0]} within {link_timeout:.0f} s after reading the ident")
-        time.sleep(poll)
-    if err is not None:
-        raise err
-    return ident
-
-
 def check_image(tool: Path, platform_name: str, image: Path) -> tuple[bool, str]:
     """Run ``esp_image.py check``; return (ok, its output)."""
     r = subprocess.run([sys.executable, str(tool), "check", "--platform", platform_name,
@@ -88,7 +48,7 @@ def check_image(tool: Path, platform_name: str, image: Path) -> tuple[bool, str]
 
 def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
          put=None, delete=None, rmdir=None, get=None, lock_factory=None, checker=None,
-         ident_probe=None) -> int:
+         ident_probe=None, ident_poll=5.0) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--host", required=True, help="the device's ETHERNET address")
     ap.add_argument("--esp", type=Path, required=True)
@@ -160,7 +120,11 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
             print("REFUSED: --expect-ident is longer than the 31 characters the module reports",
                   file=sys.stderr)
             return 2
-        probe = lambda: read_ident(menu)  # noqa: E731  (menu is bound below)
+        from ..backends.ultimate64_firmware_flash import read_wifi_ident
+
+        def probe():  # the menu is bound below; never called inside the flash window
+            return read_wifi_ident(a.host, poll_interval_s=ident_poll,
+                                   menu_factory=lambda host: menu).ident
     local = a.esp.read_bytes()
     lock = (lock_factory or DeviceLock)(a.host)
     lock.acquire_or_raise(timeout=a.lock_timeout)

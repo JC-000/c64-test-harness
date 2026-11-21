@@ -223,13 +223,13 @@ def _run_cli(tmp_path, make, extra=(), dest="/USB1/espflash/raw_u64.esp", checke
     calls = []
     lock = _Lock("h")
     rc = cli.main(
-        ["--host", "10.0.0.50", "--esp", str(esp), "--platform", "u64e",
+        ["--host", "127.0.0.1", "--esp", str(esp), "--platform", "u64e",
          "--esp-image-tool", str(tool), "--dest", dest, "--confirm-module-flash", "--timeout", "2",
          "--verify-timeout", "2", *extra],
         menu_factory=lambda host: menu, ping=lambda ip: True,
         put=lambda host, dest, path, **kw: calls.append(("put", dest)),
         get=lambda host, dest: b"x" if readback is None else readback,
-        ident_probe=ident_probe,
+        ident_probe=ident_probe, ident_poll=0.05,
         delete=lambda host, dest, **kw: calls.append(("delete", dest)),
         rmdir=lambda host, d, **kw: calls.append(("rmdir", d)),
         lock_factory=lambda host: lock,
@@ -260,9 +260,9 @@ def test_cli_failed_flash_exits_1_and_still_cleans_up(tmp_path, make, held, caps
 def test_cli_refuses_the_wifi_ip_and_missing_confirmation(tmp_path, capsys):
     esp = tmp_path / "a.esp"
     esp.write_bytes(b"x")
-    base = ["--host", "10.0.0.50", "--esp", str(esp), "--platform", "u64e",
+    base = ["--host", "127.0.0.1", "--esp", str(esp), "--platform", "u64e",
             "--dest", "/USB1/espflash/a.esp"]
-    assert cli.main(base + ["--wifi-ip", "10.0.0.50", "--confirm-module-flash"]) == 2
+    assert cli.main(base + ["--wifi-ip", "127.0.0.1", "--confirm-module-flash"]) == 2
     assert cli.main(base) == 2
 
 
@@ -299,19 +299,6 @@ def test_only_an_exact_popup_text_is_answered(make, held, text):
         _flash(menu)
     assert exc.value.enter_sent is True
     assert _oks(fake) == 0 and fake.esp_restarts == 0
-
-
-def test_read_ident_toggles_wifi_reads_and_restores_link_up(make, held):
-    fake, menu = make()
-    assert cli.read_ident(menu, poll=0.05) == "ESP32 WiFi Bridge V0.903 bench"
-    assert [c[0] for c in fake.all_commits()] == ["Disable", "Enable"]
-    assert fake.wifi["state"] == "link-up" or menu.wifi_status().state in ("link-down", "link-up")
-
-
-def test_read_ident_on_a_disabled_row_only_reads(make, held):
-    fake, menu = make(wifi={"state": "disabled", "ident": "T1 bridge"})
-    assert cli.read_ident(menu, poll=0.05) == "T1 bridge"
-    assert fake.all_commits() == []
 
 
 def test_cli_reads_the_ident_only_outside_the_flash_window(tmp_path, make, held, capsys):
