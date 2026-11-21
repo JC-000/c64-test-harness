@@ -323,3 +323,41 @@ class TestVerifyLoad:
         with pytest.raises(ValueError, match="outside"):
             prg.verify_load(t, start=start)
         assert t.reads == []
+
+    @pytest.mark.parametrize("start,length", [(0xFE00, 512), (0xFFFF, 1)])
+    def test_load_ending_at_ffff_wraps_the_pointer_and_is_complete(self, start, length):
+        # The KERNAL stores, then INC $AE / BNE / INC $AF: after a byte at
+        # $FFFF the 16-bit pointer reads $0000.
+        prg = PrgFile(start, bytes((i * 5 + 1) & 0xFF for i in range(length)))
+        t = _Ram()
+        t.put(start, prg.data)
+        t.kernal_state(0x0000)
+        r = prg.verify_load(t)
+        assert r.expected_end == 0x10000
+        assert r.complete and not r.short
+
+    def test_load_short_of_ffff_is_short(self):
+        prg = PrgFile(0xFE00, bytes(512))
+        t = _Ram()
+        t.kernal_state(0xFF00)
+        r = prg.verify_load(t)
+        assert r.short and not r.complete
+
+    def test_short_status_read_raises(self, load_prg):
+        t = _Ram()
+        t.put(0x4000, load_prg.data)
+        t.kernal_state(0x47D0)
+        real = t.read_memory
+        t.read_memory = lambda a, n: b"" if a == 0x90 else real(a, n)
+        with pytest.raises(ShortReadError):
+            load_prg.verify_load(t)
+
+    def test_result_is_immutable(self, load_prg):
+        import dataclasses
+
+        t = _Ram()
+        t.put(0x4000, load_prg.data)
+        t.kernal_state(0x4652)
+        r = load_prg.verify_load(t)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            r.end_pointer = 0x47D0

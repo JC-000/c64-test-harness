@@ -1242,16 +1242,20 @@ if wait_for_memory(transport, MAIN_LOOP, parked, timeout=60.0, poll_interval=0.5
 **In force until a released core carries the fix for
 GideonZ/1541ultimate#1120** (none as of 2026-11-21; no core or FPGA version to
 key on yet). Tracked by **#573**: every place this rule lives carries the tag
-`#573`, so `grep -rn '#573' src .claude docs` lists them for retirement.
-`PrgFile.verify_load` is not part of the retirement: a complete-LOAD check stays
-correct on any core.
+`#573`, so `grep -rn '#573' src .claude docs` lists them for retirement. Keep
+`PrgFile.verify_load` (its docstring hits the grep too): a complete-LOAD check
+stays correct on any core. The other `#573` tags on the Ultimate transport's
+"each access stops the 6510 briefly" sentences stay true until the fix ships
+and get reworded, not deleted, then.
 
-On every current Ultimate core a REST memory read halts the 6510 for about
-1.0-1.5 ms per 1000 bytes while the CIA timers and the IEC processor keep
-running. That covers `read_memory`/`read_bytes`, every screen and memory waiter
+A REST memory read stops the 6510 inside the firmware while the CIA timers and
+the IEC processor keep running. A 1000-byte read halted it for 1.0-1.5 ms (U64E,
+n=20, the development builds named in #1120); smaller reads, writes and the C64U
+have not been timed. Treat every read as unsafe on every current core: that is
+policy until a fix ships, not a measurement of each core. It covers `read_memory`/`read_bytes`, every screen and memory waiter
 (`wait_for_text`, `wait_for_stable`, `wait_for_memory`, `ScreenGrid.from_transport`),
 `watch_progress` and `verify_region`. If the halt lands in an IEC transfer, the
-transfer breaks. Measured on the U64E (3.15, #1120):
+transfer can break. Measured on the U64E (builds in #1120):
 
 - **LOAD from the emulated 1541 ends early with ST=$40 and no error.** 20/20
   exact with no reads, 16/20 with a 1000-byte read every 0.5 s, 1/13 back to back.
@@ -1261,9 +1265,10 @@ transfer breaks. Measured on the U64E (3.15, #1120):
 - `get_info()` does not halt (0 halts in 20 calls; 0 of 10 print freezes).
 
 A longer poll interval lowers the rate; it does not remove it. VICE is not
-affected (its monitor freezes the whole machine, drive included), so a test that
-polls during a LOAD passes in the emulator and fails on hardware. Firmware
-cannot fix it (#1120 tried skipping the stop: the halt stayed and LOAD got worse).
+affected (its monitor freezes the whole machine, drive included; reasoned, not
+measured), so a test that polls during a LOAD can pass in the emulator and fail
+on hardware. The one firmware-only change tried did not help (#1120: skipping
+the stop left the halt in place, and no LOAD completed in 3 runs).
 
 **Rule, on an Ultimate:** while the C64 is doing IEC I/O (LOAD, SAVE, printing,
 SoftIEC) do not read its memory and do not type. Wait out a bound you know (poll
@@ -1272,6 +1277,7 @@ LOAD with `PrgFile.verify_load`:
 
 ```python
 prg = PrgFile.from_file("build/data.prg")
+transport.write_memory(0xAE, b"\x00\x00")   # clear EAL: a LOAD that never runs then reads short
 send_text(transport, 'LOAD"DATA",8,1')
 send_key(transport, "\r")        # the last key: inject_keys polls $C6 only before a chunk
 time.sleep(LOAD_BOUND_S)          # no screen or memory reads while the LOAD runs
@@ -1282,7 +1288,9 @@ assert check.complete, check
 Do not accept ST=$40 or matching bytes as proof: a complete LOAD also leaves
 ST=$40, and a repeated LOAD of the same file leaves the earlier copy's tail in
 RAM. Only the end pointer `$AE/$AF` (`check.end_pointer`, `check.short`) tells
-them apart. Printing has no such check; compare the printer's output file.
+them apart, and only for this LOAD if you cleared it first: a LOAD that was
+never run (a dropped key, `?SYNTAX ERROR`) leaves the earlier LOAD's pointer.
+Printing has no such check; compare the printer's output file.
 
 ### Debug stream is rate-capped at 1 MHz-equivalent (turbo gives a 1/N sampled view)
 

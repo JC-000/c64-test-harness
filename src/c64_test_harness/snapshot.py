@@ -500,7 +500,8 @@ def extract_snapshot(
     Reads ``$0000-$FFFF`` and the two CPU port registers and packages
     them into a :class:`Snapshot`.  On VICE the read halts the 6510 and
     leaves it halted, so the image is one consistent instant; the U64
-    reads by DMA while the machine runs.  The backend's chunking handles any
+    reads by DMA in chunks, stopping the 6510 briefly for each and letting
+    it run between them (#573), so the image is not one instant.  The backend's chunking handles any
     transport-level size limits.  The read goes through the CPU view,
     so the ``$D000-$DFFF`` slice of :attr:`Snapshot.ram` holds I/O-view
     bytes (register reads + color RAM), not RAM under I/O — see the

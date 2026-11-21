@@ -68,8 +68,9 @@ class ScreenGrid:
            resume on every exit path, or call ``transport.resume()``
            yourself after each capture.
 
-           On the Ultimate 64 memory access is DMA-backed and the machine
-           runs throughout, so a resume is not *needed* there -- but it is
+           On the Ultimate 64 a memory access does not leave the CPU halted
+           (the firmware stops the 6510 briefly for each access and resumes
+           it, #573), so a resume is not *needed* there -- but it is
            not free either: it is a real request to the device, so it
            costs a round trip and it will clear a pause the caller set
            deliberately.  The resuming helpers are correct on both
@@ -230,8 +231,9 @@ def wait_for_text(
 
     **On an Ultimate, do not call this while the C64 is doing IEC I/O**
     (LOAD, SAVE, printing, SoftIEC): each poll is a REST memory read that
-    halts the 6510 for about 1 ms per 1000 bytes and can break the transfer
-    (#573, GideonZ/1541ultimate#1120). See the c64-test skill, PATTERNS
+    stops the 6510 in the firmware (a 1000-byte read: 1.0-1.5 ms on the
+    U64E; smaller reads were not timed, so treat any read as unsafe) and
+    can break the transfer (#573, GideonZ/1541ultimate#1120). See the c64-test skill, PATTERNS
     § "Don't read C64 memory during IEC I/O on an Ultimate".
 
     *on_progress* replaces hardcoded ``print()`` — receives elapsed seconds
@@ -369,8 +371,9 @@ def wait_for_stable(
 
     **On an Ultimate, do not call this while the C64 is doing IEC I/O**
     (LOAD, SAVE, printing, SoftIEC): each poll is a REST memory read that
-    halts the 6510 for about 1 ms per 1000 bytes and can break the transfer
-    (#573, GideonZ/1541ultimate#1120). See the c64-test skill, PATTERNS
+    stops the 6510 in the firmware (a 1000-byte read: 1.0-1.5 ms on the
+    U64E; smaller reads were not timed, so treat any read as unsafe) and
+    can break the transfer (#573, GideonZ/1541ultimate#1120). See the c64-test skill, PATTERNS
     § "Don't read C64 memory during IEC I/O on an Ultimate".
     """
     prev_text: str | None = None
