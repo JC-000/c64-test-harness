@@ -496,6 +496,39 @@ constructor that acquires a cross-process lock has its own failure modes
 `__init__`? what about the read-only probe?). The lock belongs to the
 run, and the run is the caller's to scope.
 
+## Lock shells: `C64U_LOCK_PID` and `require_device_lock`
+
+A lock shell is an external process that holds the DeviceLock and runs a
+child command with `C64U_LOCK_PID=<its pid>` and `C64U_LOCK_HOST=<host>`.
+The child takes no lock of its own: the shell's hold is the hold. The
+shell must keep the DeviceLock for that host for as long as the child
+runs. The lockfile's holder must be the shell's PID, so the shell takes
+the lock itself; a holder it merely knows about does not count.
+
+`scripts/_u64_host.py` checks the claim in `lock_shell_holds(host)`:
+
+- `C64U_LOCK_PID` unset: there is no shell, so the answer is False.
+- `C64U_LOCK_HOST` set and naming another device: False.
+- Otherwise the claim must hold, or `LockShellClaimError` is raised:
+  `device_lock_holder(host)` names that PID, and that PID is an ancestor of
+  the current process (its parent, grandparent, ... read with `ps`). A
+  process that inherited the variables but was not started under the shell
+  is refused.
+
+`require_device_lock(host)` in the same module refuses
+(`DeviceLockNotHeldError`) unless this process holds the lock
+(`lock_held_for`) or a lock shell holds it as above. A script that reaches
+the device through an injected factory calls it as the first statement of
+that factory; `tests/test_u64_runner_script_gates.py` accepts that shape in
+place of a `with hold_device_lock(...)` block. It takes no lock and waits
+for nothing.
+
+A lock shell's hold does not satisfy the harness's own gates. The FTP
+storage helpers, the Remote Menu driver and the `/Temp` hygiene check
+`lock_held_for`, which only sees locks this process holds. That is why
+`scripts/ram_run_u64.py`, which uses both, refuses to run under a lock
+shell for its device and takes its own lock instead.
+
 ## Related
 
 - `docs/u64_recovery.md` — wedge tiers and what to do instead of a
