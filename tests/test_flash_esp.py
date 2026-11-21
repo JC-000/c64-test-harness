@@ -408,3 +408,13 @@ def test_cli_refuses_temp_flash_and_non_esp_destinations(tmp_path, make, held, c
 def test_cli_dest_is_required(tmp_path, capsys):
     with pytest.raises(SystemExit):
         cli.main(["--host", "h", "--esp", "a.esp", "--platform", "u64e"])
+
+
+def test_cli_navigation_failure_is_a_clear_pre_enter_refusal(tmp_path, make, held, capsys):
+    rc, calls, lock, fake = _run_cli(tmp_path, make, ident_probe=lambda: "x",
+                                     dest="/USB1/nodir/raw_u64.esp")
+    err = capsys.readouterr()
+    assert rc == 2 and "REFUSED before the ENTER, nothing was flashed" in err.err
+    assert "hint:" in err.err and "screen|" in err.err
+    assert fake.all_commits() == []
+    assert ("delete", "/USB1/nodir/raw_u64.esp") in calls   # the upload is still removed

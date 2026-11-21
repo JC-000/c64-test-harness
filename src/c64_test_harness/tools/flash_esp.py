@@ -189,8 +189,20 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
             print(f"REFUSED: {exc}", file=sys.stderr)
             return 2
         except Ultimate64RemoteMenuError as exc:
-            print(f"FAILED {type(exc).__name__}: {exc} (enter_sent={exc.enter_sent})")
-            return 1 if exc.enter_sent else 2
+            if exc.enter_sent:
+                print(f"FAILED {type(exc).__name__}: {exc} (the ENTER was sent: the module may "
+                      "have been touched; check Wi-Fi and the ident before anything else)")
+                return 1
+            print(f"REFUSED before the ENTER, nothing was flashed: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+            if "which row is selected" in str(exc) or "is not in" in str(exc):
+                print("hint: the menu could not find or mark the file's row. A corrupted or "
+                      "oversized directory listing (duplicate or garbled names) does this: "
+                      f"look at the device's telnet screen for {parent}/ and repair the "
+                      "volume or pick another --dest.", file=sys.stderr)
+            for row in (exc.screen or ())[:6]:
+                print(f"  screen| {row}", file=sys.stderr)
+            return 2
         finally:
             try:
                 delete(a.host, dest, missing_ok=True)
