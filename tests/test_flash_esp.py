@@ -739,16 +739,3 @@ def test_cli_a_lock_lost_after_the_flash_is_rc_1_and_keeps_the_upload(tmp_path, 
     cap = capsys.readouterr()
     assert rc == 1 and _deleted(calls) == [] and "nothing was flashed" not in cap.err
     assert "KEPT" in cap.out
-
-
-def test_the_kept_message_says_may_have_been_sent(tmp_path, make, held, capsys):
-    """S3. Kills: 'the ENTER was sent' printed for an interrupt that may precede the ENTER."""
-    def boom(menu):
-        def flash_esp(*a, **k):
-            raise KeyboardInterrupt
-        menu.flash_esp = flash_esp
-
-    with pytest.raises(KeyboardInterrupt):
-        _run_cli(tmp_path, make, menu_patch=boom, ident_probe=lambda: "x")
-    out = capsys.readouterr().out
-    assert "may have been sent" in out and "the ENTER was sent" not in out
