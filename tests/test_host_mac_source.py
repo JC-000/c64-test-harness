@@ -20,7 +20,7 @@ import pytest
 
 import bridge_platform as bp
 
-REAL = "c0:56:27:b1:16:38"
+REAL = "02:c6:40:00:00:02"           # locally administered fake, not the redaction placeholder
 IFCONFIG_REDACTED = f"\tether {bp.REDACTED_MAC}\n\tinet 169.254.234.68 netmask 0xffff0000\n"
 IFCONFIG_REAL = f"\tether {REAL}\n\tinet 169.254.234.68 netmask 0xffff0000\n"
 NS_OK = f"Ethernet Address: {REAL} (Device: en4)\n"

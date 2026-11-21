@@ -256,6 +256,24 @@ def test_dead_app_still_gets_cut(env):
     assert ("poweroff",) not in ev and ("outlet", "OFF") in ev and rec["result"] == "ok"
 
 
+@pytest.mark.parametrize("host,before,stage", [
+    ("c64u", info("f1a5bed00"), "network"), ("c64u", info("f1a5bed00"), "identity"),
+    ("u64e", u64e("f1a5bed00"), "network"), ("u64e", u64e("f1a5bed00"), "identity"),
+])
+def test_the_power_up_hint_follows_only_a_device_that_did_not_come_back(env, host, before, stage):
+    """A board that never answered again gets the AC power-up hint; a wrong board answering (identity) does not."""
+    ev = env
+    plug = Plug(ev)
+    after = None if stage == "network" else info("f1a5bed00", uid="FED789", product=before["product"])
+    with pytest.raises(po.OutletError) as e:
+        cycle(ev, plug, Client(ev, plug, before, after), host=host, up_timeout=0 if stage == "network" else 5)
+    msg = str(e.value)
+    assert f"[{stage}]" in msg
+    hinted = "power-on mode" in msg or "powers up by itself" in msg
+    assert hinted is (stage == "network"), msg
+    assert plug.on and ev[-1] == ("release",)
+
+
 def test_wrong_device_behind_the_plug_refuses_before_cutting(env):
     ev = env
     plug = Plug(ev)
@@ -274,14 +292,16 @@ def test_dry_run_reads_the_plug_only(env):
 
 
 BENCH_TOML = ('[devices.abc123]\noutlet = "http://192.0.2.200"\noutlet_kind = "tasmota"\n'
-              '[devices.def456]\nram_run = true\n')
+              '[devices.def456]\nram_run = true\n'
+              '[devices.0a0b0c]\noutlet = "http://192.0.2.201"\noutlet_kind = "shelly-gen1"\n')
 
 
 def test_binding_from_bench_toml(tmp_path):
     p = tmp_path / "bench.toml"
     p.write_text(BENCH_TOML)
     assert po.outlet_binding("ABC123", p) == {"outlet": "http://192.0.2.200", "outlet_kind": "tasmota"}
-    for uid in ("DEF456", "FED789"):            # a table without the outlet keys; no table at all
+    # a table without the outlet keys; no table at all; a plug kind this script has no driver for
+    for uid in ("DEF456", "FED789", "0A0B0C"):
         with pytest.raises(po.OutletError, match="no outlet bound"):
             po.outlet_binding(uid, p)
 
@@ -297,17 +317,19 @@ def test_the_cycle_reads_its_binding_from_the_bench_file(env, tmp_path, monkeypa
         cycle(env, Plug(env), None, host="u64e", binding=None, dry_run=True)
 
 
-@pytest.mark.parametrize("text", [None, '[devices.abc123]\noutlet = 5\noutlet_kind = "tasmota"\n',
-                                  '[devices.abc123]\nhosts = ["192.0.2.26"]\noutlet = "http://p"\noutlet_kind = "tasmota"\n'],
-                         ids=["missing", "wrong-type", "unknown-key"])
-def test_a_missing_or_broken_bench_file_refuses_the_cycle(env, tmp_path, monkeypatch, text):
+@pytest.mark.parametrize("text,reason", [
+    (None, "does not exist"),
+    ('[devices.abc123]\noutlet = 5\noutlet_kind = "tasmota"\n', "outlet must be"),
+    ('[devices.abc123]\nhosts = ["192.0.2.26"]\noutlet = "http://p"\noutlet_kind = "tasmota"\n', "unknown key"),
+], ids=["missing", "wrong-type", "unknown-key"])
+def test_a_missing_or_broken_bench_file_refuses_the_cycle(env, tmp_path, monkeypatch, text, reason):
     p = tmp_path / "bench.toml"
     if text is not None:
         p.write_text(text)
     monkeypatch.setenv("C64_BENCH_BINDINGS_FILE", str(p))
-    with pytest.raises(po.OutletError, match="bench.toml"):
+    with pytest.raises(po.OutletError, match=reason) as e:
         cycle(env, Plug(env), None, binding=None, dry_run=True)
-    assert env == []
+    assert str(p) in str(e.value) and env == []
 
 
 def test_drivers_build_the_documented_urls():

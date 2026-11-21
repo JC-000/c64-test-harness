@@ -160,11 +160,11 @@ ADAPTER_LOCK = "jtag-adapter-usb-" + LOCATION
 BENCH_TOML = f"""\
 [devices.abc123]
 jtag_adapter_location = "{LOCATION}"
-jtag_adapter_baud = 921600
+jtag_adapter_baud = 460800
 
 [devices.def456]
 jtag_adapter_location = "{LOCATION}"
-jtag_adapter_baud = 921600
+jtag_adapter_baud = 115200
 jtag_scan_only = true
 
 [devices.fed789]
@@ -475,13 +475,13 @@ def test_missing_adapter_port_refuses(env, monkeypatch):
     assert e.value.stage == "adapter" and ev == []
 
 
-# -- the bindings in devices.toml ------------------------------------------------------------------------------
+# -- the bindings in bench.toml --------------------------------------------------------------------------------
 
 def test_the_load_adapter_comes_from_the_device_table(env, monkeypatch):
     seen = []
     monkeypatch.setattr(jl, "resolve_port", lambda location, comports=None: seen.append(location) or "/dev/cu.x")
     assert jl.bound_uid("c64u") == UID
-    assert jl.adapter_for(UID) == {"location": LOCATION, "lock": ADAPTER_LOCK, "baud": "921600", "port": "/dev/cu.x"}
+    assert jl.adapter_for(UID) == {"location": LOCATION, "lock": ADAPTER_LOCK, "baud": "460800", "port": "/dev/cu.x"}
     assert seen == [LOCATION]
 
 
@@ -497,7 +497,7 @@ def test_the_tables_baud_reaches_the_adapter_link(env):
     ev = env[0]
     esp = FakeEsp(ev)
     jl.read_ids("c64u", esp=esp, lock_factory=locks(ev), log=lambda m: None)
-    assert esp.baud == "921600" and ("acquire", "adapter") in ev
+    assert esp.baud == "460800" and ("acquire", "adapter") in ev
 
 
 @pytest.mark.parametrize("host", ["plain", "u64e", "no-baud", "no-location", "untabled", "192.0.2.26"])
@@ -525,7 +525,7 @@ def test_scan_uses_the_scan_only_devices_table(env, monkeypatch):
                      log=lambda m: None)
     assert e.value.stage == "power" and seen == [LOCATION]
     assert ("acquire", "u64e") in ev and ("acquire", "adapter") in ev
-    assert jl.adapter_binding("DEF456", scan=True) == {"location": LOCATION, "lock": ADAPTER_LOCK, "baud": "921600"}
+    assert jl.adapter_binding("DEF456", scan=True) == {"location": LOCATION, "lock": ADAPTER_LOCK, "baud": "115200"}
 
 
 @pytest.mark.parametrize("host", ["c64u", "plain", "no-baud", "untabled", "192.0.2.81", "zzzzdef456"])
@@ -536,7 +536,7 @@ def test_scan_refuses_a_device_that_is_not_scan_only(env, host):
     assert e.value.stage == "binding" and ev == []
 
 
-@pytest.mark.parametrize("text", [None, BENCH_TOML.replace("baud = 921600", 'baud = "921600"', 1),
+@pytest.mark.parametrize("text", [None, BENCH_TOML.replace("baud = 460800", 'baud = "460800"', 1),
                                   BENCH_TOML + "jtag_adapter_port = '/dev/cu.x'\n"],
                          ids=["missing", "wrong-type", "unknown-key"])
 def test_a_missing_or_broken_bench_file_is_a_binding_refusal(env, text):

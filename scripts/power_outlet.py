@@ -265,6 +265,8 @@ def outlet_cycle(host: str, *, off_s: float = MIN_OFF_S, graceful: bool | None =
             rec["info"] = jl.wait_info(host, uid, expect_git_hash, up_timeout, client_factory, sleep, clock,
                                        products=products)   # the board that answered before may answer after
         except jl.JtagLoadError as e:
+            if e.stage != "network":                   # it answered, as the wrong board: no power-up question
+                raise OutletError(str(e)) from e
             hint = (" The C64U powers up after AC restore by its power-on mode (power_state.c:130-158)"
                     + ("; the poweroff stored last-state OFF, so only mode ON brings it back." if poweroff else ".")
                     if isinstance(product, str) and product in C64U_PRODUCTS else

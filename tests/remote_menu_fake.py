@@ -277,7 +277,7 @@ class FakeUltimate:
         self.wifi_after_disable = list(wifi_after_disable or [
             {"state": "disabled", "ident": "ESP32 WiFi Bridge V0.903 bench"}])
         self.wifi_after_enable = list(wifi_after_enable or [
-            {"state": "link-down", "mac": "3C:DC:75:4A:38:60"},
+            {"state": "link-down", "mac": "02:C6:40:00:00:01"},
             {"state": "link-up", "ip": "10.0.0.82"}])
         self._pending_wifi: list[dict] = []
         self.redraw_after_commit = redraw_after_commit
@@ -288,7 +288,7 @@ class FakeUltimate:
         self.esp = esp
         self.esp_actions = esp_actions
         self.wifi_after_esp = list(wifi_after_esp or [
-            {"state": "link-down", "mac": "3C:DC:75:4A:38:60"},
+            {"state": "link-down", "mac": "02:C6:40:00:00:01"},
             {"state": "link-up", "ip": "10.0.0.82"}])
         self.esp_restarts = 0
         self.framed = framed

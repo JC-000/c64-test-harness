@@ -133,7 +133,7 @@ def test_no_popup_is_loud_presses_nothing_and_does_not_retry(make, held):
 
 
 def test_wifi_that_never_comes_back_fails_verification(make, held):
-    fake, menu = make(wifi_after_esp=[{"state": "link-down", "mac": "3C:DC:75:4A:38:60"}])
+    fake, menu = make(wifi_after_esp=[{"state": "link-down", "mac": "02:C6:40:00:00:01"}])
     with pytest.raises(EspFlashVerifyError) as exc:
         _flash(menu, verify_timeout=0.5)
     r = exc.value.result
