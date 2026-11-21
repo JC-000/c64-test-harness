@@ -1276,6 +1276,19 @@ class Ultimate64RemoteMenu:
                 return st
         raise RemoteMenuNotFoundError(f"no WiFi row on {self.host}'s root", screen=view.rows)
 
+    def ethernet_ip(self) -> str | None:
+        """The IP the root's Net0 (Ethernet) row shows, or ``None`` (no Net0 row,
+        or no address on it), from a fresh session."""
+        sess = self._open("ethernet_ip")
+        try:
+            for e in self._view(sess).entries:
+                if e.name == "Net0":
+                    m = re.search(r"IP:\s*(\d+\.\d+\.\d+\.\d+)", e.text)
+                    return m.group(1) if m else None
+            return None
+        finally:
+            sess.close()
+
     def context_actions(self, path: str) -> tuple[str, ...]:
         """The labels of *path*'s context menu. Opens the menu, chooses nothing."""
         _split_path(path)
@@ -1768,10 +1781,19 @@ class Ultimate64RemoteMenu:
         start = len(self._seen_messages)
         before = self.wifi_status()
         known_ip = wifi_ip or before.ip
-        if known_ip is not None and self.host == known_ip:
+        # Decide from the device's live interface data, never from notes: the
+        # host must not be the Wi-Fi address (the stated one OR the live one),
+        # and must be the address the Ethernet row reports.
+        for label, ip in (("stated Wi-Fi", wifi_ip), ("live Wi-Fi", before.ip)):
+            if ip is not None and self.host == ip:
+                raise Ultimate64UnsafeOperationError(
+                    f"flash_esp: {self.host} is the module's {label} address. The flash stops "
+                    "Wi-Fi, so this telnet session would die mid-flash. Use the Ethernet address.")
+        eth = self.ethernet_ip()
+        if eth is not None and re.fullmatch(r"\d+\.\d+\.\d+\.\d+", self.host) and self.host != eth:
             raise Ultimate64UnsafeOperationError(
-                f"flash_esp: {self.host} is the module's Wi-Fi address. The flash stops "
-                "Wi-Fi, so this telnet session would die mid-flash. Use the Ethernet address.")
+                f"flash_esp: {self.host} is not the address the device's Net0 row reports "
+                f"({eth}). Use the Ethernet address.")
         ident_before = ident_probe() if ident_probe else before.ident
         if (expect_ident is not None and ident_before is not None
                 and ident_before.strip() == expect_ident.strip() and not allow_same_ident):
@@ -1831,7 +1853,11 @@ class Ultimate64RemoteMenu:
                 if time.monotonic() >= end:
                     break
                 time.sleep(self.timing.poll_interval)
-        ident_after = ident_probe() if ident_probe else ident_seen
+        probe_err: Exception | None = None
+        try:
+            ident_after = ident_probe() if ident_probe else ident_seen
+        except Exception as exc:  # the module is already flashed: report, don't mask
+            ident_after, probe_err = None, exc
         ident_ok = None if expect_ident is None else (
             ident_after is not None and ident_after.strip() == expect_ident.strip())
         res = EspFlashResult(
@@ -1839,6 +1865,8 @@ class Ultimate64RemoteMenu:
             ident_before, ident_after, expect_ident, ident_ok, True,
             tuple(self._seen_messages[start:]))
         problems = []
+        if probe_err is not None:
+            problems.append(f"the post-flash ident read failed ({probe_err}); the module WAS flashed")
         if not back:
             problems.append(f"Wi-Fi did not return to link-up within {verify_timeout:.0f} s")
         elif not ping_ok:

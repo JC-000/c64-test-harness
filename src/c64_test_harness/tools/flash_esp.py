@@ -152,6 +152,8 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
     try:
         menu = (menu_factory or Ultimate64RemoteMenu)(a.host)
         try:
+            print("WARNING: do not touch the U64E's keyboard or menu during the flash window "
+                  "(the action has no mutex); Wi-Fi is off for its duration.")
             put(a.host, dest, a.esp, overwrite=True)
             # The firmware reports "Success!" for a truncated file: read it back.
             back = get(a.host, dest)

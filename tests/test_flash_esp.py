@@ -330,3 +330,66 @@ def test_ident_longer_than_31_chars_is_refused(make, held):
     with pytest.raises(Ultimate64UnsafeOperationError):
         _flash(menu, expect_ident="x" * 32, ident_probe=lambda: "y")
     assert fake.sessions == []
+
+
+# -- review round 1 --------------------------------------------------------------
+
+def test_an_explicit_wifi_ip_does_not_bypass_the_live_wifi_ip(make, held):
+    """The device's own Wi-Fi row says 10.0.0.82; claiming another --wifi-ip must not
+    let a session through that is on the live Wi-Fi address."""
+    fake, menu = make(wifi={"state": "link-up", "ip": "127.0.0.1"})
+    with pytest.raises(Ultimate64UnsafeOperationError):
+        _flash(menu, wifi_ip="10.9.9.9")
+    assert fake.all_commits() == []
+
+
+def test_the_host_must_be_the_ethernet_address_the_device_reports(make, held):
+    fake, menu = make(root=[("Temp", "RAM Disk", "Ready"), ("Net0", "IP: 10.1.1.1", "Link Up"),
+                            ("WiFi", "", "")])
+    with pytest.raises(Ultimate64UnsafeOperationError) as exc:
+        _flash(menu)
+    assert "Net0" in str(exc.value) and fake.all_commits() == []
+
+
+def test_an_ident_probe_failure_after_the_flash_is_not_nothing_flashed(make, held):
+    from c64_test_harness.backends.ultimate64_remote_menu import Ultimate64RemoteMenuError
+    fake, menu = make()
+    calls = iter([lambda: "OLD"])
+    n = {"i": 0}
+
+    def probe():
+        n["i"] += 1
+        if n["i"] == 1:
+            return "OLD"
+        raise Ultimate64RemoteMenuError("row unreadable", enter_sent=False)
+
+    with pytest.raises(EspFlashVerifyError) as exc:
+        _flash(menu, ident_probe=probe)
+    assert exc.value.enter_sent is True and exc.value.result.flash_ok is True
+    assert "ident" in str(exc.value)
+
+
+def test_cli_failure_after_the_enter_exits_1_not_2(tmp_path, make, held, capsys):
+    rc, calls, lock, fake = _run_cli(tmp_path, make, ident_probe=lambda: "x",
+                                     esp="popup:Something unexpected")
+    assert rc == 1 and ("delete", "/Temp/raw_u64.esp") in calls
+
+
+def test_wifi_back_on_another_address_than_the_stated_one_fails(make, held):
+    fake, menu = make()
+    with pytest.raises(EspFlashVerifyError) as exc:
+        _flash(menu, wifi_ip="10.0.0.99")
+    assert "came back as" in str(exc.value)
+
+
+def test_a_known_text_with_other_buttons_is_not_answered(make, held):
+    from c64_test_harness.backends.ultimate64_remote_menu import RemoteMenuUnexpectedScreenError
+    fake, menu = make(esp="yesno:Flashing ESP32 Success!")
+    with pytest.raises(RemoteMenuUnexpectedScreenError):
+        _flash(menu)
+    assert _oks(fake) == 0
+
+
+def test_cli_warns_not_to_touch_the_device(tmp_path, make, held, capsys):
+    _run_cli(tmp_path, make, ident_probe=lambda: "x")
+    assert "do not touch the U64E's keyboard or menu" in capsys.readouterr().out

@@ -726,6 +726,11 @@ class _Session:
             text = "Could not switch to download mode."
         elif dev.esp.startswith("popup:"):
             text = dev.esp.split(":", 1)[1]
+        elif dev.esp.startswith("yesno:"):
+            text = dev.esp.split(":", 1)[1]
+            self.popup = (text, ["Yes", "No"])
+            self.redraw()
+            return
         else:
             text = f"Flashing Error {dev.esp.split(':', 1)[1]}"
         self.popup = (text, ["Ok"])
