@@ -69,7 +69,8 @@ button and never cuts power. It never retries Run Update.
 
 **Steps** (``FlashRecord.steps`` lists the ones that finished):
 
-1. ``validate``: the image, the ROMs, the kind, the confirmation. No traffic.
+1. ``validate``: the image, the ROMs, the kind, the confirmation, and the
+   caller's ``reformat_flash_disk`` (a ``bool``, required). No traffic.
 2. ``preflight``: bodyless ``GET /v1/info``: product (picks the extension and
    the instruction), ``unique_id``, the running ``git_commit_hash``. On a
    C64U the JTAG recovery check is logged (warn-only; see
@@ -87,14 +88,22 @@ button and never cuts power. It never retries Run Update.
 7. ``reset_categories`` (official C64U images only, after NO): the harness
    resets the non-network categories with :func:`apply_factory_baseline`.
 8. ``wifi_ident`` (only with ``expected_wifi_ident``): Disable, read the
-   module IDENT, Enable, wait for Link Up. **On the U64E the Disable and
-   the Enable each write the WiFi config store to flash** (``network_esp32.cc``
-   ``set_enabled``; #543); on the C64U they switch the radio only.
-9. ``roms`` (C64U only, and only when ROMs are supplied): ``storage_put_rom``
-   for each, then ``reboot()`` so the C64 loads its ROMs again
-   (``c64.cc:915``). ``reboot()`` resets the C64 only; the firmware and REST
-   keep running. The ``/v1/info`` read after it is a sanity check that the
-   same device and firmware still answer; it proves nothing about the ROMs.
+   module IDENT, Enable, wait for Link Up; the same cycle as the public
+   :func:`read_wifi_ident`, which works outside a flash. **On the U64E the
+   Disable and the Enable each write the WiFi config store to flash**
+   (``network_esp32.cc`` ``set_enabled``; #543); on the C64U they switch
+   the radio only.
+9. ``roms`` (C64U only, and only when ROMs are supplied): a ROM that
+   ``/Flash/roms`` already holds with the same SHA-256 is not written
+   (``FlashRecord.roms_unchanged``; it is read over FTP to compare). Every
+   other one goes through ``storage_put_rom``, whose refusals (*overwrite*,
+   *replace_stock*) apply unchanged. If any was written, or step 7 reset the
+   ROM selection in RAM (a config change does not reload ROMs, 1.1.0
+   ``c64.cc:267-275``), ``reboot()`` follows so the C64 loads its ROMs
+   again (``c64.cc:915``). ``reboot()`` resets the
+   C64 only; the firmware and REST keep running. The ``/v1/info`` read after
+   it is a sanity check that the same device and firmware still answer; it
+   proves nothing about the ROMs.
 
 Evidence grades: everything here is source-read or taken from the
 2026-11-09 #543/#562 bench records, except one live flash (2026-11-09,
@@ -120,12 +129,16 @@ from typing import Any, Callable, Sequence
 from .ultimate64_baseline import BaselineReport, apply_factory_baseline
 from .ultimate64_client import Ultimate64Client, Ultimate64Error
 from .ultimate64_remote_menu import (
+    RemoteMenuLockError,
     RunUpdateResult,
     Ultimate64RemoteMenu,
+    Ultimate64RemoteMenuError,
     WifiStatus,
 )
 from .ultimate64_storage import (
+    ROM_DIRECTORY,
     StoragePutResult,
+    _ascii_fold,
     _check_path,
     _check_rom,
     storage_get_file,
@@ -149,9 +162,14 @@ __all__ = [
     "RomImage",
     "SILENT_MARKER",
     "UpdateImageInfo",
+    "WifiIdentError",
+    "WifiIdentReading",
+    "WifiIdentUnreadableError",
+    "WifiLinkTimeoutError",
     "flash_firmware",
     "inspect_update_image",
     "operator_instruction",
+    "read_wifi_ident",
 ]
 
 _log = logging.getLogger(__name__)
@@ -357,6 +375,9 @@ class FlashRecord:
     upload: StoragePutResult | None = None
     #: The answer the operator is told to give to "Reset Configuration?".
     reset_configuration_answer: str | None = None
+    #: The caller's ``reformat_flash_disk``: the answer the operator is told to
+    #: give to "Reformat Flash Disk?" (``True`` = YES).
+    reformat_flash_disk: bool | None = None
     operator_instruction: str | None = None
     run_update: RunUpdateResult | None = None
     #: Seconds from the Run Update result to REST answering.
@@ -377,7 +398,13 @@ class FlashRecord:
     wifi_ident_verified: bool | None = None
     #: The WiFi row after the Enable and the Link Up wait.
     wifi_after: WifiStatus | None = None
+    #: ROMs written by the ``roms`` step.
     roms: list[StoragePutResult] = field(default_factory=list)
+    #: ROMs already in ``/Flash/roms`` with the expected SHA-256: nothing was
+    #: written for them. Device paths, in the device's spelling.
+    roms_unchanged: list[str] = field(default_factory=list)
+    #: ``True`` when the ``roms`` step rebooted: it wrote a ROM, or
+    #: ``reset_categories`` ran before it.
     rebooted: bool = False
     git_commit_hash_after_reboot: str | None = None
     warnings: list[str] = field(default_factory=list)
@@ -542,14 +569,17 @@ def _image_class(img: UpdateImageInfo) -> str | None:
     return None
 
 
-def operator_instruction(family: str, kind: str) -> str:
+def operator_instruction(family: str, kind: str, *, reformat_flash_disk: bool) -> str:
     """The exact instruction for the person at the device.
 
     The prompts appear on the C64 screen only; the harness cannot see or
     answer them. "Reformat Flash Disk?" is asked only when the flash disk
-    already has files (``check_flash_disk``, ``FR_DIR_NOT_EMPTY``); YES
-    follows the bench rule that every flash formats flash and resets to
-    defaults, and the drive ROMs are rewritten by the updater after it.
+    already has files (``check_flash_disk``, ``FR_DIR_NOT_EMPTY``). Its
+    answer is the caller's *reformat_flash_disk* (required, no default):
+    the bench rule is NO, and YES only when a test needs a formatted flash
+    disk (owner, 2026-11-14). The drive ROMs are rewritten by the updater
+    after the question either way. A SILENT image asks nothing, so there
+    the answer does not appear.
     """
     if family == "c64u" and kind == "silent":
         return (
@@ -565,7 +595,8 @@ def operator_instruction(family: str, kind: str) -> str:
     lines = [
         f"{'C64U' if family == 'c64u' else 'U64E'} {kind} image: answer the updater "
         "prompts on the C64 screen exactly as follows:",
-        "  'Reformat Flash Disk?' (only asked if the flash disk has files): YES",
+        "  'Reformat Flash Disk?' (only asked if the flash disk has files): "
+        + ("YES" if reformat_flash_disk else "NO"),
         "  'About to update. Continue?': YES",
         f"  'Reset Configuration? (Recommended)': {reset}",
         "  an ESP32 'Flashing ESP32 ...' popup, if one waits for OK: OK",
@@ -712,63 +743,196 @@ def _settled_wifi(menu: Ultimate64RemoteMenu, timeout: float, poll: float) -> Wi
         _sleep(poll)
 
 
-def _check_wifi_ident(menu: Ultimate64RemoteMenu, expected: str, run: _Run,
-                      link_timeout: float, poll: float) -> None:
-    rec = run.record
+@dataclass(frozen=True)
+class WifiIdentReading:
+    """What :func:`read_wifi_ident` read, and the WiFi row around it.
+
+    ``ident`` is the module IDENT as the Disabled row shows it, e.g.
+    ``ESP32 WiFi Bridge V1.494``, or ``None`` when the Disabled row's field
+    is blank (``eWifi_Off``). ``before`` is the settled row before anything
+    was sent; ``after`` is the last row read (Link Up after a cycle, or
+    ``before`` itself when nothing was toggled). ``toggled`` is ``True``
+    when WiFi was disabled for the read and enabled again.
+    """
+
+    ident: str | None
+    before: WifiStatus
+    after: WifiStatus
+    toggled: bool
+
+
+class WifiIdentError(Ultimate64RemoteMenuError):
+    """:func:`read_wifi_ident` could not finish. ``reading`` holds what it
+    had read so far, or ``None``."""
+
+    def __init__(self, message: str, *, reading: WifiIdentReading | None,
+                 enter_sent: bool) -> None:
+        super().__init__(message, enter_sent=enter_sent)
+        self.reading = reading
+
+
+class WifiIdentUnreadableError(WifiIdentError):
+    """The WiFi row is in a state with no IDENT to read and no Disable to
+    show one (``scanning``, ``busy``, ``firmware?``, ``no-module``,
+    ``unknown``). Nothing was sent."""
+
+
+class WifiLinkTimeoutError(WifiIdentError):
+    """WiFi was enabled again after the IDENT read but did not get back to
+    the state it was found in (Link Up; Link Down or Link Up for a row found
+    Link Down) within the limit. ``reading`` has the IDENT and the last row."""
+
+
+class _WifiProgress:
+    """What the WiFi IDENT read has seen so far, kept if it raises."""
+
+    def __init__(self) -> None:
+        self.before: WifiStatus | None = None
+        self.ident: str | None = None
+        self.after: WifiStatus | None = None
+
+
+def _wifi_ident_cycle(menu: Ultimate64RemoteMenu, link_timeout: float, poll: float,
+                      warn: Callable[[str], None], seen: _WifiProgress, *,
+                      require_link_up: bool) -> WifiIdentReading:
+    """The one implementation of the IDENT read; see :func:`read_wifi_ident`.
+
+    After the Enable it waits for Link Up when *require_link_up* is true or
+    the row was found Link Up; a row found Link Down counts as restored at
+    Link Down or Link Up.
+    """
     st = _settled_wifi(menu, link_timeout, poll)
-    rec.wifi_before_check = st
+    seen.before = st
     if st.state == "disabled":
         # Already off: read it, and leave it as found.
-        rec.wifi_ident = st.ident
-        rec.wifi_after = st
-    elif st.state in ("link-up", "link-down"):
-        ident = None
-        failure: BaseException | None = None
-        try:
-            off = menu.set_wifi_enabled(False)
-            rec.wifi_after = off.after
-            ident = off.after.ident if off.after is not None else None
-            if ident is None:
-                ident = menu.wifi_status().ident
-            rec.wifi_ident = ident
-        except BaseException as exc:
-            failure = exc
-            raise
-        finally:
-            # Put back what this step may have changed. Skipped only when the
-            # failure says the Disable's ENTER was never sent.
-            if failure is None or getattr(failure, "enter_sent", None) is not False:
-                try:
-                    menu.set_wifi_enabled(True)
-                except Exception:
-                    run.warn("WiFi may have been Disabled for the IDENT read and the "
-                             "Enable failed: it may be left Disabled")
-                    if failure is None:
-                        raise
-        deadline = _monotonic() + link_timeout
-        while True:
-            now_st = menu.wifi_status()
-            rec.wifi_after = now_st
-            if now_st.state == "link-up":
-                break
-            if _monotonic() >= deadline:
-                raise run.fail(FirmwareFlashTimeoutError,
-                               f"WiFi enabled again but not Link Up within {link_timeout:.0f} s "
-                               f"(row {now_st.row!r}); module IDENT read {ident!r}")
-            _sleep(poll)
-    else:
-        raise run.fail(FirmwareFlashVerifyError,
-                       f"WiFi row is {st.state!r} ({st.row!r}); the module IDENT cannot be read")
-    rec.wifi_ident_verified = rec.wifi_ident == expected
+        seen.ident = st.ident
+        seen.after = st
+        return WifiIdentReading(st.ident, st, st, False)
+    if st.state not in ("link-up", "link-down"):
+        raise WifiIdentUnreadableError(
+            f"WiFi row is {st.state!r} ({st.row!r}); the module IDENT cannot be read",
+            reading=None, enter_sent=False)
+    ident = None
+    failure: BaseException | None = None
+    try:
+        off = menu.set_wifi_enabled(False)
+        seen.after = off.after
+        ident = off.after.ident if off.after is not None else None
+        if ident is None:
+            ident = menu.wifi_status().ident
+        seen.ident = ident
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        # Put back what this read may have changed. Skipped only when the
+        # failure says the Disable's ENTER was never sent.
+        if failure is None or getattr(failure, "enter_sent", None) is not False:
+            try:
+                menu.set_wifi_enabled(True)
+            except Exception:
+                warn("WiFi may have been Disabled for the IDENT read and the "
+                     "Enable failed: it may be left Disabled")
+                if failure is None:
+                    raise
+    restored = (("link-up",) if require_link_up or st.state == "link-up"
+                else ("link-up", "link-down"))
+    deadline = _monotonic() + link_timeout
+    while True:
+        now_st = menu.wifi_status()
+        seen.after = now_st
+        if now_st.state in restored:
+            return WifiIdentReading(ident, st, now_st, True)
+        if _monotonic() >= deadline:
+            raise WifiLinkTimeoutError(
+                f"WiFi enabled again but not "
+                f"{'Link Up' if len(restored) == 1 else 'Link Up or Link Down'} "
+                f"within {link_timeout:.0f} s "
+                f"(row {now_st.row!r}); module IDENT read {ident!r}",
+                reading=WifiIdentReading(ident, st, now_st, True), enter_sent=True)
+        _sleep(poll)
+
+
+def read_wifi_ident(
+    host: str,
+    *,
+    link_timeout_s: float = 90.0,
+    poll_interval_s: float = 5.0,
+    menu_factory: Callable[[str], Ultimate64RemoteMenu] | None = None,
+) -> WifiIdentReading:
+    """Read the WiFi module's IDENT from the Remote Menu's WiFi row.
+
+    The firmware shows the IDENT only while WiFi is Disabled. So, once the
+    row has settled (up to *link_timeout_s*): a row already ``disabled`` is
+    read and left as it is; a ``link-up`` or ``link-down`` row is Disabled,
+    read, Enabled again, and then polled every *poll_interval_s* (up to
+    *link_timeout_s*) until it is back where it was: a row found Link Up
+    must read Link Up again (it reads Link Down first, #562); a row found
+    Link Down counts as restored at Link Down or Link Up, so a module with
+    no access point to join is not a failure. The Enable is sent even when
+    the Disable or the read fails, unless the failure says the Disable's
+    ENTER was never sent (``enter_sent=False``). (``flash_firmware``'s
+    ``wifi_ident`` step requires Link Up whatever the row was.) A
+    ``KeyboardInterrupt`` during the re-Enable itself can leave WiFi
+    Disabled; that cannot be avoided, so check WiFi after an interrupted call.
+
+    Works on the U64E and the C64U alike, outside a flash. **On the U64E
+    the Disable and the Enable each write the WiFi config store to flash**
+    (``network_esp32.cc`` ``set_enabled``; #543); on the C64U they switch
+    the radio only. Zero ``/Temp``: telnet only.
+
+    The caller must hold *host*'s ``DeviceLock``; without it
+    :class:`RemoteMenuLockError` is raised before anything is sent.
+
+    :param menu_factory: builds the Remote Menu driver; for tests.
+    :raises WifiIdentUnreadableError: the row is in a state with no IDENT.
+    :raises WifiLinkTimeoutError: enabled again, but not back in its found
+        state in time.
+    :raises Ultimate64RemoteMenuError: from the menu driver, as it raised.
+    """
+    if not lock_held_for(host):
+        raise RemoteMenuLockError(
+            f"refusing read_wifi_ident on {host}: this process does not hold the "
+            f"device's DeviceLock. Take it first, e.g. "
+            f"DeviceLock({host!r}).acquire_or_raise(timeout=...).")
+    menu = (menu_factory or Ultimate64RemoteMenu)(host)
+
+    def warn(message: str) -> None:
+        _log.warning("read_wifi_ident %s: %s", host, message)
+
+    return _wifi_ident_cycle(menu, link_timeout_s, poll_interval_s, warn, _WifiProgress(),
+                             require_link_up=False)
+
+
+def _check_wifi_ident(menu: Ultimate64RemoteMenu, expected: str, run: _Run,
+                      link_timeout: float, poll: float) -> None:
+    """The flash's ``wifi_ident`` step: :func:`read_wifi_ident`'s cycle, then
+    the comparison with *expected*."""
+    rec = run.record
+    seen = _WifiProgress()
+    try:
+        # The flash keeps its Link Up requirement (#562) whatever the row was.
+        reading = _wifi_ident_cycle(menu, link_timeout, poll, run.warn, seen,
+                                    require_link_up=True)
+    except WifiIdentUnreadableError as exc:
+        raise run.fail(FirmwareFlashVerifyError, str(exc)) from exc
+    except WifiLinkTimeoutError as exc:
+        raise run.fail(FirmwareFlashTimeoutError, str(exc)) from exc
+    finally:
+        rec.wifi_before_check = seen.before
+        rec.wifi_ident = seen.ident
+        rec.wifi_after = seen.after
+    rec.wifi_ident_verified = reading.ident == expected
     if not rec.wifi_ident_verified:
         raise run.fail(FirmwareFlashVerifyError,
-                       f"WiFi module IDENT is {rec.wifi_ident!r}, expected {expected!r}")
+                       f"WiFi module IDENT is {reading.ident!r}, expected {expected!r}")
 
 
 def flash_firmware(
     host: str,
     image: FirmwareImage,
     *,
+    reformat_flash_disk: bool,
     confirm_device_powers_off: bool = False,
     roms: Sequence[RomImage] = (),
     dry_run: bool = False,
@@ -783,12 +947,23 @@ def flash_firmware(
     See the module docstring for the steps and the rules. The caller must
     hold the device's ``DeviceLock`` for the whole call.
 
+    :param reformat_flash_disk: required, no default, a ``bool``: the answer
+        the operator is told to give to "Reformat Flash Disk?" (``True`` =
+        YES). The bench rule is ``False`` (NO), and ``True`` only when a test
+        needs a formatted flash disk (owner, 2026-11-14). Recorded in
+        ``FlashRecord.reformat_flash_disk``. Omitting it is a ``TypeError``
+        and a value that is not a ``bool`` is refused in ``validate``, both
+        before any traffic. A SILENT image asks nothing, so there it only
+        reaches the record.
     :param confirm_device_powers_off: required for a real run (not for a dry
         run), and passed to ``run_update``. Every updater ends by switching
         the machine off; a U64E, and a C64U on a prompting image, then needs
         its power button pressed.
     :param roms: C64U only. Installed with ``storage_put_rom`` after the
-        flash is verified, followed by ``reboot()`` and a second verify.
+        flash is verified, followed by ``reboot()`` and a second verify. A
+        ROM ``/Flash/roms`` already holds with the same SHA-256 is not
+        written and is listed in ``FlashRecord.roms_unchanged``; if no ROM
+        was written there is no ``reboot()``.
     :param dry_run: validation, preflight and navigation only: no upload, no
         ENTER, no config, WiFi or ROM change. Navigation needs the image to
         be on the device already; if it is not, it is skipped with a warning.
@@ -808,9 +983,11 @@ def flash_firmware(
         expected_firmware_version=image.expected_firmware_version,
     )
     run = _Run(record)
+    if isinstance(reformat_flash_disk, bool):
+        record.reformat_flash_disk = reformat_flash_disk
     make_client = client_factory or (lambda h: Ultimate64Client(h, timeout=_INFO_TIMEOUT))
     make_menu = menu_factory or Ultimate64RemoteMenu
-    v = _validate(image, roms, dry_run, confirm_device_powers_off, run)
+    v = _validate(image, roms, dry_run, confirm_device_powers_off, reformat_flash_disk, run)
     clients: list[Ultimate64Client] = []
     try:
         return _flash(host, image, roms, v, dry_run, confirm_device_powers_off, wait_up_s,
@@ -835,7 +1012,7 @@ class _Validated:
 
 
 def _validate(image: FirmwareImage, roms: Sequence[RomImage], dry_run: bool,
-              confirm: bool, run: _Run) -> _Validated:
+              confirm: bool, reformat_flash_disk: Any, run: _Run) -> _Validated:
     """Step 1: every check that needs no traffic. The lock comes first."""
     host = run.record.host
     if not lock_held_for(host):
@@ -846,6 +1023,10 @@ def _validate(image: FirmwareImage, roms: Sequence[RomImage], dry_run: bool,
         raise run.fail(FirmwareFlashRefusedError,
                        "every updater ends by switching the machine off; pass "
                        "confirm_device_powers_off=True (or dry_run=True)")
+    if not isinstance(reformat_flash_disk, bool):
+        raise run.fail(FirmwareFlashRefusedError,
+                       "reformat_flash_disk must be True or False (the answer to "
+                       f"'Reformat Flash Disk?'), not {reformat_flash_disk!r}")
     if image.kind not in FIRMWARE_IMAGE_KINDS:
         raise run.fail(FirmwareImageError,
                        f"kind {image.kind!r} is not one of {FIRMWARE_IMAGE_KINDS}")
@@ -976,7 +1157,8 @@ def _flash(host: str, image: FirmwareImage, roms: Sequence[RomImage], v: _Valida
         run.warn(RECOVERY_CHECK_NOTE)
     record.reset_configuration_answer = (
         "automatic (SILENT: always resets)" if silent else _reset_answer(family, image.kind))
-    record.operator_instruction = operator_instruction(family, image.kind)
+    record.operator_instruction = operator_instruction(
+        family, image.kind, reformat_flash_disk=bool(record.reformat_flash_disk))
     run.done()
 
     # -- 3. upload ---------------------------------------------------------------
@@ -1093,22 +1275,56 @@ def _flash(host: str, image: FirmwareImage, roms: Sequence[RomImage], v: _Valida
         _require_lock(run)
         try:
             for rom, payload in zip(roms, v.rom_payloads):
+                same = _rom_unchanged(host, rom.name, payload)
+                if same is not None:
+                    record.roms_unchanged.append(same)
+                    _log.info("flash %s: %s already holds this ROM; not written", host, same)
+                    continue
                 record.roms.append(storage_put_rom(
                     host, rom.kind, rom.name, payload, overwrite=rom.overwrite,
                     replace_stock=rom.replace_stock, check_signature=rom.check_signature))
-            # Resets the C64 only, so it loads its ROMs again (c64.cc:915);
-            # the firmware and REST keep running.
-            client.reboot()
-            record.rebooted = True
+            if record.roms or record.baseline is not None:
+                # Resets the C64 only, so it loads its ROMs again (c64.cc:915);
+                # the firmware and REST keep running. Also after
+                # reset_categories: it resets the ROM selection in RAM, and a
+                # config change does not reload ROMs (1.1.0 c64.cc:267-275).
+                client.reboot()
+                record.rebooted = True
         except Exception as exc:
             raise run.fail(FirmwareFlashStepError, f"{type(exc).__name__}: {exc}") from exc
-        # A sanity check that the same device and firmware still answer. It
-        # proves nothing about the ROMs.
-        info, _ = _wait_for_rest(client, wait_up_s, poll_interval_s, run, "after reboot()")
-        _verify_identity(info, run, exp)
-        record.git_commit_hash_after_reboot = info.get("git_commit_hash")
+        if record.rebooted:
+            # A sanity check that the same device and firmware still answer.
+            # It proves nothing about the ROMs.
+            info, _ = _wait_for_rest(client, wait_up_s, poll_interval_s, run, "after reboot()")
+            _verify_identity(info, run, exp)
+            record.git_commit_hash_after_reboot = info.get("git_commit_hash")
         run.done()
     return record
+
+
+def _rom_unchanged(host: str, name: str, payload: bytes) -> str | None:
+    """The device path of ROM *name* if ``/Flash/roms`` already holds exactly
+    *payload*, else ``None``. Reads only; never writes.
+
+    Lists ``/Flash/roms``, matches *name* ASCII-casefolded as
+    ``storage_put_rom`` does, compares the size, and only then reads the file
+    and compares its SHA-256. When the file is absent, has another size or
+    other content, this returns ``None`` and ``storage_put_rom`` applies its
+    usual refusals (*overwrite*, *replace_stock*). A hidden file is not
+    listed, so it is never taken as unchanged.
+    """
+    try:
+        entries = storage_list_dir(host, ROM_DIRECTORY)
+    except FileNotFoundError:
+        return None
+    for e in entries:
+        if _ascii_fold(e.name) == _ascii_fold(name):
+            if e.kind != "file" or e.size != len(payload):
+                return None
+            path = f"{ROM_DIRECTORY}/{e.name}"
+            got = hashlib.sha256(storage_get_file(host, path)).hexdigest()
+            return path if got == hashlib.sha256(payload).hexdigest() else None
+    return None
 
 
 def _find_existing(host: str, device_path: str, img: UpdateImageInfo) -> str | None:
