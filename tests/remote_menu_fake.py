@@ -85,6 +85,7 @@ UPDATE_EXTENSIONS = ("U64", "UE2", "CFW")
 #: ``IecPrinter::executeCommand``'s popup when Flush/Eject's wait runs out
 #: (``iec_printer.cc:345`` at 700c7f2fa).
 STILL_PRINTING = "The page is still printing.\nIt is saved when it is done."
+ESP_ACTION = "Flash into ESP32"
 FILE_ACTIONS = ["Copy to...", "Move to...", "Rename", "Delete"]
 
 
@@ -171,6 +172,20 @@ class FakeUltimate:
         stopping. How long a real load takes is not established: on the
         C64U on 2026-11-09 the first redraw came 9.6 s after the first ENTER,
         either a slow load of 8.8 MB or a lost first ENTER.
+    :param esp: what "Flash into ESP32" does (``.ESP`` files only, U64E builds):
+        ``"success"``, ``"error:<N>"`` ("Flashing Error N"), ``"nodownload"``
+        ("Could not switch to download mode.", module never restarted), or
+        ``"none"`` (no popup at all), or ``"close"`` (the device closes the
+        session right after the ENTER). Like the firmware, the result popup
+        comes BEFORE the module restart: the module restarts only when the
+        popup is answered with ``o``, then the Wi-Fi row walks through
+        :attr:`wifi_after_esp`. What the Wi-Fi row shows while the flash runs
+        is NOT established (no source assigns the "Programming ESP32" state
+        and no live observation exists), so the fake leaves the row as it was
+        and no test may depend on it.
+    :param esp_actions: ``False`` models a build without the action (C64U).
+    :param wifi_after_esp: the Wi-Fi states after the restart, one per later
+        connection.
     :param messages: queued ``postMessage`` texts; an entry may also be
         ``(text, buttons)`` to draw a popup with other buttons.
     :param start_path: where a fresh session opens ("Enter Home on Startup").
@@ -215,6 +230,9 @@ class FakeUltimate:
         update: str = "start",
         update_load_s: float = 0.0,
         messages: list[str] | None = None,
+        esp: str = "success",
+        esp_actions: bool = True,
+        wifi_after_esp: list[dict] | None = None,
         framed: bool = False,
         password: str | None = None,
         refuse_sessions: bool = False,
@@ -245,12 +263,15 @@ class FakeUltimate:
             "/USB1/": [
                 Entry("Backups", "DIR"),
                 Entry("firmware", "DIR"),
+                Entry("espflash", "DIR"),
                 Entry("update_m3.u64", "U64", "5609K"),
                 Entry("vf_ue.u64", "U64", "5503K"),
                 Entry("wraptor.d64", "D64", "171K"),
             ],
             "/USB1/firmware/": [Entry("cu_vf.ue2", "UE2", "8830K")],
+            "/Temp/": [Entry("raw_u64.esp", "ESP", "1200K"), Entry("old.d64", "D64", "171K")],
             "/USB1/Backups/": [],
+            "/USB1/espflash/": [Entry("raw_u64.esp", "ESP", "1200K")],
         }
         self.wifi = dict(wifi or {"state": "link-up", "ip": "10.0.0.82"})
         self.wifi_after_disable = list(wifi_after_disable or [
@@ -264,6 +285,12 @@ class FakeUltimate:
         self.update = update
         self.update_load_s = update_load_s
         self.messages = list(messages or [])
+        self.esp = esp
+        self.esp_actions = esp_actions
+        self.wifi_after_esp = list(wifi_after_esp or [
+            {"state": "link-down", "mac": "3C:DC:75:4A:38:60"},
+            {"state": "link-up", "ip": "10.0.0.82"}])
+        self.esp_restarts = 0
         self.framed = framed
         self.password = password
         self.refuse_sessions = refuse_sessions
@@ -394,6 +421,14 @@ class FakeUltimate:
         cats += [(n, [(a, True) for a in acts]) for n, acts in self.task_categories.items()]
         return cats
 
+    def esp_restart(self) -> None:
+        """The firmware's EnableRunMode/StartApp, after the popup was answered."""
+        with self._lock:
+            self.esp_restarts += 1
+            seq = [dict(w) for w in self.wifi_after_esp]
+            self.wifi = seq[0]
+            self._pending_wifi = seq[1:]
+
     def pop_message(self):
         with self._lock:
             return self.messages.pop(0) if self.messages else None
@@ -416,6 +451,7 @@ class _Session:
         self.menu: list[str] | None = None
         self.menu_index = 0
         self.popup: tuple[str, list[str]] | None = None
+        self.popup_esp = False   # the popup is the ESP flash result: its Ok restarts the module
         self.tasks: list | None = None     # the task menu, when open
         self.task_index = 0
         self.sub: list[tuple[str, bool]] | None = None   # the open category
@@ -525,6 +561,9 @@ class _Session:
         if self.popup is not None:
             if name == "o" and "Ok" in self.popup[1]:
                 self.popup = None
+                if self.popup_esp:
+                    self.popup_esp = False
+                    self.dev.esp_restart()
                 self.redraw()
             return
         if self.menu is not None:
@@ -581,6 +620,8 @@ class _Session:
         e = self.entries()[self.cursor]
         if self.path == "/":
             return self.dev.wifi_actions() if e[0] == "WiFi" else []
+        if e.kind == "ESP" and self.dev.esp_actions:
+            return [ESP_ACTION] + FILE_ACTIONS
         if e.kind in UPDATE_EXTENSIONS:
             return ["Run Update"] + FILE_ACTIONS
         return list(FILE_ACTIONS)
@@ -667,6 +708,9 @@ class _Session:
         if label == "Run Update":
             self.run_update()
             return
+        if label == ESP_ACTION:
+            self.esp_flash()
+            return
         if dev.commit_takes_effect and label in ("Disable", "Enable"):
             seq = dev.wifi_after_disable if label == "Disable" else dev.wifi_after_enable
             with dev._lock:
@@ -674,6 +718,36 @@ class _Session:
                 dev._pending_wifi = [dict(s) for s in seq[1:]]
         if dev.redraw_after_commit:
             self.redraw()
+
+    def esp_flash(self) -> None:
+        """StopApp stops the application; the result popup precedes the module restart."""
+        dev = self.dev
+        with dev._lock:
+            dev._pending_wifi = []
+        if dev.esp == "none":
+            return
+        if dev.esp == "close":
+            try:
+                self.conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            return
+        if dev.esp == "success":
+            text = "Flashing ESP32 Success!"
+        elif dev.esp == "nodownload":
+            text = "Could not switch to download mode."
+        elif dev.esp.startswith("popup:"):
+            text = dev.esp.split(":", 1)[1]
+        elif dev.esp.startswith("yesno:"):
+            text = dev.esp.split(":", 1)[1]
+            self.popup = (text, ["Yes", "No"])
+            self.redraw()
+            return
+        else:
+            text = f"Flashing Error {dev.esp.split(':', 1)[1]}"
+        self.popup = (text, ["Ok"])
+        self.popup_esp = dev.esp != "nodownload"
+        self.redraw()
 
     def _flood(self) -> None:
         end = time.monotonic() + 3.0

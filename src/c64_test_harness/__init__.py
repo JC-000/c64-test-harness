@@ -213,6 +213,11 @@ from .backends.ultimate64_remote_menu import (
     RemoteMenuTiming,
     RemoteMenuUnexpectedScreenError,
     RemoteMenuVerifyError,
+    EspFlashError,
+    EspFlashFailedError,
+    EspFlashNoPopupError,
+    EspFlashResult,
+    EspFlashVerifyError,
     RunUpdateResult,
     TaskRunResult,
     Ultimate64RemoteMenu,
@@ -744,6 +749,11 @@ __all__ = [
     "RemoteMenuNavigationError",
     "RemoteMenuVerifyError",
     "UpdateImageRejectedError",
+    "EspFlashError",
+    "EspFlashFailedError",
+    "EspFlashNoPopupError",
+    "EspFlashResult",
+    "EspFlashVerifyError",
     # CBM /Temp-fix constant never set for a newer C64U release (issue #248)
     "CbmFixConstantStaleWarning",
     # Ultimate 64 liveness probe
