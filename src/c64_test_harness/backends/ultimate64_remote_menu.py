@@ -139,6 +139,11 @@ __all__ = [
     "RemoteMenuUnexpectedScreenError",
     "RemoteMenuVerifyError",
     "RunUpdateResult",
+    "EspFlashResult",
+    "EspFlashError",
+    "EspFlashFailedError",
+    "EspFlashNoPopupError",
+    "EspFlashVerifyError",
     "TASK_CATEGORIES",
     "TELNET_PORT",
     "TaskRunResult",
@@ -197,6 +202,13 @@ _TASK_EFFECTS = {
 #: Popup texts with which ``FileTypeUpdate::load_format_1`` refuses a ``.cfw``
 #: (from 3a1ff9ff on). A ``.u64``/``.ue2`` is never checked; its one refusal
 #: is a file-open error string.
+_ESP_ACTION = "Flash into ESP32"
+_ESP_SUCCESS = "Flashing ESP32 Success!"
+#: Failure popups of ``FileTypeESP::execute`` after ``StopApp``: all but the
+#: first are followed by ``EnableRunMode``/``StartApp``.
+_ESP_NO_DOWNLOAD = "Could not switch to download mode."
+_ESP_FAILURES = ("Could not read header.", "Incorrect signature in file.",
+                 "Couldn't alloc mem to load segment.")
 _CFW_REFUSALS = ("Invalid Update Image", "Wrong Product Family", "Update for Wrong Product")
 
 #: The only bytes this driver ever writes.
@@ -289,6 +301,38 @@ class UpdateImageRejectedError(Ultimate64RemoteMenuError):
     def __init__(self, message: str, *, popup: str, screen: tuple[str, ...] | None = None) -> None:
         super().__init__(message, enter_sent=True, screen=screen)
         self.popup = popup
+
+
+class EspFlashError(Ultimate64RemoteMenuError):
+    """Base of the ESP32 module-flash failures. ``result`` is what was known
+    when it failed (an :class:`EspFlashResult`, possibly partial). The flash
+    is never retried automatically."""
+
+    result: "EspFlashResult | None" = None
+
+
+class EspFlashFailedError(EspFlashError):
+    """The firmware reported a failure popup (``popup`` is its text). The
+    popup was answered once; the module was restarted by the firmware (except
+    after "Could not switch to download mode.", where it is not: see
+    ``module_restarted``)."""
+
+    popup: str = ""
+    module_restarted: bool = True
+
+
+class EspFlashNoPopupError(EspFlashError):
+    """The one ENTER was sent and no result popup came within the timeout.
+    The module is most likely still in download mode with Wi-Fi stopped
+    (``FileTypeESP::execute`` restarts it only after its result popup), and
+    the session may still be mid-flash. Nothing was pressed; do not retry
+    blindly: look at the device."""
+
+
+class EspFlashVerifyError(EspFlashError):
+    """The flash reported success but the post-flash check failed: Wi-Fi did
+    not come back, the ping failed, or the module ident is wrong or could not
+    be read. The firmware verifies nothing itself."""
 
 
 # ---------------------------------------------------------------------------
@@ -784,6 +828,48 @@ class TaskRunResult:
     messages: tuple[str, ...] = ()
     popup: str | None = None
     popup_buttons: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class EspFlashResult:
+    """Outcome of :meth:`Ultimate64RemoteMenu.flash_esp`.
+
+    ``flash_ok`` is the firmware's own word (its success popup); it checks
+    nothing else. ``wifi_back`` is the WiFi row reaching ``link-up`` on a
+    fresh session, ``ping_ok`` the ping of the Wi-Fi IP. ``ident_ok`` is
+    ``True``/``False`` against ``expect_ident`` and ``None`` when none was
+    given. ``ident_after`` is ``None`` when the module's ident could not be
+    read (the row names it only while Disabled, unless an ``ident_probe``
+    supplies it). ``ok`` is the whole verdict.
+    """
+
+    path: str
+    duration_s: float
+    popup: str | None
+    flash_ok: bool
+    wifi_before: WifiStatus
+    wifi_after: WifiStatus | None
+    wifi_ip: str | None
+    wifi_back: bool
+    ping_ok: bool
+    ident_before: str | None
+    ident_after: str | None
+    expect_ident: str | None
+    ident_ok: bool | None
+    enter_sent: bool
+    messages: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return (self.flash_ok and self.wifi_back and self.ping_ok
+                and (self.expect_ident is None or self.ident_ok is True))
+
+    def summary(self) -> str:
+        return (f"{'OK' if self.ok else 'FAILED'} flash_esp {self.path} "
+                f"duration={self.duration_s:.1f}s popup={self.popup!r} "
+                f"wifi_back={self.wifi_back} ping={self.ping_ok} wifi_ip={self.wifi_ip} "
+                f"ident_before={self.ident_before!r} ident_after={self.ident_after!r} "
+                f"expect={self.expect_ident!r} ident_ok={self.ident_ok}")
 
 
 # ---------------------------------------------------------------------------
@@ -1592,6 +1678,193 @@ class Ultimate64RemoteMenu:
                     f"{what}: ENTER sent once; after {timeout:.0f} s fresh connections still "
                     f"show {list(last)}, without {want!r}. Not resent.",
                     enter_sent=True)
+
+    # -- public: ESP32 module flash --------------------------------------------
+    def flash_esp(self, path: str, *, expect_ident: str | None = None,
+                  confirm_module_flash: bool = False, timeout: float = 300.0,
+                  verify_timeout: float = 90.0, wifi_ip: str | None = None,
+                  ping: Callable[[str], bool] | None = None,
+                  ident_probe: Callable[[], str | None] | None = None) -> EspFlashResult:
+        """Choose "Flash into ESP32" on the ``.esp`` file at *path*.
+
+        The file must already be on the device. The firmware stops the
+        application (Wi-Fi included), flashes the module over the FPGA's
+        strap lines, shows a result popup, and only *then* restarts the
+        module. So the popup is answered with exactly one ``o``; without it
+        the module stays in download mode. The firmware checks nothing: no
+        ident, no chip. Verify the image first (``tools.esp_image``), and
+        this call verifies afterwards (Wi-Fi back on a fresh session, a ping
+        of the Wi-Fi IP, the ident).
+
+        Refused (nothing sent) unless ``confirm_module_flash=True``, unless
+        the caller holds the ``DeviceLock``, when this driver's own address is
+        the module's Wi-Fi address (the flash kills Wi-Fi, and with it the
+        session), and when the file has no "Flash into ESP32" action (C64U
+        builds lack it).
+
+        :param timeout: how long to wait for the result popup after the ENTER.
+        :param verify_timeout: how long Wi-Fi gets to come back afterwards.
+        :param wifi_ip: the module's Wi-Fi address, when it is not shown on
+            the row (the row shows it only while the link is up).
+        :param ping: ``ping(ip) -> bool``; default is the system ``ping``.
+        :param ident_probe: returns the module ident. Default: the WiFi row's
+            ident, which the firmware shows only while Wi-Fi is Disabled, so
+            on a linked module it is ``None`` and a given *expect_ident*
+            then cannot be verified (:class:`EspFlashVerifyError`).
+
+        Raises :class:`EspFlashFailedError` (failure popup, answered once),
+        :class:`EspFlashNoPopupError` (no popup: nothing pressed, not
+        retried) or :class:`EspFlashVerifyError`; each carries ``.result``.
+        """
+        if not confirm_module_flash:
+            raise Ultimate64UnsafeOperationError(
+                f"flash_esp({path!r}) rewrites the ESP32 module on {self.host} and kills "
+                "Wi-Fi while it runs. Pass confirm_module_flash=True.")
+        _split_path(path)
+        if not path.upper().endswith(".ESP"):
+            raise RemoteMenuNotFoundError(
+                f"{path!r} is not a .esp file (the action is matched on the extension)")
+        self._require_lock("flash_esp")
+        if ping is None:
+            from ..tools.flash_esp import system_ping as ping  # lazy: subprocess
+        t0 = time.monotonic()
+        start = len(self._seen_messages)
+        before = self.wifi_status()
+        known_ip = wifi_ip or before.ip
+        if known_ip is not None and self.host == known_ip:
+            raise Ultimate64UnsafeOperationError(
+                f"flash_esp: {self.host} is the module's Wi-Fi address. The flash stops "
+                "Wi-Fi, so this telnet session would die mid-flash. Use the Ethernet address.")
+        ident_before = ident_probe() if ident_probe else before.ident
+
+        def make(*, popup=None, flash_ok=False, after=None, back=False, ping_ok=False,
+                 ident_after=None, ident_ok=None, sent=False) -> EspFlashResult:
+            return EspFlashResult(
+                path, time.monotonic() - t0, popup, flash_ok, before, after, known_ip, back,
+                ping_ok, ident_before, ident_after, expect_ident, ident_ok, sent,
+                tuple(self._seen_messages[start:]))
+
+        once = _Once()
+        sess = self._open("flash_esp")
+        try:
+            self._navigate(sess, path)
+            menu = self._open_menu(sess, path)
+            if _ESP_ACTION not in menu.labels:
+                raise RemoteMenuNotFoundError(
+                    f"{path}'s menu {list(menu.labels)} has no {_ESP_ACTION!r}: this build "
+                    "lacks the action (C64U builds before it is added) or the file is not "
+                    "recognised as .ESP", screen=self._view(sess).rows)
+            self._highlight(sess, _ESP_ACTION, path)
+            once.enter(sess, f"{_ESP_ACTION} on {path}", self.host)
+            popup = self._await_esp_popup(sess, path, timeout, make)
+            # The one answer: the firmware restarts the module after it.
+            sess.send("OK")
+            sess.drain(expect=True)
+        except Ultimate64RemoteMenuError as exc:
+            exc.enter_sent = once.sent
+            raise
+        finally:
+            sess.close()
+
+        if popup != _ESP_SUCCESS:
+            err = EspFlashFailedError(
+                f"flash_esp {path}: the firmware reported {popup!r}; answered once. Not retried.",
+                enter_sent=True)
+            err.popup = popup
+            err.module_restarted = popup != _ESP_NO_DOWNLOAD
+            err.result = make(popup=popup, sent=True)
+            raise err
+
+        after, back, ident_seen = self._await_wifi_back(verify_timeout)
+        ip = after.ip if (back and after is not None) else known_ip
+        ping_ok = False
+        if back and ip is not None:
+            end = time.monotonic() + verify_timeout
+            while True:
+                if ping(ip):
+                    ping_ok = True
+                    break
+                if time.monotonic() >= end:
+                    break
+                time.sleep(self.timing.poll_interval)
+        ident_after = ident_probe() if ident_probe else ident_seen
+        ident_ok = None if expect_ident is None else (
+            ident_after is not None and ident_after.strip() == expect_ident.strip())
+        res = EspFlashResult(
+            path, time.monotonic() - t0, popup, True, before, after, ip, back, ping_ok,
+            ident_before, ident_after, expect_ident, ident_ok, True,
+            tuple(self._seen_messages[start:]))
+        problems = []
+        if not back:
+            problems.append(f"Wi-Fi did not return to link-up within {verify_timeout:.0f} s")
+        elif not ping_ok:
+            problems.append(f"no ping reply from {ip}")
+        elif wifi_ip is not None and ip != wifi_ip:
+            problems.append(f"Wi-Fi came back as {ip}, expected {wifi_ip}")
+        if expect_ident is not None and ident_ok is not True:
+            problems.append(
+                f"ident {ident_after!r} is not the expected {expect_ident!r}"
+                if ident_after is not None else
+                f"ident not readable (expected {expect_ident!r}); the WiFi row names it "
+                "only while Disabled; pass an ident_probe")
+        if problems:
+            err = EspFlashVerifyError(
+                f"flash_esp {path}: the firmware said success but verification failed: "
+                + "; ".join(problems), enter_sent=True)
+            err.result = res
+            raise err
+        return res
+
+    def _await_esp_popup(self, sess: _Session, path: str, timeout: float, make) -> str:
+        """Wait on the committing session for the result popup; return its text."""
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                sess.drain(expect=False)
+            except RemoteMenuUnexpectedScreenError:
+                pass  # progress redraws that never go quiet: keep reading
+            view = self._view(sess)
+            p = view.popup
+            if p is not None:
+                self._seen_messages.append(p.message)
+                known = p.message == _ESP_SUCCESS or p.message == _ESP_NO_DOWNLOAD \
+                    or p.message in _ESP_FAILURES or re.fullmatch(r"Flashing Error -?\d+", p.message)
+                if not known or p.buttons != ("Ok",):
+                    raise RemoteMenuUnexpectedScreenError(
+                        f"flash_esp {path}: unexpected popup {p.message!r} "
+                        f"{list(p.buttons)}; no key sent", enter_sent=True, screen=view.rows)
+                return p.message
+            if sess.eof or time.monotonic() >= deadline:
+                why = "the session was closed by the device" if sess.eof else \
+                    f"no result popup within {timeout:.0f} s"
+                err = EspFlashNoPopupError(
+                    f"flash_esp {path}: ENTER sent once; {why}. Nothing was pressed and nothing "
+                    "is retried. The module is probably still in download mode (Wi-Fi off) "
+                    "until the popup is answered or the device is reset.",
+                    enter_sent=True, screen=view.rows)
+                err.result = make(sent=True)
+                raise err
+            time.sleep(self.timing.idle_gap)
+
+    def _await_wifi_back(self, timeout: float) -> tuple[WifiStatus | None, bool, str | None]:
+        """Poll fresh sessions until the WiFi row says link-up."""
+        deadline = time.monotonic() + timeout
+        last: WifiStatus | None = None
+        ident: str | None = None
+        while True:
+            time.sleep(self.timing.poll_interval)
+            try:
+                last = self.wifi_status()
+                if last.ident:
+                    ident = last.ident
+                if last.state == "link-up":
+                    return last, True, ident
+            except RemoteMenuLockError:
+                raise
+            except Ultimate64RemoteMenuError as exc:
+                _log.info("flash_esp: verification poll failed: %s", exc)
+            if time.monotonic() >= deadline:
+                return last, False, ident
 
 
 def _labels(menu: MenuBox) -> tuple[str, ...]:
