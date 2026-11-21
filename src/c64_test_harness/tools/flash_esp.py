@@ -12,8 +12,8 @@ the ``--dest`` path (a writable volume, e.g. ``/USB1/espflash/x.esp``; never
 ping and ident afterwards), delete the upload (and its directory if empty), print one result line.
 Exit 0 only when the whole verdict is OK and proven (the ident changed); 3 when the
 flash verified but is unproven (no ident change, e.g. a same-image flash); 1 on a failed or unverified flash
-(the menu's ENTER was sent); 2 on a refusal before it was; 3 also when the DeviceLock
-budget runs out (as the scripts do). After a flash whose result popup never came the
+(the menu's ENTER was sent); 2 on a refusal before it was; 2 also when the DeviceLock
+budget runs out (nothing was touched; 3 is reserved for "flashed, verified, unproven"). After a flash whose result popup never came the
 upload and its directory are KEPT (the firmware may still be reading the file).
 
 ``--host`` must be the Ethernet address: the flash stops Wi-Fi.
@@ -54,7 +54,8 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
                     help="device path of the upload, on a writable volume, e.g. "
                          "/USB1/espflash/raw_u64.esp (never /Temp or /Flash)")
     ap.add_argument("--lock-timeout", type=float, default=None,
-                    help="DeviceLock wait in seconds (default: U64_DEVICE_LOCK_TIMEOUT, else the library default)")
+                    help="DeviceLock wait in seconds (default: U64_DEVICE_LOCK_TIMEOUT, else the "
+                         "manager default, 60 s)")
     ap.add_argument("--timeout", type=float, default=300.0, help="wait for the result popup")
     ap.add_argument("--verify-timeout", type=float, default=90.0)
     ap.add_argument("--no-ident-probe", action="store_true",
@@ -66,10 +67,12 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
     ap.add_argument("--confirm-module-flash", action="store_true")
     a = ap.parse_args(argv)
 
-    from ..backends.device_lock import DeviceLock, DeviceLockTimeout, DeviceLockTimeoutConfigError
+    from ..backends.device_lock import (
+        DeviceLock, DeviceLockTimeout, DeviceLockTimeoutConfigError, resolve_lock_timeout)
+    from ..backends.unified_manager import DEFAULT_LOCK_TIMEOUT
     from ..backends.ultimate64_client import Ultimate64UnsafeOperationError
     from ..backends.ultimate64_remote_menu import (
-        ESP_IDENT_MAX, EspFlashError, EspFlashNoPopupError, Ultimate64RemoteMenu,
+        ESP_IDENT_MAX, EspFlashError, EspFlashFailedError, EspFlashVerifyError, Ultimate64RemoteMenu,
         Ultimate64RemoteMenuError)
     from ..backends.ultimate64_storage import (
         Ultimate64StorageError, storage_delete_file, storage_get_file, storage_put_file, storage_rmdir)
@@ -124,10 +127,11 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
     local = a.esp.read_bytes()
     lock = (lock_factory or DeviceLock)(a.host)
     try:
-        lock.acquire_or_raise(timeout=a.lock_timeout)
+        lock.acquire_or_raise(
+            timeout=resolve_lock_timeout(a.lock_timeout, default=DEFAULT_LOCK_TIMEOUT))
     except DeviceLockTimeout as exc:
-        print(f"refusing to run: {exc}", file=sys.stderr)
-        return 3
+        print(f"refusing to run: {exc}", file=sys.stderr)   # nothing was flashed: 2, not 3
+        return 2
     except DeviceLockTimeoutConfigError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2
@@ -152,22 +156,24 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
                       f"image ({len(local)} B, sha256 {hashlib.sha256(local).hexdigest()}); "
                       "nothing was flashed", file=sys.stderr)
                 return 2
+            keep = True   # from here the firmware may be reading the file, whatever happens
             res = menu.flash_esp(dest, ident_probe=probe, allow_same_ident=a.allow_same_ident, expect_ident=a.expect_ident,
                                  confirm_module_flash=True, timeout=a.timeout,
                                  verify_timeout=a.verify_timeout, wifi_ip=a.wifi_ip, ping=False if a.no_ping else ping)
+            keep = False   # a normal return: the module is done with the file
         except EspFlashError as exc:
-            if isinstance(exc, EspFlashNoPopupError):
-                keep = True
-                print(f"the upload is KEPT at {dest} (and its directory): the firmware may still "
-                      "be reading the open file. Delete it by hand once the module is back.")
+            # a failure popup or a verification failure: the flash has finished
+            keep = not isinstance(exc, (EspFlashFailedError, EspFlashVerifyError))
             print(f"FAILED {type(exc).__name__}: {exc}")
             if exc.result is not None:
                 print(exc.result.summary())
             return 1
         except Ultimate64UnsafeOperationError as exc:
+            keep = False
             print(f"REFUSED: {exc}", file=sys.stderr)
             return 2
         except Ultimate64RemoteMenuError as exc:
+            keep = bool(exc.enter_sent)
             if exc.enter_sent:
                 print(f"FAILED {type(exc).__name__}: {exc} (the ENTER was sent: the module may "
                       "have been touched; check Wi-Fi and the ident before anything else)")
@@ -183,6 +189,10 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
                 print(f"  screen| {row}", file=sys.stderr)
             return 2
         finally:
+            if uploaded and keep:
+                print(f"the upload is KEPT at {dest} (and its directory): the ENTER was sent and "
+                      "the firmware may still be reading the open file. Delete it by hand once "
+                      "the module is back.")
             if uploaded and not keep:
                 try:
                     delete(a.host, dest, missing_ok=True)

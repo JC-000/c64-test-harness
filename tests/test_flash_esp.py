@@ -237,8 +237,10 @@ class _Lock:
 
 def _run_cli(tmp_path, make, extra=(), dest="/USB1/espflash/raw_u64.esp", checker=None, readback=None,
              ident_probe=None, confirm=True, lock_raises=None, put_raises=None, get_raises=None,
-             ping=lambda ip: True, **fake_kw):
+             ping=lambda ip: True, menu_patch=None, **fake_kw):
     fake, menu = make(**fake_kw)
+    if menu_patch is not None:
+        menu_patch(menu)
     esp = tmp_path / "raw_u64.esp"
     esp.write_bytes(b"x")
     tool = tmp_path / "esp_image.py"
@@ -400,7 +402,7 @@ def test_an_ident_probe_failure_after_the_flash_is_not_nothing_flashed(make, hel
 def test_cli_failure_after_the_enter_exits_1_not_2(tmp_path, make, held, capsys):
     rc, calls, lock, fake = _run_cli(tmp_path, make, ident_probe=lambda: "x",
                                      esp="popup:Something unexpected")
-    assert rc == 1 and ("delete", "/USB1/espflash/raw_u64.esp") in [c[:2] for c in calls]
+    assert rc == 1 and _deleted(calls) == []   # ENTER sent, outcome unknown: the upload is kept
 
 
 def test_wifi_back_on_another_address_than_the_stated_one_fails(make, held):
@@ -487,22 +489,36 @@ def test_cli_a_storage_error_before_the_enter_exits_2(tmp_path, make, held, caps
     assert ("delete", "/USB1/espflash/raw_u64.esp") in [c[:2] for c in calls]   # we created it
 
 
-def test_cli_a_lock_timeout_exits_3_like_the_scripts(tmp_path, make, held, capsys):
-    """Finding 4 / 8b. Kills: DeviceLockTimeout escaping as a traceback (exit 1)."""
+def test_cli_a_lock_timeout_exits_2_nothing_was_flashed(tmp_path, make, held, capsys):
+    """Finding 4 / 8b, R2. Kills: DeviceLockTimeout escaping as a traceback (exit 1), or
+    mapped to 3 (which the CLI uses for "flashed, verified, unproven")."""
     from c64_test_harness.backends.device_lock import DeviceLockTimeout
     exc = DeviceLockTimeout(device_host="127.0.0.1", holder_pid=None, pid_alive=None,
                             lockfile_age_seconds=None, device_reachable_rest=None, timeout=1.0)
     rc, calls, lock, fake = _run_cli(tmp_path, make, lock_raises=exc)
-    assert rc == 3 and calls == [] and fake.sessions == []
+    assert rc == 2 and calls == [] and fake.sessions == []   # 3 means "flashed, unproven"
 
 
-def test_cli_lock_timeout_defaults_to_none_so_the_env_budget_applies(tmp_path, make, held):
-    """Finding 8a. Kills: a numeric default (600.0) that hides U64_DEVICE_LOCK_TIMEOUT."""
+def test_cli_lock_timeout_follows_the_env_then_the_manager_default(tmp_path, make, held, monkeypatch):
+    """Finding 8a + ruling. Kills: a numeric 600.0 default that hides U64_DEVICE_LOCK_TIMEOUT,
+    and a default other than unified_manager.DEFAULT_LOCK_TIMEOUT."""
+    from c64_test_harness.backends.unified_manager import DEFAULT_LOCK_TIMEOUT
+    monkeypatch.delenv("U64_DEVICE_LOCK_TIMEOUT", raising=False)
     rc, calls, lock, fake = _run_cli(tmp_path, make, ident_probe=lambda: "x")
-    assert lock.timeouts == [None]
+    assert lock.timeouts == [DEFAULT_LOCK_TIMEOUT]
+    monkeypatch.setenv("U64_DEVICE_LOCK_TIMEOUT", "5")
+    rc, calls, lock, fake = _run_cli(tmp_path, make, ident_probe=lambda: "x")
+    assert lock.timeouts == [5.0]
     rc, calls, lock, fake = _run_cli(tmp_path, make, ident_probe=lambda: "x",
                                      extra=["--lock-timeout", "7"])
     assert lock.timeouts == [7.0]
+
+
+def test_cli_a_malformed_lock_timeout_env_exits_2(tmp_path, make, held, monkeypatch, capsys):
+    """R4. Kills: DeviceLockTimeoutConfigError mapped to another exit code or escaping."""
+    monkeypatch.setenv("U64_DEVICE_LOCK_TIMEOUT", "30m")
+    rc, calls, lock, fake = _run_cli(tmp_path, make)
+    assert rc == 2 and calls == [] and fake.sessions == []
 
 
 def test_cli_a_method_refusal_exits_2(tmp_path, make, held, capsys):
@@ -611,14 +627,89 @@ def test_the_method_refuses_temp_and_flash_paths(make, held, path):
     assert fake.sessions == []
 
 
-def test_system_ping_lives_in_the_backend():
-    from c64_test_harness.backends import ultimate64_remote_menu as m
-    assert callable(m.system_ping) and cli.system_ping is m.system_ping
-
-
 @pytest.mark.parametrize("n", [-4, -5])
 def test_exactly_the_two_emitted_error_codes_are_answered(make, held, n):
     fake, menu = make(esp=f"error:{n}")
     with pytest.raises(EspFlashFailedError) as exc:
         _flash(menu)
     assert exc.value.popup == f"Flashing Error {n}" and _oks(fake) == 1
+
+
+def test_cli_keyboard_interrupt_after_the_enter_keeps_the_upload(tmp_path, make, held, capsys):
+    """R1 (probe P7). Kills: cleanup that runs for an exception other than the flash errors."""
+    def boom(menu):
+        def flash_esp(*a, **k):
+            raise KeyboardInterrupt
+        menu.flash_esp = flash_esp
+
+    with pytest.raises(KeyboardInterrupt):
+        _run_cli(tmp_path, make, menu_patch=boom, ident_probe=lambda: "x")
+    cap = capsys.readouterr()
+    assert "KEPT" in cap.out and "/USB1/espflash/raw_u64.esp" in cap.out
+
+
+def test_cli_keyboard_interrupt_keeps_calls_clean(tmp_path, make, held):
+    calls_seen = []
+
+    def boom(menu):
+        def flash_esp(*a, **k):
+            raise KeyboardInterrupt
+        menu.flash_esp = flash_esp
+    fake, menu = make()
+    esp = tmp_path / "a.esp"
+    esp.write_bytes(b"x")
+    tool = tmp_path / "t.py"
+    tool.write_text("")
+    boom(menu)
+    lock = _Lock("h")
+    with pytest.raises(KeyboardInterrupt):
+        cli.main(["--host", "127.0.0.1", "--esp", str(esp), "--platform", "u64e",
+                  "--esp-image-tool", str(tool), "--dest", "/USB1/espflash/a.esp",
+                  "--confirm-module-flash", "--no-ident-probe"],
+                 menu_factory=lambda h: menu, put=lambda *a, **k: None, get=lambda h, d: b"x",
+                 delete=lambda *a, **k: calls_seen.append("delete"),
+                 rmdir=lambda *a, **k: calls_seen.append("rmdir"),
+                 lock_factory=lambda h: lock, checker=lambda t, p, f: (True, "ok"))
+    assert calls_seen == [] and lock.events == ["acquire", "release"]
+
+
+def test_cli_an_enter_sent_error_keeps_the_upload(tmp_path, make, held, capsys):
+    """R1 (probes P8, P9). Kills: cleanup after an error with enter_sent=True."""
+    from c64_test_harness.backends.ultimate64_remote_menu import Ultimate64RemoteMenuError
+
+    def boom(menu):
+        def flash_esp(*a, **k):
+            raise Ultimate64RemoteMenuError("lost", enter_sent=True)
+        menu.flash_esp = flash_esp
+
+    rc, calls, lock, fake = _run_cli(tmp_path, make, menu_patch=boom, ident_probe=lambda: "x")
+    assert rc == 1 and _deleted(calls) == [] and "KEPT" in capsys.readouterr().out
+
+
+def test_cli_verify_and_failure_errors_still_clean_up(tmp_path, make, held):
+    """The upload is removed after EspFlashVerifyError and EspFlashFailedError (the module
+    has finished reading it). Kills: keep=True never cleared."""
+    rc, calls, lock, fake = _run_cli(tmp_path, make, ident_probe=lambda: "x",
+                                     extra=["--wifi-ip", "10.0.0.99"])   # Wi-Fi came back elsewhere
+    assert rc == 1 and ("delete", "/USB1/espflash/raw_u64.esp") in [c[:2] for c in calls]
+    rc, calls, lock, fake = _run_cli(tmp_path, make, esp="error:-4")
+    assert rc == 1 and ("delete", "/USB1/espflash/raw_u64.esp") in [c[:2] for c in calls]
+
+
+def test_cli_allow_same_ident_does_not_make_a_no_ping_run_exit_0(tmp_path, make, held, capsys):
+    """R3. Kills N11: --allow-same-ident --no-ping exiting 0."""
+    rc, calls, lock, fake = _run_cli(tmp_path, make, ident_probe=lambda: "same",
+                                     extra=["--allow-same-ident", "--no-ping"])
+    assert rc == 3
+    rc, calls, lock, fake = _run_cli(tmp_path, make, ident_probe=lambda: "same",
+                                     extra=["--allow-same-ident"])
+    assert rc == 0
+
+
+def test_a_hostname_resolving_to_the_net0_address_reaches_the_enter(make, held_name):
+    """R5. Kills N13: a hostname refused although it IS the Net0 address."""
+    held_name("localhost")
+    fake, menu = make()          # Net0 row shows 127.0.0.1
+    menu.host = "localhost"
+    res = _flash(menu)
+    assert res.enter_sent and fake.all_commits() == [("Flash into ESP32", "/USB1/espflash/")]
