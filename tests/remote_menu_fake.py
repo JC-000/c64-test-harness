@@ -258,6 +258,7 @@ class FakeUltimate:
             "/USB1/": [
                 Entry("Backups", "DIR"),
                 Entry("firmware", "DIR"),
+                Entry("espflash", "DIR"),
                 Entry("update_m3.u64", "U64", "5609K"),
                 Entry("vf_ue.u64", "U64", "5503K"),
                 Entry("wraptor.d64", "D64", "171K"),
@@ -265,6 +266,7 @@ class FakeUltimate:
             "/USB1/firmware/": [Entry("cu_vf.ue2", "UE2", "8830K")],
             "/Temp/": [Entry("raw_u64.esp", "ESP", "1200K"), Entry("old.d64", "D64", "171K")],
             "/USB1/Backups/": [],
+            "/USB1/espflash/": [Entry("raw_u64.esp", "ESP", "1200K")],
         }
         self.wifi = dict(wifi or {"state": "link-up", "ip": "10.0.0.82"})
         self.wifi_after_disable = list(wifi_after_disable or [

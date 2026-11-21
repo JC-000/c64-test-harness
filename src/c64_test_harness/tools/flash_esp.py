@@ -7,8 +7,9 @@
 Steps: run ``esp_image.py check --platform P file`` (an external tool, given
 by ``--esp-image-tool`` or the ``ESP_IMAGE_TOOL`` environment variable; the
 harness does not carry a copy), take the device's ``DeviceLock``, upload to
-``/Temp``, run ``Ultimate64RemoteMenu.flash_esp`` (which verifies Wi-Fi,
-ping and ident afterwards), delete the upload, print one result line.
+the ``--dest`` path (a writable volume, e.g. ``/USB1/espflash/x.esp``; never
+``/Temp`` or ``/Flash``), run ``Ultimate64RemoteMenu.flash_esp`` (which verifies Wi-Fi,
+ping and ident afterwards), delete the upload (and its directory if empty), print one result line.
 Exit 0 only when the whole verdict is OK and proven (the ident changed); 3 when the
 flash verified but is unproven (no ident change, e.g. a same-image flash); 1 on a failed or unverified flash
 (the menu's ENTER was sent); 2 on a refusal before it was.
@@ -86,7 +87,7 @@ def check_image(tool: Path, platform_name: str, image: Path) -> tuple[bool, str]
 
 
 def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
-         put=None, delete=None, get=None, lock_factory=None, checker=None,
+         put=None, delete=None, rmdir=None, get=None, lock_factory=None, checker=None,
          ident_probe=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--host", required=True, help="the device's ETHERNET address")
@@ -97,7 +98,9 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
                     else None, help="path of esp_image.py (or env ESP_IMAGE_TOOL)")
     ap.add_argument("--expect-ident")
     ap.add_argument("--wifi-ip", help="the module's Wi-Fi address (pinged afterwards)")
-    ap.add_argument("--dest", default=None, help="device path (default /Temp/<name>)")
+    ap.add_argument("--dest", required=True,
+                    help="device path of the upload, on a writable volume, e.g. "
+                         "/USB1/espflash/raw_u64.esp (never /Temp or /Flash)")
     ap.add_argument("--lock-timeout", type=float, default=600.0)
     ap.add_argument("--timeout", type=float, default=300.0, help="wait for the result popup")
     ap.add_argument("--verify-timeout", type=float, default=90.0)
@@ -113,7 +116,7 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
     from ..backends.ultimate64_remote_menu import (
         EspFlashError, Ultimate64RemoteMenu, Ultimate64RemoteMenuError)
     from ..backends.ultimate64_storage import (
-        storage_delete_file, storage_get_file, storage_put_file)
+        storage_delete_file, storage_get_file, storage_put_file, storage_rmdir)
 
     if not a.confirm_module_flash:
         print("REFUSED: pass --confirm-module-flash", file=sys.stderr)
@@ -135,9 +138,21 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
         print(f"REFUSED: image check for {a.platform} failed", file=sys.stderr)
         return 2
 
-    dest = a.dest or f"/Temp/{a.esp.name}"
+    dest = a.dest
+    vol = dest.split("/")[1].casefold() if dest.startswith("/") and len(dest.split("/")) > 2 else ""
+    if vol in ("temp", "flash") or not vol:
+        print(f"REFUSED: --dest {dest!r}: /Temp is the firmware RAM disk the harness sweeps and "
+              "/Flash holds the firmware's own files; the harness storage API refuses both. "
+              "Use a directory on a writable volume, e.g. /USB1/espflash/<name>.esp",
+              file=sys.stderr)
+        return 2
+    if not dest.upper().endswith(".ESP"):
+        print("REFUSED: --dest must end in .esp", file=sys.stderr)
+        return 2
     put = put or storage_put_file
     delete = delete or storage_delete_file
+    rmdir = rmdir or storage_rmdir
+    parent = dest.rsplit("/", 1)[0]   # e.g. /USB1/espflash; never a volume root here
     get = get or storage_get_file
     probe = ident_probe
     if probe is None and not a.no_ident_probe:
@@ -181,6 +196,11 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
                 delete(a.host, dest, missing_ok=True)
             except Exception as exc:  # the flash verdict matters more
                 print(f"note: could not delete {dest}: {exc}", file=sys.stderr)
+            if parent.count("/") >= 2:
+                try:
+                    rmdir(a.host, parent)   # only succeeds when empty; other files stay
+                except Exception as exc:
+                    print(f"note: left {parent} in place ({type(exc).__name__})", file=sys.stderr)
         print(res.summary())
         return 1 if not res.ok else (0 if res.proven or a.allow_same_ident else 3)
     finally:

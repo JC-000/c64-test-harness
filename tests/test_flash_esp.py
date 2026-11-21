@@ -214,7 +214,7 @@ class _Lock:
         self.events.append("release")
 
 
-def _run_cli(tmp_path, make, extra=(), checker=None, readback=None, ident_probe=None, **fake_kw):
+def _run_cli(tmp_path, make, extra=(), dest="/USB1/espflash/raw_u64.esp", checker=None, readback=None, ident_probe=None, **fake_kw):
     fake, menu = make(**fake_kw)
     esp = tmp_path / "raw_u64.esp"
     esp.write_bytes(b"x")
@@ -224,13 +224,14 @@ def _run_cli(tmp_path, make, extra=(), checker=None, readback=None, ident_probe=
     lock = _Lock("h")
     rc = cli.main(
         ["--host", "10.0.0.50", "--esp", str(esp), "--platform", "u64e",
-         "--esp-image-tool", str(tool), "--confirm-module-flash", "--timeout", "2",
+         "--esp-image-tool", str(tool), "--dest", dest, "--confirm-module-flash", "--timeout", "2",
          "--verify-timeout", "2", *extra],
         menu_factory=lambda host: menu, ping=lambda ip: True,
         put=lambda host, dest, path, **kw: calls.append(("put", dest)),
         get=lambda host, dest: b"x" if readback is None else readback,
         ident_probe=ident_probe,
         delete=lambda host, dest, **kw: calls.append(("delete", dest)),
+        rmdir=lambda host, d, **kw: calls.append(("rmdir", d)),
         lock_factory=lambda host: lock,
         checker=checker or (lambda t, p, f: (True, f"OK {p}")))
     return rc, calls, lock, fake
@@ -240,8 +241,8 @@ def test_cli_success_prints_one_result_line(tmp_path, make, held, capsys):
     seq = iter(["OLD", "NEW"])
     rc, calls, lock, fake = _run_cli(tmp_path, make, ident_probe=lambda: next(seq))
     out = capsys.readouterr().out.strip().splitlines()
-    assert rc == 0 and out[-1].startswith("OK flash_esp /Temp/raw_u64.esp")
-    assert calls == [("put", "/Temp/raw_u64.esp"), ("delete", "/Temp/raw_u64.esp")]
+    assert rc == 0 and out[-1].startswith("OK flash_esp /USB1/espflash/raw_u64.esp")
+    assert calls == [("put", "/USB1/espflash/raw_u64.esp"), ("delete", "/USB1/espflash/raw_u64.esp"), ("rmdir", "/USB1/espflash")]
     assert lock.events == ["acquire", "release"]
 
 
@@ -252,14 +253,15 @@ def test_cli_a_failed_image_check_stops_before_any_device_access(tmp_path, make,
 
 def test_cli_failed_flash_exits_1_and_still_cleans_up(tmp_path, make, held, capsys):
     rc, calls, lock, fake = _run_cli(tmp_path, make, esp="error:5")
-    assert rc == 1 and ("delete", "/Temp/raw_u64.esp") in calls
+    assert rc == 1 and ("delete", "/USB1/espflash/raw_u64.esp") in calls
     assert lock.events == ["acquire", "release"]
 
 
 def test_cli_refuses_the_wifi_ip_and_missing_confirmation(tmp_path, capsys):
     esp = tmp_path / "a.esp"
     esp.write_bytes(b"x")
-    base = ["--host", "10.0.0.50", "--esp", str(esp), "--platform", "u64e"]
+    base = ["--host", "10.0.0.50", "--esp", str(esp), "--platform", "u64e",
+            "--dest", "/USB1/espflash/a.esp"]
     assert cli.main(base + ["--wifi-ip", "10.0.0.50", "--confirm-module-flash"]) == 2
     assert cli.main(base) == 2
 
@@ -267,7 +269,7 @@ def test_cli_refuses_the_wifi_ip_and_missing_confirmation(tmp_path, capsys):
 def test_cli_a_truncated_upload_is_refused_before_the_enter(tmp_path, make, held, capsys):
     rc, calls, lock, fake = _run_cli(tmp_path, make, readback=b"")
     assert rc == 2 and fake.all_commits() == [] and fake.sessions == []
-    assert ("delete", "/Temp/raw_u64.esp") in calls
+    assert ("delete", "/USB1/espflash/raw_u64.esp") in calls
 
 
 def test_cli_with_an_ident_probe_verifies_the_ident(tmp_path, make, held, capsys):
@@ -372,7 +374,7 @@ def test_an_ident_probe_failure_after_the_flash_is_not_nothing_flashed(make, hel
 def test_cli_failure_after_the_enter_exits_1_not_2(tmp_path, make, held, capsys):
     rc, calls, lock, fake = _run_cli(tmp_path, make, ident_probe=lambda: "x",
                                      esp="popup:Something unexpected")
-    assert rc == 1 and ("delete", "/Temp/raw_u64.esp") in calls
+    assert rc == 1 and ("delete", "/USB1/espflash/raw_u64.esp") in calls
 
 
 def test_wifi_back_on_another_address_than_the_stated_one_fails(make, held):
@@ -393,3 +395,16 @@ def test_a_known_text_with_other_buttons_is_not_answered(make, held):
 def test_cli_warns_not_to_touch_the_device(tmp_path, make, held, capsys):
     _run_cli(tmp_path, make, ident_probe=lambda: "x")
     assert "do not touch the U64E's keyboard or menu" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("dest", ["/Temp/raw_u64.esp", "/temp/x/raw_u64.esp", "/Flash/raw_u64.esp",
+                                  "/raw_u64.esp", "/USB1/espflash/raw_u64.bin"])
+def test_cli_refuses_temp_flash_and_non_esp_destinations(tmp_path, make, held, capsys, dest):
+    rc, calls, lock, fake = _run_cli(tmp_path, make, dest=dest)
+    assert rc == 2 and calls == [] and fake.sessions == [] and lock.events == []
+    assert "REFUSED" in capsys.readouterr().err
+
+
+def test_cli_dest_is_required(tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["--host", "h", "--esp", "a.esp", "--platform", "u64e"])
