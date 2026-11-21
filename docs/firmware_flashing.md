@@ -441,9 +441,9 @@ when its text is one of the firmware's exact strings: `Flashing ESP32
 Success!`, `Flashing Error -4`, `Flashing Error -5`, `Could not read
 header.`, `Incorrect signature in file.`, `Couldn't alloc mem to load
 segment.` or `Could not switch to download mode.`, with an `Ok`-only button
-row. Anything else raises without a key. A session that dies does not
-leave the module in download mode: the popup loop ends with the socket and
-the module restarts. Only "Could not switch to download mode." skips the
+row. Anything else raises without a key. By source (not tested live), a
+session that dies does not leave the module in download mode: the popup
+loop ends with the socket and the module restarts. Only "Could not switch to download mode." skips the
 restart.
 
 **The firmware checks nothing.** It does not check the ident or the chip,
@@ -458,14 +458,19 @@ exactly like nothing written. So:
   true only when both were read and the ident changed. A verified flash
   whose ident did not change is reported `UNPROVEN`.
 
-**Refused before anything is sent:** without `confirm_module_flash=True`;
+**Refused before any connection:** without `confirm_module_flash=True`;
 without the `DeviceLock`; a path that is not a `.esp`, or is on `/Temp` or
 `/Flash`; an `expect_ident` longer than 31 characters (the module reports
-at most 31); a driver host that is, or resolves to, the module's WiFi
-address, or that is not the address the `Net0` row shows (the flash stops
-WiFi, so a WiFi session would die mid-flash); a file whose menu has no
-"Flash into ESP32" (C64U builds lack it); and an `expect_ident` equal to the
-ident before the flash (`allow_same_ident=True` overrides).
+at most 31).
+
+**Refused before the ENTER, after reads:** a driver host that is, or
+resolves to, the module's WiFi address, or that is not the address the
+`Net0` row shows (the flash stops WiFi, so a WiFi session would die
+mid-flash), checked after two read sessions; an `expect_ident` equal to the
+ident before the flash (`allow_same_ident=True` overrides), checked after
+the ident read, which through the CLI is `read_wifi_ident` and so already
+cost two WiFi config flash writes on the U64E; and a file whose menu has no
+"Flash into ESP32" (C64U builds lack it), checked after the navigation keys.
 
 **After the popup** it verifies on fresh sessions: the WiFi row back at Link
 Up, a ping of the module's WiFi address (`ping=False` skips it, and the
@@ -491,12 +496,15 @@ It checks the image with `esp_image.py`, takes the `DeviceLock`
 `--dest` (refusing an existing file), reads the upload back, reads the ident
 with `read_wifi_ident` before and after (never inside the flash window),
 runs `flash_esp`, and prints one result line. It deletes the upload, and its
-directory if empty, except when the ENTER may have been sent without a
-result popup being answered (no popup, an interrupt): then the file is kept
-and its path printed, because the firmware may still be reading it.
-Exit codes: **0** verified and proven; **3** verified but unproven (no
-ident change, or `--no-ping`); **1** failed or unverified after the ENTER;
-**2** refused before the ENTER, including a `DeviceLock` timeout.
+directory if empty, after a normal return, a failure popup, a verification
+failure or a refusal before the ENTER. After anything else (an interrupt,
+no popup, an unexpected popup, a session or lock lost after the flash) the
+file is kept and its path printed, because the firmware may still be
+reading it.
+Exit codes: **0** verified and proven (or, with `--allow-same-ident`,
+verified with a ping reply); **3** verified but unproven (no ident change,
+or `--no-ping`); **1** failed or unverified after the ENTER; **2** refused
+before the ENTER, including a `DeviceLock` timeout.
 
 Costs and limits:
 - Each ident read disables and re-enables WiFi, and on the U64E each toggle
@@ -509,23 +517,27 @@ Costs and limits:
 - C64U: out of scope. Its builds have no "Flash into ESP32" action, and
   the CLI accepts `--platform u64e` only.
 
-**Measured** (U64E over ethernet, 2026-11-20/21): four tagged-then-restore
-pairs during PR #575's review, every flash `PROVEN`, 62-69 s each. The last
-two (on `cd9a07b` and `6535087`) recorded the device at aab1343c2, firmware
-3.15a, core 1.50, and exited 0. The ident went
+**Measured** (U64E over ethernet, 2026-11-21): four tagged-then-restore
+pairs during PR #575's review, every flash `PROVEN`, 61.8-69.4 s each. Run
+4 (on `6535087`) recorded the device at aab1343c2, firmware 3.15a, core
+1.50, and exited 0; run 3 was the same device and day. The ident went
 `ESP32 WiFi Bridge V1.507` → `Taab1343 WiFi Bridge V1.507` → back, WiFi
 came back at Link Up each time, and each upload was read back byte-exact
-before the ENTER. Upstream, GideonZ/1541ultimate#1121/#1122 (open) make
-the action check the image and stop reporting "Success!" for an empty or
-truncated file.
+before the ENTER. Upstream, GideonZ/1541ultimate#1121 (issue) and its fix
+#1122 (PR), both open, make the action check the image and stop reporting
+"Success!" for an empty or truncated file.
 
 ## Bench scripts: RAM-run, JTAG load, outlet power cycle
 
 Three scripts under `scripts/` (#571) load firmware without writing flash,
-or power-cycle a device. Each takes the device's `DeviceLock` itself, or
-requires it held by this process or a verified ancestor lock shell. Each is
-gated by `tests/test_u64_runner_script_gates.py`. They are bench tools, not
-test steps.
+or power-cycle a device. They are bench tools for this bench, not test
+steps: `ram_run_u64.py` and `jtag_load.py` are bound by `unique_id` to one
+bench device each and refuse any other, and `power_outlet.py` needs an
+outlet bound in `devices.toml`. Each takes the device's `DeviceLock`
+(`ram_run_u64.py` takes its own and refuses to run inside a lock shell;
+`jtag_load.py` and `power_outlet.py` also accept a hold by a verified
+ancestor lock shell). All three are gated by
+`tests/test_u64_runner_script_gates.py`.
 
 - **`ram_run_u64.py run HOST IMAGE --sha256 H --expect-hash G`** runs a
   U64E application from RAM through Run Update, with no flash write. The
@@ -552,8 +564,10 @@ test steps.
   `~/.config/c64-test-harness/devices.toml` (`outlet`, `outlet_kind`).
   - On a U64E it powers off gracefully first, through the harness
     client's `poweroff(confirm_irrecoverable=True)`.
-  - On a C64U it does not, unless `--c64u-poweroff` is given: a poweroff
-    stores last-state OFF in the module, and the machine then comes back
-    only with power-on mode ON.
+  - It skips that poweroff, unless `--c64u-poweroff` is given, only on the
+    C64U whose `unique_id` is in the script's `C64U_IDS` (the bench unit):
+    a poweroff stores last-state OFF in the module, and the machine then
+    comes back only with power-on mode ON. **Any other C64U is treated like
+    a U64E and powered off first; pass `--no-graceful` for it.**
   - The outlet is never left off: any error after switching it off
     switches it back on before raising.

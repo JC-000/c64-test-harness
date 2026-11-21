@@ -181,10 +181,11 @@ Hardware reading, in order:
 - **Device storage, flash and firmware** (each needs the caller to hold the `DeviceLock`, and none costs a `/Temp` attachment):
   - `storage_*` read, write and rename files on the device's own volumes over FTP. `storage_put_rom` / `storage_delete_rom` are the only writes under `/Flash`, one ROM image in `/Flash/roms`, size- and signature-checked.
   - `save_config_item_to_flash()` saves one config key, and refuses unless it is the only RAM-vs-flash difference. It is the only sanctioned config save; the public `Ultimate64Client.save_config_to_flash` saves every dirty store, and nothing in the harness calls it except this function.
-  - `Ultimate64RemoteMenu` drives the firmware's telnet Remote Menu: read the screen and the WiFi row, toggle WiFi, run a printer task (`run_task`), start Run Update. On a U64E, WiFi Disable/Enable writes the WiFi config store to flash. It sends one state-changing key per call and never answers telnet negotiation. `read_wifi_ident()` reads the WiFi module's IDENT and leaves WiFi as it found it.
+  - `Ultimate64RemoteMenu` drives the firmware's telnet Remote Menu: read the screen and the WiFi row, toggle WiFi, run a printer task (`run_task`), start Run Update. On a U64E, WiFi Disable/Enable writes the WiFi config store to flash. It sends one state-changing key per call and never answers telnet negotiation.
+  - `read_wifi_ident()` reads the WiFi module's IDENT, cycling WiFi only when it is on, and waits for it to come back (a module found at Link Down may come back at Link Up).
   - `flash_firmware()` flashes an update image: it validates it on the host, uploads it, starts Run Update, tells the person at the device what to answer, and verifies the firmware that comes back. Dry-run it first. `reformat_flash_disk` is a required answer (since 0.15.0). See [docs/firmware_flashing.md](docs/firmware_flashing.md).
   - `Ultimate64RemoteMenu.flash_esp()` and the CLI `python -m c64_test_harness.tools.flash_esp` flash a U64E's ESP32 WiFi module from a `.esp` image. The CLI checks the image and the upload's bytes first and proves the flash by the module ident changing.
-  - Bench scripts `scripts/ram_run_u64.py` (run a U64E application from RAM, refusing anything but a RAM-run image), `scripts/jtag_load.py` (C64U over JTAG) and `scripts/power_outlet.py` (a cold cycle through a switched outlet) write no firmware flash. Same doc.
+  - Bench scripts `scripts/ram_run_u64.py` (run a U64E application from RAM, refusing anything but a RAM-run image), `scripts/jtag_load.py` (C64U over JTAG) and `scripts/power_outlet.py` (a cold cycle through a switched outlet) write no firmware flash. The first two are bound to this bench's devices and refuse others; read the doc before pointing `power_outlet.py` at a C64U. Same doc.
 - **Don't read C64 memory during disk or printer I/O on an Ultimate:** every REST memory read stops the 6510 inside the firmware while the CIA timers and the IEC processor run on, which can cut a LOAD short with no error or hang a print job (#573, GideonZ/1541ultimate#1120). That includes the screen and memory waiters. Wait the I/O out, then check a LOAD with `PrgFile.verify_load` ([below](#prg-binary-verification)). Rule and figures in the c64-test skill's PATTERNS.
 - **Liveness probe:** `probe_u64()` / `is_u64_reachable()` check reachability (ping → TCP → REST). This is not a health check ([below](#liveness-probe)).
 - **Configuration helpers:** turbo speed (cross-generation CPU-speed probing), REU size, SID sockets and addressing, disk mounting, PRG run/load, and snapshot/restore of device state.
@@ -320,8 +321,9 @@ labels = Labels.from_file("build/labels.txt")
 ok, diffs = prg.verify_region(transport, labels["sha256_k"], 256)
 assert ok, f"{diffs} bytes corrupted"
 
-# After a KERNAL LOAD of the file: did all of it arrive? ST=$40 and matching
-# bytes also follow a short LOAD, so this checks the end pointer $AE/$AF too.
+# After a KERNAL LOAD of the file: did all of it arrive? ST=$40 also follows a
+# short LOAD, and so do matching bytes after a repeated LOAD (the earlier copy's
+# tail is still in RAM), so this checks the end pointer $AE/$AF too.
 # Clear $AE/$AF before typing the LOAD; pass start=0x0801 for LOAD"NAME",8.
 check = prg.verify_load(transport)
 assert check.complete, check          # check.short: the LOAD stopped early

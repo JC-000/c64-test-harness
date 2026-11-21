@@ -1141,7 +1141,7 @@ python -m c64_test_harness.tools.flash_esp --host <ethernet address> --esp X.esp
     --expect-ident "<tag> WiFi Bridge V1.507" --wifi-ip <module WiFi address> --confirm-module-flash
 ```
 
-Exit 0 means verified and proven (the ident changed); 3 means verified but unproven; 1 means failed after the ENTER (do not re-run blind: read the WiFi row and the ident first); 2 means refused before the ENTER. Each ident read writes the WiFi config store to flash on the U64E, four writes per default run. `docs/firmware_flashing.md` also covers the bench scripts `ram_run_u64.py`, `jtag_load.py` and `power_outlet.py`.
+Exit 0 means verified and proven (the ident changed; or, with `--allow-same-ident`, verified with a ping reply); 3 means verified but unproven; 1 means failed after the ENTER (do not re-run blind: read the WiFi row and the ident first); 2 means refused before the ENTER. Each ident read writes the WiFi config store to flash on the U64E, four writes per default run. `docs/firmware_flashing.md` also covers the bench scripts `ram_run_u64.py`, `jtag_load.py` and `power_outlet.py`.
 
 ### SocketDMA write fast path (TCP 64)
 
