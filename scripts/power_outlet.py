@@ -4,10 +4,10 @@
     power_outlet.py cycle HOST [--off-s 10] [--expect-hash G] [--no-graceful] [--c64u-poweroff] [--dry-run]
     power_outlet.py status HOST
 
-Binding, in ~/.config/c64-test-harness/devices.toml under the device's table:
+Binding, in the local bench bindings file (~/.config/c64-test-harness/bench.toml, see _bench_bindings.py) under
+the table of the unique_id that the alias map (devices.toml) folds HOST to:
 
     [devices.abc123]
-    hosts = [...]
     outlet = "http://<plug address>"    # static DHCP lease
     outlet_kind = "shelly-gen2"         # or "tasmota"
 
@@ -55,6 +55,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import jtag_load as jl  # noqa: E402  (harness src on sys.path, DeviceLock, try_info, wait_info, check_git_hash)
 from _u64_host import require_device_lock  # noqa: E402
+from _bench_bindings import BenchBindingError, bench_file_path, bench_table  # noqa: E402
 
 MIN_OFF_S = 10.0
 #: Products that get the poweroff by default: U64 == 1 builds sharing one power register, by source. Their power-up
@@ -139,17 +140,15 @@ KINDS = {"shelly-gen2": ShellyGen2, "tasmota": Tasmota}
 
 
 def outlet_binding(uid: str, path: Path | None = None) -> dict:
-    """{"outlet": url, "outlet_kind": kind} from devices.toml for this unique_id; refuse if absent."""
-    import tomllib
-    from c64_test_harness.backends.device_aliases import aliases_file_path
-    p = path or aliases_file_path()
+    """{"outlet": url, "outlet_kind": kind} from bench.toml for this unique_id; refuse if absent, or if the file is
+    missing or broken."""
     try:
-        data = tomllib.loads(Path(p).read_text())
-    except FileNotFoundError:
-        data = {}
-    tbl = data.get("devices", {}).get(uid.lower()) or data.get("devices", {}).get(uid.upper()) or {}
+        tbl = bench_table(uid, path)
+    except BenchBindingError as e:
+        raise OutletError(str(e)) from None
     if not tbl.get("outlet") or tbl.get("outlet_kind") not in KINDS:
-        raise OutletError(f"no outlet bound to device {uid} in {p} (need outlet = URL, outlet_kind in {sorted(KINDS)})")
+        raise OutletError(f"no outlet bound to device {uid} in {path or bench_file_path()} (need outlet = URL, "
+                          f"outlet_kind in {sorted(KINDS)})")
     return {"outlet": tbl["outlet"], "outlet_kind": tbl["outlet_kind"]}
 
 

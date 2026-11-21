@@ -69,7 +69,7 @@ class Storage:
             self.fake.tree[d + "/"] = [e for e in self.fake.tree.get(d + "/", []) if e.name != name]
 
 
-def info(h="17995fd9c", uid="601A96", product="Ultimate 64 Elite"):
+def info(h="17995fd9c", uid="ABC123", product="Ultimate 64 Elite"):
     return {"unique_id": uid, "product": product, "git_commit_hash": h}
 
 
@@ -103,9 +103,27 @@ USB1_LONG = ([Entry(f"dir{i:02d}", "DIR") for i in range(40)] + [Entry(n, "DIR")
              + [Entry("rr71b913.u64", "U64", "1272K"), Entry("update_m3.u64", "U64", "5609K")])
 
 
+# The RAM-run binding is a key in the device's bench.toml table (fake ids; the real ones are local config).
+BENCH_TOML = """\
+[devices.abc123]
+ram_run = true
+
+[devices.def456]
+outlet = "http://192.0.2.200"
+outlet_kind = "tasmota"
+
+[devices.fed789]
+ram_run = false
+"""
+KEYS = {"u64e": "uid-abc123", "unkeyed": "uid-def456", "keyed-false": "uid-fed789", "untabled": "uid-0a0b0c"}
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
-    monkeypatch.setattr(jl, "normalize_device_host", lambda h: "uid-601a96" if h == "u64e" else h)
+    toml = tmp_path / "bench.toml"
+    toml.write_text(BENCH_TOML)
+    monkeypatch.setenv("C64_BENCH_BINDINGS_FILE", str(toml))
+    monkeypatch.setattr(jl, "normalize_device_host", lambda h: KEYS.get(h, h))
     img = tmp_path / "r.u64"
     img.write_bytes(ramrun_image())
     return [], img, hashlib.sha256(img.read_bytes()).hexdigest()
@@ -177,11 +195,32 @@ def test_pinned_hash_refuses_before_lock(env):
     assert e.value.stage == "hash" and ev == []
 
 
-def test_c64u_is_not_enabled(env):
+def test_a_device_whose_table_sets_ram_run_is_bound(env):
+    assert rr.bound_u64("u64e") == "ABC123"
+
+
+@pytest.mark.parametrize("host", ["192.0.2.26", "unkeyed", "keyed-false", "untabled"])
+def test_a_device_without_ram_run_is_refused_before_anything(env, host):
+    """Not in the alias map, a table without the key, ram_run = false, and a uid- key with no table."""
     ev, img, sha = env
     with pytest.raises(jl.JtagLoadError) as e:
-        rr.ram_run("192.0.2.26", img, sha256=sha, expect_git_hash="x", storage=Storage(ev))
-    assert e.value.stage == "binding"
+        rr.ram_run(host, img, sha256=sha, expect_git_hash="x", storage=Storage(ev),
+                   lock_factory=lambda n, allow_nested=False: Lock(ev, n))
+    assert e.value.stage == "binding" and ev == []
+
+
+@pytest.mark.parametrize("text", [None, "[devices.abc123]\nram_run = 1\n", "[devices.abc123]\nram_run = true\nramrun = true\n"],
+                         ids=["missing", "wrong-type", "unknown-key"])
+def test_a_missing_or_broken_bench_file_refuses_before_anything(env, tmp_path, text):
+    ev, img, sha = env
+    p = tmp_path / "bench.toml"
+    p.unlink()
+    if text is not None:
+        p.write_text(text)
+    with pytest.raises(jl.JtagLoadError, match="bench.toml") as e:
+        rr.ram_run("u64e", img, sha256=sha, expect_git_hash="x", storage=Storage(ev),
+                   lock_factory=lambda n, allow_nested=False: Lock(ev, n))
+    assert e.value.stage == "binding" and ev == []
 
 
 def test_other_product_answering_refuses_before_upload(env):

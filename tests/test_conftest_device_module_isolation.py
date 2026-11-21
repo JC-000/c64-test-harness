@@ -100,7 +100,7 @@ def _run(tmp_path: Path) -> dict:
     env = {k: v for k, v in os.environ.items() if not k.startswith("U64_")}
     env.update(
         ISOLATION_OUT=str(out),
-        C64_DEVICE_ALIASES="601a96=192.0.2.81",
+        C64_DEVICE_ALIASES="abc123=192.0.2.81",
         C64_DEVICE_ALIASES_FILE=str(tmp_path / "absent.toml"),
         # The package under test, not whatever the editable install points at.
         PYTHONPATH=str(Path(c64_test_harness.__file__).resolve().parents[1]),
@@ -124,7 +124,7 @@ def test_device_driving_modules_keep_the_map_and_the_ledger_unit_tests_do_not(tm
         # test leaves a count that its fixtures must reset on the way out.
         assert got["pending_before"] == 0, (module, got)
         if device:
-            assert got["key"] == "uid-601a96", (module, got)
+            assert got["key"] == "uid-abc123", (module, got)
             assert got["pending_after"] == got["pending_after_unmapped"] == 5, (module, got)
         else:
             assert got["key"] == "192.0.2.81", (module, got)

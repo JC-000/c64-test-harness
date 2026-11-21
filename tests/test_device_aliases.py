@@ -47,7 +47,7 @@ from c64_test_harness.backends.ultimate64_client import (
 from c64_test_harness.backends.ultimate64_temp_gc import TempGCResult
 
 ETH, WIFI = "192.0.2.81", "192.0.2.83"
-UID = "601a96"
+UID = "abc123"
 PRG = b"\x01\x08x"
 
 
@@ -180,7 +180,7 @@ class _Drain:
         self.calls += 1
 
 
-@pytest.mark.parametrize("edit", [BENCH, "[devices.601a96\n"], ids=["new-alias", "broken"])
+@pytest.mark.parametrize("edit", [BENCH, f"[devices.{UID}\n"], ids=["new-alias", "broken"])
 def test_editing_the_map_during_a_hold_changes_nothing_in_this_process(
     aliases, tmp_path, edit
 ):
@@ -219,7 +219,7 @@ def test_the_lock_holder_query_reports_the_spelling_and_the_device(aliases, lock
     f'[devices.{UID}]\nhost = ["{ETH}"]\n',
     f'[devices."60 1a"]\nhosts = ["{ETH}"]\n',
     f'[devices.{UID}]\nhosts = ["uid-abcdef"]\n',
-    "[devices.601a96\n",
+    f"[devices.{UID}\n",
     f'[device.{UID}]\nhosts = ["{ETH}"]\n',
 ], ids=["two-devices", "empty", "typo-key", "bad-id", "canonical-as-host", "bad-toml",
         "typo-table"])
@@ -244,7 +244,7 @@ def test_a_broken_environment_map_is_refused_before_any_lock(
 
 
 def test_a_broken_map_is_refused_before_any_request(aliases):
-    aliases("[devices.601a96\n")
+    aliases(f"[devices.{UID}\n")
     with patch("urllib.request.urlopen", side_effect=AssertionError("request sent")):
         with pytest.raises(DeviceAliasConfigError):
             Ultimate64Client(ETH, warn_unlocked=False)

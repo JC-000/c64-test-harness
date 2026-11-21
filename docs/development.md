@@ -209,11 +209,13 @@ The steps above build a harness. Moving to a new Mac takes more than that: some 
    - `~/.config/c64-test-harness/devices.toml`, the device alias map ([device_locking.md § Multi-interface devices](device_locking.md)). The 2026-10 migration archived it but did not restore it. A hand rebuild left out the U64E's WiFi address, so the original was then copied back from the archive. Copy the file across; rebuilding it from memory loses addresses. Without it, a device's ethernet and WiFi addresses become separate `DeviceLock`s and `/Temp` ledgers, and two lanes can drive one device at once. List every address of each device under its `unique_id` from `GET /v1/info`, and read that ID only while holding the device's lock:
 
      ```toml
-     [devices.5d2518]   # C64U: ethernet, WiFi, old address
+     [devices.abc123]   # C64U (its unique_id): ethernet, WiFi, old address
      hosts = ["10.43.23.26", "10.43.23.158", "10.53.21.158"]
-     [devices.601a96]   # U64E: ethernet, WiFi (seen 2026-10-04)
+     [devices.def456]   # U64E (its unique_id): ethernet, WiFi (seen 2026-10-04)
      hosts = ["10.43.23.81", "10.43.23.83"]
      ```
+
+   - `~/.config/c64-test-harness/bench.toml` (or `$C64_BENCH_BINDINGS_FILE`), the bench scripts' per-device bindings, kept in local config rather than in the repo because the id is serial-derived. It has the same `[devices.<unique_id>]` tables but no `hosts`, and it is a separate file because the alias map refuses every key except `hosts`, in every harness version that reads it. `ram_run = true` enables `scripts/ram_run_u64.py`. `jtag_adapter_location` and `jtag_adapter_baud` bind the esp-jtag kit for `scripts/jtag_load.py`; add `jtag_scan_only = true` for a device it may only scan. `outlet` and `outlet_kind` bind `scripts/power_outlet.py`. A script refuses a device without its keys, and refuses to run at all when the file is missing, holds an unknown key, or holds a value of the wrong type (`scripts/_bench_bindings.py`).
 
    - The `c64-test` skill symlink: `./scripts/install-skill.sh` (idempotent).
 
@@ -774,7 +776,7 @@ project's local brief.
 ### Standing hardware-safety clause: the C64U's `/Temp`
 
 Every review also enforces the C64U wedge clause. The C64 Ultimate
-(`uid-5d2518`, ethernet 10.43.23.26 since 2026-10-13, fw 1.1.0) predates GideonZ/1541ultimate#686 and never
+(ethernet 10.43.23.26 since 2026-10-13, fw 1.1.0) predates GideonZ/1541ultimate#686 and never
 collects the managed `/Temp` attachments left by body-carrying REST
 calls. The attachments fill `/Temp`, and a full `/Temp` crashes the device
 firmware, taking REST and the UCI bridge down together; only a physical

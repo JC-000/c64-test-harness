@@ -56,7 +56,7 @@ HOST = "127.0.0.1"
 LOAD = 0x03000000
 HASH_OLD = "7b15448a"
 HASH_NEW = "c0ffee12"
-UID = "5d2518"
+UID = "abc123"
 
 PROMPTS = (b"Reformat Flash Disk?", b"About to update. Continue?",
            b"Reset Configuration? (Recommended)")
@@ -736,7 +736,7 @@ def test_the_wrong_hash_after_the_flash_is_a_verify_error(rig, held, tmp_path):
 
 
 def test_a_different_device_answering_is_a_verify_error(rig, held, tmp_path):
-    rig.infos = [info(), info(git_hash=HASH_NEW, uid="601a96")]
+    rig.infos = [info(), info(git_hash=HASH_NEW, uid="def456")]
     with pytest.raises(FirmwareFlashVerifyError, match="different device"):
         rig.run(make_image(tmp_path))
 

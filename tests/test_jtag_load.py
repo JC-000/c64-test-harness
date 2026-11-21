@@ -12,7 +12,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts"))
 import jtag_load as jl  # noqa: E402
 
-UID = "5D2518"
+UID = "ABC123"
 XILINX_7A50T = 0x0362C093
 
 
@@ -119,6 +119,7 @@ class FakeEsp:
 
     def open_link(self, ns):
         self.ev.append(("open", ns.port))
+        self.baud = ns.baud
         return self.Link()
 
     def open_jtag(self, link, ns):
@@ -153,14 +154,43 @@ def info(hash_="abc123def", uid=UID, product="Ultimate 64-II"):
     return {"unique_id": uid, "product": product, "git_commit_hash": hash_}
 
 
+# The adapter bindings are keys in each device's bench.toml table (fake ids; the real ones are local config).
+LOCATION = "9-9.9"
+ADAPTER_LOCK = "jtag-adapter-usb-" + LOCATION
+BENCH_TOML = f"""\
+[devices.abc123]
+jtag_adapter_location = "{LOCATION}"
+jtag_adapter_baud = 921600
+
+[devices.def456]
+jtag_adapter_location = "{LOCATION}"
+jtag_adapter_baud = 921600
+jtag_scan_only = true
+
+[devices.fed789]
+ram_run = true
+
+[devices.0a0b0c]
+jtag_adapter_location = "{LOCATION}"
+
+[devices.0d0e0f]
+jtag_adapter_baud = 921600
+"""
+KEYS = {"c64u": "uid-abc123", "u64e": "uid-def456", "plain": "uid-fed789", "no-baud": "uid-0a0b0c",
+        "no-location": "uid-0d0e0f", "untabled": "uid-123456"}
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     ev = Events()
     port = tmp_path / "cu.fake"
     port.write_text("")
-    monkeypatch.setattr(jl, "ADAPTERS", {UID: {"port": str(port), "lock": "adapter", "baud": "921600"}})
-    monkeypatch.setattr(jl, "normalize_device_host",
-                        lambda h: "uid-5d2518" if h == "c64u" else h)
+    toml = tmp_path / "bench.toml"
+    toml.write_text(BENCH_TOML)
+    monkeypatch.setenv("C64_BENCH_BINDINGS_FILE", str(toml))
+    monkeypatch.delenv("JTAG_USB_LOCATION", raising=False)
+    monkeypatch.setattr(jl, "resolve_port", lambda location, comports=None: str(port))
+    monkeypatch.setattr(jl, "normalize_device_host", lambda h: KEYS.get(h, h))
     monkeypatch.setattr(jl.time, "sleep", lambda s: None)
     bit = tmp_path / "x.bit"
     app = tmp_path / "x.bin"
@@ -171,7 +201,8 @@ def env(tmp_path, monkeypatch):
 
 def locks(ev, dev_ok=True, ad_ok=True):
     def factory(name, allow_nested=False):
-        return FakeLock(ev, "device" if name == "c64u" else name, dev_ok if name == "c64u" else ad_ok)
+        label = {"c64u": "device", ADAPTER_LOCK: "adapter"}.get(name, name)
+        return FakeLock(ev, label, dev_ok if name == "c64u" else ad_ok)
     return factory
 
 
@@ -237,7 +268,7 @@ def test_unwired_idcode_stops_before_fpga(env):
 def test_wrong_device_identity_refuses_before_open(env):
     ev = env[0]
     with pytest.raises(jl.JtagLoadError) as e:
-        load(env, FakeEsp(ev), FakeClient(ev, [info(uid="601A96", product="Ultimate 64 Elite")]))
+        load(env, FakeEsp(ev), FakeClient(ev, [info(uid="DEF456", product="Ultimate 64 Elite")]))
     assert e.value.stage == "identity" and not any(x[0] == "open" for x in ev)
 
 
@@ -384,7 +415,7 @@ def test_power_cycle_that_never_drops_fails(env):
 def test_other_device_answering_after_load_is_an_identity_failure(env):
     ev = env[0]
     with pytest.raises(jl.JtagLoadError) as e:
-        load(env, FakeEsp(ev), FakeClient(ev, [None, info("abc123def", uid="601A96")]))
+        load(env, FakeEsp(ev), FakeClient(ev, [None, info("abc123def", uid="DEF456")]))
     assert e.value.stage == "identity"
 
 
@@ -438,10 +469,88 @@ def test_port_answering_as_something_else_refuses(env):
 
 def test_missing_adapter_port_refuses(env, monkeypatch):
     ev, bit, app, bsha, asha, tmp = env
-    monkeypatch.setattr(jl, "ADAPTERS", {UID: {"port": str(tmp / "absent"), "lock": "adapter"}})
+    monkeypatch.setattr(jl, "resolve_port", lambda location, comports=None: str(tmp / "absent"))
     with pytest.raises(jl.JtagLoadError) as e:
         load(env, FakeEsp(ev), FakeClient(ev, [info()]))
     assert e.value.stage == "adapter" and ev == []
+
+
+# -- the bindings in devices.toml ------------------------------------------------------------------------------
+
+def test_the_load_adapter_comes_from_the_device_table(env, monkeypatch):
+    seen = []
+    monkeypatch.setattr(jl, "resolve_port", lambda location, comports=None: seen.append(location) or "/dev/cu.x")
+    assert jl.bound_uid("c64u") == UID
+    assert jl.adapter_for(UID) == {"location": LOCATION, "lock": ADAPTER_LOCK, "baud": "921600", "port": "/dev/cu.x"}
+    assert seen == [LOCATION]
+
+
+def test_jtag_usb_location_still_overrides_the_table(env, monkeypatch):
+    seen = []
+    monkeypatch.setattr(jl, "resolve_port", lambda location, comports=None: seen.append(location) or "/dev/cu.x")
+    monkeypatch.setenv("JTAG_USB_LOCATION", "1-2.3")
+    a = jl.adapter_for(UID)
+    assert (a["location"], a["lock"], seen) == ("1-2.3", "jtag-adapter-usb-1-2.3", ["1-2.3"])
+
+
+def test_the_tables_baud_reaches_the_adapter_link(env):
+    ev = env[0]
+    esp = FakeEsp(ev)
+    jl.read_ids("c64u", esp=esp, lock_factory=locks(ev), log=lambda m: None)
+    assert esp.baud == "921600" and ("acquire", "adapter") in ev
+
+
+@pytest.mark.parametrize("host", ["plain", "u64e", "no-baud", "no-location", "untabled", "192.0.2.26"])
+def test_a_device_without_a_load_binding_is_refused_before_anything(env, host):
+    """No jtag keys, scan-only, half a binding, a uid- key with no table, and a host outside the alias map."""
+    ev = env[0]
+    with pytest.raises(jl.JtagLoadError) as e:
+        jl.bound_uid(host)
+    assert e.value.stage == "binding"
+    for call in (lambda: jl.read_ids(host, esp=FakeEsp(ev), lock_factory=locks(ev)),
+                 lambda: jl.power_cycle(host, lock_factory=locks(ev), client_factory=FakeClient(ev, [info()]),
+                                        browser_factory=lambda h: FakeBrowser(ev), log=lambda m: None)):
+        with pytest.raises(jl.JtagLoadError) as e:
+            call()
+        assert e.value.stage == "binding"
+    assert ev == []
+
+
+def test_scan_uses_the_scan_only_devices_table(env, monkeypatch):
+    ev = env[0]
+    seen = []
+    monkeypatch.setattr(jl, "resolve_port", lambda location, comports=None: seen.append(location) or "/dev/cu.x")
+    with pytest.raises(jl.JtagLoadError) as e:      # past the binding gate, stopped by the power check
+        jl.scan_u64e("u64e", esp=FakeEsp(ev), lock_factory=locks(ev), client_factory=FakeClient(ev, [None]),
+                     log=lambda m: None)
+    assert e.value.stage == "power" and seen == [LOCATION]
+    assert ("acquire", "u64e") in ev and ("acquire", "adapter") in ev
+    assert jl.adapter_binding("DEF456", scan=True) == {"location": LOCATION, "lock": ADAPTER_LOCK, "baud": "921600"}
+
+
+@pytest.mark.parametrize("host", ["c64u", "plain", "no-baud", "untabled", "192.0.2.81", "zzzzdef456"])
+def test_scan_refuses_a_device_that_is_not_scan_only(env, host):
+    ev = env[0]
+    with pytest.raises(jl.JtagLoadError) as e:
+        jl.scan_u64e(host, esp=FakeEsp(ev), lock_factory=locks(ev), client_factory=FakeClient(ev, [None]))
+    assert e.value.stage == "binding" and ev == []
+
+
+@pytest.mark.parametrize("text", [None, BENCH_TOML.replace("baud = 921600", 'baud = "921600"', 1),
+                                  BENCH_TOML + "jtag_adapter_port = '/dev/cu.x'\n"],
+                         ids=["missing", "wrong-type", "unknown-key"])
+def test_a_missing_or_broken_bench_file_is_a_binding_refusal(env, text):
+    ev = env[0]
+    p = env[5] / "bench.toml"
+    p.unlink()
+    if text is not None:
+        p.write_text(text)
+    for call in (lambda: jl.bound_uid("c64u"),
+                 lambda: jl.scan_u64e("u64e", esp=FakeEsp(ev), lock_factory=locks(ev))):
+        with pytest.raises(jl.JtagLoadError, match="bench.toml") as e:
+            call()
+        assert e.value.stage == "binding"
+    assert ev == []
 
 
 @pytest.mark.parametrize("h", ["", "abc", "zzzzzzzzz", None])
@@ -542,11 +651,6 @@ def test_sld_hub_info_and_nodes():
     assert info["node_list"][0]["node_id"] == 2 and info["node_list"][0]["manufacturer"] == "06e"
     assert set(t.latched) <= {0x00E, 0x00C, 0x3FF} and t.latched[-1] == 0x3FF
 
-
-def test_scan_refuses_the_c64u(env):
-    with pytest.raises(jl.JtagLoadError) as e:
-        jl.scan_u64e("c64u", esp=FakeEsp(env[0]), lock_factory=locks(env[0]))
-    assert e.value.stage == "binding"
 
 
 SID_POPUP = "+--------------------------------+\n| SID changed. Please review settings |\n|              Ok              |\n+---------+"

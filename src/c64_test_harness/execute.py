@@ -930,7 +930,7 @@ def _write_prg_body_verified(transport: Any, load_addr: int, body: bytes,
 
     The re-verification is the guarantee; the settle constant is only an
     optimisation on top of it.  The 2-5 s window is n=4 on one device and
-    one firmware (U64E ``601A96``, ``4011c97c`` / fpga 125), so a bare
+    one firmware (the bench U64E, ``4011c97c`` / fpga 125), so a bare
     sleep tuned to it would decay silently on another model or firmware --
     do not "simplify" this to a sleep.  No wait when the caller skipped
     the reset, because the event is reset-triggered, not time-triggered:

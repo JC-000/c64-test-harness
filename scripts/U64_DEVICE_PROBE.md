@@ -36,7 +36,7 @@ extra ones) is not dumped.
 | fpga_version       | `121`                        |
 | core_version       | `1.45`                       |
 | hostname           | `Ultimate-64-Elite-688004`   |
-| unique_id          | `601A96`                     |
+| unique_id          | 6 hex digits (kept in local config, not here) |
 | REST API version   | `0.1`                        |
 
 Endpoints hit: `GET /v1/version`, `GET /v1/info`, `GET /v1/configs`,

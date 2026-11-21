@@ -20,8 +20,9 @@ Library use (a test script looping over N images)::
     power_cycle(C64U_HOST, expect_git_hash=FLASHED_HASH)   # back to the flashed image
 
 Each call takes the device's DeviceLock (``allow_nested=True``, so a caller may hold it across the loop) and then
-the adapter's own lock. Safety gates, in order: device bound to an adapter; file SHA-256 equal to the caller's
-(files are copied first and the copies are hashed and loaded); the .bit's IDCODE is an XC7A50T; the device (if it
+the adapter's own lock. Safety gates, in order: device bound to an adapter (in the local bench.toml; see the
+comment above device_table); file SHA-256 equal to the caller's (files are copied first and the copies are hashed
+and loaded); the .bit's IDCODE is an XC7A50T; the device (if it
 answers) is the bound unique_id and a C64U-class product; the live IDCODE equals the .bit's (checked before the FPGA
 is touched); user ID 0xDEAD1541 after the load; then /v1/info must come back with the bound unique_id and, when
 given, the expected git hash.
@@ -60,6 +61,7 @@ from c64_test_harness.backends.device_lock import (  # noqa: E402
 sys.path.insert(0, str(HERE))
 from _u64_host import (  # noqa: E402
     DeviceLockNotHeldError, LockShellClaimError, lock_shell_holds, require_device_lock)
+from _bench_bindings import BenchBindingError, bench_table  # noqa: E402
 
 
 
@@ -73,16 +75,46 @@ def _env_dir(var: str, what: str) -> Path:
         raise JtagLoadError("setup", f"{var}={value} is not a directory: point it at {what}")
     return path
 
-# One kit, wired to one device. Key: the device's /v1/info unique_id (the DeviceLock key is uid-<lowercase>).
-# The adapter is selected by its USB LOCATION (pyserial list_ports .location), never by the /dev name: CP2102 bridges
-# all report serial "0001", and macOS swaps /dev/cu.usbserial-N names between two CP2102s on replug (2026-11-08: the
-# B&K 880 LCR meter's CP2102 and this adapter swapped names). JTAG_USB_LOCATION overrides the location; JTAG_PORT, if
-# set, must name the same port as the location or the run is refused. The adapter lock is keyed by the location.
+# One kit, wired to one device. The binding is local configuration, never in this public repo (the unique_id is
+# serial-derived): the device's table in bench.toml (scripts/_bench_bindings.py), keyed by the /v1/info unique_id
+# that the alias map (devices.toml) folds the host to (the DeviceLock key is uid-<lowercase>):
+#
+#     [devices.<unique_id>]
+#     jtag_adapter_location = "<USB location>"    # pyserial list_ports .location of the esp-jtag adapter
+#     jtag_adapter_baud = 921600
+#     jtag_scan_only = true                       # only for a device the kit may scan (scan-u64e) but never load
+#
+# A table with both jtag_adapter_* keys and no jtag_scan_only = true binds the device for loads and the power cycle;
+# a table with jtag_scan_only = true and both keys enables only the read-only chain scan. Anything else is refused.
+# The adapter is selected by its USB LOCATION, never by the /dev name: CP2102 bridges all report serial "0001", and
+# macOS swaps /dev/cu.usbserial-N names between two CP2102s on replug (2026-11-08: the B&K 880 LCR meter's CP2102
+# and this adapter swapped names). JTAG_USB_LOCATION overrides the table's location; JTAG_PORT, if set, must name the
+# same port as the location or the run is refused. The adapter lock is keyed by the location.
 # The esp-jtag handshake (_open) and the IDCODE pre-gate (0362c093) stay as the second and third checks.
-JTAG_USB_LOCATION = os.environ.get("JTAG_USB_LOCATION", "0-1.2")
-ADAPTERS = {
-    "5D2518": {"location": JTAG_USB_LOCATION, "lock": "jtag-adapter-usb-" + JTAG_USB_LOCATION, "baud": "921600"},
-}
+
+
+def device_table(uid: str) -> dict:
+    """The device's bindings from bench.toml ({} if it has no table there); a missing or broken file is a
+    JtagLoadError("binding")."""
+    try:
+        return bench_table(uid)
+    except BenchBindingError as e:
+        raise JtagLoadError("binding", str(e)) from None
+
+
+def adapter_binding(uid: str, *, scan: bool = False) -> dict:
+    """{"location", "lock", "baud"} of the adapter bound to *uid* in bench.toml, for a load (default) or for the
+    chain scan (scan=True); refuse (JtagLoadError "binding") when the table does not bind it for that use."""
+    t = device_table(uid)
+    use = "chain scan" if scan else "JTAG load"
+    if (t.get("jtag_scan_only") is True) != scan:
+        raise JtagLoadError("binding", f"device {uid} is not enabled for the {use} (bench.toml: jtag_scan_only = "
+                            f"{'true is required' if scan else 'true forbids a load'})")
+    if "jtag_adapter_location" not in t or "jtag_adapter_baud" not in t:
+        raise JtagLoadError("binding", f"no JTAG adapter is bound to device {uid} for the {use} (bench.toml needs "
+                            "jtag_adapter_location and jtag_adapter_baud in its table)")
+    location = os.environ.get("JTAG_USB_LOCATION") or t["jtag_adapter_location"]
+    return {"location": location, "lock": "jtag-adapter-usb-" + location, "baud": str(t["jtag_adapter_baud"])}
 
 
 DUP_SERIAL_WARNED = False   # set when resolve_port raised the duplicate-CP210x warning (recorded per load)
@@ -124,10 +156,9 @@ def resolve_port(location: str, comports=None) -> str:
 
 
 def adapter_for(uid: str, comports=None) -> dict:
-    """ADAPTERS[uid] with "port" resolved from its USB location (an entry that already names a port is kept)."""
-    a = dict(ADAPTERS[uid])
-    if "port" not in a:
-        a["port"] = resolve_port(a["location"], comports)
+    """adapter_binding(uid) with "port" resolved from its USB location."""
+    a = adapter_binding(uid)
+    a["port"] = resolve_port(a["location"], comports)
     return a
 PRODUCTS = ("C64 Ultimate", "Ultimate 64-II")   # U64 == 2 builds; the dev app reports "Ultimate 64-II"
 XC7A50T = 0x0362C093
@@ -158,8 +189,7 @@ def bound_uid(host: str) -> str:
     if not key.startswith("uid-"):
         raise JtagLoadError("binding", f"{host} is not in devices.toml, so it has no unique_id to bind an adapter to")
     uid = key[4:].upper()
-    if uid not in ADAPTERS:
-        raise JtagLoadError("binding", f"no JTAG adapter is bound to device {uid} ({host})")
+    adapter_binding(uid)                    # refuses a device whose bench.toml table binds no adapter for loads
     return uid
 
 
@@ -358,7 +388,7 @@ def read_ids(host: str, *, user_block: bool = False, lock_timeout: float = 600, 
 
 
 # ---- U64E (Altera Cyclone V) chain scan: read-only, no load, no SVF ----------------------------------------------
-SCAN_ONLY = {"601A96"}                      # devices the scan is enabled for (never loaded with this kit)
+# The scan is enabled for a device whose bench.toml table sets jtag_scan_only = true (never loaded with this kit).
 ALTERA_USER1, ALTERA_USER0, ALTERA_IR_LEN = 0x00E, 0x00C, 10
 
 
@@ -430,10 +460,11 @@ def scan_u64e(host: str, *, lock_timeout: float = 600, esp=None, lock_factory=De
     """Read-only chain scan of the U64E FPGA over the ESP32 adapter: IDCODEs, IR length, SLD hub and nodes."""
     esp = esp or esp_module()
     key = normalize_device_host(host)
-    uid = key[4:].upper() if key.startswith("uid-") else None
-    if uid not in SCAN_ONLY:
-        raise JtagLoadError("binding", f"{host}: the chain scan is enabled only for {sorted(SCAN_ONLY)}")
-    adapter = {"port": resolve_port(JTAG_USB_LOCATION), "lock": "jtag-adapter-usb-" + JTAG_USB_LOCATION, "baud": "921600"}
+    if not key.startswith("uid-"):
+        raise JtagLoadError("binding", f"{host} is not in devices.toml, so the chain scan is not enabled for it")
+    uid = key[4:].upper()
+    adapter = adapter_binding(uid, scan=True)
+    adapter["port"] = resolve_port(adapter["location"])
     with _Locked(host, adapter, lock_timeout, lock_factory):
         info = try_info(host, client_factory)      # never drive pins into an unpowered FPGA (back-feed)
         if not info or str(info.get("unique_id", "")).upper() != uid:

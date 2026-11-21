@@ -273,12 +273,41 @@ def test_dry_run_reads_the_plug_only(env):
     assert rec["graceful"] is None and rec["c64u_poweroff"] is None
 
 
-def test_binding_from_devices_toml(tmp_path):
-    p = tmp_path / "devices.toml"
-    p.write_text('[devices.abc123]\nhosts = ["192.0.2.26"]\noutlet = "http://192.0.2.200"\noutlet_kind = "tasmota"\n')
+BENCH_TOML = ('[devices.abc123]\noutlet = "http://192.0.2.200"\noutlet_kind = "tasmota"\n'
+              '[devices.def456]\nram_run = true\n')
+
+
+def test_binding_from_bench_toml(tmp_path):
+    p = tmp_path / "bench.toml"
+    p.write_text(BENCH_TOML)
     assert po.outlet_binding("ABC123", p) == {"outlet": "http://192.0.2.200", "outlet_kind": "tasmota"}
-    with pytest.raises(po.OutletError):
-        po.outlet_binding("DEF456", p)
+    for uid in ("DEF456", "FED789"):            # a table without the outlet keys; no table at all
+        with pytest.raises(po.OutletError, match="no outlet bound"):
+            po.outlet_binding(uid, p)
+
+
+def test_the_cycle_reads_its_binding_from_the_bench_file(env, tmp_path, monkeypatch):
+    p = tmp_path / "bench.toml"
+    p.write_text(BENCH_TOML)
+    monkeypatch.setenv("C64_BENCH_BINDINGS_FILE", str(p))
+    seen = []
+    rec, _ = cycle(env, Plug(env), None, binding=None, dry_run=True, outlet_factory=lambda b: seen.append(b) or Plug(env))
+    assert rec["outlet"] == "http://192.0.2.200" and seen == [{"outlet": "http://192.0.2.200", "outlet_kind": "tasmota"}]
+    with pytest.raises(po.OutletError, match="no outlet bound"):
+        cycle(env, Plug(env), None, host="u64e", binding=None, dry_run=True)
+
+
+@pytest.mark.parametrize("text", [None, '[devices.abc123]\noutlet = 5\noutlet_kind = "tasmota"\n',
+                                  '[devices.abc123]\nhosts = ["192.0.2.26"]\noutlet = "http://p"\noutlet_kind = "tasmota"\n'],
+                         ids=["missing", "wrong-type", "unknown-key"])
+def test_a_missing_or_broken_bench_file_refuses_the_cycle(env, tmp_path, monkeypatch, text):
+    p = tmp_path / "bench.toml"
+    if text is not None:
+        p.write_text(text)
+    monkeypatch.setenv("C64_BENCH_BINDINGS_FILE", str(p))
+    with pytest.raises(po.OutletError, match="bench.toml"):
+        cycle(env, Plug(env), None, binding=None, dry_run=True)
+    assert env == []
 
 
 def test_drivers_build_the_documented_urls():

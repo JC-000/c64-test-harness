@@ -391,7 +391,7 @@ ethernet, a SILENT bench image, unattended with the owner's authorisation.
 | | before | after |
 |---|---|---|
 | `git_commit_hash` | 7b15448a7 | 584250385 |
-| `unique_id` | 5D2518 | 5D2518 |
+| `unique_id` | the bench C64U's | unchanged |
 | `firmware_version` / `product` | 3.15a / Ultimate 64-II | 3.15a / Ultimate 64-II |
 
 - Steps `validate` → `preflight` → `upload` → `run_update` → `wait` →
