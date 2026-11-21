@@ -12,7 +12,9 @@ the ``--dest`` path (a writable volume, e.g. ``/USB1/espflash/x.esp``; never
 ping and ident afterwards), delete the upload (and its directory if empty), print one result line.
 Exit 0 only when the whole verdict is OK and proven (the ident changed); 3 when the
 flash verified but is unproven (no ident change, e.g. a same-image flash); 1 on a failed or unverified flash
-(the menu's ENTER was sent); 2 on a refusal before it was.
+(the menu's ENTER was sent); 2 on a refusal before it was; 3 also when the DeviceLock
+budget runs out (as the scripts do). After a flash whose result popup never came the
+upload and its directory are KEPT (the firmware may still be reading the file).
 
 ``--host`` must be the Ethernet address: the flash stops Wi-Fi.
 """
@@ -26,17 +28,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-
-def system_ping(ip: str, timeout: float = 2.0) -> bool:
-    """One ICMP echo through the system ``ping``."""
-    # macOS -W is milliseconds, Linux seconds.
-    wait = str(int(timeout * 1000)) if sys.platform == "darwin" else str(max(1, int(timeout)))
-    try:
-        r = subprocess.run(["ping", "-c", "1", "-W", wait, ip], capture_output=True,
-                           timeout=timeout + 3)
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return r.returncode == 0
+from ..backends.ultimate64_remote_menu import system_ping  # noqa: F401  (re-exported)
 
 
 def check_image(tool: Path, platform_name: str, image: Path) -> tuple[bool, str]:
@@ -61,22 +53,26 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
     ap.add_argument("--dest", required=True,
                     help="device path of the upload, on a writable volume, e.g. "
                          "/USB1/espflash/raw_u64.esp (never /Temp or /Flash)")
-    ap.add_argument("--lock-timeout", type=float, default=600.0)
+    ap.add_argument("--lock-timeout", type=float, default=None,
+                    help="DeviceLock wait in seconds (default: U64_DEVICE_LOCK_TIMEOUT, else the library default)")
     ap.add_argument("--timeout", type=float, default=300.0, help="wait for the result popup")
     ap.add_argument("--verify-timeout", type=float, default=90.0)
     ap.add_argument("--no-ident-probe", action="store_true",
                     help="do not toggle Wi-Fi to read the ident before/after (result is then unproven)")
     ap.add_argument("--allow-same-ident", action="store_true",
                     help="a flash that leaves the ident unchanged exits 0 instead of 3 (unproven)")
+    ap.add_argument("--no-ping", action="store_true",
+                    help="skip the ping of the Wi-Fi address; the run is then UNPROVEN (exit 3)")
     ap.add_argument("--confirm-module-flash", action="store_true")
     a = ap.parse_args(argv)
 
-    from ..backends.device_lock import DeviceLock
+    from ..backends.device_lock import DeviceLock, DeviceLockTimeout, DeviceLockTimeoutConfigError
     from ..backends.ultimate64_client import Ultimate64UnsafeOperationError
     from ..backends.ultimate64_remote_menu import (
-        EspFlashError, Ultimate64RemoteMenu, Ultimate64RemoteMenuError)
+        ESP_IDENT_MAX, EspFlashError, EspFlashNoPopupError, Ultimate64RemoteMenu,
+        Ultimate64RemoteMenuError)
     from ..backends.ultimate64_storage import (
-        storage_delete_file, storage_get_file, storage_put_file, storage_rmdir)
+        Ultimate64StorageError, storage_delete_file, storage_get_file, storage_put_file, storage_rmdir)
 
     if not a.confirm_module_flash:
         print("REFUSED: pass --confirm-module-flash", file=sys.stderr)
@@ -114,12 +110,12 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
     rmdir = rmdir or storage_rmdir
     parent = dest.rsplit("/", 1)[0]   # e.g. /USB1/espflash; never a volume root here
     get = get or storage_get_file
+    if a.expect_ident is not None and len(a.expect_ident) > ESP_IDENT_MAX:
+        print(f"REFUSED: --expect-ident is longer than the {ESP_IDENT_MAX} characters the "
+              "module reports", file=sys.stderr)
+        return 2
     probe = ident_probe
     if probe is None and not a.no_ident_probe:
-        if a.expect_ident is not None and len(a.expect_ident) > 31:
-            print("REFUSED: --expect-ident is longer than the 31 characters the module reports",
-                  file=sys.stderr)
-            return 2
         from ..backends.ultimate64_firmware_flash import read_wifi_ident
 
         def probe():  # the menu is bound below; never called inside the flash window
@@ -127,15 +123,30 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
                                    menu_factory=lambda host: menu).ident
     local = a.esp.read_bytes()
     lock = (lock_factory or DeviceLock)(a.host)
-    lock.acquire_or_raise(timeout=a.lock_timeout)
+    try:
+        lock.acquire_or_raise(timeout=a.lock_timeout)
+    except DeviceLockTimeout as exc:
+        print(f"refusing to run: {exc}", file=sys.stderr)
+        return 3
+    except DeviceLockTimeoutConfigError as exc:
+        print(f"REFUSED: {exc}", file=sys.stderr)
+        return 2
+    uploaded = False
+    keep = False
     try:
         menu = (menu_factory or Ultimate64RemoteMenu)(a.host)
         try:
             print("WARNING: do not touch the U64E's keyboard or menu during the flash window "
                   "(the action has no mutex); Wi-Fi is off for its duration.")
-            put(a.host, dest, a.esp, overwrite=True)
-            # The firmware reports "Success!" for a truncated file: read it back.
-            back = get(a.host, dest)
+            try:
+                put(a.host, dest, a.esp, overwrite=False)   # never replace what we did not create
+                uploaded = True
+                # The firmware reports "Success!" for a truncated file: read it back.
+                back = get(a.host, dest)
+            except (Ultimate64StorageError, OSError) as exc:   # FileExistsError is an OSError
+                print(f"REFUSED before the ENTER, nothing was flashed: {type(exc).__name__}: "
+                      f"{exc}", file=sys.stderr)
+                return 2
             if back != local:
                 print(f"REFUSED: the file on the device ({len(back)} B) is not the local "
                       f"image ({len(local)} B, sha256 {hashlib.sha256(local).hexdigest()}); "
@@ -143,8 +154,12 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
                 return 2
             res = menu.flash_esp(dest, ident_probe=probe, allow_same_ident=a.allow_same_ident, expect_ident=a.expect_ident,
                                  confirm_module_flash=True, timeout=a.timeout,
-                                 verify_timeout=a.verify_timeout, wifi_ip=a.wifi_ip, ping=ping)
+                                 verify_timeout=a.verify_timeout, wifi_ip=a.wifi_ip, ping=False if a.no_ping else ping)
         except EspFlashError as exc:
+            if isinstance(exc, EspFlashNoPopupError):
+                keep = True
+                print(f"the upload is KEPT at {dest} (and its directory): the firmware may still "
+                      "be reading the open file. Delete it by hand once the module is back.")
             print(f"FAILED {type(exc).__name__}: {exc}")
             if exc.result is not None:
                 print(exc.result.summary())
@@ -168,17 +183,18 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
                 print(f"  screen| {row}", file=sys.stderr)
             return 2
         finally:
-            try:
-                delete(a.host, dest, missing_ok=True)
-            except Exception as exc:  # the flash verdict matters more
-                print(f"note: could not delete {dest}: {exc}", file=sys.stderr)
-            if parent.count("/") >= 2:
+            if uploaded and not keep:
+                try:
+                    delete(a.host, dest, missing_ok=True)
+                except Exception as exc:  # the flash verdict matters more
+                    print(f"note: could not delete {dest}: {exc}", file=sys.stderr)
+            if uploaded and not keep and parent.count("/") >= 2:
                 try:
                     rmdir(a.host, parent)   # only succeeds when empty; other files stay
                 except Exception as exc:
                     print(f"note: left {parent} in place ({type(exc).__name__})", file=sys.stderr)
         print(res.summary())
-        return 1 if not res.ok else (0 if res.proven or a.allow_same_ident else 3)
+        return 1 if not res.ok else (0 if res.proven or (a.allow_same_ident and res.ping_ok is True) else 3)
     finally:
         lock.release()
 

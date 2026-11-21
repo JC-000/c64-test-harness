@@ -122,6 +122,8 @@ import logging
 import re
 import select
 import socket
+import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Callable
@@ -200,10 +202,21 @@ _TASK_EFFECTS = {
     ("Printer", "Turn On"): "Turn Off",
 }
 
-#: Popup texts with which ``FileTypeUpdate::load_format_1`` refuses a ``.cfw``
-#: (from 3a1ff9ff on). A ``.u64``/``.ue2`` is never checked; its one refusal
-#: is a file-open error string.
-#: The module's ident is cut at 31 characters (wifi.cc:302, wifi_cmd.cc:155-156):
+def system_ping(ip: str, timeout: float = 2.0) -> bool:
+    """One ICMP echo through the system ``ping``."""
+    # macOS -W is milliseconds, Linux seconds.
+    wait = str(int(timeout * 1000)) if sys.platform == "darwin" else str(max(1, int(timeout)))
+    try:
+        r = subprocess.run(["ping", "-c", "1", "-W", wait, ip], capture_output=True,
+                           timeout=timeout + 3)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
+#: The module's ident is cut at 31 characters: ``wifi_detect()`` passes maxlen 32
+#: from wifi.cc and the copy in wifi_cmd.cc ends ``str[maxlen-1] = 0`` (same at
+#: origin/master ea7de80c5; line numbers differ per build, so none is cited).
 #: "ESP32 WiFi Bridge V1.507" leaves 7, so a tag goes at the front.
 ESP_IDENT_MAX = 31
 _ESP_ACTION = "Flash into ESP32"
@@ -214,11 +227,15 @@ _ESP_NO_DOWNLOAD = "Could not switch to download mode."
 _ESP_FAILURES = ("Could not read header.", "Incorrect signature in file.",
                  "Couldn't alloc mem to load segment.")
 #: Every popup text this driver will answer: exact strings only (owner rule,
-#: #543), never a prefix. ``"Flashing Error %d"`` is listed for the plausible
-#: range of the flasher's status codes.
+#: #543), never a prefix. ``Esp32::Flash`` returns 0, -4 or -5 (its -6 is
+#: commented out; Download's codes surface as "Could not switch to download
+#: mode."), so "Flashing Error -4" and "-5" are the only two it can emit.
 _ESP_POPUPS = frozenset(
     (_ESP_SUCCESS, _ESP_NO_DOWNLOAD, *_ESP_FAILURES,
-     *(f"Flashing Error {n}" for n in range(-64, 65))))
+     "Flashing Error -4", "Flashing Error -5"))
+#: Popup texts with which ``FileTypeUpdate::load_format_1`` refuses a ``.cfw``
+#: (from 3a1ff9ff on). A ``.u64``/``.ue2`` is never checked; its one refusal
+#: is a file-open error string.
 _CFW_REFUSALS = ("Invalid Update Image", "Wrong Product Family", "Update for Wrong Product")
 
 #: The only bytes this driver ever writes.
@@ -337,7 +354,9 @@ class EspFlashNoPopupError(EspFlashError):
     still be running (the timeout was too short), or it may have finished.
     Nothing was pressed and nothing is retried. Closing a session does not
     leave the module in download mode: the firmware's popup loop ends when
-    the socket closes and ``StartApp`` then runs (``userinterface.cc:680``).
+    the socket closes and ``StartApp`` then runs (``UserInterface::popup`` loops
+    while ``host->exists()``, i.e. while the stream is alive; userinterface.cc at
+    origin/master ea7de80c5).
     Check the module (Wi-Fi row, ident) before doing anything else."""
 
 
@@ -848,7 +867,8 @@ class EspFlashResult:
 
     ``flash_ok`` is the firmware's own word (its success popup); it checks
     nothing else. ``wifi_back`` is the WiFi row reaching ``link-up`` on a
-    fresh session, ``ping_ok`` the ping of the Wi-Fi IP. ``ident_ok`` is
+    fresh session, ``ping_ok`` the ping of the Wi-Fi IP (``None`` when the
+    caller passed ``ping=False``: not checked, so never *proven*). ``ident_ok`` is
     ``True``/``False`` against ``expect_ident`` and ``None`` when none was
     given. ``ident_after`` is ``None`` when the module's ident could not be
     read (the row names it only while Disabled, unless an ``ident_probe``
@@ -863,7 +883,7 @@ class EspFlashResult:
     wifi_after: WifiStatus | None
     wifi_ip: str | None
     wifi_back: bool
-    ping_ok: bool
+    ping_ok: bool | None
     ident_before: str | None
     ident_after: str | None
     expect_ident: str | None
@@ -873,7 +893,7 @@ class EspFlashResult:
 
     @property
     def ok(self) -> bool:
-        return (self.flash_ok and self.wifi_back and self.ping_ok
+        return (self.flash_ok and self.wifi_back and self.ping_ok is not False
                 and (self.expect_ident is None or self.ident_ok is True))
 
     @property
@@ -882,14 +902,15 @@ class EspFlashResult:
         image already running looks exactly like nothing written (the firmware
         shows "Success!" for ``remain == 0``), so without a change the result is
         unproven even when ``ok``."""
-        return (self.ident_before is not None and self.ident_after is not None
-                and self.ident_before != self.ident_after)
+        return (self.ping_ok is True and self.ident_before is not None
+                and self.ident_after is not None and self.ident_before != self.ident_after)
 
     def summary(self) -> str:
         verdict = "FAILED" if not self.ok else ("OK" if self.proven else "UNPROVEN")
         return (f"{verdict} flash_esp {self.path} "
                 f"duration={self.duration_s:.1f}s popup={self.popup!r} "
-                f"wifi_back={self.wifi_back} ping={self.ping_ok} wifi_ip={self.wifi_ip} "
+                f"wifi_back={self.wifi_back} "
+                f"ping={'not checked' if self.ping_ok is None else self.ping_ok} wifi_ip={self.wifi_ip} "
                 f"ident_before={self.ident_before!r} ident_after={self.ident_after!r} "
                 f"expect={self.expect_ident!r} ident_ok={self.ident_ok}")
 
@@ -1718,7 +1739,7 @@ class Ultimate64RemoteMenu:
     def flash_esp(self, path: str, *, expect_ident: str | None = None,
                   confirm_module_flash: bool = False, timeout: float = 300.0,
                   verify_timeout: float = 90.0, wifi_ip: str | None = None,
-                  ping: Callable[[str], bool] | None = None,
+                  ping: Callable[[str], bool] | bool | None = None,
                   allow_same_ident: bool = False,
                   ident_probe: Callable[[], str | None] | None = None) -> EspFlashResult:
         """Choose "Flash into ESP32" on the ``.esp`` file at *path*.
@@ -1750,7 +1771,8 @@ class Ultimate64RemoteMenu:
         :param verify_timeout: how long Wi-Fi gets to come back afterwards.
         :param wifi_ip: the module's Wi-Fi address, when it is not shown on
             the row (the row shows it only while the link is up).
-        :param ping: ``ping(ip) -> bool``; default is the system ``ping``.
+        :param ping: ``ping(ip) -> bool``; default is the system ``ping``;
+            ``False`` skips it (``ping_ok`` is ``None``, the result unproven).
         :param allow_same_ident: allow *expect_ident* to equal the ident before.
         :param ident_probe: returns the module ident. Default: the WiFi row's
             ident, which the firmware shows only while Wi-Fi is Disabled, so
@@ -1769,32 +1791,52 @@ class Ultimate64RemoteMenu:
         if expect_ident is not None and len(expect_ident) > ESP_IDENT_MAX:
             raise Ultimate64UnsafeOperationError(
                 f"flash_esp: expect_ident {expect_ident!r} is {len(expect_ident)} characters; "
-                f"the module reports at most {ESP_IDENT_MAX} (wifi.cc:302, wifi_cmd.cc:155), so "
+                f"the module reports at most {ESP_IDENT_MAX} (wifi_detect()'s 32-byte buffer), so "
                 "it can never match. Put a short tag at the front of the ident.")
         if not path.upper().endswith(".ESP"):
             raise RemoteMenuNotFoundError(
                 f"{path!r} is not a .esp file (the action is matched on the extension)")
+        if path.split("/")[1:2] and path.split("/")[1].casefold() in ("temp", "flash"):
+            raise Ultimate64UnsafeOperationError(
+                f"flash_esp: {path!r} is on /Temp (the RAM disk the harness sweeps) or /Flash "
+                "(the firmware's own files); use a writable volume such as /USB1/espflash/.")
         self._require_lock("flash_esp")
         if ping is None:
-            from ..tools.flash_esp import system_ping as ping  # lazy: subprocess
+            ping = system_ping
         t0 = time.monotonic()
         start = len(self._seen_messages)
+        # Addresses, not strings: a hostname that resolves to the Wi-Fi address
+        # must be refused too. The host is resolved once (IPv4 only).
+        try:
+            host_ips = {ai[4][0] for ai in socket.getaddrinfo(self.host, None, socket.AF_INET)}
+        except (socket.gaierror, UnicodeError, OSError) as exc:
+            raise Ultimate64UnsafeOperationError(
+                f"flash_esp: {self.host!r} does not resolve to an IPv4 address ({exc}); the "
+                "Ethernet and Wi-Fi checks need it. Use the Ethernet IPv4 address.") from exc
         before = self.wifi_status()
         known_ip = wifi_ip or before.ip
         # Decide from the device's live interface data, never from notes: the
         # host must not be the Wi-Fi address (the stated one OR the live one),
         # and must be the address the Ethernet row reports.
         for label, ip in (("stated Wi-Fi", wifi_ip), ("live Wi-Fi", before.ip)):
-            if ip is not None and self.host == ip:
+            if ip is not None and ip in host_ips:
                 raise Ultimate64UnsafeOperationError(
                     f"flash_esp: {self.host} is the module's {label} address. The flash stops "
                     "Wi-Fi, so this telnet session would die mid-flash. Use the Ethernet address.")
         eth = self.ethernet_ip()
-        if eth is not None and re.fullmatch(r"\d+\.\d+\.\d+\.\d+", self.host) and self.host != eth:
+        if eth is not None and eth not in host_ips:
             raise Ultimate64UnsafeOperationError(
-                f"flash_esp: {self.host} is not the address the device's Net0 row reports "
-                f"({eth}). Use the Ethernet address.")
-        ident_before = ident_probe() if ident_probe else before.ident
+                f"flash_esp: {self.host} ({sorted(host_ips)}) is not the address the device's "
+                f"Net0 row reports ({eth}). Use the Ethernet address.")
+        try:
+            ident_before = ident_probe() if ident_probe else before.ident
+        except Ultimate64RemoteMenuError as exc:
+            # The probe's own Disable/Enable ENTERs are not the flash's ENTER.
+            note = Ultimate64RemoteMenuError(
+                f"flash_esp: reading the ident before the flash failed ({exc}); nothing was "
+                "flashed. The probe toggles Wi-Fi, so Wi-Fi may be left Disabled: check the "
+                "WiFi row before anything else.", enter_sent=False, screen=exc.screen)
+            raise note from exc
         if (expect_ident is not None and ident_before is not None
                 and ident_before.strip() == expect_ident.strip() and not allow_same_ident):
             raise Ultimate64UnsafeOperationError(
@@ -1843,8 +1885,8 @@ class Ultimate64RemoteMenu:
 
         after, back, ident_seen = self._await_wifi_back(verify_timeout)
         ip = after.ip if (back and after is not None) else known_ip
-        ping_ok = False
-        if back and ip is not None:
+        ping_ok: bool | None = None if ping is False else False
+        if ping is not False and back and ip is not None:
             end = time.monotonic() + verify_timeout
             while True:
                 if ping(ip):
@@ -1869,7 +1911,7 @@ class Ultimate64RemoteMenu:
             problems.append(f"the post-flash ident read failed ({probe_err}); the module WAS flashed")
         if not back:
             problems.append(f"Wi-Fi did not return to link-up within {verify_timeout:.0f} s")
-        elif not ping_ok:
+        elif ping_ok is False:
             problems.append(f"no ping reply from {ip}")
         elif wifi_ip is not None and ip != wifi_ip:
             problems.append(f"Wi-Fi came back as {ip}, expected {wifi_ip}")

@@ -175,9 +175,14 @@ class FakeUltimate:
     :param esp: what "Flash into ESP32" does (``.ESP`` files only, U64E builds):
         ``"success"``, ``"error:<N>"`` ("Flashing Error N"), ``"nodownload"``
         ("Could not switch to download mode.", module never restarted), or
-        ``"none"`` (no popup at all). Like the firmware, the result popup
-        comes BEFORE the module restart: Wi-Fi shows Busy until it is
-        answered with ``o``, then walks through :attr:`wifi_after_esp`.
+        ``"none"`` (no popup at all), or ``"close"`` (the device closes the
+        session right after the ENTER). Like the firmware, the result popup
+        comes BEFORE the module restart: the module restarts only when the
+        popup is answered with ``o``, then the Wi-Fi row walks through
+        :attr:`wifi_after_esp`. What the Wi-Fi row shows while the flash runs
+        is NOT established (no source assigns the "Programming ESP32" state
+        and no live observation exists), so the fake leaves the row as it was
+        and no test may depend on it.
     :param esp_actions: ``False`` models a build without the action (C64U).
     :param wifi_after_esp: the Wi-Fi states after the restart, one per later
         connection.
@@ -715,12 +720,17 @@ class _Session:
             self.redraw()
 
     def esp_flash(self) -> None:
-        """StopApp kills Wi-Fi at once; the result popup precedes the restart."""
+        """StopApp stops the application; the result popup precedes the module restart."""
         dev = self.dev
         with dev._lock:
-            dev.wifi = {"state": "busy"}
             dev._pending_wifi = []
         if dev.esp == "none":
+            return
+        if dev.esp == "close":
+            try:
+                self.conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             return
         if dev.esp == "success":
             text = "Flashing ESP32 Success!"
