@@ -521,6 +521,14 @@ def test_cli_a_malformed_lock_timeout_env_exits_2(tmp_path, make, held, monkeypa
     assert rc == 2 and calls == [] and fake.sessions == []
 
 
+def test_cli_a_nan_lock_timeout_exits_2_before_the_lock(tmp_path, make, held, capsys):
+    """resolve_lock_timeout raises a plain ValueError for an explicit NaN. Kills: that ValueError
+    escaping main() (exit 1 = "failed after the ENTER", although nothing was sent)."""
+    rc, calls, lock, fake = _run_cli(tmp_path, make, extra=["--lock-timeout", "nan"])
+    assert rc == 2 and calls == [] and fake.sessions == []
+    assert lock.timeouts == [] and lock.events == []   # never asked to acquire, so nothing to release
+
+
 def test_cli_a_method_refusal_exits_2(tmp_path, make, held, capsys):
     """Kills C11 (Ultimate64UnsafeOperationError mapped to exit 1)."""
     rc, calls, lock, fake = _run_cli(tmp_path, make, extra=["--expect-ident", "X bridge"],
