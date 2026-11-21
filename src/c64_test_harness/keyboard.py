@@ -30,7 +30,8 @@ def send_text(transport: C64Transport, text: str) -> None:
       :func:`~.memory.wait_for_memory`, or ``transport.resume()``); a
       ``time.sleep`` after this call drains nothing (issue #514).
     * On the Ultimate 64 ``inject_keys`` waits for the KERNAL buffer to
-      drain before each batch; the machine runs throughout.
+      drain before each batch; the machine is not left halted (each
+      access stops the 6510 briefly in the firmware, #573).
     """
     codes = [char_to_petscii(ch) for ch in text]
     for i in range(0, len(codes), KEYBUF_MAX):

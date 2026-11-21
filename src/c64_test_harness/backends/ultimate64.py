@@ -64,12 +64,15 @@ class Ultimate64Transport(HardwareTransportBase):
     """C64Transport implementation backed by Ultimate 64 REST API.
 
     All memory I/O goes through the device's DMA-backed ``readmem``/
-    ``writemem`` endpoints, so no CPU pause is required — reads and
-    writes happen concurrently with normal execution.
+    ``writemem`` endpoints. The harness needs no CPU pause of its own, but
+    the firmware stops the 6510 for each access and resumes it, so an
+    access is not invisible to a running program (#573,
+    GideonZ/1541ultimate#1120).
     """
 
     #: Capability read by :func:`~c64_test_harness.memory.wait_for_memory`:
-    #: DMA access does not halt the CPU, so the helper never sends a
+    #: DMA access does not leave the CPU halted (the firmware resumes it
+    #: after each access, #573), so the helper never sends a
     #: ``resume()`` here -- which would be a real ``machine:resume`` that
     #: clears a deliberate pause (issue #189).
     halts_cpu_on_access: bool = False
@@ -553,7 +556,10 @@ class Ultimate64Transport(HardwareTransportBase):
         writing at offset 0 makes the write placement race-free (the same
         convention :meth:`Ultimate64Client.send_text` uses).
 
-        Because U64 memory I/O is DMA-backed, no CPU pause is needed.
+        The harness adds no pause of its own, but the firmware stops the
+        6510 for each REST read and write (#573, GideonZ/1541ultimate#1120;
+        only 1000-byte reads have been timed). The poll runs only before a chunk
+        is written, so a command's final RETURN is sent with no read after it.
         """
         if not petscii_codes:
             return

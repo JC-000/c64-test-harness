@@ -1586,7 +1586,8 @@ class _ClientReadMemoryAdapter:
 
     __slots__ = ("_client",)
 
-    #: DMA reads do not halt the CPU, so the watcher must not send
+    #: DMA reads do not leave the CPU halted (each stops it briefly in the
+    #: firmware and resumes it, #573), so the watcher must not send
     #: ``resume()`` -- which this adapter does not even have (#514).
     halts_cpu_on_access = False
 

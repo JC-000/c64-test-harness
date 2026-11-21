@@ -263,7 +263,7 @@ def watch_progress(
                 # program freezes at the first poll and every later poll
                 # reports "Stalled".  Owed only after a read (the Timeout
                 # path above reads nothing), and never on a transport that
-                # declares its reads do not halt (the U64, where resume()
+                # declares its reads do not leave the CPU halted (the U64, where resume()
                 # would clear a deliberate pause; #189/#190).
                 if halts:
                     # Confirmed: the caller is told the program runs while

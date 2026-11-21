@@ -14,11 +14,54 @@ Usage::
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ._address import refuse_bool_address
+
 if TYPE_CHECKING:
     from .transport import C64Transport
+
+# KERNAL zero page after a LOAD: EAL, the end pointer (one past the last byte
+# stored), and ST, the I/O status.
+_KERNAL_EAL = 0x00AE
+_KERNAL_ST = 0x0090
+
+
+@dataclass(frozen=True)
+class LoadCheck:
+    """What :meth:`PrgFile.verify_load` read after a KERNAL LOAD.
+
+    ``start`` is where the payload was expected, ``expected_end`` is
+    ``start + len(payload)`` (``0x10000`` for a file that ends at ``$FFFF``:
+    the KERNAL's 16-bit pointer then wraps to ``$0000``, which counts as
+    complete), ``end_pointer`` is the KERNAL's EAL (``$AE/$AF``),
+    ``status`` is ST (``$90``) as read, and ``content_diffs`` counts payload
+    bytes that differ from RAM at ``start`` (a short read counts every
+    missing byte).
+    """
+
+    start: int
+    expected_end: int
+    end_pointer: int
+    status: int
+    content_diffs: int
+
+    @property
+    def _pointer_at_end(self) -> bool:
+        # EAL is 16 bits: a LOAD whose last byte lands at $FFFF wraps it to $0000.
+        return self.end_pointer == self.expected_end & 0xFFFF
+
+    @property
+    def complete(self) -> bool:
+        """The LOAD stored the whole payload: end pointer and bytes both match."""
+        return self._pointer_at_end and self.content_diffs == 0
+
+    @property
+    def short(self) -> bool:
+        """The LOAD stopped before the end of the payload."""
+        return self.end_pointer < self.expected_end and not self._pointer_at_end
 
 
 class PrgFile:
@@ -97,6 +140,75 @@ class PrgFile:
             return (False, diffs)
         diffs = sum(1 for a, b in zip(actual, expected) if a != b)
         return (diffs == 0, diffs)
+
+    def verify_load(
+        self,
+        transport: C64Transport,
+        *,
+        start: int | None = None,
+    ) -> LoadCheck:
+        """Check that a KERNAL LOAD of this file stored all of it.
+
+        Call it after the LOAD has finished. It reads the KERNAL's end
+        pointer EAL (``$AE/$AF``), ST (``$90``) and the payload at *start*
+        (default: the file's own load address; pass ``start=0x0801``, or
+        whatever ``$2B/$2C`` holds, for ``LOAD"NAME",8``, which loads at the
+        BASIC start).
+
+        **Use the result's** ``complete`` **, not ST or the bytes alone.** On
+        an Ultimate a REST memory read during the LOAD halts the 6510 while
+        the CIA timers run on, and the KERNAL can take a false EOI: the LOAD
+        ends early with ST=$40 and no error (#573, upstream
+        GideonZ/1541ultimate#1120). ST=$40 is also what a complete LOAD
+        leaves, and a repeated LOAD of the same file leaves the earlier
+        copy's tail in RAM, so neither ST nor a content compare can tell a
+        short LOAD from a complete one. The end pointer can. ``short`` says
+        the pointer stopped before the end.
+
+        The pointer is written only when a LOAD runs. If the typed LOAD never
+        ran (a dropped key, ``?SYNTAX ERROR``) after an earlier complete LOAD
+        of the same file, everything still matches that earlier copy and this
+        reads complete. Clear it first (``transport.write_memory(0xAE,
+        b"\\x00\\x00")``, a two-byte write) and a LOAD that never ran reads
+        short, except for a file that ends at ``$FFFF``, whose complete
+        pointer is ``$0000``.
+
+        This makes one read for EAL, one for ST and one per 128 bytes of
+        payload (chunked above 256 bytes, :func:`~.memory.read_bytes`). Do not
+        call it while the C64 is still doing IEC I/O on an Ultimate, for the
+        same reason. On VICE it leaves the CPU halted, like
+        :meth:`verify_region`, and it reads through the current memory map,
+        so on VICE a file loaded under ROM or I/O (``$A000-$BFFF``,
+        ``$D000-$FFFF`` with the default banking) is compared with the ROM or
+        I/O view and does not read complete.
+
+        :raises ValueError: *start* is a bool, outside ``0..0xFFFF``, or the
+            payload would run past ``$FFFF``; raised before any read.
+        :raises ~.memory.ShortReadError: the EAL or ST read, or a chunk of a
+            payload over 256 bytes, came back short twice.
+        """
+        from .memory import read_bytes, read_bytes_chunked  # avoid circular import
+
+        if start is None:
+            start = self._load_address
+        refuse_bool_address(start, "verify_load start")
+        if not 0 <= start <= 0xFFFF:
+            raise ValueError(f"verify_load start {start!r} is outside $0000-$FFFF")
+        expected_end = start + len(self._data)
+        if expected_end > 0x10000:
+            raise ValueError(
+                f"a {len(self._data)}-byte payload at ${start:04X} runs past $FFFF"
+            )
+
+        # Chunked reads: a short reply is retried once, then ShortReadError,
+        # so a failed pointer read is never mistaken for a short LOAD.
+        eal = read_bytes_chunked(transport, _KERNAL_EAL, 2)
+        end_pointer = eal[0] | (eal[1] << 8)
+        status = read_bytes_chunked(transport, _KERNAL_ST, 1)[0]
+        actual = read_bytes(transport, start, len(self._data))
+        diffs = sum(1 for a, b in zip(actual, self._data) if a != b)
+        diffs += abs(len(self._data) - len(actual))
+        return LoadCheck(start, expected_end, end_pointer, status, diffs)
 
     def first_diff(
         self,

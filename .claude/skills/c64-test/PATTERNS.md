@@ -1237,6 +1237,61 @@ if wait_for_memory(transport, MAIN_LOOP, parked, timeout=60.0, poll_interval=0.5
     raise TimeoutError("program never parked at MAIN_LOOP")
 ```
 
+### Don't read C64 memory during IEC I/O on an Ultimate (#573)
+
+**In force until a released core carries the fix for
+GideonZ/1541ultimate#1120** (none as of 2026-11-21; no core or FPGA version to
+key on yet). Tracked by **#573**: every place this rule lives carries the tag
+`#573`, so `grep -rn '#573' src .claude docs` lists them for retirement. Keep
+`PrgFile.verify_load` (its docstring hits the grep too): a complete-LOAD check
+stays correct on any core. The other `#573` tags on the Ultimate transport's
+"each access stops the 6510 briefly" sentences stay true until the fix ships
+and get reworded, not deleted, then.
+
+A REST memory read stops the 6510 inside the firmware while the CIA timers and
+the IEC processor keep running. A 1000-byte read halted it for 1.0-1.5 ms (U64E,
+n=20, the development builds named in #1120); smaller reads, writes and the C64U
+have not been timed. Treat every read as unsafe on every current core: that is
+policy until a fix ships, not a measurement of each core. It covers `read_memory`/`read_bytes`, every screen and memory waiter
+(`wait_for_text`, `wait_for_stable`, `wait_for_memory`, `ScreenGrid.from_transport`),
+`watch_progress` and `verify_region`. If the halt lands in an IEC transfer, the
+transfer can break. Measured on the U64E (builds in #1120):
+
+- **LOAD from the emulated 1541 ends early with ST=$40 and no error.** 20/20
+  exact with no reads, 16/20 with a 1000-byte read every 0.5 s, 1/13 back to back.
+- **Printing to the virtual printer hangs the C64 at `$ED55`** (interrupts off, no
+  timeout) or drops the end of the job. 6-8 of 10 runs froze with a read every 0.5 s;
+  1 of 4 at 5 s; 0 of 4 at 30 s.
+- `get_info()` does not halt (0 halts in 20 calls; 0 of 10 print freezes).
+
+A longer poll interval lowers the rate; it does not remove it. VICE is not
+affected (its monitor freezes the whole machine, drive included; reasoned, not
+measured), so a test that polls during a LOAD can pass in the emulator and fail
+on hardware. The one firmware-only change tried did not help (#1120: skipping
+the stop left the halt in place, and no LOAD completed in 3 runs).
+
+**Rule, on an Ultimate:** while the C64 is doing IEC I/O (LOAD, SAVE, printing,
+SoftIEC) do not read its memory and do not type. Wait out a bound you know (poll
+`client.get_info()` if you need a liveness signal), then read, and check every
+LOAD with `PrgFile.verify_load`:
+
+```python
+prg = PrgFile.from_file("build/data.prg")
+transport.write_memory(0xAE, b"\x00\x00")   # clear EAL: a LOAD that never runs then reads short
+send_text(transport, 'LOAD"DATA",8,1')
+send_key(transport, "\r")        # the last key: inject_keys polls $C6 only before a chunk
+time.sleep(LOAD_BOUND_S)          # no screen or memory reads while the LOAD runs
+check = prg.verify_load(transport)   # LOAD"DATA",8 (no ,1): start=0x0801
+assert check.complete, check
+```
+
+Do not accept ST=$40 or matching bytes as proof: a complete LOAD also leaves
+ST=$40, and a repeated LOAD of the same file leaves the earlier copy's tail in
+RAM. Only the end pointer `$AE/$AF` (`check.end_pointer`, `check.short`) tells
+them apart, and only for this LOAD if you cleared it first: a LOAD that was
+never run (a dropped key, `?SYNTAX ERROR`) leaves the earlier LOAD's pointer.
+Printing has no such check; compare the printer's output file.
+
 ### Debug stream is rate-capped at 1 MHz-equivalent (turbo gives a 1/N sampled view)
 
 The U64E FPGA emits the UDP debug stream at a fixed rate of **~1.02M bus-cycle entries/sec** (2,842-2,843 packets/sec on the NTSC U64E at 1 MHz, wired host, #432) regardless of the CPU's actual turbo speed. That matches the 6510's native rate at 1 MHz, so `DebugCapture` at 1 MHz is essentially cycle-accurate. At higher turbo speeds you receive a **uniformly sampled 1/N view** of the real bus — at 48 MHz only ~2% of cycles reach the host; turbo speed itself adds no sequence gaps, because the rate limit is at the FPGA source. Measured in `tests/test_u64_debug_stream_speed_live.py`. **`packets_dropped` is not zero in general** (#424): the bench's own loss ran 0.4-45% of packets per 1 s capture, placed at the host's Wi-Fi downlink and load-dependent (#356).

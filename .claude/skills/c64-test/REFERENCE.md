@@ -577,6 +577,22 @@ prg = PrgFile.from_file("build/program.prg")
 # prg.data -> bytes
 ```
 
+- `prg.verify_load(transport, *, start=None) -> LoadCheck` -- after a KERNAL LOAD
+  has finished, reads the end pointer EAL (`$AE/$AF`), ST (`$90`) and the payload at
+  *start* (default: the file's load address; `start=0x0801` for `LOAD"NAME",8`).
+  `LoadCheck` (frozen; exported at the package root) has `start`, `expected_end`,
+  `end_pointer`, `status`, `content_diffs`, and the properties `complete` (end
+  pointer and bytes both match) and `short` (the pointer stopped early). Gate on
+  `complete`: ST=$40 and matching bytes also follow a short LOAD over an earlier
+  copy, and clear `$AE/$AF` before typing the LOAD or a LOAD that never ran reads
+  as the earlier one. A file ending at `$FFFF` completes with the pointer wrapped
+  to `$0000`. Refuses a bool, out-of-range or past-`$FFFF` *start* with
+  `ValueError` before any read. A short EAL or ST read, or a short chunk of a
+  payload over 256 bytes, raises `ShortReadError`; a short read of a payload of
+  256 bytes or less is counted in `content_diffs`.
+  On an Ultimate, call it only once IEC I/O has stopped (#573; see PATTERNS
+  § "Don't read C64 memory during IEC I/O on an Ultimate").
+
 ---
 
 ## Module: debug
@@ -615,14 +631,14 @@ Methods (all raise `NotImplementedError` -- subclasses must override):
 ## Module: backends.ultimate64
 
 ### `Ultimate64Transport`
-Hardware transport for Ultimate 64 via REST API. Implements `C64Transport` protocol. All memory I/O is DMA-backed (no CPU pause needed).
+Hardware transport for Ultimate 64 via REST API. Implements `C64Transport` protocol. All memory I/O is DMA-backed: the harness sends no pause or resume, but the firmware stops the 6510 briefly for each access (#573).
 
 ```python
 from c64_test_harness import Ultimate64Transport
 transport = Ultimate64Transport(host="<device>", password=None, timeout=10.0)
 ```
 
-**C64Transport methods** (memory ops DMA-backed, no CPU pause):
+**C64Transport methods** (memory ops DMA-backed; each stops the 6510 briefly in the firmware, #573):
 - `read_memory(addr, length) -> bytes`
 - `write_memory(addr, data, *, override=None) -> None` -- **Do not enable SocketDMA writes: the write fast path is disabled pending a stability review** (details tracked privately); use `write_bytes` / `run_prg_via_sys` for bulk data, and note there is no fast bulk-write path on a C64U today — the sanctioned replacement is ~128 128-byte PUT round trips for 16 KiB **on a C64U** (`write_bytes` chunks at the client threshold, #252). Measured on the U64E (fw 3.15, bce4535e, 2026-09-15, host on Wi-Fi (en0), link not instrumented, n=2-4 per arm, interleaved, #267), `write_bytes` runs about 1.3 KiB/s at 48-byte chunks and about 3.2 KiB/s at 128-byte chunks (median ~36-52 ms per PUT, observed 34-79 ms, dominated by the host link), and a single 16 KiB POST took ~0.1 s there; on a post-safe U64E `write_memory` itself is a single request. The rate is not measured on the C64U. What the disabled path does, for recognition: set `transport.socket_dma = True` (constructor kwarg or attribute; default False) and payloads >= `socket_dma_min_bytes` (default 8192) route via DMAWRITE on TCP 64 instead of REST (~150 ms vs >6 s for 16 KiB on C64U fw 1.1.0, whose POST writemem degrades at >=16 KiB). Same `MemoryPolicy` checks. DMAWRITE is fire-and-forget, so the write finishes with an in-band IDENTIFY completion barrier (FIFO command servicing means the reply proves every chunk was consumed and applied; recv timeout scales with payload size — same pattern as `reu_write`), then a REST tail read-back as a post-barrier sanity check (up to `socket_dma_verify_timeout`, 2 s). WARNING + REST fallback on connect/send/barrier/verify failure (connect failure latches the fast path off). A send or barrier failure is first retried once on a fresh connection (issue #223: the firmware closes a SocketDMA connection idle for >1 s and never reads what is written into it; the client also reopens a connection idle for `IDLE_RECONNECT_SECONDS` = 0.8 s before the next command, so the retry is the second line). Requires the device's DMA service on TCP 64 (C64U: enable Network Settings → "Ultimate DMA Service", ships disabled; present on the bench U64E — measured in issue #223 on a fork build; availability on 3.14 builds untested — connect failure just falls back to REST). The prohibition above covers this **bulk-write** path only; `socket_dma_reu_write` (REUWRITE) never consults the `socket_dma` switch and is not covered by it.
 - `read_screen_codes() -> list[int]`

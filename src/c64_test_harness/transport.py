@@ -138,9 +138,10 @@ class C64Transport(Protocol):
         VICE **every** binary-monitor command halts the 6510, and it stays
         halted until this is called -- so a caller that reads memory or
         the screen and then expects time to pass must resume, or it is
-        timing a stopped machine.  On the Ultimate 64 memory access is
-        DMA-backed and the machine runs throughout, so a resume is not
-        needed; it is still a real request to the device, which costs a
+        timing a stopped machine.  On the Ultimate 64 a memory access does
+        not leave the CPU halted (the firmware stops the 6510 briefly for
+        each access and resumes it, #573), so a resume is not needed; it is
+        still a real request to the device, which costs a
         round trip and will clear a pause the caller set deliberately.
 
         The cross-backend screen waiters and

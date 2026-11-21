@@ -44,7 +44,7 @@ from .memory_arbiter import MemoryArbiter, MemoryArbiterError
 from .config import HarnessConfig
 from .runner import TestRunner, TestScenario, TestResult, TestStatus
 from .debug import dump_screen
-from .verify import PrgFile
+from .verify import LoadCheck, PrgFile
 from .execute import (
     load_code,
     goto,
@@ -531,6 +531,7 @@ __all__ = [
     # Debug
     "dump_screen",
     # Verify
+    "LoadCheck",
     "PrgFile",
     # Execution control
     "load_code",

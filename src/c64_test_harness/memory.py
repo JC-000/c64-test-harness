@@ -281,6 +281,13 @@ def wait_for_memory(
 ) -> bytes | None:
     """Poll memory at *addr* until it matches, keeping the C64 running.
 
+    **On an Ultimate, do not call this while the C64 is doing IEC I/O**
+    (LOAD, SAVE, printing, SoftIEC): each poll is a REST memory read that
+    stops the 6510 in the firmware (a 1000-byte read: 1.0-1.5 ms on the
+    U64E; smaller reads were not timed, so treat any read as unsafe) and
+    can break the transfer (#573, GideonZ/1541ultimate#1120). See the c64-test skill, PATTERNS
+    § "Don't read C64 memory during IEC I/O on an Ultimate".
+
     The safe way to wait on a flag byte after :func:`~.execute.goto` (or
     after anything else that leaves a program running).  Issue #514: on
     VICE every binary-monitor command -- a plain :func:`read_bytes`
@@ -319,8 +326,9 @@ def wait_for_memory(
     would swallow a plain resume, so the helper resumes again until one
     runs (``BinaryViceTransport._resume_confirmed``; ~5 ms per exit).
 
-    **On the Ultimate 64 it never resumes.**  Memory access there is
-    DMA-backed and does not halt the CPU, while ``resume()`` is a real
+    **On the Ultimate 64 it never resumes.**  A memory access there does
+    not leave the CPU halted (the firmware stops the 6510 briefly for each
+    access and resumes it, #573), while ``resume()`` is a real
     ``PUT /v1/machine:resume`` that would clear a pause the caller set
     deliberately (issue #189).  The helper reads the transport's
     ``halts_cpu_on_access`` attribute: only an explicit ``False`` skips
@@ -390,7 +398,7 @@ def wait_for_memory(
     deadline = time.monotonic() + timeout
     # True once a read has (possibly) halted the machine and no resume
     # has followed it -- the screen waiters' #189 bookkeeping.  Never set
-    # on a transport that does not halt, so nothing resumes there.
+    # on a transport that does not leave the CPU halted, so nothing resumes there.
     pending_resume = False
     try:
         while True:
