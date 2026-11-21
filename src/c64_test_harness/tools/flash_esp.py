@@ -14,8 +14,9 @@ Exit 0 only when the whole verdict is OK and proven (the ident changed); 3 when 
 flash verified but is unproven (no ident change, e.g. a same-image flash); 1 on a failed or unverified flash
 (the menu's ENTER was sent); 2 on a refusal before it was; 2 also when the DeviceLock
 budget runs out or cannot be read (``--lock-timeout nan``, a malformed
-``U64_DEVICE_LOCK_TIMEOUT``): nothing was touched; 3 is reserved for "flashed, verified, unproven". After a flash whose result popup never came the
-upload and its directory are KEPT (the firmware may still be reading the file).
+``U64_DEVICE_LOCK_TIMEOUT``): nothing was touched; 3 is reserved for "flashed, verified, unproven". When the
+ENTER may have been sent without a result popup being answered (no popup, an interrupt) the
+upload and its directory are KEPT and the path printed (the firmware may still be reading the file).
 
 ``--host`` must be the Ethernet address: the flash stops Wi-Fi.
 """

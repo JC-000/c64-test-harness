@@ -91,7 +91,7 @@ Summary: 13 ok, 3 missing, 1 skipped, 4 warn
 Overall: READY (with optional gaps)
 ```
 
-The `x64sc --version printed no version` note is expected: the Homebrew build's `x64sc --version` exits early, so the script falls back to Homebrew's metadata. The harness version is read from the installed package metadata. This sample's `0.11.3` came from a venv installed before the current `0.14.0` in `pyproject.toml`, and it needs `pip install -e .` again to report the right number.
+The `x64sc --version printed no version` note is expected: the Homebrew build's `x64sc --version` exits early, so the script falls back to Homebrew's metadata. The harness version is read from the installed package metadata. This sample's `0.11.3` came from a venv installed before the current `0.15.0` in `pyproject.toml`, and it needs `pip install -e .` again to report the right number.
 
 The VICE checks are **critical**, so a hardware-only machine without VICE reports NOT READY even though the Ultimate backend works. Options: `--quiet`, `--json`, `--no-u64`, `--u64-host HOST`, `--smoke`. Exit codes: `0` READY, `1` NOT READY, `2` script error. Details are in [docs/development.md](docs/development.md#quick-check-scriptsverify-dev-envsh).
 
@@ -179,10 +179,13 @@ Hardware reading, in order:
   - Connection drops map to `Ultimate64TimeoutError`, and short `readmem` payloads raise `Ultimate64ProtocolError`.
   - `write_mem_query_threshold` is auto-detected per device: 128 on firmware without the Temp-folder fix, 48 on Ultimate-line ≥ 3.15.
 - **Device storage, flash and firmware** (each needs the caller to hold the `DeviceLock`, and none costs a `/Temp` attachment):
-  - `storage_*` read and write files on the device's own volumes over FTP. `storage_put_rom` / `storage_delete_rom` are the only writes under `/Flash`, one ROM image in `/Flash/roms`, size- and signature-checked.
+  - `storage_*` read, write and rename files on the device's own volumes over FTP. `storage_put_rom` / `storage_delete_rom` are the only writes under `/Flash`, one ROM image in `/Flash/roms`, size- and signature-checked.
   - `save_config_item_to_flash()` saves one config key, and refuses unless it is the only RAM-vs-flash difference. It is the only sanctioned config save; the public `Ultimate64Client.save_config_to_flash` saves every dirty store, and nothing in the harness calls it except this function.
-  - `Ultimate64RemoteMenu` drives the firmware's telnet Remote Menu: read the screen and the WiFi row, toggle WiFi, start Run Update. On a U64E, WiFi Disable/Enable writes the WiFi config store to flash. It sends one state-changing key per call and never answers telnet negotiation.
-  - `flash_firmware()` flashes an update image: it validates it on the host, uploads it, starts Run Update, tells the person at the device what to answer, and verifies the firmware that comes back. Dry-run it first. See [docs/firmware_flashing.md](docs/firmware_flashing.md).
+  - `Ultimate64RemoteMenu` drives the firmware's telnet Remote Menu: read the screen and the WiFi row, toggle WiFi, run a printer task (`run_task`), start Run Update. On a U64E, WiFi Disable/Enable writes the WiFi config store to flash. It sends one state-changing key per call and never answers telnet negotiation. `read_wifi_ident()` reads the WiFi module's IDENT and leaves WiFi as it found it.
+  - `flash_firmware()` flashes an update image: it validates it on the host, uploads it, starts Run Update, tells the person at the device what to answer, and verifies the firmware that comes back. Dry-run it first. `reformat_flash_disk` is a required answer (since 0.15.0). See [docs/firmware_flashing.md](docs/firmware_flashing.md).
+  - `Ultimate64RemoteMenu.flash_esp()` and the CLI `python -m c64_test_harness.tools.flash_esp` flash a U64E's ESP32 WiFi module from a `.esp` image. The CLI checks the image and the upload's bytes first and proves the flash by the module ident changing.
+  - Bench scripts `scripts/ram_run_u64.py` (run a U64E application from RAM, refusing anything but a RAM-run image), `scripts/jtag_load.py` (C64U over JTAG) and `scripts/power_outlet.py` (a cold cycle through a switched outlet) write no firmware flash. Same doc.
+- **Don't read C64 memory during disk or printer I/O on an Ultimate:** every REST memory read stops the 6510 inside the firmware while the CIA timers and the IEC processor run on, which can cut a LOAD short with no error or hang a print job (#573, GideonZ/1541ultimate#1120). That includes the screen and memory waiters. Wait the I/O out, then check a LOAD with `PrgFile.verify_load` ([below](#prg-binary-verification)). Rule and figures in the c64-test skill's PATTERNS.
 - **Liveness probe:** `probe_u64()` / `is_u64_reachable()` check reachability (ping → TCP → REST). This is not a health check ([below](#liveness-probe)).
 - **Configuration helpers:** turbo speed (cross-generation CPU-speed probing), REU size, SID sockets and addressing, disk mounting, PRG run/load, and snapshot/restore of device state.
 - **Drive & disk fixtures:** `drive_on/off/reset/set_mode/load_rom`, blank-image creation with `create_d64/d71/d81/dnp`, `file_info`, `get_debug_register` / `set_debug_register` (`$D7FF`), `measure_bus_timing` (VCD), and batch `set_config_items_batch`.
@@ -316,6 +319,12 @@ labels = Labels.from_file("build/labels.txt")
 # Verify that SHA-256 constants are intact in memory
 ok, diffs = prg.verify_region(transport, labels["sha256_k"], 256)
 assert ok, f"{diffs} bytes corrupted"
+
+# After a KERNAL LOAD of the file: did all of it arrive? ST=$40 and matching
+# bytes also follow a short LOAD, so this checks the end pointer $AE/$AF too.
+# Clear $AE/$AF before typing the LOAD; pass start=0x0801 for LOAD"NAME",8.
+check = prg.verify_load(transport)
+assert check.complete, check          # check.short: the LOAD stopped early
 
 # Find the first difference
 result = prg.first_diff(transport, labels["process_block"], 1024)

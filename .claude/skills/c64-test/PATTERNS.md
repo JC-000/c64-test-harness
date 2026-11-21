@@ -1133,6 +1133,16 @@ with DeviceLock(host) as lock:          # or acquire_or_raise / release as above
     print(got.ident, got.before.state, got.after.state)
 ```
 
+**Flashing the ESP32 WiFi module** (`Ultimate64RemoteMenu.flash_esp`, U64E only): use the CLI, which checks the image, uploads and reads it back, reads the ident before and after, flashes, and cleans up. Run it against the **ethernet** address, since the flash stops WiFi.
+
+```
+python -m c64_test_harness.tools.flash_esp --host <ethernet address> --esp X.esp --platform u64e \
+    --esp-image-tool /path/to/esp_image.py --dest /USB1/espflash/X.esp \
+    --expect-ident "<tag> WiFi Bridge V1.507" --wifi-ip <module WiFi address> --confirm-module-flash
+```
+
+Exit 0 means verified and proven (the ident changed); 3 means verified but unproven; 1 means failed after the ENTER (do not re-run blind: read the WiFi row and the ident first); 2 means refused before the ENTER. Each ident read writes the WiFi config store to flash on the U64E, four writes per default run. `docs/firmware_flashing.md` also covers the bench scripts `ram_run_u64.py`, `jtag_load.py` and `power_outlet.py`.
+
 ### SocketDMA write fast path (TCP 64)
 
 > **Do not enable SocketDMA writes.** The write fast path is disabled pending a stability review. For bulk data use `write_bytes` / `run_prg_via_sys`, whose threshold-sized chunks stay on the PUT path on every grade (#252). Details are tracked privately.
