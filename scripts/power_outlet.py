@@ -21,18 +21,24 @@ DeviceLock (allow_nested, so a driver that holds it can call this):
 The outlet is never left OFF by this code: any error after step 2 switches it back ON before raising.
 
 The poweroff decision is made from the /v1/info product read in step 1, under the lock, never from a device id:
-  * "Ultimate 64", "Ultimate 64 Elite": known to come back after an outlet cycle, so the poweroff is sent unless
-    --no-graceful is given. --c64u-poweroff is refused.
+  * "Ultimate 64", "Ultimate 64 Elite": the poweroff is sent unless --no-graceful is given, as before this
+    decision moved to the product (the #1042 sequence). Basis, by source only: both are U64 == 1 builds that switch
+    off through the same power register, and the board revision picks which name it reports. That such a board
+    powers up again after a poweroff and an outlet cycle has NOT been measured here. --c64u-poweroff is refused.
   * "C64 Ultimate", "Ultimate 64-II" (the C64U class): poweroff() is unreachable on the C64U (CLAUDE.md,
     hardware-safety rule 7), so the outlet is just cut. After AC returns, its ESP32 module decides whether the
     machine powers up, by its power-on mode (software/u64ctrl/main/power_state.c:130-158: ON, LAST_STATE, else
     OFF). A poweroff stores last-state OFF, so after one the C64U comes back only with power-on mode ON.
     --c64u-poweroff sends it anyway, for a module known to be set to power-on mode ON; graceful=True without it is
     refused. This code never changes that mode.
-  * any other product (e.g. "C64 Ultimate (MK1)"), or none, or REST not answering: the outlet is just cut. An
-    explicit graceful=True or --c64u-poweroff is refused, since the poweroff it asks for cannot be sent safely.
-Every refusal comes before the outlet is switched. A dry run reads the plug only, never the Ultimate, so it cannot
-make this decision: its record has "poweroff": null.
+  * any other product, or none, or REST not answering: the outlet is just cut. An explicit graceful=True or
+    --c64u-poweroff is refused, since the poweroff it asks for cannot be sent safely. "C64 Ultimate (MK1)" is in
+    this group on purpose: it is a COMMODORE build on the same U64 == 1 hardware, but nothing about its power-up
+    after a poweroff is known either way.
+Every refusal comes before the outlet is switched. The record keeps "graceful" (poweroff sent or not) and
+"c64u_poweroff" (sent to a C64U-class product) as the resolved decision, adds "poweroff" (same as "graceful") and
+"product", and puts the arguments under "requested". A dry run reads the plug only, never the Ultimate, so it
+cannot make the decision: its resolved keys are null.
 """
 from __future__ import annotations
 
@@ -51,7 +57,8 @@ import jtag_load as jl  # noqa: E402  (harness src on sys.path, DeviceLock, try_
 from _u64_host import require_device_lock  # noqa: E402
 
 MIN_OFF_S = 10.0
-#: Products known to power up again by themselves after an outlet cycle that followed a poweroff.
+#: Products that get the poweroff by default: U64 == 1 builds sharing one power register, by source. Their power-up
+#: after a poweroff and an outlet cycle is NOT measured. "C64 Ultimate (MK1)" (same hardware) is left out on purpose.
 GRACEFUL_PRODUCTS = frozenset({"Ultimate 64", "Ultimate 64 Elite"})
 #: The C64U class (U64 == 2 builds; ultimate64_firmware_flash._PRODUCT_FAMILY "c64u"): an ESP32 power controller
 #: stores last-state OFF on a poweroff.
@@ -211,10 +218,12 @@ def outlet_cycle(host: str, *, off_s: float = MIN_OFF_S, graceful: bool | None =
         expect_git_hash = jl.check_git_hash(expect_git_hash)
     outlet = (outlet_factory or (lambda bb: KINDS[bb["outlet_kind"]](bb["outlet"], host=host)))(b)
     rec = {"t0": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": host, "uid": uid, "action": "outlet_cycle",
-           "outlet": b["outlet"], "off_s": off_s, "graceful": graceful, "c64u_poweroff": c64u_poweroff,
-           "poweroff": None}                          # decided under the lock from the /v1/info product
+           "outlet": b["outlet"], "off_s": off_s,
+           "requested": {"graceful": graceful, "c64u_poweroff": c64u_poweroff},
+           # the resolved decision, made under the lock from the /v1/info product (lane scripts read these keys)
+           "graceful": None, "c64u_poweroff": None, "poweroff": None, "product": None}
     if dry_run:
-        rec["outlet_on"] = outlet.is_on()             # reads the plug only, never the Ultimate: poweroff stays None
+        rec["outlet_on"] = outlet.is_on()             # reads the plug only, never the Ultimate: undecided
         rec["result"] = "dry-run ok"
         return rec
     with jl._Locked(host, {}, lock_timeout, lock_factory):
@@ -226,7 +235,8 @@ def outlet_cycle(host: str, *, off_s: float = MIN_OFF_S, graceful: bool | None =
         rec["product"] = product
         poweroff = _decide_poweroff(uid, product, rest_up=pre is not None, graceful=graceful,
                                     c64u_poweroff=c64u_poweroff, log=log)
-        rec["poweroff"] = poweroff
+        rec["poweroff"] = rec["graceful"] = poweroff
+        rec["c64u_poweroff"] = poweroff and product in C64U_PRODUCTS
         if poweroff:
             try:
                 client_factory(host).poweroff(confirm_irrecoverable=True)
@@ -252,7 +262,7 @@ def outlet_cycle(host: str, *, off_s: float = MIN_OFF_S, graceful: bool | None =
                 except Exception as e:
                     log(f"COULD NOT SWITCH THE OUTLET BACK ON: {e}")
         try:
-            products = tuple(C64U_PRODUCTS | GRACEFUL_PRODUCTS) + ((product,) if pre is not None else ())
+            products = tuple(C64U_PRODUCTS | GRACEFUL_PRODUCTS) + ((product,) if isinstance(product, str) else ())
             rec["info"] = jl.wait_info(host, uid, expect_git_hash, up_timeout, client_factory, sleep, clock,
                                        products=products)   # the board that answered before may answer after
         except jl.JtagLoadError as e:

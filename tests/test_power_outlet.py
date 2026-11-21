@@ -92,6 +92,9 @@ def test_u64e_sequence_graceful_off_wait_on_back(env):
     assert rec["result"] == "ok"
     assert [e for e in ev if e[0] != "get_info"] == [("acquire",), ("poweroff",), ("outlet", "OFF"), ("outlet", "ON"),
                                                      ("release",)]
+    # lane scripts read these keys: "graceful" is the resolved decision, as before; the request is under "requested"
+    assert rec["graceful"] is True and rec["c64u_poweroff"] is False
+    assert rec["requested"] == {"graceful": None, "c64u_poweroff": False}
     assert 10.0 in sleeps and plug.on
 
 
@@ -102,6 +105,7 @@ def test_c64u_is_never_powered_off_by_default(env):
     rec, _ = cycle(ev, plug, Client(ev, plug, info("f1a5bed00"), info("f1a5bed00")))
     assert [e for e in ev if e[0] != "get_info"] == [("acquire",), ("outlet", "OFF"), ("outlet", "ON"), ("release",)]
     assert rec["result"] == "ok" and rec["poweroff"] is False
+    assert rec["graceful"] is False and rec["c64u_poweroff"] is False
 
 
 def test_c64u_poweroff_needs_its_own_flag(env):
@@ -113,6 +117,7 @@ def test_c64u_poweroff_needs_its_own_flag(env):
     ev.clear()
     rec, _ = cycle(ev, plug, Client(ev, plug, info("f1a5bed00"), info("f1a5bed00")), c64u_poweroff=True)
     assert ("poweroff",) in ev and rec["poweroff"] is True
+    assert rec["graceful"] is True and rec["c64u_poweroff"] is True
 
 
 def test_the_c64u_flag_is_refused_on_another_device(env):
@@ -163,10 +168,30 @@ def test_the_poweroff_decision_follows_the_product(env, product, graceful, c64u_
             cycle(ev, plug, client, graceful=graceful, c64u_poweroff=c64u_poweroff)
         assert ev == [("acquire",), ("release",)] and plug.on and not plug.was_off
         return
-    rec, _ = cycle(ev, plug, client, graceful=graceful, c64u_poweroff=c64u_poweroff)
     head = [("acquire",), ("poweroff",)] if want == POWEROFF else [("acquire",)]
+    if not isinstance(product, str):
+        # cut, but nothing vouches for the board that answers afterwards: no product (or a malformed one) is not
+        # accepted after the cycle just because it was reported before it
+        with pytest.raises(po.OutletError):
+            cycle(ev, plug, client, graceful=graceful, c64u_poweroff=c64u_poweroff)
+        assert ev == head + [("outlet", "OFF"), ("outlet", "ON"), ("release",)] and plug.on
+        return
+    rec, _ = cycle(ev, plug, client, graceful=graceful, c64u_poweroff=c64u_poweroff)
     assert ev == head + [("outlet", "OFF"), ("outlet", "ON"), ("release",)]
     assert rec["result"] == "ok" and rec["poweroff"] is (want == POWEROFF) and plug.on
+    assert rec["graceful"] is (want == POWEROFF)
+    assert rec["c64u_poweroff"] is (want == POWEROFF and product in C64U_CLASS)
+    assert rec["requested"] == {"graceful": graceful, "c64u_poweroff": c64u_poweroff}
+
+
+@pytest.mark.parametrize("before", ["C64 Ultimate", "C64 Ultimate (MK1)"])
+def test_a_different_product_after_the_cycle_is_an_identity_failure(env, before):
+    """The bound unique_id answers after the cycle as a product that is neither known nor the one it reported before."""
+    ev = env
+    plug = Plug(ev)
+    with pytest.raises(po.OutletError):
+        cycle(ev, plug, Client(ev, plug, _info("f1a5bed00", before), _info("f1a5bed00", "Ultimate 99")))
+    assert ev == [("acquire",), ("outlet", "OFF"), ("outlet", "ON"), ("release",)] and plug.on
 
 
 class Down(Client):
@@ -195,6 +220,7 @@ def test_rest_down_cuts_by_default_and_refuses_an_explicit_poweroff(env, gracefu
     rec, _ = cycle(ev, plug, client, graceful=graceful, c64u_poweroff=c64u_poweroff)
     assert ev == [("acquire",), ("outlet", "OFF"), ("outlet", "ON"), ("release",)]
     assert rec["result"] == "ok" and rec["poweroff"] is False
+    assert rec["graceful"] is False and rec["c64u_poweroff"] is False
 
 
 @pytest.mark.parametrize("argv, want", [
@@ -240,9 +266,11 @@ def test_wrong_device_behind_the_plug_refuses_before_cutting(env):
 
 def test_dry_run_reads_the_plug_only(env):
     ev = env
-    rec, _ = cycle(ev, Plug(ev), None, dry_run=True)
+    rec, _ = cycle(ev, Plug(ev), None, dry_run=True, graceful=True)
     assert rec["result"] == "dry-run ok" and rec["outlet_on"] is True and ev == []
-    assert rec["poweroff"] is None          # undecided: that needs /v1/info, which a dry run never reads
+    # the request is recorded, but not as the decision: that needs /v1/info, which a dry run never reads
+    assert rec["requested"] == {"graceful": True, "c64u_poweroff": False}
+    assert rec["graceful"] is None and rec["c64u_poweroff"] is None
 
 
 def test_binding_from_devices_toml(tmp_path):
