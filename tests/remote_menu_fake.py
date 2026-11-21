@@ -724,6 +724,8 @@ class _Session:
             text = "Flashing ESP32 Success!"
         elif dev.esp == "nodownload":
             text = "Could not switch to download mode."
+        elif dev.esp.startswith("popup:"):
+            text = dev.esp.split(":", 1)[1]
         else:
             text = f"Flashing Error {dev.esp.split(':', 1)[1]}"
         self.popup = (text, ["Ok"])

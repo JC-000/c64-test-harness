@@ -18,6 +18,7 @@ Exit 0 only when the whole verdict is OK; 1 on a failed or unverified flash
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import subprocess
 import sys
@@ -44,11 +45,12 @@ def check_image(tool: Path, platform_name: str, image: Path) -> tuple[bool, str]
 
 
 def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
-         put=None, delete=None, lock_factory=None, checker=None) -> int:
+         put=None, delete=None, get=None, lock_factory=None, checker=None,
+         ident_probe=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--host", required=True, help="the device's ETHERNET address")
     ap.add_argument("--esp", type=Path, required=True)
-    ap.add_argument("--platform", choices=("u64e", "c64u"), required=True)
+    ap.add_argument("--platform", choices=("u64e",), required=True)
     ap.add_argument("--esp-image-tool", type=Path,
                     default=Path(os.environ["ESP_IMAGE_TOOL"]) if os.environ.get("ESP_IMAGE_TOOL")
                     else None, help="path of esp_image.py (or env ESP_IMAGE_TOOL)")
@@ -65,7 +67,8 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
     from ..backends.ultimate64_client import Ultimate64UnsafeOperationError
     from ..backends.ultimate64_remote_menu import (
         EspFlashError, Ultimate64RemoteMenu, Ultimate64RemoteMenuError)
-    from ..backends.ultimate64_storage import storage_delete_file, storage_put_file
+    from ..backends.ultimate64_storage import (
+        storage_delete_file, storage_get_file, storage_put_file)
 
     if not a.confirm_module_flash:
         print("REFUSED: pass --confirm-module-flash", file=sys.stderr)
@@ -90,13 +93,31 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
     dest = a.dest or f"/Temp/{a.esp.name}"
     put = put or storage_put_file
     delete = delete or storage_delete_file
+    get = get or storage_get_file
+    probe = ident_probe
+    if probe is None and a.expect_ident is not None:
+        try:
+            from .. import read_wifi_ident  # PR #569
+        except ImportError:
+            print("REFUSED: --expect-ident needs read_wifi_ident (harness PR #569); the WiFi "
+                  "row shows the ident only while Wi-Fi is Disabled", file=sys.stderr)
+            return 2
+        probe = lambda: read_wifi_ident(a.host).ident  # noqa: E731
+    local = a.esp.read_bytes()
     lock = (lock_factory or DeviceLock)(a.host)
     lock.acquire_or_raise(timeout=a.lock_timeout)
     try:
         menu = (menu_factory or Ultimate64RemoteMenu)(a.host)
         try:
             put(a.host, dest, a.esp, overwrite=True)
-            res = menu.flash_esp(dest, expect_ident=a.expect_ident,
+            # The firmware reports "Success!" for a truncated file: read it back.
+            back = get(a.host, dest)
+            if back != local:
+                print(f"REFUSED: the file on the device ({len(back)} B) is not the local "
+                      f"image ({len(local)} B, sha256 {hashlib.sha256(local).hexdigest()}); "
+                      "nothing was flashed", file=sys.stderr)
+                return 2
+            res = menu.flash_esp(dest, ident_probe=probe, expect_ident=a.expect_ident,
                                  confirm_module_flash=True, timeout=a.timeout,
                                  verify_timeout=a.verify_timeout, wifi_ip=a.wifi_ip, ping=ping)
         except EspFlashError as exc:

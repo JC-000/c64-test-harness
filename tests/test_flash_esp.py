@@ -69,8 +69,9 @@ def _oks(fake):
 def test_success_answers_the_popup_once_and_verifies(make, held):
     fake, menu = make()
     pinged = []
+    idents = iter(["OLD bridge", "ESP32 WiFi Bridge V1.2"])
     res = _flash(menu, expect_ident="ESP32 WiFi Bridge V1.2",
-                 ident_probe=lambda: "ESP32 WiFi Bridge V1.2",
+                 ident_probe=lambda: next(idents),
                  ping=lambda ip: pinged.append(ip) or True)
     assert res.ok and res.flash_ok and res.wifi_back and res.ping_ok and res.ident_ok is True
     assert res.popup == "Flashing ESP32 Success!"
@@ -110,7 +111,7 @@ def test_no_popup_is_loud_presses_nothing_and_does_not_retry(make, held):
     with pytest.raises(EspFlashNoPopupError) as exc:
         _flash(menu, timeout=0.6)
     msg = str(exc.value)
-    assert "download mode" in msg and "not retried" in msg.replace("nothing is retried", "not retried")
+    assert "nothing is retried" in msg and "does not leave it in download mode" in msg
     assert exc.value.enter_sent is True and exc.value.result.popup is None
     assert fake.all_commits() == [("Flash into ESP32", "/Temp/")]
     assert _oks(fake) == 0 and fake.esp_restarts == 0
@@ -213,7 +214,7 @@ class _Lock:
         self.events.append("release")
 
 
-def _run_cli(tmp_path, make, extra=(), checker=None, **fake_kw):
+def _run_cli(tmp_path, make, extra=(), checker=None, readback=None, ident_probe=None, **fake_kw):
     fake, menu = make(**fake_kw)
     esp = tmp_path / "raw_u64.esp"
     esp.write_bytes(b"x")
@@ -227,6 +228,8 @@ def _run_cli(tmp_path, make, extra=(), checker=None, **fake_kw):
          "--verify-timeout", "2", *extra],
         menu_factory=lambda host: menu, ping=lambda ip: True,
         put=lambda host, dest, path, **kw: calls.append(("put", dest)),
+        get=lambda host, dest: b"x" if readback is None else readback,
+        ident_probe=ident_probe,
         delete=lambda host, dest, **kw: calls.append(("delete", dest)),
         lock_factory=lambda host: lock,
         checker=checker or (lambda t, p, f: (True, f"OK {p}")))
@@ -258,3 +261,45 @@ def test_cli_refuses_the_wifi_ip_and_missing_confirmation(tmp_path, capsys):
     base = ["--host", "10.0.0.50", "--esp", str(esp), "--platform", "u64e"]
     assert cli.main(base + ["--wifi-ip", "10.0.0.50", "--confirm-module-flash"]) == 2
     assert cli.main(base) == 2
+
+
+def test_cli_a_truncated_upload_is_refused_before_the_enter(tmp_path, make, held, capsys):
+    rc, calls, lock, fake = _run_cli(tmp_path, make, readback=b"")
+    assert rc == 2 and fake.all_commits() == [] and fake.sessions == []
+    assert ("delete", "/Temp/raw_u64.esp") in calls
+
+
+def test_cli_expect_ident_without_a_reader_is_refused(tmp_path, make, held, capsys, monkeypatch):
+    import c64_test_harness as pkg
+    monkeypatch.delattr(pkg, "read_wifi_ident", raising=False)
+    rc, calls, lock, fake = _run_cli(tmp_path, make, extra=["--expect-ident", "T1 bridge"])
+    assert rc == 2 and calls == [] and fake.sessions == []
+
+
+def test_cli_with_an_ident_probe_verifies_the_ident(tmp_path, make, held, capsys):
+    seq = iter(["OLD bridge V1", "NEW bridge V2"])
+    rc, calls, lock, fake = _run_cli(tmp_path, make, extra=["--expect-ident", "NEW bridge V2"],
+                                     ident_probe=lambda: next(seq))
+    assert rc == 0, capsys.readouterr()
+
+
+def test_same_ident_as_before_is_refused_before_the_enter(make, held):
+    fake, menu = make()
+    with pytest.raises(Ultimate64UnsafeOperationError) as exc:
+        _flash(menu, expect_ident="X bridge", ident_probe=lambda: "X bridge")
+    assert "same-image" in str(exc.value) and fake.all_commits() == []
+    res = _flash(menu, expect_ident="X bridge", ident_probe=lambda: "X bridge",
+                 allow_same_ident=True)
+    assert res.ok
+
+
+@pytest.mark.parametrize("text", [
+    "Flashing ESP32 Success!!", "Flashing ESP32 Success", "Flashing Error 3 extra",
+    "Flashing Error", "Flashing Error 999", "flashing error 3", "Flashing Error 3\nmore"])
+def test_only_an_exact_popup_text_is_answered(make, held, text):
+    from c64_test_harness.backends.ultimate64_remote_menu import RemoteMenuUnexpectedScreenError
+    fake, menu = make(esp=f"popup:{text}")
+    with pytest.raises(RemoteMenuUnexpectedScreenError) as exc:
+        _flash(menu)
+    assert exc.value.enter_sent is True
+    assert _oks(fake) == 0 and fake.esp_restarts == 0

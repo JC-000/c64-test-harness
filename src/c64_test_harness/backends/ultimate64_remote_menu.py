@@ -209,6 +209,12 @@ _ESP_SUCCESS = "Flashing ESP32 Success!"
 _ESP_NO_DOWNLOAD = "Could not switch to download mode."
 _ESP_FAILURES = ("Could not read header.", "Incorrect signature in file.",
                  "Couldn't alloc mem to load segment.")
+#: Every popup text this driver will answer: exact strings only (owner rule,
+#: #543), never a prefix. ``"Flashing Error %d"`` is listed for the plausible
+#: range of the flasher's status codes.
+_ESP_POPUPS = frozenset(
+    (_ESP_SUCCESS, _ESP_NO_DOWNLOAD, *_ESP_FAILURES,
+     *(f"Flashing Error {n}" for n in range(-64, 65))))
 _CFW_REFUSALS = ("Invalid Update Image", "Wrong Product Family", "Update for Wrong Product")
 
 #: The only bytes this driver ever writes.
@@ -322,11 +328,13 @@ class EspFlashFailedError(EspFlashError):
 
 
 class EspFlashNoPopupError(EspFlashError):
-    """The one ENTER was sent and no result popup came within the timeout.
-    The module is most likely still in download mode with Wi-Fi stopped
-    (``FileTypeESP::execute`` restarts it only after its result popup), and
-    the session may still be mid-flash. Nothing was pressed; do not retry
-    blindly: look at the device."""
+    """The one ENTER was sent and no result popup came within the timeout, or
+    the device closed the session first. The outcome is unknown: the flash may
+    still be running (the timeout was too short), or it may have finished.
+    Nothing was pressed and nothing is retried. Closing a session does not
+    leave the module in download mode: the firmware's popup loop ends when
+    the socket closes and ``StartApp`` then runs (``userinterface.cc:680``).
+    Check the module (Wi-Fi row, ident) before doing anything else."""
 
 
 class EspFlashVerifyError(EspFlashError):
@@ -1684,15 +1692,24 @@ class Ultimate64RemoteMenu:
                   confirm_module_flash: bool = False, timeout: float = 300.0,
                   verify_timeout: float = 90.0, wifi_ip: str | None = None,
                   ping: Callable[[str], bool] | None = None,
+                  allow_same_ident: bool = False,
                   ident_probe: Callable[[], str | None] | None = None) -> EspFlashResult:
         """Choose "Flash into ESP32" on the ``.esp`` file at *path*.
 
         The file must already be on the device. The firmware stops the
         application (Wi-Fi included), flashes the module over the FPGA's
         strap lines, shows a result popup, and only *then* restarts the
-        module. So the popup is answered with exactly one ``o``; without it
-        the module stays in download mode. The firmware checks nothing: no
-        ident, no chip. Verify the image first (``tools.esp_image``), and
+        module. So the popup is answered with exactly one ``o``, and only when
+        its text is one of the firmware's exact strings. (A session that dies
+        does not leave the module in download mode either: the popup loop ends
+        with the socket and ``StartApp`` runs. Only "Could not switch to
+        download mode." skips the restart.) The firmware checks nothing: no
+        ident, no chip, not that the file was read whole (a truncated upload
+        still ends in "Success!") and an image identical to the one flashed
+        looks the same as nothing written, so ``ident_before`` is recorded and
+        an ``expect_ident`` equal to it is refused (``allow_same_ident``).
+        The caller must have verified the upload's size and hash on the
+        device; the CLI does. Verify the image first (``tools.esp_image``), and
         this call verifies afterwards (Wi-Fi back on a fresh session, a ping
         of the Wi-Fi IP, the ident).
 
@@ -1707,6 +1724,7 @@ class Ultimate64RemoteMenu:
         :param wifi_ip: the module's Wi-Fi address, when it is not shown on
             the row (the row shows it only while the link is up).
         :param ping: ``ping(ip) -> bool``; default is the system ``ping``.
+        :param allow_same_ident: allow *expect_ident* to equal the ident before.
         :param ident_probe: returns the module ident. Default: the WiFi row's
             ident, which the firmware shows only while Wi-Fi is Disabled, so
             on a linked module it is ``None`` and a given *expect_ident*
@@ -1736,6 +1754,13 @@ class Ultimate64RemoteMenu:
                 f"flash_esp: {self.host} is the module's Wi-Fi address. The flash stops "
                 "Wi-Fi, so this telnet session would die mid-flash. Use the Ethernet address.")
         ident_before = ident_probe() if ident_probe else before.ident
+        if (expect_ident is not None and ident_before is not None
+                and ident_before.strip() == expect_ident.strip() and not allow_same_ident):
+            raise Ultimate64UnsafeOperationError(
+                f"flash_esp: the module already reports {ident_before!r}, the ident this flash "
+                "should produce. A same-image flash cannot be told from nothing written. Flash "
+                "an image with another ident (a tag up front: the ident is cut at 31 characters), "
+                "or pass allow_same_ident=True.")
 
         def make(*, popup=None, flash_ok=False, after=None, back=False, ping_ok=False,
                  ident_after=None, ident_ok=None, sent=False) -> EspFlashResult:
@@ -1827,9 +1852,7 @@ class Ultimate64RemoteMenu:
             p = view.popup
             if p is not None:
                 self._seen_messages.append(p.message)
-                known = p.message == _ESP_SUCCESS or p.message == _ESP_NO_DOWNLOAD \
-                    or p.message in _ESP_FAILURES or re.fullmatch(r"Flashing Error -?\d+", p.message)
-                if not known or p.buttons != ("Ok",):
+                if p.message not in _ESP_POPUPS or p.buttons != ("Ok",):
                     raise RemoteMenuUnexpectedScreenError(
                         f"flash_esp {path}: unexpected popup {p.message!r} "
                         f"{list(p.buttons)}; no key sent", enter_sent=True, screen=view.rows)
@@ -1839,8 +1862,9 @@ class Ultimate64RemoteMenu:
                     f"no result popup within {timeout:.0f} s"
                 err = EspFlashNoPopupError(
                     f"flash_esp {path}: ENTER sent once; {why}. Nothing was pressed and nothing "
-                    "is retried. The module is probably still in download mode (Wi-Fi off) "
-                    "until the popup is answered or the device is reset.",
+                    "is retried. The outcome is unknown (the flash may still be running). "
+                    "Closing the session restarts the module by itself, it does not leave it "
+                    "in download mode; check Wi-Fi and the ident before anything else.",
                     enter_sent=True, screen=view.rows)
                 err.result = make(sent=True)
                 raise err
