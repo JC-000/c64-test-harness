@@ -190,8 +190,8 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
             return 2
         finally:
             if uploaded and keep:
-                print(f"the upload is KEPT at {dest} (and its directory): the ENTER was sent and "
-                      "the firmware may still be reading the open file. Delete it by hand once "
+                print(f"the upload is KEPT at {dest} (and its directory): the ENTER may have "
+                      "been sent, and the firmware may still be reading the open file. Delete it by hand once "
                       "the module is back.")
             if uploaded and not keep:
                 try:

@@ -527,6 +527,8 @@ def test_cli_a_method_refusal_exits_2(tmp_path, make, held, capsys):
                                      ident_probe=lambda: "X bridge")
     assert rc == 2 and fake.all_commits() == []
     assert "same-image" in capsys.readouterr().err
+    # a refusal before the ENTER: the upload is ours and the firmware never saw it (kills K8)
+    assert ("delete", "/USB1/espflash/raw_u64.esp") in [c[:2] for c in calls]
 
 
 def test_cli_a_failed_pre_enter_ident_probe_is_not_an_enter_and_warns_about_wifi(
@@ -713,3 +715,40 @@ def test_a_hostname_resolving_to_the_net0_address_reaches_the_enter(make, held_n
     menu.host = "localhost"
     res = _flash(menu)
     assert res.enter_sent and fake.all_commits() == [("Flash into ESP32", "/USB1/espflash/")]
+
+
+def test_a_lock_lost_after_the_flash_is_an_enter_sent_error(make, held):
+    """S1. Kills: a post-ENTER RemoteMenuLockError escaping with enter_sent False."""
+    fake, menu = make()
+
+    def lost(timeout):
+        raise RemoteMenuLockError("lost the DeviceLock")
+    menu._await_wifi_back = lost
+    with pytest.raises(RemoteMenuLockError) as exc:
+        _flash(menu)
+    assert exc.value.enter_sent is True and len(fake.all_commits()) == 1
+
+
+def test_cli_a_lock_lost_after_the_flash_is_rc_1_and_keeps_the_upload(tmp_path, make, held, capsys):
+    def lost(menu):
+        def f(timeout):
+            raise RemoteMenuLockError("lost the DeviceLock")
+        menu._await_wifi_back = f
+
+    rc, calls, lock, fake = _run_cli(tmp_path, make, menu_patch=lost, ident_probe=lambda: "x")
+    cap = capsys.readouterr()
+    assert rc == 1 and _deleted(calls) == [] and "nothing was flashed" not in cap.err
+    assert "KEPT" in cap.out
+
+
+def test_the_kept_message_says_may_have_been_sent(tmp_path, make, held, capsys):
+    """S3. Kills: 'the ENTER was sent' printed for an interrupt that may precede the ENTER."""
+    def boom(menu):
+        def flash_esp(*a, **k):
+            raise KeyboardInterrupt
+        menu.flash_esp = flash_esp
+
+    with pytest.raises(KeyboardInterrupt):
+        _run_cli(tmp_path, make, menu_patch=boom, ident_probe=lambda: "x")
+    out = capsys.readouterr().out
+    assert "may have been sent" in out and "the ENTER was sent" not in out

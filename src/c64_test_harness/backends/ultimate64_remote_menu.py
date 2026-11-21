@@ -1883,7 +1883,11 @@ class Ultimate64RemoteMenu:
             err.result = make(popup=popup, sent=True)
             raise err
 
-        after, back, ident_seen = self._await_wifi_back(verify_timeout)
+        try:
+            after, back, ident_seen = self._await_wifi_back(verify_timeout)
+        except Ultimate64RemoteMenuError as exc:
+            exc.enter_sent = True   # e.g. the lock lost after the flash: never "nothing was flashed"
+            raise
         ip = after.ip if (back and after is not None) else known_ip
         ping_ok: bool | None = None if ping is False else False
         if ping is not False and back and ip is not None:
