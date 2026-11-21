@@ -256,21 +256,27 @@ def test_dead_app_still_gets_cut(env):
     assert ("poweroff",) not in ev and ("outlet", "OFF") in ev and rec["result"] == "ok"
 
 
-@pytest.mark.parametrize("host,before,stage", [
-    ("c64u", info("f1a5bed00"), "network"), ("c64u", info("f1a5bed00"), "identity"),
-    ("u64e", u64e("f1a5bed00"), "network"), ("u64e", u64e("f1a5bed00"), "identity"),
-])
-def test_the_power_up_hint_follows_only_a_device_that_did_not_come_back(env, host, before, stage):
-    """A board that never answered again gets the AC power-up hint; a wrong board answering (identity) does not."""
+C64U_HINT, POWEROFF_CLAUSE, GENERIC_HINT = "power-on mode", "last-state OFF", "powers up by itself"
+
+
+@pytest.mark.parametrize("host,before,stage,kw,want", [
+    ("c64u", info("f1a5bed00"), "network", {}, [C64U_HINT]),
+    ("c64u", info("f1a5bed00"), "network", {"c64u_poweroff": True}, [C64U_HINT, POWEROFF_CLAUSE]),
+    ("c64u", info("f1a5bed00"), "identity", {}, []),
+    ("u64e", u64e("f1a5bed00"), "network", {}, [GENERIC_HINT]),
+    ("u64e", u64e("f1a5bed00"), "identity", {}, []),
+], ids=["c64u-network", "c64u-network-after-poweroff", "c64u-identity", "u64e-network", "u64e-identity"])
+def test_the_power_up_hint_follows_only_a_device_that_did_not_come_back(env, host, before, stage, kw, want):
+    """A board that never answered again gets the AC power-up hint for its product (the C64U's power-on mode, and
+    the stored last-state OFF after a poweroff; otherwise the generic one); a wrong board answering gets none."""
     ev = env
     plug = Plug(ev)
     after = None if stage == "network" else info("f1a5bed00", uid="FED789", product=before["product"])
     with pytest.raises(po.OutletError) as e:
-        cycle(ev, plug, Client(ev, plug, before, after), host=host, up_timeout=0 if stage == "network" else 5)
+        cycle(ev, plug, Client(ev, plug, before, after), host=host, up_timeout=0 if stage == "network" else 5, **kw)
     msg = str(e.value)
     assert f"[{stage}]" in msg
-    hinted = "power-on mode" in msg or "powers up by itself" in msg
-    assert hinted is (stage == "network"), msg
+    assert [h for h in (C64U_HINT, POWEROFF_CLAUSE, GENERIC_HINT) if h in msg] == want, msg
     assert plug.on and ev[-1] == ("release",)
 
 
