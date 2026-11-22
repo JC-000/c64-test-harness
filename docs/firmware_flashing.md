@@ -504,7 +504,8 @@ reading it.
 Exit codes: **0** verified and proven (or, with `--allow-same-ident`,
 verified with a ping reply); **3** verified but unproven (no ident change,
 or `--no-ping`); **1** failed or unverified after the ENTER; **2** refused
-before the ENTER, including a `DeviceLock` timeout.
+before the ENTER, including a `DeviceLock` timeout or an unreadable lock
+budget (`--lock-timeout nan`, a malformed `U64_DEVICE_LOCK_TIMEOUT`).
 
 Costs and limits:
 - Each ident read disables and re-enables WiFi, and on the U64E each toggle
@@ -530,10 +531,15 @@ before the ENTER. Upstream, GideonZ/1541ultimate#1121 (issue) and its fix
 ## Bench scripts: RAM-run, JTAG load, outlet power cycle
 
 Three scripts under `scripts/` (#571) load firmware without writing flash,
-or power-cycle a device. They are bench tools for this bench, not test
-steps: `ram_run_u64.py` and `jtag_load.py` are bound by `unique_id` to one
-bench device each and refuse any other, and `power_outlet.py` needs an
-outlet bound in `devices.toml`. Each takes the device's `DeviceLock`
+or power-cycle a device. They are bench tools, not test steps. Each acts
+only on a device bound in the local `~/.config/c64-test-harness/bench.toml`
+(`[devices.<unique_id>]` tables; `C64_BENCH_BINDINGS_FILE` overrides the
+path) and refuses any other: `ram_run = true` for `ram_run_u64.py`;
+`jtag_adapter_location` and `jtag_adapter_baud` for `jtag_load.py`, plus
+`jtag_scan_only = true` for a device that may only be scanned; `outlet` and
+`outlet_kind` for `power_outlet.py`. The host still reaches its
+`unique_id` through `devices.toml`, so a `bench.toml` table alone binds
+nothing; `docs/development.md` has the details. Each takes the device's `DeviceLock`
 (`ram_run_u64.py` takes its own and refuses to run inside a lock shell;
 `jtag_load.py` and `power_outlet.py` also accept a hold by a verified
 ancestor lock shell). All three are gated by
@@ -560,14 +566,18 @@ ancestor lock shell). All three are gated by
   git hash afterwards. `$ESP_JTAG_DIR` and `$C64U_TESTS_DIR` must be set;
   neither has a default.
 - **`power_outlet.py cycle HOST`** cold-cycles a device through a switched
-  outlet (Shelly gen2 or Tasmota). The outlet is bound to the device in
-  `~/.config/c64-test-harness/devices.toml` (`outlet`, `outlet_kind`).
-  - On a U64E it powers off gracefully first, through the harness
-    client's `poweroff(confirm_irrecoverable=True)`.
-  - It skips that poweroff, unless `--c64u-poweroff` is given, only on the
-    C64U whose `unique_id` is in the script's `C64U_IDS` (the bench unit):
-    a poweroff stores last-state OFF in the module, and the machine then
-    comes back only with power-on mode ON. **Any other C64U is treated like
-    a U64E and powered off first; pass `--no-graceful` for it.**
+  outlet (Shelly gen2 or Tasmota), bound in `bench.toml`. Whether it powers
+  the device off first is decided under the lock from the `/v1/info`
+  `product` (#577):
+  - "Ultimate 64" and "Ultimate 64 Elite": a graceful
+    `poweroff(confirm_irrecoverable=True)`, then the cut (`--no-graceful`
+    skips the poweroff). That these boards come back when power returns
+    rests on the firmware source only; #576 tracks measuring it.
+  - "C64 Ultimate" and "Ultimate 64-II": the cut only, unless
+    `--c64u-poweroff` is given. A poweroff stores last-state OFF in the
+    module, so the machine then comes back only with power-on mode ON.
+  - Any other product, none, or REST down: the cut only. An explicit
+    `graceful=True` or `--c64u-poweroff` is refused there, before the
+    outlet is switched.
   - The outlet is never left off: any error after switching it off
     switches it back on before raising.
