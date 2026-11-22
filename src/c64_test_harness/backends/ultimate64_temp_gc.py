@@ -41,8 +41,8 @@ affects any generation whose firmware predates #686 (it was verified on
 the U64E while it ran 3.14d; the C64U on 1.1.0 still qualifies). The
 module itself is host-generic (no generation branching) and has been
 verified live end-to-end (leak via ``run_prg`` + FTP GC trims to the
-keep-count) on both: originally on the U64E, and on the C64U at
-10.53.21.158 via ``tests/test_temp_gc_live.py`` (2026-08-21) — anonymous
+keep-count) on both: originally on the U64E, and on the C64U via
+``tests/test_temp_gc_live.py`` (2026-08-21) — anonymous
 FTP against ``/Temp`` worked with the same defaults as the U64E.
 
 Upstream root cause and fix: GideonZ/1541ultimate#686 (auto-cleanup of

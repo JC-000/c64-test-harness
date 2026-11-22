@@ -457,7 +457,7 @@ class RecordedCategorySet:
 BASELINE_RECORDED_CATEGORY_SETS: dict[str, RecordedCategorySet] = {
     "ultimate": RecordedCategorySet(
         generation="ultimate",
-        device="U64E (Ultimate 64 Elite, 10.43.23.81)",
+        device="U64E (Ultimate 64 Elite)",
         firmware="3.15 (fork build 7f6fcb51)",
         date="2026-09-15",
         source=(
@@ -557,7 +557,7 @@ BASELINE_RECORDED_CATEGORY_SETS: dict[str, RecordedCategorySet] = {
     ),
     "cbm": RecordedCategorySet(
         generation="cbm",
-        device="C64U (C64 Ultimate, 10.53.21.158)",
+        device="C64U (C64 Ultimate)",
         firmware="1.1.0 (tag 1.1.0 = 7b628eb1, u64ii target)",
         date="2026-09-15",
         source=(

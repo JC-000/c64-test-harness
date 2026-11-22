@@ -114,7 +114,7 @@ def test_arming_is_not_keyed_on_the_device_address():
     Consumer lanes reach the C64U through $U64_HOST/--host, so an
     address-keyed guard would miss it entirely.
     """
-    for host in ("10.53.21.158", "10.43.23.81", "u64.lan"):
+    for host in ("203.0.113.158", "192.0.2.81", "u64.lan"):
         c = Ultimate64Client(host, write_mem_query_threshold=128)
         c._capabilities = LEAKY
         assert c.temp_hygiene_armed is True, host
