@@ -571,8 +571,9 @@ ancestor lock shell). All three are gated by
   `product` (#577):
   - "Ultimate 64" and "Ultimate 64 Elite": a graceful
     `poweroff(confirm_irrecoverable=True)`, then the cut (`--no-graceful`
-    skips the poweroff). That these boards come back when power returns
-    rests on the firmware source only; #576 tracks measuring it.
+    skips the poweroff). The source shows only that both switch off
+    through the same power register; that they power up again after the
+    cut is not measured (#576).
   - "C64 Ultimate" and "Ultimate 64-II": the cut only, unless
     `--c64u-poweroff` is given. A poweroff stores last-state OFF in the
     module, so the machine then comes back only with power-on mode ON.
