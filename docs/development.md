@@ -386,13 +386,15 @@ Re-run `./scripts/verify-dev-env.sh` after each step to confirm progress.
 
 ## Live test gates: `C64_REQUIRE_VICE` / `C64_REQUIRE_ELEVATION`
 
-Two env vars, both defined in `tests/conftest.py`, turn a silent skip into a hard failure so a missing prerequisite on CI or a fresh bench cannot pass a mocks-only run as green:
+Three env vars turn a silent skip into a hard failure so a missing prerequisite on CI or a fresh bench cannot pass a mocks-only run as green:
 
 - **`C64_REQUIRE_VICE=1`** — declares that this invocation must exercise a real `x64sc`. Any `@pytest.mark.vice_live` test that would skip for lack of an emulator fails instead, and if the whole run ends without a single live VICE test actually executing (wrong `-k`, an `--ignore`, a stray future `skipif`), the session is failed and escalated to exit status 1 at `pytest_sessionfinish`. Leave it unset for ordinary development runs — the bare skip is the default, and the reason is visible under `-rs`.
 - **`C64_REQUIRE_ELEVATION=1`** — the same idea for the elevated prerequisites host-side ethernet/bridge tests need: raw-network capability for the ethernet `x64sc`: the patched build with an openable `/dev/bpf*` node, or a NOPASSWD sudoers rule for the exact `x64sc` path (`elevation("vice_root")`), NOPASSWD rules for the bridge lifecycle scripts (`elevation("bridge_scripts")`), a usable `/dev/bpf*` node (`elevation("bpf_nodes")`, macOS only), or the bridge interface(s) being present and up (`elevation("bridge_iface")`). Tests carry `@pytest.mark.elevation(kind, **kwargs)`; each kind is probed at most once per session (cached) and, unset, a missing prerequisite is a bare skip whose reason **is** the remedy (the exact `sudo`/`visudo` line, or `sudo chmod o+rw /dev/bpf*`) — no `-rs` needed to see it, because `pytest_sessionfinish` always prints an `ELEVATION REQUIRED: N test(s) skipped` section listing every distinct kind, its count, and its remedy when anything was skipped for elevation. Set the var and a missing prerequisite fails at setup instead (same remedy text), and a green exit status is escalated 0 → 1 (never masking an already-worse INTERRUPTED=2 or INTERNAL_ERROR=3). A mid-fixture refusal — `ViceProcess.start()` raising `ViceElevationRequiredError` because a preflight probe was bypassed with `MACOS_PCAP_ENABLED=1` — is converted the same way by `start_vice_or_skip()`, so it shows up in the same notice.
-- **`C64_REQUIRE_DEVICE_MAP=1`** (read by `tests/test_u64_runner_script_gates.py`, not conftest) — fails instead of skipping the check that every IPv4 address in this machine's device alias map is denied as a hard-coded host; a map that is present but refused, or lists no IPv4 address, fails either way.
+- **`C64_REQUIRE_DEVICE_MAP=1`** — the same for the check that every IPv4 address in this machine's device alias map is denied as a hard-coded host: a machine with no map fails instead of skipping. A map that is refused, or lists nothing, fails either way; a map that lists only hostnames skips either way, since the check has no address to deny.
 
-Run both together for a bench that is supposed to be fully wired (e.g. before trusting a "the ethernet suite is green" claim):
+The first two are defined in `tests/conftest.py`; `C64_REQUIRE_DEVICE_MAP` is read by `tests/test_u64_runner_script_gates.py`.
+
+Run `C64_REQUIRE_VICE` and `C64_REQUIRE_ELEVATION` together for a bench that is supposed to be fully wired (e.g. before trusting a "the ethernet suite is green" claim):
 
 ```bash
 C64_REQUIRE_VICE=1 C64_REQUIRE_ELEVATION=1 ~/.local/share/c64-test-harness/venv/bin/pytest tests/test_ethernet.py tests/test_bpf_attach_detection.py -rs

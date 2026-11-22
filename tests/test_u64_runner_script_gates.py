@@ -69,23 +69,33 @@ def _bench_hosts_from(path: Path, env_value: str = "") -> tuple[str, ...]:
     Hostnames are left out: the rule matches dotted-quad tails, and a name
     such as ``u64.lan`` is a mock host across the suite.
     """
+    return tuple(sorted({
+        host
+        for host in map(_ipv4_of, _map_spellings(path, env_value))
+        if host is not None
+    }))
+
+
+def _map_spellings(path: Path, env_value: str = "") -> list[str]:
+    """Every host spelling a device alias map lists, by the harness's parsers."""
     from c64_test_harness.backends import device_aliases
 
-    spellings = {
+    return list({
         **device_aliases._parse_file(path, str.strip),
         **device_aliases._parse_env(env_value, str.strip),
-    }
-    found = set()
-    for spelling in spellings:
-        host, sep, port = spelling.rpartition(":")
-        if not (sep and port.isdigit()):
-            host = spelling
-        try:
-            ipaddress.IPv4Address(host)
-        except ValueError:
-            continue
-        found.add(host)
-    return tuple(sorted(found))
+    })
+
+
+def _ipv4_of(spelling: str) -> str | None:
+    """The IPv4 address *spelling* names, ``:port`` dropped, else ``None``."""
+    host, sep, port = spelling.rpartition(":")
+    if not (sep and port.isdigit()):
+        host = spelling
+    try:
+        ipaddress.IPv4Address(host)
+    except ValueError:
+        return None
+    return host
 
 
 def _load_local_bench_hosts() -> tuple[tuple[str, ...], str | None]:
@@ -119,6 +129,26 @@ def _device_map_present() -> bool:
     )
 
 
+def _device_map_listed() -> tuple[int, int]:
+    """``(IPv4 spellings, other spellings)`` this machine's map lists.
+
+    A second, independent read, so that an emptied host list is told apart
+    from a map that really lists only hostnames. ``(0, 0)`` when the map is
+    absent or refused (the refusal itself is reported by the first read).
+    """
+    from c64_test_harness.backends import device_aliases
+
+    try:
+        spellings = _map_spellings(
+            device_aliases.aliases_file_path(),
+            os.environ.get(device_aliases.ALIASES_ENV, ""),
+        )
+    except device_aliases.DeviceAliasConfigError:
+        return 0, 0
+    ipv4 = sum(1 for s in spellings if _ipv4_of(s) is not None)
+    return ipv4, len(spellings) - ipv4
+
+
 #: Real bench addresses. A script must not carry these as runtime literals
 #: either — a live IP pinned into source is how the phantom got started. They
 #: are read from this machine's device alias map (``$C64_DEVICE_ALIASES_FILE``
@@ -130,6 +160,7 @@ def _device_map_present() -> bool:
 #: :func:`_local_bench_verdict` for what happens when the read is empty.
 _LOCAL_BENCH_HOSTS, _LOCAL_BENCH_ERROR = _load_local_bench_hosts()
 _LOCAL_BENCH_MAP_PRESENT = _device_map_present()
+_LOCAL_BENCH_MAP_LISTED = _device_map_listed()
 
 _DEVICE_ADDRESSES = (_PHANTOM_HOST, *_STAND_IN_HOSTS, *_LOCAL_BENCH_HOSTS)
 
@@ -144,15 +175,22 @@ def _device_map_required() -> bool:
 
 
 def _local_bench_verdict(
-    hosts: tuple[str, ...], error: str | None, present: bool, required: bool
+    hosts: tuple[str, ...],
+    error: str | None,
+    present: bool,
+    required: bool,
+    listed: tuple[int, int],
 ) -> tuple[str, str]:
     """``("check" | "skip" | "fail", reason)`` for the local-address test.
 
-    Only a machine with no map at all skips, and only when no map is
-    required. A map that is present but refused, or present but naming no
-    IPv4 address, fails: either way the bench addresses are not denied, and
-    a skip would be a green run that checked nothing. No reason quotes the
-    map, since the parser's message can contain an address.
+    *listed* is ``(IPv4 spellings, other spellings)`` from an independent
+    read of the map. Two cases skip: no map at all (unless one is
+    required), and a map that lists hostnames only, which has no address
+    to deny; failing there would push someone to add addresses to their
+    map. Everything else with an empty list fails: a refused map, a present
+    map that lists nothing, and IPv4 spellings that never reached the list.
+    A skip there would be a green run that checked nothing. No reason
+    quotes the map, since the parser's message can contain an address.
     """
     if error is not None:
         return "fail", (
@@ -163,11 +201,16 @@ def _local_bench_verdict(
         )
     if hosts:
         return "check", ""
+    ipv4_listed, names_listed = listed
+    if present and names_listed and not ipv4_listed:
+        return "skip", (
+            "this machine's device alias map lists hostnames only, so there is "
+            "no bench address to deny"
+        )
     if present:
         return "fail", (
-            "a device alias map is configured but lists no IPv4 address, so "
-            "no bench address is denied; list each device's addresses under "
-            "its hosts"
+            "a device alias map is configured but no IPv4 address from it is "
+            "denied: it lists nothing, or its addresses did not reach the list"
         )
     if required:
         return "fail", (
@@ -627,11 +670,16 @@ def test_the_local_bench_addresses_are_denied() -> None:
         _LOCAL_BENCH_ERROR,
         _LOCAL_BENCH_MAP_PRESENT,
         _device_map_required(),
+        _LOCAL_BENCH_MAP_LISTED,
     )
     if verdict == "fail":
         pytest.fail(reason)
     if verdict == "skip":
         pytest.skip(reason)
+    # The independent read must agree, or a hostname-only skip could be
+    # reached by a list that was emptied rather than a map without addresses.
+    agrees = _LOCAL_BENCH_MAP_LISTED[0] >= len(_LOCAL_BENCH_HOSTS)
+    assert agrees, "the independent count of the map's IPv4 spellings disagrees with the list"
     for i, host in enumerate(_LOCAL_BENCH_HOSTS):
         denied = host in _DEVICE_ADDRESSES
         assert denied, f"local address #{i} is not denied"
@@ -655,23 +703,34 @@ def test_the_local_bench_addresses_are_denied() -> None:
 def test_only_a_machine_without_a_device_map_skips_the_local_check() -> None:
     """The decision behind the local-address test, case by case (TEST-NET only).
 
-    An empty read is only a skip when there was nothing to read. A refused
-    map and a map without an IPv4 address both fail, and
-    ``C64_REQUIRE_DEVICE_MAP=1`` turns the remaining skip into a failure.
-    No failure reason may carry the parser's message.
+    An empty read skips when there was nothing to read, or when the map
+    lists hostnames only (there is no address to deny, and failing would
+    push someone into adding addresses to their map). A refused map, a
+    present map that lists nothing, and a map whose IPv4 spellings never
+    reached the list all fail. ``C64_REQUIRE_DEVICE_MAP=1`` turns only the
+    no-map skip into a failure. No failure reason may carry the parser's
+    message.
     """
     hosts = ("192.0.2.81",)
     secret = 'device id "192.0.2.81" listed twice'
 
     for present in (True, False):
         for required in (True, False):
-            assert _local_bench_verdict(hosts, None, present, required)[0] == "check"
-            verdict, reason = _local_bench_verdict((), secret, present, required)
-            assert verdict == "fail"
-            assert "192.0.2.81" not in reason and secret not in reason
-            assert _local_bench_verdict((), None, True, required)[0] == "fail"
-    assert _local_bench_verdict((), None, False, True)[0] == "fail"
-    assert _local_bench_verdict((), None, False, False)[0] == "skip"
+            assert _local_bench_verdict(hosts, None, present, required, (1, 0))[0] == "check"
+            for listed in ((0, 0), (0, 2), (1, 0)):
+                verdict, reason = _local_bench_verdict((), secret, present, required, listed)
+                assert verdict == "fail"
+                assert "192.0.2.81" not in reason and secret not in reason
+    for required in (True, False):
+        # Present, but nothing parsed out of it.
+        assert _local_bench_verdict((), None, True, required, (0, 0))[0] == "fail"
+        # Present with IPv4 spellings that are not on the list (an emptied read).
+        assert _local_bench_verdict((), None, True, required, (2, 1))[0] == "fail"
+        # Present with hostnames only: nothing to deny.
+        verdict, reason = _local_bench_verdict((), None, True, required, (0, 2))
+        assert verdict == "skip" and "hostname" in reason
+    assert _local_bench_verdict((), None, False, True, (0, 0))[0] == "fail"
+    assert _local_bench_verdict((), None, False, False, (0, 0))[0] == "skip"
 
 
 def test_the_require_device_map_gate_reads_like_the_other_require_gates(
@@ -794,6 +853,13 @@ def test_the_bench_list_is_read_from_the_device_map(
     assert not _device_map_present()
     monkeypatch.setenv(device_aliases.ALIASES_ENV, "def456=c64u.lan")
     assert _device_map_present()
+
+    # The independent count of what the map lists, by kind.
+    assert _device_map_listed() == (0, 1)
+    monkeypatch.setenv(device_aliases.ALIASES_FILE_ENV, str(devices))
+    assert _device_map_listed() == (2, 2)
+    monkeypatch.setenv(device_aliases.ALIASES_FILE_ENV, str(broken))
+    assert _device_map_listed() == (0, 0)
 
 
 def _runtime_string_literals(source: str) -> list[tuple[int, str]]:
