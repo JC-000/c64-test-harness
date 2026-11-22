@@ -6,8 +6,10 @@ The image is a RAM-run ``.u64`` (1541ultimate branch ``jtagv/u64-ramrun``: ``too
 record to its load address and jumps; the stub silences the running app's DMA, copies the app to 0x0 and starts it.
 Nothing is written to flash. The flashed app comes back only with a power cycle (the U64E has no software one).
 
-First, before any lock, client or upload: the file must be a RAM-run image (check_ramrun_image). "Run Update" on a
-plain update.u64 flashes the device; on 2026-11-13 a plain image passed here by mistake flashed a U64E.
+The device must be bound: ``ram_run = true`` in its table of the local bench.toml (_bench_bindings.py), checked
+before anything else. Next, before any lock, client or upload: the file must be a RAM-run image (check_ramrun_image).
+"Run Update" on a plain update.u64 flashes the device; on 2026-11-13 a plain image passed here by mistake flashed a
+U64E.
 
 Steps, all under the device's DeviceLock: identity check (bound unique_id, product "Ultimate 64 Elite"); pinned
 SHA-256 of the image; FTP put to a USB volume through the harness storage helpers (they refuse /Temp); telnet menu
@@ -33,15 +35,18 @@ sys.path.insert(0, str(HERE))
 
 import jtag_load as jl  # noqa: E402
 
-BOUND = {"601A96"}                       # devices this was reviewed for
 PRODUCTS = ("Ultimate 64 Elite", "Ultimate 64")
 
 
 def bound_u64(host: str) -> str:
+    """The unique_id of *host* if its bench.toml table (_bench_bindings.py) enables this path: ``ram_run = true``,
+    set only for a device this was reviewed for (the id is serial-derived, so the binding is local config). Else
+    refuse, as for a missing or broken bench.toml."""
     key = jl.normalize_device_host(host)
     uid = key[4:].upper() if key.startswith("uid-") else None
-    if uid not in BOUND:
-        raise jl.JtagLoadError("binding", f"{host} is not a device this RAM-run path is enabled for")
+    if uid is None or jl.device_table(uid).get("ram_run") is not True:
+        raise jl.JtagLoadError("binding", f"{host} is not a device this RAM-run path is enabled for "
+                               "(its bench.toml table needs ram_run = true)")
     return uid
 
 

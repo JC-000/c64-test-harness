@@ -241,6 +241,21 @@ def _reset_temp_ledgers(request):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_bench_bindings(monkeypatch, tmp_path_factory):
+    """Keep this machine's bench.toml out of every test.
+
+    ``scripts/_bench_bindings.py`` reads which device each bench script may
+    drive from ``~/.config/c64-test-harness/bench.toml``. Every test sees a
+    path that does not exist (so a load refuses), unless it sets
+    ``C64_BENCH_BINDINGS_FILE`` to its own temp file.
+    """
+    monkeypatch.setenv(
+        "C64_BENCH_BINDINGS_FILE",
+        str(tmp_path_factory.getbasetemp() / "no-bench-bindings.toml"),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _isolate_device_aliases(request, monkeypatch, tmp_path_factory):
     """Keep this machine's device alias map out of unit tests (#519).
 

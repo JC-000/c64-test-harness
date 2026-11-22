@@ -633,14 +633,14 @@ The reasons for each never-touch store, the precedence rules and the live covera
 
 **Any tool that touches a shared device must acquire that device's `DeviceLock` first, and hold it for the whole job.** This includes read-mostly tools: a reboot issued by somebody else invalidates a reader mid-measurement just as thoroughly as it invalidates a writer. The lockfile is machine-global (`$XDG_RUNTIME_DIR`, else `/tmp/c64-test-harness-<uid>`, keyed by the normalised host — case, scheme, path, trailing dot and `:80` fold to one lockfile since #434; a device on another port is `DeviceLock(device_key(host, port))`, from `backends.device_lock`; a hostname and its IP, or a device's ethernet and WiFi addresses, are two keys unless they are listed together in the offline alias map — see below), so every checkout, venv, and downstream repo on the machine converges on the same lock without configuration.
 
-**Multi-interface devices (#519).** A U64E or C64U answers on ethernet and WiFi at different addresses, and either address can move with DHCP, a reflash or a change of interface. Declare every address a device answers on in `~/.config/c64-test-harness/devices.toml` (or `$C64_DEVICE_ALIASES_FILE`; `C64_DEVICE_ALIASES="601a96=10.43.23.81,10.43.23.83"` for one-off runs):
+**Multi-interface devices (#519).** A U64E or C64U answers on ethernet and WiFi at different addresses, and either address can move with DHCP, a reflash or a change of interface. Declare every address a device answers on in `~/.config/c64-test-harness/devices.toml` (or `$C64_DEVICE_ALIASES_FILE`; `C64_DEVICE_ALIASES="abc123=10.43.23.81,10.43.23.83"` for one-off runs):
 
 ```toml
-[devices.601a96]            # the device's unique_id, from GET /v1/info
+[devices.abc123]            # the device's unique_id, from GET /v1/info
 hosts = ["10.43.23.81", "10.43.23.83"]
 ```
 
-Every listed spelling then shares one lockfile and one `/Temp` ledger, `uid-601a96`. The map is local configuration, read once per process, with no network I/O on the lock path; a broken map raises `DeviceAliasConfigError` before anything is locked or sent. Once a lane holds the lock, the client and the free `liveness_probe` catch three cases the map alone cannot prevent:
+Every listed spelling then shares one lockfile and one `/Temp` ledger, `uid-abc123`. The map is local configuration, read once per process, with no network I/O on the lock path; a broken map raises `DeviceAliasConfigError` before anything is locked or sent. Once a lane holds the lock, the client and the free `liveness_probe` catch three cases the map alone cannot prevent:
 
 - the device is reached under an unlisted second key, held by another lane the device has answered under that key;
 - a listed raw address is held by a process on an older harness, or flocked directly by a wrapper (possibly this process's own parent);

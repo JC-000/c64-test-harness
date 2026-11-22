@@ -107,12 +107,12 @@ The fix is to declare once which spellings are one device:
 
 ```toml
 # ~/.config/c64-test-harness/devices.toml  (or $C64_DEVICE_ALIASES_FILE)
-[devices.601a96]                       # the device's unique_id
+[devices.abc123]                       # the device's unique_id
 hosts = ["10.43.23.81", "10.43.23.83", "u64e.lan"]
 ```
 
 `normalize_device_host()` folds every listed spelling into
-`uid-601a96`. The lockfile, the `/Temp` ledger and `device_lock_holder()`
+`uid-abc123`. The lockfile, the `/Temp` ledger and `device_lock_holder()`
 all use that key, so it reaches every harness path in every project on
 the machine that uses the harness. The lockfile record carries both the
 spelling the holder used (`device_host`) and the folded key
@@ -126,7 +126,7 @@ spelling the holder used (`device_host`) and the folded key
   Network Settings > Unique ID is `Default` (the serial-derived id), a
   value set by hand, or empty (omitted from `/v1/info`). Read it with a
   bodyless `GET /v1/info`, which costs no `/Temp` attachment.
-- **For one-off runs**, `C64_DEVICE_ALIASES="601a96=10.43.23.81,10.43.23.83;..."`
+- **For one-off runs**, `C64_DEVICE_ALIASES="abc123=10.43.23.81,10.43.23.83;..."`
   adds groups. On conflict the environment wins over the file.
 - **Ports.** A port other than the default folds only if it is listed
   literally (`"10.43.23.81:8080"`). `device_key(host, port)` builds
@@ -172,7 +172,7 @@ gets only the raw-lockfile check.
 
 **Retire the #519 stopgap wrapper in the same step that installs the alias
 file.** An upgraded wrapper's `DeviceLock("10.43.23.81")` folds to
-`uid-601a96`, the same key its upgraded child takes, so the child would
+`uid-abc123`, the same key its upgraded child takes, so the child would
 queue behind its own parent until it timed out.
 
 Lanes still on a harness without this change lock the raw address and

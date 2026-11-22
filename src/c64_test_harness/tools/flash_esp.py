@@ -13,7 +13,8 @@ ping and ident afterwards), delete the upload (and its directory if empty), prin
 Exit 0 only when the whole verdict is OK and proven (the ident changed); 3 when the
 flash verified but is unproven (no ident change, e.g. a same-image flash); 1 on a failed or unverified flash
 (the menu's ENTER was sent); 2 on a refusal before it was; 2 also when the DeviceLock
-budget runs out (nothing was touched; 3 is reserved for "flashed, verified, unproven"). After a flash whose result popup never came the
+budget runs out or cannot be read (``--lock-timeout nan``, a malformed
+``U64_DEVICE_LOCK_TIMEOUT``): nothing was touched; 3 is reserved for "flashed, verified, unproven". After a flash whose result popup never came the
 upload and its directory are KEPT (the firmware may still be reading the file).
 
 ``--host`` must be the Ethernet address: the flash stops Wi-Fi.
@@ -68,7 +69,7 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
     a = ap.parse_args(argv)
 
     from ..backends.device_lock import (
-        DeviceLock, DeviceLockTimeout, DeviceLockTimeoutConfigError, resolve_lock_timeout)
+        DeviceLock, DeviceLockTimeout, resolve_lock_timeout)
     from ..backends.unified_manager import DEFAULT_LOCK_TIMEOUT
     from ..backends.ultimate64_client import Ultimate64UnsafeOperationError
     from ..backends.ultimate64_remote_menu import (
@@ -125,15 +126,16 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
             return read_wifi_ident(a.host, poll_interval_s=ident_poll,
                                    menu_factory=lambda host: menu).ident
     local = a.esp.read_bytes()
+    try:
+        budget = resolve_lock_timeout(a.lock_timeout, default=DEFAULT_LOCK_TIMEOUT)
+    except ValueError as exc:   # --lock-timeout nan, or a malformed U64_DEVICE_LOCK_TIMEOUT
+        print(f"REFUSED before the lock, nothing was sent: {exc}", file=sys.stderr)
+        return 2
     lock = (lock_factory or DeviceLock)(a.host)
     try:
-        lock.acquire_or_raise(
-            timeout=resolve_lock_timeout(a.lock_timeout, default=DEFAULT_LOCK_TIMEOUT))
+        lock.acquire_or_raise(timeout=budget)
     except DeviceLockTimeout as exc:
         print(f"refusing to run: {exc}", file=sys.stderr)   # nothing was flashed: 2, not 3
-        return 2
-    except DeviceLockTimeoutConfigError as exc:
-        print(f"REFUSED: {exc}", file=sys.stderr)
         return 2
     uploaded = False
     keep = False

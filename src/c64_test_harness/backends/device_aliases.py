@@ -25,10 +25,10 @@ Sources, merged, with the environment winning on conflict:
   It is user-wide, so every project on this machine that uses the
   harness picks it up::
 
-      [devices.601a96]
+      [devices.abc123]
       hosts = ["10.43.23.81", "10.43.23.83", "u64e.lan"]
 
-* ``C64_DEVICE_ALIASES="601a96=10.43.23.81,10.43.23.83;abcdef=..."``.
+* ``C64_DEVICE_ALIASES="abc123=10.43.23.81,10.43.23.83;abcdef=..."``.
 
 A broken configuration is fatal. A spelling listed under two ids, an empty
 ``hosts`` list, an id that is not a safe filename component, an unknown
@@ -87,7 +87,7 @@ ALIASES_ENV = "C64_DEVICE_ALIASES"
 ALIASES_FILE_ENV = "C64_DEVICE_ALIASES_FILE"
 
 #: Prefix of every canonical key. It keeps an id from ever reading as a
-#: hostname, and lets a ``DeviceLock("uid-601a96")`` name the device directly.
+#: hostname, and lets a ``DeviceLock("uid-abc123")`` name the device directly.
 CANONICAL_PREFIX = "uid-"
 
 #: The firmware's own limit on a hand-entered Unique ID is 16 characters

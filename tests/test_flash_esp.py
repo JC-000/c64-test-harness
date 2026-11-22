@@ -133,7 +133,7 @@ def test_no_popup_is_loud_presses_nothing_and_does_not_retry(make, held):
 
 
 def test_wifi_that_never_comes_back_fails_verification(make, held):
-    fake, menu = make(wifi_after_esp=[{"state": "link-down", "mac": "3C:DC:75:4A:38:60"}])
+    fake, menu = make(wifi_after_esp=[{"state": "link-down", "mac": "02:C6:40:00:00:01"}])
     with pytest.raises(EspFlashVerifyError) as exc:
         _flash(menu, verify_timeout=0.5)
     r = exc.value.result
@@ -519,6 +519,14 @@ def test_cli_a_malformed_lock_timeout_env_exits_2(tmp_path, make, held, monkeypa
     monkeypatch.setenv("U64_DEVICE_LOCK_TIMEOUT", "30m")
     rc, calls, lock, fake = _run_cli(tmp_path, make)
     assert rc == 2 and calls == [] and fake.sessions == []
+
+
+def test_cli_a_nan_lock_timeout_exits_2_before_the_lock(tmp_path, make, held, capsys):
+    """resolve_lock_timeout raises a plain ValueError for an explicit NaN. Kills: that ValueError
+    escaping main() (exit 1 = "failed after the ENTER", although nothing was sent)."""
+    rc, calls, lock, fake = _run_cli(tmp_path, make, extra=["--lock-timeout", "nan"])
+    assert rc == 2 and calls == [] and fake.sessions == []
+    assert lock.timeouts == [] and lock.events == []   # never asked to acquire, so nothing to release
 
 
 def test_cli_a_method_refusal_exits_2(tmp_path, make, held, capsys):
