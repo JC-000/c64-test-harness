@@ -2,20 +2,27 @@
 
     python -m c64_test_harness.tools.flash_esp --host <ETHERNET address> \\
         --esp raw_u64.esp --platform u64e --esp-image-tool /path/to/esp_image.py \\
-        --expect-ident "<ident>" --wifi-ip <module Wi-Fi address> --confirm-module-flash
+        --dest /USB1/espflash/raw_u64.esp --expect-ident "<ident>" \\
+        --wifi-ip <module Wi-Fi address> --confirm-module-flash
 
 Steps: run ``esp_image.py check --platform P file`` (an external tool, given
 by ``--esp-image-tool`` or the ``ESP_IMAGE_TOOL`` environment variable; the
 harness does not carry a copy), take the device's ``DeviceLock``, upload to
 the ``--dest`` path (a writable volume, e.g. ``/USB1/espflash/x.esp``; never
-``/Temp`` or ``/Flash``), run ``Ultimate64RemoteMenu.flash_esp`` (which verifies Wi-Fi,
-ping and ident afterwards), delete the upload (and its directory if empty), print one result line.
-Exit 0 only when the whole verdict is OK and proven (the ident changed); 3 when the
+``/Temp`` or ``/Flash``; an existing file is refused), read the upload back and compare bytes,
+read the module ident with ``read_wifi_ident`` (unless ``--no-ident-probe``), run
+``Ultimate64RemoteMenu.flash_esp`` (which verifies Wi-Fi, ping and ident afterwards), delete the
+upload (and its directory if empty), print one result line.
+Exit 0 only when the whole verdict is OK and proven (the ident changed), or, with
+``--allow-same-ident``, OK with a ping reply; 3 when the
 flash verified but is unproven (no ident change, e.g. a same-image flash); 1 on a failed or unverified flash
 (the menu's ENTER was sent); 2 on a refusal before it was; 2 also when the DeviceLock
 budget runs out or cannot be read (``--lock-timeout nan``, a malformed
-``U64_DEVICE_LOCK_TIMEOUT``): nothing was touched; 3 is reserved for "flashed, verified, unproven". After a flash whose result popup never came the
-upload and its directory are KEPT (the firmware may still be reading the file).
+``U64_DEVICE_LOCK_TIMEOUT``): nothing was touched; 3 is reserved for "flashed, verified, unproven". The
+upload is deleted after a normal return, a failure popup, a verification failure or a refusal
+before the ENTER; after anything else (an interrupt, no popup, an unexpected popup, a session or
+lock lost after the flash) it and its directory are KEPT and the path printed (the firmware may
+still be reading the file).
 
 ``--host`` must be the Ethernet address: the flash stops Wi-Fi.
 """

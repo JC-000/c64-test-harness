@@ -1,13 +1,14 @@
 # Firmware flashing and the Telnet Remote Menu
 
-Three harness APIs can change what an Ultimate device keeps across a
-power cycle. All three are exported at the package root, need the caller
+Four harness APIs can change what an Ultimate device keeps across a
+power cycle. All four are reached from the package root, need the caller
 to hold the device's `DeviceLock` for the whole call, and cost zero
 `/Temp` attachments on any firmware.
 
 | API | Module | What it writes |
 |---|---|---|
-| `Ultimate64RemoteMenu` (#543) | `backends/ultimate64_remote_menu.py` | Its reads write nothing. Its WiFi Disable/Enable writes the WiFi config store to flash on the U64E. `run_update` starts the firmware updater. |
+| `Ultimate64RemoteMenu` (#543) | `backends/ultimate64_remote_menu.py` | Its reads write nothing. Its WiFi Disable/Enable writes the WiFi config store to flash on the U64E. `run_update` starts the firmware updater. `run_task`'s printer Turn On/Off changes the IEC printer setting in RAM and marks the store for a flash save (#566). |
+| `Ultimate64RemoteMenu.flash_esp` (#575) | `backends/ultimate64_remote_menu.py`, CLI `tools/flash_esp.py` | The ESP32 WiFi module's own flash, from a `.esp` image you supply. U64E only. |
 | `flash_firmware` (#561) | `backends/ultimate64_firmware_flash.py` | The firmware, from an update image you supply, and optionally ROMs in `/Flash/roms`. |
 | `save_config_item_to_flash` (#559) | `backends/ultimate64_flash.py` | One config key, and only when it is the only RAM-vs-flash difference. Contract in the c64-test skill's `REFERENCE.md`. |
 
@@ -15,6 +16,9 @@ The API contract (every parameter and error) is in
 `.claude/skills/c64-test/REFERENCE.md`. The short worked patterns are in
 `.claude/skills/c64-test/PATTERNS.md` § "Firmware flash and the Remote
 Menu". This page explains how the pieces fit and what has been measured.
+The bench scripts that load firmware into RAM or over JTAG, or power-cycle
+through a switched outlet, are at the end
+(§ "Bench scripts: RAM-run, JTAG load, outlet power cycle").
 
 ## The Telnet Remote Menu (`Ultimate64RemoteMenu`)
 
@@ -424,3 +428,157 @@ RAM-vs-flash difference among the stores it can compare. Reading flash means
 loading it into RAM, so the comparison has side effects even when it
 refuses. The full contract is in the skill's `REFERENCE.md` § "Guarded
 single-key save to flash (#559)".
+
+## Flashing the ESP32 WiFi module (`flash_esp`)
+
+`Ultimate64RemoteMenu.flash_esp(path, *, expect_ident=None,
+confirm_module_flash=False, ...)` chooses the file browser's
+"Flash into ESP32" action on a `.esp` image that is already on the device
+(`FileTypeESP::execute`). The firmware stops the application, WiFi
+included, flashes the module, shows a result popup, and only then restarts
+the module. The driver answers that popup with exactly one `o`, and only
+when its text is one of the firmware's exact strings: `Flashing ESP32
+Success!`, `Flashing Error -4`, `Flashing Error -5`, `Could not read
+header.`, `Incorrect signature in file.`, `Couldn't alloc mem to load
+segment.` or `Could not switch to download mode.`, with an `Ok`-only button
+row. Anything else raises without a key. By source (not tested live), a
+session that dies does not leave the module in download mode: the popup
+loop ends with the socket and the module restarts. Only "Could not switch to download mode." skips the
+restart.
+
+**The firmware checks nothing.** It does not check the ident or the chip,
+and it does not check that the file was read whole: a truncated upload
+still ends in "Success!". An image identical to the one running looks
+exactly like nothing written. So:
+- check the image before uploading it (the CLI runs an external
+  `esp_image.py check`; the harness carries no copy of that tool);
+- verify the upload's size and hash on the device before the ENTER (the
+  CLI reads it back and compares bytes);
+- read the ident before and after the flash. `EspFlashResult.proven` is
+  true only when both were read and the ident changed. A verified flash
+  whose ident did not change is reported `UNPROVEN`.
+
+**Refused before any connection:** without `confirm_module_flash=True`;
+without the `DeviceLock`; a path that is not a `.esp`, or is on `/Temp` or
+`/Flash`; an `expect_ident` longer than 31 characters (the module reports
+at most 31).
+
+**Refused before the ENTER, after reads:** a driver host that is, or
+resolves to, the module's WiFi address, or that is not the address the
+`Net0` row shows (the flash stops WiFi, so a WiFi session would die
+mid-flash), checked after two read sessions; an `expect_ident` equal to the
+ident before the flash (`allow_same_ident=True` overrides), checked after
+the ident read, which through the CLI is `read_wifi_ident` and so already
+cost two WiFi config flash writes on the U64E; and a file whose menu has no
+"Flash into ESP32" (C64U builds lack it), checked after the navigation keys.
+
+**After the popup** it verifies on fresh sessions: the WiFi row back at Link
+Up, a ping of the module's WiFi address (`ping=False` skips it, and the
+result is then never proven), and the ident against `expect_ident`.
+Errors carry `.result`: `EspFlashFailedError` (a failure popup, answered
+once, never retried), `EspFlashNoPopupError` (no popup in time or the
+device closed the session: nothing pressed, outcome unknown, check the
+module first) and `EspFlashVerifyError` (success popup but WiFi, ping or
+ident failed). An error after the ENTER carries `enter_sent=True`,
+including a `DeviceLock` lost after the flash.
+
+**The CLI** does the whole sequence on a U64E:
+
+```
+python -m c64_test_harness.tools.flash_esp --host <ethernet address> \
+    --esp raw_u64.esp --platform u64e --esp-image-tool /path/to/esp_image.py \
+    --dest /USB1/espflash/raw_u64.esp --expect-ident "<ident>" \
+    --wifi-ip <module WiFi address> --confirm-module-flash
+```
+
+It checks the image with `esp_image.py`, takes the `DeviceLock`
+(`--lock-timeout`, else `U64_DEVICE_LOCK_TIMEOUT`, else 60 s), uploads to
+`--dest` (refusing an existing file), reads the upload back, reads the ident
+with `read_wifi_ident` before and after (never inside the flash window),
+runs `flash_esp`, and prints one result line. It deletes the upload, and its
+directory if empty, after a normal return, a failure popup, a verification
+failure or a refusal before the ENTER. After anything else (an interrupt,
+no popup, an unexpected popup, a session or lock lost after the flash) the
+file is kept and its path printed, because the firmware may still be
+reading it.
+Exit codes: **0** verified and proven (or, with `--allow-same-ident`,
+verified with a ping reply); **3** verified but unproven (no ident change,
+or `--no-ping`); **1** failed or unverified after the ENTER; **2** refused
+before the ENTER, including a `DeviceLock` timeout or an unreadable lock
+budget (`--lock-timeout nan`, a malformed `U64_DEVICE_LOCK_TIMEOUT`).
+
+Costs and limits:
+- Each ident read disables and re-enables WiFi, and on the U64E each toggle
+  writes the WiFi config store to flash, so a default CLI run costs four
+  such writes. The owner kept both reads (2026-11-21): the change of ident
+  is the proof.
+- The firmware's action has no mutex: nothing stops someone starting the
+  same flash from the device's own menu at the same time. Do not touch the
+  keyboard or the menu during the flash window.
+- C64U: out of scope. Its builds have no "Flash into ESP32" action, and
+  the CLI accepts `--platform u64e` only.
+
+**Measured** (U64E over ethernet, 2026-11-21): four tagged-then-restore
+pairs during PR #575's review, every flash `PROVEN`, 61.8-69.4 s each. Run
+4 (on `6535087`) recorded the device at aab1343c2, firmware 3.15a, core
+1.50, and exited 0; run 3 was the same device and day. The ident went
+`ESP32 WiFi Bridge V1.507` → `Taab1343 WiFi Bridge V1.507` → back, WiFi
+came back at Link Up each time, and each upload was read back byte-exact
+before the ENTER. Upstream, GideonZ/1541ultimate#1121 (issue) and its fix
+#1122 (PR), both open, make the action check the image and stop reporting
+"Success!" for an empty or truncated file.
+
+## Bench scripts: RAM-run, JTAG load, outlet power cycle
+
+Three scripts under `scripts/` (#571) load firmware without writing flash,
+or power-cycle a device. They are bench tools, not test steps. Each acts
+only on a device bound in the local `~/.config/c64-test-harness/bench.toml`
+(`[devices.<unique_id>]` tables; `C64_BENCH_BINDINGS_FILE` overrides the
+path) and refuses any other: `ram_run = true` for `ram_run_u64.py`;
+`jtag_adapter_location` and `jtag_adapter_baud` for `jtag_load.py`, plus
+`jtag_scan_only = true` for a device that may only be scanned; `outlet` and
+`outlet_kind` for `power_outlet.py`. The host still reaches its
+`unique_id` through `devices.toml`, so a `bench.toml` table alone binds
+nothing; `docs/development.md` has the details. Each takes the device's `DeviceLock`
+(`ram_run_u64.py` takes its own and refuses to run inside a lock shell;
+`jtag_load.py` and `power_outlet.py` also accept a hold by a verified
+ancestor lock shell). All three are gated by
+`tests/test_u64_runner_script_gates.py`.
+
+- **`ram_run_u64.py run HOST IMAGE --sha256 H --expect-hash G`** runs a
+  U64E application from RAM through Run Update, with no flash write. The
+  flashed application comes back only with a power cycle.
+  - **The image must be a RAM-run build** (`check_ramrun_image`: the app
+    record at `0x3001000`, the stub at `0x3000000`, a `RAMR` parameter
+    block). This is checked before any lock, client or upload. Run Update
+    on a plain `update.u64` *flashes* the device; a plain image passed by
+    mistake on 2026-11-13 did.
+  - The image's SHA-256 is pinned. The upload goes to a USB volume, the
+    Remote Menu browses to the exact file, and `/v1/info` must then report
+    the expected git hash. The upload is deleted afterwards.
+  - The hash change is the only proof that the RAM image started, so a
+    device that already runs the expected hash is refused before the
+    upload. A stronger restart proof is #570.
+- **`jtag_load.py`** loads a `.bit` and an application image into a C64
+  Ultimate over its P5 JTAG header (an ESP32 running esp-jtag), again with
+  no flash write. It checks file SHA-256s, the bitstream's and the live
+  FPGA's IDCODE, the user ID after the load, and the device's identity and
+  git hash afterwards. `$ESP_JTAG_DIR` and `$C64U_TESTS_DIR` must be set;
+  neither has a default.
+- **`power_outlet.py cycle HOST`** cold-cycles a device through a switched
+  outlet (Shelly gen2 or Tasmota), bound in `bench.toml`. Whether it powers
+  the device off first is decided under the lock from the `/v1/info`
+  `product` (#577):
+  - "Ultimate 64" and "Ultimate 64 Elite": a graceful
+    `poweroff(confirm_irrecoverable=True)`, then the cut (`--no-graceful`
+    skips the poweroff). The source shows only that both switch off
+    through the same power register; that they power up again after the
+    cut is not measured (#576).
+  - "C64 Ultimate" and "Ultimate 64-II": the cut only, unless
+    `--c64u-poweroff` is given. A poweroff stores last-state OFF in the
+    module, so the machine then comes back only with power-on mode ON.
+  - Any other product, none, or REST down: the cut only. An explicit
+    `graceful=True` or `--c64u-poweroff` is refused there, before the
+    outlet is switched.
+  - The outlet is never left off: any error after switching it off
+    switches it back on before raising.

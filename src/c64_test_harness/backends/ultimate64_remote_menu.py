@@ -1757,7 +1757,8 @@ class Ultimate64RemoteMenu:
         looks the same as nothing written, so ``ident_before`` is recorded and
         an ``expect_ident`` equal to it is refused (``allow_same_ident``).
         The caller must have verified the upload's size and hash on the
-        device; the CLI does. Verify the image first (``tools.esp_image``), and
+        device; the CLI does. Verify the image first (the CLI runs an external
+        ``esp_image.py check``; the harness carries no copy), and
         this call verifies afterwards (Wi-Fi back on a fresh session, a ping
         of the Wi-Fi IP, the ident).
 
