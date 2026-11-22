@@ -163,7 +163,7 @@ def normalize_device_host(host: str) -> str:
     That would need a DNS lookup in the keying path, which can block for
     seconds and can answer differently over time, and the lock is taken on
     paths that must not do network I/O.  So, unless both are listed in the
-    alias map below, ``c64u.lan`` and ``10.53.21.158`` remain two keys for
+    alias map below, ``c64u.lan`` and ``192.0.2.26`` remain two keys for
     one device.  Pinned for the unlisted case by
     ``tests/test_temp_budget_per_device.py::
     test_a_name_and_an_ip_are_not_merged_documented_limit``.  Keying on a
@@ -2057,7 +2057,7 @@ def device_lock_holder(
     runner that does not otherwise use this package can do::
 
         from c64_test_harness import device_lock_holder
-        if device_lock_holder("10.43.23.81"):
+        if device_lock_holder("192.0.2.81"):
             sys.exit("device busy")
 
     Note what this is **not**: :meth:`DeviceLock.read_info` reads the

@@ -105,7 +105,7 @@ only when the sweep would otherwise delete something.
 **Evidence grade for the exclusion: one device run.** On the C64U (fw
 1.1.0, 2026-10-07, n=1, #427), with `/Temp/temp0003` mounted on drive a,
 the budget sweep before the next `mount_disk` logged `gc_temp_folder: 1
-managed /Temp name(s) on 10.53.21.158 are mounted on a drive and were left
+managed /Temp name(s) on <host> are mounted on a drive and were left
 alone: temp0003`, and the file survived to the unmount. On the U64E (fw
 3.15 `bce4535e`, 2026-09-15, n=1) a raw mount reported `image_file` =
 `/Temp/cache/upload/temp0082`. The deletion this prevents has **not** been
@@ -125,7 +125,7 @@ instead. What the 1541 emulation does when a mounted read-write image's
 backing file disappears is not established.
 
 Verified live on both device generations: originally on the U64E, and
-on the C64U (10.53.21.158, firmware 1.1.0) on 2026-08-21 —
+on the C64U (firmware 1.1.0) on 2026-08-21 —
 `tests/test_temp_gc_live.py` passed end-to-end (repeated `run_prg`
 leaks `temp####` attachments, `gc_temp_folder` trims them to the
 keep-count and is idempotent on a re-run) using the same anonymous-FTP,
@@ -186,7 +186,7 @@ and handlers the same way. Two deliberate conservatisms: `runners:modplay`
 (`&attachment_reu` — the body goes to the REU) and, on the 3.15 line,
 `machine:input` (`&input_json_writer`) are both counted anyway.
 
-Measured live, and the boundary is exact (C64U 10.53.21.158, fw 1.1.0,
+Measured live, and the boundary is exact (C64U, fw 1.1.0,
 `writemem_post_safe=False`, threshold 128, 2026-09-10, under the
 `DeviceLock`, n=1 per arm, every write read back and byte-compared):
 `write_mem` at 64 B and at **exactly 128 B** takes the PUT path and
@@ -717,7 +717,7 @@ from c64_test_harness import Ultimate64Client, liveness_probe, uci_wedge_probe
 from c64_test_harness.backends.ultimate64_helpers import runner_health_check
 from c64_test_harness.backends.ultimate64_client import Ultimate64RunnerStuckError
 
-host, port, password = "10.43.23.81", 80, None
+host, port, password = "<device>", 80, None
 
 # 1. REST liveness — catches Tier 1 (writemem-degraded / TCP wedge)
 result = liveness_probe(host, port, password)

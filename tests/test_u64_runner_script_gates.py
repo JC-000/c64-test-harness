@@ -9,12 +9,11 @@ when someone is running a reduced suite. Nothing here is a live test.
 Issue #243, widened by the 2026-09-11 sweep. Six scripts fell back to a
 hard-coded ``192.168.1.81`` when the caller named no host, and a seventh
 (``rrnet_first_exchange_probe.py``) did ``os.environ.setdefault("U64_HOST",
-"10.43.23.81")`` — inventing a device *and* exporting the live gate, with the
-real bench address baked in. ``192.168.1.81`` belongs to no device on this
-bench (U64E 10.43.23.81, C64U 10.53.21.158), so those defaults did not fail
-cleanly: they reached whatever answers at that address on whatever network
-the machine was on. Two of the scripts exist to put sustained parallel load
-on a device.
+"<bench address>")`` — inventing a device *and* exporting the live gate, with
+a real bench address baked in. ``192.168.1.81`` belongs to no device on this
+bench, so those defaults did not fail cleanly: they reached whatever
+answers at that address on whatever network the machine was on. Two of the
+scripts exist to put sustained parallel load on a device.
 
 Three layers are pinned here:
 
@@ -38,6 +37,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import io
+import ipaddress
 import os
 import sys
 import re
@@ -52,21 +52,216 @@ _SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 #: The address the scripts used to invent. Belongs to no device on this bench.
 _PHANTOM_HOST = "192.168.1.81"
 
-#: Real bench addresses. A script must not carry these as runtime literals
-#: either — a live IP pinned into source is how the phantom got started.
-#: C64U addresses on record: 10.53.21.158 (interface unrecorded),
-#: 10.43.23.158 (WiFi per the owner, 2026-10-12) and ethernet 10.43.23.26
-#: (2026-10-13). A device holds both interfaces at once, so all stay listed.
-_BENCH_HOSTS = ("10.43.23.81", "10.53.21.158", "10.43.23.158", "10.43.23.26")
+#: Documentation addresses (RFC 5737 TEST-NET-2) standing in for two bench
+#: devices in the controls below. They are denied exactly as a real device
+#: address is, so every control runs through the live rule rather than a copy
+#: of it. Two, because some controls need two different devices. No module
+#: may use them as a mock address: they are on the list.
+_STAND_IN_HOSTS = ("198.51.100.81", "198.51.100.158")
 
-_DEVICE_ADDRESSES = (_PHANTOM_HOST, *_BENCH_HOSTS)
+
+def _bench_hosts_from(path: Path, env_value: str = "") -> tuple[str, ...]:
+    """The IPv4 addresses a device alias map lists (#519), sorted.
+
+    *path* is read as ``devices.toml`` and *env_value* as
+    ``$C64_DEVICE_ALIASES``, by the harness's own parsers, so a map the
+    harness refuses is refused here as well. A ``:port`` suffix is dropped.
+    Hostnames are left out: the rule matches dotted-quad tails, and a name
+    such as ``u64.lan`` is a mock host across the suite.
+    """
+    return tuple(sorted({
+        host
+        for host in map(_ipv4_of, _map_spellings(path, env_value))
+        if host is not None
+    }))
+
+
+def _map_spellings(path: Path, env_value: str = "") -> list[str]:
+    """Every host spelling a device alias map lists, by the harness's parsers."""
+    from c64_test_harness.backends import device_aliases
+
+    return list({
+        **device_aliases._parse_file(path, str.strip),
+        **device_aliases._parse_env(env_value, str.strip),
+    })
+
+
+def _ipv4_of(spelling: str) -> str | None:
+    """The IPv4 address *spelling* names, ``:port`` dropped, else ``None``."""
+    host, sep, port = spelling.rpartition(":")
+    if not (sep and port.isdigit()):
+        host = spelling
+    try:
+        ipaddress.IPv4Address(host)
+    except ValueError:
+        return None
+    return host
+
+
+def _load_local_bench_hosts() -> tuple[tuple[str, ...], str | None]:
+    """This machine's device addresses and, if the map is broken, why.
+
+    The reason is the parser's own message, which can quote a host
+    spelling, so it is for tests of the loader only and is never printed.
+    """
+    from c64_test_harness.backends import device_aliases
+
+    try:
+        hosts = _bench_hosts_from(
+            device_aliases.aliases_file_path(),
+            os.environ.get(device_aliases.ALIASES_ENV, ""),
+        )
+    except device_aliases.DeviceAliasConfigError as exc:
+        return (), str(exc)
+    return hosts, None
+
+
+def _device_map_present() -> bool:
+    """Whether this machine configures a device map at all.
+
+    Read separately from the hosts, so that a read which comes back empty
+    cannot also report that there was nothing to read.
+    """
+    from c64_test_harness.backends import device_aliases
+
+    return device_aliases.aliases_file_path().exists() or bool(
+        os.environ.get(device_aliases.ALIASES_ENV, "").strip()
+    )
+
+
+def _device_map_listed() -> tuple[int, int]:
+    """``(IPv4 spellings, other spellings)`` this machine's map lists.
+
+    A second, independent read, so that an emptied host list is told apart
+    from a map that really lists only hostnames. ``(0, 0)`` when the map is
+    absent or refused (the refusal itself is reported by the first read).
+    """
+    from c64_test_harness.backends import device_aliases
+
+    try:
+        spellings = _map_spellings(
+            device_aliases.aliases_file_path(),
+            os.environ.get(device_aliases.ALIASES_ENV, ""),
+        )
+    except device_aliases.DeviceAliasConfigError:
+        return 0, 0
+    ipv4 = sum(1 for s in spellings if _ipv4_of(s) is not None)
+    return ipv4, len(spellings) - ipv4
+
+
+#: Real bench addresses. A script must not carry these as runtime literals
+#: either — a live IP pinned into source is how the phantom got started. They
+#: are read from this machine's device alias map (``$C64_DEVICE_ALIASES_FILE``
+#: or ``~/.config/c64-test-harness/devices.toml``, plus
+#: ``$C64_DEVICE_ALIASES``), never written here: a committed file must not
+#: identify the bench. A device answers on ethernet and WiFi at once, so
+#: every address it is listed under is denied. Read at import, because
+#: conftest swaps in an empty map for each unit test. See
+#: :func:`_local_bench_verdict` for what happens when the read is empty.
+_LOCAL_BENCH_HOSTS, _LOCAL_BENCH_ERROR = _load_local_bench_hosts()
+_LOCAL_BENCH_MAP_PRESENT = _device_map_present()
+_LOCAL_BENCH_MAP_LISTED = _device_map_listed()
+
+_DEVICE_ADDRESSES = (_PHANTOM_HOST, *_STAND_IN_HOSTS, *_LOCAL_BENCH_HOSTS)
+
+#: Env var by which an operator declares this machine must have a device map,
+#: so its absence fails instead of skipping. Mirrors ``C64_REQUIRE_VICE``.
+_REQUIRE_DEVICE_MAP_ENV = "C64_REQUIRE_DEVICE_MAP"
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _device_map_required() -> bool:
+    return os.environ.get(_REQUIRE_DEVICE_MAP_ENV, "").strip().lower() in _TRUTHY
+
+
+def _local_bench_verdict(
+    hosts: tuple[str, ...],
+    error: str | None,
+    present: bool,
+    required: bool,
+    listed: tuple[int, int],
+) -> tuple[str, str]:
+    """``("check" | "skip" | "fail", reason)`` for the local-address test.
+
+    *listed* is ``(IPv4 spellings, other spellings)`` from an independent
+    read of the map. Two cases skip: no map at all (unless one is
+    required), and a map that lists hostnames only, which has no address
+    to deny; failing there would push someone to add addresses to their
+    map. Everything else with an empty list fails: a refused map, a present
+    map that lists nothing, and IPv4 spellings that never reached the list.
+    A skip there would be a green run that checked nothing. No reason
+    quotes the map, since the parser's message can contain an address.
+    """
+    if error is not None:
+        return "fail", (
+            "this machine's device alias map is present but the harness "
+            "refuses it, so no bench address is denied. The parser's message "
+            "is withheld here because it can quote an address; load the map "
+            "with c64_test_harness.backends.device_aliases to see it"
+        )
+    if hosts:
+        return "check", ""
+    ipv4_listed, names_listed = listed
+    if present and names_listed and not ipv4_listed:
+        return "skip", (
+            "this machine's device alias map lists hostnames only, so there is "
+            "no bench address to deny"
+        )
+    if present:
+        return "fail", (
+            "a device alias map is configured but no IPv4 address from it is "
+            "denied: it lists nothing, or its addresses did not reach the list"
+        )
+    if required:
+        return "fail", (
+            f"{_REQUIRE_DEVICE_MAP_ENV} is set and this machine has no device "
+            "alias map, so only the phantom and the stand-ins are denied"
+        )
+    return "skip", (
+        "no device alias map on this machine, so only the phantom and the "
+        f"stand-ins are denied (set {_REQUIRE_DEVICE_MAP_ENV}=1 to fail instead)"
+    )
+
+
+def _tails_for(hosts) -> tuple[str, ...]:
+    """Each address whole and by every tail of two octets or more — the
+    fragments the rules match on — longest first, so masking the whole
+    address wins over masking a tail of it."""
+    return tuple(sorted(
+        {".".join(host.split(".")[i:]) for host in hosts for i in range(3)},
+        key=len,
+        reverse=True,
+    ))
+
+
+#: Every distinctive tail of every local address, for :func:`_redact`.
+_LOCAL_TAILS = _tails_for(_LOCAL_BENCH_HOSTS)
+
+
+def _redact(value):
+    """*value* with every local bench address, whole or by tail, masked.
+
+    Failure messages and pytest's assertion rewriting print whatever an
+    assertion compares, so every report built from scanned text passes
+    through here first: a failing run must not echo a bench address into a
+    log, an issue or a PR body. The line number still says where to look.
+    """
+    if isinstance(value, str):
+        for tail in _LOCAL_TAILS:
+            value = value.replace(tail, "<bench address>")
+        return value
+    if isinstance(value, tuple):
+        return tuple(_redact(v) for v in value)
+    if isinstance(value, list):
+        return [_redact(v) for v in value]
+    return value
 
 
 def _address_tails(minimum_octets: int = 2) -> frozenset[str]:
     """Suffix-anchored fragments of each device address, longest to shortest.
 
-    A literal check catches ``"10.43.23.81"`` and misses ``"10." +
-    "43.23.81"`` — demonstrated, not theorised: a probe script building the
+    A literal check catches ``"198.51.100.81"`` and misses ``"198." +
+    "51.100.81"`` — demonstrated, not theorised: a probe script building the
     address by concatenation, f-string, ``str.join`` and bytes-decode passed
     both rules. Matching *fragments* closes the accidental cases.
 
@@ -101,7 +296,7 @@ def _names_a_device(text: str) -> bool:
     hiding an address. Specifically it will miss:
 
     * an f-string interpolating any part of the address
-      (``f"10.43.23.{n}"``) — the value is not in the source to match;
+      (``f"198.51.100.{n}"``) — the value is not in the source to match;
     * anything computed at runtime — base64, ``chr()`` arithmetic, a
       lookup table, an address read from a file.
 
@@ -171,8 +366,8 @@ def test_resolver_returns_none_when_no_host_is_named(
 def test_resolver_honours_the_environment_verbatim(
     u64_host_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("U64_HOST", "10.43.23.81")
-    assert u64_host_module.resolve_u64_host() == "10.43.23.81"
+    monkeypatch.setenv("U64_HOST", "198.51.100.81")
+    assert u64_host_module.resolve_u64_host() == "198.51.100.81"
 
 
 def test_resolver_treats_an_empty_env_var_as_unset(
@@ -186,13 +381,13 @@ def test_resolver_treats_an_empty_env_var_as_unset(
 def test_explicit_argument_wins_and_says_so(
     u64_host_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("U64_HOST", "10.43.23.81")
+    monkeypatch.setenv("U64_HOST", "198.51.100.81")
     err = io.StringIO()
 
-    host = u64_host_module.resolve_u64_host("10.53.21.158", stderr=err)
+    host = u64_host_module.resolve_u64_host("198.51.100.158", stderr=err)
 
-    assert host == "10.53.21.158"
-    assert "10.43.23.81" in err.getvalue(), (
+    assert host == "198.51.100.158"
+    assert "198.51.100.81" in err.getvalue(), (
         "an argument that overrides an exported U64_HOST must say so: "
         f"{err.getvalue()!r}"
     )
@@ -201,12 +396,12 @@ def test_explicit_argument_wins_and_says_so(
 def test_agreeing_argument_and_env_produce_no_warning(
     u64_host_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("U64_HOST", "10.43.23.81")
+    monkeypatch.setenv("U64_HOST", "198.51.100.81")
     err = io.StringIO()
 
-    host = u64_host_module.resolve_u64_host("10.43.23.81", stderr=err)
+    host = u64_host_module.resolve_u64_host("198.51.100.81", stderr=err)
 
-    assert host == "10.43.23.81"
+    assert host == "198.51.100.81"
     assert err.getvalue() == ""
 
 
@@ -223,8 +418,9 @@ def test_require_refuses_with_exit_2_and_a_message(
     message = err.getvalue()
     assert "U64_HOST" in message, f"refusal must name the variable: {message!r}"
     assert "scripts/whatever.py" in message, "refusal must show how to invoke"
-    assert not any(a in message for a in _DEVICE_ADDRESSES), (
-        f"the refusal must not teach a device address: {message!r}"
+    taught = any(a in message for a in _DEVICE_ADDRESSES)
+    assert not taught, (
+        f"the refusal must not teach a device address: {_redact(message)!r}"
     )
 
 
@@ -234,9 +430,9 @@ def test_require_does_not_export_the_gate_by_default(
     """Only the pytest wrappers hand the gate to a child; nothing else does."""
     monkeypatch.delenv("U64_HOST", raising=False)
 
-    host = u64_host_module.require_u64_host("10.43.23.81")
+    host = u64_host_module.require_u64_host("198.51.100.81")
 
-    assert host == "10.43.23.81"
+    assert host == "198.51.100.81"
     assert "U64_HOST" not in os.environ, (
         "a plain script exported the live gate into its own environment"
     )
@@ -247,9 +443,9 @@ def test_require_exports_the_gate_when_asked(
 ) -> None:
     monkeypatch.delenv("U64_HOST", raising=False)
 
-    u64_host_module.require_u64_host("10.43.23.81", export=True)
+    u64_host_module.require_u64_host("198.51.100.81", export=True)
 
-    assert os.environ["U64_HOST"] == "10.43.23.81"
+    assert os.environ["U64_HOST"] == "198.51.100.81"
 
 
 # ---------------------------------------------------------------------------
@@ -287,13 +483,13 @@ def test_wrapper_honours_a_host_the_caller_already_set(
     stub_pytest_main: list[list[str]],
 ) -> None:
     """``U64_HOST`` from the environment is used as-is, never overwritten."""
-    monkeypatch.setenv("U64_HOST", "10.43.23.81")
+    monkeypatch.setenv("U64_HOST", "198.51.100.81")
     monkeypatch.setattr(sys, "argv", [script])
 
     module = _load(script)
     rc = module.main()
 
-    assert os.environ["U64_HOST"] == "10.43.23.81", (
+    assert os.environ["U64_HOST"] == "198.51.100.81", (
         "the script overrode a host the caller set deliberately"
     )
     assert rc == 0
@@ -308,12 +504,12 @@ def test_wrapper_exports_an_explicit_argument(
 ) -> None:
     """A named host is the caller's consent; export it for the test modules."""
     monkeypatch.delenv("U64_HOST", raising=False)
-    monkeypatch.setattr(sys, "argv", [script, "10.53.21.158"])
+    monkeypatch.setattr(sys, "argv", [script, "198.51.100.158"])
 
     module = _load(script)
     rc = module.main()
 
-    assert os.environ["U64_HOST"] == "10.53.21.158"
+    assert os.environ["U64_HOST"] == "198.51.100.158"
     assert rc == 0
     assert len(stub_pytest_main) == 1
 
@@ -405,8 +601,8 @@ def test_the_scanners_flag_a_known_offender() -> None:
     # Rule 1 (code): a runtime literal, in the two shapes that bite.
     for source in (
         'HOST = "192.168.1.81"\n',
-        'def connect(host="10.43.23.81"):\n    pass\n',  # rule-fixture
-        'transport = T(host="10.53.21.158")\n',  # rule-fixture
+        'def connect(host="198.51.100.81"):\n    pass\n',  # rule-fixture
+        'transport = T(host="198.51.100.158")\n',  # rule-fixture
     ):
         offenders = [
             (lineno, value)
@@ -425,14 +621,14 @@ def test_the_scanners_flag_a_known_offender() -> None:
     # The evasions the reviewer demonstrated with planted probe scripts.
     # A literal-only check passed every one of these; each must now fail.
     for label, source in {
-        "concatenation": 'HOST = "10." + "43.23.81"\n',
-        "concat mid-octet": 'HOST = "10.4" + "3.23.81"\n',
-        "f-string with a literal tail": 'P = "10."\nHOST = f"{P}43.23.81"\n',
-        "str.join over single octets": 'HOST = ".".join(["10","43","23","81"])\n',
-        "bytes decode": 'HOST = b"10.43.23.81".decode()\n',
-        "split at the final octet": 'HOST = "10.43.23." + "81"\n',
+        "concatenation": 'HOST = "198." + "51.100.81"\n',
+        "concat mid-octet": 'HOST = "198.5" + "1.100.81"\n',
+        "f-string with a literal tail": 'P = "198."\nHOST = f"{P}51.100.81"\n',
+        "str.join over single octets": 'HOST = ".".join(["198","51","100","81"])\n',
+        "bytes decode": 'HOST = b"198.51.100.81".decode()\n',
+        "split at the final octet": 'HOST = "198.51.100." + "81"\n',
         "phantom via join": 'HOST = ".".join(("192","168","1","81"))\n',
-        "c64u via concat": 'HOST = "10.53." + "21.158"\n',
+        "second device via concat": 'HOST = "198.51." + "100.158"\n',
     }.items():
         assert any(
             _names_a_device(value)
@@ -442,7 +638,7 @@ def test_the_scanners_flag_a_known_offender() -> None:
     # The documented limit, asserted so it stays a known gap rather than
     # quietly becoming a surprise: an interpolated octet is not in the
     # source and cannot be matched here. The runtime tripwire covers it.
-    interpolated = 'HOST = f"10.43.23.{n}"\n'
+    interpolated = 'HOST = f"198.51.100.{n}"\n'
     assert not any(
         _names_a_device(value)
         for _, value in _runtime_string_literals(interpolated)
@@ -457,6 +653,213 @@ def test_the_scanners_flag_a_known_offender() -> None:
         line for line in prose.splitlines()
         if any(addr in line for addr in _DEVICE_ADDRESSES)
     ], "rule 2 missed an address in a comment"
+
+
+def test_the_local_bench_addresses_are_denied() -> None:
+    """Every address in this machine's device map is caught, by both rules.
+
+    The controls above prove the rules on the stand-ins; this proves the
+    real addresses are on the list they read, whole and constructed.
+
+    Nothing here may print an address. pytest's assertion rewriting echoes
+    the operands of a failing ``assert``, so every check is bound to a bool
+    first and asserted bare, and hosts are named by number.
+    """
+    verdict, reason = _local_bench_verdict(
+        _LOCAL_BENCH_HOSTS,
+        _LOCAL_BENCH_ERROR,
+        _LOCAL_BENCH_MAP_PRESENT,
+        _device_map_required(),
+        _LOCAL_BENCH_MAP_LISTED,
+    )
+    if verdict == "fail":
+        pytest.fail(reason)
+    if verdict == "skip":
+        pytest.skip(reason)
+    # The independent read must agree, or a hostname-only skip could be
+    # reached by a list that was emptied rather than a map without addresses.
+    agrees = _LOCAL_BENCH_MAP_LISTED[0] >= len(_LOCAL_BENCH_HOSTS)
+    assert agrees, "the independent count of the map's IPv4 spellings disagrees with the list"
+    for i, host in enumerate(_LOCAL_BENCH_HOSTS):
+        denied = host in _DEVICE_ADDRESSES
+        assert denied, f"local address #{i} is not denied"
+        head, _, tail = host.partition(".")
+        octets = host.split(".")
+        for shape, source in (
+            ("literal", f'HOST = "{host}"\n'),
+            ("concatenation", f'HOST = "{head}." + "{tail}"\n'),
+            ("join", f'HOST = ".".join({octets!r})\n'),
+            ("f-string tail", f'P = "{head}."\nHOST = f"{{P}}{tail}"\n'),
+        ):
+            caught = any(
+                _names_a_device(value)
+                for _, value in _runtime_string_literals(source)
+            )
+            assert caught, f"rule 1 missed local address #{i} as a {shape}"
+        taught = _names_a_device(f"# U64_HOST={host} python3 scripts/probe_u64.py")
+        assert taught, f"rule 2 missed local address #{i} in a comment"
+
+
+def test_only_a_machine_without_a_device_map_skips_the_local_check() -> None:
+    """The decision behind the local-address test, case by case (TEST-NET only).
+
+    An empty read skips when there was nothing to read, or when the map
+    lists hostnames only (there is no address to deny, and failing would
+    push someone into adding addresses to their map). A refused map, a
+    present map that lists nothing, and a map whose IPv4 spellings never
+    reached the list all fail. ``C64_REQUIRE_DEVICE_MAP=1`` turns only the
+    no-map skip into a failure. No failure reason may carry the parser's
+    message.
+    """
+    hosts = ("192.0.2.81",)
+    secret = 'device id "192.0.2.81" listed twice'
+
+    for present in (True, False):
+        for required in (True, False):
+            assert _local_bench_verdict(hosts, None, present, required, (1, 0))[0] == "check"
+            for listed in ((0, 0), (0, 2), (1, 0)):
+                verdict, reason = _local_bench_verdict((), secret, present, required, listed)
+                assert verdict == "fail"
+                assert "192.0.2.81" not in reason and secret not in reason
+    for required in (True, False):
+        # Present, but nothing parsed out of it.
+        assert _local_bench_verdict((), None, True, required, (0, 0))[0] == "fail"
+        # Present with IPv4 spellings that are not on the list (an emptied read).
+        assert _local_bench_verdict((), None, True, required, (2, 1))[0] == "fail"
+        # Present with hostnames only: nothing to deny.
+        verdict, reason = _local_bench_verdict((), None, True, required, (0, 2))
+        assert verdict == "skip" and "hostname" in reason
+    assert _local_bench_verdict((), None, False, True, (0, 0))[0] == "fail"
+    assert _local_bench_verdict((), None, False, False, (0, 0))[0] == "skip"
+
+
+def test_the_require_device_map_gate_reads_like_the_other_require_gates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for value in ("1", "true", "YES", " on "):
+        monkeypatch.setenv(_REQUIRE_DEVICE_MAP_ENV, value)
+        assert _device_map_required(), value
+    for value in ("", "0", "no", "off"):
+        monkeypatch.setenv(_REQUIRE_DEVICE_MAP_ENV, value)
+        assert not _device_map_required(), value
+    monkeypatch.delenv(_REQUIRE_DEVICE_MAP_ENV)
+    assert not _device_map_required()
+
+
+def test_scan_reports_mask_every_local_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    """:func:`_redact` masks a local address whole and by every tail it is
+    matched on, inside the shapes the scan tests report, and nothing else."""
+    assert _tails_for(("192.0.2.81",)) == ("192.0.2.81", "0.2.81", "2.81")
+    this_module = sys.modules[__name__]
+    monkeypatch.setattr(this_module, "_LOCAL_TAILS", _tails_for(("192.0.2.81",)))
+
+    report = [
+        (3, 'HOST = "192.0.2.81"'),
+        (4, 'HOST = "192.0." + "2.81"'),
+        (5, "x = 1.2"),
+    ]
+    masked = _redact(report)
+    assert masked == [
+        (3, 'HOST = "<bench address>"'),
+        (4, 'HOST = "192.0." + "<bench address>"'),
+        (5, "x = 1.2"),
+    ]
+    assert _redact(("a", 192)) == ("a", 192)
+
+
+def test_scan_failures_do_not_echo_a_local_address(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every scan that can flag a local address fails without printing it.
+
+    A TEST-NET-3 sentinel is made a local address for the duration, planted
+    in a module, and each scan test is called on it. The ``AssertionError``
+    carries pytest's rewritten explanation as well as the message, so this
+    reads exactly what a failing run would print.
+    """
+    sentinel = "203.0.113.250"
+    this_module = sys.modules[__name__]
+    monkeypatch.setattr(this_module, "_DEVICE_ADDRESSES", (*_DEVICE_ADDRESSES, sentinel))
+    monkeypatch.setattr(
+        this_module, "_ADDRESS_TAILS", _ADDRESS_TAILS | set(_tails_for((sentinel,)))
+    )
+    monkeypatch.setattr(this_module, "_LOCAL_TAILS", _tails_for((sentinel,)))
+
+    head, _, tail = sentinel.partition(".")
+    planted = tmp_path / "test_planted_sentinel.py"
+    planted.write_text(
+        "import os\n"
+        f'HOST = "{sentinel}"\n'
+        f'BUILT = "{head}." + "{tail}"\n'
+        f'GATE = os.environ.get("U64_HOST", "{sentinel}")\n'
+        f"# U64_HOST={sentinel} python3 scripts/probe_u64.py\n"
+    )
+    for scan in (
+        test_no_device_address_is_a_runtime_literal,
+        test_no_device_address_is_taught_in_usage_text,
+        test_no_test_module_teaches_a_device_address,
+        test_no_test_module_builds_a_device_address,
+        test_no_import_time_host_read_has_a_default,
+    ):
+        with pytest.raises(AssertionError) as excinfo:
+            scan(planted)
+        report = str(excinfo.value)
+        assert "<bench address>" in report or "line " in report, (
+            f"{scan.__name__} failed without saying where"
+        )
+        echoed = any(fragment in report for fragment in _tails_for((sentinel,)))
+        assert not echoed, f"{scan.__name__} echoed the local address it flagged"
+
+
+def test_the_bench_list_is_read_from_the_device_map(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The list comes from the alias map the harness itself reads.
+
+    File and environment are both read, hostnames are dropped, a port is
+    stripped, a missing file is an empty list, and a map the harness
+    refuses is reported rather than read as empty.
+    """
+    from c64_test_harness.backends import device_aliases
+
+    devices = tmp_path / "devices.toml"
+    devices.write_text(
+        '[devices.abc123]\nhosts = ["192.0.2.81", "192.0.2.83:8080", "u64e.lan"]\n'
+    )
+    assert _bench_hosts_from(devices, "def456=203.0.113.26,c64u.lan") == (
+        "192.0.2.81", "192.0.2.83", "203.0.113.26",
+    )
+    assert _bench_hosts_from(tmp_path / "absent.toml") == ()
+
+    # The import-time loader follows the harness's own file and env lookup.
+    monkeypatch.setenv(device_aliases.ALIASES_FILE_ENV, str(devices))
+    monkeypatch.setenv(device_aliases.ALIASES_ENV, "def456=203.0.113.26")
+    assert _load_local_bench_hosts() == (
+        ("192.0.2.81", "192.0.2.83", "203.0.113.26"), None,
+    )
+
+    broken = tmp_path / "broken.toml"
+    broken.write_text('[devices.abc123]\nhosts = []\n')
+    monkeypatch.setenv(device_aliases.ALIASES_FILE_ENV, str(broken))
+    hosts, error = _load_local_bench_hosts()
+    assert hosts == () and error and "hosts" in error
+
+    # Presence is read on its own: a file that exists, or the env form.
+    monkeypatch.delenv(device_aliases.ALIASES_ENV)
+    assert _device_map_present()
+    monkeypatch.setenv(device_aliases.ALIASES_FILE_ENV, str(tmp_path / "absent.toml"))
+    assert not _device_map_present()
+    monkeypatch.setenv(device_aliases.ALIASES_ENV, "  ")
+    assert not _device_map_present()
+    monkeypatch.setenv(device_aliases.ALIASES_ENV, "def456=c64u.lan")
+    assert _device_map_present()
+
+    # The independent count of what the map lists, by kind.
+    assert _device_map_listed() == (0, 1)
+    monkeypatch.setenv(device_aliases.ALIASES_FILE_ENV, str(devices))
+    assert _device_map_listed() == (2, 2)
+    monkeypatch.setenv(device_aliases.ALIASES_FILE_ENV, str(broken))
+    assert _device_map_listed() == (0, 0)
 
 
 def _runtime_string_literals(source: str) -> list[tuple[int, str]]:
@@ -486,7 +889,7 @@ def _runtime_string_literals(source: str) -> list[tuple[int, str]]:
         if isinstance(node, ast.Constant):
             value = node.value
             if isinstance(value, bytes):
-                # b"10.43.23.81".decode() is a literal wearing a hat.
+                # b"198.51.100.81".decode() is a literal wearing a hat.
                 value = value.decode("utf-8", "replace")
             if isinstance(value, str):
                 found.append((node.lineno, value))
@@ -543,11 +946,11 @@ def test_no_device_address_is_a_runtime_literal(script_path: Path) -> None:
     Ultimate device addresses are denied, because those are the ones a
     script can silently *drive*.
     """
-    offenders = [
+    offenders = _redact([
         (lineno, value)
         for lineno, value in _runtime_string_literals(script_path.read_text())
         if _names_a_device(value)
-    ]
+    ])
     assert offenders == [], (
         f"{script_path.name} picks a device by hard-coded address: {offenders}"
     )
@@ -1114,11 +1517,11 @@ def test_no_device_address_is_taught_in_usage_text(script_path: Path) -> None:
     address.
     """
     source = script_path.read_text()
-    hits = [
+    hits = _redact([
         (i, line.strip())
         for i, line in enumerate(source.splitlines(), 1)
         if _names_a_device(line)
-    ]
+    ])
     assert hits == [], (
         f"{script_path.name} teaches a device address in prose: {hits}"
     )
@@ -1146,8 +1549,7 @@ def _doc_prose_paths() -> list[Path]:
 
 
 #: Suffix tails of the phantom only, three octets and up. Unlike the scans
-#: above this rule does not cover the bench addresses: the docs name those
-#: deliberately (recovery notes, device facts). Two-octet tails are not used
+#: above this rule covers the phantom alone. Two-octet tails are not used
 #: here because a ``1.81`` tail would match version strings in prose.
 #:
 #: **Stated limit:** so a phantom split at the two-octet boundary
@@ -1175,7 +1577,7 @@ def test_no_doc_teaches_the_phantom_host(doc_path: Path) -> None:
     The skill files are what an agent reads before writing a test, so a
     pasted example there becomes a hard-coded host in a new module (#293).
     """
-    hits = _phantom_prose_hits(doc_path.read_text(encoding="utf-8"))
+    hits = _redact(_phantom_prose_hits(doc_path.read_text(encoding="utf-8")))
     assert hits == [], (
         f"{doc_path.relative_to(_REPO)} teaches the phantom device address; "
         f"use a <device> placeholder: {hits}"
@@ -1524,7 +1926,7 @@ def test_an_empty_default_is_not_a_default() -> None:
     rule teaches people to write the incorrect one.
 
     Pinned here because the distinction is the whole difference between
-    ``""`` and ``"10.43.23.81"``, and nothing else in the suite says so.
+    ``""`` and a device address, and nothing else in the suite says so.
     """
     path = Path(__file__).resolve().parent / "test_blind_agent_probe.py"
     source = path.read_text()
@@ -1651,9 +2053,6 @@ _ADDRESS_ALLOWLIST_LINES = {
     ("test_unified_manager.py", "_make_mock_u64_instance(", frozenset({_PHANTOM_HOST})),
     ("test_unified_manager.py", "_parse_u64_hosts(", frozenset({_PHANTOM_HOST})),
     ("test_unified_manager.py", "patch.dict(", frozenset({_PHANTOM_HOST})),
-    # Parametrizes over host strings to prove hygiene is not keyed on the
-    # device's address; the addresses are the test data.
-    ("test_ultimate64_temp_hygiene.py", "for host in (", frozenset({"10.53.21.158", "10.43.23.81"})),
 }
 
 #: The single whole-file exemption, and the only place file granularity is
@@ -1822,7 +2221,7 @@ def test_an_allowlisted_file_is_not_exempt_as_a_whole() -> None:
     needs asserting directly.
     """
     # A line in an allowlisted file matching none of its fragments.
-    regression = 'HOST = "10.53.21.158"'
+    regression = 'HOST = "198.51.100.158"'
     assert _names_a_device(regression)
     assert not _allowed_address_line("test_device_lock.py", regression), (
         "test_device_lock.py is exempt wholesale — one mock string would "
@@ -1836,7 +2235,7 @@ def test_an_allowlisted_file_is_not_exempt_as_a_whole() -> None:
     # ...and an entry is scoped to its address, not just its fragment:
     # "uci_tcp_connect(" was granted for the phantom mock host, so a bench
     # address on such a line is a new regression (review round 1).
-    bench_on_phantom_entry = '    uci_tcp_connect(None, "10.43.23.81", 80)'
+    bench_on_phantom_entry = '    uci_tcp_connect(None, "198.51.100.81", 80)'
     assert _names_a_device(bench_on_phantom_entry)
     assert not _allowed_address_line("test_uci_network.py", bench_on_phantom_entry), (
         "an allowlist entry granted for one address excused a different one"
@@ -1887,12 +2286,12 @@ def test_no_test_module_teaches_a_device_address(module_path: Path) -> None:
     which is where the phantom host came from in the first place. Roughly
     twenty of them taught it.
     """
-    hits = [
+    hits = _redact([
         (i, line.strip())
         for i, line in enumerate(module_path.read_text().splitlines(), 1)
         if _names_a_device(line)
         and not _allowed_address_line(module_path.name, line)
-    ]
+    ])
     assert hits == [], (
         f"{module_path.name} teaches a device address: {hits}"
     )
@@ -1927,7 +2326,7 @@ def _runtime_device_values(path: Path) -> list[tuple[int, str]]:
 )
 def test_no_test_module_builds_a_device_address(module_path: Path) -> None:
     """No test module names a device as a runtime value, however assembled."""
-    offenders = _runtime_device_values(module_path)
+    offenders = _redact(_runtime_device_values(module_path))
     assert offenders == [], (
         f"{module_path.name} carries a device address as a runtime value "
         f"(literal or built from literals): {offenders}"
@@ -2067,7 +2466,7 @@ def _default_rule_paths() -> list[Path]:
 )
 def test_no_import_time_host_read_has_a_default(module_path: Path) -> None:
     """The host is named by the caller or the module stays closed (#275)."""
-    offenders = _host_default_offenders(module_path.read_text())
+    offenders = _redact(_host_default_offenders(module_path.read_text()))
     assert offenders == [], (
         f"{module_path.name} supplies a device host when none is named, so "
         f"its host gate can never close: {offenders}"
@@ -2088,7 +2487,7 @@ def test_the_tests_scans_flag_planted_regressions(tmp_path: Path) -> None:
     joined = sub / "test_planted_join_live.py"
     joined.write_text(
         'import os, pytest\n'
-        '_HOST = os.environ.get("U64_HOST") or ".".join(["10", "43", "23", "81"])\n'
+        '_HOST = os.environ.get("U64_HOST") or ".".join(["198", "51", "100", "81"])\n'
         'pytestmark = pytest.mark.skipif(not _HOST, reason="U64_HOST not set")\n'
     )
     assert _runtime_device_values(joined), "rule 1 missed a joined address in tests/"

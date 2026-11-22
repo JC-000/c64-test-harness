@@ -210,9 +210,9 @@ The steps above build a harness. Moving to a new Mac takes more than that: some 
 
      ```toml
      [devices.abc123]   # C64U (its unique_id): ethernet, WiFi, old address
-     hosts = ["10.43.23.26", "10.43.23.158", "10.53.21.158"]
+     hosts = ["192.0.2.26", "192.0.2.158", "203.0.113.158"]
      [devices.def456]   # U64E (its unique_id): ethernet, WiFi (seen 2026-10-04)
-     hosts = ["10.43.23.81", "10.43.23.83"]
+     hosts = ["192.0.2.81", "192.0.2.83"]
      ```
 
    - `~/.config/c64-test-harness/bench.toml` (or `$C64_BENCH_BINDINGS_FILE`), the bench scripts' per-device bindings, kept in local config rather than in the repo because the id is serial-derived. It has the same `[devices.<unique_id>]` tables but no `hosts`, and it is a separate file because the alias map refuses every key except `hosts`, in every harness version that reads it. `ram_run = true` enables `scripts/ram_run_u64.py`. `jtag_adapter_location` and `jtag_adapter_baud` bind the esp-jtag kit for `scripts/jtag_load.py`; add `jtag_scan_only = true` for a device it may only scan. `outlet` and `outlet_kind` bind `scripts/power_outlet.py`. The scripts still map a host to its `unique_id` through `devices.toml` (`normalize_device_host`), so a `bench.toml` table alone binds nothing: the device's addresses must be listed in the alias map too. A script refuses a device without its keys, and refuses every device when the file is missing, holds an unknown key, or holds a value of the wrong type (`scripts/_bench_bindings.py`). `jtag_load.py extract` touches no device and does not read the file.
@@ -386,12 +386,15 @@ Re-run `./scripts/verify-dev-env.sh` after each step to confirm progress.
 
 ## Live test gates: `C64_REQUIRE_VICE` / `C64_REQUIRE_ELEVATION`
 
-Two env vars, both defined in `tests/conftest.py`, turn a silent skip into a hard failure so a missing prerequisite on CI or a fresh bench cannot pass a mocks-only run as green:
+Three env vars turn a silent skip into a hard failure so a missing prerequisite on CI or a fresh bench cannot pass a mocks-only run as green:
 
 - **`C64_REQUIRE_VICE=1`** — declares that this invocation must exercise a real `x64sc`. Any `@pytest.mark.vice_live` test that would skip for lack of an emulator fails instead, and if the whole run ends without a single live VICE test actually executing (wrong `-k`, an `--ignore`, a stray future `skipif`), the session is failed and escalated to exit status 1 at `pytest_sessionfinish`. Leave it unset for ordinary development runs — the bare skip is the default, and the reason is visible under `-rs`.
 - **`C64_REQUIRE_ELEVATION=1`** — the same idea for the elevated prerequisites host-side ethernet/bridge tests need: raw-network capability for the ethernet `x64sc`: the patched build with an openable `/dev/bpf*` node, or a NOPASSWD sudoers rule for the exact `x64sc` path (`elevation("vice_root")`), NOPASSWD rules for the bridge lifecycle scripts (`elevation("bridge_scripts")`), a usable `/dev/bpf*` node (`elevation("bpf_nodes")`, macOS only), or the bridge interface(s) being present and up (`elevation("bridge_iface")`). Tests carry `@pytest.mark.elevation(kind, **kwargs)`; each kind is probed at most once per session (cached) and, unset, a missing prerequisite is a bare skip whose reason **is** the remedy (the exact `sudo`/`visudo` line, or `sudo chmod o+rw /dev/bpf*`) — no `-rs` needed to see it, because `pytest_sessionfinish` always prints an `ELEVATION REQUIRED: N test(s) skipped` section listing every distinct kind, its count, and its remedy when anything was skipped for elevation. Set the var and a missing prerequisite fails at setup instead (same remedy text), and a green exit status is escalated 0 → 1 (never masking an already-worse INTERRUPTED=2 or INTERNAL_ERROR=3). A mid-fixture refusal — `ViceProcess.start()` raising `ViceElevationRequiredError` because a preflight probe was bypassed with `MACOS_PCAP_ENABLED=1` — is converted the same way by `start_vice_or_skip()`, so it shows up in the same notice.
+- **`C64_REQUIRE_DEVICE_MAP=1`** — the same for the check that every IPv4 address in this machine's device alias map is denied as a hard-coded host: a machine with no map fails instead of skipping. A map that is refused, or lists nothing, fails either way; a map that lists only hostnames skips either way, since the check has no address to deny.
 
-Run both together for a bench that is supposed to be fully wired (e.g. before trusting a "the ethernet suite is green" claim):
+The first two are defined in `tests/conftest.py`; `C64_REQUIRE_DEVICE_MAP` is read by `tests/test_u64_runner_script_gates.py`.
+
+Run `C64_REQUIRE_VICE` and `C64_REQUIRE_ELEVATION` together for a bench that is supposed to be fully wired (e.g. before trusting a "the ethernet suite is green" claim):
 
 ```bash
 C64_REQUIRE_VICE=1 C64_REQUIRE_ELEVATION=1 ~/.local/share/c64-test-harness/venv/bin/pytest tests/test_ethernet.py tests/test_bpf_attach_detection.py -rs
@@ -776,7 +779,7 @@ project's local brief.
 ### Standing hardware-safety clause: the C64U's `/Temp`
 
 Every review also enforces the C64U wedge clause. The C64 Ultimate
-(ethernet 10.43.23.26 since 2026-10-13, fw 1.1.0) predates GideonZ/1541ultimate#686 and never
+(on ethernet since 2026-10-13, fw 1.1.0) predates GideonZ/1541ultimate#686 and never
 collects the managed `/Temp` attachments left by body-carrying REST
 calls. The attachments fill `/Temp`, and a full `/Temp` crashes the device
 firmware, taking REST and the UCI bridge down together; only a physical

@@ -498,7 +498,7 @@ def bring_up_and_ping(target):
     assert read_bytes(t, RESULT, 1) == b"\x01"
 
 
-with create_manager(backend="u64", u64_hosts="10.43.23.81") as mgr:   # the U64E
+with create_manager(backend="u64", u64_hosts="<device>") as mgr:   # the U64E
     with mgr.instance() as target:
         t, client = target.transport, target.client
         # Read the item's default BEFORE the External PUT (#447): exit writes
@@ -639,7 +639,7 @@ A timeout is **never** "the device is broken." If you want to know whether the d
 ```python
 from c64_test_harness import DeviceLock, DeviceLockTimeout
 
-lock = DeviceLock("10.43.23.81")
+lock = DeviceLock("<device>")
 try:
     lock.acquire_or_raise(timeout=120.0)
 except DeviceLockTimeout as e:
@@ -719,7 +719,7 @@ def transport():
 from c64_test_harness import create_manager, DeviceLockTimeout
 
 try:
-    with create_manager(backend="u64", u64_hosts="10.43.23.81", lock_timeout=120.0) as mgr:
+    with create_manager(backend="u64", u64_hosts="<device>", lock_timeout=120.0) as mgr:
         with mgr.instance() as target:
             ...
 except DeviceLockTimeout as e:
@@ -741,8 +741,8 @@ Ask who holds a device **right now** without acquiring — no network traffic, o
 ```python
 from c64_test_harness import device_lock_holder
 
-holder = device_lock_holder("10.43.23.81")
-# -> {"pid": 12345, "ts": 1700000000.0, "device_host": "10.43.23.81"}
+holder = device_lock_holder("<device>")
+# -> {"pid": 12345, "ts": 1700000000.0, "device_host": "<device>"}
 # or None: nobody else holds it (or only this process does, or it can't be read).
 print(holder)
 ```
@@ -976,7 +976,7 @@ from c64_test_harness import create_manager, apply_factory_baseline, U64Baseline
 # No argument needed on a U64E: the reset resolves from the device generation.
 # baseline_on_entry=True/False is the explicit override; U64_BASELINE_ON_ENTRY=1/0
 # (or HarnessConfig.u64_baseline_on_entry / [u64] baseline_on_entry) is the env one.
-with create_manager(backend="u64", u64_hosts="10.43.23.81") as mgr:
+with create_manager(backend="u64", u64_hosts="<device>") as mgr:
     with mgr.instance() as target:       # acquire(): lock -> reset covered categories -> assert current == default
         ...                              # build your state on top; restore_state on exit stays a courtesy
 

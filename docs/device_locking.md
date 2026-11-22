@@ -71,7 +71,7 @@ Two things it does **not** fold on its own:
   on another port as `DeviceLock(device_key(host, port))`, or the lock does
   not cover that client and its lock-release `/Temp` drain never runs.
 - **Two spellings that only the network can relate**: a name and the
-  address it resolves to (`c64u.lan` and `10.53.21.158`), or a device's
+  address it resolves to (`c64u.lan` and `192.0.2.26`), or a device's
   ethernet and WiFi addresses. Folding them automatically needs either a
   DNS lookup or a `GET /v1/info` probe in the path that takes the lock.
   Either can block for seconds, and the probe is aimed at a device that
@@ -108,7 +108,7 @@ The fix is to declare once which spellings are one device:
 ```toml
 # ~/.config/c64-test-harness/devices.toml  (or $C64_DEVICE_ALIASES_FILE)
 [devices.abc123]                       # the device's unique_id
-hosts = ["10.43.23.81", "10.43.23.83", "u64e.lan"]
+hosts = ["192.0.2.81", "192.0.2.83", "u64e.lan"]
 ```
 
 `normalize_device_host()` folds every listed spelling into
@@ -126,10 +126,10 @@ spelling the holder used (`device_host`) and the folded key
   Network Settings > Unique ID is `Default` (the serial-derived id), a
   value set by hand, or empty (omitted from `/v1/info`). Read it with a
   bodyless `GET /v1/info`, which costs no `/Temp` attachment.
-- **For one-off runs**, `C64_DEVICE_ALIASES="abc123=10.43.23.81,10.43.23.83;..."`
+- **For one-off runs**, `C64_DEVICE_ALIASES="abc123=192.0.2.81,192.0.2.83;..."`
   adds groups. On conflict the environment wins over the file.
 - **Ports.** A port other than the default folds only if it is listed
-  literally (`"10.43.23.81:8080"`). `device_key(host, port)` builds
+  literally (`"192.0.2.81:8080"`). `device_key(host, port)` builds
   `host:port` before folding.
 - **A broken map is fatal.** These all raise `DeviceAliasConfigError`
   (`backends/device_aliases.py`) before any lock is tried or any device
@@ -171,7 +171,7 @@ gets only the raw-lockfile check.
 ### Migrating lanes
 
 **Retire the #519 stopgap wrapper in the same step that installs the alias
-file.** An upgraded wrapper's `DeviceLock("10.43.23.81")` folds to
+file.** An upgraded wrapper's `DeviceLock("192.0.2.81")` folds to
 `uid-abc123`, the same key its upgraded child takes, so the child would
 queue behind its own parent until it timed out.
 

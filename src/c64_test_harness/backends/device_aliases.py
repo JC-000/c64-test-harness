@@ -5,7 +5,7 @@ different addresses, and a DHCP lease change, a reflash that resets the
 config, or a switch between the two moves the address while the device
 stays the same. ``DeviceLock`` and the ``/Temp`` ledger key on
 :func:`~c64_test_harness.backends.device_lock.normalize_device_host`, so
-before this module ``10.43.23.81`` and ``10.43.23.83`` were two queues and
+before this module ``192.0.2.81`` and ``192.0.2.83`` were two queues and
 two budgets for one device (#519).
 
 **The alias map** folds every listed spelling into one canonical key,
@@ -26,9 +26,9 @@ Sources, merged, with the environment winning on conflict:
   harness picks it up::
 
       [devices.abc123]
-      hosts = ["10.43.23.81", "10.43.23.83", "u64e.lan"]
+      hosts = ["192.0.2.81", "192.0.2.83", "u64e.lan"]
 
-* ``C64_DEVICE_ALIASES="abc123=10.43.23.81,10.43.23.83;abcdef=..."``.
+* ``C64_DEVICE_ALIASES="abc123=192.0.2.81,192.0.2.83;abcdef=..."``.
 
 A broken configuration is fatal. A spelling listed under two ids, an empty
 ``hosts`` list, an id that is not a safe filename component, an unknown
