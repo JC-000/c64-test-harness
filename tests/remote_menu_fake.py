@@ -52,6 +52,19 @@ What it models, and where each behaviour comes from:
   ones the 1541ultimate lane recorded on the U64E (3.15a,
   ``lanes/async-impl/printer-uaf/hw-uaf-probe.log``, 2026-11-13).
 
+* **Tape** (#584; **source-read at 69a5f83eb, not recorded from a device**):
+  the ``Tape`` task category and its six actions (``TapeController`` /
+  ``TapeRecorder`` ``create_task_items`` and ``update_task_items``), the
+  recorder's file-name prompt (``UIStringBox``: a 27x5 window, the prompt on
+  its first row and the edit field on its third; printable keys are text,
+  RETURN ends it, and it is abandoned when the client disconnects), the
+  capture file it creates in the browser's current directory, the
+  "Tape capture stopped." popup after Finish, and the ``.tap`` context
+  menu with "Start Tape". The Tape category is listed only when one of its
+  actions is shown and enabled, and it never runs an action on being
+  opened, because it holds six actions (``TaskMenu::select_item`` counts
+  hidden ones). Enabled with ``tape=True``.
+
 Knobs on :class:`FakeUltimate` reproduce the bench facts in #543: the mirror
 that does not redraw after ENTER, the modal "SID changed" dialog on a fresh
 session, the password prompt, the session cap.
@@ -86,6 +99,14 @@ UPDATE_EXTENSIONS = ("U64", "UE2", "CFW")
 #: (``iec_printer.cc:345`` at 700c7f2fa).
 STILL_PRINTING = "The page is still printing.\nIt is saved when it is done."
 ESP_ACTION = "Flash into ESP32"
+#: Tape strings, read from tape_recorder.cc / tape_controller.cc /
+#: filetype_tap.cc at 69a5f83eb (source-read, not recorded).
+TAPE_PROMPT = "Give name for tap file.."
+TAPE_STOPPED = "Tape capture stopped."
+TAPE_PLAYER_ACTIONS = ["Pause Tape Playback", "Resume Tape Playback", "Stop Tape Playback"]
+TAPE_RECORDER_ACTIONS = ["Sample tape to TAP", "Capture save to TAP", "Finish Rec. to TAP"]
+TAP_ACTIONS = ["Enter (index)", "Run Tape", "Write to Tape", "Start Tape"]
+TAP_HEADER = b"C64-TAPE-RAW\x01" + bytes(7)
 FILE_ACTIONS = ["Copy to...", "Move to...", "Rename", "Delete"]
 
 
@@ -214,6 +235,34 @@ class FakeUltimate:
         to something else).
     :param refuse_after_commit: once a task action has run, every new
         connection is refused like a device at its session cap.
+    :param tape: model the tape recorder and player (source-read, #584).
+    :param tape_recorder_first: the recorder's actions come before the
+        player's in the Tape category (the order depends on which subsystem
+        creates its task items first, which the source does not fix).
+    :param context_prefix: extra items at the top of every file's context
+        menu, so an action's position differs from its usual one.
+    :param readonly_paths: directories the firmware reports as not writable
+        (the root never is).
+    :param capture_error: the popup a capture's file open fails with.
+    :param capture_data: the pulse bytes a capture has recorded by the time
+        it is finished.
+    :param finish_writes_length: ``False`` leaves the TAP header's length
+        field at zero when the capture is finished.
+    :param finish_popup: the popup Finish shows (``None``: none at all).
+    :param tap_start: what "Start Tape" does: ``"ok"`` or ``"popup:<text>"``.
+    :param box_drops: characters the name prompt drops (a key lost on the way).
+    :param tape_category_runs_capture: opening the Tape category opens the
+        name prompt at once (a build whose category holds a single action).
+    :param tape_renames: ``{source label: label drawn}`` for Tape actions, a
+        build that words an item differently.
+    :param tape_extra_action: one more shown, enabled Tape action that does
+        nothing, under a label the source does not have.
+    :param capture_prompt: what choosing a capture item draws: ``"normal"``
+        (the empty name prompt), ``"none"`` (nothing changes),
+        ``"prefilled:<text>"`` (the prompt with text already in it) or
+        ``"popup:<text>"`` (an ``Ok`` popup instead).
+    :param popup_after_chars: ``(n, text)``: once *n* characters are in the
+        name prompt, an ``Ok`` popup opens over it.
     """
 
     def __init__(
@@ -249,6 +298,21 @@ class FakeUltimate:
         task_key_ignored: bool = False,
         refuse_after_commit: bool = False,
         dead_keys: tuple[str, ...] = (),
+        tape: bool = False,
+        tape_recorder_first: bool = False,
+        context_prefix: tuple[str, ...] = (),
+        readonly_paths: tuple[str, ...] = (),
+        capture_error: str | None = None,
+        capture_data: bytes = bytes([0x30]) * 64,
+        finish_writes_length: bool = True,
+        finish_popup: str | None = TAPE_STOPPED,
+        tap_start: str = "ok",
+        box_drops: str = "",
+        tape_category_runs_capture: bool = False,
+        tape_renames: dict[str, str] | None = None,
+        tape_extra_action: str | None = None,
+        capture_prompt: str = "normal",
+        popup_after_chars: tuple[int, str] | None = None,
     ) -> None:
         self.title = title
         self.root = root if root is not None else [
@@ -310,6 +374,28 @@ class FakeUltimate:
         self.task_key_ignored = task_key_ignored
         self.refuse_after_commit = refuse_after_commit
         self.dead_keys = set(dead_keys)
+        self.tape = tape
+        self.tape_recorder_first = tape_recorder_first
+        self.context_prefix = list(context_prefix)
+        self.readonly_paths = set(readonly_paths)
+        self.capture_error = capture_error
+        self.capture_data = capture_data
+        self.finish_writes_length = finish_writes_length
+        self.finish_popup = finish_popup
+        self.tap_start = tap_start
+        self.box_drops = box_drops
+        self.tape_category_runs_capture = tape_category_runs_capture
+        self.tape_renames = dict(tape_renames or {})
+        self.tape_extra_action = tape_extra_action
+        self.capture_prompt = capture_prompt
+        self.popup_after_chars = popup_after_chars
+        #: file contents by path, for the storage side of a test
+        self.files: dict[str, bytes] = {}
+        #: path of the capture file being recorded, or None
+        self.recording: str | None = None
+        #: path of the tape loaded in the player, or None
+        self.playing: str | None = None
+        self.tape_paused = False
         self.sgr_sel = "0;37;1" if framed else SGR_SEL
         self.sgr_fg = "0;31;2" if framed else SGR_FG
         #: True once Run Update stopped the application: no new connection
@@ -411,7 +497,29 @@ class FakeUltimate:
             if self._pending_wifi:
                 self.wifi = dict(self._pending_wifi.pop(0))
 
-    def tasks(self) -> list[tuple[str, list[tuple[str, bool]]]]:
+    def tape_actions(self, path: str) -> list[tuple[str, bool]]:
+        """The Tape category's shown actions as ``(label, enabled)``, the way
+        ``update_task_items`` of both subsystems leaves them for a task menu
+        opened at *path*."""
+        writable = path != "/" and path not in self.readonly_paths
+        pause, resume, stop = TAPE_PLAYER_ACTIONS
+        if self.playing is None:
+            player = []
+        elif self.tape_paused:
+            player = [(resume, True), (stop, True)]
+        else:
+            player = [(pause, True)]
+        sample, capture, finish = TAPE_RECORDER_ACTIONS
+        if self.recording is not None:
+            recorder = [(finish, True)]
+        else:
+            recorder = [(sample, writable), (capture, writable)]
+        acts = recorder + player if self.tape_recorder_first else player + recorder
+        if self.tape_extra_action is not None:
+            acts.append((self.tape_extra_action, True))
+        return [(self.tape_renames.get(label, label), en) for label, en in acts]
+
+    def tasks(self, path: str = "/") -> list[tuple[str, list[tuple[str, bool]]]]:
         """Categories as ``(name, [(label, enabled)])``, shown items only."""
         if self.printer_on:
             printer = [("Flush/Eject", True), ("Reset", True), ("Turn Off", True)]
@@ -419,6 +527,10 @@ class FakeUltimate:
             printer = [("Flush/Eject", False), ("Reset", False), ("Turn On", True)]
         cats = [("Printer", printer)]
         cats += [(n, [(a, True) for a in acts]) for n, acts in self.task_categories.items()]
+        if self.tape:
+            acts = self.tape_actions(path)
+            if any(en for _, en in acts):      # TaskMenu::init: countActive()
+                cats.insert(1, ("Tape", acts))
         return cats
 
     def esp_restart(self) -> None:
@@ -458,6 +570,8 @@ class _Session:
         self.sub_name = ""
         self.sub_index = 0
         self.progress: str | None = None
+        #: the open string box: [prompt, text typed so far, the action it belongs to]
+        self.box: list | None = None
         #: the progress box's border, left on the wire under a popup
         self.progress_ghost = False
         self.sent = _blank_screen()
@@ -566,6 +680,9 @@ class _Session:
                     self.dev.esp_restart()
                 self.redraw()
             return
+        if self.box is not None:
+            self.box_key(name)
+            return
         if self.menu is not None:
             self.menu_key(name)
             return
@@ -574,7 +691,7 @@ class _Session:
             return
         task_key, page_key = ("F1", "F5") if self.dev.framed else ("F5", "F1")
         if name == task_key and not self.dev.task_key_ignored:
-            self.tasks = self.dev.tasks()
+            self.tasks = self.dev.tasks(self.path)
             self.task_index = 0
             self.redraw()
             return
@@ -620,6 +737,8 @@ class _Session:
         e = self.entries()[self.cursor]
         if self.path == "/":
             return self.dev.wifi_actions() if e[0] == "WiFi" else []
+        if e.kind == "TAP" and self.dev.tape:
+            return self.dev.context_prefix + TAP_ACTIONS + FILE_ACTIONS
         if e.kind == "ESP" and self.dev.esp_actions:
             return [ESP_ACTION] + FILE_ACTIONS
         if e.kind in UPDATE_EXTENSIONS:
@@ -666,15 +785,106 @@ class _Session:
             self.tasks = None
         elif name in ("RIGHT", "ENTER") and not self.dev.task_right_ignored:
             cat, acts = self.tasks[self.task_index]
-            if len(acts) == 1 and acts[0][1]:   # TaskMenu::select_item
+            if cat == "Tape":
+                # Six actions in the category, hidden ones included, so
+                # TaskMenu::select_item never runs one on opening it.
+                if self.dev.tape_category_runs_capture:
+                    self.run_task_action(cat, TAPE_RECORDER_ACTIONS[1])
+                    return
+            elif len(acts) == 1 and acts[0][1]:   # TaskMenu::select_item
                 self.run_task_action(cat, acts[0][0])
                 return
             self.sub, self.sub_name = acts, cat
             self.sub_index = next((i for i, (_, en) in enumerate(acts) if en), 0)
         self.redraw()
 
+    def box_key(self, name: str) -> None:
+        """UIStringEdit::poll: printable keys are text, RETURN ends the box."""
+        prompt, text, label = self.box
+        if name == "ENTER":
+            self.box = None
+            self.tasks = None
+            self.sub = None
+            if text:                      # request_file: (res > 0) && (*buffer)
+                self.start_capture(label, text)
+            self.redraw()
+            return
+        if len(name) == 1 and 32 <= ord(name) < 127:
+            if name not in self.dev.box_drops and len(text) < 22:
+                self.box[1] = text + name
+            after = self.dev.popup_after_chars
+            if after is not None and len(self.box[1]) == after[0]:
+                self.popup = (after[1], ["Ok"])
+            self.redraw()
+
+    def start_capture(self, label: str, text: str) -> None:
+        dev = self.dev
+        fname = text if "." in text else text + ".tap"
+        path = self.path + fname
+        self.log.commits.append((f"Tape/{label}:{fname}", self.path))
+        self.log.commit_times.append(time.monotonic())
+        if dev.capture_error is not None:
+            self.popup = (dev.capture_error, ["Ok"])
+            return
+        if not dev.commit_takes_effect:
+            return
+        with dev._lock:
+            dev.files[path] = TAP_HEADER
+            listing = dev.tree.setdefault(self.path, [])
+            if not any(e.name == fname for e in listing):
+                listing.append(Entry(fname, "TAP", "0K"))
+            dev.recording = path
+
+    def run_tape_action(self, label: str) -> None:
+        dev = self.dev
+        label = {drawn: source for source, drawn in dev.tape_renames.items()}.get(label, label)
+        if label == dev.tape_extra_action:
+            self.log.commits.append((f"Tape/{label}", "tasks"))
+            self.tasks = None
+            self.sub = None
+            self.redraw()
+            return
+        if label in TAPE_RECORDER_ACTIONS[:2]:
+            # request_file: the name prompt first; nothing exists until it ends.
+            mode = dev.capture_prompt
+            if mode == "none":
+                return
+            if mode.startswith("popup:"):
+                self.popup = (mode.split(":", 1)[1], ["Ok"])
+            else:
+                text = mode.split(":", 1)[1] if mode.startswith("prefilled:") else ""
+                self.box = [TAPE_PROMPT, text, label]
+            self.redraw()
+            return
+        self.tasks = None
+        self.sub = None
+        self.log.commits.append((f"Tape/{label}", "tasks"))
+        self.log.commit_times.append(time.monotonic())
+        if dev.commit_takes_effect:
+            with dev._lock:
+                if label == "Finish Rec. to TAP" and dev.recording is not None:
+                    data = dev.capture_data
+                    size = len(data) if dev.finish_writes_length else 0
+                    dev.files[dev.recording] = (
+                        TAP_HEADER[:16] + size.to_bytes(4, "little") + data)
+                    dev.recording = None
+                elif label == "Pause Tape Playback":
+                    dev.tape_paused = True
+                elif label == "Resume Tape Playback":
+                    dev.tape_paused = False
+                elif label == "Stop Tape Playback":
+                    dev.playing = None
+                    dev.tape_paused = False
+        if label == "Finish Rec. to TAP" and dev.finish_popup is not None:
+            self.popup = (dev.finish_popup, ["Ok"])
+        if dev.redraw_after_commit:
+            self.redraw()
+
     def run_task_action(self, cat: str, label: str) -> None:
         dev = self.dev
+        if cat == "Tape":
+            self.run_tape_action(label)
+            return
         self.tasks = None
         self.sub = None
         self.log.commits.append((f"{cat}/{label}", "tasks"))
@@ -710,6 +920,17 @@ class _Session:
             return
         if label == ESP_ACTION:
             self.esp_flash()
+            return
+        if label == "Start Tape":
+            e = self.entries()[self.cursor]
+            if dev.tap_start.startswith("popup:"):
+                self.popup = (dev.tap_start.split(":", 1)[1], ["Ok"])
+            elif dev.commit_takes_effect:
+                with dev._lock:
+                    dev.playing = self.path + e.name
+                    dev.tape_paused = False
+            if dev.redraw_after_commit:
+                self.redraw()
             return
         if dev.commit_takes_effect and label in ("Disable", "Enable"):
             seq = dev.wifi_after_disable if label == "Disable" else dev.wifi_after_enable
@@ -834,6 +1055,13 @@ class _Session:
             self.compose_box(scr, 9, 13, 34, 5, [self.progress.center(32), "", "####"])
         if self.progress_ghost:
             self.compose_box(scr, 9, 13, 34, 5, [])
+        if self.box is not None:
+            # UIStringBox::init: max(prompt, max_len) + 3 wide, 5 rows, centred;
+            # the prompt on the first row, the edit field on the third.
+            prompt, text, _ = self.box
+            width = max(len(prompt), 22) + 3
+            self.compose_box(scr, (HEIGHT - 5) // 2, (WIDTH - width) // 2, width, 5,
+                             [" " + prompt, "", text])
         if self.popup is not None:
             self.compose_popup(scr)
         return scr

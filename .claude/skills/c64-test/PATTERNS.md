@@ -1302,6 +1302,73 @@ them apart, and only for this LOAD if you cleared it first: a LOAD that was
 never run (a dropped key, `?SYNTAX ERROR`) leaves the earlier LOAD's pointer.
 Printing has no such check; compare the printer's output file.
 
+### Tape on an Ultimate-II+: capture, playback, stimulus (#584)
+
+**Ultimate-II+ / II+L only for capture and playback; a 1541 Ultimate-II plays
+tapes but captures only on a dual-drive build.** An Ultimate 64, Ultimate
+64 Elite or C64 Ultimate has no tape hardware (FPGA option; neither bench
+device lists a Tape menu): there these calls raise `TapeUnsupportedError`.
+Run `tape_require_supported(host, directory)` first; `tape_status` alone
+cannot tell "unsupported" from "idle". A directory the firmware will not
+write to also reads as unsupported unless you pass `tap_path=`; then a device
+with a player and no capture item raises `TapeCaptureNotOfferedError` (the
+directory is not writable, or the build has no recorder). **Source-read, never run on a device**
+(menu names from 1541ultimate `69a5f83eb`), and the harness has never been
+run against an Ultimate-II+. Full page: `docs/tape.md`.
+The firmware has no tape REST route, so these go through the Remote Menu
+(telnet) and `storage_*` (FTP). Hold the `DeviceLock` for the whole sequence.
+
+Capture what the C64 writes to the cassette port:
+
+```python
+tape_require_supported(host, "/USB1/captures")                # raises on a U64 / C64U
+stim = build_tape_pulse_stimulus(3000, tap_value=0x30)        # 3000 pulses, 384 cycles each (CPU at 1 MHz)
+cap = tape_capture_start(host, "/USB1/captures", "run1")      # Tape > "Capture save to TAP"
+try:
+    finished = run_tape_stimulus(target, stim, reset=True)    # typed SYS, sleeps, then one read
+finally:
+    res = tape_capture_stop(host, cap)                        # Tape > "Finish Rec. to TAP"
+assert finished and res.status == "ok", res                   # path, size, declared/data length
+near = [p for p in res.tap.pulses() if abs(p - stim.period_cycles) <= 8]
+assert len(near) >= stim.pulses - 1
+```
+
+Play a tape and prove the C64 loaded from it:
+
+```python
+prg = tape_test_program()                                     # valid BASIC at $0801
+storage_put_file(host, "/USB1/captures/known.tap", build_tap_from_prg(prg))
+res = tape_load_and_verify(target.transport, host, "/USB1/captures/known.tap", prg)
+assert res.loaded, res.check
+```
+
+Rules:
+
+- **Never capture to `/Temp` or `/Flash`** (refused before any menu key), never
+  to fill a volume, and always stop a capture in a `finally`: the file grows
+  with every pulse. An existing name is refused; a capture never overwrites.
+- **No memory or screen reads while the 6510 does cassette I/O (#573).** A
+  REST read stops the CPU while the tape hardware runs on, which stretches the
+  pulse being read or written (reasoned from the IEC measurement; not measured
+  for tape). Wait by time, then read. `tape_load_and_verify` and
+  `run_tape_stimulus` do; do not add a `wait_for_text("READY.")` in between.
+- **The cassette buffer `$033C-$03FB` is the KERNAL's during a tape LOAD/SAVE.**
+  No `jsr()`/`run_subroutine` on a U64 (trampoline at `$0360`), no
+  `liveness_probe`/`assert_healthy` (`$0334-$03B3`, and it bypasses the
+  transport policy), no REU extract (`$03C0` park). Start programs with
+  `run_prg_via_sys`. `cassette_buffer_reserved(transport)` reserves the buffer
+  in the transport's `MemoryPolicy` for a block, so a stray
+  `transport.write_memory` raises instead of corrupting the header.
+- **Delete a capture only after `tape_status(host).recording` reads False.**
+  A Tape menu with a label the driver does not know raises instead of reading
+  as idle, and `tape_capture_stop` raises `TapeCaptureNotStoppedError` when it
+  stopped nothing but the file's length field is still zero.
+- **Menu items are chosen by name**; `Stop Tape Playback` exists only while
+  paused, so `tape_stop` pauses first. `tape_status(host).playing` can stay
+  true after a load has finished: it is not a completion signal.
+- A plain `LOAD` relinks BASIC line pointers: load a real BASIC program
+  (`tape_test_program`) or the bytes will not compare equal.
+
 ### Debug stream is rate-capped at 1 MHz-equivalent (turbo gives a 1/N sampled view)
 
 The U64E FPGA emits the UDP debug stream at a fixed rate of **~1.02M bus-cycle entries/sec** (2,842-2,843 packets/sec on the NTSC U64E at 1 MHz, wired host, #432) regardless of the CPU's actual turbo speed. That matches the 6510's native rate at 1 MHz, so `DebugCapture` at 1 MHz is essentially cycle-accurate. At higher turbo speeds you receive a **uniformly sampled 1/N view** of the real bus — at 48 MHz only ~2% of cycles reach the host; turbo speed itself adds no sequence gaps, because the rate limit is at the FPGA source. Measured in `tests/test_u64_debug_stream_speed_live.py`. **`packets_dropped` is not zero in general** (#424): the bench's own loss ran 0.4-45% of packets per 1 s capture, placed at the host's Wi-Fi downlink and load-dependent (#356).

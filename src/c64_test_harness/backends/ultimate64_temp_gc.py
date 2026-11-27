@@ -678,7 +678,8 @@ def lock_shell_refusal(host: str) -> str | None:
 
     For the gates that need the device held for the length of one operation
     but keep no per-process state about it: the FTP storage helpers, the
-    Remote Menu driver and ``read_wifi_ident`` (#582). They ask
+    Remote Menu driver, ``read_wifi_ident`` (#582) and the tape functions
+    (#584). They ask
     :func:`lock_held_for` first and this second, so a child of a lock shell
     (``docs/device_locking.md`` § "Lock shells") passes when the shell is a
     verified ancestor that holds this device's lock right now, and is

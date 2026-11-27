@@ -344,6 +344,9 @@ exactly as before.  Opt in at your own pace:
 * `tests/test_memory_policy.py` — policy semantics by example.
 * `tests/test_transport_memory_policy.py` — confirms the transport
   wiring fires before any byte crosses the wire.
+* `docs/tape.md` § "The cassette buffer and `MemoryPolicy`" — KERNAL tape
+  I/O owns `$033C-$03FB`; `cassette_buffer_reserved()` reserves it in the
+  transport's policy for the duration of a tape operation (#584).
 * `scripts/gen_memory_table.py` — renders the scratch table above from
   `HARNESS_SCRATCH` (`--check` / `--write`); `tests/test_harness_scratch.py`
   pins each entry's bounds to the emitting code.
