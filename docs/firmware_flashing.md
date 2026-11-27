@@ -578,8 +578,10 @@ four are gated by `tests/test_u64_runner_script_gates.py`.
   Without it the run is refused with
   `[adapter] pyserial is needed ...` before any JTAG access: by
   `jtag_load.py` before its lock, and through `volatile_load.py` after
-  the lock and one bodyless `/v1/info` read (its dry run shows it with
-  no lock at all). Moving that refusal before the lock is #591.
+  the lock and the wrapper's own bodyless `/v1/info` reads: one when the
+  device answers, three, 2 s apart, when it does not (its dry run shows
+  the refusal with no lock at all). Moving that refusal before the lock
+  is #591.
 - **`blaster_load_u64.py load HOST ELF --sha256 H --expect-hash G`**
   (#583) reloads a U64 or U64E application over JTAG with
   `nios2-download -g`, through a USB-Blaster-compatible adapter (USB id
