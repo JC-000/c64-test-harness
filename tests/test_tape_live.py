@@ -53,10 +53,12 @@ from c64_test_harness.backends.ultimate64_storage import (
     storage_delete_file,
     storage_mkdir,
     storage_put_file,
+    storage_rmdir,
     storage_writable_volumes,
 )
 from c64_test_harness.backends.ultimate64_tape import (
     TapeCapture,
+    TapeDirectoryNotWritableError,
     TapeUnsupportedError,
     tape_capture_start,
     tape_capture_stop,
@@ -119,7 +121,10 @@ def rig():
     ``create_manager`` holds the ``DeviceLock``; the autouse guard holds it
     too (``allow_nested``). A product without a tape recorder (an Ultimate
     64, 64 Elite or C64 Ultimate) skips the module with the reason
-    ``tape_require_supported`` gives. Teardown stops any capture or playback
+    ``tape_require_supported`` gives, after removing the probe file and the
+    directory if this module created it; a device that has a TAP player but
+    offers no capture in the directory fails instead (the directory is not
+    writable to the firmware). Teardown stops any capture or playback
     this module left running and deletes its two files, each step on its
     own; the capture is deleted only once the device reads "not recording".
     """
@@ -133,11 +138,31 @@ def rig():
             directory = f"/{vols[0]}/{_DIR}"
             capture = TapeCapture(directory, _CAPTURE_NAME,
                                   f"{directory}/{_CAPTURE_NAME}.tap", True)
-            storage_mkdir(_HOST, directory, exist_ok=True)
+            tap_path = f"{directory}/{_TAP_NAME}"
+            created = storage_mkdir(_HOST, directory, exist_ok=True)
+
+            def leave_nothing_behind() -> None:
+                # Nothing ran: take the probe file away again, and the
+                # directory too if this module made it.
+                attempt_steps([
+                    ("delete tap", lambda: storage_delete_file(_HOST, tap_path, missing_ok=True)),
+                    ("remove directory", (lambda: storage_rmdir(_HOST, directory, missing_ok=True))
+                     if created else None),
+                ])
+
+            # The .tap lets the check ask the player too, so a directory the
+            # firmware will not write to is not taken for "no tape hardware".
+            storage_put_file(_HOST, tap_path, build_tap_from_prg(tape_test_program()),
+                             overwrite=True)
             try:
-                product = tape_require_supported(_HOST, directory)
+                product = tape_require_supported(_HOST, directory, tap_path=tap_path)
             except TapeUnsupportedError as exc:
+                leave_nothing_behind()
                 pytest.skip(f"no tape hardware on this device: {exc}")
+            except TapeDirectoryNotWritableError as exc:
+                leave_nothing_behind()
+                pytest.fail(f"the device has tape hardware but {directory} is not writable "
+                            f"to the firmware: {exc}")
             try:
                 for name in (f"{_CAPTURE_NAME}.tap", _TAP_NAME):
                     storage_delete_file(_HOST, f"{directory}/{name}", missing_ok=True)

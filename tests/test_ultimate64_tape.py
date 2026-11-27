@@ -884,3 +884,38 @@ def test_a_wait_that_could_end_early_is_refused_before_any_contact(make, held, k
     with pytest.raises(ValueError):
         ut.tape_load_and_verify(t, HOST, path, prg, menu=menu, sleep=lambda s: None, **kw)
     assert t.log == [] and storage.calls == [] and fake.connect_attempts == 0
+
+
+# ---------------------------------------------------------------------------
+# Round 3 (PR #589 review): "no tape hardware" against "directory not writable"
+# ---------------------------------------------------------------------------
+
+def test_a_player_without_a_capture_item_means_the_directory_is_not_writable(make, held):
+    fake, menu, storage = make(readonly_paths=("/USB1/Backups/",))
+    _, path = _put_tap(fake)
+    with pytest.raises(ut.TapeDirectoryNotWritableError, match="/USB1/Backups") as err:
+        ut.tape_require_supported(HOST, "/USB1/Backups", tap_path=path, menu=menu)
+    assert not isinstance(err.value, ut.TapeUnsupportedError)
+    assert "Ultimate 64 Elite" in err.value.product
+    assert fake.all_commits() == [] and fake.playing is None and _typed(fake) == ""
+
+
+def test_no_capture_item_and_no_player_is_unsupported(make, held):
+    fake, menu, storage = make(tape=False)
+    _, path = _put_tap(fake)
+    with pytest.raises(ut.TapeUnsupportedError):
+        ut.tape_require_supported(HOST, "/USB1/Backups", tap_path=path, menu=menu)
+    assert fake.all_commits() == []
+
+
+def test_without_a_tap_to_ask_the_two_cases_stay_one_error(make, held):
+    fake, menu, storage = make(readonly_paths=("/USB1/Backups/",))
+    with pytest.raises(ut.TapeUnsupportedError, match="not writable"):
+        ut.tape_require_supported(HOST, "/USB1/Backups", menu=menu)
+
+
+def test_a_supported_writable_directory_does_not_open_the_tap(make, held):
+    fake, menu, storage = make()
+    _, path = _put_tap(fake)
+    assert ut.tape_require_supported(HOST, "/USB1/Backups", tap_path=path, menu=menu)
+    assert _enters(fake) == 0

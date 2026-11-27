@@ -1308,7 +1308,9 @@ Printing has no such check; compare the printer's output file.
 64 Elite or C64 Ultimate has no tape hardware (FPGA option; neither bench
 device lists a Tape menu): there these calls raise `TapeUnsupportedError`.
 Run `tape_require_supported(host, directory)` first; `tape_status` alone
-cannot tell "unsupported" from "idle". **Source-read, never run on a device**
+cannot tell "unsupported" from "idle". A directory the firmware will not
+write to also reads as unsupported unless you pass `tap_path=` (then it
+raises `TapeDirectoryNotWritableError`). **Source-read, never run on a device**
 (menu names from 1541ultimate `69a5f83eb`), and the harness has never been
 run against an Ultimate-II+. Full page: `docs/tape.md`.
 The firmware has no tape REST route, so these go through the Remote Menu

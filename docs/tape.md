@@ -25,6 +25,15 @@ look the same (no `Tape` category), so `tape_status` cannot tell them apart.
 `tape_require_supported(host, directory)` can: inside a writable directory a
 product with a recorder always lists a capture item. Call it first.
 
+One case still looks like "unsupported" there: a directory the firmware does
+not treat as writable (a write-protected card, a volume mounted read-only).
+The capture items are then disabled and the menu lists no `Tape` category,
+whatever FTP allows. Pass `tap_path=` with a `.tap` already on the device and
+the TAP player is asked as well, since its menu items do not depend on
+writability: a player without a capture item raises
+`TapeDirectoryNotWritableError` (the device has tape hardware; the directory
+is the problem), and neither raises `TapeUnsupportedError`.
+
 ## Evidence grade
 
 Nothing here has run on a device, and this project's bench has no supported
@@ -58,7 +67,7 @@ under VICE and had not been run when this page was written.
   path check as `storage_put_file` before any menu key. A capture grows with
   every pulse for as long as it runs, so stop it in a `finally`, keep it
   short, and use a volume with ample free space. Do not use a capture to fill
-  a volume; what happens when a write fails mid-capture is not handled here.
+  a volume.
 - **Never overwrite.** The target name must be free (compared without case).
 - **Menu items by name.** The driver reads the menu, finds the label, moves
   the highlight one key at a time and reads it back. It never counts cursor
@@ -139,7 +148,9 @@ with DeviceLock(host):
 `declared_length` (the TAP header's length field), `data_length`, the popup
 the firmware showed, and the parsed file. Statuses: `ok`, `empty` (no pulses),
 `length-mismatch` (the header's length field disagrees with the file),
-`bad-header`, `missing`, `unread`.
+`bad-header`, `missing`, `unread`. With `read_file=False` the header is not
+read, so the still-open check below does not run: `unread` does not show that
+the file is closed.
 
 A capture name is 1 to 18 letters, digits, `_` or `-`; the firmware adds
 `.tap`. Nothing is typed unless an empty name prompt opened, and a popup that

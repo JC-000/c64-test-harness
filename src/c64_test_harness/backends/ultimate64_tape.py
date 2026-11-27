@@ -92,8 +92,7 @@ How the firmware behaves, as read:
 * **A capture never targets** ``/Temp`` **or** ``/Flash``. The target path
   goes through the same check as ``storage_put_file`` before any menu
   action. A capture grows for as long as it runs: stop it, keep it short,
-  and use a volume with ample free space (what happens when a write fails
-  mid-capture is outside this driver). An existing file is never
+  and use a volume with ample free space. An existing file is never
   overwritten: the name must be free.
 * **A name is 1..18 letters, digits,** ``_`` **or** ``-``; the firmware adds
   ``.tap``. Each character typed into the prompt is read back before the
@@ -156,6 +155,7 @@ __all__ = [
     "TapeCapture",
     "TapeCaptureNotStoppedError",
     "TapeCaptureResult",
+    "TapeDirectoryNotWritableError",
     "TapeLoadResult",
     "TapeMenuRejectedError",
     "TapePlayResult",
@@ -238,6 +238,20 @@ class TapeUnsupportedError(Ultimate64RemoteMenuError):
         self.product = product
 
 
+class TapeDirectoryNotWritableError(Ultimate64RemoteMenuError):
+    """The device has a TAP player, so it has tape hardware, but the Tape
+    menu offers no capture in the directory asked about: the firmware does
+    not treat that directory as writable (a write-protected card, a volume
+    mounted read-only), whatever FTP allows there. Raised by
+    :func:`tape_require_supported` when it was given a ``.tap`` to ask the
+    player with. ``product`` is the title the device's screen shows."""
+
+    def __init__(self, message: str, *, product: str,
+                 screen: tuple[str, ...] | None = None) -> None:
+        super().__init__(message, screen=screen)
+        self.product = product
+
+
 class TapeCaptureNotStoppedError(Ultimate64RemoteMenuError):
     """``tape_capture_stop`` found no "Finish Rec. to TAP" to choose, but the
     capture's file still has a zero length field: the recorder writes that
@@ -300,7 +314,9 @@ class TapeCaptureResult:
     * ``"bad-header"``: not a TAP file, or shorter than its header;
     * ``"missing"``: no such file in the directory (``size`` is ``None``);
     * ``"unread"``: listed, but not read back (``read_file=False`` or over
-      :data:`MAX_CAPTURE_READ`); only ``size`` is known.
+      :data:`MAX_CAPTURE_READ`); only ``size`` is known. The header was not
+      read, so the still-open check (:class:`TapeCaptureNotStoppedError`)
+      did not run either: ``"unread"`` does not show that the file is closed.
 
     ``was_recording`` says whether the menu offered "Finish Rec. to TAP";
     ``popup`` is the popup the firmware showed after it (answered with Ok
@@ -549,15 +565,37 @@ class Ultimate64TapeMenu(Ultimate64RemoteMenu):
         finally:
             sess.close()
 
-    def require_recorder(self, parts: list[str]) -> str:
+    def has_player(self, path: str) -> bool:
+        """Whether the ``.tap`` at *path* gets the player's context items.
+
+        They do not depend on where the file is or whether the directory is
+        writable (``FileTypeTap::fetch_context_items``). Opens the file's
+        menu and chooses nothing.
+        """
+        _rm._split_path(path)
+        sess = self._open(f"TAP player check on {path}")
+        try:
+            self._navigate(sess, path)
+            return bool(TAP_FILE_ACTIONS & set(self._open_menu(sess, path).labels))
+        finally:
+            sess.close()
+
+    def require_recorder(self, parts: list[str], tap_path: str | None = None) -> str:
         """Check that the Tape menu inside directory *parts* offers a capture.
 
         With a recorder, a writable directory always lists the Tape
         category with "Capture save to TAP" (or "Finish Rec. to TAP" while
         one runs). Returns the product title; chooses nothing.
 
-        :raises TapeUnsupportedError: no Tape category there, or one without
-            the recorder's items.
+        No capture item has two possible causes that look the same in this
+        menu: no recorder, or a directory the firmware does not treat as
+        writable. With *tap_path* (a ``.tap`` on the device) the player is
+        asked as well, and it does not depend on writability.
+
+        :raises TapeDirectoryNotWritableError: no capture item, but the
+            ``.tap`` at *tap_path* has the player's items.
+        :raises TapeUnsupportedError: no capture item, and no *tap_path* or
+            no player either.
         """
         what = f"tape support check in /{'/'.join(parts)}"
         sess = self._open(what)
@@ -567,15 +605,24 @@ class Ultimate64TapeMenu(Ultimate64RemoteMenu):
             view = self._view(sess)
             product = _product(view.rows)
             labels = _rm._labels(sub) if sub is not None else ()
-            if ACTION_CAPTURE not in labels and ACTION_FINISH not in labels:
-                raise TapeUnsupportedError(
-                    f"{product} at {self.host} offers no tape capture in {shown} (Tape menu: "
-                    f"{list(labels) or 'not listed'}). {_UNSUPPORTED_HINT} On a product that "
-                    "has a recorder this means the directory is not writable.",
-                    product=product, screen=view.rows)
-            return product
         finally:
             sess.close()
+        if ACTION_CAPTURE in labels or ACTION_FINISH in labels:
+            return product
+        seen = f"Tape menu: {list(labels) or 'not listed'}"
+        if tap_path is not None and self.has_player(tap_path):
+            raise TapeDirectoryNotWritableError(
+                f"{product} at {self.host} has tape hardware ({tap_path} gets the TAP "
+                f"player's menu items) but offers no tape capture in {shown} ({seen}): the "
+                "firmware does not treat that directory as writable. Check the medium's "
+                "write protection, or choose another directory.",
+                product=product, screen=view.rows)
+        asked = ("no TAP player either" if tap_path is not None
+                 else "on a product that has a recorder this means the directory is not "
+                      "writable; pass tap_path= to tell the two apart")
+        raise TapeUnsupportedError(
+            f"{product} at {self.host} offers no tape capture in {shown} ({seen}); {asked}. "
+            f"{_UNSUPPORTED_HINT}", product=product, screen=view.rows)
 
     # -- capture --------------------------------------------------------------
     def start_capture(self, parts: list[str], name: str, *, dry_run: bool = False,
@@ -764,7 +811,7 @@ def tape_status(host: str, *, menu: Ultimate64TapeMenu | None = None) -> TapeSta
     return _menu(host, menu).tape_status()
 
 
-def tape_require_supported(host: str, directory: str, *,
+def tape_require_supported(host: str, directory: str, *, tap_path: str | None = None,
                            menu: Ultimate64TapeMenu | None = None) -> str:
     """Check that the device has a tape recorder; return its product title.
 
@@ -772,13 +819,26 @@ def tape_require_supported(host: str, directory: str, *,
     and reads the Tape task menu there, where a product with a recorder
     always lists a capture item. Chooses nothing and creates nothing.
 
-    :raises TapeUnsupportedError: the menu offers no capture there. The
-        error names the product. On an Ultimate 64 / 64 Elite / C64 Ultimate
-        this is always the answer.
+    **A directory the firmware does not treat as writable looks the same
+    as a product without a recorder**: the capture items are disabled, so
+    the menu lists no Tape category. That FTP can write there proves
+    nothing about it. Pass *tap_path*, a ``.tap`` already on the device
+    (``storage_put_file``), and the TAP player is asked too: its menu items
+    do not depend on writability.
+
+    :raises TapeDirectoryNotWritableError: no capture is offered in
+        *directory*, but the file at *tap_path* gets the player's items:
+        the device has tape hardware and the directory is the problem.
+    :raises TapeUnsupportedError: no capture is offered and, with
+        *tap_path*, no player either. Without *tap_path* this is also what
+        a not-writable directory raises; the message says so. On an
+        Ultimate 64 / 64 Elite / C64 Ultimate this is always the answer.
     """
     _require_lock(host, "tape_require_supported")
     parts, _ = _capture_target(directory, "probe")
-    return _menu(host, menu).require_recorder(parts)
+    if tap_path is not None:
+        _rm._split_path(tap_path)
+    return _menu(host, menu).require_recorder(parts, tap_path)
 
 
 def tape_capture_start(host: str, directory: str, name: str, *, dry_run: bool = False,
@@ -828,6 +888,12 @@ def tape_capture_stop(host: str, capture: TapeCapture, *, read_file: bool = True
     ended, then lists the directory for the file's size and, with
     *read_file*, reads it back and checks its TAP header. See
     :class:`TapeCaptureResult` for the statuses.
+
+    :raises TapeCaptureNotStoppedError: Finish was not offered, yet the file
+        read back has a zero length field. This needs the read: with
+        ``read_file=False`` (or a file over :data:`MAX_CAPTURE_READ`) the
+        check is skipped and the status is ``"unread"``, so read
+        :func:`tape_status` before deleting such a file.
     """
     _require_lock(host, "tape_capture_stop")
     _capture_target(capture.directory, capture.name)
