@@ -1304,13 +1304,15 @@ Printing has no such check; compare the printer's output file.
 
 ### Tape on an Ultimate-II+: capture, playback, stimulus (#584)
 
-**Ultimate-II+ / II+L (and 1541 Ultimate-II) only.** An Ultimate 64, Ultimate
+**Ultimate-II+ / II+L only for capture and playback; a 1541 Ultimate-II plays
+tapes but captures only on a dual-drive build.** An Ultimate 64, Ultimate
 64 Elite or C64 Ultimate has no tape hardware (FPGA option; neither bench
 device lists a Tape menu): there these calls raise `TapeUnsupportedError`.
 Run `tape_require_supported(host, directory)` first; `tape_status` alone
 cannot tell "unsupported" from "idle". A directory the firmware will not
-write to also reads as unsupported unless you pass `tap_path=` (then it
-raises `TapeDirectoryNotWritableError`). **Source-read, never run on a device**
+write to also reads as unsupported unless you pass `tap_path=`; then a device
+with a player and no capture item raises `TapeCaptureNotOfferedError` (the
+directory is not writable, or the build has no recorder). **Source-read, never run on a device**
 (menu names from 1541ultimate `69a5f83eb`), and the harness has never been
 run against an Ultimate-II+. Full page: `docs/tape.md`.
 The firmware has no tape REST route, so these go through the Remote Menu

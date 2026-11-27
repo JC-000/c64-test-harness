@@ -525,9 +525,10 @@ that factory; `tests/test_u64_runner_script_gates.py` accepts that shape in
 place of a `with hold_device_lock(...)` block. It takes no lock and waits
 for nothing.
 
-Since #582 three of the harness's own gates accept the same verified claim:
+Since #582 four of the harness's own gates accept the same verified claim:
 the FTP storage helpers (`storage_*`), the Remote Menu driver
-(`Ultimate64RemoteMenu`, every call) and `read_wifi_ident`. Each asks
+(`Ultimate64RemoteMenu`, every call), `read_wifi_ident`, and the tape
+functions (`tape_*`, #584). Each asks
 `lock_held_for` first, which sees only locks this process holds, and then
 `lock_shell_refusal(host)` (`backends/ultimate64_temp_gc.py`), which is
 `None` only when `lock_shell_holds(host)` is true. They ask before every

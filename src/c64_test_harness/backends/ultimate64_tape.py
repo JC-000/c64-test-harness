@@ -1,12 +1,18 @@
 """The Ultimate-II+'s tape recorder and TAP player, driven through the Remote Menu (issue #584).
 
-**Supported products: the Ultimate-II+ and II+L (and the 1541 Ultimate-II),
-in a real C64.** The recorder and the player are FPGA options
-(``CAPAB_C2N_RECORDER``, ``CAPAB_C2N_STREAMER``) that only those builds'
-top levels switch on (``g_c2n_recorder`` / ``g_c2n_streamer`` in
-``u2p_riscv_lattice.vhd``, ``u2p_riscv.vhd``, ``u2p_nios2_solo.vhd``,
-``ultimate_mb_700a.vhd``, ``ultimate_riscv_700a.vhd``). **An Ultimate 64,
-Ultimate 64 Elite or C64 Ultimate has neither**: no top level for them sets
+**Supported products, in a real C64.** The recorder and the player are two
+separate FPGA options (``CAPAB_C2N_RECORDER``, ``CAPAB_C2N_STREAMER``;
+generics ``g_c2n_recorder`` / ``g_c2n_streamer`` in the top levels):
+
+* **Playback** (the player) and **capture** (the recorder): the
+  Ultimate-II+ and II+L (``u2p_riscv_lattice.vhd``, ``u2p_riscv.vhd``,
+  ``u2p_nios2_solo.vhd`` set both).
+* The 1541 Ultimate-II (``ultimate_mb_700a.vhd``,
+  ``ultimate_riscv_700a.vhd``): the player always, the recorder **only on
+  dual-drive builds** (``g_c2n_recorder => g_dual_drive``, default false).
+  A single-drive build can play a tape and cannot capture one.
+
+**An Ultimate 64, Ultimate 64 Elite or C64 Ultimate has neither**: no top level for them sets
 the generics (source-read, not traced exhaustively), and neither of this
 project's bench devices lists a Tape task category (bench observation). On
 those products every capture or playback call here raises
@@ -155,7 +161,7 @@ __all__ = [
     "TapeCapture",
     "TapeCaptureNotStoppedError",
     "TapeCaptureResult",
-    "TapeDirectoryNotWritableError",
+    "TapeCaptureNotOfferedError",
     "TapeLoadResult",
     "TapeMenuRejectedError",
     "TapePlayResult",
@@ -226,10 +232,11 @@ class TapeMenuRejectedError(Ultimate64RemoteMenuError):
 class TapeUnsupportedError(Ultimate64RemoteMenuError):
     """The device shows no tape recorder, or no TAP player.
 
-    The tape hardware is an FPGA option of the Ultimate-II+ / II+L (and
-    1541 Ultimate-II) builds. An Ultimate 64, Ultimate 64 Elite or C64
-    Ultimate has neither part, so its menus never list the items.
-    ``product`` is the title the device's screen shows.
+    The recorder and the player are FPGA options of the Ultimate-II+ /
+    II+L; a 1541 Ultimate-II has the player, and the recorder only on
+    dual-drive builds. An Ultimate 64, Ultimate 64 Elite or C64 Ultimate
+    has neither part, so its menus never list the items. ``product`` is
+    the title the device's screen shows.
     """
 
     def __init__(self, message: str, *, product: str,
@@ -238,13 +245,19 @@ class TapeUnsupportedError(Ultimate64RemoteMenuError):
         self.product = product
 
 
-class TapeDirectoryNotWritableError(Ultimate64RemoteMenuError):
-    """The device has a TAP player, so it has tape hardware, but the Tape
-    menu offers no capture in the directory asked about: the firmware does
-    not treat that directory as writable (a write-protected card, a volume
-    mounted read-only), whatever FTP allows there. Raised by
-    :func:`tape_require_supported` when it was given a ``.tap`` to ask the
-    player with. ``product`` is the title the device's screen shows."""
+class TapeCaptureNotOfferedError(Ultimate64RemoteMenuError):
+    """The device has a TAP player, but the Tape menu offers no capture in
+    the directory asked about. The menus cannot tell these two causes apart:
+
+    * the firmware does not treat that directory as writable (a
+      write-protected card, a volume mounted read-only), whatever FTP
+      allows there; or
+    * this build has the player and no recorder, as a single-drive 1541
+      Ultimate-II does, so no directory will ever offer a capture.
+
+    Playback works either way. Raised by :func:`tape_require_supported`
+    when it was given a ``.tap`` to ask the player with. ``product`` is the
+    title the device's screen shows."""
 
     def __init__(self, message: str, *, product: str,
                  screen: tuple[str, ...] | None = None) -> None:
@@ -403,9 +416,9 @@ def _product(rows: tuple[str, ...]) -> str:
 
 
 _UNSUPPORTED_HINT = (
-    "The tape recorder and TAP player are FPGA options of the Ultimate-II+ / II+L "
-    "(and 1541 Ultimate-II); an Ultimate 64, Ultimate 64 Elite or C64 Ultimate has "
-    "neither.")
+    "The tape recorder and TAP player are FPGA options of the Ultimate-II+ / II+L (a "
+    "1541 Ultimate-II has the player, and the recorder only on dual-drive builds); an "
+    "Ultimate 64, Ultimate 64 Elite or C64 Ultimate has neither.")
 
 
 def _capture_target(directory: str, name: str) -> tuple[list[str], str]:
@@ -592,8 +605,9 @@ class Ultimate64TapeMenu(Ultimate64RemoteMenu):
         writable. With *tap_path* (a ``.tap`` on the device) the player is
         asked as well, and it does not depend on writability.
 
-        :raises TapeDirectoryNotWritableError: no capture item, but the
-            ``.tap`` at *tap_path* has the player's items.
+        :raises TapeCaptureNotOfferedError: no capture item, but the
+            ``.tap`` at *tap_path* has the player's items: a directory that
+            is not writable, or a build with a player and no recorder.
         :raises TapeUnsupportedError: no capture item, and no *tap_path* or
             no player either.
         """
@@ -611,11 +625,13 @@ class Ultimate64TapeMenu(Ultimate64RemoteMenu):
             return product
         seen = f"Tape menu: {list(labels) or 'not listed'}"
         if tap_path is not None and self.has_player(tap_path):
-            raise TapeDirectoryNotWritableError(
-                f"{product} at {self.host} has tape hardware ({tap_path} gets the TAP "
-                f"player's menu items) but offers no tape capture in {shown} ({seen}): the "
-                "firmware does not treat that directory as writable. Check the medium's "
-                "write protection, or choose another directory.",
+            raise TapeCaptureNotOfferedError(
+                f"{product} at {self.host} has a TAP player ({tap_path} gets its menu "
+                f"items) but offers no tape capture in {shown} ({seen}). Either the "
+                "directory is not writable to the firmware (check the medium's write "
+                "protection, or try another directory), or this build has a player and no "
+                "recorder, as a single-drive 1541 Ultimate-II does. Playback is available "
+                "either way.",
                 product=product, screen=view.rows)
         asked = ("no TAP player either" if tap_path is not None
                  else "on a product that has a recorder this means the directory is not "
@@ -826,9 +842,11 @@ def tape_require_supported(host: str, directory: str, *, tap_path: str | None = 
     (``storage_put_file``), and the TAP player is asked too: its menu items
     do not depend on writability.
 
-    :raises TapeDirectoryNotWritableError: no capture is offered in
-        *directory*, but the file at *tap_path* gets the player's items:
-        the device has tape hardware and the directory is the problem.
+    :raises TapeCaptureNotOfferedError: no capture is offered in
+        *directory*, but the file at *tap_path* gets the player's items.
+        Either the directory is not writable to the firmware, or the build
+        has a player and no recorder (a single-drive 1541 Ultimate-II); the
+        menus cannot tell which. Playback works in both cases.
     :raises TapeUnsupportedError: no capture is offered and, with
         *tap_path*, no player either. Without *tap_path* this is also what
         a not-writable directory raises; the message says so. On an
@@ -837,6 +855,8 @@ def tape_require_supported(host: str, directory: str, *, tap_path: str | None = 
     _require_lock(host, "tape_require_supported")
     parts, _ = _capture_target(directory, "probe")
     if tap_path is not None:
+        # has_player checks it too, but only after the Tape-menu session has
+        # run: here a malformed path is refused before any connection.
         _rm._split_path(tap_path)
     return _menu(host, menu).require_recorder(parts, tap_path)
 

@@ -893,9 +893,11 @@ def test_a_wait_that_could_end_early_is_refused_before_any_contact(make, held, k
 def test_a_player_without_a_capture_item_means_the_directory_is_not_writable(make, held):
     fake, menu, storage = make(readonly_paths=("/USB1/Backups/",))
     _, path = _put_tap(fake)
-    with pytest.raises(ut.TapeDirectoryNotWritableError, match="/USB1/Backups") as err:
+    with pytest.raises(ut.TapeCaptureNotOfferedError, match="/USB1/Backups") as err:
         ut.tape_require_supported(HOST, "/USB1/Backups", tap_path=path, menu=menu)
     assert not isinstance(err.value, ut.TapeUnsupportedError)
+    # Both causes the menu cannot tell apart are named, not one of them.
+    assert "not writable" in str(err.value) and "no recorder" in str(err.value)
     assert "Ultimate 64 Elite" in err.value.product
     assert fake.all_commits() == [] and fake.playing is None and _typed(fake) == ""
 
@@ -919,3 +921,10 @@ def test_a_supported_writable_directory_does_not_open_the_tap(make, held):
     _, path = _put_tap(fake)
     assert ut.tape_require_supported(HOST, "/USB1/Backups", tap_path=path, menu=menu)
     assert _enters(fake) == 0
+
+
+def test_a_malformed_tap_path_is_refused_before_any_connection(make, held):
+    fake, menu, storage = make()
+    with pytest.raises(RemoteMenuNotFoundError):
+        ut.tape_require_supported(HOST, "/USB1/Backups", tap_path="USB1/known.tap", menu=menu)
+    assert fake.connect_attempts == 0

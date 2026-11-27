@@ -1,8 +1,8 @@
 """Live test for the tape helpers (issue #584) on an Ultimate-II+ / II+L.
 
 **Never run on a device, and it cannot run on this project's bench.** Tape
-hardware exists only in the Ultimate-II+ / II+L (and 1541 Ultimate-II)
-builds. On an Ultimate 64, Ultimate 64 Elite or C64 Ultimate the ``rig``
+hardware exists only in the Ultimate-II+ / II+L (a 1541 Ultimate-II has the
+player, and the recorder only on dual-drive builds). On an Ultimate 64, Ultimate 64 Elite or C64 Ultimate the ``rig``
 fixture skips the whole module with the reason ``tape_require_supported``
 gives; no test here passes on a device without a recorder. The harness has
 also never been run against an Ultimate-II+, so a failure in the fixture
@@ -58,7 +58,7 @@ from c64_test_harness.backends.ultimate64_storage import (
 )
 from c64_test_harness.backends.ultimate64_tape import (
     TapeCapture,
-    TapeDirectoryNotWritableError,
+    TapeCaptureNotOfferedError,
     TapeUnsupportedError,
     tape_capture_start,
     tape_capture_stop,
@@ -124,7 +124,8 @@ def rig():
     ``tape_require_supported`` gives, after removing the probe file and the
     directory if this module created it; a device that has a TAP player but
     offers no capture in the directory fails instead (the directory is not
-    writable to the firmware). Teardown stops any capture or playback
+    writable to the firmware, or the build has no recorder). Any other error
+    before the yield cleans up the same way and is re-raised. Teardown stops any capture or playback
     this module left running and deletes its two files, each step on its
     own; the capture is deleted only once the device reads "not recording".
     """
@@ -152,17 +153,24 @@ def rig():
 
             # The .tap lets the check ask the player too, so a directory the
             # firmware will not write to is not taken for "no tape hardware".
-            storage_put_file(_HOST, tap_path, build_tap_from_prg(tape_test_program()),
-                             overwrite=True)
             try:
+                storage_put_file(_HOST, tap_path, build_tap_from_prg(tape_test_program()),
+                                 overwrite=True)
                 product = tape_require_supported(_HOST, directory, tap_path=tap_path)
             except TapeUnsupportedError as exc:
                 leave_nothing_behind()
                 pytest.skip(f"no tape hardware on this device: {exc}")
-            except TapeDirectoryNotWritableError as exc:
+            except TapeCaptureNotOfferedError as exc:
                 leave_nothing_behind()
-                pytest.fail(f"the device has tape hardware but {directory} is not writable "
-                            f"to the firmware: {exc}")
+                pytest.fail(f"the device has a TAP player but offers no capture in "
+                            f"{directory}: the directory is not writable to the firmware, or "
+                            f"this build has no recorder (a single-drive 1541 Ultimate-II): "
+                            f"{exc}")
+            except BaseException:
+                # Telnet off, an unexpected screen, a failed upload, Ctrl-C:
+                # the teardown below has not been entered yet.
+                leave_nothing_behind()
+                raise
             try:
                 for name in (f"{_CAPTURE_NAME}.tap", _TAP_NAME):
                     storage_delete_file(_HOST, f"{directory}/{name}", missing_ok=True)

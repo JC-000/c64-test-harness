@@ -7,12 +7,17 @@ need no device and work on any backend.
 
 ## Supported products
 
-**The device functions work only on an Ultimate-II+ or II+L (or a 1541
-Ultimate-II) in a real C64.** The recorder and the player are FPGA options
-(`CAPAB_C2N_RECORDER`, `CAPAB_C2N_STREAMER`) that only those builds switch on
-(`g_c2n_recorder` / `g_c2n_streamer` in `u2p_riscv_lattice.vhd`,
-`u2p_riscv.vhd`, `u2p_nios2_solo.vhd`, `ultimate_mb_700a.vhd`,
-`ultimate_riscv_700a.vhd`).
+The recorder and the player are two separate FPGA options
+(`CAPAB_C2N_RECORDER`, `CAPAB_C2N_STREAMER`; generics `g_c2n_recorder` /
+`g_c2n_streamer` in the top levels), so capture and playback have different
+product lists. All of them mean the cartridge in a real C64.
+
+| Product | Playback (player) | Capture (recorder) | Source |
+|---|---|---|---|
+| Ultimate-II+, II+L | yes | yes | `u2p_riscv_lattice.vhd`, `u2p_riscv.vhd`, `u2p_nios2_solo.vhd` set both |
+| 1541 Ultimate-II, dual-drive build | yes | yes | `ultimate_mb_700a.vhd`, `ultimate_riscv_700a.vhd`: `g_c2n_recorder => g_dual_drive` |
+| 1541 Ultimate-II, single-drive build (the default) | yes | **no** | same files; `g_dual_drive` defaults to false |
+| Ultimate 64, Ultimate 64 Elite, C64 Ultimate | no | no | see below |
 
 **An Ultimate 64, Ultimate 64 Elite or C64 Ultimate has no tape hardware.**
 No top level for them sets those generics (source-read, not traced
@@ -31,8 +36,11 @@ The capture items are then disabled and the menu lists no `Tape` category,
 whatever FTP allows. Pass `tap_path=` with a `.tap` already on the device and
 the TAP player is asked as well, since its menu items do not depend on
 writability: a player without a capture item raises
-`TapeDirectoryNotWritableError` (the device has tape hardware; the directory
-is the problem), and neither raises `TapeUnsupportedError`.
+`TapeCaptureNotOfferedError`, and neither raises `TapeUnsupportedError`.
+`TapeCaptureNotOfferedError` has two possible causes that the menus cannot
+tell apart: the directory is not writable to the firmware, or the build has a
+player and no recorder (a single-drive 1541 Ultimate-II). Playback works in
+both.
 
 ## Evidence grade
 
