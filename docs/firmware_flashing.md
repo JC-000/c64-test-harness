@@ -648,8 +648,8 @@ four are gated by `tests/test_u64_runner_script_gates.py`.
     with exit 3: the tool returned 0 and the device answers, as it did
     before. **Measured on a U64E (3.15a), 2026-11-27, n=1:** a same-hash
     reload of an answering box ended exactly so (`rest_drop_seen` false
-    over the 90 s watch, download exit 0), so on this device a same-image
-    JTAG reload cannot be proven by a REST outage; expect exit 3 for it.
+    over the 90 s watch, download exit 0): that same-image JTAG reload
+    was not proven by a REST outage (n=1); expect exit 3.
   - `--dry-run` runs the local checks, prints the plan and sends nothing.
     Exit 0 is loaded and proven, 3 loaded but unproven, 2 refused or failed.
   - **Run on a device once** (U64E 3.15a, 2026-11-27, n=1 per case):
