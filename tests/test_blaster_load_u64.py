@@ -684,6 +684,32 @@ def test_a_same_hash_load_is_proven_only_by_a_rest_drop(env):
     assert rec["result"] == "ok" and rec["restart_proof"] == "rest-drop" and rec["rest_drop_seen"] is True
 
 
+def pauses(ev):
+    """An injected sleep that records each pause among the other events."""
+    return lambda seconds: ev.append(("sleep", seconds))
+
+
+def test_the_three_dark_probes_are_a_second_apart(env):
+    """Three refused connections in one burst are not an outage: the criterion has a duration."""
+    ev = env[0]
+    reload_(env, [None, None, None, None, info(HASH)], dark=True, sleep=pauses(ev))
+    assert ev[2:8] == [("info", None), ("sleep", 1.0), ("info", None), ("sleep", 1.0), ("info", None), ("tools",)]
+
+
+def test_the_three_misses_of_a_drop_are_a_second_apart(env):
+    ev = env[0]
+    rec = reload_(env, [info(HASH), None, None, None, info(HASH)], sleep=pauses(ev))
+    after = ev[ev.index(("download",)) + 1:]
+    assert after[:7] == [("info", None), ("sleep", 1.0)] * 3 + [("info", HASH)]
+    assert rec["restart_proof"] == "rest-drop"
+
+
+def test_blank_lines_in_the_chain_listing_are_not_unknown_lines(env):
+    chain = "\n" + CHAIN.replace("    Node 0C006E00", "\n    Node 0C006E00") + "\n\n"
+    rec = reload_(env, [info(OLD), info(HASH)], Remote(env[0], chain=(0, chain, "")))
+    assert rec["result"] == "ok" and rec["cable"] == "USB-Blaster [1-1]"
+
+
 def test_three_misses_with_an_answer_between_them_are_not_a_drop(env):
     """Packet loss is not an outage: the three misses must be consecutive."""
     rec = reload_(env, [info(HASH), None, None, info(HASH), None, info(HASH)])
