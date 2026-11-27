@@ -46,7 +46,10 @@ dependencies, so the protocol is written here. 1541ultimate's
 * **Only allow-listed keys reach the wire**: the cursor keys, VT100
   PageUp/PageDown (``ESC[5~``/``ESC[6~``, which every build maps the same
   way), ENTER as a bare CR, ``o`` for an ``Ok`` popup, and one F-key, only
-  in the browser, to open the task menu. The F-keys mean different things
+  in the browser, to open the task menu; and, into a file-name box that the
+  screen shows and nowhere else, letters, digits, ``_`` and ``-`` one at a
+  time, each read back before the next (the tape recorder's prompt,
+  ``backends/ultimate64_tape.py``, #584). The F-keys mean different things
   per build (``UserInterface::keymapper``): the task menu is F5 on the
   Ultimate line and F1 on the ``COMMODORE`` build (1.1.0), where F5 is
   PageDown, so the driver picks the key from the layout it reads (framed =
@@ -255,6 +258,14 @@ _KEYS: dict[str, bytes] = {
     "F1": b"\x1b[11~",
     "F5": b"\x1b[15~",
 }
+
+#: The characters :meth:`_Session.type_char` may send, one at a time, and only
+#: into a string box the caller has just read on the screen (the tape
+#: recorder's file-name prompt, #584). A string box reads the keyboard
+#: directly (``UIStringEdit::poll``), so there a letter is text; anywhere
+#: else it would be a key.
+_TEXT_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
 
 # Telnet (RFC 854): parsed and discarded, never answered.
 _IAC, _DONT, _DO, _WONT, _WILL, _SB, _SE = 255, 254, 253, 252, 251, 250, 240
@@ -999,6 +1010,20 @@ class _Session:
         payload = _KEYS[key]
         self.keys.append(key)
         self._write(payload)
+
+    def type_char(self, ch: str) -> int:
+        """Send one character of :data:`_TEXT_CHARS` and read the redraw.
+
+        Only for a string box the caller has read on this session's screen;
+        the caller reads the box back after every character.
+        """
+        if len(ch) != 1 or ch not in _TEXT_CHARS:
+            raise Ultimate64RemoteMenuError(
+                f"refusing to type {ch!r}: only letters, digits, '_' and '-' are sent "
+                "as text")
+        self.keys.append(f"TEXT:{ch}")
+        self._write(ch.encode("ascii"))
+        return self.drain(expect=True)
 
     def close(self) -> None:
         try:
