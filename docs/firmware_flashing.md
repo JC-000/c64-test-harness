@@ -492,7 +492,10 @@ python -m c64_test_harness.tools.flash_esp --host <ethernet address> \
 ```
 
 It checks the image with `esp_image.py`, takes the `DeviceLock`
-(`--lock-timeout`, else `U64_DEVICE_LOCK_TIMEOUT`, else 60 s), uploads to
+(`--lock-timeout`, else `U64_DEVICE_LOCK_TIMEOUT`, else 60 s; joined when
+the calling process already holds it, and not taken under a verified lock
+shell, whose claim is refused with exit 2 before anything is sent when it
+does not hold: `docs/device_locking.md` § "Lock shells"), uploads to
 `--dest` (refusing an existing file), reads the upload back, reads the ident
 with `read_wifi_ident` before and after (never inside the flash window),
 runs `flash_esp`, and prints one result line. It deletes the upload, and its
@@ -539,11 +542,12 @@ path) and refuses any other: `ram_run = true` for `ram_run_u64.py`;
 `jtag_scan_only = true` for a device that may only be scanned; `outlet` and
 `outlet_kind` for `power_outlet.py`. The host still reaches its
 `unique_id` through `devices.toml`, so a `bench.toml` table alone binds
-nothing; `docs/development.md` has the details. Each takes the device's `DeviceLock`
-(`ram_run_u64.py` takes its own and refuses to run inside a lock shell;
-`jtag_load.py` and `power_outlet.py` also accept a hold by a verified
-ancestor lock shell). All three are gated by
-`tests/test_u64_runner_script_gates.py`.
+nothing; `docs/development.md` has the details. Each takes the device's `DeviceLock`,
+joins it when the calling process already holds it (`allow_nested`), and
+takes none under a verified ancestor lock shell (since #582 that includes
+`ram_run_u64.py`: the storage helpers and the Remote Menu driver it uses
+accept the same claim; `docs/device_locking.md` § "Lock shells"). All
+three are gated by `tests/test_u64_runner_script_gates.py`.
 
 - **`ram_run_u64.py run HOST IMAGE --sha256 H --expect-hash G`** runs a
   U64E application from RAM through Run Update, with no flash write. The

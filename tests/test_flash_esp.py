@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from c64_test_harness.backends.ultimate64_remote_menu import (
 )
 from c64_test_harness.tools import flash_esp as cli
 
+from lock_shell_fake import FORGED_IDS, FORGED_KW, fake_lock_shell, forge
 from remote_menu_fake import FakeUltimate
 
 FAST = RemoteMenuTiming(connect_timeout=2.0, first_byte_timeout=0.5, idle_gap=0.03,
@@ -237,7 +239,7 @@ class _Lock:
 
 def _run_cli(tmp_path, make, extra=(), dest="/USB1/espflash/raw_u64.esp", checker=None, readback=None,
              ident_probe=None, confirm=True, lock_raises=None, put_raises=None, get_raises=None,
-             ping=lambda ip: True, menu_patch=None, **fake_kw):
+             ping=lambda ip: True, menu_patch=None, own_lock=False, **fake_kw):
     fake, menu = make(**fake_kw)
     if menu_patch is not None:
         menu_patch(menu)
@@ -266,7 +268,7 @@ def _run_cli(tmp_path, make, extra=(), dest="/USB1/espflash/raw_u64.esp", checke
         ident_probe=ident_probe, ident_poll=0.05,
         delete=lambda host, dest, **kw: calls.append(("delete", dest)),
         rmdir=lambda host, d, **kw: calls.append(("rmdir", d)),
-        lock_factory=lambda host: lock,
+        lock_factory=None if own_lock else (lambda host: lock),   # own_lock: the CLI's real DeviceLock
         checker=checker or (lambda t, p, f: (True, f"OK {p}")))
     return rc, calls, lock, fake
 
@@ -747,3 +749,52 @@ def test_cli_a_lock_lost_after_the_flash_is_rc_1_and_keeps_the_upload(tmp_path, 
     cap = capsys.readouterr()
     assert rc == 1 and _deleted(calls) == [] and "nothing was flashed" not in cap.err
     assert "KEPT" in cap.out
+
+
+# -- a DeviceLock the caller already holds (#582) ------------------------------
+
+def test_cli_joins_a_lock_this_process_already_holds(tmp_path, make, held, monkeypatch):
+    """A driver holds the device's lock and calls main(): the CLI's own DeviceLock joins that hold instead of
+    waiting on it, whatever the lock-shell variables say, and the driver still holds it on return."""
+    import c64_test_harness.backends.device_lock as dl
+    monkeypatch.setattr(dl, "_default_lock_dir", lambda create=True: tmp_path / "locks")   # the dir `held` uses
+    monkeypatch.setenv("U64_DEVICE_LOCK_TIMEOUT", "3")
+    monkeypatch.setenv("C64U_LOCK_PID", str(os.getpid()))    # a driver that is a lock shell for its children
+    monkeypatch.setenv("C64U_LOCK_HOST", "127.0.0.1")
+    seq = iter(["OLD", "NEW"])
+    rc, calls, lock, fake = _run_cli(tmp_path, make, ident_probe=lambda: next(seq), own_lock=True)
+    assert rc == 0 and fake.all_commits() == [("Flash into ESP32", "/USB1/espflash/")]
+    assert dl.held_by_this_process_in_any_dir("127.0.0.1")
+    held.release()                      # one reference was the driver's: the lock is free after it, not before
+    try:
+        assert not dl.held_by_this_process_in_any_dir("127.0.0.1")
+    finally:
+        assert held.acquire(timeout=5)  # for the fixture's own release
+
+
+def test_cli_under_a_verified_lock_shell_takes_no_lock(tmp_path, make, monkeypatch):
+    """The shell (an ancestor, the lockfile's holder) is the hold: nothing is acquired here, and the menu driver
+    accepts the same claim although this process holds nothing."""
+    fake_lock_shell(monkeypatch, "127.0.0.1")
+    seq = iter(["OLD", "NEW"])
+    rc, calls, lock, fake = _run_cli(tmp_path, make, ident_probe=lambda: next(seq))
+    assert rc == 0 and fake.all_commits() == [("Flash into ESP32", "/USB1/espflash/")]
+    assert lock.events == [] and lock.timeouts == []
+    assert [c[0] for c in calls] == ["put", "delete", "rmdir"]
+
+
+@pytest.mark.parametrize("kw", FORGED_KW, ids=FORGED_IDS)
+def test_cli_a_lock_shell_claim_that_does_not_hold_exits_2_before_anything(tmp_path, make, monkeypatch, capsys, kw):
+    forge(monkeypatch, "127.0.0.1", kw)
+    rc, calls, lock, fake = _run_cli(tmp_path, make, ident_probe=lambda: "x")
+    assert rc == 2 and calls == [] and lock.events == [] and fake.sessions == []
+    assert "nothing was sent" in capsys.readouterr().err
+
+
+def test_cli_a_lock_shell_for_another_device_does_not_cover_this_one(tmp_path, make, held, monkeypatch):
+    """The fake names the shell as holder of every lockfile: only C64U_LOCK_HOST keeps its hold off this device,
+    so the CLI takes the lock itself."""
+    fake_lock_shell(monkeypatch, "192.0.2.99")
+    seq = iter(["OLD", "NEW"])
+    rc, calls, lock, fake = _run_cli(tmp_path, make, ident_probe=lambda: next(seq))
+    assert rc == 0 and lock.events == ["acquire", "release"]

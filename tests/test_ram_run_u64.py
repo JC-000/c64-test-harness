@@ -13,9 +13,10 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts"))
 import jtag_load as jl  # noqa: E402
 import ram_run_u64 as rr  # noqa: E402
-from c64_test_harness.backends.device_lock import DeviceLock  # noqa: E402
+from c64_test_harness.backends.device_lock import DeviceLock, held_by_this_process_in_any_dir  # noqa: E402
 from c64_test_harness.backends.ultimate64_remote_menu import (  # noqa: E402
     RemoteMenuTiming, Ultimate64RemoteMenu)
+from lock_shell_fake import FORGED_IDS, FORGED_KW, fake_lock_shell, forge  # noqa: E402
 from remote_menu_fake import Entry, FakeUltimate  # noqa: E402
 
 FAST = RemoteMenuTiming(connect_timeout=2.0, first_byte_timeout=0.5, idle_gap=0.03, max_drain=5.0,
@@ -417,33 +418,73 @@ def test_anything_else_is_refused(data):
     assert e.value.stage == "image"
 
 
+def no_client(host, timeout=5.0):
+    raise AssertionError("the device was asked for /v1/info")
+
+
 @pytest.mark.parametrize("shell_host", [None, "u64e"])
-def test_ram_run_takes_its_own_lock_even_under_a_lock_shell(env, menu, monkeypatch, shell_host):
-    """The storage helpers and the menu check this process's own lock (lock_held_for), so a lock shell's hold does
-    not carry them: ram_run refuses under one, before taking anything, instead of failing half-way (or queueing for
-    up to lock_timeout behind its own parent). The shell here is genuine: this process's parent, holding the lock."""
-    import _u64_host
-    import c64_test_harness.backends.device_lock as dl
+def test_ram_run_runs_under_a_verified_lock_shell_and_takes_no_lock(env, menu, monkeypatch, shell_host):
+    """#582: the shell (this process's parent, the lockfile's holder) is the hold. Nothing is acquired or released
+    here, and the run goes through to the cleanup."""
     ev = env[0]
-    monkeypatch.setenv("C64U_LOCK_PID", "4242")
-    if shell_host:
-        monkeypatch.setenv("C64U_LOCK_HOST", shell_host)
-    else:
-        monkeypatch.delenv("C64U_LOCK_HOST", raising=False)
-    monkeypatch.setattr(dl, "device_lock_holder", lambda h: {"pid": 4242})
-    me = os.getpid()
-    monkeypatch.setattr(_u64_host, "_parent_pid", lambda pid: {me: 4242, 4242: 1}.get(pid))
-    assert _u64_host.lock_shell_holds("u64e", normalize=jl.normalize_device_host)   # jl._Locked would accept it
-    with pytest.raises(jl.JtagLoadError, match="ram_run takes its own DeviceLock") as e:
-        run(env, [info("218e36a52"), info("17995fd9c")], menu())
+    fake_lock_shell(monkeypatch, shell_host)
+    rec = run(env, [info("218e36a52"), info("17995fd9c")], menu())
+    assert rec["result"] == "ok"
+    assert [e[0] for e in ev] == ["put", "delete"]
+
+
+@pytest.mark.parametrize("kw", FORGED_KW, ids=FORGED_IDS)
+def test_a_lock_shell_claim_that_does_not_hold_is_refused_before_anything(env, monkeypatch, kw):
+    """Not the holder, not an ancestor: refused at the lock step, before /v1/info, the upload and the menu."""
+    ev = env[0]
+    forge(monkeypatch, "u64e", kw)
+    with pytest.raises(jl.JtagLoadError, match="does not hold the DeviceLock|not an ancestor") as e:
+        run(env, [info("218e36a52")], client_factory=no_client)
     assert e.value.stage == "lock" and ev == []
 
 
 def test_a_lock_shell_for_another_device_does_not_stop_ram_run(env, menu, monkeypatch):
-    monkeypatch.setenv("C64U_LOCK_PID", "4242")
-    monkeypatch.setenv("C64U_LOCK_HOST", "192.0.2.99")
+    """The lockfile's holder is the shell for every device here, so only C64U_LOCK_HOST keeps its hold off this
+    one: ram_run takes this device's lock itself."""
+    fake_lock_shell(monkeypatch, "192.0.2.99")
     rec = run(env, [info("218e36a52"), info("17995fd9c")], menu())
-    assert rec["result"] == "ok" and env[0][0] == ("acquire",)
+    assert rec["result"] == "ok" and [e[0] for e in env[0]] == ["acquire", "put", "delete", "release"]
+
+
+def test_a_lock_shell_for_another_device_does_not_cover_a_lock_that_cannot_be_taken(env, monkeypatch):
+    ev = env[0]
+
+    class Busy(Lock):
+        def acquire(self, timeout=None):
+            ev.append(("acquire",))
+            return False
+
+    fake_lock_shell(monkeypatch, "192.0.2.99")
+    with pytest.raises(jl.JtagLoadError) as e:
+        run(env, [info("218e36a52")], client_factory=no_client,
+            lock_factory=lambda n, allow_nested=False: Busy(ev, n))
+    assert e.value.stage == "lock" and ev == [("acquire",)]
+
+
+def test_ram_run_joins_a_lock_this_process_already_holds(env, menu, monkeypatch, tmp_path):
+    """#582, the importable entry point: a driver that holds the DeviceLock (and, being a lock shell for its
+    children, has exported its own PID) calls ram_run(). The hold is joined and is still held on return."""
+    ev = env[0]
+
+    def locks(name, allow_nested=False):
+        return DeviceLock(name, lock_dir=tmp_path / "locks", allow_nested=allow_nested, heartbeat_interval=None)
+
+    monkeypatch.setenv("C64U_LOCK_PID", str(os.getpid()))
+    monkeypatch.setenv("C64U_LOCK_HOST", "u64e")
+    outer_host, outer = "u64e", locks("u64e")
+    assert outer.acquire(timeout=5)
+    try:
+        rec = run(env, [info("218e36a52"), info("17995fd9c")], menu(), lock_factory=locks, lock_timeout=5)
+        assert rec["result"] == "ok" and [e[0] for e in ev] == ["put", "delete"]
+        assert held_by_this_process_in_any_dir(outer_host)
+    finally:
+        outer.release()
+    assert not held_by_this_process_in_any_dir(outer_host)
 
 
 # -- golden images: real files, when the environment names them (nothing binary is committed) ---------------

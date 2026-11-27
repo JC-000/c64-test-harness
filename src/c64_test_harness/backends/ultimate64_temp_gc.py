@@ -673,6 +673,36 @@ def lock_held_for(host: str) -> bool:
     return held_by_this_process_in_any_dir(host)
 
 
+def lock_shell_refusal(host: str) -> str | None:
+    """Why no lock shell covers this process on *host*; ``None`` when one does.
+
+    For the gates that need the device held for the length of one operation
+    but keep no per-process state about it: the FTP storage helpers, the
+    Remote Menu driver and ``read_wifi_ident`` (#582). They ask
+    :func:`lock_held_for` first and this second, so a child of a lock shell
+    (``docs/device_locking.md`` § "Lock shells") passes when the shell is a
+    verified ancestor that holds this device's lock right now, and is
+    refused, with the reason returned here, when ``C64U_LOCK_PID`` is
+    unset, names another device's shell, does not hold the lock, or is not
+    an ancestor.
+
+    The ``/Temp`` hygiene does **not** ask this. Its ledger, sweeps and
+    release drains belong to the process that holds the lock, so
+    :func:`lock_held_for` stays its only gate and a lock shell's child is
+    still an unlocked process to it.
+    """
+    try:
+        from .device_lock import LockShellClaimError, lock_shell_holds
+    except ImportError:  # pragma: no cover - only without fcntl
+        return "no lock shell can be verified without device_lock"
+    try:
+        if lock_shell_holds(host):
+            return None
+    except LockShellClaimError as exc:
+        return str(exc)
+    return "no lock shell (C64U_LOCK_PID) holds it for this process either"
+
+
 def sweep_keep(ledger: "TempLedger") -> int:
     """The keep-count for a sweep of *ledger*'s device (#513 review, finding 1).
 

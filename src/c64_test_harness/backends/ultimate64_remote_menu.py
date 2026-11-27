@@ -17,9 +17,11 @@ dependencies, so the protocol is written here. 1541ultimate's
 
 * **The caller must hold the device's** ``DeviceLock`` (any lock dir, keyed
   the way ``DeviceLock`` keys it, so addresses listed together in
-  ``devices.toml`` fold to one key). Every call checks it before every
-  connection, reads included: a telnet session is a UI session on a shared
-  device. From 3a1ff9ff on the firmware also caps them at four
+  ``devices.toml`` fold to one key), or be the child of a lock shell that
+  holds it (``C64U_LOCK_PID`` naming an ancestor that is the lockfile's
+  holder; ``docs/device_locking.md`` § "Lock shells"). Every call checks it
+  before every connection, reads included: a telnet session is a UI session
+  on a shared device. From 3a1ff9ff on the firmware also caps them at four
   (``TELNET_MAX_SESSIONS``); 1.1.0 (7b628eb1) has no cap.
 * **Nothing is sent that the UI would not read as an intended key, not
   even telnet negotiation.** The server's ``IAC`` options are parsed and
@@ -129,7 +131,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from .ultimate64_client import Ultimate64Error, Ultimate64UnsafeOperationError
-from .ultimate64_temp_gc import lock_held_for
+from .ultimate64_temp_gc import lock_held_for, lock_shell_refusal
 
 __all__ = [
     "DISMISSABLE_MESSAGES",
@@ -1072,10 +1074,11 @@ class Ultimate64RemoteMenu:
 
     # -- gate and connection --------------------------------------------
     def _require_lock(self, operation: str) -> None:
-        if not lock_held_for(self.host):
+        why = None if lock_held_for(self.host) else lock_shell_refusal(self.host)
+        if why is not None:
             raise RemoteMenuLockError(
                 f"refusing {operation} on {self.host}: this process does not hold the "
-                f"device's DeviceLock. Take it first, e.g. "
+                f"device's DeviceLock ({why}). Take it first, e.g. "
                 f"DeviceLock({self.host!r}).acquire_or_raise(timeout=...).")
 
     def _connect(self) -> socket.socket:

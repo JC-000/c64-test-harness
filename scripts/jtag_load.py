@@ -56,7 +56,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, os.environ.get("C64_HARNESS_SRC") or str(HERE.parent / "src"))
 
 from c64_test_harness.backends.device_lock import (  # noqa: E402
-    DeviceLock, normalize_device_host, resolve_lock_timeout)
+    DeviceLock, held_by_this_process_in_any_dir, normalize_device_host, resolve_lock_timeout)
 
 sys.path.insert(0, str(HERE))
 from _u64_host import (  # noqa: E402
@@ -309,7 +309,10 @@ class _Locked:
         self.host, self.timeout = host, lock_timeout
 
     def __enter__(self):
-        if _held_by_lock_shell(self.host):     # a lock shell (C64U_LOCK_PID, an ancestor) holds the DeviceLock
+        # This process's own hold is joined (allow_nested) whatever the environment says: a lock shell that calls
+        # in-process has exported its own PID, which is no ancestor. Else a lock shell (C64U_LOCK_PID, an
+        # ancestor) may hold the DeviceLock, and nothing is taken here.
+        if not held_by_this_process_in_any_dir(self.host) and _held_by_lock_shell(self.host):
             self.dev = None
         elif not self.dev.acquire(timeout=self.timeout):
             raise JtagLoadError("lock", f"DeviceLock({self.host}) not acquired within {self.timeout:.0f} s")

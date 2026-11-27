@@ -7,7 +7,9 @@
 
 Steps: run ``esp_image.py check --platform P file`` (an external tool, given
 by ``--esp-image-tool`` or the ``ESP_IMAGE_TOOL`` environment variable; the
-harness does not carry a copy), take the device's ``DeviceLock``, upload to
+harness does not carry a copy), take the device's ``DeviceLock`` (joined when
+this process already holds it; not taken under a verified lock shell, see
+below), upload to
 the ``--dest`` path (a writable volume, e.g. ``/USB1/espflash/x.esp``; never
 ``/Temp`` or ``/Flash``; an existing file is refused), read the upload back and compare bytes,
 read the module ident with ``read_wifi_ident`` (unless ``--no-ident-probe``), run
@@ -25,6 +27,15 @@ lock lost after the flash) it and its directory are KEPT and the path printed (t
 still be reading the file).
 
 ``--host`` must be the Ethernet address: the flash stops Wi-Fi.
+
+A caller that already holds the device's ``DeviceLock`` keeps it (#582). In
+process (``main([...])`` from a driver that holds the lock) the hold is joined
+with ``allow_nested`` and is still held on return. Under a lock shell
+(``C64U_LOCK_PID`` naming an ancestor that is the lockfile's holder, see
+``docs/device_locking.md`` § "Lock shells") no lock is taken. A claim that
+does not hold is refused with exit 2 before anything is sent; a shell bound
+to another device (``C64U_LOCK_HOST``) covers nothing here, and the CLI then
+takes this device's lock itself.
 """
 
 from __future__ import annotations
@@ -76,7 +87,8 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
     a = ap.parse_args(argv)
 
     from ..backends.device_lock import (
-        DeviceLock, DeviceLockTimeout, resolve_lock_timeout)
+        DeviceLock, DeviceLockTimeout, LockShellClaimError, held_by_this_process_in_any_dir,
+        lock_shell_holds, resolve_lock_timeout)
     from ..backends.unified_manager import DEFAULT_LOCK_TIMEOUT
     from ..backends.ultimate64_client import Ultimate64UnsafeOperationError
     from ..backends.ultimate64_remote_menu import (
@@ -138,12 +150,22 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
     except ValueError as exc:   # --lock-timeout nan, or a malformed U64_DEVICE_LOCK_TIMEOUT
         print(f"REFUSED before the lock, nothing was sent: {exc}", file=sys.stderr)
         return 2
-    lock = (lock_factory or DeviceLock)(a.host)
+    # A DeviceLock the caller already holds (#582). This process's own hold is joined (allow_nested) whatever the
+    # environment says. Otherwise a verified lock shell (C64U_LOCK_PID: an ancestor that is the lockfile's holder)
+    # is the hold, and nothing is taken or released here; the storage helpers and the menu check the same claim.
     try:
-        lock.acquire_or_raise(timeout=budget)
-    except DeviceLockTimeout as exc:
-        print(f"refusing to run: {exc}", file=sys.stderr)   # nothing was flashed: 2, not 3
+        shell = not held_by_this_process_in_any_dir(a.host) and lock_shell_holds(a.host)
+    except LockShellClaimError as exc:
+        print(f"refusing to run, nothing was sent: {exc}", file=sys.stderr)
         return 2
+    lock = None
+    if not shell:
+        lock = lock_factory(a.host) if lock_factory else DeviceLock(a.host, allow_nested=True)
+        try:
+            lock.acquire_or_raise(timeout=budget)
+        except DeviceLockTimeout as exc:
+            print(f"refusing to run: {exc}", file=sys.stderr)   # nothing was flashed: 2, not 3
+            return 2
     uploaded = False
     keep = False
     try:
@@ -215,7 +237,8 @@ def main(argv: list[str] | None = None, *, menu_factory=None, ping=None,
         print(res.summary())
         return 1 if not res.ok else (0 if res.proven or (a.allow_same_ident and res.ping_ok is True) else 3)
     finally:
-        lock.release()
+        if lock is not None:
+            lock.release()
 
 
 if __name__ == "__main__":
