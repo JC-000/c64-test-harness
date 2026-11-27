@@ -567,6 +567,10 @@ refused every attachment-creating request (`Ultimate64TempHygieneError`),
 exactly as an unlocked process is. `flash_firmware` and
 `save_config_item_to_flash` also still need the lock held by this process.
 
+`scripts/volatile_load.py`'s session takes the lock in this process (or leaves it to a verified lock
+shell), so the storage helpers, the Remote Menu driver and the bench scripts called in its
+body pass their checks either way.
+
 ## Related
 
 - `docs/u64_recovery.md` — wedge tiers and what to do instead of a

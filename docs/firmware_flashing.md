@@ -569,7 +569,19 @@ four are gated by `tests/test_u64_runner_script_gates.py`.
   no flash write. It checks file SHA-256s, the bitstream's and the live
   FPGA's IDCODE, the user ID after the load, and the device's identity and
   git hash afterwards. `$ESP_JTAG_DIR` and `$C64U_TESTS_DIR` must be set;
-  neither has a default.
+  neither has a default. It finds the adapter by USB location with
+  pyserial, which the harness's own venv does not install
+  (`pyproject.toml` has no such dependency): run it, and
+  `volatile_load.py` for a C64 Ultimate, with an interpreter that has
+  both pyserial and the harness on its path (the esp-jtag kit's venv with
+  `PYTHONPATH=<checkout>/src` was used for the 2026-11-27 run below).
+  Without it the run is refused with
+  `[adapter] pyserial is needed ...` before any JTAG access: by
+  `jtag_load.py` before its lock, and through `volatile_load.py` after
+  the lock and the wrapper's own bodyless `/v1/info` reads: one when the
+  device answers, three, 2 s apart, when it does not (its dry run shows
+  the refusal with no lock at all). Moving that refusal before the lock
+  is #591.
 - **`blaster_load_u64.py load HOST ELF --sha256 H --expect-hash G`**
   (#583) reloads a U64 or U64E application over JTAG with
   `nios2-download -g`, through a USB-Blaster-compatible adapter (USB id
@@ -677,3 +689,202 @@ four are gated by `tests/test_u64_runner_script_gates.py`.
     outlet is switched.
   - The outlet is never left off: any error after switching it off
     switches it back on before raising.
+
+### One volatile load for both products: `volatile_load.py` (#585)
+
+`scripts/volatile_load.py` sits above `ram_run_u64.py`, `jtag_load.py` and
+`blaster_load_u64.py` and gives both products one call, one result shape and one way back. It
+adds no device I/O of its own beyond a bodyless `/v1/info` read; each
+backend keeps its gates.
+
+```python
+from volatile_load import VolatileImage, volatile_load, volatile_restore, volatile_session
+
+image = VolatileImage(path, sha256, expected_hash)              # U64 line: a RAM-run .u64
+image = VolatileImage(app, sha256, expected_hash, bit=bit, bit_sha256=bit_sha)   # C64U class
+
+with volatile_session(host, image, baseline_first=True) as s:   # one DeviceLock across all of it
+    ...                                                         # the rows; s.load_image(other) for a second image
+```
+
+- **Backend.** Chosen under the lock from the `/v1/info` product:
+  "Ultimate 64" and "Ultimate 64 Elite" get `ram_run`; "C64 Ultimate" and
+  "Ultimate 64-II" get `jtag_cold`. Any other product is refused. A box
+  that does not answer three polls is dark: the backend then follows the
+  image's family, which the device's `bench.toml` table must enable, and
+  the identity is checked on `/v1/info` after the load. A dark U64-line
+  box goes to `blaster_load_u64.blaster_load` with `dark=True` (the
+  `u64_jtag_reload` backend; the callable is
+  `volatile_load.U64_JTAG_RELOAD`, replaceable per call). That script
+  keeps its own binding (`jtag_blaster_*`) and gates, and the image must
+  name the application ELF it loads (`jtag_image`, `jtag_sha256`); without
+  one a dark U64-line box is refused and the way back is a power cycle.
+- **Images.** Checked before any lock, upload or JTAG pin. Exactly two
+  shapes pass: a RAM-run file (`check_ramrun_image`) for the U64 line, and
+  a one-record `ultimate.app` at `0x30000` plus the FPGA `.bit` for the
+  C64U class (the DRAM image is extracted with `payload_from_app`; a raw
+  `ultimate.bin` carries nothing to check and is not accepted). Update
+  images, `.cfw` files and garbage are refused, and so is any file holding
+  an updater prompt string or the SILENT marker, whatever its shape. The
+  image's family must be the device's. What this refuses is update images
+  as they are built, by structure and by the updater's strings. It cannot
+  tell what an application does: a hand-made RAM-run wrapper around an
+  updater that carries none of those strings would pass.
+- **The image must be the build the caller names.** Both formats carry
+  the application's System Info line, `Git hash:   <hash>`
+  (`system_info.cc`), where the hash is the build's
+  `git rev-parse --short HEAD` (`target/common/rules.mk`), the same macro
+  `/v1/info` reports as `git_commit_hash`. Pre-flight reads it from the
+  file. An image with no such line, or with two different ones, is
+  refused. So is an expected hash that does not begin with every digit
+  the image carries, which includes one with fewer digits than the image
+  has. After the load `/v1/info` must report exactly the image's hash.
+  Read offline from builds on this bench (2026-11-26, no device): three
+  RAM-run `.u64` files and one u64ii `ultimate.app` each carry exactly
+  one such line with a 9-digit hash and none of the updater strings, and
+  pass; an `update.u64`, an `update.ue2`, a raw u64ii `ultimate.bin` and a
+  U64 `ultimate.app` (one record at `0x0`) are refused. The image a U64
+  JTAG reload loads (`jtag_image`) is not read here: that check is its
+  backend's.
+- **Result.** `VolatileResult`: `ok`, `backend`, `family`, `product`,
+  `git_hash` (reported by the running firmware), `expect_git_hash`,
+  `image_git_hash` (read from the file),
+  `loaded`, `dark_before`, `hash_changed`, `restart_proof`, `timings`
+  (seconds per step), `notes`, and the backend's own `record`. A failure
+  raises `VolatileLoadError` (a `JtagLoadError`, so it has a `stage`) whose
+  `result` has `ok` False.
+- **What a result proves.** After a load the running firmware must report
+  the bound `unique_id`, a product of the image's family and the expected
+  hash. `restart_proof` then says why the load is believed to have
+  started: `hash-change`; `jtag-reconfigured` (the FPGA was reloaded cold
+  and the user ID read back, which also covers a same-hash load);
+  the reload's own `no-answer-before` or `rest-drop` (and its
+  `hash-change`), carried through as `blaster_load` reports them; or
+  `none`. A reload that `blaster_load` ends as `ok-unproven` is not ok
+  here: the call fails with the stage `unproven` (CLI exit 3) and the
+  result keeps what was read. Measured once (Ultimate 64 Elite,
+  2026-11-27, n=1): a same-hash JTAG reload showed no REST outage, so that
+  case is real. A same-hash RAM-run cannot be proven
+  (#570) and `ram_run` refuses it. A U64-line device that reports no hash
+  before the load (no `git_commit_hash`, or one that is not 7 or more hex
+  digits) is refused the same way, before anything is staged: a change
+  could not be shown, and `hash_changed` is `None` whenever the hash
+  before is unknown. So `volatile_restore` on a U64-line
+  device that already reports the baseline hash loads nothing and returns
+  `loaded` False with `restart_proof` `none`: the hashes agree, and that
+  the running image is the baseline file is not proven. For the same
+  reason `baseline_first` fails on a U64-line device that already reports
+  the baseline hash, and the image is then never loaded.
+- **Baseline and restore.** `volatile_restore(host)` loads the baseline
+  from the device's `bench.toml` table: `volatile_baseline_image`,
+  `volatile_baseline_sha256`, `volatile_baseline_git_hash`; for the C64U
+  class also `volatile_baseline_bit` and `volatile_baseline_bit_sha256`;
+  optionally, for the U64 line, `volatile_baseline_jtag_image` and
+  `volatile_baseline_jtag_sha256` (what a JTAG reload loads into a dark
+  box). **Upgrade hazard, as for the `jtag_blaster_*` keys:** a harness
+  tree older than this change refuses a device table that carries the
+  `volatile_baseline_*` keys (an unknown key fails the whole file), so
+  every bench script run from such a tree stops until the keys are
+  removed or that tree is pointed at another file with
+  `C64_BENCH_BINDINGS_FILE`. Every path here reads the file that variable
+  names, so a run can keep its baseline in a private bindings file and
+  leave the shared one unchanged. The session restores on the way out, also when the load or the
+  body raised. The body's exception propagates; a restore failure is then
+  kept in `session.restore_error` and logged, and is raised only after a
+  clean body. A `KeyboardInterrupt` or `SystemExit` starts no restore
+  (`session.restore_skipped` says so): the device keeps running what was
+  loaded last, and `volatile_restore` is the operator's next step. A
+  restore of minutes behind a Ctrl-C would invite the second Ctrl-C that
+  cuts a JTAG load half-way.
+- **Lock.** The session takes the `DeviceLock` in this process
+  (`allow_nested`), so the backends and the harness helpers called in the
+  body join it; a hold this process already has is joined as well, even
+  when it has exported its own PID as a lock shell for its children.
+  Under a verified ancestor lock shell it takes none
+  (`session.lock_in_process` is False) and both backends, the storage
+  helpers and the Remote Menu driver accept the shell's hold (#582). A
+  claim that does not hold (another holder, nobody, not an ancestor,
+  unreadable parents) is refused with the stage `lock` before any
+  `/v1/info` read; a shell bound to another device covers nothing and the
+  lock is taken normally. `Ultimate64Client`'s `/Temp` hygiene on a
+  leak-prone device, `flash_firmware` and `save_config_item_to_flash`
+  still need the lock held by this process, so a body that uses those runs
+  with an in-process hold, not under a shell.
+- **Adapter.** Only the adapter bound to the device in `bench.toml` is
+  used. A `jtag_scan_only` device and a missing binding are refused before
+  the lock, and so is a `JTAG_USB_LOCATION` that names another location
+  (`jtag_load.py` alone lets that variable override the table).
+  `jtag_load.py`'s live IDCODE gate still runs before the FPGA is touched.
+- **Cold only.** The C64 Ultimate load is always cold. There is no option
+  for a warm load, and `JTAG_LOAD_WARM` is not honoured here.
+- **JTAG timeout.** `jtag_timeout` under 300 s is refused (300 passes,
+  and is the default). It is the budget handed to the U64 JTAG reload
+  (`blaster_load`'s `download_timeout`, around its one `nios2-download`).
+  One measured hash-changing reload came up in about 22 s (n=1), so 300 s
+  is over ten times a good download. The floor is kept anyway: a cut
+  download leaves the Nios paused and the box dark until a power cycle,
+  a hung one only costs the wait, and one run does not justify less. It
+  applies to nothing else: it does not reach `jtag_load.py`, so it changes nothing for a C64
+  Ultimate. `volatile_load.py` puts no deadline around the cold esp-jtag
+  load, but `jtag_load.py` runs it with the kit's link timeout of 10 s per
+  adapter transaction, and after a link error once the FPGA is programmed
+  it retries the whole load once and then leaves the box dark. Whether a
+  single transaction can need more than 10 s is not known; the two cold
+  loads of the live run below (2026-11-27, n=1 each) needed no retry and
+  recorded no link error, which measures those two loads only.
+- **Storage.** On the RAM-run path the only storage calls are
+  `ram_run_u64.py`'s: one staged file, deleted again. The upload never
+  overwrites: a file already on the volume under the staging name
+  (`rr` plus six hash digits, `.u64`) stops the load and is neither
+  replaced nor deleted.
+- **Dark.** A box is dark only after three unanswered `/v1/info` reads in
+  a row; one or two misses choose nothing.
+
+```
+volatile_load.py load    HOST IMAGE --sha256 H --expect-hash G [--bit F --bit-sha256 H]
+                         [--jtag-image F --jtag-sha256 H] [--baseline-first] [--dry-run] [--record F]
+volatile_load.py restore HOST [--dry-run] [--record F]
+```
+
+`--dry-run` prints the plan (the backend's own dry run included) and
+takes no lock and opens no client, storage, menu or adapter.
+
+**Measured** (2026-11-27, n=1 per row, one device of each product, both on
+bench builds of 3.15a, bindings from a private file through
+`C64_BENCH_BINDINGS_FILE`). These are single runs, not typical figures:
+
+- Ultimate 64 Elite, `ram_run`: a load and a restore through the CLI took
+  23.5 s and 26.0 s for the whole call, each `hash-change`, with no staged file left on the
+  volume. One `volatile_session` under a `DeviceLock` the caller held in
+  process loaded in 26.9 s, read the image's hash in its body with the
+  lock still held, and restored in 25.1 s on the way out.
+- C64 Ultimate, `jtag_cold`: a cold load and a cold restore took 89.3 s
+  and 89.9 s for the whole call, each with `cold` true, the user ID read back, no retry and
+  `jtag-reconfigured`. Before them, each `.app`'s extracted payload was
+  compared offline with the `.bin` form that bench had loaded until then:
+  byte-identical. The only traffic to that device was `GET /v1/info` and
+  JTAG; its `/Temp` hygiene was disarmed for the run
+  (`U64_AUTO_TEMP_GC=0`), since no body-carrying request was sent.
+
+- Ultimate 64 Elite, `u64_jtag_reload` (2026-11-27, n=1 per direction),
+  on a device that answered throughout. The backend was reached by
+  failing the wrapper's first three status reads inside the driver's
+  process only; nothing made the device dark. A load of another build
+  took 41.3 s (4.0 s of injected misses, 37.3 s in the reload, the device
+  up 21.2 s after the download started) and the way back to the baseline
+  36.7 s (up 21.5 s after the download started). Each was `ok` and `loaded`, with `hash-change`
+  carried through from the reload's own record, `dark=True` passed, the
+  reload's own read before the load answered by the device, and no
+  cleanup error. Before the first of the two reloads `jtagd` was not
+  running and was started by the bound start command; the second did not
+  have to start it. `dark_before` true in those two results is the injected
+  belief, not a fact about the device.
+
+Not run on a device: a real `no-answer-before` proof; a U64 that is in
+fact dark, and its recovery; the same-hash (`ok-unproven`) case through
+this call; the three-poll dark detection against a device that is
+silent; a C64 Ultimate that does not answer (`jtag_cold` chosen for a
+dark box); a restore that loads nothing because the U64 already reports
+the baseline; `baseline_first`; a failed load with the restore that follows
+it; an interrupt; and a lock-shell parent. Those rest on the stand-in
+tests.
