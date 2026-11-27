@@ -9,8 +9,9 @@ generics ``g_c2n_recorder`` / ``g_c2n_streamer`` in the top levels):
   ``u2p_nios2_solo.vhd`` set both).
 * The 1541 Ultimate-II (``ultimate_mb_700a.vhd``,
   ``ultimate_riscv_700a.vhd``): the player always, the recorder **only on
-  dual-drive builds** (``g_c2n_recorder => g_dual_drive``, default false).
-  A single-drive build can play a tape and cannot capture one.
+  dual-drive builds** (``g_c2n_recorder => g_dual_drive``). Single-drive
+  and dual-drive builds ship as separate update images; a cartridge
+  flashed with a single-drive one can play a tape and cannot capture one.
 
 **An Ultimate 64, Ultimate 64 Elite or C64 Ultimate has neither**: no top level for them sets
 the generics (source-read, not traced exhaustively), and neither of this

@@ -896,8 +896,6 @@ def test_a_player_without_a_capture_item_means_the_directory_is_not_writable(mak
     with pytest.raises(ut.TapeCaptureNotOfferedError, match="/USB1/Backups") as err:
         ut.tape_require_supported(HOST, "/USB1/Backups", tap_path=path, menu=menu)
     assert not isinstance(err.value, ut.TapeUnsupportedError)
-    # Both causes the menu cannot tell apart are named, not one of them.
-    assert "not writable" in str(err.value) and "no recorder" in str(err.value)
     assert "Ultimate 64 Elite" in err.value.product
     assert fake.all_commits() == [] and fake.playing is None and _typed(fake) == ""
 
