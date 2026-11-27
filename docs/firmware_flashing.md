@@ -854,12 +854,12 @@ bench builds of 3.15a, bindings from a private file through
 `C64_BENCH_BINDINGS_FILE`). These are single runs, not typical figures:
 
 - Ultimate 64 Elite, `ram_run`: a load and a restore through the CLI took
-  23.5 s and 26.0 s, each `hash-change`, with no staged file left on the
+  23.5 s and 26.0 s for the whole call, each `hash-change`, with no staged file left on the
   volume. One `volatile_session` under a `DeviceLock` the caller held in
   process loaded in 26.9 s, read the image's hash in its body with the
   lock still held, and restored in 25.1 s on the way out.
 - C64 Ultimate, `jtag_cold`: a cold load and a cold restore took 89.3 s
-  and 89.9 s, each with `cold` true, the user ID read back, no retry and
+  and 89.9 s for the whole call, each with `cold` true, the user ID read back, no retry and
   `jtag-reconfigured`. Before them, each `.app`'s extracted payload was
   compared offline with the `.bin` form that bench had loaded until then:
   byte-identical. The only traffic to that device was `GET /v1/info` and
@@ -871,17 +871,20 @@ bench builds of 3.15a, bindings from a private file through
   failing the wrapper's first three status reads inside the driver's
   process only; nothing made the device dark. A load of another build
   took 41.3 s (4.0 s of injected misses, 37.3 s in the reload, the device
-  up 21.2 s after the download) and the way back to the baseline 36.7 s
-  (up after 21.5 s). Each was `ok` and `loaded`, with `hash-change`
+  up 21.2 s after the download started) and the way back to the baseline
+  36.7 s (up 21.5 s after the download started). Each was `ok` and `loaded`, with `hash-change`
   carried through from the reload's own record, `dark=True` passed, the
   reload's own read before the load answered by the device, and no
-  cleanup error; `jtagd` was not running and was started by the bound
-  start command. `dark_before` true in those two results is the injected
+  cleanup error. Before the first of the two reloads `jtagd` was not
+  running and was started by the bound start command; the second did not
+  have to start it. `dark_before` true in those two results is the injected
   belief, not a fact about the device.
 
 Not run on a device: a real `no-answer-before` proof; a U64 that is in
 fact dark, and its recovery; the same-hash (`ok-unproven`) case through
 this call; the three-poll dark detection against a device that is
-silent; `baseline_first`; a failed load with the restore that follows
+silent; a C64 Ultimate that does not answer (`jtag_cold` chosen for a
+dark box); a restore that loads nothing because the U64 already reports
+the baseline; `baseline_first`; a failed load with the restore that follows
 it; an interrupt; and a lock-shell parent. Those rest on the stand-in
 tests.
