@@ -15,7 +15,11 @@ route is local configuration, in the device's table of bench.toml (_bench_bindin
     jtag_blaster_ssh_port = 2200                  # optional
     jtag_blaster_ssh_identity = "<key file>"      # optional
     jtag_blaster_env = ". <quartus env script>"   # optional: shell text run before every remote command (PATH)
-    jtag_blaster_jtagd_start = "<command>"        # optional: starts jtagd when it is not running
+    jtag_blaster_jtagd_start = "<command>"        # optional: starts jtagd when it is not running (see below)
+
+A stopped jtagd is a refusal unless a start command is bound. Lane-reported from one bench VM, not verified here:
+a plain ``jtagconfig`` started jtagd by itself there, so the key is normally left unset and the remedy for the
+refusal is to run ``jtagconfig`` on the far side once.
 
 These keys are a capability of their own. ``jtag_scan_only = true`` and the ``jtag_adapter_*`` keys describe the
 esp-jtag adapter that jtag_load.py drives, and are neither read nor changed here: a device may be scan-only for that
@@ -153,9 +157,11 @@ def check_elf(data: bytes, expect_git_hash: str) -> None:
 def parse_jtagconfig(text: str) -> list[dict]:
     """`jtagconfig -n` output as [{"name", "devices": [(idcode, part)], "nodes": [text]}], one per cable.
 
-    Strict: the layout here was written from the tool's documented output, not captured on a bench, so any non-blank
-    line that is not a cable, a device or a node is a refusal (JtagLoadError "chain") rather than skipped. A line
-    this does not know could be a second device."""
+    The layout is the one observed on a bench (one capture, 2026-11-27; tests/test_blaster_load_u64.py
+    RECORDED_CHAIN): a cable line ``1) USB-Blaster [port]``, under it a device line ``IDCODE   part``, and under the
+    device ``Node <hex>  <name>`` lines and a ``Design hash    <hex>`` line. Strict: any other non-blank line is a
+    refusal (JtagLoadError "chain") rather than skipped, because a line this does not know could be a second device.
+    A design hash describes a device's design, so it is known only once its cable has shown a device."""
     cables: list[dict] = []
     for line in text.splitlines():
         if not line.strip():
@@ -166,6 +172,8 @@ def parse_jtagconfig(text: str) -> list[dict]:
             continue
         node = re.match(r"^\s+Node\s+[0-9A-Fa-f]{8}\s*(.*?)\s*$", line)
         device = re.match(r"^\s+([0-9A-Fa-f]{8})\s+(\S.*?)\s*$", line)
+        if cables and cables[-1]["devices"] and re.match(r"^\s+Design hash\s+[0-9A-Fa-f]+\s*$", line):
+            continue
         if not cables or not (node or device):
             raise jl.JtagLoadError("chain", f"jtagconfig printed a line this script does not know ({line.strip()!r}); "
                                    "board NOT touched")

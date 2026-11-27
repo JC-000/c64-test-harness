@@ -582,6 +582,11 @@ hold by a verified ancestor lock shell). All four are gated by
     `jtag_blaster_env` (shell text run before every command there, for
     `PATH`; its own output is discarded) and `jtag_blaster_jtagd_start` (the command that starts `jtagd`
     when it is not running; without it a stopped `jtagd` is a refusal).
+    Lane-reported from this bench's VM and not verified by the harness: a
+    plain `jtagconfig` there started `jtagd` by itself, and the launcher
+    the lane's loader uses does not exist there, so
+    `jtag_blaster_jtagd_start` is normally left unset and the remedy for
+    the refusal is to run `jtagconfig` on the far side once.
     ssh runs with `BatchMode=yes`, so it never prompts.
   - **These keys are a capability of their own.** `jtag_scan_only = true`
     and `jtag_adapter_*` describe the esp-jtag adapter of `jtag_load.py`.
@@ -607,8 +612,10 @@ hold by a verified ancestor lock shell). All four are gated by
     `nios2-gdb-server` or `nios2-elf-gdb` (a refusal, or killed with
     `--kill-stray-gdb`); `jtagd` runs; `jtagconfig -n` shows exactly one
     cable, the bound one, with exactly one `5CE` device and a `Nios II`
-    node, and no line the parser does not know (the layout is not captured
-    from a bench yet, so an unknown line is a refusal).
+    node, and no line the parser does not know. The layout is observed:
+    one `jtagconfig -n` listing recorded from the bench on 2026-11-27 (a
+    cable line, a device line, a `Node` line and a `Design hash` line) is
+    a test fixture, and any other line is a refusal.
     `--preflight-only` stops here.
   - **One download, never retried.** A non-zero exit or a timeout is a
     failure that says to stop: the Nios may be left paused.
@@ -630,7 +637,8 @@ hold by a verified ancestor lock shell). All four are gated by
     Exit 0 is loaded and proven, 3 loaded but unproven, 2 refused or failed.
   - **Not run on a device yet.** The command sequence was read from a
     lane's out-of-tree loader (7 recoveries reported on 2026-11-25) and is
-    exercised here against fakes only, the `jtagconfig -n` layout included.
+    exercised here against fakes only. The `jtagconfig -n` layout is the
+    one thing observed: the fakes answer with the recorded listing.
 - **`power_outlet.py cycle HOST`** cold-cycles a device through a switched
   outlet (Shelly gen2 or Tasmota), bound in `bench.toml`. Whether it powers
   the device off first is decided under the lock from the `/v1/info`

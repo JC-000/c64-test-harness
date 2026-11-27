@@ -54,12 +54,16 @@ jtag_blaster_cable = "USB-Blaster"
 KEYS = {"u64e": "uid-abc123", "u64e-full": "uid-def456", "scan-only": "uid-fed789", "no-cable": "uid-0a0b0c",
         "no-ssh": "uid-0d0e0f", "untabled": "uid-123456"}
 
-CHAIN = """\
+# `jtagconfig -n` as recorded from the bench VM on 2026-11-27, with nothing else on the adapter. Two substitutions:
+# the USB port in the brackets and the digits of the design hash are not the real ones. Everything else, the
+# spacing included, is as printed. Every chain case below is this listing with one thing changed.
+RECORDED_CHAIN = """\
 1) USB-Blaster [1-1]
-  02B030DD   5CEBA4/5CEFA4
-    Node 19104600   Nios II #0
-    Node 0C006E00
+  02B050DD   5CE(BA4|FA4)
+    Node 19104600  Nios II #0
+    Design hash    0123456789ABCDEF0123
 """
+CHAIN = RECORDED_CHAIN
 
 
 def elf(hash_=HASH, machine=113, entry=0x120, paddr=0, magic=b"\x7fELF", klass=1, extra=b""):
@@ -628,17 +632,24 @@ def test_a_stopped_jtagd_refuses_unless_a_start_command_is_bound(env):
 
 @pytest.mark.parametrize("chain", [
     "No JTAG hardware available\n",
-    CHAIN + "2) USB-Blaster [1-2]\n  02B030DD   5CEBA4/5CEFA4\n    Node 19104600   Nios II #0\n",
+    CHAIN + "2) USB-Blaster [1-2]\n  02B050DD   5CE(BA4|FA4)\n    Node 19104600  Nios II #0\n",
     CHAIN.replace("USB-Blaster", "Arrow-USB-Other"),
-    CHAIN.replace("5CEBA4/5CEFA4", "10M08SA"),
-    CHAIN + "  02B030DD   5CEBA4/5CEFA4\n",
+    CHAIN.replace("5CE(BA4|FA4)", "10M08SA"),
+    CHAIN + "  02B050DD   5CE(BA4|FA4)\n",
     "1) USB-Blaster [1-1]\n  Unable to read device chain - JTAG chain broken\n",
     CHAIN.replace("Nios II #0", ""),
     CHAIN.replace("    Node 19104600", "  a second device in a layout nobody captured\n    Node 19104600"),
     "jtagd restarted\n" + CHAIN,
-    "  02B030DD   5CEBA4/5CEFA4\n" + CHAIN,
+    "  02B050DD   5CE(BA4|FA4)\n" + CHAIN,
+    "1) USB-Blaster [1-1]\n    Design hash    0123456789ABCDEF0123\n  02B050DD   5CE(BA4|FA4)\n"
+    "    Node 19104600  Nios II #0\n",
+    "    Design hash    0123456789ABCDEF0123\n" + CHAIN,
+    CHAIN.replace("0123456789ABCDEF0123", "unavailable, see the log"),
+    CHAIN.replace("Design hash ", "Design state"),
 ], ids=["no-cable", "two-cables", "other-cable", "other-fpga", "two-devices", "broken-chain", "no-nios-node",
-        "unknown-line-under-the-cable", "unknown-line-before-the-cable", "device-before-any-cable"])
+        "unknown-line-under-the-cable", "unknown-line-before-the-cable", "device-before-any-cable",
+        "design-hash-before-the-device", "design-hash-before-any-cable", "design-hash-not-hex",
+        "another-design-line"])
 def test_a_chain_that_is_not_the_one_bound_cable_with_a_nios_refuses_before_the_download(env, chain):
     refused_before_download(env, "chain", remote=Remote(env[0], chain=(0, chain, "")))
 
@@ -704,8 +715,14 @@ def test_the_three_misses_of_a_drop_are_a_second_apart(env):
     assert rec["restart_proof"] == "rest-drop"
 
 
+def test_the_listing_recorded_from_the_bench_loads(env):
+    rec = reload_(env, [info(OLD), info(HASH)], Remote(env[0], chain=(0, RECORDED_CHAIN, "")))
+    assert rec["result"] == "ok" and rec["cable"] == "USB-Blaster [1-1]"
+    assert [tuple(d) for d in rec["chain"]] == [("02b050dd", "5CE(BA4|FA4)")]
+
+
 def test_blank_lines_in_the_chain_listing_are_not_unknown_lines(env):
-    chain = "\n" + CHAIN.replace("    Node 0C006E00", "\n    Node 0C006E00") + "\n\n"
+    chain = "\n" + CHAIN.replace("    Design hash", "\n    Design hash") + "\n\n"
     rec = reload_(env, [info(OLD), info(HASH)], Remote(env[0], chain=(0, chain, "")))
     assert rec["result"] == "ok" and rec["cable"] == "USB-Blaster [1-1]"
 
