@@ -93,9 +93,10 @@ BACKEND_RAM_RUN, BACKEND_JTAG_COLD, BACKEND_U64_JTAG = "ram_run", "jtag_cold", "
 
 #: The seam to the U64-line JTAG reload (#583). None = not wired: a dark U64-line box is refused. A callable
 #:     reload(host, image_path, *, sha256, expect_git_hash, timeout, lock_timeout, lock_factory, client_factory,
-#:            dry_run, log) -> dict
-#: that enforces its own adapter binding, loads *image_path* without writing flash, and returns a record whose
-#: "info" is the /v1/info read afterwards. *timeout* is never below MIN_JTAG_TIMEOUT_S.
+#:            dry_run, sleep, clock, log) -> dict
+#: that enforces its own adapter binding, loads *image_path* without writing flash into a box that may not answer
+#: before the load, and returns a record whose "info" is the /v1/info read afterwards. *timeout* is the budget of
+#: its JTAG operation and is never below MIN_JTAG_TIMEOUT_S.
 U64_JTAG_RELOAD = None
 
 DARK_POLLS = 3
@@ -346,7 +347,7 @@ def _run_backend(backend: str, host: str, prep: _Prepared, o: _Opts, dry_run: bo
     return o.u64_jtag_reload(host, prep.image.jtag_image, sha256=prep.image.jtag_sha256,
                              expect_git_hash=prep.expect, timeout=o.jtag_timeout, lock_timeout=o.lock_timeout,
                              lock_factory=o.lock_factory, client_factory=o.client_factory, dry_run=dry_run,
-                             log=o.log)
+                             sleep=o.sleep, clock=o.clock, log=o.log)
 
 
 def _verify(res: VolatileResult, rec: dict, uid: str, family: str, expect: str, pre: dict | None) -> None:
