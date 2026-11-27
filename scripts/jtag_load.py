@@ -252,7 +252,7 @@ def check_identity(info: dict, uid: str, products=PRODUCTS) -> None:
     if str(info.get("unique_id", "")).upper() != uid:
         raise JtagLoadError("identity", f"device answers with unique_id {info.get('unique_id')!r}, bound is {uid}")
     if info.get("product") not in products:
-        raise JtagLoadError("identity", f"product {info.get('product')!r} is not a C64U-class board")
+        raise JtagLoadError("identity", f"product {info.get('product')!r} is not one of {list(products)}")
 
 
 def check_git_hash(expect_git_hash) -> str:

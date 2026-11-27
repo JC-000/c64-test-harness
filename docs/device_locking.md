@@ -538,7 +538,8 @@ shell bound to another device, is refused as an unlocked process is:
 
 That is what lets `scripts/ram_run_u64.py` and
 `python -m c64_test_harness.tools.flash_esp` run under a lock the caller
-already holds, like `jtag_load.py` and `power_outlet.py`:
+already holds, like `jtag_load.py`, `blaster_load_u64.py` and
+`power_outlet.py`:
 
 - **In process.** A driver that holds the `DeviceLock` and calls
   `ram_run(...)` or `flash_esp.main([...])` is joined (`allow_nested=True`)
@@ -565,6 +566,10 @@ flock, so `Ultimate64Client` and `liveness_probe` still gate on
 refused every attachment-creating request (`Ultimate64TempHygieneError`),
 exactly as an unlocked process is. `flash_firmware` and
 `save_config_item_to_flash` also still need the lock held by this process.
+
+`scripts/volatile_load.py`'s session takes the lock in this process (or leaves it to a verified lock
+shell), so the storage helpers, the Remote Menu driver and the bench scripts called in its
+body pass their checks either way.
 
 ## Related
 
