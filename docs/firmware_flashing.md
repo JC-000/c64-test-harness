@@ -569,7 +569,17 @@ four are gated by `tests/test_u64_runner_script_gates.py`.
   no flash write. It checks file SHA-256s, the bitstream's and the live
   FPGA's IDCODE, the user ID after the load, and the device's identity and
   git hash afterwards. `$ESP_JTAG_DIR` and `$C64U_TESTS_DIR` must be set;
-  neither has a default.
+  neither has a default. It finds the adapter by USB location with
+  pyserial, which the harness's own venv does not install
+  (`pyproject.toml` has no such dependency): run it, and
+  `volatile_load.py` for a C64 Ultimate, with an interpreter that has
+  both pyserial and the harness on its path (the esp-jtag kit's venv with
+  `PYTHONPATH=<checkout>/src` was used for the 2026-11-27 run below).
+  Without it the run is refused with
+  `[adapter] pyserial is needed ...` before any JTAG access: by
+  `jtag_load.py` before its lock, and through `volatile_load.py` after
+  the lock and one bodyless `/v1/info` read (its dry run shows it with
+  no lock at all). Moving that refusal before the lock is #591.
 - **`blaster_load_u64.py load HOST ELF --sha256 H --expect-hash G`**
   (#583) reloads a U64 or U64E application over JTAG with
   `nios2-download -g`, through a USB-Blaster-compatible adapter (USB id
@@ -817,7 +827,9 @@ with volatile_session(host, image, baseline_first=True) as s:   # one DeviceLock
   load, but `jtag_load.py` runs it with the kit's link timeout of 10 s per
   adapter transaction, and after a link error once the FPGA is programmed
   it retries the whole load once and then leaves the box dark. Whether a
-  single transaction can need more than 10 s is not known here.
+  single transaction can need more than 10 s is not known; the two cold
+  loads of the live run below (2026-11-27, n=1 each) needed no retry and
+  recorded no link error, which measures those two loads only.
 - **Storage.** On the RAM-run path the only storage calls are
   `ram_run_u64.py`'s: one staged file, deleted again. The upload never
   overwrites: a file already on the volume under the staging name
@@ -833,5 +845,27 @@ volatile_load.py restore HOST [--dry-run] [--record F]
 ```
 
 `--dry-run` prints the plan (the backend's own dry run included) and
-takes no lock and opens no client, storage, menu or adapter. Nothing here
-has run against a device: every test uses stand-ins.
+takes no lock and opens no client, storage, menu or adapter.
+
+**Measured** (2026-11-27, n=1 per row, one device of each product, both on
+bench builds of 3.15a, bindings from a private file through
+`C64_BENCH_BINDINGS_FILE`). These are single runs, not typical figures:
+
+- Ultimate 64 Elite, `ram_run`: a load and a restore through the CLI took
+  23.5 s and 26.0 s, each `hash-change`, with no staged file left on the
+  volume. One `volatile_session` under a `DeviceLock` the caller held in
+  process loaded in 26.9 s, read the image's hash in its body with the
+  lock still held, and restored in 25.1 s on the way out.
+- C64 Ultimate, `jtag_cold`: a cold load and a cold restore took 89.3 s
+  and 89.9 s, each with `cold` true, the user ID read back, no retry and
+  `jtag-reconfigured`. Before them, each `.app`'s extracted payload was
+  compared offline with the `.bin` form that bench had loaded until then:
+  byte-identical. The only traffic to that device was `GET /v1/info` and
+  JTAG; its `/Temp` hygiene was disarmed for the run
+  (`U64_AUTO_TEMP_GC=0`), since no body-carrying request was sent.
+
+Not run on a device: the `u64_jtag_reload` backend through this call (it
+is chosen only for a U64 that does not answer; `blaster_load_u64.py`
+itself ran live, see above), `baseline_first`, a failed load with the
+restore that follows it, an interrupt, and a lock-shell parent. Those
+rest on the stand-in tests.
