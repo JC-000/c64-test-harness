@@ -6,10 +6,18 @@ Neither is a C64. Here the KERNAL itself loads a TAP built by
 ``build_tap_from_prg`` from VICE's datasette, and the stimulus routine runs
 on VICE's 6510 and VIC.
 
-**Written but not yet run** (the lane that wrote it could not spawn VICE);
-the first run is the supervisor's. If the autostart of a ``.tap`` behaves
-differently from what is assumed below (reset, ``LOAD``, play, ``RUN``),
-that is a fault in this test, not evidence about the encoder.
+First run 2026-11-27 (VICE 3.10): both tests pass, and the load test was
+shown able to fail by mutating the encoder in a scratch copy, one VICE run
+per mutation: a medium pulse as short as a short one, or only 0x38 long
+(the program never arrives); a wrong block checksum (ST=$20); a data byte
+changed after the checksum (ST=$20, one byte differs); the repeat copies
+left out (never arrives). Leaving out only the data block's repeat copy was
+NOT caught until the wait on $2D/$2E below was added: the bytes are in RAM
+after the first copy, while the KERNAL is still waiting for the second.
+
+VICE's autostart of a ``.tap`` resets, types ``LOAD``, presses play and
+then ``RUN``. The KERNAL reads the pulses: the result depends on the pulse
+lengths, with the device-1 traps on or off.
 """
 
 from __future__ import annotations
@@ -45,7 +53,12 @@ def test_the_kernal_loads_a_tap_built_from_a_prg(tmp_path):
     reservation = allocator.take_socket(port)
     if reservation is not None:
         reservation.close()
-    config = ViceConfig(port=port, warp=True, sound=False, prg_path=str(tap))
+    # +trapdevice1: no KERNAL traps for device 1, so nothing but the
+    # datasette's pulses can deliver the program. (VICE uses those traps for
+    # .t64 images; the load fails the same way on a mis-timed TAP with them
+    # on or off, so this only pins what was measured.)
+    config = ViceConfig(port=port, warp=True, sound=False, prg_path=str(tap),
+                        extra_args=["+trapdevice1"])
     failures: list = []
     with ViceProcess(config) as vice:
         transport = None
@@ -57,6 +70,16 @@ def test_the_kernal_loads_a_tap_built_from_a_prg(tmp_path):
             got = wait_for_memory(transport, prg.end_address - 12, tail, timeout=180.0,
                                   poll_interval=0.25)
             assert got is not None, "the program never appeared at $0801"
+            # The bytes are in RAM after the first of the data block's two
+            # copies. BASIC moves its end-of-program pointer ($2D/$2E) only
+            # when the KERNAL's LOAD has returned, after the second copy.
+            end = prg.end_address
+            done = wait_for_memory(transport, 0x002D, bytes((end & 0xFF, end >> 8)),
+                                   timeout=60.0, poll_interval=0.25)
+            assert done is not None, (
+                "BASIC never took the program's end from a finished LOAD "
+                f"(ST=${read_bytes(transport, 0x0090, 1)[0]:02X}): a tape error, or the "
+                "KERNAL is still waiting for the block's second copy")
             check = prg.verify_load(transport)
             assert check.complete, check
             assert not check.status & 0x3C, f"tape error in ST: ${check.status:02X}"
